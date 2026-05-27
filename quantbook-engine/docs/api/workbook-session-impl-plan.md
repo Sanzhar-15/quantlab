@@ -3,15 +3,18 @@
 **Status:** ⏳ IN PROGRESS — **2b/2c-1/2c-2 + audit-fix SHIPPED 2026-05-26; inc.2 audit (F3–F10) +
 inc.2c-3 `snapshot_delta` + inc.2c-4 `batch` + inc.2c-5 transaction handle + inc.2c-6 F2 `Op::ClearValue`
 + inc.2c-7 undo/redo + inc.2c-8 F10 atomic table-rename + inc.2c-9 `.qbook` open/save (Option 1)
-+ inc.2c-10 xlsx `import` (dependency-inverted `ql-io-xlsx`) SHIPPED 2026-05-27.**
++ inc.2c-10 xlsx `import` (dependency-inverted `ql-io-xlsx`) + inc.2c-11 csv `import`/`export`
+(new pure-I/O `ql-io-csv`) SHIPPED 2026-05-27.**
 Chain: `83b1b33bac2` PlanCache → `7335a5a1bfa` core → `993492b6f9b` validate_formula/query_range/
 `CellValue::Blank` → `2b5e7a13f5b` delete/restore/move sheet + tables → `9f7a1645dbd` tombstone-read fix →
 **`879f3601747` inc.2 audit-fix (F3–F10)** → **`20427b1c4c7` inc.2c-3 snapshot_delta** → **`58a55f4cfb8`
 + `9d471be3663` inc.2c-4 batch** → `fdd80c7a43d` inc.2c-5 transaction handle → `d8d22a04248` inc.2c-6 F2
 `Op::ClearValue` → `4f8e9858d77` inc.2c-7 undo/redo → `dca5695549e` inc.2c-8 F10 atomic table-rename →
-`2f92d84f3ed` inc.2c-9 `.qbook` open/save → **inc.2c-10 xlsx `import` (this commit)**.
-`WorkbookSession` is in `crates/ql-exec/src/session.rs`; **ql-exec lib 723/0 + e2e 21/0, clippy clean,
-ql-io-xlsx green, workspace build green.** (xlsx import: see `docs/api/xlsx-import-integration-plan.md`.)
+`2f92d84f3ed` inc.2c-9 `.qbook` open/save → `0e932da13a7` inc.2c-10 xlsx `import` →
+**inc.2c-11 csv `import`/`export` (this commit)**.
+`WorkbookSession` is in `crates/ql-exec/src/session.rs`; **ql-exec lib 728/0 + e2e 21/0, clippy clean,
+ql-io-csv 11/0, ql-io-xlsx green, workspace build green.** (csv: see
+`docs/audits/2026-05-27-inc2c11-csv-audit/`; xlsx import: `docs/api/xlsx-import-integration-plan.md`.)
 
 ## §0 — Current state: method inventory, v1 limitations & remaining sequence (READ FIRST)
 
@@ -31,9 +34,11 @@ ql-io-xlsx green, workspace build green.** (xlsx import: see `docs/api/xlsx-impo
 `mark_volatiles_dirty`; `query_range`, `snapshot`, **`snapshot_delta`**, `cell`, `list_sheets`; `cancel`,
 `operation_status`, `poll_events`; **`.qbook` `open`/`save`** (inc.2c-9 — Option 1: reconstruct from the
 envelope + fresh op-log/undo history); **xlsx `import`** (inc.2c-10 — Option-1 adoption via
-dependency-inverted `ql-io-xlsx` + injected `EngineXlsxRecomputer`). (Construction: `new`/`from_workbook`.)
+dependency-inverted `ql-io-xlsx` + injected `EngineXlsxRecomputer`); **csv `import`/`export`** (inc.2c-11
+— pure-I/O `ql-io-csv`; import Option-1 + no recompute; export single-live-sheet, verbatim).
+(Construction: `new`/`from_workbook`.)
 **DEFERRED — return `EngineError{class:Capability, code:"not_implemented_in_v1_core"}` (honest, never a
-fallback):** `import("csv")` (net-new — no csv importer exists) + `export` (xlsx/csv exporters);
+fallback):** `export("xlsx")` (inc.2c-12 — needs a bytes-writer + the xlsx writer feature-gate);
 `register_function`/`unregister_function`/`list_functions` (6.4);
 `write_range`/`publish_dataset`/`bind_range`/`refresh_source`/`materialize_query` (6.4/6.5).
 (Unknown `import`/`export` formats → loud `BadArgument`, not Capability.)
@@ -88,12 +93,15 @@ only — the locked Option-1 trade-off); recompute-on-open; name-from-path-stem;
 collab-v1.5. Parallel Codex(gpt-5.5 xhigh)+Opus audit: 1 HIGH (the sidecar-payload validation gap — FIXED)
 + LOW/INFO (docs, 2 added tests) — synthesis `docs/audits/2026-05-27-inc2c9-persist-audit/`.
 
-**Remaining sequence (NEXT):** `import("csv")` + `export` (xlsx/csv — csv is net-new; feature-gate the
-xlsx writer so `ql-exec` sheds the image-codec deps) → functions (6.4) → reserved bulk → Node smoke
-migration (+ pending `.node` rebuild + B#1/S2-01 mocha tests) → 6.1C audit. (`batch` inc.2c-4;
+**Remaining sequence (NEXT):** `export("xlsx")` + feature-gate the xlsx WRITER (umya/image codecs behind
+a `write` feature so `ql-exec`/WASM/bindings stay lean; needs a new `export_xlsx_bytes`) — inc.2c-12 →
+functions (6.4) → reserved bulk → Node smoke migration (+ pending `.node` rebuild + B#1/S2-01 mocha
+tests) → 6.1C audit. **Also tracked (cross-cutting): a storage-level effective-non-blank-value extent
+API** adopted by all serializers (csv/xlsx/.qbook) so a blank-inflated `Sheet::bounds` can't produce a
+giant export (Codex inc.2c-11 HIGH — currently consistent-with-siblings + documented). (`batch` inc.2c-4;
 **transaction handle** inc.2c-5; **F2 `Op::ClearValue`** inc.2c-6; **undo/redo** inc.2c-7;
-**F10 atomic table-rename** inc.2c-8; **`.qbook` open/save** inc.2c-9; **xlsx import** inc.2c-10 — all
-Codex/Opus-audited, synthesis docs under `docs/audits/2026-05-27-*`.)
+**F10 atomic table-rename** inc.2c-8; **`.qbook` open/save** inc.2c-9; **xlsx import** inc.2c-10;
+**csv import/export** inc.2c-11 — all Codex/Opus-audited, synthesis docs under `docs/audits/2026-05-27-*`.)
 
 > **✅ `batch` SHIPPED inc.2c-4 (2026-05-27) — OPTION (a) chosen.** Both tensions resolved; the
 > multi-call transaction handle stays deferred (see below).
@@ -235,7 +243,16 @@ Codex/Opus-audited, synthesis docs under `docs/audits/2026-05-27-*`.)
     diagnostics (incl. `feature_inventory`, Opus/Codex HIGH fixed); `map_xlsx_err` in Appendix A.
     Tracked follow-up: feature-gate the xlsx WRITER so `ql-exec` doesn't pull image codecs. See
     `docs/api/xlsx-import-integration-plan.md`.
-13. **NEXT: `import("csv")` + `export` (xlsx/csv)** → **functions** (6.4) + **reserved bulk** (6.4/6.5).
+13. ✅ **csv `import`/`export`** (SHIPPED inc.2c-11) — new pure-I/O leaf crate `ql-io-csv` (deps: `csv` +
+    `ql-storage` + `ql-types`; NO `ql-exec` — CSV has no formulas → no recompute injection).
+    `import("csv")` = Option-1 adoption + type inference (BOM-stripped, UTF-8, injection-safe, engine-limit
+    guarded); `export("csv")` = single-live-sheet (multi → loud `BadArgument`), verbatim/value-only;
+    `map_csv_err` in Appendix A. Parallel Codex+Opus audit: Codex HIGH (conservative-bounds export
+    blowup) assessed consistent-with-siblings (xlsx/.qbook do the same) → documented + tracked
+    cross-cutting; Opus BOM fix applied; faithful-export injection stance documented. Synthesis
+    `docs/audits/2026-05-27-inc2c11-csv-audit/`.
+14. **NEXT: `export("xlsx")` + xlsx-writer feature-gate (inc.2c-12)** → **functions** (6.4) +
+    **reserved bulk** (6.4/6.5). Plus the tracked cross-cutting effective-extent serializer fix.
 
 ---
 

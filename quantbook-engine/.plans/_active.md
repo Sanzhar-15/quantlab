@@ -148,10 +148,29 @@ status: |
   `docs/api/xlsx-import-integration-plan.md`; synthesis `docs/audits/2026-05-27-inc2c10-xlsx-import-audit/`.
   **ql-exec lib 723/0 + e2e 21/0, clippy clean; ql-io-xlsx green; workspace build green.**
 
-  ⭐ NEXT = 6.1B `import("csv")` + `export` (xlsx/csv — csv net-new; feature-gate the xlsx writer) →
-  functions (6.4-0 metadata substrate then 6.4) + reserved bulk (6.4/6.5) → Node smoke-path migration
-  (+ pending `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit — **follow
-  `docs/api/workbook-session-impl-plan.md` §0**. Do NOT freeze the CollabSession CRDT façade (collab = v1.5).
+  ✅ 6.1B inc.2c-11 csv `import`/`export` SHIPPED 2026-05-27. **New pure-I/O leaf crate `ql-io-csv`**
+  (deps: `csv = "=1.3.1"` + ql-storage + ql-types; NO ql-exec — CSV has no formulas → no recompute
+  injection, true leaf, no cycle). `import_csv_bytes`/`export_csv_bytes` + `CsvError`
+  (Io/Parse/ExceedsSheetLimits/SheetNotFound). `import("csv")` = Option-1 adoption + **no recompute**;
+  type inference (empty→Blank; TRUE/FALSE→bool; finite f64→Number, inf/nan→text; leading `=`→text,
+  injection-safe; Excel-like lossy `00123`→123; BOM-stripped; UTF-8-strict; engine-limit guarded
+  before put_at → no panic). `export("csv")` (`&self`) = single LIVE sheet (>1 → loud BadArgument, no
+  silent drop; 0 → empty), verbatim/value-only (Value Display; conservative bounds like xlsx/.qbook).
+  unknown format → BadArgument. `map_csv_err` fills Appendix A. Parallel Codex(gpt-5.5 xhigh)+Opus
+  audit: Codex HIGH (export over conservative bounds → blank-inflation blowup) **assessed
+  consistent-with-siblings (xlsx exporter + .qbook saver use the IDENTICAL bounds pattern) + documented
+  + TRACKED cross-cutting** (uniform storage effective-extent API; round-trip path unaffected — import
+  skips blanks); MEDIUM (export formula-injection) → kept faithful/verbatim (silent escaping corrupts
+  data; matches Excel/Sheets), doc scoped + future opt-in noted; Opus BOM fix applied + test; LOW
+  numeric fidelity kept Excel-consistent + pinned. Synthesis `docs/audits/2026-05-27-inc2c11-csv-audit/`.
+  **ql-exec lib 728/0 + e2e 21/0, clippy clean; ql-io-csv 11/0; ql-io-xlsx green; workspace build green.**
+
+  ⭐ NEXT = 6.1B `export("xlsx")` + **feature-gate the xlsx WRITER** (umya/image codecs behind a `write`
+  feature; needs a new `export_xlsx_bytes`) — inc.2c-12 → functions (6.4-0 metadata substrate then 6.4)
+  + reserved bulk (6.4/6.5) → Node smoke-path migration (+ pending `.node` rebuild + B#1/S2-01 mocha) →
+  6.1C audit — **follow `docs/api/workbook-session-impl-plan.md` §0**. Also tracked cross-cutting: a
+  storage-level effective-non-blank-value extent API for all serializers. Do NOT freeze the
+  CollabSession CRDT façade (collab = v1.5).
 date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-26_phase-5-7-v3-6-1-delta-consumer-backlog.md (V3.6.1 backlog mini-phase, SUPERSEDED by Phase 5 COMPLETE)
 parent_phase: 6 Product Surfaces
@@ -165,7 +184,7 @@ direction: |
   foundation; 6.4 (Python UDFs) is the strategic wedge; everything else (full bindings,
   service, SQL, AI) follows. Collab is v1.5-deferred and must NOT pre-empt Phase 6.
 
-current_engine_head: 2f92d84f3ed (6.1B inc.2c-9 — .qbook open/save, Option 1; LAST CODE COMMIT, code+docs+audit in one commit) ← 18e9b9ac3cf (inc.2c-8 handoff docs) ← dca5695549e (6.1B inc.2c-8 — F10 atomic table-rename) ← 2056edacc5c (inc.2c-6/7 doc sync) ← 4f8e9858d77 (6.1B inc.2c-7 — undo/redo) ← d8d22a04248 (6.1B inc.2c-6 — F2 Op::ClearValue) ← fdd80c7a43d (6.1B inc.2c-5 — multi-call transaction handle) ← 358c2c29f5d (inc.2c-4 coherence docs) ← 9d471be3663 (6.1B inc.2c-4 batch fix — reject same-cell value/formula conflicts) ← 58a55f4cfb8 (6.1B inc.2c-4 — batch via option (a)) ← dddb19a9c0d (batch calcgraph design note) ← 03fdeead3aa (batch design-fork note) ← 67c8ad3596e (inc.2c-3 docs sync) ← 20427b1c4c7 (6.1B inc.2c-3 — snapshot_delta: change-log + state_seq) ← 879f3601747 (6.1B inc.2 audit-fix F3–F10) ← e16acdcf14b (inc.2c-2 doc sync) ← 9f7a1645dbd (6.1B inc.2c-2 audit-fix — tombstone-read consistency) ← 2b5e7a13f5b (6.1B inc.2c-2 — structure + table ops) ← 993492b6f9b (6.1B inc.2c-1 — validate_formula + query_range + CellValue::Blank) ← 7335a5a1bfa (6.1B inc.2b — WorkbookSession core path) ← 83b1b33bac2 (6.1B inc.2a — session-owned PlanCache ctor; first PRE-EXISTING-code change since S2-01, additive) ← 884b7e365e8 (6.1B inc.2 impl-plan doc) ← 38108a5c8ef (6.1B inc.1b — trait w/ table ops) ← af15dcf3a5d (race-fix) ← 20d11072a0a (6.1B inc.1 — ql-session crate) ← ff6cd4c147c (6.1A v2). PRE-EXISTING-code changes since baseline: B#1 + S2-01 + inc.2a (additive PlanCache ctor). inc.2b/2c-1/2c-2 add NEW ql-exec/src/session.rs + ql-session dep + CellValue::Blank variant (no pre-existing-code behavior change). After current_engine_head, doc-sync commits advance HEAD further. pre-B#1 baseline 1465b1db4c4.
+current_engine_head: inc.2c-11 csv import/export (THIS commit — new ql-io-csv leaf crate + session wiring + code+docs+audit in one; exact hash set in the follow-up doc-sync) ← a9ffa0519ae (inc.2c-10 Cargo.lock sync) ← 0e932da13a7 (6.1B inc.2c-10 — xlsx import + ql-io-xlsx dependency inversion; LAST CODE COMMIT before this) ← f5112879a60 (inc.2c-9 doc-sync) ← 2f92d84f3ed (6.1B inc.2c-9 — .qbook open/save, Option 1) ← 18e9b9ac3cf (inc.2c-8 handoff docs) ← dca5695549e (6.1B inc.2c-8 — F10 atomic table-rename) ← 2056edacc5c (inc.2c-6/7 doc sync) ← 4f8e9858d77 (6.1B inc.2c-7 — undo/redo) ← d8d22a04248 (6.1B inc.2c-6 — F2 Op::ClearValue) ← fdd80c7a43d (6.1B inc.2c-5 — multi-call transaction handle) ← 358c2c29f5d (inc.2c-4 coherence docs) ← 9d471be3663 (6.1B inc.2c-4 batch fix — reject same-cell value/formula conflicts) ← 58a55f4cfb8 (6.1B inc.2c-4 — batch via option (a)) ← dddb19a9c0d (batch calcgraph design note) ← 03fdeead3aa (batch design-fork note) ← 67c8ad3596e (inc.2c-3 docs sync) ← 20427b1c4c7 (6.1B inc.2c-3 — snapshot_delta: change-log + state_seq) ← 879f3601747 (6.1B inc.2 audit-fix F3–F10) ← e16acdcf14b (inc.2c-2 doc sync) ← 9f7a1645dbd (6.1B inc.2c-2 audit-fix — tombstone-read consistency) ← 2b5e7a13f5b (6.1B inc.2c-2 — structure + table ops) ← 993492b6f9b (6.1B inc.2c-1 — validate_formula + query_range + CellValue::Blank) ← 7335a5a1bfa (6.1B inc.2b — WorkbookSession core path) ← 83b1b33bac2 (6.1B inc.2a — session-owned PlanCache ctor; first PRE-EXISTING-code change since S2-01, additive) ← 884b7e365e8 (6.1B inc.2 impl-plan doc) ← 38108a5c8ef (6.1B inc.1b — trait w/ table ops) ← af15dcf3a5d (race-fix) ← 20d11072a0a (6.1B inc.1 — ql-session crate) ← ff6cd4c147c (6.1A v2). PRE-EXISTING-code changes since baseline: B#1 + S2-01 + inc.2a (additive PlanCache ctor). inc.2b/2c-1/2c-2 add NEW ql-exec/src/session.rs + ql-session dep + CellValue::Blank variant (no pre-existing-code behavior change). After current_engine_head, doc-sync commits advance HEAD further. pre-B#1 baseline 1465b1db4c4.
 current_ide_head: d028568b53b (V3.6.1.2 shared delta cache) — unchanged
 audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait claims need positive compile proof; phase-level closures use 3-5-way megaudits; range-aware fn ships need lex+parse+bind+eval coverage.
 
@@ -213,8 +232,15 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      = Option-1 adoption + import-report diagnostics (incl. `feature_inventory` — Codex/Opus HIGH fixed);
      `map_xlsx_err` in Appendix A. ~90 test call-sites migrated (delegated + reviewed). Tracked follow-up:
      feature-gate the xlsx writer (ql-exec pulls image codecs). Parallel audit clean after fixes.
-   - ⭐ **NEXT**: `import("csv")` + `export` (xlsx/csv) → functions/bulk (6.4) → migrate the Node smoke path
-     (+ `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit. See `workbook-session-impl-plan.md` §0. Leave
+   - ✅ **inc.2c-11**: **csv `import`/`export`** — new pure-I/O leaf `ql-io-csv` (no ql-exec dep; no
+     recompute). `import("csv")` = Option-1 + type inference (BOM-stripped, UTF-8, injection-safe `=`,
+     engine-limit guarded); `export("csv")` = single-live-sheet (multi → loud BadArgument), verbatim;
+     `map_csv_err` in Appendix A. Parallel Codex+Opus audit: HIGH (conservative-bounds export blowup)
+     → consistent-with-siblings + documented + tracked cross-cutting; BOM fix applied; faithful-export
+     injection stance documented.
+   - ⭐ **NEXT**: `export("xlsx")` + xlsx-writer feature-gate (inc.2c-12) → functions/bulk (6.4) →
+     migrate the Node smoke path (+ `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit. Plus tracked
+     cross-cutting effective-extent serializer fix. See `workbook-session-impl-plan.md` §0. Leave
      collab/transport/presence feature-gated.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist

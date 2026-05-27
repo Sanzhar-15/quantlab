@@ -134,9 +134,12 @@ Product commands (not collab `Op` variants — decision-lock §3.2). **v1** = in
 | `new(options)` | v1 | `WorkbookRuntime::new` + fresh `OpLog` |
 | `open(path)` | v1 ✅ (inc.2c-9) | `ql_io::load_workbook_with_oplog` → **Option 1**: reconstruct the workbook from the `.qbook` envelope, adopt with a FRESH op-log + undo history (`baseline = loaded wb`), recompute on open (saved computed values may be stale). The loaded op-log is validated (incl. per-op payloads) then **discarded** — its history is not carried (re-save writes only this session's edits). Legal in `New` **or** `Ready` (re-open replaces the document + re-mints the epoch → outstanding tokens force full rebuild). |
 | `import(bytes, "xlsx")` | v1 ✅ (inc.2c-10) | `ql_io_xlsx::import_xlsx_bytes` (BestEffort recompute via the injected `EngineXlsxRecomputer` — `ql-io-xlsx` is pure I/O, the recompute is dependency-inverted) → **Option 1** adoption (same as `open`: fresh op-log/undo, registry preserved, epoch re-minted; no second recompute). Import-report fidelity caveats (dropped features from `feature_inventory`, soft warnings, formula recompute failures) surface as `Warning` diagnostics. |
-| `import(bytes, "csv")` / other | deferred / `BadArgument` | `"csv"` → `Capability/not_implemented_in_v1_core` (net-new — no csv importer exists yet); unknown format → loud `BadArgument` |
+| `import(bytes, "csv")` | v1 ✅ (inc.2c-11) | `ql_io_csv::import_csv_bytes` (pure-I/O leaf; type inference: empty→blank, TRUE/FALSE→bool, finite f64→number, else text; leading `=` stays text — injection-safe; UTF-8 + BOM-stripped; engine-limit-guarded) → **Option 1** adoption, **no recompute** (CSV has no formulas). |
+| `import(bytes, other)` | `BadArgument` | unknown format → loud `BadArgument` |
 | `save(path)` | v1 ✅ (inc.2c-9) | `ql_io::save_workbook_with_oplog(&wb, &oplog, name, path)`; workbook name derived from the path file-stem (no document-name metadata in v1; `None` → loud `BadArgument`). `&self`, legal in `Ready`/`Busy`. |
-| `export(format) -> bytes` | deferred | `Capability/not_implemented_in_v1_core` — xlsx/csv follow-up sub-increment (exporters) |
+| `export("csv") -> bytes` | v1 ✅ (inc.2c-11) | `ql_io_csv::export_csv_bytes` — **single live sheet** only (`>1` → loud `BadArgument`, no silent sheet drop; `export` is `&self`, no warn channel); 0 sheets → empty bytes. Verbatim/value-only (cells via `Value` `Display`; no formula-trigger escaping; uses the conservative used-range like xlsx/.qbook). |
+| `export("xlsx") -> bytes` | deferred | `Capability/not_implemented_in_v1_core` — inc.2c-12 (needs a bytes-writer + the xlsx writer feature-gate) |
+| `export(other) -> bytes` | `BadArgument` | unknown format → loud `BadArgument` |
 | `close()` | v1 | handle free → `Closed` |
 
 ### 3.2 Mutation — single edits
@@ -619,6 +622,10 @@ Ambiguities Codex flagged, resolved here:
 | `XlsxError::{Io, Zip, Calamine, XmlParse, MalformedOoxml, UnsupportedFeature}` (inc.2c-10, xlsx `import`) | `Persistence` | `xlsx_io` / `xlsx_zip` / `xlsx_calamine` / `xlsx_xml_parse` / `xlsx_malformed_ooxml` / `xlsx_unsupported_feature` | no |
 | `XlsxError::{Export, Engine}` | `Internal` | `xlsx_export` / `xlsx_engine` | no |
 | `XlsxError` (foreign `#[non_exhaustive]` future variant) | `Internal` | `unmapped_xlsx_error` (loud) | no |
+| `CsvError::{Io, Parse}` (inc.2c-11, csv `import`/`export`) | `Persistence` | `csv_io` / `csv_parse` (non-UTF-8 surfaces as `csv_parse`) | no |
+| `CsvError::ExceedsSheetLimits` | `BadArgument` | `csv_exceeds_limits` (CSV larger than `MAX_ROW`/`MAX_COLUMN`) | no |
+| `CsvError::SheetNotFound` | `Internal` | `csv_sheet_not_found` (session selects the sheet → invariant break) | no |
+| `CsvError` (foreign `#[non_exhaustive]` future variant) | `Internal` | `unmapped_csv_error` (loud) | no |
 | `TransportError::*` | `Capability`/`Internal` | `transport_*` (e.g. `transport_closed`) | maybe |
 | `CollabSessionError::{OpLog,Presence,Undo,Replay,Transport}` | per inner | `session_*` / inner kind | per inner |
 | version token decode failure | `Protocol` | `invalid_version_token` | no |

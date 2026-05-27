@@ -1,0 +1,27 @@
+[package]
+name = "ql-io-csv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# **Phase 6.1B inc.2c-11 (2026-05-27):** pure-I/O CSV import/export. Mirrors
+# `ql-io-xlsx`'s layering — depends on `ql-storage` + `ql-types` only, NEVER on
+# the compute engine (`ql-exec`). CSV has no formulas, so (unlike xlsx import)
+# there is no recompute phase and no injected recomputer; this stays a leaf.
+#
+# RFC 4180 parsing/serialisation via BurntSushi's `csv` crate (quoting, embedded
+# newlines/quotes, flexible/ragged records) rather than a hand-rolled splitter —
+# RFC 4180 quoting is a classic source of subtle bugs. Exact-pinned per the
+# workspace's Phase 0 external-dependency discipline.
+csv = "=1.3.1"
+
+# Workspace shared.
+ql-storage = { path = "../ql-storage" }
+ql-types = { path = "../ql-types" }
+thiserror = { workspace = true }

@@ -29,10 +29,13 @@
 //! **`undo`/`redo`** (inc.2c-7) + **`.qbook` `open`/`save`** (inc.2c-9 — Option 1:
 //! reconstruct from the envelope, fresh op-log/undo history) + **xlsx `import`**
 //! (inc.2c-10 — same Option-1 adoption, via `ql_io_xlsx` + the injected
-//! `EngineXlsxRecomputer`) are also real. The remaining contract methods return
-//! a **surfaced** `Capability` / `not_implemented_in_v1_core` error (NOT a silent
-//! fallback — project No-Fallbacks rule) and land in later sub-increments:
-//! - `import("csv")` (net-new; no importer exists yet) + `export` (xlsx/csv),
+//! `EngineXlsxRecomputer`) + **`csv` `import`/`export`** (inc.2c-11 — via the
+//! pure-I/O `ql_io_csv`; no recompute since CSV has no formulas) are also real.
+//! The remaining contract methods return a **surfaced** `Capability` /
+//! `not_implemented_in_v1_core` error (NOT a silent fallback — project
+//! No-Fallbacks rule) and land in later sub-increments:
+//! - `export("xlsx")` (inc.2c-12 — needs a bytes-writer + the xlsx writer
+//!   feature-gate),
 //! - function registration (6.4), reserved bulk ops (6.4/6.5).
 //!
 //! ## Two design facts that shape this increment
@@ -1043,9 +1046,12 @@ impl EngineSession for WorkbookSession {
         Ok(())
     }
 
-    /// Import a workbook from in-memory bytes (inc.2c-10). v1 supports
-    /// `"xlsx"`; `"csv"` is a deferred follow-up (net-new — no importer exists
-    /// yet); any other format is a loud `BadArgument`.
+    /// Import a workbook from in-memory bytes. v1 supports `"xlsx"` (inc.2c-10)
+    /// and `"csv"` (inc.2c-11); any other format is a loud `BadArgument`.
+    ///
+    /// **csv:** parse via `ql_io_csv::import_csv_bytes` (no recompute — CSV has
+    /// no formulas) → Option-1 adoption (same model as xlsx below, minus the
+    /// recomputer).
     ///
     /// **xlsx (Option 1, same adoption model as [`open`]):** parse the bytes via
     /// `ql_io_xlsx::import_xlsx_bytes` — which recomputes BestEffort through the
@@ -1092,9 +1098,23 @@ impl EngineSession for WorkbookSession {
                 self.push_xlsx_import_diagnostics(&report);
                 Ok(())
             }
-            "csv" => Err(not_implemented("import (csv)")),
+            "csv" => {
+                // CSV has NO formulas (a leading `=` is imported as text), so
+                // there is nothing to recompute — unlike xlsx import, this path
+                // does not run a recomputer. Parse into a fresh single-sheet
+                // workbook, then adopt it Option-1 (same model as `open`/xlsx
+                // import: `*self = from_workbook`, registry preserved, fresh
+                // op-log/undo, epoch re-minted).
+                let result =
+                    ql_io_csv::import_csv_bytes(bytes, ql_io_csv::CsvImportOptions::default())
+                        .map_err(map_csv_err)?;
+                let registry = Arc::clone(&self.registry);
+                *self = Self::from_workbook(result.workbook);
+                self.registry = registry;
+                Ok(())
+            }
             other => Err(EngineError::bad_argument(format!(
-                "unsupported import format {other:?} (v1 supports \"xlsx\")"
+                "unsupported import format {other:?} (v1 supports \"xlsx\" and \"csv\")"
             ))),
         }
     }
@@ -1121,8 +1141,50 @@ impl EngineSession for WorkbookSession {
         Ok(())
     }
 
-    fn export(&self, _format: &str) -> EngineResult<Vec<u8>> {
-        Err(not_implemented("export"))
+    /// Export the live workbook to in-memory bytes (inc.2c-11). v1 supports
+    /// `"csv"`; `"xlsx"` is a deferred follow-up (inc.2c-12 — needs a
+    /// bytes-writer + the xlsx writer feature-gate); any other format is a loud
+    /// `BadArgument`.
+    ///
+    /// **csv (single-sheet, value-only):** CSV is inherently flat, and `export`
+    /// is `&self` so there is no event channel to warn through. Rather than
+    /// silently dropping sheets (a No-Fallbacks violation), a workbook with more
+    /// than one live sheet is **refused loudly** (`BadArgument`); a single live
+    /// sheet is serialised via `ql_io_csv::export_csv_bytes` (cells rendered by
+    /// `ql_types::Value`'s `Display`; no number-format application in v1). A
+    /// workbook with zero live sheets yields empty bytes.
+    fn export(&self, format: &str) -> EngineResult<Vec<u8>> {
+        self.ensure_readable()?;
+        match format {
+            "csv" => {
+                let live: Vec<SheetId> = self
+                    .workbook
+                    .sheet_display_order()
+                    .iter()
+                    .copied()
+                    .filter(|id| !self.workbook.is_sheet_removed(*id))
+                    .collect();
+                match live.as_slice() {
+                    [] => Ok(Vec::new()),
+                    [one] => ql_io_csv::export_csv_bytes(
+                        &self.workbook,
+                        *one,
+                        ql_io_csv::CsvExportOptions::default(),
+                    )
+                    .map_err(map_csv_err),
+                    many => Err(EngineError::bad_argument(format!(
+                        "csv export requires a single-sheet workbook, but this one has {} live \
+                         sheets; export each sheet separately (a sheet-targeted csv export is a \
+                         later-version feature)",
+                        many.len()
+                    ))),
+                }
+            }
+            "xlsx" => Err(not_implemented("export (xlsx)")),
+            other => Err(EngineError::bad_argument(format!(
+                "unsupported export format {other:?} (v1 supports \"csv\")"
+            ))),
+        }
     }
 
     fn close(&mut self) -> EngineResult<()> {
@@ -2561,6 +2623,32 @@ fn map_xlsx_err(e: ql_io_xlsx::XlsxError) -> EngineError {
     }
 }
 
+/// Map a `ql_io_csv::CsvError` (from `import("csv")` / `export("csv")` —
+/// inc.2c-11) to the contract `EngineError` (Appendix A). Parse/I/O failures are
+/// `Persistence` (a load/serialise operation); an over-large CSV is a
+/// `BadArgument` (the caller's input exceeds engine capacity); a missing export
+/// sheet is an `Internal` invariant break (the session selects the sheet).
+///
+/// `CsvError` is a FOREIGN `#[non_exhaustive]` enum (it lives in `ql-io-csv`), so
+/// this match REQUIRES a wildcard arm — a future variant surfaces a loud
+/// `Internal`/`unmapped_csv_error`, never a silent or generic caller-visible
+/// code (No-Fallbacks).
+fn map_csv_err(e: ql_io_csv::CsvError) -> EngineError {
+    use ql_io_csv::CsvError as C;
+    let display = e.to_string();
+    match e {
+        C::Io(_) => EngineError::new(ErrorClass::Persistence, "csv_io", display),
+        C::Parse(_) => EngineError::new(ErrorClass::Persistence, "csv_parse", display),
+        C::ExceedsSheetLimits { .. } => {
+            EngineError::new(ErrorClass::BadArgument, "csv_exceeds_limits", display)
+        }
+        C::SheetNotFound(_) => {
+            EngineError::new(ErrorClass::Internal, "csv_sheet_not_found", display)
+        }
+        _ => EngineError::new(ErrorClass::Internal, "unmapped_csv_error", display),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2667,11 +2755,11 @@ mod tests {
     #[test]
     fn deferred_methods_surface_capability_error() {
         let mut s = WorkbookSession::new();
-        // `begin_transaction` ships in inc.2c-5; `undo`/`redo` ship in inc.2c-6;
-        // `open`/`save` ship in inc.2c-9; xlsx `import` ships in inc.2c-10 (no
-        // longer Capability errors). The remaining deferred methods still
-        // surface the honest Capability error: `export` (xlsx/csv exporters),
-        // `import("csv")` (net-new — see `import_unknown_format_*`), + functions.
+        // `begin_transaction` inc.2c-5; `undo`/`redo` inc.2c-6; `open`/`save`
+        // inc.2c-9; xlsx `import` inc.2c-10; csv `import`/`export` inc.2c-11 (all
+        // no longer Capability errors). The remaining deferred methods still
+        // surface the honest Capability error: `export("xlsx")` (inc.2c-12) +
+        // function registration (6.4).
         for err in [
             s.export("xlsx").unwrap_err(),
             s.list_functions().unwrap_err(),
@@ -2977,15 +3065,96 @@ mod tests {
     /// import of an unknown format → `BadArgument`; `"csv"` is the deferred
     /// follow-up → honest `Capability`/`not_implemented_in_v1_core`.
     #[test]
-    fn import_unknown_format_bad_argument_and_csv_capability() {
+    fn import_unknown_format_is_bad_argument() {
+        // csv + xlsx are real (inc.2c-10/11); an unknown format is a loud
+        // BadArgument, NOT a Capability/not_implemented.
         let mut s = WorkbookSession::new();
         let err = s.import(b"x", "ods").unwrap_err();
         assert_eq!(err.class, ErrorClass::BadArgument);
+    }
 
-        let mut s2 = WorkbookSession::new();
-        let csv = s2.import(b"a,b\n1,2", "csv").unwrap_err();
-        assert_eq!(csv.class, ErrorClass::Capability);
-        assert_eq!(csv.code, "not_implemented_in_v1_core");
+    // --- import/export: csv (inc.2c-11) ---
+
+    /// csv round-trip through the session: import infers types, the cells read
+    /// back, and `export("csv")` re-serialises them.
+    #[test]
+    fn import_export_csv_round_trip() {
+        let mut s = WorkbookSession::new();
+        s.import(b"name,score,passed\nAlice,91.5,TRUE\nBob,0,FALSE\n", "csv")
+            .unwrap();
+        assert_eq!(s.lifecycle_state(), LifecycleState::Ready);
+        // Inferred types survive (sheet id 0 is the single imported sheet).
+        assert_eq!(
+            s.cell(addr(0, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Text {
+                text: "name".to_string()
+            })
+        );
+        assert_eq!(
+            s.cell(addr(0, 1, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 91.5 })
+        );
+        assert_eq!(
+            s.cell(addr(0, 1, 2)).unwrap().unwrap().value,
+            Some(CellValue::Boolean { boolean: true })
+        );
+        // Re-export and confirm the values come back out.
+        let out = String::from_utf8(s.export("csv").unwrap()).unwrap();
+        assert!(out.contains("name,score,passed"), "out=<{out}>");
+        assert!(out.contains("Alice,91.5,TRUE"), "out=<{out}>");
+        assert!(out.contains("Bob,0,FALSE"), "out=<{out}>");
+        // csv import adopts a fresh op-log/undo history (Option 1).
+        assert!(!s.can_undo());
+    }
+
+    /// A field with a leading `=` imports as TEXT, never a formula (csv
+    /// injection-safety + this path has no evaluator).
+    #[test]
+    fn import_csv_leading_equals_is_text_not_formula() {
+        let mut s = WorkbookSession::new();
+        s.import(b"=1+1\n", "csv").unwrap();
+        let c = s.cell(addr(0, 0, 0)).unwrap().unwrap();
+        assert_eq!(
+            c.value,
+            Some(CellValue::Text {
+                text: "=1+1".to_string()
+            })
+        );
+        assert!(c.formula.is_none(), "csv must not create a formula");
+    }
+
+    /// Malformed (non-UTF-8) csv bytes fail loud as a `Persistence` error and
+    /// leave the session unchanged + usable.
+    #[test]
+    fn import_csv_non_utf8_fails_loud_persistence() {
+        let mut s = WorkbookSession::new();
+        let err = s.import(&[b'a', b',', 0xFF, b'\n'], "csv").unwrap_err();
+        assert_eq!(err.class, ErrorClass::Persistence);
+        assert_eq!(err.code, "csv_parse");
+        assert_eq!(s.lifecycle_state(), LifecycleState::Ready);
+        assert!(s.add_sheet("StillWorks", 16384).is_ok());
+    }
+
+    /// `export("csv")` refuses a multi-sheet workbook loudly rather than
+    /// silently dropping sheets (export is `&self`, no warning channel).
+    #[test]
+    fn export_csv_multi_sheet_fails_loud_bad_argument() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("A", 16384).unwrap();
+        s.add_sheet("B", 16384).unwrap();
+        let err = s.export("csv").unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+    }
+
+    /// An unknown export format is a loud `BadArgument`; `"xlsx"` is the deferred
+    /// follow-up → honest `Capability`/`not_implemented_in_v1_core`.
+    #[test]
+    fn export_unknown_format_bad_argument_xlsx_capability() {
+        let s = WorkbookSession::new();
+        assert_eq!(s.export("ods").unwrap_err().class, ErrorClass::BadArgument);
+        let xlsx = s.export("xlsx").unwrap_err();
+        assert_eq!(xlsx.class, ErrorClass::Capability);
+        assert_eq!(xlsx.code, "not_implemented_in_v1_core");
     }
 
     /// The xlsx feature inventory (the PRIMARY dropped-feature channel —

@@ -29,6 +29,10 @@ ql-io             = { path = "../ql-io" }
 # behind a `write` feature + depend with default-features=false to keep the core
 # engine (and WASM/bindings) lean.
 ql-io-xlsx        = { path = "../ql-io-xlsx" }
+# Phase 6.1B inc.2c-11 (2026-05-27): csv import/export for `WorkbookSession`.
+# ql-io-csv is a pure-I/O leaf (deps: csv + ql-storage + ql-types) — CSV has no
+# formulas, so there is no recompute injection and no risk of a cycle.
+ql-io-csv         = { path = "../ql-io-csv" }
 # Phase 2A.3.b (2026-05-12): opt-in op-log attachment for WorkbookRuntime +
 # WorkbookTransaction. CellWireValue conversion happens via ql-io (already
 # present); Op + OpLog types come from ql-oplog.
