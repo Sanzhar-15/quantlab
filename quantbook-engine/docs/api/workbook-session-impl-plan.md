@@ -86,6 +86,25 @@ B#1/S2-01 mocha tests) → 6.1C audit. (`batch` SHIPPED inc.2c-4.)
 > reduces to zero inner ops, e.g. a Blank-clear on a non-formula cell — then no BatchCommit is appended).
 > `options.undo_label` is accepted but not yet consumed (undo lands later). 11 session tests added.
 >
+> **⚠️ FOLLOW-UP FIX (2026-05-27) — same-cell value/formula conflict guard.** Because the inner ops are
+> built from **pre-batch** state but Phase 3 applies them **sequentially**, two ops that both touch one
+> cell's value/formula could make the logged ops diverge from the live result on replay. Canonical case:
+> `batch([SetFormula A1, SetValue A1])` logs `[PutFormula A1, PutValue A1]` (SetValue saw NO formula
+> pre-batch → emitted no ClearFormula), but replaying `Op::PutValue` does NOT clear the formula
+> (`crates/ql-oplog/src/replay.rs:486-510`) → a replay yields A1 with BOTH a value and a formula,
+> divergent from the live state (where the sequential `set_value` clears the formula it now sees). This
+> was a regression vs `WorkbookTransaction`, which rejects same-cell mixed value/formula ops via
+> `check_op_kind` → `ConflictingOps`. **Rule shipped:** Phase 1 rejects any batch in which the same
+> `(sheet, row, col)` is targeted by more than ONE value/formula-affecting op — i.e. more than one of
+> `SetValue` / `SetFormula` / `Clear` (also two same-kind ops on one cell, slightly stricter than the
+> transaction's last-write-wins; same-cell-multi-write within one batch is pathological → reject loudly).
+> `SetFormat` is **orthogonal** (touches only the format overlay, replay-independent of value/formula) and
+> is deliberately NOT tracked → it MAY coexist with one value/formula op on the same cell. Rejection is
+> `EngineError { class: Conflict, code: "conflicting_batch_ops", … }` naming the offending cell, fired
+> via a `HashSet<CellAddr>` during the Phase-1 walk BEFORE any append/mutation (validation-atomic:
+> workbook + token unchanged). +3 session tests (formula-then-value → Conflict; value-then-clear →
+> Conflict; value+format → OK, both land).
+>
 > **STILL DEFERRED — the multi-call handle** (`begin_transaction`/`txn_add`/`commit_transaction`/
 > `rollback_transaction`) needs two NEW `WorkbookSession` fields (`txns: HashMap<TransactionId,
 > Vec<SessionOp>>`, `next_txn_id: u64`) not in the struct yet (impl-plan §2 sketched them; inc.2b/2c

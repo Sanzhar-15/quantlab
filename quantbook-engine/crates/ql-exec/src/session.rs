@@ -1062,11 +1062,48 @@ impl EngineSession for WorkbookSession {
         // at delta-resolve time, so a plain Vec is fine).
         let mut changes: Vec<SessionChange> = Vec::with_capacity(ops.len());
 
+        // Same-cell value/formula conflict guard. The BatchCommit inner ops are
+        // built here against the PRE-batch workbook, but Phase 3 applies the ops
+        // SEQUENTIALLY through the runtime. For two ops that both touch the
+        // value/formula of one cell, the pre-batch-built log can diverge from
+        // the sequential apply on replay: e.g. `[SetFormula A1, SetValue A1]`
+        // logs `[PutFormula A1, PutValue A1]` (SetValue saw no formula
+        // pre-batch, so emitted no ClearFormula), but replaying PutValue does
+        // NOT clear the formula (`crates/ql-oplog/src/replay.rs:486-510`), so a
+        // replay yields A1 with BOTH a value and a formula — divergent from the
+        // live state where set_value clears the formula it now sees. Rejecting
+        // any cell hit by >1 value/formula-affecting op (SetValue/SetFormula/
+        // Clear) eliminates every such divergent ordering. SetFormat is
+        // orthogonal (touches only the format overlay, independent of
+        // value/formula on replay) and is deliberately NOT tracked here, so it
+        // may coexist with one value/formula op on the same cell. This mirrors
+        // (and is stricter than) WorkbookTransaction's ConflictingOps guard.
+        let mut vf_targets: HashSet<CellAddr> = HashSet::with_capacity(ops.len());
+        // Reject the SECOND value/formula op on a cell; names the offending cell.
+        macro_rules! guard_vf_conflict {
+            ($addr:expr) => {{
+                if !vf_targets.insert(*$addr) {
+                    return Err(EngineError::new(
+                        ErrorClass::Conflict,
+                        "conflicting_batch_ops",
+                        format!(
+                            "batch: cell (sheet {}, row {}, col {}) is targeted by more \
+                             than one value/formula op (SetValue/SetFormula/Clear) in the \
+                             same batch; a batch may touch each cell's value/formula at \
+                             most once",
+                            $addr.sheet, $addr.row, $addr.col
+                        ),
+                    ));
+                }
+            }};
+        }
+
         for op in &ops {
             match op {
                 SessionOp::SetValue { addr, value } => {
                     self.require_live_sheet(addr.sheet, "batch.set_value")?;
                     Self::require_in_bounds(addr.row, addr.col, "batch.set_value")?;
+                    guard_vf_conflict!(addr);
                     // Reject Pending/Error/non-finite inputs exactly as
                     // `set_value` does (the runtime would too, but doing it
                     // here keeps validation fully up front / pre-mutation).
@@ -1101,6 +1138,7 @@ impl EngineSession for WorkbookSession {
                 SessionOp::SetFormula { addr, text } => {
                     self.require_live_sheet(addr.sheet, "batch.set_formula")?;
                     Self::require_in_bounds(addr.row, addr.col, "batch.set_formula")?;
+                    guard_vf_conflict!(addr);
                     // Canonicalize + bind-validate exactly as `set_formula`
                     // does (lex_with current mode/locale → parse → print_with
                     // A1/EnUs at the cell site → bind). The canonical text is
@@ -1122,6 +1160,7 @@ impl EngineSession for WorkbookSession {
                 SessionOp::Clear { addr } => {
                     self.require_live_sheet(addr.sheet, "batch.clear")?;
                     Self::require_in_bounds(addr.row, addr.col, "batch.clear")?;
+                    guard_vf_conflict!(addr);
                     // Mirror `clear_formula`: a no-formula cell is a no-op
                     // (no inner op, no change record). Otherwise emit the
                     // preserved-value `PutValue` (unless this cell is a spill
@@ -2764,5 +2803,108 @@ mod tests {
         assert_eq!(err.class, ErrorClass::BadArgument);
         assert!(s.cell(addr(sheet, 0, 0)).unwrap().is_none());
         assert_eq!(v0, s.snapshot().unwrap().version);
+    }
+
+    /// Two value/formula ops on the SAME cell (SetFormula then SetValue) are
+    /// rejected as a Conflict (`conflicting_batch_ops`). This guards the
+    /// pre-batch-built-log vs sequential-apply divergence: the log would carry
+    /// `[PutFormula, PutValue]` with no ClearFormula, and replaying PutValue
+    /// does not strip the formula (replay.rs:486-510) → a replay would diverge
+    /// from the live state. The rejection is validation-atomic: workbook +
+    /// version token UNCHANGED.
+    #[test]
+    fn batch_same_cell_formula_then_value_is_conflict() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let len_before = s.oplog.len();
+        let err = s
+            .batch(
+                vec![
+                    SessionOp::SetFormula {
+                        addr: addr(sheet, 0, 0),
+                        text: "1 + 1".to_string(),
+                    },
+                    SessionOp::SetValue {
+                        addr: addr(sheet, 0, 0),
+                        value: CellValue::Number { number: 5.0 },
+                    },
+                ],
+                BatchOptions::default(),
+            )
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Conflict);
+        assert_eq!(err.code, "conflicting_batch_ops");
+        // Validation-atomic: nothing appended, nothing mutated, token unchanged.
+        assert_eq!(
+            s.oplog.len(),
+            len_before,
+            "a rejected batch appends no BatchCommit"
+        );
+        assert!(
+            s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
+            "no op may apply when the batch is rejected"
+        );
+        assert_eq!(
+            v0,
+            s.snapshot().unwrap().version,
+            "a rejected batch must not advance the version token"
+        );
+    }
+
+    /// SetValue then Clear on the SAME cell — both value/formula-affecting — is
+    /// likewise a Conflict.
+    #[test]
+    fn batch_same_cell_value_then_clear_is_conflict() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let err = s
+            .batch(
+                vec![
+                    SessionOp::SetValue {
+                        addr: addr(sheet, 0, 0),
+                        value: CellValue::Number { number: 5.0 },
+                    },
+                    SessionOp::Clear {
+                        addr: addr(sheet, 0, 0),
+                    },
+                ],
+                BatchOptions::default(),
+            )
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Conflict);
+        assert_eq!(err.code, "conflicting_batch_ops");
+        assert_eq!(v0, s.snapshot().unwrap().version);
+    }
+
+    /// SetValue + SetFormat on the SAME cell is ALLOWED: format is orthogonal to
+    /// value/formula on replay, so it does not trigger the conflict guard. Both
+    /// effects land.
+    #[test]
+    fn batch_same_cell_value_plus_format_is_ok() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let fmt = s.register_format("0.00%").unwrap();
+        let res = s
+            .batch(
+                vec![
+                    SessionOp::SetValue {
+                        addr: addr(sheet, 0, 0),
+                        value: CellValue::Number { number: 5.0 },
+                    },
+                    SessionOp::SetFormat {
+                        addr: addr(sheet, 0, 0),
+                        format: fmt,
+                    },
+                ],
+                BatchOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(res.applied, 2);
+        // Both the value and the format landed on the one cell.
+        let a1 = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(a1.value, Some(CellValue::Number { number: 5.0 }));
+        assert_eq!(a1.format, Some(fmt));
     }
 }
