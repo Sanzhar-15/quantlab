@@ -2316,6 +2316,7 @@ dependencies = [
  "ql-formula-syntax",
  "ql-functions",
  "ql-io",
+ "ql-io-xlsx",
  "ql-oplog",
  "ql-profile",
  "ql-session",
