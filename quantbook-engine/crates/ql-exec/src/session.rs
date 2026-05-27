@@ -161,8 +161,37 @@ impl WorkbookSession {
     /// Run a closure against a per-edit `WorkbookRuntime` that borrows the
     /// session's owned state, recovering the (warmed) plan cache afterwards.
     /// The runtime borrow never escapes this function.
+    ///
+    /// **Panic safety (F3 / contract §8):** `f` runs the engine kernels, which
+    /// contain reachable `.expect`/`panic!` (e.g. the recompute/spill paths). If
+    /// `f` unwinds, the plan-cache restore below is skipped (leaving the cache
+    /// taken/empty) and the session may be mid-edit. A `FaultGuard` marks the
+    /// session `Faulted` on unwind so no later command runs against torn state —
+    /// never silently `Ready`/`Busy`. It is disarmed on the normal return path.
+    /// (Under `panic = "abort"` — today's default — the unwind never runs; this
+    /// becomes live once the binding shim builds with `panic = "unwind"` + a
+    /// boundary `catch_unwind`, per §8.2. The guard is the in-engine half of
+    /// that contract.)
     fn with_runtime<R>(&mut self, f: impl FnOnce(&mut WorkbookRuntime<'_>) -> R) -> R {
+        struct FaultGuard<'g> {
+            state: &'g mut LifecycleState,
+            armed: bool,
+        }
+        impl Drop for FaultGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    *self.state = LifecycleState::Faulted;
+                }
+            }
+        }
+
         let cache = std::mem::take(&mut self.plan_cache);
+        // Borrows `self.state`; the runtime below borrows the other (disjoint)
+        // fields, so both coexist within this function.
+        let mut guard = FaultGuard {
+            state: &mut self.state,
+            armed: true,
+        };
         let mut rt = WorkbookRuntime::with_session_state(
             &mut self.workbook,
             &self.registry,
@@ -172,7 +201,28 @@ impl WorkbookSession {
         );
         let out = f(&mut rt);
         self.plan_cache = rt.into_plan_cache();
+        guard.armed = false;
         out
+    }
+
+    /// Reject a coordinate outside the Excel-compatible addressable grid
+    /// (`MAX_ROW` / `MAX_COLUMN`) with `BadArgument` (F4 / contract §8). The
+    /// read paths (`cell`/`query_range`/`validate_formula`) read the live
+    /// `Workbook` directly (no `validate_cell`), and `Sheet::read` returns
+    /// `Blank` out-of-bounds — so without this an oversize coordinate would
+    /// silently read empty, and an `end = u32::MAX` range would overflow the
+    /// `end - start + 1` span before the cell-count cap. Mutators are already
+    /// covered by the runtime's `validate_cell`.
+    fn require_in_bounds(row: RowId, col: ColId, op: &str) -> EngineResult<()> {
+        if row > ql_types::MAX_ROW || col > ql_types::MAX_COLUMN {
+            return Err(EngineError::bad_argument(format!(
+                "{op}: cell ({row}, {col}) is outside the addressable grid \
+                 (max row {}, max col {})",
+                ql_types::MAX_ROW,
+                ql_types::MAX_COLUMN
+            )));
+        }
+        Ok(())
     }
 
     /// Gate a mutating/recalc command: legal only in `Ready`.
@@ -238,12 +288,21 @@ impl WorkbookSession {
     }
 
     /// A sheet is "live" (visible/editable) iff it exists AND is not tombstoned.
-    /// Reads (`cell`/`query_range`/`validate_formula`) and cell edits gate on
-    /// this so a deleted sheet behaves consistently across the whole surface:
-    /// `snapshot`/`list_sheets` already hide tombstoned sheets, so reading or
-    /// writing one must also report `NotFound` (restore it first). Both the
-    /// missing and tombstoned cases use code `sheet_not_found` (the message
-    /// distinguishes them).
+    /// Reads (`cell`/`query_range`/`validate_formula`) and cell/structure edits
+    /// (`set_*`, `rename_sheet`, `create_table`) gate on this so a deleted sheet
+    /// behaves consistently across the whole surface: `snapshot`/`list_sheets`
+    /// already hide tombstoned sheets, so reading or writing one must also report
+    /// `NotFound` (restore it first). Both the missing and tombstoned cases use
+    /// code `sheet_not_found` (the message distinguishes them).
+    ///
+    /// **F9 — deliberate v1 semantic (NOT gated here):** formula *evaluation*
+    /// still reads tombstoned sheets — sheet-name resolution + the eval env do
+    /// not filter tombstones (`workbook.rs` / `env.rs`), so a formula referencing
+    /// a deleted sheet reads its preserved cells rather than `#REF!`. This is the
+    /// locked V3.5.0.3b decision (`Op::RemoveSheet` leaves formula text intact, no
+    /// `#REF!` substitution) and matches the v1.5 `#REF!` backlog (D7). The
+    /// session surfaces gate the *direct* read/edit of a tombstoned sheet; the
+    /// transitive formula-readability is intentionally preserved for v1.
     fn require_live_sheet(&self, id: SheetId, op: &str) -> EngineResult<()> {
         if (id as usize) >= self.workbook.sheet_count() {
             return Err(EngineError::new(
@@ -458,6 +517,7 @@ impl EngineSession for WorkbookSession {
     fn validate_formula(&self, addr: CellAddr, text: &str) -> EngineResult<Vec<Diagnostic>> {
         self.ensure_readable()?;
         self.require_live_sheet(addr.sheet, "validate_formula")?;
+        Self::require_in_bounds(addr.row, addr.col, "validate_formula")?; // F4
         // Read-only lex → parse → bind against the live workbook (no mutation, so
         // no `WorkbookRuntime` `&mut` needed). A failure at any stage becomes one
         // error `Diagnostic`; a clean bind yields an empty vec (valid). Evaluation
@@ -501,6 +561,9 @@ impl EngineSession for WorkbookSession {
 
     fn rename_sheet(&mut self, id: SheetId, name: &str) -> EngineResult<()> {
         self.ensure_ready()?;
+        // F6: a tombstoned sheet is uniformly gone across the surface — renaming
+        // one must report NotFound, not silently rename a hidden sheet.
+        self.require_live_sheet(id, "rename_sheet")?;
         self.with_runtime(|rt| rt.rename_sheet(id, name))
             .map_err(map_runtime_err)
     }
@@ -508,12 +571,20 @@ impl EngineSession for WorkbookSession {
     fn delete_sheet(&mut self, id: SheetId) -> EngineResult<()> {
         self.ensure_ready()?;
         // Fail-loud (MED-3): unknown id → NotFound (NOT the silent storage no-op).
-        // An already-tombstoned (but known) id is an idempotent no-op, not an error.
         self.require_sheet_exists(id, "delete_sheet")?;
+        // F5: an already-tombstoned (but known) id is a TRUE idempotent no-op —
+        // return without appending a spurious `Op::RemoveSheet`. The earlier impl
+        // appended unconditionally; `Workbook::remove_sheet` then no-ops, but the
+        // op still advanced the version token + polluted the log for a non-change.
+        if self.workbook.is_sheet_removed(id) {
+            return Ok(());
+        }
         // Producer order: append-before-mutate, so a failed append leaves the
         // workbook unchanged. (`Workbook::remove_sheet` tombstones — preserving
         // cells for restore; cross-sheet dependents are NOT proactively dirtied
-        // here, matching the engine's current cross-sheet-ref handling.)
+        // here, matching the engine's current cross-sheet-ref handling. Formulas
+        // referencing a tombstoned sheet stay readable — see the F9 note on
+        // `require_live_sheet`.)
         self.oplog.append(Op::RemoveSheet { id }).map_err(oplog_append_err)?;
         self.workbook.remove_sheet(id);
         Ok(())
@@ -522,6 +593,16 @@ impl EngineSession for WorkbookSession {
     fn restore_sheet(&mut self, id: SheetId) -> EngineResult<()> {
         self.ensure_ready()?;
         self.require_sheet_exists(id, "restore_sheet")?;
+        // F5 / contract §3.3: restoring a sheet that is NOT tombstoned is a
+        // Conflict (there is nothing to restore) — never a silent no-op that
+        // appends a spurious `Op::RestoreSheet` + advances the version token.
+        if !self.workbook.is_sheet_removed(id) {
+            return Err(EngineError::new(
+                ErrorClass::Conflict,
+                "sheet_not_deleted",
+                format!("restore_sheet: sheet {id} is not deleted (nothing to restore)"),
+            ));
+        }
         self.oplog.append(Op::RestoreSheet { id }).map_err(oplog_append_err)?;
         self.workbook.restore_sheet(id);
         Ok(())
@@ -537,6 +618,16 @@ impl EngineSession for WorkbookSession {
             return Err(EngineError::bad_argument(format!(
                 "move_sheet: index {index} out of range (workbook has {count} sheets)"
             )));
+        }
+        // F5: moving a sheet to its current display position is a no-op — skip
+        // the spurious `Op::MoveSheet` + version advance.
+        let current = self
+            .workbook
+            .sheet_display_order()
+            .iter()
+            .position(|&s| s == id);
+        if current == Some(index as usize) {
+            return Ok(());
         }
         self.oplog
             .append(Op::MoveSheet { id, new_index: index })
@@ -554,6 +645,12 @@ impl EngineSession for WorkbookSession {
 
     fn create_table(&mut self, spec: TableSpec) -> EngineResult<()> {
         self.ensure_ready()?;
+        // F6: `WorkbookRuntime::create_table` only checks `sheet(..).is_some()`,
+        // which still returns `Some` for a tombstoned sheet — so without this you
+        // could create a table on a deleted sheet (invisible to snapshot/
+        // list_sheets). Gate on the live sheet, consistent with the read/edit
+        // surface.
+        self.require_live_sheet(spec.sheet, "create_table")?;
         let TableSpec {
             name,
             sheet,
@@ -656,12 +753,19 @@ impl EngineSession for WorkbookSession {
     fn query_range(
         &self,
         range: CellRange,
-        _options: RangeQueryOptions,
+        options: RangeQueryOptions,
     ) -> EngineResult<RangeResult> {
-        // `_options` (include_formulas/formats/rendered) is reserved: the v1
-        // `RangeColumn` carries values only. Empty cells are `CellValue::Blank`
-        // (added inc.2c) so the columnar shape stays fixed-size.
         self.ensure_readable()?;
+        // F7 / No-Fallbacks: the v1 `RangeColumn` carries values only. If the
+        // caller requested extras we do not yet serve, fail loud rather than
+        // silently returning a narrower result than asked for. Empty cells are
+        // `CellValue::Blank` (added inc.2c) so the columnar shape stays
+        // fixed-size.
+        if options.include_formulas || options.include_formats || options.include_rendered {
+            return Err(not_implemented(
+                "query_range include_formulas/include_formats/include_rendered",
+            ));
+        }
         self.require_live_sheet(range.sheet, "query_range")?;
         let sheet = self
             .workbook
@@ -672,6 +776,11 @@ impl EngineSession for WorkbookSession {
                 "range end coordinate is before its start",
             ));
         }
+        // F4: reject out-of-grid corners (BadArgument). `Sheet::read` returns
+        // `Blank` out-of-bounds, and an `end = u32::MAX` span would overflow the
+        // `end - start + 1` arithmetic below before the cell-count cap.
+        Self::require_in_bounds(range.start_row, range.start_col, "query_range")?;
+        Self::require_in_bounds(range.end_row, range.end_col, "query_range")?;
         let n_rows = range.end_row - range.start_row + 1;
         let n_cols = range.end_col - range.start_col + 1;
         // Guard against an OOM on a pathological whole-sheet request (the read is
@@ -773,6 +882,7 @@ impl EngineSession for WorkbookSession {
     fn cell(&self, addr: CellAddr) -> EngineResult<Option<CellSnapshot>> {
         self.ensure_readable()?;
         self.require_live_sheet(addr.sheet, "cell")?;
+        Self::require_in_bounds(addr.row, addr.col, "cell")?; // F4
         Ok(self.build_cell_snapshot(addr.sheet, addr.row, addr.col))
     }
 
@@ -1431,5 +1541,109 @@ mod tests {
         // clear_formula strips the formula but preserves the scalar value.
         assert_eq!(after.formula, None);
         assert_eq!(after.value, Some(CellValue::Number { number: 3.0 }));
+    }
+
+    // --- Audit-fix coverage (2026-05-27 inc.2 audit) ---
+
+    /// F5: a double-delete is a TRUE no-op — it does NOT append a spurious
+    /// `Op::RemoveSheet` and does NOT advance the version token.
+    #[test]
+    fn double_delete_sheet_is_true_noop_no_version_advance() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        s.delete_sheet(sid).unwrap();
+        let v_after_delete = s.snapshot().unwrap().version;
+        // Second delete of the already-tombstoned sheet: Ok, but no op / no bump.
+        s.delete_sheet(sid).unwrap();
+        assert_eq!(
+            v_after_delete,
+            s.snapshot().unwrap().version,
+            "double-delete must not advance the version token"
+        );
+    }
+
+    /// F5: restoring a sheet that is NOT deleted is a Conflict, not a silent
+    /// no-op that appends a spurious `Op::RestoreSheet`.
+    #[test]
+    fn restore_of_live_sheet_is_conflict() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let err = s.restore_sheet(sid).unwrap_err();
+        assert_eq!(err.class, ErrorClass::Conflict);
+        assert_eq!(err.code, "sheet_not_deleted");
+        assert_eq!(v0, s.snapshot().unwrap().version, "no token advance on rejected restore");
+    }
+
+    /// F5: moving a sheet to its current position is a no-op (no token advance).
+    #[test]
+    fn move_sheet_to_current_index_is_noop() {
+        let mut s = WorkbookSession::new();
+        let a = s.add_sheet("A", 16384).unwrap();
+        s.add_sheet("B", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        s.move_sheet(a, 0).unwrap(); // A is already at index 0
+        assert_eq!(v0, s.snapshot().unwrap().version);
+    }
+
+    /// F6: structure edits on a tombstoned sheet are NotFound (rename + table).
+    #[test]
+    fn structure_edits_on_tombstoned_sheet_are_not_found() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        s.delete_sheet(sid).unwrap();
+        assert_eq!(s.rename_sheet(sid, "X").unwrap_err().code, "sheet_not_found");
+        let spec = TableSpec {
+            name: "T".into(),
+            sheet: sid,
+            top_row: 0,
+            top_col: 0,
+            rows: 2,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["C".into()],
+        };
+        assert_eq!(s.create_table(spec).unwrap_err().code, "sheet_not_found");
+    }
+
+    /// F4: read paths reject out-of-grid coordinates with BadArgument (rather
+    /// than silently reading Blank or overflowing the range span).
+    #[test]
+    fn read_paths_reject_out_of_grid_coordinates() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // cell: col beyond MAX_COLUMN.
+        let e = s.cell(addr(sheet, 0, ql_types::MAX_COLUMN + 1)).unwrap_err();
+        assert_eq!(e.class, ErrorClass::BadArgument);
+        // query_range: end_row = u32::MAX would overflow end - start + 1.
+        let e2 = s
+            .query_range(
+                CellRange { sheet, start_row: 0, start_col: 0, end_row: u32::MAX, end_col: 0 },
+                RangeQueryOptions::default(),
+            )
+            .unwrap_err();
+        assert_eq!(e2.class, ErrorClass::BadArgument);
+        // validate_formula: row beyond MAX_ROW.
+        let e3 = s
+            .validate_formula(addr(sheet, ql_types::MAX_ROW + 1, 0), "1+1")
+            .unwrap_err();
+        assert_eq!(e3.class, ErrorClass::BadArgument);
+    }
+
+    /// F7: query_range with an unsupported include option fails loud (Capability),
+    /// rather than silently serving a narrower values-only result.
+    #[test]
+    fn query_range_include_options_fail_loud() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let err = s
+            .query_range(
+                CellRange { sheet, start_row: 0, start_col: 0, end_row: 0, end_col: 0 },
+                RangeQueryOptions { include_formulas: true, ..Default::default() },
+            )
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Capability);
+        assert_eq!(err.code, "not_implemented_in_v1_core");
     }
 }

@@ -301,9 +301,22 @@ impl<'a> WorkbookRuntime<'a> {
                 reason: "defined-name with this canonical name already exists (rename target)",
             });
         }
-        // Op-log append BEFORE mutation (W5-103 atomicity). We emit
-        // RenameTable + N PutFormula ops; if the log append fails,
-        // no workbook state has changed yet.
+        // The structural `RenameTable` op is appended before any mutation.
+        //
+        // ⚠️ NOT fully append-before-mutate (2026-05-27 inc.2 audit, F10 / Codex
+        // HIGH): the per-formula `PutFormula` rewrite ops below are appended
+        // *interleaved* with their `put_formula` mutation inside the loop, so a
+        // mid-loop `oplog.append` failure would leave a partial log + partially
+        // rewritten workbook (and this `RenameTable` already appended) — i.e.
+        // NOT atomic, contrary to the original "no workbook state has changed
+        // yet" claim that stood here. Reachability is near-zero (`PutFormula`
+        // serializes a `String`; there is no NaN/Inf serde-failure path — only a
+        // Loro-internal/OOM failure triggers it), and the session surfaces the
+        // error to the caller. TRACKED FOLLOW-UP: collect the `RenameTable` + all
+        // `PutFormula` ops and emit one `Op::BatchCommit` *before* any
+        // `put_formula`, mirroring `rename_sheet` (`sheets.rs` BatchCommit path).
+        // `rename_column` below has the identical shape. See
+        // docs/audits/2026-05-27-inc2-session-audit/SYNTHESIS.md F10.
         if let Some(oplog) = self.oplog.as_deref_mut() {
             oplog.append(Op::RenameTable {
                 old_name: old_canonical.clone(),

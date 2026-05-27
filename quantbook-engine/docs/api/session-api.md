@@ -554,13 +554,17 @@ Ambiguities Codex flagged, resolved here:
 
 | Source enum (variant) | class | code | retryable |
 |-----------------------|-------|------|-----------|
-| `RuntimeError::InvalidSheet` (mutation target absent) | `NotFound` | `sheet_not_found` | no |
-| `RuntimeError::InvalidSheet` (FFI arg coercion) | `BadArgument` | `bad_argument` | no |
-| `RuntimeError::TableCreateRejected` (dup name) | `Conflict` | `table_exists` | no |
-| `RuntimeError::TableCreateRejected` (bad spec) | `BadArgument` | `bad_table_spec` | no |
+| `RuntimeError::InvalidSheet` | `NotFound` | `sheet_not_found` | no |
+| `RuntimeError::InvalidCell` | `BadArgument` | `bad_cell` | no |
+| `RuntimeError::TableCreateRejected` | `Conflict` | `table_create_rejected` | no |
+| `RuntimeError::TableResizeRejected` | `BadArgument` | `table_resize_rejected` | no |
+| `RuntimeError::TableColumnRejected` | `Conflict` | `table_column_rejected` | no |
 | `ReplayError::FormatNotRegistered` | `Protocol` | `format_not_registered` | no |
 | `ReplayError::InvalidSheet`/`InvalidCell` | `Protocol` | `replay_invalid_target` | no |
-| `OpLogError::*` | `Persistence`/`Protocol` | `oplog_*` | no |
+| `OpLogError::{Serialize}` | `BadArgument` | `oplog_serialize` | no |
+| `OpLogError::{Deserialize,SchemaMismatch,InvalidVersionVector}` | `Protocol` | `oplog_*` | no |
+| `OpLogError::{Loro,LoroEncode}` | `Internal` | `oplog_loro` | no |
+| `OpLogError` (future `#[non_exhaustive]` variant) | `Internal` | `unmapped_oplog_error` | no |
 | `PersistenceError::{Qbook,Oplog,UnsupportedVersion,TruncatedHeader}` | `Persistence` | `qbook_error`/`session_oplog`/`qbook_unsupported_version`/`qbook_truncated_header` | no |
 | `PersistenceError` (any future variant) | — | **must be added explicitly** (no `qbook_unknown` to callers) | — |
 | `TransportError::*` | `Capability`/`Internal` | `transport_*` (e.g. `transport_closed`) | maybe |
@@ -568,6 +572,29 @@ Ambiguities Codex flagged, resolved here:
 | version token decode failure | `Protocol` | `invalid_version_token` | no |
 | panic caught at boundary | `Internal` | `panic` | no |
 | operation canceled / deadline | `Canceled` | `canceled` / `deadline_exceeded` | yes |
+
+**Implementation-reality note (6.1B inc.2 audit, 2026-05-27 — F8):** the earlier draft
+split `InvalidSheet` and `TableCreateRejected` by *cause*, but the real enums do not
+carry that context, so the mapping is honest about what it can distinguish:
+- **`InvalidSheet` → `NotFound`/`sheet_not_found` uniformly.** The variant is
+  `{sheet, sheet_count}` with no producer context. The "FFI arg coercion →
+  `BadArgument`" case is caught at the **binding boundary** (argument validation,
+  `bad_argument`) and never produces `RuntimeError::InvalidSheet`, so a uniform
+  `NotFound` at the engine layer is correct. The session's own
+  `require_live_sheet`/range guards reject most bad ids before the runtime.
+- **`TableCreateRejected` → `Conflict`/`table_create_rejected` uniformly.** The
+  variant carries only `reason: &'static str`; a dup-name-vs-bad-spec split would
+  require string-matching the reason (brittle). TRACKED follow-up: introduce typed
+  `TableCreateRejected` sub-variants, then split to `table_exists` (Conflict) vs
+  `bad_table_spec` (BadArgument).
+- **`OpLogError` `#[non_exhaustive]` wildcard.** Rust *requires* a wildcard arm for a
+  foreign `#[non_exhaustive]` enum, so a future variant cannot be matched exhaustively.
+  The wildcard maps to a **coded** `Internal`/`unmapped_oplog_error` (loud, never a
+  generic `qbook_unknown`) — No-Fallbacks-compliant: it surfaces as a bug to fix, not
+  a silent swallow. All *current* `OpLogError` variants are mapped explicitly above.
+- Implemented as the free fns `ql-exec::session::{map_runtime_err, map_oplog_err}`
+  (orphan rules forbid `impl From<…> for EngineError`); the `RuntimeError` match is
+  in-crate + exhaustive (no wildcard) → a new variant is a compile error.
 
 ---
 
