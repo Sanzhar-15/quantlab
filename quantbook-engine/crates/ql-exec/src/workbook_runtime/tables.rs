@@ -263,12 +263,13 @@ impl<'a> WorkbookRuntime<'a> {
     /// Process:
     /// 1. Validate: source exists; target name available (TableTable +
     ///    NameTable shared namespace); not a no-op (same canonical name).
-    /// 2. Op-log append `Op::RenameTable` (before any mutation).
-    /// 3. Walk every formula cell; parse the text; rewrite via
-    ///    `ast::rewrite_table_ref`; if the AST changed, print it back
-    ///    and emit `Op::PutFormula` + update storage.
-    /// 4. Re-key the `TableTable` entry from old canonical to new
-    ///    canonical; update display_name.
+    /// 2. Walk every formula cell; rewrite via `rewrite_formula_text`; collect
+    ///    the rewrites.
+    /// 3. **Append-before-mutate (F10 fix):** emit ONE `Op::BatchCommit`
+    ///    (`[Op::RenameTable, Op::PutFormula × N]`) BEFORE any mutation, so a
+    ///    failing append leaves storage unchanged. Mirrors `rename_sheet`.
+    /// 4. Apply the formula-text mutations, then re-key the `TableTable` entry
+    ///    from old canonical to new canonical + update display_name.
     ///
     /// Returns the number of formula cells whose text was rewritten.
     ///
@@ -301,28 +302,19 @@ impl<'a> WorkbookRuntime<'a> {
                 reason: "defined-name with this canonical name already exists (rename target)",
             });
         }
-        // The structural `RenameTable` op is appended before any mutation.
+        // **F10 fix (2026-05-27 inc.2c — "ship F10 now"):** fully
+        // append-before-mutate. Collect the table re-key (`RenameTable`) AND
+        // every per-cell formula-text rewrite (`PutFormula`) into ONE
+        // `Op::BatchCommit`, appended BEFORE any `put_formula` mutation —
+        // mirroring `rename_sheet` (`sheets.rs` BatchCommit path). So a failing
+        // `oplog.append` (the only post-validation failure point —
+        // Loro-internal/OOM; `PutFormula` carries a `String`, no NaN/Inf serde
+        // path) leaves the workbook + table registry UNCHANGED. Replay applies
+        // the inner ops in order: re-key the table (`apply_rename_table` only
+        // re-keys metadata), then rewrite formula text via these explicit
+        // `PutFormula` ops — independent state, order-safe. Closes the F10
+        // tracked gap (docs/audits/2026-05-27-inc2-session-audit/SYNTHESIS.md).
         //
-        // ⚠️ NOT fully append-before-mutate (2026-05-27 inc.2 audit, F10 / Codex
-        // HIGH): the per-formula `PutFormula` rewrite ops below are appended
-        // *interleaved* with their `put_formula` mutation inside the loop, so a
-        // mid-loop `oplog.append` failure would leave a partial log + partially
-        // rewritten workbook (and this `RenameTable` already appended) — i.e.
-        // NOT atomic, contrary to the original "no workbook state has changed
-        // yet" claim that stood here. Reachability is near-zero (`PutFormula`
-        // serializes a `String`; there is no NaN/Inf serde-failure path — only a
-        // Loro-internal/OOM failure triggers it), and the session surfaces the
-        // error to the caller. TRACKED FOLLOW-UP: collect the `RenameTable` + all
-        // `PutFormula` ops and emit one `Op::BatchCommit` *before* any
-        // `put_formula`, mirroring `rename_sheet` (`sheets.rs` BatchCommit path).
-        // `rename_column` below has the identical shape. See
-        // docs/audits/2026-05-27-inc2-session-audit/SYNTHESIS.md F10.
-        if let Some(oplog) = self.oplog.as_deref_mut() {
-            oplog.append(Op::RenameTable {
-                old_name: old_canonical.clone(),
-                new_name: new_canonical.clone(),
-            })?;
-        }
         // Walk formula cells and rewrite. Collect first to avoid borrow
         // conflicts (iter holds &workbook; rewrite needs &mut workbook).
         let new_display_arc: Arc<str> = Arc::from(new_name);
@@ -332,31 +324,42 @@ impl<'a> WorkbookRuntime<'a> {
             .map(|(s, r, c, text)| (s, r, c, Arc::clone(text)))
             .collect();
         // V2 Tier H1 closure (2026-05-20): use the unified helper.
-        let mut rewritten = 0;
+        // `rewrite_formula_text` → None for malformed text OR no table ref match.
+        let mut rewritten_cells: Vec<(SheetId, RowId, ColId, String)> = Vec::new();
         for (s, r, c, text) in formulas {
-            let Some(new_text) = ql_formula_syntax::rewrite_formula_text(
+            if let Some(new_text) = ql_formula_syntax::rewrite_formula_text(
                 text.as_ref(),
                 ql_formula_syntax::NameRewrite::Table {
                     old_canonical: &old_canonical,
                     new_display: &new_display_arc,
                 },
-            ) else {
-                continue; // malformed OR no table reference matched
-            };
-            // Emit PutFormula so replay reconstructs the rewrite.
-            if let Some(oplog) = self.oplog.as_deref_mut() {
-                oplog.append(Op::PutFormula {
-                    sheet: s,
-                    row: r,
-                    col: c,
-                    text: new_text.clone(),
-                })?;
+            ) {
+                rewritten_cells.push((s, r, c, new_text));
             }
-            // Update workbook formula text directly (bypass set_formula
-            // to avoid re-running the bind eagerly; the recompute path
-            // will re-bind against the new name at next eval).
+        }
+        // Append-before-mutate: ONE BatchCommit = [RenameTable, PutFormula × N].
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            let mut ops: Vec<Op> = Vec::with_capacity(rewritten_cells.len() + 1);
+            ops.push(Op::RenameTable {
+                old_name: old_canonical.clone(),
+                new_name: new_canonical.clone(),
+            });
+            for (s, r, c, new_text) in &rewritten_cells {
+                ops.push(Op::PutFormula {
+                    sheet: *s,
+                    row: *r,
+                    col: *c,
+                    text: new_text.clone(),
+                });
+            }
+            oplog.append(Op::BatchCommit { ops })?;
+        }
+        // Apply the formula-text mutations (bypass set_formula to avoid eager
+        // re-bind; the recompute path re-binds against the new name at next
+        // eval). The table re-key happens just below.
+        let rewritten = rewritten_cells.len();
+        for (s, r, c, new_text) in rewritten_cells {
             self.workbook.put_formula(s, r, c, new_text);
-            rewritten += 1;
         }
         // Re-key the TableTable entry.
         let mut meta = self
@@ -395,14 +398,13 @@ impl<'a> WorkbookRuntime<'a> {
     /// 1. Validate: table exists; source column exists (case-insensitive);
     ///    target name available within the table; non-empty; not a no-op
     ///    (same lowercase canonical).
-    /// 2. Op-log append `Op::RenameColumn` (before any mutation).
-    /// 3. Walk every formula cell; parse the text; rewrite via
-    ///    `ast::rewrite_column_ref` (scoped to refs matching the
-    ///    canonical table name); if the AST changed, print + emit
-    ///    `Op::PutFormula` + update storage.
-    /// 4. Mutate the matching `TableColumn` entry's lowercase canonical
-    ///    `name` and case-preserving `display`; bump TableTable
-    ///    generation so plan caches invalidate.
+    /// 2. Walk every formula cell; rewrite via `rewrite_formula_text` (scoped to
+    ///    refs matching the canonical table name); collect the rewrites.
+    /// 3. **Append-before-mutate (F10 fix):** emit ONE `Op::BatchCommit`
+    ///    (`[Op::RenameColumn, Op::PutFormula × N]`) BEFORE any mutation.
+    /// 4. Apply the formula-text mutations, then mutate the matching
+    ///    `TableColumn` entry's lowercase canonical `name` + case-preserving
+    ///    `display`; bump TableTable generation so plan caches invalidate.
     ///
     /// Returns the number of formula cells whose text was rewritten.
     /// Cross-table isolation: structured refs to OTHER tables pass
@@ -453,16 +455,13 @@ impl<'a> WorkbookRuntime<'a> {
                 reason: "column with this canonical name already exists (rename target)",
             });
         }
-        // Op-log append BEFORE mutation (W5-103 atomicity). RenameColumn
-        // + N PutFormula ops; if the log append fails, no workbook state
-        // has changed yet.
-        if let Some(oplog) = self.oplog.as_deref_mut() {
-            oplog.append(Op::RenameColumn {
-                table: table_canonical.clone(),
-                old_name: old_col.to_owned(),
-                new_name: new_col.to_owned(),
-            })?;
-        }
+        // **F10 fix (2026-05-27 inc.2c — "ship F10 now"):** fully
+        // append-before-mutate, mirroring `rename_table` above + `rename_sheet`.
+        // Collect `RenameColumn` + every `PutFormula` rewrite into ONE
+        // `Op::BatchCommit` appended BEFORE any `put_formula`, so a failing
+        // append (Loro-internal/OOM only — PutFormula carries a String) leaves
+        // the workbook + table metadata UNCHANGED.
+        //
         // Walk formula cells and rewrite. Collect first to avoid borrow
         // conflicts (iter holds &workbook; rewrite needs &mut workbook).
         let new_display_arc: Arc<str> = Arc::from(new_col);
@@ -472,28 +471,41 @@ impl<'a> WorkbookRuntime<'a> {
             .map(|(s, r, c, text)| (s, r, c, Arc::clone(text)))
             .collect();
         // V2 Tier H1 closure (2026-05-20): use the unified helper.
-        let mut rewritten = 0;
+        // `rewrite_formula_text` → None for malformed text OR no column match.
+        let mut rewritten_cells: Vec<(SheetId, RowId, ColId, String)> = Vec::new();
         for (s, r, c, text) in formulas {
-            let Some(new_text) = ql_formula_syntax::rewrite_formula_text(
+            if let Some(new_text) = ql_formula_syntax::rewrite_formula_text(
                 text.as_ref(),
                 ql_formula_syntax::NameRewrite::Column {
                     table_canonical_upper: &table_canonical,
                     old_col,
                     new_display: &new_display_arc,
                 },
-            ) else {
-                continue; // malformed OR no column reference matched
-            };
-            if let Some(oplog) = self.oplog.as_deref_mut() {
-                oplog.append(Op::PutFormula {
-                    sheet: s,
-                    row: r,
-                    col: c,
-                    text: new_text.clone(),
-                })?;
+            ) {
+                rewritten_cells.push((s, r, c, new_text));
             }
+        }
+        // Append-before-mutate: ONE BatchCommit = [RenameColumn, PutFormula × N].
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            let mut ops: Vec<Op> = Vec::with_capacity(rewritten_cells.len() + 1);
+            ops.push(Op::RenameColumn {
+                table: table_canonical.clone(),
+                old_name: old_col.to_owned(),
+                new_name: new_col.to_owned(),
+            });
+            for (s, r, c, new_text) in &rewritten_cells {
+                ops.push(Op::PutFormula {
+                    sheet: *s,
+                    row: *r,
+                    col: *c,
+                    text: new_text.clone(),
+                });
+            }
+            oplog.append(Op::BatchCommit { ops })?;
+        }
+        let rewritten = rewritten_cells.len();
+        for (s, r, c, new_text) in rewritten_cells {
             self.workbook.put_formula(s, r, c, new_text);
-            rewritten += 1;
         }
         // Mutate the column metadata in place.
         let meta = self
@@ -1179,15 +1191,29 @@ mod tests {
             let _ = rt.rename_table("S", "T").unwrap();
         }
         let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
-        // CreateTable + PutFormula + RenameTable + PutFormula (rewrite).
-        assert_eq!(ops.len(), 4, "got {ops:?}");
-        assert!(matches!(&ops[2], Op::RenameTable { old_name, new_name }
+        // **F10 fix:** the rename is now ONE atomic `Op::BatchCommit`
+        // ([RenameTable, PutFormula rewrite]) appended before any mutation, NOT
+        // separate interleaved ops. So the log is CreateTable + PutFormula
+        // (set_formula) + ONE BatchCommit = 3 top-level ops.
+        assert_eq!(
+            ops.len(),
+            3,
+            "rename_table must emit ONE BatchCommit (F10 atomicity), got {ops:?}"
+        );
+        let inner = match &ops[2] {
+            Op::BatchCommit { ops } => ops,
+            other => panic!("expected an atomic BatchCommit for the rename, got {other:?}"),
+        };
+        assert_eq!(
+            inner.len(),
+            2,
+            "BatchCommit = [RenameTable, PutFormula], got {inner:?}"
+        );
+        assert!(matches!(&inner[0], Op::RenameTable { old_name, new_name }
             if old_name == "S" && new_name == "T"));
-        match &ops[3] {
-            Op::PutFormula { text, .. } => {
-                assert!(text.contains('T'));
-            }
-            other => panic!("expected PutFormula for rewrite, got {other:?}"),
+        match &inner[1] {
+            Op::PutFormula { text, .. } => assert!(text.contains('T')),
+            other => panic!("expected PutFormula rewrite inside the BatchCommit, got {other:?}"),
         }
     }
 
@@ -1536,18 +1562,32 @@ mod tests {
             assert_eq!(n, 1);
         }
         let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
-        // CreateTable + PutFormula + RenameColumn + PutFormula (rewrite).
-        assert_eq!(ops.len(), 4, "got {ops:?}");
+        // **F10 fix:** ONE atomic `Op::BatchCommit` ([RenameColumn, PutFormula
+        // rewrite]); log = CreateTable + PutFormula (set_formula) + BatchCommit.
+        assert_eq!(
+            ops.len(),
+            3,
+            "rename_column must emit ONE BatchCommit (F10 atomicity), got {ops:?}"
+        );
+        let inner = match &ops[2] {
+            Op::BatchCommit { ops } => ops,
+            other => panic!("expected an atomic BatchCommit for the rename, got {other:?}"),
+        };
+        assert_eq!(
+            inner.len(),
+            2,
+            "BatchCommit = [RenameColumn, PutFormula], got {inner:?}"
+        );
         assert!(
-            matches!(&ops[2], Op::RenameColumn { table, old_name, new_name }
+            matches!(&inner[0], Op::RenameColumn { table, old_name, new_name }
             if table == "S" && old_name == "Q" && new_name == "R")
         );
-        match &ops[3] {
+        match &inner[1] {
             Op::PutFormula { text, .. } => {
                 assert!(text.contains('R'), "text: {text}");
                 assert!(!text.contains('Q'), "text: {text}");
             }
-            other => panic!("expected PutFormula for rewrite, got {other:?}"),
+            other => panic!("expected PutFormula rewrite inside the BatchCommit, got {other:?}"),
         }
     }
 

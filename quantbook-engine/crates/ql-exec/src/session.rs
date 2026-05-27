@@ -397,15 +397,15 @@ impl WorkbookSession {
 
     /// Collapse all op-log commits produced by `f` into ONE undo unit
     /// (inc.2c-6, HARD QUESTION 1). Most commands already produce exactly one
-    /// Loro commit, so they do NOT use this. The exceptions are `rename_table`
-    /// and `rename_column`, whose `WorkbookRuntime` producers append the
-    /// structural rename op AND one `Op::PutFormula` per rewritten formula cell
-    /// as SEPARATE `oplog.append` calls (= separate commits; see `tables.rs`
-    /// F10) — so with `set_merge_interval(0)` they would otherwise split into
-    /// N+1 undo units. Bracketing them in a Loro undo group makes one `undo()`
-    /// revert the whole rename. `group_end` is infallible (a no-op without a
+    /// Loro commit, so they do NOT use this — and as of the inc.2c (F10) fix,
+    /// `rename_table`/`rename_column` now ALSO emit a single `Op::BatchCommit`
+    /// (one commit), so this wrapper is **defense-in-depth, not load-bearing**:
+    /// it keeps them one undo unit even if a future change reintroduces a
+    /// multi-`oplog.append` shape. `group_end` is infallible (a no-op without a
     /// matching `group_start`); we run it on BOTH the success and error paths so
-    /// a failing `f` cannot leave a dangling open group.
+    /// a failing `f` cannot leave a dangling open group. (Once the codebase is
+    /// confident no command will ever multi-append, this helper + its two call
+    /// sites can be deleted.)
     fn grouped<R>(&mut self, f: impl FnOnce(&mut Self) -> EngineResult<R>) -> EngineResult<R> {
         // A failed `group_start` is a Loro-internal fault (e.g. a group already
         // open — unreachable from the single-writer session) → loud, not
@@ -1165,10 +1165,11 @@ impl EngineSession for WorkbookSession {
 
     fn rename_table(&mut self, old_name: &str, new_name: &str) -> EngineResult<()> {
         self.ensure_ready()?;
-        // HARD QUESTION 1: `rename_table`'s producer appends `Op::RenameTable`
-        // plus one `Op::PutFormula` per rewritten formula cell as separate
-        // commits (tables.rs F10) → N+1 undo units under merge_interval(0). Group
-        // them so one `undo()` reverts the whole rename.
+        // `rename_table`'s producer now emits ONE `Op::BatchCommit`
+        // ([RenameTable, PutFormula × N]) after the F10 fix (tables.rs) → already
+        // one commit = one undo unit. The `grouped()` wrapper is defense-in-depth
+        // (see its doc): it keeps this one undo unit even if the producer ever
+        // regresses to a multi-append shape.
         self.grouped(|s| {
             s.with_runtime(|rt| rt.rename_table(old_name, new_name))
                 .map(|_affected| ())
@@ -1180,8 +1181,9 @@ impl EngineSession for WorkbookSession {
 
     fn rename_column(&mut self, table: &str, old_col: &str, new_col: &str) -> EngineResult<()> {
         self.ensure_ready()?;
-        // HARD QUESTION 1: identical multi-commit shape to `rename_table`
-        // (`Op::RenameColumn` + per-cell `Op::PutFormula`) → group into one unit.
+        // Same as `rename_table`: the producer now emits ONE `Op::BatchCommit`
+        // ([RenameColumn, PutFormula × N]) after the F10 fix; `grouped()` is
+        // defense-in-depth (already one undo unit).
         self.grouped(|s| {
             s.with_runtime(|rt| rt.rename_column(table, old_col, new_col))
                 .map(|_affected| ())
@@ -4103,13 +4105,12 @@ mod tests {
             .expect("undo of table rename must restore the old table name");
     }
 
-    /// HARD QUESTION 1 (table-rename grouping proof): a `rename_table` of a table
-    /// that has a formula REFERENCING it appends `Op::RenameTable` + one
-    /// `Op::PutFormula` (the rewritten reference) as SEPARATE commits. The
-    /// `grouped` wrapper collapses them into ONE undo unit, so a single `undo()`
-    /// reverts the entire rename (table name AND the rewritten formula text).
-    /// Without grouping this would take two `undo()` calls and leave a torn
-    /// intermediate state.
+    /// Table-rename undo is ONE unit: a `rename_table` of a table that has a
+    /// formula REFERENCING it emits ONE `Op::BatchCommit`
+    /// (`[RenameTable, PutFormula]`) after the F10 fix → already one commit = one
+    /// undo unit (and the `grouped` wrapper is defense-in-depth). A single
+    /// `undo()` reverts the entire rename (table name AND the rewritten formula
+    /// text), never a torn intermediate state.
     #[test]
     fn undo_table_rename_with_formula_ref_is_one_unit() {
         let mut s = WorkbookSession::new();

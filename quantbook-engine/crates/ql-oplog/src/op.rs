@@ -431,9 +431,12 @@ pub enum Op {
     /// Producer side ALSO rewrites stored formula text (Excel canon —
     /// per design § 12.2). The op carries `old_name` so replay can
     /// re-key the `TableTable` entry; producer-side formula-text
-    /// rewrites land as accompanying `Op::PutFormula` entries in the
-    /// same op-log sequence (no `BatchCommit` wrapper today; relies on
-    /// replay-order determinism).
+    /// rewrites land as accompanying `Op::PutFormula` entries. **As of the
+    /// F10 fix (2026-05-27), `WorkbookSession`/`WorkbookRuntime::rename_table`
+    /// wraps `[RenameTable, PutFormula × N]` in a single `Op::BatchCommit`**
+    /// (append-before-mutate atomicity, mirroring `rename_sheet`); replay
+    /// applies the inner ops in order (re-key, then rewrite text — complementary,
+    /// since `apply_rename_table` only re-keys metadata).
     ///
     /// Replay validates: target name available (NameTable + TableTable),
     /// source name exists. Sheet-scoped names use the workbook's

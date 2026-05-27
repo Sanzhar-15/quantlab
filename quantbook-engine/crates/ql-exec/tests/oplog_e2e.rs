@@ -699,6 +699,71 @@ fn rename_column_op_log_replay_reconstructs_rename() {
     );
 }
 
+/// **F10 fix e2e (2026-05-27):** rename_table now emits ONE atomic
+/// `Op::BatchCommit` (`[RenameTable, PutFormula × N]`); replay against a fresh
+/// workbook reconstructs BOTH the renamed table metadata AND the rewritten
+/// formula text, so post-replay recompute_all evaluates the SUM correctly under
+/// the new table name. Symmetric with `rename_column_op_log_replay_reconstructs_rename`;
+/// proves the BatchCommit-wrapped rename round-trips identically to the old
+/// separate-ops shape.
+#[test]
+fn rename_table_op_log_replay_reconstructs_rename() {
+    use ql_oplog::Op;
+    let mut producer_wb = fresh_wb();
+    let reg = default_registry();
+    let mut producer_oplog = OpLog::new();
+    {
+        let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut producer_oplog);
+        rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+            .unwrap();
+        rt.set_value(0, 1, 0, Value::Number(50.0)).unwrap();
+        rt.set_value(0, 2, 0, Value::Number(75.0)).unwrap();
+        let _ = rt.set_formula(0, 10, 0, "SUM(Sales[Qty])").unwrap();
+        let n = rt.rename_table("Sales", "Revenue").unwrap();
+        assert_eq!(n, 1, "one formula rewritten");
+    }
+    assert_eq!(
+        producer_wb.read(Address::new(0, 10, 0)),
+        Value::Number(125.0)
+    );
+    // The rename is ONE atomic op-log entry (F10): a single BatchCommit.
+    let ops: Vec<Op> = producer_oplog.iter().collect::<Result<_, _>>().unwrap();
+    assert!(
+        matches!(ops.last(), Some(Op::BatchCommit { .. })),
+        "rename_table must emit one atomic BatchCommit, got {:?}",
+        ops.last()
+    );
+
+    let mut replay_wb = fresh_wb();
+    replay_into(&producer_oplog, &mut replay_wb, &reg).unwrap();
+    // Table metadata reflects rename.
+    assert!(
+        replay_wb.lookup_table("Revenue").is_some(),
+        "renamed table visible on replay"
+    );
+    assert!(
+        replay_wb.lookup_table("Sales").is_none(),
+        "old table name gone on replay"
+    );
+    // Formula text reflects rewrite.
+    let text = replay_wb
+        .formula_at(0, 10, 0)
+        .expect("formula present")
+        .clone();
+    assert!(text.contains("Revenue"), "got: {text}");
+    assert!(!text.contains("Sales"), "got: {text}");
+    // Recompute produces the same value as the producer.
+    {
+        let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
+        assert!(rt.recompute_all().is_complete());
+    }
+    assert_eq!(
+        replay_wb.read(Address::new(0, 10, 0)),
+        Value::Number(125.0),
+        "post-replay SUM(Revenue[Qty]) matches producer"
+    );
+}
+
 /// **W5-122 (Phase 4.8.J) e2e:** resize_table emits `Op::ResizeTable`;
 /// replay against a fresh workbook reconstructs the new dimensions +
 /// new column roster; post-replay recompute_all picks up the resized
