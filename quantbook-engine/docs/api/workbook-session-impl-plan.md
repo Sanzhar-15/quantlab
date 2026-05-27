@@ -1,25 +1,23 @@
 # 6.1B Increment 2 — `WorkbookSession` Implementation Plan
 
 **Status:** ⏳ IN PROGRESS — **2b/2c-1/2c-2 + audit-fix SHIPPED 2026-05-26; the 2026-05-27 inc.2 audit
-(F3–F10) + inc.2c-3 `snapshot_delta` SHIPPED 2026-05-27.** Chain: `83b1b33bac2` PlanCache →
-`7335a5a1bfa` core → `993492b6f9b` validate_formula/query_range/`CellValue::Blank` → `2b5e7a13f5b`
-delete/restore/move sheet + tables → `9f7a1645dbd` tombstone-read fix → **`879f3601747` inc.2 audit-fix
-(F3 panic-guard / F4 read-path bounds / F5 tombstone op-log fidelity / F6 require_live_sheet on
-rename+create_table / F7 query_range options fail-loud / F8 Appendix-A / F9–F10 docs)** → **`20427b1c4c7`
-inc.2c-3 snapshot_delta**. `WorkbookSession` is in `crates/ql-exec/src/session.rs`; **ql-exec lib 667/0,
-clippy clean, workspace `cargo check` green.**
+(F3–F10) + inc.2c-3 `snapshot_delta` + inc.2c-4 `batch` + inc.2c-5 transaction handle SHIPPED 2026-05-27.**
+Chain: `83b1b33bac2` PlanCache → `7335a5a1bfa` core → `993492b6f9b` validate_formula/query_range/
+`CellValue::Blank` → `2b5e7a13f5b` delete/restore/move sheet + tables → `9f7a1645dbd` tombstone-read fix →
+**`879f3601747` inc.2 audit-fix (F3–F10)** → **`20427b1c4c7` inc.2c-3 snapshot_delta** → **`58a55f4cfb8`
++ `9d471be3663` inc.2c-4 batch** → **inc.2c-5 transaction handle (this commit)**. `WorkbookSession` is in
+`crates/ql-exec/src/session.rs`; **ql-exec lib 691/0, clippy clean, workspace `cargo check` green.**
 
 ### Method status — what the next window inherits (REAL vs surfaced-not-yet)
 **REAL (implemented + tested):** `lifecycle_state`, `close`; `set_value`, `set_formula`, `clear`,
 `set_format`, `register_format`, `validate_formula`; `add_sheet`, `rename_sheet`, `delete_sheet`,
 `restore_sheet`, `move_sheet`, `set_name`; `create_table`/`rename_table`/`rename_column`/`resize_table`/
-`drop_table`; **`batch`** (inc.2c-4); `recalc_dirty`, `recalc_all`, `mark_volatiles_dirty`; `query_range`,
-`snapshot`, **`snapshot_delta`**, `cell`, `list_sheets`; `cancel`, `operation_status`, `poll_events`.
-(Construction: `new`/`from_workbook`.)
+`drop_table`; **`batch`** (inc.2c-4); **`begin_transaction`/`txn_add`/`commit_transaction`/
+`rollback_transaction`** (inc.2c-5 — the multi-call handle); `recalc_dirty`, `recalc_all`,
+`mark_volatiles_dirty`; `query_range`, `snapshot`, **`snapshot_delta`**, `cell`, `list_sheets`; `cancel`,
+`operation_status`, `poll_events`. (Construction: `new`/`from_workbook`.)
 **DEFERRED — return `EngineError{class:Capability, code:"not_implemented_in_v1_core"}` (honest, never a
-fallback):** `open`/`import`/`save`/`export` (persistence);
-`begin_transaction`/`txn_add`/`commit_transaction`/`rollback_transaction` (the multi-call handle — needs
-the two NEW `WorkbookSession` fields `txns`/`next_txn_id`, out of scope for inc.2c-4); `undo`/`redo`
+fallback):** `open`/`import`/`save`/`export` (persistence); `undo`/`redo`
 (`can_undo`/`can_redo` return `false`); `register_function`/`unregister_function`/`list_functions` (6.4);
 `write_range`/`publish_dataset`/`bind_range`/`refresh_source`/`materialize_query` (6.4/6.5).
 
@@ -44,9 +42,12 @@ the two NEW `WorkbookSession` fields `txns`/`next_txn_id`, out of scope for inc.
   one `Op::BatchCommit` before any `put_formula`, mirroring `rename_sheet`. The misleading comment is
   corrected; the fix is deferred. See `docs/audits/2026-05-27-inc2-session-audit/SYNTHESIS.md`.
 
-**Remaining sequence (NEXT):** txn-handle (begin/txn_add/commit/rollback — needs new struct fields) →
-undo/redo → persistence → functions → reserved bulk → Node smoke migration (+ pending `.node` rebuild +
-B#1/S2-01 mocha tests) → 6.1C audit. (`batch` SHIPPED inc.2c-4.)
+**Remaining sequence (NEXT):** undo/redo (design-gated: workbook+graph reversion via
+`rebuild_from_workbook` after the Loro undo; `bump_epoch` already wired) → persistence → functions →
+reserved bulk → Node smoke migration (+ pending `.node` rebuild + B#1/S2-01 mocha tests) → 6.1C audit.
+(`batch` SHIPPED inc.2c-4; the multi-call **transaction handle** SHIPPED inc.2c-5 — a pure `SessionOp`
+buffer that commits through the same `batch` machinery; parallel Codex+Opus audit clean, synthesis
+`docs/audits/2026-05-27-inc2c5-txn-audit/SYNTHESIS.md`.)
 
 > **✅ `batch` SHIPPED inc.2c-4 (2026-05-27) — OPTION (a) chosen.** Both tensions resolved; the
 > multi-call transaction handle stays deferred (see below).
@@ -105,11 +106,19 @@ B#1/S2-01 mocha tests) → 6.1C audit. (`batch` SHIPPED inc.2c-4.)
 > workbook + token unchanged). +3 session tests (formula-then-value → Conflict; value-then-clear →
 > Conflict; value+format → OK, both land).
 >
-> **STILL DEFERRED — the multi-call handle** (`begin_transaction`/`txn_add`/`commit_transaction`/
-> `rollback_transaction`) needs two NEW `WorkbookSession` fields (`txns: HashMap<TransactionId,
-> Vec<SessionOp>>`, `next_txn_id: u64`) not in the struct yet (impl-plan §2 sketched them; inc.2b/2c
-> shipped without). It will buffer `SessionOp`s and call into the same `batch` machinery on commit.
-> **Undo/redo (next) hits the same graph-reversion question** — undo retracts ops but the workbook +
+> **✅ SHIPPED inc.2c-5 — the multi-call handle** (`begin_transaction`/`txn_add`/`commit_transaction`/
+> `rollback_transaction`). Added the two `WorkbookSession` fields (`txns: HashMap<TransactionId,
+> Vec<SessionOp>>`, `next_txn_id: u64`). The handle is a **pure `SessionOp` buffer holding no engine
+> borrow**; `commit_transaction` drains it through the SAME `batch` machinery (inheriting
+> validation-atomicity, graph consistency, one `Op::BatchCommit`, single state tick, and the same-cell
+> conflict guard `conflicting_batch_ops`). No lock between begin and commit → the buffer is validated at
+> **commit time**. `begin`/`txn_add`/`commit` require `Ready`; `rollback` is ungated (cleanup). A failed
+> commit leaves the transaction OPEN (the buffer is restored — `batch` is validation-atomic so nothing
+> applied). `close` drops all buffers. Unknown handle → fail-loud `NotFound`/`transaction_not_found`;
+> id-space exhaustion → loud `Internal`/`transaction_id_exhausted` (never wraps). 10 session tests;
+> parallel Codex+Opus audit clean (no HIGH; one MED + two LOW applied — see
+> `docs/audits/2026-05-27-inc2c5-txn-audit/SYNTHESIS.md`).
+> **Undo/redo (NEXT) hits the graph-reversion question** — undo retracts ops but the workbook +
 > graph must be rebuilt to the pre-op state (likely `rebuild_from_workbook` after a Loro undo);
 > `bump_epoch` is already wired for it.
 
@@ -154,11 +163,17 @@ B#1/S2-01 mocha tests) → 6.1C audit. (`batch` SHIPPED inc.2c-4.)
 6. ✅ **`batch`** (SHIPPED inc.2c-4) — option (a): validate-all → build ONE `Op::BatchCommit` from
    pre-batch state → append-before-mutate → apply via a graph-maintaining runtime with the op-log
    DETACHED (new `WorkbookRuntime::with_session_state_no_oplog`) → `record_changes` once. All four
-   `SessionOp` variants covered; `state_seq` advances exactly one tick. **Transactions** (the multi-call
-   `begin/txn_add/commit/rollback` handle) + **`undo`/`redo`** (needs `OpLog::new_undo_manager`) +
-   **persistence** (`open`/`import`/`save`/`export` via `ql_io` — adds `PersistenceError` mapping to
-   Appendix A) remain.
-7. **functions** (6.4) + **reserved bulk** (6.4/6.5).
+   `SessionOp` variants covered; `state_seq` advances exactly one tick.
+7. ✅ **transaction handle** (SHIPPED inc.2c-5) — the multi-call
+   `begin_transaction`/`txn_add`/`commit_transaction`/`rollback_transaction`. New fields `txns`/
+   `next_txn_id`; a pure `SessionOp` buffer (no engine borrow) committed through the same `batch`
+   machinery (inherits validation-atomicity + conflict guard); validated at commit time; failed commit
+   keeps the txn open; fail-loud unknown handle / id-exhaustion. Codex+Opus audit clean.
+8. **`undo`/`redo`** (NEXT — needs `OpLog::new_undo_manager`; design-gated on workbook+graph reversion via
+   `rebuild_from_workbook` after the Loro undo; `bump_epoch` already wired) + **persistence**
+   (`open`/`import`/`save`/`export` via `ql_io` — adds `PersistenceError` mapping to Appendix A; also
+   where the `set_value(Blank)`-durability + F10 table-rename-atomicity replay gaps get fixed).
+9. **functions** (6.4) + **reserved bulk** (6.4/6.5).
 
 ---
 

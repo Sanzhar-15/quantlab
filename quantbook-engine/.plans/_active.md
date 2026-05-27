@@ -75,16 +75,28 @@ status: |
   >1 value/formula op per cell with `Conflict/conflicting_batch_ops` (SetFormat orthogonal). ql-exec lib
   681/0, clippy clean, workspace green.
 
-  ⭐ NEXT = 6.1B txn-handle OR undo/redo — **follow `docs/api/workbook-session-impl-plan.md` §0**.
+  ✅ 6.1B inc.2c-5 transaction handle SHIPPED 2026-05-27. The multi-call
+  begin_transaction/txn_add/commit_transaction/rollback_transaction. Added the two `WorkbookSession`
+  fields (`txns: HashMap<TransactionId, Vec<SessionOp>>`, `next_txn_id: u64`); a pure `SessionOp` buffer
+  (no engine borrow) committed through the SAME `batch` machinery (inherits validation-atomicity, graph
+  consistency, one BatchCommit, single state_seq tick, the same-cell conflict guard). No lock between
+  begin/commit → validated at commit time. begin/txn_add/commit require Ready; rollback ungated (cleanup);
+  close drops buffers. Failed commit keeps the txn OPEN (buffer restored — batch is validation-atomic).
+  Unknown handle → fail-loud NotFound/transaction_not_found; id exhaustion → loud Internal/
+  transaction_id_exhausted (checked_add, never wraps). 10 session tests; parallel Codex(gpt-5.5 xhigh)+Opus
+  audit CLEAN — no HIGH; both converged on 1 MED (gate txn_add on ensure_ready — APPLIED) + 2 LOW
+  (next_txn_id checked_add — APPLIED; oplog-len test assertions — APPLIED). Synthesis
+  `docs/audits/2026-05-27-inc2c5-txn-audit/SYNTHESIS.md`. ql-exec lib 691/0, clippy clean, workspace green.
+
+  ⭐ NEXT = 6.1B undo/redo — **follow `docs/api/workbook-session-impl-plan.md` §0**.
   Remaining, surfaced as `Capability/not_implemented_in_v1_core` (honest, No-Fallbacks):
-  (6a) multi-call txn handle (begin/txn_add/commit/rollback) — needs NEW `txns: HashMap<TransactionId,
-  Vec<SessionOp>>` + `next_txn_id: u64` struct fields; buffers SessionOps then reuses the SAME `batch`
-  machinery on commit (smallest next step). (6b) undo/redo (OpLog undo manager) — DESIGN-GATED: workbook +
-  calcgraph must revert to pre-op state (likely `rebuild_from_workbook` after the Loro undo); `bump_epoch`
-  already wired. (6c) persistence (open/import/save/export via ql_io → adds PersistenceError to Appendix
-  A; also fixes the set_value(Blank)-durability + F10 table-rename-atomicity replay gaps). (7) functions
-  (6.4) + reserved bulk (6.4/6.5). Then Node smoke-path migration + 6.1C audit. Do NOT freeze the
-  CollabSession CRDT façade (collab = v1.5). Also pending: the napi `.node` rebuild + B#1/S2-01 mocha tests.
+  (8a) undo/redo (OpLog undo manager) — DESIGN-GATED: workbook + calcgraph must revert to pre-op state
+  (likely `rebuild_from_workbook` after the Loro undo); `bump_epoch` already wired; empty stack →
+  consumed:false (NOT an error). (8b) persistence (open/import/save/export via ql_io → adds
+  PersistenceError to Appendix A; also fixes the set_value(Blank)-durability + F10 table-rename-atomicity
+  replay gaps). (9) functions (6.4) + reserved bulk (6.4/6.5). Then Node smoke-path migration + 6.1C audit.
+  Do NOT freeze the CollabSession CRDT façade (collab = v1.5). Also pending: the napi `.node` rebuild +
+  B#1/S2-01 mocha tests.
 date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-26_phase-5-7-v3-6-1-delta-consumer-backlog.md (V3.6.1 backlog mini-phase, SUPERSEDED by Phase 5 COMPLETE)
 parent_phase: 6 Product Surfaces
@@ -125,8 +137,12 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
    - ✅ **inc.2c-4 (`58a55f4cfb8` + fix `9d471be3663`)**: `batch(ops, options)` — option (a)
      (validate-all → one `Op::BatchCommit` → detached-oplog graph-maintaining apply → `record_changes`
      once); all 4 SessionOp variants; rejects same-cell value/formula conflicts.
-   - ⭐ **NEXT**: multi-call txn handle (begin/txn_add/commit/rollback — new `txns`/`next_txn_id` fields,
-     reuses `batch`) OR undo/redo (design-gated: workbook+graph reversion) → persistence → functions/bulk.
+   - ✅ **inc.2c-5 (this commit)**: multi-call **transaction handle** (begin/txn_add/commit/rollback) —
+     new `txns`/`next_txn_id` fields; pure `SessionOp` buffer committed through the same `batch`
+     machinery; validated at commit time; failed commit keeps the txn open; fail-loud unknown handle /
+     id-exhaustion. Parallel Codex+Opus audit clean (no HIGH; 1 MED + 2 LOW applied).
+   - ⭐ **NEXT**: undo/redo (design-gated: workbook+graph reversion via `rebuild_from_workbook` after the
+     Loro undo; `bump_epoch` wired; empty stack → consumed:false) → persistence → functions/bulk.
      See `workbook-session-impl-plan.md` §0. Then migrate the Node smoke path. Leave
      collab/transport/presence feature-gated.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).

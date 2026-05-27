@@ -23,12 +23,14 @@
 //!   change-log design (a)),
 //! - operations + events (`cancel`/`operation_status`/`poll_events`).
 //!
-//! The remaining contract methods return a **surfaced** `Capability` /
+//! `batch` (inc.2c-4) + the multi-call **transaction handle** (`begin_transaction`/
+//! `txn_add`/`commit_transaction`/`rollback_transaction`, inc.2c-5 — a pure
+//! `SessionOp` buffer that commits through the same `batch` machinery) are also
+//! real. The remaining contract methods return a **surfaced** `Capability` /
 //! `not_implemented_in_v1_core` error (NOT a silent fallback — project
 //! No-Fallbacks rule) and land in later inc.2 sub-increments:
 //! - persistence (`open`/`import`/`save`/`export`),
-//! - `batch`/transactions, `undo`/`redo`, function registration (6.4),
-//!   reserved bulk ops (6.4/6.5).
+//! - `undo`/`redo`, function registration (6.4), reserved bulk ops (6.4/6.5).
 //!
 //! ## Two design facts that shape this increment
 //!
@@ -76,8 +78,8 @@ use ql_oplog::Op;
 use ql_session::dto::{
     BatchOptions, BatchResult, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue,
     ChangedCell, DateSystem, Diagnostic, DirtyResult, FormatDef, FormatId, FullRebuildReason,
-    PublishedRef, RangeColumn, RangeQueryOptions, RangeResult, RemovedCell, Severity,
-    SessionVersion, SheetInfo, SheetSnapshot, TableSpec, UndoRedoResult, WorkbookSnapshot,
+    PublishedRef, RangeColumn, RangeQueryOptions, RangeResult, RemovedCell, SessionVersion,
+    Severity, SheetInfo, SheetSnapshot, TableSpec, UndoRedoResult, WorkbookSnapshot,
     WorkbookSnapshotDelta, WriteRangeResult,
 };
 use ql_session::error::{EngineError, EngineResult, ErrorClass};
@@ -117,7 +119,11 @@ const CHANGE_LOG_CAP: usize = 1 << 16;
 #[derive(Clone, Copy, Debug)]
 enum SessionChange {
     /// A cell whose value/formula/format may have changed (resolved at delta time).
-    Cell { sheet: SheetId, row: RowId, col: ColId },
+    Cell {
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+    },
     /// A sheet added / renamed (resolved to a full `SheetSnapshot` at delta time).
     SheetChanged { id: SheetId },
     /// A sheet tombstoned.
@@ -187,6 +193,20 @@ pub struct WorkbookSession {
     /// **v1 limitation:** unbounded, `dropped` always false (no retention horizon
     /// yet); the §9 ring-with-drop semantics land with `subscribe_events`.
     events: Vec<Event>,
+    /// Open multi-call transactions (§3.4): handle → buffered `SessionOp`s.
+    /// `begin_transaction` allocates an empty buffer, `txn_add` appends, `commit`
+    /// drains it through the SAME [`batch`] machinery, `rollback`/`close` drop it.
+    /// An open transaction holds **no engine lock** — it is a pure DTO buffer; the
+    /// workbook is untouched until commit, so interleaved single edits between
+    /// `begin` and `commit` are allowed and the buffer is validated against the
+    /// workbook state *at commit time* (the no-borrow-across-FFI contract §3.4).
+    /// **v1 limitation:** grows unbounded (one entry per open txn; dropped on
+    /// commit/rollback/close), same as `ops`/`events`.
+    ///
+    /// [`batch`]: WorkbookSession::batch
+    txns: HashMap<TransactionId, Vec<SessionOp>>,
+    /// Monotonic transaction-id source.
+    next_txn_id: u64,
 }
 
 impl WorkbookSession {
@@ -215,6 +235,8 @@ impl WorkbookSession {
             ops: HashMap::new(),
             next_op_id: 1,
             events: Vec::new(),
+            txns: HashMap::new(),
+            next_txn_id: 1,
         }
     }
 
@@ -348,9 +370,7 @@ impl WorkbookSession {
     fn ensure_readable(&self) -> EngineResult<()> {
         match self.state {
             LifecycleState::Ready | LifecycleState::Busy => Ok(()),
-            LifecycleState::New => Err(EngineError::invalid_state(
-                "session is not open yet (New)",
-            )),
+            LifecycleState::New => Err(EngineError::invalid_state("session is not open yet (New)")),
             LifecycleState::Closed => {
                 Err(EngineError::invalid_state("session is Closed (terminal)"))
             }
@@ -439,12 +459,18 @@ impl WorkbookSession {
         let locale = self.workbook.locale();
         let address = ql_types::Address::new(addr.sheet, addr.row, addr.col);
         let site = FormulaSite::at_cell(address);
-        let to_parse_err = |msg: String| EngineError::new(ErrorClass::Compute, "formula_parse", msg);
+        let to_parse_err =
+            |msg: String| EngineError::new(ErrorClass::Compute, "formula_parse", msg);
         let tokens = lex_with(text, mode, locale).map_err(|e| to_parse_err(e.to_string()))?;
         let expr = parse(tokens).map_err(|e| to_parse_err(e.to_string()))?;
         let canonical: Arc<str> = Arc::from(
-            print_with(&expr, ql_types::ReferenceMode::A1, ql_types::Locale::EnUs, Some(site))
-                .map_err(|e| to_parse_err(e.to_string()))?,
+            print_with(
+                &expr,
+                ql_types::ReferenceMode::A1,
+                ql_types::Locale::EnUs,
+                Some(site),
+            )
+            .map_err(|e| to_parse_err(e.to_string()))?,
         );
         bind_with_site(
             &expr,
@@ -486,7 +512,10 @@ impl WorkbookSession {
         epoch_bytes.copy_from_slice(&v.0[0..16]);
         let mut seq_bytes = [0u8; 8];
         seq_bytes.copy_from_slice(&v.0[16..24]);
-        Ok((u128::from_be_bytes(epoch_bytes), u64::from_be_bytes(seq_bytes)))
+        Ok((
+            u128::from_be_bytes(epoch_bytes),
+            u64::from_be_bytes(seq_bytes),
+        ))
     }
 
     /// Append change records for a just-committed command, bumping `state_seq`
@@ -654,7 +683,12 @@ impl WorkbookSession {
 
     /// Build a `CellSnapshot` for one cell, or `None` if the cell is truly empty
     /// (no value, formula, or format).
-    fn build_cell_snapshot(&self, sheet_id: SheetId, row: RowId, col: ColId) -> Option<CellSnapshot> {
+    fn build_cell_snapshot(
+        &self,
+        sheet_id: SheetId,
+        row: RowId,
+        col: ColId,
+    ) -> Option<CellSnapshot> {
         let sheet = self.workbook.sheet(sheet_id)?;
         let value = value_to_cell_value(&sheet.read(row, col));
         let formula = self
@@ -710,6 +744,9 @@ impl EngineSession for WorkbookSession {
 
     fn close(&mut self) -> EngineResult<()> {
         self.state = LifecycleState::Closed;
+        // Drop any open transaction buffers — they can never commit on a
+        // terminal session (their handles become `transaction_not_found`).
+        self.txns.clear();
         Ok(())
     }
 
@@ -783,11 +820,11 @@ impl EngineSession for WorkbookSession {
         self.ensure_readable()?;
         self.require_live_sheet(addr.sheet, "validate_formula")?;
         Self::require_in_bounds(addr.row, addr.col, "validate_formula")?; // F4
-        // Read-only lex → parse → bind against the live workbook (no mutation, so
-        // no `WorkbookRuntime` `&mut` needed). A failure at any stage becomes one
-        // error `Diagnostic`; a clean bind yields an empty vec (valid). Evaluation
-        // is intentionally skipped — a formula that *binds* is structurally valid;
-        // an eval-time `#REF!`/`#DIV/0!` is a cell value, not a validation error.
+                                                                          // Read-only lex → parse → bind against the live workbook (no mutation, so
+                                                                          // no `WorkbookRuntime` `&mut` needed). A failure at any stage becomes one
+                                                                          // error `Diagnostic`; a clean bind yields an empty vec (valid). Evaluation
+                                                                          // is intentionally skipped — a formula that *binds* is structurally valid;
+                                                                          // an eval-time `#REF!`/`#DIV/0!` is a cell value, not a validation error.
         let diag = |code: &str, message: String| -> Vec<Diagnostic> {
             vec![Diagnostic {
                 addr: Some(addr),
@@ -857,7 +894,9 @@ impl EngineSession for WorkbookSession {
         // here, matching the engine's current cross-sheet-ref handling. Formulas
         // referencing a tombstoned sheet stay readable — see the F9 note on
         // `require_live_sheet`.)
-        self.oplog.append(Op::RemoveSheet { id }).map_err(oplog_append_err)?;
+        self.oplog
+            .append(Op::RemoveSheet { id })
+            .map_err(oplog_append_err)?;
         self.workbook.remove_sheet(id);
         self.record_changes([SessionChange::SheetRemoved { id }]);
         Ok(())
@@ -876,7 +915,9 @@ impl EngineSession for WorkbookSession {
                 format!("restore_sheet: sheet {id} is not deleted (nothing to restore)"),
             ));
         }
-        self.oplog.append(Op::RestoreSheet { id }).map_err(oplog_append_err)?;
+        self.oplog
+            .append(Op::RestoreSheet { id })
+            .map_err(oplog_append_err)?;
         self.workbook.restore_sheet(id);
         // A restored sheet reappears at its preserved display position, which the
         // delta DTO cannot convey → bump the epoch so consumers reseed (rare).
@@ -906,7 +947,10 @@ impl EngineSession for WorkbookSession {
             return Ok(());
         }
         self.oplog
-            .append(Op::MoveSheet { id, new_index: index })
+            .append(Op::MoveSheet {
+                id,
+                new_index: index,
+            })
             .map_err(oplog_append_err)?;
         self.workbook.move_sheet(id, index);
         // A reorder cannot be expressed by the delta DTO (no order field) →
@@ -945,7 +989,15 @@ impl EngineSession for WorkbookSession {
         } = spec;
         self.with_runtime(|rt| {
             rt.create_table(
-                &name, sheet, top_row, top_col, rows, cols, has_header, has_totals, column_names,
+                &name,
+                sheet,
+                top_row,
+                top_col,
+                rows,
+                cols,
+                has_header,
+                has_totals,
+                column_names,
             )
         })
         .map_err(map_runtime_err)?;
@@ -1293,20 +1345,96 @@ impl EngineSession for WorkbookSession {
         })
     }
 
+    /// Begin a multi-call transaction (§3.4): allocate an opaque handle owning an
+    /// empty `SessionOp` buffer. Legal only in `Ready` (you are starting a
+    /// mutation sequence). The handle holds NO engine borrow — buffering is pure;
+    /// the workbook is touched only at [`commit_transaction`].
+    ///
+    /// [`commit_transaction`]: WorkbookSession::commit_transaction
     fn begin_transaction(&mut self) -> EngineResult<TransactionId> {
-        Err(not_implemented("begin_transaction"))
+        self.ensure_ready()?;
+        let id = TransactionId(self.next_txn_id);
+        // Fail-loud on id-space exhaustion (No-Fallbacks): never wrap, which
+        // could reuse a live handle and overwrite its buffer. Practically
+        // unreachable (2^64 begins), but the loud path is the correct one. The
+        // handle is NOT inserted on exhaustion. (audit inc.2c-5 LOW)
+        self.next_txn_id = self.next_txn_id.checked_add(1).ok_or_else(|| {
+            EngineError::new(
+                ErrorClass::Internal,
+                "transaction_id_exhausted",
+                "transaction id space exhausted (2^64 transactions begun in this session)",
+            )
+        })?;
+        self.txns.insert(id, Vec::new());
+        Ok(id)
     }
 
-    fn txn_add(&mut self, _txn: TransactionId, _op: SessionOp) -> EngineResult<()> {
-        Err(not_implemented("txn_add"))
+    /// Buffer an op into an open transaction (§3.4). Gated `Ready` (extending a
+    /// transaction is forward progress — rejected on `Busy`/terminal with
+    /// `invalid_state`, uniform with the other mutators, so a `Faulted`/`Closed`
+    /// session cannot silently keep buffering ops that can never commit — audit
+    /// inc.2c-5 MED). Unknown handle → `NotFound`/`transaction_not_found`
+    /// (fail-loud, never a silent no-op). The op's *workbook validity* is **not**
+    /// checked here — validation is atomic at commit (mirroring [`batch`]),
+    /// against the workbook state *at commit time*, because the workbook may
+    /// change between `txn_add` calls (the transaction holds no lock). Per-add
+    /// validation against a stale state would be both weaker and inconsistent
+    /// with the all-or-nothing commit guarantee.
+    ///
+    /// [`batch`]: WorkbookSession::batch
+    fn txn_add(&mut self, txn: TransactionId, op: SessionOp) -> EngineResult<()> {
+        self.ensure_ready()?;
+        let buf = self
+            .txns
+            .get_mut(&txn)
+            .ok_or_else(|| unknown_transaction(txn, "txn_add"))?;
+        buf.push(op);
+        Ok(())
     }
 
-    fn commit_transaction(&mut self, _txn: TransactionId) -> EngineResult<BatchResult> {
-        Err(not_implemented("commit_transaction"))
+    /// Commit an open transaction (§3.4): drain its buffer through the SAME
+    /// [`batch`] machinery (validate-all → one `Op::BatchCommit` → graph-
+    /// maintaining apply → single `state_seq` tick). So a transaction inherits
+    /// `batch`'s guarantees verbatim — validation-atomicity, graph consistency,
+    /// one undo unit, and the same-cell value/formula conflict guard
+    /// (`conflicting_batch_ops`): two value/formula ops buffered on one cell are
+    /// rejected at commit, exactly as in a single-call `batch` (the replay
+    /// divergence the guard prevents applies identically to a buffered txn).
+    ///
+    /// Unknown handle → `NotFound`. On a **failed** commit the buffer is
+    /// **restored** (the transaction stays open): `batch` is validation-atomic so
+    /// nothing was applied, and the caller may fix-and-retry or `rollback`. A
+    /// successful commit consumes the handle. Gated `Ready` before the buffer is
+    /// touched, so a `Busy`/terminal commit neither consumes nor applies.
+    ///
+    /// [`batch`]: WorkbookSession::batch
+    fn commit_transaction(&mut self, txn: TransactionId) -> EngineResult<BatchResult> {
+        self.ensure_ready()?;
+        if !self.txns.contains_key(&txn) {
+            return Err(unknown_transaction(txn, "commit_transaction"));
+        }
+        // Remove before committing; restore iff the commit fails (validation-
+        // atomic → nothing applied → the transaction is still meaningfully open).
+        let ops = self
+            .txns
+            .remove(&txn)
+            .expect("contains_key checked immediately above");
+        match self.batch(ops.clone(), BatchOptions::default()) {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                self.txns.insert(txn, ops);
+                Err(e)
+            }
+        }
     }
 
-    fn rollback_transaction(&mut self, _txn: TransactionId) -> EngineResult<()> {
-        Err(not_implemented("rollback_transaction"))
+    /// Discard an open transaction (§3.4): drop its buffer. Unknown handle →
+    /// `NotFound`. Always legal (cleanup), regardless of lifecycle state.
+    fn rollback_transaction(&mut self, txn: TransactionId) -> EngineResult<()> {
+        self.txns
+            .remove(&txn)
+            .map(|_| ())
+            .ok_or_else(|| unknown_transaction(txn, "rollback_transaction"))
     }
 
     // --- Recalculation (§3.7) ---
@@ -1703,6 +1831,17 @@ fn not_implemented(what: &str) -> EngineError {
     )
 }
 
+/// An operation referenced a transaction handle that is not open (never begun,
+/// already committed, rolled back, or dropped at `close`). Fail-loud
+/// `NotFound`/`transaction_not_found`, never a silent no-op (§3.4 / Appendix A).
+fn unknown_transaction(txn: TransactionId, op: &str) -> EngineError {
+    EngineError::new(
+        ErrorClass::NotFound,
+        "transaction_not_found",
+        format!("{op}: no open transaction with id {}", txn.0),
+    )
+}
+
 /// Map a `ql_types::Value` to the contract's `CellValue` (`None` for `Blank` —
 /// a cell with no committed value). `Pending` has no `Value` analog.
 fn value_to_cell_value(v: &Value) -> Option<CellValue> {
@@ -1848,12 +1987,11 @@ fn map_runtime_err(e: RuntimeError) -> EngineError {
         }
         R::TableResizeRejected { .. } => {
             EngineError::new(ErrorClass::BadArgument, "table_resize_rejected", display)
-        }
-        // NOTE: no wildcard arm. `RuntimeError` is `#[non_exhaustive]`, but
-        // this match is in the SAME crate, so it must be exhaustive — which is
-        // exactly the safety the contract wants (§5.3): a newly-added variant
-        // becomes a COMPILE error here, forcing an explicit mapping rather than
-        // silently leaking through a catch-all.
+        } // NOTE: no wildcard arm. `RuntimeError` is `#[non_exhaustive]`, but
+          // this match is in the SAME crate, so it must be exhaustive — which is
+          // exactly the safety the contract wants (§5.3): a newly-added variant
+          // becomes a COMPILE error here, forcing an explicit mapping rather than
+          // silently leaking through a catch-all.
     }
 }
 
@@ -1995,10 +2133,12 @@ mod tests {
     #[test]
     fn deferred_methods_surface_capability_error() {
         let mut s = WorkbookSession::new();
+        // `begin_transaction` is NO LONGER here — it ships in inc.2c-5. The
+        // remaining deferred methods still surface the honest Capability error.
         for err in [
             s.open("/tmp/x.qbook").unwrap_err(),
             s.undo().unwrap_err(),
-            s.begin_transaction().unwrap_err(),
+            s.redo().unwrap_err(),
         ] {
             assert_eq!(err.class, ErrorClass::Capability);
             assert_eq!(err.code, "not_implemented_in_v1_core");
@@ -2046,12 +2186,20 @@ mod tests {
     fn query_range_is_columnar_with_blanks() {
         let mut s = WorkbookSession::new();
         let sheet = s.add_sheet("S", 16384).unwrap();
-        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 }).unwrap();
-        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 2.0 }).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 2.0 })
+            .unwrap();
         // B-column left empty.
         let r = s
             .query_range(
-                CellRange { sheet, start_row: 0, start_col: 0, end_row: 1, end_col: 1 },
+                CellRange {
+                    sheet,
+                    start_row: 0,
+                    start_col: 0,
+                    end_row: 1,
+                    end_col: 1,
+                },
                 RangeQueryOptions::default(),
             )
             .unwrap();
@@ -2059,11 +2207,17 @@ mod tests {
         assert_eq!(r.n_cols, 2);
         assert_eq!(r.columns.len(), 2);
         // Column A: [1, 2]; column B: [Blank, Blank].
-        assert_eq!(r.columns[0].values, vec![
-            CellValue::Number { number: 1.0 },
-            CellValue::Number { number: 2.0 },
-        ]);
-        assert_eq!(r.columns[1].values, vec![CellValue::Blank, CellValue::Blank]);
+        assert_eq!(
+            r.columns[0].values,
+            vec![
+                CellValue::Number { number: 1.0 },
+                CellValue::Number { number: 2.0 },
+            ]
+        );
+        assert_eq!(
+            r.columns[1].values,
+            vec![CellValue::Blank, CellValue::Blank]
+        );
     }
 
     #[test]
@@ -2072,7 +2226,13 @@ mod tests {
         let sheet = s.add_sheet("S", 16384).unwrap();
         let inverted = s
             .query_range(
-                CellRange { sheet, start_row: 5, start_col: 0, end_row: 0, end_col: 0 },
+                CellRange {
+                    sheet,
+                    start_row: 5,
+                    start_col: 0,
+                    end_row: 0,
+                    end_col: 0,
+                },
                 RangeQueryOptions::default(),
             )
             .unwrap_err();
@@ -2091,15 +2251,23 @@ mod tests {
         // Valid delete tombstones the sheet (list_sheets drops it) + advances version.
         let v0 = s.snapshot().unwrap().version;
         s.delete_sheet(drop_id).unwrap();
-        let names: Vec<String> =
-            s.list_sheets().unwrap().into_iter().map(|x| x.name).collect();
+        let names: Vec<String> = s
+            .list_sheets()
+            .unwrap()
+            .into_iter()
+            .map(|x| x.name)
+            .collect();
         assert!(names.contains(&"Keep".to_string()));
         assert!(!names.contains(&"Drop".to_string()));
         assert_ne!(v0, s.snapshot().unwrap().version);
         // Restore brings it back.
         s.restore_sheet(drop_id).unwrap();
-        let names2: Vec<String> =
-            s.list_sheets().unwrap().into_iter().map(|x| x.name).collect();
+        let names2: Vec<String> = s
+            .list_sheets()
+            .unwrap()
+            .into_iter()
+            .map(|x| x.name)
+            .collect();
         assert!(names2.contains(&"Drop".to_string()));
     }
 
@@ -2107,8 +2275,14 @@ mod tests {
     fn move_sheet_out_of_range_is_bad_argument_unknown_is_not_found() {
         let mut s = WorkbookSession::new();
         let sid = s.add_sheet("S", 16384).unwrap();
-        assert_eq!(s.move_sheet(sid, 9999).unwrap_err().class, ErrorClass::BadArgument);
-        assert_eq!(s.move_sheet(9999, 0).unwrap_err().class, ErrorClass::NotFound);
+        assert_eq!(
+            s.move_sheet(sid, 9999).unwrap_err().class,
+            ErrorClass::BadArgument
+        );
+        assert_eq!(
+            s.move_sheet(9999, 0).unwrap_err().class,
+            ErrorClass::NotFound
+        );
         assert_eq!(s.restore_sheet(9999).unwrap_err().code, "sheet_not_found");
     }
 
@@ -2129,7 +2303,10 @@ mod tests {
         };
         s.create_table(spec).unwrap();
         // Drop unknown → NotFound.
-        assert_eq!(s.drop_table("NOPE").unwrap_err().class, ErrorClass::NotFound);
+        assert_eq!(
+            s.drop_table("NOPE").unwrap_err().class,
+            ErrorClass::NotFound
+        );
         // Drop the real one succeeds.
         s.drop_table("T").unwrap();
     }
@@ -2157,7 +2334,13 @@ mod tests {
         );
         assert_eq!(
             s.query_range(
-                CellRange { sheet: sid, start_row: 0, start_col: 0, end_row: 0, end_col: 0 },
+                CellRange {
+                    sheet: sid,
+                    start_row: 0,
+                    start_col: 0,
+                    end_row: 0,
+                    end_col: 0
+                },
                 RangeQueryOptions::default(),
             )
             .unwrap_err()
@@ -2182,7 +2365,10 @@ mod tests {
         let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
         assert_eq!(c.format, Some(fmt));
         // Setting a format referencing an unregistered id → BadArgument.
-        let bogus = FormatId::Custom { peer: 424242, counter: 999 };
+        let bogus = FormatId::Custom {
+            peer: 424242,
+            counter: 999,
+        };
         assert_eq!(
             s.set_format(addr(sheet, 0, 0), bogus).unwrap_err().class,
             ErrorClass::BadArgument
@@ -2233,7 +2419,11 @@ mod tests {
         let err = s.restore_sheet(sid).unwrap_err();
         assert_eq!(err.class, ErrorClass::Conflict);
         assert_eq!(err.code, "sheet_not_deleted");
-        assert_eq!(v0, s.snapshot().unwrap().version, "no token advance on rejected restore");
+        assert_eq!(
+            v0,
+            s.snapshot().unwrap().version,
+            "no token advance on rejected restore"
+        );
     }
 
     /// F5: moving a sheet to its current position is a no-op (no token advance).
@@ -2253,7 +2443,10 @@ mod tests {
         let mut s = WorkbookSession::new();
         let sid = s.add_sheet("S", 16384).unwrap();
         s.delete_sheet(sid).unwrap();
-        assert_eq!(s.rename_sheet(sid, "X").unwrap_err().code, "sheet_not_found");
+        assert_eq!(
+            s.rename_sheet(sid, "X").unwrap_err().code,
+            "sheet_not_found"
+        );
         let spec = TableSpec {
             name: "T".into(),
             sheet: sid,
@@ -2275,12 +2468,20 @@ mod tests {
         let mut s = WorkbookSession::new();
         let sheet = s.add_sheet("S", 16384).unwrap();
         // cell: col beyond MAX_COLUMN.
-        let e = s.cell(addr(sheet, 0, ql_types::MAX_COLUMN + 1)).unwrap_err();
+        let e = s
+            .cell(addr(sheet, 0, ql_types::MAX_COLUMN + 1))
+            .unwrap_err();
         assert_eq!(e.class, ErrorClass::BadArgument);
         // query_range: end_row = u32::MAX would overflow end - start + 1.
         let e2 = s
             .query_range(
-                CellRange { sheet, start_row: 0, start_col: 0, end_row: u32::MAX, end_col: 0 },
+                CellRange {
+                    sheet,
+                    start_row: 0,
+                    start_col: 0,
+                    end_row: u32::MAX,
+                    end_col: 0,
+                },
                 RangeQueryOptions::default(),
             )
             .unwrap_err();
@@ -2300,8 +2501,17 @@ mod tests {
         let sheet = s.add_sheet("S", 16384).unwrap();
         let err = s
             .query_range(
-                CellRange { sheet, start_row: 0, start_col: 0, end_row: 0, end_col: 0 },
-                RangeQueryOptions { include_formulas: true, ..Default::default() },
+                CellRange {
+                    sheet,
+                    start_row: 0,
+                    start_col: 0,
+                    end_row: 0,
+                    end_col: 0,
+                },
+                RangeQueryOptions {
+                    include_formulas: true,
+                    ..Default::default()
+                },
             )
             .unwrap_err();
         assert_eq!(err.class, ErrorClass::Capability);
@@ -2316,7 +2526,10 @@ mod tests {
         let s = WorkbookSession::new();
         let d = s.snapshot_delta(&SessionVersion(vec![])).unwrap();
         assert!(d.full_rebuild_required);
-        assert_eq!(d.full_rebuild_reason, Some(FullRebuildReason::NoPriorVersion));
+        assert_eq!(
+            d.full_rebuild_reason,
+            Some(FullRebuildReason::NoPriorVersion)
+        );
     }
 
     /// A malformed (wrong-length) token is fail-loud `invalid_version_token`
@@ -2324,7 +2537,9 @@ mod tests {
     #[test]
     fn snapshot_delta_malformed_token_fails_loud() {
         let s = WorkbookSession::new();
-        let err = s.snapshot_delta(&SessionVersion(vec![1, 2, 3])).unwrap_err();
+        let err = s
+            .snapshot_delta(&SessionVersion(vec![1, 2, 3]))
+            .unwrap_err();
         assert_eq!(err.class, ErrorClass::Protocol);
         assert_eq!(err.code, "invalid_version_token");
     }
@@ -2350,22 +2565,34 @@ mod tests {
     fn snapshot_delta_includes_recompute_changed_dependents() {
         let mut s = WorkbookSession::new();
         let sheet = s.add_sheet("S", 16384).unwrap();
-        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 }).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
         s.set_formula(addr(sheet, 0, 1), "A1*2").unwrap();
         let v0 = s.snapshot().unwrap().version;
-        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 5.0 }).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 5.0 })
+            .unwrap();
         s.recalc_dirty().unwrap();
         let d = s.snapshot_delta(&v0).unwrap();
         assert!(!d.full_rebuild_required, "same-epoch in-window delta");
-        let changed: Vec<(u32, u32)> =
-            d.changed_cells.iter().map(|c| (c.cell.row, c.cell.col)).collect();
-        assert!(changed.contains(&(0, 0)), "A1 (edited) must be in the delta");
+        let changed: Vec<(u32, u32)> = d
+            .changed_cells
+            .iter()
+            .map(|c| (c.cell.row, c.cell.col))
+            .collect();
+        assert!(
+            changed.contains(&(0, 0)),
+            "A1 (edited) must be in the delta"
+        );
         assert!(
             changed.contains(&(0, 1)),
             "B1 (recompute-changed dependent, NO op) must be in the delta — the op-walk-insufficiency fix"
         );
         // The recomputed B1 value is the current one (10), resolved at delta time.
-        let b1 = d.changed_cells.iter().find(|c| c.cell.row == 0 && c.cell.col == 1).unwrap();
+        let b1 = d
+            .changed_cells
+            .iter()
+            .find(|c| c.cell.row == 0 && c.cell.col == 1)
+            .unwrap();
         assert_eq!(b1.cell.value, Some(CellValue::Number { number: 10.0 }));
     }
 
@@ -2374,7 +2601,8 @@ mod tests {
     fn snapshot_delta_no_changes_is_empty() {
         let mut s = WorkbookSession::new();
         let sheet = s.add_sheet("S", 16384).unwrap();
-        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 }).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
         let v = s.snapshot().unwrap().version;
         let d = s.snapshot_delta(&v).unwrap();
         assert!(!d.full_rebuild_required);
@@ -2388,12 +2616,17 @@ mod tests {
     fn snapshot_delta_reports_removed_cell() {
         let mut s = WorkbookSession::new();
         let sheet = s.add_sheet("S", 16384).unwrap();
-        s.set_value(addr(sheet, 2, 2), CellValue::Number { number: 7.0 }).unwrap();
+        s.set_value(addr(sheet, 2, 2), CellValue::Number { number: 7.0 })
+            .unwrap();
         let v = s.snapshot().unwrap().version;
         // F2 token half: set_value(Blank) clears a value-only cell. The runtime
         // appends no op for this, but the change-log records it → token advances.
         s.set_value(addr(sheet, 2, 2), CellValue::Blank).unwrap();
-        assert_ne!(v, s.snapshot().unwrap().version, "Blank-clear must advance the token");
+        assert_ne!(
+            v,
+            s.snapshot().unwrap().version,
+            "Blank-clear must advance the token"
+        );
         let d = s.snapshot_delta(&v).unwrap();
         assert!(!d.full_rebuild_required);
         assert!(
@@ -2423,7 +2656,10 @@ mod tests {
         s.create_table(spec).unwrap();
         let d = s.snapshot_delta(&v0).unwrap();
         assert!(d.full_rebuild_required);
-        assert_eq!(d.full_rebuild_reason, Some(FullRebuildReason::EpochMismatch));
+        assert_eq!(
+            d.full_rebuild_reason,
+            Some(FullRebuildReason::EpochMismatch)
+        );
     }
 
     /// Added + removed sheets surface as sheets_changed / sheets_removed.
@@ -2431,7 +2667,8 @@ mod tests {
     fn snapshot_delta_sheet_add_then_remove() {
         let mut s = WorkbookSession::new();
         let keep = s.add_sheet("Keep", 16384).unwrap();
-        s.set_value(addr(keep, 0, 0), CellValue::Number { number: 1.0 }).unwrap();
+        s.set_value(addr(keep, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
         let v0 = s.snapshot().unwrap().version;
         let added = s.add_sheet("Added", 16384).unwrap();
         let d = s.snapshot_delta(&v0).unwrap();
@@ -2676,7 +2913,11 @@ mod tests {
         let v1 = s.snapshot().unwrap().version;
         let (e1, seq1) = WorkbookSession::decode_version(&v1).unwrap();
         assert_eq!(e0, e1, "batch must not bump the epoch");
-        assert_eq!(seq1, seq0 + 1, "the whole batch advances state_seq exactly once");
+        assert_eq!(
+            seq1,
+            seq0 + 1,
+            "the whole batch advances state_seq exactly once"
+        );
         // The delta from v0 must contain ALL three batched cells.
         let d = s.snapshot_delta(&v0).unwrap();
         assert!(!d.full_rebuild_required);
@@ -2906,5 +3147,304 @@ mod tests {
         let a1 = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
         assert_eq!(a1.value, Some(CellValue::Number { number: 5.0 }));
         assert_eq!(a1.format, Some(fmt));
+    }
+
+    // --- Multi-call transaction handle (inc.2c-5) ---
+
+    /// begin → txn_add×3 → commit behaves exactly like the equivalent single
+    /// `batch`: all ops apply atomically, intra-transaction references resolve,
+    /// the token advances exactly one tick, and the handle is consumed.
+    #[test]
+    fn transaction_round_trip_commits_like_batch() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+
+        let txn = s.begin_transaction().unwrap();
+        s.txn_add(
+            txn,
+            SessionOp::SetValue {
+                addr: addr(sheet, 0, 0),
+                value: CellValue::Number { number: 10.0 },
+            },
+        )
+        .unwrap();
+        s.txn_add(
+            txn,
+            SessionOp::SetValue {
+                addr: addr(sheet, 1, 0),
+                value: CellValue::Number { number: 20.0 },
+            },
+        )
+        .unwrap();
+        // References cells buffered earlier in the SAME transaction.
+        s.txn_add(
+            txn,
+            SessionOp::SetFormula {
+                addr: addr(sheet, 0, 1),
+                text: "A1 + A2".to_string(),
+            },
+        )
+        .unwrap();
+
+        let res = s.commit_transaction(txn).unwrap();
+        assert_eq!(res.applied, 3);
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 30.0 })
+        );
+        // One state tick for the whole transaction.
+        assert_ne!(v0, res.version);
+        // Handle consumed: a second commit/rollback is NotFound.
+        let err = s.commit_transaction(txn).unwrap_err();
+        assert_eq!(err.class, ErrorClass::NotFound);
+        assert_eq!(err.code, "transaction_not_found");
+    }
+
+    /// Two concurrent transactions get distinct handles and buffer independently.
+    #[test]
+    fn begin_transaction_returns_distinct_ids() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let t1 = s.begin_transaction().unwrap();
+        let t2 = s.begin_transaction().unwrap();
+        assert_ne!(t1, t2);
+        s.txn_add(
+            t1,
+            SessionOp::SetValue {
+                addr: addr(sheet, 0, 0),
+                value: CellValue::Number { number: 1.0 },
+            },
+        )
+        .unwrap();
+        s.txn_add(
+            t2,
+            SessionOp::SetValue {
+                addr: addr(sheet, 0, 1),
+                value: CellValue::Number { number: 2.0 },
+            },
+        )
+        .unwrap();
+        // Committing t1 leaves t2 open and untouched.
+        assert_eq!(s.commit_transaction(t1).unwrap().applied, 1);
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 1.0 })
+        );
+        assert!(s.cell(addr(sheet, 0, 1)).unwrap().is_none());
+        assert_eq!(s.commit_transaction(t2).unwrap().applied, 1);
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 2.0 })
+        );
+    }
+
+    /// An unknown handle is fail-loud `NotFound`/`transaction_not_found` on every
+    /// handle-taking method (never a silent no-op).
+    #[test]
+    fn unknown_transaction_handle_is_not_found() {
+        let mut s = WorkbookSession::new();
+        let ghost = TransactionId(9999);
+        for err in [
+            s.txn_add(
+                ghost,
+                SessionOp::Clear {
+                    addr: addr(0, 0, 0),
+                },
+            )
+            .unwrap_err(),
+            s.commit_transaction(ghost).unwrap_err(),
+            s.rollback_transaction(ghost).unwrap_err(),
+        ] {
+            assert_eq!(err.class, ErrorClass::NotFound);
+            assert_eq!(err.code, "transaction_not_found");
+        }
+    }
+
+    /// rollback discards the buffer: nothing applies, the token is unchanged, and
+    /// the handle is gone afterward.
+    #[test]
+    fn rollback_discards_buffered_ops() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let txn = s.begin_transaction().unwrap();
+        s.txn_add(
+            txn,
+            SessionOp::SetValue {
+                addr: addr(sheet, 0, 0),
+                value: CellValue::Number { number: 42.0 },
+            },
+        )
+        .unwrap();
+        s.rollback_transaction(txn).unwrap();
+        assert!(
+            s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
+            "rolled-back ops must not apply"
+        );
+        assert_eq!(
+            v0,
+            s.snapshot().unwrap().version,
+            "rollback must not advance the token"
+        );
+        // Handle consumed.
+        assert_eq!(
+            s.rollback_transaction(txn).unwrap_err().code,
+            "transaction_not_found"
+        );
+    }
+
+    /// Committing an empty transaction is a no-op: 0 applied, token unchanged.
+    #[test]
+    fn commit_empty_transaction_is_noop() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let txn = s.begin_transaction().unwrap();
+        let res = s.commit_transaction(txn).unwrap();
+        assert_eq!(res.applied, 0);
+        assert_eq!(v0, res.version);
+        assert_eq!(v0, s.snapshot().unwrap().version);
+    }
+
+    /// A transaction whose buffer contains an invalid op is rejected atomically
+    /// at commit (nothing applied, token unchanged) AND — because `batch` is
+    /// validation-atomic — the handle STAYS OPEN so the caller can fix/rollback.
+    #[test]
+    fn transaction_invalid_op_rejected_atomically_handle_stays_open() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let len_before = s.oplog.len();
+        let txn = s.begin_transaction().unwrap();
+        s.txn_add(
+            txn,
+            SessionOp::SetValue {
+                addr: addr(sheet, 0, 0),
+                value: CellValue::Number { number: 7.0 },
+            },
+        )
+        .unwrap();
+        s.txn_add(
+            txn,
+            SessionOp::SetFormula {
+                addr: addr(sheet, 0, 1),
+                text: "1 +* 2".to_string(), // malformed
+            },
+        )
+        .unwrap();
+        let err = s.commit_transaction(txn).unwrap_err();
+        assert_eq!(err.class, ErrorClass::Compute);
+        assert!(
+            s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
+            "no op may apply when the commit is rejected"
+        );
+        assert_eq!(v0, s.snapshot().unwrap().version);
+        // No BatchCommit was appended (commit failed in Phase 1) — this is WHY
+        // re-inserting the buffer is safe: a later retry can't double-apply.
+        assert_eq!(
+            s.oplog.len(),
+            len_before,
+            "a rejected commit must not append a BatchCommit"
+        );
+        // Handle is STILL OPEN — rollback succeeds (would be NotFound if consumed).
+        s.rollback_transaction(txn)
+            .expect("a failed commit must leave the transaction open");
+    }
+
+    /// A transaction inherits `batch`'s same-cell value/formula conflict guard:
+    /// two value/formula ops on one cell are rejected at commit, handle stays open.
+    #[test]
+    fn transaction_same_cell_conflict_rejected_at_commit() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let len_before = s.oplog.len();
+        let txn = s.begin_transaction().unwrap();
+        s.txn_add(
+            txn,
+            SessionOp::SetFormula {
+                addr: addr(sheet, 0, 0),
+                text: "1 + 1".to_string(),
+            },
+        )
+        .unwrap();
+        s.txn_add(
+            txn,
+            SessionOp::SetValue {
+                addr: addr(sheet, 0, 0),
+                value: CellValue::Number { number: 5.0 },
+            },
+        )
+        .unwrap();
+        let err = s.commit_transaction(txn).unwrap_err();
+        assert_eq!(err.class, ErrorClass::Conflict);
+        assert_eq!(err.code, "conflicting_batch_ops");
+        // Validation-atomic: nothing appended, token unchanged, handle still open.
+        assert_eq!(s.oplog.len(), len_before);
+        assert_eq!(v0, s.snapshot().unwrap().version);
+        s.rollback_transaction(txn)
+            .expect("a rejected commit must leave the transaction open");
+    }
+
+    /// The buffer is validated against the workbook state AT COMMIT TIME (the
+    /// transaction holds no lock): a sheet deleted between `txn_add` and `commit`
+    /// makes the commit fail-loud `NotFound`.
+    #[test]
+    fn transaction_validated_at_commit_time_not_add_time() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let txn = s.begin_transaction().unwrap();
+        s.txn_add(
+            txn,
+            SessionOp::SetValue {
+                addr: addr(sheet, 0, 0),
+                value: CellValue::Number { number: 1.0 },
+            },
+        )
+        .unwrap(); // accepted: sheet is live at add time
+        s.delete_sheet(sheet).unwrap();
+        let err = s.commit_transaction(txn).unwrap_err();
+        assert_eq!(err.class, ErrorClass::NotFound);
+        assert_eq!(err.code, "sheet_not_found");
+        // Commit failed → handle still open.
+        s.rollback_transaction(txn).unwrap();
+    }
+
+    /// `commit_transaction` on a Closed session is `invalid_state` (gated before
+    /// the buffer is touched); `close` also drops all open transaction buffers.
+    #[test]
+    fn commit_on_closed_session_is_invalid_state() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("S", 16384).unwrap();
+        let txn = s.begin_transaction().unwrap();
+        s.close().unwrap();
+        let err = s.commit_transaction(txn).unwrap_err();
+        assert_eq!(err.class, ErrorClass::Lifecycle);
+        assert_eq!(err.code, "invalid_state");
+        // begin_transaction is likewise rejected on a terminal session.
+        assert_eq!(s.begin_transaction().unwrap_err().code, "invalid_state");
+    }
+
+    /// `txn_add` on a terminal session is `invalid_state` (gated before the
+    /// handle lookup), uniform with the other mutators — a Faulted/Closed session
+    /// cannot keep buffering ops that could never commit (audit inc.2c-5 MED).
+    #[test]
+    fn txn_add_on_closed_session_is_invalid_state() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let txn = s.begin_transaction().unwrap();
+        s.close().unwrap();
+        let err = s
+            .txn_add(
+                txn,
+                SessionOp::SetValue {
+                    addr: addr(sheet, 0, 0),
+                    value: CellValue::Number { number: 1.0 },
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Lifecycle);
+        assert_eq!(err.code, "invalid_state");
     }
 }

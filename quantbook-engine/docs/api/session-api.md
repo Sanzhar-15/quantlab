@@ -175,6 +175,30 @@ Product commands (not collab `Op` variants — decision-lock §3.2). **v1** = in
   out of v1 scope; tracked for the collaborative producer work.)
 - **Undo grouping:** the batch is one undo unit.
 
+**Multi-call transaction handle — v1 implementation (inc.2c-5, `WorkbookSession`):**
+- The handle is a **pure `SessionOp` buffer holding NO engine borrow** (`txns:
+  HashMap<TransactionId, Vec<SessionOp>>`). `begin_transaction` allocates an empty
+  buffer; `txn_add` appends; `commit_transaction` drains it through the **same**
+  `batch` machinery (so a transaction inherits batch's validation-atomicity, graph
+  consistency, one `Op::BatchCommit`, single state tick, and the same-cell
+  value/formula conflict guard — two value/formula ops on one cell →
+  `conflicting_batch_ops` at commit); `rollback_transaction` drops the buffer.
+- **No lock between `begin` and `commit`:** interleaved single edits / other
+  transactions are permitted; the buffer is validated against the workbook state
+  **at commit time** (a sheet deleted after `txn_add` → `sheet_not_found` at commit),
+  not at add time. This is the no-borrow-across-FFI consequence (a borrowed
+  `WorkbookTransaction<'_>` cannot cross FFI).
+- **Lifecycle:** `begin`/`txn_add`/`commit` require `Ready` (forward progress →
+  `invalid_state` on Busy/terminal). `rollback` is ungated (cleanup is always
+  permitted). `close` drops all open buffers.
+- **Failed commit leaves the transaction OPEN** (the buffer is restored): `batch`
+  is validation-atomic, so a rejected commit applied nothing — the caller may
+  fix-and-retry or `rollback`. A successful commit consumes the handle. Unknown
+  handle → fail-loud `NotFound`/`transaction_not_found` (never a silent no-op).
+- **v1 limitations:** `txns` grows unbounded if callers `begin` without
+  commit/rollback (same as `ops`/`events`); `options.undo_label`/`undo_group` and
+  optional deadline are accepted-but-not-yet-consumed (land with undo/redo).
+
 ### 3.5 Bulk data / publish / bind (HIGH-4 — reserved-stable shapes; implemented 6.4/6.5)
 Reserved now so 6.4 (Python UDFs) and 6.5 (SQL/connectors) extend the shared trait instead of forking
 product-specific APIs (the #1 risk). Dirtying + provenance behavior is part of the lock:
@@ -580,6 +604,9 @@ Ambiguities Codex flagged, resolved here:
 | version token decode failure | `Protocol` | `invalid_version_token` | no |
 | panic caught at boundary | `Internal` | `panic` | no |
 | operation canceled / deadline | `Canceled` | `canceled` / `deadline_exceeded` | yes |
+| batch/txn: >1 value/formula op on one cell (inc.2c-4) | `Conflict` | `conflicting_batch_ops` | no |
+| txn handle not open: unknown / already committed / rolled-back / dropped at close (inc.2c-5) | `NotFound` | `transaction_not_found` | no |
+| txn id space exhausted — 2^64 `begin`s in one session (inc.2c-5; loud, never wraps) | `Internal` | `transaction_id_exhausted` | no |
 
 **Implementation-reality note (6.1B inc.2 audit, 2026-05-27 — F8):** the earlier draft
 split `InvalidSheet` and `TableCreateRejected` by *cause*, but the real enums do not

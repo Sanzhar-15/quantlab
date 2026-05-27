@@ -138,6 +138,7 @@ pub use plan_cache::{PlanCache, PlanCacheKey, PlanCacheStats};
 pub use scalar::{
     eval_at_cell_boundary, eval_scalar, eval_scalar_with_cache, eval_scalar_with_registry,
 };
+pub use session::WorkbookSession;
 pub use simd::{
     // Phase 2A.13 audit cycle-3 M9: `div_array` removed (was dead code after
     // Phase 2A.9 H5 routed Operator::Div through scalar evaluator).
@@ -149,7 +150,6 @@ pub use simd::{
     sub_array,
     sub_scalar,
 };
-pub use session::WorkbookSession;
 pub use transaction::WorkbookTransaction;
 pub use workbook_runtime::{RecomputeFailure, RecomputeResult, RuntimeError, WorkbookRuntime};
 
