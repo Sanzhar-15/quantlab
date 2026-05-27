@@ -149,6 +149,19 @@ struct ChangeRecord {
 pub struct WorkbookSession {
     /// Live, single-writer cell/sheet/table/name/format storage.
     workbook: Workbook,
+    /// **inc.2c-7 undo/redo baseline.** The workbook as it was at session
+    /// construction (the `from_workbook` argument), BEFORE any session edit. The
+    /// session's `oplog` records only edits made AFTER construction, so undo's
+    /// `rematerialize` replays the (post-undo) op-log onto a CLONE of this
+    /// baseline — NOT onto a fresh empty `Workbook`. For the wired `new()` path
+    /// the baseline is empty (clone is trivial), so behavior is unchanged; for a
+    /// session wrapping a populated workbook (the future `open`/`import` path)
+    /// this is what makes undo preserve the pre-loaded content instead of
+    /// silently dropping it (and makes "you cannot undo past the point the
+    /// workbook was opened" the correct, intended semantic). Audited 2026-05-27
+    /// (Codex HIGH / Opus M1: a fresh-`OpLog` + populated-workbook session would
+    /// otherwise lose its baseline on the first consumed undo).
+    baseline: Workbook,
     /// Mandatory single-writer op-log — undo/save substrate + the `op_count`
     /// half of the version token.
     oplog: OpLog,
@@ -211,6 +224,41 @@ pub struct WorkbookSession {
     txns: HashMap<TransactionId, Vec<SessionOp>>,
     /// Monotonic transaction-id source.
     next_txn_id: u64,
+    /// Loro undo/redo manager (inc.2c-6), subscribed to `oplog`'s underlying
+    /// `LoroDoc` commit stream at construction (via `OpLog::new_undo_manager`).
+    /// It records every LOCAL commit made AFTER it is constructed — i.e. every
+    /// `oplog.append`, which `OpLog::append` follows with `doc.commit()`. It
+    /// holds an internal `Arc` to the doc, so it is `'static` and may be a
+    /// field (it does NOT borrow `self.oplog`).
+    ///
+    /// **Undo-unit granularity (HARD QUESTION 1).** `set_merge_interval(0)` is
+    /// set at construction → NO time-based merging, so each Loro commit is its
+    /// own undo unit. Every `WorkbookSession` mutating command produces EXACTLY
+    /// one commit: single-cell/structure/name/format/table edits each append
+    /// one op (one `append` = one `commit`), and `set_value`/`rename_sheet`/
+    /// `rename_table`/`rename_column` (the only commands whose underlying
+    /// producer can emit MULTIPLE ops) wrap them in a single `Op::BatchCommit`
+    /// (`cells.rs` `set_value` `match log_ops.len()`; `sheets.rs`/`tables.rs`
+    /// rename producers append one `BatchCommit`), and `batch`/`commit_transaction`
+    /// append one `Op::BatchCommit`. So one `undo()` reverts exactly one command
+    /// with NO explicit `group_start`/`group_end` needed. (Proven by
+    /// `undo_clear_of_formula_cell_is_one_unit` + `undo_batch_reverts_whole_batch`.)
+    ///
+    /// **Re-materialization model.** Unlike `ql_collab::CollabSession` (snapshot-
+    /// cache + on_push cell-meta partial invalidation), `WorkbookSession` owns a
+    /// LIVE workbook and re-materializes it WHOLESALE after a Loro undo/redo:
+    /// `replay_into` the (now-compacted) op-log into a fresh workbook, rebuild
+    /// the calcgraph, recompute, then `bump_epoch`. So no on_push meta encoding
+    /// is wired here — kept deliberately simpler. See [`rematerialize`].
+    ///
+    /// **v1 depth cap (audit L1).** Loro's `UndoManager::new` defaults to
+    /// `set_max_undo_steps(100)`; the session does not override it, so the undo
+    /// stack silently drops the oldest unit past 100 undoable commands. Bounded
+    /// retention is intentional for v1 (mirrors the `ops`/`events`/`change_log`
+    /// bounds); a configurable depth is a later increment.
+    ///
+    /// [`rematerialize`]: WorkbookSession::rematerialize
+    undo_manager: loro::UndoManager,
 }
 
 impl WorkbookSession {
@@ -225,9 +273,25 @@ impl WorkbookSession {
     /// formulas so dependency tracking is live.
     pub fn from_workbook(workbook: Workbook) -> Self {
         let graph = CalcgraphSession::rebuild_from_workbook(&workbook).session;
+        // inc.2c-7: snapshot the construction-time workbook as the undo baseline
+        // BEFORE moving `workbook` into the struct (the op-log records only
+        // post-construction edits, so `rematerialize` replays onto a clone of
+        // this baseline — see the `baseline` field doc). Empty/cheap for `new()`.
+        let baseline = workbook.clone();
+        let oplog = OpLog::new();
+        // inc.2c-6: construct the undo manager AFTER `oplog` so it subscribes to
+        // the doc's commit stream and records every subsequent `append`'s commit.
+        // `set_merge_interval(0)` disables Loro's time-based commit merging so
+        // each commit is its own undo unit (HARD QUESTION 1) — every command
+        // already produces exactly one commit, so 1 command == 1 undo unit with
+        // no explicit grouping. The manager holds an internal Arc to the doc, so
+        // it does not borrow `oplog` and can be moved into the struct below.
+        let mut undo_manager = oplog.new_undo_manager();
+        undo_manager.set_merge_interval(0);
         Self {
             workbook,
-            oplog: OpLog::new(),
+            baseline,
+            oplog,
             graph,
             plan_cache: PlanCache::new(),
             registry: Arc::new(ql_functions::default_registry()),
@@ -241,6 +305,7 @@ impl WorkbookSession {
             events: Vec::new(),
             txns: HashMap::new(),
             next_txn_id: 1,
+            undo_manager,
         }
     }
 
@@ -327,6 +392,27 @@ impl WorkbookSession {
         let out = f(&mut rt);
         self.plan_cache = rt.into_plan_cache();
         guard.armed = false;
+        out
+    }
+
+    /// Collapse all op-log commits produced by `f` into ONE undo unit
+    /// (inc.2c-6, HARD QUESTION 1). Most commands already produce exactly one
+    /// Loro commit, so they do NOT use this. The exceptions are `rename_table`
+    /// and `rename_column`, whose `WorkbookRuntime` producers append the
+    /// structural rename op AND one `Op::PutFormula` per rewritten formula cell
+    /// as SEPARATE `oplog.append` calls (= separate commits; see `tables.rs`
+    /// F10) — so with `set_merge_interval(0)` they would otherwise split into
+    /// N+1 undo units. Bracketing them in a Loro undo group makes one `undo()`
+    /// revert the whole rename. `group_end` is infallible (a no-op without a
+    /// matching `group_start`); we run it on BOTH the success and error paths so
+    /// a failing `f` cannot leave a dangling open group.
+    fn grouped<R>(&mut self, f: impl FnOnce(&mut Self) -> EngineResult<R>) -> EngineResult<R> {
+        // A failed `group_start` is a Loro-internal fault (e.g. a group already
+        // open — unreachable from the single-writer session) → loud, not
+        // swallowed. We have NOT mutated anything yet, so returning here is safe.
+        self.undo_manager.group_start().map_err(map_loro_undo_err)?;
+        let out = f(self);
+        self.undo_manager.group_end();
         out
     }
 
@@ -558,6 +644,70 @@ impl WorkbookSession {
         self.epoch = mint_epoch();
         self.change_log.clear();
         self.change_log_floor = self.state_seq;
+    }
+
+    /// Rebuild the live workbook + calcgraph from the (post-undo/redo) op-log,
+    /// recompute computed values, and bump the epoch (inc.2c-6 undo/redo).
+    ///
+    /// After a Loro `undo()`/`redo()`, the UndoManager retracts (or re-applies)
+    /// the commit(s) for the reverted command, so the op-log's visible list
+    /// (`OpLog::iter`) now yields the POST-undo op sequence. But the session's
+    /// LIVE `workbook` + `graph` still reflect the pre-undo state — Loro reverts
+    /// only its own op-list, not our derived workbook/graph (which are NOT Loro
+    /// containers). So we re-derive both from the op-log:
+    ///
+    /// 1. `replay_into` a FRESH `Workbook` from the op-log. Replay persists
+    ///    formula TEXT without evaluating (its doc contract), so computed values
+    ///    are not yet present.
+    /// 2. Rebuild the calcgraph from that workbook (mirrors `from_workbook`).
+    /// 3. `recompute_all` to fill computed values — run through a per-edit
+    ///    runtime WITH THE OP-LOG DETACHED (`with_runtime_no_oplog`) so the
+    ///    recompute appends NO ops (it must not pollute the log we just
+    ///    re-materialized FROM, nor feed the UndoManager a spurious commit).
+    ///    Structural recompute failures surface as `CellDiagnostic` events
+    ///    (never silently dropped), mirroring `run_recalc`. NOTE: this does NOT
+    ///    create an operation-registry entry / `Busy` transition — undo/redo are
+    ///    fast synchronous re-derivations, not user-cancellable long ops; the
+    ///    op-registry is the shape the out-of-process 6.4/6.5 paths reuse, and a
+    ///    re-materialization is internal bookkeeping, not a recalc command.
+    /// 4. `bump_epoch` so the next `snapshot_delta` from any pre-undo token
+    ///    returns `full_rebuild_required` (`EpochMismatch`) — the wholesale
+    ///    rebuild is not incrementally delta-expressible. The token thus changes
+    ///    after every consumed undo/redo.
+    ///
+    /// A replay error here is a torn-engine condition (the op-log is the source
+    /// of truth and must replay): map it loud (`map_replay_err`), never swallow.
+    fn rematerialize(&mut self) -> EngineResult<()> {
+        // Replay onto a clone of the construction-time baseline (NOT a fresh
+        // empty workbook): the op-log holds only post-construction edits, so
+        // `baseline + (post-undo log)` reconstructs the correct state and
+        // preserves any pre-loaded content. Empty/trivial for the `new()` path.
+        let mut wb = self.baseline.clone();
+        ql_oplog::replay_into(&self.oplog, &mut wb, &self.registry).map_err(map_replay_err)?;
+        self.workbook = wb;
+        self.graph = CalcgraphSession::rebuild_from_workbook(&self.workbook).session;
+        // Recompute computed values with the op-log detached (no spurious ops /
+        // no UndoManager commit). The result's failures become diagnostics.
+        let result = self.with_runtime_no_oplog(|rt| rt.recompute_all());
+        for failure in &result.failures {
+            self.events.push(Event::CellDiagnostic {
+                diagnostic: Diagnostic {
+                    addr: Some(CellAddr {
+                        sheet: failure.sheet,
+                        row: failure.row,
+                        col: failure.col,
+                    }),
+                    severity: Severity::Error,
+                    code: "formula_recompute_failed".to_string(),
+                    message: failure.error.to_string(),
+                },
+            });
+        }
+        // The wholesale rebuild cannot be conveyed incrementally → force a full
+        // rebuild for any outstanding token (and advance the state token).
+        self.bump_epoch();
+        self.state_seq += 1;
+        Ok(())
     }
 
     /// Build a delta that tells the caller to reseed via `snapshot()` (§4.3):
@@ -1015,18 +1165,28 @@ impl EngineSession for WorkbookSession {
 
     fn rename_table(&mut self, old_name: &str, new_name: &str) -> EngineResult<()> {
         self.ensure_ready()?;
-        self.with_runtime(|rt| rt.rename_table(old_name, new_name))
-            .map(|_affected| ())
-            .map_err(map_runtime_err)?;
+        // HARD QUESTION 1: `rename_table`'s producer appends `Op::RenameTable`
+        // plus one `Op::PutFormula` per rewritten formula cell as separate
+        // commits (tables.rs F10) → N+1 undo units under merge_interval(0). Group
+        // them so one `undo()` reverts the whole rename.
+        self.grouped(|s| {
+            s.with_runtime(|rt| rt.rename_table(old_name, new_name))
+                .map(|_affected| ())
+                .map_err(map_runtime_err)
+        })?;
         self.bump_epoch(); // see create_table
         Ok(())
     }
 
     fn rename_column(&mut self, table: &str, old_col: &str, new_col: &str) -> EngineResult<()> {
         self.ensure_ready()?;
-        self.with_runtime(|rt| rt.rename_column(table, old_col, new_col))
-            .map(|_affected| ())
-            .map_err(map_runtime_err)?;
+        // HARD QUESTION 1: identical multi-commit shape to `rename_table`
+        // (`Op::RenameColumn` + per-cell `Op::PutFormula`) → group into one unit.
+        self.grouped(|s| {
+            s.with_runtime(|rt| rt.rename_column(table, old_col, new_col))
+                .map(|_affected| ())
+                .map_err(map_runtime_err)
+        })?;
         self.bump_epoch(); // see create_table
         Ok(())
     }
@@ -1713,21 +1873,53 @@ impl EngineSession for WorkbookSession {
 
     // --- Undo / redo (§3.8) ---
 
+    /// Undo the last command (inc.2c-6). Asks Loro to retract the last commit
+    /// (one undo unit = one command, by `set_merge_interval(0)` + the
+    /// one-commit-per-command invariant — see the `undo_manager` field doc), then
+    /// re-materializes the live workbook + graph from the now-compacted op-log
+    /// ([`rematerialize`]).
+    ///
+    /// Empty undo stack ⇒ `consumed: false` with the version token UNCHANGED —
+    /// NOT an error (contract §3.8). A consumed undo advances the token (epoch
+    /// bump in `rematerialize`). A Loro-internal failure is mapped loud
+    /// (`map_loro_undo_err` → `Internal`), never swallowed.
+    ///
+    /// [`rematerialize`]: WorkbookSession::rematerialize
     fn undo(&mut self) -> EngineResult<UndoRedoResult> {
-        Err(not_implemented("undo"))
+        self.ensure_ready()?;
+        let consumed = self.undo_manager.undo().map_err(map_loro_undo_err)?;
+        if consumed {
+            self.rematerialize()?;
+        }
+        Ok(UndoRedoResult {
+            consumed,
+            version: self.current_version(),
+        })
     }
 
+    /// Redo the last undone command (inc.2c-6). Symmetric to [`undo`]: Loro
+    /// re-applies the previously-retracted commit, then we re-materialize.
+    /// Empty redo stack ⇒ `consumed: false`, token unchanged.
+    ///
+    /// [`undo`]: WorkbookSession::undo
     fn redo(&mut self) -> EngineResult<UndoRedoResult> {
-        Err(not_implemented("redo"))
+        self.ensure_ready()?;
+        let consumed = self.undo_manager.redo().map_err(map_loro_undo_err)?;
+        if consumed {
+            self.rematerialize()?;
+        }
+        Ok(UndoRedoResult {
+            consumed,
+            version: self.current_version(),
+        })
     }
 
     fn can_undo(&self) -> bool {
-        // No undo machinery wired in this increment → no step available.
-        false
+        self.undo_manager.can_undo()
     }
 
     fn can_redo(&self) -> bool {
-        false
+        self.undo_manager.can_redo()
     }
 
     // --- Functions (§3.9; impl in 6.4) ---
@@ -2014,6 +2206,41 @@ fn map_runtime_err(e: RuntimeError) -> EngineError {
     }
 }
 
+/// Map a `loro::UndoManager::{undo,redo}` failure to an `EngineError`
+/// (inc.2c-6). Loro returns `LoroError` from `undo()`/`redo()` only for
+/// genuinely internal conditions — a re-entrant call while another undo is in
+/// flight (`UndoManager` is `&mut`-driven from the single-writer session, so
+/// this is unreachable here), or a doc-internal checkout/import error. An empty
+/// stack is NOT an error (Loro returns `Ok(false)`), so anything that DOES reach
+/// here is an engine-internal fault, not a caller mistake → classify `Internal`
+/// (NOT `Lifecycle`: the session lifecycle is `Ready` and valid; the fault is in
+/// the undo machinery, and surfacing it as `Internal` matches how the other
+/// "engine bug, not caller error" paths classify — e.g. `oplog_loro`,
+/// `recompute_iteration_cap`). Never swallowed (No-Fallbacks): the error is
+/// surfaced loud so an unexpected Loro undo failure is visible, not masked as a
+/// no-op `consumed: false`.
+fn map_loro_undo_err(e: loro::LoroError) -> EngineError {
+    EngineError::new(
+        ErrorClass::Internal,
+        "undo_manager_failed",
+        format!("undo/redo failed in the Loro undo manager: {e}"),
+    )
+}
+
+/// Map a `ql_oplog::ReplayError` (from `replay_into` during undo/redo
+/// re-materialization, inc.2c-6) to an `EngineError`. A replay failure means the
+/// op-log — the single source of truth we rebuild the live workbook FROM —
+/// could not be re-applied; that is a torn-engine / corrupt-log condition, not a
+/// caller mistake → loud `Internal`. Never swallowed (No-Fallbacks): a failed
+/// replay must surface, not silently leave the session on stale state.
+fn map_replay_err(e: ql_oplog::replay::ReplayError) -> EngineError {
+    EngineError::new(
+        ErrorClass::Internal,
+        "replay_failed",
+        format!("re-materializing the workbook from the op-log failed: {e}"),
+    )
+}
+
 /// Map a direct `OpLog::append` failure (the structure-op emission path —
 /// delete/restore/move sheet append ops outside a `WorkbookRuntime`) to an
 /// `EngineError`.
@@ -2152,18 +2379,22 @@ mod tests {
     #[test]
     fn deferred_methods_surface_capability_error() {
         let mut s = WorkbookSession::new();
-        // `begin_transaction` is NO LONGER here — it ships in inc.2c-5. The
-        // remaining deferred methods still surface the honest Capability error.
+        // `begin_transaction` ships in inc.2c-5; `undo`/`redo` ship in inc.2c-6
+        // (no longer Capability errors). The remaining deferred methods still
+        // surface the honest Capability error.
         for err in [
             s.open("/tmp/x.qbook").unwrap_err(),
-            s.undo().unwrap_err(),
-            s.redo().unwrap_err(),
+            s.import(&[], "xlsx").unwrap_err(),
+            s.list_functions().unwrap_err(),
         ] {
             assert_eq!(err.class, ErrorClass::Capability);
             assert_eq!(err.code, "not_implemented_in_v1_core");
         }
+        // A fresh session has nothing to undo/redo (but the methods are real now).
         assert!(!s.can_undo());
         assert!(!s.can_redo());
+        assert!(!s.undo().unwrap().consumed);
+        assert!(!s.redo().unwrap().consumed);
     }
 
     #[test]
@@ -3466,5 +3697,542 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.class, ErrorClass::Lifecycle);
         assert_eq!(err.code, "invalid_state");
+    }
+
+    // --- Undo / redo (inc.2c-6) ---
+
+    /// **Audit regression (Codex HIGH / Opus M1, inc.2c-7):** a session wrapping
+    /// a PRE-POPULATED workbook must not lose that baseline content when a later
+    /// session edit is undone. `rematerialize` replays the (post-undo) op-log
+    /// onto a CLONE of the construction-time baseline — NOT a fresh empty
+    /// workbook — so pre-loaded cells survive (and redo cannot fail replay for
+    /// lack of an `AddSheet`).
+    #[test]
+    fn undo_preserves_prepopulated_baseline_workbook() {
+        let mut wb = Workbook::new();
+        let sheet = wb.add_sheet("Base");
+        // Baseline content: present at construction, NOT recorded in the op-log.
+        wb.put_at(sheet, 0, 0, Value::Number(42.0));
+        let mut s = WorkbookSession::from_workbook(wb);
+
+        // A session edit — THIS is in the op-log (and the undo stack).
+        s.set_value(addr(sheet, 0, 1), CellValue::Number { number: 7.0 })
+            .unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 7.0 })
+        );
+
+        // Undo the session edit. The undone cell is gone; the BASELINE survives.
+        let res = s.undo().unwrap();
+        assert!(res.consumed);
+        assert!(
+            s.cell(addr(sheet, 0, 1)).unwrap().is_none(),
+            "the undone session edit must be gone"
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 42.0 }),
+            "the pre-loaded baseline cell must NOT be dropped by undo (Codex HIGH)"
+        );
+
+        // Redo re-applies the edit onto the preserved baseline (no replay failure).
+        let res = s.redo().unwrap();
+        assert!(res.consumed);
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 42.0 })
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 7.0 })
+        );
+    }
+
+    /// undo a `set_value` → the cell reverts; redo → it reapplies; the version
+    /// token changes after each consumed step.
+    #[test]
+    fn undo_redo_set_value_reverts_and_reapplies() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 42.0 })
+            .unwrap();
+        let v_after_set = s.snapshot().unwrap().version;
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 42.0 })
+        );
+        assert!(s.can_undo());
+
+        // Undo: the cell goes back to empty; token changes; redo now available.
+        let r = s.undo().unwrap();
+        assert!(r.consumed);
+        assert_ne!(v_after_set, r.version, "a consumed undo advances the token");
+        assert!(
+            s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
+            "undo must revert the set_value"
+        );
+        assert!(s.can_redo());
+
+        // Redo: the value reappears; token changes again.
+        let v_after_undo = s.snapshot().unwrap().version;
+        let r2 = s.redo().unwrap();
+        assert!(r2.consumed);
+        assert_ne!(
+            v_after_undo, r2.version,
+            "a consumed redo advances the token"
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 42.0 }),
+            "redo must reapply the set_value"
+        );
+    }
+
+    /// undo a `set_formula` → the formula is gone AND its dependent reverts
+    /// (proves the recompute ran during re-materialization).
+    #[test]
+    fn undo_set_formula_reverts_dependents() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 1), "A1*2").unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 20.0 })
+        );
+        // Undo the set_formula: B1's formula is gone and the cell is empty again.
+        assert!(s.undo().unwrap().consumed);
+        assert!(
+            s.cell(addr(sheet, 0, 1)).unwrap().is_none(),
+            "undo must remove the formula and its computed value"
+        );
+        // A1 (set earlier, a separate undo unit) is untouched.
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 10.0 })
+        );
+    }
+
+    /// THE F2 payoff: undo a `set_value(Blank)` clear → the prior value is
+    /// RESTORED. Before F2 the Blank-clear appended no op, so undo could not
+    /// reconstruct the cleared value; `Op::ClearValue` makes it replayable, and
+    /// undo retracts that op so the prior value re-materializes.
+    #[test]
+    fn undo_blank_clear_restores_prior_value() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 3, 3), CellValue::Number { number: 7.0 })
+            .unwrap();
+        // Clear the value via set_value(Blank) — its own undo unit (Op::ClearValue).
+        s.set_value(addr(sheet, 3, 3), CellValue::Blank).unwrap();
+        assert!(
+            s.cell(addr(sheet, 3, 3)).unwrap().is_none(),
+            "the Blank-clear emptied the cell"
+        );
+        // Undo the clear → the prior value (7) is back. This is the F2 fix.
+        assert!(s.undo().unwrap().consumed);
+        assert_eq!(
+            s.cell(addr(sheet, 3, 3)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 7.0 }),
+            "undo of a Blank-clear must restore the prior value (F2 payoff)"
+        );
+    }
+
+    /// undo a `batch` (multi-op) → the WHOLE batch reverts as ONE undo unit:
+    /// a single `undo()` call empties every cell the batch touched.
+    #[test]
+    fn undo_batch_reverts_whole_batch() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.batch(
+            vec![
+                SessionOp::SetValue {
+                    addr: addr(sheet, 0, 0),
+                    value: CellValue::Number { number: 1.0 },
+                },
+                SessionOp::SetValue {
+                    addr: addr(sheet, 1, 0),
+                    value: CellValue::Number { number: 2.0 },
+                },
+                SessionOp::SetFormula {
+                    addr: addr(sheet, 0, 1),
+                    text: "A1+A2".to_string(),
+                },
+            ],
+            BatchOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 3.0 })
+        );
+        // ONE undo reverts the entire batch (one Op::BatchCommit = one unit).
+        let r = s.undo().unwrap();
+        assert!(r.consumed);
+        assert!(s.cell(addr(sheet, 0, 0)).unwrap().is_none());
+        assert!(s.cell(addr(sheet, 1, 0)).unwrap().is_none());
+        assert!(s.cell(addr(sheet, 0, 1)).unwrap().is_none());
+        // The batch was a single undo unit: exactly ONE more unit remains (the
+        // earlier `add_sheet`); undoing it empties the stack. (If the batch had
+        // split into multiple units, this single extra undo would not clear it.)
+        assert!(s.can_undo(), "the add_sheet unit still remains");
+        assert!(s.undo().unwrap().consumed, "undo the add_sheet");
+        assert!(
+            !s.can_undo(),
+            "after the batch (one unit) + add_sheet (one unit) the stack is empty"
+        );
+    }
+
+    /// HARD QUESTION 1 granularity proof: `clear` of a formula cell is ONE undo
+    /// unit. `clear_formula` of a value-bearing formula emits PutValue +
+    /// ClearFormula, which `WorkbookRuntime::clear_formula` wraps in a single
+    /// `Op::BatchCommit` (one commit). So a single `undo()` fully reverts the
+    /// clear — the formula AND its value come back in one step.
+    #[test]
+    fn undo_clear_of_formula_cell_is_one_unit() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_formula(addr(sheet, 0, 0), "3 + 4").unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 7.0 })
+        );
+        s.clear(addr(sheet, 0, 0)).unwrap();
+        // clear preserves the scalar value, strips the formula.
+        let after_clear = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(after_clear.formula, None);
+        assert_eq!(after_clear.value, Some(CellValue::Number { number: 7.0 }));
+        // ONE undo restores the formula AND its computed value together.
+        assert!(s.undo().unwrap().consumed);
+        let restored = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(
+            restored.formula.as_deref(),
+            Some("3 + 4"),
+            "undo of clear must restore the formula in one unit"
+        );
+        assert_eq!(restored.value, Some(CellValue::Number { number: 7.0 }));
+        // The clear + the set_formula are two distinct units; after undoing the
+        // clear, one more undo unit (the set_formula) remains.
+        assert!(s.can_undo());
+    }
+
+    /// undo on an empty stack → `consumed: false`, NOT an error, token unchanged.
+    /// A brand-new session has issued NO commands → nothing on the undo stack.
+    /// (NOTE: `add_sheet` is itself an undoable command — a single `Op::AddSheet`
+    /// commit — so a session that added a sheet would have a non-empty stack; the
+    /// empty-stack case must use a pristine session.)
+    #[test]
+    fn undo_empty_stack_is_not_error_token_unchanged() {
+        let mut s = WorkbookSession::new();
+        assert!(!s.can_undo(), "a pristine session has nothing to undo");
+        let v0 = s.snapshot().unwrap().version;
+        let r = s.undo().unwrap();
+        assert!(
+            !r.consumed,
+            "empty undo stack ⇒ consumed:false (not an error)"
+        );
+        assert_eq!(r.version, v0, "an empty undo must not advance the token");
+        assert_eq!(
+            v0,
+            s.snapshot().unwrap().version,
+            "session state unchanged after empty undo"
+        );
+    }
+
+    /// redo on an empty stack → `consumed: false` (mirrors undo).
+    #[test]
+    fn redo_empty_stack_is_not_error() {
+        let mut s = WorkbookSession::new();
+        let v0 = s.snapshot().unwrap().version;
+        let r = s.redo().unwrap();
+        assert!(!r.consumed);
+        assert_eq!(r.version, v0);
+    }
+
+    /// undo→redo round-trip returns to the SAME observable state (cell values
+    /// equal); `can_undo`/`can_redo` reflect the stack across edit→undo→redo.
+    #[test]
+    fn undo_redo_round_trip_restores_state_and_flags_track() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 100.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 1), "A1 + 1").unwrap();
+        // Capture the post-edit observable state.
+        let a1 = s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value;
+        let b1 = s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value;
+        assert_eq!(b1, Some(CellValue::Number { number: 101.0 }));
+
+        // Flags before any undo: can_undo true, can_redo false.
+        assert!(s.can_undo());
+        assert!(!s.can_redo());
+
+        // Undo both edits. (The earlier `add_sheet` is a THIRD undo unit that we
+        // leave on the stack, so `can_undo` stays true here.)
+        assert!(s.undo().unwrap().consumed); // undo set_formula
+        assert!(s.undo().unwrap().consumed); // undo set_value
+        assert!(s.can_redo());
+        assert!(
+            s.can_undo(),
+            "the add_sheet unit still remains after undoing both edits"
+        );
+        assert!(s.cell(addr(sheet, 0, 0)).unwrap().is_none());
+        assert!(s.cell(addr(sheet, 0, 1)).unwrap().is_none());
+
+        // Redo both edits → identical observable state.
+        assert!(s.redo().unwrap().consumed); // redo set_value
+        assert!(s.redo().unwrap().consumed); // redo set_formula
+        assert!(!s.can_redo(), "both edits redone");
+        assert!(s.can_undo());
+        assert_eq!(s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value, a1);
+        assert_eq!(s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value, b1);
+    }
+
+    /// After a consumed undo, `snapshot_delta(old_token)` returns
+    /// `full_rebuild_required: true` (EpochMismatch) — the wholesale
+    /// re-materialization bumps the epoch.
+    #[test]
+    fn snapshot_delta_after_undo_forces_full_rebuild() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        let v_before_undo = s.snapshot().unwrap().version;
+        assert!(s.undo().unwrap().consumed);
+        let d = s.snapshot_delta(&v_before_undo).unwrap();
+        assert!(d.full_rebuild_required, "undo must force a full rebuild");
+        assert_eq!(
+            d.full_rebuild_reason,
+            Some(FullRebuildReason::EpochMismatch)
+        );
+    }
+
+    /// HARD QUESTION 2 (a): rename a sheet, then make + undo an UNRELATED later
+    /// edit → the sheet KEEPS its renamed name after re-materialization (linear
+    /// replay reproduces the rename faithfully; no ql-collab repair pass needed).
+    #[test]
+    fn undo_unrelated_edit_preserves_earlier_rename() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("Original", 16384).unwrap();
+        s.set_value(addr(sid, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        s.rename_sheet(sid, "Renamed").unwrap();
+        // An unrelated later edit (a different cell), then undo it.
+        s.set_value(addr(sid, 5, 5), CellValue::Number { number: 9.0 })
+            .unwrap();
+        assert!(s.undo().unwrap().consumed); // undo the (5,5) edit only
+                                             // The rename must survive the re-materialization.
+        let names: Vec<String> = s
+            .list_sheets()
+            .unwrap()
+            .into_iter()
+            .map(|x| x.name)
+            .collect();
+        assert!(
+            names.contains(&"Renamed".to_string()),
+            "linear replay must preserve the rename; got {names:?}"
+        );
+        assert!(!names.contains(&"Original".to_string()));
+        // The unrelated edit is gone; the original A1 value survives.
+        assert!(s.cell(addr(sid, 5, 5)).unwrap().is_none());
+        assert_eq!(
+            s.cell(addr(sid, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 1.0 })
+        );
+    }
+
+    /// HARD QUESTION 2 (b): rename a sheet TWICE (A→B→C), undo once → back to B
+    /// (the previous name), with cells intact. Proves linear replay reproduces a
+    /// rename CHAIN exactly (each RenameSheet keys off the current name).
+    #[test]
+    fn undo_one_of_two_renames_returns_to_intermediate_name() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("A", 16384).unwrap();
+        s.set_value(addr(sid, 0, 0), CellValue::Number { number: 5.0 })
+            .unwrap();
+        s.rename_sheet(sid, "B").unwrap();
+        s.rename_sheet(sid, "C").unwrap();
+        assert_eq!(s.list_sheets().unwrap()[0].name, "C");
+        // Undo the A→...→C's last rename (B→C) → name is B again.
+        assert!(s.undo().unwrap().consumed);
+        let names: Vec<String> = s
+            .list_sheets()
+            .unwrap()
+            .into_iter()
+            .map(|x| x.name)
+            .collect();
+        assert_eq!(names, vec!["B".to_string()], "undo of B→C returns to B");
+        // Cells intact.
+        assert_eq!(
+            s.cell(addr(sid, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 5.0 })
+        );
+    }
+
+    /// HARD QUESTION 2 (c): a table rename + undo re-materializes faithfully via
+    /// linear replay (no repair pass). After undo, the OLD table name resolves
+    /// (drop succeeds) and the new name does not (drop → NotFound).
+    #[test]
+    fn undo_table_rename_restores_old_name() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        let spec = TableSpec {
+            name: "Orig".into(),
+            sheet: sid,
+            top_row: 0,
+            top_col: 0,
+            rows: 3,
+            cols: 2,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["A".into(), "B".into()],
+        };
+        s.create_table(spec).unwrap();
+        s.rename_table("Orig", "NewName").unwrap();
+        // Undo the rename → "Orig" exists again, "NewName" does not.
+        assert!(s.undo().unwrap().consumed);
+        // Dropping "NewName" must now be NotFound (the rename was reverted).
+        assert_eq!(
+            s.drop_table("NewName").unwrap_err().class,
+            ErrorClass::NotFound
+        );
+        // Dropping "Orig" succeeds (the original name is back).
+        s.drop_table("Orig")
+            .expect("undo of table rename must restore the old table name");
+    }
+
+    /// HARD QUESTION 1 (table-rename grouping proof): a `rename_table` of a table
+    /// that has a formula REFERENCING it appends `Op::RenameTable` + one
+    /// `Op::PutFormula` (the rewritten reference) as SEPARATE commits. The
+    /// `grouped` wrapper collapses them into ONE undo unit, so a single `undo()`
+    /// reverts the entire rename (table name AND the rewritten formula text).
+    /// Without grouping this would take two `undo()` calls and leave a torn
+    /// intermediate state.
+    #[test]
+    fn undo_table_rename_with_formula_ref_is_one_unit() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        let spec = TableSpec {
+            name: "Sales".into(),
+            sheet: sid,
+            top_row: 0,
+            top_col: 0,
+            rows: 3,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["Amount".into()],
+        };
+        s.create_table(spec).unwrap();
+        // A formula referencing the table by name → its stored text mentions
+        // "Sales", so rename_table will rewrite it (an extra PutFormula commit).
+        // `SUM(Sales[Amount])` is the v1-binding structured-reference form used
+        // by the WorkbookRuntime rename_table happy-path test.
+        s.set_formula(addr(sid, 10, 0), "SUM(Sales[Amount])")
+            .unwrap();
+        let stored_before = s.cell(addr(sid, 10, 0)).unwrap().unwrap().formula.unwrap();
+        assert!(
+            stored_before.contains("Sales"),
+            "formula text should reference the table: {stored_before}"
+        );
+
+        // Rename → the formula text is rewritten to the new name.
+        s.rename_table("Sales", "Revenue").unwrap();
+        let stored_after = s.cell(addr(sid, 10, 0)).unwrap().unwrap().formula.unwrap();
+        assert!(
+            stored_after.contains("Revenue") && !stored_after.contains("Sales"),
+            "rename should rewrite the reference: {stored_after}"
+        );
+
+        // ONE undo reverts BOTH the table rename AND the formula rewrite — the
+        // grouping proof. (Without grouping, this single undo would revert only
+        // the last PutFormula, leaving the table still named "Revenue".)
+        assert!(s.undo().unwrap().consumed);
+        let stored_restored = s.cell(addr(sid, 10, 0)).unwrap().unwrap().formula.unwrap();
+        assert!(
+            stored_restored.contains("Sales") && !stored_restored.contains("Revenue"),
+            "one undo must restore the original formula reference: {stored_restored}"
+        );
+        // The table name is back to "Sales" (drop by old name succeeds).
+        assert_eq!(
+            s.drop_table("Revenue").unwrap_err().class,
+            ErrorClass::NotFound,
+            "the new table name must be gone after a single undo"
+        );
+        s.drop_table("Sales")
+            .expect("one undo must restore the old table name together with the formula");
+    }
+
+    /// undo a transaction commit (begin→txn_add→commit→undo) → the whole
+    /// committed transaction reverts as ONE undo unit (it routed through `batch`
+    /// → one `Op::BatchCommit`).
+    #[test]
+    fn undo_committed_transaction_reverts_as_one_unit() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let txn = s.begin_transaction().unwrap();
+        s.txn_add(
+            txn,
+            SessionOp::SetValue {
+                addr: addr(sheet, 0, 0),
+                value: CellValue::Number { number: 11.0 },
+            },
+        )
+        .unwrap();
+        s.txn_add(
+            txn,
+            SessionOp::SetValue {
+                addr: addr(sheet, 1, 0),
+                value: CellValue::Number { number: 22.0 },
+            },
+        )
+        .unwrap();
+        s.commit_transaction(txn).unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 11.0 })
+        );
+        // ONE undo reverts the entire committed transaction.
+        assert!(s.undo().unwrap().consumed);
+        assert!(s.cell(addr(sheet, 0, 0)).unwrap().is_none());
+        assert!(s.cell(addr(sheet, 1, 0)).unwrap().is_none());
+        // The committed transaction was a single undo unit: exactly ONE more
+        // unit (the earlier add_sheet) remains; undoing it empties the stack.
+        assert!(s.can_undo(), "the add_sheet unit still remains");
+        assert!(s.undo().unwrap().consumed, "undo the add_sheet");
+        assert!(
+            !s.can_undo(),
+            "the committed transaction collapsed to exactly one undo unit"
+        );
+    }
+
+    /// undo/redo are gated `Ready`: a Closed session rejects them with
+    /// `invalid_state` (uniform with the other mutators).
+    #[test]
+    fn undo_redo_on_closed_session_is_invalid_state() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("S", 16384).unwrap();
+        s.close().unwrap();
+        assert_eq!(s.undo().unwrap_err().code, "invalid_state");
+        assert_eq!(s.redo().unwrap_err().code, "invalid_state");
+    }
+
+    /// A new edit AFTER an undo clears the redo stack (standard undo semantics):
+    /// edit → undo (redo available) → new edit → redo no longer available.
+    #[test]
+    fn new_edit_after_undo_clears_redo_stack() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        assert!(s.undo().unwrap().consumed);
+        assert!(s.can_redo());
+        // A fresh edit invalidates the redo stack.
+        s.set_value(addr(sheet, 0, 1), CellValue::Number { number: 2.0 })
+            .unwrap();
+        assert!(!s.can_redo(), "a new edit must clear the redo stack");
+        assert!(s.can_undo());
     }
 }

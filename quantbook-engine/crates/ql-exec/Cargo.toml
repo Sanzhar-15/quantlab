@@ -30,6 +30,12 @@ ql-oplog          = { path = "../ql-oplog" }
 # the contract here, where Workbook + OpLog + CalcgraphSession + PlanCache +
 # FunctionRegistry are already composed (GAP-PS-09 / session-api.md §2.1).
 ql-session        = { path = "../ql-session" }
+# Phase 6.1B inc.2c-6 (2026-05-27): undo/redo. `WorkbookSession` owns a
+# `loro::UndoManager` field (constructed via `OpLog::new_undo_manager`), so the
+# type must be nameable here. Mirrors ql-collab's Phase 5.4 V1 direct dep for
+# the same reason — `loro` is already a transitive dep through ql-oplog; this
+# only makes the `UndoManager` type referenceable, no new transitive risk.
+loro              = { workspace = true }
 # serde_json::Value appears in two EngineSession signatures (publish_dataset /
 # materialize_query opaque payloads). Workspace dep, already linked transitively.
 serde_json        = { workspace = true }
