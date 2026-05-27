@@ -259,9 +259,17 @@ v1 token source. **Resolution (locked):**
   design):** `recompute_dirty`/`recompute_all` write recomputed dependent values via
   `Workbook::put_computed_at` and append **no** ops, so the token is unchanged across a recalc even
   though cell values changed. This is fine for `snapshot()` (it returns full current state regardless),
-  but it means `snapshot_delta` **cannot** be a pure op-walk — see §4.3 and the deferred-implementation
-  note (`WorkbookSession::snapshot_delta`): a correct delta needs a session-maintained change-log that
-  also records recompute-affected cells (or a `&mut`-cached last-snapshot diff).
+  but it means `snapshot_delta` **cannot** be a pure op-walk — see §4.3.
+- **✅ RESOLVED (6.1B inc.2c-3, `20427b1c4c7`): the token counter is a session `state_seq`, NOT
+  `OpLog::len()`.** `state_seq` is a monotonic clock that advances on every committed mutation AND every
+  recompute that changed ≥1 cell (and on a `set_value(Blank)` clear, which also appends no op) — so two
+  distinct visible states never share a token. The opaque 24-byte `{epoch, state_seq}` shape is
+  unchanged (binding-invisible; only the counter's *meaning* changed). `snapshot_delta` is implemented
+  as **design (a)**: a bounded session change-log keyed by `state_seq` (each mutator records its touched
+  cells/sheets/formats; `RecomputeResult.changed_cells` feeds recompute's set), keeping
+  `snapshot_delta(&self)`. The `epoch` is bumped for states the delta DTO cannot incrementally express
+  (`move_sheet` reorder, `restore_sheet` reposition, all table ops), forcing `EpochMismatch` full
+  rebuild. The Loro VV remains reserved for the v1.5 collab path.
 - **Validity rules (locked):**
   - A token is valid only within the **same live session + epoch**. Single-writer sessions advance
     `op_count` purely by local appends; undo/redo bumps the epoch (so the non-monotonic `len()` after a

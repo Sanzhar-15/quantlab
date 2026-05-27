@@ -1,36 +1,50 @@
 # 6.1B Increment 2 — `WorkbookSession` Implementation Plan
 
-**Status:** ⏳ IN PROGRESS — **2b (core) + 2c-1 (read path) + 2c-2 (structure + table ops) + audit-fix
-SHIPPED 2026-05-26** (`83b1b33bac2` PlanCache → `7335a5a1bfa` core → `993492b6f9b` validate_formula/
-query_range/`CellValue::Blank` → `2b5e7a13f5b` delete/restore/move sheet + tables → `9f7a1645dbd`
-tombstone-read consistency audit fix). The owning `WorkbookSession` lives in
-`crates/ql-exec/src/session.rs` and `impl EngineSession`; **17 session tests + 653 ql-exec lib tests
-green, clippy clean.**
+**Status:** ⏳ IN PROGRESS — **2b/2c-1/2c-2 + audit-fix SHIPPED 2026-05-26; the 2026-05-27 inc.2 audit
+(F3–F10) + inc.2c-3 `snapshot_delta` SHIPPED 2026-05-27.** Chain: `83b1b33bac2` PlanCache →
+`7335a5a1bfa` core → `993492b6f9b` validate_formula/query_range/`CellValue::Blank` → `2b5e7a13f5b`
+delete/restore/move sheet + tables → `9f7a1645dbd` tombstone-read fix → **`879f3601747` inc.2 audit-fix
+(F3 panic-guard / F4 read-path bounds / F5 tombstone op-log fidelity / F6 require_live_sheet on
+rename+create_table / F7 query_range options fail-loud / F8 Appendix-A / F9–F10 docs)** → **`20427b1c4c7`
+inc.2c-3 snapshot_delta**. `WorkbookSession` is in `crates/ql-exec/src/session.rs`; **ql-exec lib 667/0,
+clippy clean, workspace `cargo check` green.**
 
 ### Method status — what the next window inherits (REAL vs surfaced-not-yet)
 **REAL (implemented + tested):** `lifecycle_state`, `close`; `set_value`, `set_formula`, `clear`,
 `set_format`, `register_format`, `validate_formula`; `add_sheet`, `rename_sheet`, `delete_sheet`,
 `restore_sheet`, `move_sheet`, `set_name`; `create_table`/`rename_table`/`rename_column`/`resize_table`/
-`drop_table`; `recalc_dirty`, `recalc_all`, `mark_volatiles_dirty`; `query_range`, `snapshot`, `cell`,
-`list_sheets`; `cancel`, `operation_status`, `poll_events`. (Construction: `new`/`from_workbook`.)
+`drop_table`; `recalc_dirty`, `recalc_all`, `mark_volatiles_dirty`; `query_range`, `snapshot`,
+**`snapshot_delta`**, `cell`, `list_sheets`; `cancel`, `operation_status`, `poll_events`. (Construction:
+`new`/`from_workbook`.)
 **DEFERRED — return `EngineError{class:Capability, code:"not_implemented_in_v1_core"}` (honest, never a
-fallback):** `open`/`import`/`save`/`export` (persistence); `snapshot_delta` (⚠️ design decision, §0 item
-3); `batch`/`begin_transaction`/`txn_add`/`commit_transaction`/`rollback_transaction`; `undo`/`redo`
+fallback):** `open`/`import`/`save`/`export` (persistence);
+`batch`/`begin_transaction`/`txn_add`/`commit_transaction`/`rollback_transaction`; `undo`/`redo`
 (`can_undo`/`can_redo` return `false`); `register_function`/`unregister_function`/`list_functions` (6.4);
 `write_range`/`publish_dataset`/`bind_range`/`refresh_source`/`materialize_query` (6.4/6.5).
 
 ### Known v1 limitations (documented, not bugs — revisit when relevant)
-- **`snapshot_delta` design decision (BLOCKS that method — see §0 item 3 + the in-code note).**
-- A tombstoned sheet is uniformly `NotFound` for reads + cell edits (`require_live_sheet`); restore
-  brings it (and its preserved cells) back. delete/restore/move use `require_sheet_exists`
-  (tombstone-agnostic) for idempotency.
-- `ops` HashMap + `events` Vec grow **unbounded** (no retention horizon yet).
-- `delete_sheet` does **not** proactively dirty cross-sheet dependents (matches the engine's current
-  cross-sheet-ref handling); a zero-dim `create_table` → `Conflict` (not `BadArgument`).
-- `recalc` does not advance the version token (recompute appends no ops) — see session-api.md §4.0.
+- **Version token = `{epoch, state_seq}`** (inc.2c-3): `state_seq` (NOT `oplog.len()`) advances on every
+  committed mutation + every recompute-with-changes, so the token is a true *state* token for delta.
+- **`snapshot_delta` = change-log design (a)** keyed by `state_seq` (bounded `CHANGE_LOG_CAP`); §4.3
+  rules implemented (empty→NoPriorVersion, epoch→EpochMismatch, future→fail-loud `invalid_version_token`,
+  `seq<floor`→StaleHorizon). **Epoch-bump (forces full rebuild) for states the delta DTO can't express:**
+  `move_sheet` (reorder), `restore_sheet` (reappears at an unconveyable position), all table ops (rewrite
+  arbitrary formula cells). `set_name` is delta-invisible (no names field in the snapshot DTO).
+- A tombstoned sheet is uniformly `NotFound` for reads + cell/structure edits (`require_live_sheet`,
+  incl. rename_sheet + create_table per F6); delete/restore use a tombstone pre-check (F5: double-delete
+  = true no-op; restore-of-live = `Conflict/sheet_not_deleted`). Formula EVAL still reads tombstoned
+  sheets (deliberate v1 semantic, F9 — no `#REF!` until v1.5 D7).
+- `ops` HashMap + `events` Vec grow **unbounded** (no retention horizon yet); `change_log` IS bounded.
+- `set_value(Blank)` on a value-only cell: token advances + appears in delta (F2 token half fixed), but
+  the clear is **not replayable** on save/load (pre-existing Phase-2A.3.b wire-format limitation) →
+  tracked to the persistence increment (emit a value-clear op / wire-encode Blank).
+- **F10 (tracked, pre-existing): table rename/rename_column are NOT append-before-mutate atomic** (Codex
+  HIGH; near-zero reachability — no float serde path; only Loro-internal failure). Fix = collect ops →
+  one `Op::BatchCommit` before any `put_formula`, mirroring `rename_sheet`. The misleading comment is
+  corrected; the fix is deferred. See `docs/audits/2026-05-27-inc2-session-audit/SYNTHESIS.md`.
 
-**Remaining sequence (NEXT):** snapshot_delta (decide first) → batch/txn → undo/redo → persistence →
-functions → reserved bulk → Node smoke migration → 6.1C audit.
+**Remaining sequence (NEXT):** batch/txn → undo/redo → persistence → functions → reserved bulk → Node
+smoke migration (+ pending `.node` rebuild + B#1/S2-01 mocha tests) → 6.1C audit.
 
 ### What 2b shipped (REAL)
 - **2a — PlanCache session-ownership** (§3): `WorkbookRuntime::with_session_state(.., PlanCache)` +
@@ -54,17 +68,14 @@ functions → reserved bulk → Node smoke migration → 6.1C audit.
    than `Vec<Option<CellValue>>`. Columnar dense read; empties → `CellValue::Blank`; inverted range →
    `BadArgument`; >1M-cell request → `BadArgument` (fail-loud OOM guard). `include_*` options reserved
    (v1 `RangeColumn` is values-only). Snapshot still omits blanks (`CellSnapshot.value: None`).
-3. ⚠️ **`snapshot_delta`** (DEFERRED — design decision needed; **resolve in the audit/next window**).
-   The obvious stateless op-walk (`ops[last_op_count..current)`) is **insufficient**: `recompute_dirty`/
-   `recompute_all` write recomputed dependents via `Workbook::put_computed_at` and **do NOT append ops**,
-   so an op-walk captures the user-edited cell (A1) but MISSES its recomputed dependents (B1=A1*2) — a
-   silently-incomplete delta (No-Fallbacks violation). And `snapshot_delta` is `&self`, so it can't
-   diff-against-a-cached-snapshot. Resolution options: **(a)** a session change-log keyed by version,
-   built during mutations + recompute — needs recompute to report changed coords (extend
-   `RecomputeResult`, or read the graph dirty set pre-recompute); **(b)** make it `&mut self` + a
-   last-snapshot diff cache (mirrors the proven collab path) — a contract change; **(c)** recompute
-   appends computed-value ops (heavy; pollutes the log). (a) is the likely choice. Full note in
-   `crates/ql-exec/src/session.rs` `snapshot_delta`.
+3. ✅ **`snapshot_delta`** (SHIPPED inc.2c-3, `20427b1c4c7`) — **design (a) chosen** (user-locked
+   2026-05-27): a session change-log keyed by a monotonic `state_seq`, keeping `snapshot_delta(&self)`.
+   `state_seq` REPLACES `oplog.len()` as the token counter (advances on every committed mutation AND
+   every recompute-with-changes), because the op-walk was doubly insufficient — recompute writes via
+   `put_computed_at` with no ops AND `set_value(Blank)` appends no op. `RecomputeResult` gained
+   `changed_cells` (recompute_dirty's precise VEQ set; recompute_all's full set). §4.3 rules + fail-loud
+   `invalid_version_token`. Epoch-bump for delta-inexpressible states (move/restore/table ops). The
+   `&mut self` full-diff option (b) was rejected (trait change + O(n)/call + single-baseline).
 4. ✅ **`delete_sheet`/`restore_sheet`/`move_sheet`** (SHIPPED inc.2c-2, `2b5e7a13f5b`) — fail-loud
    (unknown id → `NotFound`; out-of-range move index → `BadArgument`); validate against the live
    workbook, append `Op::{RemoveSheet,RestoreSheet,MoveSheet}` (append-before-mutate), then mutate.
