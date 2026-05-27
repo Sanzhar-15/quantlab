@@ -300,13 +300,23 @@ impl<'a> WorkbookTransaction<'a> {
                         col,
                         value,
                     } => {
-                        if let Some(wire) = CellWireValue::from_value(value) {
-                            log_ops.push(Op::PutValue {
+                        // **F2 Blank-durability closure (2026-05-27):** mirror
+                        // `set_value` — a Blank value (encoded as `None` by
+                        // `from_value`) emits the durable `Op::ClearValue`
+                        // rather than nothing, so a transaction's Blank-clear
+                        // is reproducible on replay.
+                        match CellWireValue::from_value(value) {
+                            Some(wire) => log_ops.push(Op::PutValue {
                                 sheet: *sheet,
                                 row: *row,
                                 col: *col,
                                 value: wire,
-                            });
+                            }),
+                            None => log_ops.push(Op::ClearValue {
+                                sheet: *sheet,
+                                row: *row,
+                                col: *col,
+                            }),
                         }
                         let had_formula = workbook.formula_at(*sheet, *row, *col).is_some();
                         if had_formula {

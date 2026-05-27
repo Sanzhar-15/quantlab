@@ -10,6 +10,7 @@
 //! | `Op` variant         | Replays to                                       |
 //! |----------------------|--------------------------------------------------|
 //! | `PutValue`           | `Workbook::put_at`                               |
+//! | `ClearValue`         | `Workbook::put_at(.., Value::Blank)` (F2 closure)|
 //! | `PutFormula`         | `Workbook::put_formula`                          |
 //! | `ClearFormula`       | `Workbook::clear_formula`                        |
 //! | `SetName`            | `Workbook::set_name`                             |
@@ -53,6 +54,53 @@ pub enum Op {
         row: RowId,
         col: ColId,
         value: CellWireValue,
+    },
+
+    /// **F2 Blank-durability closure (2026-05-27):** clear a cell's
+    /// literal VALUE (set it to `Value::Blank`) WITHOUT touching its
+    /// formula association. Replays to `Workbook::put_at(.., Value::Blank)`
+    /// — the SAME storage mechanism `WorkbookRuntime::set_value` uses
+    /// when handed `Value::Blank` (it clears the user overlay by writing
+    /// Blank, which the read cascade reports identically to an absent
+    /// entry).
+    ///
+    /// **Why a dedicated op**: `CellWireValue::from_value(&Value::Blank)`
+    /// returns `None` (Blank is the storage default, encoded as the
+    /// ABSENCE of a `CellRecord`), so a Blank `set_value` previously
+    /// emitted NO op at all. The workbook was cleared live, but the
+    /// clear was invisible to the op log — replaying the log into a
+    /// fresh workbook (the canonical rebuild path, `replay_into`) did
+    /// NOT reproduce the clear: a cell that was `5` then Blank-cleared
+    /// replayed back to `5`. That broke save/load durability AND undo
+    /// correctness (which re-materializes via replay). `ClearValue`
+    /// closes the gap: every value-clearing path now logs a replayable
+    /// op.
+    ///
+    /// **Tombstoned-sheet semantics** (mirrors `PutValue` /
+    /// `ClearFormula`, V3.5.0.3b): replay onto a tombstoned sheet is a
+    /// silent no-op. `apply_op` checks `workbook.is_sheet_removed(sheet)`
+    /// after `validate_cell` and returns `Ok(())` without writing.
+    /// Concurrent {ClearValue, RemoveSheet}: ClearValue-first clears the
+    /// cell then RemoveSheet tombstones (cell unreachable via snapshot);
+    /// RemoveSheet-first silently drops the ClearValue. Deterministic
+    /// causal-merge order resolves; all peers converge.
+    ///
+    /// **Wire format compatibility**: additive new variant on the serde-
+    /// tagged enum; **`OPLOG_SCHEMA_VERSION` NOT bumped** (consistent
+    /// with every prior variant addition — RenameSheet / RemoveSheet /
+    /// RestoreSheet / MoveSheet). **Backward-compat**: new binaries read
+    /// pre-F2 .qbook files cleanly (no `Op::ClearValue` instances).
+    /// **Forward-compat caveat**: pre-F2 binaries reading a post-F2
+    /// saved .qbook with `Op::ClearValue` instances WILL fail
+    /// deserialization with `OpLogError::Deserialize` (serde `tag =
+    /// "kind"` rejects unknown variant tags). Same forward-compat
+    /// property as every historical `Op` variant addition; see the
+    /// `Op::RemoveSheet` docstring for the V3.x maintainer guidance on
+    /// schema bumps.
+    ClearValue {
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
     },
 
     /// Single formula write (text only — replay re-evaluates via the

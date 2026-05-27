@@ -67,7 +67,9 @@ use loro::LoroValue;
 use thiserror::Error;
 
 use ql_functions::FunctionRegistry;
-use ql_oplog::{replay_into, CellWireValue, Op, OpLog, OpLogError, PeerId, ReplayError, PRESENCE_COMMIT_ORIGIN};
+use ql_oplog::{
+    replay_into, CellWireValue, Op, OpLog, OpLogError, PeerId, ReplayError, PRESENCE_COMMIT_ORIGIN,
+};
 
 /// **Phase 5.7 V3.4.0.2 (2026-05-23) -- per-cell snapshot-cache state.**
 ///
@@ -161,9 +163,27 @@ pub struct CellState {
 /// `BatchCommit`, append did not handle ghost-cell formula-only delete).
 /// Hoisting to module scope eliminates the drift surface.
 enum CacheEffect {
-    PutValue { key: (u16, u32, u32), value: CellWireValue },
-    PutFormula { key: (u16, u32, u32), text: String },
-    ClearFormula { key: (u16, u32, u32) },
+    PutValue {
+        key: (u16, u32, u32),
+        value: CellWireValue,
+    },
+    PutFormula {
+        key: (u16, u32, u32),
+        text: String,
+    },
+    ClearFormula {
+        key: (u16, u32, u32),
+    },
+    /// **F2 Blank-durability closure (2026-05-27):** cell-keyed value
+    /// clear from `Op::ClearValue`. Apply: clear `state.value` (the
+    /// VALUE overlay only; `formula` + `format` are preserved). Mirrors
+    /// `ClearFormula`'s ghost-entry-avoidance discipline — `get_mut` +
+    /// skip-if-absent (clearing the value on a never-written cell is a
+    /// no-op for the cache, since there is no value to clear); if all
+    /// three fields are None after the clear, the entry is removed.
+    ClearValue {
+        key: (u16, u32, u32),
+    },
     /// **V3.5.0.5 (2026-05-24)**: cell-keyed format set/clear.
     /// `format: Some(_)` writes `state.format`; `format: None` clears
     /// it (per `Op::SetCellFormat`'s `Option<FormatIdWire>` contract).
@@ -172,7 +192,10 @@ enum CacheEffect {
     /// is a no-op for the cache.  Formula-only-key removal extended:
     /// if both `value` and `formula` AND `format` are None after the
     /// apply, the entry is removed entirely.
-    SetCellFormat { key: (u16, u32, u32), format: Option<FormatId> },
+    SetCellFormat {
+        key: (u16, u32, u32),
+        format: Option<FormatId>,
+    },
     /// **V3.5.0.X audit-closure Opus-H1 extension (2026-05-24)**:
     /// sheet tombstoned via `Op::RemoveSheet`.  Apply: insert the id
     /// into the tombstone tracker AND drop all existing snapshot
@@ -182,7 +205,9 @@ enum CacheEffect {
     /// guard semantic, which the live cache walker previously
     /// LACKED -- the leak surfaced as phantom entries in
     /// `list_sheets_from_cache`).
-    RemoveSheet { id: u16 },
+    RemoveSheet {
+        id: u16,
+    },
     /// **V3.6.0.10 D8 (2026-05-25)**: sheet un-tombstoned via
     /// `Op::RestoreSheet`.  Apply: remove the id from the tombstone
     /// tracker (cache's `removed_sheets`) so subsequent cell-keyed
@@ -196,7 +221,9 @@ enum CacheEffect {
     /// now passes the un-tombstoned sheet through.  This asymmetry
     /// (cache drops cells; Workbook preserves them) is documented in
     /// the V3.6.0.10 D8 op.rs docstring as the deterministic semantic.
-    RestoreSheet { id: u16 },
+    RestoreSheet {
+        id: u16,
+    },
     /// **V3.6.0.3 D2 (2026-05-24)**: session-wide format-table cache
     /// update from `Op::RegisterFormat`.  Apply: insert `(id, string)`
     /// into `format_table_cache` IF the id is not already present
@@ -224,7 +251,10 @@ enum CacheEffect {
     ///
     /// `string` uses `Arc<str>` for cheap clones across the walker
     /// (collect_cache_effects -> apply_cache_effect).
-    RegisterFormat { id: FormatId, string: Arc<str> },
+    RegisterFormat {
+        id: FormatId,
+        string: Arc<str>,
+    },
 }
 
 /// **Phase 5.7 V3.6.0.4 D3 (2026-05-23) -- bundle the 5 cache-walker
@@ -1310,8 +1340,10 @@ impl CollabSession {
         } else {
             Self::affected_cells_for_partial_invalidate(&op).unwrap_or_default()
         };
-        *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") =
-            Some(staged_cells);
+        *self
+            .pending_undo_cells
+            .lock()
+            .expect("pending_undo_cells mutex poisoned") = Some(staged_cells);
         self.log.append(op)?;
         // V3.6.0.4 D3: capture the op_log_index AFTER the append so
         // it points at the just-appended op's position in the visible
@@ -1352,22 +1384,44 @@ impl CollabSession {
     /// permitted by the schema but produced one level deep".
     fn collect_cache_effects(op: &Op, out: &mut Vec<CacheEffect>) {
         match op {
-            Op::PutValue { sheet, row, col, value } => out.push(CacheEffect::PutValue {
+            Op::PutValue {
+                sheet,
+                row,
+                col,
+                value,
+            } => out.push(CacheEffect::PutValue {
                 key: (*sheet, *row, *col),
                 value: value.clone(),
             }),
-            Op::PutFormula { sheet, row, col, text } => out.push(CacheEffect::PutFormula {
+            Op::PutFormula {
+                sheet,
+                row,
+                col,
+                text,
+            } => out.push(CacheEffect::PutFormula {
                 key: (*sheet, *row, *col),
                 text: text.clone(),
             }),
             Op::ClearFormula { sheet, row, col } => out.push(CacheEffect::ClearFormula {
                 key: (*sheet, *row, *col),
             }),
+            // **F2 Blank-durability closure (2026-05-27)**: cell-keyed
+            // value clear joins the cache walker (mirrors PutValue /
+            // ClearFormula).  Without this, the live snapshot cache would
+            // keep showing the pre-clear value after an `Op::ClearValue`.
+            Op::ClearValue { sheet, row, col } => out.push(CacheEffect::ClearValue {
+                key: (*sheet, *row, *col),
+            }),
             // **V3.5.0.5 (2026-05-24)**: cell-keyed `SetCellFormat`
             // joins the cache walker.  `id: Some(_)` -> set state.format;
             // `id: None` -> clear state.format.  FormatIdWire is mapped
             // to storage `FormatId` via `to_storage()` (lossless).
-            Op::SetCellFormat { sheet, row, col, id } => out.push(CacheEffect::SetCellFormat {
+            Op::SetCellFormat {
+                sheet,
+                row,
+                col,
+                id,
+            } => out.push(CacheEffect::SetCellFormat {
                 key: (*sheet, *row, *col),
                 format: id.map(|wire| wire.to_storage()),
             }),
@@ -1423,7 +1477,7 @@ impl CollabSession {
                     id: fid,
                     string: Arc::<str>::from(string.as_str()),
                 });
-            },
+            }
             _ => {}
         }
     }
@@ -1465,6 +1519,7 @@ impl CollabSession {
         // below; this branch covers the four cell-keyed variants.
         let target_sheet = match &effect {
             CacheEffect::PutValue { key, .. } => Some(key.0),
+            CacheEffect::ClearValue { key } => Some(key.0),
             CacheEffect::PutFormula { key, .. } => Some(key.0),
             CacheEffect::ClearFormula { key } => Some(key.0),
             CacheEffect::SetCellFormat { key, .. } => Some(key.0),
@@ -1489,6 +1544,7 @@ impl CollabSession {
         // no index update.
         let cell_key_for_index = match &effect {
             CacheEffect::PutValue { key, .. } => Some(*key),
+            CacheEffect::ClearValue { key } => Some(*key),
             CacheEffect::PutFormula { key, .. } => Some(*key),
             CacheEffect::ClearFormula { key } => Some(*key),
             CacheEffect::SetCellFormat { key, .. } => Some(*key),
@@ -1511,6 +1567,20 @@ impl CollabSession {
         match effect {
             CacheEffect::PutValue { key, value } => {
                 buckets.snapshot.entry(key).or_default().value = Some(value);
+            }
+            // **F2 Blank-durability closure (2026-05-27)**: clear the
+            // VALUE field only (formula + format preserved).  Mirrors
+            // ClearFormula's get_mut + skip-if-absent + remove-if-empty
+            // discipline so a value-clear on a never-set cell is a no-op
+            // for the cache and an emptied CellState does not surface in
+            // `list_sheets_from_cache`.
+            CacheEffect::ClearValue { key } => {
+                if let Some(state) = buckets.snapshot.get_mut(&key) {
+                    state.value = None;
+                    if state.value.is_none() && state.formula.is_none() && state.format.is_none() {
+                        buckets.snapshot.remove(&key);
+                    }
+                }
             }
             CacheEffect::PutFormula { key, text } => {
                 buckets.snapshot.entry(key).or_default().formula = Some(text);
@@ -1545,21 +1615,22 @@ impl CollabSession {
             // CRDT per-cell LWW: concurrent `SetCellFormat` from two
             // peers on the same cell converges via Loro's causal-merge
             // iteration order (same invariant as PutValue / PutFormula).
-            CacheEffect::SetCellFormat { key, format } => {
-                match format {
-                    Some(id) => {
-                        buckets.snapshot.entry(key).or_default().format = Some(id);
-                    }
-                    None => {
-                        if let Some(state) = buckets.snapshot.get_mut(&key) {
-                            state.format = None;
-                            if state.value.is_none() && state.formula.is_none() && state.format.is_none() {
-                                buckets.snapshot.remove(&key);
-                            }
+            CacheEffect::SetCellFormat { key, format } => match format {
+                Some(id) => {
+                    buckets.snapshot.entry(key).or_default().format = Some(id);
+                }
+                None => {
+                    if let Some(state) = buckets.snapshot.get_mut(&key) {
+                        state.format = None;
+                        if state.value.is_none()
+                            && state.formula.is_none()
+                            && state.format.is_none()
+                        {
+                            buckets.snapshot.remove(&key);
                         }
                     }
                 }
-            }
+            },
             // V3.5.0.X audit-closure Opus-H1 extension (2026-05-24):
             // tombstone the sheet + drop all existing snapshot entries
             // for it.  Subsequent cell-keyed effects targeting this
@@ -1865,9 +1936,7 @@ impl CollabSession {
     /// **Use case**: regression tests pin the index discipline; V3.7+
     /// incremental snapshot deltas may consume the index to derive
     /// per-cell change sets without walking the full log.
-    pub fn cell_op_index_iter(
-        &self,
-    ) -> impl Iterator<Item = (&(u16, u32, u32), &Vec<usize>)> {
+    pub fn cell_op_index_iter(&self) -> impl Iterator<Item = (&(u16, u32, u32), &Vec<usize>)> {
         self.cell_op_index.iter()
     }
 
@@ -2089,7 +2158,11 @@ impl CollabSession {
             .last_snapshot
             .iter()
             .filter_map(|((s, r, c), state)| {
-                if *s == sheet { Some(((*r, *c), state.clone())) } else { None }
+                if *s == sheet {
+                    Some(((*r, *c), state.clone()))
+                } else {
+                    None
+                }
             })
             .collect();
         entries.sort_by_key(|((row, col), _)| (*row, *col));
@@ -2473,6 +2546,7 @@ impl CollabSession {
                 // filter discards the unrelated inner ops.
                 let apply = match &effect {
                     CacheEffect::PutValue { key, .. } => *key == target_key,
+                    CacheEffect::ClearValue { key } => *key == target_key,
                     CacheEffect::PutFormula { key, .. } => *key == target_key,
                     CacheEffect::ClearFormula { key } => *key == target_key,
                     CacheEffect::SetCellFormat { key, .. } => *key == target_key,
@@ -2540,11 +2614,15 @@ impl CollabSession {
     /// is non-cell-keyed.
     fn collect_affected_cells_recursive(op: &Op, out: &mut Vec<(u16, u32, u32)>) -> bool {
         match op {
-            Op::PutValue { sheet, row, col, .. } => {
+            Op::PutValue {
+                sheet, row, col, ..
+            } => {
                 out.push((*sheet, *row, *col));
                 true
             }
-            Op::PutFormula { sheet, row, col, .. } => {
+            Op::PutFormula {
+                sheet, row, col, ..
+            } => {
                 out.push((*sheet, *row, *col));
                 true
             }
@@ -2552,7 +2630,16 @@ impl CollabSession {
                 out.push((*sheet, *row, *col));
                 true
             }
-            Op::SetCellFormat { sheet, row, col, .. } => {
+            // **F2 Blank-durability closure (2026-05-27)**: cell-keyed
+            // value clear is partially-invalidatable like PutValue /
+            // ClearFormula (no full rebuild forced).
+            Op::ClearValue { sheet, row, col } => {
+                out.push((*sheet, *row, *col));
+                true
+            }
+            Op::SetCellFormat {
+                sheet, row, col, ..
+            } => {
                 out.push((*sheet, *row, *col));
                 true
             }
@@ -3266,7 +3353,10 @@ impl CollabSession {
         // V3.6.0.2 D1: also reset the pending cells stash -- the prior
         // staged value (if any) referred to an op that was just
         // discarded along with the rest of the pending-op tail.
-        *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") = None;
+        *self
+            .pending_undo_cells
+            .lock()
+            .expect("pending_undo_cells mutex poisoned") = None;
         // V3.6.0.2 audit-closure: the UndoManager was recreated via
         // `make_undo_manager` so any open group is gone (group state
         // was part of the discarded UndoManager).  Clear the flag.
@@ -3805,8 +3895,10 @@ impl CollabSession {
         // rebuild" path is also pre-staged so the redo-stack item's
         // meta encodes empty.
         let pending_value = captured_cells.clone().unwrap_or_default();
-        *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") =
-            Some(pending_value);
+        *self
+            .pending_undo_cells
+            .lock()
+            .expect("pending_undo_cells mutex poisoned") = Some(pending_value);
         // V3.6.0.8 D6 (2026-05-25; R-V3.6-14): invalidate the workbook
         // cache BEFORE Loro's undo call.  Loro's UndoManager retract
         // compacts the visible log (R-V3.6-10 carry); the cached
@@ -3865,7 +3957,10 @@ impl CollabSession {
             // the staged value would have been overwritten anyway, but
             // keeping the invariant "pending is None between calls"
             // simplifies reasoning.
-            *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") = None;
+            *self
+                .pending_undo_cells
+                .lock()
+                .expect("pending_undo_cells mutex poisoned") = None;
         }
         Ok(consumed)
     }
@@ -3905,8 +4000,10 @@ impl CollabSession {
             .top_redo_meta()
             .and_then(|meta| decode_cells_from_loro_value(&meta.value));
         let pending_value = captured_cells.clone().unwrap_or_default();
-        *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") =
-            Some(pending_value);
+        *self
+            .pending_undo_cells
+            .lock()
+            .expect("pending_undo_cells mutex poisoned") = Some(pending_value);
         // V3.6.0.8 D6 (2026-05-25; R-V3.6-14): mirror `undo()` -- invalidate
         // the workbook cache BEFORE Loro's redo call.  Loro's redo also
         // mutates the visible log (pushes the previously-undone op back);
@@ -3941,7 +4038,10 @@ impl CollabSession {
         } else {
             // Mirrors `undo()` -- clear stale staged data when redo()
             // was a no-op (on_push never fired).
-            *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") = None;
+            *self
+                .pending_undo_cells
+                .lock()
+                .expect("pending_undo_cells mutex poisoned") = None;
         }
         Ok(consumed)
     }
@@ -4911,25 +5011,32 @@ mod tests {
         );
 
         // Append three RegisterFormat ops with distinct ids + strings.
-        s.append_op(register_custom_format(peer, 0, "0.00%")).unwrap();
-        s.append_op(register_custom_format(peer, 1, "yyyy-mm-dd")).unwrap();
-        s.append_op(register_custom_format(peer, 2, "$#,##0.00")).unwrap();
+        s.append_op(register_custom_format(peer, 0, "0.00%"))
+            .unwrap();
+        s.append_op(register_custom_format(peer, 1, "yyyy-mm-dd"))
+            .unwrap();
+        s.append_op(register_custom_format(peer, 2, "$#,##0.00"))
+            .unwrap();
 
         // Post-condition: cache has all three entries.
         let entries: Vec<(FormatId, String)> = s
             .format_table_cache_iter()
             .map(|(id, s)| (*id, s.as_ref().to_string()))
             .collect();
-        assert_eq!(entries.len(), 3, "three RegisterFormat ops -> three cache entries");
+        assert_eq!(
+            entries.len(),
+            3,
+            "three RegisterFormat ops -> three cache entries"
+        );
 
         // Verify each entry is present.
-        for (expected_counter, expected_string) in [
-            (0u32, "0.00%"),
-            (1, "yyyy-mm-dd"),
-            (2, "$#,##0.00"),
-        ] {
+        for (expected_counter, expected_string) in
+            [(0u32, "0.00%"), (1, "yyyy-mm-dd"), (2, "$#,##0.00")]
+        {
             let expected_id = FormatId::Custom(peer, expected_counter);
-            let found = entries.iter().any(|(id, s)| *id == expected_id && s == expected_string);
+            let found = entries
+                .iter()
+                .any(|(id, s)| *id == expected_id && s == expected_string);
             assert!(
                 found,
                 "cache must contain ({:?}, {:?})",
@@ -4946,8 +5053,10 @@ mod tests {
         // last_snapshot + removed_sheets.
         let peer = PeerId::new(7);
         let mut s = CollabSession::new(peer).unwrap();
-        s.append_op(register_custom_format(peer, 0, "0.00%")).unwrap();
-        s.append_op(register_custom_format(peer, 1, "yyyy-mm-dd")).unwrap();
+        s.append_op(register_custom_format(peer, 0, "0.00%"))
+            .unwrap();
+        s.append_op(register_custom_format(peer, 1, "yyyy-mm-dd"))
+            .unwrap();
 
         // Pre-condition: incremental cache populated.
         assert_eq!(s.format_table_cache_iter().count(), 2);
@@ -5000,8 +5109,10 @@ mod tests {
         // DIFFERENT strings.  Pre-closure: cache ends up holding
         // the SECOND string ("second").  Post-closure: cache
         // holds the FIRST string ("first").
-        s.append_op(register_custom_format(peer, 0, "first")).unwrap();
-        s.append_op(register_custom_format(peer, 0, "second")).unwrap();
+        s.append_op(register_custom_format(peer, 0, "first"))
+            .unwrap();
+        s.append_op(register_custom_format(peer, 0, "second"))
+            .unwrap();
         let entries: Vec<(FormatId, String)> = s
             .format_table_cache_iter()
             .map(|(id, st)| (*id, st.as_ref().to_string()))
@@ -5039,8 +5150,10 @@ mod tests {
         let mut b = CollabSession::new(peer_b).unwrap();
         // Both peers register the SAME FormatId with DIFFERENT
         // strings before any merge.
-        a.append_op(register_custom_format(same_id_owner, 1, "A_FMT")).unwrap();
-        b.append_op(register_custom_format(same_id_owner, 1, "B_FMT")).unwrap();
+        a.append_op(register_custom_format(same_id_owner, 1, "A_FMT"))
+            .unwrap();
+        b.append_op(register_custom_format(same_id_owner, 1, "B_FMT"))
+            .unwrap();
         let a_bytes = a.export_bytes().unwrap();
         let b_bytes = b.export_bytes().unwrap();
         a.merge_bytes(&b_bytes).unwrap();
@@ -5089,7 +5202,8 @@ mod tests {
         s.append_op(Op::RegisterFormat {
             id: ql_oplog::wire::FormatIdWire::Builtin { id: 99 },
             string: "evil-builtin".to_string(),
-        }).unwrap();
+        })
+        .unwrap();
         // Cache walker dropped the Builtin variant; cache is
         // empty.
         let has_builtin = s
@@ -5104,7 +5218,8 @@ mod tests {
         s.append_op(Op::RegisterFormat {
             id: ql_oplog::wire::FormatIdWire::Builtin { id: 0 },
             string: "evil-zero".to_string(),
-        }).unwrap();
+        })
+        .unwrap();
         let still_no_builtin = s
             .format_table_cache_iter()
             .any(|(id, _)| matches!(id, FormatId::Builtin(_)));
@@ -5128,8 +5243,10 @@ mod tests {
         let mut a = CollabSession::new(peer_a).unwrap();
         let mut b = CollabSession::new(peer_b).unwrap();
         // Peer A registers two formats locally.
-        a.append_op(register_custom_format(peer_a, 0, "0.00%")).unwrap();
-        a.append_op(register_custom_format(peer_a, 1, "yyyy-mm-dd")).unwrap();
+        a.append_op(register_custom_format(peer_a, 0, "0.00%"))
+            .unwrap();
+        a.append_op(register_custom_format(peer_a, 1, "yyyy-mm-dd"))
+            .unwrap();
         // Pre-condition: peer A has both; peer B has neither.
         assert_eq!(a.format_table_cache_iter().count(), 2);
         assert_eq!(b.format_table_cache_iter().count(), 0);
@@ -5150,7 +5267,9 @@ mod tests {
         for (counter, expected_string) in [(0u32, "0.00%"), (1, "yyyy-mm-dd")] {
             let expected_id = FormatId::Custom(peer_a, counter);
             assert!(
-                b_entries.iter().any(|(id, s)| *id == expected_id && s == expected_string),
+                b_entries
+                    .iter()
+                    .any(|(id, s)| *id == expected_id && s == expected_string),
                 "post-merge cache contains ({:?}, {:?})",
                 expected_id,
                 expected_string
@@ -5180,7 +5299,8 @@ mod tests {
         };
         s.append_op(Op::BatchCommit {
             ops: vec![inner_register, inner_put],
-        }).unwrap();
+        })
+        .unwrap();
         // Both inner ops should propagate to their respective
         // caches via BatchCommit recursion.
         assert_eq!(
@@ -5238,10 +5358,20 @@ mod tests {
         s.append_op(Op::BatchCommit {
             ops: vec![
                 put_value(0, 5, 5, 1.0),
-                Op::PutFormula { sheet: 0, row: 5, col: 5, text: "=1+1".to_string() },
-                Op::ClearFormula { sheet: 0, row: 5, col: 5 },
+                Op::PutFormula {
+                    sheet: 0,
+                    row: 5,
+                    col: 5,
+                    text: "=1+1".to_string(),
+                },
+                Op::ClearFormula {
+                    sheet: 0,
+                    row: 5,
+                    col: 5,
+                },
             ],
-        }).unwrap();
+        })
+        .unwrap();
         let idx_for_cell: Vec<usize> = s
             .cell_op_index_iter()
             .find(|(key, _)| **key == (0, 5, 5))
@@ -5272,7 +5402,11 @@ mod tests {
             .find(|(id, _)| **id == 1)
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
-        assert_eq!(idx_for_sheet_1, vec![2], "Op::RemoveSheet at op_log_index=2");
+        assert_eq!(
+            idx_for_sheet_1,
+            vec![2],
+            "Op::RemoveSheet at op_log_index=2"
+        );
     }
 
     #[test]
@@ -5380,7 +5514,8 @@ mod tests {
             assert!(
                 idx < s.op_count(),
                 "post-undo cell_op_index entry {} must point within log length {}",
-                idx, s.op_count()
+                idx,
+                s.op_count()
             );
         }
 
@@ -5537,7 +5672,10 @@ mod tests {
         s.invalidate_cell(0, 0, 0).unwrap();
         let snap = s.snapshot_cells(0);
         let a1 = snap.iter().find(|((r, c), _)| *r == 0 && *c == 0);
-        assert!(a1.is_some(), "A1 present post-invalidate (atomic-swap success)");
+        assert!(
+            a1.is_some(),
+            "A1 present post-invalidate (atomic-swap success)"
+        );
         let (_, state) = a1.unwrap();
         match &state.value {
             Some(CellWireValue::Number(n)) => assert!((*n - 3.0).abs() < 1e-9),
@@ -5579,7 +5717,10 @@ mod tests {
 
         // Drain both: the second blob should error.
         let result = receiver.poll_remote_with_limit(2);
-        assert!(result.is_err(), "poll_remote_with_limit Err on malformed blob");
+        assert!(
+            result.is_err(),
+            "poll_remote_with_limit Err on malformed blob"
+        );
 
         // Post-closure: even on Err, the snapshot cache reflects
         // the successfully-merged first blob (the committed log
@@ -5658,10 +5799,7 @@ mod tests {
             }) => {
                 assert_eq!(found, "JulianCalendar");
             }
-            other => panic!(
-                "expected ReplayError::UnknownDateSystem, got {:?}",
-                other
-            ),
+            other => panic!("expected ReplayError::UnknownDateSystem, got {:?}", other),
         }
     }
 
@@ -5878,22 +6016,31 @@ mod tests {
         let mut s = CollabSession::new(PeerId::new(1)).unwrap();
         s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
         s.append_op(put_value(0, 0, 1, 2.0)).unwrap();
-        assert_eq!(s.snapshot_cells(0).len(), 2,
-            "pre-undo: cache has both cells");
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            2,
+            "pre-undo: cache has both cells"
+        );
 
         assert!(s.undo().unwrap());
         // V3.3.0.X HIGH-1 pin: cache MUST reflect the undo (the
         // most-recently-appended cell at (0, 1) is gone).
         let post_undo = s.snapshot_cells(0);
-        assert_eq!(post_undo.len(), 1,
-            "post-undo: cache reflects retraction; pre-closure this FAILED");
+        assert_eq!(
+            post_undo.len(),
+            1,
+            "post-undo: cache reflects retraction; pre-closure this FAILED"
+        );
         // The remaining cell is the first one we appended.
         assert_eq!(post_undo[0].0, (0, 0));
 
         // Redo restores: cache rebuild on redo also.
         assert!(s.redo().unwrap());
-        assert_eq!(s.snapshot_cells(0).len(), 2,
-            "post-redo: cache reflects restoration");
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            2,
+            "post-redo: cache reflects restoration"
+        );
     }
 
     #[test]
@@ -5915,8 +6062,11 @@ mod tests {
 
         // Cache is now empty; op log is unchanged.
         assert_eq!(s.snapshot_cells(0).len(), 0);
-        assert_eq!(s.op_log().iter().count(), 2,
-            "op log untouched by force_clear_snapshot_cache");
+        assert_eq!(
+            s.op_log().iter().count(),
+            2,
+            "op log untouched by force_clear_snapshot_cache"
+        );
 
         // Subsequent op mutation triggers rebuild + restores cache.
         s.append_op(put_value(0, 1, 0, 3.0)).unwrap();
@@ -5948,10 +6098,16 @@ mod tests {
         assert_eq!(entries.len(), 1, "single cell with both value + formula");
         let ((row, col), state) = &entries[0];
         assert_eq!((*row, *col), (5, 5));
-        assert_eq!(state.value, Some(CellWireValue::Number(1.0)),
-            "PutValue's value preserved after PutFormula upsert");
-        assert_eq!(state.formula, Some("=A1+1".to_string()),
-            "PutFormula's text in cache");
+        assert_eq!(
+            state.value,
+            Some(CellWireValue::Number(1.0)),
+            "PutValue's value preserved after PutFormula upsert"
+        );
+        assert_eq!(
+            state.formula,
+            Some("=A1+1".to_string()),
+            "PutFormula's text in cache"
+        );
 
         // Reverse order also works: PutFormula first, then PutValue.
         let mut s2 = CollabSession::new(PeerId::new(2)).unwrap();
@@ -5960,8 +6116,11 @@ mod tests {
         let entries2 = s2.snapshot_cells(0);
         let ((_, _), state2) = &entries2[0];
         assert_eq!(state2.value, Some(CellWireValue::Number(42.0)));
-        assert_eq!(state2.formula, Some("=B1*2".to_string()),
-            "PutValue does NOT clobber formula (per-field LWW)");
+        assert_eq!(
+            state2.formula,
+            Some("=B1*2".to_string()),
+            "PutValue does NOT clobber formula (per-field LWW)"
+        );
     }
 
     #[test]
@@ -5980,10 +6139,12 @@ mod tests {
         let entries = s.snapshot_cells(0);
         assert_eq!(entries.len(), 1);
         let ((_, _), state) = &entries[0];
-        assert_eq!(state.value, Some(CellWireValue::Number(99.0)),
-            "ClearFormula preserves value");
-        assert_eq!(state.formula, None,
-            "ClearFormula nulls formula");
+        assert_eq!(
+            state.value,
+            Some(CellWireValue::Number(99.0)),
+            "ClearFormula preserves value"
+        );
+        assert_eq!(state.formula, None, "ClearFormula nulls formula");
 
         // Ghost-entry-avoidance: ClearFormula on a never-set cell on
         // a different sheet should NOT create a cache entry +
@@ -5991,10 +6152,16 @@ mod tests {
         let mut s2 = CollabSession::new(PeerId::new(2)).unwrap();
         assert_eq!(s2.list_sheets_from_cache(), Vec::<u16>::new());
         s2.append_op(clear_formula(7, 0, 0)).unwrap();
-        assert_eq!(s2.list_sheets_from_cache(), Vec::<u16>::new(),
-            "ClearFormula on never-written cell must not create ghost sheet entry");
-        assert_eq!(s2.snapshot_cells(7).len(), 0,
-            "cache has no entry for never-written cell");
+        assert_eq!(
+            s2.list_sheets_from_cache(),
+            Vec::<u16>::new(),
+            "ClearFormula on never-written cell must not create ghost sheet entry"
+        );
+        assert_eq!(
+            s2.snapshot_cells(7).len(),
+            0,
+            "cache has no entry for never-written cell"
+        );
     }
 
     #[test]
@@ -6019,18 +6186,27 @@ mod tests {
         // Clear the formula.  Post-clear, both fields are None ->
         // the cache key must be removed.
         s.append_op(clear_formula(7, 0, 0)).unwrap();
-        assert_eq!(s.list_sheets_from_cache(), Vec::<u16>::new(),
-            "formula-only clear removes the cache key + does not surface sheet 7");
-        assert_eq!(s.snapshot_cells(7).len(), 0,
-            "no cache entry for formula-only cleared cell");
+        assert_eq!(
+            s.list_sheets_from_cache(),
+            Vec::<u16>::new(),
+            "formula-only clear removes the cache key + does not surface sheet 7"
+        );
+        assert_eq!(
+            s.snapshot_cells(7).len(),
+            0,
+            "no cache entry for formula-only cleared cell"
+        );
 
         // Symmetric check on the rebuild_snapshot_cache path: an
         // import/merge-then-rebuild of the same op sequence must produce
         // the same empty cache.
         let bytes = s.export_bytes().unwrap();
         let s2 = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
-        assert_eq!(s2.list_sheets_from_cache(), Vec::<u16>::new(),
-            "from_snapshot rebuild also removes formula-only cleared key");
+        assert_eq!(
+            s2.list_sheets_from_cache(),
+            Vec::<u16>::new(),
+            "from_snapshot rebuild also removes formula-only cleared key"
+        );
         assert_eq!(s2.snapshot_cells(7).len(), 0);
 
         // Edge case: PutValue + PutFormula + ClearFormula should NOT
@@ -6044,8 +6220,10 @@ mod tests {
         let state = &s3.snapshot_cells(7)[0].1;
         assert_eq!(state.value, Some(CellWireValue::Number(1.0)));
         assert_eq!(state.formula, None);
-        assert!(!s3.snapshot_cells(7).is_empty(),
-            "value-bearing cell survives formula clear");
+        assert!(
+            !s3.snapshot_cells(7).is_empty(),
+            "value-bearing cell survives formula clear"
+        );
     }
 
     #[test]
@@ -6073,17 +6251,23 @@ mod tests {
         );
         // The fix's effect: a visibility consumer that filters on the
         // accessor (export_snapshot) hides the cell while it's tombstoned.
-        assert!(s.list_sheets_from_cache().is_empty(), "tombstoned sheet hidden from cache enum");
+        assert!(
+            s.list_sheets_from_cache().is_empty(),
+            "tombstoned sheet hidden from cache enum"
+        );
 
         // Restore: accessor flips false; cells resurface.
         s.append_op(Op::RestoreSheet { id: 7 }).unwrap();
-        assert!(!s.is_sheet_removed_in_cache(7), "tombstone cleared on restore");
-        assert_eq!(
-            s.snapshot_cells(7).len(),
-            1,
-            "cells resurface post-restore"
+        assert!(
+            !s.is_sheet_removed_in_cache(7),
+            "tombstone cleared on restore"
         );
-        assert_eq!(s.list_sheets_from_cache(), vec![7], "restored sheet re-surfaces");
+        assert_eq!(s.snapshot_cells(7).len(), 1, "cells resurface post-restore");
+        assert_eq!(
+            s.list_sheets_from_cache(),
+            vec![7],
+            "restored sheet re-surfaces"
+        );
     }
 
     #[test]
@@ -6118,16 +6302,22 @@ mod tests {
                     col: 5,
                 },
             ],
-        }).unwrap();
+        })
+        .unwrap();
 
         // Live append_op path: cache must reflect both inner ops.
         let entries_live = s.snapshot_cells(0);
         assert_eq!(entries_live.len(), 1, "single cell in cache");
         let state_live = &entries_live[0].1;
-        assert_eq!(state_live.value, Some(CellWireValue::Number(42.0)),
-            "BatchCommit's nested PutValue surfaces in live cache");
-        assert_eq!(state_live.formula, None,
-            "BatchCommit's nested ClearFormula clears formula in live cache");
+        assert_eq!(
+            state_live.value,
+            Some(CellWireValue::Number(42.0)),
+            "BatchCommit's nested PutValue surfaces in live cache"
+        );
+        assert_eq!(
+            state_live.formula, None,
+            "BatchCommit's nested ClearFormula clears formula in live cache"
+        );
 
         // Round-trip via from_snapshot to exercise rebuild_snapshot_cache.
         let bytes = s.export_bytes().unwrap();
@@ -6135,10 +6325,15 @@ mod tests {
         let entries_rebuilt = s2.snapshot_cells(0);
         assert_eq!(entries_rebuilt.len(), 1);
         let state_rebuilt = &entries_rebuilt[0].1;
-        assert_eq!(state_rebuilt.value, Some(CellWireValue::Number(42.0)),
-            "BatchCommit's nested PutValue surfaces in rebuilt cache");
-        assert_eq!(state_rebuilt.formula, None,
-            "BatchCommit's nested ClearFormula clears formula in rebuilt cache");
+        assert_eq!(
+            state_rebuilt.value,
+            Some(CellWireValue::Number(42.0)),
+            "BatchCommit's nested PutValue surfaces in rebuilt cache"
+        );
+        assert_eq!(
+            state_rebuilt.formula, None,
+            "BatchCommit's nested ClearFormula clears formula in rebuilt cache"
+        );
     }
 
     #[test]
@@ -6166,10 +6361,12 @@ mod tests {
         // post-undo log; cache reflects ONLY the PutFormula now.
         assert!(s.undo().unwrap());
         let post = &s.snapshot_cells(0)[0].1;
-        assert_eq!(post.formula, Some("=A1+1".to_string()),
-            "undo of PutValue must not clobber prior PutFormula");
-        assert_eq!(post.value, None,
-            "undo of PutValue removes the value");
+        assert_eq!(
+            post.formula,
+            Some("=A1+1".to_string()),
+            "undo of PutValue must not clobber prior PutFormula"
+        );
+        assert_eq!(post.value, None, "undo of PutValue removes the value");
     }
 
     // ========================================================================
@@ -6200,10 +6397,16 @@ mod tests {
         s.append_op(put_formula(0, 5, 5, "=A1+1")).unwrap();
         s.append_op(set_cell_format_builtin(0, 5, 5, 7)).unwrap();
         let state = &s.snapshot_cells(0)[0].1;
-        assert_eq!(state.value, Some(CellWireValue::Number(42.0)),
-            "PutValue preserved across SetCellFormat");
-        assert_eq!(state.formula, Some("=A1+1".to_string()),
-            "PutFormula preserved across SetCellFormat");
+        assert_eq!(
+            state.value,
+            Some(CellWireValue::Number(42.0)),
+            "PutValue preserved across SetCellFormat"
+        );
+        assert_eq!(
+            state.formula,
+            Some("=A1+1".to_string()),
+            "PutFormula preserved across SetCellFormat"
+        );
         assert_eq!(state.format, Some(FormatId::Builtin(7)));
     }
 
@@ -6215,8 +6418,11 @@ mod tests {
         s.append_op(set_cell_format_builtin(0, 0, 0, 3)).unwrap();
         s.append_op(put_value(0, 0, 0, 99.0)).unwrap();
         let state = &s.snapshot_cells(0)[0].1;
-        assert_eq!(state.format, Some(FormatId::Builtin(3)),
-            "PutValue must not clobber SetCellFormat");
+        assert_eq!(
+            state.format,
+            Some(FormatId::Builtin(3)),
+            "PutValue must not clobber SetCellFormat"
+        );
         assert_eq!(state.value, Some(CellWireValue::Number(99.0)));
     }
 
@@ -6229,8 +6435,11 @@ mod tests {
         s.append_op(set_cell_format_builtin(0, 0, 0, 2)).unwrap();
         s.append_op(set_cell_format_builtin(0, 0, 0, 7)).unwrap();
         let state = &s.snapshot_cells(0)[0].1;
-        assert_eq!(state.format, Some(FormatId::Builtin(7)),
-            "second SetCellFormat wins for the cell");
+        assert_eq!(
+            state.format,
+            Some(FormatId::Builtin(7)),
+            "second SetCellFormat wins for the cell"
+        );
     }
 
     #[test]
@@ -6244,8 +6453,11 @@ mod tests {
         s.append_op(clear_cell_format(0, 0, 0)).unwrap();
         let state = &s.snapshot_cells(0)[0].1;
         assert_eq!(state.format, None, "clear-format wipes state.format");
-        assert_eq!(state.value, Some(CellWireValue::Number(1.0)),
-            "clear-format preserves value");
+        assert_eq!(
+            state.value,
+            Some(CellWireValue::Number(1.0)),
+            "clear-format preserves value"
+        );
     }
 
     #[test]
@@ -6257,8 +6469,11 @@ mod tests {
         s.append_op(set_cell_format_builtin(7, 0, 0, 2)).unwrap();
         assert_eq!(s.list_sheets_from_cache(), vec![7]);
         s.append_op(clear_cell_format(7, 0, 0)).unwrap();
-        assert_eq!(s.list_sheets_from_cache(), Vec::<u16>::new(),
-            "format-only clear removes the cache key + does not surface sheet 7");
+        assert_eq!(
+            s.list_sheets_from_cache(),
+            Vec::<u16>::new(),
+            "format-only clear removes the cache key + does not surface sheet 7"
+        );
         assert_eq!(s.snapshot_cells(7).len(), 0);
     }
 
@@ -6269,8 +6484,11 @@ mod tests {
         // create a phantom cache entry.
         let mut s = CollabSession::new(PeerId::new(1)).unwrap();
         s.append_op(clear_cell_format(5, 0, 0)).unwrap();
-        assert_eq!(s.list_sheets_from_cache(), Vec::<u16>::new(),
-            "clear-format on never-set cell does not create a cache entry");
+        assert_eq!(
+            s.list_sheets_from_cache(),
+            Vec::<u16>::new(),
+            "clear-format on never-set cell does not create a cache entry"
+        );
         assert_eq!(s.snapshot_cells(5).len(), 0);
     }
 
@@ -6283,8 +6501,11 @@ mod tests {
         let bytes = s_a.export_bytes().unwrap();
         let s_b = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
         let state_b = &s_b.snapshot_cells(0)[0].1;
-        assert_eq!(state_b.format, Some(FormatId::Builtin(9)),
-            "peer B sees the format via rebuild_snapshot_cache");
+        assert_eq!(
+            state_b.format,
+            Some(FormatId::Builtin(9)),
+            "peer B sees the format via rebuild_snapshot_cache"
+        );
     }
 
     #[test]
@@ -6300,8 +6521,11 @@ mod tests {
         let state = &s2.snapshot_cells(2)[0].1;
         assert_eq!(state.value, Some(CellWireValue::Number(11.0)));
         assert_eq!(state.formula, Some("=B2".to_string()));
-        assert_eq!(state.format, Some(FormatId::Builtin(4)),
-            "format round-trips through rebuild_snapshot_cache");
+        assert_eq!(
+            state.format,
+            Some(FormatId::Builtin(4)),
+            "format round-trips through rebuild_snapshot_cache"
+        );
     }
 
     #[test]
@@ -6310,16 +6534,20 @@ mod tests {
         // SetCellFormat variant via collect_cache_effects recursion.
         let mut s = CollabSession::new(PeerId::new(1)).unwrap();
         s.append_op(Op::BatchCommit {
-            ops: vec![
-                put_value(0, 0, 0, 5.0),
-                set_cell_format_builtin(0, 0, 0, 2),
-            ],
-        }).unwrap();
+            ops: vec![put_value(0, 0, 0, 5.0), set_cell_format_builtin(0, 0, 0, 2)],
+        })
+        .unwrap();
         let state = &s.snapshot_cells(0)[0].1;
-        assert_eq!(state.value, Some(CellWireValue::Number(5.0)),
-            "BatchCommit nested PutValue surfaces");
-        assert_eq!(state.format, Some(FormatId::Builtin(2)),
-            "BatchCommit nested SetCellFormat surfaces (recursion works for new variant)");
+        assert_eq!(
+            state.value,
+            Some(CellWireValue::Number(5.0)),
+            "BatchCommit nested PutValue surfaces"
+        );
+        assert_eq!(
+            state.format,
+            Some(FormatId::Builtin(2)),
+            "BatchCommit nested SetCellFormat surfaces (recursion works for new variant)"
+        );
     }
 
     #[test]
@@ -6340,8 +6568,11 @@ mod tests {
         let mut s = CollabSession::new(PeerId::new(1)).unwrap();
         s.append_op(op).unwrap();
         let state = &s.snapshot_cells(0)[0].1;
-        assert_eq!(state.format, Some(FormatId::Custom(PeerId::new(42), 100)),
-            "Custom(PeerId, u32) round-trips through cache via to_storage");
+        assert_eq!(
+            state.format,
+            Some(FormatId::Custom(PeerId::new(42), 100)),
+            "Custom(PeerId, u32) round-trips through cache via to_storage"
+        );
     }
 
     #[test]
@@ -6361,10 +6592,16 @@ mod tests {
         // PutValue(1.0) + SetCellFormat(2).  Cache must reflect both.
         assert!(s.undo().unwrap());
         let state_post = &s.snapshot_cells(0)[0].1;
-        assert_eq!(state_post.value, Some(CellWireValue::Number(1.0)),
-            "undo of last PutValue reveals the prior PutValue");
-        assert_eq!(state_post.format, Some(FormatId::Builtin(2)),
-            "format survives the rebuild via SetCellFormat replay");
+        assert_eq!(
+            state_post.value,
+            Some(CellWireValue::Number(1.0)),
+            "undo of last PutValue reveals the prior PutValue"
+        );
+        assert_eq!(
+            state_post.format,
+            Some(FormatId::Builtin(2)),
+            "format survives the rebuild via SetCellFormat replay"
+        );
     }
 
     #[test]
@@ -6377,12 +6614,19 @@ mod tests {
         let mut s = CollabSession::new(PeerId::new(1)).unwrap();
         s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
         let r = s.append_op(put_value(0, 0, 0, 1.0));
-        assert!(r.is_ok(),
-            "PutValue on tombstoned sheet must NOT error (silent drop)");
-        assert_eq!(s.snapshot_cells(0).len(), 0,
-            "tombstoned sheet must not surface any cached cells after PutValue");
-        assert!(!s.list_sheets_from_cache().contains(&0),
-            "list_sheets_from_cache must NOT include the tombstoned sheet");
+        assert!(
+            r.is_ok(),
+            "PutValue on tombstoned sheet must NOT error (silent drop)"
+        );
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            0,
+            "tombstoned sheet must not surface any cached cells after PutValue"
+        );
+        assert!(
+            !s.list_sheets_from_cache().contains(&0),
+            "list_sheets_from_cache must NOT include the tombstoned sheet"
+        );
     }
 
     #[test]
@@ -6401,14 +6645,21 @@ mod tests {
         s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
         // Now SetCellFormat on the tombstoned sheet: must be silent no-op.
         let r = s.append_op(set_cell_format_builtin(0, 0, 0, 2));
-        assert!(r.is_ok(),
-            "SetCellFormat on tombstoned sheet must NOT error (silent drop)");
+        assert!(
+            r.is_ok(),
+            "SetCellFormat on tombstoned sheet must NOT error (silent drop)"
+        );
         // The cache must not contain a phantom entry for the tombstoned sheet.
-        assert_eq!(s.snapshot_cells(0).len(), 0,
-            "tombstoned sheet must not surface any cached cells after SetCellFormat");
-        assert!(!s.list_sheets_from_cache().contains(&0),
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            0,
+            "tombstoned sheet must not surface any cached cells after SetCellFormat"
+        );
+        assert!(
+            !s.list_sheets_from_cache().contains(&0),
             "list_sheets_from_cache must NOT include the tombstoned sheet \
-             (no phantom entry from format_overlay)");
+             (no phantom entry from format_overlay)"
+        );
     }
 
     #[test]
@@ -6417,8 +6668,10 @@ mod tests {
         let mut s = CollabSession::new(PeerId::new(1)).unwrap();
         s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
         let r = s.append_op(clear_cell_format(0, 0, 0));
-        assert!(r.is_ok(),
-            "SetCellFormat(None) on tombstoned sheet must NOT error");
+        assert!(
+            r.is_ok(),
+            "SetCellFormat(None) on tombstoned sheet must NOT error"
+        );
         assert_eq!(s.snapshot_cells(0).len(), 0);
         assert!(!s.list_sheets_from_cache().contains(&0));
     }
@@ -6434,12 +6687,19 @@ mod tests {
         let mut s = CollabSession::new(PeerId::new(1)).unwrap();
         s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
         let r = s.append_op(put_formula(0, 0, 0, "=A1+1"));
-        assert!(r.is_ok(),
-            "PutFormula on tombstoned sheet must NOT error (silent drop)");
-        assert_eq!(s.snapshot_cells(0).len(), 0,
-            "tombstoned sheet must not surface any cached cells after PutFormula");
-        assert!(!s.list_sheets_from_cache().contains(&0),
-            "list_sheets_from_cache must NOT include the tombstoned sheet");
+        assert!(
+            r.is_ok(),
+            "PutFormula on tombstoned sheet must NOT error (silent drop)"
+        );
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            0,
+            "tombstoned sheet must not surface any cached cells after PutFormula"
+        );
+        assert!(
+            !s.list_sheets_from_cache().contains(&0),
+            "list_sheets_from_cache must NOT include the tombstoned sheet"
+        );
     }
 
     #[test]
@@ -6452,10 +6712,15 @@ mod tests {
         let mut s = CollabSession::new(PeerId::new(1)).unwrap();
         s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
         let r = s.append_op(clear_formula(0, 0, 0));
-        assert!(r.is_ok(),
-            "ClearFormula on tombstoned sheet must NOT error (silent drop)");
-        assert_eq!(s.snapshot_cells(0).len(), 0,
-            "tombstoned sheet must not surface any cached cells after ClearFormula");
+        assert!(
+            r.is_ok(),
+            "ClearFormula on tombstoned sheet must NOT error (silent drop)"
+        );
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            0,
+            "tombstoned sheet must not surface any cached cells after ClearFormula"
+        );
         assert!(!s.list_sheets_from_cache().contains(&0));
     }
 
@@ -6487,7 +6752,8 @@ mod tests {
         s.append_op(Op::AddSheet {
             name: "ToDelete".to_string(),
             chunk_rows: 100,
-        }).unwrap();
+        })
+        .unwrap();
         // Pre-tombstone PutValue surfaces normally.
         s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
         assert_eq!(s.snapshot_cells(0).len(), 1);
@@ -6552,7 +6818,8 @@ mod tests {
         s_a.append_op(Op::AddSheet {
             name: "S".to_string(),
             chunk_rows: 100,
-        }).unwrap();
+        })
+        .unwrap();
         let base_bytes = s_a.export_bytes().unwrap();
 
         // Peer A: append local PutValue.
@@ -6575,15 +6842,20 @@ mod tests {
         // of the to-be-redone op (Peer A's PutValue at (0, 0, 0)),
         // NOT Peer B's remote op.  This is the property that lets
         // partial-invalidate fire correctly.
-        let top_meta = s_a.undo.top_redo_meta()
+        let top_meta = s_a
+            .undo
+            .top_redo_meta()
             .expect("redo stack has one item (Peer A's undone PutValue)");
         let cells = decode_cells_from_loro_value(&top_meta.value)
             .expect("redo-stack meta encodes the cells correctly");
-        assert_eq!(cells, vec![(0u16, 0u32, 0u32)],
+        assert_eq!(
+            cells,
+            vec![(0u16, 0u32, 0u32)],
             "V3.6.0.2 invariant: top_redo_meta returns the exact cells \
              of the to-be-redone op (A's PutValue at (0,0,0)), regardless \
              of remote-interleave -- this is what lets partial-invalidate \
-             fire correctly post-V3.6.0.2");
+             fire correctly post-V3.6.0.2"
+        );
 
         // Peer A: redo the undone PutValue.  Partial-invalidate
         // path fires (NOT full rebuild).
@@ -6597,10 +6869,12 @@ mod tests {
         s_a.force_clear_snapshot_cache();
         s_a.rebuild_snapshot_cache().unwrap();
         let cache_full_rebuild = capture_full_cache(&s_a);
-        assert_eq!(cache_dispatch, cache_full_rebuild,
+        assert_eq!(
+            cache_dispatch, cache_full_rebuild,
             "V3.6.0.2 correctness: partial-invalidate redo after remote \
              interleave produces the same cache as a forced full rebuild \
-             (proving that on_push meta captured the right cells)");
+             (proving that on_push meta captured the right cells)"
+        );
     }
 
     #[test]
@@ -6620,46 +6894,61 @@ mod tests {
         s.append_op(Op::AddSheet {
             name: "S".to_string(),
             chunk_rows: 100,
-        }).unwrap();
+        })
+        .unwrap();
         // Write a formula referencing sheet "S".
         s.append_op(Op::PutFormula {
             sheet: 0,
             row: 1,
             col: 0,
             text: "S!A1".to_string(),
-        }).unwrap();
+        })
+        .unwrap();
         // Rename sheet 0 from "S" to "Renamed".  Phase 5.3 repair pass
         // rewrites the formula at (0, 1, 0) to "Renamed!A1".
         s.append_op(Op::RenameSheet {
             id: 0,
             old_name: "S".to_string(),
             new_name: "Renamed".to_string(),
-        }).unwrap();
+        })
+        .unwrap();
 
         // Cache surfaces the STALE formula text (no repair).
-        let stale = s.snapshot_cells(0)
+        let stale = s
+            .snapshot_cells(0)
             .into_iter()
             .find(|((r, c), _)| *r == 1 && *c == 0)
             .map(|(_, st)| st.formula);
-        assert_eq!(stale, Some(Some("S!A1".to_string())),
-            "pre-closure: cache carries the UNREPAIRED formula text");
+        assert_eq!(
+            stale,
+            Some(Some("S!A1".to_string())),
+            "pre-closure: cache carries the UNREPAIRED formula text"
+        );
 
         // Rebuilt workbook carries the REPAIRED formula text.
         let reg = ql_functions::default_registry();
         let (wb, report) = s.rebuild_workbook(&reg).unwrap();
-        assert_eq!(report.sheet_repair.formulas_rewritten, 1,
-            "repair pass rewrites the formula referencing the renamed sheet");
+        assert_eq!(
+            report.sheet_repair.formulas_rewritten, 1,
+            "repair pass rewrites the formula referencing the renamed sheet"
+        );
         let repaired = wb.formula_at(0, 1, 0).map(|s| s.to_string());
-        assert_eq!(repaired, Some("Renamed!A1".to_string()),
+        assert_eq!(
+            repaired,
+            Some("Renamed!A1".to_string()),
             "post-closure: workbook_snapshot reads from this (via formula_at) \
-             so IDE consumers see the repaired text");
+             so IDE consumers see the repaired text"
+        );
 
         // Sanity: the cache and the workbook DIVERGE.  This is the
         // motivation for the A-HIGH-2 closure -- workbook_snapshot must
         // read from the workbook side, not the cache side.
-        assert_ne!(stale.flatten(), repaired,
+        assert_ne!(
+            stale.flatten(),
+            repaired,
             "cache and workbook formula text diverge after rename; \
-             workbook_snapshot must prefer the workbook form");
+             workbook_snapshot must prefer the workbook form"
+        );
     }
 
     #[test]
@@ -6699,7 +6988,8 @@ mod tests {
         s_a.append_op(Op::AddSheet {
             name: "S".to_string(),
             chunk_rows: 100,
-        }).unwrap();
+        })
+        .unwrap();
         let base_bytes = s_a.export_bytes().unwrap();
 
         // Peer A appends a local PutValue at (0,0,0).
@@ -6718,16 +7008,21 @@ mod tests {
         // V3.6.0.2 invariant pin: top_undo_meta returns A's cell
         // (0, 0, 0), NOT B's (0, 1, 0).  This is the property that
         // makes partial-invalidate correct under remote-interleave.
-        let top_meta = s_a.undo.top_undo_meta()
+        let top_meta = s_a
+            .undo
+            .top_undo_meta()
             .expect("undo stack has one item (A's PutValue)");
         let cells = decode_cells_from_loro_value(&top_meta.value)
             .expect("undo-stack meta encodes cells correctly");
-        assert_eq!(cells, vec![(0u16, 0u32, 0u32)],
+        assert_eq!(
+            cells,
+            vec![(0u16, 0u32, 0u32)],
             "V3.6.0.2 invariant: top_undo_meta returns A's PutValue cell \
              (0,0,0), NOT B's remote op cell (0,1,0).  This is the \
              property that lets partial-invalidate fire correctly post-\
              V3.6.0.2 (the proxy `self.log.iter().last()` returned B's \
-             cell pre-closure -- the Codex A-HIGH-1 native-binding repro).");
+             cell pre-closure -- the Codex A-HIGH-1 native-binding repro)."
+        );
 
         // Peer A undoes its local op.  Partial-invalidate runs (NOT
         // full rebuild) -- the on_pop / top_undo_meta path gives the
@@ -6742,10 +7037,12 @@ mod tests {
         s_a.force_clear_snapshot_cache();
         s_a.rebuild_snapshot_cache().unwrap();
         let cache_full_rebuild = capture_full_cache(&s_a);
-        assert_eq!(cache_dispatch, cache_full_rebuild,
+        assert_eq!(
+            cache_dispatch, cache_full_rebuild,
             "V3.6.0.2 correctness: partial-invalidate undo after remote \
              interleave produces the same cache as a forced full rebuild \
-             (proving that on_push meta captured the right cells)");
+             (proving that on_push meta captured the right cells)"
+        );
 
         // Sanity: (0,1,0) (B's cell) is present; (0,0,0) (A's cell, undone)
         // is absent.  This is what the full-rebuild path produces; if the
@@ -6799,7 +7096,9 @@ mod tests {
     /// what `rebuild_snapshot_cache` would produce.  Equality between
     /// this and `undo_and_capture` on a mirror session proves the
     /// dispatch's partial path matches the full-rebuild ground truth.
-    fn undo_then_force_full_rebuild_and_capture(s: &mut CollabSession) -> HashMap<(u16, u32, u32), CellState> {
+    fn undo_then_force_full_rebuild_and_capture(
+        s: &mut CollabSession,
+    ) -> HashMap<(u16, u32, u32), CellState> {
         assert!(s.undo().unwrap(), "undo must consume a stack item");
         s.force_clear_snapshot_cache();
         s.rebuild_snapshot_cache().unwrap();
@@ -6818,8 +7117,10 @@ mod tests {
         // Drop cell (0, 0, 0) from cache + re-derive via invalidate_cell.
         s.invalidate_cell(0, 0, 0).unwrap();
         let partial = capture_full_cache(&s);
-        assert_eq!(partial, baseline,
-            "invalidate_cell re-derives the exact CellState the full rebuild produces");
+        assert_eq!(
+            partial, baseline,
+            "invalidate_cell re-derives the exact CellState the full rebuild produces"
+        );
     }
 
     #[test]
@@ -6832,17 +7133,21 @@ mod tests {
         s.append_op(put_value(0, 1, 0, 2.0)).unwrap();
         s.append_op(put_value(0, 2, 0, 3.0)).unwrap();
         // Read out the unrelated cells' states.
-        let unrelated_before: Vec<((u32, u32), CellState)> = s.snapshot_cells(0)
+        let unrelated_before: Vec<((u32, u32), CellState)> = s
+            .snapshot_cells(0)
             .into_iter()
             .filter(|((row, col), _)| !(*row == 0 && *col == 0))
             .collect();
         s.invalidate_cell(0, 0, 0).unwrap();
-        let unrelated_after: Vec<((u32, u32), CellState)> = s.snapshot_cells(0)
+        let unrelated_after: Vec<((u32, u32), CellState)> = s
+            .snapshot_cells(0)
             .into_iter()
             .filter(|((row, col), _)| !(*row == 0 && *col == 0))
             .collect();
-        assert_eq!(unrelated_after, unrelated_before,
-            "invalidate_cell on (0,0,0) must not touch other cells");
+        assert_eq!(
+            unrelated_after, unrelated_before,
+            "invalidate_cell on (0,0,0) must not touch other cells"
+        );
     }
 
     #[test]
@@ -6862,8 +7167,11 @@ mod tests {
         // Now exercise invalidate_cell on the same coord -- should also
         // result in no entry.
         s.invalidate_cell(0, 0, 0).unwrap();
-        assert_eq!(s.snapshot_cells(0).len(), 0,
-            "invalidate_cell of formula-only-then-clear leaves no ghost entry");
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            0,
+            "invalidate_cell of formula-only-then-clear leaves no ghost entry"
+        );
     }
 
     #[test]
@@ -6883,8 +7191,10 @@ mod tests {
 
         let cache_partial = undo_and_capture(&mut s_partial);
         let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
-        assert_eq!(cache_partial, cache_full,
-            "undo via partial-invalidate dispatch produces same cache as full rebuild");
+        assert_eq!(
+            cache_partial, cache_full,
+            "undo via partial-invalidate dispatch produces same cache as full rebuild"
+        );
     }
 
     #[test]
@@ -6898,8 +7208,10 @@ mod tests {
 
         let cache_partial = undo_and_capture(&mut s_partial);
         let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
-        assert_eq!(cache_partial, cache_full,
-            "undo of PutFormula: partial == full");
+        assert_eq!(
+            cache_partial, cache_full,
+            "undo of PutFormula: partial == full"
+        );
     }
 
     #[test]
@@ -6915,8 +7227,10 @@ mod tests {
 
         let cache_partial = undo_and_capture(&mut s_partial);
         let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
-        assert_eq!(cache_partial, cache_full,
-            "undo of ClearFormula: partial == full");
+        assert_eq!(
+            cache_partial, cache_full,
+            "undo of ClearFormula: partial == full"
+        );
     }
 
     #[test]
@@ -6924,15 +7238,21 @@ mod tests {
         // V3.5.0.5 new variant integrated with V3.5.0.6 partial-invalidate.
         let mut s_partial = CollabSession::new(PeerId::new(1)).unwrap();
         s_partial.append_op(put_value(0, 0, 0, 5.0)).unwrap();
-        s_partial.append_op(set_cell_format_builtin(0, 0, 0, 2)).unwrap();
+        s_partial
+            .append_op(set_cell_format_builtin(0, 0, 0, 2))
+            .unwrap();
         let mut s_full = CollabSession::new(PeerId::new(1)).unwrap();
         s_full.append_op(put_value(0, 0, 0, 5.0)).unwrap();
-        s_full.append_op(set_cell_format_builtin(0, 0, 0, 2)).unwrap();
+        s_full
+            .append_op(set_cell_format_builtin(0, 0, 0, 2))
+            .unwrap();
 
         let cache_partial = undo_and_capture(&mut s_partial);
         let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
-        assert_eq!(cache_partial, cache_full,
-            "undo of SetCellFormat: partial == full (V3.5.0.5 + V3.5.0.6 integration)");
+        assert_eq!(
+            cache_partial, cache_full,
+            "undo of SetCellFormat: partial == full (V3.5.0.5 + V3.5.0.6 integration)"
+        );
     }
 
     #[test]
@@ -6943,19 +7263,41 @@ mod tests {
         // we can verify the cache is correct + the side-by-side equality
         // still holds (defensive).
         let mut s_partial = CollabSession::new(PeerId::new(1)).unwrap();
-        s_partial.append_op(Op::AddSheet { name: "S1".to_string(), chunk_rows: 100 }).unwrap();
+        s_partial
+            .append_op(Op::AddSheet {
+                name: "S1".to_string(),
+                chunk_rows: 100,
+            })
+            .unwrap();
         s_partial.append_op(put_value(0, 0, 0, 1.0)).unwrap();
-        s_partial.append_op(Op::AddSheet { name: "S2".to_string(), chunk_rows: 100 }).unwrap();
+        s_partial
+            .append_op(Op::AddSheet {
+                name: "S2".to_string(),
+                chunk_rows: 100,
+            })
+            .unwrap();
         let mut s_full = CollabSession::new(PeerId::new(1)).unwrap();
-        s_full.append_op(Op::AddSheet { name: "S1".to_string(), chunk_rows: 100 }).unwrap();
+        s_full
+            .append_op(Op::AddSheet {
+                name: "S1".to_string(),
+                chunk_rows: 100,
+            })
+            .unwrap();
         s_full.append_op(put_value(0, 0, 0, 1.0)).unwrap();
-        s_full.append_op(Op::AddSheet { name: "S2".to_string(), chunk_rows: 100 }).unwrap();
+        s_full
+            .append_op(Op::AddSheet {
+                name: "S2".to_string(),
+                chunk_rows: 100,
+            })
+            .unwrap();
 
         // Undo retracts the last AddSheet (non-cell-keyed -> full rebuild path).
         let cache_partial = undo_and_capture(&mut s_partial);
         let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
-        assert_eq!(cache_partial, cache_full,
-            "undo of AddSheet: full-rebuild dispatch produces same cache");
+        assert_eq!(
+            cache_partial, cache_full,
+            "undo of AddSheet: full-rebuild dispatch produces same cache"
+        );
         // Sanity: the put_value cell still exists.
         let entries = s_partial.snapshot_cells(0);
         assert_eq!(entries.len(), 1);
@@ -6967,25 +7309,31 @@ mod tests {
         // V3.5.0.6: BatchCommit of only-cell-keyed inner ops -> partial path.
         let mut s_partial = CollabSession::new(PeerId::new(1)).unwrap();
         s_partial.append_op(put_value(0, 5, 5, 10.0)).unwrap();
-        s_partial.append_op(Op::BatchCommit {
-            ops: vec![
-                put_value(0, 5, 5, 20.0),
-                set_cell_format_builtin(0, 5, 5, 3),
-            ],
-        }).unwrap();
+        s_partial
+            .append_op(Op::BatchCommit {
+                ops: vec![
+                    put_value(0, 5, 5, 20.0),
+                    set_cell_format_builtin(0, 5, 5, 3),
+                ],
+            })
+            .unwrap();
         let mut s_full = CollabSession::new(PeerId::new(1)).unwrap();
         s_full.append_op(put_value(0, 5, 5, 10.0)).unwrap();
-        s_full.append_op(Op::BatchCommit {
-            ops: vec![
-                put_value(0, 5, 5, 20.0),
-                set_cell_format_builtin(0, 5, 5, 3),
-            ],
-        }).unwrap();
+        s_full
+            .append_op(Op::BatchCommit {
+                ops: vec![
+                    put_value(0, 5, 5, 20.0),
+                    set_cell_format_builtin(0, 5, 5, 3),
+                ],
+            })
+            .unwrap();
 
         let cache_partial = undo_and_capture(&mut s_partial);
         let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
-        assert_eq!(cache_partial, cache_full,
-            "undo of BatchCommit (all cell-keyed): partial == full");
+        assert_eq!(
+            cache_partial, cache_full,
+            "undo of BatchCommit (all cell-keyed): partial == full"
+        );
         // Sanity: the prior PutValue(10.0) is now what cell (5,5) shows
         // after the batch was undone.
         let state = &s_partial.snapshot_cells(0)[0].1;
@@ -7014,8 +7362,10 @@ mod tests {
         s_full.force_clear_snapshot_cache();
         s_full.rebuild_snapshot_cache().unwrap();
         let cache_full = capture_full_cache(&s_full);
-        assert_eq!(cache_partial, cache_full,
-            "redo via partial-invalidate dispatch produces same cache as full rebuild");
+        assert_eq!(
+            cache_partial, cache_full,
+            "redo via partial-invalidate dispatch produces same cache as full rebuild"
+        );
     }
 
     #[test]
@@ -7025,49 +7375,69 @@ mod tests {
         let mut s_partial = CollabSession::new(PeerId::new(1)).unwrap();
         s_partial.append_op(put_value(0, 0, 0, 1.0)).unwrap();
         s_partial.append_op(put_value(0, 1, 0, 2.0)).unwrap();
-        s_partial.append_op(Op::BatchCommit {
-            ops: vec![
-                put_value(0, 0, 0, 100.0),
-                put_value(0, 1, 0, 200.0),
-                put_value(0, 2, 0, 300.0),
-            ],
-        }).unwrap();
+        s_partial
+            .append_op(Op::BatchCommit {
+                ops: vec![
+                    put_value(0, 0, 0, 100.0),
+                    put_value(0, 1, 0, 200.0),
+                    put_value(0, 2, 0, 300.0),
+                ],
+            })
+            .unwrap();
         let mut s_full = CollabSession::new(PeerId::new(1)).unwrap();
         s_full.append_op(put_value(0, 0, 0, 1.0)).unwrap();
         s_full.append_op(put_value(0, 1, 0, 2.0)).unwrap();
-        s_full.append_op(Op::BatchCommit {
-            ops: vec![
-                put_value(0, 0, 0, 100.0),
-                put_value(0, 1, 0, 200.0),
-                put_value(0, 2, 0, 300.0),
-            ],
-        }).unwrap();
+        s_full
+            .append_op(Op::BatchCommit {
+                ops: vec![
+                    put_value(0, 0, 0, 100.0),
+                    put_value(0, 1, 0, 200.0),
+                    put_value(0, 2, 0, 300.0),
+                ],
+            })
+            .unwrap();
 
         let cache_partial = undo_and_capture(&mut s_partial);
         let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
-        assert_eq!(cache_partial, cache_full,
-            "undo of multi-cell BatchCommit: partial == full");
+        assert_eq!(
+            cache_partial, cache_full,
+            "undo of multi-cell BatchCommit: partial == full"
+        );
     }
 
     #[test]
     fn affected_cells_helper_returns_none_for_non_cell_keyed() {
         // Direct unit test for the dispatcher's classification helper.
-        let add_sheet = Op::AddSheet { name: "S".to_string(), chunk_rows: 100 };
-        assert!(CollabSession::affected_cells_for_partial_invalidate(&add_sheet).is_none(),
-            "AddSheet -> None (forces full rebuild)");
-        let rename_sheet = Op::RenameSheet {
-            id: 0, old_name: "A".to_string(), new_name: "B".to_string(),
+        let add_sheet = Op::AddSheet {
+            name: "S".to_string(),
+            chunk_rows: 100,
         };
-        assert!(CollabSession::affected_cells_for_partial_invalidate(&rename_sheet).is_none(),
-            "RenameSheet -> None");
+        assert!(
+            CollabSession::affected_cells_for_partial_invalidate(&add_sheet).is_none(),
+            "AddSheet -> None (forces full rebuild)"
+        );
+        let rename_sheet = Op::RenameSheet {
+            id: 0,
+            old_name: "A".to_string(),
+            new_name: "B".to_string(),
+        };
+        assert!(
+            CollabSession::affected_cells_for_partial_invalidate(&rename_sheet).is_none(),
+            "RenameSheet -> None"
+        );
         let mixed_batch = Op::BatchCommit {
             ops: vec![
                 put_value(0, 0, 0, 1.0),
-                Op::AddSheet { name: "S".to_string(), chunk_rows: 100 },
+                Op::AddSheet {
+                    name: "S".to_string(),
+                    chunk_rows: 100,
+                },
             ],
         };
-        assert!(CollabSession::affected_cells_for_partial_invalidate(&mixed_batch).is_none(),
-            "BatchCommit with non-cell-keyed inner -> None (conservative)");
+        assert!(
+            CollabSession::affected_cells_for_partial_invalidate(&mixed_batch).is_none(),
+            "BatchCommit with non-cell-keyed inner -> None (conservative)"
+        );
     }
 
     #[test]
@@ -7076,13 +7446,12 @@ mod tests {
             ops: vec![
                 put_value(0, 5, 5, 1.0),
                 put_value(0, 1, 1, 2.0),
-                put_formula(0, 5, 5, "=A1"),  // duplicate cell coord
-                set_cell_format_builtin(0, 5, 5, 2),  // duplicate again
+                put_formula(0, 5, 5, "=A1"), // duplicate cell coord
+                set_cell_format_builtin(0, 5, 5, 2), // duplicate again
             ],
         };
         let cells = CollabSession::affected_cells_for_partial_invalidate(&batch).unwrap();
-        assert_eq!(cells, vec![(0, 1, 1), (0, 5, 5)],
-            "deduplicated + sorted");
+        assert_eq!(cells, vec![(0, 1, 1), (0, 5, 5)], "deduplicated + sorted");
     }
 
     #[test]
@@ -7943,8 +8312,7 @@ mod tests {
         let log_len = s.log.len();
 
         let mut wb_split = ql_storage::Workbook::default();
-        let n_first =
-            ql_oplog::apply_ops_in_range(&s.log, &mut wb_split, 0, 1, &registry).unwrap();
+        let n_first = ql_oplog::apply_ops_in_range(&s.log, &mut wb_split, 0, 1, &registry).unwrap();
         let n_second =
             ql_oplog::apply_ops_in_range(&s.log, &mut wb_split, 1, log_len, &registry).unwrap();
         assert_eq!(n_first + n_second, log_len);
@@ -7969,8 +8337,7 @@ mod tests {
         let registry = ql_functions::default_registry();
         let mut wb = ql_storage::Workbook::default();
         // to_index = 1000 vs log_len = 1.  iterator's take() saturates.
-        let n =
-            ql_oplog::apply_ops_in_range(&s.log, &mut wb, 0, 1000, &registry).unwrap();
+        let n = ql_oplog::apply_ops_in_range(&s.log, &mut wb, 0, 1000, &registry).unwrap();
         assert_eq!(n, 1, "applied only the 1 op actually in the log");
     }
 
@@ -8101,7 +8468,10 @@ mod tests {
         let (workbook_b, _) = peer_b.rebuild_workbook(&registry).unwrap();
         assert!(!workbook_a.is_sheet_removed(0));
         assert!(!workbook_b.is_sheet_removed(0));
-        assert_eq!(workbook_a.is_sheet_removed(0), workbook_b.is_sheet_removed(0));
+        assert_eq!(
+            workbook_a.is_sheet_removed(0),
+            workbook_b.is_sheet_removed(0)
+        );
     }
 
     // =====================================================
@@ -8132,7 +8502,8 @@ mod tests {
     // ide-consumer-contract.md § 4.1.z6 V3.6.0.10).
 
     #[test]
-    fn v3_6_0_x_phase_termination_codex_pt_a1_restore_sheet_resurfaces_preserved_cells_in_snapshot_cache() {
+    fn v3_6_0_x_phase_termination_codex_pt_a1_restore_sheet_resurfaces_preserved_cells_in_snapshot_cache(
+    ) {
         // The flagship regression: matches the audit's Probe 1.
         // Pre-closure: snapshot_cells(0) returned [] post-restore.
         // Post-closure: it returns the preserved cell.
@@ -8160,13 +8531,17 @@ mod tests {
         let (workbook, _) = s.rebuild_workbook(&registry).unwrap();
         assert!(!workbook.is_sheet_removed(0));
         assert!(
-            matches!(workbook.sheet(0).unwrap().read(0, 0), ql_types::Value::Number(_)),
+            matches!(
+                workbook.sheet(0).unwrap().read(0, 0),
+                ql_types::Value::Number(_)
+            ),
             "Workbook side resurrects the cell (V3.5.0.3b storage preservation)"
         );
     }
 
     #[test]
-    fn v3_6_0_x_phase_termination_rebuild_snapshot_cache_after_remove_then_restore_includes_cells() {
+    fn v3_6_0_x_phase_termination_rebuild_snapshot_cache_after_remove_then_restore_includes_cells()
+    {
         // Verifies that the rebuild path (called by from_snapshot +
         // merge_bytes + discard_pending_ops + invalidate_cell etc.)
         // produces the correct cache state across the
@@ -8212,7 +8587,11 @@ mod tests {
         s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
 
         // Cache: cell PRESERVED (mirrors Workbook V3.5.0.3b discipline).
-        assert_eq!(s.snapshot_cells(0).len(), 1, "tombstoned-sheet cells preserved in cache");
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            1,
+            "tombstoned-sheet cells preserved in cache"
+        );
         // Workbook: sheet IS tombstoned.
         let registry = ql_functions::default_registry();
         let (workbook, _) = s.rebuild_workbook(&registry).unwrap();

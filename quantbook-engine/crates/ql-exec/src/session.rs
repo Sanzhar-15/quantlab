@@ -38,9 +38,12 @@
 //!    a session-owned monotonic clock that advances on every committed mutation
 //!    AND every recompute that changed ≥1 cell. It **replaces `oplog.len()`** as
 //!    the token's counter because `oplog.len()` does NOT advance on recompute
-//!    (`put_computed_at` appends no ops) nor on a `set_value(Blank)` clear (no
-//!    op), which would let two distinct visible states share a token and make
-//!    `snapshot_delta` silently under-report. `ql-oplog::OpLog` DOES expose a
+//!    (`put_computed_at` appends no ops), which would let two distinct visible
+//!    states share a token and make `snapshot_delta` silently under-report.
+//!    (Historical note: pre-F2, a `set_value(Blank)` clear also appended no op
+//!    — that gap is now closed by `Op::ClearValue`, but the recompute case
+//!    remains the load-bearing reason `state_seq` exists.) `ql-oplog::OpLog`
+//!    DOES expose a
 //!    Loro VV (`oplog_vv()`), reserved for the v1.5 collab delta-sync path; the
 //!    opaque 24-byte token shape is unchanged (only the counter's meaning is).
 //!    `snapshot_delta` walks a bounded change-log keyed by `state_seq`; the
@@ -114,8 +117,9 @@ const CHANGE_LOG_CAP: usize = 1 << 16;
 /// resolves those to the *current* committed state at read time. This is the
 /// (a) "session change-log keyed by version" design (impl-plan §0 item 3): it
 /// keeps `snapshot_delta(&self)` and captures changes that an op-walk misses —
-/// recompute-written dependents (`put_computed_at` appends no ops) and a
-/// `set_value(Blank)` clear (appends no op).
+/// recompute-written dependents (`put_computed_at` appends no ops). (Pre-F2 a
+/// `set_value(Blank)` clear also appended no op; `Op::ClearValue` now closes
+/// that, but recompute dependents remain the load-bearing case.)
 #[derive(Clone, Copy, Debug)]
 enum SessionChange {
     /// A cell whose value/formula/format may have changed (resolved at delta time).
@@ -1071,8 +1075,9 @@ impl EngineSession for WorkbookSession {
     ///    A1/EnUs text); `Clear`→`PutValue`(preserved scalar value)+
     ///    `ClearFormula` (skipping a no-formula cell, mirroring
     ///    `clear_formula`); `SetFormat`→`SetCellFormat`. (A `SetValue(Blank)`
-    ///    on a non-formula cell contributes no inner op, mirroring
-    ///    `set_value`.)
+    ///    emits `Op::ClearValue` — the durable value-clear op, mirroring
+    ///    `set_value` post-F2; the only zero-inner-op case is a `Clear` on a
+    ///    no-formula cell.)
     /// 3. **Append the `BatchCommit` BEFORE mutating** the workbook (one undo
     ///    unit, one log entry; an append failure leaves the workbook
     ///    unchanged), unless the batch reduces to zero inner ops.
@@ -1160,13 +1165,23 @@ impl EngineSession for WorkbookSession {
                     // `set_value` does (the runtime would too, but doing it
                     // here keeps validation fully up front / pre-mutation).
                     let v = cell_value_to_value(value.clone())?;
-                    if let Some(wire) = CellWireValue::from_value(&v) {
-                        inner_ops.push(Op::PutValue {
+                    // **F2 Blank-durability closure (2026-05-27):** mirror
+                    // `set_value` exactly — a Blank value (which
+                    // `from_value` encodes as `None`) emits the durable
+                    // `Op::ClearValue` rather than nothing, so a batched
+                    // Blank-clear is reproducible on replay.
+                    match CellWireValue::from_value(&v) {
+                        Some(wire) => inner_ops.push(Op::PutValue {
                             sheet: addr.sheet,
                             row: addr.row,
                             col: addr.col,
                             value: wire,
-                        });
+                        }),
+                        None => inner_ops.push(Op::ClearValue {
+                            sheet: addr.sheet,
+                            row: addr.row,
+                            col: addr.col,
+                        }),
                     }
                     // Mirror `set_value`: a `ClearFormula` lands iff the cell
                     // currently (pre-batch) has a formula.
@@ -1294,8 +1309,11 @@ impl EngineSession for WorkbookSession {
 
         // --- Phase 2: append the single BatchCommit BEFORE any mutation.
         // (Skip iff the batch reduced to zero inner ops — e.g. only
-        // Blank-clears on non-formula cells; then there is nothing to log and
-        // nothing observable changed.) ---
+        // `SessionOp::Clear`s on cells that have no formula (mirroring
+        // `clear_formula`'s no-op); then there is nothing to log and nothing
+        // observable changed. Note: a `SetValue { Blank }` now ALWAYS emits a
+        // durable `Op::ClearValue` (F2 closure), so it never contributes to
+        // this zero-op case.) ---
         let applied = ops.len() as u32;
         if inner_ops.is_empty() {
             return Ok(BatchResult {
@@ -1553,9 +1571,10 @@ impl EngineSession for WorkbookSession {
         // Design (a) — session change-log keyed by `state_seq` (impl-plan §0 item
         // 3, locked 2026-05-27). Keeps `&self`: the `&mut self` mutators + recalc
         // populate `change_log`; this reads it. Captures what an op-walk misses —
-        // recompute-written dependents (`put_computed_at` appends no ops) and a
-        // `set_value(Blank)` clear (appends no op) — because changes are recorded
-        // explicitly at the command, not derived from the op-log.
+        // recompute-written dependents (`put_computed_at` appends no ops) —
+        // because changes are recorded explicitly at the command, not derived
+        // from the op-log. (Pre-F2 a `set_value(Blank)` clear also appended no
+        // op; `Op::ClearValue` now closes that, but the recompute case remains.)
         self.ensure_readable()?;
 
         // §4.3 designed full-rebuild states (NOT errors) + the fail-loud
@@ -2619,8 +2638,9 @@ mod tests {
         s.set_value(addr(sheet, 2, 2), CellValue::Number { number: 7.0 })
             .unwrap();
         let v = s.snapshot().unwrap().version;
-        // F2 token half: set_value(Blank) clears a value-only cell. The runtime
-        // appends no op for this, but the change-log records it → token advances.
+        // F2: set_value(Blank) clears a value-only cell. Post-F2 the runtime
+        // appends a durable Op::ClearValue, AND the change-log records the
+        // clear → token advances and the cell shows up in removed_cells.
         s.set_value(addr(sheet, 2, 2), CellValue::Blank).unwrap();
         assert_ne!(
             v,

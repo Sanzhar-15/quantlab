@@ -133,10 +133,12 @@ use ql_collab::LoopbackTransport;
 use ql_collab::PresenceState as CorePresenceState;
 use ql_collab::Transport as CoreTransport;
 use ql_collab::TransportError;
-use ql_functions::default_registry;
-use ql_io::oplog_persistence::{load_workbook_with_oplog, save_workbook_with_oplog, PersistenceError};
 use ql_collab_ws::WebSocketError;
 use ql_collab_ws::WebSocketTransport;
+use ql_functions::default_registry;
+use ql_io::oplog_persistence::{
+    load_workbook_with_oplog, save_workbook_with_oplog, PersistenceError,
+};
 use ql_oplog::CellWireValue;
 use ql_oplog::Op;
 use ql_types::PeerId;
@@ -390,7 +392,12 @@ fn classify_delta_op(
     new_formats: &mut Vec<ql_storage::FormatId>,
 ) {
     match op {
+        // **F2 Blank-durability closure (2026-05-27)**: Op::ClearValue
+        // joins the cell-keyed fast path. The delta's changedCells
+        // entry for the cleared cell carries its new (Blank) value when
+        // the IDE re-reads it; no full rebuild needed.
         Op::PutValue { sheet, row, col, .. }
+        | Op::ClearValue { sheet, row, col }
         | Op::PutFormula { sheet, row, col, .. }
         | Op::ClearFormula { sheet, row, col }
         | Op::SetCellFormat { sheet, row, col, .. } => {
@@ -1648,13 +1655,7 @@ impl CollabSession {
     /// - `[session_oplog]` if the underlying `append_op` fails (e.g.,
     ///   codec encode error; the cell-keyed CacheEffect path).
     #[napi(js_name = "appendPutFormula")]
-    pub fn append_put_formula(
-        &self,
-        sheet: f64,
-        row: f64,
-        col: f64,
-        text: String,
-    ) -> Result<()> {
+    pub fn append_put_formula(&self, sheet: f64, row: f64, col: f64, text: String) -> Result<()> {
         // V3.6.0.X audit-of-D5 OPUS-HIGH-3 closure (2026-05-24): sheet
         // is now f64 + validate_u16_index for the same reason as
         // appendPutValue's symmetric closure.  See validate_u16_index
@@ -1972,9 +1973,7 @@ impl CollabSession {
     #[napi(js_name = "clearPresence")]
     pub fn clear_presence(&self) -> Result<()> {
         let mut inner = self.inner.lock();
-        inner
-            .clear_presence()
-            .map_err(collab_session_error_to_napi)
+        inner.clear_presence().map_err(collab_session_error_to_napi)
     }
 
     /// **Phase 5.7 V3.4.0.5 (2026-05-23) -- remove ALL presence
@@ -2306,32 +2305,30 @@ impl CollabSession {
                     // **V3.6.0.X audit-of-D4 Opus LOW-2 closure**:
                     // drop `.to_string()` on the lookup result;
                     // `format::parse` takes `&str`.
-                    let rendered: Option<String> = match (
-                        state.format.as_ref(),
-                        state.value.as_ref(),
-                    ) {
-                        (Some(fmt_id), Some(wire_value)) if !wire_value.is_pending() => {
-                            let fmt_id_copy = *fmt_id;
-                            wire_value.to_value().ok().and_then(|value| {
-                                // CONVERGENT-MED-2 parse cache: reuse
-                                // FormatString across cells sharing a
-                                // FormatId within a single snapshot.
-                                if let Some(fmt) = parsed_format_cache.get(&fmt_id_copy) {
-                                    return Some(ql_functions::format::render(
-                                        &value, fmt, &eval_ctx,
-                                    ));
-                                }
-                                // Cache miss: lookup + parse + insert.
-                                let fmt_str = workbook.formats().lookup(fmt_id_copy)?;
-                                let fmt = ql_functions::format::parse(fmt_str).ok()?;
-                                let rendered_str =
-                                    ql_functions::format::render(&value, &fmt, &eval_ctx);
-                                parsed_format_cache.insert(fmt_id_copy, fmt);
-                                Some(rendered_str)
-                            })
-                        }
-                        _ => None,
-                    };
+                    let rendered: Option<String> =
+                        match (state.format.as_ref(), state.value.as_ref()) {
+                            (Some(fmt_id), Some(wire_value)) if !wire_value.is_pending() => {
+                                let fmt_id_copy = *fmt_id;
+                                wire_value.to_value().ok().and_then(|value| {
+                                    // CONVERGENT-MED-2 parse cache: reuse
+                                    // FormatString across cells sharing a
+                                    // FormatId within a single snapshot.
+                                    if let Some(fmt) = parsed_format_cache.get(&fmt_id_copy) {
+                                        return Some(ql_functions::format::render(
+                                            &value, fmt, &eval_ctx,
+                                        ));
+                                    }
+                                    // Cache miss: lookup + parse + insert.
+                                    let fmt_str = workbook.formats().lookup(fmt_id_copy)?;
+                                    let fmt = ql_functions::format::parse(fmt_str).ok()?;
+                                    let rendered_str =
+                                        ql_functions::format::render(&value, &fmt, &eval_ctx);
+                                    parsed_format_cache.insert(fmt_id_copy, fmt);
+                                    Some(rendered_str)
+                                })
+                            }
+                            _ => None,
+                        };
                     CellSnapshotJson {
                         row,
                         col,
@@ -2383,7 +2380,8 @@ impl CollabSession {
         // diffable, JSON-stringify-equal).  Iteration + sort cost is
         // O(N_formats * log N_formats) where N_formats is typically
         // < 100; negligible vs rebuild_workbook + snapshot_cells.
-        let mut format_pairs: Vec<(ql_storage::FormatId, &str)> = workbook.formats().iter().collect();
+        let mut format_pairs: Vec<(ql_storage::FormatId, &str)> =
+            workbook.formats().iter().collect();
         format_pairs.sort_by_key(|(id, _)| *id);
         let formats: Vec<FormatDefJson> = format_pairs
             .into_iter()
@@ -2515,9 +2513,7 @@ impl CollabSession {
             inner.last_snapshot_oplog_vv(),
             inner.last_snapshot_op_count(),
         ) {
-            (Some(arc), Some(vv), Some(n)) => {
-                (std::sync::Arc::clone(arc), vv.clone(), n)
-            }
+            (Some(arc), Some(vv), Some(n)) => (std::sync::Arc::clone(arc), vv.clone(), n),
             _ => {
                 return Ok(empty_delta(current_version_bytes, true));
             }
@@ -2707,8 +2703,7 @@ impl CollabSession {
         // check.
         let removed_sheet_set: std::collections::HashSet<u16> =
             removed_sheet_ids.iter().copied().collect();
-        let mut changed_cells: Vec<ChangedCellJson> =
-            Vec::with_capacity(changed_cell_coords.len());
+        let mut changed_cells: Vec<ChangedCellJson> = Vec::with_capacity(changed_cell_coords.len());
         for (sheet, row, col) in changed_cell_coords {
             // V3.6.0.X phase-termination filter + 5.8 megaudit S2-01 closure
             // (2026-05-26): skip a changedCells entry for a TOMBSTONED sheet.
@@ -2743,22 +2738,16 @@ impl CollabSession {
             let repaired_formula = next_workbook
                 .formula_at(sheet, row, col)
                 .map(|s| s.as_ref().to_string());
-            let rendered: Option<String> = match (
-                state.format.as_ref(),
-                state.value.as_ref(),
-            ) {
+            let rendered: Option<String> = match (state.format.as_ref(), state.value.as_ref()) {
                 (Some(fmt_id), Some(wire_value)) if !wire_value.is_pending() => {
                     let fmt_id_copy = *fmt_id;
                     wire_value.to_value().ok().and_then(|value| {
                         if let Some(fmt) = parsed_format_cache.get(&fmt_id_copy) {
-                            return Some(ql_functions::format::render(
-                                &value, fmt, &eval_ctx,
-                            ));
+                            return Some(ql_functions::format::render(&value, fmt, &eval_ctx));
                         }
                         let fmt_str = next_workbook.formats().lookup(fmt_id_copy)?;
                         let fmt = ql_functions::format::parse(fmt_str).ok()?;
-                        let rendered_str =
-                            ql_functions::format::render(&value, &fmt, &eval_ctx);
+                        let rendered_str = ql_functions::format::render(&value, &fmt, &eval_ctx);
                         parsed_format_cache.insert(fmt_id_copy, fmt);
                         Some(rendered_str)
                     })
@@ -2896,8 +2885,8 @@ impl CollabSession {
         let bytes = oplog
             .export_bytes()
             .map_err(|e| persistence_error_to_napi(PersistenceError::OpLog(e)))?;
-        let mut session = CoreCollabSession::from_snapshot(pid, &bytes)
-            .map_err(collab_session_error_to_napi)?;
+        let mut session =
+            CoreCollabSession::from_snapshot(pid, &bytes).map_err(collab_session_error_to_napi)?;
         // **Phase 5.7 V3.6.0.X audit-of-D4 CONVERGENT-HIGH-1 closure
         // (2026-05-24)**: seed `Op::SetDateSystem` when the loaded
         // workbook's date_system differs from the runtime default

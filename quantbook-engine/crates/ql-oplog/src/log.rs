@@ -542,6 +542,12 @@ mod tests {
     fn append_each_variant_round_trips() {
         let ops = vec![
             put_value(0, 0, 0, 1.0),
+            // F2 Blank-durability closure: ClearValue round-trips on the wire.
+            Op::ClearValue {
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
             Op::PutFormula {
                 sheet: 0,
                 row: 1,

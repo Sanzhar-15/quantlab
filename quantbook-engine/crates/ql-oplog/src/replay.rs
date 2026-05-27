@@ -509,6 +509,24 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             workbook.put_at(*sheet, *row, *col, v);
             Ok(())
         }
+        Op::ClearValue { sheet, row, col } => {
+            // **F2 Blank-durability closure (2026-05-27):** clear the
+            // cell's literal value by writing `Value::Blank` to the user
+            // overlay — the SAME mechanism `WorkbookRuntime::set_value`
+            // uses for a Blank input (`workbook.put_at(.., Value::Blank)`;
+            // the read cascade reports a Blank overlay entry identically
+            // to an absent one). The formula association, if any, is
+            // intentionally untouched — value and formula are independent
+            // overlays, so a stand-alone ClearValue must not strip a
+            // formula (that is `ClearFormula`'s job).
+            validate_cell(workbook, *sheet, *row, *col, index)?;
+            // V3.5.0.3b: silent no-op on tombstoned sheet (see Op::PutValue).
+            if workbook.is_sheet_removed(*sheet) {
+                return Ok(());
+            }
+            workbook.put_at(*sheet, *row, *col, Value::Blank);
+            Ok(())
+        }
         Op::PutFormula {
             sheet,
             row,
@@ -1685,6 +1703,101 @@ mod tests {
         let reg = default_registry();
         replay_into(&log, &mut wb, &reg).unwrap();
         assert!(wb.formula_at(0, 0, 0).is_none());
+    }
+
+    /// **F2 Blank-durability closure (2026-05-27):** a `PutValue(A1=5)`
+    /// followed by `ClearValue(A1)` must replay to A1 == Blank, NOT 5.
+    /// This is the canonical save/load + undo durability guarantee: the
+    /// value-clear is now visible in the op log and reproduces on replay
+    /// into a fresh workbook.
+    #[test]
+    fn replay_clear_value_resets_prior_put_value() {
+        let mut log = OpLog::new();
+        log.append(Op::PutValue {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: CellWireValue::Number(5.0),
+        })
+        .unwrap();
+        log.append(Op::ClearValue {
+            sheet: 0,
+            row: 0,
+            col: 0,
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        let n = replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(n, 2);
+        // The value-clear reproduced: A1 is Blank, not the prior 5.
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Blank);
+    }
+
+    /// **F2 closure:** `ClearValue` leaves any formula association at the
+    /// cell untouched (value and formula are independent overlays; a
+    /// stand-alone value-clear must not strip a formula).
+    #[test]
+    fn replay_clear_value_preserves_formula() {
+        let mut log = OpLog::new();
+        log.append(Op::PutFormula {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            text: "A2 + 1".to_owned(),
+        })
+        .unwrap();
+        log.append(Op::ClearValue {
+            sheet: 0,
+            row: 0,
+            col: 0,
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.formula_at(0, 0, 0).map(|s| s.as_ref()), Some("A2 + 1"));
+    }
+
+    /// **F2 closure + V3.5.0.3b tombstone semantic:** replaying
+    /// `ClearValue` onto a tombstoned sheet is a silent no-op (mirrors
+    /// the `PutValue` / `PutFormula` / `ClearFormula` tombstone guard).
+    #[test]
+    fn replay_clear_value_on_tombstoned_sheet_is_silent_noop() {
+        let mut log = OpLog::new();
+        // Put a value, then tombstone the sheet, then try to clear it.
+        log.append(Op::PutValue {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: CellWireValue::Number(7.0),
+        })
+        .unwrap();
+        log.append(Op::AddSheet {
+            name: "S2".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        log.append(Op::RemoveSheet { id: 0 }).unwrap();
+        log.append(Op::ClearValue {
+            sheet: 0,
+            row: 0,
+            col: 0,
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        // Replay must succeed (silent no-op, not an error) ...
+        let n = replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(n, 4);
+        assert!(wb.is_sheet_removed(0));
+        // ... and the ClearValue did NOT touch the (now-tombstoned)
+        // sheet's preserved storage: the cell still reads 7.0 underneath
+        // the tombstone (snapshot filtering happens at a higher layer).
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(7.0));
     }
 
     #[test]

@@ -778,33 +778,39 @@ impl<'a> WorkbookRuntime<'a> {
 
         // Phase 2A.3.b: emit ops BEFORE mutating, so a serialization failure
         // (NaN/Inf) leaves the workbook unchanged. `CellWireValue::from_value`
-        // returns None for `Value::Blank`; we skip the `PutValue` in that case
-        // (documented limitation — replaying a Blank write won't reset a
-        // prior non-Blank value; rare enough that the wire-format expansion
-        // is deferred to Phase 5+). The `ClearFormula` still fires below if
-        // the cell had a formula, so the produced log captures the formula
-        // removal even when the literal value is Blank.
+        // returns None for `Value::Blank` (Blank is the storage default,
+        // encoded as the ABSENCE of a `CellRecord`), so a Blank value emits
+        // `Op::ClearValue` rather than `Op::PutValue`.
         //
-        // Phase 2B.7 audit H2 (2026-05-12): when BOTH PutValue and
-        // ClearFormula need to land, wrap them in a single `Op::BatchCommit`
-        // so the pair is atomic at the Loro level — partial-pair failure
-        // (first appended, second fails) is now impossible.
+        // **F2 Blank-durability closure (2026-05-27):** previously the Blank
+        // case emitted NO op at all on a value-only cell, so replaying the
+        // log into a fresh workbook did NOT reproduce the clear (a cell that
+        // was `5` then Blank-cleared replayed back to `5`). `Op::ClearValue`
+        // now makes every value-clear durable — closing the save/load AND
+        // undo (which re-materializes via replay) correctness gap.
+        //
+        // Phase 2B.7 audit H2 (2026-05-12): when BOTH a value op and
+        // ClearFormula need to land (e.g. a Blank set over a formula cell
+        // logs `ClearValue` + `ClearFormula`), wrap them in a single
+        // `Op::BatchCommit` so the pair is atomic at the Loro level —
+        // partial-pair failure (first appended, second fails) is impossible.
         let had_formula = self.workbook.formula_at(sheet, row, col).is_some();
         if let Some(oplog) = self.oplog.as_deref_mut() {
             let mut log_ops: Vec<Op> = Vec::with_capacity(2);
-            if let Some(wire) = CellWireValue::from_value(&value) {
-                log_ops.push(Op::PutValue {
+            match CellWireValue::from_value(&value) {
+                Some(wire) => log_ops.push(Op::PutValue {
                     sheet,
                     row,
                     col,
                     value: wire,
-                });
+                }),
+                // Blank value: emit the durable value-clear op (F2).
+                None => log_ops.push(Op::ClearValue { sheet, row, col }),
             }
             if had_formula {
                 log_ops.push(Op::ClearFormula { sheet, row, col });
             }
             match log_ops.len() {
-                0 => {} // Blank value on a non-formula cell — no-op.
                 1 => oplog.append(log_ops.into_iter().next().unwrap())?,
                 _ => oplog.append(Op::BatchCommit { ops: log_ops })?,
             }
@@ -1495,27 +1501,42 @@ mod tests {
         }
     }
 
+    /// **F2 Blank-durability closure (2026-05-27):** a Blank set on a
+    /// value-only cell now emits a durable `Op::ClearValue` (previously
+    /// emitted nothing — the value-clear was invisible to the op log and
+    /// did NOT reproduce on replay). The op fires even on an
+    /// already-blank cell; that is harmless (replay just writes Blank
+    /// over Blank) and keeps the producer simple (no pre-read to detect
+    /// "already blank").
     #[test]
-    fn set_value_blank_emits_nothing_when_cell_is_already_blank() {
+    fn set_value_blank_on_value_only_cell_emits_clear_value() {
         let mut wb = make_runtime_workbook();
         let reg = default_registry();
         let mut oplog = OpLog::new();
         {
             let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
-            // Blank-write on a blank cell with no formula — emits no op
-            // (PutValue is skipped because CellWireValue::from_value(Blank) =
-            // None; ClearFormula is skipped because had_formula = false).
+            // Blank-write on a no-formula cell — emits ONE Op::ClearValue
+            // (PutValue is replaced because CellWireValue::from_value(Blank)
+            // = None; ClearFormula is skipped because had_formula = false).
             rt.set_value(0, 0, 0, Value::Blank).unwrap();
         }
-        assert!(
-            oplog.is_empty(),
-            "expected empty log, got {} ops",
-            oplog.len()
-        );
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 1, "ops were: {ops:?}");
+        match &ops[0] {
+            Op::ClearValue { sheet, row, col } => {
+                assert_eq!((*sheet, *row, *col), (0, 0, 0));
+            }
+            other => panic!("expected ClearValue, got {other:?}"),
+        }
     }
 
+    /// **F2 Blank-durability closure (2026-05-27):** a Blank set over a
+    /// formula cell now emits an atomic `BatchCommit { ClearValue,
+    /// ClearFormula }` (previously emitted `ClearFormula` only — the
+    /// value-clear half was invisible to the op log). Both halves are
+    /// durable + replay-reproducible.
     #[test]
-    fn set_value_blank_over_formula_emits_clear_formula_only() {
+    fn set_value_blank_over_formula_emits_clear_value_and_clear_formula() {
         let mut wb = make_runtime_workbook();
         let reg = default_registry();
         // Seed a formula directly on the workbook (skip the op log so we
@@ -1528,8 +1549,47 @@ mod tests {
             rt.set_value(0, 0, 0, Value::Blank).unwrap();
         }
         let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
-        assert_eq!(ops.len(), 1);
-        assert!(matches!(ops[0], Op::ClearFormula { .. }));
+        assert_eq!(ops.len(), 1, "ops were: {ops:?}");
+        match &ops[0] {
+            Op::BatchCommit { ops: inner } => {
+                assert_eq!(inner.len(), 2, "inner ops: {inner:?}");
+                assert!(matches!(inner[0], Op::ClearValue { .. }));
+                assert!(matches!(inner[1], Op::ClearFormula { .. }));
+            }
+            other => panic!("expected BatchCommit{{ClearValue, ClearFormula}}, got {other:?}"),
+        }
+    }
+
+    /// **F2 Blank-durability closure (2026-05-27):** the end-to-end
+    /// durability guarantee. `set_value(A1, 5)` then `set_value(A1,
+    /// Blank)` produces an op log which, replayed into a FRESH workbook,
+    /// yields A1 == Blank (NOT the stale 5). Pre-F2 this replayed back to
+    /// 5 because the Blank-clear emitted no op.
+    #[test]
+    fn set_value_then_blank_replays_to_blank_not_stale_value() {
+        use ql_oplog::replay_into;
+        let mut producer_wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut oplog);
+            rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+            rt.set_value(0, 0, 0, Value::Blank).unwrap();
+        }
+        // Live producer state: A1 is Blank.
+        assert_eq!(
+            producer_wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Blank
+        );
+
+        // Replay the log into a fresh workbook with the same shape.
+        let mut replay_wb = make_runtime_workbook();
+        replay_into(&oplog, &mut replay_wb, &reg).unwrap();
+        assert_eq!(
+            replay_wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Blank,
+            "ClearValue must reproduce the value-clear on replay (not leave the stale 5)"
+        );
     }
 
     #[test]
