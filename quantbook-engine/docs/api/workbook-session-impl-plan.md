@@ -46,20 +46,41 @@ fallback):** `open`/`import`/`save`/`export` (persistence);
 **Remaining sequence (NEXT):** batch/txn → undo/redo → persistence → functions → reserved bulk → Node
 smoke migration (+ pending `.node` rebuild + B#1/S2-01 mocha tests) → 6.1C audit.
 
-> **⚠️ NEXT-SESSION DESIGN NOTE — `batch` has a real fork (grounded 2026-05-27, decide first):** the
-> contract (§3.4) requires a batch to be **one `Op::BatchCommit`** (a single undo unit), and points at
-> `WorkbookTransaction` (`transaction.rs`). But `WorkbookTransaction` only exposes `put_value` /
-> `put_formula` (`:158`/`:196`) — **no `clear`, no `set_format`** — while `SessionOp`
-> (`ql-session/src/session.rs:40`) has all four variants (SetValue/SetFormula/Clear/SetFormat). So a
-> faithful single-`BatchCommit` batch needs a decision: **(i)** extend `WorkbookTransaction` with
-> clear/set-format buffering (cleanest, true atomic BatchCommit for all 4); **(ii)** value/formula-only
-> batch via `WorkbookTransaction` now + surface Clear/SetFormat-in-batch as `Capability/not_yet`
-> (honest, No-Fallbacks, ships the common bulk-paste case). Do NOT apply the ops via the per-edit
-> session mutators in a loop — that emits N separate ops, not one undo unit, violating §3.4. Also: the
-> multi-call handle (`begin_transaction`/`txn_add`/`commit_transaction`/`rollback_transaction`) needs two
-> NEW `WorkbookSession` fields (`txns: HashMap<TransactionId, Vec<SessionOp>>`, `next_txn_id: u64`) that
-> are not in the struct yet (impl-plan §2 sketched them; inc.2b shipped without them). `BatchResult` =
-> `{applied: u32, version}`; `BatchOptions` = `{undo_label?}`; `TransactionId(u64)`.
+> **⚠️ NEXT-SESSION DESIGN NOTE — `batch` is a DESIGN increment, not a wiring task (grounded
+> 2026-05-27; TWO tensions, decide both first):**
+>
+> **Tension 1 — op coverage.** `WorkbookTransaction` (`transaction.rs:158/196`) buffers only
+> `put_value`/`put_formula` — **no clear/set_format** — while `SessionOp` (`ql-session/src/session.rs:40`)
+> has all four (SetValue/SetFormula/Clear/SetFormat).
+>
+> **Tension 2 (the load-bearing one) — `WorkbookTransaction` does NOT maintain the calcgraph.** It is
+> the pre-Phase-3 batch primitive (module doc `:22-25`): `commit` writes values/formulas + evaluates in
+> op-order directly on the `Workbook`, with **no `CalcgraphSession` field**. But `WorkbookSession` owns a
+> LIVE graph that its single-cell mutators keep current (runtime `on_set_value` hooks). Routing `batch`
+> through `WorkbookTransaction` would leave the session graph **stale** → a later `recalc_dirty` misses
+> the batched cells' deps + fails to dirty their dependents = silent correctness break. So a faithful
+> `batch` must keep one `Op::BatchCommit` (§3.4 = one undo unit) AND keep the graph consistent.
+>
+> **Resolution options (pick deliberately):** **(a)** apply each op through the session's
+> graph-maintaining runtime mutators with the op-log **detached** (runtime takes `Option<&mut OpLog>` —
+> pass `None`, so graph + workbook update but NO per-op append), then append one manually-built
+> `Op::BatchCommit` — covers all 4 op types, graph stays live, but duplicates op-construction (fragile,
+> must mirror the per-mutator PutValue/ClearFormula/PutFormula/SetCellFormat logic); **(b)** a NEW native
+> runtime `apply_batch(ops)` (graph-maintaining + emits one BatchCommit) — cleanest, an engine addition
+> in `workbook_runtime`; **(c)** `WorkbookTransaction` + a full `CalcgraphSession::rebuild_from_workbook`
+> after commit — correct but O(all formulas)/batch and still no clear/set_format. **Do NOT** loop the
+> per-edit session mutators (emits N ops, not one undo unit, violating §3.4). Recommendation: **(b)** if
+> the engine-addition budget is acceptable (it's the right long-term primitive and 6.4 bulk writes will
+> want it too); otherwise **(a)** for a v1 that ships now. Verify the runtime maintains the graph with
+> `oplog = None` before committing to (a).
+>
+> **Plus:** the multi-call handle (`begin_transaction`/`txn_add`/`commit_transaction`/
+> `rollback_transaction`) needs two NEW `WorkbookSession` fields (`txns: HashMap<TransactionId,
+> Vec<SessionOp>>`, `next_txn_id: u64`) not in the struct yet (impl-plan §2 sketched them; inc.2b shipped
+> without). `BatchResult` = `{applied: u32, version}`; `BatchOptions` = `{undo_label?}`;
+> `TransactionId(u64)`. **Undo/redo (next after batch) hits the same graph-reversion question** — undo
+> retracts ops but the workbook + graph must be rebuilt to the pre-op state (likely
+> `rebuild_from_workbook` after a Loro undo); `bump_epoch` is already wired for it.
 
 ### What 2b shipped (REAL)
 - **2a — PlanCache session-ownership** (§3): `WorkbookRuntime::with_session_state(.., PlanCache)` +
