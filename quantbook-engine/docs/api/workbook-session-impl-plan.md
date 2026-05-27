@@ -2,13 +2,14 @@
 
 **Status:** ⏳ IN PROGRESS — **2b/2c-1/2c-2 + audit-fix SHIPPED 2026-05-26; inc.2 audit (F3–F10) +
 inc.2c-3 `snapshot_delta` + inc.2c-4 `batch` + inc.2c-5 transaction handle + inc.2c-6 F2 `Op::ClearValue`
-+ inc.2c-7 undo/redo SHIPPED 2026-05-27.**
++ inc.2c-7 undo/redo + inc.2c-8 F10 atomic table-rename SHIPPED 2026-05-27.**
 Chain: `83b1b33bac2` PlanCache → `7335a5a1bfa` core → `993492b6f9b` validate_formula/query_range/
 `CellValue::Blank` → `2b5e7a13f5b` delete/restore/move sheet + tables → `9f7a1645dbd` tombstone-read fix →
 **`879f3601747` inc.2 audit-fix (F3–F10)** → **`20427b1c4c7` inc.2c-3 snapshot_delta** → **`58a55f4cfb8`
 + `9d471be3663` inc.2c-4 batch** → `fdd80c7a43d` inc.2c-5 transaction handle → `d8d22a04248` inc.2c-6 F2
-`Op::ClearValue` → **`4f8e9858d77` inc.2c-7 undo/redo**. `WorkbookSession` is in
-`crates/ql-exec/src/session.rs`; **ql-exec lib 709/0, clippy clean, workspace build green.**
+`Op::ClearValue` → `4f8e9858d77` inc.2c-7 undo/redo → **`dca5695549e` inc.2c-8 F10 atomic table-rename**.
+`WorkbookSession` is in `crates/ql-exec/src/session.rs`; **ql-exec lib 709/0 + e2e 21/0, clippy clean,
+workspace build green.**
 
 ### Method status — what the next window inherits (REAL vs surfaced-not-yet)
 **REAL (implemented + tested):** `lifecycle_state`, `close`; `set_value`, `set_formula`, `clear`,
@@ -49,19 +50,21 @@ fallback):** `open`/`import`/`save`/`export` (persistence);
   `from_workbook` data-loss path) → `rebuild_from_workbook` → `recompute_all` (op-log detached) →
   `bump_epoch`. Empty stack → `consumed:false`. Linear single-writer replay reproduces renames without
   the ql-collab repair passes (concurrency-only).
-- **F10 (still tracked, pre-existing): table rename/rename_column are NOT append-before-mutate atomic**
-  (near-zero reachability — only a Loro-internal append failure mid-loop). Fix = collect ops → one
-  `Op::BatchCommit` before any `put_formula`, mirroring `rename_sheet`; folds into the persistence
-  increment. undo's `grouped()` brackets a successful rename as one unit. See
-  `docs/audits/2026-05-27-inc2c67-undo-audit/SYNTHESIS.md`.
+- ✅ **F10 CLOSED (inc.2c-8, `dca5695549e`): table rename/rename_column are now append-before-mutate
+  atomic** — `rename_table`/`rename_column` collect the rename op + all `PutFormula` rewrites into ONE
+  `Op::BatchCommit` appended before any mutation (mirroring `rename_sheet`). Replay applies the inner ops
+  in order (re-key, then rewrite text — complementary). Focused Codex audit clean (no HIGH/MED). The undo
+  `grouped()` wrapper is now defense-in-depth (the renames are single-commit by construction).
 
 **Remaining sequence (NEXT):** persistence (`open`/`import`/`save`/`export` via `ql_io` — adds
-`PersistenceError` to Appendix A; also the place to land the F10 table-rename BatchCommit fix; **`open`/
-`import` MUST set `baseline = loaded` so undo preserves loaded content** — the inc.2c-7 baseline field is
-already wired for this) → functions (6.4) → reserved bulk → Node smoke migration (+ pending `.node`
-rebuild + B#1/S2-01 mocha tests) → 6.1C audit. (`batch` SHIPPED inc.2c-4; **transaction handle** SHIPPED
-inc.2c-5; **F2 `Op::ClearValue`** SHIPPED inc.2c-6; **undo/redo** SHIPPED inc.2c-7 — all parallel
-Codex+Opus audited, synthesis docs under `docs/audits/2026-05-27-*`.)
+`PersistenceError` to Appendix A). **DESIGN FORK to lock first (see the handoff): `open` adopts loaded
+state — Option 1 (baseline = loaded workbook + FRESH op-log; simple, always-correct for undo, loses
+op-log history on resave) vs Option 2 (baseline = empty + adopt the loaded op-log; preserves history but
+requires `loaded_wb == replay(loaded_oplog)`).** The inc.2c-7 `baseline` field is wired for Option 1.
+Then → functions (6.4) → reserved bulk → Node smoke migration (+ pending `.node` rebuild + B#1/S2-01 mocha
+tests) → 6.1C audit. (`batch` inc.2c-4; **transaction handle** inc.2c-5; **F2 `Op::ClearValue`** inc.2c-6;
+**undo/redo** inc.2c-7; **F10 atomic table-rename** inc.2c-8 — all Codex/Opus-audited, synthesis docs
+under `docs/audits/2026-05-27-*`.)
 
 > **✅ `batch` SHIPPED inc.2c-4 (2026-05-27) — OPTION (a) chosen.** Both tensions resolved; the
 > multi-call transaction handle stays deferred (see below).
@@ -190,9 +193,12 @@ Codex+Opus audited, synthesis docs under `docs/audits/2026-05-27-*`.)
    replay post-undo op-log onto a clone of the construction-time `baseline` workbook → rebuild graph →
    recompute_all (op-log detached) → bump_epoch. Empty stack → consumed:false. Codex+Opus audit: closed a
    real populated-`from_workbook` data-loss HIGH (the baseline field); F10 left tracked.
-10. **NEXT: persistence** (`open`/`import`/`save`/`export` via `ql_io` — adds `PersistenceError` mapping to
-    Appendix A; lands the F10 table-rename BatchCommit fix; `open`/`import` MUST set `baseline = loaded`).
-11. **functions** (6.4) + **reserved bulk** (6.4/6.5).
+10. ✅ **F10 atomic table-rename** (SHIPPED inc.2c-8, `dca5695549e`) — `rename_table`/`rename_column` emit
+    ONE `Op::BatchCommit` ([Rename*, PutFormula × N]) append-before-mutate (mirror `rename_sheet`); closes
+    the tracked F10 gap. Codex audit clean.
+11. **NEXT: persistence** (`open`/`import`/`save`/`export` via `ql_io` — adds `PersistenceError` to
+    Appendix A; lock the `open` baseline/op-log design fork first — see Remaining sequence above).
+12. **functions** (6.4) + **reserved bulk** (6.4/6.5).
 
 ---
 

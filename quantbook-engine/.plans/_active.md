@@ -105,13 +105,23 @@ status: |
   cap documented. Synthesis `docs/audits/2026-05-27-inc2c67-undo-audit/SYNTHESIS.md`. ql-exec 709/0, clippy
   clean, workspace build green.
 
+  ✅ 6.1B inc.2c-8 F10 atomic table-rename SHIPPED 2026-05-27 (`dca5695549e`). rename_table/rename_column
+  emit ONE Op::BatchCommit ([Rename*, PutFormula × N]) append-before-mutate (mirror rename_sheet); closes
+  the tracked F10 Codex-HIGH gap. Replay reproduces identical end state (apply_rename_* only re-key
+  metadata; PutFormula ops carry text — complementary). undo grouped() now defense-in-depth. Focused Codex
+  (gpt-5.5 xhigh) audit: no HIGH/MED; 2 LOW (stale docs, rename_table e2e) APPLIED. emits_ops tests assert
+  single-BatchCommit; + e2e rename_table_op_log_replay_reconstructs_rename. ql-exec 709/0 + e2e 21/0,
+  ql-oplog 70/0, clippy clean, workspace build green.
+
   ⭐ NEXT = 6.1B persistence — **follow `docs/api/workbook-session-impl-plan.md` §0**.
   Remaining, surfaced as `Capability/not_implemented_in_v1_core` (honest, No-Fallbacks):
-  (10) persistence (open/import/save/export via ql_io → adds PersistenceError to Appendix A; **lands the
-  F10 table-rename BatchCommit fix**; `open`/`import` MUST set `baseline = loaded` so undo preserves loaded
-  content — the inc.2c-7 baseline field is already wired). (11) functions (6.4) + reserved bulk (6.4/6.5).
-  Then Node smoke-path migration + 6.1C audit. Do NOT freeze the CollabSession CRDT façade (collab = v1.5).
-  Also pending: the napi `.node` rebuild + B#1/S2-01 mocha tests.
+  (11) persistence (open/import/save/export via ql_io → adds PersistenceError to Appendix A). **DESIGN
+  FORK to lock first: `open` adopts loaded state — Option 1 (baseline = loaded workbook + FRESH op-log;
+  simple, always-correct for undo, loses op-log history on resave) vs Option 2 (baseline = empty + adopt
+  the loaded op-log; preserves history but needs loaded_wb == replay(loaded_oplog)). The inc.2c-7 baseline
+  field is wired for Option 1.** (12) functions (6.4) + reserved bulk (6.4/6.5). Then Node smoke-path
+  migration + 6.1C audit. Do NOT freeze the CollabSession CRDT façade (collab = v1.5). Also pending: the
+  napi `.node` rebuild + B#1/S2-01 mocha tests.
 date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-26_phase-5-7-v3-6-1-delta-consumer-backlog.md (V3.6.1 backlog mini-phase, SUPERSEDED by Phase 5 COMPLETE)
 parent_phase: 6 Product Surfaces
@@ -125,7 +135,7 @@ direction: |
   foundation; 6.4 (Python UDFs) is the strategic wedge; everything else (full bindings,
   service, SQL, AI) follows. Collab is v1.5-deferred and must NOT pre-empt Phase 6.
 
-current_engine_head: 4f8e9858d77 (6.1B inc.2c-7 — undo/redo; LAST CODE COMMIT) ← d8d22a04248 (6.1B inc.2c-6 — F2 Op::ClearValue) ← fdd80c7a43d (6.1B inc.2c-5 — multi-call transaction handle) ← 358c2c29f5d (inc.2c-4 coherence docs) ← 9d471be3663 (6.1B inc.2c-4 batch fix — reject same-cell value/formula conflicts) ← 58a55f4cfb8 (6.1B inc.2c-4 — batch via option (a)) ← dddb19a9c0d (batch calcgraph design note) ← 03fdeead3aa (batch design-fork note) ← 67c8ad3596e (inc.2c-3 docs sync) ← 20427b1c4c7 (6.1B inc.2c-3 — snapshot_delta: change-log + state_seq) ← 879f3601747 (6.1B inc.2 audit-fix F3–F10) ← e16acdcf14b (inc.2c-2 doc sync) ← 9f7a1645dbd (6.1B inc.2c-2 audit-fix — tombstone-read consistency) ← 2b5e7a13f5b (6.1B inc.2c-2 — structure + table ops) ← 993492b6f9b (6.1B inc.2c-1 — validate_formula + query_range + CellValue::Blank) ← 7335a5a1bfa (6.1B inc.2b — WorkbookSession core path) ← 83b1b33bac2 (6.1B inc.2a — session-owned PlanCache ctor; first PRE-EXISTING-code change since S2-01, additive) ← 884b7e365e8 (6.1B inc.2 impl-plan doc) ← 38108a5c8ef (6.1B inc.1b — trait w/ table ops) ← af15dcf3a5d (race-fix) ← 20d11072a0a (6.1B inc.1 — ql-session crate) ← ff6cd4c147c (6.1A v2). PRE-EXISTING-code changes since baseline: B#1 + S2-01 + inc.2a (additive PlanCache ctor). inc.2b/2c-1/2c-2 add NEW ql-exec/src/session.rs + ql-session dep + CellValue::Blank variant (no pre-existing-code behavior change). After current_engine_head, doc-sync commits advance HEAD further. pre-B#1 baseline 1465b1db4c4.
+current_engine_head: dca5695549e (6.1B inc.2c-8 — F10 atomic table-rename; LAST CODE COMMIT) ← 2056edacc5c (inc.2c-6/7 doc sync) ← 4f8e9858d77 (6.1B inc.2c-7 — undo/redo) ← d8d22a04248 (6.1B inc.2c-6 — F2 Op::ClearValue) ← fdd80c7a43d (6.1B inc.2c-5 — multi-call transaction handle) ← 358c2c29f5d (inc.2c-4 coherence docs) ← 9d471be3663 (6.1B inc.2c-4 batch fix — reject same-cell value/formula conflicts) ← 58a55f4cfb8 (6.1B inc.2c-4 — batch via option (a)) ← dddb19a9c0d (batch calcgraph design note) ← 03fdeead3aa (batch design-fork note) ← 67c8ad3596e (inc.2c-3 docs sync) ← 20427b1c4c7 (6.1B inc.2c-3 — snapshot_delta: change-log + state_seq) ← 879f3601747 (6.1B inc.2 audit-fix F3–F10) ← e16acdcf14b (inc.2c-2 doc sync) ← 9f7a1645dbd (6.1B inc.2c-2 audit-fix — tombstone-read consistency) ← 2b5e7a13f5b (6.1B inc.2c-2 — structure + table ops) ← 993492b6f9b (6.1B inc.2c-1 — validate_formula + query_range + CellValue::Blank) ← 7335a5a1bfa (6.1B inc.2b — WorkbookSession core path) ← 83b1b33bac2 (6.1B inc.2a — session-owned PlanCache ctor; first PRE-EXISTING-code change since S2-01, additive) ← 884b7e365e8 (6.1B inc.2 impl-plan doc) ← 38108a5c8ef (6.1B inc.1b — trait w/ table ops) ← af15dcf3a5d (race-fix) ← 20d11072a0a (6.1B inc.1 — ql-session crate) ← ff6cd4c147c (6.1A v2). PRE-EXISTING-code changes since baseline: B#1 + S2-01 + inc.2a (additive PlanCache ctor). inc.2b/2c-1/2c-2 add NEW ql-exec/src/session.rs + ql-session dep + CellValue::Blank variant (no pre-existing-code behavior change). After current_engine_head, doc-sync commits advance HEAD further. pre-B#1 baseline 1465b1db4c4.
 current_ide_head: d028568b53b (V3.6.1.2 shared delta cache) — unchanged
 audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait claims need positive compile proof; phase-level closures use 3-5-way megaudits; range-aware fn ships need lex+parse+bind+eval coverage.
 
@@ -160,13 +170,15 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      value-clear path durable on replay/save-load (prerequisite for correct undo).
    - ✅ **inc.2c-7 (`4f8e9858d77`)**: **undo/redo** — Loro `UndoManager` field + baseline-replay
      re-materialization (replay post-undo op-log onto a clone of the construction-time `baseline`
-     workbook → rebuild graph → recompute_all detached → bump_epoch); 1 command = 1 unit (grouped() for
-     table renames). Parallel Codex+Opus audit: closed a populated-`from_workbook` data-loss HIGH via the
-     `baseline` field; F10 tracked.
-   - ⭐ **NEXT**: persistence (open/import/save/export via ql_io → PersistenceError in Appendix A; lands
-     the F10 table-rename BatchCommit fix; open/import set `baseline = loaded`) → functions/bulk.
-     See `workbook-session-impl-plan.md` §0. Then migrate the Node smoke path. Leave
-     collab/transport/presence feature-gated.
+     workbook → rebuild graph → recompute_all detached → bump_epoch); 1 command = 1 unit. Parallel
+     Codex+Opus audit: closed a populated-`from_workbook` data-loss HIGH via the `baseline` field.
+   - ✅ **inc.2c-8 (`dca5695549e`)**: **F10 atomic table-rename** — rename_table/rename_column emit ONE
+     Op::BatchCommit append-before-mutate (mirror rename_sheet); closes the tracked F10 Codex-HIGH gap.
+     Focused Codex audit clean (no HIGH/MED). undo grouped() now defense-in-depth.
+   - ⭐ **NEXT**: persistence (open/import/save/export via ql_io → PersistenceError in Appendix A) —
+     **lock the `open` design fork first: Option 1 (baseline=loaded + fresh oplog) vs Option 2
+     (baseline=empty + loaded oplog)**. → functions/bulk. See `workbook-session-impl-plan.md` §0. Then
+     migrate the Node smoke path. Leave collab/transport/presence feature-gated.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +
