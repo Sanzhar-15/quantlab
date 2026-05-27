@@ -149,8 +149,13 @@ impl<'a> WorkbookRuntime<'a> {
         let attempted = entries.len();
         let mut succeeded = 0;
         let mut failures: Vec<RecomputeFailure> = Vec::new();
+        // inc.2c-3: the full-pass path rewrites every formula cell, so report
+        // them all as changed (a safe over-report for the delta change-log; the
+        // cycled cells were written to `#CIRC!` in the pre-pass above).
+        let mut changed_cells: Vec<(SheetId, RowId, ColId)> = Vec::with_capacity(attempted);
 
         for (sheet, row, col, formula_text) in entries {
+            changed_cells.push((sheet, row, col));
             // Tier C1: cycled cells were already written to `#CIRC!`
             // in the pre-pass above and any stale spill cleared.
             // Match `recompute_dirty`'s cycled-cell accounting:
@@ -226,6 +231,7 @@ impl<'a> WorkbookRuntime<'a> {
             // Phase 3.9: SIMD-eligibility profile is recompute_dirty-
             // only. `recompute_all` is the legacy full-pass path.
             simd_classified: 0,
+            changed_cells,
         }
     }
 
@@ -647,12 +653,17 @@ impl<'a> WorkbookRuntime<'a> {
         }
 
         self.graph = session_slot;
+        // inc.2c-3: surface the precise value-changed set (the VEQ `changed`
+        // set accumulated across fixed-point iterations) so the owning session's
+        // delta change-log captures recompute-changed dependents.
+        let changed_cells: Vec<(SheetId, RowId, ColId)> = changed.into_iter().collect();
         Some(RecomputeResult {
             attempted,
             succeeded,
             failures,
             skipped_value_equality,
             simd_classified,
+            changed_cells,
         })
     }
 

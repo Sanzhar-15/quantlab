@@ -8,37 +8,42 @@
 //! through it so no borrow crosses an FFI boundary (GAP-PS-09; the
 //! `calcgraph_session.rs:69-71` "absorb into ONE owning struct" anticipation).
 //!
-//! ## Scope (6.1B inc.2 — the "core path" sub-increment)
+//! ## Scope (6.1B inc.2 — core path + read/structure/table + snapshot_delta)
 //!
-//! This increment ships the architecturally load-bearing core **real**:
+//! Shipped **real**:
 //! - lifecycle (`new`/`close`/state gating, the `Busy` state, version `epoch`),
 //! - single-cell mutations (`set_value`/`set_formula`/`clear`/`set_format`/
-//!   `register_format`) + sheet `add`/`rename` + `set_name`,
+//!   `register_format`/`validate_formula`) + sheet `add`/`rename`/`delete`/
+//!   `restore`/`move` + `set_name` + table ops (`create`/`rename`/
+//!   `rename_column`/`resize`/`drop`),
 //! - recalc (`recalc_dirty`/`recalc_all`/`mark_volatiles_dirty`) under the
 //!   `Busy` + operation-registry model,
-//! - the read path (`snapshot`/`cell`/`list_sheets`) + the `{epoch, op_count}`
-//!   version token,
+//! - the read path (`snapshot`/`cell`/`list_sheets`/`query_range`) + the
+//!   `{epoch, state_seq}` version token + **`snapshot_delta`** (inc.2c-3 —
+//!   change-log design (a)),
 //! - operations + events (`cancel`/`operation_status`/`poll_events`).
 //!
 //! The remaining contract methods return a **surfaced** `Capability` /
 //! `not_implemented_in_v1_core` error (NOT a silent fallback — project
 //! No-Fallbacks rule) and land in later inc.2 sub-increments:
 //! - persistence (`open`/`import`/`save`/`export`),
-//! - `query_range` + `snapshot_delta` (see the two notes below),
-//! - `delete_sheet`/`restore_sheet`/`move_sheet` (need manual op-emission +
-//!   fail-loud wrappers — MED-3), table ops, `batch`/transactions,
-//!   `undo`/`redo`, function registration (6.4), reserved bulk ops (6.4/6.5).
+//! - `batch`/transactions, `undo`/`redo`, function registration (6.4),
+//!   reserved bulk ops (6.4/6.5).
 //!
-//! ## Two design facts discovered while grounding this increment
+//! ## Two design facts that shape this increment
 //!
-//! 1. **Version token = `{epoch, op_count}` — and `ql-oplog::OpLog` DOES have a
-//!    Loro version vector** (`oplog_vv()`), contrary to an earlier doc claim
-//!    that it had none. We still use `{epoch, op_count}` deliberately, because
-//!    (a) `op_count = OpLog::len()` is the simplest monotonic single-writer
-//!    counter and (b) `len()` is NOT monotonic under undo-retraction
-//!    (`OpLog::len` reads Loro live), so the `epoch` (bumped on
-//!    reload / cache-clear / undo) is what keeps tokens sound — not the absence
-//!    of a VV. The Loro VV is reserved for the v1.5 collab delta-sync path.
+//! 1. **Version token = `{epoch, state_seq}` (inc.2c-3 — F1/F2).** `state_seq` is
+//!    a session-owned monotonic clock that advances on every committed mutation
+//!    AND every recompute that changed ≥1 cell. It **replaces `oplog.len()`** as
+//!    the token's counter because `oplog.len()` does NOT advance on recompute
+//!    (`put_computed_at` appends no ops) nor on a `set_value(Blank)` clear (no
+//!    op), which would let two distinct visible states share a token and make
+//!    `snapshot_delta` silently under-report. `ql-oplog::OpLog` DOES expose a
+//!    Loro VV (`oplog_vv()`), reserved for the v1.5 collab delta-sync path; the
+//!    opaque 24-byte token shape is unchanged (only the counter's meaning is).
+//!    `snapshot_delta` walks a bounded change-log keyed by `state_seq`; the
+//!    `epoch` (bumped on reorder/restore/table-op/undo) forces a full rebuild for
+//!    states the delta DTO cannot incrementally express.
 //!
 //! 2. **`EngineError` cannot have `From<RuntimeError>`** — orphan rules forbid
 //!    `impl From<LocalErr> for ForeignErr` when the foreign type is `Self`
@@ -56,7 +61,7 @@
 //! by bulk construction / import (`open`/`import` — surfaced-not-yet here), so
 //! base-chunk enumeration is a tracked follow-up that lands with `import`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -68,10 +73,11 @@ use ql_types::{ColId, RowId, SheetId, Value};
 use ql_formula_syntax::{lex, parse};
 use ql_oplog::Op;
 use ql_session::dto::{
-    BatchOptions, BatchResult, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue, DateSystem,
-    Diagnostic, DirtyResult, FormatDef, FormatId, PublishedRef, RangeColumn, RangeQueryOptions,
-    RangeResult, Severity, SessionVersion, SheetInfo, SheetSnapshot, TableSpec, UndoRedoResult,
-    WorkbookSnapshot, WorkbookSnapshotDelta, WriteRangeResult,
+    BatchOptions, BatchResult, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue,
+    ChangedCell, DateSystem, Diagnostic, DirtyResult, FormatDef, FormatId, FullRebuildReason,
+    PublishedRef, RangeColumn, RangeQueryOptions, RangeResult, RemovedCell, Severity,
+    SessionVersion, SheetInfo, SheetSnapshot, TableSpec, UndoRedoResult, WorkbookSnapshot,
+    WorkbookSnapshotDelta, WriteRangeResult,
 };
 use ql_session::error::{EngineError, EngineResult, ErrorClass};
 use ql_session::function_meta::FunctionMetadata;
@@ -91,6 +97,37 @@ static EPOCH_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn mint_epoch() -> u128 {
     EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed) as u128
+}
+
+/// Retained `change_log` size before the oldest records are pruned and the
+/// horizon floor advances (a `last` token older than the floor gets
+/// `StaleHorizon`, never a silently-incomplete delta). Bounded so a long-lived
+/// session does not leak; generous enough that interactive deltas never hit it.
+const CHANGE_LOG_CAP: usize = 1 << 16;
+
+/// One delta-relevant change recorded against a [`WorkbookSession`] state-seq.
+/// The change-log is the source for [`WorkbookSession::snapshot_delta`]: it
+/// records *what* changed (cells/sheets/formats) at each `seq`, and the delta
+/// resolves those to the *current* committed state at read time. This is the
+/// (a) "session change-log keyed by version" design (impl-plan §0 item 3): it
+/// keeps `snapshot_delta(&self)` and captures changes that an op-walk misses —
+/// recompute-written dependents (`put_computed_at` appends no ops) and a
+/// `set_value(Blank)` clear (appends no op).
+#[derive(Clone, Copy, Debug)]
+enum SessionChange {
+    /// A cell whose value/formula/format may have changed (resolved at delta time).
+    Cell { sheet: SheetId, row: RowId, col: ColId },
+    /// A sheet added / renamed (resolved to a full `SheetSnapshot` at delta time).
+    SheetChanged { id: SheetId },
+    /// A sheet tombstoned.
+    SheetRemoved { id: SheetId },
+    /// A format registered (resolved to a `FormatDef` at delta time).
+    FormatAdded { id: ql_storage::FormatId },
+}
+
+struct ChangeRecord {
+    seq: u64,
+    change: SessionChange,
 }
 
 /// The owning, single-writer engine session (contract §2.1).
@@ -114,9 +151,30 @@ pub struct WorkbookSession {
     registry: Arc<FunctionRegistry>,
     /// Lifecycle state; commands are gated on it (§2.3).
     state: LifecycleState,
-    /// Version-token epoch (minted at construction; re-minted on cache-clear /
-    /// undo when those land).
+    /// Version-token epoch (minted at construction; re-minted by [`bump_epoch`]
+    /// on changes the delta DTO cannot incrementally express — sheet reorder /
+    /// restore, table ops that rewrite arbitrary formula cells — and on
+    /// cache-clearing events). An old token whose epoch ≠ current →
+    /// `EpochMismatch` full rebuild.
+    ///
+    /// [`bump_epoch`]: WorkbookSession::bump_epoch
     epoch: u128,
+    /// Monotonic logical state clock — the `op_count` half of the version token
+    /// (§4.0). **Replaces `oplog.len()`** (inc.2c-3): it advances on every
+    /// committed mutation AND every recompute that changed ≥1 cell, so — unlike
+    /// `oplog.len()`, which does NOT move on `put_computed_at` (recompute) nor on
+    /// a `set_value(Blank)` clear — two *distinct* visible states can never share
+    /// a token. The opaque 24-byte `{epoch, state_seq}` token shape is unchanged
+    /// (bindings round-trip it verbatim); only what the 8-byte counter *means*
+    /// changed. Closes audit F1 + the F2 token half.
+    state_seq: u64,
+    /// Bounded change-log keyed by `state_seq` — the source for `snapshot_delta`.
+    /// Records what changed; the delta resolves each to current committed state.
+    change_log: VecDeque<ChangeRecord>,
+    /// The highest `seq` that has been pruned from `change_log`. A `last` token
+    /// with `seq < change_log_floor` can no longer be served incrementally →
+    /// `StaleHorizon` full rebuild (never a silently-incomplete delta).
+    change_log_floor: u64,
     /// Operation registry: op-id → terminal-or-running state (§6).
     /// **v1 limitation:** grows unbounded (one entry per recalc, never pruned).
     /// Bounded retention (drop terminal entries past a horizon) is a later
@@ -150,6 +208,9 @@ impl WorkbookSession {
             registry: Arc::new(ql_functions::default_registry()),
             state: LifecycleState::Ready,
             epoch: mint_epoch(),
+            state_seq: 0,
+            change_log: VecDeque::new(),
+            change_log_floor: 0,
             ops: HashMap::new(),
             next_op_id: 1,
             events: Vec::new(),
@@ -324,13 +385,109 @@ impl WorkbookSession {
         Ok(())
     }
 
-    /// Encode the current `{epoch, op_count}` version token (§4.0). 16-byte
-    /// big-endian epoch followed by 8-byte big-endian op_count.
+    /// Encode the current `{epoch, state_seq}` version token (§4.0). 16-byte
+    /// big-endian epoch followed by 8-byte big-endian `state_seq`. (inc.2c-3:
+    /// the counter is `state_seq`, not `oplog.len()` — see the `state_seq` field
+    /// doc; this is what makes the token a true *state* token for delta.)
     fn current_version(&self) -> SessionVersion {
         let mut bytes = Vec::with_capacity(24);
         bytes.extend_from_slice(&self.epoch.to_be_bytes());
-        bytes.extend_from_slice(&(self.oplog.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&self.state_seq.to_be_bytes());
         SessionVersion(bytes)
+    }
+
+    /// Decode a 24-byte `{epoch(16, BE), state_seq(8, BE)}` token. A malformed
+    /// token (wrong length) is **fail-loud** `invalid_version_token` (`Protocol`)
+    /// — NEVER a silent full-rebuild (§4.3 / MED-2 / No-Fallbacks).
+    fn decode_version(v: &SessionVersion) -> EngineResult<(u128, u64)> {
+        if v.0.len() != 24 {
+            return Err(EngineError::new(
+                ErrorClass::Protocol,
+                "invalid_version_token",
+                format!(
+                    "version token must be 24 bytes ({{epoch:16, state_seq:8}}), got {}",
+                    v.0.len()
+                ),
+            ));
+        }
+        let mut epoch_bytes = [0u8; 16];
+        epoch_bytes.copy_from_slice(&v.0[0..16]);
+        let mut seq_bytes = [0u8; 8];
+        seq_bytes.copy_from_slice(&v.0[16..24]);
+        Ok((u128::from_be_bytes(epoch_bytes), u64::from_be_bytes(seq_bytes)))
+    }
+
+    /// Append change records for a just-committed command, bumping `state_seq`
+    /// once (all records of the command share the new seq). A no-op if `changes`
+    /// is empty — a command that changed nothing observable must NOT advance the
+    /// token. Prunes the oldest records past [`CHANGE_LOG_CAP`], advancing
+    /// `change_log_floor` so a token older than the retained window gets
+    /// `StaleHorizon` rather than an incomplete delta.
+    fn record_changes(&mut self, changes: impl IntoIterator<Item = SessionChange>) {
+        let mut iter = changes.into_iter().peekable();
+        if iter.peek().is_none() {
+            return;
+        }
+        self.state_seq += 1;
+        let seq = self.state_seq;
+        for change in iter {
+            self.change_log.push_back(ChangeRecord { seq, change });
+        }
+        while self.change_log.len() > CHANGE_LOG_CAP {
+            if let Some(dropped) = self.change_log.pop_front() {
+                self.change_log_floor = self.change_log_floor.max(dropped.seq);
+            }
+        }
+    }
+
+    /// Mint a fresh epoch → every outstanding version token becomes
+    /// `EpochMismatch` (full rebuild) on its next `snapshot_delta`. Used for
+    /// state changes the delta DTO cannot incrementally express — sheet reorder
+    /// (`move_sheet`) / restore (`restore_sheet`, reappears at a position the
+    /// delta can't convey) and table ops (`create/rename/rename_column/resize/
+    /// drop_table`, which rewrite arbitrary formula cells the session can't
+    /// enumerate) — and for cache-clearing events (undo/redo, future). The
+    /// change-log is keyed by the OLD epoch's seqs, so it is cleared (a new-epoch
+    /// token starts fresh from the current `state_seq`).
+    fn bump_epoch(&mut self) {
+        self.epoch = mint_epoch();
+        self.change_log.clear();
+        self.change_log_floor = self.state_seq;
+    }
+
+    /// Build a delta that tells the caller to reseed via `snapshot()` (§4.3):
+    /// empty change vectors + the current token + the designed `reason`. This is
+    /// a *designed* state (NOT an error — unlike a malformed token, which is the
+    /// fail-loud `invalid_version_token`).
+    fn full_rebuild_delta(&self, reason: FullRebuildReason) -> WorkbookSnapshotDelta {
+        WorkbookSnapshotDelta {
+            schema_version: SCHEMA_VERSION,
+            changed_cells: Vec::new(),
+            removed_cells: Vec::new(),
+            sheets_changed: Vec::new(),
+            sheets_removed: Vec::new(),
+            formats_added: Vec::new(),
+            version: self.current_version(),
+            full_rebuild_required: true,
+            full_rebuild_reason: Some(reason),
+        }
+    }
+
+    /// Build a full `SheetSnapshot` for one live sheet (shared by `snapshot` and
+    /// `snapshot_delta`'s `sheets_changed`). `None` if the sheet is gone.
+    fn build_sheet_snapshot(&self, sheet_id: SheetId) -> Option<SheetSnapshot> {
+        let name = self.workbook.sheet(sheet_id)?.name().to_string();
+        let mut cells = Vec::new();
+        for (row, col) in self.populated_coords(sheet_id) {
+            if let Some(cell) = self.build_cell_snapshot(sheet_id, row, col) {
+                cells.push(cell);
+            }
+        }
+        Some(SheetSnapshot {
+            id: sheet_id,
+            name,
+            cells,
+        })
     }
 
     /// Run a recompute closure under the `Busy` plus operation-registry model
@@ -350,6 +507,17 @@ impl WorkbookSession {
         let result = self.with_runtime(f);
 
         if let Some(res) = &result {
+            // F1: recompute commits via `put_computed_at` and appends NO ops, so
+            // the version token must advance HERE — fold the changed cells into
+            // the delta change-log (no-op if nothing changed).
+            if !res.changed_cells.is_empty() {
+                let changes: Vec<SessionChange> = res
+                    .changed_cells
+                    .iter()
+                    .map(|&(sheet, row, col)| SessionChange::Cell { sheet, row, col })
+                    .collect();
+                self.record_changes(changes);
+            }
             for failure in &res.failures {
                 self.events.push(Event::CellDiagnostic {
                     diagnostic: Diagnostic {
@@ -480,7 +648,13 @@ impl EngineSession for WorkbookSession {
         self.require_live_sheet(addr.sheet, "set_value")?;
         let v = cell_value_to_value(value)?;
         self.with_runtime(|rt| rt.set_value(addr.sheet, addr.row, addr.col, v))
-            .map_err(map_runtime_err)
+            .map_err(map_runtime_err)?;
+        self.record_changes([SessionChange::Cell {
+            sheet: addr.sheet,
+            row: addr.row,
+            col: addr.col,
+        }]);
+        Ok(())
     }
 
     fn set_formula(&mut self, addr: CellAddr, text: &str) -> EngineResult<()> {
@@ -488,14 +662,26 @@ impl EngineSession for WorkbookSession {
         self.require_live_sheet(addr.sheet, "set_formula")?;
         self.with_runtime(|rt| rt.set_formula(addr.sheet, addr.row, addr.col, text))
             .map(|_value| ())
-            .map_err(map_runtime_err)
+            .map_err(map_runtime_err)?;
+        self.record_changes([SessionChange::Cell {
+            sheet: addr.sheet,
+            row: addr.row,
+            col: addr.col,
+        }]);
+        Ok(())
     }
 
     fn clear(&mut self, addr: CellAddr) -> EngineResult<()> {
         self.ensure_ready()?;
         self.require_live_sheet(addr.sheet, "clear")?;
         self.with_runtime(|rt| rt.clear_formula(addr.sheet, addr.row, addr.col))
-            .map_err(map_runtime_err)
+            .map_err(map_runtime_err)?;
+        self.record_changes([SessionChange::Cell {
+            sheet: addr.sheet,
+            row: addr.row,
+            col: addr.col,
+        }]);
+        Ok(())
     }
 
     fn set_format(&mut self, addr: CellAddr, format: FormatId) -> EngineResult<()> {
@@ -503,7 +689,13 @@ impl EngineSession for WorkbookSession {
         self.require_live_sheet(addr.sheet, "set_format")?;
         let id = dto_format_id_to_storage(format);
         self.with_runtime(|rt| rt.set_cell_format(addr.sheet, addr.row, addr.col, Some(id)))
-            .map_err(map_runtime_err)
+            .map_err(map_runtime_err)?;
+        self.record_changes([SessionChange::Cell {
+            sheet: addr.sheet,
+            row: addr.row,
+            col: addr.col,
+        }]);
+        Ok(())
     }
 
     fn register_format(&mut self, format_string: &str) -> EngineResult<FormatId> {
@@ -511,6 +703,7 @@ impl EngineSession for WorkbookSession {
         let id = self
             .with_runtime(|rt| rt.intern_format(format_string))
             .map_err(map_runtime_err)?;
+        self.record_changes([SessionChange::FormatAdded { id }]);
         Ok(storage_format_id_to_dto(id))
     }
 
@@ -555,8 +748,13 @@ impl EngineSession for WorkbookSession {
 
     fn add_sheet(&mut self, name: &str, chunk_rows: u32) -> EngineResult<SheetId> {
         self.ensure_ready()?;
-        self.with_runtime(|rt| rt.add_sheet(name, chunk_rows))
-            .map_err(map_runtime_err)
+        let id = self
+            .with_runtime(|rt| rt.add_sheet(name, chunk_rows))
+            .map_err(map_runtime_err)?;
+        // A new sheet appends at the end of the display order — reconstructable
+        // by the delta consumer, so a plain `SheetChanged` (no epoch bump).
+        self.record_changes([SessionChange::SheetChanged { id }]);
+        Ok(id)
     }
 
     fn rename_sheet(&mut self, id: SheetId, name: &str) -> EngineResult<()> {
@@ -565,7 +763,9 @@ impl EngineSession for WorkbookSession {
         // one must report NotFound, not silently rename a hidden sheet.
         self.require_live_sheet(id, "rename_sheet")?;
         self.with_runtime(|rt| rt.rename_sheet(id, name))
-            .map_err(map_runtime_err)
+            .map_err(map_runtime_err)?;
+        self.record_changes([SessionChange::SheetChanged { id }]);
+        Ok(())
     }
 
     fn delete_sheet(&mut self, id: SheetId) -> EngineResult<()> {
@@ -587,6 +787,7 @@ impl EngineSession for WorkbookSession {
         // `require_live_sheet`.)
         self.oplog.append(Op::RemoveSheet { id }).map_err(oplog_append_err)?;
         self.workbook.remove_sheet(id);
+        self.record_changes([SessionChange::SheetRemoved { id }]);
         Ok(())
     }
 
@@ -605,6 +806,9 @@ impl EngineSession for WorkbookSession {
         }
         self.oplog.append(Op::RestoreSheet { id }).map_err(oplog_append_err)?;
         self.workbook.restore_sheet(id);
+        // A restored sheet reappears at its preserved display position, which the
+        // delta DTO cannot convey → bump the epoch so consumers reseed (rare).
+        self.bump_epoch();
         Ok(())
     }
 
@@ -633,6 +837,9 @@ impl EngineSession for WorkbookSession {
             .append(Op::MoveSheet { id, new_index: index })
             .map_err(oplog_append_err)?;
         self.workbook.move_sheet(id, index);
+        // A reorder cannot be expressed by the delta DTO (no order field) →
+        // bump the epoch so consumers reseed for the new order (rare).
+        self.bump_epoch();
         Ok(())
     }
 
@@ -641,6 +848,8 @@ impl EngineSession for WorkbookSession {
         let range: ql_types::Range = target.into();
         self.with_runtime(|rt| rt.set_name(name, NamedTarget::Range(range)))
             .map_err(map_runtime_err)
+        // No change-log record: defined names are not part of `WorkbookSnapshot`
+        // / `WorkbookSnapshotDelta`, so a name definition is delta-invisible.
     }
 
     fn create_table(&mut self, spec: TableSpec) -> EngineResult<()> {
@@ -667,21 +876,31 @@ impl EngineSession for WorkbookSession {
                 &name, sheet, top_row, top_col, rows, cols, has_header, has_totals, column_names,
             )
         })
-        .map_err(map_runtime_err)
+        .map_err(map_runtime_err)?;
+        // Table ops write/rewrite cells (headers, totals, and — for rename — formula
+        // text anywhere in the workbook) that the session cannot enumerate, so they
+        // are not incrementally delta-expressible → bump the epoch (consumers reseed;
+        // table ops are infrequent schema changes).
+        self.bump_epoch();
+        Ok(())
     }
 
     fn rename_table(&mut self, old_name: &str, new_name: &str) -> EngineResult<()> {
         self.ensure_ready()?;
         self.with_runtime(|rt| rt.rename_table(old_name, new_name))
             .map(|_affected| ())
-            .map_err(map_runtime_err)
+            .map_err(map_runtime_err)?;
+        self.bump_epoch(); // see create_table
+        Ok(())
     }
 
     fn rename_column(&mut self, table: &str, old_col: &str, new_col: &str) -> EngineResult<()> {
         self.ensure_ready()?;
         self.with_runtime(|rt| rt.rename_column(table, old_col, new_col))
             .map(|_affected| ())
-            .map_err(map_runtime_err)
+            .map_err(map_runtime_err)?;
+        self.bump_epoch(); // see create_table
+        Ok(())
     }
 
     fn resize_table(
@@ -696,13 +915,17 @@ impl EngineSession for WorkbookSession {
         self.with_runtime(|rt| {
             rt.resize_table(name, new_rows, new_cols, added_columns, removed_columns)
         })
-        .map_err(map_runtime_err)
+        .map_err(map_runtime_err)?;
+        self.bump_epoch(); // see create_table
+        Ok(())
     }
 
     fn drop_table(&mut self, name: &str) -> EngineResult<()> {
         self.ensure_ready()?;
         self.with_runtime(|rt| rt.drop_table(name))
-            .map_err(map_runtime_err)
+            .map_err(map_runtime_err)?;
+        self.bump_epoch(); // see create_table
+        Ok(())
     }
 
     // --- Batch / transaction (§3.4) ---
@@ -816,21 +1039,9 @@ impl EngineSession for WorkbookSession {
             if self.workbook.is_sheet_removed(sheet_id) {
                 continue;
             }
-            let name = match self.workbook.sheet(sheet_id) {
-                Some(s) => s.name().to_string(),
-                None => continue,
-            };
-            let mut cells = Vec::new();
-            for (row, col) in self.populated_coords(sheet_id) {
-                if let Some(cell) = self.build_cell_snapshot(sheet_id, row, col) {
-                    cells.push(cell);
-                }
+            if let Some(snap) = self.build_sheet_snapshot(sheet_id) {
+                sheets.push(snap);
             }
-            sheets.push(SheetSnapshot {
-                id: sheet_id,
-                name,
-                cells,
-            });
         }
         let formats = self
             .workbook
@@ -851,32 +1062,123 @@ impl EngineSession for WorkbookSession {
         })
     }
 
-    fn snapshot_delta(&self, _last_version: &SessionVersion) -> EngineResult<WorkbookSnapshotDelta> {
-        // DEFERRED (inc.2c-2) with a known DESIGN PROBLEM to resolve deliberately
-        // — surfaced honestly rather than shipped incomplete:
-        //
-        // The obvious stateless implementation — decode the `{epoch, op_count}`
-        // token and walk ops `[last_op_count .. current)` from the op-log — is
-        // INSUFFICIENT, because `recompute_dirty`/`recompute_all` write recomputed
-        // dependent values via `Workbook::put_computed_at` and DO NOT append ops.
-        // So an op-walk captures the *user-edited* cell (e.g. A1) but MISSES its
-        // recomputed dependents (e.g. B1=A1*2) — a silently incomplete delta
-        // (No-Fallbacks violation).
-        //
-        // A correct delta needs the set of cells whose value/formula/format
-        // changed since `last_version`, INCLUDING recompute-affected ones. But
-        // `snapshot_delta` is `&self` (can't cache a prior snapshot to diff), and
-        // `RecomputeResult` does not return the changed coords. Resolution
-        // options (decide in the audit / next window):
-        //   (a) maintain a session change-log keyed by version (built during
-        //       mutations + recompute; snapshot_delta reads it with &self) —
-        //       requires recompute to report changed coords (extend
-        //       RecomputeResult or read the graph dirty set pre-recompute);
-        //   (b) make snapshot_delta `&mut self` + a diff-against-last-snapshot
-        //       cache (mirrors the proven collab path) — a contract change;
-        //   (c) have recompute append computed-value ops (heavy; pollutes the log).
-        // (a) is the likely choice. See workbook-session-impl-plan.md §0 item 3.
-        Err(not_implemented("snapshot_delta"))
+    fn snapshot_delta(&self, last_version: &SessionVersion) -> EngineResult<WorkbookSnapshotDelta> {
+        // Design (a) — session change-log keyed by `state_seq` (impl-plan §0 item
+        // 3, locked 2026-05-27). Keeps `&self`: the `&mut self` mutators + recalc
+        // populate `change_log`; this reads it. Captures what an op-walk misses —
+        // recompute-written dependents (`put_computed_at` appends no ops) and a
+        // `set_value(Blank)` clear (appends no op) — because changes are recorded
+        // explicitly at the command, not derived from the op-log.
+        self.ensure_readable()?;
+
+        // §4.3 designed full-rebuild states (NOT errors) + the fail-loud
+        // malformed-token error (§4.3 / MED-2 / No-Fallbacks).
+        if last_version.0.is_empty() {
+            // First call — no prior version to diff against.
+            return Ok(self.full_rebuild_delta(FullRebuildReason::NoPriorVersion));
+        }
+        let (last_epoch, last_seq) = Self::decode_version(last_version)?;
+        if last_epoch != self.epoch {
+            // Reload/import/undo/move/restore/table-op minted a new epoch.
+            return Ok(self.full_rebuild_delta(FullRebuildReason::EpochMismatch));
+        }
+        if last_seq > self.state_seq {
+            // A single-writer session cannot have produced a future token →
+            // malformed, fail loud (never a silent resync).
+            return Err(EngineError::new(
+                ErrorClass::Protocol,
+                "invalid_version_token",
+                format!(
+                    "version token state_seq {last_seq} is ahead of current {}",
+                    self.state_seq
+                ),
+            ));
+        }
+        if last_seq < self.change_log_floor {
+            // Older than the retained change-log window — we cannot prove the
+            // delta is complete, so reseed rather than under-report.
+            return Ok(self.full_rebuild_delta(FullRebuildReason::StaleHorizon));
+        }
+
+        // Walk the records strictly after `last_seq`; dedup by target.
+        let mut changed_coords: HashSet<(SheetId, RowId, ColId)> = HashSet::new();
+        let mut changed_sheets: HashSet<SheetId> = HashSet::new();
+        let mut removed_sheets: HashSet<SheetId> = HashSet::new();
+        let mut added_formats: HashSet<ql_storage::FormatId> = HashSet::new();
+        for rec in self.change_log.iter().filter(|r| r.seq > last_seq) {
+            match rec.change {
+                SessionChange::Cell { sheet, row, col } => {
+                    changed_coords.insert((sheet, row, col));
+                }
+                SessionChange::SheetChanged { id } => {
+                    changed_sheets.insert(id);
+                }
+                SessionChange::SheetRemoved { id } => {
+                    removed_sheets.insert(id);
+                }
+                SessionChange::FormatAdded { id } => {
+                    added_formats.insert(id);
+                }
+            }
+        }
+
+        // Resolve cell changes to current committed state: present → changed,
+        // absent → removed. A cell on a now-tombstoned sheet is conveyed via
+        // `sheets_removed`, so skip it here (avoids a redundant per-cell entry).
+        let mut changed_cells = Vec::new();
+        let mut removed_cells = Vec::new();
+        for (sheet, row, col) in changed_coords {
+            if self.workbook.is_sheet_removed(sheet) {
+                continue;
+            }
+            match self.build_cell_snapshot(sheet, row, col) {
+                Some(cell) => changed_cells.push(ChangedCell { sheet, cell }),
+                None => removed_cells.push(RemovedCell { sheet, row, col }),
+            }
+        }
+
+        // Resolve changed sheets to full snapshots (a since-removed sheet is
+        // reported only in `sheets_removed`).
+        let mut sheets_changed = Vec::new();
+        for id in changed_sheets {
+            if removed_sheets.contains(&id) || self.workbook.is_sheet_removed(id) {
+                continue;
+            }
+            if let Some(snap) = self.build_sheet_snapshot(id) {
+                sheets_changed.push(snap);
+            }
+        }
+        let sheets_removed: Vec<SheetId> = removed_sheets
+            .into_iter()
+            .filter(|id| self.workbook.is_sheet_removed(*id))
+            .collect();
+
+        // Resolve added formats to their current `FormatDef`.
+        let formats_added: Vec<FormatDef> = added_formats
+            .into_iter()
+            .filter_map(|id| {
+                self.workbook
+                    .formats()
+                    .iter()
+                    .find(|(fid, _)| *fid == id)
+                    .map(|(fid, s)| FormatDef {
+                        id: storage_format_id_to_dto(fid),
+                        string: s.to_string(),
+                    })
+            })
+            .collect();
+
+        Ok(WorkbookSnapshotDelta {
+            schema_version: SCHEMA_VERSION,
+            changed_cells,
+            removed_cells,
+            sheets_changed,
+            sheets_removed,
+            formats_added,
+            version: self.current_version(),
+            full_rebuild_required: false,
+            full_rebuild_reason: None,
+        })
     }
 
     fn cell(&self, addr: CellAddr) -> EngineResult<Option<CellSnapshot>> {
@@ -1335,9 +1637,9 @@ mod tests {
     fn deferred_methods_surface_capability_error() {
         let mut s = WorkbookSession::new();
         for err in [
-            s.snapshot_delta(&SessionVersion(vec![])).unwrap_err(),
             s.open("/tmp/x.qbook").unwrap_err(),
             s.undo().unwrap_err(),
+            s.begin_transaction().unwrap_err(),
         ] {
             assert_eq!(err.class, ErrorClass::Capability);
             assert_eq!(err.code, "not_implemented_in_v1_core");
@@ -1645,5 +1947,141 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.class, ErrorClass::Capability);
         assert_eq!(err.code, "not_implemented_in_v1_core");
+    }
+
+    // --- snapshot_delta (inc.2c-3) ---
+
+    /// Empty token → designed full rebuild (NoPriorVersion), NOT an error.
+    #[test]
+    fn snapshot_delta_empty_token_is_full_rebuild() {
+        let s = WorkbookSession::new();
+        let d = s.snapshot_delta(&SessionVersion(vec![])).unwrap();
+        assert!(d.full_rebuild_required);
+        assert_eq!(d.full_rebuild_reason, Some(FullRebuildReason::NoPriorVersion));
+    }
+
+    /// A malformed (wrong-length) token is fail-loud `invalid_version_token`
+    /// (Protocol) — NEVER a silent full rebuild (§4.3 / No-Fallbacks).
+    #[test]
+    fn snapshot_delta_malformed_token_fails_loud() {
+        let s = WorkbookSession::new();
+        let err = s.snapshot_delta(&SessionVersion(vec![1, 2, 3])).unwrap_err();
+        assert_eq!(err.class, ErrorClass::Protocol);
+        assert_eq!(err.code, "invalid_version_token");
+    }
+
+    /// A token whose state_seq is ahead of the session is malformed → fail-loud.
+    #[test]
+    fn snapshot_delta_future_token_fails_loud() {
+        let s = WorkbookSession::new();
+        // {current epoch, state_seq = u64::MAX} — a future seq.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&s.epoch.to_be_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        let err = s.snapshot_delta(&SessionVersion(bytes)).unwrap_err();
+        assert_eq!(err.class, ErrorClass::Protocol);
+        assert_eq!(err.code, "invalid_version_token");
+    }
+
+    /// THE gating fix (F1): a delta MUST include recompute-changed dependents,
+    /// even though recompute appends no ops. A1=10, B1=A1*2 (=20); token v0;
+    /// set A1=5; recalc_dirty (B1→10 via put_computed_at, no op); the delta from
+    /// v0 contains BOTH A1 (edited) and B1 (recompute-changed).
+    #[test]
+    fn snapshot_delta_includes_recompute_changed_dependents() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 }).unwrap();
+        s.set_formula(addr(sheet, 0, 1), "A1*2").unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 5.0 }).unwrap();
+        s.recalc_dirty().unwrap();
+        let d = s.snapshot_delta(&v0).unwrap();
+        assert!(!d.full_rebuild_required, "same-epoch in-window delta");
+        let changed: Vec<(u32, u32)> =
+            d.changed_cells.iter().map(|c| (c.cell.row, c.cell.col)).collect();
+        assert!(changed.contains(&(0, 0)), "A1 (edited) must be in the delta");
+        assert!(
+            changed.contains(&(0, 1)),
+            "B1 (recompute-changed dependent, NO op) must be in the delta — the op-walk-insufficiency fix"
+        );
+        // The recomputed B1 value is the current one (10), resolved at delta time.
+        let b1 = d.changed_cells.iter().find(|c| c.cell.row == 0 && c.cell.col == 1).unwrap();
+        assert_eq!(b1.cell.value, Some(CellValue::Number { number: 10.0 }));
+    }
+
+    /// A token equal to the current version yields an empty (no-change) delta.
+    #[test]
+    fn snapshot_delta_no_changes_is_empty() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 }).unwrap();
+        let v = s.snapshot().unwrap().version;
+        let d = s.snapshot_delta(&v).unwrap();
+        assert!(!d.full_rebuild_required);
+        assert!(d.changed_cells.is_empty());
+        assert!(d.removed_cells.is_empty());
+        assert_eq!(d.version, v, "no change → token unchanged");
+    }
+
+    /// A cleared cell is reported in `removed_cells`.
+    #[test]
+    fn snapshot_delta_reports_removed_cell() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 2, 2), CellValue::Number { number: 7.0 }).unwrap();
+        let v = s.snapshot().unwrap().version;
+        // F2 token half: set_value(Blank) clears a value-only cell. The runtime
+        // appends no op for this, but the change-log records it → token advances.
+        s.set_value(addr(sheet, 2, 2), CellValue::Blank).unwrap();
+        assert_ne!(v, s.snapshot().unwrap().version, "Blank-clear must advance the token");
+        let d = s.snapshot_delta(&v).unwrap();
+        assert!(!d.full_rebuild_required);
+        assert!(
+            d.removed_cells.iter().any(|r| r.row == 2 && r.col == 2),
+            "cleared cell must appear in removed_cells"
+        );
+    }
+
+    /// A table op bumps the epoch → a prior token gets EpochMismatch (the delta
+    /// cannot incrementally express table cell rewrites).
+    #[test]
+    fn snapshot_delta_table_op_forces_epoch_mismatch() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let spec = TableSpec {
+            name: "T".into(),
+            sheet,
+            top_row: 0,
+            top_col: 0,
+            rows: 2,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["C".into()],
+        };
+        s.create_table(spec).unwrap();
+        let d = s.snapshot_delta(&v0).unwrap();
+        assert!(d.full_rebuild_required);
+        assert_eq!(d.full_rebuild_reason, Some(FullRebuildReason::EpochMismatch));
+    }
+
+    /// Added + removed sheets surface as sheets_changed / sheets_removed.
+    #[test]
+    fn snapshot_delta_sheet_add_then_remove() {
+        let mut s = WorkbookSession::new();
+        let keep = s.add_sheet("Keep", 16384).unwrap();
+        s.set_value(addr(keep, 0, 0), CellValue::Number { number: 1.0 }).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let added = s.add_sheet("Added", 16384).unwrap();
+        let d = s.snapshot_delta(&v0).unwrap();
+        assert!(!d.full_rebuild_required);
+        assert!(d.sheets_changed.iter().any(|sh| sh.id == added));
+        // Now delete it; a fresh delta from v1 reports it removed.
+        let v1 = s.snapshot().unwrap().version;
+        s.delete_sheet(added).unwrap();
+        let d2 = s.snapshot_delta(&v1).unwrap();
+        assert!(d2.sheets_removed.contains(&added));
     }
 }

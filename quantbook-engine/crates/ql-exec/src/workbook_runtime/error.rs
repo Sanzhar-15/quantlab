@@ -285,6 +285,16 @@ pub struct RecomputeResult {
     /// (Phase 4.7+); this counter proves the graph scheduler is aware
     /// of region-eligible formulas. Always `0` for `recompute_all`.
     pub simd_classified: usize,
+    /// Phase 6.1B inc.2c-3 (snapshot_delta): the `(sheet, row, col)` cells whose
+    /// computed value was (re)written by this pass. `recompute_dirty` reports the
+    /// precise value-changed set (its internal VEQ `changed` set);
+    /// `recompute_all` reports every formula cell it touched (a safe over-report —
+    /// the legacy full-pass path rewrites everything). The owning
+    /// `WorkbookSession` folds these into its delta change-log, because recompute
+    /// commits via `put_computed_at` and appends **no** ops, so an op-walk alone
+    /// would miss recompute-changed dependents (the snapshot_delta gating
+    /// problem). Always empty is harmless; never under-reporting is the contract.
+    pub changed_cells: Vec<(SheetId, RowId, ColId)>,
 }
 
 impl RecomputeResult {
