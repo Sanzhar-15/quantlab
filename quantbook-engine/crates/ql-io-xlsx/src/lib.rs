@@ -60,6 +60,13 @@ mod report;
 // itself. Stubs declared here so the public API can reference them
 // without the impl crates being fully populated yet.
 mod read;
+// **inc.2c-12 (2026-05-27):** the writer (umya-spreadsheet + its image/rav1e/
+// exr/tiff codec deps) is behind the `write` feature so reader-only consumers
+// (`ql-exec`'s default build, and through it WASM / bindings) don't pull the
+// heavy codec tree. `write` is ON by default for this crate's own builds/tests
+// (which exercise round-trip); `ql-exec` depends with `default-features = false`
+// and re-enables it only behind its own `xlsx-write` feature.
+#[cfg(feature = "write")]
 mod write;
 
 pub use error::{UnsupportedFeatureKind, XlsxError};
@@ -440,6 +447,10 @@ pub fn import_xlsx_bytes(
 /// umya-spreadsheet. Cells + formula text + cached values
 /// round-trip. `ExportMode::UpdateOriginal` (preserve opaque OOXML
 /// parts from a prior import) lands in a follow-up.
+///
+/// **inc.2c-12 (2026-05-27):** behind the `write` feature (the umya writer
+/// dependency tree). See [`export_xlsx_bytes`] for the in-memory companion.
+#[cfg(feature = "write")]
 pub fn export_xlsx_path(
     workbook: &Workbook,
     _registry: &FunctionRegistry,
@@ -497,6 +508,56 @@ pub fn export_xlsx_path(
     }
 }
 
+/// Export a `Workbook` to xlsx **bytes** (in-memory, no filesystem side
+/// effects).
+///
+/// **inc.2c-12 (2026-05-27):** the in-memory companion to [`export_xlsx_path`],
+/// backing `WorkbookSession::export("xlsx")` (the engine session trait returns
+/// `Vec<u8>`). umya 2.2.0 exposes `writer::xlsx::write_writer<W: io::Write>`, so
+/// the package is serialized straight into a `Vec<u8>` and the post-process
+/// pass runs in memory — no tempfile.
+///
+/// Only [`ExportMode::NewWorkbook`] is supported. [`ExportMode::UpdateOriginal`]
+/// patches an on-disk source package and has no in-memory-bytes path in v1; a
+/// caller that requests it gets a loud [`XlsxError::Export`] rather than a
+/// silent downgrade to `NewWorkbook` (No-Fallbacks).
+///
+/// Returns the bytes plus the [`XlsxExportReport`] (the
+/// `dropped_features`/`warnings` fidelity record), matching `export_xlsx_path`.
+/// Under [`UnsupportedPolicy::Strict`] any dropped feature is a hard error
+/// (nothing was written, so — unlike the path variant — there is no file to
+/// clean up).
+#[cfg(feature = "write")]
+pub fn export_xlsx_bytes(
+    workbook: &Workbook,
+    _registry: &FunctionRegistry,
+    options: XlsxExportOptions,
+) -> Result<(Vec<u8>, XlsxExportReport), XlsxError> {
+    match options.mode {
+        ExportMode::NewWorkbook => {
+            let (bytes, mut report) =
+                write::umya_export::export_new_workbook_to_bytes(workbook, options.formula_cache)?;
+            report.warnings.shrink_to_fit();
+            if !report.dropped_features.is_empty()
+                && options.unsupported_policy == UnsupportedPolicy::Strict
+            {
+                let first = report.dropped_features[0].clone();
+                return Err(XlsxError::UnsupportedFeature {
+                    feature: first.kind,
+                    part: first.part,
+                    detail: first.detail,
+                });
+            }
+            Ok((bytes, report))
+        }
+        ExportMode::UpdateOriginal { .. } => Err(XlsxError::Export(
+            "UpdateOriginal mode is not supported for in-memory bytes export in v1; \
+             use export_xlsx_path for round-trip package patching"
+                .to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +602,9 @@ mod tests {
         }
     }
 
+    // **inc.2c-12:** exercises the writer (`export_xlsx_path`), so gated on the
+    // `write` feature. (The crate's own test builds enable `write` by default.)
+    #[cfg(feature = "write")]
     #[test]
     fn export_update_original_empty_preservation_falls_through_to_shadow() {
         // **W5-D-14.2 (HIGH-7 closure):** UpdateOriginal with empty

@@ -31,11 +31,12 @@
 //! (inc.2c-10 — same Option-1 adoption, via `ql_io_xlsx` + the injected
 //! `EngineXlsxRecomputer`) + **`csv` `import`/`export`** (inc.2c-11 — via the
 //! pure-I/O `ql_io_csv`; no recompute since CSV has no formulas) are also real.
-//! The remaining contract methods return a **surfaced** `Capability` /
+//! **xlsx `export`** (inc.2c-12 — whole-workbook, via `ql_io_xlsx` behind the
+//! `xlsx-write` feature so the default reader-only build stays lean; without
+//! the feature it returns the honest `Capability` error) is also real. The
+//! remaining contract methods return a **surfaced** `Capability` /
 //! `not_implemented_in_v1_core` error (NOT a silent fallback — project
 //! No-Fallbacks rule) and land in later sub-increments:
-//! - `export("xlsx")` (inc.2c-12 — needs a bytes-writer + the xlsx writer
-//!   feature-gate),
 //! - function registration (6.4), reserved bulk ops (6.4/6.5).
 //!
 //! ## Two design facts that shape this increment
@@ -1141,10 +1142,9 @@ impl EngineSession for WorkbookSession {
         Ok(())
     }
 
-    /// Export the live workbook to in-memory bytes (inc.2c-11). v1 supports
-    /// `"csv"`; `"xlsx"` is a deferred follow-up (inc.2c-12 — needs a
-    /// bytes-writer + the xlsx writer feature-gate); any other format is a loud
-    /// `BadArgument`.
+    /// Export the live workbook to in-memory bytes. v1 supports `"csv"`
+    /// (inc.2c-11) and `"xlsx"` (inc.2c-12, behind the `xlsx-write` feature);
+    /// any other format is a loud `BadArgument`.
     ///
     /// **csv (single-sheet, value-only):** CSV is inherently flat, and `export`
     /// is `&self` so there is no event channel to warn through. Rather than
@@ -1153,6 +1153,16 @@ impl EngineSession for WorkbookSession {
     /// sheet is serialised via `ql_io_csv::export_csv_bytes` (cells rendered by
     /// `ql_types::Value`'s `Display`; no number-format application in v1). A
     /// workbook with zero live sheets yields empty bytes.
+    ///
+    /// **xlsx (whole-workbook, inc.2c-12):** serialises ALL sheets via
+    /// `ql_io_xlsx::export_xlsx_bytes` (`NewWorkbook` mode) — xlsx is multi-sheet
+    /// so, unlike csv, no single-sheet restriction applies. This path exists
+    /// only when the crate is built with the `xlsx-write` feature (the
+    /// umya-spreadsheet writer); without it, `export("xlsx")` returns the honest
+    /// `Capability`/`not_implemented_in_v1_core` error (the writer's heavy codec
+    /// tree is kept out of the default reader-only build). Export fidelity
+    /// caveats are NOT surfaced (the `&self` no-event-channel limitation shared
+    /// with csv); errors map through `map_xlsx_err` (Appendix A).
     fn export(&self, format: &str) -> EngineResult<Vec<u8>> {
         self.ensure_readable()?;
         match format {
@@ -1180,9 +1190,46 @@ impl EngineSession for WorkbookSession {
                     ))),
                 }
             }
-            "xlsx" => Err(not_implemented("export (xlsx)")),
+            "xlsx" => {
+                #[cfg(feature = "xlsx-write")]
+                {
+                    // **inc.2c-12:** real xlsx export — serialize the WHOLE
+                    // workbook (xlsx is multi-sheet) to bytes via the
+                    // feature-gated `ql-io-xlsx` writer (`NewWorkbook` mode,
+                    // Permissive policy = the defaults). Errors route through
+                    // `map_xlsx_err` (Appendix A). Like csv export, this is
+                    // `&self`, so there is NO event channel to surface the
+                    // export report's fidelity caveats (multi-peer-format
+                    // flattening, unregistered overlay customs, named-range
+                    // constants); under the default Permissive policy those are
+                    // dropped on the wire — the same `&self` no-warning-channel
+                    // limitation as csv export (which likewise surfaces no
+                    // export-fidelity report). A future surfacing channel would
+                    // need either `&mut self` (events) or a richer return type;
+                    // deferred.
+                    let (bytes, _report) = ql_io_xlsx::export_xlsx_bytes(
+                        &self.workbook,
+                        &self.registry,
+                        ql_io_xlsx::XlsxExportOptions::default(),
+                    )
+                    .map_err(map_xlsx_err)?;
+                    Ok(bytes)
+                }
+                #[cfg(not(feature = "xlsx-write"))]
+                {
+                    // The xlsx writer is not compiled into this build. Honest
+                    // `Capability`/`not_implemented_in_v1_core` (No-Fallbacks),
+                    // never a silent empty export.
+                    Err(not_implemented("export (xlsx)"))
+                }
+            }
             other => Err(EngineError::bad_argument(format!(
-                "unsupported export format {other:?} (v1 supports \"csv\")"
+                "unsupported export format {other:?} (v1 supports \"csv\"{})",
+                if cfg!(feature = "xlsx-write") {
+                    " and \"xlsx\""
+                } else {
+                    ""
+                }
             ))),
         }
     }
@@ -2756,17 +2803,15 @@ mod tests {
     fn deferred_methods_surface_capability_error() {
         let mut s = WorkbookSession::new();
         // `begin_transaction` inc.2c-5; `undo`/`redo` inc.2c-6; `open`/`save`
-        // inc.2c-9; xlsx `import` inc.2c-10; csv `import`/`export` inc.2c-11 (all
-        // no longer Capability errors). The remaining deferred methods still
-        // surface the honest Capability error: `export("xlsx")` (inc.2c-12) +
-        // function registration (6.4).
-        for err in [
-            s.export("xlsx").unwrap_err(),
-            s.list_functions().unwrap_err(),
-        ] {
-            assert_eq!(err.class, ErrorClass::Capability);
-            assert_eq!(err.code, "not_implemented_in_v1_core");
-        }
+        // inc.2c-9; xlsx `import` inc.2c-10; csv `import`/`export` inc.2c-11;
+        // xlsx `export` inc.2c-12 (real behind `xlsx-write`) — all no longer
+        // unconditional Capability errors. The remaining always-deferred methods
+        // still surface the honest Capability error: function registration (6.4)
+        // + reserved bulk ops. (`export("xlsx")` is covered separately, gated on
+        // the `xlsx-write` feature.)
+        let err = s.list_functions().unwrap_err();
+        assert_eq!(err.class, ErrorClass::Capability);
+        assert_eq!(err.code, "not_implemented_in_v1_core");
         // A fresh session has nothing to undo/redo (but the methods are real now).
         assert!(!s.can_undo());
         assert!(!s.can_redo());
@@ -3146,15 +3191,56 @@ mod tests {
         assert_eq!(err.class, ErrorClass::BadArgument);
     }
 
-    /// An unknown export format is a loud `BadArgument`; `"xlsx"` is the deferred
-    /// follow-up → honest `Capability`/`not_implemented_in_v1_core`.
+    /// An unknown export format is always a loud `BadArgument`.
     #[test]
-    fn export_unknown_format_bad_argument_xlsx_capability() {
+    fn export_unknown_format_is_bad_argument() {
         let s = WorkbookSession::new();
         assert_eq!(s.export("ods").unwrap_err().class, ErrorClass::BadArgument);
+    }
+
+    /// Without the `xlsx-write` feature, the umya writer isn't compiled in, so
+    /// `export("xlsx")` returns the honest deferred
+    /// `Capability`/`not_implemented_in_v1_core` error (No-Fallbacks — never a
+    /// silent empty export).
+    #[cfg(not(feature = "xlsx-write"))]
+    #[test]
+    fn export_xlsx_without_feature_is_capability() {
+        let s = WorkbookSession::new();
         let xlsx = s.export("xlsx").unwrap_err();
         assert_eq!(xlsx.class, ErrorClass::Capability);
         assert_eq!(xlsx.code, "not_implemented_in_v1_core");
+    }
+
+    /// With the `xlsx-write` feature, `export("xlsx")` produces real bytes that
+    /// re-import into a session with cells + recomputed formulas intact. xlsx is
+    /// multi-sheet, so the WHOLE workbook round-trips (no single-sheet limit like
+    /// csv). Exercises the in-memory `export_xlsx_bytes` writer end-to-end
+    /// through the session contract.
+    #[cfg(feature = "xlsx-write")]
+    #[test]
+    fn export_xlsx_round_trip_through_session() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 6.0 })
+            .unwrap();
+        // set_formula evaluates immediately → A2 == 42 is cached for export.
+        s.set_formula(addr(sheet, 1, 0), "A1 * 7").unwrap();
+
+        let bytes = s.export("xlsx").unwrap();
+        assert!(!bytes.is_empty(), "xlsx export produced no bytes");
+
+        // Re-import the bytes into a fresh session; cells + formula survive.
+        let mut s2 = WorkbookSession::new();
+        s2.import(&bytes, "xlsx").unwrap();
+        assert_eq!(s2.lifecycle_state(), LifecycleState::Ready);
+        let a1 = s2.cell(addr(0, 0, 0)).unwrap().unwrap();
+        assert_eq!(a1.value, Some(CellValue::Number { number: 6.0 }));
+        let a2 = s2.cell(addr(0, 1, 0)).unwrap().unwrap();
+        assert_eq!(a2.value, Some(CellValue::Number { number: 42.0 }));
+        assert!(
+            a2.formula.is_some(),
+            "A2 must retain its formula after the xlsx round-trip"
+        );
     }
 
     /// The xlsx feature inventory (the PRIMARY dropped-feature channel —

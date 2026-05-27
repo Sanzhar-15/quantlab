@@ -165,12 +165,35 @@ status: |
   numeric fidelity kept Excel-consistent + pinned. Synthesis `docs/audits/2026-05-27-inc2c11-csv-audit/`.
   **ql-exec lib 728/0 + e2e 21/0, clippy clean; ql-io-csv 11/0; ql-io-xlsx green; workspace build green.**
 
-  ⭐ NEXT = 6.1B `export("xlsx")` + **feature-gate the xlsx WRITER** (umya/image codecs behind a `write`
-  feature; needs a new `export_xlsx_bytes`) — inc.2c-12 → functions (6.4-0 metadata substrate then 6.4)
-  + reserved bulk (6.4/6.5) → Node smoke-path migration (+ pending `.node` rebuild + B#1/S2-01 mocha) →
-  6.1C audit — **follow `docs/api/workbook-session-impl-plan.md` §0**. Also tracked cross-cutting: a
-  storage-level effective-non-blank-value extent API for all serializers. Do NOT freeze the
-  CollabSession CRDT façade (collab = v1.5).
+  ✅ 6.1B inc.2c-12 xlsx `export` + xlsx-writer feature-gate SHIPPED 2026-05-27. `export("xlsx")`
+  serialises the WHOLE workbook (xlsx is multi-sheet) via `ql_io_xlsx::export_xlsx_bytes`, AND the
+  tracked inc.2c-10 follow-up (ql-exec pulling the writer's umya + image/rav1e/exr/tiff codec tree for
+  import-only use) is CLOSED. umya 2.2.0 has `writer::xlsx::write_writer<W: io::Write>` → serialise to a
+  `Vec<u8>` in memory (NO tempfile); the path exporter now delegates to a shared
+  `export_new_workbook_to_bytes` core + one `atomic_write_to_path`, and `post_process_zip` became the
+  bytes-in/bytes-out `post_process_bytes` (byte-identical output — both umya write paths go through
+  `make_buffer`). `export_xlsx_bytes` is `NewWorkbook`-only (UpdateOriginal → loud `XlsxError::Export`).
+  Feature-gate: ql-io-xlsx `umya-spreadsheet` optional; `default = ["write"]`, `write =
+  ["dep:umya-spreadsheet"]` gates `mod write` + both export fns; the READER stays always-compiled.
+  ql-exec depends `default-features = false` + `xlsx-write = ["ql-io-xlsx/write"]`; `export("xlsx")` real
+  behind `#[cfg(feature = "xlsx-write")]`, else honest `Capability` (writer codecs opt-in → default
+  build + WASM/bindings lean). A ql-exec `[dev-dependencies]` re-enables `write` for the inc.2c-10
+  round-trip test fixture; workspace `resolver = "2"` keeps that out of the normal lib build. `export`
+  is `&self` (no event channel) → fidelity report dropped under Permissive (same as csv, documented).
+  Parallel Codex(gpt-5.5 xhigh)+Opus audit **CLEAN — 0 HIGH/MED/LOW** (both verified `write_writer ≡
+  write` byte-equivalence at the umya registry source + the feature graph via `cargo tree`: umya absent
+  from default ql-exec normal deps, present under `--features xlsx-write`; 1 doc-precision INFO applied;
+  1 pre-existing HashMap-ordered fresh-rels INFO folded into the cross-cutting tracker). Synthesis
+  `docs/audits/2026-05-27-inc2c12-xlsx-export-audit/`. **ql-exec lib 729/0 (default + `--features
+  xlsx-write`), clippy clean; ql-io-xlsx 60+49/0 (default), `--no-default-features` builds clean;
+  workspace build green.**
+
+  ⭐ NEXT = 6.1B functions (6.4-0 metadata substrate then 6.4) + reserved bulk (6.4/6.5) → Node
+  smoke-path migration (+ pending `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit — **follow
+  `docs/api/workbook-session-impl-plan.md` §0**. The v1 import/export surface is now COMPLETE: .qbook
+  open/save (2c-9), xlsx import (2c-10) + export (2c-12), csv import/export (2c-11). Also tracked
+  cross-cutting: a storage-level effective-non-blank-value extent API for all serializers. Do NOT freeze
+  the CollabSession CRDT façade (collab = v1.5).
 date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-26_phase-5-7-v3-6-1-delta-consumer-backlog.md (V3.6.1 backlog mini-phase, SUPERSEDED by Phase 5 COMPLETE)
 parent_phase: 6 Product Surfaces
@@ -238,10 +261,18 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      `map_csv_err` in Appendix A. Parallel Codex+Opus audit: HIGH (conservative-bounds export blowup)
      → consistent-with-siblings + documented + tracked cross-cutting; BOM fix applied; faithful-export
      injection stance documented.
-   - ⭐ **NEXT**: `export("xlsx")` + xlsx-writer feature-gate (inc.2c-12) → functions/bulk (6.4) →
-     migrate the Node smoke path (+ `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit. Plus tracked
-     cross-cutting effective-extent serializer fix. See `workbook-session-impl-plan.md` §0. Leave
-     collab/transport/presence feature-gated.
+   - ✅ **inc.2c-12**: **xlsx `export`** + xlsx-writer feature-gate — `export("xlsx")` serialises the
+     WHOLE workbook via `ql_io_xlsx::export_xlsx_bytes` (umya `write_writer` → in-memory `Vec<u8>`, no
+     tempfile; path exporter delegates to a shared bytes core, `post_process_zip` → `post_process_bytes`,
+     byte-identical). umya WRITER (+ image codecs) behind ql-io-xlsx `write` feature (`default=["write"]`,
+     `umya` optional); ql-exec `default-features=false` + `xlsx-write` feature gates the export (else
+     honest `Capability`); dev-dep re-enables `write` for the round-trip fixture. Closes the inc.2c-10
+     tracked writer-leanness follow-up. Parallel Codex+Opus audit CLEAN (0 HIGH/MED/LOW).
+   - ⭐ **NEXT**: functions/bulk (6.4-0 metadata substrate then 6.4) → migrate the Node smoke path (+
+     `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit. The v1 import/export surface is COMPLETE (.qbook
+     open/save, xlsx import+export, csv import/export). Plus tracked cross-cutting effective-extent
+     serializer fix. See `workbook-session-impl-plan.md` §0. Leave collab/transport/presence
+     feature-gated.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +

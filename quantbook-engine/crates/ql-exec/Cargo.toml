@@ -23,12 +23,15 @@ ql-io             = { path = "../ql-io" }
 # Phase 6.1B inc.2c-10 (2026-05-27): xlsx import for `WorkbookSession::import`.
 # ql-io-xlsx no longer depends on ql-exec (recompute is injected via its
 # `XlsxRecomputer` trait, which `EngineXlsxRecomputer` implements here) — so
-# `ql-exec -> ql-io-xlsx` is now acyclic. NOTE (tracked follow-up): ql-io-xlsx
-# pulls the xlsx WRITER's heavy deps (umya-spreadsheet + image/rav1e/exr/tiff)
-# transitively even though import needs only the reader; feature-gate the writer
-# behind a `write` feature + depend with default-features=false to keep the core
-# engine (and WASM/bindings) lean.
-ql-io-xlsx        = { path = "../ql-io-xlsx" }
+# `ql-exec -> ql-io-xlsx` is now acyclic.
+# **inc.2c-12 (2026-05-27):** `default-features = false` so the default ql-exec
+# build pulls only the xlsx READER (calamine/zip/quick-xml) — NOT the writer's
+# heavy umya-spreadsheet + image/rav1e/exr/tiff codec tree. `export("xlsx")`
+# lives behind the `xlsx-write` feature below; the writer is opt-in, which keeps
+# WASM / bindings (which depend on ql-exec) lean for import-only use. The
+# [dev-dependencies] entry re-enables `write` for THIS crate's tests (the import
+# round-trip fixture builds via `export_xlsx_path`).
+ql-io-xlsx        = { path = "../ql-io-xlsx", default-features = false }
 # Phase 6.1B inc.2c-11 (2026-05-27): csv import/export for `WorkbookSession`.
 # ql-io-csv is a pure-I/O leaf (deps: csv + ql-storage + ql-types) — CSV has no
 # formulas, so there is no recompute injection and no risk of a cycle.
@@ -61,10 +64,27 @@ thiserror         = { workspace = true }
 # the unmaintained `paste` transitive (RUSTSEC-2024-0436) which fails cargo-audit.
 # Re-add when actually used.
 
+[features]
+# **inc.2c-12 (2026-05-27):** opt-in xlsx WRITER. OFF by default — the default
+# ql-exec build (and WASM / bindings through it) pulls only the xlsx reader.
+# When enabled, turns on `ql-io-xlsx/write` (the umya-spreadsheet writer) and
+# `WorkbookSession::export("xlsx")` becomes a real export (else it returns the
+# honest `Capability`/`not_implemented_in_v1_core` error). `import("xlsx")` does
+# NOT require this feature — the reader is always present.
+xlsx-write = ["ql-io-xlsx/write"]
+
 [dev-dependencies]
 proptest  = { workspace = true }
 criterion = { workspace = true }
 tempfile  = { workspace = true }
+# **inc.2c-12 (2026-05-27):** the import round-trip TEST
+# (`import_xlsx_round_trip_loads_cells_and_recomputes`) builds its `.xlsx`
+# fixture via `ql_io_xlsx::export_xlsx_path`, which is behind ql-io-xlsx's
+# `write` feature. The normal dependency above is `default-features = false`
+# (reader only); this dev-dependency re-enables `write` for THIS crate's test
+# builds so the fixture compiles. Cargo unifies the two declarations: `write` is
+# present for test/bench builds, absent for the normal lib build.
+ql-io-xlsx = { path = "../ql-io-xlsx", features = ["write"] }
 # Phase 2B.3: BPC-04 test wires bind-plan-cache stats into Timings to prove
 # the visibility contract.
 ql-profile = { path = "../ql-profile" }

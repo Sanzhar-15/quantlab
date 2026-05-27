@@ -138,7 +138,7 @@ Product commands (not collab `Op` variants — decision-lock §3.2). **v1** = in
 | `import(bytes, other)` | `BadArgument` | unknown format → loud `BadArgument` |
 | `save(path)` | v1 ✅ (inc.2c-9) | `ql_io::save_workbook_with_oplog(&wb, &oplog, name, path)`; workbook name derived from the path file-stem (no document-name metadata in v1; `None` → loud `BadArgument`). `&self`, legal in `Ready`/`Busy`. |
 | `export("csv") -> bytes` | v1 ✅ (inc.2c-11) | `ql_io_csv::export_csv_bytes` — **single live sheet** only (`>1` → loud `BadArgument`, no silent sheet drop; `export` is `&self`, no warn channel); 0 sheets → empty bytes. Verbatim/value-only (cells via `Value` `Display`; no formula-trigger escaping; uses the conservative used-range like xlsx/.qbook). |
-| `export("xlsx") -> bytes` | deferred | `Capability/not_implemented_in_v1_core` — inc.2c-12 (needs a bytes-writer + the xlsx writer feature-gate) |
+| `export("xlsx") -> bytes` | v1 ✅ (inc.2c-12, feature `xlsx-write`) | `ql_io_xlsx::export_xlsx_bytes` (`NewWorkbook` mode; umya 2.2.0 `write_writer` → in-memory `Vec<u8>`, post-process pass in memory — no tempfile). Exports the **whole workbook** (xlsx is multi-sheet, unlike csv). The umya writer (+ its image/rav1e/exr/tiff codecs) is behind ql-io-xlsx's `write` feature; `ql-exec` depends `default-features = false` and gates this path on its own `xlsx-write` feature so the **default reader-only build (and WASM/bindings through it) stays lean**. Without the feature → honest `Capability/not_implemented_in_v1_core` (No-Fallbacks). `&self`, so export-fidelity caveats are not surfaced (same as csv); errors map via `map_xlsx_err` (Appendix A). |
 | `export(other) -> bytes` | `BadArgument` | unknown format → loud `BadArgument` |
 | `close()` | v1 | handle free → `Closed` |
 
@@ -619,8 +619,8 @@ Ambiguities Codex flagged, resolved here:
 | `OpLogError` (future `#[non_exhaustive]` variant) | `Internal` | `unmapped_oplog_error` | no |
 | `PersistenceError::{Qbook, OpLog, OplogUnsupportedVersion, OplogTruncatedHeader}` | `Persistence` | `qbook_error` / `session_oplog` / `qbook_unsupported_version` / `qbook_truncated_header` | no |
 | `PersistenceError` (foreign `#[non_exhaustive]` future variant) | `Internal` | `unmapped_persistence_error` (loud — never a generic `qbook_unknown` to callers) | no |
-| `XlsxError::{Io, Zip, Calamine, XmlParse, MalformedOoxml, UnsupportedFeature}` (inc.2c-10, xlsx `import`) | `Persistence` | `xlsx_io` / `xlsx_zip` / `xlsx_calamine` / `xlsx_xml_parse` / `xlsx_malformed_ooxml` / `xlsx_unsupported_feature` | no |
-| `XlsxError::{Export, Engine}` | `Internal` | `xlsx_export` / `xlsx_engine` | no |
+| `XlsxError::{Io, Zip, Calamine, XmlParse, MalformedOoxml, UnsupportedFeature}` (inc.2c-10 xlsx `import`; inc.2c-12 xlsx `export`) | `Persistence` | `xlsx_io` / `xlsx_zip` / `xlsx_calamine` / `xlsx_xml_parse` / `xlsx_malformed_ooxml` / `xlsx_unsupported_feature` | no |
+| `XlsxError::{Export, Engine}` (incl. inc.2c-12 `export("xlsx")` umya-write failures) | `Internal` | `xlsx_export` / `xlsx_engine` | no |
 | `XlsxError` (foreign `#[non_exhaustive]` future variant) | `Internal` | `unmapped_xlsx_error` (loud) | no |
 | `CsvError::{Io, Parse}` (inc.2c-11, csv `import`/`export`) | `Persistence` | `csv_io` / `csv_parse` (non-UTF-8 surfaces as `csv_parse`) | no |
 | `CsvError::ExceedsSheetLimits` | `BadArgument` | `csv_exceeds_limits` (CSV larger than `MAX_ROW`/`MAX_COLUMN`) | no |

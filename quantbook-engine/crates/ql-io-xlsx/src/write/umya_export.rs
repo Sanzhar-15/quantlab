@@ -295,13 +295,42 @@ impl XlsxNumFmtTranslation {
     }
 }
 
-/// Export a Quantbook `Workbook` to an xlsx file via umya-spreadsheet
+/// Export a Quantbook `Workbook` to an xlsx **file** via umya-spreadsheet
 /// in `NewWorkbook` mode (generate fresh).
+///
+/// **inc.2c-12 (2026-05-27):** now a thin wrapper over
+/// [`export_new_workbook_to_bytes`] — the workbook is fully serialized in
+/// memory (umya's `write_writer` + the post-process zip pass) and the bytes
+/// are written once via the atomic write-then-rename helper. Output is
+/// byte-identical to the prior two-step (umya-write-to-path then
+/// post-process-read-rewrite) flow: umya's `write` internally routes through
+/// the same `write_writer`/`make_buffer` path, so the initial bytes match,
+/// and the post-process transforms are unchanged.
 pub(crate) fn export_new_workbook(
     workbook: &Workbook,
     output_path: &std::path::Path,
     formula_cache: FormulaCachePolicy,
 ) -> Result<XlsxExportReport, XlsxError> {
+    let (bytes, report) = export_new_workbook_to_bytes(workbook, formula_cache)?;
+    atomic_write_to_path(output_path, &bytes)?;
+    Ok(report)
+}
+
+/// Export a Quantbook `Workbook` to xlsx **bytes** via umya-spreadsheet in
+/// `NewWorkbook` mode (generate fresh), with no filesystem side effects.
+///
+/// **inc.2c-12 (2026-05-27):** the in-memory companion to
+/// [`export_new_workbook`], backing `WorkbookSession::export("xlsx")` (whose
+/// trait returns `Vec<u8>`). umya 2.2.0 exposes
+/// `writer::xlsx::write_writer<W: io::Write>`, so the initial package is built
+/// straight into a `Vec<u8>`; the post-process zip pass
+/// ([`post_process_bytes`]) then applies the umya-bug workarounds + roster
+/// injections in memory and returns the final bytes. No tempfile, no
+/// `std::fs`.
+pub(crate) fn export_new_workbook_to_bytes(
+    workbook: &Workbook,
+    formula_cache: FormulaCachePolicy,
+) -> Result<(Vec<u8>, XlsxExportReport), XlsxError> {
     let mut report = XlsxExportReport::default();
     let mut spreadsheet = umya_spreadsheet::new_file_empty_worksheet();
 
@@ -566,8 +595,13 @@ pub(crate) fn export_new_workbook(
         sheet_fixes.push(fixes);
     }
 
-    // Persist to disk.
-    umya_spreadsheet::writer::xlsx::write(&spreadsheet, output_path)
+    // Serialize the umya package into an in-memory buffer. `write_writer`
+    // produces the SAME bytes umya's path-based `write` would put on disk —
+    // `write` itself calls `write_writer(.., BufWriter::new(File))` over the
+    // identical `make_buffer` output — so the post-process pass below sees
+    // exactly what it saw under the prior path-based flow.
+    let mut initial_bytes: Vec<u8> = Vec::new();
+    umya_spreadsheet::writer::xlsx::write_writer(&spreadsheet, &mut initial_bytes)
         .map_err(|e| XlsxError::Export(format!("umya write failed: {e}")))?;
 
     // **W5-D-14.1 unified post-process pass:** apply workarounds for
@@ -663,23 +697,25 @@ pub(crate) fn export_new_workbook(
         || !defined_names.is_empty()
         || !tables.is_empty()
         || !cellxfs_roster_translated.is_empty();
-    if needs_post_process {
-        post_process_zip(
-            output_path,
+    let final_bytes = if needs_post_process {
+        post_process_bytes(
+            initial_bytes,
             needs_date1904,
             &sheet_fixes,
             &custom_formats,
             &defined_names,
             &tables,
             &cellxfs_roster_translated,
-        )?;
-    }
+        )?
+    } else {
+        initial_bytes
+    };
 
-    Ok(report)
+    Ok((final_bytes, report))
 }
 
-/// Unified post-process pass over the just-written xlsx. Applies all
-/// workarounds and roster injections in a single zip walk:
+/// Unified post-process pass over the just-serialized xlsx **bytes**. Applies
+/// all workarounds and roster injections in a single in-memory zip walk:
 /// - `xl/workbook.xml`: inject `date1904="1"` + `<definedNames>`.
 /// - `xl/worksheets/sheet{N}.xml`: per-cell fixes (HIGH-1 / HIGH-6) +
 ///   `<tableParts>` references for tables anchored to that sheet.
@@ -691,8 +727,15 @@ pub(crate) fn export_new_workbook(
 ///
 /// **W5-D-14.1** audit HIGH-1 / HIGH-2 / HIGH-6 closure.
 /// **W5-D-14.2** audit HIGH-3 / HIGH-4 / HIGH-5 closure.
-fn post_process_zip(
-    path: &std::path::Path,
+///
+/// **inc.2c-12 (2026-05-27):** takes the package bytes by value and returns
+/// the transformed bytes (was: read from a path + atomic-write back to it).
+/// The path-based caller ([`export_new_workbook`]) now does the single atomic
+/// write itself, and the bytes caller
+/// ([`export_new_workbook_to_bytes`]/`export_xlsx_bytes`) keeps everything in
+/// memory.
+fn post_process_bytes(
+    input: Vec<u8>,
     inject_date1904: bool,
     sheet_fixes: &[Vec<CellFix>],
     custom_formats: &[(u32, String)],
@@ -703,7 +746,7 @@ fn post_process_zip(
     // kept alongside for the format_to_xf_index lookup that maps cells
     // to their roster slot.
     cellxfs_roster: &[(FormatId, u32)],
-) -> Result<(), XlsxError> {
+) -> Result<Vec<u8>, XlsxError> {
     use std::io::{Read, Write};
 
     // Pre-compute per-sheet table groupings: for each Quantbook
@@ -715,7 +758,7 @@ fn post_process_zip(
         tables_by_sheet.entry(t.sheet_idx).or_default().push(t);
     }
 
-    let bytes = std::fs::read(path)?;
+    let bytes = input;
     let mut reader =
         zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).map_err(XlsxError::Zip)?;
     let mut out_buf: Vec<u8> = Vec::new();
@@ -797,13 +840,12 @@ fn post_process_zip(
 
         writer.finish().map_err(XlsxError::Zip)?;
     }
-    // **W5-D-PM-4 (megaudit Opus-B HIGH-6 closure):** atomic write
-    // via write-tmp + rename. Concurrent exports to the same
-    // `output_path` would otherwise interleave bytes, producing
-    // corrupt output (3 of 4 concurrent calls were observed to fail
-    // empirically). POSIX `rename` is atomic on the same filesystem.
-    atomic_write_to_path(path, &out_buf)?;
-    Ok(())
+    // **inc.2c-12:** return the transformed bytes. The atomic write-tmp +
+    // rename (W5-D-PM-4 megaudit Opus-B HIGH-6 closure — concurrent exports
+    // to the same path would otherwise interleave bytes) is now performed by
+    // the path-based caller `export_new_workbook`; the bytes caller keeps the
+    // result in memory.
+    Ok(out_buf)
 }
 
 /// **W5-D-PM-4 (megaudit Opus-B HIGH-6 closure):** write `bytes` to
