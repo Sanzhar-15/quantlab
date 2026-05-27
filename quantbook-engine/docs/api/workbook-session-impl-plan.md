@@ -2,13 +2,14 @@
 
 **Status:** ⏳ IN PROGRESS — **2b/2c-1/2c-2 + audit-fix SHIPPED 2026-05-26; inc.2 audit (F3–F10) +
 inc.2c-3 `snapshot_delta` + inc.2c-4 `batch` + inc.2c-5 transaction handle + inc.2c-6 F2 `Op::ClearValue`
-+ inc.2c-7 undo/redo + inc.2c-8 F10 atomic table-rename SHIPPED 2026-05-27.**
++ inc.2c-7 undo/redo + inc.2c-8 F10 atomic table-rename + inc.2c-9 `.qbook` open/save (Option 1)
+SHIPPED 2026-05-27.**
 Chain: `83b1b33bac2` PlanCache → `7335a5a1bfa` core → `993492b6f9b` validate_formula/query_range/
 `CellValue::Blank` → `2b5e7a13f5b` delete/restore/move sheet + tables → `9f7a1645dbd` tombstone-read fix →
 **`879f3601747` inc.2 audit-fix (F3–F10)** → **`20427b1c4c7` inc.2c-3 snapshot_delta** → **`58a55f4cfb8`
 + `9d471be3663` inc.2c-4 batch** → `fdd80c7a43d` inc.2c-5 transaction handle → `d8d22a04248` inc.2c-6 F2
 `Op::ClearValue` → `4f8e9858d77` inc.2c-7 undo/redo → **`dca5695549e` inc.2c-8 F10 atomic table-rename**.
-`WorkbookSession` is in `crates/ql-exec/src/session.rs`; **ql-exec lib 709/0 + e2e 21/0, clippy clean,
+`WorkbookSession` is in `crates/ql-exec/src/session.rs`; **ql-exec lib 719/0 + e2e 21/0, clippy clean,
 workspace build green.**
 
 ## §0 — Current state: method inventory, v1 limitations & remaining sequence (READ FIRST)
@@ -27,9 +28,10 @@ workspace build green.**
 `rollback_transaction`** (inc.2c-5 — the multi-call handle); **`undo`/`redo`/`can_undo`/`can_redo`**
 (inc.2c-7 — Loro `UndoManager` + baseline-replay re-materialization); `recalc_dirty`, `recalc_all`,
 `mark_volatiles_dirty`; `query_range`, `snapshot`, **`snapshot_delta`**, `cell`, `list_sheets`; `cancel`,
-`operation_status`, `poll_events`. (Construction: `new`/`from_workbook`.)
+`operation_status`, `poll_events`; **`.qbook` `open`/`save`** (inc.2c-9 — Option 1: reconstruct from the
+envelope + fresh op-log/undo history). (Construction: `new`/`from_workbook`.)
 **DEFERRED — return `EngineError{class:Capability, code:"not_implemented_in_v1_core"}` (honest, never a
-fallback):** `open`/`import`/`save`/`export` (persistence);
+fallback):** `import`/`export` (xlsx/csv — a persistence follow-up sub-increment);
 `register_function`/`unregister_function`/`list_functions` (6.4);
 `write_range`/`publish_dataset`/`bind_range`/`refresh_source`/`materialize_query` (6.4/6.5).
 
@@ -64,15 +66,30 @@ fallback):** `open`/`import`/`save`/`export` (persistence);
   in order (re-key, then rewrite text — complementary). Focused Codex audit clean (no HIGH/MED). The undo
   `grouped()` wrapper is now defense-in-depth (the renames are single-commit by construction).
 
-**Remaining sequence (NEXT):** persistence (`open`/`import`/`save`/`export` via `ql_io` — adds
-`PersistenceError` to Appendix A). **DESIGN FORK to lock first (see the handoff): `open` adopts loaded
-state — Option 1 (baseline = loaded workbook + FRESH op-log; simple, always-correct for undo, loses
-op-log history on resave) vs Option 2 (baseline = empty + adopt the loaded op-log; preserves history but
-requires `loaded_wb == replay(loaded_oplog)`).** The inc.2c-7 `baseline` field is wired for Option 1.
-Then → functions (6.4) → reserved bulk → Node smoke migration (+ pending `.node` rebuild + B#1/S2-01 mocha
-tests) → 6.1C audit. (`batch` inc.2c-4; **transaction handle** inc.2c-5; **F2 `Op::ClearValue`** inc.2c-6;
-**undo/redo** inc.2c-7; **F10 atomic table-rename** inc.2c-8 — all Codex/Opus-audited, synthesis docs
-under `docs/audits/2026-05-27-*`.)
+✅ **`.qbook` `open`/`save` SHIPPED (inc.2c-9).** **DESIGN FORK LOCKED — Option 1** (user-confirmed
+2026-05-27): `open` reconstructs the workbook from the `.qbook` envelope and adopts it via
+`*self = from_workbook(loaded_wb)` — fresh empty op-log, fresh `UndoManager`, `baseline = loaded_wb`,
+re-minted epoch, reset state — then recomputes (op-log detached; saved computed values may be stale,
+mirroring `loader.rs::load_workbook_and_recompute`). The loaded op-log is loaded via
+`ql_io::load_workbook_with_oplog` and its op payloads are **fully validated by iterating it** (Codex HIGH:
+`load_workbook_with_oplog` checks only Loro framing; per-op JSON is lazy via `iter()` — a frame-valid but
+payload-corrupt sidecar must fail loud on open, not be silently discarded then masked by the next save),
+then discarded. `save` writes `&self.workbook` + `&self.oplog` via `ql_io::save_workbook_with_oplog`; the
+workbook name is derived from the path file-stem (no document-name metadata in v1). `map_persistence_err`
+fills Appendix A (`Persistence`/`qbook_error`|`session_oplog`|`qbook_unsupported_version`|
+`qbook_truncated_header`; foreign `#[non_exhaustive]` wildcard → loud `Internal`/`unmapped_persistence_error`).
+**v1 limitations (documented, not bugs):** loaded op-log history not carried (re-save = this session's edits
+only — the locked Option-1 trade-off); recompute-on-open; name-from-path-stem; `open` legal in `New`/`Ready`
+(re-open replaces the document). Option 2 (adopt the loaded op-log) was rejected — it needs
+`loaded_wb == replay(loaded_oplog)`, re-opening the data-loss bug class inc.2c-7 closed; revisit for
+collab-v1.5. Parallel Codex(gpt-5.5 xhigh)+Opus audit: 1 HIGH (the sidecar-payload validation gap — FIXED)
++ LOW/INFO (docs, 2 added tests) — synthesis `docs/audits/2026-05-27-inc2c9-persist-audit/`.
+
+**Remaining sequence (NEXT):** `import`/`export` (xlsx/csv — a persistence follow-up) → functions (6.4) →
+reserved bulk → Node smoke migration (+ pending `.node` rebuild + B#1/S2-01 mocha tests) → 6.1C audit.
+(`batch` inc.2c-4; **transaction handle** inc.2c-5; **F2 `Op::ClearValue`** inc.2c-6; **undo/redo** inc.2c-7;
+**F10 atomic table-rename** inc.2c-8; **`.qbook` open/save** inc.2c-9 — all Codex/Opus-audited, synthesis
+docs under `docs/audits/2026-05-27-*`.)
 
 > **✅ `batch` SHIPPED inc.2c-4 (2026-05-27) — OPTION (a) chosen.** Both tensions resolved; the
 > multi-call transaction handle stays deferred (see below).
@@ -205,9 +222,11 @@ under `docs/audits/2026-05-27-*`.)
 10. ✅ **F10 atomic table-rename** (SHIPPED inc.2c-8, `dca5695549e`) — `rename_table`/`rename_column` emit
     ONE `Op::BatchCommit` ([Rename*, PutFormula × N]) append-before-mutate (mirror `rename_sheet`); closes
     the tracked F10 gap. Codex audit clean.
-11. **NEXT: persistence** (`open`/`import`/`save`/`export` via `ql_io` — adds `PersistenceError` to
-    Appendix A; lock the `open` baseline/op-log design fork first — see Remaining sequence above).
-12. **functions** (6.4) + **reserved bulk** (6.4/6.5).
+11. ✅ **persistence `.qbook` `open`/`save`** (SHIPPED inc.2c-9) — **Option 1** (locked): reconstruct from
+    the envelope + fresh op-log/undo history; `map_persistence_err` fills Appendix A; sidecar op-payloads
+    validated on open (Codex HIGH fixed). `import`/`export` (xlsx/csv) deferred to a follow-up. See the
+    Remaining sequence block above.
+12. **NEXT: `import`/`export`** (xlsx/csv) → **functions** (6.4) + **reserved bulk** (6.4/6.5).
 
 ---
 

@@ -25,12 +25,14 @@
 //!
 //! `batch` (inc.2c-4) + the multi-call **transaction handle** (`begin_transaction`/
 //! `txn_add`/`commit_transaction`/`rollback_transaction`, inc.2c-5 — a pure
-//! `SessionOp` buffer that commits through the same `batch` machinery) are also
-//! real. The remaining contract methods return a **surfaced** `Capability` /
+//! `SessionOp` buffer that commits through the same `batch` machinery) +
+//! **`undo`/`redo`** (inc.2c-7) + **`.qbook` `open`/`save`** (inc.2c-9 — Option 1:
+//! reconstruct from the envelope, fresh op-log/undo history) are also real. The
+//! remaining contract methods return a **surfaced** `Capability` /
 //! `not_implemented_in_v1_core` error (NOT a silent fallback — project
-//! No-Fallbacks rule) and land in later inc.2 sub-increments:
-//! - persistence (`open`/`import`/`save`/`export`),
-//! - `undo`/`redo`, function registration (6.4), reserved bulk ops (6.4/6.5).
+//! No-Fallbacks rule) and land in later sub-increments:
+//! - `import`/`export` (xlsx/csv — a persistence follow-up),
+//! - function registration (6.4), reserved bulk ops (6.4/6.5).
 //!
 //! ## Two design facts that shape this increment
 //!
@@ -67,6 +69,7 @@
 //! base-chunk enumeration is a tracked follow-up that lands with `import`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -461,6 +464,30 @@ impl WorkbookSession {
         match self.state {
             LifecycleState::Ready | LifecycleState::Busy => Ok(()),
             LifecycleState::New => Err(EngineError::invalid_state("session is not open yet (New)")),
+            LifecycleState::Closed => {
+                Err(EngineError::invalid_state("session is Closed (terminal)"))
+            }
+            LifecycleState::Faulted => {
+                Err(EngineError::invalid_state("session is Faulted (terminal)"))
+            }
+        }
+    }
+
+    /// Gate [`open`]/[`import`] (inc.2c-9 persistence): legal in `New` (the
+    /// `New → Ready` lifecycle transition the trait doc names) OR `Ready`
+    /// (re-opening over a live session is allowed — it replaces the document).
+    /// Rejected loud in `Busy` (a long op is in flight) and the terminal states.
+    /// NOT `ensure_ready` — that rejects `New`, which `open` is precisely the
+    /// way out of.
+    ///
+    /// [`open`]: WorkbookSession::open
+    /// [`import`]: WorkbookSession::import
+    fn ensure_openable(&self) -> EngineResult<()> {
+        match self.state {
+            LifecycleState::New | LifecycleState::Ready => Ok(()),
+            LifecycleState::Busy => Err(EngineError::session_busy(
+                "a long operation is in progress; open/import is rejected while Busy",
+            )),
             LifecycleState::Closed => {
                 Err(EngineError::invalid_state("session is Closed (terminal)"))
             }
@@ -880,16 +907,95 @@ impl EngineSession for WorkbookSession {
         self.state
     }
 
-    fn open(&mut self, _path: &str) -> EngineResult<()> {
-        Err(not_implemented("open (.qbook load)"))
+    /// Open a `.qbook` directory (inc.2c-9). **Option 1 (locked 2026-05-27):**
+    /// reconstruct the workbook from the `.qbook` and adopt it with a FRESH
+    /// op-log + undo history (`baseline = loaded workbook`), so the undo
+    /// invariant `baseline + replay(oplog) == workbook` holds trivially (the
+    /// loaded workbook IS the baseline; replay of the empty log is identity) —
+    /// matching `from_workbook` and avoiding Option 2's data-loss bug class
+    /// (a loaded `oplog` whose replay diverges from the loaded envelope). The
+    /// loaded file's op-log history is therefore NOT carried forward: a later
+    /// `save` writes only THIS session's edits, and undo cannot cross the open
+    /// point (the intended semantic). The on-disk `oplog.bin` is still loaded
+    /// and validated (via the oplog-aware loader) so a corrupt sidecar fails
+    /// loud here rather than being silently ignored — it is then discarded.
+    fn open(&mut self, path: &str) -> EngineResult<()> {
+        self.ensure_openable()?;
+        // Load + validate BOTH the workbook envelope and the op-log sidecar; the
+        // op-log is discarded (Option 1). A missing sidecar or a bad envelope
+        // surfaces loud as a `Persistence` error (No-Fallbacks).
+        let (wb, discarded_oplog) =
+            ql_io::load_workbook_with_oplog(Path::new(path)).map_err(map_persistence_err)?;
+        // `load_workbook_with_oplog` validates only the Loro snapshot FRAMING;
+        // per-op JSON is deserialized lazily by `OpLog::iter()` (`log.rs:107`).
+        // A frame-valid but payload-corrupt sidecar (e.g. a pre-Tier-D3 op shape
+        // — see `ql-oplog/tests/d1_step8_legacy_op_shape.rs`) would otherwise be
+        // silently accepted here and then masked by the next `save`'s overwrite.
+        // Even though Option 1 discards this op-log, validate its payloads now so
+        // a corrupt sidecar fails LOUD on open (the No-Fallbacks contract this
+        // increment promises). Done BEFORE `*self = ...` → atomic: a failure
+        // leaves the session untouched and still usable.
+        for op in discarded_oplog.iter() {
+            op.map_err(|e| map_persistence_err(ql_io::PersistenceError::OpLog(e)))?;
+        }
+        // Adopt as a fresh session over the loaded workbook. `from_workbook`
+        // rebuilds the calcgraph, mints a new epoch (so any pre-open delta token
+        // → EpochMismatch full rebuild), resets `state_seq`/`change_log`/`ops`/
+        // `events`/`txns` (a fresh document), and — crucially — builds a FRESH
+        // `OpLog` + `UndoManager` re-subscribed to it AND sets `baseline = wb`.
+        // The function registry is session-scoped tooling (not document state),
+        // so it is preserved across the open (v1: always the default registry).
+        let registry = Arc::clone(&self.registry);
+        *self = Self::from_workbook(wb);
+        self.registry = registry;
+        // Recompute on open — mirrors the canonical IDE path
+        // (`loader.rs::load_workbook_and_recompute`): the saved computed values
+        // may be stale relative to their inputs. Run with the op-log DETACHED so
+        // the recompute appends no ops and feeds the (fresh) undo manager no
+        // spurious commit. Structural failures surface as `CellDiagnostic`
+        // events (never swallowed — the `run_recalc`/`rematerialize` pattern).
+        let result = self.with_runtime_no_oplog(|rt| rt.recompute_all());
+        for failure in &result.failures {
+            self.events.push(Event::CellDiagnostic {
+                diagnostic: Diagnostic {
+                    addr: Some(CellAddr {
+                        sheet: failure.sheet,
+                        row: failure.row,
+                        col: failure.col,
+                    }),
+                    severity: Severity::Error,
+                    code: "formula_recompute_failed".to_string(),
+                    message: failure.error.to_string(),
+                },
+            });
+        }
+        Ok(())
     }
 
     fn import(&mut self, _bytes: &[u8], _format: &str) -> EngineResult<()> {
         Err(not_implemented("import"))
     }
 
-    fn save(&self, _path: &str) -> EngineResult<()> {
-        Err(not_implemented("save (.qbook write)"))
+    /// Save the live workbook + this session's op-log to a `.qbook` directory
+    /// (inc.2c-9). Both files land atomically via the `.qbook` rename protocol
+    /// (`ql_io::save_workbook_with_oplog`). Under Option 1 the op-log holds only
+    /// edits made since construction/`open`, so a re-save of an opened file
+    /// writes just this session's edits (the documented history trade-off).
+    ///
+    /// The workbook display name written into the envelope is derived from the
+    /// path's file stem — the `.qbook` format's own documented default; the
+    /// in-memory `Workbook` carries no document name in v1.
+    fn save(&self, path: &str) -> EngineResult<()> {
+        self.ensure_readable()?;
+        let p = Path::new(path);
+        let name = p.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+            EngineError::bad_argument(format!(
+                "save path {path:?} has no file stem to derive a workbook name from"
+            ))
+        })?;
+        ql_io::save_workbook_with_oplog(&self.workbook, &self.oplog, name, p)
+            .map_err(map_persistence_err)?;
+        Ok(())
     }
 
     fn export(&self, _format: &str) -> EngineResult<Vec<u8>> {
@@ -2275,6 +2381,34 @@ fn map_oplog_err(e: ql_oplog::OpLogError, display: String) -> EngineError {
     }
 }
 
+/// Map a `ql_io::PersistenceError` (from `open`/`save` — inc.2c-9) to the
+/// contract `EngineError` (Appendix A). All persistence failures are
+/// `ErrorClass::Persistence`; the codes are the contract-locked
+/// `qbook_error`/`session_oplog`/`qbook_unsupported_version`/`qbook_truncated_header`.
+///
+/// `PersistenceError` is a FOREIGN `#[non_exhaustive]` enum (it lives in
+/// `ql-io`), so this match REQUIRES a wildcard arm. A future variant must be
+/// mapped explicitly (Appendix A: "no `qbook_unknown` to callers"); until then
+/// it surfaces a loud `Internal`/`unmapped_persistence_error` — never a silent
+/// swallow or a generic catch-all code (No-Fallbacks).
+fn map_persistence_err(e: ql_io::PersistenceError) -> EngineError {
+    use ql_io::PersistenceError as P;
+    let display = e.to_string();
+    match e {
+        P::Qbook(_) => EngineError::new(ErrorClass::Persistence, "qbook_error", display),
+        P::OpLog(_) => EngineError::new(ErrorClass::Persistence, "session_oplog", display),
+        P::OplogUnsupportedVersion { .. } => EngineError::new(
+            ErrorClass::Persistence,
+            "qbook_unsupported_version",
+            display,
+        ),
+        P::OplogTruncatedHeader { .. } => {
+            EngineError::new(ErrorClass::Persistence, "qbook_truncated_header", display)
+        }
+        _ => EngineError::new(ErrorClass::Internal, "unmapped_persistence_error", display),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2381,12 +2515,13 @@ mod tests {
     #[test]
     fn deferred_methods_surface_capability_error() {
         let mut s = WorkbookSession::new();
-        // `begin_transaction` ships in inc.2c-5; `undo`/`redo` ship in inc.2c-6
-        // (no longer Capability errors). The remaining deferred methods still
-        // surface the honest Capability error.
+        // `begin_transaction` ships in inc.2c-5; `undo`/`redo` ship in inc.2c-6;
+        // `open`/`save` ship in inc.2c-9 (no longer Capability errors). The
+        // remaining deferred methods still surface the honest Capability error:
+        // `import`/`export` (xlsx/csv — follow-up sub-increment) + functions.
         for err in [
-            s.open("/tmp/x.qbook").unwrap_err(),
             s.import(&[], "xlsx").unwrap_err(),
+            s.export("xlsx").unwrap_err(),
             s.list_functions().unwrap_err(),
         ] {
             assert_eq!(err.class, ErrorClass::Capability);
@@ -2397,6 +2532,245 @@ mod tests {
         assert!(!s.can_redo());
         assert!(!s.undo().unwrap().consumed);
         assert!(!s.redo().unwrap().consumed);
+    }
+
+    // --- persistence: open + save .qbook round-trip (inc.2c-9) ---
+
+    /// save → open round-trips cell values, formula text, and computed values.
+    /// (Sheet ids are preserved by the `.qbook` format, so `sheet` is reused.)
+    #[test]
+    fn save_open_round_trip_preserves_cells_formulas_values() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rt.qbook");
+        let path_str = path.to_str().unwrap();
+
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("Sheet1", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 1), "A1*2").unwrap();
+        let _ = s.recalc_dirty().unwrap();
+        s.save(path_str).unwrap();
+
+        let mut s2 = WorkbookSession::new();
+        s2.open(path_str).unwrap();
+        assert_eq!(s2.lifecycle_state(), LifecycleState::Ready);
+        let a1 = s2.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(a1.value, Some(CellValue::Number { number: 10.0 }));
+        let b1 = s2.cell(addr(sheet, 0, 1)).unwrap().unwrap();
+        assert_eq!(b1.value, Some(CellValue::Number { number: 20.0 }));
+        assert_eq!(b1.formula.as_deref(), Some("A1 * 2"));
+    }
+
+    /// open recomputes a stale saved formula value (mirrors the canonical IDE
+    /// path `loader.rs::load_workbook_and_recompute`): a `.qbook` whose stored
+    /// A2 (= A1*2) is stale relative to A1 is refreshed on open.
+    #[test]
+    fn open_recomputes_stale_saved_formula_value() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("stale.qbook");
+        let path_str = path.to_str().unwrap();
+
+        // Build a workbook with a deliberately-stale computed value: A2 = A1*2
+        // computed against A1=10 (→20), then A1 mutated to 100 WITHOUT recompute.
+        let mut wb = Workbook::new();
+        let sheet = wb.add_sheet("S");
+        wb.put_at(sheet, 0, 0, Value::Number(10.0));
+        let reg = ql_functions::default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(sheet, 1, 0, "A1 * 2").unwrap();
+        }
+        wb.put_at(sheet, 0, 0, Value::Number(100.0)); // A2 now stale at 20
+        ql_io::save_workbook_with_oplog(&wb, &OpLog::new(), "stale", &path).unwrap();
+
+        let mut s = WorkbookSession::new();
+        s.open(path_str).unwrap();
+        // open recomputed: A2 = 100 * 2 = 200.
+        let a2 = s.cell(addr(sheet, 1, 0)).unwrap().unwrap();
+        assert_eq!(a2.value, Some(CellValue::Number { number: 200.0 }));
+    }
+
+    /// A value cleared to Blank (`Op::ClearValue`, F2) survives save → open —
+    /// the prior value does NOT resurrect (the core F2-durability round-trip).
+    #[test]
+    fn set_value_blank_survives_save_open_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("blank.qbook");
+        let path_str = path.to_str().unwrap();
+
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 5.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Blank).unwrap(); // clear to blank
+        s.save(path_str).unwrap();
+
+        let mut s2 = WorkbookSession::new();
+        s2.open(path_str).unwrap();
+        // A1 is empty — the 5.0 did not survive the clear through save/open.
+        assert!(s2.cell(addr(sheet, 0, 0)).unwrap().is_none());
+    }
+
+    /// open of a non-existent path fails loud as a `Persistence` error and
+    /// leaves the session unchanged + usable (No-Fallbacks).
+    #[test]
+    fn open_nonexistent_path_fails_loud_persistence() {
+        let mut s = WorkbookSession::new();
+        let err = s.open("/no/such/path/nope.qbook").unwrap_err();
+        assert_eq!(err.class, ErrorClass::Persistence);
+        assert_eq!(err.code, "qbook_error");
+        // The failed open did not mutate the session (it errored before adopting).
+        assert_eq!(s.lifecycle_state(), LifecycleState::Ready);
+        assert!(s.add_sheet("StillWorks", 16384).is_ok());
+    }
+
+    /// open re-mints the epoch, so a delta token captured before open returns
+    /// `full_rebuild_required` (EpochMismatch), never a silently-incomplete delta.
+    #[test]
+    fn open_rebumps_epoch_invalidates_prior_delta_token() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("epoch.qbook");
+        let path_str = path.to_str().unwrap();
+        {
+            let mut s = WorkbookSession::new();
+            let sheet = s.add_sheet("S", 16384).unwrap();
+            s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+                .unwrap();
+            s.save(path_str).unwrap();
+        }
+
+        let mut s = WorkbookSession::new();
+        let _ = s.add_sheet("Old", 16384).unwrap();
+        let token = s.snapshot().unwrap().version;
+        s.open(path_str).unwrap();
+        let delta = s.snapshot_delta(&token).unwrap();
+        assert!(
+            delta.full_rebuild_required,
+            "a pre-open delta token must force a full rebuild after open re-mints the epoch"
+        );
+    }
+
+    /// save is rejected once the session is terminal (Closed) — loud, never a
+    /// silent no-op.
+    #[test]
+    fn save_while_closed_fails_invalid_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("closed.qbook");
+        let mut s = WorkbookSession::new();
+        s.close().unwrap();
+        let err = s.save(path.to_str().unwrap()).unwrap_err();
+        assert_eq!(err.code, "invalid_state");
+    }
+
+    /// A save path with no file stem (the workbook name source in v1) fails
+    /// loud as `BadArgument` rather than writing a nameless workbook.
+    #[test]
+    fn save_path_without_stem_fails_bad_argument() {
+        let s = WorkbookSession::new();
+        let err = s.save("/tmp/..").unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert_eq!(err.code, "bad_argument");
+    }
+
+    /// open of a `.qbook` whose `oplog.bin` sidecar is corrupt fails LOUD as a
+    /// `Persistence` error and leaves the session untouched (the Codex inc.2c-9
+    /// HIGH: a corrupt sidecar must not be silently accepted then masked by the
+    /// next save). Here the corruption is at the Loro framing level (caught by
+    /// `load_workbook_with_oplog`); payload-level corruption (frame-valid op JSON
+    /// of the wrong shape) is caught by the `open` op-iteration validation loop
+    /// and pinned at the ql-oplog layer by `d1_step8_legacy_op_shape.rs`.
+    #[test]
+    fn open_with_corrupt_oplog_sidecar_fails_loud_persistence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("corrupt.qbook");
+        let path_str = path.to_str().unwrap();
+        {
+            let mut s = WorkbookSession::new();
+            let sheet = s.add_sheet("S", 16384).unwrap();
+            s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+                .unwrap();
+            s.save(path_str).unwrap();
+        }
+        // Corrupt the op-log sidecar in place.
+        std::fs::write(path.join(ql_io::OPLOG_FILENAME), b"not a loro snapshot").unwrap();
+
+        let mut s = WorkbookSession::new();
+        let err = s.open(path_str).unwrap_err();
+        assert_eq!(err.class, ErrorClass::Persistence);
+        // The failed open did not adopt the document; the session is still usable.
+        assert_eq!(s.lifecycle_state(), LifecycleState::Ready);
+        assert!(s.add_sheet("StillWorks", 16384).is_ok());
+    }
+
+    /// Immediately after `open`, the (fresh) undo stack is empty: `can_undo()` is
+    /// false and an `undo()` is a no-op — undo cannot cross the open point
+    /// (Option 1: the loaded op-log is discarded, a fresh `UndoManager` is built).
+    #[test]
+    fn can_undo_false_immediately_after_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("undo.qbook");
+        let path_str = path.to_str().unwrap();
+        {
+            let mut s = WorkbookSession::new();
+            let sheet = s.add_sheet("S", 16384).unwrap();
+            s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 42.0 })
+                .unwrap();
+            s.set_formula(addr(sheet, 0, 1), "A1+1").unwrap();
+            s.save(path_str).unwrap();
+        }
+
+        let mut s = WorkbookSession::new();
+        s.open(path_str).unwrap();
+        // The opened content is present (recompute ran)…
+        let sheet = 0;
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 43.0 })
+        );
+        // …but nothing is undoable, and undo is a no-op (cannot cross open).
+        assert!(!s.can_undo());
+        assert!(!s.undo().unwrap().consumed);
+    }
+
+    /// A save → open → mutate → re-save → open cycle is stable: the original
+    /// cells, the new mutation, and formula recompute all survive even though
+    /// `open` resets the op-log to empty each time (the documented Option-1
+    /// history trade-off does not cost document state — `save` writes the full
+    /// workbook envelope independent of the op-log).
+    #[test]
+    fn save_open_resave_open_stable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cycle.qbook");
+        let path_str = path.to_str().unwrap();
+
+        let sheet;
+        {
+            let mut s = WorkbookSession::new();
+            sheet = s.add_sheet("S", 16384).unwrap();
+            s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+                .unwrap();
+            s.set_formula(addr(sheet, 0, 1), "A1*2").unwrap();
+            let _ = s.recalc_dirty().unwrap();
+            s.save(path_str).unwrap();
+        }
+
+        // Reopen, mutate A1, recalc, re-save to the SAME path (overwrite).
+        let mut s2 = WorkbookSession::new();
+        s2.open(path_str).unwrap();
+        s2.set_value(addr(sheet, 0, 0), CellValue::Number { number: 7.0 })
+            .unwrap();
+        let _ = s2.recalc_dirty().unwrap();
+        s2.save(path_str).unwrap();
+
+        // Reopen the re-saved file: the mutation + recompute + formula all survive.
+        let mut s3 = WorkbookSession::new();
+        s3.open(path_str).unwrap();
+        let a1 = s3.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(a1.value, Some(CellValue::Number { number: 7.0 }));
+        let b1 = s3.cell(addr(sheet, 0, 1)).unwrap().unwrap();
+        assert_eq!(b1.value, Some(CellValue::Number { number: 14.0 }));
+        assert_eq!(b1.formula.as_deref(), Some("A1 * 2"));
     }
 
     #[test]

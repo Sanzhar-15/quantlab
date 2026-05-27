@@ -132,8 +132,10 @@ Product commands (not collab `Op` variants — decision-lock §3.2). **v1** = in
 | Command | Tier | Backed by |
 |---------|------|-----------|
 | `new(options)` | v1 | `WorkbookRuntime::new` + fresh `OpLog` |
-| `open(path)` / `import(bytes, format)` | v1 | `from_qbook` (`lib.rs:2883`), Phase 4 importers |
-| `save(path)` / `export(format) -> bytes` | v1 | `to_qbook` (`lib.rs:2076`), exporters |
+| `open(path)` | v1 ✅ (inc.2c-9) | `ql_io::load_workbook_with_oplog` → **Option 1**: reconstruct the workbook from the `.qbook` envelope, adopt with a FRESH op-log + undo history (`baseline = loaded wb`), recompute on open (saved computed values may be stale). The loaded op-log is validated (incl. per-op payloads) then **discarded** — its history is not carried (re-save writes only this session's edits). Legal in `New` **or** `Ready` (re-open replaces the document + re-mints the epoch → outstanding tokens force full rebuild). |
+| `import(bytes, format)` | deferred | `Capability/not_implemented_in_v1_core` — xlsx/csv follow-up sub-increment (Phase 4 importers) |
+| `save(path)` | v1 ✅ (inc.2c-9) | `ql_io::save_workbook_with_oplog(&wb, &oplog, name, path)`; workbook name derived from the path file-stem (no document-name metadata in v1; `None` → loud `BadArgument`). `&self`, legal in `Ready`/`Busy`. |
+| `export(format) -> bytes` | deferred | `Capability/not_implemented_in_v1_core` — xlsx/csv follow-up sub-increment (exporters) |
 | `close()` | v1 | handle free → `Closed` |
 
 ### 3.2 Mutation — single edits
@@ -611,8 +613,8 @@ Ambiguities Codex flagged, resolved here:
 | `OpLogError::{Deserialize,SchemaMismatch,InvalidVersionVector}` | `Protocol` | `oplog_*` | no |
 | `OpLogError::{Loro,LoroEncode}` | `Internal` | `oplog_loro` | no |
 | `OpLogError` (future `#[non_exhaustive]` variant) | `Internal` | `unmapped_oplog_error` | no |
-| `PersistenceError::{Qbook,Oplog,UnsupportedVersion,TruncatedHeader}` | `Persistence` | `qbook_error`/`session_oplog`/`qbook_unsupported_version`/`qbook_truncated_header` | no |
-| `PersistenceError` (any future variant) | — | **must be added explicitly** (no `qbook_unknown` to callers) | — |
+| `PersistenceError::{Qbook, OpLog, OplogUnsupportedVersion, OplogTruncatedHeader}` | `Persistence` | `qbook_error` / `session_oplog` / `qbook_unsupported_version` / `qbook_truncated_header` | no |
+| `PersistenceError` (foreign `#[non_exhaustive]` future variant) | `Internal` | `unmapped_persistence_error` (loud — never a generic `qbook_unknown` to callers) | no |
 | `TransportError::*` | `Capability`/`Internal` | `transport_*` (e.g. `transport_closed`) | maybe |
 | `CollabSessionError::{OpLog,Presence,Undo,Replay,Transport}` | per inner | `session_*` / inner kind | per inner |
 | version token decode failure | `Protocol` | `invalid_version_token` | no |

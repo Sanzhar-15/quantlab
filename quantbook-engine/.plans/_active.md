@@ -113,15 +113,30 @@ status: |
   single-BatchCommit; + e2e rename_table_op_log_replay_reconstructs_rename. ql-exec 709/0 + e2e 21/0,
   ql-oplog 70/0, clippy clean, workspace build green.
 
-  ⭐ NEXT = 6.1B persistence — **follow `docs/api/workbook-session-impl-plan.md` §0**.
-  Remaining, surfaced as `Capability/not_implemented_in_v1_core` (honest, No-Fallbacks):
-  (11) persistence (open/import/save/export via ql_io → adds PersistenceError to Appendix A). **DESIGN
-  FORK to lock first: `open` adopts loaded state — Option 1 (baseline = loaded workbook + FRESH op-log;
-  simple, always-correct for undo, loses op-log history on resave) vs Option 2 (baseline = empty + adopt
-  the loaded op-log; preserves history but needs loaded_wb == replay(loaded_oplog)). The inc.2c-7 baseline
-  field is wired for Option 1.** (12) functions (6.4) + reserved bulk (6.4/6.5). Then Node smoke-path
-  migration + 6.1C audit. Do NOT freeze the CollabSession CRDT façade (collab = v1.5). Also pending: the
-  napi `.node` rebuild + B#1/S2-01 mocha tests.
+  ✅ 6.1B inc.2c-9 `.qbook` open/save SHIPPED 2026-05-27. **DESIGN FORK LOCKED — Option 1** (user-confirmed):
+  `open` reconstructs the workbook from the `.qbook` envelope (`ql_io::load_workbook_with_oplog`) and adopts
+  it via `*self = from_workbook(loaded_wb)` — FRESH empty op-log + fresh UndoManager + `baseline = loaded_wb`
+  + re-minted epoch (pre-open snapshot_delta token → EpochMismatch) + reset state_seq/change_log/ops/events/
+  txns, registry preserved — then recomputes with the op-log DETACHED (saved computed values may be stale,
+  mirrors loader.rs::load_workbook_and_recompute), failures → CellDiagnostic. The loaded op-log is FULLY
+  validated (framing by the loader + per-op payloads by an explicit iter() loop — Codex HIGH: framing-only
+  would silently accept a payload-corrupt sidecar then mask it on the next save) then DISCARDED (Option-1
+  trade-off: history not carried; re-save = this session's edits only). `save(&self)` writes wb+oplog via
+  `ql_io::save_workbook_with_oplog`; name from path file-stem (None → loud BadArgument). New
+  `map_persistence_err` fills Appendix A (Persistence/qbook_error|session_oplog|qbook_unsupported_version|
+  qbook_truncated_header; foreign non_exhaustive wildcard → loud Internal/unmapped_persistence_error). `open`
+  gated New|Ready (re-open replaces the doc) via ensure_openable; save uses ensure_readable. Option 2 rejected
+  (needs loaded_wb==replay(loaded_oplog) → data-loss class inc.2c-7 closed; revisit collab-v1.5).
+  import/export (xlsx/csv) stay honest not_implemented_in_v1_core (follow-up). **Parallel Codex(gpt-5.5
+  xhigh)+Opus audit:** 1 HIGH (sidecar payload-validation gap — FIXED + regression test) + 2 LOW (module-doc
+  drift; can_undo-false-after-open + resave-stability tests added) + INFO (Appendix-A variant-name tidy);
+  both verified post-open undo invariant + open-failure atomicity + recompute op-log isolation at source.
+  Synthesis `docs/audits/2026-05-27-inc2c9-persist-audit/`. **ql-exec lib 719/0 + e2e 21/0, clippy clean,
+  workspace build green.**
+
+  ⭐ NEXT = 6.1B `import`/`export` (xlsx/csv — a persistence follow-up) → functions (6.4) + reserved bulk
+  (6.4/6.5) → Node smoke-path migration (+ pending `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit — **follow
+  `docs/api/workbook-session-impl-plan.md` §0**. Do NOT freeze the CollabSession CRDT façade (collab = v1.5).
 date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-26_phase-5-7-v3-6-1-delta-consumer-backlog.md (V3.6.1 backlog mini-phase, SUPERSEDED by Phase 5 COMPLETE)
 parent_phase: 6 Product Surfaces
@@ -175,10 +190,13 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
    - ✅ **inc.2c-8 (`dca5695549e`)**: **F10 atomic table-rename** — rename_table/rename_column emit ONE
      Op::BatchCommit append-before-mutate (mirror rename_sheet); closes the tracked F10 Codex-HIGH gap.
      Focused Codex audit clean (no HIGH/MED). undo grouped() now defense-in-depth.
-   - ⭐ **NEXT**: persistence (open/import/save/export via ql_io → PersistenceError in Appendix A) —
-     **lock the `open` design fork first: Option 1 (baseline=loaded + fresh oplog) vs Option 2
-     (baseline=empty + loaded oplog)**. → functions/bulk. See `workbook-session-impl-plan.md` §0. Then
-     migrate the Node smoke path. Leave collab/transport/presence feature-gated.
+   - ✅ **inc.2c-9**: **`.qbook` `open`/`save`** — **Option 1 LOCKED** (reconstruct from envelope + fresh
+     op-log/undo history; loaded op-log validated incl. per-op payloads then discarded; `map_persistence_err`
+     fills Appendix A). Parallel Codex+Opus audit: 1 HIGH (sidecar payload-validation gap — FIXED) + LOW/INFO.
+     `import`/`export` (xlsx/csv) deferred to a follow-up.
+   - ⭐ **NEXT**: `import`/`export` (xlsx/csv) → functions/bulk (6.4) → migrate the Node smoke path
+     (+ `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit. See `workbook-session-impl-plan.md` §0. Leave
+     collab/transport/presence feature-gated.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +
