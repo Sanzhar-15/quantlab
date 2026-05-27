@@ -236,6 +236,20 @@ product-specific APIs (the #1 risk). Dirtying + provenance behavior is part of t
 
 *(Single-writer undo is v1; cross-peer undo-group **merge** semantics are the v1.5 part.)*
 
+**Implemented in `WorkbookSession` (inc.2c-7).** A long-lived `loro::UndoManager` field (built in
+`from_workbook`, `set_merge_interval(0)` → each Loro commit is one undo unit; every command emits exactly
+one commit — single op or one `Op::BatchCommit` — except `rename_table`/`rename_column`, which are
+bracketed in a Loro undo group so the rename + its per-cell formula rewrites collapse to one unit).
+`undo`/`redo` revert/replay the commit, then **re-materialize wholesale**: replay the (post-undo) op-log
+onto a clone of the construction-time **baseline workbook** → `rebuild_from_workbook` → `recompute_all`
+(op-log detached) → `bump_epoch` (so any outstanding `snapshot_delta` token gets `EpochMismatch`/full
+rebuild — undo/redo do NOT incrementally patch the delta cache; they reseed it). Empty stack →
+`consumed:false`. Errors: `undo_manager_failed`/`replay_failed` (both `Internal` — engine faults, never a
+silent `consumed:false`). **v1 depth cap = 100 undo steps** (Loro default). Linear single-writer replay
+reproduces sheet/table/column renames WITHOUT the ql-collab rename-repair passes (those are
+concurrency-only). undo of a `set_value(Blank)` clear correctly restores the prior value (depends on the
+inc.2c-6 `Op::ClearValue` durability fix). Audit: `docs/audits/2026-05-27-inc2c67-undo-audit/SYNTHESIS.md`.
+
 ### 3.9 Functions / diagnostics / events / cancellation
 | Command | Tier | Backed by | Notes |
 |---------|------|-----------|-------|
@@ -607,6 +621,8 @@ Ambiguities Codex flagged, resolved here:
 | batch/txn: >1 value/formula op on one cell (inc.2c-4) | `Conflict` | `conflicting_batch_ops` | no |
 | txn handle not open: unknown / already committed / rolled-back / dropped at close (inc.2c-5) | `NotFound` | `transaction_not_found` | no |
 | txn id space exhausted — 2^64 `begin`s in one session (inc.2c-5; loud, never wraps) | `Internal` | `transaction_id_exhausted` | no |
+| Loro `UndoManager::undo`/`redo` internal failure (inc.2c-7; empty stack is `consumed:false`, NOT this) | `Internal` | `undo_manager_failed` | no |
+| op-log replay failure during undo/redo re-materialization (inc.2c-7) | `Internal` | `replay_failed` | no |
 
 **Implementation-reality note (6.1B inc.2 audit, 2026-05-27 — F8):** the earlier draft
 split `InvalidSheet` and `TableCreateRejected` by *cause*, but the real enums do not

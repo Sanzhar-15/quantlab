@@ -1,24 +1,27 @@
 # 6.1B Increment 2 — `WorkbookSession` Implementation Plan
 
-**Status:** ⏳ IN PROGRESS — **2b/2c-1/2c-2 + audit-fix SHIPPED 2026-05-26; the 2026-05-27 inc.2 audit
-(F3–F10) + inc.2c-3 `snapshot_delta` + inc.2c-4 `batch` + inc.2c-5 transaction handle SHIPPED 2026-05-27.**
+**Status:** ⏳ IN PROGRESS — **2b/2c-1/2c-2 + audit-fix SHIPPED 2026-05-26; inc.2 audit (F3–F10) +
+inc.2c-3 `snapshot_delta` + inc.2c-4 `batch` + inc.2c-5 transaction handle + inc.2c-6 F2 `Op::ClearValue`
++ inc.2c-7 undo/redo SHIPPED 2026-05-27.**
 Chain: `83b1b33bac2` PlanCache → `7335a5a1bfa` core → `993492b6f9b` validate_formula/query_range/
 `CellValue::Blank` → `2b5e7a13f5b` delete/restore/move sheet + tables → `9f7a1645dbd` tombstone-read fix →
 **`879f3601747` inc.2 audit-fix (F3–F10)** → **`20427b1c4c7` inc.2c-3 snapshot_delta** → **`58a55f4cfb8`
-+ `9d471be3663` inc.2c-4 batch** → **inc.2c-5 transaction handle (this commit)**. `WorkbookSession` is in
-`crates/ql-exec/src/session.rs`; **ql-exec lib 691/0, clippy clean, workspace `cargo check` green.**
++ `9d471be3663` inc.2c-4 batch** → `fdd80c7a43d` inc.2c-5 transaction handle → `d8d22a04248` inc.2c-6 F2
+`Op::ClearValue` → **`4f8e9858d77` inc.2c-7 undo/redo**. `WorkbookSession` is in
+`crates/ql-exec/src/session.rs`; **ql-exec lib 709/0, clippy clean, workspace build green.**
 
 ### Method status — what the next window inherits (REAL vs surfaced-not-yet)
 **REAL (implemented + tested):** `lifecycle_state`, `close`; `set_value`, `set_formula`, `clear`,
 `set_format`, `register_format`, `validate_formula`; `add_sheet`, `rename_sheet`, `delete_sheet`,
 `restore_sheet`, `move_sheet`, `set_name`; `create_table`/`rename_table`/`rename_column`/`resize_table`/
 `drop_table`; **`batch`** (inc.2c-4); **`begin_transaction`/`txn_add`/`commit_transaction`/
-`rollback_transaction`** (inc.2c-5 — the multi-call handle); `recalc_dirty`, `recalc_all`,
+`rollback_transaction`** (inc.2c-5 — the multi-call handle); **`undo`/`redo`/`can_undo`/`can_redo`**
+(inc.2c-7 — Loro `UndoManager` + baseline-replay re-materialization); `recalc_dirty`, `recalc_all`,
 `mark_volatiles_dirty`; `query_range`, `snapshot`, **`snapshot_delta`**, `cell`, `list_sheets`; `cancel`,
 `operation_status`, `poll_events`. (Construction: `new`/`from_workbook`.)
 **DEFERRED — return `EngineError{class:Capability, code:"not_implemented_in_v1_core"}` (honest, never a
-fallback):** `open`/`import`/`save`/`export` (persistence); `undo`/`redo`
-(`can_undo`/`can_redo` return `false`); `register_function`/`unregister_function`/`list_functions` (6.4);
+fallback):** `open`/`import`/`save`/`export` (persistence);
+`register_function`/`unregister_function`/`list_functions` (6.4);
 `write_range`/`publish_dataset`/`bind_range`/`refresh_source`/`materialize_query` (6.4/6.5).
 
 ### Known v1 limitations (documented, not bugs — revisit when relevant)
@@ -34,20 +37,31 @@ fallback):** `open`/`import`/`save`/`export` (persistence); `undo`/`redo`
   = true no-op; restore-of-live = `Conflict/sheet_not_deleted`). Formula EVAL still reads tombstoned
   sheets (deliberate v1 semantic, F9 — no `#REF!` until v1.5 D7).
 - `ops` HashMap + `events` Vec grow **unbounded** (no retention horizon yet); `change_log` IS bounded.
-- `set_value(Blank)` on a value-only cell: token advances + appears in delta (F2 token half fixed), but
-  the clear is **not replayable** on save/load (pre-existing Phase-2A.3.b wire-format limitation) →
-  tracked to the persistence increment (emit a value-clear op / wire-encode Blank).
-- **F10 (tracked, pre-existing): table rename/rename_column are NOT append-before-mutate atomic** (Codex
-  HIGH; near-zero reachability — no float serde path; only Loro-internal failure). Fix = collect ops →
-  one `Op::BatchCommit` before any `put_formula`, mirroring `rename_sheet`. The misleading comment is
-  corrected; the fix is deferred. See `docs/audits/2026-05-27-inc2-session-audit/SYNTHESIS.md`.
+  The Loro undo stack is capped at **100 steps** (Loro default; inc.2c-7 L1) — oldest unit silently
+  dropped past 100 undoable commands (bounded retention, intentional v1).
+- ✅ **F2 CLOSED (inc.2c-6, `d8d22a04248`):** `set_value(Blank)` (+ batch/transaction Blank-clears) now
+  emit a replayable **`Op::ClearValue`** → durable on save/load AND on undo's replay re-materialization.
+  `clear_formula` deliberately unchanged (preserves values — Excel convert-to-literal).
+- **undo/redo (inc.2c-7):** Loro `UndoManager` field (`set_merge_interval(0)`) → 1 command = 1 undo unit
+  (every command = one Loro commit; `rename_table`/`rename_column` wrapped in `grouped()` since they emit
+  N+1 commits via the F10 loop). `rematerialize` = replay the post-undo op-log onto a CLONE of the
+  construction-time **baseline workbook** (NOT a fresh empty one — closes the Codex-HIGH populated-
+  `from_workbook` data-loss path) → `rebuild_from_workbook` → `recompute_all` (op-log detached) →
+  `bump_epoch`. Empty stack → `consumed:false`. Linear single-writer replay reproduces renames without
+  the ql-collab repair passes (concurrency-only).
+- **F10 (still tracked, pre-existing): table rename/rename_column are NOT append-before-mutate atomic**
+  (near-zero reachability — only a Loro-internal append failure mid-loop). Fix = collect ops → one
+  `Op::BatchCommit` before any `put_formula`, mirroring `rename_sheet`; folds into the persistence
+  increment. undo's `grouped()` brackets a successful rename as one unit. See
+  `docs/audits/2026-05-27-inc2c67-undo-audit/SYNTHESIS.md`.
 
-**Remaining sequence (NEXT):** undo/redo (design-gated: workbook+graph reversion via
-`rebuild_from_workbook` after the Loro undo; `bump_epoch` already wired) → persistence → functions →
-reserved bulk → Node smoke migration (+ pending `.node` rebuild + B#1/S2-01 mocha tests) → 6.1C audit.
-(`batch` SHIPPED inc.2c-4; the multi-call **transaction handle** SHIPPED inc.2c-5 — a pure `SessionOp`
-buffer that commits through the same `batch` machinery; parallel Codex+Opus audit clean, synthesis
-`docs/audits/2026-05-27-inc2c5-txn-audit/SYNTHESIS.md`.)
+**Remaining sequence (NEXT):** persistence (`open`/`import`/`save`/`export` via `ql_io` — adds
+`PersistenceError` to Appendix A; also the place to land the F10 table-rename BatchCommit fix; **`open`/
+`import` MUST set `baseline = loaded` so undo preserves loaded content** — the inc.2c-7 baseline field is
+already wired for this) → functions (6.4) → reserved bulk → Node smoke migration (+ pending `.node`
+rebuild + B#1/S2-01 mocha tests) → 6.1C audit. (`batch` SHIPPED inc.2c-4; **transaction handle** SHIPPED
+inc.2c-5; **F2 `Op::ClearValue`** SHIPPED inc.2c-6; **undo/redo** SHIPPED inc.2c-7 — all parallel
+Codex+Opus audited, synthesis docs under `docs/audits/2026-05-27-*`.)
 
 > **✅ `batch` SHIPPED inc.2c-4 (2026-05-27) — OPTION (a) chosen.** Both tensions resolved; the
 > multi-call transaction handle stays deferred (see below).
@@ -169,11 +183,16 @@ buffer that commits through the same `batch` machinery; parallel Codex+Opus audi
    `next_txn_id`; a pure `SessionOp` buffer (no engine borrow) committed through the same `batch`
    machinery (inherits validation-atomicity + conflict guard); validated at commit time; failed commit
    keeps the txn open; fail-loud unknown handle / id-exhaustion. Codex+Opus audit clean.
-8. **`undo`/`redo`** (NEXT — needs `OpLog::new_undo_manager`; design-gated on workbook+graph reversion via
-   `rebuild_from_workbook` after the Loro undo; `bump_epoch` already wired) + **persistence**
-   (`open`/`import`/`save`/`export` via `ql_io` — adds `PersistenceError` mapping to Appendix A; also
-   where the `set_value(Blank)`-durability + F10 table-rename-atomicity replay gaps get fixed).
-9. **functions** (6.4) + **reserved bulk** (6.4/6.5).
+8. ✅ **F2 `Op::ClearValue`** (SHIPPED inc.2c-6, `d8d22a04248`) — replayable value-clear; every Blank-clear
+   path (set_value/batch/transaction) is now durable on save/load + undo-replay. Prerequisite for undo.
+9. ✅ **`undo`/`redo`/`can_undo`/`can_redo`** (SHIPPED inc.2c-7, `4f8e9858d77`) — Loro `UndoManager` field
+   (`set_merge_interval(0)`, 1 command = 1 unit; `grouped()` for rename_table/column); `rematerialize` =
+   replay post-undo op-log onto a clone of the construction-time `baseline` workbook → rebuild graph →
+   recompute_all (op-log detached) → bump_epoch. Empty stack → consumed:false. Codex+Opus audit: closed a
+   real populated-`from_workbook` data-loss HIGH (the baseline field); F10 left tracked.
+10. **NEXT: persistence** (`open`/`import`/`save`/`export` via `ql_io` — adds `PersistenceError` mapping to
+    Appendix A; lands the F10 table-rename BatchCommit fix; `open`/`import` MUST set `baseline = loaded`).
+11. **functions** (6.4) + **reserved bulk** (6.4/6.5).
 
 ---
 
