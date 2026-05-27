@@ -46,6 +46,21 @@ fallback):** `open`/`import`/`save`/`export` (persistence);
 **Remaining sequence (NEXT):** batch/txn → undo/redo → persistence → functions → reserved bulk → Node
 smoke migration (+ pending `.node` rebuild + B#1/S2-01 mocha tests) → 6.1C audit.
 
+> **⚠️ NEXT-SESSION DESIGN NOTE — `batch` has a real fork (grounded 2026-05-27, decide first):** the
+> contract (§3.4) requires a batch to be **one `Op::BatchCommit`** (a single undo unit), and points at
+> `WorkbookTransaction` (`transaction.rs`). But `WorkbookTransaction` only exposes `put_value` /
+> `put_formula` (`:158`/`:196`) — **no `clear`, no `set_format`** — while `SessionOp`
+> (`ql-session/src/session.rs:40`) has all four variants (SetValue/SetFormula/Clear/SetFormat). So a
+> faithful single-`BatchCommit` batch needs a decision: **(i)** extend `WorkbookTransaction` with
+> clear/set-format buffering (cleanest, true atomic BatchCommit for all 4); **(ii)** value/formula-only
+> batch via `WorkbookTransaction` now + surface Clear/SetFormat-in-batch as `Capability/not_yet`
+> (honest, No-Fallbacks, ships the common bulk-paste case). Do NOT apply the ops via the per-edit
+> session mutators in a loop — that emits N separate ops, not one undo unit, violating §3.4. Also: the
+> multi-call handle (`begin_transaction`/`txn_add`/`commit_transaction`/`rollback_transaction`) needs two
+> NEW `WorkbookSession` fields (`txns: HashMap<TransactionId, Vec<SessionOp>>`, `next_txn_id: u64`) that
+> are not in the struct yet (impl-plan §2 sketched them; inc.2b shipped without them). `BatchResult` =
+> `{applied: u32, version}`; `BatchOptions` = `{undo_label?}`; `TransactionId(u64)`.
+
 ### What 2b shipped (REAL)
 - **2a — PlanCache session-ownership** (§3): `WorkbookRuntime::with_session_state(.., PlanCache)` +
   `into_plan_cache(self)` (ownership-transfer, not a `&mut` field — zero existing-call-site change).
