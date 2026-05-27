@@ -11,6 +11,14 @@ Chain: `83b1b33bac2` PlanCache → `7335a5a1bfa` core → `993492b6f9b` validate
 `WorkbookSession` is in `crates/ql-exec/src/session.rs`; **ql-exec lib 709/0 + e2e 21/0, clippy clean,
 workspace build green.**
 
+## §0 — Current state: method inventory, v1 limitations & remaining sequence (READ FIRST)
+
+> This top matter (everything between here and the `---` before `## 1. Placement`) is the **live,
+> kept-current** state of the increment — the canonical "§0" the handoff docs point at. **§1–§11 below
+> are the original pre-implementation design (rationale), retained but NOT updated as things shipped — they
+> describe the *plan*, not the *current code*; where they diverge (e.g. the token name, the batch
+> mechanism), §0 + the header above win.**
+
 ### Method status — what the next window inherits (REAL vs surfaced-not-yet)
 **REAL (implemented + tested):** `lifecycle_state`, `close`; `set_value`, `set_formula`, `clear`,
 `set_format`, `register_format`, `validate_formula`; `add_sheet`, `rename_sheet`, `delete_sheet`,
@@ -142,8 +150,9 @@ under `docs/audits/2026-05-27-*`.)
 ### What 2b shipped (REAL)
 - **2a — PlanCache session-ownership** (§3): `WorkbookRuntime::with_session_state(.., PlanCache)` +
   `into_plan_cache(self)` (ownership-transfer, not a `&mut` field — zero existing-call-site change).
-- Struct + lifecycle (`new`/`from_workbook`/`close`, Ready/Busy/Closed gating) + `{epoch,op_count}`
-  version token (§2, §4).
+- Struct + lifecycle (`new`/`from_workbook`/`close`, Ready/Busy/Closed gating) + `{epoch, state_seq}`
+  version token (2b shipped it as `{epoch, op_count}`; the counter was renamed `state_seq` in inc.2c-3 —
+  §1–§11 below still say `op_count`, see the §0 banner) (§2, §4).
 - `map_runtime_err` + `map_oplog_err` (§6 / Appendix A) — **free fns, NOT `From` impls** (orphan rules
   forbid `impl From<RuntimeError> for EngineError`; the in-crate `RuntimeError` match is exhaustive →
   a new variant is a compile error, stronger than a runtime catch-all).
