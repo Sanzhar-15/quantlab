@@ -67,12 +67,24 @@ status: |
   rules + fail-loud invalid_version_token; epoch-bump for delta-inexpressible states (move/restore sheet,
   table ops). ql-exec lib 667/0, clippy clean, workspace cargo check green.
 
-  ⭐ NEXT = 6.1B inc.2c-4+ (continue the impl) — **follow `docs/api/workbook-session-impl-plan.md` §0**.
+  ✅ 6.1B inc.2c-4 `batch` SHIPPED 2026-05-27 (`58a55f4cfb8` + fix `9d471be3663`). `batch(ops, options)`
+  via option (a): validate-all → ONE `Op::BatchCommit` → apply via graph-maintaining runtime with op-log
+  DETACHED (`with_session_state_no_oplog`) → `record_changes` once; all 4 SessionOp variants. Built by a
+  delegated Opus agent; a self-review CAUGHT + fixed a real latent replay-divergence (same-cell
+  value/formula ops; `Op::PutValue` replay doesn't clear a formula, `replay.rs:486-510`) → now rejects
+  >1 value/formula op per cell with `Conflict/conflicting_batch_ops` (SetFormat orthogonal). ql-exec lib
+  681/0, clippy clean, workspace green.
+
+  ⭐ NEXT = 6.1B txn-handle OR undo/redo — **follow `docs/api/workbook-session-impl-plan.md` §0**.
   Remaining, surfaced as `Capability/not_implemented_in_v1_core` (honest, No-Fallbacks):
-  (6) batch/txn + undo/redo (OpLog::new_undo_manager) + persistence (open/import/save/export via ql_io →
-  adds PersistenceError to Appendix A); (7) functions (6.4) + reserved bulk (6.4/6.5). Then Node
-  smoke-path migration + 6.1C audit. Do NOT freeze the CollabSession CRDT façade (collab = v1.5).
-  Also pending from inc.1: the napi `.node` rebuild + B#1/S2-01 mocha tests.
+  (6a) multi-call txn handle (begin/txn_add/commit/rollback) — needs NEW `txns: HashMap<TransactionId,
+  Vec<SessionOp>>` + `next_txn_id: u64` struct fields; buffers SessionOps then reuses the SAME `batch`
+  machinery on commit (smallest next step). (6b) undo/redo (OpLog undo manager) — DESIGN-GATED: workbook +
+  calcgraph must revert to pre-op state (likely `rebuild_from_workbook` after the Loro undo); `bump_epoch`
+  already wired. (6c) persistence (open/import/save/export via ql_io → adds PersistenceError to Appendix
+  A; also fixes the set_value(Blank)-durability + F10 table-rename-atomicity replay gaps). (7) functions
+  (6.4) + reserved bulk (6.4/6.5). Then Node smoke-path migration + 6.1C audit. Do NOT freeze the
+  CollabSession CRDT façade (collab = v1.5). Also pending: the napi `.node` rebuild + B#1/S2-01 mocha tests.
 date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-26_phase-5-7-v3-6-1-delta-consumer-backlog.md (V3.6.1 backlog mini-phase, SUPERSEDED by Phase 5 COMPLETE)
 parent_phase: 6 Product Surfaces
@@ -107,9 +119,15 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      `CellValue::Blank` + **structure ops (delete/restore/move_sheet, fail-loud) + table ops
      (create/rename/rename_column/resize/drop)** + Appendix-A error mapping (free fns). 14 session tests
      + 650 ql-exec lib green, clippy clean. Remaining surfaced `not_implemented_in_v1_core` (No-Fallbacks).
-   - ⭐ **inc.2c-3 (NEXT)**: ⚠️ snapshot_delta (DESIGN DECISION needed — recompute deps not op-logged +
-     &self; see §0 item 3) → batch/txn + undo/redo + persistence → functions/bulk. See
-     `workbook-session-impl-plan.md` §0. Then migrate the Node smoke path. Leave
+   - ✅ **inc.2c-3 (`20427b1c4c7`)**: snapshot_delta — change-log design (a) keyed by a monotonic
+     `state_seq` (replaces `oplog.len()` as the token counter); §4.3 rules + fail-loud
+     `invalid_version_token`; epoch-bump for move/restore sheet + table ops.
+   - ✅ **inc.2c-4 (`58a55f4cfb8` + fix `9d471be3663`)**: `batch(ops, options)` — option (a)
+     (validate-all → one `Op::BatchCommit` → detached-oplog graph-maintaining apply → `record_changes`
+     once); all 4 SessionOp variants; rejects same-cell value/formula conflicts.
+   - ⭐ **NEXT**: multi-call txn handle (begin/txn_add/commit/rollback — new `txns`/`next_txn_id` fields,
+     reuses `batch`) OR undo/redo (design-gated: workbook+graph reversion) → persistence → functions/bulk.
+     See `workbook-session-impl-plan.md` §0. Then migrate the Node smoke path. Leave
      collab/transport/presence feature-gated.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
