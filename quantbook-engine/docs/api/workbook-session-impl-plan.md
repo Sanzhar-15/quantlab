@@ -133,19 +133,55 @@ full-rebuild fallback). Full IDE suite **1435/0/25**. Scope = types + loader + m
 change** (the live `CellGridPanel` needs delta/presence/transport, none on `Session` yet — 6.3). Synthesis
 `docs/audits/2026-05-28-6-1b-ide-node-migration/`.
 
-**Remaining sequence (NEXT) — reconciled to the canonical decision-lock §2:**
-✅ IDE-side Node smoke wiring + mocha **DONE** (cross-repo `feat/visualise-v1` `c24222315ed`, 2026-05-28 —
-`Session` driven through `loader.ts`/types, `.node` rebuilt, B#1/S2-01 regressions added). →
-**6.1C security/design audit (NEXT — best as a fresh dedicated multi-lane Codex+Opus megaudit; consumes the
-inc.2d/migration-deferred findings: snapshot `formats` ordering, `schema_version` omission, no
-`catch_unwind` under `panic=abort`, the `WorkbookSnapshotJson.version` optional-in-TS DTO drift, and the
-no-`workbookSnapshotDelta`-over-napi gap blocking the live-grid wiring)** → **6.4-0 function-metadata
-substrate** → **6.4 Python UDFs**. **Also tracked
-(cross-cutting):
-a storage-level effective-non-blank-value extent API** adopted by all serializers (csv/xlsx/.qbook) so a
-blank-inflated `Sheet::bounds` can't produce a giant export (Codex inc.2c-11 HIGH — currently
-consistent-with-siblings + documented; Opus inc.2c-12 INFO re-noted the HashMap-ordered fresh-rels emission,
-also pre-existing). (`batch` inc.2c-4; **transaction handle** inc.2c-5; **F2 `Op::ClearValue`** inc.2c-6;
+**✅ 6.1C — Security/Design Audit SHIPPED 2026-05-28 (5-way parallel megaudit; audit-fix `6a14bd9075a`).**
+Decision-lock §2 item 4 closed. 4 Codex (gpt-5.5 xhigh) lanes + 1 Opus agent + Opus synthesis over
+~9859 LoC (`session.rs` 5117 + `Session` napi class ~150 + `ql-session` ~316 + IDE consumer + shared
+DTOs). **Verdict SHIP-WITH-FIXES**: 3 HIGH (1 fixed, 2 filed for 6.3-entry), 8 MED (2 fixed, 6 filed),
+8 LOW + 6 INFO. Synthesis `docs/audits/2026-05-28-6-1c-megaudit/SYNTHESIS.md`.
+**Audit-fix landed in this commit:** H2 deterministic ordering on `snapshot.formats` + 5
+`snapshot_delta` Vecs (`ql_session::FormatId` gained `Ord`/`PartialOrd`); M8 `Session.close()` bound
+over napi (5-line wrapper + `[invalid_state]` smoke); M3 FaultGuard defense-in-depth — lifted to
+module scope, wraps `delete_sheet`/`restore_sheet`/`move_sheet`/`mark_volatiles_dirty` + `batch`'s
+Phase-2 oplog append; L1 `EngineSession::clear` trait-doc tightened (closes seed input #5 — the
+"delete-contents" gap was docs-only; `set_value(.., Blank)` atomically emits `ClearValue + ClearFormula`
+when a formula was present, verified at `cells.rs::set_value` Blank arm); A-INFO/L-E6 misleading
+`session.rs:332` panic-default docstring corrected (Cargo default is `unwind`, not `abort`; the host
+abort comes from napi-derive not setting `catch_unwind` by default); M6 partial `next_op_id` →
+`checked_add` matching `next_txn_id`.
+**Tracked block-on-6.3-entry:** H1 (cross-repo IDE `parseQuantbookError` allowlist covers ~15 codes;
+engine `Session` emits ~40 — IDE-side commit on `feat/visualise-v1`), H3 (`snapshot_delta` under-reports
+spill changes — `set_formula` records only the anchor cell, `write_spill` writes the full footprint;
+fix touches `WorkbookRuntime` return signature, too invasive for the audit-fix cycle).
+**Filed for 6.3:** M1 (`#[napi(catch_unwind)]` boundary), M2 (recalc cancel honesty — `run_recalc`
+allocates the op-id internally + never checks the registry, so even "pre-start cancel" is
+non-functional in v1; honest reframing or refactor), M5 (`schema_version` dropped at napi DTO boundary
+— engine emits it at `dto.rs:234,:285`, mapper at `lib.rs:4242-4264` doesn't propagate), M6
+(`events`/`ops` bounded retention; needs the event-ring infrastructure per contract §9), M7
+(storage-level effective-non-blank-value extent cross-cutting — `Sheet::iter_effective_cells()`
+adopted by csv/xlsx/.qbook).
+**Over-napi cut-line:** at 6.1C `Session` binds 11 methods (the existing 10 + `close`). Everything
+else (`snapshotDelta`/`undo`/`redo`/`import`/`export`/`open`/`save`/`validateFormula`/`pollEvents`/
+`lifecycleState`/`operationStatus`/`cancel`/table+transaction+batch ops) defers to 6.3; functions to
+6.4 (function-metadata substrate prerequisite). Cycle-budget discipline (≤2 plan-implement-audit
+cycles per session) — megaudit was cycle 1, audit-fix cycle 2, doc-sync separate.
+**Verification (focused re-verify of affected lanes; NOT the full megaudit):** `cargo build -p ql-exec
+-p ql-session -p ql-bindings-node` clean; `cargo test -p ql-exec --lib` **732/0** default + `--features
+xlsx-write` (+3 new H2 tests vs the 729 baseline); `cargo clippy -p ql-exec -p ql-session
+-p ql-bindings-node --all-targets` clean for edits; `node crates/ql-bindings-node/tests/smoke_session.mjs`
+PASS incl. the new post-close `[invalid_state]` + idempotent re-close assertions.
+
+**Remaining sequence (NEXT) — canonical decision-lock §2 item 5+:**
+✅ IDE-side Node smoke wiring + mocha **DONE** (cross-repo `feat/visualise-v1` `c24222315ed`, 2026-05-28).
+✅ 6.1C security/design audit **DONE** (this entry; audit-fix `6a14bd9075a`).
+→ **6.4-0 function-metadata substrate (NEXT)**: replace the hardcoded volatility/reference-shape
+whitelists at `calcgraph_session.rs:149-164/:201-203` with first-class per-function metadata
+(`FunctionMetadata`) + `functions_used` reverse index — the graph-invalidation prerequisite for UDFs
+not bypassing the Phase-3 graph. → **6.4 Python UDFs** (the wedge: trusted-workspace `qb.show/publish/
+bind/register_formula_function`, batch Arrow exchange, debugpy-attachable worker process).
+**Also tracked (cross-cutting):** a storage-level effective-non-blank-value extent API
+(`Sheet::iter_effective_cells()`) adopted by all serializers (csv/xlsx/.qbook) so a blank-inflated
+`Sheet::bounds` can't produce a giant export — Lane D proposed the fix; not 6.1C-blocking on its own
+(consistent across siblings + documented). (`batch` inc.2c-4; **transaction handle** inc.2c-5; **F2 `Op::ClearValue`** inc.2c-6;
 **undo/redo** inc.2c-7; **F10 atomic table-rename** inc.2c-8; **`.qbook` open/save** inc.2c-9; **xlsx import**
 inc.2c-10; **csv import/export** inc.2c-11; **xlsx export** inc.2c-12 — all Codex/Opus-audited, synthesis
 docs under `docs/audits/2026-05-27-*`.)

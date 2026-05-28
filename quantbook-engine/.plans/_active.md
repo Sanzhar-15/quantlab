@@ -306,12 +306,34 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      B#1/S2-01 regressions through the real loader (full IDE suite 1435/0/25). Scope = types+loader+mocha,
      no live-UI change. Codex MED (cross-window S2-01 vacuous → reframed; LOCAL is the real guard) + LOW +
      INFO; Opus SHIP. Synthesis `docs/audits/2026-05-28-6-1b-ide-node-migration/`.
-   - ⭐ **NEXT — 6.1C security/design audit** (decision-lock §2 item 4): a fresh dedicated multi-lane
-     Codex+Opus megaudit of the 6.1 session surface; consumes the migration-deferred findings (snapshot
-     `formats` ordering, `schema_version` omission, no `catch_unwind`, `version`-optional DTO drift,
-     no-`workbookSnapshotDelta`-over-napi). → **6.4-0 function-metadata substrate** → **6.4 Python UDFs**.
-     The v1 import/export surface is COMPLETE. Plus tracked cross-cutting effective-extent serializer fix.
-     See `workbook-session-impl-plan.md` §0. Leave collab/transport/presence feature-gated.
+   - ✅ **6.1C SHIPPED 2026-05-28** (decision-lock §2 item 4): 5-way parallel megaudit (4 Codex `gpt-5.5
+     xhigh` lanes + 1 Opus agent + Opus synthesis). Scope ≈9859 LoC (`session.rs` 5117 + `Session` napi
+     class ~150 + `ql-session` ~316 + IDE consumer + DTOs). **Verdict SHIP-WITH-FIXES**: 3 HIGH (1 fixed,
+     2 filed for 6.3-entry), 8 MED (2 fixed, 6 filed), 8 LOW + 6 INFO. Synthesis
+     `docs/audits/2026-05-28-6-1c-megaudit/SYNTHESIS.md`. **Audit-fix `6a14bd9075a`:** H2 deterministic
+     ordering on `snapshot.formats` + 5 `snapshot_delta` Vecs (added `Ord`/`PartialOrd` to
+     `ql_session::FormatId`); M8 `Session.close()` over napi (+ `[invalid_state]` smoke); M3 FaultGuard
+     defense-in-depth (lifted to module scope; wraps `delete_sheet`/`restore_sheet`/`move_sheet`/
+     `mark_volatiles_dirty` + `batch`'s Phase-2 oplog append); L1 trait-doc tightened (closes seed input
+     #5 — `set_value(.., Blank)` IS the unified delete-contents command, atomic at `cells.rs::set_value`
+     Blank arm); A-INFO/L-E6 misleading `session.rs:332` panic-default docstring corrected; M6 partial
+     `next_op_id` → `checked_add`. **Block-on-6.3-entry:** H1 (cross-repo IDE allowlist), H3
+     (snapshot_delta spill under-report — touches `WorkbookRuntime` return signature). **Filed for 6.3:**
+     M1 (`#[napi(catch_unwind)]`), M2 (recalc cancel honesty — `run_recalc` allocates the op-id mid-call
+     and never checks the registry), M5 (`schema_version` napi-DTO drop), M6 (`events`/`ops` bounded
+     retention; needs event-ring per §9), M7 (effective-extent cross-cutting). **Over-napi cut-line:**
+     `Session` binds 11 methods at 6.1C (the existing 10 + `close`); everything else defers to 6.3
+     (functions to 6.4). **Verification (focused re-verify of affected lanes):** `cargo build` clean,
+     `cargo test -p ql-exec --lib` **732/0** default + `--features xlsx-write` (+3 new H2 tests vs the
+     729 baseline), clippy clean for edits, `node tests/smoke_session.mjs` PASS incl. the new post-close
+     `[invalid_state]` + idempotent re-close assertions.
+   - ⭐ **NEXT — 6.4-0 function-metadata substrate** (decision-lock §2 item 5): replace the hardcoded
+     volatility (`calcgraph_session.rs:149-164`) + address-only-reference (`:201-203`) whitelists +
+     dispatch-only `FunctionRegistry` with first-class `FunctionMetadata`
+     (arity/volatility/determinism/dep-shape/batch-shape/arg-policy/cancel/provenance) + the
+     `functions_used` reverse index — the graph-invalidation prerequisite for UDFs not bypassing the
+     Phase-3 graph. Then **6.4 Python UDFs** (the wedge). Tracked cross-cutting:
+     `Sheet::iter_effective_cells()` serializer fix.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +
@@ -340,10 +362,13 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
    metadata + explicit deps + provenance + dirty triggers; enforce via the §4 exit tests.
 
 ## ⚠️ Carryover caveats (from the prior session)
-- **FIXES NOT LIVE / NOT DIRECTLY TESTED**: B#1 (ff09a5e17a7) + S2-01 (7e536fc07b2) are SOURCE-only.
-  The napi .node is unrebuilt (running IDE still has old behavior) AND neither has a bug-exercising
-  test (napi lib-test can't link). HIGHEST-VALUE next CODE step (do early in 6.1B session or before):
-  rebuild the .node + add B#1 + S2-01 cross-window mocha tests.
+- ✅ **B#1 / S2-01 NOW LIVE 2026-05-28** (cross-repo IDE `c24222315ed`): cdylib rebuilt
+  (`cargo build -p ql-bindings-node --release --features test-fixtures`); mocha
+  `extensions/quantlab/test/quantbook-session.test.ts` covers both — the LOCAL S2-01 test is the genuine
+  filter regression, the cross-window variant was reframed after a Codex MED showed `mergeBytes`
+  forces a full-rebuild fallback (so the cross-window path can't discriminate the filter fix; it now
+  honestly asserts the full-rebuild fallback + end-to-end no-leak). Full IDE suite 1435/0/25. Note: a
+  *running* IDE picks up the rebuilt cdylib only on main-process restart (reload-window is not enough).
 - **Mac-host tooling gotchas**: `rg` NOT installed (use grep); `cargo` NOT on non-interactive PATH
   (use $HOME/.cargo/bin/cargo); ql-bindings-node lib-TEST can't link standalone (napi runtime symbols)
   → test the napi surface via IDE mocha or at the ql-collab core level; ql-collab-ws tests need a
