@@ -628,7 +628,14 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      friendly); `RegisteredFn::Udf(FunctionImplHandle)` dispatch tier + a `scalar.rs` arm + an
      `Option<&WorkerHandle>` on `EvalContext`; worker-kill = hard cancel (contract §6.2);
      trusted-workspace gating. **Cycle decomposition (multi-session per entry-plan §6 "2-3 sessions"):**
-     6.4-3a protocol + `ql-udf` + Arrow↔Value codec against a mock responder (Rust-only, 2-way);
+     ✅ **6.4-3a CODE SHIPPED 2026-05-28** — `ql-udf` leaf crate built out from the reserved stub:
+     `codec.rs` (`ArrayValue`⇄Arrow-IPC tagged-column codec), `frame.rs` (`[u32 LE len][u8 type]
+     [payload]` envelope + `FrameType` + EOF/torn/oversized/unknown-type guards), `worker.rs`
+     (`UdfWorker` trait + `UdfError` taxonomy + in-process `MockWorker`). Deps `ql-types` + `arrow`
+     + `thiserror` — leaf, NO ql-functions/ql-exec. 15 tests (round-trip over every Value variant +
+     all 15 error sigils + degenerate shapes + full codec→frame→codec composition); clippy + workspace
+     check clean. **2-way audit PENDING = next session's cycle 1** (this session spent its 2 cycles:
+     6.4-2 audit-fix + 6.4-3a code). Control-frame payload internals deferred to 6.4-3b. Then:
      6.4-3b real Python worker spawn/handshake/kill (2-way); 6.4-3c eval wiring end-to-end (3-way);
      6.4-3d debugpy + trusted-workspace + IDE bridge (3-way). Then **6.4-4 exit-tests + closure
      megaudit** (5-way; contract §10.4 tests 1-8). **Open questions at impl start** (§10 of the

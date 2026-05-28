@@ -10,3 +10,18 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+# **Phase 6.4-3a (2026-05-28):** out-of-process UDF worker transport + codec.
+# LEAF crate (dependency-inversion, mirroring `ql-io-csv`/`ql-io-xlsx`): owns the
+# wire protocol + the Arrow<->engine-Value codec + the `UdfWorker` abstraction,
+# depending ONLY on `ql-types` (`Value`/`ArrayValue`/`ErrorValue`) + `arrow` (the
+# IPC wire format) + `thiserror`. It must NEVER depend on `ql-functions`/`ql-exec`
+# — the eval layer (6.4-3c) adapts `FunctionArg`/`FunctionReturn` <-> `ArrayValue`
+# at the dispatch site and injects a worker.
+ql-types = { path = "../ql-types" }
+
+# Arrow is already a pinned workspace dependency (used by ql-bench); the `arrow`
+# umbrella crate's default features include `ipc`, which we use for the on-wire
+# RecordBatch stream encoding.
+arrow = { workspace = true }
+
+thiserror = { workspace = true }
