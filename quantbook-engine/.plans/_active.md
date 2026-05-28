@@ -668,11 +668,35 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      raise→Raised{ValueError}, timeout(300ms)→kill→respawn-new-pid; against host python3 + pyarrow 21.0.0,
      loud-skips if absent); clippy `-p ql-udf --all-targets` clean; `cargo check --workspace` clean;
      `python3 -m quantbook._self_test` PASS. ql-udf + quantbook-py stay out of default-members.
-     **2-way audit PENDING = next session's cycle 1** (this session spent its 2 cycles: 6.4-3a audit-fix +
-     6.4-3b code, per CLAUDE.md). **Audit focus to hand off:** reader-thread/kill race + zombie reaping,
-     respawn + deadline accounting, control-frame codec symmetry Rust↔Python, the LOG→eprintln stopgap
-     (6.4-3c routes to CellDiagnostics), worker stdout-purity, handshake-version-mismatch path.
-     **NEXT = 6.4-3b 2-way audit.** Then:
+   - ✅ **6.4-3b cycle-1 AUDIT-FIX SHIPPED 2026-05-28** (`aa988b61afa`) — parallel 2-way (Codex gpt-5.5
+     xhigh + fresh-context Opus). Codex DO-NOT-SHIP / Opus SHIP-WITH-FIXES → reconciled SHIP-WITH-FIXES.
+     **3 HIGH + 4 MED + LOW/INFO.** The 2-way earned its keep: **BOTH lanes** caught the Drop-join
+     deadlock on inherited stdout + the user-print() stdout-corruption; **CODEX-ONLY net-new HIGH**
+     `frame-flood-defeats-timeout` (recv_timeout returns a ready frame regardless of remaining → a
+     continuous LOG/stale-call_id stream defeats the deadline; Opus rated the same channel only LOW);
+     **CODEX-ONLY MED** registry-silent-overwrite; **OPUS-ONLY MED** malformed-CALL-crash +
+     python-encode-nan-inf. **HIGH fixes:** (1) `WorkerProcess::drop` DETACHES the reader thread instead
+     of unconditionally joining (a UDF grandchild inheriting stdout kept the pipe open → read_frame
+     blocked → join deadlocked the engine); keeps kill()+wait() reap (no zombie; wait() doesn't block on
+     reparented grandchildren). (2) `worker.py` main() reserves the protocol fd (dup stdout→private fd,
+     dup2 stderr→fd1, sys.stdout=sys.stderr) BEFORE importing user code → stray print()/chatter → stderr,
+     not the frame stream. (3) `call()` checks `Instant::now() >= deadline_at` at the TOP of the loop
+     before recv → a frame flood still hard-cancels on time. **MED fixes:** deadline_at computed at call
+     ENTRY + respawn handshake capped by remaining budget (spawn()/handshake() take explicit timeout);
+     register_formula_function validates callable + u64 range + rejects dup handle (replace=True override);
+     worker decodes the 16-byte CALL header outside the try + grid INSIDE → malformed args → RAISE w/
+     call_id, not a loop crash; `_codec.encode_grid` rejects NaN/Inf at source → clean RAISE. **LOW/INFO:**
+     decode_grid num_columns==5 guard; smoke respawn proof rests on the fresh successful CALL (dropped
+     flaky pid-inequality assert); protocol-write BrokenPipeError → clean exit; D-state wait() caveat doc.
+     **Verified:** `cargo test -p ql-udf` **39/0** unit + `tests/process_smoke.rs` **2/2** real-python
+     (added `process_worker_times_out_under_frame_flood` driving a new `_flood_worker.py` fixture — proves
+     the deadline guard hard-cancels under a stale-RETURN flood); clippy `-p ql-udf --all-targets` clean;
+     `cargo check --workspace` clean; `python3 -m quantbook._self_test` PASS; py_compile OK. Cargo.lock
+     unchanged (std-only Rust fix). Synthesis + lanes `docs/audits/2026-05-28-6-4-3b-python-worker-audit/`.
+     **Filed for 6.4-3c:** process-group/session kill (kill grandchildren so the pipe closes — the detach
+     prevents the hang but can leak one blocked reader thread + fd if a UDF orphans a child); bounded
+     reader channel/backpressure; Python LOG-emit path + a real LOG round-trip test; LOG→CellDiagnostic.
+     **NEXT = 6.4-3c.** Then:
      6.4-3c eval wiring end-to-end (`RegisteredFn::Udf` + scalar.rs arm + `Option<&mut dyn UdfWorker>` on
      EvalContext + re-examine 6.4-2 `register_udf` atomicity as a 3-way atomic; 3-way);
      6.4-3d debugpy + trusted-workspace + IDE bridge (3-way). Then **6.4-4 exit-tests + closure
