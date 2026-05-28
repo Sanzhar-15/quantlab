@@ -275,9 +275,9 @@ inc.2c-6 `Op::ClearValue` durability fix). Audit: `docs/audits/2026-05-27-inc2c6
 ### 3.9 Functions / diagnostics / events / cancellation
 | Command | Tier | Backed by | Notes |
 |---------|------|-----------|-------|
-| `register_function(metadata, impl_handle)` | v1 contract / 6.4 impl | `FunctionRegistry` + §10 | collision + invalidation rules in §10 |
-| `unregister_function(canonical_name)` | v1 contract / 6.4 impl | `FunctionRegistry` | dirties referencing formulas (§10) |
-| `list_functions() -> [FunctionMetadata]` | v1 contract / 6.4 impl | `FunctionRegistry` | built-ins + UDFs |
+| `register_function(metadata, impl_handle)` | v1 ✅ (6.4-2) | `FunctionRegistry::register_udf` + §10 | collision + invalidation rules in §10; validates canonical_name → `bad_argument` |
+| `unregister_function(canonical_name)` | v1 ✅ (6.4-2) | `FunctionRegistry::unregister_metadata` | dirties referencing formulas (§10); symmetric handle clear |
+| `list_functions() -> [FunctionMetadata]` | v1 ✅ (6.4-2) | `FunctionRegistry::sorted_metadata` | built-ins + UDFs; deterministic order |
 | `subscribe_events() -> EventStream` / `poll_events(cursor) -> EventPage` | v1 | *new* event queue (§9) | cursor + backpressure rules in §9 |
 | `cancel(op_id) -> bool` / `operation_status(op_id) -> OperationState` | v1 | *new* cancellation registry (§6) | |
 
@@ -554,12 +554,12 @@ and a registration/metadata change couldn't dirty its callers → silent graph b
   pre-6.4-1 API was a 2-of-6 lie that the substrate gate papered over.
 - **M3 (substrate-completion)** — new `FunctionRegistry::sorted_metadata() -> Vec<&FunctionMetadata>`
   returning the metadata table sorted by `canonical_name` ascending. Matches the 6.1C H2
-  deterministic-ordering discipline; the (forthcoming) 6.4-2 `EngineSession::list_functions` mapper
-  reads it at the DTO seam.
+  deterministic-ordering discipline; the 6.4-2 `EngineSession::list_functions` mapper reads it at
+  the DTO seam (✅ wired).
 - **M5 (substrate-completion)** — new `map_function_registry_err` closed-enum exhaustive mapper at
   `crates/ql-exec/src/session.rs` translates `Conflict { name } → function_exists` and
-  `NotFound { name } → function_not_found` per Appendix A. `#[allow(dead_code)]` until 6.4-2
-  wires the trait methods.
+  `NotFound { name } → function_not_found` per Appendix A. ✅ 6.4-2 wired this into
+  `register_function` / `unregister_function` (the `#[allow(dead_code)]` was removed).
 - **I1 (substrate-completion)** — new `DepShape::LazyShape` variant; ISREF moves to LazyShape;
   new `is_lazy_shape_reference_fn` migration shim parallel to `is_address_only_reference_fn`.
   Walker checks LazyShape FIRST in the `ExprPlan::Function` arm (the strictest skip-arg-walking
@@ -642,15 +642,19 @@ metadata (built-ins register their true metadata; the engine-side functions are 
 migration shims that delegate to `FunctionRegistry::metadata(name)`).
 
 ### 10.3 Registration + invalidation rules (HIGH-5)
-- **Canonical name:** ASCII-uppercase; `register_function` normalizes + validates against the parser's
-  canonicalization. Unicode/alias policy documented.
+- **Canonical name:** ASCII-uppercase; `register_function` **validates** (6.4-2 cycle-2 audit-fix
+  H1): an empty or non-ASCII-upper-case `canonical_name` returns `EngineError{class:BadArgument,
+  code:"bad_argument"}` rather than reaching the registry's internal `assert!`s (which would panic
+  across the catch_unwind-free napi boundary and seal the session). It validates-and-rejects (does
+  NOT silently normalize — No-Fallbacks); callers/IDE upper-case before the call. Unicode/alias
+  policy documented.
 - **Collision rules:** `register_function` **returns an error** (not a panic) on collision with a
   built-in, an existing UDF, or (if applicable) a name/table — `EngineError{class:Conflict,
   code:"function_exists"}`. Symmetric: `unregister_function` returns
   `EngineError{class:NotFound, code:"function_not_found"}` for a name not in the registry. Both
   codes are listed in Appendix A (6.4-1 cycle 1 added the M5 `map_function_registry_err` closed-enum
-  exhaustive mapper at `crates/ql-exec/src/session.rs`; marked `#[allow(dead_code)]` until 6.4-2
-  wires the trait methods).
+  exhaustive mapper at `crates/ql-exec/src/session.rs`; ✅ 6.4-2 wired it into the two trait methods
+  and removed the `#[allow(dead_code)]` — both codes are now wire-live to the IDE allowlist).
 - **`functions_used` reverse index** *(new `FormulaDeps` field + graph map)*: the dep walker records
   each function a formula calls; the graph keeps `function -> [formula nodes]`. Built at 6.4-0
   substrate; the storage gate that admits a `FormulaDeps` instance into the per-formula table now
@@ -680,8 +684,9 @@ migration shims that delegate to `FunctionRegistry::metadata(name)`).
   `name_gen` exactly — fewer moving parts for the same result.
 - **Unknown-function policy (substrate v1 deferral):** the contract specifies "a formula
   referencing an unregistered name is **graph-visible and treated Volatile/Dynamic** (never
-  silently Pure), so it recomputes once the UDF appears." **6.4-0 substrate + 6.4-1 cycle 1
-  HONESTLY DEFER the Volatile/Dynamic tightening to 6.4-2 trait wiring (or later):** the
+  silently Pure), so it recomputes once the UDF appears." **6.4-0 substrate + 6.4-1/6.4-2 cycles
+  HONESTLY DEFER the Volatile/Dynamic tightening to 6.4-3 (or later) — 6.4-2 trait wiring did not
+  change it:** the
   migration shim `is_volatile_function` at `crates/ql-exec/src/calcgraph_session.rs:202-207`
   returns `false` for unknown names (preserves pre-substrate behavior); the formula stays
   graph-visible via the normal cell-dep + name-dep paths, but its `is_volatile` flag is the
@@ -790,8 +795,8 @@ Ambiguities Codex flagged, resolved here:
 | `CsvError::ExceedsSheetLimits` | `BadArgument` | `csv_exceeds_limits` (CSV larger than `MAX_ROW`/`MAX_COLUMN`) | no |
 | `CsvError::SheetNotFound` | `Internal` | `csv_sheet_not_found` (session selects the sheet → invariant break) | no |
 | `CsvError` (foreign `#[non_exhaustive]` future variant) | `Internal` | `unmapped_csv_error` (loud) | no |
-| `FunctionRegistryError::Conflict` (6.4-1 cycle-1; consumed by 6.4-2 `register_function`) | `Conflict` | `function_exists` | no |
-| `FunctionRegistryError::NotFound` (6.4-1 cycle-1; consumed by 6.4-2 `unregister_function`) | `NotFound` | `function_not_found` | no |
+| `FunctionRegistryError::Conflict` (6.4-1 cycle-1; ✅ wired by 6.4-2 `register_function`/`unregister_function` — wire-live to IDE allowlist) | `Conflict` | `function_exists` | no |
+| `FunctionRegistryError::NotFound` (6.4-1 cycle-1; ✅ wired by 6.4-2 `unregister_function` — wire-live to IDE allowlist) | `NotFound` | `function_not_found` | no |
 | `TransportError::*` | `Capability`/`Internal` | `transport_*` (e.g. `transport_closed`) | maybe |
 | `CollabSessionError::{OpLog,Presence,Undo,Replay,Transport}` | per inner | `session_*` / inner kind | per inner |
 | version token decode failure | `Protocol` | `invalid_version_token` | no |
@@ -843,6 +848,6 @@ carry that context, so the mapping is honest about what it can distinguish:
 | `updatePresence`/`peerPresence`/`clearPresence`/`sweepPresence` | (collab presence) | v1.5 (§3.10) |
 | `setAutoFlushPolicy`/`autoFlushPolicy` | (collab policy) | v1.5 (§3.10) |
 | *(none today)* | `cancel`/`operation_status`/`subscribe_events`/`poll_events` | v1 (new) |
-| *(none today)* | `register_function`/`unregister_function`/`list_functions` | v1 contract / 6.4 impl |
+| `registerFunction`/`unregisterFunction`/`listFunctions` (owning `Session`) | `register_function`/`unregister_function`/`list_functions` | v1 ✅ (6.4-2) |
 | *(none today)* | `write_range`/`publish_dataset`/`bind_range`/`refresh_source`/`materialize_query` | reserved (6.4/6.5) |
 | *(none today)* | `begin/commit/rollback_transaction`, `query_range` | v1 |

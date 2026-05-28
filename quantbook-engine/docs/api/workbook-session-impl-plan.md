@@ -215,6 +215,29 @@ re-verify):** `cargo test -p ql-exec --lib` **742/0** (732 pre-substrate + 6 cyc
 audit-fix); `cargo test -p ql-functions --lib` **1815/0**; `cargo check --workspace` clean;
 clippy clean for edits; Node smoke PASS.
 
+**✅ 6.4-2 — Engine trait wiring + napi DTO surface SHIPPED 2026-05-28 (parallel 2-way audit; audit-fix `3bf0d4fcbef`).**
+Decision-lock §2 item 6 (continued). The three `EngineSession` function methods are real over napi:
+`register_function` (registry `register_udf` — new `udf_handles` map + atomic metadata+handle insert,
+single `fn_gen` bump — then `on_function_registered` dirty fanout, all under a `FaultGuard` that disarms
+on the legitimate-error path), `unregister_function` (symmetric; `unregister_metadata` clears the handle),
+`list_functions` (`sorted_metadata`, deterministic). napi: `FunctionMetadataJson` + `ArityJson`
+(strict tagged union) + 6 enum-string mapper pairs (unknown → `[bad_argument]`) + BigInt
+sign/losslessness checks. Cycle-1 code `f8eeaaeadfe` (+1477/-27 across 5 files in 4 crates) + IDE
+`739b625b4fd`. **Verdict SHIP-WITH-FIXES** after 2 HIGHs (parallel 2-way INVERTED the usual pattern:
+H1 bad-name FFI panic found by BOTH lanes — Opus added the armed-FaultGuard-seals-session detail +
+catch_unwind probe; F2 open/import graph-vs-UDF-free-registry divergence found by CODEX ONLY).
+**Audit-fix `3bf0d4fcbef`:** (H1) `register_function` validates canonical_name (non-empty +
+ASCII-upper-case) BEFORE the registry / FaultGuard, returning `[bad_argument]` instead of panicking
+across the catch_unwind-free napi boundary; (F2) new `from_workbook_with_registry` adoption helper
+used by `open`/`import` so the graph is extracted against the preserved UDF-aware registry (live
+divergence was xlsx-import; `open` self-healed via post-swap `recompute_all`); (F3) ArityJson strict;
+(M1/L1/M2/M3) 4 test-honesty strengthenings; (F4) ArityJson `undefined`-not-`null` doc. Synthesis +
+lanes `docs/audits/2026-05-28-6-4-2-trait-wiring-audit/`. **Verification:** `cargo test -p ql-exec
+--lib` **755/0** (default + `xlsx-write`); `--tests` all 18 suites green; `ql-functions --lib`
+**1824/0**; clippy clean for edits; Node smoke PASS. **Still filed (non-blocking, 6.4-3 / perf
+backlog):** L2-OPUS LazyShape `#[serde(alias)]`; I2-OPUS Phase-1.5 overlap `debug_assert`; L3-OPUS
+walker hot-path 2x HashMap-lookup.
+
 **✅ 6.4-1 — Substrate-completion SHIPPED 2026-05-28 (parallel 2-way audit; audit-fix `befcd0d34cc`).**
 Decision-lock §2 item 6 (entry) closed. Cycle 1 code at `1a7dfee12b0` (+1095/-348 across 21 files
 in 3 crates) batched two block-on-6.4-entry HIGHs (H1 binder whitelists + H3 PlanCache re-extraction)
@@ -256,14 +279,12 @@ clippy clean for edits; Node smoke PASS through fresh-built audit-fix cdylib.
 ✅ IDE-side Node smoke wiring + mocha **DONE** (cross-repo `feat/visualise-v1` `c24222315ed`, 2026-05-28).
 ✅ 6.1C security/design audit **DONE** (audit-fix `6a14bd9075a`).
 ✅ 6.4-0 function-metadata substrate **DONE** (audit-fix `63592126afe`).
-✅ 6.4-1 substrate-completion **DONE** (this entry; audit-fix `befcd0d34cc`).
-→ **6.4-2 engine trait wiring (NEXT)**: implement `WorkbookSession::register_function` /
-`unregister_function` / `list_functions` (currently `not_implemented_in_v1_core`); each method
-calls the substrate building blocks — registry `register_metadata` / `unregister_metadata` /
-`sorted_metadata` + calcgraph `on_function_(un)registered` + the M5 `map_function_registry_err`
-mapper. Surface the methods over napi; update IDE `parseQuantbookError` allowlist for
-`function_exists` / `function_not_found` codes. Then 6.4-3 (Python worker + Arrow exchange +
-debugpy) and 6.4-4 (exit tests + closure megaudit).
+✅ 6.4-1 substrate-completion **DONE** (audit-fix `befcd0d34cc`).
+✅ 6.4-2 engine trait wiring + napi DTO surface **DONE** (this entry; audit-fix `3bf0d4fcbef`).
+`WorkbookSession::register_function` / `unregister_function` / `list_functions` are live over napi;
+IDE allowlist carries `function_exists` / `function_not_found` (`739b625b4fd`).
+→ **6.4-3 Python worker + Arrow exchange + debugpy (NEXT)** — the substantial sub-increment
+(3-way audit: engine + Opus + IDE). Then 6.4-4 (exit tests + closure megaudit, 5-way).
 → **6.4 Python UDFs (DOWNSTREAM — the wedge)**: trusted-workspace `qb.show/publish/bind/register_formula_function`,
 batch Arrow exchange, debugpy-attachable worker process. **Block-on-entry must-fix CLOSED at 6.4-1:**
 H1 (binder whitelists derive from metadata) + H3 (PlanCache `fn_gen` invalidation) both shipped.

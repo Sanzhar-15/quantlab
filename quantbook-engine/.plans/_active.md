@@ -399,12 +399,31 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      xlsx-write`; `cargo test -p ql-exec --tests` all integration suites green; `cargo test -p
      ql-functions --lib` **1820/0**; clippy clean for edits; Node smoke PASS through fresh-built
      audit-fix cdylib.
-   - ⭐ **CYCLE 1 SHIPPED 2026-05-28 — 6.4-2 engine trait wiring** (decision-lock §2 item 6 continued,
-     fresh-session takeover after 6.4-1 doc-sync handoff). Cycle 1 CODE shipped at engine commit
+   - ✅ **SHIPPED 2026-05-28 — 6.4-2 engine trait wiring + napi DTO surface** (decision-lock §2 item 6
+     continued). **Cycle 1 CODE** `f8eeaaeadfe` (+1477/-27 across 5 files in 4 crates) + IDE
+     `739b625b4fd`. **Cycle 2 audit + audit-fix** (this fresh session, per auditor-independence
+     discipline): parallel 2-way (Codex gpt-5.5 xhigh + fresh-context Opus) → reconciled
+     SHIP-WITH-FIXES after **2 HIGHs** → audit-fix `3bf0d4fcbef` → doc-sync (MASTER-PLAN +
+     session-api §3.9/§10.3/Appendix A + impl-plan §0). The 2-way INVERTED the usual pattern:
+     **H1** (bad-name FFI panic + armed-FaultGuard session-seal + doc lie) found by BOTH lanes;
+     **F2** (open/import rebuild graph against fresh UDF-free registry) found by **CODEX ONLY**.
+     Audit-fix: H1 validate canonical_name at trait boundary → `[bad_argument]`; F2
+     `from_workbook_with_registry` adoption helper (open/xlsx-import/csv-import); F3 strict ArityJson;
+     M1/L1/M2/M3 test-honesty strengthenings; F4 ArityJson `undefined`-not-`null` doc. Verify all
+     green (ql-exec lib 755/0 default + xlsx-write; 18 integration suites; ql-functions 1824/0;
+     clippy clean; node smoke PASS). Synthesis + lanes
+     `docs/audits/2026-05-28-6-4-2-trait-wiring-audit/`. **Still filed (non-blocking):** L2-OPUS
+     LazyShape `#[serde(alias)]` (6.4-3); I2-OPUS Phase-1.5 overlap `debug_assert` (6.4-3); L3-OPUS
+     walker hot-path 2x HashMap-lookup (perf backlog). **NEXT: 6.4-3 Python worker + Arrow + debugpy
+     (3-way audit), then 6.4-4 exit tests (5-way megaudit).**
+     <details><summary>6.4-2 cycle-1 + cycle-2 detail (historical)</summary>
+
+     Cycle 1 CODE shipped at engine commit
      `f8eeaaeadfe` (+1477/-27 across 5 source files in 4 crates) + IDE commit `739b625b4fd` on
-     `feat/visualise-v1` (+22 across 2 TS files). Cycle 2 (audit + audit-fix) handed to a fresh
+     `feat/visualise-v1` (+22 across 2 TS files). Cycle 2 (audit + audit-fix) ran in a fresh
      session per the auditor-independence discipline (the 6.4-1 cycle-2 audit caught 2 net-new HIGH
-     that a same-session-as-code Opus couldn't have surfaced). Implement
+     that a same-session-as-code Opus couldn't have surfaced). Implemented
+     `WorkbookSession::register_function` / `unregister_function` / `list_functions` (was
      `WorkbookSession::register_function` / `unregister_function` / `list_functions` (currently
      `not_implemented_in_v1_core` at `crates/ql-exec/src/session.rs:2423-2437`). Each method calls
      the substrate building blocks: registry `register_metadata` / `unregister_metadata` /
@@ -594,8 +613,9 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
            / `list_functions` IMPLEMENTED in 6.4-2; update Appendix A `function_exists` /
            `function_not_found` rows to reflect they're now wire-live (not just M5-mapper-ready).
      - [ ] `docs/api/workbook-session-impl-plan.md` §0: 6.4-2 SHIPPED entry.
-     - [ ] `.plans/_active.md`: this section transitions from ⭐IN-PROGRESS to ✅SHIPPED.
-     - [ ] Memory: `current_work.md` + `MEMORY.md` pointer updated for 6.4-2.
+     - [x] `.plans/_active.md`: this section transitions from ⭐IN-PROGRESS to ✅SHIPPED.
+     - [x] Memory: `current_work.md` + `MEMORY.md` pointer updated for 6.4-2.
+     </details>
 
      Then **6.4-3 Python worker + Arrow exchange + debugpy** (the most substantial sub-increment;
      3-way audit), then **6.4-4 exit-tests + closure megaudit** (5-way). Tracked cross-cutting:
