@@ -285,6 +285,14 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 	if (typeof loaded.LoopbackPair !== 'function') {
 		missing.push('LoopbackPair constructor (V2.1)');
 	}
+	// **Phase 6.1B inc.2d (2026-05-28):** the owning `WorkbookSession` over
+	// napi -- the new `Session` class. A pre-inc.2d binary lacks it; fail at
+	// the boundary (the established per-version discipline above) rather than
+	// letting a consumer hit a cryptic `engine.Session is not a constructor`
+	// at the use site.
+	if (typeof loaded.Session !== 'function') {
+		missing.push('Session constructor (6.1B inc.2d)');
+	}
 	if (typeof loaded.CollabSession === 'function') {
 		// V2.2: validate CollabSession.prototype has the V2.2 sync
 		// transport methods. (Skip this branch when the V2.1 constructor
@@ -314,6 +322,32 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 			// "session.flushPendingToTransport is not a function" later.
 			if (typeof proto.flushPendingToTransport !== 'function') {
 				missing.push('CollabSession.prototype.flushPendingToTransport (V2.4)');
+			}
+		}
+	}
+	if (typeof loaded.Session === 'function') {
+		// **Phase 6.1B inc.2d (2026-05-28):** validate the `Session`
+		// prototype carries the owning-session methods, so a stale/partial
+		// binary fails at the boundary instead of at a use site (mirrors the
+		// CollabSession.prototype check above).
+		const sproto = (loaded.Session as unknown as { prototype?: Record<string, unknown> }).prototype;
+		if (!sproto) {
+			missing.push('Session.prototype (6.1B inc.2d prototype check)');
+		} else {
+			for (const method of [
+				'addSheet',
+				'setValue',
+				'setFormula',
+				'clear',
+				'recalcDirty',
+				'recalcAll',
+				'snapshot',
+				'cell',
+				'listSheets',
+			]) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (6.1B inc.2d)`);
+				}
 			}
 		}
 	}

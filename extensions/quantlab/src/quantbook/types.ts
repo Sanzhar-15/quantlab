@@ -1329,6 +1329,101 @@ export interface LoopbackPairConstructor {
 	new(): LoopbackPairInstance;
 }
 
+// ============================================================================
+// Phase 6.1B inc.2d (2026-05-28) -- the owning `WorkbookSession` over napi.
+//
+// `Session` is the single-engine OWNING session (`ql_exec::WorkbookSession`),
+// the product-neutral surface 6.1+ bindings build against -- distinct from
+// `CollabSession` (the CRDT collab facade, v1.5). It exposes the
+// edit -> recalc -> snapshot loop directly. Source of truth: the Rust crate
+// `crates/ql-bindings-node/src/lib.rs` (the `Session` `#[napi]` class).
+//
+// Contract gaps surfaced by this migration (tracked for 6.1C): unlike
+// `CollabSession`, `Session` exposes NO `workbookSnapshotDelta`, transport,
+// presence, merge, or undo over napi yet -- only full `snapshot()`. The live
+// `CellGridPanel` delta/presence/transport render path therefore cannot be
+// driven by `Session` until those land (a later increment / 6.3).
+// ============================================================================
+
+/**
+ * One sheet's identity in {@link SessionInstance.listSheets}. Mirrors the
+ * engine `SheetInfoJson` (`{ id, name }`) -- RICHER than
+ * `CollabSession.listSheets()`, which returns bare `number[]` ids.
+ */
+export interface SheetInfoJson {
+	id: number;
+	name: string;
+}
+
+/**
+ * Value argument to {@link SessionInstance.setValue}. Mirrors the engine
+ * `CellValueJson` INPUT shape (a flat struct discriminated by `kind`), with
+ * `'blank'` ADDED (blank clears the cell's value). The snapshot-OUTPUT
+ * {@link CellValueJson} never carries `'blank'` -- blanks are simply absent.
+ * Unknown `kind` is rejected fail-loud by the engine (`[bad_argument]`).
+ */
+export interface SessionCellValueInput {
+	kind: 'number' | 'boolean' | 'text' | 'blank';
+	number?: number;
+	boolean?: boolean;
+	text?: string;
+}
+
+/**
+ * The owning `WorkbookSession` napi class (Phase 6.1B inc.2d). Wraps
+ * `Arc<Mutex<ql_exec::WorkbookSession>>`; single-writer; the product-neutral
+ * session contract from the 6.1 decision-lock. Engine errors surface as JS
+ * `Error` with a `"[code] message"` body (parse via {@link parseQuantbookError}).
+ */
+export interface SessionInstance {
+	/**
+	 * Append a sheet; returns the new SheetId. (Note: `CollabSession.addSheet`
+	 * returns `void` -- this returned id is a surfaced shape difference.)
+	 * @param chunkRows storage chunk height (>= 1).
+	 */
+	addSheet(name: string, chunkRows: number): number;
+
+	/**
+	 * Set a cell's value. `kind:'blank'` clears the value. Unknown `kind`
+	 * throws `[bad_argument]` (No-Fallbacks).
+	 */
+	setValue(sheet: number, row: number, col: number, value: SessionCellValueInput): void;
+
+	/**
+	 * Set a cell's formula. `text` is the formula BODY with NO leading `=`
+	 * (engine/op-log convention; the engine canonicalizes e.g. `"A1+1"` ->
+	 * `"A1 + 1"`). Mirrors `CollabSession.appendPutFormula`.
+	 */
+	setFormula(sheet: number, row: number, col: number, text: string): void;
+
+	/**
+	 * Convert-to-literal: remove the cell's FORMULA but PRESERVE its last
+	 * computed value (inc.2c-6 contract). To also clear the value, call
+	 * `setValue(..., { kind: 'blank' })`.
+	 */
+	clear(sheet: number, row: number, col: number): void;
+
+	/** Recompute only dirty cells; returns the operation id. */
+	recalcDirty(): bigint;
+
+	/** Recompute the whole workbook; returns the operation id. */
+	recalcAll(): bigint;
+
+	/** Full workbook snapshot (sheets + formats + dateSystem + opaque version). */
+	snapshot(): WorkbookSnapshotJson;
+
+	/** Single-cell read; `null` when the cell is absent. */
+	cell(sheet: number, row: number, col: number): CellSnapshotJson | null;
+
+	/** Live (non-tombstoned) sheets, each as `{ id, name }`. */
+	listSheets(): SheetInfoJson[];
+}
+
+export interface SessionConstructor {
+	/** Construct an empty owning workbook session. */
+	new(): SessionInstance;
+}
+
 /**
  * Top-level exports from the native `.dylib` / `.so` / `.dll`. Loaded
  * via {@link loadQuantbookEngine} in `./loader`.
@@ -1339,6 +1434,14 @@ export interface QuantbookNativeModule {
 
 	/** Session class -- see {@link CollabSessionInstance}. */
 	readonly CollabSession: CollabSessionConstructor;
+
+	/**
+	 * Phase 6.1B inc.2d: the owning `WorkbookSession` over napi -- the
+	 * product-neutral single-writer session. See {@link SessionInstance}.
+	 * Distinct from `CollabSession` (the collab facade). Additive over the
+	 * V1+ surface; the loader validates its presence (fail-at-boundary).
+	 */
+	readonly Session: SessionConstructor;
 
 	/**
 	 * V2.1: opaque Transport wrapper. JS-side this is mostly used

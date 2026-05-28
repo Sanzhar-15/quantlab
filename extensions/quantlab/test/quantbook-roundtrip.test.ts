@@ -1480,11 +1480,24 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		}
 		const fakeTransport = function () { /* fake */ } as unknown as { websocketConnect?: unknown };
 		fakeTransport.websocketConnect = function () { /* fake */ };
+		// **Phase 6.1B inc.2d (2026-05-28):** a valid post-inc.2d binary must
+		// also export the owning `Session` class (the loader now checks it).
+		// Add a fixture-less-but-Session-complete fake so this test keeps
+		// pinning the BlockingTransportFixture-optionality contract (the
+		// fixture, NOT Session, is the thing being made optional here).
+		const fakeSession = function () { /* fake */ };
+		for (const m of [
+			'addSheet', 'setValue', 'setFormula', 'clear',
+			'recalcDirty', 'recalcAll', 'snapshot', 'cell', 'listSheets',
+		]) {
+			(fakeSession.prototype as Record<string, unknown>)[m] = function () { /* */ };
+		}
 		(process as unknown as { dlopen: typeof process.dlopen }).dlopen =
 			(mod: NodeJS.Module): void => {
 				(mod as unknown as { exports: Record<string, unknown> }).exports = {
 					version: () => '0.1.0-prod-no-fixture',
 					CollabSession: fakeCollabSession,
+					Session: fakeSession,
 					Transport: fakeTransport,
 					LoopbackPair: function () { /* fake */ },
 					// BlockingTransportFixture intentionally omitted —

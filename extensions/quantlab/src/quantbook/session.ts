@@ -33,6 +33,7 @@ import type {
 	QuantbookCellSnapshot,
 	QuantbookErrorCode,
 	QuantbookErrorInfo,
+	SessionInstance,
 	TransportInstance,
 	WorkbookSnapshotDeltaJson,
 	WorkbookSnapshotJson,
@@ -47,6 +48,21 @@ import type {
 export function createSession(peerId: bigint): CollabSessionInstance {
 	const engine = loadQuantbookEngine();
 	return new engine.CollabSession(peerId);
+}
+
+/**
+ * **Phase 6.1B inc.2d (2026-05-28) -- typed factory for the owning
+ * `WorkbookSession`.**
+ *
+ * Constructs a fresh `Session` (the product-neutral, single-writer engine
+ * session, distinct from the collab `CollabSession`). Single-line indirection
+ * matching {@link createSession} so consumers hold a stable IDE-side identifier
+ * over the dynamically-loaded native class. No peer id: the owning session is
+ * not a CRDT peer.
+ */
+export function createWorkbookSession(): SessionInstance {
+	const engine = loadQuantbookEngine();
+	return new engine.Session();
 }
 
 /**
