@@ -143,6 +143,7 @@ use ql_io::oplog_persistence::{
 };
 use ql_oplog::CellWireValue;
 use ql_oplog::Op;
+use ql_session::session::FunctionImplHandle;
 use ql_session::{EngineError, EngineSession};
 use ql_types::PeerId;
 
@@ -4263,16 +4264,312 @@ fn workbook_snapshot_json_from_session(snap: ql_session::WorkbookSnapshot) -> Wo
     }
 }
 
+// ============================================================================
+// 6.4-2 (2026-05-28) — function-metadata DTOs over napi.
+//
+// Mirrors `ql_session::function_meta::FunctionMetadata` for the JS surface.
+// String-discriminated enums match the engine's `#[serde(rename_all =
+// "snake_case")]` serialization (so the wire bytes are stable if the IDE ever
+// round-trips through JSON). Unknown JS-input strings surface as
+// `[bad_argument]` engine-shaped errors (No-Fallbacks; never a silent default).
+//
+// `Arity` is a tagged union: `kind: "fixed" | "range" | "variadic"` plus
+// per-variant fields (`n` / `min` / `max`). napi-rs doesn't support `enum`
+// over the boundary, so the tagged-union pattern (same as `CellValueJson`)
+// is the canonical shape.
+// ============================================================================
+
+/// **6.4-2:** JS-facing `Arity` mirror.
+///
+/// `kind` discriminates: `"fixed"` requires `n`; `"range"` requires `min` and
+/// optionally `max` (None ≡ unbounded); `"variadic"` requires no payload.
+/// Mismatches surface `[bad_argument]` errors.
+#[napi(object)]
+pub struct ArityJson {
+    pub kind: String,
+    pub n: Option<u32>,
+    pub min: Option<u32>,
+    pub max: Option<u32>,
+}
+
+/// **6.4-2:** JS-facing `FunctionMetadata` mirror. All fields are flat
+/// primitives or strings (per `#[serde(rename_all = "snake_case")]` on the
+/// engine enums); the `Arity` is the only nested union (see [`ArityJson`]).
+///
+/// **String-enum policy:**
+/// - `volatility`: `"pure" | "volatile" | "dynamic"`.
+/// - `dep_shape`: `"value_deps" | "address_only" | "lazy_shape" | "custom"`.
+/// - `batch_shape`: `"scalar" | "array_batch"`.
+/// - `arg_policy`: `"strict" | "coercing"`.
+/// - `cancellation`: `"cooperative" | "worker_kill" | "non_cancelable"`.
+/// - `arg_context`: `"scalar" | "aggregate" | "reference"`.
+///
+/// Unknown strings on JS→Rust input fail loud with `[bad_argument]`.
+#[napi(object)]
+pub struct FunctionMetadataJson {
+    pub canonical_name: String,
+    pub display_name: Option<String>,
+    pub aliases: Vec<String>,
+    pub arity: ArityJson,
+    pub volatility: String,
+    pub determinism: bool,
+    pub dep_shape: String,
+    pub batch_shape: String,
+    pub arg_policy: String,
+    pub cancellation: String,
+    pub arg_context: String,
+    pub provenance_tags: Vec<String>,
+}
+
+/// **6.4-2:** JS→Rust enum-string mapper. Free-fn rather than a method to keep
+/// the DTO type itself a plain data carrier (no impl blocks on `#[napi(object)]`
+/// types — napi-rs is happiest that way).
+fn arity_from_json(a: ArityJson) -> Result<ql_session::function_meta::Arity> {
+    use ql_session::function_meta::Arity;
+    match a.kind.as_str() {
+        "fixed" => {
+            let n = a.n.ok_or_else(|| {
+                bad_argument_error("ArityJson kind 'fixed' requires field 'n'".into())
+            })?;
+            let n = u8::try_from(n).map_err(|_| {
+                bad_argument_error(format!("ArityJson 'fixed': n={n} exceeds u8 range (0..=255)"))
+            })?;
+            Ok(Arity::Fixed { n })
+        }
+        "range" => {
+            let min = a.min.ok_or_else(|| {
+                bad_argument_error("ArityJson kind 'range' requires field 'min'".into())
+            })?;
+            let min = u8::try_from(min).map_err(|_| {
+                bad_argument_error(format!(
+                    "ArityJson 'range': min={min} exceeds u8 range (0..=255)"
+                ))
+            })?;
+            let max = a
+                .max
+                .map(|m| {
+                    u8::try_from(m).map_err(|_| {
+                        bad_argument_error(format!(
+                            "ArityJson 'range': max={m} exceeds u8 range (0..=255)"
+                        ))
+                    })
+                })
+                .transpose()?;
+            Ok(Arity::Range { min, max })
+        }
+        "variadic" => Ok(Arity::Variadic),
+        other => Err(bad_argument_error(format!(
+            "ArityJson: unknown kind {other:?} (expected 'fixed'|'range'|'variadic')"
+        ))),
+    }
+}
+
+fn arity_to_json(a: ql_session::function_meta::Arity) -> ArityJson {
+    use ql_session::function_meta::Arity;
+    match a {
+        Arity::Fixed { n } => ArityJson {
+            kind: "fixed".to_string(),
+            n: Some(u32::from(n)),
+            min: None,
+            max: None,
+        },
+        Arity::Range { min, max } => ArityJson {
+            kind: "range".to_string(),
+            n: None,
+            min: Some(u32::from(min)),
+            max: max.map(u32::from),
+        },
+        Arity::Variadic => ArityJson {
+            kind: "variadic".to_string(),
+            n: None,
+            min: None,
+            max: None,
+        },
+    }
+}
+
+fn volatility_from_str(s: &str) -> Result<ql_session::function_meta::Volatility> {
+    use ql_session::function_meta::Volatility;
+    match s {
+        "pure" => Ok(Volatility::Pure),
+        "volatile" => Ok(Volatility::Volatile),
+        "dynamic" => Ok(Volatility::Dynamic),
+        other => Err(bad_argument_error(format!(
+            "unknown volatility {other:?} (expected 'pure'|'volatile'|'dynamic')"
+        ))),
+    }
+}
+
+fn volatility_to_str(v: ql_session::function_meta::Volatility) -> &'static str {
+    use ql_session::function_meta::Volatility;
+    match v {
+        Volatility::Pure => "pure",
+        Volatility::Volatile => "volatile",
+        Volatility::Dynamic => "dynamic",
+    }
+}
+
+fn dep_shape_from_str(s: &str) -> Result<ql_session::function_meta::DepShape> {
+    use ql_session::function_meta::DepShape;
+    match s {
+        "value_deps" => Ok(DepShape::ValueDeps),
+        "address_only" => Ok(DepShape::AddressOnly),
+        "lazy_shape" => Ok(DepShape::LazyShape),
+        "custom" => Ok(DepShape::Custom),
+        other => Err(bad_argument_error(format!(
+            "unknown dep_shape {other:?} \
+             (expected 'value_deps'|'address_only'|'lazy_shape'|'custom')"
+        ))),
+    }
+}
+
+fn dep_shape_to_str(d: ql_session::function_meta::DepShape) -> &'static str {
+    use ql_session::function_meta::DepShape;
+    match d {
+        DepShape::ValueDeps => "value_deps",
+        DepShape::AddressOnly => "address_only",
+        DepShape::LazyShape => "lazy_shape",
+        DepShape::Custom => "custom",
+    }
+}
+
+fn batch_shape_from_str(s: &str) -> Result<ql_session::function_meta::BatchShape> {
+    use ql_session::function_meta::BatchShape;
+    match s {
+        "scalar" => Ok(BatchShape::Scalar),
+        "array_batch" => Ok(BatchShape::ArrayBatch),
+        other => Err(bad_argument_error(format!(
+            "unknown batch_shape {other:?} (expected 'scalar'|'array_batch')"
+        ))),
+    }
+}
+
+fn batch_shape_to_str(b: ql_session::function_meta::BatchShape) -> &'static str {
+    use ql_session::function_meta::BatchShape;
+    match b {
+        BatchShape::Scalar => "scalar",
+        BatchShape::ArrayBatch => "array_batch",
+    }
+}
+
+fn arg_policy_from_str(s: &str) -> Result<ql_session::function_meta::ArgPolicy> {
+    use ql_session::function_meta::ArgPolicy;
+    match s {
+        "strict" => Ok(ArgPolicy::Strict),
+        "coercing" => Ok(ArgPolicy::Coercing),
+        other => Err(bad_argument_error(format!(
+            "unknown arg_policy {other:?} (expected 'strict'|'coercing')"
+        ))),
+    }
+}
+
+fn arg_policy_to_str(a: ql_session::function_meta::ArgPolicy) -> &'static str {
+    use ql_session::function_meta::ArgPolicy;
+    match a {
+        ArgPolicy::Strict => "strict",
+        ArgPolicy::Coercing => "coercing",
+    }
+}
+
+fn cancellation_from_str(s: &str) -> Result<ql_session::function_meta::CancelPolicy> {
+    use ql_session::function_meta::CancelPolicy;
+    match s {
+        "cooperative" => Ok(CancelPolicy::Cooperative),
+        "worker_kill" => Ok(CancelPolicy::WorkerKill),
+        "non_cancelable" => Ok(CancelPolicy::NonCancelable),
+        other => Err(bad_argument_error(format!(
+            "unknown cancellation {other:?} \
+             (expected 'cooperative'|'worker_kill'|'non_cancelable')"
+        ))),
+    }
+}
+
+fn cancellation_to_str(c: ql_session::function_meta::CancelPolicy) -> &'static str {
+    use ql_session::function_meta::CancelPolicy;
+    match c {
+        CancelPolicy::Cooperative => "cooperative",
+        CancelPolicy::WorkerKill => "worker_kill",
+        CancelPolicy::NonCancelable => "non_cancelable",
+    }
+}
+
+fn arg_context_from_str(s: &str) -> Result<ql_session::function_meta::ArgContext> {
+    use ql_session::function_meta::ArgContext;
+    match s {
+        "scalar" => Ok(ArgContext::Scalar),
+        "aggregate" => Ok(ArgContext::Aggregate),
+        "reference" => Ok(ArgContext::Reference),
+        other => Err(bad_argument_error(format!(
+            "unknown arg_context {other:?} (expected 'scalar'|'aggregate'|'reference')"
+        ))),
+    }
+}
+
+fn arg_context_to_str(a: ql_session::function_meta::ArgContext) -> &'static str {
+    use ql_session::function_meta::ArgContext;
+    match a {
+        ArgContext::Scalar => "scalar",
+        ArgContext::Aggregate => "aggregate",
+        ArgContext::Reference => "reference",
+    }
+}
+
+/// **6.4-2:** JS→Rust `FunctionMetadata` mapper. Validates every enum string;
+/// unknown strings surface `[bad_argument]`.
+fn function_metadata_from_json(
+    m: FunctionMetadataJson,
+) -> Result<ql_session::function_meta::FunctionMetadata> {
+    Ok(ql_session::function_meta::FunctionMetadata {
+        canonical_name: m.canonical_name,
+        display_name: m.display_name,
+        aliases: m.aliases,
+        arity: arity_from_json(m.arity)?,
+        volatility: volatility_from_str(&m.volatility)?,
+        determinism: m.determinism,
+        dep_shape: dep_shape_from_str(&m.dep_shape)?,
+        batch_shape: batch_shape_from_str(&m.batch_shape)?,
+        arg_policy: arg_policy_from_str(&m.arg_policy)?,
+        cancellation: cancellation_from_str(&m.cancellation)?,
+        arg_context: arg_context_from_str(&m.arg_context)?,
+        provenance_tags: m.provenance_tags,
+    })
+}
+
+/// **6.4-2:** Rust→JS `FunctionMetadata` mapper. Total — every Rust value maps
+/// to a string (no failure mode at this direction).
+fn function_metadata_to_json(
+    m: ql_session::function_meta::FunctionMetadata,
+) -> FunctionMetadataJson {
+    FunctionMetadataJson {
+        canonical_name: m.canonical_name,
+        display_name: m.display_name,
+        aliases: m.aliases,
+        arity: arity_to_json(m.arity),
+        volatility: volatility_to_str(m.volatility).to_string(),
+        determinism: m.determinism,
+        dep_shape: dep_shape_to_str(m.dep_shape).to_string(),
+        batch_shape: batch_shape_to_str(m.batch_shape).to_string(),
+        arg_policy: arg_policy_to_str(m.arg_policy).to_string(),
+        cancellation: cancellation_to_str(m.cancellation).to_string(),
+        arg_context: arg_context_to_str(m.arg_context).to_string(),
+        provenance_tags: m.provenance_tags,
+    }
+}
+
 /// JS-facing wrapper for the owning [`ql_exec::WorkbookSession`] (the product
 /// single-writer session). Holds `Arc<Mutex<…>>` for the same `Send + Sync`
 /// reason as [`CollabSession`] (positive proof at the bottom of this file): the
 /// engine session is `Send + !Sync`, and `Arc<Mutex<Send>>` is `Send + Sync`.
 ///
-/// **Scope (inc.2d):** the minimal smoke surface — construct, single-cell
-/// edits, recalc, snapshot/read — enough to prove the IDE edit→recalc→snapshot
-/// loop runs through the owning session over FFI. The richer surface
-/// (batch/transaction/import/export/undo/delta) is 6.3 Full Bindings;
-/// `register_function`/… is 6.4.
+/// **Scope (inc.2d + 6.4-2):** the minimal edit→recalc→snapshot smoke surface
+/// (construct, single-cell edits, recalc, snapshot/read, close) PLUS the 6.4-2
+/// function-registration surface (`registerFunction` / `unregisterFunction` /
+/// `listFunctions`). The richer surface (batch/transaction/import/export/undo/
+/// delta) is 6.3 Full Bindings. The 6.4-2 methods route through the substrate
+/// shipped at 6.4-0 + 6.4-1: registry `register_udf` / `unregister_metadata` /
+/// `sorted_metadata` + calcgraph `on_function_(un)registered` + the
+/// `map_function_registry_err` mapper for the Appendix A `function_exists` /
+/// `function_not_found` codes.
 #[napi(js_name = "Session")]
 pub struct Session {
     inner: Arc<Mutex<CoreWorkbookSession>>,
@@ -4415,6 +4712,113 @@ impl Session {
     #[napi(js_name = "close")]
     pub fn close(&self) -> Result<()> {
         self.inner.lock().close().map_err(engine_error_to_napi)
+    }
+
+    // ============================================================================
+    // 6.4-2 (2026-05-28) — function registration over napi.
+    //
+    // Wires the substrate shipped at 6.4-0 (function-metadata storage + hooks)
+    // and 6.4-1 (binder ArgContext migration + PlanCache fn_gen invalidation +
+    // M3 sorted_metadata + M5 mapper + I1 LazyShape) to the JS surface.
+    // ============================================================================
+
+    /// **6.4-2:** Register a UDF — `metadata` is a `FunctionMetadataJson`
+    /// describing the function's contract-§10.2 properties; `implHandle` is the
+    /// opaque dispatch-pointer the worker dispatcher will consult at eval time
+    /// (6.4-3). v1 stores the handle but does NOT yet dispatch to a Python
+    /// worker — that lands at 6.4-3 (Arrow IPC + debugpy).
+    ///
+    /// **Behavior:**
+    /// - Validates every enum string field at the napi boundary; unknown
+    ///   strings surface a structured `[bad_argument]` engine error
+    ///   (No-Fallbacks; never silent default).
+    /// - Dirties + transitive-fans every formula that referenced the
+    ///   (previously-unknown) `canonicalName` via the calcgraph hook.
+    /// - Bumps the registry's `fn_gen` so the bind cache invalidates for
+    ///   formulas needing re-extraction against the new metadata
+    ///   (contract §10.3 "re-extract deps" half — option A from the 6.4-0
+    ///   audit, shipped at 6.4-1 H3).
+    /// - Lifecycle gate: rejects on Closed/Busy/New/Faulted with
+    ///   `[invalid_state]` or `[session_busy]`.
+    ///
+    /// **Errors (Appendix A):**
+    /// - `[function_exists]` — canonical name already registered (built-in
+    ///   or existing UDF). `EngineError{Conflict, "function_exists"}`.
+    /// - `[bad_argument]` — invalid enum string OR non-canonical (lower-case)
+    ///   canonical_name. (The registry's canonicalization assert turns into
+    ///   a panic, which the napi boundary wraps; callers should always pass
+    ///   ASCII-uppercase canonical names — the IDE side is expected to
+    ///   uppercase before the call.)
+    /// - `[invalid_state]` — session is not Ready.
+    #[napi(js_name = "registerFunction")]
+    pub fn register_function(
+        &self,
+        metadata: FunctionMetadataJson,
+        impl_handle: BigInt,
+    ) -> Result<()> {
+        let meta = function_metadata_from_json(metadata)?;
+        // BigInt → u64: the napi-rs `BigInt::get_u64()` returns `(sign_bit,
+        // value, lossless)`. Reject negative (sign bit set) + lossy (anything
+        // above u64::MAX) loud per No-Fallbacks. Matches the `peerId` validation
+        // discipline at `CollabSession::new`.
+        let (sign_bit, raw, lossless) = impl_handle.get_u64();
+        if sign_bit {
+            return Err(bad_argument_error(
+                "registerFunction: implHandle must be a non-negative BigInt".into(),
+            ));
+        }
+        if !lossless {
+            return Err(bad_argument_error(
+                "registerFunction: implHandle exceeds u64::MAX (lossy conversion rejected)".into(),
+            ));
+        }
+        let handle = FunctionImplHandle(raw);
+        self.inner
+            .lock()
+            .register_function(meta, handle)
+            .map_err(engine_error_to_napi)
+    }
+
+    /// **6.4-2:** Unregister a UDF. Symmetric to [`Self::register_function`].
+    /// Removes BOTH the metadata and the dispatch handle atomically (via the
+    /// registry's `unregister_metadata` extension that clears
+    /// `udf_handles[name]` on success). Dirties + transitive-fans every
+    /// dependent formula via the calcgraph hook; the next eval will surface
+    /// `#NAME?` because dispatch is now missing.
+    ///
+    /// **Errors (Appendix A):**
+    /// - `[function_not_found]` — no UDF registered under `canonicalName`.
+    /// - `[function_exists]` — `canonicalName` is a built-in (dispatch entry
+    ///   still present; the registry's builtin-guard refuses removal). The
+    ///   `Conflict / function_exists` class is the same as duplicate-register;
+    ///   the message disambiguates (`"is a registered built-in"`).
+    /// - `[invalid_state]` — session is not Ready.
+    #[napi(js_name = "unregisterFunction")]
+    pub fn unregister_function(&self, canonical_name: String) -> Result<()> {
+        self.inner
+            .lock()
+            .unregister_function(&canonical_name)
+            .map_err(engine_error_to_napi)
+    }
+
+    /// **6.4-2:** List every registered function (built-ins + UDFs) with full
+    /// metadata. Returned sorted ascending by `canonical_name` (per the 6.4-1
+    /// M3 `sorted_metadata` discipline + the 6.1C H2 deterministic-ordering
+    /// rule for snapshot DTOs).
+    ///
+    /// Allocates the full metadata table (~260 entries at v1; cheap for an
+    /// IDE poll). Use sparingly — this is not a per-keystroke surface.
+    ///
+    /// **Errors:** `[invalid_state]` if the session is Closed/New/Faulted
+    /// (Busy is OK — this is a read).
+    #[napi(js_name = "listFunctions")]
+    pub fn list_functions(&self) -> Result<Vec<FunctionMetadataJson>> {
+        let metas = self
+            .inner
+            .lock()
+            .list_functions()
+            .map_err(engine_error_to_napi)?;
+        Ok(metas.into_iter().map(function_metadata_to_json).collect())
     }
 }
 

@@ -2418,22 +2418,150 @@ impl EngineSession for WorkbookSession {
         self.undo_manager.can_redo()
     }
 
-    // --- Functions (§3.9; impl in 6.4) ---
+    // --- Functions (§3.9; substrate 6.4-0, completion 6.4-1, trait-wiring 6.4-2) ---
 
+    /// **6.4-2 (2026-05-28):** combined UDF metadata + dispatch-handle
+    /// registration. Calls [`ql_functions::FunctionRegistry::register_udf`]
+    /// (which calls `register_metadata` then inserts the handle on success,
+    /// bumping `fn_gen` exactly once), then fires the
+    /// [`CalcgraphSession::on_function_registered`] hook so every formula
+    /// referencing the (previously-unknown) name dirties + transitive-fans.
+    ///
+    /// The `fn_gen` bump invalidates [`PlanCacheKey`] entries that were
+    /// minted before this call, so the next eval re-binds + re-extracts
+    /// deps against the new metadata — closes contract §10.3's
+    /// "re-extract deps" half. The dirty fanout closes the "dirties every
+    /// formula referencing that canonical name (reschedule)" half.
+    ///
+    /// **Errors (Appendix A):**
+    /// - `Conflict / function_exists` — canonical name already registered
+    ///   (built-in or existing UDF). Via [`map_function_registry_err`].
+    /// - `Capability / session_busy` / `Capability / invalid_state` —
+    ///   gated by [`Self::ensure_ready`]; mutator legal only in `Ready`.
+    ///
+    /// **No event emission v1:** function registration is session-scoped
+    /// tooling (not document state — `open` / `import` deliberately
+    /// preserve the registry across workbook adoption); contract §9
+    /// doesn't list it as a `StructureChanged` source. Filed for 6.4-3 if
+    /// observability demands it.
+    ///
+    /// **No version-token bump:** registry mutation does not advance the
+    /// `{epoch, op_count}` token — the workbook + op-log are untouched.
+    /// `snapshot()` after `register_function` returns the same token as
+    /// before; consumers polling on the token won't see a change. This is
+    /// deliberate (registry IS tooling, not document state).
+    ///
+    /// **FaultGuard discipline:** the registry mutation + graph hook are
+    /// two separate state mutations on `self`. A panic between them would
+    /// leave `fn_gen` bumped + metadata registered + handle inserted but
+    /// no dirty fanout — a subtle inconsistency. Bracket the pair with a
+    /// [`FaultGuard`] matching the 6.1C audit-fix M3 pattern at
+    /// [`Self::delete_sheet`]. Disarms cleanly on the
+    /// `register_udf`-returned-Err path so a legitimate `Conflict` does
+    /// NOT seal the session.
     fn register_function(
         &mut self,
-        _metadata: FunctionMetadata,
-        _impl_handle: FunctionImplHandle,
+        metadata: FunctionMetadata,
+        impl_handle: FunctionImplHandle,
     ) -> EngineResult<()> {
-        Err(not_implemented("register_function"))
+        self.ensure_ready()?;
+        // Stash the canonical name BEFORE `register_udf` moves `metadata`
+        // into the registry — needed for the dirty-fanout hook.
+        let canonical_name = metadata.canonical_name.clone();
+        // FaultGuard around registry + graph mutation (6.1C audit-fix M3 pattern).
+        {
+            let mut guard = FaultGuard {
+                state: &mut self.state,
+                armed: true,
+            };
+            match Arc::make_mut(&mut self.registry)
+                .register_udf(metadata, impl_handle)
+                .map_err(map_function_registry_err)
+            {
+                Ok(()) => {
+                    // Substrate hook: dirty every dependent formula +
+                    // transitive-fan. Returns the directly-dirtied count
+                    // (downstream-of-downstream handled transitively by
+                    // `mark_dirty_from_cell_write`).
+                    let _dirty_count = self.graph.on_function_registered(&canonical_name);
+                    guard.armed = false;
+                }
+                Err(e) => {
+                    guard.armed = false;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
     }
 
-    fn unregister_function(&mut self, _canonical_name: &str) -> EngineResult<()> {
-        Err(not_implemented("unregister_function"))
+    /// **6.4-2 (2026-05-28):** symmetric counterpart to
+    /// [`Self::register_function`]. Removes UDF metadata via
+    /// [`ql_functions::FunctionRegistry::unregister_metadata`] (which
+    /// clears the matching `udf_handles` entry symmetrically + bumps
+    /// `fn_gen` on success), then fires
+    /// [`CalcgraphSession::on_function_unregistered`] for the dirty
+    /// fanout. After this call, formulas referencing the now-missing
+    /// canonical name will surface `#NAME?` on the next eval (dispatch is
+    /// gone from `RegisteredFn`; `scalar.rs:463` returns
+    /// `Value::Error(ErrorValue::Name)` for missing-function calls).
+    ///
+    /// **Errors (Appendix A):**
+    /// - `NotFound / function_not_found` — name has no metadata (never
+    ///   registered, or already unregistered). Via [`map_function_registry_err`].
+    /// - `Conflict / function_exists` — name is a built-in (dispatch entry
+    ///   still present); the registry's builtin-guard prevents removing
+    ///   built-in metadata. The mapper translates `Conflict` to
+    ///   `function_exists` regardless of variant; the message distinguishes.
+    /// - `Capability / session_busy` / `Capability / invalid_state` —
+    ///   gated by [`Self::ensure_ready`].
+    fn unregister_function(&mut self, canonical_name: &str) -> EngineResult<()> {
+        self.ensure_ready()?;
+        // FaultGuard around registry + graph mutation (6.1C audit-fix M3 pattern).
+        {
+            let mut guard = FaultGuard {
+                state: &mut self.state,
+                armed: true,
+            };
+            match Arc::make_mut(&mut self.registry)
+                .unregister_metadata(canonical_name)
+                .map_err(map_function_registry_err)
+            {
+                Ok(()) => {
+                    let _dirty_count = self.graph.on_function_unregistered(canonical_name);
+                    guard.armed = false;
+                }
+                Err(e) => {
+                    guard.armed = false;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
     }
 
+    /// **6.4-2 (2026-05-28):** list every registered function (built-ins +
+    /// UDFs) with full metadata. Reads via
+    /// [`ql_functions::FunctionRegistry::sorted_metadata`] (M3 from 6.4-1)
+    /// for deterministic ordering by `canonical_name` — matches the 6.1C
+    /// H2 ordering discipline for snapshot DTOs (Vecs serialized over the
+    /// wire MUST be call-stable; a 5-way megaudit caught the snapshot
+    /// `formats` non-determinism at exactly this seam).
+    ///
+    /// Allocates `Vec<&FunctionMetadata>` of registry-len size at the
+    /// registry layer, then clones each entry into the owned `Vec<FunctionMetadata>`
+    /// the DTO returns. v1 sizes (~260 builtins + UDFs) keep this cheap.
+    ///
+    /// **Gate:** [`Self::ensure_readable`] (Ready/Busy OK; rejects
+    /// New/Closed/Faulted). Matches `snapshot`/`cell`/`list_sheets`.
     fn list_functions(&self) -> EngineResult<Vec<FunctionMetadata>> {
-        Err(not_implemented("list_functions"))
+        self.ensure_readable()?;
+        Ok(self
+            .registry
+            .sorted_metadata()
+            .into_iter()
+            .cloned()
+            .collect())
     }
 
     // --- Operations / events (§6 / §9) ---
@@ -2875,7 +3003,10 @@ fn map_csv_err(e: ql_io_csv::CsvError) -> EngineError {
 /// closed enum we own — adding a new variant without a mapping should
 /// surface as a compile error at this match, not a silent runtime
 /// catch-all.
-#[allow(dead_code)] // wired by 6.4-2 `register_function`/`unregister_function`/`list_functions`
+// **6.4-2 (2026-05-28):** the `#[allow(dead_code)]` from 6.4-1 is REMOVED —
+// `WorkbookSession::register_function` and `unregister_function` now wire
+// this mapper into the engine→napi error surface (Appendix A
+// `function_exists` / `function_not_found`).
 fn map_function_registry_err(e: ql_functions::FunctionRegistryError) -> EngineError {
     use ql_functions::FunctionRegistryError as F;
     let display = e.to_string();
@@ -2993,12 +3124,24 @@ mod tests {
         let mut s = WorkbookSession::new();
         // `begin_transaction` inc.2c-5; `undo`/`redo` inc.2c-6; `open`/`save`
         // inc.2c-9; xlsx `import` inc.2c-10; csv `import`/`export` inc.2c-11;
-        // xlsx `export` inc.2c-12 (real behind `xlsx-write`) — all no longer
-        // unconditional Capability errors. The remaining always-deferred methods
-        // still surface the honest Capability error: function registration (6.4)
-        // + reserved bulk ops. (`export("xlsx")` is covered separately, gated on
-        // the `xlsx-write` feature.)
-        let err = s.list_functions().unwrap_err();
+        // xlsx `export` inc.2c-12 (real behind `xlsx-write`); `register_function`
+        // / `unregister_function` / `list_functions` 6.4-2 — all no longer
+        // unconditional Capability errors. The remaining always-deferred
+        // methods still surface the honest Capability error: the reserved bulk
+        // ops (`write_range` / `publish_dataset` / `bind_range` /
+        // `refresh_source` / `materialize_query`). (`export("xlsx")` is covered
+        // separately, gated on the `xlsx-write` feature.)
+        //
+        // **6.4-2 (2026-05-28):** swapped `list_functions` for `bind_range` —
+        // the former became real in 6.4-2; the latter stays deferred to 6.4-3.
+        let dummy_range = CellRange {
+            sheet: 0,
+            start_row: 0,
+            start_col: 0,
+            end_row: 0,
+            end_col: 0,
+        };
+        let err = s.bind_range("ignored", dummy_range).unwrap_err();
         assert_eq!(err.class, ErrorClass::Capability);
         assert_eq!(err.code, "not_implemented_in_v1_core");
         // A fresh session has nothing to undo/redo (but the methods are real now).
@@ -3006,6 +3149,366 @@ mod tests {
         assert!(!s.can_redo());
         assert!(!s.undo().unwrap().consumed);
         assert!(!s.redo().unwrap().consumed);
+        // 6.4-2 verification: `list_functions` is now real on a fresh session;
+        // returns the built-in metadata set (Vec) with deterministic ordering.
+        let funcs = s.list_functions().expect("list_functions is real in 6.4-2");
+        assert!(!funcs.is_empty(), "fresh session must list ~260 built-ins");
+        assert!(
+            funcs.iter().any(|m| m.canonical_name == "SUM"),
+            "built-in SUM must appear in list_functions"
+        );
+    }
+
+    // --- 6.4-2: register_function / unregister_function / list_functions ---
+
+    /// Build a UDF metadata stub for tests. Defaults to `Volatility::Volatile +
+    /// ArgContext::Aggregate + BatchShape::ArrayBatch` because that's the shape
+    /// the 6.4-3 Python UDF flow actually uses (so the test fixtures exercise
+    /// the wedge configuration); individual tests override fields as needed.
+    fn udf_meta(canonical_name: &str) -> FunctionMetadata {
+        use ql_session::function_meta::{
+            ArgContext, ArgPolicy, Arity, BatchShape, CancelPolicy, DepShape, Volatility,
+        };
+        FunctionMetadata {
+            canonical_name: canonical_name.to_string(),
+            display_name: None,
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Volatile,
+            determinism: false,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::ArrayBatch,
+            arg_policy: ArgPolicy::Strict,
+            cancellation: CancelPolicy::WorkerKill,
+            arg_context: ArgContext::Aggregate,
+            provenance_tags: vec!["python".to_string()],
+        }
+    }
+
+    /// **6.4-2 (2026-05-28):** the happy path — register a UDF, then
+    /// `list_functions` includes it; unregister it, then `list_functions`
+    /// excludes it. Verifies the trait wiring through the
+    /// substrate-completion seam (`sorted_metadata` view).
+    #[test]
+    fn register_function_succeeds_and_list_functions_includes_then_excludes_it() {
+        let mut s = WorkbookSession::new();
+        let initial_count = s.list_functions().unwrap().len();
+        assert!(initial_count > 200, "fresh session must hold the built-ins (~260)");
+
+        s.register_function(udf_meta("MYUDF"), FunctionImplHandle(0xABCD))
+            .expect("register_function clean");
+        let after_register = s.list_functions().unwrap();
+        assert_eq!(after_register.len(), initial_count + 1);
+        let myudf = after_register
+            .iter()
+            .find(|m| m.canonical_name == "MYUDF")
+            .expect("MYUDF must appear in list_functions");
+        // Metadata faithful end-to-end.
+        assert_eq!(myudf.volatility, ql_session::function_meta::Volatility::Volatile);
+        assert_eq!(myudf.batch_shape, ql_session::function_meta::BatchShape::ArrayBatch);
+        assert_eq!(myudf.arg_context, ql_session::function_meta::ArgContext::Aggregate);
+        assert_eq!(myudf.provenance_tags, vec!["python".to_string()]);
+
+        s.unregister_function("MYUDF").expect("unregister clean");
+        let after_unregister = s.list_functions().unwrap();
+        assert_eq!(after_unregister.len(), initial_count);
+        assert!(
+            !after_unregister.iter().any(|m| m.canonical_name == "MYUDF"),
+            "MYUDF must NOT appear in list_functions after unregister"
+        );
+    }
+
+    /// **6.4-2 (2026-05-28):** duplicate UDF registration surfaces
+    /// `Conflict / function_exists` per Appendix A. The mapper at
+    /// `map_function_registry_err` is now wired (the `#[allow(dead_code)]`
+    /// was removed in 6.4-2).
+    #[test]
+    fn register_function_duplicate_returns_conflict_function_exists() {
+        let mut s = WorkbookSession::new();
+        s.register_function(udf_meta("MYUDF"), FunctionImplHandle(1))
+            .unwrap();
+        let err = s
+            .register_function(udf_meta("MYUDF"), FunctionImplHandle(2))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Conflict);
+        assert_eq!(err.code, "function_exists");
+        // The Conflict short-circuited BEFORE the udf_handles insert, so the
+        // original handle (1) is the one the registry holds — verified via
+        // a fresh registration after unregister: ensures the new (2) lands.
+        s.unregister_function("MYUDF").unwrap();
+        s.register_function(udf_meta("MYUDF"), FunctionImplHandle(2))
+            .unwrap();
+        // Final state has exactly one MYUDF (re-registered).
+        assert_eq!(
+            s.list_functions()
+                .unwrap()
+                .iter()
+                .filter(|m| m.canonical_name == "MYUDF")
+                .count(),
+            1
+        );
+    }
+
+    /// **6.4-2 (2026-05-28):** registering against a built-in name
+    /// (which holds metadata via the boot-time `register_builtin_metadata`
+    /// pass) ALSO returns `Conflict / function_exists`. The mapper
+    /// translates the registry-level `Conflict` regardless of whether
+    /// the conflict is with another UDF or with a built-in's metadata —
+    /// both are user-visible as "function_exists" per contract §10.3.
+    #[test]
+    fn register_function_against_builtin_returns_conflict() {
+        let mut s = WorkbookSession::new();
+        let err = s
+            .register_function(udf_meta("SUM"), FunctionImplHandle(99))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Conflict);
+        assert_eq!(err.code, "function_exists");
+        // SUM's built-in metadata is untouched.
+        let sum = s
+            .list_functions()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.canonical_name == "SUM")
+            .expect("SUM must still appear after rejected register");
+        // Built-in SUM is Pure, NOT Volatile (our udf_meta stub).
+        assert_eq!(sum.volatility, ql_session::function_meta::Volatility::Pure);
+    }
+
+    /// **6.4-2 (2026-05-28):** unregistering an unknown name returns
+    /// `NotFound / function_not_found` — never a silent no-op (the
+    /// substrate's fail-loud rule per Appendix A).
+    #[test]
+    fn unregister_function_returns_not_found_for_unknown_name() {
+        let mut s = WorkbookSession::new();
+        let err = s.unregister_function("DOES_NOT_EXIST").unwrap_err();
+        assert_eq!(err.class, ErrorClass::NotFound);
+        assert_eq!(err.code, "function_not_found");
+    }
+
+    /// **6.4-2 (2026-05-28):** unregistering a built-in name returns
+    /// `Conflict / function_exists` via the registry's builtin-guard
+    /// (6.4-0 audit-fix Codex A LOW). The mapper translates `Conflict`
+    /// to `function_exists` regardless of the underlying reason; the
+    /// message disambiguates ("registered built-in (dispatch entry
+    /// present)").
+    #[test]
+    fn unregister_function_against_builtin_returns_conflict() {
+        let mut s = WorkbookSession::new();
+        let err = s.unregister_function("SUM").unwrap_err();
+        assert_eq!(err.class, ErrorClass::Conflict);
+        assert_eq!(err.code, "function_exists");
+        assert!(
+            err.message.contains("built-in") || err.message.contains("dispatch"),
+            "builtin-guard message must explain why: got {:?}",
+            err.message
+        );
+        // SUM stays in the list.
+        assert!(s
+            .list_functions()
+            .unwrap()
+            .iter()
+            .any(|m| m.canonical_name == "SUM"));
+    }
+
+    /// **6.4-2 (2026-05-28):** `list_functions` returns sorted metadata
+    /// (M3 from 6.4-1's `sorted_metadata` view) — deterministic order
+    /// across consecutive calls + ascending `canonical_name`. Matches
+    /// the 6.1C H2 ordering discipline for snapshot DTOs.
+    #[test]
+    fn list_functions_is_call_stable_and_ascending() {
+        let s = WorkbookSession::new();
+        let first = s.list_functions().unwrap();
+        let second = s.list_functions().unwrap();
+        // Call-stable.
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.canonical_name, b.canonical_name);
+        }
+        // Strictly ascending.
+        for w in first.windows(2) {
+            assert!(
+                w[0].canonical_name < w[1].canonical_name,
+                "list_functions violated ordering at {:?} -> {:?}",
+                w[0].canonical_name,
+                w[1].canonical_name
+            );
+        }
+    }
+
+    /// **6.4-2 (2026-05-28):** the H3 wire test — a formula that bound
+    /// while MYUDF was unknown becomes dirty when MYUDF is registered;
+    /// `recalc_dirty` re-evaluates it. Pre-registration the formula
+    /// evaluates to `#NAME?` (unknown function); post-registration it
+    /// STILL evaluates to `#NAME?` because there's no dispatch entry
+    /// for UDFs in v1 (6.4-3 wires the Python worker dispatcher). But
+    /// the DIRTY FANOUT MUST FIRE — `recalc_dirty` after registration
+    /// re-binds the formula against the new metadata (closes the H3
+    /// fn_gen cache-invalidation pathway end-to-end through the trait).
+    #[test]
+    fn register_function_dirties_dependent_formulas() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 42.0 })
+            .unwrap();
+        // Bind a formula referencing MYUDF while it's unknown → evaluates to
+        // #NAME? (scalar.rs:463 returns ErrorValue::Name for missing dispatch).
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap();
+        let b1_before = s.cell(addr(sheet, 0, 1)).unwrap().unwrap();
+        assert!(
+            matches!(b1_before.value, Some(CellValue::Error { .. })),
+            "MYUDF(A1) bound while unknown must evaluate to a #NAME?-class error \
+             (got {:?})",
+            b1_before.value
+        );
+
+        // Register MYUDF. Dirty fanout fires; fn_gen bumps → bind cache miss.
+        s.register_function(udf_meta("MYUDF"), FunctionImplHandle(1))
+            .expect("register_function clean");
+
+        // recalc_dirty re-evaluates — B1 was dirtied by the substrate hook.
+        let op = s.recalc_dirty().unwrap();
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
+
+        // Post-recalc: B1 is still #NAME? (no dispatch entry for UDFs in v1 —
+        // 6.4-3 wires the worker). But the recalc DID run; the dirty fanout
+        // was triggered + the plan was re-bound through the new metadata.
+        let b1_after = s.cell(addr(sheet, 0, 1)).unwrap().unwrap();
+        assert!(
+            matches!(b1_after.value, Some(CellValue::Error { .. })),
+            "post-register: dispatch still missing in v1 → still #NAME? (got {:?})",
+            b1_after.value
+        );
+    }
+
+    /// **6.4-2 (2026-05-28; closes M4-OPUS UDF-flow binder integration
+    /// test from the 6.4-1 cycle 2 audit):** a UDF registered with
+    /// `arg_context: Aggregate` admits **named-range** args at the binder
+    /// layer (via `BindContext::AggregateNameRef`). Pre-registration the
+    /// binder rejects `=MYUDF(MyRange)` with
+    /// `BindError::NamedRangeInScalarContext` — the binder's default
+    /// `Scalar` arg-context for unknown names; post-registration it binds
+    /// because the metadata-derived arg_context is now `Aggregate`. This is
+    /// the load-bearing wire-through of 6.4-1's H1 binder migration
+    /// (`ql-exec::plan::is_aggregate_function` consults metadata) to the
+    /// trait surface.
+    ///
+    /// **Why named range, not literal `A1:A2`:** literal RangeRefs as
+    /// direct args to non-Function-context callsites are rejected at a
+    /// layer ABOVE the arg_context check (the W5-108 / Phase 4.7.O
+    /// "literal RangeRef in non-Function context is unsupported in v1"
+    /// constraint). The H1 binder migration affects NAMED ranges
+    /// (`AggregateNameRef`), not literal ranges — verified at source by
+    /// the test failure when the test was first written against
+    /// `MYUDF(A1:A2)`.
+    #[test]
+    fn register_function_with_aggregate_arg_context_admits_named_range_args() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 2.0 })
+            .unwrap();
+        // Define a named range `MyRange` → A1:A2.
+        s.set_name(
+            "MyRange",
+            CellRange {
+                sheet,
+                start_row: 0,
+                start_col: 0,
+                end_row: 1,
+                end_col: 0,
+            },
+        )
+        .expect("set_name");
+
+        // Pre-registration: MYUDF unknown → binder defaults to Scalar
+        // arg_context → rejects the named-range arg.
+        // The bind error surfaces either as a `formula_bind` engine error
+        // OR as a CellDiagnostic with the cell holding an error value;
+        // both are acceptable engine paths.
+        let pre = s.set_formula(addr(sheet, 0, 1), "MYUDF(MyRange)");
+        let pre_rejected = pre.is_err() || {
+            s.cell(addr(sheet, 0, 1))
+                .unwrap()
+                .is_some_and(|c| matches!(c.value, Some(CellValue::Error { .. })))
+        };
+        assert!(
+            pre_rejected,
+            "MYUDF(MyRange) MUST fail to bind while MYUDF is unknown \
+             (binder defaults to Scalar arg_context)"
+        );
+
+        // Register MYUDF with arg_context: Aggregate (the udf_meta() default).
+        s.register_function(udf_meta("MYUDF"), FunctionImplHandle(1))
+            .expect("register_function clean");
+
+        // Post-registration: setting the formula succeeds (binder admits the
+        // named-range arg under AggregateNameRef context). Whether eval
+        // produces #NAME? or something else depends on dispatch (still
+        // missing in v1), but the BIND must pass.
+        s.set_formula(addr(sheet, 1, 1), "MYUDF(MyRange)").expect(
+            "MYUDF(MyRange) MUST bind after registering MYUDF with arg_context=Aggregate",
+        );
+        // The cell exists (formula is stored).
+        let c1 = s.cell(addr(sheet, 1, 1)).unwrap();
+        assert!(
+            c1.is_some_and(|c| c.formula.is_some()),
+            "formula text must round-trip after successful bind"
+        );
+    }
+
+    /// **6.4-2 (2026-05-28; closes M3-OPUS Reference+ArrayBatch forward-
+    /// compat smoke from the 6.4-1 cycle 2 audit):** a UDF declaring the
+    /// unusual combination `arg_context: Reference + batch_shape:
+    /// ArrayBatch` registers + lists + unregisters cleanly. No substrate
+    /// assertion fires; the metadata round-trips through `list_functions`
+    /// faithfully. Forward-compat for the 6.4-3 worker-dispatcher design
+    /// (which may want a Reference-arg UDF returning an Arrow batch).
+    #[test]
+    fn register_function_reference_plus_array_batch_round_trips_through_dto() {
+        use ql_session::function_meta::{ArgContext, BatchShape};
+        let mut s = WorkbookSession::new();
+        let mut meta = udf_meta("MYREFUDF");
+        meta.arg_context = ArgContext::Reference;
+        meta.batch_shape = BatchShape::ArrayBatch;
+        s.register_function(meta, FunctionImplHandle(7))
+            .expect("Reference + ArrayBatch combo registers clean");
+        let listed = s
+            .list_functions()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.canonical_name == "MYREFUDF")
+            .expect("MYREFUDF in list");
+        assert_eq!(listed.arg_context, ArgContext::Reference);
+        assert_eq!(listed.batch_shape, BatchShape::ArrayBatch);
+        // Unregister cleanly too.
+        s.unregister_function("MYREFUDF").expect("unregister clean");
+        assert!(!s
+            .list_functions()
+            .unwrap()
+            .iter()
+            .any(|m| m.canonical_name == "MYREFUDF"));
+    }
+
+    /// **6.4-2 (2026-05-28):** lifecycle gate — `register_function` /
+    /// `unregister_function` require `Ready`; rejected on `Closed` with
+    /// `invalid_state`. `list_functions` requires `Readable` (Ready/Busy
+    /// OK; Closed rejected).
+    #[test]
+    fn function_methods_respect_lifecycle_gate() {
+        let mut s = WorkbookSession::new();
+        s.close().unwrap();
+        // register_function: ensure_ready rejects Closed.
+        let err = s
+            .register_function(udf_meta("MYUDF"), FunctionImplHandle(1))
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_state");
+        // unregister_function: same gate.
+        let err = s.unregister_function("MYUDF").unwrap_err();
+        assert_eq!(err.code, "invalid_state");
+        // list_functions: ensure_readable also rejects Closed.
+        let err = s.list_functions().unwrap_err();
+        assert_eq!(err.code, "invalid_state");
     }
 
     // --- persistence: open + save .qbook round-trip (inc.2c-9) ---

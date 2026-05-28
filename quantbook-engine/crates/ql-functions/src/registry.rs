@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use ql_session::function_meta::{
     ArgContext, ArgPolicy, Arity, BatchShape, CancelPolicy, DepShape, FunctionMetadata, Volatility,
 };
+use ql_session::session::FunctionImplHandle;
 use ql_types::{ArrayValue, EvalContext, Value};
 
 use crate::context_aware_fns::ContextAwareFn;
@@ -234,6 +235,32 @@ pub struct FunctionRegistry {
     /// surface a panic the user can't act on, and `wrapping_add` would
     /// re-collide with prior cache keys (the failure mode H3 closes!).
     fn_gen: u64,
+    /// **6.4-2 (2026-05-28):** opaque dispatch-handle for UDFs, indexed by
+    /// canonical (ASCII-uppercase) name — parallel to [`Self::metadata`]
+    /// but populated **only for UDFs** (built-ins have no handle; their
+    /// dispatch goes through the static [`Self::fns`] table). Stored on
+    /// `FunctionRegistry` rather than on `WorkbookSession` so the
+    /// substrate stays the single authority on function identity — when
+    /// 6.4-3 wires the Python-worker dispatcher, the lookup is one
+    /// `registry.udf_handle(name)` call, not a two-table cross-check.
+    ///
+    /// **Invariant:** every key here also has an entry in [`Self::metadata`]
+    /// (the only way to insert is via [`Self::register_udf`], which calls
+    /// [`Self::register_metadata`] first; the only way to remove is via
+    /// [`Self::unregister_metadata`], which clears both atomically after
+    /// the builtin-guard). NO key here ever overlaps with [`Self::fns`]:
+    /// the builtin-guard in `unregister_metadata` ensures UDFs never share
+    /// a name with a built-in (and `register_udf` runs through the same
+    /// `register_metadata` Conflict check that rejects built-in collisions
+    /// via metadata-already-present).
+    ///
+    /// **No `fn_gen` bump on handle-only mutation:** handle inserts /
+    /// removals happen ATOMICALLY with metadata mutations through
+    /// `register_udf` / `unregister_metadata` (both of which already bump
+    /// `fn_gen`). Exposing a stand-alone "set the handle for an existing
+    /// metadata entry" path would invite a fn_gen-skew bug; we don't ship
+    /// one in v1.
+    udf_handles: HashMap<String, FunctionImplHandle>,
 }
 
 impl Default for FunctionRegistry {
@@ -254,6 +281,10 @@ impl FunctionRegistry {
             // the value at bind time so a cache hit only happens if the
             // metadata snapshot is unchanged since the bind.
             fn_gen: 0,
+            // **6.4-2 (2026-05-28):** empty at boot — built-ins have no
+            // handle (their dispatch goes through `fns`). UDFs add entries
+            // via [`Self::register_udf`].
+            udf_handles: HashMap::new(),
         }
     }
 
@@ -390,6 +421,24 @@ impl FunctionRegistry {
             });
         }
         if self.metadata.remove(&upper).is_some() {
+            // **6.4-2 (2026-05-28):** symmetric handle cleanup. The
+            // builtin-guard above ensures the metadata being removed is
+            // UDF-only, so `udf_handles` MAY or MAY NOT carry a matching
+            // entry:
+            // - YES if the metadata was registered via
+            //   [`Self::register_udf`] (the 6.4-2 trait-wiring path) —
+            //   handle inserted alongside.
+            // - NO if the metadata was registered via the lower-level
+            //   [`Self::register_metadata`] (e.g., a test-only path that
+            //   bypasses the trait method's combined registration).
+            // The `remove` returns `Option`; we ignore the return because
+            // a missing handle is NOT an error here — it just means the
+            // UDF was metadata-only. The metadata removal already pinned
+            // the success-path; the handle removal is a defense-in-depth
+            // cleanup that leaves the invariant
+            // "every key in `udf_handles` has a matching `metadata` entry"
+            // intact even if a future code path registers metadata-only.
+            self.udf_handles.remove(&upper);
             // **6.4-1 (2026-05-28; H3):** symmetric `fn_gen` bump on
             // successful removal. A `NotFound` returned below leaves the
             // counter alone (metadata table unchanged → cache stays
@@ -401,6 +450,63 @@ impl FunctionRegistry {
                 name: canonical_name.to_string(),
             })
         }
+    }
+
+    /// **6.4-2 (2026-05-28):** combined UDF-metadata + dispatch-handle
+    /// registration. Used by `WorkbookSession::register_function` (the
+    /// 6.4-2 trait-wiring sub-increment); built-ins use the metadata-only
+    /// path at boot via [`register_builtin_metadata`].
+    ///
+    /// **Atomicity:** the metadata insertion happens first (via
+    /// [`Self::register_metadata`]); only on its `Ok` does the handle
+    /// land in [`Self::udf_handles`]. A `Conflict` from
+    /// `register_metadata` short-circuits BEFORE the handle insert, so
+    /// the registry never observes a state with a handle but no
+    /// metadata (the inverse — metadata without handle — is the normal
+    /// state for built-ins and metadata-only test registrations).
+    /// `HashMap::insert` itself cannot fail, so once `register_metadata`
+    /// succeeds, the handle insertion is infallible.
+    ///
+    /// **Single `fn_gen` bump:** the bump happens inside
+    /// [`Self::register_metadata`]; the handle insertion does NOT add
+    /// another bump. Bind cache invalidation is keyed by metadata mutation,
+    /// not by handle mutation — UDF dispatch consults the handle table at
+    /// eval time, not at bind time.
+    ///
+    /// Returns the same [`FunctionRegistryError`] taxonomy as
+    /// [`Self::register_metadata`]: `Conflict` on duplicate canonical name
+    /// (built-in or existing UDF). The `WorkbookSession` trait method
+    /// translates this via `map_function_registry_err` to the
+    /// contract-§10.3 `EngineError{class:Conflict, code:"function_exists"}`.
+    pub fn register_udf(
+        &mut self,
+        meta: FunctionMetadata,
+        handle: FunctionImplHandle,
+    ) -> Result<(), FunctionRegistryError> {
+        // Stash the canonical name BEFORE `register_metadata` moves `meta`
+        // into the table — needed as the `udf_handles` key.
+        let canonical_name = meta.canonical_name.clone();
+        self.register_metadata(meta)?;
+        // `register_metadata` succeeded → metadata is in the table and
+        // `fn_gen` ticked. Insert the handle under the same canonical key.
+        // HashMap::insert can't fail; the prior value (if any) was already
+        // ruled out by the `Conflict` check inside `register_metadata`.
+        self.udf_handles.insert(canonical_name, handle);
+        Ok(())
+    }
+
+    /// **6.4-2 (2026-05-28):** read the dispatch handle for a UDF by
+    /// canonical name (case-insensitive — uppercases the query for
+    /// symmetry with [`Self::metadata`]). Returns `None` for built-ins
+    /// (no handle), for unknown names, and for UDFs registered
+    /// metadata-only via the lower-level [`Self::register_metadata`].
+    ///
+    /// 6.4-3's worker dispatcher will call this at eval time to route
+    /// `RegisteredFn::Udf(_)` calls to the Python worker process; v1
+    /// substrate just owns the storage.
+    pub fn udf_handle(&self, canonical_name: &str) -> Option<FunctionImplHandle> {
+        let upper = canonical_name.to_ascii_uppercase();
+        self.udf_handles.get(upper.as_str()).copied()
     }
 
     /// Iterator over every registered `FunctionMetadata`. Used by the
@@ -2732,6 +2838,170 @@ mod tests {
             r.fn_generation(),
             snapshot,
             "failed unregister_metadata (builtin Conflict) MUST leave fn_gen untouched"
+        );
+    }
+
+    // ===== 6.4-2 trait-wiring substrate tests ============================
+
+    /// **6.4-2 (2026-05-28):** the `register_udf` combined path inserts
+    /// BOTH metadata + handle atomically; `udf_handle` reads back what
+    /// was stored. Pairs with the `WorkbookSession::register_function`
+    /// trait method that calls `register_udf` from the engine side.
+    #[test]
+    fn register_udf_inserts_metadata_and_handle_atomically() {
+        let mut r = default_registry();
+        let initial_gen = r.fn_generation();
+        let meta = FunctionMetadata {
+            canonical_name: "MYUDF".to_string(),
+            display_name: Some("My UDF".to_string()),
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Volatile,
+            determinism: false,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::ArrayBatch,
+            arg_policy: ArgPolicy::Strict,
+            cancellation: CancelPolicy::WorkerKill,
+            arg_context: ArgContext::Aggregate,
+            provenance_tags: vec!["python".to_string()],
+        };
+        let handle = FunctionImplHandle(0xDEAD_BEEF);
+        r.register_udf(meta, handle).expect("register_udf clean");
+        // Metadata side: present + faithful.
+        let got = r.metadata("MYUDF").expect("metadata present");
+        assert_eq!(got.volatility, Volatility::Volatile);
+        assert_eq!(got.batch_shape, BatchShape::ArrayBatch);
+        assert_eq!(got.arg_context, ArgContext::Aggregate);
+        // Handle side: present + faithful; case-insensitive lookup.
+        assert_eq!(r.udf_handle("MYUDF"), Some(handle));
+        assert_eq!(
+            r.udf_handle("myudf"),
+            Some(handle),
+            "udf_handle MUST be case-insensitive"
+        );
+        // Single fn_gen bump (from the inner register_metadata).
+        assert_eq!(
+            r.fn_generation(),
+            initial_gen + 1,
+            "register_udf MUST bump fn_gen exactly once (via register_metadata)"
+        );
+    }
+
+    /// **6.4-2 (2026-05-28):** built-ins have no UDF handle — the
+    /// `udf_handles` table only carries UDF entries. Verifies the
+    /// invariant that `udf_handle(builtin_name) == None` even though
+    /// `metadata(builtin_name)` is `Some`.
+    #[test]
+    fn udf_handle_returns_none_for_builtins_and_unknown_names() {
+        let r = default_registry();
+        // SUM is a built-in: has metadata but no UDF handle.
+        assert!(r.metadata("SUM").is_some());
+        assert_eq!(r.udf_handle("SUM"), None);
+        // ROW (also built-in, reference-aware): same.
+        assert!(r.metadata("ROW").is_some());
+        assert_eq!(r.udf_handle("ROW"), None);
+        // Unknown name: None on both sides.
+        assert!(r.metadata("MYUDF").is_none());
+        assert_eq!(r.udf_handle("MYUDF"), None);
+    }
+
+    /// **6.4-2 (2026-05-28):** `unregister_metadata` removes the
+    /// matching `udf_handles` entry symmetrically — closes the invariant
+    /// "every key in `udf_handles` has a matching `metadata` entry."
+    /// Without this, a register-then-unregister-then-re-register-as-
+    /// metadata-only sequence would leak the stale handle.
+    #[test]
+    fn unregister_metadata_clears_udf_handle_symmetrically() {
+        let mut r = default_registry();
+        let meta = FunctionMetadata {
+            canonical_name: "MYUDF".to_string(),
+            display_name: None,
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Pure,
+            determinism: true,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::Scalar,
+            arg_policy: ArgPolicy::Coercing,
+            cancellation: CancelPolicy::Cooperative,
+            arg_context: ArgContext::Scalar,
+            provenance_tags: vec![],
+        };
+        r.register_udf(meta, FunctionImplHandle(42))
+            .expect("register_udf clean");
+        assert!(r.udf_handle("MYUDF").is_some());
+        r.unregister_metadata("MYUDF").expect("unregister clean");
+        // Handle is cleared atomically with the metadata removal.
+        assert_eq!(
+            r.udf_handle("MYUDF"),
+            None,
+            "unregister_metadata MUST clear the matching udf_handles entry"
+        );
+    }
+
+    /// **6.4-2 (2026-05-28):** the atomicity property — if
+    /// `register_udf`'s inner `register_metadata` call returns
+    /// `Conflict`, the handle table is NOT mutated (the early-return
+    /// happens before the `udf_handles.insert` line). This pins the
+    /// "metadata-first, handle-second-only-on-success" invariant: an
+    /// auditor reading this test understands that a partial state
+    /// (handle without metadata) is impossible.
+    #[test]
+    fn register_udf_conflict_does_not_insert_handle() {
+        let mut r = default_registry();
+        // Pre-register MYUDF metadata directly (no handle).
+        let meta = FunctionMetadata {
+            canonical_name: "MYUDF".to_string(),
+            display_name: None,
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Pure,
+            determinism: true,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::Scalar,
+            arg_policy: ArgPolicy::Coercing,
+            cancellation: CancelPolicy::Cooperative,
+            arg_context: ArgContext::Scalar,
+            provenance_tags: vec![],
+        };
+        r.register_metadata(meta).expect("metadata-only registers");
+        assert_eq!(r.udf_handle("MYUDF"), None, "metadata-only path leaves handle empty");
+
+        // Now register_udf with a colliding name → Conflict → handle MUST stay empty.
+        let dup_meta = FunctionMetadata {
+            canonical_name: "MYUDF".to_string(),
+            display_name: None,
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Volatile,
+            determinism: false,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::ArrayBatch,
+            arg_policy: ArgPolicy::Strict,
+            cancellation: CancelPolicy::WorkerKill,
+            arg_context: ArgContext::Aggregate,
+            provenance_tags: vec![],
+        };
+        let err = r
+            .register_udf(dup_meta, FunctionImplHandle(99))
+            .expect_err("collision MUST surface as Conflict");
+        assert!(matches!(
+            err,
+            FunctionRegistryError::Conflict { ref name } if name == "MYUDF"
+        ));
+        assert_eq!(
+            r.udf_handle("MYUDF"),
+            None,
+            "Conflict short-circuits BEFORE udf_handles.insert — no partial state"
+        );
+
+        // The prior metadata-only entry is UNCHANGED — the conflicting
+        // register_metadata never reached the `metadata.insert` line
+        // either, so the original Volatility::Pure entry survives.
+        assert_eq!(
+            r.metadata("MYUDF").unwrap().volatility,
+            Volatility::Pure,
+            "register_udf Conflict MUST NOT overwrite the existing metadata"
         );
     }
 }

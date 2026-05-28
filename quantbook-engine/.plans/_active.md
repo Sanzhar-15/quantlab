@@ -399,14 +399,159 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      xlsx-write`; `cargo test -p ql-exec --tests` all integration suites green; `cargo test -p
      ql-functions --lib` **1820/0**; clippy clean for edits; Node smoke PASS through fresh-built
      audit-fix cdylib.
-   - ⭐ **NEXT — 6.4-2 engine trait wiring** (decision-lock §2 item 6 continued): implement
+   - ⭐ **IN-PROGRESS — 6.4-2 engine trait wiring** (decision-lock §2 item 6 continued, 2026-05-28
+     fresh-session takeover after 6.4-1 doc-sync handoff). Implement
      `WorkbookSession::register_function` / `unregister_function` / `list_functions` (currently
-     `not_implemented_in_v1_core`). Each method calls the substrate building blocks: registry
-     `register_metadata` / `unregister_metadata` / `sorted_metadata` + calcgraph
-     `on_function_(un)registered` + the M5 `map_function_registry_err` mapper. Surface the
+     `not_implemented_in_v1_core` at `crates/ql-exec/src/session.rs:2423-2437`). Each method calls
+     the substrate building blocks: registry `register_metadata` / `unregister_metadata` /
+     `sorted_metadata` + calcgraph `on_function_(un)registered` + the M5 `map_function_registry_err`
+     mapper (currently `#[allow(dead_code)]` at `session.rs:2878` — remove the gate). Surface the
      methods over napi (extends `Session` class beyond its 11-method 6.1C surface). Update IDE
-     `parseQuantbookError` allowlist for `function_exists` / `function_not_found` codes. Then
-     **6.4-3 Python worker + Arrow exchange + debugpy** (the most substantial sub-increment;
+     `parseQuantbookError` allowlist for `function_exists` / `function_not_found` codes.
+
+     **Cycle budget (CLAUDE.md):** ≤2 plan-implement-audit cycles per session. Cycle 1 = engine +
+     napi + IDE allowlist + tests; cycle 2 = parallel 2-way audit (Codex `gpt-5.5 xhigh` + Opus
+     reviewer) + audit-fix; doc-sync separate. The substrate-completion shape (no Send/Sync change,
+     no IO, narrow new FFI surface) puts this at 2-way per the audit-discipline memory rule 2 — the
+     6.4-3 cross-repo Python-worker increment is the one that earns the 3-way (engine+Opus+IDE).
+
+     **Design calls (locked in this plan; revisit in audit if challenged):**
+     1. **UDF handle storage:** new `udf_handles: HashMap<String, FunctionImplHandle>` field on
+        `FunctionRegistry`, parallel to `metadata` (matches the 6.4-0 audit's filed-design note
+        "likely a HashMap<String, FunctionImplHandle> on FunctionRegistry parallel to metadata,
+        populated only for UDFs"). The registry IS the authority on function identity; the handle
+        is the dispatch-pointer for UDFs (vs the static fn pointer for built-ins). 6.4-3's worker
+        dispatcher will look up `registry.udf_handle(name)` to invoke the Python worker.
+     2. **Atomic register flow:** new `FunctionRegistry::register_udf(meta, handle)` combined
+        method that calls `register_metadata` (which can fail Conflict) then inserts the handle on
+        success (HashMap::insert can't fail). Single `fn_gen` bump (inside register_metadata).
+        Symmetric `unregister_metadata` extended to ALSO clear any matching `udf_handles` entry
+        (the builtin-guard at `registry.rs:382-394` already prevents removing builtin metadata, so
+        the handle-removal is implicitly UDF-only). No separate `unregister_udf` needed — keeps
+        the existing 6.4-0/6.4-1 invariant tests valid.
+     3. **Arc::make_mut on registry:** the production-path mutation is
+        `Arc::make_mut(&mut self.registry).register_udf(meta, handle)?`. Strong count is 1 in the
+        normal flow (open/import's Arc::clone-then-drop pattern releases before mutation), so
+        make_mut is O(1) (no clone). The session is single-writer so no concurrent reader.
+     4. **Lifecycle gate:** `register_function`/`unregister_function` use `ensure_ready` (matches
+        `register_format`/`add_sheet`/etc. — mutation gate; rejects Busy/Closed/New/Faulted).
+        `list_functions` uses `ensure_readable` (matches `snapshot`/`cell`/`list_sheets` —
+        Ready+Busy OK, New/Closed/Faulted rejected). NO FaultGuard wrap because no Workbook
+        mutation through `with_runtime` — the registry mutation is pure HashMap work; failure
+        modes are Conflict/NotFound (caller errors, not invariant breaks).
+     5. **No event emission v1:** `register_function` does NOT emit `Event::StructureChanged`
+        (function registration isn't a structural change in the §3.3 sense — sheet/table/name).
+        Contract §9 doesn't list it; leave to a future increment if observability demands it.
+     6. **napi DTO:** new `FunctionMetadataJson` `#[napi(object)]` mirror + enum-string mappings
+        (volatility/dep_shape/batch_shape/arg_policy/cancellation/arg_context) + nested
+        `ArityJson` (kind: "fixed"|"range"|"variadic" + n/min/max). Conversion fns:
+        `metadata_from_json` (JS→Rust; rejects unknown enum strings as `bad_argument`),
+        `metadata_to_json` (Rust→JS; total). `FunctionImplHandle(u64)` over napi as `BigInt`
+        (matches `OperationId` convention at `lib.rs:4351`).
+     7. **Cross-repo IDE allowlist:** ONLY the 2 new codes (`function_exists`, `function_not_found`)
+        added to `KNOWN_QUANTBOOK_ERROR_CODE_RECORD` + the `QuantbookErrorCode` type union. The
+        broader 6.1C-carryover H1 (~25 missing codes) STAYS deferred to 6.3 per the lock — not
+        load-bearing for 6.4-2's wedge.
+
+     **Cycle 1 (CODE) checklist:**
+     - [ ] `crates/ql-functions/src/registry.rs`:
+       - [ ] Add `udf_handles: HashMap<String, FunctionImplHandle>` field on `FunctionRegistry`.
+       - [ ] Add `pub fn register_udf(&mut self, meta, handle) -> Result<...>` (calls
+             `register_metadata` then inserts handle on success).
+       - [ ] Add `pub fn udf_handle(&self, canonical_name: &str) -> Option<FunctionImplHandle>`.
+       - [ ] Extend `unregister_metadata` to ALSO remove from `udf_handles` (after builtin-guard).
+             Update its doc to describe the symmetric removal.
+       - [ ] Add `use ql_session::FunctionImplHandle` import.
+       - [ ] Tests: `register_udf_inserts_metadata_and_handle`,
+             `udf_handle_returns_none_for_builtins`,
+             `unregister_metadata_clears_udf_handle_symmetrically`,
+             `register_udf_conflict_does_not_insert_handle` (test the atomicity property).
+     - [ ] `crates/ql-exec/src/session.rs`:
+       - [ ] Replace `register_function` stub with real impl: ensure_ready + Arc::make_mut +
+             registry.register_udf + on_function_registered + map_function_registry_err.
+       - [ ] Replace `unregister_function` stub with real impl: ensure_ready + Arc::make_mut +
+             registry.unregister_metadata + on_function_unregistered.
+       - [ ] Replace `list_functions` stub with real impl: ensure_readable +
+             self.registry.sorted_metadata().into_iter().cloned().collect().
+       - [ ] Remove `#[allow(dead_code)]` from `map_function_registry_err` at `:2878`.
+       - [ ] Remove `list_functions` from `deferred_methods_surface_capability_error` test at
+             `:2992-3009` (it's now real); keep the test for the actually-still-deferred methods
+             (`write_range`/`publish_dataset`/`bind_range`/`refresh_source`/`materialize_query`).
+       - [ ] New tests in the `mod tests` block (closes 6.4-1 cycle 2 filed items M3-OPUS + M4-OPUS):
+         - [ ] `register_function_succeeds_and_list_functions_includes_it`
+         - [ ] `register_function_duplicate_returns_conflict_function_exists`
+         - [ ] `register_function_against_builtin_returns_conflict`
+         - [ ] `unregister_function_returns_not_found_for_unknown`
+         - [ ] `unregister_function_against_builtin_returns_conflict`
+         - [ ] `list_functions_returns_sorted_metadata` (calls list twice; equal vecs; check
+               canonical_name ascending; len() includes all built-ins post-register).
+         - [ ] `register_function_dirties_dependent_formulas_then_recompute_clears_them`
+               (the H3 wire test: `=MYUDF(A1)` binds while unknown → register MYUDF (Volatile) →
+               recalc_dirty re-evaluates → cell becomes #NAME? value since dispatch is missing,
+               but the dirty fanout DID fire + plan-cache invalidation works).
+         - [ ] `register_function_with_aggregate_arg_context_admits_range_args` (the M4-OPUS UDF-
+               flow binder integration test: stub UDF with arg_context=Aggregate; `=MYUDF(A:A)`
+               binds successfully; without registration, binder rejects with
+               `NamedRangeInScalarContext`).
+         - [ ] `register_function_reference_plus_array_batch_round_trips` (M3-OPUS forward-compat:
+               metadata with `arg_context: Reference + batch_shape: ArrayBatch` registers + lists
+               + unregisters cleanly; no engine assertion fires).
+         - [ ] `register_function_closed_session_invalid_state` (lifecycle gate).
+     - [ ] `crates/ql-bindings-node/src/lib.rs`:
+       - [ ] Add `FunctionMetadataJson` `#[napi(object)]` + nested `ArityJson` DTOs.
+       - [ ] Add enum-string conversion helpers
+             (`volatility_to_str`/`str_to_volatility`/etc.) — 6 enums; each unknown-string-input
+             surfaces a `bad_argument_error` (No-Fallbacks).
+       - [ ] Add 3 `#[napi]` methods on `Session`: `registerFunction(metadata, implHandle:
+             BigInt) -> Result<()>`, `unregisterFunction(canonicalName: String) -> Result<()>`,
+             `listFunctions() -> Result<Vec<FunctionMetadataJson>>`.
+       - [ ] Import `FunctionImplHandle` from ql_session.
+     - [ ] `crates/ql-bindings-node/tests/smoke_session.mjs`:
+       - [ ] Add UDF round-trip: register → list (includes MYUDF) → unregister → list (excludes).
+       - [ ] Negative cases: duplicate register → function_exists; unregister-unknown →
+             function_not_found.
+     - [ ] **Cross-repo IDE** (`/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab`, branch
+           `feat/visualise-v1`):
+       - [ ] `extensions/quantlab/src/quantbook/session.ts`: add `function_exists: true` and
+             `function_not_found: true` to `KNOWN_QUANTBOOK_ERROR_CODE_RECORD`.
+       - [ ] Find `QuantbookErrorCode` type union (likely in `types.ts` or same file); add
+             `'function_exists'` + `'function_not_found'`.
+       - [ ] Separate IDE-side commit on `feat/visualise-v1`.
+     - [ ] **Verification:**
+       - [ ] `cargo check --workspace` clean.
+       - [ ] `cargo test -p ql-functions --lib` — expect 1820 + ~4 new = ~1824/0.
+       - [ ] `cargo test -p ql-exec --lib` default + `--features xlsx-write` — expect 743 +
+             ~10 new = ~753/0.
+       - [ ] `cargo test -p ql-exec --tests` — all integration suites still green.
+       - [ ] `cargo clippy -p ql-functions -p ql-exec -p ql-session -p ql-bindings-node
+             --all-targets` clean for edits.
+       - [ ] `node crates/ql-bindings-node/tests/smoke_session.mjs` PASS after touching `lib.rs`
+             + `cargo build -p ql-bindings-node` to rebuild the cdylib.
+       - [ ] (Cross-repo) IDE typecheck on `feat/visualise-v1` (`npm run -s typecheck` or
+             equivalent) — confirm the new codes type-check.
+
+     **Cycle 2 (AUDIT + AUDIT-FIX):**
+     - [ ] Parallel 2-way audit: Codex (`gpt-5.5 xhigh` via `codex exec -s read-only`) + Opus
+           reviewer agent (fresh-context, general-purpose). Audit scope: trait wiring correctness,
+           Arc::make_mut soundness (no aliasing during mutation), atomicity of register_udf (no
+           handle-without-metadata window), lifecycle gate coverage (`ensure_ready` for mutators,
+           `ensure_readable` for read), unregister symmetric handle clearing, napi DTO round-trip
+           soundness (every enum value preserved, unknown JS strings rejected loudly), IDE-side
+           allowlist drift (the cross-repo wire-contract: codes engine emits ↔ codes IDE knows
+           about).
+     - [ ] Synthesis at `docs/audits/2026-05-XX-6-4-2-trait-wiring-audit/SYNTHESIS.md`.
+     - [ ] Audit-fix commit closes any HIGH/MED.
+
+     **Doc-sync (separate commit per project convention):**
+     - [ ] `docs/MASTER-PLAN.md`: 6.4-2 SHIPPED entry before 6.4-1.
+     - [ ] `docs/api/session-api.md` §10.3 / §10.5: mark `register_function` / `unregister_function`
+           / `list_functions` IMPLEMENTED in 6.4-2; update Appendix A `function_exists` /
+           `function_not_found` rows to reflect they're now wire-live (not just M5-mapper-ready).
+     - [ ] `docs/api/workbook-session-impl-plan.md` §0: 6.4-2 SHIPPED entry.
+     - [ ] `.plans/_active.md`: this section transitions from ⭐IN-PROGRESS to ✅SHIPPED.
+     - [ ] Memory: `current_work.md` + `MEMORY.md` pointer updated for 6.4-2.
+
+     Then **6.4-3 Python worker + Arrow exchange + debugpy** (the most substantial sub-increment;
      3-way audit), then **6.4-4 exit-tests + closure megaudit** (5-way). Tracked cross-cutting:
      `Sheet::iter_effective_cells()` serializer fix (still pending).
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
