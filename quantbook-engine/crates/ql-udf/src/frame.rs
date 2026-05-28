@@ -74,9 +74,12 @@ pub enum FrameError {
     /// The type byte was not a known [`FrameType`].
     #[error("frame: unknown frame type tag {0}")]
     UnknownType(u8),
-    /// A frame payload exceeded the sanity cap.
+    /// A frame payload exceeded the sanity cap. Carries the ACTUAL declared/total
+    /// length (`u64`, since the write side computes `1 + payload.len()` before the
+    /// `u32` narrowing) — not the cap — so the diagnostic is symmetric across the
+    /// read and write sides (6.4-3a audit-fix: `write-too-large-report`).
     #[error("frame: length {0} exceeds the {MAX_FRAME_LEN}-byte cap")]
-    TooLarge(u32),
+    TooLarge(u64),
 }
 
 /// Sanity cap on a single frame (64 MiB). A larger declared length is rejected
@@ -88,7 +91,7 @@ pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 pub fn write_frame<W: Write>(w: &mut W, frame: &Frame) -> Result<(), FrameError> {
     let total = 1u64 + frame.payload.len() as u64;
     if total > u64::from(MAX_FRAME_LEN) {
-        return Err(FrameError::TooLarge(MAX_FRAME_LEN));
+        return Err(FrameError::TooLarge(total));
     }
     let total = total as u32;
     w.write_all(&total.to_le_bytes())?;
@@ -111,7 +114,7 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<Option<Frame>, FrameError> {
         return Err(FrameError::ZeroLength);
     }
     if total > MAX_FRAME_LEN {
-        return Err(FrameError::TooLarge(total));
+        return Err(FrameError::TooLarge(u64::from(total)));
     }
     let mut type_buf = [0u8; 1];
     r.read_exact(&mut type_buf)?;
@@ -209,7 +212,12 @@ mod tests {
         bytes.extend_from_slice(&(MAX_FRAME_LEN + 1).to_le_bytes());
         let mut cursor = std::io::Cursor::new(bytes);
         let e = read_frame(&mut cursor).unwrap_err();
-        assert!(matches!(e, FrameError::TooLarge(_)), "got {e:?}");
+        // 6.4-3a audit-fix (write-too-large-report): the carried length is the
+        // ACTUAL declared length, not the cap.
+        assert!(
+            matches!(e, FrameError::TooLarge(n) if n == u64::from(MAX_FRAME_LEN) + 1),
+            "got {e:?}"
+        );
     }
 
     #[test]

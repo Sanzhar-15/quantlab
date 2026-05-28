@@ -18,6 +18,15 @@ use crate::codec::CodecError;
 /// engine-side result at the call site (6.4-3c) — a cell error value + a
 /// `CellDiagnostic` — never a panic and never a silently-dropped failure
 /// (No-Fallbacks; contract §10.4 exit tests 6 + 7).
+///
+/// **6.4-3a audit-fix note (M3 — filed for 6.4-3b):** this taxonomy is
+/// intentionally INCOMPLETE for the Rust-only sliver. 6.4-3b (the real
+/// process-backed worker) will add at least `Cancelled` (a cooperative/hard cancel
+/// mapped to a cancel diagnostic, DISTINCT from `Timeout`/`#TIMEOUT!` — exit test 6
+/// treats user-cancel and deadline-breach differently) and a handshake/
+/// protocol-version-mismatch variant (the `HELLO`/`HELLO_ACK` exchange). They are
+/// deferred — not forgotten — because they only become exercisable once a real
+/// async pipe + handshake exist; the in-process `MockWorker` cannot reach them.
 #[derive(Debug, thiserror::Error)]
 pub enum UdfError {
     /// The Python callable raised. Maps to `#CALC!`/`#VALUE!` + a diagnostic
@@ -89,8 +98,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{decode_grid, encode_grid};
     use crate::frame::{read_frame, write_frame, Frame, FrameType};
+    use crate::payload::{decode_call, decode_return, encode_call, encode_return, CallPayload, ReturnPayload};
     use ql_types::Value;
     use std::sync::Arc;
 
@@ -137,11 +146,13 @@ mod tests {
         ));
     }
 
-    /// The load-bearing composition test: push args + result through the FULL
-    /// wire pipeline (codec → frame → … → frame → codec) with the mock standing
-    /// in for the worker process. Proves [`crate::codec`] + [`crate::frame`]
-    /// compose into a faithful round-trip — the thing the real 6.4-3b worker will
-    /// rely on across the actual pipe.
+    /// The load-bearing composition test: push a CALL (handle + call_id + args) and
+    /// its RETURN (call_id + result) through the FULL wire pipeline
+    /// (payload → frame → … → frame → payload) with the mock standing in for the
+    /// worker process. Proves [`crate::payload`] + [`crate::frame`] + [`crate::codec`]
+    /// compose into a faithful round-trip — the thing the real 6.4-3b worker relies
+    /// on across the actual pipe — AND that the dispatch `handle` + correlation
+    /// `call_id` survive the trip (6.4-3a audit-fix: `call-return-missing-ids`).
     #[test]
     fn call_round_trips_through_frame_and_codec() {
         // Engine-side args grid (a 1×3 row of mixed values).
@@ -155,28 +166,41 @@ mod tests {
             ],
         )
         .unwrap();
+        let call = CallPayload {
+            handle: 7,
+            call_id: 99,
+            args,
+        };
 
-        // --- engine → wire ---
-        let call_frame = Frame::new(FrameType::Call, encode_grid(&args).unwrap());
+        // --- engine → wire: typed CALL payload inside a Call frame ---
+        let call_frame = Frame::new(FrameType::Call, encode_call(&call).unwrap());
         let mut pipe = Vec::new();
         write_frame(&mut pipe, &call_frame).unwrap();
 
-        // --- worker side: read the CALL, decode, "run" the UDF, encode RETURN ---
+        // --- worker side: read the CALL, decode handle/call_id/args, "run" the UDF, encode RETURN ---
         let mut cursor = std::io::Cursor::new(pipe);
         let got = read_frame(&mut cursor).unwrap().expect("a frame");
         assert_eq!(got.frame_type, FrameType::Call);
-        let decoded_args = decode_grid(&got.payload).unwrap();
-        // The worker echoes its args back as the result (identity UDF).
-        let result = decoded_args.clone();
-        let return_frame = Frame::new(FrameType::Return, encode_grid(&result).unwrap());
+        let decoded_call = decode_call(&got.payload).unwrap();
+        assert_eq!(decoded_call.handle, 7, "handle survives the wire");
+        assert_eq!(decoded_call.call_id, 99, "call_id survives the wire");
+        // The worker echoes its args back as the result (identity UDF), correlating
+        // the RETURN to the originating call_id.
+        let ret = ReturnPayload {
+            call_id: decoded_call.call_id,
+            result: decoded_call.args.clone(),
+        };
+        let return_frame = Frame::new(FrameType::Return, encode_return(&ret).unwrap());
         let mut back = Vec::new();
         write_frame(&mut back, &return_frame).unwrap();
 
-        // --- wire → engine: read the RETURN, decode ---
+        // --- wire → engine: read the RETURN, decode, check correlation + grid ---
         let mut rcursor = std::io::Cursor::new(back);
         let rframe = read_frame(&mut rcursor).unwrap().expect("a frame");
         assert_eq!(rframe.frame_type, FrameType::Return);
-        let final_grid = decode_grid(&rframe.payload).unwrap();
+        let decoded_return = decode_return(&rframe.payload).unwrap();
+        assert_eq!(decoded_return.call_id, 99, "RETURN correlates to the CALL");
+        let final_grid = decoded_return.result;
 
         // The grid survived engine → Arrow → frame → Arrow → engine intact.
         assert_eq!(final_grid.rows(), 1);

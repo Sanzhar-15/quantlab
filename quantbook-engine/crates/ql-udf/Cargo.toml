@@ -19,9 +19,16 @@ path = "src/lib.rs"
 # at the dispatch site and injects a worker.
 ql-types = { path = "../ql-types" }
 
-# Arrow is already a pinned workspace dependency (used by ql-bench); the `arrow`
-# umbrella crate's default features include `ipc`, which we use for the on-wire
-# RecordBatch stream encoding.
-arrow = { workspace = true }
+# Arrow is already a pinned workspace dependency (used by ql-bench). **6.4-3a
+# audit-fix (M4):** declare the `ipc` feature EXPLICITLY (additively) rather than
+# silently relying on the umbrella crate's defaults — `ipc` is the one feature this
+# crate hard-depends on (`StreamReader`/`StreamWriter` for the on-wire RecordBatch
+# stream); `arrow-array`/`arrow-schema` (RecordBatch, the typed arrays, DataType/
+# Field/Schema) are non-optional and always present. Declaring `ipc` here keeps the
+# requirement visible AND robust to a future workspace-level `default-features =
+# false` (this crate would still pull `ipc`). NB: `default-features = false` on an
+# inherited workspace dep is ignored-with-warning unless the workspace sets it too,
+# so it is deliberately omitted here (the additive `features` is what matters).
+arrow = { workspace = true, features = ["ipc"] }
 
 thiserror = { workspace = true }

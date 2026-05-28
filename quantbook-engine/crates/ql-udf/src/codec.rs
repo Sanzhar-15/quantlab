@@ -20,6 +20,25 @@
 //! shapes (`rows==0` or `cols==0`, zero cells) round-trip faithfully. The encoding
 //! is deliberately verbose-but-unambiguous; a compact layout is a later optimization
 //! behind this same boundary.
+//!
+//! **Decode is a trust boundary (6.4-3a cycle-1 audit-fix).** The bytes a `RETURN`
+//! frame carries are produced by an out-of-process Python worker — possibly buggy
+//! or hostile. `decode_grid` therefore validates the batch BEFORE trusting it:
+//! - the schema must be EXACTLY the 5 expected fields, by name + Arrow type +
+//!   nullability, in order ([`validate_grid_schema`]) — so a `pyarrow` worker that
+//!   reorders/renames columns is rejected loudly rather than silently mis-read (the
+//!   two `Utf8` columns `str`/`err` are otherwise type-interchangeable);
+//! - the active payload column for each `kind` must be non-null (a null active slot
+//!   is a malformed response, not a silent `0.0`/`false`/`""`);
+//! - a decoded `number` must be finite (`NaN`/`Inf` from the worker is a malformed
+//!   result — the engine's `Value::Number` invariant is "always finite");
+//! - the stream must contain EXACTLY one record batch (trailing data is rejected).
+//!
+//! No code path reachable from worker-controlled bytes may panic — every failure is
+//! a loud [`CodecError`] (No-Fallbacks; design §5 / contract §10.4 exit tests 6+7).
+//! `encode_grid` trusts its input (engine-resident `Value`s already satisfy the
+//! finite-`Number` invariant); the validation above guards the untrusted *decode*
+//! direction.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -46,24 +65,45 @@ pub enum CodecError {
     /// The IPC stream contained no record batch.
     #[error("decode: empty IPC stream (expected exactly one record batch)")]
     Empty,
+    /// The IPC stream contained MORE than one record batch (expected exactly one).
+    #[error("decode: trailing data after the first record batch (expected exactly one)")]
+    TrailingBatch,
+    /// The batch schema was not the exact expected 5-field grid schema.
+    #[error("decode: bad grid schema ({0})")]
+    BadSchema(String),
     /// The schema metadata was missing the `rows`/`cols` shape keys.
     #[error("decode: missing '{0}' in schema metadata")]
     MissingShape(&'static str),
     /// A shape metadata value did not parse as a u32.
     #[error("decode: shape '{key}' = {value:?} is not a u32")]
     BadShape { key: &'static str, value: String },
+    /// `rows * cols` overflowed `usize` (a hostile/garbage shape).
+    #[error("decode: shape rows={rows} * cols={cols} overflows usize")]
+    ShapeOverflow { rows: u32, cols: u32 },
     /// A column was absent or had the wrong Arrow type.
     #[error("decode: column {0} missing or wrong type")]
     BadColumn(&'static str),
     /// A `kind` discriminant was not one of the five known tags.
     #[error("decode: unknown kind {0:?}")]
     BadKind(String),
+    /// The active payload column for a cell's `kind` was NULL (malformed response —
+    /// reading it would silently coerce to `0.0`/`false`/`""`).
+    #[error("decode: cell {row} has kind {kind:?} but its payload column is null")]
+    NullPayload { row: usize, kind: String },
+    /// A decoded `number` was non-finite (`NaN`/`Inf`) — out of the engine's
+    /// `Value::Number` finite invariant; a malformed worker result.
+    #[error("decode: cell {row} is a non-finite number ({value})")]
+    NonFinite { row: usize, value: f64 },
     /// An `error` cell carried a sigil that is not a known `ErrorValue`.
     #[error("decode: unknown error sigil {0:?}")]
     BadErrorSigil(String),
     /// The decoded cells did not match the declared shape.
     #[error("decode: shape mismatch ({0})")]
     ShapeMismatch(String),
+    /// A `CALL`/`RETURN` payload was shorter than its fixed `handle`/`call_id`
+    /// header (6.4-3a audit-fix: typed payload framing — see [`crate::payload`]).
+    #[error("decode: payload header truncated (need {need} bytes, got {got})")]
+    ShortHeader { need: usize, got: usize },
 }
 
 const COL_KIND: usize = 0;
@@ -72,14 +112,22 @@ const COL_STR: usize = 2;
 const COL_BOOL: usize = 3;
 const COL_ERR: usize = 4;
 
+/// The exact field layout (name, type, nullability) the decoder requires. `kind`
+/// is the non-null discriminant; the four payload columns are nullable (only the
+/// one matching `kind` is populated per cell).
+const EXPECTED_FIELDS: [(&str, DataType, bool); 5] = [
+    ("kind", DataType::Utf8, false),
+    ("num", DataType::Float64, true),
+    ("str", DataType::Utf8, true),
+    ("bool", DataType::Boolean, true),
+    ("err", DataType::Utf8, true),
+];
+
 fn grid_schema(rows: u32, cols: u32) -> Schema {
-    let fields = vec![
-        Field::new("kind", DataType::Utf8, false),
-        Field::new("num", DataType::Float64, true),
-        Field::new("str", DataType::Utf8, true),
-        Field::new("bool", DataType::Boolean, true),
-        Field::new("err", DataType::Utf8, true),
-    ];
+    let fields: Vec<Field> = EXPECTED_FIELDS
+        .iter()
+        .map(|(name, dt, nullable)| Field::new(*name, dt.clone(), *nullable))
+        .collect();
     let metadata = HashMap::from([
         ("rows".to_string(), rows.to_string()),
         ("cols".to_string(), cols.to_string()),
@@ -163,6 +211,44 @@ pub fn encode_grid(grid: &ArrayValue) -> Result<Vec<u8>, CodecError> {
     Ok(buf)
 }
 
+/// Validate that `schema` is EXACTLY the expected 5-field grid schema (each field's
+/// name, type, and nullability, in order). Worker-controlled bytes are not trusted
+/// to honor the column order/identity; a mismatch (reordered, renamed, retyped,
+/// wrong count) is rejected loudly so positional column access below is sound and
+/// the two `Utf8` columns (`str`/`err`) can never be silently swapped.
+fn validate_grid_schema(schema: &Schema) -> Result<(), CodecError> {
+    let fields = schema.fields();
+    if fields.len() != EXPECTED_FIELDS.len() {
+        return Err(CodecError::BadSchema(format!(
+            "expected {} columns, got {}",
+            EXPECTED_FIELDS.len(),
+            fields.len()
+        )));
+    }
+    for (idx, (name, dt, nullable)) in EXPECTED_FIELDS.iter().enumerate() {
+        let f = &fields[idx];
+        if f.name() != *name {
+            return Err(CodecError::BadSchema(format!(
+                "column {idx}: expected name {name:?}, got {:?}",
+                f.name()
+            )));
+        }
+        if f.data_type() != dt {
+            return Err(CodecError::BadSchema(format!(
+                "column {idx} ({name:?}): expected type {dt:?}, got {:?}",
+                f.data_type()
+            )));
+        }
+        if f.is_nullable() != *nullable {
+            return Err(CodecError::BadSchema(format!(
+                "column {idx} ({name:?}): expected nullable={nullable}, got {}",
+                f.is_nullable()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn shape_from_metadata(md: &HashMap<String, String>, key: &'static str) -> Result<u32, CodecError> {
     let raw = md.get(key).ok_or(CodecError::MissingShape(key))?;
     raw.parse::<u32>().map_err(|_| CodecError::BadShape {
@@ -171,7 +257,13 @@ fn shape_from_metadata(md: &HashMap<String, String>, key: &'static str) -> Resul
     })
 }
 
-fn col<'a, T: Array + 'static>(batch: &'a RecordBatch, idx: usize, name: &'static str) -> Result<&'a T, CodecError> {
+fn col<'a, T: Array + 'static>(
+    batch: &'a RecordBatch,
+    idx: usize,
+    name: &'static str,
+) -> Result<&'a T, CodecError> {
+    // `idx` is in-bounds: `validate_grid_schema` has already asserted exactly 5
+    // columns, so `batch.column(idx)` for idx in 0..5 cannot panic.
     batch
         .column(idx)
         .as_any()
@@ -180,11 +272,24 @@ fn col<'a, T: Array + 'static>(batch: &'a RecordBatch, idx: usize, name: &'stati
 }
 
 /// Decode Arrow IPC stream bytes (a `CALL`/`RETURN` frame payload) back to a grid.
+///
+/// Every failure mode for worker-controlled bytes is a loud [`CodecError`] — no
+/// reachable panic, no silent coercion (No-Fallbacks; design §5).
 pub fn decode_grid(bytes: &[u8]) -> Result<ArrayValue, CodecError> {
     let mut reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
     let batch = reader.next().ok_or(CodecError::Empty)??;
 
+    // Exactly one batch: a worker writing extra batches into one frame is malformed.
+    if reader.next().is_some() {
+        return Err(CodecError::TrailingBatch);
+    }
+
     let schema = batch.schema();
+    // Validate the schema BEFORE any positional column access (so `col()` indexing
+    // is sound) and BEFORE trusting column identity (the `Utf8` `str`/`err` columns
+    // are otherwise indistinguishable by type).
+    validate_grid_schema(&schema)?;
+
     let rows = shape_from_metadata(schema.metadata(), "rows")?;
     let cols = shape_from_metadata(schema.metadata(), "cols")?;
 
@@ -195,7 +300,11 @@ pub fn decode_grid(bytes: &[u8]) -> Result<ArrayValue, CodecError> {
     let err = col::<StringArray>(&batch, COL_ERR, "err")?;
 
     let n = batch.num_rows();
-    let expected = (rows as usize).saturating_mul(cols as usize);
+    // `checked_mul` (matching `ArrayValue::new`) — a hostile shape that overflows is
+    // a loud error, not a silent saturation that happens to disagree with `n`.
+    let expected = (rows as usize)
+        .checked_mul(cols as usize)
+        .ok_or(CodecError::ShapeOverflow { rows, cols })?;
     if n != expected {
         return Err(CodecError::ShapeMismatch(format!(
             "{n} cells but rows*cols = {expected} (rows={rows}, cols={cols})"
@@ -204,14 +313,51 @@ pub fn decode_grid(bytes: &[u8]) -> Result<ArrayValue, CodecError> {
 
     let mut cells = Vec::with_capacity(n);
     for i in 0..n {
+        // `kind` is non-nullable per the validated schema; an empty/garbage tag
+        // falls through to `BadKind` below rather than panicking.
         let v = match kind.value(i) {
             "blank" => Value::Blank,
-            // Raw `Value::Number` (not the sanitizing constructor) to round-trip
-            // the f64 bit pattern faithfully.
-            "number" => Value::Number(num.value(i)),
-            "bool" => Value::Boolean(boolean.value(i)),
-            "text" => Value::Text(Arc::from(text.value(i))),
+            "number" => {
+                if num.is_null(i) {
+                    return Err(CodecError::NullPayload {
+                        row: i,
+                        kind: "number".to_string(),
+                    });
+                }
+                let x = num.value(i);
+                // The engine's `Value::Number` invariant is "always finite"; a
+                // `NaN`/`Inf` from the worker is a malformed result (it would
+                // otherwise poison equality/dirty-tracking downstream).
+                if !x.is_finite() {
+                    return Err(CodecError::NonFinite { row: i, value: x });
+                }
+                Value::Number(x)
+            }
+            "bool" => {
+                if boolean.is_null(i) {
+                    return Err(CodecError::NullPayload {
+                        row: i,
+                        kind: "bool".to_string(),
+                    });
+                }
+                Value::Boolean(boolean.value(i))
+            }
+            "text" => {
+                if text.is_null(i) {
+                    return Err(CodecError::NullPayload {
+                        row: i,
+                        kind: "text".to_string(),
+                    });
+                }
+                Value::Text(Arc::from(text.value(i)))
+            }
             "error" => {
+                if err.is_null(i) {
+                    return Err(CodecError::NullPayload {
+                        row: i,
+                        kind: "error".to_string(),
+                    });
+                }
                 let sigil = err.value(i);
                 let ev = ErrorValue::from_str(sigil)
                     .map_err(|_| CodecError::BadErrorSigil(sigil.to_string()))?;
@@ -251,6 +397,17 @@ mod tests {
         }
     }
 
+    /// Write a hand-built (schema, columns) pair to IPC stream bytes — for the
+    /// adversarial decode tests that fabricate malformed worker output.
+    fn write_ipc(schema: &Arc<Schema>, columns: Vec<ArrayRef>) -> Vec<u8> {
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let mut buf = Vec::new();
+        let mut w = StreamWriter::try_new(&mut buf, schema).unwrap();
+        w.write(&batch).unwrap();
+        w.finish().unwrap();
+        buf
+    }
+
     #[test]
     fn roundtrips_every_value_variant_in_one_grid() {
         // A 2×3 grid touching all five Value variants + a representative error.
@@ -260,7 +417,7 @@ mod tests {
             Value::Boolean(true),
             Value::Text(Arc::from("hello")),
             Value::Error(ErrorValue::DivZero),
-            Value::Number(-0.0),
+            Value::Number(-1.5),
         ];
         assert_roundtrip(ArrayValue::new(2, 3, cells).unwrap());
     }
@@ -271,6 +428,21 @@ mod tests {
         assert_roundtrip(ArrayValue::singleton(Value::Text(Arc::from(""))));
         assert_roundtrip(ArrayValue::singleton(Value::Boolean(false)));
         assert_roundtrip(ArrayValue::singleton(Value::Blank));
+    }
+
+    /// **6.4-3a audit-fix (L1):** `-0.0` must survive bit-for-bit. Derived `Value`
+    /// equality compares `-0.0 == 0.0` true, so `assert_roundtrip` alone would pass
+    /// even on a sign flip — assert the raw bits to actually pin sign preservation.
+    #[test]
+    fn negative_zero_round_trips_bit_for_bit() {
+        let bytes = encode_scalar(Value::Number(-0.0)).unwrap();
+        let back = decode_grid(&bytes).unwrap();
+        match back.get(0, 0) {
+            Some(Value::Number(x)) => {
+                assert_eq!(x.to_bits(), (-0.0f64).to_bits(), "sign bit lost");
+            }
+            other => panic!("expected Number(-0.0), got {other:?}"),
+        }
     }
 
     #[test]
@@ -309,12 +481,13 @@ mod tests {
     #[test]
     fn roundtrips_large_numeric_grid_and_extremes() {
         // Finite f64 extremes round-trip exactly (NaN/Inf are out-of-contract for
-        // Value::Number — the engine sanitizes them to Error(Num) upstream).
+        // Value::Number — `decode_grid` REJECTS them; see `decode_rejects_*` below).
         let mut cells = Vec::new();
         for i in 0..50u32 {
             cells.push(Value::Number(f64::from(i) * 1.5 - 12.25));
         }
         cells.push(Value::Number(f64::MAX));
+        cells.push(Value::Number(f64::MIN));
         cells.push(Value::Number(f64::MIN_POSITIVE));
         let n = cells.len() as u32;
         assert_roundtrip(ArrayValue::new(n, 1, cells).unwrap());
@@ -329,15 +502,220 @@ mod tests {
         let text = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
         let boolean = Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef;
         let err = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![kind, num, text, boolean, err]).unwrap();
+        let buf = write_ipc(&schema, vec![kind, num, text, boolean, err]);
+        let e = decode_grid(&buf).unwrap_err();
+        assert!(matches!(e, CodecError::BadKind(ref k) if k == "bogus"), "got {e:?}");
+    }
+
+    /// **6.4-3a audit-fix (H1):** a batch with FEWER than 5 columns must error, not
+    /// panic. Pre-fix `decode_grid` did `batch.column(1..4)` which panics out of
+    /// bounds (arrow `RecordBatch::column` is a slice index).
+    #[test]
+    fn decode_rejects_short_column_set_without_panicking() {
+        // A single `kind` column + the shape metadata — would have panicked at
+        // `batch.column(1)`.
+        let one_field =
+            Schema::new(vec![Field::new("kind", DataType::Utf8, false)]).with_metadata(
+                HashMap::from([("rows".into(), "1".into()), ("cols".into(), "1".into())]),
+            );
+        let schema = Arc::new(one_field);
+        let kind = Arc::new(StringArray::from(vec!["blank"])) as ArrayRef;
+        let buf = write_ipc(&schema, vec![kind]);
+        let e = decode_grid(&buf).unwrap_err();
+        assert!(
+            matches!(e, CodecError::BadSchema(_)),
+            "short column set must be BadSchema, got {e:?}"
+        );
+    }
+
+    /// **6.4-3a audit-fix (H2):** a reordered schema (the two `Utf8` columns
+    /// `str`/`err` swapped — type-compatible, so the OLD positional decode would
+    /// have silently mis-read sigils as text) must be rejected.
+    #[test]
+    fn decode_rejects_reordered_schema() {
+        // Fields in order kind, num, ERR, bool, STR (str<->err swapped by name).
+        let fields = vec![
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("num", DataType::Float64, true),
+            Field::new("err", DataType::Utf8, true), // was "str"
+            Field::new("bool", DataType::Boolean, true),
+            Field::new("str", DataType::Utf8, true), // was "err"
+        ];
+        let schema = Arc::new(Schema::new(fields).with_metadata(HashMap::from([
+            ("rows".into(), "1".into()),
+            ("cols".into(), "1".into()),
+        ])));
+        let kind = Arc::new(StringArray::from(vec!["text"])) as ArrayRef;
+        let num = Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef;
+        let c2 = Arc::new(StringArray::from(vec![Some("#REF!")])) as ArrayRef;
+        let boolean = Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef;
+        let c4 = Arc::new(StringArray::from(vec![Some("hi")])) as ArrayRef;
+        let buf = write_ipc(&schema, vec![kind, num, c2, boolean, c4]);
+        let e = decode_grid(&buf).unwrap_err();
+        assert!(
+            matches!(e, CodecError::BadSchema(_)),
+            "reordered schema must be BadSchema, got {e:?}"
+        );
+    }
+
+    /// **6.4-3a audit-fix (null-slot coercion):** `kind="number"` with a NULL `num`
+    /// slot must error, not silently decode to `0.0`.
+    #[test]
+    fn decode_rejects_null_active_payload() {
+        let schema = Arc::new(grid_schema(1, 1));
+        let kind = Arc::new(StringArray::from(vec!["number"])) as ArrayRef;
+        let num = Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef; // NULL!
+        let text = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
+        let boolean = Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef;
+        let err = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
+        let buf = write_ipc(&schema, vec![kind, num, text, boolean, err]);
+        let e = decode_grid(&buf).unwrap_err();
+        assert!(
+            matches!(e, CodecError::NullPayload { row: 0, .. }),
+            "null active payload must be NullPayload, got {e:?}"
+        );
+    }
+
+    /// **6.4-3a audit-fix (nan-inf-leak):** a worker returning `NaN`/`Inf` must be
+    /// rejected, not passed through as an unsanitized `Value::Number`.
+    #[test]
+    fn decode_rejects_non_finite_number() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let schema = Arc::new(grid_schema(1, 1));
+            let kind = Arc::new(StringArray::from(vec!["number"])) as ArrayRef;
+            let num = Arc::new(Float64Array::from(vec![Some(bad)])) as ArrayRef;
+            let text = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
+            let boolean = Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef;
+            let err = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
+            let buf = write_ipc(&schema, vec![kind, num, text, boolean, err]);
+            let e = decode_grid(&buf).unwrap_err();
+            assert!(
+                matches!(e, CodecError::NonFinite { row: 0, .. }),
+                "non-finite {bad} must be NonFinite, got {e:?}"
+            );
+        }
+    }
+
+    /// **6.4-3a audit-fix (bad error sigil decode path — previously untested):** an
+    /// `error` cell carrying an unknown sigil must surface `BadErrorSigil`.
+    #[test]
+    fn decode_rejects_unknown_error_sigil() {
+        let schema = Arc::new(grid_schema(1, 1));
+        let kind = Arc::new(StringArray::from(vec!["error"])) as ArrayRef;
+        let num = Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef;
+        let text = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
+        let boolean = Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef;
+        let err = Arc::new(StringArray::from(vec![Some("#NOT_A_REAL_SIGIL!")])) as ArrayRef;
+        let buf = write_ipc(&schema, vec![kind, num, text, boolean, err]);
+        let e = decode_grid(&buf).unwrap_err();
+        assert!(
+            matches!(e, CodecError::BadErrorSigil(ref s) if s == "#NOT_A_REAL_SIGIL!"),
+            "got {e:?}"
+        );
+    }
+
+    /// **6.4-3a audit-fix (shape metadata — previously untested):** missing
+    /// `rows`/`cols` metadata, non-u32 metadata, and a metadata-vs-cell-count
+    /// mismatch must all error.
+    #[test]
+    fn decode_rejects_bad_shape_metadata() {
+        // (a) missing metadata entirely.
+        let fields: Vec<Field> = EXPECTED_FIELDS
+            .iter()
+            .map(|(n, dt, nl)| Field::new(*n, dt.clone(), *nl))
+            .collect();
+        let no_md = Arc::new(Schema::new(fields)); // no .with_metadata
+        let cols0: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["blank"])),
+            Arc::new(Float64Array::from(vec![None as Option<f64>])),
+            Arc::new(StringArray::from(vec![None as Option<&str>])),
+            Arc::new(BooleanArray::from(vec![None as Option<bool>])),
+            Arc::new(StringArray::from(vec![None as Option<&str>])),
+        ];
+        let buf = write_ipc(&no_md, cols0);
+        assert!(
+            matches!(decode_grid(&buf).unwrap_err(), CodecError::MissingShape(_)),
+            "missing metadata must be MissingShape"
+        );
+
+        // (b) non-u32 metadata.
+        let bad_md = {
+            let fields: Vec<Field> = EXPECTED_FIELDS
+                .iter()
+                .map(|(n, dt, nl)| Field::new(*n, dt.clone(), *nl))
+                .collect();
+            Arc::new(Schema::new(fields).with_metadata(HashMap::from([
+                ("rows".into(), "abc".into()),
+                ("cols".into(), "1".into()),
+            ])))
+        };
+        let cols1: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["blank"])),
+            Arc::new(Float64Array::from(vec![None as Option<f64>])),
+            Arc::new(StringArray::from(vec![None as Option<&str>])),
+            Arc::new(BooleanArray::from(vec![None as Option<bool>])),
+            Arc::new(StringArray::from(vec![None as Option<&str>])),
+        ];
+        let buf = write_ipc(&bad_md, cols1);
+        assert!(
+            matches!(decode_grid(&buf).unwrap_err(), CodecError::BadShape { .. }),
+            "non-u32 metadata must be BadShape"
+        );
+
+        // (c) metadata says 2×2 (=4 cells) but the batch has 1 row.
+        let mismatch = Arc::new(grid_schema(2, 2));
+        let cols2: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["blank"])),
+            Arc::new(Float64Array::from(vec![None as Option<f64>])),
+            Arc::new(StringArray::from(vec![None as Option<&str>])),
+            Arc::new(BooleanArray::from(vec![None as Option<bool>])),
+            Arc::new(StringArray::from(vec![None as Option<&str>])),
+        ];
+        let buf = write_ipc(&mismatch, cols2);
+        assert!(
+            matches!(decode_grid(&buf).unwrap_err(), CodecError::ShapeMismatch(_)),
+            "cell-count mismatch must be ShapeMismatch"
+        );
+    }
+
+    /// **6.4-3a audit-fix (extra-batches-dropped):** a stream with more than one
+    /// record batch must be rejected, matching the "exactly one" doc contract.
+    #[test]
+    fn decode_rejects_trailing_batch() {
+        let schema = Arc::new(grid_schema(1, 1));
+        let make_cols = || -> Vec<ArrayRef> {
+            vec![
+                Arc::new(StringArray::from(vec!["blank"])),
+                Arc::new(Float64Array::from(vec![None as Option<f64>])),
+                Arc::new(StringArray::from(vec![None as Option<&str>])),
+                Arc::new(BooleanArray::from(vec![None as Option<bool>])),
+                Arc::new(StringArray::from(vec![None as Option<&str>])),
+            ]
+        };
         let mut buf = Vec::new();
         {
             let mut w = StreamWriter::try_new(&mut buf, &schema).unwrap();
-            w.write(&batch).unwrap();
+            w.write(&RecordBatch::try_new(schema.clone(), make_cols()).unwrap())
+                .unwrap();
+            w.write(&RecordBatch::try_new(schema.clone(), make_cols()).unwrap())
+                .unwrap();
             w.finish().unwrap();
         }
-        let e = decode_grid(&buf).unwrap_err();
-        assert!(matches!(e, CodecError::BadKind(ref k) if k == "bogus"), "got {e:?}");
+        assert!(
+            matches!(decode_grid(&buf).unwrap_err(), CodecError::TrailingBatch),
+            "two batches must be TrailingBatch"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_empty_stream() {
+        // A schema-only stream (no batches) → Empty.
+        let schema = Arc::new(grid_schema(0, 0));
+        let mut buf = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut buf, &schema).unwrap();
+            w.finish().unwrap();
+        }
+        assert!(matches!(decode_grid(&buf).unwrap_err(), CodecError::Empty));
     }
 }

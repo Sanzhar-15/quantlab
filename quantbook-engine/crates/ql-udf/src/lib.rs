@@ -11,24 +11,34 @@
 //!
 //! **6.4-3a scope (this cycle — Rust-only, no Python, no subprocess):**
 //! - [`codec`] — `ArrayValue` ⇄ Arrow IPC stream bytes (the "fiddly part", with
-//!   round-trip property tests over every `Value` variant).
+//!   round-trip property tests over every `Value` variant AND adversarial decode
+//!   tests — the decoder is a trust boundary for worker-controlled bytes: it
+//!   validates the exact schema, rejects null/non-finite/short-column/reordered/
+//!   trailing-batch input loudly, and never panics).
 //! - [`frame`] — the `[u32 LE len][u8 type][payload]` envelope + [`frame::FrameType`].
+//! - [`payload`] — the typed `CALL` / `RETURN` payloads ([`payload::CallPayload`]
+//!   `{ handle, call_id, args }` / [`payload::ReturnPayload`] `{ call_id, result }`)
+//!   that carry the dispatch handle + correlation id in front of the Arrow grid.
 //! - [`worker`] — the [`worker::UdfWorker`] trait + an in-process
 //!   [`worker::MockWorker`] (proves call / raise / timeout mapping without a
 //!   subprocess) + the [`worker::UdfError`] taxonomy.
 //!
 //! **Deliberately deferred** (later 6.4-3 cycles): real subprocess spawn /
 //! handshake / kill (6.4-3b); the eval-site `RegisteredFn::Udf` dispatch arm
-//! (6.4-3c); debugpy + trusted-workspace gating (6.4-3d). The control-frame
-//! payload internals (Hello/Raise/Log field encodings) are intentionally opaque
-//! `Vec<u8>` at this layer until 6.4-3b pins the worker handshake.
+//! (6.4-3c); debugpy + trusted-workspace gating (6.4-3d). The CONTROL-frame
+//! payload internals (Hello/HelloAck/Raise/Cancel/Log field encodings) are
+//! intentionally opaque `Vec<u8>` at this layer until 6.4-3b pins the worker
+//! handshake — and the [`worker::UdfError`] taxonomy will gain the `Cancelled`
+//! (cancel distinct from timeout) and handshake/protocol-version variants then.
 //!
 //! The on-wire batch format is Arrow IPC (chosen so the Python side uses
 //! `pyarrow` natively); the [`codec`] boundary keeps it swappable.
 
 pub mod codec;
 pub mod frame;
+pub mod payload;
 pub mod worker;
 
 pub use frame::{Frame, FrameType};
+pub use payload::{CallPayload, ReturnPayload};
 pub use worker::{MockWorker, UdfError, UdfWorker};
