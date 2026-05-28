@@ -108,7 +108,22 @@ impl<'a> WorkbookRuntime<'a> {
         //   pathway.
         let cycled_cells: std::collections::HashSet<(SheetId, RowId, ColId)> = {
             use crate::calcgraph_session::CalcgraphSession;
-            let mut session = CalcgraphSession::rebuild_from_workbook(self.workbook).session;
+            // **6.4-0 audit-fix H2 (2026-05-28):** the original
+            // `rebuild_from_workbook(wb)` zero-arg call silently fell
+            // back to `ql_functions::default_registry()`, ignoring
+            // `self.registry` — benign today (both registries are
+            // builtin-equivalent) but at 6.4 with UDFs the production
+            // recompute_all path would walk against a UDF-free
+            // registry while live `set_formula` paths see the
+            // session-scoped one. Silent divergence between
+            // load/replay and live editing. The substrate already
+            // shipped `_with_registry`; this site just missed the
+            // migration. (Caught by the Opus reviewer lane in cycle 2
+            // audit; Codex lane verified populate/cleanup symmetry
+            // but missed the production divergence.)
+            let mut session =
+                CalcgraphSession::rebuild_from_workbook_with_registry(self.workbook, self.registry)
+                    .session;
             let formula_addrs: Vec<(SheetId, RowId, ColId)> = self
                 .workbook
                 .iter_formulas()

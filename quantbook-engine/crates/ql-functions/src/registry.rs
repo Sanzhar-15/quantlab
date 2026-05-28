@@ -320,11 +320,35 @@ impl FunctionRegistry {
     /// silent no-op (per No-Fallbacks: a quiet remove would mask a typo
     /// that leaves stale metadata associated with a since-renamed name).
     /// Lookup uppercases the query for symmetry with [`Self::metadata`].
+    ///
+    /// **6.4-0 audit-fix (2026-05-28; Codex A LOW):** REFUSES to
+    /// remove metadata for any name that still has a dispatch entry
+    /// in [`Self::fns`]. Without this guard, an unregister-builtin
+    /// call would leave dispatch present + metadata absent — a state
+    /// the migration-shim invariant (every dispatched fn has metadata)
+    /// forbids, and which would silently regress the dep walker for
+    /// the affected built-in (unknown-fn semantics). The (6.4)
+    /// `WorkbookSession::unregister_function` trait method should
+    /// only ever target UDF names (no dispatch entry by construction);
+    /// this guard catches a programmer error at the registry layer
+    /// rather than silently corrupting the metadata invariant.
+    /// Returns [`FunctionRegistryError::Conflict`] (re-using the
+    /// existing variant — the conflict is between "remove" and
+    /// "dispatch-still-present").
     pub fn unregister_metadata(
         &mut self,
         canonical_name: &str,
     ) -> Result<(), FunctionRegistryError> {
         let upper = canonical_name.to_ascii_uppercase();
+        // Guard: refuse to break the dispatch-has-metadata invariant.
+        if self.fns.contains_key(upper.as_str()) {
+            return Err(FunctionRegistryError::Conflict {
+                name: format!(
+                    "{canonical_name} is a registered built-in (dispatch entry present); \
+                     unregister_metadata must only target UDF metadata"
+                ),
+            });
+        }
         if self.metadata.remove(&upper).is_some() {
             Ok(())
         } else {
@@ -1228,8 +1252,17 @@ fn register_builtin_metadata(r: &mut FunctionRegistry) {
     // visible and treated Volatile/Dynamic"; encoding that here keeps a
     // user-typed `=INDIRECT(...)` flagged volatile even before dispatch
     // ships, matching today's `is_volatile_function` whitelist behavior.
-    // Debug-build only so release builds don't pay the walk.
-    debug_assert!(
+    //
+    // **6.4-0 audit-fix (2026-05-28; Opus L2):** upgraded from
+    // `debug_assert!` to `assert!` — a release build that hits this
+    // failure now panics at registry construction (boot time) rather
+    // than silently shipping with broken walker invariants. Cost is
+    // one O(n) walk at boot (n=260; ~µs); the alternative is that a
+    // future contributor adding a `r.register*` call without a
+    // matching metadata entry ships a release binary with silent
+    // unknown-fn fallback for that built-in. The boot-time fail-loud
+    // matches the No-Fallbacks rule.
+    assert!(
         r.fns.keys().all(|name| r.metadata.contains_key(*name)),
         "FunctionRegistry: every dispatched built-in must have metadata; \
          a `r.register*` call without a matching metadata override here \
@@ -2010,30 +2043,67 @@ mod tests {
         ));
     }
 
-    /// **Unregister happy path + NotFound:** removing metadata for an
-    /// existing name yields `Ok(())` and removes the entry; removing
-    /// an unknown name returns `NotFound` (never silent no-op).
+    /// **Unregister happy path + NotFound + builtin-guard
+    /// (6.4-0 audit-fix; Codex A LOW):** removing UDF-style metadata
+    /// (no dispatch entry) yields `Ok(())` and removes the entry;
+    /// removing an unknown name returns `NotFound`; attempting to
+    /// remove a built-in (dispatch entry still present) returns
+    /// `Conflict` — never silent removal of a built-in's metadata,
+    /// which would silently regress the dep walker for that name.
     #[test]
-    fn unregister_metadata_removes_then_returns_not_found_on_second_call() {
+    fn unregister_metadata_removes_udf_returns_not_found_for_unknown_and_blocks_builtins() {
         let mut r = default_registry();
-        assert!(r.metadata("SUM").is_some());
-        r.unregister_metadata("SUM").expect("first remove succeeds");
-        assert!(
-            r.metadata("SUM").is_none(),
-            "metadata must be gone after unregister"
-        );
+        // UDF-style: register metadata for a name with NO dispatch
+        // entry, then unregister it — round-trip OK.
+        let meta = FunctionMetadata {
+            canonical_name: "MYUDF".to_string(),
+            display_name: None,
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Pure,
+            determinism: true,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::Scalar,
+            arg_policy: ArgPolicy::Coercing,
+            cancellation: CancelPolicy::Cooperative,
+            provenance_tags: vec![],
+        };
+        r.register_metadata(meta).expect("UDF metadata registers");
+        assert!(r.metadata("MYUDF").is_some());
+        r.unregister_metadata("MYUDF").expect("UDF unregister OK");
+        assert!(r.metadata("MYUDF").is_none());
+
+        // Second unregister of the same name → NotFound (never silent
+        // no-op).
         let err = r
-            .unregister_metadata("SUM")
+            .unregister_metadata("MYUDF")
             .expect_err("second remove must fail loud");
         assert!(matches!(
             err,
-            FunctionRegistryError::NotFound { ref name } if name == "SUM"
+            FunctionRegistryError::NotFound { ref name } if name == "MYUDF"
         ));
-        // Case-insensitive (uppercases the query, mirroring `metadata`).
+
+        // Case-insensitive: unknown name → NotFound.
         let err = r
             .unregister_metadata("does_not_exist")
             .expect_err("unknown name must fail loud");
         assert!(matches!(err, FunctionRegistryError::NotFound { .. }));
+
+        // Builtin-guard: SUM has a dispatch entry → unregister must
+        // refuse with Conflict. This preserves the migration-shim
+        // invariant (every dispatched fn has metadata).
+        let err = r
+            .unregister_metadata("SUM")
+            .expect_err("must refuse to unregister a built-in's metadata");
+        assert!(
+            matches!(err, FunctionRegistryError::Conflict { .. }),
+            "removing a built-in's metadata must surface as Conflict, not NotFound"
+        );
+        // SUM's metadata is untouched.
+        assert!(
+            r.metadata("SUM").is_some(),
+            "builtin guard must preserve SUM's metadata"
+        );
     }
 
     /// **Lowercase guard:** `register_metadata` rejects non-canonical

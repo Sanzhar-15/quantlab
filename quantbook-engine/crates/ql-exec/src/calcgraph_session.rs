@@ -605,6 +605,16 @@ pub struct HookCounts {
     /// **W5-159 (Phase 4.8.G.3):** counts of `on_table_resize`
     /// invocations.
     pub table_resize: u64,
+    /// **6.4-0 audit-fix (2026-05-28; Opus L3):** counts of
+    /// `on_function_registered` invocations. Parity with the other
+    /// mutation hooks for ql-profile / observability. Once 6.4 wires
+    /// the trait method, this counter will tell us how often UDFs are
+    /// (re-)registered per session.
+    pub function_registered: u64,
+    /// **6.4-0 audit-fix (2026-05-28; Opus L3):** counts of
+    /// `on_function_unregistered` invocations. Parity with
+    /// `function_registered`.
+    pub function_unregistered: u64,
 }
 
 /// Phase 3.2: aggregate outcome of `rebuild_from_workbook`. Parallel
@@ -1244,21 +1254,60 @@ impl CalcgraphSession {
         self.hook_counts.add_sheet = self.hook_counts.add_sheet.saturating_add(1);
     }
 
-    /// **6.4-0 substrate (2026-05-28) — function-metadata graph hook.**
-    /// Mark every formula that references the function `canonical_name`
-    /// dirty, with transitive BFS-fanout via [`Self::mark_dirty_from_cell_write`]
-    /// (mirrors [`Self::on_set_name`]'s pattern). Returns the count of
-    /// formulas directly dirtied (downstream-of-downstream count is not
+    /// **6.4-0 substrate (2026-05-28) — function-metadata graph hook
+    /// (dirty-only).** Mark every formula that references the function
+    /// `canonical_name` dirty, with transitive BFS-fanout via
+    /// [`Self::mark_dirty_from_cell_write`] (mirrors
+    /// [`Self::on_set_name`]'s pattern). Returns the count of formulas
+    /// directly dirtied (downstream-of-downstream count is not
     /// returned — `mark_dirty_from_cell_write` handles it transitively
     /// the same way `set_value` does).
     ///
+    /// **Substrate scope LIMIT (6.4-0 audit-fix H3 — DOC-honesty
+    /// correction, 2026-05-28):** this hook ONLY dirties; it does
+    /// NOT re-extract dependencies. The cached `FormulaDeps` (stored
+    /// per-NodeId in `self.formula_deps`) was computed at bind time
+    /// with whatever registry metadata existed THEN. Marking a
+    /// formula dirty does not refresh its `is_volatile` flag; the
+    /// next `recompute_dirty` uses the cached `ExprPlan` + cached
+    /// `FormulaDeps`.
+    ///
+    /// Why this matters: a formula `=MYUDF(A1)` that bound while
+    /// MYUDF was unknown has `deps.is_volatile = false`. If the IDE
+    /// then registers MYUDF as `Volatility::Volatile` and calls this
+    /// hook, the formula dirties + recomputes once — but its membership
+    /// in `volatile_formulas: HashSet<NodeId>` is determined by the
+    /// original (stale) extract, so a subsequent F9 / volatile-pass
+    /// would not re-evaluate it.
+    ///
+    /// **6.4 must close this** via either:
+    ///   1. An `fn_gen: u64` counter on [`crate::plan_cache::PlanCache`]
+    ///      (mirroring the existing `name_gen` pattern at
+    ///      `plan_cache.rs:69-74`), bumped per
+    ///      `register_function`/`unregister_function`. Plan-cache
+    ///      misses then re-bind + re-extract on next eval.
+    ///   2. Per-dependent `reextract_deps(node, &cached_plan, &workbook,
+    ///      &registry)` calls in the [`crate::session::WorkbookSession`]
+    ///      orchestrator AFTER the registry's `register_metadata` /
+    ///      `unregister_metadata` succeeds, BEFORE this hook fires.
+    ///   3. Or document the policy as "registration only re-extracts
+    ///      formulas bound after registration; pre-registration callers
+    ///      must explicitly re-bind."
+    ///
+    /// The substrate provides the building block; 6.4 carries the
+    /// orchestration. The contract §10.3 phrase "register_function /
+    /// unregister_function dirties every formula referencing that
+    /// canonical name (re-extract deps + reschedule)" — the substrate
+    /// satisfies the "dirty every formula" + "reschedule" halves;
+    /// "re-extract deps" lands at the orchestrator level. Tracked
+    /// in 6.4 entry-plan.
+    ///
     /// **When to fire (6.4):** `WorkbookSession::register_function`
-    /// calls this AFTER `FunctionRegistry::register_metadata` so that
-    /// (a) the registry sees the new metadata for subsequent walker
-    /// queries, and (b) every formula that was bound while the name
-    /// was unknown (or with stale metadata) gets re-walked + re-
-    /// evaluated. Contract §10.3 exit test 8: "registering a UDF
-    /// dirties formulas that referenced its (previously-unknown) name."
+    /// calls this AFTER `FunctionRegistry::register_metadata` AND
+    /// AFTER its own re-extract orchestration (per the options above).
+    /// Contract §10.4 exit test 8: "registering a UDF dirties formulas
+    /// that referenced its (previously-unknown) name" — satisfied by
+    /// the dirty-fanout below.
     ///
     /// **v1 substrate scope (6.4-0):** this hook is live + tested but
     /// NOT yet wired through the trait method — the trait method
@@ -1273,21 +1322,35 @@ impl CalcgraphSession {
     /// reverse-index lookup so callers passing lowercase / mixed case
     /// behave the same as the canonical form.
     pub fn on_function_registered(&mut self, canonical_name: &str) -> usize {
+        self.hook_counts.function_registered =
+            self.hook_counts.function_registered.saturating_add(1);
         self.dirty_formulas_referencing_function(canonical_name)
     }
 
-    /// **6.4-0 substrate (2026-05-28) — function-metadata graph hook.**
-    /// Symmetric counterpart to [`Self::on_function_registered`]: when
-    /// a UDF is removed via `WorkbookSession::unregister_function`,
-    /// every formula referencing the name must re-evaluate (the next
-    /// recompute will surface the now-missing-function error). Same
-    /// dirty-fanout pattern.
+    /// **6.4-0 substrate (2026-05-28) — function-metadata graph hook
+    /// (dirty-only).** Symmetric counterpart to
+    /// [`Self::on_function_registered`]: when a UDF is removed via
+    /// `WorkbookSession::unregister_function`, every formula
+    /// referencing the name must re-evaluate (the next recompute will
+    /// surface the now-missing-function error). Same dirty-fanout
+    /// pattern; same re-extraction caveat documented at
+    /// `on_function_registered`.
+    ///
+    /// Unregister's eval-time semantics is simpler than register's:
+    /// the cached plan will dispatch a now-missing function and
+    /// produce `Value::Error(ErrorValue::Name)` per
+    /// `crates/ql-exec/src/scalar.rs:463`. So even WITHOUT a
+    /// re-extract, the formula's user-visible result correctly
+    /// surfaces as `#NAME?`. Register's gap (stale
+    /// `deps.is_volatile`) is the more pressing 6.4 concern.
     ///
     /// Calling this for a name with zero registered formulas is a
     /// no-op that returns `0`; never silently masks a typo (the caller
     /// gets the count and can decide whether the unregister should
     /// have hit something).
     pub fn on_function_unregistered(&mut self, canonical_name: &str) -> usize {
+        self.hook_counts.function_unregistered =
+            self.hook_counts.function_unregistered.saturating_add(1);
         self.dirty_formulas_referencing_function(canonical_name)
     }
 
@@ -2677,6 +2740,169 @@ mod tests {
         let set = s.functions_used_for("NOW").unwrap();
         assert_eq!(set.len(), 1, "the formula appears ONCE in functions_used[NOW]");
         assert!(set.contains(&node));
+    }
+
+    /// **6.4-0 audit-fix (Opus M4 / Codex D LOW):** the walker pushes
+    /// to `functions_used` at the TOP of the `ExprPlan::Function` arm,
+    /// BEFORE any routing decision. This pins that invariant for the
+    /// **address-only path** (ROW / COLUMN / ROWS / COLUMNS / ISREF)
+    /// — without the push-before-routing discipline, a future
+    /// refactor that moves the push inside the `else` branch would
+    /// silently drop these names from the reverse index and break
+    /// register-time invalidation for any UDF whose name happened to
+    /// be in the address-only list. (None today, but the substrate
+    /// must hold under future contract evolution.)
+    #[test]
+    fn functions_used_records_address_only_fns() {
+        // ROW(A1) routes through walk_plan_for_address_only_deps; the
+        // outer ROW arm's push runs BEFORE the route. Same for ISREF.
+        let wb = workbook_with_formulas(&[(0, 0, 0, "ROW(A1)"), (0, 1, 0, "ISREF(A1)")]);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete(), "ROW(A1) and ISREF(A1) must bind");
+        let s = r.session;
+        let row_caller = s.cell_node_for(0, 0, 0).unwrap();
+        let isref_caller = s.cell_node_for(0, 1, 0).unwrap();
+        assert!(
+            s.functions_used_for("ROW").unwrap().contains(&row_caller),
+            "the walker MUST record ROW into functions_used even though args route through address-only walker"
+        );
+        assert!(
+            s.functions_used_for("ISREF").unwrap().contains(&isref_caller),
+            "the walker MUST record ISREF even though its arm short-circuits arg walking"
+        );
+    }
+
+    /// **6.4-0 audit-fix (Opus M4):** nested function calls record
+    /// BOTH names. `ROW(NOW())` is the smallest test of the
+    /// address-only walker's `_ => walk_plan_for_deps(plan, deps,
+    /// registry)` delegation — when the address-only walker hits a
+    /// nested `ExprPlan::Function`, it delegates back to the normal
+    /// walker which records the inner function name. Without the
+    /// delegation passing `registry` through, the nested arm would
+    /// either fail to compile (current safety) or silently lose the
+    /// volatile mark on the outer formula. Pins both halves.
+    #[test]
+    fn functions_used_records_nested_functions_through_address_only_delegation() {
+        let wb = workbook_with_formulas(&[(0, 0, 0, "ROW(NOW())")]);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete(), "ROW(NOW()) must bind");
+        let s = r.session;
+        let node = s.cell_node_for(0, 0, 0).unwrap();
+        // Both names land in the reverse index.
+        assert!(s.functions_used_for("ROW").unwrap().contains(&node));
+        assert!(
+            s.functions_used_for("NOW").unwrap().contains(&node),
+            "the address-only walker's `_ => walk_plan_for_deps(... , registry)` \
+             delegation MUST record nested function names"
+        );
+        // The formula is volatile because NOW lives somewhere in the
+        // tree — the metadata lookup at NOW's arm sets is_volatile.
+        let deps = s.formula_deps(node).expect("formula must store deps");
+        assert!(
+            deps.is_volatile,
+            "ROW(NOW()) must be volatile because NOW propagates through the delegation"
+        );
+    }
+
+    /// **6.4-0 audit-fix (Codex D LOW):** the function-registration
+    /// hook fires transitive BFS-fanout via
+    /// `mark_dirty_from_cell_write` — a chain `A1=NOW()` →
+    /// `B1 = A1+1` → `C1 = B1+1` must dirty ALL three when NOW is
+    /// (re-)registered. Mirrors the Phase 3.10 H2 set_name fix.
+    #[test]
+    fn on_function_registered_fans_dirty_transitively() {
+        let wb = workbook_with_formulas(&[
+            (0, 0, 0, "NOW()"),   // A1 = NOW()
+            (0, 0, 1, "A1 + 1"),  // B1 = A1 + 1
+            (0, 0, 2, "B1 + 1"),  // C1 = B1 + 1
+        ]);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete(), "NOW() + chain must bind");
+        let mut s = r.session;
+        let a1 = s.cell_node_for(0, 0, 0).unwrap();
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        let c1 = s.cell_node_for(0, 0, 2).unwrap();
+        assert!(s.dirty_formulas().is_empty(), "fresh rebuild is clean");
+
+        // NOW is a builtin volatile so A1 is already volatile-eligible
+        // via rebuild. The hook tests register-time RE-fanout — the
+        // transitive part is what matters.
+        let n = s.on_function_registered("NOW");
+        assert_eq!(n, 1, "only A1 directly references NOW");
+        assert!(s.is_dirty(a1), "A1 dirties (direct)");
+        assert!(s.is_dirty(b1), "B1 dirties (transitive: depends on A1)");
+        assert!(s.is_dirty(c1), "C1 dirties (transitive: depends on B1)");
+    }
+
+    /// **6.4-0 audit-fix (Codex D LOW):** the widened storage gate
+    /// closes a latent cleanup bug for `ROW(MyName)`-shape formulas
+    /// — the address-only walker pushes only to `deps.names` (line
+    /// ~480), not `deps.named_ranges`; the pre-substrate storage
+    /// gate `!deps.is_empty() || deps.is_volatile` (cells +
+    /// named_ranges only) skipped storage of such formulas'
+    /// `FormulaDeps`, leaving the `name_to_formulas` reverse-index
+    /// entry to leak on re-bind. Substrate gate widened to
+    /// `!deps.names.is_empty()` catches this. This test pins the
+    /// fix: bind a formula `ROW(MyName)` then re-bind to unrelated
+    /// text → `name_to_formulas[MYNAME]` MUST be empty.
+    #[test]
+    fn name_to_formulas_cleaned_for_address_only_named_dep_on_rebind() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.put_at(0, 0, 0, Value::Number(42.0));
+        wb.set_name(
+            "MyName",
+            ql_storage::NamedTarget::Range(Range {
+                sheet: 0,
+                start_row: 0,
+                end_row: 2,
+                start_col: 0,
+                end_col: 0,
+            }),
+        )
+        .unwrap();
+        wb.put_at(0, 5, 5, Value::Blank);
+        wb.put_formula(0, 5, 5, "ROW(MyName)");
+
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete());
+        let mut s = r.session;
+        let node = s.cell_node_for(0, 5, 5).unwrap();
+        // Substrate must record the name-dep AND store formula_deps
+        // (the widened storage gate catches this).
+        assert!(
+            s.formulas_referencing_name("MyName")
+                .map(|set| set.contains(&node))
+                .unwrap_or(false),
+            "ROW(MyName) must populate name_to_formulas[MYNAME] (substrate behavior)"
+        );
+
+        // Re-bind to text with no name reference.
+        let mut wb2 = wb.clone();
+        wb2.put_at(0, 5, 5, Value::Blank);
+        wb2.put_formula(0, 5, 5, "1 + 1");
+        let plan = CalcgraphSession::bind_text(
+            "1 + 1",
+            BindSite::at_cell(ql_types::Address::new(0, 5, 5)),
+            &wb2,
+        )
+        .expect("simple arithmetic must bind");
+        let registry = ql_functions::default_registry();
+        s.on_set_formula(0, 5, 5, &plan, &wb2, &registry);
+
+        // Without the widened storage gate, name_to_formulas[MYNAME]
+        // would still contain `node` here (formula_deps was skipped on
+        // first store; remove_formula_deps had nothing to walk). With
+        // the gate widened, formula_deps was stored → cleanup found
+        // `names: [MYNAME]` → removed `node` from `name_to_formulas[MYNAME]`.
+        assert!(
+            s.formulas_referencing_name("MyName")
+                .map(|set| !set.contains(&node))
+                .unwrap_or(true),
+            "ROW(MyName) cleanup MUST drop the formula from name_to_formulas[MYNAME] \
+             on re-bind to unrelated text (Codex D LOW regression pin; storage gate \
+             widened in 6.4-0)"
+        );
     }
 
     /// **6.4-0:** the volatile set is now metadata-derived. `NOW/TODAY/
