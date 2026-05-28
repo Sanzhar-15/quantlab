@@ -25,6 +25,7 @@ Payload framings (the ``payload`` inside a `_frame` envelope):
     HELLO_ACK [u32 LE protocol_version][u32 LE worker_pid]
 """
 
+import math
 import struct
 
 import pyarrow as pa
@@ -107,7 +108,17 @@ def encode_grid(grid):
             # NB: bool is a subclass of int — check it BEFORE the numeric branch.
             kinds.append("bool"); nums.append(None); strs.append(None); bools.append(cell); errs.append(None)
         elif isinstance(cell, (int, float)):
-            kinds.append("number"); nums.append(float(cell)); strs.append(None); bools.append(None); errs.append(None)
+            # The engine's Value::Number invariant is "always finite"; the Rust decoder REJECTS
+            # NaN/Inf. Reject here at the source so a UDF returning a non-finite number (or a
+            # huge int that overflows float() to inf) surfaces a comprehensible RAISE rather than
+            # a cryptic codec error from the far side (6.4-3b audit-fix: python-encode-grid-
+            # accepts-nan-inf-cryptic-engine-error).
+            n = float(cell)
+            if not math.isfinite(n):
+                raise ValueError(
+                    "UDF returned a non-finite number (%r); only finite numbers are supported" % cell
+                )
+            kinds.append("number"); nums.append(n); strs.append(None); bools.append(None); errs.append(None)
         elif isinstance(cell, str):
             kinds.append("text"); nums.append(None); strs.append(cell); bools.append(None); errs.append(None)
         elif isinstance(cell, Err):
@@ -156,6 +167,13 @@ def decode_grid(data):
     if len(batches) != 1:
         raise ValueError("trailing data after the first record batch")
     batch = batches[0]
+    # Guard the positional column access below: a grid batch with the wrong column count would
+    # otherwise raise an opaque IndexError deep in the loop. The engine is the trusted producer
+    # here, so a minimal count check (not the full Rust schema validation) suffices; once this is
+    # reached from inside the worker's CALL try/except, the raise becomes a clean RAISE
+    # (6.4-3b audit-fix: python-decode-grid-no-validation-positional-access).
+    if batch.num_columns != 5:
+        raise ValueError("grid batch has %d columns, expected 5 (kind,num,str,bool,err)" % batch.num_columns)
     schema = batch.schema
     rows = int(_md_get(schema.metadata, "rows"))
     cols = int(_md_get(schema.metadata, "cols"))

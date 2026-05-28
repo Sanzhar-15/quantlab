@@ -107,17 +107,23 @@ struct WorkerProcess {
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        // Hard-stop the child and REAP it (no zombies), then let the reader thread
-        // wind down on the resulting stdout EOF. Errors are ignored — the process
-        // may already be dead.
+        // Hard-stop the child and REAP it (no zombies). `wait()` returns promptly after
+        // `kill()` because it waits only on the DIRECT child (grandchildren are reparented
+        // to init, not waited here). NB: a child stuck in uninterruptible (`D`) kernel I/O
+        // won't die until it leaves `D`, so `wait()` is not strictly bounded — rare, and
+        // std offers no clean bounded wait; accepted for v1 (6.4-3b audit: drop-child-wait-unbounded).
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(h) = self.reader.take() {
-            // The child is reaped, so its stdout is closed → the reader's
-            // `read_frame` returns EOF and the thread exits promptly; this join
-            // does not block.
-            let _ = h.join();
-        }
+        // DETACH the reader thread — do NOT join it. If a UDF spawned a grandchild that
+        // inherited our stdout write-end, that pipe stays open after the direct child dies,
+        // so the reader's `read_frame` blocks forever; joining here would DEADLOCK the engine
+        // on the hard-cancel path (6.4-3b audit-fix: drop-join-deadlock-on-inherited-stdout).
+        // Dropping the `JoinHandle` detaches the thread; in the common case (no grandchild) the
+        // child's death closes the pipe → the reader hits EOF and exits on its own. A UDF that
+        // orphans a child can leak this one reader thread + fd until process exit; the proper
+        // fix (process-group/session kill so grandchildren die too) needs a `libc`/`nix` dep and
+        // is filed for 6.4-3c.
+        drop(self.reader.take());
     }
 }
 
@@ -144,10 +150,11 @@ impl ProcessWorker {
         self.proc.as_ref().map(|p| p.pid)
     }
 
-    /// Eagerly spawn + handshake (otherwise the first `call()` does it lazily).
+    /// Eagerly spawn + handshake (otherwise the first `call()` does it lazily). Uses the
+    /// full configured `handshake_timeout` (no per-call deadline applies to eager startup).
     pub fn ensure_started(&mut self) -> Result<(), UdfError> {
         if self.proc.is_none() {
-            self.proc = Some(self.spawn()?);
+            self.proc = Some(self.spawn(self.config.handshake_timeout)?);
         }
         Ok(())
     }
@@ -157,7 +164,10 @@ impl ProcessWorker {
         self.proc = None; // `WorkerProcess::drop` kills + reaps.
     }
 
-    fn spawn(&self) -> Result<WorkerProcess, UdfError> {
+    /// Spawn + handshake. `handshake_timeout` bounds the wait for `HELLO_ACK` (the caller
+    /// passes either the full configured timeout for eager startup, or — from `call()` — the
+    /// remaining per-call deadline budget, capped by the configured timeout).
+    fn spawn(&self, handshake_timeout: Duration) -> Result<WorkerProcess, UdfError> {
         let mut cmd = Command::new(&self.config.python);
         cmd.arg("-m")
             .arg(&self.config.module)
@@ -223,11 +233,11 @@ impl ProcessWorker {
             reader: Some(reader),
             pid,
         };
-        self.handshake(&mut wp)?;
+        self.handshake(&mut wp, handshake_timeout)?;
         Ok(wp)
     }
 
-    fn handshake(&self, wp: &mut WorkerProcess) -> Result<(), UdfError> {
+    fn handshake(&self, wp: &mut WorkerProcess, timeout: Duration) -> Result<(), UdfError> {
         let hello = Frame::new(FrameType::Hello, encode_hello(self.config.protocol_version));
         write_frame(&mut wp.stdin, &hello)
             .map_err(|e| UdfError::WorkerDied(format!("write HELLO: {e}")))?;
@@ -238,7 +248,7 @@ impl ProcessWorker {
             .flush()
             .map_err(|e| UdfError::WorkerDied(format!("flush HELLO: {e}")))?;
 
-        match wp.rx.recv_timeout(self.config.handshake_timeout) {
+        match wp.rx.recv_timeout(timeout) {
             Ok(ReaderMsg::Frame(f)) => {
                 if f.frame_type != FrameType::HelloAck {
                     return Err(UdfError::Protocol(format!(
@@ -281,11 +291,20 @@ impl UdfWorker for ProcessWorker {
         args: &ArrayValue,
         deadline: Duration,
     ) -> Result<ArrayValue, UdfError> {
+        // Absolute deadline for the WHOLE call — covers (re)spawn + handshake + CALL write +
+        // the RETURN/RAISE wait (6.4-3b audit-fix: call-deadline-excludes-respawn-handshake-and-write).
+        let deadline_at = Instant::now() + deadline;
         let call_id = self.next_call_id;
         self.next_call_id = self.next_call_id.wrapping_add(1);
 
-        // (Re)spawn if dead. A spawn/handshake failure is the caller's error.
-        self.ensure_started()?;
+        // (Re)spawn if dead, bounding the handshake by the REMAINING call budget (capped by the
+        // configured `handshake_timeout`) so a respawn can't blow the caller's deadline. A
+        // spawn/handshake failure is the caller's error.
+        if self.proc.is_none() {
+            let remaining = deadline_at.saturating_duration_since(Instant::now());
+            let hs_timeout = self.config.handshake_timeout.min(remaining);
+            self.proc = Some(self.spawn(hs_timeout)?);
+        }
 
         // Encode + send the CALL.
         let payload = encode_call(&CallPayload {
@@ -304,9 +323,17 @@ impl UdfWorker for ProcessWorker {
             return Err(UdfError::WorkerDied(format!("write CALL: {e}")));
         }
 
-        // Await the correlated RETURN/RAISE, honoring the deadline.
-        let deadline_at = Instant::now() + deadline;
+        // Await the correlated RETURN/RAISE, honoring the absolute deadline.
         loop {
+            // Deadline guard FIRST: a worker that floods `LOG` / stale-`call_id` frames keeps
+            // `recv_timeout` returning a ready frame regardless of `remaining`, which would
+            // otherwise let it defeat the deadline indefinitely (6.4-3b audit-fix:
+            // frame-flood-defeats-timeout / contract §10.4 exit test 6). Check the clock before
+            // each recv so a continuous nonterminal-frame stream still hard-cancels on time.
+            if Instant::now() >= deadline_at {
+                self.kill_worker();
+                return Err(UdfError::Timeout(deadline));
+            }
             let remaining = deadline_at.saturating_duration_since(Instant::now());
             let msg = {
                 let wp = self.proc.as_mut().expect("spawned above");

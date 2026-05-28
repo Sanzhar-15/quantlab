@@ -1,0 +1,3543 @@
+OpenAI Codex v0.134.0
+--------
+workdir: /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019e70b6-2819-7571-9eb2-a270ca9f2f4a
+--------
+user
+# Adversarial audit — Quantbook Phase 6.4-3b (real Python UDF worker)
+
+You are auditing a SHIPPED code increment for correctness, soundness, robustness, and
+contract-fidelity. This is a **cycle-1 adversarial audit** of code that already compiles and
+passes its tests (`cargo test -p ql-udf` 39 unit + 1 real-python integration; clippy clean;
+`python3 -m quantbook._self_test` PASS). Your job is to find what the author missed. Be
+skeptical. Default to flagging anything you cannot prove safe from source. **A clean "looks
+good" is a FAILED audit if defects exist** — assume defects exist.
+
+## Repo / scope
+
+- Repo root: this directory (`quantbook-engine`), branch `feat/quantbook-engine`, HEAD `ec39a55c39b`.
+- Read-only. Do not modify files. Produce findings only.
+- **In scope (the 6.4-3b increment — commit `2671ade0cfa`):**
+  - `crates/ql-udf/src/process.rs` (NEW — the `ProcessWorker`: spawn / handshake / reader
+    thread / `call()` with deadline / timeout-kill / respawn / `Drop`). **This is the highest-risk file.**
+  - `crates/ql-udf/src/control.rs` (NEW — HELLO/HELLO_ACK/RAISE/LOG/CANCEL payload codecs).
+  - `crates/ql-udf/src/worker.rs` (the `UdfError` taxonomy — gained `Cancelled`/`Handshake`/`Protocol` this cycle).
+  - `crates/ql-udf/src/lib.rs` (module wiring + re-exports).
+  - `crates/ql-udf/tests/process_smoke.rs` (NEW — real-python end-to-end smoke).
+  - `crates/quantbook-py/python/quantbook/` — the Python worker package (ALL files):
+    `_frame.py`, `_codec.py`, `worker.py`, `__init__.py`, `_registry.py`, `_smoke_udfs.py`, `_self_test.py`.
+- **Context (read for symmetry, but 6.4-3a-audited already — flag only NEW issues or 3b regressions):**
+  `crates/ql-udf/src/codec.rs`, `crates/ql-udf/src/frame.rs`, `crates/ql-udf/src/payload.rs`.
+
+## What this increment does
+
+The engine drives an out-of-process Python worker over stdio using the wire protocol pinned in
+6.4-3a (frame envelope `[u32 LE len][u8 type][payload]`; CALL/RETURN data payloads; an
+`ArrayValue`⇄Arrow-IPC 5-column tagged-grid codec). 6.4-3b adds:
+- the control-frame codecs (HELLO/HELLO_ACK handshake; RAISE; LOG; CANCEL),
+- `ProcessWorker` (Rust): spawns `python -m quantbook.worker`, does a HELLO/HELLO_ACK handshake,
+  sends one CALL per UDF invocation, reads RETURN/RAISE/LOG on a per-worker reader thread via an
+  mpsc channel, enforces a per-call `deadline` via `recv_timeout`, and on a deadline breach or any
+  transport break KILLS + reaps the child (hard cancel) and lazily respawns on the next call,
+- the Python worker (plain Python 3.9-compatible, NO PyO3 in the hot path): a stdin→stdout frame
+  loop that mirrors the Rust codec/frame/control encodings in `pyarrow`, dispatches CALL by handle
+  to a registered Python callable, and turns any UDF exception into a RAISE.
+
+Design doc: `docs/phase6/6-4-3-design.md` (esp. §2 architecture, §3 protocol, §5 worker
+lifecycle/kill, §6 cancellation). Contract exit tests of interest: §10.4 test 6 (a late RETURN
+after a deadline-kill must be DROPPED — never committed) and test 7 (a raise surfaces a diagnostic).
+
+## Project rules that are FINDINGS if violated (from CLAUDE.md)
+
+- **No-Fallbacks — errors must be visible.** No swallowed errors, no `|| default`, no silent
+  retries, no `except: pass`, no graceful-degradation that hides the real failure. Every failure
+  must surface loudly as a typed error. Flag any place a real error is masked, defaulted, or dropped.
+- No panic reachable from worker-controlled bytes (the decode side is a trust boundary).
+
+## Focus areas (the author's own hand-off — audit these HARD, but do NOT limit yourself to them)
+
+1. **Reader-thread ↔ kill race + zombie reaping.** `ProcessWorker::call` on timeout calls
+   `kill_worker()` → sets `self.proc = None` → `WorkerProcess::drop` does `child.kill()` +
+   `child.wait()` + `reader.join()`. Is the join guaranteed to terminate (no deadlock / no hang)?
+   Can the reader thread block forever on `read_frame` if the child is killed but a grandchild or
+   a dup'd stdout fd keeps the pipe write-end open? Is the child always reaped (no zombies) on every
+   exit path — timeout, transport error, handshake failure, `Drop`, `shutdown()`, normal completion?
+   Is there a window where `kill()` then `wait()` races the reader's own read?
+2. **Respawn + deadline accounting.** `call()` runs `ensure_started()` (spawn + handshake, bounded
+   only by `handshake_timeout`, default 5s) and THEN starts the `deadline` clock for `recv_timeout`.
+   Does a call with a short `deadline` that triggers a respawn actually honor that deadline, or can
+   it block for up to `handshake_timeout + deadline`? Does the deadline cover CALL-write time? Is
+   `deadline_at` computed correctly across LOG frames and stale-call_id skips (each `continue`
+   recomputes `remaining` from the absolute `deadline_at` — verify no drift / no negative / no
+   accidental infinite wait)? What if `deadline` is zero?
+3. **Control-frame codec symmetry Rust↔Python.** Byte-for-byte compare `control.rs` ⇄ `_codec.py`
+   (HELLO, HELLO_ACK, RAISE) and `frame.rs` ⇄ `_frame.py` (envelope, FrameType ints, MAX_FRAME_LEN,
+   torn/zero/oversized handling) and `codec.rs`/`payload.rs` ⇄ `_codec.py` (grid schema field
+   names/types/nullability/order, rows/cols metadata, CALL/RETURN u64-LE headers, endianness, the
+   bool-before-int ordering in Python encode). Any asymmetry (a field the Python side omits, a
+   length the two disagree on, an integer width/endianness mismatch, NaN/Inf handling divergence)
+   is a HIGH — it means a real worker desyncs the stream.
+4. **LOG → eprintln stopgap.** `call()` prints LOG frames via `eprintln!` and `continue`s. Is that
+   a No-Fallbacks violation (is anything being swallowed)? Does it interact badly with the deadline
+   (a flood of LOG frames resetting nothing / spinning)? (6.4-3c routes these to CellDiagnostics —
+   judge whether the stopgap is acceptable, not whether the final design is done.)
+5. **Worker stdout-purity.** `worker.py` writes protocol frames to `sys.stdout.buffer`. Is there
+   ANYTHING that can write stray bytes to that same fd and corrupt the frame stream — a `print()`
+   in user UDF code, a library writing to stdout, Python's own startup chatter, buffering? Is stdin
+   read as raw bytes (`sys.stdin.buffer`) with no text-mode/`universal newlines` corruption? On
+   Windows would stdio need binary mode (note if relevant, but host is macOS/Linux)?
+6. **Handshake-version-mismatch path.** Trace the full handshake: engine writes HELLO, worker
+   replies HELLO_ACK. What happens on: wrong protocol version (→ `Handshake`?), a non-HELLO_ACK
+   first frame, the worker dying mid-handshake, the worker hanging (handshake_timeout), the worker
+   importing a failing `QUANTBOOK_UDF_MODULE` before it ever reads HELLO? Is the child reaped on
+   each of these? Does the engine ever leak a zombie/handle on a failed handshake?
+
+## Also consider (open-ended — this list is NOT exhaustive; think adversarially)
+
+- The Python worker's CALL handling: `decode_call(payload)` runs BEFORE the `try/except`. What
+  happens if the engine sends a malformed CALL (bad grid bytes)? Does the worker crash the loop
+  (no RAISE, no call_id) → engine sees EOF? Is that acceptable or a robustness defect?
+- Python `_codec.encode_grid`: does it reject non-finite numbers? If a UDF returns `float('nan')`/
+  `inf`, what does the engine see (the Rust decoder rejects non-finite — does the user get a
+  comprehensible error or a cryptic codec error)? Large Python `int` → `float()` overflow to `inf`?
+- Python `decode_grid` does NOT validate the schema (unlike the hardened Rust decoder) — positional
+  `batch.column(0..4)`. Is the engine a sufficiently-trusted producer to justify the asymmetry, or
+  is this a latent crash (IndexError on a short column set) that takes down the worker loop?
+- `next_call_id` is consumed before `ensure_started()` — gaps on spawn failure (harmless?). Wrapping
+  at u64::MAX (`wrapping_add`) — any correlation hazard?
+- mpsc channel growth: the reader thread sends every frame; if `call()` is slow to drain (or a flood
+  of LOG frames), does the unbounded channel grow without bound?
+- Pipe-buffer deadlock: a very large CALL frame (> OS pipe buffer) written by `call()` while the
+  worker simultaneously writes a large RETURN — can both block? Single-in-flight mitigates, but
+  verify the ordering (worker reads the whole CALL before writing RETURN).
+- `Drop` ordering of `WorkerProcess` fields vs the explicit `Drop::drop` (does `rx` drop before the
+  join, breaking the reader's `tx.send`? Is that benign?).
+- The `_self_test.py` and `process_smoke.rs`: do their assertions actually prove what they claim, or
+  are any of them vacuous (e.g. asserting a round-trip that can't fail, or a timeout test that
+  doesn't prove the child was killed / a new pid was spawned)? Test-honesty matters.
+- `_smoke_udfs.py` fixture: does it exercise the claimed handles (double / raise / sleep-timeout)?
+- Any `unwrap`/`expect`/`panic!`/array-index/slice that a worker (or a malformed frame) can reach.
+- `__init__.py` `register_formula_function`: handle collisions, re-registration, int coercion.
+- Cross-platform: `child.kill()` semantics, `SIGKILL` vs graceful, signal handling in the Python
+  worker (does it ignore SIGPIPE / SIGINT correctly?).
+
+## Output format (STRICT)
+
+Start with one line: `VERDICT: SHIP-WITH-FIXES` or `VERDICT: DO-NOT-SHIP` or `VERDICT: SHIP-CLEAN`.
+
+Then a findings list. For EACH finding:
+- `ID:` a short kebab-case slug.
+- `SEVERITY:` HIGH | MED | LOW | INFO.
+- `LOCATION:` file:line(s).
+- `WHAT:` the defect, concretely.
+- `WHY:` the consequence (what breaks, under what input/timing). Cite the rule/contract if relevant.
+- `FIX:` the concrete change you'd make.
+
+Be specific and cite line numbers. If you believe the increment is genuinely clean on a focus area,
+say so explicitly per-area (don't omit it). Prioritize: a real HIGH that desyncs the protocol, hangs
+the engine, leaks a zombie, drops an error silently, or violates exit test 6 is worth more than ten
+style nits. Think hard about timing/races/process-lifecycle — that is where this increment is riskiest.
+
+codex
+I’ll audit this as a code review against the shipped diff and the protocol contract, without editing anything. I’m going to read the lifecycle code first, then cross-check Rust and Python codecs byte-for-byte and finish with test coverage gaps.
+exec
+/bin/zsh -lc "pwd && rg --files -g 'AGENTS.md' -g 'CLAUDE.md' -g '.github/copilot-instructions.md' -g 'docs/phase6/6-4-3-design.md' -g 'crates/ql-udf/src/*.rs' -g 'crates/ql-udf/tests/*.rs' -g 'crates/quantbook-py/python/quantbook/*.py'" in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+docs/phase6/6-4-3-design.md
+crates/ql-udf/src/payload.rs
+crates/ql-udf/src/process.rs
+crates/ql-udf/src/frame.rs
+crates/ql-udf/src/codec.rs
+crates/ql-udf/src/worker.rs
+crates/ql-udf/src/lib.rs
+crates/ql-udf/src/control.rs
+crates/ql-udf/tests/process_smoke.rs
+crates/quantbook-py/python/quantbook/_smoke_udfs.py
+crates/quantbook-py/python/quantbook/_self_test.py
+crates/quantbook-py/python/quantbook/_frame.py
+crates/quantbook-py/python/quantbook/_codec.py
+crates/quantbook-py/python/quantbook/_registry.py
+crates/quantbook-py/python/quantbook/__init__.py
+crates/quantbook-py/python/quantbook/worker.py
+
+codex
+I have the scoped files. Next I’m reading them with line numbers so any findings can point to the exact trust boundary or lifecycle path.
+exec
+/bin/zsh -lc 'nl -ba crates/ql-udf/src/control.rs' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+exec
+/bin/zsh -lc 'nl -ba crates/quantbook-py/python/quantbook/worker.py' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+     1	"""``python -m quantbook.worker`` — the out-of-process UDF worker loop. 6.4-3b.
+     2	
+     3	Speaks the `ql-udf` wire protocol over stdio: reads frames from **stdin**, replies
+     4	on **stdout**. stdout is the PROTOCOL channel — the worker must NEVER print to it;
+     5	diagnostics go to stderr. The engine (`ql-udf::ProcessWorker`) spawns this, performs
+     6	the HELLO/HELLO_ACK handshake, and sends one CALL per UDF invocation.
+     7	
+     8	UDFs are registered by handle via `quantbook.register_formula_function`. The trusted
+     9	user module that does the registering is named by the ``QUANTBOOK_UDF_MODULE`` env
+    10	var and imported once at startup (its import side-effects populate the registry).
+    11	"""
+    12	
+    13	import importlib
+    14	import os
+    15	import sys
+    16	
+    17	from . import _codec, _frame, _registry
+    18	
+    19	# Wire protocol version — MUST match `ql-udf::control::PROTOCOL_VERSION`.
+    20	PROTOCOL_VERSION = 1
+    21	
+    22	
+    23	def _import_udf_module():
+    24	    """Import the trusted user module (registers UDFs by handle) if configured."""
+    25	    mod = os.environ.get("QUANTBOOK_UDF_MODULE")
+    26	    if mod:
+    27	        importlib.import_module(mod)
+    28	
+    29	
+    30	def run(stdin, stdout, stderr):
+    31	    """The worker loop. Returns 0 when the engine closes stdin (clean shutdown)."""
+    32	    _import_udf_module()
+    33	    while True:
+    34	        frame = _frame.read_frame(stdin)
+    35	        if frame is None:
+    36	            return 0  # engine closed stdin → clean exit
+    37	        ftype, payload = frame
+    38	        if ftype == _frame.HELLO:
+    39	            # Validate the HELLO shape; the engine decides version compatibility from
+    40	            # our ack. Reply with OUR protocol version + pid (pid → IDE debugpy, 6.4-3d).
+    41	            _codec.decode_hello(payload)
+    42	            _frame.write_frame(
+    43	                stdout, _frame.HELLO_ACK, _codec.encode_hello_ack(PROTOCOL_VERSION, os.getpid())
+    44	            )
+    45	        elif ftype == _frame.CALL:
+    46	            handle, call_id, args = _codec.decode_call(payload)
+    47	            try:
+    48	                fn = _registry.lookup(handle)
+    49	                if fn is None:
+    50	                    raise LookupError("no UDF registered for handle %d" % handle)
+    51	                result = _codec.as_grid(fn(args))
+    52	                _frame.write_frame(stdout, _frame.RETURN, _codec.encode_return(call_id, result))
+    53	            except Exception as e:  # noqa: BLE001 — ANY UDF failure becomes a RAISE, never crashes the loop
+    54	                _frame.write_frame(
+    55	                    stdout, _frame.RAISE, _codec.encode_raise(call_id, type(e).__name__, str(e))
+    56	                )
+    57	        elif ftype == _frame.CANCEL:
+    58	            # Cooperative cancel: v1 best-effort no-op. Hard cancel = the engine
+    59	            # SIGKILLs this process (the worker is designed to be killable mid-call).
+    60	            pass
+    61	        else:
+    62	            stderr.write("quantbook.worker: ignoring unexpected frame type %d\n" % ftype)
+    63	            stderr.flush()
+    64	
+    65	
+    66	def main():
+    67	    return run(sys.stdin.buffer, sys.stdout.buffer, sys.stderr)
+    68	
+    69	
+    70	if __name__ == "__main__":
+    71	    sys.exit(main())
+
+ succeeded in 0ms:
+     1	//! Control-frame payload codecs: `HELLO` / `HELLO_ACK` / `RAISE` / `LOG` / `CANCEL`.
+     2	//!
+     3	//! **6.4-3b.** 6.4-3a defined the [`crate::frame`] envelope + the data-frame
+     4	//! ([`crate::payload`]) `CALL`/`RETURN` payloads, and left the CONTROL-frame payload
+     5	//! internals deliberately opaque `Vec<u8>` until a real worker pinned the handshake.
+     6	//! This module pins them. On-wire layouts (the [`crate::frame`] envelope wraps each
+     7	//! as the `payload`):
+     8	//!
+     9	//! - `HELLO`     (engine→worker): `[u32 LE protocol_version]`
+    10	//! - `HELLO_ACK` (worker→engine): `[u32 LE protocol_version][u32 LE worker_pid]`
+    11	//! - `RAISE`     (worker→engine): `[u64 LE call_id][u32 LE exc_type_len][exc_type utf8][message utf8…]`
+    12	//! - `LOG`       (worker→engine): `[u8 level][message utf8…]`
+    13	//! - `CANCEL`    (engine→worker): `[u64 LE call_id]`
+    14	//!
+    15	//! Every short/garbage payload is a loud [`CodecError`] — never a panic, never a
+    16	//! silent default (No-Fallbacks; design §5). All multi-byte integers are
+    17	//! little-endian, matching [`crate::frame`] + [`crate::payload`]. Strings are raw
+    18	//! UTF-8 (no length prefix on the trailing string, which runs to the payload end).
+    19	//!
+    20	//! The protocol version the engine speaks. Bumped on any breaking wire change.
+    21	//! The worker echoes it in `HELLO_ACK`; a mismatch is a handshake failure.
+    22	
+    23	use crate::codec::CodecError;
+    24	
+    25	/// The wire protocol version the engine and worker must agree on at handshake.
+    26	pub const PROTOCOL_VERSION: u32 = 1;
+    27	
+    28	const U32: usize = 4;
+    29	const U64: usize = 8;
+    30	
+    31	fn need(bytes: &[u8], n: usize) -> Result<(), CodecError> {
+    32	    if bytes.len() < n {
+    33	        return Err(CodecError::ShortHeader {
+    34	            need: n,
+    35	            got: bytes.len(),
+    36	        });
+    37	    }
+    38	    Ok(())
+    39	}
+    40	
+    41	fn read_u32_le(bytes: &[u8], at: usize) -> u32 {
+    42	    u32::from_le_bytes(bytes[at..at + U32].try_into().expect("4 bytes"))
+    43	}
+    44	
+    45	// ---- HELLO ----------------------------------------------------------------
+    46	
+    47	/// Encode a `HELLO` payload (engine→worker): the engine's protocol version.
+    48	pub fn encode_hello(protocol_version: u32) -> Vec<u8> {
+    49	    protocol_version.to_le_bytes().to_vec()
+    50	}
+    51	
+    52	/// Decode a `HELLO` payload → the protocol version.
+    53	pub fn decode_hello(bytes: &[u8]) -> Result<u32, CodecError> {
+    54	    need(bytes, U32)?;
+    55	    Ok(read_u32_le(bytes, 0))
+    56	}
+    57	
+    58	// ---- HELLO_ACK ------------------------------------------------------------
+    59	
+    60	/// The worker's handshake acknowledgement: the protocol version it accepts +
+    61	/// its OS pid (surfaced to the IDE for debugpy attach at 6.4-3d).
+    62	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    63	pub struct HelloAck {
+    64	    pub protocol_version: u32,
+    65	    pub worker_pid: u32,
+    66	}
+    67	
+    68	/// Encode a `HELLO_ACK` payload (worker→engine).
+    69	pub fn encode_hello_ack(ack: &HelloAck) -> Vec<u8> {
+    70	    let mut buf = Vec::with_capacity(2 * U32);
+    71	    buf.extend_from_slice(&ack.protocol_version.to_le_bytes());
+    72	    buf.extend_from_slice(&ack.worker_pid.to_le_bytes());
+    73	    buf
+    74	}
+    75	
+    76	/// Decode a `HELLO_ACK` payload.
+    77	pub fn decode_hello_ack(bytes: &[u8]) -> Result<HelloAck, CodecError> {
+    78	    need(bytes, 2 * U32)?;
+    79	    Ok(HelloAck {
+    80	        protocol_version: read_u32_le(bytes, 0),
+    81	        worker_pid: read_u32_le(bytes, U32),
+    82	    })
+    83	}
+    84	
+    85	// ---- RAISE ----------------------------------------------------------------
+    86	
+    87	/// A Python exception surfaced by the worker (maps to [`crate::UdfError::Raised`]).
+    88	/// `call_id` correlates the raise to the originating `CALL` (design §3).
+    89	#[derive(Debug, Clone, PartialEq, Eq)]
+    90	pub struct Raise {
+    91	    pub call_id: u64,
+    92	    pub exc_type: String,
+    93	    pub message: String,
+    94	}
+    95	
+    96	/// Encode a `RAISE` payload (worker→engine).
+    97	pub fn encode_raise(raise: &Raise) -> Vec<u8> {
+    98	    let et = raise.exc_type.as_bytes();
+    99	    let mut buf = Vec::with_capacity(U64 + U32 + et.len() + raise.message.len());
+   100	    buf.extend_from_slice(&raise.call_id.to_le_bytes());
+   101	    buf.extend_from_slice(&(et.len() as u32).to_le_bytes());
+   102	    buf.extend_from_slice(et);
+   103	    buf.extend_from_slice(raise.message.as_bytes());
+   104	    buf
+   105	}
+   106	
+   107	/// Decode a `RAISE` payload. The `exc_type` length-prefix must not exceed the
+   108	/// remaining bytes (a lying length is a loud error, not an OOB panic).
+   109	pub fn decode_raise(bytes: &[u8]) -> Result<Raise, CodecError> {
+   110	    need(bytes, U64 + U32)?;
+   111	    let call_id = u64::from_le_bytes(bytes[0..U64].try_into().expect("8 bytes"));
+   112	    let et_len = read_u32_le(bytes, U64) as usize;
+   113	    let after_len = &bytes[U64 + U32..];
+   114	    if after_len.len() < et_len {
+   115	        return Err(CodecError::ShortHeader {
+   116	            need: U64 + U32 + et_len,
+   117	            got: bytes.len(),
+   118	        });
+   119	    }
+   120	    let exc_type = std::str::from_utf8(&after_len[..et_len])
+   121	        .map_err(|_| CodecError::BadUtf8 { field: "exc_type" })?
+   122	        .to_string();
+   123	    let message = std::str::from_utf8(&after_len[et_len..])
+   124	        .map_err(|_| CodecError::BadUtf8 { field: "message" })?
+   125	        .to_string();
+   126	    Ok(Raise {
+   127	        call_id,
+   128	        exc_type,
+   129	        message,
+   130	    })
+   131	}
+   132	
+   133	// ---- LOG ------------------------------------------------------------------
+   134	
+   135	/// A worker log line (stdout/stderr passthrough), surfaced as a diagnostic.
+   136	#[derive(Debug, Clone, PartialEq, Eq)]
+   137	pub struct Log {
+   138	    pub level: u8,
+   139	    pub message: String,
+   140	}
+   141	
+   142	/// Encode a `LOG` payload (worker→engine).
+   143	pub fn encode_log(log: &Log) -> Vec<u8> {
+   144	    let mut buf = Vec::with_capacity(1 + log.message.len());
+   145	    buf.push(log.level);
+   146	    buf.extend_from_slice(log.message.as_bytes());
+   147	    buf
+   148	}
+   149	
+   150	/// Decode a `LOG` payload.
+   151	pub fn decode_log(bytes: &[u8]) -> Result<Log, CodecError> {
+   152	    need(bytes, 1)?;
+   153	    let level = bytes[0];
+   154	    let message = std::str::from_utf8(&bytes[1..])
+   155	        .map_err(|_| CodecError::BadUtf8 { field: "log message" })?
+   156	        .to_string();
+   157	    Ok(Log { level, message })
+   158	}
+   159	
+   160	// ---- CANCEL ---------------------------------------------------------------
+   161	
+   162	/// Encode a `CANCEL` payload (engine→worker): the `call_id` to cancel.
+   163	pub fn encode_cancel(call_id: u64) -> Vec<u8> {
+   164	    call_id.to_le_bytes().to_vec()
+   165	}
+   166	
+   167	/// Decode a `CANCEL` payload → the `call_id`.
+   168	pub fn decode_cancel(bytes: &[u8]) -> Result<u64, CodecError> {
+   169	    need(bytes, U64)?;
+   170	    Ok(u64::from_le_bytes(bytes[0..U64].try_into().expect("8 bytes")))
+   171	}
+   172	
+   173	#[cfg(test)]
+   174	mod tests {
+   175	    use super::*;
+   176	
+   177	    #[test]
+   178	    fn hello_round_trips() {
+   179	        let bytes = encode_hello(PROTOCOL_VERSION);
+   180	        assert_eq!(decode_hello(&bytes).unwrap(), PROTOCOL_VERSION);
+   181	    }
+   182	
+   183	    #[test]
+   184	    fn hello_ack_round_trips() {
+   185	        let ack = HelloAck {
+   186	            protocol_version: 1,
+   187	            worker_pid: 4242,
+   188	        };
+   189	        assert_eq!(decode_hello_ack(&encode_hello_ack(&ack)).unwrap(), ack);
+   190	    }
+   191	
+   192	    #[test]
+   193	    fn raise_round_trips_including_empty_and_unicode() {
+   194	        for r in [
+   195	            Raise {
+   196	                call_id: 5,
+   197	                exc_type: "ValueError".into(),
+   198	                message: "boom".into(),
+   199	            },
+   200	            Raise {
+   201	                call_id: 0,
+   202	                exc_type: "".into(),
+   203	                message: "".into(),
+   204	            },
+   205	            Raise {
+   206	                call_id: u64::MAX,
+   207	                exc_type: "KeyError".into(),
+   208	                message: "naïve λ message with : colons".into(),
+   209	            },
+   210	        ] {
+   211	            assert_eq!(decode_raise(&encode_raise(&r)).unwrap(), r);
+   212	        }
+   213	    }
+   214	
+   215	    #[test]
+   216	    fn log_round_trips() {
+   217	        let log = Log {
+   218	            level: 3,
+   219	            message: "a warning".into(),
+   220	        };
+   221	        assert_eq!(decode_log(&encode_log(&log)).unwrap(), log);
+   222	    }
+   223	
+   224	    #[test]
+   225	    fn cancel_round_trips() {
+   226	        let bytes = encode_cancel(u64::MAX);
+   227	        assert_eq!(decode_cancel(&bytes).unwrap(), u64::MAX);
+   228	    }
+   229	
+   230	    #[test]
+   231	    fn short_payloads_are_loud_not_panics() {
+   232	        assert!(matches!(
+   233	            decode_hello(&[1, 2]).unwrap_err(),
+   234	            CodecError::ShortHeader { need: 4, got: 2 }
+   235	        ));
+   236	        assert!(matches!(
+   237	            decode_hello_ack(&[0u8; 7]).unwrap_err(),
+   238	            CodecError::ShortHeader { need: 8, got: 7 }
+   239	        ));
+   240	        assert!(matches!(
+   241	            decode_cancel(&[0u8; 3]).unwrap_err(),
+   242	            CodecError::ShortHeader { need: 8, got: 3 }
+   243	        ));
+   244	        // RAISE shorter than its call_id + exc_type-len header.
+   245	        assert!(matches!(
+   246	            decode_raise(&[1, 2]).unwrap_err(),
+   247	            CodecError::ShortHeader { .. }
+   248	        ));
+   249	        // LOG with an empty payload (need the level byte).
+   250	        assert!(matches!(
+   251	            decode_log(&[]).unwrap_err(),
+   252	            CodecError::ShortHeader { need: 1, got: 0 }
+   253	        ));
+   254	    }
+   255	
+   256	    #[test]
+   257	    fn raise_with_lying_exc_type_length_is_loud() {
+   258	        // call_id (8) + claim exc_type is 100 bytes but provide only 2 → ShortHeader, not OOB panic.
+   259	        let mut bytes = 1u64.to_le_bytes().to_vec();
+   260	        bytes.extend_from_slice(&(100u32).to_le_bytes());
+   261	        bytes.extend_from_slice(b"ab");
+   262	        assert!(matches!(
+   263	            decode_raise(&bytes).unwrap_err(),
+   264	            CodecError::ShortHeader { .. }
+   265	        ));
+   266	    }
+   267	
+   268	    #[test]
+   269	    fn raise_rejects_invalid_utf8() {
+   270	        // call_id (8) + exc_type_len = 2, then two invalid-UTF-8 bytes.
+   271	        let mut bytes = 1u64.to_le_bytes().to_vec();
+   272	        bytes.extend_from_slice(&(2u32).to_le_bytes());
+   273	        bytes.extend_from_slice(&[0xFF, 0xFE]);
+   274	        assert!(matches!(
+   275	            decode_raise(&bytes).unwrap_err(),
+   276	            CodecError::BadUtf8 { field: "exc_type" }
+   277	        ));
+   278	    }
+   279	}
+
+exec
+/bin/zsh -lc 'nl -ba crates/ql-udf/src/worker.rs' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+     1	//! The [`UdfWorker`] abstraction + its error taxonomy + an in-process
+     2	//! [`MockWorker`].
+     3	//!
+     4	//! **6.4-3a.** The eval layer (6.4-3c) will hold a `&mut dyn UdfWorker` on the
+     5	//! eval context and call it from the `RegisteredFn::Udf` dispatch arm. This cycle
+     6	//! defines the trait + the loud [`UdfError`] taxonomy and proves the call paths
+     7	//! (success / raise / timeout) against a [`MockWorker`] — **no subprocess, no
+     8	//! Python**. The real process-backed worker (spawn / handshake / timeout-kill /
+     9	//! respawn) lands in 6.4-3b and will implement this same trait.
+    10	
+    11	use std::time::Duration;
+    12	
+    13	use ql_types::ArrayValue;
+    14	
+    15	use crate::codec::CodecError;
+    16	
+    17	/// Outcome of a failed UDF dispatch. Every variant maps to a *deterministic*
+    18	/// engine-side result at the call site (6.4-3c) — a cell error value + a
+    19	/// `CellDiagnostic` — never a panic and never a silently-dropped failure
+    20	/// (No-Fallbacks; contract §10.4 exit tests 6 + 7).
+    21	///
+    22	/// **6.4-3b completed the taxonomy** (the M3 item the 6.4-3a audit filed): the
+    23	/// process-backed [`crate::process::ProcessWorker`] can hit `Handshake` (the
+    24	/// `HELLO`/`HELLO_ACK` protocol-version exchange failed) and `Protocol` (a
+    25	/// malformed control frame), and `Cancelled` is reserved for a cooperative/hard
+    26	/// cancel distinct from a deadline `Timeout` (exit test 6 treats user-cancel and
+    27	/// deadline-breach differently; the v1 hard-cancel mechanism is worker-kill →
+    28	/// `Timeout`, with `Cancelled` wired when cooperative `CANCEL` lands).
+    29	#[derive(Debug, thiserror::Error)]
+    30	pub enum UdfError {
+    31	    /// The Python callable raised. Maps to `#CALC!`/`#VALUE!` + a diagnostic
+    32	    /// carrying `exc_type` + `message` (exit test 7).
+    33	    #[error("udf raised {exc_type}: {message}")]
+    34	    Raised { exc_type: String, message: String },
+    35	    /// The call exceeded its deadline. The worker is killed; the result (if any
+    36	    /// arrives late) is dropped (exit test 6). Maps to `#TIMEOUT!`.
+    37	    #[error("udf timed out after {0:?}")]
+    38	    Timeout(Duration),
+    39	    /// The call was cancelled (cooperative `CANCEL` / hard cancel) BEFORE a
+    40	    /// deadline breach — distinct from [`UdfError::Timeout`] so the engine can
+    41	    /// surface a cancel diagnostic rather than `#TIMEOUT!` (exit test 6).
+    42	    #[error("udf call cancelled")]
+    43	    Cancelled,
+    44	    /// The worker handshake failed: the worker reported an incompatible protocol
+    45	    /// version. Maps to `#CALC!` + a diagnostic; the worker is not usable.
+    46	    #[error("udf worker handshake: protocol mismatch (engine {expected}, worker {got})")]
+    47	    Handshake { expected: u32, got: u32 },
+    48	    /// The worker spoke a malformed/unexpected frame (a wire-protocol violation
+    49	    /// that is neither a clean `Raised` nor a codec error). Maps to `#CALC!`.
+    50	    #[error("udf worker protocol violation: {0}")]
+    51	    Protocol(String),
+    52	    /// The worker process died / the transport broke. Maps to `#CALC!` + a
+    53	    /// diagnostic; the worker respawns lazily on the next call.
+    54	    #[error("udf worker died / transport broken: {0}")]
+    55	    WorkerDied(String),
+    56	    /// Args could not be encoded, or the result could not be decoded.
+    57	    #[error("udf codec: {0}")]
+    58	    Codec(#[from] CodecError),
+    59	}
+    60	
+    61	/// Dispatch one UDF call: marshal `args`, invoke the worker function identified by
+    62	/// `handle`, and return its result grid — subject to `deadline`.
+    63	///
+    64	/// Implementations must guarantee: a `deadline` breach surfaces
+    65	/// [`UdfError::Timeout`] (and, for a real process worker, kills it), and a dead
+    66	/// worker surfaces [`UdfError::WorkerDied`] rather than hanging. A scalar result
+    67	/// is a 1×1 [`ArrayValue`].
+    68	pub trait UdfWorker {
+    69	    fn call(
+    70	        &mut self,
+    71	        handle: u64,
+    72	        args: &ArrayValue,
+    73	        deadline: Duration,
+    74	    ) -> Result<ArrayValue, UdfError>;
+    75	}
+    76	
+    77	/// In-process worker double for tests + for wiring the eval layer before the real
+    78	/// process worker exists. Runs a Rust closure in place of the Python callable.
+    79	///
+    80	/// It does NOT enforce `deadline` itself (there is no out-of-process work to time
+    81	/// out) — a test simulates a timeout by having the closure return
+    82	/// [`UdfError::Timeout`]. Real deadline enforcement + process-kill is 6.4-3b.
+    83	pub struct MockWorker<F> {
+    84	    responder: F,
+    85	}
+    86	
+    87	impl<F> MockWorker<F>
+    88	where
+    89	    F: FnMut(u64, &ArrayValue) -> Result<ArrayValue, UdfError>,
+    90	{
+    91	    pub fn new(responder: F) -> Self {
+    92	        Self { responder }
+    93	    }
+    94	}
+    95	
+    96	impl<F> UdfWorker for MockWorker<F>
+    97	where
+    98	    F: FnMut(u64, &ArrayValue) -> Result<ArrayValue, UdfError>,
+    99	{
+   100	    fn call(
+   101	        &mut self,
+   102	        handle: u64,
+   103	        args: &ArrayValue,
+   104	        _deadline: Duration,
+   105	    ) -> Result<ArrayValue, UdfError> {
+   106	        (self.responder)(handle, args)
+   107	    }
+   108	}
+   109	
+   110	#[cfg(test)]
+   111	mod tests {
+   112	    use super::*;
+   113	    use crate::frame::{read_frame, write_frame, Frame, FrameType};
+   114	    use crate::payload::{decode_call, decode_return, encode_call, encode_return, CallPayload, ReturnPayload};
+   115	    use ql_types::Value;
+   116	    use std::sync::Arc;
+   117	
+   118	    fn scalar(v: Value) -> ArrayValue {
+   119	        ArrayValue::singleton(v)
+   120	    }
+   121	
+   122	    #[test]
+   123	    fn mock_worker_returns_a_result_grid() {
+   124	        // A UDF that doubles its single numeric arg.
+   125	        let mut w = MockWorker::new(|_handle, args: &ArrayValue| {
+   126	            let n = match args.get(0, 0) {
+   127	                Some(Value::Number(x)) => *x,
+   128	                _ => return Err(UdfError::Raised {
+   129	                    exc_type: "TypeError".into(),
+   130	                    message: "expected a number".into(),
+   131	                }),
+   132	            };
+   133	            Ok(ArrayValue::singleton(Value::Number(n * 2.0)))
+   134	        });
+   135	        let out = w
+   136	            .call(7, &scalar(Value::Number(21.0)), Duration::from_secs(1))
+   137	            .unwrap();
+   138	        assert_eq!(out.get(0, 0), Some(&Value::Number(42.0)));
+   139	    }
+   140	
+   141	    #[test]
+   142	    fn mock_worker_surfaces_raise_and_timeout() {
+   143	        let mut raiser = MockWorker::new(|_h, _a| {
+   144	            Err(UdfError::Raised {
+   145	                exc_type: "ValueError".into(),
+   146	                message: "boom".into(),
+   147	            })
+   148	        });
+   149	        assert!(matches!(
+   150	            raiser.call(1, &scalar(Value::Blank), Duration::from_secs(1)),
+   151	            Err(UdfError::Raised { .. })
+   152	        ));
+   153	
+   154	        let mut slow = MockWorker::new(|_h, _a| Err(UdfError::Timeout(Duration::from_millis(500))));
+   155	        assert!(matches!(
+   156	            slow.call(1, &scalar(Value::Blank), Duration::from_millis(500)),
+   157	            Err(UdfError::Timeout(_))
+   158	        ));
+   159	    }
+   160	
+   161	    /// The load-bearing composition test: push a CALL (handle + call_id + args) and
+   162	    /// its RETURN (call_id + result) through the FULL wire pipeline
+   163	    /// (payload → frame → … → frame → payload) with the mock standing in for the
+   164	    /// worker process. Proves [`crate::payload`] + [`crate::frame`] + [`crate::codec`]
+   165	    /// compose into a faithful round-trip — the thing the real 6.4-3b worker relies
+   166	    /// on across the actual pipe — AND that the dispatch `handle` + correlation
+   167	    /// `call_id` survive the trip (6.4-3a audit-fix: `call-return-missing-ids`).
+   168	    #[test]
+   169	    fn call_round_trips_through_frame_and_codec() {
+   170	        // Engine-side args grid (a 1×3 row of mixed values).
+   171	        let args = ArrayValue::new(
+   172	            1,
+   173	            3,
+   174	            vec![
+   175	                Value::Number(10.0),
+   176	                Value::Text(Arc::from("x")),
+   177	                Value::Error(ql_types::ErrorValue::NA),
+   178	            ],
+   179	        )
+   180	        .unwrap();
+   181	        let call = CallPayload {
+   182	            handle: 7,
+   183	            call_id: 99,
+   184	            args,
+   185	        };
+   186	
+   187	        // --- engine → wire: typed CALL payload inside a Call frame ---
+   188	        let call_frame = Frame::new(FrameType::Call, encode_call(&call).unwrap());
+   189	        let mut pipe = Vec::new();
+   190	        write_frame(&mut pipe, &call_frame).unwrap();
+   191	
+   192	        // --- worker side: read the CALL, decode handle/call_id/args, "run" the UDF, encode RETURN ---
+   193	        let mut cursor = std::io::Cursor::new(pipe);
+   194	        let got = read_frame(&mut cursor).unwrap().expect("a frame");
+   195	        assert_eq!(got.frame_type, FrameType::Call);
+   196	        let decoded_call = decode_call(&got.payload).unwrap();
+   197	        assert_eq!(decoded_call.handle, 7, "handle survives the wire");
+   198	        assert_eq!(decoded_call.call_id, 99, "call_id survives the wire");
+   199	        // The worker echoes its args back as the result (identity UDF), correlating
+   200	        // the RETURN to the originating call_id.
+   201	        let ret = ReturnPayload {
+   202	            call_id: decoded_call.call_id,
+   203	            result: decoded_call.args.clone(),
+   204	        };
+   205	        let return_frame = Frame::new(FrameType::Return, encode_return(&ret).unwrap());
+   206	        let mut back = Vec::new();
+   207	        write_frame(&mut back, &return_frame).unwrap();
+   208	
+   209	        // --- wire → engine: read the RETURN, decode, check correlation + grid ---
+   210	        let mut rcursor = std::io::Cursor::new(back);
+   211	        let rframe = read_frame(&mut rcursor).unwrap().expect("a frame");
+   212	        assert_eq!(rframe.frame_type, FrameType::Return);
+   213	        let decoded_return = decode_return(&rframe.payload).unwrap();
+   214	        assert_eq!(decoded_return.call_id, 99, "RETURN correlates to the CALL");
+   215	        let final_grid = decoded_return.result;
+   216	
+   217	        // The grid survived engine → Arrow → frame → Arrow → engine intact.
+   218	        assert_eq!(final_grid.rows(), 1);
+   219	        assert_eq!(final_grid.cols(), 3);
+   220	        assert_eq!(final_grid.get(0, 0), Some(&Value::Number(10.0)));
+   221	        assert_eq!(final_grid.get(0, 1), Some(&Value::Text(Arc::from("x"))));
+   222	        assert_eq!(
+   223	            final_grid.get(0, 2),
+   224	            Some(&Value::Error(ql_types::ErrorValue::NA))
+   225	        );
+   226	    }
+   227	}
+
+exec
+/bin/zsh -lc 'nl -ba crates/ql-udf/src/process.rs' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+     1	//! [`ProcessWorker`] — a managed Python worker process implementing [`UdfWorker`].
+     2	//!
+     3	//! **6.4-3b.** This is the real, process-backed worker the 6.4-3a `MockWorker`
+     4	//! stood in for. It spawns `python -m quantbook.worker`, performs the
+     5	//! `HELLO`/`HELLO_ACK` handshake, sends one `CALL` per UDF invocation, and reads
+     6	//! the `RETURN`/`RAISE`/`LOG` response — subject to a deadline. On a deadline
+     7	//! breach (or any transport break) it KILLS the worker (hard cancel, design §5)
+     8	//! and marks itself dead; the next [`UdfWorker::call`] lazily re-spawns +
+     9	//! re-handshakes. A late `RETURN` arriving after a kill is dropped because the
+    10	//! reader thread dies with the process (contract §10.4 exit test 6).
+    11	//!
+    12	//! **Threading model (single-in-flight, matching the SYNC recalc):** a per-worker
+    13	//! reader thread reads frames off the child's stdout and forwards them on an
+    14	//! `mpsc` channel; `call()` writes the `CALL`, then `recv_timeout`s for the
+    15	//! correlated `RETURN`/`RAISE` (skipping `LOG` and stale `call_id`s). The engine's
+    16	//! recalc evaluates one UDF cell at a time, so there is at most one outstanding
+    17	//! call; `call_id` correlation is still enforced defensively.
+    18	//!
+    19	//! **No new dependencies** — only `std::process` / `std::thread` / `std::sync::mpsc`.
+    20	//! Every failure is a deterministic [`UdfError`] (No-Fallbacks): a missing
+    21	//! interpreter, a failed handshake, a dead worker, a protocol violation, or a codec
+    22	//! error never panics the caller.
+    23	//!
+    24	//! Production interpreter discovery + trusted-workspace gating + debugpy attach are
+    25	//! 6.4-3d; [`PythonWorkerConfig`] takes the interpreter + module path explicitly.
+    26	
+    27	use std::io::BufReader;
+    28	use std::path::PathBuf;
+    29	use std::process::{Child, ChildStdin, Command, Stdio};
+    30	use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+    31	use std::thread::JoinHandle;
+    32	use std::time::{Duration, Instant};
+    33	
+    34	use ql_types::ArrayValue;
+    35	
+    36	use crate::control::{decode_hello_ack, decode_log, decode_raise, encode_hello, PROTOCOL_VERSION};
+    37	use crate::frame::{read_frame, write_frame, Frame, FrameError, FrameType};
+    38	use crate::payload::{decode_return, encode_call, CallPayload};
+    39	use crate::worker::{UdfError, UdfWorker};
+    40	
+    41	/// How the engine launches + talks to a Python worker. Interpreter + module path
+    42	/// are explicit (production trusted-workspace discovery is 6.4-3d).
+    43	#[derive(Debug, Clone)]
+    44	pub struct PythonWorkerConfig {
+    45	    /// The Python interpreter to launch (e.g. a workspace venv's `python3`).
+    46	    pub python: PathBuf,
+    47	    /// The `-m` module that runs the worker loop. Default `"quantbook.worker"`.
+    48	    pub module: String,
+    49	    /// Directories prepended to `PYTHONPATH` (so the worker module + the
+    50	    /// `quantbook` package resolve). The inherited `PYTHONPATH` is appended.
+    51	    pub pythonpath: Vec<PathBuf>,
+    52	    /// The trusted user module the worker imports to register UDFs by handle
+    53	    /// (passed as `QUANTBOOK_UDF_MODULE`). `None` = the worker registers nothing
+    54	    /// (every `CALL` then surfaces a `[function_not_found]`-style raise).
+    55	    pub udf_module: Option<String>,
+    56	    /// The wire protocol version the engine speaks (checked at handshake).
+    57	    pub protocol_version: u32,
+    58	    /// How long to wait for `HELLO_ACK` after spawning before declaring the
+    59	    /// worker dead.
+    60	    pub handshake_timeout: Duration,
+    61	}
+    62	
+    63	impl PythonWorkerConfig {
+    64	    /// Config with defaults: module `quantbook.worker`, current [`PROTOCOL_VERSION`],
+    65	    /// a 5s handshake timeout, no extra `PYTHONPATH` / udf module.
+    66	    pub fn new(python: impl Into<PathBuf>) -> Self {
+    67	        Self {
+    68	            python: python.into(),
+    69	            module: "quantbook.worker".to_string(),
+    70	            pythonpath: Vec::new(),
+    71	            udf_module: None,
+    72	            protocol_version: PROTOCOL_VERSION,
+    73	            handshake_timeout: Duration::from_secs(5),
+    74	        }
+    75	    }
+    76	
+    77	    /// Builder: prepend a directory to `PYTHONPATH`.
+    78	    pub fn with_pythonpath(mut self, dir: impl Into<PathBuf>) -> Self {
+    79	        self.pythonpath.push(dir.into());
+    80	        self
+    81	    }
+    82	
+    83	    /// Builder: set the trusted user module the worker imports.
+    84	    pub fn with_udf_module(mut self, module: impl Into<String>) -> Self {
+    85	        self.udf_module = Some(module.into());
+    86	        self
+    87	    }
+    88	}
+    89	
+    90	/// A message from the reader thread to `call()`. A clean stdout EOF disconnects the
+    91	/// channel (no message); a frame-decode failure is forwarded as `Error` so the
+    92	/// caller can distinguish a torn stream from a clean shutdown.
+    93	enum ReaderMsg {
+    94	    Frame(Frame),
+    95	    Error(String),
+    96	}
+    97	
+    98	/// A live worker process + its stdin writer + the reader-thread channel.
+    99	struct WorkerProcess {
+   100	    child: Child,
+   101	    stdin: ChildStdin,
+   102	    rx: Receiver<ReaderMsg>,
+   103	    reader: Option<JoinHandle<()>>,
+   104	    /// The OS pid (also surfaced to the IDE for debugpy attach at 6.4-3d).
+   105	    pid: u32,
+   106	}
+   107	
+   108	impl Drop for WorkerProcess {
+   109	    fn drop(&mut self) {
+   110	        // Hard-stop the child and REAP it (no zombies), then let the reader thread
+   111	        // wind down on the resulting stdout EOF. Errors are ignored — the process
+   112	        // may already be dead.
+   113	        let _ = self.child.kill();
+   114	        let _ = self.child.wait();
+   115	        if let Some(h) = self.reader.take() {
+   116	            // The child is reaped, so its stdout is closed → the reader's
+   117	            // `read_frame` returns EOF and the thread exits promptly; this join
+   118	            // does not block.
+   119	            let _ = h.join();
+   120	        }
+   121	    }
+   122	}
+   123	
+   124	/// A managed Python worker process implementing [`UdfWorker`].
+   125	pub struct ProcessWorker {
+   126	    config: PythonWorkerConfig,
+   127	    proc: Option<WorkerProcess>,
+   128	    next_call_id: u64,
+   129	}
+   130	
+   131	impl ProcessWorker {
+   132	    /// Create a worker handle. The process is spawned lazily on the first
+   133	    /// [`UdfWorker::call`] (or via [`ProcessWorker::ensure_started`]).
+   134	    pub fn new(config: PythonWorkerConfig) -> Self {
+   135	        Self {
+   136	            config,
+   137	            proc: None,
+   138	            next_call_id: 1,
+   139	        }
+   140	    }
+   141	
+   142	    /// The live worker's OS pid, if spawned.
+   143	    pub fn pid(&self) -> Option<u32> {
+   144	        self.proc.as_ref().map(|p| p.pid)
+   145	    }
+   146	
+   147	    /// Eagerly spawn + handshake (otherwise the first `call()` does it lazily).
+   148	    pub fn ensure_started(&mut self) -> Result<(), UdfError> {
+   149	        if self.proc.is_none() {
+   150	            self.proc = Some(self.spawn()?);
+   151	        }
+   152	        Ok(())
+   153	    }
+   154	
+   155	    /// Kill + reap the worker and mark dead so the next call re-spawns.
+   156	    pub fn shutdown(&mut self) {
+   157	        self.proc = None; // `WorkerProcess::drop` kills + reaps.
+   158	    }
+   159	
+   160	    fn spawn(&self) -> Result<WorkerProcess, UdfError> {
+   161	        let mut cmd = Command::new(&self.config.python);
+   162	        cmd.arg("-m")
+   163	            .arg(&self.config.module)
+   164	            .stdin(Stdio::piped())
+   165	            .stdout(Stdio::piped())
+   166	            .stderr(Stdio::inherit()); // worker stderr (stray prints / tracebacks) → our stderr
+   167	
+   168	        // PYTHONPATH = configured dirs ++ inherited (so site-packages stays reachable
+   169	        // via the normal interpreter config; pyarrow lives there).
+   170	        let mut paths = self.config.pythonpath.clone();
+   171	        if let Some(existing) = std::env::var_os("PYTHONPATH") {
+   172	            paths.extend(std::env::split_paths(&existing));
+   173	        }
+   174	        if !paths.is_empty() {
+   175	            let joined = std::env::join_paths(paths)
+   176	                .map_err(|e| UdfError::WorkerDied(format!("invalid PYTHONPATH: {e}")))?;
+   177	            cmd.env("PYTHONPATH", joined);
+   178	        }
+   179	        if let Some(m) = &self.config.udf_module {
+   180	            cmd.env("QUANTBOOK_UDF_MODULE", m);
+   181	        }
+   182	
+   183	        let mut child = cmd.spawn().map_err(|e| {
+   184	            UdfError::WorkerDied(format!(
+   185	                "spawn {} -m {}: {e}",
+   186	                self.config.python.display(),
+   187	                self.config.module
+   188	            ))
+   189	        })?;
+   190	        let stdin = child
+   191	            .stdin
+   192	            .take()
+   193	            .ok_or_else(|| UdfError::WorkerDied("worker stdin pipe missing".to_string()))?;
+   194	        let stdout = child
+   195	            .stdout
+   196	            .take()
+   197	            .ok_or_else(|| UdfError::WorkerDied("worker stdout pipe missing".to_string()))?;
+   198	        let pid = child.id();
+   199	
+   200	        let (tx, rx) = mpsc::channel();
+   201	        let reader = std::thread::spawn(move || {
+   202	            let mut r = BufReader::new(stdout);
+   203	            loop {
+   204	                match read_frame(&mut r) {
+   205	                    Ok(Some(f)) => {
+   206	                        if tx.send(ReaderMsg::Frame(f)).is_err() {
+   207	                            break; // receiver dropped (worker being torn down)
+   208	                        }
+   209	                    }
+   210	                    Ok(None) => break, // clean EOF — worker closed stdout
+   211	                    Err(e) => {
+   212	                        let _ = tx.send(ReaderMsg::Error(e.to_string()));
+   213	                        break;
+   214	                    }
+   215	                }
+   216	            }
+   217	        });
+   218	
+   219	        let mut wp = WorkerProcess {
+   220	            child,
+   221	            stdin,
+   222	            rx,
+   223	            reader: Some(reader),
+   224	            pid,
+   225	        };
+   226	        self.handshake(&mut wp)?;
+   227	        Ok(wp)
+   228	    }
+   229	
+   230	    fn handshake(&self, wp: &mut WorkerProcess) -> Result<(), UdfError> {
+   231	        let hello = Frame::new(FrameType::Hello, encode_hello(self.config.protocol_version));
+   232	        write_frame(&mut wp.stdin, &hello)
+   233	            .map_err(|e| UdfError::WorkerDied(format!("write HELLO: {e}")))?;
+   234	        // (write_frame writes the whole frame; ChildStdin is unbuffered, no flush needed,
+   235	        // but flushing is harmless and explicit.)
+   236	        use std::io::Write;
+   237	        wp.stdin
+   238	            .flush()
+   239	            .map_err(|e| UdfError::WorkerDied(format!("flush HELLO: {e}")))?;
+   240	
+   241	        match wp.rx.recv_timeout(self.config.handshake_timeout) {
+   242	            Ok(ReaderMsg::Frame(f)) => {
+   243	                if f.frame_type != FrameType::HelloAck {
+   244	                    return Err(UdfError::Protocol(format!(
+   245	                        "expected HELLO_ACK, got {:?}",
+   246	                        f.frame_type
+   247	                    )));
+   248	                }
+   249	                let ack = decode_hello_ack(&f.payload)?;
+   250	                if ack.protocol_version != self.config.protocol_version {
+   251	                    return Err(UdfError::Handshake {
+   252	                        expected: self.config.protocol_version,
+   253	                        got: ack.protocol_version,
+   254	                    });
+   255	                }
+   256	                Ok(())
+   257	            }
+   258	            Ok(ReaderMsg::Error(e)) => {
+   259	                Err(UdfError::WorkerDied(format!("reader during handshake: {e}")))
+   260	            }
+   261	            Err(RecvTimeoutError::Timeout) => {
+   262	                Err(UdfError::WorkerDied("handshake timed out (no HELLO_ACK)".to_string()))
+   263	            }
+   264	            Err(RecvTimeoutError::Disconnected) => {
+   265	                Err(UdfError::WorkerDied("worker exited before handshake".to_string()))
+   266	            }
+   267	        }
+   268	    }
+   269	
+   270	    fn kill_worker(&mut self) {
+   271	        // Dropping the `WorkerProcess` kills + reaps the child and winds down the
+   272	        // reader thread; setting `None` marks dead so the next call re-spawns.
+   273	        self.proc = None;
+   274	    }
+   275	}
+   276	
+   277	impl UdfWorker for ProcessWorker {
+   278	    fn call(
+   279	        &mut self,
+   280	        handle: u64,
+   281	        args: &ArrayValue,
+   282	        deadline: Duration,
+   283	    ) -> Result<ArrayValue, UdfError> {
+   284	        let call_id = self.next_call_id;
+   285	        self.next_call_id = self.next_call_id.wrapping_add(1);
+   286	
+   287	        // (Re)spawn if dead. A spawn/handshake failure is the caller's error.
+   288	        self.ensure_started()?;
+   289	
+   290	        // Encode + send the CALL.
+   291	        let payload = encode_call(&CallPayload {
+   292	            handle,
+   293	            call_id,
+   294	            args: args.clone(),
+   295	        })?;
+   296	        let frame = Frame::new(FrameType::Call, payload);
+   297	        let write_res: Result<(), FrameError> = {
+   298	            let wp = self.proc.as_mut().expect("spawned above");
+   299	            use std::io::Write;
+   300	            write_frame(&mut wp.stdin, &frame).and_then(|()| wp.stdin.flush().map_err(FrameError::from))
+   301	        };
+   302	        if let Err(e) = write_res {
+   303	            self.kill_worker();
+   304	            return Err(UdfError::WorkerDied(format!("write CALL: {e}")));
+   305	        }
+   306	
+   307	        // Await the correlated RETURN/RAISE, honoring the deadline.
+   308	        let deadline_at = Instant::now() + deadline;
+   309	        loop {
+   310	            let remaining = deadline_at.saturating_duration_since(Instant::now());
+   311	            let msg = {
+   312	                let wp = self.proc.as_mut().expect("spawned above");
+   313	                wp.rx.recv_timeout(remaining)
+   314	            };
+   315	            match msg {
+   316	                Ok(ReaderMsg::Frame(f)) => match f.frame_type {
+   317	                    FrameType::Return => {
+   318	                        let ret = decode_return(&f.payload)?;
+   319	                        if ret.call_id != call_id {
+   320	                            continue; // stale response from a prior call — skip
+   321	                        }
+   322	                        return Ok(ret.result);
+   323	                    }
+   324	                    FrameType::Raise => {
+   325	                        let r = decode_raise(&f.payload)?;
+   326	                        if r.call_id != call_id {
+   327	                            continue;
+   328	                        }
+   329	                        return Err(UdfError::Raised {
+   330	                            exc_type: r.exc_type,
+   331	                            message: r.message,
+   332	                        });
+   333	                    }
+   334	                    FrameType::Log => {
+   335	                        let log = decode_log(&f.payload)?;
+   336	                        // Surfaced visibly (NOT silently dropped). 6.4-3c routes worker
+   337	                        // logs to `CellDiagnostic`s; until then they go to stderr.
+   338	                        eprintln!(
+   339	                            "[quantbook-udf worker log lvl={}] {}",
+   340	                            log.level, log.message
+   341	                        );
+   342	                        continue;
+   343	                    }
+   344	                    other => {
+   345	                        self.kill_worker();
+   346	                        return Err(UdfError::Protocol(format!(
+   347	                            "unexpected {other:?} frame while awaiting RETURN/RAISE for call_id {call_id}"
+   348	                        )));
+   349	                    }
+   350	                },
+   351	                Ok(ReaderMsg::Error(e)) => {
+   352	                    self.kill_worker();
+   353	                    return Err(UdfError::WorkerDied(format!("reader: {e}")));
+   354	                }
+   355	                Err(RecvTimeoutError::Timeout) => {
+   356	                    // Hard cancel: kill the worker so a late RETURN is dropped (exit test 6).
+   357	                    self.kill_worker();
+   358	                    return Err(UdfError::Timeout(deadline));
+   359	                }
+   360	                Err(RecvTimeoutError::Disconnected) => {
+   361	                    self.kill_worker();
+   362	                    return Err(UdfError::WorkerDied("worker exited mid-call".to_string()));
+   363	                }
+   364	            }
+   365	        }
+   366	    }
+   367	}
+   368	
+   369	#[cfg(test)]
+   370	mod tests {
+   371	    use super::*;
+   372	    use ql_types::Value;
+   373	
+   374	    #[test]
+   375	    fn config_defaults_and_builders() {
+   376	        let c = PythonWorkerConfig::new("/usr/bin/python3")
+   377	            .with_pythonpath("/some/dir")
+   378	            .with_udf_module("my.udfs");
+   379	        assert_eq!(c.module, "quantbook.worker");
+   380	        assert_eq!(c.protocol_version, PROTOCOL_VERSION);
+   381	        assert_eq!(c.pythonpath, vec![PathBuf::from("/some/dir")]);
+   382	        assert_eq!(c.udf_module.as_deref(), Some("my.udfs"));
+   383	    }
+   384	
+   385	    /// A non-existent interpreter must surface a loud `WorkerDied` (No-Fallbacks),
+   386	    /// NOT a panic — and the worker stays usable as a handle (next call retries).
+   387	    #[test]
+   388	    fn missing_interpreter_is_worker_died_not_panic() {
+   389	        let cfg = PythonWorkerConfig::new("/definitely/not/a/real/python-xyzzy");
+   390	        let mut w = ProcessWorker::new(cfg);
+   391	        let err = w
+   392	            .call(1, &ArrayValue::singleton(Value::Number(1.0)), Duration::from_secs(1))
+   393	            .unwrap_err();
+   394	        assert!(
+   395	            matches!(err, UdfError::WorkerDied(_)),
+   396	            "missing interpreter must be WorkerDied, got {err:?}"
+   397	        );
+   398	        // No live process was created.
+   399	        assert_eq!(w.pid(), None);
+   400	    }
+   401	}
+
+exec
+/bin/zsh -lc 'nl -ba crates/ql-udf/src/codec.rs' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+exec
+/bin/zsh -lc 'nl -ba crates/ql-udf/src/payload.rs' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+exec
+/bin/zsh -lc 'nl -ba crates/ql-udf/src/frame.rs' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+exec
+/bin/zsh -lc 'nl -ba crates/quantbook-py/python/quantbook/_frame.py' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+     1	//! Typed `CALL` / `RETURN` frame payloads — the correlation + dispatch header that
+     2	//! rides in front of the Arrow grid.
+     3	//!
+     4	//! **6.4-3a audit-fix (`call-return-missing-ids`).** The wire protocol (design §3)
+     5	//! specifies `CALL { handle, call_id, args }` and `RETURN { call_id, result }` —
+     6	//! NOT a bare Arrow grid. Without `handle` the worker cannot know which registered
+     7	//! Python callable to invoke; without `call_id` the engine cannot correlate a
+     8	//! response, drop a late result after a deadline/kill, or address a `CANCEL`
+     9	//! (contract §6.2 / §10.4 exit test 6). This module defines those payload structures
+    10	//! so the contract a real Python worker speaks is pinned NOW, at the protocol layer,
+    11	//! rather than retrofitted under the 6.4-3c eval-wiring audit.
+    12	//!
+    13	//! **On-wire layout** (the [`crate::frame`] envelope wraps these as the `payload`):
+    14	//! - `CALL`   payload = `[u64 LE handle][u64 LE call_id][Arrow IPC args grid]`
+    15	//! - `RETURN` payload = `[u64 LE call_id][Arrow IPC result grid]`
+    16	//!
+    17	//! The fixed `u64`-LE header is deliberately trivial (no Arrow, no length prefix —
+    18	//! the [`crate::frame`] layer already delimits the whole payload). The grid bytes
+    19	//! are produced/consumed by [`crate::codec`], which validates them as a trust
+    20	//! boundary. A payload shorter than its header is a loud [`CodecError::ShortHeader`]
+    21	//! — never a panic (No-Fallbacks; design §5).
+    22	//!
+    23	//! The actual correlation MECHANICS (minting `call_id`s, the in-flight table,
+    24	//! dropping late results) live in the process-backed worker handle (6.4-3b); this
+    25	//! module owns only the on-wire structure + its codec.
+    26	
+    27	use ql_types::ArrayValue;
+    28	
+    29	use crate::codec::{decode_grid, encode_grid, CodecError};
+    30	
+    31	/// Width of a `u64`-LE header field.
+    32	const U64: usize = 8;
+    33	
+    34	/// A `CALL` frame's payload: which UDF (`handle`), correlation id (`call_id`), and
+    35	/// the evaluated argument grid.
+    36	#[derive(Debug, Clone, PartialEq)]
+    37	pub struct CallPayload {
+    38	    /// Opaque worker-side function id (the `FunctionImplHandle` minted IDE-side).
+    39	    pub handle: u64,
+    40	    /// Correlates the [`ReturnPayload`] / a `CANCEL`; lets the engine drop a result
+    41	    /// that arrives after the deadline (exit test 6).
+    42	    pub call_id: u64,
+    43	    /// The evaluated UDF arguments as a grid (a scalar is a 1×1 grid).
+    44	    pub args: ArrayValue,
+    45	}
+    46	
+    47	/// A `RETURN` frame's payload: the `call_id` it answers + the result grid.
+    48	#[derive(Debug, Clone, PartialEq)]
+    49	pub struct ReturnPayload {
+    50	    /// Echoes the originating [`CallPayload::call_id`].
+    51	    pub call_id: u64,
+    52	    /// The UDF result as a grid (a scalar is a 1×1 grid).
+    53	    pub result: ArrayValue,
+    54	}
+    55	
+    56	/// Encode a [`CallPayload`] to `CALL`-frame payload bytes.
+    57	pub fn encode_call(p: &CallPayload) -> Result<Vec<u8>, CodecError> {
+    58	    let grid = encode_grid(&p.args)?;
+    59	    let mut buf = Vec::with_capacity(2 * U64 + grid.len());
+    60	    buf.extend_from_slice(&p.handle.to_le_bytes());
+    61	    buf.extend_from_slice(&p.call_id.to_le_bytes());
+    62	    buf.extend_from_slice(&grid);
+    63	    Ok(buf)
+    64	}
+    65	
+    66	/// Decode `CALL`-frame payload bytes back to a [`CallPayload`].
+    67	pub fn decode_call(bytes: &[u8]) -> Result<CallPayload, CodecError> {
+    68	    let need = 2 * U64;
+    69	    if bytes.len() < need {
+    70	        return Err(CodecError::ShortHeader {
+    71	            need,
+    72	            got: bytes.len(),
+    73	        });
+    74	    }
+    75	    let handle = u64::from_le_bytes(bytes[0..U64].try_into().expect("8 bytes"));
+    76	    let call_id = u64::from_le_bytes(bytes[U64..2 * U64].try_into().expect("8 bytes"));
+    77	    let args = decode_grid(&bytes[2 * U64..])?;
+    78	    Ok(CallPayload {
+    79	        handle,
+    80	        call_id,
+    81	        args,
+    82	    })
+    83	}
+    84	
+    85	/// Encode a [`ReturnPayload`] to `RETURN`-frame payload bytes.
+    86	pub fn encode_return(p: &ReturnPayload) -> Result<Vec<u8>, CodecError> {
+    87	    let grid = encode_grid(&p.result)?;
+    88	    let mut buf = Vec::with_capacity(U64 + grid.len());
+    89	    buf.extend_from_slice(&p.call_id.to_le_bytes());
+    90	    buf.extend_from_slice(&grid);
+    91	    Ok(buf)
+    92	}
+    93	
+    94	/// Decode `RETURN`-frame payload bytes back to a [`ReturnPayload`].
+    95	pub fn decode_return(bytes: &[u8]) -> Result<ReturnPayload, CodecError> {
+    96	    let need = U64;
+    97	    if bytes.len() < need {
+    98	        return Err(CodecError::ShortHeader {
+    99	            need,
+   100	            got: bytes.len(),
+   101	        });
+   102	    }
+   103	    let call_id = u64::from_le_bytes(bytes[0..U64].try_into().expect("8 bytes"));
+   104	    let result = decode_grid(&bytes[U64..])?;
+   105	    Ok(ReturnPayload { call_id, result })
+   106	}
+   107	
+   108	#[cfg(test)]
+   109	mod tests {
+   110	    use super::*;
+   111	    use ql_types::Value;
+   112	    use std::sync::Arc;
+   113	
+   114	    #[test]
+   115	    fn call_payload_round_trips_handle_call_id_and_args() {
+   116	        let args = ArrayValue::new(
+   117	            1,
+   118	            2,
+   119	            vec![Value::Number(3.0), Value::Text(Arc::from("hi"))],
+   120	        )
+   121	        .unwrap();
+   122	        let p = CallPayload {
+   123	            handle: 0xDEAD_BEEF_0000_0007,
+   124	            call_id: 42,
+   125	            args,
+   126	        };
+   127	        let bytes = encode_call(&p).unwrap();
+   128	        let back = decode_call(&bytes).unwrap();
+   129	        assert_eq!(back, p);
+   130	    }
+   131	
+   132	    #[test]
+   133	    fn return_payload_round_trips_call_id_and_result() {
+   134	        let result = ArrayValue::singleton(Value::Boolean(true));
+   135	        let p = ReturnPayload {
+   136	            call_id: u64::MAX,
+   137	            result,
+   138	        };
+   139	        let bytes = encode_return(&p).unwrap();
+   140	        let back = decode_return(&bytes).unwrap();
+   141	        assert_eq!(back, p);
+   142	    }
+   143	
+   144	    #[test]
+   145	    fn decode_call_rejects_a_truncated_header() {
+   146	        // 15 bytes < the 16-byte handle+call_id header.
+   147	        let e = decode_call(&[0u8; 15]).unwrap_err();
+   148	        assert!(
+   149	            matches!(e, CodecError::ShortHeader { need: 16, got: 15 }),
+   150	            "got {e:?}"
+   151	        );
+   152	    }
+   153	
+   154	    #[test]
+   155	    fn decode_return_rejects_a_truncated_header() {
+   156	        let e = decode_return(&[0u8; 7]).unwrap_err();
+   157	        assert!(
+   158	            matches!(e, CodecError::ShortHeader { need: 8, got: 7 }),
+   159	            "got {e:?}"
+   160	        );
+   161	    }
+   162	
+   163	    #[test]
+   164	    fn decode_call_propagates_a_bad_grid_loudly() {
+   165	        // Valid 16-byte header + garbage grid bytes → the codec error surfaces (not a panic).
+   166	        let mut bytes = Vec::new();
+   167	        bytes.extend_from_slice(&7u64.to_le_bytes());
+   168	        bytes.extend_from_slice(&1u64.to_le_bytes());
+   169	        bytes.extend_from_slice(b"not arrow ipc");
+   170	        assert!(decode_call(&bytes).is_err());
+   171	    }
+   172	}
+
+ succeeded in 0ms:
+     1	"""UDF wire envelope — the Python mirror of `ql-udf/src/frame.rs`.
+     2	
+     3	Frame layout: ``[u32 LE total_len][u8 frame_type][payload...]`` where
+     4	``total_len == 1 + len(payload)`` (the type byte counts). All integers are
+     5	little-endian. 3.9-compatible.
+     6	
+     7	This is the worker side of the protocol the Rust engine (`ql-udf::ProcessWorker`)
+     8	speaks over stdio. Every malformed frame raises loudly — never a silent skip.
+     9	"""
+    10	
+    11	import struct
+    12	
+    13	# Frame type tags — MUST match `ql-udf/src/frame.rs::FrameType` exactly.
+    14	HELLO = 1
+    15	HELLO_ACK = 2
+    16	CALL = 3
+    17	RETURN = 4
+    18	RAISE = 5
+    19	CANCEL = 6
+    20	LOG = 7
+    21	
+    22	# Sanity cap, mirroring `ql-udf::frame::MAX_FRAME_LEN` (64 MiB).
+    23	MAX_FRAME_LEN = 64 * 1024 * 1024
+    24	
+    25	
+    26	def _read_n(stream, n):
+    27	    """Read exactly ``n`` bytes from ``stream``.
+    28	
+    29	    Returns the bytes, or ``None`` if EOF occurs *before any byte* (a clean
+    30	    shutdown between frames). Raises ``EOFError`` on a partial read (torn frame).
+    31	    """
+    32	    buf = bytearray()
+    33	    while len(buf) < n:
+    34	        chunk = stream.read(n - len(buf))
+    35	        if not chunk:
+    36	            if not buf:
+    37	                return None
+    38	            raise EOFError("torn frame: read %d of %d bytes" % (len(buf), n))
+    39	        buf.extend(chunk)
+    40	    return bytes(buf)
+    41	
+    42	
+    43	def read_frame(stream):
+    44	    """Read one frame. Returns ``(frame_type, payload_bytes)`` or ``None`` on a
+    45	    clean EOF between frames. Raises on a torn / zero-length / oversized frame."""
+    46	    head = _read_n(stream, 4)
+    47	    if head is None:
+    48	        return None  # clean EOF between frames
+    49	    total = struct.unpack("<I", head)[0]
+    50	    if total == 0:
+    51	        raise ValueError("zero-length frame (need at least the 1-byte type tag)")
+    52	    if total > MAX_FRAME_LEN:
+    53	        raise ValueError("frame length %d exceeds the %d-byte cap" % (total, MAX_FRAME_LEN))
+    54	    body = _read_n(stream, total)
+    55	    if body is None:
+    56	        raise EOFError("torn frame: EOF before the %d-byte body" % total)
+    57	    frame_type = body[0]
+    58	    payload = body[1:]
+    59	    return (frame_type, payload)
+    60	
+    61	
+    62	def write_frame(stream, frame_type, payload):
+    63	    """Write one frame and flush. ``payload`` is ``bytes``."""
+    64	    total = 1 + len(payload)
+    65	    if total > MAX_FRAME_LEN:
+    66	        raise ValueError("frame length %d exceeds the %d-byte cap" % (total, MAX_FRAME_LEN))
+    67	    stream.write(struct.pack("<I", total))
+    68	    stream.write(bytes([frame_type]))
+    69	    if payload:
+    70	        stream.write(payload)
+    71	    stream.flush()
+
+ succeeded in 0ms:
+     1	//! The UDF wire envelope: `[u32 LE total_len][u8 frame_type][payload…]`.
+     2	//!
+     3	//! **6.4-3a.** `total_len` counts the type byte + payload (so a frame with an
+     4	//! empty payload is `total_len == 1`). The payload bytes are **opaque at this
+     5	//! layer**: for [`FrameType::Call`] / [`FrameType::Return`] they are the Arrow
+     6	//! IPC stream from [`crate::codec`]; for the control frames
+     7	//! ([`FrameType::Hello`] / `HelloAck` / `Raise` / `Cancel` / `Log`) the internal
+     8	//! field encoding is intentionally deferred to 6.4-3b (where the real worker
+     9	//! handshake pins it). This module owns only the framing + the type tag, so the
+    10	//! transport is exercisable and round-trip-tested now.
+    11	
+    12	use std::io::{Read, Write};
+    13	
+    14	/// Discriminates the kind of a [`Frame`]. The `u8` tag is stable wire identity.
+    15	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    16	#[repr(u8)]
+    17	pub enum FrameType {
+    18	    /// Worker→? handshake request (protocol version, capabilities).
+    19	    Hello = 1,
+    20	    /// ?→worker handshake ack (worker pid for debugpy, accepted version).
+    21	    HelloAck = 2,
+    22	    /// Engine→worker: one UDF invocation. Payload = Arrow IPC args grid.
+    23	    Call = 3,
+    24	    /// Worker→engine: success. Payload = Arrow IPC result grid.
+    25	    Return = 4,
+    26	    /// Worker→engine: the Python callable raised. Payload = error detail.
+    27	    Raise = 5,
+    28	    /// Engine→worker: cooperative cancel of an in-flight call.
+    29	    Cancel = 6,
+    30	    /// Worker→engine: a log line (stdout/stderr passthrough), surfaced as a diagnostic.
+    31	    Log = 7,
+    32	}
+    33	
+    34	impl FrameType {
+    35	    fn from_u8(b: u8) -> Option<Self> {
+    36	        match b {
+    37	            1 => Some(FrameType::Hello),
+    38	            2 => Some(FrameType::HelloAck),
+    39	            3 => Some(FrameType::Call),
+    40	            4 => Some(FrameType::Return),
+    41	            5 => Some(FrameType::Raise),
+    42	            6 => Some(FrameType::Cancel),
+    43	            7 => Some(FrameType::Log),
+    44	            _ => None,
+    45	        }
+    46	    }
+    47	}
+    48	
+    49	/// A single framed message: a [`FrameType`] tag plus an opaque payload.
+    50	#[derive(Debug, Clone, PartialEq, Eq)]
+    51	pub struct Frame {
+    52	    pub frame_type: FrameType,
+    53	    pub payload: Vec<u8>,
+    54	}
+    55	
+    56	impl Frame {
+    57	    pub fn new(frame_type: FrameType, payload: Vec<u8>) -> Self {
+    58	        Self {
+    59	            frame_type,
+    60	            payload,
+    61	        }
+    62	    }
+    63	}
+    64	
+    65	/// Errors framing/deframing can produce. Loud — a malformed frame is never
+    66	/// silently skipped (No-Fallbacks).
+    67	#[derive(Debug, thiserror::Error)]
+    68	pub enum FrameError {
+    69	    #[error("frame io: {0}")]
+    70	    Io(#[from] std::io::Error),
+    71	    /// The declared length was zero — there is no room even for the type byte.
+    72	    #[error("frame: zero-length frame (need at least the 1-byte type tag)")]
+    73	    ZeroLength,
+    74	    /// The type byte was not a known [`FrameType`].
+    75	    #[error("frame: unknown frame type tag {0}")]
+    76	    UnknownType(u8),
+    77	    /// A frame payload exceeded the sanity cap. Carries the ACTUAL declared/total
+    78	    /// length (`u64`, since the write side computes `1 + payload.len()` before the
+    79	    /// `u32` narrowing) — not the cap — so the diagnostic is symmetric across the
+    80	    /// read and write sides (6.4-3a audit-fix: `write-too-large-report`).
+    81	    #[error("frame: length {0} exceeds the {MAX_FRAME_LEN}-byte cap")]
+    82	    TooLarge(u64),
+    83	}
+    84	
+    85	/// Sanity cap on a single frame (64 MiB). A larger declared length is rejected
+    86	/// rather than used to allocate — defends the reader against a corrupt/hostile
+    87	/// length prefix.
+    88	pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
+    89	
+    90	/// Write one frame: `[u32 LE (1 + payload.len())][type][payload]`.
+    91	pub fn write_frame<W: Write>(w: &mut W, frame: &Frame) -> Result<(), FrameError> {
+    92	    let total = 1u64 + frame.payload.len() as u64;
+    93	    if total > u64::from(MAX_FRAME_LEN) {
+    94	        return Err(FrameError::TooLarge(total));
+    95	    }
+    96	    let total = total as u32;
+    97	    w.write_all(&total.to_le_bytes())?;
+    98	    w.write_all(&[frame.frame_type as u8])?;
+    99	    w.write_all(&frame.payload)?;
+   100	    Ok(())
+   101	}
+   102	
+   103	/// Read one frame. Returns `Ok(None)` on a clean EOF *before any bytes of the
+   104	/// length prefix* (the stream ended between frames); any other short read is a
+   105	/// loud error.
+   106	pub fn read_frame<R: Read>(r: &mut R) -> Result<Option<Frame>, FrameError> {
+   107	    let mut len_buf = [0u8; 4];
+   108	    match read_exact_or_eof(r, &mut len_buf)? {
+   109	        ReadOutcome::Eof => return Ok(None),
+   110	        ReadOutcome::Filled => {}
+   111	    }
+   112	    let total = u32::from_le_bytes(len_buf);
+   113	    if total == 0 {
+   114	        return Err(FrameError::ZeroLength);
+   115	    }
+   116	    if total > MAX_FRAME_LEN {
+   117	        return Err(FrameError::TooLarge(u64::from(total)));
+   118	    }
+   119	    let mut type_buf = [0u8; 1];
+   120	    r.read_exact(&mut type_buf)?;
+   121	    let frame_type = FrameType::from_u8(type_buf[0]).ok_or(FrameError::UnknownType(type_buf[0]))?;
+   122	    let payload_len = (total - 1) as usize;
+   123	    let mut payload = vec![0u8; payload_len];
+   124	    r.read_exact(&mut payload)?;
+   125	    Ok(Some(Frame {
+   126	        frame_type,
+   127	        payload,
+   128	    }))
+   129	}
+   130	
+   131	enum ReadOutcome {
+   132	    Filled,
+   133	    Eof,
+   134	}
+   135	
+   136	/// Like `read_exact`, but distinguishes a clean EOF *before the first byte* (the
+   137	/// stream ended between frames — a normal shutdown) from a partial read (a torn
+   138	/// frame — an error).
+   139	fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<ReadOutcome, FrameError> {
+   140	    let mut filled = 0;
+   141	    while filled < buf.len() {
+   142	        match r.read(&mut buf[filled..]) {
+   143	            Ok(0) => {
+   144	                if filled == 0 {
+   145	                    return Ok(ReadOutcome::Eof);
+   146	                }
+   147	                return Err(FrameError::Io(std::io::Error::new(
+   148	                    std::io::ErrorKind::UnexpectedEof,
+   149	                    "torn length prefix",
+   150	                )));
+   151	            }
+   152	            Ok(n) => filled += n,
+   153	            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+   154	            Err(e) => return Err(FrameError::Io(e)),
+   155	        }
+   156	    }
+   157	    Ok(ReadOutcome::Filled)
+   158	}
+   159	
+   160	#[cfg(test)]
+   161	mod tests {
+   162	    use super::*;
+   163	
+   164	    #[test]
+   165	    fn frame_round_trips_through_a_byte_buffer() {
+   166	        let frames = vec![
+   167	            Frame::new(FrameType::Hello, vec![1, 2, 3]),
+   168	            Frame::new(FrameType::Call, vec![0u8; 1000]),
+   169	            Frame::new(FrameType::Cancel, vec![]), // empty payload → total_len == 1
+   170	            Frame::new(FrameType::Return, vec![255, 0, 128]),
+   171	            Frame::new(FrameType::Log, b"a warning".to_vec()),
+   172	        ];
+   173	        let mut buf = Vec::new();
+   174	        for f in &frames {
+   175	            write_frame(&mut buf, f).unwrap();
+   176	        }
+   177	        let mut cursor = std::io::Cursor::new(buf);
+   178	        let mut got = Vec::new();
+   179	        while let Some(f) = read_frame(&mut cursor).unwrap() {
+   180	            got.push(f);
+   181	        }
+   182	        assert_eq!(got, frames);
+   183	    }
+   184	
+   185	    #[test]
+   186	    fn read_returns_none_on_clean_eof_between_frames() {
+   187	        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+   188	        assert_eq!(read_frame(&mut cursor).unwrap(), None);
+   189	    }
+   190	
+   191	    #[test]
+   192	    fn read_rejects_unknown_type_tag() {
+   193	        // total_len = 1 (just the type byte), type = 99 (unknown).
+   194	        let mut bytes = Vec::new();
+   195	        bytes.extend_from_slice(&1u32.to_le_bytes());
+   196	        bytes.push(99);
+   197	        let mut cursor = std::io::Cursor::new(bytes);
+   198	        let e = read_frame(&mut cursor).unwrap_err();
+   199	        assert!(matches!(e, FrameError::UnknownType(99)), "got {e:?}");
+   200	    }
+   201	
+   202	    #[test]
+   203	    fn read_rejects_zero_length_frame() {
+   204	        let mut cursor = std::io::Cursor::new(0u32.to_le_bytes().to_vec());
+   205	        let e = read_frame(&mut cursor).unwrap_err();
+   206	        assert!(matches!(e, FrameError::ZeroLength), "got {e:?}");
+   207	    }
+   208	
+   209	    #[test]
+   210	    fn read_rejects_oversized_length_without_allocating() {
+   211	        let mut bytes = Vec::new();
+   212	        bytes.extend_from_slice(&(MAX_FRAME_LEN + 1).to_le_bytes());
+   213	        let mut cursor = std::io::Cursor::new(bytes);
+   214	        let e = read_frame(&mut cursor).unwrap_err();
+   215	        // 6.4-3a audit-fix (write-too-large-report): the carried length is the
+   216	        // ACTUAL declared length, not the cap.
+   217	        assert!(
+   218	            matches!(e, FrameError::TooLarge(n) if n == u64::from(MAX_FRAME_LEN) + 1),
+   219	            "got {e:?}"
+   220	        );
+   221	    }
+   222	
+   223	    #[test]
+   224	    fn torn_length_prefix_is_an_error_not_eof() {
+   225	        // Two bytes then EOF — a partial length prefix is a torn frame, not a
+   226	        // clean between-frames shutdown.
+   227	        let mut cursor = std::io::Cursor::new(vec![1u8, 0u8]);
+   228	        let e = read_frame(&mut cursor).unwrap_err();
+   229	        assert!(matches!(e, FrameError::Io(_)), "got {e:?}");
+   230	    }
+   231	}
+
+ succeeded in 0ms:
+     1	//! Arrow ⇄ engine-`Value` codec — the wire payload for `CALL` / `RETURN` frames.
+     2	//!
+     3	//! **6.4-3a.** A UDF call's arguments and result are 2-D grids of spreadsheet
+     4	//! values ([`ql_types::ArrayValue`]); a scalar is just a 1×1 grid. This module
+     5	//! encodes a grid to Arrow IPC stream bytes and back.
+     6	//!
+     7	//! **Encoding (design §3 — the tagged columns).** Arrow has no native
+     8	//! spreadsheet-error type, so a value is encoded across five parallel columns of
+     9	//! length `rows*cols` (row-major), discriminated by `kind`:
+    10	//!
+    11	//! | kind     | populated column | engine `Value`            |
+    12	//! |----------|------------------|---------------------------|
+    13	//! | `blank`  | (none)           | `Value::Blank`            |
+    14	//! | `number` | `num: f64`       | `Value::Number`           |
+    15	//! | `bool`   | `bool: bool`     | `Value::Boolean`          |
+    16	//! | `text`   | `str: Utf8`      | `Value::Text`             |
+    17	//! | `error`  | `err: Utf8`      | `Value::Error` (by sigil) |
+    18	//!
+    19	//! The grid shape (`rows`, `cols`) rides in the Arrow schema metadata so degenerate
+    20	//! shapes (`rows==0` or `cols==0`, zero cells) round-trip faithfully. The encoding
+    21	//! is deliberately verbose-but-unambiguous; a compact layout is a later optimization
+    22	//! behind this same boundary.
+    23	//!
+    24	//! **Decode is a trust boundary (6.4-3a cycle-1 audit-fix).** The bytes a `RETURN`
+    25	//! frame carries are produced by an out-of-process Python worker — possibly buggy
+    26	//! or hostile. `decode_grid` therefore validates the batch BEFORE trusting it:
+    27	//! - the schema must be EXACTLY the 5 expected fields, by name + Arrow type +
+    28	//!   nullability, in order ([`validate_grid_schema`]) — so a `pyarrow` worker that
+    29	//!   reorders/renames columns is rejected loudly rather than silently mis-read (the
+    30	//!   two `Utf8` columns `str`/`err` are otherwise type-interchangeable);
+    31	//! - the active payload column for each `kind` must be non-null (a null active slot
+    32	//!   is a malformed response, not a silent `0.0`/`false`/`""`);
+    33	//! - a decoded `number` must be finite (`NaN`/`Inf` from the worker is a malformed
+    34	//!   result — the engine's `Value::Number` invariant is "always finite");
+    35	//! - the stream must contain EXACTLY one record batch (trailing data is rejected).
+    36	//!
+    37	//! No code path reachable from worker-controlled bytes may panic — every failure is
+    38	//! a loud [`CodecError`] (No-Fallbacks; design §5 / contract §10.4 exit tests 6+7).
+    39	//! `encode_grid` trusts its input (engine-resident `Value`s already satisfy the
+    40	//! finite-`Number` invariant); the validation above guards the untrusted *decode*
+    41	//! direction.
+    42	
+    43	use std::collections::HashMap;
+    44	use std::str::FromStr;
+    45	use std::sync::Arc;
+    46	
+    47	use arrow::array::{
+    48	    Array, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder, StringArray,
+    49	    StringBuilder,
+    50	};
+    51	use arrow::datatypes::{DataType, Field, Schema};
+    52	use arrow::ipc::reader::StreamReader;
+    53	use arrow::ipc::writer::StreamWriter;
+    54	use arrow::record_batch::RecordBatch;
+    55	
+    56	use ql_types::{ArrayValue, ErrorValue, Value};
+    57	
+    58	/// Failure to encode/decode a grid on the UDF wire. Every variant is loud — no
+    59	/// silent normalization (No-Fallbacks).
+    60	#[derive(Debug, thiserror::Error)]
+    61	pub enum CodecError {
+    62	    /// Underlying Arrow IPC read/write error.
+    63	    #[error("arrow ipc: {0}")]
+    64	    Arrow(#[from] arrow::error::ArrowError),
+    65	    /// The IPC stream contained no record batch.
+    66	    #[error("decode: empty IPC stream (expected exactly one record batch)")]
+    67	    Empty,
+    68	    /// The IPC stream contained MORE than one record batch (expected exactly one).
+    69	    #[error("decode: trailing data after the first record batch (expected exactly one)")]
+    70	    TrailingBatch,
+    71	    /// The batch schema was not the exact expected 5-field grid schema.
+    72	    #[error("decode: bad grid schema ({0})")]
+    73	    BadSchema(String),
+    74	    /// The schema metadata was missing the `rows`/`cols` shape keys.
+    75	    #[error("decode: missing '{0}' in schema metadata")]
+    76	    MissingShape(&'static str),
+    77	    /// A shape metadata value did not parse as a u32.
+    78	    #[error("decode: shape '{key}' = {value:?} is not a u32")]
+    79	    BadShape { key: &'static str, value: String },
+    80	    /// `rows * cols` overflowed `usize` (a hostile/garbage shape).
+    81	    #[error("decode: shape rows={rows} * cols={cols} overflows usize")]
+    82	    ShapeOverflow { rows: u32, cols: u32 },
+    83	    /// A column was absent or had the wrong Arrow type.
+    84	    #[error("decode: column {0} missing or wrong type")]
+    85	    BadColumn(&'static str),
+    86	    /// A `kind` discriminant was not one of the five known tags.
+    87	    #[error("decode: unknown kind {0:?}")]
+    88	    BadKind(String),
+    89	    /// The active payload column for a cell's `kind` was NULL (malformed response —
+    90	    /// reading it would silently coerce to `0.0`/`false`/`""`).
+    91	    #[error("decode: cell {row} has kind {kind:?} but its payload column is null")]
+    92	    NullPayload { row: usize, kind: String },
+    93	    /// A decoded `number` was non-finite (`NaN`/`Inf`) — out of the engine's
+    94	    /// `Value::Number` finite invariant; a malformed worker result.
+    95	    #[error("decode: cell {row} is a non-finite number ({value})")]
+    96	    NonFinite { row: usize, value: f64 },
+    97	    /// An `error` cell carried a sigil that is not a known `ErrorValue`.
+    98	    #[error("decode: unknown error sigil {0:?}")]
+    99	    BadErrorSigil(String),
+   100	    /// The decoded cells did not match the declared shape.
+   101	    #[error("decode: shape mismatch ({0})")]
+   102	    ShapeMismatch(String),
+   103	    /// A `CALL`/`RETURN` payload was shorter than its fixed `handle`/`call_id`
+   104	    /// header (6.4-3a audit-fix: typed payload framing — see [`crate::payload`]).
+   105	    #[error("decode: payload header truncated (need {need} bytes, got {got})")]
+   106	    ShortHeader { need: usize, got: usize },
+   107	    /// A control-frame string field ([`crate::control`]) was not valid UTF-8.
+   108	    #[error("decode: {field} field is not valid UTF-8")]
+   109	    BadUtf8 { field: &'static str },
+   110	}
+   111	
+   112	const COL_KIND: usize = 0;
+   113	const COL_NUM: usize = 1;
+   114	const COL_STR: usize = 2;
+   115	const COL_BOOL: usize = 3;
+   116	const COL_ERR: usize = 4;
+   117	
+   118	/// The exact field layout (name, type, nullability) the decoder requires. `kind`
+   119	/// is the non-null discriminant; the four payload columns are nullable (only the
+   120	/// one matching `kind` is populated per cell).
+   121	const EXPECTED_FIELDS: [(&str, DataType, bool); 5] = [
+   122	    ("kind", DataType::Utf8, false),
+   123	    ("num", DataType::Float64, true),
+   124	    ("str", DataType::Utf8, true),
+   125	    ("bool", DataType::Boolean, true),
+   126	    ("err", DataType::Utf8, true),
+   127	];
+   128	
+   129	fn grid_schema(rows: u32, cols: u32) -> Schema {
+   130	    let fields: Vec<Field> = EXPECTED_FIELDS
+   131	        .iter()
+   132	        .map(|(name, dt, nullable)| Field::new(*name, dt.clone(), *nullable))
+   133	        .collect();
+   134	    let metadata = HashMap::from([
+   135	        ("rows".to_string(), rows.to_string()),
+   136	        ("cols".to_string(), cols.to_string()),
+   137	    ]);
+   138	    Schema::new(fields).with_metadata(metadata)
+   139	}
+   140	
+   141	/// Encode a grid to Arrow IPC stream bytes (the `CALL`/`RETURN` frame payload).
+   142	pub fn encode_grid(grid: &ArrayValue) -> Result<Vec<u8>, CodecError> {
+   143	    let rows = grid.rows();
+   144	    let cols = grid.cols();
+   145	
+   146	    let mut kind = StringBuilder::new();
+   147	    let mut num = Float64Builder::new();
+   148	    let mut text = StringBuilder::new();
+   149	    let mut boolean = BooleanBuilder::new();
+   150	    let mut err = StringBuilder::new();
+   151	
+   152	    // Row-major, matching `ArrayValue`'s own cell ordering.
+   153	    for r in 0..rows {
+   154	        for c in 0..cols {
+   155	            let v = grid
+   156	                .get(r, c)
+   157	                .ok_or_else(|| CodecError::ShapeMismatch(format!("get({r},{c}) out of bounds")))?;
+   158	            match v {
+   159	                Value::Blank => {
+   160	                    kind.append_value("blank");
+   161	                    num.append_null();
+   162	                    text.append_null();
+   163	                    boolean.append_null();
+   164	                    err.append_null();
+   165	                }
+   166	                Value::Number(x) => {
+   167	                    kind.append_value("number");
+   168	                    num.append_value(*x);
+   169	                    text.append_null();
+   170	                    boolean.append_null();
+   171	                    err.append_null();
+   172	                }
+   173	                Value::Boolean(x) => {
+   174	                    kind.append_value("bool");
+   175	                    num.append_null();
+   176	                    text.append_null();
+   177	                    boolean.append_value(*x);
+   178	                    err.append_null();
+   179	                }
+   180	                Value::Text(t) => {
+   181	                    kind.append_value("text");
+   182	                    num.append_null();
+   183	                    text.append_value(t.as_ref());
+   184	                    boolean.append_null();
+   185	                    err.append_null();
+   186	                }
+   187	                Value::Error(e) => {
+   188	                    kind.append_value("error");
+   189	                    num.append_null();
+   190	                    text.append_null();
+   191	                    boolean.append_null();
+   192	                    err.append_value(e.sigil());
+   193	                }
+   194	            }
+   195	        }
+   196	    }
+   197	
+   198	    let columns: Vec<ArrayRef> = vec![
+   199	        Arc::new(kind.finish()),
+   200	        Arc::new(num.finish()),
+   201	        Arc::new(text.finish()),
+   202	        Arc::new(boolean.finish()),
+   203	        Arc::new(err.finish()),
+   204	    ];
+   205	    let schema = Arc::new(grid_schema(rows, cols));
+   206	    let batch = RecordBatch::try_new(schema.clone(), columns)?;
+   207	
+   208	    let mut buf = Vec::new();
+   209	    {
+   210	        let mut writer = StreamWriter::try_new(&mut buf, &schema)?;
+   211	        writer.write(&batch)?;
+   212	        writer.finish()?;
+   213	    }
+   214	    Ok(buf)
+   215	}
+   216	
+   217	/// Validate that `schema` is EXACTLY the expected 5-field grid schema (each field's
+   218	/// name, type, and nullability, in order). Worker-controlled bytes are not trusted
+   219	/// to honor the column order/identity; a mismatch (reordered, renamed, retyped,
+   220	/// wrong count) is rejected loudly so positional column access below is sound and
+   221	/// the two `Utf8` columns (`str`/`err`) can never be silently swapped.
+   222	fn validate_grid_schema(schema: &Schema) -> Result<(), CodecError> {
+   223	    let fields = schema.fields();
+   224	    if fields.len() != EXPECTED_FIELDS.len() {
+   225	        return Err(CodecError::BadSchema(format!(
+   226	            "expected {} columns, got {}",
+   227	            EXPECTED_FIELDS.len(),
+   228	            fields.len()
+   229	        )));
+   230	    }
+   231	    for (idx, (name, dt, nullable)) in EXPECTED_FIELDS.iter().enumerate() {
+   232	        let f = &fields[idx];
+   233	        if f.name() != *name {
+   234	            return Err(CodecError::BadSchema(format!(
+   235	                "column {idx}: expected name {name:?}, got {:?}",
+   236	                f.name()
+   237	            )));
+   238	        }
+   239	        if f.data_type() != dt {
+   240	            return Err(CodecError::BadSchema(format!(
+   241	                "column {idx} ({name:?}): expected type {dt:?}, got {:?}",
+   242	                f.data_type()
+   243	            )));
+   244	        }
+   245	        if f.is_nullable() != *nullable {
+   246	            return Err(CodecError::BadSchema(format!(
+   247	                "column {idx} ({name:?}): expected nullable={nullable}, got {}",
+   248	                f.is_nullable()
+   249	            )));
+   250	        }
+   251	    }
+   252	    Ok(())
+   253	}
+   254	
+   255	fn shape_from_metadata(md: &HashMap<String, String>, key: &'static str) -> Result<u32, CodecError> {
+   256	    let raw = md.get(key).ok_or(CodecError::MissingShape(key))?;
+   257	    raw.parse::<u32>().map_err(|_| CodecError::BadShape {
+   258	        key,
+   259	        value: raw.clone(),
+   260	    })
+   261	}
+   262	
+   263	fn col<'a, T: Array + 'static>(
+   264	    batch: &'a RecordBatch,
+   265	    idx: usize,
+   266	    name: &'static str,
+   267	) -> Result<&'a T, CodecError> {
+   268	    // `idx` is in-bounds: `validate_grid_schema` has already asserted exactly 5
+   269	    // columns, so `batch.column(idx)` for idx in 0..5 cannot panic.
+   270	    batch
+   271	        .column(idx)
+   272	        .as_any()
+   273	        .downcast_ref::<T>()
+   274	        .ok_or(CodecError::BadColumn(name))
+   275	}
+   276	
+   277	/// Decode Arrow IPC stream bytes (a `CALL`/`RETURN` frame payload) back to a grid.
+   278	///
+   279	/// Every failure mode for worker-controlled bytes is a loud [`CodecError`] — no
+   280	/// reachable panic, no silent coercion (No-Fallbacks; design §5).
+   281	pub fn decode_grid(bytes: &[u8]) -> Result<ArrayValue, CodecError> {
+   282	    let mut reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
+   283	    let batch = reader.next().ok_or(CodecError::Empty)??;
+   284	
+   285	    // Exactly one batch: a worker writing extra batches into one frame is malformed.
+   286	    if reader.next().is_some() {
+   287	        return Err(CodecError::TrailingBatch);
+   288	    }
+   289	
+   290	    let schema = batch.schema();
+   291	    // Validate the schema BEFORE any positional column access (so `col()` indexing
+   292	    // is sound) and BEFORE trusting column identity (the `Utf8` `str`/`err` columns
+   293	    // are otherwise indistinguishable by type).
+   294	    validate_grid_schema(&schema)?;
+   295	
+   296	    let rows = shape_from_metadata(schema.metadata(), "rows")?;
+   297	    let cols = shape_from_metadata(schema.metadata(), "cols")?;
+   298	
+   299	    let kind = col::<StringArray>(&batch, COL_KIND, "kind")?;
+   300	    let num = col::<Float64Array>(&batch, COL_NUM, "num")?;
+   301	    let text = col::<StringArray>(&batch, COL_STR, "str")?;
+   302	    let boolean = col::<BooleanArray>(&batch, COL_BOOL, "bool")?;
+   303	    let err = col::<StringArray>(&batch, COL_ERR, "err")?;
+   304	
+   305	    let n = batch.num_rows();
+   306	    // `checked_mul` (matching `ArrayValue::new`) — a hostile shape that overflows is
+   307	    // a loud error, not a silent saturation that happens to disagree with `n`.
+   308	    let expected = (rows as usize)
+   309	        .checked_mul(cols as usize)
+   310	        .ok_or(CodecError::ShapeOverflow { rows, cols })?;
+   311	    if n != expected {
+   312	        return Err(CodecError::ShapeMismatch(format!(
+   313	            "{n} cells but rows*cols = {expected} (rows={rows}, cols={cols})"
+   314	        )));
+   315	    }
+   316	
+   317	    let mut cells = Vec::with_capacity(n);
+   318	    for i in 0..n {
+   319	        // `kind` is non-nullable per the validated schema; an empty/garbage tag
+   320	        // falls through to `BadKind` below rather than panicking.
+   321	        let v = match kind.value(i) {
+   322	            "blank" => Value::Blank,
+   323	            "number" => {
+   324	                if num.is_null(i) {
+   325	                    return Err(CodecError::NullPayload {
+   326	                        row: i,
+   327	                        kind: "number".to_string(),
+   328	                    });
+   329	                }
+   330	                let x = num.value(i);
+   331	                // The engine's `Value::Number` invariant is "always finite"; a
+   332	                // `NaN`/`Inf` from the worker is a malformed result (it would
+   333	                // otherwise poison equality/dirty-tracking downstream).
+   334	                if !x.is_finite() {
+   335	                    return Err(CodecError::NonFinite { row: i, value: x });
+   336	                }
+   337	                Value::Number(x)
+   338	            }
+   339	            "bool" => {
+   340	                if boolean.is_null(i) {
+   341	                    return Err(CodecError::NullPayload {
+   342	                        row: i,
+   343	                        kind: "bool".to_string(),
+   344	                    });
+   345	                }
+   346	                Value::Boolean(boolean.value(i))
+   347	            }
+   348	            "text" => {
+   349	                if text.is_null(i) {
+   350	                    return Err(CodecError::NullPayload {
+   351	                        row: i,
+   352	                        kind: "text".to_string(),
+   353	                    });
+   354	                }
+   355	                Value::Text(Arc::from(text.value(i)))
+   356	            }
+   357	            "error" => {
+   358	                if err.is_null(i) {
+   359	                    return Err(CodecError::NullPayload {
+   360	                        row: i,
+   361	                        kind: "error".to_string(),
+   362	                    });
+   363	                }
+   364	                let sigil = err.value(i);
+   365	                let ev = ErrorValue::from_str(sigil)
+   366	                    .map_err(|_| CodecError::BadErrorSigil(sigil.to_string()))?;
+   367	                Value::Error(ev)
+   368	            }
+   369	            other => return Err(CodecError::BadKind(other.to_string())),
+   370	        };
+   371	        cells.push(v);
+   372	    }
+   373	
+   374	    ArrayValue::new(rows, cols, cells)
+   375	        .map_err(|e| CodecError::ShapeMismatch(format!("ArrayValue::new: {e:?}")))
+   376	}
+   377	
+   378	/// Convenience: encode a single scalar as a 1×1 grid (a UDF returning a scalar).
+   379	pub fn encode_scalar(value: Value) -> Result<Vec<u8>, CodecError> {
+   380	    encode_grid(&ArrayValue::singleton(value))
+   381	}
+   382	
+   383	#[cfg(test)]
+   384	mod tests {
+   385	    use super::*;
+   386	
+   387	    fn roundtrip(grid: &ArrayValue) -> ArrayValue {
+   388	        let bytes = encode_grid(grid).expect("encode");
+   389	        decode_grid(&bytes).expect("decode")
+   390	    }
+   391	
+   392	    fn assert_roundtrip(grid: ArrayValue) {
+   393	        let back = roundtrip(&grid);
+   394	        assert_eq!(back.rows(), grid.rows(), "rows");
+   395	        assert_eq!(back.cols(), grid.cols(), "cols");
+   396	        for r in 0..grid.rows() {
+   397	            for c in 0..grid.cols() {
+   398	                assert_eq!(back.get(r, c), grid.get(r, c), "cell ({r},{c})");
+   399	            }
+   400	        }
+   401	    }
+   402	
+   403	    /// Write a hand-built (schema, columns) pair to IPC stream bytes — for the
+   404	    /// adversarial decode tests that fabricate malformed worker output.
+   405	    fn write_ipc(schema: &Arc<Schema>, columns: Vec<ArrayRef>) -> Vec<u8> {
+   406	        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+   407	        let mut buf = Vec::new();
+   408	        let mut w = StreamWriter::try_new(&mut buf, schema).unwrap();
+   409	        w.write(&batch).unwrap();
+   410	        w.finish().unwrap();
+   411	        buf
+   412	    }
+   413	
+   414	    #[test]
+   415	    fn roundtrips_every_value_variant_in_one_grid() {
+   416	        // A 2×3 grid touching all five Value variants + a representative error.
+   417	        let cells = vec![
+   418	            Value::Blank,
+   419	            Value::Number(42.5),
+   420	            Value::Boolean(true),
+   421	            Value::Text(Arc::from("hello")),
+   422	            Value::Error(ErrorValue::DivZero),
+   423	            Value::Number(-1.5),
+   424	        ];
+   425	        assert_roundtrip(ArrayValue::new(2, 3, cells).unwrap());
+   426	    }
+   427	
+   428	    #[test]
+   429	    fn roundtrips_scalar() {
+   430	        assert_roundtrip(ArrayValue::singleton(Value::Number(12.5)));
+   431	        assert_roundtrip(ArrayValue::singleton(Value::Text(Arc::from(""))));
+   432	        assert_roundtrip(ArrayValue::singleton(Value::Boolean(false)));
+   433	        assert_roundtrip(ArrayValue::singleton(Value::Blank));
+   434	    }
+   435	
+   436	    /// **6.4-3a audit-fix (L1):** `-0.0` must survive bit-for-bit. Derived `Value`
+   437	    /// equality compares `-0.0 == 0.0` true, so `assert_roundtrip` alone would pass
+   438	    /// even on a sign flip — assert the raw bits to actually pin sign preservation.
+   439	    #[test]
+   440	    fn negative_zero_round_trips_bit_for_bit() {
+   441	        let bytes = encode_scalar(Value::Number(-0.0)).unwrap();
+   442	        let back = decode_grid(&bytes).unwrap();
+   443	        match back.get(0, 0) {
+   444	            Some(Value::Number(x)) => {
+   445	                assert_eq!(x.to_bits(), (-0.0f64).to_bits(), "sign bit lost");
+   446	            }
+   447	            other => panic!("expected Number(-0.0), got {other:?}"),
+   448	        }
+   449	    }
+   450	
+   451	    #[test]
+   452	    fn roundtrips_all_15_error_sigils() {
+   453	        // Every ErrorValue variant must survive the sigil ↔ from_str round trip.
+   454	        let errors = [
+   455	            ErrorValue::Ref,
+   456	            ErrorValue::Value,
+   457	            ErrorValue::NA,
+   458	            ErrorValue::DivZero,
+   459	            ErrorValue::Null,
+   460	            ErrorValue::Num,
+   461	            ErrorValue::Name,
+   462	            ErrorValue::Spill,
+   463	            ErrorValue::Calc,
+   464	            ErrorValue::Disconnected,
+   465	            ErrorValue::Binding,
+   466	            ErrorValue::Timeout,
+   467	            ErrorValue::Permission,
+   468	            ErrorValue::AINotAvailable,
+   469	            ErrorValue::Circ,
+   470	        ];
+   471	        let cells: Vec<Value> = errors.iter().copied().map(Value::Error).collect();
+   472	        let n = cells.len() as u32;
+   473	        assert_roundtrip(ArrayValue::new(n, 1, cells).unwrap());
+   474	    }
+   475	
+   476	    #[test]
+   477	    fn roundtrips_degenerate_empty_shapes() {
+   478	        // rows>0, cols==0 (zero cells) and the fully-empty case must preserve shape.
+   479	        assert_roundtrip(ArrayValue::empty(3, 0));
+   480	        assert_roundtrip(ArrayValue::empty(0, 0));
+   481	        assert_roundtrip(ArrayValue::empty(0, 4));
+   482	    }
+   483	
+   484	    #[test]
+   485	    fn roundtrips_large_numeric_grid_and_extremes() {
+   486	        // Finite f64 extremes round-trip exactly (NaN/Inf are out-of-contract for
+   487	        // Value::Number — `decode_grid` REJECTS them; see `decode_rejects_*` below).
+   488	        let mut cells = Vec::new();
+   489	        for i in 0..50u32 {
+   490	            cells.push(Value::Number(f64::from(i) * 1.5 - 12.25));
+   491	        }
+   492	        cells.push(Value::Number(f64::MAX));
+   493	        cells.push(Value::Number(f64::MIN));
+   494	        cells.push(Value::Number(f64::MIN_POSITIVE));
+   495	        let n = cells.len() as u32;
+   496	        assert_roundtrip(ArrayValue::new(n, 1, cells).unwrap());
+   497	    }
+   498	
+   499	    #[test]
+   500	    fn decode_rejects_unknown_kind_loudly() {
+   501	        // Hand-build a batch with a bogus kind → decode must error, not silently coerce.
+   502	        let schema = Arc::new(grid_schema(1, 1));
+   503	        let kind = Arc::new(StringArray::from(vec!["bogus"])) as ArrayRef;
+   504	        let num = Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef;
+   505	        let text = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
+   506	        let boolean = Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef;
+   507	        let err = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
+   508	        let buf = write_ipc(&schema, vec![kind, num, text, boolean, err]);
+   509	        let e = decode_grid(&buf).unwrap_err();
+   510	        assert!(matches!(e, CodecError::BadKind(ref k) if k == "bogus"), "got {e:?}");
+   511	    }
+   512	
+   513	    /// **6.4-3a audit-fix (H1):** a batch with FEWER than 5 columns must error, not
+   514	    /// panic. Pre-fix `decode_grid` did `batch.column(1..4)` which panics out of
+   515	    /// bounds (arrow `RecordBatch::column` is a slice index).
+   516	    #[test]
+   517	    fn decode_rejects_short_column_set_without_panicking() {
+   518	        // A single `kind` column + the shape metadata — would have panicked at
+   519	        // `batch.column(1)`.
+   520	        let one_field =
+   521	            Schema::new(vec![Field::new("kind", DataType::Utf8, false)]).with_metadata(
+   522	                HashMap::from([("rows".into(), "1".into()), ("cols".into(), "1".into())]),
+   523	            );
+   524	        let schema = Arc::new(one_field);
+   525	        let kind = Arc::new(StringArray::from(vec!["blank"])) as ArrayRef;
+   526	        let buf = write_ipc(&schema, vec![kind]);
+   527	        let e = decode_grid(&buf).unwrap_err();
+   528	        assert!(
+   529	            matches!(e, CodecError::BadSchema(_)),
+   530	            "short column set must be BadSchema, got {e:?}"
+   531	        );
+   532	    }
+   533	
+   534	    /// **6.4-3a audit-fix (H2):** a reordered schema (the two `Utf8` columns
+   535	    /// `str`/`err` swapped — type-compatible, so the OLD positional decode would
+   536	    /// have silently mis-read sigils as text) must be rejected.
+   537	    #[test]
+   538	    fn decode_rejects_reordered_schema() {
+   539	        // Fields in order kind, num, ERR, bool, STR (str<->err swapped by name).
+   540	        let fields = vec![
+   541	            Field::new("kind", DataType::Utf8, false),
+   542	            Field::new("num", DataType::Float64, true),
+   543	            Field::new("err", DataType::Utf8, true), // was "str"
+   544	            Field::new("bool", DataType::Boolean, true),
+   545	            Field::new("str", DataType::Utf8, true), // was "err"
+   546	        ];
+   547	        let schema = Arc::new(Schema::new(fields).with_metadata(HashMap::from([
+   548	            ("rows".into(), "1".into()),
+   549	            ("cols".into(), "1".into()),
+   550	        ])));
+   551	        let kind = Arc::new(StringArray::from(vec!["text"])) as ArrayRef;
+   552	        let num = Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef;
+   553	        let c2 = Arc::new(StringArray::from(vec![Some("#REF!")])) as ArrayRef;
+   554	        let boolean = Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef;
+   555	        let c4 = Arc::new(StringArray::from(vec![Some("hi")])) as ArrayRef;
+   556	        let buf = write_ipc(&schema, vec![kind, num, c2, boolean, c4]);
+   557	        let e = decode_grid(&buf).unwrap_err();
+   558	        assert!(
+   559	            matches!(e, CodecError::BadSchema(_)),
+   560	            "reordered schema must be BadSchema, got {e:?}"
+   561	        );
+   562	    }
+   563	
+   564	    /// **6.4-3a audit-fix (null-slot coercion):** `kind="number"` with a NULL `num`
+   565	    /// slot must error, not silently decode to `0.0`.
+   566	    #[test]
+   567	    fn decode_rejects_null_active_payload() {
+   568	        let schema = Arc::new(grid_schema(1, 1));
+   569	        let kind = Arc::new(StringArray::from(vec!["number"])) as ArrayRef;
+   570	        let num = Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef; // NULL!
+   571	        let text = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
+   572	        let boolean = Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef;
+   573	        let err = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
+   574	        let buf = write_ipc(&schema, vec![kind, num, text, boolean, err]);
+   575	        let e = decode_grid(&buf).unwrap_err();
+   576	        assert!(
+   577	            matches!(e, CodecError::NullPayload { row: 0, .. }),
+   578	            "null active payload must be NullPayload, got {e:?}"
+   579	        );
+   580	    }
+   581	
+   582	    /// **6.4-3a audit-fix (nan-inf-leak):** a worker returning `NaN`/`Inf` must be
+   583	    /// rejected, not passed through as an unsanitized `Value::Number`.
+   584	    #[test]
+   585	    fn decode_rejects_non_finite_number() {
+   586	        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+   587	            let schema = Arc::new(grid_schema(1, 1));
+   588	            let kind = Arc::new(StringArray::from(vec!["number"])) as ArrayRef;
+   589	            let num = Arc::new(Float64Array::from(vec![Some(bad)])) as ArrayRef;
+   590	            let text = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
+   591	            let boolean = Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef;
+   592	            let err = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
+   593	            let buf = write_ipc(&schema, vec![kind, num, text, boolean, err]);
+   594	            let e = decode_grid(&buf).unwrap_err();
+   595	            assert!(
+   596	                matches!(e, CodecError::NonFinite { row: 0, .. }),
+   597	                "non-finite {bad} must be NonFinite, got {e:?}"
+   598	            );
+   599	        }
+   600	    }
+   601	
+   602	    /// **6.4-3a audit-fix (bad error sigil decode path — previously untested):** an
+   603	    /// `error` cell carrying an unknown sigil must surface `BadErrorSigil`.
+   604	    #[test]
+   605	    fn decode_rejects_unknown_error_sigil() {
+   606	        let schema = Arc::new(grid_schema(1, 1));
+   607	        let kind = Arc::new(StringArray::from(vec!["error"])) as ArrayRef;
+   608	        let num = Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef;
+   609	        let text = Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef;
+   610	        let boolean = Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef;
+   611	        let err = Arc::new(StringArray::from(vec![Some("#NOT_A_REAL_SIGIL!")])) as ArrayRef;
+   612	        let buf = write_ipc(&schema, vec![kind, num, text, boolean, err]);
+   613	        let e = decode_grid(&buf).unwrap_err();
+   614	        assert!(
+   615	            matches!(e, CodecError::BadErrorSigil(ref s) if s == "#NOT_A_REAL_SIGIL!"),
+   616	            "got {e:?}"
+   617	        );
+   618	    }
+   619	
+   620	    /// **6.4-3a audit-fix (shape metadata — previously untested):** missing
+   621	    /// `rows`/`cols` metadata, non-u32 metadata, and a metadata-vs-cell-count
+   622	    /// mismatch must all error.
+   623	    #[test]
+   624	    fn decode_rejects_bad_shape_metadata() {
+   625	        // (a) missing metadata entirely.
+   626	        let fields: Vec<Field> = EXPECTED_FIELDS
+   627	            .iter()
+   628	            .map(|(n, dt, nl)| Field::new(*n, dt.clone(), *nl))
+   629	            .collect();
+   630	        let no_md = Arc::new(Schema::new(fields)); // no .with_metadata
+   631	        let cols0: Vec<ArrayRef> = vec![
+   632	            Arc::new(StringArray::from(vec!["blank"])),
+   633	            Arc::new(Float64Array::from(vec![None as Option<f64>])),
+   634	            Arc::new(StringArray::from(vec![None as Option<&str>])),
+   635	            Arc::new(BooleanArray::from(vec![None as Option<bool>])),
+   636	            Arc::new(StringArray::from(vec![None as Option<&str>])),
+   637	        ];
+   638	        let buf = write_ipc(&no_md, cols0);
+   639	        assert!(
+   640	            matches!(decode_grid(&buf).unwrap_err(), CodecError::MissingShape(_)),
+   641	            "missing metadata must be MissingShape"
+   642	        );
+   643	
+   644	        // (b) non-u32 metadata.
+   645	        let bad_md = {
+   646	            let fields: Vec<Field> = EXPECTED_FIELDS
+   647	                .iter()
+   648	                .map(|(n, dt, nl)| Field::new(*n, dt.clone(), *nl))
+   649	                .collect();
+   650	            Arc::new(Schema::new(fields).with_metadata(HashMap::from([
+   651	                ("rows".into(), "abc".into()),
+   652	                ("cols".into(), "1".into()),
+   653	            ])))
+   654	        };
+   655	        let cols1: Vec<ArrayRef> = vec![
+   656	            Arc::new(StringArray::from(vec!["blank"])),
+   657	            Arc::new(Float64Array::from(vec![None as Option<f64>])),
+   658	            Arc::new(StringArray::from(vec![None as Option<&str>])),
+   659	            Arc::new(BooleanArray::from(vec![None as Option<bool>])),
+   660	            Arc::new(StringArray::from(vec![None as Option<&str>])),
+   661	        ];
+   662	        let buf = write_ipc(&bad_md, cols1);
+   663	        assert!(
+   664	            matches!(decode_grid(&buf).unwrap_err(), CodecError::BadShape { .. }),
+   665	            "non-u32 metadata must be BadShape"
+   666	        );
+   667	
+   668	        // (c) metadata says 2×2 (=4 cells) but the batch has 1 row.
+   669	        let mismatch = Arc::new(grid_schema(2, 2));
+   670	        let cols2: Vec<ArrayRef> = vec![
+   671	            Arc::new(StringArray::from(vec!["blank"])),
+   672	            Arc::new(Float64Array::from(vec![None as Option<f64>])),
+   673	            Arc::new(StringArray::from(vec![None as Option<&str>])),
+   674	            Arc::new(BooleanArray::from(vec![None as Option<bool>])),
+   675	            Arc::new(StringArray::from(vec![None as Option<&str>])),
+   676	        ];
+   677	        let buf = write_ipc(&mismatch, cols2);
+   678	        assert!(
+   679	            matches!(decode_grid(&buf).unwrap_err(), CodecError::ShapeMismatch(_)),
+   680	            "cell-count mismatch must be ShapeMismatch"
+   681	        );
+   682	    }
+   683	
+   684	    /// **6.4-3a audit-fix (extra-batches-dropped):** a stream with more than one
+   685	    /// record batch must be rejected, matching the "exactly one" doc contract.
+   686	    #[test]
+   687	    fn decode_rejects_trailing_batch() {
+   688	        let schema = Arc::new(grid_schema(1, 1));
+   689	        let make_cols = || -> Vec<ArrayRef> {
+   690	            vec![
+   691	                Arc::new(StringArray::from(vec!["blank"])),
+   692	                Arc::new(Float64Array::from(vec![None as Option<f64>])),
+   693	                Arc::new(StringArray::from(vec![None as Option<&str>])),
+   694	                Arc::new(BooleanArray::from(vec![None as Option<bool>])),
+   695	                Arc::new(StringArray::from(vec![None as Option<&str>])),
+   696	            ]
+   697	        };
+   698	        let mut buf = Vec::new();
+   699	        {
+   700	            let mut w = StreamWriter::try_new(&mut buf, &schema).unwrap();
+   701	            w.write(&RecordBatch::try_new(schema.clone(), make_cols()).unwrap())
+   702	                .unwrap();
+   703	            w.write(&RecordBatch::try_new(schema.clone(), make_cols()).unwrap())
+   704	                .unwrap();
+   705	            w.finish().unwrap();
+   706	        }
+   707	        assert!(
+   708	            matches!(decode_grid(&buf).unwrap_err(), CodecError::TrailingBatch),
+   709	            "two batches must be TrailingBatch"
+   710	        );
+   711	    }
+   712	
+   713	    #[test]
+   714	    fn decode_rejects_empty_stream() {
+   715	        // A schema-only stream (no batches) → Empty.
+   716	        let schema = Arc::new(grid_schema(0, 0));
+   717	        let mut buf = Vec::new();
+   718	        {
+   719	            let mut w = StreamWriter::try_new(&mut buf, &schema).unwrap();
+   720	            w.finish().unwrap();
+   721	        }
+   722	        assert!(matches!(decode_grid(&buf).unwrap_err(), CodecError::Empty));
+   723	    }
+   724	}
+
+codex
+The Rust decode path validates schemas before positional access; the process path is where timing and crash behavior look more interesting. I’m cross-checking the Python side now, especially places where exceptions happen outside the per-call `try`.
+exec
+/bin/zsh -lc 'nl -ba crates/quantbook-py/python/quantbook/_registry.py' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+     1	"""Process-local UDF registry shared by `register_formula_function` (in the
+     2	package ``__init__``) and the worker loop (`quantbook.worker`). Maps a `u64`
+     3	handle to a Python callable. 6.4-3b."""
+     4	
+     5	_REGISTRY = {}
+     6	
+     7	
+     8	def register(handle, fn):
+     9	    _REGISTRY[int(handle)] = fn
+    10	
+    11	
+    12	def lookup(handle):
+    13	    return _REGISTRY.get(int(handle))
+    14	
+    15	
+    16	def clear():
+    17	    _REGISTRY.clear()
+
+exec
+/bin/zsh -lc 'nl -ba crates/ql-udf/tests/process_smoke.rs' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+exec
+/bin/zsh -lc 'nl -ba crates/quantbook-py/python/quantbook/__init__.py' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+     1	"""Quantbook Python bindings.
+     2	
+     3	**6.4-3b** ships the plain-Python **UDF worker** (`python -m quantbook.worker`) that
+     4	the Rust engine (`ql-udf::ProcessWorker`) drives over stdio — NO PyO3 in the hot
+     5	path. `register_formula_function` registers a Python callable as a formula function
+     6	the engine can invoke by handle.
+     7	
+     8	The future PyO3 extension (`quantbook._quantbook`, the `qb.show`/`publish`/`bind`
+     9	authoring surface) is a SEPARATE, later concern (see `pyproject.toml`); it is not
+    10	required for the worker.
+    11	"""
+    12	
+    13	from ._codec import Err, Grid  # noqa: F401  (re-exported for UDF authors)
+    14	from ._registry import lookup as _lookup  # noqa: F401  (used by quantbook.worker)
+    15	from ._registry import register as _register
+    16	
+    17	
+    18	def register_formula_function(fn, *, handle, name=None):
+    19	    """Register ``fn`` as a Quantbook formula function under ``handle``.
+    20	
+    21	    ``fn`` receives a :class:`quantbook.Grid` of evaluated arguments and returns a
+    22	    ``Grid`` or a scalar cell value (``float``/``int``/``bool``/``str``/``None``/
+    23	    :class:`quantbook.Err`). ``handle`` is an explicit ``u64`` for now (the IDE mints
+    24	    it at 6.4-3c/3d); ``name`` is informational. Returns ``handle``.
+    25	    """
+    26	    _register(int(handle), fn)
+    27	    return handle
+
+ succeeded in 0ms:
+     1	//! Real-Python end-to-end smoke for [`ql_udf::ProcessWorker`] (Phase 6.4-3b).
+     2	//!
+     3	//! Spawns the actual `python -m quantbook.worker` and drives the full
+     4	//! engine → Arrow → stdio → pyarrow → dispatch → Arrow → stdio → engine round trip,
+     5	//! plus the raise / timeout-kill / respawn paths. If `python3` (or `python`) with
+     6	//! `pyarrow` is not available, the test prints a LOUD skip and returns — this is
+     7	//! test-environment gating, not a production fallback (the engine itself fails loud
+     8	//! on a missing interpreter; see `process::tests::missing_interpreter_*`).
+     9	
+    10	use std::path::PathBuf;
+    11	use std::process::Command;
+    12	use std::sync::Arc;
+    13	use std::time::Duration;
+    14	
+    15	use ql_types::{ArrayValue, Value};
+    16	use ql_udf::{ProcessWorker, PythonWorkerConfig, UdfError, UdfWorker};
+    17	
+    18	/// Find an interpreter that can `import pyarrow`, or `None`.
+    19	fn python_with_pyarrow() -> Option<String> {
+    20	    for py in ["python3", "python"] {
+    21	        let ok = Command::new(py)
+    22	            .args(["-c", "import pyarrow"])
+    23	            .output()
+    24	            .map(|o| o.status.success())
+    25	            .unwrap_or(false);
+    26	        if ok {
+    27	            return Some(py.to_string());
+    28	        }
+    29	    }
+    30	    None
+    31	}
+    32	
+    33	fn smoke_config(py: &str) -> PythonWorkerConfig {
+    34	    let pythonpath = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    35	        .join("../quantbook-py/python")
+    36	        .canonicalize()
+    37	        .expect("quantbook-py/python directory should exist");
+    38	    PythonWorkerConfig::new(py)
+    39	        .with_pythonpath(pythonpath)
+    40	        .with_udf_module("quantbook._smoke_udfs")
+    41	}
+    42	
+    43	#[test]
+    44	fn process_worker_round_trips_against_real_python() {
+    45	    let py = match python_with_pyarrow() {
+    46	        Some(p) => p,
+    47	        None => {
+    48	            eprintln!(
+    49	                "SKIP process_worker_round_trips_against_real_python: \
+    50	                 no `python3`/`python` with `pyarrow` on PATH"
+    51	            );
+    52	            return;
+    53	        }
+    54	    };
+    55	    let mut w = ProcessWorker::new(smoke_config(&py));
+    56	
+    57	    // (1) handle 7 — double a number: full engine↔pyarrow round trip.
+    58	    let out = w
+    59	        .call(7, &ArrayValue::singleton(Value::Number(21.0)), Duration::from_secs(10))
+    60	        .expect("call handle 7");
+    61	    assert_eq!(out.rows(), 1);
+    62	    assert_eq!(out.cols(), 1);
+    63	    assert_eq!(out.get(0, 0), Some(&Value::Number(42.0)));
+    64	    let pid_before = w.pid();
+    65	    assert!(pid_before.is_some(), "worker should be live after a successful call");
+    66	
+    67	    // (2) handle 8 — identity over a mixed 1x3 grid: faithful round-trip of
+    68	    //     number / text / boolean across the Arrow tagged columns.
+    69	    let grid = ArrayValue::new(
+    70	        1,
+    71	        3,
+    72	        vec![
+    73	            Value::Number(1.5),
+    74	            Value::Text(Arc::from("hi")),
+    75	            Value::Boolean(true),
+    76	        ],
+    77	    )
+    78	    .unwrap();
+    79	    let back = w.call(8, &grid, Duration::from_secs(10)).expect("call handle 8");
+    80	    assert_eq!(back.rows(), 1);
+    81	    assert_eq!(back.cols(), 3);
+    82	    assert_eq!(back.get(0, 0), Some(&Value::Number(1.5)));
+    83	    assert_eq!(back.get(0, 1), Some(&Value::Text(Arc::from("hi"))));
+    84	    assert_eq!(back.get(0, 2), Some(&Value::Boolean(true)));
+    85	
+    86	    // (3) handle 9 — the Python callable raises → deterministic Raised + diagnostic.
+    87	    let err = w
+    88	        .call(9, &ArrayValue::singleton(Value::Blank), Duration::from_secs(10))
+    89	        .unwrap_err();
+    90	    match err {
+    91	        UdfError::Raised { exc_type, message } => {
+    92	            assert_eq!(exc_type, "ValueError");
+    93	            assert!(
+    94	                message.contains("intentional smoke failure"),
+    95	                "raise message: {message}"
+    96	            );
+    97	        }
+    98	        other => panic!("expected UdfError::Raised, got {other:?}"),
+    99	    }
+   100	
+   101	    // (4) handle 11 — sleeps 60s, deadline 300ms → Timeout + the worker is killed.
+   102	    let timed_out = w
+   103	        .call(11, &ArrayValue::singleton(Value::Blank), Duration::from_millis(300))
+   104	        .unwrap_err();
+   105	    assert!(
+   106	        matches!(timed_out, UdfError::Timeout(_)),
+   107	        "expected UdfError::Timeout, got {timed_out:?}"
+   108	    );
+   109	    assert_eq!(w.pid(), None, "the worker must be dead after a timeout-kill");
+   110	
+   111	    // (5) Respawn: a subsequent call lazily re-spawns + re-handshakes and succeeds.
+   112	    let out2 = w
+   113	        .call(7, &ArrayValue::singleton(Value::Number(4.0)), Duration::from_secs(10))
+   114	        .expect("respawn + call handle 7");
+   115	    assert_eq!(out2.get(0, 0), Some(&Value::Number(8.0)));
+   116	    assert!(w.pid().is_some(), "a fresh worker should be live after respawn");
+   117	    assert_ne!(
+   118	        w.pid(),
+   119	        pid_before,
+   120	        "respawn must be a NEW process (different pid)"
+   121	    );
+   122	}
+
+exec
+/bin/zsh -lc 'nl -ba crates/quantbook-py/python/quantbook/_codec.py' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+     1	"""Arrow ⇄ engine-value codec + CALL/RETURN/control payload codecs — the Python
+     2	mirror of `ql-udf/src/{codec,payload,control}.rs`. 3.9-compatible; needs `pyarrow`.
+     3	
+     4	A UDF call's args and result are 2-D grids of spreadsheet values. A value is
+     5	encoded across five parallel Arrow columns discriminated by ``kind``:
+     6	
+     7	    kind     populated column   engine Value
+     8	    blank    (none)             Blank
+     9	    number   num: float64       Number   (finite only; the Rust decoder rejects NaN/Inf)
+    10	    bool     bool: bool         Boolean
+    11	    text     str: utf8          Text
+    12	    error    err: utf8          Error (by sigil, e.g. "#DIV/0!")
+    13	
+    14	The grid shape rides in the Arrow **schema metadata** (``rows``/``cols``) so
+    15	degenerate shapes round-trip. The Rust decoder validates the EXACT schema (field
+    16	names, types, nullability) before trusting positions, so this module MUST emit
+    17	that schema precisely: ``kind`` non-null utf8, then nullable ``num``/``str``/
+    18	``bool``/``err``.
+    19	
+    20	Payload framings (the ``payload`` inside a `_frame` envelope):
+    21	    CALL    [u64 LE handle][u64 LE call_id][grid IPC bytes]
+    22	    RETURN  [u64 LE call_id][grid IPC bytes]
+    23	    RAISE   [u64 LE call_id][u32 LE exc_type_len][exc_type utf8][message utf8...]
+    24	    HELLO   [u32 LE protocol_version]
+    25	    HELLO_ACK [u32 LE protocol_version][u32 LE worker_pid]
+    26	"""
+    27	
+    28	import struct
+    29	
+    30	import pyarrow as pa
+    31	
+    32	
+    33	class Err:
+    34	    """A spreadsheet error value, identified by its sigil (e.g. ``"#DIV/0!"``)."""
+    35	
+    36	    __slots__ = ("sigil",)
+    37	
+    38	    def __init__(self, sigil):
+    39	        self.sigil = sigil
+    40	
+    41	    def __repr__(self):
+    42	        return "Err(%r)" % (self.sigil,)
+    43	
+    44	    def __eq__(self, other):
+    45	        return isinstance(other, Err) and other.sigil == self.sigil
+    46	
+    47	    def __hash__(self):
+    48	        return hash(self.sigil)
+    49	
+    50	
+    51	class Grid:
+    52	    """A 2-D grid of cells in row-major order. A cell is one of: ``None`` (blank),
+    53	    ``float``/``int`` (number), ``bool`` (boolean), ``str`` (text), ``Err`` (error)."""
+    54	
+    55	    __slots__ = ("rows", "cols", "cells")
+    56	
+    57	    def __init__(self, rows, cols, cells):
+    58	        if len(cells) != rows * cols:
+    59	            raise ValueError("Grid: %d cells != rows*cols = %d*%d" % (len(cells), rows, cols))
+    60	        self.rows = rows
+    61	        self.cols = cols
+    62	        self.cells = cells
+    63	
+    64	    def get(self, r, c):
+    65	        return self.cells[r * self.cols + c]
+    66	
+    67	    @staticmethod
+    68	    def scalar(value):
+    69	        return Grid(1, 1, [value])
+    70	
+    71	    def __eq__(self, other):
+    72	        return (
+    73	            isinstance(other, Grid)
+    74	            and other.rows == self.rows
+    75	            and other.cols == self.cols
+    76	            and other.cells == self.cells
+    77	        )
+    78	
+    79	    def __repr__(self):
+    80	        return "Grid(%d, %d, %r)" % (self.rows, self.cols, self.cells)
+    81	
+    82	
+    83	def as_grid(value):
+    84	    """Coerce a UDF return value into a `Grid`: a `Grid` passes through; any scalar
+    85	    cell value becomes a 1x1 grid."""
+    86	    if isinstance(value, Grid):
+    87	        return value
+    88	    return Grid.scalar(value)
+    89	
+    90	
+    91	_GRID_SCHEMA_FIELDS = [
+    92	    pa.field("kind", pa.utf8(), nullable=False),
+    93	    pa.field("num", pa.float64(), nullable=True),
+    94	    pa.field("str", pa.utf8(), nullable=True),
+    95	    pa.field("bool", pa.bool_(), nullable=True),
+    96	    pa.field("err", pa.utf8(), nullable=True),
+    97	]
+    98	
+    99	
+   100	def encode_grid(grid):
+   101	    """Encode a `Grid` to Arrow IPC stream bytes (matching `ql-udf::codec::encode_grid`)."""
+   102	    kinds, nums, strs, bools, errs = [], [], [], [], []
+   103	    for cell in grid.cells:
+   104	        if cell is None:
+   105	            kinds.append("blank"); nums.append(None); strs.append(None); bools.append(None); errs.append(None)
+   106	        elif isinstance(cell, bool):
+   107	            # NB: bool is a subclass of int — check it BEFORE the numeric branch.
+   108	            kinds.append("bool"); nums.append(None); strs.append(None); bools.append(cell); errs.append(None)
+   109	        elif isinstance(cell, (int, float)):
+   110	            kinds.append("number"); nums.append(float(cell)); strs.append(None); bools.append(None); errs.append(None)
+   111	        elif isinstance(cell, str):
+   112	            kinds.append("text"); nums.append(None); strs.append(cell); bools.append(None); errs.append(None)
+   113	        elif isinstance(cell, Err):
+   114	            kinds.append("error"); nums.append(None); strs.append(None); bools.append(None); errs.append(cell.sigil)
+   115	        else:
+   116	            raise TypeError("Grid cell of unsupported type %r: %r" % (type(cell).__name__, cell))
+   117	
+   118	    schema = pa.schema(
+   119	        _GRID_SCHEMA_FIELDS,
+   120	        metadata={"rows": str(grid.rows), "cols": str(grid.cols)},
+   121	    )
+   122	    batch = pa.RecordBatch.from_arrays(
+   123	        [
+   124	            pa.array(kinds, pa.utf8()),
+   125	            pa.array(nums, pa.float64()),
+   126	            pa.array(strs, pa.utf8()),
+   127	            pa.array(bools, pa.bool_()),
+   128	            pa.array(errs, pa.utf8()),
+   129	        ],
+   130	        schema=schema,
+   131	    )
+   132	    sink = pa.BufferOutputStream()
+   133	    with pa.ipc.new_stream(sink, schema) as writer:
+   134	        writer.write_batch(batch)
+   135	    return sink.getvalue().to_pybytes()
+   136	
+   137	
+   138	def _md_get(metadata, key):
+   139	    """Read a schema-metadata value; pyarrow returns keys/values as bytes."""
+   140	    if metadata is None:
+   141	        raise ValueError("grid schema has no metadata (missing rows/cols)")
+   142	    kb = key.encode("utf-8")
+   143	    if kb in metadata:
+   144	        return metadata[kb].decode("utf-8")
+   145	    if key in metadata:  # tolerate str-keyed metadata
+   146	        return metadata[key]
+   147	    raise ValueError("grid schema metadata missing %r" % key)
+   148	
+   149	
+   150	def decode_grid(data):
+   151	    """Decode Arrow IPC stream bytes (from the Rust engine) back to a `Grid`."""
+   152	    reader = pa.ipc.open_stream(pa.BufferReader(data))
+   153	    batches = list(reader)
+   154	    if not batches:
+   155	        raise ValueError("empty IPC stream (expected exactly one record batch)")
+   156	    if len(batches) != 1:
+   157	        raise ValueError("trailing data after the first record batch")
+   158	    batch = batches[0]
+   159	    schema = batch.schema
+   160	    rows = int(_md_get(schema.metadata, "rows"))
+   161	    cols = int(_md_get(schema.metadata, "cols"))
+   162	
+   163	    kind = batch.column(0)
+   164	    num = batch.column(1)
+   165	    strc = batch.column(2)
+   166	    boolc = batch.column(3)
+   167	    errc = batch.column(4)
+   168	
+   169	    cells = []
+   170	    for i in range(batch.num_rows):
+   171	        k = kind[i].as_py()
+   172	        if k == "blank":
+   173	            cells.append(None)
+   174	        elif k == "number":
+   175	            cells.append(num[i].as_py())
+   176	        elif k == "bool":
+   177	            cells.append(boolc[i].as_py())
+   178	        elif k == "text":
+   179	            cells.append(strc[i].as_py())
+   180	        elif k == "error":
+   181	            cells.append(Err(errc[i].as_py()))
+   182	        else:
+   183	            raise ValueError("unknown cell kind %r" % (k,))
+   184	    return Grid(rows, cols, cells)
+   185	
+   186	
+   187	# ---- CALL / RETURN payloads ----------------------------------------------
+   188	
+   189	def decode_call(payload):
+   190	    """Decode a CALL payload → ``(handle, call_id, args_grid)``."""
+   191	    if len(payload) < 16:
+   192	        raise ValueError("CALL payload header truncated (need 16 bytes, got %d)" % len(payload))
+   193	    handle = struct.unpack("<Q", payload[0:8])[0]
+   194	    call_id = struct.unpack("<Q", payload[8:16])[0]
+   195	    args = decode_grid(payload[16:])
+   196	    return (handle, call_id, args)
+   197	
+   198	
+   199	def encode_return(call_id, result_grid):
+   200	    """Encode a RETURN payload: ``[u64 call_id][grid]``."""
+   201	    return struct.pack("<Q", call_id) + encode_grid(result_grid)
+   202	
+   203	
+   204	def encode_raise(call_id, exc_type, message):
+   205	    """Encode a RAISE payload: ``[u64 call_id][u32 exc_type_len][exc_type][message]``."""
+   206	    et = exc_type.encode("utf-8")
+   207	    return (
+   208	        struct.pack("<Q", call_id)
+   209	        + struct.pack("<I", len(et))
+   210	        + et
+   211	        + message.encode("utf-8")
+   212	    )
+   213	
+   214	
+   215	# ---- control payloads -----------------------------------------------------
+   216	
+   217	def decode_hello(payload):
+   218	    """Decode a HELLO payload → the engine's protocol version."""
+   219	    if len(payload) < 4:
+   220	        raise ValueError("HELLO payload truncated")
+   221	    return struct.unpack("<I", payload[0:4])[0]
+   222	
+   223	
+   224	def encode_hello_ack(protocol_version, worker_pid):
+   225	    """Encode a HELLO_ACK payload: ``[u32 protocol_version][u32 worker_pid]``."""
+   226	    return struct.pack("<I", protocol_version) + struct.pack("<I", worker_pid)
+
+exec
+/bin/zsh -lc 'nl -ba crates/quantbook-py/python/quantbook/_self_test.py' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+exec
+/bin/zsh -lc 'nl -ba crates/quantbook-py/python/quantbook/_smoke_udfs.py' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+exec
+/bin/zsh -lc 'nl -ba crates/ql-udf/src/lib.rs' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+     1	"""Smoke-test UDF fixture — registers a few functions by handle for the
+     2	`ql-udf` `process_smoke` integration test (`QUANTBOOK_UDF_MODULE=quantbook._smoke_udfs`).
+     3	Not part of the product surface."""
+     4	
+     5	import time
+     6	
+     7	import quantbook
+     8	
+     9	
+    10	def _double(args):
+    11	    """handle 7 — double a single numeric arg (1x1 grid in → scalar out)."""
+    12	    return args.get(0, 0) * 2.0
+    13	
+    14	
+    15	def _echo(args):
+    16	    """handle 8 — identity over the whole args grid (round-trip fidelity check)."""
+    17	    return args
+    18	
+    19	
+    20	def _raise_value_error(args):
+    21	    """handle 9 — always raises (exercises the RAISE path)."""
+    22	    raise ValueError("intentional smoke failure")
+    23	
+    24	
+    25	def _slow(args):
+    26	    """handle 11 — sleeps far longer than any test deadline (exercises timeout-kill)."""
+    27	    time.sleep(60)
+    28	    return 0.0
+    29	
+    30	
+    31	quantbook.register_formula_function(_double, handle=7)
+    32	quantbook.register_formula_function(_echo, handle=8)
+    33	quantbook.register_formula_function(_raise_value_error, handle=9)
+    34	quantbook.register_formula_function(_slow, handle=11)
+
+ succeeded in 0ms:
+     1	//! `ql-udf` — out-of-process Python UDF worker transport + codec.
+     2	//!
+     3	//! **Phase 6.4-3 (the wedge).** Design: `docs/phase6/6-4-3-design.md`. This crate
+     4	//! owns the *mechanics* of talking to a managed Python worker process: the wire
+     5	//! protocol (length-prefixed frames), the Arrow ↔ engine-`Value` codec, and the
+     6	//! [`UdfWorker`] abstraction. It is a **leaf** (dependency-inversion, mirroring
+     7	//! `ql-io-csv` / `ql-io-xlsx`): it depends only on `ql-types`, `arrow`, and
+     8	//! `thiserror`, and is consumed by `ql-exec` at the dispatch site (6.4-3c), which
+     9	//! adapts `FunctionArg`/`FunctionReturn` ↔ [`ql_types::ArrayValue`] and injects a
+    10	//! worker into the eval context.
+    11	//!
+    12	//! **Modules:**
+    13	//! - [`codec`] — `ArrayValue` ⇄ Arrow IPC stream bytes (the "fiddly part"). The
+    14	//!   decoder is a trust boundary for worker-controlled bytes: it validates the exact
+    15	//!   schema and rejects null/non-finite/short-column/reordered/trailing-batch input
+    16	//!   loudly, never panicking (6.4-3a + its audit-fix).
+    17	//! - [`frame`] — the `[u32 LE len][u8 type][payload]` envelope + [`frame::FrameType`].
+    18	//! - [`payload`] — the typed `CALL` / `RETURN` data payloads ([`payload::CallPayload`]
+    19	//!   `{ handle, call_id, args }` / [`payload::ReturnPayload`] `{ call_id, result }`).
+    20	//! - [`control`] — the `HELLO` / `HELLO_ACK` / `RAISE` / `LOG` / `CANCEL` control-frame
+    21	//!   payload codecs + [`control::PROTOCOL_VERSION`] (6.4-3b pinned these; 6.4-3a left
+    22	//!   them opaque).
+    23	//! - [`worker`] — the [`worker::UdfWorker`] trait + the [`worker::UdfError`] taxonomy
+    24	//!   + an in-process [`worker::MockWorker`] (test double).
+    25	//! - [`process`] — [`process::ProcessWorker`]: the real, process-backed worker
+    26	//!   (6.4-3b) that spawns `python -m quantbook.worker`, handshakes, calls, and
+    27	//!   timeout-kills/respawns. Implements [`UdfWorker`].
+    28	//!
+    29	//! It is a **leaf** (dependency-inversion, mirroring `ql-io-csv` / `ql-io-xlsx`):
+    30	//! depends only on `ql-types`, `arrow`, `thiserror`, and `std`. `ql-exec` will consume
+    31	//! it at the dispatch site (6.4-3c), adapting `FunctionArg`/`FunctionReturn` ↔
+    32	//! [`ql_types::ArrayValue`] and injecting a worker into the eval context.
+    33	//!
+    34	//! **Deferred** to later 6.4-3 cycles: the eval-site `RegisteredFn::Udf` dispatch arm
+    35	//! (6.4-3c); debugpy attach + trusted-workspace gating + IDE handle-minting +
+    36	//! `LOG`→`CellDiagnostic` routing (6.4-3d). The on-wire batch format is Arrow IPC
+    37	//! (so the Python side uses `pyarrow` natively); the [`codec`] boundary keeps it
+    38	//! swappable. The Python worker lives in `crates/quantbook-py/python/quantbook/`.
+    39	
+    40	pub mod codec;
+    41	pub mod control;
+    42	pub mod frame;
+    43	pub mod payload;
+    44	pub mod process;
+    45	pub mod worker;
+    46	
+    47	pub use frame::{Frame, FrameType};
+    48	pub use payload::{CallPayload, ReturnPayload};
+    49	pub use process::{ProcessWorker, PythonWorkerConfig};
+    50	pub use worker::{MockWorker, UdfError, UdfWorker};
+
+ succeeded in 0ms:
+     1	"""Standalone Python-side codec sanity check: ``python3 -m quantbook._self_test``.
+     2	
+     3	Round-trips grids + the CALL/RETURN payload headers through the codec WITHOUT the
+     4	Rust engine — confirms the Python mirror is internally consistent (the Rust↔Python
+     5	cross-check is the `ql-udf` `process_smoke` integration test). Prints ``PASS`` and
+     6	exits 0 on success; raises (non-zero exit) on any mismatch.
+     7	"""
+     8	
+     9	import struct
+    10	import sys
+    11	
+    12	from . import _codec
+    13	from ._codec import Err, Grid
+    14	
+    15	
+    16	def _check(cond, msg):
+    17	    if not cond:
+    18	        raise AssertionError(msg)
+    19	
+    20	
+    21	def main():
+    22	    grids = [
+    23	        Grid(1, 1, [42.5]),
+    24	        Grid(1, 1, [True]),
+    25	        Grid(1, 1, [False]),
+    26	        Grid(1, 1, ["hello"]),
+    27	        Grid(1, 1, [""]),
+    28	        Grid(1, 1, [None]),
+    29	        Grid(1, 1, [Err("#DIV/0!")]),
+    30	        Grid(2, 3, [None, 1.0, True, "x", Err("#N/A"), -2.5]),
+    31	        Grid(3, 0, []),  # degenerate: rows>0, cols==0
+    32	        Grid(0, 0, []),  # fully empty
+    33	        Grid(0, 4, []),  # degenerate: rows==0, cols>0
+    34	    ]
+    35	    for g in grids:
+    36	        back = _codec.decode_grid(_codec.encode_grid(g))
+    37	        _check(back == g, "grid round-trip failed: %r != %r" % (back, g))
+    38	
+    39	    # CALL payload: build [u64 handle][u64 call_id][grid] and decode it.
+    40	    g = Grid(1, 2, [10.0, "x"])
+    41	    call_bytes = struct.pack("<Q", 7) + struct.pack("<Q", 99) + _codec.encode_grid(g)
+    42	    handle, call_id, args = _codec.decode_call(call_bytes)
+    43	    _check(handle == 7 and call_id == 99, "decode_call header mismatch")
+    44	    _check(args == g, "decode_call args grid mismatch")
+    45	
+    46	    # RETURN payload: [u64 call_id][grid] — verify the header + the grid tail decodes.
+    47	    ret = _codec.encode_return(99, g)
+    48	    _check(struct.unpack("<Q", ret[0:8])[0] == 99, "encode_return call_id mismatch")
+    49	    _check(_codec.decode_grid(ret[8:]) == g, "encode_return grid tail mismatch")
+    50	
+    51	    # CALL truncated-header is loud, not an IndexError.
+    52	    try:
+    53	        _codec.decode_call(b"\x00" * 15)
+    54	        _check(False, "decode_call should reject a 15-byte payload")
+    55	    except ValueError:
+    56	        pass
+    57	
+    58	    print("PASS")
+    59	    return 0
+    60	
+    61	
+    62	if __name__ == "__main__":
+    63	    sys.exit(main())
+
+exec
+/bin/zsh -lc 'rg -n "exit test 6|late RETURN|deadline|handshake|kill|protocol|LOG|stdout|No-Fallbacks|test 7|raise" docs/phase6/6-4-3-design.md' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+40:**block the recalc thread** on the response (with a deadline) → map the Arrow batch back to
+41:`FunctionReturn`. Worker-kill on timeout/cancel.
+49:  one UDF in a recompute pass → one Arrow batch → one round-trip). Design the protocol so this is
+57:**Decision: Model A for 6.4-3.** Design the wire protocol batch-ready (see §3) so Model B is a
+73:- **New crate `ql-udf`** (Rust): owns the `WorkerHandle` — spawn / handshake / request-response /
+74:  timeout / kill / drain. Pure process+IPC mechanics; depends on `arrow` + `ql-types` (+ a small
+75:  protocol module). NOT on `ql-exec` (leaf, dependency-inversion like `ql-io-csv`/`ql-io-xlsx`).
+82:  speaking the Arrow-IPC protocol over stdio — no PyO3 in the hot path (simpler, debugpy-friendly,
+89:## 3. Wire protocol (length-prefixed Arrow IPC over a duplex pipe)
+92:- `HELLO` / `HELLO_ACK` — handshake: protocol version, worker pid (for debugpy), capability flags.
+98:- `RAISE { call_id, exc_type, message, traceback }` — Python raised; maps to a deterministic
+99:  `CellDiagnostic` + the cell value `#CALC!`/`#VALUE!` per contract (exit test 7).
+100:- `CANCEL { call_id }` — cooperative cancel request (best-effort; hard cancel is process kill).
+101:- `LOG { level, message }` — worker stdout/stderr surfaced as diagnostics (never silently dropped).
+118:   marshal the evaluated args to an Arrow batch, call `ctx.worker.call(handle, batch, deadline)`,
+119:   map `RETURN`→`FunctionReturn`, `RAISE`→error value + diagnostic, timeout→worker-kill + `#CALC!`.
+122:   `#CALC!`/diagnostic, NOT a panic — No-Fallbacks-honest).
+124:## 5. Cancellation / worker-kill (contract §6.2 — hard cancel)
+126:- `CancelPolicy::WorkerKill` (already a `FunctionMetadata` axis, 6.4-1) → cancel/timeout kills the
+127:  worker process. The engine must survive a killed worker: the `WorkerHandle` respawns lazily on
+130:  drops any `RETURN` arriving after the deadline/kill.
+139:  gate. No effect on the protocol hot path.
+145:  gating, no untrusted-Python file write, worker-kill leaves the engine usable.
+156:- **6.4-3a — protocol + `ql-udf` crate (Rust-only, no Python):** framing, frame types, the
+159:- **6.4-3b — real Python worker + spawn/handshake/kill:** `quantbook-py` worker loop, process
+160:  lifecycle, timeout→kill, respawn. Audit: 2-way (engine) + smoke against a real `python`.
+169:   coexists (debugpy uses its own port); a socket decouples logging from the protocol. Lean stdio
+170:   for v1 with stderr reserved for LOG passthrough.
+172:   provides the path; fail loud if absent (No-Fallbacks).
+
+exec
+/bin/zsh -lc "nl -ba docs/phase6/6-4-3-design.md | sed -n '80,140p'" in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+    80	  loop) + the user-facing `quantbook` Python package (`register_formula_function`, `qb.*`). The
+    81	  Rust `src/lib.rs` may host a PyO3 bridge later; for v1 the worker is a **plain Python process**
+    82	  speaking the Arrow-IPC protocol over stdio — no PyO3 in the hot path (simpler, debugpy-friendly,
+    83	  no GIL-in-Rust complications). Promote `quantbook-py` to a workspace member.
+    84	- **`FunctionImplHandle(u64)`** indexes a worker-side registry of user functions (the handle is
+    85	  minted IDE-side when the user calls `register_formula_function`, passed to `registerFunction`
+    86	  over napi, stored in `udf_handles`, and echoed in each dispatch request so the worker knows which
+    87	  Python callable to invoke).
+    88	
+    89	## 3. Wire protocol (length-prefixed Arrow IPC over a duplex pipe)
+    90	
+    91	Framing: `[u32 LE length][u8 frame-type][payload]`. Frame types:
+    92	- `HELLO` / `HELLO_ACK` — handshake: protocol version, worker pid (for debugpy), capability flags.
+    93	- `CALL { handle: u64, call_id: u64, args: Arrow RecordBatch }` — one UDF invocation. Args encoded
+    94	  as an Arrow batch (scalars = 1-row; ranges/columns = N-row; the `ArgContext`/`BatchShape`
+    95	  metadata determines the schema). `call_id` correlates the response + supports cancel.
+    96	- `RETURN { call_id, result: Arrow RecordBatch }` — success; maps to `FunctionReturn::Scalar`
+    97	  (1×1) or `Array` (N×M).
+    98	- `RAISE { call_id, exc_type, message, traceback }` — Python raised; maps to a deterministic
+    99	  `CellDiagnostic` + the cell value `#CALC!`/`#VALUE!` per contract (exit test 7).
+   100	- `CANCEL { call_id }` — cooperative cancel request (best-effort; hard cancel is process kill).
+   101	- `LOG { level, message }` — worker stdout/stderr surfaced as diagnostics (never silently dropped).
+   102	
+   103	**Arrow ↔ engine `Value` mapping** (the fiddly part — its own cycle):
+   104	- engine `Value::{Number, Text, Boolean, Error, Blank}` ↔ Arrow `Float64 / Utf8 / Boolean / (error
+   105	  as a sentinel union or a separate error column) / null`. `ArrayValue` ↔ a 2-D batch (row-major).
+   106	  Error values need an explicit encoding (Arrow has no native spreadsheet-error type) — a tagged
+   107	  struct column `{ kind: Utf8 ("number"|"text"|"bool"|"error"|"blank"), num, str, bool, err }` is
+   108	  the safe v1 encoding (verbose but unambiguous; optimize later).
+   109	
+   110	## 4. Eval-path wiring (`RegisteredFn::Udf`)
+   111	
+   112	1. Add `RegisteredFn::Udf(FunctionImplHandle)` to the enum (`registry.rs:172`).
+   113	2. `register_udf` (6.4-2) currently stores metadata + handle but registers NO `RegisteredFn`.
+   114	   6.4-3: also insert `RegisteredFn::Udf(handle)` into the dispatch table (`fns`) so the
+   115	   `scalar.rs` match finds it instead of falling to the `None` #NAME? arm. (Re-examine the
+   116	   6.4-2 atomicity invariant — `register_udf` becomes a 3-way atomic: metadata + handle + dispatch.)
+   117	3. New match arm in `scalar.rs` (~before `:463`): `Some(RegisteredFn::Udf(handle)) => { … }` —
+   118	   marshal the evaluated args to an Arrow batch, call `ctx.worker.call(handle, batch, deadline)`,
+   119	   map `RETURN`→`FunctionReturn`, `RAISE`→error value + diagnostic, timeout→worker-kill + `#CALC!`.
+   120	4. The `FunctionContext` / `EvalContext` gains access to the `WorkerHandle` (a new optional field;
+   121	   `None` when no worker is configured → registered UDF with no worker = deterministic
+   122	   `#CALC!`/diagnostic, NOT a panic — No-Fallbacks-honest).
+   123	
+   124	## 5. Cancellation / worker-kill (contract §6.2 — hard cancel)
+   125	
+   126	- `CancelPolicy::WorkerKill` (already a `FunctionMetadata` axis, 6.4-1) → cancel/timeout kills the
+   127	  worker process. The engine must survive a killed worker: the `WorkerHandle` respawns lazily on
+   128	  the next call; in-flight `call_id`s resolve to a deterministic cancel diagnostic.
+   129	- Exit test 6: a canceled/timed-out UDF must NOT commit a late result — `call_id` correlation
+   130	  drops any `RETURN` arriving after the deadline/kill.
+   131	- FaultGuard discipline (6.1C M3 / 6.4-2): a worker round-trip happening inside recompute must not,
+   132	  on worker death, leave the session torn. The worker call is I/O at the leaf; failures map to a
+   133	  cell error, not an engine fault.
+   134	
+   135	## 6. debugpy
+   136	
+   137	- Worker spawned with an env/flag that, in trusted-workspace mode, starts `debugpy` listening on a
+   138	  port (surfaced in `HELLO_ACK` → IDE can attach). Off by default; opt-in per the trusted-workspace
+   139	  gate. No effect on the protocol hot path.
+   140	
+
+exec
+/bin/zsh -lc "rg -n \"unwrap\\(|expect\\(|panic"'!|'"\\[.*\\]|pass|except|print\\(|stdout|stderr|kill|wait|recv_timeout|wrapping_add|flush|import_module|register_formula_function|int\\(\" crates/ql-udf/src/process.rs crates/ql-udf/src/control.rs crates/ql-udf/src/worker.rs crates/ql-udf/src/lib.rs crates/ql-udf/tests/process_smoke.rs crates/quantbook-py/python/quantbook/*.py" in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+crates/quantbook-py/python/quantbook/__init__.py:5:path. `register_formula_function` registers a Python callable as a formula function
+crates/quantbook-py/python/quantbook/__init__.py:18:def register_formula_function(fn, *, handle, name=None):
+crates/quantbook-py/python/quantbook/__init__.py:26:    _register(int(handle), fn)
+crates/quantbook-py/python/quantbook/_frame.py:3:Frame layout: ``[u32 LE total_len][u8 frame_type][payload...]`` where
+crates/quantbook-py/python/quantbook/_frame.py:49:    total = struct.unpack("<I", head)[0]
+crates/quantbook-py/python/quantbook/_frame.py:57:    frame_type = body[0]
+crates/quantbook-py/python/quantbook/_frame.py:58:    payload = body[1:]
+crates/quantbook-py/python/quantbook/_frame.py:63:    """Write one frame and flush. ``payload`` is ``bytes``."""
+crates/quantbook-py/python/quantbook/_frame.py:68:    stream.write(bytes([frame_type]))
+crates/quantbook-py/python/quantbook/_frame.py:71:    stream.flush()
+crates/quantbook-py/python/quantbook/_self_test.py:23:        Grid(1, 1, [42.5]),
+crates/quantbook-py/python/quantbook/_self_test.py:24:        Grid(1, 1, [True]),
+crates/quantbook-py/python/quantbook/_self_test.py:25:        Grid(1, 1, [False]),
+crates/quantbook-py/python/quantbook/_self_test.py:26:        Grid(1, 1, ["hello"]),
+crates/quantbook-py/python/quantbook/_self_test.py:27:        Grid(1, 1, [""]),
+crates/quantbook-py/python/quantbook/_self_test.py:28:        Grid(1, 1, [None]),
+crates/quantbook-py/python/quantbook/_self_test.py:29:        Grid(1, 1, [Err("#DIV/0!")]),
+crates/quantbook-py/python/quantbook/_self_test.py:30:        Grid(2, 3, [None, 1.0, True, "x", Err("#N/A"), -2.5]),
+crates/quantbook-py/python/quantbook/_self_test.py:31:        Grid(3, 0, []),  # degenerate: rows>0, cols==0
+crates/quantbook-py/python/quantbook/_self_test.py:32:        Grid(0, 0, []),  # fully empty
+crates/quantbook-py/python/quantbook/_self_test.py:33:        Grid(0, 4, []),  # degenerate: rows==0, cols>0
+crates/quantbook-py/python/quantbook/_self_test.py:39:    # CALL payload: build [u64 handle][u64 call_id][grid] and decode it.
+crates/quantbook-py/python/quantbook/_self_test.py:40:    g = Grid(1, 2, [10.0, "x"])
+crates/quantbook-py/python/quantbook/_self_test.py:46:    # RETURN payload: [u64 call_id][grid] — verify the header + the grid tail decodes.
+crates/quantbook-py/python/quantbook/_self_test.py:48:    _check(struct.unpack("<Q", ret[0:8])[0] == 99, "encode_return call_id mismatch")
+crates/quantbook-py/python/quantbook/_self_test.py:49:    _check(_codec.decode_grid(ret[8:]) == g, "encode_return grid tail mismatch")
+crates/quantbook-py/python/quantbook/_self_test.py:55:    except ValueError:
+crates/quantbook-py/python/quantbook/_self_test.py:56:        pass
+crates/quantbook-py/python/quantbook/_self_test.py:58:    print("PASS")
+crates/quantbook-py/python/quantbook/_smoke_udfs.py:26:    """handle 11 — sleeps far longer than any test deadline (exercises timeout-kill)."""
+crates/quantbook-py/python/quantbook/_smoke_udfs.py:31:quantbook.register_formula_function(_double, handle=7)
+crates/quantbook-py/python/quantbook/_smoke_udfs.py:32:quantbook.register_formula_function(_echo, handle=8)
+crates/quantbook-py/python/quantbook/_smoke_udfs.py:33:quantbook.register_formula_function(_raise_value_error, handle=9)
+crates/quantbook-py/python/quantbook/_smoke_udfs.py:34:quantbook.register_formula_function(_slow, handle=11)
+crates/quantbook-py/python/quantbook/_codec.py:21:    CALL    [u64 LE handle][u64 LE call_id][grid IPC bytes]
+crates/quantbook-py/python/quantbook/_codec.py:22:    RETURN  [u64 LE call_id][grid IPC bytes]
+crates/quantbook-py/python/quantbook/_codec.py:23:    RAISE   [u64 LE call_id][u32 LE exc_type_len][exc_type utf8][message utf8...]
+crates/quantbook-py/python/quantbook/_codec.py:24:    HELLO   [u32 LE protocol_version]
+crates/quantbook-py/python/quantbook/_codec.py:25:    HELLO_ACK [u32 LE protocol_version][u32 LE worker_pid]
+crates/quantbook-py/python/quantbook/_codec.py:65:        return self.cells[r * self.cols + c]
+crates/quantbook-py/python/quantbook/_codec.py:69:        return Grid(1, 1, [value])
+crates/quantbook-py/python/quantbook/_codec.py:84:    """Coerce a UDF return value into a `Grid`: a `Grid` passes through; any scalar
+crates/quantbook-py/python/quantbook/_codec.py:102:    kinds, nums, strs, bools, errs = [], [], [], [], []
+crates/quantbook-py/python/quantbook/_codec.py:144:        return metadata[kb].decode("utf-8")
+crates/quantbook-py/python/quantbook/_codec.py:146:        return metadata[key]
+crates/quantbook-py/python/quantbook/_codec.py:158:    batch = batches[0]
+crates/quantbook-py/python/quantbook/_codec.py:160:    rows = int(_md_get(schema.metadata, "rows"))
+crates/quantbook-py/python/quantbook/_codec.py:161:    cols = int(_md_get(schema.metadata, "cols"))
+crates/quantbook-py/python/quantbook/_codec.py:169:    cells = []
+crates/quantbook-py/python/quantbook/_codec.py:171:        k = kind[i].as_py()
+crates/quantbook-py/python/quantbook/_codec.py:175:            cells.append(num[i].as_py())
+crates/quantbook-py/python/quantbook/_codec.py:177:            cells.append(boolc[i].as_py())
+crates/quantbook-py/python/quantbook/_codec.py:179:            cells.append(strc[i].as_py())
+crates/quantbook-py/python/quantbook/_codec.py:181:            cells.append(Err(errc[i].as_py()))
+crates/quantbook-py/python/quantbook/_codec.py:193:    handle = struct.unpack("<Q", payload[0:8])[0]
+crates/quantbook-py/python/quantbook/_codec.py:194:    call_id = struct.unpack("<Q", payload[8:16])[0]
+crates/quantbook-py/python/quantbook/_codec.py:195:    args = decode_grid(payload[16:])
+crates/quantbook-py/python/quantbook/_codec.py:200:    """Encode a RETURN payload: ``[u64 call_id][grid]``."""
+crates/quantbook-py/python/quantbook/_codec.py:205:    """Encode a RAISE payload: ``[u64 call_id][u32 exc_type_len][exc_type][message]``."""
+crates/quantbook-py/python/quantbook/_codec.py:221:    return struct.unpack("<I", payload[0:4])[0]
+crates/quantbook-py/python/quantbook/_codec.py:225:    """Encode a HELLO_ACK payload: ``[u32 protocol_version][u32 worker_pid]``."""
+crates/quantbook-py/python/quantbook/worker.py:4:on **stdout**. stdout is the PROTOCOL channel — the worker must NEVER print to it;
+crates/quantbook-py/python/quantbook/worker.py:5:diagnostics go to stderr. The engine (`ql-udf::ProcessWorker`) spawns this, performs
+crates/quantbook-py/python/quantbook/worker.py:8:UDFs are registered by handle via `quantbook.register_formula_function`. The trusted
+crates/quantbook-py/python/quantbook/worker.py:27:        importlib.import_module(mod)
+crates/quantbook-py/python/quantbook/worker.py:30:def run(stdin, stdout, stderr):
+crates/quantbook-py/python/quantbook/worker.py:43:                stdout, _frame.HELLO_ACK, _codec.encode_hello_ack(PROTOCOL_VERSION, os.getpid())
+crates/quantbook-py/python/quantbook/worker.py:52:                _frame.write_frame(stdout, _frame.RETURN, _codec.encode_return(call_id, result))
+crates/quantbook-py/python/quantbook/worker.py:53:            except Exception as e:  # noqa: BLE001 — ANY UDF failure becomes a RAISE, never crashes the loop
+crates/quantbook-py/python/quantbook/worker.py:55:                    stdout, _frame.RAISE, _codec.encode_raise(call_id, type(e).__name__, str(e))
+crates/quantbook-py/python/quantbook/worker.py:59:            # SIGKILLs this process (the worker is designed to be killable mid-call).
+crates/quantbook-py/python/quantbook/worker.py:60:            pass
+crates/quantbook-py/python/quantbook/worker.py:62:            stderr.write("quantbook.worker: ignoring unexpected frame type %d\n" % ftype)
+crates/quantbook-py/python/quantbook/worker.py:63:            stderr.flush()
+crates/quantbook-py/python/quantbook/worker.py:67:    return run(sys.stdin.buffer, sys.stdout.buffer, sys.stderr)
+crates/ql-udf/tests/process_smoke.rs:1://! Real-Python end-to-end smoke for [`ql_udf::ProcessWorker`] (Phase 6.4-3b).
+crates/ql-udf/tests/process_smoke.rs:5://! plus the raise / timeout-kill / respawn paths. If `python3` (or `python`) with
+crates/ql-udf/tests/process_smoke.rs:20:    for py in ["python3", "python"] {
+crates/ql-udf/tests/process_smoke.rs:22:            .args(["-c", "import pyarrow"])
+crates/ql-udf/tests/process_smoke.rs:37:        .expect("quantbook-py/python directory should exist");
+crates/ql-udf/tests/process_smoke.rs:43:#[test]
+crates/ql-udf/tests/process_smoke.rs:60:        .expect("call handle 7");
+crates/ql-udf/tests/process_smoke.rs:78:    .unwrap();
+crates/ql-udf/tests/process_smoke.rs:79:    let back = w.call(8, &grid, Duration::from_secs(10)).expect("call handle 8");
+crates/ql-udf/tests/process_smoke.rs:98:        other => panic!("expected UdfError::Raised, got {other:?}"),
+crates/ql-udf/tests/process_smoke.rs:101:    // (4) handle 11 — sleeps 60s, deadline 300ms → Timeout + the worker is killed.
+crates/ql-udf/tests/process_smoke.rs:109:    assert_eq!(w.pid(), None, "the worker must be dead after a timeout-kill");
+crates/ql-udf/tests/process_smoke.rs:114:        .expect("respawn + call handle 7");
+crates/quantbook-py/python/quantbook/_registry.py:1:"""Process-local UDF registry shared by `register_formula_function` (in the
+crates/quantbook-py/python/quantbook/_registry.py:9:    _REGISTRY[int(handle)] = fn
+crates/quantbook-py/python/quantbook/_registry.py:13:    return _REGISTRY.get(int(handle))
+crates/ql-udf/src/lib.rs:6://! [`UdfWorker`] abstraction. It is a **leaf** (dependency-inversion, mirroring
+crates/ql-udf/src/lib.rs:9://! adapts `FunctionArg`/`FunctionReturn` ↔ [`ql_types::ArrayValue`] and injects a
+crates/ql-udf/src/lib.rs:13://! - [`codec`] — `ArrayValue` ⇄ Arrow IPC stream bytes (the "fiddly part"). The
+crates/ql-udf/src/lib.rs:17://! - [`frame`] — the `[u32 LE len][u8 type][payload]` envelope + [`frame::FrameType`].
+crates/ql-udf/src/lib.rs:18://! - [`payload`] — the typed `CALL` / `RETURN` data payloads ([`payload::CallPayload`]
+crates/ql-udf/src/lib.rs:19://!   `{ handle, call_id, args }` / [`payload::ReturnPayload`] `{ call_id, result }`).
+crates/ql-udf/src/lib.rs:20://! - [`control`] — the `HELLO` / `HELLO_ACK` / `RAISE` / `LOG` / `CANCEL` control-frame
+crates/ql-udf/src/lib.rs:21://!   payload codecs + [`control::PROTOCOL_VERSION`] (6.4-3b pinned these; 6.4-3a left
+crates/ql-udf/src/lib.rs:23://! - [`worker`] — the [`worker::UdfWorker`] trait + the [`worker::UdfError`] taxonomy
+crates/ql-udf/src/lib.rs:24://!   + an in-process [`worker::MockWorker`] (test double).
+crates/ql-udf/src/lib.rs:25://! - [`process`] — [`process::ProcessWorker`]: the real, process-backed worker
+crates/ql-udf/src/lib.rs:27://!   timeout-kills/respawns. Implements [`UdfWorker`].
+crates/ql-udf/src/lib.rs:32://! [`ql_types::ArrayValue`] and injecting a worker into the eval context.
+crates/ql-udf/src/lib.rs:37://! (so the Python side uses `pyarrow` natively); the [`codec`] boundary keeps it
+crates/ql-udf/src/control.rs:3://! **6.4-3b.** 6.4-3a defined the [`crate::frame`] envelope + the data-frame
+crates/ql-udf/src/control.rs:4://! ([`crate::payload`]) `CALL`/`RETURN` payloads, and left the CONTROL-frame payload
+crates/ql-udf/src/control.rs:6://! This module pins them. On-wire layouts (the [`crate::frame`] envelope wraps each
+crates/ql-udf/src/control.rs:9://! - `HELLO`     (engine→worker): `[u32 LE protocol_version]`
+crates/ql-udf/src/control.rs:10://! - `HELLO_ACK` (worker→engine): `[u32 LE protocol_version][u32 LE worker_pid]`
+crates/ql-udf/src/control.rs:11://! - `RAISE`     (worker→engine): `[u64 LE call_id][u32 LE exc_type_len][exc_type utf8][message utf8…]`
+crates/ql-udf/src/control.rs:12://! - `LOG`       (worker→engine): `[u8 level][message utf8…]`
+crates/ql-udf/src/control.rs:13://! - `CANCEL`    (engine→worker): `[u64 LE call_id]`
+crates/ql-udf/src/control.rs:15://! Every short/garbage payload is a loud [`CodecError`] — never a panic, never a
+crates/ql-udf/src/control.rs:17://! little-endian, matching [`crate::frame`] + [`crate::payload`]. Strings are raw
+crates/ql-udf/src/control.rs:31:fn need(bytes: &[u8], n: usize) -> Result<(), CodecError> {
+crates/ql-udf/src/control.rs:41:fn read_u32_le(bytes: &[u8], at: usize) -> u32 {
+crates/ql-udf/src/control.rs:42:    u32::from_le_bytes(bytes[at..at + U32].try_into().expect("4 bytes"))
+crates/ql-udf/src/control.rs:53:pub fn decode_hello(bytes: &[u8]) -> Result<u32, CodecError> {
+crates/ql-udf/src/control.rs:62:#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+crates/ql-udf/src/control.rs:77:pub fn decode_hello_ack(bytes: &[u8]) -> Result<HelloAck, CodecError> {
+crates/ql-udf/src/control.rs:87:/// A Python exception surfaced by the worker (maps to [`crate::UdfError::Raised`]).
+crates/ql-udf/src/control.rs:89:#[derive(Debug, Clone, PartialEq, Eq)]
+crates/ql-udf/src/control.rs:109:pub fn decode_raise(bytes: &[u8]) -> Result<Raise, CodecError> {
+crates/ql-udf/src/control.rs:111:    let call_id = u64::from_le_bytes(bytes[0..U64].try_into().expect("8 bytes"));
+crates/ql-udf/src/control.rs:113:    let after_len = &bytes[U64 + U32..];
+crates/ql-udf/src/control.rs:120:    let exc_type = std::str::from_utf8(&after_len[..et_len])
+crates/ql-udf/src/control.rs:123:    let message = std::str::from_utf8(&after_len[et_len..])
+crates/ql-udf/src/control.rs:135:/// A worker log line (stdout/stderr passthrough), surfaced as a diagnostic.
+crates/ql-udf/src/control.rs:136:#[derive(Debug, Clone, PartialEq, Eq)]
+crates/ql-udf/src/control.rs:151:pub fn decode_log(bytes: &[u8]) -> Result<Log, CodecError> {
+crates/ql-udf/src/control.rs:153:    let level = bytes[0];
+crates/ql-udf/src/control.rs:154:    let message = std::str::from_utf8(&bytes[1..])
+crates/ql-udf/src/control.rs:168:pub fn decode_cancel(bytes: &[u8]) -> Result<u64, CodecError> {
+crates/ql-udf/src/control.rs:170:    Ok(u64::from_le_bytes(bytes[0..U64].try_into().expect("8 bytes")))
+crates/ql-udf/src/control.rs:173:#[cfg(test)]
+crates/ql-udf/src/control.rs:177:    #[test]
+crates/ql-udf/src/control.rs:180:        assert_eq!(decode_hello(&bytes).unwrap(), PROTOCOL_VERSION);
+crates/ql-udf/src/control.rs:183:    #[test]
+crates/ql-udf/src/control.rs:189:        assert_eq!(decode_hello_ack(&encode_hello_ack(&ack)).unwrap(), ack);
+crates/ql-udf/src/control.rs:192:    #[test]
+crates/ql-udf/src/control.rs:211:            assert_eq!(decode_raise(&encode_raise(&r)).unwrap(), r);
+crates/ql-udf/src/control.rs:215:    #[test]
+crates/ql-udf/src/control.rs:221:        assert_eq!(decode_log(&encode_log(&log)).unwrap(), log);
+crates/ql-udf/src/control.rs:224:    #[test]
+crates/ql-udf/src/control.rs:227:        assert_eq!(decode_cancel(&bytes).unwrap(), u64::MAX);
+crates/ql-udf/src/control.rs:230:    #[test]
+crates/ql-udf/src/control.rs:233:            decode_hello(&[1, 2]).unwrap_err(),
+crates/ql-udf/src/control.rs:237:            decode_hello_ack(&[0u8; 7]).unwrap_err(),
+crates/ql-udf/src/control.rs:241:            decode_cancel(&[0u8; 3]).unwrap_err(),
+crates/ql-udf/src/control.rs:246:            decode_raise(&[1, 2]).unwrap_err(),
+crates/ql-udf/src/control.rs:251:            decode_log(&[]).unwrap_err(),
+crates/ql-udf/src/control.rs:256:    #[test]
+crates/ql-udf/src/control.rs:268:    #[test]
+crates/ql-udf/src/control.rs:273:        bytes.extend_from_slice(&[0xFF, 0xFE]);
+crates/ql-udf/src/worker.rs:1://! The [`UdfWorker`] abstraction + its error taxonomy + an in-process
+crates/ql-udf/src/worker.rs:2://! [`MockWorker`].
+crates/ql-udf/src/worker.rs:6://! defines the trait + the loud [`UdfError`] taxonomy and proves the call paths
+crates/ql-udf/src/worker.rs:7://! (success / raise / timeout) against a [`MockWorker`] — **no subprocess, no
+crates/ql-udf/src/worker.rs:8://! Python**. The real process-backed worker (spawn / handshake / timeout-kill /
+crates/ql-udf/src/worker.rs:23:/// process-backed [`crate::process::ProcessWorker`] can hit `Handshake` (the
+crates/ql-udf/src/worker.rs:27:/// deadline-breach differently; the v1 hard-cancel mechanism is worker-kill →
+crates/ql-udf/src/worker.rs:29:#[derive(Debug, thiserror::Error)]
+crates/ql-udf/src/worker.rs:33:    #[error("udf raised {exc_type}: {message}")]
+crates/ql-udf/src/worker.rs:35:    /// The call exceeded its deadline. The worker is killed; the result (if any
+crates/ql-udf/src/worker.rs:37:    #[error("udf timed out after {0:?}")]
+crates/ql-udf/src/worker.rs:40:    /// deadline breach — distinct from [`UdfError::Timeout`] so the engine can
+crates/ql-udf/src/worker.rs:42:    #[error("udf call cancelled")]
+crates/ql-udf/src/worker.rs:46:    #[error("udf worker handshake: protocol mismatch (engine {expected}, worker {got})")]
+crates/ql-udf/src/worker.rs:50:    #[error("udf worker protocol violation: {0}")]
+crates/ql-udf/src/worker.rs:54:    #[error("udf worker died / transport broken: {0}")]
+crates/ql-udf/src/worker.rs:57:    #[error("udf codec: {0}")]
+crates/ql-udf/src/worker.rs:58:    Codec(#[from] CodecError),
+crates/ql-udf/src/worker.rs:65:/// [`UdfError::Timeout`] (and, for a real process worker, kills it), and a dead
+crates/ql-udf/src/worker.rs:66:/// worker surfaces [`UdfError::WorkerDied`] rather than hanging. A scalar result
+crates/ql-udf/src/worker.rs:67:/// is a 1×1 [`ArrayValue`].
+crates/ql-udf/src/worker.rs:82:/// [`UdfError::Timeout`]. Real deadline enforcement + process-kill is 6.4-3b.
+crates/ql-udf/src/worker.rs:110:#[cfg(test)]
+crates/ql-udf/src/worker.rs:122:    #[test]
+crates/ql-udf/src/worker.rs:137:            .unwrap();
+crates/ql-udf/src/worker.rs:141:    #[test]
+crates/ql-udf/src/worker.rs:164:    /// worker process. Proves [`crate::payload`] + [`crate::frame`] + [`crate::codec`]
+crates/ql-udf/src/worker.rs:168:    #[test]
+crates/ql-udf/src/worker.rs:180:        .unwrap();
+crates/ql-udf/src/worker.rs:188:        let call_frame = Frame::new(FrameType::Call, encode_call(&call).unwrap());
+crates/ql-udf/src/worker.rs:190:        write_frame(&mut pipe, &call_frame).unwrap();
+crates/ql-udf/src/worker.rs:194:        let got = read_frame(&mut cursor).unwrap().expect("a frame");
+crates/ql-udf/src/worker.rs:196:        let decoded_call = decode_call(&got.payload).unwrap();
+crates/ql-udf/src/worker.rs:205:        let return_frame = Frame::new(FrameType::Return, encode_return(&ret).unwrap());
+crates/ql-udf/src/worker.rs:207:        write_frame(&mut back, &return_frame).unwrap();
+crates/ql-udf/src/worker.rs:211:        let rframe = read_frame(&mut rcursor).unwrap().expect("a frame");
+crates/ql-udf/src/worker.rs:213:        let decoded_return = decode_return(&rframe.payload).unwrap();
+crates/ql-udf/src/process.rs:1://! [`ProcessWorker`] — a managed Python worker process implementing [`UdfWorker`].
+crates/ql-udf/src/process.rs:8://! and marks itself dead; the next [`UdfWorker::call`] lazily re-spawns +
+crates/ql-udf/src/process.rs:9://! re-handshakes. A late `RETURN` arriving after a kill is dropped because the
+crates/ql-udf/src/process.rs:13://! reader thread reads frames off the child's stdout and forwards them on an
+crates/ql-udf/src/process.rs:14://! `mpsc` channel; `call()` writes the `CALL`, then `recv_timeout`s for the
+crates/ql-udf/src/process.rs:20://! Every failure is a deterministic [`UdfError`] (No-Fallbacks): a missing
+crates/ql-udf/src/process.rs:25://! 6.4-3d; [`PythonWorkerConfig`] takes the interpreter + module path explicitly.
+crates/ql-udf/src/process.rs:43:#[derive(Debug, Clone)]
+crates/ql-udf/src/process.rs:53:    /// (passed as `QUANTBOOK_UDF_MODULE`). `None` = the worker registers nothing
+crates/ql-udf/src/process.rs:54:    /// (every `CALL` then surfaces a `[function_not_found]`-style raise).
+crates/ql-udf/src/process.rs:58:    /// How long to wait for `HELLO_ACK` after spawning before declaring the
+crates/ql-udf/src/process.rs:64:    /// Config with defaults: module `quantbook.worker`, current [`PROTOCOL_VERSION`],
+crates/ql-udf/src/process.rs:90:/// A message from the reader thread to `call()`. A clean stdout EOF disconnects the
+crates/ql-udf/src/process.rs:111:        // wind down on the resulting stdout EOF. Errors are ignored — the process
+crates/ql-udf/src/process.rs:113:        let _ = self.child.kill();
+crates/ql-udf/src/process.rs:114:        let _ = self.child.wait();
+crates/ql-udf/src/process.rs:116:            // The child is reaped, so its stdout is closed → the reader's
+crates/ql-udf/src/process.rs:124:/// A managed Python worker process implementing [`UdfWorker`].
+crates/ql-udf/src/process.rs:133:    /// [`UdfWorker::call`] (or via [`ProcessWorker::ensure_started`]).
+crates/ql-udf/src/process.rs:157:        self.proc = None; // `WorkerProcess::drop` kills + reaps.
+crates/ql-udf/src/process.rs:165:            .stdout(Stdio::piped())
+crates/ql-udf/src/process.rs:166:            .stderr(Stdio::inherit()); // worker stderr (stray prints / tracebacks) → our stderr
+crates/ql-udf/src/process.rs:194:        let stdout = child
+crates/ql-udf/src/process.rs:195:            .stdout
+crates/ql-udf/src/process.rs:197:            .ok_or_else(|| UdfError::WorkerDied("worker stdout pipe missing".to_string()))?;
+crates/ql-udf/src/process.rs:202:            let mut r = BufReader::new(stdout);
+crates/ql-udf/src/process.rs:210:                    Ok(None) => break, // clean EOF — worker closed stdout
+crates/ql-udf/src/process.rs:234:        // (write_frame writes the whole frame; ChildStdin is unbuffered, no flush needed,
+crates/ql-udf/src/process.rs:235:        // but flushing is harmless and explicit.)
+crates/ql-udf/src/process.rs:238:            .flush()
+crates/ql-udf/src/process.rs:239:            .map_err(|e| UdfError::WorkerDied(format!("flush HELLO: {e}")))?;
+crates/ql-udf/src/process.rs:241:        match wp.rx.recv_timeout(self.config.handshake_timeout) {
+crates/ql-udf/src/process.rs:270:    fn kill_worker(&mut self) {
+crates/ql-udf/src/process.rs:271:        // Dropping the `WorkerProcess` kills + reaps the child and winds down the
+crates/ql-udf/src/process.rs:285:        self.next_call_id = self.next_call_id.wrapping_add(1);
+crates/ql-udf/src/process.rs:298:            let wp = self.proc.as_mut().expect("spawned above");
+crates/ql-udf/src/process.rs:300:            write_frame(&mut wp.stdin, &frame).and_then(|()| wp.stdin.flush().map_err(FrameError::from))
+crates/ql-udf/src/process.rs:303:            self.kill_worker();
+crates/ql-udf/src/process.rs:307:        // Await the correlated RETURN/RAISE, honoring the deadline.
+crates/ql-udf/src/process.rs:312:                let wp = self.proc.as_mut().expect("spawned above");
+crates/ql-udf/src/process.rs:313:                wp.rx.recv_timeout(remaining)
+crates/ql-udf/src/process.rs:337:                        // logs to `CellDiagnostic`s; until then they go to stderr.
+crates/ql-udf/src/process.rs:339:                            "[quantbook-udf worker log lvl={}] {}",
+crates/ql-udf/src/process.rs:345:                        self.kill_worker();
+crates/ql-udf/src/process.rs:347:                            "unexpected {other:?} frame while awaiting RETURN/RAISE for call_id {call_id}"
+crates/ql-udf/src/process.rs:352:                    self.kill_worker();
+crates/ql-udf/src/process.rs:356:                    // Hard cancel: kill the worker so a late RETURN is dropped (exit test 6).
+crates/ql-udf/src/process.rs:357:                    self.kill_worker();
+crates/ql-udf/src/process.rs:361:                    self.kill_worker();
+crates/ql-udf/src/process.rs:369:#[cfg(test)]
+crates/ql-udf/src/process.rs:374:    #[test]
+crates/ql-udf/src/process.rs:381:        assert_eq!(c.pythonpath, vec![PathBuf::from("/some/dir")]);
+crates/ql-udf/src/process.rs:387:    #[test]
+
+exec
+/bin/zsh -lc 'git show --stat --oneline --decorate --name-only 2671ade0cfa' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 0ms:
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-fScBx3kV' (errno=Operation not permitted)
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-0I0q0Ypp' (errno=Operation not permitted)
+2671ade0cfa feat(quantbook): Phase 6.4-3b -- real Python UDF worker (spawn/handshake/call/timeout-kill/respawn)
+quantbook-engine/crates/ql-udf/Cargo.toml
+quantbook-engine/crates/ql-udf/src/codec.rs
+quantbook-engine/crates/ql-udf/src/control.rs
+quantbook-engine/crates/ql-udf/src/lib.rs
+quantbook-engine/crates/ql-udf/src/process.rs
+quantbook-engine/crates/ql-udf/src/worker.rs
+quantbook-engine/crates/ql-udf/tests/process_smoke.rs
+quantbook-engine/crates/quantbook-py/python/quantbook/__init__.py
+quantbook-engine/crates/quantbook-py/python/quantbook/_codec.py
+quantbook-engine/crates/quantbook-py/python/quantbook/_frame.py
+quantbook-engine/crates/quantbook-py/python/quantbook/_registry.py
+quantbook-engine/crates/quantbook-py/python/quantbook/_self_test.py
+quantbook-engine/crates/quantbook-py/python/quantbook/_smoke_udfs.py
+quantbook-engine/crates/quantbook-py/python/quantbook/worker.py
+
+exec
+/bin/zsh -lc 'git status --short' in /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+ succeeded in 1065ms:
+ M .plans/_archive/2026-05-24_phase-5-7-v3-6-on-pop-format-registry-rendering.md
+?? ../.codex-phase-5-5-v2-v3-step-3-audit-prompt.md
+?? ../.codex-phase-5-5-v2-v3-step-3-audit.out
+?? ../.codex-phase-5-5-v2-v3-step-4-audit-prompt.md
+?? ../.codex-phase-5-5-v2-v3-step-4-audit.out
+?? ../.codex-phase-5-5-v2-v3-step-5-megaudit-prompt.md
+?? ../.codex-phase-5-5-v2-v3-step-5-megaudit.out
+?? ../.codex-phase-5-5-v2-v4-v1-step-1-audit-prompt.md
+?? ../.codex-phase-5-5-v2-v4-v1-step-1-audit.out
+?? ../.codex-phase-5-5-v2-v4-v1-step-2-audit-prompt.md
+?? ../.codex-phase-5-5-v2-v4-v1-step-2-audit.out
+?? ../.codex-phase-5-5-v2-v4-v1-step-3-audit-prompt.md
+?? ../.codex-phase-5-5-v2-v4-v1-step-3-audit.out
+?? ../.codex-phase-5-5-v2-v4-v1-step-4-audit-prompt.md
+?? ../.codex-phase-5-5-v2-v4-v1-step-4-audit.out
+?? ../.codex-phase-5-5-v2-v4-v1-step-5-audit-prompt.md
+?? ../.codex-phase-5-5-v2-v4-v1-step-5-audit.out
+?? ../.codex-phase-5-7-v1-audit-prompt.md
+?? ../.codex-phase-5-7-v1-audit.out
+?? ../.codex-phase-5-7-v1-megaudit-prompt.md
+?? ../.codex-phase-5-7-v1-megaudit.out
+?? ../.codex-phase-5-7-v2-1-audit-prompt.md
+?? ../.codex-phase-5-7-v2-1-audit.out
+?? ../.codex-phase-5-7-v2-2-audit-prompt.md
+?? ../.codex-phase-5-7-v2-2-audit.out
+?? ../.codex-phase-5-7-v2-3-audit-prompt.md
+?? ../.codex-phase-5-7-v2-3-audit.out
+?? ../.codex-phase-5-7-v2-4-audit-prompt.md
+?? ../.codex-phase-5-7-v2-4-audit.out
+?? ../.codex-phase-5-7-v2-5-audit-prompt.md
+?? ../.codex-phase-5-7-v2-5-audit.out
+?? ../.codex-phase-5-7-v2-7-audit-prompt.md
+?? ../.codex-phase-5-7-v2-7-audit.out
+?? ../.codex-phase-5-7-v2-megaudit.out
+?? ../.codex-phase-5-7-v3-1-audit.out
+?? ../.codex-prompt-tmp.md
+?? ../.codex-v2-5-plan-review-prompt.md
+?? ../.codex-v2-5-plan-review.out
+?? ../.codex-v3-2-d-prompt.md
+?? ../.codex-v3-2-d.out
+?? ../.codex-v3-3-0-x-prompt.md
+?? ../.codex-v3-3-0-x.out
+?? ../2026-05-11-222312-this-session-is-being-continued-from-a-previous-c.txt
+?? ../2026-05-13-003338-this-session-is-being-continued-from-a-previous-c.txt
+?? ../node_modules
+?? .codex-6-1b-f10-audit-prompt.md
+?? .codex-6-1b-f10-audit.out
+?? .codex-6-1b-inc2-session-audit-prompt.md
+?? .codex-6-1b-inc2-session-audit.out
+?? .codex-6-1b-inc2c10-xlsx-import-audit-prompt.md
+?? .codex-6-1b-inc2c10-xlsx-import-audit.out
+?? .codex-6-1b-inc2c11-csv-audit-prompt.md
+?? .codex-6-1b-inc2c11-csv-audit.out
+?? .codex-6-1b-inc2c5-txn-audit-prompt.md
+?? .codex-6-1b-inc2c5-txn-audit.out
+?? .codex-6-1b-inc2c67-undo-audit-prompt.md
+?? .codex-6-1b-inc2c67-undo-audit.out
+?? .codex-6-1b-inc2c9-persist-audit-prompt.md
+?? .codex-6-1b-inc2c9-persist-audit.out
+?? .codex-6-4-0-substrate-audit-prompt.md
+?? .codex-6-4-0-substrate-audit.out
+?? .codex-6-4-3a-ql-udf-audit-prompt.md
+?? .codex-6-4-3a-ql-udf-audit.out
+?? .codex-6-4-3b-python-worker-audit-prompt.md
+?? .codex-6-4-3b-python-worker-audit.out
+?? .codex-inc2c12-xlsx-export-audit-prompt.md
+?? .codex-inc2d-session-napi-audit-prompt.md
+?? .codex-inc2d-session-napi-audit.out
+?? .codex-prompt-v3-5-0-x-closure-audit.txt
+?? .codex-v3-5-0-x-closure-audit-run.log
+?? .codex-v3-6-0-10-megaudit-docs-prompt.txt
+?? .codex-v3-6-0-10-megaudit-docs-run.log
+?? .codex-v3-6-0-2-audit-prompt.txt
+?? .codex-v3-6-0-2-audit-run.log
+?? .codex-v3-6-0-X-phase-termination-prompt.txt
+?? .codex-v3-6-0-X-phase-termination.out
+?? .codex/prompts/2026-05-14-AA-design-review.md
+?? .codex/prompts/2026-05-14-J-127-verify.md
+?? .codex/prompts/2026-05-14-J-128-verify.md
+?? .codex/prompts/2026-05-14-J-129-verify.md
+?? .codex/prompts/2026-05-14-J-megaudit-132-133followup-verify.md
+?? .codex/prompts/2026-05-14-J-megaudit-HIGH3-verify.md
+?? .codex/prompts/2026-05-14-J-megaudit-LOW-verify.md
+?? .codex/prompts/2026-05-14-J-megaudit-MEDIUM4-verify.md
+?? .codex/prompts/2026-05-14-J-megaudit-MEDIUM5-verify.md
+?? .codex/prompts/2026-05-14-K-verify.md
+?? .codex/prompts/2026-05-14-L-verify.md
+?? .codex/prompts/2026-05-14-M-verify.md
+?? .codex/prompts/2026-05-14-N-verify.md
+?? .codex/prompts/2026-05-14-O-closure-verify.md
+?? .codex/prompts/2026-05-14-O-megaudit.md
+?? .codex/prompts/2026-05-14-phase-4.7.I-review.md
+?? .codex/prompts/2026-05-14-phase-4.7.J-megaudit-pass2.md
+?? .codex/prompts/2026-05-14-phase-4.7.J-review.md
+?? .codex/prompts/2026-05-15-phase-4.8-closing-megaudit.md
+?? .codex/prompts/2026-05-15-phase-4.8-closure-verify.md
+?? .codex/prompts/2026-05-15-phase-4.8-final-reverify.md
+?? .codex/prompts/2026-05-15-phase-4.9-design-review.md
+?? .codex/prompts/2026-05-15-phase-4.9-mid-arc-audit.md
+?? .plans/_archive/2026-05-13_w5-77-phase-4.5d-format-parser.md
+?? .plans/_archive/2026-05-13_w5-78-phase-4.5d-renderer.md
+?? .plans/_archive/2026-05-14_w5-121-phase-4.8.i.2-rename-column.md
+?? .plans/_archive/2026-05-14_w5-122-phase-4.8.j-resize-table.md
+?? .plans/_archive/2026-05-14_w5-123-phase-4.8.l-persistence-v6.md
+?? .plans/_archive/2026-05-15_phase-4.8.O-findings.md
+?? .plans/_archive/2026-05-17_phase-4-10-v1-260-closeout.md
+?? .plans/_archive/2026-05-17_rt-v1-01-reference-tier-mini-phase.md
+?? .plans/_archive/2026-05-18_phase-4-11-xlsx-import-export.md
+?? .plans/_archive/2026-05-18_tier-a-api-stability.md
+?? .plans/_archive/2026-05-21_phase-5-5-v2-v2-auto-flush.md
+?? .plans/_archive/2026-05-21_phase-5-5-v2-v3-step-1-version-vector.md
+?? .plans/_archive/2026-05-21_phase-5-5-v2-v3-step-2-poll-remote-auto-flush.md
+?? .plans/_archive/2026-05-21_phase-5-5-v2-v3-step-3-offline-write-queue.md
+?? .plans/_archive/2026-05-21_phase-5-5-v2-v3-step-4-websocket-transport.md
+?? .plans/_archive/2026-05-21_phase-5-5-v2-v3-step-5-full-arc-megaudit.md
+?? .plans/_archive/2026-05-21_phase-5-5-v2-v3-step-6-exit-packet.md
+?? .plans/_archive/2026-05-21_phase-5-5-v2-v4-v1-step-1-ack-channel.md
+?? .plans/_archive/2026-05-21_phase-5-5-v2-v4-v1-step-2-pending-op-count.md
+?? .plans/_archive/2026-05-21_phase-5-5-v2-v4-v1-step-3-tier-j-bundle.md
+?? .plans/_archive/2026-05-21_phase-5-5-v2-v4-v1-step-4-small-bundle.md
+?? .plans/_archive/2026-05-21_phase-5-5-v2-v4-v1-step-5-discard-pending-ops.md
+?? .plans/_archive/2026-05-22_phase-5-7-v1-vertical-slice.md
+?? 2026-05-14-222539-this-session-is-being-continued-from-a-previous-c.txt
+?? 2026-05-16-175547-this-session-is-being-continued-from-a-previous-c.txt
+?? 2026-05-22-175341-local-command-caveatcaveat-the-messages-below.txt
+?? 2026-05-26-115435-local-command-caveatcaveat-the-messages-below.txt
+?? 2026-05-27-005339-local-command-caveatcaveat-the-messages-below.txt
+?? 2026-05-27-112405-this-is-the-old-window-026-05-27-005339-local-c.txt
+?? 2026-05-27-153708-local-command-caveatcaveat-the-messages-below.txt
+?? 2026-05-27-215616-local-command-caveatcaveat-the-messages-below.txt
+?? 2026-05-28-152633-local-command-caveatcaveat-the-messages-below.txt
+?? 2026-05-28-220428-continue-claude-code-v21152.txt
+?? crates/ql-bindings-node/ql_bindings_node.darwin-arm64.node
+?? docs/api/codex-6-1a-review.out
+?? docs/audits/2026-05-26-session-megaudit/lane-codex.out
+?? docs/phase5/megaudit-5-8/lane-a.out
+?? docs/phase6/6-1c-prep/lane-a.out
+?? docs/phase6/6-1c-prep/lane-b.out
+?? docs/phase6/6-1c-prep/lane-c.out
+?? docs/phase6/6-1c-prep/lane-d.out
+?? docs/phase6/codex-decision-lock.out
+
+codex
+VERDICT: DO-NOT-SHIP
+
+ID: timeout-kill-can-deadlock-on-inherited-stdout  
+SEVERITY: HIGH  
+LOCATION: `crates/ql-udf/src/process.rs:108-119`, `crates/ql-udf/src/process.rs:355-358`  
+WHAT: `WorkerProcess::drop` kills only the direct Python child, waits it, then unconditionally joins the reader thread assuming stdout EOF. A UDF can spawn a subprocess/grandchild that inherits fd 1; after the Python child is killed, that grandchild keeps the pipe write-end open, so the reader blocks forever in `read_frame` and `join()` never returns.  
+WHY: A timeout/cancel path can hang the engine permanently instead of returning `UdfError::Timeout`, violating the hard-cancel contract and zombie/lifecycle requirements.  
+FIX: Spawn the worker in its own process group/session and kill the whole group on timeout/drop. Also make reader shutdown bounded or nonblocking; do not rely on direct-child death implying stdout EOF.
+
+ID: udf-print-corrupts-protocol-stdout  
+SEVERITY: HIGH  
+LOCATION: `crates/quantbook-py/python/quantbook/worker.py:30-55`, `crates/ql-udf/src/process.rs:164-166`  
+WHAT: The protocol uses `sys.stdout.buffer`, but user module import and UDF execution run with normal `sys.stdout` still pointing at the protocol fd. Any `print()` or library stdout write during import or call injects raw bytes into the frame stream.  
+WHY: A common UDF behavior desynchronizes the worker protocol. It is not converted to `LOG`, despite design §3 requiring stdout/stderr diagnostics not be silently dropped.  
+FIX: Reserve fd 1 exclusively for protocol writes. Before importing user code, replace `sys.stdout` with a stderr/log proxy, or capture stdout/stderr and emit `LOG` frames through the protocol writer.
+
+ID: call-deadline-excludes-respawn-handshake-and-write  
+SEVERITY: MED  
+LOCATION: `crates/ql-udf/src/process.rs:241`, `crates/ql-udf/src/process.rs:287-308`  
+WHAT: `call()` performs `ensure_started()` and writes the CALL before starting `deadline_at`. A short-deadline call that must respawn can block up to `handshake_timeout + write time + deadline`.  
+WHY: `UdfWorker::call` is documented as subject to `deadline`; this violates deadline accounting, especially after a killed worker or hung import.  
+FIX: Compute an absolute deadline at call entry. Pass remaining time into spawn/handshake, cap handshake timeout by remaining, and cover CALL encode/write/flush.
+
+ID: log-or-stale-frame-flood-can-defeat-timeout  
+SEVERITY: HIGH  
+LOCATION: `crates/ql-udf/src/process.rs:307-342`  
+WHAT: The loop uses `recv_timeout(remaining)`, but if queued `LOG` or stale-call frames are always available, it keeps processing and `continue`s even after `remaining` reaches zero.  
+WHY: A buggy/hostile worker can keep the recalc thread alive indefinitely with nonterminal frames, so the deadline never triggers. The unbounded `mpsc` channel can also grow without bound.  
+FIX: Check `Instant::now() >= deadline_at` before processing another nonterminal frame, bound/log-coalesce `LOG` handling, and use a bounded channel or backpressure policy.
+
+ID: registry-silently-overwrites-invalid-handles  
+SEVERITY: MED  
+LOCATION: `crates/quantbook-py/python/quantbook/__init__.py:18-27`, `crates/quantbook-py/python/quantbook/_registry.py:8-13`  
+WHAT: `register_formula_function` coerces `handle` with `int()` and blindly stores it. Duplicate handles overwrite prior functions; negative or >u64 handles are accepted; non-callables are accepted.  
+WHY: This can route a shipped handle to the wrong callable or make registration appear successful when the engine can never call it, violating No-Fallbacks/error visibility.  
+FIX: Validate `callable(fn)`, require `0 <= handle <= u64::MAX`, and reject duplicate registration unless an explicit replace flag is provided.
+
+CLEAN AREAS: Rust/Python frame tags, length prefixing, CALL/RETURN headers, HELLO/HELLO_ACK, and RAISE byte layouts match. Rust decode paths avoid panics on malformed worker-controlled frames in the reviewed codec/control/frame code. Direct-child handshake failure paths do get reaped, except for the inherited-stdout/process-tree hole above.
+tokens used
+73,625
+VERDICT: DO-NOT-SHIP
+
+ID: timeout-kill-can-deadlock-on-inherited-stdout  
+SEVERITY: HIGH  
+LOCATION: `crates/ql-udf/src/process.rs:108-119`, `crates/ql-udf/src/process.rs:355-358`  
+WHAT: `WorkerProcess::drop` kills only the direct Python child, waits it, then unconditionally joins the reader thread assuming stdout EOF. A UDF can spawn a subprocess/grandchild that inherits fd 1; after the Python child is killed, that grandchild keeps the pipe write-end open, so the reader blocks forever in `read_frame` and `join()` never returns.  
+WHY: A timeout/cancel path can hang the engine permanently instead of returning `UdfError::Timeout`, violating the hard-cancel contract and zombie/lifecycle requirements.  
+FIX: Spawn the worker in its own process group/session and kill the whole group on timeout/drop. Also make reader shutdown bounded or nonblocking; do not rely on direct-child death implying stdout EOF.
+
+ID: udf-print-corrupts-protocol-stdout  
+SEVERITY: HIGH  
+LOCATION: `crates/quantbook-py/python/quantbook/worker.py:30-55`, `crates/ql-udf/src/process.rs:164-166`  
+WHAT: The protocol uses `sys.stdout.buffer`, but user module import and UDF execution run with normal `sys.stdout` still pointing at the protocol fd. Any `print()` or library stdout write during import or call injects raw bytes into the frame stream.  
+WHY: A common UDF behavior desynchronizes the worker protocol. It is not converted to `LOG`, despite design §3 requiring stdout/stderr diagnostics not be silently dropped.  
+FIX: Reserve fd 1 exclusively for protocol writes. Before importing user code, replace `sys.stdout` with a stderr/log proxy, or capture stdout/stderr and emit `LOG` frames through the protocol writer.
+
+ID: call-deadline-excludes-respawn-handshake-and-write  
+SEVERITY: MED  
+LOCATION: `crates/ql-udf/src/process.rs:241`, `crates/ql-udf/src/process.rs:287-308`  
+WHAT: `call()` performs `ensure_started()` and writes the CALL before starting `deadline_at`. A short-deadline call that must respawn can block up to `handshake_timeout + write time + deadline`.  
+WHY: `UdfWorker::call` is documented as subject to `deadline`; this violates deadline accounting, especially after a killed worker or hung import.  
+FIX: Compute an absolute deadline at call entry. Pass remaining time into spawn/handshake, cap handshake timeout by remaining, and cover CALL encode/write/flush.
+
+ID: log-or-stale-frame-flood-can-defeat-timeout  
+SEVERITY: HIGH  
+LOCATION: `crates/ql-udf/src/process.rs:307-342`  
+WHAT: The loop uses `recv_timeout(remaining)`, but if queued `LOG` or stale-call frames are always available, it keeps processing and `continue`s even after `remaining` reaches zero.  
+WHY: A buggy/hostile worker can keep the recalc thread alive indefinitely with nonterminal frames, so the deadline never triggers. The unbounded `mpsc` channel can also grow without bound.  
+FIX: Check `Instant::now() >= deadline_at` before processing another nonterminal frame, bound/log-coalesce `LOG` handling, and use a bounded channel or backpressure policy.
+
+ID: registry-silently-overwrites-invalid-handles  
+SEVERITY: MED  
+LOCATION: `crates/quantbook-py/python/quantbook/__init__.py:18-27`, `crates/quantbook-py/python/quantbook/_registry.py:8-13`  
+WHAT: `register_formula_function` coerces `handle` with `int()` and blindly stores it. Duplicate handles overwrite prior functions; negative or >u64 handles are accepted; non-callables are accepted.  
+WHY: This can route a shipped handle to the wrong callable or make registration appear successful when the engine can never call it, violating No-Fallbacks/error visibility.  
+FIX: Validate `callable(fn)`, require `0 <= handle <= u64::MAX`, and reject duplicate registration unless an explicit replace flag is provided.
+
+CLEAN AREAS: Rust/Python frame tags, length prefixing, CALL/RETURN headers, HELLO/HELLO_ACK, and RAISE byte layouts match. Rust decode paths avoid panics on malformed worker-controlled frames in the reviewed codec/control/frame code. Direct-child handshake failure paths do get reaped, except for the inherited-stdout/process-tree hole above.
+CODEX_EXIT=0

@@ -15,13 +15,30 @@ from ._registry import lookup as _lookup  # noqa: F401  (used by quantbook.worke
 from ._registry import register as _register
 
 
-def register_formula_function(fn, *, handle, name=None):
+_U64_MAX = (1 << 64) - 1
+
+
+def register_formula_function(fn, *, handle, name=None, replace=False):
     """Register ``fn`` as a Quantbook formula function under ``handle``.
 
     ``fn`` receives a :class:`quantbook.Grid` of evaluated arguments and returns a
     ``Grid`` or a scalar cell value (``float``/``int``/``bool``/``str``/``None``/
     :class:`quantbook.Err`). ``handle`` is an explicit ``u64`` for now (the IDE mints
     it at 6.4-3c/3d); ``name`` is informational. Returns ``handle``.
+
+    Validates loudly (6.4-3b audit-fix: registry-silently-overwrites-invalid-handles;
+    No-Fallbacks): ``fn`` must be callable, ``handle`` must fit ``u64``, and a duplicate
+    ``handle`` is rejected unless ``replace=True`` — so a shipped handle can never silently
+    route to the wrong callable or register a value the engine can never call.
     """
-    _register(int(handle), fn)
+    if not callable(fn):
+        raise TypeError(
+            "register_formula_function: fn must be callable, got %r" % type(fn).__name__
+        )
+    h = int(handle)
+    if not (0 <= h <= _U64_MAX):
+        raise ValueError(
+            "register_formula_function: handle %d out of u64 range [0, 2**64)" % h
+        )
+    _register(h, fn, replace=replace)
     return handle

@@ -114,9 +114,57 @@ fn process_worker_round_trips_against_real_python() {
         .expect("respawn + call handle 7");
     assert_eq!(out2.get(0, 0), Some(&Value::Number(8.0)));
     assert!(w.pid().is_some(), "a fresh worker should be live after respawn");
-    assert_ne!(
-        w.pid(),
-        pid_before,
-        "respawn must be a NEW process (different pid)"
+    // The load-bearing respawn proof is: pid()==None after the timeout-kill (line above) AND a
+    // subsequent call succeeds (out2) — which is only possible by spawning + handshaking a fresh
+    // process, since the old `WorkerProcess` was dropped. We do NOT assert pid inequality: the OS
+    // can legitimately reuse the killed pid (6.4-3b audit-fix: respawn-pid-reuse-flaky-assert).
+    let _ = pid_before;
+}
+
+/// A worker that floods nonterminal frames (stale-`call_id` RETURNs) must NOT defeat the per-call
+/// deadline. `recv_timeout` returns a ready frame immediately regardless of the time left, so
+/// without the top-of-loop `Instant::now() >= deadline_at` guard the `call()` loop would `continue`
+/// forever and hang the (synchronous) recalc thread (6.4-3b audit-fix: frame-flood-defeats-timeout /
+/// contract §10.4 exit test 6). This proves the guard hard-cancels on time under a continuous flood.
+#[test]
+fn process_worker_times_out_under_frame_flood() {
+    let py = match python_with_pyarrow() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "SKIP process_worker_times_out_under_frame_flood: \
+                 no `python3`/`python` with `pyarrow` on PATH"
+            );
+            return;
+        }
+    };
+    let pythonpath = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../quantbook-py/python")
+        .canonicalize()
+        .expect("quantbook-py/python directory should exist");
+    let mut cfg = PythonWorkerConfig::new(&py).with_pythonpath(pythonpath);
+    cfg.module = "quantbook._flood_worker".to_string();
+    let mut w = ProcessWorker::new(cfg);
+
+    // Spawn + handshake eagerly (full handshake_timeout, NOT the per-call deadline) so the flood
+    // CALL's short deadline measures ONLY the recv loop, not Python cold-start.
+    w.ensure_started().expect("flood worker should spawn + handshake");
+    assert!(w.pid().is_some());
+
+    let started = std::time::Instant::now();
+    let err = w
+        .call(1, &ArrayValue::singleton(Value::Blank), Duration::from_millis(300))
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(err, UdfError::Timeout(_)),
+        "a frame flood must still time out, got {err:?}"
     );
+    // The deadline guard must hard-cancel near the 300ms deadline — NOT hang on the endless flood.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "deadline defeated by frame flood: took {elapsed:?} (expected ~300ms)"
+    );
+    assert_eq!(w.pid(), None, "the flooding worker must be killed after the timeout");
 }
