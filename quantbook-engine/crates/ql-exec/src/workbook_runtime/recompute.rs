@@ -545,6 +545,7 @@ impl<'a> WorkbookRuntime<'a> {
                             }
                             for (rn, reader_sheet, reader_row, reader_col, reader_text) in readers {
                                 let name_gen = self.workbook.names().generation();
+                                let fn_gen = self.registry.fn_generation();
                                 // **W5-150 (Phase 4.9.O HIGH-1):** cell-aware key when `@`
                                 // is present.
                                 let cell_anchor = if reader_text.contains('@') {
@@ -556,6 +557,7 @@ impl<'a> WorkbookRuntime<'a> {
                                     text: Arc::clone(&reader_text),
                                     sheet: reader_sheet,
                                     name_gen,
+                                    fn_gen,
                                     cell_anchor,
                                 };
                                 let workbook: &Workbook = self.workbook;
@@ -576,6 +578,7 @@ impl<'a> WorkbookRuntime<'a> {
                                                 workbook,
                                                 workbook,
                                                 workbook,
+                                                self.registry,
                                             )?)
                                         },
                                     ) {
@@ -751,6 +754,7 @@ impl<'a> WorkbookRuntime<'a> {
         agg_cache: &dyn crate::aggregate_cache::AggregateCache,
     ) -> Result<(Value, bool, Option<SpillShape>, Option<SpillShape>), RuntimeError> {
         let name_gen = self.workbook.names().generation();
+        let fn_gen = self.registry.fn_generation();
         // **W5-150 (Phase 4.9.O HIGH-1):** cell-aware key when `@`
         // is present in the stored formula text. This is the
         // recompute path — same canonical text at different cells
@@ -765,6 +769,7 @@ impl<'a> WorkbookRuntime<'a> {
             text: Arc::clone(formula_text),
             sheet,
             name_gen,
+            fn_gen,
             cell_anchor,
         };
         // Borrow split: we need an immutable view of the workbook
@@ -797,6 +802,7 @@ impl<'a> WorkbookRuntime<'a> {
                         workbook,
                         workbook,
                         workbook,
+                        self.registry,
                     )?)
                 })?;
 
@@ -889,12 +895,19 @@ impl<'a> WorkbookRuntime<'a> {
 
 #[cfg(test)]
 mod tests {
-    use ql_functions::default_registry;
+    use std::sync::LazyLock;
+
+    use ql_functions::{default_registry, FunctionRegistry};
     use ql_storage::Workbook;
     use ql_types::{ErrorValue, Value};
 
     use crate::plan::BindError;
     use crate::workbook_runtime::{RuntimeError, WorkbookRuntime};
+
+    /// **6.4-1 (2026-05-28; H1):** shared default registry — see
+    /// `crates/ql-exec/src/plan.rs::tests::TEST_REGISTRY` for the
+    /// pattern. The binder now needs metadata to route range args.
+    static TEST_REGISTRY: LazyLock<FunctionRegistry> = LazyLock::new(default_registry);
 
     fn make_runtime_workbook() -> Workbook {
         let mut wb = Workbook::new();
@@ -2627,7 +2640,7 @@ mod tests {
         // Parse `=A1 * 2` (Excel canon: 1-based row in source).
         let tokens = lex("A1 * 2").unwrap();
         let expr = parse(tokens).unwrap();
-        let plan = bind(&expr, 0).unwrap();
+        let plan = bind(&expr, 0, &TEST_REGISTRY).unwrap();
         let shape = crate::lower::classify(&plan);
         assert!(matches!(shape, crate::SimdShape::MulScalar { .. }));
         // And the converse: a non-arithmetic expression doesn't
@@ -2653,7 +2666,7 @@ mod tests {
         // force scalar fallback.
         let tokens = lex("A1 / 2").unwrap();
         let expr = parse(tokens).unwrap();
-        let plan = bind(&expr, 0).unwrap();
+        let plan = bind(&expr, 0, &TEST_REGISTRY).unwrap();
         assert_eq!(
             crate::lower::classify(&plan),
             crate::SimdShape::NotApplicable,

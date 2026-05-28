@@ -36,6 +36,8 @@
 use std::sync::Arc;
 
 use ql_formula_syntax::{AxisSpec, Expr, Operator, SheetRef};
+use ql_functions::FunctionRegistry;
+use ql_session::function_meta::ArgContext;
 use ql_types::{ColId, ErrorValue, Range, RowId, SheetId, MAX_COLUMN, MAX_ROW};
 
 /// Bound, execution-ready expression. Sheet refs are concrete.
@@ -390,149 +392,34 @@ enum BindContext {
 /// historical — this list is now better understood as "names for which
 /// the binder allows `AggregateNameRef` in arg positions"; both scalar
 /// aggregates (SUM, AVERAGE) AND range-aware functions (SUMIF, VLOOKUP,
-/// LARGE, ...) live here. The `is_aggregate_function_lists_only_registered_aggregates`
-/// test invariant pins the cross-table sync.
+/// LARGE, ...) live here.
 ///
-/// **Re-target:** the planned replacement with per-function metadata
-/// (`FunctionRegistry` attributes) is no longer Phase 4.3 work — Phase
-/// 4.3 wave 1 closed W5-58 with this matcher still in place. The right
-/// time to replace this is **Phase 4.7 (array formulas) or Phase 4.10
-/// (function library wave 2)**, whichever introduces richer per-
-/// function metadata first.
+/// **6.4-1 (2026-05-28; H1):** the prior ~66-entry `matches!` whitelist
+/// is now a thin migration shim that reads
+/// `FunctionRegistry::metadata(name).arg_context == ArgContext::Aggregate`.
+/// The Phase 1.5 override pass in
+/// `ql_functions::register_builtin_metadata` mirrors the prior list
+/// byte-for-byte; the shim is behavior-preserving against the prior
+/// `matches!`. The `is_aggregate_function_lists_only_registered_aggregates`
+/// invariant test (`workbook_runtime/validate.rs`) now also flows
+/// through metadata — same direction, derived from one source.
+///
+/// **Unknown name policy:** returns `false` — matches the pre-6.4-1
+/// `matches!` default (any name not in the list) and ensures unknown
+/// functions (including UDFs that haven't registered yet) get
+/// `BindContext::Scalar`. UDFs that need range args MUST register
+/// `ArgContext::Aggregate` via `register_metadata` before binding any
+/// formula that uses them with a range arg — same contract as the
+/// pre-6.4-1 hardcoded list (where adding a new aggregate required a
+/// source edit + recompile).
 ///
 /// Aggregate detection is binary in V0 (all args are aggregate or no args
 /// are). Per-arg-position decisions (e.g. IF's then/else accept arrays in
 /// some contexts) land alongside Engine Phase 4.7 array formulas.
-pub(crate) fn is_aggregate_function(name: &str) -> bool {
-    // Phase 2B.7 audit (correctness M1): MEDIAN removed — it was listed
-    // here but not registered in `ql_functions::default_registry`. Keeping
-    // the list synced with the registry is a hard rule; the
-    // `is_aggregate_function_lists_only_registered_aggregates` test pins
-    // it. When Engine Phase 4.3 expands the function library, the metadata
-    // moves to per-function FunctionRegistry attributes and this hardcoded
-    // matcher goes away entirely.
-    //
-    // W5-53 (GAP-F-05 closure): SUMIF + COUNTIF are NOT scalar aggregates
-    // (they return a scalar but take range + criteria) — they live in the
-    // parallel `range_aware_fns` table. But the binder uses this list to
-    // decide whether `NamedRangeInScalarContext` should fire on
-    // `=SUMIF(NamedRange, 5)`. Since SUMIF NEEDS a range arg, we add it
-    // here so the binder allows the AggregateNameRef in arg position. The
-    // eval-side dispatch routes correctly via `lookup_range_aware` first.
+pub(crate) fn is_aggregate_function(registry: &FunctionRegistry, name: &str) -> bool {
     matches!(
-        name,
-        "SUM"
-            | "AVERAGE"
-            | "AVG"
-            | "COUNT"
-            | "COUNTA"
-            | "MIN"
-            | "MAX"
-            | "PRODUCT"
-            | "VAR"
-            | "VAR.S"
-            | "VAR.P"
-            | "STDEV"
-            | "STDEV.S"
-            | "STDEV.P"
-            // Range-aware (W5-53): NOT scalar aggregates, but the binder
-            // treats them as aggregate-context for arg binding so named-
-            // range args resolve to `AggregateNameRef`.
-            | "SUMIF"
-            | "COUNTIF"
-            // Range-aware lookup family (W5-54): same reason — table
-            // args are range references that must bind as
-            // AggregateNameRef so the eval-side dispatch can construct
-            // `FnArg::Range { values, rows, cols }`.
-            | "MATCH"
-            | "INDEX"
-            | "VLOOKUP"
-            | "HLOOKUP"
-            | "CHOOSE"
-            // Range-aware conditional-aggregate completion (W5-55).
-            | "AVERAGEIF"
-            | "SUMIFS"
-            | "COUNTIFS"
-            | "AVERAGEIFS"
-            | "SUMPRODUCT"
-            // Range-aware stats family (W5-58, FN4-01 closure).
-            | "LARGE"
-            | "SMALL"
-            | "RANK"
-            | "RANK.EQ"
-            | "RANK.AVG"
-            | "MEDIAN"
-            | "MODE"
-            | "MODE.SNGL"
-            // Range-aware text completion (W5-61 polish).
-            | "CONCAT"
-            // **W5-107 (Phase 4.7.N) — Codex audit HIGH closure**:
-            // array-returning Unified-ABI functions that accept Range
-            // / named-range args. TRANSPOSE accepts a Range (its only
-            // arg). FILTER accepts a Range as both `array` and
-            // `include` args. Without adding them here, the binder
-            // rejects `FILTER(Data, Mask)` with
-            // `NamedRangeInScalarContext` despite the function having
-            // full FunctionArg::Range support in its body. SEQUENCE
-            // is NOT added — it takes only scalar args (rows, cols,
-            // start, step).
-            | "TRANSPOSE"
-            | "FILTER"
-            // **W5-D-12 (Phase 4.10 V1-260 sealer) — Codex HIGH-001
-            // closure**: SUBTOTAL is a range-aware conditional
-            // aggregate. Without admission here, the binder rejects
-            // `=SUBTOTAL(9, SalesRange)` with NamedRangeInScalarContext
-            // (the function lookup succeeds, but its range arg can't
-            // bind as `AggregateNameRef`). Eval-side dispatch routes
-            // via the parallel `lookup_range_aware` table.
-            | "SUBTOTAL"
-            // **W5-D-13.1 (Phase 4.10 V1-260 megaudit closure — Codex
-            // HIGH-001 / Opus HIGH-1)**: SUBTOTAL was the ONLY fn
-            // admitted by the W5-D-12 closure; the same systemic gap
-            // affected 28 other range-aware fns that take range args.
-            // The per-batch audits missed this because the unit tests
-            // construct FnArg::Range directly (bypassing the binder)
-            // and registry-lookup smoke tests prove the symbol is
-            // registered but NOT that the binder routes range args to
-            // it. Admitting all of them here closes the gap.
-            //
-            // Phase 4.10 statistical paired-array fns (W5-177, W5-178,
-            // W5-179, W5-D-6) — take 2 ranges:
-            | "CORREL"
-            | "PEARSON"
-            | "RSQ"
-            | "STEYX"
-            | "SLOPE"
-            | "INTERCEPT"
-            | "COVARIANCE.P"
-            | "COVARIANCE.S"
-            | "SUMX2MY2"
-            | "SUMX2PY2"
-            | "SUMXMY2"
-            // Phase 4.10 financial cash-flow fns (W5-168, W5-174,
-            // W5-D-7) — take 1-2 ranges:
-            | "NPV"
-            | "IRR"
-            | "MIRR"
-            | "XNPV"
-            | "XIRR"
-            // Phase 4.10 modern lookup fns (W5-169) — take ranges:
-            | "XLOOKUP"
-            | "XMATCH"
-            // Phase 4.10 order-statistics fns (W5-D-11) — take 1
-            // range:
-            | "PERCENTILE.INC"
-            | "PERCENTILE.EXC"
-            | "PERCENTILE"
-            | "QUARTILE.INC"
-            | "QUARTILE.EXC"
-            | "QUARTILE"
-            // Phase 4.10 conditional aggregates / text join
-            // (W5-65-ish, W5-167):
-            | "MINIFS"
-            | "MAXIFS"
-            | "COUNTBLANK"
-            | "TEXTJOIN"
+        registry.metadata(name).map(|m| m.arg_context),
+        Some(ArgContext::Aggregate)
     )
 }
 
@@ -563,10 +450,22 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
 ///   W5-RT-2 Step 2); extends as Step 3 (ISREF/ISFORMULA) and Step 4
 ///   (FORMULATEXT) ship. The matcher pre-lists all 7 by design so the
 ///   binder routing is stable as registrations land.
-pub(crate) fn is_reference_aware_function(name: &str) -> bool {
+pub(crate) fn is_reference_aware_function(registry: &FunctionRegistry, name: &str) -> bool {
+    // **6.4-1 (2026-05-28; H1):** the prior 7-entry `matches!` whitelist
+    // (ROW / COLUMN / ROWS / COLUMNS / ISREF / ISFORMULA / FORMULATEXT)
+    // now derives from `metadata.arg_context == ArgContext::Reference`.
+    // The Phase 1 + Phase 1.5 overrides in
+    // `ql_functions::register_builtin_metadata` carry the same 7 names —
+    // see the `step_2_reference_aware_names_registered_in_reference_tier`
+    // invariant test for the cross-table sync.
+    //
+    // Unknown name returns `false`, matching the prior `matches!`
+    // default. UDFs that want `BindContext::ReferenceArg` (e.g., a UDF
+    // that takes a literal `RangeRef`) MUST register
+    // `ArgContext::Reference` before binding.
     matches!(
-        name,
-        "ROW" | "COLUMN" | "ROWS" | "COLUMNS" | "ISREF" | "ISFORMULA" | "FORMULATEXT"
+        registry.metadata(name).map(|m| m.arg_context),
+        Some(ArgContext::Reference)
     )
 }
 
@@ -576,8 +475,18 @@ pub(crate) fn is_reference_aware_function(name: &str) -> bool {
 /// produces `BindError::UnknownSheet`.
 ///
 /// `owning_sheet` is the sheet the formula lives on.
-pub fn bind(expr: &Expr, owning_sheet: SheetId) -> Result<ExprPlan, BindError> {
-    bind_with_names_and_sheets(expr, owning_sheet, &EmptyNameLookup, &EmptySheetResolver)
+pub fn bind(
+    expr: &Expr,
+    owning_sheet: SheetId,
+    registry: &FunctionRegistry,
+) -> Result<ExprPlan, BindError> {
+    bind_with_names_and_sheets(
+        expr,
+        owning_sheet,
+        &EmptyNameLookup,
+        &EmptySheetResolver,
+        registry,
+    )
 }
 
 /// Phase 2A.1 — bind with a name resolver. **W5-90 update**: this entry
@@ -585,12 +494,22 @@ pub fn bind(expr: &Expr, owning_sheet: SheetId) -> Result<ExprPlan, BindError> {
 /// `BindError::UnknownSheet`. Callers that need cross-sheet support
 /// should use [`bind_with_names_and_sheets`] and pass a real
 /// [`SheetResolver`] (typically `&Workbook` via the blanket impl).
+///
+/// **6.4-1 (2026-05-28; H1):** every binder entry now takes
+/// `&FunctionRegistry` so `is_aggregate_function` /
+/// `is_reference_aware_function` (and any future 6.4 UDF metadata-aware
+/// binder decision) can derive from `metadata` rather than a hardcoded
+/// `matches!`. Pre-6.4-1 entries that called these without a registry
+/// have been migrated; tests build a registry via
+/// `ql_functions::default_registry()` (the same path every binder caller
+/// already touches via the eval site).
 pub fn bind_with_names<L: NameLookup>(
     expr: &Expr,
     owning_sheet: SheetId,
     names: &L,
+    registry: &FunctionRegistry,
 ) -> Result<ExprPlan, BindError> {
-    bind_with_names_and_sheets(expr, owning_sheet, names, &EmptySheetResolver)
+    bind_with_names_and_sheets(expr, owning_sheet, names, &EmptySheetResolver, registry)
 }
 
 /// **W5-90 (Phase 4.6.B):** bind with BOTH name and sheet resolvers.
@@ -610,6 +529,7 @@ pub fn bind_with_names_and_sheets<L: NameLookup>(
     owning_sheet: SheetId,
     names: &L,
     sheets: &dyn SheetResolver,
+    registry: &FunctionRegistry,
 ) -> Result<ExprPlan, BindError> {
     bind_with_site_no_tables(
         expr,
@@ -619,6 +539,7 @@ pub fn bind_with_names_and_sheets<L: NameLookup>(
         },
         names,
         sheets,
+        registry,
     )
 }
 
@@ -662,8 +583,17 @@ pub fn bind_with_site<L: NameLookup>(
     names: &L,
     sheets: &dyn SheetResolver,
     tables: &dyn TableLookup,
+    registry: &FunctionRegistry,
 ) -> Result<ExprPlan, BindError> {
-    bind_with_context_v2(expr, site, names, sheets, tables, BindContext::Scalar)
+    bind_with_context_v2(
+        expr,
+        site,
+        names,
+        sheets,
+        tables,
+        registry,
+        BindContext::Scalar,
+    )
 }
 
 /// **W5-115 (Phase 4.8.F):** convenience wrapper for legacy call sites
@@ -675,8 +605,9 @@ pub fn bind_with_site_no_tables<L: NameLookup>(
     site: BindSite,
     names: &L,
     sheets: &dyn SheetResolver,
+    registry: &FunctionRegistry,
 ) -> Result<ExprPlan, BindError> {
-    bind_with_site(expr, site, names, sheets, &EmptyTableLookup)
+    bind_with_site(expr, site, names, sheets, &EmptyTableLookup, registry)
 }
 
 #[allow(dead_code)]
@@ -685,6 +616,7 @@ fn bind_with_context<L: NameLookup>(
     owning_sheet: SheetId,
     names: &L,
     sheets: &dyn SheetResolver,
+    registry: &FunctionRegistry,
     ctx: BindContext,
 ) -> Result<ExprPlan, BindError> {
     // 4.8.F: legacy entry — no table resolver, no cell context.
@@ -694,6 +626,7 @@ fn bind_with_context<L: NameLookup>(
         names,
         sheets,
         &EmptyTableLookup,
+        registry,
         ctx,
     )
 }
@@ -704,6 +637,7 @@ fn bind_with_context_v2<L: NameLookup>(
     names: &L,
     sheets: &dyn SheetResolver,
     tables: &dyn TableLookup,
+    registry: &FunctionRegistry,
     ctx: BindContext,
 ) -> Result<ExprPlan, BindError> {
     let owning_sheet = site.sheet;
@@ -729,6 +663,7 @@ fn bind_with_context_v2<L: NameLookup>(
                 names,
                 sheets,
                 tables,
+                registry,
                 BindContext::Scalar,
             )?),
             rhs: Box::new(bind_with_context_v2(
@@ -737,6 +672,7 @@ fn bind_with_context_v2<L: NameLookup>(
                 names,
                 sheets,
                 tables,
+                registry,
                 BindContext::Scalar,
             )?),
         }),
@@ -748,6 +684,7 @@ fn bind_with_context_v2<L: NameLookup>(
                 names,
                 sheets,
                 tables,
+                registry,
                 BindContext::Scalar,
             )?),
         }),
@@ -783,9 +720,9 @@ fn bind_with_context_v2<L: NameLookup>(
             // accepted; CellRef passes through). Aggregate/range-aware/
             // unified-tier fns keep the existing `AggregateArg` context.
             // Plain scalar fns get `Scalar` (rejects range args).
-            let arg_ctx = if is_reference_aware_function(name) {
+            let arg_ctx = if is_reference_aware_function(registry, name) {
                 BindContext::ReferenceArg
-            } else if is_aggregate_function(name) {
+            } else if is_aggregate_function(registry, name) {
                 BindContext::AggregateArg
             } else {
                 BindContext::Scalar
@@ -793,7 +730,7 @@ fn bind_with_context_v2<L: NameLookup>(
             let mut bound_args = Vec::with_capacity(args.len());
             for a in args {
                 bound_args.push(bind_with_context_v2(
-                    a, site, names, sheets, tables, arg_ctx,
+                    a, site, names, sheets, tables, registry, arg_ctx,
                 )?);
             }
             Ok(ExprPlan::Function {
@@ -994,6 +931,7 @@ fn bind_with_context_v2<L: NameLookup>(
             names,
             sheets,
             tables,
+            registry,
             ctx,
         ),
     }
@@ -1002,6 +940,7 @@ fn bind_with_context_v2<L: NameLookup>(
 /// **W5-144 (Phase 4.9.H):** narrow `@expr` at bind time per design
 /// § 3.3. Returns an `ExprPlan` with the wrapper dropped (every
 /// reachable case collapses to an existing ExprPlan shape).
+#[allow(clippy::too_many_arguments)]
 fn bind_implicit_intersection<L: NameLookup>(
     inner: &Expr,
     owning_sheet: SheetId,
@@ -1009,6 +948,7 @@ fn bind_implicit_intersection<L: NameLookup>(
     names: &L,
     sheets: &dyn SheetResolver,
     tables: &dyn TableLookup,
+    registry: &FunctionRegistry,
     ctx: BindContext,
 ) -> Result<ExprPlan, BindError> {
     match inner {
@@ -1022,14 +962,14 @@ fn bind_implicit_intersection<L: NameLookup>(
         | Expr::R1C1Ref { .. }
         | Expr::Unary { .. }
         | Expr::Binary { .. }
-        | Expr::NameRef(_) => bind_with_context_v2(inner, site, names, sheets, tables, ctx),
+        | Expr::NameRef(_) => bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx),
 
         // Rule 8: function inner. The `@` is semantically a no-op for
         // scalar function returns (most common case). Array returns
         // currently surface as `#CALC!` in scalar context per existing
         // 4.7.G limit; the design § 3.3 rule 7 "array → top-left" is
         // a known v1 gap (deferred to cell-boundary spill rewiring).
-        Expr::Function { .. } => bind_with_context_v2(inner, site, names, sheets, tables, ctx),
+        Expr::Function { .. } => bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx),
 
         // Rule 7: array literal → top-left.
         Expr::Array(rows) => {
@@ -1043,6 +983,7 @@ fn bind_implicit_intersection<L: NameLookup>(
                 names,
                 sheets,
                 tables,
+                registry,
                 BindContext::Scalar,
             )
         }
@@ -1106,7 +1047,7 @@ fn bind_implicit_intersection<L: NameLookup>(
         // Nested `@@expr` — Excel-canon idempotent. Strip outer
         // wrapper; recurse on the inner ImplicitIntersection.
         Expr::ImplicitIntersection(_) => {
-            bind_with_context_v2(inner, site, names, sheets, tables, ctx)
+            bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx)
         }
 
         // Spill-range syntax (`A1#`) is reserved for a future Phase.
@@ -1743,8 +1684,20 @@ fn resolve_range_ref_to_range(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use super::*;
     use ql_formula_syntax::{CellAddr, RangeRef, SheetRef};
+
+    /// **6.4-1 (2026-05-28; H1):** lazily-constructed default registry
+    /// shared across every test in this module. The binder's `is_aggregate_function`
+    /// / `is_reference_aware_function` now consult metadata rather than
+    /// hardcoded `matches!`, so every binder call site needs a
+    /// `&FunctionRegistry`. A single shared instance keeps test setup
+    /// cost negligible (boot-time builtin-metadata pop runs once across
+    /// the suite).
+    static TEST_REGISTRY: LazyLock<FunctionRegistry> =
+        LazyLock::new(ql_functions::default_registry);
 
     /// **W5-RT-1 / Step 1.1 (S1-HIGH-C closure):** matcher-only direction
     /// of the `accepts_special_arg_lists_only_registered_reference_aware`
@@ -1771,7 +1724,7 @@ mod tests {
             "FORMULATEXT",
         ] {
             assert!(
-                is_reference_aware_function(name),
+                is_reference_aware_function(&TEST_REGISTRY, name),
                 "design v2 enumerates {name:?} as reference-aware but matcher \
                  returns false"
             );
@@ -1787,7 +1740,7 @@ mod tests {
             "VLOOKUP",
         ] {
             assert!(
-                !is_reference_aware_function(name),
+                !is_reference_aware_function(&TEST_REGISTRY, name),
                 "{name:?} is NOT supposed to be reference-aware but matcher \
                  returns true"
             );
@@ -1829,7 +1782,7 @@ mod tests {
                 "Step 2 registered {name:?} but lookup_reference_aware can't find it"
             );
             assert!(
-                is_reference_aware_function(name),
+                is_reference_aware_function(&reg, name),
                 "{name:?} is registered as reference-aware but matcher returns false"
             );
             // Disjointness: must not resolve as any other tier.
@@ -1862,13 +1815,13 @@ mod tests {
 
     #[test]
     fn bind_number() {
-        let p = bind(&Expr::Number(42.5), 0).unwrap();
+        let p = bind(&Expr::Number(42.5), 0, &TEST_REGISTRY).unwrap();
         assert_eq!(p, ExprPlan::Number(42.5));
     }
 
     #[test]
     fn bind_bool() {
-        let p = bind(&Expr::Bool(true), 0).unwrap();
+        let p = bind(&Expr::Bool(true), 0, &TEST_REGISTRY).unwrap();
         assert_eq!(p, ExprPlan::Bool(true));
     }
 
@@ -1881,7 +1834,7 @@ mod tests {
             abs_col: false,
             abs_row: true,
         });
-        let p = bind(&expr, 7).unwrap();
+        let p = bind(&expr, 7, &TEST_REGISTRY).unwrap();
         assert_eq!(
             p,
             ExprPlan::CellRef {
@@ -1904,7 +1857,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         });
-        let p = bind(&expr, 0).unwrap();
+        let p = bind(&expr, 0, &TEST_REGISTRY).unwrap();
         assert!(matches!(p, ExprPlan::CellRef { sheet: 2, .. }));
     }
 
@@ -1922,7 +1875,7 @@ mod tests {
             })),
             rhs: Box::new(Expr::Number(2.0)),
         };
-        let p = bind(&expr, 0).unwrap();
+        let p = bind(&expr, 0, &TEST_REGISTRY).unwrap();
         match p {
             ExprPlan::Binary {
                 op: Operator::Mul,
@@ -1942,7 +1895,7 @@ mod tests {
             op: Operator::Minus,
             operand: Box::new(Expr::Number(5.0)),
         };
-        let p = bind(&expr, 0).unwrap();
+        let p = bind(&expr, 0, &TEST_REGISTRY).unwrap();
         assert!(matches!(
             p,
             ExprPlan::Unary {
@@ -1962,7 +1915,7 @@ mod tests {
             abs_end: false,
         });
         assert!(matches!(
-            bind(&expr, 0),
+            bind(&expr, 0, &TEST_REGISTRY),
             Err(BindError::UnsupportedVariant(_))
         ));
     }
@@ -1974,7 +1927,7 @@ mod tests {
             name: Arc::from("SUM"),
             args: vec![Expr::Number(1.0), Expr::Number(2.0)],
         };
-        let p = bind(&expr, 0).unwrap();
+        let p = bind(&expr, 0, &TEST_REGISTRY).unwrap();
         match p {
             ExprPlan::Function { name, args } => {
                 assert_eq!(name.as_ref(), "SUM");
@@ -2008,7 +1961,7 @@ mod tests {
                 }),
             ],
         };
-        let p = bind(&expr, 7).unwrap();
+        let p = bind(&expr, 7, &TEST_REGISTRY).unwrap();
         match p {
             ExprPlan::Function { args, .. } => {
                 assert!(matches!(
@@ -2066,7 +2019,7 @@ mod tests {
             abs_row: false,
         });
         let sheets = MockSheetResolver::new(&[("Sheet2", 1)]);
-        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets).expect("bind");
+        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets, &TEST_REGISTRY).expect("bind");
         match p {
             ExprPlan::CellRef { sheet, .. } => assert_eq!(sheet, 1),
             other => panic!("expected CellRef, got {other:?}"),
@@ -2083,7 +2036,7 @@ mod tests {
             abs_row: false,
         });
         let sheets = MockSheetResolver::new(&[("Sheet1", 5)]);
-        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets).expect("bind");
+        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets, &TEST_REGISTRY).expect("bind");
         match p {
             ExprPlan::CellRef { sheet, .. } => assert_eq!(sheet, 5),
             other => panic!("expected CellRef, got {other:?}"),
@@ -2100,7 +2053,7 @@ mod tests {
             abs_row: false,
         });
         let sheets = MockSheetResolver::new(&[("Sheet1", 0)]);
-        let err = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets).unwrap_err();
+        let err = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets, &TEST_REGISTRY).unwrap_err();
         match err {
             BindError::UnknownSheet(name) => assert_eq!(name.as_ref(), "Nonexistent"),
             other => panic!("expected UnknownSheet, got {other:?}"),
@@ -2109,7 +2062,7 @@ mod tests {
 
     #[test]
     fn bind_empty_sheet_resolver_rejects_all_sheet_names() {
-        // The legacy `bind()` / `bind_with_names()` entry points use an
+        // The legacy `bind(, &TEST_REGISTRY)` / `bind_with_names(, &TEST_REGISTRY)` entry points use an
         // empty resolver, so any cross-sheet ref errors cleanly.
         let expr = Expr::CellRef(CellAddr {
             sheet: SheetRef::Name(Arc::from("AnySheet")),
@@ -2118,7 +2071,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         });
-        let err = bind(&expr, 0).unwrap_err();
+        let err = bind(&expr, 0, &TEST_REGISTRY).unwrap_err();
         assert!(matches!(err, BindError::UnknownSheet(_)));
     }
 
@@ -2132,7 +2085,7 @@ mod tests {
             abs_row: false,
         });
         let sheets = MockSheetResolver::new(&[]);
-        let p = bind_with_names_and_sheets(&expr, 9, &EmptyNameLookup, &sheets).expect("bind");
+        let p = bind_with_names_and_sheets(&expr, 9, &EmptyNameLookup, &sheets, &TEST_REGISTRY).expect("bind");
         match p {
             ExprPlan::CellRef { sheet, .. } => assert_eq!(sheet, 9),
             other => panic!("expected CellRef, got {other:?}"),
@@ -2155,7 +2108,7 @@ mod tests {
             rhs: Box::new(Expr::Number(1.0)),
         };
         let sheets = MockSheetResolver::new(&[("Sheet2", 7)]);
-        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets).expect("bind");
+        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets, &TEST_REGISTRY).expect("bind");
         match p {
             ExprPlan::Binary { lhs, .. } => match lhs.as_ref() {
                 ExprPlan::CellRef { sheet, .. } => assert_eq!(*sheet, 7),
@@ -2170,7 +2123,7 @@ mod tests {
     #[test]
     fn bind_error_literal_lowers_to_expr_plan_error() {
         let expr = Expr::Error(ErrorValue::Ref);
-        let p = bind(&expr, 0).expect("bind");
+        let p = bind(&expr, 0, &TEST_REGISTRY).expect("bind");
         match p {
             ExprPlan::Error(ev) => assert_eq!(ev, ErrorValue::Ref),
             other => panic!("expected ExprPlan::Error, got {other:?}"),
@@ -2184,7 +2137,7 @@ mod tests {
             vec![Expr::Number(1.0), Expr::String(Arc::from("hi"))],
             vec![Expr::Bool(true), Expr::Error(ErrorValue::NA)],
         ]);
-        let p = bind(&expr, 0).expect("bind");
+        let p = bind(&expr, 0, &TEST_REGISTRY).expect("bind");
         match p {
             ExprPlan::Array(rows) => {
                 assert_eq!(rows.len(), 2);
@@ -2211,7 +2164,7 @@ mod tests {
             vec![Expr::Number(1.0), Expr::Number(2.0)],
             vec![Expr::Number(3.0)],
         ]);
-        let err = bind(&expr, 0).unwrap_err();
+        let err = bind(&expr, 0, &TEST_REGISTRY).unwrap_err();
         match err {
             BindError::ArrayRowArityMismatch {
                 expected,
@@ -2240,7 +2193,7 @@ mod tests {
                 abs_row: false,
             }),
         ]]);
-        let err = bind(&expr, 0).unwrap_err();
+        let err = bind(&expr, 0, &TEST_REGISTRY).unwrap_err();
         match err {
             BindError::ArrayCellNotLiteral { row, col, got } => {
                 assert_eq!(row, 0);
@@ -2260,7 +2213,7 @@ mod tests {
             Expr::Number(1.0),
             Expr::Array(vec![vec![Expr::Number(2.0)]]),
         ]]);
-        let err = bind(&expr, 0).unwrap_err();
+        let err = bind(&expr, 0, &TEST_REGISTRY).unwrap_err();
         match err {
             BindError::ArrayCellNotLiteral { got, .. } => assert_eq!(got, "Array"),
             other => panic!("expected ArrayCellNotLiteral, got {other:?}"),
@@ -2272,7 +2225,7 @@ mod tests {
         // W5-99 closure (Codex MEDIUM-7): now uses the dedicated
         // EmptyArrayLiteral variant (was UnsupportedVariant pre-closure).
         let expr = Expr::Array(vec![]);
-        let err = bind(&expr, 0).unwrap_err();
+        let err = bind(&expr, 0, &TEST_REGISTRY).unwrap_err();
         assert!(matches!(err, BindError::EmptyArrayLiteral));
     }
 
@@ -2283,7 +2236,7 @@ mod tests {
         // previously accepted because `expected_arity = rows[0].len() = 0`
         // matched every subsequent row. Now rejected.
         let expr = Expr::Array(vec![vec![]]);
-        let err = bind(&expr, 0).unwrap_err();
+        let err = bind(&expr, 0, &TEST_REGISTRY).unwrap_err();
         assert!(matches!(err, BindError::EmptyArrayLiteral));
     }
 
@@ -2296,7 +2249,7 @@ mod tests {
             Expr::Number(1.0),
             Expr::NameRef(Arc::from("TAXRATE")),
         ]]);
-        let err = bind(&expr, 0).unwrap_err();
+        let err = bind(&expr, 0, &TEST_REGISTRY).unwrap_err();
         match err {
             BindError::ArrayCellNotLiteral { row, col, got } => {
                 assert_eq!(row, 0);
@@ -2317,7 +2270,7 @@ mod tests {
                 args: vec![Expr::Number(1.0)],
             },
         ]]);
-        let err = bind(&expr, 0).unwrap_err();
+        let err = bind(&expr, 0, &TEST_REGISTRY).unwrap_err();
         match err {
             BindError::ArrayCellNotLiteral { row, col, got } => {
                 assert_eq!(row, 0);
@@ -2332,7 +2285,7 @@ mod tests {
     fn bind_array_literal_singleton_lowers() {
         // 1x1 array — degenerate but valid.
         let expr = Expr::Array(vec![vec![Expr::Number(42.0)]]);
-        let p = bind(&expr, 0).expect("bind");
+        let p = bind(&expr, 0, &TEST_REGISTRY).expect("bind");
         match p {
             ExprPlan::Array(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -2351,7 +2304,7 @@ mod tests {
             vec![Expr::Number(3.0), Expr::Number(4.0)],
             vec![Expr::Number(5.0), Expr::Number(6.0)],
         ]);
-        let p = bind(&expr, 0).expect("bind");
+        let p = bind(&expr, 0, &TEST_REGISTRY).expect("bind");
         match p {
             ExprPlan::Array(rows) => {
                 assert_eq!(rows.len(), 3);
@@ -2421,6 +2374,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
+        
+            &TEST_REGISTRY,
         )
         .unwrap();
         match plan {
@@ -2455,6 +2410,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
+        
+            &TEST_REGISTRY,
         )
         .unwrap_err();
         match err {
@@ -2476,6 +2433,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
+        
+            &TEST_REGISTRY,
         )
         .unwrap_err();
         match err {
@@ -2500,6 +2459,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
+        
+            &TEST_REGISTRY,
         )
         .unwrap();
         match plan {
@@ -2531,6 +2492,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
+        
+            &TEST_REGISTRY,
         )
         .unwrap();
         match plan {
@@ -2561,6 +2524,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
+        
+            &TEST_REGISTRY,
         )
         .unwrap();
         match plan {
@@ -2587,6 +2552,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
+        
+            &TEST_REGISTRY,
         )
         .unwrap();
         match plan {
@@ -2613,6 +2580,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
+        
+            &TEST_REGISTRY,
         )
         .unwrap();
         match plan {
@@ -2647,6 +2616,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
+        
+            &TEST_REGISTRY,
         )
         .unwrap_err();
         match err {
@@ -2676,6 +2647,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &EmptyTableLookup,
+        
+            &TEST_REGISTRY,
         )
     }
 
@@ -2686,6 +2659,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &EmptyTableLookup,
+        
+            &TEST_REGISTRY,
         )
     }
 
@@ -2906,6 +2881,8 @@ mod tests {
             &EmptyNameLookup,
             &OneSheet,
             &EmptyTableLookup,
+        
+            &TEST_REGISTRY,
         )
         .unwrap();
         match p {
@@ -2980,6 +2957,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &EmptyTableLookup,
+        
+            &TEST_REGISTRY,
         )
     }
 
@@ -3266,6 +3245,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &EmptyTableLookup,
+        
+            &TEST_REGISTRY,
         )
         .unwrap_err();
         assert!(matches!(err, BindError::ImplicitIntersectionRequiresAnchor));
@@ -3289,6 +3270,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
+        
+            &TEST_REGISTRY,
         )
         .unwrap();
         match plan {
@@ -3323,6 +3306,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
+        
+            &TEST_REGISTRY,
         )
         .unwrap();
         match plan {
@@ -3356,6 +3341,8 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
+        
+            &TEST_REGISTRY,
         )
         .unwrap();
         match plan {

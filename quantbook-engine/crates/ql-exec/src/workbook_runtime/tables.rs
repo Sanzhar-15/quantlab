@@ -823,6 +823,7 @@ impl<'a> WorkbookRuntime<'a> {
         // Step 2: re-bind + re-extract.
         for (node, sheet, row, col, text) in reader_info {
             let name_gen = self.workbook.names().generation();
+            let fn_gen = self.registry.fn_generation();
             let cell_anchor = if text.contains('@') {
                 Some((row, col))
             } else {
@@ -832,6 +833,7 @@ impl<'a> WorkbookRuntime<'a> {
                 text: Arc::clone(&text),
                 sheet,
                 name_gen,
+                fn_gen,
                 cell_anchor,
             };
             let plan: Arc<crate::plan::ExprPlan> = match self
@@ -850,6 +852,7 @@ impl<'a> WorkbookRuntime<'a> {
                         self.workbook,
                         self.workbook,
                         self.workbook,
+                        self.registry,
                     )?)
                 }) {
                 Ok(p) => p,

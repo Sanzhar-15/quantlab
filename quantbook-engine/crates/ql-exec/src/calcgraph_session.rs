@@ -76,8 +76,9 @@
 //!   internally) + new `_with_registry(wb, registry)` for production
 //!   sites that own a session-scoped registry (UDF-aware at 6.4).
 //! - Storage gate widened from `!deps.is_empty() || deps.is_volatile`
-//!   to also cover `!deps.functions_used.is_empty()` /
-//!   `!deps.names.is_empty()` / `!deps.tables.is_empty()` — closes a
+//!   (substrate audit-fix 5-clause `||`-chain; 6.4-1 M1 collapsed it
+//!   back to `!deps.is_empty()` after honest widening of the method) —
+//!   closes a
 //!   latent `ROW(MyName)` cleanup bug where the address-only walker's
 //!   `names` push (without `named_ranges`) caused
 //!   `name_to_formulas[MYNAME]` to leak on rebind.
@@ -255,6 +256,31 @@ pub(crate) fn is_address_only_reference_fn(registry: &FunctionRegistry, name: &s
     )
 }
 
+/// **6.4-1 (2026-05-28; I1):** registry-driven check for the LazyShape
+/// dep contract — ISREF today, any future UDF declaring
+/// `DepShape::LazyShape` tomorrow. LazyShape semantics: the function
+/// inspects the syntactic shape of its arg via `materialize_ref_arg_lazy`
+/// without ever evaluating it, so the walker MUST skip arg walking
+/// entirely (no value-deps, no volatility propagation, no nested-function
+/// recording).
+///
+/// Pre-6.4-1 the walker carried a hardcoded `name.as_ref() == "ISREF"`
+/// short-circuit in its `Function` arm; the I1 closure moves that decision
+/// to metadata so user-supplied UDFs participate uniformly. The walker's
+/// routing is now:
+/// 1. LazyShape → skip all arg walking.
+/// 2. AddressOnly → walk_plan_for_address_only_deps.
+/// 3. Otherwise → walk_plan_for_deps.
+///
+/// Unknown name returns `false` — the conservative routing falls through
+/// to the normal walker, matching pre-6.4-1's `false` default.
+pub(crate) fn is_lazy_shape_reference_fn(registry: &FunctionRegistry, name: &str) -> bool {
+    matches!(
+        registry.metadata(name).map(|m| m.dep_shape),
+        Some(DepShape::LazyShape)
+    )
+}
+
 /// Phase 3.2 — direct-dep collection extracted from walking a bound
 /// `ExprPlan`. Fields are owned (no borrows) so the caller can pass
 /// the collection around or store it without lifetime ceremony.
@@ -298,15 +324,44 @@ pub struct FormulaDeps {
 }
 
 impl FormulaDeps {
-    /// Total dependency count (cells + named ranges). Useful for
-    /// summary metrics; Phase 3.10 megaudit / ql-profile will surface
-    /// per-formula dep counts in the graph-profile JSON.
+    /// **6.4-1 (2026-05-28; M1):** total dependency count summed across
+    /// EVERY tracked-dep field — `cells`, `named_ranges`, `names`,
+    /// `tables`, `functions_used` (plus 1 for `is_volatile = true` since
+    /// volatility is itself a graph-meaningful "dep" on the volatile-pass
+    /// machinery). Useful for summary metrics; Phase 3.10 megaudit /
+    /// ql-profile will surface per-formula dep counts in the graph-
+    /// profile JSON.
+    ///
+    /// Pre-6.4-1 this only summed `cells + named_ranges` (2 of 6 fields),
+    /// silently understating the dep count for formulas that touched a
+    /// `Name` (without resolving to a Range), a `Table` (structured-ref
+    /// `Sales[Qty]`), or a function (any formula calling a function had
+    /// `functions_used >= 1` but `len() == 0` if no cells/named-ranges).
+    /// The substrate's `extract_and_register_deps` orchestrator papered
+    /// over this with a 5-clause `||`-chain at the storage gate; the M1
+    /// fix moves the truth back to a single canonical method.
     pub fn len(&self) -> usize {
-        self.cells.len() + self.named_ranges.len()
+        self.cells.len()
+            + self.named_ranges.len()
+            + self.names.len()
+            + self.tables.len()
+            + self.functions_used.len()
+            + usize::from(self.is_volatile)
     }
 
+    /// **6.4-1 (2026-05-28; M1):** true iff no tracked-dep field has any
+    /// entry AND the formula is not volatile. The substrate's storage gate
+    /// at `extract_and_register_deps` is now a single `!deps.is_empty()`
+    /// check instead of the 5-clause `||`-chain the substrate audit-fix
+    /// added (which the M1 disposition flagged as papering over this
+    /// method's lie).
     pub fn is_empty(&self) -> bool {
-        self.cells.is_empty() && self.named_ranges.is_empty()
+        self.cells.is_empty()
+            && self.named_ranges.is_empty()
+            && self.names.is_empty()
+            && self.tables.is_empty()
+            && self.functions_used.is_empty()
+            && !self.is_volatile
     }
 }
 
@@ -378,10 +433,18 @@ pub(crate) fn walk_plan_for_deps(
             // The previous Step 1.1 design routed ISREF through path 2,
             // which produced wrong behavior under LazyShape (Step 3
             // audit caught this).
-            if name.as_ref() == "ISREF" {
-                // LazyShape contract: NO arg walking. The args' inner
-                // value-deps / volatility / structural deps don't
-                // affect ISREF's result.
+            if is_lazy_shape_reference_fn(registry, name) {
+                // **6.4-1 (2026-05-28; I1):** LazyShape contract — NO arg
+                // walking. Pre-6.4-1 this was a hardcoded
+                // `name.as_ref() == "ISREF"` check; the I1 closure routes
+                // through metadata so any UDF declaring
+                // `dep_shape: LazyShape` participates uniformly. ISREF
+                // remains the only built-in with this contract today (its
+                // Phase-1 override in `register_builtin_metadata` sets
+                // `DepShape::LazyShape`).
+                //
+                // The args' inner value-deps / volatility / structural
+                // deps don't affect a LazyShape function's result.
             } else if is_address_only_reference_fn(registry, name) {
                 for arg in args {
                     walk_plan_for_address_only_deps(arg, deps, registry);
@@ -937,19 +1000,21 @@ impl CalcgraphSession {
                 .or_default()
                 .insert(formula_node);
         }
-        // **6.4-0 substrate:** also store `formula_deps` for any formula
-        // that referenced functions, so `remove_formula_deps` can clean
-        // up `functions_used` on re-bind. Without this, a formula like
+        // **6.4-0 substrate** widened the gate from `!deps.is_empty() ||
+        // deps.is_volatile` (cells + named_ranges only, the 2-of-6 lie)
+        // to a 5-clause `||`-chain that also covered functions_used /
+        // names / tables — closing a latent leak where a formula like
         // `=NA()` (no cell/range deps, not volatile, but `functions_used
-        // == ["NA"]`) would skip storage → leaked reverse-index entry
-        // on next re-bind. The existing `!deps.is_empty()` only checks
-        // cell + named_range emptiness.
-        if !deps.is_empty()
-            || deps.is_volatile
-            || !deps.functions_used.is_empty()
-            || !deps.names.is_empty()
-            || !deps.tables.is_empty()
-        {
+        // == ["NA"]`) would skip storage and leak a reverse-index entry
+        // on next re-bind.
+        //
+        // **6.4-1 (2026-05-28; M1):** `FormulaDeps::is_empty()` now
+        // honestly spans every tracked-dep field, so the gate collapses
+        // to a single `!deps.is_empty()`. Behavior-preserving against the
+        // 6.4-0 audit-fix chain (the 6 cases are: cells, named_ranges,
+        // names, tables, functions_used, is_volatile — exactly the M1
+        // widening).
+        if !deps.is_empty() {
             self.formula_deps.insert(formula_node, deps);
         }
     }
@@ -1093,6 +1158,7 @@ impl CalcgraphSession {
                 &text,
                 BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
                 wb,
+                registry,
             ) {
                 Ok(plan) => {
                     session.extract_and_register_deps(node, sheet, &plan, wb, registry);
@@ -1136,13 +1202,25 @@ impl CalcgraphSession {
     /// **W5-114 (Phase 4.8.E):** signature now takes `BindSite` so
     /// the formula's cell address flows through for structured-ref
     /// `[@Col]` resolution (4.8.F).
-    fn bind_text(text: &str, site: BindSite, wb: &Workbook) -> Result<ExprPlan, RuntimeError> {
+    fn bind_text(
+        text: &str,
+        site: BindSite,
+        wb: &Workbook,
+        registry: &FunctionRegistry,
+    ) -> Result<ExprPlan, RuntimeError> {
         let tokens = lex(text)?;
         let expr = parse(tokens)?;
         // W5-92 (Phase 4.6.D): pass `wb` for names so the two-tier
         // sheet-then-workbook scope chain fires; was `wb.names()`
         // (workbook-scoped only).
-        Ok(bind_with_site(&expr, site, wb, wb, wb)?)
+        //
+        // **6.4-1 (2026-05-28; H1):** the binder now consults
+        // `&FunctionRegistry` for `is_aggregate_function` /
+        // `is_reference_aware_function` — threading the session's
+        // registry rather than relying on a hardcoded `matches!` keeps
+        // UDF-registered metadata (6.4) participating in the binder's
+        // `arg_ctx` decision.
+        Ok(bind_with_site(&expr, site, wb, wb, wb, registry)?)
     }
 
     /// **G3-02 acceptance (hook 1/5).** Mutation hook fired by
@@ -2054,23 +2132,55 @@ mod tests {
     /// adding ISFORMULA or FORMULATEXT to the list by accident (the design
     /// reserves them for value-dep / formula-status-dep over-recompute
     /// per § 8 R8) would also fail.
+    ///
+    /// **6.4-1 (2026-05-28; I1):** ISREF moved from `DepShape::AddressOnly`
+    /// to `DepShape::LazyShape` (its arg is never evaluated — neither value
+    /// nor address is needed). The address-only shim no longer matches
+    /// ISREF; the new [`is_lazy_shape_reference_fn`] shim takes over for
+    /// the walker's ISREF short-circuit. Both shims preserve the prior
+    /// walker behavior — only the routing now flows through metadata.
     #[test]
     fn dep_suppressed_reference_fns_match_design() {
         // 6.4-0: the helper now reads `DepShape::AddressOnly` off the
         // registry's per-function metadata. The default registry pins
-        // ROW/COLUMN/ROWS/COLUMNS/ISREF to AddressOnly via
+        // ROW/COLUMN/ROWS/COLUMNS to AddressOnly via
         // `register_builtin_metadata`; ISFORMULA/FORMULATEXT default to
         // ValueDeps; unknown names default to None (the matcher returns
         // false). Behavior is identical to the prior hardcoded
         // whitelist — this test pins the metadata-derived view at the
         // engine layer in addition to the registry-level pin at
         // `ql_functions::registry::builtin_metadata_pins_prior_address_only_whitelist`.
+        //
+        // 6.4-1 (I1): ISREF moves to LazyShape; it'\''s pinned separately
+        // below.
         let registry = ql_functions::default_registry();
         // Address-only — value-deps suppressed for these.
-        for name in &["ROW", "COLUMN", "ROWS", "COLUMNS", "ISREF"] {
+        for name in &["ROW", "COLUMN", "ROWS", "COLUMNS"] {
             assert!(
                 is_address_only_reference_fn(&registry, name),
                 "design § 5.3 lists {name:?} as address-only but matcher returns false"
+            );
+        }
+        // 6.4-1 I1: ISREF is LazyShape now, NOT AddressOnly.
+        assert!(
+            !is_address_only_reference_fn(&registry, "ISREF"),
+            "6.4-1 I1: ISREF moved to DepShape::LazyShape; address-only matcher \
+             must return false"
+        );
+        assert!(
+            is_lazy_shape_reference_fn(&registry, "ISREF"),
+            "6.4-1 I1: ISREF must register as LazyShape so the walker skips arg \
+             walking entirely (no value-deps, no volatility propagation)"
+        );
+        // ROW/COLUMN/etc are AddressOnly, not LazyShape — confirm the two
+        // are disjoint at the metadata level so a mistaken Phase-1
+        // override flipping ROW to LazyShape (and silently dropping
+        // value-deps for `ROW(A1+1)`) would be caught.
+        for name in &["ROW", "COLUMN", "ROWS", "COLUMNS"] {
+            assert!(
+                !is_lazy_shape_reference_fn(&registry, name),
+                "{name:?} is AddressOnly, not LazyShape; matcher must not \
+                 confuse them"
             );
         }
         // Reference-aware but NOT address-only — value-deps kept as v1 cost.
@@ -2080,12 +2190,21 @@ mod tests {
                 "{name:?} should keep value-deps (formula-status / source-text \
                  access) — must not be in is_address_only_reference_fn"
             );
+            assert!(
+                !is_lazy_shape_reference_fn(&registry, name),
+                "{name:?} keeps value-deps via the normal walker — must not be \
+                 LazyShape"
+            );
         }
         // Typo guards. Unknown / unregistered names default to false.
         for name in &["RAW", "COLUM", "ISREFENCE", "SUM", "IF"] {
             assert!(
                 !is_address_only_reference_fn(&registry, name),
                 "{name:?} is not reference-aware; must not be in the suppressed list"
+            );
+            assert!(
+                !is_lazy_shape_reference_fn(&registry, name),
+                "{name:?} is not LazyShape; matcher must not match unknowns"
             );
         }
     }
@@ -2662,13 +2781,14 @@ mod tests {
         let mut wb2 = wb.clone();
         wb2.put_at(0, 0, 0, Value::Blank);
         wb2.put_formula(0, 0, 0, "1 + 1");
+        let registry = ql_functions::default_registry();
         let plan = CalcgraphSession::bind_text(
             "1 + 1",
             BindSite::at_cell(ql_types::Address::new(0, 0, 0)),
             &wb2,
+            &registry,
         )
         .expect("simple arithmetic must bind");
-        let registry = ql_functions::default_registry();
         s.on_set_formula(0, 0, 0, &plan, &wb2, &registry);
 
         assert!(
@@ -2919,13 +3039,14 @@ mod tests {
         let mut wb2 = wb.clone();
         wb2.put_at(0, 5, 5, Value::Blank);
         wb2.put_formula(0, 5, 5, "1 + 1");
+        let registry = ql_functions::default_registry();
         let plan = CalcgraphSession::bind_text(
             "1 + 1",
             BindSite::at_cell(ql_types::Address::new(0, 5, 5)),
             &wb2,
+            &registry,
         )
         .expect("simple arithmetic must bind");
-        let registry = ql_functions::default_registry();
         s.on_set_formula(0, 5, 5, &plan, &wb2, &registry);
 
         // Without the widened storage gate, name_to_formulas[MYNAME]

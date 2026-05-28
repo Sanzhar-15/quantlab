@@ -99,7 +99,7 @@ fn registry_with_placeholders() -> FunctionRegistry {
 fn bind_and_eval(src: &str, env: &MapEnv, reg: &FunctionRegistry) -> Value {
     let tokens = lex(src).expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+    let plan = ql_exec::bind(&ast, 0, reg).expect("bind");
     eval_scalar_with_cache(&plan, env, reg, &NoAggregateCache)
 }
 

@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 
 use ql_session::function_meta::{
-    ArgPolicy, Arity, BatchShape, CancelPolicy, DepShape, FunctionMetadata, Volatility,
+    ArgContext, ArgPolicy, Arity, BatchShape, CancelPolicy, DepShape, FunctionMetadata, Volatility,
 };
 use ql_types::{ArrayValue, EvalContext, Value};
 
@@ -218,6 +218,22 @@ pub struct FunctionRegistry {
     /// `default_registry_metadata_is_complete_for_every_dispatch_entry`
     /// debug-build invariant test catches drift.
     metadata: HashMap<String, FunctionMetadata>,
+    /// **6.4-1 (2026-05-28; H3):** monotonic generation counter that ticks
+    /// on every metadata mutation ([`Self::register_metadata`] /
+    /// [`Self::unregister_metadata`]). Mirrors `NameTable::generation()` at
+    /// `ql-storage`; `PlanCacheKey` (`ql-exec::plan_cache:69-74`) reads it
+    /// alongside `name_gen` so the bind cache invalidates on UDF
+    /// register / unregister. Closes contract §10.3's "re-extract deps"
+    /// half — the 6.4-0 substrate dirties + reschedules; the 6.4-1
+    /// `fn_gen` invalidates the bind cache, forcing the next eval to
+    /// re-bind through `walk_plan_for_deps` against the current metadata.
+    ///
+    /// `saturating_add(1)` (rather than `+= 1` / `wrapping_add`) on bump:
+    /// `u64::MAX` would require ~10^19 mutations in one session, so
+    /// saturation is fine; the alternative (`checked_add` + `expect`) would
+    /// surface a panic the user can't act on, and `wrapping_add` would
+    /// re-collide with prior cache keys (the failure mode H3 closes!).
+    fn_gen: u64,
 }
 
 impl Default for FunctionRegistry {
@@ -233,7 +249,20 @@ impl FunctionRegistry {
         Self {
             fns: HashMap::new(),
             metadata: HashMap::new(),
+            // **6.4-1 (2026-05-28; H3):** starts at 0. The very first
+            // `register_metadata` call bumps to 1; `PlanCacheKey` carries
+            // the value at bind time so a cache hit only happens if the
+            // metadata snapshot is unchanged since the bind.
+            fn_gen: 0,
         }
+    }
+
+    /// **6.4-1 (2026-05-28; H3):** read the metadata generation counter.
+    /// Used by `WorkbookSession` (and the test fixture) to populate
+    /// `PlanCacheKey::fn_gen` so cache hits are consistent with the
+    /// current metadata table. Monotonically increases.
+    pub fn fn_generation(&self) -> u64 {
+        self.fn_gen
     }
 
     /// W5-96 internal: assert canonical-uppercase name + insert with
@@ -312,6 +341,17 @@ impl FunctionRegistry {
             });
         }
         self.metadata.insert(meta.canonical_name.clone(), meta);
+        // **6.4-1 (2026-05-28; H3):** bump the metadata generation counter
+        // so any `PlanCacheKey` minted before this call misses on next
+        // lookup. The bind cache invalidation is what closes contract
+        // §10.3's "re-extract deps" half — `CalcgraphSession`'s hooks
+        // already dirty + reschedule; the cache miss forces re-binding
+        // through `walk_plan_for_deps` against the current metadata so
+        // `FormulaDeps::is_volatile` / `functions_used` / `is_volatile`
+        // / `dep_shape`-driven routing all reflect the new entry. Only
+        // bumped on success — a `Conflict` returned above leaves the
+        // metadata table state and `fn_gen` both untouched.
+        self.fn_gen = self.fn_gen.saturating_add(1);
         Ok(())
     }
 
@@ -350,6 +390,11 @@ impl FunctionRegistry {
             });
         }
         if self.metadata.remove(&upper).is_some() {
+            // **6.4-1 (2026-05-28; H3):** symmetric `fn_gen` bump on
+            // successful removal. A `NotFound` returned below leaves the
+            // counter alone (metadata table unchanged → cache stays
+            // valid).
+            self.fn_gen = self.fn_gen.saturating_add(1);
             Ok(())
         } else {
             Err(FunctionRegistryError::NotFound {
@@ -363,8 +408,28 @@ impl FunctionRegistry {
     /// the substrate's own invariant tests. Order is HashMap-arbitrary
     /// at the registry layer — the trait method sorts at the DTO seam
     /// (matching the 6.1C H2 ordering discipline for snapshot DTOs).
+    /// For deterministic ordering at the registry layer, use
+    /// [`Self::sorted_metadata`] instead.
     pub fn iter_metadata(&self) -> impl Iterator<Item = &FunctionMetadata> {
         self.metadata.values()
+    }
+
+    /// **6.4-1 (2026-05-28; M3):** deterministic view over every registered
+    /// `FunctionMetadata`, sorted ascending by `canonical_name`. Matches
+    /// the 6.1C H2 ordering discipline (Vecs serialized over the wire
+    /// MUST be deterministic — a 5-way megaudit caught the snapshot
+    /// `formats` non-determinism at exactly this seam). The
+    /// (forthcoming, 6.4) `EngineSession::list_functions` mapper consumes
+    /// this view; tests that compare metadata snapshots between runs
+    /// should also use this rather than `iter_metadata`.
+    ///
+    /// Allocates a `Vec<&FunctionMetadata>` of registry-len size; cheap
+    /// at v1 sizes (260 builtins + UDFs) and called once per
+    /// `list_functions` request.
+    pub fn sorted_metadata(&self) -> Vec<&FunctionMetadata> {
+        let mut v: Vec<&FunctionMetadata> = self.metadata.values().collect();
+        v.sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+        v
     }
 
     /// Register a scalar function under `name`. Stored internally as
@@ -1178,6 +1243,13 @@ fn register_builtin_metadata(r: &mut FunctionRegistry) {
             batch_shape: BatchShape::Scalar,
             arg_policy: ArgPolicy::Coercing,
             cancellation: CancelPolicy::Cooperative,
+            // **6.4-1 (2026-05-28; H1):** the conservative default. The
+            // binder rejects range args under `BindContext::Scalar`, so any
+            // pure-scalar built-in (ABS / SQRT / IF / …) and any unknown
+            // function lands here. Phase 1.5 below explicitly overrides
+            // the ~66 aggregate / range-aware / array-tier names; Phase 1
+            // explicitly sets the 7 reference-aware names.
+            arg_context: ArgContext::Scalar,
             provenance_tags: Vec::new(),
         }
     }
@@ -1210,16 +1282,176 @@ fn register_builtin_metadata(r: &mut FunctionRegistry) {
         r.register_metadata(m)
             .expect("phase-1 dynamic override must not collide with prior phase-1 entry");
     }
-    // Address-only reference fns: ROW/COLUMN/ROWS/COLUMNS/ISREF. The
+    // Address-only reference fns: ROW / COLUMN / ROWS / COLUMNS. The
     // walker `walk_plan_for_address_only_deps` routes their args away
-    // from value-deps. ISREF additionally keeps its hardcoded LazyShape
-    // short-circuit in the walker (Function arm `name == "ISREF"`); the
-    // metadata only carries the address-only axis the V1 DTO supports.
-    for name in ["ROW", "COLUMN", "ROWS", "COLUMNS", "ISREF"] {
+    // from value-deps.
+    //
+    // **6.4-1 (2026-05-28; H1):** all four also gain `ArgContext::Reference`
+    // so `ql-exec::plan`'s `is_reference_aware_function` derives from
+    // metadata. The binder routes their args under `BindContext::ReferenceArg`
+    // (accepts literal CellRef / RangeRef / NameRef).
+    for name in ["ROW", "COLUMN", "ROWS", "COLUMNS"] {
         let mut m = pure_scalar(name);
         m.dep_shape = DepShape::AddressOnly;
+        m.arg_context = ArgContext::Reference;
         r.register_metadata(m)
             .expect("phase-1 address-only override must not collide with prior phase-1 entry");
+    }
+
+    // **6.4-1 (2026-05-28; I1):** ISREF gets `DepShape::LazyShape` (not
+    // `AddressOnly`). LazyShape semantics: the walker never recurses,
+    // never registers value-deps, never propagates volatility — `ISREF(NOW())`
+    // does NOT mark the formula volatile; `ISREF(A1+1)` does NOT register
+    // A1's dep. Pre-6.4-1 this was a hardcoded `name == "ISREF"` short-
+    // circuit in the walker's `Function` arm; the I1 closure moves the
+    // decision to metadata so 6.4 UDFs declaring `dep_shape: LazyShape`
+    // get the same treatment without engine-side name special-casing. The
+    // engine's `is_address_only_reference_fn` migration shim accepts BOTH
+    // `AddressOnly` and `LazyShape` so the binder's reference-arg routing
+    // is preserved.
+    {
+        let mut m = pure_scalar("ISREF");
+        m.dep_shape = DepShape::LazyShape;
+        m.arg_context = ArgContext::Reference;
+        r.register_metadata(m)
+            .expect("phase-1 ISREF override must not collide with prior phase-1 entry");
+    }
+
+    // **6.4-1 (2026-05-28; H1):** the remaining two reference-aware
+    // names — ISFORMULA and FORMULATEXT — that the binder admits under
+    // `BindContext::ReferenceArg` but whose walker treats with normal
+    // `ValueDeps` semantics (Eager + workbook query — design § 8 R8). They
+    // need `ArgContext::Reference` from metadata; their `DepShape` stays
+    // `ValueDeps` (the `pure_scalar` default).
+    for name in ["ISFORMULA", "FORMULATEXT"] {
+        let mut m = pure_scalar(name);
+        m.arg_context = ArgContext::Reference;
+        r.register_metadata(m)
+            .expect("phase-1 reference-arg override must not collide with prior phase-1 entry");
+    }
+
+    // ---- Phase 1.5: ArgContext::Aggregate overrides (H1 source) -----------
+    //
+    // **6.4-1 (2026-05-28; H1):** the binder-admission category for the
+    // names that pre-6.4-1 lived as the ~66-entry `matches!` whitelist in
+    // `ql-exec::plan::is_aggregate_function`. These names accept range
+    // args (named ranges, literal ranges in some tiers, range-aware
+    // dispatch) — the binder must route them under
+    // `BindContext::AggregateArg` rather than `BindContext::Scalar` so
+    // `=SUM(SalesRange)` etc. bind correctly. The list is mirrored from
+    // the pre-6.4-1 source at `plan.rs:422-536`. Adding a name here is
+    // equivalent to adding it to the pre-6.4-1 `matches!` list — the
+    // `plan.rs::is_aggregate_function` shim now reads
+    // `metadata.arg_context == ArgContext::Aggregate`.
+    //
+    // The list straddles three dispatch tiers (scalar aggregates,
+    // range-aware, unified array) — `ArgContext` is orthogonal to the
+    // dispatch tier and to `BatchShape` (builtin aggregates remain
+    // `BatchShape::Scalar` because their eval ABI is `fn(&[Value]) -> Value`
+    // per cell after the named-range cache hit; UDFs declaring
+    // `BatchShape::ArrayBatch` register their own `ArgContext::Aggregate`).
+    for name in [
+        // Scalar aggregates (W4-4, W5-58 stats family extras).
+        "SUM",
+        "AVERAGE",
+        "AVG",
+        "COUNT",
+        "COUNTA",
+        "MIN",
+        "MAX",
+        "PRODUCT",
+        "VAR",
+        "VAR.S",
+        "VAR.P",
+        "STDEV",
+        "STDEV.S",
+        "STDEV.P",
+        // Range-aware conditional aggregates (W5-53).
+        "SUMIF",
+        "COUNTIF",
+        // Range-aware lookup family (W5-54).
+        "MATCH",
+        "INDEX",
+        "VLOOKUP",
+        "HLOOKUP",
+        "CHOOSE",
+        // Range-aware conditional-aggregate completion (W5-55).
+        "AVERAGEIF",
+        "SUMIFS",
+        "COUNTIFS",
+        "AVERAGEIFS",
+        "SUMPRODUCT",
+        // Range-aware stats family (W5-58).
+        "LARGE",
+        "SMALL",
+        "RANK",
+        "RANK.EQ",
+        "RANK.AVG",
+        "MEDIAN",
+        "MODE",
+        "MODE.SNGL",
+        // Range-aware text completion (W5-61 polish).
+        "CONCAT",
+        // Unified-ABI array-returning fns (W5-107 / Phase 4.7.N).
+        "TRANSPOSE",
+        "FILTER",
+        // Range-aware conditional-aggregate dispatcher (W5-D-12).
+        "SUBTOTAL",
+        // Phase 4.10 statistical paired-array fns (W5-177, W5-178,
+        // W5-179, W5-D-6).
+        "CORREL",
+        "PEARSON",
+        "RSQ",
+        "STEYX",
+        "SLOPE",
+        "INTERCEPT",
+        "COVARIANCE.P",
+        "COVARIANCE.S",
+        "SUMX2MY2",
+        "SUMX2PY2",
+        "SUMXMY2",
+        // Phase 4.10 financial cash-flow fns (W5-168, W5-174, W5-D-7).
+        "NPV",
+        "IRR",
+        "MIRR",
+        "XNPV",
+        "XIRR",
+        // Phase 4.10 modern lookup fns (W5-169).
+        "XLOOKUP",
+        "XMATCH",
+        // Phase 4.10 order-statistics fns (W5-D-11).
+        "PERCENTILE.INC",
+        "PERCENTILE.EXC",
+        "PERCENTILE",
+        "QUARTILE.INC",
+        "QUARTILE.EXC",
+        "QUARTILE",
+        // Phase 4.10 conditional aggregates / text join (W5-164, W5-167).
+        "MINIFS",
+        "MAXIFS",
+        "COUNTBLANK",
+        "TEXTJOIN",
+    ] {
+        // Some of these names overlap Phase-1 overrides (none currently —
+        // Phase 1 covers NOW/TODAY/RAND/RANDBETWEEN/RANDARRAY +
+        // INDIRECT/OFFSET/INFO/CELL + ROW/COLUMN/ROWS/COLUMNS/ISREF +
+        // ISFORMULA/FORMULATEXT, none of which appear above), but if a
+        // future Phase-1 entry ALSO needs `ArgContext::Aggregate` the
+        // override path is to merge there (set `m.arg_context =
+        // Aggregate` after the volatility/dep-shape fields).
+        //
+        // For now this pass is self-contained: insert directly if absent,
+        // patch arg_context if already present from a prior pass.
+        if let Some(existing) = r.metadata.get_mut(name) {
+            existing.arg_context = ArgContext::Aggregate;
+        } else {
+            let mut m = pure_scalar(name);
+            m.arg_context = ArgContext::Aggregate;
+            r.register_metadata(m).expect(
+                "phase-1.5 aggregate override must not collide with prior \
+                 phase-1 or phase-1.5 entry",
+            );
+        }
     }
 
     // ---- Phase 2: defaults for every other dispatched built-in ----------
@@ -1951,13 +2183,20 @@ mod tests {
     }
 
     /// **Prior `is_address_only_reference_fn` whitelist pin** (was at
-    /// `ql-exec::calcgraph_session:201-203`). ROW/COLUMN/ROWS/COLUMNS/
-    /// ISREF now carry `DepShape::AddressOnly`; the walker's routing
-    /// migrates to a registry lookup in cycle-1 step 3.
+    /// `ql-exec::calcgraph_session:201-203`).
+    ///
+    /// **6.4-1 (2026-05-28; I1):** ISREF moved out of `AddressOnly` to
+    /// `DepShape::LazyShape` — the walker now skips its arg subtree
+    /// entirely rather than routing through `walk_plan_for_address_only_deps`.
+    /// Behavior is preserved (both paths skip value-deps on direct refs,
+    /// LazyShape additionally skips Binary / Unary / Function subtrees
+    /// that `AddressOnly` would still recurse into). The
+    /// `isref_carries_lazy_shape_others_carry_address_only` test below
+    /// pins the new variant assignment.
     #[test]
     fn builtin_metadata_pins_prior_address_only_whitelist() {
         let r = default_registry();
-        for name in &["ROW", "COLUMN", "ROWS", "COLUMNS", "ISREF"] {
+        for name in &["ROW", "COLUMN", "ROWS", "COLUMNS"] {
             let m = r
                 .metadata(name)
                 .unwrap_or_else(|| panic!("{name} must have metadata"));
@@ -1967,6 +2206,13 @@ mod tests {
                 "{name} must be AddressOnly per design § 5.3"
             );
         }
+        // 6.4-1 I1: ISREF is LazyShape now.
+        let isref = r.metadata("ISREF").expect("ISREF must have metadata");
+        assert_eq!(
+            isref.dep_shape,
+            DepShape::LazyShape,
+            "6.4-1 I1: ISREF must be LazyShape (skip-all-arg-walking contract)"
+        );
         // Value-dep reference fns (ISFORMULA / FORMULATEXT) must keep
         // their default `ValueDeps` — the prior whitelist explicitly
         // excluded them and the substrate must preserve that exclusion.
@@ -2001,6 +2247,11 @@ mod tests {
             batch_shape: BatchShape::ArrayBatch,
             arg_policy: ArgPolicy::Strict,
             cancellation: CancelPolicy::WorkerKill,
+            // **6.4-1:** UDFs taking range args declare Aggregate so the
+            // binder admits named-range / range-aware args. This is the
+            // expected shape for Python UDFs registered via
+            // `qb.register_formula_function` against batch-shaped data.
+            arg_context: ArgContext::Aggregate,
             provenance_tags: vec!["python".to_string()],
         };
         assert!(r.register_metadata(meta.clone()).is_ok());
@@ -2032,6 +2283,7 @@ mod tests {
             batch_shape: BatchShape::Scalar,
             arg_policy: ArgPolicy::Coercing,
             cancellation: CancelPolicy::Cooperative,
+            arg_context: ArgContext::Aggregate,
             provenance_tags: vec![],
         };
         let err = r
@@ -2066,6 +2318,7 @@ mod tests {
             batch_shape: BatchShape::Scalar,
             arg_policy: ArgPolicy::Coercing,
             cancellation: CancelPolicy::Cooperative,
+            arg_context: ArgContext::Scalar,
             provenance_tags: vec![],
         };
         r.register_metadata(meta).expect("UDF metadata registers");
@@ -2124,6 +2377,7 @@ mod tests {
             batch_shape: BatchShape::Scalar,
             arg_policy: ArgPolicy::Coercing,
             cancellation: CancelPolicy::Cooperative,
+            arg_context: ArgContext::Scalar,
             provenance_tags: vec![],
         };
         let _ = r.register_metadata(meta);
@@ -2141,6 +2395,179 @@ mod tests {
         assert!(
             r.iter_metadata().any(|m| m.canonical_name == "SUM"),
             "iter_metadata must reach SUM"
+        );
+    }
+
+    // ===== 6.4-1 substrate-completion tests =====================================
+
+    /// **6.4-1 (2026-05-28; M3):** `sorted_metadata` returns entries in
+    /// ascending `canonical_name` order across multiple calls — the
+    /// determinism property the (forthcoming) `list_functions` mapper
+    /// relies on. HashMap iteration order is not stable across runs;
+    /// `sorted_metadata` is the seam the DTO layer reads from.
+    #[test]
+    fn sorted_metadata_is_deterministic_across_calls() {
+        let r = default_registry();
+        let first: Vec<&str> = r.sorted_metadata().iter().map(|m| m.canonical_name.as_str()).collect();
+        let second: Vec<&str> = r.sorted_metadata().iter().map(|m| m.canonical_name.as_str()).collect();
+        assert_eq!(first, second, "sorted_metadata MUST be call-stable");
+        // Strictly ascending.
+        for w in first.windows(2) {
+            assert!(w[0] < w[1], "sorted_metadata violated ordering at {:?} -> {:?}", w[0], w[1]);
+        }
+        // Covers every metadata entry — same len as iter_metadata.
+        assert_eq!(first.len(), r.metadata_count());
+    }
+
+    /// **6.4-1 (2026-05-28; I1):** ISREF carries `DepShape::LazyShape`;
+    /// the address-only batch (ROW / COLUMN / ROWS / COLUMNS) stays
+    /// `AddressOnly`. The walker'\''s migration shims
+    /// (`is_address_only_reference_fn` / `is_lazy_shape_reference_fn`)
+    /// derive from this — flipping ISREF back to AddressOnly here would
+    /// silently regress the LazyShape skip-all-arg-walking contract.
+    #[test]
+    fn isref_carries_lazy_shape_others_carry_address_only() {
+        let r = default_registry();
+        assert_eq!(
+            r.metadata("ISREF").map(|m| m.dep_shape),
+            Some(DepShape::LazyShape),
+            "ISREF must register as LazyShape (the only LazyShape builtin in v1)"
+        );
+        for name in ["ROW", "COLUMN", "ROWS", "COLUMNS"] {
+            assert_eq!(
+                r.metadata(name).map(|m| m.dep_shape),
+                Some(DepShape::AddressOnly),
+                "{} must register as AddressOnly (eager + skip value-deps on direct refs)",
+                name,
+            );
+        }
+        // ISFORMULA / FORMULATEXT are Eager + workbook query → ValueDeps.
+        for name in ["ISFORMULA", "FORMULATEXT"] {
+            assert_eq!(
+                r.metadata(name).map(|m| m.dep_shape),
+                Some(DepShape::ValueDeps),
+                "{} keeps value-deps (formula-status access; design § 8 R8)",
+                name,
+            );
+        }
+    }
+
+    /// **6.4-1 (2026-05-28; H1):** all 7 reference-aware names carry
+    /// `ArgContext::Reference`, and a sample of the ~66 aggregate-list
+    /// names carry `ArgContext::Aggregate`. Spelling drift in the
+    /// Phase-1.5 override list (mirror of the pre-6.4-1 `matches!`
+    /// whitelist at `ql-exec::plan::is_aggregate_function`) is caught
+    /// here.
+    #[test]
+    fn arg_context_overrides_match_pre_6_4_1_whitelists() {
+        let r = default_registry();
+        // Reference-aware (7 names — Phase 1 in `register_builtin_metadata`).
+        for name in ["ROW", "COLUMN", "ROWS", "COLUMNS", "ISREF", "ISFORMULA", "FORMULATEXT"] {
+            assert_eq!(
+                r.metadata(name).map(|m| m.arg_context),
+                Some(ArgContext::Reference),
+                "{} must register ArgContext::Reference (binder admits literal refs)",
+                name,
+            );
+        }
+        // Aggregate sample (covers scalar aggregates, range-aware, unified array,
+        // financial, statistical, lookup, order stats — one from each subgroup).
+        for name in [
+            "SUM", "AVERAGE", "VLOOKUP", "SUMIFS", "TRANSPOSE", "FILTER", "SUBTOTAL",
+            "CORREL", "XIRR", "XLOOKUP", "PERCENTILE.INC", "MINIFS", "TEXTJOIN",
+        ] {
+            assert_eq!(
+                r.metadata(name).map(|m| m.arg_context),
+                Some(ArgContext::Aggregate),
+                "{} must register ArgContext::Aggregate (binder admits range args; \
+                 mirror of pre-6.4-1 `ql-exec::plan::is_aggregate_function` whitelist)",
+                name,
+            );
+        }
+        // Sample non-aggregate scalars stay Scalar (the binder rejects range args).
+        for name in ["ABS", "SQRT", "IF", "ROUND", "LEN"] {
+            assert_eq!(
+                r.metadata(name).map(|m| m.arg_context),
+                Some(ArgContext::Scalar),
+                "{} must register ArgContext::Scalar (pure scalar; binder rejects ranges)",
+                name,
+            );
+        }
+    }
+
+    /// **6.4-1 (2026-05-28; H3):** `fn_generation()` ticks monotonically
+    /// on `register_metadata` / `unregister_metadata` success only. The
+    /// `PlanCache` reads this value into `PlanCacheKey::fn_gen`; a tick
+    /// invalidates every plan bound before the tick → next eval re-binds
+    /// against current metadata. Closes the contract §10.3
+    /// "re-extract deps" half.
+    #[test]
+    fn fn_gen_ticks_on_successful_register_and_unregister() {
+        let mut r = default_registry();
+        let initial = r.fn_generation();
+        assert!(initial > 0, "default_registry runs ~260+ register_metadata calls at boot");
+
+        // Successful register bumps once.
+        let meta = FunctionMetadata {
+            canonical_name: "MYUDF1".to_string(),
+            display_name: None,
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Pure,
+            determinism: true,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::ArrayBatch,
+            arg_policy: ArgPolicy::Coercing,
+            cancellation: CancelPolicy::WorkerKill,
+            arg_context: ArgContext::Aggregate,
+            provenance_tags: vec![],
+        };
+        r.register_metadata(meta).unwrap();
+        assert_eq!(r.fn_generation(), initial + 1, "register_metadata MUST bump fn_gen");
+
+        // Successful unregister bumps again.
+        r.unregister_metadata("MYUDF1").unwrap();
+        assert_eq!(r.fn_generation(), initial + 2, "unregister_metadata MUST bump fn_gen");
+
+        // Failed register (Conflict) MUST NOT bump.
+        let snapshot = r.fn_generation();
+        let dup = FunctionMetadata {
+            canonical_name: "SUM".to_string(),
+            display_name: None,
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Pure,
+            determinism: true,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::Scalar,
+            arg_policy: ArgPolicy::Coercing,
+            cancellation: CancelPolicy::Cooperative,
+            arg_context: ArgContext::Aggregate,
+            provenance_tags: vec![],
+        };
+        assert!(r.register_metadata(dup).is_err());
+        assert_eq!(
+            r.fn_generation(),
+            snapshot,
+            "failed register_metadata (Conflict) MUST leave fn_gen untouched"
+        );
+
+        // Failed unregister (NotFound) MUST NOT bump.
+        let snapshot = r.fn_generation();
+        assert!(r.unregister_metadata("DOES_NOT_EXIST").is_err());
+        assert_eq!(
+            r.fn_generation(),
+            snapshot,
+            "failed unregister_metadata (NotFound) MUST leave fn_gen untouched"
+        );
+
+        // Failed unregister (Conflict — builtin guard) MUST NOT bump either.
+        let snapshot = r.fn_generation();
+        assert!(r.unregister_metadata("SUM").is_err());
+        assert_eq!(
+            r.fn_generation(),
+            snapshot,
+            "failed unregister_metadata (builtin Conflict) MUST leave fn_gen untouched"
         );
     }
 }

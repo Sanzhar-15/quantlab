@@ -24,9 +24,9 @@ use ql_types::{Address, ErrorValue, Range, Value};
 fn eval_with_map(src: &str) -> Value {
     let tokens = lex(src).expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = MapEnv::new();
-    let reg = default_registry();
     eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache)
 }
 
@@ -119,9 +119,9 @@ fn isref_of_named_range_returns_true() {
 
     let tokens = lex("ISREF(MyRange)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb).expect("bind");
-    let env = MapEnv::new();
     let reg = default_registry();
+    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb, &reg).expect("bind");
+    let env = MapEnv::new();
     // NameRef resolves through binder to AggregateNameRef → PlanKind::RangeRef.
     assert_eq!(
         eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),
@@ -142,9 +142,9 @@ fn isformula_of_formula_cell_returns_true() {
 
     let tokens = lex("ISFORMULA(B2)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     assert_eq!(
         eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),
         Value::Boolean(true)
@@ -159,9 +159,9 @@ fn isformula_of_literal_cell_returns_false() {
 
     let tokens = lex("ISFORMULA(B2)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     assert_eq!(
         eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),
         Value::Boolean(false)
@@ -174,9 +174,9 @@ fn isformula_of_blank_cell_returns_false() {
     // No content at B2.
     let tokens = lex("ISFORMULA(B2)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     assert_eq!(
         eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),
         Value::Boolean(false)
@@ -188,9 +188,9 @@ fn isformula_of_multi_cell_range_returns_na() {
     let wb = workbook_with_sheet();
     let tokens = lex("ISFORMULA(A1:B3)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     // Microsoft canon: multi-cell ref → #N/A.
     assert_eq!(
         eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),
@@ -254,9 +254,9 @@ fn isformula_of_named_cell_pointing_at_formula_returns_true() {
 
     let tokens = lex("ISFORMULA(MyCell)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb).expect("bind");
-    let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
     let reg = default_registry();
+    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb, &reg).expect("bind");
+    let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
     // 1×1 range → treated as single-cell → ISFORMULA queries A1 →
     // formula present → TRUE.
     assert_eq!(
@@ -276,7 +276,8 @@ fn isformula_of_named_cell_pointing_at_formula_returns_true() {
 fn isref_of_sum_literal_range_bind_fails_v1_scope() {
     let tokens = lex("ISREF(SUM(A1:A3))").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let result = ql_exec::bind(&ast, 0);
+    let reg = default_registry();
+    let result = ql_exec::bind(&ast, 0, &reg);
     assert!(
         result.is_err(),
         "v1 scope: ISREF(SUM(A1:A3)) bind-fails per S1-MED-γ AggregateArg \
@@ -289,7 +290,8 @@ fn isref_of_sum_literal_range_bind_fails_v1_scope() {
 fn isformula_of_sum_literal_range_bind_fails_v1_scope() {
     let tokens = lex("ISFORMULA(SUM(A1:A3))").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let result = ql_exec::bind(&ast, 0);
+    let reg = default_registry();
+    let result = ql_exec::bind(&ast, 0, &reg);
     assert!(
         result.is_err(),
         "v1 scope: ISFORMULA(SUM(A1:A3)) bind-fails per S1-MED-γ \
@@ -312,9 +314,9 @@ fn isformula_of_cell_with_error_value_returns_false() {
 
     let tokens = lex("ISFORMULA(A1)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     // Cell holds an error but is NOT a formula → ISFORMULA returns FALSE.
     // (Pre-S3-HIGH-1 fix returned `#N/A` instead.)
     assert_eq!(
@@ -337,9 +339,9 @@ fn row_of_cell_with_error_value_returns_row_index() {
 
     let tokens = lex("ROW(A1)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     // Per Excel canon: ROW looks at the address, ignores the cell's value.
     assert_eq!(
         eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),
@@ -374,9 +376,9 @@ fn isformula_self_reference_returns_false_during_set_formula_v1_pin() {
     // when A1's formula isn't yet installed.
     let tokens = lex("ISFORMULA(A1)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 0, 0));
-    let reg = default_registry();
     // Pre-installation: A1 has no formula stored → ISFORMULA returns
     // FALSE. This is the producer-side result for
     // `set_formula(A1, "=ISFORMULA(A1)")`.
@@ -418,9 +420,9 @@ fn isformula_cross_sheet_returns_correct_status() {
 
     let tokens = lex("ISFORMULA(S1!A1)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb).expect("bind");
-    let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
     let reg = default_registry();
+    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb, &reg).expect("bind");
+    let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
     // Cross-sheet ISFORMULA → TRUE for the formula cell.
     assert_eq!(
         eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),

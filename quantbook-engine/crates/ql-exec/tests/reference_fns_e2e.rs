@@ -19,9 +19,9 @@ use ql_types::{ErrorValue, Value};
 fn eval_with_map(src: &str) -> Value {
     let tokens = lex(src).expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = MapEnv::new();
-    let reg = default_registry();
     eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache)
 }
 
@@ -218,9 +218,9 @@ fn row_of_multi_cell_range_at_cell_boundary_returns_calc_error() {
     // BEFORE the per-fn impl runs.
     let tokens = lex("ROW(A1:B3)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = MapEnv::new();
-    let reg = default_registry();
     match eval_at_cell_boundary(&plan, &env, &reg, &NoAggregateCache) {
         EvalResult::Scalar(Value::Error(ErrorValue::Calc)) => {}
         other => panic!("expected #CALC! at cell boundary, got {other:?}"),
@@ -233,9 +233,9 @@ fn row_of_single_cell_range_at_cell_boundary_returns_top_left() {
     // per-fn returns top-left = 5.
     let tokens = lex("ROW(A5:A5)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = MapEnv::new();
-    let reg = default_registry();
     match eval_at_cell_boundary(&plan, &env, &reg, &NoAggregateCache) {
         EvalResult::Scalar(v) => assert_eq!(v, Value::number(5.0)),
         other => panic!("expected Scalar(5), got {other:?}"),
@@ -246,9 +246,9 @@ fn row_of_single_cell_range_at_cell_boundary_returns_top_left() {
 fn column_of_multi_cell_range_at_cell_boundary_returns_calc_error() {
     let tokens = lex("COLUMN(A1:C1)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = MapEnv::new();
-    let reg = default_registry();
     match eval_at_cell_boundary(&plan, &env, &reg, &NoAggregateCache) {
         EvalResult::Scalar(Value::Error(ErrorValue::Calc)) => {}
         other => panic!("expected #CALC!, got {other:?}"),

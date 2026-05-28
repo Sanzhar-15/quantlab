@@ -348,7 +348,7 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                         _ => None,
                     };
                     if let Some(range) = single_range_arg {
-                        if crate::plan::is_aggregate_function(name) {
+                        if crate::plan::is_aggregate_function(registry, name) {
                             if let Some(cached) = cache.lookup_aggregate(range, name) {
                                 return cached;
                             }
@@ -380,7 +380,7 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 | ExprPlan::StructuredRef { .. }
                         )
                     });
-                    if has_range_or_array_arg && crate::plan::is_aggregate_function(name) {
+                    if has_range_or_array_arg && crate::plan::is_aggregate_function(registry, name) {
                         // Multi-range / mixed aggregate args: materialize
                         // every range AND every array literal, then call
                         // the function. No cache use (V2 may add multi-
@@ -1073,11 +1073,17 @@ fn eval_unary(op: Operator, operand: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, LazyLock};
+
     use super::*;
     use crate::env::MapEnv;
     use crate::plan::bind;
     use ql_formula_syntax::{CellAddr, Expr, SheetRef};
-    use std::sync::Arc;
+
+    /// **6.4-1 (2026-05-28; H1):** shared default registry for binder calls
+    /// in these tests. Lazily constructed (one-time builtin-metadata pop).
+    static TEST_REGISTRY: LazyLock<FunctionRegistry> =
+        LazyLock::new(ql_functions::default_registry);
 
     fn cell_ref(col: u32, row: u32) -> Expr {
         Expr::CellRef(CellAddr {
@@ -1102,7 +1108,7 @@ mod tests {
     }
 
     fn eval(expr: &Expr, env: &MapEnv) -> Value {
-        let plan = bind(expr, 0).expect("bind");
+        let plan = bind(expr, 0, &TEST_REGISTRY).expect("bind");
         eval_scalar(&plan, env)
     }
 
@@ -1402,7 +1408,7 @@ mod tests {
     // ===== W4-5: function dispatch via registry =====
 
     fn eval_reg(expr: &Expr, env: &MapEnv, reg: &FunctionRegistry) -> Value {
-        let plan = bind(expr, 0).expect("bind");
+        let plan = bind(expr, 0, &TEST_REGISTRY).expect("bind");
         eval_scalar_with_registry(&plan, env, reg)
     }
 
@@ -1414,7 +1420,7 @@ mod tests {
             name: Arc::from("SUM"),
             args: vec![n(1.0), n(2.0)],
         };
-        let plan = bind(&expr, 0).unwrap();
+        let plan = bind(&expr, 0, &TEST_REGISTRY).unwrap();
         assert_eq!(eval_scalar(&plan, &env), Value::Error(ErrorValue::Name));
     }
 
@@ -1788,7 +1794,7 @@ mod tests {
         };
         // Bind + call directly (eval_reg in this test mod takes &MapEnv;
         // we need the generic path for a custom env).
-        let plan = crate::plan::bind(&expr, 0).unwrap();
+        let plan = crate::plan::bind(&expr, 0, &TEST_REGISTRY).unwrap();
         let result = eval_scalar_with_registry(&plan, &env, &reg);
         // Env overrides date_system → 1904.
         assert_eq!(result, Value::Number(1904.0));

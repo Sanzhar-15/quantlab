@@ -45,7 +45,10 @@ fn build_mul2_plan_for(row: u32) -> ExprPlan {
         })),
         rhs: Box::new(Expr::Number(2.0)),
     };
-    bind(&expr, 0).unwrap()
+    // 6.4-1 (H1): binder now takes &FunctionRegistry. Bench formula has no
+    // function calls so a fresh empty/default registry is sufficient.
+    let registry = default_registry();
+    bind(&expr, 0, &registry).unwrap()
 }
 
 fn bench_og04_scalar_1m_mul2(c: &mut Criterion) {

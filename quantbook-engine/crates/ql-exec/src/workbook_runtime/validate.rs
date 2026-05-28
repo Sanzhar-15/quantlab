@@ -84,6 +84,7 @@ impl<'a> WorkbookRuntime<'a> {
             self.workbook,
             self.workbook,
             self.workbook,
+            self.registry,
         )?;
         // **W5-117 (Phase 4.8.G.2):** carry cell for `[@Col]` narrowing.
         let env =
@@ -118,11 +119,20 @@ impl<'a> WorkbookRuntime<'a> {
 
 #[cfg(test)]
 mod tests {
-    use ql_functions::default_registry;
+    use std::sync::LazyLock;
+
+    use ql_functions::{default_registry, FunctionRegistry};
     use ql_storage::Workbook;
     use ql_types::{ErrorValue, Value};
 
     use crate::workbook_runtime::{RuntimeError, WorkbookRuntime};
+
+    /// **6.4-1 (2026-05-28; H1):** shared default registry — see
+    /// `crates/ql-exec/src/plan.rs::tests::TEST_REGISTRY` for the
+    /// pattern. The W5-D-13.1 / aggregate-list invariant tests still
+    /// pin the matcher; the matcher now reads metadata so they look up
+    /// against this same default registry instance.
+    static TEST_REGISTRY: LazyLock<FunctionRegistry> = LazyLock::new(default_registry);
 
     fn make_runtime_workbook() -> Workbook {
         let mut wb = Workbook::new();
@@ -547,7 +557,7 @@ mod tests {
             if exceptions.contains(&name) {
                 continue;
             }
-            if !is_aggregate_function(name) {
+            if !is_aggregate_function(&TEST_REGISTRY, name) {
                 missing.push(name);
             }
         }

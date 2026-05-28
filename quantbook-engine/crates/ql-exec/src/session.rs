@@ -618,6 +618,7 @@ impl WorkbookSession {
             &self.workbook,
             &self.workbook,
             &self.workbook,
+            &self.registry,
         )
         .map_err(|e| EngineError::new(ErrorClass::Compute, "formula_bind", e.to_string()))?;
         Ok(canonical)
@@ -1357,6 +1358,7 @@ impl EngineSession for WorkbookSession {
             &self.workbook,
             &self.workbook,
             &self.workbook,
+            &self.registry,
         ) {
             Ok(_plan) => Ok(Vec::new()),
             Err(e) => Ok(diag("formula_bind", e.to_string())),
@@ -2820,6 +2822,39 @@ fn map_csv_err(e: ql_io_csv::CsvError) -> EngineError {
             EngineError::new(ErrorClass::Internal, "csv_sheet_not_found", display)
         }
         _ => EngineError::new(ErrorClass::Internal, "unmapped_csv_error", display),
+    }
+}
+
+/// **6.4-1 (2026-05-28; M5):** map `FunctionRegistryError` to the
+/// binding-neutral `EngineError` taxonomy. Used by the (forthcoming, 6.4)
+/// `WorkbookSession::register_function` / `unregister_function` /
+/// `list_functions` trait methods to translate the registry-level error
+/// into the contract §10.3 caller-visible codes
+/// (`function_exists` / `function_not_found`). Mirrors the
+/// `map_runtime_err` / `map_persistence_err` / `map_xlsx_err` / `map_csv_err`
+/// pattern — one mapper per Appendix-A row family, exhaustive match, never
+/// a silent default.
+///
+/// Both registry-level variants land in this mapper:
+/// - `Conflict { name }` → `Conflict` / `function_exists`. The substrate's
+///   `unregister_metadata` builtin-guard (6.4-0 audit-fix) ALSO returns
+///   `Conflict` (with a different message) to signal that a built-in's
+///   metadata can'\''t be removed — both surface here as the same caller-
+///   visible code; the message disambiguates.
+/// - `NotFound { name }` → `NotFound` / `function_not_found`. Matches the
+///   contract §10.3 wording exactly.
+///
+/// No `_ => unmapped_*_error` arm because `FunctionRegistryError` is a
+/// closed enum we own — adding a new variant without a mapping should
+/// surface as a compile error at this match, not a silent runtime
+/// catch-all.
+#[allow(dead_code)] // wired by 6.4-2 `register_function`/`unregister_function`/`list_functions`
+fn map_function_registry_err(e: ql_functions::FunctionRegistryError) -> EngineError {
+    use ql_functions::FunctionRegistryError as F;
+    let display = e.to_string();
+    match e {
+        F::Conflict { .. } => EngineError::new(ErrorClass::Conflict, "function_exists", display),
+        F::NotFound { .. } => EngineError::new(ErrorClass::NotFound, "function_not_found", display),
     }
 }
 

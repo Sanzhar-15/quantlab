@@ -222,6 +222,7 @@ impl<'a> WorkbookTransaction<'a> {
             self.workbook,
             self.workbook,
             self.workbook,
+            self.registry,
         )?;
         self.ops.push(PendingOp::Formula {
             sheet,

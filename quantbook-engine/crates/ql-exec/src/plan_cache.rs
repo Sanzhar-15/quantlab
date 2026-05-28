@@ -57,6 +57,17 @@ use crate::plan::ExprPlan;
 /// - `name_gen` — `NameTable::generation()` at the moment of bind. A
 ///   subsequent name registration / removal bumps this, so old plans
 ///   become unreachable.
+/// - `fn_gen` (6.4-1 H3) — `FunctionRegistry::fn_generation()` at the
+///   moment of bind. The 6.4-0 substrate moved volatility / dep-shape /
+///   arg-context routing to first-class metadata; a UDF
+///   `register_metadata` / `unregister_metadata` call at runtime would
+///   change the bind result for any formula referencing that function
+///   name (volatility flag, dep walker routing, binder arg-ctx).
+///   Bumping `fn_gen` on every metadata mutation forces a cache miss on
+///   next lookup → re-bind → fresh `FormulaDeps` against the current
+///   metadata. Closes the `re-extract deps` half of contract §10.3 (the
+///   6.4-0 substrate hooks dirty + reschedule; `fn_gen` invalidates the
+///   bind cache). Mirrors the `name_gen` pattern byte-for-byte.
 /// - `cell_anchor` (W5-150) — `Some((row, col))` when the bind result is
 ///   cell-anchor-dependent, `None` otherwise. Set by callers when the
 ///   canonical text contains `@` (implicit intersection narrows
@@ -70,6 +81,9 @@ pub struct PlanCacheKey {
     pub text: Arc<str>,
     pub sheet: SheetId,
     pub name_gen: u64,
+    /// **6.4-1 (2026-05-28; H3):** metadata-table generation; see the
+    /// type-level docstring for the contract §10.3 closure rationale.
+    pub fn_gen: u64,
     pub cell_anchor: Option<(RowId, ColId)>,
 }
 
@@ -190,6 +204,12 @@ mod tests {
             text: Arc::from(text),
             sheet,
             name_gen,
+            // **6.4-1 (2026-05-28; H3):** test helper pins `fn_gen = 0`
+            // because the plan_cache unit tests don'\''t mutate function
+            // metadata; the cross-tier integration tests at
+            // `WorkbookSession::register_function` (6.4) exercise the
+            // cache-invalidation pathway end-to-end.
+            fn_gen: 0,
             cell_anchor: None,
         }
     }

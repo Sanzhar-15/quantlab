@@ -29,7 +29,8 @@ use ql_types::{ErrorValue, Value};
 fn eval_source_scalar(src: &str, cells: &[((u16, u32, u32), Value)]) -> Value {
     let tokens = lex(src).expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = bind(&ast, 0).expect("bind");
+    let reg = default_registry();
+    let plan = bind(&ast, 0, &reg).expect("bind");
     let mut env = MapEnv::new();
     for ((s, r, c), v) in cells {
         env.put(*s, *r, *c, v.clone());
@@ -40,13 +41,13 @@ fn eval_source_scalar(src: &str, cells: &[((u16, u32, u32), Value)]) -> Value {
 fn eval_source_with_registry(src: &str, cells: &[((u16, u32, u32), Value)]) -> Value {
     let tokens = lex(src).expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = bind(&ast, 0).expect("bind");
+    let reg = default_registry();
+    let plan = bind(&ast, 0, &reg).expect("bind");
     let mut env = MapEnv::new();
     for ((s, r, c), v) in cells {
         env.put(*s, *r, *c, v.clone());
     }
-    let registry = default_registry();
-    eval_scalar_with_registry(&plan, &env, &registry)
+    eval_scalar_with_registry(&plan, &env, &reg)
 }
 
 // ===== scalar E2E =====
@@ -220,7 +221,7 @@ fn e2e_switch_type_strict_no_match() {
 // ===== W5-164 (Phase 4.10.B) — Conditional-aggregate fillins e2e =====
 //
 // These functions take Range args which need named-range or table-ref
-// bindings to work through the lightweight `bind(&ast, 0)` test
+// bindings to work through the lightweight `bind(&ast, 0, &reg)` test
 // helper. The unit tests in range_fns::tests cover the function
 // contracts directly; this e2e proves they're discoverable via the
 // registry (smoke test only).
@@ -447,7 +448,7 @@ fn e2e_textjoin_registered() {
 
 #[test]
 fn e2e_vdb_depreciation() {
-    // W5-183: VDB is ScalarFn; evaluable through `bind(&ast, 0)`.
+    // W5-183: VDB is ScalarFn; evaluable through `bind(&ast, 0, &reg)`.
     // Microsoft docs first-year example: VDB(2400, 300, 10, 0, 1) = 480.
     let result = eval_source_with_registry("VDB(2400, 300, 10, 0, 1)", &[]);
     assert_eq!(result, Value::Number(480.0));
@@ -464,7 +465,7 @@ fn e2e_vdb_depreciation() {
 
 #[test]
 fn e2e_db_depreciation() {
-    // W5-182: DB is ScalarFn; evaluable through `bind(&ast, 0)`.
+    // W5-182: DB is ScalarFn; evaluable through `bind(&ast, 0, &reg)`.
     // Microsoft docs first-period example: rate=0.319; result =
     // 1_000_000 * 0.319 * 7/12 = 186083.333...
     let expected = 1_000_000.0
@@ -483,7 +484,7 @@ fn e2e_db_depreciation() {
 
 #[test]
 fn e2e_ddb_depreciation() {
-    // W5-181: DDB is ScalarFn; evaluable through `bind(&ast, 0)`.
+    // W5-181: DDB is ScalarFn; evaluable through `bind(&ast, 0, &reg)`.
     // Microsoft docs example: DDB(2400, 300, 10, 1) = 480.
     let result = eval_source_with_registry("DDB(2400, 300, 10, 1)", &[]);
     assert_eq!(result, Value::Number(480.0));
@@ -495,7 +496,7 @@ fn e2e_ddb_depreciation() {
 #[test]
 fn e2e_sln_syd_depreciation() {
     // W5-180: SLN + SYD are ScalarFns; we can evaluate them directly
-    // through the lightweight `bind(&ast, 0)` test helper (no range
+    // through the lightweight `bind(&ast, 0, &reg)` test helper (no range
     // construction needed).
     // SLN(30000, 7500, 10) = 2250 (Microsoft docs example).
     let result = eval_source_with_registry("SLN(30000, 7500, 10)", &[]);
@@ -529,7 +530,7 @@ fn e2e_pearson_rsq_steyx_registered() {
 fn e2e_slope_intercept_registered() {
     // W5-178: SLOPE + INTERCEPT are RangeAwareFns; registry-lookup
     // smoke check per the W5-176 / W5-177 pattern (range-arg
-    // construction not reachable via `bind(&ast, 0)` without
+    // construction not reachable via `bind(&ast, 0, &reg)` without
     // named-range scaffolding).
     let registry = default_registry();
     assert!(registry.lookup_range_aware("SLOPE").is_some());
@@ -541,7 +542,7 @@ fn e2e_slope_intercept_registered() {
 #[test]
 fn e2e_correl_registered() {
     // W5-177: CORREL is RangeAwareFn; range-arg construction can't go
-    // through the lightweight `bind(&ast, 0)` test helper without
+    // through the lightweight `bind(&ast, 0, &reg)` test helper without
     // named-range / table-ref scaffolding. Smoke-check via registry
     // dispatch (same pattern as XLOOKUP / XMATCH / TEXTJOIN / MIRR).
     let registry = default_registry();
@@ -816,7 +817,7 @@ fn e2e_subtotal_invalid_function_num_is_value_error() {
 #[test]
 fn e2e_mirr_registered() {
     // W5-174: MIRR is RangeAwareFn; range-arg construction can't go
-    // through the lightweight `bind(&ast, 0)` test helper without
+    // through the lightweight `bind(&ast, 0, &reg)` test helper without
     // named-range / table-ref scaffolding, so we smoke-check via
     // registry dispatch (same pattern as XLOOKUP / XMATCH / TEXTJOIN).
     let registry = default_registry();
@@ -946,7 +947,8 @@ fn e2e_og02_source_to_simd_dispatch() {
     let src = "A1 * 2";
     let tokens = lex(src).expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = bind(&ast, 0).expect("bind");
+    let reg = default_registry();
+    let plan = bind(&ast, 0, &reg).expect("bind");
 
     let shape = classify(&plan);
     assert!(matches!(
@@ -979,7 +981,8 @@ fn e2e_og02_bare_column_bind_unsupported_in_phase_0() {
     use ql_exec::BindError;
     let src = "A * 2";
     let ast = parse(lex(src).unwrap()).unwrap();
-    let result = bind(&ast, 0);
+    let reg = default_registry();
+    let result = bind(&ast, 0, &reg);
     assert!(matches!(result, Err(BindError::UnsupportedVariant(_))));
 }
 

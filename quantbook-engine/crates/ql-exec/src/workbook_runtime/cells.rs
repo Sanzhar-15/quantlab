@@ -114,6 +114,7 @@ impl<'a> WorkbookRuntime<'a> {
         // cache continues to share plans across cells (preserves
         // the SUM(A1:A10)-across-rows fast path).
         let name_gen = self.workbook.names().generation();
+        let fn_gen = self.registry.fn_generation();
         let cell_anchor = if canonical_text.contains('@') {
             Some((row, col))
         } else {
@@ -123,6 +124,7 @@ impl<'a> WorkbookRuntime<'a> {
             text: Arc::clone(&canonical_text),
             sheet,
             name_gen,
+            fn_gen,
             cell_anchor,
         };
         let plan: Arc<crate::plan::ExprPlan> =
@@ -138,6 +140,7 @@ impl<'a> WorkbookRuntime<'a> {
                         self.workbook,
                         self.workbook,
                         self.workbook,
+                        self.registry,
                     )?)
                 })?;
 
@@ -519,6 +522,7 @@ impl<'a> WorkbookRuntime<'a> {
         // mutations (reextract_deps).
         for (node, reader_sheet, reader_row, reader_col, text) in reader_info {
             let name_gen = self.workbook.names().generation();
+            let fn_gen = self.registry.fn_generation();
             // **W5-150 (Phase 4.9.O HIGH-1):** cell-aware key when `@`
             // is present (see set_formula for rationale).
             let cell_anchor = if text.contains('@') {
@@ -530,6 +534,7 @@ impl<'a> WorkbookRuntime<'a> {
                 text: Arc::clone(&text),
                 sheet: reader_sheet,
                 name_gen,
+                fn_gen,
                 cell_anchor,
             };
             let plan: Arc<crate::plan::ExprPlan> = match self
@@ -548,6 +553,7 @@ impl<'a> WorkbookRuntime<'a> {
                         self.workbook,
                         self.workbook,
                         self.workbook,
+                        self.registry,
                     )?)
                 }) {
                 Ok(p) => p,

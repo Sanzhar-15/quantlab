@@ -24,9 +24,9 @@ use ql_types::{ErrorValue, Value};
 fn eval(src: &str) -> Value {
     let tokens = lex(src).expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = MapEnv::new();
-    let reg = default_registry();
     eval_scalar_with_registry(&plan, &env, &reg)
 }
 

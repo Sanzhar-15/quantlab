@@ -25,9 +25,9 @@ use ql_types::{Address, ErrorValue, Range, Value};
 fn eval_with_map(src: &str) -> Value {
     let tokens = lex(src).expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = MapEnv::new();
-    let reg = default_registry();
     eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache)
 }
 
@@ -56,9 +56,9 @@ fn formulatext_of_formula_cell_returns_text_with_leading_eq() {
 
     let tokens = lex("FORMULATEXT(A1)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     let result = eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache);
 
     // Excel canon: FORMULATEXT returns the formula WITH leading `=`.
@@ -81,9 +81,9 @@ fn formulatext_of_complex_formula_returns_canonical_text() {
 
     let tokens = lex("FORMULATEXT(B2)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     let result = eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache);
     match result {
         Value::Text(text) => {
@@ -106,9 +106,9 @@ fn formulatext_of_literal_cell_returns_na() {
 
     let tokens = lex("FORMULATEXT(A1)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     assert_eq!(
         eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),
         Value::Error(ErrorValue::NA)
@@ -120,9 +120,9 @@ fn formulatext_of_blank_cell_returns_na() {
     let wb = workbook_with_sheet();
     let tokens = lex("FORMULATEXT(A1)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     assert_eq!(
         eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),
         Value::Error(ErrorValue::NA)
@@ -137,9 +137,9 @@ fn formulatext_of_1x1_range_pointing_at_formula_returns_text() {
     // FORMULATEXT(A1:A1) — 1×1 range → treated as single-cell.
     let tokens = lex("FORMULATEXT(A1:A1)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     let result = eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache);
     match result {
         Value::Text(text) => assert_eq!(text.as_ref(), "=1+2"),
@@ -152,9 +152,9 @@ fn formulatext_of_multi_cell_range_returns_na() {
     let wb = workbook_with_sheet();
     let tokens = lex("FORMULATEXT(A1:B3)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     // Microsoft canon: multi-cell ref → #N/A (vs IronCalc's #ERROR!).
     assert_eq!(
         eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),
@@ -213,9 +213,9 @@ fn formulatext_of_cell_with_error_value_returns_na_not_propagated_error() {
 
     let tokens = lex("FORMULATEXT(A1)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
-    let reg = default_registry();
     // No formula at A1 → #N/A (NOT #DIV/0! from A1's value).
     assert_eq!(
         eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),
@@ -248,9 +248,9 @@ fn formulatext_cross_sheet_returns_text() {
 
     let tokens = lex("FORMULATEXT(S1!B5)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb).expect("bind");
-    let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
     let reg = default_registry();
+    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb, &reg).expect("bind");
+    let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
     match eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache) {
         Value::Text(text) => assert_eq!(text.as_ref(), "=A1*2"),
         other => panic!("expected Text(\"=A1*2\"), got {other:?}"),
@@ -266,9 +266,9 @@ fn formulatext_of_named_cell_pointing_at_formula_returns_text() {
 
     let tokens = lex("FORMULATEXT(MyCell)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb).expect("bind");
-    let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
     let reg = default_registry();
+    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb, &reg).expect("bind");
+    let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 4, 4));
     match eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache) {
         Value::Text(text) => assert_eq!(text.as_ref(), "=1+2"),
         other => panic!("expected Text(\"=1+2\"), got {other:?}"),
@@ -281,7 +281,8 @@ fn formulatext_of_sum_literal_range_bind_fails_v1_scope() {
     // S1-MED-γ AggregateArg defer.
     let tokens = lex("FORMULATEXT(SUM(A1:A3))").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let result = ql_exec::bind(&ast, 0);
+    let reg = default_registry();
+    let result = ql_exec::bind(&ast, 0, &reg);
     assert!(
         result.is_err(),
         "v1 scope: FORMULATEXT(SUM(A1:A3)) bind-fails per S1-MED-γ \
@@ -306,9 +307,9 @@ fn formulatext_self_reference_returns_na_during_set_formula_v1_pin() {
     let wb = workbook_with_sheet();
     let tokens = lex("FORMULATEXT(A1)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = ql_exec::bind(&ast, 0).expect("bind");
+        let reg = default_registry();
+let plan = ql_exec::bind(&ast, 0, &reg).expect("bind");
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 0, 0));
-    let reg = default_registry();
     // Pre-installation: A1 has no formula → FORMULATEXT returns #N/A.
     // This is the producer-side result for set_formula(A1, "=FORMULATEXT(A1)").
     // Replay-side would return Text("=FORMULATEXT(A1)") since op-log

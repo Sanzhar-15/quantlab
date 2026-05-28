@@ -30,7 +30,8 @@ fn workbook_with_two_sheets() -> Workbook {
 fn parse_and_bind_with_workbook(src: &str, wb: &Workbook) -> ql_exec::ExprPlan {
     let tokens = lex(src).expect("lex");
     let ast = parse(tokens).expect("parse");
-    bind_with_names_and_sheets(&ast, 0, wb, wb).expect("bind")
+    let reg = default_registry();
+    bind_with_names_and_sheets(&ast, 0, wb, wb, &reg).expect("bind")
 }
 
 // ---------------------------------------------------------------------
@@ -167,7 +168,8 @@ fn row_zero_arg_with_formula_cell_via_workbook_env_returns_row() {
     // Bind `ROW()` (no arg).
     let tokens = lex("ROW()").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb).expect("bind");
+    let reg = default_registry();
+    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb, &reg).expect("bind");
 
     // Construct a WorkbookEnv with formula_cell = Sheet1!B3 (row 2, col 1).
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 2, 1));
@@ -186,10 +188,10 @@ fn column_zero_arg_with_formula_cell_via_workbook_env_returns_col() {
 
     let tokens = lex("COLUMN()").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb).expect("bind");
+    let reg = default_registry();
+    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb, &reg).expect("bind");
 
     let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 7, 4));
-    let reg = default_registry();
     // COLUMN() at E8 = 5 (col 4 + 1).
     assert_eq!(
         eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),
@@ -210,9 +212,8 @@ fn row_zero_arg_evaluates_per_cell_via_plan_cache_sharing() {
 
     let tokens = lex("ROW()").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb).expect("bind");
     let reg = default_registry();
-
+    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb, &reg).expect("bind");
     // Env at row 2 → ROW() = 3.
     let env_b3 = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 2, 1));
     assert_eq!(
@@ -244,7 +245,8 @@ fn row_of_sum_literal_range_bind_fails_v1_scope() {
     let wb = workbook_with_two_sheets();
     let tokens = lex("ROW(SUM(A1:A3))").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let result = bind_with_names_and_sheets(&ast, 0, &wb, &wb);
+    let reg = default_registry();
+    let result = bind_with_names_and_sheets(&ast, 0, &wb, &wb, &reg);
     assert!(
         result.is_err(),
         "v1 scope: ROW(SUM(A1:A3)) bind-fails per S1-MED-γ AggregateArg defer; \
@@ -290,7 +292,8 @@ fn row_of_unknown_sheet_at_bind_time_surfaces_error_class() {
     let wb = workbook_with_two_sheets();
     let tokens = lex("ROW(UnknownSheet!A1)").expect("lex");
     let ast = parse(tokens).expect("parse");
-    let result = bind_with_names_and_sheets(&ast, 0, &wb, &wb);
+    let reg = default_registry();
+    let result = bind_with_names_and_sheets(&ast, 0, &wb, &wb, &reg);
     assert!(
         result.is_err(),
         "unknown-sheet CellRef should bind-fail; got {result:?}"
