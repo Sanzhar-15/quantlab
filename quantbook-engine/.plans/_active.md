@@ -628,14 +628,29 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      friendly); `RegisteredFn::Udf(FunctionImplHandle)` dispatch tier + a `scalar.rs` arm + an
      `Option<&WorkerHandle>` on `EvalContext`; worker-kill = hard cancel (contract §6.2);
      trusted-workspace gating. **Cycle decomposition (multi-session per entry-plan §6 "2-3 sessions"):**
-     ✅ **6.4-3a CODE SHIPPED 2026-05-28** — `ql-udf` leaf crate built out from the reserved stub:
-     `codec.rs` (`ArrayValue`⇄Arrow-IPC tagged-column codec), `frame.rs` (`[u32 LE len][u8 type]
-     [payload]` envelope + `FrameType` + EOF/torn/oversized/unknown-type guards), `worker.rs`
-     (`UdfWorker` trait + `UdfError` taxonomy + in-process `MockWorker`). Deps `ql-types` + `arrow`
-     + `thiserror` — leaf, NO ql-functions/ql-exec. 15 tests (round-trip over every Value variant +
-     all 15 error sigils + degenerate shapes + full codec→frame→codec composition); clippy + workspace
-     check clean. **2-way audit PENDING = next session's cycle 1** (this session spent its 2 cycles:
-     6.4-2 audit-fix + 6.4-3a code). Control-frame payload internals deferred to 6.4-3b. Then:
+     ✅ **6.4-3a CODE + cycle-1 AUDIT-FIX SHIPPED 2026-05-28** — `ql-udf` leaf crate
+     (deps `ql-types` + `arrow` `features=["ipc"]` + `thiserror`; leaf, NO ql-functions/ql-exec; NOT
+     yet a default-member — pulled in at 6.4-3c). **CODE** `dce2e8bec3c`; **cycle-1 audit-fix**
+     `c68bb794edc`. Modules: `codec.rs` (`ArrayValue`⇄Arrow-IPC tagged-column codec — decode is now a
+     HARDENED trust boundary), `frame.rs` (`[u32 LE len][u8 type][payload]` envelope + guards),
+     `payload.rs` (NEW — typed `CallPayload{handle,call_id,args}`/`ReturnPayload{call_id,result}`),
+     `worker.rs` (`UdfWorker` trait + `UdfError` taxonomy + in-process `MockWorker`). **Parallel 2-way
+     audit** (Codex gpt-5.5 xhigh + fresh-context Opus) → reconciled SHIP-WITH-FIXES. The 2-way again
+     earned its keep: H1 (decode panic on <5 cols — arrow `RecordBatch::column` slice-OOB) + H2
+     (positional-vs-field-name silent mis-read of the two `Utf8` cols str/err) found by BOTH lanes;
+     the net-new HIGH **call-return-missing-ids** (CALL/RETURN carried only the bare grid — no
+     handle/call_id) found by **CODEX ONLY**. **Audit-fix `c68bb794edc`:** decode validates the exact
+     5-field schema (name+type+nullability) BEFORE any positional access (closes H1+H2); per-kind
+     active-column is_null check (NullPayload); non-finite-number rejection (NonFinite — NaN/Inf no
+     longer leak as raw Value::Number); exactly-one-batch (TrailingBatch); checked_mul (ShapeOverflow);
+     NEW `payload.rs` typed CALL/RETURN codecs (closes call-return-missing-ids — on-wire STRUCTURE
+     pinned now; correlation MECHANICS at 6.4-3b); `FrameError::TooLarge(u64)` reports actual length;
+     explicit arrow `ipc` feature. **+14 tests (15→29)** incl. 9 adversarial decodes + bit-exact -0.0.
+     Verified: `cargo test -p ql-udf` **29/0**, clippy `-p ql-udf --all-targets` clean, `cargo check
+     --workspace` clean. Synthesis + lanes `docs/audits/2026-05-28-6-4-3a-ql-udf-audit/`. **Filed for
+     6.4-3b:** M3 `UdfError` taxonomy completion (`Cancelled` distinct from `Timeout` + handshake/
+     protocol-version variants — only exercisable with a real async pipe); real deadline/process-kill/
+     no-late-commit coverage (exit test 6) is UNPROVEN here (mock can't reach it). **NEXT = 6.4-3b.** Then:
      6.4-3b real Python worker spawn/handshake/kill (2-way); 6.4-3c eval wiring end-to-end (3-way);
      6.4-3d debugpy + trusted-workspace + IDE bridge (3-way). Then **6.4-4 exit-tests + closure
      megaudit** (5-way; contract §10.4 tests 1-8). **Open questions at impl start** (§10 of the
