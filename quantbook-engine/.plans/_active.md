@@ -650,14 +650,34 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      --workspace` clean. Synthesis + lanes `docs/audits/2026-05-28-6-4-3a-ql-udf-audit/`. **Filed for
      6.4-3b:** M3 `UdfError` taxonomy completion (`Cancelled` distinct from `Timeout` + handshake/
      protocol-version variants — only exercisable with a real async pipe); real deadline/process-kill/
-     no-late-commit coverage (exit test 6) is UNPROVEN here (mock can't reach it). **NEXT = 6.4-3b.** Then:
-     6.4-3b real Python worker spawn/handshake/kill (2-way); 6.4-3c eval wiring end-to-end (3-way);
+     no-late-commit coverage (exit test 6) is UNPROVEN here (mock can't reach it).
+   - ✅ **6.4-3b CODE SHIPPED 2026-05-28** (`2671ade0cfa`) — the real Python worker. Rust
+     (`crates/ql-udf`): `control.rs` (NEW — HELLO/HELLO_ACK/RAISE/LOG/CANCEL control-frame codecs +
+     `PROTOCOL_VERSION`; RAISE carries call_id), `process.rs` (NEW — `PythonWorkerConfig` +
+     `ProcessWorker` impl `UdfWorker`: spawn `python -m quantbook.worker`, HELLO/HELLO_ACK handshake,
+     per-worker reader thread + mpsc, `call()` recv_timeout for the correlated RETURN/RAISE, timeout→
+     kill+mark-dead→`Timeout` (late RETURN dropped, exit test 6), lazy respawn, `WorkerProcess::drop`
+     kills+reaps; std-only, no new deps), `worker.rs` (completed the M3 taxonomy: `Cancelled`/`Handshake`/
+     `Protocol`), `codec.rs` (+`BadUtf8`), `lib.rs` (mod control/process + re-exports). Python
+     (`crates/quantbook-py/python/quantbook`, 3.9-compatible plain worker, NO PyO3 hot path): `_frame.py`
+     (envelope mirror), `_codec.py` (tagged 5-col pyarrow grid codec EXACTLY mirroring codec.rs + payload/
+     control codecs + Grid/Err), `worker.py` (`python -m quantbook.worker` loop), `__init__.py`
+     (`register_formula_function` + registry), `_registry.py`, `_smoke_udfs.py` (fixture handles 7/8/9/11),
+     `_self_test.py`. **Verified:** `cargo test -p ql-udf` **39/0** unit (was 29: +7 control, +2 process) +
+     `tests/process_smoke.rs` **1/1** real-python end-to-end (double 21→42, mixed-grid identity,
+     raise→Raised{ValueError}, timeout(300ms)→kill→respawn-new-pid; against host python3 + pyarrow 21.0.0,
+     loud-skips if absent); clippy `-p ql-udf --all-targets` clean; `cargo check --workspace` clean;
+     `python3 -m quantbook._self_test` PASS. ql-udf + quantbook-py stay out of default-members.
+     **2-way audit PENDING = next session's cycle 1** (this session spent its 2 cycles: 6.4-3a audit-fix +
+     6.4-3b code, per CLAUDE.md). **Audit focus to hand off:** reader-thread/kill race + zombie reaping,
+     respawn + deadline accounting, control-frame codec symmetry Rust↔Python, the LOG→eprintln stopgap
+     (6.4-3c routes to CellDiagnostics), worker stdout-purity, handshake-version-mismatch path.
+     **NEXT = 6.4-3b 2-way audit.** Then:
+     6.4-3c eval wiring end-to-end (`RegisteredFn::Udf` + scalar.rs arm + `Option<&mut dyn UdfWorker>` on
+     EvalContext + re-examine 6.4-2 `register_udf` atomicity as a 3-way atomic; 3-way);
      6.4-3d debugpy + trusted-workspace + IDE bridge (3-way). Then **6.4-4 exit-tests + closure
-     megaudit** (5-way; contract §10.4 tests 1-8). **Open questions at impl start** (§10 of the
-     design): transport (lean stdio), python discovery, arrow dep surface, re-examine 6.4-2
-     `register_udf` atomicity once it also inserts a `RegisteredFn::Udf` dispatch entry (3-way atomic),
-     EvalContext worker-threading churn. Tracked cross-cutting (still pending): `Sheet::iter_effective_cells()`
-     serializer fix.
+     megaudit** (5-way; contract §10.4 tests 1-8). Tracked cross-cutting (still pending):
+     `Sheet::iter_effective_cells()` serializer fix.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +
