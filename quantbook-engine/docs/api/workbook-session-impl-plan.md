@@ -120,11 +120,27 @@ A plain-Node `process.dlopen` smoke (`crates/ql-bindings-node/tests/smoke_sessio
 edit→recalc→snapshot through the owning session over FFI. Parallel Codex+Opus audit **SHIP** (0 HIGH/MED;
 1 LOW doc-fix applied; rest tracked) — synthesis `docs/audits/2026-05-28-inc2d-session-napi-audit/`.
 
-**Remaining sequence (NEXT) — reconciled to the canonical decision-lock §2** (the prior "functions-first"
-ordering here had drifted; the lock puts the Node smoke migration inside 6.1B → then 6.1C → then 6.4-0):
-**IDE-side Node smoke wiring + mocha (drive the `Session` class through `loader.ts`; rebuild the `.node`;
-add the B#1/S2-01 cross-window mocha tests) — cross-repo (`feat/visualise-v1`), the explicit hand-off** →
-**6.1C security/design audit** → **6.4-0 function-metadata substrate** → **6.4 Python UDFs**. **Also tracked
+**✅ IDE-side consumer wiring SHIPPED (cross-repo, 2026-05-28, IDE `feat/visualise-v1` `c24222315ed`).**
+The VS Code fork now consumes the `Session` class through its real Node load path
+(`extensions/quantlab/src/quantbook/{types.ts,loader.ts,session.ts}`: typed `SessionInstance`/
+`SessionConstructor` + `SheetInfoJson` + `SessionCellValueInput`; a `Session` fail-at-boundary shape-check
+in `loadQuantbookEngine()`; a `createWorkbookSession()` factory) + a mocha suite
+(`test/quantbook-session.test.ts`) proving edit→recalc→snapshot through `loadQuantbookEngine()`. The rebuilt
+cdylib (`cargo build -p ql-bindings-node --release --features test-fixtures`) also makes the source-only
+`CollabSession` fixes B#1 + S2-01 live, now backed by regression tests (the LOCAL S2-01 test is the genuine
+filter regression; the cross-peer one was reframed after a Codex MED showed `mergeBytes` forces a
+full-rebuild fallback). Full IDE suite **1435/0/25**. Scope = types + loader + mocha proof, **no live-UI
+change** (the live `CellGridPanel` needs delta/presence/transport, none on `Session` yet — 6.3). Synthesis
+`docs/audits/2026-05-28-6-1b-ide-node-migration/`.
+
+**Remaining sequence (NEXT) — reconciled to the canonical decision-lock §2:**
+✅ IDE-side Node smoke wiring + mocha **DONE** (cross-repo `feat/visualise-v1` `c24222315ed`, 2026-05-28 —
+`Session` driven through `loader.ts`/types, `.node` rebuilt, B#1/S2-01 regressions added). →
+**6.1C security/design audit (NEXT — best as a fresh dedicated multi-lane Codex+Opus megaudit; consumes the
+inc.2d/migration-deferred findings: snapshot `formats` ordering, `schema_version` omission, no
+`catch_unwind` under `panic=abort`, the `WorkbookSnapshotJson.version` optional-in-TS DTO drift, and the
+no-`workbookSnapshotDelta`-over-napi gap blocking the live-grid wiring)** → **6.4-0 function-metadata
+substrate** → **6.4 Python UDFs**. **Also tracked
 (cross-cutting):
 a storage-level effective-non-blank-value extent API** adopted by all serializers (csv/xlsx/.qbook) so a
 blank-inflated `Sheet::bounds` can't produce a giant export (Codex inc.2c-11 HIGH — currently

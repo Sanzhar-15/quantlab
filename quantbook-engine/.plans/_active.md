@@ -205,16 +205,24 @@ status: |
   struct). **Still TRACKED (deferred, warn-level, non-breaking): workspace doc_lazy_continuation
   (ql-storage 1 / ql-oplog 3 / ql-collab 14) + type_complexity (ql-collab ×4) — a focused pass.**
 
-  ⭐ NEXT — **reconciled to the canonical decision-lock §2** (the prior "functions-first" NEXT here had
-  drifted; the lock puts the Node smoke migration INSIDE 6.1B → THEN 6.1C → THEN 6.4-0): **IDE-side Node
-  smoke wiring + mocha** (drive the `Session` class through `loader.ts`; rebuild the `.node`; add the
-  B#1/S2-01 cross-window mocha tests) — **cross-repo on `feat/visualise-v1`, the explicit hand-off** →
-  **6.1C security/design audit** (also the home for the inc.2d-surfaced contract observations: snapshot
-  determinism, "delete cell contents" command, schema_version) → **6.4-0 function-metadata substrate** →
-  **6.4 Python UDFs**. The v1 import/export surface is COMPLETE (.qbook 2c-9, xlsx import 2c-10 + export
-  2c-12, csv 2c-11). Also tracked cross-cutting: a storage-level effective-non-blank-value extent API for
-  all serializers. Do NOT freeze the CollabSession CRDT façade (collab = v1.5). **Follow
-  `docs/api/workbook-session-impl-plan.md` §0.**
+  ✅ **IDE-side Node smoke wiring + mocha SHIPPED 2026-05-28** (cross-repo, IDE `feat/visualise-v1`
+  `c24222315ed`): the VS Code fork drives the `Session` class through `loader.ts`/types
+  (`createWorkbookSession()` + a fail-at-boundary shape-check), the `.node` was rebuilt (so B#1/S2-01 are
+  now LIVE), and a mocha suite (`test/quantbook-session.test.ts`) proves edit→recalc→snapshot + the
+  B#1/S2-01 regressions through the real loader. Full IDE suite 1435/0/25. Scope = types+loader+mocha,
+  NO live-UI change. Parallel Codex+Opus: Opus SHIP; Codex 1 MED (cross-window S2-01 test vacuous as a
+  filter regression → reframed; LOCAL S2-01 is the real guard) + pre-existing LOW + INFO. Synthesis
+  `docs/audits/2026-05-28-6-1b-ide-node-migration/`.
+
+  ⭐ NEXT — **6.1C security/design audit** (decision-lock §2 item 4; MANDATORY before broader binding/
+  service exposure). Best run as a fresh dedicated multi-lane Codex+Opus megaudit; it is the home for the
+  migration-deferred contract findings: snapshot `formats` ordering non-determinism, `schema_version`
+  omission, no `catch_unwind` under `panic=abort`, the `WorkbookSnapshotJson.version` optional-in-TS DTO
+  drift, and the no-`workbookSnapshotDelta`-over-napi gap that blocks driving the live `CellGridPanel` off
+  `Session`. → **6.4-0 function-metadata substrate** → **6.4 Python UDFs**. The v1 import/export surface is
+  COMPLETE (.qbook 2c-9, xlsx import 2c-10 + export 2c-12, csv 2c-11). Also tracked cross-cutting: a
+  storage-level effective-non-blank-value extent API for all serializers. Do NOT freeze the CollabSession
+  CRDT façade (collab = v1.5). **Follow `docs/api/workbook-session-impl-plan.md` §0.**
 date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-26_phase-5-7-v3-6-1-delta-consumer-backlog.md (V3.6.1 backlog mini-phase, SUPERSEDED by Phase 5 COMPLETE)
 parent_phase: 6 Product Surfaces
@@ -292,13 +300,18 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
    - ✅ **inc.2d (2026-05-28)**: owning `WorkbookSession` over napi — the new `Session` `#[napi]` class
      in `ql-bindings-node` (engine-side half of the Node smoke-path migration; `CollabSession` façade
      untouched). Parallel Codex+Opus audit SHIP. Synthesis `docs/audits/2026-05-28-inc2d-session-napi-audit/`.
-   - ⭐ **NEXT (reconciled to canonical decision-lock §2 — the prior "functions-first" order here had
-     drifted)**: **IDE-side Node smoke wiring + mocha** (drive `Session` through `loader.ts`, rebuild the
-     `.node`, add B#1/S2-01 cross-window tests) — cross-repo `feat/visualise-v1` → **6.1C security/design
-     audit** → **6.4-0 function-metadata substrate** → **6.4 Python UDFs**. The v1 import/export surface is
-     COMPLETE (.qbook 2c-9, xlsx import 2c-10 + export 2c-12, csv 2c-11). Plus tracked cross-cutting
-     effective-extent serializer fix. See `workbook-session-impl-plan.md` §0. Leave collab/transport/
-     presence feature-gated.
+   - ✅ **IDE-side Node smoke wiring + mocha SHIPPED 2026-05-28** (cross-repo, IDE `feat/visualise-v1`
+     `c24222315ed`): `Session` driven through `loader.ts`/types + `createWorkbookSession()`; `.node`
+     rebuilt (B#1/S2-01 now live); mocha `test/quantbook-session.test.ts` proves edit→recalc→snapshot +
+     B#1/S2-01 regressions through the real loader (full IDE suite 1435/0/25). Scope = types+loader+mocha,
+     no live-UI change. Codex MED (cross-window S2-01 vacuous → reframed; LOCAL is the real guard) + LOW +
+     INFO; Opus SHIP. Synthesis `docs/audits/2026-05-28-6-1b-ide-node-migration/`.
+   - ⭐ **NEXT — 6.1C security/design audit** (decision-lock §2 item 4): a fresh dedicated multi-lane
+     Codex+Opus megaudit of the 6.1 session surface; consumes the migration-deferred findings (snapshot
+     `formats` ordering, `schema_version` omission, no `catch_unwind`, `version`-optional DTO drift,
+     no-`workbookSnapshotDelta`-over-napi). → **6.4-0 function-metadata substrate** → **6.4 Python UDFs**.
+     The v1 import/export surface is COMPLETE. Plus tracked cross-cutting effective-extent serializer fix.
+     See `workbook-session-impl-plan.md` §0. Leave collab/transport/presence feature-gated.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +

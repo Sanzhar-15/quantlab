@@ -105,8 +105,17 @@ the runtime methods onto `WorkbookSession`). This is flagged work, not an emerge
     `setValue`/`setFormula`/`clear`/`recalcDirty`/`recalcAll`/`snapshot`/`cell`/`listSheets`), proving
     this contract over FFI (edit→recalc→snapshot smoke passes). `WorkbookSession: Send` is compile-proven;
     every method returns owned data (no guard/ref escapes); `EngineError` maps via `engine_error_to_napi`
-    (`"[code] message"`). The richer surface (batch/txn/import/export/undo/delta, register_function) +
-    the IDE-side mocha wiring are the 6.3 / cross-repo follow-up.
+    (`"[code] message"`). The richer surface (batch/txn/import/export/undo/delta, register_function) is the
+    6.3 follow-up.
+  - **✅ IDE consumer wiring realized (cross-repo, 2026-05-28, IDE `feat/visualise-v1` `c24222315ed`):**
+    the VS Code fork now consumes the `Session` class through its real Node load path —
+    `extensions/quantlab/src/quantbook/{types.ts,loader.ts,session.ts}` (typed `SessionInstance`, a
+    `Session` fail-at-boundary shape-check in `loadQuantbookEngine()`, a `createWorkbookSession()`
+    factory) + a mocha suite (`test/quantbook-session.test.ts`) proving edit→recalc→snapshot through
+    `loadQuantbookEngine()`. The rebuilt cdylib also made the source-only `CollabSession` fixes B#1 +
+    S2-01 live, now backed by regression tests. Full IDE suite 1435/0/25. Synthesis
+    `docs/audits/2026-05-28-6-1b-ide-node-migration/`. **Driving the live `CellGridPanel` off `Session`
+    stays deferred** (the panel needs `workbookSnapshotDelta`/presence/transport, none yet on `Session`).
 - Long-running / multi-call state (transactions §3.4, operations §6) is referenced by **opaque IDs**,
   never by a borrowed runtime object.
 
