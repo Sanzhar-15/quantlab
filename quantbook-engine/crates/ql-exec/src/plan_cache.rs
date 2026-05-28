@@ -205,11 +205,34 @@ mod tests {
             sheet,
             name_gen,
             // **6.4-1 (2026-05-28; H3):** test helper pins `fn_gen = 0`
-            // because the plan_cache unit tests don'\''t mutate function
-            // metadata; the cross-tier integration tests at
-            // `WorkbookSession::register_function` (6.4) exercise the
-            // cache-invalidation pathway end-to-end.
+            // because most plan_cache unit tests don'\''t mutate function
+            // metadata. The 6.4-1 cycle-2 audit-fix M1 added
+            // `key_with_fn_gen` below + the `different_function_generation_misses`
+            // test for the fn_gen-varying case; the cross-tier integration
+            // tests at `WorkbookSession::register_function` (6.4-2) will
+            // exercise the cache-invalidation pathway end-to-end.
             fn_gen: 0,
+            cell_anchor: None,
+        }
+    }
+
+    /// **6.4-1 cycle-2 audit-fix M1 (2026-05-28):** sibling of [`key`] that
+    /// varies the `fn_gen` axis. Used by `different_function_generation_misses`
+    /// to prove the H3 cache-invalidation invariant: two keys differing ONLY
+    /// in `fn_gen` MUST be unequal AND hash differently, so a
+    /// `FunctionRegistry::register_metadata` bump on a live session forces a
+    /// cache miss → re-bind → fresh `FormulaDeps` against current metadata.
+    /// The cycle-1 commit's `Hash + Eq + PartialEq` derive on [`PlanCacheKey`]
+    /// already includes `fn_gen` by structural property; this test pins the
+    /// invariant directly so a future edit that silently drops or normalizes
+    /// `fn_gen` (e.g., a `serde(flatten)` attribute or a hand-rolled `impl
+    /// PartialEq` regression) fails loudly.
+    fn key_with_fn_gen(text: &str, sheet: SheetId, name_gen: u64, fn_gen: u64) -> PlanCacheKey {
+        PlanCacheKey {
+            text: Arc::from(text),
+            sheet,
+            name_gen,
+            fn_gen,
             cell_anchor: None,
         }
     }
@@ -270,6 +293,69 @@ mod tests {
             .unwrap();
         assert_eq!(cache.stats().misses, 2);
         assert_eq!(cache.stats().hits, 0);
+    }
+
+    /// **6.4-1 cycle-2 audit-fix M1 (2026-05-28):** the H3 closure invariant —
+    /// bumping `FunctionRegistry::fn_gen` invalidates every plan in the cache.
+    /// Mirrors `different_name_generation_misses` for the `name_gen` axis. The
+    /// 2-way audit (Codex M2 + Opus M1-OPUS) verified the structural property
+    /// (PlanCacheKey derives `Hash + Eq + PartialEq` and `fn_gen` is a field,
+    /// so different `fn_gen` values produce different hashes by Rust struct
+    /// equality semantics). This test pins the invariant directly so a future
+    /// derive-attr regression — e.g., someone tagging the field with
+    /// `#[serde(skip)]` and silently dropping it from a custom Hash impl —
+    /// fails loudly.
+    ///
+    /// The test simulates the production flow: bind plan at fn_gen=0 → cache
+    /// hit on the same key → cycle the fn_gen counter (as would happen on
+    /// `register_metadata` / `unregister_metadata`) → same text+sheet+name_gen
+    /// but new fn_gen MUST miss → re-bind populates a fresh entry.
+    #[test]
+    fn different_function_generation_misses() {
+        let mut cache = PlanCache::new();
+        // Plan-A registered at fn_gen=0.
+        cache
+            .get_or_insert::<_, ()>(key_with_fn_gen("X", 0, 0, 0), || Ok(dummy_plan()))
+            .unwrap();
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 0);
+
+        // Same text+sheet+name_gen at fn_gen=0 → hit.
+        cache
+            .get_or_insert::<_, ()>(key_with_fn_gen("X", 0, 0, 0), || Ok(dummy_plan()))
+            .unwrap();
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 1);
+
+        // fn_gen bumps to 1 (simulates register_metadata success on UDF).
+        // Same text+sheet+name_gen but new fn_gen MUST miss.
+        cache
+            .get_or_insert::<_, ()>(key_with_fn_gen("X", 0, 0, 1), || Ok(dummy_plan()))
+            .unwrap();
+        assert_eq!(cache.stats().misses, 2);
+        assert_eq!(cache.stats().hits, 1);
+
+        // fn_gen bumps to 2 (simulates unregister_metadata success). Miss again.
+        cache
+            .get_or_insert::<_, ()>(key_with_fn_gen("X", 0, 0, 2), || Ok(dummy_plan()))
+            .unwrap();
+        assert_eq!(cache.stats().misses, 3);
+        assert_eq!(cache.stats().hits, 1);
+
+        // Going BACK to fn_gen=1 hits the cycle-A entry that was inserted
+        // when fn_gen first stepped to 1 — confirms entries don'\''t get
+        // silently aliased across fn_gen values.
+        cache
+            .get_or_insert::<_, ()>(key_with_fn_gen("X", 0, 0, 1), || Ok(dummy_plan()))
+            .unwrap();
+        assert_eq!(cache.stats().misses, 3);
+        assert_eq!(cache.stats().hits, 2);
+
+        // Hash + Eq direct check: two keys differing ONLY in fn_gen MUST
+        // be unequal (this is what the cache lookup relies on).
+        let k0 = key_with_fn_gen("Y", 0, 5, 7);
+        let k1 = key_with_fn_gen("Y", 0, 5, 8);
+        assert_ne!(k0, k1, "fn_gen MUST participate in PlanCacheKey equality");
     }
 
     #[test]

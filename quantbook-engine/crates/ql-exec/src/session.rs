@@ -300,8 +300,23 @@ impl WorkbookSession {
     /// Wrap an existing `Workbook` (e.g. a hand-built test workbook; later the
     /// product of `open`/`import`). Rebuilds the calc graph from the workbook's
     /// formulas so dependency tracking is live.
+    ///
+    /// **6.4-1 cycle-2 audit-fix H1 (2026-05-28):** `registry` is constructed
+    /// BEFORE `graph` so the dep walker passes through the same
+    /// `Arc<FunctionRegistry>` the session holds for the rest of its lifetime.
+    /// Pre-audit-fix the body called the zero-arg
+    /// `CalcgraphSession::rebuild_from_workbook(&workbook)` which constructs
+    /// `default_registry()` internally — silently divergent from `self.registry`
+    /// once 6.4-2 wires `register_function` and the two registries can drift.
+    /// Behavior-preserving today (both registries are builtin-equivalent at
+    /// session construction) but closes the same divergence pattern the 6.4-0
+    /// H2 audit-fix closed at `recompute_all` — the 6.4-0 sweep missed this
+    /// site and the parallel `rematerialize` site below; the 6.4-1 cycle-2
+    /// Opus lane surfaced both.
     pub fn from_workbook(workbook: Workbook) -> Self {
-        let graph = CalcgraphSession::rebuild_from_workbook(&workbook).session;
+        let registry = Arc::new(ql_functions::default_registry());
+        let graph =
+            CalcgraphSession::rebuild_from_workbook_with_registry(&workbook, &registry).session;
         // inc.2c-7: snapshot the construction-time workbook as the undo baseline
         // BEFORE moving `workbook` into the struct (the op-log records only
         // post-construction edits, so `rematerialize` replays onto a clone of
@@ -323,7 +338,7 @@ impl WorkbookSession {
             oplog,
             graph,
             plan_cache: PlanCache::new(),
-            registry: Arc::new(ql_functions::default_registry()),
+            registry,
             state: LifecycleState::Ready,
             epoch: mint_epoch(),
             state_seq: 0,
@@ -736,7 +751,19 @@ impl WorkbookSession {
         let mut wb = self.baseline.clone();
         ql_oplog::replay_into(&self.oplog, &mut wb, &self.registry).map_err(map_replay_err)?;
         self.workbook = wb;
-        self.graph = CalcgraphSession::rebuild_from_workbook(&self.workbook).session;
+        // **6.4-1 cycle-2 audit-fix H1 (2026-05-28):** thread `self.registry`
+        // through the rebuild so the dep walker uses the session's live
+        // (potentially UDF-aware) registry rather than a fresh
+        // `default_registry()`. `rematerialize` runs on every undo/redo; the
+        // 6.4-0 H2 audit-fix closed the parallel `recompute_all` site but
+        // missed this one and `from_workbook` — both surfaced by the 6.4-1
+        // cycle-2 Opus lane. Behavior-preserving today; prevents future
+        // silent divergence once 6.4-2 wires `register_function`.
+        self.graph = CalcgraphSession::rebuild_from_workbook_with_registry(
+            &self.workbook,
+            &self.registry,
+        )
+        .session;
         // Recompute computed values with the op-log detached (no spurious ops /
         // no UndoManager commit). The result's failures become diagnostics.
         let result = self.with_runtime_no_oplog(|rt| rt.recompute_all());

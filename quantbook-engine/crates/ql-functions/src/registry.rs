@@ -1305,10 +1305,22 @@ fn register_builtin_metadata(r: &mut FunctionRegistry) {
     // A1's dep. Pre-6.4-1 this was a hardcoded `name == "ISREF"` short-
     // circuit in the walker's `Function` arm; the I1 closure moves the
     // decision to metadata so 6.4 UDFs declaring `dep_shape: LazyShape`
-    // get the same treatment without engine-side name special-casing. The
-    // engine's `is_address_only_reference_fn` migration shim accepts BOTH
-    // `AddressOnly` and `LazyShape` so the binder's reference-arg routing
-    // is preserved.
+    // get the same treatment without engine-side name special-casing.
+    //
+    // **6.4-1 cycle-2 audit-fix L1 (2026-05-28; doc correction):** the
+    // engine has TWO DISJOINT migration shims after I1:
+    // (1) `is_address_only_reference_fn(registry, name)` matches ONLY
+    //     `Some(DepShape::AddressOnly)` and returns `true` for ROW /
+    //     COLUMN / ROWS / COLUMNS, `false` for ISREF.
+    // (2) `is_lazy_shape_reference_fn(registry, name)` matches ONLY
+    //     `Some(DepShape::LazyShape)` and returns `true` for ISREF,
+    //     `false` for the four address-only names.
+    // The walker checks `is_lazy_shape_reference_fn` FIRST in the
+    // `ExprPlan::Function` arm (the LazyShape skip-all-arg-walking branch
+    // is the strictest, so it gets priority); then falls through to
+    // `is_address_only_reference_fn` for the eager-with-shape-aware-walk
+    // branch; then the normal `walk_plan_for_deps`. The two shims do NOT
+    // overlap — `arg_context: Reference` is the axis they share.
     {
         let mut m = pure_scalar("ISREF");
         m.dep_shape = DepShape::LazyShape;
@@ -2492,6 +2504,158 @@ mod tests {
                 "{} must register ArgContext::Scalar (pure scalar; binder rejects ranges)",
                 name,
             );
+        }
+    }
+
+    /// **6.4-1 cycle-2 audit-fix M2 (2026-05-28):** exhaustive byte-for-byte
+    /// enumeration of all 66 Phase-1.5 `ArgContext::Aggregate` overrides.
+    /// The 2-way audit (Codex L1 + Opus M2-OPUS) flagged that
+    /// `arg_context_overrides_match_pre_6_4_1_whitelists` above only spot-
+    /// checks 13 of 66 names — a future contributor dropping or renaming an
+    /// Aggregate name in the Phase-1.5 source list would not be caught by
+    /// the sample. This test mirrors the 6.4-0 audit-fix's
+    /// `builtin_metadata_pins_prior_address_only_whitelist` pattern: the
+    /// 66-name list IS the test fixture, derived directly from the pre-6.4-1
+    /// `is_aggregate_function` `matches!` whitelist at
+    /// `fdbccb704f7^:crates/ql-exec/src/plan.rs:422-536` (the byte-for-byte
+    /// claim the H1 migration is load-bearing on). Order matches the source
+    /// list verbatim. Any drift — name dropped from Phase 1.5, name renamed,
+    /// metadata pop sequence reordered to overwrite arg_context with the
+    /// Scalar default — fails this test loudly. Pair with the existing
+    /// `validate.rs` invariants — `is_aggregate_function_lists_only_registered_aggregates`
+    /// and `every_range_aware_fn_is_admitted_to_is_aggregate_function` — which
+    /// cover the OPPOSITE-direction drift (a name dispatched but not in the
+    /// Aggregate set).
+    #[test]
+    fn phase_1_5_aggregate_overrides_byte_for_byte_against_pre_6_4_1_whitelist() {
+        let r = default_registry();
+        // The 66-name pre-6.4-1 `plan.rs::is_aggregate_function` whitelist,
+        // verbatim from `fdbccb704f7^:crates/ql-exec/src/plan.rs:422-536`.
+        // Order preserved so a diff against the pre-6.4-1 source produces
+        // a clean visual confirmation.
+        let pre_6_4_1_aggregate_whitelist: &[&str] = &[
+            // Scalar aggregates (W4-4, W5-58 stats family extras).
+            "SUM",
+            "AVERAGE",
+            "AVG",
+            "COUNT",
+            "COUNTA",
+            "MIN",
+            "MAX",
+            "PRODUCT",
+            "VAR",
+            "VAR.S",
+            "VAR.P",
+            "STDEV",
+            "STDEV.S",
+            "STDEV.P",
+            // Range-aware conditional aggregates (W5-53).
+            "SUMIF",
+            "COUNTIF",
+            // Range-aware lookup family (W5-54).
+            "MATCH",
+            "INDEX",
+            "VLOOKUP",
+            "HLOOKUP",
+            "CHOOSE",
+            // Range-aware conditional-aggregate completion (W5-55).
+            "AVERAGEIF",
+            "SUMIFS",
+            "COUNTIFS",
+            "AVERAGEIFS",
+            "SUMPRODUCT",
+            // Range-aware stats family (W5-58).
+            "LARGE",
+            "SMALL",
+            "RANK",
+            "RANK.EQ",
+            "RANK.AVG",
+            "MEDIAN",
+            "MODE",
+            "MODE.SNGL",
+            // Range-aware text completion (W5-61 polish).
+            "CONCAT",
+            // Unified-ABI array-returning fns (W5-107 / Phase 4.7.N).
+            "TRANSPOSE",
+            "FILTER",
+            // Range-aware conditional-aggregate dispatcher (W5-D-12).
+            "SUBTOTAL",
+            // Phase 4.10 statistical paired-array fns (W5-177, W5-178,
+            // W5-179, W5-D-6).
+            "CORREL",
+            "PEARSON",
+            "RSQ",
+            "STEYX",
+            "SLOPE",
+            "INTERCEPT",
+            "COVARIANCE.P",
+            "COVARIANCE.S",
+            "SUMX2MY2",
+            "SUMX2PY2",
+            "SUMXMY2",
+            // Phase 4.10 financial cash-flow fns (W5-168, W5-174, W5-D-7).
+            "NPV",
+            "IRR",
+            "MIRR",
+            "XNPV",
+            "XIRR",
+            // Phase 4.10 modern lookup fns (W5-169).
+            "XLOOKUP",
+            "XMATCH",
+            // Phase 4.10 order-statistics fns (W5-D-11).
+            "PERCENTILE.INC",
+            "PERCENTILE.EXC",
+            "PERCENTILE",
+            "QUARTILE.INC",
+            "QUARTILE.EXC",
+            "QUARTILE",
+            // Phase 4.10 conditional aggregates / text join (W5-164, W5-167).
+            "MINIFS",
+            "MAXIFS",
+            "COUNTBLANK",
+            "TEXTJOIN",
+        ];
+        assert_eq!(
+            pre_6_4_1_aggregate_whitelist.len(),
+            66,
+            "the byte-for-byte fixture must hold exactly 66 names (matches the cycle-1 \
+             commit message's claim about the pre-6.4-1 `is_aggregate_function` size)"
+        );
+
+        // Direction A: every pre-6.4-1 name must now register with
+        // ArgContext::Aggregate via Phase 1.5. Any drop / rename / Phase-1-
+        // override-after-Phase-1.5-bug surfaces here.
+        for name in pre_6_4_1_aggregate_whitelist {
+            let meta = r
+                .metadata(name)
+                .unwrap_or_else(|| panic!("{name}: pre-6.4-1 Aggregate name has no metadata at all (Phase 1.5 dropped it)"));
+            assert_eq!(
+                meta.arg_context,
+                ArgContext::Aggregate,
+                "{name}: pre-6.4-1 `is_aggregate_function` whitelist member \
+                 registered with arg_context={:?} instead of Aggregate — \
+                 cycle-1 H1 migration drifted",
+                meta.arg_context,
+            );
+        }
+
+        // Direction B (sanity): no name OUTSIDE the pre-6.4-1 whitelist
+        // should silently flip to ArgContext::Aggregate via a Phase-1.5 typo
+        // / accidental extra entry. Walk every metadata entry; any
+        // Aggregate-tagged name must be in the whitelist.
+        let pre_set: std::collections::HashSet<&&str> =
+            pre_6_4_1_aggregate_whitelist.iter().collect();
+        for m in r.iter_metadata() {
+            if m.arg_context == ArgContext::Aggregate {
+                assert!(
+                    pre_set.contains(&m.canonical_name.as_str()),
+                    "{}: registered with arg_context=Aggregate but is NOT in the \
+                     pre-6.4-1 `is_aggregate_function` whitelist — Phase 1.5 \
+                     silently added a name (extension OK, but cycle-1 H1 claimed \
+                     byte-for-byte; this test pins that claim)",
+                    m.canonical_name,
+                );
+            }
         }
     }
 

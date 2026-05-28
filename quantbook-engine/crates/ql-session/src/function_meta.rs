@@ -38,17 +38,51 @@
 //! `unregister_metadata(canonical_name)` then `register_metadata(new_meta)`
 //! to update an existing entry; there is NO atomic `update_metadata`
 //! today. The transient window between the two calls leaves the function
-//! in the "unknown" state — formulas referencing it bind / re-bind with
-//! `Volatility::Dynamic` (the conservative default in contract §10.3), so
-//! the engine never serves a result computed against stale metadata. The
-//! binder's `arg_ctx` falls back to `Scalar` during the gap (a `=MYUDF(A1:
-//! A10)` call would surface `BindError::NamedRangeInScalarContext`); this
-//! is acceptable because (a) UDFs register at workspace-trust elevation,
-//! a transient window during a known reload event; (b) atomic in-place
-//! swap on a HashMap is straightforward to add when a real UDF live-edit
-//! flow needs it, and the two-step path keeps the substrate small. 6.4
+//! in the "unknown" state.
+//!
+//! **6.4-1 cycle-2 audit-fix H2 (2026-05-28; doc-honesty).** The original
+//! 6.4-1 cycle-1 paragraph claimed formulas re-bind with `Volatility::
+//! Dynamic` during the gap (the contract §10.3 unknown-fn policy). The
+//! parallel 2-way audit (Codex M1 + Opus H2-OPUS) verified at source that
+//! the substrate does NOT honor §10.3's unknown-fn policy today; the
+//! migration shim `is_volatile_function` (`crates/ql-exec/src/
+//! calcgraph_session.rs:202-207`) returns `false` for unknown names, and
+//! its own docstring explicitly documents the deliberate deferral:
+//! "**Unknown-function policy (substrate v1):** returns `false`. … 6.4
+//! will tighten this when UDF metadata becomes session-scoped." The
+//! substrate's reasoning is that the formula stays graph-visible via the
+//! normal cell-dep + name-dep paths even when its function name is
+//! unknown — so the cost of the deferral is a brief incorrect-volatility
+//! window, not a graph-invisibility hole.
+//!
+//! Actual transient behavior during the gap:
+//! 1. **Volatility:** the formula re-binds as NOT volatile (matches the
+//!    migration shim's unknown-name policy). If the formula was relying
+//!    on UDF-driven volatility, F9 / volatile-pass will NOT recompute it
+//!    until the new metadata lands AND `PlanCacheKey::fn_gen` invalidates
+//!    the bind cache → next eval re-binds with the new metadata.
+//! 2. **Binder arg-ctx:** falls back to `Scalar` during the gap. A
+//!    `=MYUDF(A1:A10)` call surfaces
+//!    `BindError::NamedRangeInScalarContext` because `ArgContext`
+//!    defaults to `Scalar` for unknown metadata (`function_meta.rs`'s
+//!    `ArgContext::default()` is the conservative-rejection variant).
+//! 3. **Dispatch:** the function isn't registered for dispatch at the
+//!    unknown-fn point, so eval surfaces `#NAME?` (or
+//!    `BindError::UnknownFunction` if cycle 2's `register_function`
+//!    flow validates dispatch at bind time).
+//!
+//! The two-step path is acceptable because (a) UDFs register at
+//! workspace-trust elevation — a transient window during a known reload
+//! event, not a general-purpose live-edit; (b) the contract §10.3
+//! unknown-fn tightening is FILED for 6.4 (when UDF metadata becomes
+//! session-scoped per the deliberate-deferral note in
+//! `is_volatile_function`); (c) atomic in-place swap on a HashMap is
+//! straightforward to add when a real UDF live-edit flow needs it. 6.4
 //! may add `update_metadata` as a non-breaking superset; the two-step
-//! path remains supported.
+//! path remains supported. The 6.4-1 cycle-2 audit synthesis records
+//! both lanes' verification of this gap behavior at
+//! `docs/audits/2026-05-28-6-4-1-substrate-completion-audit/SYNTHESIS.md`
+//! (finding H2).
 //!
 //! Cross-refs: `docs/api/session-api.md` §10 (function metadata contract),
 //! `docs/phase6/6-4-entry-plan.md` §2 (the H1+H3+M+I scope of 6.4-1),

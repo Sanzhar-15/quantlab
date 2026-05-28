@@ -82,15 +82,21 @@
 //!   latent `ROW(MyName)` cleanup bug where the address-only walker's
 //!   `names` push (without `named_ranges`) caused
 //!   `name_to_formulas[MYNAME]` to leak on rebind.
-//! - 6.4 entry-plan must close two HIGH carryovers: H1 (the parallel
-//!   `is_aggregate_function` / `is_reference_aware_function`
-//!   whitelists in `ql-exec::plan` that still drive the binder's
-//!   `arg_ctx` decision; UDFs with range args won't bind until these
-//!   derive from metadata too) and H3 (hooks dirty-only; PlanCache
-//!   needs an `fn_gen` counter mirroring `name_gen`, OR the
-//!   `WorkbookSession::register_function` orchestrator must call
-//!   `reextract_deps` per dependent). See
-//!   `docs/audits/2026-05-28-6-4-0-substrate-audit/SYNTHESIS.md`.
+//! - **6.4-1 cycle 1 SHIPPED 2026-05-28 (`1a7dfee12b0`):** closes both
+//!   block-on-6.4-entry HIGHs from the 6.4-0 substrate audit. H1 —
+//!   the parallel `is_aggregate_function` / `is_reference_aware_function`
+//!   whitelists in `ql-exec::plan` now derive from metadata via the new
+//!   `ArgContext` axis on `FunctionMetadata`; UDFs registering
+//!   `ArgContext::Aggregate` bind range args correctly. H3 — `PlanCache`
+//!   gained an `fn_gen: u64` field mirroring `name_gen`; `FunctionRegistry`
+//!   bumps it on `register_metadata` / `unregister_metadata` success, so
+//!   the bind cache invalidates and the next eval re-extracts deps with
+//!   current metadata. The 6.4-1 cycle 1 also lands M1 / M3 / M5 / I1 / I2
+//!   from the same audit. See
+//!   `docs/audits/2026-05-28-6-4-0-substrate-audit/SYNTHESIS.md` (6.4-0)
+//!   and
+//!   `docs/audits/2026-05-28-6-4-1-substrate-completion-audit/SYNTHESIS.md`
+//!   (6.4-1 — cycle 2 audit-fix closed 2 net-new HIGHs Opus surfaced).
 //!
 //! ## Ownership model
 //!
@@ -243,12 +249,19 @@ pub(crate) fn is_volatile_function(registry: &FunctionRegistry, name: &str) -> b
 /// explicit enumeration; spelling drift will surface there.
 ///
 /// **6.4-0 substrate (2026-05-28):** consults `FunctionRegistry` metadata
-/// (`DepShape::AddressOnly`) rather than a hardcoded match. The set is
-/// identical for built-ins today (ROW/COLUMN/ROWS/COLUMNS/ISREF) — they
-/// register that variant in `register_builtin_metadata`. Unknown name
+/// (`DepShape::AddressOnly`) rather than a hardcoded match. Unknown name
 /// returns `false`, matching today's `matches!`-default behavior; this
 /// keeps the walker's address-only routing decision stable for typos
 /// and future-but-unregistered names.
+///
+/// **6.4-1 I1 (2026-05-28):** the registered AddressOnly set is now
+/// ROW / COLUMN / ROWS / COLUMNS — ISREF moved to [`DepShape::LazyShape`]
+/// and routes through the parallel [`is_lazy_shape_reference_fn`] shim
+/// BEFORE this one in the walker (`ExprPlan::Function` arm). The two
+/// shims are DISJOINT — this matcher returns `false` for ISREF post-I1,
+/// and `is_lazy_shape_reference_fn` returns `false` for ROW / COLUMN /
+/// ROWS / COLUMNS. The `dep_suppressed_reference_fns_match_design` test
+/// pins both directions of the disjointness invariant.
 pub(crate) fn is_address_only_reference_fn(registry: &FunctionRegistry, name: &str) -> bool {
     matches!(
         registry.metadata(name).map(|m| m.dep_shape),
@@ -520,12 +533,22 @@ pub(crate) fn walk_plan_for_deps(
 }
 
 /// **W5-RT-1 / Step 1.1 (S1-HIGH-A closure):** shape-aware dep walker for
-/// args of address-only reference-aware functions (ROW/COLUMN/ROWS/COLUMNS/
-/// ISREF — see [`is_address_only_reference_fn`]). The default walker
+/// args of address-only reference-aware functions (see
+/// [`is_address_only_reference_fn`]). The default walker
 /// [`walk_plan_for_deps`] would register value-deps on every direct
 /// reference; this walker preserves the dep-suppress semantics for the
 /// shapes that *truly* don't affect the calling fn's result, while still
 /// recursing into eagerly-evaluated subtrees whose inputs DO affect it.
+///
+/// **6.4-1 I1 (2026-05-28):** the address-only set is ROW / COLUMN / ROWS /
+/// COLUMNS (4 names). ISREF used to be the 5th but moved to
+/// [`DepShape::LazyShape`] and now routes through the parallel
+/// [`is_lazy_shape_reference_fn`] shim BEFORE reaching this walker — ISREF
+/// skips arg walking entirely (no value-deps, no volatility propagation,
+/// no nested-fn recording at all). For the 4 names remaining here, the
+/// walker DOES recurse into Binary / Unary / Function sub-trees because
+/// the eager materializer evaluates those (so `ROW(A1+1)` MUST keep A1's
+/// value-dep — the `+1` makes the materializer evaluate A1).
 ///
 /// **Per-shape policy:**
 ///
@@ -1396,27 +1419,37 @@ impl CalcgraphSession {
     /// original (stale) extract, so a subsequent F9 / volatile-pass
     /// would not re-evaluate it.
     ///
-    /// **6.4 must close this** via either:
-    ///   1. An `fn_gen: u64` counter on [`crate::plan_cache::PlanCache`]
-    ///      (mirroring the existing `name_gen` pattern at
-    ///      `plan_cache.rs:69-74`), bumped per
-    ///      `register_function`/`unregister_function`. Plan-cache
-    ///      misses then re-bind + re-extract on next eval.
-    ///   2. Per-dependent `reextract_deps(node, &cached_plan, &workbook,
-    ///      &registry)` calls in the [`crate::session::WorkbookSession`]
-    ///      orchestrator AFTER the registry's `register_metadata` /
-    ///      `unregister_metadata` succeeds, BEFORE this hook fires.
-    ///   3. Or document the policy as "registration only re-extracts
-    ///      formulas bound after registration; pre-registration callers
-    ///      must explicitly re-bind."
+    /// **6.4-1 cycle 1 closure (2026-05-28; H3):** option 1 SHIPPED — an
+    /// `fn_gen: u64` counter on [`crate::plan_cache::PlanCacheKey`]
+    /// (mirroring the existing `name_gen` pattern at
+    /// `plan_cache.rs:60-70`), bumped on every successful
+    /// [`ql_functions::FunctionRegistry::register_metadata`] /
+    /// [`ql_functions::FunctionRegistry::unregister_metadata`] call.
+    /// Plan-cache lookups then miss on the same `text + sheet + name_gen`
+    /// pair when `fn_gen` ticks → next eval re-binds + re-extracts deps
+    /// with the current metadata. Closes the contract §10.3 phrase
+    /// "register_function / unregister_function dirties every formula
+    /// referencing that canonical name (re-extract deps + reschedule)":
+    /// the substrate's hooks (this method + [`Self::on_function_unregistered`])
+    /// satisfy the "dirty every formula" + "reschedule" halves; the
+    /// `fn_gen` counter satisfies the "re-extract deps" half via cache
+    /// invalidation.
     ///
-    /// The substrate provides the building block; 6.4 carries the
-    /// orchestration. The contract §10.3 phrase "register_function /
-    /// unregister_function dirties every formula referencing that
-    /// canonical name (re-extract deps + reschedule)" — the substrate
-    /// satisfies the "dirty every formula" + "reschedule" halves;
-    /// "re-extract deps" lands at the orchestrator level. Tracked
-    /// in 6.4 entry-plan.
+    /// **Subtlety: contract §10.3's unknown-function policy.** The
+    /// formula `=MYUDF(A1)` that bound BEFORE MYUDF was known has stale
+    /// `is_volatile = false` from the bind-time walk against the unknown-
+    /// fn migration shim ([`is_volatile_function`] returns `false` for
+    /// unknown names — see its own docstring at `:191-197`). When the IDE
+    /// registers MYUDF as `Volatility::Volatile` and this hook fires:
+    /// (a) the registry's `fn_gen` bump invalidates the bind cache;
+    /// (b) this hook dirties the dependent formula + transitively fans;
+    /// (c) `recompute_dirty` re-evaluates → cache miss → re-bind →
+    ///     fresh `FormulaDeps` with `is_volatile = true` → entry lands
+    ///     in `volatile_formulas`;
+    /// (d) F9 / volatile-pass now correctly re-evaluates the formula.
+    /// This closes the "transient stale-volatility window" the 6.4-0
+    /// audit-fix flagged as the consequence of substrate-v1 hooks being
+    /// dirty-only.
     ///
     /// **When to fire (6.4):** `WorkbookSession::register_function`
     /// calls this AFTER `FunctionRegistry::register_metadata` AND
