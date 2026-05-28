@@ -790,6 +790,14 @@ const KNOWN_QUANTBOOK_ERROR_CODE_RECORD: Record<Exclude<QuantbookErrorCode, 'unk
 	qbook_unsupported_version: true,
 	qbook_truncated_header: true,
 	qbook_unknown: true,
+	// Phase 6.4-2 (2026-05-28): function-registration codes emitted by
+	// `Session.registerFunction` / `unregisterFunction` via the engine's
+	// `map_function_registry_err` mapper (Appendix A).
+	// `function_exists` covers BOTH the duplicate-register Conflict
+	// AND the unregister-builtin builtin-guard Conflict (the message
+	// disambiguates); `function_not_found` covers unregister-unknown.
+	function_exists: true,
+	function_not_found: true,
 };
 
 /**

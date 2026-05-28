@@ -1571,6 +1571,20 @@ export type QuantbookErrorCode =
 	// Closure: all such errors now carry the `[bad_argument]` prefix
 	// per the napi binding's `bad_argument_error_to_napi` helper.
 	| 'bad_argument'
+	// **Phase 6.4-2 (2026-05-28)**: function-registration codes emitted
+	// by the new `Session.registerFunction` / `unregisterFunction` napi
+	// methods, mapped from `FunctionRegistryError` via the engine's
+	// `map_function_registry_err` (Appendix A `function_exists` /
+	// `function_not_found`). `function_exists` surfaces for BOTH
+	// duplicate UDF registration AND attempts to register/unregister
+	// against a built-in's name (the registry's builtin-guard refuses
+	// removal; the `Conflict` variant is shared with the
+	// duplicate-register case -- the message disambiguates).
+	// `function_not_found` surfaces only for `unregisterFunction` on
+	// an unknown canonical name (never the silent no-op per
+	// No-Fallbacks).
+	| 'function_exists'
+	| 'function_not_found'
 	// Fallback when the message has no recognizable code prefix.
 	// Typically means the error came from non-engine, non-binding
 	// code (napi task panic, JS-side throw, runtime task error
