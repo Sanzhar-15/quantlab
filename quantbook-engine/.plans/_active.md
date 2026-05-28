@@ -327,13 +327,47 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      `cargo test -p ql-exec --lib` **732/0** default + `--features xlsx-write` (+3 new H2 tests vs the
      729 baseline), clippy clean for edits, `node tests/smoke_session.mjs` PASS incl. the new post-close
      `[invalid_state]` + idempotent re-close assertions.
-   - ⭐ **NEXT — 6.4-0 function-metadata substrate** (decision-lock §2 item 5): replace the hardcoded
-     volatility (`calcgraph_session.rs:149-164`) + address-only-reference (`:201-203`) whitelists +
-     dispatch-only `FunctionRegistry` with first-class `FunctionMetadata`
-     (arity/volatility/determinism/dep-shape/batch-shape/arg-policy/cancel/provenance) + the
-     `functions_used` reverse index — the graph-invalidation prerequisite for UDFs not bypassing the
-     Phase-3 graph. Then **6.4 Python UDFs** (the wedge). Tracked cross-cutting:
-     `Sheet::iter_effective_cells()` serializer fix.
+   - ✅ **6.4-0 SHIPPED 2026-05-28** (decision-lock §2 item 5): function-metadata substrate via
+     parallel 2-way audit (Codex `gpt-5.5 xhigh` + Opus reviewer). Cycle 1 code at `ac20a432c63`
+     (+1071/-117 across 8 files); cycle 2 audit-fix at `63592126afe` (+806/-33). The two hardcoded
+     whitelists (`calcgraph_session.rs:149-164/:201-203`) are now metadata-derived; `FormulaDeps`
+     gains `functions_used: Vec<Arc<str>>`; `CalcgraphSession` gains a `functions_used` reverse
+     index + two hooks (`on_function_registered` / `on_function_unregistered`) mirroring
+     `on_set_name`'s transitive-BFS pattern. `FunctionRegistry` gains `metadata: HashMap<String,
+     FunctionMetadata>` + 5 public methods + a `FunctionRegistryError` enum; `default_registry()`
+     runs `register_builtin_metadata` at boot (Phase 1 explicit overrides = prior whitelists
+     byte-for-byte; Phase 2 defaults for every other dispatched fn via `r.fns.keys()`); migration-
+     shim invariant `assert!` at boot (release-build coverage; audit-fix L2). Walker signature
+     gains `&FunctionRegistry`; `rebuild_from_workbook(wb)` keeps zero-arg signature (constructs
+     `default_registry()` internally) + new `_with_registry(wb, registry)` for production paths.
+     Storage gate widened to also cover `functions_used`/`names`/`tables` — closes a latent
+     `ROW(MyName)` cleanup bug. **Verdict SHIP-WITH-FIXES**: 3 HIGH (1 fixed, 2 filed for 6.4
+     entry-plan), 5 MED (2 closed, 3 filed), 4 LOW (all 4 fixed), 5 INFO. Synthesis
+     `docs/audits/2026-05-28-6-4-0-substrate-audit/SYNTHESIS.md`. **Audit-fix `63592126afe`:**
+     H2 (recompute_all cycle pre-pass used `default_registry()` — swapped to
+     `_with_registry(self.registry)`); Codex A LOW (unregister_metadata builtin-guard); L2
+     (assert! migration-shim invariant); L3 (HookCounts parity); M4 + Codex D LOW (5 new
+     substrate tests: ROW + ISREF / ROW(NOW()) registry-propagation + is_volatile / transitive
+     fanout / ROW(MyName) cleanup regression / unregister builtin-guard); H3 doc-honesty
+     correction (hooks are dirty-only; re-extract is the 6.4 orchestrator's responsibility).
+     **Block-on-6.4-entry:** H1 (`ql-exec::plan`'s `is_aggregate_function` `:406-505` +
+     `is_reference_aware_function` `:566-571` survive — UDFs with range args won't bind until
+     these also derive from metadata; substrate is "two-thirds of UDF prerequisite"), H3 (hooks
+     dirty-only; PlanCache needs `fn_gen` counter mirroring `name_gen` OR
+     `WorkbookSession::register_function` orchestrator must call `reextract_deps` per dependent).
+     **Filed for 6.4:** M1 `FormulaDeps::is_empty/len()` lie (only check 2 of 6 fields), M3
+     `iter_metadata` HashMap-order (add `sorted_metadata()` view, matching 6.1C H2 ordering
+     discipline), M5 `FunctionRegistryError → EngineError` mapper + Appendix A rows, I1
+     `DepShape::LazyShape` for ISREF, I2 metadata-update atomicity docs, L1 walker hot-path
+     `to_ascii_uppercase` allocation. **Verification (focused re-verify):** `cargo test -p ql-exec
+     --lib` **742/0** (732 pre-substrate + 6 cycle-1 + 4 audit-fix), `cargo test -p ql-functions
+     --lib` **1815/0**, `cargo check --workspace` clean, clippy clean for edits, Node smoke PASS.
+   - ⭐ **NEXT — 6.4 Python UDFs (the wedge)** (decision-lock §2 item 6): trusted-workspace
+     `qb.show/publish/bind/register_formula_function`, batch Arrow exchange, debugpy-attachable
+     worker process. **Block-on-entry must-fix:** close H1 (plan.rs binder whitelists derive from
+     metadata) + H3 (PlanCache `fn_gen` or orchestrator reextract). **Ship as 6.4-entry substrate-
+     completion increments:** M1 / M3 / M5 / I1 / I2 from the synthesis. Tracked cross-cutting:
+     `Sheet::iter_effective_cells()` serializer fix (still pending).
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +

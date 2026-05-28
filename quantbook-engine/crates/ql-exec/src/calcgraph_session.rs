@@ -53,6 +53,44 @@
 //!   Phase 3.3 may switch to per-name dirty propagation; until then
 //!   the PlanCache covers correctness.
 //!
+//! ## Phase 6.4-0 (2026-05-28) — function-metadata substrate
+//!
+//! - `FormulaDeps` gained `functions_used: Vec<Arc<str>>`; the walker
+//!   pushes the canonical function name at the TOP of the
+//!   `ExprPlan::Function` arm, BEFORE any routing decision, so every
+//!   path (volatile / address-only / ISREF short-circuit / normal)
+//!   participates uniformly.
+//! - `CalcgraphSession` gained `functions_used: HashMap<Arc<str>,
+//!   HashSet<NodeId>>` — the reverse index symmetric to
+//!   `name_to_formulas`. Two new hooks (`on_function_registered` /
+//!   `on_function_unregistered`) dirty + transitive-fan; they are
+//!   dirty-ONLY (no re-extract — that's the 6.4 orchestrator's
+//!   responsibility at the `WorkbookSession::register_function`
+//!   layer; see the hook docstrings for the two closure options).
+//! - The prior whitelists at lines 149-164 / 201-203 are now thin
+//!   migration shims reading `FunctionRegistry::metadata(name)` (a
+//!   first-class store populated at boot by `register_builtin_metadata`
+//!   in `ql-functions/src/registry.rs`). Walker signature gained
+//!   `&FunctionRegistry`; `rebuild_from_workbook(wb)` keeps its
+//!   zero-arg public signature (constructs `default_registry()`
+//!   internally) + new `_with_registry(wb, registry)` for production
+//!   sites that own a session-scoped registry (UDF-aware at 6.4).
+//! - Storage gate widened from `!deps.is_empty() || deps.is_volatile`
+//!   to also cover `!deps.functions_used.is_empty()` /
+//!   `!deps.names.is_empty()` / `!deps.tables.is_empty()` — closes a
+//!   latent `ROW(MyName)` cleanup bug where the address-only walker's
+//!   `names` push (without `named_ranges`) caused
+//!   `name_to_formulas[MYNAME]` to leak on rebind.
+//! - 6.4 entry-plan must close two HIGH carryovers: H1 (the parallel
+//!   `is_aggregate_function` / `is_reference_aware_function`
+//!   whitelists in `ql-exec::plan` that still drive the binder's
+//!   `arg_ctx` decision; UDFs with range args won't bind until these
+//!   derive from metadata too) and H3 (hooks dirty-only; PlanCache
+//!   needs an `fn_gen` counter mirroring `name_gen`, OR the
+//!   `WorkbookSession::register_function` orchestrator must call
+//!   `reextract_deps` per dependent). See
+//!   `docs/audits/2026-05-28-6-4-0-substrate-audit/SYNTHESIS.md`.
+//!
 //! ## Ownership model
 //!
 //! ```text

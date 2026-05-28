@@ -507,14 +507,44 @@ lock**, then `spawn_blocking(|| handle.wait_for_drain())`. Obligations:
 
 ## 10. Function metadata & graph-invalidation contract (R-P6-4 / 6.4-0)
 
-### 10.1 The gap today
-`FunctionRegistry` (`ql-functions/src/registry.rs`) stores **dispatch only** (`RegisteredFn` enum;
-panics on duplicate at `:188`, uppercases lookups at `:281`). Volatility + reference-shape are **two
-hardcoded whitelists** in `calcgraph_session.rs` (`is_volatile_function` `:149-164`;
-`is_address_only_reference_fn` `:201-203`). Critically, `FormulaDeps` (`calcgraph_session.rs:~213`) has
-`cells/named_ranges/names/tables/is_volatile` but **no `functions_used`** — so there is no reverse
-index from a function name to the formulas that call it. A Python UDF cannot be added to a hardcoded
-`match`, and a registration/metadata change cannot dirty its callers → silent graph bypass.
+### 10.1 The gap (CLOSED by 6.4-0 substrate, 2026-05-28; commits `ac20a432c63` + audit-fix `63592126afe`)
+**Pre-substrate (historical):** `FunctionRegistry` (`ql-functions/src/registry.rs`) stored **dispatch only**.
+Volatility + reference-shape lived in **two hardcoded whitelists** in `calcgraph_session.rs`
+(`is_volatile_function` `:149-164`; `is_address_only_reference_fn` `:201-203`); `FormulaDeps`
+had no `functions_used` reverse index. A Python UDF couldn't be added to a hardcoded match,
+and a registration/metadata change couldn't dirty its callers → silent graph bypass.
+
+**Post-substrate (6.4-0 SHIPPED 2026-05-28):**
+- `FunctionRegistry` carries a first-class `metadata: HashMap<String, FunctionMetadata>` keyed by
+  canonical (ASCII-uppercase) name; populated for every builtin via `register_builtin_metadata`
+  at `default_registry()` tail. Public API: `metadata(name)` / `register_metadata(meta)` /
+  `unregister_metadata(name)` / `iter_metadata()` / `metadata_count()`. Dispatched-builtin
+  unregister is REFUSED (`FunctionRegistryError::Conflict`) — preserves the migration-shim
+  invariant. Boot-time `assert!` enforces "every dispatched fn has metadata."
+- `FormulaDeps` gained `functions_used: Vec<Arc<str>>`; walker pushes at the TOP of the
+  `ExprPlan::Function` arm so address-only / ISREF / nested-function paths all record uniformly.
+- `CalcgraphSession` gained `functions_used: HashMap<Arc<str>, HashSet<NodeId>>` (mirror of
+  `name_to_formulas`) + two hooks `on_function_registered(name)` / `on_function_unregistered(name)`
+  with transitive BFS-fanout (same Phase 3.10 H2 pattern as `on_set_name`). Storage gate was
+  widened to also store `formula_deps` when only `names`/`tables`/`functions_used` are populated
+  (closes the latent `ROW(MyName)` cleanup bug).
+- The two prior whitelists are now thin migration shims (`is_volatile_function(registry, name)` →
+  `metadata.volatility ∈ {Volatile, Dynamic}`; `is_address_only_reference_fn(registry, name)` →
+  `metadata.dep_shape == AddressOnly`). Behavior is preserved byte-for-byte against the prior
+  matchers.
+
+**STILL OPEN at 6.4 entry (block-on-entry must-fix; see audit-fix `63592126afe` + synthesis):**
+- **H1** — `ql-exec::plan` carries two more hardcoded `matches!` whitelists
+  (`is_aggregate_function` `plan.rs:406-505`, `is_reference_aware_function` `plan.rs:566-571`)
+  that drive the binder's `arg_ctx` decision. UDFs with range args (every
+  `BatchShape::ArrayBatch` UDF) won't bind until these also derive from registry metadata. The
+  6.4-0 substrate is "two-thirds of the UDF prerequisite"; H1 is the missing third.
+- **H3** — register/unregister hooks dirty + transitive-fan but DO NOT re-extract deps. Contract
+  §10.3 ("re-extract deps + reschedule") requires both halves. The substrate hook is the
+  building block; 6.4 carries the orchestration via either (a) `fn_gen: u64` counter on
+  `crates/ql-exec/src/plan_cache.rs` (mirror `name_gen` at `:69-74`; bump per register/unregister;
+  cache miss triggers re-bind + fresh `FormulaDeps`), or (b) per-dependent `reextract_deps(node,
+  cached_plan, workbook, registry)` in the `WorkbookSession::register_function` orchestrator.
 
 ### 10.2 `FunctionMetadata` (built in 6.4-0; v1 DTO now)
 ```

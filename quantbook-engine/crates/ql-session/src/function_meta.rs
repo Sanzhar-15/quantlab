@@ -1,11 +1,23 @@
 //! Function metadata — the 6.4-0 substrate shape (contract §10.2).
 //!
-//! Today `FunctionRegistry` (`ql-functions/src/registry.rs`) stores **dispatch
-//! only**, and volatility/reference-shape are two hardcoded whitelists in
-//! `calcgraph_session.rs` (`is_volatile_function`, `is_address_only_reference_fn`).
-//! 6.4-0 makes per-function metadata first-class so UDFs participate correctly in
-//! graph invalidation; the hardcoded whitelists become *derived* from registered
-//! metadata. Defined here as a v1 DTO so the shape is locked now.
+//! **Status (2026-05-28): SUBSTRATE SHIPPED.** `FunctionRegistry` now carries
+//! `metadata: HashMap<String, FunctionMetadata>` (`ql-functions/src/registry.rs`),
+//! populated for every builtin via `register_builtin_metadata` at boot. The
+//! two prior whitelists in `calcgraph_session.rs` (`is_volatile_function`,
+//! `is_address_only_reference_fn`) are now thin migration shims that read
+//! `metadata.volatility ∈ {Volatile, Dynamic}` and `metadata.dep_shape ==
+//! AddressOnly` respectively — behavior is preserved byte-for-byte against the
+//! prior hardcoded matchers. `FormulaDeps` gained `functions_used: Vec<Arc<str>>`
+//! and `CalcgraphSession` gained `functions_used: HashMap<Arc<str>,
+//! HashSet<NodeId>>` + two hooks (`on_function_registered` /
+//! `on_function_unregistered`) for contract §10.3 registration-invalidation.
+//! This DTO is the binding-neutral shape the (forthcoming, 6.4) trait method
+//! `EngineSession::register_function` accepts; the substrate hooks at 6.4-0
+//! are dirty-only — re-extraction lands at the 6.4 orchestrator level via
+//! either a PlanCache `fn_gen` counter (mirror `name_gen`) or per-dependent
+//! `reextract_deps` calls in `WorkbookSession::register_function`. See
+//! `docs/api/session-api.md` §10 and
+//! `docs/audits/2026-05-28-6-4-0-substrate-audit/SYNTHESIS.md`.
 
 use serde::{Deserialize, Serialize};
 
