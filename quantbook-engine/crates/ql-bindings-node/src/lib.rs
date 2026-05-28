@@ -413,7 +413,7 @@ fn classify_delta_op(
             removed_sheets.push(*id);
         }
         Op::RegisterFormat { id, .. } => {
-            new_formats.push(id.clone().to_storage());
+            new_formats.push((*id).to_storage());
         }
         Op::BatchCommit { ops } => {
             for inner in ops {
@@ -498,8 +498,7 @@ fn websocket_error_to_napi(e: WebSocketError) -> Error {
 ///
 /// Codes:
 /// - `qbook_error`           -- workbook persistence layer (I/O, schema, malformed cell)
-/// - `session_oplog`         -- op-log Loro snapshot decode (matches existing
-///                              `CollabSessionError::OpLog` code for symmetry)
+/// - `session_oplog`         -- op-log Loro snapshot decode (matches the existing `CollabSessionError::OpLog` code for symmetry)
 /// - `qbook_unsupported_version` -- `oplog.bin` schema version out of band
 /// - `qbook_truncated_header`    -- `oplog.bin` magic-prefix present but header < 8 bytes
 fn persistence_error_to_napi(e: PersistenceError) -> Error {
@@ -537,31 +536,6 @@ fn persistence_error_to_napi(e: PersistenceError) -> Error {
 fn bad_argument_error(message: String) -> Error {
     Error::from_reason(format!("[bad_argument] {message}"))
 }
-
-/// **Phase 5.7 V3.4.0.5 (2026-05-23) -- JS-facing PresenceState.**
-///
-/// Mirrors `ql_collab::presence::PresenceState` for the napi boundary.
-/// Plain data struct (no methods) marked `#[napi(object)]` so napi-rs
-/// generates a TypeScript interface with structural typing.  Field
-/// names use camelCase to follow JS conventions (engine uses snake_case);
-/// napi-rs maps Rust `snake_case` field names to JS `camelCase` by
-/// default but the explicit conversion below makes the contract obvious
-/// to readers.
-///
-/// All fields are required (no `Option`); the engine's `PresenceState`
-/// is a `#[derive(Default)]`-able struct so callers can build minimal
-/// state by setting cursor coords + `selectionEnd*` to match (collapsed
-/// selection) + `typing: false`.
-///
-/// **Coordinate semantics** (carries from engine): `(sheet, row, col)`
-/// = cursor cell; `(selectionEndRow, selectionEndCol)` = opposite
-/// corner of selection rectangle (equals cursor coords when no range
-/// selected); `typing` = true while peer is mid-edit (soft hint for IDE
-/// cursor styling).
-///
-/// (The `#[napi(object)]` attribute for `PresenceStateJson` lives at the
-/// struct definition further down, after the V3.5.0.2 snapshot-related
-/// structs are defined.)
 
 /// **Phase 5.7 V3.5.0.2 (2026-05-24) -- JS-facing cell value mirror.**
 ///
@@ -1084,6 +1058,26 @@ pub struct WorkbookSnapshotDeltaJson {
     pub full_rebuild_required: bool,
 }
 
+/// **Phase 5.7 V3.4.0.5 (2026-05-23) -- JS-facing PresenceState.**
+///
+/// Mirrors `ql_collab::presence::PresenceState` for the napi boundary.
+/// Plain data struct (no methods) marked `#[napi(object)]` so napi-rs
+/// generates a TypeScript interface with structural typing.  Field
+/// names use camelCase to follow JS conventions (engine uses snake_case);
+/// napi-rs maps Rust `snake_case` field names to JS `camelCase` by
+/// default but the explicit conversion makes the contract obvious to
+/// readers.
+///
+/// All fields are required (no `Option`); the engine's `PresenceState`
+/// is a `#[derive(Default)]`-able struct so callers can build minimal
+/// state by setting cursor coords + `selectionEnd*` to match (collapsed
+/// selection) + `typing: false`.
+///
+/// **Coordinate semantics** (carries from engine): `(sheet, row, col)`
+/// = cursor cell; `(selectionEndRow, selectionEndCol)` = opposite
+/// corner of selection rectangle (equals cursor coords when no range
+/// selected); `typing` = true while peer is mid-edit (soft hint for IDE
+/// cursor styling).
 #[napi(object)]
 pub struct PresenceStateJson {
     pub sheet: u16,
@@ -2784,8 +2778,8 @@ impl CollabSession {
         // within the same kind, non-deterministic across runs.
         // Mirrors `workbook_snapshot.formats`'s
         // `sort_by_key(|(id, _)| *id)` discipline (V3.6.0.X audit-of-
-        // D2 CONVERGENT-MED-1 closure).
-        let mut new_format_ids = new_format_ids;
+        // D2 CONVERGENT-MED-1 closure). `new_format_ids` is already `mut`
+        // (declared above), so sort/dedup it in place.
         new_format_ids.sort();
         new_format_ids.dedup();
         let mut formats_added: Vec<FormatDefJson> = Vec::new();
