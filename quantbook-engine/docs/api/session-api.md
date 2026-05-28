@@ -533,7 +533,7 @@ and a registration/metadata change couldn't dirty its callers → silent graph b
   `metadata.dep_shape == AddressOnly`). Behavior is preserved byte-for-byte against the prior
   matchers.
 
-**STILL OPEN at 6.4 entry (block-on-entry must-fix; see audit-fix `63592126afe` + synthesis):**
+**STILL OPEN at 6.4 entry (block-on-entry must-fix; see audit-fix `63592126afe` + synthesis at `docs/audits/2026-05-28-6-4-0-substrate-audit/SYNTHESIS.md` + entry plan at `docs/phase6/6-4-entry-plan.md`):**
 - **H1** — `ql-exec::plan` carries two more hardcoded `matches!` whitelists
   (`is_aggregate_function` `plan.rs:406-505`, `is_reference_aware_function` `plan.rs:566-571`)
   that drive the binder's `arg_ctx` decision. UDFs with range args (every
