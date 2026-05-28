@@ -123,7 +123,14 @@ pub enum CellValue {
 }
 
 /// A format identifier — builtin index or session-custom (peer, counter).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Ord`/`PartialOrd` are derived so consumers (and the in-engine
+/// `WorkbookSession::snapshot` / `snapshot_delta` deterministic-ordering pass
+/// added by the 6.1C audit-fix H2) can sort `formats` / `formats_added`
+/// stably. Variant order (`Builtin` < `Custom`) + tuple-of-fields order
+/// matches the storage-side `ql_storage::FormatId`'s derive, so the wire-
+/// observable ordering is identical regardless of which side does the sort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum FormatId {
     /// Builtin format index.

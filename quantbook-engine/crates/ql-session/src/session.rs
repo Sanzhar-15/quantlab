@@ -153,7 +153,17 @@ pub trait EngineSession {
     /// Set a formula (lex+parse+bind+eval). Parse/bind failure → `Compute`
     /// error or `Diagnostic`, never silently dropped (§5.5).
     fn set_formula(&mut self, addr: CellAddr, text: &str) -> EngineResult<()>;
-    /// Clear a cell.
+    /// Clear a cell's formula — **convert-to-literal**: removes the formula
+    /// association but PRESERVES the last computed value (Excel "convert to
+    /// value"; matches `clear_formula` / the inc.2c-6 contract).
+    ///
+    /// To delete cell contents entirely (value + any formula in one atomic op),
+    /// call [`Self::set_value`] with [`CellValue::Blank`] — the runtime emits
+    /// `ClearValue + ClearFormula` together when a formula was present,
+    /// otherwise just the value clear, closing the seed input #5
+    /// "delete-contents" question without a separate `delete_cell` command
+    /// (6.1C audit-fix L1; verified at `crates/ql-exec/src/workbook_runtime/cells.rs`
+    /// `set_value` Blank arm).
     fn clear(&mut self, addr: CellAddr) -> EngineResult<()>;
     /// Set a cell format.
     fn set_format(&mut self, addr: CellAddr, format: FormatId) -> EngineResult<()>;

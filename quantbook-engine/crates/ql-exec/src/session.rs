@@ -149,6 +149,27 @@ struct ChangeRecord {
     change: SessionChange,
 }
 
+/// RAII guard that transitions the session to [`LifecycleState::Faulted`] if
+/// dropped while still armed (i.e., the wrapped block panicked). Lifted to
+/// module scope from the two inline copies in [`WorkbookSession::with_runtime`]
+/// and [`WorkbookSession::with_runtime_no_oplog`] so the **6.1C audit-fix M3**
+/// non-runtime mutator paths (`delete_sheet`, `restore_sheet`, `move_sheet`,
+/// `mark_volatiles_dirty`, and `batch`'s Phase 2 op-log append) can reuse it
+/// without duplicating the pattern. Disarmed on the normal return path; the
+/// drop is a no-op when `armed == false`.
+struct FaultGuard<'g> {
+    state: &'g mut LifecycleState,
+    armed: bool,
+}
+
+impl Drop for FaultGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            *self.state = LifecycleState::Faulted;
+        }
+    }
+}
+
 /// The owning, single-writer engine session (contract §2.1).
 ///
 /// Bindings wrap this behind an opaque handle (Node: `#[napi]` over
@@ -326,26 +347,22 @@ impl WorkbookSession {
     /// **Panic safety (F3 / contract §8):** `f` runs the engine kernels, which
     /// contain reachable `.expect`/`panic!` (e.g. the recompute/spill paths). If
     /// `f` unwinds, the plan-cache restore below is skipped (leaving the cache
-    /// taken/empty) and the session may be mid-edit. A `FaultGuard` marks the
+    /// taken/empty) and the session may be mid-edit. A [`FaultGuard`] marks the
     /// session `Faulted` on unwind so no later command runs against torn state —
     /// never silently `Ready`/`Busy`. It is disarmed on the normal return path.
-    /// (Under `panic = "abort"` — today's default — the unwind never runs; this
-    /// becomes live once the binding shim builds with `panic = "unwind"` + a
-    /// boundary `catch_unwind`, per §8.2. The guard is the in-engine half of
-    /// that contract.)
+    ///
+    /// **6.1C audit-fix A-INFO/L-E6 — panic-default rationale corrected.** The
+    /// prior docstring claimed `panic = "abort"` was "today's default"; this is
+    /// factually wrong (the workspace `Cargo.toml` does not set `panic`, so the
+    /// cargo default for release cdylib is `unwind`). The operational behavior
+    /// (a `Session` method panic aborts the host) is still correct, but for the
+    /// **napi-derive opt-in** reason: napi-rs only wraps panics into JS errors
+    /// when `#[napi(catch_unwind)]` is set, and the `Session` class does not set
+    /// it (tracked 6.1C M1 → 6.3). Unwinding through the generated `extern "C"`
+    /// callback aborts. Once 6.3 lands `#[napi(catch_unwind)]` per method, this
+    /// in-engine guard becomes the half that ensures even a catch-unwind'd panic
+    /// leaves the session sealed (`Faulted`) rather than torn.
     fn with_runtime<R>(&mut self, f: impl FnOnce(&mut WorkbookRuntime<'_>) -> R) -> R {
-        struct FaultGuard<'g> {
-            state: &'g mut LifecycleState,
-            armed: bool,
-        }
-        impl Drop for FaultGuard<'_> {
-            fn drop(&mut self) {
-                if self.armed {
-                    *self.state = LifecycleState::Faulted;
-                }
-            }
-        }
-
         let cache = std::mem::take(&mut self.plan_cache);
         // Borrows `self.state`; the runtime below borrows the other (disjoint)
         // fields, so both coexist within this function.
@@ -374,18 +391,6 @@ impl WorkbookSession {
     /// [`with_runtime`]: WorkbookSession::with_runtime
     /// [`batch`]: WorkbookSession::batch
     fn with_runtime_no_oplog<R>(&mut self, f: impl FnOnce(&mut WorkbookRuntime<'_>) -> R) -> R {
-        struct FaultGuard<'g> {
-            state: &'g mut LifecycleState,
-            armed: bool,
-        }
-        impl Drop for FaultGuard<'_> {
-            fn drop(&mut self) {
-                if self.armed {
-                    *self.state = LifecycleState::Faulted;
-                }
-            }
-        }
-
         let cache = std::mem::take(&mut self.plan_cache);
         let mut guard = FaultGuard {
             state: &mut self.state,
@@ -502,9 +507,22 @@ impl WorkbookSession {
         }
     }
 
+    /// Allocate the next operation id.
+    ///
+    /// **6.1C audit-fix M6 (partial) — `checked_add` consistency with
+    /// `next_txn_id` (`begin_transaction`).** Plain `+= 1` would wrap on the
+    /// (practically unreachable) 2^64th allocation, silently reusing a live
+    /// op-id. Fail loud instead — the loud path matches the
+    /// `transaction_id_exhausted` pattern next door, and a panic here trips the
+    /// `with_runtime` FaultGuard on the calling path so the session seals
+    /// (`Faulted`) rather than continuing with a colliding id. (Bounded
+    /// retention of `ops` is the broader M6 follow-up filed for 6.3.)
     fn next_op(&mut self) -> OperationId {
         let id = OperationId(self.next_op_id);
-        self.next_op_id += 1;
+        self.next_op_id = self
+            .next_op_id
+            .checked_add(1)
+            .expect("operation id space exhausted (2^64 ops in one session)");
         id
     }
 
@@ -1386,10 +1404,33 @@ impl EngineSession for WorkbookSession {
         // here, matching the engine's current cross-sheet-ref handling. Formulas
         // referencing a tombstoned sheet stay readable — see the F9 note on
         // `require_live_sheet`.)
-        self.oplog
-            .append(Op::RemoveSheet { id })
-            .map_err(oplog_append_err)?;
-        self.workbook.remove_sheet(id);
+        //
+        // **6.1C audit-fix M3:** bracket the append+mutate window with a
+        // `FaultGuard` so a panic mid-flight transitions →`Faulted` rather than
+        // leaving `state = Ready` with the op-log torn from the workbook. The
+        // graceful `Err` from `oplog.append` disarms before propagating; only an
+        // actual unwind triggers the fault. The block scope releases the
+        // guard's `&mut self.state` borrow before `record_changes` runs.
+        {
+            let mut guard = FaultGuard {
+                state: &mut self.state,
+                armed: true,
+            };
+            match self
+                .oplog
+                .append(Op::RemoveSheet { id })
+                .map_err(oplog_append_err)
+            {
+                Ok(()) => {
+                    self.workbook.remove_sheet(id);
+                    guard.armed = false;
+                }
+                Err(e) => {
+                    guard.armed = false;
+                    return Err(e);
+                }
+            }
+        }
         self.record_changes([SessionChange::SheetRemoved { id }]);
         Ok(())
     }
@@ -1407,10 +1448,28 @@ impl EngineSession for WorkbookSession {
                 format!("restore_sheet: sheet {id} is not deleted (nothing to restore)"),
             ));
         }
-        self.oplog
-            .append(Op::RestoreSheet { id })
-            .map_err(oplog_append_err)?;
-        self.workbook.restore_sheet(id);
+        // **6.1C audit-fix M3:** FaultGuard around append+mutate (see
+        // `delete_sheet` for the rationale; same pattern).
+        {
+            let mut guard = FaultGuard {
+                state: &mut self.state,
+                armed: true,
+            };
+            match self
+                .oplog
+                .append(Op::RestoreSheet { id })
+                .map_err(oplog_append_err)
+            {
+                Ok(()) => {
+                    self.workbook.restore_sheet(id);
+                    guard.armed = false;
+                }
+                Err(e) => {
+                    guard.armed = false;
+                    return Err(e);
+                }
+            }
+        }
         // A restored sheet reappears at its preserved display position, which the
         // delta DTO cannot convey → bump the epoch so consumers reseed (rare).
         self.bump_epoch();
@@ -1438,13 +1497,31 @@ impl EngineSession for WorkbookSession {
         if current == Some(index as usize) {
             return Ok(());
         }
-        self.oplog
-            .append(Op::MoveSheet {
-                id,
-                new_index: index,
-            })
-            .map_err(oplog_append_err)?;
-        self.workbook.move_sheet(id, index);
+        // **6.1C audit-fix M3:** FaultGuard around append+mutate (see
+        // `delete_sheet` for the rationale; same pattern).
+        {
+            let mut guard = FaultGuard {
+                state: &mut self.state,
+                armed: true,
+            };
+            match self
+                .oplog
+                .append(Op::MoveSheet {
+                    id,
+                    new_index: index,
+                })
+                .map_err(oplog_append_err)
+            {
+                Ok(()) => {
+                    self.workbook.move_sheet(id, index);
+                    guard.armed = false;
+                }
+                Err(e) => {
+                    guard.armed = false;
+                    return Err(e);
+                }
+            }
+        }
         // A reorder cannot be expressed by the delta DTO (no order field) →
         // bump the epoch so consumers reseed for the new order (rare).
         self.bump_epoch();
@@ -1821,9 +1898,25 @@ impl EngineSession for WorkbookSession {
                 version: self.current_version(),
             });
         }
-        self.oplog
-            .append(Op::BatchCommit { ops: inner_ops })
-            .map_err(oplog_append_err)?;
+        // **6.1C audit-fix M3:** Phase 2 (the single `Op::BatchCommit` append)
+        // runs OUTSIDE `with_runtime_no_oplog`'s FaultGuard. A Loro-internal
+        // panic during `append` (practically unreachable, but the contract §8
+        // promise is "panic → Faulted, not Ready") would otherwise leave the
+        // session in `Ready` with a partially-written op-log. Bracket the
+        // append in a `FaultGuard` so an unwind here seals the session, and
+        // Phase 3 below (inside `with_runtime_no_oplog`) preserves its own.
+        {
+            let mut guard = FaultGuard {
+                state: &mut self.state,
+                armed: true,
+            };
+            let append_res = self
+                .oplog
+                .append(Op::BatchCommit { ops: inner_ops })
+                .map_err(oplog_append_err);
+            guard.armed = false;
+            append_res?;
+        }
 
         // --- Phase 3: apply every op through a graph-maintaining runtime with
         // the op-log DETACHED, so the workbook + calcgraph update but NO second
@@ -1969,10 +2062,20 @@ impl EngineSession for WorkbookSession {
 
     fn mark_volatiles_dirty(&mut self) -> EngineResult<()> {
         self.ensure_ready()?;
+        // **6.1C audit-fix M3:** the graph mutator runs outside `with_runtime`
+        // (no op-log append, no workbook mutation), but a panic here would still
+        // leave the calcgraph in a half-marked state with `state = Ready`. Wrap
+        // in a FaultGuard so any unwind seals the session → `Faulted` per the
+        // contract §8 panic-safety promise.
+        let mut guard = FaultGuard {
+            state: &mut self.state,
+            armed: true,
+        };
         let nodes: Vec<_> = self.graph.volatile_formulas().iter().copied().collect();
         for node in nodes {
             self.graph.mark_dirty(node);
         }
+        guard.armed = false;
         Ok(())
     }
 
@@ -2048,7 +2151,15 @@ impl EngineSession for WorkbookSession {
                 sheets.push(snap);
             }
         }
-        let formats = self
+        // **6.1C audit-fix H2 — deterministic `formats` ordering.** The
+        // upstream `FormatTable::iter()` is HashMap-backed (arbitrary order, per
+        // `ql-storage/src/format.rs`), while the shared `WorkbookSnapshot.formats`
+        // docs promise sorted-by-`FormatId` (`crates/ql-bindings-node/src/lib.rs`
+        // `WorkbookSnapshotJson.formats`; `CollabSession`'s napi delta path
+        // already sorts). Sort here so EVERY binding sees a stable order and
+        // golden-test diffs / `JSON.stringify`-equal comparisons hold. Cost is
+        // O(n log n) on the format-table size (typically < 100); negligible.
+        let mut formats: Vec<FormatDef> = self
             .workbook
             .formats()
             .iter()
@@ -2057,6 +2168,7 @@ impl EngineSession for WorkbookSession {
                 string: s.to_string(),
             })
             .collect();
+        formats.sort_by_key(|fd| fd.id);
         let date_system = date_system_to_dto(self.workbook.date_system());
         Ok(WorkbookSnapshot {
             schema_version: SCHEMA_VERSION,
@@ -2154,13 +2266,13 @@ impl EngineSession for WorkbookSession {
                 sheets_changed.push(snap);
             }
         }
-        let sheets_removed: Vec<SheetId> = removed_sheets
+        let mut sheets_removed: Vec<SheetId> = removed_sheets
             .into_iter()
             .filter(|id| self.workbook.is_sheet_removed(*id))
             .collect();
 
         // Resolve added formats to their current `FormatDef`.
-        let formats_added: Vec<FormatDef> = added_formats
+        let mut formats_added: Vec<FormatDef> = added_formats
             .into_iter()
             .filter_map(|id| {
                 self.workbook
@@ -2173,6 +2285,21 @@ impl EngineSession for WorkbookSession {
                     })
             })
             .collect();
+
+        // **6.1C audit-fix H2 — deterministic ordering across all five delta
+        // collections.** The HashSet walks above (`changed_coords`,
+        // `changed_sheets`, `removed_sheets`, `added_formats`) produce arbitrary
+        // iteration order, so consecutive deltas with identical logical content
+        // would otherwise differ on the wire. Sort each output by its natural
+        // key so consumers get byte-stable JSON, golden-test diffs hold, and
+        // every binding sees the same shape (CollabSession's napi delta path
+        // already sorts the comparable arrays). Cost is O(n log n) on the per-
+        // call change-count, dwarfed by `build_cell_snapshot` / `build_sheet_snapshot`.
+        changed_cells.sort_by_key(|c| (c.sheet, c.cell.row, c.cell.col));
+        removed_cells.sort_by_key(|c| (c.sheet, c.row, c.col));
+        sheets_changed.sort_by_key(|s| s.id);
+        sheets_removed.sort_unstable();
+        formats_added.sort_by_key(|fd| fd.id);
 
         Ok(WorkbookSnapshotDelta {
             schema_version: SCHEMA_VERSION,
@@ -5113,5 +5240,140 @@ mod tests {
             .unwrap();
         assert!(!s.can_redo(), "a new edit must clear the redo stack");
         assert!(s.can_undo());
+    }
+
+    // === 6.1C audit-fix H2 — deterministic ordering across snapshot DTOs ===
+
+    /// `snapshot.formats` must be sorted by `FormatId` regardless of the
+    /// underlying `FormatTable::iter` HashMap order. Without the audit-fix
+    /// sort, two consecutive snapshots in DIFFERENT processes (each with its
+    /// own per-process HashMap hash seed) could disagree, breaking the
+    /// shared-DTO documented contract that `formats` is sorted by `FormatId`.
+    #[test]
+    fn snapshot_formats_are_sorted_by_format_id() {
+        let mut s = WorkbookSession::new();
+        // Register several formats; the assigned FormatIds are `Custom{peer,
+        // counter}` whose counter advances per registration. The test doesn't
+        // care what the IDs are — only that the output Vec is sorted.
+        for fmt in ["0.00", "@", "yyyy-mm-dd", "0%", "$#,##0.00"] {
+            s.register_format(fmt).unwrap();
+        }
+        let snap = s.snapshot().unwrap();
+        assert!(snap.formats.len() >= 5, "all registered formats present");
+        let ids: Vec<_> = snap.formats.iter().map(|fd| fd.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "snapshot.formats must be sorted by FormatId");
+    }
+
+    /// `snapshot_delta.changed_cells` / `removed_cells` / `sheets_changed` /
+    /// `sheets_removed` / `formats_added` MUST all be sorted by their natural
+    /// key. The HashSet walks that populate the intermediate sets produce
+    /// arbitrary order, so without the audit-fix sort the wire output would
+    /// be nondeterministic for identical logical content.
+    #[test]
+    fn snapshot_delta_collections_are_sorted_deterministically() {
+        let mut s = WorkbookSession::new();
+        // Two sheets so the (sheet, row, col) tie-breaker is exercised.
+        let sa = s.add_sheet("A", 16384).unwrap();
+        let sb = s.add_sheet("B", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+
+        // Cell writes in REVERSE of the expected sort order on both sheets.
+        for (sheet, row, col) in [
+            (sb, 5, 3),
+            (sb, 1, 0),
+            (sa, 7, 2),
+            (sa, 0, 0),
+            (sa, 0, 5),
+            (sa, 4, 1),
+        ] {
+            s.set_value(addr(sheet, row, col), CellValue::Number { number: 1.0 })
+                .unwrap();
+        }
+        // A removed cell: write then clear → ends up in `removed_cells`.
+        s.set_value(addr(sa, 9, 9), CellValue::Number { number: 1.0 })
+            .unwrap();
+        s.set_value(addr(sa, 9, 9), CellValue::Blank).unwrap();
+        s.set_value(addr(sb, 8, 8), CellValue::Number { number: 2.0 })
+            .unwrap();
+        s.set_value(addr(sb, 8, 8), CellValue::Blank).unwrap();
+
+        // Two formats so `formats_added` ordering is exercised.
+        s.register_format("0.00%").unwrap();
+        s.register_format("yyyy").unwrap();
+
+        let d = s.snapshot_delta(&v0).unwrap();
+        assert!(!d.full_rebuild_required);
+
+        // Each output Vec must be in sorted order by its natural key.
+        let cell_keys: Vec<_> = d
+            .changed_cells
+            .iter()
+            .map(|c| (c.sheet, c.cell.row, c.cell.col))
+            .collect();
+        let mut cell_sorted = cell_keys.clone();
+        cell_sorted.sort();
+        assert_eq!(
+            cell_keys, cell_sorted,
+            "changed_cells must be sorted by (sheet, row, col)"
+        );
+
+        let removed_keys: Vec<_> = d
+            .removed_cells
+            .iter()
+            .map(|c| (c.sheet, c.row, c.col))
+            .collect();
+        let mut removed_sorted = removed_keys.clone();
+        removed_sorted.sort();
+        assert_eq!(
+            removed_keys, removed_sorted,
+            "removed_cells must be sorted by (sheet, row, col)"
+        );
+
+        let sheet_ids: Vec<_> = d.sheets_changed.iter().map(|sh| sh.id).collect();
+        let mut sheet_sorted = sheet_ids.clone();
+        sheet_sorted.sort();
+        assert_eq!(
+            sheet_ids, sheet_sorted,
+            "sheets_changed must be sorted by id"
+        );
+
+        let mut removed_sheets_sorted = d.sheets_removed.clone();
+        removed_sheets_sorted.sort();
+        assert_eq!(
+            d.sheets_removed, removed_sheets_sorted,
+            "sheets_removed must be sorted"
+        );
+
+        let format_ids: Vec<_> = d.formats_added.iter().map(|fd| fd.id).collect();
+        let mut format_sorted = format_ids.clone();
+        format_sorted.sort();
+        assert_eq!(
+            format_ids, format_sorted,
+            "formats_added must be sorted by FormatId"
+        );
+    }
+
+    /// Two snapshots taken back-to-back against the same workbook state must
+    /// be IDENTICAL — without the audit-fix sort, two `snapshot()` calls
+    /// would already agree within a process (HashMap's hasher seed is
+    /// stable per HashMap instance), but the wire output would diverge
+    /// across processes. This test catches a regression that would break the
+    /// stability guarantee at the same locus (Vec field ordering).
+    #[test]
+    fn snapshot_formats_are_stable_across_calls() {
+        let mut s = WorkbookSession::new();
+        for fmt in ["@", "0.00", "yyyy-mm-dd", "0%"] {
+            s.register_format(fmt).unwrap();
+        }
+        let a = s.snapshot().unwrap();
+        let b = s.snapshot().unwrap();
+        let ids_a: Vec<_> = a.formats.iter().map(|fd| fd.id).collect();
+        let ids_b: Vec<_> = b.formats.iter().map(|fd| fd.id).collect();
+        assert_eq!(
+            ids_a, ids_b,
+            "two consecutive snapshots must produce identical formats order"
+        );
     }
 }

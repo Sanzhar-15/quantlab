@@ -4399,6 +4399,23 @@ impl Session {
             })
             .collect())
     }
+
+    /// Deterministically release the underlying [`ql_exec::WorkbookSession`]
+    /// state — transitions the session to `Closed` (terminal). Subsequent
+    /// command calls return a structured `[invalid_state]` engine error rather
+    /// than panic. Any open transaction buffers are dropped (their handles
+    /// become `[transaction_not_found]` if reused, never silent no-ops).
+    ///
+    /// **6.1C audit-fix M8 — closes the lifecycle hole.** Without this,
+    /// JS-side the only way to free the workbook + op-log + plan cache + Loro
+    /// substrate was to GC the JS handle — non-deterministic, can hold large
+    /// workbooks in memory long after the IDE panel closes. Calling `close()`
+    /// frees the engine state synchronously (engine `WorkbookSession::close`
+    /// at `crates/ql-exec/src/session.rs`).
+    #[napi(js_name = "close")]
+    pub fn close(&self) -> Result<()> {
+        self.inner.lock().close().map_err(engine_error_to_napi)
+    }
 }
 
 // **Phase 6.1B inc.2d (2026-05-27) — Send + Sync positive proof (audit Rule 4).**

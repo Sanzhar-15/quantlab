@@ -127,4 +127,23 @@ assert.throws(
   "unknown value kind surfaces a structured [bad_argument] error",
 );
 
-console.log("[smoke] PASS — edit/recalc/snapshot through WorkbookSession over napi");
+// **6.1C audit-fix M8 — Session.close() deterministic lifecycle release.**
+// Post-close any command call returns a structured [invalid_state] error, not
+// a panic / silent failure. Closes the lifecycle hole flagged by the megaudit
+// (engine has `close()`; without the napi wrapper JS could only GC-free the
+// underlying workbook). The double-close is a no-op (idempotent terminal).
+s.close();
+assert.throws(
+  () => s.cell(sheetId, 0, 0),
+  /\[invalid_state\]/,
+  "post-close cell() must fail loud with [invalid_state]",
+);
+assert.throws(
+  () => s.setValue(sheetId, 0, 0, { kind: "number", number: 42 }),
+  /\[invalid_state\]/,
+  "post-close setValue() must fail loud with [invalid_state]",
+);
+// Idempotent: re-closing a Closed session is a no-op (state stays Closed).
+s.close();
+
+console.log("[smoke] PASS — edit/recalc/snapshot/close through WorkbookSession over napi");
