@@ -617,9 +617,25 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      - [x] Memory: `current_work.md` + `MEMORY.md` pointer updated for 6.4-2.
      </details>
 
-     Then **6.4-3 Python worker + Arrow exchange + debugpy** (the most substantial sub-increment;
-     3-way audit), then **6.4-4 exit-tests + closure megaudit** (5-way). Tracked cross-cutting:
-     `Sheet::iter_effective_cells()` serializer fix (still pending).
+   - ⭐ **NEXT — 6.4-3 Python worker + Arrow exchange + debugpy.** ✅ DESIGNED 2026-05-28 at
+     `docs/phase6/6-4-3-design.md` (the entry-plan sketch was one paragraph; the design resolves the
+     central decisions). Ground truth: `quantbook-py` is a 20-line stub (greenfield); `RegisteredFn`
+     has no `Udf` variant; `scalar.rs:463` returns #NAME? for registered-but-undispatchable UDFs.
+     **Key decisions:** Model A (inline blocking worker call, timeout-guarded — fits the sync recalc;
+     protocol kept batch-ready so the `BatchShape::ArrayBatch` batched model is a later additive
+     optimization); new leaf crate `ql-udf` (process+IPC, dependency-inversion like ql-io-csv);
+     plain-Python worker over length-prefixed Arrow-IPC framing (no PyO3 in the hot path — debugpy-
+     friendly); `RegisteredFn::Udf(FunctionImplHandle)` dispatch tier + a `scalar.rs` arm + an
+     `Option<&WorkerHandle>` on `EvalContext`; worker-kill = hard cancel (contract §6.2);
+     trusted-workspace gating. **Cycle decomposition (multi-session per entry-plan §6 "2-3 sessions"):**
+     6.4-3a protocol + `ql-udf` + Arrow↔Value codec against a mock responder (Rust-only, 2-way);
+     6.4-3b real Python worker spawn/handshake/kill (2-way); 6.4-3c eval wiring end-to-end (3-way);
+     6.4-3d debugpy + trusted-workspace + IDE bridge (3-way). Then **6.4-4 exit-tests + closure
+     megaudit** (5-way; contract §10.4 tests 1-8). **Open questions at impl start** (§10 of the
+     design): transport (lean stdio), python discovery, arrow dep surface, re-examine 6.4-2
+     `register_udf` atomicity once it also inserts a `RegisteredFn::Udf` dispatch entry (3-way atomic),
+     EvalContext worker-threading churn. Tracked cross-cutting (still pending): `Sheet::iter_effective_cells()`
+     serializer fix.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +
