@@ -2368,6 +2368,7 @@ name = "ql-functions"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "ql-session",
  "ql-types",
  "statrs",
 ]

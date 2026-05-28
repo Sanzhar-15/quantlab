@@ -11,6 +11,13 @@ path = "src/lib.rs"
 
 [dependencies]
 ql-types = { path = "../ql-types" }
+# **6.4-0 substrate (2026-05-28):** the registry now stores first-class
+# `FunctionMetadata` (contract §10.2) so volatility / dep-shape become a
+# property of registration rather than two hardcoded whitelists in
+# `ql-exec::calcgraph_session`. The DTO lives in `ql-session` (the binding-
+# neutral contract crate); `ql-functions` consumes the contract one-way.
+# No cycle — `ql-session` does not depend on `ql-functions`.
+ql-session = { path = "../ql-session" }
 # **W5-D-1 (Wave 3 distributions batch):** statrs ports IronCalc's
 # statistical distributions (NORM.* / T.* / CHISQ.* / F.* / BINOM.* /
 # POISSON.* / GAMMA.* / BETA.*). Pinned to IronCalc's version for

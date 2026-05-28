@@ -56,8 +56,8 @@ pub use reference_aware_fns::{
     ReferenceQuery, NO_OP_REFERENCE_QUERY,
 };
 pub use registry::{
-    default_registry, FunctionArg, FunctionContext, FunctionFn, FunctionRegistry, FunctionReturn,
-    RegisteredFn, ScalarFn,
+    default_registry, FunctionArg, FunctionContext, FunctionFn, FunctionRegistry,
+    FunctionRegistryError, FunctionReturn, RegisteredFn, ScalarFn,
 };
 pub use volatile::{clear_test_overrides, set_test_now_secs, set_test_rng_seed};
 pub use welford::{

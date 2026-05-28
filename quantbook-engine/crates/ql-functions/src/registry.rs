@@ -29,6 +29,9 @@
 
 use std::collections::HashMap;
 
+use ql_session::function_meta::{
+    ArgPolicy, Arity, BatchShape, CancelPolicy, DepShape, FunctionMetadata, Volatility,
+};
 use ql_types::{ArrayValue, EvalContext, Value};
 
 use crate::context_aware_fns::ContextAwareFn;
@@ -38,6 +41,45 @@ use crate::{
     date_fns, distribution_fns, financial_fns, format, range_fns, reference_fns, scalar_fns,
     volatile,
 };
+
+/// **6.4-0 (2026-05-28):** registry-level error type for the new
+/// metadata-only registration methods (`register_metadata` /
+/// `unregister_metadata`). Dispatch-side registration (`register`,
+/// `register_range_aware`, …) still panics on collision because the
+/// builtin-population path has no recoverable failure mode — a duplicate
+/// `r.register("SUM", …)` is a programming bug, not a runtime condition.
+///
+/// The metadata side is different: UDFs register at runtime under the
+/// `EngineSession::register_function` trait method (6.4) which must
+/// translate this enum into the contract-specified `EngineError`
+/// (`Conflict / function_exists`, `NotFound / function_not_found`) per
+/// `docs/api/session-api.md` §10.3. Returning errors here keeps the
+/// fail-loud contract (No-Fallbacks rule) without panicking the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FunctionRegistryError {
+    /// `register_metadata` saw a canonical name that is already present
+    /// (built-in or existing UDF). Carries the offending name verbatim.
+    Conflict { name: String },
+    /// `unregister_metadata` was called for a name with no metadata
+    /// entry — never a silent no-op (would mask a typo that becomes
+    /// "leaked stale metadata" once 6.4 lands UDFs).
+    NotFound { name: String },
+}
+
+impl std::fmt::Display for FunctionRegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict { name } => {
+                write!(f, "function metadata already registered for {name:?}")
+            }
+            Self::NotFound { name } => {
+                write!(f, "no function metadata registered for {name:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FunctionRegistryError {}
 
 /// Function signature: pre-evaluated args → result Value.
 pub type ScalarFn = fn(&[Value]) -> Value;
@@ -164,6 +206,18 @@ pub enum RegisteredFn {
 #[derive(Clone, Debug)]
 pub struct FunctionRegistry {
     fns: HashMap<&'static str, RegisteredFn>,
+    /// **6.4-0 (2026-05-28):** per-function metadata, indexed by canonical
+    /// (ASCII-uppercase) name — the same keying as `fns`. Built-ins
+    /// populate this in [`default_registry`] via [`register_builtin_metadata`];
+    /// UDFs (6.4) populate it via [`Self::register_metadata`]. Keys are
+    /// `String` (not `&'static str` like `fns`) so UDF metadata can carry
+    /// owned names without lifetime ceremony at the binding boundary.
+    ///
+    /// **Migration shim discipline (contract §10.2):** every entry in
+    /// `fns` SHOULD have a matching entry here; the
+    /// `default_registry_metadata_is_complete_for_every_dispatch_entry`
+    /// debug-build invariant test catches drift.
+    metadata: HashMap<String, FunctionMetadata>,
 }
 
 impl Default for FunctionRegistry {
@@ -178,6 +232,7 @@ impl FunctionRegistry {
     pub fn new() -> Self {
         Self {
             fns: HashMap::new(),
+            metadata: HashMap::new(),
         }
     }
 
@@ -198,6 +253,94 @@ impl FunctionRegistry {
             "{method}: duplicate registration for {name:?} — silent override \
              would let a typo replace a built-in"
         );
+    }
+
+    // ===== 6.4-0 metadata substrate (contract §10.2/§10.3) ==================
+
+    /// Case-insensitive metadata lookup. Returns `None` if no metadata is
+    /// registered under the canonicalized name — the **conservative
+    /// caller policy (contract §10.3)** is to treat an unknown function
+    /// as `Volatility::Dynamic` (graph-visible, never silently `Pure`)
+    /// at the engine layer rather than have the registry pretend to know.
+    /// The current `is_volatile_function` / `is_address_only_reference_fn`
+    /// callers preserve today's behavior (unknown = NOT volatile / NOT
+    /// address-only) for backward compat; 6.4 will tighten the engine-
+    /// side conservative default once UDFs land.
+    pub fn metadata(&self, name: &str) -> Option<&FunctionMetadata> {
+        let upper = name.to_ascii_uppercase();
+        self.metadata.get(upper.as_str())
+    }
+
+    /// Number of metadata entries registered. Tests use this to assert the
+    /// `default_registry` covers every dispatched name.
+    pub fn metadata_count(&self) -> usize {
+        self.metadata.len()
+    }
+
+    /// Register first-class metadata for a function. The `canonical_name`
+    /// **must** be ASCII-uppercase (matches the parser's canonicalization);
+    /// rejecting a non-uppercase name with `Conflict` would be wrong
+    /// (that's bad input, not collision), so this asserts loud — the
+    /// caller is expected to pass already-canonical names per contract
+    /// §10.3 ("`register_function` normalizes + validates").
+    ///
+    /// Returns [`FunctionRegistryError::Conflict`] if a metadata entry
+    /// already exists for this name (built-in or prior UDF), per the
+    /// fail-loud collision rule in contract §10.3. This is the
+    /// non-panicking counterpart to [`Self::insert_or_panic`]'s
+    /// dispatch-side duplicate panic — UDFs register at runtime where
+    /// a panic would abort the host.
+    pub fn register_metadata(
+        &mut self,
+        meta: FunctionMetadata,
+    ) -> Result<(), FunctionRegistryError> {
+        assert!(
+            !meta.canonical_name.is_empty(),
+            "FunctionRegistry::register_metadata: canonical_name must not be empty"
+        );
+        assert!(
+            meta.canonical_name
+                .bytes()
+                .all(|b| !b.is_ascii_lowercase()),
+            "FunctionRegistry::register_metadata: canonical_name {:?} must be \
+             canonical upper-case (caller must normalize before calling)",
+            meta.canonical_name
+        );
+        if self.metadata.contains_key(&meta.canonical_name) {
+            return Err(FunctionRegistryError::Conflict {
+                name: meta.canonical_name,
+            });
+        }
+        self.metadata.insert(meta.canonical_name.clone(), meta);
+        Ok(())
+    }
+
+    /// Remove metadata for `canonical_name`. Returns
+    /// [`FunctionRegistryError::NotFound`] if no entry exists — never a
+    /// silent no-op (per No-Fallbacks: a quiet remove would mask a typo
+    /// that leaves stale metadata associated with a since-renamed name).
+    /// Lookup uppercases the query for symmetry with [`Self::metadata`].
+    pub fn unregister_metadata(
+        &mut self,
+        canonical_name: &str,
+    ) -> Result<(), FunctionRegistryError> {
+        let upper = canonical_name.to_ascii_uppercase();
+        if self.metadata.remove(&upper).is_some() {
+            Ok(())
+        } else {
+            Err(FunctionRegistryError::NotFound {
+                name: canonical_name.to_string(),
+            })
+        }
+    }
+
+    /// Iterator over every registered `FunctionMetadata`. Used by the
+    /// (forthcoming, 6.4) `EngineSession::list_functions` mapper and by
+    /// the substrate's own invariant tests. Order is HashMap-arbitrary
+    /// at the registry layer — the trait method sorts at the DTO seam
+    /// (matching the 6.1C H2 ordering discipline for snapshot DTOs).
+    pub fn iter_metadata(&self) -> impl Iterator<Item = &FunctionMetadata> {
+        self.metadata.values()
     }
 
     /// Register a scalar function under `name`. Stored internally as
@@ -955,7 +1098,146 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("CONFIDENCE.NORM", distribution_fns::confidence_norm);
     r.register("CONFIDENCE.T", distribution_fns::confidence_t);
 
+    // **6.4-0 substrate (2026-05-28):** populate first-class metadata
+    // for every built-in dispatched above. Volatility + dep-shape come
+    // from the two prior whitelists in `ql-exec::calcgraph_session`
+    // (`is_volatile_function` `:149-164`, `is_address_only_reference_fn`
+    // `:201-203`); the rest default to `Pure + ValueDeps + Scalar`. The
+    // pass also debug-asserts every dispatch key has a matching metadata
+    // entry — drift surfaces loud at test time.
+    register_builtin_metadata(&mut r);
+
     r
+}
+
+/// **6.4-0 substrate (2026-05-28):** the builtin-metadata population
+/// pass invoked at the tail of [`default_registry`]. Two phases:
+///
+/// 1. **Explicit overrides** for the small set of names whose volatility
+///    / dep-shape diverges from the `Pure + ValueDeps` default. These
+///    mirror the prior whitelists in `ql-exec::calcgraph_session`
+///    (`is_volatile_function` for NOW/TODAY/RAND/.../INDIRECT/OFFSET/
+///    INFO/CELL; `is_address_only_reference_fn` for ROW/COLUMN/ROWS/
+///    COLUMNS/ISREF) so today's behavior carries over byte-for-byte.
+///    INDIRECT/OFFSET/INFO/CELL are tagged `Volatility::Dynamic` rather
+///    than `Volatile` (their result depends on workbook structure, not
+///    on recalc cadence — closer to the DTO's variant rationale at
+///    `crates/ql-session/src/function_meta.rs:40-43`). The engine's
+///    `is_volatile_function` migration shim treats both `Volatile` and
+///    `Dynamic` as "include in the volatile-pass set" to preserve today's
+///    over-conservative-but-correct re-eval; 6.4 may refine.
+///
+/// 2. **Defaults** for every other dispatched function — `Pure +
+///    ValueDeps + Scalar + Coercing + Cooperative`. Built off the
+///    iteration of `r.fns.keys()` so adding a new built-in
+///    auto-acquires metadata with no parallel-list maintenance burden.
+///    Arity is left as `Variadic` for v1 (we don't track per-function
+///    arity in the dispatch tables today; 6.4 may carry richer metadata
+///    on `RegisteredFn` directly).
+///
+/// The two passes are **idempotent** — phase 2 inserts only when the
+/// name isn't already in `metadata` (so the phase-1 overrides win).
+fn register_builtin_metadata(r: &mut FunctionRegistry) {
+    /// Construct the standard "pure scalar built-in" metadata for `name`
+    /// — used as the default and as the base for the small set of
+    /// overrides. Centralized so adding a new field to `FunctionMetadata`
+    /// only touches one site.
+    fn pure_scalar(name: &str) -> FunctionMetadata {
+        FunctionMetadata {
+            canonical_name: name.to_string(),
+            display_name: None,
+            aliases: Vec::new(),
+            arity: Arity::Variadic,
+            volatility: Volatility::Pure,
+            determinism: true,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::Scalar,
+            arg_policy: ArgPolicy::Coercing,
+            cancellation: CancelPolicy::Cooperative,
+            provenance_tags: Vec::new(),
+        }
+    }
+
+    // ---- Phase 1: explicit overrides for the prior whitelists ----------
+    //
+    // Time / pseudo-random — recompute every recalc (Volatility::Volatile
+    // is the natural fit). `NOW`/`TODAY` are ContextAware in the dispatch
+    // tier but their VOLATILITY (axis) is independent of their dispatch
+    // ABI; both are still graph-volatile.
+    for name in ["NOW", "TODAY", "RAND", "RANDBETWEEN", "RANDARRAY"] {
+        let mut m = pure_scalar(name);
+        m.volatility = Volatility::Volatile;
+        m.determinism = false;
+        // `register_metadata` enforces canonical-uppercase + dup loud;
+        // we built the metadata above so insertion can't conflict here
+        // unless someone added a duplicate to the override list.
+        r.register_metadata(m)
+            .expect("phase-1 volatile override must not collide with prior phase-1 entry");
+    }
+    // Address-by-string / structural / environment introspection —
+    // result depends on workbook structure, not just args. Tagged
+    // `Dynamic` (per DTO variant rationale); the migration shim in
+    // `calcgraph_session::is_volatile_function` treats Dynamic as
+    // "include in the volatile-pass set" so today's behavior carries.
+    for name in ["INDIRECT", "OFFSET", "INFO", "CELL"] {
+        let mut m = pure_scalar(name);
+        m.volatility = Volatility::Dynamic;
+        m.determinism = false;
+        r.register_metadata(m)
+            .expect("phase-1 dynamic override must not collide with prior phase-1 entry");
+    }
+    // Address-only reference fns: ROW/COLUMN/ROWS/COLUMNS/ISREF. The
+    // walker `walk_plan_for_address_only_deps` routes their args away
+    // from value-deps. ISREF additionally keeps its hardcoded LazyShape
+    // short-circuit in the walker (Function arm `name == "ISREF"`); the
+    // metadata only carries the address-only axis the V1 DTO supports.
+    for name in ["ROW", "COLUMN", "ROWS", "COLUMNS", "ISREF"] {
+        let mut m = pure_scalar(name);
+        m.dep_shape = DepShape::AddressOnly;
+        r.register_metadata(m)
+            .expect("phase-1 address-only override must not collide with prior phase-1 entry");
+    }
+
+    // ---- Phase 2: defaults for every other dispatched built-in ----------
+    let names: Vec<&'static str> = r.fns.keys().copied().collect();
+    for name in names {
+        if !r.metadata.contains_key(name) {
+            // Phase-1 didn't set this one; insert the Pure+ValueDeps default
+            // directly into the map (skip the public API's canonical-case
+            // assert — every `fns` key is already canonical per
+            // `insert_or_panic`'s precondition assert).
+            r.metadata.insert(name.to_string(), pure_scalar(name));
+        }
+    }
+
+    // ---- Invariant: every dispatch key now has metadata -----------------
+    //
+    // Tightens the "migration shim" discipline in contract §10.2 — a
+    // future built-in that registers via `r.register*(…)` but bypasses
+    // this pass would be invisible to the metadata table and silently
+    // fall back to "unknown function" semantics at the walker, breaking
+    // the contract's "built-ins register their true metadata" promise.
+    //
+    // **Subset invariant (NOT bijection):** the metadata table may carry
+    // extra entries that have no dispatch counterpart — Phase 1 above
+    // explicitly tags RANDARRAY/INDIRECT/OFFSET/INFO/CELL as
+    // Volatile/Dynamic so the dep walker treats them as graph-volatile
+    // EVEN THOUGH they aren't yet dispatchable (the registry comment at
+    // `:647-648` defers their implementation to a future Phase 4.3
+    // wave). The contract §10.3 unknown-function policy is "graph-
+    // visible and treated Volatile/Dynamic"; encoding that here keeps a
+    // user-typed `=INDIRECT(...)` flagged volatile even before dispatch
+    // ships, matching today's `is_volatile_function` whitelist behavior.
+    // Debug-build only so release builds don't pay the walk.
+    debug_assert!(
+        r.fns.keys().all(|name| r.metadata.contains_key(*name)),
+        "FunctionRegistry: every dispatched built-in must have metadata; \
+         a `r.register*` call without a matching metadata override here \
+         would silently fall back to unknown-fn semantics in the dep walker. \
+         dispatch={} metadata={}.",
+        r.fns.len(),
+        r.metadata.len(),
+    );
 }
 
 #[cfg(test)]
@@ -1552,5 +1834,243 @@ mod tests {
             Some(RegisteredFn::Unified(_))
         ));
         assert!(r.lookup_any("missing").is_none());
+    }
+
+    // =====================================================================
+    // 6.4-0 substrate — metadata tests (2026-05-28)
+    // =====================================================================
+
+    /// **The migration-shim invariant (contract §10.2):** every dispatched
+    /// built-in in the default registry has a matching metadata entry —
+    /// a `r.register*` call without a Phase 1 / Phase 2 override would
+    /// fall back to unknown-fn semantics at the walker. The converse is
+    /// NOT required (metadata may carry extra entries — see
+    /// `register_builtin_metadata`'s Phase-1 RANDARRAY/INDIRECT/OFFSET/
+    /// INFO/CELL block; those names are graph-volatile but not yet
+    /// dispatchable). `default_registry()` debug-asserts the same;
+    /// asserting it here too gives a release-build green-light and a
+    /// clearer failure message.
+    #[test]
+    fn default_registry_metadata_covers_every_dispatched_builtin() {
+        let r = default_registry();
+        let dispatch_keys: Vec<&'static str> = r.fns.keys().copied().collect();
+        for name in &dispatch_keys {
+            assert!(
+                r.metadata(name).is_some(),
+                "default_registry missing metadata for dispatched fn {name:?}"
+            );
+        }
+        // Metadata may exceed dispatch — RANDARRAY/INDIRECT/OFFSET/INFO/
+        // CELL are Volatility-tagged but their dispatch is deferred
+        // (registry.rs:~647-648). Assert the documented superset
+        // relationship explicitly so a future drift is visible.
+        assert!(
+            r.metadata_count() >= r.fns.len(),
+            "metadata table must cover at least every dispatched fn"
+        );
+        // Spot-check a handful, including the dispatch-deferred ones.
+        for name in &["SUM", "IF", "VLOOKUP", "NOW", "ROW", "INDIRECT"] {
+            assert!(
+                r.metadata(name).is_some(),
+                "default_registry missing metadata for {name:?}"
+            );
+        }
+    }
+
+    /// **Prior `is_volatile_function` whitelist pin** (was at
+    /// `ql-exec::calcgraph_session:149-164`). The substrate puts these
+    /// names on the registry as `Volatility::Volatile`
+    /// (NOW/TODAY/RAND/RANDBETWEEN/RANDARRAY — recompute every recalc)
+    /// or `Volatility::Dynamic` (INDIRECT/OFFSET/INFO/CELL — workbook-
+    /// structure sensitive). Both classes are graph-volatile; the
+    /// migration shim in `calcgraph_session::is_volatile_function`
+    /// returns true for either. This test pins each name to the right
+    /// variant so a future shuffle that mis-classifies (e.g. demotes
+    /// INDIRECT to `Pure`) surfaces here.
+    #[test]
+    fn builtin_metadata_pins_prior_volatile_whitelist() {
+        let r = default_registry();
+        for name in &["NOW", "TODAY", "RAND", "RANDBETWEEN", "RANDARRAY"] {
+            let m = r
+                .metadata(name)
+                .unwrap_or_else(|| panic!("{name} must have metadata"));
+            assert_eq!(
+                m.volatility,
+                Volatility::Volatile,
+                "{name} must be Volatile (recompute every recalc)"
+            );
+            assert!(
+                !m.determinism,
+                "{name} is non-deterministic (different result on same args at different times)"
+            );
+        }
+        for name in &["INDIRECT", "OFFSET", "INFO", "CELL"] {
+            let m = r
+                .metadata(name)
+                .unwrap_or_else(|| panic!("{name} must have metadata"));
+            assert_eq!(
+                m.volatility,
+                Volatility::Dynamic,
+                "{name} must be Dynamic (workbook-structure sensitive)"
+            );
+            assert!(!m.determinism, "{name} result depends on workbook structure");
+        }
+    }
+
+    /// **Prior `is_address_only_reference_fn` whitelist pin** (was at
+    /// `ql-exec::calcgraph_session:201-203`). ROW/COLUMN/ROWS/COLUMNS/
+    /// ISREF now carry `DepShape::AddressOnly`; the walker's routing
+    /// migrates to a registry lookup in cycle-1 step 3.
+    #[test]
+    fn builtin_metadata_pins_prior_address_only_whitelist() {
+        let r = default_registry();
+        for name in &["ROW", "COLUMN", "ROWS", "COLUMNS", "ISREF"] {
+            let m = r
+                .metadata(name)
+                .unwrap_or_else(|| panic!("{name} must have metadata"));
+            assert_eq!(
+                m.dep_shape,
+                DepShape::AddressOnly,
+                "{name} must be AddressOnly per design § 5.3"
+            );
+        }
+        // Value-dep reference fns (ISFORMULA / FORMULATEXT) must keep
+        // their default `ValueDeps` — the prior whitelist explicitly
+        // excluded them and the substrate must preserve that exclusion.
+        for name in &["ISFORMULA", "FORMULATEXT"] {
+            let m = r
+                .metadata(name)
+                .unwrap_or_else(|| panic!("{name} must have metadata"));
+            assert_eq!(
+                m.dep_shape,
+                DepShape::ValueDeps,
+                "{name} keeps value-deps (formula-status / source-text access, design § 8 R8)"
+            );
+        }
+    }
+
+    /// **UDF-style `register_metadata` happy path:** a previously-
+    /// unregistered canonical name accepts metadata and becomes lookup-
+    /// visible. Mirrors the 6.4 `EngineSession::register_function`
+    /// contract at the registry layer (the trait method delegates here
+    /// + maps the error variant).
+    #[test]
+    fn register_metadata_round_trip_for_a_fresh_name() {
+        let mut r = FunctionRegistry::new();
+        let meta = FunctionMetadata {
+            canonical_name: "MYUDF".to_string(),
+            display_name: Some("my_udf".to_string()),
+            aliases: vec![],
+            arity: Arity::Fixed { n: 1 },
+            volatility: Volatility::Pure,
+            determinism: true,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::ArrayBatch,
+            arg_policy: ArgPolicy::Strict,
+            cancellation: CancelPolicy::WorkerKill,
+            provenance_tags: vec!["python".to_string()],
+        };
+        assert!(r.register_metadata(meta.clone()).is_ok());
+        let read = r.metadata("MYUDF").expect("UDF metadata must be readable");
+        assert_eq!(read.canonical_name, "MYUDF");
+        assert_eq!(read.batch_shape, BatchShape::ArrayBatch);
+        // Case-insensitive lookup (lookup canonicalizes the query).
+        assert!(
+            r.metadata("myudf").is_some(),
+            "metadata lookup must be case-insensitive (matches dispatch convention)"
+        );
+    }
+
+    /// **Conflict on dup:** registering metadata under a name that
+    /// already has metadata returns `Conflict` — never silent
+    /// override. Mirrors the dispatch table's duplicate-panic rule
+    /// but recoverable (UDF runtime, not boot-time builtin pop).
+    #[test]
+    fn register_metadata_returns_conflict_on_duplicate() {
+        let mut r = default_registry();
+        let dup = FunctionMetadata {
+            canonical_name: "SUM".to_string(),
+            display_name: None,
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Pure,
+            determinism: true,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::Scalar,
+            arg_policy: ArgPolicy::Coercing,
+            cancellation: CancelPolicy::Cooperative,
+            provenance_tags: vec![],
+        };
+        let err = r
+            .register_metadata(dup)
+            .expect_err("duplicate must fail loud");
+        assert!(matches!(
+            err,
+            FunctionRegistryError::Conflict { ref name } if name == "SUM"
+        ));
+    }
+
+    /// **Unregister happy path + NotFound:** removing metadata for an
+    /// existing name yields `Ok(())` and removes the entry; removing
+    /// an unknown name returns `NotFound` (never silent no-op).
+    #[test]
+    fn unregister_metadata_removes_then_returns_not_found_on_second_call() {
+        let mut r = default_registry();
+        assert!(r.metadata("SUM").is_some());
+        r.unregister_metadata("SUM").expect("first remove succeeds");
+        assert!(
+            r.metadata("SUM").is_none(),
+            "metadata must be gone after unregister"
+        );
+        let err = r
+            .unregister_metadata("SUM")
+            .expect_err("second remove must fail loud");
+        assert!(matches!(
+            err,
+            FunctionRegistryError::NotFound { ref name } if name == "SUM"
+        ));
+        // Case-insensitive (uppercases the query, mirroring `metadata`).
+        let err = r
+            .unregister_metadata("does_not_exist")
+            .expect_err("unknown name must fail loud");
+        assert!(matches!(err, FunctionRegistryError::NotFound { .. }));
+    }
+
+    /// **Lowercase guard:** `register_metadata` rejects non-canonical
+    /// names loud (asserts, since this is a caller-precondition bug
+    /// rather than a runtime collision). Documented at the method.
+    #[test]
+    #[should_panic(expected = "canonical_name")]
+    fn register_metadata_panics_on_non_uppercase_name() {
+        let mut r = FunctionRegistry::new();
+        let meta = FunctionMetadata {
+            canonical_name: "lowercase".to_string(),
+            display_name: None,
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Pure,
+            determinism: true,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::Scalar,
+            arg_policy: ArgPolicy::Coercing,
+            cancellation: CancelPolicy::Cooperative,
+            provenance_tags: vec![],
+        };
+        let _ = r.register_metadata(meta);
+    }
+
+    /// **`iter_metadata` covers everything:** count matches
+    /// `metadata_count` and the iterator yields canonical names of
+    /// dispatched functions. Used by the (forthcoming, 6.4)
+    /// `list_functions` mapper.
+    #[test]
+    fn iter_metadata_yields_all_registered_entries() {
+        let r = default_registry();
+        let n = r.iter_metadata().count();
+        assert_eq!(n, r.metadata_count());
+        assert!(
+            r.iter_metadata().any(|m| m.canonical_name == "SUM"),
+            "iter_metadata must reach SUM"
+        );
     }
 }

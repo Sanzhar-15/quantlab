@@ -574,7 +574,12 @@ impl<'a> WorkbookRuntime<'a> {
                                             continue;
                                         }
                                     };
-                                session.reextract_deps(rn, plan.as_ref(), self.workbook);
+                                session.reextract_deps(
+                                    rn,
+                                    plan.as_ref(),
+                                    self.workbook,
+                                    self.registry,
+                                );
                                 session.mark_dirty(rn);
                             }
                         }

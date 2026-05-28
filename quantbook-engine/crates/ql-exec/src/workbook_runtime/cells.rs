@@ -304,7 +304,7 @@ impl<'a> WorkbookRuntime<'a> {
         // extractor can rewrite spill-target CellRefs to point at the
         // anchor's formula node (producer-alias model, design § 10.1).
         if let Some(g) = self.graph.as_deref_mut() {
-            g.on_set_formula(sheet, row, col, plan.as_ref(), self.workbook);
+            g.on_set_formula(sheet, row, col, plan.as_ref(), self.workbook, self.registry);
         }
 
         // **W5-103 (Phase 4.7.J.3 / Codex W5-102 MEDIUM-1):** fire
@@ -579,7 +579,7 @@ impl<'a> WorkbookRuntime<'a> {
                 }
             };
             if let Some(g) = self.graph.as_deref_mut() {
-                g.reextract_deps(node, plan.as_ref(), self.workbook);
+                g.reextract_deps(node, plan.as_ref(), self.workbook, self.registry);
                 // **megaudit HIGH-1 closure (#127)**: dirty the
                 // re-extracted reader. on_set_value at the OLD/NEW
                 // footprint addresses (fired before this loop) used

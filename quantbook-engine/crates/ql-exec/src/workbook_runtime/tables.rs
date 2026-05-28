@@ -864,7 +864,7 @@ impl<'a> WorkbookRuntime<'a> {
                 }
             };
             if let Some(g) = self.graph.as_deref_mut() {
-                g.reextract_deps(node, plan.as_ref(), self.workbook);
+                g.reextract_deps(node, plan.as_ref(), self.workbook, self.registry);
             }
         }
     }

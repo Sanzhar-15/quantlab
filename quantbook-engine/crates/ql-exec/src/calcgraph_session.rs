@@ -78,6 +78,8 @@ use ql_calcgraph::{
     range_contains_rowcol, schedule_with_supplemental, CellNode, Graph, Node, NodeId, Schedule,
 };
 use ql_formula_syntax::{lex, parse, RangeRef, SheetRef};
+use ql_functions::FunctionRegistry;
+use ql_session::function_meta::{DepShape, Volatility};
 use ql_storage::Workbook;
 use ql_types::{ColId, Range, RowId, SheetId};
 
@@ -136,30 +138,32 @@ fn range_to_rangeref(r: Range) -> RangeRef {
     }
 }
 
-/// Phase 3.2 (2026-05-12) — hardcoded list of functions whose RESULT
-/// depends on something other than their arguments (NOW changes every
-/// recompute even with no inputs; INDIRECT reads a cell named by a
-/// string at runtime). The Phase 3.7 volatile-invalidation pass will
-/// use this set to schedule volatile re-evaluation. Tracked here as
-/// V0; Engine Phase 4.3 (function library expansion) replaces with
-/// per-function metadata on `FunctionRegistry`.
+/// **6.4-0 substrate (2026-05-28):** registry-driven replacement for the
+/// prior hardcoded whitelist. Returns true iff the function name carries
+/// `Volatility::Volatile` (NOW/TODAY/RAND/RANDBETWEEN/RANDARRAY —
+/// recompute every recalc) OR `Volatility::Dynamic` (INDIRECT/OFFSET/
+/// INFO/CELL — workbook-structure sensitive). Today's volatile-pass
+/// machinery (`volatile_formulas: HashSet<NodeId>` set + Phase 3.7
+/// invalidation) treats both classes the same — include in the pass —
+/// so the migration is behavior-preserving even though the DTO splits
+/// the axes. 6.4 may refine `Dynamic` to a structure-change trigger
+/// rather than every-recalc.
 ///
-/// Names MUST be canonical upper-case (matches the parser's
-/// canonicalization for `Expr::Function::name`).
-pub(crate) fn is_volatile_function(name: &str) -> bool {
+/// **Unknown-function policy (substrate v1):** returns `false`. Today's
+/// hardcoded whitelist had the same effect (`matches!` returns false on
+/// unknown). Contract §10.3 specifies "Unknown = graph-visible / treated
+/// Volatile-or-Dynamic"; the substrate keeps today's behavior because
+/// the call site only registers volatility (the formula stays graph-
+/// visible regardless via the normal cell-dep + name-dep paths). 6.4
+/// will tighten this when UDF metadata becomes session-scoped.
+///
+/// Names are case-insensitive on lookup (the registry canonicalizes the
+/// query), so `Expr::Function::name` not being normalized at the call
+/// site is OK — but the parser already canonicalizes (per AST docs).
+pub(crate) fn is_volatile_function(registry: &FunctionRegistry, name: &str) -> bool {
     matches!(
-        name,
-        // Time / date — value changes every recompute.
-        "NOW" | "TODAY"
-        // Pseudo-random — value changes every recompute.
-        | "RAND" | "RANDBETWEEN" | "RANDARRAY"
-        // Address-by-string — result depends on workbook structure;
-        // a cell rename anywhere can affect the result.
-        | "INDIRECT"
-        // Structural offset — result depends on the current grid.
-        | "OFFSET"
-        // Environment introspection.
-        | "INFO" | "CELL"
+        registry.metadata(name).map(|m| m.volatility),
+        Some(Volatility::Volatile) | Some(Volatility::Dynamic)
     )
 }
 
@@ -198,8 +202,19 @@ pub(crate) fn is_volatile_function(name: &str) -> bool {
 /// **Invariant pin:** the `dep_suppressed_reference_fns_match_design`
 /// test (S1-MED-ζ closure) asserts the list contents against the design's
 /// explicit enumeration; spelling drift will surface there.
-pub(crate) fn is_address_only_reference_fn(name: &str) -> bool {
-    matches!(name, "ROW" | "COLUMN" | "ROWS" | "COLUMNS" | "ISREF")
+///
+/// **6.4-0 substrate (2026-05-28):** consults `FunctionRegistry` metadata
+/// (`DepShape::AddressOnly`) rather than a hardcoded match. The set is
+/// identical for built-ins today (ROW/COLUMN/ROWS/COLUMNS/ISREF) — they
+/// register that variant in `register_builtin_metadata`. Unknown name
+/// returns `false`, matching today's `matches!`-default behavior; this
+/// keeps the walker's address-only routing decision stable for typos
+/// and future-but-unregistered names.
+pub(crate) fn is_address_only_reference_fn(registry: &FunctionRegistry, name: &str) -> bool {
+    matches!(
+        registry.metadata(name).map(|m| m.dep_shape),
+        Some(DepShape::AddressOnly)
+    )
 }
 
 /// Phase 3.2 — direct-dep collection extracted from walking a bound
@@ -231,6 +246,17 @@ pub struct FormulaDeps {
     /// `true` iff any volatile function appears anywhere in the
     /// plan tree.
     pub is_volatile: bool,
+    /// **6.4-0 substrate (2026-05-28):** every function name the formula
+    /// calls, in walk order, with duplicates (the
+    /// `extract_and_register_deps` orchestrator collapses them when
+    /// folding into `functions_used` on the session). Used to build the
+    /// session-side `functions_used: HashMap<Arc<str>, HashSet<NodeId>>`
+    /// reverse index so a `register_function` / `unregister_function`
+    /// call can dirty every formula referencing that canonical name
+    /// (contract §10.3 invalidation rule). Names are the canonical
+    /// (uppercase) `Arc<str>` from `ExprPlan::Function.name` — already
+    /// canonicalized by the parser.
+    pub functions_used: Vec<Arc<str>>,
 }
 
 impl FormulaDeps {
@@ -249,7 +275,11 @@ impl FormulaDeps {
 /// Phase 3.2 — recursive walker. Accumulates dependencies + volatile-
 /// function presence by descending the `ExprPlan` tree. Does not
 /// allocate any nodes or touch any graph state; pure read.
-pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
+pub(crate) fn walk_plan_for_deps(
+    plan: &ExprPlan,
+    deps: &mut FormulaDeps,
+    registry: &FunctionRegistry,
+) {
     match plan {
         ExprPlan::Number(_) | ExprPlan::Bool(_) | ExprPlan::String(_) => {
             // Leaf literals carry no dependencies.
@@ -260,14 +290,26 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
             deps.cells.push((*sheet, *row, *col));
         }
         ExprPlan::Binary { lhs, rhs, .. } => {
-            walk_plan_for_deps(lhs, deps);
-            walk_plan_for_deps(rhs, deps);
+            walk_plan_for_deps(lhs, deps, registry);
+            walk_plan_for_deps(rhs, deps, registry);
         }
         ExprPlan::Unary { operand, .. } => {
-            walk_plan_for_deps(operand, deps);
+            walk_plan_for_deps(operand, deps, registry);
         }
         ExprPlan::Function { name, args } => {
-            if is_volatile_function(name) {
+            // **6.4-0 substrate (2026-05-28):** record the function name
+            // in `functions_used` BEFORE any routing decision so every
+            // path through the arm (volatile / address-only / ISREF
+            // short-circuit / normal) participates uniformly. The arm
+            // RE-ENTERS the walker for non-ref arg subtrees via either
+            // `walk_plan_for_address_only_deps` (which delegates back to
+            // `walk_plan_for_deps` for nested functions) or the normal
+            // for-loop below, so nested calls like `ROW(NOW())` record
+            // both `ROW` and `NOW` in walk order. Duplicates are
+            // collapsed by the `extract_and_register_deps` orchestrator
+            // when folding into the session reverse index.
+            deps.functions_used.push(Arc::clone(name));
+            if is_volatile_function(registry, name) {
                 deps.is_volatile = true;
             }
             // **W5-RT-3.1 (S3-HIGH-2 closure — Codex MEDIUM-1 + Opus
@@ -302,13 +344,13 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
                 // LazyShape contract: NO arg walking. The args' inner
                 // value-deps / volatility / structural deps don't
                 // affect ISREF's result.
-            } else if is_address_only_reference_fn(name) {
+            } else if is_address_only_reference_fn(registry, name) {
                 for arg in args {
-                    walk_plan_for_address_only_deps(arg, deps);
+                    walk_plan_for_address_only_deps(arg, deps, registry);
                 }
             } else {
                 for arg in args {
-                    walk_plan_for_deps(arg, deps);
+                    walk_plan_for_deps(arg, deps, registry);
                 }
             }
         }
@@ -414,7 +456,11 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
 /// materializer eager-eval and walker suppression; the Opus audit
 /// documented the resulting volatile re-firing under suppressed deps.
 /// Step 1.1 closes both by making the walker shape-aware.
-fn walk_plan_for_address_only_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
+fn walk_plan_for_address_only_deps(
+    plan: &ExprPlan,
+    deps: &mut FormulaDeps,
+    registry: &FunctionRegistry,
+) {
     match plan {
         // Direct reference shapes: skip value-deps. Address is the input.
         ExprPlan::CellRef { .. } | ExprPlan::RangeRef { .. } => {}
@@ -429,8 +475,11 @@ fn walk_plan_for_address_only_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
         // Non-reference shapes: walk normally. The eager materializer
         // evaluates them; their inputs affect the result class and
         // error propagation. Wasted CPU under volatile / nested calls
-        // is acceptable v1 cost (see S1-HIGH-E doc note).
-        _ => walk_plan_for_deps(plan, deps),
+        // is acceptable v1 cost (see S1-HIGH-E doc note). The
+        // delegation passes `registry` through so a nested
+        // `ExprPlan::Function` arg can consult metadata (6.4-0
+        // substrate).
+        _ => walk_plan_for_deps(plan, deps, registry),
     }
 }
 
@@ -467,6 +516,28 @@ pub struct CalcgraphSession {
     /// in Phase 3.3 to mark formulas dirty when a named range
     /// changes.
     name_to_formulas: HashMap<Arc<str>, HashSet<NodeId>>,
+    /// **6.4-0 substrate (2026-05-28):** reverse index from canonical
+    /// (uppercase, per parser canonicalization) function name → formula
+    /// nodes whose `ExprPlan` contains an `ExprPlan::Function { name }`.
+    /// Symmetric to [`name_to_formulas`] for the function-dep path.
+    ///
+    /// Populated by `extract_and_register_deps` from the walker's new
+    /// `FormulaDeps.functions_used` field; cleaned up by
+    /// `remove_formula_deps` on re-bind / clear. Consumed by
+    /// [`Self::on_function_registered`] and
+    /// [`Self::on_function_unregistered`] to BFS-fan dirty per the
+    /// contract §10.3 invalidation rule — when a UDF appears or
+    /// disappears, every formula that named it must re-extract deps
+    /// (the new metadata may have a different dep-shape than the
+    /// "unknown" default the prior walk assumed) and re-evaluate.
+    ///
+    /// **v1 substrate scope (6.4-0):** the hooks exist and are tested;
+    /// they're not yet wired through `WorkbookSession::register_function`
+    /// over napi (deferred to 6.4, where UDF dispatch lands too). The
+    /// reverse-index population is live for every formula bound today,
+    /// so the moment 6.4 wires the trait method, every existing formula
+    /// referencing a freshly-registered UDF will dirty correctly.
+    functions_used: HashMap<Arc<str>, HashSet<NodeId>>,
     /// **W5-154 (Phase 4.8.G.3 foundation):** reverse index from
     /// canonical (case-preserved as stored at extract time) table
     /// name → formula nodes that reference it via
@@ -673,6 +744,7 @@ impl CalcgraphSession {
         formula_sheet: SheetId,
         plan: &ExprPlan,
         workbook: &Workbook,
+        registry: &FunctionRegistry,
     ) {
         // First, evict any prior deps for this formula. Required so
         // re-binding a formula whose text changed (e.g. `=A1` → `=B1`)
@@ -686,9 +758,10 @@ impl CalcgraphSession {
         self.graph.clear_outgoing(formula_node);
         self.graph.clear_range_deps_for_formula(formula_node);
 
-        // Walk and collect.
+        // Walk and collect. `registry` threads through for the 6.4-0
+        // metadata substrate (volatility + address-only routing).
         let mut deps = FormulaDeps::default();
-        walk_plan_for_deps(plan, &mut deps);
+        walk_plan_for_deps(plan, &mut deps, registry);
 
         // **W5-102 (Phase 4.7.I) — PRODUCER-ALIAS REWRITE.** Per design
         // § 10.1: if a CellRef points to a spill TARGET, reroute the
@@ -803,7 +876,32 @@ impl CalcgraphSession {
                 .or_default()
                 .insert(formula_node);
         }
-        if !deps.is_empty() || deps.is_volatile {
+        // **6.4-0 substrate (2026-05-28):** populate `functions_used`
+        // for every `ExprPlan::Function` name the walker recorded.
+        // Symmetric to `name_to_formulas` above; consumed by
+        // `on_function_registered` / `on_function_unregistered` (6.4
+        // wires these through `WorkbookSession::register_function`).
+        // The walker emits duplicates (e.g. `SUM(SUM(A1:A3), 1)` records
+        // `SUM` twice in walk order); the `HashSet::insert` collapses.
+        for fn_name in &deps.functions_used {
+            self.functions_used
+                .entry(Arc::clone(fn_name))
+                .or_default()
+                .insert(formula_node);
+        }
+        // **6.4-0 substrate:** also store `formula_deps` for any formula
+        // that referenced functions, so `remove_formula_deps` can clean
+        // up `functions_used` on re-bind. Without this, a formula like
+        // `=NA()` (no cell/range deps, not volatile, but `functions_used
+        // == ["NA"]`) would skip storage → leaked reverse-index entry
+        // on next re-bind. The existing `!deps.is_empty()` only checks
+        // cell + named_range emptiness.
+        if !deps.is_empty()
+            || deps.is_volatile
+            || !deps.functions_used.is_empty()
+            || !deps.names.is_empty()
+            || !deps.tables.is_empty()
+        {
             self.formula_deps.insert(formula_node, deps);
         }
     }
@@ -851,6 +949,22 @@ impl CalcgraphSession {
                     }
                 }
             }
+            // **6.4-0 substrate (2026-05-28):** clean `functions_used`
+            // symmetric with `name_to_formulas`. Re-binding a formula
+            // whose text dropped a function call (e.g. `=NOW()` →
+            // `=1+1`) MUST drop the stale entry, else a later
+            // `on_function_unregistered("NOW")` would falsely dirty
+            // formulas that no longer reference NOW. Walks deduplicated
+            // — the walker emits duplicates but they collapse to the
+            // same HashSet membership on remove.
+            for fn_name in &prior.functions_used {
+                if let Some(set) = self.functions_used.get_mut(fn_name) {
+                    set.remove(&formula_node);
+                    if set.is_empty() {
+                        self.functions_used.remove(fn_name);
+                    }
+                }
+            }
         }
         self.volatile_formulas.remove(&formula_node);
     }
@@ -870,6 +984,31 @@ impl CalcgraphSession {
     /// some formulas missing dep info. Matches Phase 2B.2's
     /// `RecomputeResult` shape.
     pub fn rebuild_from_workbook(wb: &Workbook) -> RebuildResult {
+        // **6.4-0 substrate (2026-05-28):** the dep walker now consults a
+        // `FunctionRegistry` for volatility + address-only routing.
+        // `rebuild_from_workbook` keeps its zero-arg public signature for
+        // backward compatibility with the ~25 existing test sites that
+        // call it as `CalcgraphSession::rebuild_from_workbook(&wb)`;
+        // those tests don't exercise UDFs (substrate phase) so a fresh
+        // `default_registry()` is sufficient. Production callers that
+        // own a session-scoped registry (UDF-aware, 6.4+) should call
+        // [`Self::rebuild_from_workbook_with_registry`] directly to thread
+        // their UDF metadata through the dep walk.
+        let registry = ql_functions::default_registry();
+        Self::rebuild_from_workbook_with_registry(wb, &registry)
+    }
+
+    /// **6.4-0 substrate (2026-05-28):** registry-aware variant of
+    /// [`Self::rebuild_from_workbook`]. Same semantics; the difference
+    /// is that the caller supplies the `FunctionRegistry` whose
+    /// per-function metadata governs volatility + address-only routing
+    /// in the dep walker. UDFs (6.4) register their metadata on the
+    /// `WorkbookSession`'s owned registry; that registry must be passed
+    /// HERE for the rebuild to see their dep-shape correctly.
+    pub fn rebuild_from_workbook_with_registry(
+        wb: &Workbook,
+        registry: &FunctionRegistry,
+    ) -> RebuildResult {
         let mut session = Self::new();
 
         // Snapshot + sort the formula list for determinism.
@@ -908,7 +1047,7 @@ impl CalcgraphSession {
                 wb,
             ) {
                 Ok(plan) => {
-                    session.extract_and_register_deps(node, sheet, &plan, wb);
+                    session.extract_and_register_deps(node, sheet, &plan, wb, registry);
                     succeeded += 1;
                 }
                 Err(error) => failures.push(RebuildFailure {
@@ -995,6 +1134,7 @@ impl CalcgraphSession {
         col: ColId,
         plan: &ExprPlan,
         workbook: &Workbook,
+        registry: &FunctionRegistry,
     ) {
         self.hook_counts.set_formula = self.hook_counts.set_formula.saturating_add(1);
         // Phase 3.4: distinguish first-time-formula at this cell vs
@@ -1016,7 +1156,7 @@ impl CalcgraphSession {
                 }
             }
         }
-        self.extract_and_register_deps(node, sheet, plan, workbook);
+        self.extract_and_register_deps(node, sheet, plan, workbook, registry);
         // Phase 3.3: dirty downstream — formulas referencing the cell
         // whose formula text just changed see a (potentially) new
         // value. The formula itself is NOT marked dirty (the runtime
@@ -1102,6 +1242,86 @@ impl CalcgraphSession {
     /// the graph's sheet-id tracking.
     pub fn on_add_sheet(&mut self, _new_sheet: SheetId) {
         self.hook_counts.add_sheet = self.hook_counts.add_sheet.saturating_add(1);
+    }
+
+    /// **6.4-0 substrate (2026-05-28) — function-metadata graph hook.**
+    /// Mark every formula that references the function `canonical_name`
+    /// dirty, with transitive BFS-fanout via [`Self::mark_dirty_from_cell_write`]
+    /// (mirrors [`Self::on_set_name`]'s pattern). Returns the count of
+    /// formulas directly dirtied (downstream-of-downstream count is not
+    /// returned — `mark_dirty_from_cell_write` handles it transitively
+    /// the same way `set_value` does).
+    ///
+    /// **When to fire (6.4):** `WorkbookSession::register_function`
+    /// calls this AFTER `FunctionRegistry::register_metadata` so that
+    /// (a) the registry sees the new metadata for subsequent walker
+    /// queries, and (b) every formula that was bound while the name
+    /// was unknown (or with stale metadata) gets re-walked + re-
+    /// evaluated. Contract §10.3 exit test 8: "registering a UDF
+    /// dirties formulas that referenced its (previously-unknown) name."
+    ///
+    /// **v1 substrate scope (6.4-0):** this hook is live + tested but
+    /// NOT yet wired through the trait method — the trait method
+    /// `EngineSession::register_function` still returns
+    /// `Capability/function_registration_not_implemented_in_v1_core`
+    /// (per `WorkbookSession`'s impl). Wiring lands in 6.4 alongside
+    /// `FunctionImplHandle` + the UDF dispatch path.
+    ///
+    /// **Name canonicalization:** the registry's `metadata` lookup is
+    /// case-insensitive; the parser canonicalizes `ExprPlan::Function`
+    /// names to uppercase. This hook uppercases the input for the
+    /// reverse-index lookup so callers passing lowercase / mixed case
+    /// behave the same as the canonical form.
+    pub fn on_function_registered(&mut self, canonical_name: &str) -> usize {
+        self.dirty_formulas_referencing_function(canonical_name)
+    }
+
+    /// **6.4-0 substrate (2026-05-28) — function-metadata graph hook.**
+    /// Symmetric counterpart to [`Self::on_function_registered`]: when
+    /// a UDF is removed via `WorkbookSession::unregister_function`,
+    /// every formula referencing the name must re-evaluate (the next
+    /// recompute will surface the now-missing-function error). Same
+    /// dirty-fanout pattern.
+    ///
+    /// Calling this for a name with zero registered formulas is a
+    /// no-op that returns `0`; never silently masks a typo (the caller
+    /// gets the count and can decide whether the unregister should
+    /// have hit something).
+    pub fn on_function_unregistered(&mut self, canonical_name: &str) -> usize {
+        self.dirty_formulas_referencing_function(canonical_name)
+    }
+
+    /// Internal: shared body for [`Self::on_function_registered`] and
+    /// [`Self::on_function_unregistered`]. Walk `functions_used[upper]`,
+    /// dirty every formula + transitive via `mark_dirty_from_cell_write`.
+    fn dirty_formulas_referencing_function(&mut self, canonical_name: &str) -> usize {
+        let upper = canonical_name.to_ascii_uppercase();
+        let dependents: Vec<NodeId> = self
+            .functions_used
+            .get(upper.as_str())
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let count = dependents.len();
+        for n in dependents {
+            self.dirty.insert(n);
+            // Same transitive fanout as `on_set_name` (Phase 3.10 H2):
+            // whatever depends on this function-referencing formula
+            // must also recompute when the function's binding changes.
+            if let Some((s, r, c)) = self.cell_address_for(n) {
+                self.mark_dirty_from_cell_write(s, r, c);
+            }
+        }
+        count
+    }
+
+    /// **6.4-0 substrate (2026-05-28) — test-only inspector.** Returns
+    /// the set of formula nodes that reference `canonical_name`, or
+    /// `None` if no formula references it. Used by substrate-level
+    /// tests + (future, 6.4) the `list_functions` mapper's "n callers"
+    /// telemetry. Read-only; the caller cannot mutate the index.
+    pub fn functions_used_for(&self, canonical_name: &str) -> Option<&HashSet<NodeId>> {
+        let upper = canonical_name.to_ascii_uppercase();
+        self.functions_used.get(upper.as_str())
     }
 
     /// **W5-154 (Phase 4.8.G.3 foundation):** mutation hook fired by
@@ -1619,11 +1839,12 @@ impl CalcgraphSession {
         reader_node: NodeId,
         plan: &ExprPlan,
         workbook: &Workbook,
+        registry: &FunctionRegistry,
     ) -> bool {
         let Some((reader_sheet, _, _)) = self.cell_address_for(reader_node) else {
             return false;
         };
-        self.extract_and_register_deps(reader_node, reader_sheet, plan, workbook);
+        self.extract_and_register_deps(reader_node, reader_sheet, plan, workbook, registry);
         true
     }
 
@@ -1734,25 +1955,35 @@ mod tests {
     /// per § 8 R8) would also fail.
     #[test]
     fn dep_suppressed_reference_fns_match_design() {
+        // 6.4-0: the helper now reads `DepShape::AddressOnly` off the
+        // registry's per-function metadata. The default registry pins
+        // ROW/COLUMN/ROWS/COLUMNS/ISREF to AddressOnly via
+        // `register_builtin_metadata`; ISFORMULA/FORMULATEXT default to
+        // ValueDeps; unknown names default to None (the matcher returns
+        // false). Behavior is identical to the prior hardcoded
+        // whitelist — this test pins the metadata-derived view at the
+        // engine layer in addition to the registry-level pin at
+        // `ql_functions::registry::builtin_metadata_pins_prior_address_only_whitelist`.
+        let registry = ql_functions::default_registry();
         // Address-only — value-deps suppressed for these.
         for name in &["ROW", "COLUMN", "ROWS", "COLUMNS", "ISREF"] {
             assert!(
-                is_address_only_reference_fn(name),
+                is_address_only_reference_fn(&registry, name),
                 "design § 5.3 lists {name:?} as address-only but matcher returns false"
             );
         }
         // Reference-aware but NOT address-only — value-deps kept as v1 cost.
         for name in &["ISFORMULA", "FORMULATEXT"] {
             assert!(
-                !is_address_only_reference_fn(name),
+                !is_address_only_reference_fn(&registry, name),
                 "{name:?} should keep value-deps (formula-status / source-text \
                  access) — must not be in is_address_only_reference_fn"
             );
         }
-        // Typo guards.
+        // Typo guards. Unknown / unregistered names default to false.
         for name in &["RAW", "COLUM", "ISREFENCE", "SUM", "IF"] {
             assert!(
-                !is_address_only_reference_fn(name),
+                !is_address_only_reference_fn(&registry, name),
                 "{name:?} is not reference-aware; must not be in the suppressed list"
             );
         }
@@ -1846,8 +2077,8 @@ mod tests {
         let wb = ql_storage::Workbook::new();
         let plan = ExprPlan::Number(1.0);
         s.on_set_value(0, 0, 0);
-        s.on_set_formula(0, 0, 1, &plan, &wb);
-        s.on_set_formula(0, 0, 2, &plan, &wb);
+        s.on_set_formula(0, 0, 1, &plan, &wb, &ql_functions::default_registry());
+        s.on_set_formula(0, 0, 2, &plan, &wb, &ql_functions::default_registry());
         s.on_clear_formula(0, 0, 1);
         s.on_set_name("Tax");
         s.on_set_name("Discount");
@@ -1868,9 +2099,9 @@ mod tests {
         let mut s = CalcgraphSession::new();
         let wb = ql_storage::Workbook::new();
         let plan = ExprPlan::Number(0.0);
-        s.on_set_formula(0, 3, 7, &plan, &wb);
+        s.on_set_formula(0, 3, 7, &plan, &wb, &ql_functions::default_registry());
         let first_node = s.cell_node_for(0, 3, 7).unwrap();
-        s.on_set_formula(0, 3, 7, &plan, &wb);
+        s.on_set_formula(0, 3, 7, &plan, &wb, &ql_functions::default_registry());
         let second_node = s.cell_node_for(0, 3, 7).unwrap();
         assert_eq!(
             first_node, second_node,
@@ -2086,7 +2317,7 @@ mod tests {
                 abs_row: false,
             }),
         };
-        s.on_set_formula(0, 5, 5, &plan_v1, &wb);
+        s.on_set_formula(0, 5, 5, &plan_v1, &wb, &ql_functions::default_registry());
         let node = s.cell_node_for(0, 5, 5).unwrap();
         assert_eq!(s.formula_deps(node).unwrap().cells.len(), 2);
 
@@ -2098,7 +2329,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_v2, &wb);
+        s.on_set_formula(0, 5, 5, &plan_v2, &wb, &ql_functions::default_registry());
         let deps = s.formula_deps(node).unwrap();
         assert_eq!(deps.cells, vec![(0, 0, 2)]);
     }
@@ -2246,6 +2477,9 @@ mod tests {
 
     /// `walk_plan_for_deps` is pure — calling it twice on the same
     /// plan with two fresh `FormulaDeps` produces equal collections.
+    /// **6.4-0:** the walker now takes `&FunctionRegistry`; passing the
+    /// same registry twice still produces identical output (the
+    /// registry's metadata lookup is read-only).
     #[test]
     fn walk_plan_for_deps_is_pure() {
         use ql_formula_syntax::Operator;
@@ -2263,19 +2497,201 @@ mod tests {
                 args: Vec::new(),
             }),
         };
+        let registry = ql_functions::default_registry();
         let mut a = FormulaDeps::default();
         let mut b = FormulaDeps::default();
-        walk_plan_for_deps(&plan, &mut a);
-        walk_plan_for_deps(&plan, &mut b);
+        walk_plan_for_deps(&plan, &mut a, &registry);
+        walk_plan_for_deps(&plan, &mut b, &registry);
         assert_eq!(a, b);
         assert!(a.is_volatile);
         assert_eq!(a.cells.len(), 1);
+        // 6.4-0: `functions_used` records every Function arm walked.
+        assert_eq!(a.functions_used.len(), 1);
+        assert_eq!(a.functions_used[0].as_ref(), "NOW");
     }
 
-    /// The hardcoded volatile set covers Excel-canon volatile
-    /// functions and is upper-case canonical.
+    // =====================================================================
+    // 6.4-0 substrate — `functions_used` reverse index + register hooks
+    // (2026-05-28)
+    // =====================================================================
+
+    /// **The substrate's core promise:** binding a formula that calls
+    /// `NOW()` (built-in function) populates the calcgraph session's
+    /// `functions_used` reverse index — the same way `name_to_formulas`
+    /// is populated for `AggregateNameRef`. Without this, contract
+    /// §10.3 invalidation can't fire (register/unregister has nothing
+    /// to dirty).
+    #[test]
+    fn functions_used_reverse_index_populated_on_rebuild() {
+        // Workbook with one formula that calls a builtin.
+        let wb = workbook_with_formulas(&[(0, 0, 0, "NOW()")]);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete());
+        let s = r.session;
+        let node = s.cell_node_for(0, 0, 0).unwrap();
+
+        let nodes = s
+            .functions_used_for("NOW")
+            .expect("functions_used must record NOW() callers");
+        assert!(
+            nodes.contains(&node),
+            "the formula calling NOW must appear in functions_used[NOW]"
+        );
+        // Lookup is case-insensitive (matches registry convention).
+        assert!(s.functions_used_for("now").is_some());
+        // Unknown / unreferenced names → None.
+        assert!(s.functions_used_for("MY_UNUSED_UDF").is_none());
+    }
+
+    /// **Cleanup discipline (mirrors `name_to_formulas` cleanup):** when
+    /// a formula is re-bound to text that no longer calls `NOW()`, the
+    /// `functions_used[NOW]` entry MUST drop the formula node — else a
+    /// future `on_function_unregistered("NOW")` would falsely dirty a
+    /// formula that doesn't reference NOW anymore.
+    #[test]
+    fn functions_used_cleaned_on_rebind_to_unrelated_text() {
+        let wb = workbook_with_formulas(&[(0, 0, 0, "NOW() + 1")]);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete());
+        let mut s = r.session;
+        let node = s.cell_node_for(0, 0, 0).unwrap();
+        assert!(s.functions_used_for("NOW").unwrap().contains(&node));
+
+        // Re-bind the formula to text with no function calls.
+        let mut wb2 = wb.clone();
+        wb2.put_at(0, 0, 0, Value::Blank);
+        wb2.put_formula(0, 0, 0, "1 + 1");
+        let plan = CalcgraphSession::bind_text(
+            "1 + 1",
+            BindSite::at_cell(ql_types::Address::new(0, 0, 0)),
+            &wb2,
+        )
+        .expect("simple arithmetic must bind");
+        let registry = ql_functions::default_registry();
+        s.on_set_formula(0, 0, 0, &plan, &wb2, &registry);
+
+        assert!(
+            s.functions_used_for("NOW").is_none(),
+            "functions_used[NOW] must be empty after re-bind drops the NOW call"
+        );
+    }
+
+    /// **Contract §10.4 exit test 8 (foundation level):** registering a
+    /// function MUST dirty every formula that referenced its
+    /// (previously-unknown) name. The substrate's
+    /// `on_function_registered` hook IS the dirty-fanout that the (6.4)
+    /// `WorkbookSession::register_function` trait method will call. The
+    /// reverse-index discovery is metadata-independent: even if `MYUDF`
+    /// isn't registered when the formula `=MYUDF(A1)` binds (today the
+    /// formula will fail to dispatch at eval time, but the parser still
+    /// produces `ExprPlan::Function { name: "MYUDF" }`), the walker
+    /// records it in `functions_used` so later `on_function_registered`
+    /// can find it. **This is the load-bearing invariant for UDFs.**
+    #[test]
+    fn on_function_registered_dirties_formulas_that_named_the_function() {
+        // Two formulas — only one references MYUDF.
+        let wb = workbook_with_formulas(&[
+            (0, 0, 0, "MYUDF(A2)"),
+            (0, 1, 1, "1 + 1"), // unrelated; must NOT dirty
+        ]);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        // The formula binds even though MYUDF isn't registered — the
+        // walker doesn't validate registration at bind time. Eval-time
+        // dispatch will fail, but that's irrelevant to the substrate.
+        let mut s = r.session;
+        let myudf_caller = s.cell_node_for(0, 0, 0).unwrap();
+        let unrelated = s.cell_node_for(0, 1, 1).unwrap();
+        assert!(
+            s.functions_used_for("MYUDF").unwrap().contains(&myudf_caller),
+            "the walker MUST record `MYUDF` even for unregistered names — \
+             otherwise on_function_registered has nothing to dirty"
+        );
+        // Clear any dirt from rebuild — rebuild_from_workbook ends clean.
+        assert!(s.dirty_formulas().is_empty());
+
+        // Fire the substrate hook (this is what (6.4)
+        // WorkbookSession::register_function will invoke after the
+        // registry's register_metadata succeeds).
+        let n = s.on_function_registered("MYUDF");
+        assert_eq!(n, 1, "exactly one formula references MYUDF");
+        assert!(
+            s.is_dirty(myudf_caller),
+            "registering MYUDF must dirty the formula that referenced \
+             its previously-unknown name (contract §10.4 exit test 8)"
+        );
+        assert!(
+            !s.is_dirty(unrelated),
+            "unrelated formula must NOT dirty — selective fanout"
+        );
+    }
+
+    /// **Symmetric unregister hook:** removing a function name dirties
+    /// every formula that called it (so the next recompute surfaces
+    /// the now-broken dispatch). Same fanout pattern. Uses `NOW()`
+    /// (volatile, no-arg) because the v1 binder rejects literal-range
+    /// args in AggregateArg context (`SUM(A1:A3)` doesn't bind today;
+    /// tracked as design § 5.4 follow-up).
+    #[test]
+    fn on_function_unregistered_dirties_callers() {
+        let wb = workbook_with_formulas(&[(0, 0, 0, "NOW()")]);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete(), "NOW() must bind");
+        let mut s = r.session;
+        let caller = s.cell_node_for(0, 0, 0).unwrap();
+        assert!(s.dirty_formulas().is_empty());
+
+        let n = s.on_function_unregistered("NOW");
+        assert_eq!(n, 1);
+        assert!(s.is_dirty(caller));
+    }
+
+    /// **Unknown-name hook is a no-op:** firing the hook for a function
+    /// name no formula references returns 0 + dirties nothing. Never
+    /// silently masks a typo at the substrate layer; the (6.4) trait
+    /// method's caller can decide whether 0 dependents is OK.
+    #[test]
+    fn on_function_registered_with_no_callers_is_zero_count_noop() {
+        let wb = workbook_with_formulas(&[(0, 0, 0, "1 + 1")]);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        let mut s = r.session;
+        let n = s.on_function_registered("NONEXISTENT");
+        assert_eq!(n, 0);
+        assert!(s.dirty_formulas().is_empty());
+    }
+
+    /// **`functions_used` survives the duplicate-walker emission:** a
+    /// formula that calls the same function twice (e.g. `NOW() + NOW()`)
+    /// records `NOW` twice in walk order, but the reverse-index
+    /// HashSet collapses it to a single membership for the formula.
+    /// Verifies the substrate doesn't double-fan-dirty on subsequent
+    /// hooks. Uses `NOW()` (no-arg builtin) because the v1 binder
+    /// rejects literal-range args in aggregate context (design § 5.4
+    /// follow-up).
+    #[test]
+    fn functions_used_dedupes_repeated_calls_in_one_formula() {
+        let wb = workbook_with_formulas(&[(0, 0, 0, "NOW() + NOW()")]);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete(), "NOW() + NOW() must bind");
+        let s = r.session;
+        let node = s.cell_node_for(0, 0, 0).unwrap();
+        let set = s.functions_used_for("NOW").unwrap();
+        assert_eq!(set.len(), 1, "the formula appears ONCE in functions_used[NOW]");
+        assert!(set.contains(&node));
+    }
+
+    /// **6.4-0:** the volatile set is now metadata-derived. `NOW/TODAY/
+    /// RAND/RANDBETWEEN/RANDARRAY` carry `Volatility::Volatile`;
+    /// `INDIRECT/OFFSET/INFO/CELL` carry `Volatility::Dynamic` (workbook-
+    /// structure sensitive). The migration shim treats both as
+    /// volatile-pass-eligible so the existing volatile-formulas set
+    /// behavior is preserved byte-for-byte. The parser canonicalizes
+    /// names to uppercase before binding so the walker only ever sees
+    /// uppercase; the registry's `metadata()` is case-insensitive
+    /// anyway, but the lowercase / unknown assertions still hold via
+    /// the matcher returning false on `None` metadata.
     #[test]
     fn volatile_function_set_is_canonical() {
+        let registry = ql_functions::default_registry();
         for f in [
             "NOW",
             "TODAY",
@@ -2287,17 +2703,22 @@ mod tests {
             "INFO",
             "CELL",
         ] {
-            assert!(is_volatile_function(f), "{f} must be volatile");
+            assert!(is_volatile_function(&registry, f), "{f} must be volatile");
         }
-        // Lowercase / mixed are NOT recognized — the parser
-        // canonicalizes function names to uppercase before binding, so
-        // the set only ever sees uppercase.
-        assert!(!is_volatile_function("now"));
-        assert!(!is_volatile_function("Sum"));
+        // `metadata()` is case-insensitive (uppercases the query), so
+        // "now" lookups `NOW`'s metadata. The migration shim therefore
+        // returns true for lowercase — DIFFERENT from the old
+        // hardcoded matcher. Document the change here so a future
+        // change to case-sensitive matching surfaces.
+        assert!(
+            is_volatile_function(&registry, "now"),
+            "metadata-derived lookup is case-insensitive (registry uppercases the query)"
+        );
+        assert!(!is_volatile_function(&registry, "Sum"));
         // Sanity: non-volatile arithmetic functions are not in the set.
-        assert!(!is_volatile_function("SUM"));
-        assert!(!is_volatile_function("AVERAGE"));
-        assert!(!is_volatile_function("IF"));
+        assert!(!is_volatile_function(&registry, "SUM"));
+        assert!(!is_volatile_function(&registry, "AVERAGE"));
+        assert!(!is_volatile_function(&registry, "IF"));
     }
 
     // ----------------------------------------------------------------
@@ -2665,7 +3086,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_v1, &wb);
+        s.on_set_formula(0, 5, 5, &plan_v1, &wb, &ql_functions::default_registry());
         let node = s.cell_node_for(0, 5, 5).unwrap();
         assert_eq!(s.cell_dep_count(), 1, "A1 indexed");
 
@@ -2678,7 +3099,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_v2, &wb);
+        s.on_set_formula(0, 5, 5, &plan_v2, &wb, &ql_functions::default_registry());
         assert_eq!(s.cell_dep_count(), 1, "only B1 now");
 
         // Take dirty (clear residue from the two on_set_formula calls).
@@ -2732,7 +3153,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_v1, &wb);
+        s.on_set_formula(0, 5, 5, &plan_v1, &wb, &ql_functions::default_registry());
         let f = s.cell_node_for(0, 5, 5).unwrap();
         let a1 = s.cell_node_for(0, 0, 0).unwrap();
         let b1 = s.cell_node_for(0, 1, 0).unwrap();
@@ -2747,7 +3168,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_v2, &wb);
+        s.on_set_formula(0, 5, 5, &plan_v2, &wb, &ql_functions::default_registry());
 
         // Graph-level outgoing now reflects ONLY the new dep.
         assert_eq!(
@@ -2795,10 +3216,10 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 1, &plan_b1_v1, &wb);
+        s.on_set_formula(0, 0, 1, &plan_b1_v1, &wb, &ql_functions::default_registry());
 
         // Step 2: B1 = "=1" — constant, no deps. clear_outgoing fires.
-        s.on_set_formula(0, 0, 1, &ExprPlan::Number(1.0), &wb);
+        s.on_set_formula(0, 0, 1, &ExprPlan::Number(1.0), &wb, &ql_functions::default_registry());
 
         // Step 3: A1 = "=B1"
         let plan_a1 = ExprPlan::CellRef {
@@ -2808,7 +3229,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 0, &plan_a1, &wb);
+        s.on_set_formula(0, 0, 0, &plan_a1, &wb, &ql_functions::default_registry());
 
         let a1 = s.cell_node_for(0, 0, 0).unwrap();
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
@@ -2861,7 +3282,7 @@ mod tests {
             name: Arc::from("SUM"),
             args: vec![plan_v1],
         };
-        s.on_set_formula(0, 0, 1, &plan_v1_wrapped, &wb);
+        s.on_set_formula(0, 0, 1, &plan_v1_wrapped, &wb, &ql_functions::default_registry());
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         assert_eq!(
             s.graph().stripe_index().stripe_count(),
@@ -2885,7 +3306,7 @@ mod tests {
             name: Arc::from("SUM"),
             args: vec![plan_v2],
         };
-        s.on_set_formula(0, 0, 1, &plan_v2_wrapped, &wb);
+        s.on_set_formula(0, 0, 1, &plan_v2_wrapped, &wb, &ql_functions::default_registry());
 
         // Stripe map: ONLY Column B now (Column A was cleared).
         assert_eq!(s.graph().stripe_index().stripe_count(), 1);
@@ -2957,7 +3378,7 @@ mod tests {
                 range: b1_range,
             }],
         };
-        s.on_set_formula(0, 0, 0, &plan_a1, &wb);
+        s.on_set_formula(0, 0, 0, &plan_a1, &wb, &ql_functions::default_registry());
 
         // B1 = "=A1"
         let plan_b1 = ExprPlan::CellRef {
@@ -2967,7 +3388,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb, &ql_functions::default_registry());
 
         // Drive both into the dirty set.
         s.take_dirty(); // clear any residue from the on_set_formula calls
@@ -3021,7 +3442,7 @@ mod tests {
                 range: b1_range,
             }],
         };
-        s.on_set_formula(0, 0, 0, &plan_a1, &wb);
+        s.on_set_formula(0, 0, 0, &plan_a1, &wb, &ql_functions::default_registry());
 
         // B1 = "=C1"
         let plan_b1 = ExprPlan::CellRef {
@@ -3031,7 +3452,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb, &ql_functions::default_registry());
 
         // Drive both A1 and B1 dirty via a literal write to C1: B1
         // depends on C1 (direct cell), A1 depends on B1 (via range).
@@ -3076,7 +3497,7 @@ mod tests {
                 range: a1_range,
             }],
         };
-        s.on_set_formula(0, 0, 0, &plan_a1, &wb);
+        s.on_set_formula(0, 0, 0, &plan_a1, &wb, &ql_functions::default_registry());
 
         // Force A1 dirty: write to A1's cell (self-fanout via stripe).
         s.take_dirty();
@@ -3116,7 +3537,7 @@ mod tests {
                 range: b1_range,
             }],
         };
-        s.on_set_formula(0, 0, 0, &plan_a1, &wb);
+        s.on_set_formula(0, 0, 0, &plan_a1, &wb, &ql_functions::default_registry());
 
         // Force A1 into dirty by writing to its own cell (no
         // dependents exist for A1 since it's the only formula).
@@ -3181,7 +3602,7 @@ mod tests {
                 abs_row: false,
             }),
         };
-        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb, &ql_functions::default_registry());
         let a1 = s.cell_node_for(0, 0, 0).unwrap();
         let a2 = s.cell_node_for(0, 1, 0).unwrap();
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
@@ -3233,7 +3654,7 @@ mod tests {
                 range: col_a,
             }],
         };
-        s.on_set_formula(0, 0, 1, &plan, &wb);
+        s.on_set_formula(0, 0, 1, &plan, &wb, &ql_functions::default_registry());
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         assert_eq!(
             s.graph().stripe_index().stripe_count(),
@@ -3285,7 +3706,7 @@ mod tests {
                 range: a1_range,
             }],
         };
-        s.on_set_formula(0, 0, 0, &plan, &wb);
+        s.on_set_formula(0, 0, 0, &plan, &wb, &ql_functions::default_registry());
         let a1 = s.cell_node_for(0, 0, 0).unwrap();
         assert!(s.graph().dependents_for_cell(0, 0, 0).contains(&a1));
 
@@ -3372,11 +3793,11 @@ mod tests {
                 },
             ],
         };
-        s.on_set_formula(0, 0, 1, &plan, &wb);
+        s.on_set_formula(0, 0, 1, &plan, &wb, &ql_functions::default_registry());
 
         // Make A3 a formula too so it's a NodeId we can find in dirty.
         let a3_plan = ExprPlan::Number(42.0);
-        s.on_set_formula(0, 2, 0, &a3_plan, &wb);
+        s.on_set_formula(0, 2, 0, &a3_plan, &wb, &ql_functions::default_registry());
 
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         let a3 = s.cell_node_for(0, 2, 0).unwrap();
@@ -3424,13 +3845,13 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 1, &plan, &wb);
+        s.on_set_formula(0, 0, 1, &plan, &wb, &ql_functions::default_registry());
         let f = s.cell_node_for(0, 0, 1).unwrap();
         let edges_before: Vec<_> = s.graph().outgoing(f).to_vec();
         let stripe_count_before = s.graph().stripe_index().stripe_count();
 
         // Same plan again.
-        s.on_set_formula(0, 0, 1, &plan, &wb);
+        s.on_set_formula(0, 0, 1, &plan, &wb, &ql_functions::default_registry());
         let edges_after: Vec<_> = s.graph().outgoing(f).to_vec();
         let stripe_count_after = s.graph().stripe_index().stripe_count();
 
@@ -3691,7 +4112,7 @@ mod tests {
             }),
             rhs: Box::new(ExprPlan::Number(1.0)),
         };
-        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb, &ql_functions::default_registry());
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         // A1 isn't a formula yet.
         assert!(s.cell_node_for(0, 0, 0).is_none());
@@ -3702,7 +4123,7 @@ mod tests {
         // Now set A1 = 99 — turns A1 into a formula. Retroactive
         // edge B1 → A1 must materialize.
         let plan_a1 = ExprPlan::Number(99.0);
-        s.on_set_formula(0, 0, 0, &plan_a1, &wb);
+        s.on_set_formula(0, 0, 0, &plan_a1, &wb, &ql_functions::default_registry());
         let a1 = s.cell_node_for(0, 0, 0).unwrap();
         assert!(
             s.graph().outgoing(b1).contains(&a1),
@@ -3737,7 +4158,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb, &ql_functions::default_registry());
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
 
         let deps = s.formula_deps(b1).expect("B1 must have deps recorded");
@@ -3771,7 +4192,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 2, &plan_c1, &wb);
+        s.on_set_formula(0, 0, 2, &plan_c1, &wb, &ql_functions::default_registry());
         // D1 = A3 (different target, same anchor).
         let plan_d1 = ExprPlan::CellRef {
             sheet: 0,
@@ -3780,7 +4201,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 3, &plan_d1, &wb);
+        s.on_set_formula(0, 0, 3, &plan_d1, &wb, &ql_functions::default_registry());
 
         let c1 = s.cell_node_for(0, 0, 2).unwrap();
         let d1 = s.cell_node_for(0, 0, 3).unwrap();
@@ -3829,7 +4250,7 @@ mod tests {
                 abs_row: false,
             }),
         };
-        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb, &ql_functions::default_registry());
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         let deps = s.formula_deps(b1).unwrap();
         assert_eq!(
@@ -3869,7 +4290,7 @@ mod tests {
                 abs_row: false,
             }),
         };
-        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb, &ql_functions::default_registry());
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         let deps = s.formula_deps(b1).unwrap();
         assert_eq!(
@@ -3899,7 +4320,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 1, &plan_v1, &wb);
+        s.on_set_formula(0, 0, 1, &plan_v1, &wb, &ql_functions::default_registry());
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         assert_eq!(s.formula_deps(b1).unwrap().cells, vec![(0, 0, 0)]);
 
@@ -3911,7 +4332,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 1, &plan_v2, &wb);
+        s.on_set_formula(0, 0, 1, &plan_v2, &wb, &ql_functions::default_registry());
         assert_eq!(
             s.formula_deps(b1).unwrap().cells,
             vec![(0, 0, 25)],
@@ -3949,7 +4370,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb, &ql_functions::default_registry());
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         assert_eq!(
             s.formula_deps(b1).unwrap().cells,
@@ -3988,7 +4409,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 0, 10, 0),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan, &wb);
+        s.on_set_formula(0, 5, 5, &plan, &wb, &ql_functions::default_registry());
         let node = s.cell_node_for(0, 5, 5).unwrap();
         // The formula registered in `table_to_formulas["Sales"]`.
         let deps = s.formula_deps(node).unwrap();
@@ -4012,7 +4433,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 0, 10, 0),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_f1, &wb);
+        s.on_set_formula(0, 5, 5, &plan_f1, &wb, &ql_functions::default_registry());
         let f1 = s.cell_node_for(0, 5, 5).unwrap();
         s.take_dirty(); // clear any seeding dirty from set_formula
 
@@ -4044,7 +4465,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 0, 10, 0),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan, &wb);
+        s.on_set_formula(0, 5, 5, &plan, &wb, &ql_functions::default_registry());
         let f1 = s.cell_node_for(0, 5, 5).unwrap();
         s.take_dirty();
 
@@ -4075,7 +4496,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 0, 10, 0),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_v1, &wb);
+        s.on_set_formula(0, 5, 5, &plan_v1, &wb, &ql_functions::default_registry());
         // Rebind to reference "Costs" instead.
         let plan_v2 = ExprPlan::StructuredRef {
             table_name: Arc::from("Costs"),
@@ -4085,7 +4506,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 1, 10, 1),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_v2, &wb);
+        s.on_set_formula(0, 5, 5, &plan_v2, &wb, &ql_functions::default_registry());
         let f1 = s.cell_node_for(0, 5, 5).unwrap();
         s.take_dirty();
 
@@ -4137,7 +4558,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 0, 10, 0),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan, &wb);
+        s.on_set_formula(0, 5, 5, &plan, &wb, &ql_functions::default_registry());
         let f1 = s.cell_node_for(0, 5, 5).unwrap();
         s.take_dirty();
 
@@ -4178,7 +4599,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 0, 10, 0),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan, &wb);
+        s.on_set_formula(0, 5, 5, &plan, &wb, &ql_functions::default_registry());
         let f1 = s.cell_node_for(0, 5, 5).unwrap();
         s.take_dirty();
 
@@ -4206,7 +4627,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 0, 10, 0),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan, &wb);
+        s.on_set_formula(0, 5, 5, &plan, &wb, &ql_functions::default_registry());
         let f1 = s.cell_node_for(0, 5, 5).unwrap();
 
         s.on_table_rename("SALES", "ORDERS");
@@ -4262,8 +4683,8 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 1, 10, 1),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &qty_plan, &wb);
-        s.on_set_formula(0, 6, 5, &price_plan, &wb);
+        s.on_set_formula(0, 5, 5, &qty_plan, &wb, &ql_functions::default_registry());
+        s.on_set_formula(0, 6, 5, &price_plan, &wb, &ql_functions::default_registry());
         let f1 = s.cell_node_for(0, 5, 5).unwrap();
         let f2 = s.cell_node_for(0, 6, 5).unwrap();
         s.take_dirty();
@@ -4296,7 +4717,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 0, 10, 0),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan, &wb);
+        s.on_set_formula(0, 5, 5, &plan, &wb, &ql_functions::default_registry());
         let f1 = s.cell_node_for(0, 5, 5).unwrap();
 
         s.on_column_rename("SALES", "Qty", "Quantity");
@@ -4337,7 +4758,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 0, 10, 0),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan, &wb);
+        s.on_set_formula(0, 5, 5, &plan, &wb, &ql_functions::default_registry());
         let f1 = s.cell_node_for(0, 5, 5).unwrap();
         s.take_dirty();
 
@@ -4361,7 +4782,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 0, 10, 0),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan, &wb);
+        s.on_set_formula(0, 5, 5, &plan, &wb, &ql_functions::default_registry());
         let f1 = s.cell_node_for(0, 5, 5).unwrap();
 
         // Exact match.
@@ -4402,7 +4823,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 0, 10, 0),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan, &wb);
+        s.on_set_formula(0, 5, 5, &plan, &wb, &ql_functions::default_registry());
         let f1 = s.cell_node_for(0, 5, 5).unwrap();
         s.take_dirty();
 
@@ -4429,7 +4850,7 @@ mod tests {
             resolved: ql_types::Range::new(0, 0, 0, 10, 0),
             is_this_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan, &wb);
+        s.on_set_formula(0, 5, 5, &plan, &wb, &ql_functions::default_registry());
         let f1 = s.cell_node_for(0, 5, 5).unwrap();
         s.take_dirty();
 
