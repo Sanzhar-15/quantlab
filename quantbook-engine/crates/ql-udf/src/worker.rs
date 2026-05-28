@@ -19,14 +19,13 @@ use crate::codec::CodecError;
 /// `CellDiagnostic` — never a panic and never a silently-dropped failure
 /// (No-Fallbacks; contract §10.4 exit tests 6 + 7).
 ///
-/// **6.4-3a audit-fix note (M3 — filed for 6.4-3b):** this taxonomy is
-/// intentionally INCOMPLETE for the Rust-only sliver. 6.4-3b (the real
-/// process-backed worker) will add at least `Cancelled` (a cooperative/hard cancel
-/// mapped to a cancel diagnostic, DISTINCT from `Timeout`/`#TIMEOUT!` — exit test 6
-/// treats user-cancel and deadline-breach differently) and a handshake/
-/// protocol-version-mismatch variant (the `HELLO`/`HELLO_ACK` exchange). They are
-/// deferred — not forgotten — because they only become exercisable once a real
-/// async pipe + handshake exist; the in-process `MockWorker` cannot reach them.
+/// **6.4-3b completed the taxonomy** (the M3 item the 6.4-3a audit filed): the
+/// process-backed [`crate::process::ProcessWorker`] can hit `Handshake` (the
+/// `HELLO`/`HELLO_ACK` protocol-version exchange failed) and `Protocol` (a
+/// malformed control frame), and `Cancelled` is reserved for a cooperative/hard
+/// cancel distinct from a deadline `Timeout` (exit test 6 treats user-cancel and
+/// deadline-breach differently; the v1 hard-cancel mechanism is worker-kill →
+/// `Timeout`, with `Cancelled` wired when cooperative `CANCEL` lands).
 #[derive(Debug, thiserror::Error)]
 pub enum UdfError {
     /// The Python callable raised. Maps to `#CALC!`/`#VALUE!` + a diagnostic
@@ -37,6 +36,19 @@ pub enum UdfError {
     /// arrives late) is dropped (exit test 6). Maps to `#TIMEOUT!`.
     #[error("udf timed out after {0:?}")]
     Timeout(Duration),
+    /// The call was cancelled (cooperative `CANCEL` / hard cancel) BEFORE a
+    /// deadline breach — distinct from [`UdfError::Timeout`] so the engine can
+    /// surface a cancel diagnostic rather than `#TIMEOUT!` (exit test 6).
+    #[error("udf call cancelled")]
+    Cancelled,
+    /// The worker handshake failed: the worker reported an incompatible protocol
+    /// version. Maps to `#CALC!` + a diagnostic; the worker is not usable.
+    #[error("udf worker handshake: protocol mismatch (engine {expected}, worker {got})")]
+    Handshake { expected: u32, got: u32 },
+    /// The worker spoke a malformed/unexpected frame (a wire-protocol violation
+    /// that is neither a clean `Raised` nor a codec error). Maps to `#CALC!`.
+    #[error("udf worker protocol violation: {0}")]
+    Protocol(String),
     /// The worker process died / the transport broke. Maps to `#CALC!` + a
     /// diagnostic; the worker respawns lazily on the next call.
     #[error("udf worker died / transport broken: {0}")]

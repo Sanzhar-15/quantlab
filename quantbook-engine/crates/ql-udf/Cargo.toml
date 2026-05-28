@@ -32,3 +32,8 @@ ql-types = { path = "../ql-types" }
 arrow = { workspace = true, features = ["ipc"] }
 
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Integration tests (`tests/process_smoke.rs`) are a separate crate and need
+# `ql-types` directly to build engine `ArrayValue`/`Value` inputs.
+ql-types = { path = "../ql-types" }

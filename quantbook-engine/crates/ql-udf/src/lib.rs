@@ -9,36 +9,42 @@
 //! adapts `FunctionArg`/`FunctionReturn` ↔ [`ql_types::ArrayValue`] and injects a
 //! worker into the eval context.
 //!
-//! **6.4-3a scope (this cycle — Rust-only, no Python, no subprocess):**
-//! - [`codec`] — `ArrayValue` ⇄ Arrow IPC stream bytes (the "fiddly part", with
-//!   round-trip property tests over every `Value` variant AND adversarial decode
-//!   tests — the decoder is a trust boundary for worker-controlled bytes: it
-//!   validates the exact schema, rejects null/non-finite/short-column/reordered/
-//!   trailing-batch input loudly, and never panics).
+//! **Modules:**
+//! - [`codec`] — `ArrayValue` ⇄ Arrow IPC stream bytes (the "fiddly part"). The
+//!   decoder is a trust boundary for worker-controlled bytes: it validates the exact
+//!   schema and rejects null/non-finite/short-column/reordered/trailing-batch input
+//!   loudly, never panicking (6.4-3a + its audit-fix).
 //! - [`frame`] — the `[u32 LE len][u8 type][payload]` envelope + [`frame::FrameType`].
-//! - [`payload`] — the typed `CALL` / `RETURN` payloads ([`payload::CallPayload`]
-//!   `{ handle, call_id, args }` / [`payload::ReturnPayload`] `{ call_id, result }`)
-//!   that carry the dispatch handle + correlation id in front of the Arrow grid.
-//! - [`worker`] — the [`worker::UdfWorker`] trait + an in-process
-//!   [`worker::MockWorker`] (proves call / raise / timeout mapping without a
-//!   subprocess) + the [`worker::UdfError`] taxonomy.
+//! - [`payload`] — the typed `CALL` / `RETURN` data payloads ([`payload::CallPayload`]
+//!   `{ handle, call_id, args }` / [`payload::ReturnPayload`] `{ call_id, result }`).
+//! - [`control`] — the `HELLO` / `HELLO_ACK` / `RAISE` / `LOG` / `CANCEL` control-frame
+//!   payload codecs + [`control::PROTOCOL_VERSION`] (6.4-3b pinned these; 6.4-3a left
+//!   them opaque).
+//! - [`worker`] — the [`worker::UdfWorker`] trait + the [`worker::UdfError`] taxonomy
+//!   + an in-process [`worker::MockWorker`] (test double).
+//! - [`process`] — [`process::ProcessWorker`]: the real, process-backed worker
+//!   (6.4-3b) that spawns `python -m quantbook.worker`, handshakes, calls, and
+//!   timeout-kills/respawns. Implements [`UdfWorker`].
 //!
-//! **Deliberately deferred** (later 6.4-3 cycles): real subprocess spawn /
-//! handshake / kill (6.4-3b); the eval-site `RegisteredFn::Udf` dispatch arm
-//! (6.4-3c); debugpy + trusted-workspace gating (6.4-3d). The CONTROL-frame
-//! payload internals (Hello/HelloAck/Raise/Cancel/Log field encodings) are
-//! intentionally opaque `Vec<u8>` at this layer until 6.4-3b pins the worker
-//! handshake — and the [`worker::UdfError`] taxonomy will gain the `Cancelled`
-//! (cancel distinct from timeout) and handshake/protocol-version variants then.
+//! It is a **leaf** (dependency-inversion, mirroring `ql-io-csv` / `ql-io-xlsx`):
+//! depends only on `ql-types`, `arrow`, `thiserror`, and `std`. `ql-exec` will consume
+//! it at the dispatch site (6.4-3c), adapting `FunctionArg`/`FunctionReturn` ↔
+//! [`ql_types::ArrayValue`] and injecting a worker into the eval context.
 //!
-//! The on-wire batch format is Arrow IPC (chosen so the Python side uses
-//! `pyarrow` natively); the [`codec`] boundary keeps it swappable.
+//! **Deferred** to later 6.4-3 cycles: the eval-site `RegisteredFn::Udf` dispatch arm
+//! (6.4-3c); debugpy attach + trusted-workspace gating + IDE handle-minting +
+//! `LOG`→`CellDiagnostic` routing (6.4-3d). The on-wire batch format is Arrow IPC
+//! (so the Python side uses `pyarrow` natively); the [`codec`] boundary keeps it
+//! swappable. The Python worker lives in `crates/quantbook-py/python/quantbook/`.
 
 pub mod codec;
+pub mod control;
 pub mod frame;
 pub mod payload;
+pub mod process;
 pub mod worker;
 
 pub use frame::{Frame, FrameType};
 pub use payload::{CallPayload, ReturnPayload};
+pub use process::{ProcessWorker, PythonWorkerConfig};
 pub use worker::{MockWorker, UdfError, UdfWorker};

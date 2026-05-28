@@ -104,6 +104,9 @@ pub enum CodecError {
     /// header (6.4-3a audit-fix: typed payload framing — see [`crate::payload`]).
     #[error("decode: payload header truncated (need {need} bytes, got {got})")]
     ShortHeader { need: usize, got: usize },
+    /// A control-frame string field ([`crate::control`]) was not valid UTF-8.
+    #[error("decode: {field} field is not valid UTF-8")]
+    BadUtf8 { field: &'static str },
 }
 
 const COL_KIND: usize = 0;
