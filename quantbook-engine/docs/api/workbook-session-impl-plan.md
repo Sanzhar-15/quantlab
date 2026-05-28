@@ -215,14 +215,59 @@ re-verify):** `cargo test -p ql-exec --lib` **742/0** (732 pre-substrate + 6 cyc
 audit-fix); `cargo test -p ql-functions --lib` **1815/0**; `cargo check --workspace` clean;
 clippy clean for edits; Node smoke PASS.
 
+**✅ 6.4-1 — Substrate-completion SHIPPED 2026-05-28 (parallel 2-way audit; audit-fix `befcd0d34cc`).**
+Decision-lock §2 item 6 (entry) closed. Cycle 1 code at `1a7dfee12b0` (+1095/-348 across 21 files
+in 3 crates) batched two block-on-6.4-entry HIGHs (H1 binder whitelists + H3 PlanCache re-extraction)
+and five filed substrate-completion items (M1 `FormulaDeps::is_empty/len` widening, M3
+`sorted_metadata` view, M5 `FunctionRegistryError → EngineError` mapper, I1 `DepShape::LazyShape`
+for ISREF, I2 atomicity policy docs). **H1 closure:** new `ArgContext` axis on `FunctionMetadata`
+(`Scalar` / `Aggregate` / `Reference`, orthogonal to `BatchShape`); `register_builtin_metadata`
+Phase 1 sets 7 reference-aware names' `arg_context: Reference` + Phase 1.5 sets ~66 aggregate /
+range-aware / array-tier names' `arg_context: Aggregate` mirroring pre-6.4-1
+`is_aggregate_function` `matches!` BYTE-FOR-BYTE (66/66 verified by both audit lanes);
+`ql-exec::plan::is_aggregate_function` + `is_reference_aware_function` drop hardcoded `matches!`
+and read metadata; every binder entry point gains `&FunctionRegistry`. **H3 closure:**
+`FunctionRegistry::fn_gen: u64` counter mirrors `name_gen`; bumps on success-only via
+`saturating_add(1)`; `PlanCacheKey` gains `fn_gen`; 5 production call sites
+(`cells.rs:116, :521`, `recompute.rs:547, :753`, `tables.rs:825`) read it. Bind cache invalidates
+on bump → re-bind → fresh `FormulaDeps` against current metadata. **Verdict SHIP-WITH-FIXES**:
+2 HIGH (both Opus-only, surfaced 2 more silent-registry-divergence sites the 6.4-0 H2 audit-fix
+missed at `from_workbook` + `rematerialize` + the I2 docstring's `Volatility::Dynamic` claim
+contradicting substrate's actual unknown-fn deferral; both FIXED in audit-fix), 5 MED, 4 LOW,
+3 INFO. Synthesis `docs/audits/2026-05-28-6-4-1-substrate-completion-audit/SYNTHESIS.md`.
+**Audit-fix `befcd0d34cc` landed in this commit:** (H1-OPUS) `WorkbookSession::from_workbook` +
+`rematerialize` thread `self.registry` via `_with_registry`; (H2-OPUS / Codex M1) I2 docstring
+rewritten to honestly describe substrate-v1 transient-gap behavior; (Codex M2 / Opus M1-OPUS)
+new `different_function_generation_misses` plan-cache test pins H3 cache-miss invariant;
+(Codex L1 / Opus M2-OPUS) new `phase_1_5_aggregate_overrides_byte_for_byte_against_pre_6_4_1_whitelist`
+enumerates all 66 Phase-1.5 Aggregate names verbatim; (Codex L2) 5-site stale-docstring sweep
+(ISREF no longer listed as AddressOnly in walker comments; H1/H3 framed as SHIPPED-not-open).
+**Filed for 6.4-2 (non-blocking):** M3-OPUS Reference+ArrayBatch forward-compat smoke; M4-OPUS
+UDF-flow binder integration test; L2-OPUS `DepShape::LazyShape` `#[serde(alias)]`; I2-OPUS
+Phase-1.5 overlap `debug_assert`. **Filed for 6.4 perf backlog (joint with 6.4-0 L1):** L3-OPUS
+walker hot-path 2x HashMap-lookup collapse. **Verification (focused re-verify of audit-fix scope):**
+`cargo check --workspace` clean; `cargo test -p ql-exec --lib` **743/0** default + `--features
+xlsx-write` (742 pre-audit-fix + `different_function_generation_misses`); `cargo test -p ql-exec
+--tests` all integration suites green; `cargo test -p ql-functions --lib` **1820/0** (1819
+pre-audit-fix + `phase_1_5_aggregate_overrides_byte_for_byte_against_pre_6_4_1_whitelist`);
+clippy clean for edits; Node smoke PASS through fresh-built audit-fix cdylib.
+
 **Remaining sequence (NEXT) — canonical decision-lock §2 item 6:**
 ✅ IDE-side Node smoke wiring + mocha **DONE** (cross-repo `feat/visualise-v1` `c24222315ed`, 2026-05-28).
 ✅ 6.1C security/design audit **DONE** (audit-fix `6a14bd9075a`).
-✅ 6.4-0 function-metadata substrate **DONE** (this entry; audit-fix `63592126afe`).
-→ **6.4 Python UDFs (NEXT — the wedge)**: trusted-workspace `qb.show/publish/bind/register_formula_function`,
-batch Arrow exchange, debugpy-attachable worker process. **Block-on-entry must-fix:** close H1
-(plan.rs binder whitelists derive from metadata) + H3 (PlanCache `fn_gen` or orchestrator
-reextract). **Ship as 6.4-entry substrate-completion increments:** M1 / M3 / M5 / I1 / I2.
+✅ 6.4-0 function-metadata substrate **DONE** (audit-fix `63592126afe`).
+✅ 6.4-1 substrate-completion **DONE** (this entry; audit-fix `befcd0d34cc`).
+→ **6.4-2 engine trait wiring (NEXT)**: implement `WorkbookSession::register_function` /
+`unregister_function` / `list_functions` (currently `not_implemented_in_v1_core`); each method
+calls the substrate building blocks — registry `register_metadata` / `unregister_metadata` /
+`sorted_metadata` + calcgraph `on_function_(un)registered` + the M5 `map_function_registry_err`
+mapper. Surface the methods over napi; update IDE `parseQuantbookError` allowlist for
+`function_exists` / `function_not_found` codes. Then 6.4-3 (Python worker + Arrow exchange +
+debugpy) and 6.4-4 (exit tests + closure megaudit).
+→ **6.4 Python UDFs (DOWNSTREAM — the wedge)**: trusted-workspace `qb.show/publish/bind/register_formula_function`,
+batch Arrow exchange, debugpy-attachable worker process. **Block-on-entry must-fix CLOSED at 6.4-1:**
+H1 (binder whitelists derive from metadata) + H3 (PlanCache `fn_gen` invalidation) both shipped.
+**Substrate-completion increments M1 / M3 / M5 / I1 / I2 also shipped at 6.4-1.**
 **Also tracked (cross-cutting):** a storage-level effective-non-blank-value extent API
 (`Sheet::iter_effective_cells()`) adopted by all serializers (csv/xlsx/.qbook) so a blank-inflated
 `Sheet::bounds` can't produce a giant export — Lane D proposed the fix; not 6.1C-blocking on its own

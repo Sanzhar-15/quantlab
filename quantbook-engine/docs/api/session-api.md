@@ -507,7 +507,7 @@ lock**, then `spawn_blocking(|| handle.wait_for_drain())`. Obligations:
 
 ## 10. Function metadata & graph-invalidation contract (R-P6-4 / 6.4-0)
 
-### 10.1 The gap (CLOSED by 6.4-0 substrate, 2026-05-28; commits `ac20a432c63` + audit-fix `63592126afe`)
+### 10.1 The gap (CLOSED by 6.4-0 substrate + 6.4-1 substrate-completion, 2026-05-28; commits `ac20a432c63` + audit-fix `63592126afe` + `1a7dfee12b0` + audit-fix `befcd0d34cc`)
 **Pre-substrate (historical):** `FunctionRegistry` (`ql-functions/src/registry.rs`) stored **dispatch only**.
 Volatility + reference-shape lived in **two hardcoded whitelists** in `calcgraph_session.rs`
 (`is_volatile_function` `:149-164`; `is_address_only_reference_fn` `:201-203`); `FormulaDeps`
@@ -533,47 +533,165 @@ and a registration/metadata change couldn't dirty its callers → silent graph b
   `metadata.dep_shape == AddressOnly`). Behavior is preserved byte-for-byte against the prior
   matchers.
 
-**STILL OPEN at 6.4 entry (block-on-entry must-fix; see audit-fix `63592126afe` + synthesis at `docs/audits/2026-05-28-6-4-0-substrate-audit/SYNTHESIS.md` + entry plan at `docs/phase6/6-4-entry-plan.md`):**
-- **H1** — `ql-exec::plan` carries two more hardcoded `matches!` whitelists
-  (`is_aggregate_function` `plan.rs:406-505`, `is_reference_aware_function` `plan.rs:566-571`)
-  that drive the binder's `arg_ctx` decision. UDFs with range args (every
-  `BatchShape::ArrayBatch` UDF) won't bind until these also derive from registry metadata. The
-  6.4-0 substrate is "two-thirds of the UDF prerequisite"; H1 is the missing third.
-- **H3** — register/unregister hooks dirty + transitive-fan but DO NOT re-extract deps. Contract
-  §10.3 ("re-extract deps + reschedule") requires both halves. The substrate hook is the
-  building block; 6.4 carries the orchestration via either (a) `fn_gen: u64` counter on
-  `crates/ql-exec/src/plan_cache.rs` (mirror `name_gen` at `:69-74`; bump per register/unregister;
-  cache miss triggers re-bind + fresh `FormulaDeps`), or (b) per-dependent `reextract_deps(node,
-  cached_plan, workbook, registry)` in the `WorkbookSession::register_function` orchestrator.
+**6.4-1 substrate-completion (SHIPPED 2026-05-28; commits `1a7dfee12b0` cycle 1 + `befcd0d34cc` cycle-2 audit-fix) — closes H1 + H3 + 5 filed items:**
+- **H1 CLOSED** — new `ArgContext` axis on `FunctionMetadata` (`Scalar` / `Aggregate` / `Reference`,
+  orthogonal to `BatchShape`); `register_builtin_metadata` Phase 1 sets the 7 reference-aware names'
+  `arg_context: Reference` and Phase 1.5 sets the ~66 aggregate / range-aware / array-tier names'
+  `arg_context: Aggregate` mirroring the pre-6.4-1 `is_aggregate_function` `matches!` BYTE-FOR-BYTE.
+  `ql-exec::plan::is_aggregate_function` + `is_reference_aware_function` drop the hardcoded
+  `matches!` and read metadata; every binder entry point threads `&FunctionRegistry`. UDFs
+  registering `ArgContext::Aggregate` admit range args at bind time (no
+  `BindError::NamedRangeInScalarContext` for `=MYUDF(MyNamedRange)`).
+- **H3 CLOSED via option (a)** — `FunctionRegistry::fn_gen: u64` counter mirrors `name_gen` exactly;
+  bump on every `register_metadata` / `unregister_metadata` success via `saturating_add(1)`
+  (Conflict / NotFound / builtin-guard return BEFORE the bump). `PlanCacheKey` carries `fn_gen`;
+  5 production call sites read it. Cache miss on bump → re-bind → fresh `FormulaDeps` against
+  current metadata. See §10.3 for the full closure rationale (and why option (a) was chosen over
+  option (b) per the Opus I1-OPUS audit finding).
+- **M1 (substrate-completion)** — `FormulaDeps::is_empty/len` widened to span ALL 6 tracked-dep
+  fields (`cells`, `named_ranges`, `names`, `tables`, `functions_used`, `is_volatile`); the
+  substrate audit-fix's 5-clause `||`-chain storage gate collapses to `!deps.is_empty()`. The
+  pre-6.4-1 API was a 2-of-6 lie that the substrate gate papered over.
+- **M3 (substrate-completion)** — new `FunctionRegistry::sorted_metadata() -> Vec<&FunctionMetadata>`
+  returning the metadata table sorted by `canonical_name` ascending. Matches the 6.1C H2
+  deterministic-ordering discipline; the (forthcoming) 6.4-2 `EngineSession::list_functions` mapper
+  reads it at the DTO seam.
+- **M5 (substrate-completion)** — new `map_function_registry_err` closed-enum exhaustive mapper at
+  `crates/ql-exec/src/session.rs` translates `Conflict { name } → function_exists` and
+  `NotFound { name } → function_not_found` per Appendix A. `#[allow(dead_code)]` until 6.4-2
+  wires the trait methods.
+- **I1 (substrate-completion)** — new `DepShape::LazyShape` variant; ISREF moves to LazyShape;
+  new `is_lazy_shape_reference_fn` migration shim parallel to `is_address_only_reference_fn`.
+  Walker checks LazyShape FIRST in the `ExprPlan::Function` arm (the strictest skip-arg-walking
+  branch), then AddressOnly, then normal. The two shims are DISJOINT — `arg_context: Reference`
+  is the only axis they share.
+- **I2 (substrate-completion)** — `function_meta.rs` module header documents the two-step v1
+  atomicity policy (`unregister_metadata` then `register_metadata`); the cycle-2 audit-fix's H2
+  doc-honesty rewrite describes the actual substrate-v1 transient-gap behavior in detail
+  (formula re-binds as NOT volatile during the gap because the substrate's
+  `is_volatile_function` returns `false` for unknown names — see §10.3's
+  "Unknown-function policy" sub-section for the contract §10.3 deferral note).
 
-### 10.2 `FunctionMetadata` (built in 6.4-0; v1 DTO now)
+**Cycle-2 audit-fix `befcd0d34cc` (2 net-new HIGH Opus surfaced + cycle-1 doc + test polish):**
+- **H1-OPUS (HIGH)** — `WorkbookSession::from_workbook` (`session.rs:304`) + `rematerialize`
+  (`:739`) were using zero-arg `rebuild_from_workbook(&workbook)` → silent registry divergence at
+  TWO more sites the 6.4-0 H2 audit-fix didn't close. Audit-fix threads
+  `self.registry` through both. Behavior-preserving today; prevents future UDF divergence.
+- **H2-OPUS / Codex M1 (HIGH doc-honesty)** — the cycle-1 I2 docstring claimed `Volatility::Dynamic`
+  during the transient gap (contract §10.3 desired behavior); both lanes verified at source the
+  substrate explicitly defers honoring §10.3's unknown-fn policy. Rewrite describes what the
+  substrate ACTUALLY does (formula re-binds as NOT volatile, binder arg_ctx falls back to Scalar,
+  dispatch surfaces `#NAME?`).
+- **M1 / M2 / L1** — new `different_function_generation_misses` plan-cache test pins H3 cache-miss
+  invariant; new `phase_1_5_aggregate_overrides_byte_for_byte_against_pre_6_4_1_whitelist`
+  enumerates all 66 Phase-1.5 names verbatim; 5-site stale-docstring sweep.
+
+**Filed for 6.4-2 (non-blocking):** M3-OPUS Reference+ArrayBatch forward-compat smoke; M4-OPUS
+UDF-flow binder integration test; L2-OPUS `DepShape::LazyShape` `#[serde(alias)]`; I2-OPUS Phase-1.5
+overlap `debug_assert`. **Filed for 6.4 perf backlog (joint with 6.4-0 L1):** L3-OPUS walker hot-path
+2x HashMap-lookup collapse + `to_ascii_uppercase` allocation. Full inventory at
+`docs/audits/2026-05-28-6-4-1-substrate-completion-audit/SYNTHESIS.md`.
+
+### 10.2 `FunctionMetadata` (built in 6.4-0; extended at 6.4-1; v1 DTO now)
 ```
 FunctionMetadata {
   canonical_name: String,        // ASCII-UPPERCASE, matches parser canonicalization (ast.rs:54)
   display_name: String?, aliases: [String]?,   // documented Unicode/alias policy
   arity: Arity, volatility: Volatility,         // Pure | Volatile | Dynamic
-  determinism: bool, dep_shape: DepShape,       // Value-deps | AddressOnly | Custom(explicit deps)
+  determinism: bool, dep_shape: DepShape,       // Value-deps | AddressOnly | LazyShape | Custom
   batch_shape: BatchShape,                       // Scalar | Arrow/array batch (UDFs: batch from day one)
   arg_policy: ArgPolicy, cancellation: CancelPolicy,  // cooperative | worker-kill
+  arg_context: ArgContext,                       // Scalar | Aggregate | Reference (6.4-1 H1; #[serde(default)])
   provenance_tags: [String],
 }
 ```
-The two hardcoded whitelists become **derived** from registered metadata (built-ins register their
-true metadata; the whitelists remain only as a migration shim).
+**6.4-0 + 6.4-1 axes (full taxonomy):**
+- `dep_shape: DepShape` now has THREE variants: `ValueDeps` (default — normal value-deps),
+  `AddressOnly` (ROW / COLUMN / ROWS / COLUMNS — depends on address/shape, not value), and
+  **`LazyShape`** (ISREF — function never evaluates its arg, walker skips arg subtree entirely;
+  added at 6.4-1 I1 to replace the pre-substrate hardcoded `name == "ISREF"` walker short-circuit).
+  `Custom` is reserved for `register_formula_function(.., deps=[...])` explicit deps.
+- `arg_context: ArgContext` is the NEW 6.4-1 H1 axis the binder consults at the
+  `ExprPlan::Function` arm:
+  - `Scalar` (default) — binder rejects range args (`BindError::NamedRangeInScalarContext`).
+    All pure-scalar builtins (`ABS` / `SQRT` / `IF` / etc.) and any unknown function name land
+    here. The `#[serde(default)]` attribute provides v0-wire compat with snapshots taken before
+    the 6.4-1 cycle 1 (which had no `arg_context` field).
+  - `Aggregate` — binder admits named-range / range-aware args under `BindContext::AggregateArg`.
+    The ~66 names that pre-6.4-1 lived as the `is_aggregate_function` `matches!` whitelist
+    (`SUM` / `AVERAGE` / `VLOOKUP` / `SUMIFS` / `TRANSPOSE` / `FILTER` / `SUBTOTAL` /
+    `CORREL` / `XIRR` / `XLOOKUP` / `PERCENTILE.INC` / `MINIFS` / `TEXTJOIN` / … verified
+    66/66 at the 6.4-1 cycle-2 audit). Python UDFs taking a column / range argument MUST
+    register `ArgContext::Aggregate` to bind range args.
+  - `Reference` — binder admits literal references (CellRef / RangeRef / NameRef) under
+    `BindContext::ReferenceArg`. The 7 names that pre-6.4-1 lived as the
+    `is_reference_aware_function` `matches!` whitelist (ROW / COLUMN / ROWS / COLUMNS / ISREF
+    / ISFORMULA / FORMULATEXT).
+- `ArgContext` is ORTHOGONAL to `BatchShape`: a builtin aggregate like `SUM` is
+  `ArgContext::Aggregate` AND `BatchShape::Scalar` (binder admits range args; eval is per-cell
+  `fn(&[Value]) -> Value` after the named-range cache hit). A Python UDF taking a Range arg
+  would declare `ArgContext::Aggregate` AND `BatchShape::ArrayBatch` (binder admits range;
+  eval is Arrow IPC). The two axes are kept distinct because conflating them would force UDFs
+  that want range args to declare `BatchShape::ArrayBatch` even when they don't need the Arrow
+  IPC ABI.
+
+The pre-substrate hardcoded whitelists (4 total: `is_volatile_function`,
+`is_address_only_reference_fn` at `calcgraph_session.rs` from 6.4-0 + `is_aggregate_function`,
+`is_reference_aware_function` at `plan.rs` from 6.4-1) all became **derived** from registered
+metadata (built-ins register their true metadata; the engine-side functions are now thin
+migration shims that delegate to `FunctionRegistry::metadata(name)`).
 
 ### 10.3 Registration + invalidation rules (HIGH-5)
 - **Canonical name:** ASCII-uppercase; `register_function` normalizes + validates against the parser's
   canonicalization. Unicode/alias policy documented.
 - **Collision rules:** `register_function` **returns an error** (not a panic) on collision with a
   built-in, an existing UDF, or (if applicable) a name/table — `EngineError{class:Conflict,
-  code:"function_exists"}`.
+  code:"function_exists"}`. Symmetric: `unregister_function` returns
+  `EngineError{class:NotFound, code:"function_not_found"}` for a name not in the registry. Both
+  codes are listed in Appendix A (6.4-1 cycle 1 added the M5 `map_function_registry_err` closed-enum
+  exhaustive mapper at `crates/ql-exec/src/session.rs`; marked `#[allow(dead_code)]` until 6.4-2
+  wires the trait methods).
 - **`functions_used` reverse index** *(new `FormulaDeps` field + graph map)*: the dep walker records
-  each function a formula calls; the graph keeps `function -> [formula nodes]`.
+  each function a formula calls; the graph keeps `function -> [formula nodes]`. Built at 6.4-0
+  substrate; the storage gate that admits a `FormulaDeps` instance into the per-formula table now
+  spans ALL six tracked-dep fields (cells / named_ranges / names / tables / functions_used /
+  is_volatile) post-6.4-1 M1 (the cycle-1 commit collapsed the substrate audit-fix's 5-clause
+  `||`-chain back to a single `!deps.is_empty()` once `FormulaDeps::is_empty/len` honestly span
+  all 6 fields).
 - **Invalidation:** `register_function` / `unregister_function` / metadata-update **dirties every
   formula referencing that canonical name** (re-extract deps + reschedule). This also covers formulas
   that bound while the name was **unknown** and become valid on registration.
-- **Unknown-function policy:** a formula referencing an unregistered name is **graph-visible and
-  treated Volatile/Dynamic** (never silently Pure), so it recomputes once the UDF appears.
+- **How re-extract is implemented (6.4-0 substrate + 6.4-1 H3):** the substrate's
+  `on_function_registered` / `on_function_unregistered` hooks satisfy the "dirty every formula"
+  + "reschedule" halves via `mark_dirty_from_cell_write`'s transitive BFS-fanout. The
+  "re-extract deps" half is closed at 6.4-1 by a `fn_gen: u64` counter on `FunctionRegistry`,
+  mirroring the established `name_gen` pattern at `crates/ql-storage::names::NameTable::generation()`.
+  Every `register_metadata` / `unregister_metadata` success bumps `fn_gen` via `saturating_add(1)`
+  (Conflict / NotFound failures leave the counter untouched — the metadata table is unchanged so
+  the cache stays valid). `PlanCacheKey` carries `fn_gen` alongside `name_gen`; the 5 production
+  call sites (`cells.rs:116`, `cells.rs:521`, `recompute.rs:547`, `recompute.rs:753`,
+  `tables.rs:825`) read `self.registry.fn_generation()` at bind time. A subsequent
+  `register_metadata` bump invalidates the bind cache → next eval re-binds → fresh
+  `FormulaDeps` against current metadata → `is_volatile` flag + `functions_used` reverse index
+  reflect the new registration. **Design choice (Opus I1-OPUS, 6.4-1 cycle-2 audit):** the
+  cache-invalidation route was chosen over per-dependent `reextract_deps` calls in the
+  `WorkbookSession::register_function` orchestrator because one cache-counter bump invalidates
+  every plan in one HashMap lookup vs. N walks of the dependent set, and the pattern mirrors
+  `name_gen` exactly — fewer moving parts for the same result.
+- **Unknown-function policy (substrate v1 deferral):** the contract specifies "a formula
+  referencing an unregistered name is **graph-visible and treated Volatile/Dynamic** (never
+  silently Pure), so it recomputes once the UDF appears." **6.4-0 substrate + 6.4-1 cycle 1
+  HONESTLY DEFER the Volatile/Dynamic tightening to 6.4-2 trait wiring (or later):** the
+  migration shim `is_volatile_function` at `crates/ql-exec/src/calcgraph_session.rs:202-207`
+  returns `false` for unknown names (preserves pre-substrate behavior); the formula stays
+  graph-visible via the normal cell-dep + name-dep paths, but its `is_volatile` flag is the
+  conservative `false` rather than the contract's prescribed Volatile/Dynamic. The transient
+  unregister→register window therefore can serve a result computed against the unknown-fn
+  fallback until the new metadata lands and `fn_gen` invalidates the cache. The substrate-v1
+  reasoning is that workspace-trust elevation makes the gap small and predictable (UDFs
+  register at trusted-reload events, not live edits); 6.4 will tighten this when UDF metadata
+  becomes truly session-scoped. The 6.4-1 cycle-2 audit's H2 doc-honesty correction at
+  `function_meta.rs:35-100` describes the actual substrate-v1 gap behavior in detail.
 
 ### 10.4 Graph-invalidation model + exit tests (decision-lock §4)
 A UDF formula is a normal graph node; args walked + registered as deps via `mark_dirty_from_cell_write`
@@ -672,6 +790,8 @@ Ambiguities Codex flagged, resolved here:
 | `CsvError::ExceedsSheetLimits` | `BadArgument` | `csv_exceeds_limits` (CSV larger than `MAX_ROW`/`MAX_COLUMN`) | no |
 | `CsvError::SheetNotFound` | `Internal` | `csv_sheet_not_found` (session selects the sheet → invariant break) | no |
 | `CsvError` (foreign `#[non_exhaustive]` future variant) | `Internal` | `unmapped_csv_error` (loud) | no |
+| `FunctionRegistryError::Conflict` (6.4-1 cycle-1; consumed by 6.4-2 `register_function`) | `Conflict` | `function_exists` | no |
+| `FunctionRegistryError::NotFound` (6.4-1 cycle-1; consumed by 6.4-2 `unregister_function`) | `NotFound` | `function_not_found` | no |
 | `TransportError::*` | `Capability`/`Internal` | `transport_*` (e.g. `transport_closed`) | maybe |
 | `CollabSessionError::{OpLog,Presence,Undo,Replay,Transport}` | per inner | `session_*` / inner kind | per inner |
 | version token decode failure | `Protocol` | `invalid_version_token` | no |

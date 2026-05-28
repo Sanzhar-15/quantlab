@@ -362,11 +362,52 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      `to_ascii_uppercase` allocation. **Verification (focused re-verify):** `cargo test -p ql-exec
      --lib` **742/0** (732 pre-substrate + 6 cycle-1 + 4 audit-fix), `cargo test -p ql-functions
      --lib` **1815/0**, `cargo check --workspace` clean, clippy clean for edits, Node smoke PASS.
-   - ⭐ **NEXT — 6.4 Python UDFs (the wedge)** (decision-lock §2 item 6): trusted-workspace
-     `qb.show/publish/bind/register_formula_function`, batch Arrow exchange, debugpy-attachable
-     worker process. **Block-on-entry must-fix:** close H1 (plan.rs binder whitelists derive from
-     metadata) + H3 (PlanCache `fn_gen` or orchestrator reextract). **Ship as 6.4-entry substrate-
-     completion increments:** M1 / M3 / M5 / I1 / I2 from the synthesis. Tracked cross-cutting:
+   - ✅ **6.4-1 SHIPPED 2026-05-28** (decision-lock §2 item 6 entry): substrate-completion via
+     parallel 2-way audit (Codex `gpt-5.5 xhigh` + Opus reviewer). Cycle 1 code at `1a7dfee12b0`
+     (+1095/-348 across 21 files in 3 crates) batched the two block-on-6.4-entry HIGHs (H1 binder
+     whitelists + H3 PlanCache re-extraction) AND the five filed substrate-completion items
+     (M1 `FormulaDeps::is_empty/len` widening, M3 `sorted_metadata` view, M5
+     `FunctionRegistryError → EngineError` mapper, I1 `DepShape::LazyShape` for ISREF, I2
+     atomicity policy docs). Cycle 2 audit-fix at `befcd0d34cc` (+399/-55 across 5 source files).
+     **H1 closure:** new `ArgContext` axis (`Scalar` / `Aggregate` / `Reference`, orthogonal to
+     `BatchShape`); Phase 1.5 sets ~66 aggregate names' `arg_context: Aggregate` mirroring
+     pre-6.4-1 `is_aggregate_function` `matches!` BYTE-FOR-BYTE (66/66 verified by both lanes);
+     `ql-exec::plan::is_aggregate_function` + `is_reference_aware_function` drop hardcoded
+     `matches!`; every binder entry point threads `&FunctionRegistry`. **H3 closure:**
+     `FunctionRegistry::fn_gen` counter mirrors `name_gen`; bumps on success-only via
+     `saturating_add(1)`; `PlanCacheKey` gains `fn_gen`; 5 production sites read it; bind cache
+     invalidates on bump → re-bind → fresh `FormulaDeps` against current metadata. **Verdict
+     SHIP-WITH-FIXES**: 2 HIGH (both Opus-only — 2 more silent-registry-divergence sites at
+     `from_workbook`+`rematerialize` the 6.4-0 H2 audit-fix missed + the I2 docstring's
+     `Volatility::Dynamic` claim contradicting substrate's actual unknown-fn deferral; both
+     FIXED in audit-fix), 5 MED, 4 LOW, 3 INFO. Synthesis
+     `docs/audits/2026-05-28-6-4-1-substrate-completion-audit/SYNTHESIS.md`. The 2-way pattern's
+     structural value held for the third audit in a row (6.1C → 6.4-0 → 6.4-1). **Audit-fix
+     `befcd0d34cc`:** (H1-OPUS) `WorkbookSession::from_workbook` (`session.rs:304`) +
+     `rematerialize` (`:739`) now use `rebuild_from_workbook_with_registry(.., &self.registry)`;
+     (H2-OPUS / Codex M1) I2 docstring rewritten to honestly describe substrate-v1 transient-gap
+     behavior (formula re-binds as NOT volatile, binder arg_ctx falls back to Scalar, dispatch
+     surfaces `#NAME?`); (Codex M2 / Opus M1-OPUS) new `different_function_generation_misses`
+     plan-cache test pins H3 cache-miss invariant; (Codex L1 / Opus M2-OPUS) new
+     `phase_1_5_aggregate_overrides_byte_for_byte_against_pre_6_4_1_whitelist` enumerates all
+     66 Phase-1.5 Aggregate names verbatim; (Codex L2) 5-site stale-docstring sweep.
+     **Filed for 6.4-2 (non-blocking):** M3-OPUS Reference+ArrayBatch forward-compat smoke;
+     M4-OPUS UDF-flow binder integration test; L2-OPUS `DepShape::LazyShape` `#[serde(alias)]`;
+     I2-OPUS Phase-1.5 overlap `debug_assert`. **Filed for 6.4 perf backlog (joint with 6.4-0
+     L1):** L3-OPUS walker hot-path 2x HashMap-lookup collapse. **Verification:** `cargo check
+     --workspace` clean; `cargo test -p ql-exec --lib` **743/0** default + `--features
+     xlsx-write`; `cargo test -p ql-exec --tests` all integration suites green; `cargo test -p
+     ql-functions --lib` **1820/0**; clippy clean for edits; Node smoke PASS through fresh-built
+     audit-fix cdylib.
+   - ⭐ **NEXT — 6.4-2 engine trait wiring** (decision-lock §2 item 6 continued): implement
+     `WorkbookSession::register_function` / `unregister_function` / `list_functions` (currently
+     `not_implemented_in_v1_core`). Each method calls the substrate building blocks: registry
+     `register_metadata` / `unregister_metadata` / `sorted_metadata` + calcgraph
+     `on_function_(un)registered` + the M5 `map_function_registry_err` mapper. Surface the
+     methods over napi (extends `Session` class beyond its 11-method 6.1C surface). Update IDE
+     `parseQuantbookError` allowlist for `function_exists` / `function_not_found` codes. Then
+     **6.4-3 Python worker + Arrow exchange + debugpy** (the most substantial sub-increment;
+     3-way audit), then **6.4-4 exit-tests + closure megaudit** (5-way). Tracked cross-cutting:
      `Sheet::iter_effective_cells()` serializer fix (still pending).
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
