@@ -236,6 +236,40 @@ assert.throws(
   "unknown volatility string surfaces structured [bad_argument]",
 );
 
+// 6.4-2 cycle-2 audit-fix (H1/F1): a lowercase or empty canonicalName must
+// surface a structured [bad_argument] — NOT panic across the napi boundary
+// (which pre-fix would have aborted the host AND sealed the session Faulted).
+assert.throws(
+  () => s.registerFunction({ ...myUdfMeta, canonicalName: "mylowerudf" }, 1n),
+  /\[bad_argument\]/,
+  "lowercase canonicalName surfaces structured [bad_argument] (no FFI panic)",
+);
+assert.throws(
+  () => s.registerFunction({ ...myUdfMeta, canonicalName: "" }, 1n),
+  /\[bad_argument\]/,
+  "empty canonicalName surfaces structured [bad_argument] (no FFI panic)",
+);
+// The rejected bad-name calls must NOT have sealed the session: a valid
+// registration still succeeds afterwards.
+s.registerFunction({ ...myUdfMeta, canonicalName: "MYUDF2" }, 7n);
+assert.ok(
+  s.listFunctions().some((m) => m.canonicalName === "MYUDF2"),
+  "session stays usable after rejected bad-name registrations (not sealed)",
+);
+s.unregisterFunction("MYUDF2");
+
+// 6.4-2 cycle-2 audit-fix (F3): a strict ArityJson tagged union rejects
+// extraneous payload fields rather than silently ignoring them.
+assert.throws(
+  () =>
+    s.registerFunction(
+      { ...myUdfMeta, canonicalName: "MYUDF3", arity: { kind: "variadic", n: 7 } },
+      1n,
+    ),
+  /\[bad_argument\]/,
+  "variadic arity carrying 'n' surfaces structured [bad_argument] (strict tagged union)",
+);
+
 console.log("[smoke] 6.4-2 function registration PASS");
 
 // **6.1C audit-fix M8 — Session.close() deterministic lifecycle release.**

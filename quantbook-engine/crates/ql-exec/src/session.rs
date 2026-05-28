@@ -298,23 +298,27 @@ impl WorkbookSession {
     }
 
     /// Wrap an existing `Workbook` (e.g. a hand-built test workbook; later the
-    /// product of `open`/`import`). Rebuilds the calc graph from the workbook's
-    /// formulas so dependency tracking is live.
+    /// product of `open`/`import`) using a CALLER-PROVIDED registry `Arc`.
+    /// Rebuilds the calc graph from the workbook's formulas — extracting deps,
+    /// arg-context, and volatility against THAT registry — so dependency
+    /// tracking is live and consistent with the registry the session will hold.
     ///
-    /// **6.4-1 cycle-2 audit-fix H1 (2026-05-28):** `registry` is constructed
-    /// BEFORE `graph` so the dep walker passes through the same
-    /// `Arc<FunctionRegistry>` the session holds for the rest of its lifetime.
-    /// Pre-audit-fix the body called the zero-arg
-    /// `CalcgraphSession::rebuild_from_workbook(&workbook)` which constructs
-    /// `default_registry()` internally — silently divergent from `self.registry`
-    /// once 6.4-2 wires `register_function` and the two registries can drift.
-    /// Behavior-preserving today (both registries are builtin-equivalent at
-    /// session construction) but closes the same divergence pattern the 6.4-0
-    /// H2 audit-fix closed at `recompute_all` — the 6.4-0 sweep missed this
-    /// site and the parallel `rematerialize` site below; the 6.4-1 cycle-2
-    /// Opus lane surfaced both.
-    pub fn from_workbook(workbook: Workbook) -> Self {
-        let registry = Arc::new(ql_functions::default_registry());
+    /// **6.4-2 cycle-2 audit-fix (F2 — Codex):** the `open`/`import` adoption
+    /// sites need this overload. They previously did
+    /// `*self = Self::from_workbook(wb); self.registry = preserved_registry;`
+    /// — but `from_workbook` builds the graph against a FRESH `default_registry()`,
+    /// so after the post-hoc `self.registry =` swap the graph was extracted
+    /// UDF-free while `self.registry` was UDF-aware: a graph⊥registry divergence
+    /// the increment introduces once 6.4-2 lets a UDF be registered before an
+    /// adoption. (`open` self-healed via its post-swap `recompute_all`, which
+    /// rebuilds the graph against `self.registry`; xlsx `import` does NOT
+    /// recompute after the swap, so its graph stayed divergent.) Passing the
+    /// preserved registry into construction closes the divergence at the source
+    /// for ALL adoption sites and removes `open`'s wasteful double graph build.
+    /// This is the same divergence class the 6.4-0 H2 + 6.4-1 H1 audit-fixes
+    /// closed at `recompute_all` / `rematerialize`; the adoption-site variant
+    /// was the gap those sweeps missed.
+    pub fn from_workbook_with_registry(workbook: Workbook, registry: Arc<FunctionRegistry>) -> Self {
         let graph =
             CalcgraphSession::rebuild_from_workbook_with_registry(&workbook, &registry).session;
         // inc.2c-7: snapshot the construction-time workbook as the undo baseline
@@ -351,6 +355,15 @@ impl WorkbookSession {
             next_txn_id: 1,
             undo_manager,
         }
+    }
+
+    /// Wrap an existing `Workbook` with a FRESH default registry (built-ins
+    /// only). The construction-time path for `new()` and hand-built test
+    /// workbooks, where no UDFs exist yet. Adoption sites that must preserve a
+    /// UDF-aware registry across workbook replacement use
+    /// [`Self::from_workbook_with_registry`] instead (6.4-2 cycle-2 audit-fix F2).
+    pub fn from_workbook(workbook: Workbook) -> Self {
+        Self::from_workbook_with_registry(workbook, Arc::new(ql_functions::default_registry()))
     }
 
     // --- internal helpers ---
@@ -1066,9 +1079,14 @@ impl EngineSession for WorkbookSession {
         // `OpLog` + `UndoManager` re-subscribed to it AND sets `baseline = wb`.
         // The function registry is session-scoped tooling (not document state),
         // so it is preserved across the open (v1: always the default registry).
+        // **6.4-2 cycle-2 audit-fix (F2):** adopt via `from_workbook_with_registry`
+        // so the rebuilt graph is extracted against the PRESERVED (UDF-aware)
+        // registry — not the fresh default `from_workbook` would build. (`open`
+        // additionally self-heals via the `recompute_all` below, but building the
+        // graph correctly the first time avoids the wasteful double build and
+        // keeps the pre-recompute graph consistent.)
         let registry = Arc::clone(&self.registry);
-        *self = Self::from_workbook(wb);
-        self.registry = registry;
+        *self = Self::from_workbook_with_registry(wb, registry);
         // Recompute on open — mirrors the canonical IDE path
         // (`loader.rs::load_workbook_and_recompute`): the saved computed values
         // may be stale relative to their inputs. Run with the op-log DETACHED so
@@ -1139,9 +1157,14 @@ impl EngineSession for WorkbookSession {
                 // Adopt the imported (already-recomputed) workbook as a fresh
                 // session, preserving the function registry (session tooling, not
                 // document state). Mirrors `open`'s Option-1 adoption.
+                // **6.4-2 cycle-2 audit-fix (F2 — the live divergence site):**
+                // xlsx import does NOT recompute after adoption (the importer
+                // already recomputed on the local workbook), so unlike `open`
+                // there is no post-swap `recompute_all` to rebuild the graph.
+                // Adopting via `from_workbook_with_registry` is what keeps the
+                // graph extracted against the preserved UDF-aware registry.
                 let registry = Arc::clone(&self.registry);
-                *self = Self::from_workbook(result.workbook);
-                self.registry = registry;
+                *self = Self::from_workbook_with_registry(result.workbook, registry);
                 self.push_xlsx_import_diagnostics(&report);
                 Ok(())
             }
@@ -1155,9 +1178,12 @@ impl EngineSession for WorkbookSession {
                 let result =
                     ql_io_csv::import_csv_bytes(bytes, ql_io_csv::CsvImportOptions::default())
                         .map_err(map_csv_err)?;
+                // **6.4-2 cycle-2 audit-fix (F2):** preserve the registry into
+                // graph construction (consistency with `open`/xlsx; CSV has no
+                // formulas so the graph is empty either way, but the adoption
+                // pattern stays uniform and correct).
                 let registry = Arc::clone(&self.registry);
-                *self = Self::from_workbook(result.workbook);
-                self.registry = registry;
+                *self = Self::from_workbook_with_registry(result.workbook, registry);
                 Ok(())
             }
             other => Err(EngineError::bad_argument(format!(
@@ -2465,6 +2491,18 @@ impl EngineSession for WorkbookSession {
         impl_handle: FunctionImplHandle,
     ) -> EngineResult<()> {
         self.ensure_ready()?;
+        // **6.4-2 cycle-2 audit-fix (H1/F1 — Codex + Opus, both lanes):**
+        // validate the canonical name BEFORE touching the registry.
+        // [`ql_functions::FunctionRegistry::register_metadata`] `assert!`s the
+        // name is non-empty + ASCII-upper-case (`registry.rs:357,:361`) — those
+        // are INTERNAL invariants, not input validation. Reaching them from JS
+        // over napi (which has NO `catch_unwind`, `ql-bindings-node/src/lib.rs:19`)
+        // would PANIC the host; worse, the panic would unwind through the armed
+        // `FaultGuard` below and permanently seal the session `Faulted` — one
+        // bad input bricks the session. Convert a non-canonical name into a loud
+        // structured `bad_argument` here (No-Fallbacks: a caller contract
+        // violation surfaces honestly; it is NOT silently normalized).
+        validate_canonical_function_name(&metadata.canonical_name)?;
         // Stash the canonical name BEFORE `register_udf` moves `metadata`
         // into the registry — needed for the dirty-fanout hook.
         let canonical_name = metadata.canonical_name.clone();
@@ -2980,6 +3018,32 @@ fn map_csv_err(e: ql_io_csv::CsvError) -> EngineError {
     }
 }
 
+/// **6.4-2 cycle-2 audit-fix (H1 — Codex F1 + Opus H1/H2):** enforce the
+/// registry's canonical-name contract at the trait boundary, returning a
+/// structured `bad_argument` rather than letting
+/// [`ql_functions::FunctionRegistry::register_metadata`]'s internal `assert!`s
+/// (`registry.rs:357,:361`) panic across the (catch_unwind-free) napi boundary
+/// and seal the session via the armed `FaultGuard`. The contract is: non-empty
+/// + ASCII-upper-case canonical name (the IDE / any caller is expected to
+/// upper-case before calling — the registry stores and `list_functions` returns
+/// the name verbatim, so we VALIDATE rather than silently normalize, per
+/// No-Fallbacks). This makes the two registry asserts genuine unreachable
+/// invariants for the trait path.
+fn validate_canonical_function_name(name: &str) -> EngineResult<()> {
+    if name.is_empty() {
+        return Err(EngineError::bad_argument(
+            "register_function: canonical_name must not be empty".to_string(),
+        ));
+    }
+    if name.bytes().any(|b| b.is_ascii_lowercase()) {
+        return Err(EngineError::bad_argument(format!(
+            "register_function: canonical_name {name:?} must be canonical upper-case \
+             (caller must normalize before calling)"
+        )));
+    }
+    Ok(())
+}
+
 /// **6.4-1 (2026-05-28; M5):** map `FunctionRegistryError` to the
 /// binding-neutral `EngineError` taxonomy. Used by the (forthcoming, 6.4)
 /// `WorkbookSession::register_function` / `unregister_function` /
@@ -3232,12 +3296,32 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.class, ErrorClass::Conflict);
         assert_eq!(err.code, "function_exists");
-        // The Conflict short-circuited BEFORE the udf_handles insert, so the
-        // original handle (1) is the one the registry holds — verified via
-        // a fresh registration after unregister: ensures the new (2) lands.
+        // **6.4-2 cycle-2 audit-fix (M3/F6):** the Conflict short-circuited
+        // BEFORE the `udf_handles.insert`, so the ORIGINAL handle (1) is still
+        // the one the registry holds. `list_functions` exposes only metadata
+        // (not handles), so assert the handle directly through the session's
+        // registry (test-internal field access) rather than overclaiming via a
+        // metadata-count check.
+        assert_eq!(
+            s.registry.udf_handle("MYUDF"),
+            Some(FunctionImplHandle(1)),
+            "rejected duplicate must NOT overwrite the original handle (1)"
+        );
+        // Unregister (clears metadata + handle), then re-register with a
+        // DIFFERENT handle (2) and prove (2) actually lands.
         s.unregister_function("MYUDF").unwrap();
+        assert_eq!(
+            s.registry.udf_handle("MYUDF"),
+            None,
+            "unregister_function clears the handle symmetrically"
+        );
         s.register_function(udf_meta("MYUDF"), FunctionImplHandle(2))
             .unwrap();
+        assert_eq!(
+            s.registry.udf_handle("MYUDF"),
+            Some(FunctionImplHandle(2)),
+            "re-register lands the NEW handle (2)"
+        );
         // Final state has exactly one MYUDF (re-registered).
         assert_eq!(
             s.list_functions()
@@ -3361,9 +3445,37 @@ mod tests {
             b1_before.value
         );
 
+        // **6.4-2 cycle-2 audit-fix (M1/F5 + L1):** capture observable state
+        // BEFORE registration so the dirty fanout + fn_gen bump are PROVEN, not
+        // merely implied by an unchanged #NAME? value. A no-op recalc would
+        // leave the value identical and still report `Completed`, so the old
+        // "#NAME? before AND after" assertions proved nothing about the wire.
+        // B1 is clean here (its `set_formula` already evaluated it).
+        let gen_before = s.registry.fn_generation();
+        let dirty_before = s.graph.dirty_formulas().len();
+
         // Register MYUDF. Dirty fanout fires; fn_gen bumps → bind cache miss.
         s.register_function(udf_meta("MYUDF"), FunctionImplHandle(1))
             .expect("register_function clean");
+
+        // PROOF (a): the registry mutation wired through the trait — fn_gen
+        // bumped exactly once (the H3 cache-invalidation half; also closes L1,
+        // since no trait-level fn_gen-bump test existed before).
+        assert_eq!(
+            s.registry.fn_generation(),
+            gen_before + 1,
+            "register_function MUST bump fn_gen exactly once through the trait (H3 wire)"
+        );
+        // PROOF (b): the dirty fanout fired — the formula naming MYUDF was
+        // dirtied by `on_function_registered`. Without the hook this set is
+        // unchanged. (The unit-level count==1 proof lives in calcgraph_session;
+        // this pins the END-TO-END trait wire.)
+        let dirty_after_register = s.graph.dirty_formulas().len();
+        assert!(
+            dirty_after_register > dirty_before,
+            "register_function MUST dirty the formula(s) referencing MYUDF (the fanout); \
+             dirty set went {dirty_before} -> {dirty_after_register}"
+        );
 
         // recalc_dirty re-evaluates — B1 was dirtied by the substrate hook.
         let op = s.recalc_dirty().unwrap();
@@ -3421,21 +3533,27 @@ mod tests {
         )
         .expect("set_name");
 
-        // Pre-registration: MYUDF unknown → binder defaults to Scalar
-        // arg_context → rejects the named-range arg.
-        // The bind error surfaces either as a `formula_bind` engine error
-        // OR as a CellDiagnostic with the cell holding an error value;
-        // both are acceptable engine paths.
-        let pre = s.set_formula(addr(sheet, 0, 1), "MYUDF(MyRange)");
-        let pre_rejected = pre.is_err() || {
-            s.cell(addr(sheet, 0, 1))
-                .unwrap()
-                .is_some_and(|c| matches!(c.value, Some(CellValue::Error { .. })))
-        };
+        // Pre-registration: MYUDF unknown → binder defaults its args to Scalar
+        // arg_context → the named range `MyRange` surfaces
+        // `BindError::NamedRangeInScalarContext`, which `set_formula` maps via
+        // `map_runtime_err` to `Compute / formula_bind` (it returns `Err`, not a
+        // cell diagnostic — verified at `set_formula` :1336-1338).
+        //
+        // **6.4-2 cycle-2 audit-fix (M2/F7):** assert the SPECIFIC failure, not
+        // "any error". The old check accepted any `set_formula` error or any
+        // error-valued cell, so it could pass for an unrelated parse/arity/
+        // lifecycle failure and still claim it pinned the ArgContext migration.
+        let pre = s
+            .set_formula(addr(sheet, 0, 1), "MYUDF(MyRange)")
+            .expect_err("MYUDF(MyRange) MUST fail to bind while MYUDF is unknown");
+        assert_eq!(pre.class, ErrorClass::Compute, "pre-registration error class");
+        assert_eq!(pre.code, "formula_bind", "pre-registration error code");
         assert!(
-            pre_rejected,
-            "MYUDF(MyRange) MUST fail to bind while MYUDF is unknown \
-             (binder defaults to Scalar arg_context)"
+            pre.message.contains("scalar position")
+                && pre.message.to_uppercase().contains("MYRANGE"),
+            "pre-registration failure must be the named-range-in-scalar-context bind error \
+             (the binder's Scalar default for an unknown function), got: {}",
+            pre.message
         );
 
         // Register MYUDF with arg_context: Aggregate (the udf_meta() default).
@@ -3509,6 +3627,87 @@ mod tests {
         // list_functions: ensure_readable also rejects Closed.
         let err = s.list_functions().unwrap_err();
         assert_eq!(err.code, "invalid_state");
+    }
+
+    /// **6.4-2 cycle-2 audit-fix (H1/F1 — Codex + Opus, both lanes):** a
+    /// lowercase or empty `canonical_name` returns a loud structured
+    /// `[bad_argument]` instead of PANICKING across the (catch_unwind-free) napi
+    /// boundary. Pre-fix, `register_function` forwarded the name straight to
+    /// `register_metadata`, whose `assert!`s (`registry.rs:357,:361`) panicked —
+    /// and the panic unwound through the ARMED `FaultGuard`, permanently sealing
+    /// the session `Faulted`. This test pins BOTH the structured error AND the
+    /// no-seal property (a valid registration after the rejected ones succeeds).
+    #[test]
+    fn register_function_rejects_lowercase_or_empty_canonical_name_with_bad_argument() {
+        let mut s = WorkbookSession::new();
+        // Lowercase canonical_name (registry.rs:361 asserts ASCII-upper-case).
+        let err = s
+            .register_function(udf_meta("mylowerudf"), FunctionImplHandle(1))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert_eq!(err.code, "bad_argument");
+        // Empty canonical_name (registry.rs:357 asserts non-empty).
+        let err = s
+            .register_function(udf_meta(""), FunctionImplHandle(1))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert_eq!(err.code, "bad_argument");
+        // CRUCIAL no-seal property: validation happens BEFORE the FaultGuard is
+        // armed, so the rejected calls leave the session Ready. A subsequent
+        // VALID registration must still succeed (proves the session was not
+        // sealed Faulted by the rejected inputs).
+        s.register_function(udf_meta("MYUDF"), FunctionImplHandle(2))
+            .expect("a valid registration after rejected ones must still succeed");
+        assert!(s
+            .list_functions()
+            .unwrap()
+            .iter()
+            .any(|m| m.canonical_name == "MYUDF"));
+    }
+
+    /// **6.4-2 cycle-2 audit-fix (F2 — Codex):** prove `from_workbook_with_registry`
+    /// extracts the rebuilt graph against the CALLER-PROVIDED registry, so the
+    /// `open`/`import` adoption sites preserve UDF-awareness. Build a workbook
+    /// whose `B1 = MYVOL(A1)` references a VOLATILE UDF (via a helper session
+    /// that has MYVOL registered), then adopt the SAME workbook two ways and
+    /// compare the rebuilt graph's volatile classification:
+    ///   - via `from_workbook_with_registry(.., udf_aware_registry)` → B1 volatile
+    ///   - via `from_workbook(..)` (fresh default, UDF-free registry) → NOT volatile
+    /// With the pre-fix adoption pattern (`from_workbook` then post-hoc registry
+    /// swap), the graph would have been built UDF-free and the volatile
+    /// classification silently lost — the divergence this fix closes.
+    #[test]
+    fn from_workbook_with_registry_threads_udf_metadata_into_graph() {
+        let mut helper = WorkbookSession::new();
+        let sheet = helper.add_sheet("S", 16384).unwrap();
+        helper
+            .set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        // udf_meta defaults to Volatility::Volatile (the Python-UDF wedge shape).
+        helper
+            .register_function(udf_meta("MYVOL"), FunctionImplHandle(1))
+            .unwrap();
+        helper.set_formula(addr(sheet, 0, 1), "MYVOL(A1)").unwrap();
+        let wb = helper.workbook.clone();
+        let udf_registry = Arc::clone(&helper.registry);
+
+        // Adopt with the preserved UDF-aware registry → B1 classified volatile.
+        let adopted = WorkbookSession::from_workbook_with_registry(wb.clone(), udf_registry);
+        assert!(
+            !adopted.graph.volatile_formulas().is_empty(),
+            "from_workbook_with_registry MUST extract the graph against the PASSED \
+             registry — MYVOL is Volatile, so B1=MYVOL(A1) lands in the volatile set"
+        );
+
+        // Adopt with a fresh default (UDF-free) registry → MYVOL unknown → NOT
+        // volatile. This is exactly the divergence the F2 fix prevents at the
+        // open/import adoption sites.
+        let default_adopted = WorkbookSession::from_workbook(wb);
+        assert!(
+            default_adopted.graph.volatile_formulas().is_empty(),
+            "from_workbook (default registry) does not know MYVOL is volatile — \
+             confirms the registry choice DRIVES graph extraction (the F2 hazard)"
+        );
     }
 
     // --- persistence: open + save .qbook round-trip (inc.2c-9) ---

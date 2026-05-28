@@ -4279,11 +4279,23 @@ fn workbook_snapshot_json_from_session(snap: ql_session::WorkbookSnapshot) -> Wo
 // is the canonical shape.
 // ============================================================================
 
-/// **6.4-2:** JS-facing `Arity` mirror.
+/// **6.4-2:** JS-facing `Arity` mirror — a strict tagged union on `kind`.
 ///
-/// `kind` discriminates: `"fixed"` requires `n`; `"range"` requires `min` and
-/// optionally `max` (None ≡ unbounded); `"variadic"` requires no payload.
-/// Mismatches surface `[bad_argument]` errors.
+/// - `"fixed"` requires `n`, and must NOT carry `min`/`max`.
+/// - `"range"` requires `min`, optionally `max` (absent ≡ unbounded), and must
+///   NOT carry `n`; `max` (when present) must be `>= min`.
+/// - `"variadic"` carries no payload (`n`/`min`/`max` must all be absent).
+///
+/// Any mismatch — wrong/extraneous field, missing required field, inverted
+/// range, or out-of-`u8`-range value — surfaces `[bad_argument]` (No-Fallbacks;
+/// 6.4-2 cycle-2 audit-fix F3 hardened the extraneous-field cases).
+///
+/// **`null` vs `undefined` (6.4-2 cycle-2 audit-fix F4):** optional fields use
+/// napi `Option<u32>`, which maps a MISSING/`undefined` JS field to `None`.
+/// Passing an explicit JS `null` triggers a generated napi `NumberExpected`
+/// conversion error BEFORE this mapper runs — so callers MUST OMIT optional
+/// fields (or set them `undefined`), not pass `null`. e.g. an unbounded range is
+/// `{kind:"range", min:1}` (omit `max`), never `{..., max:null}`.
 #[napi(object)]
 pub struct ArityJson {
     pub kind: String,
@@ -4326,8 +4338,19 @@ pub struct FunctionMetadataJson {
 /// types — napi-rs is happiest that way).
 fn arity_from_json(a: ArityJson) -> Result<ql_session::function_meta::Arity> {
     use ql_session::function_meta::Arity;
+    // **6.4-2 cycle-2 audit-fix (F3 — Codex / Opus L2):** strict tagged union.
+    // Each `kind` admits ONLY its own payload fields; an extraneous field
+    // (e.g. `{kind:"variadic", n:7}` or `{kind:"fixed", n:3, min:5}`) is a
+    // malformed DTO and is REJECTED loudly, not silently ignored. This keeps the
+    // JS→Rust mapper as strict as the enum-string mappers (No-Fallbacks: a
+    // caller's malformed DTO surfaces, it is not normalized away).
     match a.kind.as_str() {
         "fixed" => {
+            if a.min.is_some() || a.max.is_some() {
+                return Err(bad_argument_error(
+                    "ArityJson kind 'fixed' must carry only 'n' (got 'min'/'max')".into(),
+                ));
+            }
             let n = a.n.ok_or_else(|| {
                 bad_argument_error("ArityJson kind 'fixed' requires field 'n'".into())
             })?;
@@ -4337,6 +4360,11 @@ fn arity_from_json(a: ArityJson) -> Result<ql_session::function_meta::Arity> {
             Ok(Arity::Fixed { n })
         }
         "range" => {
+            if a.n.is_some() {
+                return Err(bad_argument_error(
+                    "ArityJson kind 'range' must carry 'min'/'max', not 'n'".into(),
+                ));
+            }
             let min = a.min.ok_or_else(|| {
                 bad_argument_error("ArityJson kind 'range' requires field 'min'".into())
             })?;
@@ -4355,9 +4383,24 @@ fn arity_from_json(a: ArityJson) -> Result<ql_session::function_meta::Arity> {
                     })
                 })
                 .transpose()?;
+            // Reject an inverted range loudly (max < min is not a valid arity).
+            if let Some(mx) = max {
+                if mx < min {
+                    return Err(bad_argument_error(format!(
+                        "ArityJson 'range': max ({mx}) must be >= min ({min})"
+                    )));
+                }
+            }
             Ok(Arity::Range { min, max })
         }
-        "variadic" => Ok(Arity::Variadic),
+        "variadic" => {
+            if a.n.is_some() || a.min.is_some() || a.max.is_some() {
+                return Err(bad_argument_error(
+                    "ArityJson kind 'variadic' must carry no payload (got 'n'/'min'/'max')".into(),
+                ));
+            }
+            Ok(Arity::Variadic)
+        }
         other => Err(bad_argument_error(format!(
             "ArityJson: unknown kind {other:?} (expected 'fixed'|'range'|'variadic')"
         ))),
@@ -4744,11 +4787,15 @@ impl Session {
     /// **Errors (Appendix A):**
     /// - `[function_exists]` — canonical name already registered (built-in
     ///   or existing UDF). `EngineError{Conflict, "function_exists"}`.
-    /// - `[bad_argument]` — invalid enum string OR non-canonical (lower-case)
-    ///   canonical_name. (The registry's canonicalization assert turns into
-    ///   a panic, which the napi boundary wraps; callers should always pass
-    ///   ASCII-uppercase canonical names — the IDE side is expected to
-    ///   uppercase before the call.)
+    /// - `[bad_argument]` — invalid enum string, OR empty/non-canonical
+    ///   (lower-case) canonical_name. **6.4-2 cycle-2 audit-fix (H1):** the
+    ///   trait method `WorkbookSession::register_function` VALIDATES the
+    ///   canonical name before touching the registry and returns a structured
+    ///   `[bad_argument]` for empty/lower-case names. (Pre-fix it forwarded the
+    ///   name unchecked and the registry's `assert!` PANICKED across this
+    ///   catch_unwind-free boundary, sealing the session — that path no longer
+    ///   exists.) Callers should still pass ASCII-uppercase canonical names; the
+    ///   IDE is expected to uppercase before the call.
     /// - `[invalid_state]` — session is not Ready.
     #[napi(js_name = "registerFunction")]
     pub fn register_function(
