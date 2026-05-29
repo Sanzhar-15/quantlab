@@ -3180,12 +3180,30 @@ fn map_csv_err(e: ql_io_csv::CsvError) -> EngineError {
 /// structured `bad_argument` rather than letting
 /// [`ql_functions::FunctionRegistry::register_metadata`]'s internal `assert!`s
 /// (`registry.rs:357,:361`) panic across the (catch_unwind-free) napi boundary
-/// and seal the session via the armed `FaultGuard`. The contract is: non-empty
-/// + ASCII-upper-case canonical name (the IDE / any caller is expected to
+/// and seal the session via the armed `FaultGuard`. The contract is: a non-empty
+/// ASCII-upper-case canonical name (the IDE / any caller is expected to
 /// upper-case before calling — the registry stores and `list_functions` returns
 /// the name verbatim, so we VALIDATE rather than silently normalize, per
 /// No-Fallbacks). This makes the two registry asserts genuine unreachable
 /// invariants for the trait path.
+///
+/// **6.4B hardening (2026-05-29; closes the 6.4-4 megaudit FF-1 / Codex-2 MED):**
+/// also reject a canonical name the formula language cannot CALL. Previously the
+/// gate accepted any non-empty all-upper string, so `register_function("MY UDF")`
+/// / `"MY-UDF"` / `"É"` succeeded and `list_functions` advertised a name no
+/// formula could reference (an inert registration — `=MY UDF(..)` fails loud at
+/// parse, never silently). We validate against the REAL lexer+parser (the single
+/// source of truth) rather than a hand-rolled identifier grammar: a hand grammar
+/// would drift from the parser and wrongly reject valid forms — dotted Excel
+/// canon (`T.DIST.2T`, via the lexer's digit-leading segments) and names that lex
+/// as a `CellRef` but the parser disambiguates as a function when followed by `(`
+/// (`LOG10`, `ATAN2`; see `token.rs`). The probe `NAME(1)` must lex+parse to a
+/// single `Expr::Function` whose name matches; anything else (whitespace,
+/// punctuation, non-ASCII, trailing garbage) fails to parse as one and is
+/// rejected. (The lower-level registry `register_metadata` keeps its own
+/// upper-case asserts; this trait-boundary gate is where host/napi registrations
+/// enter, so it is the right place to enforce callability without adding a
+/// formula-syntax dependency to the `ql-functions` registry crate.)
 fn validate_canonical_function_name(name: &str) -> EngineResult<()> {
     if name.is_empty() {
         return Err(EngineError::bad_argument(
@@ -3196,6 +3214,23 @@ fn validate_canonical_function_name(name: &str) -> EngineResult<()> {
         return Err(EngineError::bad_argument(format!(
             "register_function: canonical_name {name:?} must be canonical upper-case \
              (caller must normalize before calling)"
+        )));
+    }
+    // Callability gate: `NAME(1)` must parse to exactly a function call named
+    // `NAME`. Uses the engine's own lexer+parser so the accepted set is exactly
+    // what `=NAME(..)` can bind — no separate grammar to keep in sync.
+    let probe = format!("{name}(1)");
+    let is_callable = lex(&probe)
+        .ok()
+        .and_then(|tokens| parse(tokens).ok())
+        .is_some_and(|expr| {
+            matches!(&expr, ql_formula_syntax::Expr::Function { name: parsed, .. }
+                if parsed.eq_ignore_ascii_case(name))
+        });
+    if !is_callable {
+        return Err(EngineError::bad_argument(format!(
+            "register_function: canonical_name {name:?} is not a callable formula \
+             function name (must be usable as the head of `=NAME(..)`)"
         )));
     }
     Ok(())
@@ -4583,6 +4618,47 @@ mod tests {
             .unwrap()
             .iter()
             .any(|m| m.canonical_name == "MYUDF"));
+    }
+
+    /// **6.4B hardening (2026-05-29; 6.4-4 megaudit FF-1):** `register_function`
+    /// rejects an upper-case-but-UNCALLABLE canonical name (one the formula
+    /// language cannot use as `=NAME(..)`), while still accepting the DOTTED
+    /// shapes a naive identifier grammar would wrongly reject — both letter-led
+    /// (`VAR.S` shape) and digit-led (`T.DIST.2T` / `.2T` shape) segments. (The
+    /// gate uses the real lexer+parser, so it also accepts CellRef-lexed builtin
+    /// names like `LOG10`; that is not asserted here because every such name is
+    /// already a registered builtin and would hit the dup-check, not the gate —
+    /// the acceptance is covered by the parser path itself + the validator doc.)
+    #[test]
+    fn register_function_rejects_uncallable_canonical_names() {
+        // Accept: plain + both dotted-segment shapes + leading underscore — all
+        // callable as a formula head and none a pre-registered builtin.
+        for (i, ok_name) in ["MYUDF", "MY.DOTUDF", "MYUDF.2X", "_HIDDEN"]
+            .iter()
+            .enumerate()
+        {
+            let mut s = WorkbookSession::new();
+            s.register_function(udf_meta(ok_name), FunctionImplHandle(i as u64 + 1))
+                .unwrap_or_else(|e| {
+                    panic!("{ok_name:?} is a callable name and must register: {e:?}")
+                });
+        }
+        // Reject: whitespace, punctuation, non-ASCII, trailing dot, digit-led —
+        // all upper-case (so they pass the lowercase gate) but uncallable as a
+        // formula function head.
+        let mut s = WorkbookSession::new();
+        for bad_name in ["MY UDF", "MY-UDF", "MY+UDF", "É", "MY.UDF.", "1UDF"] {
+            let err = s
+                .register_function(udf_meta(bad_name), FunctionImplHandle(99))
+                .unwrap_err();
+            assert_eq!(
+                err.code, "bad_argument",
+                "{bad_name:?} is not callable as =NAME(..) and must be rejected bad_argument"
+            );
+        }
+        // No-seal: a valid registration still succeeds after the rejects.
+        s.register_function(udf_meta("OKUDF"), FunctionImplHandle(100))
+            .expect("session must remain usable (validation precedes the FaultGuard)");
     }
 
     /// **6.4-2 cycle-2 audit-fix (F2 — Codex):** prove `from_workbook_with_registry`
