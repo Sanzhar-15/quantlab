@@ -55,6 +55,14 @@ use crate::plan::ExprPlan;
 /// v1 uses one session-wide constant; per-function / [`CancelPolicy`]-driven
 /// deadlines are deferred. Lives here (the sole consumer is [`dispatch_udf`])
 /// rather than on the session.
+///
+/// **Aggregate-stall caveat (Codex MED-2 / Opus MED-3, 6.4-3c audit):** this is
+/// PER-CALL. A single `recalc_all` over N hung/slow UDF cells can block the
+/// synchronous recalc thread — and the napi session `Mutex` it holds — for up to
+/// `30s × N`, stalling every other JS call on that session. No deadlock (the
+/// worker IPC is a separate process and never re-acquires the session lock), but
+/// the aggregate stall is unbounded. An operation-level recalc budget / cancel
+/// check is FILED-FORWARD for 6.4-3d alongside per-function deadlines.
 const UDF_CALL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Evaluate an `ExprPlan` against `env` to produce a `Value`. Total function — never
@@ -922,6 +930,12 @@ pub fn eval_at_cell_boundary<E: CellEnv>(
         // `udf_handle` is `Some` ONLY for UDFs, and those guards' `lookup_any`
         // returns `None` for a UDF (a name is never both a built-in and a UDF —
         // `register_udf`'s Conflict check enforces it). Must precede `_`.
+        // (Opus LOW-3, 6.4-3c audit: that invariant relies on every built-in in
+        // `fns` having metadata, which `default_registry`'s boot-time assert
+        // guarantees; a hand-built registry that inserts a `fns` entry WITHOUT
+        // metadata and then `register_udf`s the same name could populate both
+        // tables — there the built-in guards still win, so no wrong result, but
+        // the exclusivity is construction-dependent, not structural.)
         ExprPlan::Function { name, args } if registry.udf_handle(name).is_some() => {
             let handle = registry
                 .udf_handle(name)
@@ -942,12 +956,31 @@ pub fn eval_at_cell_boundary<E: CellEnv>(
 /// SINGLE `ArrayValue` the wire protocol carries (`ql_udf::CallPayload.args`).
 /// The v1 shape rule (design §3 + the 6.4-3c plan; the worker receives one grid):
 ///   - N scalar args → a 1×N row grid (a single scalar arg → 1×1).
-///   - exactly ONE range/array arg → that arg's full grid (its native shape).
-///   - mixed scalar+range, OR ≥2 range/array args → `Err(#VALUE!)` — these can't
+///   - exactly ONE grid arg → that arg's full grid (its native shape).
+///   - mixed scalar+grid, OR ≥2 grid args → `Err(#VALUE!)` — these can't
 ///     be expressed in one rectangular grid; a richer args protocol (list-of-
-///     grids) is deferred. The limitation is documented, not silent.
+///     grids) is deferred. The limitation is a VISIBLE `#VALUE!`, never silent.
+///
+/// **Classification is by RUNTIME shape, not plan shape** (CODEX-HIGH-1, 6.4-3c
+/// 3-way audit). A "grid" arg is a range reference (`AggregateNameRef` /
+/// `RangeRef` / `StructuredRef`), a literal array (`{1,2}`), OR a function call
+/// that actually PRODUCES an array at runtime — a Unified-tier built-in (the
+/// only built-in tier that can return `FunctionReturn::Array`, e.g.
+/// `SEQUENCE(2,2)`) or a nested UDF that returns a grid. Those function args are
+/// evaluated through [`eval_at_cell_boundary`] so their `Array` return is
+/// preserved; without this they would fall to scalar eval, which collapses an
+/// array to `#CALC!`, and the UDF would silently receive a 1×1 error grid
+/// instead of the table the user wrote. Everything else (cell refs, literals,
+/// arithmetic, and non-array built-ins INCLUDING `ROW`/`COLUMN` — `ReferenceAware`,
+/// not `Unified` — which keep their implicit-intersection scalar semantics at a
+/// UDF arg) is a scalar.
 ///
 /// A `StructuredRef` whose `[@]` narrowing fails surfaces its error as `Err`.
+///
+/// **Error-valued args are forwarded** (Opus MED, 6.4-3c audit — intentional):
+/// `=MYUDF(1/0)` packs `#DIV/0!` into the grid and sends it to Python, matching
+/// Excel, where a UDF receives error values as arguments and may handle them
+/// (e.g. an `IFERROR`-style UDF). It is NOT short-circuited to the error.
 ///
 /// Range-shaped args reach here per the UDF's registered `ArgContext`: an
 /// Aggregate-context UDF binds `=MYUDF(SomeRange)` to `AggregateNameRef`
@@ -958,32 +991,25 @@ fn marshal_udf_args<E: CellEnv>(
     registry: &FunctionRegistry,
     cache: &dyn AggregateCache,
 ) -> Result<ArrayValue, ErrorValue> {
-    fn is_range_like(a: &ExprPlan) -> bool {
-        matches!(
-            a,
-            ExprPlan::AggregateNameRef { .. }
-                | ExprPlan::StructuredRef { .. }
-                | ExprPlan::RangeRef { .. }
-                | ExprPlan::Array(_)
-        )
-    }
-    let n_range = args.iter().filter(|a| is_range_like(a)).count();
-
-    // All-scalar (incl. the zero-arg case → a 1×0 row): pack a 1×N row.
-    if n_range == 0 {
-        let cells: Vec<Value> = args
-            .iter()
-            .map(|a| eval_scalar_with_cache(a, env, registry, cache))
-            .collect();
-        return Ok(ArrayValue::row(cells));
+    // One evaluated argument: either a single value or a full grid, decided by
+    // RUNTIME shape (see the fn doc — CODEX-HIGH-1 audit fix).
+    enum Arg {
+        Scalar(Value),
+        Grid(ArrayValue),
     }
 
-    // Exactly one range/array arg, and it is the only arg → its native grid.
-    if n_range == 1 && args.len() == 1 {
-        return match &args[0] {
+    fn eval_arg<E: CellEnv>(
+        a: &ExprPlan,
+        env: &E,
+        registry: &FunctionRegistry,
+        cache: &dyn AggregateCache,
+    ) -> Result<Arg, ErrorValue> {
+        match a {
             ExprPlan::AggregateNameRef { range, .. } | ExprPlan::RangeRef { range } => {
                 let (values, rows, cols) = env.read_range_with_shape(*range);
-                ArrayValue::new(rows as u32, cols as u32, values).map_err(|_| ErrorValue::Value)
+                Ok(Arg::Grid(
+                    ArrayValue::new(rows as u32, cols as u32, values).map_err(|_| ErrorValue::Value)?,
+                ))
             }
             ExprPlan::StructuredRef {
                 resolved,
@@ -992,7 +1018,9 @@ fn marshal_udf_args<E: CellEnv>(
             } => {
                 let range = narrow_structured_ref(*resolved, *is_this_row, env)?;
                 let (values, rows, cols) = env.read_range_with_shape(range);
-                ArrayValue::new(rows as u32, cols as u32, values).map_err(|_| ErrorValue::Value)
+                Ok(Arg::Grid(
+                    ArrayValue::new(rows as u32, cols as u32, values).map_err(|_| ErrorValue::Value)?,
+                ))
             }
             ExprPlan::Array(rows) => {
                 let row_count = rows.len() as u32;
@@ -1004,15 +1032,59 @@ fn marshal_udf_args<E: CellEnv>(
                         cells.push(eval_scalar_with_cache(cell, env, registry, cache));
                     }
                 }
-                ArrayValue::new(row_count, col_count, cells).map_err(|_| ErrorValue::Value)
+                Ok(Arg::Grid(
+                    ArrayValue::new(row_count, col_count, cells).map_err(|_| ErrorValue::Value)?,
+                ))
             }
-            // `is_range_like` matched but no arm handled it — an upstream
-            // ExprPlan-shape change. Loud per No-Fallbacks.
-            other => unreachable!("marshal_udf_args: is_range_like matched {other:?} unhandled"),
+            // Array-CAPABLE function: a Unified-tier built-in (the only built-in
+            // tier that can return an Array) or a nested UDF. Evaluate at the
+            // cell boundary so an Array return is preserved, not scalarized to
+            // `#CALC!`. A scalar return (e.g. `SUM(..)`, or a UDF returning 1×1)
+            // flows through as a scalar — no behavior change.
+            ExprPlan::Function { name, .. }
+                if matches!(
+                    registry.lookup_any(name),
+                    Some(ql_functions::RegisteredFn::Unified(_))
+                ) || registry.udf_handle(name).is_some() =>
+            {
+                match eval_at_cell_boundary(a, env, registry, cache) {
+                    EvalResult::Scalar(v) => Ok(Arg::Scalar(v)),
+                    EvalResult::Array(av) => Ok(Arg::Grid(av)),
+                }
+            }
+            // Plain scalar arg.
+            other => Ok(Arg::Scalar(eval_scalar_with_cache(other, env, registry, cache))),
+        }
+    }
+
+    let mut evaluated: Vec<Arg> = Vec::with_capacity(args.len());
+    for a in args {
+        evaluated.push(eval_arg(a, env, registry, cache)?);
+    }
+    let n_grid = evaluated.iter().filter(|a| matches!(a, Arg::Grid(_))).count();
+
+    // All scalar (incl. the zero-arg case → a 1×0 row): pack a 1×N row.
+    if n_grid == 0 {
+        let cells: Vec<Value> = evaluated
+            .into_iter()
+            .map(|a| match a {
+                Arg::Scalar(v) => v,
+                Arg::Grid(_) => unreachable!("n_grid==0 ⇒ no Grid args"),
+            })
+            .collect();
+        return Ok(ArrayValue::row(cells));
+    }
+
+    // Exactly one grid arg AND it is the only arg → its native grid.
+    if n_grid == 1 && evaluated.len() == 1 {
+        return match evaluated.into_iter().next() {
+            Some(Arg::Grid(g)) => Ok(g),
+            _ => unreachable!("n_grid==1 && len==1 ⇒ the sole arg is a Grid"),
         };
     }
 
-    // Mixed scalar+range, or ≥2 range/array args: deferred v1 limitation.
+    // Mixed scalar+grid, or ≥2 grid args: can't fit one rectangular grid →
+    // VISIBLE `#VALUE!`, never a silent scalarization. (list-of-grids deferred.)
     Err(ErrorValue::Value)
 }
 
@@ -1044,8 +1116,16 @@ fn dispatch_udf<E: CellEnv>(
     match worker.call(handle, &args_grid, UDF_CALL_DEADLINE) {
         Ok(grid) => {
             if grid.rows() == 1 && grid.cols() == 1 {
-                // 1×1 result → a scalar cell value.
-                FunctionReturn::Scalar(grid.get(0, 0).cloned().unwrap_or(Value::Blank))
+                // 1×1 result → a scalar cell value. `get(0,0)` on a grid we
+                // just confirmed is 1×1 is always `Some`; a `None` here would
+                // mean an internally-inconsistent `ArrayValue` from the worker
+                // — surface it as a VISIBLE `#CALC!` (No-Fallbacks), NOT a
+                // silent `Blank` (Opus LOW-1, 6.4-3c audit).
+                FunctionReturn::Scalar(
+                    grid.get(0, 0)
+                        .cloned()
+                        .unwrap_or(Value::Error(ErrorValue::Calc)),
+                )
             } else {
                 // N×M (incl. degenerate) → an array; the cell-boundary caller
                 // spills it, the scalar-context caller maps it to `#CALC!`.

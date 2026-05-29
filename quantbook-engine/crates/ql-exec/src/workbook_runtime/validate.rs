@@ -44,6 +44,9 @@ impl<'a> WorkbookRuntime<'a> {
             self.workbook,
             self.registry,
             self.oplog.as_deref_mut(),
+            // 6.4-3c (CODEX-HIGH-2): forward the session's UDF worker so UDFs
+            // committed via a runtime transaction compute, not stale-`#CALC!`.
+            self.udf_worker,
         )
     }
 

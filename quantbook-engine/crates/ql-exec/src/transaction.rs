@@ -29,6 +29,7 @@
 //!   both ops in the list, and pass 2 applies them in order — so the final value
 //!   matches the last `put_*` for that cell.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -38,6 +39,7 @@ use ql_io::CellWireValue;
 use ql_oplog::{Op, OpLog};
 use ql_storage::Workbook;
 use ql_types::{ColId, RowId, SheetId, Value};
+use ql_udf::UdfWorker;
 
 use crate::env::WorkbookEnv;
 use crate::plan::{bind_with_site, BindSite, ExprPlan};
@@ -97,6 +99,15 @@ pub struct WorkbookTransaction<'a> {
     /// `BatchCommit` at the end of pass 2 when this is `Some` and there is
     /// at least one buffered op.
     oplog: Option<&'a mut OpLog>,
+    /// **6.4-3c (2026-05-29; CODEX-HIGH-2 audit fix):** borrowed handle to the
+    /// session's Python-UDF worker, inherited from the `WorkbookRuntime` via
+    /// `with_optional_oplog`. `None` for the bare `new`/`with_oplog`
+    /// constructors. Threaded into pass-2's eval env so a UDF committed through
+    /// a transaction COMPUTES instead of writing a permanent silent `#CALC!`
+    /// (this struct keeps no calcgraph, so a stale `#CALC!` here would NOT
+    /// self-heal). `None` (no worker) still yields a deterministic `#CALC!` at
+    /// the dispatch site — honest, never a panic.
+    udf_worker: Option<&'a RefCell<Box<dyn UdfWorker + Send>>>,
 }
 
 impl<'a> WorkbookTransaction<'a> {
@@ -107,6 +118,9 @@ impl<'a> WorkbookTransaction<'a> {
             ops: Vec::new(),
             cell_kinds: HashMap::new(),
             oplog: None,
+            // 6.4-3c: bare constructor has no session, hence no worker. A UDF
+            // committed through it is `#CALC!` (no-worker, honest + visible).
+            udf_worker: None,
         }
     }
 
@@ -125,6 +139,8 @@ impl<'a> WorkbookTransaction<'a> {
             ops: Vec::new(),
             cell_kinds: HashMap::new(),
             oplog: Some(oplog),
+            // 6.4-3c: standalone op-log constructor, no session worker.
+            udf_worker: None,
         }
     }
 
@@ -132,10 +148,16 @@ impl<'a> WorkbookTransaction<'a> {
     /// `WorkbookRuntime::transaction` to pass through the runtime's
     /// (possibly absent) op-log handle via `Option::as_deref_mut`. Public
     /// callers should prefer `new` or `with_oplog`.
+    ///
+    /// **6.4-3c (2026-05-29; CODEX-HIGH-2 audit fix):** also forwards the
+    /// runtime's (possibly absent) Python-UDF worker so UDFs committed through a
+    /// runtime transaction compute correctly instead of writing a permanent
+    /// silent `#CALC!`.
     pub fn with_optional_oplog(
         workbook: &'a mut Workbook,
         registry: &'a FunctionRegistry,
         oplog: Option<&'a mut OpLog>,
+        udf_worker: Option<&'a RefCell<Box<dyn UdfWorker + Send>>>,
     ) -> Self {
         Self {
             workbook,
@@ -143,6 +165,7 @@ impl<'a> WorkbookTransaction<'a> {
             ops: Vec::new(),
             cell_kinds: HashMap::new(),
             oplog,
+            udf_worker,
         }
     }
 
@@ -278,6 +301,7 @@ impl<'a> WorkbookTransaction<'a> {
             ops,
             cell_kinds: _,
             oplog,
+            udf_worker,
         } = self;
 
         // Phase 2B.7 audit H2/H4 (2026-05-12): build the log_ops list AND
@@ -394,7 +418,19 @@ impl<'a> WorkbookTransaction<'a> {
             } = op
             {
                 let value = {
-                    let env = WorkbookEnv::new(workbook);
+                    // 6.4-3c (CODEX-HIGH-2): carry the session's UDF worker so a
+                    // `=MYUDF(..)` committed through this transaction dispatches
+                    // to the worker rather than writing a permanent `#CALC!`
+                    // (this struct has no calcgraph to self-heal one). `None`
+                    // worker still yields an honest `#CALC!` at the dispatch
+                    // site. Scalar context: an array-returning UDF here is
+                    // `#CALC!` (no spill on this no-graph path), same as any
+                    // array-in-scalar-context.
+                    let env = WorkbookEnv::with_formula_cell_and_worker(
+                        workbook,
+                        ql_types::Address::new(*sheet, *row, *col),
+                        udf_worker,
+                    );
                     eval_scalar_with_registry(plan, &env, registry)
                 };
                 // Phase 3.5 (CORR-25): formula outputs go to the computed
@@ -494,6 +530,79 @@ mod tests {
 
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(10.0));
         assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(20.0));
+    }
+
+    /// **CODEX-HIGH-2 (6.4-3c 3-way audit):** a UDF committed through a
+    /// `WorkbookTransaction` that carries a worker COMPUTES, instead of writing
+    /// a permanent silent `#CALC!` (this primitive keeps no calcgraph, so a
+    /// stale `#CALC!` here would never self-heal). Without a worker it is an
+    /// honest, visible `#CALC!` — never a panic or a wrong value.
+    #[test]
+    fn commit_dispatches_udf_through_worker() {
+        use ql_session::function_meta::{
+            ArgContext, ArgPolicy, Arity, BatchShape, CancelPolicy, DepShape, FunctionMetadata,
+            Volatility,
+        };
+        use ql_session::session::FunctionImplHandle;
+        use ql_udf::MockWorker;
+
+        let udf_meta = |name: &str| FunctionMetadata {
+            canonical_name: name.to_string(),
+            display_name: None,
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Volatile,
+            determinism: false,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::ArrayBatch,
+            arg_policy: ArgPolicy::Strict,
+            cancellation: CancelPolicy::WorkerKill,
+            arg_context: ArgContext::Aggregate,
+            provenance_tags: vec!["python".to_string()],
+        };
+
+        // (a) With a worker → computes (the fix).
+        {
+            let mut wb = make_wb();
+            let mut reg = default_registry();
+            reg.register_udf(udf_meta("MYUDF"), FunctionImplHandle(7))
+                .unwrap();
+            let worker: RefCell<Box<dyn UdfWorker + Send>> =
+                RefCell::new(Box::new(MockWorker::new(|_h, args: &ql_types::ArrayValue| {
+                    let n = match args.get(0, 0) {
+                        Some(Value::Number(x)) => *x,
+                        other => panic!("expected number, got {other:?}"),
+                    };
+                    Ok(ql_types::ArrayValue::singleton(Value::Number(n * 2.0)))
+                })));
+            let mut tx =
+                WorkbookTransaction::with_optional_oplog(&mut wb, &reg, None, Some(&worker));
+            tx.put_value(0, 0, 0, Value::Number(21.0)).unwrap();
+            tx.put_formula(0, 0, 1, "MYUDF(A1)").unwrap();
+            tx.commit().unwrap();
+            assert_eq!(
+                wb.read(Address::new(0, 0, 1)),
+                Value::Number(42.0),
+                "a worker-carrying transaction must dispatch the UDF, not write #CALC!"
+            );
+        }
+
+        // (b) No worker → honest #CALC! (not a panic, not a wrong value).
+        {
+            let mut wb = make_wb();
+            let mut reg = default_registry();
+            reg.register_udf(udf_meta("MYUDF"), FunctionImplHandle(7))
+                .unwrap();
+            let mut tx = WorkbookTransaction::with_optional_oplog(&mut wb, &reg, None, None);
+            tx.put_value(0, 0, 0, Value::Number(21.0)).unwrap();
+            tx.put_formula(0, 0, 1, "MYUDF(A1)").unwrap();
+            tx.commit().unwrap();
+            assert_eq!(
+                wb.read(Address::new(0, 0, 1)),
+                Value::Error(ErrorValue::Calc),
+                "no worker on the transaction → honest #CALC!"
+            );
+        }
     }
 
     #[test]

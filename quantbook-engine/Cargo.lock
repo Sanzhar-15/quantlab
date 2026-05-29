@@ -2589,6 +2589,7 @@ dependencies = [
  "ql-session",
  "ql-storage",
  "ql-types",
+ "ql-udf",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",

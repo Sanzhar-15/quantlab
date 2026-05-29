@@ -1,0 +1,23 @@
+I did not find a reportable RefCell re-entry or Send/Sync escape in the normal shipped worker path. Nested UDF args finish evaluating before the outer `borrow_mut`, and the process worker does not call back into eval.
+
+[HIGH] Array-producing UDF arguments are scalarized to `#CALC!`  
+[crates/ql-exec/src/scalar.rs:961](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/scalar.rs:961), [crates/ql-exec/src/scalar.rs:972](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/scalar.rs:972), [crates/ql-exec/src/scalar.rs:320](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/scalar.rs:320)  
+`marshal_udf_args` only treats `AggregateNameRef`, `StructuredRef`, `RangeRef`, and literal `Array` as grid-shaped. A single dynamic-array producer like `=MYUDF(SEQUENCE(2,2))` is an `ExprPlan::Function`, so it goes through scalar eval, where array returns are intentionally converted to `#CALC!`; Python receives a 1x1 error grid instead of the native 2x2 grid.  
+Suggested fix: marshal each arg through an eval path that can return `FunctionReturn::Array`/`EvalResult::Array`, then apply the existing one-grid-only rule to the runtime result, not just the plan shape.
+
+[HIGH] Legacy runtime transactions commit UDF formulas with no worker  
+[crates/ql-exec/src/workbook_runtime/validate.rs:42](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/workbook_runtime/validate.rs:42), [crates/ql-exec/src/transaction.rs:397](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/transaction.rs:397), [crates/ql-exec/src/transaction.rs:402](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/transaction.rs:402)  
+`WorkbookRuntime::transaction()` does not pass `self.udf_worker`, and `WorkbookTransaction::commit` evaluates formulas with `WorkbookEnv::new`, so a registered UDF deterministically becomes `#CALC!` and that value is written into the computed overlay. The public session transaction path routes through `batch`, but this runtime transaction path remains a real stale-value trap.  
+Suggested fix: thread the worker into `WorkbookTransaction` and use the same cell-boundary eval path as `set_formula`, or delete/route this transaction API through the session batch implementation.
+
+[MEDIUM] `set_udf_worker` leaves previously computed UDF `#CALC!` cells clean  
+[crates/ql-exec/src/session.rs:398](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/session.rs:398), [crates/ql-exec/src/session.rs:401](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/session.rs:401), [crates/ql-exec/src/scalar.rs:1039](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/scalar.rs:1039), [crates/ql-exec/src/session.rs:2148](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/session.rs:2148)  
+If formulas are evaluated before a worker is installed, they become clean `#CALC!` values. `set_udf_worker` only swaps the worker, and the comment suggests `recalc_dirty`, but clean UDF cells are not dirty, so they stay stuck until `recalc_all` or an unrelated dirtying event.  
+Suggested fix: have `set_udf_worker` dirty formulas using registered UDFs, or make the API explicitly require and enforce a full recalc after worker installation.
+
+[MEDIUM] Per-call timeout allows unbounded recalc stalls under the NAPI session lock  
+[crates/ql-exec/src/scalar.rs:51](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/scalar.rs:51), [crates/ql-exec/src/scalar.rs:1044](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/scalar.rs:1044), [crates/ql-bindings-node/src/lib.rs:4691](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-bindings-node/src/lib.rs:4691)  
+`UDF_CALL_DEADLINE` bounds one worker call, but a recompute with N hung UDF cells can block for roughly `30s * N`. The Node binding holds the session mutex across `setFormula`, `recalcDirty`, and `recalcAll`, so other API calls are blocked for the full sheet-dependent stall.  
+Suggested fix: add an operation-level UDF budget/cancel check, cap timeout failures per recompute, or move long-running recalc off the mutex-held synchronous path.
+
+Verdict: DO-NOT-SHIP, 2 HIGH / 2 MEDIUM / 0 LOW.

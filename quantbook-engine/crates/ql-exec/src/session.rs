@@ -395,9 +395,15 @@ impl WorkbookSession {
     /// `Box<dyn UdfWorker + Send>` directly; the napi/IDE bridge that constructs a
     /// `ProcessWorker` from trusted-workspace config (+ `debugpy`) is 6.4-3d.
     ///
-    /// NOTE: this does NOT itself recompute — existing `#CALC!` UDF cells become
-    /// values on the next recalc. Callers that want immediate effect should
-    /// follow with `recalc_all`/`recalc_dirty`.
+    /// NOTE: this does NOT itself recompute, and it does NOT dirty anything.
+    /// A UDF cell evaluated BEFORE the worker was installed is a *clean*
+    /// `#CALC!`, so `recalc_dirty` will NOT heal it — callers that want existing
+    /// UDF cells to pick up the worker must call `recalc_all` (Codex MED-1 /
+    /// Opus LOW-2, 6.4-3c audit). In the intended flow the host injects the
+    /// worker BEFORE any UDF formulas are entered, so `set_formula`'s immediate
+    /// eval sees it and no heal is needed. Auto-dirtying UDF-using cells on
+    /// injection (via the 6.4-0 `functions_used` reverse index) is FILED-FORWARD
+    /// for the 6.4-3d host bridge, which owns injection ordering.
     pub fn set_udf_worker(&mut self, worker: Box<dyn UdfWorker + Send>) {
         self.udf_worker = Some(RefCell::new(worker));
     }
@@ -3757,6 +3763,130 @@ mod tests {
         assert!(
             matches!(&got, CellValue::Error { error } if error == "#VALUE!"),
             "two range args exceed the v1 single-grid protocol → #VALUE! (got {got:?})"
+        );
+    }
+
+    // ===== 6.4-3c 3-way audit fixes — array-producing args (CODEX-HIGH-1) =====
+
+    /// **CODEX-HIGH-1 regression:** an array-PRODUCING function arg (a
+    /// Unified-tier built-in like `SEQUENCE`) must reach the UDF as its FULL
+    /// grid, not be silently collapsed to a 1×1 `#CALC!` by scalar eval.
+    #[test]
+    fn udf_array_producing_function_arg_passes_full_grid() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        register_udf(&mut s, "MYUDF", 7);
+        // Shape-echo worker: returns rows*10 + cols of the grid it received.
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+            |_h, args: &ql_types::ArrayValue| {
+                Ok(ql_types::ArrayValue::singleton(Value::Number(
+                    (args.rows() * 10 + args.cols()) as f64,
+                )))
+            },
+        )));
+        // SEQUENCE(2,2) is a real Unified-tier built-in producing a 2×2 grid.
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(SEQUENCE(2,2))").unwrap();
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 1)),
+            CellValue::Number { number: 22.0 },
+            "MYUDF must receive SEQUENCE(2,2)'s full 2×2 grid (rows*10+cols=22); \
+             a scalarized 1×1 would echo 11"
+        );
+    }
+
+    /// One array arg + a scalar can't fit the v1 single-grid protocol → a
+    /// VISIBLE `#VALUE!`, never a silent scalarization. CODEX-HIGH-1 follow-on.
+    #[test]
+    fn udf_array_producing_function_arg_with_extra_scalar_is_value_error() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        register_udf(&mut s, "MYUDF", 7);
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(|_h, _a| {
+            Ok(ql_types::ArrayValue::singleton(Value::Number(0.0)))
+        })));
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(SEQUENCE(2,2), 5)")
+            .unwrap();
+        assert!(
+            matches!(cell_value(&s, addr(sheet, 0, 1)), CellValue::Error { error } if error == "#VALUE!"),
+            "an array arg + a scalar exceeds the single-grid protocol → #VALUE!"
+        );
+    }
+
+    /// A nested UDF that RETURNS a grid, used as an arg, must pass that grid to
+    /// the outer UDF (array-aware arg eval), not a scalarized `#CALC!`.
+    #[test]
+    fn udf_nested_array_returning_udf_arg_passes_grid() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        register_udf(&mut s, "OUTER", 7);
+        register_udf(&mut s, "INNER", 8);
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+            |h, args: &ql_types::ArrayValue| match h {
+                // INNER → a fixed 2×3 grid.
+                8 => Ok(ql_types::ArrayValue::new(
+                    2,
+                    3,
+                    vec![
+                        Value::Number(1.0),
+                        Value::Number(2.0),
+                        Value::Number(3.0),
+                        Value::Number(4.0),
+                        Value::Number(5.0),
+                        Value::Number(6.0),
+                    ],
+                )
+                .expect("2×3 test grid")),
+                // OUTER → echo the shape it received.
+                _ => Ok(ql_types::ArrayValue::singleton(Value::Number(
+                    (args.rows() * 10 + args.cols()) as f64,
+                ))),
+            },
+        )));
+        s.set_formula(addr(sheet, 0, 1), "OUTER(INNER())").unwrap();
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 1)),
+            CellValue::Number { number: 23.0 },
+            "OUTER must receive INNER()'s full 2×3 grid (rows*10+cols=23)"
+        );
+    }
+
+    /// **Codex MED-1 / Opus LOW-2 pin:** a UDF cell computed BEFORE a worker is
+    /// installed is a CLEAN `#CALC!`. `set_udf_worker` does NOT dirty it, so
+    /// `recalc_dirty` leaves it `#CALC!`; only `recalc_all` heals it. Pins the
+    /// documented v1 behavior so a future change is a deliberate decision.
+    #[test]
+    fn udf_set_worker_after_formula_needs_recalc_all() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        register_udf(&mut s, "MYUDF", 7);
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 21.0 })
+            .unwrap();
+        // No worker yet → clean #CALC!.
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap();
+        assert!(
+            matches!(cell_value(&s, addr(sheet, 0, 1)), CellValue::Error { error } if error == "#CALC!"),
+            "pre-worker: clean #CALC!"
+        );
+        // Install a doubling worker. Does NOT dirty the clean #CALC! cell.
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+            |_h, args: &ql_types::ArrayValue| {
+                let n = match args.get(0, 0) {
+                    Some(Value::Number(x)) => *x,
+                    other => panic!("expected a number arg, got {other:?}"),
+                };
+                Ok(ql_types::ArrayValue::singleton(Value::Number(n * 2.0)))
+            },
+        )));
+        s.recalc_dirty().unwrap();
+        assert!(
+            matches!(cell_value(&s, addr(sheet, 0, 1)), CellValue::Error { error } if error == "#CALC!"),
+            "recalc_dirty does NOT heal a clean #CALC! UDF cell (documented v1 behavior)"
+        );
+        s.recalc_all().unwrap();
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 1)),
+            CellValue::Number { number: 42.0 },
+            "recalc_all picks up the worker → 42"
         );
     }
 
