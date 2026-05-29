@@ -74,6 +74,30 @@ impl<'a> WorkbookRuntime<'a> {
     /// succeeded — those error values are normal cell contents per
     /// Excel canon, not structural failures.
     pub fn recompute_all(&mut self) -> RecomputeResult {
+        self.recompute_all_impl(false)
+    }
+
+    /// **6.4-3d (audit-fix HIGH-1):** full-pass recompute for the LOAD path
+    /// (`WorkbookSession::open`) ONLY. When NO worker is configured, a UDF cell
+    /// PRESERVES its saved computed value (blocker D2) instead of recomputing to
+    /// `#CALC!`. MUST NOT be used by `recalc_all` / `rematerialize` (undo/redo) /
+    /// replay: rematerialize replays formula TEXT only, so the cell holds no
+    /// computed value — preserving would write `Blank` back (a SILENT wrong
+    /// result); and a user `recalc_all` explicitly asked to recompute. Spill
+    /// bodies are NOT restored without a worker (`.qbook` does not persist spill
+    /// target cells) — a previously-spilled UDF shows only its anchor value until
+    /// the workbook is reopened with a worker (D1).
+    pub fn recompute_all_preserving_saved_udf(&mut self) -> RecomputeResult {
+        self.recompute_all_impl(true)
+    }
+
+    /// Shared full-pass recompute. `preserve_saved_udf` is `true` only on the
+    /// load path (see [`recompute_all_preserving_saved_udf`]); `false` everywhere
+    /// else (see [`recompute_all`]).
+    ///
+    /// [`recompute_all`]: WorkbookRuntime::recompute_all
+    /// [`recompute_all_preserving_saved_udf`]: WorkbookRuntime::recompute_all_preserving_saved_udf
+    fn recompute_all_impl(&mut self, preserve_saved_udf: bool) -> RecomputeResult {
         // **Tier C1 (2026-05-18 — Phase 4.12 Opus-B H-2 closure):**
         // cycle detection. `recompute_all` is the no-session-attached
         // fallback used by `.qbook` load + replay. Before this fix,
@@ -196,9 +220,11 @@ impl<'a> WorkbookRuntime<'a> {
             if cycled_cells.contains(&(sheet, row, col)) {
                 continue;
             }
-            // 6.4-3d (blocker D2): the LOAD path — preserve saved UDF values
-            // when no worker is configured (`true`).
-            match self.try_recompute_one_cached(sheet, row, col, &formula_text, true) {
+            // 6.4-3d (blocker D2): preserve saved UDF values only on the load
+            // path (`preserve_saved_udf` — true only via
+            // `recompute_all_preserving_saved_udf`, i.e. `open`).
+            match self.try_recompute_one_cached(sheet, row, col, &formula_text, preserve_saved_udf)
+            {
                 Ok(value) => {
                     // Phase 3.5 (CORR-25): formula outputs route to the
                     // COMPUTED overlay, never the user lane.
@@ -856,18 +882,31 @@ impl<'a> WorkbookRuntime<'a> {
         // Pure function over the plan tree; no allocation.
         let simd_eligible = crate::lower::classify(plan.as_ref()).is_applicable();
 
-        // **6.4-3d (2026-05-29; megaudit blocker D2):** if this session has NO
-        // UDF worker AND the formula calls a UDF, PRESERVE the cell's existing
-        // computed value instead of recomputing it to `#CALC!` — which would
-        // destroy a value that was saved while a worker WAS present (`.qbook`
-        // persists computed values). Return the current value WITHOUT clearing
-        // the spill (the `clear_spill_if_present` below is skipped by this early
-        // return), so a saved spilled-array footprint survives too. Gated on
-        // `is_none()` so a worker-present session pays zero cost. The value
-        // re-derives to a fresh result once a worker is injected + `recalc_all`
-        // runs (per `set_udf_worker`'s doc). Soundness for DEPENDENTS: a skipped
+        // **6.4-3d (2026-05-29; megaudit blocker D2 + 3-way audit-fix HIGH-1/2):**
+        // on the LOAD path ONLY (`preserve_saved_udf_when_no_worker`, set true
+        // only via `recompute_all_preserving_saved_udf`, i.e. `open`), if this
+        // session has NO UDF worker AND the formula calls a UDF, PRESERVE the
+        // cell's existing SCALAR computed value instead of recomputing it to
+        // `#CALC!` — which would destroy a value `.qbook` saved while a worker
+        // WAS present. Return the current value WITHOUT clearing the spill (the
+        // `clear_spill_if_present` below is skipped by this early return).
+        //
+        // **Spill caveat (audit HIGH-2):** `.qbook` does NOT persist spill
+        // TARGET cells (they are rebuilt by recompute), so a previously-SPILLED
+        // UDF cannot be restored without a worker — preserving keeps the anchor
+        // value, but the spill BODY stays blank until the workbook is reopened
+        // with a worker (D1). This is non-destructive (the spill body was never
+        // on disk) but incomplete; it is the documented v1 limitation. Filed for
+        // 6.4-3d follow-up: a spilled-UDF round-trip test + (option) marking a
+        // re-spillable UDF anchor `#CALC!` when no worker can rebuild the body.
+        //
+        // Gated on `is_none()` so a worker-present session pays zero cost. The
+        // value re-derives once a worker is injected + `recalc_all` runs (per
+        // `set_udf_worker`'s doc). Soundness for DEPENDENTS: a skipped
         // `B1=MYUDF(A1)` keeps its stored value, so `C1=B1+1` reads it and
-        // recomputes correctly in any order.
+        // recomputes correctly in any order. NOT used by recalc_all/rematerialize
+        // (they pass `false`): rematerialize's replayed cell has no saved value,
+        // so preserving would write Blank — a silent wrong result.
         if preserve_saved_udf_when_no_worker
             && self.udf_worker.is_none()
             && plan_references_udf(plan.as_ref(), self.registry)
@@ -3416,6 +3455,4 @@ mod tests {
             wb.read(ql_types::Address::new(s0, 0, 0)),
             Value::Error(ErrorValue::Name),
             "cell must show #NAME? for unknown-sheet bind error"
-        );
-    }
-}
+       

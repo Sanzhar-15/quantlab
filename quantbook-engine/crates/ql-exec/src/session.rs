@@ -424,6 +424,30 @@ impl WorkbookSession {
         self.udf_worker = Some(RefCell::new(worker));
     }
 
+    /// **6.4-3d (audit-fix HIGH-3):** lifecycle-gated worker injection for the
+    /// napi/host boundary. `ensure_ready()` first, so a `New`/`Busy`/`Closed`/
+    /// `Faulted` session rejects with `[invalid_state]`/`[session_busy]` instead
+    /// of silently attaching a live Python child to a terminal session (and the
+    /// `close()` worker-drop would then never run for it). The bare
+    /// [`set_udf_worker`] stays an infallible field-setter for Rust tests on a
+    /// known-`Ready` session.
+    ///
+    /// The napi `setUdfWorker` spawns + handshakes the worker OUTSIDE the session
+    /// lock (a process op), then calls this UNDER the lock — so a session that
+    /// transitioned to `Closed` during the spawn is caught HERE and the passed
+    /// `worker` is dropped by the caller (its child killed + reaped), closing the
+    /// inject-vs-close race.
+    ///
+    /// [`set_udf_worker`]: WorkbookSession::set_udf_worker
+    pub fn set_udf_worker_checked(
+        &mut self,
+        worker: Box<dyn UdfWorker + Send>,
+    ) -> EngineResult<()> {
+        self.ensure_ready()?;
+        self.udf_worker = Some(RefCell::new(worker));
+        Ok(())
+    }
+
     // --- internal helpers ---
 
     /// Run a closure against a per-edit `WorkbookRuntime` that borrows the
@@ -1199,7 +1223,13 @@ impl EngineSession for WorkbookSession {
         // the recompute appends no ops and feeds the (fresh) undo manager no
         // spurious commit. Structural failures surface as `CellDiagnostic`
         // events (never swallowed — the `run_recalc`/`rematerialize` pattern).
-        let result = self.with_runtime_no_oplog(|rt| rt.recompute_all());
+        // **6.4-3d (audit-fix HIGH-1):** the LOAD path uses the PRESERVING
+        // variant so a saved UDF value survives an open with no worker (D2).
+        // `recalc_all` (session.rs:2227) and `rematerialize` (session.rs:877)
+        // deliberately use the plain `recompute_all` (no preserve) — they must
+        // recompute honestly (rematerialize's replayed cells have no saved value
+        // → preserving would write Blank, a silent wrong result).
+        let result = self.with_runtime_no_oplog(|rt| rt.recompute_all_preserving_saved_udf());
         for failure in &result.failures {
             self.events.push(Event::CellDiagnostic {
                 diagnostic: Diagnostic {
@@ -1423,6 +1453,11 @@ impl EngineSession for WorkbookSession {
         // Drop any open transaction buffers — they can never commit on a
         // terminal session (their handles become `transaction_not_found`).
         self.txns.clear();
+        // **6.4-3d (audit-fix HIGH-3):** drop the Python-UDF worker on close so
+        // its child process is killed + reaped deterministically (the
+        // `ProcessWorker::drop` kills the child) — otherwise a closed session
+        // would leak the worker until the whole session is dropped/GC'd.
+        self.udf_worker = None;
         Ok(())
     }
 
@@ -3846,6 +3881,129 @@ mod tests {
                 "D1: a worker present before open is preserved across the swap; open's recompute uses it (21*3=63)"
             );
         }
+    }
+
+    /// **6.4-3d audit-fix HIGH-1:** the D2 preserve is LOAD-ONLY. A user
+    /// `recalc_all` on a no-worker session must NOT keep the stale saved UDF
+    /// value — it must recompute honestly to `#CALC!`. (Pre-fix `recompute_all`
+    /// hardcoded preserve=true, so recalc_all wrongly kept the stale value.)
+    #[test]
+    fn recalc_all_does_not_preserve_stale_udf_value_without_worker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("udf2.qbook");
+        let path_str = path.to_str().unwrap();
+        let sheet;
+        {
+            let mut s = WorkbookSession::new();
+            sheet = s.add_sheet("S", 16384).unwrap();
+            register_udf(&mut s, "MYUDF", 7);
+            s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+                |_h, a: &ql_types::ArrayValue| {
+                    let n = match a.get(0, 0) {
+                        Some(Value::Number(x)) => *x,
+                        o => panic!("{o:?}"),
+                    };
+                    Ok(ql_types::ArrayValue::singleton(Value::Number(n * 2.0)))
+                },
+            )));
+            s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 21.0 })
+                .unwrap();
+            s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap(); // 42
+            s.save(path_str).unwrap();
+        }
+        let mut s2 = WorkbookSession::new();
+        register_udf(&mut s2, "MYUDF", 7);
+        s2.open(path_str).unwrap();
+        // LOAD preserved the saved value (D2).
+        assert_eq!(
+            cell_value(&s2, addr(sheet, 0, 1)),
+            CellValue::Number { number: 42.0 }
+        );
+        // But an explicit recalc with no worker must recompute → #CALC! (honest),
+        // NOT keep the stale 42.
+        s2.recalc_all().unwrap();
+        assert!(
+            matches!(cell_value(&s2, addr(sheet, 0, 1)), CellValue::Error { error } if error == "#CALC!"),
+            "recalc_all with no worker must recompute a UDF cell to #CALC!, not preserve the stale value"
+        );
+    }
+
+    /// **6.4-3d audit-fix HIGH-1 (the catastrophic one):** undo/redo
+    /// (`rematerialize`) must NOT preserve. Rematerialize replays formula TEXT
+    /// only, so the OLD preserve path could read `Blank` and write it back,
+    /// silently blanking a UDF cell. Post-fix `rematerialize` uses the
+    /// non-preserving `recompute_all`, so a UDF cell with no worker recomputes
+    /// HONESTLY to `#CALC!` — never silently `Blank`/stale. (NB: `recompute_all`
+    /// is HashMap-order single-pass, so a *dependent* may transiently read the
+    /// pre-recompute value — a pre-existing recompute_all property, not this fix;
+    /// we assert the UDF cell ITSELF, which is deterministic.)
+    #[test]
+    fn undo_recomputes_udf_cell_honestly_without_worker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("udf3.qbook");
+        let path_str = path.to_str().unwrap();
+        let sheet;
+        {
+            let mut s = WorkbookSession::new();
+            sheet = s.add_sheet("S", 16384).unwrap();
+            register_udf(&mut s, "MYUDF", 7);
+            s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+                |_h, a: &ql_types::ArrayValue| {
+                    let n = match a.get(0, 0) {
+                        Some(Value::Number(x)) => *x,
+                        o => panic!("{o:?}"),
+                    };
+                    Ok(ql_types::ArrayValue::singleton(Value::Number(n * 2.0)))
+                },
+            )));
+            s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 21.0 })
+                .unwrap();
+            s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap(); // B1 = 42
+            s.save(path_str).unwrap();
+        }
+        let mut s2 = WorkbookSession::new();
+        register_udf(&mut s2, "MYUDF", 7);
+        s2.open(path_str).unwrap(); // no worker → B1 = 42 preserved (D2)
+        assert_eq!(
+            cell_value(&s2, addr(sheet, 0, 1)),
+            CellValue::Number { number: 42.0 }
+        );
+        // One undoable edit, then undo → triggers rematerialize.
+        s2.set_value(addr(sheet, 3, 3), CellValue::Number { number: 7.0 })
+            .unwrap();
+        let undo = s2.undo().unwrap();
+        assert!(undo.consumed, "the edit must be undoable");
+        // Post-fix: rematerialize recomputes (NO preserve) → no worker → #CALC!,
+        // never a silently-blanked cell.
+        let b1 = cell_value(&s2, addr(sheet, 0, 1));
+        assert!(
+            matches!(&b1, CellValue::Error { error } if error == "#CALC!"),
+            "after undo on a no-worker session, the UDF cell must recompute to #CALC! (never silently Blank); got {b1:?}"
+        );
+    }
+
+    /// **6.4-3d audit-fix HIGH-3:** `set_udf_worker_checked` gates lifecycle —
+    /// a non-Ready (Closed) session rejects with `[invalid_state]` (the worker is
+    /// dropped, not attached), unlike the infallible `set_udf_worker`.
+    #[test]
+    fn set_udf_worker_checked_rejects_closed_session() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("S", 16384).unwrap();
+        // Ready → checked injection succeeds.
+        s.set_udf_worker_checked(Box::new(ql_udf::MockWorker::new(|_h, _a| {
+            Ok(ql_types::ArrayValue::singleton(Value::Number(1.0)))
+        })))
+        .expect("checked inject on a Ready session succeeds");
+        s.close().unwrap();
+        let err = s
+            .set_udf_worker_checked(Box::new(ql_udf::MockWorker::new(|_h, _a| {
+                Ok(ql_types::ArrayValue::singleton(Value::Number(1.0)))
+            })))
+            .unwrap_err();
+        assert_eq!(
+            err.code, "invalid_state",
+            "checked inject on a Closed session → invalid_state"
+        );
     }
 
     /// **6.4-3c (2026-05-29):** the wedge — a registered UDF with a worker

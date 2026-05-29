@@ -4923,7 +4923,11 @@ impl Session {
     ///   worker died during startup (python not found, import error, …).
     /// - `[worker_handshake]` — the worker reported an incompatible protocol
     ///   version.
-    /// - `[bad_argument]` — `handshakeTimeoutMs` is negative / non-finite.
+    /// - `[bad_argument]` — `handshakeTimeoutMs` is negative / non-finite / above
+    ///   the 10-minute cap.
+    /// - `[invalid_state]` — session is not `Ready` (New / Closed / Faulted); the
+    ///   just-spawned worker is dropped (its child killed) without being attached.
+    /// - `[session_busy]` — a long operation is in progress.
     ///
     /// **Trust:** the IDE MUST gate this call on workspace trust — spawning a
     /// worker runs arbitrary workspace Python. The engine has no workspace
@@ -4944,18 +4948,33 @@ impl Session {
             cfg = cfg.with_udf_module(udf_module);
         }
         if let Some(ms) = config.handshake_timeout_ms {
-            if !ms.is_finite() || ms < 0.0 {
-                return Err(bad_argument_error(
-                    "setUdfWorker: handshakeTimeoutMs must be a non-negative finite number".into(),
-                ));
+            // **6.4-3d audit-fix (LOW):** require a non-negative finite value AND
+            // cap it (10 min) so a huge `f64` cannot saturate `as u64` into an
+            // effectively-unbounded handshake wait. `!is_finite()` also rejects
+            // NaN. Fractional ms truncate (harmless).
+            const MAX_HANDSHAKE_MS: f64 = 600_000.0;
+            if !ms.is_finite() || ms < 0.0 || ms > MAX_HANDSHAKE_MS {
+                return Err(bad_argument_error(format!(
+                    "setUdfWorker: handshakeTimeoutMs must be a finite number in [0, {MAX_HANDSHAKE_MS}] ms"
+                )));
             }
             cfg.handshake_timeout = std::time::Duration::from_millis(ms as u64);
         }
         // Spawn + handshake EAGERLY (outside the session lock — the spawn is a
         // process op) so a failure is reported here, not deferred to first call.
+        // **NOTE (audit MED, filed for IDE Step 5):** this is a SYNCHRONOUS napi
+        // method and blocks the calling JS thread for up to the handshake timeout
+        // — the IDE MUST call it off the UI/main thread.
         let mut worker = ql_udf::ProcessWorker::new(cfg);
         worker.ensure_started().map_err(udf_spawn_error_to_napi)?;
-        self.inner.lock().set_udf_worker(Box::new(worker));
+        // **6.4-3d audit-fix (HIGH-3):** inject UNDER the lock via the
+        // lifecycle-gated setter — a Closed/Faulted/New/Busy session rejects with
+        // `[invalid_state]`/`[session_busy]` and the just-spawned `worker` drops
+        // here (its child killed + reaped), closing the inject-vs-close race.
+        self.inner
+            .lock()
+            .set_udf_worker_checked(Box::new(worker))
+            .map_err(engine_error_to_napi)?;
         Ok(())
     }
 }

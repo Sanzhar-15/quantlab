@@ -2517,6 +2517,7 @@ dependencies = [
  "ql-session",
  "ql-storage",
  "ql-types",
+ "ql-udf",
  "serde_json",
  "tokio",
 ]
