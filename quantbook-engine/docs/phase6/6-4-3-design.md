@@ -21,8 +21,18 @@
 >   (`Timeout`→`#TIMEOUT!`, all else→`#CALC!`) — the structured `CellDiagnostic` sink (exit test 7's
 >   target) is a focused follow-up; (3) one session-wide `UDF_CALL_DEADLINE = 30s`.
 
-> **6.4-3c 5-way MEGAUDIT (2026-05-29) — HARD BLOCKERS for 6.4-3d. Do NOT ship worker injection
-> until these are closed:**
+> **STATUS (2026-05-29): D, C, G are CLOSED in the 6.4-3d engine + napi increment and 3-way-audited**
+> (`06c06d4a407`; synthesis `docs/audits/2026-05-29-6-4-3d-audit/`). **G** = CellDiagnostic sink shipped
+> (defaulted `CellEnv::push_udf_diagnostic` + collector drained to `Event::CellDiagnostic`). **C** = C1
+> "make it work" — literal multi-cell range deps via `FormulaDeps.literal_ranges` (the audit-offered
+> fail-loud C2 is the recorded fallback). **D** = D1 worker preserved across `open`/import + D2 saved-value
+> preserve on the LOAD path ONLY (`recompute_all_preserving_saved_udf`, used only by `open`; recalc_all /
+> rematerialize recompute honestly). napi `set_udf_worker` injection is shipped + lifecycle-gated
+> (`set_udf_worker_checked`). **H/I remain FILED-FORWARD** (op-level recalc budget + per-call cancel; grid
+> caps). Remaining 6.4-3d work = the **IDE side** (Step 5) + a `pollEvents` napi binding for CellDiagnostic.
+> Original blocker text kept below for provenance — these are NO LONGER open:
+>
+> **6.4-3c 5-way MEGAUDIT (2026-05-29) — were the 6.4-3d-gating blockers (now CLOSED — see STATUS above):**
 > - **D (data-loss):** `open`/`import`/load recompute UDF cells with `udf_worker: None` (the session
 >   is replaced wholesale in `open`, resetting the worker), overwriting saved computed UDF values
 >   with `#CALC!` and collapsing saved spills. NOT reachable in the product at 6.4-3c (no napi
@@ -48,9 +58,12 @@
 > widened by the 6.4-3c audit-fix routing UDF args through it) and `mark_volatiles_dirty` bypassing
 > dependent-fanout (stale dependents of volatile UDFs / RAND / NOW).
 
-**Status:** ✅ DESIGNED 2026-05-28. **6.4-3a/b/c SHIPPED** (6.4-3c eval wiring 2026-05-29 + 3-way
-audit-fix + 5-way megaudit-fix — see the implementation note + megaudit blockers above). Remaining:
-6.4-3d (debugpy + trusted-workspace + napi/IDE bridge).
+**Status:** ✅ DESIGNED 2026-05-28. **6.4-3a/b/c SHIPPED**; **6.4-3d engine blockers C1/D/G + napi
+`setUdfWorker` SHIPPED + 3-way-audited 2026-05-29** (see STATUS box above). **Remaining 6.4-3d = the IDE
+side (Step 5):** trust-gated `setUdfWorker` call + error-code allowlist (`worker_spawn_failed` /
+`worker_handshake` / `worker_untrusted_workspace` + the now-reachable `invalid_state` / `session_busy`) +
+a `pollEvents` napi binding + CellDiagnostic rendering, all cross-repo on `feat/visualise-v1`. **debugpy
+deferred to a focused `6.4-3d-debug` follow-up** (`ProcessWorker::pid()` is ready for it).
 **Predecessor:** 6.4-2 trait wiring + napi DTO surface FULLY SHIPPED (engine HEAD `a9992a32e67`).
 The dispatch substrate is in place: `FunctionRegistry::udf_handles: HashMap<String,
 FunctionImplHandle>` + `udf_handle(name)` reader (6.4-2 cycle 1), `register_function` /
