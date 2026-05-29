@@ -696,12 +696,36 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      **Filed for 6.4-3c:** process-group/session kill (kill grandchildren so the pipe closes — the detach
      prevents the hang but can leak one blocked reader thread + fd if a UDF orphans a child); bounded
      reader channel/backpressure; Python LOG-emit path + a real LOG round-trip test; LOG→CellDiagnostic.
-     **NEXT = 6.4-3c.** Then:
-     6.4-3c eval wiring end-to-end (`RegisteredFn::Udf` + scalar.rs arm + `Option<&mut dyn UdfWorker>` on
-     EvalContext + re-examine 6.4-2 `register_udf` atomicity as a 3-way atomic; 3-way);
-     6.4-3d debugpy + trusted-workspace + IDE bridge (3-way). Then **6.4-4 exit-tests + closure
-     megaudit** (5-way; contract §10.4 tests 1-8). Tracked cross-cutting (still pending):
-     `Sheet::iter_effective_cells()` serializer fix.
+   - ✅ **6.4-3c CODE SHIPPED 2026-05-29** (`88406c32b70`) — UDF eval wiring; `=MYUDF(A1)` computes
+     end-to-end (the wedge). **Two design-doc §10 open questions resolved AGAINST the doc** (annotated
+     in `docs/phase6/6-4-3-design.md`): (1) dispatch = **Option B** (scalar.rs `None` arm via
+     `registry.udf_handle(name)` + a mandatory `eval_at_cell_boundary` guard for spill) — NOT a
+     `RegisteredFn::Udf` variant (`fns` is `&'static str`-keyed; UDF names are runtime `String`s →
+     leak/retype). `register_udf` stays a **2-way** atomic. (2) worker lives on **`CellEnv`**
+     (interior mutability `Option<&RefCell<Box<dyn UdfWorker + Send>>>`), NOT `EvalContext` (Copy);
+     `+ Send` keeps `WorkbookSession: Send` (napi `assert_send`). **v1 cuts (user-confirmed):** arg
+     marshalling N-scalars→1×N row / single-range→its grid / mixed-or-≥2-range→`#VALUE!`;
+     failures→error VALUES now (`Timeout`→`#TIMEOUT!`, else `#CALC!`), CellDiagnostic sink deferred;
+     no-worker→`#CALC!` (panic-free, FaultGuard never seals); `UDF_CALL_DEADLINE = 30s`. Files:
+     ql-exec→ql-udf dep + default-members; `env.rs` (CellEnv accessor + `with_formula_cell_and_worker`);
+     `scalar.rs` (`marshal_udf_args`/`dispatch_udf`/`map_udf_error` + None-arm + boundary guard);
+     `workbook_runtime/{mod,recompute,cells}.rs` (worker threaded through `with_session_state*`);
+     `session.rs` (`udf_worker` field + `set_udf_worker` + both `with_runtime` variants). **Verified:**
+     `cargo test -p ql-exec` **763/0** lib + 8 new MockWorker tests + `tests/udf_e2e.rs` **1/1**
+     real-python (`=MYUDF(A1)`→42 via live `python -m quantbook.worker`, loud-skip if no pyarrow) +
+     updated `register_function_dirties_dependent_formulas` (#NAME?→#CALC! transition); clippy
+     `-p ql-exec` (no new warnings); `cargo check --workspace` clean (incl. ql-bindings-node Send).
+     Cargo.lock unchanged.
+     **NEXT = 6.4-3c 3-way audit** (engine + Opus + IDE-lens — code shipped, audit next per 6.4-3a/b
+     precedent): RefCell threading/re-entrancy, FaultGuard panic-freedom, the `!Sync` single-thread
+     invariant (SIMD/rayon never carries `&WorkbookEnv` during a UDF call), arg-marshalling,
+     boundary-spill guard, the **transaction.rs inline-eval-without-worker gap** (UDF in a txn →
+     `#CALC!` until post-commit recompute self-heals — confirm), cross-repo napi error-code/CellValue.
+     **Filed-forward:** CellDiagnostic sink (exc_type/message → exit test 7); richer list-of-grids args
+     protocol (mixed/multi-range); per-function/`CancelPolicy` deadlines. Then:
+     6.4-3d debugpy + trusted-workspace + napi/IDE worker-injection bridge (3-way). Then **6.4-4
+     exit-tests + closure megaudit** (5-way; contract §10.4 tests 1-8). Tracked cross-cutting (still
+     pending): `Sheet::iter_effective_cells()` serializer fix.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +
