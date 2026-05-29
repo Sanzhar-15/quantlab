@@ -736,9 +736,31 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      forwarded to worker (intentional, Excel); registry mutual-exclusivity construction-dependent.
      **Tests +5** (768/0 lib + 1/1 e2e real-python; clippy no new warnings; workspace clean incl.
      bindings Send). Synthesis + 3 lanes `docs/audits/2026-05-29-6-4-3c-udf-eval-wiring-audit/`.
-     **6.4-3c FULLY SHIPPED (code + 3-way audit).**
+   - ✅ **6.4-3c 5-way MEGAUDIT-fix SHIPPED 2026-05-29** (`92bbaa8601e`) — re-audited the FULL
+     increment incl. the 570-line 3-way audit-fix delta (which the 3-way hadn't reviewed). 2 Codex
+     gpt-5.5 xhigh (DO-NOT-SHIP 1H+2M / 3H+3M+1L) + 3 Opus (marshal SWF 0/1/1, concurrency SHIP 0/0/3,
+     semantics SWF 1/2/3). Surfaced **5 findings the 3-way missed**, incl. a regression the 3-way's
+     OWN fix introduced + a known-parked pre-existing bug. **FIXED 2 HIGH:** (A) `eval_at_cell_boundary`
+     Unified arm was MISSING the `StructuredRef`→Range materialization the scalar arm has → broke
+     `=TRANSPOSE(Table[Col])` (pre-existing for direct use; the 6.4-3c audit-fix widened it via UDF
+     args) — added the arm + **un-ignored `i23_transpose_over_structured_ref`** (the parked Phase-4.12
+     test documenting it); (B) `mark_volatiles_dirty` looped `graph.mark_dirty(node)` (NO fanout) →
+     dependents of volatile UDFs/RAND/NOW went STALE — now calls `graph.mark_volatile_dirty()` (fans
+     out) + new test. Both pre-date 6.4-3c. **HARD 6.4-3d BLOCKERS (in design §top):** (D) open/import/
+     load recompute UDF cells w/ no worker → DESTROYS saved values (`#CALC!`)+spills — not product-
+     reachable at 6.4-3c (no napi injection) but a data-loss blocker the moment 6.4-3d ships injection
+     (must preserve/inject worker on open, trust-gated, or preserve cached values); (C) multi-cell
+     LITERAL `RangeRef` args of a Reference-context UDF read values but aren't dep-tracked (needs a
+     literal-range value-dep mechanism; common Aggregate+named-range path IS tracked); (G) `#CALC!`
+     conflates no-worker/raised/died → CellDiagnostic sink; (H/I) op-level recalc budget + grid caps;
+     (E) spill-delta under-report = the tracked 6.1C H3 (all arrays). Verified: `cargo test -p ql-exec
+     --features xlsx-write` 769 lib + all integration 0-failed (i23 passes); e2e 1/1; clippy no new
+     warnings; workspace clean. Cargo.lock unchanged. Synthesis+5 lanes
+     `docs/audits/2026-05-29-6-4-3c-MEGAUDIT/`.
+     **6.4-3c FULLY SHIPPED (code + 3-way audit + 5-way megaudit).**
      **NEXT = 6.4-3d** — debugpy + trusted-workspace + napi/IDE worker-injection bridge (`set_udf_worker`
      over napi; the IDE constructs a `ProcessWorker` from trusted-workspace config). 3-way audit.
+     **⚠️ 6.4-3d MUST close megaudit blockers D + C + G before shipping worker injection (see design §top).**
      **Filed-forward (for 6.4-3d/later):** CellDiagnostic sink (exc_type/message → exit test 7);
      op-level UDF recalc budget + per-function deadlines (the N×30s stall); auto-dirty UDF cells on
      `set_udf_worker` (6.4-0 `functions_used` index); richer list-of-grids args protocol
