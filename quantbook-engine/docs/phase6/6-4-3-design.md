@@ -59,11 +59,22 @@
 > dependent-fanout (stale dependents of volatile UDFs / RAND / NOW).
 
 **Status:** ✅ DESIGNED 2026-05-28. **6.4-3a/b/c SHIPPED**; **6.4-3d engine blockers C1/D/G + napi
-`setUdfWorker` SHIPPED + 3-way-audited 2026-05-29** (see STATUS box above). **Remaining 6.4-3d = the IDE
-side (Step 5):** trust-gated `setUdfWorker` call + error-code allowlist (`worker_spawn_failed` /
-`worker_handshake` / `worker_untrusted_workspace` + the now-reachable `invalid_state` / `session_busy`) +
-a `pollEvents` napi binding + CellDiagnostic rendering, all cross-repo on `feat/visualise-v1`. **debugpy
-deferred to a focused `6.4-3d-debug` follow-up** (`ProcessWorker::pid()` is ready for it).
+`setUdfWorker` SHIPPED + 3-way-audited 2026-05-29** (see STATUS box above). **Step 5 (IDE + the
+`pollEvents` napi binding) SHIPPED + 3-way-audited 2026-05-29 — 6.4-3d is now FULLY SHIPPED.** Engine
+`pollEvents` + Event/Diagnostic DTOs + worker.py no-stderr robustness (`1e182a2fad3`, audit-fix
+`01541cd1b7e`); IDE trust-gated `injectUdfWorker` (double-gated on `vscode.workspace.isTrusted` +
+QuantLab `TrustManager`) + the 5 error codes (`worker_spawn_failed` / `worker_handshake` /
+`worker_untrusted_workspace` / now-reachable `invalid_state` / `session_busy`) + CellDiagnostic→`title=`
+tooltip + the `quantlab.pythonPath` cascade (IDE `9d5ca7b75fa`, audit-fix `9df6b5c820f` on
+`feat/visualise-v1`). 3-way audit (Codex xhigh + 2 Opus) — 2 HIGH (VS-Code-Restricted-Mode trust gate;
+client-repaint tooltip drop) + 3 MED fixed; synthesis `docs/audits/2026-05-29-6-4-3d-step5-audit/`.
+**FILED-FORWARD (NOT 6.4-3d):** the live `cellGridPanel`→owning-`Session` migration + a live `pollEvents`
+loop (the Step-5 Option-A scope boundary — the contract/helper/renderer surface ships, but the live panel
+still runs on `CollabSession` so nothing drives the tooltip end-to-end yet); the synchronous-blocking
+`setUdfWorker` → async-napi `AsyncTask`; worker.py pyarrow-import-before-fd1-redirect. **debugpy deferred
+to a focused `6.4-3d-debug` follow-up** (`ProcessWorker::pid()` is ready for it). **NEXT = 6.4-4 exit
+tests** (5-way; §10.4 tests 1-8; exit-test-7 backed by the G diagnostic sink, now IDE-reachable via
+`pollEvents`).
 **Predecessor:** 6.4-2 trait wiring + napi DTO surface FULLY SHIPPED (engine HEAD `a9992a32e67`).
 The dispatch substrate is in place: `FunctionRegistry::udf_handles: HashMap<String,
 FunctionImplHandle>` + `udf_handle(name)` reader (6.4-2 cycle 1), `register_function` /

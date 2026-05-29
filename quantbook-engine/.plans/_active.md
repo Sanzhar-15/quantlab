@@ -792,20 +792,30 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      776 lib + all integration 0-failed, e2e 1/1, clippy no-new, workspace clean. Synthesis+3 lanes
      `docs/audits/2026-05-29-6-4-3d-audit/`. (Two cargo-fmt×git-add padding-race truncations hit+fixed:
      `0de9f1fd7b5`, `e844109c565`.) **6.4-3d engine+napi+audit FULLY SHIPPED.**
-     **NEXT = 6.4-3d IDE side ONLY (Step 5, cross-repo `feat/visualise-v1`, `extensions/quantlab/src/quantbook`):**
-     `setUdfWorker` on SessionInstance + loader shape check; TrustManager `isWorkspaceTrusted` gate;
-     `quantlab.pythonPath` discovery; error codes worker_spawn_failed/worker_handshake/worker_untrusted_workspace
-     **+ invalid_state/session_busy** in the union + KNOWN_QUANTBOOK_ERROR_CODE_RECORD; a **pollEvents napi
-     binding** (not yet bound) + CellDiagnostic tooltip in cellGridHtml; call setUdfWorker OFF the UI thread
-     (it's synchronous). Then cdylib rebuild + node smoke + IDE tsc/mocha, then doc-sync (mark D/C/G CLOSED
-     in `docs/phase6/6-4-3-design.md` §top), then 6.4-4.
-     **Filed-forward (for 6.4-3d/later):** CellDiagnostic sink (exc_type/message → exit test 7);
-     op-level UDF recalc budget + per-function deadlines (the N×30s stall); auto-dirty UDF cells on
-     `set_udf_worker` (6.4-0 `functions_used` index); richer list-of-grids args protocol
-     (mixed/multi-range/array+scalar). Then:
-     6.4-3d debugpy + trusted-workspace + napi/IDE worker-injection bridge (3-way). Then **6.4-4
-     exit-tests + closure megaudit** (5-way; contract §10.4 tests 1-8). Tracked cross-cutting (still
-     pending): `Sheet::iter_effective_cells()` serializer fix.
+   - ✅ **6.4-3d STEP 5 (IDE + pollEvents napi) SHIPPED + 3-way-audited 2026-05-29 — 6.4-3d is now FULLY
+     SHIPPED.** Engine `1e182a2fad3` (audit-fix `01541cd1b7e`): napi `Session.pollEvents(cursor)` +
+     Event/Diagnostic/Severity/OperationState/CellAddr/EventPage DTOs (every Event variant; `CellDiagnostic`
+     now reaches JS) + worker.py `main()` no-stderr robustness (the embedded node/electron host left
+     `sys.stderr=None` → the old `os.dup2(sys.stderr.fileno(),1)` crashed → worker exited before HELLO_ACK →
+     every UDF `#CALC!`; now reserves the protocol channel via raw fd 1 + sinks to devnull when stderr
+     unusable; does NOT dup2 fd 2 — that would clobber the protocol pipe when fd 2 was the reused dup). IDE
+     `9d5ca7b75fa` (audit-fix `9df6b5c820f`, `feat/visualise-v1`): `setUdfWorker`/`pollEvents` on
+     SessionInstance + loader shape check; the 5 error codes in the union + Record;
+     `udfWorker.ts::injectUdfWorker` (double trust gate `vscode.workspace.isTrusted` && QuantLab
+     `TrustManager` + `quantlab.pythonPath` cascade + `QUANTBOOK_PY_DIR` override) + `planUdfWorkerConfig`
+     (pure); `cellGridLogic.ts::buildCellDiagnosticMessages`/`attachCellDiagnostics` (strip-stale,
+     idempotent) + `cellGridHtml.ts` `title=` tooltip (server + client-repaint mirror). 3-way audit (Codex
+     xhigh DO-NOT-SHIP + 2 Opus): 2 HIGH (VS-Code-Restricted-Mode trust gate [Codex-only]; client-repaint
+     tooltip drop [Opus-only]) + 3 MED fixed. Synthesis `docs/audits/2026-05-29-6-4-3d-step5-audit/`.
+     Verified: engine py_compile/self_test/process_smoke + node smoke (real-python `=MYUDF`→42 via no-stderr
+     path); IDE hygiene/tsc/mocha 464 passing. **FILED-FORWARD (NOT 6.4-3d):** the live `cellGridPanel`→
+     owning-`Session` migration + a live `pollEvents` loop (Step-5 Option-A scope boundary — the panel still
+     runs on `CollabSession`, so the tooltip surface ships but nothing drives it end-to-end yet); sync
+     `setUdfWorker` → async-napi `AsyncTask`; debugpy (`6.4-3d-debug`); op-level recalc budget +
+     per-function deadlines (N×30s); worker.py pyarrow-import-before-fd1-redirect + `run()` param rename.
+     **NEXT = 6.4-4 exit-tests + closure megaudit** (5-way; contract §10.4 tests 1-8; exit-test-7 backed by
+     the G diagnostic sink, now IDE-reachable via `pollEvents`). Tracked cross-cutting (still pending):
+     `Sheet::iter_effective_cells()` serializer fix.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +
