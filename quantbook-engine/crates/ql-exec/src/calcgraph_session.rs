@@ -5340,4 +5340,13 @@ mod tests {
         s.on_table_rename("SALES", "ORDERS");
         let dirty = s.take_dirty();
         assert!(
-            dirty.c
+            dirty.contains(&f1),
+            "case-insensitive lookup must reach the reader"
+        );
+
+        // The deps.tables entry must be substituted (not retained as "Sales").
+        let deps = s.formula_deps(f1).unwrap();
+        assert!(deps.tables.iter().any(|t| t.as_ref() == "ORDERS"));
+        assert!(!deps.tables.iter().any(|t| t.as_ref() == "Sales"));
+    }
+}

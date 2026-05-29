@@ -4980,4 +4980,6 @@ const _ASSERT_BINDING_SESSION_SEND: fn() = || {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
     assert_send::<CoreWorkbookSession>();
-    assert_send::<Session
+    assert_send::<Session>();
+    assert_sync::<Session>();
+};

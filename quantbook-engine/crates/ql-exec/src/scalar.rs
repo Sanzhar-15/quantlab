@@ -2708,4 +2708,10 @@ mod tests {
             name: Arc::from("SEQUENCE"),
             args: vec![ExprPlan::Number(0.0)],
         };
-        let r = eval_at_cell_boundary
+        let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
+        match r {
+            EvalResult::Scalar(Value::Error(ErrorValue::Num)) => {}
+            other => panic!("expected Scalar(#NUM!), got {other:?}"),
+        }
+    }
+}

@@ -6888,4 +6888,18 @@ mod tests {
     /// across processes. This test catches a regression that would break the
     /// stability guarantee at the same locus (Vec field ordering).
     #[test]
-    fn snapshot_formats_are_stable_acros
+    fn snapshot_formats_are_stable_across_calls() {
+        let mut s = WorkbookSession::new();
+        for fmt in ["@", "0.00", "yyyy-mm-dd", "0%"] {
+            s.register_format(fmt).unwrap();
+        }
+        let a = s.snapshot().unwrap();
+        let b = s.snapshot().unwrap();
+        let ids_a: Vec<_> = a.formats.iter().map(|fd| fd.id).collect();
+        let ids_b: Vec<_> = b.formats.iter().map(|fd| fd.id).collect();
+        assert_eq!(
+            ids_a, ids_b,
+            "two consecutive snapshots must produce identical formats order"
+        );
+    }
+}
