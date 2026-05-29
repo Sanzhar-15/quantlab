@@ -91,23 +91,67 @@ def run(stdin, stdout, stderr):
         return 0
 
 
+def _usable_fd(stream):
+    """Return ``stream``'s OS fd if it is a live, real fd, else ``None``.
+
+    A host that gives the child no console (notably the engine embedded in
+    node/electron — 6.4-3d Step 5) can leave ``sys.stdout``/``sys.stderr`` as
+    ``None`` or backed by a closed fd. ``fileno()`` then raises or the attribute
+    is missing; treat all of those as "no usable fd"."""
+    if stream is None:
+        return None
+    try:
+        return stream.fileno()
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def main():
-    # Reserve fd 1 EXCLUSIVELY for the wire protocol (6.4-3b audit-fix:
-    # udf-print-corrupts-protocol-stdout). Dup the real stdout (the engine's pipe) to a private
-    # fd, then repoint fd 1 and Python-level sys.stdout at stderr so ANY user `print()` / library
-    # stdout write / import-time chatter goes to stderr instead of corrupting the frame stream.
-    # This MUST happen before `run()` imports user UDF code.
-    proto_fd = os.dup(sys.stdout.fileno())
-    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
-    sys.stdout = sys.stderr
+    # Reserve the wire-protocol channel — the engine's pipe, which `ProcessWorker`
+    # wires to the child's fd 1 (`Command::stdout(piped)`). Use the RAW fd 1, not
+    # `sys.stdout.fileno()`: an embedded host may hand us a `None`/closed
+    # sys.stdout, and the protocol channel is fd 1 regardless of the Python-level
+    # stream object.
+    proto_fd = os.dup(1)
+
+    # Repoint fd 1 (and Python-level sys.stdout) at a "sink" so a stray UDF
+    # `print()` / library stdout write / import-time chatter cannot corrupt the
+    # frame stream (6.4-3b audit-fix: udf-print-corrupts-protocol-stdout). Prefer
+    # the real stderr (fd 2) so such chatter stays visible; if stderr is unusable
+    # (`sys.stderr is None` / closed — common when the host gives the child no
+    # console), fall back to os.devnull so the redirect can NEVER crash the worker
+    # on startup (6.4-3d Step 5 fix: worker-crashes-when-host-has-no-stderr —
+    # the prior `os.dup2(sys.stderr.fileno(), 1)` raised `AttributeError` on
+    # `None.fileno()`, the worker exited before HELLO_ACK, and every UDF call in
+    # the IDE failed with `#CALC!`).
+    diag = sys.stderr  # the worker's own diagnostic writer (may be None)
+    sink_fd = _usable_fd(diag)
+    opened_devnull = False
+    if sink_fd is None:
+        sink_fd = os.open(os.devnull, os.O_WRONLY)
+        opened_devnull = True
+    os.dup2(sink_fd, 1)
+    # Python-level sys.stdout → a fresh handle on the (redirected) fd 1.
+    sys.stdout = os.fdopen(os.dup(1), "w", buffering=1)
+    if diag is None:
+        # No real stderr either; route the worker's own diagnostics to the sink
+        # too (rather than crashing on `None.write`).
+        diag = sys.stdout
+        sys.stderr = sys.stdout
+
     proto = os.fdopen(proto_fd, "wb", buffering=0)
     try:
-        return run(sys.stdin.buffer, proto, sys.stderr)
+        return run(sys.stdin.buffer, proto, diag)
     finally:
         try:
             proto.close()
         except BrokenPipeError:
             pass  # engine already gone — nothing to flush
+        if opened_devnull:
+            try:
+                os.close(sink_fd)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

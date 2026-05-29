@@ -4358,6 +4358,205 @@ pub struct PythonWorkerConfigJson {
     pub handshake_timeout_ms: Option<f64>,
 }
 
+// ============================================================================
+// 6.4-3d Step 5 (2026-05-29) — event-stream DTOs (`pollEvents`).
+//
+// The engine's `Event` ring (contract §9) is surfaced to JS so `CellDiagnostic`
+// (the UDF no-worker / raised / timeout / died sink shipped in 6.4-3d Steps 1-3)
+// reaches the IDE — without it the IDE can render `#CALC!` but not WHY. Every
+// `Event` variant is modeled faithfully (No-Fallbacks: no variant is silently
+// dropped). napi-rs camelCases the object field names (e.g. `next_cursor` →
+// `nextCursor`, `structure_kind` → `structureKind`).
+// ============================================================================
+
+/// JS-facing cell address (mirrors [`ql_session::CellAddr`]); `sheet` widened
+/// u16→u32 (lossless), `row`/`col` are the 0-indexed u32 ids.
+#[napi(object)]
+pub struct CellAddrJson {
+    pub sheet: u32,
+    pub row: u32,
+    pub col: u32,
+}
+
+/// JS-facing per-cell diagnostic (mirrors [`ql_session::Diagnostic`]).
+/// `severity` is `"info"` | `"warning"` | `"error"`; `addr` is absent for a
+/// workbook-level diagnostic.
+#[napi(object)]
+pub struct DiagnosticJson {
+    pub addr: Option<CellAddrJson>,
+    pub severity: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// JS-facing operation state (mirrors [`ql_session::OperationState`]).
+/// `state` is `"running"` | `"completed"` | `"canceled"` | `"failed"`; `error`
+/// carries the `[code] message` display ONLY when `state == "failed"`.
+#[napi(object)]
+pub struct OperationStateJson {
+    pub state: String,
+    pub error: Option<String>,
+}
+
+/// JS-facing event (mirrors [`ql_session::session::Event`]). A tagged union: the
+/// `kind` discriminator selects which optional payload fields are populated —
+/// the same shape discipline as [`CellValueJson`]. Variant → fields:
+/// - `"recalc_progress"`: `op`, `done`, `total`
+/// - `"cell_diagnostic"`: `diagnostic`
+/// - `"operation_completed"`: `op`, `state`
+/// - `"provenance"`: `addr`, `source`
+/// - `"structure_changed"`: `structureKind`, `target`
+/// - `"full_resync_required"`: (no payload — the consumer must reseed via
+///   `snapshot()`, contract §9)
+#[napi(object)]
+pub struct EventJson {
+    pub kind: String,
+    /// `recalc_progress` / `operation_completed`: the operation id.
+    pub op: Option<BigInt>,
+    /// `recalc_progress`: nodes done so far.
+    pub done: Option<BigInt>,
+    /// `recalc_progress`: total nodes.
+    pub total: Option<BigInt>,
+    /// `cell_diagnostic`: the diagnostic.
+    pub diagnostic: Option<DiagnosticJson>,
+    /// `operation_completed`: the terminal state.
+    pub state: Option<OperationStateJson>,
+    /// `provenance`: the cell the provenance applies to.
+    pub addr: Option<CellAddrJson>,
+    /// `provenance`: the source descriptor.
+    pub source: Option<String>,
+    /// `structure_changed`: the structure kind (`"sheet"`/`"table"`/`"name"`).
+    /// (`kind` is taken by the discriminator, hence `structureKind` in JS.)
+    pub structure_kind: Option<String>,
+    /// `structure_changed`: the affected target id/name.
+    pub target: Option<String>,
+}
+
+/// JS-facing page of events read from a cursor (mirrors
+/// [`ql_session::session::EventPage`]). Reading does NOT drain the ring; pass
+/// `nextCursor` to the next `pollEvents` call. `dropped == true` pairs with a
+/// `full_resync_required` event — the consumer fell behind the retention
+/// horizon and MUST reseed via `snapshot()` (v1 uses an unbounded ring, so this
+/// never fires yet).
+#[napi(object)]
+pub struct EventPageJson {
+    pub events: Vec<EventJson>,
+    pub next_cursor: BigInt,
+    pub dropped: bool,
+}
+
+fn severity_to_str(s: ql_session::Severity) -> &'static str {
+    use ql_session::Severity;
+    match s {
+        Severity::Info => "info",
+        Severity::Warning => "warning",
+        Severity::Error => "error",
+    }
+}
+
+fn cell_addr_json_from_session(a: ql_session::CellAddr) -> CellAddrJson {
+    CellAddrJson {
+        sheet: u32::from(a.sheet),
+        row: a.row,
+        col: a.col,
+    }
+}
+
+fn diagnostic_json_from_session(d: ql_session::Diagnostic) -> DiagnosticJson {
+    DiagnosticJson {
+        addr: d.addr.map(cell_addr_json_from_session),
+        severity: severity_to_str(d.severity).to_string(),
+        code: d.code,
+        message: d.message,
+    }
+}
+
+/// Map an [`ql_session::OperationState`] to its JS DTO. The `Failed` error is
+/// rendered via the `[code] message` `Display` (the same wire convention the
+/// napi error helpers use) so the IDE can `parseQuantbookError` it.
+fn operation_state_json_from_session(s: ql_session::OperationState) -> OperationStateJson {
+    use ql_session::OperationState;
+    match s {
+        OperationState::Running => OperationStateJson {
+            state: "running".to_string(),
+            error: None,
+        },
+        OperationState::Completed => OperationStateJson {
+            state: "completed".to_string(),
+            error: None,
+        },
+        OperationState::Canceled => OperationStateJson {
+            state: "canceled".to_string(),
+            error: None,
+        },
+        OperationState::Failed { error } => OperationStateJson {
+            state: "failed".to_string(),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn event_json_from_session(e: ql_session::session::Event) -> EventJson {
+    use ql_session::session::Event;
+    // All-None base; each arm fills only its own variant's payload fields.
+    let base = EventJson {
+        kind: String::new(),
+        op: None,
+        done: None,
+        total: None,
+        diagnostic: None,
+        state: None,
+        addr: None,
+        source: None,
+        structure_kind: None,
+        target: None,
+    };
+    match e {
+        Event::RecalcProgress { op, done, total } => EventJson {
+            kind: "recalc_progress".to_string(),
+            op: Some(BigInt::from(op.0)),
+            done: Some(BigInt::from(done)),
+            total: Some(BigInt::from(total)),
+            ..base
+        },
+        Event::CellDiagnostic { diagnostic } => EventJson {
+            kind: "cell_diagnostic".to_string(),
+            diagnostic: Some(diagnostic_json_from_session(diagnostic)),
+            ..base
+        },
+        Event::OperationCompleted { op, state } => EventJson {
+            kind: "operation_completed".to_string(),
+            op: Some(BigInt::from(op.0)),
+            state: Some(operation_state_json_from_session(state)),
+            ..base
+        },
+        Event::Provenance { addr, source } => EventJson {
+            kind: "provenance".to_string(),
+            addr: Some(cell_addr_json_from_session(addr)),
+            source: Some(source),
+            ..base
+        },
+        Event::StructureChanged { kind, target } => EventJson {
+            kind: "structure_changed".to_string(),
+            structure_kind: Some(kind),
+            target: Some(target),
+            ..base
+        },
+        Event::FullResyncRequired => EventJson {
+            kind: "full_resync_required".to_string(),
+            ..base
+        },
+    }
+}
+
+fn event_page_json_from_session(p: ql_session::session::EventPage) -> EventPageJson {
+    EventPageJson {
+        events: p.events.into_iter().map(event_json_from_session).collect(),
+        next_cursor: BigInt::from(p.next_cursor.0),
+        dropped: p.dropped,
+    }
+}
+
 /// **6.4-3d (2026-05-29):** map a worker spawn/handshake [`ql_udf::UdfError`] to
 /// a napi `[code] message` error. Only the startup variants are reachable from
 /// `ProcessWorker::ensure_started` (a missing interpreter / worker death during
@@ -4950,10 +5149,15 @@ impl Session {
         if let Some(ms) = config.handshake_timeout_ms {
             // **6.4-3d audit-fix (LOW):** require a non-negative finite value AND
             // cap it (10 min) so a huge `f64` cannot saturate `as u64` into an
-            // effectively-unbounded handshake wait. `!is_finite()` also rejects
-            // NaN. Fractional ms truncate (harmless).
+            // effectively-unbounded handshake wait. The inclusive-range
+            // `!contains` rejects NaN/Inf (neither is `>= 0.0`) as well as a
+            // negative or above-cap value in one expression. Fractional ms
+            // truncate (harmless).
+            // (6.4-3d Step 5: rewritten from the `ms < 0.0 || ms > MAX` form to
+            // satisfy clippy `manual_range_contains` under rust 1.95's stricter
+            // `deny(clippy::all)`; behavior-identical.)
             const MAX_HANDSHAKE_MS: f64 = 600_000.0;
-            if !ms.is_finite() || ms < 0.0 || ms > MAX_HANDSHAKE_MS {
+            if !(0.0..=MAX_HANDSHAKE_MS).contains(&ms) {
                 return Err(bad_argument_error(format!(
                     "setUdfWorker: handshakeTimeoutMs must be a finite number in [0, {MAX_HANDSHAKE_MS}] ms"
                 )));
@@ -4976,6 +5180,47 @@ impl Session {
             .set_udf_worker_checked(Box::new(worker))
             .map_err(engine_error_to_napi)?;
         Ok(())
+    }
+
+    /// **6.4-3d Step 5 (2026-05-29):** drain a page of structured events from the
+    /// session's event ring (contract §9), starting at `cursor` (pass `0n` to read
+    /// from the start, then the returned `nextCursor` on each subsequent call).
+    /// Reading does NOT drain the ring, so independent pollers never starve each
+    /// other. The IDE consumes this to surface `cell_diagnostic` events (the UDF
+    /// no-worker / raised / timeout / died sink from 6.4-3d Steps 1-3) as cell
+    /// tooltips, plus `recalc_progress` / `operation_completed` for long ops.
+    ///
+    /// If `dropped == true` (paired with a `full_resync_required` event) the
+    /// consumer fell behind the retention horizon and MUST reseed via `snapshot()`
+    /// (v1 uses an unbounded ring, so this never fires yet).
+    ///
+    /// **Lifecycle:** unlike the mutators, the engine `poll_events` does NOT gate
+    /// on lifecycle (it is a pure read of the buffered ring) — polling a Closed
+    /// session returns whatever was already buffered, never `[invalid_state]`.
+    ///
+    /// **Errors:** `[bad_argument]` if `cursor` is negative or exceeds `u64::MAX`.
+    #[napi(js_name = "pollEvents")]
+    pub fn poll_events(&self, cursor: BigInt) -> Result<EventPageJson> {
+        // BigInt → u64, mirroring the `registerFunction` implHandle discipline:
+        // reject a negative (sign bit) or lossy (> u64::MAX) cursor loud per
+        // No-Fallbacks rather than silently truncating to a wrong ring position.
+        let (sign_bit, raw, lossless) = cursor.get_u64();
+        if sign_bit {
+            return Err(bad_argument_error(
+                "pollEvents: cursor must be a non-negative BigInt".into(),
+            ));
+        }
+        if !lossless {
+            return Err(bad_argument_error(
+                "pollEvents: cursor exceeds u64::MAX (lossy conversion rejected)".into(),
+            ));
+        }
+        let page = self
+            .inner
+            .lock()
+            .poll_events(ql_session::session::EventCursor(raw))
+            .map_err(engine_error_to_napi)?;
+        Ok(event_page_json_from_session(page))
     }
 }
 
