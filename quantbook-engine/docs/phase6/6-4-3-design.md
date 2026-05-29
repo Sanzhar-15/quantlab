@@ -81,12 +81,19 @@ to a focused `6.4-3d-debug` follow-up** (`ProcessWorker::pid()` is ready for it)
 > (2 Codex gpt-5.5 xhigh + 3 fresh Opus): 0 HIGH / 0 DO-NOT-SHIP; test-hardening applied (test-8
 > register→dirty→recalc made airtight; test-7 widened to all 8 diagnostic codes incl. the 5
 > previously-untested; test-3 isolates volatility; test-6 citation honesty). Synthesis+lanes
-> `docs/audits/2026-05-29-6-4-4-exit-tests-megaudit/`. Engine commit `6b1fdb36578`. **Filed forward**
-> (NOT arc-blocking): `validate_canonical_function_name` should reject names the formula lexer can't
-> tokenize (`MY UDF`/`MY-UDF`/non-ASCII) — pre-existing 6.4-2 gap, no corruption (inert registration;
-> `=MY UDF(..)` fails loud), deferred to a 6.4-2-followup that extracts a shared lexer identifier
-> predicate; `WorkbookTransaction` diagnostics sink (not live). **NEXT = the next decision-lock item
-> (6.5 / reserved-tier producers).**
+> `docs/audits/2026-05-29-6-4-4-exit-tests-megaudit/`. Engine commit `6b1fdb36578`.
+>
+> **6.4B (UDF hardening) STARTED 2026-05-29 — FF-1 CLOSED (`57bfc434850`):**
+> `validate_canonical_function_name` now gates on CALLABILITY via the engine's own
+> lexer+parser (the probe `NAME(1)` must parse to exactly an `Expr::Function` whose name matches) —
+> rejects `MY UDF`/`MY-UDF`/non-ASCII/trailing-dot/digit-led while accepting dotted Excel canon
+> (`T.DIST.2T`) and CellRef-lexed-but-callable names (`LOG10`). Using the parser as the single source
+> of truth (not a hand grammar) is regression-proof — the parser-fidelity trap the megaudit warned of
+> (a hand grammar would wrongly reject `LOG10`/dotted) is avoided by construction. **Still open in 6.4B
+> (fresh session):** FF-2 `WorkbookTransaction` diagnostics sink (not live); `docs/security/udf-ai-connectors.md`
+> sandbox-limitations doc (decision-lock §2 item 7); op-level UDF recalc budget + per-call deadlines (the
+> N×30s stall, design §H/I); UDF-6-02..04 security-audit closure. **NEXT = finish 6.4B, then the
+> locked sequence (6.3 bindings → 6.2 service → 6.5 SQL).**
 **Predecessor:** 6.4-2 trait wiring + napi DTO surface FULLY SHIPPED (engine HEAD `a9992a32e67`).
 The dispatch substrate is in place: `FunctionRegistry::udf_handles: HashMap<String,
 FunctionImplHandle>` + `udf_handle(name)` reader (6.4-2 cycle 1), `register_function` /

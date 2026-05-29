@@ -833,6 +833,17 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      ql-functions) to avoid regressing dotted names like `T.DIST.2T`; (FF-2) `WorkbookTransaction`
      diagnostics sink (not live — only test callers; live batch/commit threads diagnostics). **NEXT =
      the next decision-lock item (reserved-tier producers / 6.5).**
+   - ✅ **6.4B (UDF hardening, decision-lock §2 item 7) STARTED 2026-05-29 — FF-1 CLOSED (`57bfc434850`).**
+     `validate_canonical_function_name` now gates on CALLABILITY via the engine lexer+parser (probe
+     `NAME(1)` must parse to exactly `Expr::Function` matching) — rejects `MY UDF`/`MY-UDF`/non-ASCII/
+     trailing-dot/digit-led; accepts dotted canon (`T.DIST.2T`) + CellRef-lexed callable (`LOG10`).
+     Parser-as-source-of-truth is regression-proof (a hand grammar would wrongly reject LOG10/dotted —
+     the megaudit's parser-fidelity trap). New test `register_function_rejects_uncallable_canonical_names`
+     + fixed a pre-existing clippy doc_lazy_continuation. Verified lib 777/0 + exit-tests 8/8 + clippy
+     clean + workspace clean. **6.4B REMAINING (fresh session, needs planning + likely a focused audit):**
+     FF-2 WorkbookTransaction diagnostics sink (not live); `docs/security/udf-ai-connectors.md`
+     sandbox-limitations doc; op-level UDF recalc budget + per-call deadlines (N×30s stall, design §H/I);
+     UDF-6-02..04 security-audit closure. Then the locked sequence: 6.3 bindings → 6.2 service → 6.5 SQL.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +
