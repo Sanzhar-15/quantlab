@@ -2172,10 +2172,20 @@ impl EngineSession for WorkbookSession {
             state: &mut self.state,
             armed: true,
         };
-        let nodes: Vec<_> = self.graph.volatile_formulas().iter().copied().collect();
-        for node in nodes {
-            self.graph.mark_dirty(node);
-        }
+        // **MEGAUDIT fix (2026-05-29; Codex-B HIGH):** call the graph's
+        // `mark_volatile_dirty`, which marks each volatile node dirty AND fans
+        // out the transitive reverse-dep graph from each volatile cell. The
+        // previous code looped `self.graph.mark_dirty(node)` per volatile
+        // formula — but `mark_dirty` (pub(crate), for coordinated recovery
+        // only) inserts ONLY that node, with NO fanout. So a downstream
+        // `C1 = B1 + 1` over a volatile `B1 = MYUDF(A1)` (or RAND/NOW) stayed
+        // STALE after `mark_volatiles_dirty` + `recalc_dirty`, because
+        // `recompute_dirty` re-dirties dependents only through spill writes,
+        // not ordinary value changes — it relies on the dirty set being
+        // pre-fanned-out (which is exactly what `mark_volatile_dirty` does).
+        // Pre-dates 6.4-3c (affects all volatile fns); surfaced because UDFs
+        // are the first host-declared-volatile functions with dependents.
+        self.graph.mark_volatile_dirty();
         guard.armed = false;
         Ok(())
     }
@@ -3887,6 +3897,58 @@ mod tests {
             cell_value(&s, addr(sheet, 0, 1)),
             CellValue::Number { number: 42.0 },
             "recalc_all picks up the worker → 42"
+        );
+    }
+
+    /// **MEGAUDIT 2026-05-29 (Codex-B HIGH):** `mark_volatiles_dirty` must fan
+    /// out to DEPENDENTS of a volatile UDF, not just mark the volatile cell. The
+    /// prior code looped `graph.mark_dirty(node)` (no fanout), so a downstream
+    /// `C1 = B1 + 1` over a volatile `B1 = MYUDF(A1)` stayed STALE after
+    /// `mark_volatiles_dirty` + `recalc_dirty`. (Pre-dates 6.4-3c; affects all
+    /// volatile fns — UDFs are the first host-declared-volatile fns w/ deps.)
+    #[test]
+    fn mark_volatiles_dirty_fans_out_to_dependents_of_volatile_udf() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // udf_meta() declares Volatility::Volatile.
+        register_udf(&mut s, "MYUDF", 7);
+        // Counting worker: each call returns a strictly larger number, so a
+        // re-dispatch is observable (the value actually changes).
+        let counter = Arc::new(AtomicU64::new(0));
+        let c2 = Arc::clone(&counter);
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+            move |_h, _a: &ql_types::ArrayValue| {
+                let n = c2.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(ql_types::ArrayValue::singleton(Value::Number(n as f64)))
+            },
+        )));
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap(); // B1 = call#1 = 1
+        s.set_formula(addr(sheet, 0, 2), "B1+1").unwrap(); // C1 = 2
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 1)),
+            CellValue::Number { number: 1.0 }
+        );
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 2)),
+            CellValue::Number { number: 2.0 }
+        );
+        // F9: mark volatiles dirty + recalc. B1 re-dispatches (call#2 = 2); C1
+        // MUST fan out from the volatile B1 and recompute to 3.
+        s.mark_volatiles_dirty().unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 1)),
+            CellValue::Number { number: 2.0 },
+            "volatile B1 re-dispatches"
+        );
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 2)),
+            CellValue::Number { number: 3.0 },
+            "C1 must fan out from volatile B1 (the bug left it stale at 2)"
         );
     }
 

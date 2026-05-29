@@ -928,11 +928,20 @@ fn i27_named_range_survives_sheet_rename() {
     }
 }
 
-/// I23: TRANSPOSE over a structured ref — should spill across columns.
-/// Verify: does TRANSPOSE(T[X]) actually produce a 1-row spill, or
-/// does it return #CALC?
+/// I23: TRANSPOSE over a structured ref — should spill across columns and
+/// match TRANSPOSE over the equivalent named range.
+///
+/// **MEGAUDIT 2026-05-29 (Codex-A HIGH / Opus-marshal MED) — FIXED + un-ignored.**
+/// This was a parked investigative test documenting a real bug: `TRANSPOSE(T[X])`
+/// returned `#CALC!` while `TRANSPOSE(TRange)` over the same cells worked, because
+/// `eval_at_cell_boundary`'s Unified arm was MISSING the `StructuredRef`
+/// materialization that the scalar Unified arm had (W5-116) — so the structured
+/// ref was scalar-evaluated to `#CALC!` and TRANSPOSE got a 1×1 error instead of
+/// the column. The 6.4-3c audit-fix later routed array-capable UDF args through
+/// this same boundary arm, widening the blast radius (`=MYUDF(TRANSPOSE(T[X]))`),
+/// which is how the megaudit surfaced it. The fix adds the `StructuredRef` arm to
+/// the boundary materializer; the two forms now agree.
 #[test]
-#[ignore]
 fn i23_transpose_over_structured_ref() {
     let mut wb = Workbook::new();
     let s1 = wb.add_sheet("Data");
@@ -945,21 +954,28 @@ fn i23_transpose_over_structured_ref() {
     rt.set_value(s1, 3, 0, Value::Number(3.0)).unwrap();
     rt.create_table("T", s1, 0, 0, 4, 1, true, false, vec!["X".to_owned()])
         .unwrap();
-    // TRANSPOSE over a column should give a row.
+    // TRANSPOSE over the column's data body [1;2;3] → a 1×3 row; anchor = 1.0.
     let v_struct = rt.set_formula(s2, 0, 0, "TRANSPOSE(T[X])");
-    println!("[I23] TRANSPOSE(T[X]) = {v_struct:?}");
     // Compare with TRANSPOSE over a named range covering the same cells.
     rt.set_name("TRange", NamedTarget::Range(Range::new(s1, 1, 0, 3, 0)))
         .unwrap();
     let v_named = rt.set_formula(s2, 2, 0, "TRANSPOSE(TRange)");
-    println!("[I23] TRANSPOSE(TRange) = {v_named:?}");
-    if matches!(v_struct, Ok(Value::Error(_))) && matches!(v_named, Ok(Value::Number(_))) {
-        println!(
-            "[I23 FINDING] TRANSPOSE over structured ref returns {v_struct:?} \
-            but TRANSPOSE over named range works ({v_named:?}). Phase 4.7 \
-            spill × Phase 4.8 structured-ref interaction broken."
-        );
-    }
+
+    // Both must compute (NOT #CALC!) and agree on the anchor.
+    assert!(
+        !matches!(v_struct, Ok(Value::Error(_))),
+        "TRANSPOSE(T[X]) must no longer be a #CALC! error (got {v_struct:?})"
+    );
+    assert_eq!(
+        v_struct.unwrap(),
+        Value::Number(1.0),
+        "TRANSPOSE(T[X]) anchor = first transposed cell = 1.0"
+    );
+    assert_eq!(
+        v_named.unwrap(),
+        Value::Number(1.0),
+        "TRANSPOSE(TRange) anchor = 1.0 (the structured-ref form must match this)"
+    );
 }
 
 /// I24: BLANK cell vs Number(0) in SUM — Excel treats blank as 0

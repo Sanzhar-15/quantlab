@@ -825,10 +825,11 @@ pub fn eval_at_cell_boundary<E: CellEnv>(
                 ),
             };
             // Materialize args into `FunctionArg`. Mirrors the scalar
-            // dispatch path's arg construction (scalar.rs ~210-258):
+            // dispatch path's arg construction (scalar.rs ~258-310):
             //   - `AggregateNameRef` → `FunctionArg::Range`.
-            //   - `ExprPlan::Array` → `FunctionArg::Array`.
-            //   - Everything else → `FunctionArg::Scalar(eval)`.
+            //   - `StructuredRef`     → `FunctionArg::Range` (narrowed).
+            //   - `ExprPlan::Array`   → `FunctionArg::Array`.
+            //   - Everything else     → `FunctionArg::Scalar(eval)`.
             use ql_functions::{FunctionArg, FunctionContext, FunctionReturn};
             let mut f_args: Vec<FunctionArg> = Vec::with_capacity(args.len());
             for a in args {
@@ -837,6 +838,25 @@ pub fn eval_at_cell_boundary<E: CellEnv>(
                         let (values, rows, cols) = env.read_range_with_shape(*range);
                         f_args.push(FunctionArg::Range { values, rows, cols });
                     }
+                    // **MEGAUDIT fix (2026-05-29; Codex-A HIGH / Opus-marshal
+                    // MED):** the scalar Unified arm (scalar.rs:280-295) reads a
+                    // `StructuredRef` as a `Range`, but this boundary arm was
+                    // missing it — a `StructuredRef` fell to the `other` arm and
+                    // was scalar-evaluated. That mis-fed `=TRANSPOSE(Table[Col])`
+                    // (typed directly AND, after the 6.4-3c audit-fix routed
+                    // array-capable UDF args through here, as a UDF arg). Mirror
+                    // the scalar path: narrow `[@Col]`, then read the range.
+                    ExprPlan::StructuredRef {
+                        resolved,
+                        is_this_row,
+                        ..
+                    } => match narrow_structured_ref(*resolved, *is_this_row, env) {
+                        Ok(range) => {
+                            let (values, rows, cols) = env.read_range_with_shape(range);
+                            f_args.push(FunctionArg::Range { values, rows, cols });
+                        }
+                        Err(ev) => f_args.push(FunctionArg::Scalar(Value::Error(ev))),
+                    },
                     ExprPlan::Array(rows) => {
                         let row_count = rows.len() as u32;
                         let col_count = rows.first().map(|r| r.len()).unwrap_or(0) as u32;

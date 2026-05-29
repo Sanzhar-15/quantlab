@@ -21,8 +21,36 @@
 >   (`Timeout`→`#TIMEOUT!`, all else→`#CALC!`) — the structured `CellDiagnostic` sink (exit test 7's
 >   target) is a focused follow-up; (3) one session-wide `UDF_CALL_DEADLINE = 30s`.
 
-**Status:** ✅ DESIGNED 2026-05-28. **6.4-3a/b/c SHIPPED** (6.4-3c eval wiring 2026-05-29 — see the
-implementation note above). Remaining: 6.4-3d (debugpy + trusted-workspace + napi/IDE bridge).
+> **6.4-3c 5-way MEGAUDIT (2026-05-29) — HARD BLOCKERS for 6.4-3d. Do NOT ship worker injection
+> until these are closed:**
+> - **D (data-loss):** `open`/`import`/load recompute UDF cells with `udf_worker: None` (the session
+>   is replaced wholesale in `open`, resetting the worker), overwriting saved computed UDF values
+>   with `#CALC!` and collapsing saved spills. NOT reachable in the product at 6.4-3c (no napi
+>   injection path), but the moment 6.4-3d exposes `set_udf_worker` over napi this becomes invisible
+>   data-loss on reopen. 6.4-3d MUST preserve/inject the worker on open (trusted-workspace-gated —
+>   reusing a live worker across opening an untrusted workbook is itself a trust decision) OR
+>   preserve cached UDF values when no worker is present, then `recalc_all`.
+> - **C:** multi-cell LITERAL `RangeRef` args of a Reference-context UDF (`=MYUDF(A1:A2)` with
+>   `ArgContext::Reference`) read the range VALUES (via `marshal_udf_args`) but `walk_plan_for_deps`
+>   records NO dep for a multi-cell literal `RangeRef` (the "multi-cell → `#N/A`, value-independent"
+>   assumption held only for reference-aware builtins, NOT value-consuming UDFs) → editing the range
+>   does not recompute. Needs a literal-range value-dep mechanism (none exists). The common
+>   Aggregate-context + named-range path IS tracked. Either build the dep mechanism or reject literal
+>   multi-cell range args for value-consuming UDFs at bind (fail-loud).
+> - **G:** `#CALC!` conflates no-worker / Python-raised / worker-died — wire the `CellDiagnostic`
+>   sink (exit test 7) so these are distinguishable.
+> - **H/I:** op-level recalc budget + per-call cancel (the N×30s mutex stall); grid cell/byte caps
+>   before read/encode (huge range args / produced grids).
+>
+> Full reconciliation + the 5 preserved lanes: `docs/audits/2026-05-29-6-4-3c-MEGAUDIT/`. The
+> megaudit also FIXED (this cycle, in 6.4-3c) two real bugs it found: a `StructuredRef`
+> materialization gap in `eval_at_cell_boundary`'s Unified arm (broke `=TRANSPOSE(Table[Col])`,
+> widened by the 6.4-3c audit-fix routing UDF args through it) and `mark_volatiles_dirty` bypassing
+> dependent-fanout (stale dependents of volatile UDFs / RAND / NOW).
+
+**Status:** ✅ DESIGNED 2026-05-28. **6.4-3a/b/c SHIPPED** (6.4-3c eval wiring 2026-05-29 + 3-way
+audit-fix + 5-way megaudit-fix — see the implementation note + megaudit blockers above). Remaining:
+6.4-3d (debugpy + trusted-workspace + napi/IDE bridge).
 **Predecessor:** 6.4-2 trait wiring + napi DTO surface FULLY SHIPPED (engine HEAD `a9992a32e67`).
 The dispatch substrate is in place: `FunctionRegistry::udf_handles: HashMap<String,
 FunctionImplHandle>` + `udf_handle(name)` reader (6.4-2 cycle 1), `register_function` /
