@@ -758,9 +758,33 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      warnings; workspace clean. Cargo.lock unchanged. Synthesis+5 lanes
      `docs/audits/2026-05-29-6-4-3c-MEGAUDIT/`.
      **6.4-3c FULLY SHIPPED (code + 3-way audit + 5-way megaudit).**
-     **NEXT = 6.4-3d** — debugpy + trusted-workspace + napi/IDE worker-injection bridge (`set_udf_worker`
-     over napi; the IDE constructs a `ProcessWorker` from trusted-workspace config). 3-way audit.
-     **⚠️ 6.4-3d MUST close megaudit blockers D + C + G before shipping worker injection (see design §top).**
+   - ✅ **6.4-3d ENGINE blockers C1/D/G + napi setUdfWorker SHIPPED 2026-05-29** (plan-mode session;
+     plan `~/.claude/plans/pure-frolicking-puzzle.md`; user picked C1=make-`=MYUDF(A1:A2)`-work + defer
+     debugpy). Engine `5f163027a80` (+665/-95, 7 files): **G** = CellDiagnostic sink — `dispatch_udf`
+     emits a structured per-cell diagnostic (udf_no_worker/raised/timeout/worker_died/cancelled/handshake/
+     protocol/codec) ADDITIVELY (value mapping unchanged); ql-exec-local `env::UdfCellDiagnostic` + a
+     **defaulted** `CellEnv::push_udf_diagnostic` + a `RefCell<Vec<_>>` collector on WorkbookSession lent
+     through `with_session_state[_no_oplog]` + drained into `Event::CellDiagnostic` by `drain_udf_diagnostics`
+     in both `with_runtime[_no_oplog]` after `drop(guard)`. **C1** = literal multi-cell range deps —
+     `FormulaDeps.literal_ranges` + a walk_plan_for_deps arm + registration through the EXISTING
+     range-keyed `register_range_dependency` (graph crate untouched) + is_empty/len/VEQ updates;
+     `=MYUDF(A1:A2)` re-evals on edits (C2 fail-loud is the recorded fallback). **D** = D1 take/restore
+     worker across the `*self=from_workbook` swap (open/xlsx/csv) + D2 `recompute_all`-ONLY preserve a
+     saved UDF value when no worker (skip clear+eval+write incl. the spill-clear; scoped via a
+     `preserve_saved_udf_when_no_worker` bool so recompute_dirty still goes #NAME?→#CALC! honestly). +4
+     tests. napi `66a788e40c2` (+99/-4): ql-bindings-node direct ql-udf dep + `PythonWorkerConfigJson`
+     DTO + `Session::setUdfWorker` (eager `ensure_started` fail-loud → `[worker_spawn_failed]`/
+     `[worker_handshake]`; trust gate is the IDE's job). **Verified:** `cargo test -p ql-exec
+     --features xlsx-write` 773 lib + ALL integration 0-failed; udf_e2e 1/1 real-python; clippy
+     -p ql-exec no new warnings; cargo check --workspace clean incl. ql-bindings-node assert_send.
+     **NEXT = 6.4-3d IDE side + 3-way audit (FRESH session — the audit needs fresh context):**
+     IDE (cross-repo `feat/visualise-v1`, `extensions/quantlab/src/quantbook`): `setUdfWorker` on
+     SessionInstance + loader shape check; TrustManager `isWorkspaceTrusted` gate; `quantlab.pythonPath`
+     discovery; error codes worker_spawn_failed/worker_handshake/worker_untrusted_workspace in the union
+     + KNOWN_QUANTBOOK_ERROR_CODE_RECORD; CellDiagnostic tooltip in cellGridHtml. Then rebuild cdylib +
+     node smoke + IDE tsc/mocha, then the 3-way audit (Codex + Opus-engine [D2 spill-skip + load-scoping,
+     C1 dep/VEQ, G drain timing] + Opus-IDE), then doc-sync (mark D/C/G CLOSED in design §top), then 6.4-4.
+     **⚠️ (historical) 6.4-3d MUST close megaudit blockers D + C + G before shipping worker injection — DONE in the engine commit above.**
      **Filed-forward (for 6.4-3d/later):** CellDiagnostic sink (exc_type/message → exit test 7);
      op-level UDF recalc budget + per-function deadlines (the N×30s stall); auto-dirty UDF cells on
      `set_udf_worker` (6.4-0 `functions_used` index); richer list-of-grids args protocol
