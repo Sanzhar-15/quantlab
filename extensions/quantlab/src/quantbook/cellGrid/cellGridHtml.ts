@@ -282,8 +282,16 @@ function renderRows(
 			const dataAttrs = editable
 				? ` data-row="${rowSafe}" data-col="${colSafe}" data-original-text="${escapeHtml(displayStr)}" data-raw-value="${escapeHtml(rawValueStr)}"${formulaAttr} data-original-kind="${escapeHtml(e.value.kind)}"`
 				: '';
+			// **Phase 6.4-3d Step 5 (2026-05-29)**: a per-cell diagnostic (from
+			// `Event::CellDiagnostic` via `pollEvents`, merged onto error-valued
+			// cells by `attachCellDiagnostics`) surfaces as a `title=` tooltip so
+			// a failed UDF explains WHY -- the `#CALC!`/`#TIMEOUT!` text is KEPT.
+			// CSP-safe: the message is `escapeHtml`d like every other attribute.
+			const titleAttr = (typeof e.diagnostic === 'string' && e.diagnostic.length > 0)
+				? ` title="${escapeHtml(e.diagnostic)}"`
+				: '';
 			const cellClass = editable ? 'cell-value' : '';
-			return `<tr><td>${rowSafe}</td><td>${colSafe}</td><td class="${cellClass}"${dataAttrs}>${escapeHtml(displayStr)}<span class="kind">[${escapeHtml(e.value.kind)}]</span></td></tr>`;
+			return `<tr><td>${rowSafe}</td><td>${colSafe}</td><td class="${cellClass}"${dataAttrs}${titleAttr}>${escapeHtml(displayStr)}<span class="kind">[${escapeHtml(e.value.kind)}]</span></td></tr>`;
 		})
 		.join('');
 }

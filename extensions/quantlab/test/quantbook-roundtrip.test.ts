@@ -1489,6 +1489,9 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		for (const m of [
 			'addSheet', 'setValue', 'setFormula', 'clear',
 			'recalcDirty', 'recalcAll', 'snapshot', 'cell', 'listSheets',
+			// **Phase 6.4-3d Step 5 (2026-05-29):** the loader now also checks
+			// these owning-Session methods, so a "complete" fake must carry them.
+			'setUdfWorker', 'pollEvents',
 		]) {
 			(fakeSession.prototype as Record<string, unknown>)[m] = function () { /* */ };
 		}

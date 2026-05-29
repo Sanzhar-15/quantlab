@@ -349,6 +349,15 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (6.1B inc.2d)`);
 				}
 			}
+			// **Phase 6.4-3d Step 5 (2026-05-29):** the Python-UDF worker
+			// injection + event-stream methods. A stale binary (pre-6.4-3d
+			// cdylib) lacks these -- fail at the boundary, not at the
+			// `setUdfWorker is not a function` use site.
+			for (const method of ['setUdfWorker', 'pollEvents']) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (6.4-3d Step 5)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

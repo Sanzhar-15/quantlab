@@ -1147,6 +1147,21 @@ export interface QuantbookCellSnapshot {
 		 * tests pin this).
 		 */
 		readonly formula?: string;
+		/**
+		 * **Phase 6.4-3d Step 5 (2026-05-29)**: a per-cell diagnostic MESSAGE
+		 * (e.g. `"no Python worker is configured for this session"` or
+		 * `"ValueError: boom"`), sourced from `Event::CellDiagnostic` via
+		 * {@link SessionInstance.pollEvents} and merged onto error-valued cells
+		 * by `attachCellDiagnostics` (in `cellGrid/cellGridLogic`). `undefined`
+		 * for the common case (no diagnostic / non-error cell). `buildHtml`'s
+		 * `renderRows` surfaces it as a `title=` tooltip while KEEPING the
+		 * `#CALC!`/`#TIMEOUT!` text -- so a failed UDF explains WHY on hover.
+		 *
+		 * NOT produced by `extractSheetSnapshot` (the snapshot carries values,
+		 * not events); the conditional-key discipline (absent when unset) keeps
+		 * the existing shape-stability `deepStrictEqual` tests intact.
+		 */
+		readonly diagnostic?: string;
 	}>;
 }
 
@@ -1370,6 +1385,120 @@ export interface SessionCellValueInput {
 }
 
 /**
+ * **Phase 6.4-3d Step 5 (2026-05-29)**: config for the out-of-process Python-UDF
+ * worker the IDE injects via {@link SessionInstance.setUdfWorker}. Mirrors the
+ * engine `PythonWorkerConfigJson` (napi object; optional fields are OMITTED, NOT
+ * `null`/`undefined`-valued -- napi-rs rejects an explicit `null`). The IDE
+ * resolves these from trusted-workspace config (the `quantlab.pythonPath`
+ * cascade + the workspace UDF dir); see `udfWorker.ts`.
+ */
+export interface PythonWorkerConfigJson {
+	/** Absolute path to the Python interpreter to launch (required). */
+	python: string;
+	/** `-m` module that runs the worker loop. Defaults to `"quantbook.worker"`. */
+	module?: string;
+	/**
+	 * Directories prepended to `PYTHONPATH` (the worker module + `quantbook`
+	 * package must resolve). Typically the engine's `quantbook-py/python` plus
+	 * the workspace UDF dir.
+	 */
+	pythonpath?: string[];
+	/** Trusted user module the worker imports to register UDFs by handle. */
+	udfModule?: string;
+	/** Handshake timeout in ms (HELLO_ACK wait). Engine default 5000; capped at 600000. */
+	handshakeTimeoutMs?: number;
+}
+
+/**
+ * **Phase 6.4-3d Step 5 (2026-05-29)**: severity of a {@link DiagnosticJson}.
+ * Mirrors the engine `Severity` (`snake_case` serde).
+ */
+export type DiagnosticSeverity = 'info' | 'warning' | 'error';
+
+/**
+ * **Phase 6.4-3d Step 5 (2026-05-29)**: a cell address as carried by an
+ * {@link EventJson} / {@link DiagnosticJson}. Mirrors the engine `CellAddrJson`
+ * (`sheet` widened u16->u32; `row`/`col` 0-indexed). Distinct from the
+ * snapshot's per-cell `{ row, col }` (which omits `sheet`).
+ */
+export interface CellAddrJson {
+	sheet: number;
+	row: number;
+	col: number;
+}
+
+/**
+ * **Phase 6.4-3d Step 5 (2026-05-29)**: a per-cell diagnostic. Mirrors the
+ * engine `DiagnosticJson` (contract section 9). `addr` is absent for a workbook-level
+ * diagnostic. For UDFs the `code` is one of `udf_no_worker` / `udf_raised` /
+ * `udf_timeout` / `udf_worker_died` / `udf_cancelled` / `udf_handshake` /
+ * `udf_protocol` / `udf_codec`; `message` carries the human-readable reason
+ * (e.g. `"ValueError: boom"` for a raised UDF).
+ */
+export interface DiagnosticJson {
+	addr?: CellAddrJson;
+	severity: DiagnosticSeverity;
+	code: string;
+	message: string;
+}
+
+/**
+ * **Phase 6.4-3d Step 5 (2026-05-29)**: an operation's terminal/running state
+ * carried by an `operation_completed` {@link EventJson}. Mirrors the engine
+ * `OperationStateJson`. `error` is the `[code] message` display ONLY when
+ * `state === 'failed'` (parse via {@link parseQuantbookError}).
+ */
+export interface OperationStateJson {
+	state: 'running' | 'completed' | 'canceled' | 'failed';
+	error?: string;
+}
+
+/**
+ * **Phase 6.4-3d Step 5 (2026-05-29)**: one structured event drained from the
+ * session's event ring (contract section 9). Mirrors the engine `EventJson`: a tagged
+ * union keyed by `kind`; only that variant's payload fields are populated.
+ * - `'recalc_progress'`: `op`, `done`, `total`
+ * - `'cell_diagnostic'`: `diagnostic`
+ * - `'operation_completed'`: `op`, `state`
+ * - `'provenance'`: `addr`, `source`
+ * - `'structure_changed'`: `structureKind`, `target`
+ * - `'full_resync_required'`: (no payload -- reseed via `snapshot()`)
+ *
+ * `op`/`done`/`total` are engine `u64` ids surfaced as JS `bigint` (napi BigInt).
+ */
+export interface EventJson {
+	kind:
+	| 'recalc_progress'
+	| 'cell_diagnostic'
+	| 'operation_completed'
+	| 'provenance'
+	| 'structure_changed'
+	| 'full_resync_required';
+	op?: bigint;
+	done?: bigint;
+	total?: bigint;
+	diagnostic?: DiagnosticJson;
+	state?: OperationStateJson;
+	addr?: CellAddrJson;
+	source?: string;
+	structureKind?: string;
+	target?: string;
+}
+
+/**
+ * **Phase 6.4-3d Step 5 (2026-05-29)**: a page of events read from a cursor.
+ * Mirrors the engine `EventPageJson`. Reading does NOT drain the ring; pass
+ * `nextCursor` to the next {@link SessionInstance.pollEvents} call. `dropped`
+ * pairs with a `full_resync_required` event (consumer fell behind -- reseed via
+ * `snapshot()`; v1's ring is unbounded so this never fires yet).
+ */
+export interface EventPageJson {
+	events: EventJson[];
+	nextCursor: bigint;
+	dropped: boolean;
+}
+
+/**
  * The owning `WorkbookSession` napi class (Phase 6.1B inc.2d). Wraps
  * `Arc<Mutex<ql_exec::WorkbookSession>>`; single-writer; the product-neutral
  * session contract from the 6.1 decision-lock. Engine errors surface as JS
@@ -1417,6 +1546,36 @@ export interface SessionInstance {
 
 	/** Live (non-tombstoned) sheets, each as `{ id, name }`. */
 	listSheets(): SheetInfoJson[];
+
+	/**
+	 * **Phase 6.4-3d Step 5**: attach an out-of-process Python-UDF worker built
+	 * from `config`. The worker is spawned + handshaked EAGERLY (fail-loud), so
+	 * a missing interpreter / protocol mismatch surfaces NOW (`[worker_spawn_failed]`
+	 * / `[worker_handshake]`), not later as a silent `#CALC!`. After injecting,
+	 * call {@link recalcAll} so existing UDF cells pick up the worker
+	 * (`recalcDirty` will NOT heal an already-computed `#CALC!`). Re-calling
+	 * REPLACES the worker (the prior child is killed).
+	 *
+	 * **SYNCHRONOUS + BLOCKING**: this is a synchronous napi method that blocks
+	 * the calling thread up to the handshake timeout. The IDE MUST NOT call it on
+	 * the UI/keystroke path -- go through the async `injectUdfWorker` helper
+	 * (`udfWorker.ts`), which also enforces the workspace-trust gate.
+	 *
+	 * Errors: `[worker_spawn_failed]` / `[worker_handshake]` / `[bad_argument]`
+	 * (bad `handshakeTimeoutMs`) / `[invalid_state]` (session not Ready) /
+	 * `[session_busy]`.
+	 */
+	setUdfWorker(config: PythonWorkerConfigJson): void;
+
+	/**
+	 * **Phase 6.4-3d Step 5**: drain a page of structured events from the
+	 * session's event ring (contract section 9) starting at `cursor` (`0n` reads from
+	 * the start; pass the returned `nextCursor` each subsequent call). Reading
+	 * does NOT drain the ring. The IDE consumes this to surface `cell_diagnostic`
+	 * events (the UDF no-worker/raised/timeout/died sink) as cell tooltips. A
+	 * negative/lossy cursor is rejected `[bad_argument]`.
+	 */
+	pollEvents(cursor: bigint): EventPageJson;
 }
 
 export interface SessionConstructor {
@@ -1585,6 +1744,25 @@ export type QuantbookErrorCode =
 	// No-Fallbacks).
 	| 'function_exists'
 	| 'function_not_found'
+	// **Phase 6.4-3d Step 5 (2026-05-29)**: Python-UDF worker codes.
+	// `worker_spawn_failed` / `worker_handshake` are emitted by the engine's
+	// `Session.setUdfWorker` napi method (`udf_spawn_error_to_napi`) when the
+	// interpreter can't be launched / the worker dies during startup, or reports
+	// an incompatible protocol version. `worker_untrusted_workspace` is an
+	// IDE-ONLY code (never emitted by the engine -- the engine has no workspace
+	// concept): the `injectUdfWorker` helper throws it when the workspace is not
+	// trusted, refusing to spawn arbitrary workspace Python.
+	| 'worker_spawn_failed'
+	| 'worker_handshake'
+	| 'worker_untrusted_workspace'
+	// **Phase 6.4-3d Step 5**: lifecycle codes now reachable via `setUdfWorker`
+	// (the lifecycle-gated `set_udf_worker_checked`) -- and shared with the other
+	// gated mutators. `invalid_state` = the session is not Ready (New/Closed/
+	// Faulted); `session_busy` = a long operation is in progress. Pre-existing
+	// engine codes (`EngineError::invalid_state` / `session_busy`) that the IDE
+	// allowlist had not yet enumerated (6.4-2 gap closed here).
+	| 'invalid_state'
+	| 'session_busy'
 	// Fallback when the message has no recognizable code prefix.
 	// Typically means the error came from non-engine, non-binding
 	// code (napi task panic, JS-side throw, runtime task error

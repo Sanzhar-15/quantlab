@@ -798,6 +798,16 @@ const KNOWN_QUANTBOOK_ERROR_CODE_RECORD: Record<Exclude<QuantbookErrorCode, 'unk
 	// disambiguates); `function_not_found` covers unregister-unknown.
 	function_exists: true,
 	function_not_found: true,
+	// Phase 6.4-3d Step 5 (2026-05-29): Python-UDF worker codes
+	// (`Session.setUdfWorker` via `udf_spawn_error_to_napi`) +
+	// `worker_untrusted_workspace` (IDE-only, thrown by `injectUdfWorker` when the
+	// workspace is not trusted) + the lifecycle codes now reachable through the
+	// gated `set_udf_worker_checked` (and shared with the other mutators).
+	worker_spawn_failed: true,
+	worker_handshake: true,
+	worker_untrusted_workspace: true,
+	invalid_state: true,
+	session_busy: true,
 };
 
 /**

@@ -27,7 +27,7 @@
  * - `panel.webview.postMessage` -> wired as `DispatchDeps.onError`.
  */
 
-import type { CellSnapshotJson, CollabSessionInstance, FormatIdJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
+import type { CellSnapshotJson, CollabSessionInstance, EventJson, FormatIdJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
 import { appendPutFormulaValidated, appendPutValueValidated, parseQuantbookError, workbookSnapshot, workbookSnapshotDelta } from '../session';
 
 /**
@@ -888,6 +888,80 @@ export function extractSheetSnapshot(
 		sheet: sheetId,
 		entries,
 	};
+}
+
+// ---------------------------------------------------------------------
+// Phase 6.4-3d Step 5 (2026-05-29) -- CellDiagnostic -> cell tooltip.
+//
+// `Event::CellDiagnostic` (the UDF no-worker/raised/timeout/died sink) arrives
+// via `SessionInstance.pollEvents`, NOT in the value snapshot. These two pure
+// helpers bridge the gap: fold the event page into a per-cell message map, then
+// merge it onto a `QuantbookCellSnapshot` so `renderRows` can show a `title=`
+// tooltip explaining WHY a cell is `#CALC!`/`#TIMEOUT!`.
+// ---------------------------------------------------------------------
+
+/** Map key for a cell within a sheet. */
+function diagKey(row: number, col: number): string {
+	return `${row},${col}`;
+}
+
+/**
+ * **Phase 6.4-3d Step 5**: fold the `cell_diagnostic` events of `events` for
+ * `sheetId` into a `Map` keyed by `"row,col"` whose value is the diagnostic
+ * MESSAGE. Last-wins (a later diagnostic for the same cell supersedes an earlier
+ * one, e.g. a re-eval that fails differently). Events for other sheets, events
+ * without a `cell_diagnostic` kind, and workbook-level diagnostics (no `addr`)
+ * are ignored. Pure -- no I/O.
+ *
+ * Note: the engine ring is append-only with no "diagnostic cleared" event; a
+ * cell that later recomputes to a real value keeps a stale entry HERE, but
+ * {@link attachCellDiagnostics} only surfaces a message on a cell whose CURRENT
+ * value is an error, so a recovered cell naturally drops its tooltip.
+ */
+export function buildCellDiagnosticMessages(
+	events: readonly EventJson[],
+	sheetId: number,
+): Map<string, string> {
+	const out = new Map<string, string>();
+	for (const e of events) {
+		if (e.kind !== 'cell_diagnostic') {
+			continue;
+		}
+		const d = e.diagnostic;
+		if (d === undefined || d.addr === undefined || d.addr.sheet !== sheetId) {
+			continue;
+		}
+		out.set(diagKey(d.addr.row, d.addr.col), d.message);
+	}
+	return out;
+}
+
+/**
+ * **Phase 6.4-3d Step 5**: return a COPY of `snapshot` where each ERROR-valued
+ * entry that has a message in `messages` gains a `diagnostic` field (the
+ * message). Non-error cells are left untouched even if a (stale) message exists
+ * for their coord -- so a UDF cell that recovered to a real value shows no
+ * tooltip. The conditional-key discipline (only set `diagnostic` when present)
+ * keeps shape-stability comparisons meaningful. Pure -- does not mutate input.
+ */
+export function attachCellDiagnostics(
+	snapshot: QuantbookCellSnapshot,
+	messages: Map<string, string>,
+): QuantbookCellSnapshot {
+	if (messages.size === 0) {
+		return snapshot;
+	}
+	const entries = snapshot.entries.map(entry => {
+		if (entry.value.kind !== 'error') {
+			return entry;
+		}
+		const msg = messages.get(diagKey(entry.row, entry.col));
+		if (msg === undefined) {
+			return entry;
+		}
+		return { ...entry, diagnostic: msg };
+	});
+	return { ...snapshot, entries };
 }
 
 // ---------------------------------------------------------------------
