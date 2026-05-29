@@ -777,14 +777,28 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      `[worker_handshake]`; trust gate is the IDE's job). **Verified:** `cargo test -p ql-exec
      --features xlsx-write` 773 lib + ALL integration 0-failed; udf_e2e 1/1 real-python; clippy
      -p ql-exec no new warnings; cargo check --workspace clean incl. ql-bindings-node assert_send.
-     **NEXT = 6.4-3d IDE side + 3-way audit (FRESH session — the audit needs fresh context):**
-     IDE (cross-repo `feat/visualise-v1`, `extensions/quantlab/src/quantbook`): `setUdfWorker` on
-     SessionInstance + loader shape check; TrustManager `isWorkspaceTrusted` gate; `quantlab.pythonPath`
-     discovery; error codes worker_spawn_failed/worker_handshake/worker_untrusted_workspace in the union
-     + KNOWN_QUANTBOOK_ERROR_CODE_RECORD; CellDiagnostic tooltip in cellGridHtml. Then rebuild cdylib +
-     node smoke + IDE tsc/mocha, then the 3-way audit (Codex + Opus-engine [D2 spill-skip + load-scoping,
-     C1 dep/VEQ, G drain timing] + Opus-IDE), then doc-sync (mark D/C/G CLOSED in design §top), then 6.4-4.
-     **⚠️ (historical) 6.4-3d MUST close megaudit blockers D + C + G before shipping worker injection — DONE in the engine commit above.**
+   - ✅ **6.4-3d 3-way AUDIT DONE & FIXED 2026-05-29** (`06c06d4a407`; user asked "need audit"). Codex
+     gpt-5.5 xhigh (DO-NOT-SHIP 3H+2M+2L) + fresh-context Opus engine-internal (2H+1M+3L) + Opus
+     napi/cross-repo (1H+2M+2L). **3 HIGH, each caught by ≥2 lanes — real bugs in the just-shipped code.**
+     HIGH-1: D2 preserve fired on NON-load `recompute_all` (recalc_all kept stale; rematerialize/undo-redo
+     CATASTROPHIC — replay restores formula TEXT only → preserve read Blank → dependent `=B1+1` became 1.0
+     silent-wrong). FIX: `recompute_all()`=preserve-false (all ~60 callers); new
+     `recompute_all_preserving_saved_udf()` called ONLY by `open`. HIGH-2: D2 doesn't preserve spills
+     (.qbook never persists spill targets) → Option A scoped-preserve, documented honestly + filed a spill
+     round-trip test. HIGH-3: setUdfWorker no lifecycle gate + close() didn't drop worker → injected into
+     Closed/Faulted. FIX: `set_udf_worker_checked` (ensure_ready; napi spawns outside lock, calls it under
+     lock → closes inject-vs-close race) + close() drops worker. LOW: handshakeTimeoutMs cap 600_000ms.
+     CLEAN (all lanes): C1, G borrow/drain, D1, Send/!Sync, DTO, panic-across-boundary. +3 tests; verified
+     776 lib + all integration 0-failed, e2e 1/1, clippy no-new, workspace clean. Synthesis+3 lanes
+     `docs/audits/2026-05-29-6-4-3d-audit/`. (Two cargo-fmt×git-add padding-race truncations hit+fixed:
+     `0de9f1fd7b5`, `e844109c565`.) **6.4-3d engine+napi+audit FULLY SHIPPED.**
+     **NEXT = 6.4-3d IDE side ONLY (Step 5, cross-repo `feat/visualise-v1`, `extensions/quantlab/src/quantbook`):**
+     `setUdfWorker` on SessionInstance + loader shape check; TrustManager `isWorkspaceTrusted` gate;
+     `quantlab.pythonPath` discovery; error codes worker_spawn_failed/worker_handshake/worker_untrusted_workspace
+     **+ invalid_state/session_busy** in the union + KNOWN_QUANTBOOK_ERROR_CODE_RECORD; a **pollEvents napi
+     binding** (not yet bound) + CellDiagnostic tooltip in cellGridHtml; call setUdfWorker OFF the UI thread
+     (it's synchronous). Then cdylib rebuild + node smoke + IDE tsc/mocha, then doc-sync (mark D/C/G CLOSED
+     in `docs/phase6/6-4-3-design.md` §top), then 6.4-4.
      **Filed-forward (for 6.4-3d/later):** CellDiagnostic sink (exc_type/message → exit test 7);
      op-level UDF recalc budget + per-function deadlines (the N×30s stall); auto-dirty UDF cells on
      `set_udf_worker` (6.4-0 `functions_used` index); richer list-of-grids args protocol
