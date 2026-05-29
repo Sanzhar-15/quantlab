@@ -55,14 +55,27 @@ export const UDF_DEFAULT_HANDSHAKE_MS = 30_000;
 
 /**
  * Resolve the engine's `crates/quantbook-py/python` directory (the `quantbook`
- * package + the worker module live here). Derived from {@link resolveEnginePath}
- * -- `.../quantbook-engine/target/release/lib...` → `.../quantbook-engine` →
- * `crates/quantbook-py/python` -- so it tracks the same canonical layout (and the
- * `QUANTBOOK_ENGINE_PATH` override).
+ * package + the worker module live here).
+ *
+ * Resolution: an explicit `QUANTBOOK_PY_DIR` env override wins; otherwise it is
+ * DERIVED from {@link resolveEnginePath} assuming the CANONICAL dev layout
+ * (`.../quantbook-engine/target/release/lib...` -> up 2 -> `.../quantbook-engine`
+ * -> `crates/quantbook-py/python`).
+ *
+ * 6.4-3d Step 5 audit-fix (Opus MED): the derivation only holds for the
+ * canonical layout. If `QUANTBOOK_ENGINE_PATH` points the cdylib OUTSIDE that
+ * layout (e.g. a copied binary), the up-2 derivation yields a bogus dir and the
+ * worker fails to `import quantbook.worker` (surfacing as `[worker_spawn_failed]`).
+ * In that case set `QUANTBOOK_PY_DIR` explicitly to the engine's
+ * `crates/quantbook-py/python`.
  */
 export function resolveQuantbookPyDir(): string {
+	const override = process.env.QUANTBOOK_PY_DIR;
+	if (override !== undefined && override.length > 0) {
+		return override;
+	}
 	const enginePath = resolveEnginePath();
-	// dirname = target/release → up two = the quantbook-engine crate root.
+	// dirname = target/release; up two = the quantbook-engine crate root.
 	const engineRoot = path.resolve(path.dirname(enginePath), '..', '..');
 	return path.join(engineRoot, 'crates', 'quantbook-py', 'python');
 }
@@ -148,10 +161,17 @@ export interface InjectUdfWorkerOptions {
 
 /**
  * Resolve config from the workspace + the `quantlab.pythonPath` cascade, gate on
- * trust, and attach the worker to `session`. Async -- yields before the
- * SYNCHRONOUS, blocking `setUdfWorker` call so it is never invoked inline on a
- * caller's synchronous tick; the caller still MUST run this off the UI/keystroke
- * path (the engine method blocks this thread up to the handshake timeout).
+ * trust, and attach the worker to `session`.
+ *
+ * **WARNING -- this BLOCKS the extension-host thread.** `setUdfWorker` is a
+ * SYNCHRONOUS napi method that blocks until the worker handshake completes (up to
+ * `handshakeTimeoutMs`, default 30s). The `await` below only defers it to a later
+ * microtask -- a VS Code extension host is single-threaded, so when the call
+ * runs it freezes the host (UI commands, other extensions) for the duration.
+ * There is no worker-thread offload here; the only real mitigations are a short
+ * `handshakeTimeoutMs` or the filed-forward async-napi `AsyncTask` variant. Do
+ * NOT call this on a keystroke/hot path; prefer an explicit user action + a
+ * progress notification at the (future) live call site.
  *
  * On success the caller should `session.recalcAll()` so existing `#CALC!` UDF
  * cells pick up the worker (`recalcDirty` will not heal them).
@@ -169,13 +189,27 @@ export async function injectUdfWorker(
 	const vscode = await import('vscode');
 	const { TrustManager } = await import('../core/trust/TrustManager');
 
-	const isWorkspaceTrusted = TrustManager.getInstance().isWorkspaceTrusted(opts.workspaceUri);
+	// 6.4-3d Step 5 audit-fix (Codex HIGH): require BOTH VS Code Restricted-Mode
+	// trust (`vscode.workspace.isTrusted`) AND QuantLab's own workspace-trust
+	// store. A workspace can be trusted in QuantLab's map yet opened in VS Code
+	// Restricted Mode, where extensions MUST NOT execute workspace code -- and a
+	// UDF worker runs arbitrary workspace Python. Gate FIRST, before resolving any
+	// interpreter path (no fs probing for an untrusted workspace).
+	const isWorkspaceTrusted =
+		vscode.workspace.isTrusted &&
+		TrustManager.getInstance().isWorkspaceTrusted(opts.workspaceUri);
 
-	const quantlabConfigPath =
-		vscode.workspace.getConfiguration('quantlab').get<string>('pythonPath') || undefined;
-	const pythonExtConfigPath =
-		vscode.workspace.getConfiguration('python').get<string>('defaultInterpreterPath') || undefined;
-	const resolvedPython = resolveQuantlabPython({ quantlabConfigPath, pythonExtConfigPath });
+	// Resolve the interpreter ONLY when trusted; `planUdfWorkerConfig` throws
+	// `[worker_untrusted_workspace]` first when not, so we never stat/spawn for an
+	// untrusted workspace.
+	const resolvedPython = isWorkspaceTrusted
+		? resolveQuantlabPython({
+			quantlabConfigPath:
+				vscode.workspace.getConfiguration('quantlab').get<string>('pythonPath') || undefined,
+			pythonExtConfigPath:
+				vscode.workspace.getConfiguration('python').get<string>('defaultInterpreterPath') || undefined,
+		})
+		: null;
 
 	const config = planUdfWorkerConfig({
 		isWorkspaceTrusted,
@@ -190,10 +224,9 @@ export async function injectUdfWorker(
 		handshakeTimeoutMs: opts.handshakeTimeoutMs,
 	});
 
-	// `setUdfWorker` is SYNCHRONOUS and blocks up to the handshake timeout. Yield
-	// once so we never block within a synchronous caller's tick; the engine call
-	// itself still runs on this thread (the async-napi `AsyncTask` variant is
-	// filed-forward). Callers MUST invoke `injectUdfWorker` off the UI path.
+	// Defer to a later microtask so we never run the blocking call inline on a
+	// synchronous caller's tick (see the WARNING above -- this does NOT take it
+	// off the host thread).
 	await Promise.resolve();
 	session.setUdfWorker(config);
 }

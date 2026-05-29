@@ -937,29 +937,52 @@ export function buildCellDiagnosticMessages(
 }
 
 /**
- * **Phase 6.4-3d Step 5**: return a COPY of `snapshot` where each ERROR-valued
- * entry that has a message in `messages` gains a `diagnostic` field (the
- * message). Non-error cells are left untouched even if a (stale) message exists
- * for their coord -- so a UDF cell that recovered to a real value shows no
- * tooltip. The conditional-key discipline (only set `diagnostic` when present)
- * keeps shape-stability comparisons meaningful. Pure -- does not mutate input.
+ * **Phase 6.4-3d Step 5**: return a COPY of `snapshot` whose `diagnostic` fields
+ * reflect EXACTLY the current `messages` on current ERROR-valued cells:
+ * - an error cell with a current message gets `diagnostic = message`;
+ * - every other cell has NO `diagnostic` -- any stale one carried on the input
+ *   is STRIPPED.
+ *
+ * The strip makes the function IDEMPOTENT and reattachment-safe (6.4-3d Step 5
+ * audit-fix, Codex/Opus): a cell that recovered to a real value, or whose
+ * message changed, can never keep a stale tooltip even if the caller passes a
+ * previously-attached snapshot. (In the intended flow the input is always a
+ * fresh `extractSheetSnapshot` with no diagnostics, so the strip is defensive.)
+ * Pure -- does not mutate the input. Fast-path: returns the input unchanged when
+ * there is nothing to attach AND nothing to strip.
  */
 export function attachCellDiagnostics(
 	snapshot: QuantbookCellSnapshot,
 	messages: Map<string, string>,
 ): QuantbookCellSnapshot {
-	if (messages.size === 0) {
+	const hasStale = snapshot.entries.some(e => e.diagnostic !== undefined);
+	if (messages.size === 0 && !hasStale) {
 		return snapshot;
 	}
 	const entries = snapshot.entries.map(entry => {
-		if (entry.value.kind !== 'error') {
-			return entry;
+		const msg = entry.value.kind === 'error'
+			? messages.get(diagKey(entry.row, entry.col))
+			: undefined;
+		// Rebuild without any pre-existing `diagnostic`, re-adding the optional
+		// keys per the conditional-key discipline + only the CURRENT message.
+		const rebuilt: {
+			row: number;
+			col: number;
+			value: QuantbookCellValue;
+			rendered?: string;
+			formula?: string;
+			diagnostic?: string;
+		} = { row: entry.row, col: entry.col, value: entry.value };
+		if (entry.rendered !== undefined) {
+			rebuilt.rendered = entry.rendered;
 		}
-		const msg = messages.get(diagKey(entry.row, entry.col));
-		if (msg === undefined) {
-			return entry;
+		if (entry.formula !== undefined) {
+			rebuilt.formula = entry.formula;
 		}
-		return { ...entry, diagnostic: msg };
+		if (msg !== undefined) {
+			rebuilt.diagnostic = msg;
+		}
+		return rebuilt;
 	});
 	return { ...snapshot, entries };
 }

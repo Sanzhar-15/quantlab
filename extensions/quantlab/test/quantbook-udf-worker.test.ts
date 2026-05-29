@@ -16,10 +16,12 @@
  */
 
 import * as assert from 'assert';
+import * as path from 'path';
 
+import { buildHtml } from '../src/quantbook/cellGrid/cellGridHtml';
 import { attachCellDiagnostics, buildCellDiagnosticMessages } from '../src/quantbook/cellGrid/cellGridLogic';
 import { parseQuantbookError } from '../src/quantbook/session';
-import { planUdfWorkerConfig, UDF_DEFAULT_HANDSHAKE_MS } from '../src/quantbook/udfWorker';
+import { planUdfWorkerConfig, resolveQuantbookPyDir, UDF_DEFAULT_HANDSHAKE_MS } from '../src/quantbook/udfWorker';
 import type { EventJson, QuantbookCellSnapshot } from '../src/quantbook/types';
 
 suite('quantbook 6.4-3d Step 5 -- UDF worker wiring', () => {
@@ -128,6 +130,35 @@ suite('quantbook 6.4-3d Step 5 -- UDF worker wiring', () => {
 		});
 	});
 
+	suite('resolveQuantbookPyDir (engine python package dir)', () => {
+		// Save/restore the two env vars the resolver consults.
+		let savedPyDir: string | undefined;
+		let savedEnginePath: string | undefined;
+		setup(() => {
+			savedPyDir = process.env.QUANTBOOK_PY_DIR;
+			savedEnginePath = process.env.QUANTBOOK_ENGINE_PATH;
+		});
+		teardown(() => {
+			if (savedPyDir === undefined) { delete process.env.QUANTBOOK_PY_DIR; } else { process.env.QUANTBOOK_PY_DIR = savedPyDir; }
+			if (savedEnginePath === undefined) { delete process.env.QUANTBOOK_ENGINE_PATH; } else { process.env.QUANTBOOK_ENGINE_PATH = savedEnginePath; }
+		});
+
+		test('QUANTBOOK_PY_DIR override wins verbatim', () => {
+			process.env.QUANTBOOK_PY_DIR = '/opt/quantlab/py';
+			assert.strictEqual(resolveQuantbookPyDir(), '/opt/quantlab/py');
+		});
+
+		test('derives from QUANTBOOK_ENGINE_PATH under the canonical layout', () => {
+			delete process.env.QUANTBOOK_PY_DIR;
+			process.env.QUANTBOOK_ENGINE_PATH =
+				'/foo/quantbook-engine/target/release/libql_bindings_node.dylib';
+			assert.strictEqual(
+				resolveQuantbookPyDir(),
+				path.join('/foo/quantbook-engine', 'crates', 'quantbook-py', 'python'),
+			);
+		});
+	});
+
 	suite('buildCellDiagnosticMessages (event -> per-cell message map)', () => {
 		const events: EventJson[] = [
 			{ kind: 'recalc_progress', op: 1n, done: 0n, total: 1n }, // ignored
@@ -203,6 +234,61 @@ suite('quantbook 6.4-3d Step 5 -- UDF worker wiring', () => {
 				!Object.prototype.hasOwnProperty.call(errCell, 'diagnostic'),
 				'input must be left unchanged',
 			);
+		});
+
+		test('STRIPS a stale diagnostic on a recovered or no-longer-covered cell (audit-fix)', () => {
+			// Simulate a previously-attached snapshot fed back in with an EMPTY
+			// current map: both stale tooltips must be dropped.
+			const stale: QuantbookCellSnapshot = {
+				snapshot_format_version: 1,
+				sheet: 0,
+				entries: [
+					{ row: 0, col: 0, value: { kind: 'number', value: 7 }, diagnostic: 'old: no worker' },
+					{ row: 0, col: 1, value: { kind: 'error', value: '#CALC!' }, diagnostic: 'old: no worker' },
+				],
+			};
+			const out = attachCellDiagnostics(stale, new Map());
+			const recovered = out.entries.find(e => e.col === 0)!;
+			const stillErr = out.entries.find(e => e.col === 1)!;
+			assert.ok(
+				!Object.prototype.hasOwnProperty.call(recovered, 'diagnostic'),
+				'a cell that recovered to a value drops its stale tooltip',
+			);
+			assert.ok(
+				!Object.prototype.hasOwnProperty.call(stillErr, 'diagnostic'),
+				'an error cell with no CURRENT message drops its stale tooltip',
+			);
+		});
+
+		test('idempotent: re-attaching with a changed message REPLACES, never accumulates', () => {
+			const first = attachCellDiagnostics(base, new Map([['0,1', 'msg A']]));
+			const second = attachCellDiagnostics(first, new Map([['0,1', 'msg B']]));
+			const c = second.entries.find(e => e.col === 1)!;
+			assert.strictEqual(c.diagnostic, 'msg B', 'latest message wins, no stale carryover');
+		});
+	});
+
+	suite('buildHtml renders the diagnostic as a title= tooltip (server + client mirror)', () => {
+		const snapWithDiag: QuantbookCellSnapshot = {
+			snapshot_format_version: 1,
+			sheet: 0,
+			entries: [
+				{ row: 0, col: 1, value: { kind: 'error', value: '#CALC!' }, diagnostic: 'no Python worker configured' },
+			],
+		};
+
+		test('server-side render emits an escaped title= for a diagnostic cell, keeping the #CALC! text', () => {
+			const html = buildHtml(snapWithDiag, {});
+			assert.ok(html.includes('title="no Python worker configured"'), 'server render carries the tooltip');
+			assert.ok(html.includes('#CALC!'), 'the error sigil text is preserved');
+		});
+
+		test('client-side renderRowsClient mirror reads e.diagnostic (survives scroll repaints)', () => {
+			// The nonce path injects the client virtualization script; the audit-fix
+			// added the titleAttr mirror so the tooltip is not lost on repaint.
+			const html = buildHtml(snapWithDiag, { nonce: 'test-nonce' });
+			assert.ok(html.includes('e.diagnostic'), 'client renderRowsClient references e.diagnostic');
+			assert.ok(html.includes('titleAttr'), 'client render builds a titleAttr');
 		});
 	});
 });
