@@ -72,9 +72,21 @@ client-repaint tooltip drop) + 3 MED fixed; synthesis `docs/audits/2026-05-29-6-
 loop (the Step-5 Option-A scope boundary — the contract/helper/renderer surface ships, but the live panel
 still runs on `CollabSession` so nothing drives the tooltip end-to-end yet); the synchronous-blocking
 `setUdfWorker` → async-napi `AsyncTask`; worker.py pyarrow-import-before-fd1-redirect. **debugpy deferred
-to a focused `6.4-3d-debug` follow-up** (`ProcessWorker::pid()` is ready for it). **NEXT = 6.4-4 exit
-tests** (5-way; §10.4 tests 1-8; exit-test-7 backed by the G diagnostic sink, now IDE-reachable via
-`pollEvents`).
+to a focused `6.4-3d-debug` follow-up** (`ProcessWorker::pid()` is ready for it).
+
+> **STATUS (2026-05-29): 6.4-4 exit tests SHIPPED + 5-way-closure-megaudited — the 6.4-3 Python-UDF
+> arc is CLOSED.** `crates/ql-exec/tests/udf_exit_tests.rs` proves §10.4 tests 1-8 (6 positive exits
+> 1/2/3/6/7/8 + 2 reserved-capability guards 4/5 = `publish_dataset`/`bind_range` asserting
+> `not_implemented_in_v1_core`). No production behavior changed (two doc-only notes). 5-way megaudit
+> (2 Codex gpt-5.5 xhigh + 3 fresh Opus): 0 HIGH / 0 DO-NOT-SHIP; test-hardening applied (test-8
+> register→dirty→recalc made airtight; test-7 widened to all 8 diagnostic codes incl. the 5
+> previously-untested; test-3 isolates volatility; test-6 citation honesty). Synthesis+lanes
+> `docs/audits/2026-05-29-6-4-4-exit-tests-megaudit/`. Engine commit `6b1fdb36578`. **Filed forward**
+> (NOT arc-blocking): `validate_canonical_function_name` should reject names the formula lexer can't
+> tokenize (`MY UDF`/`MY-UDF`/non-ASCII) — pre-existing 6.4-2 gap, no corruption (inert registration;
+> `=MY UDF(..)` fails loud), deferred to a 6.4-2-followup that extracts a shared lexer identifier
+> predicate; `WorkbookTransaction` diagnostics sink (not live). **NEXT = the next decision-lock item
+> (6.5 / reserved-tier producers).**
 **Predecessor:** 6.4-2 trait wiring + napi DTO surface FULLY SHIPPED (engine HEAD `a9992a32e67`).
 The dispatch substrate is in place: `FunctionRegistry::udf_handles: HashMap<String,
 FunctionImplHandle>` + `udf_handle(name)` reader (6.4-2 cycle 1), `register_function` /

@@ -709,6 +709,21 @@ dependents; (5) `BoundFrame` overlay edit dirties bound-range formulas; (6) canc
 does not commit a late result; (7) failed UDF → deterministic `CellDiagnostic`; **(8, new)** registering
 a UDF dirties formulas that referenced its (previously-unknown) name.
 
+> **✅ SHIPPED 2026-05-29 (6.4-4, engine `6b1fdb36578`; 5-way closure megaudit, 0 HIGH).** Proven in
+> `crates/ql-exec/tests/udf_exit_tests.rs` as 6 positive exits — (1) `exit_test_1_*` (scalar
+> input-change recompute, invocation-counted), (2) `exit_test_2_*` (unrelated-edit no-recompute),
+> (3) `exit_test_3_*` (`mark_volatiles_dirty`+`recalc_dirty` re-eval, isolated from a plain recalc),
+> (6) `exit_test_6_*` (`Timeout`→`#TIMEOUT!` committed atomically; the process-half kill+drop-late-RETURN
+> is enforced in `ql-udf` + exercised by `process_smoke.rs`), (7) `exit_test_7_*` (all 8 diagnostic
+> codes incl. `udf_worker_died`/`udf_codec`/`udf_protocol`/`udf_handshake`/`udf_cancelled`, at `Error`
+> severity), (8) `exit_test_8_*` (register→dirty→recalc, airtight: `#NAME?`+`calls==0` before
+> `recalc_dirty`, `==42`+`calls==1` after). **Tests (4) `publish` and (5) `BoundFrame` are
+> reserved-tier capability guards** — `publish_dataset`/`bind_range` are `not_implemented_in_v1_core`
+> (§11), so the suite asserts the fail-loud status; the positive dirty-dependents proof lands when
+> those producers ship (the cell-dep fanout they generalize is proven by (1)/(8)). v1 reaches the
+> timeout half of (6); the cooperative-CANCEL route is not yet driven from the session (its diagnostic
+> code IS covered by (7)).
+
 ---
 
 ## 11. Per-binding obligations

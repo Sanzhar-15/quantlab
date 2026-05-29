@@ -813,9 +813,26 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      runs on `CollabSession`, so the tooltip surface ships but nothing drives it end-to-end yet); sync
      `setUdfWorker` → async-napi `AsyncTask`; debugpy (`6.4-3d-debug`); op-level recalc budget +
      per-function deadlines (N×30s); worker.py pyarrow-import-before-fd1-redirect + `run()` param rename.
-     **NEXT = 6.4-4 exit-tests + closure megaudit** (5-way; contract §10.4 tests 1-8; exit-test-7 backed by
-     the G diagnostic sink, now IDE-reachable via `pollEvents`). Tracked cross-cutting (still pending):
-     `Sheet::iter_effective_cells()` serializer fix.
+     Tracked cross-cutting (still pending): `Sheet::iter_effective_cells()` serializer fix.
+   - ✅ **6.4-4 EXIT TESTS + 5-WAY CLOSURE MEGAUDIT SHIPPED 2026-05-29 — the 6.4-3 Python-UDF arc is
+     CLOSED.** Engine `6b1fdb36578`. New `crates/ql-exec/tests/udf_exit_tests.rs` (public-API integration)
+     proves §10.4 tests 1-8: 6 positive exits (1 scalar input-change recompute / 2 unrelated-edit
+     no-recompute / 3 volatile-pass re-eval isolated from plain recalc / 6 Timeout→#TIMEOUT! committed
+     atomically / 7 ALL 8 diagnostic codes at Error severity / 8 register→dirty→recalc airtight via
+     invocation counters) + 2 reserved-capability guards (4 `publish_dataset` / 5 `bind_range` assert
+     `not_implemented_in_v1_core`). NO production behavior changed (2 doc-only notes: scalar.rs
+     `map_udf_error` wildcard + loader.rs D2 forward-risk). 5-way megaudit (2 Codex gpt-5.5 xhigh + 3
+     fresh Opus): **0 HIGH / 0 DO-NOT-SHIP**; all SHIP / SHIP-WITH-FIXES. Test-hardening applied this
+     cycle (Codex-1 MED-1 test-8 calls==0/==1; Opus-C MED-1 test-7 5 untested codes; Codex-1 LOW-3 test-3
+     plain-recalc-flat-first; test-6 citation honesty). Verified `udf_exit_tests` 8/8 + lib 776/0 +
+     `udf_e2e` 1/1 real-python + clippy no-new + workspace clean. Synthesis+lanes
+     `docs/audits/2026-05-29-6-4-4-exit-tests-megaudit/`. **FILED FORWARD (NOT arc-blocking):** (FF-1)
+     `validate_canonical_function_name` should reject names the formula lexer can't tokenize (`MY UDF`/
+     `MY-UDF`/non-ASCII) — pre-existing 6.4-2 gap, MED, no corruption (inert registration; `=MY UDF(..)`
+     fails loud), deferred to a 6.4-2-followup extracting a shared lexer identifier predicate (mirror in
+     ql-functions) to avoid regressing dotted names like `T.DIST.2T`; (FF-2) `WorkbookTransaction`
+     diagnostics sink (not live — only test callers; live batch/commit threads diagnostics). **NEXT =
+     the next decision-lock item (reserved-tier producers / 6.5).**
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +
