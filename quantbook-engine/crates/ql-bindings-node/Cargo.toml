@@ -88,6 +88,12 @@ ql-storage   = { path = "../ql-storage" }
 # this dep does NOT pull umya/image into the binding's default cdylib.
 ql-exec      = { path = "../ql-exec" }
 ql-session   = { path = "../ql-session" }
+# **6.4-3d (2026-05-29):** the Python-UDF worker (`ProcessWorker` +
+# `PythonWorkerConfig`). The `setUdfWorker` napi method builds a `ProcessWorker`
+# from a JS config DTO and injects it via `WorkbookSession::set_udf_worker`.
+# Now a DIRECT dep, but `ql-exec` already pulls `ql-udf` (and its `arrow`/ipc
+# tree) transitively, so this adds NO new external crate to the cdylib.
+ql-udf       = { path = "../ql-udf" }
 
 # **V2.4 (2026-05-22):** `parking_lot::Mutex` for the `Arc<Mutex<CoreCollabSession>>`
 # refactor that closes V2.3's `&mut self` async aliasing UB hazard. Faster

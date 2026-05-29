@@ -4333,6 +4333,44 @@ pub struct FunctionMetadataJson {
     pub provenance_tags: Vec<String>,
 }
 
+/// **6.4-3d (2026-05-29):** config for the out-of-process Python-UDF worker the
+/// IDE injects via [`Session::set_udf_worker`]. Mirrors
+/// [`ql_udf::PythonWorkerConfig`]; the IDE resolves these from
+/// trusted-workspace config (`quantlab.pythonPath` cascade + the workspace UDF
+/// dir). Optional fields fall back to the engine defaults (module
+/// `"quantbook.worker"`, 5s handshake, current protocol version, no extra
+/// `PYTHONPATH` / udf module). Per napi-rs, OMIT optional fields (undefined) —
+/// do not pass `null`.
+#[napi(object)]
+pub struct PythonWorkerConfigJson {
+    /// Absolute path to the Python interpreter to launch (required).
+    pub python: String,
+    /// The `-m` module that runs the worker loop. Defaults to `"quantbook.worker"`.
+    pub module: Option<String>,
+    /// Directories prepended to `PYTHONPATH` (the worker module + `quantbook`
+    /// package must resolve). Typically the engine's `quantbook-py/python` plus
+    /// the workspace UDF dir.
+    pub pythonpath: Option<Vec<String>>,
+    /// The trusted user module the worker imports to register UDFs by handle
+    /// (passed as `QUANTBOOK_UDF_MODULE`).
+    pub udf_module: Option<String>,
+    /// Handshake timeout in milliseconds (HELLO_ACK wait). Defaults to 5000.
+    pub handshake_timeout_ms: Option<f64>,
+}
+
+/// **6.4-3d (2026-05-29):** map a worker spawn/handshake [`ql_udf::UdfError`] to
+/// a napi `[code] message` error. Only the startup variants are reachable from
+/// `ProcessWorker::ensure_started` (a missing interpreter / worker death during
+/// startup → `WorkerDied`; an incompatible protocol → `Handshake`). A per-call
+/// dispatch failure is NOT routed here — that surfaces as a cell error value +
+/// a `CellDiagnostic`, never a JS exception.
+fn udf_spawn_error_to_napi(e: ql_udf::UdfError) -> Error {
+    match e {
+        ql_udf::UdfError::Handshake { .. } => Error::from_reason(format!("[worker_handshake] {e}")),
+        other => Error::from_reason(format!("[worker_spawn_failed] {other}")),
+    }
+}
+
 /// **6.4-2:** JS→Rust enum-string mapper. Free-fn rather than a method to keep
 /// the DTO type itself a plain data carrier (no impl blocks on `#[napi(object)]`
 /// types — napi-rs is happiest that way).
@@ -4355,7 +4393,9 @@ fn arity_from_json(a: ArityJson) -> Result<ql_session::function_meta::Arity> {
                 bad_argument_error("ArityJson kind 'fixed' requires field 'n'".into())
             })?;
             let n = u8::try_from(n).map_err(|_| {
-                bad_argument_error(format!("ArityJson 'fixed': n={n} exceeds u8 range (0..=255)"))
+                bad_argument_error(format!(
+                    "ArityJson 'fixed': n={n} exceeds u8 range (0..=255)"
+                ))
             })?;
             Ok(Arity::Fixed { n })
         }
@@ -4867,6 +4907,57 @@ impl Session {
             .map_err(engine_error_to_napi)?;
         Ok(metas.into_iter().map(function_metadata_to_json).collect())
     }
+
+    /// **6.4-3d (2026-05-29):** attach an out-of-process Python-UDF worker to
+    /// this session, built from `config` (a trusted-workspace `ProcessWorker`).
+    /// The worker is spawned + handshaked EAGERLY here (fail-loud) so a missing
+    /// interpreter / protocol mismatch surfaces NOW as a clear error, not later
+    /// as a silent `#CALC!` on the first `=MYUDF(..)`. After injecting, the IDE
+    /// should call `recalcAll` so existing UDF cells pick up the worker — a UDF
+    /// cell computed before injection is a clean `#CALC!` that `recalcDirty`
+    /// will NOT heal (see engine `WorkbookSession::set_udf_worker`). Calling
+    /// again REPLACES the worker (the prior one is dropped → its child killed).
+    ///
+    /// **Errors (Appendix A):**
+    /// - `[worker_spawn_failed]` — the interpreter could not be launched / the
+    ///   worker died during startup (python not found, import error, …).
+    /// - `[worker_handshake]` — the worker reported an incompatible protocol
+    ///   version.
+    /// - `[bad_argument]` — `handshakeTimeoutMs` is negative / non-finite.
+    ///
+    /// **Trust:** the IDE MUST gate this call on workspace trust — spawning a
+    /// worker runs arbitrary workspace Python. The engine has no workspace
+    /// concept, so the trust gate lives in the IDE (`worker_untrusted_workspace`
+    /// is an IDE-side code, never emitted here).
+    #[napi(js_name = "setUdfWorker")]
+    pub fn set_udf_worker(&self, config: PythonWorkerConfigJson) -> Result<()> {
+        let mut cfg = ql_udf::PythonWorkerConfig::new(&config.python);
+        if let Some(module) = config.module {
+            cfg.module = module;
+        }
+        if let Some(paths) = config.pythonpath {
+            for p in paths {
+                cfg = cfg.with_pythonpath(p);
+            }
+        }
+        if let Some(udf_module) = config.udf_module {
+            cfg = cfg.with_udf_module(udf_module);
+        }
+        if let Some(ms) = config.handshake_timeout_ms {
+            if !ms.is_finite() || ms < 0.0 {
+                return Err(bad_argument_error(
+                    "setUdfWorker: handshakeTimeoutMs must be a non-negative finite number".into(),
+                ));
+            }
+            cfg.handshake_timeout = std::time::Duration::from_millis(ms as u64);
+        }
+        // Spawn + handshake EAGERLY (outside the session lock — the spawn is a
+        // process op) so a failure is reported here, not deferred to first call.
+        let mut worker = ql_udf::ProcessWorker::new(cfg);
+        worker.ensure_started().map_err(udf_spawn_error_to_napi)?;
+        self.inner.lock().set_udf_worker(Box::new(worker));
+        Ok(())
+    }
 }
 
 // **Phase 6.1B inc.2d (2026-05-27) — Send + Sync positive proof (audit Rule 4).**
@@ -4889,6 +4980,4 @@ const _ASSERT_BINDING_SESSION_SEND: fn() = || {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
     assert_send::<CoreWorkbookSession>();
-    assert_send::<Session>();
-    assert_sync::<Session>();
-};
+    assert_send::<Session
