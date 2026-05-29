@@ -716,13 +716,33 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      updated `register_function_dirties_dependent_formulas` (#NAME?→#CALC! transition); clippy
      `-p ql-exec` (no new warnings); `cargo check --workspace` clean (incl. ql-bindings-node Send).
      Cargo.lock unchanged.
-     **NEXT = 6.4-3c 3-way audit** (engine + Opus + IDE-lens — code shipped, audit next per 6.4-3a/b
-     precedent): RefCell threading/re-entrancy, FaultGuard panic-freedom, the `!Sync` single-thread
-     invariant (SIMD/rayon never carries `&WorkbookEnv` during a UDF call), arg-marshalling,
-     boundary-spill guard, the **transaction.rs inline-eval-without-worker gap** (UDF in a txn →
-     `#CALC!` until post-commit recompute self-heals — confirm), cross-repo napi error-code/CellValue.
-     **Filed-forward:** CellDiagnostic sink (exc_type/message → exit test 7); richer list-of-grids args
-     protocol (mixed/multi-range); per-function/`CancelPolicy` deadlines. Then:
+   - ✅ **6.4-3c 3-way AUDIT-FIX SHIPPED 2026-05-29** (`a9ef3f252ca`) — Codex gpt-5.5 xhigh
+     (DO-NOT-SHIP 2H+2M) + fresh-context Opus engine-internal (SHIP-WITH-FIXES 0/3/3) + Opus
+     cross-repo/IDE (SHIP 0/0/0). The four hardest dims (RefCell re-entrancy, FaultGuard
+     panic-freedom, Send/`!Sync`, builtin↔UDF mutual-exclusivity) CLEAN by both engine lanes.
+     **NET-NEW HIGH (Codex only — Opus rated that dim CLEAN): HIGH-1** array-PRODUCING function
+     args silently scalarized — `marshal_udf_args`'s `is_range_like` sniffed PLAN shape, so
+     `=MYUDF(SEQUENCE(2,2))` (an `ExprPlan::Function`) bypassed it → scalar eval → array→`#CALC!`
+     → Python got a 1×1 error grid not the 2×2. FIX: classify args by RUNTIME shape (a "grid" arg
+     = range ref / literal array / array-producing fn = Unified tier or nested UDF, evaluated via
+     `eval_at_cell_boundary`; plain scalars incl. ROW/COLUMN stay on scalar eval). Now passes the
+     full 2×2; array+scalar → VISIBLE `#VALUE!`. **HIGH-2** (Codex HIGH / Opus MED-latent):
+     standalone `WorkbookTransaction` committed UDFs with no worker (no calcgraph → permanent
+     `#CALC!`); latent (only `#[cfg(test)]` callers — live `commit_transaction` already threads via
+     batch→`with_runtime_no_oplog`). FIX: thread `udf_worker` into `WorkbookTransaction` via
+     `with_optional_oplog`. **LOW-1** `dispatch_udf` 1×1 `unwrap_or(Value::Blank)` → visible `#CALC!`.
+     **Documented:** `set_udf_worker` stale-`#CALC!` needs `recalc_all` not `recalc_dirty` (doc
+     fixed + test pinned; auto-dirty filed-fwd); `UDF_CALL_DEADLINE` per-call N×30s stall; error-args
+     forwarded to worker (intentional, Excel); registry mutual-exclusivity construction-dependent.
+     **Tests +5** (768/0 lib + 1/1 e2e real-python; clippy no new warnings; workspace clean incl.
+     bindings Send). Synthesis + 3 lanes `docs/audits/2026-05-29-6-4-3c-udf-eval-wiring-audit/`.
+     **6.4-3c FULLY SHIPPED (code + 3-way audit).**
+     **NEXT = 6.4-3d** — debugpy + trusted-workspace + napi/IDE worker-injection bridge (`set_udf_worker`
+     over napi; the IDE constructs a `ProcessWorker` from trusted-workspace config). 3-way audit.
+     **Filed-forward (for 6.4-3d/later):** CellDiagnostic sink (exc_type/message → exit test 7);
+     op-level UDF recalc budget + per-function deadlines (the N×30s stall); auto-dirty UDF cells on
+     `set_udf_worker` (6.4-0 `functions_used` index); richer list-of-grids args protocol
+     (mixed/multi-range/array+scalar). Then:
      6.4-3d debugpy + trusted-workspace + napi/IDE worker-injection bridge (3-way). Then **6.4-4
      exit-tests + closure megaudit** (5-way; contract §10.4 tests 1-8). Tracked cross-cutting (still
      pending): `Sheet::iter_effective_cells()` serializer fix.
