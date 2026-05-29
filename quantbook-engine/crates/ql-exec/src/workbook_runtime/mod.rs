@@ -36,11 +36,14 @@
 //! - FN4-03 — lazy IF/IFERROR (needs scalar.rs Function-branch refactor).
 //! - Cross-sheet formula references via NameTable resolution (Phase 4.6).
 
+use std::cell::RefCell;
+
 use ql_functions::format::FormatString;
 use ql_functions::FunctionRegistry;
 use ql_oplog::OpLog;
 use ql_storage::{FormatId, Workbook};
 use ql_types::{ColId, RowId, SheetId, MAX_COLUMN, MAX_ROW};
+use ql_udf::UdfWorker;
 
 use crate::plan_cache::{PlanCache, PlanCacheStats};
 
@@ -156,6 +159,15 @@ pub struct WorkbookRuntime<'a> {
     /// runtime's lifetime. A new `RegisterFormat` op merely inserts a
     /// new entry; no invalidation needed.
     format_cache: std::collections::HashMap<FormatId, FormatString>,
+    /// **6.4-3c (2026-05-29):** borrowed handle to the session's out-of-process
+    /// Python-UDF worker, or `None` when no worker is configured (every
+    /// non-session constructor, plus a session that never called
+    /// `set_udf_worker`). Threaded into the value-computing env at the
+    /// `set_formula` / recompute sites (`with_formula_cell_and_worker`) so a
+    /// `=MYUDF(A1)` dispatches to the worker; the binding-only `validate` path
+    /// leaves it unused. The session owns the `RefCell<Box<dyn UdfWorker + Send>>`; the
+    /// runtime only borrows it (single-threaded — `RefCell` is `!Sync`).
+    udf_worker: Option<&'a RefCell<Box<dyn UdfWorker + Send>>>,
 }
 
 impl<'a> WorkbookRuntime<'a> {
@@ -167,6 +179,7 @@ impl<'a> WorkbookRuntime<'a> {
             plan_cache: PlanCache::new(),
             format_cache: std::collections::HashMap::new(),
             graph: None,
+            udf_worker: None,
         }
     }
 
@@ -191,6 +204,7 @@ impl<'a> WorkbookRuntime<'a> {
             plan_cache: PlanCache::new(),
             format_cache: std::collections::HashMap::new(),
             graph: None,
+            udf_worker: None,
         }
     }
 
@@ -213,6 +227,7 @@ impl<'a> WorkbookRuntime<'a> {
             plan_cache: PlanCache::new(),
             format_cache: std::collections::HashMap::new(),
             graph: Some(graph),
+            udf_worker: None,
         }
     }
 
@@ -235,6 +250,7 @@ impl<'a> WorkbookRuntime<'a> {
             plan_cache: PlanCache::new(),
             format_cache: std::collections::HashMap::new(),
             graph: Some(graph),
+            udf_worker: None,
         }
     }
 
@@ -269,6 +285,10 @@ impl<'a> WorkbookRuntime<'a> {
         oplog: &'a mut OpLog,
         graph: &'a mut crate::CalcgraphSession,
         plan_cache: PlanCache,
+        // **6.4-3c (2026-05-29):** borrowed handle to the session's Python-UDF
+        // worker (`None` when none configured). Threaded into the eval env so
+        // `=MYUDF(A1)` dispatches; mirrors the `plan_cache` threading style.
+        udf_worker: Option<&'a RefCell<Box<dyn UdfWorker + Send>>>,
     ) -> Self {
         Self {
             workbook,
@@ -277,6 +297,7 @@ impl<'a> WorkbookRuntime<'a> {
             plan_cache,
             format_cache: std::collections::HashMap::new(),
             graph: Some(graph),
+            udf_worker,
         }
     }
 
@@ -305,6 +326,8 @@ impl<'a> WorkbookRuntime<'a> {
         registry: &'a FunctionRegistry,
         graph: &'a mut crate::CalcgraphSession,
         plan_cache: PlanCache,
+        // **6.4-3c (2026-05-29):** see `with_session_state`.
+        udf_worker: Option<&'a RefCell<Box<dyn UdfWorker + Send>>>,
     ) -> Self {
         Self {
             workbook,
@@ -313,6 +336,7 @@ impl<'a> WorkbookRuntime<'a> {
             plan_cache,
             format_cache: std::collections::HashMap::new(),
             graph: Some(graph),
+            udf_worker,
         }
     }
 

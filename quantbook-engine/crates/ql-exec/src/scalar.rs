@@ -37,6 +37,8 @@
 //!
 //! Unary `-x` negates; `+x` no-ops; `x%` divides by 100.
 
+use std::time::Duration;
+
 use ql_formula_syntax::Operator;
 use ql_functions::FunctionRegistry;
 use ql_types::{coercion, ArrayValue, ErrorValue, Value};
@@ -45,6 +47,15 @@ use crate::aggregate_cache::{AggregateCache, NoAggregateCache};
 use crate::env::CellEnv;
 use crate::eval_result::EvalResult;
 use crate::plan::ExprPlan;
+
+/// **6.4-3c (2026-05-29):** deadline bounding ONE blocking UDF call. The call
+/// runs inline on the synchronous recalc thread (Model A, design §1), so this is
+/// the maximum a single hung/slow UDF can stall recompute before
+/// [`ql_udf::UdfWorker`] kills the worker and the cell becomes `#TIMEOUT!`.
+/// v1 uses one session-wide constant; per-function / [`CancelPolicy`]-driven
+/// deadlines are deferred. Lives here (the sole consumer is [`dispatch_udf`])
+/// rather than on the session.
+const UDF_CALL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Evaluate an `ExprPlan` against `env` to produce a `Value`. Total function — never
 /// panics on Excel semantics (NaN, div-by-zero, etc.). Panics only on internal
@@ -460,7 +471,26 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                     );
                     rf(&ref_args, &ctx)
                 }
-                None => Value::Error(ErrorValue::Name),
+                // **6.4-3c (2026-05-29):** no built-in dispatch entry. Before
+                // returning `#NAME?`, check the UDF table: a name registered
+                // via `register_function` lives in `registry.udf_handles` (NOT
+                // in `fns` — `fns` is keyed `&'static str`, UDF names are
+                // runtime `String`s; see the design-doc Option-B note). Dispatch
+                // it to the Python worker. SCALAR context: an array return
+                // becomes `#CALC!` (mirrors the Unified arm above) — the
+                // cell-boundary entry point spills it instead.
+                None => match registry.udf_handle(name) {
+                    Some(handle) => match marshal_udf_args(args, env, registry, cache) {
+                        Ok(grid) => match dispatch_udf(handle.0, grid, env) {
+                            ql_functions::FunctionReturn::Scalar(v) => v,
+                            ql_functions::FunctionReturn::Array(_) => {
+                                Value::Error(ErrorValue::Calc)
+                            }
+                        },
+                        Err(ev) => Value::Error(ev),
+                    },
+                    None => Value::Error(ErrorValue::Name),
+                },
             }
         }
         // `AggregateNameRef` outside a Function context — the binder is
@@ -883,7 +913,159 @@ pub fn eval_at_cell_boundary<E: CellEnv>(
             }
             EvalResult::Scalar(eval_scalar_with_cache(plan, env, registry, cache))
         }
+        // **6.4-3c (2026-05-29):** top-level UDF call. A UDF can return an N×M
+        // grid (the wedge — a Python function producing a table); at the cell
+        // boundary that must surface as `EvalResult::Array` so the existing
+        // `write_spill` writeback (recompute.rs) spills it, NOT collapse to
+        // `#CALC!` (the ROW/COLUMN wrong-result lesson above). Mutually
+        // exclusive with the Unified / ROW-COLUMN guards by construction:
+        // `udf_handle` is `Some` ONLY for UDFs, and those guards' `lookup_any`
+        // returns `None` for a UDF (a name is never both a built-in and a UDF —
+        // `register_udf`'s Conflict check enforces it). Must precede `_`.
+        ExprPlan::Function { name, args } if registry.udf_handle(name).is_some() => {
+            let handle = registry
+                .udf_handle(name)
+                .expect("guard above matched udf_handle(name).is_some()");
+            match marshal_udf_args(args, env, registry, cache) {
+                Ok(grid) => match dispatch_udf(handle.0, grid, env) {
+                    ql_functions::FunctionReturn::Scalar(v) => EvalResult::Scalar(v),
+                    ql_functions::FunctionReturn::Array(a) => EvalResult::Array(a),
+                },
+                Err(ev) => EvalResult::Scalar(Value::Error(ev)),
+            }
+        }
         _ => EvalResult::Scalar(eval_scalar_with_cache(plan, env, registry, cache)),
+    }
+}
+
+/// **6.4-3c (2026-05-29):** marshal a UDF call's evaluated arguments into the
+/// SINGLE `ArrayValue` the wire protocol carries (`ql_udf::CallPayload.args`).
+/// The v1 shape rule (design §3 + the 6.4-3c plan; the worker receives one grid):
+///   - N scalar args → a 1×N row grid (a single scalar arg → 1×1).
+///   - exactly ONE range/array arg → that arg's full grid (its native shape).
+///   - mixed scalar+range, OR ≥2 range/array args → `Err(#VALUE!)` — these can't
+///     be expressed in one rectangular grid; a richer args protocol (list-of-
+///     grids) is deferred. The limitation is documented, not silent.
+///
+/// A `StructuredRef` whose `[@]` narrowing fails surfaces its error as `Err`.
+///
+/// Range-shaped args reach here per the UDF's registered `ArgContext`: an
+/// Aggregate-context UDF binds `=MYUDF(SomeRange)` to `AggregateNameRef`
+/// (session.rs `register_function_with_aggregate_arg_context_admits_named_range_args`).
+fn marshal_udf_args<E: CellEnv>(
+    args: &[ExprPlan],
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> Result<ArrayValue, ErrorValue> {
+    fn is_range_like(a: &ExprPlan) -> bool {
+        matches!(
+            a,
+            ExprPlan::AggregateNameRef { .. }
+                | ExprPlan::StructuredRef { .. }
+                | ExprPlan::RangeRef { .. }
+                | ExprPlan::Array(_)
+        )
+    }
+    let n_range = args.iter().filter(|a| is_range_like(a)).count();
+
+    // All-scalar (incl. the zero-arg case → a 1×0 row): pack a 1×N row.
+    if n_range == 0 {
+        let cells: Vec<Value> = args
+            .iter()
+            .map(|a| eval_scalar_with_cache(a, env, registry, cache))
+            .collect();
+        return Ok(ArrayValue::row(cells));
+    }
+
+    // Exactly one range/array arg, and it is the only arg → its native grid.
+    if n_range == 1 && args.len() == 1 {
+        return match &args[0] {
+            ExprPlan::AggregateNameRef { range, .. } | ExprPlan::RangeRef { range } => {
+                let (values, rows, cols) = env.read_range_with_shape(*range);
+                ArrayValue::new(rows as u32, cols as u32, values).map_err(|_| ErrorValue::Value)
+            }
+            ExprPlan::StructuredRef {
+                resolved,
+                is_this_row,
+                ..
+            } => {
+                let range = narrow_structured_ref(*resolved, *is_this_row, env)?;
+                let (values, rows, cols) = env.read_range_with_shape(range);
+                ArrayValue::new(rows as u32, cols as u32, values).map_err(|_| ErrorValue::Value)
+            }
+            ExprPlan::Array(rows) => {
+                let row_count = rows.len() as u32;
+                let col_count = rows.first().map(|r| r.len()).unwrap_or(0) as u32;
+                let mut cells: Vec<Value> =
+                    Vec::with_capacity((row_count as usize) * (col_count as usize));
+                for row in rows {
+                    for cell in row {
+                        cells.push(eval_scalar_with_cache(cell, env, registry, cache));
+                    }
+                }
+                ArrayValue::new(row_count, col_count, cells).map_err(|_| ErrorValue::Value)
+            }
+            // `is_range_like` matched but no arm handled it — an upstream
+            // ExprPlan-shape change. Loud per No-Fallbacks.
+            other => unreachable!("marshal_udf_args: is_range_like matched {other:?} unhandled"),
+        };
+    }
+
+    // Mixed scalar+range, or ≥2 range/array args: deferred v1 limitation.
+    Err(ErrorValue::Value)
+}
+
+/// **6.4-3c (2026-05-29):** dispatch ONE UDF call to the session-injected
+/// out-of-process Python worker (reached via `env.udf_worker()`), mapping the
+/// result / [`ql_udf::UdfError`] to a [`ql_functions::FunctionReturn`].
+///
+/// **Panic-free by contract:** every `UdfError` maps to a cell error value, so a
+/// UDF failure can NEVER trip the recompute `FaultGuard` that seals the session
+/// (6.1C M3 / design §5 — worker death is leaf I/O, a cell error, not an engine
+/// fault). A registered UDF with NO worker configured is a deterministic
+/// `#CALC!` (No-Fallbacks-honest: a visible error, never a silent no-op or panic).
+///
+/// The `RefCell` borrow is taken only here, AFTER `marshal_udf_args` finished
+/// evaluating every arg — so a nested `=MYUDF(MYUDF2(A1))` released its inner
+/// borrow before this outer one. The borrow is held across the single blocking
+/// IPC round-trip, which never re-enters eval (the worker is a leaf).
+fn dispatch_udf<E: CellEnv>(
+    handle: u64,
+    args_grid: ArrayValue,
+    env: &E,
+) -> ql_functions::FunctionReturn {
+    use ql_functions::FunctionReturn;
+    let Some(worker_cell) = env.udf_worker() else {
+        // Registered, but no worker wired to this session → can't compute.
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::Calc));
+    };
+    let mut worker = worker_cell.borrow_mut();
+    match worker.call(handle, &args_grid, UDF_CALL_DEADLINE) {
+        Ok(grid) => {
+            if grid.rows() == 1 && grid.cols() == 1 {
+                // 1×1 result → a scalar cell value.
+                FunctionReturn::Scalar(grid.get(0, 0).cloned().unwrap_or(Value::Blank))
+            } else {
+                // N×M (incl. degenerate) → an array; the cell-boundary caller
+                // spills it, the scalar-context caller maps it to `#CALC!`.
+                FunctionReturn::Array(grid)
+            }
+        }
+        Err(e) => FunctionReturn::Scalar(Value::Error(map_udf_error(&e))),
+    }
+}
+
+/// **6.4-3c (2026-05-29):** map a [`ql_udf::UdfError`] to a deterministic cell
+/// error value. v1 is coarse: only `Timeout` → `#TIMEOUT!`; everything else
+/// (`Raised`/`Cancelled`/`Handshake`/`Protocol`/`WorkerDied`/`Codec`) → `#CALC!`.
+/// The structured `CellDiagnostic` (Python `exc_type`/`message`/`traceback`) that
+/// distinguishes these — exit test 7's real target — is deferred to the
+/// diagnostic-sink follow-up; the cell error itself is already visible here.
+fn map_udf_error(e: &ql_udf::UdfError) -> ErrorValue {
+    match e {
+        ql_udf::UdfError::Timeout(_) => ErrorValue::Timeout,
+        _ => ErrorValue::Calc,
     }
 }
 

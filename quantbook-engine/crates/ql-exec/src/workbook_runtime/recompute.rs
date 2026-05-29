@@ -852,9 +852,13 @@ impl<'a> WorkbookRuntime<'a> {
         let result: crate::eval_result::EvalResult = {
             // **W5-117 (Phase 4.8.G.2):** carry recomputed cell for
             // structured-ref `[@Col]` row narrowing.
-            let env = WorkbookEnv::with_formula_cell(
+            // **6.4-3c (2026-05-29):** carry the session's UDF worker so a
+            // recomputed `=MYUDF(A1)` dispatches to the Python worker (and an
+            // array return spills via the cell-boundary path below).
+            let env = WorkbookEnv::with_formula_cell_and_worker(
                 self.workbook,
                 ql_types::Address::new(sheet, row, col),
+                self.udf_worker,
             );
             crate::scalar::eval_at_cell_boundary(plan.as_ref(), &env, self.registry, agg_cache)
         };

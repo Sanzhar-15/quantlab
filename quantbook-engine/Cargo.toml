@@ -18,6 +18,9 @@ default-members = [
     "crates/ql-functions",
     "crates/ql-calcgraph",
     "crates/ql-exec",
+    # Phase 6.4-3c (2026-05-29): ql-udf joins the active set now that ql-exec
+    # depends on it for Python-UDF dispatch (was member-only through 6.4-3a/b).
+    "crates/ql-udf",
     "crates/ql-bench",
     "crates/ql-profile",
     "crates/ql-oplog",

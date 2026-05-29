@@ -1,7 +1,28 @@
 # Phase 6.4-3 — Python worker + Arrow exchange + debugpy · DESIGN
 
-**Status:** ✅ DESIGNED 2026-05-28. Ready to implement in a fresh session (multi-cycle — the
-6.4 entry plan estimates 2-3 sessions for this sub-increment alone).
+> **6.4-3c IMPLEMENTATION NOTE (2026-05-29) — two §10 open questions resolved AGAINST this doc's
+> first guess; do not let an audit revert them:**
+> - **§4 steps 1-2 / §10 Q?: dispatch is Option B, NOT a `RegisteredFn::Udf` variant in `fns`.**
+>   `FunctionRegistry::fns` is keyed `&'static str`; UDF names are runtime `String`s, so inserting
+>   a `RegisteredFn::Udf` into `fns` would require leaking each name (`Box::leak`, unbounded under
+>   register/unregister churn) or retyping the map (~130 builtin sites). 6.4-3c instead dispatches
+>   UDFs from the `scalar.rs` `None` arm via `registry.udf_handle(name)` (the 6.4-2 table) +
+>   a mandatory parallel guard in `eval_at_cell_boundary` for array spill. `register_udf` stays a
+>   **2-way** atomic (metadata + handle) — no third dispatch table to keep in sync.
+> - **§10 Q5: the worker lives on `CellEnv` (interior mutability), NOT on `EvalContext`.**
+>   `EvalContext` is `Copy`; a `&mut`-needed worker cannot hang there. The eval stack threads
+>   `&E: CellEnv` (shared), so `CellEnv::udf_worker() -> Option<&RefCell<Box<dyn UdfWorker + Send>>>`
+>   bridges to `UdfWorker::call(&mut self)`. The session owns the `RefCell`; `WorkbookRuntime`
+>   borrows it through the two `with_session_state*` constructors. `+ Send` keeps
+>   `WorkbookSession: Send` (asserted by the napi bindings).
+> - **v1 scope cuts (user-confirmed 2026-05-29):** (1) arg marshalling packs N scalars → 1×N row,
+>   a single range/array arg → its grid, mixed/≥2-range → `#VALUE!` (one-grid wire limit; a richer
+>   list-of-grids protocol is deferred); (2) failures map to deterministic cell error VALUES now
+>   (`Timeout`→`#TIMEOUT!`, all else→`#CALC!`) — the structured `CellDiagnostic` sink (exit test 7's
+>   target) is a focused follow-up; (3) one session-wide `UDF_CALL_DEADLINE = 30s`.
+
+**Status:** ✅ DESIGNED 2026-05-28. **6.4-3a/b/c SHIPPED** (6.4-3c eval wiring 2026-05-29 — see the
+implementation note above). Remaining: 6.4-3d (debugpy + trusted-workspace + napi/IDE bridge).
 **Predecessor:** 6.4-2 trait wiring + napi DTO surface FULLY SHIPPED (engine HEAD `a9992a32e67`).
 The dispatch substrate is in place: `FunctionRegistry::udf_handles: HashMap<String,
 FunctionImplHandle>` + `udf_handle(name)` reader (6.4-2 cycle 1), `register_function` /

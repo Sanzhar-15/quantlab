@@ -12,11 +12,14 @@
 //! `ql-storage` directly and the SIMD path (W4-2) doesn't go through this trait at all —
 //! it reads Arrow chunks via `ColumnStore::iter_chunks` for batch processing.
 
+use std::cell::RefCell;
+
 use ql_functions::{ReferenceQuery, NO_OP_REFERENCE_QUERY};
 use ql_storage::{NameTable, NamedTarget};
 use ql_types::{
     ColId, ErrorValue, EvalContext, Range, RowId, SheetId, Value, DEFAULT_EVAL_CONTEXT,
 };
+use ql_udf::UdfWorker;
 
 use crate::plan::{NameLookup, ResolvedName};
 
@@ -97,6 +100,29 @@ pub trait CellEnv {
     fn reference_query(&self) -> &dyn ReferenceQuery {
         &NO_OP_REFERENCE_QUERY
     }
+
+    /// **6.4-3c (2026-05-29):** the out-of-process Python-UDF worker, if one
+    /// is configured for this eval. The `RegisteredFn`-dispatch site in
+    /// `scalar.rs` reaches the worker through this accessor and calls it from
+    /// the UDF arm (a `=MYUDF(A1)` whose name resolves via
+    /// `registry.udf_handle`).
+    ///
+    /// Returns a `&RefCell<Box<dyn UdfWorker + Send>>` rather than `&mut` because the
+    /// whole eval stack threads `&self` (shared) env references — interior
+    /// mutability bridges that to `UdfWorker::call`'s `&mut self`. The
+    /// `RefCell` borrow is taken only AFTER all args are evaluated (so a nested
+    /// `=MYUDF(MYUDF2(A1))` releases the inner borrow before the outer one) and
+    /// is held across the single blocking IPC round-trip, which never re-enters
+    /// eval (the worker is a leaf). Single-threaded: `RefCell` is `!Sync`, and
+    /// the SIMD/rayon aggregate path bypasses `CellEnv` entirely.
+    ///
+    /// Default `None`: tests, `MapEnv`, benches, and any workbook opened
+    /// without a worker. A registered UDF with no worker is a deterministic
+    /// `#CALC!` at the dispatch site (No-Fallbacks — a visible error, never a
+    /// panic), NOT a silent no-op.
+    fn udf_worker(&self) -> Option<&RefCell<Box<dyn UdfWorker + Send>>> {
+        None
+    }
 }
 
 /// `ql-storage::Workbook`-backed implementation. Wraps a Workbook reference; reads dispatch
@@ -124,6 +150,12 @@ pub struct WorkbookEnv<'w> {
     /// range). `None` for paths without cell context (legacy callers,
     /// tests).
     formula_cell: Option<ql_types::Address>,
+    /// **6.4-3c (2026-05-29):** borrowed handle to the session's Python-UDF
+    /// worker, threaded in by the value-computing recompute / set_formula env
+    /// sites (`workbook_runtime`). `None` for the binding-only / validate paths
+    /// and for every legacy caller (`new` / `with_formula_cell`). Surfaced to
+    /// the dispatch site via the `CellEnv::udf_worker` override below.
+    udf_worker: Option<&'w RefCell<Box<dyn UdfWorker + Send>>>,
 }
 
 impl<'w> WorkbookEnv<'w> {
@@ -144,6 +176,7 @@ impl<'w> WorkbookEnv<'w> {
             workbook,
             eval_ctx,
             formula_cell: None,
+            udf_worker: None,
         }
     }
 
@@ -154,6 +187,24 @@ impl<'w> WorkbookEnv<'w> {
     pub fn with_formula_cell(workbook: &'w ql_storage::Workbook, cell: ql_types::Address) -> Self {
         let mut env = Self::new(workbook);
         env.formula_cell = Some(cell);
+        env
+    }
+
+    /// **6.4-3c (2026-05-29):** WorkbookEnv carrying BOTH the formula cell
+    /// (for structured-ref narrowing) AND the session's Python-UDF worker (for
+    /// `RegisteredFn::Udf` dispatch). Used by the value-computing recompute /
+    /// set_formula env sites in `workbook_runtime` so a `=MYUDF(A1)` actually
+    /// calls the worker. `worker` is `None` when the session has no worker
+    /// configured — a registered UDF then evaluates to `#CALC!` at the dispatch
+    /// site (No-Fallbacks-honest), never a panic.
+    pub fn with_formula_cell_and_worker(
+        workbook: &'w ql_storage::Workbook,
+        cell: ql_types::Address,
+        worker: Option<&'w RefCell<Box<dyn UdfWorker + Send>>>,
+    ) -> Self {
+        let mut env = Self::new(workbook);
+        env.formula_cell = Some(cell);
+        env.udf_worker = worker;
         env
     }
 
@@ -297,6 +348,13 @@ impl<'w> CellEnv for WorkbookEnv<'w> {
     /// `&Workbook::formula_at`), so we return `self`.
     fn reference_query(&self) -> &dyn ReferenceQuery {
         self
+    }
+
+    /// **6.4-3c (2026-05-29):** surface the session-injected Python-UDF worker
+    /// to the dispatch site. `Some` only when this env was built via
+    /// `with_formula_cell_and_worker` with a configured worker.
+    fn udf_worker(&self) -> Option<&RefCell<Box<dyn UdfWorker + Send>>> {
+        self.udf_worker
     }
 }
 
