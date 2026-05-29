@@ -3455,4 +3455,6 @@ mod tests {
             wb.read(ql_types::Address::new(s0, 0, 0)),
             Value::Error(ErrorValue::Name),
             "cell must show #NAME? for unknown-sheet bind error"
-       
+        );
+    }
+}
