@@ -1,0 +1,568 @@
+commit 1e182a2fad3ce67d0b5d75bb033823cc0224bb96
+Author: Sanzhar <sanzhar@Sanzhars-MacBook-Pro.local>
+Date:   Fri May 29 13:35:36 2026 +0100
+
+    feat(quantbook): 6.4-3d Step 5 (engine) -- pollEvents napi binding + worker no-stderr robustness
+    
+    Engine prerequisites for the IDE side of 6.4-3d (Python-UDF worker injection).
+    
+    - napi `Session.pollEvents(cursor)` + faithful Event/Diagnostic/Severity/
+      OperationState/CellAddr/EventPage DTOs. Every `Event` variant is modeled
+      (No-Fallbacks: none silently dropped). This is how `Event::CellDiagnostic`
+      (the 6.4-3d Step G no-worker/raised/timeout/died sink) reaches the IDE so it
+      can render WHY a cell is #CALC!. Cursor BigInt->u64 is fail-loud
+      (negative/lossy -> [bad_argument]), mirroring registerFunction's implHandle.
+      poll_events has no lifecycle gate (pure ring read) -- documented honestly.
+    
+    - worker.py main(): crash-proof startup when the host gives the child no usable
+      stderr. An embedded host (node/electron -- exactly the IDE setUdfWorker path)
+      leaves sys.stderr=None; the prior `os.dup2(sys.stderr.fileno(), 1)` raised
+      AttributeError on None.fileno(), the worker exited before HELLO_ACK, and every
+      UDF call failed with #CALC!. Now: reserve the protocol channel via the raw
+      fd 1, redirect fd 1 to real stderr when usable else os.devnull, never assume
+      sys.stdout/stderr are non-None. The 6.4-3b audit only ran the worker under
+      cargo (fd2 always valid), so this was never exercised.
+    
+    - clippy: rewrote the pre-existing handshakeTimeoutMs check to
+      `!(0.0..=MAX).contains(&ms)` (rust 1.95 manual_range_contains now fires under
+      deny(clippy::all); behavior-identical).
+    
+    - new node smoke crates/ql-bindings-node/tests/smoke_udf_pollevents.mjs:
+      pollEvents surfaces the udf_no_worker cell_diagnostic; setUdfWorker spawn-fail
+      -> [worker_spawn_failed]; real-python =MYUDF(A1) -> 42 (loud-skip if no pyarrow).
+    
+    Verified: cargo check --workspace clean; clippy -p ql-bindings-node no new
+    warnings; release cdylib (--features test-fixtures) builds; ql-udf process_smoke
+    2/2 + ql-exec udf_e2e 1/1 (real python, new worker main()); python self_test
+    PASS; node smoke all assertions pass.
+    
+    Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+diff --git a/quantbook-engine/crates/ql-bindings-node/src/lib.rs b/quantbook-engine/crates/ql-bindings-node/src/lib.rs
+index d080bcaa2f0..7143ff07e28 100644
+--- a/quantbook-engine/crates/ql-bindings-node/src/lib.rs
++++ b/quantbook-engine/crates/ql-bindings-node/src/lib.rs
+@@ -4358,6 +4358,205 @@ pub struct PythonWorkerConfigJson {
+     pub handshake_timeout_ms: Option<f64>,
+ }
+ 
++// ============================================================================
++// 6.4-3d Step 5 (2026-05-29) — event-stream DTOs (`pollEvents`).
++//
++// The engine's `Event` ring (contract §9) is surfaced to JS so `CellDiagnostic`
++// (the UDF no-worker / raised / timeout / died sink shipped in 6.4-3d Steps 1-3)
++// reaches the IDE — without it the IDE can render `#CALC!` but not WHY. Every
++// `Event` variant is modeled faithfully (No-Fallbacks: no variant is silently
++// dropped). napi-rs camelCases the object field names (e.g. `next_cursor` →
++// `nextCursor`, `structure_kind` → `structureKind`).
++// ============================================================================
++
++/// JS-facing cell address (mirrors [`ql_session::CellAddr`]); `sheet` widened
++/// u16→u32 (lossless), `row`/`col` are the 0-indexed u32 ids.
++#[napi(object)]
++pub struct CellAddrJson {
++    pub sheet: u32,
++    pub row: u32,
++    pub col: u32,
++}
++
++/// JS-facing per-cell diagnostic (mirrors [`ql_session::Diagnostic`]).
++/// `severity` is `"info"` | `"warning"` | `"error"`; `addr` is absent for a
++/// workbook-level diagnostic.
++#[napi(object)]
++pub struct DiagnosticJson {
++    pub addr: Option<CellAddrJson>,
++    pub severity: String,
++    pub code: String,
++    pub message: String,
++}
++
++/// JS-facing operation state (mirrors [`ql_session::OperationState`]).
++/// `state` is `"running"` | `"completed"` | `"canceled"` | `"failed"`; `error`
++/// carries the `[code] message` display ONLY when `state == "failed"`.
++#[napi(object)]
++pub struct OperationStateJson {
++    pub state: String,
++    pub error: Option<String>,
++}
++
++/// JS-facing event (mirrors [`ql_session::session::Event`]). A tagged union: the
++/// `kind` discriminator selects which optional payload fields are populated —
++/// the same shape discipline as [`CellValueJson`]. Variant → fields:
++/// - `"recalc_progress"`: `op`, `done`, `total`
++/// - `"cell_diagnostic"`: `diagnostic`
++/// - `"operation_completed"`: `op`, `state`
++/// - `"provenance"`: `addr`, `source`
++/// - `"structure_changed"`: `structureKind`, `target`
++/// - `"full_resync_required"`: (no payload — the consumer must reseed via
++///   `snapshot()`, contract §9)
++#[napi(object)]
++pub struct EventJson {
++    pub kind: String,
++    /// `recalc_progress` / `operation_completed`: the operation id.
++    pub op: Option<BigInt>,
++    /// `recalc_progress`: nodes done so far.
++    pub done: Option<BigInt>,
++    /// `recalc_progress`: total nodes.
++    pub total: Option<BigInt>,
++    /// `cell_diagnostic`: the diagnostic.
++    pub diagnostic: Option<DiagnosticJson>,
++    /// `operation_completed`: the terminal state.
++    pub state: Option<OperationStateJson>,
++    /// `provenance`: the cell the provenance applies to.
++    pub addr: Option<CellAddrJson>,
++    /// `provenance`: the source descriptor.
++    pub source: Option<String>,
++    /// `structure_changed`: the structure kind (`"sheet"`/`"table"`/`"name"`).
++    /// (`kind` is taken by the discriminator, hence `structureKind` in JS.)
++    pub structure_kind: Option<String>,
++    /// `structure_changed`: the affected target id/name.
++    pub target: Option<String>,
++}
++
++/// JS-facing page of events read from a cursor (mirrors
++/// [`ql_session::session::EventPage`]). Reading does NOT drain the ring; pass
++/// `nextCursor` to the next `pollEvents` call. `dropped == true` pairs with a
++/// `full_resync_required` event — the consumer fell behind the retention
++/// horizon and MUST reseed via `snapshot()` (v1 uses an unbounded ring, so this
++/// never fires yet).
++#[napi(object)]
++pub struct EventPageJson {
++    pub events: Vec<EventJson>,
++    pub next_cursor: BigInt,
++    pub dropped: bool,
++}
++
++fn severity_to_str(s: ql_session::Severity) -> &'static str {
++    use ql_session::Severity;
++    match s {
++        Severity::Info => "info",
++        Severity::Warning => "warning",
++        Severity::Error => "error",
++    }
++}
++
++fn cell_addr_json_from_session(a: ql_session::CellAddr) -> CellAddrJson {
++    CellAddrJson {
++        sheet: u32::from(a.sheet),
++        row: a.row,
++        col: a.col,
++    }
++}
++
++fn diagnostic_json_from_session(d: ql_session::Diagnostic) -> DiagnosticJson {
++    DiagnosticJson {
++        addr: d.addr.map(cell_addr_json_from_session),
++        severity: severity_to_str(d.severity).to_string(),
++        code: d.code,
++        message: d.message,
++    }
++}
++
++/// Map an [`ql_session::OperationState`] to its JS DTO. The `Failed` error is
++/// rendered via the `[code] message` `Display` (the same wire convention the
++/// napi error helpers use) so the IDE can `parseQuantbookError` it.
++fn operation_state_json_from_session(s: ql_session::OperationState) -> OperationStateJson {
++    use ql_session::OperationState;
++    match s {
++        OperationState::Running => OperationStateJson {
++            state: "running".to_string(),
++            error: None,
++        },
++        OperationState::Completed => OperationStateJson {
++            state: "completed".to_string(),
++            error: None,
++        },
++        OperationState::Canceled => OperationStateJson {
++            state: "canceled".to_string(),
++            error: None,
++        },
++        OperationState::Failed { error } => OperationStateJson {
++            state: "failed".to_string(),
++            error: Some(error.to_string()),
++        },
++    }
++}
++
++fn event_json_from_session(e: ql_session::session::Event) -> EventJson {
++    use ql_session::session::Event;
++    // All-None base; each arm fills only its own variant's payload fields.
++    let base = EventJson {
++        kind: String::new(),
++        op: None,
++        done: None,
++        total: None,
++        diagnostic: None,
++        state: None,
++        addr: None,
++        source: None,
++        structure_kind: None,
++        target: None,
++    };
++    match e {
++        Event::RecalcProgress { op, done, total } => EventJson {
++            kind: "recalc_progress".to_string(),
++            op: Some(BigInt::from(op.0)),
++            done: Some(BigInt::from(done)),
++            total: Some(BigInt::from(total)),
++            ..base
++        },
++        Event::CellDiagnostic { diagnostic } => EventJson {
++            kind: "cell_diagnostic".to_string(),
++            diagnostic: Some(diagnostic_json_from_session(diagnostic)),
++            ..base
++        },
++        Event::OperationCompleted { op, state } => EventJson {
++            kind: "operation_completed".to_string(),
++            op: Some(BigInt::from(op.0)),
++            state: Some(operation_state_json_from_session(state)),
++            ..base
++        },
++        Event::Provenance { addr, source } => EventJson {
++            kind: "provenance".to_string(),
++            addr: Some(cell_addr_json_from_session(addr)),
++            source: Some(source),
++            ..base
++        },
++        Event::StructureChanged { kind, target } => EventJson {
++            kind: "structure_changed".to_string(),
++            structure_kind: Some(kind),
++            target: Some(target),
++            ..base
++        },
++        Event::FullResyncRequired => EventJson {
++            kind: "full_resync_required".to_string(),
++            ..base
++        },
++    }
++}
++
++fn event_page_json_from_session(p: ql_session::session::EventPage) -> EventPageJson {
++    EventPageJson {
++        events: p.events.into_iter().map(event_json_from_session).collect(),
++        next_cursor: BigInt::from(p.next_cursor.0),
++        dropped: p.dropped,
++    }
++}
++
+ /// **6.4-3d (2026-05-29):** map a worker spawn/handshake [`ql_udf::UdfError`] to
+ /// a napi `[code] message` error. Only the startup variants are reachable from
+ /// `ProcessWorker::ensure_started` (a missing interpreter / worker death during
+@@ -4950,10 +5149,15 @@ impl Session {
+         if let Some(ms) = config.handshake_timeout_ms {
+             // **6.4-3d audit-fix (LOW):** require a non-negative finite value AND
+             // cap it (10 min) so a huge `f64` cannot saturate `as u64` into an
+-            // effectively-unbounded handshake wait. `!is_finite()` also rejects
+-            // NaN. Fractional ms truncate (harmless).
++            // effectively-unbounded handshake wait. The inclusive-range
++            // `!contains` rejects NaN/Inf (neither is `>= 0.0`) as well as a
++            // negative or above-cap value in one expression. Fractional ms
++            // truncate (harmless).
++            // (6.4-3d Step 5: rewritten from the `ms < 0.0 || ms > MAX` form to
++            // satisfy clippy `manual_range_contains` under rust 1.95's stricter
++            // `deny(clippy::all)`; behavior-identical.)
+             const MAX_HANDSHAKE_MS: f64 = 600_000.0;
+-            if !ms.is_finite() || ms < 0.0 || ms > MAX_HANDSHAKE_MS {
++            if !(0.0..=MAX_HANDSHAKE_MS).contains(&ms) {
+                 return Err(bad_argument_error(format!(
+                     "setUdfWorker: handshakeTimeoutMs must be a finite number in [0, {MAX_HANDSHAKE_MS}] ms"
+                 )));
+@@ -4977,6 +5181,47 @@ impl Session {
+             .map_err(engine_error_to_napi)?;
+         Ok(())
+     }
++
++    /// **6.4-3d Step 5 (2026-05-29):** drain a page of structured events from the
++    /// session's event ring (contract §9), starting at `cursor` (pass `0n` to read
++    /// from the start, then the returned `nextCursor` on each subsequent call).
++    /// Reading does NOT drain the ring, so independent pollers never starve each
++    /// other. The IDE consumes this to surface `cell_diagnostic` events (the UDF
++    /// no-worker / raised / timeout / died sink from 6.4-3d Steps 1-3) as cell
++    /// tooltips, plus `recalc_progress` / `operation_completed` for long ops.
++    ///
++    /// If `dropped == true` (paired with a `full_resync_required` event) the
++    /// consumer fell behind the retention horizon and MUST reseed via `snapshot()`
++    /// (v1 uses an unbounded ring, so this never fires yet).
++    ///
++    /// **Lifecycle:** unlike the mutators, the engine `poll_events` does NOT gate
++    /// on lifecycle (it is a pure read of the buffered ring) — polling a Closed
++    /// session returns whatever was already buffered, never `[invalid_state]`.
++    ///
++    /// **Errors:** `[bad_argument]` if `cursor` is negative or exceeds `u64::MAX`.
++    #[napi(js_name = "pollEvents")]
++    pub fn poll_events(&self, cursor: BigInt) -> Result<EventPageJson> {
++        // BigInt → u64, mirroring the `registerFunction` implHandle discipline:
++        // reject a negative (sign bit) or lossy (> u64::MAX) cursor loud per
++        // No-Fallbacks rather than silently truncating to a wrong ring position.
++        let (sign_bit, raw, lossless) = cursor.get_u64();
++        if sign_bit {
++            return Err(bad_argument_error(
++                "pollEvents: cursor must be a non-negative BigInt".into(),
++            ));
++        }
++        if !lossless {
++            return Err(bad_argument_error(
++                "pollEvents: cursor exceeds u64::MAX (lossy conversion rejected)".into(),
++            ));
++        }
++        let page = self
++            .inner
++            .lock()
++            .poll_events(ql_session::session::EventCursor(raw))
++            .map_err(engine_error_to_napi)?;
++        Ok(event_page_json_from_session(page))
++    }
+ }
+ 
+ // **Phase 6.1B inc.2d (2026-05-27) — Send + Sync positive proof (audit Rule 4).**
+diff --git a/quantbook-engine/crates/ql-bindings-node/tests/smoke_udf_pollevents.mjs b/quantbook-engine/crates/ql-bindings-node/tests/smoke_udf_pollevents.mjs
+new file mode 100644
+index 00000000000..1944be17a87
+--- /dev/null
++++ b/quantbook-engine/crates/ql-bindings-node/tests/smoke_udf_pollevents.mjs
+@@ -0,0 +1,164 @@
++// Phase 6.4-3d Step 5 — engine-side cdylib smoke for `pollEvents` + `setUdfWorker`.
++//
++// Proves over the REAL napi boundary (not just compilation):
++//   1. `pollEvents(cursor)` surfaces `Event::CellDiagnostic` as a typed JS DTO —
++//      a UDF cell with NO worker computes `#CALC!` AND emits a
++//      `cell_diagnostic` event with code `udf_no_worker` (the 6.4-3d Step G
++//      sink, the reason the IDE can render WHY a cell is `#CALC!`).
++//   2. `setUdfWorker` fails loud with `[worker_spawn_failed]` on a bad
++//      interpreter, and (when a `python3`/`python` with `pyarrow` is present)
++//      succeeds so that `recalcAll` recomputes `=MYUDF(A1)` to the real value.
++//
++// Run (from the engine workspace root, via the Mac bridge):
++//   cargo build -p ql-bindings-node --release --features test-fixtures
++//   node crates/ql-bindings-node/tests/smoke_udf_pollevents.mjs
++//
++// Override the cdylib path with QL_NODE_CDYLIB=/abs/path/to/lib....{dylib,so}.
++
++import assert from "node:assert/strict";
++import { execFileSync } from "node:child_process";
++import { existsSync } from "node:fs";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++
++const here = path.dirname(fileURLToPath(import.meta.url));
++// crates/ql-bindings-node/tests → ../../.. = the cargo workspace root.
++const workspaceRoot = path.resolve(here, "../../..");
++
++function resolveCdylib() {
++  if (process.env.QL_NODE_CDYLIB) {
++    const p = process.env.QL_NODE_CDYLIB;
++    if (!existsSync(p)) {
++      throw new Error(`QL_NODE_CDYLIB does not exist: ${p}`);
++    }
++    return p;
++  }
++  const ext = process.platform === "darwin" ? "dylib" : "so";
++  const base = `libql_bindings_node.${ext}`;
++  const candidates = [
++    path.join(workspaceRoot, "target", "release", base),
++    path.join(workspaceRoot, "target", "debug", base),
++  ];
++  const found = candidates.find(existsSync);
++  if (!found) {
++    throw new Error(
++      `built cdylib not found. Run \`cargo build -p ql-bindings-node --release\` first.\n` +
++        `Looked in:\n  ${candidates.join("\n  ")}`,
++    );
++  }
++  return found;
++}
++
++function loadNative(cdylibPath) {
++  const mod = { exports: {} };
++  process.dlopen(mod, cdylibPath);
++  return mod.exports;
++}
++
++// Find `python3`/`python` that can `import pyarrow`, or null (loud skip).
++function pythonWithPyarrow() {
++  for (const py of ["python3", "python"]) {
++    try {
++      execFileSync(py, ["-c", "import pyarrow"], { stdio: "ignore" });
++      return py;
++    } catch {
++      // try the next candidate
++    }
++  }
++  return null;
++}
++
++const cdylibPath = resolveCdylib();
++console.log(`[smoke] loading cdylib: ${cdylibPath}`);
++const native = loadNative(cdylibPath);
++assert.ok(native.Session, "the native module must export the `Session` class");
++const { Session } = native;
++
++// MYUDF: variadic / aggregate / volatile (mirrors udf_e2e.rs `udf_meta`).
++const myUdfMeta = {
++  canonicalName: "MYUDF",
++  aliases: [],
++  arity: { kind: "variadic" },
++  volatility: "volatile",
++  determinism: false,
++  depShape: "value_deps",
++  batchShape: "array_batch",
++  argPolicy: "strict",
++  cancellation: "worker_kill",
++  argContext: "aggregate",
++  provenanceTags: ["python"],
++};
++
++const s = new Session();
++const sheetId = s.addSheet("S", 16384);
++
++// Register MYUDF under handle 7 (`_smoke_udfs._double`).
++s.registerFunction(myUdfMeta, 7n);
++
++// A1 = 21, B1 = MYUDF(A1). With NO worker injected, B1 → #CALC! + diagnostic.
++s.setValue(sheetId, 0, 0, { kind: "number", number: 21 });
++s.setFormula(sheetId, 0, 1, "MYUDF(A1)");
++s.recalcAll();
++
++const b1NoWorker = s.cell(sheetId, 0, 1);
++assert.ok(b1NoWorker && b1NoWorker.value, "B1 must exist after recalc");
++assert.equal(b1NoWorker.value.kind, "error", "B1 with no worker is an error value");
++console.log(`[smoke] no-worker B1 value = ${JSON.stringify(b1NoWorker.value)}`);
++
++// --- pollEvents surfaces the CellDiagnostic --------------------------------
++const page = s.pollEvents(0n);
++assert.ok(Array.isArray(page.events), "pollEvents returns an events array");
++assert.equal(typeof page.nextCursor, "bigint", "nextCursor is a BigInt");
++assert.equal(page.dropped, false, "v1 unbounded ring never drops");
++const diags = page.events.filter((e) => e.kind === "cell_diagnostic");
++assert.ok(diags.length >= 1, "at least one cell_diagnostic event after a no-worker UDF recalc");
++const d = diags.find((e) => e.diagnostic && e.diagnostic.code === "udf_no_worker");
++assert.ok(d, `expected a udf_no_worker diagnostic; got ${JSON.stringify(diags)}`);
++assert.equal(d.diagnostic.severity, "error", "diagnostic severity is 'error'");
++assert.ok(d.diagnostic.addr, "diagnostic carries a cell addr");
++assert.equal(d.diagnostic.addr.row, 0, "diagnostic addr.row");
++assert.equal(d.diagnostic.addr.col, 1, "diagnostic addr.col (B1)");
++assert.equal(typeof d.diagnostic.message, "string", "diagnostic message is a string");
++console.log(`[smoke] pollEvents cell_diagnostic = ${JSON.stringify(d.diagnostic)}`);
++
++// pollEvents from nextCursor returns no new events (ring did not advance).
++const page2 = s.pollEvents(page.nextCursor);
++assert.equal(page2.events.length, 0, "polling from nextCursor yields no new events");
++
++// Negative / lossy cursor is rejected loud ([bad_argument]).
++assert.throws(() => s.pollEvents(-1n), /\[bad_argument\]/, "negative cursor rejected");
++
++// --- setUdfWorker: spawn-fail fails loud -----------------------------------
++assert.throws(
++  () => s.setUdfWorker({ python: "/nonexistent/definitely/not/a/python" }),
++  /\[worker_spawn_failed\]/,
++  "a bad interpreter surfaces [worker_spawn_failed]",
++);
++console.log("[smoke] setUdfWorker spawn-fail -> [worker_spawn_failed] OK");
++
++// --- setUdfWorker: real-python success (loud-skip if no pyarrow) ------------
++const py = pythonWithPyarrow();
++if (!py) {
++  console.warn("[smoke] SKIP real-python half: no python3/python with pyarrow on PATH");
++} else {
++  const pythonpath = path.join(workspaceRoot, "crates", "quantbook-py", "python");
++  s.setUdfWorker({
++    python: py,
++    pythonpath: [pythonpath],
++    udfModule: "quantbook._smoke_udfs",
++    // Eager handshake spawns + imports pyarrow up-front; a cold import on the
++    // system interpreter can exceed the 5s default. Give it generous headroom
++    // (the Rust e2e spawns lazily under the 30s call deadline, never the 5s).
++    handshakeTimeoutMs: 30000,
++  });
++  // Existing #CALC! cell needs a FULL recalc to pick up the worker (recalcDirty
++  // would not — the cell is not dirty). Mirrors the engine docstring.
++  s.recalcAll();
++  const b1 = s.cell(sheetId, 0, 1);
++  assert.ok(b1 && b1.value, "B1 must exist after worker recalc");
++  assert.equal(b1.value.kind, "number", `B1 should compute a number, got ${JSON.stringify(b1.value)}`);
++  assert.equal(b1.value.number, 42, "=MYUDF(A1) with A1=21 computes 42 via real python");
++  console.log("[smoke] real-python =MYUDF(A1) -> 42 OK");
++}
++
++console.log("[smoke] ALL pollEvents + setUdfWorker assertions passed");
+diff --git a/quantbook-engine/crates/quantbook-py/python/quantbook/worker.py b/quantbook-engine/crates/quantbook-py/python/quantbook/worker.py
+index 5dedf1abc7b..3803739ef20 100644
+--- a/quantbook-engine/crates/quantbook-py/python/quantbook/worker.py
++++ b/quantbook-engine/crates/quantbook-py/python/quantbook/worker.py
+@@ -91,23 +91,67 @@ def run(stdin, stdout, stderr):
+         return 0
+ 
+ 
++def _usable_fd(stream):
++    """Return ``stream``'s OS fd if it is a live, real fd, else ``None``.
++
++    A host that gives the child no console (notably the engine embedded in
++    node/electron — 6.4-3d Step 5) can leave ``sys.stdout``/``sys.stderr`` as
++    ``None`` or backed by a closed fd. ``fileno()`` then raises or the attribute
++    is missing; treat all of those as "no usable fd"."""
++    if stream is None:
++        return None
++    try:
++        return stream.fileno()
++    except (OSError, ValueError, AttributeError):
++        return None
++
++
+ def main():
+-    # Reserve fd 1 EXCLUSIVELY for the wire protocol (6.4-3b audit-fix:
+-    # udf-print-corrupts-protocol-stdout). Dup the real stdout (the engine's pipe) to a private
+-    # fd, then repoint fd 1 and Python-level sys.stdout at stderr so ANY user `print()` / library
+-    # stdout write / import-time chatter goes to stderr instead of corrupting the frame stream.
+-    # This MUST happen before `run()` imports user UDF code.
+-    proto_fd = os.dup(sys.stdout.fileno())
+-    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+-    sys.stdout = sys.stderr
++    # Reserve the wire-protocol channel — the engine's pipe, which `ProcessWorker`
++    # wires to the child's fd 1 (`Command::stdout(piped)`). Use the RAW fd 1, not
++    # `sys.stdout.fileno()`: an embedded host may hand us a `None`/closed
++    # sys.stdout, and the protocol channel is fd 1 regardless of the Python-level
++    # stream object.
++    proto_fd = os.dup(1)
++
++    # Repoint fd 1 (and Python-level sys.stdout) at a "sink" so a stray UDF
++    # `print()` / library stdout write / import-time chatter cannot corrupt the
++    # frame stream (6.4-3b audit-fix: udf-print-corrupts-protocol-stdout). Prefer
++    # the real stderr (fd 2) so such chatter stays visible; if stderr is unusable
++    # (`sys.stderr is None` / closed — common when the host gives the child no
++    # console), fall back to os.devnull so the redirect can NEVER crash the worker
++    # on startup (6.4-3d Step 5 fix: worker-crashes-when-host-has-no-stderr —
++    # the prior `os.dup2(sys.stderr.fileno(), 1)` raised `AttributeError` on
++    # `None.fileno()`, the worker exited before HELLO_ACK, and every UDF call in
++    # the IDE failed with `#CALC!`).
++    diag = sys.stderr  # the worker's own diagnostic writer (may be None)
++    sink_fd = _usable_fd(diag)
++    opened_devnull = False
++    if sink_fd is None:
++        sink_fd = os.open(os.devnull, os.O_WRONLY)
++        opened_devnull = True
++    os.dup2(sink_fd, 1)
++    # Python-level sys.stdout → a fresh handle on the (redirected) fd 1.
++    sys.stdout = os.fdopen(os.dup(1), "w", buffering=1)
++    if diag is None:
++        # No real stderr either; route the worker's own diagnostics to the sink
++        # too (rather than crashing on `None.write`).
++        diag = sys.stdout
++        sys.stderr = sys.stdout
++
+     proto = os.fdopen(proto_fd, "wb", buffering=0)
+     try:
+-        return run(sys.stdin.buffer, proto, sys.stderr)
++        return run(sys.stdin.buffer, proto, diag)
+     finally:
+         try:
+             proto.close()
+         except BrokenPipeError:
+             pass  # engine already gone — nothing to flush
++        if opened_devnull:
++            try:
++                os.close(sink_fd)
++            except OSError:
++                pass
+ 
+ 
+ if __name__ == "__main__":

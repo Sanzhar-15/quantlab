@@ -124,18 +124,27 @@ def main():
     # the prior `os.dup2(sys.stderr.fileno(), 1)` raised `AttributeError` on
     # `None.fileno()`, the worker exited before HELLO_ACK, and every UDF call in
     # the IDE failed with `#CALC!`).
-    diag = sys.stderr  # the worker's own diagnostic writer (may be None)
+    diag = sys.stderr  # the worker's own diagnostic writer (may be None / broken)
     sink_fd = _usable_fd(diag)
     opened_devnull = False
     if sink_fd is None:
         sink_fd = os.open(os.devnull, os.O_WRONLY)
         opened_devnull = True
     os.dup2(sink_fd, 1)
+    # NOTE (6.4-3d Step 5 audit): we deliberately do NOT `os.dup2(sink_fd, 2)`.
+    # When the host left fd 2 closed (the very case that makes `sys.stderr` None),
+    # the earlier `proto_fd = os.dup(1)` reuses fd 2 as the protocol channel — so
+    # repointing fd 2 here would CLOBBER the protocol pipe and the worker would
+    # exit before HELLO_ACK (verified: it breaks the node-hosted handshake). fd 2
+    # is left as the host gave it; the worker never writes to a raw fd 2 (its
+    # diagnostics go through the Python `diag` object, routed to the sink below).
     # Python-level sys.stdout → a fresh handle on the (redirected) fd 1.
     sys.stdout = os.fdopen(os.dup(1), "w", buffering=1)
-    if diag is None:
-        # No real stderr either; route the worker's own diagnostics to the sink
-        # too (rather than crashing on `None.write`).
+    if opened_devnull:
+        # stderr was unusable (None OR a broken non-None stream — 6.4-3d Step 5
+        # audit-fix, Codex LOW): route the worker's own diagnostics to the sink
+        # UNCONDITIONALLY, rather than leaving `diag` pointed at a broken stream
+        # that would crash `run()` on `diag.write(...)`.
         diag = sys.stdout
         sys.stderr = sys.stdout
 

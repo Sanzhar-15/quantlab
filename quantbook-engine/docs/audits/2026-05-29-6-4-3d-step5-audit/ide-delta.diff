@@ -1,0 +1,841 @@
+commit 9d5ca7b75fa43b824bcfc1319f114e6489493404
+Author: Sanzhar <sanzhar@Sanzhars-MacBook-Pro.local>
+Date:   Fri May 29 13:49:46 2026 +0100
+
+    feat(quantbook): 6.4-3d Step 5 (IDE) -- trust-gated UDF worker injection + CellDiagnostic tooltips + error-code allowlist
+    
+    The IDE side of 6.4-3d (engine side: pollEvents napi binding + worker no-stderr
+    robustness, engine commit 1e182a2fad3 on feat/quantbook-engine). Builds the
+    contract + helper + renderer surface; the live cellGridPanel still runs on
+    CollabSession, so wiring the owning Session + a live pollEvents loop into the
+    panel is filed-forward (its own increment).
+    
+    - types.ts: PythonWorkerConfigJson + setUdfWorker(config) + pollEvents(cursor) on
+      SessionInstance; Event/Diagnostic/Severity/OperationState/CellAddr/EventPage TS
+      types mirroring the engine DTOs; +5 QuantbookErrorCode union members
+      (worker_spawn_failed, worker_handshake, worker_untrusted_workspace,
+      invalid_state, session_busy); diagnostic? on the QuantbookCellSnapshot entry.
+    - session.ts: the same 5 codes in KNOWN_QUANTBOOK_ERROR_CODE_RECORD
+      (compile-enforced parity with the union).
+    - loader.ts: setUdfWorker + pollEvents added to the Session.prototype shape check.
+    - udfWorker.ts (new): planUdfWorkerConfig (PURE: trust gate ->
+      [worker_untrusted_workspace]; interpreter via the quantlab.pythonPath cascade,
+      verified >= 3.9 -> [worker_spawn_failed]) + injectUdfWorker (async wrapper; lazy
+      vscode/TrustManager imports keep the planner testable without the shim; yields
+      before the SYNCHRONOUS, blocking setUdfWorker call -- callers MUST run it off
+      the UI path; async-napi AsyncTask filed-forward).
+    - cellGridLogic.ts: buildCellDiagnosticMessages (pollEvents page -> per-cell
+      message map, sheet-filtered, last-wins) + attachCellDiagnostics (merge onto
+      ERROR-valued cells only, so a recovered cell drops the stale tooltip; pure).
+    - cellGridHtml.ts: renderRows adds an escapeHtml'd title= tooltip when a cell has
+      a diagnostic, KEEPING the #CALC!/#TIMEOUT! text.
+    - tests: new quantbook-udf-worker.test.ts (error-code parity, planUdfWorkerConfig
+      gates, both diagnostics helpers -- 16 cases, no FFI/vscode);
+      quantbook-roundtrip.test.ts fake-Session prototype updated for the 2 new
+      loader-checked methods.
+    
+    Verified: tsc --noEmit clean; quantbook mocha 458/458 (incl. the cdylib-backed
+    Session smoke against the 6.4-3d engine build).
+    
+    Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+diff --git a/extensions/quantlab/src/quantbook/cellGrid/cellGridHtml.ts b/extensions/quantlab/src/quantbook/cellGrid/cellGridHtml.ts
+index b3a88d3f82f..762bec432c4 100644
+--- a/extensions/quantlab/src/quantbook/cellGrid/cellGridHtml.ts
++++ b/extensions/quantlab/src/quantbook/cellGrid/cellGridHtml.ts
+@@ -282,8 +282,16 @@ function renderRows(
+ 			const dataAttrs = editable
+ 				? ` data-row="${rowSafe}" data-col="${colSafe}" data-original-text="${escapeHtml(displayStr)}" data-raw-value="${escapeHtml(rawValueStr)}"${formulaAttr} data-original-kind="${escapeHtml(e.value.kind)}"`
+ 				: '';
++			// **Phase 6.4-3d Step 5 (2026-05-29)**: a per-cell diagnostic (from
++			// `Event::CellDiagnostic` via `pollEvents`, merged onto error-valued
++			// cells by `attachCellDiagnostics`) surfaces as a `title=` tooltip so
++			// a failed UDF explains WHY -- the `#CALC!`/`#TIMEOUT!` text is KEPT.
++			// CSP-safe: the message is `escapeHtml`d like every other attribute.
++			const titleAttr = (typeof e.diagnostic === 'string' && e.diagnostic.length > 0)
++				? ` title="${escapeHtml(e.diagnostic)}"`
++				: '';
+ 			const cellClass = editable ? 'cell-value' : '';
+-			return `<tr><td>${rowSafe}</td><td>${colSafe}</td><td class="${cellClass}"${dataAttrs}>${escapeHtml(displayStr)}<span class="kind">[${escapeHtml(e.value.kind)}]</span></td></tr>`;
++			return `<tr><td>${rowSafe}</td><td>${colSafe}</td><td class="${cellClass}"${dataAttrs}${titleAttr}>${escapeHtml(displayStr)}<span class="kind">[${escapeHtml(e.value.kind)}]</span></td></tr>`;
+ 		})
+ 		.join('');
+ }
+diff --git a/extensions/quantlab/src/quantbook/cellGrid/cellGridLogic.ts b/extensions/quantlab/src/quantbook/cellGrid/cellGridLogic.ts
+index d0e833559fc..ec07fff7ab1 100644
+--- a/extensions/quantlab/src/quantbook/cellGrid/cellGridLogic.ts
++++ b/extensions/quantlab/src/quantbook/cellGrid/cellGridLogic.ts
+@@ -27,7 +27,7 @@
+  * - `panel.webview.postMessage` -> wired as `DispatchDeps.onError`.
+  */
+ 
+-import type { CellSnapshotJson, CollabSessionInstance, FormatIdJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
++import type { CellSnapshotJson, CollabSessionInstance, EventJson, FormatIdJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
+ import { appendPutFormulaValidated, appendPutValueValidated, parseQuantbookError, workbookSnapshot, workbookSnapshotDelta } from '../session';
+ 
+ /**
+@@ -890,6 +890,80 @@ export function extractSheetSnapshot(
+ 	};
+ }
+ 
++// ---------------------------------------------------------------------
++// Phase 6.4-3d Step 5 (2026-05-29) -- CellDiagnostic -> cell tooltip.
++//
++// `Event::CellDiagnostic` (the UDF no-worker/raised/timeout/died sink) arrives
++// via `SessionInstance.pollEvents`, NOT in the value snapshot. These two pure
++// helpers bridge the gap: fold the event page into a per-cell message map, then
++// merge it onto a `QuantbookCellSnapshot` so `renderRows` can show a `title=`
++// tooltip explaining WHY a cell is `#CALC!`/`#TIMEOUT!`.
++// ---------------------------------------------------------------------
++
++/** Map key for a cell within a sheet. */
++function diagKey(row: number, col: number): string {
++	return `${row},${col}`;
++}
++
++/**
++ * **Phase 6.4-3d Step 5**: fold the `cell_diagnostic` events of `events` for
++ * `sheetId` into a `Map` keyed by `"row,col"` whose value is the diagnostic
++ * MESSAGE. Last-wins (a later diagnostic for the same cell supersedes an earlier
++ * one, e.g. a re-eval that fails differently). Events for other sheets, events
++ * without a `cell_diagnostic` kind, and workbook-level diagnostics (no `addr`)
++ * are ignored. Pure -- no I/O.
++ *
++ * Note: the engine ring is append-only with no "diagnostic cleared" event; a
++ * cell that later recomputes to a real value keeps a stale entry HERE, but
++ * {@link attachCellDiagnostics} only surfaces a message on a cell whose CURRENT
++ * value is an error, so a recovered cell naturally drops its tooltip.
++ */
++export function buildCellDiagnosticMessages(
++	events: readonly EventJson[],
++	sheetId: number,
++): Map<string, string> {
++	const out = new Map<string, string>();
++	for (const e of events) {
++		if (e.kind !== 'cell_diagnostic') {
++			continue;
++		}
++		const d = e.diagnostic;
++		if (d === undefined || d.addr === undefined || d.addr.sheet !== sheetId) {
++			continue;
++		}
++		out.set(diagKey(d.addr.row, d.addr.col), d.message);
++	}
++	return out;
++}
++
++/**
++ * **Phase 6.4-3d Step 5**: return a COPY of `snapshot` where each ERROR-valued
++ * entry that has a message in `messages` gains a `diagnostic` field (the
++ * message). Non-error cells are left untouched even if a (stale) message exists
++ * for their coord -- so a UDF cell that recovered to a real value shows no
++ * tooltip. The conditional-key discipline (only set `diagnostic` when present)
++ * keeps shape-stability comparisons meaningful. Pure -- does not mutate input.
++ */
++export function attachCellDiagnostics(
++	snapshot: QuantbookCellSnapshot,
++	messages: Map<string, string>,
++): QuantbookCellSnapshot {
++	if (messages.size === 0) {
++		return snapshot;
++	}
++	const entries = snapshot.entries.map(entry => {
++		if (entry.value.kind !== 'error') {
++			return entry;
++		}
++		const msg = messages.get(diagKey(entry.row, entry.col));
++		if (msg === undefined) {
++			return entry;
++		}
++		return { ...entry, diagnostic: msg };
++	});
++	return { ...snapshot, entries };
++}
++
+ // ---------------------------------------------------------------------
+ // Phase 5.7 V3.6.1 (2026-05-26) -- incremental snapshot delta merge
+ // (OPUS-PT-B10).  Realizes the V3.6.0.8 D6 engine win (228x faster than
+diff --git a/extensions/quantlab/src/quantbook/loader.ts b/extensions/quantlab/src/quantbook/loader.ts
+index 09e65aeb753..ec210e1a7db 100644
+--- a/extensions/quantlab/src/quantbook/loader.ts
++++ b/extensions/quantlab/src/quantbook/loader.ts
+@@ -349,6 +349,15 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
+ 					missing.push(`Session.prototype.${method} (6.1B inc.2d)`);
+ 				}
+ 			}
++			// **Phase 6.4-3d Step 5 (2026-05-29):** the Python-UDF worker
++			// injection + event-stream methods. A stale binary (pre-6.4-3d
++			// cdylib) lacks these -- fail at the boundary, not at the
++			// `setUdfWorker is not a function` use site.
++			for (const method of ['setUdfWorker', 'pollEvents']) {
++				if (typeof sproto[method] !== 'function') {
++					missing.push(`Session.prototype.${method} (6.4-3d Step 5)`);
++				}
++			}
+ 		}
+ 	}
+ 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {
+diff --git a/extensions/quantlab/src/quantbook/session.ts b/extensions/quantlab/src/quantbook/session.ts
+index ef6f7a48f3e..2419c7e7ed4 100644
+--- a/extensions/quantlab/src/quantbook/session.ts
++++ b/extensions/quantlab/src/quantbook/session.ts
+@@ -798,6 +798,16 @@ const KNOWN_QUANTBOOK_ERROR_CODE_RECORD: Record<Exclude<QuantbookErrorCode, 'unk
+ 	// disambiguates); `function_not_found` covers unregister-unknown.
+ 	function_exists: true,
+ 	function_not_found: true,
++	// Phase 6.4-3d Step 5 (2026-05-29): Python-UDF worker codes
++	// (`Session.setUdfWorker` via `udf_spawn_error_to_napi`) +
++	// `worker_untrusted_workspace` (IDE-only, thrown by `injectUdfWorker` when the
++	// workspace is not trusted) + the lifecycle codes now reachable through the
++	// gated `set_udf_worker_checked` (and shared with the other mutators).
++	worker_spawn_failed: true,
++	worker_handshake: true,
++	worker_untrusted_workspace: true,
++	invalid_state: true,
++	session_busy: true,
+ };
+ 
+ /**
+diff --git a/extensions/quantlab/src/quantbook/types.ts b/extensions/quantlab/src/quantbook/types.ts
+index 6c778a9b455..5779f8643d5 100644
+--- a/extensions/quantlab/src/quantbook/types.ts
++++ b/extensions/quantlab/src/quantbook/types.ts
+@@ -1147,6 +1147,21 @@ export interface QuantbookCellSnapshot {
+ 		 * tests pin this).
+ 		 */
+ 		readonly formula?: string;
++		/**
++		 * **Phase 6.4-3d Step 5 (2026-05-29)**: a per-cell diagnostic MESSAGE
++		 * (e.g. `"no Python worker is configured for this session"` or
++		 * `"ValueError: boom"`), sourced from `Event::CellDiagnostic` via
++		 * {@link SessionInstance.pollEvents} and merged onto error-valued cells
++		 * by `attachCellDiagnostics` (in `cellGrid/cellGridLogic`). `undefined`
++		 * for the common case (no diagnostic / non-error cell). `buildHtml`'s
++		 * `renderRows` surfaces it as a `title=` tooltip while KEEPING the
++		 * `#CALC!`/`#TIMEOUT!` text -- so a failed UDF explains WHY on hover.
++		 *
++		 * NOT produced by `extractSheetSnapshot` (the snapshot carries values,
++		 * not events); the conditional-key discipline (absent when unset) keeps
++		 * the existing shape-stability `deepStrictEqual` tests intact.
++		 */
++		readonly diagnostic?: string;
+ 	}>;
+ }
+ 
+@@ -1369,6 +1384,120 @@ export interface SessionCellValueInput {
+ 	text?: string;
+ }
+ 
++/**
++ * **Phase 6.4-3d Step 5 (2026-05-29)**: config for the out-of-process Python-UDF
++ * worker the IDE injects via {@link SessionInstance.setUdfWorker}. Mirrors the
++ * engine `PythonWorkerConfigJson` (napi object; optional fields are OMITTED, NOT
++ * `null`/`undefined`-valued -- napi-rs rejects an explicit `null`). The IDE
++ * resolves these from trusted-workspace config (the `quantlab.pythonPath`
++ * cascade + the workspace UDF dir); see `udfWorker.ts`.
++ */
++export interface PythonWorkerConfigJson {
++	/** Absolute path to the Python interpreter to launch (required). */
++	python: string;
++	/** `-m` module that runs the worker loop. Defaults to `"quantbook.worker"`. */
++	module?: string;
++	/**
++	 * Directories prepended to `PYTHONPATH` (the worker module + `quantbook`
++	 * package must resolve). Typically the engine's `quantbook-py/python` plus
++	 * the workspace UDF dir.
++	 */
++	pythonpath?: string[];
++	/** Trusted user module the worker imports to register UDFs by handle. */
++	udfModule?: string;
++	/** Handshake timeout in ms (HELLO_ACK wait). Engine default 5000; capped at 600000. */
++	handshakeTimeoutMs?: number;
++}
++
++/**
++ * **Phase 6.4-3d Step 5 (2026-05-29)**: severity of a {@link DiagnosticJson}.
++ * Mirrors the engine `Severity` (`snake_case` serde).
++ */
++export type DiagnosticSeverity = 'info' | 'warning' | 'error';
++
++/**
++ * **Phase 6.4-3d Step 5 (2026-05-29)**: a cell address as carried by an
++ * {@link EventJson} / {@link DiagnosticJson}. Mirrors the engine `CellAddrJson`
++ * (`sheet` widened u16->u32; `row`/`col` 0-indexed). Distinct from the
++ * snapshot's per-cell `{ row, col }` (which omits `sheet`).
++ */
++export interface CellAddrJson {
++	sheet: number;
++	row: number;
++	col: number;
++}
++
++/**
++ * **Phase 6.4-3d Step 5 (2026-05-29)**: a per-cell diagnostic. Mirrors the
++ * engine `DiagnosticJson` (contract section 9). `addr` is absent for a workbook-level
++ * diagnostic. For UDFs the `code` is one of `udf_no_worker` / `udf_raised` /
++ * `udf_timeout` / `udf_worker_died` / `udf_cancelled` / `udf_handshake` /
++ * `udf_protocol` / `udf_codec`; `message` carries the human-readable reason
++ * (e.g. `"ValueError: boom"` for a raised UDF).
++ */
++export interface DiagnosticJson {
++	addr?: CellAddrJson;
++	severity: DiagnosticSeverity;
++	code: string;
++	message: string;
++}
++
++/**
++ * **Phase 6.4-3d Step 5 (2026-05-29)**: an operation's terminal/running state
++ * carried by an `operation_completed` {@link EventJson}. Mirrors the engine
++ * `OperationStateJson`. `error` is the `[code] message` display ONLY when
++ * `state === 'failed'` (parse via {@link parseQuantbookError}).
++ */
++export interface OperationStateJson {
++	state: 'running' | 'completed' | 'canceled' | 'failed';
++	error?: string;
++}
++
++/**
++ * **Phase 6.4-3d Step 5 (2026-05-29)**: one structured event drained from the
++ * session's event ring (contract section 9). Mirrors the engine `EventJson`: a tagged
++ * union keyed by `kind`; only that variant's payload fields are populated.
++ * - `'recalc_progress'`: `op`, `done`, `total`
++ * - `'cell_diagnostic'`: `diagnostic`
++ * - `'operation_completed'`: `op`, `state`
++ * - `'provenance'`: `addr`, `source`
++ * - `'structure_changed'`: `structureKind`, `target`
++ * - `'full_resync_required'`: (no payload -- reseed via `snapshot()`)
++ *
++ * `op`/`done`/`total` are engine `u64` ids surfaced as JS `bigint` (napi BigInt).
++ */
++export interface EventJson {
++	kind:
++	| 'recalc_progress'
++	| 'cell_diagnostic'
++	| 'operation_completed'
++	| 'provenance'
++	| 'structure_changed'
++	| 'full_resync_required';
++	op?: bigint;
++	done?: bigint;
++	total?: bigint;
++	diagnostic?: DiagnosticJson;
++	state?: OperationStateJson;
++	addr?: CellAddrJson;
++	source?: string;
++	structureKind?: string;
++	target?: string;
++}
++
++/**
++ * **Phase 6.4-3d Step 5 (2026-05-29)**: a page of events read from a cursor.
++ * Mirrors the engine `EventPageJson`. Reading does NOT drain the ring; pass
++ * `nextCursor` to the next {@link SessionInstance.pollEvents} call. `dropped`
++ * pairs with a `full_resync_required` event (consumer fell behind -- reseed via
++ * `snapshot()`; v1's ring is unbounded so this never fires yet).
++ */
++export interface EventPageJson {
++	events: EventJson[];
++	nextCursor: bigint;
++	dropped: boolean;
++}
++
+ /**
+  * The owning `WorkbookSession` napi class (Phase 6.1B inc.2d). Wraps
+  * `Arc<Mutex<ql_exec::WorkbookSession>>`; single-writer; the product-neutral
+@@ -1417,6 +1546,36 @@ export interface SessionInstance {
+ 
+ 	/** Live (non-tombstoned) sheets, each as `{ id, name }`. */
+ 	listSheets(): SheetInfoJson[];
++
++	/**
++	 * **Phase 6.4-3d Step 5**: attach an out-of-process Python-UDF worker built
++	 * from `config`. The worker is spawned + handshaked EAGERLY (fail-loud), so
++	 * a missing interpreter / protocol mismatch surfaces NOW (`[worker_spawn_failed]`
++	 * / `[worker_handshake]`), not later as a silent `#CALC!`. After injecting,
++	 * call {@link recalcAll} so existing UDF cells pick up the worker
++	 * (`recalcDirty` will NOT heal an already-computed `#CALC!`). Re-calling
++	 * REPLACES the worker (the prior child is killed).
++	 *
++	 * **SYNCHRONOUS + BLOCKING**: this is a synchronous napi method that blocks
++	 * the calling thread up to the handshake timeout. The IDE MUST NOT call it on
++	 * the UI/keystroke path -- go through the async `injectUdfWorker` helper
++	 * (`udfWorker.ts`), which also enforces the workspace-trust gate.
++	 *
++	 * Errors: `[worker_spawn_failed]` / `[worker_handshake]` / `[bad_argument]`
++	 * (bad `handshakeTimeoutMs`) / `[invalid_state]` (session not Ready) /
++	 * `[session_busy]`.
++	 */
++	setUdfWorker(config: PythonWorkerConfigJson): void;
++
++	/**
++	 * **Phase 6.4-3d Step 5**: drain a page of structured events from the
++	 * session's event ring (contract section 9) starting at `cursor` (`0n` reads from
++	 * the start; pass the returned `nextCursor` each subsequent call). Reading
++	 * does NOT drain the ring. The IDE consumes this to surface `cell_diagnostic`
++	 * events (the UDF no-worker/raised/timeout/died sink) as cell tooltips. A
++	 * negative/lossy cursor is rejected `[bad_argument]`.
++	 */
++	pollEvents(cursor: bigint): EventPageJson;
+ }
+ 
+ export interface SessionConstructor {
+@@ -1585,6 +1744,25 @@ export type QuantbookErrorCode =
+ 	// No-Fallbacks).
+ 	| 'function_exists'
+ 	| 'function_not_found'
++	// **Phase 6.4-3d Step 5 (2026-05-29)**: Python-UDF worker codes.
++	// `worker_spawn_failed` / `worker_handshake` are emitted by the engine's
++	// `Session.setUdfWorker` napi method (`udf_spawn_error_to_napi`) when the
++	// interpreter can't be launched / the worker dies during startup, or reports
++	// an incompatible protocol version. `worker_untrusted_workspace` is an
++	// IDE-ONLY code (never emitted by the engine -- the engine has no workspace
++	// concept): the `injectUdfWorker` helper throws it when the workspace is not
++	// trusted, refusing to spawn arbitrary workspace Python.
++	| 'worker_spawn_failed'
++	| 'worker_handshake'
++	| 'worker_untrusted_workspace'
++	// **Phase 6.4-3d Step 5**: lifecycle codes now reachable via `setUdfWorker`
++	// (the lifecycle-gated `set_udf_worker_checked`) -- and shared with the other
++	// gated mutators. `invalid_state` = the session is not Ready (New/Closed/
++	// Faulted); `session_busy` = a long operation is in progress. Pre-existing
++	// engine codes (`EngineError::invalid_state` / `session_busy`) that the IDE
++	// allowlist had not yet enumerated (6.4-2 gap closed here).
++	| 'invalid_state'
++	| 'session_busy'
+ 	// Fallback when the message has no recognizable code prefix.
+ 	// Typically means the error came from non-engine, non-binding
+ 	// code (napi task panic, JS-side throw, runtime task error
+diff --git a/extensions/quantlab/src/quantbook/udfWorker.ts b/extensions/quantlab/src/quantbook/udfWorker.ts
+new file mode 100644
+index 00000000000..d069576ff2e
+--- /dev/null
++++ b/extensions/quantlab/src/quantbook/udfWorker.ts
+@@ -0,0 +1,199 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++/**
++ * Phase 6.4-3d Step 5 (2026-05-29) -- IDE-side Python-UDF worker injection.
++ *
++ * Builds a {@link PythonWorkerConfigJson} and attaches it to an owning
++ * {@link SessionInstance} via `setUdfWorker`, behind two gates the engine cannot
++ * enforce (it has no workspace concept):
++ *
++ *   1. **Workspace trust.** A UDF worker runs ARBITRARY workspace Python. We
++ *      refuse to spawn one in an untrusted workspace, surfacing the IDE-only
++ *      `[worker_untrusted_workspace]` code (caller shows a non-fatal notice).
++ *   2. **Interpreter resolution.** The interpreter comes from the existing
++ *      `quantlab.pythonPath` cascade (see `../qviz/pythonPath`), verified to be
++ *      Python >= 3.9 (the worker is 3.9-compatible) before we hand it to the
++ *      engine.
++ *
++ * `setUdfWorker` is a SYNCHRONOUS napi method that blocks the calling thread up
++ * to the handshake timeout. {@link injectUdfWorker} is `async` and yields before
++ * the call; callers MUST invoke it OFF the UI/keystroke path. (Converting the
++ * engine method to an async napi `AsyncTask` is filed-forward; today the call
++ * runs on this thread.)
++ *
++ * The planning step ({@link planUdfWorkerConfig}) is a PURE function (no vscode /
++ * no spawn) so the trust + resolution + version logic is unit-testable; only the
++ * thin {@link injectUdfWorker} wrapper touches vscode + the singleton TrustManager.
++ */
++
++import * as path from 'path';
++
++import { resolveQuantlabPython, verifyPythonVersion, type ResolvedPython } from '../qviz/pythonPath';
++import { resolveEnginePath } from './loader';
++import type { PythonWorkerConfigJson, SessionInstance } from './types';
++
++// `vscode` + `TrustManager` are imported LAZILY inside `injectUdfWorker` (the
++// only vscode-touching entry point) so this module's top-level import graph
++// stays vscode-free -- keeping the pure planner + diagnostics helpers importable
++// (and unit-testable) in plain mocha without the vscode shim (mirrors the
++// `../qviz/pythonPath` discipline).
++
++/** Minimum interpreter version -- the worker (`quantbook.worker`) is 3.9-compatible. */
++export const UDF_MIN_PY_MAJOR = 3;
++export const UDF_MIN_PY_MINOR = 9;
++
++/**
++ * Default eager-handshake timeout (ms). A cold `import pyarrow` in a freshly
++ * spawned interpreter can take several seconds; the engine default (5000) is too
++ * tight when the IDE host has never warmed the interpreter, so the helper passes
++ * a generous default. Capped engine-side at 600000.
++ */
++export const UDF_DEFAULT_HANDSHAKE_MS = 30_000;
++
++/**
++ * Resolve the engine's `crates/quantbook-py/python` directory (the `quantbook`
++ * package + the worker module live here). Derived from {@link resolveEnginePath}
++ * -- `.../quantbook-engine/target/release/lib...` → `.../quantbook-engine` →
++ * `crates/quantbook-py/python` -- so it tracks the same canonical layout (and the
++ * `QUANTBOOK_ENGINE_PATH` override).
++ */
++export function resolveQuantbookPyDir(): string {
++	const enginePath = resolveEnginePath();
++	// dirname = target/release → up two = the quantbook-engine crate root.
++	const engineRoot = path.resolve(path.dirname(enginePath), '..', '..');
++	return path.join(engineRoot, 'crates', 'quantbook-py', 'python');
++}
++
++/** Lazy interpreter version check (only invoked once the trust gate passes). */
++export type VersionCheck = (pythonPath: string) => { ok: boolean; error?: string };
++
++export interface PlanUdfWorkerInputs {
++	/** Result of the workspace-trust check (`true` = trusted). */
++	readonly isWorkspaceTrusted: boolean;
++	/** The resolved interpreter (or `null` when none was found). */
++	readonly resolvedPython: ResolvedPython | null;
++	/** The engine `quantbook-py/python` dir (first PYTHONPATH entry). */
++	readonly quantbookPyDir: string;
++	/**
++	 * Optional version check, invoked ONLY after the trust gate passes and an
++	 * interpreter resolved -- so an untrusted workspace never spawns a subprocess.
++	 */
++	readonly versionCheck?: VersionCheck;
++	/** Trusted user module the worker imports to register UDFs by handle. */
++	readonly udfModule?: string;
++	/** Extra PYTHONPATH dirs appended after {@link quantbookPyDir} (e.g. the workspace UDF dir). */
++	readonly extraPythonPath?: readonly string[];
++	/** Handshake timeout override (ms). Defaults to {@link UDF_DEFAULT_HANDSHAKE_MS}. */
++	readonly handshakeTimeoutMs?: number;
++}
++
++/**
++ * PURE: build the worker config, applying the trust + resolution + version
++ * gates. Throws a `[code] message` engine-style error on any gate failure (so
++ * the caller can `parseQuantbookError` it uniformly):
++ *   - `[worker_untrusted_workspace]` -- workspace not trusted (no spawn).
++ *   - `[worker_spawn_failed]` -- no interpreter found, OR the interpreter is too
++ *     old / not runnable (the version check failed).
++ *
++ * No I/O beyond the injected `versionCheck` (which the caller wires to
++ * `verifyPythonVersion`); never touches vscode.
++ */
++export function planUdfWorkerConfig(inp: PlanUdfWorkerInputs): PythonWorkerConfigJson {
++	if (!inp.isWorkspaceTrusted) {
++		throw new Error(
++			'[worker_untrusted_workspace] refusing to launch a Python UDF worker: the workspace is not ' +
++			'trusted. A UDF worker runs arbitrary workspace Python -- trust the workspace to enable Python UDFs.',
++		);
++	}
++	if (inp.resolvedPython === null) {
++		throw new Error(
++			'[worker_spawn_failed] no Python interpreter found. Set `quantlab.pythonPath` (or ' +
++			'`python.defaultInterpreterPath`, or create ~/.quantlab/venv) to a Python >= ' +
++			`${UDF_MIN_PY_MAJOR}.${UDF_MIN_PY_MINOR} with pyarrow installed.`,
++		);
++	}
++	const python = inp.resolvedPython.pythonPath;
++	if (inp.versionCheck) {
++		const v = inp.versionCheck(python);
++		if (!v.ok) {
++			throw new Error(`[worker_spawn_failed] interpreter ${python} is not usable: ${v.error ?? 'unknown'}`);
++		}
++	}
++	const pythonpath = [inp.quantbookPyDir, ...(inp.extraPythonPath ?? [])];
++	const config: PythonWorkerConfigJson = {
++		python,
++		pythonpath,
++		handshakeTimeoutMs: inp.handshakeTimeoutMs ?? UDF_DEFAULT_HANDSHAKE_MS,
++	};
++	// Per napi-rs: OMIT optional fields when unset (do not pass `undefined`-valued).
++	if (inp.udfModule !== undefined && inp.udfModule.length > 0) {
++		config.udfModule = inp.udfModule;
++	}
++	return config;
++}
++
++export interface InjectUdfWorkerOptions {
++	/** Workspace URI for the trust gate (e.g. `workspaceFolders[0].uri.toString()`). */
++	readonly workspaceUri: string;
++	/** Trusted user module the worker imports to register UDFs by handle. */
++	readonly udfModule?: string;
++	/** Extra PYTHONPATH dirs (e.g. the workspace UDF directory). */
++	readonly extraPythonPath?: readonly string[];
++	/** Handshake timeout override (ms). Defaults to {@link UDF_DEFAULT_HANDSHAKE_MS}. */
++	readonly handshakeTimeoutMs?: number;
++}
++
++/**
++ * Resolve config from the workspace + the `quantlab.pythonPath` cascade, gate on
++ * trust, and attach the worker to `session`. Async -- yields before the
++ * SYNCHRONOUS, blocking `setUdfWorker` call so it is never invoked inline on a
++ * caller's synchronous tick; the caller still MUST run this off the UI/keystroke
++ * path (the engine method blocks this thread up to the handshake timeout).
++ *
++ * On success the caller should `session.recalcAll()` so existing `#CALC!` UDF
++ * cells pick up the worker (`recalcDirty` will not heal them).
++ *
++ * Throws `[worker_untrusted_workspace]` / `[worker_spawn_failed]` /
++ * `[worker_handshake]` / `[invalid_state]` / `[session_busy]` /
++ * `[bad_argument]` -- all `parseQuantbookError`-parseable.
++ */
++export async function injectUdfWorker(
++	session: SessionInstance,
++	opts: InjectUdfWorkerOptions,
++): Promise<void> {
++	// Lazy runtime imports (see the top-of-file note): keeps this module's
++	// top-level graph vscode-free for testability.
++	const vscode = await import('vscode');
++	const { TrustManager } = await import('../core/trust/TrustManager');
++
++	const isWorkspaceTrusted = TrustManager.getInstance().isWorkspaceTrusted(opts.workspaceUri);
++
++	const quantlabConfigPath =
++		vscode.workspace.getConfiguration('quantlab').get<string>('pythonPath') || undefined;
++	const pythonExtConfigPath =
++		vscode.workspace.getConfiguration('python').get<string>('defaultInterpreterPath') || undefined;
++	const resolvedPython = resolveQuantlabPython({ quantlabConfigPath, pythonExtConfigPath });
++
++	const config = planUdfWorkerConfig({
++		isWorkspaceTrusted,
++		resolvedPython,
++		quantbookPyDir: resolveQuantbookPyDir(),
++		versionCheck: (p) => {
++			const r = verifyPythonVersion(p, UDF_MIN_PY_MAJOR, UDF_MIN_PY_MINOR);
++			return r.ok ? { ok: true } : { ok: false, error: r.error };
++		},
++		udfModule: opts.udfModule,
++		extraPythonPath: opts.extraPythonPath,
++		handshakeTimeoutMs: opts.handshakeTimeoutMs,
++	});
++
++	// `setUdfWorker` is SYNCHRONOUS and blocks up to the handshake timeout. Yield
++	// once so we never block within a synchronous caller's tick; the engine call
++	// itself still runs on this thread (the async-napi `AsyncTask` variant is
++	// filed-forward). Callers MUST invoke `injectUdfWorker` off the UI path.
++	await Promise.resolve();
++	session.setUdfWorker(config);
++}
+diff --git a/extensions/quantlab/test/quantbook-roundtrip.test.ts b/extensions/quantlab/test/quantbook-roundtrip.test.ts
+index 79bbfa7d95a..b1e7569c65d 100644
+--- a/extensions/quantlab/test/quantbook-roundtrip.test.ts
++++ b/extensions/quantlab/test/quantbook-roundtrip.test.ts
+@@ -1489,6 +1489,9 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
+ 		for (const m of [
+ 			'addSheet', 'setValue', 'setFormula', 'clear',
+ 			'recalcDirty', 'recalcAll', 'snapshot', 'cell', 'listSheets',
++			// **Phase 6.4-3d Step 5 (2026-05-29):** the loader now also checks
++			// these owning-Session methods, so a "complete" fake must carry them.
++			'setUdfWorker', 'pollEvents',
+ 		]) {
+ 			(fakeSession.prototype as Record<string, unknown>)[m] = function () { /* */ };
+ 		}
+diff --git a/extensions/quantlab/test/quantbook-udf-worker.test.ts b/extensions/quantlab/test/quantbook-udf-worker.test.ts
+new file mode 100644
+index 00000000000..534e1b356e8
+--- /dev/null
++++ b/extensions/quantlab/test/quantbook-udf-worker.test.ts
+@@ -0,0 +1,208 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++/**
++ * Phase 6.4-3d Step 5 (2026-05-29) -- IDE-side Python-UDF worker wiring.
++ *
++ * Pure-logic tests (no native binary, no vscode): the error-code allowlist
++ * parity for the 5 new codes, the trust + interpreter-resolution planner
++ * (`planUdfWorkerConfig`), and the `Event::CellDiagnostic` -> cell-tooltip
++ * bridge (`buildCellDiagnosticMessages` + `attachCellDiagnostics`).
++ *
++ * These exercise no FFI and no vscode, so they run unconditionally (unlike
++ * `quantbook-session.test.ts`, which needs the rebuilt cdylib).
++ */
++
++import * as assert from 'assert';
++
++import { attachCellDiagnostics, buildCellDiagnosticMessages } from '../src/quantbook/cellGrid/cellGridLogic';
++import { parseQuantbookError } from '../src/quantbook/session';
++import { planUdfWorkerConfig, UDF_DEFAULT_HANDSHAKE_MS } from '../src/quantbook/udfWorker';
++import type { EventJson, QuantbookCellSnapshot } from '../src/quantbook/types';
++
++suite('quantbook 6.4-3d Step 5 -- UDF worker wiring', () => {
++	suite('error-code allowlist (the 5 new codes parse)', () => {
++		// The Record<Exclude<QuantbookErrorCode,'unknown'>, true> in session.ts is
++		// COMPILE-enforced parity; `parseQuantbookError` derives its recognized
++		// set from that Record's keys. So a `[code] msg` round-trip proves both
++		// the union member AND the Record entry exist for each new code.
++		for (const code of [
++			'worker_spawn_failed',
++			'worker_handshake',
++			'worker_untrusted_workspace',
++			'invalid_state',
++			'session_busy',
++		] as const) {
++			test(`parseQuantbookError recognizes [${code}]`, () => {
++				const info = parseQuantbookError(new Error(`[${code}] something went wrong`));
++				assert.strictEqual(info.code, code);
++				assert.strictEqual(info.message, 'something went wrong');
++			});
++		}
++
++		test('an unknown bracket code still falls back to unknown (sanity)', () => {
++			const info = parseQuantbookError(new Error('[definitely_not_a_code] x'));
++			assert.strictEqual(info.code, 'unknown');
++		});
++	});
++
++	suite('planUdfWorkerConfig (pure trust + resolution gates)', () => {
++		const okPython = { pythonPath: '/usr/bin/python3', source: 'config-quantlab' as const };
++		const qpyDir = '/engine/crates/quantbook-py/python';
++
++		test('untrusted workspace -> [worker_untrusted_workspace], no spawn (versionCheck never runs)', () => {
++			let versionChecked = false;
++			assert.throws(
++				() =>
++					planUdfWorkerConfig({
++						isWorkspaceTrusted: false,
++						resolvedPython: okPython,
++						quantbookPyDir: qpyDir,
++						versionCheck: () => {
++							versionChecked = true;
++							return { ok: true };
++						},
++					}),
++				/\[worker_untrusted_workspace\]/,
++			);
++			assert.strictEqual(versionChecked, false, 'must not probe the interpreter when untrusted');
++		});
++
++		test('no interpreter resolved -> [worker_spawn_failed] mentioning quantlab.pythonPath', () => {
++			assert.throws(
++				() =>
++					planUdfWorkerConfig({
++						isWorkspaceTrusted: true,
++						resolvedPython: null,
++						quantbookPyDir: qpyDir,
++					}),
++				/\[worker_spawn_failed\][\s\S]*quantlab\.pythonPath/,
++			);
++		});
++
++		test('interpreter too old -> [worker_spawn_failed] (version check fails)', () => {
++			assert.throws(
++				() =>
++					planUdfWorkerConfig({
++						isWorkspaceTrusted: true,
++						resolvedPython: okPython,
++						quantbookPyDir: qpyDir,
++						versionCheck: () => ({ ok: false, error: 'python 3.8 is below minimum 3.9' }),
++					}),
++				/\[worker_spawn_failed\][\s\S]*3\.8 is below/,
++			);
++		});
++
++		test('happy path: config carries python, quantbookPyDir first on PYTHONPATH, default handshake, udfModule', () => {
++			const cfg = planUdfWorkerConfig({
++				isWorkspaceTrusted: true,
++				resolvedPython: okPython,
++				quantbookPyDir: qpyDir,
++				versionCheck: () => ({ ok: true }),
++				udfModule: 'my_udfs',
++				extraPythonPath: ['/workspace/udfs'],
++			});
++			assert.strictEqual(cfg.python, '/usr/bin/python3');
++			assert.deepStrictEqual(cfg.pythonpath, [qpyDir, '/workspace/udfs']);
++			assert.strictEqual(cfg.pythonpath?.[0], qpyDir, 'engine package dir must be first');
++			assert.strictEqual(cfg.udfModule, 'my_udfs');
++			assert.strictEqual(cfg.handshakeTimeoutMs, UDF_DEFAULT_HANDSHAKE_MS);
++		});
++
++		test('udfModule omitted when not provided (no undefined-valued key); handshake override honored', () => {
++			const cfg = planUdfWorkerConfig({
++				isWorkspaceTrusted: true,
++				resolvedPython: okPython,
++				quantbookPyDir: qpyDir,
++				versionCheck: () => ({ ok: true }),
++				handshakeTimeoutMs: 12345,
++			});
++			assert.ok(
++				!Object.prototype.hasOwnProperty.call(cfg, 'udfModule'),
++				'udfModule key must be ABSENT, not undefined (napi-rs)',
++			);
++			assert.strictEqual(cfg.handshakeTimeoutMs, 12345);
++			assert.deepStrictEqual(cfg.pythonpath, [qpyDir]);
++		});
++	});
++
++	suite('buildCellDiagnosticMessages (event -> per-cell message map)', () => {
++		const events: EventJson[] = [
++			{ kind: 'recalc_progress', op: 1n, done: 0n, total: 1n }, // ignored
++			{
++				kind: 'cell_diagnostic',
++				diagnostic: { addr: { sheet: 0, row: 0, col: 1 }, severity: 'error', code: 'udf_no_worker', message: 'no worker' },
++			},
++			{
++				// other sheet -> ignored when filtering sheet 0
++				kind: 'cell_diagnostic',
++				diagnostic: { addr: { sheet: 1, row: 0, col: 1 }, severity: 'error', code: 'udf_raised', message: 'other sheet' },
++			},
++			{
++				// later diagnostic for the SAME cell wins
++				kind: 'cell_diagnostic',
++				diagnostic: { addr: { sheet: 0, row: 0, col: 1 }, severity: 'error', code: 'udf_raised', message: 'ValueError: boom' },
++			},
++			{
++				// workbook-level (no addr) -> ignored
++				kind: 'cell_diagnostic',
++				diagnostic: { severity: 'warning', code: 'something', message: 'no addr' },
++			},
++		];
++
++		test('filters by sheet, ignores non-diagnostic + addr-less, last-wins', () => {
++			const m = buildCellDiagnosticMessages(events, 0);
++			assert.strictEqual(m.size, 1);
++			assert.strictEqual(m.get('0,1'), 'ValueError: boom');
++		});
++
++		test('a different sheet sees only its own diagnostics', () => {
++			const m = buildCellDiagnosticMessages(events, 1);
++			assert.strictEqual(m.size, 1);
++			assert.strictEqual(m.get('0,1'), 'other sheet');
++		});
++	});
++
++	suite('attachCellDiagnostics (merge onto error-valued cells only)', () => {
++		const base: QuantbookCellSnapshot = {
++			snapshot_format_version: 1,
++			sheet: 0,
++			entries: [
++				{ row: 0, col: 0, value: { kind: 'number', value: 42 } },
++				{ row: 0, col: 1, value: { kind: 'error', value: '#CALC!' } },
++			],
++		};
++
++		test('attaches the message to the error cell only; number cell untouched', () => {
++			const msgs = new Map<string, string>([
++				['0,0', 'stale message for a recovered cell'],
++				['0,1', 'no Python worker is configured for this session'],
++			]);
++			const out = attachCellDiagnostics(base, msgs);
++			const errCell = out.entries.find(e => e.col === 1)!;
++			const numCell = out.entries.find(e => e.col === 0)!;
++			assert.strictEqual(errCell.diagnostic, 'no Python worker is configured for this session');
++			assert.ok(
++				!Object.prototype.hasOwnProperty.call(numCell, 'diagnostic'),
++				'a non-error (recovered) cell drops the stale tooltip',
++			);
++		});
++
++		test('empty message map returns the same snapshot reference (no-op)', () => {
++			const out = attachCellDiagnostics(base, new Map());
++			assert.strictEqual(out, base);
++		});
++
++		test('does not mutate the input snapshot', () => {
++			const msgs = new Map<string, string>([['0,1', 'boom']]);
++			attachCellDiagnostics(base, msgs);
++			const errCell = base.entries.find(e => e.col === 1)!;
++			assert.ok(
++				!Object.prototype.hasOwnProperty.call(errCell, 'diagnostic'),
++				'input must be left unchanged',
++			);
++		});
++	});
++});
