@@ -1230,6 +1230,11 @@ fn udf_error_diagnostic(e: &ql_udf::UdfError) -> (&'static str, String) {
 fn map_udf_error(e: &ql_udf::UdfError) -> ErrorValue {
     match e {
         ql_udf::UdfError::Timeout(_) => ErrorValue::Timeout,
+        // Adding a new `UdfError` variant? Reconsider this wildcard before it
+        // silently maps to `#CALC!` — a future variant (e.g. a memory-limit
+        // breach) may warrant a distinct cell value. The companion
+        // `udf_error_diagnostic` IS exhaustive (no wildcard), so a new variant is
+        // a compile error THERE — that break is the prompt to revisit this arm.
         _ => ErrorValue::Calc,
     }
 }

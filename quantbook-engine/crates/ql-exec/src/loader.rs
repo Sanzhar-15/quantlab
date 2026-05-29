@@ -53,6 +53,16 @@ use crate::workbook_runtime::{RecomputeResult, WorkbookRuntime};
 /// Only `QbookError` short-circuits (file missing, schema mismatch, malformed
 /// cell, etc.). Recompute failures are aggregated into `RecomputeResult`
 /// without losing the workbook.
+///
+/// **6.4-4 megaudit note (UDF data-loss):** this builds a `WorkbookRuntime` with
+/// NO UDF worker and calls the HONEST `recompute_all` — so a `.qbook` carrying
+/// SAVED Python-UDF values, loaded through THIS function, would recompute those
+/// cells to `#CALC!` (the D2 data-loss the 6.4-3c megaudit closed). It is safe
+/// today because the product loads via `WorkbookSession::open`, which uses
+/// `recompute_all_preserving_saved_udf` to keep saved UDF values when no worker
+/// is present. Do NOT wire this standalone loader as the `.qbook` open path for a
+/// workbook that may contain UDF values without first injecting the worker (or
+/// switching to the preserving variant).
 pub fn load_workbook_and_recompute(
     path: &Path,
     registry: &FunctionRegistry,
