@@ -23,6 +23,29 @@ use ql_udf::UdfWorker;
 
 use crate::plan::{NameLookup, ResolvedName};
 
+/// **6.4-3d (2026-05-29; megaudit blocker G):** a structured per-cell
+/// diagnostic emitted by the UDF dispatch site when a `=MYUDF(..)` fails (or
+/// has no worker). Deliberately a ql-exec-local, `ql_session`-free type so the
+/// eval layer ([`crate::scalar::dispatch_udf`]) stays decoupled from the session
+/// DTOs; the owning [`crate::session::WorkbookSession`] converts it to a
+/// `ql_session::dto::Diagnostic` (severity `Error`) and emits an
+/// `Event::CellDiagnostic` when it drains the per-recompute collector. The cell
+/// VALUE is unchanged (still `#CALC!`/`#TIMEOUT!`); this is purely additive so a
+/// failed UDF explains *why* (exit test 7). `code` is a stable `&'static str`
+/// (`udf_no_worker` / `udf_raised` / `udf_timeout` / `udf_worker_died` /
+/// `udf_cancelled` / `udf_handshake` / `udf_protocol` / `udf_codec`); for
+/// `udf_raised`, `message` carries `"{exc_type}: {message}"`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UdfCellDiagnostic {
+    /// The formula cell the failing UDF lives in.
+    pub addr: ql_types::Address,
+    /// Stable diagnostic code (maps 1:1 from the [`ql_udf::UdfError`] variant /
+    /// the no-worker case).
+    pub code: &'static str,
+    /// Human-readable detail.
+    pub message: String,
+}
+
 /// Read a single cell value. Out-of-bounds reads return `Value::Blank` per Excel semantics.
 pub trait CellEnv {
     fn read_cell(&self, sheet: SheetId, row: RowId, col: ColId) -> Value;
@@ -123,6 +146,18 @@ pub trait CellEnv {
     fn udf_worker(&self) -> Option<&RefCell<Box<dyn UdfWorker + Send>>> {
         None
     }
+
+    /// **6.4-3d (2026-05-29; megaudit blocker G):** record a UDF-dispatch
+    /// diagnostic for the current formula cell. Default is a no-op — only
+    /// [`WorkbookEnv`] built via [`WorkbookEnv::with_formula_cell_worker_and_diagnostics`]
+    /// with a collector present actually retains it (the value-computing
+    /// recompute / `set_formula` sites). `MapEnv`, benches, the binding-only
+    /// `validate` path, and the standalone-transaction commit path all inherit
+    /// the no-op — their UDF failures still produce the correct cell VALUE,
+    /// just no diagnostic event. Same defaulted-method shape as [`udf_worker`].
+    ///
+    /// [`udf_worker`]: CellEnv::udf_worker
+    fn push_udf_diagnostic(&self, _diag: UdfCellDiagnostic) {}
 }
 
 /// `ql-storage::Workbook`-backed implementation. Wraps a Workbook reference; reads dispatch
@@ -156,6 +191,14 @@ pub struct WorkbookEnv<'w> {
     /// and for every legacy caller (`new` / `with_formula_cell`). Surfaced to
     /// the dispatch site via the `CellEnv::udf_worker` override below.
     udf_worker: Option<&'w RefCell<Box<dyn UdfWorker + Send>>>,
+    /// **6.4-3d (2026-05-29; megaudit blocker G):** borrowed per-recompute
+    /// collector the UDF dispatch site pushes a [`UdfCellDiagnostic`] into on a
+    /// failed (or no-worker) `=MYUDF(..)`. `None` for every path without a
+    /// session-owned collector (legacy ctors, `validate`, standalone txn). The
+    /// session lends `&self.udf_diagnostics` and drains it into
+    /// `Event::CellDiagnostic` after the runtime borrow ends. Interior-mutable
+    /// + `!Sync` like `udf_worker`; sound under single-threaded recompute.
+    udf_diagnostics: Option<&'w RefCell<Vec<UdfCellDiagnostic>>>,
 }
 
 impl<'w> WorkbookEnv<'w> {
@@ -177,6 +220,7 @@ impl<'w> WorkbookEnv<'w> {
             eval_ctx,
             formula_cell: None,
             udf_worker: None,
+            udf_diagnostics: None,
         }
     }
 
@@ -205,6 +249,30 @@ impl<'w> WorkbookEnv<'w> {
         let mut env = Self::new(workbook);
         env.formula_cell = Some(cell);
         env.udf_worker = worker;
+        env
+    }
+
+    /// **6.4-3d (2026-05-29; megaudit blocker G):** like
+    /// [`with_formula_cell_and_worker`] but ALSO carries the session's
+    /// per-recompute `UdfCellDiagnostic` collector, so a failed (or no-worker)
+    /// `=MYUDF(..)` records a structured diagnostic the session drains into an
+    /// `Event::CellDiagnostic`. Used by the value-computing recompute /
+    /// `set_formula` env sites (`workbook_runtime`). The plain
+    /// [`with_formula_cell_and_worker`] (used by the standalone-transaction
+    /// commit path) leaves the collector `None` — its UDF failures still yield
+    /// the correct cell value, just no diagnostic event.
+    ///
+    /// [`with_formula_cell_and_worker`]: WorkbookEnv::with_formula_cell_and_worker
+    pub fn with_formula_cell_worker_and_diagnostics(
+        workbook: &'w ql_storage::Workbook,
+        cell: ql_types::Address,
+        worker: Option<&'w RefCell<Box<dyn UdfWorker + Send>>>,
+        diagnostics: Option<&'w RefCell<Vec<UdfCellDiagnostic>>>,
+    ) -> Self {
+        let mut env = Self::new(workbook);
+        env.formula_cell = Some(cell);
+        env.udf_worker = worker;
+        env.udf_diagnostics = diagnostics;
         env
     }
 
@@ -355,6 +423,18 @@ impl<'w> CellEnv for WorkbookEnv<'w> {
     /// `with_formula_cell_and_worker` with a configured worker.
     fn udf_worker(&self) -> Option<&RefCell<Box<dyn UdfWorker + Send>>> {
         self.udf_worker
+    }
+
+    /// **6.4-3d (2026-05-29; megaudit blocker G):** push into the borrowed
+    /// per-recompute collector when one is present (set via
+    /// `with_formula_cell_worker_and_diagnostics`); otherwise a no-op. The
+    /// `borrow_mut` is taken for the single push only — `dispatch_udf` pushes
+    /// once, AFTER the IPC round-trip, never re-entrantly — so there is no
+    /// nested-borrow hazard.
+    fn push_udf_diagnostic(&self, diag: UdfCellDiagnostic) {
+        if let Some(sink) = self.udf_diagnostics {
+            sink.borrow_mut().push(diag);
+        }
     }
 }
 

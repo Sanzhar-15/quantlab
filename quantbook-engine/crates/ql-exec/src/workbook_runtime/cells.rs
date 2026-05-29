@@ -258,10 +258,11 @@ impl<'a> WorkbookRuntime<'a> {
             // **6.4-3c (2026-05-29):** also carry the session's UDF worker so
             // `set_formula`'s immediate eval of `=MYUDF(A1)` dispatches to the
             // worker (not only later recomputes).
-            let env = WorkbookEnv::with_formula_cell_and_worker(
+            let env = WorkbookEnv::with_formula_cell_worker_and_diagnostics(
                 self.workbook,
                 ql_types::Address::new(sheet, row, col),
                 self.udf_worker,
+                self.udf_diagnostics,
             );
             match self.graph.as_deref() {
                 Some(session) => crate::scalar::eval_at_cell_boundary(

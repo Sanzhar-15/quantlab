@@ -79,11 +79,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::env::UdfCellDiagnostic;
 use ql_functions::FunctionRegistry;
-use ql_udf::UdfWorker;
 use ql_oplog::OpLog;
 use ql_storage::{NamedTarget, Workbook};
 use ql_types::{ColId, RowId, SheetId, Value};
+use ql_udf::UdfWorker;
 
 use ql_formula_syntax::{lex, lex_with, parse, print_with, FormulaSite};
 use ql_io::CellWireValue;
@@ -303,6 +304,16 @@ pub struct WorkbookSession {
     ///
     /// [`set_udf_worker`]: WorkbookSession::set_udf_worker
     udf_worker: Option<RefCell<Box<dyn UdfWorker + Send>>>,
+    /// **6.4-3d (2026-05-29; megaudit blocker G):** per-recompute collector for
+    /// UDF-dispatch diagnostics. `with_runtime`/`with_runtime_no_oplog` lend
+    /// `&self.udf_diagnostics` into the runtime (alongside `udf_worker`); the
+    /// dispatch site pushes a [`crate::env::UdfCellDiagnostic`] on a failed (or
+    /// no-worker) `=MYUDF(..)`; the same helpers DRAIN it into
+    /// `Event::CellDiagnostic` after the runtime borrow ends. Always-present
+    /// (cheap empty `Vec`), unlike `udf_worker`. `!Sync` `RefCell` is sound
+    /// under single-threaded recompute. The cell VALUE is unchanged — this is
+    /// purely the "why did the UDF fail" channel (exit test 7).
+    udf_diagnostics: RefCell<Vec<UdfCellDiagnostic>>,
 }
 
 impl WorkbookSession {
@@ -333,7 +344,10 @@ impl WorkbookSession {
     /// This is the same divergence class the 6.4-0 H2 + 6.4-1 H1 audit-fixes
     /// closed at `recompute_all` / `rematerialize`; the adoption-site variant
     /// was the gap those sweeps missed.
-    pub fn from_workbook_with_registry(workbook: Workbook, registry: Arc<FunctionRegistry>) -> Self {
+    pub fn from_workbook_with_registry(
+        workbook: Workbook,
+        registry: Arc<FunctionRegistry>,
+    ) -> Self {
         let graph =
             CalcgraphSession::rebuild_from_workbook_with_registry(&workbook, &registry).session;
         // inc.2c-7: snapshot the construction-time workbook as the undo baseline
@@ -371,6 +385,8 @@ impl WorkbookSession {
             undo_manager,
             // 6.4-3c: no UDF worker until the host injects one via set_udf_worker.
             udf_worker: None,
+            // 6.4-3d (blocker G): empty per-recompute diagnostic collector.
+            udf_diagnostics: RefCell::new(Vec::new()),
         }
     }
 
@@ -448,11 +464,41 @@ impl WorkbookSession {
             cache,
             // 6.4-3c: lend the worker (disjoint field from the &mut borrows above).
             self.udf_worker.as_ref(),
+            // 6.4-3d (blocker G): lend the per-recompute diagnostic collector.
+            Some(&self.udf_diagnostics),
         );
         let out = f(&mut rt);
         self.plan_cache = rt.into_plan_cache();
         guard.armed = false;
+        // 6.4-3d (blocker G): release the runtime + guard borrows, then drain
+        // any UDF-dispatch diagnostics into the event stream.
+        drop(guard);
+        self.drain_udf_diagnostics();
         out
+    }
+
+    /// **6.4-3d (2026-05-29; megaudit blocker G):** drain the per-recompute UDF
+    /// diagnostic collector into the event stream as `Event::CellDiagnostic`.
+    /// Called by [`with_runtime`]/[`with_runtime_no_oplog`] AFTER the runtime
+    /// (and its borrow of `self.udf_diagnostics`) is dropped, so the fresh
+    /// `borrow_mut` here cannot overlap the dispatch-site borrows. The cell
+    /// VALUE was already written during recompute; this only surfaces WHY a
+    /// UDF failed. Severity is always `Error` for these codes.
+    ///
+    /// [`with_runtime`]: WorkbookSession::with_runtime
+    /// [`with_runtime_no_oplog`]: WorkbookSession::with_runtime_no_oplog
+    fn drain_udf_diagnostics(&mut self) {
+        let diags: Vec<UdfCellDiagnostic> = self.udf_diagnostics.borrow_mut().drain(..).collect();
+        for diag in diags {
+            self.events.push(Event::CellDiagnostic {
+                diagnostic: Diagnostic {
+                    addr: Some(diag.addr.into()),
+                    severity: Severity::Error,
+                    code: diag.code.to_string(),
+                    message: diag.message,
+                },
+            });
+        }
     }
 
     /// Like [`with_runtime`] but with the op-log **detached** — the mutators
@@ -475,10 +521,15 @@ impl WorkbookSession {
             cache,
             // 6.4-3c: lend the worker (disjoint field from the &mut borrows above).
             self.udf_worker.as_ref(),
+            // 6.4-3d (blocker G): lend the per-recompute diagnostic collector.
+            Some(&self.udf_diagnostics),
         );
         let out = f(&mut rt);
         self.plan_cache = rt.into_plan_cache();
         guard.armed = false;
+        // 6.4-3d (blocker G): release borrows, then drain UDF diagnostics.
+        drop(guard);
+        self.drain_udf_diagnostics();
         out
     }
 
@@ -818,11 +869,9 @@ impl WorkbookSession {
         // missed this one and `from_workbook` — both surfaced by the 6.4-1
         // cycle-2 Opus lane. Behavior-preserving today; prevents future
         // silent divergence once 6.4-2 wires `register_function`.
-        self.graph = CalcgraphSession::rebuild_from_workbook_with_registry(
-            &self.workbook,
-            &self.registry,
-        )
-        .session;
+        self.graph =
+            CalcgraphSession::rebuild_from_workbook_with_registry(&self.workbook, &self.registry)
+                .session;
         // Recompute computed values with the op-log detached (no spurious ops /
         // no UndoManager commit). The result's failures become diagnostics.
         let result = self.with_runtime_no_oplog(|rt| rt.recompute_all());
@@ -1132,7 +1181,18 @@ impl EngineSession for WorkbookSession {
         // graph correctly the first time avoids the wasteful double build and
         // keeps the pre-recompute graph consistent.)
         let registry = Arc::clone(&self.registry);
+        // **6.4-3d (megaudit blocker D1):** preserve the live Python-UDF worker
+        // across the wholesale `*self = ...` replacement. `take()` leaves `None`
+        // in the about-to-be-dropped old self (so its `Drop` kills nothing), and
+        // we re-home the worker into the rebuilt session BEFORE the recompute
+        // below — so a `=MYUDF(..)` recomputes against the live worker instead
+        // of being destroyed to `#CALC!`. Moving the `RefCell<Box<..>>` (a
+        // by-value IPC handle) never signals the child process. When no worker
+        // is configured, this is `None` and blocker D2 (recompute preserves
+        // saved UDF values) keeps the loaded values intact.
+        let preserved_worker = self.udf_worker.take();
         *self = Self::from_workbook_with_registry(wb, registry);
+        self.udf_worker = preserved_worker;
         // Recompute on open — mirrors the canonical IDE path
         // (`loader.rs::load_workbook_and_recompute`): the saved computed values
         // may be stale relative to their inputs. Run with the op-log DETACHED so
@@ -1210,7 +1270,10 @@ impl EngineSession for WorkbookSession {
                 // Adopting via `from_workbook_with_registry` is what keeps the
                 // graph extracted against the preserved UDF-aware registry.
                 let registry = Arc::clone(&self.registry);
+                // 6.4-3d (blocker D1): preserve the live UDF worker across the swap.
+                let preserved_worker = self.udf_worker.take();
                 *self = Self::from_workbook_with_registry(result.workbook, registry);
+                self.udf_worker = preserved_worker;
                 self.push_xlsx_import_diagnostics(&report);
                 Ok(())
             }
@@ -1229,7 +1292,10 @@ impl EngineSession for WorkbookSession {
                 // formulas so the graph is empty either way, but the adoption
                 // pattern stays uniform and correct).
                 let registry = Arc::clone(&self.registry);
+                // 6.4-3d (blocker D1): preserve the live UDF worker across the swap.
+                let preserved_worker = self.udf_worker.take();
                 *self = Self::from_workbook_with_registry(result.workbook, registry);
+                self.udf_worker = preserved_worker;
                 Ok(())
             }
             other => Err(EngineError::bad_argument(format!(
@@ -3313,7 +3379,10 @@ mod tests {
     fn register_function_succeeds_and_list_functions_includes_then_excludes_it() {
         let mut s = WorkbookSession::new();
         let initial_count = s.list_functions().unwrap().len();
-        assert!(initial_count > 200, "fresh session must hold the built-ins (~260)");
+        assert!(
+            initial_count > 200,
+            "fresh session must hold the built-ins (~260)"
+        );
 
         s.register_function(udf_meta("MYUDF"), FunctionImplHandle(0xABCD))
             .expect("register_function clean");
@@ -3324,9 +3393,18 @@ mod tests {
             .find(|m| m.canonical_name == "MYUDF")
             .expect("MYUDF must appear in list_functions");
         // Metadata faithful end-to-end.
-        assert_eq!(myudf.volatility, ql_session::function_meta::Volatility::Volatile);
-        assert_eq!(myudf.batch_shape, ql_session::function_meta::BatchShape::ArrayBatch);
-        assert_eq!(myudf.arg_context, ql_session::function_meta::ArgContext::Aggregate);
+        assert_eq!(
+            myudf.volatility,
+            ql_session::function_meta::Volatility::Volatile
+        );
+        assert_eq!(
+            myudf.batch_shape,
+            ql_session::function_meta::BatchShape::ArrayBatch
+        );
+        assert_eq!(
+            myudf.arg_context,
+            ql_session::function_meta::ArgContext::Aggregate
+        );
         assert_eq!(myudf.provenance_tags, vec!["python".to_string()]);
 
         s.unregister_function("MYUDF").expect("unregister clean");
@@ -3570,6 +3648,206 @@ mod tests {
             .expect("register_function clean");
     }
 
+    /// **6.4-3d (blocker C1):** register `name` as a Reference-context,
+    /// NON-volatile (`Pure`) Python UDF — so a literal multi-cell range arg
+    /// (`=MYUDF(A1:A2)`) binds as a `RangeRef` and re-evaluation is driven ONLY
+    /// by the literal-range dependency, NOT by volatility (a `Volatile` UDF
+    /// would always re-eval and mask whether the dep is actually tracked).
+    fn register_udf_reference(s: &mut WorkbookSession, name: &str, handle: u64) {
+        use ql_session::function_meta::{ArgContext, Volatility};
+        let mut meta = udf_meta(name);
+        meta.arg_context = ArgContext::Reference;
+        meta.volatility = Volatility::Pure;
+        meta.determinism = true;
+        s.register_function(meta, FunctionImplHandle(handle))
+            .expect("register_function clean");
+    }
+
+    /// **6.4-3d (megaudit blocker G):** a registered UDF with NO worker yields
+    /// `#CALC!` AND a structured `udf_no_worker` `CellDiagnostic` (value
+    /// unchanged; the diagnostic explains WHY — exit test 7).
+    #[test]
+    fn udf_no_worker_emits_diagnostic() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        register_udf(&mut s, "MYUDF", 7);
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 21.0 })
+            .unwrap();
+        // No worker configured → dispatch yields #CALC! AND a diagnostic.
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap();
+        assert!(
+            matches!(cell_value(&s, addr(sheet, 0, 1)), CellValue::Error { error } if error == "#CALC!"),
+            "no-worker UDF cell value is #CALC!"
+        );
+        let page = s.poll_events(EventCursor(0)).unwrap();
+        assert!(
+            page.events.iter().any(|e| matches!(
+                e,
+                Event::CellDiagnostic { diagnostic }
+                    if diagnostic.code == "udf_no_worker"
+                        && diagnostic.addr == Some(addr(sheet, 0, 1))
+            )),
+            "set_formula with no worker must emit a udf_no_worker CellDiagnostic"
+        );
+    }
+
+    /// **6.4-3d (megaudit blocker G):** a UDF that RAISES yields `#CALC!` AND a
+    /// `udf_raised` `CellDiagnostic` carrying `"{exc_type}: {message}"`.
+    #[test]
+    fn udf_raised_emits_diagnostic_with_exc_type() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        register_udf(&mut s, "MYUDF", 7);
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 21.0 })
+            .unwrap();
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(|_h, _a| {
+            Err(ql_udf::UdfError::Raised {
+                exc_type: "ValueError".into(),
+                message: "boom".into(),
+            })
+        })));
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap();
+        // Value mapping unchanged: a raise → #CALC! (additive diagnostic).
+        assert!(
+            matches!(cell_value(&s, addr(sheet, 0, 1)), CellValue::Error { error } if error == "#CALC!"),
+            "raised UDF cell value is #CALC!"
+        );
+        let page = s.poll_events(EventCursor(0)).unwrap();
+        assert!(
+            page.events.iter().any(|e| matches!(
+                e,
+                Event::CellDiagnostic { diagnostic }
+                    if diagnostic.code == "udf_raised" && diagnostic.message == "ValueError: boom"
+            )),
+            "a raised UDF must emit a udf_raised diagnostic carrying exc_type: message"
+        );
+    }
+
+    /// **6.4-3d (megaudit blocker C1):** a literal multi-cell range arg of a
+    /// Reference-context UDF (`=MYSUM(A1:A2)`) is dep-tracked — editing a cell
+    /// INSIDE the range re-evaluates the UDF. Pre-6.4-3d the range recorded no
+    /// dep and the UDF went silently stale. The UDF is `Pure` (non-volatile) so
+    /// the re-eval is driven solely by the literal-range dependency.
+    #[test]
+    fn udf_literal_multicell_range_arg_tracks_edits() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        register_udf_reference(&mut s, "MYSUM", 7);
+        // Worker sums every value in the grid it receives.
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+            |_h, args: &ql_types::ArrayValue| {
+                let mut total = 0.0;
+                for r in 0..args.rows() {
+                    for c in 0..args.cols() {
+                        if let Some(Value::Number(n)) = args.get(r, c) {
+                            total += *n;
+                        }
+                    }
+                }
+                Ok(ql_types::ArrayValue::singleton(Value::Number(total)))
+            },
+        )));
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap(); // A1
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 2.0 })
+            .unwrap(); // A2
+        s.set_formula(addr(sheet, 0, 1), "MYSUM(A1:A2)").unwrap(); // B1 = 1+2 = 3
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 1)),
+            CellValue::Number { number: 3.0 }
+        );
+        // Edit A2 INSIDE the literal range → the UDF must re-evaluate.
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 5.0 })
+            .unwrap(); // A2 = 5
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 1)),
+            CellValue::Number { number: 6.0 },
+            "editing A2 inside MYSUM(A1:A2) must re-evaluate the UDF (literal-range dep tracked)"
+        );
+    }
+
+    /// **6.4-3d (megaudit blocker D):** open/load is non-destructive for saved
+    /// UDF values. D2: opening with NO worker PRESERVES the saved value instead
+    /// of recomputing it to `#CALC!` (and a dependent stays correct). D1: a
+    /// worker present BEFORE open is preserved across the wholesale `*self = ..`
+    /// swap, so open's recompute uses it.
+    #[test]
+    fn open_preserves_saved_udf_value_and_preserves_worker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("udf.qbook");
+        let path_str = path.to_str().unwrap();
+
+        // Author with a DOUBLING worker: A1=21, B1=MYUDF(A1)=42, C1=B1+1=43.
+        let sheet;
+        {
+            let mut s = WorkbookSession::new();
+            sheet = s.add_sheet("S", 16384).unwrap();
+            register_udf(&mut s, "MYUDF", 7);
+            s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+                |_h, args: &ql_types::ArrayValue| {
+                    let n = match args.get(0, 0) {
+                        Some(Value::Number(x)) => *x,
+                        o => panic!("expected number, got {o:?}"),
+                    };
+                    Ok(ql_types::ArrayValue::singleton(Value::Number(n * 2.0)))
+                },
+            )));
+            s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 21.0 })
+                .unwrap();
+            s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap(); // B1 = 42
+            s.set_formula(addr(sheet, 0, 2), "B1+1").unwrap(); // C1 = 43
+            assert_eq!(
+                cell_value(&s, addr(sheet, 0, 1)),
+                CellValue::Number { number: 42.0 }
+            );
+            assert_eq!(
+                cell_value(&s, addr(sheet, 0, 2)),
+                CellValue::Number { number: 43.0 }
+            );
+            s.save(path_str).unwrap();
+        }
+
+        // (D2) Open with NO worker → saved values PRESERVED, not destroyed.
+        {
+            let mut s2 = WorkbookSession::new();
+            register_udf(&mut s2, "MYUDF", 7); // registry is session tooling, re-registered
+            s2.open(path_str).unwrap();
+            assert_eq!(
+                cell_value(&s2, addr(sheet, 0, 1)),
+                CellValue::Number { number: 42.0 },
+                "D2: open with no worker must PRESERVE the saved UDF value, not destroy it to #CALC!"
+            );
+            assert_eq!(
+                cell_value(&s2, addr(sheet, 0, 2)),
+                CellValue::Number { number: 43.0 },
+                "D2: a dependent of a preserved UDF cell stays correct"
+            );
+        }
+
+        // (D1) Open in a session that HAS a TRIPLING worker → the worker is
+        // preserved across the swap, so open's recompute uses it: 21*3 = 63.
+        {
+            let mut s3 = WorkbookSession::new();
+            register_udf(&mut s3, "MYUDF", 7);
+            s3.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+                |_h, args: &ql_types::ArrayValue| {
+                    let n = match args.get(0, 0) {
+                        Some(Value::Number(x)) => *x,
+                        o => panic!("expected number, got {o:?}"),
+                    };
+                    Ok(ql_types::ArrayValue::singleton(Value::Number(n * 3.0)))
+                },
+            )));
+            s3.open(path_str).unwrap();
+            assert_eq!(
+                cell_value(&s3, addr(sheet, 0, 1)),
+                CellValue::Number { number: 63.0 },
+                "D1: a worker present before open is preserved across the swap; open's recompute uses it (21*3=63)"
+            );
+        }
+    }
+
     /// **6.4-3c (2026-05-29):** the wedge — a registered UDF with a worker
     /// actually COMPUTES. `=MYUDF(A1)` with `A1=21` and a doubling worker → 42.
     /// Inverts the old "registered UDF stays #NAME?" assertion.
@@ -3579,13 +3857,15 @@ mod tests {
         let sheet = s.add_sheet("S", 16384).unwrap();
         register_udf(&mut s, "MYUDF", 7);
         // Doubling worker: read the single scalar arg, return n*2 as a 1×1 grid.
-        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(|_handle, args: &ql_types::ArrayValue| {
-            let n = match args.get(0, 0) {
-                Some(Value::Number(x)) => *x,
-                other => panic!("expected a number arg, got {other:?}"),
-            };
-            Ok(ql_types::ArrayValue::singleton(Value::Number(n * 2.0)))
-        })));
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+            |_handle, args: &ql_types::ArrayValue| {
+                let n = match args.get(0, 0) {
+                    Some(Value::Number(x)) => *x,
+                    other => panic!("expected a number arg, got {other:?}"),
+                };
+                Ok(ql_types::ArrayValue::singleton(Value::Number(n * 2.0)))
+            },
+        )));
         s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 21.0 })
             .unwrap();
         // set_formula evaluates immediately through the worker-carrying env.
@@ -3648,7 +3928,9 @@ mod tests {
         let sheet = s.add_sheet("S", 16384).unwrap();
         register_udf(&mut s, "MYUDF", 7);
         s.set_udf_worker(Box::new(ql_udf::MockWorker::new(|_h, _a| {
-            Err(ql_udf::UdfError::Timeout(std::time::Duration::from_millis(1)))
+            Err(ql_udf::UdfError::Timeout(std::time::Duration::from_millis(
+                1,
+            )))
         })));
         s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
             .unwrap();
@@ -3722,16 +4004,19 @@ mod tests {
         let sheet = s.add_sheet("S", 16384).unwrap();
         register_udf(&mut s, "MYUDF", 7);
         register_udf(&mut s, "MYUDF2", 8);
-        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(|_h, args: &ql_types::ArrayValue| {
-            let n = match args.get(0, 0) {
-                Some(Value::Number(x)) => *x,
-                other => panic!("expected a number arg, got {other:?}"),
-            };
-            Ok(ql_types::ArrayValue::singleton(Value::Number(n * 2.0)))
-        })));
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+            |_h, args: &ql_types::ArrayValue| {
+                let n = match args.get(0, 0) {
+                    Some(Value::Number(x)) => *x,
+                    other => panic!("expected a number arg, got {other:?}"),
+                };
+                Ok(ql_types::ArrayValue::singleton(Value::Number(n * 2.0)))
+            },
+        )));
         s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 21.0 })
             .unwrap();
-        s.set_formula(addr(sheet, 0, 1), "MYUDF(MYUDF2(A1))").unwrap();
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(MYUDF2(A1))")
+            .unwrap();
         assert_eq!(
             cell_value(&s, addr(sheet, 0, 1)),
             CellValue::Number { number: 84.0 },
@@ -3754,12 +4039,24 @@ mod tests {
         // names) — hence the "MyRange*" prefix, matching the single-range test.
         s.set_name(
             "MyRangeA",
-            CellRange { sheet, start_row: 0, start_col: 0, end_row: 1, end_col: 0 },
+            CellRange {
+                sheet,
+                start_row: 0,
+                start_col: 0,
+                end_row: 1,
+                end_col: 0,
+            },
         )
         .expect("set_name MyRangeA");
         s.set_name(
             "MyRangeB",
-            CellRange { sheet, start_row: 0, start_col: 0, end_row: 1, end_col: 0 },
+            CellRange {
+                sheet,
+                start_row: 0,
+                start_col: 0,
+                end_row: 1,
+                end_col: 0,
+            },
         )
         .expect("set_name MyRangeB");
         register_udf(&mut s, "MYUDF", 7);
@@ -3768,7 +4065,8 @@ mod tests {
         s.set_udf_worker(Box::new(ql_udf::MockWorker::new(|_h, _a| {
             Ok(ql_types::ArrayValue::singleton(Value::Number(0.0)))
         })));
-        s.set_formula(addr(sheet, 0, 1), "MYUDF(MyRangeA, MyRangeB)").unwrap();
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(MyRangeA, MyRangeB)")
+            .unwrap();
         let got = cell_value(&s, addr(sheet, 0, 1));
         assert!(
             matches!(&got, CellValue::Error { error } if error == "#VALUE!"),
@@ -3795,7 +4093,8 @@ mod tests {
             },
         )));
         // SEQUENCE(2,2) is a real Unified-tier built-in producing a 2×2 grid.
-        s.set_formula(addr(sheet, 0, 1), "MYUDF(SEQUENCE(2,2))").unwrap();
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(SEQUENCE(2,2))")
+            .unwrap();
         assert_eq!(
             cell_value(&s, addr(sheet, 0, 1)),
             CellValue::Number { number: 22.0 },
@@ -4006,7 +4305,11 @@ mod tests {
         let pre = s
             .set_formula(addr(sheet, 0, 1), "MYUDF(MyRange)")
             .expect_err("MYUDF(MyRange) MUST fail to bind while MYUDF is unknown");
-        assert_eq!(pre.class, ErrorClass::Compute, "pre-registration error class");
+        assert_eq!(
+            pre.class,
+            ErrorClass::Compute,
+            "pre-registration error class"
+        );
         assert_eq!(pre.code, "formula_bind", "pre-registration error code");
         assert!(
             pre.message.contains("scalar position")
@@ -4024,9 +4327,8 @@ mod tests {
         // named-range arg under AggregateNameRef context). Whether eval
         // produces #NAME? or something else depends on dispatch (still
         // missing in v1), but the BIND must pass.
-        s.set_formula(addr(sheet, 1, 1), "MYUDF(MyRange)").expect(
-            "MYUDF(MyRange) MUST bind after registering MYUDF with arg_context=Aggregate",
-        );
+        s.set_formula(addr(sheet, 1, 1), "MYUDF(MyRange)")
+            .expect("MYUDF(MyRange) MUST bind after registering MYUDF with arg_context=Aggregate");
         // The cell exists (formula is stored).
         let c1 = s.cell(addr(sheet, 1, 1)).unwrap();
         assert!(
@@ -6586,18 +6888,4 @@ mod tests {
     /// across processes. This test catches a regression that would break the
     /// stability guarantee at the same locus (Vec field ordering).
     #[test]
-    fn snapshot_formats_are_stable_across_calls() {
-        let mut s = WorkbookSession::new();
-        for fmt in ["@", "0.00", "yyyy-mm-dd", "0%"] {
-            s.register_format(fmt).unwrap();
-        }
-        let a = s.snapshot().unwrap();
-        let b = s.snapshot().unwrap();
-        let ids_a: Vec<_> = a.formats.iter().map(|fd| fd.id).collect();
-        let ids_b: Vec<_> = b.formats.iter().map(|fd| fd.id).collect();
-        assert_eq!(
-            ids_a, ids_b,
-            "two consecutive snapshots must produce identical formats order"
-        );
-    }
-}
+    fn snapshot_formats_are_stable_acros

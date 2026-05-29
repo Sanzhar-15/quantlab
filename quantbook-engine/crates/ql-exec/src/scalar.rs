@@ -399,7 +399,8 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 | ExprPlan::StructuredRef { .. }
                         )
                     });
-                    if has_range_or_array_arg && crate::plan::is_aggregate_function(registry, name) {
+                    if has_range_or_array_arg && crate::plan::is_aggregate_function(registry, name)
+                    {
                         // Multi-range / mixed aggregate args: materialize
                         // every range AND every array literal, then call
                         // the function. No cache use (V2 may add multi-
@@ -1028,7 +1029,8 @@ fn marshal_udf_args<E: CellEnv>(
             ExprPlan::AggregateNameRef { range, .. } | ExprPlan::RangeRef { range } => {
                 let (values, rows, cols) = env.read_range_with_shape(*range);
                 Ok(Arg::Grid(
-                    ArrayValue::new(rows as u32, cols as u32, values).map_err(|_| ErrorValue::Value)?,
+                    ArrayValue::new(rows as u32, cols as u32, values)
+                        .map_err(|_| ErrorValue::Value)?,
                 ))
             }
             ExprPlan::StructuredRef {
@@ -1039,7 +1041,8 @@ fn marshal_udf_args<E: CellEnv>(
                 let range = narrow_structured_ref(*resolved, *is_this_row, env)?;
                 let (values, rows, cols) = env.read_range_with_shape(range);
                 Ok(Arg::Grid(
-                    ArrayValue::new(rows as u32, cols as u32, values).map_err(|_| ErrorValue::Value)?,
+                    ArrayValue::new(rows as u32, cols as u32, values)
+                        .map_err(|_| ErrorValue::Value)?,
                 ))
             }
             ExprPlan::Array(rows) => {
@@ -1073,7 +1076,9 @@ fn marshal_udf_args<E: CellEnv>(
                 }
             }
             // Plain scalar arg.
-            other => Ok(Arg::Scalar(eval_scalar_with_cache(other, env, registry, cache))),
+            other => Ok(Arg::Scalar(eval_scalar_with_cache(
+                other, env, registry, cache,
+            ))),
         }
     }
 
@@ -1081,7 +1086,10 @@ fn marshal_udf_args<E: CellEnv>(
     for a in args {
         evaluated.push(eval_arg(a, env, registry, cache)?);
     }
-    let n_grid = evaluated.iter().filter(|a| matches!(a, Arg::Grid(_))).count();
+    let n_grid = evaluated
+        .iter()
+        .filter(|a| matches!(a, Arg::Grid(_)))
+        .count();
 
     // All scalar (incl. the zero-arg case → a 1×0 row): pack a 1×N row.
     if n_grid == 0 {
@@ -1130,6 +1138,14 @@ fn dispatch_udf<E: CellEnv>(
     use ql_functions::FunctionReturn;
     let Some(worker_cell) = env.udf_worker() else {
         // Registered, but no worker wired to this session → can't compute.
+        // **6.4-3d (blocker G):** record WHY as a structured diagnostic
+        // (additive — the cell value is still `#CALC!`); distinguishes
+        // no-worker from a Python raise / worker death for the IDE.
+        push_udf_cell_diagnostic(
+            env,
+            "udf_no_worker",
+            "no Python worker is configured for this session".to_string(),
+        );
         return FunctionReturn::Scalar(Value::Error(ErrorValue::Calc));
     };
     let mut worker = worker_cell.borrow_mut();
@@ -1152,16 +1168,65 @@ fn dispatch_udf<E: CellEnv>(
                 FunctionReturn::Array(grid)
             }
         }
-        Err(e) => FunctionReturn::Scalar(Value::Error(map_udf_error(&e))),
+        Err(e) => {
+            // **6.4-3d (blocker G):** emit a structured diagnostic alongside
+            // the cell error value (the value mapping is unchanged — still
+            // `#TIMEOUT!`/`#CALC!`).
+            let (code, message) = udf_error_diagnostic(&e);
+            push_udf_cell_diagnostic(env, code, message);
+            FunctionReturn::Scalar(Value::Error(map_udf_error(&e)))
+        }
+    }
+}
+
+/// **6.4-3d (2026-05-29; megaudit blocker G):** push a [`UdfCellDiagnostic`] for
+/// the current formula cell into the env's per-recompute collector (a no-op when
+/// the env carries no collector or no formula cell). Keyed by the formula's own
+/// address (`env_formula_cell`), which the recompute / `set_formula` env sites
+/// always set.
+fn push_udf_cell_diagnostic<E: CellEnv + ?Sized>(env: &E, code: &'static str, message: String) {
+    if let Some(addr) = env_formula_cell(env) {
+        env.push_udf_diagnostic(crate::env::UdfCellDiagnostic {
+            addr,
+            code,
+            message,
+        });
+    }
+}
+
+/// **6.4-3d (2026-05-29; megaudit blocker G):** map a [`ql_udf::UdfError`] to a
+/// stable diagnostic `code` + a human-readable `message`. Parallels
+/// [`map_udf_error`] (which maps to the cell VALUE); this maps to the structured
+/// `CellDiagnostic` detail so the IDE can show WHY a UDF failed (exit test 7).
+fn udf_error_diagnostic(e: &ql_udf::UdfError) -> (&'static str, String) {
+    use ql_udf::UdfError;
+    match e {
+        UdfError::Raised { exc_type, message } => ("udf_raised", format!("{exc_type}: {message}")),
+        UdfError::Timeout(d) => (
+            "udf_timeout",
+            format!("UDF call exceeded its deadline ({d:?})"),
+        ),
+        UdfError::Cancelled => ("udf_cancelled", "UDF call cancelled".to_string()),
+        UdfError::Handshake { expected, got } => (
+            "udf_handshake",
+            format!("worker handshake failed: protocol mismatch (engine {expected}, worker {got})"),
+        ),
+        UdfError::Protocol(m) => ("udf_protocol", format!("worker protocol violation: {m}")),
+        UdfError::WorkerDied(m) => (
+            "udf_worker_died",
+            format!("Python worker died / transport broken: {m}"),
+        ),
+        UdfError::Codec(c) => ("udf_codec", format!("UDF argument/return codec error: {c}")),
     }
 }
 
 /// **6.4-3c (2026-05-29):** map a [`ql_udf::UdfError`] to a deterministic cell
 /// error value. v1 is coarse: only `Timeout` → `#TIMEOUT!`; everything else
 /// (`Raised`/`Cancelled`/`Handshake`/`Protocol`/`WorkerDied`/`Codec`) → `#CALC!`.
-/// The structured `CellDiagnostic` (Python `exc_type`/`message`/`traceback`) that
-/// distinguishes these — exit test 7's real target — is deferred to the
-/// diagnostic-sink follow-up; the cell error itself is already visible here.
+/// This maps only the cell VALUE; the structured `CellDiagnostic` that
+/// distinguishes the variants (no-worker / raise / death — exit test 7's target)
+/// is emitted ADDITIONALLY by [`dispatch_udf`] via [`udf_error_diagnostic`] +
+/// [`push_udf_cell_diagnostic`] (6.4-3d, megaudit blocker G).
 fn map_udf_error(e: &ql_udf::UdfError) -> ErrorValue {
     match e {
         ql_udf::UdfError::Timeout(_) => ErrorValue::Timeout,
@@ -2643,10 +2708,4 @@ mod tests {
             name: Arc::from("SEQUENCE"),
             args: vec![ExprPlan::Number(0.0)],
         };
-        let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
-        match r {
-            EvalResult::Scalar(Value::Error(ErrorValue::Num)) => {}
-            other => panic!("expected Scalar(#NUM!), got {other:?}"),
-        }
-    }
-}
+        let r = eval_at_cell_boundary

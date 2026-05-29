@@ -334,6 +334,20 @@ pub struct FormulaDeps {
     /// (uppercase) `Arc<str>` from `ExprPlan::Function.name` — already
     /// canonicalized by the parser.
     pub functions_used: Vec<Arc<str>>,
+    /// **6.4-3d (2026-05-29; megaudit blocker C1):** literal multi-cell range
+    /// refs (`ExprPlan::RangeRef` whose start != end) that a value-consuming
+    /// function reads — notably a Reference-context UDF, e.g. `=MYUDF(A1:A2)`.
+    /// 1×1 ranges go to `cells`; multi-cell literal ranges land here and are
+    /// registered with the Graph's stripe index by the registration loop in
+    /// `extract_and_register_deps` (which keys purely by `Range`, not by name —
+    /// the same path `named_ranges` uses), so editing any cell inside the range
+    /// dirties the formula. Pre-6.4-3d a multi-cell literal range recorded NO
+    /// dep, so a UDF reading its values went silently stale on edits (blocker
+    /// C). Over-tracks value-INDEPENDENT consumers (ISFORMULA/FORMULATEXT
+    /// multi-cell args → `#N/A`), but that is a harmless re-eval to the same
+    /// value, never a wrong result. Like `named_ranges`, NOT deduped (duplicate
+    /// registration is idempotent for invalidation).
+    pub literal_ranges: Vec<Range>,
 }
 
 impl FormulaDeps {
@@ -359,6 +373,7 @@ impl FormulaDeps {
             + self.names.len()
             + self.tables.len()
             + self.functions_used.len()
+            + self.literal_ranges.len()
             + usize::from(self.is_volatile)
     }
 
@@ -374,6 +389,7 @@ impl FormulaDeps {
             && self.names.is_empty()
             && self.tables.is_empty()
             && self.functions_used.is_empty()
+            && self.literal_ranges.is_empty()
             && !self.is_volatile
     }
 }
@@ -502,6 +518,15 @@ pub(crate) fn walk_plan_for_deps(
             if range.start_row == range.end_row && range.start_col == range.end_col {
                 deps.cells
                     .push((range.sheet, range.start_row, range.start_col));
+            } else {
+                // **6.4-3d (megaudit blocker C1):** a multi-cell literal
+                // range. A value-consuming function (a Reference-context UDF
+                // reading `=MYUDF(A1:A2)`) depends on the range's VALUES, so
+                // track it via the stripe index (registered by
+                // `extract_and_register_deps`, keyed by range). Value-
+                // independent consumers (ISFORMULA/FORMULATEXT multi-cell →
+                // `#N/A`) over-track harmlessly (re-eval to the same value).
+                deps.literal_ranges.push(*range);
             }
         }
         // **W5-99 (Phase 4.7.F):** array-literal and error-literal plans
@@ -985,6 +1010,16 @@ impl CalcgraphSession {
         // fallback (today every conversion sets `range.sheet =
         // Some(_)`, so the fallback is unused).
         for (_, range) in &deps.named_ranges {
+            let range_ref = range_to_rangeref(*range);
+            self.graph
+                .register_range_dependency(formula_node, range_ref, formula_sheet);
+        }
+        // **6.4-3d (megaudit blocker C1):** literal multi-cell range deps
+        // register through the SAME stripe path — `register_range_dependency`
+        // keys by range, not name, so an unnamed literal range (`=MYUDF(A1:A2)`)
+        // tracks edits identically to a named range. Cleanup is automatic:
+        // `clear_range_deps_for_formula` (on re-bind) is name-agnostic.
+        for range in &deps.literal_ranges {
             let range_ref = range_to_rangeref(*range);
             self.graph
                 .register_range_dependency(formula_node, range_ref, formula_sheet);
@@ -2856,7 +2891,9 @@ mod tests {
         let myudf_caller = s.cell_node_for(0, 0, 0).unwrap();
         let unrelated = s.cell_node_for(0, 1, 1).unwrap();
         assert!(
-            s.functions_used_for("MYUDF").unwrap().contains(&myudf_caller),
+            s.functions_used_for("MYUDF")
+                .unwrap()
+                .contains(&myudf_caller),
             "the walker MUST record `MYUDF` even for unregistered names — \
              otherwise on_function_registered has nothing to dirty"
         );
@@ -2929,7 +2966,11 @@ mod tests {
         let s = r.session;
         let node = s.cell_node_for(0, 0, 0).unwrap();
         let set = s.functions_used_for("NOW").unwrap();
-        assert_eq!(set.len(), 1, "the formula appears ONCE in functions_used[NOW]");
+        assert_eq!(
+            set.len(),
+            1,
+            "the formula appears ONCE in functions_used[NOW]"
+        );
         assert!(set.contains(&node));
     }
 
@@ -2958,7 +2999,9 @@ mod tests {
             "the walker MUST record ROW into functions_used even though args route through address-only walker"
         );
         assert!(
-            s.functions_used_for("ISREF").unwrap().contains(&isref_caller),
+            s.functions_used_for("ISREF")
+                .unwrap()
+                .contains(&isref_caller),
             "the walker MUST record ISREF even though its arm short-circuits arg walking"
         );
     }
@@ -3003,9 +3046,9 @@ mod tests {
     #[test]
     fn on_function_registered_fans_dirty_transitively() {
         let wb = workbook_with_formulas(&[
-            (0, 0, 0, "NOW()"),   // A1 = NOW()
-            (0, 0, 1, "A1 + 1"),  // B1 = A1 + 1
-            (0, 0, 2, "B1 + 1"),  // C1 = B1 + 1
+            (0, 0, 0, "NOW()"),  // A1 = NOW()
+            (0, 0, 1, "A1 + 1"), // B1 = A1 + 1
+            (0, 0, 2, "B1 + 1"), // C1 = B1 + 1
         ]);
         let r = CalcgraphSession::rebuild_from_workbook(&wb);
         assert!(r.is_complete(), "NOW() + chain must bind");
@@ -3637,7 +3680,14 @@ mod tests {
         s.on_set_formula(0, 0, 1, &plan_b1_v1, &wb, &ql_functions::default_registry());
 
         // Step 2: B1 = "=1" — constant, no deps. clear_outgoing fires.
-        s.on_set_formula(0, 0, 1, &ExprPlan::Number(1.0), &wb, &ql_functions::default_registry());
+        s.on_set_formula(
+            0,
+            0,
+            1,
+            &ExprPlan::Number(1.0),
+            &wb,
+            &ql_functions::default_registry(),
+        );
 
         // Step 3: A1 = "=B1"
         let plan_a1 = ExprPlan::CellRef {
@@ -3700,7 +3750,14 @@ mod tests {
             name: Arc::from("SUM"),
             args: vec![plan_v1],
         };
-        s.on_set_formula(0, 0, 1, &plan_v1_wrapped, &wb, &ql_functions::default_registry());
+        s.on_set_formula(
+            0,
+            0,
+            1,
+            &plan_v1_wrapped,
+            &wb,
+            &ql_functions::default_registry(),
+        );
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         assert_eq!(
             s.graph().stripe_index().stripe_count(),
@@ -3724,7 +3781,14 @@ mod tests {
             name: Arc::from("SUM"),
             args: vec![plan_v2],
         };
-        s.on_set_formula(0, 0, 1, &plan_v2_wrapped, &wb, &ql_functions::default_registry());
+        s.on_set_formula(
+            0,
+            0,
+            1,
+            &plan_v2_wrapped,
+            &wb,
+            &ql_functions::default_registry(),
+        );
 
         // Stripe map: ONLY Column B now (Column A was cleared).
         assert_eq!(s.graph().stripe_index().stripe_count(), 1);
@@ -5276,13 +5340,4 @@ mod tests {
         s.on_table_rename("SALES", "ORDERS");
         let dirty = s.take_dirty();
         assert!(
-            dirty.contains(&f1),
-            "case-insensitive lookup must reach the reader"
-        );
-
-        // The deps.tables entry must be substituted (not retained as "Sales").
-        let deps = s.formula_deps(f1).unwrap();
-        assert!(deps.tables.iter().any(|t| t.as_ref() == "ORDERS"));
-        assert!(!deps.tables.iter().any(|t| t.as_ref() == "Sales"));
-    }
-}
+            dirty.c

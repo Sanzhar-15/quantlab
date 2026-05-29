@@ -30,10 +30,25 @@ use ql_storage::{SpillShape, Workbook};
 use ql_types::{ColId, ErrorValue, RowId, SheetId, Value};
 
 use crate::env::WorkbookEnv;
-use crate::plan::{bind_with_site, BindError, BindSite};
+use crate::plan::{bind_with_site, BindError, BindSite, ExprPlan};
 use crate::plan_cache::PlanCacheKey;
 
 use super::{RecomputeFailure, RecomputeResult, RuntimeError, WorkbookRuntime};
+
+/// **6.4-3d (2026-05-29; megaudit blocker D2):** does the bound plan directly
+/// call any registered UDF? Reuses the exhaustive dependency walker, so it
+/// covers every `ExprPlan` shape and nested calls — and, matching dispatch
+/// semantics, does NOT descend ISREF's lazy-shape arg (which never reaches the
+/// worker). It therefore answers precisely "would a UDF actually dispatch when
+/// this cell recomputes." Used to PRESERVE a saved UDF-cell value when no worker
+/// is configured (the recompute would otherwise overwrite it with `#CALC!`).
+fn plan_references_udf(plan: &ExprPlan, registry: &ql_functions::FunctionRegistry) -> bool {
+    let mut deps = crate::calcgraph_session::FormulaDeps::default();
+    crate::calcgraph_session::walk_plan_for_deps(plan, &mut deps, registry);
+    deps.functions_used
+        .iter()
+        .any(|name| registry.udf_handle(name).is_some())
+}
 
 impl<'a> WorkbookRuntime<'a> {
     /// Re-evaluate every formula in the workbook. Used after `load_workbook` to
@@ -181,7 +196,9 @@ impl<'a> WorkbookRuntime<'a> {
             if cycled_cells.contains(&(sheet, row, col)) {
                 continue;
             }
-            match self.try_recompute_one_cached(sheet, row, col, &formula_text) {
+            // 6.4-3d (blocker D2): the LOAD path — preserve saved UDF values
+            // when no worker is configured (`true`).
+            match self.try_recompute_one_cached(sheet, row, col, &formula_text, true) {
                 Ok(value) => {
                     // Phase 3.5 (CORR-25): formula outputs route to the
                     // COMPUTED overlay, never the user lane.
@@ -380,8 +397,10 @@ impl<'a> WorkbookRuntime<'a> {
                 // have a reason to recompute? Cases:
                 //   a) Volatile (NOW/RAND/etc.) — always re-eval (its
                 //      value can change without any cell edit).
-                //   b) Has named-range deps — V1 conservatively re-evals
-                //      (we don't track per-cell-in-range changes yet).
+                //   b) Has named-range OR literal-range deps — V1
+                //      conservatively re-evals (we don't track per-cell-in-
+                //      range changes yet; 6.4-3d C1 added literal_ranges for
+                //      value-consuming UDF args like `=MYUDF(A1:A2)`).
                 //   c) Has at least one direct-cell dep that's a
                 //      formula in the original dirty set AND that
                 //      formula's value changed → re-eval.
@@ -394,7 +413,7 @@ impl<'a> WorkbookRuntime<'a> {
                 let needs_eval = if is_volatile {
                     true
                 } else if let Some(deps) = session.formula_deps(*node) {
-                    if !deps.named_ranges.is_empty() {
+                    if !deps.named_ranges.is_empty() || !deps.literal_ranges.is_empty() {
                         true
                     } else {
                         let mut had_dirty_dep = false;
@@ -449,7 +468,11 @@ impl<'a> WorkbookRuntime<'a> {
                 // post-bind — call a slightly-expanded helper that
                 // returns the value AND the SimdShape classification.
                 let agg_cache = session.aggregate_cache();
-                match self.try_recompute_with_simd_profile(sheet, row, col, &text, agg_cache) {
+                // 6.4-3d (blocker D2): live-edit path — do NOT preserve
+                // (`false`); a UDF cell with no worker recomputes honestly
+                // (e.g. a just-registered UDF goes `#NAME?` → `#CALC!`).
+                match self.try_recompute_with_simd_profile(sheet, row, col, &text, agg_cache, false)
+                {
                     Ok((value, simd_eligible, old_spill_shape, new_spill_shape)) => {
                         if simd_eligible {
                             simd_classified += 1;
@@ -707,6 +730,10 @@ impl<'a> WorkbookRuntime<'a> {
         row: RowId,
         col: ColId,
         formula_text: &Arc<str>,
+        // **6.4-3d (blocker D2):** see `try_recompute_with_simd_profile`. Only
+        // the load path (`recompute_all`) passes `true` — preserving a saved
+        // UDF value when no worker is configured.
+        preserve_saved_udf_when_no_worker: bool,
     ) -> Result<Value, RuntimeError> {
         self.try_recompute_with_aggregate_cache(
             sheet,
@@ -714,6 +741,7 @@ impl<'a> WorkbookRuntime<'a> {
             col,
             formula_text,
             &crate::aggregate_cache::NoAggregateCache,
+            preserve_saved_udf_when_no_worker,
         )
     }
 
@@ -733,9 +761,18 @@ impl<'a> WorkbookRuntime<'a> {
         col: ColId,
         formula_text: &Arc<str>,
         agg_cache: &dyn crate::aggregate_cache::AggregateCache,
+        // **6.4-3d (blocker D2):** see `try_recompute_with_simd_profile`.
+        preserve_saved_udf_when_no_worker: bool,
     ) -> Result<Value, RuntimeError> {
-        self.try_recompute_with_simd_profile(sheet, row, col, formula_text, agg_cache)
-            .map(|(v, _, _, _)| v)
+        self.try_recompute_with_simd_profile(
+            sheet,
+            row,
+            col,
+            formula_text,
+            agg_cache,
+            preserve_saved_udf_when_no_worker,
+        )
+        .map(|(v, _, _, _)| v)
     }
 
     /// Phase 3.9 (W5-42): like `try_recompute_with_aggregate_cache`
@@ -752,6 +789,15 @@ impl<'a> WorkbookRuntime<'a> {
         col: ColId,
         formula_text: &Arc<str>,
         agg_cache: &dyn crate::aggregate_cache::AggregateCache,
+        // **6.4-3d (megaudit blocker D2):** when `true` AND no worker is
+        // configured, a formula that calls a UDF PRESERVES its existing stored
+        // value instead of recomputing to `#CALC!`. Only the LOAD path
+        // (`recompute_all` over a freshly-loaded `.qbook`, where the stored
+        // value IS the trustworthy saved value) passes `true`. `recompute_dirty`
+        // passes `false`: there the stored value may be stale or an unrelated
+        // error (e.g. a just-registered UDF whose cell was `#NAME?` must become
+        // `#CALC!`, not stay `#NAME?`), so it must NOT be preserved.
+        preserve_saved_udf_when_no_worker: bool,
     ) -> Result<(Value, bool, Option<SpillShape>, Option<SpillShape>), RuntimeError> {
         let name_gen = self.workbook.names().generation();
         let fn_gen = self.registry.fn_generation();
@@ -810,6 +856,26 @@ impl<'a> WorkbookRuntime<'a> {
         // Pure function over the plan tree; no allocation.
         let simd_eligible = crate::lower::classify(plan.as_ref()).is_applicable();
 
+        // **6.4-3d (2026-05-29; megaudit blocker D2):** if this session has NO
+        // UDF worker AND the formula calls a UDF, PRESERVE the cell's existing
+        // computed value instead of recomputing it to `#CALC!` — which would
+        // destroy a value that was saved while a worker WAS present (`.qbook`
+        // persists computed values). Return the current value WITHOUT clearing
+        // the spill (the `clear_spill_if_present` below is skipped by this early
+        // return), so a saved spilled-array footprint survives too. Gated on
+        // `is_none()` so a worker-present session pays zero cost. The value
+        // re-derives to a fresh result once a worker is injected + `recalc_all`
+        // runs (per `set_udf_worker`'s doc). Soundness for DEPENDENTS: a skipped
+        // `B1=MYUDF(A1)` keeps its stored value, so `C1=B1+1` reads it and
+        // recomputes correctly in any order.
+        if preserve_saved_udf_when_no_worker
+            && self.udf_worker.is_none()
+            && plan_references_udf(plan.as_ref(), self.registry)
+        {
+            let existing = workbook.read(ql_types::Address::new(sheet, row, col));
+            return Ok((existing, simd_eligible, None, None));
+        }
+
         // **W5-103 megaudit HIGH-2 closure (#128, all 3 reviewers
         // cross-confirmed):** route through `eval_at_cell_boundary`
         // (same entry set_formula uses) so a top-level
@@ -855,10 +921,11 @@ impl<'a> WorkbookRuntime<'a> {
             // **6.4-3c (2026-05-29):** carry the session's UDF worker so a
             // recomputed `=MYUDF(A1)` dispatches to the Python worker (and an
             // array return spills via the cell-boundary path below).
-            let env = WorkbookEnv::with_formula_cell_and_worker(
+            let env = WorkbookEnv::with_formula_cell_worker_and_diagnostics(
                 self.workbook,
                 ql_types::Address::new(sheet, row, col),
                 self.udf_worker,
+                self.udf_diagnostics,
             );
             crate::scalar::eval_at_cell_boundary(plan.as_ref(), &env, self.registry, agg_cache)
         };

@@ -45,6 +45,7 @@ use ql_storage::{FormatId, Workbook};
 use ql_types::{ColId, RowId, SheetId, MAX_COLUMN, MAX_ROW};
 use ql_udf::UdfWorker;
 
+use crate::env::UdfCellDiagnostic;
 use crate::plan_cache::{PlanCache, PlanCacheStats};
 
 // **Tier D1 (2026-05-18) — Phase 5 prep monolith split.** Sibling
@@ -168,6 +169,14 @@ pub struct WorkbookRuntime<'a> {
     /// leaves it unused. The session owns the `RefCell<Box<dyn UdfWorker + Send>>`; the
     /// runtime only borrows it (single-threaded — `RefCell` is `!Sync`).
     udf_worker: Option<&'a RefCell<Box<dyn UdfWorker + Send>>>,
+    /// **6.4-3d (2026-05-29; megaudit blocker G):** borrowed per-recompute
+    /// collector for UDF-dispatch diagnostics, lent by the session alongside
+    /// `udf_worker`. Threaded into the value-computing env (recompute /
+    /// `set_formula`) so a failed `=MYUDF(..)` records WHY; `None` for every
+    /// non-session constructor (binding-only / standalone-transaction paths).
+    /// The session owns the `RefCell<Vec<_>>` and drains it after the runtime
+    /// borrow ends (single-threaded — `RefCell` is `!Sync`).
+    udf_diagnostics: Option<&'a RefCell<Vec<UdfCellDiagnostic>>>,
 }
 
 impl<'a> WorkbookRuntime<'a> {
@@ -180,6 +189,7 @@ impl<'a> WorkbookRuntime<'a> {
             format_cache: std::collections::HashMap::new(),
             graph: None,
             udf_worker: None,
+            udf_diagnostics: None,
         }
     }
 
@@ -205,6 +215,7 @@ impl<'a> WorkbookRuntime<'a> {
             format_cache: std::collections::HashMap::new(),
             graph: None,
             udf_worker: None,
+            udf_diagnostics: None,
         }
     }
 
@@ -228,6 +239,7 @@ impl<'a> WorkbookRuntime<'a> {
             format_cache: std::collections::HashMap::new(),
             graph: Some(graph),
             udf_worker: None,
+            udf_diagnostics: None,
         }
     }
 
@@ -251,6 +263,7 @@ impl<'a> WorkbookRuntime<'a> {
             format_cache: std::collections::HashMap::new(),
             graph: Some(graph),
             udf_worker: None,
+            udf_diagnostics: None,
         }
     }
 
@@ -289,6 +302,9 @@ impl<'a> WorkbookRuntime<'a> {
         // worker (`None` when none configured). Threaded into the eval env so
         // `=MYUDF(A1)` dispatches; mirrors the `plan_cache` threading style.
         udf_worker: Option<&'a RefCell<Box<dyn UdfWorker + Send>>>,
+        // **6.4-3d (2026-05-29; blocker G):** the per-recompute UDF-diagnostic
+        // collector, lent alongside the worker.
+        udf_diagnostics: Option<&'a RefCell<Vec<UdfCellDiagnostic>>>,
     ) -> Self {
         Self {
             workbook,
@@ -298,6 +314,7 @@ impl<'a> WorkbookRuntime<'a> {
             format_cache: std::collections::HashMap::new(),
             graph: Some(graph),
             udf_worker,
+            udf_diagnostics,
         }
     }
 
@@ -328,6 +345,8 @@ impl<'a> WorkbookRuntime<'a> {
         plan_cache: PlanCache,
         // **6.4-3c (2026-05-29):** see `with_session_state`.
         udf_worker: Option<&'a RefCell<Box<dyn UdfWorker + Send>>>,
+        // **6.4-3d (2026-05-29; blocker G):** see `with_session_state`.
+        udf_diagnostics: Option<&'a RefCell<Vec<UdfCellDiagnostic>>>,
     ) -> Self {
         Self {
             workbook,
@@ -337,6 +356,7 @@ impl<'a> WorkbookRuntime<'a> {
             format_cache: std::collections::HashMap::new(),
             graph: Some(graph),
             udf_worker,
+            udf_diagnostics,
         }
     }
 
