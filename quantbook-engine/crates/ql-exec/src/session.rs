@@ -6048,6 +6048,13 @@ mod tests {
             changed.contains(&(1, 2)) && changed.contains(&(2, 2)),
             "C2/C3 changed despite the anchor C1 being VEQ-unchanged — got {changed:?}"
         );
+        // The VEQ-invariant anchor C1 (value stays 1) must NOT be over-reported
+        // (audit LOW): the footprint enumeration skips the anchor and the VEQ
+        // short-circuit suppresses its write.
+        assert!(
+            !changed.contains(&(0, 2)),
+            "value-invariant anchor C1 must NOT be in the delta — got {changed:?}"
+        );
         // Confirm the new target values resolved correctly (1+10=11, 1+20=21).
         let c3 = d
             .changed_cells
@@ -6055,6 +6062,65 @@ mod tests {
             .find(|c| c.cell.row == 2 && c.cell.col == 2)
             .expect("C3 present");
         assert_eq!(c3.cell.value, Some(CellValue::Number { number: 21.0 }));
+    }
+
+    /// Audit HIGH-1 regression: a spill SHRUNK by a DEPENDENCY edit + `recalc_all`
+    /// (NOT `recalc_dirty`, NOT a direct anchor edit) must still report the
+    /// dropped targets as removed. The dissolving edit (`set_value(B1, ..)`)
+    /// records only B1; `recompute_all` walks anchors only and clears the old
+    /// spill internally — the fix captures the old footprint so A3/A4 surface.
+    #[test]
+    fn snapshot_delta_spill_recalc_all_dependency_shrink_reports_removed() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 1), CellValue::Number { number: 4.0 })
+            .unwrap();
+        // A1 = SEQUENCE(B1) spills B1 rows down column 0 (B1=4 → A1:A4).
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(B1)").unwrap();
+        let v1 = s.snapshot().unwrap().version;
+        s.set_value(addr(sheet, 0, 1), CellValue::Number { number: 2.0 })
+            .unwrap();
+        s.recalc_all().unwrap();
+        let d = s.snapshot_delta(&v1).unwrap();
+        assert!(!d.full_rebuild_required, "recalc_all does NOT bump the epoch");
+        let removed = delta_removed_coords(&d);
+        assert!(
+            removed.contains(&(2, 0)) && removed.contains(&(3, 0)),
+            "dependency-driven shrink via recalc_all must report A3/A4 removed — got removed={removed:?}"
+        );
+    }
+
+    /// Audit HIGH-2 regression: a spill anchor that becomes part of a CYCLE via a
+    /// recompute (a dependency edit, not a direct anchor edit) must dissolve its
+    /// footprint — old targets cleared from storage AND reported removed. The
+    /// cycled-node branch previously wrote `#CIRC!` without clearing the spill.
+    #[test]
+    fn snapshot_delta_spill_dissolved_when_anchor_becomes_cyclic() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 2), CellValue::Number { number: 3.0 })
+            .unwrap();
+        // A1 = SEQUENCE(C1) spills A1:A3 (C1=3). A2 = (1,0) is a spill target.
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(C1)").unwrap();
+        let v1 = s.snapshot().unwrap().version;
+        // Make C1 read A2 (a target of A1's spill) → A1→C1→A2(≈A1) cycle.
+        s.set_formula(addr(sheet, 0, 2), "A2").unwrap();
+        s.recalc_dirty().unwrap();
+        // Storage: the dissolved target A2 must carry no stale spilled value —
+        // a fully-cleared cell reports absent (`None`) or Blank, never the old 2.0.
+        let a2 = s.cell(addr(sheet, 1, 0)).unwrap();
+        assert!(
+            a2.as_ref()
+                .and_then(|c| c.value.clone())
+                .map_or(true, |v| v == CellValue::Blank),
+            "A2 must not retain a stale spilled value after cycle dissolution — got {a2:?}"
+        );
+        let d = s.snapshot_delta(&v1).unwrap();
+        let removed = delta_removed_coords(&d);
+        assert!(
+            removed.contains(&(1, 0)) && removed.contains(&(2, 0)),
+            "cycle-dissolved spill targets A2/A3 must be reported removed — got removed={removed:?}"
+        );
     }
 
     /// A token equal to the current version yields an empty (no-change) delta.

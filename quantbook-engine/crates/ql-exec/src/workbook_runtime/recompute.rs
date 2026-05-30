@@ -188,7 +188,23 @@ impl<'a> WorkbookRuntime<'a> {
         // the loop guarantees a non-cycled dependent that reads
         // from a cycled cell sees the error sigil and propagates
         // it, instead of reading a stale prior value.
+        // **H3 (6.3-0, audit HIGH-2 sibling):** a cycled cell that ANCHORED a
+        // spill has its footprint cleared here; record the dissolved non-anchor
+        // targets so a same-epoch `recalc_all` reports them removed (folded into
+        // `changed_cells` once it is constructed below). Mirrors the
+        // `recompute_dirty` cycle-branch fix.
+        let mut cycled_dissolved_targets: Vec<(SheetId, RowId, ColId)> = Vec::new();
         for &(sheet, row, col) in &cycled_cells {
+            if let Some(shape) = self.workbook.spill_anchor_at(sheet, row, col).copied() {
+                for dr in 0..shape.rows {
+                    for dc in 0..shape.cols {
+                        if dr == 0 && dc == 0 {
+                            continue;
+                        }
+                        cycled_dissolved_targets.push((sheet, row + dr, col + dc));
+                    }
+                }
+            }
             self.workbook.clear_spill_if_present((sheet, row, col));
             self.workbook
                 .put_computed_at(sheet, row, col, Value::Error(ErrorValue::Circ));
@@ -207,6 +223,8 @@ impl<'a> WorkbookRuntime<'a> {
         // them all as changed (a safe over-report for the delta change-log; the
         // cycled cells were written to `#CIRC!` in the pre-pass above).
         let mut changed_cells: Vec<(SheetId, RowId, ColId)> = Vec::with_capacity(attempted);
+        // **H3 (6.3-0):** dissolved-spill targets from cycled anchors (pre-pass).
+        changed_cells.extend(cycled_dissolved_targets);
 
         for (sheet, row, col, formula_text) in entries {
             changed_cells.push((sheet, row, col));
@@ -220,6 +238,16 @@ impl<'a> WorkbookRuntime<'a> {
             if cycled_cells.contains(&(sheet, row, col)) {
                 continue;
             }
+            // **H3 (6.3-0, audit HIGH-1):** capture the OLD spill shape BEFORE the
+            // recompute clears it. `try_recompute_one_cached` →
+            // `try_recompute_with_simd_profile` clears the old spill and writes the
+            // new one internally, but `try_recompute_with_aggregate_cache` DISCARDS
+            // both shapes (`.map(|(v,_,_,_)| v)`). Without capturing here, a spill
+            // that SHRINKS/DISSOLVES during a recompute-driven `recalc_all` pass
+            // (e.g. a DEPENDENCY cell changed — which records only its own coord,
+            // not the anchor's footprint) would leave its dropped targets absent
+            // from `snapshot_delta.removed_cells`.
+            let old_shape = self.workbook.spill_anchor_at(sheet, row, col).copied();
             // 6.4-3d (blocker D2): preserve saved UDF values only on the load
             // path (`preserve_saved_udf` — true only via
             // `recompute_all_preserving_saved_udf`, i.e. `open`).
@@ -230,23 +258,15 @@ impl<'a> WorkbookRuntime<'a> {
                     // COMPUTED overlay, never the user lane.
                     self.workbook.put_computed_at(sheet, row, col, value);
                     succeeded += 1;
-                    // **H3 (6.3-0):** if this formula spilled, record the
-                    // NON-anchor footprint too (the anchor was already pushed at
-                    // the top of the loop). recompute_all over-reports formula
-                    // cells for the delta, but still missed spill TARGETS — they
-                    // have no formula, so `iter_formulas()` never visits them.
-                    //
-                    // Dissolution is intentionally NOT handled here: this loop
-                    // walks anchors only, so a dissolved spill's OLD targets are
-                    // never visited. Every `recompute_all` caller either bumps
-                    // the epoch (`rematerialize`/`open`/`import` → full rebuild,
-                    // delta reseeded) or is `recalc_all`, where the direct edit
-                    // that dissolved the spill already recorded the old targets
-                    // as Blank (the Part-B direct-mutation path). The residual
-                    // (a formula-text dissolve, then `recalc_all` with no
-                    // intervening `recalc_dirty`) is an epoch-protected,
-                    // non-reachable edge.
-                    if let Some(shape) = self.workbook.spill_anchor_at(sheet, row, col).copied() {
+                    // **H3 (6.3-0):** record the OLD ∪ NEW non-anchor spill
+                    // footprint into `changed_cells` (the anchor was pushed above).
+                    // `snapshot_delta` resolves each coord against current state:
+                    // surviving/grown targets → changed, dropped targets → removed.
+                    // recompute_all otherwise misses spill TARGETS entirely (they
+                    // have no formula, so `iter_formulas()` never visits them) and,
+                    // pre-fix (audit HIGH-1), missed dropped targets on shrink too.
+                    let new_shape = self.workbook.spill_anchor_at(sheet, row, col).copied();
+                    for shape in [old_shape, new_shape].into_iter().flatten() {
                         for dr in 0..shape.rows {
                             for dc in 0..shape.cols {
                                 if dr == 0 && dc == 0 {
@@ -427,6 +447,29 @@ impl<'a> WorkbookRuntime<'a> {
                 let Some((sheet, row, col)) = session.cell_address_for(*node) else {
                     continue;
                 };
+                // **H3 (6.3-0, audit HIGH-2):** if this cell ANCHORED a spill that
+                // is now becoming `#CIRC!`, dissolve the old footprint and record
+                // its non-anchor targets. The cycled branch previously wrote
+                // `#CIRC!` at the anchor but NEVER cleared the spill (unlike
+                // `recompute_all`'s cycle pre-pass) — leaving stale target overlays
+                // in storage AND absent from `snapshot_delta`. Reachable when an
+                // anchor enters a cycle via a recompute (e.g. a dependency edit
+                // makes the formula cyclic), not a direct edit. Mirrors the
+                // dissolution recording of the sorted-spill branch below.
+                if let Some(old_shape) = self.workbook.spill_anchor_at(sheet, row, col).copied() {
+                    self.workbook.clear_spill_if_present((sheet, row, col));
+                    for dr in 0..old_shape.rows {
+                        for dc in 0..old_shape.cols {
+                            if dr == 0 && dc == 0 {
+                                continue;
+                            }
+                            changed.insert((sheet, row + dr, col + dc));
+                            // Dirty readers of the now-Blank target so they
+                            // re-evaluate within this fixed-point loop.
+                            session.on_set_value(sheet, row + dr, col + dc);
+                        }
+                    }
+                }
                 let prior_val = prior.get(&(sheet, row, col));
                 if prior_val == Some(&circ) {
                     skipped_value_equality += 1;
