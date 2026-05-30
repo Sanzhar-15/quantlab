@@ -358,6 +358,21 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (6.4-3d Step 5)`);
 				}
 			}
+			// **Phase 6.3-1b/6.3-1c (2026-05-30):** the recalc start/await/cancel
+			// window methods (6.3-1b) + the operation-status reader (6.3-1c). A
+			// stale cdylib lacks these -- fail at the boundary, not at the
+			// `startRecalcDirty is not a function` use site.
+			for (const method of [
+				'startRecalcDirty',
+				'startRecalcAll',
+				'awaitRecalc',
+				'cancel',
+				'operationStatus',
+			]) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (6.3-1b/6.3-1c)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

@@ -28,7 +28,7 @@
  */
 
 import type { CellSnapshotJson, CollabSessionInstance, EventJson, FormatIdJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
-import { appendPutFormulaValidated, appendPutValueValidated, parseQuantbookError, workbookSnapshot, workbookSnapshotDelta } from '../session';
+import { appendPutFormulaValidated, appendPutValueValidated, assertSupportedSchemaVersion, parseQuantbookError, workbookSnapshot, workbookSnapshotDelta } from '../session';
 
 /**
  * V3.2.c.3 / V3.2.c.5 (2026-05-22) -- classification of a single
@@ -762,6 +762,10 @@ export function extractSheetSnapshot(
 	snapshot: WorkbookSnapshotJson,
 	sheetId: number,
 ): QuantbookCellSnapshot | null {
+	// **Phase 6.3-1c M5 (2026-05-30):** the snapshot-ingest boundary -- fail loud
+	// if the engine DTO's schema version drifted from this IDE build's mirrors
+	// (gives `unsupported_schema_version` a producer; no-op when absent).
+	assertSupportedSchemaVersion(snapshot.schemaVersion);
 	const sheet: SheetSnapshotJson | undefined = snapshot.sheets.find(s => s.id === sheetId);
 	if (sheet === undefined) {
 		return null;
@@ -846,6 +850,19 @@ export function extractSheetSnapshot(
 			case 'pending':
 				typed = { kind: 'pending' };
 				break;
+			case 'blank':
+				// Phase 6.3-1c (2026-05-30): 'blank' is a KNOWN engine CellValue
+				// kind, but a workbook SNAPSHOT never carries blank cells -- the
+				// engine omits empty cells (CellSnapshot.value absent). A blank
+				// surfaces only via a columnar query_range read (reserved for
+				// v1.5). Seeing one in a snapshot entry is anomalous, so fail loud
+				// with an accurate message (No-Fallbacks: do not silently coerce a
+				// blank into pending/empty).
+				throw new Error(
+					`[bad_argument] extractSheetSnapshot: kind='blank' is unexpected in a ` +
+					`snapshot (the engine omits blank cells; blank surfaces only via ` +
+					`query_range) for cell (sheet=${sheetId}, row=${cell.row}, col=${cell.col}).`,
+				);
 			default:
 				throw new Error(
 					`[bad_argument] extractSheetSnapshot: unknown CellValueJson kind ` +

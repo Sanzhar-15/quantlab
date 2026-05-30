@@ -71,7 +71,13 @@ export interface PresenceStateJson {
  * `WorkbookSnapshotJson` surface.
  */
 export interface CellValueJson {
-	kind: 'number' | 'boolean' | 'text' | 'error' | 'pending';
+	// Phase 6.3-1c (2026-05-30): 'blank' added to mirror the engine's full
+	// CellValue variant set -- the napi converter (cell_value_json_from_session)
+	// emits kind:'blank' (all payloads absent) for CellValue::Blank. Snapshots
+	// still OMIT blank cells (CellSnapshot.value absent), so 'blank' surfaces on
+	// the wire only via a columnar query_range read (reserved for v1.5); declared
+	// now for forward DTO field-parity with the engine.
+	kind: 'number' | 'boolean' | 'text' | 'error' | 'pending' | 'blank';
 	// napi-rs serializes Rust Option<T>::None as ABSENT (undefined) at the JS
 	// layer, NOT null.  Declared as optional (?:) to reflect this.  IDE
 	// consumers MUST switch on `kind` to know which payload field is set.
@@ -309,6 +315,19 @@ export interface WorkbookSnapshotJson {
 	 * came from a real `workbookSnapshot()` invocation.
 	 */
 	version?: Buffer;
+	/**
+	 * **Phase 6.3-1c M5 (2026-05-30)**: the contract DTO schema version
+	 * (engine `ql_session::SCHEMA_VERSION`) every DTO crossing the boundary
+	 * carries (contract section 4.1). The IDE asserts this matches
+	 * {@link QUANTBOOK_SCHEMA_VERSION} on snapshot ingest; a mismatch is a
+	 * fail-loud `unsupported_schema_version` (the IDE is that code's producer),
+	 * never a silent shape drift.
+	 *
+	 * **TypeScript-side optional** (napi-side always populated): marked optional
+	 * so fixture-literal unit tests that hand-construct `WorkbookSnapshotJson`
+	 * need not set it. Real napi calls ALWAYS populate it.
+	 */
+	schemaVersion?: number;
 }
 
 /**
@@ -419,6 +438,22 @@ export interface WorkbookSnapshotDeltaJson {
 	 * after the `workbookSnapshot()` re-fetch (no race window).
 	 */
 	fullRebuildRequired: boolean;
+	/**
+	 * **Phase 6.3-1c (2026-05-30, contract section 4.3)**: when
+	 * `fullRebuildRequired` is `true` for an ENUMERATED, designed resync state,
+	 * the reason. `undefined` when `fullRebuildRequired` is `false`, or for a
+	 * full-rebuild case that is not one of the four designed states (a malformed
+	 * token -- which the contract reserves for a fail-loud `invalid_version_token`
+	 * but the legacy collab path treats as a recoverable resync -- a rename, or a
+	 * defensive cache-invariant guard).
+	 */
+	fullRebuildReason?: 'no_prior_version' | 'cache_cleared' | 'stale_horizon' | 'epoch_mismatch';
+	/**
+	 * **Phase 6.3-1c M5 (2026-05-30)**: contract DTO schema version -- see
+	 * {@link WorkbookSnapshotJson.schemaVersion}. Optional TS-side (napi always
+	 * populates) for hand-constructed fixture literals.
+	 */
+	schemaVersion?: number;
 }
 
 export interface CollabSessionInstance {
@@ -1538,6 +1573,45 @@ export interface SessionInstance {
 	/** Recompute the whole workbook; returns the operation id. */
 	recalcAll(): bigint;
 
+	/**
+	 * **Phase 6.3-1b/6.3-1c (2026-05-30):** reserve an incremental (dirty-set)
+	 * recalc WITHOUT running it; returns the operation id. Opens a pre-start
+	 * cancel window -- call {@link cancel} with this id before {@link awaitRecalc}
+	 * to prevent the run (contract section 6.4). You MUST then call `awaitRecalc`
+	 * (even after a `cancel`) to run-or-skip the recompute and release the session
+	 * from `Busy`. For the common no-cancel path prefer {@link recalcDirty}.
+	 */
+	startRecalcDirty(): bigint;
+
+	/** Reserve a full recalc WITHOUT running it; see {@link startRecalcDirty}. */
+	startRecalcAll(): bigint;
+
+	/**
+	 * Run (or skip) the recalc reserved by `startRecalcDirty` / `startRecalcAll`.
+	 * If a {@link cancel} won the pre-start window the recompute is SKIPPED (the
+	 * op surfaces `canceled` via {@link operationStatus}); otherwise it runs to
+	 * `completed` / `failed`. Throws `[bad_argument]` if `op` is not the in-flight
+	 * recalc, `[invalid_state]` if the session went terminal mid-window.
+	 */
+	awaitRecalc(op: bigint): void;
+
+	/**
+	 * Cancel an operation by id. Returns `true` if it was `running` and is now
+	 * `canceled`, `false` if already terminal. For in-engine recalc this is
+	 * honored only in the pre-start window (before `awaitRecalc` begins the
+	 * synchronous pass -- contract section 6.4). Throws `[operation_not_found]`
+	 * for an unknown id.
+	 */
+	cancel(op: bigint): boolean;
+
+	/**
+	 * **Phase 6.3-1c (2026-05-30):** read an operation's state by id. This is how
+	 * the `startRecalc*` / `awaitRecalc` + `cancel` outcome is observed: after
+	 * `awaitRecalc(op)` the op is `completed` (or `canceled` if a cancel won the
+	 * window, or `failed` with the engine error string). Legal while `Busy`.
+	 */
+	operationStatus(op: bigint): OperationStateJson;
+
 	/** Full workbook snapshot (sheets + formats + dateSystem + opaque version). */
 	snapshot(): WorkbookSnapshotJson;
 
@@ -1913,4 +1987,28 @@ export interface QuantbookErrorInfo {
 	 * classes, etc.).
 	 */
 	readonly cause: unknown;
+	/**
+	 * **Phase 6.3-1c (2026-05-30, contract section 5.1):** the engine error's
+	 * coarse source class when the thrown error carried it as a NATIVE own-
+	 * property (engine-taxonomy errors -- `not_found` / `conflict` / `compute` /
+	 * `protocol` / `lifecycle` / ...). `undefined` for FFI-boundary
+	 * `bad_argument` validation + collab errors, which still arrive as a
+	 * `[code]`-prefix string (the code is recovered from the prefix; class is
+	 * inferable from the code).
+	 */
+	readonly class?: string;
+	/**
+	 * **Phase 6.3-1c (2026-05-30):** structured context for the error, when the
+	 * thrown error carried a native `details` own-property. Delivered as a JSON
+	 * string (the engine serializes `EngineError.details`); parse with
+	 * `JSON.parse` on demand. `undefined` when the error has no details or did
+	 * not arrive as a native structured object.
+	 */
+	readonly details?: string;
+	/**
+	 * **Phase 6.3-1c (2026-05-30):** whether a naive retry is meaningful, when
+	 * the thrown error carried a native `retryable` own-property. `undefined`
+	 * for prefix-string errors.
+	 */
+	readonly retryable?: boolean;
 }

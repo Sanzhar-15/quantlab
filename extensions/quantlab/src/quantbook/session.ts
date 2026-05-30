@@ -927,6 +927,38 @@ const QUANTBOOK_ERROR_PREFIX_RE = /^\[([a-z][a-z0-9_]*)\]\s*(.*)$/s;
 const QUANTBOOK_ERROR_CAUSE_MAX_DEPTH = 8;
 
 /**
+ * **Phase 6.3-1c M5 (2026-05-30):** the engine contract DTO schema version this
+ * IDE build's mirrors were written against (engine `ql_session::SCHEMA_VERSION`,
+ * contract section 4.1). Every snapshot / delta DTO crossing the napi boundary
+ * carries its own `schemaVersion`; {@link assertSupportedSchemaVersion} compares
+ * it against this constant at the ingest boundary. Bump in lockstep with the
+ * engine when a breaking DTO/error/command change lands.
+ */
+export const QUANTBOOK_SCHEMA_VERSION = 1;
+
+/**
+ * **Phase 6.3-1c M5 (2026-05-30):** fail loud if a DTO's `schemaVersion` does not
+ * match {@link QUANTBOOK_SCHEMA_VERSION} -- the producer of the (previously
+ * producerless) `unsupported_schema_version` code (contract section 4.1). A
+ * mismatch means the loaded native binary is newer/older than these TS mirrors,
+ * so the DTO shape can no longer be trusted; surfacing it as a recognized
+ * `[unsupported_schema_version]` error (parseable by {@link parseQuantbookError},
+ * in the allowlist) is far better than silently mis-reading drifted fields.
+ *
+ * `undefined` is tolerated (no-op): hand-built fixture literals + delta-merged
+ * snapshots omit `schemaVersion`; a real napi call ALWAYS populates it.
+ */
+export function assertSupportedSchemaVersion(version: number | undefined): void {
+	if (version !== undefined && version !== QUANTBOOK_SCHEMA_VERSION) {
+		throw new Error(
+			`[unsupported_schema_version] engine DTO schemaVersion=${version} but this IDE ` +
+			`build supports ${QUANTBOOK_SCHEMA_VERSION}. The native binary and the TypeScript ` +
+			`mirrors are out of sync -- rebuild the .node and the extension together.`,
+		);
+	}
+}
+
+/**
  * Extract the structured code + message from a caught error.
  *
  * **Usage**:
@@ -979,6 +1011,34 @@ export function parseQuantbookError(err: unknown): QuantbookErrorInfo {
 			code: 'unknown',
 			message: typeof err === 'string' ? err : String(err),
 			cause: err,
+		};
+	}
+	// **Phase 6.3-1c (2026-05-30) -- native-first read (contract section 5.1).**
+	// Engine-taxonomy errors now arrive as JS Errors carrying the structured
+	// fields as NATIVE own-properties (code/class/details/retryable -- the
+	// structured-error reshape via the napi Env throw). Prefer them: a recognized
+	// string `.code` means the engine set it deliberately as data, no prefix
+	// parse needed. Falls through to the legacy `[code]`-prefix cause-chain walk
+	// below for FFI-boundary `bad_argument` validation + collab errors (which
+	// still carry the prefix and a generic napi `.code` like 'GenericFailure',
+	// rejected by the allowlist guard). Dual-format read -- monotonic, no
+	// regression to the prefix path.
+	const nativeCode: unknown = (err as { code?: unknown }).code;
+	if (
+		typeof nativeCode === 'string' &&
+		nativeCode !== 'unknown' &&
+		isQuantbookErrorCode(nativeCode)
+	) {
+		const nativeClass: unknown = (err as { class?: unknown }).class;
+		const nativeDetails: unknown = (err as { details?: unknown }).details;
+		const nativeRetryable: unknown = (err as { retryable?: unknown }).retryable;
+		return {
+			code: nativeCode,
+			message: err.message,
+			cause: err,
+			class: typeof nativeClass === 'string' ? nativeClass : undefined,
+			details: typeof nativeDetails === 'string' ? nativeDetails : undefined,
+			retryable: typeof nativeRetryable === 'boolean' ? nativeRetryable : undefined,
 		};
 	}
 	// Walk Error.cause looking for the first bracket-prefixed engine
