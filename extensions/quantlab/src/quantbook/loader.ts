@@ -403,6 +403,13 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (6.3-2c)`);
 				}
 			}
+			// **Phase 6.3-2d (2026-05-30):** tables -- create/rename/
+			// rename-column/resize/drop.
+			for (const method of ['createTable', 'renameTable', 'renameColumn', 'resizeTable', 'dropTable']) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (6.3-2d)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

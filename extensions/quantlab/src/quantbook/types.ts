@@ -1510,6 +1510,26 @@ export interface CellRangeJson {
 }
 
 /**
+ * **Phase 6.3-2d (2026-05-30)**: spec for {@link SessionInstance.createTable}
+ * (mirrors the engine `TableSpecJson` / `ql_session::TableSpec`). Coordinates are
+ * 0-indexed; `rows`/`cols` are counts the engine requires to be `> 0` (a `0`
+ * surfaces `[table_create_rejected]`, not a boundary `[bad_argument]`).
+ * `columnNames` length must match `cols`. The name is canonicalized (uppercase)
+ * by the engine.
+ */
+export interface TableSpecJson {
+	name: string;
+	sheet: number;
+	topRow: number;
+	topCol: number;
+	rows: number;
+	cols: number;
+	hasHeader: boolean;
+	hasTotals: boolean;
+	columnNames: string[];
+}
+
+/**
  * **Phase 6.3-2a (2026-05-30)**: which extras a `queryRange` read includes
  * (mirrors the engine `RangeQueryOptionsJson`). In v1 every field MUST be
  * `false` -- the engine fail-loud rejects a `true` with
@@ -1827,6 +1847,46 @@ export interface SessionInstance {
 	 * such hazard.
 	 */
 	setName(name: string, target: CellRangeJson): void;
+
+	// --- Phase 6.3-2d (2026-05-30): tables ---
+
+	/**
+	 * Create a table from `spec`. A duplicate name (shared table/defined-name namespace),
+	 * zero `rows`/`cols`, a footprint that exceeds the grid / overlaps an existing table /
+	 * contains a spill anchor, or a `columnNames` length-mismatch / empty / non-unique column
+	 * throws `[table_create_rejected]`. An unknown or tombstoned `sheet` throws `[sheet_not_found]`.
+	 * Coords/dims outside u16/u32 throw `[bad_argument]`. `[invalid_state]` off a Ready session.
+	 * Table ops are not delta-expressible -- the engine bumps the epoch (reseed from a snapshot).
+	 */
+	createTable(spec: TableSpecJson): void;
+
+	/**
+	 * Rename a table. Unknown `oldName` throws `[table_not_found]`; a `newName` colliding with
+	 * another table or defined name throws `[table_create_rejected]`. Rewrites stored formula
+	 * text that references the table (Excel canon). `[invalid_state]` off a Ready session.
+	 */
+	renameTable(oldName: string, newName: string): void;
+
+	/**
+	 * Rename a column within a table. Unknown `table` throws `[table_not_found]`; unknown `oldCol`
+	 * throws `[table_column_not_found]`; a `newCol` collision throws `[table_column_rejected]`.
+	 * Rewrites stored structured-reference formula text. `[invalid_state]` off a Ready session.
+	 */
+	renameColumn(table: string, oldCol: string, newCol: string): void;
+
+	/**
+	 * Resize a table to `newRows` x `newCols`, adding/removing the named columns. Unknown `name`
+	 * throws `[table_not_found]`; invalid dimensions / column lists throw `[table_resize_rejected]`.
+	 * `newRows`/`newCols` outside u32 throw `[bad_argument]`. `[invalid_state]` off a Ready session.
+	 */
+	resizeTable(name: string, newRows: number, newCols: number, addedColumns: string[], removedColumns: string[]): void;
+
+	/**
+	 * Drop a table. Its metadata is removed; footprint cells remain and formulas referencing the
+	 * table re-bind to `#NAME?` on the next recompute. Unknown `name` throws `[table_not_found]`.
+	 * `[invalid_state]` off a Ready session.
+	 */
+	dropTable(name: string): void;
 }
 
 export interface SessionConstructor {
