@@ -161,9 +161,17 @@ fn value_variants_and_error_sigils_round_trip_through_real_worker() {
     assert_eq!(out.rows(), 3, "row count preserved");
 
     // --- Degenerate (0-area) shapes must survive the codec's metadata path. ---
-    let empty = ArrayValue::empty(0, 3);
-    let out = w.call(ECHO, &empty, DEADLINE).expect("echo of a 0×3 grid");
-    assert_eq!(out, empty, "a 0×3 degenerate grid must round-trip");
+    // All three zero-area shapes round-trip end-to-end through the real worker (the
+    // shape rides in schema metadata, so 0×3 / 3×0 / 0×0 are distinguishable).
+    for (r, c) in [(0u32, 3u32), (3, 0), (0, 0)] {
+        let empty = ArrayValue::empty(r, c);
+        let out = w
+            .call(ECHO, &empty, DEADLINE)
+            .unwrap_or_else(|e| panic!("echo of a {r}×{c} grid: {e:?}"));
+        assert_eq!(out, empty, "a {r}×{c} degenerate grid must round-trip");
+        assert_eq!(out.rows(), r, "{r}×{c}: row count preserved");
+        assert_eq!(out.cols(), c, "{r}×{c}: col count preserved");
+    }
 }
 
 /// Signed zero is preserved bit-exactly (`-0.0` keeps its sign bit). `ArrayValue`'s

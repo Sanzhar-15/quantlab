@@ -215,14 +215,36 @@ let Some(effective) = effective_udf_deadline(env.udf_op_deadline(), Instant::now
 };
 ```
 
-The budget is armed only when a worker is attached; non-UDF / no-worker recompute is
-byte-for-byte unchanged (deadline `None`). The budget is **not host-configurable in
-v1** (filed forward — §7).
+Every full-pass recompute that can dispatch a UDF arms this budget — the explicit
+`recalc_dirty`/`recalc_all`, the `rematerialize` pass behind undo/redo, and the `open`
+load path all route through one `udf_op_deadline_for_pass()` helper
+(`crates/ql-exec/src/session.rs`). The only UDF dispatch NOT under the op-budget is a
+single `set_formula` that immediately evaluates one UDF cell — that is one call, bounded
+by the 30 s per-call deadline (§4.1). The budget is armed only when a worker is attached;
+non-UDF / no-worker recompute is byte-for-byte unchanged (deadline `None`). The budget is
+**not host-configurable in v1** (filed forward — §7).
 
 ### 4.3 Wire-size caps — 5 M cells / 64 MiB
 
-A UDF cannot force an unbounded allocation across the boundary. The grid codec caps
-both cell-count and byte-length **before** allocating:
+A UDF cannot force an unbounded allocation across the boundary. There are four
+distinct allocation layers on the receive path, each separately bounded:
+
+1. **Transport frame** (`frame.rs` `read_frame`) — rejects a frame over `MAX_FRAME_LEN`
+   (64 MiB) **before** allocating its payload buffer.
+2. **Arrow-IPC internal** — `decode_grid` pre-walks the IPC message framing and rejects
+   any message whose declared metadata length or `bodyLength` exceeds `MAX_GRID_BYTES`
+   **before** handing the bytes to arrow's `StreamReader` (`codec.rs`
+   `precheck_ipc_message_bounds`). This closes a real gap: arrow's `StreamReader`
+   otherwise allocates `from_len_zeroed(bodyLength)` from a worker-controlled flatbuffer
+   field that the outer buffer-length cap does NOT bound (6.4B closure-audit HIGH).
+3. **Engine cell vector** — `decode_grid` rejects a grid over `MAX_GRID_CELLS` (5 M)
+   **before** the `Vec::with_capacity` for the decoded cells.
+4. **Encode (outbound)** — `encode_grid` rejects argument grids over the cell cap
+   **before** building the Arrow arrays; the byte cap on the encode side is checked
+   **after** serialization (a transient buffer for an over-cap *outbound* grid, never a
+   worker-controlled input — not an attack surface).
+
+The cell-count and byte caps:
 
 ```rust
 // crates/ql-udf/src/codec.rs:132
@@ -288,7 +310,7 @@ come from a process running user code:
   **before** any positional column access (`crates/ql-udf/src/codec.rs`,
   `EXPECTED_FIELDS`) — a malformed batch is a clean `CodecError`, never an OOB panic.
 - **NaN / Inf are rejected on both sides.** Rust decode rejects non-finite numbers
-  (`crates/ql-udf/src/codec.rs:428`, `CodecError::NonFinite`); the Python encoder
+  (`crates/ql-udf/src/codec.rs:538`, `CodecError::NonFinite`); the Python encoder
   rejects them at source (`crates/quantbook-py/python/quantbook/_codec.py:117-120`).
   This preserves the engine invariant that `Value::Number` is always finite
   (`crates/ql-types/src/value.rs`, `Value::number()` sanitizes to `#NUM!`).
@@ -325,6 +347,7 @@ binding for any corresponding restriction and found none unless noted.
 | **CPU** | Bounded only by the 30 s/120 s *wall-clock* deadlines, not CPU quota | No `setrlimit(RLIMIT_CPU)` / no cgroup CPU cap |
 | **Subprocess spawning** | Spawns arbitrary children; they **orphan** on cancel (§5) | No process-group kill (needs `libc`/`nix`) |
 | **Persistence across cancel** | A forked grandchild survives worker-kill | Reparented to `init`, not in the kill set |
+| **Worker statefulness** | UDF module globals, open file descriptors, and live sockets **persist across calls and recompute passes** | The worker process is long-lived — `ProcessWorker` reuses one child and only respawns it after it dies (`process.rs`), and the session preserves `udf_worker` across edits/open. A UDF that opens a socket or accumulates state on one call still sees it on the next; nothing tears the worker down between invocations |
 
 The defensive perimeter that **is** in place: the workspace-trust double gate (§2),
 process/memory/crash isolation (§3), the kill-backed deadline + op-budget + wire caps

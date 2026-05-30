@@ -1203,16 +1203,26 @@ fn dispatch_udf<E: CellEnv>(
     match worker.call(handle, &args_grid, effective) {
         Ok(grid) => {
             if grid.rows() == 1 && grid.cols() == 1 {
-                // 1×1 result → a scalar cell value. `get(0,0)` on a grid we
-                // just confirmed is 1×1 is always `Some`; a `None` here would
-                // mean an internally-inconsistent `ArrayValue` from the worker
-                // — surface it as a VISIBLE `#CALC!` (No-Fallbacks), NOT a
-                // silent `Blank` (Opus LOW-1, 6.4-3c audit).
-                FunctionReturn::Scalar(
-                    grid.get(0, 0)
-                        .cloned()
-                        .unwrap_or(Value::Error(ErrorValue::Calc)),
-                )
+                // 1×1 result → a scalar cell value. `get(0,0)` on a grid we just
+                // confirmed is 1×1 is always `Some`; a `None` here would mean an
+                // internally-inconsistent `ArrayValue` from the worker. Surface it
+                // as a VISIBLE `#CALC!` (No-Fallbacks), NOT a silent `Blank` (Opus
+                // LOW-1, 6.4-3c audit) — AND emit a diagnostic saying WHY, mirroring
+                // the `Err` arm below so the invariant violation is never silent
+                // (6.4B closure-audit LOW, Codex).
+                FunctionReturn::Scalar(match grid.get(0, 0).cloned() {
+                    Some(v) => v,
+                    None => {
+                        push_udf_cell_diagnostic(
+                            env,
+                            "udf_protocol",
+                            "worker returned a 1x1 grid with no cell at (0,0) — \
+                             internally-inconsistent ArrayValue"
+                                .to_string(),
+                        );
+                        Value::Error(ErrorValue::Calc)
+                    }
+                })
             } else {
                 // N×M (incl. degenerate) → an array; the cell-boundary caller
                 // spills it, the scalar-context caller maps it to `#CALC!`.

@@ -909,7 +909,14 @@ impl WorkbookSession {
                 .session;
         // Recompute computed values with the op-log detached (no spurious ops /
         // no UndoManager commit). The result's failures become diagnostics.
-        let result = self.with_runtime_no_oplog(|rt| rt.recompute_all());
+        // **6.4B closure-audit (MED):** arm the op-budget — undo/redo can replay a
+        // workbook with many UDF cells; without this the pass is bounded only by the
+        // 30s per-call deadline (the N×30s aggregate stall item H exists to close).
+        let op_deadline = self.udf_op_deadline_for_pass();
+        let result = self.with_runtime_no_oplog(|rt| {
+            rt.arm_udf_op_deadline(op_deadline);
+            rt.recompute_all()
+        });
         for failure in &result.failures {
             self.events.push(Event::CellDiagnostic {
                 diagnostic: Diagnostic {
@@ -982,6 +989,25 @@ impl WorkbookSession {
         self.udf_op_budget = budget;
     }
 
+    /// **6.4B (item H):** the operation-level UDF time budget for ONE recompute
+    /// pass — `Some(now + UDF_OP_BUDGET)` iff a worker is attached, else `None`.
+    /// With no worker, UDFs are `#CALC!` no-worker and never block, so a budget
+    /// would be meaningless and the `None` path keeps non-UDF recompute byte-for-byte
+    /// unchanged. EVERY full-pass recompute that can dispatch a UDF must arm this so
+    /// the aggregate stall is bounded (not just the explicit `recalc_*` paths):
+    /// [`run_recalc`], [`rematerialize`] (undo/redo), and the `open` load path all
+    /// route through it (6.4B closure-audit MED — the budget was previously armed
+    /// only in `run_recalc`, leaving undo/redo + open bounded by the 30s per-call
+    /// deadline alone).
+    ///
+    /// [`run_recalc`]: WorkbookSession::run_recalc
+    /// [`rematerialize`]: WorkbookSession::rematerialize
+    fn udf_op_deadline_for_pass(&self) -> Option<std::time::Instant> {
+        self.udf_worker
+            .is_some()
+            .then(|| std::time::Instant::now() + self.udf_op_budget)
+    }
+
     fn run_recalc(
         &mut self,
         f: impl FnOnce(&mut WorkbookRuntime<'_>) -> Option<crate::RecomputeResult>,
@@ -991,14 +1017,9 @@ impl WorkbookSession {
         self.state = LifecycleState::Busy;
 
         // **6.4B (item H):** arm the operation-level UDF time budget for THIS recalc
-        // pass — only when a worker is attached (no worker → UDFs are `#CALC!`
-        // no-worker and never block, so a budget would be meaningless). Computed
-        // before `with_runtime` borrows `self`, then set on the runtime so the
-        // per-cell recompute env carries it to the dispatch site.
-        let op_deadline = self
-            .udf_worker
-            .is_some()
-            .then(|| std::time::Instant::now() + self.udf_op_budget);
+        // pass. Computed before `with_runtime` borrows `self`, then set on the
+        // runtime so the per-cell recompute env carries it to the dispatch site.
+        let op_deadline = self.udf_op_deadline_for_pass();
         let result = self.with_runtime(|rt| {
             rt.arm_udf_op_deadline(op_deadline);
             f(rt)
@@ -1262,7 +1283,14 @@ impl EngineSession for WorkbookSession {
         // deliberately use the plain `recompute_all` (no preserve) — they must
         // recompute honestly (rematerialize's replayed cells have no saved value
         // → preserving would write Blank, a silent wrong result).
-        let result = self.with_runtime_no_oplog(|rt| rt.recompute_all_preserving_saved_udf());
+        // **6.4B closure-audit (MED):** arm the op-budget for the load-path pass too
+        // (the worker was restored just above) — a reopened workbook can re-dispatch
+        // many UDF cells; bound the aggregate, not just per-call.
+        let op_deadline = self.udf_op_deadline_for_pass();
+        let result = self.with_runtime_no_oplog(|rt| {
+            rt.arm_udf_op_deadline(op_deadline);
+            rt.recompute_all_preserving_saved_udf()
+        });
         for failure in &result.failures {
             self.events.push(Event::CellDiagnostic {
                 diagnostic: Diagnostic {
@@ -3501,6 +3529,58 @@ mod tests {
         assert!(
             calls.load(Ordering::SeqCst) > after_set,
             "with budget restored the recalc dispatches the UDF again"
+        );
+    }
+
+    /// **6.4B closure-audit (MED):** the op-budget is also armed on the
+    /// `rematerialize` pass behind undo/redo (not only the explicit `recalc_*`) —
+    /// with the budget exhausted, an undo (which replays + recomputes a full pass)
+    /// SKIPS the UDF dispatch instead of blocking N × the per-call deadline.
+    #[test]
+    fn udf_op_budget_arms_on_undo_redo_rematerialize() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        register_udf(&mut s, "MYUDF", 7);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_w = Arc::clone(&calls);
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+            move |_h, _a: &ql_types::ArrayValue| {
+                calls_w.fetch_add(1, Ordering::SeqCst);
+                Ok(ql_types::ArrayValue::singleton(Value::Number(42.0)))
+            },
+        )));
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 21.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap();
+        // A further edit to undo back across (the UDF cell is recomputed every
+        // rematerialize regardless — recompute_all is a full pass).
+        s.set_value(addr(sheet, 0, 2), CellValue::Number { number: 1.0 })
+            .unwrap();
+
+        // Exhaust the budget, then undo -> rematerialize SKIPS the UDF dispatch.
+        s.set_udf_op_budget(std::time::Duration::ZERO);
+        let before = calls.load(Ordering::SeqCst);
+        s.undo().unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before,
+            "op budget exhausted -> the worker is NOT called during undo's rematerialize"
+        );
+        assert!(
+            matches!(cell_value(&s, addr(sheet, 0, 1)), CellValue::Error { error } if error == "#TIMEOUT!"),
+            "budget-exhausted UDF cell is #TIMEOUT! after undo"
+        );
+
+        // Restore a normal budget, then redo -> rematerialize dispatches the UDF.
+        s.set_udf_op_budget(std::time::Duration::from_secs(120));
+        let before2 = calls.load(Ordering::SeqCst);
+        s.redo().unwrap();
+        assert!(
+            calls.load(Ordering::SeqCst) > before2,
+            "with budget restored, redo's rematerialize dispatches the UDF again"
         );
     }
 

@@ -122,6 +122,13 @@ pub enum CodecError {
     /// specific error). The frame layer remains the authoritative wire-size gate.
     #[error("grid: {bytes} bytes exceeds the {max}-byte cap")]
     GridTooManyBytes { bytes: usize, max: usize },
+    /// **6.4B closure-audit fix (HIGH):** the IPC stream framing was un-parseable
+    /// during the pre-`StreamReader` allocation-bounds walk (negative/overflowing
+    /// length, or a metadata flatbuffer that does not parse). Rejected here so a
+    /// hostile/garbage `RETURN` frame never reaches `arrow-ipc`'s
+    /// `bodyLength`-driven allocation (see [`precheck_ipc_message_bounds`]).
+    #[error("decode: malformed IPC framing ({0})")]
+    MalformedIpcFraming(String),
 }
 
 /// **6.4B (item I):** max cell count (`rows * cols`) of a UDF arg/return grid. A
@@ -346,6 +353,104 @@ pub fn decode_grid(bytes: &[u8]) -> Result<ArrayValue, CodecError> {
     decode_grid_capped(bytes, MAX_GRID_CELLS, MAX_GRID_BYTES)
 }
 
+/// **6.4B closure-audit fix (HIGH — arrow `bodyLength` unbounded allocation).**
+///
+/// The [`MAX_GRID_BYTES`] check in [`decode_grid_capped`] bounds the *outer* input
+/// buffer, but `arrow-ipc`'s `StreamReader` reads each IPC message's
+/// worker-declared metadata length and `bodyLength` and allocates
+/// `MutableBuffer::resize(meta_len)` / `from_len_zeroed(bodyLength)` BEFORE the
+/// `read_exact` that would fail on a short stream (arrow-ipc-58.3.0
+/// `reader.rs:~1828/1835`). Those declared lengths are INDEPENDENT of the buffer
+/// size, so a tiny `RETURN` frame can declare an enormous `bodyLength` and OOM /
+/// abort the ENGINE process before any engine-side cap fires — turning worker
+/// misbehaviour into engine death (violating the leaf "worker fault → cell error"
+/// contract, design §5).
+///
+/// This pre-walks the encapsulated-message framing
+/// (`[0xFFFFFFFF marker][i32 meta_len][meta flatbuffer][body]`, repeated, `meta_len
+/// == 0` ends the stream) and rejects any message whose declared metadata or body
+/// length exceeds `max_bytes` (or whose framing is un-parseable) BEFORE the bytes
+/// reach `StreamReader`. For a self-contained in-memory stream every declared
+/// length must fit within `max_bytes`, so a well-formed grid is never rejected
+/// (the round-trip tests prove this). Truncation/short-buffer cases are left to
+/// `arrow`'s own loud error — they cannot over-allocate because every length that
+/// drives an allocation has already been bounded by `max_bytes` here.
+fn precheck_ipc_message_bounds(bytes: &[u8], max_bytes: usize) -> Result<(), CodecError> {
+    const CONTINUATION: u32 = 0xFFFF_FFFF;
+    let mut pos = 0usize;
+    loop {
+        let rem = bytes.len() - pos;
+        if rem < 4 {
+            // No further framing to validate; a real truncation surfaces as a loud
+            // `ArrowError` from `StreamReader` (nothing left to over-allocate).
+            break;
+        }
+        let first = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        // The encapsulated format (arrow >= 0.15, which our writer always emits)
+        // prefixes a 0xFFFFFFFF continuation marker; tolerate its absence defensively.
+        let meta_off = if first == CONTINUATION { pos + 4 } else { pos };
+        if meta_off + 4 > bytes.len() {
+            break;
+        }
+        let meta_len_raw = i32::from_le_bytes(bytes[meta_off..meta_off + 4].try_into().unwrap());
+        if meta_len_raw == 0 {
+            break; // end-of-stream marker
+        }
+        if meta_len_raw < 0 {
+            return Err(CodecError::MalformedIpcFraming(format!(
+                "negative IPC metadata length {meta_len_raw}"
+            )));
+        }
+        let meta_len = meta_len_raw as usize;
+        // Bounds arrow's `self.buf.resize(meta_len, 0)` (reader.rs:~1828).
+        if meta_len > max_bytes {
+            return Err(CodecError::GridTooManyBytes {
+                bytes: meta_len,
+                max: max_bytes,
+            });
+        }
+        let meta_start = meta_off + 4;
+        let Some(meta_end) = meta_start.checked_add(meta_len) else {
+            return Err(CodecError::MalformedIpcFraming(
+                "IPC metadata length overflows usize".to_string(),
+            ));
+        };
+        if meta_end > bytes.len() {
+            // Truncated metadata: arrow's `read_exact` errors cheaply (it only
+            // resized to meta_len <= max_bytes, already bounded above).
+            break;
+        }
+        let message = arrow::ipc::root_as_message(&bytes[meta_start..meta_end])
+            .map_err(|e| CodecError::MalformedIpcFraming(format!("bad IPC message header: {e}")))?;
+        let body_len_raw = message.bodyLength();
+        if body_len_raw < 0 {
+            return Err(CodecError::MalformedIpcFraming(format!(
+                "negative IPC body length {body_len_raw}"
+            )));
+        }
+        // Bounds arrow's `from_len_zeroed(bodyLength)` (reader.rs:~1835). Compare as
+        // u64 so a >usize::MAX declaration on a 32-bit target cannot wrap.
+        if body_len_raw as u64 > max_bytes as u64 {
+            return Err(CodecError::GridTooManyBytes {
+                bytes: body_len_raw as usize,
+                max: max_bytes,
+            });
+        }
+        // Advance past this whole message (marker?/meta_len already counted in
+        // `meta_end - pos`). `body_len_raw <= max_bytes` here, so the cast is sound.
+        let Some(next) = (meta_end - pos)
+            .checked_add(body_len_raw as usize)
+            .and_then(|consumed| pos.checked_add(consumed))
+        else {
+            return Err(CodecError::MalformedIpcFraming(
+                "IPC message length overflows usize".to_string(),
+            ));
+        };
+        pos = next;
+    }
+    Ok(())
+}
+
 /// [`decode_grid`] with explicit caps (the public wrapper passes the
 /// [`MAX_GRID_CELLS`] / [`MAX_GRID_BYTES`] defaults). Split out so tests can drive
 /// the cap paths with tiny limits instead of decoding a multi-million-cell grid.
@@ -363,6 +468,11 @@ fn decode_grid_capped(
             max: max_bytes,
         });
     }
+    // **6.4B closure-audit fix (HIGH):** the buffer-length cap above does NOT bound
+    // `arrow-ipc`'s internal `from_len_zeroed(bodyLength)` allocation — pre-walk the
+    // framing and reject an over-cap declared body/metadata length BEFORE `arrow`
+    // can allocate it. See [`precheck_ipc_message_bounds`].
+    precheck_ipc_message_bounds(bytes, max_bytes)?;
     let mut reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
     let batch = reader.next().ok_or(CodecError::Empty)??;
 
@@ -871,6 +981,107 @@ mod tests {
         let err = decode_grid_capped(&bytes, MAX_GRID_CELLS, 8).unwrap_err();
         assert!(
             matches!(err, CodecError::GridTooManyBytes { max: 8, .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// Walk the IPC framing and return `(metadata_range, body_len)` for the first
+    /// message with a non-zero body (the record batch; the schema message body is 0).
+    fn recordbatch_meta_and_body(bytes: &[u8]) -> Option<(std::ops::Range<usize>, i64)> {
+        const CONTINUATION: u32 = 0xFFFF_FFFF;
+        let mut pos = 0usize;
+        loop {
+            if bytes.len() - pos < 4 {
+                return None;
+            }
+            let first = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let meta_off = if first == CONTINUATION { pos + 4 } else { pos };
+            if meta_off + 4 > bytes.len() {
+                return None;
+            }
+            let meta_len = i32::from_le_bytes(bytes[meta_off..meta_off + 4].try_into().unwrap());
+            if meta_len <= 0 {
+                return None;
+            }
+            let meta_len = meta_len as usize;
+            let meta_start = meta_off + 4;
+            let meta_end = meta_start + meta_len;
+            if meta_end > bytes.len() {
+                return None;
+            }
+            let message = arrow::ipc::root_as_message(&bytes[meta_start..meta_end]).ok()?;
+            let body = message.bodyLength();
+            if body > 0 {
+                return Some((meta_start..meta_end, body));
+            }
+            pos = meta_end + body as usize;
+        }
+    }
+
+    /// **6.4B closure-audit regression (HIGH).** A `RETURN` frame that fits the byte
+    /// cap but declares an enormous IPC `bodyLength` is rejected by the framing
+    /// precheck BEFORE `arrow` can `from_len_zeroed(bodyLength)` — i.e. a hostile
+    /// worker can't OOM the engine through arrow's internal allocation. Without the
+    /// precheck, `decode_grid` would hand the bloated length straight to arrow.
+    #[test]
+    fn decode_rejects_oversized_ipc_body_length() {
+        // A well-formed small grid; its bytes are far under the cap.
+        let grid = ArrayValue::row((0..512).map(|i| Value::Number(i as f64 + 0.5)).collect());
+        let bytes = encode_grid(&grid).expect("encode under cap");
+        assert!(bytes.len() < MAX_GRID_BYTES);
+
+        // Regression guard: the WELL-FORMED stream passes the precheck (no false-reject).
+        precheck_ipc_message_bounds(&bytes, MAX_GRID_BYTES).expect("valid stream passes precheck");
+
+        // Bloat the record batch's declared bodyLength past the cap. The true value's
+        // bytes may appear more than once in the metadata flatbuffer (e.g. a buffer
+        // length that happens to equal it), so locate the occurrence whose mutation
+        // actually changes `Message::bodyLength()` — deterministic, collision-proof.
+        let (meta, true_body) =
+            recordbatch_meta_and_body(&bytes).expect("a record-batch message with a body");
+        assert!(true_body > 0);
+        let needle = true_body.to_le_bytes();
+        let huge_val = MAX_GRID_BYTES as i64 + 4096;
+        let huge = huge_val.to_le_bytes();
+        let mut hostile = None;
+        let mut i = meta.start;
+        while i + 8 <= meta.end {
+            if bytes[i..i + 8] == needle {
+                let mut trial = bytes.clone();
+                trial[i..i + 8].copy_from_slice(&huge);
+                if matches!(recordbatch_meta_and_body(&trial), Some((_, b)) if b == huge_val) {
+                    hostile = Some(trial);
+                    break;
+                }
+            }
+            i += 1;
+        }
+        let hostile = hostile.expect("could locate + bloat the bodyLength field");
+
+        // The buffer is still tiny (outer byte cap passes); the precheck must reject
+        // the bloated bodyLength rather than let arrow allocate it.
+        let err = decode_grid(&hostile).unwrap_err();
+        assert!(
+            matches!(err, CodecError::GridTooManyBytes { .. }),
+            "bloated IPC bodyLength must be rejected as GridTooManyBytes, got {err:?}"
+        );
+    }
+
+    /// A bloated IPC `metadata_length` is likewise bounded before arrow's
+    /// `buf.resize(meta_len)` allocation.
+    #[test]
+    fn decode_rejects_oversized_ipc_metadata_length() {
+        let grid = ArrayValue::singleton(Value::Number(1.0));
+        let bytes = encode_grid(&grid).expect("encode");
+        // The first 4 bytes are the continuation marker; the next 4 are the first
+        // message's metadata_length. Bloat it past a tiny cap that the buffer length
+        // itself still satisfies.
+        let mut hostile = bytes.clone();
+        assert_eq!(u32::from_le_bytes(hostile[0..4].try_into().unwrap()), 0xFFFF_FFFF);
+        hostile[4..8].copy_from_slice(&(5000i32).to_le_bytes());
+        let err = decode_grid_capped(&hostile, MAX_GRID_CELLS, 4096).unwrap_err();
+        assert!(
+            matches!(err, CodecError::GridTooManyBytes { bytes: 5000, max: 4096 }),
             "got {err:?}"
         );
     }
