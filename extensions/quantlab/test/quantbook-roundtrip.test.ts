@@ -4423,8 +4423,10 @@ suite('quantbook V3.5.0.2 -- workbookSnapshot napi contract', function () {
 		const keys = Object.keys(snap).sort();
 		// V3.6.0.8.4 OPUS-HIGH-2 closure: + version (Buffer; opaque
 		// VV token for workbookSnapshotDelta round-trip).
-		assert.deepStrictEqual(keys, ['dateSystem', 'formats', 'sheets', 'version'],
-			`V3.6.0.8.4 ship shape is {sheets, formats, dateSystem, version}; if V3.7+ adds more fields, update this test`);
+		// Phase 6.3-1c M5 (2026-05-30): + schemaVersion (contract section 4.1
+		// schema-version propagation; stamped on every snapshot DTO).
+		assert.deepStrictEqual(keys, ['dateSystem', 'formats', 'schemaVersion', 'sheets', 'version'],
+			`6.3-1c ship shape is {sheets, formats, dateSystem, version, schemaVersion}; if a later phase adds fields, update this test`);
 	});
 
 	test('SheetSnapshotJson shape: id + name + cells fields', () => {
@@ -5716,11 +5718,12 @@ suite('quantbook V3.6.0.3 -- WorkbookSnapshotJson.formats field', function () {
 		// - V3.6.0.3 D2 added: + formats
 		// - V3.6.0.5 D4 added: + dateSystem
 		// - V3.6.0.8.4 OPUS-HIGH-2 closure: + version (Buffer)
+		// - Phase 6.3-1c M5 (2026-05-30): + schemaVersion (contract section 4.1)
 		const session = createSession(8304n);
 		const snap = workbookSnapshot(session);
 		const topLevelKeys = Object.keys(snap).sort();
-		assert.deepStrictEqual(topLevelKeys, ['dateSystem', 'formats', 'sheets', 'version'],
-			`V3.6.0.8.4 WorkbookSnapshotJson has exactly { sheets, formats, dateSystem, version }; got ${JSON.stringify(topLevelKeys)}`);
+		assert.deepStrictEqual(topLevelKeys, ['dateSystem', 'formats', 'schemaVersion', 'sheets', 'version'],
+			`6.3-1c WorkbookSnapshotJson has exactly { sheets, formats, dateSystem, version, schemaVersion }; got ${JSON.stringify(topLevelKeys)}`);
 	});
 });
 
