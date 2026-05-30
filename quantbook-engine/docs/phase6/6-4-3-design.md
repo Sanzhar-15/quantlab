@@ -28,7 +28,7 @@
 > fail-loud C2 is the recorded fallback). **D** = D1 worker preserved across `open`/import + D2 saved-value
 > preserve on the LOAD path ONLY (`recompute_all_preserving_saved_udf`, used only by `open`; recalc_all /
 > rematerialize recompute honestly). napi `set_udf_worker` injection is shipped + lifecycle-gated
-> (`set_udf_worker_checked`). **H/I remain FILED-FORWARD** (op-level recalc budget + per-call cancel; grid
+> (`set_udf_worker_checked`). **H/I CLOSED in 6.4B code cycle 1 (`4f1e9c2a7d3`)** (op-level recalc budget + per-call cancel; grid
 > caps). Remaining 6.4-3d work = the **IDE side** (Step 5) + a `pollEvents` napi binding for CellDiagnostic.
 > Original blocker text kept below for provenance — these are NO LONGER open:
 >
@@ -89,7 +89,9 @@ to a focused `6.4-3d-debug` follow-up** (`ProcessWorker::pid()` is ready for it)
 > rejects `MY UDF`/`MY-UDF`/non-ASCII/trailing-dot/digit-led while accepting dotted Excel canon
 > (`T.DIST.2T`) and CellRef-lexed-but-callable names (`LOG10`). Using the parser as the single source
 > of truth (not a hand grammar) is regression-proof — the parser-fidelity trap the megaudit warned of
-> (a hand grammar would wrongly reject `LOG10`/dotted) is avoided by construction. **Still open in 6.4B
+> (a hand grammar would wrongly reject `LOG10`/dotted) is avoided by construction.
+>
+> **6.4B CODE CYCLE 1 SHIPPED 2026-05-30 (`4f1e9c2a7d3`) -- H + I + FF-2 CLOSED:** (H) op-level UDF recalc budget -- session-wide `UDF_OP_BUDGET` (120s) armed once per recalc pass by `run_recalc` (worker-attached only), threaded runtime->env->dispatch; `effective_udf_deadline` clamps each call to `min(per-call 30s, remaining)` and SKIPS the worker once spent (`#TIMEOUT!` + new `udf_budget_exhausted` diagnostic) -- bounds the N x 30s mutex stall; worker-kill stays the only honest cancel under GIL-only Python; `#[cfg(test)] set_udf_op_budget` knob (not yet napi-bound). (I) grid cell/byte caps in `ql-udf` codec -- `MAX_GRID_CELLS` (5M) + `MAX_GRID_BYTES` (=64MiB frame cap) checked in `encode_grid`/`decode_grid` BEFORE alloc -> `GridTooManyCells`/`GridTooManyBytes` -> `#VALUE!` + new `udf_grid_too_large`. (FF-2) the `WorkbookTransaction` commit path now threads the diagnostic collector (no longer drops UDF failure diagnostics). Verified: ql-udf 43/0, ql-exec lib 790/0 (default+xlsx-write), udf_exit_tests 8/8, udf_e2e 1/1 real-python, clippy no-new (26 pre-existing), workspace clean. **H/I are now CLOSED.** **Still open in 6.4B
 > (fresh session):** FF-2 `WorkbookTransaction` diagnostics sink (not live); `docs/security/udf-ai-connectors.md`
 > sandbox-limitations doc (decision-lock §2 item 7); op-level UDF recalc budget + per-call deadlines (the
 > N×30s stall, design §H/I); UDF-6-02..04 security-audit closure. **NEXT = finish 6.4B, then the
