@@ -1,0 +1,137 @@
+# Phase 6.3 — Full bindings over the stable session API · Entry Plan
+
+**Status:** 🟢 REVISED 2026-05-30 post-Codex review (gpt-5.5 xhigh, verdict REVISE — full review at `6-3-entry-plan-codex-review.out`). Cut-line verified correct (51/14/32/5, no miscategorization). Codex's 3 HIGH + 3 MED + 1 LOW folded in below (Python authoring scope reconciled, M2 refactor now mandatory, ≥2 binding rows required to freeze, H1 resequenced earlier, a DTO/FFI substrate workstream added, L8 op-state RAII added). Authored at engine HEAD `6c256608522` on `feat/quantbook-engine` (6.4B FULLY SHIPPED — the 6.4 Python-UDF wedge is closed).
+**Mandate:** decision-lock §2 item 8 — *"Full bindings (WASM/Node/C/Python) over the stable session API + parity golden matrix. The existing Node binding becomes an adapter to the stable session, not a separate semantic surface."*
+**Predecessor:** 6.4B closure (`docs/audits/2026-05-30-6-4b-udf-closure/`). The locked post-6.4B sequence is **6.3 → 6.2 → 6.5**.
+
+---
+
+## 1. What 6.3 is (and is NOT)
+
+6.1 built the binding-neutral `EngineSession` trait + versioned DTOs + the `EngineError` taxonomy, and bound a **first slice** over napi (Node) to drive the IDE. 6.4 added the UDF surface. **6.3 finishes the job**: every command the IDE/product needs is bound over a real binding, the existing Node path becomes a thin *adapter* to the stable contract (not a parallel semantic surface), and a **golden parity matrix** runs one canonical flow through the adapter(s) so a future binding cannot fork the semantics.
+
+6.3 is **breadth over a frozen contract**, not new engine semantics. The one place 6.3 *must* touch engine internals is the H3 spill-change-log prerequisite (below) — everything else is marshalling + the cross-cutting binding-layer machinery (panic boundary, versioning, event retention, cancellation honesty).
+
+**Strategic note:** the product wedge (Python-signal → pokeable-sheet) already has its *minimal* Python authoring bridge from 6.4A (UDF registration over the worker). 6.3 is what makes the contract real enough that Node/Python/(WASM/C) cannot drift — the decision-lock §5 risk #1 ("wrong 6.1 API lock → binding forks") is the thing 6.3 exists to retire.
+
+---
+
+## 2. The cut-line (source of truth: `EngineSession` = 51 methods)
+
+`crates/ql-session/src/session.rs:133-326` declares **51 trait methods**. `WorkbookSession` (`crates/ql-exec/src/session.rs`) implements **46** for real; **5** are honest `not_implemented_in_v1_core`. The napi `Session` class (`crates/ql-bindings-node/src/lib.rs`) currently binds **14** trait methods.
+
+### (a) Bound now over napi — 14 methods
+`add_sheet, set_value, set_formula, clear, recalc_dirty, recalc_all, snapshot, cell, list_sheets, close, register_function, unregister_function, list_functions, poll_events` (+ inherent `new` ctor and `set_udf_worker`).
+
+### (b) Implemented-but-UNBOUND — the 32-method "bind these in 6.3" set
+Grouped by binding cluster (sequencing in §5):
+
+- **Lifecycle / read (independent):** `lifecycle_state`, `validate_formula`, `query_range`, `mark_volatiles_dirty`
+- **Persistence:** `open`, `save`, `import`, `export` *(note: `export("xlsx")` needs the `xlsx-write` feature else `not_implemented`; `query_range` rejects `include_formulas/include_formats/include_rendered` with `not_implemented` — surface these as honest Capability errors at the binding)*
+- **Format:** `set_format`, `register_format`
+- **Structure:** `rename_sheet`, `delete_sheet`, `restore_sheet`, `move_sheet`, `set_name`
+- **Tables:** `create_table`, `rename_table`, `rename_column`, `resize_table`, `drop_table`
+- **Atomic groups:** `batch`, `begin_transaction`, `txn_add`, `commit_transaction`, `rollback_transaction`
+- **Live-grid cluster (H3-GATED — see §3):** `snapshot_delta`, `undo`, `redo`, `can_undo`, `can_redo`
+- **Operations (M2-related — see §4):** `cancel`, `operation_status`
+
+### (c) Deferred / not-implemented (out of v1 scope) — 5 methods
+`write_range, publish_dataset, bind_range, refresh_source, materialize_query` — the reserved bulk/SQL/AI surface (their DTO *shapes* are reserved in 6.1 so 6.5 extends, not forks). Bindings surface them as honest `Capability`/`not_implemented_in_v1_core`, never silent no-ops.
+
+**Verification gate:** 14 + 32 + 5 = 51 ✓.
+
+---
+
+## 3. Block-on-ENTRY hard prerequisite — H3 (engine fix, must land FIRST)
+
+**H3 — `snapshot_delta` under-reports spill changes** (`docs/audits/2026-05-28-6-1c-megaudit/SYNTHESIS.md:48,:114`). `set_formula` records only the **anchor cell** in the change-log (`session.rs:1267`); `run_recalc` records only `res.changed_cells` (`session.rs:800`) which holds only the anchor for spill results (`recompute.rs:447,:659`); but `write_spill` writes the FULL spill footprint (`cells.rs:731`) without bubbling its shape into a `record_changes` call. So spill targets changed/removed by `set_formula`/recalc can be **absent** from `changedCells`/`removedCells`.
+
+**Why it gates entry:** the fix **changes `WorkbookRuntime`'s/`RecomputeResult`'s return signature** (`RecomputeResult.changed_cells` carries only `(sheet,row,col)` today, `error.rs:288-297`; it must surface the spill footprint into the session change-log) — too invasive for an audit-fix cycle, deliberately deferred to "6.3 binding work MUST land this engine fix as its prerequisite" (`SYNTHESIS.md:122`).
+
+**Precise blast radius (Codex MED — "live-grid cluster blocked" was over-broad):** `snapshot_delta` is the method that is genuinely *broken* without H3 (its delta omits spill targets). `undo`/`redo`/`can_undo`/`can_redo` can bind *mechanically* without H3 — but undo bumps the epoch → invalidates the delta cache → a consumer re-reads via `snapshot_delta`, so shipping undo/redo with a broken delta path is a latent correctness bug. So: **`snapshot_delta` is hard-blocked on H3; undo/redo are bind-able but not safely *useful* until H3 lands.** Treat the whole cluster as H3-gated for shipping, even though only `snapshot_delta` is mechanically blocked.
+
+→ **6.3 sequencing: H3 is increment 0.** It is the only engine-internal change in 6.3 and it must ship + be audited before the live-grid cluster ships.
+
+---
+
+## 4. Filed debts to fold into 6.3 (the binding-layer machinery)
+
+These are decision-lock §3 acceptance items + 6.1C-filed MEDs. They are not optional polish — §3 makes the cancellation model and the structured-error/panic boundary **acceptance items for the binding layer**.
+
+| Id | Item | What | Anchors |
+|----|------|------|---------|
+| **M1 (+L8)** | `#[napi(catch_unwind)]` boundary + op-state RAII | No `catch_unwind` anywhere → a panic across the napi `extern "C"` callback **aborts the IDE host**. Add `#[napi(catch_unwind)]` to every `Session` method + surface a `[panic] msg` Error via the FaultGuard machinery (the `EngineError::panic` constructor exists but is unused). decision-lock §3.6 mandates a panic boundary in the common API layer. **+L8 (Codex):** once panics are *caught* rather than aborting, a panic mid-`run_recalc` leaves the op stuck `Running` — add an op-state RAII guard so a caught panic terminalizes the op (`Faulted`/`Failed`), done in the same increment. | `lib.rs` (no catch_unwind); `cells.rs:720`, `recompute.rs:856` (in-path panics); `error.rs:138-141`; `SYNTHESIS.md:73-74` |
+| **M2** | Recalc cancel honesty — **DO THE REFACTOR (Codex HIGH)** | `run_recalc` allocates the op-id internally + inserts `Completed` unconditionally, never checking the cancel registry; the Node wrapper holds the mutex through `recalcDirty()` so the caller gets the op-id only AFTER completion → pre-start cancel is **non-functional**. Codex: documenting "decorative cancel" **fails** the §3.3 acceptance item (sync FFIs MUST expose `start→poll/wait/cancel`) and the §6.4 pre-start-cancel contract. **Decision (locked): implement `start_recalc()→OperationId` + `await_recalc(op_id)`** so the caller holds the op-id with a real pre-start cancel window. This is a decision-lock §3.3 **acceptance item**, not optional. | `session.rs:786-829,:1015-1056`; `lib.rs:4353,:4930-4936`; `session-api.md:450-456`; `decision-lock.md:46` |
+| **M5** | `schema_version` DTO propagation | Engine snapshot/delta/range DTOs carry `schema_version: u16` but the napi DTOs + mapper + IDE TS DTO drop it → no forward-compat versioning surfaced. Add `schemaVersion` to the napi DTOs + mapper + TS + a loader shape-check (mismatch → `unsupported_schema_version`, which exists but has no producer). decision-lock §3.7. | `dto.rs:234,:285,:329`; `lib.rs:4242-4264`; IDE `types.ts:233-312` |
+| **M6** | `events`/`ops` bounded retention | `ops` HashMap + `events` Vec grow unbounded (poll reads from a cursor, never drains). Build the event-ring per contract §9 (ring + `dropped` page metadata + `Event::FullResyncRequired` re-seed); prune terminal `ops` past a horizon. (`next_op_id → checked_add` already shipped.) | `session.rs:210,:217,:790,:2315`; `session-api.md:493-504` |
+| **M7** | Effective-extent (cross-cutting) | `Sheet::put` grows conservative bounds even on `Blank` writes; all exporters iterate `Sheet::bounds` → blank-inflated workbook ⇒ giant export. Add `Sheet::iter_effective_cells()` / `effective_value_bounds()`. **Ambiguously filed** (synthesis "tracked cross-cutting", impl-plan "6.3"). Recommend: land it WITH the persistence-binding increment (it directly affects `save`/`export` payload size) or explicitly defer to v1.5 — decide in review. | `sheet.rs:155`; csv/xlsx/.qbook exporters |
+| **H1** | Cross-repo IDE `parseQuantbookError` allowlist | IDE allowlist = 22 codes (grew during 6.4); engine `Session` emits ~40. Still **missing**: `invalid_version_token`, `panic`, `sheet_not_found`, `bad_cell`, `formula_parse`, `conflicting_*`, `xlsx_*`, `csv_*`, `transaction_*`, `not_implemented_in_v1_core`. Unrecognized codes silently bucket as `unknown`, defeating the V2.7 stable-code wire contract. **Needs an IDE-side commit on `feat/visualise-v1`** extending `QuantbookErrorCode` + the record, compile-enforced (the V2.9 Record invariant). | engine `session.rs:2483-2697`, `error.rs:107-141`; IDE `session.ts:775-793`, `types.ts:1523-1582` |
+| **L4** | IDE `WorkbookSnapshotJson.version` TS narrowing | Required-in-Rust, optional-in-TS → tighten the TS DTO to `version: Buffer`. IDE-side, low priority. | `lib.rs:916,:4262`; IDE `types.ts:300` |
+
+**Explicitly NOT 6.3** (do not mis-file): `DepShape::LazyShape #[serde(alias)]` and the Phase-1.5 overlap `debug_assert` are **6.4 perf backlog** (`impl-plan:238,:269-270`).
+
+The `EngineError::Display = "[code] message"` ↔ IDE bracket-prefix wire contract is verified-consistent on the engine side (6.1C I1); the open gap is the **consumer side = H1**.
+
+### 4b — DTO / FFI substrate (Codex MED — the plan can't be purely method-centric)
+
+Binding 32 methods is not just method signatures; several DTOs + FFI-discipline items must land alongside, or the bindings silently drop fields:
+
+- **DTO field-parity inventory.** Cross-check every engine DTO against its napi mirror. Known gap: `WorkbookSnapshotDelta.full_rebuild_reason` (`dto.rs:307-310`) is **absent** from the napi delta DTO (`lib.rs:1003-1060`) — a binding consumer can't distinguish the legitimate `full_rebuild_required` resync states (§4.3) from a bug. Audit `FullRebuildReason`, `RangeResult`, `TableSpec`, `SessionOp`, `BatchResult`, `UndoRedoResult`, the transaction handle/IDs, and the structured-error object shape (`.code`/`.class`/`.details` as data, not parsed from the message — session-api.md §5.1) for the same field-drop class. M5 (`schemaVersion`) is one instance of this; do the full sweep.
+- **Opaque handles + owned buffers (session-api.md §1.3).** No borrowed Rust ref crosses FFI; the transaction surface is an opaque *handle* (not an RAII scope), and snapshot/range results are owned buffers/Arrow handles with explicit release. The binding increment must define + test the buffer-ownership/release discipline for the result DTOs (and the async-vs-sync lock discipline — locks guard state transitions, not arbitrary waiting; the `flushPendingToTransport` detach-then-`spawn_blocking` lesson, decision-lock §3.5).
+
+---
+
+## 5. Proposed sequencing (sub-increments, each Codex+Opus audited)
+
+> **6.3-0 — H3 spill change-log engine fix.** The only engine-internal change. Surface the spill footprint into the session change-log (touches `WorkbookRuntime`/`RecomputeResult` return signature). Audit, then `snapshot_delta` becomes correct + the live-grid cluster is safe to ship. *(H2 determinism already shipped.)*
+>
+> **6.3-1 — Binding-layer machinery + the error-code contract (cross-cutting, applies to ALL methods, BEFORE breadth).** (a) M1+L8 (`catch_unwind` + panic→`[panic]` Error + op-state RAII on every method); (b) M2 refactor (`start_recalc`/`await_recalc`); (c) M5 + the §4b DTO field-parity sweep + opaque-handle/buffer-ownership discipline; (d) **H1/L4 IDE allowlist FIRST (Codex MED — H1 blocks 6.3 entry, must precede any error-heavy method wiring into IDE paths)** — extend `QuantbookErrorCode` + the compile-enforced Record to the full snapshot/persistence/formula/transaction/version-token code families on `feat/visualise-v1`. Do ALL of this before binding 32 more methods so they inherit the boundary + the structured-error contract, not retrofit it.
+>
+> **6.3-2 — Bind the independent clusters over napi.** Lifecycle/read + persistence (+ M7 rides here, on `save`/`export`) + format + structure + tables + atomic groups (batch/transaction). ~27 methods; mechanical once 6.3-1 sets the pattern. Migrate the existing IDE call-sites to the owning `Session` as each lands (the "migrate Node early to catch missing commands" mandate).
+>
+> **6.3-3 — Bind the live-grid + ops clusters** (depends on 6.3-0 + 6.3-1): `snapshot_delta`, `undo`, `redo`, `can_undo`, `can_redo`, `cancel`, `operation_status` + M6 event-ring.
+>
+> **6.3-4 — The thin Python session facade** (the second binding row — see §6/§7): the smallest `quantbook-py` adapter over the same contract that runs the golden flow, so the parity matrix proves cross-binding parity, not Node self-consistency.
+>
+> **6.3-5 — The golden parity matrix (≥2 rows) + closure megaudit** (Codex + Opus + IDE-aware Opus lane). See §6.
+
+---
+
+## 6. The golden parity matrix (the 6.3 exit gate)
+
+decision-lock §5 risk #1 + `session-api.md §10:745-746`: **one golden flow matrix that runs across every binding.** A single canonical script (new sheet → set values + a spill formula → recalc → snapshot + snapshot_delta → table op → batch → undo/redo → save → open → register UDF → poll events → a deliberate-panic row asserting `[panic]` surfaces-not-aborts → error-path assertions on a few stable codes) executed through each adapter, asserting byte-identical DTOs + identical `EngineError` codes. The harness **adds a binding by adding a row**.
+
+**≥2 rows required to freeze the contract (Codex HIGH).** A Node-only matrix proves *self-consistency*, not *cross-binding parity* — the exact fork risk decision-lock §5 #1 exists to retire only closes when a second binding runs the same rows (`session-api.md:744-748`). The cheapest product-relevant second row is the **thin `quantbook-py` session facade** (6.3-4). The contract is NOT declared frozen until Node + the Python row both pass; WASM/C rows are added later iff/when those bindings are built.
+
+---
+
+## 7. Which bindings does v1 build — RESOLVED post-Codex
+
+decision-lock §2.8 lists **WASM/Node/C/Python**, but today only Node is real (wasm/c/pyo3-session crates are empty stubs; `quantbook-py` is the UDF worker, not a session binding). The decisions below incorporate Codex's review (verdict REVISE).
+
+- **v1-critical — Node:** complete the adapter (all of §2b + the §4/§4b debts). Migrate IDE call-sites onto the owning `Session`. This is the bulk of 6.3.
+- **v1 — a THIN Python session facade (the second parity row), NOT full `qb.show/publish/bind`.** Codex caught a real inconsistency the earlier draft had: `qb.show`→`write_range`, `qb.publish`→`publish_dataset`, `qb.bind`→`bind_range` all map to the **5 deferred bulk methods (§2c)** which currently return Capability errors (`session.rs:2872-2903`). So a *full* Python authoring slice would require **implementing those deferred methods — that is 6.5 (datasets/connectors/bulk) territory, not 6.3.** **Resolution:** keep `publish_dataset`/`bind_range`/`write_range` deferred (§2c unchanged); the 6.3 Python deliverable is the **thin session facade** over the already-bound contract (enough to run the golden flow as the second matrix row, §6) **plus reuse of the minimal authoring/`qb.show`-into-IDE bridge that already shipped in 6.4A** (decision-lock §2.13). Full `qb.publish`/`qb.bind` over the session is explicitly **deferred to 6.5**. This removes the contradiction (we no longer claim 6.3 ships show/publish/bind) while still satisfying "freeze the contract with ≥2 bindings."
+- **v1.5 / on concrete-consumer-demand — WASM + C.** **Formally recorded rescope (Codex §7-A1):** deferring WASM/C is a deliberate deviation from decision-lock §2.8's "WASM/Node/C/Python." It is product-plausible (no v1 consumer needs a browser-WASM or C-FFI host today — the v1 surfaces are the VS Code IDE (Node) + Python authoring), but because it deviates from the locked list it must be **ratified, not assumed**. Build the golden harness binding-agnostic so a WASM/C row is "add a row" later; do not build the adapters speculatively. *(This is the one item that still needs an explicit user/decision-lock sign-off before 6.3 locks.)*
+
+**Codex's direct answers to the original four questions** (now folded into the decisions above): (1) WASM/C→v1.5 is product-plausible but a formal deviation — record it. (2) Do the `start_recalc/await_recalc` refactor; documenting decorative cancel fails the §3.3 acceptance item. (3) M7 rides the persistence increment (`save`/`export` are the first blast radius). (4) Bind Node first but do NOT freeze the contract with only Node — require a thin Python row before lock.
+
+---
+
+## 8. Risks
+
+1. **Single-binding parity is not parity.** If only Node ships in v1, the matrix proves self-consistency, not cross-binding parity — the fork risk it exists to retire only truly closes when a second binding runs the same rows. Mitigation: keep the harness binding-agnostic; bring a thin Python row online early (ties to §7-Q4).
+2. **H3 is invasive.** Changing `WorkbookRuntime`'s return signature can ripple through every recompute caller (the 6.4B op-budget arming touched 3 such sites). Budget a focused audit for 6.3-0.
+3. **M1 is broad-but-mechanical** — `catch_unwind` on ~46 methods; a missed method is an abort-the-host hole. The golden harness should include a deliberate-panic row asserting `[panic]` surfaces, not aborts.
+4. **Cross-repo drift (H1).** The engine-emits-40 / IDE-knows-22 gap is the exact class the 6.1C megaudit's Opus-only lane caught; the closure megaudit must include an IDE-aware lane (the 6.4-3d lesson).
+
+---
+
+## 9. Definition of done (6.3 exit)
+
+- H3 shipped + audited; `snapshot_delta` reports the full spill footprint; the live-grid cluster ships against a correct delta path.
+- All 32 §2b methods bound over Node; IDE call-sites migrated to the owning `Session`; the 5 §2c methods surface honest Capability errors.
+- M1+L8 (panic boundary + op-state RAII) + M5 (schema_version) + the §4b DTO field-parity sweep shipped on every method; **M2 `start_recalc`/`await_recalc` refactor shipped** (the §3.3 cancellation acceptance item, not documented-around); M6 event-ring; H1 IDE allowlist closed (compile-enforced) BEFORE the error-heavy methods wired in; M7 ridden on persistence; L4 resolved.
+- The golden parity matrix runs green through **≥2 bindings (Node + the thin `quantbook-py` facade)** — incl. the deliberate-panic + error-code-stability rows — before the contract is declared frozen.
+- The WASM/C→v1.5 rescope ratified (the one open sign-off, §7).
+- Closure megaudit (Codex + Opus + IDE-aware Opus lane) clean.
+- Then: **6.2 service transport** (the HTTP-vs-gRPC pick, deferred to here).
