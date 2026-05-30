@@ -373,6 +373,21 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (6.3-1b/6.3-1c)`);
 				}
 			}
+			// **Phase 6.3-2a (2026-05-30):** the read/lifecycle/format/validate
+			// cluster -- the first batch of the 6.3-2 method-binding sweep. A
+			// stale cdylib lacks these -- fail at the boundary, not at the use site.
+			for (const method of [
+				'lifecycleState',
+				'validateFormula',
+				'queryRange',
+				'markVolatilesDirty',
+				'setFormat',
+				'registerFormat',
+			]) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (6.3-2a)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

@@ -1489,6 +1489,63 @@ export interface OperationStateJson {
 }
 
 /**
+ * **Phase 6.3-2a (2026-05-30)**: the session lifecycle state (contract section 2.3),
+ * the wire string returned by {@link SessionInstance.lifecycleState}. `busy` means
+ * a long op owns mutable state (mutating/recalc rejected; reads + cancel legal);
+ * `closed`/`faulted` are terminal.
+ */
+export type QuantbookLifecycleState = 'new' | 'ready' | 'busy' | 'closed' | 'faulted';
+
+/**
+ * **Phase 6.3-2a (2026-05-30)**: a rectangular range within one sheet (mirrors
+ * the engine `CellRangeJson`). All five coordinates are 0-indexed; bounds are
+ * inclusive. Input to {@link SessionInstance.queryRange}.
+ */
+export interface CellRangeJson {
+	sheet: number;
+	startRow: number;
+	startCol: number;
+	endRow: number;
+	endCol: number;
+}
+
+/**
+ * **Phase 6.3-2a (2026-05-30)**: which extras a `queryRange` read includes
+ * (mirrors the engine `RangeQueryOptionsJson`). In v1 every field MUST be
+ * `false` -- the engine fail-loud rejects a `true` with
+ * `[not_implemented_in_v1_core]` (only the columnar value read is the v1 surface).
+ */
+export interface RangeQueryOptions {
+	includeFormulas: boolean;
+	includeFormats: boolean;
+	includeRendered: boolean;
+}
+
+/**
+ * **Phase 6.3-2a (2026-05-30)**: one column of a {@link RangeResultJson}
+ * (columnar layout; mirrors the engine `RangeColumnJson`). `values` is
+ * top-to-bottom with length `RangeResultJson.nRows`; each entry is the
+ * discriminated {@link CellValueJson} (incl. `blank` / `pending`).
+ */
+export interface RangeColumnJson {
+	values: CellValueJson[];
+}
+
+/**
+ * **Phase 6.3-2a (2026-05-30)**: a batch-shaped columnar range read (mirrors the
+ * engine `RangeResultJson`). `columns` has length `nCols`; each column has length
+ * `nRows`. Carries `schemaVersion` (contract section 4.1 / section 4b field-parity)
+ * -- the IDE asserts it at ingest. Returned by {@link SessionInstance.queryRange}.
+ */
+export interface RangeResultJson {
+	schemaVersion?: number;
+	range: CellRangeJson;
+	nRows: number;
+	nCols: number;
+	columns: RangeColumnJson[];
+}
+
+/**
  * **Phase 6.4-3d Step 5 (2026-05-29)**: one structured event drained from the
  * session's event ring (contract section 9). Mirrors the engine `EventJson`: a tagged
  * union keyed by `kind`; only that variant's payload fields are populated.
@@ -1620,6 +1677,49 @@ export interface SessionInstance {
 
 	/** Live (non-tombstoned) sheets, each as `{ id, name }`. */
 	listSheets(): SheetInfoJson[];
+
+	// --- Phase 6.3-2a (2026-05-30): read / lifecycle / format / validate ---
+
+	/**
+	 * Current lifecycle state as a wire string (contract section 2.3). Infallible
+	 * -- legal in every state including the terminal ones; this is the only read
+	 * that works on a `faulted` / `closed` session.
+	 */
+	lifecycleState(): QuantbookLifecycleState;
+
+	/**
+	 * Parse + bind a formula WITHOUT mutating (the keystroke-validation path).
+	 * Returns diagnostics as DATA -- a malformed formula yields a non-empty
+	 * `DiagnosticJson[]`, NOT a thrown error; an empty array means valid. `text`
+	 * is the formula BODY with no leading `=` (engine convention).
+	 */
+	validateFormula(sheet: number, row: number, col: number, text: string): DiagnosticJson[];
+
+	/**
+	 * Batch-shaped columnar range read (contract section 3.6). Returns a
+	 * {@link RangeResultJson} (`nRows` x `nCols`, column-major: `columns` has
+	 * length `nCols`, each `column.values` has length `nRows`). In v1 every
+	 * `include*` option MUST be `false` -- a `true` is rejected loud with
+	 * `[not_implemented_in_v1_core]`. `[bad_argument]` for an invalid range.
+	 */
+	queryRange(range: CellRangeJson, options: RangeQueryOptions): RangeResultJson;
+
+	/** Mark every volatile function dirty (so the next recalc recomputes them). */
+	markVolatilesDirty(): void;
+
+	/**
+	 * Set a cell's format to a registered {@link FormatIdJson} (a builtin index or
+	 * a session-custom id from {@link registerFormat}). `[bad_argument]` for
+	 * invalid coords / a malformed format id; `[not_found]` for an unknown custom id.
+	 */
+	setFormat(sheet: number, row: number, col: number, formatId: FormatIdJson): void;
+
+	/**
+	 * Register a session-wide custom number format, returning its
+	 * {@link FormatIdJson} for use with {@link setFormat}. The engine may dedup a
+	 * well-known string to a builtin index. `[bad_argument]` for an invalid string.
+	 */
+	registerFormat(formatString: string): FormatIdJson;
 
 	/**
 	 * **Phase 6.4-3d Step 5**: attach an out-of-process Python-UDF worker built
