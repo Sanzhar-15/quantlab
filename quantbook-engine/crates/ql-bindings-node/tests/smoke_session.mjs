@@ -236,6 +236,68 @@ assert.equal(sheets[0].name, "Sheet1", "sheet name preserved");
   );
 }
 
+// --- 6.3-2a: read / lifecycle / format / validate cluster ----------------------
+// Grid state here: A1 (0,0) = 10 (literal), B1 (0,1) = A1+1 = 11 (computed).
+{
+  // lifecycleState: a live, drained session is "ready".
+  assert.equal(s.lifecycleState(), "ready", "lifecycleState() is 'ready' on a live session");
+
+  // queryRange: columnar read of A1:B1. Layout is column-major:
+  // columns has length n_cols; each column.values has length n_rows.
+  const rr = s.queryRange(
+    { sheet: sheetId, startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
+    { includeFormulas: false, includeFormats: false, includeRendered: false },
+  );
+  assert.equal(rr.schemaVersion, 1, "RangeResult carries schemaVersion === 1");
+  assert.equal(rr.nRows, 1, "queryRange A1:B1 has 1 row");
+  assert.equal(rr.nCols, 2, "queryRange A1:B1 has 2 cols");
+  assert.equal(rr.columns.length, 2, "columnar: 2 columns");
+  assert.equal(rr.columns[0].values[0].number, 10, "col 0 row 0 = A1 = 10");
+  assert.equal(rr.columns[1].values[0].number, 11, "col 1 row 0 = B1 = 11");
+
+  // include_* options are not implemented in v1 -> fail loud (honest capability).
+  throwsWithCode(
+    () =>
+      s.queryRange(
+        { sheet: sheetId, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+        { includeFormulas: true, includeFormats: false, includeRendered: false },
+      ),
+    "not_implemented_in_v1_core",
+    "queryRange with include_formulas surfaces a loud not_implemented_in_v1_core",
+  );
+
+  // registerFormat -> a FormatId (the engine dedups a well-known string like
+  // "0.00" to a BUILTIN index; a novel string would be custom). setFormat
+  // round-trips it (no throw) -- exercises both converters' happy path.
+  const fmt = s.registerFormat("0.00");
+  assert.ok(fmt.kind === "builtin" || fmt.kind === "custom", "registerFormat returns a FormatId");
+  s.setFormat(sheetId, 0, 0, fmt);
+
+  // setFormat reverse-converter fail-loud: a negative customPeer BigInt is
+  // rejected (No-Fallbacks; exercises the custom-path sign-bit guard).
+  throwsWithCode(
+    () => s.setFormat(sheetId, 0, 0, { kind: "custom", customPeer: -1n, customCounter: 0 }),
+    "bad_argument",
+    "setFormat with a negative customPeer BigInt surfaces a loud bad_argument",
+  );
+
+  // validateFormula returns diagnostics as DATA (never throws on a bad formula).
+  const okDiags = s.validateFormula(sheetId, 0, 0, "1 + 2 * 3");
+  assert.ok(Array.isArray(okDiags) && okDiags.length === 0, "valid formula -> empty diagnostics");
+  const badDiags = s.validateFormula(sheetId, 0, 0, "1 +* 2");
+  assert.ok(Array.isArray(badDiags) && badDiags.length >= 1, "malformed formula -> >=1 diagnostic");
+  assert.equal(badDiags[0].severity, "error", "diagnostic severity is 'error'");
+  assert.equal(typeof badDiags[0].code, "string", "diagnostic carries a string code");
+
+  // markVolatilesDirty: no-throw (no volatiles here, so B1 stays 11 for the
+  // clear() assertion below; no recalc between).
+  s.markVolatilesDirty();
+
+  console.log(
+    "[smoke] 6.3-2a read/lifecycle/format/validate OK (queryRange schemaVersion=1, diagnostics-as-data)",
+  );
+}
+
 // clear() == clear_formula() == "convert to literal": it removes the FORMULA
 // but PRESERVES the last computed value (inc.2c-6 contract). So B1 keeps
 // value==11 and loses its formula. (To also clear the value, setValue(blank).)

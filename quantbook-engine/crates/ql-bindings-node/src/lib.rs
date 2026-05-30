@@ -4426,6 +4426,114 @@ fn format_id_json_from_session(id: ql_session::FormatId) -> FormatIdJson {
     }
 }
 
+/// **Phase 6.3-2a (2026-05-30):** the reverse of [`format_id_json_from_session`]
+/// — build a validated [`ql_session::FormatId`] from a JS-supplied
+/// [`FormatIdJson`] for `setFormat`. Discriminates on `kind`; the payload field
+/// for that kind MUST be present (fail-loud `[bad_argument]` otherwise —
+/// No-Fallbacks, no silent default). `custom_peer` is a `BigInt` widened from the
+/// engine's `u64` peer id; reject a negative (sign bit) or lossy (> `u64::MAX`)
+/// value loud, mirroring the `awaitRecalc`/`pollEvents` BigInt discipline.
+fn session_format_id_from_json(id: FormatIdJson) -> Result<ql_session::FormatId> {
+    match id.kind.as_str() {
+        "builtin" => {
+            let builtin = id.builtin.ok_or_else(|| {
+                bad_argument_error("setFormat: kind 'builtin' requires a 'builtin' field".into())
+            })?;
+            Ok(ql_session::FormatId::Builtin { builtin })
+        }
+        "custom" => {
+            let peer_bigint = id.custom_peer.ok_or_else(|| {
+                bad_argument_error(
+                    "setFormat: kind 'custom' requires a 'customPeer' field".into(),
+                )
+            })?;
+            let (sign_bit, peer, lossless) = peer_bigint.get_u64();
+            if sign_bit {
+                return Err(bad_argument_error(
+                    "setFormat: customPeer must be a non-negative BigInt".into(),
+                ));
+            }
+            if !lossless {
+                return Err(bad_argument_error(
+                    "setFormat: customPeer exceeds u64::MAX (lossy conversion rejected)".into(),
+                ));
+            }
+            let counter = id.custom_counter.ok_or_else(|| {
+                bad_argument_error(
+                    "setFormat: kind 'custom' requires a 'customCounter' field".into(),
+                )
+            })?;
+            Ok(ql_session::FormatId::Custom { peer, counter })
+        }
+        other => Err(bad_argument_error(format!(
+            "setFormat: unsupported format id kind '{other}' (expected builtin|custom)"
+        ))),
+    }
+}
+
+/// **Phase 6.3-2a (2026-05-30):** build a validated [`ql_session::CellRange`]
+/// from a JS-supplied [`CellRangeJson`] for `queryRange`. `sheet` is a `u16`
+/// `SheetId`; the four bounds are `u32` `RowId`/`ColId` — same
+/// finite/non-negative/integer/in-range validators as [`session_addr_from_f64`].
+/// (Inverted bounds — `end < start` — are the engine's `bad_argument` to reject,
+/// not the binding's, so they reach `query_range` verbatim.)
+fn session_range_from_json(method: &str, range: CellRangeJson) -> Result<ql_session::CellRange> {
+    let sheet = validate_u16_index(method, "sheet", range.sheet)?;
+    let start_row = validate_u32_index(method, "startRow", range.start_row)?;
+    let start_col = validate_u32_index(method, "startCol", range.start_col)?;
+    let end_row = validate_u32_index(method, "endRow", range.end_row)?;
+    let end_col = validate_u32_index(method, "endCol", range.end_col)?;
+    Ok(ql_session::CellRange {
+        sheet,
+        start_row,
+        start_col,
+        end_row,
+        end_col,
+    })
+}
+
+/// **Phase 6.3-2a (2026-05-30):** stable snake_case wire string for a
+/// [`ql_session::LifecycleState`] (mirrors `#[serde(rename_all = "snake_case")]`
+/// — though the enum is read via this helper, not serde) — the value returned by
+/// `lifecycleState()`. The single source of truth for the lifecycle wire strings
+/// + the IDE `QuantbookLifecycleState` union.
+fn lifecycle_state_str(s: ql_session::LifecycleState) -> &'static str {
+    use ql_session::LifecycleState as L;
+    match s {
+        L::New => "new",
+        L::Ready => "ready",
+        L::Busy => "busy",
+        L::Closed => "closed",
+        L::Faulted => "faulted",
+    }
+}
+
+/// **Phase 6.3-2a (2026-05-30):** map a [`ql_session::RangeResult`] to the JS
+/// [`RangeResultJson`] (columnar). Forwards the engine DTO's own `schema_version`
+/// (single source of truth, §4b) and maps each `CellValue` via the existing
+/// [`cell_value_json_from_session`] (which already emits `blank`/`pending`).
+fn range_result_json_from_session(r: ql_session::RangeResult) -> RangeResultJson {
+    RangeResultJson {
+        schema_version: r.schema_version,
+        range: CellRangeJson {
+            sheet: f64::from(r.range.sheet),
+            start_row: f64::from(r.range.start_row),
+            start_col: f64::from(r.range.start_col),
+            end_row: f64::from(r.range.end_row),
+            end_col: f64::from(r.range.end_col),
+        },
+        n_rows: r.n_rows,
+        n_cols: r.n_cols,
+        columns: r
+            .columns
+            .into_iter()
+            .map(|c| RangeColumnJson {
+                values: c.values.into_iter().map(cell_value_json_from_session).collect(),
+            })
+            .collect(),
+    }
+}
+
 /// Map a [`ql_session::CellSnapshot`] to the JS [`CellSnapshotJson`].
 fn cell_snapshot_json_from_session(c: ql_session::CellSnapshot) -> CellSnapshotJson {
     CellSnapshotJson {
@@ -4613,6 +4721,54 @@ pub struct DiagnosticJson {
 pub struct OperationStateJson {
     pub state: String,
     pub error: Option<String>,
+}
+
+/// **Phase 6.3-2a (2026-05-30):** JS-facing rectangular range (mirrors
+/// [`ql_session::CellRange`]). All five coordinates are JS Numbers, validated to
+/// `u16`/`u32` at the boundary (same finite/non-negative/integer/in-range
+/// discipline as [`CellAddrJson`]); `sheet` is a `u16` `SheetId`,
+/// `start*`/`end*` are `u32` `RowId`/`ColId`. Inclusive bounds.
+#[napi(object)]
+pub struct CellRangeJson {
+    pub sheet: f64,
+    pub start_row: f64,
+    pub start_col: f64,
+    pub end_row: f64,
+    pub end_col: f64,
+}
+
+/// **Phase 6.3-2a (2026-05-30):** which extras a `queryRange` read includes
+/// (mirrors [`ql_session::RangeQueryOptions`]). In v1 the engine fail-loud
+/// rejects any `true` here with `not_implemented_in_v1_core` (the columnar value
+/// read is the v1 surface); declared now for forward-compatible field-parity.
+#[napi(object)]
+pub struct RangeQueryOptionsJson {
+    pub include_formulas: bool,
+    pub include_formats: bool,
+    pub include_rendered: bool,
+}
+
+/// **Phase 6.3-2a (2026-05-30):** one column of a [`RangeResultJson`] (columnar
+/// layout; mirrors [`ql_session::RangeColumn`]). `values` is top-to-bottom and
+/// has length `RangeResultJson.n_rows`; each entry is the same discriminated
+/// [`CellValueJson`] as elsewhere (incl. `blank` for an empty cell and `pending`
+/// for a not-yet-computed one).
+#[napi(object)]
+pub struct RangeColumnJson {
+    pub values: Vec<CellValueJson>,
+}
+
+/// **Phase 6.3-2a (2026-05-30):** a batch-shaped columnar range read (mirrors
+/// [`ql_session::RangeResult`]). `columns` has length `n_cols`; each column has
+/// length `n_rows`. **§4b field-parity:** carries `schema_version` (forwarded
+/// from the engine DTO, contract §4.1) — the IDE asserts it at ingest.
+#[napi(object)]
+pub struct RangeResultJson {
+    pub schema_version: u16,
+    pub range: CellRangeJson,
+    pub n_rows: u32,
+    pub n_cols: u32,
+    pub columns: Vec<RangeColumnJson>,
 }
 
 /// JS-facing event (mirrors [`ql_session::session::Event`]). A tagged union: the
@@ -5369,6 +5525,131 @@ impl Session {
                     name: s.name,
                 })
                 .collect())
+        })
+    }
+
+    // ============================================================================
+    // 6.3-2a (2026-05-30) — read / lifecycle / format / validate cluster.
+    //
+    // The first 6.3-2 sub-increment: bind 6 engine-implemented `EngineSession`
+    // methods over napi, inheriting the locked 6.3-1 contract (guarded + the
+    // structured native error + schemaVersion on DTOs). Pure FFI plumbing — the
+    // engine work is done (crates/ql-exec/src/session.rs). The rest of 6.3-2
+    // (persistence / structure / tables / atomic groups + the reserved §2c
+    // capability stubs) rides later sub-increments; the live-grid cluster
+    // (undo/redo/snapshot_delta-on-Session) is 6.3-3.
+    // ============================================================================
+
+    /// Current lifecycle state as a wire string (`"new"` | `"ready"` | `"busy"` |
+    /// `"closed"` | `"faulted"`; contract §2.3). Infallible — legal in every
+    /// state, including the terminal ones (it is how the IDE reads them). This is
+    /// the only read that works on a `Faulted`/`Closed` session.
+    #[napi(js_name = "lifecycleState", catch_unwind)]
+    pub fn lifecycle_state(&self, env: Env) -> Result<String> {
+        guarded(env, "lifecycleState", || {
+            Ok(lifecycle_state_str(self.inner.lock().lifecycle_state()).to_string())
+        })
+    }
+
+    /// Parse + bind a formula WITHOUT mutating (the keystroke-validation path).
+    /// Returns the diagnostics as DATA (a `Vec<DiagnosticJson>`) — a malformed
+    /// formula yields diagnostics, NOT a thrown error (contract §3.2). An empty
+    /// result means the formula is valid.
+    #[napi(js_name = "validateFormula", catch_unwind)]
+    pub fn validate_formula(
+        &self,
+        env: Env,
+        sheet: f64,
+        row: f64,
+        col: f64,
+        text: String,
+    ) -> Result<Vec<DiagnosticJson>> {
+        guarded(env, "validateFormula", || {
+            let addr = session_addr_from_f64("validateFormula", sheet, row, col)?;
+            let diags = self
+                .inner
+                .lock()
+                .validate_formula(addr, &text)
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(diags.into_iter().map(diagnostic_json_from_session).collect())
+        })
+    }
+
+    /// Batch-shaped columnar range read (contract §3.6). Returns a
+    /// [`RangeResultJson`] (`n_rows` × `n_cols`, column-major). In v1 every
+    /// `include_*` option must be `false` — the engine fail-loud rejects a `true`
+    /// with `not_implemented_in_v1_core` (only the columnar value read is the v1
+    /// surface). `bad_argument` for an invalid/inverted range.
+    #[napi(js_name = "queryRange", catch_unwind)]
+    pub fn query_range(
+        &self,
+        env: Env,
+        range: CellRangeJson,
+        options: RangeQueryOptionsJson,
+    ) -> Result<RangeResultJson> {
+        guarded(env, "queryRange", || {
+            let range = session_range_from_json("queryRange", range)?;
+            let options = ql_session::RangeQueryOptions {
+                include_formulas: options.include_formulas,
+                include_formats: options.include_formats,
+                include_rendered: options.include_rendered,
+            };
+            let result = self
+                .inner
+                .lock()
+                .query_range(range, options)
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(range_result_json_from_session(result))
+        })
+    }
+
+    /// Mark every volatile function dirty (so the next recalc recomputes them).
+    /// Mutating command — rejected with `session_busy`/`invalid_state` off Ready.
+    #[napi(js_name = "markVolatilesDirty", catch_unwind)]
+    pub fn mark_volatiles_dirty(&self, env: Env) -> Result<()> {
+        guarded(env, "markVolatilesDirty", || {
+            self.inner
+                .lock()
+                .mark_volatiles_dirty()
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Set a cell's format to a registered [`FormatIdJson`] (builtin index or a
+    /// session-custom id from [`Self::register_format`]). `bad_argument` for
+    /// invalid coords or a malformed format id; `not_found` for an unknown
+    /// custom id.
+    #[napi(js_name = "setFormat", catch_unwind)]
+    pub fn set_format(
+        &self,
+        env: Env,
+        sheet: f64,
+        row: f64,
+        col: f64,
+        format_id: FormatIdJson,
+    ) -> Result<()> {
+        guarded(env, "setFormat", || {
+            let addr = session_addr_from_f64("setFormat", sheet, row, col)?;
+            let format = session_format_id_from_json(format_id)?;
+            self.inner
+                .lock()
+                .set_format(addr, format)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Register a session-wide custom number format, returning its
+    /// [`FormatIdJson`] (a `kind:"custom"` id) for use with [`Self::set_format`].
+    /// `bad_argument` for an invalid format string.
+    #[napi(js_name = "registerFormat", catch_unwind)]
+    pub fn register_format(&self, env: Env, format_string: String) -> Result<FormatIdJson> {
+        guarded(env, "registerFormat", || {
+            let id = self
+                .inner
+                .lock()
+                .register_format(&format_string)
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(format_id_json_from_session(id))
         })
     }
 
