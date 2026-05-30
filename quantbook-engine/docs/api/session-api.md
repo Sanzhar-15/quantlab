@@ -245,8 +245,10 @@ product-specific APIs (the #1 risk). Dirtying + provenance behavior is part of t
 ### 3.7 Recalculation (HIGH-1 — cancellation scoped honestly; see §6)
 | Command | Tier | Backed by | v1 cancellation |
 |---------|------|-----------|-----------------|
-| `recalc_dirty() -> op_id` | v1 | `WorkbookRuntime::recompute_dirty` (synchronous, Tarjan-SCC) | **pre-start cancel only** in v1 (§6.4) |
-| `recalc_all() -> op_id` | v1 | `WorkbookRuntime::recompute_all` (synchronous) | **pre-start cancel only** in v1 (§6.4) |
+| `recalc_dirty() -> op_id` | v1 | `WorkbookRuntime::recompute_dirty` (synchronous, Tarjan-SCC) | **pre-start cancel only** in v1 (§6.4) — convenience = `start_recalc(Dirty)`+`await_recalc` in one call (no window) |
+| `recalc_all() -> op_id` | v1 | `WorkbookRuntime::recompute_all` (synchronous) | **pre-start cancel only** in v1 (§6.4) — convenience = `start_recalc(All)`+`await_recalc` |
+| `start_recalc(kind) -> op_id` | v1 | reserve-only (no compute) | **M2 (6.3-1b) SHIPPED.** Returns the op-id, sets `Busy`, opens the pre-start cancel window; the lock releases so `cancel(op)` can land before `await_recalc` (§6.4). |
+| `await_recalc(op)` | v1 | `WorkbookRuntime::recompute_*` via the shared executor | **M2 (6.3-1b) SHIPPED.** Runs the reserved recalc, or SKIPS it (op → `Canceled`) if a `cancel` won the window; rejects a terminal session (`invalid_state`). |
 | `mark_volatiles_dirty()` | v1 | volatile pass (`calcgraph_session.rs:149`) | — |
 
 ### 3.8 Undo / redo (MED-4 — explicit v1 commands)
@@ -454,6 +456,16 @@ path) and commits, then transitions to `Completed`. The contract does **not** pr
 abort or partial-result rollback for in-engine recalc in v1, and bindings MUST NOT claim it (this is
 the exact wording that prevents the binding fork). Sync FFI: `start→poll/wait/cancel`; async bindings
 `await` the same op; both surface `Canceled` identically when the pre-start cancel wins.
+
+**M2 (6.3-1b) — SHIPPED.** This is now implemented via the `start_recalc(kind) -> op_id` /
+`await_recalc(op)` split (the convenience `recalc_dirty`/`recalc_all` are start+await in one locked
+call → no window). `start_recalc` reserves the op (`Running`, session `Busy`) and returns WITHOUT
+computing; because the binding releases the lock on return, a `cancel(op)` lands in the gap and
+`await_recalc` then SKIPS the recompute (no commit, no change-log/epoch advance) and surfaces
+`Canceled`. A `close()` during the window terminalizes the reserved op as `Canceled`; `await_recalc`
+rejects a terminal session (`invalid_state`) — never resurrects it. napi binds `startRecalcDirty`/
+`startRecalcAll`/`awaitRecalc`/`cancel`; `operation_status` over napi lands with the M5/§4b DTO sweep
+(6.3-1c).
 
 ---
 
