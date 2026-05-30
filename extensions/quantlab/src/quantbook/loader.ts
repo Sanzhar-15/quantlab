@@ -396,6 +396,13 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (6.3-2b)`);
 				}
 			}
+			// **Phase 6.3-2c (2026-05-30):** structure / sheets -- sheet
+			// rename/delete/restore/move + defined-name binding.
+			for (const method of ['renameSheet', 'deleteSheet', 'restoreSheet', 'moveSheet', 'setName']) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (6.3-2c)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

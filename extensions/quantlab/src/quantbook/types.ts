@@ -1785,6 +1785,48 @@ export interface SessionInstance {
 	 * `[bad_argument]`.
 	 */
 	export(format: string): Uint8Array;
+
+	// --- Phase 6.3-2c (2026-05-30): structure / sheets ---
+
+	/**
+	 * Rename a sheet by id. Unknown id throws `[sheet_not_found]`; a name colliding
+	 * with another live sheet throws `[sheet_name_duplicate]`. An id outside the
+	 * SheetId (u16) range throws `[bad_argument]`. `[invalid_state]` off a Ready session.
+	 */
+	renameSheet(id: number, newName: string): void;
+
+	/**
+	 * Tombstone a sheet by id (preserves its cells for `restoreSheet` -- NOT a silent
+	 * no-op). Unknown id throws `[sheet_not_found]`. `[invalid_state]` off a Ready session.
+	 */
+	deleteSheet(id: number): void;
+
+	/**
+	 * Restore a previously-tombstoned sheet by id. Unknown id throws `[sheet_not_found]`;
+	 * a still-live (not-tombstoned) sheet throws a conflict. `[invalid_state]` off a Ready session.
+	 */
+	restoreSheet(id: number): void;
+
+	/**
+	 * Reorder a sheet to display position `newIndex`. Unknown id throws `[sheet_not_found]`;
+	 * an out-of-range index (valid positions are `[0, sheetCount)`) throws `[bad_argument]`
+	 * (NOT a silent clamp); moving to the current position is a no-op. `[invalid_state]` off
+	 * a Ready session.
+	 */
+	moveSheet(id: number, newIndex: number): void;
+
+	/**
+	 * Define a workbook name bound to a range (`target` is a {@link CellRangeJson}). A defined
+	 * name is delta-invisible (not part of the snapshot/delta DTOs), so this only signals
+	 * success. Invalid range coords throw `[bad_argument]`. `[invalid_state]` off a Ready session.
+	 *
+	 * Range orientation (documented, NOT silent): an inverted `target` (e.g. `startRow > endRow`)
+	 * is normalized to `start <= end` per axis -- a defined name is a rectangle, so corner order
+	 * carries no meaning (Excel/Sheets named-range semantics). This differs from `queryRange`,
+	 * which rejects an inverted range (its span arithmetic would underflow); `setName` has no
+	 * such hazard.
+	 */
+	setName(name: string, target: CellRangeJson): void;
 }
 
 export interface SessionConstructor {
