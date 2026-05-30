@@ -42,7 +42,7 @@ pub use error::{EngineError, ErrorClass};
 pub use function_meta::{
     ArgPolicy, Arity, BatchShape, CancelPolicy, DepShape, FunctionMetadata, Volatility,
 };
-pub use operation::{LifecycleState, OperationId, OperationState};
+pub use operation::{LifecycleState, OperationId, OperationState, RecalcKind};
 pub use session::EngineSession;
 
 /// Contract schema version. Bumped on a breaking DTO/error/command change.

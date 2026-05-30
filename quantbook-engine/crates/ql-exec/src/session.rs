@@ -98,7 +98,7 @@ use ql_session::dto::{
 };
 use ql_session::error::{EngineError, EngineResult, ErrorClass};
 use ql_session::function_meta::FunctionMetadata;
-use ql_session::operation::{LifecycleState, OperationId, OperationState};
+use ql_session::operation::{LifecycleState, OperationId, OperationState, RecalcKind};
 use ql_session::session::{
     EngineSession, Event, EventCursor, EventPage, FunctionImplHandle, SessionOp, TransactionId,
 };
@@ -238,6 +238,21 @@ pub struct WorkbookSession {
     ops: HashMap<OperationId, OperationState>,
     /// Monotonic op-id source.
     next_op_id: u64,
+    /// **M2 (6.3-1b):** the in-flight recalc reserved by [`start_recalc`] and
+    /// drained by [`await_recalc`] — `Some((op, kind))` between those two calls,
+    /// `None` otherwise. This is what makes the **pre-start cancel window** real:
+    /// `start_recalc` allocates the op, marks it `Running`, sets the session
+    /// `Busy`, and RETURNS (releasing the binding lock) without recomputing; a
+    /// `cancel(op)` landing before `await_recalc` flips the op to `Canceled`, and
+    /// `await_recalc` then skips the recompute entirely (contract §6.4 pre-start
+    /// cancel; the synchronous compute core cannot do mid-flight abort — §6.3).
+    /// The session is `Busy` while this is `Some`, so no second `start_recalc` and
+    /// no mutation can interleave; the caller MUST `await_recalc` (even after a
+    /// `cancel`) to drain it back to `Ready`.
+    ///
+    /// [`start_recalc`]: WorkbookSession::start_recalc
+    /// [`await_recalc`]: WorkbookSession::await_recalc
+    pending_recalc: Option<(OperationId, RecalcKind)>,
     /// Append-only event ring; the cursor is an index into this vec (§9).
     /// **v1 limitation:** unbounded, `dropped` always false (no retention horizon
     /// yet); the §9 ring-with-drop semantics land with `subscribe_events`.
@@ -408,6 +423,7 @@ impl WorkbookSession {
             change_log_floor: 0,
             ops: HashMap::new(),
             next_op_id: 1,
+            pending_recalc: None,
             events: Vec::new(),
             txns: HashMap::new(),
             next_txn_id: 1,
@@ -1056,16 +1072,26 @@ impl WorkbookSession {
             .then(|| std::time::Instant::now() + self.udf_op_budget)
     }
 
-    fn run_recalc(
+    /// **M2 (6.3-1b):** the shared recompute executor — runs the recompute, folds
+    /// its changes into the delta change-log, and terminalizes the op. Assumes `op`
+    /// is already `Running` and the session already `Busy` (set by [`start_recalc`]).
+    /// This is the single recompute code path: both the windowed [`await_recalc`] and
+    /// the one-shot convenience wrappers ([`recalc_dirty`]/[`recalc_all`]) funnel
+    /// through here, so the L8 panic-terminalization and the 6.3-1a terminal-event
+    /// emit live in exactly one place.
+    ///
+    /// [`start_recalc`]: WorkbookSession::start_recalc
+    /// [`await_recalc`]: WorkbookSession::await_recalc
+    /// [`recalc_dirty`]: WorkbookSession::recalc_dirty
+    /// [`recalc_all`]: WorkbookSession::recalc_all
+    fn execute_recalc(
         &mut self,
+        op: OperationId,
         f: impl FnOnce(&mut WorkbookRuntime<'_>) -> Option<crate::RecomputeResult>,
-    ) -> OperationId {
-        let op = self.next_op();
-        self.ops.insert(op, OperationState::Running);
-        self.state = LifecycleState::Busy;
-
+    ) {
         // **6.4B (item H):** arm the operation-level UDF time budget for THIS recalc
-        // pass. Computed before `with_runtime` borrows `self`, then set on the
+        // pass. Computed at AWAIT time (when the recompute actually starts, not at
+        // `start_recalc`), before `with_runtime` borrows `self`, then set on the
         // runtime so the per-cell recompute env carries it to the dispatch site.
         let op_deadline = self.udf_op_deadline_for_pass();
         // **L8 (6.3-1a):** terminalize the op on a recompute panic. `with_runtime`'s
@@ -1135,7 +1161,6 @@ impl WorkbookSession {
             op,
             state: OperationState::Completed,
         });
-        op
     }
 
     /// Collect the populated `(row, col)` coordinates of one sheet from the live
@@ -2408,14 +2433,82 @@ impl EngineSession for WorkbookSession {
 
     // --- Recalculation (§3.7) ---
 
-    fn recalc_dirty(&mut self) -> EngineResult<OperationId> {
+    // **M2 (6.3-1b):** `start_recalc`/`await_recalc` are the windowed split of the
+    // recalc ops — the contract §6.4 "start → wait/cancel" shape that makes a
+    // pre-start cancel actually work (pre-6.3-1b, `cancel` wrote `Canceled` but
+    // nothing read it). They are `EngineSession` trait methods (the binding-neutral
+    // op surface, alongside `recalc_dirty`/`recalc_all`/`cancel`); the private
+    // inherent `execute_recalc` is the shared recompute body.
+    fn start_recalc(&mut self, kind: RecalcKind) -> EngineResult<OperationId> {
+        // `ensure_ready` rejects a second concurrent start (already `Busy` with the
+        // first in-flight op) and any non-`Ready` state.
         self.ensure_ready()?;
-        Ok(self.run_recalc(|rt| rt.recompute_dirty()))
+        let op = self.next_op();
+        self.ops.insert(op, OperationState::Running);
+        self.state = LifecycleState::Busy;
+        self.pending_recalc = Some((op, kind));
+        Ok(op)
+    }
+
+    fn await_recalc(&mut self, op: OperationId) -> EngineResult<()> {
+        // Validate `op` is the in-flight recalc before consuming the reservation.
+        match self.pending_recalc {
+            None => {
+                return Err(EngineError::bad_argument(
+                    "await_recalc: no recalc is in progress (call start_recalc first)",
+                ));
+            }
+            Some((pending_op, _)) if pending_op != op => {
+                return Err(EngineError::bad_argument(format!(
+                    "await_recalc: op {op:?} is not the in-flight recalc ({pending_op:?})"
+                )));
+            }
+            Some(_) => {}
+        }
+        let (op, kind) = self.pending_recalc.take().expect("pending validated above");
+
+        // **Pre-start cancel check (the §6.4 guarantee, now functional).** A
+        // `cancel(op)` between `start_recalc` and here flipped the op to `Canceled`;
+        // honor it by NOT recomputing — no commit, no change-log/epoch advance, no
+        // partial state. Emit the terminal event (the "terminal ops emit a terminal
+        // event" invariant from the 6.3-1a audit — `cancel` itself only writes the
+        // state) and release `Busy` back to `Ready`.
+        if matches!(self.ops.get(&op), Some(OperationState::Canceled)) {
+            self.state = LifecycleState::Ready;
+            self.events.push(Event::OperationCompleted {
+                op,
+                state: OperationState::Canceled,
+            });
+            return Ok(());
+        }
+
+        // Not canceled → run the synchronous recompute. Dispatch the stored kind to
+        // the matching `WorkbookRuntime` call (the recompute closure can't be stored
+        // across the start→await boundary, so `RecalcKind` carries the intent).
+        match kind {
+            RecalcKind::Dirty => self.execute_recalc(op, |rt| rt.recompute_dirty()),
+            RecalcKind::All => self.execute_recalc(op, |rt| Some(rt.recompute_all())),
+        }
+        Ok(())
+    }
+
+    // **M2 (6.3-1b):** `recalc_dirty`/`recalc_all` are the one-shot CONVENIENCE
+    // wrappers — `start_recalc` + `await_recalc` in a single call. Because both run
+    // under one binding lock with nothing interleaved, there is NO cancel window
+    // here (identical observable behavior to the pre-6.3-1b single call); the
+    // windowed path is the explicit `start_recalc`/`await_recalc` pair the binding
+    // exposes separately. `ensure_ready` lives in `start_recalc`, so these no longer
+    // gate it themselves (no double-gate).
+    fn recalc_dirty(&mut self) -> EngineResult<OperationId> {
+        let op = self.start_recalc(RecalcKind::Dirty)?;
+        self.await_recalc(op)?;
+        Ok(op)
     }
 
     fn recalc_all(&mut self) -> EngineResult<OperationId> {
-        self.ensure_ready()?;
-        Ok(self.run_recalc(|rt| Some(rt.recompute_all())))
+        let op = self.start_recalc(RecalcKind::All)?;
+        self.await_recalc(op)?;
+        Ok(op)
     }
 
     fn mark_volatiles_dirty(&mut self) -> EngineResult<()> {
@@ -5442,10 +5535,12 @@ mod tests {
     /// `Failed` (NOT leave it stranded `Running`, since the `Completed` insert
     /// never runs) AND seal the session `Faulted` (the existing `FaultGuard`),
     /// with subsequent mutators rejected `[invalid_state]` — never a second
-    /// panic. Drives the private `run_recalc` with a panicking closure under
-    /// `catch_unwind` (the napi boundary's M1 `guarded` does the same in prod).
+    /// panic. **6.3-1b:** drives the shared `execute_recalc` executor (the body
+    /// formerly in `run_recalc`) with a panicking closure under `catch_unwind`,
+    /// after arming an op via `start_recalc` exactly as the windowed path does (the
+    /// napi boundary's M1 `guarded` does the same in prod).
     #[test]
-    fn run_recalc_panic_terminalizes_op_and_faults_session() {
+    fn execute_recalc_panic_terminalizes_op_and_faults_session() {
         let mut s = WorkbookSession::new();
         let sheet = s.add_sheet("S", 16384).unwrap();
         s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
@@ -5454,16 +5549,20 @@ mod tests {
         // the test output; restore it immediately after.
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
+        // Arm an op (Running + Busy) as `start_recalc` does (op id 1 — fresh
+        // session, edits allocate no ops), then drive the shared executor with a
+        // panicking recompute closure.
+        let op = s.start_recalc(RecalcKind::Dirty).unwrap();
+        assert_eq!(op, OperationId(1));
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            s.run_recalc(|_rt| panic!("boom"))
+            s.execute_recalc(op, |_rt| panic!("boom"))
         }));
         std::panic::set_hook(prev);
         assert!(
             caught.is_err(),
-            "the panic must propagate past run_recalc (resume_unwind)"
+            "the panic must propagate past execute_recalc (resume_unwind)"
         );
-        // The op `run_recalc` allocated (id 1 in a fresh session — no prior
-        // recalc, and edits do not allocate ops) is `Failed`, not `Running`.
+        // The armed op is `Failed`, not stranded `Running`.
         match s.operation_status(OperationId(1)).unwrap() {
             OperationState::Failed { .. } => {}
             other => panic!("op must be Failed after a recompute panic, got {other:?}"),
@@ -5487,6 +5586,129 @@ mod tests {
             .set_value(addr(sheet, 0, 0), CellValue::Number { number: 2.0 })
             .unwrap_err();
         assert_eq!(err.code, "invalid_state");
+    }
+
+    // ---- M2 (6.3-1b): start_recalc / await_recalc pre-start cancel window ----
+
+    /// Build `A1=10`, `B1==A1*2` (=20), then dirty B1 by setting `A1=5` WITHOUT
+    /// recomputing — so a recalc that runs makes B1=10, and a recalc that is skipped
+    /// leaves the stale B1=20. Returns `(session, sheet)`.
+    fn dirty_dependent_session() -> (WorkbookSession, SheetId) {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 1), "A1*2").unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 20.0 })
+        );
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 5.0 })
+            .unwrap();
+        (s, sheet)
+    }
+
+    /// (a) A `cancel(op)` in the pre-start window makes `await_recalc` SKIP the
+    /// recompute: the op is `Canceled`, the dependent stays stale, the session is
+    /// `Ready`, and a terminal `Canceled` event is emitted.
+    #[test]
+    fn await_recalc_honors_pre_start_cancel_and_skips_recompute() {
+        let (mut s, sheet) = dirty_dependent_session();
+        let op = s.start_recalc(RecalcKind::Dirty).unwrap();
+        // Reads + cancel are legal in the Busy window.
+        assert_eq!(s.lifecycle_state(), LifecycleState::Busy);
+        assert!(s.cell(addr(sheet, 0, 1)).is_ok());
+        assert!(s.cancel(op).unwrap(), "cancel of a Running op succeeds");
+        s.await_recalc(op).unwrap();
+        // Recompute was SKIPPED: B1 still the stale 20 (NOT 10).
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 20.0 }),
+            "canceled recalc must not recompute"
+        );
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Canceled);
+        assert_eq!(s.lifecycle_state(), LifecycleState::Ready);
+        let page = s.poll_events(EventCursor(0)).unwrap();
+        assert!(
+            page.events.iter().any(|e| matches!(
+                e,
+                Event::OperationCompleted { op: o, state: OperationState::Canceled } if *o == op
+            )),
+            "a terminal Canceled event must be emitted"
+        );
+    }
+
+    /// (b) `start_recalc` then `await_recalc` with no cancel completes normally and
+    /// recomputes the dependent.
+    #[test]
+    fn start_then_await_recalc_completes_and_recomputes() {
+        let (mut s, sheet) = dirty_dependent_session();
+        let op = s.start_recalc(RecalcKind::Dirty).unwrap();
+        s.await_recalc(op).unwrap();
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 10.0 }),
+            "uncanceled recalc must recompute B1 to A1*2 = 10"
+        );
+        assert_eq!(s.lifecycle_state(), LifecycleState::Ready);
+    }
+
+    /// (c) Cancel AFTER the op is terminal (already completed) returns `false`.
+    #[test]
+    fn cancel_after_completed_returns_false() {
+        let (mut s, _sheet) = dirty_dependent_session();
+        let op = s.recalc_dirty().unwrap();
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
+        assert!(
+            !s.cancel(op).unwrap(),
+            "cancel of an already-terminal op is a no-op (false)"
+        );
+    }
+
+    /// (d) `await_recalc` misuse is fail-loud: no pending recalc, or an op that is
+    /// not the in-flight one (and the real pending recalc stays drainable).
+    #[test]
+    fn await_recalc_misuse_is_bad_argument() {
+        let (mut s, _sheet) = dirty_dependent_session();
+        // No pending recalc.
+        let err = s.await_recalc(OperationId(999)).unwrap_err();
+        assert_eq!(err.code, "bad_argument");
+        // Mismatched op: pending stays intact and is still drainable.
+        let op = s.start_recalc(RecalcKind::Dirty).unwrap();
+        let err = s.await_recalc(OperationId(op.0 + 1)).unwrap_err();
+        assert_eq!(err.code, "bad_argument");
+        s.await_recalc(op).unwrap();
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
+    }
+
+    /// (e) The Busy window blocks a second `start_recalc` and any mutation
+    /// (`session_busy`), and convenience `recalc_dirty`/`recalc_all` still behave as
+    /// before (no window).
+    #[test]
+    fn recalc_window_is_busy_and_convenience_wrappers_unchanged() {
+        let (mut s, sheet) = dirty_dependent_session();
+        let op = s.start_recalc(RecalcKind::Dirty).unwrap();
+        // Second start + mutation are rejected while Busy.
+        assert_eq!(
+            s.start_recalc(RecalcKind::All).unwrap_err().code,
+            "session_busy"
+        );
+        assert_eq!(
+            s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+                .unwrap_err()
+                .code,
+            "session_busy"
+        );
+        s.await_recalc(op).unwrap();
+        // Drained back to Ready; convenience recalc now works and recomputes.
+        assert_eq!(s.lifecycle_state(), LifecycleState::Ready);
+        let op2 = s.recalc_all().unwrap();
+        assert_eq!(s.operation_status(op2).unwrap(), OperationState::Completed);
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 10.0 })
+        );
     }
 
     #[test]

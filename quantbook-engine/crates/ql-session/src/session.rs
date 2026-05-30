@@ -16,7 +16,7 @@ use crate::dto::{
 };
 use crate::error::EngineResult;
 use crate::function_meta::FunctionMetadata;
-use crate::operation::{LifecycleState, OperationId, OperationState};
+use crate::operation::{LifecycleState, OperationId, OperationState, RecalcKind};
 
 /// Opaque handle to a multi-call transaction (owns buffered DTOs, never a
 /// borrowed runtime — contract §3.4).
@@ -234,10 +234,29 @@ pub trait EngineSession {
     // --- Recalculation (§3.7; cancellation scoped per §6) ---
 
     /// Recompute the dirty set (incremental). Returns an op id; in v1, cancel is
-    /// honored only pre-start (§6.4).
+    /// honored only pre-start (§6.4). One-shot convenience = [`start_recalc`] +
+    /// [`await_recalc`] under one call (no cancel window).
+    ///
+    /// [`start_recalc`]: EngineSession::start_recalc
+    /// [`await_recalc`]: EngineSession::await_recalc
     fn recalc_dirty(&mut self) -> EngineResult<OperationId>;
     /// Recompute everything. Returns an op id; pre-start cancel only in v1.
     fn recalc_all(&mut self) -> EngineResult<OperationId>;
+    /// **M2 — reserve a recalc and return its op id WITHOUT running it** (the §6.4
+    /// "start → wait/cancel" shape). The session becomes `Busy`; the caller releases
+    /// the binding lock, so a [`cancel`](EngineSession::cancel) can land in the
+    /// resulting **pre-start window** before [`await_recalc`](EngineSession::await_recalc)
+    /// runs the synchronous recompute. A second `start_recalc` while one is pending is
+    /// rejected (`Busy`). The caller MUST follow with `await_recalc` (even after a
+    /// `cancel`) to drain back to `Ready`.
+    fn start_recalc(&mut self, kind: RecalcKind) -> EngineResult<OperationId>;
+    /// **M2 — run (or skip) the recalc reserved by [`start_recalc`](EngineSession::start_recalc).**
+    /// If a `cancel(op)` won the pre-start window, the recompute is SKIPPED (no commit,
+    /// no state change) and the op surfaces `Canceled` (§6.4 pre-start cancel — the
+    /// synchronous core cannot mid-flight abort, §6.3); otherwise it runs to
+    /// `Completed`/`Failed`. Fail-loud (`bad_argument`) if `op` is not the in-flight
+    /// recalc.
+    fn await_recalc(&mut self, op: OperationId) -> EngineResult<()>;
     /// Mark all volatile functions dirty.
     fn mark_volatiles_dirty(&mut self) -> EngineResult<()>;
 

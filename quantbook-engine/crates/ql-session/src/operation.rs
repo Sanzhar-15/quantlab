@@ -12,6 +12,22 @@ use crate::error::EngineError;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OperationId(pub u64);
 
+/// **M2 (6.3-1b):** which recompute a [`EngineSession::start_recalc`] /
+/// [`EngineSession::await_recalc`] pair runs — carried across the pre-start cancel
+/// window in place of the (non-nameable) recompute closure. Lives here so it is part
+/// of the binding-neutral trait surface.
+///
+/// [`EngineSession::start_recalc`]: crate::session::EngineSession::start_recalc
+/// [`EngineSession::await_recalc`]: crate::session::EngineSession::await_recalc
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecalcKind {
+    /// Incremental dirty-set recompute (`recompute_dirty`).
+    Dirty,
+    /// Full recompute (`recompute_all`).
+    All,
+}
+
 /// Terminal-or-running state of an operation (contract §6.1). Terminal states
 /// (`Completed`/`Canceled`/`Failed`) are immutable once reached.
 // NOTE: not `Eq` — `Failed` holds an `EngineError`, which is not `Eq`.

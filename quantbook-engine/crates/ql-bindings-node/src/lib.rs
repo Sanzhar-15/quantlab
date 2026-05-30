@@ -5011,6 +5011,97 @@ impl Session {
         })
     }
 
+    /// **M2 (6.3-1b):** reserve an incremental (dirty-set) recalc WITHOUT running
+    /// it; returns the operation id (u64 as BigInt). The session goes `Busy` and the
+    /// lock is released on return, opening a **pre-start cancel window**: call
+    /// [`Self::cancel`] with this id before [`Self::await_recalc`] to prevent the
+    /// run (contract §6.4). You MUST then call `awaitRecalc(op)` (even after a
+    /// `cancel`) to actually run-or-skip the recompute and release `Busy`. For the
+    /// common "recompute now" path with no cancellation, prefer
+    /// [`Self::recalc_dirty`] (one call, no window).
+    #[napi(js_name = "startRecalcDirty", catch_unwind)]
+    pub fn start_recalc_dirty(&self) -> Result<BigInt> {
+        guarded("startRecalcDirty", || {
+            let op = self
+                .inner
+                .lock()
+                .start_recalc(ql_session::RecalcKind::Dirty)
+                .map_err(engine_error_to_napi)?;
+            Ok(BigInt::from(op.0))
+        })
+    }
+
+    /// **M2 (6.3-1b):** reserve a full recalc WITHOUT running it; the
+    /// `startRecalcAll` counterpart of [`Self::start_recalc_dirty`] (same window +
+    /// `awaitRecalc` contract). Prefer [`Self::recalc_all`] for the no-cancel path.
+    #[napi(js_name = "startRecalcAll", catch_unwind)]
+    pub fn start_recalc_all(&self) -> Result<BigInt> {
+        guarded("startRecalcAll", || {
+            let op = self
+                .inner
+                .lock()
+                .start_recalc(ql_session::RecalcKind::All)
+                .map_err(engine_error_to_napi)?;
+            Ok(BigInt::from(op.0))
+        })
+    }
+
+    /// **M2 (6.3-1b):** run (or skip) the recalc reserved by `startRecalcDirty` /
+    /// `startRecalcAll`. If a [`Self::cancel`] won the pre-start window the
+    /// recompute is SKIPPED (the op surfaces `Canceled`); otherwise it runs to
+    /// `Completed`/`Failed`. Errors `[bad_argument]` if `op` is not the in-flight
+    /// recalc. (Read the resulting state via `operationStatus` once it is bound —
+    /// 6.3-1c/6.3-2.)
+    #[napi(js_name = "awaitRecalc", catch_unwind)]
+    pub fn await_recalc(&self, op: BigInt) -> Result<()> {
+        guarded("awaitRecalc", || {
+            // BigInt → u64, mirroring the `pollEvents`/`registerFunction` discipline:
+            // reject negative (sign bit) / lossy (> u64::MAX) loud per No-Fallbacks.
+            let (sign_bit, raw, lossless) = op.get_u64();
+            if sign_bit {
+                return Err(bad_argument_error(
+                    "awaitRecalc: op must be a non-negative BigInt".into(),
+                ));
+            }
+            if !lossless {
+                return Err(bad_argument_error(
+                    "awaitRecalc: op exceeds u64::MAX (lossy conversion rejected)".into(),
+                ));
+            }
+            self.inner
+                .lock()
+                .await_recalc(ql_session::OperationId(raw))
+                .map_err(engine_error_to_napi)
+        })
+    }
+
+    /// **M2 (6.3-1b):** cancel an operation by id. Returns `true` if the op was
+    /// `Running` and is now `Canceled`, `false` if it was already terminal
+    /// (completed/canceled/failed). For in-engine recalc this is honored only in the
+    /// pre-start window (before `awaitRecalc` begins the synchronous pass — §6.4).
+    /// Legal while the session is `Busy`. Errors `[operation_not_found]` for an
+    /// unknown id.
+    #[napi(js_name = "cancel", catch_unwind)]
+    pub fn cancel(&self, op: BigInt) -> Result<bool> {
+        guarded("cancel", || {
+            let (sign_bit, raw, lossless) = op.get_u64();
+            if sign_bit {
+                return Err(bad_argument_error(
+                    "cancel: op must be a non-negative BigInt".into(),
+                ));
+            }
+            if !lossless {
+                return Err(bad_argument_error(
+                    "cancel: op exceeds u64::MAX (lossy conversion rejected)".into(),
+                ));
+            }
+            self.inner
+                .lock()
+                .cancel(ql_session::OperationId(raw))
+                .map_err(engine_error_to_napi)
+        })
+    }
+
     /// Full workbook snapshot (carries the opaque `version` token as a `Buffer`).
     #[napi(js_name = "snapshot", catch_unwind)]
     pub fn snapshot(&self) -> Result<WorkbookSnapshotJson> {

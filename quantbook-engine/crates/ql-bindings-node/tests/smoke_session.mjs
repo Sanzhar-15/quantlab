@@ -129,6 +129,38 @@ const sheets = s.listSheets();
 assert.equal(sheets.length, 1, "one live sheet");
 assert.equal(sheets[0].name, "Sheet1", "sheet name preserved");
 
+// --- M2 (6.3-1b): start/await recalc + pre-start cancel window over napi -------
+// Self-contained on fresh cells E1/F1 (col 4/5) so it does not disturb the A1/B1
+// assertions above. Proves end-to-end that the windowed split works over napi:
+// startRecalc* returns an op id without running, cancel(op) in the window makes
+// awaitRecalc SKIP the recompute, and the session stays usable.
+{
+  s.setValue(sheetId, 0, 4, { kind: "number", number: 100 }); // E1 = 100
+  s.setFormula(sheetId, 0, 5, "E1+1"); // F1 = E1 + 1
+  // Happy path: startRecalcAll -> awaitRecalc completes and recomputes F1 = 101.
+  const opAll = s.startRecalcAll();
+  assert.equal(typeof opAll, "bigint", "startRecalcAll returns a BigInt op id");
+  s.awaitRecalc(opAll);
+  assert.equal(s.cell(sheetId, 0, 5).value.number, 101, "F1 = E1+1 = 101 after start/await");
+  // Pre-start cancel: dirty F1 (E1=200), start, cancel (true), await SKIPS recompute.
+  s.setValue(sheetId, 0, 4, { kind: "number", number: 200 });
+  const opDirty = s.startRecalcDirty();
+  assert.equal(typeof opDirty, "bigint", "startRecalcDirty returns a BigInt op id");
+  assert.equal(s.cancel(opDirty), true, "cancel of a Running op returns true");
+  s.awaitRecalc(opDirty);
+  assert.equal(
+    s.cell(sheetId, 0, 5).value.number,
+    101,
+    "canceled recalc must NOT recompute F1 (stays stale 101, not 201)",
+  );
+  assert.equal(s.cancel(opDirty), false, "cancel of an already-terminal op is false");
+  // Session still usable: a fresh recalc after the window recomputes F1 = 201.
+  const opDirty2 = s.startRecalcDirty();
+  s.awaitRecalc(opDirty2);
+  assert.equal(s.cell(sheetId, 0, 5).value.number, 201, "fresh recalc after the window recomputes F1 = 201");
+  console.log("[smoke] M2 start/await recalc + pre-start cancel window OK (cancel skipped recompute, session usable)");
+}
+
 // clear() == clear_formula() == "convert to literal": it removes the FORMULA
 // but PRESERVES the last computed value (inc.2c-6 contract). So B1 keeps
 // value==11 and loses its formula. (To also clear the value, setValue(blank).)
