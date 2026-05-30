@@ -12,7 +12,8 @@
 // Override the cdylib path with QL_NODE_CDYLIB=/abs/path/to/lib....{dylib,so}.
 
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -463,6 +464,80 @@ throwsWithCode(
 );
 
 console.log("[smoke] 6.4-2 function registration PASS");
+
+// === 6.3-2b (2026-05-30) — persistence over napi (.qbook open/save + import/export) ===
+//
+// Self-contained on FRESH sessions (order-independent of the shared `s`): a .qbook
+// save/open round-trip + a csv export/import round-trip + the xlsx-export capability
+// error (the default cdylib lacks the xlsx-write feature) + loud import negatives.
+{
+  const w = new Session();
+  const dataSheet = w.addSheet("Data", 1000);
+  w.setValue(dataSheet, 0, 0, { kind: "number", number: 123 });
+  w.recalcDirty();
+
+  // .qbook round-trip: save -> new Session().open() -> the value survives.
+  const dir = mkdtempSync(path.join(tmpdir(), "ql-qbook-"));
+  const qbookPath = path.join(dir, "smoke.qbook");
+  w.save(qbookPath);
+  const w2 = new Session();
+  w2.open(qbookPath);
+  assert.equal(w2.lifecycleState(), "ready", "opened .qbook session is 'ready'");
+  const opened = w2.cell(dataSheet, 0, 0);
+  assert.ok(
+    opened && opened.value && opened.value.number === 123,
+    ".qbook open round-trips the A1 value",
+  );
+  w2.close();
+
+  // csv round-trip: export bytes -> fresh session import -> the value survives.
+  // (Single live sheet, so csv export is unambiguous.)
+  const csvBytes = w.export("csv");
+  assert.ok(
+    csvBytes instanceof Uint8Array && csvBytes.length > 0,
+    "export('csv') returns a non-empty Uint8Array",
+  );
+  const w3 = new Session();
+  w3.import(csvBytes, "csv");
+  const imported = w3.cell(0, 0, 0); // csv import builds a fresh single sheet (id 0)
+  assert.ok(
+    imported && imported.value && imported.value.number === 123,
+    "csv import round-trips the A1 value",
+  );
+  w3.close();
+
+  // export('xlsx'): the default cdylib is built WITHOUT the `xlsx-write` feature,
+  // so the writer is absent -> honest capability error (No-Fallbacks), not a silent
+  // empty export.
+  throwsWithCode(
+    () => w.export("xlsx"),
+    "not_implemented_in_v1_core",
+    "export('xlsx') without the xlsx-write feature surfaces a loud not_implemented_in_v1_core",
+  );
+
+  // negatives: an unknown import format is a loud [bad_argument]; malformed xlsx
+  // bytes fail loud as a Persistence-class error (the exact parse code — zip vs
+  // calamine — is input-dependent, so assert the stable .class). Neither mutates `w`.
+  throwsWithCode(
+    () => w.import(new Uint8Array([1, 2, 3]), "json"),
+    "bad_argument",
+    "import with an unknown format surfaces a loud bad_argument",
+  );
+  assert.throws(
+    () => w.import(new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]), "xlsx"),
+    (e) => {
+      assert.equal(e.class, "persistence", `malformed xlsx import must be persistence-class; got ${e?.class}`);
+      return true;
+    },
+    "import of malformed xlsx bytes must fail loud (persistence)",
+  );
+
+  w.close();
+  rmSync(dir, { recursive: true, force: true });
+  console.log(
+    "[smoke] 6.3-2b persistence OK (.qbook open/save + csv round-trip + xlsx capability + loud negatives)",
+  );
+}
 
 // **6.1C audit-fix M8 — Session.close() deterministic lifecycle release.**
 // Post-close any command call returns a structured [invalid_state] error, not

@@ -389,6 +389,69 @@ impl ColumnStore {
             .map(|(idx, ((base, user), computed))| (idx, base, user, computed))
     }
 
+    /// **M7 (6.3-2b):** the highest absolute row whose EFFECTIVE (cascade) value is
+    /// non-blank, or `None` if the column carries no non-blank value anywhere. This is
+    /// the per-column half of [`Sheet::effective_value_bounds`] — the *value* extent that
+    /// shrinks when trailing cells are blank, unlike the conservative `Sheet::bounds` (which
+    /// grows on `put(.., Blank)` and never shrinks).
+    ///
+    /// Honors the read cascade (`user → computed → base`): a base non-null cell shadowed by
+    /// a `Blank` overlay entry is NOT counted (it reads Blank), and a `Blank` overlay entry
+    /// never counts even though it grew `bounds`. Only counts cells that actually read
+    /// non-blank. Cost is O(base cells + overlay entries) — a single pass.
+    ///
+    /// [`Sheet::effective_value_bounds`]: crate::Sheet::effective_value_bounds
+    pub fn effective_max_row(&self) -> Option<RowId> {
+        let mut max_row: Option<RowId> = None;
+        for (chunk_idx, base, user, computed) in self.iter_chunks() {
+            let chunk_base = chunk_idx as u64 * self.chunk_rows as u64;
+            let base_arr = base
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "ColumnStore::effective_max_row: Phase 0 only supports Float64Array \
+                         bases; got {:?}",
+                        base.data_type()
+                    )
+                });
+            let mut chunk_max: Option<RowId> = None;
+            let mut bump = |rel: RowId| {
+                chunk_max = Some(chunk_max.map_or(rel, |m| m.max(rel)));
+            };
+            // Base non-null cells are the effective source ONLY where no overlay shadows
+            // them (an overlay entry — Blank or not — is handled by the overlay loops below).
+            for idx in 0..base_arr.len() {
+                if base_arr.is_null(idx) {
+                    continue;
+                }
+                let rel = idx as RowId;
+                if user.get(rel).is_none() && computed.get(rel).is_none() {
+                    // read_base sanitizes NaN/Inf → #NUM! (an Error, non-blank); a finite
+                    // number is non-blank. Either way a non-null base cell reads non-blank.
+                    bump(rel);
+                }
+            }
+            // User overlay wins the cascade; count its non-blank entries.
+            for (rel, v) in user.iter() {
+                if !v.is_blank() {
+                    bump(rel);
+                }
+            }
+            // Computed overlay counts only where the user lane does not shadow it.
+            for (rel, v) in computed.iter() {
+                if user.get(rel).is_none() && !v.is_blank() {
+                    bump(rel);
+                }
+            }
+            if let Some(cm) = chunk_max {
+                let abs = (chunk_base + cm as u64) as RowId;
+                max_row = Some(max_row.map_or(abs, |m| m.max(abs)));
+            }
+        }
+        max_row
+    }
+
     /// Locate `(chunk_idx, rel_row)` for an absolute `row`.
     fn locate(&self, row: RowId) -> (usize, RowId) {
         let chunk_idx = (row / self.chunk_rows) as usize;

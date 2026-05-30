@@ -33,13 +33,13 @@
 //!   data (No-Fallbacks). CSV-injection mitigation for a consuming spreadsheet
 //!   app is that app's import responsibility (matches Excel/Sheets export); an
 //!   opt-in sanitising export mode is a documented future extension.
-//! - **Export uses the sheet's conservative used-range** (`Sheet::bounds`), the
-//!   same rectangle the xlsx exporter and `.qbook` saver use. ⚠️ Because
-//!   `Sheet::put` grows `bounds` even on a `Blank` write, a workbook that has
-//!   had a far cell *cleared* can carry an inflated used-range — a cross-cutting
-//!   property of every serializer, tracked for a uniform storage-level
-//!   effective-extent fix (a freshly *imported* CSV is unaffected: blank fields
-//!   are skipped, so its bounds track real data).
+//! - **Export uses the sheet's effective value extent** (`Sheet::effective_value_bounds`,
+//!   M7 / 6.3-2b) — the bounding box of non-blank values, NOT the conservative
+//!   `Sheet::bounds` (which grows on a `Blank` write and never shrinks). Trailing
+//!   all-blank rows/cols are trimmed; interior blanks (cells that are blank but
+//!   have a non-blank cell below/right of them) still render as empty fields, so
+//!   rectangular alignment is preserved. CSV is value-only, so this is exactly the
+//!   right extent — it carries no formats or formulas to lose.
 //! - **UTF-8 only.** A non-UTF-8 byte stream fails loud as [`CsvError::Parse`]
 //!   (the `csv` crate surfaces invalid UTF-8 as a parse error) — never a lossy
 //!   substitution (No-Fallbacks).
@@ -222,17 +222,18 @@ pub fn import_csv_bytes(
 
 /// Serialise one sheet of `workbook` to CSV bytes.
 ///
-/// Emits the sheet's used-range rectangle (`0..row_extent` × `0..col_extent`
-/// from [`ql_storage::Sheet::bounds`]); trailing blank cells within the
-/// rectangle render as empty fields. Each cell is rendered **verbatim** via
-/// [`ql_types::Value`]'s `Display` (no formula-trigger escaping — see the module
-/// docs); the `csv` writer applies RFC 4180 quoting. An empty sheet produces
-/// empty output.
+/// Emits the sheet's **effective value extent** rectangle (`0..row_extent` ×
+/// `0..col_extent` from [`ql_storage::Sheet::effective_value_bounds`], M7 / 6.3-2b);
+/// interior blank cells within the rectangle render as empty fields (preserving
+/// rectangular alignment), while trailing all-blank rows/cols are trimmed. Each cell
+/// is rendered **verbatim** via [`ql_types::Value`]'s `Display` (no formula-trigger
+/// escaping — see the module docs); the `csv` writer applies RFC 4180 quoting. An
+/// empty / all-blank sheet produces empty output.
 ///
-/// ⚠️ The used-range is conservative (`Sheet::put` grows it even on a `Blank`
-/// write), matching the xlsx exporter and `.qbook` saver — see the module-level
-/// "Export uses the sheet's conservative used-range" note and the tracked
-/// cross-cutting effective-extent follow-up.
+/// Uses the effective (non-blank-value) extent rather than the conservative
+/// `Sheet::bounds` (which grows on a `Blank` write and never shrinks) so a workbook
+/// whose far cells were cleared no longer exports inflated trailing empty fields. CSV
+/// is value-only, so this is lossless — it has no formats or formulas to drop.
 pub fn export_csv_bytes(
     workbook: &Workbook,
     sheet_id: SheetId,
@@ -241,7 +242,7 @@ pub fn export_csv_bytes(
     let sheet = workbook
         .sheet(sheet_id)
         .ok_or(CsvError::SheetNotFound(sheet_id))?;
-    let bounds = sheet.bounds();
+    let bounds = sheet.effective_value_bounds();
 
     let mut wtr = csv::WriterBuilder::new()
         .delimiter(options.delimiter)
@@ -412,5 +413,49 @@ mod tests {
         assert!(out.contains("name,score,passed"));
         assert!(out.contains("Alice,91.5,TRUE"));
         assert!(out.contains("Bob,0,FALSE"));
+    }
+
+    // -- M7 (6.3-2b): effective-extent export ----------------------------------
+
+    #[test]
+    fn export_trims_trailing_blank_rows() {
+        // A far explicit Blank inflates `bounds` but must NOT inflate the CSV.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::text("a"));
+        wb.put_at(s, 1, 0, Value::text("b"));
+        wb.put_at(s, 5, 0, Value::Blank); // grows bounds to row 6, value extent stays 2
+        let out =
+            String::from_utf8(export_csv_bytes(&wb, s, CsvExportOptions::default()).unwrap())
+                .unwrap();
+        assert_eq!(out, "a\nb\n", "trailing blank rows must be trimmed; got <{out}>");
+    }
+
+    #[test]
+    fn export_preserves_interior_blanks_rectangular() {
+        // Interior blanks stay (rectangular alignment); only trailing all-blank
+        // rows/cols trim. Data at (0,0),(0,2),(2,0) → a tight 3x3 rectangle.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::text("a"));
+        wb.put_at(s, 0, 2, Value::text("c"));
+        wb.put_at(s, 2, 0, Value::text("z"));
+        let out =
+            String::from_utf8(export_csv_bytes(&wb, s, CsvExportOptions::default()).unwrap())
+                .unwrap();
+        assert_eq!(out, "a,,c\n,,\nz,,\n", "interior blanks must be preserved; got <{out}>");
+    }
+
+    #[test]
+    fn export_import_export_is_stable() {
+        // Trimming trailing blanks makes the round-trip a fixed point.
+        let original = b"name,score\nAlice,91.5\nBob,0\n";
+        let imported = import_csv_bytes(original, CsvImportOptions::default()).unwrap();
+        let once =
+            export_csv_bytes(&imported.workbook, 0, CsvExportOptions::default()).unwrap();
+        let reimported = import_csv_bytes(&once, CsvImportOptions::default()).unwrap();
+        let twice =
+            export_csv_bytes(&reimported.workbook, 0, CsvExportOptions::default()).unwrap();
+        assert_eq!(once, twice, "import->export must be a stable fixed point");
     }
 }

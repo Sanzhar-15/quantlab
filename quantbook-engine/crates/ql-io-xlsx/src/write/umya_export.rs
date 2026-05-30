@@ -433,7 +433,32 @@ pub(crate) fn export_new_workbook_to_bytes(
             .new_sheet(&sheet_name)
             .map_err(|e| XlsxError::Export(format!("umya new_sheet({sheet_name}) failed: {e}")))?;
 
-        let bounds = sheet.bounds();
+        // **M7 (6.3-2b):** walk the union of the effective value extent and this
+        // sheet's formula bbox, NOT the conservative `Sheet::bounds`. xlsx has no
+        // separate formula-only emit pass (formulas are written INLINE in this
+        // value-walk), and a formula can compute to `Blank` (e.g. `=A1` over an empty
+        // A1 — `ql-functions` scalar.rs `cell_ref_missing_is_blank`), so a value-only
+        // extent could silently DROP a Blank-computed formula cell sitting outside the
+        // value bbox. Unioning the per-sheet formula positions guarantees every formula
+        // cell is visited and emitted. The format-overlay pass below stays
+        // bounds-independent (untouched) so format-only cells are never lost either.
+        // This union is never larger than the old `bounds()` (which already covered
+        // every formula cell via `put_computed`) — usually smaller.
+        let value_bounds = sheet.effective_value_bounds();
+        let mut row_extent = value_bounds.row_extent;
+        let mut col_extent = value_bounds.col_extent;
+        for (s, r, c) in formula_map.keys() {
+            if *s == sheet_id {
+                // `+1` one-past-max, fail-loud on overflow (No-Fallbacks; coords are
+                // gated to MAX_ROW/MAX_COLUMN by the writers — never reached).
+                row_extent = row_extent.max(r.checked_add(1).expect("xlsx row extent overflow"));
+                col_extent = col_extent.max(c.checked_add(1).expect("xlsx col extent overflow"));
+            }
+        }
+        let bounds = ql_storage::Bounds {
+            row_extent,
+            col_extent,
+        };
         // **W5-D-15.1 (Codex audit HIGH-3 closure):** the prior code
         // `continue`-d for empty-bounds sheets, skipping the
         // `sheet_fixes.push(fixes)` at end of loop. That misaligned

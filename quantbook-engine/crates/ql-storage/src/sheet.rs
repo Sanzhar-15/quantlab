@@ -125,6 +125,36 @@ impl Sheet {
         self.bounds
     }
 
+    /// **M7 (6.3-2b):** the bounding box of cells whose *value* is non-blank — the
+    /// **effective** value extent. Unlike [`Self::bounds`] (conservative: grows on
+    /// `put(.., Blank)` and never shrinks), this tightens to the actual non-blank data, so
+    /// trailing all-blank rows/cols are excluded. An empty / all-blank sheet → `Bounds::default()`.
+    ///
+    /// Serializer-only and purely additive — `bounds()` and its never-shrinks contract are
+    /// untouched (the calcgraph / op-log / UI viewport still rely on the conservative extent).
+    /// Honors the read cascade (a `Blank` overlay shadowing a non-null base reads Blank and
+    /// is excluded). Note this is a VALUE extent: a cell that is value-blank but carries a
+    /// format or a formula is NOT reflected here — callers that must preserve those
+    /// (`.qbook` save, xlsx export) union in the format-overlay / formula positions themselves.
+    pub fn effective_value_bounds(&self) -> Bounds {
+        let mut max_row: Option<RowId> = None;
+        let mut max_col: Option<ColId> = None;
+        for (col_idx, col) in self.columns.iter().enumerate() {
+            if let Some(r) = col.effective_max_row() {
+                max_row = Some(max_row.map_or(r, |m| m.max(r)));
+                let c = col_idx as ColId;
+                max_col = Some(max_col.map_or(c, |m| m.max(c)));
+            }
+        }
+        match (max_row, max_col) {
+            (Some(r), Some(c)) => Bounds {
+                row_extent: r.checked_add(1).expect("effective row extent overflow"),
+                col_extent: c.checked_add(1).expect("effective col extent overflow"),
+            },
+            _ => Bounds::default(),
+        }
+    }
+
     /// Row count per chunk for this sheet. Used by ql-io (W5-6) to record the actual
     /// chunk layout for round-trip. Audit H5 fix (2026-05-12).
     pub fn chunk_rows(&self) -> u32 {
@@ -353,6 +383,153 @@ mod tests {
             Bounds {
                 row_extent: 11,
                 col_extent: 6
+            }
+        );
+    }
+
+    // -- M7 (6.3-2b): effective_value_bounds -----------------------------------
+
+    #[test]
+    fn effective_value_bounds_empty_sheet_is_default() {
+        let s = Sheet::with_chunk_rows("S", 4);
+        assert_eq!(s.effective_value_bounds(), Bounds::default());
+    }
+
+    #[test]
+    fn effective_value_bounds_single_value() {
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.put(5, 2, Value::Number(42.0));
+        assert_eq!(
+            s.effective_value_bounds(),
+            Bounds {
+                row_extent: 6,
+                col_extent: 3
+            }
+        );
+    }
+
+    #[test]
+    fn effective_value_bounds_shrinks_vs_bounds_on_explicit_blank() {
+        // E1: a far explicit Blank grows `bounds` but NOT the effective extent.
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.put(0, 0, Value::Number(1.0));
+        s.put(10, 5, Value::Blank);
+        // Conservative bounds inflate to the far Blank…
+        assert_eq!(
+            s.bounds(),
+            Bounds {
+                row_extent: 11,
+                col_extent: 6
+            }
+        );
+        // …but the effective value extent is just the single real cell.
+        assert_eq!(
+            s.effective_value_bounds(),
+            Bounds {
+                row_extent: 1,
+                col_extent: 1
+            }
+        );
+    }
+
+    #[test]
+    fn effective_value_bounds_overlay_blank_shadows_nonnull_base() {
+        // E2 (the trap): a base non-null cell shadowed by a Blank user overlay reads
+        // Blank, so it must NOT count. Independent per-lane maxima would wrongly count
+        // the base 4.0 at row 3.
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.append_column(col_with(&[5.0, 2.0, 3.0, 4.0])); // col 0, base rows 0..3 non-null
+        s.put(3, 0, Value::Blank); // shadow the last base cell
+        assert_eq!(s.read(3, 0), Value::Blank);
+        // Highest non-blank effective row is 2 (value 3.0) → row_extent 3.
+        assert_eq!(
+            s.effective_value_bounds(),
+            Bounds {
+                row_extent: 3,
+                col_extent: 1
+            }
+        );
+    }
+
+    #[test]
+    fn effective_value_bounds_computed_blank_not_counted() {
+        // E3: a formula cell whose computed value is Blank does not extend the value bbox…
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.put_computed(7, 0, Value::Blank);
+        assert_eq!(s.effective_value_bounds(), Bounds::default());
+        // …but a non-blank computed value does.
+        let mut s2 = Sheet::with_chunk_rows("S", 4);
+        s2.put_computed(7, 0, Value::Number(1.0));
+        assert_eq!(
+            s2.effective_value_bounds(),
+            Bounds {
+                row_extent: 8,
+                col_extent: 1
+            }
+        );
+    }
+
+    #[test]
+    fn effective_value_bounds_ignores_format_only_cells() {
+        // A format-bearing but value-blank cell is NOT a value cell.
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.format_overlay_mut().set(9, 9, crate::FormatId::Builtin(14));
+        assert_eq!(s.effective_value_bounds(), Bounds::default());
+    }
+
+    #[test]
+    fn effective_value_bounds_mixed_user_computed_base_lanes() {
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.put(0, 2, Value::Number(7.0)); // user value, col 2
+        s.put(2, 0, Value::Number(1.0)); // user value, col 0
+        s.put_computed(4, 1, Value::Number(9.0)); // computed value, col 1
+        assert_eq!(
+            s.effective_value_bounds(),
+            Bounds {
+                row_extent: 5,
+                col_extent: 3
+            }
+        );
+    }
+
+    #[test]
+    fn effective_value_bounds_short_tail_overlay_beyond_base_len() {
+        // E5: an overlay entry at rel >= base.len() (short last chunk) must be counted.
+        let arr: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::Float64Array::from(vec![1.0, 2.0])); // base len 2
+        let col = ColumnStore::from_chunks(4, vec![arr]); // chunk_rows 4 > base len 2
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.append_column(col);
+        s.put(3, 0, Value::Number(8.0)); // overlay at rel 3, beyond base.len() == 2
+        assert_eq!(
+            s.effective_value_bounds(),
+            Bounds {
+                row_extent: 4,
+                col_extent: 1
+            }
+        );
+    }
+
+    #[test]
+    fn effective_value_bounds_all_blank_allocated_column_shrinks_col_extent() {
+        // E7: writing a Blank allocates intermediate columns but none carry a value →
+        // col_extent shrinks to 0, not just row_extent.
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.put(0, 3, Value::Blank);
+        assert!(s.bounds().col_extent >= 4); // columns 0..3 allocated, bounds grew
+        assert_eq!(s.effective_value_bounds(), Bounds::default());
+    }
+
+    #[test]
+    fn effective_value_bounds_error_value_counts() {
+        // An error value is a real (non-blank) cell.
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.put(3, 1, Value::Error(ErrorValue::Ref));
+        assert_eq!(
+            s.effective_value_bounds(),
+            Bounds {
+                row_extent: 4,
+                col_extent: 2
             }
         );
     }

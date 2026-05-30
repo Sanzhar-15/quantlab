@@ -5676,6 +5676,80 @@ impl Session {
     }
 
     // ============================================================================
+    // 6.3-2b (2026-05-30) — persistence over napi.
+    //
+    // Binds the four already-implemented engine persistence methods (inc.2c-9/10/
+    // 11/12): `.qbook` open/save, multi-format import/export. Byte payloads cross as
+    // `Uint8Array`. Each inherits the locked 6.3-1 contract — `guarded(env,..)` +
+    // `catch_unwind`, native structured errors via `engine_error_to_napi`.
+    // ============================================================================
+
+    /// Open a `.qbook` workbook from `path` (New → Ready; engine re-mints the epoch,
+    /// so any prior delta token full-rebuilds, and recomputes on load). A missing
+    /// file / bad envelope / corrupt op-log sidecar surfaces a structured
+    /// `[persistence]` engine error (No-Fallbacks). `[invalid_state]` off an openable
+    /// state.
+    #[napi(js_name = "open", catch_unwind)]
+    pub fn open(&self, env: Env, path: String) -> Result<()> {
+        guarded(env, "open", || {
+            self.inner
+                .lock()
+                .open(&path)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Import a workbook from in-memory `bytes` in `format` — v1 supports `"xlsx"`
+    /// (recomputed BestEffort on import) and `"csv"` (no formulas). Any other format
+    /// is a loud `[bad_argument]`; malformed bytes surface `[persistence]`. Adopts the
+    /// imported workbook as a fresh session (epoch re-minted).
+    ///
+    /// **V1 SharedArrayBuffer note** (mirrors `mergeBytes`): `bytes.as_ref()` lends a
+    /// slice INTO the JS-owned buffer; the engine consumes it synchronously into a
+    /// workbook before returning, so the V1 direct read is safe (a concurrent mutation
+    /// of a `SharedArrayBuffer` during the call is the documented V2 hardening target).
+    #[napi(js_name = "import", catch_unwind)]
+    pub fn import(&self, env: Env, bytes: Uint8Array, format: String) -> Result<()> {
+        guarded(env, "import", || {
+            self.inner
+                .lock()
+                .import(bytes.as_ref(), &format)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Save the live workbook + this session's op-log to a `.qbook` directory at
+    /// `path` (atomic rename protocol). The workbook display name is derived from the
+    /// path's file stem — a path with no stem is `[bad_argument]`. `[invalid_state]`
+    /// off a readable state; I/O / serialization failures surface `[persistence]`.
+    #[napi(js_name = "save", catch_unwind)]
+    pub fn save(&self, env: Env, path: String) -> Result<()> {
+        guarded(env, "save", || {
+            self.inner
+                .lock()
+                .save(&path)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Export the live workbook to in-memory bytes in `format` — v1 supports `"csv"`
+    /// (single live sheet; >1 → loud `[bad_argument]`) and `"xlsx"` (whole workbook,
+    /// only when the engine is built with the `xlsx-write` feature; otherwise the
+    /// honest `[not_implemented_in_v1_core]`). Any other format is `[bad_argument]`.
+    /// Returns the bytes as a `Uint8Array`.
+    #[napi(js_name = "export", catch_unwind)]
+    pub fn export(&self, env: Env, format: String) -> Result<Uint8Array> {
+        guarded(env, "export", || {
+            let bytes = self
+                .inner
+                .lock()
+                .export(&format)
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(Uint8Array::from(bytes))
+        })
+    }
+
+    // ============================================================================
     // 6.4-2 (2026-05-28) — function registration over napi.
     //
     // Wires the substrate shipped at 6.4-0 (function-metadata storage + hooks)

@@ -1192,6 +1192,38 @@ fn target_envelope_is_valid(target: &Path) -> bool {
 /// Inner write that populates `dir` with `workbook.toml` + `sheets/*.jsonl`. Used by
 /// `save_workbook` against a temp dir; not a public surface (the atomic-save wrapper
 /// is what callers want).
+/// **M7 (6.3-2b):** the honest persisted footprint of a sheet for the `.qbook`
+/// envelope `row_extent`/`col_extent` — a true upper bound covering every cell the
+/// save actually writes: non-blank values (JSONL value records) ∪ formula cells
+/// (the formula-only pass) ∪ format-overlay cells (the envelope `format_overlay`
+/// section). So a reader sizing a grid from these fields sees every cell that will
+/// materialize on load. Tighter than `Sheet::bounds` (which inflates on a `Blank`
+/// write and never shrinks) — the value contribution shrinks to real data — while
+/// still covering far-flung formula-only / format-only cells (which a bare value
+/// extent would under-report). The fields are write-only metadata (the loader
+/// re-grows `bounds` from the JSONL puts), but keeping them honest avoids the
+/// inflated footprint M7 exists to remove without ever under-reporting.
+fn effective_sheet_footprint(wb: &Workbook, sheet: &Sheet, sheet_id: SheetId) -> (RowId, ColId) {
+    let vb = sheet.effective_value_bounds();
+    let mut row_extent = vb.row_extent;
+    let mut col_extent = vb.col_extent;
+    // `+1` one-past-max, fail-loud on overflow (No-Fallbacks; coords are gated to
+    // MAX_ROW/MAX_COLUMN by the writers, so this is defense-in-depth, never reached).
+    let mut grow = |r: RowId, c: ColId| {
+        row_extent = row_extent.max(r.checked_add(1).expect("footprint row extent overflow"));
+        col_extent = col_extent.max(c.checked_add(1).expect("footprint col extent overflow"));
+    };
+    for (s, r, c, _) in wb.iter_formulas() {
+        if s == sheet_id {
+            grow(r, c);
+        }
+    }
+    for ((r, c), _) in sheet.format_overlay().iter() {
+        grow(r, c);
+    }
+    (row_extent, col_extent)
+}
+
 fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), QbookError> {
     fs::create_dir_all(dir)?;
     let sheets_dir = dir.join("sheets");
@@ -1201,7 +1233,9 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
     let mut sheet_envelopes: Vec<SheetEnvelope> = Vec::new();
     for sheet_id in 0..(wb.sheet_count() as SheetId) {
         let sheet = wb.sheet(sheet_id).expect("sheet_count was wrong");
-        let bounds = sheet.bounds();
+        // **M7 (6.3-2b):** honest tight footprint (value ∪ formula ∪ format
+        // positions) rather than the conservative `Sheet::bounds`.
+        let (env_row_extent, env_col_extent) = effective_sheet_footprint(wb, sheet, sheet_id);
         // **W5-81 (Phase 4.5.D part 5):** serialize the per-sheet cell-format
         // overlay if it has any entries. Sorted by (row, col) for diffability.
         let format_overlay = {
@@ -1229,8 +1263,8 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
             id: sheet_id,
             name: sheet.name().to_owned(),
             chunk_rows: sheet_chunk_rows(sheet),
-            row_extent: bounds.row_extent,
-            col_extent: bounds.col_extent,
+            row_extent: env_row_extent,
+            col_extent: env_col_extent,
             format_overlay,
         });
     }
@@ -1399,7 +1433,15 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         let sheet_path = sheets_dir.join(format!("{sheet_id}.jsonl"));
         let f = fs::File::create(&sheet_path)?;
         let mut writer = BufWriter::new(f);
-        let bounds = sheet.bounds();
+        // **M7 (6.3-2b):** sweep the effective value extent (non-blank values) rather
+        // than the conservative `Sheet::bounds`. Formula cells outside this rectangle
+        // (incl. formula-only cells whose computed value is Blank) are caught by the
+        // formula-only pass below — its `formula_positions` covers EVERY sheet formula
+        // regardless of position, so narrowing here is lossless (a skipped formula cell
+        // simply emits as `Pending` in that pass, identical wire output). Format-only
+        // cells (blank value, no formula) are never in the JSONL at all — they ride the
+        // bounds-independent envelope `format_overlay` section.
+        let bounds = sheet.effective_value_bounds();
 
         // Collect formula cells for this sheet so we can emit them even when their
         // row/col falls outside the value-bounds rectangle (e.g. a formula cell
@@ -3205,6 +3247,89 @@ sheets = [
         );
         // Sheet A doesn't see Sheet B's binding.
         assert_eq!(loaded.sheet(s0).unwrap().format_overlay().get(10, 20), None);
+    }
+
+    // -- M7 (6.3-2b): effective-extent save --------------------------------------
+
+    #[test]
+    fn m7_format_only_cell_outside_value_bbox_survives_narrowed_walk() {
+        // A format-only cell (blank value, no formula) far outside the value extent
+        // must survive — it rides the bounds-independent envelope format_overlay
+        // section, not the (now narrowed) JSONL value-walk.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fmt_only.qbook");
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::Number(1.0)); // value extent = just (0,0)
+        wb.sheet_mut(s)
+            .unwrap()
+            .format_overlay_mut()
+            .set(50, 7, ql_storage::FormatId::Builtin(14)); // far format-only cell
+        save_workbook(&wb, "fmt_only", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(
+            loaded.sheet(s).unwrap().format_overlay().get(50, 7),
+            Some(ql_storage::FormatId::Builtin(14)),
+            "format-only cell must survive the narrowed value-walk"
+        );
+    }
+
+    #[test]
+    fn m7_formula_only_blank_cell_outside_value_bbox_survives() {
+        // A formula-only cell whose value is Blank, positioned far outside the value
+        // extent, is caught by the formula-only pass (not the narrowed value-walk).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fml_only.qbook");
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::Number(1.0)); // value extent = just (0,0)
+        wb.put_formula(s, 200, 200, "SUM(A:A)"); // formula-only, Blank value, far away
+        save_workbook(&wb, "fml_only", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(
+            loaded.formula_at(s, 200, 200).map(|f| f.as_ref()),
+            Some("SUM(A:A)"),
+            "formula-only cell outside the value bbox must survive"
+        );
+    }
+
+    #[test]
+    fn m7_envelope_extent_is_honest_union_not_inflated_bounds() {
+        // Envelope row_extent/col_extent = union(value, formula, format) footprint,
+        // tight to real data — NOT the conservative Sheet::bounds (which a far Blank
+        // inflates).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("env_extent.qbook");
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::Number(1.0));
+        wb.put_at(s, 9, 9, Value::Blank); // inflates Sheet::bounds to {10,10}
+        wb.put_formula(s, 3, 4, "A1"); // formula extends the union to row 4, col 5
+        save_workbook(&wb, "env_extent", &path).unwrap();
+        let toml_str = fs::read_to_string(path.join("workbook.toml")).unwrap();
+        let env: WorkbookEnvelope = toml::from_str(&toml_str).unwrap();
+        // Union of value bbox {1,1} and formula at (3,4) -> {4,5}; the far Blank is excluded.
+        assert_eq!(env.sheets[0].row_extent, 4, "envelope row_extent must be the tight union");
+        assert_eq!(env.sheets[0].col_extent, 5, "envelope col_extent must be the tight union");
+    }
+
+    #[test]
+    fn m7_trailing_blank_shrink_full_round_trip_stable() {
+        // Values + a far explicit Blank: the save/load round-trip preserves all real
+        // cells while the inflated trailing region is dropped.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shrink.qbook");
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::Number(1.0));
+        wb.put_at(s, 1, 1, Value::text("x"));
+        wb.put_at(s, 40, 40, Value::Blank); // inflates bounds only
+        save_workbook(&wb, "shrink", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(loaded.sheet(s).unwrap().read(0, 0), Value::Number(1.0));
+        assert_eq!(loaded.sheet(s).unwrap().read(1, 1), Value::text("x"));
+        // The far Blank carried no data and is gone (reads Blank either way).
+        assert_eq!(loaded.sheet(s).unwrap().read(40, 40), Value::Blank);
     }
 
     #[test]
