@@ -13,6 +13,7 @@
 //! it reads Arrow chunks via `ColumnStore::iter_chunks` for batch processing.
 
 use std::cell::RefCell;
+use std::time::Instant;
 
 use ql_functions::{ReferenceQuery, NO_OP_REFERENCE_QUERY};
 use ql_storage::{NameTable, NamedTarget};
@@ -158,6 +159,25 @@ pub trait CellEnv {
     ///
     /// [`udf_worker`]: CellEnv::udf_worker
     fn push_udf_diagnostic(&self, _diag: UdfCellDiagnostic) {}
+
+    /// **6.4B (item H):** the operation-level UDF time-budget deadline for the
+    /// current recompute pass, if one is armed. [`dispatch_udf`] clamps each call's
+    /// timeout to `min(per-call, remaining-budget)` and, once `now >= deadline`,
+    /// skips the worker entirely — a deterministic `#TIMEOUT!` + `udf_budget_exhausted`
+    /// diagnostic — so a sheet full of slow UDFs cannot stall ONE recompute for
+    /// N×(per-call deadline).
+    ///
+    /// Default `None`: no budget armed (single-cell `set_formula`, tests, `MapEnv`,
+    /// the standalone-transaction commit path) — the per-call deadline alone
+    /// applies, exactly as before. Only the value-computing recompute pass
+    /// ([`WorkbookRuntime::recompute_dirty`] / `recompute_all`) arms it, via
+    /// [`WorkbookEnv::with_op_deadline`].
+    ///
+    /// [`dispatch_udf`]: crate::scalar
+    /// [`WorkbookRuntime::recompute_dirty`]: crate::workbook_runtime::WorkbookRuntime
+    fn udf_op_deadline(&self) -> Option<Instant> {
+        None
+    }
 }
 
 /// `ql-storage::Workbook`-backed implementation. Wraps a Workbook reference; reads dispatch
@@ -199,6 +219,13 @@ pub struct WorkbookEnv<'w> {
     /// `Event::CellDiagnostic` after the runtime borrow ends. Interior-mutable
     /// + `!Sync` like `udf_worker`; sound under single-threaded recompute.
     udf_diagnostics: Option<&'w RefCell<Vec<UdfCellDiagnostic>>>,
+    /// **6.4B (item H):** the operation-level UDF time-budget deadline for the
+    /// recompute pass this env belongs to. `None` everywhere except the
+    /// value-computing recompute pass, which sets it via [`WorkbookEnv::with_op_deadline`]
+    /// from the runtime's pass-start deadline. Surfaced to the dispatch site through
+    /// the [`CellEnv::udf_op_deadline`] override. `Copy` (`Instant`), so threading it
+    /// per-cell is free and keeps `WorkbookSession: Send`.
+    op_deadline: Option<Instant>,
 }
 
 impl<'w> WorkbookEnv<'w> {
@@ -221,6 +248,9 @@ impl<'w> WorkbookEnv<'w> {
             formula_cell: None,
             udf_worker: None,
             udf_diagnostics: None,
+            // **6.4B (item H):** no op-budget by default; only the recompute pass
+            // sets one via `with_op_deadline`.
+            op_deadline: None,
         }
     }
 
@@ -274,6 +304,17 @@ impl<'w> WorkbookEnv<'w> {
         env.udf_worker = worker;
         env.udf_diagnostics = diagnostics;
         env
+    }
+
+    /// **6.4B (item H):** attach the operation-level UDF time-budget deadline for
+    /// the current recompute pass (builder style so only the value-computing
+    /// recompute site sets it; every other ctor leaves it `None`). Surfaced to the
+    /// dispatch site via [`CellEnv::udf_op_deadline`]; `dispatch_udf` clamps each
+    /// call to `min(per-call, remaining)` and skips the worker once the budget is
+    /// spent.
+    pub fn with_op_deadline(mut self, op_deadline: Option<Instant>) -> Self {
+        self.op_deadline = op_deadline;
+        self
     }
 
     /// **W5-117 (Phase 4.8.G.2):** the formula's cell address, if the
@@ -435,6 +476,12 @@ impl<'w> CellEnv for WorkbookEnv<'w> {
         if let Some(sink) = self.udf_diagnostics {
             sink.borrow_mut().push(diag);
         }
+    }
+
+    /// **6.4B (item H):** surface the recompute pass's op-level UDF budget deadline
+    /// (set via [`WorkbookEnv::with_op_deadline`]) to the dispatch site.
+    fn udf_op_deadline(&self) -> Option<Instant> {
+        self.op_deadline
     }
 }
 

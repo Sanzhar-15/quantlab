@@ -965,7 +965,11 @@ impl<'a> WorkbookRuntime<'a> {
                 ql_types::Address::new(sheet, row, col),
                 self.udf_worker,
                 self.udf_diagnostics,
-            );
+            )
+            // **6.4B (item H):** carry this recompute pass's op-level UDF budget
+            // deadline (armed by `run_recalc`; `None` for direct test callers /
+            // no-worker passes → per-call deadline only) to the dispatch site.
+            .with_op_deadline(self.op_deadline);
             crate::scalar::eval_at_cell_boundary(plan.as_ref(), &env, self.registry, agg_cache)
         };
 

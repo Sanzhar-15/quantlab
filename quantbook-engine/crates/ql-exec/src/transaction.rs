@@ -41,7 +41,7 @@ use ql_storage::Workbook;
 use ql_types::{ColId, RowId, SheetId, Value};
 use ql_udf::UdfWorker;
 
-use crate::env::WorkbookEnv;
+use crate::env::{UdfCellDiagnostic, WorkbookEnv};
 use crate::plan::{bind_with_site, BindSite, ExprPlan};
 use crate::scalar::eval_scalar_with_registry;
 use crate::workbook_runtime::{validate_cell, RuntimeError};
@@ -108,6 +108,18 @@ pub struct WorkbookTransaction<'a> {
     /// self-heal). `None` (no worker) still yields a deterministic `#CALC!` at
     /// the dispatch site — honest, never a panic.
     udf_worker: Option<&'a RefCell<Box<dyn UdfWorker + Send>>>,
+    /// **6.4B (FF-2):** borrowed `UdfCellDiagnostic` collector, forwarded from the
+    /// `WorkbookRuntime` (which borrows the session's `udf_diagnostics`). Threaded
+    /// into pass-2's eval env so a `=MYUDF(..)` that fails (or has no worker) while
+    /// committing through THIS transaction records a structured diagnostic the
+    /// session drains into an `Event::CellDiagnostic` — symmetric with the
+    /// recompute / `set_formula` paths. `None` for the bare `new` / `with_oplog`
+    /// constructors (their UDF failures still yield the correct cell value, just no
+    /// diagnostic event). The standalone-transaction commit path was the one
+    /// value-computing eval site that previously dropped UDF diagnostics
+    /// (forward-risk: only test callers reach it today, but a future live commit
+    /// path would otherwise silently lose them).
+    udf_diagnostics: Option<&'a RefCell<Vec<UdfCellDiagnostic>>>,
 }
 
 impl<'a> WorkbookTransaction<'a> {
@@ -121,6 +133,8 @@ impl<'a> WorkbookTransaction<'a> {
             // 6.4-3c: bare constructor has no session, hence no worker. A UDF
             // committed through it is `#CALC!` (no-worker, honest + visible).
             udf_worker: None,
+            // 6.4B (FF-2): no session collector on the bare constructor.
+            udf_diagnostics: None,
         }
     }
 
@@ -141,6 +155,8 @@ impl<'a> WorkbookTransaction<'a> {
             oplog: Some(oplog),
             // 6.4-3c: standalone op-log constructor, no session worker.
             udf_worker: None,
+            // 6.4B (FF-2): standalone op-log constructor, no session collector.
+            udf_diagnostics: None,
         }
     }
 
@@ -158,6 +174,9 @@ impl<'a> WorkbookTransaction<'a> {
         registry: &'a FunctionRegistry,
         oplog: Option<&'a mut OpLog>,
         udf_worker: Option<&'a RefCell<Box<dyn UdfWorker + Send>>>,
+        // **6.4B (FF-2):** forward the runtime's (possibly absent) diagnostic
+        // collector so transaction-committed UDF failures emit a `CellDiagnostic`.
+        udf_diagnostics: Option<&'a RefCell<Vec<UdfCellDiagnostic>>>,
     ) -> Self {
         Self {
             workbook,
@@ -166,6 +185,7 @@ impl<'a> WorkbookTransaction<'a> {
             cell_kinds: HashMap::new(),
             oplog,
             udf_worker,
+            udf_diagnostics,
         }
     }
 
@@ -302,6 +322,7 @@ impl<'a> WorkbookTransaction<'a> {
             cell_kinds: _,
             oplog,
             udf_worker,
+            udf_diagnostics,
         } = self;
 
         // Phase 2B.7 audit H2/H4 (2026-05-12): build the log_ops list AND
@@ -426,10 +447,14 @@ impl<'a> WorkbookTransaction<'a> {
                     // site. Scalar context: an array-returning UDF here is
                     // `#CALC!` (no spill on this no-graph path), same as any
                     // array-in-scalar-context.
-                    let env = WorkbookEnv::with_formula_cell_and_worker(
+                    // **6.4B (FF-2):** the diagnostics-carrying env ctor so a UDF
+                    // failure here records a `CellDiagnostic` (no op-budget on the
+                    // one-shot commit path — the per-call deadline bounds it).
+                    let env = WorkbookEnv::with_formula_cell_worker_and_diagnostics(
                         workbook,
                         ql_types::Address::new(*sheet, *row, *col),
                         udf_worker,
+                        udf_diagnostics,
                     );
                     eval_scalar_with_registry(plan, &env, registry)
                 };
@@ -576,7 +601,7 @@ mod tests {
                     Ok(ql_types::ArrayValue::singleton(Value::Number(n * 2.0)))
                 })));
             let mut tx =
-                WorkbookTransaction::with_optional_oplog(&mut wb, &reg, None, Some(&worker));
+                WorkbookTransaction::with_optional_oplog(&mut wb, &reg, None, Some(&worker), None);
             tx.put_value(0, 0, 0, Value::Number(21.0)).unwrap();
             tx.put_formula(0, 0, 1, "MYUDF(A1)").unwrap();
             tx.commit().unwrap();
@@ -593,7 +618,7 @@ mod tests {
             let mut reg = default_registry();
             reg.register_udf(udf_meta("MYUDF"), FunctionImplHandle(7))
                 .unwrap();
-            let mut tx = WorkbookTransaction::with_optional_oplog(&mut wb, &reg, None, None);
+            let mut tx = WorkbookTransaction::with_optional_oplog(&mut wb, &reg, None, None, None);
             tx.put_value(0, 0, 0, Value::Number(21.0)).unwrap();
             tx.put_formula(0, 0, 1, "MYUDF(A1)").unwrap();
             tx.commit().unwrap();
@@ -603,6 +628,64 @@ mod tests {
                 "no worker on the transaction → honest #CALC!"
             );
         }
+    }
+
+    /// **6.4B (FF-2):** a UDF that FAILS while committing through a transaction now
+    /// records a `CellDiagnostic` into the forwarded collector — the
+    /// standalone-transaction commit path is no longer a diagnostics black hole
+    /// (forward-risk closure: only test callers reach it live today, but a future
+    /// live commit path would otherwise silently drop UDF failure diagnostics).
+    #[test]
+    fn transaction_udf_failure_records_diagnostic() {
+        use ql_functions::FunctionImplHandle;
+        use ql_udf::{MockWorker, UdfWorker};
+
+        let mut wb = make_wb();
+        let mut reg = default_registry();
+        let meta = ql_session::function_meta::FunctionMetadata {
+            canonical_name: "MYUDF".to_string(),
+            min_args: 1,
+            max_args: Some(1),
+            volatility: ql_session::function_meta::Volatility::Pure,
+            determinism: false,
+            dep_shape: ql_session::function_meta::DepShape::ValueDeps,
+            batch_shape: ql_session::function_meta::BatchShape::ArrayBatch,
+            arg_context: ql_session::function_meta::ArgContext::Aggregate,
+            provenance_tags: vec!["python".to_string()],
+            cancellation: ql_session::function_meta::CancelPolicy::WorkerKill,
+            arg_policy: ql_session::function_meta::ArgPolicy::Strict,
+        };
+        reg.register_udf(meta, FunctionImplHandle(7)).unwrap();
+        let worker: RefCell<Box<dyn UdfWorker + Send>> =
+            RefCell::new(Box::new(MockWorker::new(|_h, _a: &ql_types::ArrayValue| {
+                Err(ql_udf::UdfError::Raised {
+                    exc_type: "ValueError".to_string(),
+                    message: "boom".to_string(),
+                })
+            })));
+        let diags: RefCell<Vec<UdfCellDiagnostic>> = RefCell::new(Vec::new());
+        {
+            let mut tx = WorkbookTransaction::with_optional_oplog(
+                &mut wb,
+                &reg,
+                None,
+                Some(&worker),
+                Some(&diags),
+            );
+            tx.put_value(0, 0, 0, Value::Number(21.0)).unwrap();
+            tx.put_formula(0, 0, 1, "MYUDF(A1)").unwrap();
+            tx.commit().unwrap();
+        }
+        // The cell is #CALC! (a raise) AND the failure was recorded as a diagnostic.
+        assert_eq!(
+            wb.read(Address::new(0, 0, 1)),
+            Value::Error(ErrorValue::Calc),
+            "a raised UDF in a transaction is an honest #CALC!"
+        );
+        let recorded = diags.borrow();
+        assert_eq!(recorded.len(), 1, "exactly one diagnostic recorded");
+        assert_eq!(recorded[0].code, "udf_raised");
+        assert_eq!(recorded[0].addr, Address::new(0, 0, 1));
     }
 
     #[test]

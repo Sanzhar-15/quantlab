@@ -47,6 +47,9 @@ impl<'a> WorkbookRuntime<'a> {
             // 6.4-3c (CODEX-HIGH-2): forward the session's UDF worker so UDFs
             // committed via a runtime transaction compute, not stale-`#CALC!`.
             self.udf_worker,
+            // 6.4B (FF-2): forward the diagnostic collector too, so a UDF failure
+            // committed through a runtime transaction emits a `CellDiagnostic`.
+            self.udf_diagnostics,
         )
     }
 

@@ -107,7 +107,30 @@ pub enum CodecError {
     /// A control-frame string field ([`crate::control`]) was not valid UTF-8.
     #[error("decode: {field} field is not valid UTF-8")]
     BadUtf8 { field: &'static str },
+    /// **6.4B (item I):** the grid's cell count (`rows * cols`) exceeds
+    /// [`MAX_GRID_CELLS`]. Rejected loudly BEFORE allocating the cell vec — bounds
+    /// both the engine-side `Vec<Value>` and the downstream spill.
+    #[error("grid: {cells} cells exceeds the {max}-cell cap")]
+    GridTooManyCells { cells: usize, max: usize },
+    /// **6.4B (item I):** the encoded (or decoded-input) grid byte length exceeds
+    /// [`MAX_GRID_BYTES`]. Complements [`crate::frame::MAX_FRAME_LEN`]'s wire cap so
+    /// `encode_grid` cannot produce a buffer the frame layer would later reject with
+    /// a less specific error.
+    #[error("grid: {bytes} bytes exceeds the {max}-byte cap")]
+    GridTooManyBytes { bytes: usize, max: usize },
 }
+
+/// **6.4B (item I):** max cell count (`rows * cols`) of a UDF arg/return grid. A
+/// larger grid is rejected as [`CodecError::GridTooManyCells`] rather than
+/// allocated. Bounds the engine-side `Vec<Value>` and the spill that follows a UDF
+/// array return. Generous (a full Excel column is ~1.05M cells; this admits ~5
+/// columns of full height) but finite.
+pub const MAX_GRID_CELLS: usize = 5_000_000;
+
+/// **6.4B (item I):** max byte length of an encoded grid / decode input. Set to the
+/// transport frame cap so `encode_grid` never yields a payload the frame writer
+/// would reject, and a direct `decode_grid` of an over-cap buffer fails the same way.
+pub const MAX_GRID_BYTES: usize = crate::frame::MAX_FRAME_LEN as usize;
 
 const COL_KIND: usize = 0;
 const COL_NUM: usize = 1;
@@ -139,9 +162,37 @@ fn grid_schema(rows: u32, cols: u32) -> Schema {
 }
 
 /// Encode a grid to Arrow IPC stream bytes (the `CALL`/`RETURN` frame payload).
+/// Rejects a grid exceeding [`MAX_GRID_CELLS`] / [`MAX_GRID_BYTES`] (6.4B item I).
 pub fn encode_grid(grid: &ArrayValue) -> Result<Vec<u8>, CodecError> {
+    encode_grid_capped(grid, MAX_GRID_CELLS, MAX_GRID_BYTES)
+}
+
+/// [`encode_grid`] with explicit caps (the public wrapper passes the
+/// [`MAX_GRID_CELLS`] / [`MAX_GRID_BYTES`] defaults). Split out so tests can drive
+/// the cap paths with tiny limits instead of allocating a multi-million-cell grid.
+fn encode_grid_capped(
+    grid: &ArrayValue,
+    max_cells: usize,
+    max_bytes: usize,
+) -> Result<Vec<u8>, CodecError> {
     let rows = grid.rows();
     let cols = grid.cols();
+
+    // **6.4B (item I):** reject an over-cap arg grid (e.g. a huge range arg) BEFORE
+    // building any Arrow buffers. `rows`/`cols` are `u32`; `checked_mul` guards the
+    // 32-bit product overflowing `usize` on a hostile shape.
+    let cell_count = (rows as usize)
+        .checked_mul(cols as usize)
+        .ok_or(CodecError::GridTooManyCells {
+            cells: usize::MAX,
+            max: max_cells,
+        })?;
+    if cell_count > max_cells {
+        return Err(CodecError::GridTooManyCells {
+            cells: cell_count,
+            max: max_cells,
+        });
+    }
 
     let mut kind = StringBuilder::new();
     let mut num = Float64Builder::new();
@@ -211,6 +262,15 @@ pub fn encode_grid(grid: &ArrayValue) -> Result<Vec<u8>, CodecError> {
         writer.write(&batch)?;
         writer.finish()?;
     }
+    // **6.4B (item I):** a grid within the cell cap can still exceed the byte cap
+    // via a few very large strings — reject here with a specific error rather than
+    // letting the frame writer reject the payload with a generic length error.
+    if buf.len() > max_bytes {
+        return Err(CodecError::GridTooManyBytes {
+            bytes: buf.len(),
+            max: max_bytes,
+        });
+    }
     Ok(buf)
 }
 
@@ -279,6 +339,26 @@ fn col<'a, T: Array + 'static>(
 /// Every failure mode for worker-controlled bytes is a loud [`CodecError`] — no
 /// reachable panic, no silent coercion (No-Fallbacks; design §5).
 pub fn decode_grid(bytes: &[u8]) -> Result<ArrayValue, CodecError> {
+    decode_grid_capped(bytes, MAX_GRID_CELLS, MAX_GRID_BYTES)
+}
+
+/// [`decode_grid`] with explicit caps (the public wrapper passes the
+/// [`MAX_GRID_CELLS`] / [`MAX_GRID_BYTES`] defaults). Split out so tests can drive
+/// the cap paths with tiny limits instead of decoding a multi-million-cell grid.
+fn decode_grid_capped(
+    bytes: &[u8],
+    max_cells: usize,
+    max_bytes: usize,
+) -> Result<ArrayValue, CodecError> {
+    // **6.4B (item I):** reject an over-cap input buffer up front (defense in depth
+    // — the transport frame layer already caps reads at `MAX_FRAME_LEN`, but a
+    // direct `decode_grid` of in-memory bytes does not pass through it).
+    if bytes.len() > max_bytes {
+        return Err(CodecError::GridTooManyBytes {
+            bytes: bytes.len(),
+            max: max_bytes,
+        });
+    }
     let mut reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
     let batch = reader.next().ok_or(CodecError::Empty)??;
 
@@ -312,6 +392,16 @@ pub fn decode_grid(bytes: &[u8]) -> Result<ArrayValue, CodecError> {
         return Err(CodecError::ShapeMismatch(format!(
             "{n} cells but rows*cols = {expected} (rows={rows}, cols={cols})"
         )));
+    }
+
+    // **6.4B (item I):** reject an over-cap grid BEFORE the `Vec::with_capacity(n)`
+    // allocation below — a worker returning a legitimately-shaped but enormous grid
+    // (within the byte cap) is a visible `#VALUE!`, not a multi-million-element alloc.
+    if n > max_cells {
+        return Err(CodecError::GridTooManyCells {
+            cells: n,
+            max: max_cells,
+        });
     }
 
     let mut cells = Vec::with_capacity(n);
@@ -720,5 +810,64 @@ mod tests {
             w.finish().unwrap();
         }
         assert!(matches!(decode_grid(&buf).unwrap_err(), CodecError::Empty));
+    }
+
+    // ---- 6.4B (item I): grid resource caps ----
+
+    /// `encode_grid_capped` rejects a grid whose cell count exceeds the cap BEFORE
+    /// building Arrow buffers (a tiny cap stands in for the 5M default so the test
+    /// allocates nothing large).
+    #[test]
+    fn encode_rejects_grid_over_cell_cap() {
+        let grid = ArrayValue::new(2, 2, vec![Value::Number(1.0); 4]).unwrap();
+        let err = encode_grid_capped(&grid, 3, MAX_GRID_BYTES).unwrap_err();
+        assert!(
+            matches!(err, CodecError::GridTooManyCells { cells: 4, max: 3 }),
+            "got {err:?}"
+        );
+        // At the cap it still encodes.
+        assert!(encode_grid_capped(&grid, 4, MAX_GRID_BYTES).is_ok());
+    }
+
+    /// `decode_grid_capped` rejects an over-cap grid BEFORE the cell-vec allocation.
+    #[test]
+    fn decode_rejects_grid_over_cell_cap() {
+        let grid = ArrayValue::new(2, 2, vec![Value::Number(7.0); 4]).unwrap();
+        let bytes = encode_grid(&grid).expect("encode (under default cap)");
+        let err = decode_grid_capped(&bytes, 3, MAX_GRID_BYTES).unwrap_err();
+        assert!(
+            matches!(err, CodecError::GridTooManyCells { cells: 4, max: 3 }),
+            "got {err:?}"
+        );
+        // At the cap it round-trips.
+        let back = decode_grid_capped(&bytes, 4, MAX_GRID_BYTES).expect("decode at cap");
+        assert_eq!(back.rows(), 2);
+        assert_eq!(back.cols(), 2);
+    }
+
+    /// `encode_grid_capped` rejects a grid whose ENCODED bytes exceed the byte cap
+    /// even when its cell count is under the cell cap (few cells, large strings).
+    #[test]
+    fn encode_rejects_grid_over_byte_cap() {
+        let big = "x".repeat(4096);
+        let grid = ArrayValue::new(1, 1, vec![Value::Text(Arc::from(big.as_str()))]).unwrap();
+        let err = encode_grid_capped(&grid, MAX_GRID_CELLS, 64).unwrap_err();
+        assert!(
+            matches!(err, CodecError::GridTooManyBytes { max: 64, .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// `decode_grid_capped` rejects an over-cap input buffer up front (defense in
+    /// depth beyond the transport frame cap).
+    #[test]
+    fn decode_rejects_input_over_byte_cap() {
+        let grid = ArrayValue::new(1, 1, vec![Value::Number(1.0)]).unwrap();
+        let bytes = encode_grid(&grid).expect("encode");
+        let err = decode_grid_capped(&bytes, MAX_GRID_CELLS, 8).unwrap_err();
+        assert!(
+            matches!(err, CodecError::GridTooManyBytes { max: 8, .. }),
+            "got {err:?}"
+        );
     }
 }

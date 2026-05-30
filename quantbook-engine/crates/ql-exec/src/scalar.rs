@@ -37,7 +37,7 @@
 //!
 //! Unary `-x` negates; `+x` no-ops; `x%` divides by 100.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ql_formula_syntax::Operator;
 use ql_functions::FunctionRegistry;
@@ -64,6 +64,43 @@ use crate::plan::ExprPlan;
 /// the aggregate stall is unbounded. An operation-level recalc budget / cancel
 /// check is FILED-FORWARD for 6.4-3d alongside per-function deadlines.
 const UDF_CALL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// **6.4B (item H):** operation-level UDF time budget for ONE recompute pass.
+/// Without it, a pass touching N slow UDF cells could block the recalc thread for
+/// up to N × [`UDF_CALL_DEADLINE`] (the "N×30s mutex stall" — design §H/I). The
+/// recompute pass arms a deadline `Instant::now() + UDF_OP_BUDGET` once at the
+/// start (only when a worker is attached); [`effective_udf_deadline`] then clamps
+/// each call to the remaining budget and, once spent, skips the worker entirely
+/// (a deterministic `#TIMEOUT!` + `udf_budget_exhausted`). 120s = 4 × the per-call
+/// deadline: room for several genuinely-slow UDFs without an unbounded stall.
+///
+/// A session-level override (`WorkbookSession::set_udf_op_budget`) exists for
+/// tests; it is not yet bound over napi (a follow-up — per-function deadlines +
+/// host configurability are filed for 6.4B/later).
+pub(crate) const UDF_OP_BUDGET: Duration = Duration::from_secs(120);
+
+/// **6.4B (item H):** the effective timeout for ONE UDF call given the optional
+/// operation-level budget deadline `op_deadline` and the current instant `now`.
+///
+/// - `None` budget (single-cell `set_formula`, tests, no recompute pass) →
+///   `Some(UDF_CALL_DEADLINE)`: the per-call deadline alone, exactly as before.
+/// - budget present and still open → `Some(min(UDF_CALL_DEADLINE, remaining))`.
+/// - budget present and `now >= op_deadline` → `None`: **exhausted**, the caller
+///   must NOT dispatch (skip → `#TIMEOUT!` + `udf_budget_exhausted`).
+///
+/// Pure (no clock read of its own) so the clamp/exhaustion logic is unit-testable
+/// with synthetic instants.
+fn effective_udf_deadline(op_deadline: Option<Instant>, now: Instant) -> Option<Duration> {
+    match op_deadline {
+        None => Some(UDF_CALL_DEADLINE),
+        // `checked_duration_since` is `None` when `now` is later than the deadline;
+        // a zero remaining (now == deadline) is also treated as exhausted.
+        Some(dl) => match dl.checked_duration_since(now) {
+            Some(remaining) if !remaining.is_zero() => Some(remaining.min(UDF_CALL_DEADLINE)),
+            _ => None,
+        },
+    }
+}
 
 /// Evaluate an `ExprPlan` against `env` to produce a `Value`. Total function — never
 /// panics on Excel semantics (NaN, div-by-zero, etc.). Panics only on internal
@@ -1148,8 +1185,22 @@ fn dispatch_udf<E: CellEnv>(
         );
         return FunctionReturn::Scalar(Value::Error(ErrorValue::Calc));
     };
+    // **6.4B (item H):** operation-level budget gate. If this recompute pass has
+    // already spent its UDF time budget, SKIP the call — a deterministic `#TIMEOUT!`
+    // + `udf_budget_exhausted` diagnostic — rather than block the recalc thread for
+    // another full per-call deadline (the N×30s stall). Otherwise the call's timeout
+    // is clamped to the remaining budget so a mid-pass overrun is killed at the op
+    // deadline (worker-kill IS the cancel under GIL-only Python), not 30s later.
+    let Some(effective) = effective_udf_deadline(env.udf_op_deadline(), Instant::now()) else {
+        push_udf_cell_diagnostic(
+            env,
+            "udf_budget_exhausted",
+            "recompute UDF time budget exhausted before this cell; not dispatched".to_string(),
+        );
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::Timeout));
+    };
     let mut worker = worker_cell.borrow_mut();
-    match worker.call(handle, &args_grid, UDF_CALL_DEADLINE) {
+    match worker.call(handle, &args_grid, effective) {
         Ok(grid) => {
             if grid.rows() == 1 && grid.cols() == 1 {
                 // 1×1 result → a scalar cell value. `get(0,0)` on a grid we
@@ -1216,8 +1267,29 @@ fn udf_error_diagnostic(e: &ql_udf::UdfError) -> (&'static str, String) {
             "udf_worker_died",
             format!("Python worker died / transport broken: {m}"),
         ),
+        // **6.4B (item I):** a cap breach is its own code so the IDE can say "grid
+        // too large" rather than a generic codec error; the cell value is `#VALUE!`.
+        UdfError::Codec(c) if is_grid_too_large(c) => (
+            "udf_grid_too_large",
+            format!("UDF grid exceeds a resource cap: {c}"),
+        ),
         UdfError::Codec(c) => ("udf_codec", format!("UDF argument/return codec error: {c}")),
     }
+}
+
+/// **6.4B (item I):** distinguish a grid cap breach ([`CodecError::GridTooManyCells`]
+/// / [`CodecError::GridTooManyBytes`]) from a malformed-bytes codec error. Cap
+/// breaches map to `#VALUE!` + `udf_grid_too_large`; other codec errors stay
+/// `#CALC!` + `udf_codec`.
+///
+/// [`CodecError::GridTooManyCells`]: ql_udf::codec::CodecError::GridTooManyCells
+/// [`CodecError::GridTooManyBytes`]: ql_udf::codec::CodecError::GridTooManyBytes
+fn is_grid_too_large(c: &ql_udf::codec::CodecError) -> bool {
+    matches!(
+        c,
+        ql_udf::codec::CodecError::GridTooManyCells { .. }
+            | ql_udf::codec::CodecError::GridTooManyBytes { .. }
+    )
 }
 
 /// **6.4-3c (2026-05-29):** map a [`ql_udf::UdfError`] to a deterministic cell
@@ -1230,6 +1302,10 @@ fn udf_error_diagnostic(e: &ql_udf::UdfError) -> (&'static str, String) {
 fn map_udf_error(e: &ql_udf::UdfError) -> ErrorValue {
     match e {
         ql_udf::UdfError::Timeout(_) => ErrorValue::Timeout,
+        // **6.4B (item I):** a grid breaching the cell/byte cap is a sizing error
+        // in the UDF's args or result → `#VALUE!`, distinct from the generic codec
+        // `#CALC!`. (Paired with the `udf_grid_too_large` diagnostic below.)
+        ql_udf::UdfError::Codec(c) if is_grid_too_large(c) => ErrorValue::Value,
         // Adding a new `UdfError` variant? Reconsider this wildcard before it
         // silently maps to `#CALC!` — a future variant (e.g. a memory-limit
         // breach) may warrant a distinct cell value. The companion
@@ -2718,5 +2794,64 @@ mod tests {
             EvalResult::Scalar(Value::Error(ErrorValue::Num)) => {}
             other => panic!("expected Scalar(#NUM!), got {other:?}"),
         }
+    }
+
+    // ---- 6.4B (items H + I): UDF hardening unit tests ----
+
+    /// **6.4B (item H):** the pure budget clamp/exhaustion logic.
+    #[test]
+    fn effective_udf_deadline_no_budget_yields_per_call() {
+        let now = Instant::now();
+        assert_eq!(effective_udf_deadline(None, now), Some(UDF_CALL_DEADLINE));
+    }
+
+    #[test]
+    fn effective_udf_deadline_clamps_to_remaining_below_per_call() {
+        let t0 = Instant::now();
+        // 5s remaining < 30s per-call -> clamp to ~5s.
+        assert_eq!(
+            effective_udf_deadline(Some(t0 + Duration::from_secs(5)), t0),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn effective_udf_deadline_caps_at_per_call_when_remaining_larger() {
+        let t0 = Instant::now();
+        // 100s remaining > 30s per-call -> per-call wins.
+        assert_eq!(
+            effective_udf_deadline(Some(t0 + Duration::from_secs(100)), t0),
+            Some(UDF_CALL_DEADLINE)
+        );
+    }
+
+    #[test]
+    fn effective_udf_deadline_spent_budget_is_exhausted() {
+        let t0 = Instant::now();
+        // past the deadline -> None (skip).
+        assert_eq!(
+            effective_udf_deadline(Some(t0), t0 + Duration::from_secs(1)),
+            None
+        );
+        // exactly at the deadline (zero remaining) -> None.
+        assert_eq!(effective_udf_deadline(Some(t0), t0), None);
+    }
+
+    /// **6.4B (item I):** a grid cap breach maps to #VALUE! + udf_grid_too_large;
+    /// other codec errors stay #CALC! + udf_codec.
+    #[test]
+    fn grid_too_large_maps_to_value_error_and_diagnostic() {
+        use ql_udf::codec::CodecError;
+        for err in [
+            CodecError::GridTooManyCells { cells: 10, max: 5 },
+            CodecError::GridTooManyBytes { bytes: 100, max: 8 },
+        ] {
+            let e = ql_udf::UdfError::Codec(err);
+            assert_eq!(map_udf_error(&e), ErrorValue::Value);
+            assert_eq!(udf_error_diagnostic(&e).0, "udf_grid_too_large");
+        }
+        let other = ql_udf::UdfError::Codec(CodecError::Empty);
+        assert_eq!(map_udf_error(&other), ErrorValue::Calc);
+        assert_eq!(udf_error_diagnostic(&other).0, "udf_codec");
     }
 }

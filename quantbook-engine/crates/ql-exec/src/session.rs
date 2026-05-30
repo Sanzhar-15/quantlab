@@ -314,6 +314,16 @@ pub struct WorkbookSession {
     /// under single-threaded recompute. The cell VALUE is unchanged — this is
     /// purely the "why did the UDF fail" channel (exit test 7).
     udf_diagnostics: RefCell<Vec<UdfCellDiagnostic>>,
+    /// **6.4B (item H):** operation-level UDF time budget armed on each recalc pass
+    /// (see [`run_recalc`]). Default [`crate::scalar::UDF_OP_BUDGET`] (120s); bounds
+    /// a recompute touching N slow UDF cells to ~this instead of N × the per-call
+    /// deadline (the "N×30s stall"). Settable via [`set_udf_op_budget`] (used by
+    /// tests; a host-config / per-function-deadline surface is filed forward, not
+    /// yet bound over napi).
+    ///
+    /// [`run_recalc`]: WorkbookSession::run_recalc
+    /// [`set_udf_op_budget`]: WorkbookSession::set_udf_op_budget
+    udf_op_budget: std::time::Duration,
 }
 
 impl WorkbookSession {
@@ -387,6 +397,7 @@ impl WorkbookSession {
             udf_worker: None,
             // 6.4-3d (blocker G): empty per-recompute diagnostic collector.
             udf_diagnostics: RefCell::new(Vec::new()),
+            udf_op_budget: crate::scalar::UDF_OP_BUDGET,
         }
     }
 
@@ -961,6 +972,16 @@ impl WorkbookSession {
     /// and the `Busy` state are the shape the out-of-process UDF/SQL/AI paths
     /// (6.4/6.5) reuse for honest hard-cancel. Structural failures surface as
     /// `CellDiagnostic` events (never silently dropped).
+    /// **6.4B (item H):** override the operation-level UDF time budget (default
+    /// [`crate::scalar::UDF_OP_BUDGET`] = 120s). A test/host configuration knob —
+    /// not yet bound over napi (host configurability + per-function deadlines are
+    /// filed forward). `Duration::ZERO` makes every UDF in a recalc pass exhaust the
+    /// budget immediately, which the budget tests use to drive the skip path.
+    #[cfg(test)]
+    pub(crate) fn set_udf_op_budget(&mut self, budget: std::time::Duration) {
+        self.udf_op_budget = budget;
+    }
+
     fn run_recalc(
         &mut self,
         f: impl FnOnce(&mut WorkbookRuntime<'_>) -> Option<crate::RecomputeResult>,
@@ -969,7 +990,19 @@ impl WorkbookSession {
         self.ops.insert(op, OperationState::Running);
         self.state = LifecycleState::Busy;
 
-        let result = self.with_runtime(f);
+        // **6.4B (item H):** arm the operation-level UDF time budget for THIS recalc
+        // pass — only when a worker is attached (no worker → UDFs are `#CALC!`
+        // no-worker and never block, so a budget would be meaningless). Computed
+        // before `with_runtime` borrows `self`, then set on the runtime so the
+        // per-cell recompute env carries it to the dispatch site.
+        let op_deadline = self
+            .udf_worker
+            .is_some()
+            .then(|| std::time::Instant::now() + self.udf_op_budget);
+        let result = self.with_runtime(|rt| {
+            rt.arm_udf_op_deadline(op_deadline);
+            f(rt)
+        });
 
         if let Some(res) = &result {
             // F1: recompute commits via `put_computed_at` and appends NO ops, so
@@ -3421,6 +3454,56 @@ mod tests {
     /// ArgContext::Aggregate + BatchShape::ArrayBatch` because that's the shape
     /// the 6.4-3 Python UDF flow actually uses (so the test fixtures exercise
     /// the wedge configuration); individual tests override fields as needed.
+    /// **6.4B (item H):** with the op-level UDF budget exhausted (set to ZERO), a
+    /// recalc pass SKIPS every UDF dispatch — the worker is NOT called — bounding
+    /// the recalc instead of blocking N × the per-call deadline. With a normal
+    /// budget the same recalc DOES dispatch. Proven via an invocation counter.
+    #[test]
+    fn udf_op_budget_zero_skips_dispatch_in_recalc() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        register_udf(&mut s, "MYUDF", 7);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_w = Arc::clone(&calls);
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+            move |_h, _a: &ql_types::ArrayValue| {
+                calls_w.fetch_add(1, Ordering::SeqCst);
+                Ok(ql_types::ArrayValue::singleton(Value::Number(42.0)))
+            },
+        )));
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 21.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap();
+        // set_formula evaluated B1 once (a single edit carries no op budget).
+        let after_set = calls.load(Ordering::SeqCst);
+        assert!(after_set >= 1, "set_formula computed the cell once");
+
+        // Exhaust the op budget, then recalc -> every UDF dispatch is SKIPPED.
+        s.set_udf_op_budget(std::time::Duration::ZERO);
+        s.recalc_all().unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after_set,
+            "op budget exhausted -> the worker is NOT called during recalc"
+        );
+        // The cell holds the budget-exhausted #TIMEOUT! value.
+        assert!(
+            matches!(cell_value(&s, addr(sheet, 0, 1)), CellValue::Error { error } if error == "#TIMEOUT!"),
+            "budget-exhausted UDF cell is #TIMEOUT!"
+        );
+
+        // Restore a normal budget -> the same recalc now DOES dispatch.
+        s.set_udf_op_budget(std::time::Duration::from_secs(120));
+        s.recalc_all().unwrap();
+        assert!(
+            calls.load(Ordering::SeqCst) > after_set,
+            "with budget restored the recalc dispatches the UDF again"
+        );
+    }
+
     fn udf_meta(canonical_name: &str) -> FunctionMetadata {
         use ql_session::function_meta::{
             ArgContext, ArgPolicy, Arity, BatchShape, CancelPolicy, DepShape, Volatility,

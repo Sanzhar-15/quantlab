@@ -177,6 +177,17 @@ pub struct WorkbookRuntime<'a> {
     /// The session owns the `RefCell<Vec<_>>` and drains it after the runtime
     /// borrow ends (single-threaded — `RefCell` is `!Sync`).
     udf_diagnostics: Option<&'a RefCell<Vec<UdfCellDiagnostic>>>,
+    /// **6.4B (item H):** the operation-level UDF time-budget deadline for the
+    /// in-progress recompute pass. Armed by the session's recalc entry
+    /// ([`WorkbookSession::run_recalc`]) via [`arm_udf_op_deadline`] to
+    /// `Instant::now() + udf_op_budget` — only when a worker is attached — then
+    /// threaded into each per-cell recompute env via [`WorkbookEnv::with_op_deadline`].
+    /// `None` outside a worker-backed recompute pass (so non-UDF / no-worker
+    /// recompute is byte-for-byte unchanged, and direct `rt.recompute_*()` test
+    /// callers keep the per-call deadline only).
+    ///
+    /// [`arm_udf_op_deadline`]: WorkbookRuntime::arm_udf_op_deadline
+    op_deadline: Option<std::time::Instant>,
 }
 
 impl<'a> WorkbookRuntime<'a> {
@@ -190,6 +201,7 @@ impl<'a> WorkbookRuntime<'a> {
             graph: None,
             udf_worker: None,
             udf_diagnostics: None,
+            op_deadline: None,
         }
     }
 
@@ -216,6 +228,7 @@ impl<'a> WorkbookRuntime<'a> {
             graph: None,
             udf_worker: None,
             udf_diagnostics: None,
+            op_deadline: None,
         }
     }
 
@@ -240,6 +253,7 @@ impl<'a> WorkbookRuntime<'a> {
             graph: Some(graph),
             udf_worker: None,
             udf_diagnostics: None,
+            op_deadline: None,
         }
     }
 
@@ -264,6 +278,7 @@ impl<'a> WorkbookRuntime<'a> {
             graph: Some(graph),
             udf_worker: None,
             udf_diagnostics: None,
+            op_deadline: None,
         }
     }
 
@@ -315,6 +330,7 @@ impl<'a> WorkbookRuntime<'a> {
             graph: Some(graph),
             udf_worker,
             udf_diagnostics,
+            op_deadline: None,
         }
     }
 
@@ -357,6 +373,7 @@ impl<'a> WorkbookRuntime<'a> {
             graph: Some(graph),
             udf_worker,
             udf_diagnostics,
+            op_deadline: None,
         }
     }
 
@@ -365,6 +382,17 @@ impl<'a> WorkbookRuntime<'a> {
     /// for the next edit. Pairs with [`with_session_state`].
     ///
     /// [`with_session_state`]: WorkbookRuntime::with_session_state
+    /// **6.4B (item H):** arm the operation-level UDF budget deadline for the
+    /// recompute pass about to run through this runtime. Called by the session's
+    /// recalc entry with `Some(Instant::now() + budget)` when a worker is attached,
+    /// `None` otherwise. The per-cell recompute env-build site reads [`op_deadline`]
+    /// and threads it to the dispatch site via [`WorkbookEnv::with_op_deadline`].
+    ///
+    /// [`op_deadline`]: WorkbookRuntime::op_deadline
+    pub fn arm_udf_op_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.op_deadline = deadline;
+    }
+
     pub fn into_plan_cache(self) -> PlanCache {
         self.plan_cache
     }
