@@ -382,7 +382,20 @@ live sheet → `sheet_not_deleted`, move-to-current-index → silent no-op. **`s
 `target` is normalized to `start ≤ end` per axis (engine `Range::new`, Excel named-range semantics) — deliberately
 unlike `queryRange`, which rejects inversion (its `end - start + 1` span arithmetic would underflow). This
 `query_range`-vs-`set_name` inversion asymmetry is an engine-side API choice (filed forward), not a binding defect.
-`TableSpec`/`BatchResult`/transaction DTOs ride 6.3-2d/2e; `UndoRedoResult` rides 6.3-3.
+
+**6.3-2d — SHIPPED over napi (Node).** The tables cluster is bound on the owning `Session`:
+`createTable(spec)` / `renameTable(oldName, newName)` / `renameColumn(table, oldCol, newCol)` /
+`resizeTable(name, newRows, newCols, addedColumns, removedColumns)` / `dropTable(name)` (§3.3). The FIRST 6.3-2
+sub-increment with a new DTO: `TableSpecJson` (mirrors `ql_session::TableSpec`), converted by
+`session_table_spec_from_json` (`sheet` → u16, `topRow`/`topCol`/`rows`/`cols` → u32 via the same boundary
+validators as `session_range_from_json`; the u32 validator permits `0`, so a zero-dim spec reaches the engine and
+surfaces `table_create_rejected` rather than a boundary `bad_argument` — faithful). Each inherits the locked 6.3-1
+contract: duplicate name / zero dims / overlap / footprint / column-name issues → `table_create_rejected`
+(Conflict); unknown table → `table_not_found`; unknown column → `table_column_not_found`; rename-column target
+collision / empty name → `table_column_rejected`; invalid resize dims → `table_resize_rejected`; create on a
+non-live sheet → `sheet_not_found`. Table ops are not delta-expressible (they rewrite cells the session cannot
+enumerate) → the engine bumps the epoch (consumers reseed from a fresh snapshot). `BatchResult`/transaction DTOs
+ride 6.3-2e; `UndoRedoResult` rides 6.3-3.
 
 ### 4.2 Core DTOs (extracted from the proven `#[napi(object)]` structs; `+` = added/clarified)
 - **`CellValue`** (← `CellValueJson`, `lib.rs:580`): a **discriminated union** on `kind`
