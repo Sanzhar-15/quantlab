@@ -854,9 +854,13 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
    (qb.show/publish/bind/register_formula_function, BoundFrame.refresh, explicit edit txns);
    batch-shaped/Arrow call API from day one; deterministic structured error mapping. Proves the
    Month-6 kill gate.
-7. **6.4B — UDF hardening** — timeout/cancel via process kill, type-conversion matrix, resource
-   policy, subprocess lifecycle, docs/security/udf-ai-connectors.md, §4 graph-invalidation exit
-   tests, security-audit closure (UDF-6-02..04).
+7. ✅ **6.4B — UDF hardening — FULLY SHIPPED 2026-05-30** (HEAD `66f9b77b46d`). FF-1 (callable-name
+   gate) + H (op-budget) + I (grid caps) + FF-2 (txn diag sink) + UDF-6-03 type-conversion matrix
+   (`crates/ql-exec/tests/udf_type_matrix.rs` — real-worker round-trip of every Value variant + 15
+   sigils + the honest numpy/pandas boundary) + UDF-6-04 sandbox doc (`docs/security/udf-ai-connectors.md`).
+   Multi-lane closure audit (Codex + 3 Opus, `docs/audits/2026-05-30-6-4b-udf-closure/`) → 1 HIGH
+   (arrow `bodyLength` unbounded decode alloc → `precheck_ipc_message_bounds`) + 2 MED (op-budget armed
+   on undo/redo + open; doc worker-persistence) + 3 LOW, all fixed. ql-exec lib 785/0, ql-udf 45/0.
 8. **6.3 — Full bindings** (WASM/Node/C/Python) over the stable session API + parity golden matrix.
 9. **6.2 — Full service transport** — decide HTTP/gRPC then (default HTTP+SSE).
 10. **6.5 — SQL surface + connectors** — creds in VS Code SecretStorage, never in .qbook.

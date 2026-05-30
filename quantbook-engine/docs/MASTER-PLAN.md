@@ -782,6 +782,7 @@ This session counted **2 plan-implement-audit cycles** (V3.6.0.6 D5 ship + V3.6.
    Register and execute Python UDFs through PyO3 with sandbox boundaries, timeouts, cancellation, type conversion, and deterministic error mapping.  
    References: `.references/formualizer/bindings/python/examples/custom_function_registration.py`; `.references/formualizer/crates/formualizer-workbook/tests/custom_functions.rs`; `.references/formualizer/crates/formualizer-eval/src/function.rs`.  
    Acceptance: UDF-6-01 Python UDF callable from formula; UDF-6-02 timeout/cancel works; UDF-6-03 type conversion matrix tested; UDF-6-04 sandbox limitations documented.  
+   **✅ SHIPPED 2026-05-30 (UDF-6-01..04 all met).** UDFs callable end-to-end (6.4-3 arc); timeout/cancel via worker-kill + op-budget (6.4B H); type matrix `crates/ql-exec/tests/udf_type_matrix.rs` (UDF-6-03); sandbox doc `docs/security/udf-ai-connectors.md` (UDF-6-04). Closure audit `docs/audits/2026-05-30-6-4b-udf-closure/`. HEAD `66f9b77b46d`.  
    Effort: 1-2 weeks.
 
 5. **6.5 SQL Surface And Connectors**  

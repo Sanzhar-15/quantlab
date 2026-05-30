@@ -30,6 +30,13 @@
 > rematerialize recompute honestly). napi `set_udf_worker` injection is shipped + lifecycle-gated
 > (`set_udf_worker_checked`). **H/I CLOSED in 6.4B code cycle 1 (`fee55b8c719`)** (op-level recalc budget + per-call cancel; grid
 > caps). Remaining 6.4-3d work = the **IDE side** (Step 5) + a `pollEvents` napi binding for CellDiagnostic.
+> **6.4B FULLY CLOSED 2026-05-30** (UDF-6-02..04 phase gate): FF-1 + H + I + FF-2 +
+> UDF-6-03 type matrix (`crates/ql-exec/tests/udf_type_matrix.rs`) + UDF-6-04 security doc
+> (`docs/security/udf-ai-connectors.md`) shipped, then a multi-lane closure audit
+> (`docs/audits/2026-05-30-6-4b-udf-closure/`) fixed 1 HIGH (arrow `bodyLength` unbounded
+> alloc on decode → `precheck_ipc_message_bounds`) + 2 MED (op-budget now armed on
+> undo/redo `rematerialize` + `open` via `udf_op_deadline_for_pass`; doc worker-persistence)
+> + 3 LOW. HEAD `66f9b77b46d`.
 > Original blocker text kept below for provenance — these are NO LONGER open:
 >
 > **6.4-3c 5-way MEGAUDIT (2026-05-29) — were the 6.4-3d-gating blockers (now CLOSED — see STATUS above):**
