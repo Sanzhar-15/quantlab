@@ -372,6 +372,18 @@ feature is off). **M7 effective-extent landed with this increment** (CSV output 
 extent; see the `export("csv")` row in §3.1 and `Sheet::effective_value_bounds`). `TableSpec`/`BatchResult`/transaction
 DTOs ride later 6.3-2 sub-increments; `UndoRedoResult` rides 6.3-3.
 
+**6.3-2c — SHIPPED over napi (Node).** The structure / sheets cluster is bound on the owning `Session`:
+`renameSheet(id, newName)` / `deleteSheet(id)` / `restoreSheet(id)` / `moveSheet(id, newIndex)` / `setName(name, target)`
+(§3.3; `addSheet` was bound earlier). No new DTOs — sheet ids validated to u16 (`validate_u16_index`), the move
+index to u32 (`validate_u32_index`), and `setName`'s `target` reuses the 6.3-2a `CellRangeJson` / `session_range_from_json`.
+Each inherits the locked 6.3-1 contract (`guarded(env,…)` + native `engine_error_to_napi`): unknown id →
+`sheet_not_found`, duplicate name → `sheet_name_duplicate`, out-of-range move index → `bad_argument`, restore of a
+live sheet → `sheet_not_deleted`, move-to-current-index → silent no-op. **`setName` orientation:** an inverted
+`target` is normalized to `start ≤ end` per axis (engine `Range::new`, Excel named-range semantics) — deliberately
+unlike `queryRange`, which rejects inversion (its `end - start + 1` span arithmetic would underflow). This
+`query_range`-vs-`set_name` inversion asymmetry is an engine-side API choice (filed forward), not a binding defect.
+`TableSpec`/`BatchResult`/transaction DTOs ride 6.3-2d/2e; `UndoRedoResult` rides 6.3-3.
+
 ### 4.2 Core DTOs (extracted from the proven `#[napi(object)]` structs; `+` = added/clarified)
 - **`CellValue`** (← `CellValueJson`, `lib.rs:580`): a **discriminated union** on `kind`
   (`number`/`boolean`/`text`/`error`/`blank`/`pending`), exactly one payload. Bindings narrow on `kind`.
