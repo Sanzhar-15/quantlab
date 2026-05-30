@@ -823,6 +823,125 @@ console.log("[smoke] 6.4-2 function registration PASS");
   );
 }
 
+// === 6.3-2e (2026-05-30) — atomic groups + reserved stubs over napi ===
+//
+// Self-contained on a FRESH session. batch + the transaction handle are OBSERVABLE
+// (the staged ops really apply + resolve through a formula); the all-or-nothing
+// contract is pinned (a rejected batch leaves the grid intact); rollback discards;
+// the 5 reserved stubs surface not_implemented_in_v1_core; and the SessionOpJson
+// converter rejects malformed ops loudly. Exercises the new SessionOpJson /
+// BatchOptionsJson / BatchResultJson DTOs.
+{
+  const w = new Session();
+  const sh = w.addSheet("Ops", 1000);
+
+  // batch: atomic apply, OBSERVABLE (a no-op batch would leave B1 #NAME!/blank).
+  const r = w.batch(
+    [
+      { kind: "setValue", sheet: sh, row: 0, col: 0, value: { kind: "number", number: 5 } }, // A1=5
+      { kind: "setFormula", sheet: sh, row: 0, col: 1, text: "A1*2" }, // B1=A1*2
+    ],
+    {},
+  );
+  assert.equal(r.applied, 2, "batch reports applied=2");
+  assert.ok(
+    r.version instanceof Uint8Array && r.version.length > 0,
+    "batch returns a non-empty version token",
+  );
+  w.recalcDirty();
+  assert.equal(w.cell(sh, 0, 0).value.number, 5, "batch setValue applied (A1=5)");
+  assert.equal(w.cell(sh, 0, 1).value.number, 10, "batch setFormula applied + resolves (B1=A1*2=10)");
+
+  // batch all-or-nothing: a same-cell conflict rejects the WHOLE batch with NO
+  // partial mutation (the conflict is detected pre-mutation). A sentinel set before
+  // the failing batch must survive intact, AND a *valid* op on a DIFFERENT cell in
+  // the same rejected batch must NOT land (cross-cell atomicity, not just the
+  // conflicting cell).
+  w.setValue(sh, 9, 9, { kind: "number", number: 99 }); // sentinel J10=99
+  throwsWithCode(
+    () =>
+      w.batch(
+        [
+          { kind: "setValue", sheet: sh, row: 10, col: 10, value: { kind: "number", number: 7 } }, // valid, different cell
+          { kind: "setValue", sheet: sh, row: 9, col: 9, value: { kind: "number", number: 1 } },
+          { kind: "setValue", sheet: sh, row: 9, col: 9, value: { kind: "number", number: 2 } }, // same cell -> conflict
+        ],
+        {},
+      ),
+    "conflicting_batch_ops",
+    "a same-cell-twice batch is rejected as a conflict",
+  );
+  assert.equal(
+    w.cell(sh, 9, 9).value.number,
+    99,
+    "the rejected batch left the sentinel cell unchanged (all-or-nothing)",
+  );
+  assert.equal(
+    w.cell(sh, 10, 10),
+    null,
+    "the valid op on a different cell in the rejected batch also did NOT land (cross-cell atomicity)",
+  );
+
+  // transaction: begin / add / commit, OBSERVABLE.
+  const t = w.beginTransaction();
+  assert.equal(typeof t, "bigint", "beginTransaction returns a BigInt id");
+  w.txnAdd(t, { kind: "setValue", sheet: sh, row: 1, col: 2, value: { kind: "number", number: 7 } }); // C2=7
+  w.txnAdd(t, { kind: "setFormula", sheet: sh, row: 1, col: 3, text: "C2+1" }); // D2=C2+1
+  const rc = w.commitTransaction(t);
+  assert.equal(rc.applied, 2, "commitTransaction applied 2 staged ops");
+  w.recalcDirty();
+  assert.equal(w.cell(sh, 1, 3).value.number, 8, "committed txn resolves (D2=C2+1=8)");
+
+  // transaction rollback: the staged op is discarded (the cell stays empty -> null).
+  const t2 = w.beginTransaction();
+  assert.notEqual(t2, t, "beginTransaction returns distinct ids");
+  w.txnAdd(t2, { kind: "setValue", sheet: sh, row: 5, col: 5, value: { kind: "number", number: 42 } }); // F6 staged
+  w.rollbackTransaction(t2);
+  w.recalcDirty();
+  assert.equal(w.cell(sh, 5, 5), null, "a rolled-back txn did NOT apply its staged op (F6 still empty)");
+  // rollback REALLY consumed the handle (not a silent no-op): a follow-up op on it fails.
+  throwsWithCode(
+    () => w.txnAdd(t2, { kind: "setValue", sheet: sh, row: 5, col: 5, value: { kind: "number", number: 1 } }),
+    "transaction_not_found",
+    "rollback consumed the handle (txnAdd on a rolled-back txn is transaction_not_found)",
+  );
+
+  // reserved stubs: all 5 surface not_implemented_in_v1_core (loud Capability).
+  const r0 = { sheet: sh, startRow: 0, startCol: 0, endRow: 0, endCol: 0 };
+  throwsWithCode(() => w.writeRange(r0, [[{ kind: "number", number: 1 }]]), "not_implemented_in_v1_core", "writeRange reserved");
+  throwsWithCode(() => w.publishDataset("ds", "{}", r0), "not_implemented_in_v1_core", "publishDataset reserved");
+  throwsWithCode(() => w.bindRange("b1", r0), "not_implemented_in_v1_core", "bindRange reserved");
+  throwsWithCode(() => w.refreshSource("s1", 1n), "not_implemented_in_v1_core", "refreshSource reserved");
+  throwsWithCode(() => w.materializeQuery("q1", r0, "{}"), "not_implemented_in_v1_core", "materializeQuery reserved");
+
+  // arg validation (loud): unknown op kind / missing-for-kind payload / malformed JSON.
+  throwsWithCode(
+    () => w.batch([{ kind: "frobnicate", sheet: sh, row: 0, col: 0 }], {}),
+    "bad_argument",
+    "unknown SessionOp kind",
+  );
+  throwsWithCode(
+    () => w.batch([{ kind: "setValue", sheet: sh, row: 0, col: 0 }], {}),
+    "bad_argument",
+    "setValue op missing its 'value' payload",
+  );
+  throwsWithCode(
+    () => w.batch([{ kind: "clear", sheet: sh, row: 0, col: 0, value: { kind: "number", number: 1 } }], {}),
+    "bad_argument",
+    "clear op carrying an extraneous 'value' payload (strict tagged union)",
+  );
+  throwsWithCode(
+    () => w.publishDataset("ds", "{not valid json", r0),
+    "bad_argument",
+    "publishDataset with malformed JSON data",
+  );
+
+  w.close();
+  console.log(
+    "[smoke] 6.3-2e atomic groups + reserved stubs OK (batch atomic+observable, txn commit/rollback, reserved Capability, arg validation)",
+  );
+}
+
 // **6.1C audit-fix M8 — Session.close() deterministic lifecycle release.**
 // Post-close any command call returns a structured [invalid_state] error, not
 // a panic / silent failure. Closes the lifecycle hole flagged by the megaudit

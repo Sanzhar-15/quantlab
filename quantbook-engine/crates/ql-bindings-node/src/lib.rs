@@ -4516,6 +4516,111 @@ fn session_table_spec_from_json(method: &str, spec: TableSpecJson) -> Result<ql_
     })
 }
 
+/// **Phase 6.3-2e (2026-05-30):** convert a JS [`SessionOpJson`] (a `kind`-tagged
+/// union) into an engine [`ql_session::SessionOp`]. Strict like [`arity_from_json`]:
+/// each `kind` requires its own payload (`setValue`→`value`, `setFormula`→`text`,
+/// `setFormat`→`format`, `clear`→none) and a missing payload or unknown `kind` is a
+/// loud `[bad_argument]` (No-Fallbacks — a malformed op is never normalized away).
+/// The address is always validated via [`session_addr_from_f64`].
+fn session_op_from_json(method: &str, op: SessionOpJson) -> Result<ql_session::session::SessionOp> {
+    use ql_session::session::SessionOp;
+    let addr = session_addr_from_f64(method, op.sheet, op.row, op.col)?;
+    // Strict tagged union (mirrors `arity_from_json`): each `kind` admits ONLY its
+    // own payload. An extraneous-for-kind field (e.g. a `clear` carrying `value`) is
+    // a malformed DTO and is REJECTED loudly, not silently dropped (No-Fallbacks).
+    let SessionOpJson {
+        kind,
+        value,
+        text,
+        format,
+        ..
+    } = op;
+    let reject_extra = |present: bool, field: &str, kind: &str| -> Result<()> {
+        if present {
+            return Err(bad_argument_error(format!(
+                "{method}: SessionOp kind '{kind}' must not carry a '{field}' field"
+            )));
+        }
+        Ok(())
+    };
+    match kind.as_str() {
+        "setValue" => {
+            reject_extra(text.is_some(), "text", "setValue")?;
+            reject_extra(format.is_some(), "format", "setValue")?;
+            let value = value.ok_or_else(|| {
+                bad_argument_error(format!(
+                    "{method}: SessionOp kind 'setValue' requires a 'value' field"
+                ))
+            })?;
+            let value = session_cell_value_from_json(value)?;
+            Ok(SessionOp::SetValue { addr, value })
+        }
+        "setFormula" => {
+            reject_extra(value.is_some(), "value", "setFormula")?;
+            reject_extra(format.is_some(), "format", "setFormula")?;
+            let text = text.ok_or_else(|| {
+                bad_argument_error(format!(
+                    "{method}: SessionOp kind 'setFormula' requires a 'text' field"
+                ))
+            })?;
+            Ok(SessionOp::SetFormula { addr, text })
+        }
+        "clear" => {
+            reject_extra(value.is_some(), "value", "clear")?;
+            reject_extra(text.is_some(), "text", "clear")?;
+            reject_extra(format.is_some(), "format", "clear")?;
+            Ok(SessionOp::Clear { addr })
+        }
+        "setFormat" => {
+            reject_extra(value.is_some(), "value", "setFormat")?;
+            reject_extra(text.is_some(), "text", "setFormat")?;
+            let format = format.ok_or_else(|| {
+                bad_argument_error(format!(
+                    "{method}: SessionOp kind 'setFormat' requires a 'format' field"
+                ))
+            })?;
+            let format = session_format_id_from_json(format)?;
+            Ok(SessionOp::SetFormat { addr, format })
+        }
+        other => Err(bad_argument_error(format!(
+            "{method}: unknown SessionOp kind '{other}' \
+             (expected setValue|setFormula|clear|setFormat)"
+        ))),
+    }
+}
+
+/// **Phase 6.3-2e (2026-05-30):** BigInt → [`ql_session::TransactionId`] (`u64`),
+/// rejecting a negative (sign bit) or lossy (> u64::MAX) value loudly per
+/// No-Fallbacks — the same discipline as `awaitRecalc`'s `OperationId` conversion.
+fn transaction_id_from_bigint(
+    method: &str,
+    txn: BigInt,
+) -> Result<ql_session::session::TransactionId> {
+    let (sign_bit, raw, lossless) = txn.get_u64();
+    if sign_bit {
+        return Err(bad_argument_error(format!(
+            "{method}: txn must be a non-negative BigInt"
+        )));
+    }
+    if !lossless {
+        return Err(bad_argument_error(format!(
+            "{method}: txn exceeds u64::MAX (lossy conversion rejected)"
+        )));
+    }
+    Ok(ql_session::session::TransactionId(raw))
+}
+
+/// **Phase 6.3-2e (2026-05-30):** parse a reserved-stub `data` payload (a JSON
+/// string — the napi `serde-json` feature is not enabled, so opaque JSON crosses the
+/// boundary as text, mirroring the 6.3-1c `details` convention). Invalid JSON is a
+/// loud `[bad_argument]`. Used only by the reserved `publishDataset`/`materializeQuery`
+/// forwarders, which then surface `not_implemented_in_v1_core`.
+fn parse_reserved_json_payload(method: &str, data: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(data).map_err(|e| {
+        bad_argument_error(format!("{method}: data must be valid JSON text ({e})"))
+    })
+}
+
 /// **Phase 6.3-2a (2026-05-30):** stable snake_case wire string for a
 /// [`ql_session::LifecycleState`] (mirrors `#[serde(rename_all = "snake_case")]`
 /// — though the enum is read via this helper, not serde) — the value returned by
@@ -4780,6 +4885,39 @@ pub struct TableSpecJson {
     pub has_header: bool,
     pub has_totals: bool,
     pub column_names: Vec<String>,
+}
+
+/// **Phase 6.3-2e (2026-05-30):** one op in a `batch`/transaction (a `kind`-tagged
+/// mirror of the 4-variant [`ql_session::SessionOp`]). Exactly one payload field is
+/// required per `kind`: `setValue`→`value`, `setFormula`→`text`, `setFormat`→`format`,
+/// `clear`→none. `sheet`/`row`/`col` are JS Numbers validated to `u16`/`u32` at the
+/// boundary (same discipline as `setValue`). Converted by `session_op_from_json`.
+#[napi(object)]
+pub struct SessionOpJson {
+    pub kind: String,
+    pub sheet: f64,
+    pub row: f64,
+    pub col: f64,
+    pub value: Option<CellValueJson>,
+    pub text: Option<String>,
+    pub format: Option<FormatIdJson>,
+}
+
+/// **Phase 6.3-2e (2026-05-30):** options for `batch` (mirrors
+/// [`ql_session::BatchOptions`]). `undoLabel` groups the batch under a named undo unit.
+#[napi(object)]
+pub struct BatchOptionsJson {
+    pub undo_label: Option<String>,
+}
+
+/// **Phase 6.3-2e (2026-05-30):** result of a `batch`/`commitTransaction` (mirrors
+/// [`ql_session::BatchResult`]). `applied` is the op count; `version` is the opaque
+/// post-batch [`ql_session::SessionVersion`] as a `Buffer` (round-trip it into the
+/// next `snapshotDelta`, exactly like `WorkbookSnapshotJson.version`).
+#[napi(object)]
+pub struct BatchResultJson {
+    pub applied: f64,
+    pub version: Buffer,
 }
 
 /// **Phase 6.3-2a (2026-05-30):** which extras a `queryRange` read includes
@@ -5997,6 +6135,234 @@ impl Session {
             self.inner
                 .lock()
                 .drop_table(&name)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    // ============================================================================
+    // 6.3-2e (2026-05-30) — atomic groups + reserved §2c stubs over napi.
+    //
+    // Binds the already-implemented atomic-group methods (§3.4) — `batch` + the
+    // multi-call transaction handle (`begin`/`txnAdd`/`commit`/`rollback`) — plus
+    // the 5 reserved §3.5 capability stubs as thin loud-Capability forwarders. The
+    // FIFTH and final 6.3-2 sub-increment (completes 6.3-2). New DTOs: `SessionOpJson`
+    // (the op union), `BatchOptionsJson`, `BatchResultJson`. Each method inherits the
+    // locked 6.3-1 contract — `guarded(env,..)` + `catch_unwind`, native
+    // `engine_error_to_napi`. `TransactionId` is a `u64` carried as a JS `BigInt`
+    // (sign/lossless-validated on input, exactly like `OperationId`).
+    // ============================================================================
+
+    /// Apply a sequence of ops atomically as ONE undo unit / ONE op-log entry
+    /// (`Op::BatchCommit`, §3.4) — all-or-nothing. An invalid op (e.g. a non-finite
+    /// value → `[bad_argument]`) or a same-cell value/formula conflict (two such ops
+    /// on one cell → `[conflicting_batch_ops]`) rejects the WHOLE batch with no
+    /// partial mutation (validated pre-mutation). Returns
+    /// the applied count + the post-batch version token. `[invalid_state]` off a Ready
+    /// session; a tombstoned target sheet → `[sheet_not_found]`.
+    #[napi(js_name = "batch", catch_unwind)]
+    pub fn batch(
+        &self,
+        env: Env,
+        ops: Vec<SessionOpJson>,
+        options: BatchOptionsJson,
+    ) -> Result<BatchResultJson> {
+        guarded(env, "batch", || {
+            let ops = ops
+                .into_iter()
+                .map(|op| session_op_from_json("batch", op))
+                .collect::<Result<Vec<_>>>()?;
+            let options = ql_session::BatchOptions {
+                undo_label: options.undo_label,
+            };
+            let result = self
+                .inner
+                .lock()
+                .batch(ops, options)
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(BatchResultJson {
+                applied: result.applied as f64,
+                version: Buffer::from(result.version.0),
+            })
+        })
+    }
+
+    /// Open a multi-call transaction; returns its id (u64 as BigInt). Stage ops with
+    /// `txnAdd`, then `commitTransaction` (atomic, one undo unit) or
+    /// `rollbackTransaction` (discard). `[invalid_state]` off a Ready session.
+    #[napi(js_name = "beginTransaction", catch_unwind)]
+    pub fn begin_transaction(&self, env: Env) -> Result<BigInt> {
+        guarded(env, "beginTransaction", || {
+            let txn = self
+                .inner
+                .lock()
+                .begin_transaction()
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(BigInt::from(txn.0))
+        })
+    }
+
+    /// Stage an op into an open transaction. An unknown txn id surfaces
+    /// `[transaction_not_found]` (NotFound); a malformed BigInt id or a malformed op
+    /// surfaces `[bad_argument]`. Staged ops do not apply until `commitTransaction`.
+    #[napi(js_name = "txnAdd", catch_unwind)]
+    pub fn txn_add(&self, env: Env, txn: BigInt, op: SessionOpJson) -> Result<()> {
+        guarded(env, "txnAdd", || {
+            let txn = transaction_id_from_bigint("txnAdd", txn)?;
+            let op = session_op_from_json("txnAdd", op)?;
+            self.inner
+                .lock()
+                .txn_add(txn, op)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Commit a transaction atomically (one undo unit). Same all-or-nothing semantics
+    /// as `batch`. An unknown txn id surfaces `[transaction_not_found]` (NotFound); a
+    /// malformed BigInt id surfaces `[bad_argument]`. On a FAILED commit the engine
+    /// restores the buffer (the transaction stays open for fix-and-retry/rollback); a
+    /// successful commit consumes the handle. Returns the applied count + the
+    /// post-commit version token.
+    #[napi(js_name = "commitTransaction", catch_unwind)]
+    pub fn commit_transaction(&self, env: Env, txn: BigInt) -> Result<BatchResultJson> {
+        guarded(env, "commitTransaction", || {
+            let txn = transaction_id_from_bigint("commitTransaction", txn)?;
+            let result = self
+                .inner
+                .lock()
+                .commit_transaction(txn)
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(BatchResultJson {
+                applied: result.applied as f64,
+                version: Buffer::from(result.version.0),
+            })
+        })
+    }
+
+    /// Roll back (discard) a transaction; its staged ops never apply and the handle is
+    /// consumed. An unknown txn id surfaces `[transaction_not_found]` (NotFound); a
+    /// malformed BigInt id surfaces `[bad_argument]`.
+    #[napi(js_name = "rollbackTransaction", catch_unwind)]
+    pub fn rollback_transaction(&self, env: Env, txn: BigInt) -> Result<()> {
+        guarded(env, "rollbackTransaction", || {
+            let txn = transaction_id_from_bigint("rollbackTransaction", txn)?;
+            self.inner
+                .lock()
+                .rollback_transaction(txn)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    // --- Reserved §3.5 capability stubs (real impls land in 6.4 / 6.5) ---
+    //
+    // These ALWAYS surface `not_implemented_in_v1_core` (Capability) in v1 — that is
+    // the AUTHORITATIVE v1 signal ("this feature does not exist yet"). Each is declared
+    // `-> ()` (it never returns a value) and forwards to the engine via `.map(|_| ())`
+    // on the unreachable Ok arm — a real impl only swaps the return type. Inputs are
+    // converted enough to keep types honest (bad coords / cell values / JSON →
+    // `[bad_argument]`); the FULL input contract (e.g. `writeRange`'s rectangular
+    // matrix-shape rule) is deliberately NOT enforced here — it lands with the real
+    // implementation in 6.4 (publish/bind) / 6.5 (SQL materialize), which defines it.
+
+    /// Reserved (§3.5): bulk-write a rectangular value matrix. Always
+    /// `[not_implemented_in_v1_core]` in v1.
+    #[napi(js_name = "writeRange", catch_unwind)]
+    pub fn write_range(
+        &self,
+        env: Env,
+        range: CellRangeJson,
+        values: Vec<Vec<CellValueJson>>,
+    ) -> Result<()> {
+        guarded(env, "writeRange", || {
+            let range = session_range_from_json("writeRange", range)?;
+            let values = values
+                .into_iter()
+                .map(|row| row.into_iter().map(session_cell_value_from_json).collect())
+                .collect::<Result<Vec<Vec<_>>>>()?;
+            self.inner
+                .lock()
+                .write_range(range, values)
+                .map(|_| ())
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Reserved (§3.5; `qb.publish()`): publish a dataset into a target. `data` is a
+    /// JSON string (the napi `serde-json` feature is not enabled). Always
+    /// `[not_implemented_in_v1_core]` in v1.
+    #[napi(js_name = "publishDataset", catch_unwind)]
+    pub fn publish_dataset(
+        &self,
+        env: Env,
+        name: String,
+        data: String,
+        target: CellRangeJson,
+    ) -> Result<()> {
+        guarded(env, "publishDataset", || {
+            let data = parse_reserved_json_payload("publishDataset", &data)?;
+            let target = session_range_from_json("publishDataset", target)?;
+            self.inner
+                .lock()
+                .publish_dataset(&name, data, target)
+                .map(|_| ())
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Reserved (§3.5; `qb.bind()`): bind an overlay range. Always
+    /// `[not_implemented_in_v1_core]` in v1.
+    #[napi(js_name = "bindRange", catch_unwind)]
+    pub fn bind_range(&self, env: Env, binding_id: String, target: CellRangeJson) -> Result<()> {
+        guarded(env, "bindRange", || {
+            let target = session_range_from_json("bindRange", target)?;
+            self.inner
+                .lock()
+                .bind_range(&binding_id, target)
+                .map(|_| ())
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Reserved (§3.5): refresh an external source by revision. `revision` is a u64
+    /// (BigInt). Always `[not_implemented_in_v1_core]` in v1.
+    #[napi(js_name = "refreshSource", catch_unwind)]
+    pub fn refresh_source(&self, env: Env, source_id: String, revision: BigInt) -> Result<()> {
+        guarded(env, "refreshSource", || {
+            let (sign_bit, revision, lossless) = revision.get_u64();
+            if sign_bit {
+                return Err(bad_argument_error(
+                    "refreshSource: revision must be a non-negative BigInt".into(),
+                ));
+            }
+            if !lossless {
+                return Err(bad_argument_error(
+                    "refreshSource: revision exceeds u64::MAX (lossy conversion rejected)".into(),
+                ));
+            }
+            self.inner
+                .lock()
+                .refresh_source(&source_id, revision)
+                .map(|_| ())
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Reserved (§3.5; SQL): materialize a query result into a target. `data` is a
+    /// JSON string. Always `[not_implemented_in_v1_core]` in v1.
+    #[napi(js_name = "materializeQuery", catch_unwind)]
+    pub fn materialize_query(
+        &self,
+        env: Env,
+        query_id: String,
+        target: CellRangeJson,
+        data: String,
+    ) -> Result<()> {
+        guarded(env, "materializeQuery", || {
+            let target = session_range_from_json("materializeQuery", target)?;
+            let data = parse_reserved_json_payload("materializeQuery", &data)?;
+            self.inner
+                .lock()
+                .materialize_query(&query_id, target, data)
+                .map(|_| ())
                 .map_err(|e| engine_error_to_napi(env, e))
         })
     }
