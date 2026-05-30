@@ -1530,6 +1530,41 @@ export interface TableSpecJson {
 }
 
 /**
+ * **Phase 6.3-2e (2026-05-30)**: one op in a `batch`/transaction (a `kind`-tagged
+ * mirror of the engine `SessionOp`). EXACTLY ONE payload field is required per `kind`:
+ * `setValue` -> `value`, `setFormula` -> `text`, `setFormat` -> `format`, `clear` -> none.
+ * A missing-for-kind payload or an unknown `kind` throws `[bad_argument]`. Coords are
+ * 0-indexed and validated to u16/u32 at the boundary.
+ */
+export interface SessionOpJson {
+	kind: 'setValue' | 'setFormula' | 'clear' | 'setFormat';
+	sheet: number;
+	row: number;
+	col: number;
+	value?: CellValueJson;
+	text?: string;
+	format?: FormatIdJson;
+}
+
+/**
+ * **Phase 6.3-2e (2026-05-30)**: options for {@link SessionInstance.batch} (mirrors the
+ * engine `BatchOptions`). `undoLabel` groups the batch under a named undo unit.
+ */
+export interface BatchOptionsJson {
+	undoLabel?: string;
+}
+
+/**
+ * **Phase 6.3-2e (2026-05-30)**: result of a `batch`/`commitTransaction` (mirrors the
+ * engine `BatchResult`). `applied` is the op count; `version` is the opaque post-batch
+ * version token (round-trip it into the next `snapshotDelta`, like the snapshot version).
+ */
+export interface BatchResultJson {
+	applied: number;
+	version: Uint8Array;
+}
+
+/**
  * **Phase 6.3-2a (2026-05-30)**: which extras a `queryRange` read includes
  * (mirrors the engine `RangeQueryOptionsJson`). In v1 every field MUST be
  * `false` -- the engine fail-loud rejects a `true` with
@@ -1887,6 +1922,70 @@ export interface SessionInstance {
 	 * `[invalid_state]` off a Ready session.
 	 */
 	dropTable(name: string): void;
+
+	// --- Phase 6.3-2e (2026-05-30): atomic groups + reserved stubs ---
+
+	/**
+	 * Apply a sequence of ops atomically as ONE undo unit (all-or-nothing). An invalid op
+	 * (`[bad_argument]`) or a same-cell value/formula conflict (two such ops on one cell ->
+	 * `[conflicting_batch_ops]`) rejects the WHOLE batch with no partial mutation (validated
+	 * pre-mutation). Returns the applied count + post-batch version token. A tombstoned target
+	 * sheet throws `[sheet_not_found]`. `[invalid_state]` off a Ready session.
+	 */
+	batch(ops: SessionOpJson[], options: BatchOptionsJson): BatchResultJson;
+
+	/**
+	 * Open a multi-call transaction; returns its id. Stage ops with `txnAdd`, then
+	 * `commitTransaction` (atomic) or `rollbackTransaction` (discard). `[invalid_state]` off a
+	 * Ready session.
+	 */
+	beginTransaction(): bigint;
+
+	/**
+	 * Stage an op into an open transaction. An unknown txn id throws `[transaction_not_found]`;
+	 * a malformed BigInt id or a malformed op throws `[bad_argument]`. Staged ops do not apply
+	 * until `commitTransaction`.
+	 */
+	txnAdd(txn: bigint, op: SessionOpJson): void;
+
+	/**
+	 * Commit a transaction atomically (one undo unit; same all-or-nothing semantics as `batch`).
+	 * An unknown txn id throws `[transaction_not_found]`; a malformed BigInt id throws
+	 * `[bad_argument]`. On a FAILED commit the transaction stays open (fix-and-retry/rollback); a
+	 * successful commit consumes the handle. Returns the applied count + post-commit version token.
+	 */
+	commitTransaction(txn: bigint): BatchResultJson;
+
+	/**
+	 * Roll back (discard) a transaction; its staged ops never apply and the handle is consumed.
+	 * An unknown txn id throws `[transaction_not_found]`; a malformed BigInt id throws `[bad_argument]`.
+	 */
+	rollbackTransaction(txn: bigint): void;
+
+	// Reserved (Section 3.5) capability stubs -- real impls land in 6.4 (publish/bind)
+	// / 6.5 (SQL materialize) / a future bulk-write. In v1 each ALWAYS throws
+	// `[not_implemented_in_v1_core]` (a malformed arg throws `[bad_argument]` first).
+
+	/** Reserved: bulk-write a value matrix. Always throws `[not_implemented_in_v1_core]` in v1. */
+	writeRange(range: CellRangeJson, values: CellValueJson[][]): void;
+
+	/**
+	 * Reserved (`qb.publish()`): publish a dataset. `data` is a JSON string (opaque payload).
+	 * Always throws `[not_implemented_in_v1_core]` in v1.
+	 */
+	publishDataset(name: string, data: string, target: CellRangeJson): void;
+
+	/** Reserved (`qb.bind()`): bind an overlay range. Always throws `[not_implemented_in_v1_core]` in v1. */
+	bindRange(bindingId: string, target: CellRangeJson): void;
+
+	/** Reserved: refresh an external source by revision. Always throws `[not_implemented_in_v1_core]` in v1. */
+	refreshSource(sourceId: string, revision: bigint): void;
+
+	/**
+	 * Reserved (SQL): materialize a query result into a target. `data` is a JSON string.
+	 * Always throws `[not_implemented_in_v1_core]` in v1.
+	 */
+	materializeQuery(queryId: string, target: CellRangeJson, data: string): void;
 }
 
 export interface SessionConstructor {

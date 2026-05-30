@@ -410,6 +410,16 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (6.3-2d)`);
 				}
 			}
+			// **Phase 6.3-2e (2026-05-30):** atomic groups (batch + the
+			// transaction handle) + the 5 reserved Section 3.5 capability stubs.
+			for (const method of [
+				'batch', 'beginTransaction', 'txnAdd', 'commitTransaction', 'rollbackTransaction',
+				'writeRange', 'publishDataset', 'bindRange', 'refreshSource', 'materializeQuery',
+			]) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (6.3-2e)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {
