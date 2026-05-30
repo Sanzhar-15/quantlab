@@ -113,9 +113,13 @@ pub enum CodecError {
     #[error("grid: {cells} cells exceeds the {max}-cell cap")]
     GridTooManyCells { cells: usize, max: usize },
     /// **6.4B (item I):** the encoded (or decoded-input) grid byte length exceeds
-    /// [`MAX_GRID_BYTES`]. Complements [`crate::frame::MAX_FRAME_LEN`]'s wire cap so
-    /// `encode_grid` cannot produce a buffer the frame layer would later reject with
-    /// a less specific error.
+    /// [`MAX_GRID_BYTES`]. A coarse guard sized at the transport frame cap so a
+    /// hostile grid is rejected here (a specific [`CodecError`]) rather than only
+    /// at allocation. NOTE: it does NOT make a frame-layer rejection impossible —
+    /// the frame payload is the grid PLUS a fixed header (8/16 bytes) PLUS the
+    /// 1-byte type tag, so a grid within `(MAX_FRAME_LEN - 17, MAX_FRAME_LEN]`
+    /// still trips [`crate::frame::MAX_FRAME_LEN`] (also fail-loud, just a less
+    /// specific error). The frame layer remains the authoritative wire-size gate.
     #[error("grid: {bytes} bytes exceeds the {max}-byte cap")]
     GridTooManyBytes { bytes: usize, max: usize },
 }
