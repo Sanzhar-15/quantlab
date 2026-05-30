@@ -351,8 +351,9 @@ never silent coercion (generalizes `.qbook snapshot_format_version` + the op wir
 `WorkbookSnapshotDeltaJson` now carry `schemaVersion` (= engine `SCHEMA_VERSION`); the IDE's
 `assertSupportedSchemaVersion` at the snapshot AND delta ingest boundaries is the producer of
 `unsupported_schema_version` (previously a producerless code). `full_rebuild_reason` (§4.3) is also
-threaded on the delta DTO. The remaining DTOs (`RangeResult`/`TableSpec`/`BatchResult`/`UndoRedoResult`/
-transaction) gain `schemaVersion` as they bind in 6.3-2.
+threaded on the delta DTO. `RangeResult` gained `schemaVersion` when it bound in 6.3-2a (below); the
+remaining DTOs (`TableSpec`/`BatchResult`/`UndoRedoResult`/transaction) gain it as they bind in the
+later 6.3-2 sub-increments / 6.3-3.
 
 **6.3-2a — SHIPPED over napi (Node).** The read/lifecycle/format/validate cluster is bound on the
 owning `Session`: `lifecycleState` (§2.3 wire string), `validateFormula` (§3.2 — diagnostics-as-data,
