@@ -1763,6 +1763,121 @@ export type QuantbookErrorCode =
 	// allowlist had not yet enumerated (6.4-2 gap closed here).
 	| 'invalid_state'
 	| 'session_busy'
+	// **Phase 6.3-1d (2026-05-30)**: the COMPLETE set of `EngineError` codes the
+	// engine emits over the napi `Session` surface. `engine_error_to_napi`
+	// (`crates/ql-bindings-node/src/lib.rs::engine_error_to_napi`) forwards
+	// `EngineError`'s stable `code` VERBATIM as the `[code]` prefix
+	// (`EngineError::Display`, `crates/ql-session/src/error.rs`), so every code the
+	// engine can construct reaches `parseQuantbookError`. Phase 6.3-2 binds the
+	// remaining 32 `Session` methods (structure / table / transaction /
+	// import-export / version-token / undo-redo), all of which emit codes from
+	// these families; recognizing them all NOW (before 6.3-2) keeps engine errors
+	// from silently bucketing under `'unknown'` (the V2.7/V2.9 structured-error
+	// contract). Codes are SemVer-stable (`error.rs` doc). Enumerated against engine
+	// ground truth (60 `EngineError` codes; 9 were already listed above).
+	//
+	// NOTE: the per-cell UDF DIAGNOSTIC codes (`udf_no_worker` / `udf_raised` /
+	// `udf_timeout` / `udf_worker_died` / `udf_cancelled` / `udf_handshake` /
+	// `udf_protocol` / `udf_codec`, from `crates/ql-exec/src/scalar.rs`) are
+	// DELIBERATELY NOT here -- they travel on a different channel
+	// (`DiagnosticJson.code: string` via `Event::CellDiagnostic`), not as thrown
+	// `[code]`-prefixed errors parsed by `parseQuantbookError`.
+	//
+	// Formula / compute (`map_runtime_err`, `session.rs`: Lex/Parse/Print -> parse,
+	// Bind -> bind). A formula that *evaluates* to an error is a `CellValue::Error`,
+	// not one of these; these are structural lex/parse/bind failures of the text.
+	| 'formula_parse'
+	| 'formula_bind'
+	// Cell coordinate (`map_runtime_err` `InvalidCell`).
+	| 'bad_cell'
+	// Sheet structure (`map_runtime_err`: `InvalidSheet` -> not_found; `SheetName`
+	// Duplicate -> duplicate, else bad_sheet_name; `TooManySheets`) + the
+	// `delete_sheet` "already deleted / not deletable" guard (`sheet_not_deleted`).
+	| 'sheet_not_found'
+	| 'sheet_name_duplicate'
+	| 'bad_sheet_name'
+	| 'too_many_sheets'
+	| 'sheet_not_deleted'
+	// Chunk-rows validation (`map_runtime_err` `InvalidChunkRows`; `addSheet`).
+	| 'invalid_chunk_rows'
+	// Format registry (`map_runtime_err`: `UnknownFormatId`,
+	// `FormatCounterExhausted`).
+	| 'unknown_format_id'
+	| 'format_counter_exhausted'
+	// Recompute fixed-point cap (`map_runtime_err` `RecomputeIterationCap` --
+	// Internal-class engine fault, surfaced loud not swallowed).
+	| 'recompute_iteration_cap'
+	// Conflict: `conflicting_ops` (`map_runtime_err` `ConflictingOps` -- transaction
+	// commit conflict) and `conflicting_batch_ops` (the `batch` two-writes-to-one-
+	// cell guard, `session.rs`).
+	| 'conflicting_ops'
+	| 'conflicting_batch_ops'
+	// Defined-name validation (`map_runtime_err` `Name` -- reserved/invalid name).
+	| 'name_reserved'
+	// Table ops (`map_runtime_err` `Table*`: create/resize rejected, not-found,
+	// column not-found / rejected).
+	| 'table_create_rejected'
+	| 'table_not_found'
+	| 'table_column_not_found'
+	| 'table_column_rejected'
+	| 'table_resize_rejected'
+	// Transaction handle lifecycle (`session.rs`: unknown/closed handle ->
+	// not_found; u64 id space exhausted -> id_exhausted, Internal-class).
+	| 'transaction_not_found'
+	| 'transaction_id_exhausted'
+	// Operation handle lookup (`operationStatus` / `cancel` on an unknown op id).
+	| 'operation_not_found'
+	// Version-token / protocol (`error.rs` `invalid_version_token` /
+	// `unsupported_schema_version`; `map_oplog_err` `InvalidVersionVector`). The
+	// snapshot/`snapshotDelta` token-decode + schema-version family.
+	| 'invalid_version_token'
+	| 'invalid_version_vector'
+	| 'unsupported_schema_version'
+	// Op-log persistence (`map_oplog_err`: serialize -> BadArgument; deserialize /
+	// schema-mismatch -> Protocol; Loro-internal -> Internal).
+	| 'oplog_serialize'
+	| 'oplog_deserialize'
+	| 'oplog_schema'
+	| 'oplog_loro'
+	// Undo/redo re-materialization (`map_loro_undo_err` / `map_replay_err` --
+	// Internal-class engine faults in the undo manager / op-log replay).
+	| 'undo_manager_failed'
+	| 'replay_failed'
+	// Cancellation (`error.rs` `canceled`; retryable). Reachable via cancel / the
+	// 6.3-1b `start_recalc`/`await_recalc` path.
+	| 'canceled'
+	// Panic boundary (`error.rs` `panic`). Surfaced as a thrown `[panic]` error by
+	// the 6.3-1a napi `guarded()` boundary, AND via `OperationStateJson.error` when
+	// a recompute panics (the 6.3-1a L8 fix emits `OperationCompleted{failed}`).
+	| 'panic'
+	// xlsx import/export (`map_xlsx_err`, `session.rs`: io/zip/calamine/xml-parse/
+	// malformed-ooxml/unsupported-feature on import; export/engine on write).
+	| 'xlsx_io'
+	| 'xlsx_zip'
+	| 'xlsx_calamine'
+	| 'xlsx_xml_parse'
+	| 'xlsx_malformed_ooxml'
+	| 'xlsx_unsupported_feature'
+	| 'xlsx_export'
+	| 'xlsx_engine'
+	// csv import/export (`map_csv_err`, `session.rs`: io/parse;
+	// exceeds-sheet-limits -> BadArgument; missing export sheet -> Internal).
+	| 'csv_io'
+	| 'csv_parse'
+	| 'csv_exceeds_limits'
+	| 'csv_sheet_not_found'
+	// Capability -- a surface that is not implemented in the v1 core yet
+	// (`not_implemented`, `session.rs`; a visible `Capability` error, never a silent
+	// fallback). Emitted today by the reserved `publish_dataset` / `bind_range`.
+	| 'not_implemented_in_v1_core'
+	// Unmapped catch-alls: the No-Fallbacks loud-Internal arms in the foreign
+	// `#[non_exhaustive]` mappers (`map_oplog_err` / `map_persistence_err` /
+	// `map_xlsx_err` / `map_csv_err`). A future upstream variant surfaces here
+	// (recognizable, not bucketed under `'unknown'`) until its mapper is extended.
+	| 'unmapped_oplog_error'
+	| 'unmapped_persistence_error'
+	| 'unmapped_xlsx_error'
+	| 'unmapped_csv_error'
 	// Fallback when the message has no recognizable code prefix.
 	// Typically means the error came from non-engine, non-binding
 	// code (napi task panic, JS-side throw, runtime task error

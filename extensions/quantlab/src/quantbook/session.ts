@@ -808,6 +808,89 @@ const KNOWN_QUANTBOOK_ERROR_CODE_RECORD: Record<Exclude<QuantbookErrorCode, 'unk
 	worker_untrusted_workspace: true,
 	invalid_state: true,
 	session_busy: true,
+	// Phase 6.3-1d (2026-05-30): the COMPLETE set of `EngineError` codes the engine
+	// emits over the napi `Session` surface, recognized BEFORE 6.3-2 binds the
+	// methods that emit them. `engine_error_to_napi` forwards `EngineError.code`
+	// verbatim as the `[code]` prefix, so every engine code reaches this allowlist.
+	// Grouped to mirror the union in `types.ts` (engine sources cited there: the
+	// `map_*_err` mappers + named constructors). The compile-enforced
+	// `Record<Exclude<QuantbookErrorCode,'unknown'>, true>` shape guarantees this
+	// stays in exact sync with the union. The 8 `udf_*` cell-DIAGNOSTIC codes are
+	// intentionally absent (different channel: `DiagnosticJson.code`).
+	// Formula / compute (`map_runtime_err`).
+	formula_parse: true,
+	formula_bind: true,
+	// Cell coordinate (`map_runtime_err` InvalidCell).
+	bad_cell: true,
+	// Sheet structure (`map_runtime_err` InvalidSheet/SheetName/TooManySheets) +
+	// the `delete_sheet` guard.
+	sheet_not_found: true,
+	sheet_name_duplicate: true,
+	bad_sheet_name: true,
+	too_many_sheets: true,
+	sheet_not_deleted: true,
+	// Chunk-rows validation.
+	invalid_chunk_rows: true,
+	// Format registry.
+	unknown_format_id: true,
+	format_counter_exhausted: true,
+	// Recompute fixed-point cap (Internal).
+	recompute_iteration_cap: true,
+	// Conflict (transaction-commit `conflicting_ops`; batch double-write
+	// `conflicting_batch_ops`).
+	conflicting_ops: true,
+	conflicting_batch_ops: true,
+	// Defined-name validation.
+	name_reserved: true,
+	// Table ops.
+	table_create_rejected: true,
+	table_not_found: true,
+	table_column_not_found: true,
+	table_column_rejected: true,
+	table_resize_rejected: true,
+	// Transaction handle lifecycle.
+	transaction_not_found: true,
+	transaction_id_exhausted: true,
+	// Operation handle lookup.
+	operation_not_found: true,
+	// Version-token / protocol (snapshot/snapshotDelta token + schema version).
+	invalid_version_token: true,
+	invalid_version_vector: true,
+	unsupported_schema_version: true,
+	// Op-log persistence (`map_oplog_err`).
+	oplog_serialize: true,
+	oplog_deserialize: true,
+	oplog_schema: true,
+	oplog_loro: true,
+	// Undo/redo re-materialization (Internal).
+	undo_manager_failed: true,
+	replay_failed: true,
+	// Cancellation (retryable; reachable via 6.3-1b recalc cancel).
+	canceled: true,
+	// Panic boundary (6.3-1a `guarded()` + the L8 OperationCompleted{failed} path).
+	panic: true,
+	// xlsx import/export (`map_xlsx_err`).
+	xlsx_io: true,
+	xlsx_zip: true,
+	xlsx_calamine: true,
+	xlsx_xml_parse: true,
+	xlsx_malformed_ooxml: true,
+	xlsx_unsupported_feature: true,
+	xlsx_export: true,
+	xlsx_engine: true,
+	// csv import/export (`map_csv_err`).
+	csv_io: true,
+	csv_parse: true,
+	csv_exceeds_limits: true,
+	csv_sheet_not_found: true,
+	// Capability (reserved-surface `not_implemented`).
+	not_implemented_in_v1_core: true,
+	// Unmapped catch-alls (No-Fallbacks loud-Internal arms of the foreign
+	// `#[non_exhaustive]` mappers).
+	unmapped_oplog_error: true,
+	unmapped_persistence_error: true,
+	unmapped_xlsx_error: true,
+	unmapped_csv_error: true,
 };
 
 /**
