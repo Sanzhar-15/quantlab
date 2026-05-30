@@ -637,23 +637,28 @@ mod tests {
     /// live commit path would otherwise silently drop UDF failure diagnostics).
     #[test]
     fn transaction_udf_failure_records_diagnostic() {
-        use ql_functions::FunctionImplHandle;
-        use ql_udf::{MockWorker, UdfWorker};
+        use ql_session::function_meta::{
+            ArgContext, ArgPolicy, Arity, BatchShape, CancelPolicy, DepShape, FunctionMetadata,
+            Volatility,
+        };
+        use ql_session::session::FunctionImplHandle;
+        use ql_udf::MockWorker;
 
         let mut wb = make_wb();
         let mut reg = default_registry();
-        let meta = ql_session::function_meta::FunctionMetadata {
+        let meta = FunctionMetadata {
             canonical_name: "MYUDF".to_string(),
-            min_args: 1,
-            max_args: Some(1),
-            volatility: ql_session::function_meta::Volatility::Pure,
+            display_name: None,
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Volatile,
             determinism: false,
-            dep_shape: ql_session::function_meta::DepShape::ValueDeps,
-            batch_shape: ql_session::function_meta::BatchShape::ArrayBatch,
-            arg_context: ql_session::function_meta::ArgContext::Aggregate,
+            dep_shape: DepShape::ValueDeps,
+            batch_shape: BatchShape::ArrayBatch,
+            arg_policy: ArgPolicy::Strict,
+            cancellation: CancelPolicy::WorkerKill,
+            arg_context: ArgContext::Aggregate,
             provenance_tags: vec!["python".to_string()],
-            cancellation: ql_session::function_meta::CancelPolicy::WorkerKill,
-            arg_policy: ql_session::function_meta::ArgPolicy::Strict,
         };
         reg.register_udf(meta, FunctionImplHandle(7)).unwrap();
         let worker: RefCell<Box<dyn UdfWorker + Send>> =
