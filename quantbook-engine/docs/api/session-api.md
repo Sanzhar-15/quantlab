@@ -394,8 +394,25 @@ contract: duplicate name / zero dims / overlap / footprint / column-name issues 
 (Conflict); unknown table → `table_not_found`; unknown column → `table_column_not_found`; rename-column target
 collision / empty name → `table_column_rejected`; invalid resize dims → `table_resize_rejected`; create on a
 non-live sheet → `sheet_not_found`. Table ops are not delta-expressible (they rewrite cells the session cannot
-enumerate) → the engine bumps the epoch (consumers reseed from a fresh snapshot). `BatchResult`/transaction DTOs
-ride 6.3-2e; `UndoRedoResult` rides 6.3-3.
+enumerate) → the engine bumps the epoch (consumers reseed from a fresh snapshot).
+
+**6.3-2e — SHIPPED over napi (Node) — 6.3-2 COMPLETE.** The atomic-group cluster + the reserved §3.5 stubs are
+bound on the owning `Session`. Atomic groups (§3.4): `batch(ops, options)` / `beginTransaction()` /
+`txnAdd(txn, op)` / `commitTransaction(txn)` / `rollbackTransaction(txn)`. New DTOs: `SessionOpJson` (a
+`kind`-tagged STRICT mirror of the 4-variant `SessionOp` — `setValue`/`setFormula`/`clear`/`setFormat`, each
+admitting ONLY its own payload; an extraneous-for-kind field → `bad_argument`), `BatchOptionsJson`
+(`undoLabel?`), `BatchResultJson` (`applied` + `version` = the opaque `SessionVersion` as a `Buffer`).
+`TransactionId` (u64) is a JS `BigInt` (sign/lossless-validated like `OperationId`). Semantics: `batch` /
+`commitTransaction` are all-or-nothing (validated pre-mutation) — a same-cell value/formula conflict →
+`conflicting_batch_ops` (Conflict), a non-finite value → `bad_argument`; an unknown txn id →
+`transaction_not_found` (NotFound); a FAILED commit restores the buffer (txn stays open), a successful commit
+consumes the handle; `rollbackTransaction` discards + consumes. The 5 reserved §3.5 stubs `writeRange` /
+`publishDataset` / `bindRange` / `refreshSource` / `materializeQuery` are bound as thin loud-Capability
+forwarders (declared `-> void`, always `not_implemented_in_v1_core`; `publishDataset`/`materializeQuery` take
+`data` as a JSON string since the napi `serde-json` feature is off) — their FULL input contract (e.g.
+`writeRange`'s matrix-shape rule) lands with the real impl in 6.4/6.5. `UndoRedoResult` rides 6.3-3.
+
+**6.3-2 is now COMPLETE** — all 32 `EngineSession` methods are bound across sub-increments a–e.
 
 ### 4.2 Core DTOs (extracted from the proven `#[napi(object)]` structs; `+` = added/clarified)
 - **`CellValue`** (← `CellValueJson`, `lib.rs:580`): a **discriminated union** on `kind`
