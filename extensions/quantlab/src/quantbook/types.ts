@@ -1515,7 +1515,7 @@ export interface CellRangeJson {
  * `false` -- the engine fail-loud rejects a `true` with
  * `[not_implemented_in_v1_core]` (only the columnar value read is the v1 surface).
  */
-export interface RangeQueryOptions {
+export interface RangeQueryOptionsJson {
 	includeFormulas: boolean;
 	includeFormats: boolean;
 	includeRendered: boolean;
@@ -1702,7 +1702,7 @@ export interface SessionInstance {
 	 * `include*` option MUST be `false` -- a `true` is rejected loud with
 	 * `[not_implemented_in_v1_core]`. `[bad_argument]` for an invalid range.
 	 */
-	queryRange(range: CellRangeJson, options: RangeQueryOptions): RangeResultJson;
+	queryRange(range: CellRangeJson, options: RangeQueryOptionsJson): RangeResultJson;
 
 	/** Mark every volatile function dirty (so the next recalc recomputes them). */
 	markVolatilesDirty(): void;
