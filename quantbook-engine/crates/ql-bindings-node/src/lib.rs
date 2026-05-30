@@ -144,7 +144,7 @@ use ql_io::oplog_persistence::{
 use ql_oplog::CellWireValue;
 use ql_oplog::Op;
 use ql_session::session::FunctionImplHandle;
-use ql_session::{EngineError, EngineSession};
+use ql_session::{EngineError, EngineSession, ErrorClass, FullRebuildReason};
 use ql_types::PeerId;
 
 /// **Phase 5.7 V1 (2026-05-22):** smoke method exposing the binding's
@@ -359,7 +359,20 @@ fn collab_session_error_to_napi(e: CollabSessionError) -> Error {
 /// / empty-delta paths.  Single source of truth for the "empty
 /// arrays, just version + bool" shape; keeps the algorithm body
 /// reading sequentially.
-fn empty_delta(version: Buffer, full_rebuild_required: bool) -> WorkbookSnapshotDeltaJson {
+///
+/// **6.3-1c:** `full_rebuild_reason` (`Some` only when `full_rebuild_required`)
+/// carries the contract-§4.3 reason; `schema_version` is stamped from
+/// [`ql_session::SCHEMA_VERSION`] on every delta DTO (M5).
+fn empty_delta(
+    version: Buffer,
+    full_rebuild_required: bool,
+    full_rebuild_reason: Option<FullRebuildReason>,
+) -> WorkbookSnapshotDeltaJson {
+    // A reason is only meaningful alongside a required rebuild.
+    debug_assert!(
+        full_rebuild_required || full_rebuild_reason.is_none(),
+        "full_rebuild_reason must be None when full_rebuild_required is false"
+    );
     WorkbookSnapshotDeltaJson {
         changed_cells: Vec::new(),
         removed_cells: Vec::new(),
@@ -368,6 +381,20 @@ fn empty_delta(version: Buffer, full_rebuild_required: bool) -> WorkbookSnapshot
         formats_added: Vec::new(),
         version,
         full_rebuild_required,
+        full_rebuild_reason: full_rebuild_reason.map(|r| full_rebuild_reason_str(r).to_string()),
+        schema_version: ql_session::SCHEMA_VERSION,
+    }
+}
+
+/// **Phase 6.3-1c (2026-05-30)**: stable snake_case wire string for a
+/// [`FullRebuildReason`] (mirrors its `#[serde(rename_all = "snake_case")]`),
+/// the single source of truth for the `full_rebuild_reason` DTO field + TS mirror.
+fn full_rebuild_reason_str(r: FullRebuildReason) -> &'static str {
+    match r {
+        FullRebuildReason::NoPriorVersion => "no_prior_version",
+        FullRebuildReason::CacheCleared => "cache_cleared",
+        FullRebuildReason::StaleHorizon => "stale_horizon",
+        FullRebuildReason::EpochMismatch => "epoch_mismatch",
     }
 }
 
@@ -915,6 +942,14 @@ pub struct WorkbookSnapshotJson {
     /// around `Vec<u8>` (Send + Sync via Vec composition); the
     /// underlying encoded bytes are owned + cloneable.
     pub version: Buffer,
+
+    /// **Phase 6.3-1c M5 (2026-05-30)**: the contract DTO schema version
+    /// ([`ql_session::SCHEMA_VERSION`]) every DTO crossing the boundary carries
+    /// (contract §4.1). The IDE asserts it matches the version its mirrors were
+    /// built against; a mismatch is a fail-loud `unsupported_schema_version`
+    /// (the IDE is the producer of that code) rather than a silent shape drift.
+    /// napi serializes as `schemaVersion`.
+    pub schema_version: u16,
 }
 
 /// **Phase 5.7 V3.6.0.3 D2 (2026-05-24)** -- one format registration
@@ -1057,6 +1092,24 @@ pub struct WorkbookSnapshotDeltaJson {
     /// retry the delta call right after its `workbookSnapshot()`
     /// fetch + cache populate (no race window).
     pub full_rebuild_required: bool,
+
+    /// **Phase 6.3-1c (2026-05-30, MED-2 / contract §4.3)**: when
+    /// `full_rebuild_required` is `true` for an ENUMERATED, designed resync
+    /// state, the reason string (`"no_prior_version"` / `"cache_cleared"` /
+    /// `"stale_horizon"` / `"epoch_mismatch"` — [`ql_session::FullRebuildReason`]
+    /// snake_case). `None` when `full_rebuild_required` is `false`, or for the
+    /// collab-path full-rebuild cases that are not one of the four designed
+    /// states (a malformed token — which contract §4.3 reserves for a fail-loud
+    /// `invalid_version_token`, but the legacy collab path treats as a
+    /// recoverable resync — a rename, or a defensive cache-invariant guard).
+    /// napi serializes as `fullRebuildReason`.
+    pub full_rebuild_reason: Option<String>,
+
+    /// **Phase 6.3-1c M5 (2026-05-30)**: contract DTO schema version
+    /// ([`ql_session::SCHEMA_VERSION`], contract §4.1) — see
+    /// [`WorkbookSnapshotJson::schema_version`]. napi serializes as
+    /// `schemaVersion`.
+    pub schema_version: u16,
 }
 
 /// **Phase 5.7 V3.4.0.5 (2026-05-23) -- JS-facing PresenceState.**
@@ -2416,6 +2469,8 @@ impl CollabSession {
             formats,
             date_system,
             version: version_bytes,
+            // 6.3-1c M5: stamp the contract schema version on every snapshot DTO.
+            schema_version: ql_session::SCHEMA_VERSION,
         })
     }
 
@@ -2502,7 +2557,11 @@ impl CollabSession {
 
         // Step 1a: empty buffer → full rebuild required.
         if last_seen_version.is_empty() {
-            return Ok(empty_delta(current_version_bytes, true));
+            return Ok(empty_delta(
+                current_version_bytes,
+                true,
+                Some(FullRebuildReason::NoPriorVersion),
+            ));
         }
 
         // Step 1b: no prior cache → full rebuild required.
@@ -2513,7 +2572,11 @@ impl CollabSession {
         ) {
             (Some(arc), Some(vv), Some(n)) => (std::sync::Arc::clone(arc), vv.clone(), n),
             _ => {
-                return Ok(empty_delta(current_version_bytes, true));
+                return Ok(empty_delta(
+                    current_version_bytes,
+                    true,
+                    Some(FullRebuildReason::CacheCleared),
+                ));
             }
         };
 
@@ -2526,18 +2589,26 @@ impl CollabSession {
                 // protocol treats `fullRebuildRequired=true` as the
                 // recovery path; returning Err here would force the
                 // IDE into exception-handling for a recoverable case.
-                return Ok(empty_delta(current_version_bytes, true));
+                // **6.3-1c:** reason `None` — contract §4.3 reserves a malformed
+                // token for a fail-loud `invalid_version_token`, NOT one of the
+                // four designed resync reasons; the legacy collab path keeps the
+                // recoverable rebuild, so it carries no enumerated reason.
+                return Ok(empty_delta(current_version_bytes, true, None));
             }
         };
 
         // Step 3: staleness check.
         if caller_vv != cached_vv {
-            return Ok(empty_delta(current_version_bytes, true));
+            return Ok(empty_delta(
+                current_version_bytes,
+                true,
+                Some(FullRebuildReason::StaleHorizon),
+            ));
         }
 
         // Step 4: same-VV fast-path.
         if current_vv == cached_vv {
-            return Ok(empty_delta(current_version_bytes, false));
+            return Ok(empty_delta(current_version_bytes, false, None));
         }
 
         // Step 5-6: enumerate ops since cached_op_count + classify.
@@ -2550,7 +2621,10 @@ impl CollabSession {
             // we do now.  Should be impossible (invalidation triggers
             // on undo/discard/merge), but guard defensively.
             inner.force_clear_workbook_cache();
-            return Ok(empty_delta(current_version_bytes, true));
+            // **6.3-1c:** reason `None` — a defensive cache-invariant guard
+            // (cached_op_count > current_op_count is supposed to be impossible),
+            // not one of the four designed §4.3 resync states.
+            return Ok(empty_delta(current_version_bytes, true, None));
         }
         let new_ops_range = cached_op_count..current_op_count;
         // Collect classification + the bodies we'll need for the
@@ -2627,7 +2701,10 @@ impl CollabSession {
                     // rebuild.  Invalidate cache too since we can't
                     // trust the ops range.
                     inner.force_clear_workbook_cache();
-                    return Ok(empty_delta(current_version_bytes, true));
+                    // **6.3-1c:** reason `None` — an op-decode failure mid-walk
+                    // is a defensive conservative rebuild, not a designed §4.3
+                    // resync state.
+                    return Ok(empty_delta(current_version_bytes, true, None));
                 }
             };
             classify_delta_op(
@@ -2644,7 +2721,9 @@ impl CollabSession {
 
         // Step 7: rename detected → full rebuild fallback.
         if has_rename {
-            return Ok(empty_delta(current_version_bytes, true));
+            // **6.3-1c:** reason `None` — a rename forces a full rebuild but is
+            // not one of the four designed §4.3 resync states.
+            return Ok(empty_delta(current_version_bytes, true, None));
         }
 
         // Step 8: cell-only fast-path.  Clone the cached Workbook via
@@ -2814,6 +2893,10 @@ impl CollabSession {
             formats_added,
             version: current_version_bytes,
             full_rebuild_required: false,
+            // 6.3-1c: a successful incremental delta — no rebuild, no reason.
+            full_rebuild_reason: None,
+            // 6.3-1c M5: stamp the contract schema version on every delta DTO.
+            schema_version: ql_session::SCHEMA_VERSION,
         })
     }
 
@@ -4120,13 +4203,81 @@ pub struct SheetInfoJson {
     pub name: String,
 }
 
-/// Map a structured [`EngineError`] to a napi [`Error`] with a code-prefixed
-/// message. `EngineError`'s `Display` is already `"[<code>] <message>"`
-/// (contract §5), so this mirrors [`collab_session_error_to_napi`] — the binding
-/// does NOT invent its own error shape (acceptance API6-03). The stable `code`
-/// is the leading bracketed token; the IDE branches on it.
-fn engine_error_to_napi(e: EngineError) -> Error {
-    Error::from_reason(e.to_string())
+/// **6.3-1c — structured-error reshape (contract §5.1).** Map a structured
+/// [`EngineError`] to a NATIVE JS error and throw it: the JS `Error` carries the
+/// stable `code`, `class`, `retryable` (+ `details` / `source` when present) as
+/// **own data properties**, not parsed from a `[code]`-prefix message.
+///
+/// **Mechanism (napi-rs 3.9.0):** the `#[napi] -> Result<T>` path can only return
+/// the default-`Status` `napi::Error` (no custom `.code`, no extra props). The
+/// supported escape hatch is to build the JS error object via [`Env`]
+/// ([`throw_structured`]) and `napi_throw` it ourselves, then return
+/// `Error::new(Status::PendingException, …)` — napi's `throw_into` short-circuits
+/// on `PendingException` (`napi-3.9.0/src/error.rs:488`), so OUR augmented object
+/// propagates verbatim, no double-throw.
+///
+/// **Scope line:** this is for the engine error TAXONOMY (`EngineSession` results
+/// — `sheet_not_found`, `conflicting_ops`, `formula_parse`, … which carry real
+/// `class`/`details`). FFI-boundary argument validation (`bad_argument` from
+/// [`validate_u32_index`] / [`bad_argument_error`]) keeps the existing
+/// `[code]`-prefix string — it is uniformly `class=bad_argument` with no details,
+/// the IDE's `parseQuantbookError` reads its code from the prefix exactly as
+/// today, and collab (`collab_session_error_to_napi`) is unchanged. The IDE reads
+/// native fields when present and falls back to the prefix otherwise (dual-format,
+/// monotonic — no regression).
+///
+/// If building/throwing the native object itself fails (a napi-internal failure,
+/// not expected), `e` is STILL surfaced loudly via the legacy prefix string — the
+/// real error is never swallowed; only its field richness degrades (No-Fallbacks:
+/// we degrade richness, never mask a failure).
+fn engine_error_to_napi(env: Env, e: EngineError) -> Error {
+    match throw_structured(env, &e) {
+        Ok(()) => Error::new(Status::PendingException, String::new()),
+        Err(_) => Error::from_reason(e.to_string()),
+    }
+}
+
+/// Build the native JS `Error` object for an [`EngineError`] and `napi_throw` it.
+/// Augments a real `Error` (so `instanceof Error` + `.cause` walking still hold)
+/// with the contract-§5.1 own-properties. `details` is carried as a JSON string
+/// (`details`): napi-rs's `serde-json` feature is not enabled in v1, so a native
+/// nested object is deferred; the data is delivered losslessly and the IDE parses
+/// it on demand. Returns `Err` only if napi object construction fails.
+fn throw_structured(env: Env, e: &EngineError) -> Result<()> {
+    let mut obj = env.create_error(Error::from_reason(e.message.clone()))?;
+    obj.set("code", e.code.as_str())?;
+    obj.set("class", class_str(e.class))?;
+    obj.set("retryable", e.retryable)?;
+    if !e.details.is_empty() {
+        // serde_json::to_string of a BTreeMap<String, Value> only fails on a
+        // non-serializable value (not possible here); surface loud if it ever does.
+        let details_json = serde_json::to_string(&e.details).map_err(|err| {
+            Error::from_reason(format!("[panic] EngineError.details serialize failed: {err}"))
+        })?;
+        obj.set("details", details_json.as_str())?;
+    }
+    if let Some(src) = &e.source {
+        obj.set("source", src.as_str())?;
+    }
+    env.throw(obj)?;
+    Ok(())
+}
+
+/// Stable snake_case wire string for an [`ErrorClass`] (mirrors its
+/// `#[serde(rename_all = "snake_case")]`); set as the JS error's `.class`.
+fn class_str(c: ErrorClass) -> &'static str {
+    match c {
+        ErrorClass::BadArgument => "bad_argument",
+        ErrorClass::Lifecycle => "lifecycle",
+        ErrorClass::NotFound => "not_found",
+        ErrorClass::Conflict => "conflict",
+        ErrorClass::Compute => "compute",
+        ErrorClass::Persistence => "persistence",
+        ErrorClass::Protocol => "protocol",
+        ErrorClass::Canceled => "canceled",
+        ErrorClass::Capability => "capability",
+        ErrorClass::Internal => "internal",
+    }
 }
 
 /// **M1 (6.3-1a) — napi panic boundary.** Run a `Session` method body under
@@ -4147,13 +4298,16 @@ fn engine_error_to_napi(e: EngineError) -> Error {
 /// `#[napi(catch_unwind)]` attribute on each method is a belt-and-suspenders
 /// backstop for panics in napi-rs's OWN argument marshalling (before this closure
 /// runs); THIS helper is what yields the structured `[panic]` code.
-fn guarded<R>(method: &str, f: impl FnOnce() -> Result<R>) -> Result<R> {
+fn guarded<R>(env: Env, method: &str, f: impl FnOnce() -> Result<R>) -> Result<R> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(result) => result,
-        Err(payload) => Err(engine_error_to_napi(EngineError::panic(format!(
-            "{method}: {}",
-            panic_payload_message(payload.as_ref())
-        )))),
+        Err(payload) => Err(engine_error_to_napi(
+            env,
+            EngineError::panic(format!(
+                "{method}: {}",
+                panic_payload_message(payload.as_ref())
+            )),
+        )),
     }
 }
 
@@ -4313,6 +4467,9 @@ fn workbook_snapshot_json_from_session(snap: ql_session::WorkbookSnapshot) -> Wo
             .collect(),
         date_system: date_system.to_string(),
         version: Buffer::from(snap.version.0),
+        // 6.3-1c M5: forward the engine snapshot's own schema_version (contract
+        // §4.1) rather than re-deriving — single source of truth on the DTO.
+        schema_version: snap.schema_version,
     }
 }
 
@@ -4924,8 +5081,8 @@ impl Session {
     /// `chunkRows` is the per-sheet row partition size (must be ≥ 1; the engine
     /// rejects 0 to prevent a `ColumnStore` panic).
     #[napi(js_name = "addSheet", catch_unwind)]
-    pub fn add_sheet(&self, name: String, chunk_rows: f64) -> Result<u32> {
-        guarded("addSheet", || {
+    pub fn add_sheet(&self, env: Env, name: String, chunk_rows: f64) -> Result<u32> {
+        guarded(env, "addSheet", || {
             let chunk_rows = validate_u32_index("addSheet", "chunkRows", chunk_rows)?;
             if chunk_rows == 0 {
                 return Err(bad_argument_error(
@@ -4936,7 +5093,7 @@ impl Session {
                 .inner
                 .lock()
                 .add_sheet(&name, chunk_rows)
-                .map_err(engine_error_to_napi)?;
+                .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(u32::from(id))
         })
     }
@@ -4944,14 +5101,21 @@ impl Session {
     /// Set a cell's literal value (clears any formula). `value` is the
     /// discriminated-union [`CellValueJson`]; `blank` clears the value.
     #[napi(js_name = "setValue", catch_unwind)]
-    pub fn set_value(&self, sheet: f64, row: f64, col: f64, value: CellValueJson) -> Result<()> {
-        guarded("setValue", || {
+    pub fn set_value(
+        &self,
+        env: Env,
+        sheet: f64,
+        row: f64,
+        col: f64,
+        value: CellValueJson,
+    ) -> Result<()> {
+        guarded(env, "setValue", || {
             let addr = session_addr_from_f64("setValue", sheet, row, col)?;
             let value = session_cell_value_from_json(value)?;
             self.inner
                 .lock()
                 .set_value(addr, value)
-                .map_err(engine_error_to_napi)
+                .map_err(|e| engine_error_to_napi(env, e))
         })
     }
 
@@ -4961,13 +5125,20 @@ impl Session {
     /// the text (e.g. `"A1+1"` → `"A1 + 1"`). Lex/parse/bind failures surface as
     /// a structured engine error (`[formula_parse]`/`[bad_argument]`-class).
     #[napi(js_name = "setFormula", catch_unwind)]
-    pub fn set_formula(&self, sheet: f64, row: f64, col: f64, text: String) -> Result<()> {
-        guarded("setFormula", || {
+    pub fn set_formula(
+        &self,
+        env: Env,
+        sheet: f64,
+        row: f64,
+        col: f64,
+        text: String,
+    ) -> Result<()> {
+        guarded(env, "setFormula", || {
             let addr = session_addr_from_f64("setFormula", sheet, row, col)?;
             self.inner
                 .lock()
                 .set_formula(addr, &text)
-                .map_err(engine_error_to_napi)
+                .map_err(|e| engine_error_to_napi(env, e))
         })
     }
 
@@ -4977,36 +5148,39 @@ impl Session {
     /// `setValue(.., { kind: "blank" })`. (A single "delete contents"
     /// value+formula command is a 6.1C contract decision — see handoff.)
     #[napi(js_name = "clear", catch_unwind)]
-    pub fn clear(&self, sheet: f64, row: f64, col: f64) -> Result<()> {
-        guarded("clear", || {
+    pub fn clear(&self, env: Env, sheet: f64, row: f64, col: f64) -> Result<()> {
+        guarded(env, "clear", || {
             let addr = session_addr_from_f64("clear", sheet, row, col)?;
-            self.inner.lock().clear(addr).map_err(engine_error_to_napi)
+            self.inner
+                .lock()
+                .clear(addr)
+                .map_err(|e| engine_error_to_napi(env, e))
         })
     }
 
     /// Recompute the dirty set (incremental). Returns the operation id (u64 as
     /// BigInt). In v1 a recalc is synchronous; cancel is honored pre-start only.
     #[napi(js_name = "recalcDirty", catch_unwind)]
-    pub fn recalc_dirty(&self) -> Result<BigInt> {
-        guarded("recalcDirty", || {
+    pub fn recalc_dirty(&self, env: Env) -> Result<BigInt> {
+        guarded(env, "recalcDirty", || {
             let op = self
                 .inner
                 .lock()
                 .recalc_dirty()
-                .map_err(engine_error_to_napi)?;
+                .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(BigInt::from(op.0))
         })
     }
 
     /// Recompute everything. Returns the operation id (u64 as BigInt).
     #[napi(js_name = "recalcAll", catch_unwind)]
-    pub fn recalc_all(&self) -> Result<BigInt> {
-        guarded("recalcAll", || {
+    pub fn recalc_all(&self, env: Env) -> Result<BigInt> {
+        guarded(env, "recalcAll", || {
             let op = self
                 .inner
                 .lock()
                 .recalc_all()
-                .map_err(engine_error_to_napi)?;
+                .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(BigInt::from(op.0))
         })
     }
@@ -5020,13 +5194,13 @@ impl Session {
     /// common "recompute now" path with no cancellation, prefer
     /// [`Self::recalc_dirty`] (one call, no window).
     #[napi(js_name = "startRecalcDirty", catch_unwind)]
-    pub fn start_recalc_dirty(&self) -> Result<BigInt> {
-        guarded("startRecalcDirty", || {
+    pub fn start_recalc_dirty(&self, env: Env) -> Result<BigInt> {
+        guarded(env, "startRecalcDirty", || {
             let op = self
                 .inner
                 .lock()
                 .start_recalc(ql_session::RecalcKind::Dirty)
-                .map_err(engine_error_to_napi)?;
+                .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(BigInt::from(op.0))
         })
     }
@@ -5035,13 +5209,13 @@ impl Session {
     /// `startRecalcAll` counterpart of [`Self::start_recalc_dirty`] (same window +
     /// `awaitRecalc` contract). Prefer [`Self::recalc_all`] for the no-cancel path.
     #[napi(js_name = "startRecalcAll", catch_unwind)]
-    pub fn start_recalc_all(&self) -> Result<BigInt> {
-        guarded("startRecalcAll", || {
+    pub fn start_recalc_all(&self, env: Env) -> Result<BigInt> {
+        guarded(env, "startRecalcAll", || {
             let op = self
                 .inner
                 .lock()
                 .start_recalc(ql_session::RecalcKind::All)
-                .map_err(engine_error_to_napi)?;
+                .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(BigInt::from(op.0))
         })
     }
@@ -5053,8 +5227,8 @@ impl Session {
     /// recalc. (Read the resulting state via `operationStatus` once it is bound —
     /// 6.3-1c/6.3-2.)
     #[napi(js_name = "awaitRecalc", catch_unwind)]
-    pub fn await_recalc(&self, op: BigInt) -> Result<()> {
-        guarded("awaitRecalc", || {
+    pub fn await_recalc(&self, env: Env, op: BigInt) -> Result<()> {
+        guarded(env, "awaitRecalc", || {
             // BigInt → u64, mirroring the `pollEvents`/`registerFunction` discipline:
             // reject negative (sign bit) / lossy (> u64::MAX) loud per No-Fallbacks.
             let (sign_bit, raw, lossless) = op.get_u64();
@@ -5071,7 +5245,7 @@ impl Session {
             self.inner
                 .lock()
                 .await_recalc(ql_session::OperationId(raw))
-                .map_err(engine_error_to_napi)
+                .map_err(|e| engine_error_to_napi(env, e))
         })
     }
 
@@ -5082,8 +5256,8 @@ impl Session {
     /// Legal while the session is `Busy`. Errors `[operation_not_found]` for an
     /// unknown id.
     #[napi(js_name = "cancel", catch_unwind)]
-    pub fn cancel(&self, op: BigInt) -> Result<bool> {
-        guarded("cancel", || {
+    pub fn cancel(&self, env: Env, op: BigInt) -> Result<bool> {
+        guarded(env, "cancel", || {
             let (sign_bit, raw, lossless) = op.get_u64();
             if sign_bit {
                 return Err(bad_argument_error(
@@ -5098,38 +5272,88 @@ impl Session {
             self.inner
                 .lock()
                 .cancel(ql_session::OperationId(raw))
-                .map_err(engine_error_to_napi)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// **6.3-1c (2026-05-30):** read an operation's terminal-or-running state by
+    /// id — `{ state: "running" | "completed" | "canceled" | "failed", error? }`
+    /// (contract §6.1). This is how the 6.3-1b `startRecalc*`/`awaitRecalc` +
+    /// `cancel` OUTCOME is observed from JS: after `awaitRecalc(op)` the op is
+    /// `completed` (or `canceled` if a `cancel` won the pre-start window, or
+    /// `failed` with the `[code] message` of the recompute error). Legal while
+    /// the session is `Busy` (it is a pure read). Errors `[operation_not_found]`
+    /// for an unknown id, `[bad_argument]` for a negative / lossy BigInt.
+    ///
+    /// **v1 note:** `error` is the engine error's `[code] message` string (a DTO
+    /// data field, parseable by `parseQuantbookError`); nesting the structured
+    /// `{code,class,details}` object here is a filed-forward follow-on.
+    #[napi(js_name = "operationStatus", catch_unwind)]
+    pub fn operation_status(&self, env: Env, op: BigInt) -> Result<OperationStateJson> {
+        guarded(env, "operationStatus", || {
+            // BigInt -> u64, mirroring the `cancel`/`awaitRecalc` discipline.
+            let (sign_bit, raw, lossless) = op.get_u64();
+            if sign_bit {
+                return Err(bad_argument_error(
+                    "operationStatus: op must be a non-negative BigInt".into(),
+                ));
+            }
+            if !lossless {
+                return Err(bad_argument_error(
+                    "operationStatus: op exceeds u64::MAX (lossy conversion rejected)".into(),
+                ));
+            }
+            let state = self
+                .inner
+                .lock()
+                .operation_status(ql_session::OperationId(raw))
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(operation_state_json_from_session(state))
         })
     }
 
     /// Full workbook snapshot (carries the opaque `version` token as a `Buffer`).
     #[napi(js_name = "snapshot", catch_unwind)]
-    pub fn snapshot(&self) -> Result<WorkbookSnapshotJson> {
-        guarded("snapshot", || {
-            let snap = self.inner.lock().snapshot().map_err(engine_error_to_napi)?;
+    pub fn snapshot(&self, env: Env) -> Result<WorkbookSnapshotJson> {
+        guarded(env, "snapshot", || {
+            let snap = self
+                .inner
+                .lock()
+                .snapshot()
+                .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(workbook_snapshot_json_from_session(snap))
         })
     }
 
     /// Single-cell lookup. `null` if the cell is empty/absent.
     #[napi(js_name = "cell", catch_unwind)]
-    pub fn cell(&self, sheet: f64, row: f64, col: f64) -> Result<Option<CellSnapshotJson>> {
-        guarded("cell", || {
+    pub fn cell(
+        &self,
+        env: Env,
+        sheet: f64,
+        row: f64,
+        col: f64,
+    ) -> Result<Option<CellSnapshotJson>> {
+        guarded(env, "cell", || {
             let addr = session_addr_from_f64("cell", sheet, row, col)?;
-            let cell = self.inner.lock().cell(addr).map_err(engine_error_to_napi)?;
+            let cell = self
+                .inner
+                .lock()
+                .cell(addr)
+                .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(cell.map(cell_snapshot_json_from_session))
         })
     }
 
     /// List (non-tombstoned) sheets (id + name, no cells).
     #[napi(js_name = "listSheets", catch_unwind)]
-    pub fn list_sheets(&self) -> Result<Vec<SheetInfoJson>> {
-        guarded("listSheets", || {
+    pub fn list_sheets(&self, env: Env) -> Result<Vec<SheetInfoJson>> {
+        guarded(env, "listSheets", || {
             let sheets = self
                 .inner
                 .lock()
                 .list_sheets()
-                .map_err(engine_error_to_napi)?;
+                .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(sheets
                 .into_iter()
                 .map(|s| SheetInfoJson {
@@ -5153,9 +5377,12 @@ impl Session {
     /// frees the engine state synchronously (engine `WorkbookSession::close`
     /// at `crates/ql-exec/src/session.rs`).
     #[napi(js_name = "close", catch_unwind)]
-    pub fn close(&self) -> Result<()> {
-        guarded("close", || {
-            self.inner.lock().close().map_err(engine_error_to_napi)
+    pub fn close(&self, env: Env) -> Result<()> {
+        guarded(env, "close", || {
+            self.inner
+                .lock()
+                .close()
+                .map_err(|e| engine_error_to_napi(env, e))
         })
     }
 
@@ -5202,10 +5429,11 @@ impl Session {
     #[napi(js_name = "registerFunction", catch_unwind)]
     pub fn register_function(
         &self,
+        env: Env,
         metadata: FunctionMetadataJson,
         impl_handle: BigInt,
     ) -> Result<()> {
-        guarded("registerFunction", || {
+        guarded(env, "registerFunction", || {
             let meta = function_metadata_from_json(metadata)?;
             // BigInt → u64: the napi-rs `BigInt::get_u64()` returns `(sign_bit,
             // value, lossless)`. Reject negative (sign bit set) + lossy (anything
@@ -5227,7 +5455,7 @@ impl Session {
             self.inner
                 .lock()
                 .register_function(meta, handle)
-                .map_err(engine_error_to_napi)
+                .map_err(|e| engine_error_to_napi(env, e))
         })
     }
 
@@ -5246,12 +5474,12 @@ impl Session {
     ///   the message disambiguates (`"is a registered built-in"`).
     /// - `[invalid_state]` — session is not Ready.
     #[napi(js_name = "unregisterFunction", catch_unwind)]
-    pub fn unregister_function(&self, canonical_name: String) -> Result<()> {
-        guarded("unregisterFunction", || {
+    pub fn unregister_function(&self, env: Env, canonical_name: String) -> Result<()> {
+        guarded(env, "unregisterFunction", || {
             self.inner
                 .lock()
                 .unregister_function(&canonical_name)
-                .map_err(engine_error_to_napi)
+                .map_err(|e| engine_error_to_napi(env, e))
         })
     }
 
@@ -5266,13 +5494,13 @@ impl Session {
     /// **Errors:** `[invalid_state]` if the session is Closed/New/Faulted
     /// (Busy is OK — this is a read).
     #[napi(js_name = "listFunctions", catch_unwind)]
-    pub fn list_functions(&self) -> Result<Vec<FunctionMetadataJson>> {
-        guarded("listFunctions", || {
+    pub fn list_functions(&self, env: Env) -> Result<Vec<FunctionMetadataJson>> {
+        guarded(env, "listFunctions", || {
             let metas = self
                 .inner
                 .lock()
                 .list_functions()
-                .map_err(engine_error_to_napi)?;
+                .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(metas.into_iter().map(function_metadata_to_json).collect())
         })
     }
@@ -5303,8 +5531,8 @@ impl Session {
     /// concept, so the trust gate lives in the IDE (`worker_untrusted_workspace`
     /// is an IDE-side code, never emitted here).
     #[napi(js_name = "setUdfWorker", catch_unwind)]
-    pub fn set_udf_worker(&self, config: PythonWorkerConfigJson) -> Result<()> {
-        guarded("setUdfWorker", || {
+    pub fn set_udf_worker(&self, env: Env, config: PythonWorkerConfigJson) -> Result<()> {
+        guarded(env, "setUdfWorker", || {
             let mut cfg = ql_udf::PythonWorkerConfig::new(&config.python);
             if let Some(module) = config.module {
                 cfg.module = module;
@@ -5349,7 +5577,7 @@ impl Session {
             self.inner
                 .lock()
                 .set_udf_worker_checked(Box::new(worker))
-                .map_err(engine_error_to_napi)?;
+                .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(())
         })
     }
@@ -5372,8 +5600,8 @@ impl Session {
     ///
     /// **Errors:** `[bad_argument]` if `cursor` is negative or exceeds `u64::MAX`.
     #[napi(js_name = "pollEvents", catch_unwind)]
-    pub fn poll_events(&self, cursor: BigInt) -> Result<EventPageJson> {
-        guarded("pollEvents", || {
+    pub fn poll_events(&self, env: Env, cursor: BigInt) -> Result<EventPageJson> {
+        guarded(env, "pollEvents", || {
             // BigInt → u64, mirroring the `registerFunction` implHandle discipline:
             // reject a negative (sign bit) or lossy (> u64::MAX) cursor loud per
             // No-Fallbacks rather than silently truncating to a wrong ring position.
@@ -5392,7 +5620,7 @@ impl Session {
                 .inner
                 .lock()
                 .poll_events(ql_session::session::EventCursor(raw))
-                .map_err(engine_error_to_napi)?;
+                .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(event_page_json_from_session(page))
         })
     }
@@ -5419,8 +5647,8 @@ impl Session {
 #[napi]
 impl Session {
     #[napi(js_name = "__forcePanicForTest", catch_unwind)]
-    pub fn force_panic_for_test(&self) -> Result<()> {
-        guarded("__forcePanicForTest", || -> Result<()> {
+    pub fn force_panic_for_test(&self, env: Env) -> Result<()> {
+        guarded(env, "__forcePanicForTest", || -> Result<()> {
             panic!("forced panic for the M1 panic-boundary smoke test");
         })
     }

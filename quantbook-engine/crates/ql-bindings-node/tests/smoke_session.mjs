@@ -62,6 +62,28 @@ const native = loadNative(cdylibPath);
 assert.ok(native.Session, "the native module must export the `Session` class");
 const { Session } = native;
 
+// **6.3-1c (2026-05-30):** assert a thrown error reports the given engine `code`,
+// accepting EITHER a native `.code` own-property (engine-taxonomy errors -- the
+// structured reshape delivers code/class/details/retryable as data) OR a legacy
+// `[code]`-prefix message (FFI bad_argument validation + collab errors, which
+// stay prefix-encoded). Mirrors the IDE's parseQuantbookError dual-read, so the
+// smoke is correct regardless of which channel an error took.
+function throwsWithCode(fn, code, msg) {
+  assert.throws(
+    fn,
+    (e) => {
+      const native = typeof e?.code === "string" && e.code === code;
+      const prefixed = e instanceof Error && e.message.startsWith(`[${code}]`);
+      assert.ok(
+        native || prefixed,
+        `${msg} -- expected engine code '${code}' but got native .code='${e?.code}', message='${e?.message}'`,
+      );
+      return true;
+    },
+    msg,
+  );
+}
+
 // --- M1 (6.3-1a) panic boundary: a Rust panic in a #[napi] method surfaces as a
 // structured [panic] JS error and does NOT abort the Node host. `__forcePanicForTest`
 // is a debug-only probe (absent from release cdylibs). After the caught panic the
@@ -70,15 +92,23 @@ const { Session } = native;
 {
   const probe = new Session();
   if (typeof probe.__forcePanicForTest === "function") {
+    // 6.3-1c: a panic is an engine-taxonomy Internal error, so the structured
+    // reshape routes it through throw_structured -> the thrown JS error carries
+    // a NATIVE `.code === "panic"` (and `.class === "internal"`); its message no
+    // longer carries the legacy `[panic]` prefix (code is data, not parsed).
     assert.throws(
       () => probe.__forcePanicForTest(),
-      /\[panic\]/,
-      "a panic in a #[napi] method must surface a [panic] error, not abort the host",
+      (e) => {
+        assert.equal(e.code, "panic", "panic must surface native .code='panic'");
+        assert.equal(e.class, "internal", "panic .class must be 'internal'");
+        return true;
+      },
+      "a panic in a #[napi] method must surface a native [code=panic] error, not abort the host",
     );
     // Host survived (we reached here) and the session is still usable.
     const sid = probe.addSheet("AfterPanic", 1000);
     assert.equal(typeof sid, "number", "session remains usable after a caught panic");
-    console.log("[smoke] M1 panic boundary: [panic] surfaced, host alive, session usable");
+    console.log("[smoke] M1 panic boundary: native code=panic surfaced, host alive, session usable");
   } else {
     console.log("[smoke] M1 panic boundary: __forcePanicForTest absent (release cdylib) — skipped");
   }
@@ -142,6 +172,12 @@ assert.equal(sheets[0].name, "Sheet1", "sheet name preserved");
   assert.equal(typeof opAll, "bigint", "startRecalcAll returns a BigInt op id");
   s.awaitRecalc(opAll);
   assert.equal(s.cell(sheetId, 0, 5).value.number, 101, "F1 = E1+1 = 101 after start/await");
+  // 6.3-1c: operationStatus reports the completed outcome of the awaited op.
+  assert.equal(
+    s.operationStatus(opAll).state,
+    "completed",
+    "operationStatus(op) is 'completed' after a successful awaitRecalc",
+  );
   // Pre-start cancel: dirty F1 (E1=200), start, cancel (true), await SKIPS recompute.
   s.setValue(sheetId, 0, 4, { kind: "number", number: 200 });
   const opDirty = s.startRecalcDirty();
@@ -153,12 +189,51 @@ assert.equal(sheets[0].name, "Sheet1", "sheet name preserved");
     101,
     "canceled recalc must NOT recompute F1 (stays stale 101, not 201)",
   );
+  // 6.3-1c: operationStatus reports the canceled outcome (the pre-start cancel won).
+  assert.equal(
+    s.operationStatus(opDirty).state,
+    "canceled",
+    "operationStatus(op) is 'canceled' after a pre-start cancel won the window",
+  );
   assert.equal(s.cancel(opDirty), false, "cancel of an already-terminal op is false");
   // Session still usable: a fresh recalc after the window recomputes F1 = 201.
   const opDirty2 = s.startRecalcDirty();
   s.awaitRecalc(opDirty2);
   assert.equal(s.cell(sheetId, 0, 5).value.number, 201, "fresh recalc after the window recomputes F1 = 201");
   console.log("[smoke] M2 start/await recalc + pre-start cancel window OK (cancel skipped recompute, session usable)");
+}
+
+// --- 6.3-1c M5: every snapshot DTO carries schemaVersion (contract section 4.1) -
+{
+  const snap = s.snapshot();
+  assert.equal(snap.schemaVersion, 1, "snapshot carries schemaVersion === 1");
+  console.log("[smoke] 6.3-1c M5: snapshot.schemaVersion === 1");
+}
+
+// --- 6.3-1c: structured engine error carries NATIVE .code/.class/.retryable ----
+// A duplicate sheet name is an engine-taxonomy Conflict error, so the structured
+// reshape delivers it as a JS Error with native own-properties (NOT a
+// [code]-prefixed message). FFI bad_argument validation stays prefix-encoded.
+{
+  let caught;
+  try {
+    s.addSheet("Sheet1", 1000); // "Sheet1" already exists -> sheet_name_duplicate
+  } catch (e) {
+    caught = e;
+  }
+  assert.ok(caught instanceof Error, "duplicate addSheet must throw");
+  assert.equal(caught.code, "sheet_name_duplicate", "native .code present as data");
+  assert.equal(caught.class, "conflict", "native .class is the snake_case ErrorClass");
+  assert.equal(typeof caught.retryable, "boolean", "native .retryable present");
+  assert.ok(
+    !caught.message.startsWith("["),
+    "structured error message has NO [code] prefix (code is data, not a parsed token)",
+  );
+  // Session is unfaulted by a clean engine error -> still usable.
+  assert.equal(typeof s.snapshot().schemaVersion, "number", "session usable after a structured error");
+  console.log(
+    `[smoke] 6.3-1c structured error OK (native code=${caught.code} class=${caught.class} retryable=${caught.retryable})`,
+  );
 }
 
 // clear() == clear_formula() == "convert to literal": it removes the FORMULA
@@ -176,9 +251,9 @@ const blanked = s.cell(sheetId, 0, 1);
 assert.ok(!blanked || !blanked.value, "setValue(blank) clears the value");
 
 // fail-loud: unknown value kind is rejected (No-Fallbacks), not silently dropped.
-assert.throws(
+throwsWithCode(
   () => s.setValue(sheetId, 0, 2, { kind: "bogus" }),
-  /\[bad_argument\]/,
+  "bad_argument",
   "unknown value kind surfaces a structured [bad_argument] error",
 );
 
@@ -242,17 +317,17 @@ assert.deepStrictEqual(reg.provenanceTags, ["python"], "metadata Vec<String> rou
 assert.strictEqual(reg.arity.kind, "variadic", "Arity tagged-union round-trips");
 
 // Duplicate register → [function_exists] (Appendix A 6.4-2 new row).
-assert.throws(
+throwsWithCode(
   () => s.registerFunction(myUdfMeta, 0xBEEFn),
-  /\[function_exists\]/,
+  "function_exists",
   "duplicate registerFunction surfaces structured [function_exists]",
 );
 
 // Register-against-builtin → also [function_exists] (registry's metadata
 // already exists for SUM at boot via register_builtin_metadata).
-assert.throws(
+throwsWithCode(
   () => s.registerFunction({ ...myUdfMeta, canonicalName: "SUM" }, 1n),
-  /\[function_exists\]/,
+  "function_exists",
   "registering against a built-in's name surfaces [function_exists]",
 );
 
@@ -266,42 +341,42 @@ assert.ok(
 );
 
 // Unregister unknown → [function_not_found] (Appendix A 6.4-2 new row).
-assert.throws(
+throwsWithCode(
   () => s.unregisterFunction("DOES_NOT_EXIST"),
-  /\[function_not_found\]/,
+  "function_not_found",
   "unregisterFunction on unknown name surfaces structured [function_not_found]",
 );
 
 // Unregister built-in → [function_exists] (builtin-guard re-uses the Conflict
 // variant per the 6.4-0 audit-fix Codex A LOW closure).
-assert.throws(
+throwsWithCode(
   () => s.unregisterFunction("SUM"),
-  /\[function_exists\]/,
+  "function_exists",
   "unregisterFunction on a built-in name surfaces [function_exists] (builtin-guard)",
 );
 
 // Fail-loud: unknown enum string at the napi boundary.
-assert.throws(
+throwsWithCode(
   () =>
     s.registerFunction(
       { ...myUdfMeta, canonicalName: "BOGUS_VOLATILITY", volatility: "extremely_volatile" },
       1n,
     ),
-  /\[bad_argument\]/,
+  "bad_argument",
   "unknown volatility string surfaces structured [bad_argument]",
 );
 
 // 6.4-2 cycle-2 audit-fix (H1/F1): a lowercase or empty canonicalName must
 // surface a structured [bad_argument] — NOT panic across the napi boundary
 // (which pre-fix would have aborted the host AND sealed the session Faulted).
-assert.throws(
+throwsWithCode(
   () => s.registerFunction({ ...myUdfMeta, canonicalName: "mylowerudf" }, 1n),
-  /\[bad_argument\]/,
+  "bad_argument",
   "lowercase canonicalName surfaces structured [bad_argument] (no FFI panic)",
 );
-assert.throws(
+throwsWithCode(
   () => s.registerFunction({ ...myUdfMeta, canonicalName: "" }, 1n),
-  /\[bad_argument\]/,
+  "bad_argument",
   "empty canonicalName surfaces structured [bad_argument] (no FFI panic)",
 );
 // The rejected bad-name calls must NOT have sealed the session: a valid
@@ -315,13 +390,13 @@ s.unregisterFunction("MYUDF2");
 
 // 6.4-2 cycle-2 audit-fix (F3): a strict ArityJson tagged union rejects
 // extraneous payload fields rather than silently ignoring them.
-assert.throws(
+throwsWithCode(
   () =>
     s.registerFunction(
       { ...myUdfMeta, canonicalName: "MYUDF3", arity: { kind: "variadic", n: 7 } },
       1n,
     ),
-  /\[bad_argument\]/,
+  "bad_argument",
   "variadic arity carrying 'n' surfaces structured [bad_argument] (strict tagged union)",
 );
 
@@ -333,31 +408,31 @@ console.log("[smoke] 6.4-2 function registration PASS");
 // (engine has `close()`; without the napi wrapper JS could only GC-free the
 // underlying workbook). The double-close is a no-op (idempotent terminal).
 s.close();
-assert.throws(
+throwsWithCode(
   () => s.cell(sheetId, 0, 0),
-  /\[invalid_state\]/,
+  "invalid_state",
   "post-close cell() must fail loud with [invalid_state]",
 );
-assert.throws(
+throwsWithCode(
   () => s.setValue(sheetId, 0, 0, { kind: "number", number: 42 }),
-  /\[invalid_state\]/,
+  "invalid_state",
   "post-close setValue() must fail loud with [invalid_state]",
 );
 // 6.4-2 post-close lifecycle: all three new methods rejected by ensure_ready
 // (registerFunction, unregisterFunction) or ensure_readable (listFunctions).
-assert.throws(
+throwsWithCode(
   () => s.registerFunction(myUdfMeta, 1n),
-  /\[invalid_state\]/,
+  "invalid_state",
   "post-close registerFunction must fail loud with [invalid_state]",
 );
-assert.throws(
+throwsWithCode(
   () => s.unregisterFunction("MYUDF"),
-  /\[invalid_state\]/,
+  "invalid_state",
   "post-close unregisterFunction must fail loud with [invalid_state]",
 );
-assert.throws(
+throwsWithCode(
   () => s.listFunctions(),
-  /\[invalid_state\]/,
+  "invalid_state",
   "post-close listFunctions must fail loud with [invalid_state]",
 );
 // Idempotent: re-closing a Closed session is a no-op (state stays Closed).
