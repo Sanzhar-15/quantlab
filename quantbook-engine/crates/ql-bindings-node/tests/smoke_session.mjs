@@ -539,6 +539,102 @@ console.log("[smoke] 6.4-2 function registration PASS");
   );
 }
 
+// === 6.3-2c (2026-05-30) — structure / sheets over napi ===
+//
+// Self-contained on a FRESH session: rename / move (incl. no-op) / delete+restore
+// round-trips observed through listSheets() (which reflects display order) + a
+// defined-name binding + loud structured negatives. Sheet ids are captured from
+// addSheet (no assumption about a default sheet's id).
+{
+  const w = new Session();
+  const a = w.addSheet("Alpha", 1000);
+  const b = w.addSheet("Beta", 1000);
+
+  // rename: the new name appears in listSheets under the same id.
+  w.renameSheet(a, "AlphaRenamed");
+  assert.ok(
+    w.listSheets().some((s) => s.id === a && s.name === "AlphaRenamed"),
+    "renameSheet reflected in listSheets",
+  );
+
+  // move: place b at display index 0; listSheets order reflects it.
+  w.moveSheet(b, 0);
+  assert.equal(
+    w.listSheets()[0].id,
+    b,
+    "moveSheet placed sheet b at display index 0",
+  );
+  // no-op: moving b to its current index must not throw.
+  w.moveSheet(b, 0);
+
+  // setName: bind a workbook name to a range on a live sheet. A defined name is
+  // delta-invisible, so prove it is OBSERVABLE by resolving it inside a formula
+  // (not merely "did not throw" -- a no-op would pass that).
+  w.setValue(b, 0, 0, { kind: "number", number: 10 }); // b!A1
+  w.setValue(b, 1, 0, { kind: "number", number: 20 }); // b!A2
+  w.setValue(b, 2, 0, { kind: "number", number: 30 }); // b!A3
+  w.setName("Nums", { sheet: b, startRow: 0, startCol: 0, endRow: 2, endCol: 0 }); // A1:A3
+  w.setFormula(b, 0, 1, "SUM(Nums)"); // b!B1 = SUM(Nums)
+  w.recalcDirty();
+  assert.equal(
+    w.cell(b, 0, 1).value.number,
+    60,
+    "setName is observable: SUM(Nums) over the defined range resolves to 10+20+30",
+  );
+  // Range orientation is a documented contract: an INVERTED target normalizes to
+  // the same rectangle (start <= end per axis), so SUM over it is identical.
+  w.setName("NumsInv", { sheet: b, startRow: 2, startCol: 0, endRow: 0, endCol: 0 }); // A3:A1 inverted
+  w.setFormula(b, 1, 1, "SUM(NumsInv)"); // b!B2 = SUM(NumsInv)
+  w.recalcDirty();
+  assert.equal(
+    w.cell(b, 1, 1).value.number,
+    60,
+    "setName normalizes an inverted range to the same rectangle (A3:A1 == A1:A3)",
+  );
+
+  // delete + restore: the sheet drops from / returns to listSheets.
+  w.deleteSheet(a);
+  assert.ok(
+    !w.listSheets().some((s) => s.id === a),
+    "deleteSheet drops the sheet from listSheets",
+  );
+  w.restoreSheet(a);
+  assert.ok(
+    w.listSheets().some((s) => s.id === a && s.name === "AlphaRenamed"),
+    "restoreSheet returns the sheet (with its name) to listSheets",
+  );
+
+  // negatives (loud, structured): unknown id -> sheet_not_found on every mutator;
+  // duplicate name -> sheet_name_duplicate; out-of-range move index -> bad_argument;
+  // restoring a live (not-tombstoned) sheet -> sheet_not_deleted.
+  const unknownId = 60000;
+  throwsWithCode(() => w.deleteSheet(unknownId), "sheet_not_found", "deleteSheet on unknown id");
+  throwsWithCode(() => w.renameSheet(unknownId, "X"), "sheet_not_found", "renameSheet on unknown id");
+  throwsWithCode(() => w.restoreSheet(unknownId), "sheet_not_found", "restoreSheet on unknown id");
+  throwsWithCode(() => w.moveSheet(unknownId, 0), "sheet_not_found", "moveSheet on unknown id");
+  throwsWithCode(
+    () => w.renameSheet(b, "AlphaRenamed"),
+    "sheet_name_duplicate",
+    "renameSheet to an existing live name",
+  );
+  const count = w.listSheets().length;
+  throwsWithCode(
+    () => w.moveSheet(b, count + 5),
+    "bad_argument",
+    "moveSheet to an out-of-range index",
+  );
+  throwsWithCode(
+    () => w.restoreSheet(b),
+    "sheet_not_deleted",
+    "restoreSheet on a live (not-tombstoned) sheet",
+  );
+
+  w.close();
+  console.log(
+    "[smoke] 6.3-2c structure/sheets OK (rename/move/delete/restore round-trips + setName + loud negatives)",
+  );
+}
+
 // **6.1C audit-fix M8 — Session.close() deterministic lifecycle release.**
 // Post-close any command call returns a structured [invalid_state] error, not
 // a panic / silent failure. Closes the lifecycle hole flagged by the megaudit

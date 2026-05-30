@@ -5750,6 +5750,106 @@ impl Session {
     }
 
     // ============================================================================
+    // 6.3-2c (2026-05-30) — structure / sheets over napi.
+    //
+    // Binds the already-implemented engine structure mutators (§3.3):
+    // sheet rename / delete (tombstone) / restore / move (reorder) + defined-name
+    // binding. `addSheet` is bound above (it predates this cluster). Each inherits
+    // the locked 6.3-1 contract — `guarded(env,..)` + `catch_unwind`, native
+    // structured errors via `engine_error_to_napi`. Sheet ids are validated as u16
+    // (the `SheetId` width) via `validate_u16_index`; the move index as u32 via
+    // `validate_u32_index`; `setName`'s range reuses the 6.3-2a `session_range_from_json`
+    // converter (no new DTO).
+    // ============================================================================
+
+    /// Rename a sheet by id. Unknown id surfaces `[sheet_not_found]` (NotFound);
+    /// a name colliding with another live sheet surfaces `[sheet_name_duplicate]`
+    /// (Conflict). `[invalid_state]` off a Ready session. `id` is validated to the
+    /// `SheetId` (u16) range — out of range is a loud `[bad_argument]`.
+    #[napi(js_name = "renameSheet", catch_unwind)]
+    pub fn rename_sheet(&self, env: Env, id: f64, new_name: String) -> Result<()> {
+        guarded(env, "renameSheet", || {
+            let id = validate_u16_index("renameSheet", "id", id)?;
+            self.inner
+                .lock()
+                .rename_sheet(id, &new_name)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Tombstone a sheet by id (preserves its cells for `restoreSheet`; NOT a
+    /// silent storage no-op). Unknown id surfaces `[sheet_not_found]` (NotFound);
+    /// `[invalid_state]` off a Ready session.
+    #[napi(js_name = "deleteSheet", catch_unwind)]
+    pub fn delete_sheet(&self, env: Env, id: f64) -> Result<()> {
+        guarded(env, "deleteSheet", || {
+            let id = validate_u16_index("deleteSheet", "id", id)?;
+            self.inner
+                .lock()
+                .delete_sheet(id)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Restore a previously-tombstoned sheet by id. Unknown id surfaces
+    /// `[sheet_not_found]` (NotFound); a not-tombstoned (still-live) sheet surfaces
+    /// a Conflict. `[invalid_state]` off a Ready session.
+    #[napi(js_name = "restoreSheet", catch_unwind)]
+    pub fn restore_sheet(&self, env: Env, id: f64) -> Result<()> {
+        guarded(env, "restoreSheet", || {
+            let id = validate_u16_index("restoreSheet", "id", id)?;
+            self.inner
+                .lock()
+                .restore_sheet(id)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Reorder a sheet to display position `newIndex`. Unknown id surfaces
+    /// `[sheet_not_found]` (NotFound); an out-of-range index (valid positions are
+    /// `[0, sheet_count)`) surfaces a loud `[bad_argument]` (NOT a silent clamp);
+    /// moving to the current position is a no-op (no version advance, no throw).
+    /// `[invalid_state]` off a Ready session.
+    #[napi(js_name = "moveSheet", catch_unwind)]
+    pub fn move_sheet(&self, env: Env, id: f64, new_index: f64) -> Result<()> {
+        guarded(env, "moveSheet", || {
+            let id = validate_u16_index("moveSheet", "id", id)?;
+            let index = validate_u32_index("moveSheet", "newIndex", new_index)?;
+            self.inner
+                .lock()
+                .move_sheet(id, index)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Define a workbook name bound to a range (`target` is the 6.3-2a
+    /// [`CellRangeJson`]). A defined name is delta-invisible (not part of
+    /// `WorkbookSnapshot`/`WorkbookSnapshotDelta`), so this only signals success.
+    /// Invalid range coords surface a loud `[bad_argument]` at the converter;
+    /// engine-side name/target failures map natively. `[invalid_state]` off a
+    /// Ready session.
+    ///
+    /// **Range orientation (documented contract, NOT silent):** an unordered /
+    /// inverted `target` (e.g. `startRow > endRow`) is **normalized** to
+    /// `start <= end` per axis by the engine's canonical `Range` constructor —
+    /// a defined name is a rectangle, so the corner order carries no meaning
+    /// (matching Excel/Sheets named-range semantics). This deliberately differs
+    /// from `queryRange`, which *rejects* an inverted range with `[bad_argument]`
+    /// because its `end - start + 1` span arithmetic would underflow — a hazard
+    /// `set_name` does not have. (The `query_range`-vs-`set_name` inversion
+    /// asymmetry is an engine-side API choice, filed forward, not a binding defect.)
+    #[napi(js_name = "setName", catch_unwind)]
+    pub fn set_name(&self, env: Env, name: String, target: CellRangeJson) -> Result<()> {
+        guarded(env, "setName", || {
+            let range = session_range_from_json("setName", target)?;
+            self.inner
+                .lock()
+                .set_name(&name, range)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    // ============================================================================
     // 6.4-2 (2026-05-28) — function registration over napi.
     //
     // Wires the substrate shipped at 6.4-0 (function-metadata storage + hooks)
