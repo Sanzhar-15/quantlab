@@ -230,6 +230,32 @@ impl<'a> WorkbookRuntime<'a> {
                     // COMPUTED overlay, never the user lane.
                     self.workbook.put_computed_at(sheet, row, col, value);
                     succeeded += 1;
+                    // **H3 (6.3-0):** if this formula spilled, record the
+                    // NON-anchor footprint too (the anchor was already pushed at
+                    // the top of the loop). recompute_all over-reports formula
+                    // cells for the delta, but still missed spill TARGETS — they
+                    // have no formula, so `iter_formulas()` never visits them.
+                    //
+                    // Dissolution is intentionally NOT handled here: this loop
+                    // walks anchors only, so a dissolved spill's OLD targets are
+                    // never visited. Every `recompute_all` caller either bumps
+                    // the epoch (`rematerialize`/`open`/`import` → full rebuild,
+                    // delta reseeded) or is `recalc_all`, where the direct edit
+                    // that dissolved the spill already recorded the old targets
+                    // as Blank (the Part-B direct-mutation path). The residual
+                    // (a formula-text dissolve, then `recalc_all` with no
+                    // intervening `recalc_dirty`) is an epoch-protected,
+                    // non-reachable edge.
+                    if let Some(shape) = self.workbook.spill_anchor_at(sheet, row, col).copied() {
+                        for dr in 0..shape.rows {
+                            for dc in 0..shape.cols {
+                                if dr == 0 && dc == 0 {
+                                    continue;
+                                }
+                                changed_cells.push((sheet, row + dr, col + dc));
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
                     // **W5-156 (Phase 4.8.G.3 — HIGH-2 closure):**
@@ -547,6 +573,18 @@ impl<'a> WorkbookRuntime<'a> {
                                 }
                             }
                             for (s, r, c) in affected {
+                                // **H3 (6.3-0):** record each spill-footprint
+                                // TARGET in the delta change-log set, not just
+                                // dirty it. This block runs even when the anchor
+                                // value VEQ-skips the write above (line ~514), so
+                                // targets that changed while the anchor stayed
+                                // invariant (the HIGH-1 case: SEQUENCE(3,1,1,A1)
+                                // — anchor = start = 1 fixed, C2/C3 vary with A1)
+                                // are still reported by `snapshot_delta`. Without
+                                // this, `snapshot_delta` under-reported spill
+                                // targets on recalc (it walks the change-log,
+                                // which only carried the anchor).
+                                changed.insert((s, r, c));
                                 session.on_set_value(s, r, c);
                             }
                             // Anchor cell — dirties aliased readers.

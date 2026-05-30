@@ -188,6 +188,23 @@ pub struct WorkbookRuntime<'a> {
     ///
     /// [`arm_udf_op_deadline`]: WorkbookRuntime::arm_udf_op_deadline
     op_deadline: Option<std::time::Instant>,
+    /// **H3 (6.3-0):** borrowed per-edit collector for spill-footprint TARGET
+    /// cells (the NON-anchor cells of a dynamic-array spill) touched by a DIRECT
+    /// mutation (`set_formula` materializing a new spill, `set_value`/`clear`
+    /// dissolving one). The owning [`WorkbookSession`] lends its
+    /// `RefCell<Vec<_>>` here (cleared at each `with_runtime` entry) and folds
+    /// the drained coords into its delta change-log alongside the anchor — so
+    /// `snapshot_delta` reports the full footprint, not just the anchor. `None`
+    /// for every non-session constructor (binding-only / standalone paths).
+    /// Pushed to ONLY from the direct-mutation primitives, never from
+    /// `write_spill` (shared with recompute) nor the recompute loop — the
+    /// recompute path records footprints through `RecomputeResult.changed_cells`
+    /// instead. Mirrors [`udf_diagnostics`] (single-threaded — `RefCell` is
+    /// `!Sync`).
+    ///
+    /// [`WorkbookSession`]: crate::session::WorkbookSession
+    /// [`udf_diagnostics`]: WorkbookRuntime::udf_diagnostics
+    spill_footprint: Option<&'a RefCell<Vec<(SheetId, RowId, ColId)>>>,
 }
 
 impl<'a> WorkbookRuntime<'a> {
@@ -202,6 +219,7 @@ impl<'a> WorkbookRuntime<'a> {
             udf_worker: None,
             udf_diagnostics: None,
             op_deadline: None,
+            spill_footprint: None,
         }
     }
 
@@ -229,6 +247,7 @@ impl<'a> WorkbookRuntime<'a> {
             udf_worker: None,
             udf_diagnostics: None,
             op_deadline: None,
+            spill_footprint: None,
         }
     }
 
@@ -254,6 +273,7 @@ impl<'a> WorkbookRuntime<'a> {
             udf_worker: None,
             udf_diagnostics: None,
             op_deadline: None,
+            spill_footprint: None,
         }
     }
 
@@ -279,6 +299,7 @@ impl<'a> WorkbookRuntime<'a> {
             udf_worker: None,
             udf_diagnostics: None,
             op_deadline: None,
+            spill_footprint: None,
         }
     }
 
@@ -320,6 +341,9 @@ impl<'a> WorkbookRuntime<'a> {
         // **6.4-3d (2026-05-29; blocker G):** the per-recompute UDF-diagnostic
         // collector, lent alongside the worker.
         udf_diagnostics: Option<&'a RefCell<Vec<UdfCellDiagnostic>>>,
+        // **H3 (6.3-0):** the per-edit spill-footprint collector, lent so direct
+        // mutations surface their full spill footprint into the delta change-log.
+        spill_footprint: Option<&'a RefCell<Vec<(SheetId, RowId, ColId)>>>,
     ) -> Self {
         Self {
             workbook,
@@ -331,6 +355,7 @@ impl<'a> WorkbookRuntime<'a> {
             udf_worker,
             udf_diagnostics,
             op_deadline: None,
+            spill_footprint,
         }
     }
 
@@ -363,6 +388,8 @@ impl<'a> WorkbookRuntime<'a> {
         udf_worker: Option<&'a RefCell<Box<dyn UdfWorker + Send>>>,
         // **6.4-3d (2026-05-29; blocker G):** see `with_session_state`.
         udf_diagnostics: Option<&'a RefCell<Vec<UdfCellDiagnostic>>>,
+        // **H3 (6.3-0):** see `with_session_state`.
+        spill_footprint: Option<&'a RefCell<Vec<(SheetId, RowId, ColId)>>>,
     ) -> Self {
         Self {
             workbook,
@@ -374,6 +401,7 @@ impl<'a> WorkbookRuntime<'a> {
             udf_worker,
             udf_diagnostics,
             op_deadline: None,
+            spill_footprint,
         }
     }
 

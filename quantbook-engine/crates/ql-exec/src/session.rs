@@ -314,6 +314,25 @@ pub struct WorkbookSession {
     /// under single-threaded recompute. The cell VALUE is unchanged — this is
     /// purely the "why did the UDF fail" channel (exit test 7).
     udf_diagnostics: RefCell<Vec<UdfCellDiagnostic>>,
+    /// **H3 (6.3-0):** per-edit collector for spill-footprint TARGET cells (the
+    /// NON-anchor cells of a dynamic-array spill) touched by a DIRECT mutation.
+    /// [`with_runtime`]/[`with_runtime_no_oplog`] CLEAR it at entry and lend
+    /// `&self.spill_footprint` to the runtime (alongside `udf_diagnostics`); the
+    /// `set_formula`/`set_value`/`clear` runtime primitives push their footprint
+    /// targets; and the owning command DRAINS it (via [`drain_spill_footprint`])
+    /// into its delta change-log alongside the anchor — so `snapshot_delta`
+    /// reports the FULL footprint, not just the anchor. Unlike `udf_diagnostics`
+    /// (drained automatically into the event stream by the `with_runtime`
+    /// helpers), this is drained by the specific command, because only
+    /// `set_formula`/`set_value`/`clear`/`batch` fold it into `record_changes`;
+    /// the recompute paths record footprints through `RecomputeResult.changed_cells`
+    /// instead. Always-present (cheap empty `Vec`); `!Sync` `RefCell` sound under
+    /// single-threaded edits.
+    ///
+    /// [`with_runtime`]: WorkbookSession::with_runtime
+    /// [`with_runtime_no_oplog`]: WorkbookSession::with_runtime_no_oplog
+    /// [`drain_spill_footprint`]: WorkbookSession::drain_spill_footprint
+    spill_footprint: RefCell<Vec<(SheetId, RowId, ColId)>>,
     /// **6.4B (item H):** operation-level UDF time budget armed on each recalc pass
     /// (see [`run_recalc`]). Default [`crate::scalar::UDF_OP_BUDGET`] (120s); bounds
     /// a recompute touching N slow UDF cells to ~this instead of N × the per-call
@@ -397,6 +416,7 @@ impl WorkbookSession {
             udf_worker: None,
             // 6.4-3d (blocker G): empty per-recompute diagnostic collector.
             udf_diagnostics: RefCell::new(Vec::new()),
+            spill_footprint: RefCell::new(Vec::new()),
             udf_op_budget: crate::scalar::UDF_OP_BUDGET,
         }
     }
@@ -485,6 +505,11 @@ impl WorkbookSession {
     /// leaves the session sealed (`Faulted`) rather than torn.
     fn with_runtime<R>(&mut self, f: impl FnOnce(&mut WorkbookRuntime<'_>) -> R) -> R {
         let cache = std::mem::take(&mut self.plan_cache);
+        // **H3 (6.3-0):** start each runtime borrow with an empty spill-footprint
+        // collector so a command drains exactly its own footprint (no leak across
+        // commands). Unlike `udf_diagnostics` (auto-drained below), the owning
+        // command drains this after the closure returns.
+        self.spill_footprint.borrow_mut().clear();
         // Borrows `self.state`; the runtime below borrows the other (disjoint)
         // fields, so both coexist within this function.
         let mut guard = FaultGuard {
@@ -501,6 +526,8 @@ impl WorkbookSession {
             self.udf_worker.as_ref(),
             // 6.4-3d (blocker G): lend the per-recompute diagnostic collector.
             Some(&self.udf_diagnostics),
+            // H3 (6.3-0): lend the per-edit spill-footprint collector.
+            Some(&self.spill_footprint),
         );
         let out = f(&mut rt);
         self.plan_cache = rt.into_plan_cache();
@@ -536,6 +563,23 @@ impl WorkbookSession {
         }
     }
 
+    /// **H3 (6.3-0):** drain the per-edit spill-footprint collector into
+    /// [`SessionChange::Cell`] records for the delta change-log. The owning
+    /// command (`set_value`/`set_formula`/`clear`/`batch`) calls this AFTER its
+    /// `with_runtime` closure returns and folds the result into ONE
+    /// `record_changes` call alongside the anchor cell — so `snapshot_delta`
+    /// reports the full spill footprint, not just the anchor. Takes `&self` (the
+    /// `RefCell` gives interior mutability) so it composes inside a change-list
+    /// builder without a second `&mut self` borrow. The recompute paths do NOT
+    /// use this — they record footprints via `RecomputeResult.changed_cells`.
+    fn drain_spill_footprint(&self) -> Vec<SessionChange> {
+        self.spill_footprint
+            .borrow_mut()
+            .drain(..)
+            .map(|(sheet, row, col)| SessionChange::Cell { sheet, row, col })
+            .collect()
+    }
+
     /// Like [`with_runtime`] but with the op-log **detached** — the mutators
     /// update the workbook AND maintain the calcgraph, but append **no** ops
     /// (the [`batch`] path appends its single `Op::BatchCommit` itself). Same
@@ -545,6 +589,8 @@ impl WorkbookSession {
     /// [`batch`]: WorkbookSession::batch
     fn with_runtime_no_oplog<R>(&mut self, f: impl FnOnce(&mut WorkbookRuntime<'_>) -> R) -> R {
         let cache = std::mem::take(&mut self.plan_cache);
+        // **H3 (6.3-0):** clear-on-entry; see `with_runtime`.
+        self.spill_footprint.borrow_mut().clear();
         let mut guard = FaultGuard {
             state: &mut self.state,
             armed: true,
@@ -558,6 +604,8 @@ impl WorkbookSession {
             self.udf_worker.as_ref(),
             // 6.4-3d (blocker G): lend the per-recompute diagnostic collector.
             Some(&self.udf_diagnostics),
+            // H3 (6.3-0): lend the per-edit spill-footprint collector.
+            Some(&self.spill_footprint),
         );
         let out = f(&mut rt);
         self.plan_cache = rt.into_plan_cache();
@@ -1530,11 +1578,16 @@ impl EngineSession for WorkbookSession {
         let v = cell_value_to_value(value)?;
         self.with_runtime(|rt| rt.set_value(addr.sheet, addr.row, addr.col, v))
             .map_err(map_runtime_err)?;
-        self.record_changes([SessionChange::Cell {
+        // **H3 (6.3-0):** anchor + any dissolved spill-footprint targets (a
+        // literal write over a spill anchor/target retracts the footprint → the
+        // old targets must surface as removed in `snapshot_delta`).
+        let mut changes = vec![SessionChange::Cell {
             sheet: addr.sheet,
             row: addr.row,
             col: addr.col,
-        }]);
+        }];
+        changes.extend(self.drain_spill_footprint());
+        self.record_changes(changes);
         Ok(())
     }
 
@@ -1544,11 +1597,15 @@ impl EngineSession for WorkbookSession {
         self.with_runtime(|rt| rt.set_formula(addr.sheet, addr.row, addr.col, text))
             .map(|_value| ())
             .map_err(map_runtime_err)?;
-        self.record_changes([SessionChange::Cell {
+        // **H3 (6.3-0):** anchor + spill-footprint targets (grow/shrink/dissolve)
+        // so `snapshot_delta` reports the full footprint, not just the anchor.
+        let mut changes = vec![SessionChange::Cell {
             sheet: addr.sheet,
             row: addr.row,
             col: addr.col,
-        }]);
+        }];
+        changes.extend(self.drain_spill_footprint());
+        self.record_changes(changes);
         Ok(())
     }
 
@@ -1557,11 +1614,15 @@ impl EngineSession for WorkbookSession {
         self.require_live_sheet(addr.sheet, "clear")?;
         self.with_runtime(|rt| rt.clear_formula(addr.sheet, addr.row, addr.col))
             .map_err(map_runtime_err)?;
-        self.record_changes([SessionChange::Cell {
+        // **H3 (6.3-0):** anchor + any dissolved spill-footprint targets (clearing
+        // a spill anchor retracts the whole footprint → old targets go removed).
+        let mut changes = vec![SessionChange::Cell {
             sheet: addr.sheet,
             row: addr.row,
             col: addr.col,
-        }]);
+        }];
+        changes.extend(self.drain_spill_footprint());
+        self.record_changes(changes);
         Ok(())
     }
 
@@ -2211,6 +2272,12 @@ impl EngineSession for WorkbookSession {
         .map_err(map_runtime_err)?;
 
         // --- Phase 4: advance state_seq exactly once for the whole batch. ---
+        // **H3 (6.3-0):** fold in any spill-footprint targets touched by the
+        // batch's set_formula/set_value/clear ops (drained from the Phase-3
+        // runtime) alongside the per-op anchor changes built in Phase 1, so
+        // `snapshot_delta` reports the full footprint for batched/transacted
+        // spill edits too.
+        changes.extend(self.drain_spill_footprint());
         self.record_changes(changes);
 
         Ok(BatchResult {
@@ -5774,6 +5841,220 @@ mod tests {
             .find(|c| c.cell.row == 0 && c.cell.col == 1)
             .unwrap();
         assert_eq!(b1.cell.value, Some(CellValue::Number { number: 10.0 }));
+    }
+
+    // ---- H3 (6.3-0): snapshot_delta reports the FULL spill footprint ----
+
+    /// (row, col) pairs of a delta's `changed_cells`.
+    fn delta_changed_coords(d: &WorkbookSnapshotDelta) -> Vec<(u32, u32)> {
+        d.changed_cells
+            .iter()
+            .map(|c| (c.cell.row, c.cell.col))
+            .collect()
+    }
+    /// (row, col) pairs of a delta's `removed_cells`.
+    fn delta_removed_coords(d: &WorkbookSnapshotDelta) -> Vec<(u32, u32)> {
+        d.removed_cells.iter().map(|r| (r.row, r.col)).collect()
+    }
+
+    /// Direct `set_formula` of a spill reports EVERY footprint target (not just
+    /// the anchor) — the core H3 fix on the direct-mutation path, no recalc.
+    #[test]
+    fn snapshot_delta_includes_spill_targets_on_set_formula() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        // SEQUENCE(3) spills 3×1 down A1:A3 → 1, 2, 3.
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(3)").unwrap();
+        let d = s.snapshot_delta(&v0).unwrap();
+        assert!(!d.full_rebuild_required, "same-epoch in-window delta");
+        let changed = delta_changed_coords(&d);
+        for row in 0..3 {
+            assert!(
+                changed.contains(&(row, 0)),
+                "spill target ({row},0) must be in the delta — got {changed:?}"
+            );
+        }
+        // The target values resolve to the spilled numbers.
+        let a3 = d
+            .changed_cells
+            .iter()
+            .find(|c| c.cell.row == 2 && c.cell.col == 0)
+            .expect("A3 present");
+        assert_eq!(a3.cell.value, Some(CellValue::Number { number: 3.0 }));
+    }
+
+    /// A spill that GROWS reports the newly-added targets.
+    #[test]
+    fn snapshot_delta_spill_grow() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(2)").unwrap();
+        let v1 = s.snapshot().unwrap().version;
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(4)").unwrap();
+        let d = s.snapshot_delta(&v1).unwrap();
+        let changed = delta_changed_coords(&d);
+        for row in 0..4 {
+            assert!(
+                changed.contains(&(row, 0)),
+                "grown footprint cell ({row},0) must be in the delta — got {changed:?}"
+            );
+        }
+    }
+
+    /// A spill that SHRINKS reports the dropped targets in `removed_cells`.
+    #[test]
+    fn snapshot_delta_spill_shrink_reports_removed() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(4)").unwrap();
+        let v1 = s.snapshot().unwrap().version;
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(2)").unwrap();
+        let d = s.snapshot_delta(&v1).unwrap();
+        let removed = delta_removed_coords(&d);
+        assert!(
+            removed.contains(&(2, 0)) && removed.contains(&(3, 0)),
+            "dropped targets A3/A4 must be in removed_cells — got {removed:?}"
+        );
+        let changed = delta_changed_coords(&d);
+        assert!(
+            changed.contains(&(0, 0)) && changed.contains(&(1, 0)),
+            "surviving targets A1/A2 must be in changed_cells — got {changed:?}"
+        );
+    }
+
+    /// Overwriting a spill anchor with a literal dissolves the spill — old
+    /// targets surface as removed (the `set_value` dissolution path).
+    #[test]
+    fn snapshot_delta_spill_dissolve_via_literal() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(3)").unwrap();
+        let v1 = s.snapshot().unwrap().version;
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 99.0 })
+            .unwrap();
+        let d = s.snapshot_delta(&v1).unwrap();
+        let changed = delta_changed_coords(&d);
+        let removed = delta_removed_coords(&d);
+        assert!(changed.contains(&(0, 0)), "anchor A1 now 99 → changed");
+        assert!(
+            removed.contains(&(1, 0)) && removed.contains(&(2, 0)),
+            "dissolved targets A2/A3 must be removed — got removed={removed:?}"
+        );
+    }
+
+    /// Clearing a spill anchor dissolves the whole footprint — all targets
+    /// surface as removed (the `clear_formula` dissolution path).
+    #[test]
+    fn snapshot_delta_spill_dissolve_via_clear() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(3)").unwrap();
+        let v1 = s.snapshot().unwrap().version;
+        s.clear(addr(sheet, 0, 0)).unwrap();
+        let d = s.snapshot_delta(&v1).unwrap();
+        let removed = delta_removed_coords(&d);
+        for row in 0..3 {
+            assert!(
+                removed.contains(&(row, 0)),
+                "cleared footprint cell ({row},0) must be removed — got {removed:?}"
+            );
+        }
+    }
+
+    /// A spill RESIZED by a recompute (its size depends on an edited cell)
+    /// reports the new footprint — the load-bearing `recompute_dirty` fix.
+    #[test]
+    fn snapshot_delta_spill_via_recalc_dependent() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 1), CellValue::Number { number: 3.0 })
+            .unwrap();
+        // A1 = SEQUENCE(B1, 1, B1) spills B1 rows down column 0, starting at B1
+        // (so EVERY footprint value changes when B1 changes — including the
+        // anchor; the anchor-invariant case is covered separately by the VEQ
+        // test below).
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(B1,1,B1)").unwrap();
+        let v1 = s.snapshot().unwrap().version;
+        s.set_value(addr(sheet, 0, 1), CellValue::Number { number: 5.0 })
+            .unwrap();
+        s.recalc_dirty().unwrap();
+        let d = s.snapshot_delta(&v1).unwrap();
+        assert!(!d.full_rebuild_required, "same-epoch delta");
+        let changed = delta_changed_coords(&d);
+        for row in 0..5 {
+            assert!(
+                changed.contains(&(row, 0)),
+                "recompute-grown footprint cell ({row},0) must be in the delta — got {changed:?}"
+            );
+        }
+        // The grown targets A4/A5 (blank → number) are the load-bearing proof:
+        // without the recompute_dirty footprint fix they'd be silently missing.
+        let a5 = d
+            .changed_cells
+            .iter()
+            .find(|c| c.cell.row == 4 && c.cell.col == 0)
+            .expect("A5 (grown target) present");
+        assert_eq!(a5.cell.value, Some(CellValue::Number { number: 9.0 }));
+    }
+
+    /// A spill produced inside a `batch` reports its full footprint (the batch
+    /// folds the drained footprint into its single `record_changes`).
+    #[test]
+    fn snapshot_delta_spill_in_batch() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        s.batch(vec![
+            SessionOp::SetValue {
+                addr: addr(sheet, 0, 1),
+                value: CellValue::Number { number: 3.0 },
+            },
+            SessionOp::SetFormula {
+                addr: addr(sheet, 0, 0),
+                text: "SEQUENCE(3)".to_string(),
+            },
+        ], BatchOptions::default())
+        .unwrap();
+        let d = s.snapshot_delta(&v0).unwrap();
+        let changed = delta_changed_coords(&d);
+        for row in 0..3 {
+            assert!(
+                changed.contains(&(row, 0)),
+                "batched spill target ({row},0) must be in the delta — got {changed:?}"
+            );
+        }
+    }
+
+    /// The VEQ trap: a spill whose ANCHOR value is invariant but whose TARGETS
+    /// change must still report the changed targets. `SEQUENCE(3,1,1,A1)` →
+    /// [1, 1+A1, 1+2·A1]; the anchor (start) stays 1 across A1 edits, so the
+    /// anchor VEQ-skips its write — but C2/C3 vary and MUST be reported.
+    #[test]
+    fn snapshot_delta_spill_veq_anchor_unchanged_targets_changed() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        // C1 = SEQUENCE(3,1,1,A1) spills C1:C3 = 1, 1+A1, 1+2A1.
+        s.set_formula(addr(sheet, 0, 2), "SEQUENCE(3,1,1,A1)").unwrap();
+        let v1 = s.snapshot().unwrap().version;
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.recalc_dirty().unwrap();
+        let d = s.snapshot_delta(&v1).unwrap();
+        let changed = delta_changed_coords(&d);
+        assert!(
+            changed.contains(&(1, 2)) && changed.contains(&(2, 2)),
+            "C2/C3 changed despite the anchor C1 being VEQ-unchanged — got {changed:?}"
+        );
+        // Confirm the new target values resolved correctly (1+10=11, 1+20=21).
+        let c3 = d
+            .changed_cells
+            .iter()
+            .find(|c| c.cell.row == 2 && c.cell.col == 2)
+            .expect("C3 present");
+        assert_eq!(c3.cell.value, Some(CellValue::Number { number: 21.0 }));
     }
 
     /// A token equal to the current version yields an empty (no-change) delta.

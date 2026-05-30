@@ -303,6 +303,26 @@ impl<'a> WorkbookRuntime<'a> {
             EvalResult::Array(array) => self.write_spill(sheet, row, col, array, formula_text),
         };
 
+        // **H3 (6.3-0):** record the spill-footprint TARGET cells touched by this
+        // edit into the session's per-edit delta collector, so `snapshot_delta`
+        // reports the FULL footprint — not just the anchor the session records
+        // directly. Independent of (and complementary to) the calcgraph hook
+        // pass below, which dirties the same cells for recompute; this is the
+        // change-log side. No-op for graph-less runtimes (`spill_footprint`
+        // `None`). OLD self footprint → cells that lost their spilled value
+        // (resolve to removed); NEW self footprint → cells that gained one
+        // (changed); DISSOLVED HOST footprint → host targets that lost the
+        // host's value PLUS the host anchor itself (it re-emits `#SPILL!`).
+        if let Some(shape) = old_spill_shape {
+            self.record_spill_footprint(sheet, row, col, shape, true);
+        }
+        if let Some(shape) = new_spill_shape {
+            self.record_spill_footprint(sheet, row, col, shape, true);
+        }
+        if let Some((host_anchor, host_shape)) = dissolved_host {
+            self.record_spill_footprint(host_anchor.0, host_anchor.1, host_anchor.2, host_shape, false);
+        }
+
         // Phase 3.1: notify calcgraph after the workbook mutation
         // succeeds. Phase 3.2 (2026-05-12): pass the already-bound
         // `ExprPlan` straight from the PlanCache so the hook walks it
@@ -878,6 +898,19 @@ impl<'a> WorkbookRuntime<'a> {
             let _ = self.workbook.clear_spill_at((sheet, row, col));
         }
 
+        // **H3 (6.3-0):** record the dissolved footprint TARGET cells (about to
+        // go Blank) into the delta collector so `snapshot_delta` reports them as
+        // removed. Self-anchored: the edited == anchor cell is recorded by the
+        // session directly (skip_anchor). Host-anchored: include the host anchor
+        // (it re-emits `#SPILL!`); the edited cell is also in the host footprint
+        // but the session records it directly (deduped downstream).
+        if let Some(shape) = dissolved_self_shape {
+            self.record_spill_footprint(sheet, row, col, shape, true);
+        }
+        if let Some((host_anchor, host_shape)) = dissolved_host {
+            self.record_spill_footprint(host_anchor.0, host_anchor.1, host_anchor.2, host_shape, false);
+        }
+
         self.workbook.put_at(sheet, row, col, value);
         self.workbook.clear_formula(sheet, row, col);
 
@@ -963,6 +996,45 @@ impl<'a> WorkbookRuntime<'a> {
         }
 
         Ok(())
+    }
+
+    /// **H3 (6.3-0):** record the NON-anchor cells of a spill `shape` anchored
+    /// at `(sheet, row, col)` into the lent per-edit spill-footprint collector,
+    /// so the owning session folds them into its delta change-log alongside the
+    /// edited cell. No-op when no collector is lent (every non-session runtime →
+    /// `spill_footprint` is `None`, e.g. op-log replay / standalone transaction).
+    ///
+    /// `skip_anchor` excludes the anchor cell `(0,0)`: pass `true` for a
+    /// SELF-anchored footprint (old/new spill at the EDITED cell — the session
+    /// already records the edited == anchor cell directly); pass `false` for a
+    /// DISSOLVED-HOST footprint (the host anchor is a DIFFERENT cell that must
+    /// also be reported, since it re-emits `#SPILL!` on its next recompute).
+    ///
+    /// `snapshot_delta` resolves each recorded coord against current committed
+    /// state (present → `changed`, absent → `removed`), so recording grown /
+    /// shrunk / dissolved targets is uniform — over-reporting an unchanged cell
+    /// is harmless (it re-snapshots to its current value) and duplicates are
+    /// deduped by the delta walk's `HashSet`.
+    fn record_spill_footprint(
+        &self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        shape: SpillShape,
+        skip_anchor: bool,
+    ) {
+        let Some(fp) = self.spill_footprint else {
+            return;
+        };
+        let mut fp = fp.borrow_mut();
+        for dr in 0..shape.rows {
+            for dc in 0..shape.cols {
+                if skip_anchor && dr == 0 && dc == 0 {
+                    continue;
+                }
+                fp.push((sheet, row + dr, col + dc));
+            }
+        }
     }
 
     // (Tier D1 Step 3.4: set_name / set_sheet_scoped_name moved
@@ -1124,6 +1196,11 @@ impl<'a> WorkbookRuntime<'a> {
             // The comment at line 1632 marked this as Phase 4.7.K
             // work; 4.7.O closes it.
             self.reextract_spill_footprint_readers(sheet, row, col, Some(shape), None);
+            // **H3 (6.3-0):** record the dissolved footprint TARGET cells (now
+            // Blank) into the delta collector so `snapshot_delta` reports them as
+            // removed. The anchor (the cleared cell) is recorded by the session
+            // directly, so skip it here.
+            self.record_spill_footprint(sheet, row, col, shape, true);
         }
 
         Ok(())
