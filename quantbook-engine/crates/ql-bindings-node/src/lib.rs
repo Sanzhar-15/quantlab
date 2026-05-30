@@ -4233,7 +4233,15 @@ pub struct SheetInfoJson {
 fn engine_error_to_napi(env: Env, e: EngineError) -> Error {
     match throw_structured(env, &e) {
         Ok(()) => Error::new(Status::PendingException, String::new()),
-        Err(_) => Error::from_reason(e.to_string()),
+        // **6.3-1c closure-audit (Codex LOW):** the real error `e` is still
+        // surfaced loud via its `[code] message` Display (so `parseQuantbookError`
+        // still recovers the code from the prefix); ALSO append the napi-build
+        // failure so the binding defect is VISIBLE, not silently dropped (a
+        // structured-throw build failure would otherwise be invisible behind a
+        // normal-looking prefixed error).
+        Err(build_err) => Error::from_reason(format!(
+            "{e} [structured-error build failed: {build_err}]"
+        )),
     }
 }
 
