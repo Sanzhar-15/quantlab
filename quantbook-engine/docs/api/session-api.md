@@ -347,6 +347,13 @@ Every DTO crossing the contract carries `schema_version` (or the envelope's `pro
 A version a binding doesn't understand → `EngineError{class:Protocol, code:"unsupported_schema_version"}`,
 never silent coercion (generalizes `.qbook snapshot_format_version` + the op wire `deny_unknown_fields`).
 
+**6.3-1c (M5) — SHIPPED for the snapshot DTOs over napi (Node).** `WorkbookSnapshotJson` +
+`WorkbookSnapshotDeltaJson` now carry `schemaVersion` (= engine `SCHEMA_VERSION`); the IDE's
+`assertSupportedSchemaVersion` at the snapshot AND delta ingest boundaries is the producer of
+`unsupported_schema_version` (previously a producerless code). `full_rebuild_reason` (§4.3) is also
+threaded on the delta DTO. The remaining DTOs (`RangeResult`/`TableSpec`/`BatchResult`/`UndoRedoResult`/
+transaction) gain `schemaVersion` as they bind in 6.3-2.
+
 ### 4.2 Core DTOs (extracted from the proven `#[napi(object)]` structs; `+` = added/clarified)
 - **`CellValue`** (← `CellValueJson`, `lib.rs:580`): a **discriminated union** on `kind`
   (`number`/`boolean`/`text`/`error`/`blank`/`pending`), exactly one payload. Bindings narrow on `kind`.
@@ -394,6 +401,17 @@ EngineError { code: String, class: ErrorClass, message: String,
 Replaces the `[<kind>]`-prefix-on-Display workaround (`lib.rs:306-349`, forced because napi-rs's
 `Error` `Status` is an enum with no custom string code). `code` is carried as **data**, not parsed from
 a message.
+
+**6.3-1c — SHIPPED over napi (Node).** Engine-taxonomy errors (`EngineSession` results) now reach JS
+as a NATIVE `Error` with `.code` / `.class` / `.retryable` (+ `.details` as a JSON string, `.source`)
+own-properties. napi-rs 3.9.0's `Result<T>` path can't carry a custom `.code`, so the binding builds the
+error via `Env::create_error` + `Object::set` and `Env::throw`s it, returning `Status::PendingException`
+(napi's `throw_into` short-circuits → the augmented object propagates verbatim). The single throw point
+is the `guarded(env, …)` boundary. **Scope:** FFI argument-validation `bad_argument` (the binding's own
+`validate_*` / `bad_argument_error`) + collab + udf-spawn KEEP the `[<code>]`-prefix string (uniform
+`class=BadArgument`, no details); the IDE's `parseQuantbookError` reads the native `.code` when present
+and falls back to the prefix otherwise (dual-format, monotonic). `details` as a native nested object
+(rather than a JSON string) awaits enabling napi-rs's `serde-json` feature — filed forward.
 
 ### 5.2 `ErrorClass`
 `BadArgument` · `Lifecycle` (incl. `session_busy`, `invalid_state`) · `NotFound` · `Conflict` ·
