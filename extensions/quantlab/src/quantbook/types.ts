@@ -1750,6 +1750,41 @@ export interface SessionInstance {
 	 * negative/lossy cursor is rejected `[bad_argument]`.
 	 */
 	pollEvents(cursor: bigint): EventPageJson;
+
+	// --- Phase 6.3-2b (2026-05-30): persistence ---
+
+	/**
+	 * Open a `.qbook` workbook from `path` (New -> Ready). The engine re-mints the
+	 * epoch (any prior delta token full-rebuilds) and recomputes on load. A missing
+	 * file / bad envelope / corrupt op-log sidecar throws a structured
+	 * `[persistence]` error (No-Fallbacks); `[invalid_state]` off an openable state.
+	 */
+	open(path: string): void;
+
+	/**
+	 * Import a workbook from in-memory `bytes` in `format` -- v1 supports `'xlsx'`
+	 * (recomputed best-effort on import) and `'csv'` (no formulas). Any other format
+	 * throws `[bad_argument]`; malformed bytes throw `[persistence]`. Adopts the
+	 * imported workbook as a fresh session (epoch re-minted).
+	 */
+	import(bytes: Uint8Array, format: string): void;
+
+	/**
+	 * Save the live workbook + this session's op-log to a `.qbook` directory at
+	 * `path` (atomic rename). The workbook name is derived from the path's file
+	 * stem -- a path with no stem throws `[bad_argument]`. `[invalid_state]` off a
+	 * readable state; I/O / serialization failures throw `[persistence]`.
+	 */
+	save(path: string): void;
+
+	/**
+	 * Export the live workbook to bytes in `format` -- v1 supports `'csv'` (single
+	 * live sheet; more than one throws `[bad_argument]`) and `'xlsx'` (whole
+	 * workbook, only when the engine is built with the `xlsx-write` feature;
+	 * otherwise the honest `[not_implemented_in_v1_core]`). Any other format throws
+	 * `[bad_argument]`.
+	 */
+	export(format: string): Uint8Array;
 }
 
 export interface SessionConstructor {

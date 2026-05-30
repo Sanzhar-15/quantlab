@@ -388,6 +388,14 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (6.3-2a)`);
 				}
 			}
+			// **Phase 6.3-2b (2026-05-30):** persistence -- .qbook open/save +
+			// multi-format import/export. A stale cdylib lacks these -- fail at
+			// the boundary, not at the use site.
+			for (const method of ['open', 'save', 'import', 'export']) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (6.3-2b)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {
