@@ -1219,6 +1219,11 @@ export function acquireWorkbookSnapshotViaDelta(
 		return seed;
 	}
 	const delta = workbookSnapshotDelta(session, cachedVersion);
+	// **Phase 6.3-1c closure-audit (Opus MED-1):** assert the delta DTO's schema
+	// version at the delta ingest too -- not just the full-snapshot path. Without
+	// this a drifted DELTA would surface as a downstream mergeWorkbookDelta shape
+	// mismatch rather than a clean fail-loud unsupported_schema_version.
+	assertSupportedSchemaVersion(delta.schemaVersion);
 	if (delta.fullRebuildRequired) {
 		const full = workbookSnapshot(session);
 		cache.snapshot = full;
