@@ -4492,6 +4492,30 @@ fn session_range_from_json(method: &str, range: CellRangeJson) -> Result<ql_sess
     })
 }
 
+/// **Phase 6.3-2d:** convert a JS [`TableSpecJson`] into an engine
+/// [`ql_session::TableSpec`], validating coords/dimensions to `u16`/`u32` at the
+/// boundary (mirrors `session_range_from_json`). `rows`/`cols` are validated only
+/// as u32 (the validator permits `0`); the engine enforces the `> 0` invariant and
+/// the `columnNames`-length / uniqueness rules, surfacing `[table_create_rejected]`.
+fn session_table_spec_from_json(method: &str, spec: TableSpecJson) -> Result<ql_session::TableSpec> {
+    let sheet = validate_u16_index(method, "sheet", spec.sheet)?;
+    let top_row = validate_u32_index(method, "topRow", spec.top_row)?;
+    let top_col = validate_u32_index(method, "topCol", spec.top_col)?;
+    let rows = validate_u32_index(method, "rows", spec.rows)?;
+    let cols = validate_u32_index(method, "cols", spec.cols)?;
+    Ok(ql_session::TableSpec {
+        name: spec.name,
+        sheet,
+        top_row,
+        top_col,
+        rows,
+        cols,
+        has_header: spec.has_header,
+        has_totals: spec.has_totals,
+        column_names: spec.column_names,
+    })
+}
+
 /// **Phase 6.3-2a (2026-05-30):** stable snake_case wire string for a
 /// [`ql_session::LifecycleState`] (mirrors `#[serde(rename_all = "snake_case")]`
 /// — though the enum is read via this helper, not serde) — the value returned by
@@ -4735,6 +4759,27 @@ pub struct CellRangeJson {
     pub start_col: f64,
     pub end_row: f64,
     pub end_col: f64,
+}
+
+/// **Phase 6.3-2d (2026-05-30):** spec for `createTable` (mirrors
+/// [`ql_session::TableSpec`]). `sheet`/`topRow`/`topCol`/`rows`/`cols` are JS
+/// Numbers validated to `u16`/`u32` at the boundary (same
+/// finite/non-negative/integer/in-range discipline as [`CellRangeJson`]); `sheet`
+/// is a `u16` `SheetId`, `top*` are `u32` `RowId`/`ColId`, `rows`/`cols` are u32
+/// counts (the engine requires both `> 0` — a `0` reaches the engine and surfaces
+/// `[table_create_rejected]`, not a boundary `[bad_argument]`). `columnNames`
+/// length must match `cols`. The name is canonicalized (uppercase) by the engine.
+#[napi(object)]
+pub struct TableSpecJson {
+    pub name: String,
+    pub sheet: f64,
+    pub top_row: f64,
+    pub top_col: f64,
+    pub rows: f64,
+    pub cols: f64,
+    pub has_header: bool,
+    pub has_totals: bool,
+    pub column_names: Vec<String>,
 }
 
 /// **Phase 6.3-2a (2026-05-30):** which extras a `queryRange` read includes
@@ -5845,6 +5890,113 @@ impl Session {
             self.inner
                 .lock()
                 .set_name(&name, range)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    // ============================================================================
+    // 6.3-2d (2026-05-30) — tables over napi.
+    //
+    // Binds the already-implemented engine table mutators (§3.3): create / rename
+    // table / rename column / resize / drop. The FIRST 6.3-2 sub-increment that
+    // adds a new DTO — `TableSpecJson` (mirrors `ql_session::TableSpec`), converted
+    // via `session_table_spec_from_json` (sheet -> u16, top/rows/cols -> u32, with
+    // the same boundary validation as `session_range_from_json`). Each method
+    // inherits the locked 6.3-1 contract — `guarded(env,..)` + `catch_unwind`,
+    // native structured errors via `engine_error_to_napi`. Table ops are not
+    // delta-expressible (they rewrite cells the session cannot enumerate), so the
+    // engine bumps the epoch — consumers reseed from a fresh snapshot.
+    // ============================================================================
+
+    /// Create a table from `spec`. A duplicate name (shared Table+Name namespace),
+    /// zero `rows`/`cols`, a footprint that exceeds the grid / overlaps an existing
+    /// table / contains a spill anchor, a `columnNames` length mismatch, or empty /
+    /// non-unique column names all surface `[table_create_rejected]` (Conflict). An
+    /// unknown or tombstoned `sheet` surfaces `[sheet_not_found]` (NotFound).
+    /// `[invalid_state]` off a Ready session. Coords are validated to u16/u32 at the
+    /// converter (a loud `[bad_argument]` for non-integer / negative / out-of-range).
+    #[napi(js_name = "createTable", catch_unwind)]
+    pub fn create_table(&self, env: Env, spec: TableSpecJson) -> Result<()> {
+        guarded(env, "createTable", || {
+            let spec = session_table_spec_from_json("createTable", spec)?;
+            self.inner
+                .lock()
+                .create_table(spec)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Rename a table. Unknown `oldName` surfaces `[table_not_found]` (NotFound); a
+    /// `newName` colliding with another table or defined name surfaces
+    /// `[table_create_rejected]` (Conflict). Rewrites stored formula text that
+    /// references the table (Excel canon) as one undo unit. `[invalid_state]` off a
+    /// Ready session.
+    #[napi(js_name = "renameTable", catch_unwind)]
+    pub fn rename_table(&self, env: Env, old_name: String, new_name: String) -> Result<()> {
+        guarded(env, "renameTable", || {
+            self.inner
+                .lock()
+                .rename_table(&old_name, &new_name)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Rename a column within a table. An unknown `table` surfaces
+    /// `[table_not_found]`; an unknown `oldCol` surfaces `[table_column_not_found]`;
+    /// a `newCol` colliding with another column surfaces `[table_column_rejected]`
+    /// (Conflict). Rewrites stored structured-reference formula text as one undo
+    /// unit. `[invalid_state]` off a Ready session.
+    #[napi(js_name = "renameColumn", catch_unwind)]
+    pub fn rename_column(
+        &self,
+        env: Env,
+        table: String,
+        old_col: String,
+        new_col: String,
+    ) -> Result<()> {
+        guarded(env, "renameColumn", || {
+            self.inner
+                .lock()
+                .rename_column(&table, &old_col, &new_col)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Resize a table to `newRows` x `newCols`, adding/removing the named columns.
+    /// An unknown `name` surfaces `[table_not_found]`; invalid dimensions / column
+    /// lists surface `[table_resize_rejected]` (BadArgument). `newRows`/`newCols`
+    /// are validated to u32 at the boundary (a loud `[bad_argument]` for
+    /// non-integer / negative / out-of-range). `[invalid_state]` off a Ready session.
+    #[napi(js_name = "resizeTable", catch_unwind)]
+    pub fn resize_table(
+        &self,
+        env: Env,
+        name: String,
+        new_rows: f64,
+        new_cols: f64,
+        added_columns: Vec<String>,
+        removed_columns: Vec<String>,
+    ) -> Result<()> {
+        guarded(env, "resizeTable", || {
+            let new_rows = validate_u32_index("resizeTable", "newRows", new_rows)?;
+            let new_cols = validate_u32_index("resizeTable", "newCols", new_cols)?;
+            self.inner
+                .lock()
+                .resize_table(&name, new_rows, new_cols, added_columns, removed_columns)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Drop a table. Its metadata is removed; cells inside the footprint are left
+    /// in place, and formulas referencing the table re-bind to `#NAME?` on the next
+    /// recompute. An unknown `name` surfaces `[table_not_found]` (NotFound).
+    /// `[invalid_state]` off a Ready session.
+    #[napi(js_name = "dropTable", catch_unwind)]
+    pub fn drop_table(&self, env: Env, name: String) -> Result<()> {
+        guarded(env, "dropTable", || {
+            self.inner
+                .lock()
+                .drop_table(&name)
                 .map_err(|e| engine_error_to_napi(env, e))
         })
     }

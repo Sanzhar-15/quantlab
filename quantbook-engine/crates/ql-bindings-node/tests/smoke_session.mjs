@@ -635,6 +635,194 @@ console.log("[smoke] 6.4-2 function registration PASS");
   );
 }
 
+// === 6.3-2d (2026-05-30) — tables over napi ===
+//
+// Self-contained on a FRESH session. Tables have NO read surface (snapshot() does
+// NOT surface tables), so observe via a STRUCTURED-REFERENCE formula: SUM(T[Col])
+// resolves over the table's data column. It SURVIVES renameColumn / renameTable
+// (the engine rewrites the stored formula text), TRACKS a resize that extends the
+// data range, and re-binds to an error (#NAME!) once the table is dropped. Exercises
+// the new TableSpecJson DTO + loud structured negatives.
+{
+  const w = new Session();
+  const sh = w.addSheet("Data", 1000);
+
+  // Header at row 0; data at rows 1-2 of col 0 = 10, 20.
+  w.setValue(sh, 1, 0, { kind: "number", number: 10 });
+  w.setValue(sh, 2, 0, { kind: "number", number: 20 });
+
+  // create: a 3x1 table (header + 2 data rows) anchored at (0,0), one column "Qty".
+  w.createTable({
+    name: "Sales",
+    sheet: sh,
+    topRow: 0,
+    topCol: 0,
+    rows: 3,
+    cols: 1,
+    hasHeader: true,
+    hasTotals: false,
+    columnNames: ["Qty"],
+  });
+
+  // OBSERVABLE: a structured-reference formula resolves over the data column.
+  // (A no-op createTable would leave this #NAME!, so this pins REAL creation.)
+  w.setFormula(sh, 0, 2, "SUM(Sales[Qty])"); // C1
+  w.recalcDirty();
+  assert.equal(w.cell(sh, 0, 2).value.number, 30, "SUM(Sales[Qty]) resolves to 10+20");
+
+  // renameColumn: the engine rewrites the stored formula text -> still resolves.
+  w.renameColumn("Sales", "Qty", "Quantity");
+  w.recalcDirty();
+  assert.equal(
+    w.cell(sh, 0, 2).value.number,
+    30,
+    "renameColumn rewrites the structured ref (Qty -> Quantity) -> still 30",
+  );
+  // PIN that the rename REALLY took effect (a silent no-op would leave the old
+  // column name still bound, so "still 30" alone is not enough): a FRESH formula
+  // using the NEW column name binds + resolves (only possible if the column was
+  // actually renamed), AND a fresh formula using the OLD name fails to bind
+  // (setFormula rejects an unbindable structured ref eagerly -> [formula_bind];
+  // a bind error does NOT fault the session, so it stays usable afterward).
+  w.setFormula(sh, 0, 5, "SUM(Sales[Quantity])"); // F1 (new name binds)
+  w.recalcDirty();
+  assert.equal(w.cell(sh, 0, 5).value.number, 30, "the NEW column name binds after renameColumn");
+  throwsWithCode(
+    () => w.setFormula(sh, 1, 5, "SUM(Sales[Qty])"),
+    "formula_bind",
+    "the OLD column name no longer binds after renameColumn",
+  );
+
+  // renameTable: likewise rewrites the table reference -> still resolves.
+  w.renameTable("Sales", "Revenue");
+  w.recalcDirty();
+  assert.equal(
+    w.cell(sh, 0, 2).value.number,
+    30,
+    "renameTable rewrites the structured ref (Sales -> Revenue) -> still 30",
+  );
+  // PIN the table rename the same way: the NEW table name binds, the OLD fails.
+  w.setFormula(sh, 2, 5, "SUM(Revenue[Quantity])"); // F3 (new table name binds)
+  w.recalcDirty();
+  assert.equal(w.cell(sh, 2, 5).value.number, 30, "the NEW table name binds after renameTable");
+  throwsWithCode(
+    () => w.setFormula(sh, 3, 5, "SUM(Sales[Quantity])"),
+    "formula_bind",
+    "the OLD table name no longer binds after renameTable",
+  );
+
+  // resize: add a data row BELOW the footprint, grow rows 3 -> 4 (header + 3 data),
+  // and watch the SUM range extend to include it (OBSERVABLE, not just no-throw).
+  w.setValue(sh, 3, 0, { kind: "number", number: 40 });
+  w.resizeTable("Revenue", 4, 1, [], []);
+  w.recalcDirty();
+  assert.equal(
+    w.cell(sh, 0, 2).value.number,
+    70,
+    "resizeTable extends the data range -> SUM now 10+20+40",
+  );
+
+  // drop: metadata removed -> the structured ref re-binds to a #NAME? error on
+  // recompute (the cell read 70 immediately above, so this error IS the drop's
+  // rebind, not a pre-existing one). Pin the error VALUE, not just kind==="error".
+  w.dropTable("Revenue");
+  w.recalcDirty();
+  const dropped = w.cell(sh, 0, 2).value;
+  assert.equal(dropped.kind, "error", "dropTable -> SUM over the dropped table re-binds to an error");
+  assert.ok(
+    typeof dropped.error === "string" && dropped.error.includes("NAME"),
+    `dropTable rebind is a #NAME? error (UnknownTable), got ${JSON.stringify(dropped.error)}`,
+  );
+
+  // negatives (loud, structured). Seed a live table to drive the collision paths.
+  w.createTable({
+    name: "T2",
+    sheet: sh,
+    topRow: 6,
+    topCol: 0,
+    rows: 2,
+    cols: 1,
+    hasHeader: true,
+    hasTotals: false,
+    columnNames: ["X"],
+  });
+  throwsWithCode(
+    () =>
+      w.createTable({
+        name: "T2",
+        sheet: sh,
+        topRow: 10,
+        topCol: 0,
+        rows: 2,
+        cols: 1,
+        hasHeader: true,
+        hasTotals: false,
+        columnNames: ["Y"],
+      }),
+    "table_create_rejected",
+    "createTable with a duplicate name",
+  );
+  throwsWithCode(
+    () =>
+      w.createTable({
+        name: "ZeroRows",
+        sheet: sh,
+        topRow: 20,
+        topCol: 0,
+        rows: 0,
+        cols: 1,
+        hasHeader: false,
+        hasTotals: false,
+        columnNames: ["Q"],
+      }),
+    "table_create_rejected",
+    "createTable with rows=0 (validator permits 0; engine enforces > 0)",
+  );
+  throwsWithCode(
+    () =>
+      w.createTable({
+        name: "BadSheet",
+        sheet: 60000,
+        topRow: 0,
+        topCol: 0,
+        rows: 2,
+        cols: 1,
+        hasHeader: false,
+        hasTotals: false,
+        columnNames: ["Q"],
+      }),
+    "sheet_not_found",
+    "createTable on a non-live sheet",
+  );
+  throwsWithCode(() => w.renameTable("NoSuch", "X"), "table_not_found", "renameTable on unknown table");
+  throwsWithCode(() => w.dropTable("NoSuch"), "table_not_found", "dropTable on unknown table");
+  throwsWithCode(() => w.resizeTable("NoSuch", 2, 1, [], []), "table_not_found", "resizeTable on unknown table");
+  throwsWithCode(() => w.renameColumn("NoSuch", "X", "Y"), "table_not_found", "renameColumn on unknown table");
+  throwsWithCode(
+    () => w.renameColumn("T2", "NoCol", "Y"),
+    "table_column_not_found",
+    "renameColumn on unknown column",
+  );
+  // The remaining two table error classes: a rejected column rename target
+  // (empty new name) and a rejected resize (zero dims -- the u32 validator
+  // permits 0, so the engine is the one that rejects).
+  throwsWithCode(
+    () => w.renameColumn("T2", "X", ""),
+    "table_column_rejected",
+    "renameColumn to an empty column name",
+  );
+  throwsWithCode(
+    () => w.resizeTable("T2", 0, 1, [], []),
+    "table_resize_rejected",
+    "resizeTable to zero rows",
+  );
+
+  w.close();
+  console.log(
+    "[smoke] 6.3-2d tables OK (create/rename-col/rename-table/resize/drop via SUM(T[Col]) + loud negatives)",
+  );
+}
+
 // **6.1C audit-fix M8 — Session.close() deterministic lifecycle release.**
 // Post-close any command call returns a structured [invalid_state] error, not
 // a panic / silent failure. Closes the lifecycle hole flagged by the megaudit
