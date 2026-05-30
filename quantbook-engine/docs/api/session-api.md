@@ -153,7 +153,7 @@ Product commands (not collab `Op` variants — decision-lock §3.2). **v1** = in
 | `import(bytes, "csv")` | v1 ✅ (inc.2c-11) | `ql_io_csv::import_csv_bytes` (pure-I/O leaf; type inference: empty→blank, TRUE/FALSE→bool, finite f64→number, else text; leading `=` stays text — injection-safe; UTF-8 + BOM-stripped; engine-limit-guarded) → **Option 1** adoption, **no recompute** (CSV has no formulas). |
 | `import(bytes, other)` | `BadArgument` | unknown format → loud `BadArgument` |
 | `save(path)` | v1 ✅ (inc.2c-9) | `ql_io::save_workbook_with_oplog(&wb, &oplog, name, path)`; workbook name derived from the path file-stem (no document-name metadata in v1; `None` → loud `BadArgument`). `&self`, legal in `Ready`/`Busy`. |
-| `export("csv") -> bytes` | v1 ✅ (inc.2c-11) | `ql_io_csv::export_csv_bytes` — **single live sheet** only (`>1` → loud `BadArgument`, no silent sheet drop; `export` is `&self`, no warn channel); 0 sheets → empty bytes. Verbatim/value-only (cells via `Value` `Display`; no formula-trigger escaping; uses the conservative used-range like xlsx/.qbook). |
+| `export("csv") -> bytes` | v1 ✅ (inc.2c-11) | `ql_io_csv::export_csv_bytes` — **single live sheet** only (`>1` → loud `BadArgument`, no silent sheet drop; `export` is `&self`, no warn channel); 0 sheets → empty bytes. Verbatim/value-only (cells via `Value` `Display`; no formula-trigger escaping). **M7 (6.3-2b):** uses `Sheet::effective_value_bounds` (the non-blank-value extent) — interior blanks preserved, trailing all-blank rows/cols trimmed (the one serializer whose OUTPUT was genuinely blank-inflated; xlsx/.qbook already skipped blank cells and only narrowed their iteration range / envelope footprint). |
 | `export("xlsx") -> bytes` | v1 ✅ (inc.2c-12, feature `xlsx-write`) | `ql_io_xlsx::export_xlsx_bytes` (`NewWorkbook` mode; umya 2.2.0 `write_writer` → in-memory `Vec<u8>`, post-process pass in memory — no tempfile). Exports the **whole workbook** (xlsx is multi-sheet, unlike csv). The umya writer (+ its image/rav1e/exr/tiff codecs) is behind ql-io-xlsx's `write` feature; `ql-exec` depends `default-features = false` and gates this path on its own `xlsx-write` feature so the **default reader-only build (and WASM/bindings through it) stays lean**. Without the feature → honest `Capability/not_implemented_in_v1_core` (No-Fallbacks). `&self`, so export-fidelity caveats are not surfaced (same as csv); errors map via `map_xlsx_err` (Appendix A). |
 | `export(other) -> bytes` | `BadArgument` | unknown format → loud `BadArgument` |
 | `close()` | v1 | handle free → `Closed` |
@@ -362,6 +362,15 @@ never throws on a bad formula), `queryRange` → `RangeResultJson` (§3.6 — co
 `markVolatilesDirty`, `setFormat` / `registerFormat` (§3.2 — `FormatIdJson` round-trips both
 directions). `TableSpec`/`BatchResult`/transaction DTOs ride later 6.3-2 sub-increments;
 `UndoRedoResult` rides 6.3-3.
+
+**6.3-2b — SHIPPED over napi (Node).** The persistence cluster is bound on the owning `Session`:
+`open(path)` / `save(path)` (§3.1 — `.qbook`), `import(bytes, format)` / `export(format) -> Uint8Array`
+(§3.1 — `"xlsx"`/`"csv"`; byte payloads as `Uint8Array`). No new DTOs — strings + byte buffers only;
+each inherits the locked 6.3-1 contract (`guarded(env,…)` + native `engine_error_to_napi`). `export("xlsx")`
+in the default (reader-only) cdylib returns the honest `not_implemented_in_v1_core` (the `xlsx-write`
+feature is off). **M7 effective-extent landed with this increment** (CSV output fix + .qbook/xlsx tight
+extent; see the `export("csv")` row in §3.1 and `Sheet::effective_value_bounds`). `TableSpec`/`BatchResult`/transaction
+DTOs ride later 6.3-2 sub-increments; `UndoRedoResult` rides 6.3-3.
 
 ### 4.2 Core DTOs (extracted from the proven `#[napi(object)]` structs; `+` = added/clarified)
 - **`CellValue`** (← `CellValueJson`, `lib.rs:580`): a **discriminated union** on `kind`
