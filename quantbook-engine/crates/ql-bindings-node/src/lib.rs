@@ -4920,23 +4920,6 @@ impl Session {
         }
     }
 
-    /// **M1 (6.3-1a) — test-only panic-boundary probe.** Compiled into DEBUG
-    /// cdylibs only (`#[cfg(debug_assertions)]`; absent from release builds).
-    /// Forces a Rust panic INSIDE [`guarded`] so `tests/smoke_session.mjs` can
-    /// assert end-to-end that a panic in a `#[napi]` method surfaces as a
-    /// `[panic]` JS error and does **not** abort the Node host — and that the
-    /// session remains usable afterward (a bare panic here does not arm the
-    /// engine `FaultGuard`, so it is recoverable, unlike a panic through
-    /// `run_recalc`). This is the only way to exercise the boundary, since
-    /// `cargo test` cannot link the napi runtime symbols standalone.
-    #[cfg(debug_assertions)]
-    #[napi(js_name = "__forcePanicForTest", catch_unwind)]
-    pub fn force_panic_for_test(&self) -> Result<()> {
-        guarded("__forcePanicForTest", || -> Result<()> {
-            panic!("forced panic for the M1 panic-boundary smoke test");
-        })
-    }
-
     /// Add a sheet; returns its assigned `SheetId` (u16 widened to u32).
     /// `chunkRows` is the per-sheet row partition size (must be ≥ 1; the engine
     /// rejects 0 to prevent a `ColumnStore` panic).
@@ -5320,6 +5303,34 @@ impl Session {
                 .poll_events(ql_session::session::EventCursor(raw))
                 .map_err(engine_error_to_napi)?;
             Ok(event_page_json_from_session(page))
+        })
+    }
+}
+
+/// **M1 (6.3-1a) — test-only panic-boundary probe, in its OWN whole-block-gated
+/// impl.** The `#[cfg(debug_assertions)]` MUST gate the entire `#[napi] impl`
+/// block, not a single method inside the main (unconditionally-compiled) block:
+/// napi-derive emits an ungated module-level registration that references the
+/// per-method callback, so a method-level `cfg` removes the body in release
+/// while leaving a dangling registration symbol → the **release cdylib fails to
+/// link** (6.3-1a closure-audit HIGH; mirrors the `BlockingTransportFixture`
+/// whole-block `cfg` pattern). Whole-block gating keeps the probe entirely
+/// absent from release builds.
+///
+/// Forces a Rust panic INSIDE [`guarded`] so `tests/smoke_session.mjs` can
+/// assert end-to-end that a panic in a `#[napi]` method surfaces as a `[panic]`
+/// JS error and does NOT abort the Node host — and that the session remains
+/// usable afterward (a bare panic here does not arm the engine `FaultGuard`, so
+/// it is recoverable, unlike a panic through `run_recalc`). This is the only way
+/// to exercise the boundary, since `cargo test` cannot link the napi runtime
+/// symbols standalone.
+#[cfg(debug_assertions)]
+#[napi]
+impl Session {
+    #[napi(js_name = "__forcePanicForTest", catch_unwind)]
+    pub fn force_panic_for_test(&self) -> Result<()> {
+        guarded("__forcePanicForTest", || -> Result<()> {
+            panic!("forced panic for the M1 panic-boundary smoke test");
         })
     }
 }

@@ -328,6 +328,12 @@ impl<'a> WorkbookRuntime<'a> {
     /// session-owning it is a later refinement.
     ///
     /// [`into_plan_cache`]: WorkbookRuntime::into_plan_cache
+    // The session lends several disjoint borrowed handles (op-log, graph,
+    // plan-cache, UDF worker, UDF-diagnostics, spill-footprint collector) — a
+    // constructor legitimately taking each is clearer than a bundling struct
+    // here. (Crossed the clippy 7-arg threshold when the H3 spill-footprint
+    // collector was added at 6.3-0.)
+    #[allow(clippy::too_many_arguments)]
     pub fn with_session_state(
         workbook: &'a mut Workbook,
         registry: &'a FunctionRegistry,

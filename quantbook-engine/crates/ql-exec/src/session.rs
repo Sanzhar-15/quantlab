@@ -1084,12 +1084,19 @@ impl WorkbookSession {
         })) {
             Ok(result) => result,
             Err(payload) => {
-                self.ops.insert(
-                    op,
-                    OperationState::Failed {
-                        error: EngineError::panic("recompute panicked"),
-                    },
-                );
+                // **6.3-1a closure-audit (Codex MEDIUM / Opus LOW):** a terminal op
+                // MUST also emit its terminal event — the normal `Completed` path
+                // does (tail of this fn), and `Event::OperationCompleted` means
+                // "operation reached a terminal state". Record `Failed` AND announce
+                // it before re-raising so an IDE polling `poll_events` for op
+                // terminalization sees this op resolve (not hang on `Running`). The
+                // structured panic message still reaches the caller via the napi
+                // boundary's `[panic]` error; here we only surface the terminal state.
+                let failed = OperationState::Failed {
+                    error: EngineError::panic("recompute panicked"),
+                };
+                self.ops.insert(op, failed.clone());
+                self.events.push(Event::OperationCompleted { op, state: failed });
                 std::panic::resume_unwind(payload);
             }
         };
@@ -5462,6 +5469,20 @@ mod tests {
             other => panic!("op must be Failed after a recompute panic, got {other:?}"),
         }
         assert_eq!(s.lifecycle_state(), LifecycleState::Faulted);
+        // The terminal event is emitted (6.3-1a closure-audit): an IDE polling
+        // events sees the op resolve to Failed, not hang on Running. poll_events
+        // is a pure read and stays legal on a Faulted session.
+        let page = s.poll_events(EventCursor(0)).unwrap();
+        assert!(
+            page.events.iter().any(|e| matches!(
+                e,
+                Event::OperationCompleted {
+                    op: o,
+                    state: OperationState::Failed { .. }
+                } if *o == OperationId(1)
+            )),
+            "a Failed OperationCompleted event must be emitted for the panicked op"
+        );
         let err = s
             .set_value(addr(sheet, 0, 0), CellValue::Number { number: 2.0 })
             .unwrap_err();
