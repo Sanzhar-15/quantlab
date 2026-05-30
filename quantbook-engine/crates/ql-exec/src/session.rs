@@ -1611,6 +1611,22 @@ impl EngineSession for WorkbookSession {
     }
 
     fn close(&mut self) -> EngineResult<()> {
+        // **M2 (6.3-1b) closure-audit HIGH (both lanes):** a recalc reserved by
+        // `start_recalc` but not yet `await`ed leaves `pending_recalc` set and the
+        // op `Running`. `close()` is always allowed (teardown), so without this a
+        // later `await_recalc(op)` would run the recompute and flip `Closed → Ready`
+        // — RESURRECTING a terminal session. Terminalize the stranded op as
+        // `Canceled` (with its terminal event, preserving the "terminal ops emit a
+        // terminal event" invariant) and clear the reservation, so close is
+        // self-consistent. (`await_recalc` also gates on the terminal state — defense
+        // in depth — but this keeps the op resolved rather than stranded `Running`.)
+        if let Some((op, _)) = self.pending_recalc.take() {
+            self.ops.insert(op, OperationState::Canceled);
+            self.events.push(Event::OperationCompleted {
+                op,
+                state: OperationState::Canceled,
+            });
+        }
         self.state = LifecycleState::Closed;
         // Drop any open transaction buffers — they can never commit on a
         // terminal session (their handles become `transaction_not_found`).
@@ -2451,6 +2467,21 @@ impl EngineSession for WorkbookSession {
     }
 
     fn await_recalc(&mut self, op: OperationId) -> EngineResult<()> {
+        // **M2 (6.3-1b) closure-audit HIGH (both lanes):** never resurrect a terminal
+        // session. If the session went `Closed`/`Faulted` after `start_recalc` (e.g.
+        // `close()` mid-window), drain any stranded reservation and reject — running
+        // the recompute here would flip the state back to `Ready`. (`close()` also
+        // terminalizes the op as `Canceled`; this guard is the second line of defense
+        // and the honest `invalid_state` for the caller.)
+        if matches!(
+            self.state,
+            LifecycleState::Closed | LifecycleState::Faulted
+        ) {
+            self.pending_recalc = None;
+            return Err(EngineError::invalid_state(
+                "await_recalc: session is terminal (Closed/Faulted); the reserved recalc is abandoned",
+            ));
+        }
         // Validate `op` is the in-flight recalc before consuming the reservation.
         match self.pending_recalc {
             None => {
@@ -5708,6 +5739,35 @@ mod tests {
         assert_eq!(
             s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
             Some(CellValue::Number { number: 10.0 })
+        );
+    }
+
+    /// **6.3-1b closure-audit HIGH (both lanes):** `close()` mid-window must NOT be
+    /// resurrectable. `start_recalc` then `close` then `await_recalc` must reject
+    /// (`invalid_state`), leave the session `Closed`, and resolve the stranded op as
+    /// `Canceled` (not run the recompute and flip back to `Ready`).
+    #[test]
+    fn close_during_recalc_window_cannot_be_resurrected_by_await() {
+        let (mut s, sheet) = dirty_dependent_session();
+        let op = s.start_recalc(RecalcKind::Dirty).unwrap();
+        s.close().unwrap();
+        assert_eq!(s.lifecycle_state(), LifecycleState::Closed);
+        // close() terminalized the stranded op as Canceled (not left Running).
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Canceled);
+        // await_recalc rejects on the terminal session and does NOT recompute.
+        let err = s.await_recalc(op).unwrap_err();
+        assert_eq!(err.code, "invalid_state");
+        assert_eq!(
+            s.lifecycle_state(),
+            LifecycleState::Closed,
+            "the session must stay Closed — never resurrected to Ready"
+        );
+        // A subsequent mutating command stays rejected (terminal is terminal).
+        assert_eq!(
+            s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 9.0 })
+                .unwrap_err()
+                .code,
+            "invalid_state"
         );
     }
 
