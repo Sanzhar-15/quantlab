@@ -62,6 +62,29 @@ const native = loadNative(cdylibPath);
 assert.ok(native.Session, "the native module must export the `Session` class");
 const { Session } = native;
 
+// --- M1 (6.3-1a) panic boundary: a Rust panic in a #[napi] method surfaces as a
+// structured [panic] JS error and does NOT abort the Node host. `__forcePanicForTest`
+// is a debug-only probe (absent from release cdylibs). After the caught panic the
+// host is still alive (this assert.throws returning at all proves it) and the
+// session — not faulted by a bare panic — remains usable.
+{
+  const probe = new Session();
+  if (typeof probe.__forcePanicForTest === "function") {
+    assert.throws(
+      () => probe.__forcePanicForTest(),
+      /\[panic\]/,
+      "a panic in a #[napi] method must surface a [panic] error, not abort the host",
+    );
+    // Host survived (we reached here) and the session is still usable.
+    const sid = probe.addSheet("AfterPanic", 1000);
+    assert.equal(typeof sid, "number", "session remains usable after a caught panic");
+    console.log("[smoke] M1 panic boundary: [panic] surfaced, host alive, session usable");
+  } else {
+    console.log("[smoke] M1 panic boundary: __forcePanicForTest absent (release cdylib) — skipped");
+  }
+  probe.close();
+}
+
 // --- edit → recalc → snapshot loop through the owning WorkbookSession ---------
 const s = new Session();
 

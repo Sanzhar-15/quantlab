@@ -4000,6 +4000,18 @@ mod tests {
         assert!(v.contains('.'));
     }
 
+    // **M1 (6.3-1a) panic boundary — tested END-TO-END in the Node host, not
+    // here.** `cargo test -p ql-bindings-node` cannot LINK a standalone test
+    // executable: the `napi_*` runtime symbols (e.g. `napi_delete_reference`,
+    // pulled by `napi::Error`'s `Drop`) are supplied by the Node process at
+    // dlopen time, not statically. So any unit test that constructs/drops a
+    // `napi::Error` (what `guarded` returns) fails to link. The boundary is
+    // instead proven by `tests/smoke_session.mjs` (`__forcePanicForTest` →
+    // asserts a `[panic]` JS error is thrown AND the host stays alive + the
+    // session remains usable), and the engine-side panic mechanics (FaultGuard +
+    // op terminalization) are covered by `ql-exec`'s
+    // `run_recalc_panic_terminalizes_op_and_faults_session`.
+
     #[test]
     fn collab_session_roundtrip_via_rust() {
         // Test the Rust side directly (no napi runtime here -- that
@@ -4115,6 +4127,46 @@ pub struct SheetInfoJson {
 /// is the leading bracketed token; the IDE branches on it.
 fn engine_error_to_napi(e: EngineError) -> Error {
     Error::from_reason(e.to_string())
+}
+
+/// **M1 (6.3-1a) — napi panic boundary.** Run a `Session` method body under
+/// `catch_unwind` and map a caught panic to a structured `[panic]` engine error.
+///
+/// napi-rs 3.x does NOT wrap entry points in `catch_unwind` by default, so a Rust
+/// panic in the engine (an `assert!`/`unwrap`/`expect`/`panic!` that input
+/// pre-validation didn't pre-empt) would otherwise unwind across the generated
+/// `extern "C"` trampoline and **abort the IDE host process**. This catches the
+/// unwind and returns `EngineError::panic(..)` → `[panic] <method>: <msg>`, so the
+/// host keeps running and the IDE sees a recognizable structured error.
+///
+/// Soundness of `AssertUnwindSafe`: during the unwind the session's own
+/// `FaultGuard` (in `ql-exec`) already sealed it `Faulted`, and the napi `Mutex`
+/// is `parking_lot` (no poisoning), so the lock is released and the next call
+/// observes a consistent (Faulted → `[invalid_state]`) session. We never resume
+/// normal logic on a half-updated value — we return an error. The
+/// `#[napi(catch_unwind)]` attribute on each method is a belt-and-suspenders
+/// backstop for panics in napi-rs's OWN argument marshalling (before this closure
+/// runs); THIS helper is what yields the structured `[panic]` code.
+fn guarded<R>(method: &str, f: impl FnOnce() -> Result<R>) -> Result<R> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => Err(engine_error_to_napi(EngineError::panic(format!(
+            "{method}: {}",
+            panic_payload_message(payload.as_ref())
+        )))),
+    }
+}
+
+/// Best-effort extraction of a panic's message from its `Box<dyn Any>` payload
+/// (the common `&'static str` / `String` cases; otherwise a placeholder).
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
 }
 
 /// Build a validated [`ql_session::CellAddr`] from raw JS Numbers. `sheet` is a
@@ -4860,7 +4912,7 @@ pub struct Session {
 #[napi]
 impl Session {
     /// Construct a fresh, empty in-memory session (lifecycle `Ready`).
-    #[napi(constructor)]
+    #[napi(constructor, catch_unwind)]
     #[allow(clippy::new_without_default)] // napi(constructor); Default would not be exposed to JS.
     pub fn new() -> Self {
         Self {
@@ -4868,35 +4920,56 @@ impl Session {
         }
     }
 
+    /// **M1 (6.3-1a) — test-only panic-boundary probe.** Compiled into DEBUG
+    /// cdylibs only (`#[cfg(debug_assertions)]`; absent from release builds).
+    /// Forces a Rust panic INSIDE [`guarded`] so `tests/smoke_session.mjs` can
+    /// assert end-to-end that a panic in a `#[napi]` method surfaces as a
+    /// `[panic]` JS error and does **not** abort the Node host — and that the
+    /// session remains usable afterward (a bare panic here does not arm the
+    /// engine `FaultGuard`, so it is recoverable, unlike a panic through
+    /// `run_recalc`). This is the only way to exercise the boundary, since
+    /// `cargo test` cannot link the napi runtime symbols standalone.
+    #[cfg(debug_assertions)]
+    #[napi(js_name = "__forcePanicForTest", catch_unwind)]
+    pub fn force_panic_for_test(&self) -> Result<()> {
+        guarded("__forcePanicForTest", || -> Result<()> {
+            panic!("forced panic for the M1 panic-boundary smoke test");
+        })
+    }
+
     /// Add a sheet; returns its assigned `SheetId` (u16 widened to u32).
     /// `chunkRows` is the per-sheet row partition size (must be ≥ 1; the engine
     /// rejects 0 to prevent a `ColumnStore` panic).
-    #[napi(js_name = "addSheet")]
+    #[napi(js_name = "addSheet", catch_unwind)]
     pub fn add_sheet(&self, name: String, chunk_rows: f64) -> Result<u32> {
-        let chunk_rows = validate_u32_index("addSheet", "chunkRows", chunk_rows)?;
-        if chunk_rows == 0 {
-            return Err(bad_argument_error(
-                "addSheet: chunkRows must be >= 1 (engine rejects chunk_rows == 0)".into(),
-            ));
-        }
-        let id = self
-            .inner
-            .lock()
-            .add_sheet(&name, chunk_rows)
-            .map_err(engine_error_to_napi)?;
-        Ok(u32::from(id))
+        guarded("addSheet", || {
+            let chunk_rows = validate_u32_index("addSheet", "chunkRows", chunk_rows)?;
+            if chunk_rows == 0 {
+                return Err(bad_argument_error(
+                    "addSheet: chunkRows must be >= 1 (engine rejects chunk_rows == 0)".into(),
+                ));
+            }
+            let id = self
+                .inner
+                .lock()
+                .add_sheet(&name, chunk_rows)
+                .map_err(engine_error_to_napi)?;
+            Ok(u32::from(id))
+        })
     }
 
     /// Set a cell's literal value (clears any formula). `value` is the
     /// discriminated-union [`CellValueJson`]; `blank` clears the value.
-    #[napi(js_name = "setValue")]
+    #[napi(js_name = "setValue", catch_unwind)]
     pub fn set_value(&self, sheet: f64, row: f64, col: f64, value: CellValueJson) -> Result<()> {
-        let addr = session_addr_from_f64("setValue", sheet, row, col)?;
-        let value = session_cell_value_from_json(value)?;
-        self.inner
-            .lock()
-            .set_value(addr, value)
-            .map_err(engine_error_to_napi)
+        guarded("setValue", || {
+            let addr = session_addr_from_f64("setValue", sheet, row, col)?;
+            let value = session_cell_value_from_json(value)?;
+            self.inner
+                .lock()
+                .set_value(addr, value)
+                .map_err(engine_error_to_napi)
+        })
     }
 
     /// Set a cell's formula. `text` is the formula BODY **without** a leading
@@ -4904,13 +4977,15 @@ impl Session {
     /// convention; the IDE strips the `=` client-side. The engine canonicalizes
     /// the text (e.g. `"A1+1"` → `"A1 + 1"`). Lex/parse/bind failures surface as
     /// a structured engine error (`[formula_parse]`/`[bad_argument]`-class).
-    #[napi(js_name = "setFormula")]
+    #[napi(js_name = "setFormula", catch_unwind)]
     pub fn set_formula(&self, sheet: f64, row: f64, col: f64, text: String) -> Result<()> {
-        let addr = session_addr_from_f64("setFormula", sheet, row, col)?;
-        self.inner
-            .lock()
-            .set_formula(addr, &text)
-            .map_err(engine_error_to_napi)
+        guarded("setFormula", || {
+            let addr = session_addr_from_f64("setFormula", sheet, row, col)?;
+            self.inner
+                .lock()
+                .set_formula(addr, &text)
+                .map_err(engine_error_to_napi)
+        })
     }
 
     /// Clear a cell's formula — **convert-to-literal**: removes the formula but
@@ -4918,65 +4993,77 @@ impl Session {
     /// contract; Excel "convert to value"). To also clear the value, call
     /// `setValue(.., { kind: "blank" })`. (A single "delete contents"
     /// value+formula command is a 6.1C contract decision — see handoff.)
-    #[napi(js_name = "clear")]
+    #[napi(js_name = "clear", catch_unwind)]
     pub fn clear(&self, sheet: f64, row: f64, col: f64) -> Result<()> {
-        let addr = session_addr_from_f64("clear", sheet, row, col)?;
-        self.inner.lock().clear(addr).map_err(engine_error_to_napi)
+        guarded("clear", || {
+            let addr = session_addr_from_f64("clear", sheet, row, col)?;
+            self.inner.lock().clear(addr).map_err(engine_error_to_napi)
+        })
     }
 
     /// Recompute the dirty set (incremental). Returns the operation id (u64 as
     /// BigInt). In v1 a recalc is synchronous; cancel is honored pre-start only.
-    #[napi(js_name = "recalcDirty")]
+    #[napi(js_name = "recalcDirty", catch_unwind)]
     pub fn recalc_dirty(&self) -> Result<BigInt> {
-        let op = self
-            .inner
-            .lock()
-            .recalc_dirty()
-            .map_err(engine_error_to_napi)?;
-        Ok(BigInt::from(op.0))
+        guarded("recalcDirty", || {
+            let op = self
+                .inner
+                .lock()
+                .recalc_dirty()
+                .map_err(engine_error_to_napi)?;
+            Ok(BigInt::from(op.0))
+        })
     }
 
     /// Recompute everything. Returns the operation id (u64 as BigInt).
-    #[napi(js_name = "recalcAll")]
+    #[napi(js_name = "recalcAll", catch_unwind)]
     pub fn recalc_all(&self) -> Result<BigInt> {
-        let op = self
-            .inner
-            .lock()
-            .recalc_all()
-            .map_err(engine_error_to_napi)?;
-        Ok(BigInt::from(op.0))
+        guarded("recalcAll", || {
+            let op = self
+                .inner
+                .lock()
+                .recalc_all()
+                .map_err(engine_error_to_napi)?;
+            Ok(BigInt::from(op.0))
+        })
     }
 
     /// Full workbook snapshot (carries the opaque `version` token as a `Buffer`).
-    #[napi(js_name = "snapshot")]
+    #[napi(js_name = "snapshot", catch_unwind)]
     pub fn snapshot(&self) -> Result<WorkbookSnapshotJson> {
-        let snap = self.inner.lock().snapshot().map_err(engine_error_to_napi)?;
-        Ok(workbook_snapshot_json_from_session(snap))
+        guarded("snapshot", || {
+            let snap = self.inner.lock().snapshot().map_err(engine_error_to_napi)?;
+            Ok(workbook_snapshot_json_from_session(snap))
+        })
     }
 
     /// Single-cell lookup. `null` if the cell is empty/absent.
-    #[napi(js_name = "cell")]
+    #[napi(js_name = "cell", catch_unwind)]
     pub fn cell(&self, sheet: f64, row: f64, col: f64) -> Result<Option<CellSnapshotJson>> {
-        let addr = session_addr_from_f64("cell", sheet, row, col)?;
-        let cell = self.inner.lock().cell(addr).map_err(engine_error_to_napi)?;
-        Ok(cell.map(cell_snapshot_json_from_session))
+        guarded("cell", || {
+            let addr = session_addr_from_f64("cell", sheet, row, col)?;
+            let cell = self.inner.lock().cell(addr).map_err(engine_error_to_napi)?;
+            Ok(cell.map(cell_snapshot_json_from_session))
+        })
     }
 
     /// List (non-tombstoned) sheets (id + name, no cells).
-    #[napi(js_name = "listSheets")]
+    #[napi(js_name = "listSheets", catch_unwind)]
     pub fn list_sheets(&self) -> Result<Vec<SheetInfoJson>> {
-        let sheets = self
-            .inner
-            .lock()
-            .list_sheets()
-            .map_err(engine_error_to_napi)?;
-        Ok(sheets
-            .into_iter()
-            .map(|s| SheetInfoJson {
-                id: u32::from(s.id),
-                name: s.name,
-            })
-            .collect())
+        guarded("listSheets", || {
+            let sheets = self
+                .inner
+                .lock()
+                .list_sheets()
+                .map_err(engine_error_to_napi)?;
+            Ok(sheets
+                .into_iter()
+                .map(|s| SheetInfoJson {
+                    id: u32::from(s.id),
+                    name: s.name,
+                })
+                .collect())
+        })
     }
 
     /// Deterministically release the underlying [`ql_exec::WorkbookSession`]
@@ -4991,9 +5078,11 @@ impl Session {
     /// workbooks in memory long after the IDE panel closes. Calling `close()`
     /// frees the engine state synchronously (engine `WorkbookSession::close`
     /// at `crates/ql-exec/src/session.rs`).
-    #[napi(js_name = "close")]
+    #[napi(js_name = "close", catch_unwind)]
     pub fn close(&self) -> Result<()> {
-        self.inner.lock().close().map_err(engine_error_to_napi)
+        guarded("close", || {
+            self.inner.lock().close().map_err(engine_error_to_napi)
+        })
     }
 
     // ============================================================================
@@ -5036,33 +5125,36 @@ impl Session {
     ///   exists.) Callers should still pass ASCII-uppercase canonical names; the
     ///   IDE is expected to uppercase before the call.
     /// - `[invalid_state]` — session is not Ready.
-    #[napi(js_name = "registerFunction")]
+    #[napi(js_name = "registerFunction", catch_unwind)]
     pub fn register_function(
         &self,
         metadata: FunctionMetadataJson,
         impl_handle: BigInt,
     ) -> Result<()> {
-        let meta = function_metadata_from_json(metadata)?;
-        // BigInt → u64: the napi-rs `BigInt::get_u64()` returns `(sign_bit,
-        // value, lossless)`. Reject negative (sign bit set) + lossy (anything
-        // above u64::MAX) loud per No-Fallbacks. Matches the `peerId` validation
-        // discipline at `CollabSession::new`.
-        let (sign_bit, raw, lossless) = impl_handle.get_u64();
-        if sign_bit {
-            return Err(bad_argument_error(
-                "registerFunction: implHandle must be a non-negative BigInt".into(),
-            ));
-        }
-        if !lossless {
-            return Err(bad_argument_error(
-                "registerFunction: implHandle exceeds u64::MAX (lossy conversion rejected)".into(),
-            ));
-        }
-        let handle = FunctionImplHandle(raw);
-        self.inner
-            .lock()
-            .register_function(meta, handle)
-            .map_err(engine_error_to_napi)
+        guarded("registerFunction", || {
+            let meta = function_metadata_from_json(metadata)?;
+            // BigInt → u64: the napi-rs `BigInt::get_u64()` returns `(sign_bit,
+            // value, lossless)`. Reject negative (sign bit set) + lossy (anything
+            // above u64::MAX) loud per No-Fallbacks. Matches the `peerId` validation
+            // discipline at `CollabSession::new`.
+            let (sign_bit, raw, lossless) = impl_handle.get_u64();
+            if sign_bit {
+                return Err(bad_argument_error(
+                    "registerFunction: implHandle must be a non-negative BigInt".into(),
+                ));
+            }
+            if !lossless {
+                return Err(bad_argument_error(
+                    "registerFunction: implHandle exceeds u64::MAX (lossy conversion rejected)"
+                        .into(),
+                ));
+            }
+            let handle = FunctionImplHandle(raw);
+            self.inner
+                .lock()
+                .register_function(meta, handle)
+                .map_err(engine_error_to_napi)
+        })
     }
 
     /// **6.4-2:** Unregister a UDF. Symmetric to [`Self::register_function`].
@@ -5079,12 +5171,14 @@ impl Session {
     ///   `Conflict / function_exists` class is the same as duplicate-register;
     ///   the message disambiguates (`"is a registered built-in"`).
     /// - `[invalid_state]` — session is not Ready.
-    #[napi(js_name = "unregisterFunction")]
+    #[napi(js_name = "unregisterFunction", catch_unwind)]
     pub fn unregister_function(&self, canonical_name: String) -> Result<()> {
-        self.inner
-            .lock()
-            .unregister_function(&canonical_name)
-            .map_err(engine_error_to_napi)
+        guarded("unregisterFunction", || {
+            self.inner
+                .lock()
+                .unregister_function(&canonical_name)
+                .map_err(engine_error_to_napi)
+        })
     }
 
     /// **6.4-2:** List every registered function (built-ins + UDFs) with full
@@ -5097,14 +5191,16 @@ impl Session {
     ///
     /// **Errors:** `[invalid_state]` if the session is Closed/New/Faulted
     /// (Busy is OK — this is a read).
-    #[napi(js_name = "listFunctions")]
+    #[napi(js_name = "listFunctions", catch_unwind)]
     pub fn list_functions(&self) -> Result<Vec<FunctionMetadataJson>> {
-        let metas = self
-            .inner
-            .lock()
-            .list_functions()
-            .map_err(engine_error_to_napi)?;
-        Ok(metas.into_iter().map(function_metadata_to_json).collect())
+        guarded("listFunctions", || {
+            let metas = self
+                .inner
+                .lock()
+                .list_functions()
+                .map_err(engine_error_to_napi)?;
+            Ok(metas.into_iter().map(function_metadata_to_json).collect())
+        })
     }
 
     /// **6.4-3d (2026-05-29):** attach an out-of-process Python-UDF worker to
@@ -5132,54 +5228,56 @@ impl Session {
     /// worker runs arbitrary workspace Python. The engine has no workspace
     /// concept, so the trust gate lives in the IDE (`worker_untrusted_workspace`
     /// is an IDE-side code, never emitted here).
-    #[napi(js_name = "setUdfWorker")]
+    #[napi(js_name = "setUdfWorker", catch_unwind)]
     pub fn set_udf_worker(&self, config: PythonWorkerConfigJson) -> Result<()> {
-        let mut cfg = ql_udf::PythonWorkerConfig::new(&config.python);
-        if let Some(module) = config.module {
-            cfg.module = module;
-        }
-        if let Some(paths) = config.pythonpath {
-            for p in paths {
-                cfg = cfg.with_pythonpath(p);
+        guarded("setUdfWorker", || {
+            let mut cfg = ql_udf::PythonWorkerConfig::new(&config.python);
+            if let Some(module) = config.module {
+                cfg.module = module;
             }
-        }
-        if let Some(udf_module) = config.udf_module {
-            cfg = cfg.with_udf_module(udf_module);
-        }
-        if let Some(ms) = config.handshake_timeout_ms {
-            // **6.4-3d audit-fix (LOW):** require a non-negative finite value AND
-            // cap it (10 min) so a huge `f64` cannot saturate `as u64` into an
-            // effectively-unbounded handshake wait. The inclusive-range
-            // `!contains` rejects NaN/Inf (neither is `>= 0.0`) as well as a
-            // negative or above-cap value in one expression. Fractional ms
-            // truncate (harmless).
-            // (6.4-3d Step 5: rewritten from the `ms < 0.0 || ms > MAX` form to
-            // satisfy clippy `manual_range_contains` under rust 1.95's stricter
-            // `deny(clippy::all)`; behavior-identical.)
-            const MAX_HANDSHAKE_MS: f64 = 600_000.0;
-            if !(0.0..=MAX_HANDSHAKE_MS).contains(&ms) {
-                return Err(bad_argument_error(format!(
+            if let Some(paths) = config.pythonpath {
+                for p in paths {
+                    cfg = cfg.with_pythonpath(p);
+                }
+            }
+            if let Some(udf_module) = config.udf_module {
+                cfg = cfg.with_udf_module(udf_module);
+            }
+            if let Some(ms) = config.handshake_timeout_ms {
+                // **6.4-3d audit-fix (LOW):** require a non-negative finite value AND
+                // cap it (10 min) so a huge `f64` cannot saturate `as u64` into an
+                // effectively-unbounded handshake wait. The inclusive-range
+                // `!contains` rejects NaN/Inf (neither is `>= 0.0`) as well as a
+                // negative or above-cap value in one expression. Fractional ms
+                // truncate (harmless).
+                // (6.4-3d Step 5: rewritten from the `ms < 0.0 || ms > MAX` form to
+                // satisfy clippy `manual_range_contains` under rust 1.95's stricter
+                // `deny(clippy::all)`; behavior-identical.)
+                const MAX_HANDSHAKE_MS: f64 = 600_000.0;
+                if !(0.0..=MAX_HANDSHAKE_MS).contains(&ms) {
+                    return Err(bad_argument_error(format!(
                     "setUdfWorker: handshakeTimeoutMs must be a finite number in [0, {MAX_HANDSHAKE_MS}] ms"
                 )));
+                }
+                cfg.handshake_timeout = std::time::Duration::from_millis(ms as u64);
             }
-            cfg.handshake_timeout = std::time::Duration::from_millis(ms as u64);
-        }
-        // Spawn + handshake EAGERLY (outside the session lock — the spawn is a
-        // process op) so a failure is reported here, not deferred to first call.
-        // **NOTE (audit MED, filed for IDE Step 5):** this is a SYNCHRONOUS napi
-        // method and blocks the calling JS thread for up to the handshake timeout
-        // — the IDE MUST call it off the UI/main thread.
-        let mut worker = ql_udf::ProcessWorker::new(cfg);
-        worker.ensure_started().map_err(udf_spawn_error_to_napi)?;
-        // **6.4-3d audit-fix (HIGH-3):** inject UNDER the lock via the
-        // lifecycle-gated setter — a Closed/Faulted/New/Busy session rejects with
-        // `[invalid_state]`/`[session_busy]` and the just-spawned `worker` drops
-        // here (its child killed + reaped), closing the inject-vs-close race.
-        self.inner
-            .lock()
-            .set_udf_worker_checked(Box::new(worker))
-            .map_err(engine_error_to_napi)?;
-        Ok(())
+            // Spawn + handshake EAGERLY (outside the session lock — the spawn is a
+            // process op) so a failure is reported here, not deferred to first call.
+            // **NOTE (audit MED, filed for IDE Step 5):** this is a SYNCHRONOUS napi
+            // method and blocks the calling JS thread for up to the handshake timeout
+            // — the IDE MUST call it off the UI/main thread.
+            let mut worker = ql_udf::ProcessWorker::new(cfg);
+            worker.ensure_started().map_err(udf_spawn_error_to_napi)?;
+            // **6.4-3d audit-fix (HIGH-3):** inject UNDER the lock via the
+            // lifecycle-gated setter — a Closed/Faulted/New/Busy session rejects with
+            // `[invalid_state]`/`[session_busy]` and the just-spawned `worker` drops
+            // here (its child killed + reaped), closing the inject-vs-close race.
+            self.inner
+                .lock()
+                .set_udf_worker_checked(Box::new(worker))
+                .map_err(engine_error_to_napi)?;
+            Ok(())
+        })
     }
 
     /// **6.4-3d Step 5 (2026-05-29):** drain a page of structured events from the
@@ -5199,28 +5297,30 @@ impl Session {
     /// session returns whatever was already buffered, never `[invalid_state]`.
     ///
     /// **Errors:** `[bad_argument]` if `cursor` is negative or exceeds `u64::MAX`.
-    #[napi(js_name = "pollEvents")]
+    #[napi(js_name = "pollEvents", catch_unwind)]
     pub fn poll_events(&self, cursor: BigInt) -> Result<EventPageJson> {
-        // BigInt → u64, mirroring the `registerFunction` implHandle discipline:
-        // reject a negative (sign bit) or lossy (> u64::MAX) cursor loud per
-        // No-Fallbacks rather than silently truncating to a wrong ring position.
-        let (sign_bit, raw, lossless) = cursor.get_u64();
-        if sign_bit {
-            return Err(bad_argument_error(
-                "pollEvents: cursor must be a non-negative BigInt".into(),
-            ));
-        }
-        if !lossless {
-            return Err(bad_argument_error(
-                "pollEvents: cursor exceeds u64::MAX (lossy conversion rejected)".into(),
-            ));
-        }
-        let page = self
-            .inner
-            .lock()
-            .poll_events(ql_session::session::EventCursor(raw))
-            .map_err(engine_error_to_napi)?;
-        Ok(event_page_json_from_session(page))
+        guarded("pollEvents", || {
+            // BigInt → u64, mirroring the `registerFunction` implHandle discipline:
+            // reject a negative (sign bit) or lossy (> u64::MAX) cursor loud per
+            // No-Fallbacks rather than silently truncating to a wrong ring position.
+            let (sign_bit, raw, lossless) = cursor.get_u64();
+            if sign_bit {
+                return Err(bad_argument_error(
+                    "pollEvents: cursor must be a non-negative BigInt".into(),
+                ));
+            }
+            if !lossless {
+                return Err(bad_argument_error(
+                    "pollEvents: cursor exceeds u64::MAX (lossy conversion rejected)".into(),
+                ));
+            }
+            let page = self
+                .inner
+                .lock()
+                .poll_events(ql_session::session::EventCursor(raw))
+                .map_err(engine_error_to_napi)?;
+            Ok(event_page_json_from_session(page))
+        })
     }
 }
 

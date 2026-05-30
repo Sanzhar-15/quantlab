@@ -1068,10 +1068,31 @@ impl WorkbookSession {
         // pass. Computed before `with_runtime` borrows `self`, then set on the
         // runtime so the per-cell recompute env carries it to the dispatch site.
         let op_deadline = self.udf_op_deadline_for_pass();
-        let result = self.with_runtime(|rt| {
-            rt.arm_udf_op_deadline(op_deadline);
-            f(rt)
-        });
+        // **L8 (6.3-1a):** terminalize the op on a recompute panic. `with_runtime`'s
+        // `FaultGuard` already seals the session `Faulted` as the stack unwinds out
+        // of it, but the op would otherwise stay stranded `Running` (the
+        // `Completed` insert below never runs). Catch the unwind, mark the op
+        // `Failed`, then `resume_unwind` so the napi boundary (M1) still surfaces a
+        // `[panic]` error and we never run normal post-processing on the now-Faulted
+        // session. `AssertUnwindSafe` is sound: `self.ops` is a plain map untouched
+        // by the panic, and we immediately re-raise rather than observe `self`.
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.with_runtime(|rt| {
+                rt.arm_udf_op_deadline(op_deadline);
+                f(rt)
+            })
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                self.ops.insert(
+                    op,
+                    OperationState::Failed {
+                        error: EngineError::panic("recompute panicked"),
+                    },
+                );
+                std::panic::resume_unwind(payload);
+            }
+        };
 
         if let Some(res) = &result {
             // F1: recompute commits via `put_computed_at` and appends NO ops, so
@@ -5408,6 +5429,43 @@ mod tests {
             Event::OperationCompleted { op: o, .. } if *o == op
         )));
         assert!(!page.dropped);
+    }
+
+    /// **L8 (6.3-1a):** a panic during recompute must terminalize the op as
+    /// `Failed` (NOT leave it stranded `Running`, since the `Completed` insert
+    /// never runs) AND seal the session `Faulted` (the existing `FaultGuard`),
+    /// with subsequent mutators rejected `[invalid_state]` — never a second
+    /// panic. Drives the private `run_recalc` with a panicking closure under
+    /// `catch_unwind` (the napi boundary's M1 `guarded` does the same in prod).
+    #[test]
+    fn run_recalc_panic_terminalizes_op_and_faults_session() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        // Silence the default panic hook so the deliberate panic does not spam
+        // the test output; restore it immediately after.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.run_recalc(|_rt| panic!("boom"))
+        }));
+        std::panic::set_hook(prev);
+        assert!(
+            caught.is_err(),
+            "the panic must propagate past run_recalc (resume_unwind)"
+        );
+        // The op `run_recalc` allocated (id 1 in a fresh session — no prior
+        // recalc, and edits do not allocate ops) is `Failed`, not `Running`.
+        match s.operation_status(OperationId(1)).unwrap() {
+            OperationState::Failed { .. } => {}
+            other => panic!("op must be Failed after a recompute panic, got {other:?}"),
+        }
+        assert_eq!(s.lifecycle_state(), LifecycleState::Faulted);
+        let err = s
+            .set_value(addr(sheet, 0, 0), CellValue::Number { number: 2.0 })
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_state");
     }
 
     #[test]
