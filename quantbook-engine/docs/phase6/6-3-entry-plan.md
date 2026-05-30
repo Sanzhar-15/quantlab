@@ -83,7 +83,7 @@ Binding 32 methods is not just method signatures; several DTOs + FFI-discipline 
 
 ## 5. Proposed sequencing (sub-increments, each Codex+Opus audited)
 
-> **6.3-0 — H3 spill change-log engine fix.** The only engine-internal change. Surface the spill footprint into the session change-log (touches `WorkbookRuntime`/`RecomputeResult` return signature). Audit, then `snapshot_delta` becomes correct + the live-grid cluster is safe to ship. *(H2 determinism already shipped.)*
+> **6.3-0 — H3 spill change-log engine fix. ✅ SHIPPED 2026-05-30** (HEAD `8bf20b41fe5` ← `46f4bf599c8`). `snapshot_delta` now reports the full dynamic-array spill footprint (grow / shrink→removed / dissolve), so the live-grid cluster is safe to ship. Implementation was SIMPLER than this sketch feared: **no `RecomputeResult`/`WorkbookRuntime` signature change** — `snapshot_delta` already resolves changed-vs-removed by reading current state, so only the touched COORDS are needed. Two prongs: recompute path records footprints into the existing `changed_cells`; direct mutations (`set_formula`/`set_value`/`clear`/`batch`) push to a per-edit `spill_footprint` `RefCell` collector lent by the session (mirroring the audited `udf_diagnostics` pattern), drained into `record_changes`. Parallel Codex(xhigh)+Opus closure audit caught 2 net-new HIGHs (both reachable, both reproduced): `recalc_all` dependency-driven shrink under-report + `recompute_dirty` cycle branch never dissolving a spill — both fixed (`8bf20b41fe5`) with regression tests. 10 snapshot_delta spill tests; ql-exec lib 795/0. *(H2 determinism already shipped.)*
 >
 > **6.3-1 — Binding-layer machinery + the error-code contract (cross-cutting, applies to ALL methods, BEFORE breadth).** (a) M1+L8 (`catch_unwind` + panic→`[panic]` Error + op-state RAII on every method); (b) M2 refactor (`start_recalc`/`await_recalc`); (c) M5 + the §4b DTO field-parity sweep + opaque-handle/buffer-ownership discipline; (d) **H1/L4 IDE allowlist FIRST (Codex MED — H1 blocks 6.3 entry, must precede any error-heavy method wiring into IDE paths)** — extend `QuantbookErrorCode` + the compile-enforced Record to the full snapshot/persistence/formula/transaction/version-token code families on `feat/visualise-v1`. Do ALL of this before binding 32 more methods so they inherit the boundary + the structured-error contract, not retrofit it.
 >
@@ -128,7 +128,7 @@ decision-lock §2.8 lists **WASM/Node/C/Python**, but today only Node is real (w
 
 ## 9. Definition of done (6.3 exit)
 
-- H3 shipped + audited; `snapshot_delta` reports the full spill footprint; the live-grid cluster ships against a correct delta path.
+- ✅ H3 shipped + audited (6.3-0, HEAD `8bf20b41fe5`); `snapshot_delta` reports the full spill footprint (grow/shrink/dissolve); the live-grid cluster can now ship against a correct delta path.
 - All 32 §2b methods bound over Node; IDE call-sites migrated to the owning `Session`; the 5 §2c methods surface honest Capability errors.
 - M1+L8 (panic boundary + op-state RAII) + M5 (schema_version) + the §4b DTO field-parity sweep shipped on every method; **M2 `start_recalc`/`await_recalc` refactor shipped** (the §3.3 cancellation acceptance item, not documented-around); M6 event-ring; H1 IDE allowlist closed (compile-enforced) BEFORE the error-heavy methods wired in; M7 ridden on persistence; L4 resolved.
 - The golden parity matrix runs green through **≥2 bindings (Node + the thin `quantbook-py` facade)** — incl. the deliberate-panic + error-code-stability rows — before the contract is declared frozen.
