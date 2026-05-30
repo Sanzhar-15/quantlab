@@ -354,6 +354,14 @@ never silent coercion (generalizes `.qbook snapshot_format_version` + the op wir
 threaded on the delta DTO. The remaining DTOs (`RangeResult`/`TableSpec`/`BatchResult`/`UndoRedoResult`/
 transaction) gain `schemaVersion` as they bind in 6.3-2.
 
+**6.3-2a — SHIPPED over napi (Node).** The read/lifecycle/format/validate cluster is bound on the
+owning `Session`: `lifecycleState` (§2.3 wire string), `validateFormula` (§3.2 — diagnostics-as-data,
+never throws on a bad formula), `queryRange` → `RangeResultJson` (§3.6 — columnar; carries
+`schemaVersion` forwarded from the engine DTO; `include_*` → loud `not_implemented_in_v1_core`),
+`markVolatilesDirty`, `setFormat` / `registerFormat` (§3.2 — `FormatIdJson` round-trips both
+directions). `TableSpec`/`BatchResult`/transaction DTOs ride later 6.3-2 sub-increments;
+`UndoRedoResult` rides 6.3-3.
+
 ### 4.2 Core DTOs (extracted from the proven `#[napi(object)]` structs; `+` = added/clarified)
 - **`CellValue`** (← `CellValueJson`, `lib.rs:580`): a **discriminated union** on `kind`
   (`number`/`boolean`/`text`/`error`/`blank`/`pending`), exactly one payload. Bindings narrow on `kind`.
