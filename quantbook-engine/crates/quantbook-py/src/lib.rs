@@ -1337,7 +1337,28 @@ fn operation_state_to_py<'py>(py: Python<'py>, s: &ql_session::OperationState) -
         }
         S::Failed { error } => {
             d.set_item("state", "failed")?;
-            d.set_item("error", format!("[{}] {}", error.code, error.message))?;
+            // MED-5 (6.3-5): `error` is a NESTED structured object
+            // {code, class, retryable, details?, source?} mirroring the napi
+            // `OperationErrorJson` / `operation_error_json_from_engine_error` and the
+            // IDE `OperationErrorJson` interface (was the legacy `[code] message`
+            // string -- the retired anti-pattern). `details`/`source` are OMITTED when
+            // absent so the dict matches napi's `Option<String>` -> undefined -> key
+            // dropped by `JSON.stringify` (byte-parity across bindings).
+            let ed = PyDict::new(py);
+            ed.set_item("code", &error.code)?;
+            ed.set_item("class", class_str(error.class))?;
+            ed.set_item("retryable", error.retryable)?;
+            if !error.details.is_empty() {
+                ed.set_item(
+                    "details",
+                    serde_json::to_string(&error.details)
+                        .unwrap_or_else(|err| format!("[details serialize failed: {err}]")),
+                )?;
+            }
+            if let Some(src) = &error.source {
+                ed.set_item("source", src)?;
+            }
+            d.set_item("error", ed)?;
         }
     }
     Ok(d)
