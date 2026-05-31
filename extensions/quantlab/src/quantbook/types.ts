@@ -1565,6 +1565,18 @@ export interface BatchResultJson {
 }
 
 /**
+ * **Phase 6.3-3 (2026-05-30)**: result of {@link SessionInstance.undo} /
+ * {@link SessionInstance.redo} (mirrors the engine `UndoRedoResult`). `consumed`
+ * is `false` when the stack was empty -- a normal outcome, NOT an error.
+ * `version` is the opaque post-step token; undo/redo clears the delta cache, so
+ * the next `snapshotDelta` against an older token full-rebuilds.
+ */
+export interface UndoRedoResultJson {
+	consumed: boolean;
+	version: Uint8Array;
+}
+
+/**
  * **6.4-2 (mirrored 6.3-2 hardening, 2026-05-30)**: JS-facing `Arity` -- a strict
  * tagged union on `kind`. `fixed` carries only `n`; `range` carries `min` and
  * optionally `max` (absent means unbounded); `variadic` carries no payload. Omit the
@@ -2062,6 +2074,33 @@ export interface SessionInstance {
 	 * `canonicalName` (6.4-2). `[invalid_state]` off a readable session.
 	 */
 	listFunctions(): FunctionMetadataJson[];
+
+	// --- Phase 6.3-3 (2026-05-30): live-grid + ops ---
+
+	/**
+	 * Incremental delta since `lastVersion` (the `version` from a prior
+	 * `snapshot`/`snapshotDelta`/`batch`/`undo`/`redo`). A first/stale/unrecognized
+	 * token is NOT an error -- the result has `fullRebuildRequired === true` with a
+	 * `fullRebuildReason`, and the caller reseeds via `snapshot()`. `[invalid_state]`
+	 * off a readable session.
+	 */
+	snapshotDelta(lastVersion: Uint8Array): WorkbookSnapshotDeltaJson;
+
+	/**
+	 * Undo the last committed step. An empty undo stack yields `consumed: false`
+	 * (NOT an error). Undo/redo clears the delta cache, so the next `snapshotDelta`
+	 * against an older token full-rebuilds. `[invalid_state]` off a Ready session.
+	 */
+	undo(): UndoRedoResultJson;
+
+	/** Redo the last undone step (symmetric to `undo`; empty stack -> `consumed: false`). `[invalid_state]` off a Ready session. */
+	redo(): UndoRedoResultJson;
+
+	/** Whether an undo step is available. */
+	canUndo(): boolean;
+
+	/** Whether a redo step is available. */
+	canRedo(): boolean;
 }
 
 export interface SessionConstructor {

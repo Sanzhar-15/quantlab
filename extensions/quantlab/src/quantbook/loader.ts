@@ -428,6 +428,12 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (6.1C/6.4-2 parity backfill)`);
 				}
 			}
+			// **Phase 6.3-3 (2026-05-30):** live-grid + ops -- delta + undo/redo.
+			for (const method of ['snapshotDelta', 'undo', 'redo', 'canUndo', 'canRedo']) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (6.3-3)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {
