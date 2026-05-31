@@ -35,6 +35,20 @@
 //! 6.2-1b endpoint set (cluster C structure/sheets + cluster D tables), all -> `{ ok }`:
 //! - `POST   /v1/sessions/:id/rename-sheet`, `delete-sheet`, `restore-sheet`, `move-sheet`, `set-name`
 //! - `POST   /v1/sessions/:id/create-table`, `rename-table`, `rename-column`, `resize-table`, `drop-table`
+//!
+//! 6.2-1c endpoint set (cluster E atomic/txn + reserved bulk + undo/delta + functions):
+//! - `POST   /v1/sessions/:id/batch`                -> BatchResult wire
+//! - `POST   /v1/sessions/:id/begin-transaction`    -> `{ txn }` (decimal string)
+//! - `POST   /v1/sessions/:id/txn-add`              -> `{ ok }`
+//! - `POST   /v1/sessions/:id/commit-transaction`   -> BatchResult wire
+//! - `POST   /v1/sessions/:id/rollback-transaction` -> `{ ok }`
+//! - `POST   /v1/sessions/:id/write-range`, `publish-dataset`, `bind-range`, `refresh-source`,
+//!   `materialize-query` -> 501 `[not_implemented_in_v1_core]` (reserved sec-3.5)
+//! - `POST   /v1/sessions/:id/undo`, `redo`         -> UndoRedoResult wire
+//! - `GET    /v1/sessions/:id/can-undo`, `can-redo` -> bare bool
+//! - `POST   /v1/sessions/:id/snapshot-delta`       -> WorkbookSnapshotDelta wire (consumes `version` hex)
+//! - `POST   /v1/sessions/:id/register-function`, `unregister-function` -> `{ ok }`
+//! - `GET    /v1/sessions/:id/functions`            -> FunctionMetadata wire array
 
 use bytes::Bytes;
 use http::{header, Response, StatusCode};
@@ -49,14 +63,19 @@ use crate::error::engine_error_to_problem;
 use crate::guarded::guarded;
 use crate::session_store::SessionStore;
 use crate::wire::{
-    self, cell_range_from_wire, cell_snapshot_to_wire, cell_value_from_wire, diagnostic_to_wire,
-    format_id_from_wire, range_result_to_wire, sheet_info_to_wire, table_spec_from_wire,
-    workbook_snapshot_to_wire, AddSheetBody, AddSheetResponse, CellBody, LifecycleResponse,
-    MoveSheetBody, NameBody, NewSessionResponse, PathBody, QueryRangeBody, RecalcResponse,
-    RegisterFormatBody, RenameColumnBody, RenameSheetBody, RenameTableBody, ResizeTableBody,
-    SetFormatBody, SetFormulaBody, SetNameBody, SetValueBody, SheetIdBody, TableSpecWire,
-    ValidateFormulaBody,
+    self, batch_result_to_wire, cell_range_from_wire, cell_snapshot_to_wire, cell_value_from_wire,
+    diagnostic_to_wire, format_id_from_wire, function_metadata_from_wire, function_metadata_to_wire,
+    range_result_to_wire, session_op_from_wire, sheet_info_to_wire, table_spec_from_wire,
+    undo_redo_result_to_wire, workbook_snapshot_delta_to_wire, workbook_snapshot_to_wire,
+    AddSheetBody, AddSheetResponse, BatchBody, BindRangeBody, CellBody, LifecycleResponse,
+    MaterializeQueryBody, MoveSheetBody, NameBody, NewSessionResponse, PathBody, PublishDatasetBody,
+    QueryRangeBody, RecalcResponse, RefreshSourceBody, RegisterFormatBody, RegisterFunctionBody,
+    RenameColumnBody, RenameSheetBody, RenameTableBody, ResizeTableBody, SetFormatBody,
+    SetFormulaBody, SetNameBody, SetValueBody, SheetIdBody, SnapshotDeltaBody, TableSpecWire,
+    TransactionResponse, TxnAddBody, TxnIdBody, UnregisterFunctionBody, ValidateFormulaBody,
+    WriteRangeBody,
 };
+use ql_session::session::{FunctionImplHandle, SessionOp, TransactionId};
 use ql_session::RangeQueryOptions;
 
 /// Acknowledgement for a void mutation (`set-value`/`set-formula`). Not part of
@@ -118,6 +137,41 @@ pub(crate) async fn handle(req: http::Request<Incoming>, store: SessionStore) ->
         ("POST", ["v1", "sessions", id, "rename-column"]) => rename_column(&store, id, body).await,
         ("POST", ["v1", "sessions", id, "resize-table"]) => resize_table(&store, id, body).await,
         ("POST", ["v1", "sessions", id, "drop-table"]) => drop_table(&store, id, body).await,
+        // ---- 6.2-1c cluster E (atomic groups / transactions) ----
+        ("POST", ["v1", "sessions", id, "batch"]) => batch(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "begin-transaction"]) => begin_transaction(&store, id),
+        ("POST", ["v1", "sessions", id, "txn-add"]) => txn_add(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "commit-transaction"]) => {
+            commit_transaction(&store, id, body).await
+        }
+        ("POST", ["v1", "sessions", id, "rollback-transaction"]) => {
+            rollback_transaction(&store, id, body).await
+        }
+        // ---- 6.2-1c reserved sec-3.5 bulk (always not_implemented_in_v1_core -> 501) ----
+        ("POST", ["v1", "sessions", id, "write-range"]) => write_range(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "publish-dataset"]) => {
+            publish_dataset(&store, id, body).await
+        }
+        ("POST", ["v1", "sessions", id, "bind-range"]) => bind_range(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "refresh-source"]) => refresh_source(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "materialize-query"]) => {
+            materialize_query(&store, id, body).await
+        }
+        // ---- 6.2-1c undo/redo ----
+        ("POST", ["v1", "sessions", id, "undo"]) => undo(&store, id),
+        ("POST", ["v1", "sessions", id, "redo"]) => redo(&store, id),
+        ("GET", ["v1", "sessions", id, "can-undo"]) => can_undo(&store, id),
+        ("GET", ["v1", "sessions", id, "can-redo"]) => can_redo(&store, id),
+        // ---- 6.2-1c snapshot-delta (first version-consuming endpoint) ----
+        ("POST", ["v1", "sessions", id, "snapshot-delta"]) => snapshot_delta(&store, id, body).await,
+        // ---- 6.2-1c functions ----
+        ("POST", ["v1", "sessions", id, "register-function"]) => {
+            register_function(&store, id, body).await
+        }
+        ("POST", ["v1", "sessions", id, "unregister-function"]) => {
+            unregister_function(&store, id, body).await
+        }
+        ("GET", ["v1", "sessions", id, "functions"]) => list_functions(&store, id),
         #[cfg(debug_assertions)]
         ("POST", ["v1", "sessions", id, "__force_panic"]) => force_panic(&store, id),
         _ => problem(&EngineError::new(
@@ -510,6 +564,224 @@ async fn drop_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     with_session(store, id, "dropTable", move |s| {
         s.drop_table(&b.name)?;
         Ok(AckResponse { ok: true })
+    })
+}
+
+// ---- 6.2-1c cluster E handlers (atomic groups / transactions) ----
+
+async fn batch(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: BatchBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "batch", move |s| {
+        let ops = b
+            .ops
+            .into_iter()
+            .map(session_op_from_wire)
+            .collect::<Result<Vec<SessionOp>, EngineError>>()?;
+        let options = ql_session::BatchOptions {
+            undo_label: b.options.undo_label,
+        };
+        Ok(batch_result_to_wire(s.batch(ops, options)?))
+    })
+}
+
+fn begin_transaction(store: &SessionStore, id: &str) -> Resp {
+    with_session(store, id, "beginTransaction", |s| {
+        Ok(TransactionResponse {
+            txn: s.begin_transaction()?.0,
+        })
+    })
+}
+
+async fn txn_add(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: TxnAddBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "txnAdd", move |s| {
+        let op = session_op_from_wire(b.op)?;
+        s.txn_add(TransactionId(b.txn), op)?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn commit_transaction(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: TxnIdBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "commitTransaction", move |s| {
+        Ok(batch_result_to_wire(s.commit_transaction(TransactionId(b.txn))?))
+    })
+}
+
+async fn rollback_transaction(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: TxnIdBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "rollbackTransaction", move |s| {
+        s.rollback_transaction(TransactionId(b.txn))?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+// ---- 6.2-1c reserved sec-3.5 bulk handlers ----
+//
+// These ALWAYS surface `not_implemented_in_v1_core` (Capability -> 501) in v1 --
+// the authoritative v1 signal. Each converts its inputs for type honesty (a bad
+// coord / cell value / enum surfaces `[bad_argument]` first, mirroring napi 6.3-2e)
+// then forwards to the engine stub, which returns Capability; the Ok arm is
+// unreachable in v1 and discarded with `.map(|_| ())`. A real impl (6.4/6.5) only
+// swaps the return type.
+
+async fn write_range(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: WriteRangeBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "writeRange", move |s| {
+        let range = cell_range_from_wire(b.range);
+        let values = b
+            .values
+            .into_iter()
+            .map(|row| row.into_iter().map(cell_value_from_wire).collect())
+            .collect::<Result<Vec<Vec<_>>, EngineError>>()?;
+        s.write_range(range, values).map(|_| ())?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn publish_dataset(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: PublishDatasetBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "publishDataset", move |s| {
+        let data = wire::parse_reserved_json_payload("publishDataset", &b.data)?;
+        let target = cell_range_from_wire(b.target);
+        s.publish_dataset(&b.name, data, target).map(|_| ())?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn bind_range(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: BindRangeBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "bindRange", move |s| {
+        let target = cell_range_from_wire(b.target);
+        s.bind_range(&b.binding_id, target).map(|_| ())?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn refresh_source(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: RefreshSourceBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "refreshSource", move |s| {
+        s.refresh_source(&b.source_id, b.revision).map(|_| ())?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn materialize_query(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: MaterializeQueryBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "materializeQuery", move |s| {
+        let data = wire::parse_reserved_json_payload("materializeQuery", &b.data)?;
+        let target = cell_range_from_wire(b.target);
+        s.materialize_query(&b.query_id, target, data).map(|_| ())?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+// ---- 6.2-1c undo/redo handlers ----
+
+fn undo(store: &SessionStore, id: &str) -> Resp {
+    with_session(store, id, "undo", |s| Ok(undo_redo_result_to_wire(s.undo()?)))
+}
+
+fn redo(store: &SessionStore, id: &str) -> Resp {
+    with_session(store, id, "redo", |s| Ok(undo_redo_result_to_wire(s.redo()?)))
+}
+
+/// `canUndo`/`canRedo` are pure bool reads (the engine method does not return a
+/// `Result`); `guarded` only provides the panic boundary. The response body is a
+/// bare JSON `true`/`false` (matching the napi bool return).
+fn can_undo(store: &SessionStore, id: &str) -> Resp {
+    with_session(store, id, "canUndo", |s| {
+        Ok::<bool, EngineError>(s.can_undo())
+    })
+}
+
+fn can_redo(store: &SessionStore, id: &str) -> Resp {
+    with_session(store, id, "canRedo", |s| {
+        Ok::<bool, EngineError>(s.can_redo())
+    })
+}
+
+// ---- 6.2-1c snapshot-delta handler (first version-consuming endpoint) ----
+
+/// `snapshot-delta` is the FIRST endpoint to CONSUME a `version` token: the request
+/// body carries the caller's opaque token as hex, which [`wire::hex_decode`] turns
+/// back into a [`ql_session::SessionVersion`] (an odd-length / non-hex token is a
+/// loud `invalid_version_token` -> 400, BEFORE the engine call). An empty/stale/
+/// epoch-mismatched (but well-formed) token is NOT an error -- the engine returns a
+/// `fullRebuildRequired` delta with the designed reason.
+async fn snapshot_delta(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: SnapshotDeltaBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let bytes = match wire::hex_decode(&b.version) {
+        Ok(v) => v,
+        Err(e) => return problem(&e),
+    };
+    with_session(store, id, "snapshotDelta", move |s| {
+        let last = ql_session::SessionVersion(bytes);
+        Ok(workbook_snapshot_delta_to_wire(s.snapshot_delta(&last)?))
+    })
+}
+
+// ---- 6.2-1c functions handlers ----
+
+async fn register_function(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: RegisterFunctionBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "registerFunction", move |s| {
+        let meta = function_metadata_from_wire(b.metadata)?;
+        s.register_function(meta, FunctionImplHandle(b.impl_handle))?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn unregister_function(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: UnregisterFunctionBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "unregisterFunction", move |s| {
+        s.unregister_function(&b.canonical_name)?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+fn list_functions(store: &SessionStore, id: &str) -> Resp {
+    with_session(store, id, "listFunctions", |s| {
+        Ok(s.list_functions()?
+            .into_iter()
+            .map(function_metadata_to_wire)
+            .collect::<Vec<_>>())
     })
 }
 

@@ -811,6 +811,653 @@ pub struct NameBody {
     pub name: String,
 }
 
+// ============================================================================
+// Phase 6.2-1c -- cluster E (atomic/txn + reserved bulk) + undo/redo +
+// snapshotDelta + functions DTOs.
+// ============================================================================
+
+// ---- session ops (mirror napi SessionOpJson; the batch/txn op union) ----
+
+/// Mirror of napi `SessionOpJson`: one buffered mutation in a `batch`/transaction,
+/// a `kind`-tagged STRICT union over the 4-variant [`ql_session::session::SessionOp`].
+/// Exactly one payload per `kind`: `setValue`->`value`, `setFormula`->`text`,
+/// `setFormat`->`format`, `clear`->none. `sheet`/`row`/`col` are concrete ints
+/// (serde rejects non-integer/out-of-range loudly, faithful to napi's validation).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionOpWire {
+    pub kind: String,
+    pub sheet: u16,
+    pub row: u32,
+    pub col: u32,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub value: Option<CellValueWire>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub format: Option<FormatIdWire>,
+}
+
+/// Map a [`SessionOpWire`] to a [`ql_session::session::SessionOp`] (mirror napi
+/// `session_op_from_json`). STRICT tagged union: each `kind` admits ONLY its own
+/// payload; an extraneous-for-kind field or a missing required payload is a loud
+/// `[bad_argument]` (No-Fallbacks). Reuses [`cell_value_from_wire`]/
+/// [`format_id_from_wire`]/[`addr`].
+pub fn session_op_from_wire(op: SessionOpWire) -> Result<ql_session::session::SessionOp, EngineError> {
+    use ql_session::session::SessionOp;
+    let SessionOpWire {
+        kind,
+        sheet,
+        row,
+        col,
+        value,
+        text,
+        format,
+    } = op;
+    let addr = addr(sheet, row, col);
+    let reject_extra = |present: bool, field: &str, kind: &str| -> Result<(), EngineError> {
+        if present {
+            return Err(EngineError::bad_argument(format!(
+                "SessionOp kind '{kind}' must not carry a '{field}' field"
+            )));
+        }
+        Ok(())
+    };
+    match kind.as_str() {
+        "setValue" => {
+            reject_extra(text.is_some(), "text", "setValue")?;
+            reject_extra(format.is_some(), "format", "setValue")?;
+            let value = value.ok_or_else(|| {
+                EngineError::bad_argument("SessionOp kind 'setValue' requires a 'value' field")
+            })?;
+            Ok(SessionOp::SetValue {
+                addr,
+                value: cell_value_from_wire(value)?,
+            })
+        }
+        "setFormula" => {
+            reject_extra(value.is_some(), "value", "setFormula")?;
+            reject_extra(format.is_some(), "format", "setFormula")?;
+            let text = text.ok_or_else(|| {
+                EngineError::bad_argument("SessionOp kind 'setFormula' requires a 'text' field")
+            })?;
+            Ok(SessionOp::SetFormula { addr, text })
+        }
+        "clear" => {
+            reject_extra(value.is_some(), "value", "clear")?;
+            reject_extra(text.is_some(), "text", "clear")?;
+            reject_extra(format.is_some(), "format", "clear")?;
+            Ok(SessionOp::Clear { addr })
+        }
+        "setFormat" => {
+            reject_extra(value.is_some(), "value", "setFormat")?;
+            reject_extra(text.is_some(), "text", "setFormat")?;
+            let format = format.ok_or_else(|| {
+                EngineError::bad_argument("SessionOp kind 'setFormat' requires a 'format' field")
+            })?;
+            Ok(SessionOp::SetFormat {
+                addr,
+                format: format_id_from_wire(format)?,
+            })
+        }
+        other => Err(EngineError::bad_argument(format!(
+            "unknown SessionOp kind '{other}' (expected setValue|setFormula|clear|setFormat)"
+        ))),
+    }
+}
+
+/// `batch` options (mirror napi `BatchOptionsJson`). `undoLabel` is optional.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchOptionsWire {
+    #[serde(default)]
+    pub undo_label: Option<String>,
+}
+
+/// Result of `batch`/`commitTransaction` (mirror napi `BatchResultJson`). `applied`
+/// is the op count (integer); `version` is the opaque post-batch token as hex.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchResultWire {
+    pub applied: u32,
+    pub version: String,
+}
+
+/// Map a [`ql_session::BatchResult`] to [`BatchResultWire`] (version -> hex).
+pub fn batch_result_to_wire(r: ql_session::BatchResult) -> BatchResultWire {
+    BatchResultWire {
+        applied: r.applied,
+        version: hex_encode(&r.version.0),
+    }
+}
+
+/// `beginTransaction` reply: the opaque transaction id as a decimal string (the
+/// frozen u64 convention; napi crosses it as a `BigInt`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionResponse {
+    #[serde(with = "u64_dec")]
+    pub txn: u64,
+}
+
+/// `txn-add` body: the transaction id (decimal string) + the op to stage.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TxnAddBody {
+    #[serde(with = "u64_dec")]
+    pub txn: u64,
+    pub op: SessionOpWire,
+}
+
+/// `commit-transaction`/`rollback-transaction` body: the transaction id.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TxnIdBody {
+    #[serde(with = "u64_dec")]
+    pub txn: u64,
+}
+
+/// `batch` body: the ops + options.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchBody {
+    pub ops: Vec<SessionOpWire>,
+    pub options: BatchOptionsWire,
+}
+
+// ---- undo/redo (mirror napi UndoRedoResultJson) ----
+
+/// Result of `undo`/`redo` (mirror napi `UndoRedoResultJson`). `consumed: false`
+/// means the stack was empty (a normal outcome, NOT an error); `version` is the
+/// opaque post-step token as hex.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoRedoResultWire {
+    pub consumed: bool,
+    pub version: String,
+}
+
+/// Map a [`ql_session::UndoRedoResult`] to [`UndoRedoResultWire`] (version -> hex).
+pub fn undo_redo_result_to_wire(r: ql_session::UndoRedoResult) -> UndoRedoResultWire {
+    UndoRedoResultWire {
+        consumed: r.consumed,
+        version: hex_encode(&r.version.0),
+    }
+}
+
+// ---- snapshot-delta (mirror napi WorkbookSnapshotDeltaJson) ----
+
+/// A changed cell in a delta (mirror napi `ChangedCellJson`; sheet widened u16 -> u32).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangedCellWire {
+    pub sheet: u32,
+    pub cell: CellSnapshotWire,
+}
+
+/// A removed (cleared) cell in a delta (mirror napi `RemovedCellJson`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemovedCellWire {
+    pub sheet: u32,
+    pub row: u32,
+    pub col: u32,
+}
+
+/// Mirror of napi `WorkbookSnapshotDeltaJson` (the `snapshotDelta` return). Field
+/// order matches the napi DTO (`schemaVersion` last). `version` is the opaque token
+/// as hex; `fullRebuildReason` is a snake_case [`ql_session::FullRebuildReason`]
+/// string, present (`skip_serializing_if`) only alongside a required rebuild.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbookSnapshotDeltaWire {
+    pub changed_cells: Vec<ChangedCellWire>,
+    pub removed_cells: Vec<RemovedCellWire>,
+    pub sheets_changed: Vec<SheetSnapshotWire>,
+    pub sheets_removed: Vec<u32>,
+    pub formats_added: Vec<FormatDefWire>,
+    pub version: String,
+    pub full_rebuild_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub full_rebuild_reason: Option<String>,
+    pub schema_version: u16,
+}
+
+/// Stable snake_case wire string for a [`ql_session::FullRebuildReason`] (mirror
+/// napi `full_rebuild_reason_str`; matches the enum's `#[serde(rename_all = "snake_case")]`).
+pub fn full_rebuild_reason_str(r: ql_session::FullRebuildReason) -> &'static str {
+    match r {
+        ql_session::FullRebuildReason::NoPriorVersion => "no_prior_version",
+        ql_session::FullRebuildReason::CacheCleared => "cache_cleared",
+        ql_session::FullRebuildReason::StaleHorizon => "stale_horizon",
+        ql_session::FullRebuildReason::EpochMismatch => "epoch_mismatch",
+    }
+}
+
+/// Map a [`ql_session::WorkbookSnapshotDelta`] to [`WorkbookSnapshotDeltaWire`]
+/// (mirror napi `workbook_snapshot_delta_json_from_session`; reuses the cell/sheet/
+/// format snapshot mappers; forwards the engine delta's own `schema_version`).
+pub fn workbook_snapshot_delta_to_wire(
+    delta: ql_session::WorkbookSnapshotDelta,
+) -> WorkbookSnapshotDeltaWire {
+    WorkbookSnapshotDeltaWire {
+        changed_cells: delta
+            .changed_cells
+            .into_iter()
+            .map(|c| ChangedCellWire {
+                sheet: u32::from(c.sheet),
+                cell: cell_snapshot_to_wire(c.cell),
+            })
+            .collect(),
+        removed_cells: delta
+            .removed_cells
+            .into_iter()
+            .map(|r| RemovedCellWire {
+                sheet: u32::from(r.sheet),
+                row: r.row,
+                col: r.col,
+            })
+            .collect(),
+        sheets_changed: delta
+            .sheets_changed
+            .into_iter()
+            .map(sheet_snapshot_to_wire)
+            .collect(),
+        sheets_removed: delta.sheets_removed.into_iter().map(u32::from).collect(),
+        formats_added: delta
+            .formats_added
+            .into_iter()
+            .map(|fd| FormatDefWire {
+                id: format_id_to_wire(fd.id),
+                string: fd.string,
+            })
+            .collect(),
+        version: hex_encode(&delta.version.0),
+        full_rebuild_required: delta.full_rebuild_required,
+        full_rebuild_reason: delta
+            .full_rebuild_reason
+            .map(|r| full_rebuild_reason_str(r).to_string()),
+        schema_version: delta.schema_version,
+    }
+}
+
+/// `snapshot-delta` body: the caller's opaque `version` token (hex). This is the
+/// FIRST version-consuming endpoint; the hex is decoded via [`hex_decode`] into a
+/// [`ql_session::SessionVersion`] (an odd-length/non-hex token is a loud
+/// `invalid_version_token`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotDeltaBody {
+    pub version: String,
+}
+
+// ---- functions (mirror napi ArityJson + FunctionMetadataJson) ----
+
+/// Mirror of napi `ArityJson`: a strict tagged union on `kind`. `n`/`min`/`max` are
+/// concrete `u32` on the wire (serde rejects non-integer/out-of-range loudly -- no
+/// ECMAScript `ToUint32` coercion hole exists here, so the napi `f64`-then-validate
+/// dance is unneeded; the engine values are whole `u8`s, emitted as integers like
+/// [`FormatIdWire`] `builtin`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArityWire {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub min: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max: Option<u32>,
+}
+
+/// Map an [`ArityWire`] to a [`ql_session::Arity`] (mirror napi `arity_from_json`):
+/// strict tagged union (each `kind` admits ONLY its payload), `u8`-range checked,
+/// inverted range rejected. Errors are `[bad_argument]` (No-Fallbacks).
+pub fn arity_from_wire(a: ArityWire) -> Result<ql_session::Arity, EngineError> {
+    use ql_session::Arity;
+    let to_u8 = |label: &str, v: u32| -> Result<u8, EngineError> {
+        u8::try_from(v).map_err(|_| {
+            EngineError::bad_argument(format!("Arity '{label}': {v} exceeds u8 range (0..=255)"))
+        })
+    };
+    match a.kind.as_str() {
+        "fixed" => {
+            if a.min.is_some() || a.max.is_some() {
+                return Err(EngineError::bad_argument(
+                    "Arity kind 'fixed' must carry only 'n' (got 'min'/'max')",
+                ));
+            }
+            let n = a
+                .n
+                .ok_or_else(|| EngineError::bad_argument("Arity kind 'fixed' requires field 'n'"))?;
+            Ok(Arity::Fixed { n: to_u8("n", n)? })
+        }
+        "range" => {
+            if a.n.is_some() {
+                return Err(EngineError::bad_argument(
+                    "Arity kind 'range' must carry 'min'/'max', not 'n'",
+                ));
+            }
+            let min = a.min.ok_or_else(|| {
+                EngineError::bad_argument("Arity kind 'range' requires field 'min'")
+            })?;
+            let min = to_u8("min", min)?;
+            let max = a.max.map(|m| to_u8("max", m)).transpose()?;
+            if let Some(mx) = max {
+                if mx < min {
+                    return Err(EngineError::bad_argument(format!(
+                        "Arity 'range': max ({mx}) must be >= min ({min})"
+                    )));
+                }
+            }
+            Ok(Arity::Range { min, max })
+        }
+        "variadic" => {
+            if a.n.is_some() || a.min.is_some() || a.max.is_some() {
+                return Err(EngineError::bad_argument(
+                    "Arity kind 'variadic' must carry no payload (got 'n'/'min'/'max')",
+                ));
+            }
+            Ok(Arity::Variadic)
+        }
+        other => Err(EngineError::bad_argument(format!(
+            "Arity: unknown kind '{other}' (expected 'fixed'|'range'|'variadic')"
+        ))),
+    }
+}
+
+/// Map a [`ql_session::Arity`] to [`ArityWire`] (mirror napi `arity_to_json`).
+pub fn arity_to_wire(a: ql_session::Arity) -> ArityWire {
+    use ql_session::Arity;
+    match a {
+        Arity::Fixed { n } => ArityWire {
+            kind: "fixed".to_string(),
+            n: Some(u32::from(n)),
+            min: None,
+            max: None,
+        },
+        Arity::Range { min, max } => ArityWire {
+            kind: "range".to_string(),
+            n: None,
+            min: Some(u32::from(min)),
+            max: max.map(u32::from),
+        },
+        Arity::Variadic => ArityWire {
+            kind: "variadic".to_string(),
+            n: None,
+            min: None,
+            max: None,
+        },
+    }
+}
+
+/// Mirror of napi `FunctionMetadataJson`. The enum-valued fields are snake_case
+/// strings (validated on input). `aliases`/`provenanceTags` are REQUIRED (no serde
+/// default) so an omitted list is a loud deserialize error, matching napi's
+/// reject-missing semantics; the `Arity` is the only nested union.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FunctionMetadataWire {
+    pub canonical_name: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub display_name: Option<String>,
+    pub aliases: Vec<String>,
+    pub arity: ArityWire,
+    pub volatility: String,
+    pub determinism: bool,
+    pub dep_shape: String,
+    pub batch_shape: String,
+    pub arg_policy: String,
+    pub cancellation: String,
+    pub arg_context: String,
+    pub provenance_tags: Vec<String>,
+}
+
+fn volatility_from_str(s: &str) -> Result<ql_session::Volatility, EngineError> {
+    use ql_session::Volatility;
+    match s {
+        "pure" => Ok(Volatility::Pure),
+        "volatile" => Ok(Volatility::Volatile),
+        "dynamic" => Ok(Volatility::Dynamic),
+        other => Err(EngineError::bad_argument(format!(
+            "unknown volatility '{other}' (expected 'pure'|'volatile'|'dynamic')"
+        ))),
+    }
+}
+
+fn volatility_to_str(v: ql_session::Volatility) -> &'static str {
+    use ql_session::Volatility;
+    match v {
+        Volatility::Pure => "pure",
+        Volatility::Volatile => "volatile",
+        Volatility::Dynamic => "dynamic",
+    }
+}
+
+fn dep_shape_from_str(s: &str) -> Result<ql_session::DepShape, EngineError> {
+    use ql_session::DepShape;
+    match s {
+        "value_deps" => Ok(DepShape::ValueDeps),
+        "address_only" => Ok(DepShape::AddressOnly),
+        "lazy_shape" => Ok(DepShape::LazyShape),
+        "custom" => Ok(DepShape::Custom),
+        other => Err(EngineError::bad_argument(format!(
+            "unknown dep_shape '{other}' (expected 'value_deps'|'address_only'|'lazy_shape'|'custom')"
+        ))),
+    }
+}
+
+fn dep_shape_to_str(d: ql_session::DepShape) -> &'static str {
+    use ql_session::DepShape;
+    match d {
+        DepShape::ValueDeps => "value_deps",
+        DepShape::AddressOnly => "address_only",
+        DepShape::LazyShape => "lazy_shape",
+        DepShape::Custom => "custom",
+    }
+}
+
+fn batch_shape_from_str(s: &str) -> Result<ql_session::BatchShape, EngineError> {
+    use ql_session::BatchShape;
+    match s {
+        "scalar" => Ok(BatchShape::Scalar),
+        "array_batch" => Ok(BatchShape::ArrayBatch),
+        other => Err(EngineError::bad_argument(format!(
+            "unknown batch_shape '{other}' (expected 'scalar'|'array_batch')"
+        ))),
+    }
+}
+
+fn batch_shape_to_str(b: ql_session::BatchShape) -> &'static str {
+    use ql_session::BatchShape;
+    match b {
+        BatchShape::Scalar => "scalar",
+        BatchShape::ArrayBatch => "array_batch",
+    }
+}
+
+fn arg_policy_from_str(s: &str) -> Result<ql_session::ArgPolicy, EngineError> {
+    use ql_session::ArgPolicy;
+    match s {
+        "strict" => Ok(ArgPolicy::Strict),
+        "coercing" => Ok(ArgPolicy::Coercing),
+        other => Err(EngineError::bad_argument(format!(
+            "unknown arg_policy '{other}' (expected 'strict'|'coercing')"
+        ))),
+    }
+}
+
+fn arg_policy_to_str(a: ql_session::ArgPolicy) -> &'static str {
+    use ql_session::ArgPolicy;
+    match a {
+        ArgPolicy::Strict => "strict",
+        ArgPolicy::Coercing => "coercing",
+    }
+}
+
+fn cancellation_from_str(s: &str) -> Result<ql_session::CancelPolicy, EngineError> {
+    use ql_session::CancelPolicy;
+    match s {
+        "cooperative" => Ok(CancelPolicy::Cooperative),
+        "worker_kill" => Ok(CancelPolicy::WorkerKill),
+        "non_cancelable" => Ok(CancelPolicy::NonCancelable),
+        other => Err(EngineError::bad_argument(format!(
+            "unknown cancellation '{other}' (expected 'cooperative'|'worker_kill'|'non_cancelable')"
+        ))),
+    }
+}
+
+fn cancellation_to_str(c: ql_session::CancelPolicy) -> &'static str {
+    use ql_session::CancelPolicy;
+    match c {
+        CancelPolicy::Cooperative => "cooperative",
+        CancelPolicy::WorkerKill => "worker_kill",
+        CancelPolicy::NonCancelable => "non_cancelable",
+    }
+}
+
+fn arg_context_from_str(s: &str) -> Result<ql_session::function_meta::ArgContext, EngineError> {
+    use ql_session::function_meta::ArgContext;
+    match s {
+        "scalar" => Ok(ArgContext::Scalar),
+        "aggregate" => Ok(ArgContext::Aggregate),
+        "reference" => Ok(ArgContext::Reference),
+        other => Err(EngineError::bad_argument(format!(
+            "unknown arg_context '{other}' (expected 'scalar'|'aggregate'|'reference')"
+        ))),
+    }
+}
+
+fn arg_context_to_str(a: ql_session::function_meta::ArgContext) -> &'static str {
+    use ql_session::function_meta::ArgContext;
+    match a {
+        ArgContext::Scalar => "scalar",
+        ArgContext::Aggregate => "aggregate",
+        ArgContext::Reference => "reference",
+    }
+}
+
+/// Map a [`FunctionMetadataWire`] to a [`ql_session::FunctionMetadata`] (mirror napi
+/// `function_metadata_from_json`): validates every enum string; unknown strings are
+/// loud `[bad_argument]`. The required string-lists are already enforced by serde
+/// (no default), so an empty list here means the caller supplied it explicitly.
+pub fn function_metadata_from_wire(
+    m: FunctionMetadataWire,
+) -> Result<ql_session::FunctionMetadata, EngineError> {
+    Ok(ql_session::FunctionMetadata {
+        canonical_name: m.canonical_name,
+        display_name: m.display_name,
+        aliases: m.aliases,
+        arity: arity_from_wire(m.arity)?,
+        volatility: volatility_from_str(&m.volatility)?,
+        determinism: m.determinism,
+        dep_shape: dep_shape_from_str(&m.dep_shape)?,
+        batch_shape: batch_shape_from_str(&m.batch_shape)?,
+        arg_policy: arg_policy_from_str(&m.arg_policy)?,
+        cancellation: cancellation_from_str(&m.cancellation)?,
+        arg_context: arg_context_from_str(&m.arg_context)?,
+        provenance_tags: m.provenance_tags,
+    })
+}
+
+/// Map a [`ql_session::FunctionMetadata`] to [`FunctionMetadataWire`] (mirror napi
+/// `function_metadata_to_json`; total -- every Rust value maps to a string).
+pub fn function_metadata_to_wire(
+    m: ql_session::FunctionMetadata,
+) -> FunctionMetadataWire {
+    FunctionMetadataWire {
+        canonical_name: m.canonical_name,
+        display_name: m.display_name,
+        aliases: m.aliases,
+        arity: arity_to_wire(m.arity),
+        volatility: volatility_to_str(m.volatility).to_string(),
+        determinism: m.determinism,
+        dep_shape: dep_shape_to_str(m.dep_shape).to_string(),
+        batch_shape: batch_shape_to_str(m.batch_shape).to_string(),
+        arg_policy: arg_policy_to_str(m.arg_policy).to_string(),
+        cancellation: cancellation_to_str(m.cancellation).to_string(),
+        arg_context: arg_context_to_str(m.arg_context).to_string(),
+        provenance_tags: m.provenance_tags,
+    }
+}
+
+/// `register-function` body: the metadata + the opaque `implHandle` (u64 decimal
+/// string; napi crosses it as a `BigInt`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterFunctionBody {
+    pub metadata: FunctionMetadataWire,
+    #[serde(with = "u64_dec")]
+    pub impl_handle: u64,
+}
+
+/// `unregister-function` body: the canonical (ASCII-uppercase) function name.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnregisterFunctionBody {
+    pub canonical_name: String,
+}
+
+// ---- reserved sec-3.5 bulk request bodies (always -> Capability/501) ----
+
+/// Parse a reserved-stub `data` payload (a JSON STRING carrying opaque JSON text;
+/// mirror of napi `parse_reserved_json_payload`). The frozen napi convention crosses
+/// opaque JSON as TEXT (the napi `serde-json` feature is off; same as the 6.3-1c
+/// `details` convention), so the service reproduces it: `data` is a string field, and
+/// malformed JSON text is a loud `[bad_argument]` (No-Fallbacks) BEFORE the engine
+/// call -- matching napi exactly rather than letting non-JSON text ride through to the
+/// `not_implemented_in_v1_core` 501.
+pub fn parse_reserved_json_payload(method: &str, data: &str) -> Result<serde_json::Value, EngineError> {
+    serde_json::from_str(data).map_err(|e| {
+        EngineError::bad_argument(format!("{method}: data must be valid JSON text ({e})"))
+    })
+}
+
+/// `write-range` body (reserved). A rectangular value matrix; always 501 in v1.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteRangeBody {
+    pub range: CellRangeWire,
+    pub values: Vec<Vec<CellValueWire>>,
+}
+
+/// `publish-dataset` body (reserved). `data` is opaque JSON TEXT (a string carrying
+/// JSON, mirroring napi). Always 501 in v1.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishDatasetBody {
+    pub name: String,
+    pub data: String,
+    pub target: CellRangeWire,
+}
+
+/// `bind-range` body (reserved). Always 501 in v1.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindRangeBody {
+    pub binding_id: String,
+    pub target: CellRangeWire,
+}
+
+/// `refresh-source` body (reserved). `revision` is a u64 decimal string. Always 501.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshSourceBody {
+    pub source_id: String,
+    #[serde(with = "u64_dec")]
+    pub revision: u64,
+}
+
+/// `materialize-query` body (reserved). `data` is opaque JSON TEXT (a string carrying
+/// JSON, mirroring napi). Always 501 in v1.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterializeQueryBody {
+    pub query_id: String,
+    pub target: CellRangeWire,
+    pub data: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,5 +1734,235 @@ mod tests {
         let j = r#"{"name":"T","sheet":0,"topRow":0,"topCol":0,"rows":1,"cols":1,
                     "hasHeader":false,"hasTotals":false}"#;
         assert!(serde_json::from_str::<TableSpecWire>(j).is_err());
+    }
+
+    // ---- 6.2-1c DTO tests ----
+
+    #[test]
+    fn session_op_wire_strict_union_and_maps() {
+        use ql_session::session::SessionOp;
+        // setValue requires `value`, rejects text/format.
+        let j = r#"{"kind":"setValue","sheet":1,"row":2,"col":3,
+                    "value":{"kind":"number","number":6}}"#;
+        let op: SessionOpWire = serde_json::from_str(j).unwrap();
+        assert!(matches!(
+            session_op_from_wire(op).unwrap(),
+            SessionOp::SetValue { .. }
+        ));
+        // clear admits no payload; an extraneous `value` is rejected loudly.
+        let bad = SessionOpWire {
+            kind: "clear".to_string(),
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: Some(CellValueWire {
+                kind: "number".to_string(),
+                number: Some(1.0),
+                boolean: None,
+                text: None,
+                error: None,
+            }),
+            text: None,
+            format: None,
+        };
+        assert!(session_op_from_wire(bad).is_err());
+        // setFormula requires `text`.
+        let missing = SessionOpWire {
+            kind: "setFormula".to_string(),
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: None,
+            text: None,
+            format: None,
+        };
+        assert!(session_op_from_wire(missing).is_err());
+        // unknown kind rejected.
+        let unknown = SessionOpWire {
+            kind: "frob".to_string(),
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: None,
+            text: None,
+            format: None,
+        };
+        assert!(session_op_from_wire(unknown).is_err());
+    }
+
+    #[test]
+    fn txn_and_batch_result_use_decimal_and_hex() {
+        // beginTransaction reply: u64 txn as a QUOTED decimal string.
+        assert_eq!(
+            serde_json::to_string(&TransactionResponse {
+                txn: 18_446_744_073_709_551_615
+            })
+            .unwrap(),
+            r#"{"txn":"18446744073709551615"}"#
+        );
+        // txn-add / commit bodies parse the decimal string back.
+        let b: TxnAddBody = serde_json::from_str(
+            r#"{"txn":"42","op":{"kind":"clear","sheet":0,"row":0,"col":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(b.txn, 42);
+        // BatchResult: applied is an INTEGER, version is lowercase hex.
+        let w = batch_result_to_wire(ql_session::BatchResult {
+            applied: 3,
+            version: ql_session::SessionVersion(vec![0xde, 0xad]),
+        });
+        assert_eq!(
+            serde_json::to_string(&w).unwrap(),
+            r#"{"applied":3,"version":"dead"}"#
+        );
+    }
+
+    #[test]
+    fn undo_redo_result_wire_shape() {
+        let w = undo_redo_result_to_wire(ql_session::UndoRedoResult {
+            consumed: false,
+            version: ql_session::SessionVersion(vec![0x01, 0x02]),
+        });
+        assert_eq!(
+            serde_json::to_string(&w).unwrap(),
+            r#"{"consumed":false,"version":"0102"}"#
+        );
+    }
+
+    #[test]
+    fn workbook_snapshot_delta_wire_camel_case_and_reason() {
+        // a full-rebuild delta carries the snake_case reason + empty arrays + hex version.
+        let delta = ql_session::WorkbookSnapshotDelta {
+            schema_version: 1,
+            changed_cells: Vec::new(),
+            removed_cells: Vec::new(),
+            sheets_changed: Vec::new(),
+            sheets_removed: Vec::new(),
+            formats_added: Vec::new(),
+            version: ql_session::SessionVersion(vec![0xab, 0xcd]),
+            full_rebuild_required: true,
+            full_rebuild_reason: Some(ql_session::FullRebuildReason::EpochMismatch),
+        };
+        let j = serde_json::to_string(&workbook_snapshot_delta_to_wire(delta)).unwrap();
+        assert!(j.contains(r#""fullRebuildRequired":true"#), "{j}");
+        assert!(j.contains(r#""fullRebuildReason":"epoch_mismatch""#), "{j}");
+        assert!(j.contains(r#""version":"abcd""#), "{j}");
+        assert!(j.contains(r#""schemaVersion":1"#), "{j}");
+        assert!(j.contains(r#""changedCells":[]"#), "{j}");
+        // a non-rebuild delta OMITS fullRebuildReason (skip_serializing_if).
+        let delta2 = ql_session::WorkbookSnapshotDelta {
+            schema_version: 1,
+            changed_cells: Vec::new(),
+            removed_cells: Vec::new(),
+            sheets_changed: Vec::new(),
+            sheets_removed: Vec::new(),
+            formats_added: Vec::new(),
+            version: ql_session::SessionVersion(vec![0x00]),
+            full_rebuild_required: false,
+            full_rebuild_reason: None,
+        };
+        let j2 = serde_json::to_string(&workbook_snapshot_delta_to_wire(delta2)).unwrap();
+        assert!(
+            !j2.contains("fullRebuildReason"),
+            "None reason must be omitted: {j2}"
+        );
+    }
+
+    #[test]
+    fn arity_wire_strict_union_and_integer_emit() {
+        use ql_session::Arity;
+        // fixed emits `n` as an INTEGER (not 7.0).
+        assert_eq!(
+            serde_json::to_string(&arity_to_wire(Arity::Fixed { n: 7 })).unwrap(),
+            r#"{"kind":"fixed","n":7}"#
+        );
+        // range with unbounded max omits `max`.
+        assert_eq!(
+            serde_json::to_string(&arity_to_wire(Arity::Range { min: 1, max: None })).unwrap(),
+            r#"{"kind":"range","min":1}"#
+        );
+        // strict: fixed rejects min/max.
+        assert!(arity_from_wire(ArityWire {
+            kind: "fixed".to_string(),
+            n: Some(2),
+            min: Some(1),
+            max: None,
+        })
+        .is_err());
+        // inverted range rejected.
+        assert!(arity_from_wire(ArityWire {
+            kind: "range".to_string(),
+            n: None,
+            min: Some(5),
+            max: Some(2),
+        })
+        .is_err());
+        // u8 overflow rejected.
+        assert!(arity_from_wire(ArityWire {
+            kind: "fixed".to_string(),
+            n: Some(256),
+            min: None,
+            max: None,
+        })
+        .is_err());
+        // variadic with payload rejected.
+        assert!(arity_from_wire(ArityWire {
+            kind: "variadic".to_string(),
+            n: Some(1),
+            min: None,
+            max: None,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn function_metadata_wire_round_trips() {
+        let j = r#"{"canonicalName":"MYUDF","displayName":"My UDF","aliases":["MU"],
+                    "arity":{"kind":"range","min":1,"max":3},"volatility":"pure",
+                    "determinism":true,"depShape":"value_deps","batchShape":"scalar",
+                    "argPolicy":"strict","cancellation":"cooperative","argContext":"scalar",
+                    "provenanceTags":["udf"]}"#;
+        let w: FunctionMetadataWire = serde_json::from_str(j).unwrap();
+        let meta = function_metadata_from_wire(w).unwrap();
+        assert_eq!(meta.canonical_name, "MYUDF");
+        assert_eq!(meta.aliases, vec!["MU".to_string()]);
+        assert_eq!(meta.provenance_tags, vec!["udf".to_string()]);
+        assert!(matches!(meta.arity, ql_session::Arity::Range { min: 1, max: Some(3) }));
+        // round-trip back to wire preserves the snake_case enum strings.
+        let back = serde_json::to_string(&function_metadata_to_wire(meta)).unwrap();
+        assert!(back.contains(r#""volatility":"pure""#), "{back}");
+        assert!(back.contains(r#""depShape":"value_deps""#), "{back}");
+        assert!(back.contains(r#""argContext":"scalar""#), "{back}");
+    }
+
+    #[test]
+    fn function_metadata_wire_requires_lists_and_rejects_bad_enum() {
+        // omitting aliases is a loud deserialize error (no serde default).
+        let missing = r#"{"canonicalName":"F","arity":{"kind":"variadic"},"volatility":"pure",
+                    "determinism":true,"depShape":"value_deps","batchShape":"scalar",
+                    "argPolicy":"strict","cancellation":"cooperative","argContext":"scalar",
+                    "provenanceTags":[]}"#;
+        assert!(serde_json::from_str::<FunctionMetadataWire>(missing).is_err());
+        // an unknown enum string is a loud bad_argument at conversion.
+        let bad_enum = FunctionMetadataWire {
+            canonical_name: "F".to_string(),
+            display_name: None,
+            aliases: Vec::new(),
+            arity: ArityWire {
+                kind: "variadic".to_string(),
+                n: None,
+                min: None,
+                max: None,
+            },
+            volatility: "bogus".to_string(),
+            determinism: true,
+            dep_shape: "value_deps".to_string(),
+            batch_shape: "scalar".to_string(),
+            arg_policy: "strict".to_string(),
+            cancellation: "cooperative".to_string(),
+            arg_context: "scalar".to_string(),
+            provenance_tags: Vec::new(),
+        };
+        assert!(function_metadata_from_wire(bad_enum).is_err());
     }
 }

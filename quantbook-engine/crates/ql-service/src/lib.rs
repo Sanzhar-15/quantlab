@@ -16,10 +16,13 @@
 //! **Shipped so far:** 6.2-0 (crate foundation + golden-flow endpoint set proving
 //! SVC-6-01: open/edit/recalc/snapshot over HTTP on `hyper`); 6.2-1a (cluster A
 //! read/format/validate/query and cluster B persistence); 6.2-1b (cluster C
-//! structure/sheets and cluster D tables). Remaining: 6.2-1c (atomic/txn,
-//! reserved bulk, undo/delta, functions); SSE event streaming (SVC-6-02); op-id
-//! cancellation (SVC-6-03); auth hooks, protocol versioning, and lifecycle/TTL
-//! hardening (SVC-6-04 / 6.2-3); the golden-parity third row (6.2-4).
+//! structure/sheets and cluster D tables); 6.2-1c (cluster E atomic/transactions,
+//! the reserved sec-3.5 bulk methods as `not_implemented_in_v1_core` Capability
+//! stubs, undo/redo, `snapshotDelta` -- the first `version`-consuming endpoint --
+//! and function register/unregister/list) -- which COMPLETES 6.2-1. Remaining:
+//! SSE event streaming (SVC-6-02); op-id cancellation (SVC-6-03); auth hooks,
+//! protocol versioning, and lifecycle/TTL hardening (SVC-6-04 / 6.2-3); the
+//! golden-parity third row (6.2-4).
 //!
 //! Transport: HTTP/1.1 on `hyper` 1.x (`http1::Builder::serve_connection`), one
 //! tokio task per connection, `hyper_util::rt::TokioIo` adapting the tokio
