@@ -49,17 +49,19 @@ function loadNative(cdylibPath) {
   return mod.exports;
 }
 
-// Recover the engine code from a thrown napi error. Two channels exist and the
-// PREFIX must be preferred over `.code`:
+// Recover the engine code from a thrown napi error. Two channels exist:
+//   - Engine-taxonomy errors (`throw_structured`) carry a real native `.code`
+//     (e.g. "sheet_name_duplicate") and a message with NO `[code]` prefix.
 //   - FFI arg-validation (`bad_argument_error`) throws a plain napi `Error` whose
 //     `.code` is napi's default Status ("GenericFailure") and whose real engine
 //     code lives in the `[bad_argument] ...` MESSAGE PREFIX.
-//   - Engine-taxonomy errors (`throw_structured`) carry a real native `.code`
-//     (e.g. "sheet_name_duplicate") and a message with NO `[code]` prefix.
-// So: take the `[code]` message prefix when present, else the native `.code`.
-// This converges on the same token the Python row emits (which always sets a
-// native `.code`), and matches the smoke's `throwsWithCode` dual-read intent.
+// **LOW-1 (6.3-5):** prefer the NATIVE `.code` FIRST, then fall back to the
+// `[code]`-message-prefix regex — matching the Python row's `_err_code` (which
+// reads the native `.code` first). The native `.code` is only meaningful for the
+// structured-throw path (a generic napi Status like "GenericFailure" is NOT a
+// stable engine code, so it is skipped and the prefix is used instead).
 function errCode(e) {
+  if (e && typeof e.code === "string" && e.code !== "GenericFailure") return e.code;
   if (e instanceof Error && e.message.startsWith("[")) {
     const end = e.message.indexOf("]");
     if (end > 0) return e.message.slice(1, end);
@@ -89,7 +91,15 @@ function run(native) {
   rec("add_sheet", { value: sh });
   s.setValue(sh, 0, 0, { kind: "number", number: 10 }); // A1 = 10
   s.setFormula(sh, 0, 1, "A1+1"); // B1 = A1+1
-  rec("recalc", { value: s.recalcDirty() != null ? "<opid>" : null });
+  // HIGH-A step 4 (6.3-5): the FIRST recalc op id is deterministically `1`
+  // (engine `next_op_id` starts at 1) across both fresh sessions, so it is a
+  // DETERMINISTIC, UNMASKED u64 witness. Post-fix BOTH bindings emit the decimal
+  // STRING "1" (napi BigInt → quoted decimal in stableStringify; pyo3 now returns
+  // a decimal string too); PRE-fix Python emitted the JSON number `1` → a
+  // divergence. The masked-`<opid>` form below keeps the original presence signal.
+  const firstRecalcOp = s.recalcDirty();
+  rec("recalc_op_id", { value: firstRecalcOp });
+  rec("recalc", { value: firstRecalcOp != null ? "<opid>" : null });
   rec("b1_value", { value: s.cell(sh, 0, 1).value });
 
   // --- snapshot ---
@@ -190,9 +200,15 @@ function run(native) {
   };
   s.registerFunction(meta, 1n);
   const fns = s.listFunctions();
+  // MED-4 (6.3-5): record the FULL metadata DTO of the registered "MYUDF" entry
+  // (every field listFunctions returns) so the parity comparator field-checks the
+  // whole FunctionMetadata cross-binding, not just presence + count. Keys are
+  // sorted by the comparator's canonical stringify.
+  const myudf = fns.find((f) => f.canonicalName === "MYUDF") ?? null;
   rec("register_udf", {
-    present: fns.some((f) => f.canonicalName === "MYUDF"),
+    present: myudf != null,
     total: fns.length,
+    metadata: myudf,
   });
 
   // --- events: poll from cursor 0 (>=1 event after the recalcs) ---

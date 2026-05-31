@@ -112,7 +112,14 @@ def run(qb) -> list:
     rec("add_sheet", value=sh)
     s.set_value(sh, 0, 0, {"kind": "number", "number": 10.0})  # A1 = 10
     s.set_formula(sh, 0, 1, "A1+1")  # B1 = A1+1
-    rec("recalc", value="<opid>" if s.recalc_dirty() is not None else None)
+    # HIGH-A step 4 (6.3-5): the FIRST recalc op id is deterministically "1"
+    # (engine next_op_id starts at 1) across both fresh sessions -> a
+    # DETERMINISTIC, UNMASKED u64 witness. Post-fix pyo3 recalc_dirty() returns the
+    # decimal STRING "1" (matching the napi BigInt -> quoted-decimal rendering);
+    # pre-fix it returned a Python int 1 (JSON number) -> a cross-binding mismatch.
+    first_recalc_op = s.recalc_dirty()
+    rec("recalc_op_id", value=first_recalc_op)
+    rec("recalc", value="<opid>" if first_recalc_op is not None else None)
     rec("b1_value", value=s.cell(sh, 0, 1)["value"])
 
     # --- snapshot ---
@@ -213,7 +220,11 @@ def run(qb) -> list:
     }
     s.register_function(meta, 1)
     fns = s.list_functions()
-    rec("register_udf", present=any(f["canonicalName"] == "MYUDF" for f in fns), total=len(fns))
+    # MED-4 (6.3-5): record the FULL metadata dict of the registered "MYUDF" entry
+    # (every field list_functions returns) so the parity comparator field-checks
+    # the whole FunctionMetadata cross-binding, not just presence + count.
+    myudf = next((f for f in fns if f["canonicalName"] == "MYUDF"), None)
+    rec("register_udf", present=myudf is not None, total=len(fns), metadata=myudf)
 
     # --- events: poll from cursor 0 (>=1 event after the recalcs) ---
     # Audit MED-2: pin the SORTED-UNIQUE event kinds (order-independent) so the

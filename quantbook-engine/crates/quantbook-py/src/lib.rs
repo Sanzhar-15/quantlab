@@ -236,13 +236,20 @@ fn session_addr(py: Python<'_>, method: &str, sheet: f64, row: f64, col: f64) ->
 // the napi `session_cell_value_from_json` / `session_op_from_json`.
 // ============================================================================
 
-/// Read an optional dict key as `f64`. Missing/None → `None`; a non-number → loud.
+/// Read an optional dict key as `f64`. **MED-1 (6.3-5):** a MISSING key → `None`
+/// (absent, OK); a key PRESENT with an explicit `None`/`null` value → loud
+/// `bad_argument` (a present-but-null field is malformed, matching napi's
+/// `Option<f64>` reject-null — napi-rs rejects an explicit `null` for an
+/// `Option<f64>` DTO field). A non-number → loud.
 fn opt_f64(py: Python<'_>, d: &Bound<'_, PyDict>, key: &str, ctx: &str) -> PyResult<Option<f64>> {
     match d.get_item(key)? {
         None => Ok(None),
         Some(v) => {
             if v.is_none() {
-                Ok(None)
+                Err(bad_argument(
+                    py,
+                    format!("{ctx}: field '{key}' must not be explicitly null (omit it instead)"),
+                ))
             } else {
                 Ok(Some(v.extract::<f64>().map_err(|_| {
                     bad_argument(py, format!("{ctx}: field '{key}' must be a number"))
@@ -389,7 +396,11 @@ fn format_id_to_py<'py>(py: Python<'py>, id: &ql_session::FormatId) -> PyResult<
         }
         ql_session::FormatId::Custom { peer, counter } => {
             d.set_item("kind", "custom")?;
-            d.set_item("customPeer", *peer)?;
+            // HIGH-A (6.3-5): u64 crosses as a DECIMAL STRING (the napi `customPeer`
+            // BigInt renders to a quoted decimal string in the golden harness's
+            // `stableStringify`); a Python int would render as a JSON number → a
+            // cross-binding MISMATCH. `counter` is a u32 (JS number), not a u64.
+            d.set_item("customPeer", peer.to_string())?;
             d.set_item("customCounter", *counter)?;
         }
     }
@@ -648,9 +659,16 @@ fn function_metadata_from_py(
         .map_err(|_| bad_argument(py, "metadata: 'arity' must be an object/dict"))?;
     let arity = arity_from_py(py, arity_dict)?;
 
+    // MED-1 (6.3-5): a MISSING key → None (OK); a PRESENT explicit-null →
+    // loud bad_argument (matches napi `Option<String>` reject-null).
     let display_name = match m.get_item("displayName")? {
         None => None,
-        Some(x) if x.is_none() => None,
+        Some(x) if x.is_none() => {
+            return Err(bad_argument(
+                py,
+                "metadata: 'displayName' must not be explicitly null (omit it instead)",
+            ))
+        }
         Some(x) => Some(x.extract::<String>().map_err(|_| bad_argument(py, "metadata: 'displayName' must be a string"))?),
     };
     let aliases = req_str_list(py, m, "aliases", "metadata")?;
@@ -787,11 +805,19 @@ pub struct Session {
 #[pymethods]
 impl Session {
     /// Construct a fresh, empty in-memory session (lifecycle `Ready`).
+    ///
+    /// **6.3-5 closure (HIGH-B):** routed through `guarded(py, ..)` like every other
+    /// facade method so a construction panic becomes the structured
+    /// `QuantbookError(code="panic", class="internal", ..)` instead of unwinding into
+    /// CPython as a bare `PanicException`. Construction is allocation-only and
+    /// realistically infallible; the guard makes the boundary uniform.
     #[new]
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(CoreWorkbookSession::new())),
-        }
+    fn new(py: Python<'_>) -> PyResult<Self> {
+        guarded(py, "constructor", || {
+            Ok(Self {
+                inner: Arc::new(Mutex::new(CoreWorkbookSession::new())),
+            })
+        })
     }
 
     /// Current lifecycle state wire string (`new|ready|busy|closed|faulted`).
@@ -902,19 +928,22 @@ impl Session {
         })
     }
 
-    /// Recompute the dirty set; returns the operation id (u64 as `int`).
-    fn recalc_dirty(&self, py: Python<'_>) -> PyResult<u64> {
+    /// Recompute the dirty set; returns the operation id (u64 as a DECIMAL STRING,
+    /// mirroring the napi `recalcDirty` BigInt → quoted-decimal harness rendering —
+    /// HIGH-A, 6.3-5).
+    fn recalc_dirty(&self, py: Python<'_>) -> PyResult<String> {
         guarded(py, "recalcDirty", || {
             let op = self.inner.lock().recalc_dirty().map_err(|e| engine_error_to_pyerr(py, &e))?;
-            Ok(op.0)
+            Ok(op.0.to_string())
         })
     }
 
-    /// Recompute everything; returns the operation id (u64 as `int`).
-    fn recalc_all(&self, py: Python<'_>) -> PyResult<u64> {
+    /// Recompute everything; returns the operation id (u64 as a DECIMAL STRING,
+    /// mirroring the napi `recalcAll` BigInt rendering — HIGH-A, 6.3-5).
+    fn recalc_all(&self, py: Python<'_>) -> PyResult<String> {
         guarded(py, "recalcAll", || {
             let op = self.inner.lock().recalc_all().map_err(|e| engine_error_to_pyerr(py, &e))?;
-            Ok(op.0)
+            Ok(op.0.to_string())
         })
     }
 
@@ -1224,9 +1253,13 @@ fn event_page_to_py<'py>(py: Python<'py>, page: &ql_session::session::EventPage)
         match e {
             Event::RecalcProgress { op, done, total } => {
                 ed.set_item("kind", "recalc_progress")?;
-                ed.set_item("op", op.0)?;
-                ed.set_item("done", *done)?;
-                ed.set_item("total", *total)?;
+                // HIGH-A (6.3-5): every u64 wire field crosses as a DECIMAL STRING
+                // to match the napi BigInt → quoted-decimal harness rendering
+                // (`op`/`done`/`total` are all `BigInt::from(...)` on the napi side —
+                // no count-vs-id special-casing).
+                ed.set_item("op", op.0.to_string())?;
+                ed.set_item("done", done.to_string())?;
+                ed.set_item("total", total.to_string())?;
             }
             Event::CellDiagnostic { diagnostic } => {
                 ed.set_item("kind", "cell_diagnostic")?;
@@ -1234,7 +1267,8 @@ fn event_page_to_py<'py>(py: Python<'py>, page: &ql_session::session::EventPage)
             }
             Event::OperationCompleted { op, state } => {
                 ed.set_item("kind", "operation_completed")?;
-                ed.set_item("op", op.0)?;
+                // HIGH-A (6.3-5): u64 op id crosses as a decimal string (napi BigInt).
+                ed.set_item("op", op.0.to_string())?;
                 ed.set_item("state", operation_state_to_py(py, state)?)?;
             }
             Event::Provenance { addr, source } => {
@@ -1254,7 +1288,10 @@ fn event_page_to_py<'py>(py: Python<'py>, page: &ql_session::session::EventPage)
         events.append(ed)?;
     }
     d.set_item("events", events)?;
-    d.set_item("nextCursor", page.next_cursor.0)?;
+    // HIGH-A (6.3-5): nextCursor is a u64 → decimal string (napi `BigInt::from`).
+    // (The matrix MASKS nextCursor by value, but the WIRE TYPE must still be a
+    // string so the masked placeholder substitutes a string for a string.)
+    d.set_item("nextCursor", page.next_cursor.0.to_string())?;
     d.set_item("dropped", page.dropped)?;
     Ok(d)
 }

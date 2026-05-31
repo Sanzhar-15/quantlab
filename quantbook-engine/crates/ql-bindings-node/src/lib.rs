@@ -4582,6 +4582,12 @@ fn session_table_spec_from_json(method: &str, spec: TableSpecJson) -> Result<ql_
     let top_col = validate_u32_index(method, "topCol", spec.top_col)?;
     let rows = validate_u32_index(method, "rows", spec.rows)?;
     let cols = validate_u32_index(method, "cols", spec.cols)?;
+    // **6.3-5 (MED-2):** `columnNames` is required — a MISSING field surfaces
+    // structured `[bad_argument]` (like the pyo3 `req_str_list`), not a generic
+    // napi-deserialize `Status` error.
+    let column_names = spec.column_names.ok_or_else(|| {
+        bad_argument_error(format!("{method}: spec requires a 'columnNames' field"))
+    })?;
     Ok(ql_session::TableSpec {
         name: spec.name,
         sheet,
@@ -4591,7 +4597,7 @@ fn session_table_spec_from_json(method: &str, spec: TableSpecJson) -> Result<ql_
         cols,
         has_header: spec.has_header,
         has_totals: spec.has_totals,
-        column_names: spec.column_names,
+        column_names,
     })
 }
 
@@ -4910,11 +4916,20 @@ pub struct ArityJson {
 /// - `arg_context`: `"scalar" | "aggregate" | "reference"`.
 ///
 /// Unknown strings on JS→Rust input fail loud with `[bad_argument]`.
+///
+/// **6.3-5 (MED-2):** `aliases` / `provenanceTags` are modeled as
+/// `Option<Vec<String>>` (not bare `Vec<String>`) so a MISSING field surfaces the
+/// project's structured `[bad_argument]` (via the explicit presence check in
+/// `function_metadata_from_json`) rather than a generic napi-rs deserialize
+/// `Status` error — matching the pyo3 `req_str_list` reject-missing behavior. An
+/// explicit `null` is also rejected (napi-rs treats a present `null` as `None`,
+/// indistinguishable from missing — both fail loud). On the OUTPUT side
+/// (`function_metadata_to_json`) both are always emitted as a present array.
 #[napi(object)]
 pub struct FunctionMetadataJson {
     pub canonical_name: String,
     pub display_name: Option<String>,
-    pub aliases: Vec<String>,
+    pub aliases: Option<Vec<String>>,
     pub arity: ArityJson,
     pub volatility: String,
     pub determinism: bool,
@@ -4923,7 +4938,7 @@ pub struct FunctionMetadataJson {
     pub arg_policy: String,
     pub cancellation: String,
     pub arg_context: String,
-    pub provenance_tags: Vec<String>,
+    pub provenance_tags: Option<Vec<String>>,
 }
 
 /// **6.4-3d (2026-05-29):** config for the out-of-process Python-UDF worker the
@@ -4982,13 +4997,30 @@ pub struct DiagnosticJson {
     pub message: String,
 }
 
+/// **6.3-5 (MED-5):** JS-facing structured operation error — the NESTED object
+/// carried by [`OperationStateJson::error`] when `state == "failed"`. Mirrors the
+/// contract-§5.1 [`ql_session::error::EngineError`] shape (the same fields
+/// `throw_structured` sets on a thrown native error): `code`/`class`/`retryable`
+/// always present; `details` (a JSON string, like the main error channel) +
+/// `source` present only when non-empty. This RETIRES the `[code] message` string
+/// anti-pattern the main error channel already dropped (6.3-1c) — a Failed op now
+/// carries the same structured shape, not a code-prefixed display string.
+#[napi(object)]
+pub struct OperationErrorJson {
+    pub code: String,
+    pub class: String,
+    pub retryable: bool,
+    pub details: Option<String>,
+    pub source: Option<String>,
+}
+
 /// JS-facing operation state (mirrors [`ql_session::OperationState`]).
 /// `state` is `"running"` | `"completed"` | `"canceled"` | `"failed"`; `error`
-/// carries the `[code] message` display ONLY when `state == "failed"`.
+/// carries the structured [`OperationErrorJson`] ONLY when `state == "failed"`.
 #[napi(object)]
 pub struct OperationStateJson {
     pub state: String,
-    pub error: Option<String>,
+    pub error: Option<OperationErrorJson>,
 }
 
 /// **Phase 6.3-2a (2026-05-30):** JS-facing rectangular range (mirrors
@@ -5013,6 +5045,12 @@ pub struct CellRangeJson {
 /// counts (the engine requires both `> 0` — a `0` reaches the engine and surfaces
 /// `[table_create_rejected]`, not a boundary `[bad_argument]`). `columnNames`
 /// length must match `cols`. The name is canonicalized (uppercase) by the engine.
+///
+/// **6.3-5 (MED-2):** `columnNames` is `Option<Vec<String>>` (not bare
+/// `Vec<String>`) so a MISSING field surfaces the project's structured
+/// `[bad_argument]` (via the explicit presence check in
+/// `session_table_spec_from_json`) rather than a generic napi-rs deserialize
+/// `Status` error — matching the pyo3 `req_str_list` reject-missing behavior.
 #[napi(object)]
 pub struct TableSpecJson {
     pub name: String,
@@ -5023,7 +5061,7 @@ pub struct TableSpecJson {
     pub cols: f64,
     pub has_header: bool,
     pub has_totals: bool,
-    pub column_names: Vec<String>,
+    pub column_names: Option<Vec<String>>,
 }
 
 /// **Phase 6.3-2e (2026-05-30):** one op in a `batch`/transaction (a `kind`-tagged
@@ -5166,9 +5204,10 @@ fn diagnostic_json_from_session(d: ql_session::Diagnostic) -> DiagnosticJson {
     }
 }
 
-/// Map an [`ql_session::OperationState`] to its JS DTO. The `Failed` error is
-/// rendered via the `[code] message` `Display` (the same wire convention the
-/// napi error helpers use) so the IDE can `parseQuantbookError` it.
+/// Map an [`ql_session::OperationState`] to its JS DTO. **6.3-5 (MED-5):** the
+/// `Failed` error is rendered as a NESTED structured [`OperationErrorJson`]
+/// `{code, class, retryable, details?, source?}` (same field extraction as
+/// `throw_structured`), NOT the retired `[code] message` display string.
 fn operation_state_json_from_session(s: ql_session::OperationState) -> OperationStateJson {
     use ql_session::OperationState;
     match s {
@@ -5186,8 +5225,34 @@ fn operation_state_json_from_session(s: ql_session::OperationState) -> Operation
         },
         OperationState::Failed { error } => OperationStateJson {
             state: "failed".to_string(),
-            error: Some(error.to_string()),
+            error: Some(operation_error_json_from_engine_error(&error)),
         },
+    }
+}
+
+/// **6.3-5 (MED-5):** extract the contract-§5.1 structured fields from an
+/// [`EngineError`] into an [`OperationErrorJson`] — the same `code`/`class`/
+/// `retryable`/`details`(JSON string)/`source` projection `throw_structured`
+/// uses for the main error channel. `details` is emitted only when non-empty
+/// (matching the main channel + the IDE's optional `details`).
+fn operation_error_json_from_engine_error(e: &EngineError) -> OperationErrorJson {
+    let details = if e.details.is_empty() {
+        None
+    } else {
+        // serde_json::to_string of a BTreeMap<String, Value> only fails on a
+        // non-serializable value (not possible here); fall back to None-free
+        // visibility by stringifying the serde error so it is never silently lost.
+        Some(
+            serde_json::to_string(&e.details)
+                .unwrap_or_else(|err| format!("[details serialize failed: {err}]")),
+        )
+    };
+    OperationErrorJson {
+        code: e.code.clone(),
+        class: class_str(e.class).to_string(),
+        retryable: e.retryable,
+        details,
+        source: e.source.clone(),
     }
 }
 
@@ -5499,10 +5564,20 @@ fn arg_context_to_str(a: ql_session::function_meta::ArgContext) -> &'static str 
 fn function_metadata_from_json(
     m: FunctionMetadataJson,
 ) -> Result<ql_session::function_meta::FunctionMetadata> {
+    // **6.3-5 (MED-2):** the required string-list fields are `Option` so a MISSING
+    // one surfaces structured `[bad_argument]` (like the pyo3 `req_str_list`),
+    // not a generic napi-deserialize `Status` error. An empty list is fine
+    // (caller supplied it explicitly).
+    let aliases = m.aliases.ok_or_else(|| {
+        bad_argument_error("registerFunction: metadata requires an 'aliases' field".into())
+    })?;
+    let provenance_tags = m.provenance_tags.ok_or_else(|| {
+        bad_argument_error("registerFunction: metadata requires a 'provenanceTags' field".into())
+    })?;
     Ok(ql_session::function_meta::FunctionMetadata {
         canonical_name: m.canonical_name,
         display_name: m.display_name,
-        aliases: m.aliases,
+        aliases,
         arity: arity_from_json(m.arity)?,
         volatility: volatility_from_str(&m.volatility)?,
         determinism: m.determinism,
@@ -5511,7 +5586,7 @@ fn function_metadata_from_json(
         arg_policy: arg_policy_from_str(&m.arg_policy)?,
         cancellation: cancellation_from_str(&m.cancellation)?,
         arg_context: arg_context_from_str(&m.arg_context)?,
-        provenance_tags: m.provenance_tags,
+        provenance_tags,
     })
 }
 
@@ -5523,7 +5598,9 @@ fn function_metadata_to_json(
     FunctionMetadataJson {
         canonical_name: m.canonical_name,
         display_name: m.display_name,
-        aliases: m.aliases,
+        // **6.3-5 (MED-2):** always emit the required lists as a present array
+        // (the field is `Option` only so a MISSING *input* fails loud).
+        aliases: Some(m.aliases),
         arity: arity_to_json(m.arity),
         volatility: volatility_to_str(m.volatility).to_string(),
         determinism: m.determinism,
@@ -5532,7 +5609,7 @@ fn function_metadata_to_json(
         arg_policy: arg_policy_to_str(m.arg_policy).to_string(),
         cancellation: cancellation_to_str(m.cancellation).to_string(),
         arg_context: arg_context_to_str(m.arg_context).to_string(),
-        provenance_tags: m.provenance_tags,
+        provenance_tags: Some(m.provenance_tags),
     }
 }
 
@@ -5558,12 +5635,19 @@ pub struct Session {
 #[napi]
 impl Session {
     /// Construct a fresh, empty in-memory session (lifecycle `Ready`).
+    ///
+    /// **6.3-5 closure (HIGH-B):** routed through `guarded` like every other bound
+    /// method so a panic in `CoreWorkbookSession::new()` surfaces as the structured
+    /// `[panic]` error (native `.code="panic"`/`.class="internal"`), not napi's
+    /// default. Construction is allocation-only and realistically infallible; the
+    /// guard makes the panic-boundary contract uniform across 100% of the surface.
     #[napi(constructor, catch_unwind)]
-    #[allow(clippy::new_without_default)] // napi(constructor); Default would not be exposed to JS.
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(CoreWorkbookSession::new())),
-        }
+    pub fn new(env: Env) -> Result<Self> {
+        guarded(env, "constructor", || {
+            Ok(Self {
+                inner: Arc::new(Mutex::new(CoreWorkbookSession::new())),
+            })
+        })
     }
 
     /// Add a sheet; returns its assigned `SheetId` (u16 widened to u32).

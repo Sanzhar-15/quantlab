@@ -40,6 +40,38 @@ PY_EMITTER = HERE / "golden_flow.py"
 # compared verbatim.
 MASK_KEYS = {"version", "nextCursor"}
 
+# MED-3 (6.3-5): the EXACT ordered step-name list both golden flows emit. The
+# anti-vacuity guard asserts each transcript's `step` sequence equals this list
+# VERBATIM (not just len >= N) so a silently-truncated, reordered, or renamed
+# emitter cannot slip a vacuous pass. Derived from `golden_flow.py`'s `rec(...)`/
+# `expect_err(...)` calls in order. Includes the HIGH-A `recalc_op_id` witness
+# (step 3) added in 6.3-5 -> 23 steps (was 22).
+EXPECTED_STEPS = [
+    "lifecycle_initial",
+    "add_sheet",
+    "recalc_op_id",
+    "recalc",
+    "b1_value",
+    "snapshot",
+    "delta_after_edit",
+    "delta_empty_token",
+    "table_sum",
+    "batch_applied",
+    "batch_d1",
+    "can_undo_before",
+    "undo",
+    "redo",
+    "persist_a1",
+    "register_udf",
+    "poll_events",
+    "panic",
+    "after_panic_lifecycle",
+    "err_dup_sheet",
+    "err_bad_kind",
+    "err_register_builtin",
+    "err_post_close",
+]
+
 
 def mask(node):
     """Recursively normalize a parsed transcript: blank out opaque token values."""
@@ -70,10 +102,21 @@ def run_emitter(argv, label):
     except json.JSONDecodeError as e:
         sys.stderr.write(f"--- {label} STDOUT ---\n{proc.stdout}\n")
         raise SystemExit(f"{label}: transcript is not valid JSON: {e}")
-    # Guard against a vacuous pass (an empty transcript from a silently-broken emitter).
-    if not isinstance(parsed, list) or len(parsed) < 10:
+    # MED-3 (6.3-5): guard against a vacuous/truncated/reordered pass by asserting
+    # the EXACT ordered step-name list (not just a length floor). A silently-broken
+    # emitter that drops, renames, or reorders steps now fails loud here.
+    if not isinstance(parsed, list):
         sys.stderr.write(f"--- {label} STDOUT ---\n{proc.stdout}\n")
-        raise SystemExit(f"{label}: transcript too short ({len(parsed) if isinstance(parsed, list) else 'not-a-list'}) -- refusing a vacuous pass")
+        raise SystemExit(f"{label}: transcript is not a list -- refusing a vacuous pass")
+    actual_steps = [row.get("step") if isinstance(row, dict) else None for row in parsed]
+    if actual_steps != EXPECTED_STEPS:
+        sys.stderr.write(f"--- {label} STDOUT ---\n{proc.stdout}\n")
+        sys.stderr.write(f"expected steps: {EXPECTED_STEPS}\n")
+        sys.stderr.write(f"actual steps:   {actual_steps}\n")
+        raise SystemExit(
+            f"{label}: step list does not match the canonical {len(EXPECTED_STEPS)}-step flow "
+            f"({len(actual_steps)} steps) -- refusing a vacuous/divergent pass"
+        )
     return parsed
 
 
