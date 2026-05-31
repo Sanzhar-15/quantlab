@@ -1478,14 +1478,32 @@ export interface DiagnosticJson {
 }
 
 /**
+ * **Phase 6.3-5 (MED-5, 2026-05-31)**: the structured error nested in
+ * {@link OperationStateJson.error} when `state === 'failed'`. Mirrors the engine
+ * `OperationErrorJson` (contract section 5.1 `EngineError` shape -- the same
+ * `code`/`class`/`retryable`/`details`/`source` the main error channel carries).
+ * This REPLACES the retired `[code] message` display string. `details` is a JSON
+ * string (parse with `JSON.parse` on demand); `details`/`source` are present only
+ * when the engine attached them.
+ */
+export interface OperationErrorJson {
+	readonly code: string;
+	readonly class: string;
+	readonly retryable: boolean;
+	readonly details?: string;
+	readonly source?: string;
+}
+
+/**
  * **Phase 6.4-3d Step 5 (2026-05-29)**: an operation's terminal/running state
  * carried by an `operation_completed` {@link EventJson}. Mirrors the engine
- * `OperationStateJson`. `error` is the `[code] message` display ONLY when
- * `state === 'failed'` (parse via {@link parseQuantbookError}).
+ * `OperationStateJson`. **Phase 6.3-5 (MED-5):** `error` is now a NESTED
+ * structured {@link OperationErrorJson} (not a `[code] message` string) and is
+ * present ONLY when `state === 'failed'`.
  */
 export interface OperationStateJson {
 	state: 'running' | 'completed' | 'canceled' | 'failed';
-	error?: string;
+	error?: OperationErrorJson;
 }
 
 /**
