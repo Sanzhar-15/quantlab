@@ -420,6 +420,14 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (6.3-2e)`);
 				}
 			}
+			// **Parity backfill (2026-05-30, megaudit X1/X2):** pre-existing bound
+			// methods (close = 6.1C M8; the UDF-registration surface = 6.4-2) that
+			// were missing from this presence list. A stale cdylib lacks these.
+			for (const method of ['close', 'registerFunction', 'unregisterFunction', 'listFunctions']) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (6.1C/6.4-2 parity backfill)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

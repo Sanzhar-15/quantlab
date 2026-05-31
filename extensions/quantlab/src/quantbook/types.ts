@@ -1565,6 +1565,44 @@ export interface BatchResultJson {
 }
 
 /**
+ * **6.4-2 (mirrored 6.3-2 hardening, 2026-05-30)**: JS-facing `Arity` -- a strict
+ * tagged union on `kind`. `fixed` carries only `n`; `range` carries `min` and
+ * optionally `max` (absent means unbounded); `variadic` carries no payload. Omit the
+ * unused fields (do not pass `null`). A mismatch/extraneous/out-of-range value
+ * throws `[bad_argument]` (engine-side `n`/`min`/`max` are validated as integers
+ * in u8 range).
+ */
+export interface ArityJson {
+	kind: 'fixed' | 'range' | 'variadic';
+	n?: number;
+	min?: number;
+	max?: number;
+}
+
+/**
+ * **6.4-2 (mirrored 6.3-2 hardening, 2026-05-30)**: JS-facing `FunctionMetadata`
+ * mirror (the {@link SessionInstance.registerFunction} / {@link SessionInstance.listFunctions}
+ * type). String-enum fields: `volatility` (`pure|volatile|dynamic`), `depShape`
+ * (`value_deps|address_only|lazy_shape|custom`), `batchShape` (`scalar|array_batch`),
+ * `argPolicy` (`strict|coercing`); `cancellation`/`argContext` are engine enums.
+ * `canonicalName` MUST be ASCII-uppercase (the IDE uppercases before the call).
+ */
+export interface FunctionMetadataJson {
+	canonicalName: string;
+	displayName?: string;
+	aliases: string[];
+	arity: ArityJson;
+	volatility: string;
+	determinism: boolean;
+	depShape: string;
+	batchShape: string;
+	argPolicy: string;
+	cancellation: string;
+	argContext: string;
+	provenanceTags: string[];
+}
+
+/**
  * **Phase 6.3-2a (2026-05-30)**: which extras a `queryRange` read includes
  * (mirrors the engine `RangeQueryOptionsJson`). In v1 every field MUST be
  * `false` -- the engine fail-loud rejects a `true` with
@@ -1660,15 +1698,18 @@ export interface SessionInstance {
 	addSheet(name: string, chunkRows: number): number;
 
 	/**
-	 * Set a cell's value. `kind:'blank'` clears the value. Unknown `kind`
-	 * throws `[bad_argument]` (No-Fallbacks).
+	 * Set a cell's value. `kind:'blank'` clears the value. A strict tagged union:
+	 * an unknown `kind` OR an extraneous-for-kind field (e.g. `{kind:'blank',
+	 * number:1}`) throws `[bad_argument]` (No-Fallbacks; 6.3-2 hardening M1).
 	 */
 	setValue(sheet: number, row: number, col: number, value: SessionCellValueInput): void;
 
 	/**
 	 * Set a cell's formula. `text` is the formula BODY with NO leading `=`
 	 * (engine/op-log convention; the engine canonicalizes e.g. `"A1+1"` ->
-	 * `"A1 + 1"`). Mirrors `CollabSession.appendPutFormula`.
+	 * `"A1 + 1"`). Mirrors `CollabSession.appendPutFormula`. A lex/parse failure
+	 * throws `[formula_parse]`; a bind failure (e.g. an unresolvable structured
+	 * reference) throws `[formula_bind]` (Compute class).
 	 */
 	setFormula(sheet: number, row: number, col: number, text: string): void;
 
@@ -1720,7 +1761,8 @@ export interface SessionInstance {
 	 * **Phase 6.3-1c (2026-05-30):** read an operation's state by id. This is how
 	 * the `startRecalc*` / `awaitRecalc` + `cancel` outcome is observed: after
 	 * `awaitRecalc(op)` the op is `completed` (or `canceled` if a cancel won the
-	 * window, or `failed` with the engine error string). Legal while `Busy`.
+	 * window, or `failed` with the engine error string). Legal in ALL lifecycle
+	 * states including terminal/Busy (a pure read, never gated).
 	 */
 	operationStatus(op: bigint): OperationStateJson;
 
@@ -1819,8 +1861,9 @@ export interface SessionInstance {
 	/**
 	 * Import a workbook from in-memory `bytes` in `format` -- v1 supports `'xlsx'`
 	 * (recomputed best-effort on import) and `'csv'` (no formulas). Any other format
-	 * throws `[bad_argument]`; malformed bytes throw `[persistence]`. Adopts the
-	 * imported workbook as a fresh session (epoch re-minted).
+	 * throws `[bad_argument]`; malformed bytes throw `[persistence]`; a well-formed
+	 * CSV over the row/col/cell limits throws `[csv_exceeds_limits]` (BadArgument).
+	 * Adopts the imported workbook as a fresh session (epoch re-minted).
 	 */
 	import(bytes: Uint8Array, format: string): void;
 
@@ -1858,7 +1901,7 @@ export interface SessionInstance {
 
 	/**
 	 * Restore a previously-tombstoned sheet by id. Unknown id throws `[sheet_not_found]`;
-	 * a still-live (not-tombstoned) sheet throws a conflict. `[invalid_state]` off a Ready session.
+	 * a still-live (not-tombstoned) sheet throws `[sheet_not_deleted]`. `[invalid_state]` off a Ready session.
 	 */
 	restoreSheet(id: number): void;
 
@@ -1930,7 +1973,9 @@ export interface SessionInstance {
 	 * (`[bad_argument]`) or a same-cell value/formula conflict (two such ops on one cell ->
 	 * `[conflicting_batch_ops]`) rejects the WHOLE batch with no partial mutation (validated
 	 * pre-mutation). Returns the applied count + post-batch version token. A tombstoned target
-	 * sheet throws `[sheet_not_found]`. `[invalid_state]` off a Ready session.
+	 * sheet throws `[sheet_not_found]`. `[invalid_state]` off a Ready session. (Validation is
+	 * Phase-1; the Phase-3 apply is designed-infallible after it passes -- a Phase-3 failure
+	 * is an engine-invariant bug, not a normal error.)
 	 */
 	batch(ops: SessionOpJson[], options: BatchOptionsJson): BatchResultJson;
 
@@ -1986,6 +2031,37 @@ export interface SessionInstance {
 	 * Always throws `[not_implemented_in_v1_core]` in v1.
 	 */
 	materializeQuery(queryId: string, target: CellRangeJson, data: string): void;
+
+	// --- Parity backfill (2026-05-30, megaudit X1/X2): pre-existing bound methods
+	// (close = 6.1C M8; the UDF-registration surface = 6.4-2) that lacked a typed
+	// SessionInstance sig. Not new methods -- only the IDE-side type was missing. ---
+
+	/**
+	 * Release the session deterministically (6.1C M8). Idempotent: re-closing a
+	 * Closed session is a no-op. After close, any command throws `[invalid_state]`.
+	 */
+	close(): void;
+
+	/**
+	 * Register a UDF (6.4-2). `metadata.canonicalName` MUST be ASCII-uppercase;
+	 * `implHandle` is the opaque dispatch pointer (stored, not yet dispatched in v1).
+	 * A duplicate / built-in name throws `[function_exists]`; an invalid enum string,
+	 * non-uppercase/empty name, or malformed arity throws `[bad_argument]`.
+	 * `[invalid_state]` off a Ready session.
+	 */
+	registerFunction(metadata: FunctionMetadataJson, implHandle: bigint): void;
+
+	/**
+	 * Unregister a UDF (6.4-2). Unknown name throws `[function_not_found]`; a built-in
+	 * name throws `[function_exists]` (builtin-guard). `[invalid_state]` off a Ready session.
+	 */
+	unregisterFunction(canonicalName: string): void;
+
+	/**
+	 * List all registered functions (built-ins + UDFs), sorted ascending by
+	 * `canonicalName` (6.4-2). `[invalid_state]` off a readable session.
+	 */
+	listFunctions(): FunctionMetadataJson[];
 }
 
 export interface SessionConstructor {
