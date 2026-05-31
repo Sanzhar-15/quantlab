@@ -6,7 +6,49 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# **Phase 6.3-4 (2026-05-31) — the thin Python (pyo3) session facade.**
+#
+# Previously a pure-Python crate (the 6.4B UDF *worker* under `python/quantbook/`,
+# with an empty Rust `lib.rs` stub). 6.3-4 fills the Rust half: a pyo3 extension
+# module `quantbook._quantbook` exposing a thin `Session` facade over the SAME
+# binding-neutral `EngineSession` contract the napi binding (`ql-bindings-node`)
+# wraps, so the golden parity matrix can run one canonical flow through TWO
+# structurally-different bindings (Node + Python) and freeze the contract
+# (entry-plan 6.3 §6: "the harness adds a binding by adding a row").
+#
+# `crate-type = ["cdylib", "rlib"]`: `cdylib` is the importable extension module
+# (loaded by python3.12 by path -- the raw-cdylib pattern mirroring how the Node
+# smoke `process.dlopen`s the napi cdylib; no maturin needed because pyo3's
+# `extension-module` feature means the cdylib does NOT link libpython). `rlib`
+# lets the in-crate converter unit tests link.
+#
+# The pure-Python UDF worker under `python/quantbook/` is UNAFFECTED -- the
+# native `_quantbook` module is additive (its `__init__.py` documents it as "a
+# SEPARATE, later concern ... not required for the worker").
 [lib]
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# pyo3 0.28 (workspace pin) with extension-module + abi3-py310 (so one wheel runs
+# on CPython 3.10+; abi3 means no libpython link at build time). The workspace pin
+# sets `default-features = false`, which DROPS the `macros` feature -- so the
+# `#[pyclass]`/`#[pymethods]`/`#[pymodule]`/`#[new]` proc-macro attributes are not
+# in scope unless we additively re-enable it here. (extension-module + abi3-py310
+# come from the workspace pin and compose with this.)
+pyo3 = { workspace = true, features = ["macros"] }
+
+# The binding-neutral session contract (`EngineSession` trait + DTOs +
+# `EngineError`) and its sole implementation (`ql_exec::WorkbookSession`) -- the
+# SAME two crates the napi binding wraps. `ql-exec` declares no default features,
+# so this does NOT pull the umya/xlsx-write tree into the default cdylib.
+ql-session = { path = "../ql-session" }
+ql-exec = { path = "../ql-exec" }
+
+# `parking_lot::Mutex` for the `Arc<Mutex<WorkbookSession>>` handle (mirrors the
+# napi binding: faster, no poison flag, releases cleanly on a caught panic).
+parking_lot = "=0.12.5"
+
+# `serde_json` to carry `EngineError.details` as a JSON string on the Python
+# exception (byte-identical to the napi `throw_structured` `details` convention).
+serde_json = { workspace = true }
