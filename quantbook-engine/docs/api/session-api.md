@@ -410,9 +410,21 @@ consumes the handle; `rollbackTransaction` discards + consumes. The 5 reserved �
 `publishDataset` / `bindRange` / `refreshSource` / `materializeQuery` are bound as thin loud-Capability
 forwarders (declared `-> void`, always `not_implemented_in_v1_core`; `publishDataset`/`materializeQuery` take
 `data` as a JSON string since the napi `serde-json` feature is off) — their FULL input contract (e.g.
-`writeRange`'s matrix-shape rule) lands with the real impl in 6.4/6.5. `UndoRedoResult` rides 6.3-3.
+`writeRange`'s matrix-shape rule) lands with the real impl in 6.4/6.5.
 
 **6.3-2 is now COMPLETE** — all 32 `EngineSession` methods are bound across sub-increments a–e.
+
+**6.3-3 — SHIPPED over napi (Node).** The live-grid + ops cluster is bound on the owning `Session`:
+`snapshotDelta(lastVersion)` / `undo()` / `redo()` / `canUndo()` / `canRedo()` (`cancel`/`operationStatus`/
+`pollEvents` landed earlier). New DTO `UndoRedoResultJson { consumed, version }` (mirrors `UndoRedoResult`;
+`consumed:false` on an empty stack is a normal return, NOT an error). `snapshotDelta` takes the opaque
+`SessionVersion` as a `Buffer` and returns `WorkbookSnapshotDeltaJson` via the new
+`workbook_snapshot_delta_json_from_session` converter (forwards the engine delta's `schema_version`; distinct
+from the legacy CollabSession CRDT delta path). A first/stale/cross-epoch token is NOT an error — the result
+carries `fullRebuildRequired = true` with a `fullRebuildReason` (`no_prior_version`/`epoch_mismatch`/
+`stale_horizon`/`cache_cleared`); a future-seq token fails loud with `invalid_version_token`. `undo`/`redo`
+clear the delta cache, so the next `snapshotDelta` against an older token full-rebuilds; both gate
+`ensure_ready` (→ `invalid_state` post-close). `canUndo`/`canRedo` are ungated pure reads.
 
 ### 4.2 Core DTOs (extracted from the proven `#[napi(object)]` structs; `+` = added/clarified)
 - **`CellValue`** (← `CellValueJson`, `lib.rs:580`): a **discriminated union** on `kind`
