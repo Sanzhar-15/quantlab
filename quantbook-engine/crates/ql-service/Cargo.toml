@@ -9,4 +9,37 @@ publish.workspace = true
 [lib]
 path = "src/lib.rs"
 
+# Phase 6.2-0 (2026-06-01): the local engine-as-service entry point. Member-only
+# (like ql-collab-ws) — NOT in workspace default-members, so a bare `cargo build`
+# is unperturbed; `cargo build --workspace` / `-p ql-service` cover it.
+[[bin]]
+name = "ql-service"
+path = "src/bin/ql-service.rs"
+
 [dependencies]
+# Engine contract: the service is a THIRD consumer of the frozen EngineSession
+# contract (after the napi + pyo3 binding rows). It wraps `ql_exec::WorkbookSession`
+# (the trait impl) and maps the `ql_session` DTOs to/from the frozen wire shapes.
+ql-exec = { path = "../ql-exec" }
+ql-session = { path = "../ql-session" }
+ql-types = { path = "../ql-types" }
+
+# HTTP+SSE transport (hyper, user decision 2026-06-01).
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# parking_lot::Mutex (no poisoning) for the session handle — matches the napi
+# binding (`ql-bindings-node`): a panic caught by the service `guarded` boundary
+# must leave the next `.lock()` usable (the engine FaultGuard already sealed the
+# session `Faulted`), which a std Mutex would defeat by poisoning.
+parking_lot = "=0.12.5"
+
+[dev-dependencies]
+# The golden-flow integration test drives the running service over real HTTP
+# using a hyper client connection on tokio.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
