@@ -691,6 +691,113 @@ pub struct PathBody {
     pub path: String,
 }
 
+// ============================================================================
+// Phase 6.2-1b -- cluster C (structure/sheets) + D (tables) DTOs.
+// ============================================================================
+
+/// Mirror of napi `TableSpecJson`: a `createTable` spec. `columnNames` is a
+/// REQUIRED field (no serde default) so an omitted list is a loud deserialize
+/// error -- matching napi's required-`columnNames` semantics (the engine then
+/// enforces `len == cols`, zero rows/cols, overlap, etc.).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableSpecWire {
+    pub name: String,
+    pub sheet: u16,
+    pub top_row: u32,
+    pub top_col: u32,
+    pub rows: u32,
+    pub cols: u32,
+    pub has_header: bool,
+    pub has_totals: bool,
+    pub column_names: Vec<String>,
+}
+
+/// Map a [`TableSpecWire`] to a [`ql_session::TableSpec`]. Coordinate ranges are
+/// enforced by serde (u16/u32); the engine enforces the table-shape contract
+/// (zero rows/cols -> `table_create_rejected`, column-name rules, overlap, etc.).
+pub fn table_spec_from_wire(s: TableSpecWire) -> ql_session::TableSpec {
+    ql_session::TableSpec {
+        name: s.name,
+        sheet: s.sheet,
+        top_row: s.top_row,
+        top_col: s.top_col,
+        rows: s.rows,
+        cols: s.cols,
+        has_header: s.has_header,
+        has_totals: s.has_totals,
+        column_names: s.column_names,
+    }
+}
+
+// ---- request bodies (cluster C + D) ----
+
+/// `rename-sheet` body.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameSheetBody {
+    pub id: u16,
+    pub new_name: String,
+}
+
+/// `delete-sheet`/`restore-sheet` body: a sheet id.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetIdBody {
+    pub id: u16,
+}
+
+/// `move-sheet` body.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveSheetBody {
+    pub id: u16,
+    pub new_index: u32,
+}
+
+/// `set-name` body: a defined name + its target range.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetNameBody {
+    pub name: String,
+    pub target: CellRangeWire,
+}
+
+/// `rename-table` body.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameTableBody {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+/// `rename-column` body.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameColumnBody {
+    pub table: String,
+    pub old_col: String,
+    pub new_col: String,
+}
+
+/// `resize-table` body.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResizeTableBody {
+    pub name: String,
+    pub new_rows: u32,
+    pub new_cols: u32,
+    pub added_columns: Vec<String>,
+    pub removed_columns: Vec<String>,
+}
+
+/// `drop-table` body: a table name.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NameBody {
+    pub name: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,5 +1043,36 @@ mod tests {
         ));
         // unknown kind rejected:
         assert!(format_id_from_wire(mk("bogus", None, None, None)).is_err());
+    }
+
+    // ---- 6.2-1b DTO tests ----
+
+    #[test]
+    fn table_spec_wire_deserializes_camel_case_and_maps() {
+        // DISTINCT nonzero coordinates so a mapper that swaps/drops
+        // sheet/topRow/topCol/rows/cols cannot pass (6.2-1b audit Codex LOW-1).
+        let j = r#"{"name":"Sales","sheet":2,"topRow":5,"topCol":7,"rows":3,"cols":2,
+                    "hasHeader":true,"hasTotals":false,"columnNames":["Qty","Price"]}"#;
+        let w: TableSpecWire = serde_json::from_str(j).unwrap();
+        let spec = table_spec_from_wire(w);
+        // assert ALL 9 fields:
+        assert_eq!(spec.name, "Sales");
+        assert_eq!(spec.sheet, 2);
+        assert_eq!(spec.top_row, 5);
+        assert_eq!(spec.top_col, 7);
+        assert_eq!(spec.rows, 3);
+        assert_eq!(spec.cols, 2);
+        assert!(spec.has_header);
+        assert!(!spec.has_totals);
+        assert_eq!(spec.column_names, vec!["Qty".to_string(), "Price".to_string()]);
+    }
+
+    #[test]
+    fn table_spec_wire_requires_column_names() {
+        // omitting columnNames is a loud deserialize error (no serde default),
+        // matching napi's required-columnNames semantics.
+        let j = r#"{"name":"T","sheet":0,"topRow":0,"topCol":0,"rows":1,"cols":1,
+                    "hasHeader":false,"hasTotals":false}"#;
+        assert!(serde_json::from_str::<TableSpecWire>(j).is_err());
     }
 }

@@ -31,6 +31,10 @@
 //! - `POST   /v1/sessions/:id/save`             -> `{ ok }`
 //! - `POST   /v1/sessions/:id/import?format=<fmt>` -> `{ ok }` (raw bytes request body)
 //! - `GET    /v1/sessions/:id/export?format=<fmt>` -> raw bytes (`application/octet-stream`)
+//!
+//! 6.2-1b endpoint set (cluster C structure/sheets + cluster D tables), all -> `{ ok }`:
+//! - `POST   /v1/sessions/:id/rename-sheet`, `delete-sheet`, `restore-sheet`, `move-sheet`, `set-name`
+//! - `POST   /v1/sessions/:id/create-table`, `rename-table`, `rename-column`, `resize-table`, `drop-table`
 
 use bytes::Bytes;
 use http::{header, Response, StatusCode};
@@ -46,9 +50,11 @@ use crate::guarded::guarded;
 use crate::session_store::SessionStore;
 use crate::wire::{
     self, cell_range_from_wire, cell_snapshot_to_wire, cell_value_from_wire, diagnostic_to_wire,
-    format_id_from_wire, range_result_to_wire, sheet_info_to_wire, workbook_snapshot_to_wire,
-    AddSheetBody, AddSheetResponse, CellBody, LifecycleResponse, NewSessionResponse, PathBody,
-    QueryRangeBody, RecalcResponse, RegisterFormatBody, SetFormatBody, SetFormulaBody, SetValueBody,
+    format_id_from_wire, range_result_to_wire, sheet_info_to_wire, table_spec_from_wire,
+    workbook_snapshot_to_wire, AddSheetBody, AddSheetResponse, CellBody, LifecycleResponse,
+    MoveSheetBody, NameBody, NewSessionResponse, PathBody, QueryRangeBody, RecalcResponse,
+    RegisterFormatBody, RenameColumnBody, RenameSheetBody, RenameTableBody, ResizeTableBody,
+    SetFormatBody, SetFormulaBody, SetNameBody, SetValueBody, SheetIdBody, TableSpecWire,
     ValidateFormulaBody,
 };
 use ql_session::RangeQueryOptions;
@@ -100,6 +106,18 @@ pub(crate) async fn handle(req: http::Request<Incoming>, store: SessionStore) ->
         ("POST", ["v1", "sessions", id, "save"]) => save(&store, id, body).await,
         ("POST", ["v1", "sessions", id, "import"]) => import(&store, id, &query, body).await,
         ("GET", ["v1", "sessions", id, "export"]) => export(&store, id, &query),
+        // ---- 6.2-1b cluster C (structure/sheets) ----
+        ("POST", ["v1", "sessions", id, "rename-sheet"]) => rename_sheet(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "delete-sheet"]) => delete_sheet(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "restore-sheet"]) => restore_sheet(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "move-sheet"]) => move_sheet(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "set-name"]) => set_name(&store, id, body).await,
+        // ---- 6.2-1b cluster D (tables) ----
+        ("POST", ["v1", "sessions", id, "create-table"]) => create_table(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "rename-table"]) => rename_table(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "rename-column"]) => rename_column(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "resize-table"]) => resize_table(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "drop-table"]) => drop_table(&store, id, body).await,
         #[cfg(debug_assertions)]
         ("POST", ["v1", "sessions", id, "__force_panic"]) => force_panic(&store, id),
         _ => problem(&EngineError::new(
@@ -361,6 +379,126 @@ fn export(store: &SessionStore, id: &str, query: &Option<String>) -> Resp {
         Ok(bytes) => octet_stream(bytes),
         Err(e) => problem(&e),
     }
+}
+
+// ---- 6.2-1b cluster C handlers (structure/sheets) ----
+
+async fn rename_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: RenameSheetBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "renameSheet", move |s| {
+        s.rename_sheet(b.id, &b.new_name)?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn delete_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: SheetIdBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "deleteSheet", move |s| {
+        s.delete_sheet(b.id)?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn restore_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: SheetIdBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "restoreSheet", move |s| {
+        s.restore_sheet(b.id)?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn move_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: MoveSheetBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "moveSheet", move |s| {
+        s.move_sheet(b.id, b.new_index)?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn set_name(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: SetNameBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "setName", move |s| {
+        s.set_name(&b.name, cell_range_from_wire(b.target))?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+// ---- 6.2-1b cluster D handlers (tables) ----
+
+async fn create_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: TableSpecWire = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "createTable", move |s| {
+        s.create_table(table_spec_from_wire(b))?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn rename_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: RenameTableBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "renameTable", move |s| {
+        s.rename_table(&b.old_name, &b.new_name)?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn rename_column(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: RenameColumnBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "renameColumn", move |s| {
+        s.rename_column(&b.table, &b.old_col, &b.new_col)?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn resize_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: ResizeTableBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "resizeTable", move |s| {
+        s.resize_table(
+            &b.name,
+            b.new_rows,
+            b.new_cols,
+            b.added_columns,
+            b.removed_columns,
+        )?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn drop_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: NameBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "dropTable", move |s| {
+        s.drop_table(&b.name)?;
+        Ok(AckResponse { ok: true })
+    })
 }
 
 /// Debug-only panic-boundary probe: panics inside [`guarded`], which must surface
