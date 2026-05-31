@@ -61,7 +61,8 @@ on collab; 6.1B **re-founds the command shapes on `WorkbookSession`** — do **n
    DTOs and mapping the same `EngineError`. No binding invents its own command/error/event semantics.
 2. **Transport-neutral** (decision-lock §1 D2): no napi-only/HTTP-only/gRPC-only assumption. IDs,
    version tokens, cancellation handles, error envelopes are plain owned data. The HTTP-vs-gRPC pick
-   is deferred to 6.2.
+   was DECIDED 2026-06-01 — **HTTP/1.1 + SSE on hyper** (`ql-service`, Phase 6.2; see §13). Transport
+   neutrality still holds (a future gRPC adapter would marshal the same DTOs).
 3. **Opaque handles, owned results.** FFI holds an opaque session handle. **No borrowed Rust ref
    crosses FFI** (this is why §3.4 uses an opaque transaction *handle*, not an RAII scope). Results are
    owned snapshots/buffers/Arrow handles with explicit release; version tokens + operation IDs are
@@ -466,13 +467,16 @@ crosses as a string.)
 - **`FormatId`** (← `FormatIdJson`): `builtin(u32)` | `custom(peer,counter)`. **`FormatDef`** `{id,string}`.
 - **`CellSnapshot`** (← `CellSnapshotJson`): `{row,col,value?,formula?,format?,rendered?}`.
 - **`SheetSnapshot`** / **`SheetInfo`** `{id,name}`.
-- **`WorkbookSnapshot`** (← `WorkbookSnapshotJson`): `{sheets[],formats[],date_system,version}`.
+- **`WorkbookSnapshot`** (← `WorkbookSnapshotJson`): `{schema_version,sheets[],formats[],date_system,version}`.
 - **`WorkbookSnapshotDelta`** (← `WorkbookSnapshotDeltaJson`): `{changed_cells[],removed_cells[],
   sheets_changed[],sheets_removed[],formats_added[],version,full_rebuild_required,full_rebuild_reason?}`
   *(+`full_rebuild_reason`, MED-2)*.
-- **`RangeResult`** *(+ MED-5)*: `{schema_version, range, n_rows, n_cols, layout:"columnar",
-  columns:[{values: CellValue[] | ArrowHandle}], include:{formulas?,formats?,rendered?}}`. **Columnar**
-  (Arrow-friendly); null/pending/error encoded inside `CellValue`. One shape across all bindings.
+- **`RangeResult`** *(+ MED-5)*: `{schema_version, range, n_rows, n_cols, columns:[{values: CellValue[]}]}`
+  (the FROZEN shape — matches `RangeResultJson`/`RangeResultWire`). **Columnar** (`columns.len()==n_cols`,
+  each column's `values.len()==n_rows`); null/pending/error/blank encoded inside `CellValue`. One shape
+  across all bindings. (The query OPTIONS — `include_formulas`/`include_formats`/`include_rendered` — are
+  an `RangeQueryOptions` INPUT, not a field of the result; an Arrow-handle column layout is a future option,
+  not in the v1 wire.)
 - **`WriteRangeResult`/`PublishedRef`/`BoundRange`/`DirtyResult`** (§3.5 reserved).
 - **`FunctionMetadata`** (§10).
 - **`Diagnostic`/`Event`/`EventPage`/`OperationState`/`EngineError`** (§5/§6/§9).
@@ -871,7 +875,7 @@ becomes an adapter in 6.3.
 | **Python** (`quantbook-py`) | PyO3 class, GIL-aware | `asyncio` await | → typed exception hierarchy keyed on `class` | GC |
 | **C** | opaque ptr + `qb_session_free` | start/poll/wait/cancel | `code`+`class` ints + `qb_last_error()` | **explicit** `qb_release_*` |
 | **WASM** | JS handle | Promise | `EngineError`→JS object | JS GC |
-| **Service** (6.2) | session-per-connection | streaming (SSE/gRPC); op-id cancel over the wire | →HTTP problem+json / gRPC status+details | connection close |
+| **Service** (6.2 · `ql-service`, HTTP/1.1+SSE on hyper) | session-per-connection (opaque id) | SSE event stream + op-id cancel over the wire | →HTTP `application/problem+json` | connection close + (6.2-3) idle-TTL |
 
 **Golden-flow matrix (BND-6-01 / API6-01 enforcement):** one scripted flow — open → set_value →
 set_formula → recalc → snapshot → snapshot_delta → register UDF → recalc → cancel a long op →
