@@ -282,6 +282,41 @@ assert.equal(sheets[0].name, "Sheet1", "sheet name preserved");
     "setFormat with a negative customPeer BigInt surfaces a loud bad_argument",
   );
 
+  // **6.3-2 hardening (megaudit H1):** the `builtin` field is `f64`-typed +
+  // validate_u32_index'd, so a malformed JS Number FAILS LOUD instead of being
+  // silently ToUint32-coerced (NaN->0, 2.9->2, -1->u32::MAX) into a wrong-but-
+  // valid-looking format id.
+  throwsWithCode(
+    () => s.setFormat(sheetId, 0, 0, { kind: "builtin", builtin: NaN }),
+    "bad_argument",
+    "setFormat builtin NaN is rejected (not coerced to 0)",
+  );
+  throwsWithCode(
+    () => s.setFormat(sheetId, 0, 0, { kind: "builtin", builtin: 2.9 }),
+    "bad_argument",
+    "setFormat builtin 2.9 is rejected (not floored to 2)",
+  );
+  throwsWithCode(
+    () => s.setFormat(sheetId, 0, 0, { kind: "builtin", builtin: -1 }),
+    "bad_argument",
+    "setFormat builtin -1 is rejected (not wrapped to u32::MAX)",
+  );
+  // **6.3-2 hardening (megaudit M2):** strict tagged union -- a 'builtin' kind
+  // carrying a custom payload is a malformed DTO (rejected, not silently dropped).
+  throwsWithCode(
+    () => s.setFormat(sheetId, 0, 0, { kind: "builtin", builtin: 0, customPeer: 1n }),
+    "bad_argument",
+    "setFormat builtin kind carrying customPeer is rejected (strict union)",
+  );
+  // **6.3-2 hardening (megaudit M1):** CellValueJson is a strict tagged union --
+  // an extraneous-for-kind field is a malformed DTO (rejected, not silently
+  // dropped). Throws pre-mutation, so the target cell is untouched.
+  throwsWithCode(
+    () => s.setValue(sheetId, 50, 50, { kind: "blank", number: 123 }),
+    "bad_argument",
+    "setValue blank kind carrying a number is rejected (strict union)",
+  );
+
   // validateFormula returns diagnostics as DATA (never throws on a bad formula).
   const okDiags = s.validateFormula(sheetId, 0, 0, "1 + 2 * 3");
   assert.ok(Array.isArray(okDiags) && okDiags.length === 0, "valid formula -> empty diagnostics");
@@ -427,6 +462,29 @@ throwsWithCode(
     ),
   "bad_argument",
   "unknown volatility string surfaces structured [bad_argument]",
+);
+
+// **6.3-2 hardening (megaudit H2):** arity n/min/max are f64-typed +
+// validate_u32_index'd, so a malformed JS Number FAILS LOUD instead of being
+// silently ToUint32-coerced (2.9->2, NaN->0) into a wrong-but-valid arity.
+// (These throw at arity_from_json before registration, so no name lands.)
+throwsWithCode(
+  () =>
+    s.registerFunction(
+      { ...myUdfMeta, canonicalName: "ARITYFRAC", arity: { kind: "fixed", n: 2.9 } },
+      1n,
+    ),
+  "bad_argument",
+  "registerFunction arity n=2.9 is rejected (not floored to 2)",
+);
+throwsWithCode(
+  () =>
+    s.registerFunction(
+      { ...myUdfMeta, canonicalName: "ARITYNAN", arity: { kind: "fixed", n: NaN } },
+      1n,
+    ),
+  "bad_argument",
+  "registerFunction arity n=NaN is rejected (not coerced to 0)",
 );
 
 // 6.4-2 cycle-2 audit-fix (H1/F1): a lowercase or empty canonicalName must
@@ -940,6 +998,67 @@ console.log("[smoke] 6.4-2 function registration PASS");
   console.log(
     "[smoke] 6.3-2e atomic groups + reserved stubs OK (batch atomic+observable, txn commit/rollback, reserved Capability, arg validation)",
   );
+}
+
+// === 6.3-2 hardening coverage (2026-05-30, megaudit Opus-3) ===
+//
+// Closes the smoke-coverage gaps the megaudit flagged: recalcAll (the
+// never-exercised recompute wrapper), pollEvents (bound but never called -- real
+// cursor-decode + EventPageJson builder unexercised at the JS boundary), and
+// setUdfWorker arg-validation (the handshakeTimeoutMs guard, which needs no
+// Python spawn -- it fires BEFORE the eager spawn).
+{
+  const w = new Session();
+  const sh = w.addSheet("Cover", 1000);
+
+  // recalcAll: OBSERVABLE recompute. setFormula eagerly computes at set time, so
+  // to PIN that recalcAll actually recomputes (not merely returns an op id),
+  // mutate the input AFTER the formula is set: B1 is then STALE (12) and only a
+  // real recalcAll that picks up the dirtied dependency recomputes it to 14. A
+  // broken no-op recalcAll would leave B1 at 12 and fail this assert.
+  w.setValue(sh, 0, 0, { kind: "number", number: 6 }); // A1
+  w.setFormula(sh, 0, 1, "A1*2"); // B1 eagerly = 12
+  w.setValue(sh, 0, 0, { kind: "number", number: 7 }); // A1=7 -> B1 dirty, still reads 12 until recalc
+  const opId = w.recalcAll();
+  assert.equal(typeof opId, "bigint", "recalcAll returns an operation id (BigInt)");
+  assert.equal(
+    w.cell(sh, 0, 1).value.number,
+    14,
+    "recalcAll recomputes the dirtied B1=A1*2=14 (pins real recompute, not a stale 12)",
+  );
+
+  // pollEvents: decode a real EventPageJson from the ring. The recalcAll above
+  // wrote at least an operation_completed event; poll from cursor 0n and assert
+  // the page shape + that the cursor-decode/builder produced a usable page.
+  const page = w.pollEvents(0n);
+  assert.ok(Array.isArray(page.events), "pollEvents page.events is an array");
+  assert.equal(typeof page.nextCursor, "bigint", "pollEvents page.nextCursor is a BigInt");
+  assert.equal(page.dropped, false, "pollEvents page.dropped is false (unbounded ring in v1)");
+  assert.ok(page.events.length >= 1, "pollEvents surfaces >=1 event after a recompute");
+  // negative cursor -> loud bad_argument (the BigInt sign-bit guard), not a
+  // silently-truncated ring position.
+  throwsWithCode(() => w.pollEvents(-1n), "bad_argument", "pollEvents(-1n) is rejected (sign-bit guard)");
+
+  // setUdfWorker handshakeTimeoutMs arg-validation: these throw BEFORE the eager
+  // Python spawn, so no fixture is needed. (The spawn path itself is deferred.)
+  throwsWithCode(
+    () => w.setUdfWorker({ python: "python3", handshakeTimeoutMs: -5 }),
+    "bad_argument",
+    "setUdfWorker handshakeTimeoutMs -5 is rejected",
+  );
+  throwsWithCode(
+    () => w.setUdfWorker({ python: "python3", handshakeTimeoutMs: NaN }),
+    "bad_argument",
+    "setUdfWorker handshakeTimeoutMs NaN is rejected",
+  );
+  throwsWithCode(
+    () => w.setUdfWorker({ python: "python3", handshakeTimeoutMs: 700000 }),
+    "bad_argument",
+    "setUdfWorker handshakeTimeoutMs over the 600000ms cap is rejected",
+  );
+
+  w.close();
+  console.log("[smoke] 6.3-2 hardening coverage OK (recalcAll observable, pollEvents page + negative cursor, setUdfWorker arg-validation)");
 }
 
 // **6.1C audit-fix M8 — Session.close() deterministic lifecycle release.**

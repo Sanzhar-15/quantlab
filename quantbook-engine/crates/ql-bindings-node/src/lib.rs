@@ -653,14 +653,17 @@ impl From<CellWireValue> for CellValueJson {
 ///                                  customCounter: counter }` (builtin absent)
 ///
 /// `customPeer` is `u64` widened to JS BigInt (matches the PresenceState +
-/// peerId conventions throughout V3.x).  `customCounter` is `u32`
-/// (JS-number-safe).
+/// peerId conventions throughout V3.x).  `builtin`/`customCounter` are
+/// **`Option<f64>`** as of the 6.3-2 hardening (megaudit H1): they carry a
+/// u32-domain value but are typed `f64` so a malformed JS Number reaches
+/// `session_format_id_from_json` UN-coerced and is validated via
+/// `validate_u32_index` (rather than letting napi-rs silently `ToUint32` it).
 ///
 /// **Rule 4 per-field walk**: `kind: String` Send + Sync;
-/// `builtin: Option<u32>` Send + Sync; `custom_peer: Option<BigInt>`
+/// `builtin: Option<f64>` Send + Sync; `custom_peer: Option<BigInt>`
 /// (napi::bindgen_prelude::BigInt is a u128-sized struct wrapping
 /// Vec<u64> + sign; Vec<u64> is Send + Sync; trivially Send + Sync);
-/// `custom_counter: Option<u32>` Send + Sync.  Composition:
+/// `custom_counter: Option<f64>` Send + Sync.  Composition:
 /// `FormatIdJson: Send + Sync`.  **0 new Rule 4 triggers**; arc
 /// terminus stays at 6.
 ///
@@ -671,14 +674,20 @@ impl From<CellWireValue> for CellValueJson {
 #[napi(object)]
 pub struct FormatIdJson {
     pub kind: String,
-    /// Set when `kind == "builtin"`; absent otherwise.
-    pub builtin: Option<u32>,
+    /// Set when `kind == "builtin"`; absent otherwise. **6.3-2 hardening
+    /// (2026-05-30, megaudit H1):** typed `Option<f64>` (not `Option<u32>`) so
+    /// the JS Number reaches `session_format_id_from_json` UN-coerced and is
+    /// validated via [`validate_u32_index`] — a `u32` field would let napi-rs
+    /// silently `ToUint32` a malformed input (NaN/Inf->0, 2.9->2, -1->u32::MAX)
+    /// into a valid-looking format id. Engine-produced values are whole u32s.
+    pub builtin: Option<f64>,
     /// Set when `kind == "custom"`; absent otherwise.  PeerId widened
     /// to BigInt (matches V3.4.0.4b generateUuidPeerId + V3.4.0.5a
     /// PresenceStateJson conventions).
     pub custom_peer: Option<BigInt>,
-    /// Set when `kind == "custom"`; absent otherwise.
-    pub custom_counter: Option<u32>,
+    /// Set when `kind == "custom"`; absent otherwise. `Option<f64>` for the same
+    /// no-coercion reason as `builtin` (6.3-2 hardening H1).
+    pub custom_counter: Option<f64>,
 }
 
 impl From<ql_storage::FormatId> for FormatIdJson {
@@ -686,7 +695,7 @@ impl From<ql_storage::FormatId> for FormatIdJson {
         match id {
             ql_storage::FormatId::Builtin(n) => Self {
                 kind: "builtin".to_string(),
-                builtin: Some(n),
+                builtin: Some(n as f64),
                 custom_peer: None,
                 custom_counter: None,
             },
@@ -694,7 +703,7 @@ impl From<ql_storage::FormatId> for FormatIdJson {
                 kind: "custom".to_string(),
                 builtin: None,
                 custom_peer: Some(BigInt::from(peer.0)),
-                custom_counter: Some(counter),
+                custom_counter: Some(counter as f64),
             },
         }
     }
@@ -4353,9 +4362,32 @@ fn session_addr_from_f64(
 /// cell's value. `error`/`pending` are READ-only states (produced by the engine,
 /// never set by a caller) → rejected; an unknown `kind` is rejected.
 fn session_cell_value_from_json(v: CellValueJson) -> Result<ql_session::CellValue> {
-    match v.kind.as_str() {
+    // **6.3-2 hardening (2026-05-30, megaudit M1):** strict tagged union — each
+    // `kind` admits ONLY its own payload. An extraneous-for-kind field (e.g.
+    // `{kind:"blank", number:123}` or `{kind:"number", number:1, text:"x"}`) is a
+    // malformed DTO and is REJECTED loudly, not silently dropped (No-Fallbacks;
+    // same discipline as `session_op_from_json`/`arity_from_json`).
+    let CellValueJson {
+        kind,
+        number,
+        boolean,
+        text,
+        error,
+    } = v;
+    let reject_extra = |present: bool, field: &str, kind: &str| -> Result<()> {
+        if present {
+            return Err(bad_argument_error(format!(
+                "setValue: value kind '{kind}' must not carry a '{field}' field"
+            )));
+        }
+        Ok(())
+    };
+    match kind.as_str() {
         "number" => {
-            let n = v.number.ok_or_else(|| {
+            reject_extra(boolean.is_some(), "boolean", "number")?;
+            reject_extra(text.is_some(), "text", "number")?;
+            reject_extra(error.is_some(), "error", "number")?;
+            let n = number.ok_or_else(|| {
                 bad_argument_error("setValue: kind 'number' requires a 'number' field".into())
             })?;
             if !n.is_finite() {
@@ -4366,18 +4398,30 @@ fn session_cell_value_from_json(v: CellValueJson) -> Result<ql_session::CellValu
             Ok(ql_session::CellValue::Number { number: n })
         }
         "boolean" => {
-            let b = v.boolean.ok_or_else(|| {
+            reject_extra(number.is_some(), "number", "boolean")?;
+            reject_extra(text.is_some(), "text", "boolean")?;
+            reject_extra(error.is_some(), "error", "boolean")?;
+            let b = boolean.ok_or_else(|| {
                 bad_argument_error("setValue: kind 'boolean' requires a 'boolean' field".into())
             })?;
             Ok(ql_session::CellValue::Boolean { boolean: b })
         }
         "text" => {
-            let t = v.text.ok_or_else(|| {
+            reject_extra(number.is_some(), "number", "text")?;
+            reject_extra(boolean.is_some(), "boolean", "text")?;
+            reject_extra(error.is_some(), "error", "text")?;
+            let t = text.ok_or_else(|| {
                 bad_argument_error("setValue: kind 'text' requires a 'text' field".into())
             })?;
             Ok(ql_session::CellValue::Text { text: t })
         }
-        "blank" => Ok(ql_session::CellValue::Blank),
+        "blank" => {
+            reject_extra(number.is_some(), "number", "blank")?;
+            reject_extra(boolean.is_some(), "boolean", "blank")?;
+            reject_extra(text.is_some(), "text", "blank")?;
+            reject_extra(error.is_some(), "error", "blank")?;
+            Ok(ql_session::CellValue::Blank)
+        }
         other => Err(bad_argument_error(format!(
             "setValue: unsupported value kind '{other}' \
              (expected number|boolean|text|blank; 'error'/'pending' are engine-produced, read-only)"
@@ -4413,7 +4457,7 @@ fn format_id_json_from_session(id: ql_session::FormatId) -> FormatIdJson {
     match id {
         ql_session::FormatId::Builtin { builtin } => FormatIdJson {
             kind: "builtin".to_string(),
-            builtin: Some(builtin),
+            builtin: Some(builtin as f64),
             custom_peer: None,
             custom_counter: None,
         },
@@ -4421,7 +4465,7 @@ fn format_id_json_from_session(id: ql_session::FormatId) -> FormatIdJson {
             kind: "custom".to_string(),
             builtin: None,
             custom_peer: Some(BigInt::from(peer)),
-            custom_counter: Some(counter),
+            custom_counter: Some(counter as f64),
         },
     }
 }
@@ -4434,18 +4478,40 @@ fn format_id_json_from_session(id: ql_session::FormatId) -> FormatIdJson {
 /// engine's `u64` peer id; reject a negative (sign bit) or lossy (> `u64::MAX`)
 /// value loud, mirroring the `awaitRecalc`/`pollEvents` BigInt discipline.
 fn session_format_id_from_json(id: FormatIdJson) -> Result<ql_session::FormatId> {
-    match id.kind.as_str() {
+    // **6.3-2 hardening (2026-05-30, megaudit H1+M2):** strict tagged union —
+    // each `kind` admits ONLY its own payload (an extraneous-for-kind field is a
+    // malformed DTO, rejected loudly like `arity_from_json`/`session_op_from_json`,
+    // not silently dropped) — AND the numeric payloads (`builtin`/`customCounter`)
+    // arrive as `f64` and are validated via `validate_u32_index` rather than letting
+    // napi-rs silently `ToUint32`-coerce a malformed JS Number.
+    let FormatIdJson {
+        kind,
+        builtin,
+        custom_peer,
+        custom_counter,
+    } = id;
+    match kind.as_str() {
         "builtin" => {
-            let builtin = id.builtin.ok_or_else(|| {
+            if custom_peer.is_some() || custom_counter.is_some() {
+                return Err(bad_argument_error(
+                    "setFormat: format id kind 'builtin' must not carry 'customPeer'/'customCounter'"
+                        .into(),
+                ));
+            }
+            let builtin = builtin.ok_or_else(|| {
                 bad_argument_error("setFormat: kind 'builtin' requires a 'builtin' field".into())
             })?;
+            let builtin = validate_u32_index("setFormat", "builtin", builtin)?;
             Ok(ql_session::FormatId::Builtin { builtin })
         }
         "custom" => {
-            let peer_bigint = id.custom_peer.ok_or_else(|| {
-                bad_argument_error(
-                    "setFormat: kind 'custom' requires a 'customPeer' field".into(),
-                )
+            if builtin.is_some() {
+                return Err(bad_argument_error(
+                    "setFormat: format id kind 'custom' must not carry 'builtin'".into(),
+                ));
+            }
+            let peer_bigint = custom_peer.ok_or_else(|| {
+                bad_argument_error("setFormat: kind 'custom' requires a 'customPeer' field".into())
             })?;
             let (sign_bit, peer, lossless) = peer_bigint.get_u64();
             if sign_bit {
@@ -4458,11 +4524,12 @@ fn session_format_id_from_json(id: FormatIdJson) -> Result<ql_session::FormatId>
                     "setFormat: customPeer exceeds u64::MAX (lossy conversion rejected)".into(),
                 ));
             }
-            let counter = id.custom_counter.ok_or_else(|| {
+            let counter = custom_counter.ok_or_else(|| {
                 bad_argument_error(
                     "setFormat: kind 'custom' requires a 'customCounter' field".into(),
                 )
             })?;
+            let counter = validate_u32_index("setFormat", "customCounter", counter)?;
             Ok(ql_session::FormatId::Custom { peer, counter })
         }
         other => Err(bad_argument_error(format!(
@@ -4745,17 +4812,24 @@ fn workbook_snapshot_json_from_session(snap: ql_session::WorkbookSnapshot) -> Wo
 /// 6.4-2 cycle-2 audit-fix F3 hardened the extraneous-field cases).
 ///
 /// **`null` vs `undefined` (6.4-2 cycle-2 audit-fix F4):** optional fields use
-/// napi `Option<u32>`, which maps a MISSING/`undefined` JS field to `None`.
+/// napi `Option<f64>`, which maps a MISSING/`undefined` JS field to `None`.
 /// Passing an explicit JS `null` triggers a generated napi `NumberExpected`
 /// conversion error BEFORE this mapper runs — so callers MUST OMIT optional
 /// fields (or set them `undefined`), not pass `null`. e.g. an unbounded range is
 /// `{kind:"range", min:1}` (omit `max`), never `{..., max:null}`.
+///
+/// **6.3-2 hardening (2026-05-30, megaudit H2):** `n`/`min`/`max` are typed
+/// `Option<f64>` (not `Option<u32>`) so a malformed JS Number reaches
+/// `arity_from_json` UN-coerced and is validated via [`validate_u32_index`]
+/// before the `u8` cast — a `u32` field would let napi-rs silently `ToUint32`
+/// `2.9`->2 / `NaN`->0 into a valid-looking arity. Engine-produced values are
+/// whole `u8`s.
 #[napi(object)]
 pub struct ArityJson {
     pub kind: String,
-    pub n: Option<u32>,
-    pub min: Option<u32>,
-    pub max: Option<u32>,
+    pub n: Option<f64>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
 }
 
 /// **6.4-2:** JS-facing `FunctionMetadata` mirror. All fields are flat
@@ -5147,6 +5221,7 @@ fn arity_from_json(a: ArityJson) -> Result<ql_session::function_meta::Arity> {
             let n = a.n.ok_or_else(|| {
                 bad_argument_error("ArityJson kind 'fixed' requires field 'n'".into())
             })?;
+            let n = validate_u32_index("registerFunction", "arity.n", n)?;
             let n = u8::try_from(n).map_err(|_| {
                 bad_argument_error(format!(
                     "ArityJson 'fixed': n={n} exceeds u8 range (0..=255)"
@@ -5163,6 +5238,7 @@ fn arity_from_json(a: ArityJson) -> Result<ql_session::function_meta::Arity> {
             let min = a.min.ok_or_else(|| {
                 bad_argument_error("ArityJson kind 'range' requires field 'min'".into())
             })?;
+            let min = validate_u32_index("registerFunction", "arity.min", min)?;
             let min = u8::try_from(min).map_err(|_| {
                 bad_argument_error(format!(
                     "ArityJson 'range': min={min} exceeds u8 range (0..=255)"
@@ -5171,6 +5247,7 @@ fn arity_from_json(a: ArityJson) -> Result<ql_session::function_meta::Arity> {
             let max = a
                 .max
                 .map(|m| {
+                    let m = validate_u32_index("registerFunction", "arity.max", m)?;
                     u8::try_from(m).map_err(|_| {
                         bad_argument_error(format!(
                             "ArityJson 'range': max={m} exceeds u8 range (0..=255)"
@@ -5207,15 +5284,15 @@ fn arity_to_json(a: ql_session::function_meta::Arity) -> ArityJson {
     match a {
         Arity::Fixed { n } => ArityJson {
             kind: "fixed".to_string(),
-            n: Some(u32::from(n)),
+            n: Some(f64::from(n)),
             min: None,
             max: None,
         },
         Arity::Range { min, max } => ArityJson {
             kind: "range".to_string(),
             n: None,
-            min: Some(u32::from(min)),
-            max: max.map(u32::from),
+            min: Some(f64::from(min)),
+            max: max.map(f64::from),
         },
         Arity::Variadic => ArityJson {
             kind: "variadic".to_string(),
@@ -5469,8 +5546,10 @@ impl Session {
     /// Set a cell's formula. `text` is the formula BODY **without** a leading
     /// `=` (e.g. `"A1+1"`) — matching `appendPutFormula` + the engine op-log
     /// convention; the IDE strips the `=` client-side. The engine canonicalizes
-    /// the text (e.g. `"A1+1"` → `"A1 + 1"`). Lex/parse/bind failures surface as
-    /// a structured engine error (`[formula_parse]`/`[bad_argument]`-class).
+    /// the text (e.g. `"A1+1"` → `"A1 + 1"`). A lex/parse failure surfaces
+    /// `[formula_parse]`; a **bind** failure (e.g. an unresolvable structured
+    /// reference) surfaces `[formula_bind]` (Compute class), not `[formula_parse]`
+    /// — both are structured engine errors thrown at set time.
     #[napi(js_name = "setFormula", catch_unwind)]
     pub fn set_formula(
         &self,
@@ -5628,9 +5707,10 @@ impl Session {
     /// (contract §6.1). This is how the 6.3-1b `startRecalc*`/`awaitRecalc` +
     /// `cancel` OUTCOME is observed from JS: after `awaitRecalc(op)` the op is
     /// `completed` (or `canceled` if a `cancel` won the pre-start window, or
-    /// `failed` with the `[code] message` of the recompute error). Legal while
-    /// the session is `Busy` (it is a pure read). Errors `[operation_not_found]`
-    /// for an unknown id, `[bad_argument]` for a negative / lossy BigInt.
+    /// `failed` with the `[code] message` of the recompute error). Legal in ALL
+    /// lifecycle states including terminal/Busy (it is a pure read, never gated).
+    /// Errors `[operation_not_found]` for an unknown id, `[bad_argument]` for a
+    /// negative / lossy BigInt.
     ///
     /// **v1 note:** `error` is the engine error's `[code] message` string (a DTO
     /// data field, parseable by `parseQuantbookError`); nesting the structured
@@ -5884,7 +5964,9 @@ impl Session {
 
     /// Import a workbook from in-memory `bytes` in `format` — v1 supports `"xlsx"`
     /// (recomputed BestEffort on import) and `"csv"` (no formulas). Any other format
-    /// is a loud `[bad_argument]`; malformed bytes surface `[persistence]`. Adopts the
+    /// is a loud `[bad_argument]`; malformed bytes surface `[persistence]`; a
+    /// well-formed CSV that exceeds the row/col/cell limits surfaces
+    /// `[csv_exceeds_limits]` (BadArgument), distinct from malformed bytes. Adopts the
     /// imported workbook as a fresh session (epoch re-minted).
     ///
     /// **V1 SharedArrayBuffer note** (mirrors `mergeBytes`): `bytes.as_ref()` lends a
@@ -5976,7 +6058,7 @@ impl Session {
 
     /// Restore a previously-tombstoned sheet by id. Unknown id surfaces
     /// `[sheet_not_found]` (NotFound); a not-tombstoned (still-live) sheet surfaces
-    /// a Conflict. `[invalid_state]` off a Ready session.
+    /// `[sheet_not_deleted]` (Conflict). `[invalid_state]` off a Ready session.
     #[napi(js_name = "restoreSheet", catch_unwind)]
     pub fn restore_sheet(&self, env: Env, id: f64) -> Result<()> {
         guarded(env, "restoreSheet", || {
@@ -6159,6 +6241,11 @@ impl Session {
     /// partial mutation (validated pre-mutation). Returns
     /// the applied count + the post-batch version token. `[invalid_state]` off a Ready
     /// session; a tombstoned target sheet → `[sheet_not_found]`.
+    ///
+    /// **Invariant note (megaudit Opus-2 LOW, visibility):** validation is Phase-1;
+    /// the Phase-3 apply is designed-infallible after Phase-1 passes — a Phase-3
+    /// failure (engine invariant violation) is the only path that could leave a
+    /// partial mutation + Ready session, and is treated as a bug, not a normal error.
     #[napi(js_name = "batch", catch_unwind)]
     pub fn batch(
         &self,
