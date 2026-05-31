@@ -119,7 +119,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 | ID | Gap | Reproduce | Owner | Target phase |
 |---|---|---|---|---|
-| GAP-PS-01 | `quantbook-py` Python binding stub only | `quantbook-py/src/lib.rs:15` | Engine | Engine Phase 6.3 |
+| GAP-PS-01 | **PARTIALLY CLOSED 6.3-4 (2026-05-31, engine `38f4f51dfac`):** `quantbook-py` now ships a real pyo3 extension (`quantbook._quantbook`) — a THIN `Session` facade (~24 golden-flow methods) over the stable `EngineSession` contract, the SECOND row of the golden parity matrix (Node + Python, 22 steps, byte-identical). Still deferred to 6.5: full `qb.show`/`publish`/`bind` (the 5 §2c bulk methods) + maturin/wheel packaging (v1 loads the raw cdylib by path). | `quantbook-py/src/lib.rs` (was `:15` stub) | Engine | facade ✅ 6.3-4; authoring + packaging Phase 6.5 |
 | GAP-PS-02 | `ql-bindings-{wasm,node,c}` stubs only | Three stub crates | Engine | Engine Phase 6.3 |
 | GAP-PS-03 | `ql-udf` (Python UDF execution) stub | `ql-udf/src/lib.rs:15` | Engine | Engine Phase 6.4 |
 | GAP-PS-04 | `ql-sql` (DuckDB integration, `=DUCKDB(...)`) stub | `ql-sql/src/lib.rs` | Engine | Engine Phase 6.5 |

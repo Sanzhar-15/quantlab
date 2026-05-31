@@ -426,6 +426,8 @@ carries `fullRebuildRequired = true` with a `fullRebuildReason` (`no_prior_versi
 clear the delta cache, so the next `snapshotDelta` against an older token full-rebuilds; both gate
 `ensure_ready` (→ `invalid_state` post-close). `canUndo`/`canRedo` are ungated pure reads.
 
+**6.3-4 — a SECOND binding row (Python) over pyo3.** The thin pyo3 `Session` facade (`quantbook._quantbook`) SHIPPED 2026-05-31 (engine `38f4f51dfac`), wrapping the SAME `EngineSession` contract this document specifies. A cross-binding **golden parity matrix** (`crates/quantbook-py/tests/parity_matrix.py`) runs one canonical 22-step flow through Node AND Python and asserts byte-identical DTOs + error codes (masking only the opaque `version`/`nextCursor` tokens) -- so the contract is now exercised by two structurally-different bindings, not Node self-consistency alone. The Python facade is THIN (golden-flow methods only); the 5 reserved §2c bulk methods stay Capability-erroring (6.5). Errors cross as a `QuantbookError(Exception)` carrying the same `code`/`class`/`retryable`/`details`/`source` the napi native error carries. NEXT = 6.3-5 (declare the contract frozen on ≥ 2 passing rows).
+
 ### 4.2 Core DTOs (extracted from the proven `#[napi(object)]` structs; `+` = added/clarified)
 - **`CellValue`** (← `CellValueJson`, `lib.rs:580`): a **discriminated union** on `kind`
   (`number`/`boolean`/`text`/`error`/`blank`/`pending`), exactly one payload. Bindings narrow on `kind`.
