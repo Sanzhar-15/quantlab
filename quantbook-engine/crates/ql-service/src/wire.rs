@@ -113,17 +113,30 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, EngineError> {
 ///
 /// **KNOWN number-encoding divergence (filed forward to 6.2-4; 6.2-1a audit
 /// Codex HIGH, disposition: deferred).** `number` is an `f64` serialized by serde
-/// as e.g. `6.0`, whereas napi crosses it as a JS `Number` that `JSON.stringify`
-/// renders as `6` (no trailing `.0` for integer-valued floats; ECMAScript also
-/// differs on exponent thresholds at `1e21`/`1e-7`). So number values are NOT
-/// byte-identical to the napi row today. This is the 6.2-0 filed-forward item
-/// ("the whole-f64 cell-value representation question for byte-identical parity
-/// (6.0 vs 6)") and already ships in the 6.2-0 `snapshot` endpoint; `queryRange`
-/// (6.2-1a) reuses the same [`cell_value_to_wire`]. 6.2-4 resolves it against the
-/// parity matrix's ACTUAL comparison mode: structural comparison treats `6.0`==`6`
-/// (no fix needed); only a byte-identical mode requires a uniform ECMAScript
-/// `Number`->string serializer applied across ALL number-emitting endpoints (here
-/// + snapshot), which is why it is NOT patched piecemeal in cluster A.
+/// (ryu), whereas napi crosses it as a JS `Number` that `JSON.stringify` renders
+/// via the ECMAScript `Number::toString` algorithm. The serde and ECMAScript
+/// renderings differ on AT LEAST these cases, so number values are NOT
+/// byte-identical to the napi row today:
+///
+/// - integer-valued floats: serde `6.0` vs napi `6` (the headline case);
+/// - signed zero: serde `-0.0` vs napi `0`;
+/// - exponent thresholds + format: ECMAScript switches to exponent form at
+///   `>=1e21` and `<1e-6` and writes `e+21`/`e-7`, where ryu's thresholds/format
+///   differ.
+///
+/// Non-finite (`NaN`/`Inf`) is not a wire concern on OUTPUT (the engine does not
+/// emit them as `CellValue::Number`; `cell_value_from_wire` rejects them on
+/// INPUT), but the 6.2-4 serializer MUST pin a fail-loud policy if a future
+/// engine/UDF path ever leaks one.
+///
+/// This is the 6.2-0 filed-forward item ("the whole-f64 cell-value representation
+/// question for byte-identical parity (6.0 vs 6)") and already ships in the 6.2-0
+/// `snapshot` endpoint; `queryRange` (6.2-1a) reuses the same
+/// [`cell_value_to_wire`]. 6.2-4 resolves it against the parity matrix's ACTUAL
+/// comparison mode: structural comparison treats `6.0`==`6` (no fix needed); only
+/// a byte-identical mode requires a uniform ECMAScript `Number`->string serializer
+/// (covering ALL the cases above) applied across ALL number-emitting endpoints
+/// (here + snapshot), which is why it is NOT patched piecemeal in cluster A.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CellValueWire {

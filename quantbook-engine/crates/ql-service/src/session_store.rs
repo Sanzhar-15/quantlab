@@ -43,15 +43,25 @@ impl SessionStore {
         }
     }
 
-    /// Allocate a fresh `WorkbookSession`, register it, and return `(id, handle)`.
-    pub fn create(&self) -> (String, SessionHandle) {
+    /// Register an already-constructed `WorkbookSession`, returning its id. The
+    /// construction is done by the caller so it can run under the panic boundary
+    /// ([`crate::guarded`]) -- the store only allocates the id + inserts.
+    pub fn register(&self, session: WorkbookSession) -> String {
         let n = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let id = format!("s{n}");
-        let handle: SessionHandle = Arc::new(Mutex::new(WorkbookSession::new()));
         self.inner
             .sessions
             .lock()
-            .insert(id.clone(), Arc::clone(&handle));
+            .insert(id.clone(), Arc::new(Mutex::new(session)));
+        id
+    }
+
+    /// Allocate a fresh `WorkbookSession`, register it, and return `(id, handle)`.
+    /// (Convenience for tests / non-guarded callers; the HTTP `create` handler
+    /// constructs under [`crate::guarded`] then calls [`Self::register`].)
+    pub fn create(&self) -> (String, SessionHandle) {
+        let id = self.register(WorkbookSession::new());
+        let handle = self.get(&id).expect("handle present immediately after register");
         (id, handle)
     }
 

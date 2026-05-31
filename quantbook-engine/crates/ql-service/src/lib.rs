@@ -3,15 +3,23 @@
 //! A long-running service exposing the **frozen** `EngineSession` contract
 //! (6.3-5 FROZEN v1) over HTTP for the IDE / web frontends. It is the THIRD
 //! consumer of the contract after the napi (`ql-bindings-node`) and pyo3
-//! (`quantbook-py`) binding rows, and emits the SAME wire DTO shapes (camelCase
-//! keys, u64 as decimal strings, structured `problem+json` errors). This is a
-//! pure transport layer -- NO engine logic lives here.
+//! (`quantbook-py`) binding rows, and reproduces the SAME wire DTO shapes
+//! (camelCase keys, u64 as decimal strings, structured `problem+json` errors).
+//! This is a pure transport layer -- NO engine logic lives here.
 //!
-//! **6.2-0 (this increment):** crate foundation + the golden-flow endpoint set
-//! proving SVC-6-01 (open/edit/recalc/snapshot over HTTP) on `hyper`. SSE event
-//! streaming (SVC-6-02), op-id cancellation (SVC-6-03), auth hooks + protocol
-//! versioning hardening (SVC-6-04), and the golden-parity third row land in
-//! 6.2-1..6.2-4.
+//! **Wire parity caveat:** the DTO *shapes* are byte-identical to the napi row,
+//! with ONE documented, 6.2-4-deferred number-encoding divergence -- integer-
+//! valued `f64` `number` fields render `6.0` (serde) vs `6` (napi
+//! `JSON.stringify`); see [`wire::CellValueWire`] for the full scope and the
+//! 6.2-4 resolution.
+//!
+//! **Shipped so far:** 6.2-0 (crate foundation + golden-flow endpoint set proving
+//! SVC-6-01: open/edit/recalc/snapshot over HTTP on `hyper`); 6.2-1a (cluster A
+//! read/format/validate/query and cluster B persistence); 6.2-1b (cluster C
+//! structure/sheets and cluster D tables). Remaining: 6.2-1c (atomic/txn,
+//! reserved bulk, undo/delta, functions); SSE event streaming (SVC-6-02); op-id
+//! cancellation (SVC-6-03); auth hooks, protocol versioning, and lifecycle/TTL
+//! hardening (SVC-6-04 / 6.2-3); the golden-parity third row (6.2-4).
 //!
 //! Transport: HTTP/1.1 on `hyper` 1.x (`http1::Builder::serve_connection`), one
 //! tokio task per connection, `hyper_util::rt::TokioIo` adapting the tokio

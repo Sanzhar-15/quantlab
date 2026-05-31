@@ -131,8 +131,20 @@ pub(crate) async fn handle(req: http::Request<Incoming>, store: SessionStore) ->
 // ---- handlers ----
 
 fn create_session(store: &SessionStore) -> Resp {
-    let (id, _handle) = store.create();
-    json(StatusCode::CREATED, &NewSessionResponse { session_id: id })
+    // Construct under the panic boundary too (every engine call is guarded): a
+    // panic in `WorkbookSession::new()` surfaces as a `[panic]`/500 problem+json,
+    // not an unwound connection task. The session is only registered on success.
+    match guarded("createSession", || {
+        Ok::<WorkbookSession, EngineError>(WorkbookSession::new())
+    }) {
+        Ok(session) => json(
+            StatusCode::CREATED,
+            &NewSessionResponse {
+                session_id: store.register(session),
+            },
+        ),
+        Err(e) => problem(&e),
+    }
 }
 
 fn delete_session(store: &SessionStore, id: &str) -> Resp {
