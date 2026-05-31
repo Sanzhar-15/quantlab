@@ -1,0 +1,159 @@
+# Phase 6.3-5 — Cycle-2 FOLD-ALL Fix Report (EngineSession binding-contract freeze gate)
+
+Date: 2026-05-31
+Engine repo: /Users/sanzhar/.../quantlab-quantbook/quantbook-engine @ feat/quantbook-engine (HEAD 9429ac48193 at start)
+IDE repo:    /Users/sanzhar/.../quantlab/extensions/quantlab @ feat/visualise-v1
+
+STATUS: ALL fixes folded. ALL verification gates GREEN. NOT committed, freeze NOT
+declared (parent's job). HIGH-B was already done (constructors guarded) — left as-is.
+
+================================================================================
+PER-FINDING — WHAT CHANGED
+================================================================================
+
+### HIGH-A — u64 = decimal STRING on the wire (pyo3 emit + matrix witness + doc)
+pyo3 emit sites changed from Python int → decimal string (crates/quantbook-py/src/lib.rs):
+  - ~L392  format_id_to_py customPeer: `d.set_item("customPeer", peer.to_string())` (was `*peer`).
+            customCounter stays a number (it is u32, not u64).
+  - ~L920  recalc_dirty: signature `-> PyResult<u64>` → `-> PyResult<String>`; returns `op.0.to_string()`.
+  - ~L929  recalc_all:   signature `-> PyResult<u64>` → `-> PyResult<String>`; returns `op.0.to_string()`.
+  - ~L1234 event_page_to_py RecalcProgress: `op`/`done`/`total` all emitted as `.to_string()`.
+  - ~L1245 event_page_to_py OperationCompleted: `op` emitted as `op.0.to_string()`.
+  - ~L1267 event_page_to_py nextCursor: `page.next_cursor.0.to_string()`.
+  napi DTOs/emit UNCHANGED (BigInt preserved for the IDE consumer) — only the pyo3 facade + matrix.
+
+HIGH-A step 3 (txn INPUT symmetry on pyo3): NOT APPLICABLE — see DEVIATIONS below. The pyo3
+  facade binds NO transaction methods (begin/txn_add/commit/rollback_transaction); they are
+  filed-forward per the facade's own module docstring. There is nothing to retype.
+
+HIGH-A step 4 (deterministic unmasked u64 witness): added a `recalc_op_id` step to BOTH golden
+  emitters recording the FIRST `recalcDirty()` op id, which is deterministically `1`
+  (engine `next_op_id` starts at 1 — crates/ql-exec/src/session.rs:425). See DEVIATIONS: the brief
+  specified a `txn_id` witness from `beginTransaction`, but neither binding/flow has a transaction
+  section; the first-recalc op id is the equivalent deterministic, comparable-unmasked u64 and
+  serves the IDENTICAL purpose (post-fix both emit "1"; pre-fix pyo3 emitted JSON number 1 → mismatch).
+  - crates/ql-bindings-node/tests/golden_flow.mjs: capture `firstRecalcOp = s.recalcDirty()`, add
+    `rec("recalc_op_id", { value: firstRecalcOp })` before the existing masked `recalc` step.
+  - crates/quantbook-py/tests/golden_flow.py: same — `first_recalc_op = s.recalc_dirty()`,
+    `rec("recalc_op_id", value=first_recalc_op)`. NOT added to MASK_KEYS.
+
+HIGH-A step 5 (doc): docs/api/session-api.md §4.2 — added a FROZEN "u64 wire encoding" paragraph:
+  every u64 wire field (operation/transaction ids, format customPeer, event cursors, recalc op-ids,
+  recalc_progress op/done/total) crosses as a DECIMAL STRING; in-process a binding MAY use a native
+  big-int (napi BigInt → quoted decimal via stableStringify) but the serialized form is a string;
+  a binding emitting a JSON number for a u64 is non-conformant; u32 fields (customCounter, n_rows/
+  n_cols) stay JSON numbers. Freeze BANNER untouched.
+
+### HIGH-B — already done (both Session constructors guarded). Skipped. Left untouched.
+
+### MED-1 — pyo3 reject explicit None for optional DTO fields (match napi reject-null)
+crates/quantbook-py/src/lib.rs:
+  - ~L240 opt_f64: a key PRESENT with explicit None → loud `bad_argument` (was: treated as absent).
+            A MISSING key still → None (OK). Used by the arity tagged-union converter.
+  - ~L651 displayName reader in function_metadata_from_py: present-explicit-null → loud `bad_argument`
+            (was: `Some(x) if x.is_none() => None`). Missing → None (OK).
+  Scope note: the `has()` presence helpers in cell_value/format_id/session_op converters were left
+  as-is — there, "present-null counts as absent" MATCHES napi (`Option<f64>` null → None → not an
+  extraneous-field reject). Required-field readers (number/boolean/text) already reject null-as-missing
+  consistently with napi. So MED-1 is correctly scoped to the value-extraction optional readers.
+
+### MED-2 — missing REQUIRED list → `bad_argument` on BOTH bindings
+crates/ql-bindings-node/src/lib.rs — made the napi required-list DTO fields `Option<Vec<String>>`
+  + explicit presence checks producing `bad_argument_error(...)`:
+  - FunctionMetadataJson.aliases / .provenance_tags → `Option<Vec<String>>`; function_metadata_from_json
+    now `.ok_or_else(bad_argument)` for each missing field; function_metadata_to_json wraps both in `Some(...)`.
+  - TableSpecJson.column_names → `Option<Vec<String>>`; session_table_spec_from_json `.ok_or_else(bad_argument)`.
+  Result: a MISSING required list surfaces the structured `[bad_argument]` (matching pyo3 req_str_list),
+  not a generic napi-deserialize Status error. DTO field names/camelCase unchanged.
+
+### MED-3 — matrix anti-vacuity guard: EXACT ordered step list
+crates/quantbook-py/tests/parity_matrix.py:
+  - Added EXPECTED_STEPS = the canonical 23-step ordered list (was 22; +1 for `recalc_op_id`).
+  - run_emitter now asserts `[row["step"] for row in parsed] == EXPECTED_STEPS` verbatim (was
+    `len(parsed) < 10`), failing loud with expected-vs-actual on any drop/rename/reorder.
+
+### MED-4 — matrix field-compares the FULL FunctionMetadata DTO
+Both golden emitters: the `register_udf` step now records the FULL metadata dict of the registered
+  "MYUDF" entry (`metadata: myudf`) in addition to `present` + `total`, so the comparator field-checks
+  every FunctionMetadata field (canonicalName/aliases/volatility/depShape/batchShape/argPolicy/
+  cancellation/argContext/arity{...}/provenanceTags/determinism) cross-binding.
+  - golden_flow.mjs: `const myudf = fns.find(f => f.canonicalName==="MYUDF") ?? null; rec("register_udf",{present:myudf!=null,total:fns.length,metadata:myudf})`.
+  - golden_flow.py: `myudf = next((f for f in fns if f["canonicalName"]=="MYUDF"), None); rec("register_udf", present=myudf is not None, total=len(fns), metadata=myudf)`.
+  Verified the two output converters emit identical field sets (displayName omitted when None on both).
+
+### MED-5 — OperationState.Failed.error → nested structured object (cross-repo, IDE-touching)
+napi (crates/ql-bindings-node/src/lib.rs):
+  - New `#[napi(object)] OperationErrorJson { code, class, retryable, details?, source? }`.
+  - OperationStateJson.error retyped `Option<String>` → `Option<OperationErrorJson>`.
+  - operation_state_json_from_session Failed arm → `operation_error_json_from_engine_error(&error)`,
+    a new helper extracting the same code/class(via class_str)/retryable/details(JSON string when
+    non-empty)/source fields throw_structured uses.
+pyo3 (crates/quantbook-py/src/lib.rs):
+  - operation_state_to_py Failed arm: `error` set to a nested dict {code, class(via class_str),
+    retryable, details? (JSON string when non-empty), source?} from the same EngineError fields
+    (was `format!("[{}] {}", error.code, error.message)`).
+IDE (extensions/quantlab/src/quantbook/types.ts):
+  - New `interface OperationErrorJson { code; class; retryable; details?; source? }`.
+  - OperationStateJson.error retyped `string` → `OperationErrorJson`.
+  - NO session.ts consumer change needed: `grep` confirms OperationStateJson is referenced ONLY in
+    types.ts (its def + EventJson.state?); no code reads `.error` as a string.
+
+### LOW-1 — Node harness errCode native-first
+crates/ql-bindings-node/tests/golden_flow.mjs errCode: now prefers native `.code` FIRST (skipping
+  the generic napi "GenericFailure" Status, which is not a stable engine code), then falls back to
+  the `[code]` message-prefix regex — matching the Python `_err_code` order. Error-path golden steps
+  still pass (parity OK).
+
+================================================================================
+VERIFICATION RESULTS (all output routed to files, read back)
+================================================================================
+1. cargo build -p ql-bindings-node (debug)   → Finished, no errors/warnings.
+   cargo build -p ql-bindings-node --release  → NODE_REL_EXIT=0, Finished.
+2. cargo build -p quantbook-py (debug)        → PY_DEBUG_EXIT=0, Finished.
+   cargo build -p quantbook-py --release      → PY_REL_EXIT=0, Finished.
+3. cargo test -p ql-exec --lib                → test result: ok. 802 passed; 0 failed (EXIT=0).
+   cargo test -p ql-exec --lib --features xlsx-write → ok. 802 passed; 0 failed (EXIT=0).
+4. cargo clippy -p ql-bindings-node --all-targets → CLIPPY_NODE_EXIT=0, no warnings.
+   cargo clippy -p quantbook-py               → CLIPPY_PY_EXIT=0, no warnings.
+5. node crates/ql-bindings-node/tests/smoke_session.mjs → SMOKE_EXIT=0, "[smoke] ALL BLOCKS PASSED".
+6. /opt/homebrew/bin/python3.12 crates/quantbook-py/tests/parity_matrix.py
+                                              → "PARITY OK (23 steps matched across Node + Python rows)", EXIT=0.
+   Re-run (mandated)                          → "PARITY OK (23 steps matched...)", EXIT=0.
+7. IDE npx tsc --noEmit -p ./                 → TSC_EXIT=0 (no type errors).
+   IDE npx eslint src/quantbook --ext ts      → ESLINT_EXIT=0 (no lint errors).
+
+================================================================================
+DEVIATIONS FROM THE BRIEF (and why)
+================================================================================
+- HIGH-A step 3 (pyo3 txn input symmetry) — NOT IMPLEMENTED because it does not apply: the pyo3
+  facade binds NO transaction methods (txn_add/commit_transaction/rollback_transaction). Confirmed
+  by enumerating all pyo3 #[pymethods] (24 methods; `batch` is the only atomic-group method). The
+  facade docstring explicitly files transactions forward. There is no code to retype. Not a defect.
+- HIGH-A step 4 witness uses the first-recalc OperationId (deterministically 1), NOT a beginTransaction
+  TransactionId. Reason: neither golden flow opens a transaction and pyo3 cannot return a txn id (no
+  binding). The brief's premise ("there is a begin/txnAdd/commit/rollback section") does not hold for
+  these flows. The first `recalcDirty()` op id is the equivalent deterministic, comparable-UNMASKED
+  u64 (both `next_op_id` and `next_txn_id` start at 1). The witness satisfies the brief's stated
+  intent verbatim: post-fix both emit "1"; pre-fix pyo3 emitted JSON number 1 vs napi "1" → divergence.
+  EXPECTED_STEPS count is therefore 23 (22 + recalc_op_id), as the brief anticipated for the new step.
+- No engine logic was changed (6.3 is binding-layer only). 802/802 tests unchanged in both feature
+  sets confirms this.
+
+================================================================================
+git status --porcelain (touched files — for the parent's freeze diff review)
+================================================================================
+ENGINE repo (paths shown relative to the outer git root; the engine tree sits under quantbook-engine/):
+ M quantbook-engine/crates/ql-bindings-node/src/lib.rs
+ M quantbook-engine/crates/quantbook-py/src/lib.rs
+ M quantbook-engine/crates/ql-bindings-node/tests/golden_flow.mjs
+ M quantbook-engine/crates/quantbook-py/tests/golden_flow.py
+ M quantbook-engine/crates/quantbook-py/tests/parity_matrix.py
+ M quantbook-engine/docs/api/session-api.md
+(Plus the pre-existing uncommitted HIGH-B constructor edits already in ql-bindings-node/src/lib.rs +
+ quantbook-py/src/lib.rs from before this session — same two files, not re-touched for HIGH-B.)
+
+IDE repo:
+ M src/quantbook/types.ts
+
+NOT committed. Freeze NOT declared. MASTER-PLAN/entry-plan/decision-lock untouched. session-api.md
+freeze BANNER untouched (only the §4.2 u64 doc note added).

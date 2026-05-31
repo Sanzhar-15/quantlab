@@ -1,5 +1,20 @@
 # Engine Session API — Stable Contract (Phase 6.1A)
 
+> ## 🔒 FROZEN v1 — 2026-05-31 (Phase 6.3-5 exit gate)
+> The `EngineSession` binding contract is **FROZEN v1** as of 6.3-5. Its DTO shapes
+> (field names + camelCase keys), the `EngineError` taxonomy + structured-error
+> own-properties (`code`/`class`/`retryable`/`details`/`source`), the **u64 = decimal
+> string** wire encoding (§4.2), the `OperationState.Failed.error` nested-object shape
+> (§ below), and the `Buffer`/`BigInt` conventions are a forward-compatibility
+> commitment: additive changes only; any breaking change requires a new schema version.
+> **Basis for the freeze:** ≥2 structurally-different binding rows (Node napi + the
+> thin `quantbook-py` pyo3 facade) pass one canonical 22-step golden flow byte-identical
+> (`crates/quantbook-py/tests/parity_matrix.py` — PARITY OK, now 23 steps incl. the
+> deterministic unmasked u64 witness), plus a 3-lane closure megaudit (Codex + engine
+> Opus + IDE-aware Opus) clean after fold-all
+> (`docs/audits/2026-05-31-6-3-5-closure-megaudit/`). WASM/C rows are v1.5-deferred
+> (decision-lock §2 item 8) and add a matrix row when built — purely additive.
+
 **Status:** ✅ v2 — REVISED 2026-05-26 after the Codex 6.1A contract review (gpt-5.5 xhigh,
 verdict REVISE → all 5 HIGH / 5 MED / 2 LOW / 1 INFO resolved in this revision). Full review:
 `docs/api/codex-6-1a-review.md`. This is the API6-01 deliverable — the contract **6.1B**
@@ -429,6 +444,19 @@ clear the delta cache, so the next `snapshotDelta` against an older token full-r
 **6.3-4 — a SECOND binding row (Python) over pyo3.** The thin pyo3 `Session` facade (`quantbook._quantbook`) SHIPPED 2026-05-31 (engine `38f4f51dfac`), wrapping the SAME `EngineSession` contract this document specifies. A cross-binding **golden parity matrix** (`crates/quantbook-py/tests/parity_matrix.py`) runs one canonical 22-step flow through Node AND Python and asserts byte-identical DTOs + error codes (masking only the opaque `version`/`nextCursor` tokens) -- so the contract is now exercised by two structurally-different bindings, not Node self-consistency alone. The Python facade is THIN (golden-flow methods only); the 5 reserved §2c bulk methods stay Capability-erroring (6.5). Errors cross as a `QuantbookError(Exception)` carrying the same `code`/`class`/`retryable`/`details`/`source` the napi native error carries. NEXT = 6.3-5 (declare the contract frozen on ≥ 2 passing rows).
 
 ### 4.2 Core DTOs (extracted from the proven `#[napi(object)]` structs; `+` = added/clarified)
+
+**u64 wire encoding (FROZEN — 6.3-5 HIGH-A):** Every `u64`-typed wire field —
+operation ids, transaction ids, format `customPeer`, event cursors (`nextCursor`),
+recalc op-ids, and the `recalc_progress` `op`/`done`/`total` counters — crosses as
+a **decimal STRING** in the canonical JSON projection. In-process a binding MAY use
+its native big-int (napi `BigInt`; the harness `stableStringify` renders a `BigInt`
+to a quoted decimal string), but the **serialized form is a decimal string**. The
+pyo3 facade therefore emits `str(value)` for these fields (a Python `int` would
+serialize as a JSON number → a cross-binding mismatch). A binding that emits a JSON
+**number** for a `u64` is **non-conformant**. (`u32`-typed fields — e.g. format
+`customCounter`, `RangeResult.n_rows`/`n_cols` — stay JSON numbers; only `u64`
+crosses as a string.)
+
 - **`CellValue`** (← `CellValueJson`, `lib.rs:580`): a **discriminated union** on `kind`
   (`number`/`boolean`/`text`/`error`/`blank`/`pending`), exactly one payload. Bindings narrow on `kind`.
   `blank` (added 6.1B inc.2c) maps from `ql_types::Value::Blank` — needed so a columnar `query_range`

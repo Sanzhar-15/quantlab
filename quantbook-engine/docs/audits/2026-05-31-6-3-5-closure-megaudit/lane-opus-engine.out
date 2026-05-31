@@ -1,0 +1,279 @@
+# 6.3-5 Closure Megaudit — ENGINE OPUS lane (re-run, COMPLETE read)
+
+## VERDICT: SHIP-WITH-FIXES
+
+The 6.3 `EngineSession` binding contract is freeze-ready on its **tested surface**:
+panic-boundary coverage is total on both bindings, the error taxonomy genuinely
+cannot fork for engine-taxonomy errors (both bindings forward the SAME engine
+`EngineError.code/.class/.retryable` — neither invents codes), No-Fallbacks
+discipline holds in both converter sets, the golden flow exercises the SAME steps
+through both rows, and the parity comparator is non-vacuous.
+
+BUT there are **latent cross-binding divergences in DTO value REPRESENTATION (u64
+fields) that the golden flow does not exercise** and that, once frozen, become
+permanent warts fixable only with a breaking change. None are hit by the matrix (so
+the matrix passes honestly), but a freeze gate is exactly where they must be recorded
+and ideally fixed. HIGH-1 and HIGH-2 are one root cause; fix or explicitly waive (with
+a pinning test) BEFORE freeze. The MED/LOW are fix-or-document in the same pass.
+
+Coverage: this re-run READ the full surface despite a severe intermittent tool-channel
+fault (hundreds of empty Read returns + single-line-only Bash for stretches; recovered
+via temp-file slicing + single-pattern greps + anchor maps). Every finding cites text
+read directly. Read in full: napi `impl Session` (constructor + 42 methods,
+lib.rs:5559-6857, every `#[napi(..,catch_unwind)]` attr enumerated via the 167-line
+anchor map); the error helpers (engine_error_to_napi/throw_structured/class_str/
+guarded/panic_payload_message lib.rs:4254-4353); all output+input converters
+(cell_value/format_id both directions, session_range, session_table_spec, session_op,
+event, operation_state, lib.rs:4444-5253); the DTO structs (CellValueJson, FormatIdJson,
+CellSnapshotJson, WorkbookSnapshotJson, WorkbookSnapshotDeltaJson, UndoRedoResultJson,
+EventJson, EventPageJson, OperationStateJson); the reserved §3.5 stubs (lib.rs:6407-6518);
+the pyo3 facade in full (quantbook-py/src/lib.rs 1-1329); build.rs; Cargo.toml; both
+golden emitters; parity_matrix.py; session-api.md (all 975 lines incl. Appendix A);
+the EngineSession trait (346 lines).
+
+---
+
+## FINDINGS
+
+### HIGH-1 · `FormatId.Custom.customPeer` (u64): BigInt-string in Node, JSON number in Python — frozen DTO diverges across bindings
+- napi `format_id_json_from_session` (lib.rs:4476-4481): `custom_peer: Some(BigInt::from(peer))`.
+  The harness `stableStringify` (golden_flow.mjs:248) renders a BigInt as
+  `JSON.stringify(v.toString())` → a **quoted decimal string**.
+- pyo3 `format_id_to_py` (quantbook-py/src/lib.rs:390-394): `d.set_item("customPeer", *peer)`
+  (`peer: u64`) → a **JSON number**.
+- Input side diverges too: napi `session_format_id_from_json` consumes a `BigInt` via
+  `peer_bigint.get_u64()` (lib.rs:4528, sign+lossless checked); pyo3 `format_id_from_py`
+  takes a plain int via `u64_from_pyany` (src/lib.rs:1129). Node callers MUST pass a
+  BigInt; Python callers pass an int.
+- WHY AT FREEZE: `FormatId.Custom` is a frozen §4.2 DTO. A JSON consumer parsing Node
+  output gets `customPeer:"12345"` (string); Python gives `customPeer:12345` (number) —
+  a real wire-shape fork in a frozen DTO. INVISIBLE to the matrix because the golden flow
+  only ever uses `builtin 0` (every setFormat/registerFormat path), so "PARITY OK" never
+  covers the Custom branch.
+- FIX: pick the frozen u64 representation ONCE. Decimal STRING is the only lossless
+  JSON-portable choice for full u64 (a JSON number loses precision >2^53 — exactly why
+  Node chose BigInt). Apply to BOTH rows (Node: `.toString()` at the seam / accept string
+  input; Python: emit `str(peer)` / parse string input) and ADD a matrix step that creates
+  a custom format so the representation is pinned by a test.
+
+### HIGH-2 · Same u64 fork on `Event.op`, `EventPage.nextCursor`, `TransactionId`, recalc op-ids — BigInt in Node, int in Python
+- napi: `EventJson.op: Option<BigInt>` (lib.rs:5110), set via `BigInt::from(op.0)`
+  (lib.rs:5212 recalc_progress, :5224 operation_completed); `EventPageJson.next_cursor:
+  BigInt` (lib.rs:5139), set `BigInt::from(p.next_cursor.0)` (:5250); `recalcDirty`/
+  `recalcAll` return `BigInt` (lib.rs:5662/5675); `beginTransaction` returns
+  `BigInt::from(txn.0)` (:6352); `EventJson.done`/`total` also `Option<BigInt>` (:5213-14).
+- pyo3 emits plain Python ints everywhere: `op.0`, `page.next_cursor.0`
+  (src/lib.rs:1228/1238/1257), `recalc_dirty` returns `op.0` (:909).
+- WHY AT FREEZE: same frozen-in fork as HIGH-1, on the frozen `Event`/`EventPage` DTOs.
+  `nextCursor` is in `MASK_KEYS` (parity_matrix.py:41) so masking HIDES its representation
+  divergence rather than removing it from the contract. `Event.op` is NOT masked, but the
+  golden `poll_events` step records only `count`, `dropped`, and sorted `kinds` — it never
+  reads `op`, so int-vs-string is never surfaced. (The events emitted by the flow are the
+  recalc completions; the `op` field IS present in the DTO but uncompared.)
+- FIX: decide the u64 wire representation ONCE (decimal string, per HIGH-1), apply to
+  both rows, add matrix coverage comparing a non-masked `op`/cursor value. At minimum
+  DOCUMENT in §4b "u64 fields are BigInt in Node, int in Python, value-masked in the
+  matrix" as an EXPLICIT accepted asymmetry — but note documentation does not make two
+  JSON parsers agree.
+
+### MED-1 · Missing required list field (`aliases`/`provenanceTags`/`columnNames`) → DIFFERENT error codes across bindings
+- pyo3 `req_str_list` (quantbook-py/src/lib.rs:687-694) makes these REQUIRED: a missing
+  field → structured `bad_argument` (native `.code="bad_argument"`), explicitly documented
+  as a No-Fallbacks cross-binding parity requirement.
+- napi models them as non-`Option` `Vec<String>` on the `#[napi(object)]` DTO
+  (FunctionMetadataJson.aliases/provenance_tags; TableSpecJson.column_names — confirmed
+  `column_names: spec.column_names` passed straight through, session_table_spec_from_json
+  lib.rs:4594). A missing field in JS is rejected by napi-rs's OWN object deserialize as a
+  generic type error: `.code` is napi's default Status (NOT "bad_argument"), the message
+  has no `[bad_argument]` prefix. So Node's `errCode` returns the napi Status; Python
+  returns `"bad_argument"`.
+- WHY AT FREEZE: §5.1 promises the SAME code for the same malformed-DTO condition across
+  bindings; here they diverge. Not hit by the matrix (the golden flow always supplies
+  `aliases:[]`/`provenanceTags:[]`/`columnNames:[...]`).
+- FIX: add a matrix error-row that omits a required list field and assert the SAME code on
+  both (fails today → forces the real fix), OR document the asymmetry as accepted. The
+  matrix-row choice is freeze-correct.
+
+### MED-2 · The matrix never compares a full `FunctionMetadata` DTO field-by-field — only `present`+`total`
+- golden `register_udf` records `present` (is MYUDF listed) + `total` (count); it never
+  compares any function's full metadata DTO across bindings. The per-field converters
+  (function_metadata_to_json napi side; function_metadata_to_py src/lib.rs:696-758) emit
+  identical keys + enum strings, but that equivalence is never EXERCISED.
+- WHY AT FREEZE: `FunctionMetadata` (§10.2) is a frozen ~12-field DTO. A representation
+  drift in any field (e.g. an enum string) would pass the matrix today. Coverage gap.
+- FIX: add a matrix step pinning the full DTO of one deterministic built-in (e.g. find
+  `SUM` in `list_functions()` and compare its entire metadata dict). Cheap.
+
+### MED-3 · `OperationState.Failed.error` flattens the structured error to a `"[code] message"` STRING in BOTH bindings — a frozen-in lossy shape
+- napi `operation_state_json_from_session` (lib.rs:5187-5190):
+  `error: Some(error.to_string())` where the `Display` is `"[code] message"`
+  (OperationStateJson.error: Option<String>, lib.rs:4989). pyo3 identical
+  (operation_state_to_py src/lib.rs:1301-1304: `format!("[{}] {}", error.code, error.message)`).
+- WHY AT FREEZE: this is SYMMETRIC (no cross-binding fork — good) but it FREEZES
+  `OperationState.Failed.error` as a STRING that re-buries the code in a `[code]`-prefix —
+  the exact anti-pattern §5.1 killed for the MAIN error channel. Once frozen, a consumer
+  wanting `{code,class,retryable}` of a failed op can only string-parse. Not exercised by
+  the golden flow (no op reaches `Failed`; `operation_status` is bound at lib.rs:5784 but
+  the flow never calls it, and `poll_events` only ever sees `completed`).
+- FIX (cheap, before freeze): emit `OperationState.Failed.error` as a nested structured
+  object `{code,class,retryable,message,details?,source?}` mirroring the main error DTO,
+  in BOTH bindings. Post-freeze it is breaking.
+
+### LOW-1 · Node harness `errCode` prefers the `[code]` message prefix over native `.code` — opposite order to Python; converges only because no engine message starts with `[`
+- golden_flow.mjs:62-69 takes the `[...]` message prefix FIRST, native `.code` second.
+  Python `_err_code` (golden_flow.py:77-89) takes native `.code` FIRST. Both converge today
+  only because no engine-taxonomy message in the flow begins with `[`.
+- WHY AT FREEZE: a future engine error whose message legitimately begins with `[` would
+  make the Node row mis-extract while Python reads the correct native code → spurious
+  PARITY MISMATCH. TEST-HARNESS-only (the real IDE `parseQuantbookError` is native-first
+  per §5.1; this does NOT affect the frozen binding contract) — but a latent matrix
+  fragility worth a one-line reorder (native-`.code`-first, prefix fallback).
+
+### INFO-1 · The 5 deferred §2c bulk methods: honest loud-Capability on Node, absent on Python — correct; record the asymmetry as a written freeze decision
+- napi binds all 5 — writeRange/publishDataset/bindRange/refreshSource/materializeQuery
+  (lib.rs:6420/6444/6465/6479/6503) as thin forwarders that always surface
+  `not_implemented_in_v1_core` (Capability; the §3.5 stub block is documented at
+  lib.rs:6407-6416 — "ALWAYS surface not_implemented_in_v1_core", `-> ()`, `.map(|_|())`).
+  pyo3 omits them (thin facade, documented src/lib.rs:16-19). Neither silently succeeds —
+  No-Fallbacks honored. Record "Node Session has 5 loud-erroring stubs, Python Session has
+  none" as the intended v1 shape so a later Python binding doesn't make them succeed.
+
+### INFO-2 · Method-surface asymmetry between the two rows is intentional but worth pinning in the freeze record
+- napi `Session` is the FULL 6.3 surface (42 methods incl. unregisterFunction lib.rs:6609,
+  setUdfWorker :6666, transactions, import/export, start/await-recalc, cancel/
+  operationStatus, queryRange, setName, all sheet/table ops). The pyo3 facade is
+  intentionally THIN (~24 golden-flow methods; documented). Fine for a "≥2 rows pass the
+  SAME golden flow" freeze, but the record should state the Python row does NOT yet cover
+  transactions / import-export / start-await-recalc / cancel / queryRange /
+  unregisterFunction / setName — so a future "Python is a full binding" claim isn't read
+  into 6.3-5.
+
+---
+
+## VERIFIED CLEAN (with how I confirmed)
+
+- **Panic-boundary completeness — TOTAL on both rows.** napi: EVERY method in `impl Session`
+  carries `#[napi(.., catch_unwind)]` AND wraps its body in `guarded(env, "<name>", || …)`
+  — enumerated the full attribute list from the anchor map (constructor 5561; addSheet 5572;
+  setValue 5592; setFormula 5618; clear 5641; recalcDirty 5654; recalcAll 5667;
+  startRecalcDirty 5687; startRecalcAll 5702; awaitRecalc 5720; cancel 5749; operationStatus
+  5783; snapshot 5808; cell 5821; listSheets 5841; lifecycleState 5875; validateFormula 5886;
+  queryRange 5911; markVolatilesDirty 5936; setFormat 5950; registerFormat 5972; close 5996;
+  open 6020; import 6041; save 6055; export 6070; renameSheet 6099; deleteSheet 6113;
+  restoreSheet 6127; moveSheet 6143; setName 6171; createTable 6203; renameTable 6219;
+  renameColumn 6234; resizeTable 6255; dropTable 6279; batch 6314; beginTransaction 6344;
+  txnAdd 6359; commitTransaction 6377; rollbackTransaction 6396; writeRange 6420;
+  publishDataset 6444; bindRange 6465; refreshSource 6479; materializeQuery 6503;
+  registerFunction 6562; unregisterFunction 6609; listFunctions 6629; setUdfWorker 6666;
+  pollEvents 6735; snapshotDelta 6778; undo 6795; redo 6809; canUndo 6822; canRedo 6829).
+  `__forcePanicForTest` (6855) is `#[cfg(debug_assertions)]`-gated, in a SECOND
+  `impl Session` block (6854), debug-only, documented. pyo3: every method in
+  `#[pymethods] impl Session` (src/lib.rs:788-1075) wraps in `guarded(py, "<name>", || …)`;
+  probe at src/lib.rs:1069. `guarded` on both = catch_unwind → `EngineError::panic` → code
+  `"panic"` (napi lib.rs:4330-4341 / pyo3 src/lib.rs:138-146); release-build caveat handled
+  symmetrically by both emitters (`note:"probe-absent-release"`).
+- **Error taxonomy cannot fork for engine-taxonomy errors.** Both bindings route every
+  engine error through a converter that READS `e.code`/`e.class`/`e.retryable` from the SAME
+  engine `EngineError` (napi throw_structured lib.rs:4275-4293 sets .code/.class/.retryable/
+  .details(JSON-string)/.source; pyo3 engine_error_to_pyerr src/lib.rs:93-124 sets the
+  identical five attributes). Neither maps variants→codes itself — codes are produced once
+  in the engine (map_runtime_err/map_oplog_err/map_function_registry_err, exhaustive per
+  §5.4 + Appendix A). `class_str` byte-identical (napi lib.rs:4297-4310 vs pyo3
+  src/lib.rs:74-87). The matrix masks ONLY `version`/`nextCursor` (parity_matrix.py:41);
+  error `code`s compared verbatim.
+- **FFI `bad_argument` channel parity.** napi `bad_argument_error` (lib.rs:564) produces the
+  `[bad_argument]`-prefix string with default `.code`; the `.mjs` errCode recovers it from
+  the prefix; pyo3 `bad_argument` (src/lib.rs:129) sets a NATIVE `.code="bad_argument"` and
+  the `.py` _err_code reads it. For the codes the golden flow exercises (err_bad_kind →
+  unknown value kind; err_dup_sheet → sheet_name_duplicate; err_register_builtin →
+  function_exists; err_post_close → invalid_state) both rows converge — the matrix passing
+  proves it.
+- **engine_error_to_napi degrades RICHNESS only, never masks (No-Fallbacks).** On a
+  structured-throw build failure (lib.rs:4263-4265) it STILL surfaces `e` via `{e}` Display
+  AND appends the build failure so the binding defect is visible — not a swallow. throw_structured
+  surfaces a details-serialize failure loud (lib.rs:4283-4285). pyo3 mirror surfaces setattr
+  failure (src/lib.rs:120-123) + details-serialize as a panic error (:107-112).
+- **No-Fallbacks discipline in input converters.** napi session_cell_value_from_json,
+  session_format_id_from_json (lib.rs:4492-4551), session_op_from_json (:4604-4663),
+  session_table_spec_from_json (:4579), arity_from_json and the pyo3 twins are STRICT tagged
+  unions: `reject_extra` on every off-kind field, loud `bad_argument` on missing required
+  fields and unknown kinds, non-finite numbers rejected. No `|| default`, no swallowed
+  errors. The §3.5 reserved stubs validate inputs to keep types honest but always return
+  `not_implemented_in_v1_core` (documented they deliberately do NOT enforce the full input
+  contract — that lands with the real impl).
+- **Numeric boundary validators equivalent; no silent ToUint32.** napi validate_u32_index/
+  validate_u16_index (lib.rs:175/225) reject non-finite/negative/fractional/oversize; all
+  `WorkbookSession` coord/dim args are `f64` so they reach the validator UN-coerced
+  (addSheet chunk_rows: f64 5573; setValue/cell coords f64; createTable via
+  session_table_spec_from_json; format payloads `Option<f64>` via session_format_id_from_json).
+  Found NO get_uint32/ToNumber coercion in any 6.3 Session method. BigInt→u64 rejects
+  sign+non-lossless (transaction_id_from_bigint lib.rs:4674; customPeer :4528-4538). pyo3
+  validate_u32_index/validate_u16_index (src/lib.rs:168/196) + u64_from_pyany (:766) impose
+  the same domain. (NOTE: the u64 OUTPUT representation is HIGH-1/HIGH-2; INPUT validation is
+  clean.)
+- **Parity comparator is non-vacuous.** parity_matrix.py: run_emitter refuses a transcript
+  that isn't a list of ≥10 records (:74-76); success branch is literal `node_t == py_t` deep
+  equality on the FULLY-MASKED structures (:97), with a first-divergence diff (:80-87).
+  Masking is NARROW (named keys only, recursive, :44-56) so it cannot blank a sibling key.
+  `if __name__ == "__main__": raise SystemExit(main())` (:111-112) — exit code IS propagated
+  (main returns 1 on mismatch). The ≥10 guard is sound (the flow emits ~27 step records).
+- **Both rows run the SAME steps.** golden_flow.mjs:84-231 vs golden_flow.py:107-251 read
+  side by side: identical step sequence + names (lifecycle_initial, add_sheet, recalc,
+  b1_value, snapshot, delta_after_edit, delta_empty_token, table_sum, batch_applied,
+  batch_d1, can_undo_before, undo, redo, persist_a1, register_udf, poll_events, panic,
+  after_panic_lifecycle, err_dup_sheet, err_bad_kind, err_register_builtin, err_post_close),
+  same recorded fields, same literal inputs (10, A1+1, F6=77, SUM(Sales[Qty]), C1*2,
+  builtin 0). Neither stubs/skips a step. delta_after_edit pins schemaVersion + the
+  changed-cell coordinate + value (not mere presence); poll_events pins sorted-unique kinds.
+- **Output DTO key/camelCase parity.** snapshot (sheets/formats/dateSystem/version/
+  schemaVersion), delta (changedCells/removedCells/sheetsChanged/sheetsRemoved/formatsAdded/
+  version/fullRebuildRequired/fullRebuildReason/schemaVersion), batchResult (applied/version),
+  undoRedo (consumed/version), cellSnapshot (row/col/value?/formula?/format?/rendered?),
+  cellValue (kind+payload — both add `blank`: napi cell_value_json_from_session lib.rs:4453,
+  pyo3 :372), eventPage (events/nextCursor/dropped), event (kind+per-variant: recalc_progress/
+  cell_diagnostic/operation_completed/provenance/structure_changed/full_resync_required) —
+  key-for-key identical between lib.rs:4444-5253 and src/lib.rs:352-1307. Absent Option fields
+  omitted on both. fullRebuildReason enum strings identical (no_prior_version/cache_cleared/
+  stale_horizon/epoch_mismatch — napi full_rebuild_reason_str lib.rs:392-399 vs pyo3 :499-504).
+  DateSystem strings identical (Excel1900/Excel1904). (u64 sub-field REPRESENTATION is the
+  HIGH-1/HIGH-2 exception; KEY parity is clean.)
+- **Lifecycle gating is the engine's, identical for both bindings.** Neither binding adds
+  gating — both call `self.inner.lock().<method>()` directly, so gating is the unchanged
+  engine's (ensure_ready in ql-exec/src/session.rs). The golden flow empirically pins it:
+  can_undo_before succeeds pre-close on both rows; err_post_close (a cell() after close())
+  throws invalid_state on both (matrix passes → codes match). canUndo/canRedo bound ungated
+  on both (lib.rs:6822/6829, src/lib.rs:988/993) per §3.8.
+- **Deferred §2c bulk methods never silently succeed** — see INFO-1; both honor No-Fallbacks
+  (Node loud Capability with `.map(|_|())` on the unreachable Ok arm, Python absent).
+- **`js_name="Session"` confirmed** on the owning struct (lib.rs:5554 `pub struct Session {
+  inner: Arc<Mutex<CoreWorkbookSession>> }`), wrapping `ql_exec::WorkbookSession` (the sole
+  EngineSession impl). The legacy `CollabSession` (lib.rs:1214) is a SEPARATE class with its
+  own `collab_session_error_to_napi` mapper (the `[kind]`-prefix-only legacy path) — NOT
+  reachable from WorkbookSession methods and NOT the 6.3 surface. The golden emitter
+  `new Session()` instantiates the owning class.
+- **macOS linkage** (quantbook-py/build.rs): `-undefined dynamic_lookup` emitted only on
+  macOS via `cargo:rustc-cdylib-link-arg`, scoped to this cdylib; Linux needs no flag.
+  Correct for the non-maturin raw-cdylib load. Cargo.toml re-enables pyo3 `macros` (dropped
+  by the workspace default-features=false pin) — necessary; abi3-py310 + extension-module
+  compose from the pin.
+- **Send/Sync positive proof** present on both (napi assert_send<CoreWorkbookSession> +
+  assert_send/sync<Session> near file end; pyo3 src/lib.rs:1323-1329) per audit Rule 4.
+- **pyo3 E0119 caveat handled correctly** — the debug-only probe lives INSIDE the single
+  `#[pymethods]` block with a per-method `#[cfg(debug_assertions)]` (src/lib.rs:1069); the
+  comment notes a second `#[pymethods] impl` would conflict without `multiple-pymethods`.
+
+---
+
+## BOTTOM LINE
+Ship the freeze AFTER resolving HIGH-1 and HIGH-2 — the u64-representation fork
+(BigInt-string in Node vs JSON int in Python on customPeer / Event.op / nextCursor /
+TransactionId / recalc op-ids). These are frozen-in DTO-shape divergences that a JSON
+consumer's two parsers would disagree on, and the matrix does not exercise them (it
+value-masks version/nextCursor and never reads `op` or a custom format). Fix-or-document
+MED-1/MED-2/MED-3 and LOW-1 in the same pass (each cheap; each closes a real divergence or
+a coverage gap that freezing makes permanent). Record INFO-1/INFO-2 as written decisions.
+The tested golden-flow surface is genuinely parity-clean and the panic/error/No-Fallbacks/
+lifecycle contract is sound — but a phase-FREEZE must not lock the u64 wire asymmetry
+without an explicit, tested decision.
+
+— ENGINE OPUS lane (complete read).

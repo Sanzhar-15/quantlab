@@ -1,0 +1,15 @@
+# 6.3-5 Closure Megaudit — CODEX lane (read-only, reasoning=high)
+# NOTE: Codex could not self-write (read-only sandbox); this is its verbatim inline verdict, transcribed from lane-codex-run.log:9676+.
+
+SHIP-WITH-FIXES
+
+Findings
+- LOW — crates/quantbook-py/tests/parity_matrix.py:74 — Anti-vacuity guard accepts >=10 steps while the closure claims a 22-step matrix; a future emitter that silently drops steps (down to 10) would still pass. Why at freeze: the parity matrix is THE cross-binding gate; its own guard should pin the contract's step count. Fix: assert len(parsed) >= 22 (or compare the exact ordered step-name list across rows) instead of >= 10.
+- INFO — crates/ql-bindings-node/src/lib.rs:565 / crates/quantbook-py/src/lib.rs:1303 — FFI bad_argument and the OperationStateJson.error DTO field carry the `[code] message` string form, while engine-taxonomy throws are native structured errors. This is the documented, intentional split (session-api.md §5.1); both bindings agree, so parity holds. No action; recorded so the freeze explicitly blesses the dual form.
+- INFO — golden_flow parity rows (py:108-251 / mjs:85-230) — Both emitters run the identical 22-step ordered flow (lifecycle_initial → add_sheet → recalc → b1_value → snapshot → delta_after_edit → delta_empty_token → table_sum → batch_applied → batch_d1 → can_undo_before → undo → redo → persist_a1 → register_udf → poll_events → panic → after_panic_lifecycle → err_dup_sheet → err_bad_kind → err_register_builtin → err_post_close), and the mask set is exactly {version,nextCursor}. Verified non-vacuous in practice.
+
+Verified clean
+- Cross-binding flow parity: Node and Python emit the same ordered step names with the same masked keys; DTO-bearing steps (snapshot schemaVersion, delta fullRebuildRequired, batch applied, undo/redo consumed, register_udf canonicalName/total) compare verbatim.
+- Error taxonomy parity: both rows assert error codes via a code-extracting helper (errCode / _err_code) on the dup-sheet, bad-kind, register-builtin, and post-close cases; the deferred §2c methods are not bound in the Python facade and remain Capability-erroring in Node.
+- No-Fallbacks: the parity error rows assert specific codes (not just "threw"); the panic row records a structured code or the documented release-probe-absent note rather than swallowing.
+- Panic boundary: both bindings route a deliberate panic to a structured [panic]/code and then assert the session is still queryable (after_panic_lifecycle), proving surface-not-abort.

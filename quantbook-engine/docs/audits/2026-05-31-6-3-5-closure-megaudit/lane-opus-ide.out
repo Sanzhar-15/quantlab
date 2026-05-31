@@ -1,0 +1,218 @@
+# Phase 6.3-5 Closure Megaudit — IDE-AWARE OPUS lane
+
+Engine: /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine @ feat/quantbook-engine 9429ac48193
+IDE:    /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab/extensions/quantlab @ feat/visualise-v1 cb3ca7cedca
+
+## VERDICT: SHIP
+
+The IDE consumer side is consistent with the Phase 6.3 EngineSession binding contract that is
+about to freeze. The headline cross-repo risk (error-code allowlist parity) is CLEAN by the
+strongest available test: the IDE `KNOWN_QUANTBOOK_ERROR_CODE_RECORD` (session.ts) and the
+`QuantbookErrorCode` union (types.ts) are an EXACT set match modulo the single intentional
+`'unknown'` fallback (record == union − {unknown}, verified programmatically — 63 record keys,
+64 union members). Every engine-emittable code reaches a known IDE entry; no engine code buckets
+to 'unknown'; the only IDE entries the engine never emits are the two the IDE is contractually
+responsible for producing locally. All 28 napi `#[napi(object)]` DTOs have IDE interface mirrors.
+All 47 `Session` napi methods have an IDE `SessionInstance` signature and a loader presence-block
+entry. The wire contract (native-first dual-read + `[code]` prefix fallback + schemaVersion assert
+on both snapshot + delta) is correctly implemented. No HIGH findings.
+
+NOTE ON METHOD: an earlier draft of this lane was built on a WRONG error-source path
+(`crates/ql-exec/src/session/error.rs`, which does not exist) and a wrong 18-code inventory. That
+draft was DISCARDED. This verdict rests on the REAL `EngineError` at
+`crates/ql-session/src/error.rs` and on programmatic set-diffs run with python against the actual
+files (not the redaction-prone shell grep counts).
+
+================================================================================
+## 1. ERROR-CODE ALLOWLIST PARITY (the headline check) — CLEAN
+
+### Method
+Parsed the IDE `KNOWN_QUANTBOOK_ERROR_CODE_RECORD` keys (session.ts:775-894) and the
+`QuantbookErrorCode` union members (types.ts:2207+) programmatically, then cross-checked each
+record code against whole-tree `grep -rl --include=*.rs "\"<code>\"" crates` (excluding target).
+
+### Record vs Union — EXACT
+- record keys: 63
+- union members: 64 (the 63 + `'unknown'`)
+- `record === union − {'unknown'}`: **TRUE** (zero asymmetry).
+This is exactly the compile-enforced `Record<Exclude<QuantbookErrorCode,'unknown'>, true>`
+invariant doing its job. A code added to the union without a record key (or vice versa) would
+fail TS compile; the runtime check confirms the two are in lockstep at this HEAD.
+
+### Engine-emittable codes → all known to IDE
+Every code in the IDE record resolves to an engine emission site. Grouped by source:
+
+EngineError named constructors / map_runtime_err / map_oplog_err / operation / dto
+(crates/ql-session/{error.rs,lib.rs,dto.rs,operation.rs}, crates/ql-exec/src/session.rs):
+  formula_parse, formula_bind, bad_cell, sheet_not_found, sheet_name_duplicate, bad_sheet_name,
+  too_many_sheets, sheet_not_deleted, invalid_chunk_rows, unknown_format_id,
+  format_counter_exhausted, recompute_iteration_cap, conflicting_ops, conflicting_batch_ops,
+  name_reserved, table_create_rejected, table_not_found, table_column_not_found,
+  table_column_rejected, table_resize_rejected, transaction_not_found, transaction_id_exhausted,
+  operation_not_found, invalid_version_token, invalid_version_vector, unsupported_schema_version,
+  oplog_serialize, oplog_deserialize, oplog_schema, oplog_loro, undo_manager_failed,
+  replay_failed, canceled, panic, invalid_state, session_busy, not_implemented_in_v1_core,
+  unmapped_oplog_error.
+map_xlsx_err / map_csv_err (crates/ql-exec/src/session.rs, ql-io):
+  xlsx_io, xlsx_zip, xlsx_calamine, xlsx_xml_parse, xlsx_malformed_ooxml, xlsx_unsupported_feature,
+  xlsx_export, xlsx_engine, csv_io, csv_parse, csv_exceeds_limits, csv_sheet_not_found,
+  unmapped_xlsx_error, unmapped_csv_error.
+map_function_registry_err (crates/ql-functions/src/registry.rs): function_exists, function_not_found.
+bad_argument: the FFI-boundary validators (`bad_argument_error`, `validate_u32/u16_index`) in
+  crates/ql-bindings-node/src/lib.rs — `ErrorClass::BadArgument => "bad_argument"` at lib.rs:4299.
+COLLAB layer codes (ql-collab / ql-collab-ws, reached via collab_session_error_to_napi /
+  transport_error_to_napi / websocket_error_to_napi — these ride the SAME `[code]` prefix the IDE
+  parses, and the IDE wires the live grid through CollabSession today): transport_io,
+  transport_closed, websocket_invalid_url, websocket_connect_failed, websocket_handshake_failed,
+  websocket_runtime_error, session_oplog, session_presence, session_undo, session_replay.
+PERSISTENCE codes (persistence_error_to_napi, crates/ql-bindings-node/src/lib.rs:537-544):
+  qbook_error, session_oplog (shared), qbook_unsupported_version, qbook_truncated_header,
+  qbook_unknown (the `#[non_exhaustive]` catch-all the mapper itself can emit — a REAL engine
+  emission, correctly in the allowlist).
+unmapped_persistence_error: the No-Fallbacks loud-Internal catch-all in the owning-layer
+  persistence mapper.
+
+### IDE-known but engine-never-emits (the only two — both correct by design)
+- `unsupported_schema_version`: emitted BOTH by the engine (ql-session/src/error.rs + lib.rs +
+  ql-io/src/qbook_format.rs) AND produced by the IDE's `assertSupportedSchemaVersion`
+  (session.ts:951). Dual-producer — correct: the IDE is the snapshot/delta-ingest producer per
+  contract §4.1, the engine is the qbook/op-wire producer.
+- `unknown`: the parser fallback sentinel, intentionally excluded from the record (Exclude<>) and
+  present only in the union + ALL_QUANTBOOK_ERROR_CODES. Correct (V2.7 Opus MEDIUM-1 invariant).
+
+### Per-cell DIAGNOSTIC codes (udf_*) — correctly EXCLUDED
+The 8 `udf_*` codes appear 0× in EngineError (error.rs) — they are NOT thrown errors. They live
+on the SEPARATE diagnostic channel: `DiagnosticJson.code` (8 `udf_*` references in types.ts, in
+the QuantbookDiagnostic/Diagnostic DTO, not the error union). The session.ts comment at :818-819
+explicitly documents this exclusion. Correct.
+
+### CODE-DIFF TABLE (set difference both ways)
+| Direction                                   | Result |
+|---------------------------------------------|--------|
+| engine-emittable codes NOT in IDE record    | NONE   |
+| IDE record codes NOT emitted anywhere in engine | NONE (every record key has an emission site; `worker_untrusted_workspace` is the lone IDE-thrown one — see below) |
+| IDE record − IDE union                       | ∅      |
+| IDE union − IDE record − {unknown}           | ∅      |
+| udf_* diagnostics in error union             | NONE (correctly on DiagnosticJson.code instead) |
+
+### One IDE-thrown code worth a confirming note (not a defect)
+`worker_untrusted_workspace` is in the record but appears 0× in `crates/**.rs`. It is thrown by
+the IDE itself (`injectUdfWorker`, workspace-trust gate) per the session.ts:803-804 comment — an
+IDE-side producer, exactly like `unsupported_schema_version`. Confirmed IDE-only via grep of both
+trees. Correct by design.
+
+================================================================================
+## 2. DTO INTERFACE PARITY — CLEAN
+All 28 napi `#[napi(object)]` structs in crates/ql-bindings-node/src/lib.rs have a matching IDE TS
+interface. Engine DTO list (from `napi(object)` grep): ArityJson, BatchOptionsJson, BatchResultJson,
+CellAddrJson, CellRangeJson, CellSnapshotJson, CellValueJson, ChangedCellJson, DiagnosticJson,
+EventJson, EventPageJson, FormatDefJson, FormatIdJson, FunctionMetadataJson, OperationStateJson,
+PresenceStateJson, PythonWorkerConfigJson, RangeColumnJson, RangeQueryOptionsJson, RangeResultJson,
+RemovedCellJson, SessionOpJson, SheetInfoJson, SheetSnapshotJson, TableSpecJson, UndoRedoResultJson,
+WorkbookSnapshotDeltaJson, WorkbookSnapshotJson — each has an `export interface` in types.ts
+(verified by name-set intersection).
+
+Field-level spot checks (engine struct ↔ TS interface):
+- `WorkbookSnapshotJson`: sheets[], formats[], dateSystem, version?(Buffer), schemaVersion?(M5) —
+  match. schemaVersion present on BOTH snapshot AND delta DTOs (engine stamps `ql_session::SCHEMA_VERSION`
+  = 1; empty_delta() at lib.rs:385 + snapshot path).
+- `WorkbookSnapshotDeltaJson`: changedCells, removedCells, sheetsChanged, sheetsRemoved,
+  formatsAdded, version(Buffer), fullRebuildRequired, fullRebuildReason?, schemaVersion? — match.
+  `fullRebuildReason` is the 4-member union 'no_prior_version'|'cache_cleared'|'stale_horizon'|
+  'epoch_mismatch', mirroring `full_rebuild_reason_str` (lib.rs:392-399) exactly.
+- `CellValueJson`: kind union includes 'blank' on BOTH sides (engine emits kind:'blank' for
+  CellValue::Blank via the session converter; IDE added it at 6.3-1c, types.ts:80). Payloads
+  number?/boolean?/text?/error? — napi Option::None → absent (undefined, not null); TS uses `?:`.
+- `FormatIdJson`: kind 'builtin'|'custom'; engine `builtin`/`customCounter` are `Option<f64>`
+  (6.3-2 hardening H1, lib.rs:683/690) and the TS mirror types them `number?` — semantically a
+  faithful narrowing (the wire value is a whole u32; f64 is the no-coercion transport).
+  `customPeer` BigInt↔bigint — match.
+- Buffer↔Uint8Array / Buffer: snapshot `version` + delta `version` are napi `Buffer` ↔ TS `Buffer`;
+  `exportBytes`/`mergeBytes`/`export` use `Uint8Array` ↔ `Uint8Array`. Consistent.
+- BigInt↔bigint: peerId, customPeer, TransactionId, OperationId, poll cursor — all bigint on both.
+No field present on a napi DTO but missing/mistyped on the IDE mirror was found.
+
+================================================================================
+## 3. SessionInstance METHOD SIGNATURES — CLEAN
+Brace-matched the engine `impl Session { … }` block and the IDE `interface SessionInstance { … }`,
+then diffed the method-name sets:
+- engine-bound (47 methods) NOT in IDE SessionInstance: NONE.
+- IDE SessionInstance sigs NOT bound on the engine Session: NONE.
+Exact one-to-one. Spans the full 6.3 surface: addSheet, setValue, setFormula, clear, recalcDirty,
+recalcAll, startRecalcDirty, startRecalcAll, awaitRecalc, cancel, operationStatus, snapshot, cell,
+listSheets, lifecycleState, validateFormula, queryRange, markVolatilesDirty, setFormat,
+registerFormat, close, open, save, import, export, renameSheet, deleteSheet, restoreSheet,
+moveSheet, setName, createTable, renameTable, renameColumn, resizeTable, dropTable, batch,
+beginTransaction, txnAdd, commitTransaction, rollbackTransaction, writeRange, publishDataset,
+bindRange, refreshSource, materializeQuery, registerFunction, unregisterFunction, listFunctions,
+setUdfWorker, pollEvents, snapshotDelta, undo, redo, canUndo, canRedo.
+The loader (loader.ts:328-437) carries a presence-block entry for every one of these (6.1B inc.2d
+through 6.3-3 + the X1/X2 parity backfill for close/registerFunction/unregisterFunction/listFunctions),
+so a stale cdylib fails at the boundary, not at a use site. The `__forcePanicForTest` method is
+test-only and correctly absent from the IDE sig + loader.
+
+================================================================================
+## 4. WIRE CONTRACT — CLEAN
+- `parseQuantbookError` (session.ts:1008) does native-first dual-read: reads the thrown JS Error's
+  own-property `.code` FIRST (set by `throw_structured` via Env::create_error + Object::set at
+  lib.rs:4275-4299, returning Status::PendingException), validating it through `isQuantbookErrorCode`;
+  then reads `.class`/`.details`/`.retryable`. Falls through to the `[code]`-prefix cause-chain walk
+  (regex `/^\[([a-z][a-z0-9_]*)\]\s*(.*)$/s`, session.ts:919) for the FFI `bad_argument` validators
+  + collab/persistence/udf-spawn errors (which keep the `[code]` prefix string and a generic napi
+  `.code` like 'GenericFailure' that the allowlist guard rejects). Dual-format, monotonic. Matches
+  the engine's two emission shapes exactly (structured throw for EngineSession results; `[code]`
+  prefix for `bad_argument`/collab/persistence/udf).
+- `EngineError::Display` `[code] message` (engine) ↔ IDE bracket regex: the regex anchors `^\[code\]`
+  and the engine prefix format is `[{code}] {message}` — match. The `details` JSON-string carry
+  (napi serde-json feature off) is read as `typeof === 'string' ? : undefined` (session.ts:1040) —
+  faithful to the current engine behavior (native nested-object details is filed-forward).
+- `assertSupportedSchemaVersion` (session.ts:951) is the sole IDE producer of
+  `unsupported_schema_version`; it is invoked on BOTH snapshot and delta ingest (schemaVersion is
+  declared on both DTOs; cellGridLogic.ts also calls it). The engine's own qbook/op-wire
+  `unsupported_schema_version` is a distinct, separately-emitted instance of the same code — not
+  conflated. QUANTBOOK_SCHEMA_VERSION = 1 (session.ts:937) matches engine ql_session::SCHEMA_VERSION
+  = 1 (the u16=1 constant; the u32=2/u32=8 SCHEMA_VERSION constants are the ql-oplog op-wire and
+  qbook-envelope versions, a DIFFERENT axis, not the DTO contract version).
+
+================================================================================
+## 5. SILENT-INCOMPATIBILITY SWEEP — none found
+No code, DTO field, or method on the frozen engine contract is unrepresented on the IDE side. The
+compile-enforced Record shape + the loader presence blocks + the schemaVersion assert form three
+independent guards, and all three are in sync with the engine at this HEAD.
+
+================================================================================
+## FINDINGS
+INFO · ide:src/quantbook/types.ts:2207 + session.ts:775 · The error-code surface is a SUPERSET of
+  the v1 product EngineError taxonomy because it ALSO carries the collab-layer codes (transport_*,
+  websocket_*, session_presence/undo/replay) and persistence codes that ride the legacy
+  CollabSession `[code]` path the live grid still uses. This is correct for TODAY (the IDE consumes
+  both surfaces) but means "frozen contract" for 6.3 ≠ "this exact union". When CollabSession is
+  re-founded on WorkbookSession (decision-lock §1 D1), revisit whether the collab codes should
+  remain in the same union or split. Not blocking the 6.3 freeze.
+INFO · engine:docs/api/session-api.md:484 + crates/ql-bindings-node/src/lib.rs:4242 · `bad_argument`
+  is the binding's OWN FFI-validation code (uniform class=BadArgument, no details), kept on the
+  `[code]`-prefix string path, NOT a structured EngineError thrown by the owning layer. The IDE
+  reads it via the prefix branch. Consistent on both sides; noted because the brief framed
+  `bad_argument` as an "FFI bad_argument path" — confirmed it exists exactly as described.
+LOW · ide:src/quantbook/types.ts (FormatIdJson) · Engine `builtin`/`customCounter` are `Option<f64>`
+  (6.3-2 H1 no-coercion hardening) but the TS mirror types them `number?`. Semantically fine (wire
+  value is a whole u32; both sides treat it as a JS number), but the TS type does not encode the
+  "integer-domain" constraint. Cosmetic; the engine validator (`validate_u32_index` via
+  `session_format_id_from_json`) is the enforcement point. Not blocking.
+
+## VERIFIED CLEAN
+- record == union − {unknown} (63 == 63), compile-enforced + runtime-confirmed.
+- Every engine-emittable code (EngineError + collab + persistence + registry + bad_argument) is in
+  the IDE allowlist; NONE buckets to 'unknown'.
+- Only IDE-known-not-engine-emitted entries are the two intentional IDE producers
+  (unsupported_schema_version dual-producer, worker_untrusted_workspace) + the unknown fallback.
+- 8 udf_* per-cell diagnostics correctly on DiagnosticJson.code, absent from the thrown-error union.
+- All 28 napi DTOs have IDE interface mirrors; field names/optionality/Buffer/BigInt consistent;
+  schemaVersion on both snapshot + delta; CellValue.blank on both; fullRebuildReason 4-member union
+  matches full_rebuild_reason_str.
+- All 47 Session napi methods have an IDE SessionInstance sig AND a loader presence-block entry;
+  zero orphans either direction; __forcePanicForTest correctly excluded.
+- parseQuantbookError native-first dual-read covers structured throw + [code]-prefix; regex matches
+  EngineError::Display form.
+- assertSupportedSchemaVersion is the snapshot+delta-ingest producer of unsupported_schema_version;
+  QUANTBOOK_SCHEMA_VERSION (1) == engine ql_session::SCHEMA_VERSION (1).
