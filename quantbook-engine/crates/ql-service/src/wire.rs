@@ -110,6 +110,20 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, EngineError> {
 /// Mirror of napi `CellValueJson`: a `kind`-tagged union. Exactly one payload
 /// field is present for `number`/`boolean`/`text`/`error`; `blank`/`pending`
 /// carry only `kind`.
+///
+/// **KNOWN number-encoding divergence (filed forward to 6.2-4; 6.2-1a audit
+/// Codex HIGH, disposition: deferred).** `number` is an `f64` serialized by serde
+/// as e.g. `6.0`, whereas napi crosses it as a JS `Number` that `JSON.stringify`
+/// renders as `6` (no trailing `.0` for integer-valued floats; ECMAScript also
+/// differs on exponent thresholds at `1e21`/`1e-7`). So number values are NOT
+/// byte-identical to the napi row today. This is the 6.2-0 filed-forward item
+/// ("the whole-f64 cell-value representation question for byte-identical parity
+/// (6.0 vs 6)") and already ships in the 6.2-0 `snapshot` endpoint; `queryRange`
+/// (6.2-1a) reuses the same [`cell_value_to_wire`]. 6.2-4 resolves it against the
+/// parity matrix's ACTUAL comparison mode: structural comparison treats `6.0`==`6`
+/// (no fix needed); only a byte-identical mode requires a uniform ECMAScript
+/// `Number`->string serializer applied across ALL number-emitting endpoints (here
+/// + snapshot), which is why it is NOT patched piecemeal in cluster A.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CellValueWire {
@@ -427,6 +441,256 @@ pub fn addr(sheet: u16, row: u32, col: u32) -> ql_session::CellAddr {
     ql_session::CellAddr { sheet, row, col }
 }
 
+// ============================================================================
+// Phase 6.2-1a -- cluster A (read/format/validate/query) + B (persistence) DTOs.
+// ============================================================================
+
+// ---- ranges (mirror napi CellRangeJson; coords as concrete ints, like the
+//      6.2-0 SetValueBody pattern -- serde rejects non-integer/out-of-range
+//      numbers loudly, faithful to napi's validate_u*_index intent) ----
+
+/// Mirror of napi `CellRangeJson`: a rectangular range within one sheet
+/// (inclusive bounds). Both Serialize (echoed back by `queryRange`) and
+/// Deserialize (request input for `queryRange`/`setName`/tables).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CellRangeWire {
+    pub sheet: u16,
+    pub start_row: u32,
+    pub start_col: u32,
+    pub end_row: u32,
+    pub end_col: u32,
+}
+
+/// Map a [`CellRangeWire`] to a [`ql_session::CellRange`]. The engine validates
+/// sheet existence + inverted bounds downstream (inversion is the engine's
+/// `bad_argument` for `queryRange`, normalized for `setName` -- pre-existing
+/// engine behavior, not a service concern).
+pub fn cell_range_from_wire(r: CellRangeWire) -> ql_session::CellRange {
+    ql_session::CellRange {
+        sheet: r.sheet,
+        start_row: r.start_row,
+        start_col: r.start_col,
+        end_row: r.end_row,
+        end_col: r.end_col,
+    }
+}
+
+fn cell_range_to_wire(r: ql_session::CellRange) -> CellRangeWire {
+    CellRangeWire {
+        sheet: r.sheet,
+        start_row: r.start_row,
+        start_col: r.start_col,
+        end_row: r.end_row,
+        end_col: r.end_col,
+    }
+}
+
+// ---- query_range (columnar; mirror napi RangeQueryOptionsJson + RangeResultJson) ----
+
+/// Mirror of napi `RangeQueryOptionsJson`. All three flags are required (No-Fallbacks:
+/// a missing flag is a loud deserialize error, not a silent default).
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RangeQueryOptionsWire {
+    pub include_formulas: bool,
+    pub include_formats: bool,
+    pub include_rendered: bool,
+}
+
+/// One column of a [`RangeResultWire`] (columnar layout; mirror napi `RangeColumnJson`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RangeColumnWire {
+    pub values: Vec<CellValueWire>,
+}
+
+/// Mirror of napi `RangeResultJson` (a batch-shaped, columnar range read).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RangeResultWire {
+    pub schema_version: u16,
+    pub range: CellRangeWire,
+    pub n_rows: u32,
+    pub n_cols: u32,
+    pub columns: Vec<RangeColumnWire>,
+}
+
+/// Map a [`ql_session::RangeResult`] to [`RangeResultWire`] (mirror of napi
+/// `range_result_json_from_session`).
+pub fn range_result_to_wire(r: ql_session::RangeResult) -> RangeResultWire {
+    RangeResultWire {
+        schema_version: r.schema_version,
+        range: cell_range_to_wire(r.range),
+        n_rows: r.n_rows,
+        n_cols: r.n_cols,
+        columns: r
+            .columns
+            .into_iter()
+            .map(|c| RangeColumnWire {
+                values: c.values.into_iter().map(cell_value_to_wire).collect(),
+            })
+            .collect(),
+    }
+}
+
+// ---- validate_formula (mirror napi DiagnosticJson + CellAddrJson) ----
+
+/// Mirror of napi `CellAddrJson` (sheet widened u16 -> u32).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CellAddrWire {
+    pub sheet: u32,
+    pub row: u32,
+    pub col: u32,
+}
+
+/// Mirror of napi `DiagnosticJson`. `severity` is `"info"`/`"warning"`/`"error"`
+/// (matches the `ql_session::Severity` snake_case serde rename).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticWire {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub addr: Option<CellAddrWire>,
+    pub severity: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// Stable snake_case wire string for a [`ql_session::Severity`] (mirror napi `severity_to_str`).
+pub fn severity_to_str(s: ql_session::Severity) -> &'static str {
+    match s {
+        ql_session::Severity::Info => "info",
+        ql_session::Severity::Warning => "warning",
+        ql_session::Severity::Error => "error",
+    }
+}
+
+/// Map a [`ql_session::Diagnostic`] to [`DiagnosticWire`] (mirror napi `diagnostic_json_from_session`).
+pub fn diagnostic_to_wire(d: ql_session::Diagnostic) -> DiagnosticWire {
+    DiagnosticWire {
+        addr: d.addr.map(|a| CellAddrWire {
+            sheet: u32::from(a.sheet),
+            row: a.row,
+            col: a.col,
+        }),
+        severity: severity_to_str(d.severity).to_string(),
+        code: d.code,
+        message: d.message,
+    }
+}
+
+// ---- list_sheets (mirror napi SheetInfoJson) ----
+
+/// Mirror of napi `SheetInfoJson` (lightweight sheet descriptor; id widened u16 -> u32).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetInfoWire {
+    pub id: u32,
+    pub name: String,
+}
+
+/// Map a [`ql_session::SheetInfo`] to [`SheetInfoWire`].
+pub fn sheet_info_to_wire(s: ql_session::SheetInfo) -> SheetInfoWire {
+    SheetInfoWire {
+        id: u32::from(s.id),
+        name: s.name,
+    }
+}
+
+// ---- reverse mapper: FormatIdWire -> ql_session::FormatId (set_format input) ----
+
+/// Map a [`FormatIdWire`] to a [`ql_session::FormatId`] for `set-format`. STRICT
+/// tagged union (mirror napi `session_format_id_from_json`): `builtin` requires
+/// `builtin` and rejects `customPeer`/`customCounter`; `custom` requires both
+/// `customPeer`+`customCounter` and rejects `builtin`; unknown kind rejected.
+/// Numeric ranges are enforced by serde on deserialize (u32/u64), so this only
+/// validates the tagged-union shape. Errors are `[bad_argument]` (No-Fallbacks).
+pub fn format_id_from_wire(id: FormatIdWire) -> Result<ql_session::FormatId, EngineError> {
+    let FormatIdWire {
+        kind,
+        builtin,
+        custom_peer,
+        custom_counter,
+    } = id;
+    match kind.as_str() {
+        "builtin" => {
+            if custom_peer.is_some() || custom_counter.is_some() {
+                return Err(EngineError::bad_argument(
+                    "setFormat: format id kind 'builtin' must not carry 'customPeer'/'customCounter'",
+                ));
+            }
+            let builtin = builtin.ok_or_else(|| {
+                EngineError::bad_argument("setFormat: kind 'builtin' requires a 'builtin' field")
+            })?;
+            Ok(ql_session::FormatId::Builtin { builtin })
+        }
+        "custom" => {
+            if builtin.is_some() {
+                return Err(EngineError::bad_argument(
+                    "setFormat: format id kind 'custom' must not carry 'builtin'",
+                ));
+            }
+            let peer = custom_peer.ok_or_else(|| {
+                EngineError::bad_argument("setFormat: kind 'custom' requires a 'customPeer' field")
+            })?;
+            let counter = custom_counter.ok_or_else(|| {
+                EngineError::bad_argument(
+                    "setFormat: kind 'custom' requires a 'customCounter' field",
+                )
+            })?;
+            Ok(ql_session::FormatId::Custom { peer, counter })
+        }
+        other => Err(EngineError::bad_argument(format!(
+            "setFormat: unsupported format id kind '{other}' (expected builtin|custom)"
+        ))),
+    }
+}
+
+// ---- request bodies (cluster A + B; transport-specific) ----
+
+/// `set-format` body: a cell address + the format id.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetFormatBody {
+    pub sheet: u16,
+    pub row: u32,
+    pub col: u32,
+    pub format: FormatIdWire,
+}
+
+/// `register-format` body.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterFormatBody {
+    pub format_string: String,
+}
+
+/// `validate-formula` body: a cell address + the formula body (without leading `=`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateFormulaBody {
+    pub sheet: u16,
+    pub row: u32,
+    pub col: u32,
+    pub text: String,
+}
+
+/// `query-range` body.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryRangeBody {
+    pub range: CellRangeWire,
+    pub options: RangeQueryOptionsWire,
+}
+
+/// `open`/`save` body: a filesystem path.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathBody {
+    pub path: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +806,135 @@ mod tests {
             cell_value_from_wire(mk("blank", None, None)).unwrap(),
             ql_session::CellValue::Blank
         ));
+    }
+
+    // ---- 6.2-1a DTO tests ----
+
+    #[test]
+    fn cell_range_wire_round_trips_camel_case() {
+        let r = CellRangeWire {
+            sheet: 1,
+            start_row: 0,
+            start_col: 2,
+            end_row: 9,
+            end_col: 4,
+        };
+        let j = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            j,
+            r#"{"sheet":1,"startRow":0,"startCol":2,"endRow":9,"endCol":4}"#
+        );
+        let back: CellRangeWire = serde_json::from_str(&j).unwrap();
+        let cr = cell_range_from_wire(back);
+        assert_eq!(cr.sheet, 1);
+        assert_eq!(cr.end_row, 9);
+        assert_eq!(cr.end_col, 4);
+    }
+
+    #[test]
+    fn range_result_wire_is_columnar_with_widened_keys() {
+        let r = ql_session::RangeResult {
+            schema_version: 1,
+            range: ql_session::CellRange {
+                sheet: 0,
+                start_row: 0,
+                start_col: 0,
+                end_row: 1,
+                end_col: 0,
+            },
+            n_rows: 2,
+            n_cols: 1,
+            columns: vec![ql_session::RangeColumn {
+                values: vec![
+                    ql_session::CellValue::Number { number: 6.0 },
+                    ql_session::CellValue::Blank,
+                ],
+            }],
+        };
+        let j = serde_json::to_string(&range_result_to_wire(r)).unwrap();
+        assert!(j.contains(r#""schemaVersion":1"#), "{j}");
+        assert!(j.contains(r#""nRows":2"#), "{j}");
+        assert!(j.contains(r#""nCols":1"#), "{j}");
+        // columnar: a `columns` array, each with a `values` array of CellValueWire.
+        // NOTE: `number:6.0` is the CURRENT serde rendering; the napi row emits `6`
+        // (the documented 6.2-4-deferred number-encoding divergence -- see the
+        // `CellValueWire` doc). This test pins the current shape, not the final
+        // byte-identical wire (which 6.2-4 reconciles uniformly if byte-identical
+        // comparison is chosen).
+        assert!(
+            j.contains(r#""columns":[{"values":[{"kind":"number","number":6.0},{"kind":"blank"}]}]"#),
+            "{j}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_wire_severity_strings() {
+        let d = ql_session::Diagnostic {
+            addr: Some(ql_session::CellAddr {
+                sheet: 0,
+                row: 3,
+                col: 4,
+            }),
+            severity: ql_session::Severity::Error,
+            code: "syntax_error".to_string(),
+            message: "bad".to_string(),
+        };
+        let j = serde_json::to_string(&diagnostic_to_wire(d)).unwrap();
+        assert!(j.contains(r#""severity":"error""#), "{j}");
+        assert!(j.contains(r#""addr":{"sheet":0,"row":3,"col":4}"#), "{j}");
+        // None addr is omitted (skip_serializing_if).
+        let d2 = ql_session::Diagnostic {
+            addr: None,
+            severity: ql_session::Severity::Warning,
+            code: "w".to_string(),
+            message: "m".to_string(),
+        };
+        let j2 = serde_json::to_string(&diagnostic_to_wire(d2)).unwrap();
+        assert!(!j2.contains("addr"), "None addr must be omitted: {j2}");
+        assert!(j2.contains(r#""severity":"warning""#), "{j2}");
+    }
+
+    #[test]
+    fn sheet_info_wire_widens_id() {
+        let s = ql_session::SheetInfo {
+            id: 7,
+            name: "Sheet1".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_string(&sheet_info_to_wire(s)).unwrap(),
+            r#"{"id":7,"name":"Sheet1"}"#
+        );
+    }
+
+    #[test]
+    fn format_id_from_wire_strict_union() {
+        let mk = |kind: &str,
+                  builtin: Option<u32>,
+                  custom_peer: Option<u64>,
+                  custom_counter: Option<u32>| FormatIdWire {
+            kind: kind.to_string(),
+            builtin,
+            custom_peer,
+            custom_counter,
+        };
+        // builtin requires `builtin`, rejects custom payload:
+        assert!(format_id_from_wire(mk("builtin", None, None, None)).is_err());
+        assert!(format_id_from_wire(mk("builtin", Some(164), Some(1), None)).is_err());
+        assert!(matches!(
+            format_id_from_wire(mk("builtin", Some(164), None, None)).unwrap(),
+            ql_session::FormatId::Builtin { builtin: 164 }
+        ));
+        // custom requires both, rejects builtin:
+        assert!(format_id_from_wire(mk("custom", None, Some(5), None)).is_err());
+        assert!(format_id_from_wire(mk("custom", Some(1), Some(5), Some(2))).is_err());
+        assert!(matches!(
+            format_id_from_wire(mk("custom", None, Some(5), Some(2))).unwrap(),
+            ql_session::FormatId::Custom {
+                peer: 5,
+                counter: 2
+            }
+        ));
+        // unknown kind rejected:
+        assert!(format_id_from_wire(mk("bogus", None, None, None)).is_err());
     }
 }

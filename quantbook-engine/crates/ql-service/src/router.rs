@@ -18,6 +18,19 @@
 //! - `GET    /v1/sessions/:id/snapshot`     -> WorkbookSnapshot wire
 //! - `POST   /v1/sessions/:id/cell`         -> CellSnapshot wire | null
 //! - `POST   /v1/sessions/:id/__force_panic` (debug builds only) -> 500 `[panic]`
+//!
+//! 6.2-1a endpoint set (cluster A read/format/validate/query + cluster B persistence):
+//! - `POST   /v1/sessions/:id/clear`            -> `{ ok }`
+//! - `POST   /v1/sessions/:id/set-format`       -> `{ ok }`
+//! - `POST   /v1/sessions/:id/register-format`  -> FormatId wire
+//! - `POST   /v1/sessions/:id/validate-formula` -> Diagnostic wire array
+//! - `POST   /v1/sessions/:id/query-range`      -> RangeResult wire (columnar)
+//! - `GET    /v1/sessions/:id/sheets`           -> SheetInfo wire array
+//! - `POST   /v1/sessions/:id/mark-volatiles-dirty` -> `{ ok }`
+//! - `POST   /v1/sessions/:id/open`             -> `{ ok }`
+//! - `POST   /v1/sessions/:id/save`             -> `{ ok }`
+//! - `POST   /v1/sessions/:id/import?format=<fmt>` -> `{ ok }` (raw bytes request body)
+//! - `GET    /v1/sessions/:id/export?format=<fmt>` -> raw bytes (`application/octet-stream`)
 
 use bytes::Bytes;
 use http::{header, Response, StatusCode};
@@ -32,10 +45,13 @@ use crate::error::engine_error_to_problem;
 use crate::guarded::guarded;
 use crate::session_store::SessionStore;
 use crate::wire::{
-    self, cell_snapshot_to_wire, cell_value_from_wire, workbook_snapshot_to_wire, AddSheetBody,
-    AddSheetResponse, CellBody, LifecycleResponse, NewSessionResponse, RecalcResponse,
-    SetFormulaBody, SetValueBody,
+    self, cell_range_from_wire, cell_snapshot_to_wire, cell_value_from_wire, diagnostic_to_wire,
+    format_id_from_wire, range_result_to_wire, sheet_info_to_wire, workbook_snapshot_to_wire,
+    AddSheetBody, AddSheetResponse, CellBody, LifecycleResponse, NewSessionResponse, PathBody,
+    QueryRangeBody, RecalcResponse, RegisterFormatBody, SetFormatBody, SetFormulaBody, SetValueBody,
+    ValidateFormulaBody,
 };
+use ql_session::RangeQueryOptions;
 
 /// Acknowledgement for a void mutation (`set-value`/`set-formula`). Not part of
 /// the frozen DTO set -- a transport-level confirmation the client can parse.
@@ -67,6 +83,23 @@ pub(crate) async fn handle(req: http::Request<Incoming>, store: SessionStore) ->
         ("POST", ["v1", "sessions", id, "recalc"]) => recalc(&store, id, &query),
         ("GET", ["v1", "sessions", id, "snapshot"]) => snapshot(&store, id),
         ("POST", ["v1", "sessions", id, "cell"]) => cell(&store, id, body).await,
+        // ---- 6.2-1a cluster A (read/format/validate/query) ----
+        ("POST", ["v1", "sessions", id, "clear"]) => clear(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "set-format"]) => set_format(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "register-format"]) => {
+            register_format(&store, id, body).await
+        }
+        ("POST", ["v1", "sessions", id, "validate-formula"]) => {
+            validate_formula(&store, id, body).await
+        }
+        ("POST", ["v1", "sessions", id, "query-range"]) => query_range(&store, id, body).await,
+        ("GET", ["v1", "sessions", id, "sheets"]) => list_sheets(&store, id),
+        ("POST", ["v1", "sessions", id, "mark-volatiles-dirty"]) => mark_volatiles_dirty(&store, id),
+        // ---- 6.2-1a cluster B (persistence) ----
+        ("POST", ["v1", "sessions", id, "open"]) => open(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "save"]) => save(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "import"]) => import(&store, id, &query, body).await,
+        ("GET", ["v1", "sessions", id, "export"]) => export(&store, id, &query),
         #[cfg(debug_assertions)]
         ("POST", ["v1", "sessions", id, "__force_panic"]) => force_panic(&store, id),
         _ => problem(&EngineError::new(
@@ -188,6 +221,148 @@ async fn cell(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
+// ---- 6.2-1a cluster A handlers (read/format/validate/query) ----
+
+async fn clear(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: CellBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "clear", move |s| {
+        s.clear(wire::addr(b.sheet, b.row, b.col))?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn set_format(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: SetFormatBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "setFormat", move |s| {
+        let format = format_id_from_wire(b.format)?;
+        s.set_format(wire::addr(b.sheet, b.row, b.col), format)?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn register_format(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: RegisterFormatBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "registerFormat", move |s| {
+        Ok(wire::format_id_to_wire(s.register_format(&b.format_string)?))
+    })
+}
+
+async fn validate_formula(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: ValidateFormulaBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "validateFormula", move |s| {
+        let diags = s.validate_formula(wire::addr(b.sheet, b.row, b.col), &b.text)?;
+        Ok(diags.into_iter().map(diagnostic_to_wire).collect::<Vec<_>>())
+    })
+}
+
+async fn query_range(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: QueryRangeBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "queryRange", move |s| {
+        let range = cell_range_from_wire(b.range);
+        let options = RangeQueryOptions {
+            include_formulas: b.options.include_formulas,
+            include_formats: b.options.include_formats,
+            include_rendered: b.options.include_rendered,
+        };
+        Ok(range_result_to_wire(s.query_range(range, options)?))
+    })
+}
+
+fn list_sheets(store: &SessionStore, id: &str) -> Resp {
+    with_session(store, id, "listSheets", |s| {
+        Ok(s.list_sheets()?
+            .into_iter()
+            .map(sheet_info_to_wire)
+            .collect::<Vec<_>>())
+    })
+}
+
+fn mark_volatiles_dirty(store: &SessionStore, id: &str) -> Resp {
+    with_session(store, id, "markVolatilesDirty", |s| {
+        s.mark_volatiles_dirty()?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+// ---- 6.2-1a cluster B handlers (persistence) ----
+
+async fn open(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: PathBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "open", move |s| {
+        s.open(&b.path)?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+async fn save(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: PathBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "save", move |s| {
+        s.save(&b.path)?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+/// `import` takes the raw workbook bytes as the request body (`application/octet-stream`
+/// -- the faithful transport for the contract's `Uint8Array`; no JSON shape exists for
+/// the blob) and the `format` as a required query parameter.
+async fn import(store: &SessionStore, id: &str, query: &Option<String>, body: Incoming) -> Resp {
+    let Some(format) = query_value(query, "format") else {
+        return problem(&EngineError::bad_argument(
+            "import: query parameter 'format' is required",
+        ));
+    };
+    let bytes = match read_bytes(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "import", move |s| {
+        s.import(&bytes, &format)?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+/// `export` returns the raw workbook bytes (`application/octet-stream`); `format` is a
+/// required query parameter. A serialize-free path -- the bytes are the body verbatim.
+fn export(store: &SessionStore, id: &str, query: &Option<String>) -> Resp {
+    let Some(format) = query_value(query, "format") else {
+        return problem(&EngineError::bad_argument(
+            "export: query parameter 'format' is required",
+        ));
+    };
+    let Some(handle) = store.get(id) else {
+        return problem(&session_not_found(id));
+    };
+    let result = guarded("export", || {
+        let g = handle.lock();
+        g.export(&format)
+    });
+    match result {
+        Ok(bytes) => octet_stream(bytes),
+        Err(e) => problem(&e),
+    }
+}
+
 /// Debug-only panic-boundary probe: panics inside [`guarded`], which must surface
 /// as a `[panic]`/500 problem+json WITHOUT killing the server (6.2-0 test).
 #[cfg(debug_assertions)]
@@ -259,6 +434,16 @@ async fn read_json<T: DeserializeOwned>(body: Incoming) -> Result<T, Resp> {
     })
 }
 
+/// Read a request body as RAW bytes (no JSON parse) -- the `import` blob path.
+async fn read_bytes(body: Incoming) -> Result<Vec<u8>, Resp> {
+    let collected = body.collect().await.map_err(|e| {
+        problem(&EngineError::bad_argument(format!(
+            "failed to read request body: {e}"
+        )))
+    })?;
+    Ok(collected.to_bytes().to_vec())
+}
+
 /// Read a `key=value` query parameter (no percent-decoding in v1 -- values like
 /// `kind=dirty` are plain ASCII; richer parsing is deferred).
 fn query_value(query: &Option<String>, key: &str) -> Option<String> {
@@ -311,4 +496,13 @@ fn no_content() -> Resp {
         .status(StatusCode::NO_CONTENT)
         .body(Full::new(Bytes::new()))
         .expect("response builder with valid status never fails")
+}
+
+/// Build a raw `application/octet-stream` 200 response (the `export` byte blob).
+fn octet_stream(bytes: Vec<u8>) -> Resp {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Full::new(Bytes::from(bytes)))
+        .expect("response builder with valid status/header never fails")
 }
