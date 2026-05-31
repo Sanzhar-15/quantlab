@@ -1,0 +1,21 @@
+# Codex lane verdict (transcribed from lane-codex-run.log -- codex read-only sandbox cannot self-write)
+# Model: codex default + model_reasoning_effort=high. Read-only.
+
+VERDICT: SHIP-WITH-FIXES
+
+HIGH: none.
+
+MED crates/ql-service/src/router.rs (chunkRows==0 precheck): service re-validates `chunkRows == 0` before calling the engine, "masking the engine's own add_sheet error." Fix proposed: remove the precheck.
+  -> RESOLUTION: REJECTED. Verified the engine add_sheet has no 0-guard; chunk_rows==0 panics in ColumnStore. napi prechecks for the same reason. Keeping it is correct napi-parity + panic-prevention (turns a panic-500 into a clean bad_argument-400). See SYNTHESIS.md #1.
+
+MED crates/ql-service/src/router.rs problem(): last-resort `unwrap_or_default()` can silently emit an empty body. Fix: infallible static problem JSON byte string.
+  -> FIXED.
+
+MED crates/ql-service/src/wire.rs: SessionVersion documented as hex but no decode helper or round-trip test. Fix: add strict hex decode + round-trip coverage.
+  -> FIXED (hex_decode + hex_round_trips test).
+
+LOW crates/ql-service/tests/golden_flow_http.rs: helper discards headers; the application/problem+json assertion is not real.
+  -> FIXED (http_full captures + asserts Content-Type).
+
+LOW crates/ql-service/tests/golden_flow_http.rs: u64-as-string coverage real for op but not for FormatIdWire.customPeer; option omission uncovered. Fix: serde golden/unit test for builtin/custom FormatIdWire, None omission, dateSystem, schemaVersion.
+  -> FIXED (wire.rs serde unit tests). Caught a latent freeze divergence: builtin/customCounter f64 -> serde "164.0" vs napi integer "164"; re-typed u32. See SYNTHESIS.md #5.

@@ -1,0 +1,29 @@
+# Phase 6.2 — `ql-service` Engine-As-Service (HTTP+SSE) · Entry Plan
+
+## 1. What 6.2 is
+
+The local **engine-as-service** transport (`GAP-PS-07`): a long-running service exposing the **FROZEN v1** `EngineSession` contract (6.3-5) over the wire so the IDE / web frontends can drive the engine without an in-process binding. It is the **third consumer** of the identical contract after the napi (`ql-bindings-node`) and pyo3 (`quantbook-py`) binding rows. **Pure transport — no engine logic.** The contract was built transport-neutral in 6.1 (decision-lock D2) precisely so this bolts on without rework.
+
+**Transport (decision 2026-06-01):** HTTP/1.1 + SSE on **hyper** (the decision-lock default-lean; battle-tested HTTP core, far lighter than axum — respects the workspace's strict `=`-exact-pin minimal-dep discipline). HTTP-vs-gRPC was deferred to here by decision-lock D2.
+
+## 2. Acceptance (MASTER-PLAN / entry-plan)
+
+SVC-6-01 service opens + edits a workbook · SVC-6-02 streams diagnostics · SVC-6-03 cancellation over the wire · SVC-6-04 protocol versioned. Plus the inherited mandates: session-per-connection, op-id cancel, `EngineError`→problem+json, auth hooks, connection-close lifecycle, schema versioning, and (REQ-6.2-11) the service passes the golden parity matrix as a 3rd row.
+
+## 3. The central design fact
+
+`ql_session`'s DTOs already derive serde, but their output is **NOT** the frozen wire shape: u64 → JSON *numbers* (freeze needs decimal *strings*), `snake_case`/`lowercase` keys (freeze is *camelCase*), `SessionVersion` → number array (freeze treats it opaque). And the napi `FooJson` structs live inside the napi crate (can't import). So `ql-service` defines its **own serde wire-DTO layer** reproducing the napi `FooJson` JSON shapes, validated by a **3rd "service" row** in the golden parity matrix (6.2-4) — not by sharing.
+
+## 4. Decomposition (auditable sub-increments; Codex+Opus each; closure megaudit at exit)
+
+- **6.2-0 — Foundation + first vertical slice. ✅ SHIPPED 2026-06-01.** Crate scaffold + deps (hyper/hyper-util/http-body-util/http/bytes, exact-pinned; `ql-service` member-only like `ql-collab-ws`, NOT in default-members); `wire.rs` (golden-flow-subset DTOs mirroring napi `FooJson`: camelCase, u64→decimal-string, `SessionVersion`→hex, `hex_encode`/`hex_decode`); `error.rs` (`EngineError`→problem+json + `ErrorClass`→HTTP status, mirroring napi `throw_structured`); `guarded.rs` (catch_unwind panic boundary, port of napi `guarded`); `session_store.rs` (`Arc<Mutex<WorkbookSession>>` registry, parking_lot no-poison); `router.rs` (minimal `match (method, segs)` dispatch under `/v1`); `bin/ql-service.rs` (`#[tokio::main]`, `QL_SERVICE_PORT` default 7321, Ctrl-C shutdown). **Endpoints (SVC-6-01):** `POST /v1/sessions` · `DELETE /v1/sessions/:id` · `GET …/lifecycle` · `POST …/add-sheet` · `POST …/set-value` · `POST …/set-formula` · `POST …/recalc?kind=dirty|all` · `GET …/snapshot` · `POST …/cell` (+ debug-only `…/__force_panic`). **Test:** `tests/golden_flow_http.rs` drives the golden flow over real HTTP — observable recompute (A1=6→B1=12, A1=7→B1=14), u64 ids as quoted decimal strings, problem+json 400, panic-boundary 500 with server survival, 404, 204. **Audit:** Codex(high) SHIP-WITH-FIXES + Opus SHIP, 0 HIGH; all folds applied (`docs/audits/2026-06-01-6-2-0-audit/`). A fold caught a latent freeze divergence: `FormatId` `builtin`/`customCounter` re-typed `f64`→`u32` so serde emits integer `164` (not `164.0`) matching napi. **Verified:** ql-service build debug+release 0/0 · 6 unit + 1 integration test pass · clippy 0 · **ql-exec 802/0 (default + xlsx-write) UNCHANGED** (pure-transport invariant) · workspace build clean. Engine `cbec…`→see commit; engine-only (no IDE change).
+- **6.2-1 — Remaining contract endpoints** (clustered a–e like 6.3-2: format/validate/query_range · persistence open/save/import/export · structure/sheets · tables · atomic-groups/transactions + undo/redo + functions). Reserved §3.5 bulk methods (`writeRange`/`publishDataset`/`bindRange`/`refreshSource`/`materializeQuery`) surface as `not_implemented_in_v1_core` Capability errors. `snapshot-delta` (the first `version`-consuming endpoint) uses `hex_decode`.
+- **6.2-2 — SSE streaming + cancellation** (SVC-6-02 + SVC-6-03): `GET /v1/sessions/:id/events` long-lived `text/event-stream` forwarding the engine event ring (`poll_events` cursor) in order; op-id `cancel`/`operationStatus` over the wire honoring the real pre-start cancel window.
+- **6.2-3 — Auth hooks + protocol-versioning hardening + lifecycle** (SVC-6-04 + REQ-6.2-06/07/09): pluggable auth trait (default no-op + bearer-token stub), `schemaVersion` echo + mismatch → `unsupported_schema_version`, connection-close + idle-TTL session reaping, request-body size cap.
+- **6.2-4 — Golden parity 3rd row + closure megaudit** (REQ-6.2-11): extend `parity_matrix.py` to launch the service binary, drive the golden flow over HTTP (stdlib `urllib`), assert byte-identical transcript vs the Node+Python rows (masking the opaque `version`/`nextCursor` + the `op` id whose value legitimately differs); 3-lane closure megaudit; declare 6.2 done.
+
+## 5. 6.2-0 deferred items (filed forward)
+
+- The whole-`f64` cell-value (`CellValue.number`) representation question for byte-identical parity (`6.0` vs `6`) — resolve in 6.2-4 against the matrix's actual comparison mode (structural vs byte-identical).
+- Request-body size cap (DoS) — 6.2-3.
+- `recalc` returns `{op:"…"}` (object-wrapped scalar) — 6.2-4 parity must treat `op` as encoding-checked/masked, not value-equal.
