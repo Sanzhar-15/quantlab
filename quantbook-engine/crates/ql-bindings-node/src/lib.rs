@@ -1121,6 +1121,18 @@ pub struct WorkbookSnapshotDeltaJson {
     pub schema_version: u16,
 }
 
+/// **Phase 6.3-3 (2026-05-30):** result of `undo`/`redo` (mirrors
+/// [`ql_session::dto::UndoRedoResult`], contract §3.8). `consumed: false` means
+/// the stack was empty — that is a normal outcome, NOT an error. `version` is the
+/// opaque post-step [`ql_session::SessionVersion`] as a `Buffer`; undo/redo clears
+/// the delta cache, so the NEXT `snapshotDelta` against an older token
+/// full-rebuilds.
+#[napi(object)]
+pub struct UndoRedoResultJson {
+    pub consumed: bool,
+    pub version: Buffer,
+}
+
 /// **Phase 5.7 V3.4.0.5 (2026-05-23) -- JS-facing PresenceState.**
 ///
 /// Mirrors `ql_collab::presence::PresenceState` for the napi boundary.
@@ -4785,6 +4797,59 @@ fn workbook_snapshot_json_from_session(snap: ql_session::WorkbookSnapshot) -> Wo
     }
 }
 
+/// **Phase 6.3-3 (2026-05-30):** map the owning-`Session` engine delta
+/// [`ql_session::WorkbookSnapshotDelta`] to the JS [`WorkbookSnapshotDeltaJson`]
+/// (the `snapshotDelta` return). Mirrors [`workbook_snapshot_json_from_session`]
+/// and reuses its sub-converters; forwards the engine delta's own
+/// `schema_version` (M5 — NOT re-derived) and maps `full_rebuild_reason` via
+/// [`full_rebuild_reason_str`]. NOTE: this is the engine `EngineSession` delta
+/// path — distinct from the legacy `CollabSession` CRDT delta builder (which uses
+/// `empty_delta` + the loro version-vector). `version` round-trips verbatim as a
+/// `Buffer`; the caller stores it for the next `snapshotDelta`.
+fn workbook_snapshot_delta_json_from_session(
+    delta: ql_session::WorkbookSnapshotDelta,
+) -> WorkbookSnapshotDeltaJson {
+    WorkbookSnapshotDeltaJson {
+        changed_cells: delta
+            .changed_cells
+            .into_iter()
+            .map(|c| ChangedCellJson {
+                sheet: u32::from(c.sheet),
+                cell: cell_snapshot_json_from_session(c.cell),
+            })
+            .collect(),
+        removed_cells: delta
+            .removed_cells
+            .into_iter()
+            .map(|r| RemovedCellJson {
+                sheet: u32::from(r.sheet),
+                row: r.row,
+                col: r.col,
+            })
+            .collect(),
+        sheets_changed: delta
+            .sheets_changed
+            .into_iter()
+            .map(sheet_snapshot_json_from_session)
+            .collect(),
+        sheets_removed: delta.sheets_removed.into_iter().map(u32::from).collect(),
+        formats_added: delta
+            .formats_added
+            .into_iter()
+            .map(|fd| FormatDefJson {
+                id: format_id_json_from_session(fd.id),
+                string: fd.string,
+            })
+            .collect(),
+        version: Buffer::from(delta.version.0),
+        full_rebuild_required: delta.full_rebuild_required,
+        full_rebuild_reason: delta
+            .full_rebuild_reason
+            .map(|r| full_rebuild_reason_str(r).to_string()),
+        schema_version: delta.schema_version,
+    }
+}
+
 // ============================================================================
 // 6.4-2 (2026-05-28) — function-metadata DTOs over napi.
 //
@@ -6691,6 +6756,79 @@ impl Session {
                 .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(event_page_json_from_session(page))
         })
+    }
+
+    // ============================================================================
+    // 6.3-3 (2026-05-30) — live-grid + ops over napi.
+    //
+    // Binds the already-implemented `EngineSession` delta/undo/redo methods on the
+    // owning `Session` class (the remaining live-grid cluster — `cancel`/
+    // `operationStatus`/`pollEvents` landed at 6.3-1b/c + 6.4-3d). Each inherits
+    // the locked 6.3-1 contract — `guarded(env,..)` + `catch_unwind`, native
+    // `engine_error_to_napi`. The opaque `SessionVersion` round-trips as a
+    // `Buffer`; the IDE seeds from `snapshot()` then pulls `snapshotDelta`.
+    // ============================================================================
+
+    /// Compute the incremental delta since the caller's `lastVersion` token (the
+    /// `version` from a prior `snapshot`/`snapshotDelta`/`batch`/`undo`/`redo`).
+    /// A first/stale/unrecognized token is NOT an error — the engine returns
+    /// `fullRebuildRequired = true` with a `fullRebuildReason` and the caller
+    /// reseeds via `snapshot()`. `schemaVersion` is forwarded from the engine
+    /// delta. `[invalid_state]` off a readable session.
+    #[napi(js_name = "snapshotDelta", catch_unwind)]
+    pub fn snapshot_delta(&self, env: Env, last_version: Buffer) -> Result<WorkbookSnapshotDeltaJson> {
+        guarded(env, "snapshotDelta", || {
+            let last = ql_session::SessionVersion(last_version.to_vec());
+            let delta = self
+                .inner
+                .lock()
+                .snapshot_delta(&last)
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(workbook_snapshot_delta_json_from_session(delta))
+        })
+    }
+
+    /// Undo the last committed step. Returns `{ consumed, version }`: an empty
+    /// undo stack yields `consumed: false` (NOT an error). Undo/redo clears the
+    /// delta cache, so the next `snapshotDelta` against an older token
+    /// full-rebuilds. `[invalid_state]` off a Ready session.
+    #[napi(js_name = "undo", catch_unwind)]
+    pub fn undo(&self, env: Env) -> Result<UndoRedoResultJson> {
+        guarded(env, "undo", || {
+            let r = self.inner.lock().undo().map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(UndoRedoResultJson {
+                consumed: r.consumed,
+                version: Buffer::from(r.version.0),
+            })
+        })
+    }
+
+    /// Redo the last undone step. Symmetric to [`Self::undo`] — an empty redo
+    /// stack yields `consumed: false` (NOT an error). `[invalid_state]` off a
+    /// Ready session.
+    #[napi(js_name = "redo", catch_unwind)]
+    pub fn redo(&self, env: Env) -> Result<UndoRedoResultJson> {
+        guarded(env, "redo", || {
+            let r = self.inner.lock().redo().map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(UndoRedoResultJson {
+                consumed: r.consumed,
+                version: Buffer::from(r.version.0),
+            })
+        })
+    }
+
+    /// Whether an undo step is available (pure read; `guarded` for the panic
+    /// boundary). Never throws on a Ready session.
+    #[napi(js_name = "canUndo", catch_unwind)]
+    pub fn can_undo(&self, env: Env) -> Result<bool> {
+        guarded(env, "canUndo", || Ok(self.inner.lock().can_undo()))
+    }
+
+    /// Whether a redo step is available (pure read). Never throws on a Ready
+    /// session.
+    #[napi(js_name = "canRedo", catch_unwind)]
+    pub fn can_redo(&self, env: Env) -> Result<bool> {
+        guarded(env, "canRedo", || Ok(self.inner.lock().can_redo()))
     }
 }
 

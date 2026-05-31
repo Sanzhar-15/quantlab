@@ -1061,6 +1061,77 @@ console.log("[smoke] 6.4-2 function registration PASS");
   console.log("[smoke] 6.3-2 hardening coverage OK (recalcAll observable, pollEvents page + negative cursor, setUdfWorker arg-validation)");
 }
 
+// === 6.3-3 (2026-05-30) — live-grid + ops over napi ===
+//
+// snapshotDelta / undo / redo / canUndo / canRedo, all OBSERVABLE. The version
+// token is the (epoch, state_seq) blob from snapshot(); snapshotDelta(v) walks the
+// change-log after v. undo MINTS A NEW EPOCH, so a delta against a pre-undo token
+// full-rebuilds (epoch_mismatch). An empty undo stack yields consumed:false (NOT
+// an error). canUndo/canRedo are ungated pure reads (bool, never throw).
+{
+  const w = new Session();
+  const sh = w.addSheet("Live", 1000);
+
+  // --- snapshotDelta: incremental path (changed cell carried) ---
+  const snap0 = w.snapshot();
+  assert.ok(snap0.version instanceof Uint8Array && snap0.version.length > 0, "snapshot carries a version token");
+  w.setValue(sh, 2, 3, { kind: "number", number: 77 }); // D3 = 77 (first + only undo step)
+  w.recalcDirty();
+  const d = w.snapshotDelta(snap0.version);
+  assert.equal(d.schemaVersion, 1, "delta schemaVersion === 1");
+  assert.equal(d.fullRebuildRequired, false, "same-epoch seq-advance is an incremental delta");
+  assert.ok(d.version instanceof Uint8Array && d.version.length > 0, "delta carries a version token");
+  const hit = d.changedCells.find((c) => c.sheet === sh && c.cell.row === 2 && c.cell.col === 3);
+  assert.ok(hit, "delta changedCells includes the mutated D3");
+  assert.equal(hit.cell.value.number, 77, "delta carries D3's new value 77 (observable)");
+
+  // --- snapshotDelta: empty token -> full rebuild (NoPriorVersion), NOT a throw ---
+  const fr = w.snapshotDelta(new Uint8Array(0));
+  assert.equal(fr.fullRebuildRequired, true, "empty token -> fullRebuildRequired");
+  assert.equal(fr.fullRebuildReason, "no_prior_version", "empty-token reason is no_prior_version");
+
+  // --- undo / redo OBSERVABLE ---
+  assert.equal(w.canUndo(), true, "canUndo true after the D3 edit");
+  assert.equal(w.cell(sh, 2, 3).value.number, 77, "D3 is 77 before undo");
+  const u1 = w.undo();
+  assert.equal(u1.consumed, true, "undo consumed the D3 step");
+  assert.ok(u1.version instanceof Uint8Array && u1.version.length > 0, "undo returns a version token");
+  w.recalcDirty();
+  assert.equal(w.cell(sh, 2, 3), null, "undo reverted D3 to absent (observable: was 77)");
+  assert.equal(w.canRedo(), true, "canRedo true after undo");
+  const r1 = w.redo();
+  assert.equal(r1.consumed, true, "redo consumed a step");
+  w.recalcDirty();
+  assert.equal(w.cell(sh, 2, 3).value.number, 77, "redo restored D3 = 77 (observable)");
+
+  // --- post-undo snapshotDelta full-rebuilds (undo mints a new epoch) ---
+  const vPreUndo = w.snapshot().version;
+  assert.equal(w.undo().consumed, true, "undo (again) consumed the redone step");
+  const afterEpoch = w.snapshotDelta(vPreUndo);
+  assert.equal(afterEpoch.fullRebuildRequired, true, "snapshotDelta after undo -> full rebuild");
+  assert.equal(afterEpoch.fullRebuildReason, "epoch_mismatch", "post-undo reason is epoch_mismatch (new epoch minted)");
+
+  // --- drain to the empty stack -> consumed:false (NOT an error) ---
+  // (addSheet is itself an undoable step, so the stack holds more than the one
+  // setValue; drain whatever remains, then prove the empty-stack contract.)
+  let undoGuard = 0;
+  while (w.undo().consumed) {
+    if (++undoGuard > 200) throw new Error("undo did not drain");
+  }
+  assert.equal(w.canUndo(), false, "undo stack fully drained");
+  assert.equal(w.undo().consumed, false, "undo on an empty stack returns consumed:false (not a throw)");
+
+  // --- negatives: the gated ops reject post-close; canUndo/canRedo are pure reads ---
+  w.close();
+  throwsWithCode(() => w.snapshotDelta(new Uint8Array(0)), "invalid_state", "snapshotDelta after close");
+  throwsWithCode(() => w.undo(), "invalid_state", "undo after close");
+  throwsWithCode(() => w.redo(), "invalid_state", "redo after close");
+  assert.equal(typeof w.canUndo(), "boolean", "canUndo is an ungated pure read (no throw post-close)");
+  assert.equal(typeof w.canRedo(), "boolean", "canRedo is an ungated pure read (no throw post-close)");
+
+  console.log("[smoke] 6.3-3 live-grid + ops OK (snapshotDelta incremental + full-rebuild reasons, undo/redo observable, empty-stack consumed:false, post-close invalid_state)");
+}
+
 // **6.1C audit-fix M8 — Session.close() deterministic lifecycle release.**
 // Post-close any command call returns a structured [invalid_state] error, not
 // a panic / silent failure. Closes the lifecycle hole flagged by the megaudit
