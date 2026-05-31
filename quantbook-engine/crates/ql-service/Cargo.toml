@@ -38,6 +38,10 @@ serde_json = { workspace = true }
 # must leave the next `.lock()` usable (the engine FaultGuard already sealed the
 # session `Faulted`), which a std Mutex would defeat by poisoning.
 parking_lot = "=0.12.5"
+# 6.2-2 SSE: futures_util::stream::unfold drives the lazy event-ring poll loop that
+# backs the long-lived `text/event-stream` body (http_body_util::StreamBody). Already
+# a workspace pin (ql-collab-ws); wired into this member here.
+futures-util = { workspace = true }
 
 [dev-dependencies]
 # The golden-flow integration test drives the running service over real HTTP

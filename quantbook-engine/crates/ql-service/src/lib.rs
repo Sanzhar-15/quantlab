@@ -19,10 +19,12 @@
 //! structure/sheets and cluster D tables); 6.2-1c (cluster E atomic/transactions,
 //! the reserved sec-3.5 bulk methods as `not_implemented_in_v1_core` Capability
 //! stubs, undo/redo, `snapshotDelta` -- the first `version`-consuming endpoint --
-//! and function register/unregister/list) -- which COMPLETES 6.2-1. Remaining:
-//! SSE event streaming (SVC-6-02); op-id cancellation (SVC-6-03); auth hooks,
-//! protocol versioning, and lifecycle/TTL hardening (SVC-6-04 / 6.2-3); the
-//! golden-parity third row (6.2-4).
+//! and function register/unregister/list) -- which COMPLETES 6.2-1; 6.2-2 (the
+//! operations/events surface: the M2 split-recalc `startRecalc`/`awaitRecalc`,
+//! op-id `cancel`/`operationStatus`, `pollEvents`, and the SVC-6-02 long-lived
+//! `text/event-stream` events endpoint forwarding the engine event ring). Remaining:
+//! auth hooks, protocol versioning, and lifecycle/TTL hardening (SVC-6-04 / 6.2-3);
+//! the golden-parity third row (6.2-4).
 //!
 //! Transport: HTTP/1.1 on `hyper` 1.x (`http1::Builder::serve_connection`), one
 //! tokio task per connection, `hyper_util::rt::TokioIo` adapting the tokio

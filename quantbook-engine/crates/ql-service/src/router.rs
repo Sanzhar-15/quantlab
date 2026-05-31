@@ -49,10 +49,23 @@
 //! - `POST   /v1/sessions/:id/snapshot-delta`       -> WorkbookSnapshotDelta wire (consumes `version` hex)
 //! - `POST   /v1/sessions/:id/register-function`, `unregister-function` -> `{ ok }`
 //! - `GET    /v1/sessions/:id/functions`            -> FunctionMetadata wire array
+//!
+//! 6.2-2 endpoint set (operations/events: split-recalc + cancellation + the SSE stream):
+//! - `POST   /v1/sessions/:id/start-recalc?kind=dirty|all` -> `{ op }` (decimal string)
+//! - `POST   /v1/sessions/:id/await-recalc`         -> `{ ok }` (blocking; runs/skips the reserved recalc)
+//! - `POST   /v1/sessions/:id/cancel`               -> bare bool (pre-start cancel window)
+//! - `GET    /v1/sessions/:id/operation-status?op=<dec>` -> OperationState wire
+//! - `GET    /v1/sessions/:id/poll-events?cursor=<dec>`  -> EventPage wire (one-shot, cursor required)
+//! - `GET    /v1/sessions/:id/events?cursor=<dec>`  -> SVC-6-02 long-lived `text/event-stream`
+//!   (cursor optional, default 0 = from the ring start)
+
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::{header, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Empty, Full, StreamBody};
+use hyper::body::Frame;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -64,19 +77,20 @@ use crate::guarded::guarded;
 use crate::session_store::SessionStore;
 use crate::wire::{
     self, batch_result_to_wire, cell_range_from_wire, cell_snapshot_to_wire, cell_value_from_wire,
-    diagnostic_to_wire, format_id_from_wire, function_metadata_from_wire, function_metadata_to_wire,
+    diagnostic_to_wire, event_page_to_wire, event_to_wire, format_id_from_wire,
+    function_metadata_from_wire, function_metadata_to_wire, operation_state_to_wire,
     range_result_to_wire, session_op_from_wire, sheet_info_to_wire, table_spec_from_wire,
     undo_redo_result_to_wire, workbook_snapshot_delta_to_wire, workbook_snapshot_to_wire,
     AddSheetBody, AddSheetResponse, BatchBody, BindRangeBody, CellBody, LifecycleResponse,
-    MaterializeQueryBody, MoveSheetBody, NameBody, NewSessionResponse, PathBody, PublishDatasetBody,
-    QueryRangeBody, RecalcResponse, RefreshSourceBody, RegisterFormatBody, RegisterFunctionBody,
-    RenameColumnBody, RenameSheetBody, RenameTableBody, ResizeTableBody, SetFormatBody,
-    SetFormulaBody, SetNameBody, SetValueBody, SheetIdBody, SnapshotDeltaBody, TableSpecWire,
-    TransactionResponse, TxnAddBody, TxnIdBody, UnregisterFunctionBody, ValidateFormulaBody,
-    WriteRangeBody,
+    MaterializeQueryBody, MoveSheetBody, NameBody, NewSessionResponse, OpBody, PathBody,
+    PublishDatasetBody, QueryRangeBody, RecalcResponse, RefreshSourceBody, RegisterFormatBody,
+    RegisterFunctionBody, RenameColumnBody, RenameSheetBody, RenameTableBody, ResizeTableBody,
+    SetFormatBody, SetFormulaBody, SetNameBody, SetValueBody, SheetIdBody, SnapshotDeltaBody,
+    TableSpecWire, TransactionResponse, TxnAddBody, TxnIdBody, UnregisterFunctionBody,
+    ValidateFormulaBody, WriteRangeBody,
 };
-use ql_session::session::{FunctionImplHandle, SessionOp, TransactionId};
-use ql_session::RangeQueryOptions;
+use ql_session::session::{EventCursor, FunctionImplHandle, SessionOp, TransactionId};
+use ql_session::{OperationId, RangeQueryOptions, RecalcKind};
 
 /// Acknowledgement for a void mutation (`set-value`/`set-formula`). Not part of
 /// the frozen DTO set -- a transport-level confirmation the client can parse.
@@ -87,7 +101,17 @@ struct AckResponse {
 }
 
 type Incoming = hyper::body::Incoming;
-type Resp = Response<Full<Bytes>>;
+
+/// The unified response body. 6.2-2 added the SSE `text/event-stream` endpoint,
+/// which needs a STREAMING body; the prior endpoints are all buffered (`Full`).
+/// `UnsyncBoxBody` boxes both behind one type so `handle` has a single return type.
+/// `boxed_unsync` (vs `boxed`) requires only `Send + 'static` (not `Sync`) -- the
+/// `unfold`-driven SSE stream future is `Send` but not `Sync`, and the per-connection
+/// task that hyper spawns needs only `Send`. The error is `Infallible`: buffered
+/// bodies never fail, and the SSE stream signals an error by ENDING (yielding a final
+/// frame then `None`), never by erroring the body.
+type SvcBody = UnsyncBoxBody<Bytes, std::convert::Infallible>;
+type Resp = Response<SvcBody>;
 
 /// Route + handle one request. Always produces a `Response` (errors become
 /// problem+json); never returns `Err` so the hyper service is infallible.
@@ -172,6 +196,14 @@ pub(crate) async fn handle(req: http::Request<Incoming>, store: SessionStore) ->
             unregister_function(&store, id, body).await
         }
         ("GET", ["v1", "sessions", id, "functions"]) => list_functions(&store, id),
+        // ---- 6.2-2 operations: split-recalc + cancel/status ----
+        ("POST", ["v1", "sessions", id, "start-recalc"]) => start_recalc(&store, id, &query),
+        ("POST", ["v1", "sessions", id, "await-recalc"]) => await_recalc(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "cancel"]) => cancel(&store, id, body).await,
+        ("GET", ["v1", "sessions", id, "operation-status"]) => operation_status(&store, id, &query),
+        // ---- 6.2-2 events: one-shot poll + the long-lived SSE stream ----
+        ("GET", ["v1", "sessions", id, "poll-events"]) => poll_events(&store, id, &query),
+        ("GET", ["v1", "sessions", id, "events"]) => events(store.clone(), id, &query),
         #[cfg(debug_assertions)]
         ("POST", ["v1", "sessions", id, "__force_panic"]) => force_panic(&store, id),
         _ => problem(&EngineError::new(
@@ -785,6 +817,202 @@ fn list_functions(store: &SessionStore, id: &str) -> Resp {
     })
 }
 
+// ---- 6.2-2 operations handlers (split-recalc + cancel/status) ----
+
+/// `start-recalc?kind=dirty|all` reserves a recalc and returns its op id WITHOUT
+/// running it (the M2 pre-start cancel window opens here). Mirror of the existing
+/// `recalc?kind` dispatch. `kind` is required + explicit (No-Fallbacks).
+fn start_recalc(store: &SessionStore, id: &str, query: &Option<String>) -> Resp {
+    let kind = match query_value(query, "kind").as_deref() {
+        Some("dirty") => RecalcKind::Dirty,
+        Some("all") => RecalcKind::All,
+        other => {
+            return problem(&EngineError::bad_argument(format!(
+                "startRecalc: query parameter 'kind' must be 'dirty' or 'all' (got {other:?})"
+            )))
+        }
+    };
+    with_session(store, id, "startRecalc", move |s| {
+        Ok(RecalcResponse {
+            op: s.start_recalc(kind)?.0,
+        })
+    })
+}
+
+/// `await-recalc` runs (or, if the op was canceled in the window, skips) the recalc
+/// reserved by `start-recalc`. BLOCKING: the synchronous recompute holds the
+/// per-session lock on this connection's tokio task. Acceptable for v1 single-client
+/// localhost (spawn_blocking is filed to 6.2-3 for multi-client; matches the napi
+/// synchronous binding).
+async fn await_recalc(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: OpBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    with_session(store, id, "awaitRecalc", move |s| {
+        s.await_recalc(OperationId(b.op))?;
+        Ok(AckResponse { ok: true })
+    })
+}
+
+/// `cancel` an operation (cooperative; honored pre-start for in-engine recalc).
+/// Returns a bare bool: `true` if a cancel was registered, `false` if already
+/// terminal. An unknown op id -> 404 `operation_not_found`.
+async fn cancel(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+    let b: OpBody = match read_json(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    // The engine `cancel` returns `EngineResult<bool>`, which IS the closure's
+    // `Result<T, EngineError>` (T = bool) -- forward it directly (no `Ok(_?)` wrap).
+    with_session(store, id, "cancel", move |s| s.cancel(OperationId(b.op)))
+}
+
+/// `operation-status?op=<dec>` -> the op's `OperationState` (read; legal in all
+/// states). An unknown op id -> 404 `operation_not_found`.
+fn operation_status(store: &SessionStore, id: &str, query: &Option<String>) -> Resp {
+    let op = match query_u64(query, "op") {
+        Ok(v) => v,
+        Err(e) => return problem(&e),
+    };
+    with_session(store, id, "operationStatus", move |s| {
+        Ok(operation_state_to_wire(s.operation_status(OperationId(op))?))
+    })
+}
+
+// ---- 6.2-2 events handlers (one-shot poll + the long-lived SSE stream) ----
+
+/// `poll-events?cursor=<dec>` -> one non-destructive page of the event ring from
+/// `cursor`. The direct binding of `poll_events` (the parity-row surface). `cursor`
+/// is REQUIRED + explicit (No-Fallbacks; missing -> `bad_argument`).
+fn poll_events(store: &SessionStore, id: &str, query: &Option<String>) -> Resp {
+    let cursor = match query_u64(query, "cursor") {
+        Ok(v) => v,
+        Err(e) => return problem(&e),
+    };
+    with_session(store, id, "pollEvents", move |s| {
+        Ok(event_page_to_wire(s.poll_events(EventCursor(cursor))?))
+    })
+}
+
+/// SSE cadence: how long the stream sleeps between non-destructive `poll_events`
+/// reads. v1 is poll-based (no engine push/notify); a notify upgrade is future work.
+const SSE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// `GET /v1/sessions/:id/events?cursor=<dec>` -- the SVC-6-02 long-lived
+/// `text/event-stream`. Forwards the engine event ring (`poll_events`, in order) as
+/// SSE frames. `cursor` is OPTIONAL (default 0 = stream from the ring start -- a
+/// designed default for a stream, not an error-masking fallback). The session is
+/// resolved at connect (missing -> buffered 404); the stream then lazily polls on a
+/// ~250ms cadence (the lock is held only for each `poll_events`, never across the
+/// sleep), ending when the session is removed from the store (DELETE) or on a poll
+/// error. Each event crosses as `event: <kind>` + `id: <cursor-after>` + `data:
+/// <EventWire JSON>`; an empty poll emits a `: heartbeat` comment to keep the
+/// connection alive and give clients a liveness signal.
+fn events(store: SessionStore, id: &str, query: &Option<String>) -> Resp {
+    let cursor = query_value(query, "cursor")
+        .map(|s| s.parse::<u64>())
+        .transpose();
+    let cursor = match cursor {
+        Ok(opt) => opt.unwrap_or(0),
+        Err(_) => {
+            return problem(&EngineError::bad_argument(
+                "events: query parameter 'cursor' must be a non-negative integer",
+            ))
+        }
+    };
+    // Resolve the session at connect time (so a missing session is a clean buffered
+    // 404, not a stream that immediately ends).
+    if store.get(id).is_none() {
+        return problem(&session_not_found(id));
+    }
+    let id = id.to_string();
+    // Lazy poll loop: hyper pulls each frame, driving one sleep->poll->format step.
+    // No spawned task, no channel -- the stream IS the loop. `done` ends the stream
+    // after a terminal frame (session gone or poll error).
+    let stream = futures_util::stream::unfold(
+        (store, id, cursor, false),
+        |(store, id, cursor, done)| async move {
+            if done {
+                return None;
+            }
+            tokio::time::sleep(SSE_POLL_INTERVAL).await;
+            // Session removed (DELETE) -> end the stream (`?` on the Option early-returns
+            // None, which `unfold` treats as stream end).
+            let handle = store.get(&id)?;
+            // Lock + poll UNDER the panic boundary -- the same guard every other engine
+            // call in this service gets (6.2-2 audit Codex MED). A panic becomes a
+            // structured Err -> a final SSE `event: error` frame + clean stream end,
+            // never an unwound connection task (parking_lot no-poison + the engine
+            // FaultGuard keep the session usable). The lock is still held only for the
+            // poll, never across the `sleep().await` above.
+            let page = guarded("events", || {
+                let mut g = handle.lock();
+                g.poll_events(EventCursor(cursor))
+            });
+            match page {
+                Ok(page) => {
+                    let next = page.next_cursor.0;
+                    let chunk = render_sse_chunk(page, cursor);
+                    Some((
+                        Ok::<Frame<Bytes>, std::convert::Infallible>(Frame::data(Bytes::from(
+                            chunk,
+                        ))),
+                        (store, id, next, false),
+                    ))
+                }
+                Err(e) => {
+                    // Surface the error as a final SSE frame, then end the stream.
+                    let chunk = format!("event: error\ndata: {}\n\n", sse_error_data(&e));
+                    Some((
+                        Ok(Frame::data(Bytes::from(chunk))),
+                        (store, id, cursor, true),
+                    ))
+                }
+            }
+        },
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(StreamBody::new(stream).boxed_unsync())
+        .expect("response builder with valid status/header never fails")
+}
+
+/// Render one [`wire::EventPageWire`]'s worth of SSE frames. Each event crosses as
+/// `event: <kind>` + `id: <cursor-after-this-event>` + `data: <EventWire JSON>`; an
+/// empty page is a `: heartbeat` comment (connection-keepalive + liveness signal).
+/// `start_cursor` is the cursor BEFORE this page, used to compute per-event ids.
+fn render_sse_chunk(page: ql_session::session::EventPage, start_cursor: u64) -> String {
+    if page.events.is_empty() {
+        return ": heartbeat\n\n".to_string();
+    }
+    let mut out = String::new();
+    for (i, ev) in page.events.into_iter().enumerate() {
+        let wire = event_to_wire(ev);
+        // A serialize failure of our OWN wire type cannot normally happen; if it ever
+        // did, emit a loud error frame rather than dropping the event silently.
+        let data = serde_json::to_string(&wire)
+            .unwrap_or_else(|e| format!(r#"{{"kind":"error","source":"serialize failed: {e}"}}"#));
+        let event_id = start_cursor + i as u64 + 1;
+        out.push_str(&format!(
+            "event: {}\nid: {}\ndata: {}\n\n",
+            wire.kind, event_id, data
+        ));
+    }
+    out
+}
+
+/// Render the `data:` payload for a mid-stream poll error (a structured problem
+/// body, single-line so it is a valid SSE `data:` value).
+fn sse_error_data(e: &EngineError) -> String {
+    let (_status, body) = engine_error_to_problem(e);
+    serde_json::to_string(&body).unwrap_or_else(|err| {
+        format!(r#"{{"code":"panic","class":"internal","message":"problem serialize failed: {err}","retryable":false}}"#)
+    })
+}
+
 /// Debug-only panic-boundary probe: panics inside [`guarded`], which must surface
 /// as a `[panic]`/500 problem+json WITHOUT killing the server (6.2-0 test).
 #[cfg(debug_assertions)]
@@ -879,6 +1107,20 @@ fn query_value(query: &Option<String>, key: &str) -> Option<String> {
     None
 }
 
+/// Read a REQUIRED `u64` query parameter (the `?op=`/`?cursor=` decimal-string
+/// convention for the GET op/event endpoints). Missing or non-`u64` is a loud
+/// `[bad_argument]` (No-Fallbacks).
+fn query_u64(query: &Option<String>, key: &str) -> Result<u64, EngineError> {
+    let raw = query_value(query, key).ok_or_else(|| {
+        EngineError::bad_argument(format!("query parameter '{key}' is required"))
+    })?;
+    raw.parse::<u64>().map_err(|_| {
+        EngineError::bad_argument(format!(
+            "query parameter '{key}' must be a non-negative integer (got {raw:?})"
+        ))
+    })
+}
+
 /// Build a JSON `application/json` response. A serialize failure of our OWN
 /// response types cannot normally happen; if it ever does it is surfaced loudly as
 /// a 500 problem+json rather than dropped.
@@ -887,7 +1129,7 @@ fn json<T: Serialize>(status: StatusCode, body: &T) -> Resp {
         Ok(bytes) => Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(bytes)))
+            .body(Full::new(Bytes::from(bytes)).boxed_unsync())
             .expect("response builder with valid status/header never fails"),
         Err(e) => problem(&EngineError::panic(format!(
             "response serialize failed: {e}"
@@ -909,14 +1151,14 @@ fn problem(e: &EngineError) -> Resp {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/problem+json")
-        .body(Full::new(Bytes::from(bytes)))
+        .body(Full::new(Bytes::from(bytes)).boxed_unsync())
         .expect("response builder with valid status/header never fails")
 }
 
 fn no_content() -> Resp {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .body(Full::new(Bytes::new()))
+        .body(Empty::<Bytes>::new().boxed_unsync())
         .expect("response builder with valid status never fails")
 }
 
@@ -925,6 +1167,6 @@ fn octet_stream(bytes: Vec<u8>) -> Resp {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Full::new(Bytes::from(bytes)))
+        .body(Full::new(Bytes::from(bytes)).boxed_unsync())
         .expect("response builder with valid status/header never fails")
 }

@@ -1458,6 +1458,197 @@ pub struct MaterializeQueryBody {
     pub data: String,
 }
 
+// ============================================================================
+// Phase 6.2-2 -- operations/events DTOs (cancel/operationStatus/pollEvents +
+// the SSE event stream).
+// ============================================================================
+
+/// Mirror of napi `OperationErrorJson`: the structured cause carried by a
+/// `failed` operation state. Same own-property set as `error::ProblemJson` minus
+/// `message` (matching napi's `OperationErrorJson`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationErrorWire {
+    pub code: String,
+    pub class: String,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source: Option<String>,
+}
+
+/// Map an [`EngineError`] to [`OperationErrorWire`] (mirror napi
+/// `operation_error_json_from_engine_error`; `details` rendered only when non-empty).
+pub fn operation_error_to_wire(e: &EngineError) -> OperationErrorWire {
+    let details = if e.details.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&e.details)
+                .unwrap_or_else(|err| format!("[details serialize failed: {err}]")),
+        )
+    };
+    OperationErrorWire {
+        code: e.code.clone(),
+        class: crate::error::class_str(e.class).to_string(),
+        retryable: e.retryable,
+        details,
+        source: e.source.clone(),
+    }
+}
+
+/// Mirror of napi `OperationStateJson`: `state` is `running`/`completed`/
+/// `canceled`/`failed`; `error` is present ONLY for `failed`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationStateWire {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<OperationErrorWire>,
+}
+
+/// Map a [`ql_session::OperationState`] to [`OperationStateWire`] (mirror napi
+/// `operation_state_json_from_session`).
+pub fn operation_state_to_wire(s: ql_session::OperationState) -> OperationStateWire {
+    use ql_session::OperationState as St;
+    match s {
+        St::Running => OperationStateWire {
+            state: "running".to_string(),
+            error: None,
+        },
+        St::Completed => OperationStateWire {
+            state: "completed".to_string(),
+            error: None,
+        },
+        St::Canceled => OperationStateWire {
+            state: "canceled".to_string(),
+            error: None,
+        },
+        St::Failed { error } => OperationStateWire {
+            state: "failed".to_string(),
+            error: Some(operation_error_to_wire(&error)),
+        },
+    }
+}
+
+/// Mirror of napi `EventJson`: a `kind`-tagged union over [`ql_session::session::Event`].
+/// `op`/`done`/`total` are u64 decimal strings (napi `BigInt`); the optional payload
+/// fields populate per `kind` (recalc_progress / cell_diagnostic / operation_completed
+/// / provenance / structure_changed / full_resync_required).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventWire {
+    pub kind: String,
+    #[serde(with = "opt_u64_dec", skip_serializing_if = "Option::is_none", default)]
+    pub op: Option<u64>,
+    #[serde(with = "opt_u64_dec", skip_serializing_if = "Option::is_none", default)]
+    pub done: Option<u64>,
+    #[serde(with = "opt_u64_dec", skip_serializing_if = "Option::is_none", default)]
+    pub total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub diagnostic: Option<DiagnosticWire>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub state: Option<OperationStateWire>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub addr: Option<CellAddrWire>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub structure_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub target: Option<String>,
+}
+
+/// Map a [`ql_session::session::Event`] to [`EventWire`] (mirror napi
+/// `event_json_from_session`; reuses [`diagnostic_to_wire`] + the `CellAddrWire`
+/// widening).
+pub fn event_to_wire(e: ql_session::session::Event) -> EventWire {
+    use ql_session::session::Event as Ev;
+    let base = EventWire {
+        kind: String::new(),
+        op: None,
+        done: None,
+        total: None,
+        diagnostic: None,
+        state: None,
+        addr: None,
+        source: None,
+        structure_kind: None,
+        target: None,
+    };
+    match e {
+        Ev::RecalcProgress { op, done, total } => EventWire {
+            kind: "recalc_progress".to_string(),
+            op: Some(op.0),
+            done: Some(done),
+            total: Some(total),
+            ..base
+        },
+        Ev::CellDiagnostic { diagnostic } => EventWire {
+            kind: "cell_diagnostic".to_string(),
+            diagnostic: Some(diagnostic_to_wire(diagnostic)),
+            ..base
+        },
+        Ev::OperationCompleted { op, state } => EventWire {
+            kind: "operation_completed".to_string(),
+            op: Some(op.0),
+            state: Some(operation_state_to_wire(state)),
+            ..base
+        },
+        Ev::Provenance { addr, source } => EventWire {
+            kind: "provenance".to_string(),
+            addr: Some(CellAddrWire {
+                sheet: u32::from(addr.sheet),
+                row: addr.row,
+                col: addr.col,
+            }),
+            source: Some(source),
+            ..base
+        },
+        Ev::StructureChanged { kind, target } => EventWire {
+            kind: "structure_changed".to_string(),
+            structure_kind: Some(kind),
+            target: Some(target),
+            ..base
+        },
+        Ev::FullResyncRequired => EventWire {
+            kind: "full_resync_required".to_string(),
+            ..base
+        },
+    }
+}
+
+/// Mirror of napi `EventPageJson`: a non-destructive page of events read from a
+/// cursor. `nextCursor` is the u64 decimal string to pass on the next read.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventPageWire {
+    pub events: Vec<EventWire>,
+    #[serde(with = "u64_dec")]
+    pub next_cursor: u64,
+    pub dropped: bool,
+}
+
+/// Map a [`ql_session::session::EventPage`] to [`EventPageWire`] (mirror napi
+/// `event_page_json_from_session`).
+pub fn event_page_to_wire(p: ql_session::session::EventPage) -> EventPageWire {
+    EventPageWire {
+        events: p.events.into_iter().map(event_to_wire).collect(),
+        next_cursor: p.next_cursor.0,
+        dropped: p.dropped,
+    }
+}
+
+/// `await-recalc`/`cancel` body: the operation id as a u64 decimal string (napi
+/// crosses it as a `BigInt`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpBody {
+    #[serde(with = "u64_dec")]
+    pub op: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1964,5 +2155,92 @@ mod tests {
             provenance_tags: Vec::new(),
         };
         assert!(function_metadata_from_wire(bad_enum).is_err());
+    }
+
+    // ---- 6.2-2 DTO tests ----
+
+    #[test]
+    fn operation_state_wire_shapes() {
+        // running/completed/canceled carry no error (omitted).
+        assert_eq!(
+            serde_json::to_string(&operation_state_to_wire(ql_session::OperationState::Running))
+                .unwrap(),
+            r#"{"state":"running"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&operation_state_to_wire(
+                ql_session::OperationState::Canceled
+            ))
+            .unwrap(),
+            r#"{"state":"canceled"}"#
+        );
+        // failed carries the structured error.
+        let w = operation_state_to_wire(ql_session::OperationState::Failed {
+            error: EngineError::bad_argument("boom"),
+        });
+        let j = serde_json::to_string(&w).unwrap();
+        assert!(j.contains(r#""state":"failed""#), "{j}");
+        assert!(j.contains(r#""code":"bad_argument""#), "{j}");
+        assert!(j.contains(r#""class":"bad_argument""#), "{j}");
+    }
+
+    #[test]
+    fn event_wire_recalc_progress_uses_decimal_strings() {
+        let w = event_to_wire(ql_session::session::Event::RecalcProgress {
+            op: ql_session::OperationId(5),
+            done: 3,
+            total: 10,
+        });
+        let j = serde_json::to_string(&w).unwrap();
+        assert!(j.contains(r#""kind":"recalc_progress""#), "{j}");
+        // u64 op/done/total are QUOTED decimal strings (napi BigInt).
+        assert!(j.contains(r#""op":"5""#), "{j}");
+        assert!(j.contains(r#""done":"3""#), "{j}");
+        assert!(j.contains(r#""total":"10""#), "{j}");
+        // unused payload fields omitted.
+        assert!(!j.contains("diagnostic"), "{j}");
+        assert!(!j.contains("addr"), "{j}");
+    }
+
+    #[test]
+    fn event_wire_operation_completed_nests_state() {
+        let w = event_to_wire(ql_session::session::Event::OperationCompleted {
+            op: ql_session::OperationId(7),
+            state: ql_session::OperationState::Completed,
+        });
+        let j = serde_json::to_string(&w).unwrap();
+        assert!(j.contains(r#""kind":"operation_completed""#), "{j}");
+        assert!(j.contains(r#""op":"7""#), "{j}");
+        assert!(j.contains(r#""state":{"state":"completed"}"#), "{j}");
+    }
+
+    #[test]
+    fn event_wire_full_resync_is_bare_kind() {
+        let w = event_to_wire(ql_session::session::Event::FullResyncRequired);
+        assert_eq!(
+            serde_json::to_string(&w).unwrap(),
+            r#"{"kind":"full_resync_required"}"#
+        );
+    }
+
+    #[test]
+    fn event_page_wire_next_cursor_is_decimal_string() {
+        let p = event_page_to_wire(ql_session::session::EventPage {
+            events: vec![ql_session::session::Event::FullResyncRequired],
+            next_cursor: ql_session::session::EventCursor(42),
+            dropped: false,
+        });
+        let j = serde_json::to_string(&p).unwrap();
+        assert!(j.contains(r#""nextCursor":"42""#), "{j}");
+        assert!(j.contains(r#""dropped":false"#), "{j}");
+        assert!(j.contains(r#""kind":"full_resync_required""#), "{j}");
+    }
+
+    #[test]
+    fn op_body_parses_decimal_string() {
+        let b: OpBody = serde_json::from_str(r#"{"op":"123"}"#).unwrap();
+        assert_eq!(b.op, 123);
+        // a bare JSON number is rejected (the frozen convention is a quoted string).
+        assert!(serde_json::from_str::<OpBody>(r#"{"op":123}"#).is_err());
     }
 }
