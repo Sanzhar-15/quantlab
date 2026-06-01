@@ -1,9 +1,29 @@
 ---
 name: 2026-05-26_phase-6-product-surfaces
 status: |
-  IN-PROGRESS — Phase 6 (Product Surfaces), the v1-critical path. Phase 5 COMPLETE
+  PHASE 6 CLOSED (v1) — Phase 6 (Product Surfaces), the v1-critical path. Phase 5 COMPLETE
   (5.8 megaudit PASS-WITH-FINDINGS); Phase 6 DECISION-LOCKED (docs/phase6/decision-lock.md,
-  Codex gpt-5.5 xhigh validated). Sequence = wedge-first, STAGED.
+  Codex gpt-5.5 xhigh validated). Sequence = wedge-first, STAGED. NEXT = Phase 7 (hardening + ship);
+  do NOT archive this plan until Phase 7 entry is scoped.
+
+  ✅ 6.7 PHASE-6 CLOSURE MEGAUDIT COMPLETE 2026-06-01 (SHIP-WITH-FIXES). By-hand 5-lane closure
+  (3 Codex read-only/high + 2 fresh Opus; NOT the Cockpit): FFI (napi/pyo3), service-security,
+  SQL/connector/Python-exec isolation, binding-consistency + cross-repo seam, docs coherence.
+  Record docs/phase6/6-7-megaudit/SYNTHESIS.md; phase exit docs/phase6/exit-packet.md (rewritten to
+  full phase). WASM/C bindings = v1.5 deferral (operator-confirmed); 6.6 AI = v2.
+  - FOLDED: C-H1 (SQL generate_series/range + recursive-CTE unbounded-compute DoS, runtime-probe-CONFIRMED
+    reachable via materialize_query → ql-sql deregisters all default table functions + disables recursive
+    CTEs, +regression tests); B-02 (QL_SERVICE_PORT No-Fallbacks on non-Unicode); C-M1 (Credentials redacted
+    Debug); docs (session-api Appendix A completion + 6.5/6.7 amendment + §9 diagnostic table + transport
+    codes; MASTER-PLAN 6.2/6.6/6.7 markers; router/napi/stub doc comments).
+  - FILED (not v1-blocking, rationale in SYNTHESIS): cross-repo IDE error-code sync D-H1/H2 on
+    feat/visualise-v1 (the 6.1C-H1 class — engine emits sql_error/sql_table_build/source_not_found now in
+    Appendix A; IDE allowlist + types.ts stale); connector path/OOM hardening C-H2/H3 (v1.5 —
+    ql-connectors has NO consumer, unreachable in v1); UDF process-tree/channel hardening C-H4/H5 (v1.5 /
+    pre-multi-client — self-authored-UDF + single-client-localhost threat model); A/C/D LOW consistency
+    items. Several lane HIGHs were independently verified OVER-RATED and reclassified (A-HIGH-1/2 → LOW,
+    B-01 → LOW). Note: Codex C-H1 re-audit was usage-limited; the fix is verified by source/API analysis +
+    passing regression tests (generate_series/range/recursive-CTE rejected; workbook SELECT still works).
 
   ✅ 6.1A SHIPPED + CODEX-VALIDATED 2026-05-26 (this session, docs-only): wrote docs/api/session-api.md
   (v2) — the stable engine session contract. Codex (gpt-5.5 xhigh) reviewed it, verdict REVISE

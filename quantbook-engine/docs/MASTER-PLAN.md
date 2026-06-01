@@ -768,7 +768,7 @@ This session counted **2 plan-implement-audit cycles** (V3.6.0.6 D5 ship + V3.6.
    Acceptance: API6-01 one Rust trait/API backs all bindings; API6-02 cancellation included; API6-03 errors are structured.  
    Effort: 4-6 days.
 
-2. **6.2 `ql-service` Engine-As-Service** — **IN PROGRESS (2026-06-01).** Transport chosen: **HTTP/1.1 + SSE on hyper** (decision-lock D2 default-lean). The THIRD consumer of the FROZEN v1 `EngineSession` contract (after napi + pyo3); PURE transport (ql-exec 802/0 unchanged). Decomposition + records: `docs/phase6/6-2-entry-plan.md`.
+2. **6.2 `ql-service` Engine-As-Service** — **✅ COMPLETE 2026-06-01** (6.2-0 … 6.2-4; all 53 contract methods reachable byte-identical to napi/pyo3). Transport chosen: **HTTP/1.1 + SSE on hyper** (decision-lock D2 default-lean). The THIRD consumer of the FROZEN v1 `EngineSession` contract (after napi + pyo3); PURE transport (ql-exec unchanged). Decomposition + records: `docs/phase6/6-2-entry-plan.md`.
    - **6.2-0 ✅ SHIPPED** — foundation + golden-flow vertical slice (SVC-6-01): crate scaffold, `wire.rs`/`error.rs`/`guarded.rs`/`session_store.rs`/`router.rs`, golden-flow endpoints (create/close/lifecycle/add-sheet/set-value/set-formula/recalc/snapshot/cell). 2-lane audit clean.
    - **6.2-1a ✅ SHIPPED** — cluster A (read/format/validate/query) + B (persistence): 11 more methods bound. 2-lane audit (`docs/audits/2026-06-01-6-2-1a-audit/`); the one HIGH is the pre-existing 6.2-0 number-encoding deferral, kept to 6.2-4 + documented.
    - **6.2-1b ✅ SHIPPED** — cluster C (structure/sheets) + D (tables): 10 more methods bound (+`TableSpecWire`). 2-lane audit (`docs/audits/2026-06-01-6-2-1b-audit/`): Codex SHIP-WITH-FIXES + Opus SHIP, 0 HIGH/0 MED, 2 LOW test-observability folded.
@@ -778,10 +778,10 @@ This session counted **2 plan-implement-audit cycles** (V3.6.0.6 D5 ship + V3.6.
    Acceptance: SVC-6-01 service opens and edits workbook; SVC-6-02 streams diagnostics; SVC-6-03 cancellation works; SVC-6-04 protocol versioned.  
    Effort: 1 week.
 
-3. **6.3 WASM, Node, C, Python Bindings**  
-   Make `ql-bindings-wasm`, `ql-bindings-node`, `ql-bindings-c`, and `quantbook-py` real over the stable session API.  
+3. **6.3 WASM, Node, C, Python Bindings** — **✅ COMPLETE 2026-05-31 for Node + Python; WASM + C = v1.5-deferred.**
+   Node (napi) + the thin `quantbook-py` (pyo3) facade are real over the contract, which is **FROZEN v1** at 6.3-5 on ≥2 passing golden-parity rows. **`ql-bindings-wasm` + `ql-bindings-c` are v1.5-deferred** (decision-lock §2.8, ratified 2026-05-30; Phase-6.7 closure confirmed): they remain empty reserved placeholder crates — no v1 consumer (IDE uses napi, service uses HTTP).  
    References: `.references/formualizer/bindings/wasm/`; `.references/formualizer/bindings/python/`; `.references/formualizer/crates/formualizer-cffi/`.  
-   Acceptance: BND-6-01 smoke tests for all bindings; BND-6-02 C ABI guardrails; BND-6-03 Python wheel builds; BND-6-04 Node binding consumed by IDE path or test harness.  
+   Acceptance: BND-6-01 smoke tests (Node + Python ✅; WASM/C → v1.5); BND-6-02 C ABI guardrails (→ v1.5); BND-6-03 Python wheel builds ✅; BND-6-04 Node binding consumed by IDE path ✅.  
    Effort: 2-3 weeks.
 
 4. **6.4 Python UDFs (`ql-udf`)**  
@@ -798,15 +798,24 @@ This session counted **2 plan-implement-audit cycles** (V3.6.0.6 D5 ship + V3.6.
    Effort: 1-2 weeks.  
    **✅ COMPLETE 2026-06-01 — LANDED on `feat/quantbook-engine` @ `1b50f7d7d30`.** Decisions locked (see `docs/phase6/6-5-entry-plan.md`): SQL engine = **DataFusion** (arrow-58 match, off-hot-path); v1 connectors = **CSV + Parquet** local files behind a credentials-aware `DataSource` trait (DuckDB-attach/Postgres deferred to v1.5); refresh = **full provenance reverse-index**. **6.5-0** `write_range` bulk-write substrate (one `Op::BatchCommit`/undo unit). **6.5-1** `ql-sql` (pure DataFusion `run_sql`, off-hot-path) + `materialize_query` (SQL-6-01/02; deep 3-lane megaudit folded 4 HIGHs — SQL DDL/file-write -> `sql_with_options` read-only, nested-runtime panic -> dedicated OS thread, unbounded result/input -> row+cell caps). **6.5-2** dual typed provenance (per-cell `cell→{source_id,revision}` + per-source `source_id→cells` reverse index) + revision-gated `refresh_source` (SQL-6-03). **6.5-3** `ql-connectors` CSV + Parquet `DataSource`, unsupported types fail loud (CONN-6-01/02). **6.5-4** napi + pyo3 + ql-service binding exposure + golden parity. **6.5-5** closure megaudit + exit packet (`docs/phase6/exit-packet.md`). 6.5-2..6.5-5 were driven autonomously through the Window-1 Cockpit (codex_forensic caught ~6 real correctness bugs, all fixed); 6.5 stack 0 failures (ql-exec 836, ql-sql 16, ql-connectors, ql-service 40, ql-bindings-node). NEXT = **6.7 Phase-6 closure megaudit** (6.6 ql-ai deferred to v2; first confirm the 6.3 WASM/C bindings v1.5-deferral scope).
 
-6. **6.6 AI() Real Backend (`ql-ai`)**  
-   Replace sentinel with real provider boundary, prompt/value marshalling, cancellation, caching policy, provenance, and no-secret-leak defaults.  
+6. **6.6 AI() Real Backend (`ql-ai`)** — **DEFERRED to v2 (decision-lock D3).** `=AI()` as a real cell
+   function is v2-aligned; v1 ships NO AI execution code. `ql-ai` stays an empty reserved crate and the
+   `AINotAvailable` sentinel stays live in `ql-functions`. **The AI-6-0x acceptance below is SUPERSEDED by
+   decision-lock D3** — any v1.x work here is limited to provider-boundary design, not a working `=AI()`.  
    References: Phase 1 AI sentinel tests; function metadata from Phase 4; service cancellation from 6.2.  
-   Acceptance: AI-6-01 AI() executes through configured backend; AI-6-02 missing credentials produce visible error; AI-6-03 cancellation works; AI-6-04 results carry provenance/caching metadata.  
+   Acceptance (SUPERSEDED — v2): AI-6-01 AI() executes through configured backend; AI-6-02 missing credentials produce visible error; AI-6-03 cancellation works; AI-6-04 results carry provenance/caching metadata.  
    Effort: 1 week. Uncertain: provider and product policy.
 
-7. **6.7 Phase 6 Audit**  
-   Audit FFI, service security, Python execution, connector credentials, AI data flow, and binding consistency.  
-   Acceptance: A6-01 all gates green; A6-02 binding smoke matrix green; A6-03 security review checked in; A6-04 no unpinned deps.  
+7. **6.7 Phase 6 Audit** — **✅ COMPLETE 2026-06-01 (SHIP-WITH-FIXES).** By-hand 5-lane closure megaudit
+   (3 Codex read-only/high + 2 fresh Opus): FFI (napi/pyo3), service-security, SQL/connector/Python-exec
+   isolation, binding-consistency + cross-repo seam, docs coherence. Record: `docs/phase6/6-7-megaudit/SYNTHESIS.md`;
+   Phase exit: `docs/phase6/exit-packet.md`. One genuinely-reachable HIGH folded (C-H1: SQL `generate_series`/
+   `range` unbounded-compute DoS → all default table functions deregistered in `ql-sql`) + B-02 (No-Fallbacks
+   port) + C-M1 (redacted `Credentials` Debug) + docs (Appendix A completion, this plan, exit-packet). Filed
+   (not v1-blocking): the cross-repo IDE error-code sync (D-H1/H2, the 6.1C-H1 class), connector path/OOM
+   hardening (C-H2/H3 — unreachable in v1, `ql-connectors` has no consumer), UDF process-tree/channel
+   hardening (C-H4/H5 — threat-model-bounded to self-authored-UDF + single-client localhost).  
+   Acceptance: A6-01 gates green (test suites pass); A6-02 binding matrix green (golden parity OK); A6-03 security review checked in (SYNTHESIS); A6-04 no unpinned deps.  
    Effort: 4-6 days.
 
 **Audit Checkpoints**

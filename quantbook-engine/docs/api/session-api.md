@@ -426,7 +426,10 @@ consumes the handle; `rollbackTransaction` discards + consumes. The 5 reserved �
 `publishDataset` / `bindRange` / `refreshSource` / `materializeQuery` are bound as thin loud-Capability
 forwarders (declared `-> void`, always `not_implemented_in_v1_core`; `publishDataset`/`materializeQuery` take
 `data` as a JSON string since the napi `serde-json` feature is off) — their FULL input contract (e.g.
-`writeRange`'s matrix-shape rule) lands with the real impl in 6.4/6.5.
+`writeRange`'s matrix-shape rule) lands with the real impl in 6.4/6.5. **(Post-6.5 — authoritative state in
+§3.5:** `writeRange`/`materializeQuery`/`refreshSource` are now LIVE and return real DTOs
+[`WriteRangeResult`/`PublishedRef`/`DirtyResult`], no longer `void` or `not_implemented_in_v1_core`; only
+`publishDataset`/`bindRange` remain reserved-Capability.)
 
 **6.3-2 is now COMPLETE** — all 32 `EngineSession` methods are bound across sub-increments a–e.
 
@@ -442,7 +445,7 @@ carries `fullRebuildRequired = true` with a `fullRebuildReason` (`no_prior_versi
 clear the delta cache, so the next `snapshotDelta` against an older token full-rebuilds; both gate
 `ensure_ready` (→ `invalid_state` post-close). `canUndo`/`canRedo` are ungated pure reads.
 
-**6.3-4 — a SECOND binding row (Python) over pyo3.** The thin pyo3 `Session` facade (`quantbook._quantbook`) SHIPPED 2026-05-31 (engine `38f4f51dfac`), wrapping the SAME `EngineSession` contract this document specifies. A cross-binding **golden parity matrix** (`crates/quantbook-py/tests/parity_matrix.py`) runs one canonical 22-step flow through Node AND Python and asserts byte-identical DTOs + error codes (masking only the opaque `version`/`nextCursor` tokens) -- so the contract is now exercised by two structurally-different bindings, not Node self-consistency alone. The Python facade is THIN (golden-flow methods only); the 5 reserved §2c bulk methods stay Capability-erroring (6.5). Errors cross as a `QuantbookError(Exception)` carrying the same `code`/`class`/`retryable`/`details`/`source` the napi native error carries. NEXT = 6.3-5 (declare the contract frozen on ≥ 2 passing rows).
+**6.3-4 — a SECOND binding row (Python) over pyo3.** The thin pyo3 `Session` facade (`quantbook._quantbook`) SHIPPED 2026-05-31 (engine `38f4f51dfac`), wrapping the SAME `EngineSession` contract this document specifies. A cross-binding **golden parity matrix** (`crates/quantbook-py/tests/parity_matrix.py`) runs one canonical flow through Node, Python AND (as of 6.2-4) the HTTP service and asserts byte-identical DTOs + error codes (masking only the opaque `version`/`nextCursor` tokens) -- so the contract is exercised by three structurally-different transports, not Node self-consistency alone. (The flow grew from the original 22 steps to **26** when 6.5 added `write_range`/`materialize_query`/`refresh_source` steps; the byte gate compares Node vs Service, with Python structural-only.) The Python facade is THIN (golden-flow methods only). **Post-6.5 status of the §3.5 bulk methods (see §3.5):** `write_range`/`materialize_query`/`refresh_source` are LIVE across all three transports; only `publish_dataset`/`bind_range` remain `Capability`-erroring. Errors cross as a `QuantbookError(Exception)` carrying the same `code`/`class`/`retryable`/`details`/`source` the napi native error carries. NEXT = 6.3-5 (declare the contract frozen on ≥ 2 passing rows).
 
 ### 4.2 Core DTOs (extracted from the proven `#[napi(object)]` structs; `+` = added/clarified)
 
@@ -638,6 +641,17 @@ lock**, then `spawn_blocking(|| handle.wait_for_drain())`. Obligations:
   `FullResyncRequired` event (the consumer reseeds via `snapshot()`), rather than silently losing
   events. Ordering: an `OperationCompleted{op_id}` event never precedes the events produced by that op.
 - `Diagnostic` is the same DTO whether returned synchronously (`validate_formula`) or via the stream.
+
+**Diagnostic `code` vocabulary (6.7 E-5 — distinct from the EngineError taxonomy in Appendix A).** The
+`CellDiagnostic.code` field is a free string; bindings pass it through (the IDE must NOT bucket it like an
+EngineError code). The current emitted namespace:
+- **UDF (`crates/ql-exec/src/scalar.rs`):** `udf_raised`, `udf_timeout`, `udf_cancelled`, `udf_handshake`,
+  `udf_protocol`, `udf_worker_died`, `udf_codec`, `udf_no_worker`, `udf_budget_exhausted`, `udf_grid_too_large`.
+- **Import / recompute (`crates/ql-exec/src/session.rs`):** `formula_recompute_failed`,
+  `xlsx_unsupported_feature`, `xlsx_import_warning`, `xlsx_formula_recompute_failed`.
+
+These are wire-observable and additive (new diagnostic codes are not a contract break, since the field is an
+open string); this list is descriptive, not a closed enum.
 
 ---
 
@@ -923,20 +937,35 @@ version-rejection is fail-loud, and the trait truly backs the Node adapter with 
 
 ## Appendix A — error variant → code mapping (MED-1; 6.1B fills exhaustively)
 
-Skeleton; 6.1B enumerates every variant from the real enums and locks `{class, code, retryable}`.
-Ambiguities Codex flagged, resolved here:
+Enumerates every variant from the real enums and locks `{class, code, retryable}`. Completed
+exhaustively at 6.1B; re-swept and extended with the 6.4 function-registry, 6.5 SQL/source, and the
+previously-undocumented `RuntimeError`/`OpLogError` codes at the Phase-6.7 closure (see the 6.5/6.7
+amendment note below the table). Ambiguities Codex flagged, resolved here:
 
 | Source enum (variant) | class | code | retryable |
 |-----------------------|-------|------|-----------|
+| `RuntimeError::{Lex,Parse,Print}` | `Compute` | `formula_parse` | no |
+| `RuntimeError::Bind` | `Compute` | `formula_bind` | no |
 | `RuntimeError::InvalidSheet` | `NotFound` | `sheet_not_found` | no |
 | `RuntimeError::InvalidCell` | `BadArgument` | `bad_cell` | no |
+| `RuntimeError::ConflictingOps` | `Conflict` | `conflicting_ops` | no |
+| `RuntimeError::Name` | `BadArgument` | `name_reserved` | no |
+| `RuntimeError::SheetName(Duplicate)` | `Conflict` | `sheet_name_duplicate` | no |
+| `RuntimeError::SheetName(_)` | `BadArgument` | `bad_sheet_name` | no |
+| `RuntimeError::InvalidChunkRows` | `BadArgument` | `invalid_chunk_rows` | no |
+| `RuntimeError::TooManySheets` | `Conflict` | `too_many_sheets` | no |
+| `RuntimeError::UnknownFormatId` | `BadArgument` | `unknown_format_id` | no |
+| `RuntimeError::FormatCounterExhausted` | `Internal` | `format_counter_exhausted` | no |
+| `RuntimeError::RecomputeIterationCap` | `Internal` | `recompute_iteration_cap` | no |
 | `RuntimeError::TableCreateRejected` | `Conflict` | `table_create_rejected` | no |
+| `RuntimeError::TableNotFound` | `NotFound` | `table_not_found` | no |
+| `RuntimeError::TableColumnNotFound` | `NotFound` | `table_column_not_found` | no |
 | `RuntimeError::TableResizeRejected` | `BadArgument` | `table_resize_rejected` | no |
 | `RuntimeError::TableColumnRejected` | `Conflict` | `table_column_rejected` | no |
-| `ReplayError::FormatNotRegistered` | `Protocol` | `format_not_registered` | no |
-| `ReplayError::InvalidSheet`/`InvalidCell` | `Protocol` | `replay_invalid_target` | no |
-| `OpLogError::{Serialize}` | `BadArgument` | `oplog_serialize` | no |
-| `OpLogError::{Deserialize,SchemaMismatch,InvalidVersionVector}` | `Protocol` | `oplog_*` | no |
+| `OpLogError::Serialize` | `BadArgument` | `oplog_serialize` | no |
+| `OpLogError::Deserialize` | `Protocol` | `oplog_deserialize` | no |
+| `OpLogError::SchemaMismatch` | `Protocol` | `oplog_schema` | no |
+| `OpLogError::InvalidVersionVector` | `Protocol` | `invalid_version_vector` | no |
 | `OpLogError::{Loro,LoroEncode}` | `Internal` | `oplog_loro` | no |
 | `OpLogError` (future `#[non_exhaustive]` variant) | `Internal` | `unmapped_oplog_error` | no |
 | `PersistenceError::{Qbook, OpLog, OplogUnsupportedVersion, OplogTruncatedHeader}` | `Persistence` | `qbook_error` / `session_oplog` / `qbook_unsupported_version` / `qbook_truncated_header` | no |
@@ -960,6 +989,26 @@ Ambiguities Codex flagged, resolved here:
 | txn id space exhausted — 2^64 `begin`s in one session (inc.2c-5; loud, never wraps) | `Internal` | `transaction_id_exhausted` | no |
 | Loro `UndoManager::undo`/`redo` internal failure (inc.2c-7; empty stack is `consumed:false`, NOT this) | `Internal` | `undo_manager_failed` | no |
 | op-log replay failure during undo/redo re-materialization (inc.2c-7) | `Internal` | `replay_failed` | no |
+| §3.5 reserved bulk method not yet implemented (`not_implemented`; `publishDataset`/`bindRange`) | `Capability` | `not_implemented_in_v1_core` | no |
+| `materialize_query`: SQL parse/plan/execute failure, or a result that does not fit / DDL-DML-statements rejected (6.5-1) | `BadArgument` | `sql_error` | no |
+| `materialize_query`: workbook→Arrow table build / result-shape failure (6.5-1) | `Internal` | `sql_table_build` | no |
+| `refresh_source`: unknown `source_id` (6.5-2) | `NotFound` | `source_not_found` | no |
+
+**6.5 / 6.7 amendment (2026-06-01):** the four rows immediately above (`not_implemented_in_v1_core`,
+`sql_error`, `sql_table_build`, `source_not_found`) and the expanded `RuntimeError` / `OpLogError` rows were
+added during the Phase-6.7 closure megaudit (finding E-2/D-M1) after a source sweep of `map_runtime_err` /
+`map_oplog_err` / the SQL paths found them emitted-but-undocumented. These are **additive** `code` strings
+(SemVer-compatible per §5.3 — the freeze permits new codes, it forbids renaming/removing existing ones); the
+runtime behavior was always correct (`map_runtime_err` is in-crate exhaustive). The earlier
+`ReplayError::FormatNotRegistered → format_not_registered` and `ReplayError::{InvalidSheet,InvalidCell} →
+replay_invalid_target` rows were REMOVED: `map_replay_err` emits a single `replay_failed` (`Internal`) and no
+mapper emits those two codes (finding D-INFO-2).
+
+**Transport-boundary codes (ql-service, 6.2):** the HTTP adapter emits a small set of transport-layer codes
+that are NOT engine `EngineError` variants and therefore not in the table above: `route_not_found`,
+`method_not_allowed`, `payload_too_large`, `unsupported_schema_version`, `unauthorized`, `forbidden`,
+`session_not_found`, `operation_not_found`. These are RFC-7807 transport rejections; bindings over a
+non-HTTP transport (napi/pyo3) never see them. (Finding E-7.)
 
 **Implementation-reality note (6.1B inc.2 audit, 2026-05-27 — F8):** the earlier draft
 split `InvalidSheet` and `TableCreateRejected` by *cause*, but the real enums do not
