@@ -15,7 +15,9 @@ use ql_service::{bind_and_serve, Authorizer, BearerToken, NoAuth, ServiceConfig,
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // A SET-but-unparseable port is a loud error (No-Fallbacks); only a genuinely
-    // unset var uses the documented default.
+    // unset var uses the documented default. A SET-but-non-Unicode value is ALSO a
+    // loud error -- NOT a silent fallback to the default (matches `env_usize` /
+    // `auth_from_env` / `idle_ttl_from_env` below; 6.7 audit B-02).
     let port: u16 = match std::env::var("QL_SERVICE_PORT") {
         Ok(s) => s.parse().map_err(|e| {
             io::Error::new(
@@ -23,7 +25,13 @@ async fn main() -> io::Result<()> {
                 format!("QL_SERVICE_PORT is set but invalid ({s:?}): {e}"),
             )
         })?,
-        Err(_) => 7321,
+        Err(std::env::VarError::NotPresent) => 7321,
+        Err(e @ std::env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("QL_SERVICE_PORT is set but not valid Unicode: {e}"),
+            ));
+        }
     };
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let store = SessionStore::new();

@@ -102,7 +102,31 @@ async fn run_sql_async(
     // With DataFusion's default normalization, unquoted identifiers are lowercased and
     // would not match the case-exact registered table/column names.
     config.options_mut().sql_parser.enable_ident_normalization = false;
+    // SECURITY (6.7 C-H1): forbid recursive CTEs. A `WITH RECURSIVE` can iterate
+    // unboundedly -- the only `recursion_limit` DataFusion exposes is a PARSER AST-depth
+    // cap, NOT a row/iteration cap -- and an aggregate over it collapses to one row, so it
+    // is the SAME unbounded-compute DoS as the table functions removed below. ql-sql queries
+    // flat workbook tables; recursion is never needed. A `WITH RECURSIVE` now fails to plan.
+    config.options_mut().execution.enable_recursive_ctes = false;
     let ctx = SessionContext::new_with_config(config);
+    // SECURITY (6.7 C-H1): drop EVERY default table function. DataFusion registers
+    // `generate_series`/`range` by default; a query like
+    // `SELECT SUM(value) FROM generate_series(1, 9e18)` synthesizes rows OUTSIDE the
+    // caller's workbook-input cap, and the aggregate collapses to one row so the
+    // target-aware result cap never trips -- an unbounded-compute DoS from a single
+    // query string (verified reachable by probe). ql-sql only queries the registered
+    // in-memory workbook tables, so NO table function is ever needed. Enumerating and
+    // deregistering (rather than name-matching `generate_series`/`range`) stays correct
+    // if a future DataFusion adds more default table functions.
+    for name in ctx
+        .state()
+        .table_functions()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        ctx.deregister_udtf(&name);
+    }
     for (name, batch) in tables {
         ctx.register_batch(&name, batch)
             .map_err(|e| SqlError::DataFusion(e.to_string()))?;
@@ -262,6 +286,50 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SqlError::DataFusion(_)), "got {err:?}");
+    }
+
+    // --- Security: default table functions removed (6.7 C-H1) ---
+
+    #[test]
+    fn generate_series_table_function_is_rejected() {
+        // `generate_series` synthesizes unbounded rows outside the input cap; an
+        // aggregate over it defeats the result row cap. It MUST be unavailable.
+        let err = run_sql(
+            vec![sample()],
+            "SELECT COUNT(*) FROM generate_series(1, 1000000)",
+            CAP,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SqlError::DataFusion(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn range_table_function_is_rejected() {
+        let err = run_sql(vec![sample()], "SELECT COUNT(*) FROM range(1, 1000000)", CAP)
+            .unwrap_err();
+        assert!(matches!(err, SqlError::DataFusion(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn recursive_cte_is_rejected() {
+        // A recursive CTE can iterate unboundedly and an aggregate hides the row count
+        // from the result cap -- the same DoS shape as generate_series. MUST be rejected.
+        let err = run_sql(
+            vec![sample()],
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 1000000) \
+             SELECT SUM(n) FROM t",
+            CAP,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SqlError::DataFusion(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn no_table_functions_remain_registered() {
+        // Belt-and-braces: a registered workbook table still queries fine AFTER the
+        // table-function purge (the purge must not remove our MemTables).
+        let r = run_sql(vec![sample()], "SELECT COUNT(*) AS n FROM sales", CAP).unwrap();
+        assert_eq!(r.num_rows(), 1);
     }
 
     // --- Resource bound: result row cap ---

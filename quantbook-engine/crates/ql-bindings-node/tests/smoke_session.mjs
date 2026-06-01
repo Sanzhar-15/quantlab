@@ -964,13 +964,19 @@ console.log("[smoke] 6.4-2 function registration PASS");
     "rollback consumed the handle (txnAdd on a rolled-back txn is transaction_not_found)",
   );
 
-  // reserved stubs: all 5 surface not_implemented_in_v1_core (loud Capability).
-  const r0 = { sheet: sh, startRow: 0, startCol: 0, endRow: 0, endCol: 0 };
-  throwsWithCode(() => w.writeRange(r0, [[{ kind: "number", number: 1 }]]), "not_implemented_in_v1_core", "writeRange reserved");
+  // sec-3.5 bulk methods post-6.5: writeRange / materializeQuery / refreshSource are LIVE;
+  // only publishDataset / bindRange remain reserved (loud Capability). (6.7 smoke-sync — the
+  // pre-6.5 "all 5 reserved" assertion was stale once 6.5-4 implemented three of them.)
+  const r0 = { sheet: sh, startRow: 10, startCol: 10, endRow: 10, endCol: 10 };
+  const wrRes = w.writeRange(r0, [[{ kind: "number", number: 1 }]]);
+  assert.equal(Number(wrRes.written), 1, "writeRange is LIVE (6.5) and reports 1 cell written");
+  // materializeQuery with no "sql" key is a loud bad_argument (not a reserved Capability stub).
+  throwsWithCode(() => w.materializeQuery("q1", r0, "{}"), "bad_argument", "materializeQuery requires a sql key");
+  // refreshSource on an unknown source id is source_not_found (not a reserved Capability stub).
+  throwsWithCode(() => w.refreshSource("s1", 1n), "source_not_found", "refreshSource on an unknown source");
+  // the two still-reserved bulk methods stay loud Capability.
   throwsWithCode(() => w.publishDataset("ds", "{}", r0), "not_implemented_in_v1_core", "publishDataset reserved");
   throwsWithCode(() => w.bindRange("b1", r0), "not_implemented_in_v1_core", "bindRange reserved");
-  throwsWithCode(() => w.refreshSource("s1", 1n), "not_implemented_in_v1_core", "refreshSource reserved");
-  throwsWithCode(() => w.materializeQuery("q1", r0, "{}"), "not_implemented_in_v1_core", "materializeQuery reserved");
 
   // arg validation (loud): unknown op kind / missing-for-kind payload / malformed JSON.
   throwsWithCode(

@@ -42,8 +42,9 @@
 //! - `POST   /v1/sessions/:id/txn-add`              -> `{ ok }`
 //! - `POST   /v1/sessions/:id/commit-transaction`   -> BatchResult wire
 //! - `POST   /v1/sessions/:id/rollback-transaction` -> `{ ok }`
-//! - `POST   /v1/sessions/:id/write-range`, `publish-dataset`, `bind-range`, `refresh-source`,
-//!   `materialize-query` -> 501 `[not_implemented_in_v1_core]` (reserved sec-3.5)
+//! - `POST   /v1/sessions/:id/write-range` -> WriteRangeResult wire; `materialize-query` ->
+//!   PublishedRef wire; `refresh-source` -> DirtyResult wire (all LIVE since 6.5). Only
+//!   `publish-dataset` + `bind-range` remain 501 `[not_implemented_in_v1_core]` (reserved sec-3.5).
 //! - `POST   /v1/sessions/:id/undo`, `redo`         -> UndoRedoResult wire
 //! - `GET    /v1/sessions/:id/can-undo`, `can-redo` -> bare bool
 //! - `POST   /v1/sessions/:id/snapshot-delta`       -> WorkbookSnapshotDelta wire (consumes `version` hex)

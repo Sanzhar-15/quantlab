@@ -6628,7 +6628,9 @@ impl Session {
     /// `{"sql":"SELECT ..."}`) — the napi `serde-json` feature is off, so it crosses as
     /// opaque text and the engine parses it. Returns `{ id: queryId }`. `[bad_argument]`
     /// for an inverted/out-of-bounds target, a result that does not fit, DDL/DML/
-    /// statements, or malformed JSON text. `[invalid_state]` off a Ready session.
+    /// statements, or malformed JSON text; `[sql_error]` for a query that fails to
+    /// parse/plan/execute; `[sql_table_build]` if the workbook->Arrow table build fails.
+    /// `[invalid_state]` off a Ready session.
     #[napi(js_name = "materializeQuery", catch_unwind)]
     pub fn materialize_query(
         &self,

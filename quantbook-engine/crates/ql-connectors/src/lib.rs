@@ -30,12 +30,28 @@ use thiserror::Error;
 /// (Postgres, S3, API keys) will use `token` and additional fields. The struct
 /// is `#[non_exhaustive]` so adding fields is not a breaking change for callers
 /// that construct it via `Default` or `Credentials { token: None, ..Default::default() }`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct Credentials {
     /// Bearer token / API key for network data sources. Ignored by local-file
     /// connectors.
     pub token: Option<String>,
+}
+
+// Manual, REDACTED `Debug` (6.7 audit C-M1): the derived `Debug` would print the
+// secret `token`, leaking it into any log line / error chain / panic message that
+// formats a `Credentials`. Local connectors ignore the token today, but a redacted
+// `Debug` closes the disclosure path before network connectors (v1.5) carry a real
+// secret here. Print only PRESENCE, never the value.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field(
+                "token",
+                &self.token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +721,19 @@ mod tests {
     // -----------------------------------------------------------------------
     // Error message visibility (CONN-6-02)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn credentials_debug_redacts_token() {
+        // 6.7 C-M1: the secret must never appear in Debug output.
+        let c = Credentials {
+            token: Some("super-secret-api-key".to_string()),
+        };
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("super-secret-api-key"), "secret leaked: {dbg}");
+        assert!(dbg.contains("redacted"), "expected redaction marker: {dbg}");
+        // Absent token is shown as None (no value to leak).
+        assert!(format!("{:?}", Credentials::default()).contains("None"));
+    }
 
     #[test]
     fn error_messages_include_source_id() {
