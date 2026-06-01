@@ -1,6 +1,7 @@
 # Phase 6.5 — SQL surface + connectors (`ql-sql`, `ql-connectors`) — entry plan
 
-**Status:** STARTED 2026-06-01. 6.5-0 (`write_range` substrate) SHIPPED. NEXT = 6.5-1.
+**Status:** STARTED 2026-06-01. 6.5-0 (`write_range` substrate) + 6.5-1 (`ql-sql` DataFusion +
+`materialize_query`, SQL-6-01/02) SHIPPED. NEXT = 6.5-2 (provenance reverse-index + `refresh_source`).
 
 Master plan §6.5 (`docs/MASTER-PLAN.md`): SQL over sheets/tables, external refresh, credentials
 boundary, Arrow interop, explicit dependency invalidation. Acceptance: **SQL-6-01** query table/sheet ·
@@ -37,11 +38,24 @@ signature** — no contract re-freeze.
   **Audit lesson:** the first impl looped `rt.set_value` under `with_runtime` (op-log attached) → N
   per-cell commits / N undo units — a Codex HIGH (the Opus lane under-rated it as "pre-existing"). Fixed by
   delegating to `batch`. The regression guard is `write_range_is_one_batch_commit_and_undo_reverts_whole_range`.
-- **6.5-1 — `ql-sql` (DataFusion) + `materialize_query`.** New `ql-sql` crate (member-only; deps
-  datafusion/arrow/tokio/ql-session/ql-storage): register sheets/tables as `MemTable`s, parse+execute SQL
-  on a current-thread tokio `block_on`, RecordBatch ⇄ CellValue. Flip `materialize_query` (`data` =
-  `{sql, ...}` JSON; run over the workbook's own tables → write target via the 6.5-0 substrate); begin
-  provenance recording. SQL-6-01 + SQL-6-02. Stage `Cargo.lock` WITH the feat.
+- **6.5-1 — `ql-sql` (DataFusion) + `materialize_query`.** SHIPPED 2026-06-01. New `ql-sql` crate
+  (member-only; PURE deps `datafusion`(features=["sql"]) + `arrow-array/schema/select` + `tokio` +
+  `thiserror` — **NO** ql-session/ql-storage/ql-exec, so reusable + acyclic): `run_sql(tables, sql,
+  max_rows)` registers each named RecordBatch as a MemTable, runs the SQL on a DEDICATED OS thread
+  (current-thread tokio `block_on` there), case-preserving identifiers, returns one concatenated
+  RecordBatch. `materialize_query` (ql-exec): parse `data={"sql":..}`, `build_sql_tables` (tables by
+  display name + sheets by A1-letter columns over effective bounds, per-column type inference
+  Float64/Boolean/Utf8), run, `record_batch_to_cell_values`, write the result block at target top-left
+  via the 6.5-0 `write_range` substrate. SQL-6-01 + SQL-6-02. ql-sql 12 tests + 10 materialize/write
+  tests; ql-exec 822/0. **Deep 3-lane megaudit (Codex + 2 Opus): 4 HIGHs folded** — (H1) DataFusion's
+  default `SQLOptions` allow `COPY ... TO`/DDL/SET = arbitrary file write (Opus-B reproduced it) ->
+  `sql_with_options` with ddl/dml/statements=false; (H2) `run_sql`'s `block_on` panics inside the
+  ql-service async runtime -> dedicated OS thread (also isolates DataFusion panics -> `SqlError::Panicked`);
+  (H3) unbounded result -> `df.limit(max+1)` + `MAX_SQL_RESULT_ROWS`; (H4) unbounded input -> per-source
+  `MAX_SQL_INPUT_CELLS` pre-build cap. MEDIUM: table/sheet name collision -> loud `bad_argument` (was
+  silent shadow). **Provenance is NOT recorded in 6.5-1 (deferred fully to 6.5-2)** — the earlier "begin
+  provenance recording" note was dropped; 6.5-2 designs recording into materialize_query. Cargo.lock
+  staged WITH the feat (datafusion + arrow-shared tree; arrow stays single-version 58.3.0).
 - **6.5-2 — provenance reverse-index + `refresh_source`.** Typed provenance + `source_id→cells` index;
   typed `Event::Provenance`; revision-gated `refresh_source` re-runs the producer, re-materializes via the
   substrate, dirties dependents → `DirtyResult`. SQL-6-03.
