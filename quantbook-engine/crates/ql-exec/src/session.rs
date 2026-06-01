@@ -1122,7 +1122,8 @@ impl WorkbookSession {
                     error: EngineError::panic("recompute panicked"),
                 };
                 self.ops.insert(op, failed.clone());
-                self.events.push(Event::OperationCompleted { op, state: failed });
+                self.events
+                    .push(Event::OperationCompleted { op, state: failed });
                 std::panic::resume_unwind(payload);
             }
         };
@@ -2473,10 +2474,7 @@ impl EngineSession for WorkbookSession {
         // the recompute here would flip the state back to `Ready`. (`close()` also
         // terminalizes the op as `Canceled`; this guard is the second line of defense
         // and the honest `invalid_state` for the caller.)
-        if matches!(
-            self.state,
-            LifecycleState::Closed | LifecycleState::Faulted
-        ) {
+        if matches!(self.state, LifecycleState::Closed | LifecycleState::Faulted) {
             self.pending_recalc = None;
             return Err(EngineError::invalid_state(
                 "await_recalc: session is terminal (Closed/Faulted); the reserved recalc is abandoned",
@@ -3088,12 +3086,94 @@ impl EngineSession for WorkbookSession {
 
     // --- Reserved bulk data / publish / bind (§3.5; impl 6.4/6.5) ---
 
+    /// **6.5-0:** bulk rectangular literal write — the substrate every
+    /// materialize path (SQL result, connector refresh) builds on. After
+    /// validating the rectangle (range/shape/cap), it lowers the matrix to one
+    /// [`SessionOp::SetValue`] per cell and applies them through
+    /// [`batch`](WorkbookSession::batch) — so the whole bulk write is ONE atomic
+    /// command: validate-all-then-apply (no partial write on any input error), a
+    /// SINGLE `Op::BatchCommit` (so the write is ONE undo unit, not N — undo
+    /// reverts the entire range), and the version token advances exactly once.
+    /// `values` is row-major and must match the range shape EXACTLY — a mismatch
+    /// is a loud `bad_argument`, never a silent truncate/pad (No-Fallbacks).
+    /// `Blank` clears a cell (the same `set_value`/`batch` input semantics). A
+    /// per-cell `set_value` loop would be WRONG here: each call appends its own
+    /// op-log commit, splitting one logical write into N undo units.
     fn write_range(
         &mut self,
-        _range: CellRange,
-        _values: Vec<Vec<CellValue>>,
+        range: CellRange,
+        values: Vec<Vec<CellValue>>,
     ) -> EngineResult<WriteRangeResult> {
-        Err(not_implemented("write_range"))
+        self.ensure_ready()?;
+        self.require_live_sheet(range.sheet, "write_range")?;
+
+        // Range validation mirrors `query_range` (F4): reject an inverted range,
+        // then both corners must lie in the addressable grid (an `end = u32::MAX`
+        // span would overflow the `end - start + 1` arithmetic below).
+        if range.end_row < range.start_row || range.end_col < range.start_col {
+            return Err(EngineError::bad_argument(
+                "write_range: range end coordinate is before its start",
+            ));
+        }
+        Self::require_in_bounds(range.start_row, range.start_col, "write_range")?;
+        Self::require_in_bounds(range.end_row, range.end_col, "write_range")?;
+        let n_rows = range.end_row - range.start_row + 1;
+        let n_cols = range.end_col - range.start_col + 1;
+        // Same OOM guard as `query_range`: a fixed cell cap fails loud rather than
+        // accepting a pathological whole-grid write.
+        const MAX_CELLS: u64 = 1 << 20; // ~1M cells
+        let cell_count = (n_rows as u64) * (n_cols as u64);
+        if cell_count > MAX_CELLS {
+            return Err(EngineError::bad_argument(format!(
+                "write_range: {n_rows}x{n_cols} exceeds the {MAX_CELLS}-cell write cap"
+            )));
+        }
+
+        // Shape must match the range EXACTLY, validated before any mutation.
+        if values.len() as u64 != n_rows as u64 {
+            return Err(EngineError::bad_argument(format!(
+                "write_range: values has {} row(s), range spans {n_rows} row(s)",
+                values.len()
+            )));
+        }
+        for (i, row) in values.iter().enumerate() {
+            if row.len() as u64 != n_cols as u64 {
+                return Err(EngineError::bad_argument(format!(
+                    "write_range: values row {i} has {} cell(s), range spans {n_cols} column(s)",
+                    row.len()
+                )));
+            }
+        }
+
+        // Lower the matrix to one `SetValue` op per cell (row-major), then apply
+        // them as a SINGLE atomic command via `batch`. `batch` validates every op
+        // pre-mutation (a literal error / Pending / non-finite value fails loud in
+        // its Phase 1 with NO partial write), logs ONE `Op::BatchCommit` under a
+        // FaultGuard (so the bulk write is one undo unit), dirties dependents, and
+        // advances the version token exactly once. Each cell of a rectangle is a
+        // distinct address, so `batch`'s same-cell value/formula conflict guard
+        // never fires here.
+        let sheet = range.sheet;
+        let start_row = range.start_row;
+        let start_col = range.start_col;
+        let mut ops: Vec<SessionOp> = Vec::with_capacity(cell_count as usize);
+        for (r_idx, row) in values.into_iter().enumerate() {
+            for (c_idx, value) in row.into_iter().enumerate() {
+                ops.push(SessionOp::SetValue {
+                    addr: CellAddr {
+                        sheet,
+                        row: start_row + r_idx as RowId,
+                        col: start_col + c_idx as ColId,
+                    },
+                    value,
+                });
+            }
+        }
+        let result = self.batch(ops, BatchOptions::default())?;
+        Ok(WriteRangeResult {
+            written: result.applied,
+            version: result.version,
+        })
     }
 
     fn publish_dataset(
@@ -3664,12 +3744,15 @@ mod tests {
         // / `unregister_function` / `list_functions` 6.4-2 — all no longer
         // unconditional Capability errors. The remaining always-deferred
         // methods still surface the honest Capability error: the reserved bulk
-        // ops (`write_range` / `publish_dataset` / `bind_range` /
-        // `refresh_source` / `materialize_query`). (`export("xlsx")` is covered
-        // separately, gated on the `xlsx-write` feature.)
+        // ops (`publish_dataset` / `bind_range` / `refresh_source` /
+        // `materialize_query`). (`export("xlsx")` is covered separately, gated on
+        // the `xlsx-write` feature.)
         //
         // **6.4-2 (2026-05-28):** swapped `list_functions` for `bind_range` —
         // the former became real in 6.4-2; the latter stays deferred to 6.4-3.
+        // **6.5-0:** `write_range` is now REAL (the bulk-write substrate) — it is
+        // no longer in the deferred set; its behavior is covered by the
+        // `write_range_*` tests below.
         let dummy_range = CellRange {
             sheet: 0,
             start_row: 0,
@@ -3692,6 +3775,318 @@ mod tests {
         assert!(
             funcs.iter().any(|m| m.canonical_name == "SUM"),
             "built-in SUM must appear in list_functions"
+        );
+    }
+
+    // --- 6.5-0: write_range (bulk rectangular literal write substrate) ---
+
+    /// The `state_seq` half of the version token (trailing 8 bytes, big-endian).
+    fn token_seq(v: &SessionVersion) -> u64 {
+        u64::from_be_bytes(v.0[16..24].try_into().expect("24-byte token"))
+    }
+
+    fn rng(sheet: SheetId, sr: RowId, sc: ColId, er: RowId, ec: ColId) -> CellRange {
+        CellRange {
+            sheet,
+            start_row: sr,
+            start_col: sc,
+            end_row: er,
+            end_col: ec,
+        }
+    }
+
+    fn num(n: f64) -> CellValue {
+        CellValue::Number { number: n }
+    }
+
+    /// A bulk write lands every cell AND dirties dependents: a `SUM(A1:B2)`
+    /// formula recomputes after a `write_range` over its inputs. A broken no-op
+    /// `write_range` fails this on BOTH the read-back and the recompute.
+    #[test]
+    fn write_range_is_observable_and_dirties_dependents() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+
+        // Initial 2x2 write into A1:B2 (row-major: row0=[A1,B1], row1=[A2,B2]).
+        let res = s
+            .write_range(
+                rng(sheet, 0, 0, 1, 1),
+                vec![vec![num(1.0), num(2.0)], vec![num(3.0), num(4.0)]],
+            )
+            .unwrap();
+        assert_eq!(res.written, 4);
+        assert_eq!(cell_value(&s, addr(sheet, 0, 0)), num(1.0));
+        assert_eq!(cell_value(&s, addr(sheet, 0, 1)), num(2.0));
+        assert_eq!(cell_value(&s, addr(sheet, 1, 0)), num(3.0));
+        assert_eq!(cell_value(&s, addr(sheet, 1, 1)), num(4.0));
+
+        // A formula depending on every written cell evaluates eagerly to 10.
+        // (Cell-ref arithmetic, not a literal range arg — the session binder
+        // only admits literal ranges inside reference-aware fn arg lists.)
+        s.set_formula(addr(sheet, 0, 2), "A1+B1+A2+B2").unwrap();
+        assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(10.0));
+
+        // Overwrite the inputs in bulk → C1 goes dirty → recalc recomputes to 100.
+        s.write_range(
+            rng(sheet, 0, 0, 1, 1),
+            vec![vec![num(10.0), num(20.0)], vec![num(30.0), num(40.0)]],
+        )
+        .unwrap();
+        let op = s.recalc_dirty().unwrap();
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
+        assert_eq!(cell_value(&s, addr(sheet, 1, 1)), num(40.0));
+        assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(100.0));
+    }
+
+    /// The whole bulk write is ONE command: the `state_seq` advances by exactly 1
+    /// for a 4-cell write (not once per cell).
+    #[test]
+    fn write_range_advances_version_exactly_once() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let before = token_seq(&s.snapshot().unwrap().version);
+        let res = s
+            .write_range(
+                rng(sheet, 0, 0, 1, 1),
+                vec![vec![num(1.0), num(2.0)], vec![num(3.0), num(4.0)]],
+            )
+            .unwrap();
+        let after = token_seq(&s.snapshot().unwrap().version);
+        assert_eq!(
+            after,
+            before + 1,
+            "a 4-cell bulk write is ONE state-seq bump"
+        );
+        assert_eq!(
+            token_seq(&res.version),
+            after,
+            "result.version is the post-write token"
+        );
+    }
+
+    /// A shape mismatch (wrong row count) is a loud `bad_argument` with NO partial
+    /// write and NO version advance.
+    #[test]
+    fn write_range_shape_mismatch_is_bad_argument_no_partial_write() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), num(99.0)).unwrap();
+        let seq0 = token_seq(&s.snapshot().unwrap().version);
+
+        // Range spans 2 rows, matrix has 1 → mismatch.
+        let err = s
+            .write_range(rng(sheet, 0, 0, 1, 0), vec![vec![num(1.0)]])
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+
+        // Wrong row width (range spans 2 cols, row has 1).
+        let err2 = s
+            .write_range(rng(sheet, 0, 0, 0, 1), vec![vec![num(1.0)]])
+            .unwrap_err();
+        assert_eq!(err2.class, ErrorClass::BadArgument);
+
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 0)),
+            num(99.0),
+            "no partial write"
+        );
+        assert_eq!(
+            token_seq(&s.snapshot().unwrap().version),
+            seq0,
+            "no version advance on rejection"
+        );
+    }
+
+    /// An inverted range (end before start) is rejected loudly.
+    #[test]
+    fn write_range_inverted_range_is_bad_argument() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let err = s
+            .write_range(rng(sheet, 5, 0, 1, 0), vec![vec![num(1.0)]])
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+    }
+
+    /// A literal error value (or `Pending`) anywhere in the matrix is rejected
+    /// UP FRONT — a preceding valid cell is NOT written (validate-all-then-apply).
+    #[test]
+    fn write_range_rejects_invalid_cell_value_no_partial_write() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), num(99.0)).unwrap();
+        let seq0 = token_seq(&s.snapshot().unwrap().version);
+        // A1:A2 (2 rows, 1 col): [Number, Error] — the error aborts before A1 is
+        // overwritten with the new Number.
+        let err = s
+            .write_range(
+                rng(sheet, 0, 0, 1, 0),
+                vec![
+                    vec![num(7.0)],
+                    vec![CellValue::Error {
+                        error: "#REF!".to_string(),
+                    }],
+                ],
+            )
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 0)),
+            num(99.0),
+            "no partial write"
+        );
+
+        let err2 = s
+            .write_range(rng(sheet, 0, 0, 0, 0), vec![vec![CellValue::Pending]])
+            .unwrap_err();
+        assert_eq!(err2.class, ErrorClass::BadArgument);
+        // Neither rejected write advanced the version token (validate-before-apply).
+        assert_eq!(
+            token_seq(&s.snapshot().unwrap().version),
+            seq0,
+            "no version advance on rejection"
+        );
+    }
+
+    /// `Blank` in the matrix clears the cell (same `set_value` input semantics).
+    #[test]
+    fn write_range_blank_clears_cell() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), num(5.0)).unwrap();
+        assert_eq!(cell_value(&s, addr(sheet, 0, 0)), num(5.0));
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![CellValue::Blank]])
+            .unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap();
+        assert!(
+            c.is_none() || c.unwrap().value.is_none(),
+            "a Blank bulk write clears the cell"
+        );
+    }
+
+    /// Lifecycle + target gating: closed session → `invalid_state`; unknown sheet
+    /// → `sheet_not_found`.
+    #[test]
+    fn write_range_gating() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let miss = s
+            .write_range(rng(99, 0, 0, 0, 0), vec![vec![num(1.0)]])
+            .unwrap_err();
+        assert_eq!(miss.class, ErrorClass::NotFound);
+        assert_eq!(miss.code, "sheet_not_found");
+        s.close().unwrap();
+        let closed = s
+            .write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(1.0)]])
+            .unwrap_err();
+        assert_eq!(closed.code, "invalid_state");
+    }
+
+    /// A range exceeding the cell cap fails loud BEFORE any allocation/shape work
+    /// (the cap is checked ahead of the matrix-shape validation).
+    #[test]
+    fn write_range_over_cell_cap_is_bad_argument() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // ~4M cells > the 1<<20 cap; pass an empty matrix so the cap fires first
+        // (no multi-million-cell allocation).
+        let err = s
+            .write_range(rng(sheet, 0, 0, 1999, 1999), Vec::new())
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        // The CAP must be what rejects it (checked before shape) — both branches
+        // are `bad_argument`, so pin the cap by its message.
+        assert!(
+            err.message.contains("write cap"),
+            "cap must reject before shape validation; got: {}",
+            err.message
+        );
+    }
+
+    /// The whole bulk write is ONE op-log unit: it logs a single `Op::BatchCommit`
+    /// (not N per-cell commits), and a single `undo()` reverts the ENTIRE range.
+    /// This is the regression guard for the "per-cell `set_value` loop splits the
+    /// write into N undo units" defect.
+    #[test]
+    fn write_range_is_one_batch_commit_and_undo_reverts_whole_range() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let log_before = s.oplog.len();
+        s.write_range(
+            rng(sheet, 0, 0, 1, 1),
+            vec![vec![num(1.0), num(2.0)], vec![num(3.0), num(4.0)]],
+        )
+        .unwrap();
+
+        // Exactly ONE op-log entry, and it is a BatchCommit holding all 4 cells.
+        assert_eq!(
+            s.oplog.len() - log_before,
+            1,
+            "a 4-cell write_range must log ONE BatchCommit"
+        );
+        let ops: Vec<Op> = s.oplog.iter().collect::<Result<_, _>>().unwrap();
+        match ops.last().unwrap() {
+            Op::BatchCommit { ops: inner } => {
+                assert_eq!(
+                    inner.len(),
+                    4,
+                    "4 written cells -> 4 inner ops; got {inner:?}"
+                );
+                assert!(inner.iter().all(|o| matches!(o, Op::PutValue { .. })));
+            }
+            other => panic!("expected BatchCommit, got {other:?}"),
+        }
+
+        // ONE undo reverts the ENTIRE bulk write (a broken N-commit impl would
+        // leave A1..B2 minus the last cell behind).
+        assert!(s.undo().unwrap().consumed);
+        for (r, c) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)] {
+            assert!(
+                s.cell(addr(sheet, r, c)).unwrap().is_none(),
+                "cell ({r},{c}) must revert to empty after a single undo"
+            );
+        }
+    }
+
+    /// A non-A1-anchored range with mixed value kinds lands each cell at the right
+    /// address (catches an offset bug in the row-major idx -> (row,col) mapping)
+    /// and touches NOTHING outside the range.
+    #[test]
+    fn write_range_nonzero_anchor_mixed_kinds() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // B2:C3 (rows 1-2, cols 1-2). row0=[B2,C2], row1=[B3,C3].
+        let res = s
+            .write_range(
+                rng(sheet, 1, 1, 2, 2),
+                vec![
+                    vec![num(1.0), CellValue::Boolean { boolean: true }],
+                    vec![
+                        CellValue::Text {
+                            text: "hi".to_string(),
+                        },
+                        num(2.0),
+                    ],
+                ],
+            )
+            .unwrap();
+        assert_eq!(res.written, 4);
+        assert_eq!(cell_value(&s, addr(sheet, 1, 1)), num(1.0)); // B2
+        assert_eq!(
+            cell_value(&s, addr(sheet, 1, 2)),
+            CellValue::Boolean { boolean: true }
+        ); // C2
+        assert_eq!(
+            cell_value(&s, addr(sheet, 2, 1)),
+            CellValue::Text {
+                text: "hi".to_string()
+            }
+        ); // B3
+        assert_eq!(cell_value(&s, addr(sheet, 2, 2)), num(2.0)); // C3
+                                                                 // A1 (outside the range) was never touched.
+        assert!(
+            s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
+            "A1 must be untouched"
         );
     }
 
@@ -6335,7 +6730,8 @@ mod tests {
         // (so EVERY footprint value changes when B1 changes — including the
         // anchor; the anchor-invariant case is covered separately by the VEQ
         // test below).
-        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(B1,1,B1)").unwrap();
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(B1,1,B1)")
+            .unwrap();
         let v1 = s.snapshot().unwrap().version;
         s.set_value(addr(sheet, 0, 1), CellValue::Number { number: 5.0 })
             .unwrap();
@@ -6366,16 +6762,19 @@ mod tests {
         let mut s = WorkbookSession::new();
         let sheet = s.add_sheet("S", 16384).unwrap();
         let v0 = s.snapshot().unwrap().version;
-        s.batch(vec![
-            SessionOp::SetValue {
-                addr: addr(sheet, 0, 1),
-                value: CellValue::Number { number: 3.0 },
-            },
-            SessionOp::SetFormula {
-                addr: addr(sheet, 0, 0),
-                text: "SEQUENCE(3)".to_string(),
-            },
-        ], BatchOptions::default())
+        s.batch(
+            vec![
+                SessionOp::SetValue {
+                    addr: addr(sheet, 0, 1),
+                    value: CellValue::Number { number: 3.0 },
+                },
+                SessionOp::SetFormula {
+                    addr: addr(sheet, 0, 0),
+                    text: "SEQUENCE(3)".to_string(),
+                },
+            ],
+            BatchOptions::default(),
+        )
         .unwrap();
         let d = s.snapshot_delta(&v0).unwrap();
         let changed = delta_changed_coords(&d);
@@ -6398,7 +6797,8 @@ mod tests {
         s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
             .unwrap();
         // C1 = SEQUENCE(3,1,1,A1) spills C1:C3 = 1, 1+A1, 1+2A1.
-        s.set_formula(addr(sheet, 0, 2), "SEQUENCE(3,1,1,A1)").unwrap();
+        s.set_formula(addr(sheet, 0, 2), "SEQUENCE(3,1,1,A1)")
+            .unwrap();
         let v1 = s.snapshot().unwrap().version;
         s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
             .unwrap();
@@ -6443,7 +6843,10 @@ mod tests {
             .unwrap();
         s.recalc_all().unwrap();
         let d = s.snapshot_delta(&v1).unwrap();
-        assert!(!d.full_rebuild_required, "recalc_all does NOT bump the epoch");
+        assert!(
+            !d.full_rebuild_required,
+            "recalc_all does NOT bump the epoch"
+        );
         let removed = delta_removed_coords(&d);
         assert!(
             removed.contains(&(2, 0)) && removed.contains(&(3, 0)),
