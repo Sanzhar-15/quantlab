@@ -64,6 +64,13 @@ loro              = { workspace = true }
 # materialize_query opaque payloads). Workspace dep, already linked transitively.
 serde_json        = { workspace = true }
 arrow-array       = { workspace = true }
+# Phase 6.5-1 (2026-06-01): `materialize_query` builds one Arrow RecordBatch per
+# workbook table/sheet (schema via arrow-schema Field/Schema), runs SQL through the
+# pure `ql-sql` DataFusion wrapper (Arrow-in -> SQL -> Arrow-out; no engine deps),
+# then converts the result RecordBatch back to cell values and writes it via the
+# `write_range` substrate. `ql-sql` is a LEAF SQL crate (datafusion/arrow/tokio only).
+arrow-schema      = { workspace = true }
+ql-sql            = { path = "../ql-sql" }
 multiversion      = { workspace = true }
 thiserror         = { workspace = true }
 # `pulp` is in workspace.dependencies for Phase 4+ kernels that need explicit lane ops

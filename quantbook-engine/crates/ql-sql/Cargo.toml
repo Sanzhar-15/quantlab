@@ -9,4 +9,31 @@ publish.workspace = true
 [lib]
 path = "src/lib.rs"
 
+# Phase 6.5-1 (2026-06-01): off-hot-path SQL over workbook tables/sheets via
+# DataFusion (T1-D03 keeps Arrow kernels on the HOT path; SQL is off-hot-path, so
+# DataFusion is allowed here). PURE Arrow-in -> SQL -> Arrow-out: this crate has
+# NO engine deps (no ql-session/ql-storage/ql-exec) -- the caller (ql-exec
+# WorkbookSession::materialize_query) builds one RecordBatch per registered
+# table/sheet, runs a SQL string here, and converts the result RecordBatch back
+# into cell values. Member-only (NOT in default-members), like ql-service -- a
+# bare `cargo build` is unperturbed; `cargo build --workspace` / `-p ql-sql` cover it.
 [dependencies]
+# datafusion is workspace-pinned =53.1.0 (requires arrow ^58.0.0 = the workspace
+# arrow =58.3.0 pin, so RecordBatches built with the workspace arrow crates are
+# the SAME type DataFusion consumes -- no second arrow version, no conversion).
+# The workspace pin sets default-features=false; `SessionContext::sql` is gated
+# behind the `sql` feature, so enable it here (aggregates + MemTable register are
+# core, ungated). Scalar-fn packages (regex/crypto/encoding) + parquet/avro stay
+# off -- the SQL we run (SELECT/WHERE/GROUP BY/aggregates/ORDER BY) needs none of
+# them. NOTE: the local-filesystem datasource stack (object_store + datafusion-
+# datasource-{csv,json,arrow}) is a NON-optional datafusion dep and links in
+# regardless; `run_sql` therefore forbids DDL/DML/statements via SQLOptions so a
+# query cannot reach it (no COPY/CREATE EXTERNAL TABLE/SET).
+datafusion = { workspace = true, features = ["sql"] }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+# A current-thread runtime to block_on DataFusion's async collect (the engine
+# session is synchronous).
+tokio = { workspace = true }
+thiserror = { workspace = true }

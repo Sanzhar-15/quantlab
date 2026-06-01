@@ -86,6 +86,16 @@ use ql_storage::{NamedTarget, Workbook};
 use ql_types::{ColId, RowId, SheetId, Value};
 use ql_udf::UdfWorker;
 
+// 6.5-1: Arrow types for building per-table/sheet RecordBatches (SQL inputs) and
+// converting a SQL result RecordBatch back to cell values.
+use arrow_array::builder::{BooleanBuilder, Float64Builder, StringBuilder};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Int8Array, LargeStringArray, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
+};
+use arrow_schema::{DataType, Field, Schema};
+
 use ql_formula_syntax::{lex, lex_with, parse, print_with, FormulaSite};
 use ql_io::CellWireValue;
 use ql_oplog::Op;
@@ -3193,13 +3203,83 @@ impl EngineSession for WorkbookSession {
         Err(not_implemented("refresh_source"))
     }
 
+    /// **6.5-1:** materialize a SQL query result into `target`. `data` is a JSON
+    /// object `{"sql": "<query>"}`; the query runs OFF the hot path (DataFusion, via
+    /// the pure `ql-sql` crate) over the workbook's tables (registered by display name
+    /// with their named columns) and sheets (by sheet name with A1 column-letter
+    /// columns over the effective value bounds). The result is written as a block
+    /// anchored at `target`'s top-left through the [`write_range`] substrate (ONE
+    /// `Op::BatchCommit`, dirties dependents, one version bump); the result must FIT
+    /// within `target` (else loud `bad_argument`) and cells of `target` beyond the
+    /// result are left unchanged. A zero-row result writes nothing. Returns
+    /// `PublishedRef { id }` (the caller's `query_id`). Per-cell provenance + the
+    /// `refresh_source` re-run path are 6.5-2.
+    ///
+    /// [`write_range`]: WorkbookSession::write_range
     fn materialize_query(
         &mut self,
-        _query_id: &str,
-        _target: CellRange,
-        _data: serde_json::Value,
+        query_id: &str,
+        target: CellRange,
+        data: serde_json::Value,
     ) -> EngineResult<PublishedRef> {
-        Err(not_implemented("materialize_query"))
+        self.ensure_ready()?;
+        self.require_live_sheet(target.sheet, "materialize_query")?;
+        if target.end_row < target.start_row || target.end_col < target.start_col {
+            return Err(EngineError::bad_argument(
+                "materialize_query: target range end coordinate is before its start",
+            ));
+        }
+        Self::require_in_bounds(target.start_row, target.start_col, "materialize_query")?;
+        Self::require_in_bounds(target.end_row, target.end_col, "materialize_query")?;
+        let target_rows = (target.end_row - target.start_row + 1) as usize;
+        let target_cols = (target.end_col - target.start_col + 1) as usize;
+
+        let sql = parse_materialize_sql(&data)?;
+        let tables = build_sql_tables(&self.workbook)?;
+        // Bound execution to the target's row capacity: SQL stops after `target_rows + 1`
+        // rows, so a result that cannot fit is rejected loud WITHOUT collecting OR
+        // converting an oversized result (a 1-row target never materializes ~1M rows).
+        let result = ql_sql::run_sql(tables, &sql, target_rows).map_err(|e| match e {
+            ql_sql::SqlError::ResultTooLarge { .. } => EngineError::bad_argument(format!(
+                "materialize_query: result does not fit the target range (more than \
+                 {target_rows} row(s))"
+            )),
+            other => EngineError::new(ErrorClass::BadArgument, "sql_error", other.to_string()),
+        })?;
+
+        // Fit is checked on the RecordBatch (cheap row/col counts) BEFORE the row-major
+        // conversion. `run_sql` already bounded rows at `target_rows` (else the
+        // `ResultTooLarge` arm above fired); this catches the column overflow.
+        let n_rows = result.num_rows();
+        if n_rows == 0 {
+            // A zero-row result materializes nothing (no write, no version advance).
+            return Ok(PublishedRef {
+                id: query_id.to_string(),
+            });
+        }
+        let n_cols = result.num_columns();
+        if n_rows > target_rows || n_cols > target_cols {
+            return Err(EngineError::bad_argument(format!(
+                "materialize_query: result {n_rows}x{n_cols} does not fit the target range \
+                 {target_rows}x{target_cols}"
+            )));
+        }
+        let values = record_batch_to_cell_values(&result)?;
+
+        // Write the result block anchored at the target's top-left via the bulk-write
+        // substrate (validation + one BatchCommit + dependent dirtying). Cells of the
+        // target beyond the result block are left unchanged.
+        let block = CellRange {
+            sheet: target.sheet,
+            start_row: target.start_row,
+            start_col: target.start_col,
+            end_row: target.start_row + (n_rows as RowId) - 1,
+            end_col: target.start_col + (n_cols as ColId) - 1,
+        };
+        self.write_range(block, values)?;
+        Ok(PublishedRef {
+            id: query_id.to_string(),
+        })
     }
 }
 
@@ -3630,6 +3710,339 @@ fn map_function_registry_err(e: ql_functions::FunctionRegistryError) -> EngineEr
         F::Conflict { .. } => EngineError::new(ErrorClass::Conflict, "function_exists", display),
         F::NotFound { .. } => EngineError::new(ErrorClass::NotFound, "function_not_found", display),
     }
+}
+
+// ============================================================================
+// 6.5-1: SQL materialize support. SQL execution lives in the pure `ql-sql` crate
+// (DataFusion, off the hot path); here we (a) build one Arrow RecordBatch per
+// workbook table/sheet to register as a queryable table, and (b) convert a result
+// RecordBatch back into a row-major cell-value matrix.
+// ============================================================================
+
+/// Parse the `materialize_query` `data` payload: a JSON object `{"sql": "<query>"}`.
+/// Anything else is a loud `bad_argument` (No-Fallbacks -- never a silent default query).
+fn parse_materialize_sql(data: &serde_json::Value) -> EngineResult<String> {
+    let sql = data.get("sql").and_then(|v| v.as_str()).ok_or_else(|| {
+        EngineError::bad_argument(
+            "materialize_query: `data` must be a JSON object with a string `sql` field",
+        )
+    })?;
+    if sql.trim().is_empty() {
+        return Err(EngineError::bad_argument(
+            "materialize_query: `sql` must be a non-empty query",
+        ));
+    }
+    Ok(sql.to_string())
+}
+
+/// Excel column letters for a 0-based column index (0 -> "A", 25 -> "Z", 26 -> "AA").
+/// Names sheet-as-table columns (a raw sheet has no header row in v1). Bijective
+/// base-26 (A=1), matching ql-formula-syntax's printer.
+fn column_index_to_letters(mut col: u32) -> String {
+    let mut letters = String::new();
+    loop {
+        let digit = (col % 26) as u8;
+        letters.insert(0, (b'A' + digit) as char);
+        if col < 26 {
+            break;
+        }
+        col = col / 26 - 1;
+    }
+    letters
+}
+
+/// Build one Arrow column from cell values, inferring the type: all non-blank Number
+/// -> Float64; all non-blank Boolean -> Boolean; otherwise Utf8 (every non-blank cell
+/// stringified via `Value`'s `Display` -- numbers, TRUE/FALSE, text, error sigils).
+/// Blank cells become Arrow nulls; an all-blank column -> Float64 of nulls. Returns the
+/// column `DataType` (for the schema `Field`) + the array.
+fn build_inferred_column(values: &[Value]) -> (DataType, ArrayRef) {
+    let mut all_number = true;
+    let mut all_boolean = true;
+    for v in values {
+        match v {
+            Value::Blank => {}
+            Value::Number(_) => all_boolean = false,
+            Value::Boolean(_) => all_number = false,
+            Value::Text(_) | Value::Error(_) => {
+                all_number = false;
+                all_boolean = false;
+            }
+        }
+    }
+    if all_number {
+        let mut b = Float64Builder::with_capacity(values.len());
+        for v in values {
+            match v {
+                Value::Number(n) => b.append_value(*n),
+                _ => b.append_null(),
+            }
+        }
+        (DataType::Float64, Arc::new(b.finish()))
+    } else if all_boolean {
+        let mut b = BooleanBuilder::with_capacity(values.len());
+        for v in values {
+            match v {
+                Value::Boolean(x) => b.append_value(*x),
+                _ => b.append_null(),
+            }
+        }
+        (DataType::Boolean, Arc::new(b.finish()))
+    } else {
+        let mut b = StringBuilder::new();
+        for v in values {
+            if matches!(v, Value::Blank) {
+                b.append_null();
+            } else {
+                b.append_value(v.to_string());
+            }
+        }
+        (DataType::Utf8, Arc::new(b.finish()))
+    }
+}
+
+/// Assemble a RecordBatch from named columns (field name + values), inferring each
+/// column's Arrow type. The caller guarantees all columns are the same length
+/// (a rectangular region); a mismatch surfaces loud as `Internal`/`sql_table_build`.
+fn record_batch_from_columns(columns: Vec<(String, Vec<Value>)>) -> EngineResult<RecordBatch> {
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+    for (name, values) in columns {
+        let (dt, arr) = build_inferred_column(&values);
+        fields.push(Field::new(name, dt, true));
+        arrays.push(arr);
+    }
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, arrays).map_err(|e| {
+        EngineError::new(
+            ErrorClass::Internal,
+            "sql_table_build",
+            format!("failed to build an in-memory SQL table: {e}"),
+        )
+    })
+}
+
+/// Per-source cell cap for SQL inputs. A sheet's `effective_value_bounds` can span up to
+/// the whole grid from a single far cell, and a table by its footprint; both would
+/// otherwise build every (mostly-blank) cell into Arrow. A source over this cap is a loud
+/// `bad_argument` (No-Fallbacks; sparse/range pushdown is a later increment).
+const MAX_SQL_INPUT_CELLS: u64 = 1 << 20; // ~1M cells
+
+/// Build the queryable tables for a SQL query over the workbook: every defined table
+/// (by display name, with its named columns, data rows only) and every live sheet (by
+/// name, with A1 column-letter columns over the effective value bounds). Each becomes
+/// one in-memory Arrow RecordBatch. (v1: ALL sources are built per query, off the hot
+/// path; referenced-only / lazy registration is a v1.5 improvement.) The TOTAL cells
+/// across all sources is bounded by [`MAX_SQL_INPUT_CELLS`] -- checked incrementally
+/// BEFORE each source's columns are materialized, so a single far cell (whole-grid
+/// `effective_value_bounds`) or many sources cannot force an unbounded Arrow allocation.
+/// Over-cap, or a table/sheet name collision (which would silently shadow under one SQL
+/// schema -- the sheet registers last and wins), is a loud `bad_argument`.
+fn build_sql_tables(workbook: &Workbook) -> EngineResult<Vec<(String, RecordBatch)>> {
+    let mut out: Vec<(String, RecordBatch)> = Vec::new();
+    let mut names: HashSet<String> = HashSet::new();
+    let mut total_cells: u64 = 0;
+
+    // Defined tables: named columns, data rows only (header/totals excluded).
+    for (_canonical, table) in workbook.tables().iter() {
+        let sheet = match workbook.sheet(table.sheet) {
+            Some(s) => s,
+            None => continue, // tombstoned anchor sheet -> skip the table
+        };
+        let name = table.display_name.to_string();
+        let n_rows = table
+            .data_range()
+            .map(|r| u64::from(r.end_row - r.start_row + 1))
+            .unwrap_or(0);
+        let cells = n_rows * (table.columns.len() as u64);
+        total_cells = total_cells.saturating_add(cells);
+        if total_cells > MAX_SQL_INPUT_CELLS {
+            return Err(sql_input_cap_err(total_cells));
+        }
+        let mut columns: Vec<(String, Vec<Value>)> = Vec::with_capacity(table.columns.len());
+        for (col_idx, col_meta) in table.columns.iter().enumerate() {
+            let mut vals = Vec::new();
+            if let Some(range) = table.column_data_range(col_idx as u32) {
+                for row in range.start_row..=range.end_row {
+                    vals.push(sheet.read(row, range.start_col));
+                }
+            }
+            columns.push((col_meta.display.to_string(), vals));
+        }
+        if !names.insert(name.clone()) {
+            return Err(name_collision_err(&name));
+        }
+        out.push((name, record_batch_from_columns(columns)?));
+    }
+
+    // Live sheets: A1 column-letter columns over the effective value bounds.
+    for &sheet_id in workbook.sheet_display_order() {
+        if workbook.is_sheet_removed(sheet_id) {
+            continue;
+        }
+        let sheet = match workbook.sheet(sheet_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        let bounds = sheet.effective_value_bounds();
+        if bounds.col_extent == 0 {
+            continue; // empty sheet -> nothing to query
+        }
+        let name = sheet.name().to_string();
+        let cells = u64::from(bounds.row_extent) * u64::from(bounds.col_extent);
+        // Check the running total BEFORE materializing the (potentially whole-grid) columns.
+        total_cells = total_cells.saturating_add(cells);
+        if total_cells > MAX_SQL_INPUT_CELLS {
+            return Err(sql_input_cap_err(total_cells));
+        }
+        if !names.insert(name.clone()) {
+            return Err(name_collision_err(&name));
+        }
+        let mut columns: Vec<(String, Vec<Value>)> = Vec::with_capacity(bounds.col_extent as usize);
+        for col in 0..bounds.col_extent {
+            let mut vals = Vec::with_capacity(bounds.row_extent as usize);
+            for row in 0..bounds.row_extent {
+                vals.push(sheet.read(row, col));
+            }
+            columns.push((column_index_to_letters(col), vals));
+        }
+        out.push((name, record_batch_from_columns(columns)?));
+    }
+
+    Ok(out)
+}
+
+/// The total cells across all queryable tables/sheets exceeded the SQL input budget.
+/// Bounds total Arrow allocation per query (v1; referenced-only registration is v1.5).
+fn sql_input_cap_err(total_cells: u64) -> EngineError {
+    EngineError::bad_argument(format!(
+        "materialize_query: total SQL input ({total_cells} cells across the workbook's \
+         tables/sheets) exceeds the {MAX_SQL_INPUT_CELLS}-cell input cap"
+    ))
+}
+
+/// A table and a sheet (or two sources) share a SQL-registration name -> a query would
+/// silently resolve to whichever registered last. Fail loud instead (No-Fallbacks).
+fn name_collision_err(name: &str) -> EngineError {
+    EngineError::bad_argument(format!(
+        "materialize_query: ambiguous SQL source name `{name}` (a table and a sheet, or \
+         two sources, share it); rename one before querying"
+    ))
+}
+
+/// Convert one SQL result column (an Arrow array) into a column of `CellValue`s.
+/// Handles the Arrow types DataFusion produces over our inferred Float64/Boolean/Utf8
+/// inputs, plus the integer types from `COUNT`/casts. Nulls -> `Blank`. An unsupported
+/// result type is a loud `bad_argument` (No-Fallbacks).
+fn arrow_column_to_cell_values(col: &ArrayRef) -> EngineResult<Vec<CellValue>> {
+    macro_rules! num_col {
+        ($ty:ty) => {{
+            let a = col
+                .as_any()
+                .downcast_ref::<$ty>()
+                .expect("data_type checked above");
+            (0..a.len())
+                .map(|i| {
+                    if a.is_null(i) {
+                        CellValue::Blank
+                    } else {
+                        CellValue::Number {
+                            number: a.value(i) as f64,
+                        }
+                    }
+                })
+                .collect()
+        }};
+    }
+    let out: Vec<CellValue> = match col.data_type() {
+        DataType::Float64 => num_col!(Float64Array),
+        DataType::Float32 => num_col!(Float32Array),
+        DataType::Int64 => num_col!(Int64Array),
+        DataType::Int32 => num_col!(Int32Array),
+        DataType::Int16 => num_col!(Int16Array),
+        DataType::Int8 => num_col!(Int8Array),
+        DataType::UInt64 => num_col!(UInt64Array),
+        DataType::UInt32 => num_col!(UInt32Array),
+        DataType::UInt16 => num_col!(UInt16Array),
+        DataType::UInt8 => num_col!(UInt8Array),
+        DataType::Boolean => {
+            let a = col
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("data_type checked above");
+            (0..a.len())
+                .map(|i| {
+                    if a.is_null(i) {
+                        CellValue::Blank
+                    } else {
+                        CellValue::Boolean {
+                            boolean: a.value(i),
+                        }
+                    }
+                })
+                .collect()
+        }
+        DataType::Utf8 => {
+            let a = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("data_type checked above");
+            (0..a.len())
+                .map(|i| {
+                    if a.is_null(i) {
+                        CellValue::Blank
+                    } else {
+                        CellValue::Text {
+                            text: a.value(i).to_string(),
+                        }
+                    }
+                })
+                .collect()
+        }
+        DataType::LargeUtf8 => {
+            let a = col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("data_type checked above");
+            (0..a.len())
+                .map(|i| {
+                    if a.is_null(i) {
+                        CellValue::Blank
+                    } else {
+                        CellValue::Text {
+                            text: a.value(i).to_string(),
+                        }
+                    }
+                })
+                .collect()
+        }
+        DataType::Null => (0..col.len()).map(|_| CellValue::Blank).collect(),
+        other => {
+            return Err(EngineError::bad_argument(format!(
+                "materialize_query: unsupported SQL result column type {other:?}"
+            )));
+        }
+    };
+    Ok(out)
+}
+
+/// Convert a SQL result RecordBatch into a row-major `Vec<Vec<CellValue>>`.
+fn record_batch_to_cell_values(batch: &RecordBatch) -> EngineResult<Vec<Vec<CellValue>>> {
+    let n_rows = batch.num_rows();
+    let n_cols = batch.num_columns();
+    let mut cols: Vec<Vec<CellValue>> = Vec::with_capacity(n_cols);
+    for c in 0..n_cols {
+        cols.push(arrow_column_to_cell_values(batch.column(c))?);
+    }
+    let mut rows: Vec<Vec<CellValue>> = Vec::with_capacity(n_rows);
+    for r in 0..n_rows {
+        let mut row = Vec::with_capacity(n_cols);
+        for c in cols.iter() {
+            row.push(c[r].clone());
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -4088,6 +4501,269 @@ mod tests {
             s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
             "A1 must be untouched"
         );
+    }
+
+    // --- 6.5-1: materialize_query (SQL over sheets/tables -> sheet) ---
+
+    fn sql_data(sql: &str) -> serde_json::Value {
+        serde_json::json!({ "sql": sql })
+    }
+
+    /// SQL-6-01 (query a SHEET) + SQL-6-02 (materialize to sheet): a GROUP BY/SUM over
+    /// a sheet's A1-letter columns lands in the target block.
+    #[test]
+    fn materialize_query_sheet_aggregate() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(
+            rng(sheet, 0, 0, 2, 1),
+            vec![
+                vec![num(10.0), CellValue::Text { text: "x".into() }],
+                vec![num(20.0), CellValue::Text { text: "y".into() }],
+                vec![num(30.0), CellValue::Text { text: "x".into() }],
+            ],
+        )
+        .unwrap();
+        let r = s
+            .materialize_query(
+                "q1",
+                rng(sheet, 0, 3, 1, 4),
+                sql_data("SELECT B, SUM(A) AS total FROM S GROUP BY B ORDER BY B"),
+            )
+            .unwrap();
+        assert_eq!(r.id, "q1");
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 3)),
+            CellValue::Text { text: "x".into() }
+        );
+        assert_eq!(cell_value(&s, addr(sheet, 0, 4)), num(40.0));
+        assert_eq!(
+            cell_value(&s, addr(sheet, 1, 3)),
+            CellValue::Text { text: "y".into() }
+        );
+        assert_eq!(cell_value(&s, addr(sheet, 1, 4)), num(20.0));
+    }
+
+    /// SQL-6-01 (query a TABLE by name with its named columns).
+    #[test]
+    fn materialize_query_over_named_table() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        let spec = TableSpec {
+            name: "T".into(),
+            sheet: sid,
+            top_row: 0,
+            top_col: 0,
+            rows: 3, // 1 header + 2 data
+            cols: 2,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["region".into(), "amount".into()],
+        };
+        s.create_table(spec).unwrap();
+        // Data rows (1-2): region (col 0) + amount (col 1).
+        s.write_range(
+            rng(sid, 1, 0, 2, 1),
+            vec![
+                vec![
+                    CellValue::Text {
+                        text: "east".into(),
+                    },
+                    num(100.0),
+                ],
+                vec![
+                    CellValue::Text {
+                        text: "west".into(),
+                    },
+                    num(200.0),
+                ],
+            ],
+        )
+        .unwrap();
+        let r = s
+            .materialize_query(
+                "q2",
+                rng(sid, 0, 3, 1, 4),
+                sql_data(
+                    "SELECT region, SUM(amount) AS total FROM T GROUP BY region ORDER BY region",
+                ),
+            )
+            .unwrap();
+        assert_eq!(r.id, "q2");
+        assert_eq!(
+            cell_value(&s, addr(sid, 0, 3)),
+            CellValue::Text {
+                text: "east".into()
+            }
+        );
+        assert_eq!(cell_value(&s, addr(sid, 0, 4)), num(100.0));
+        assert_eq!(
+            cell_value(&s, addr(sid, 1, 3)),
+            CellValue::Text {
+                text: "west".into()
+            }
+        );
+        assert_eq!(cell_value(&s, addr(sid, 1, 4)), num(200.0));
+    }
+
+    /// SQL-6-02: a materialized cell dirties its dependents (a formula recomputes).
+    #[test]
+    fn materialize_query_dirties_dependents() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), num(5.0)).unwrap(); // A1 = 5
+        s.set_formula(addr(sheet, 0, 2), "B1*2").unwrap(); // C1 = B1*2; B1 blank -> 0
+        assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(0.0));
+        s.materialize_query(
+            "q3",
+            rng(sheet, 0, 1, 0, 1),
+            sql_data("SELECT A FROM S WHERE A = 5"),
+        )
+        .unwrap();
+        assert_eq!(cell_value(&s, addr(sheet, 0, 1)), num(5.0)); // B1 materialized
+        let op = s.recalc_dirty().unwrap();
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
+        assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(10.0)); // C1 recomputed
+    }
+
+    /// A result larger than the target range is a loud bad_argument (No-Fallbacks).
+    #[test]
+    fn materialize_query_result_exceeds_target_is_bad_argument() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(
+            rng(sheet, 0, 0, 2, 0),
+            vec![vec![num(1.0)], vec![num(2.0)], vec![num(3.0)]],
+        )
+        .unwrap();
+        // 3-row result into a 2x1 target -> does not fit.
+        let err = s
+            .materialize_query("q4", rng(sheet, 0, 2, 1, 2), sql_data("SELECT A FROM S"))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert!(err.message.contains("does not fit"), "got: {}", err.message);
+    }
+
+    /// A zero-row result writes nothing and leaves the target + version unchanged.
+    #[test]
+    fn materialize_query_zero_rows_writes_nothing() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(7.0)]])
+            .unwrap();
+        s.set_value(addr(sheet, 0, 2), num(99.0)).unwrap(); // target sentinel
+        let seq0 = token_seq(&s.snapshot().unwrap().version);
+        let r = s
+            .materialize_query(
+                "q5",
+                rng(sheet, 0, 2, 0, 2),
+                sql_data("SELECT A FROM S WHERE A > 1000"),
+            )
+            .unwrap();
+        assert_eq!(r.id, "q5");
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 2)),
+            num(99.0),
+            "target untouched on 0-row result"
+        );
+        assert_eq!(
+            token_seq(&s.snapshot().unwrap().version),
+            seq0,
+            "no version advance"
+        );
+    }
+
+    /// Malformed `data` and bad SQL are loud bad_argument.
+    #[test]
+    fn materialize_query_bad_input_is_loud() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(1.0)]])
+            .unwrap();
+        let e1 = s
+            .materialize_query("q", rng(sheet, 0, 1, 0, 1), serde_json::json!({"nope": 1}))
+            .unwrap_err();
+        assert_eq!(e1.class, ErrorClass::BadArgument);
+        let e2 = s
+            .materialize_query("q", rng(sheet, 0, 1, 0, 1), sql_data("   "))
+            .unwrap_err();
+        assert_eq!(e2.class, ErrorClass::BadArgument);
+        let e3 = s
+            .materialize_query("q", rng(sheet, 0, 1, 0, 1), sql_data("SELECT * FROM nope"))
+            .unwrap_err();
+        assert_eq!(e3.class, ErrorClass::BadArgument);
+        assert_eq!(e3.code, "sql_error");
+    }
+
+    /// Lifecycle + target gating: closed -> invalid_state; unknown target sheet ->
+    /// sheet_not_found (both before any SQL runs).
+    #[test]
+    fn materialize_query_gating() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let miss = s
+            .materialize_query("q", rng(99, 0, 0, 0, 0), sql_data("SELECT 1"))
+            .unwrap_err();
+        assert_eq!(miss.code, "sheet_not_found");
+        s.close().unwrap();
+        let closed = s
+            .materialize_query("q", rng(sheet, 0, 0, 0, 0), sql_data("SELECT 1"))
+            .unwrap_err();
+        assert_eq!(closed.code, "invalid_state");
+    }
+
+    /// A table and a sheet sharing a name is a loud bad_argument (no silent shadow).
+    #[test]
+    fn materialize_query_name_collision_is_bad_argument() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        s.create_table(TableSpec {
+            name: "S".into(), // collides with the sheet name "S"
+            sheet: sid,
+            top_row: 0,
+            top_col: 0,
+            rows: 2,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["c".into()],
+        })
+        .unwrap();
+        s.set_value(addr(sid, 1, 0), num(1.0)).unwrap();
+        let err = s
+            .materialize_query("q", rng(sid, 0, 3, 0, 3), sql_data("SELECT 1"))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert!(err.message.contains("ambiguous"), "got: {}", err.message);
+    }
+
+    /// A sheet too large to materialize into Arrow is rejected (input cap), not OOM.
+    #[test]
+    fn materialize_query_oversized_input_is_bad_argument() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // One far cell makes effective_value_bounds span ~4M cells (> the 1<<20 cap).
+        s.set_value(addr(sheet, 2047, 2047), num(1.0)).unwrap();
+        let err = s
+            .materialize_query("q", rng(sheet, 0, 0, 0, 0), sql_data("SELECT 1"))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert!(err.message.contains("input cap"), "got: {}", err.message);
+    }
+
+    /// A result with more columns than the target is a loud "does not fit".
+    #[test]
+    fn materialize_query_too_many_columns_is_bad_argument() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 1), vec![vec![num(1.0), num(2.0)]])
+            .unwrap();
+        // 1 row x 2 cols into a 1x1 target.
+        let err = s
+            .materialize_query("q", rng(sheet, 0, 3, 0, 3), sql_data("SELECT A, B FROM S"))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert!(err.message.contains("does not fit"), "got: {}", err.message);
     }
 
     // --- 6.4-2: register_function / unregister_function / list_functions ---
