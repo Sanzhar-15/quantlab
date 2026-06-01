@@ -22,8 +22,10 @@
 //! and function register/unregister/list) -- which COMPLETES 6.2-1; 6.2-2 (the
 //! operations/events surface: the M2 split-recalc `startRecalc`/`awaitRecalc`,
 //! op-id `cancel`/`operationStatus`, `pollEvents`, and the SVC-6-02 long-lived
-//! `text/event-stream` events endpoint forwarding the engine event ring). Remaining:
-//! auth hooks, protocol versioning, and lifecycle/TTL hardening (SVC-6-04 / 6.2-3);
+//! `text/event-stream` events endpoint forwarding the engine event ring); 6.2-3a
+//! (request-path hardening: a request-body size cap on both the JSON and raw-blob
+//! paths, `schemaVersion` echo + mismatch rejection, and RFC-correct 405 + `Allow`).
+//! Remaining: auth hooks + unguessable session ids + idle-TTL reaping (6.2-3b);
 //! the golden-parity third row (6.2-4).
 //!
 //! Transport: HTTP/1.1 on `hyper` 1.x (`http1::Builder::serve_connection`), one
@@ -45,21 +47,56 @@ pub mod wire;
 
 pub use session_store::SessionStore;
 
-/// Serve HTTP on an already-bound [`TcpListener`] until an `accept()` error.
+/// Service-level configuration (transport hardening knobs). Cheap to `Clone` --
+/// one is cloned into every connection task. 6.2-3a carries the request-body size
+/// caps; 6.2-3b will extend it with the auth hook + idle-TTL.
+#[derive(Clone, Debug)]
+pub struct ServiceConfig {
+    /// Max bytes accepted for a JSON request body (every endpoint except `import`).
+    /// Over-limit -> `413 payload_too_large` (No-Fallbacks: a loud cap, never a
+    /// silent truncation). A bound against unbounded memory, not a policy limit.
+    pub max_json_body_bytes: usize,
+    /// Max bytes accepted for the raw `import` blob body (`.qbook`/xlsx/csv).
+    pub max_blob_body_bytes: usize,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            max_json_body_bytes: 16 * 1024 * 1024,
+            max_blob_body_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+/// Serve HTTP on an already-bound [`TcpListener`] with the default
+/// [`ServiceConfig`]. Back-compat entry point (used by the integration tests).
+pub async fn serve(listener: TcpListener, store: SessionStore) -> std::io::Result<()> {
+    serve_with_config(listener, store, ServiceConfig::default()).await
+}
+
+/// Serve HTTP on an already-bound [`TcpListener`] until an `accept()` error,
+/// applying `cfg` (the request-body caps) to every connection.
 ///
 /// The caller binds the listener (so tests can use `127.0.0.1:0` and read the
 /// assigned port via [`TcpListener::local_addr`] before spawning this). Each
 /// accepted connection is driven on its own tokio task; a per-connection serve
 /// error is logged to stderr and does not stop the accept loop.
-pub async fn serve(listener: TcpListener, store: SessionStore) -> std::io::Result<()> {
+pub async fn serve_with_config(
+    listener: TcpListener,
+    store: SessionStore,
+    cfg: ServiceConfig,
+) -> std::io::Result<()> {
     loop {
         let (stream, _peer) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let store = store.clone();
+        let cfg = cfg.clone();
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let store = store.clone();
-                async move { Ok::<_, std::convert::Infallible>(router::handle(req, store).await) }
+                let cfg = cfg.clone();
+                async move { Ok::<_, std::convert::Infallible>(router::handle(req, store, cfg).await) }
             });
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
                 eprintln!("ql-service: connection error: {err}");
@@ -68,10 +105,14 @@ pub async fn serve(listener: TcpListener, store: SessionStore) -> std::io::Resul
     }
 }
 
-/// Bind `addr` and [`serve`] on it (the binary entry point). Returns the bind
-/// error loudly if the address is unavailable.
-pub async fn bind_and_serve(addr: SocketAddr, store: SessionStore) -> std::io::Result<()> {
+/// Bind `addr` and [`serve_with_config`] on it (the binary entry point). Returns
+/// the bind error loudly if the address is unavailable.
+pub async fn bind_and_serve(
+    addr: SocketAddr,
+    store: SessionStore,
+    cfg: ServiceConfig,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     eprintln!("ql-service: listening on http://{addr}/v1");
-    serve(listener, store).await
+    serve_with_config(listener, store, cfg).await
 }

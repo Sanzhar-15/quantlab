@@ -58,19 +58,25 @@
 //! - `GET    /v1/sessions/:id/poll-events?cursor=<dec>`  -> EventPage wire (one-shot, cursor required)
 //! - `GET    /v1/sessions/:id/events?cursor=<dec>`  -> SVC-6-02 long-lived `text/event-stream`
 //!   (cursor optional, default 0 = from the ring start)
+//!
+//! 6.2-3a adds request-path hardening: a request-body size cap on both the JSON
+//! and raw-`import` paths (over-limit becomes 413 `payload_too_large`), an
+//! `x-ql-schema-version` echo on every response with a mismatched or malformed
+//! client value rejected as 400 `unsupported_schema_version`, and a wrong method
+//! on a known path answered with 405 `method_not_allowed` + `Allow`.
 
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{header, Response, StatusCode};
+use http::{header, HeaderValue, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Empty, Full, StreamBody};
+use http_body_util::{BodyExt, Empty, Full, LengthLimitError, Limited, StreamBody};
 use hyper::body::Frame;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use ql_exec::WorkbookSession;
-use ql_session::{EngineError, EngineSession, ErrorClass, LifecycleState};
+use ql_session::{EngineError, EngineSession, ErrorClass, LifecycleState, SCHEMA_VERSION};
 
 use crate::error::engine_error_to_problem;
 use crate::guarded::guarded;
@@ -89,6 +95,7 @@ use crate::wire::{
     TableSpecWire, TransactionResponse, TxnAddBody, TxnIdBody, UnregisterFunctionBody,
     ValidateFormulaBody, WriteRangeBody,
 };
+use crate::ServiceConfig;
 use ql_session::session::{EventCursor, FunctionImplHandle, SessionOp, TransactionId};
 use ql_session::{OperationId, RangeQueryOptions, RecalcKind};
 
@@ -101,6 +108,11 @@ struct AckResponse {
 }
 
 type Incoming = hyper::body::Incoming;
+
+/// The request body after the 6.2-3a size cap wraps the raw `Incoming` -- it
+/// yields a `LengthLimitError` once the per-route byte limit is exceeded (see
+/// [`handle`]); [`read_json`]/[`read_bytes`] map that to a 413.
+type ReqBody = Limited<Incoming>;
 
 /// The unified response body. 6.2-2 added the SSE `text/event-stream` endpoint,
 /// which needs a STREAMING body; the prior endpoints are all buffered (`Full`).
@@ -115,14 +127,51 @@ type Resp = Response<SvcBody>;
 
 /// Route + handle one request. Always produces a `Response` (errors become
 /// problem+json); never returns `Err` so the hyper service is infallible.
-pub(crate) async fn handle(req: http::Request<Incoming>, store: SessionStore) -> Resp {
+pub(crate) async fn handle(
+    req: http::Request<Incoming>,
+    store: SessionStore,
+    cfg: ServiceConfig,
+) -> Resp {
     let (parts, body) = req.into_parts();
     let method = parts.method;
     let path = parts.uri.path().to_owned();
     let query = parts.uri.query().map(str::to_owned);
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
-    match (method.as_str(), segs.as_slice()) {
+    // 6.2-3a (SVC-6-04): reject a mismatched client-declared schema version up
+    // front; the echo header (added to every response below) advertises ours.
+    if let Some(err) = schema_version_check(&parts.headers) {
+        return with_schema_header(problem(&err));
+    }
+    // 6.2-3a: cap the request body (DoS) -- the blob limit for the raw `import`
+    // path, the JSON limit otherwise; GET routes wrap-and-drop harmlessly.
+    let is_blob = matches!(
+        (method.as_str(), segs.as_slice()),
+        ("POST", ["v1", "sessions", _, "import"])
+    );
+    let limit = if is_blob {
+        cfg.max_blob_body_bytes
+    } else {
+        cfg.max_json_body_bytes
+    };
+    // 6.2-3a (audit MED): the cap must bind EVERY route, not only those that read
+    // the body. A declared Content-Length over the per-route limit is rejected up
+    // front (413, connection closed since the body is left undrained) before any
+    // dispatch; the `Limited` wrap below still bounds the ACTUAL read (chunked or
+    // understated-length bodies) on the routes that consume it.
+    if let Some(len) = parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if len > limit {
+            return with_schema_header(with_close(payload_too_large()));
+        }
+    }
+    let body = Limited::new(body, limit);
+
+    let resp = match (method.as_str(), segs.as_slice()) {
         ("POST", ["v1", "sessions"]) => create_session(&store),
         ("DELETE", ["v1", "sessions", id]) => delete_session(&store, id),
         ("GET", ["v1", "sessions", id, "lifecycle"]) => lifecycle(&store, id),
@@ -143,7 +192,9 @@ pub(crate) async fn handle(req: http::Request<Incoming>, store: SessionStore) ->
         }
         ("POST", ["v1", "sessions", id, "query-range"]) => query_range(&store, id, body).await,
         ("GET", ["v1", "sessions", id, "sheets"]) => list_sheets(&store, id),
-        ("POST", ["v1", "sessions", id, "mark-volatiles-dirty"]) => mark_volatiles_dirty(&store, id),
+        ("POST", ["v1", "sessions", id, "mark-volatiles-dirty"]) => {
+            mark_volatiles_dirty(&store, id)
+        }
         // ---- 6.2-1a cluster B (persistence) ----
         ("POST", ["v1", "sessions", id, "open"]) => open(&store, id, body).await,
         ("POST", ["v1", "sessions", id, "save"]) => save(&store, id, body).await,
@@ -177,7 +228,9 @@ pub(crate) async fn handle(req: http::Request<Incoming>, store: SessionStore) ->
             publish_dataset(&store, id, body).await
         }
         ("POST", ["v1", "sessions", id, "bind-range"]) => bind_range(&store, id, body).await,
-        ("POST", ["v1", "sessions", id, "refresh-source"]) => refresh_source(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "refresh-source"]) => {
+            refresh_source(&store, id, body).await
+        }
         ("POST", ["v1", "sessions", id, "materialize-query"]) => {
             materialize_query(&store, id, body).await
         }
@@ -187,7 +240,9 @@ pub(crate) async fn handle(req: http::Request<Incoming>, store: SessionStore) ->
         ("GET", ["v1", "sessions", id, "can-undo"]) => can_undo(&store, id),
         ("GET", ["v1", "sessions", id, "can-redo"]) => can_redo(&store, id),
         // ---- 6.2-1c snapshot-delta (first version-consuming endpoint) ----
-        ("POST", ["v1", "sessions", id, "snapshot-delta"]) => snapshot_delta(&store, id, body).await,
+        ("POST", ["v1", "sessions", id, "snapshot-delta"]) => {
+            snapshot_delta(&store, id, body).await
+        }
         // ---- 6.2-1c functions ----
         ("POST", ["v1", "sessions", id, "register-function"]) => {
             register_function(&store, id, body).await
@@ -206,12 +261,9 @@ pub(crate) async fn handle(req: http::Request<Incoming>, store: SessionStore) ->
         ("GET", ["v1", "sessions", id, "events"]) => events(store.clone(), id, &query),
         #[cfg(debug_assertions)]
         ("POST", ["v1", "sessions", id, "__force_panic"]) => force_panic(&store, id),
-        _ => problem(&EngineError::new(
-            ErrorClass::NotFound,
-            "route_not_found",
-            format!("no route for {} {}", method.as_str(), path),
-        )),
-    }
+        _ => fallback(&method, &segs, &path),
+    };
+    with_schema_header(resp)
 }
 
 // ---- handlers ----
@@ -257,7 +309,7 @@ fn lifecycle(store: &SessionStore, id: &str) -> Resp {
     })
 }
 
-async fn add_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn add_sheet(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: AddSheetBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -275,7 +327,7 @@ async fn add_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn set_value(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn set_value(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: SetValueBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -287,7 +339,7 @@ async fn set_value(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn set_formula(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn set_formula(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: SetFormulaBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -325,7 +377,7 @@ fn snapshot(store: &SessionStore, id: &str) -> Resp {
     })
 }
 
-async fn cell(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn cell(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: CellBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -339,7 +391,7 @@ async fn cell(store: &SessionStore, id: &str, body: Incoming) -> Resp {
 
 // ---- 6.2-1a cluster A handlers (read/format/validate/query) ----
 
-async fn clear(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn clear(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: CellBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -350,7 +402,7 @@ async fn clear(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn set_format(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn set_format(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: SetFormatBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -362,28 +414,33 @@ async fn set_format(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn register_format(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn register_format(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: RegisterFormatBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
     };
     with_session(store, id, "registerFormat", move |s| {
-        Ok(wire::format_id_to_wire(s.register_format(&b.format_string)?))
+        Ok(wire::format_id_to_wire(
+            s.register_format(&b.format_string)?,
+        ))
     })
 }
 
-async fn validate_formula(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn validate_formula(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: ValidateFormulaBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
     };
     with_session(store, id, "validateFormula", move |s| {
         let diags = s.validate_formula(wire::addr(b.sheet, b.row, b.col), &b.text)?;
-        Ok(diags.into_iter().map(diagnostic_to_wire).collect::<Vec<_>>())
+        Ok(diags
+            .into_iter()
+            .map(diagnostic_to_wire)
+            .collect::<Vec<_>>())
     })
 }
 
-async fn query_range(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn query_range(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: QueryRangeBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -417,7 +474,7 @@ fn mark_volatiles_dirty(store: &SessionStore, id: &str) -> Resp {
 
 // ---- 6.2-1a cluster B handlers (persistence) ----
 
-async fn open(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn open(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: PathBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -428,7 +485,7 @@ async fn open(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn save(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn save(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: PathBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -442,7 +499,7 @@ async fn save(store: &SessionStore, id: &str, body: Incoming) -> Resp {
 /// `import` takes the raw workbook bytes as the request body (`application/octet-stream`
 /// -- the faithful transport for the contract's `Uint8Array`; no JSON shape exists for
 /// the blob) and the `format` as a required query parameter.
-async fn import(store: &SessionStore, id: &str, query: &Option<String>, body: Incoming) -> Resp {
+async fn import(store: &SessionStore, id: &str, query: &Option<String>, body: ReqBody) -> Resp {
     let Some(format) = query_value(query, "format") else {
         return problem(&EngineError::bad_argument(
             "import: query parameter 'format' is required",
@@ -481,7 +538,7 @@ fn export(store: &SessionStore, id: &str, query: &Option<String>) -> Resp {
 
 // ---- 6.2-1b cluster C handlers (structure/sheets) ----
 
-async fn rename_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn rename_sheet(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: RenameSheetBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -492,7 +549,7 @@ async fn rename_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn delete_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn delete_sheet(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: SheetIdBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -503,7 +560,7 @@ async fn delete_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn restore_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn restore_sheet(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: SheetIdBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -514,7 +571,7 @@ async fn restore_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn move_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn move_sheet(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: MoveSheetBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -525,7 +582,7 @@ async fn move_sheet(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn set_name(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn set_name(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: SetNameBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -538,7 +595,7 @@ async fn set_name(store: &SessionStore, id: &str, body: Incoming) -> Resp {
 
 // ---- 6.2-1b cluster D handlers (tables) ----
 
-async fn create_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn create_table(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: TableSpecWire = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -549,7 +606,7 @@ async fn create_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn rename_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn rename_table(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: RenameTableBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -560,7 +617,7 @@ async fn rename_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn rename_column(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn rename_column(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: RenameColumnBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -571,7 +628,7 @@ async fn rename_column(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn resize_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn resize_table(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: ResizeTableBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -588,7 +645,7 @@ async fn resize_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn drop_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn drop_table(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: NameBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -601,7 +658,7 @@ async fn drop_table(store: &SessionStore, id: &str, body: Incoming) -> Resp {
 
 // ---- 6.2-1c cluster E handlers (atomic groups / transactions) ----
 
-async fn batch(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn batch(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: BatchBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -627,7 +684,7 @@ fn begin_transaction(store: &SessionStore, id: &str) -> Resp {
     })
 }
 
-async fn txn_add(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn txn_add(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: TxnAddBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -639,17 +696,19 @@ async fn txn_add(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn commit_transaction(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn commit_transaction(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: TxnIdBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
     };
     with_session(store, id, "commitTransaction", move |s| {
-        Ok(batch_result_to_wire(s.commit_transaction(TransactionId(b.txn))?))
+        Ok(batch_result_to_wire(
+            s.commit_transaction(TransactionId(b.txn))?,
+        ))
     })
 }
 
-async fn rollback_transaction(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn rollback_transaction(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: TxnIdBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -669,7 +728,7 @@ async fn rollback_transaction(store: &SessionStore, id: &str, body: Incoming) ->
 // unreachable in v1 and discarded with `.map(|_| ())`. A real impl (6.4/6.5) only
 // swaps the return type.
 
-async fn write_range(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn write_range(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: WriteRangeBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -686,7 +745,7 @@ async fn write_range(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn publish_dataset(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn publish_dataset(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: PublishDatasetBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -699,7 +758,7 @@ async fn publish_dataset(store: &SessionStore, id: &str, body: Incoming) -> Resp
     })
 }
 
-async fn bind_range(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn bind_range(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: BindRangeBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -711,7 +770,7 @@ async fn bind_range(store: &SessionStore, id: &str, body: Incoming) -> Resp {
     })
 }
 
-async fn refresh_source(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn refresh_source(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: RefreshSourceBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -722,7 +781,7 @@ async fn refresh_source(store: &SessionStore, id: &str, body: Incoming) -> Resp 
     })
 }
 
-async fn materialize_query(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn materialize_query(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: MaterializeQueryBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -738,11 +797,15 @@ async fn materialize_query(store: &SessionStore, id: &str, body: Incoming) -> Re
 // ---- 6.2-1c undo/redo handlers ----
 
 fn undo(store: &SessionStore, id: &str) -> Resp {
-    with_session(store, id, "undo", |s| Ok(undo_redo_result_to_wire(s.undo()?)))
+    with_session(store, id, "undo", |s| {
+        Ok(undo_redo_result_to_wire(s.undo()?))
+    })
 }
 
 fn redo(store: &SessionStore, id: &str) -> Resp {
-    with_session(store, id, "redo", |s| Ok(undo_redo_result_to_wire(s.redo()?)))
+    with_session(store, id, "redo", |s| {
+        Ok(undo_redo_result_to_wire(s.redo()?))
+    })
 }
 
 /// `canUndo`/`canRedo` are pure bool reads (the engine method does not return a
@@ -768,7 +831,7 @@ fn can_redo(store: &SessionStore, id: &str) -> Resp {
 /// loud `invalid_version_token` -> 400, BEFORE the engine call). An empty/stale/
 /// epoch-mismatched (but well-formed) token is NOT an error -- the engine returns a
 /// `fullRebuildRequired` delta with the designed reason.
-async fn snapshot_delta(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn snapshot_delta(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: SnapshotDeltaBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -785,7 +848,7 @@ async fn snapshot_delta(store: &SessionStore, id: &str, body: Incoming) -> Resp 
 
 // ---- 6.2-1c functions handlers ----
 
-async fn register_function(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn register_function(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: RegisterFunctionBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -797,7 +860,7 @@ async fn register_function(store: &SessionStore, id: &str, body: Incoming) -> Re
     })
 }
 
-async fn unregister_function(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn unregister_function(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: UnregisterFunctionBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -844,7 +907,7 @@ fn start_recalc(store: &SessionStore, id: &str, query: &Option<String>) -> Resp 
 /// per-session lock on this connection's tokio task. Acceptable for v1 single-client
 /// localhost (spawn_blocking is filed to 6.2-3 for multi-client; matches the napi
 /// synchronous binding).
-async fn await_recalc(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn await_recalc(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: OpBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -858,7 +921,7 @@ async fn await_recalc(store: &SessionStore, id: &str, body: Incoming) -> Resp {
 /// `cancel` an operation (cooperative; honored pre-start for in-engine recalc).
 /// Returns a bare bool: `true` if a cancel was registered, `false` if already
 /// terminal. An unknown op id -> 404 `operation_not_found`.
-async fn cancel(store: &SessionStore, id: &str, body: Incoming) -> Resp {
+async fn cancel(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: OpBody = match read_json(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -876,7 +939,9 @@ fn operation_status(store: &SessionStore, id: &str, query: &Option<String>) -> R
         Err(e) => return problem(&e),
     };
     with_session(store, id, "operationStatus", move |s| {
-        Ok(operation_state_to_wire(s.operation_status(OperationId(op))?))
+        Ok(operation_state_to_wire(
+            s.operation_status(OperationId(op))?,
+        ))
     })
 }
 
@@ -1060,6 +1125,218 @@ fn lifecycle_state_str(s: LifecycleState) -> &'static str {
     }
 }
 
+// ---- 6.2-3a transport hardening helpers (schemaVersion / 405 / body cap) ----
+
+/// The header carrying the wire schema version in BOTH directions: the service
+/// echoes [`SCHEMA_VERSION`] on every response, and rejects a request that
+/// declares a different one (SVC-6-04 protocol versioning).
+const SCHEMA_VERSION_HEADER: &str = "x-ql-schema-version";
+
+/// Stamp the server's [`SCHEMA_VERSION`] onto a response (called on every path).
+fn with_schema_header(mut resp: Resp) -> Resp {
+    resp.headers_mut()
+        .insert(SCHEMA_VERSION_HEADER, HeaderValue::from(SCHEMA_VERSION));
+    resp
+}
+
+/// If the request declares `x-ql-schema-version`, require it to equal the server's
+/// [`SCHEMA_VERSION`]; a missing header is allowed (the echo lets clients learn
+/// it). A malformed or mismatched value is a loud `unsupported_schema_version`
+/// (Protocol -> 400, No-Fallbacks).
+fn schema_version_check(headers: &http::HeaderMap) -> Option<EngineError> {
+    let raw = headers.get(SCHEMA_VERSION_HEADER)?;
+    let text = match raw.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            return Some(EngineError::unsupported_schema_version(
+                "header 'x-ql-schema-version' is not valid text",
+            ))
+        }
+    };
+    match text.parse::<u16>() {
+        Ok(v) if v == SCHEMA_VERSION => None,
+        Ok(v) => Some(EngineError::unsupported_schema_version(format!(
+            "client schema version {v} != server {SCHEMA_VERSION}"
+        ))),
+        Err(_) => Some(EngineError::unsupported_schema_version(format!(
+            "header 'x-ql-schema-version' must be a u16 (got {text:?})"
+        ))),
+    }
+}
+
+/// GET-only route verbs (the 4-segment `/v1/sessions/:id/<verb>` paths). With
+/// [`POST_VERBS`] this is the registry that drives the 405 fallback; it MUST stay
+/// in sync with the route table in [`handle`].
+const GET_VERBS: &[&str] = &[
+    "lifecycle",
+    "snapshot",
+    "sheets",
+    "export",
+    "can-undo",
+    "can-redo",
+    "functions",
+    "operation-status",
+    "poll-events",
+    "events",
+];
+
+/// POST-only route verbs (the 4-segment paths). See [`GET_VERBS`]. The debug-only
+/// `__force_panic` probe is intentionally absent: it must not be advertised, so a
+/// wrong method on it yields 404 (not 405) -- acceptable for a non-contract hook.
+const POST_VERBS: &[&str] = &[
+    "add-sheet",
+    "set-value",
+    "set-formula",
+    "recalc",
+    "cell",
+    "clear",
+    "set-format",
+    "register-format",
+    "validate-formula",
+    "query-range",
+    "mark-volatiles-dirty",
+    "open",
+    "save",
+    "import",
+    "rename-sheet",
+    "delete-sheet",
+    "restore-sheet",
+    "move-sheet",
+    "set-name",
+    "create-table",
+    "rename-table",
+    "rename-column",
+    "resize-table",
+    "drop-table",
+    "batch",
+    "begin-transaction",
+    "txn-add",
+    "commit-transaction",
+    "rollback-transaction",
+    "write-range",
+    "publish-dataset",
+    "bind-range",
+    "refresh-source",
+    "materialize-query",
+    "undo",
+    "redo",
+    "snapshot-delta",
+    "register-function",
+    "unregister-function",
+    "start-recalc",
+    "await-recalc",
+    "cancel",
+];
+
+/// The HTTP methods valid for a known path shape (drives RFC-correct 405). An
+/// empty result means the path itself is unknown (caller responds 404).
+fn allowed_methods(segs: &[&str]) -> Vec<&'static str> {
+    match segs {
+        ["v1", "sessions"] => vec!["POST"],
+        ["v1", "sessions", _] => vec!["DELETE"],
+        ["v1", "sessions", _, verb] => {
+            if GET_VERBS.contains(verb) {
+                vec!["GET"]
+            } else if POST_VERBS.contains(verb) {
+                vec!["POST"]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve an unmatched `(method, segs)` to a 405 (known path, wrong method, with
+/// an `Allow` header) or a 404 `route_not_found` (unknown path).
+fn fallback(method: &http::Method, segs: &[&str], path: &str) -> Resp {
+    let allowed = allowed_methods(segs);
+    if !allowed.is_empty() && !allowed.iter().any(|m| *m == method.as_str()) {
+        method_not_allowed(&allowed)
+    } else {
+        problem(&EngineError::new(
+            ErrorClass::NotFound,
+            "route_not_found",
+            format!("no route for {} {}", method.as_str(), path),
+        ))
+    }
+}
+
+/// Build a transport-level `problem+json` with an explicit status that does NOT
+/// derive from an engine [`ErrorClass`]. 405 method-not-allowed and 413 payload-
+/// too-large are HTTP-layer concerns the frozen engine taxonomy does not model;
+/// the body keeps the same shape with `class = "protocol"`.
+fn transport_problem(status: StatusCode, code: &str, message: String, allow: Option<&str>) -> Resp {
+    let body = crate::error::ProblemJson {
+        code: code.to_string(),
+        class: "protocol".to_string(),
+        message,
+        retryable: false,
+        details: None,
+        source: None,
+    };
+    let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| {
+        br#"{"code":"panic","class":"internal","message":"problem serialize failed","retryable":false}"#
+            .to_vec()
+    });
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/problem+json");
+    if let Some(a) = allow {
+        builder = builder.header(header::ALLOW, a);
+    }
+    builder
+        .body(Full::new(Bytes::from(bytes)).boxed_unsync())
+        .expect("response builder with valid status/header never fails")
+}
+
+/// 405 Method Not Allowed with the RFC-required `Allow` header.
+fn method_not_allowed(allowed: &[&str]) -> Resp {
+    let allow = allowed.join(", ");
+    transport_problem(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        format!("method not allowed; allowed: {allow}"),
+        Some(&allow),
+    )
+}
+
+/// 413 Payload Too Large -- the request body exceeded the configured cap.
+fn payload_too_large() -> Resp {
+    transport_problem(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "payload_too_large",
+        "request body exceeds the configured size limit".to_string(),
+        None,
+    )
+}
+
+/// Map a request-body read error to a response: a [`LengthLimitError`] from the
+/// body cap becomes a 413; anything else is a loud 400 `bad_argument`. Either way
+/// the response carries `Connection: close` -- a body read that aborted early
+/// (over the cap, or a framing error) leaves the connection's byte stream in an
+/// uncertain state, so a keep-alive client must NOT reuse it (6.2-3a audit LOW:
+/// undrained-body desync). v1 clients already send `Connection: close`; this makes
+/// the close authoritative for the keep-alive path too.
+fn map_body_err(e: Box<dyn std::error::Error + Send + Sync>) -> Resp {
+    let resp = if e.downcast_ref::<LengthLimitError>().is_some() {
+        payload_too_large()
+    } else {
+        problem(&EngineError::bad_argument(format!(
+            "failed to read request body: {e}"
+        )))
+    };
+    with_close(resp)
+}
+
+/// Force `Connection: close` on a response (used when the request body was not
+/// fully drained, so the connection cannot be safely reused).
+fn with_close(mut resp: Resp) -> Resp {
+    resp.headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    resp
+}
+
 fn session_not_found(id: &str) -> EngineError {
     EngineError::new(
         ErrorClass::NotFound,
@@ -1070,12 +1347,8 @@ fn session_not_found(id: &str) -> EngineError {
 
 /// Read + JSON-parse a request body, mapping any failure to a loud `[bad_argument]`
 /// problem+json (No-Fallbacks).
-async fn read_json<T: DeserializeOwned>(body: Incoming) -> Result<T, Resp> {
-    let collected = body.collect().await.map_err(|e| {
-        problem(&EngineError::bad_argument(format!(
-            "failed to read request body: {e}"
-        )))
-    })?;
+async fn read_json<T: DeserializeOwned>(body: ReqBody) -> Result<T, Resp> {
+    let collected = body.collect().await.map_err(map_body_err)?;
     let bytes = collected.to_bytes();
     serde_json::from_slice::<T>(&bytes).map_err(|e| {
         problem(&EngineError::bad_argument(format!(
@@ -1085,12 +1358,8 @@ async fn read_json<T: DeserializeOwned>(body: Incoming) -> Result<T, Resp> {
 }
 
 /// Read a request body as RAW bytes (no JSON parse) -- the `import` blob path.
-async fn read_bytes(body: Incoming) -> Result<Vec<u8>, Resp> {
-    let collected = body.collect().await.map_err(|e| {
-        problem(&EngineError::bad_argument(format!(
-            "failed to read request body: {e}"
-        )))
-    })?;
+async fn read_bytes(body: ReqBody) -> Result<Vec<u8>, Resp> {
+    let collected = body.collect().await.map_err(map_body_err)?;
     Ok(collected.to_bytes().to_vec())
 }
 
@@ -1111,9 +1380,8 @@ fn query_value(query: &Option<String>, key: &str) -> Option<String> {
 /// convention for the GET op/event endpoints). Missing or non-`u64` is a loud
 /// `[bad_argument]` (No-Fallbacks).
 fn query_u64(query: &Option<String>, key: &str) -> Result<u64, EngineError> {
-    let raw = query_value(query, key).ok_or_else(|| {
-        EngineError::bad_argument(format!("query parameter '{key}' is required"))
-    })?;
+    let raw = query_value(query, key)
+        .ok_or_else(|| EngineError::bad_argument(format!("query parameter '{key}' is required")))?;
     raw.parse::<u64>().map_err(|_| {
         EngineError::bad_argument(format!(
             "query parameter '{key}' must be a non-negative integer (got {raw:?})"

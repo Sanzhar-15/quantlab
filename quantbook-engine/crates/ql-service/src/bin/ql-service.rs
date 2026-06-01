@@ -8,7 +8,7 @@
 use std::io;
 use std::net::SocketAddr;
 
-use ql_service::{bind_and_serve, SessionStore};
+use ql_service::{bind_and_serve, ServiceConfig, SessionStore};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -25,12 +25,42 @@ async fn main() -> io::Result<()> {
     };
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let store = SessionStore::new();
+    let cfg = service_config_from_env()?;
 
     tokio::select! {
-        r = bind_and_serve(addr, store) => r,
+        r = bind_and_serve(addr, store, cfg) => r,
         _ = tokio::signal::ctrl_c() => {
             eprintln!("ql-service: received Ctrl-C, shutting down");
             Ok(())
         }
+    }
+}
+
+/// Build the [`ServiceConfig`] from optional env overrides. Unset -> the documented
+/// default; SET-but-unparseable -> a loud error (No-Fallbacks), mirroring the port.
+fn service_config_from_env() -> io::Result<ServiceConfig> {
+    let d = ServiceConfig::default();
+    Ok(ServiceConfig {
+        max_json_body_bytes: env_usize("QL_SERVICE_MAX_JSON_BYTES", d.max_json_body_bytes)?,
+        max_blob_body_bytes: env_usize("QL_SERVICE_MAX_BLOB_BYTES", d.max_blob_body_bytes)?,
+    })
+}
+
+/// Read an optional `usize` env override (set-but-invalid -> loud error).
+fn env_usize(key: &str, default: usize) -> io::Result<usize> {
+    match std::env::var(key) {
+        Ok(s) => s.parse().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{key} is set but invalid ({s:?}): {e}"),
+            )
+        }),
+        // Only a genuinely-unset var uses the default (No-Fallbacks): a SET-but-
+        // non-Unicode value is a loud error, never a silent fallback to default.
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e @ std::env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{key} is set but not valid Unicode: {e}"),
+        )),
     }
 }
