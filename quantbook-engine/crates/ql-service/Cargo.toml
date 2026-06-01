@@ -44,6 +44,8 @@ parking_lot = "=0.12.5"
 futures-util = { workspace = true }
 # 6.2-3b: getrandom::fill for unguessable session ids (16 CSPRNG bytes -> hex).
 getrandom = { workspace = true }
+# 6.2-4: ECMAScript-compliant f64->string so cell numbers cross byte-identically to napi.
+ryu-js = { workspace = true }
 
 [dev-dependencies]
 # The golden-flow integration test drives the running service over real HTTP

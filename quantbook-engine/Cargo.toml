@@ -152,8 +152,17 @@ siphasher = "=1.0.1"
 # Serialization (graph-profile.json export — OG-06; `.qbook/workbook.toml` envelope per
 # the Phase 1 workbook format).
 serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = "=1.0.149"
+# `raw_value` (6.2-4): ql-service emits cell numbers as ECMAScript `Number` tokens
+# (unquoted `6`/`0`/`1e+21`) via `serde_json::value::RawValue`, matching the frozen
+# napi wire. Additive feature; no new crate edge in the lock.
+serde_json = { version = "=1.0.149", features = ["raw_value"] }
 toml = "=0.9.7"
+
+# `ryu-js` (6.2-4): ECMAScript-compliant f64->string (Boa's JS-semantics Ryu). Used by
+# ql-service to render cell numbers byte-identically to V8 / the frozen napi wire --
+# including the shortest-decimal tie-break that Rust's own formatter resolves differently
+# (~0.025% of f64; caught by the 6.2-4 megaudit). No required runtime deps of its own.
+ryu-js = "=1.0.2"
 
 # Statistical distributions (Wave 3 distributions batch: NORM.* / T.* /
 # CHISQ.* / F.* / BINOM.* / POISSON.* / GAMMA.* / BETA.*). IronCalc uses

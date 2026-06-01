@@ -32,6 +32,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 NODE_EMITTER = HERE.parents[1] / "ql-bindings-node" / "tests" / "golden_flow.mjs"
 PY_EMITTER = HERE / "golden_flow.py"
+# 6.2-4: the third row -- the ql-service HTTP transport (launches the debug binary).
+SERVICE_EMITTER = HERE / "golden_flow_service.py"
 
 # Dict keys whose VALUES are engine-internal opaque tokens (mask their value).
 # `version` = the opaque SessionVersion bytes; `nextCursor` = the event-ring
@@ -88,6 +90,45 @@ def mask(node):
     return node
 
 
+# The `err_post_close` code legitimately differs by TRANSPORT: the in-process rows
+# (napi/pyo3) call close() then hit a still-present CLOSED session -> `invalid_state`;
+# the service DELETE both closes AND removes the session, so the follow-up command gets
+# `session_not_found`. (Verified empirically 2026-06-01.) There is no close-without-remove
+# route, so this is a real transport difference, not a defect.
+CLOSED_SESSION_CODES = {
+    "node": {"invalid_state"},
+    "python": {"invalid_state"},
+    "service": {"session_not_found"},
+}
+
+
+def normalize_closed_session(transcript, label):
+    """ASSERT the err_post_close code is the expected closed-session code for this
+    transport, THEN normalize it to a placeholder so the cross-row compare ignores the
+    (legitimate) per-transport value. This keeps the "fails loud with the RIGHT code"
+    proof the step is named for -- a regression to a wrong/absent code fails here -- while
+    still allowing the transports to differ. Only this ONE code value is touched."""
+    expected = CLOSED_SESSION_CODES[label]
+    for row in transcript:
+        if isinstance(row, dict) and row.get("step") == "err_post_close":
+            err = row.get("error")
+            if not (isinstance(err, dict) and isinstance(err.get("code"), str)):
+                raise SystemExit(f"{label}: err_post_close has no error code -- must fail loud")
+            if err["code"] not in expected:
+                raise SystemExit(
+                    f"{label}: err_post_close code {err['code']!r} not in expected {sorted(expected)} "
+                    f"-- a command after close must fail with the closed-session code"
+                )
+            err["code"] = "<closed-session>"
+    return transcript
+
+
+def canonical(transcript):
+    """Compact, key-sorted JSON. Unlike `==`, this PRESERVES int-vs-float (`6` != `6.0`),
+    so it is the byte-identical gate for the service-vs-node number rendering."""
+    return json.dumps(transcript, sort_keys=True, separators=(",", ":"))
+
+
 def run_emitter(argv, label):
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=300)
@@ -131,24 +172,58 @@ def diff(a, b):
 
 
 def main():
+    # The pyo3 cdylib is abi3-py310; running the matrix under an older interpreter would
+    # mis-load (or subtly mis-behave) the Python row. Fail loud rather than silently use a
+    # wrong interpreter (the host default `python3` is 3.9; run with python3.12+).
+    if sys.version_info < (3, 10):
+        raise SystemExit(
+            f"parity_matrix requires Python >= 3.10 (pyo3 abi3-py310); got {sys.version.split()[0]}"
+        )
+
     node_bin = os.environ.get("QL_NODE", "node")
     py_bin = os.environ.get("QL_PY", sys.executable)
 
-    node_t = mask(run_emitter([node_bin, str(NODE_EMITTER)], "node"))
-    py_t = mask(run_emitter([py_bin, str(PY_EMITTER)], "python"))
+    def prep(argv, label):
+        # mask opaque tokens, then assert+normalize the transport-specific closed-session code.
+        return normalize_closed_session(mask(run_emitter(argv, label)), label)
 
-    if node_t == py_t:
-        print(f"PARITY OK ({len(node_t)} steps matched across Node + Python rows)")
-        return 0
+    node_t = prep([node_bin, str(NODE_EMITTER)], "node")
+    py_t = prep([py_bin, str(PY_EMITTER)], "python")
+    service_t = prep([py_bin, str(SERVICE_EMITTER)], "service")
 
-    d = diff(node_t, py_t)
-    sys.stderr.write("PARITY MISMATCH\n")
-    if d is not None:
-        i, x, y = d
-        sys.stderr.write(f"first divergence at step index {i}:\n")
-        sys.stderr.write(f"  node:   {json.dumps(x, sort_keys=True)}\n")
-        sys.stderr.write(f"  python: {json.dumps(y, sort_keys=True)}\n")
-    return 1
+    # 1. STRUCTURAL parity across all three rows (Node + pyo3 + service). `==` is
+    #    int/float-tolerant (`6 == 6.0`); this is the cross-binding contract gate.
+    for label, t in (("python", py_t), ("service", service_t)):
+        if node_t != t:
+            d = diff(node_t, t)
+            sys.stderr.write(f"PARITY MISMATCH (node vs {label})\n")
+            if d is not None:
+                i, x, y = d
+                sys.stderr.write(f"first divergence at step index {i}:\n")
+                sys.stderr.write(f"  node:    {json.dumps(x, sort_keys=True)}\n")
+                sys.stderr.write(f"  {label}: {json.dumps(y, sort_keys=True)}\n")
+            return 1
+
+    # 2. BYTE gate (service vs node ONLY): the service wire must be byte-identical to
+    #    the napi/Node row INCLUDING number rendering (ECMAScript `6`, not serde `6.0`).
+    #    The Python (pyo3) row is EXCLUDED BY DESIGN -- its FROZEN contract emits Python
+    #    floats (`6.0`), so it participates only in the structural gate above. This is
+    #    what gates the 6.2-4 `ecma_number_string` serializer end-to-end.
+    if canonical(node_t) != canonical(service_t):
+        sys.stderr.write("BYTE PARITY MISMATCH (service vs node) -- number/format divergence\n")
+        d = diff(node_t, service_t)
+        if d is not None:
+            i, x, y = d
+            sys.stderr.write(f"first byte divergence at step index {i}:\n")
+            sys.stderr.write(f"  node:    {canonical(x)}\n")
+            sys.stderr.write(f"  service: {canonical(y)}\n")
+        return 1
+
+    print(
+        f"PARITY OK ({len(node_t)} steps matched across Node + Python + Service rows; "
+        f"service==node byte-identical)"
+    )
+    return 0
 
 
 if __name__ == "__main__":

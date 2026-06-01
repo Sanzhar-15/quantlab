@@ -105,43 +105,109 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, EngineError> {
     Ok(out)
 }
 
+// ---- ECMAScript number rendering (the frozen wire's f64 form) ----
+
+/// Render a finite `f64` exactly as ECMAScript `Number::toString` (radix 10) -- the
+/// algorithm `JSON.stringify` applies to a JS `Number`, and therefore the frozen napi
+/// wire form. This resolves the 6.2-0/6.2-1a filed-forward number-encoding divergence
+/// (6.2-4): serde/ryu renders `6.0` / `-0.0` / `1e21`, whereas the freeze requires
+/// `6` / `0` / `1e+21`.
+///
+/// Backed by the `ryu-js` crate (Boa's JS-semantics Ryu), which reproduces V8's
+/// shortest-decimal algorithm EXACTLY -- INCLUDING the last-digit tie-break. A
+/// hand-rolled approach over Rust's own `{:e}`/`Display` is NOT byte-identical to
+/// napi: Rust's shortest formatter and V8 resolve shortest-decimal ties differently
+/// for ~0.025% of `f64` (e.g. `1658206780088562.2` in V8 vs `...562.3` in Rust;
+/// both round-trip), which would defeat the byte-identical golden-parity goal. This
+/// was caught by the 6.2-4 closure megaudit (HIGH-1) via a Node differential fuzz.
+///
+/// Caller MUST pass a finite value (the only `CellValue::Number` the engine produces);
+/// non-finite is rejected upstream by [`ecma_opt_number`] as a serde error (No-Fallbacks
+/// -> `serde_json::to_*` returns `Err` -> the router maps it to a 500), so this fn never
+/// sees `NaN`/`Inf` on the wire path.
+pub fn ecma_number_string(value: f64) -> String {
+    debug_assert!(
+        value.is_finite(),
+        "ecma_number_string requires a finite f64 (non-finite is rejected in ecma_opt_number)"
+    );
+    let mut buffer = ryu_js::Buffer::new();
+    buffer.format(value).to_owned()
+}
+
+/// Serde adapter for an `Option<f64>` wire field that must cross as an ECMAScript
+/// `Number` token (unquoted) rather than serde/ryu's `f64` form. Serialize rejects
+/// non-finite as a serde error (No-Fallbacks: surfaced as a 500, never a panic or a
+/// malformed token), then routes the value through [`ecma_number_string`] and emits it
+/// as a raw JSON number via [`serde_json::value::RawValue`] (the ES token is always a
+/// valid JSON number literal: `6`, `0`, `0.5`, `1e+21`, `1e-7`). Deserialize reads a
+/// JSON number back into `f64` unchanged. This layer is serde_json-specific by design
+/// (the wire is JSON); `RawValue` requires the `serde_json` `raw_value` feature.
+pub mod ecma_opt_number {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::value::RawValue;
+
+    use super::ecma_number_string;
+
+    pub fn serialize<S: Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(n) => {
+                if !n.is_finite() {
+                    // No-Fallbacks: a non-finite cell value must not silently ship a
+                    // bogus token. `serde_json::to_*` propagates this `Err`; the router's
+                    // `json()` maps a serialization error to a 500 problem+json.
+                    return Err(serde::ser::Error::custom(format!(
+                        "non-finite f64 ({n}) cannot cross the JSON wire"
+                    )));
+                }
+                let raw =
+                    RawValue::from_string(ecma_number_string(*n)).map_err(serde::ser::Error::custom)?;
+                raw.serialize(s)
+            }
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+        Option::<f64>::deserialize(d)
+    }
+}
+
 // ---- value DTOs (mirror the napi FooJson structs) ----
 
 /// Mirror of napi `CellValueJson`: a `kind`-tagged union. Exactly one payload
 /// field is present for `number`/`boolean`/`text`/`error`; `blank`/`pending`
 /// carry only `kind`.
 ///
-/// **KNOWN number-encoding divergence (filed forward to 6.2-4; 6.2-1a audit
-/// Codex HIGH, disposition: deferred).** `number` is an `f64` serialized by serde
-/// (ryu), whereas napi crosses it as a JS `Number` that `JSON.stringify` renders
-/// via the ECMAScript `Number::toString` algorithm. The serde and ECMAScript
-/// renderings differ on AT LEAST these cases, so number values are NOT
-/// byte-identical to the napi row today:
+/// **Number-encoding divergence RESOLVED in 6.2-4 (was 6.2-0/6.2-1a filed-forward;
+/// 6.2-1a Codex HIGH).** `number` now crosses via the [`ecma_opt_number`] serde
+/// adapter, which renders the `f64` with [`ecma_number_string`] (ECMAScript
+/// `Number::toString`) and emits it as an UNQUOTED JSON number token. This makes
+/// the service wire byte-identical to the napi row, which crosses a JS `Number`
+/// via `JSON.stringify`. The cases that previously diverged are now matched:
 ///
-/// - integer-valued floats: serde `6.0` vs napi `6` (the headline case);
-/// - signed zero: serde `-0.0` vs napi `0`;
-/// - exponent thresholds + format: ECMAScript switches to exponent form at
-///   `>=1e21` and `<1e-6` and writes `e+21`/`e-7`, where ryu's thresholds/format
-///   differ.
+/// - integer-valued floats: `6` (was serde `6.0`) -- the headline case;
+/// - signed zero: `0` (was serde `-0.0`);
+/// - exponent thresholds + format: `1e+21` / `1e-7` at the ECMAScript `>=1e21` /
+///   `<1e-6` boundaries (was ryu's differing thresholds/format).
 ///
-/// Non-finite (`NaN`/`Inf`) is not a wire concern on OUTPUT (the engine does not
-/// emit them as `CellValue::Number`; `cell_value_from_wire` rejects them on
-/// INPUT), but the 6.2-4 serializer MUST pin a fail-loud policy if a future
-/// engine/UDF path ever leaks one.
+/// Non-finite (`NaN`/`Inf`) is fail-loud: [`ecma_opt_number`] returns a serde error
+/// (the engine never emits them as `CellValue::Number` and `cell_value_from_wire`
+/// rejects them on INPUT; the error surfaces as a 500, never a silent/malformed token).
 ///
-/// This is the 6.2-0 filed-forward item ("the whole-f64 cell-value representation
-/// question for byte-identical parity (6.0 vs 6)") and already ships in the 6.2-0
-/// `snapshot` endpoint; `queryRange` (6.2-1a) reuses the same
-/// [`cell_value_to_wire`]. 6.2-4 resolves it against the parity matrix's ACTUAL
-/// comparison mode: structural comparison treats `6.0`==`6` (no fix needed); only
-/// a byte-identical mode requires a uniform ECMAScript `Number`->string serializer
-/// (covering ALL the cases above) applied across ALL number-emitting endpoints
-/// (here + snapshot), which is why it is NOT patched piecemeal in cluster A.
+/// Applies to EVERY number-emitting endpoint uniformly via [`cell_value_to_wire`]:
+/// `snapshot` (6.2-0), `queryRange` (6.2-1a), `cell`, and `snapshot-delta`
+/// changedCells. Gated by the `ecma_number_string` unit table + the
+/// `number_encoding_http.rs` raw-bytes test + the parity matrix's service-vs-node
+/// byte check (6.2-4).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CellValueWire {
     pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        with = "ecma_opt_number",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub number: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub boolean: Option<bool>,
@@ -1654,6 +1720,112 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ecma_number_string_matches_v8_tostring() {
+        // Expected values are the exact `String(x)` / `JSON.stringify(x)` outputs in
+        // V8/Node -- the frozen napi wire form. Covers every case of the ES algorithm:
+        // integer, fraction, leading-zero fraction, both exponent boundaries (>=1e21,
+        // <1e-6), signed zero, negatives, and IEEE-754 extremes.
+        let cases: &[(f64, &str)] = &[
+            (0.0, "0"),
+            (-0.0, "0"),
+            (6.0, "6"),
+            (14.0, "14"),
+            (10.0, "10"),
+            (100.0, "100"),
+            (123.0, "123"),
+            (-3.0, "-3"),
+            (123456789.0, "123456789"),
+            (0.5, "0.5"),
+            (-0.5, "-0.5"),
+            (0.1, "0.1"),
+            (12.5, "12.5"),
+            (2.5, "2.5"),
+            (0.001, "0.001"),
+            (0.00001, "0.00001"),
+            (1e-6, "0.000001"),   // last fixed-point case (-6 < n)
+            (1e-7, "1e-7"),       // first negative-exponent case (n <= -6)
+            (1.5e-7, "1.5e-7"),
+            (-1e-7, "-1e-7"),
+            (1e20, "100000000000000000000"), // last fixed-point integer (n == 21)
+            (1e21, "1e+21"),                 // first positive-exponent case (n > 21)
+            (1.5e21, "1.5e+21"),
+            (1.5e300, "1.5e+300"),
+            (1.7976931348623157e308, "1.7976931348623157e+308"), // f64::MAX
+            (5e-324, "5e-324"),                                  // smallest subnormal
+            (9007199254740992.0, "9007199254740992"),            // 2^53
+            (1234567890123456.0, "1234567890123456"),
+            // HIGH-1 regression pins (6.2-4 megaudit): the shortest-decimal TIE-BREAK
+            // band where Rust's own `{:e}`/`Display` diverges from V8 (Rust would emit
+            // the `...3` form; V8 -- and ryu-js -- emit `...2`). These must match V8.
+            (1658206780088562.2, "1658206780088562.2"),
+            (233115890514796.12, "233115890514796.12"),
+            (871790086129008.2, "871790086129008.2"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                &ecma_number_string(*input),
+                expected,
+                "ecma_number_string({input:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn ecma_opt_number_emits_unquoted_token_via_cell_value() {
+        // The wire field is an UNQUOTED JSON number (not a string, not `6.0`).
+        let j = serde_json::to_string(&cell_value_to_wire(ql_session::CellValue::Number {
+            number: 6.0,
+        }))
+        .unwrap();
+        assert_eq!(j, r#"{"kind":"number","number":6}"#);
+        // Deserialize round-trips back to the f64.
+        let back: CellValueWire = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.number, Some(6.0));
+        // A genuine fraction is preserved verbatim.
+        let jf = serde_json::to_string(&cell_value_to_wire(ql_session::CellValue::Number {
+            number: 0.5,
+        }))
+        .unwrap();
+        assert_eq!(jf, r#"{"kind":"number","number":0.5}"#);
+    }
+
+    #[test]
+    fn ecma_opt_number_rejects_non_finite_as_serde_error() {
+        // Non-finite -> a serde error (NOT a panic, NOT a malformed token). The router's
+        // json() maps a serialization error to a 500 problem+json (No-Fallbacks).
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let r = serde_json::to_string(&cell_value_to_wire(ql_session::CellValue::Number {
+                number: bad,
+            }));
+            assert!(r.is_err(), "non-finite {bad} must fail serialization, not panic");
+        }
+    }
+
+    #[test]
+    fn ecma_number_string_round_trips_over_random_f64() {
+        // A deterministic LCG over many f64 bit patterns: every emitted ECMAScript token
+        // must parse back to the EXACT same f64 (ryu-js is shortest-round-trip). This
+        // guards the wiring + the ryu-js contract without needing Node at test time.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut checked = 0u32;
+        for _ in 0..50_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let x = f64::from_bits(state);
+            if !x.is_finite() {
+                continue;
+            }
+            let token = ecma_number_string(x);
+            let back: f64 = token.parse().expect("ECMAScript token parses as f64");
+            // `==` (not bits) so -0.0 round-tripping to "0"->0.0 is accepted.
+            assert!(back == x, "round-trip {x} -> {token} -> {back}");
+            checked += 1;
+        }
+        assert!(checked > 40_000, "sanity: most random bit patterns are finite");
+    }
+
+    #[test]
     fn hex_round_trips() {
         let cases: [Vec<u8>; 4] = [
             vec![],
@@ -1705,12 +1877,13 @@ mod tests {
 
     #[test]
     fn cell_value_wire_kind_shapes() {
+        // 6.2-4: integer-valued numbers cross as `14` (ECMAScript form), NOT serde `14.0`.
         assert_eq!(
             serde_json::to_string(&cell_value_to_wire(ql_session::CellValue::Number {
                 number: 14.0
             }))
             .unwrap(),
-            r#"{"kind":"number","number":14.0}"#
+            r#"{"kind":"number","number":14}"#
         );
         assert_eq!(
             serde_json::to_string(&cell_value_to_wire(ql_session::CellValue::Blank)).unwrap(),
@@ -1814,13 +1987,10 @@ mod tests {
         assert!(j.contains(r#""nRows":2"#), "{j}");
         assert!(j.contains(r#""nCols":1"#), "{j}");
         // columnar: a `columns` array, each with a `values` array of CellValueWire.
-        // NOTE: `number:6.0` is the CURRENT serde rendering; the napi row emits `6`
-        // (the documented 6.2-4-deferred number-encoding divergence -- see the
-        // `CellValueWire` doc). This test pins the current shape, not the final
-        // byte-identical wire (which 6.2-4 reconciles uniformly if byte-identical
-        // comparison is chosen).
+        // 6.2-4: integer numbers cross as `6` (ECMAScript form via `ecma_opt_number`),
+        // byte-identical to the napi row (was serde `6.0`).
         assert!(
-            j.contains(r#""columns":[{"values":[{"kind":"number","number":6.0},{"kind":"blank"}]}]"#),
+            j.contains(r#""columns":[{"values":[{"kind":"number","number":6},{"kind":"blank"}]}]"#),
             "{j}"
         );
     }
