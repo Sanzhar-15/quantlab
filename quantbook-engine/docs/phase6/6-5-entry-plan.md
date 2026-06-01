@@ -1,7 +1,10 @@
 # Phase 6.5 — SQL surface + connectors (`ql-sql`, `ql-connectors`) — entry plan
 
-**Status:** STARTED 2026-06-01. 6.5-0 (`write_range` substrate) + 6.5-1 (`ql-sql` DataFusion +
-`materialize_query`, SQL-6-01/02) SHIPPED. NEXT = 6.5-2 (provenance reverse-index + `refresh_source`).
+**Status:** COMPLETE 2026-06-01. All increments 6.5-0 … 6.5-5 SHIPPED and LANDED on
+`feat/quantbook-engine` @ `1b50f7d7d30` (6.5-0/6.5-1 by hand; 6.5-2..6.5-5 driven through the Window-1
+Cockpit on a `cockpit/6.5` worktree, then subtree-landed with a pre-ship hygiene/clippy pass). Phase 6.5
+(SQL surface + connectors) is DONE. NEXT = 6.7 Phase-6 closure megaudit (after confirming the 6.3 WASM/C
+bindings v1.5-deferral scope); 6.6 (ql-ai) deferred to v2. Exit packet: `docs/phase6/exit-packet.md`.
 
 Master plan §6.5 (`docs/MASTER-PLAN.md`): SQL over sheets/tables, external refresh, credentials
 boundary, Arrow interop, explicit dependency invalidation. Acceptance: **SQL-6-01** query table/sheet ·
@@ -56,15 +59,25 @@ signature** — no contract re-freeze.
   silent shadow). **Provenance is NOT recorded in 6.5-1 (deferred fully to 6.5-2)** — the earlier "begin
   provenance recording" note was dropped; 6.5-2 designs recording into materialize_query. Cargo.lock
   staged WITH the feat (datafusion + arrow-shared tree; arrow stays single-version 58.3.0).
-- **6.5-2 — provenance reverse-index + `refresh_source`.** Typed provenance + `source_id→cells` index;
-  typed `Event::Provenance`; revision-gated `refresh_source` re-runs the producer, re-materializes via the
-  substrate, dirties dependents → `DirtyResult`. SQL-6-03.
-- **6.5-3 — `ql-connectors` (CSV + Parquet).** Uniform credentials-aware `DataSource` trait (pattern ref:
-  `.references/formualizer/.../backends/csv.rs`); CSV wraps `ql-io-csv`; Parquet via arrow/parquet.
-  Connectors register as refreshable sources. CONN-6-01 + CONN-6-02 (loud errors; No-Fallbacks).
-- **6.5-4 — binding exposure + golden parity.** Bind `writeRange`/`materializeQuery`/`refreshSource` over
-  napi + pyo3 + ql-service (flip the Capability stubs); extend the golden parity matrix.
-- **6.5-5 — closure megaudit + 6.5 exit.** 3-lane megaudit; MASTER-PLAN / this doc / session-api sync.
+- **6.5-2 — provenance reverse-index + `refresh_source`.** SHIPPED 2026-06-01 (Cockpit). DUAL typed
+  provenance: a per-cell `CellProvenance{source_id, revision}` map PLUS a per-source `ProvenanceEntry`
+  (`source_id → produced cells` reverse index); `materialize_query` records both; revision-gated
+  `refresh_source` re-runs the producer, re-materializes via the substrate, dirties dependents →
+  `DirtyResult`. SQL-6-03. codex_forensic caught + fixed: missing per-cell provenance, dirty-before-success
+  ordering, undo/redo provenance desync, multi-source last-writer ownership clobbering. (`session.rs` +715.)
+- **6.5-3 — `ql-connectors` (CSV + Parquet).** SHIPPED 2026-06-01 (Cockpit). `DataSource` trait + CSV
+  (wraps `ql-io-csv`) + Parquet (arrow/parquet) local-file connectors. CONN-6-01 + CONN-6-02 — unsupported
+  Arrow column types (incl. the all-null-column edge) FAIL LOUD (`ConnectorError`, No-Fallbacks) rather than
+  silently storing the type name (codex catch). (`lib.rs` +708.)
+- **6.5-4 — binding exposure + golden parity.** SHIPPED 2026-06-01 (Cockpit). `write_range` /
+  `materialize_query` / `refresh_source` exposed over napi + pyo3 + ql-service; golden parity extended
+  (Node + Python + Service).
+- **6.5-5 — closure megaudit + 6.5 exit.** SHIPPED 2026-06-01. Full-stack validation caught a real defect
+  6.5-4's BUILD-only acceptance missed: the `cluster_e_http` reserved-bulk test asserted all five §3.5
+  methods return 501, but write/materialize/refresh now return 200/400/404 — corrected (renamed
+  `cluster_e_reserved_bulk_methods_v1`). Exit packet `docs/phase6/exit-packet.md`; this doc + MASTER-PLAN +
+  session-api synced. 6.5 stack 0 failures (ql-exec 836, ql-sql 16, ql-connectors, ql-service 40,
+  ql-bindings-node).
 
 `publish_dataset` + `bind_range` are the **6.4** Python `qb.publish()`/`qb.bind()` surface — out of 6.5
 scope; they stay Capability stubs (revisit in a 6.4 follow-up). They share the 6.5-0 `write_range`
