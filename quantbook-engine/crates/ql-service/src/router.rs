@@ -84,10 +84,11 @@ use crate::guarded::guarded;
 use crate::session_store::SessionStore;
 use crate::wire::{
     self, batch_result_to_wire, cell_range_from_wire, cell_snapshot_to_wire, cell_value_from_wire,
-    diagnostic_to_wire, event_page_to_wire, event_to_wire, format_id_from_wire,
-    function_metadata_from_wire, function_metadata_to_wire, operation_state_to_wire,
-    range_result_to_wire, session_op_from_wire, sheet_info_to_wire, table_spec_from_wire,
-    undo_redo_result_to_wire, workbook_snapshot_delta_to_wire, workbook_snapshot_to_wire,
+    diagnostic_to_wire, dirty_result_to_wire, event_page_to_wire, event_to_wire,
+    format_id_from_wire, function_metadata_from_wire, function_metadata_to_wire,
+    operation_state_to_wire, published_ref_to_wire, range_result_to_wire, session_op_from_wire,
+    sheet_info_to_wire, table_spec_from_wire, undo_redo_result_to_wire,
+    workbook_snapshot_delta_to_wire, workbook_snapshot_to_wire, write_range_result_to_wire,
     AddSheetBody, AddSheetResponse, BatchBody, BindRangeBody, CellBody, LifecycleResponse,
     MaterializeQueryBody, MoveSheetBody, NameBody, NewSessionResponse, OpBody, PathBody,
     PublishDatasetBody, QueryRangeBody, RecalcResponse, RefreshSourceBody, RegisterFormatBody,
@@ -746,8 +747,8 @@ async fn write_range(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
             .into_iter()
             .map(|row| row.into_iter().map(cell_value_from_wire).collect())
             .collect::<Result<Vec<Vec<_>>, EngineError>>()?;
-        s.write_range(range, values).map(|_| ())?;
-        Ok(AckResponse { ok: true })
+        let result = s.write_range(range, values)?;
+        Ok(write_range_result_to_wire(result))
     })
 }
 
@@ -782,8 +783,8 @@ async fn refresh_source(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
         Err(r) => return r,
     };
     with_session(store, id, "refreshSource", move |s| {
-        s.refresh_source(&b.source_id, b.revision).map(|_| ())?;
-        Ok(AckResponse { ok: true })
+        let result = s.refresh_source(&b.source_id, b.revision)?;
+        Ok(dirty_result_to_wire(result))
     })
 }
 
@@ -795,8 +796,8 @@ async fn materialize_query(store: &SessionStore, id: &str, body: ReqBody) -> Res
     with_session(store, id, "materializeQuery", move |s| {
         let data = wire::parse_reserved_json_payload("materializeQuery", &b.data)?;
         let target = cell_range_from_wire(b.target);
-        s.materialize_query(&b.query_id, target, data).map(|_| ())?;
-        Ok(AckResponse { ok: true })
+        let result = s.materialize_query(&b.query_id, target, data)?;
+        Ok(published_ref_to_wire(result))
     })
 }
 

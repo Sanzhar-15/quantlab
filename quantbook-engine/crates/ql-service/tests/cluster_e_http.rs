@@ -271,7 +271,12 @@ async fn cluster_e_batch_and_transactions() {
 }
 
 #[tokio::test]
-async fn cluster_e_reserved_bulk_all_501() {
+async fn cluster_e_reserved_bulk_methods_v1() {
+    // The §3.5 reserved bulk methods over HTTP. Phase 6.5 implemented three of them
+    // (write_range 6.5-0, materialize_query 6.5-1, refresh_source 6.5-2), exposed over
+    // the service in 6.5-4; publish_dataset / bind_range remain 6.4-reserved (501). This
+    // asserts the AUTHORITATIVE per-method v1 signal (No-Fallbacks: real errors are loud,
+    // not silent or 501-masked). `data` (publish/materialize) is opaque JSON TEXT.
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let server = tokio::spawn(async move { serve(listener, SessionStore::new()).await });
@@ -281,15 +286,46 @@ async fn cluster_e_reserved_bulk_all_501() {
     let sh = add_sheet(addr, &base, "S").await;
     let range = format!(r#"{{"sheet":{sh},"startRow":0,"startCol":0,"endRow":0,"endCol":0}}"#);
 
-    // Each reserved method takes VALID inputs (so conversion passes) and must surface
-    // not_implemented_in_v1_core (Capability -> 501) -- the authoritative v1 signal.
-    // `data` (publish/materialize) is opaque JSON TEXT (a string carrying JSON,
-    // mirroring napi), so it is double-encoded here.
-    let cases: [(&str, String); 5] = [
-        (
-            "write-range",
-            format!(r#"{{"range":{range},"values":[[{{"kind":"number","number":1}}]]}}"#),
-        ),
+    // write-range (6.5-0): a valid 1x1 write succeeds (200).
+    let (st, body) = http(
+        addr,
+        "POST",
+        &format!("{base}/write-range"),
+        Some(&format!(
+            r#"{{"range":{range},"values":[[{{"kind":"number","number":1}}]]}}"#
+        )),
+    )
+    .await;
+    assert_eq!(st, 200, "write-range should succeed (6.5-0): {body}");
+
+    // materialize-query (6.5-1): `data` carrying no `sql` key surfaces bad_argument (400)
+    // from the real parse path -- proving the endpoint is implemented, not a 501 stub.
+    let (st, body) = http(
+        addr,
+        "POST",
+        &format!("{base}/materialize-query"),
+        Some(&format!(
+            r#"{{"queryId":"q","target":{range},"data":"{{\"rows\":[]}}"}}"#
+        )),
+    )
+    .await;
+    assert_eq!(st, 400, "materialize-query: no sql key -> bad_argument (6.5-1): {body}");
+    assert_eq!(code(&body).as_deref(), Some("bad_argument"), "materialize-query code: {body}");
+
+    // refresh-source (6.5-2): an unknown source (never materialized in this session) is a
+    // loud not_found (404 source_not_found), NOT a 501 stub.
+    let (st, body) = http(
+        addr,
+        "POST",
+        &format!("{base}/refresh-source"),
+        Some(r#"{"sourceId":"s","revision":"1"}"#),
+    )
+    .await;
+    assert_eq!(st, 404, "refresh-source unknown source -> not_found (6.5-2): {body}");
+    assert_eq!(code(&body).as_deref(), Some("source_not_found"), "refresh-source code: {body}");
+
+    // publish-dataset / bind-range remain 6.4-reserved -> not_implemented_in_v1_core (501).
+    let cases: [(&str, String); 2] = [
         (
             "publish-dataset",
             format!(r#"{{"name":"d","data":"{{\"k\":1}}","target":{range}}}"#),
@@ -297,14 +333,6 @@ async fn cluster_e_reserved_bulk_all_501() {
         (
             "bind-range",
             format!(r#"{{"bindingId":"b","target":{range}}}"#),
-        ),
-        (
-            "refresh-source",
-            r#"{"sourceId":"s","revision":"1"}"#.to_string(),
-        ),
-        (
-            "materialize-query",
-            format!(r#"{{"queryId":"q","target":{range},"data":"{{\"rows\":[]}}"}}"#),
         ),
     ];
     for (path, payload) in cases {

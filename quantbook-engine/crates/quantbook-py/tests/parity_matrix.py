@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 6.3-4 — the golden cross-binding PARITY MATRIX (the 6.3 exit gate).
+"""Phase 6.3-4 / 6.5-4 — the golden cross-binding PARITY MATRIX.
 
 Runs the canonical golden flow through BOTH binding rows and asserts the
 transcripts are byte-identical after masking engine-internal opaque values
@@ -10,11 +10,15 @@ row (the pyo3 facade) proves cross-binding parity.
 
     cargo build -p quantbook-py
     cargo build -p ql-bindings-node
+    cargo build -p ql-service
     python3.12 crates/quantbook-py/tests/parity_matrix.py
 
-Env overrides: QL_PY_CDYLIB, QL_NODE_CDYLIB (passed through to the emitters),
-QL_NODE for the node binary (default "node"), QL_PY for the python binary
-(default this interpreter).
+Env overrides: QL_PY_CDYLIB, QL_NODE_CDYLIB, QL_SERVICE_BIN (passed through to
+the emitters), QL_NODE for the node binary (default "node"), QL_PY for the
+python binary (default this interpreter). When CARGO_TARGET_DIR is set (the
+acceptance-criterion pattern) and QL_*_CDYLIB/QL_SERVICE_BIN are NOT explicitly
+set, the cdylib/binary paths are auto-derived from CARGO_TARGET_DIR/debug so
+the test works without a workspace target/ symlink.
 
 Masking (user decision): opaque ids / version tokens legitimately differ in VALUE
 across bindings (engine-internal counters) without being a parity defect, so they
@@ -42,12 +46,12 @@ SERVICE_EMITTER = HERE / "golden_flow_service.py"
 # compared verbatim.
 MASK_KEYS = {"version", "nextCursor"}
 
-# MED-3 (6.3-5): the EXACT ordered step-name list both golden flows emit. The
-# anti-vacuity guard asserts each transcript's `step` sequence equals this list
+# MED-3 (6.3-5) / 6.5-4: the EXACT ordered step-name list both golden flows emit.
+# The anti-vacuity guard asserts each transcript's `step` sequence equals this list
 # VERBATIM (not just len >= N) so a silently-truncated, reordered, or renamed
 # emitter cannot slip a vacuous pass. Derived from `golden_flow.py`'s `rec(...)`/
-# `expect_err(...)` calls in order. Includes the HIGH-A `recalc_op_id` witness
-# (step 3) added in 6.3-5 -> 23 steps (was 22).
+# `expect_err(...)` calls in order. 6.5-4 adds write_range / materialize_query /
+# refresh_source after poll_events -> 26 steps (was 23).
 EXPECTED_STEPS = [
     "lifecycle_initial",
     "add_sheet",
@@ -66,6 +70,9 @@ EXPECTED_STEPS = [
     "persist_a1",
     "register_udf",
     "poll_events",
+    "write_range",
+    "materialize_query",
+    "refresh_source",
     "panic",
     "after_panic_lifecycle",
     "err_dup_sheet",
@@ -182,6 +189,21 @@ def main():
 
     node_bin = os.environ.get("QL_NODE", "node")
     py_bin = os.environ.get("QL_PY", sys.executable)
+
+    # Auto-derive cdylib / binary paths from CARGO_TARGET_DIR when the
+    # per-emitter env overrides (QL_*_CDYLIB, QL_SERVICE_BIN) are not set.
+    # The acceptance-criterion build sets CARGO_TARGET_DIR=$HOME/.cockpit-ql65-target
+    # which places artifacts outside the workspace target/ directory the emitters
+    # search by default. Setting these vars before subprocess.run propagates them.
+    _ct = os.environ.get("CARGO_TARGET_DIR")
+    if _ct:
+        _ext = "dylib" if sys.platform == "darwin" else "so"
+        if "QL_NODE_CDYLIB" not in os.environ:
+            os.environ["QL_NODE_CDYLIB"] = str(Path(_ct) / "debug" / f"libql_bindings_node.{_ext}")
+        if "QL_PY_CDYLIB" not in os.environ:
+            os.environ["QL_PY_CDYLIB"] = str(Path(_ct) / "debug" / f"libquantbook_py.{_ext}")
+        if "QL_SERVICE_BIN" not in os.environ:
+            os.environ["QL_SERVICE_BIN"] = str(Path(_ct) / "debug" / "ql-service")
 
     def prep(argv, label):
         # mask opaque tokens, then assert+normalize the transport-specific closed-session code.

@@ -221,6 +221,25 @@ function run(native) {
     kinds: [...new Set(page.events.map((e) => e.kind))].sort(),
   });
 
+  // --- writeRange (§3.5; 6.5-0 substrate): bulk-write a 1x2 range ---
+  const wr = s.writeRange(
+    { sheet: sh, startRow: 20, startCol: 0, endRow: 20, endCol: 1 },
+    [[{ kind: "number", number: 10 }, { kind: "number", number: 20 }]],
+  );
+  rec("write_range", { written: wr.written });
+
+  // --- materializeQuery (§3.5; 6.5-1 substrate): SELECT 1 -> cell (sh, 20, 2) ---
+  const mq = s.materializeQuery(
+    "q1",
+    { sheet: sh, startRow: 20, startCol: 2, endRow: 20, endCol: 2 },
+    '{"sql":"SELECT 1 AS a"}',
+  );
+  rec("materialize_query", { id: mq.id });
+
+  // --- refreshSource (§3.5): re-run q1 at revision 1; no formula dependents -> dirtied=0 ---
+  const rs = s.refreshSource("q1", 1n);
+  rec("refresh_source", { dirtied: rs.dirtied });
+
   // --- deliberate panic on a SEPARATE session: surfaces, does NOT abort ---
   const p = new Session();
   if (typeof p.__forcePanicForTest === "function") {

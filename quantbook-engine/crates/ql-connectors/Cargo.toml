@@ -9,4 +9,21 @@ publish.workspace = true
 [lib]
 path = "src/lib.rs"
 
+# Phase 6.5-3 (2026-06-01): CONN-6-01/02 — uniform credentials-aware DataSource
+# trait with CSV (wraps ql-io-csv) + Parquet (arrow/parquet 58.3.0 family,
+# already in the workspace — no new heavy dependency) local-file connectors.
+# Connectors register as refreshable sources; errors surface loudly (No-Fallbacks).
 [dependencies]
+ql-io-csv = { path = "../ql-io-csv" }
+ql-storage = { path = "../ql-storage" }
+ql-types = { path = "../ql-types" }
+thiserror = { workspace = true }
+# Parquet reader: arrow-native RecordBatch reader from the same Apache Arrow
+# 58.3.0 ecosystem already pinned in the workspace.  The `arrow` feature enables
+# ParquetRecordBatchReaderBuilder and ArrowWriter (used in tests).
+parquet = { version = "=58.3.0", default-features = false, features = ["arrow"] }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

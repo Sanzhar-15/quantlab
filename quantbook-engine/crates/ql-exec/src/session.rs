@@ -183,6 +183,40 @@ impl Drop for FaultGuard<'_> {
     }
 }
 
+/// **6.5-2:** typed per-cell provenance record stored in
+/// [`WorkbookSession::cell_provenance`]. Records which source last wrote a cell
+/// and at which revision — the cell-keyed half of the dual provenance index.
+struct CellProvenance {
+    /// The `source_id` (query_id) that last produced this cell.
+    source_id: String,
+    /// The revision at which the source last wrote this cell. Starts at `0`
+    /// for a direct `materialize_query`; updated to the caller-supplied
+    /// revision on every successful `refresh_source`. Carried per the locked
+    /// typed-provenance contract (source_id + revision); v1 refresh dirties via
+    /// the source-level reverse index, so the per-cell revision is reserved for
+    /// future staleness checks and not yet read.
+    #[allow(dead_code)]
+    revision: u64,
+}
+
+/// **6.5-2:** per-source provenance record stored in [`WorkbookSession::provenance`].
+/// Holds enough state to re-run `materialize_query` on `refresh_source` and
+/// to report the cells produced in the last materialization (the reverse index).
+struct ProvenanceEntry {
+    /// The revision at which this source was last successfully materialized.
+    /// Starts at 0 (first call sets it on the first `refresh_source`). A
+    /// `refresh_source(revision)` with `revision <= stored` is a no-op.
+    revision: u64,
+    /// The `data` argument (e.g. `{"sql": "..."}`) needed to re-run the producer.
+    data: serde_json::Value,
+    /// The `target` range passed to the last `materialize_query` call.
+    target: CellRange,
+    /// Cells produced in the last materialization (row-major, anchored at
+    /// `target`'s top-left). Empty for a zero-row result. This is the
+    /// `source_id → produced_cells` reverse index.
+    cells: Vec<CellAddr>,
+}
+
 /// The owning, single-writer engine session (contract §2.1).
 ///
 /// Bindings wrap this behind an opaque handle (Node: `#[napi]` over
@@ -368,6 +402,17 @@ pub struct WorkbookSession {
     /// [`run_recalc`]: WorkbookSession::run_recalc
     /// [`set_udf_op_budget`]: WorkbookSession::set_udf_op_budget
     udf_op_budget: std::time::Duration,
+    /// **6.5-2:** `source_id → ProvenanceEntry` reverse index. Populated by
+    /// `materialize_query` on every successful write; consumed by `refresh_source`
+    /// to revision-gate re-runs and dirty exactly the produced cells' dependents.
+    provenance: HashMap<String, ProvenanceEntry>,
+    /// **6.5-2:** `cell_addr → CellProvenance` typed per-cell map — the cell-keyed
+    /// half of the dual provenance index. Records which source last wrote each cell
+    /// and at which revision. Updated by `materialize_query` (revision=0 baseline)
+    /// and by `refresh_source` (advanced to the caller's revision). Stale entries
+    /// (cells a source no longer produces after a shrinking result) are evicted by
+    /// `refresh_source`.
+    cell_provenance: HashMap<CellAddr, CellProvenance>,
 }
 
 impl WorkbookSession {
@@ -444,6 +489,8 @@ impl WorkbookSession {
             udf_diagnostics: RefCell::new(Vec::new()),
             spill_footprint: RefCell::new(Vec::new()),
             udf_op_budget: crate::scalar::UDF_OP_BUDGET,
+            provenance: HashMap::new(),
+            cell_provenance: HashMap::new(),
         }
     }
 
@@ -1005,6 +1052,15 @@ impl WorkbookSession {
                 },
             });
         }
+        // 6.5-2: provenance maps are session-local state — they are NOT stored in
+        // the op-log, so undo/redo cannot replay them. After a wholesale rebuild the
+        // live workbook no longer reflects any prior materialize_query write, so
+        // stale provenance entries would let refresh_source re-apply an undone source
+        // to the rebuilt state. Clear both maps unconditionally; the caller must
+        // re-run materialize_query to re-establish provenance after undo/redo.
+        self.provenance.clear();
+        self.cell_provenance.clear();
+
         // The wholesale rebuild cannot be conveyed incrementally → force a full
         // rebuild for any outstanding token (and advance the state token).
         self.bump_epoch();
@@ -3199,8 +3255,114 @@ impl EngineSession for WorkbookSession {
         Err(not_implemented("bind_range"))
     }
 
-    fn refresh_source(&mut self, _source_id: &str, _revision: u64) -> EngineResult<DirtyResult> {
-        Err(not_implemented("refresh_source"))
+    /// **6.5-2:** revision-gated source refresh. Re-runs the producer (via the
+    /// 6.5-1 `materialize_query` substrate) and dirties the dependents of ALL cells
+    /// the source previously produced, not just the cells in the new result block.
+    /// This ensures correctness when a result shrinks: a formula that depended on a
+    /// cell the source no longer covers is still queued for `recalc_dirty`.
+    ///
+    /// `revision` is the caller's new-version counter for the external source. If
+    /// `revision <= stored_revision` the source data has not changed — the call is
+    /// a no-op (`dirtied = 0`; version unchanged). On the first call after a
+    /// `materialize_query` the stored revision is `0`, so any positive `revision`
+    /// triggers a refresh. A `revision = 0` refresh call is always a no-op.
+    ///
+    /// Returns `source_not_found` (`NotFound`) if `source_id` has never been
+    /// materialized in this session.
+    fn refresh_source(&mut self, source_id: &str, revision: u64) -> EngineResult<DirtyResult> {
+        self.ensure_ready()?;
+
+        // Extract the full provenance record under an immutable borrow; release
+        // before any mutable use of `self`.
+        let (stored_rev, data, target, old_cells) = match self.provenance.get(source_id) {
+            None => {
+                return Err(EngineError::new(
+                    ErrorClass::NotFound,
+                    "source_not_found",
+                    format!(
+                        "refresh_source: source '{source_id}' has not been materialized \
+                         in this session"
+                    ),
+                ))
+            }
+            Some(e) => (e.revision, e.data.clone(), e.target, e.cells.clone()),
+        };
+
+        // Revision gate: a caller-provided revision that is not newer than the last
+        // materialization means the source data has not changed — nothing to refresh.
+        if revision <= stored_rev {
+            return Ok(DirtyResult {
+                dirtied: 0,
+                version: self.current_version(),
+            });
+        }
+
+        // Snapshot dirty count before re-materializing.
+        let dirty_before = self.graph.dirty_formulas().len();
+
+        // Re-run the producer via the 6.5-1 substrate (parse SQL → run → write_range
+        // → one BatchCommit → calcgraph on_set_value fans out to new cells' dependents).
+        // This MUST succeed before we touch the dirty set — a failed re-materialization
+        // (deleted sheet, invalid SQL, oversized result) must leave the graph dirty set
+        // completely unchanged (audit MED: pre-fan-out mutates observable state on error).
+        self.materialize_query(source_id, target, data)?;
+
+        // Fan out dirty propagation over ALL previously-produced cells. This covers the
+        // shrinking-result case: if the re-run no longer writes cell C, `write_range`
+        // never fires `on_set_value` at C, so C's formula dependents would not be
+        // dirtied without this pass. The `write_range` above already fired `on_set_value`
+        // at every newly-written cell; firing again here is idempotent for the overlap.
+        // Staged AFTER the successful re-materialization so a failed refresh is invisible
+        // to subsequent `recalc_dirty` calls.
+        for cell in &old_cells {
+            self.graph.on_set_value(cell.sheet, cell.row, cell.col);
+        }
+
+        let dirty_after = self.graph.dirty_formulas().len();
+
+        // Advance the stored revision now that re-materialization succeeded.
+        if let Some(e) = self.provenance.get_mut(source_id) {
+            e.revision = revision;
+        }
+
+        // Sync per-cell provenance: evict stale cells (old but not in the new result)
+        // and advance the revision on current cells.
+        let new_cells: Vec<CellAddr> = self
+            .provenance
+            .get(source_id)
+            .map(|e| e.cells.clone())
+            .unwrap_or_default();
+        let new_cells_set: HashSet<CellAddr> = new_cells.iter().copied().collect();
+        for old_cell in &old_cells {
+            if !new_cells_set.contains(old_cell) {
+                // Only evict if this source still owns the cell. Another source may
+                // have claimed ownership via last-writer-wins since the last time
+                // this source ran; removing that entry would clobber the other
+                // source's provenance record.
+                if self
+                    .cell_provenance
+                    .get(old_cell)
+                    .map(|cp| cp.source_id.as_str())
+                    == Some(source_id)
+                {
+                    self.cell_provenance.remove(old_cell);
+                }
+            }
+        }
+        for new_cell in new_cells {
+            self.cell_provenance.insert(
+                new_cell,
+                CellProvenance {
+                    source_id: source_id.to_string(),
+                    revision,
+                },
+            );
+        }
+
+        Ok(DirtyResult {
+            dirtied: dirty_after.saturating_sub(dirty_before) as u32,
+            version: self.current_version(),
+        })
     }
 
     /// **6.5-1:** materialize a SQL query result into `target`. `data` is a JSON
@@ -3253,6 +3415,34 @@ impl EngineSession for WorkbookSession {
         let n_rows = result.num_rows();
         if n_rows == 0 {
             // A zero-row result materializes nothing (no write, no version advance).
+            // Evict per-cell entries from a prior non-empty run of this same source
+            // (shrinking to zero), guarded by ownership so we don't remove cells
+            // another source has since claimed via last-writer-wins.
+            let old_cells: Vec<CellAddr> = self
+                .provenance
+                .get(query_id)
+                .map(|e| e.cells.clone())
+                .unwrap_or_default();
+            for old_cell in old_cells {
+                if self
+                    .cell_provenance
+                    .get(&old_cell)
+                    .map(|cp| cp.source_id.as_str())
+                    == Some(query_id)
+                {
+                    self.cell_provenance.remove(&old_cell);
+                }
+            }
+            // Still record a provenance entry so refresh_source can re-run the query.
+            self.provenance.insert(
+                query_id.to_string(),
+                ProvenanceEntry {
+                    revision: 0,
+                    data,
+                    target,
+                    cells: Vec::new(),
+                },
+            );
             return Ok(PublishedRef {
                 id: query_id.to_string(),
             });
@@ -3277,6 +3467,70 @@ impl EngineSession for WorkbookSession {
             end_col: target.start_col + (n_cols as ColId) - 1,
         };
         self.write_range(block, values)?;
+
+        // 6.5-2: record per-cell provenance and emit Event::Provenance for each
+        // produced cell. The dual index (source_id→cells reverse + cell→source forward)
+        // lets refresh_source dirty all produced cells' dependents and supports per-cell
+        // attribution queries.
+        let mut produced: Vec<CellAddr> = Vec::with_capacity(n_rows * n_cols);
+        for r in 0..n_rows as RowId {
+            for c in 0..n_cols as ColId {
+                let cell_addr = CellAddr {
+                    sheet: target.sheet,
+                    row: target.start_row + r,
+                    col: target.start_col + c,
+                };
+                produced.push(cell_addr);
+                self.events.push(Event::Provenance {
+                    addr: cell_addr,
+                    source: query_id.to_string(),
+                });
+                // Per-cell typed provenance (cell → {source_id, revision}).
+                // revision=0 baseline; refresh_source advances it after a successful
+                // re-run. Overwrites any prior entry if a different source now owns
+                // this cell (last-writer-wins).
+                self.cell_provenance.insert(
+                    cell_addr,
+                    CellProvenance {
+                        source_id: query_id.to_string(),
+                        revision: 0,
+                    },
+                );
+            }
+        }
+
+        // Evict per-cell entries for cells this source produced before but no longer
+        // produces now (e.g. target shrunk or query returns fewer columns). Clone old
+        // cells before replacing the entry; guard removal so we don't evict a cell
+        // that another source has since claimed via last-writer-wins.
+        let new_produced_set: HashSet<CellAddr> = produced.iter().copied().collect();
+        let old_cells: Vec<CellAddr> = self
+            .provenance
+            .get(query_id)
+            .map(|e| e.cells.clone())
+            .unwrap_or_default();
+        for old_cell in old_cells {
+            if !new_produced_set.contains(&old_cell)
+                && self
+                    .cell_provenance
+                    .get(&old_cell)
+                    .map(|cp| cp.source_id.as_str())
+                    == Some(query_id)
+            {
+                self.cell_provenance.remove(&old_cell);
+            }
+        }
+
+        self.provenance.insert(
+            query_id.to_string(),
+            ProvenanceEntry {
+                revision: 0,
+                data,
+                target,
+                cells: produced,
+            },
+        );
+
         Ok(PublishedRef {
             id: query_id.to_string(),
         })
@@ -4764,6 +5018,463 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.class, ErrorClass::BadArgument);
         assert!(err.message.contains("does not fit"), "got: {}", err.message);
+    }
+
+    // --- 6.5-2: provenance reverse-index + refresh_source ---
+
+    /// materialize_query records per-cell provenance and emits Event::Provenance
+    /// for each produced cell (SQL-6-03 provenance recording).
+    #[test]
+    fn provenance_recorded_after_materialize_query() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(
+            rng(sheet, 0, 0, 1, 0),
+            vec![vec![num(1.0)], vec![num(2.0)]],
+        )
+        .unwrap();
+        let cursor0 = s.poll_events(EventCursor(0)).unwrap().next_cursor;
+        s.materialize_query(
+            "src1",
+            rng(sheet, 0, 2, 1, 2),
+            sql_data("SELECT A FROM S ORDER BY A"),
+        )
+        .unwrap();
+        // Two cells produced (2 rows × 1 col): Event::Provenance for each.
+        let page = s.poll_events(cursor0).unwrap();
+        let prov_events: Vec<_> = page
+            .events
+            .iter()
+            .filter(|e| matches!(e, Event::Provenance { .. }))
+            .collect();
+        assert_eq!(prov_events.len(), 2, "one Provenance event per produced cell");
+        for ev in &prov_events {
+            match ev {
+                Event::Provenance { source, .. } => assert_eq!(source, "src1"),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// A zero-row materialize_query still registers a provenance entry (no events,
+    /// but refresh_source can later re-run the query when data arrives).
+    #[test]
+    fn provenance_recorded_for_zero_row_result() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(99.0)]])
+            .unwrap();
+        let cursor0 = s.poll_events(EventCursor(0)).unwrap().next_cursor;
+        s.materialize_query(
+            "src_empty",
+            rng(sheet, 0, 2, 2, 2),
+            sql_data("SELECT A FROM S WHERE A > 1000"),
+        )
+        .unwrap();
+        // No Provenance events for a zero-row result.
+        let page = s.poll_events(cursor0).unwrap();
+        let n_prov = page
+            .events
+            .iter()
+            .filter(|e| matches!(e, Event::Provenance { .. }))
+            .count();
+        assert_eq!(n_prov, 0, "no Provenance events for zero-row result");
+        // But refresh_source should NOT return source_not_found — the entry exists.
+        let dirty = s.refresh_source("src_empty", 1).unwrap();
+        // The re-run still produces zero rows (same query), so dirtied == 0.
+        assert_eq!(dirty.dirtied, 0);
+    }
+
+    /// refresh_source on an unknown source_id returns source_not_found (NotFound).
+    #[test]
+    fn refresh_source_unknown_id_is_not_found() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("S", 16384).unwrap();
+        let err = s.refresh_source("no_such_source", 1).unwrap_err();
+        assert_eq!(err.class, ErrorClass::NotFound);
+        assert_eq!(err.code, "source_not_found");
+    }
+
+    /// refresh_source with revision == 0 is always a no-op (stored revision starts
+    /// at 0, so 0 <= 0 → gate fires immediately).
+    #[test]
+    fn refresh_source_revision_zero_is_noop() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(5.0)]])
+            .unwrap();
+        s.materialize_query("src", rng(sheet, 0, 2, 0, 2), sql_data("SELECT A FROM S"))
+            .unwrap();
+        let v_before = s.snapshot().unwrap().version;
+        let result = s.refresh_source("src", 0).unwrap();
+        assert_eq!(result.dirtied, 0);
+        // Version must not advance on a no-op refresh.
+        assert_eq!(s.snapshot().unwrap().version, v_before);
+    }
+
+    /// refresh_source revision gate: calling with the same revision twice is a
+    /// no-op on the second call (stored revision == caller revision → gate fires).
+    #[test]
+    fn refresh_source_same_revision_is_noop_on_second_call() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(7.0)]])
+            .unwrap();
+        s.materialize_query("src", rng(sheet, 0, 2, 0, 2), sql_data("SELECT A FROM S"))
+            .unwrap();
+        s.refresh_source("src", 1).unwrap(); // first refresh: revision 1
+        let v_after_first = s.snapshot().unwrap().version;
+        let result = s.refresh_source("src", 1).unwrap(); // same revision again
+        assert_eq!(result.dirtied, 0, "second call with same revision is no-op");
+        assert_eq!(s.snapshot().unwrap().version, v_after_first);
+    }
+
+    /// refresh_source re-materializes the query and dirties dependents of the
+    /// produced cells (SQL-6-03: refresh dirties dependents → recalc_dirty heals).
+    #[test]
+    fn refresh_source_rematerializes_and_dirties_dependents() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // Col A: source data (1 row). Col B: will be the materialized output.
+        // Col C: formula depending on Col B.
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(3.0)]])
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 2), "B1 * 10").unwrap(); // C1 = B1*10
+        // First materialization: B1 = 3 (from SELECT A FROM S).
+        s.materialize_query("src", rng(sheet, 0, 1, 0, 1), sql_data("SELECT A FROM S"))
+            .unwrap();
+        assert_eq!(cell_value(&s, addr(sheet, 0, 1)), num(3.0));
+        // C1 is now dirty (B1 changed); recalc it.
+        let op = s.recalc_dirty().unwrap();
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
+        assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(30.0));
+
+        // Update source data: A1 = 7.
+        s.set_value(addr(sheet, 0, 0), num(7.0)).unwrap();
+
+        // refresh_source(revision=1) should re-materialize B1=7 and dirty C1.
+        let dirty = s.refresh_source("src", 1).unwrap();
+        assert!(dirty.dirtied >= 1, "at least C1 must be dirtied");
+        assert_eq!(cell_value(&s, addr(sheet, 0, 1)), num(7.0)); // B1 updated
+        let op2 = s.recalc_dirty().unwrap();
+        assert_eq!(s.operation_status(op2).unwrap(), OperationState::Completed);
+        assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(70.0)); // C1 healed
+    }
+
+    /// refresh_source advances the stored revision so a lower revision is a no-op.
+    #[test]
+    fn refresh_source_advances_stored_revision() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(1.0)]])
+            .unwrap();
+        s.materialize_query("src", rng(sheet, 0, 2, 0, 2), sql_data("SELECT A FROM S"))
+            .unwrap();
+        // First refresh at revision 5.
+        s.refresh_source("src", 5).unwrap();
+        // Refresh at revision 3 (lower than stored 5) → no-op.
+        let result = s.refresh_source("src", 3).unwrap();
+        assert_eq!(
+            result.dirtied, 0,
+            "lower revision is a no-op after higher refresh"
+        );
+    }
+
+    /// refresh_source on a closed session returns invalid_state (lifecycle gate).
+    #[test]
+    fn refresh_source_closed_session_is_invalid_state() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(1.0)]])
+            .unwrap();
+        s.materialize_query("src", rng(sheet, 0, 2, 0, 2), sql_data("SELECT A FROM S"))
+            .unwrap();
+        s.close().unwrap();
+        let err = s.refresh_source("src", 1).unwrap_err();
+        assert_eq!(err.code, "invalid_state");
+    }
+
+    /// A shrinking refresh correctly dirties dependents of cells the source no
+    /// longer produces (SQL-6-03 correctness for the shrinking-result case).
+    ///
+    /// Setup: A1=1, A2=2, A3=3; query `SELECT A FROM S WHERE A > 0` → B1=1, B2=2,
+    /// B3=3 (3 cells). Formulas C1=B1*10, C2=B2*10, C3=B3*10 are all clean after
+    /// recalc. Then A2 and A3 become negative so the query now returns only 1 row.
+    /// `refresh_source` MUST dirty C2 and C3 (B2/B3 not in new write block) via the
+    /// `source_id→cells` reverse-index fan-out, not just via `write_range`.
+    #[test]
+    fn refresh_source_shrinking_result_dirties_stale_cell_dependents() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+
+        // A1=1, A2=2, A3=3 (all positive so WHERE A>0 returns 3 rows).
+        s.write_range(
+            rng(sheet, 0, 0, 2, 0),
+            vec![vec![num(1.0)], vec![num(2.0)], vec![num(3.0)]],
+        )
+        .unwrap();
+
+        // Formulas in col C that depend on col B (the materialized output).
+        s.set_formula(addr(sheet, 0, 2), "B1 * 10").unwrap(); // C1
+        s.set_formula(addr(sheet, 1, 2), "B2 * 10").unwrap(); // C2
+        s.set_formula(addr(sheet, 2, 2), "B3 * 10").unwrap(); // C3
+
+        // First materialization: 3 rows → B1=1, B2=2, B3=3.
+        s.materialize_query(
+            "src",
+            rng(sheet, 0, 1, 2, 1),
+            sql_data("SELECT A FROM S WHERE A > 0 ORDER BY A"),
+        )
+        .unwrap();
+        assert_eq!(cell_value(&s, addr(sheet, 0, 1)), num(1.0));
+        assert_eq!(cell_value(&s, addr(sheet, 1, 1)), num(2.0));
+        assert_eq!(cell_value(&s, addr(sheet, 2, 1)), num(3.0));
+
+        // Recalc so C1=10, C2=20, C3=30 are all clean.
+        let op = s.recalc_dirty().unwrap();
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
+        assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(10.0));
+        assert_eq!(cell_value(&s, addr(sheet, 1, 2)), num(20.0));
+        assert_eq!(cell_value(&s, addr(sheet, 2, 2)), num(30.0));
+        assert_eq!(s.graph.dirty_formulas().len(), 0, "no dirty formulas after recalc");
+
+        // Shrink: A2 = -1, A3 = -2 (both negative, filtered out by WHERE A>0).
+        // C1/C2/C3 depend on B1/B2/B3, not on A2/A3, so no formula is dirtied here.
+        s.set_value(addr(sheet, 1, 0), num(-1.0)).unwrap();
+        s.set_value(addr(sheet, 2, 0), num(-2.0)).unwrap();
+        assert_eq!(
+            s.graph.dirty_formulas().len(),
+            0,
+            "col-A writes must not dirty col-C formulas"
+        );
+
+        // refresh_source: SQL now returns only 1 row (B1=1). The refresh must fire
+        // on_set_value at B2 and B3 (old cells, via the reverse-index fan-out) so C2
+        // and C3 are dirtied even though write_range never touches B2/B3.
+        let result = s.refresh_source("src", 1).unwrap();
+        assert!(
+            result.dirtied >= 3,
+            "expected C1, C2, C3 all dirtied (got {}); shrinking refresh must \
+             dirty stale-cell dependents via reverse-index fan-out",
+            result.dirtied
+        );
+
+        // Per-cell provenance: B1 still present at revision=1; B2/B3 evicted.
+        assert!(
+            s.cell_provenance.contains_key(&addr(sheet, 0, 1)),
+            "B1 must remain in cell_provenance"
+        );
+        assert!(
+            !s.cell_provenance.contains_key(&addr(sheet, 1, 1)),
+            "B2 must be evicted (no longer produced)"
+        );
+        assert!(
+            !s.cell_provenance.contains_key(&addr(sheet, 2, 1)),
+            "B3 must be evicted (no longer produced)"
+        );
+        assert_eq!(s.cell_provenance[&addr(sheet, 0, 1)].revision, 1);
+        assert_eq!(s.cell_provenance[&addr(sheet, 0, 1)].source_id, "src");
+
+        // Recalc: C1/C2/C3 all recompute correctly.
+        let op2 = s.recalc_dirty().unwrap();
+        assert_eq!(s.operation_status(op2).unwrap(), OperationState::Completed);
+        assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(10.0)); // B1=1 → C1=10
+        // B2 was not overwritten by the shrinking refresh, so it keeps its old value.
+        assert_eq!(cell_value(&s, addr(sheet, 1, 2)), num(20.0)); // B2 still=2 → C2=20
+        assert_eq!(cell_value(&s, addr(sheet, 2, 2)), num(30.0)); // B3 still=3 → C3=30
+    }
+
+    /// Per-cell provenance map is populated and accessible after materialize_query.
+    #[test]
+    fn cell_provenance_populated_after_materialize_query() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 1, 0), vec![vec![num(5.0)], vec![num(6.0)]])
+            .unwrap();
+        s.materialize_query(
+            "qp",
+            rng(sheet, 0, 2, 1, 2),
+            sql_data("SELECT A FROM S ORDER BY A"),
+        )
+        .unwrap();
+        // Both produced cells must be in the per-cell map with source="qp", revision=0.
+        let cp0 = s.cell_provenance.get(&addr(sheet, 0, 2)).expect("cell (0,2) in map");
+        assert_eq!(cp0.source_id, "qp");
+        assert_eq!(cp0.revision, 0);
+        let cp1 = s.cell_provenance.get(&addr(sheet, 1, 2)).expect("cell (1,2) in map");
+        assert_eq!(cp1.source_id, "qp");
+        assert_eq!(cp1.revision, 0);
+    }
+
+    /// Undo after materialize_query clears provenance: refresh_source on the
+    /// undone source returns source_not_found (not a resurrection of undone data).
+    #[test]
+    fn refresh_source_after_undo_is_not_found() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(1.0)]])
+            .unwrap();
+        s.materialize_query("src", rng(sheet, 0, 2, 0, 2), sql_data("SELECT A FROM S"))
+            .unwrap();
+        // Provenance is established.
+        assert!(s.provenance.contains_key("src"));
+        assert!(s.cell_provenance.contains_key(&addr(sheet, 0, 2)));
+
+        // Undo the materialization.
+        let ur = s.undo().unwrap();
+        assert!(ur.consumed, "undo must consume a step");
+        // Both provenance maps must be cleared by rematerialize.
+        assert!(
+            !s.provenance.contains_key("src"),
+            "provenance must be cleared after undo"
+        );
+        assert!(
+            s.cell_provenance.is_empty(),
+            "cell_provenance must be cleared after undo"
+        );
+        // refresh_source on the undone source must return source_not_found.
+        let err = s.refresh_source("src", 1).unwrap_err();
+        assert_eq!(err.code, "source_not_found");
+    }
+
+    /// Redo also clears provenance (rematerialize rebuilds from op-log; session-local
+    /// provenance is not in the log and must not survive a wholesale rebuild).
+    #[test]
+    fn refresh_source_after_redo_is_not_found() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(2.0)]])
+            .unwrap();
+        s.materialize_query("src", rng(sheet, 0, 2, 0, 2), sql_data("SELECT A FROM S"))
+            .unwrap();
+        s.undo().unwrap();
+        // Redo brings the cell values back from the op-log but NOT provenance.
+        let ur = s.redo().unwrap();
+        assert!(ur.consumed, "redo must consume a step");
+        assert!(
+            !s.provenance.contains_key("src"),
+            "provenance must remain cleared after redo (not in op-log)"
+        );
+        let err = s.refresh_source("src", 1).unwrap_err();
+        assert_eq!(err.code, "source_not_found");
+    }
+
+    /// Repeated materialize_query for the same query_id evicts cells from the prior
+    /// run that are no longer produced, without touching cells owned by other sources.
+    #[test]
+    fn materialize_query_repeated_evicts_stale_cell_provenance() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // First run: A1=1, A2=2, A3=3 → B1, B2, B3 produced.
+        s.write_range(
+            rng(sheet, 0, 0, 2, 0),
+            vec![vec![num(1.0)], vec![num(2.0)], vec![num(3.0)]],
+        )
+        .unwrap();
+        s.materialize_query(
+            "q1",
+            rng(sheet, 0, 1, 2, 1),
+            sql_data("SELECT A FROM S ORDER BY A"),
+        )
+        .unwrap();
+        assert!(s.cell_provenance.contains_key(&addr(sheet, 0, 1))); // B1
+        assert!(s.cell_provenance.contains_key(&addr(sheet, 1, 1))); // B2
+        assert!(s.cell_provenance.contains_key(&addr(sheet, 2, 1))); // B3
+
+        // Another source claims B2.
+        s.materialize_query(
+            "q2",
+            rng(sheet, 1, 1, 1, 1),
+            sql_data("SELECT A FROM S WHERE A = 2"),
+        )
+        .unwrap();
+        assert_eq!(s.cell_provenance[&addr(sheet, 1, 1)].source_id, "q2");
+
+        // Second run of q1 with a 1-row result: B1 still owned, B2 now owned by q2
+        // (must not be evicted), B3 owned by q1 (must be evicted).
+        s.write_range(rng(sheet, 1, 0, 2, 0), vec![vec![num(-1.0)], vec![num(-2.0)]])
+            .unwrap();
+        s.materialize_query(
+            "q1",
+            rng(sheet, 0, 1, 2, 1),
+            sql_data("SELECT A FROM S WHERE A > 0 ORDER BY A"),
+        )
+        .unwrap();
+        // B1 still owned by q1.
+        assert_eq!(s.cell_provenance[&addr(sheet, 0, 1)].source_id, "q1");
+        // B2 still owned by q2 (q1 no longer produced it, but q2 is the last writer).
+        assert_eq!(
+            s.cell_provenance[&addr(sheet, 1, 1)].source_id,
+            "q2",
+            "q2's ownership of B2 must not be evicted by q1's re-run"
+        );
+        // B3 was owned by q1 and is no longer produced → evicted.
+        assert!(
+            !s.cell_provenance.contains_key(&addr(sheet, 2, 1)),
+            "B3 must be evicted from cell_provenance (q1 no longer produces it)"
+        );
+    }
+
+    /// refresh_source does not clobber another source's last-writer ownership when
+    /// evicting stale cells from the shrinking result.
+    #[test]
+    fn refresh_source_does_not_evict_other_source_ownership() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+
+        // q1 produces B1=1, B2=2, B3=3.
+        s.write_range(
+            rng(sheet, 0, 0, 2, 0),
+            vec![vec![num(1.0)], vec![num(2.0)], vec![num(3.0)]],
+        )
+        .unwrap();
+        // D1=B3*10 — a formula that depends on B3 so we can verify dirtying.
+        s.set_formula(addr(sheet, 0, 3), "B3 * 10").unwrap();
+        s.materialize_query(
+            "q1",
+            rng(sheet, 0, 1, 2, 1),
+            sql_data("SELECT A FROM S WHERE A > 0 ORDER BY A"),
+        )
+        .unwrap();
+        let op = s.recalc_dirty().unwrap();
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
+        assert_eq!(cell_value(&s, addr(sheet, 0, 3)), num(30.0)); // D1=3*10=30
+        // q2 takes over B2.
+        s.materialize_query(
+            "q2",
+            rng(sheet, 1, 1, 1, 1),
+            sql_data("SELECT A FROM S WHERE A = 2"),
+        )
+        .unwrap();
+        assert_eq!(s.cell_provenance[&addr(sheet, 1, 1)].source_id, "q2");
+
+        // Shrink source data so q1's refresh only produces 1 row (B1).
+        s.set_value(addr(sheet, 1, 0), num(-1.0)).unwrap();
+        s.set_value(addr(sheet, 2, 0), num(-2.0)).unwrap();
+        let _ = s.recalc_dirty(); // clean any dirty from set_value
+
+        let result = s.refresh_source("q1", 1).unwrap();
+        // D1 depends on B3 which is in q1's old_cells → at least D1 must be dirtied.
+        assert!(
+            result.dirtied >= 1,
+            "D1 (depends on B3) must be dirtied, got {}",
+            result.dirtied
+        );
+
+        // B1 still owned by q1 with revision=1.
+        assert_eq!(s.cell_provenance[&addr(sheet, 0, 1)].source_id, "q1");
+        assert_eq!(s.cell_provenance[&addr(sheet, 0, 1)].revision, 1);
+        // B2 must still be owned by q2 (q1's eviction must not remove q2's entry).
+        assert_eq!(
+            s.cell_provenance[&addr(sheet, 1, 1)].source_id,
+            "q2",
+            "q2 ownership of B2 must survive q1's shrinking refresh"
+        );
+        // B3 was owned by q1 and not produced any more → evicted by q1's refresh.
+        assert!(
+            !s.cell_provenance.contains_key(&addr(sheet, 2, 1)),
+            "B3 (owned by q1, not in new result) must be evicted"
+        );
     }
 
     // --- 6.4-2: register_function / unregister_function / list_functions ---

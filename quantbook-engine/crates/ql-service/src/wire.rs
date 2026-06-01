@@ -1715,6 +1715,60 @@ pub struct OpBody {
     pub op: u64,
 }
 
+// ============================================================================
+// Phase 6.5-4 — §3.5 bulk result wire types (write-range / refresh-source /
+// materialize-query). Mirror the napi `WriteRangeResultJson` / `DirtyResultJson`
+// / `PublishedRefJson` shapes so the service is byte-identical to the napi row.
+// ============================================================================
+
+/// Mirror of napi `WriteRangeResultJson` (result of `write-range`). `written` is an
+/// INTEGER cell count; `version` is the opaque post-write version token as lowercase hex.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteRangeResultWire {
+    pub written: u32,
+    pub version: String,
+}
+
+/// Map a [`ql_session::WriteRangeResult`] to [`WriteRangeResultWire`] (version → hex).
+pub fn write_range_result_to_wire(r: ql_session::WriteRangeResult) -> WriteRangeResultWire {
+    WriteRangeResultWire {
+        written: r.written,
+        version: hex_encode(&r.version.0),
+    }
+}
+
+/// Mirror of napi `DirtyResultJson` (result of `refresh-source`). `dirtied` is an
+/// INTEGER dependent-cell count; `version` is the opaque post-refresh version token as
+/// lowercase hex.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirtyResultWire {
+    pub dirtied: u32,
+    pub version: String,
+}
+
+/// Map a [`ql_session::DirtyResult`] to [`DirtyResultWire`] (version → hex).
+pub fn dirty_result_to_wire(r: ql_session::DirtyResult) -> DirtyResultWire {
+    DirtyResultWire {
+        dirtied: r.dirtied,
+        version: hex_encode(&r.version.0),
+    }
+}
+
+/// Mirror of napi `PublishedRefJson` (result of `materialize-query`). `id` is the
+/// stable artifact id (the caller's `queryId` echoed back).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishedRefWire {
+    pub id: String,
+}
+
+/// Map a [`ql_session::PublishedRef`] to [`PublishedRefWire`].
+pub fn published_ref_to_wire(r: ql_session::PublishedRef) -> PublishedRefWire {
+    PublishedRefWire { id: r.id }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

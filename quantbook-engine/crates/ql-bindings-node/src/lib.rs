@@ -5097,6 +5097,32 @@ pub struct BatchResultJson {
     pub version: Buffer,
 }
 
+/// **Phase 6.5-4:** result of `writeRange` (mirrors [`ql_session::WriteRangeResult`]).
+/// `written` is the cell count; `version` is the opaque post-write version token as a
+/// `Buffer` (same semantics as `BatchResultJson.version`).
+#[napi(object)]
+pub struct WriteRangeResultJson {
+    pub written: f64,
+    pub version: Buffer,
+}
+
+/// **Phase 6.5-4:** result of `refreshSource` (mirrors [`ql_session::DirtyResult`]).
+/// `dirtied` is the number of dependent cells dirtied; `version` is the opaque
+/// post-refresh version token as a `Buffer`.
+#[napi(object)]
+pub struct DirtyResultJson {
+    pub dirtied: f64,
+    pub version: Buffer,
+}
+
+/// **Phase 6.5-4:** reference to a published/materialized artifact (mirrors
+/// [`ql_session::PublishedRef`]). `id` is the stable artifact id (the caller's
+/// `queryId` echoed back).
+#[napi(object)]
+pub struct PublishedRefJson {
+    pub id: String,
+}
+
 /// **Phase 6.3-2a (2026-05-30):** which extras a `queryRange` read includes
 /// (mirrors [`ql_session::RangeQueryOptions`]). In v1 the engine fail-loud
 /// rejects any `true` here with `not_implemented_in_v1_core` (the columnar value
@@ -6499,26 +6525,32 @@ impl Session {
     // matrix-shape rule) is deliberately NOT enforced here — it lands with the real
     // implementation in 6.4 (publish/bind) / 6.5 (SQL materialize), which defines it.
 
-    /// Reserved (§3.5): bulk-write a rectangular value matrix. Always
-    /// `[not_implemented_in_v1_core]` in v1.
+    /// Bulk-write a rectangular value matrix into `range`; dirties dependents.
+    /// Returns `{ written, version }`. `[bad_argument]` for an inverted/out-of-bounds
+    /// range, a mismatched matrix shape, or a non-finite value. `[invalid_state]` off
+    /// a Ready session.
     #[napi(js_name = "writeRange", catch_unwind)]
     pub fn write_range(
         &self,
         env: Env,
         range: CellRangeJson,
         values: Vec<Vec<CellValueJson>>,
-    ) -> Result<()> {
+    ) -> Result<WriteRangeResultJson> {
         guarded(env, "writeRange", || {
             let range = session_range_from_json("writeRange", range)?;
             let values = values
                 .into_iter()
                 .map(|row| row.into_iter().map(session_cell_value_from_json).collect())
                 .collect::<Result<Vec<Vec<_>>>>()?;
-            self.inner
+            let result = self
+                .inner
                 .lock()
                 .write_range(range, values)
-                .map(|_| ())
-                .map_err(|e| engine_error_to_napi(env, e))
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(WriteRangeResultJson {
+                written: result.written as f64,
+                version: Buffer::from(result.version.0),
+            })
         })
     }
 
@@ -6558,10 +6590,16 @@ impl Session {
         })
     }
 
-    /// Reserved (§3.5): refresh an external source by revision. `revision` is a u64
-    /// (BigInt). Always `[not_implemented_in_v1_core]` in v1.
+    /// Refresh an external source by revision; dirties dependent cells. `revision` is a
+    /// u64 (BigInt). A `revision <= last stored` is a no-op (`dirtied:0`). Returns
+    /// `{ dirtied, version }`. `[invalid_state]` off a Ready session.
     #[napi(js_name = "refreshSource", catch_unwind)]
-    pub fn refresh_source(&self, env: Env, source_id: String, revision: BigInt) -> Result<()> {
+    pub fn refresh_source(
+        &self,
+        env: Env,
+        source_id: String,
+        revision: BigInt,
+    ) -> Result<DirtyResultJson> {
         guarded(env, "refreshSource", || {
             let (sign_bit, revision, lossless) = revision.get_u64();
             if sign_bit {
@@ -6574,16 +6612,23 @@ impl Session {
                     "refreshSource: revision exceeds u64::MAX (lossy conversion rejected)".into(),
                 ));
             }
-            self.inner
+            let result = self
+                .inner
                 .lock()
                 .refresh_source(&source_id, revision)
-                .map(|_| ())
-                .map_err(|e| engine_error_to_napi(env, e))
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(DirtyResultJson {
+                dirtied: result.dirtied as f64,
+                version: Buffer::from(result.version.0),
+            })
         })
     }
 
-    /// Reserved (§3.5; SQL): materialize a query result into a target. `data` is a
-    /// JSON string. Always `[not_implemented_in_v1_core]` in v1.
+    /// Materialize a SQL query result into `target`. `data` is a JSON string (e.g.
+    /// `{"sql":"SELECT ..."}`) — the napi `serde-json` feature is off, so it crosses as
+    /// opaque text and the engine parses it. Returns `{ id: queryId }`. `[bad_argument]`
+    /// for an inverted/out-of-bounds target, a result that does not fit, DDL/DML/
+    /// statements, or malformed JSON text. `[invalid_state]` off a Ready session.
     #[napi(js_name = "materializeQuery", catch_unwind)]
     pub fn materialize_query(
         &self,
@@ -6591,15 +6636,16 @@ impl Session {
         query_id: String,
         target: CellRangeJson,
         data: String,
-    ) -> Result<()> {
+    ) -> Result<PublishedRefJson> {
         guarded(env, "materializeQuery", || {
             let target = session_range_from_json("materializeQuery", target)?;
             let data = parse_reserved_json_payload("materializeQuery", &data)?;
-            self.inner
+            let result = self
+                .inner
                 .lock()
                 .materialize_query(&query_id, target, data)
-                .map(|_| ())
-                .map_err(|e| engine_error_to_napi(env, e))
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(PublishedRefJson { id: result.id })
         })
     }
 

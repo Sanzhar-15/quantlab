@@ -237,6 +237,25 @@ def run(qb) -> list:
         kinds=sorted({e["kind"] for e in page["events"]}),
     )
 
+    # --- write_range (§3.5; 6.5-0 substrate): bulk-write a 1x2 range ---
+    wr = s.write_range(
+        {"sheet": sh, "startRow": 20, "startCol": 0, "endRow": 20, "endCol": 1},
+        [[{"kind": "number", "number": 10.0}, {"kind": "number", "number": 20.0}]],
+    )
+    rec("write_range", written=wr["written"])
+
+    # --- materialize_query (§3.5; 6.5-1 substrate): SELECT 1 -> cell (sh, 20, 2) ---
+    mq = s.materialize_query(
+        "q1",
+        {"sheet": sh, "startRow": 20, "startCol": 2, "endRow": 20, "endCol": 2},
+        '{"sql":"SELECT 1 AS a"}',
+    )
+    rec("materialize_query", id=mq["id"])
+
+    # --- refresh_source (§3.5): re-run q1 at revision 1; no formula dependents -> dirtied=0 ---
+    rs = s.refresh_source("q1", 1)
+    rec("refresh_source", dirtied=rs["dirtied"])
+
     # --- deliberate panic on a SEPARATE session: surfaces, does NOT abort ---
     p = Session()
     fn = getattr(p, "__force_panic_for_test", None) or getattr(p, "_Session__force_panic_for_test", None)

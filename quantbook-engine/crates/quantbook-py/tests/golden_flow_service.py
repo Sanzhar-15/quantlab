@@ -288,6 +288,37 @@ def run(c: Client) -> list:
         kinds=sorted({e["kind"] for e in page["events"]}),
     )
 
+    # --- write_range (§3.5; 6.5-0 substrate): bulk-write a 1x2 range ---
+    wr = c.call(
+        "POST",
+        f"{base}/write-range",
+        {
+            "range": {"sheet": sh, "startRow": 20, "startCol": 0, "endRow": 20, "endCol": 1},
+            "values": [[{"kind": "number", "number": 10}, {"kind": "number", "number": 20}]],
+        },
+    )[1]
+    rec("write_range", written=wr["written"])
+
+    # --- materialize_query (§3.5; 6.5-1 substrate): SELECT 1 -> cell (sh, 20, 2) ---
+    mq = c.call(
+        "POST",
+        f"{base}/materialize-query",
+        {
+            "queryId": "q1",
+            "target": {"sheet": sh, "startRow": 20, "startCol": 2, "endRow": 20, "endCol": 2},
+            "data": '{"sql":"SELECT 1 AS a"}',
+        },
+    )[1]
+    rec("materialize_query", id=mq["id"])
+
+    # --- refresh_source (§3.5): re-run q1 at revision 1; no formula dependents -> dirtied=0 ---
+    rs = c.call(
+        "POST",
+        f"{base}/refresh-source",
+        {"sourceId": "q1", "revision": "1"},
+    )[1]
+    rec("refresh_source", dirtied=rs["dirtied"])
+
     # --- deliberate panic on a SEPARATE session: surfaces, does NOT abort ---
     stp, bp = c.call("POST", "/v1/sessions")
     psid = bp["sessionId"]

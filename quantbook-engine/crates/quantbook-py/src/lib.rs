@@ -58,7 +58,7 @@ create_exception!(
     QuantbookError,
     PyException,
     "Structured Quantbook engine error.\n\n\
-     Carries the contract-§5.1 fields as instance attributes: `code` (stable\n\
+     Carries the contract section-5.1 fields as instance attributes: `code` (stable\n\
      machine-matchable string), `class` (coarse category), `retryable` (bool),\n\
      `details` (a JSON string, present only when non-empty), and `source`\n\
      (present only when the engine attached a cause). Mirrors the native error\n\
@@ -228,6 +228,19 @@ fn session_addr(py: Python<'_>, method: &str, sheet: f64, row: f64, col: f64) ->
         sheet: validate_u16_index(py, method, "sheet", sheet)?,
         row: validate_u32_index(py, method, "row", row)?,
         col: validate_u32_index(py, method, "col", col)?,
+    })
+}
+
+/// Build a validated [`ql_session::CellRange`] from a Python dict
+/// (`{sheet, startRow, startCol, endRow, endCol}`; camelCase keys matching
+/// the napi `CellRangeJson`). The pyo3 twin of `session_range_from_json`.
+fn session_range(py: Python<'_>, method: &str, d: &Bound<'_, PyDict>) -> PyResult<ql_session::CellRange> {
+    Ok(ql_session::CellRange {
+        sheet: validate_u16_index(py, method, "sheet", req_f64(py, d, "sheet", method)?)?,
+        start_row: validate_u32_index(py, method, "startRow", req_f64(py, d, "startRow", method)?)?,
+        start_col: validate_u32_index(py, method, "startCol", req_f64(py, d, "startCol", method)?)?,
+        end_row: validate_u32_index(py, method, "endRow", req_f64(py, d, "endRow", method)?)?,
+        end_col: validate_u32_index(py, method, "endCol", req_f64(py, d, "endCol", method)?)?,
     })
 }
 
@@ -1077,6 +1090,87 @@ impl Session {
     fn save(&self, py: Python<'_>, path: String) -> PyResult<()> {
         guarded(py, "save", || {
             self.inner.lock().save(&path).map_err(|e| engine_error_to_pyerr(py, &e))
+        })
+    }
+
+    /// Bulk-write a rectangular value matrix into `range`; dirties dependents. `range`
+    /// is a dict `{sheet, startRow, startCol, endRow, endCol}` (same camelCase as the
+    /// napi `CellRangeJson`). `values` is a list-of-rows (row-major); each cell is a
+    /// value-dict (`{kind, number?|boolean?|text?}`). Returns `{written, version}`.
+    fn write_range(
+        &self,
+        py: Python<'_>,
+        range: Bound<'_, PyDict>,
+        values: Vec<Vec<Bound<'_, PyAny>>>,
+    ) -> PyResult<Py<PyDict>> {
+        guarded(py, "writeRange", || {
+            let range = session_range(py, "writeRange", &range)?;
+            let values: Vec<Vec<ql_session::CellValue>> = values
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| cell_value_from_py(py, &v))
+                        .collect::<PyResult<Vec<_>>>()
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            let result = self
+                .inner
+                .lock()
+                .write_range(range, values)
+                .map_err(|e| engine_error_to_pyerr(py, &e))?;
+            let d = PyDict::new(py);
+            d.set_item("written", result.written)?;
+            d.set_item("version", PyBytes::new(py, &result.version.0))?;
+            Ok(d.unbind())
+        })
+    }
+
+    /// Refresh an external source by revision; dirties dependent cells. `revision` is
+    /// a non-negative int (mirrors the napi `BigInt`). A `revision <= last stored` is a
+    /// no-op (`dirtied: 0`). Returns `{dirtied, version}`.
+    fn refresh_source(
+        &self,
+        py: Python<'_>,
+        source_id: String,
+        revision: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyDict>> {
+        guarded(py, "refreshSource", || {
+            let revision = u64_from_pyany(py, "refreshSource", "revision", &revision)?;
+            let result = self
+                .inner
+                .lock()
+                .refresh_source(&source_id, revision)
+                .map_err(|e| engine_error_to_pyerr(py, &e))?;
+            let d = PyDict::new(py);
+            d.set_item("dirtied", result.dirtied)?;
+            d.set_item("version", PyBytes::new(py, &result.version.0))?;
+            Ok(d.unbind())
+        })
+    }
+
+    /// Materialize a SQL query into `target`. `target` is a range-dict
+    /// `{sheet, startRow, startCol, endRow, endCol}`; `data` is a JSON string (e.g.
+    /// `'{"sql":"SELECT ..."}'`). Returns `{id}` (the caller's `query_id` echoed back).
+    fn materialize_query(
+        &self,
+        py: Python<'_>,
+        query_id: String,
+        target: Bound<'_, PyDict>,
+        data: String,
+    ) -> PyResult<Py<PyDict>> {
+        guarded(py, "materializeQuery", || {
+            let target = session_range(py, "materializeQuery", &target)?;
+            let data: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
+                bad_argument(py, format!("materializeQuery: data must be valid JSON text ({e})"))
+            })?;
+            let result = self
+                .inner
+                .lock()
+                .materialize_query(&query_id, target, data)
+                .map_err(|e| engine_error_to_pyerr(py, &e))?;
+            let d = PyDict::new(py);
+            d.set_item("id", result.id)?;
+            Ok(d.unbind())
         })
     }
 
