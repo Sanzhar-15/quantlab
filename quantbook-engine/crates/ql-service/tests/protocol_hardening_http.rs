@@ -140,6 +140,7 @@ async fn body_size_cap_returns_413() {
     let addr = spawn(ServiceConfig {
         max_json_body_bytes: 512,
         max_blob_body_bytes: 256,
+        ..ServiceConfig::default()
     })
     .await;
 
@@ -295,6 +296,7 @@ async fn body_cap_binds_bodyless_routes_via_content_length() {
     let addr = spawn(ServiceConfig {
         max_json_body_bytes: 512,
         max_blob_body_bytes: 256,
+        ..ServiceConfig::default()
     })
     .await;
     let (_st, _h, b) = http(addr, "POST", "/v1/sessions", None, &[]).await;

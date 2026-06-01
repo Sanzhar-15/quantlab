@@ -78,6 +78,7 @@ use serde::Serialize;
 use ql_exec::WorkbookSession;
 use ql_session::{EngineError, EngineSession, ErrorClass, LifecycleState, SCHEMA_VERSION};
 
+use crate::auth::AuthReject;
 use crate::error::engine_error_to_problem;
 use crate::guarded::guarded;
 use crate::session_store::SessionStore;
@@ -133,7 +134,9 @@ pub(crate) async fn handle(
     cfg: ServiceConfig,
 ) -> Resp {
     let (parts, body) = req.into_parts();
-    let method = parts.method;
+    // Clone (not move) the method so `parts` stays whole for the 6.2-3b auth gate
+    // (`cfg.auth.authorize(&parts)` below) -- `Method` is cheap to clone.
+    let method = parts.method.clone();
     let path = parts.uri.path().to_owned();
     let query = parts.uri.query().map(str::to_owned);
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -142,6 +145,13 @@ pub(crate) async fn handle(
     // front; the echo header (added to every response below) advertises ours.
     if let Some(err) = schema_version_check(&parts.headers) {
         return with_schema_header(problem(&err));
+    }
+    // 6.2-3b: authorization gate. Runs after the (cheap) schema check and BEFORE any
+    // route dispatch or body read, so an unauthorized client cannot probe routes or
+    // submit a body. The 401/403 still echoes x-ql-schema-version and closes the
+    // connection (do not keep-alive an unauthorized socket).
+    if let Err(reject) = cfg.auth.authorize(&parts) {
+        return with_schema_header(with_close(auth_reject_response(reject)));
     }
     // 6.2-3a: cap the request body (DoS) -- the blob limit for the raw `import`
     // path, the JSON limit otherwise; GET routes wrap-and-drop harmlessly.
@@ -269,18 +279,14 @@ pub(crate) async fn handle(
 // ---- handlers ----
 
 fn create_session(store: &SessionStore) -> Resp {
-    // Construct under the panic boundary too (every engine call is guarded): a
-    // panic in `WorkbookSession::new()` surfaces as a `[panic]`/500 problem+json,
-    // not an unwound connection task. The session is only registered on success.
+    // Construct AND register under the panic boundary (every engine call is guarded):
+    // a panic in `WorkbookSession::new()` OR in the CSPRNG id generation (6.2-3b)
+    // surfaces as a `[panic]`/500 problem+json, not an unwound connection task. The
+    // session is only registered on a successful construction.
     match guarded("createSession", || {
-        Ok::<WorkbookSession, EngineError>(WorkbookSession::new())
+        Ok::<String, EngineError>(store.register(WorkbookSession::new()))
     }) {
-        Ok(session) => json(
-            StatusCode::CREATED,
-            &NewSessionResponse {
-                session_id: store.register(session),
-            },
-        ),
+        Ok(session_id) => json(StatusCode::CREATED, &NewSessionResponse { session_id }),
         Err(e) => problem(&e),
     }
 }
@@ -1266,6 +1272,23 @@ fn fallback(method: &http::Method, segs: &[&str], path: &str) -> Resp {
 /// derive from an engine [`ErrorClass`]. 405 method-not-allowed and 413 payload-
 /// too-large are HTTP-layer concerns the frozen engine taxonomy does not model;
 /// the body keeps the same shape with `class = "protocol"`.
+/// Map an [`AuthReject`] (6.2-3b) to a transport `problem+json`: 401 `unauthorized`
+/// (with a `WWW-Authenticate: Bearer` challenge per RFC 7235) or 403 `forbidden`.
+fn auth_reject_response(reject: AuthReject) -> Resp {
+    match reject {
+        AuthReject::Unauthorized { message } => {
+            let mut resp =
+                transport_problem(StatusCode::UNAUTHORIZED, "unauthorized", message, None);
+            resp.headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            resp
+        }
+        AuthReject::Forbidden { message } => {
+            transport_problem(StatusCode::FORBIDDEN, "forbidden", message, None)
+        }
+    }
+}
+
 fn transport_problem(status: StatusCode, code: &str, message: String, allow: Option<&str>) -> Resp {
     let body = crate::error::ProblemJson {
         code: code.to_string(),

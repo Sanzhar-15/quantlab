@@ -42,6 +42,8 @@ parking_lot = "=0.12.5"
 # backs the long-lived `text/event-stream` body (http_body_util::StreamBody). Already
 # a workspace pin (ql-collab-ws); wired into this member here.
 futures-util = { workspace = true }
+# 6.2-3b: getrandom::fill for unguessable session ids (16 CSPRNG bytes -> hex).
+getrandom = { workspace = true }
 
 [dev-dependencies]
 # The golden-flow integration test drives the running service over real HTTP

@@ -24,33 +24,39 @@
 //! op-id `cancel`/`operationStatus`, `pollEvents`, and the SVC-6-02 long-lived
 //! `text/event-stream` events endpoint forwarding the engine event ring); 6.2-3a
 //! (request-path hardening: a request-body size cap on both the JSON and raw-blob
-//! paths, `schemaVersion` echo + mismatch rejection, and RFC-correct 405 + `Allow`).
-//! Remaining: auth hooks + unguessable session ids + idle-TTL reaping (6.2-3b);
-//! the golden-parity third row (6.2-4).
+//! paths, `schemaVersion` echo + mismatch rejection, and RFC-correct 405 + `Allow`);
+//! 6.2-3b (identity/lifecycle: a pluggable auth hook -- default no-op + a bearer-token
+//! stub -- unguessable CSPRNG session ids, and idle-TTL session reaping via a
+//! background task). Remaining: the golden-parity third row (6.2-4).
 //!
 //! Transport: HTTP/1.1 on `hyper` 1.x (`http1::Builder::serve_connection`), one
 //! tokio task per connection, `hyper_util::rt::TokioIo` adapting the tokio
 //! `TcpStream`. The version prefix is `/v1` (SVC-6-04).
 
+use std::fmt;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+pub mod auth;
 pub mod error;
 pub mod guarded;
 mod router;
 pub mod session_store;
 pub mod wire;
 
+pub use auth::{AuthReject, Authorizer, BearerToken, NoAuth};
 pub use session_store::SessionStore;
 
 /// Service-level configuration (transport hardening knobs). Cheap to `Clone` --
 /// one is cloned into every connection task. 6.2-3a carries the request-body size
 /// caps; 6.2-3b will extend it with the auth hook + idle-TTL.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServiceConfig {
     /// Max bytes accepted for a JSON request body (every endpoint except `import`).
     /// Over-limit -> `413 payload_too_large` (No-Fallbacks: a loud cap, never a
@@ -58,6 +64,17 @@ pub struct ServiceConfig {
     pub max_json_body_bytes: usize,
     /// Max bytes accepted for the raw `import` blob body (`.qbook`/xlsx/csv).
     pub max_blob_body_bytes: usize,
+    /// 6.2-3b: per-request authorization gate. Default [`NoAuth`] (open localhost --
+    /// the documented v1 posture); a [`BearerToken`] gates on a shared secret.
+    pub auth: Arc<dyn Authorizer>,
+    /// 6.2-3b: idle-session TTL. `Some(ttl)` spawns a background reaper in
+    /// [`serve_with_config`] that evicts sessions idle longer than `ttl` (an in-use
+    /// session -- one with an in-flight request, or an SSE stream mid-poll -- is never
+    /// reaped); `None` (default) disables reaping (sessions live until `DELETE` or
+    /// process exit). Set `ttl` in seconds, comfortably above the internal SSE poll
+    /// interval (~250ms), so an idle-but-streaming session stays warm between polls;
+    /// sub-second TTLs are not a supported configuration.
+    pub idle_ttl: Option<Duration>,
 }
 
 impl Default for ServiceConfig {
@@ -65,7 +82,22 @@ impl Default for ServiceConfig {
         Self {
             max_json_body_bytes: 16 * 1024 * 1024,
             max_blob_body_bytes: 512 * 1024 * 1024,
+            auth: Arc::new(NoAuth),
+            idle_ttl: None,
         }
+    }
+}
+
+// Manual `Debug` (the `Arc<dyn Authorizer>` field is not `Debug`). The authorizer is
+// rendered opaquely -- NEVER print a bearer secret into logs.
+impl fmt::Debug for ServiceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceConfig")
+            .field("max_json_body_bytes", &self.max_json_body_bytes)
+            .field("max_blob_body_bytes", &self.max_blob_body_bytes)
+            .field("auth", &"<authorizer>")
+            .field("idle_ttl", &self.idle_ttl)
+            .finish()
     }
 }
 
@@ -87,6 +119,27 @@ pub async fn serve_with_config(
     store: SessionStore,
     cfg: ServiceConfig,
 ) -> std::io::Result<()> {
+    // 6.2-3b: spawn the idle-session reaper when an idle-TTL is configured. It sweeps
+    // on an interval (ttl/2, clamped) and lives for the process; with no TTL (the
+    // default) NO task is spawned -- back-compat + determinism for the existing tests.
+    if let Some(ttl) = cfg.idle_ttl {
+        let weak = store.downgrade();
+        let interval = reaper_interval(ttl);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                // A Weak handle: once the serving task drops its `SessionStore`,
+                // `upgrade` returns None and the reaper ends -- it never keeps sessions
+                // alive past the service's lifetime (audit LOW).
+                match weak.upgrade() {
+                    Some(store) => {
+                        store.reap_idle(ttl);
+                    }
+                    None => break,
+                }
+            }
+        });
+    }
     loop {
         let (stream, _peer) = listener.accept().await?;
         let io = TokioIo::new(stream);
@@ -103,6 +156,12 @@ pub async fn serve_with_config(
             }
         });
     }
+}
+
+/// The reaper sweep interval for a given idle-TTL: `ttl/2` clamped to [50ms, 30s] --
+/// frequent enough to evict promptly (and be observable in tests) without busy-looping.
+fn reaper_interval(ttl: Duration) -> Duration {
+    (ttl / 2).clamp(Duration::from_millis(50), Duration::from_secs(30))
 }
 
 /// Bind `addr` and [`serve_with_config`] on it (the binary entry point). Returns
