@@ -795,7 +795,8 @@ This session counted **2 plan-implement-audit cycles** (V3.6.0.6 D5 ship + V3.6.
    Implement `ql-sql` and `ql-connectors`: SQL over sheets/tables, external refresh, credentials boundary, Arrow interop, and explicit dependency invalidation.  
    References: `.references/formualizer/crates/formualizer-workbook/src/backends/csv.rs`; `.references/formualizer/crates/formualizer-workbook/tests/csv_backend.rs`; workspace pins for DuckDB/DataFusion/Polars are not hot-path engine approvals.  
    Acceptance: SQL-6-01 query table/sheet; SQL-6-02 materialize result to sheet; SQL-6-03 refresh dirties dependents; CONN-6-01 CSV/local connector; CONN-6-02 errors visible.  
-   Effort: 1-2 weeks.
+   Effort: 1-2 weeks.  
+   **STARTED 2026-06-01.** Decisions locked (see `docs/phase6/6-5-entry-plan.md`): SQL engine = **DataFusion** (arrow-58 match, off-hot-path); v1 connectors = **CSV + Parquet** local files behind a credentials-aware `DataSource` trait (DuckDB-attach/Postgres deferred to v1.5); refresh = **full provenance reverse-index**. **6.5-0 SHIPPED** = `write_range` bulk-write substrate (validate rectangle → lower to per-cell `SetValue` → apply via `batch`: one `Op::BatchCommit`/undo unit, one version bump, dirties dependents). NEXT = 6.5-1 (`ql-sql` + `materialize_query`).
 
 6. **6.6 AI() Real Backend (`ql-ai`)**  
    Replace sentinel with real provider boundary, prompt/value marshalling, cancellation, caching policy, provenance, and no-secret-leak defaults.  

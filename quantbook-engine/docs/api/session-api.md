@@ -243,7 +243,7 @@ product-specific APIs (the #1 risk). Dirtying + provenance behavior is part of t
 
 | Command | Tier | Purpose / dirtying |
 |---------|------|--------------------|
-| `write_range(range, values, options) -> WriteRangeResult` | reserved (6.4/6.5) | Bulk write a rectangular value matrix / Arrow batch; dirties dependents of the written range |
+| `write_range(range, values) -> WriteRangeResult` | **v1 ✅ (6.5-0)** | Bulk write a rectangular `Vec<Vec<CellValue>>` matrix; dirties dependents of the written range. **6.5-0:** validates the rectangle (inverted-range / out-of-grid / `1<<20`-cell cap / exact shape, all loud `bad_argument` pre-mutation), then lowers to one `SetValue` op per cell and applies via `batch` — so the whole write is ONE `Op::BatchCommit` (one undo unit; `undo` reverts the entire range) and the version token advances exactly once. `Blank` clears a cell. Returns `WriteRangeResult { written, version }`. (`options` deferred; Arrow-batch input form is a later increment.) |
 | `publish_dataset(name, data, target, provenance) -> PublishedRef` | reserved (6.4) | `qb.publish()` — materialize a DataFrame/table into a sheet/table; dirties dependents; carries provenance (§9) |
 | `bind_range(binding_id, target, schema, options) -> BoundRange` | reserved (6.4) | `qb.bind()` — overlay a `BoundFrame` onto a range/table; overlay edits dirty bound-range formulas |
 | `refresh_source(source_id, revision) -> DirtyResult` | reserved (6.5) | external source refresh; dirties dependents by **source revision** |
