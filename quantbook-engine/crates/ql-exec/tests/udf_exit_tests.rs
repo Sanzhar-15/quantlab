@@ -4,9 +4,9 @@
 //! codec, 6.4-3b real worker, 6.4-3c eval dispatch, 6.4-3d blockers and
 //! diagnostics). The production code shipped across those increments; this proves it
 //! against the contract's eight exit tests, each test below labeled with its
-//! §10.4 number. Of the eight, this suite proves SEVEN as positive exits (1, 2,
-//! 3, 4, 6, 7, 8) and guards the remaining ONE (5) as a reserved-capability
-//! tripwire — see the note below. It is a **public-API integration test** (parallel to
+//! §10.4 number. With ENG-FUSION shipping `publish_dataset` (4) and `bind_range`
+//! (5), this suite now proves ALL EIGHT as positive exits. It is a **public-API
+//! integration test** (parallel to
 //! `udf_e2e.rs`) — it touches `WorkbookSession` only through `EngineSession` +
 //! the inherent `set_udf_worker`, so it doubles as a no-private-access contract
 //! check.
@@ -22,18 +22,11 @@
 //!   (8) registering a UDF dirties formulas that referenced its (previously-
 //!       unknown) name.
 //!
-//! **Test 4 (`publish_dataset`) is now a positive exit** — ENG-FUSION shipped
-//! the producer, so test 4 asserts the publish->dirty->recompute path directly.
-//! **Test 5 still targets a reserved-tier producer (`bind_range`) that is
-//! `not_implemented_in_v1_core` today** (session-api.md §11 reserved row;
-//! `WorkbookSession` returns `not_implemented`). It is NOT silently skipped: the
-//! test asserts the not-implemented status and documents the deferral, so the
-//! moment `bind_range` is wired without its dirty path, the documented
-//! expectation is right here to update. The reactivity-dirty mechanics it would
-//! exercise are themselves covered: dependent fanout by tests (1)/(4)/(8), and
-//! the `mark_volatiles_dirty` volatile re-eval by test (3) (its
-//! fanout-to-dependents is proven separately by
-//! `session.rs::mark_volatiles_dirty_fans_out_to_dependents_of_volatile_udf`).
+//! **Tests 4 (`publish_dataset`) and 5 (`bind_range`) are now positive exits** —
+//! ENG-FUSION shipped both producers. Test 4 asserts the publish->dirty->recompute
+//! path; test 5 asserts a `BoundFrame` overlay edit (a write into the bound range)
+//! dirties bound-range formulas. The volatile-UDF re-eval mechanics of test (3) are
+//! additionally proven by `session.rs::mark_volatiles_dirty_fans_out_to_dependents_of_volatile_udf`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -296,17 +289,16 @@ fn exit_test_4_publish_dirties_dependents() {
 }
 
 // ---------------------------------------------------------------------------
-// §10.4 (5) — BoundFrame overlay edit dirties  [DEFERRED — reserved-tier]
+// §10.4 (5) — BoundFrame overlay edit dirties bound-range formulas
 // ---------------------------------------------------------------------------
 
-/// `bind_range` (the `BoundFrame` overlay producer) is reserved-tier
-/// (session-api.md §11), today `not_implemented_in_v1_core`. Same posture as
-/// exit test 4: assert the not-implemented status and document that, when
-/// `bind_range` lands, a `BoundFrame` overlay edit MUST dirty formulas over the
-/// bound range (the overlay-dirty mechanics generalize the cell-dep fanout that
-/// tests 1/8 prove).
+/// `bind_range` (ENG-FUSION) registers a `BoundFrame` overlay region; a v1
+/// overlay edit is a write into that region (via the `write_range` substrate), so
+/// a formula referencing a bound cell is dirtied and recomputes on `recalc_dirty`.
+/// This asserts the binding is registered AND that an edit within the bound range
+/// dirties bound-range formulas.
 #[test]
-fn exit_test_5_boundframe_overlay_edit_dirties_deferred_until_bind_range_implemented() {
+fn exit_test_5_boundframe_overlay_edit_dirties_bound_range_formulas() {
     let mut s = WorkbookSession::new();
     let sheet = s.add_sheet("S", 16384).unwrap();
     let target = CellRange {
@@ -316,13 +308,26 @@ fn exit_test_5_boundframe_overlay_edit_dirties_deferred_until_bind_range_impleme
         end_row: 0,
         end_col: 0,
     };
-    let err = s
+    let bound = s
         .bind_range("binding-1", target)
-        .expect_err("bind_range is reserved-tier (not implemented in v1 core)");
+        .expect("bind_range registers the overlay region");
+    assert_eq!(bound.binding_id, "binding-1");
     assert_eq!(
-        err.code, "not_implemented_in_v1_core",
-        "bind_range must fail loud as not-implemented until the overlay producer ships; \
-         when it ships, a BoundFrame edit MUST dirty bound-range formulas and this test asserts that"
+        s.binding("binding-1"),
+        Some(target),
+        "the bound region is recorded and resolvable by id"
+    );
+
+    // B1 = A1 * 2 references the bound cell A1.
+    s.set_formula(addr(sheet, 0, 1), "A1*2").unwrap(); // B1 = 0 (A1 blank)
+    // A BoundFrame overlay edit = a write into the bound range. It dirties B1.
+    s.write_range(target, vec![vec![CellValue::Number { number: 21.0 }]])
+        .unwrap();
+    s.recalc_dirty().unwrap();
+    assert_eq!(
+        cell_value(&s, addr(sheet, 0, 1)),
+        CellValue::Number { number: 42.0 },
+        "an overlay edit within the bound range must dirty + recompute bound-range formulas"
     );
 }
 

@@ -413,6 +413,13 @@ pub struct WorkbookSession {
     /// (cells a source no longer produces after a shrinking result) are evicted by
     /// `refresh_source`.
     cell_provenance: HashMap<CellAddr, CellProvenance>,
+    /// **ENG-FUSION:** `binding_id → CellRange` registry for `bind_range` (the
+    /// `BoundFrame` overlay region). Unlike the provenance maps (data-derived, so
+    /// cleared on undo/redo), a binding is a region POINTER independent of cell
+    /// content, so it is KEPT across undo/redo. Round-trip reads of a bound range go
+    /// through the existing `query_range`/snapshot path; re-binding an id overwrites
+    /// after validation (No-Fallbacks, never a silent default).
+    bindings: HashMap<String, CellRange>,
 }
 
 impl WorkbookSession {
@@ -491,6 +498,7 @@ impl WorkbookSession {
             udf_op_budget: crate::scalar::UDF_OP_BUDGET,
             provenance: HashMap::new(),
             cell_provenance: HashMap::new(),
+            bindings: HashMap::new(),
         }
     }
 
@@ -3352,8 +3360,28 @@ impl EngineSession for WorkbookSession {
         })
     }
 
-    fn bind_range(&mut self, _binding_id: &str, _target: CellRange) -> EngineResult<BoundRange> {
-        Err(not_implemented("bind_range"))
+    /// **ENG-FUSION:** register `binding_id -> target` as a `BoundFrame` overlay
+    /// region. `target` is validated like `write_range` (live sheet, not inverted, both
+    /// corners in the addressable grid — loud `bad_argument`/`sheet_not_found`, never a
+    /// silent default). Round-trip reads of the bound range use the existing
+    /// `query_range`/snapshot path; this call only records the region so the FE / kernel
+    /// can address it by id. Re-binding an existing id overwrites it (after validation).
+    /// The binding is session-local and KEPT across undo/redo (a region pointer, not
+    /// data). Returns `BoundRange { binding_id }`.
+    fn bind_range(&mut self, binding_id: &str, target: CellRange) -> EngineResult<BoundRange> {
+        self.ensure_ready()?;
+        self.require_live_sheet(target.sheet, "bind_range")?;
+        if target.end_row < target.start_row || target.end_col < target.start_col {
+            return Err(EngineError::bad_argument(
+                "bind_range: target range end coordinate is before its start",
+            ));
+        }
+        Self::require_in_bounds(target.start_row, target.start_col, "bind_range")?;
+        Self::require_in_bounds(target.end_row, target.end_col, "bind_range")?;
+        self.bindings.insert(binding_id.to_string(), target);
+        Ok(BoundRange {
+            binding_id: binding_id.to_string(),
+        })
     }
 
     /// **6.5-2:** revision-gated source refresh. Re-runs the producer (via the
@@ -3567,6 +3595,13 @@ impl EngineSession for WorkbookSession {
 }
 
 impl WorkbookSession {
+    /// **ENG-FUSION:** the `CellRange` a `binding_id` is bound to, if any — the read
+    /// accessor for the `bind_range` registry (used by tests and the FE/kernel to
+    /// resolve a `BoundFrame`'s region for round-trip reads).
+    pub fn binding(&self, binding_id: &str) -> Option<CellRange> {
+        self.bindings.get(binding_id).copied()
+    }
+
     /// **ENG-FUSION (extracted from `materialize_query`, 6.5-2 logic):** record the
     /// dual-index provenance for a freshly produced block under `source_id`, and evict
     /// the per-cell entries this source produced before but no longer produces (target
@@ -4579,21 +4614,17 @@ mod tests {
     #[test]
     fn deferred_methods_surface_capability_error() {
         let mut s = WorkbookSession::new();
-        // `begin_transaction` inc.2c-5; `undo`/`redo` inc.2c-6; `open`/`save`
-        // inc.2c-9; xlsx `import` inc.2c-10; csv `import`/`export` inc.2c-11;
-        // xlsx `export` inc.2c-12 (real behind `xlsx-write`); `register_function`
-        // / `unregister_function` / `list_functions` 6.4-2 — all no longer
-        // unconditional Capability errors. The remaining always-deferred
-        // methods still surface the honest Capability error: the reserved bulk
-        // ops (`publish_dataset` / `bind_range` / `refresh_source` /
-        // `materialize_query`). (`export("xlsx")` is covered separately, gated on
-        // the `xlsx-write` feature.)
-        //
-        // **6.4-2 (2026-05-28):** swapped `list_functions` for `bind_range` —
-        // the former became real in 6.4-2; the latter stays deferred to 6.4-3.
-        // **6.5-0:** `write_range` is now REAL (the bulk-write substrate) — it is
-        // no longer in the deferred set; its behavior is covered by the
-        // `write_range_*` tests below.
+        // History: `begin_transaction` inc.2c-5; `undo`/`redo` inc.2c-6;
+        // `open`/`save` inc.2c-9; xlsx/csv `import`/`export` inc.2c-10/11/12;
+        // `register`/`unregister`/`list_functions` 6.4-2; and the reserved bulk ops
+        // `write_range` (6.5-0), `materialize_query` (6.5-1), `refresh_source`
+        // (6.5-2), `publish_dataset` + `bind_range` (ENG-FUSION) are ALL real now.
+        // The remaining honest Capability surface is `query_range` asked for column
+        // extras the v1 columnar shape does not serve (formulas / formats /
+        // rendered) — fail loud, never a silently narrower result. The option check
+        // runs before sheet lookup, so a fresh session (no sheet, nothing to undo)
+        // still surfaces it. (`export("xlsx")` without the `xlsx-write` feature is
+        // covered separately.)
         let dummy_range = CellRange {
             sheet: 0,
             start_row: 0,
@@ -4601,7 +4632,15 @@ mod tests {
             end_row: 0,
             end_col: 0,
         };
-        let err = s.bind_range("ignored", dummy_range).unwrap_err();
+        let err = s
+            .query_range(
+                dummy_range,
+                RangeQueryOptions {
+                    include_formulas: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
         assert_eq!(err.class, ErrorClass::Capability);
         assert_eq!(err.code, "not_implemented_in_v1_core");
         // A fresh session has nothing to undo/redo (but the methods are real now).
@@ -5901,6 +5940,91 @@ mod tests {
                 rng(sheet, 0, 0, 0, 0),
             )
             .unwrap_err();
+        assert_eq!(closed.code, "invalid_state");
+    }
+
+    // --- ENG-FUSION: bind_range ---
+
+    /// bind_range registers binding_id -> target (resolvable via `binding`), and a
+    /// write into the bound region round-trips through the normal read path.
+    #[test]
+    fn bind_range_registers_and_round_trips() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let target = rng(sheet, 0, 0, 1, 0); // A1:A2
+        let b = s.bind_range("b1", target).unwrap();
+        assert_eq!(b.binding_id, "b1");
+        assert_eq!(s.binding("b1"), Some(target));
+        // Round-trip: a write into the bound region reads back via the normal path.
+        s.write_range(target, vec![vec![num(10.0)], vec![num(20.0)]])
+            .unwrap();
+        assert_eq!(cell_value(&s, addr(sheet, 0, 0)), num(10.0));
+        assert_eq!(cell_value(&s, addr(sheet, 1, 0)), num(20.0));
+    }
+
+    /// Re-binding an existing id overwrites the region (after validation).
+    #[test]
+    fn bind_range_rebind_overwrites() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let a = rng(sheet, 0, 0, 0, 0);
+        let b = rng(sheet, 1, 1, 2, 2);
+        s.bind_range("x", a).unwrap();
+        s.bind_range("x", b).unwrap();
+        assert_eq!(s.binding("x"), Some(b), "re-binding overwrites the region");
+    }
+
+    /// An inverted target is a loud bad_argument and records no binding.
+    #[test]
+    fn bind_range_inverted_is_bad_argument() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let err = s.bind_range("b", rng(sheet, 2, 0, 0, 0)).unwrap_err(); // end < start
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert!(
+            s.binding("b").is_none(),
+            "no binding recorded on an invalid target"
+        );
+    }
+
+    /// A target outside the addressable grid is a loud bad_argument.
+    #[test]
+    fn bind_range_out_of_bounds_is_bad_argument() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let err = s
+            .bind_range("b", rng(sheet, 0, 0, 2_000_000, 0))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+    }
+
+    /// A binding is a region pointer (not data), so it survives undo/redo — unlike
+    /// the provenance maps, which are cleared on undo.
+    #[test]
+    fn bind_range_kept_across_undo() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let target = rng(sheet, 0, 0, 0, 0);
+        s.bind_range("b", target).unwrap();
+        s.set_value(addr(sheet, 0, 0), num(5.0)).unwrap();
+        assert!(s.undo().unwrap().consumed);
+        assert_eq!(
+            s.binding("b"),
+            Some(target),
+            "binding survives undo (unlike provenance)"
+        );
+    }
+
+    /// Lifecycle + target gating: unknown sheet -> sheet_not_found; closed ->
+    /// invalid_state.
+    #[test]
+    fn bind_range_gating() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let miss = s.bind_range("b", rng(99, 0, 0, 0, 0)).unwrap_err();
+        assert_eq!(miss.code, "sheet_not_found");
+        s.close().unwrap();
+        let closed = s.bind_range("b", rng(sheet, 0, 0, 0, 0)).unwrap_err();
         assert_eq!(closed.code, "invalid_state");
     }
 
