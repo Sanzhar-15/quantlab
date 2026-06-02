@@ -3279,7 +3279,9 @@ impl EngineSession for WorkbookSession {
     /// unchanged. A zero-row value writes nothing.
     ///
     /// Provenance is recorded keyed by `name` (the dual index, exactly like
-    /// `materialize_query`), so the dataset is `refresh_source`-able and attributable.
+    /// `materialize_query`) for attribution. Note a published dataset is NOT
+    /// `refresh_source`-able (its producer is external — re-publish to update;
+    /// `refresh_source` on a `Published` source is a loud `bad_argument`).
     ///
     /// **Reactive dirty-notify (the moat):** on RE-publish under the same `name`, after
     /// writing the new block this also dirties the dependents of cells the previous value
@@ -3320,9 +3322,9 @@ impl EngineSession for WorkbookSession {
 
         let n_rows = values.len();
         if n_rows == 0 {
-            // Zero-row publish: write nothing, record an (empty, refresh-able) provenance
-            // entry, but still dirty the dependents of any previously-produced cells so a
-            // shrink-to-zero reactively invalidates downstream formulas.
+            // Zero-row publish: write nothing, record an (empty) provenance entry for
+            // attribution, but still dirty the dependents of any previously-produced
+            // cells so a shrink-to-zero reactively invalidates downstream formulas.
             self.record_block_provenance(name, target, Vec::new(), data, ProducerKind::Published);
             for cell in &old_cells {
                 self.graph.on_set_value(cell.sheet, cell.row, cell.col);
@@ -5931,7 +5933,7 @@ mod tests {
     }
 
     /// A zero-row value writes nothing and leaves the target + version unchanged, but
-    /// records a refresh-able provenance entry.
+    /// records a provenance entry (for attribution).
     #[test]
     fn publish_dataset_zero_rows_writes_nothing() {
         let mut s = WorkbookSession::new();
@@ -5958,7 +5960,7 @@ mod tests {
         );
         assert!(
             s.provenance.contains_key("d"),
-            "still records a refresh-able entry"
+            "still records a provenance entry"
         );
     }
 
@@ -6006,6 +6008,12 @@ mod tests {
             "got: {}",
             err.message
         );
+        // Precedence: the Published rejection fires BEFORE the revision gate, so even a
+        // revision=0 (normally a no-op) refresh on a published id is the loud rejection,
+        // not a silent dirtied=0.
+        let err0 = s.refresh_source("ds", 0).unwrap_err();
+        assert_eq!(err0.class, ErrorClass::BadArgument);
+        assert!(err0.message.contains("published dataset"), "got: {}", err0.message);
     }
 
     /// A value-matrix exceeding the 1<<20-cell cap is a loud bad_argument BEFORE the

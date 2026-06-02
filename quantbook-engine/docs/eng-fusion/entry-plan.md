@@ -80,8 +80,14 @@ pre-refactor `materialize_query` bookkeeping; No-Fallbacks honoured end-to-end; 
 removal path (v1 = a validated server-side reservation; the FE holds the coordinates and reads via
 `query_range`) — add a resolver/unbind when the FE consumes `qb.bind()`; (2) clear-on-shrink option for
 `publish_dataset` (v1 keeps vacated values, consistent with the other producers) — v2; (3) IDE
-`types.ts` still types `publishDataset`/`bindRange` as `void` — the existing cross-repo D-H1/H2 sync item
-on `feat/visualise-v1` (now also covers publish/bind).
+`types.ts` `publishDataset`/`bindRange` `void` drift — CLOSED 2026-06-02 via FE-0a Part A (IDE
+`e233276c76d`): the 5 §3.5 methods retyped to real DTOs + `sql_error`/`sql_table_build`/`source_not_found`
+added to the union + allowlist (`tsc` clean). (4) **Unbounded identifier retention (deep-audit MED,
+pre-existing 6.5-2 class):** `record_block_provenance` clones `source_id`/`query_id` into every per-cell
+`Event::Provenance` (at the `1<<20` cap a large caller-supplied id is a per-cell multiplier), and the event
+log + `bindings` map are unbounded. Bounded in v1 by single-client-localhost + self-authored ids; intern the
+id (`Arc<str>`) + bound the event log as a v1.5/pre-multi-client hardening item (alongside the 6.7-filed
+UDF/connector resource hardening).
 
 ## Build/commit discipline (carried)
 Mac bridge (`mac zsh -lc` + explicit `cd`; `export PATH=$HOME/.cargo/bin:$PATH`); commit with node

@@ -847,8 +847,8 @@ This session counted **2 plan-implement-audit cycles** (V3.6.0.6 D5 ship + V3.6.
 FUSION-01..04 met; see `docs/eng-fusion/entry-plan.md`). The moat is now engine-unblocked for FE-1.5.
 
 **Purpose:** Unblock the product moat (a live reactive Python<->grid fusion workspace). Implement the two
-reserved section 3.5 stubs `publish_dataset` and `bind_range` (`crates/ql-exec/src/session.rs:3245/3254`,
-currently `not_implemented_in_v1_core`) plus the re-publish dirty-notify path, so a Python value can be
+reserved section 3.5 stubs `publish_dataset` and `bind_range` (which were `not_implemented_in_v1_core`
+at entry) plus the re-publish dirty-notify path, so a Python value can be
 pushed into the sheet and reactively dirty dependent cells. This is a pre-Phase-7 insertion: the
 "beyond Excel/Sheets" megaudit (2026-06-02) found the moat engine-blocked by these two stubs. The FE build
 plan v2 section ENG-FUSION is the cross-repo authority; this engine mini-phase is the half that lives here.

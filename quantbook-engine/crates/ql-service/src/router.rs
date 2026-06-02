@@ -727,14 +727,13 @@ async fn rollback_transaction(store: &SessionStore, id: &str, body: ReqBody) -> 
     })
 }
 
-// ---- 6.2-1c reserved sec-3.5 bulk handlers ----
+// ---- sec-3.5 bulk handlers (all LIVE since 6.5 / ENG-FUSION) ----
 //
-// These ALWAYS surface `not_implemented_in_v1_core` (Capability -> 501) in v1 --
-// the authoritative v1 signal. Each converts its inputs for type honesty (a bad
-// coord / cell value / enum surfaces `[bad_argument]` first, mirroring napi 6.3-2e)
-// then forwards to the engine stub, which returns Capability; the Ok arm is
-// unreachable in v1 and discarded with `.map(|_| ())`. A real impl (6.4/6.5) only
-// swaps the return type.
+// write_range (6.5-0), materialize_query (6.5-1), refresh_source (6.5-2),
+// publish_dataset + bind_range (ENG-FUSION) are all implemented and return real wire
+// DTOs. Each converts its inputs for type honesty (a bad coord / cell value / enum
+// surfaces `[bad_argument]` first, mirroring napi) then forwards to the engine and
+// maps the result to its wire form.
 
 async fn write_range(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     let b: WriteRangeBody = match read_json(body).await {

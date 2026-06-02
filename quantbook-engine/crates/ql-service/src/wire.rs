@@ -1479,7 +1479,7 @@ pub fn parse_reserved_json_payload(method: &str, data: &str) -> Result<serde_jso
     })
 }
 
-/// `write-range` body (reserved). A rectangular value matrix; always 501 in v1.
+/// `write-range` body (LIVE since 6.5-0). A rectangular value matrix; returns a WriteRangeResult wire.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WriteRangeBody {

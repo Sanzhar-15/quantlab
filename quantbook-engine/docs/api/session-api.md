@@ -860,7 +860,8 @@ does not commit a late result; (7) failed UDF → deterministic `CellDiagnostic`
 a UDF dirties formulas that referenced its (previously-unknown) name.
 
 > **✅ SHIPPED 2026-05-29 (6.4-4, engine `6b1fdb36578`; 5-way closure megaudit, 0 HIGH).** Proven in
-> `crates/ql-exec/tests/udf_exit_tests.rs` as 6 positive exits — (1) `exit_test_1_*` (scalar
+> `crates/ql-exec/tests/udf_exit_tests.rs` as all 8 positive exits (4+5 flipped by ENG-FUSION; see the
+> note after the list) — (1) `exit_test_1_*` (scalar
 > input-change recompute, invocation-counted), (2) `exit_test_2_*` (unrelated-edit no-recompute),
 > (3) `exit_test_3_*` (`mark_volatiles_dirty`+`recalc_dirty` re-eval, isolated from a plain recalc),
 > (6) `exit_test_6_*` (`Timeout`→`#TIMEOUT!` committed atomically; the process-half kill+drop-late-RETURN

@@ -4695,7 +4695,7 @@ fn transaction_id_from_bigint(
     Ok(ql_session::session::TransactionId(raw))
 }
 
-/// **Phase 6.3-2e (2026-05-30):** parse a reserved-stub `data` payload (a JSON
+/// **Phase 6.3-2e (2026-05-30):** parse a section-3.5 `data` payload (a JSON
 /// string — the napi `serde-json` feature is not enabled, so opaque JSON crosses the
 /// boundary as text, mirroring the 6.3-1c `details` convention). Invalid JSON is a
 /// loud `[bad_argument]`. Used only by the reserved `publishDataset`/`materializeQuery`
@@ -6404,11 +6404,11 @@ impl Session {
     }
 
     // ============================================================================
-    // 6.3-2e (2026-05-30) — atomic groups + reserved §2c stubs over napi.
+    // 6.3-2e (2026-05-30) — atomic groups + the §3.5 bulk methods over napi.
     //
     // Binds the already-implemented atomic-group methods (§3.4) — `batch` + the
     // multi-call transaction handle (`begin`/`txnAdd`/`commit`/`rollback`) — plus
-    // the 5 reserved §3.5 capability stubs as thin loud-Capability forwarders. The
+    // the 5 §3.5 bulk methods (all LIVE since 6.5 / ENG-FUSION; were stubs at 6.3-2e). The
     // FIFTH and final 6.3-2 sub-increment (completes 6.3-2). New DTOs: `SessionOpJson`
     // (the op union), `BatchOptionsJson`, `BatchResultJson`. Each method inherits the
     // locked 6.3-1 contract — `guarded(env,..)` + `catch_unwind`, native
