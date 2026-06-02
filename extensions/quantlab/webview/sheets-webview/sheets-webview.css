@@ -1,0 +1,102 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/*
+ * FE-0b-1 (2026-06-02) -- bundled sheets-webview styles. Ported from the inline
+ * CSS array in cellGridHtml.ts (the DOM-table look is preserved). The dormant
+ * collab `.cell-peer-presence` rule is intentionally dropped (presence is
+ * v1.5-deferred and the host no longer emits it). All colours are VS Code theme
+ * variables so the grid tracks the active theme.
+ */
+
+body {
+	font-family: var(--vscode-font-family);
+	color: var(--vscode-foreground);
+	background: var(--vscode-editor-background);
+	margin: 0;
+	padding: 16px;
+}
+
+h2 {
+	margin-top: 0;
+}
+
+table {
+	border-collapse: collapse;
+	width: auto;
+}
+
+th,
+td {
+	padding: 4px 12px;
+	border: 1px solid var(--vscode-panel-border);
+	text-align: left;
+}
+
+th {
+	background: var(--vscode-toolbar-hoverBackground);
+	font-weight: 600;
+}
+
+.meta {
+	color: var(--vscode-descriptionForeground);
+	font-size: 12px;
+	margin-bottom: 12px;
+}
+
+.empty {
+	color: var(--vscode-descriptionForeground);
+	font-style: italic;
+}
+
+.kind {
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+	margin-left: 8px;
+}
+
+.cell-value {
+	cursor: cell;
+}
+
+.cell-value.cell-edit-error {
+	border: 2px solid var(--vscode-errorForeground);
+	background: var(--vscode-inputValidation-errorBackground);
+}
+
+.cell-edit-input {
+	width: 8em;
+	font-family: var(--vscode-editor-font-family);
+	font-size: inherit;
+	color: var(--vscode-input-foreground);
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-focusBorder);
+	padding: 2px 4px;
+	box-sizing: border-box;
+}
+
+.cell-grid-viewport {
+	max-height: 80vh;
+	overflow-y: auto;
+	border: 1px solid var(--vscode-panel-border);
+}
+
+.cell-grid-viewport thead th {
+	position: sticky;
+	top: 0;
+	z-index: 1;
+}
+
+.cell-grid-spacer-top,
+.cell-grid-spacer-bottom {
+	padding: 0;
+	border: none;
+}
+
+.cell-grid-spacer-top td,
+.cell-grid-spacer-bottom td {
+	padding: 0;
+	border: none;
+}

@@ -16,6 +16,8 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "build:webviews:quantbook": "node ./esbuild-quantbook-webviews.mjs",
+    "watch:webviews:quantbook": "node ./esbuild-quantbook-webviews.mjs --watch",
     "lint": "eslint src --ext ts",
     "test": "npm run compile && node node_modules/mocha/bin/mocha.js 'out/test/qviz*.test.js' 'out/test/quantbook*.test.js' --ui tdd --timeout 10000 --require source-map-support/register --require out/test/helpers/mocha-setup.js",
     "test:all": "npm run compile && node node_modules/mocha/bin/mocha.js 'out/test/**/*.test.js' 'out/src/test/**/*.test.js' --ui tdd --timeout 10000 --require source-map-support/register --require out/test/helpers/mocha-setup.js",

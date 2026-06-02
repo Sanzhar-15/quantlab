@@ -22,6 +22,7 @@
 		"test/**/*.ts",
 		"webview/qviz/**/*.ts",
 		"webview/qviz-spec/**/*.ts",
+		"webview/sheets-webview/**/*.ts",
 		"../../src/vscode-dts/vscode.d.ts"
 	],
 	"exclude": []

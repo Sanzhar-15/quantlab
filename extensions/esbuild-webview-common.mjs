@@ -85,6 +85,13 @@ export async function run(config, args, didBuild) {
 		const watcher = await import('@vscode/watcher');
 		watcher.subscribe(config.srcDir, () => tryBuild(resolvedOptions, didBuild));
 	} else {
-		return build(resolvedOptions, didBuild).catch(() => process.exit(1));
+		return build(resolvedOptions, didBuild).catch(err => {
+			// No-Fallbacks: surface WHY the build failed before exiting. The prior
+			// `.catch(() => process.exit(1))` swallowed the esbuild error, so a syntax
+			// error / wrong-platform native binary exited 1 with NO message -- the
+			// caller saw a bare failure and could not tell why.
+			console.error(err);
+			process.exit(1);
+		});
 	}
 }

@@ -28,18 +28,34 @@
  *
  * The vscode-free pure helpers live in companion files so unit tests can
  * exercise them without a vscode shim:
- * - {@link buildHtml} / `formatCellValue` in `cellGridHtml.ts`.
  * - {@link dispatchIncomingMessage} / {@link classifyCellInput} / envelope types
  *   in `cellGridLogic.ts`.
+ *
+ * **FE-0b (2026-06-02)**: the webview is now a PERSISTENT bundled (esbuild)
+ * module at `dist/webview/quantbook/sheets-webview.js` (source:
+ * `webview/sheets-webview/`), loaded ONCE via a thin shell ({@link buildShellHtml}).
+ * The host pushes the sheet snapshot to it via `postMessage({type:'render', ...})`
+ * after each commit instead of rebuilding `webview.html`. The old host-built
+ * inline HTML in `cellGridHtml.ts` (`buildHtml`) is no longer called by the panel
+ * (retired in FE-0b-2 when the DOM table is replaced by the Canvas2D renderer).
  */
 
 import * as vscode from 'vscode';
 
 import type { QuantbookCellSnapshot, SessionInstance, WorkbookSnapshotJson } from '../types';
-import { buildHtml } from './cellGridHtml';
 import { acquireWorkbookSnapshotViaDelta, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache } from './cellGridLogic';
+import { getNonce, getWebviewUri } from '../../utils/webview';
 
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
+
+/**
+ * How long to wait for the bundled webview's `webviewReady` handshake before
+ * surfacing a loud initialization error. The bundle is a local file (load +
+ * script-exec is sub-second), so a generous 6s avoids false positives on a slow
+ * machine while still failing VISIBLY if the bundle is missing/broken (a blank
+ * grid with no error would violate No-Fallbacks).
+ */
+const READY_WATCHDOG_MS = 6000;
 
 /**
  * Module-level registry of live panels keyed by sheet number. Lets the
@@ -84,29 +100,40 @@ export class CellGridPanel {
 			vscode.ViewColumn.Active,
 			{
 				// Scripts ON for the click-to-edit flow. CSP + nonce enforce that
-				// only the host-emitted inline script can execute; no remote
-				// `<script src=>` and no localResourceRoots widen beyond the
-				// extension root.
+				// only the bundled `<script src=>` carrying the matching nonce can
+				// execute. FE-0b: the webview is a PERSISTENT bundled module loaded
+				// once from `dist/webview/quantbook` -- so `retainContextWhenHidden`
+				// keeps its DOM + scroll state across tab switches (no reload flash;
+				// this is the point of the persistent model) and `localResourceRoots`
+				// is narrowed to the bundle directory.
 				enableScripts: true,
-				retainContextWhenHidden: false,
-				localResourceRoots: [context.extensionUri],
+				retainContextWhenHidden: true,
+				localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview', 'quantbook')],
 			},
 		);
 		const instance = new CellGridPanel(panel, session, sheet);
-		// Attach the message handler BEFORE the first render(). It survives across
-		// `webview.html = ...` rebuilds because it's attached to the PANEL, not
-		// the document.
+		// Attach the message handler BEFORE mounting the shell so the webview's
+		// `webviewReady` handshake (posted on bundle load) is never missed. It
+		// survives for the panel's lifetime (attached to the PANEL, not the doc).
 		panel.webview.onDidReceiveMessage(
 			(raw: unknown) => instance.handleIncoming(raw),
 			undefined,
 			context.subscriptions,
 		);
+		// Mount the persistent bundle shell ONCE. Snapshots are pushed via
+		// postMessage in render() (gated on the webviewReady handshake), NOT by
+		// rebuilding webview.html.
+		panel.webview.html = buildShellHtml(panel.webview, context.extensionUri);
 		instance.render();
+		// Watch for the webviewReady handshake; surface a loud error if the bundle
+		// never loads (else render() silently withholds every paint -> blank grid).
+		instance.armReadyWatchdog();
 		panels.set(sheet, instance);
 		panel.onDidDispose(() => {
 			// Set _disposed BEFORE anything else so a postMessage racing with
 			// disposal early-returns from the onError guard.
 			instance._disposed = true;
+			instance.clearReadyWatchdog();
 			// Only clear the cache entry if we still own it (a fresh open for the
 			// same sheet may have replaced us).
 			if (panels.get(sheet) === instance) {
@@ -199,6 +226,30 @@ export class CellGridPanel {
 	 */
 	_disposed: boolean = false;
 
+	/**
+	 * Latest computed sheet snapshot. Stored so the FE-0b `webviewReady`
+	 * handshake can (re)send the current state once the bundle's message channel
+	 * is live (render() may run before the bundle has loaded).
+	 */
+	private latestSnapshot: QuantbookCellSnapshot | undefined;
+
+	/**
+	 * True once the bundled webview has posted `{type:'webviewReady'}`. Before
+	 * the handshake, `postMessage` is dropped (the bundle's `message` listener
+	 * isn't wired yet), so render() defers the push.
+	 */
+	private webviewReady: boolean = false;
+
+	/**
+	 * Watchdog timer that fires if the bundled webview never completes its
+	 * `webviewReady` handshake (missing/broken bundle, CSP error, or
+	 * `acquireVsCodeApi` failure). Without it, render() silently withholds every
+	 * paint and the user sees a blank panel with no error -- a No-Fallbacks
+	 * violation. On timeout we surface a loud `showErrorMessage`. Cleared on the
+	 * handshake + on dispose.
+	 */
+	private readyWatchdog: ReturnType<typeof setTimeout> | undefined;
+
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly session: SessionInstance,
@@ -218,10 +269,13 @@ export class CellGridPanel {
 	}
 
 	/**
-	 * Compute the snapshot, generate a fresh nonce, and set the webview HTML.
-	 * Re-rendering blows away the prior webview script; the host's
-	 * `onDidReceiveMessage` handler survives (attached to the panel, not the
-	 * document). The title is reactive (sheet count + name from the snapshot).
+	 * Compute the snapshot and PUSH it to the persistent bundled webview via
+	 * `postMessage({type:'render', snapshot})` (FE-0b -- no `webview.html`
+	 * rebuild; the bundle + the `onDidReceiveMessage` handler persist). The push
+	 * is gated on the `webviewReady` handshake: the snapshot is always stored in
+	 * {@link latestSnapshot}, and {@link postRenderIfReady} sends it now if the
+	 * channel is live or the handshake sends it on bundle load. The title is
+	 * reactive (sheet count + name from the snapshot).
 	 *
 	 * **Tombstone race**: if the active sheet was deleted while the panel is open,
 	 * `extractSheetSnapshot` returns null; we render an empty grid + log a warning
@@ -250,8 +304,59 @@ export class CellGridPanel {
 			? `Sheet ${this.sheet} "${sheetName}"`
 			: `Sheet ${this.sheet}`;
 		this.panel.title = `Cell Grid (${sheetLabel}${titleSuffix})`;
-		const nonce = buildPanelNonce();
-		this.panel.webview.html = buildHtml(snapshot, { nonce });
+		// FE-0b: push the snapshot to the persistent bundle via postMessage (no
+		// webview.html rebuild). Store it first so the webviewReady handshake can
+		// (re)send the latest snapshot once the bundle's channel is live.
+		this.latestSnapshot = snapshot;
+		this.postRenderIfReady();
+	}
+
+	/**
+	 * Post {@link latestSnapshot} to the bundled webview as a `render` message,
+	 * IFF the webview has completed its `webviewReady` handshake (and the panel
+	 * is live + a snapshot exists). Before the handshake, `postMessage` would be
+	 * silently dropped; render() defers and the handshake re-sends.
+	 */
+	private postRenderIfReady(): void {
+		if (!this.webviewReady || this.latestSnapshot === undefined || this._disposed) {
+			return;
+		}
+		// Log a non-delivered render (No-Fallbacks): postMessage resolves false /
+		// rejects when the channel can't accept the message; a dropped paint must
+		// not pass silently.
+		this.panel.webview.postMessage({ type: 'render', snapshot: this.latestSnapshot }).then(
+			delivered => {
+				if (!delivered && !this._disposed) {
+					console.warn('[cellGrid] render postMessage was not delivered to the webview.');
+				}
+			},
+			err => console.error('[cellGrid] render postMessage rejected:', err),
+		);
+	}
+
+	/**
+	 * Start the {@link readyWatchdog}. Called once from `show()` after the shell
+	 * is mounted; on timeout (no `webviewReady`) it surfaces a loud error rather
+	 * than leaving a silently-blank grid.
+	 */
+	private armReadyWatchdog(): void {
+		this.readyWatchdog = setTimeout(() => {
+			if (this.webviewReady || this._disposed) {
+				return;
+			}
+			const detail = 'Quantbook cell grid failed to initialize: the webview bundle did not load. '
+				+ 'Rebuild it with "npm run build:webviews:quantbook" (in extensions/quantlab) and reopen the grid.';
+			console.error(`[cellGrid] ${detail}`);
+			void vscode.window.showErrorMessage(detail);
+		}, READY_WATCHDOG_MS);
+	}
+
+	/** Cancel the {@link readyWatchdog} (handshake arrived, or panel disposed). */
+	private clearReadyWatchdog(): void {
+		if (this.readyWatchdog !== undefined) {
+			clearTimeout(this.readyWatchdog);
+			this.readyWatchdog = undefined;
+		}
 	}
 
 	/**
@@ -262,6 +367,16 @@ export class CellGridPanel {
 	 * `typing_stroke` envelopes.
 	 */
 	private handleIncoming(raw: unknown): void {
+		// FE-0b handshake: the bundled webview posts `{type:'webviewReady'}` once
+		// on load. Mark the channel live + (re)send the latest snapshot. Intercept
+		// BEFORE delegating -- dispatchIncomingMessage would log it as an unknown
+		// outbound type.
+		if (typeof raw === 'object' && raw !== null && (raw as { type?: unknown }).type === 'webviewReady') {
+			this.webviewReady = true;
+			this.clearReadyWatchdog();
+			this.postRenderIfReady();
+			return;
+		}
 		dispatchIncomingMessage(raw, {
 			session: this.session,
 			sheet: this.sheet,
@@ -277,25 +392,55 @@ export class CellGridPanel {
 					);
 					return;
 				}
-				void this.panel.webview.postMessage(reply);
+				// Post the cell decoration. If delivery fails (channel busy /
+				// transient) fall back to a visible warning so the validation error
+				// is never silently lost (No-Fallbacks).
+				this.panel.webview.postMessage(reply).then(
+					delivered => {
+						if (!delivered && !this._disposed) {
+							void vscode.window.showWarningMessage(
+								`Cell Grid (sheet ${reply.sheet}, row ${reply.row}, col ${reply.col}): [${reply.code}] ${reply.message}`,
+							);
+						}
+					},
+					err => console.error('[cellGrid] errorReply postMessage rejected:', err),
+				);
 			},
 		});
 	}
 }
 
-const NONCE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-const NONCE_LENGTH = 32;
-
 /**
- * 32-char alphanumeric nonce for the webview CSP + inline `<script nonce=...>`.
- * `Math.random()` is adequate: the threat model is "prevent inline script
- * injection via snapshot data leaking past escapeHtml", not crypto-grade brute
- * force. 62^32 ~= 10^57 possibilities.
+ * **FE-0b (2026-06-02)** -- build the one-time shell HTML that loads the
+ * persistent bundled sheets webview. Mirrors the established bundled-webview
+ * pattern (qviz-spec via `VisualiseSpecProvider`): a fresh nonce, the bundle
+ * `<script nonce src>` + `<link>` loaded via `asWebviewUri`, and a nonce-based
+ * CSP. Snapshot DATA never appears in this HTML (it arrives via postMessage), so
+ * there is no user-controlled content in the shell -- only the nonce
+ * (alphanumeric, from {@link getNonce}) and the webview's own resource URIs.
+ *
+ * CSP: `default-src 'none'` (deny by default); `style-src ${cspSource}
+ * 'unsafe-inline'` (the bundled stylesheet is served from the webview's resource
+ * origin; `'unsafe-inline'` is retained for VS Code theme-variable styles);
+ * `script-src 'nonce-${nonce}'` (only the nonce-tagged bundle script runs);
+ * `img-src ${cspSource}`.
  */
-function buildPanelNonce(): string {
-	let out = '';
-	for (let i = 0; i < NONCE_LENGTH; i += 1) {
-		out += NONCE_ALPHABET[Math.floor(Math.random() * NONCE_ALPHABET.length)];
-	}
-	return out;
+function buildShellHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
+	const nonce = getNonce();
+	const scriptUri = getWebviewUri(webview, extensionUri, ['dist', 'webview', 'quantbook', 'sheets-webview.js']);
+	const styleUri = getWebviewUri(webview, extensionUri, ['dist', 'webview', 'quantbook', 'sheets-webview-style.css']);
+	const csp = `default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src ${webview.cspSource};`;
+	return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="${csp}">
+<link href="${styleUri}" rel="stylesheet">
+<title>Quantbook Cell Grid</title>
+</head>
+<body>
+<div id="sheets-root">Loading Quantbook cell grid&hellip;</div>
+<script nonce="${nonce}" src="${scriptUri}"></script>
+</body>
+</html>`;
 }
