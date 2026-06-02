@@ -5117,10 +5117,17 @@ pub struct DirtyResultJson {
 
 /// **Phase 6.5-4:** reference to a published/materialized artifact (mirrors
 /// [`ql_session::PublishedRef`]). `id` is the stable artifact id (the caller's
-/// `queryId` echoed back).
+/// `queryId` / `name` echoed back).
 #[napi(object)]
 pub struct PublishedRefJson {
     pub id: String,
+}
+
+/// **ENG-FUSION:** a bound overlay range (mirrors [`ql_session::BoundRange`]).
+/// `bindingId` is the stable binding id (the caller's id echoed back).
+#[napi(object)]
+pub struct BoundRangeJson {
+    pub binding_id: String,
 }
 
 /// **Phase 6.3-2a (2026-05-30):** which extras a `queryRange` read includes
@@ -6554,9 +6561,13 @@ impl Session {
         })
     }
 
-    /// Reserved (§3.5; `qb.publish()`): publish a dataset into a target. `data` is a
-    /// JSON string (the napi `serde-json` feature is not enabled). Always
-    /// `[not_implemented_in_v1_core]` in v1.
+    /// **ENG-FUSION** (§3.5; `qb.publish()`): publish a value-matrix dataset into a
+    /// target. `data` is a JSON string (the napi `serde-json` feature is not enabled) —
+    /// `{"values":[[scalar|null,...],...]}`, converted per cell. Writes ONE BatchCommit,
+    /// records provenance keyed by `name`, and on re-publish dirties the dependents of
+    /// vacated cells. Returns `{ id: name }`. `[bad_argument]` for an inverted/out-of-
+    /// bounds target, a result that does not fit, or malformed/non-rectangular/non-scalar
+    /// `data`; `[invalid_state]` off a Ready session.
     #[napi(js_name = "publishDataset", catch_unwind)]
     pub fn publish_dataset(
         &self,
@@ -6564,29 +6575,40 @@ impl Session {
         name: String,
         data: String,
         target: CellRangeJson,
-    ) -> Result<()> {
+    ) -> Result<PublishedRefJson> {
         guarded(env, "publishDataset", || {
             let data = parse_reserved_json_payload("publishDataset", &data)?;
             let target = session_range_from_json("publishDataset", target)?;
-            self.inner
+            let result = self
+                .inner
                 .lock()
                 .publish_dataset(&name, data, target)
-                .map(|_| ())
-                .map_err(|e| engine_error_to_napi(env, e))
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(PublishedRefJson { id: result.id })
         })
     }
 
-    /// Reserved (§3.5; `qb.bind()`): bind an overlay range. Always
-    /// `[not_implemented_in_v1_core]` in v1.
+    /// **ENG-FUSION** (§3.5; `qb.bind()`): register `bindingId -> target` as a
+    /// `BoundFrame` overlay region (round-trip reads go through `queryRange`). Returns
+    /// `{ bindingId }`. `[bad_argument]` for an inverted/out-of-bounds target;
+    /// `[sheet_not_found]` for an unknown sheet; `[invalid_state]` off a Ready session.
     #[napi(js_name = "bindRange", catch_unwind)]
-    pub fn bind_range(&self, env: Env, binding_id: String, target: CellRangeJson) -> Result<()> {
+    pub fn bind_range(
+        &self,
+        env: Env,
+        binding_id: String,
+        target: CellRangeJson,
+    ) -> Result<BoundRangeJson> {
         guarded(env, "bindRange", || {
             let target = session_range_from_json("bindRange", target)?;
-            self.inner
+            let result = self
+                .inner
                 .lock()
                 .bind_range(&binding_id, target)
-                .map(|_| ())
-                .map_err(|e| engine_error_to_napi(env, e))
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(BoundRangeJson {
+                binding_id: result.binding_id,
+            })
         })
     }
 

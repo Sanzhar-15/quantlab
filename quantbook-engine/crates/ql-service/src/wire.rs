@@ -1487,8 +1487,8 @@ pub struct WriteRangeBody {
     pub values: Vec<Vec<CellValueWire>>,
 }
 
-/// `publish-dataset` body (reserved). `data` is opaque JSON TEXT (a string carrying
-/// JSON, mirroring napi). Always 501 in v1.
+/// `publish-dataset` body (ENG-FUSION). `data` is opaque JSON TEXT (a string carrying
+/// JSON `{"values":[[scalar|null,...],...]}`, mirroring napi). Returns a PublishedRef wire.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublishDatasetBody {
@@ -1497,7 +1497,7 @@ pub struct PublishDatasetBody {
     pub target: CellRangeWire,
 }
 
-/// `bind-range` body (reserved). Always 501 in v1.
+/// `bind-range` body (ENG-FUSION). Returns a BoundRange wire.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BindRangeBody {
@@ -1505,7 +1505,7 @@ pub struct BindRangeBody {
     pub target: CellRangeWire,
 }
 
-/// `refresh-source` body (reserved). `revision` is a u64 decimal string. Always 501.
+/// `refresh-source` body. `revision` is a u64 decimal string. LIVE since 6.5-2.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefreshSourceBody {
@@ -1767,6 +1767,21 @@ pub struct PublishedRefWire {
 /// Map a [`ql_session::PublishedRef`] to [`PublishedRefWire`].
 pub fn published_ref_to_wire(r: ql_session::PublishedRef) -> PublishedRefWire {
     PublishedRefWire { id: r.id }
+}
+
+/// **ENG-FUSION:** mirror of napi `BoundRangeJson` (result of `bind-range`).
+/// `bindingId` is the stable binding id (the caller's id echoed back).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundRangeWire {
+    pub binding_id: String,
+}
+
+/// Map a [`ql_session::BoundRange`] to [`BoundRangeWire`].
+pub fn bound_range_to_wire(r: ql_session::BoundRange) -> BoundRangeWire {
+    BoundRangeWire {
+        binding_id: r.binding_id,
+    }
 }
 
 #[cfg(test)]

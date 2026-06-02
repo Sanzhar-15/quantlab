@@ -43,8 +43,8 @@
 //! - `POST   /v1/sessions/:id/commit-transaction`   -> BatchResult wire
 //! - `POST   /v1/sessions/:id/rollback-transaction` -> `{ ok }`
 //! - `POST   /v1/sessions/:id/write-range` -> WriteRangeResult wire; `materialize-query` ->
-//!   PublishedRef wire; `refresh-source` -> DirtyResult wire (all LIVE since 6.5). Only
-//!   `publish-dataset` + `bind-range` remain 501 `[not_implemented_in_v1_core]` (reserved sec-3.5).
+//!   PublishedRef wire; `refresh-source` -> DirtyResult wire; `publish-dataset` -> PublishedRef
+//!   wire; `bind-range` -> BoundRange wire (all sec-3.5 bulk methods LIVE since 6.5/ENG-FUSION).
 //! - `POST   /v1/sessions/:id/undo`, `redo`         -> UndoRedoResult wire
 //! - `GET    /v1/sessions/:id/can-undo`, `can-redo` -> bare bool
 //! - `POST   /v1/sessions/:id/snapshot-delta`       -> WorkbookSnapshotDelta wire (consumes `version` hex)
@@ -84,9 +84,9 @@ use crate::error::engine_error_to_problem;
 use crate::guarded::guarded;
 use crate::session_store::SessionStore;
 use crate::wire::{
-    self, batch_result_to_wire, cell_range_from_wire, cell_snapshot_to_wire, cell_value_from_wire,
-    diagnostic_to_wire, dirty_result_to_wire, event_page_to_wire, event_to_wire,
-    format_id_from_wire, function_metadata_from_wire, function_metadata_to_wire,
+    self, batch_result_to_wire, bound_range_to_wire, cell_range_from_wire, cell_snapshot_to_wire,
+    cell_value_from_wire, diagnostic_to_wire, dirty_result_to_wire, event_page_to_wire,
+    event_to_wire, format_id_from_wire, function_metadata_from_wire, function_metadata_to_wire,
     operation_state_to_wire, published_ref_to_wire, range_result_to_wire, session_op_from_wire,
     sheet_info_to_wire, table_spec_from_wire, undo_redo_result_to_wire,
     workbook_snapshot_delta_to_wire, workbook_snapshot_to_wire, write_range_result_to_wire,
@@ -761,8 +761,8 @@ async fn publish_dataset(store: &SessionStore, id: &str, body: ReqBody) -> Resp 
     with_session(store, id, "publishDataset", move |s| {
         let data = wire::parse_reserved_json_payload("publishDataset", &b.data)?;
         let target = cell_range_from_wire(b.target);
-        s.publish_dataset(&b.name, data, target).map(|_| ())?;
-        Ok(AckResponse { ok: true })
+        let result = s.publish_dataset(&b.name, data, target)?;
+        Ok(published_ref_to_wire(result))
     })
 }
 
@@ -773,8 +773,8 @@ async fn bind_range(store: &SessionStore, id: &str, body: ReqBody) -> Resp {
     };
     with_session(store, id, "bindRange", move |s| {
         let target = cell_range_from_wire(b.target);
-        s.bind_range(&b.binding_id, target).map(|_| ())?;
-        Ok(AckResponse { ok: true })
+        let result = s.bind_range(&b.binding_id, target)?;
+        Ok(bound_range_to_wire(result))
     })
 }
 

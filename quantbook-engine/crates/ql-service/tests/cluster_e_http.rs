@@ -272,11 +272,11 @@ async fn cluster_e_batch_and_transactions() {
 
 #[tokio::test]
 async fn cluster_e_reserved_bulk_methods_v1() {
-    // The §3.5 reserved bulk methods over HTTP. Phase 6.5 implemented three of them
-    // (write_range 6.5-0, materialize_query 6.5-1, refresh_source 6.5-2), exposed over
-    // the service in 6.5-4; publish_dataset / bind_range remain 6.4-reserved (501). This
-    // asserts the AUTHORITATIVE per-method v1 signal (No-Fallbacks: real errors are loud,
-    // not silent or 501-masked). `data` (publish/materialize) is opaque JSON TEXT.
+    // The §3.5 reserved bulk methods over HTTP. Phase 6.5 implemented three
+    // (write_range 6.5-0, materialize_query 6.5-1, refresh_source 6.5-2); ENG-FUSION
+    // implemented the last two (publish_dataset + bind_range) -- all five are live now.
+    // This asserts the AUTHORITATIVE per-method v1 signal (No-Fallbacks: real errors are
+    // loud, never silent or 501-masked). `data` (publish/materialize) is opaque JSON TEXT.
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let server = tokio::spawn(async move { serve(listener, SessionStore::new()).await });
@@ -324,29 +324,51 @@ async fn cluster_e_reserved_bulk_methods_v1() {
     assert_eq!(st, 404, "refresh-source unknown source -> not_found (6.5-2): {body}");
     assert_eq!(code(&body).as_deref(), Some("source_not_found"), "refresh-source code: {body}");
 
-    // publish-dataset / bind-range remain 6.4-reserved -> not_implemented_in_v1_core (501).
-    let cases: [(&str, String); 2] = [
-        (
-            "publish-dataset",
-            format!(r#"{{"name":"d","data":"{{\"k\":1}}","target":{range}}}"#),
-        ),
-        (
-            "bind-range",
-            format!(r#"{{"bindingId":"b","target":{range}}}"#),
-        ),
-    ];
-    for (path, payload) in cases {
-        let (st, body) = http(addr, "POST", &format!("{base}/{path}"), Some(&payload)).await;
-        assert_eq!(st, 501, "{path} -> 501: {body}");
-        assert_eq!(
-            code(&body).as_deref(),
-            Some("not_implemented_in_v1_core"),
-            "{path} code: {body}"
-        );
-    }
+    // publish-dataset (ENG-FUSION): a valid value-matrix writes (200) and echoes {id}.
+    let (st, body) = http(
+        addr,
+        "POST",
+        &format!("{base}/publish-dataset"),
+        Some(&format!(
+            r#"{{"name":"d","data":"{{\"values\":[[21]]}}","target":{range}}}"#
+        )),
+    )
+    .await;
+    assert_eq!(st, 200, "publish-dataset valid -> 200 (ENG-FUSION): {body}");
+    let v: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["id"].as_str(), Some("d"), "publish-dataset echoes name as id: {body}");
 
-    // malformed `data` JSON TEXT fails loud as bad_argument BEFORE the 501 (mirrors
-    // napi parse_reserved_json_payload; proves the No-Fallbacks parse path).
+    // bind-range (ENG-FUSION): registers the overlay region (200) and echoes {bindingId}.
+    let (st, body) = http(
+        addr,
+        "POST",
+        &format!("{base}/bind-range"),
+        Some(&format!(r#"{{"bindingId":"b","target":{range}}}"#)),
+    )
+    .await;
+    assert_eq!(st, 200, "bind-range valid -> 200 (ENG-FUSION): {body}");
+    let v: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["bindingId"].as_str(), Some("b"), "bind-range echoes bindingId: {body}");
+
+    // Reactive (the moat, end-to-end over HTTP): B1 = A1*2 depends on the published
+    // A1 (=21). After recalc, B1 = 42 -- publish dirtied the dependent.
+    let (st, _) = http(
+        addr,
+        "POST",
+        &format!("{base}/set-formula"),
+        Some(&format!(r#"{{"sheet":{sh},"row":0,"col":1,"text":"A1*2"}}"#)),
+    )
+    .await;
+    assert_eq!(st, 200);
+    recalc_dirty(addr, &base).await;
+    assert_eq!(
+        cell(addr, &base, sh, 0, 1).await["value"]["number"].as_f64(),
+        Some(42.0),
+        "publish-dataset must dirty + recompute the dependent over HTTP"
+    );
+
+    // malformed `data` JSON TEXT fails loud as bad_argument (mirrors napi
+    // parse_reserved_json_payload; proves the No-Fallbacks parse path).
     let (st, body) = http(
         addr,
         "POST",

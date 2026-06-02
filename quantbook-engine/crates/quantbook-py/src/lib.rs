@@ -1174,6 +1174,56 @@ impl Session {
         })
     }
 
+    /// **ENG-FUSION** (`qb.publish()`): publish a value-matrix dataset into `target`.
+    /// `target` is a range-dict; `data` is a JSON string `'{"values":[[scalar|null,...],
+    /// ...]}'` (per-cell conversion). Writes one BatchCommit, records provenance keyed by
+    /// `name`, and on re-publish dirties the dependents of vacated cells. Returns `{id}`
+    /// (the caller's `name` echoed back).
+    fn publish_dataset(
+        &self,
+        py: Python<'_>,
+        name: String,
+        data: String,
+        target: Bound<'_, PyDict>,
+    ) -> PyResult<Py<PyDict>> {
+        guarded(py, "publishDataset", || {
+            let target = session_range(py, "publishDataset", &target)?;
+            let data: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
+                bad_argument(py, format!("publishDataset: data must be valid JSON text ({e})"))
+            })?;
+            let result = self
+                .inner
+                .lock()
+                .publish_dataset(&name, data, target)
+                .map_err(|e| engine_error_to_pyerr(py, &e))?;
+            let d = PyDict::new(py);
+            d.set_item("id", result.id)?;
+            Ok(d.unbind())
+        })
+    }
+
+    /// **ENG-FUSION** (`qb.bind()`): register `binding_id -> target` as a `BoundFrame`
+    /// overlay region (round-trip reads go through `query_range`). `target` is a
+    /// range-dict. Returns `{bindingId}` (echoed back).
+    fn bind_range(
+        &self,
+        py: Python<'_>,
+        binding_id: String,
+        target: Bound<'_, PyDict>,
+    ) -> PyResult<Py<PyDict>> {
+        guarded(py, "bindRange", || {
+            let target = session_range(py, "bindRange", &target)?;
+            let result = self
+                .inner
+                .lock()
+                .bind_range(&binding_id, target)
+                .map_err(|e| engine_error_to_pyerr(py, &e))?;
+            let d = PyDict::new(py);
+            d.set_item("bindingId", result.binding_id)?;
+            Ok(d.unbind())
+        })
+    }
+
     /// Deterministically release the session (transition to Closed). Idempotent.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         guarded(py, "close", || {

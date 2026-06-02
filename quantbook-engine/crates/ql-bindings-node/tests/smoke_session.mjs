@@ -881,14 +881,15 @@ console.log("[smoke] 6.4-2 function registration PASS");
   );
 }
 
-// === 6.3-2e (2026-05-30) — atomic groups + reserved stubs over napi ===
+// === 6.3-2e (2026-05-30) — atomic groups + sec-3.5 bulk methods over napi ===
 //
 // Self-contained on a FRESH session. batch + the transaction handle are OBSERVABLE
 // (the staged ops really apply + resolve through a formula); the all-or-nothing
 // contract is pinned (a rejected batch leaves the grid intact); rollback discards;
-// the 5 reserved stubs surface not_implemented_in_v1_core; and the SessionOpJson
-// converter rejects malformed ops loudly. Exercises the new SessionOpJson /
-// BatchOptionsJson / BatchResultJson DTOs.
+// the 5 sec-3.5 bulk methods (writeRange/materializeQuery/refreshSource 6.5,
+// publishDataset/bindRange ENG-FUSION) are all LIVE with the right semantics; and the
+// SessionOpJson converter rejects malformed ops loudly. Exercises the new SessionOpJson
+// / BatchOptionsJson / BatchResultJson DTOs.
 {
   const w = new Session();
   const sh = w.addSheet("Ops", 1000);
@@ -964,9 +965,8 @@ console.log("[smoke] 6.4-2 function registration PASS");
     "rollback consumed the handle (txnAdd on a rolled-back txn is transaction_not_found)",
   );
 
-  // sec-3.5 bulk methods post-6.5: writeRange / materializeQuery / refreshSource are LIVE;
-  // only publishDataset / bindRange remain reserved (loud Capability). (6.7 smoke-sync — the
-  // pre-6.5 "all 5 reserved" assertion was stale once 6.5-4 implemented three of them.)
+  // sec-3.5 bulk methods: writeRange / materializeQuery / refreshSource (6.5) AND
+  // publishDataset / bindRange (ENG-FUSION) are ALL live now.
   const r0 = { sheet: sh, startRow: 10, startCol: 10, endRow: 10, endCol: 10 };
   const wrRes = w.writeRange(r0, [[{ kind: "number", number: 1 }]]);
   assert.equal(Number(wrRes.written), 1, "writeRange is LIVE (6.5) and reports 1 cell written");
@@ -974,9 +974,20 @@ console.log("[smoke] 6.4-2 function registration PASS");
   throwsWithCode(() => w.materializeQuery("q1", r0, "{}"), "bad_argument", "materializeQuery requires a sql key");
   // refreshSource on an unknown source id is source_not_found (not a reserved Capability stub).
   throwsWithCode(() => w.refreshSource("s1", 1n), "source_not_found", "refreshSource on an unknown source");
-  // the two still-reserved bulk methods stay loud Capability.
-  throwsWithCode(() => w.publishDataset("ds", "{}", r0), "not_implemented_in_v1_core", "publishDataset reserved");
-  throwsWithCode(() => w.bindRange("b1", r0), "not_implemented_in_v1_core", "bindRange reserved");
+  // publishDataset (ENG-FUSION): a valid value-matrix writes A21=21 and echoes { id }.
+  const pubRange = { sheet: sh, startRow: 20, startCol: 0, endRow: 20, endCol: 0 }; // A21
+  const pubRes = w.publishDataset("ds", JSON.stringify({ values: [[21]] }), pubRange);
+  assert.equal(pubRes.id, "ds", "publishDataset echoes the name as id");
+  // bindRange (ENG-FUSION): registers the overlay region and echoes { bindingId }.
+  const bindRes = w.bindRange("b1", pubRange);
+  assert.equal(bindRes.bindingId, "b1", "bindRange echoes the bindingId");
+  // Reactive (the moat): B21 = A21*2 depends on the published A21 (=21) -> 42 after recalc.
+  w.setFormula(sh, 20, 1, "A21*2");
+  w.recalcDirty();
+  const b21 = w.cell(sh, 20, 1);
+  assert.equal(b21 && b21.value && b21.value.number, 42, "publishDataset dirties + recomputes the dependent");
+  // malformed data text is a loud bad_argument (No-Fallbacks), not a silent default.
+  throwsWithCode(() => w.publishDataset("ds", "not json", pubRange), "bad_argument", "publishDataset malformed data");
 
   // arg validation (loud): unknown op kind / missing-for-kind payload / malformed JSON.
   throwsWithCode(
@@ -1002,7 +1013,7 @@ console.log("[smoke] 6.4-2 function registration PASS");
 
   w.close();
   console.log(
-    "[smoke] 6.3-2e atomic groups + reserved stubs OK (batch atomic+observable, txn commit/rollback, reserved Capability, arg validation)",
+    "[smoke] 6.3-2e atomic groups + sec-3.5 bulk methods OK (batch atomic+observable, txn commit/rollback, publish/bind LIVE + reactive, arg validation)",
   );
 }
 
