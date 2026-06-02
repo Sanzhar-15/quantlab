@@ -62,6 +62,7 @@ import {
 	listSheets,
 	loopbackTransportPair,
 	moveSheet,
+	openWorkbookFromQbook,
 	parseQuantbookError,
 	peerPresence,
 	peersWithPresence,
@@ -70,8 +71,10 @@ import {
 	redo,
 	renameSheet,
 	restoreSheet,
+	saveSessionToQbook,
 	sessionFromQbook,
 	sessionFromSnapshot,
+	setFormulaValidated,
 	setValueValidated,
 	sweepPresence,
 	undo,
@@ -7225,6 +7228,107 @@ suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (engine)', f
 		setValueValidated(s, 0, 0, 1, num(4)); step('put A!(0,1)=4 (delta after rebuild)');
 		s.undo(); step('undo (fullRebuild)');
 		setValueValidated(s, 0, 3, 3, num(5)); step('put A!(3,3)=5 (delta after rebuild)');
+	});
+});
+
+// ============================================================================
+// FE-0a Part B2 (2026-06-02) -- sheet ops + .qbook persistence on the owning
+// single-writer Session. Exercises the helpers the B2 commands call:
+// saveSessionToQbook / openWorkbookFromQbook + Session.addSheet / renameSheet /
+// deleteSheet / moveSheet / listSheets. Requires the engine cdylib (skip-guarded).
+// ============================================================================
+suite('quantbook B2 -- sheet ops + .qbook persistence on Session', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	const numv = (n: number): { kind: 'number'; number: number } => ({ kind: 'number', number: n });
+
+	test('save -> open round-trip preserves values + recomputed formulas', () => {
+		const session = createWorkbookSession();
+		const sheetId = session.addSheet('S0', 1000);
+		setValueValidated(session, sheetId, 0, 0, numv(21));   // A1 = 21
+		setFormulaValidated(session, sheetId, 1, 0, 'A1*2');   // A2 = =A1*2 -> 42
+		recalcDirtyChecked(session);
+
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qbook-b2-'));
+		const qpath = path.join(dir, 'roundtrip.qbook');
+		try {
+			saveSessionToQbook(session, qpath);
+			const opened = openWorkbookFromQbook(qpath);
+			try {
+				assert.strictEqual(opened.lifecycleState(), 'ready', 'opened session is Ready');
+				const openedSheet = opened.listSheets()[0].id;
+				const a1 = opened.cell(openedSheet, 0, 0);
+				assert.strictEqual(a1?.value?.kind, 'number');
+				assert.strictEqual(a1?.value?.number, 21, 'literal value survives save/open');
+				const a2 = opened.cell(openedSheet, 1, 0);
+				assert.strictEqual(a2?.value?.kind, 'number');
+				assert.strictEqual(a2?.value?.number, 42, 'recomputed formula survives save/open');
+				assert.ok(a2?.formula !== undefined && a2.formula.length > 0, 'formula text persisted');
+			} finally {
+				opened.close();
+			}
+		} finally {
+			session.close();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test('addSheet returns an id that appears in listSheets', () => {
+		const session = createWorkbookSession();
+		try {
+			const id0 = session.addSheet('Alpha', 1000);
+			const id1 = session.addSheet('Beta', 1000);
+			const ids = session.listSheets().map(s => s.id);
+			assert.ok(ids.includes(id0) && ids.includes(id1), 'both added sheets are live');
+			assert.strictEqual(session.listSheets().length, 2);
+		} finally {
+			session.close();
+		}
+	});
+
+	test('renameSheet changes the listed name', () => {
+		const session = createWorkbookSession();
+		try {
+			const id = session.addSheet('Old', 1000);
+			session.renameSheet(id, 'New');
+			const info = session.listSheets().find(s => s.id === id);
+			assert.strictEqual(info?.name, 'New');
+		} finally {
+			session.close();
+		}
+	});
+
+	test('deleteSheet removes the sheet from listSheets (tombstone)', () => {
+		const session = createWorkbookSession();
+		try {
+			const keep = session.addSheet('Keep', 1000);
+			const drop = session.addSheet('Drop', 1000);
+			session.deleteSheet(drop);
+			const ids = session.listSheets().map(s => s.id);
+			assert.ok(ids.includes(keep), 'kept sheet remains');
+			assert.ok(!ids.includes(drop), 'deleted sheet is gone from listSheets');
+		} finally {
+			session.close();
+		}
+	});
+
+	test('moveSheet reorders listSheets', () => {
+		const session = createWorkbookSession();
+		try {
+			const a = session.addSheet('A', 1000);
+			const b = session.addSheet('B', 1000);
+			const c = session.addSheet('C', 1000);
+			assert.deepStrictEqual(session.listSheets().map(s => s.id), [a, b, c], 'initial order = append order');
+			session.moveSheet(a, 2);   // move A to the last display position
+			const after = session.listSheets().map(s => s.id);
+			assert.strictEqual(after[2], a, 'A moved to display position 2');
+			assert.deepStrictEqual([...after].sort((x, y) => x - y), [a, b, c].sort((x, y) => x - y), 'no sheets lost');
+		} finally {
+			session.close();
+		}
 	});
 });
 

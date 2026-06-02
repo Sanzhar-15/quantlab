@@ -119,31 +119,62 @@ export class CellGridPanel {
 
 	/**
 	 * Refresh ALL currently-open cell-grid panels. Called by
-	 * `quantlab.quantbookCellGridRefresh`. Returns the number refreshed.
+	 * `quantlab.quantbookCellGridRefresh` + the B2 sheet-management commands.
+	 * Returns `{ refreshed, failed }` so callers can surface a render failure LOUD
+	 * (No-Fallbacks): a panel whose `render()` throws is NOT counted as refreshed
+	 * (it does not silently masquerade as success). `safeRender` still isolates the
+	 * failure so one bad panel does not abort the refresh of its siblings.
 	 */
-	static refreshAll(): number {
-		let count = 0;
+	static refreshAll(): { refreshed: number; failed: number } {
+		let refreshed = 0;
+		let failed = 0;
 		for (const instance of panels.values()) {
-			instance.safeRender();
-			count += 1;
+			if (instance.safeRender()) {
+				refreshed += 1;
+			} else {
+				failed += 1;
+			}
 		}
-		return count;
+		return { refreshed, failed };
+	}
+
+	/**
+	 * Dispose ALL live cell-grid panels. Used by the Open command (FE-0a Part B2):
+	 * opening a `.qbook` REPLACES the current workbook, so any panel still bound to
+	 * the previous session must be torn down BEFORE the new session is shown.
+	 * Otherwise {@link show} -- which reveals an existing panel keyed by the same
+	 * sheet id before binding the new session -- would surface the stale panel and
+	 * leave the newly-opened workbook inaccessible (reviewer HIGH). Calling
+	 * `panel.dispose()` fires `onDidDispose`, which clears the registry entry; we
+	 * snapshot `panels.values()` first so the dispose-time mutation is safe.
+	 * Returns the number of panels disposed.
+	 */
+	static disposeAll(): number {
+		const live = Array.from(panels.values());
+		for (const instance of live) {
+			instance.panel.dispose();
+		}
+		return live.length;
 	}
 
 	/**
 	 * Render wrapper that never throws into the caller (refreshAll iterates many
-	 * panels). A render failure is logged (visible per No-Fallbacks) but does not
-	 * abort the refresh of sibling panels.
+	 * panels). Returns `true` on success, `false` if `render()` threw -- the caller
+	 * (refreshAll) aggregates the failure count so the command layer can surface it
+	 * LOUD (No-Fallbacks); `console.warn` keeps the per-panel detail. A failure does
+	 * not abort the refresh of sibling panels. A disposed panel is a no-op success.
 	 */
-	private safeRender(): void {
+	private safeRender(): boolean {
 		if (this._disposed) {
-			return;
+			return true;
 		}
 		try {
 			this.render();
+			return true;
 		} catch (err) {
 			const detail = err instanceof Error ? err.message : String(err);
 			console.warn(`[quantbook] cell-grid safeRender failed: ${detail}`);
+			return false;
 		}
 	}
 

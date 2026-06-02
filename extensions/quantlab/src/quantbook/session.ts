@@ -281,6 +281,37 @@ export function recalcDirtyChecked(session: SessionInstance): void {
 }
 
 /**
+ * **FE-0a Part B2 (2026-06-02) -- Session-typed `.qbook` save helper.**
+ *
+ * Thin indirection over `Session.save(path)`, mirroring the CollabSession
+ * {@link exportToQbook} pattern for API-surface stability. The owning Session
+ * persists the live workbook + its op-log atomically to a `.qbook` directory at
+ * `path` (name derived from the path stem). `Session` is peer-id-agnostic
+ * (single-writer); there is no `generateUuidPeerId` here. A path with no file
+ * stem throws `[bad_argument]`; an I/O / serialization failure throws
+ * `[persistence]` (No-Fallbacks -- surfaced loud, never swallowed).
+ */
+export function saveSessionToQbook(session: SessionInstance, path: string): void {
+	session.save(path);
+}
+
+/**
+ * **FE-0a Part B2 (2026-06-02) -- Session-typed `.qbook` open helper.**
+ *
+ * Constructs a fresh owning Session via {@link createWorkbookSession}, loads the
+ * `.qbook` workbook at `path` via `session.open(path)` (New -> Ready; epoch
+ * re-minted + recomputed on load), and returns the ready session. Mirrors the
+ * CollabSession {@link sessionFromQbook} pattern but WITHOUT a `peerIdOverride`
+ * (the owning session is not a CRDT peer). A missing file / bad envelope / corrupt
+ * op-log sidecar throws a structured `[persistence]` error.
+ */
+export function openWorkbookFromQbook(path: string): SessionInstance {
+	const session = createWorkbookSession();
+	session.open(path);
+	return session;
+}
+
+/**
  * Reconstruct a `CollabSession` from a previously-exported snapshot.
  *
  * @param peerId Non-zero u64-domain peer identifier for THIS session

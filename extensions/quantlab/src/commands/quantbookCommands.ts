@@ -9,15 +9,17 @@
  * Registers the demo round-trip command (engine smoke), the multi-window demo,
  * and the cell-grid commands.
  *
- * **FE-0a Part B (B1, 2026-06-02) -- grid migrated to the owning single-writer
- * `Session`.** The primary "Open Cell Grid" command now binds the owning
- * `Session` (createWorkbookSession) so the grid can consume the ENG-FUSION
- * fusion primitives and write text cells. The collaborative path
+ * **FE-0a Part B (B1+B2, 2026-06-02) -- grid on the owning single-writer
+ * `Session`.** The primary "Open Cell Grid" command binds the owning `Session`
+ * (createWorkbookSession) so the grid can consume the ENG-FUSION fusion
+ * primitives and write text cells. **B2** un-stubbed the sheet-management +
+ * `.qbook` persistence commands on `Session`: switch/add/rename/delete/move sheet
+ * (via `Session.listSheets`/`addSheet`/`renameSheet`/`deleteSheet`/`moveSheet`),
+ * Save As (`Session.save` via {@link saveSessionToQbook}), and Open
+ * (`Session.open` via {@link openWorkbookFromQbook}; Open REPLACES the current
+ * workbook -- it disposes prior panels first). The collaborative path
  * (`quantbookCellGridCollab`) is a loud stub (real-time collab is v1.5-deferred:
- * "CRDT built, transport unwired"). The sheet-management + .qbook persistence
- * commands (switch/add/rename/delete/move sheet, Save As, Open) are type-coupled
- * to the panel's session and need real rework on `Session`; they are loud B2
- * stubs until FE-0a Part B2. The CollabSession demo commands
+ * "CRDT built, transport unwired"). The CollabSession demo commands
  * (quantbookDemo / quantbookDemoMultiWindow) remain dormant on `CollabSession`.
  */
 
@@ -32,11 +34,12 @@ import * as vscode from 'vscode';
 // / deleteSheet / moveSheet / workbookSnapshot, the buildSheet* quickpick
 // builders, connectOrSpawn) belong to the B2-stubbed grid commands and are no
 // longer imported here.
-import { addSheet, appendPutValueValidated, createSession, createWorkbookSession, quantbookEngineVersion, recalcDirtyChecked, sessionFromSnapshot, setValueValidated } from '../quantbook/session';
+import { addSheet, appendPutValueValidated, createSession, createWorkbookSession, openWorkbookFromQbook, quantbookEngineVersion, recalcDirtyChecked, saveSessionToQbook, sessionFromSnapshot, setValueValidated } from '../quantbook/session';
 import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
 import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
-import type { CollabSessionInstance } from '../quantbook/types';
+import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems } from '../quantbook/cellGrid/cellGridLogic';
+import type { CollabSessionInstance, SessionInstance } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
 
@@ -48,24 +51,19 @@ function getOutput(): vscode.OutputChannel {
 }
 
 /**
- * **FE-0a Part B (B1, 2026-06-02)** -- register a grid command that is being
- * migrated to the owning single-writer `Session` in B2 as a LOUD, intentional
- * placeholder. These commands (sheet switch/add/rename/delete/move, .qbook
- * save/open) are type-coupled to the panel's session and need real rework on
- * `Session`; until B2 they surface a visible "temporarily unavailable" message
- * rather than silently doing nothing (the No-Fallbacks system-boundary
- * exception: errors/limits must be visible). The command stays registered so
- * invoking it from the palette gives a clean message, not "command not found".
+ * Close an owning `Session`, logging (never swallowing) any close failure. Used on
+ * the Open command's error / workbook-replace paths where the session is being
+ * discarded: a close failure must not mask the primary outcome, but it MUST stay
+ * VISIBLE (No-Fallbacks -- the underlying error is written to the Quantbook output
+ * channel rather than dropped).
  */
-function registerB2Stub(context: vscode.ExtensionContext, commandId: string, feature: string): void {
-	context.subscriptions.push(
-		vscode.commands.registerCommand(commandId, () => {
-			void vscode.window.showInformationMessage(
-				`Quantbook: "${feature}" is being migrated to the single-writer session ` +
-				`(FE-0a Part B2) and is temporarily unavailable.`,
-			);
-		}),
-	);
+function closeSessionQuietly(session: SessionInstance, log: vscode.OutputChannel, when: string): void {
+	try {
+		session.close();
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		log.appendLine(`(non-fatal) closing session failed during ${when}: ${detail}`);
+	}
 }
 
 function describe(label: string, session: CollabSessionInstance): string {
@@ -210,14 +208,17 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// Phase 5.7 V3.2.a.1 (2026-05-22) -- refresh active cell-grid panels in place.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookCellGridRefresh', () => {
-			const count = CellGridPanel.refreshAll();
-			if (count === 0) {
+			const { refreshed, failed } = CellGridPanel.refreshAll();
+			if (refreshed === 0 && failed === 0) {
 				void vscode.window.showInformationMessage(
 					'No Cell Grid panels are open. Run "Quantbook: Open Cell Grid" first.',
 				);
 			} else {
 				const log = getOutput();
-				log.appendLine(`Refreshed ${count} cell-grid panel(s).`);
+				log.appendLine(`Refreshed ${refreshed} cell-grid panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
+				if (failed > 0) {
+					void vscode.window.showWarningMessage(`Quantbook: ${failed} panel(s) failed to re-render -- check the Quantbook output for details.`);
+				}
 			}
 		}),
 	);
@@ -273,14 +274,411 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 		}),
 	);
 
-	// FE-0a Part B (B1): these grid commands are type-coupled to the panel's
-	// session and are being migrated to the owning Session in B2. Loud B2 stubs
-	// (No-Fallbacks system-boundary exception: visible, intentional) until then.
-	registerB2Stub(context, 'quantlab.quantbookCellGridSwitchSheet', 'Switch Cell Grid Sheet');
-	registerB2Stub(context, 'quantlab.quantbookSaveAs', 'Save As (.qbook)');
-	registerB2Stub(context, 'quantlab.quantbookOpen', 'Open (.qbook)');
-	registerB2Stub(context, 'quantlab.quantbookSheetAdd', 'Add Sheet');
-	registerB2Stub(context, 'quantlab.quantbookSheetRename', 'Rename Sheet');
-	registerB2Stub(context, 'quantlab.quantbookSheetDelete', 'Delete Sheet');
-	registerB2Stub(context, 'quantlab.quantbookSheetMove', 'Move Sheet');
+	// --- FE-0a Part B2 (2026-06-02): sheet-management + .qbook persistence on the
+	// owning single-writer Session. All operate on the OLDEST open local panel
+	// (panels[0]); a panel-picker for multi-panel sessions is a v1.x refinement.
+	// Engine ops fail loud (No-Fallbacks); the refreshAll repaint is in a SEPARATE
+	// try so a render failure is not misreported as an engine-op failure.
+
+	// Switch the active panel to another sheet of the same session.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookCellGridSwitchSheet', async () => {
+			const localPanels = CellGridPanel.activeLocalPanels();
+			if (localPanels.length === 0) {
+				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+				return;
+			}
+			const target = localPanels[0];
+			// SessionInstance.listSheets() returns SheetInfoJson[]; the number-only
+			// switch builder takes ids -> map to ids (FE-0a Part B2 reviewer fix).
+			// listSheets() can throw off an unreadable lifecycle state -> report loud
+			// (consistent with rename/delete/move; No-Fallbacks).
+			let sheetInfos;
+			try {
+				sheetInfos = target.session.listSheets();
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				getOutput().appendLine(`FATAL listSheets error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook cell grid switch failed: ${detail}`);
+				return;
+			}
+			if (sheetInfos.length === 0) {
+				void vscode.window.showInformationMessage('This session has no sheets yet.');
+				return;
+			}
+			if (sheetInfos.length === 1) {
+				void vscode.window.showInformationMessage(`Only sheet ${sheetInfos[0].id} exists in this session; nothing to switch to.`);
+				return;
+			}
+			const items = buildSheetQuickPickItems(sheetInfos.map(s => s.id), target.sheet);
+			const selection = await vscode.window.showQuickPick(items, {
+				title: 'Switch Cell Grid Sheet',
+				placeHolder: `Currently on Sheet ${target.sheet} (${sheetInfos.length} sheets total)`,
+			});
+			if (selection === undefined) {
+				return;
+			}
+			try {
+				CellGridPanel.show(context, target.session, selection.sheet);
+				getOutput().appendLine(`Switched Cell Grid view to sheet ${selection.sheet}.`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				getOutput().appendLine(`FATAL switch-sheet error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook cell grid switch failed: ${detail}`);
+			}
+		}),
+	);
+
+	// Save As: persist the active panel's Session to a `.qbook` directory.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookSaveAs', async () => {
+			const localPanels = CellGridPanel.activeLocalPanels();
+			if (localPanels.length === 0) {
+				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+				return;
+			}
+			const target = localPanels[0];
+			const uri = await vscode.window.showSaveDialog({
+				title: 'Save Quantbook As',
+				filters: { Quantbook: ['qbook'] },
+				saveLabel: 'Save',
+			});
+			if (uri === undefined) {
+				return;
+			}
+			const log = getOutput();
+			try {
+				saveSessionToQbook(target.session, uri.fsPath);
+				log.appendLine(`Saved Cell Grid (sheet ${target.sheet}) to ${uri.fsPath}.`);
+				void vscode.window.showInformationMessage(`Quantbook saved to ${uri.fsPath}`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL Save As error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook save failed: ${detail}`);
+			}
+		}),
+	);
+
+	// Open: load a `.qbook` into a fresh Session. Opening REPLACES the current
+	// workbook, so dispose panels bound to the previous session BEFORE showing the
+	// new one (else show() would reveal a stale panel keyed by the same sheet id
+	// and the opened workbook would be inaccessible -- FE-0a Part B2 reviewer fix).
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookOpen', async () => {
+			const uris = await vscode.window.showOpenDialog({
+				title: 'Open Quantbook',
+				filters: { Quantbook: ['qbook'] },
+				canSelectFiles: false,
+				canSelectFolders: true, // .qbook is a directory
+				canSelectMany: false,
+				openLabel: 'Open',
+			});
+			if (uris === undefined || uris.length === 0) {
+				return;
+			}
+			const path = uris[0].fsPath;
+			const log = getOutput();
+			// 1) Open the new workbook FIRST. A failed open leaves the current workbook
+			// + its panels intact (nothing has been disposed yet).
+			let session;
+			try {
+				session = openWorkbookFromQbook(path);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL Open error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook open failed: ${detail}`);
+				return;
+			}
+			// 2) The opened workbook MUST have a live sheet -- never show a phantom
+			// sheet 0 for an empty/corrupt workbook (No-Fallbacks). listSheets() can also
+			// throw off an unreadable state -> close the new session + report loud.
+			let firstSheet: number;
+			try {
+				const sheetInfos = session.listSheets();
+				if (sheetInfos.length === 0) {
+					closeSessionQuietly(session, log, 'empty-workbook open');
+					log.appendLine(`Open aborted: "${path}" has no live sheets.`);
+					void vscode.window.showErrorMessage(`Quantbook open failed: "${path}" has no live sheets.`);
+					return;
+				}
+				firstSheet = sheetInfos[0].id;
+				log.appendLine(`Opened Quantbook from ${path} (${sheetInfos.length} sheet(s)).`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				closeSessionQuietly(session, log, 'open read-sheets failure');
+				log.appendLine(`FATAL Open (read sheets) error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook open failed: ${detail}`);
+				return;
+			}
+			// 3) Replace the current workbook: close the displaced session(s) + dispose
+			// their panels, THEN show the new session. A display failure here is reported
+			// AS a display failure (not "open failed") and the new session is closed.
+			try {
+				const displaced = new Set(CellGridPanel.activeLocalPanels().map(p => p.session));
+				const disposed = CellGridPanel.disposeAll();
+				if (disposed > 0) {
+					log.appendLine(`Closed ${disposed} panel(s) from the previous workbook.`);
+				}
+				for (const prev of displaced) {
+					if (prev !== session) {
+						closeSessionQuietly(prev, log, 'displaced workbook');
+					}
+				}
+				CellGridPanel.show(context, session, firstSheet);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				closeSessionQuietly(session, log, 'open display failure');
+				log.appendLine(`FATAL Open (display) error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook opened the workbook but failed to display it: ${detail}`);
+			}
+		}),
+	);
+
+	// Add a sheet to the active panel's session.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookSheetAdd', async () => {
+			const localPanels = CellGridPanel.activeLocalPanels();
+			if (localPanels.length === 0) {
+				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+				return;
+			}
+			const target = localPanels[0];
+			const name = await vscode.window.showInputBox({
+				title: 'Add Quantbook Sheet',
+				prompt: 'Enter a name for the new sheet',
+				placeHolder: 'e.g., "Q4 Returns" or "Sheet3"',
+				validateInput: (value) => (value.trim() === '' ? 'Sheet name cannot be empty' : null),
+			});
+			if (name === undefined) {
+				return;
+			}
+			const log = getOutput();
+			let opSucceeded = false;
+			try {
+				const newId = target.session.addSheet(name.trim(), 1000);
+				opSucceeded = true;
+				log.appendLine(`Added sheet "${name.trim()}" (id ${newId}) to session.`);
+				void vscode.window.showInformationMessage(`Sheet "${name.trim()}" added (id ${newId}).`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL addSheet error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook add sheet failed: ${detail}`);
+			}
+			if (opSucceeded) {
+				try {
+					const { refreshed, failed } = CellGridPanel.refreshAll();
+					log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
+					if (failed > 0) {
+						void vscode.window.showWarningMessage(`Quantbook: the sheet change succeeded, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
+					}
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`refreshAll after addSheet failed (non-fatal): ${detail}`);
+				}
+			}
+		}),
+	);
+
+	// Rename a sheet of the active panel's session.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookSheetRename', async () => {
+			const localPanels = CellGridPanel.activeLocalPanels();
+			if (localPanels.length === 0) {
+				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+				return;
+			}
+			const target = localPanels[0];
+			const log = getOutput();
+			let sheetInfos;
+			try {
+				sheetInfos = target.session.listSheets();
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL listSheets error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook rename sheet failed: ${detail}`);
+				return;
+			}
+			if (sheetInfos.length === 0) {
+				void vscode.window.showInformationMessage('This session has no sheets yet.  Add a sheet first via "Quantbook: Add Sheet...".');
+				return;
+			}
+			const pick = await vscode.window.showQuickPick(buildSheetManagementQuickPickItems(sheetInfos, target.sheet), {
+				title: 'Rename Quantbook Sheet',
+				placeHolder: 'Select a sheet to rename',
+			});
+			if (pick === undefined) {
+				return;
+			}
+			const newName = await vscode.window.showInputBox({
+				title: `Rename Sheet "${pick.name}"`,
+				prompt: `Enter a new name for sheet ${pick.sheet}`,
+				value: pick.name,
+				validateInput: (value) => {
+					if (value.trim() === '') {
+						return 'Sheet name cannot be empty';
+					}
+					if (value.trim() === pick.name) {
+						return 'New name is the same as the current name';
+					}
+					return null;
+				},
+			});
+			if (newName === undefined) {
+				return;
+			}
+			let opSucceeded = false;
+			try {
+				target.session.renameSheet(pick.sheet, newName.trim());
+				opSucceeded = true;
+				log.appendLine(`Renamed sheet ${pick.sheet} from "${pick.name}" to "${newName.trim()}".`);
+				void vscode.window.showInformationMessage(`Sheet ${pick.sheet} renamed to "${newName.trim()}".`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL renameSheet error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook rename sheet failed: ${detail}`);
+			}
+			if (opSucceeded) {
+				try {
+					const { refreshed, failed } = CellGridPanel.refreshAll();
+					log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
+					if (failed > 0) {
+						void vscode.window.showWarningMessage(`Quantbook: the sheet change succeeded, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
+					}
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`refreshAll after renameSheet failed (non-fatal): ${detail}`);
+				}
+			}
+		}),
+	);
+
+	// Delete (tombstone) a sheet of the active panel's session.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookSheetDelete', async () => {
+			const localPanels = CellGridPanel.activeLocalPanels();
+			if (localPanels.length === 0) {
+				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+				return;
+			}
+			const target = localPanels[0];
+			const log = getOutput();
+			let sheetInfos;
+			try {
+				sheetInfos = target.session.listSheets();
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL listSheets error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook delete sheet failed: ${detail}`);
+				return;
+			}
+			if (sheetInfos.length === 0) {
+				void vscode.window.showInformationMessage('This session has no sheets to delete.');
+				return;
+			}
+			const pick = await vscode.window.showQuickPick(buildSheetManagementQuickPickItems(sheetInfos, target.sheet), {
+				title: 'Delete Quantbook Sheet',
+				placeHolder: 'Select a sheet to delete',
+			});
+			if (pick === undefined) {
+				return;
+			}
+			// Tombstone semantic (engine preserves cells internally); the sheet
+			// disappears from the grid. restoreSheet exists on the engine but has no
+			// UI yet, so confirm before applying.
+			const confirm = await vscode.window.showWarningMessage(
+				`Delete sheet ${pick.sheet} ("${pick.name}")?  It is tombstoned (cells preserved internally) but disappears from the grid; no restore command exists yet.`,
+				{ modal: true },
+				'Delete',
+			);
+			if (confirm !== 'Delete') {
+				return;
+			}
+			let opSucceeded = false;
+			try {
+				target.session.deleteSheet(pick.sheet);
+				opSucceeded = true;
+				log.appendLine(`Deleted sheet ${pick.sheet} ("${pick.name}").`);
+				void vscode.window.showInformationMessage(`Sheet ${pick.sheet} ("${pick.name}") deleted.`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL deleteSheet error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook delete sheet failed: ${detail}`);
+			}
+			if (opSucceeded) {
+				try {
+					const { refreshed, failed } = CellGridPanel.refreshAll();
+					log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
+					if (failed > 0) {
+						void vscode.window.showWarningMessage(`Quantbook: the sheet change succeeded, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
+					}
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`refreshAll after deleteSheet failed (non-fatal): ${detail}`);
+				}
+			}
+		}),
+	);
+
+	// Move (reorder) a sheet of the active panel's session.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookSheetMove', async () => {
+			const localPanels = CellGridPanel.activeLocalPanels();
+			if (localPanels.length === 0) {
+				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+				return;
+			}
+			const target = localPanels[0];
+			const log = getOutput();
+			let sheetInfos;
+			try {
+				sheetInfos = target.session.listSheets();
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL listSheets error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook move sheet failed: ${detail}`);
+				return;
+			}
+			if (sheetInfos.length < 2) {
+				void vscode.window.showInformationMessage('This session needs at least 2 sheets to move one.');
+				return;
+			}
+			const sourcePick = await vscode.window.showQuickPick(buildSheetManagementQuickPickItems(sheetInfos, target.sheet), {
+				title: 'Move Quantbook Sheet (1 of 2)',
+				placeHolder: 'Select a sheet to move',
+			});
+			if (sourcePick === undefined) {
+				return;
+			}
+			const positionPick = await vscode.window.showQuickPick(buildSheetMovePositionItems(sheetInfos, sourcePick.sheet), {
+				title: `Move "${sourcePick.name}" (2 of 2)`,
+				placeHolder: 'Select the target display position',
+			});
+			if (positionPick === undefined) {
+				return;
+			}
+			let opSucceeded = false;
+			try {
+				target.session.moveSheet(sourcePick.sheet, positionPick.sheet);
+				opSucceeded = true;
+				log.appendLine(`Moved sheet ${sourcePick.sheet} ("${sourcePick.name}") to display position ${positionPick.sheet}.`);
+				void vscode.window.showInformationMessage(`Sheet "${sourcePick.name}" moved to position ${positionPick.sheet}.`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL moveSheet error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook move sheet failed: ${detail}`);
+			}
+			if (opSucceeded) {
+				try {
+					const { refreshed, failed } = CellGridPanel.refreshAll();
+					log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
+					if (failed > 0) {
+						void vscode.window.showWarningMessage(`Quantbook: the sheet change succeeded, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
+					}
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`refreshAll after moveSheet failed (non-fatal): ${detail}`);
+				}
+			}
+		}),
+	);
 }
