@@ -199,15 +199,31 @@ struct CellProvenance {
     revision: u64,
 }
 
+/// **ENG-FUSION:** which producer wrote a provenance entry. `refresh_source` re-runs
+/// only `Query` (SQL) sources through `materialize_query`; a `Published` dataset
+/// (`qb.publish`) is updated by RE-publishing (its producer is external — a Python
+/// value — so the engine cannot re-run it), so `refresh_source` rejects it loudly
+/// rather than mis-parsing the stored `{"values":...}` payload as SQL (No-Fallbacks).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProducerKind {
+    /// `materialize_query` — `data = {"sql": "..."}`, refreshable.
+    Query,
+    /// `publish_dataset` — `data = {"values": [[...]]}`, NOT refresh_source-able.
+    Published,
+}
+
 /// **6.5-2:** per-source provenance record stored in [`WorkbookSession::provenance`].
 /// Holds enough state to re-run `materialize_query` on `refresh_source` and
 /// to report the cells produced in the last materialization (the reverse index).
 struct ProvenanceEntry {
+    /// **ENG-FUSION:** the producer that wrote this entry (gates `refresh_source`).
+    kind: ProducerKind,
     /// The revision at which this source was last successfully materialized.
     /// Starts at 0 (first call sets it on the first `refresh_source`). A
     /// `refresh_source(revision)` with `revision <= stored` is a no-op.
     revision: u64,
-    /// The `data` argument (e.g. `{"sql": "..."}`) needed to re-run the producer.
+    /// The `data` argument (`{"sql": "..."}` for Query, `{"values": [[...]]}` for
+    /// Published) needed to re-run / re-record the producer.
     data: serde_json::Value,
     /// The `target` range passed to the last `materialize_query` call.
     target: CellRange,
@@ -3307,7 +3323,7 @@ impl EngineSession for WorkbookSession {
             // Zero-row publish: write nothing, record an (empty, refresh-able) provenance
             // entry, but still dirty the dependents of any previously-produced cells so a
             // shrink-to-zero reactively invalidates downstream formulas.
-            self.record_block_provenance(name, target, Vec::new(), data);
+            self.record_block_provenance(name, target, Vec::new(), data, ProducerKind::Published);
             for cell in &old_cells {
                 self.graph.on_set_value(cell.sheet, cell.row, cell.col);
             }
@@ -3345,7 +3361,7 @@ impl EngineSession for WorkbookSession {
                 });
             }
         }
-        self.record_block_provenance(name, target, produced, data);
+        self.record_block_provenance(name, target, produced, data, ProducerKind::Published);
 
         // Reactive dirty-notify: fan out over the PREVIOUS produced cells so dependents of
         // cells the new value no longer covers are dirtied. `write_range` already fired
@@ -3403,7 +3419,7 @@ impl EngineSession for WorkbookSession {
 
         // Extract the full provenance record under an immutable borrow; release
         // before any mutable use of `self`.
-        let (stored_rev, data, target, old_cells) = match self.provenance.get(source_id) {
+        let (kind, stored_rev, data, target, old_cells) = match self.provenance.get(source_id) {
             None => {
                 return Err(EngineError::new(
                     ErrorClass::NotFound,
@@ -3414,8 +3430,20 @@ impl EngineSession for WorkbookSession {
                     ),
                 ))
             }
-            Some(e) => (e.revision, e.data.clone(), e.target, e.cells.clone()),
+            Some(e) => (e.kind, e.revision, e.data.clone(), e.target, e.cells.clone()),
         };
+
+        // ENG-FUSION: a published dataset (`qb.publish`) has an EXTERNAL producer (a
+        // Python value the engine cannot re-run), so refresh_source cannot regenerate
+        // it. Reject loudly (No-Fallbacks) rather than replaying its `{"values":...}`
+        // payload through the SQL path (which would mis-parse as a missing-`sql` error).
+        // A published dataset is updated by RE-publishing it.
+        if kind == ProducerKind::Published {
+            return Err(EngineError::bad_argument(format!(
+                "refresh_source: source '{source_id}' is a published dataset (qb.publish); \
+                 update it by re-publishing, not refresh_source"
+            )));
+        }
 
         // Revision gate: a caller-provided revision that is not newer than the last
         // materialization means the source data has not changed — nothing to refresh.
@@ -3547,7 +3575,7 @@ impl EngineSession for WorkbookSession {
             // record_block_provenance still records an (empty) entry so refresh_source
             // can re-run, and evicts per-cell entries from a prior non-empty run of this
             // same source (shrink-to-zero), ownership-guarded.
-            self.record_block_provenance(query_id, target, Vec::new(), data);
+            self.record_block_provenance(query_id, target, Vec::new(), data, ProducerKind::Query);
             return Ok(PublishedRef {
                 id: query_id.to_string(),
             });
@@ -3586,7 +3614,7 @@ impl EngineSession for WorkbookSession {
                 });
             }
         }
-        self.record_block_provenance(query_id, target, produced, data);
+        self.record_block_provenance(query_id, target, produced, data, ProducerKind::Query);
 
         Ok(PublishedRef {
             id: query_id.to_string(),
@@ -3617,6 +3645,7 @@ impl WorkbookSession {
         target: CellRange,
         produced: Vec<CellAddr>,
         data: serde_json::Value,
+        kind: ProducerKind,
     ) {
         for &cell_addr in &produced {
             self.events.push(Event::Provenance {
@@ -3656,6 +3685,7 @@ impl WorkbookSession {
         self.provenance.insert(
             source_id.to_string(),
             ProvenanceEntry {
+                kind,
                 revision: 0,
                 data,
                 target,
@@ -4147,6 +4177,20 @@ fn json_block_to_cell_values(data: &serde_json::Value) -> EngineResult<Vec<Vec<C
                     return Err(EngineError::bad_argument(
                         "publish_dataset: `data.values` rows must have at least one column",
                     ));
+                }
+                // Cap the input cell count BEFORE converting the bulk matrix (and before
+                // publish_dataset stores `data` in provenance), mirroring the SQL input
+                // cap. The write_range cap also bounds the committed block, but this
+                // bails after row 0 so a within-parse-but-oversized payload cannot force
+                // a full Vec<Vec<CellValue>> allocation + long-lived provenance retention.
+                const MAX_PUBLISH_CELLS: u64 = 1 << 20; // ~1M cells
+                let total = (rows.len() as u64).saturating_mul(cells.len() as u64);
+                if total > MAX_PUBLISH_CELLS {
+                    return Err(EngineError::bad_argument(format!(
+                        "publish_dataset: data {}x{} exceeds the {MAX_PUBLISH_CELLS}-cell cap",
+                        rows.len(),
+                        cells.len()
+                    )));
                 }
                 width = Some(cells.len());
             }
@@ -5941,6 +5985,52 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(closed.code, "invalid_state");
+    }
+
+    /// refresh_source on a published dataset is a loud bad_argument (its producer is
+    /// external -> update by re-publishing), NOT a misleading SQL-parse error.
+    #[test]
+    fn refresh_source_rejects_published_dataset() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "ds",
+            serde_json::json!({"values": [[1.0]]}),
+            rng(sheet, 0, 0, 0, 0),
+        )
+        .unwrap();
+        let err = s.refresh_source("ds", 1).unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert!(
+            err.message.contains("published dataset"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    /// A value-matrix exceeding the 1<<20-cell cap is a loud bad_argument BEFORE the
+    /// bulk conversion + with no write / no provenance retained.
+    #[test]
+    fn publish_dataset_oversized_input_is_bad_argument() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // One row, (1<<20)+1 columns -> over the cap (caught after parsing row 0).
+        let n = (1usize << 20) + 1;
+        let row = serde_json::Value::Array(vec![serde_json::Value::from(1.0); n]);
+        let data = serde_json::json!({ "values": [row] });
+        let err = s
+            .publish_dataset("big", data, rng(sheet, 0, 0, 0, 0))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert!(err.message.contains("cap"), "got: {}", err.message);
+        assert!(
+            s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
+            "nothing written on an over-cap publish"
+        );
+        assert!(
+            !s.provenance.contains_key("big"),
+            "no provenance retained on an over-cap publish"
+        );
     }
 
     // --- ENG-FUSION: bind_range ---

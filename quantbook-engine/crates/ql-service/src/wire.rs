@@ -1464,7 +1464,7 @@ pub struct UnregisterFunctionBody {
     pub canonical_name: String,
 }
 
-// ---- reserved sec-3.5 bulk request bodies (always -> Capability/501) ----
+// ---- sec-3.5 bulk request bodies (all LIVE since 6.5 / ENG-FUSION) ----
 
 /// Parse a reserved-stub `data` payload (a JSON STRING carrying opaque JSON text;
 /// mirror of napi `parse_reserved_json_payload`). The frozen napi convention crosses

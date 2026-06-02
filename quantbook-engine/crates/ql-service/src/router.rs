@@ -234,7 +234,7 @@ pub(crate) async fn handle(
         ("POST", ["v1", "sessions", id, "rollback-transaction"]) => {
             rollback_transaction(&store, id, body).await
         }
-        // ---- 6.2-1c reserved sec-3.5 bulk (always not_implemented_in_v1_core -> 501) ----
+        // ---- sec-3.5 bulk methods (all LIVE since 6.5 / ENG-FUSION) ----
         ("POST", ["v1", "sessions", id, "write-range"]) => write_range(&store, id, body).await,
         ("POST", ["v1", "sessions", id, "publish-dataset"]) => {
             publish_dataset(&store, id, body).await

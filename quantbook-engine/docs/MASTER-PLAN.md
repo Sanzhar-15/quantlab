@@ -843,6 +843,9 @@ This session counted **2 plan-implement-audit cycles** (V3.6.0.6 D5 ship + V3.6.
 
 ## ENG-FUSION - Reactive Fusion Primitives
 
+**✅ COMPLETE 2026-06-02** (EF-1..EF-5; `publish_dataset` + `bind_range` live across napi/pyo3/service;
+FUSION-01..04 met; see `docs/eng-fusion/entry-plan.md`). The moat is now engine-unblocked for FE-1.5.
+
 **Purpose:** Unblock the product moat (a live reactive Python<->grid fusion workspace). Implement the two
 reserved section 3.5 stubs `publish_dataset` and `bind_range` (`crates/ql-exec/src/session.rs:3245/3254`,
 currently `not_implemented_in_v1_core`) plus the re-publish dirty-notify path, so a Python value can be

@@ -1,6 +1,10 @@
 # ENG-FUSION — Reactive fusion primitives (`publish_dataset`, `bind_range`) — entry plan
 
-**Status:** IN PROGRESS (started 2026-06-02). Pre-Phase-7 engine mini-phase on `feat/quantbook-engine`.
+**Status:** COMPLETE 2026-06-02. Pre-Phase-7 engine mini-phase on `feat/quantbook-engine`. Shipped across
+EF-1 (`c797ddd5a9b` docs) -> EF-2 (`01a4372b5ab` publish_dataset) -> EF-3 (`3d86557416d` bind_range) ->
+EF-4 (`b1f5366f58b` bindings) -> EF-5 (doc-sync + closure). FUSION-01..04 met. Verified: ql-exec 851 lib +
+8 §10.4 exit tests; ql-service 40 + cluster_e; node smoke; pyo3 eng-fusion smoke + golden_flow; clippy 0-new.
+The moat primitives are now live across all three transports; FE-1.5 (reactive fusion) is engine-unblocked.
 
 Master plan (`docs/MASTER-PLAN.md`, section `ENG-FUSION - Reactive Fusion Primitives`): unblock the product
 moat — implement the two reserved section-3.5 stubs `publish_dataset` and `bind_range`
@@ -56,6 +60,28 @@ signature** — no contract re-freeze.
   integration test per transport (publish -> recalc -> dependent recomputed).
 - **EF-5 — closure.** doc-sync (`session-api.md` section 3.5 + Appendix A, MASTER-PLAN markers, exit note);
   parallel Codex (high, read-only) + fresh-Opus closure audit; fold; memory handoff.
+
+## Closure audit (EF-5, 2026-06-02)
+Parallel **Codex (gpt-5.5, high, read-only) + fresh-Opus** lanes; every finding verified at source.
+**Both lanes: SHIP-WITH-FIXES, NO HIGH.** `record_block_provenance` confirmed behaviour-equivalent to the
+pre-refactor `materialize_query` bookkeeping; No-Fallbacks honoured end-to-end; bindings parity clean.
+**FOLDED (2 MED, Codex-caught):**
+- **MED-1 (provenance namespace collision):** `publish_dataset` recorded into the same `provenance` map
+  `refresh_source` replays through `materialize_query`, so `refresh_source` on a published id mis-parsed
+  `{"values":...}` as SQL (and a publish could clobber a SQL source's refreshability). FIX: tag entries with
+  `ProducerKind {Query, Published}`; `refresh_source` rejects `Published` with a clear `bad_argument`
+  (re-publish to update). Test `refresh_source_rejects_published_dataset`.
+- **MED-2 (oversized input pre-cap alloc):** the JSON matrix was converted + retained in provenance before
+  the `1<<20` write cap fired. FIX: cap input cells in `json_block_to_cell_values` (after row 0, before the
+  bulk convert), mirroring `materialize_query`'s input cap. Test `publish_dataset_oversized_input_is_bad_argument`.
+- Doc-sync: stale `router.rs`/`wire.rs` "always 501" section comments + the `refresh-source` "Always 501"
+  leftover; `session-api.md` publish row made explicit on shrink-keeps-values + not-`refresh_source`-able.
+**FILED (not v1-blocking):** (1) `bind_range` registry has no resolver/unbind over the transports + no
+removal path (v1 = a validated server-side reservation; the FE holds the coordinates and reads via
+`query_range`) — add a resolver/unbind when the FE consumes `qb.bind()`; (2) clear-on-shrink option for
+`publish_dataset` (v1 keeps vacated values, consistent with the other producers) — v2; (3) IDE
+`types.ts` still types `publishDataset`/`bindRange` as `void` — the existing cross-repo D-H1/H2 sync item
+on `feat/visualise-v1` (now also covers publish/bind).
 
 ## Build/commit discipline (carried)
 Mac bridge (`mac zsh -lc` + explicit `cd`; `export PATH=$HOME/.cargo/bin:$PATH`); commit with node

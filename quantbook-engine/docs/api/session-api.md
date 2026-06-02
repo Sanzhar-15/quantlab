@@ -237,15 +237,15 @@ Product commands (not collab `Op` variants — decision-lock §3.2). **v1** = in
   commit/rollback (same as `ops`/`events`); `options.undo_label`/`undo_group` and
   optional deadline are accepted-but-not-yet-consumed (land with undo/redo).
 
-### 3.5 Bulk data / publish / bind (HIGH-4 — reserved-stable shapes; implemented 6.4/6.5)
+### 3.5 Bulk data / publish / bind (HIGH-4 — reserved-stable shapes; implemented 6.4/6.5/ENG-FUSION)
 Reserved now so 6.4 (Python UDFs) and 6.5 (SQL/connectors) extend the shared trait instead of forking
 product-specific APIs (the #1 risk). Dirtying + provenance behavior is part of the lock:
 
 | Command | Tier | Purpose / dirtying |
 |---------|------|--------------------|
 | `write_range(range, values) -> WriteRangeResult` | **v1 ✅ (6.5-0)** | Bulk write a rectangular `Vec<Vec<CellValue>>` matrix; dirties dependents of the written range. **6.5-0:** validates the rectangle (inverted-range / out-of-grid / `1<<20`-cell cap / exact shape, all loud `bad_argument` pre-mutation), then lowers to one `SetValue` op per cell and applies via `batch` — so the whole write is ONE `Op::BatchCommit` (one undo unit; `undo` reverts the entire range) and the version token advances exactly once. `Blank` clears a cell. Returns `WriteRangeResult { written, version }`. (`options` deferred; Arrow-batch input form is a later increment.) |
-| `publish_dataset(name, data, target, provenance) -> PublishedRef` | reserved (6.4) | `qb.publish()` — materialize a DataFrame/table into a sheet/table; dirties dependents; carries provenance (§9) |
-| `bind_range(binding_id, target, schema, options) -> BoundRange` | reserved (6.4) | `qb.bind()` — overlay a `BoundFrame` onto a range/table; overlay edits dirty bound-range formulas |
+| `publish_dataset(name, data, target) -> PublishedRef` | **v1 ✅ (ENG-FUSION)** | `qb.publish()` — publish a JSON value-matrix `data = {"values":[[scalar\|null,...],...]}` (per-CELL conversion: finite number→Number, string→Text, bool→Boolean, null→Blank) into `target` via the `write_range` substrate (one `Op::BatchCommit`, dirties dependents). Records dual provenance keyed by `name`; on RE-publish dirties the dependents of vacated cells (the reactive moat) — but vacated cells KEEP their values (only their dependents are dirtied, matching `materialize_query`/`refresh_source`; re-publish a Blank-padded matrix into the original `target` to clear). Must FIT `target` (else loud `bad_argument`); input is capped at `1<<20` cells; malformed/non-rectangular/non-scalar/non-finite `data` is loud `bad_argument` (No-Fallbacks). A published dataset is NOT `refresh_source`-able (its producer is external — re-publish to update; `refresh_source` on a published id is a loud `bad_argument`). Returns `PublishedRef { id: name }`. (`provenance` arg + Arrow-IPC `data` variant are later increments.) |
+| `bind_range(binding_id, target) -> BoundRange` | **v1 ✅ (ENG-FUSION)** | `qb.bind()` — register `binding_id → target` as a `BoundFrame` overlay region (a region pointer, KEPT across undo/redo); round-trip reads go through `query_range`. Validates `target` like `write_range` (loud `bad_argument`/`sheet_not_found`). Returns `BoundRange { binding_id }`. (`schema`/`options` deferred.) |
 | `refresh_source(source_id, revision) -> DirtyResult` | **v1 ✅ (6.5-2)** | **6.5-2:** re-runs the recorded `materialize_query` producer for `source_id` and re-materializes its result via the `write_range` substrate, dirtying dependents. Revision-gated: a `revision` ≤ the stored revision is a no-op. An unknown `source_id` (never materialized in this session) is a loud `source_not_found` (404; No-Fallbacks). Returns `DirtyResult { dirtied, version }`. Backed by the dual provenance index (per-cell `cell→{source_id, revision}` + per-source `source_id→produced cells`). |
 | `materialize_query(query_id, target, data) -> PublishedRef` | **v1 ✅ (6.5-1)** | **6.5-1:** `data` = `{"sql": "<query>"}`. Runs the SQL OFF the hot path (DataFusion, via the pure `ql-sql` crate) over the workbook's tables (by display name, named columns) + sheets (by name, A1-letter columns over the effective value bounds), case-preserving identifiers. The result is written as a block anchored at `target`'s top-left via the `write_range` substrate (one `Op::BatchCommit`, dirties dependents); it must FIT within `target` (else loud `bad_argument`), a 0-row result writes nothing, and surplus target cells are untouched. Read-only: DDL/DML/statements are forbidden (no `COPY`/`CREATE EXTERNAL TABLE`/`SET`). Input + result are capped at 1<<20 cells/rows (loud over-cap). Returns `PublishedRef { id: query_id }`. **6.5-2:** records dual provenance (per-cell `cell→{source_id, revision}` + per-source `source_id→produced cells` reverse index) consumed by `refresh_source`. |
 
@@ -426,10 +426,10 @@ consumes the handle; `rollbackTransaction` discards + consumes. The 5 reserved �
 `publishDataset` / `bindRange` / `refreshSource` / `materializeQuery` are bound as thin loud-Capability
 forwarders (declared `-> void`, always `not_implemented_in_v1_core`; `publishDataset`/`materializeQuery` take
 `data` as a JSON string since the napi `serde-json` feature is off) — their FULL input contract (e.g.
-`writeRange`'s matrix-shape rule) lands with the real impl in 6.4/6.5. **(Post-6.5 — authoritative state in
-§3.5:** `writeRange`/`materializeQuery`/`refreshSource` are now LIVE and return real DTOs
-[`WriteRangeResult`/`PublishedRef`/`DirtyResult`], no longer `void` or `not_implemented_in_v1_core`; only
-`publishDataset`/`bindRange` remain reserved-Capability.)
+`writeRange`'s matrix-shape rule) lands with the real impl in 6.4/6.5/ENG-FUSION. **(Post-6.5 + ENG-FUSION —
+authoritative state in §3.5:** ALL FIVE §3.5 bulk methods `writeRange`/`materializeQuery`/`refreshSource`/
+`publishDataset`/`bindRange` are now LIVE and return real DTOs [`WriteRangeResult`/`PublishedRef`/
+`DirtyResult`/`PublishedRef`/`BoundRange`], no longer `void` or `not_implemented_in_v1_core`.)
 
 **6.3-2 is now COMPLETE** — all 32 `EngineSession` methods are bound across sub-increments a–e.
 
@@ -445,7 +445,7 @@ carries `fullRebuildRequired = true` with a `fullRebuildReason` (`no_prior_versi
 clear the delta cache, so the next `snapshotDelta` against an older token full-rebuilds; both gate
 `ensure_ready` (→ `invalid_state` post-close). `canUndo`/`canRedo` are ungated pure reads.
 
-**6.3-4 — a SECOND binding row (Python) over pyo3.** The thin pyo3 `Session` facade (`quantbook._quantbook`) SHIPPED 2026-05-31 (engine `38f4f51dfac`), wrapping the SAME `EngineSession` contract this document specifies. A cross-binding **golden parity matrix** (`crates/quantbook-py/tests/parity_matrix.py`) runs one canonical flow through Node, Python AND (as of 6.2-4) the HTTP service and asserts byte-identical DTOs + error codes (masking only the opaque `version`/`nextCursor` tokens) -- so the contract is exercised by three structurally-different transports, not Node self-consistency alone. (The flow grew from the original 22 steps to **26** when 6.5 added `write_range`/`materialize_query`/`refresh_source` steps; the byte gate compares Node vs Service, with Python structural-only.) The Python facade is THIN (golden-flow methods only). **Post-6.5 status of the §3.5 bulk methods (see §3.5):** `write_range`/`materialize_query`/`refresh_source` are LIVE across all three transports; only `publish_dataset`/`bind_range` remain `Capability`-erroring. Errors cross as a `QuantbookError(Exception)` carrying the same `code`/`class`/`retryable`/`details`/`source` the napi native error carries. NEXT = 6.3-5 (declare the contract frozen on ≥ 2 passing rows).
+**6.3-4 — a SECOND binding row (Python) over pyo3.** The thin pyo3 `Session` facade (`quantbook._quantbook`) SHIPPED 2026-05-31 (engine `38f4f51dfac`), wrapping the SAME `EngineSession` contract this document specifies. A cross-binding **golden parity matrix** (`crates/quantbook-py/tests/parity_matrix.py`) runs one canonical flow through Node, Python AND (as of 6.2-4) the HTTP service and asserts byte-identical DTOs + error codes (masking only the opaque `version`/`nextCursor` tokens) -- so the contract is exercised by three structurally-different transports, not Node self-consistency alone. (The flow grew from the original 22 steps to **26** when 6.5 added `write_range`/`materialize_query`/`refresh_source` steps; the byte gate compares Node vs Service, with Python structural-only.) The Python facade is THIN (golden-flow methods only). **Post-6.5 + ENG-FUSION status (see §3.5):** ALL FIVE §3.5 bulk methods (`write_range`/`materialize_query`/`refresh_source`/`publish_dataset`/`bind_range`) are LIVE across all three transports. Errors cross as a `QuantbookError(Exception)` carrying the same `code`/`class`/`retryable`/`details`/`source` the napi native error carries. NEXT = 6.3-5 (declare the contract frozen on ≥ 2 passing rows).
 
 ### 4.2 Core DTOs (extracted from the proven `#[napi(object)]` structs; `+` = added/clarified)
 
@@ -867,12 +867,11 @@ a UDF dirties formulas that referenced its (previously-unknown) name.
 > is enforced in `ql-udf` + exercised by `process_smoke.rs`), (7) `exit_test_7_*` (all 8 diagnostic
 > codes incl. `udf_worker_died`/`udf_codec`/`udf_protocol`/`udf_handshake`/`udf_cancelled`, at `Error`
 > severity), (8) `exit_test_8_*` (register→dirty→recalc, airtight: `#NAME?`+`calls==0` before
-> `recalc_dirty`, `==42`+`calls==1` after). **Tests (4) `publish` and (5) `BoundFrame` are
-> reserved-tier capability guards** — `publish_dataset`/`bind_range` are `not_implemented_in_v1_core`
-> (§11), so the suite asserts the fail-loud status; the positive dirty-dependents proof lands when
-> those producers ship (the cell-dep fanout they generalize is proven by (1)/(8)). v1 reaches the
-> timeout half of (6); the cooperative-CANCEL route is not yet driven from the session (its diagnostic
-> code IS covered by (7)).
+> `recalc_dirty`, `==42`+`calls==1` after). **Tests (4) `publish` and (5) `BoundFrame` are now
+> positive exits** — ENG-FUSION shipped `publish_dataset`/`bind_range`, so (4) asserts the
+> publish→dirty→recompute path and (5) asserts a `BoundFrame` overlay edit (a write into the bound
+> range) dirties bound-range formulas. v1 reaches the timeout half of (6); the cooperative-CANCEL
+> route is not yet driven from the session (its diagnostic code IS covered by (7)).
 
 ---
 
@@ -989,7 +988,7 @@ amendment note below the table). Ambiguities Codex flagged, resolved here:
 | txn id space exhausted — 2^64 `begin`s in one session (inc.2c-5; loud, never wraps) | `Internal` | `transaction_id_exhausted` | no |
 | Loro `UndoManager::undo`/`redo` internal failure (inc.2c-7; empty stack is `consumed:false`, NOT this) | `Internal` | `undo_manager_failed` | no |
 | op-log replay failure during undo/redo re-materialization (inc.2c-7) | `Internal` | `replay_failed` | no |
-| §3.5 reserved bulk method not yet implemented (`not_implemented`; `publishDataset`/`bindRange`) | `Capability` | `not_implemented_in_v1_core` | no |
+| `query_range` requested column extras (formulas/formats/rendered) not served by the v1 columnar read; `export("xlsx")` without the `xlsx-write` feature | `Capability` | `not_implemented_in_v1_core` | no |
 | `materialize_query`: SQL parse/plan/execute failure, or a result that does not fit / DDL-DML-statements rejected (6.5-1) | `BadArgument` | `sql_error` | no |
 | `materialize_query`: workbook→Arrow table build / result-shape failure (6.5-1) | `Internal` | `sql_table_build` | no |
 | `refresh_source`: unknown `source_id` (6.5-2) | `NotFound` | `source_not_found` | no |
@@ -1052,5 +1051,5 @@ carry that context, so the mapping is honest about what it can distinguish:
 | *(none today)* | `cancel`/`operation_status`/`subscribe_events`/`poll_events` | v1 (new) |
 | `registerFunction`/`unregisterFunction`/`listFunctions` (owning `Session`) | `register_function`/`unregister_function`/`list_functions` | v1 ✅ (6.4-2) |
 | *(none today)* | `write_range`/`materialize_query`/`refresh_source` | v1 ✅ (6.5-0 / 6.5-1 / 6.5-2) |
-| *(none today)* | `publish_dataset`/`bind_range` | reserved (6.4 — `qb.publish()`/`qb.bind()`) |
+| *(none today)* | `publish_dataset`/`bind_range` | v1 ✅ (ENG-FUSION — `qb.publish()`/`qb.bind()`) |
 | *(none today)* | `begin/commit/rollback_transaction`, `query_range` | v1 |
