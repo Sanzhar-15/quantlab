@@ -33,6 +33,7 @@ import type {
 	QuantbookCellSnapshot,
 	QuantbookErrorCode,
 	QuantbookErrorInfo,
+	SessionCellValueInput,
 	SessionInstance,
 	TransportInstance,
 	WorkbookSnapshotDeltaJson,
@@ -156,6 +157,120 @@ export function appendPutFormulaValidated(
 		throw new Error(`[bad_argument] appendPutFormula: text must be a string, got ${typeof text}`);
 	}
 	session.appendPutFormula(sheet, row, col, text);
+}
+
+// ============================================================================
+// FE-0a Part B / B1 (2026-06-02) -- owning single-writer `Session` write path.
+//
+// The grid migrates off the legacy `CollabSession` op-log append model onto the
+// owning `Session` (direct-set + explicit recalc) so it can consume the
+// ENG-FUSION fusion primitives (publishDataset/bindRange/recalcDirty). These are
+// the `Session` counterparts to appendPutValue/FormulaValidated above: same
+// JS-side validation discipline (the napi ToUint32-coercion guard surfaces a
+// precise `[bad_argument]` BEFORE the FFI boundary), plus setValue validates the
+// SessionCellValueInput shape so number/text/boolean/blank cells round-trip.
+// ============================================================================
+
+/**
+ * **FE-0a Part B (B1)** -- typed wrapper for `Session.setValue` with JS-side
+ * validation. `value` is a {@link SessionCellValueInput} (`number` | `boolean` |
+ * `text` | `blank`); `blank` clears the cell. Validates sheet/row/col ranges
+ * (the ToUint32 guard) AND the value's payload field matches its `kind`, so a
+ * malformed cell value surfaces `[bad_argument]` at the TS layer rather than
+ * after a silent FFI coercion. This is the write path the text-cell fix relies
+ * on -- `CollabSession.appendPutValue` had no text variant.
+ *
+ * @throws Error (`parseQuantbookError(err).code === 'bad_argument'`) on an
+ *         out-of-range coordinate, a non-finite number, or a payload/kind mismatch.
+ */
+export function setValueValidated(
+	session: SessionInstance,
+	sheet: number,
+	row: number,
+	col: number,
+	value: SessionCellValueInput,
+): void {
+	if (!Number.isInteger(sheet) || sheet < 0 || sheet > 0xFFFF) {
+		throw new Error(`[bad_argument] setValue: sheet must be an integer in [0, 65535], got ${sheet}`);
+	}
+	if (!Number.isInteger(row) || row < 0 || row > 0xFFFFFFFF) {
+		throw new Error(`[bad_argument] setValue: row must be an integer in [0, 4294967295], got ${row}`);
+	}
+	if (!Number.isInteger(col) || col < 0 || col > 0xFFFFFFFF) {
+		throw new Error(`[bad_argument] setValue: col must be an integer in [0, 4294967295], got ${col}`);
+	}
+	switch (value.kind) {
+		case 'number':
+			if (typeof value.number !== 'number' || !Number.isFinite(value.number)) {
+				throw new Error(`[bad_argument] setValue: a number cell requires a finite number, got ${value.number}`);
+			}
+			break;
+		case 'boolean':
+			if (typeof value.boolean !== 'boolean') {
+				throw new Error(`[bad_argument] setValue: a boolean cell requires a boolean, got ${typeof value.boolean}`);
+			}
+			break;
+		case 'text':
+			if (typeof value.text !== 'string') {
+				throw new Error(`[bad_argument] setValue: a text cell requires a string, got ${typeof value.text}`);
+			}
+			break;
+		case 'blank':
+			break;
+		default:
+			throw new Error(`[bad_argument] setValue: unknown cell value kind ${String((value as { kind?: unknown }).kind)}`);
+	}
+	session.setValue(sheet, row, col, value);
+}
+
+/**
+ * **FE-0a Part B (B1)** -- typed wrapper for `Session.setFormula` with JS-side
+ * validation. Mirrors {@link setValueValidated}'s coordinate discipline; like
+ * `appendPutFormulaValidated`, performs NO `text` validation (any string is a
+ * valid formula at the wire level -- the engine surfaces parse/bind issues as
+ * `#NAME?`/`#REF!` cell values, not append-time throws).
+ */
+export function setFormulaValidated(
+	session: SessionInstance,
+	sheet: number,
+	row: number,
+	col: number,
+	text: string,
+): void {
+	if (!Number.isInteger(sheet) || sheet < 0 || sheet > 0xFFFF) {
+		throw new Error(`[bad_argument] setFormula: sheet must be an integer in [0, 65535], got ${sheet}`);
+	}
+	if (!Number.isInteger(row) || row < 0 || row > 0xFFFFFFFF) {
+		throw new Error(`[bad_argument] setFormula: row must be an integer in [0, 4294967295], got ${row}`);
+	}
+	if (!Number.isInteger(col) || col < 0 || col > 0xFFFFFFFF) {
+		throw new Error(`[bad_argument] setFormula: col must be an integer in [0, 4294967295], got ${col}`);
+	}
+	if (typeof text !== 'string') {
+		throw new Error(`[bad_argument] setFormula: text must be a string, got ${typeof text}`);
+	}
+	session.setFormula(sheet, row, col, text);
+}
+
+/**
+ * **FE-0a Part B (B1)** -- run an incremental recalc on the owning `Session` and
+ * surface a failed operation loudly (No-Fallbacks). Unlike `CollabSession`, where
+ * `appendPutValue` recomputes during op-apply, `Session.setValue` only marks
+ * dependents dirty -- so the grid MUST recalc before re-snapshotting or formulas
+ * stay stale. In-engine recalc runs synchronously, so `operationStatus(op)` is
+ * terminal on return; a `failed` op (e.g. recompute-iteration-cap, panic) throws
+ * with the engine's structured `code` as a parseable `[code]` prefix instead of
+ * leaving the grid showing stale values.
+ */
+export function recalcDirtyChecked(session: SessionInstance): void {
+	const op = session.recalcDirty();
+	const status = session.operationStatus(op);
+	if (status.state === 'failed') {
+		const e = status.error;
+		const code = e?.code ?? 'panic';
+		const detail = e?.details ? `: ${e.details}` : '';
+		throw new Error(`[${code}] recalcDirty operation failed (class=${e?.class ?? 'Internal'})${detail}`);
+	}
 }
 
 /**

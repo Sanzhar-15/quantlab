@@ -52,6 +52,7 @@ import {
 	buildPresenceSnapshotJson,
 	clearPresence,
 	createSession,
+	createWorkbookSession,
 	deleteSheet,
 	exportCellSnapshot,
 	exportToQbook,
@@ -65,11 +66,13 @@ import {
 	peerPresence,
 	peersWithPresence,
 	quantbookEngineVersion,
+	recalcDirtyChecked,
 	redo,
 	renameSheet,
 	restoreSheet,
 	sessionFromQbook,
 	sessionFromSnapshot,
+	setValueValidated,
 	sweepPresence,
 	undo,
 	updatePresence,
@@ -78,10 +81,10 @@ import {
 import type {
 	BlockingTransportFixtureConstructor,
 	CellSnapshotJson,
-	CollabSessionInstance,
 	FormatDefJson,
 	QuantbookCellSnapshot,
 	QuantbookNativeModule,
+	SessionInstance,
 	SheetSnapshotJson,
 	WorkbookSnapshotDeltaJson,
 	WorkbookSnapshotJson,
@@ -2421,7 +2424,7 @@ suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', f
 		if (r.skip) { this.skip(); }
 	});
 
-	function makeDeps(session: CollabSessionInstance, sheet: number) {
+	function makeDeps(session: SessionInstance, sheet: number) {
 		const errorReplies: ErrorReplyMessage[] = [];
 		let commitCount = 0;
 		const deps = {
@@ -2433,8 +2436,21 @@ suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', f
 		return { deps, errorReplies, getCommitCount: () => commitCount };
 	}
 
-	test('putValue success: commits the value + invokes onCommit', () => {
-		const session = createSession(401n);
+	// FE-0a Part B (B1): the grid writes via the owning Session, which requires
+	// the target sheet to exist before setValue/setFormula. Seed sheet 0.
+	function freshSession(): SessionInstance {
+		const s = createWorkbookSession();
+		s.addSheet('S', 1000);
+		return s;
+	}
+
+	function cellAt(session: SessionInstance, sheet: number, row: number, col: number) {
+		const snap = extractSheetSnapshot(session.snapshot(), sheet);
+		return snap?.entries.find(e => e.row === row && e.col === col);
+	}
+
+	test('putValue number: commits the value + invokes onCommit', () => {
+		const session = freshSession();
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 		dispatchIncomingMessage(
 			{ type: 'putValue', sheet: 0, row: 1, col: 2, rawInput: '99.5' },
@@ -2442,46 +2458,63 @@ suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', f
 		);
 		assert.strictEqual(getCommitCount(), 1, 'onCommit fired once');
 		assert.strictEqual(errorReplies.length, 0, 'no error reply on success');
-		assert.strictEqual(session.opCount(), 1, 'op log has the new PutValue');
-		const snap = exportCellSnapshot(session, 0);
-		assert.strictEqual(snap.entries.length, 1);
-		assert.deepStrictEqual(snap.entries[0], {
+		assert.deepStrictEqual(cellAt(session, 0, 1, 2), {
 			row: 1, col: 2, value: { kind: 'number', value: 99.5 },
 		});
 	});
 
-	test('putValue with non-numeric rawInput: posts errorReply with bad_argument code', () => {
-		const session = createSession(402n);
+	// FE-0a Part B (B1) -- THE TEXT-CELL FIX: a non-numeric, non-formula literal
+	// is now a TEXT cell (was a bad_argument rejection under the numeric-only path).
+	test('putValue text: a non-numeric literal commits as a text cell (no error)', () => {
+		const session = freshSession();
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 		dispatchIncomingMessage(
 			{ type: 'putValue', sheet: 0, row: 1, col: 2, rawInput: 'hello world' },
 			deps,
 		);
-		assert.strictEqual(getCommitCount(), 0, 'no commit on parse failure');
-		assert.strictEqual(session.opCount(), 0, 'op log unchanged');
-		assert.strictEqual(errorReplies.length, 1);
-		const reply = errorReplies[0];
-		assert.strictEqual(reply.type, 'errorReply');
-		assert.strictEqual(reply.sheet, 0);
-		assert.strictEqual(reply.row, 1);
-		assert.strictEqual(reply.col, 2);
-		assert.strictEqual(reply.code, 'bad_argument');
-		assert.match(reply.message, /finite number/);
+		assert.strictEqual(getCommitCount(), 1, 'onCommit fired (text is a valid value)');
+		assert.strictEqual(errorReplies.length, 0, 'no error reply -- text is valid');
+		assert.deepStrictEqual(cellAt(session, 0, 1, 2), {
+			row: 1, col: 2, value: { kind: 'text', value: 'hello world' },
+		});
 	});
 
-	test('putValue with empty rawInput: posts bad_argument errorReply', () => {
-		const session = createSession(403n);
-		const { deps, errorReplies } = makeDeps(session, 0);
+	// FE-0a Part B (B1): an empty literal clears the cell (blank) rather than
+	// erroring (the old numeric-only path threw "cell value cannot be empty").
+	test('putValue empty: clears the cell (blank), no error', () => {
+		const session = freshSession();
+		setValueValidated(session, 0, 0, 0, { kind: 'number', number: 7 });
+		recalcDirtyChecked(session);
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 		dispatchIncomingMessage(
 			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: '' },
 			deps,
 		);
-		assert.strictEqual(errorReplies.length, 1);
-		assert.strictEqual(errorReplies[0].code, 'bad_argument');
+		assert.strictEqual(getCommitCount(), 1, 'onCommit fired (blank clears)');
+		assert.strictEqual(errorReplies.length, 0, 'empty input clears rather than erroring');
+		assert.strictEqual(cellAt(session, 0, 0, 0), undefined, 'cell cleared');
+	});
+
+	// FE-0a Part B (B1): `=`-prefix routes to setFormula; the dependent recomputes
+	// after the dispatch's recalc.
+	test('putValue formula: commits via setFormula + recomputes the dependent', () => {
+		const session = freshSession();
+		setValueValidated(session, 0, 0, 0, { kind: 'number', number: 5 });
+		recalcDirtyChecked(session);
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 0, row: 0, col: 1, rawInput: '=A1*2' },
+			deps,
+		);
+		assert.strictEqual(getCommitCount(), 1);
+		assert.strictEqual(errorReplies.length, 0);
+		assert.deepStrictEqual(cellAt(session, 0, 0, 1), {
+			row: 0, col: 1, value: { kind: 'number', value: 10 },
+		});
 	});
 
 	test('putValue with sheet mismatch: dropped (no commit, no errorReply)', () => {
-		const session = createSession(404n);
+		const session = freshSession();
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 		dispatchIncomingMessage(
 			{ type: 'putValue', sheet: 99, row: 0, col: 0, rawInput: '1.0' },
@@ -2489,25 +2522,23 @@ suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', f
 		);
 		assert.strictEqual(getCommitCount(), 0);
 		assert.strictEqual(errorReplies.length, 0);
-		assert.strictEqual(session.opCount(), 0);
 	});
 
-	test('unknown message type: dropped silently (no commit, no errorReply)', () => {
-		const session = createSession(405n);
+	test('unknown + dormant-collab message types: dropped silently', () => {
+		const session = freshSession();
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage({ type: 'futureFeature', payload: 42 }, deps);
+		dispatchIncomingMessage({ noType: true }, deps);
+		dispatchIncomingMessage('not an object', deps);
+		dispatchIncomingMessage(null, deps);
+		// FE-0a Part B (B1): presence + typing-stroke are collab-only (v1.5-dormant);
+		// the Session dispatch drops them silently (no engine call, no error).
 		dispatchIncomingMessage(
-			{ type: 'futureFeature', payload: 42 },
+			{ type: 'presenceUpdate', state: { sheet: 0, row: 0, col: 0, selectionEndRow: 0, selectionEndCol: 0, typing: true } },
 			deps,
 		);
+		dispatchIncomingMessage({ type: 'typing_stroke' }, deps);
 		assert.strictEqual(getCommitCount(), 0);
-		assert.strictEqual(errorReplies.length, 0);
-		// Same for missing type field.
-		dispatchIncomingMessage({ noType: true }, deps);
-		assert.strictEqual(errorReplies.length, 0);
-		// Same for non-object input.
-		dispatchIncomingMessage('not an object', deps);
-		assert.strictEqual(errorReplies.length, 0);
-		dispatchIncomingMessage(null, deps);
 		assert.strictEqual(errorReplies.length, 0);
 	});
 });
@@ -2700,7 +2731,7 @@ suite('quantbook V3.2.d HIGH-2 -- dispatcher rawInput type guard', function () {
 		if (r.skip) { this.skip(); }
 	});
 
-	function makeDeps(session: CollabSessionInstance, sheet: number) {
+	function makeDeps(session: SessionInstance, sheet: number) {
 		const errorReplies: ErrorReplyMessage[] = [];
 		let commitCount = 0;
 		const deps = {
@@ -2713,7 +2744,7 @@ suite('quantbook V3.2.d HIGH-2 -- dispatcher rawInput type guard', function () {
 	}
 
 	test('rawInput = null surfaces bad_argument (NOT unknown)', () => {
-		const session = createSession(705n);
+		const session = createWorkbookSession();
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 		dispatchIncomingMessage(
 			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: null },
@@ -2727,7 +2758,7 @@ suite('quantbook V3.2.d HIGH-2 -- dispatcher rawInput type guard', function () {
 	});
 
 	test('rawInput = undefined surfaces bad_argument', () => {
-		const session = createSession(706n);
+		const session = createWorkbookSession();
 		const { deps, errorReplies } = makeDeps(session, 0);
 		dispatchIncomingMessage(
 			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: undefined },
@@ -2738,7 +2769,7 @@ suite('quantbook V3.2.d HIGH-2 -- dispatcher rawInput type guard', function () {
 	});
 
 	test('rawInput = 42 (number) surfaces bad_argument', () => {
-		const session = createSession(707n);
+		const session = createWorkbookSession();
 		const { deps, errorReplies } = makeDeps(session, 0);
 		dispatchIncomingMessage(
 			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: 42 },
@@ -2749,7 +2780,7 @@ suite('quantbook V3.2.d HIGH-2 -- dispatcher rawInput type guard', function () {
 	});
 
 	test('rawInput = string but fractional row surfaces bad_argument via IDE validator', () => {
-		const session = createSession(708n);
+		const session = createWorkbookSession();
 		const { deps, errorReplies } = makeDeps(session, 0);
 		dispatchIncomingMessage(
 			{ type: 'putValue', sheet: 0, row: 1.5, col: 0, rawInput: '42' },
@@ -3456,7 +3487,7 @@ suite('quantbook V3.4.0.3 -- dispatchIncomingMessage undo/redo arms', function (
 		if (r.skip) { this.skip(); }
 	});
 
-	function makeDeps(session: CollabSessionInstance, sheet: number) {
+	function makeDeps(session: SessionInstance, sheet: number) {
 		const errorReplies: ErrorReplyMessage[] = [];
 		let commitCount = 0;
 		const deps = {
@@ -3468,46 +3499,55 @@ suite('quantbook V3.4.0.3 -- dispatchIncomingMessage undo/redo arms', function (
 		return { deps, errorReplies, getCommitCount: () => commitCount };
 	}
 
+	// FE-0a Part B (B1): on the owning Session, undo/redo return
+	// `UndoRedoResultJson { consumed }` (the dispatch handles the DTO internally);
+	// the entry count is read via extractSheetSnapshot(session.snapshot(), ...).
+	// NB addSheet is itself undoable, so the empty-stack tests stay pristine.
+	function entryCount(session: SessionInstance, sheet: number): number {
+		return (extractSheetSnapshot(session.snapshot(), sheet)?.entries ?? []).length;
+	}
+
 	test('undo envelope on consumed undo: triggers onCommit, no errorReply', () => {
-		const session = createSession(3411n);
-		appendPutValueValidated(session, 0, 0, 0, 1);
+		const session = createWorkbookSession();
+		session.addSheet('S', 1000);
+		setValueValidated(session, 0, 0, 0, { kind: 'number', number: 1 });
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 
 		dispatchIncomingMessage({ type: 'undo' }, deps);
 
 		assert.strictEqual(getCommitCount(), 1, 'consumed undo triggers onCommit');
 		assert.strictEqual(errorReplies.length, 0);
-		// Engine state confirmation: cell retracted.
-		assert.strictEqual(exportCellSnapshot(session, 0).entries.length, 0);
+		// Engine state confirmation: cell retracted (the setValue undone).
+		assert.strictEqual(entryCount(session, 0), 0);
 	});
 
 	test('undo envelope on empty stack: silent no-op (no onCommit, no errorReply)', () => {
-		const session = createSession(3412n);
+		const session = createWorkbookSession(); // pristine: nothing to undo
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 
 		dispatchIncomingMessage({ type: 'undo' }, deps);
 
 		assert.strictEqual(getCommitCount(), 0, 'empty undo stack does NOT trigger onCommit');
 		assert.strictEqual(errorReplies.length, 0,
-			'empty undo stack does NOT generate errorReply (per V3.4.0.3 dispatcher contract)');
+			'empty undo stack does NOT generate errorReply (per the dispatcher contract)');
 	});
 
 	test('redo envelope on consumed redo: triggers onCommit', () => {
-		const session = createSession(3413n);
-		appendPutValueValidated(session, 0, 0, 0, 99);
-		undo(session); // populate redo stack
+		const session = createWorkbookSession();
+		session.addSheet('S', 1000);
+		setValueValidated(session, 0, 0, 0, { kind: 'number', number: 99 });
+		session.undo(); // undo the setValue -> populates the redo stack
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 
 		dispatchIncomingMessage({ type: 'redo' }, deps);
 
 		assert.strictEqual(getCommitCount(), 1);
 		assert.strictEqual(errorReplies.length, 0);
-		assert.strictEqual(exportCellSnapshot(session, 0).entries.length, 1,
-			'redo restored the cell');
+		assert.strictEqual(entryCount(session, 0), 1, 'redo restored the cell');
 	});
 
 	test('redo envelope on empty stack: silent no-op', () => {
-		const session = createSession(3414n);
+		const session = createWorkbookSession(); // pristine: nothing to redo
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 
 		dispatchIncomingMessage({ type: 'redo' }, deps);
@@ -3519,10 +3559,10 @@ suite('quantbook V3.4.0.3 -- dispatchIncomingMessage undo/redo arms', function (
 	test('undo envelope ignored payload fields (session-wide, not cell-keyed)', () => {
 		// Defensive: even if the webview script accidentally posts
 		// {type:'undo', sheet: 99, row: 5} the dispatcher should ignore
-		// the extra fields + operate on the engine's session-wide
-		// undo stack.
-		const session = createSession(3415n);
-		appendPutValueValidated(session, 0, 0, 0, 1);
+		// the extra fields + operate on the engine's session-wide undo stack.
+		const session = createWorkbookSession();
+		session.addSheet('S', 1000);
+		setValueValidated(session, 0, 0, 0, { kind: 'number', number: 1 });
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 
 		dispatchIncomingMessage({ type: 'undo', sheet: 99, row: 5, col: 5 }, deps);
@@ -3853,81 +3893,11 @@ suite('quantbook V3.4.0.5b -- webview script body wires presence init + edit-mod
 	});
 });
 
-suite('quantbook V3.4.0.5b -- dispatchIncomingMessage presenceUpdate arm', function () {
-	suiteSetup(function () {
-		const r = shouldSkip();
-		if (r.skip) { this.skip(); }
-	});
-
-	function makeDeps(session: CollabSessionInstance, sheet: number) {
-		const errorReplies: ErrorReplyMessage[] = [];
-		let commitCount = 0;
-		const deps = {
-			session,
-			sheet,
-			onCommit: () => { commitCount += 1; },
-			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
-		};
-		return { deps, errorReplies, getCommitCount: () => commitCount };
-	}
-
-	const validState = { sheet: 0, row: 3, col: 4, selectionEndRow: 3, selectionEndCol: 4, typing: false };
-
-	test('presenceUpdate envelope: success -> session updated, NO onCommit', () => {
-		const session = createSession(3611n);
-		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
-
-		dispatchIncomingMessage({ type: 'presenceUpdate', state: validState }, deps);
-
-		assert.strictEqual(getCommitCount(), 0,
-			'presenceUpdate does NOT trigger onCommit (re-render thrash avoidance)');
-		assert.strictEqual(errorReplies.length, 0);
-		// Engine state confirmation: own presence stored.
-		const stored = peerPresence(session, session.peerId());
-		assert.ok(stored !== null);
-		assert.strictEqual(stored?.row, 3);
-		assert.strictEqual(stored?.col, 4);
-	});
-
-	test('presenceUpdate with missing state field -> bad_argument errorReply', () => {
-		const session = createSession(3612n);
-		const { deps, errorReplies } = makeDeps(session, 0);
-
-		dispatchIncomingMessage({ type: 'presenceUpdate' }, deps);
-
-		assert.strictEqual(errorReplies.length, 1);
-		assert.strictEqual(errorReplies[0].code, 'bad_argument');
-		assert.match(errorReplies[0].message, /\[presenceUpdate\]/);
-	});
-
-	test('presenceUpdate with malformed state (wrong field type) -> bad_argument', () => {
-		const session = createSession(3613n);
-		const { deps, errorReplies } = makeDeps(session, 0);
-
-		// row is a string, not a number.
-		dispatchIncomingMessage({
-			type: 'presenceUpdate',
-			state: { ...validState, row: 'not-a-number' },
-		}, deps);
-
-		assert.strictEqual(errorReplies.length, 1);
-		assert.strictEqual(errorReplies[0].code, 'bad_argument');
-	});
-
-	test('presenceUpdate with missing typing field -> bad_argument (all 6 fields required)', () => {
-		const session = createSession(3614n);
-		const { deps, errorReplies } = makeDeps(session, 0);
-
-		// Note: `typing` field intentionally omitted.
-		dispatchIncomingMessage({
-			type: 'presenceUpdate',
-			state: { sheet: 0, row: 0, col: 0, selectionEndRow: 0, selectionEndCol: 0 },
-		}, deps);
-
-		assert.strictEqual(errorReplies.length, 1);
-		assert.strictEqual(errorReplies[0].code, 'bad_argument');
-	});
-});
+// FE-0a Part B (B1): the "dispatchIncomingMessage presenceUpdate arm" suite was
+// REMOVED -- presence is a collab-only dispatch path (v1.5-dormant). The owning
+// Session dispatch drops presenceUpdate silently (asserted by the drop-test in
+// the "dispatchIncomingMessage (host-side commit path, owning Session)" suite).
+// These presence-arm tests return in v1.5 when collab re-enables.
 
 // ============================================================================
 // Phase 5.7 V3.4.0.4a -- .qbook persistence (engine napi round-trip)
@@ -4163,48 +4133,11 @@ suite('quantbook V3.4.0.X -- validatePresenceNumeric (MEDIUM-3 closure)', functi
 	});
 });
 
-suite('quantbook V3.4.0.X -- dispatchIncomingMessage presenceUpdate numeric rejection (MEDIUM-3)', function () {
-	suiteSetup(function () {
-		const r = shouldSkip();
-		if (r.skip) { this.skip(); }
-	});
-
-	function makeDeps(session: CollabSessionInstance, sheet: number) {
-		const errorReplies: ErrorReplyMessage[] = [];
-		let commitCount = 0;
-		const deps = {
-			session,
-			sheet,
-			onCommit: () => { commitCount += 1; },
-			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
-		};
-		return { deps, errorReplies, getCommitCount: () => commitCount };
-	}
-
-	const cases: Array<{ label: string; state: Record<string, unknown>; substr: string }> = [
-		{ label: 'NaN row', state: { sheet: 0, row: NaN, col: 0, selectionEndRow: 0, selectionEndCol: 0, typing: false }, substr: 'finite' },
-		{ label: 'Infinity col', state: { sheet: 0, row: 0, col: Infinity, selectionEndRow: 0, selectionEndCol: 0, typing: false }, substr: 'finite' },
-		{ label: 'negative row', state: { sheet: 0, row: -1, col: 0, selectionEndRow: 0, selectionEndCol: 0, typing: false }, substr: 'non-negative' },
-		{ label: 'fractional col', state: { sheet: 0, row: 0, col: 1.5, selectionEndRow: 0, selectionEndCol: 0, typing: false }, substr: 'integer' },
-		{ label: 'sheet > u16::MAX', state: { sheet: 70000, row: 0, col: 0, selectionEndRow: 0, selectionEndCol: 0, typing: false }, substr: '65535' },
-		{ label: 'row > u32::MAX', state: { sheet: 0, row: 4294967296, col: 0, selectionEndRow: 0, selectionEndCol: 0, typing: false }, substr: '4294967295' },
-	];
-
-	for (const c of cases) {
-		test(`malformed presenceUpdate: ${c.label} -> bad_argument errorReply`, () => {
-			const session = createSession(7401n);
-			const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
-			dispatchIncomingMessage({ type: 'presenceUpdate', state: c.state }, deps);
-			assert.strictEqual(errorReplies.length, 1, `expected 1 errorReply for ${c.label}`);
-			assert.strictEqual(errorReplies[0].code, 'bad_argument');
-			assert.ok(errorReplies[0].message.includes('[presenceUpdate]'),
-				`expected [presenceUpdate] prefix, got: ${errorReplies[0].message}`);
-			assert.ok(errorReplies[0].message.includes(c.substr),
-				`expected message to mention ${c.substr}, got: ${errorReplies[0].message}`);
-			assert.strictEqual(getCommitCount(), 0, 'no onCommit on rejected presenceUpdate');
-		});
-	}
-});
+// FE-0a Part B (B1): the "presenceUpdate numeric rejection" suite was REMOVED --
+// presence is a collab-only dispatch path (v1.5-dormant); the owning Session
+// dispatch drops presenceUpdate silently (no per-field numeric validation). The
+// pure validatePresenceNumeric helper remains exported + unit-tested above; these
+// dispatch-arm rejection tests return in v1.5 when collab re-enables.
 
 suite('quantbook V3.4.0.X -- endEdit commit broadcasts typing:false (MEDIUM-2 webview wiring pin)', function () {
 	test('script body emits typing:false ABOVE the if(commit) branch', () => {
@@ -5823,152 +5756,11 @@ suite('quantbook V3.6.0.5 D4 -- format-aware rendering shape', function () {
 // boolean at the right time, and DOESN'T fire on validation/engine
 // failures.
 
-suite('quantbook V3.5.0.7 -- presenceUpdate fires onLocalTyping (mid-edit-render guard contract)', function () {
-	suiteSetup(function () {
-		const r = shouldSkip();
-		if (r.skip) { this.skip(); }
-	});
-
-	function makeDeps(session: CollabSessionInstance, sheet: number) {
-		const typingHistory: boolean[] = [];
-		const errorReplies: ErrorReplyMessage[] = [];
-		let commitCount = 0;
-		const deps = {
-			session,
-			sheet,
-			onCommit: () => { commitCount += 1; },
-			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
-			onLocalTyping: (typing: boolean) => { typingHistory.push(typing); },
-		};
-		return { deps, typingHistory, errorReplies, getCommitCount: () => commitCount };
-	}
-
-	function validPresenceState(typing: boolean) {
-		return {
-			sheet: 0,
-			row: 0,
-			col: 0,
-			selectionEndRow: 0,
-			selectionEndCol: 0,
-			typing,
-		};
-	}
-
-	test('presenceUpdate typing:true -> onLocalTyping(true) fires once', () => {
-		const session = createSession(8201n);
-		const { deps, typingHistory } = makeDeps(session, 0);
-		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(true) }, deps);
-		assert.deepStrictEqual(typingHistory, [true],
-			'onLocalTyping fires once with true on successful typing:true presenceUpdate');
-	});
-
-	test('presenceUpdate typing:false -> onLocalTyping(false) fires once', () => {
-		const session = createSession(8202n);
-		const { deps, typingHistory } = makeDeps(session, 0);
-		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(false) }, deps);
-		assert.deepStrictEqual(typingHistory, [false],
-			'onLocalTyping fires once with false on successful typing:false presenceUpdate');
-	});
-
-	test('sequence true -> false -> true -> false reflects in history', () => {
-		const session = createSession(8203n);
-		const { deps, typingHistory } = makeDeps(session, 0);
-		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(true) }, deps);
-		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(false) }, deps);
-		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(true) }, deps);
-		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(false) }, deps);
-		assert.deepStrictEqual(typingHistory, [true, false, true, false]);
-	});
-
-	test('shape-validation failure (missing state) -> NO onLocalTyping fire', () => {
-		const session = createSession(8204n);
-		const { deps, typingHistory, errorReplies } = makeDeps(session, 0);
-		dispatchIncomingMessage({ type: 'presenceUpdate' }, deps);  // no state
-		assert.strictEqual(typingHistory.length, 0,
-			'onLocalTyping must NOT fire when shape validation rejects (engine never saw the state)');
-		assert.strictEqual(errorReplies.length, 1);
-		assert.strictEqual(errorReplies[0].code, 'bad_argument');
-	});
-
-	test('shape-validation failure (typing missing) -> NO onLocalTyping fire', () => {
-		const session = createSession(8205n);
-		const { deps, typingHistory, errorReplies } = makeDeps(session, 0);
-		dispatchIncomingMessage({
-			type: 'presenceUpdate',
-			state: { sheet: 0, row: 0, col: 0, selectionEndRow: 0, selectionEndCol: 0 },  // no typing
-		}, deps);
-		assert.strictEqual(typingHistory.length, 0,
-			'onLocalTyping must NOT fire when typing field is missing from envelope');
-		assert.strictEqual(errorReplies.length, 1);
-	});
-
-	test('numeric-validation failure (NaN row) -> NO onLocalTyping fire', () => {
-		const session = createSession(8206n);
-		const { deps, typingHistory, errorReplies } = makeDeps(session, 0);
-		dispatchIncomingMessage({
-			type: 'presenceUpdate',
-			state: { sheet: 0, row: NaN, col: 0, selectionEndRow: 0, selectionEndCol: 0, typing: true },
-		}, deps);
-		assert.strictEqual(typingHistory.length, 0,
-			'onLocalTyping must NOT fire when numeric validation rejects');
-		assert.strictEqual(errorReplies.length, 1);
-		assert.strictEqual(errorReplies[0].code, 'bad_argument');
-	});
-
-	test('onLocalTyping optional -- omitting it does NOT crash the dispatcher', () => {
-		// Backward-compat: V3.4.0.X + V3.5.0.5 tests don't pass onLocalTyping.
-		const session = createSession(8207n);
-		const errorReplies: ErrorReplyMessage[] = [];
-		const deps = {
-			session,
-			sheet: 0,
-			onCommit: () => {},
-			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
-			// no onLocalTyping
-		};
-		// Should not throw.
-		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(true) }, deps);
-		assert.strictEqual(errorReplies.length, 0, 'success path: no error reply');
-	});
-
-	test('engine-throw path -- NO onLocalTyping fire (state never reached engine successfully)', () => {
-		// Hard to trigger a real engine throw on updatePresence from the
-		// IDE side without a corrupt session.  Use a synthetic session
-		// proxy that throws on updatePresence.  This pins the contract:
-		// onLocalTyping fires ONLY when updatePresence succeeds.
-		const realSession = createSession(8208n);
-		const throwingSession = new Proxy(realSession, {
-			get(target, prop, receiver) {
-				if (prop === 'updatePresence') {
-					return () => {
-						throw new Error('[session_oplog] simulated engine failure');
-					};
-				}
-				return Reflect.get(target, prop, receiver);
-			},
-		}) as CollabSessionInstance;
-		const { deps, typingHistory, errorReplies } = makeDeps(throwingSession, 0);
-		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(true) }, deps);
-		assert.strictEqual(typingHistory.length, 0,
-			'onLocalTyping must NOT fire when updatePresence throws (host flag stays in sync with engine state)');
-		assert.strictEqual(errorReplies.length, 1);
-		assert.strictEqual(errorReplies[0].code, 'session_oplog');
-		assert.ok(errorReplies[0].message.includes('[presenceUpdate]'),
-			'error prefix includes [presenceUpdate]');
-	});
-
-	test('non-presenceUpdate message types do NOT fire onLocalTyping', () => {
-		// Sanity: putValue / unknown types must not accidentally trigger
-		// the typing callback.
-		const session = createSession(8209n);
-		const { deps, typingHistory } = makeDeps(session, 0);
-		addSheet(session, 'S');
-		dispatchIncomingMessage({ type: 'putValue', sheet: 0, row: 0, col: 0, raw: '42' }, deps);
-		dispatchIncomingMessage({ type: 'unknown' }, deps);
-		assert.strictEqual(typingHistory.length, 0,
-			'only presenceUpdate (after both validations) fires onLocalTyping');
-	});
-});
+// FE-0a Part B (B1): the "presenceUpdate fires onLocalTyping" suite was REMOVED
+// -- the mid-edit-render guard (onLocalTyping / setPresenceTyping watchdog) was
+// part of the collab presence path, which is v1.5-dormant. The owning Session is
+// single-writer (no remote merges race a local edit), so the dispatch has no
+// onLocalTyping callback and drops presenceUpdate silently. Returns in v1.5.
 
 // ============================================================================
 // Phase 5.7 V3.6.0.6 D5 (2026-05-24) -- IDE-facing appendPutFormula napi
@@ -6305,7 +6097,7 @@ suite('quantbook V3.6.0.X audit-of-D5 OPUS-HIGH-1 -- dispatcher routes = prefix 
 		if (r.skip) { this.skip(); }
 	});
 
-	function makeDeps(session: CollabSessionInstance, sheet: number) {
+	function makeDeps(session: SessionInstance, sheet: number) {
 		const errorReplies: ErrorReplyMessage[] = [];
 		let commitCount = 0;
 		const deps = {
@@ -6317,9 +6109,11 @@ suite('quantbook V3.6.0.X audit-of-D5 OPUS-HIGH-1 -- dispatcher routes = prefix 
 		return { deps, errorReplies, getCommitCount: () => commitCount };
 	}
 
-	test('rawInput starting with = routes to appendPutFormula; workbookSnapshot surfaces formula text', () => {
-		const session = createSession(9001n);
-		addSheet(session, 'S');
+	// FE-0a Part B (B1): the `=`-prefix routing is unchanged; the grid now writes
+	// via the owning Session (createWorkbookSession + session.addSheet + setFormula).
+	test('rawInput starting with = routes to setFormula; snapshot surfaces formula text', () => {
+		const session = createWorkbookSession();
+		session.addSheet('S', 1000);
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 		dispatchIncomingMessage(
 			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: '=A2+1' },
@@ -6328,16 +6122,16 @@ suite('quantbook V3.6.0.X audit-of-D5 OPUS-HIGH-1 -- dispatcher routes = prefix 
 		assert.strictEqual(getCommitCount(), 1, 'formula commit fired onCommit');
 		assert.strictEqual(errorReplies.length, 0,
 			`no errorReply on formula commit; got: ${JSON.stringify(errorReplies)}`);
-		const snap = workbookSnapshot(session);
+		const snap = session.snapshot();
 		const cell = snap.sheets[0].cells.find(c => c.row === 0 && c.col === 0);
 		assert.ok(cell !== undefined, 'PutFormula cell present in snapshot');
 		assert.strictEqual(cell!.formula, '=A2+1',
-			'rawInput=A2+1 routed to PutFormula not PutValue; formula text surfaces verbatim');
+			'rawInput=A2+1 routed to setFormula not setValue; formula text surfaces verbatim');
 	});
 
 	test('rawInput with leading whitespace + = still detected as formula (trimStart)', () => {
-		const session = createSession(9002n);
-		addSheet(session, 'S');
+		const session = createWorkbookSession();
+		session.addSheet('S', 1000);
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 		dispatchIncomingMessage(
 			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: '   =SUM(A1:B10)' },
@@ -6345,15 +6139,15 @@ suite('quantbook V3.6.0.X audit-of-D5 OPUS-HIGH-1 -- dispatcher routes = prefix 
 		);
 		assert.strictEqual(getCommitCount(), 1);
 		assert.strictEqual(errorReplies.length, 0);
-		const snap = workbookSnapshot(session);
+		const snap = session.snapshot();
 		const cell = snap.sheets[0].cells[0];
 		assert.strictEqual(cell.formula, '   =SUM(A1:B10)',
 			'engine stores formula text verbatim including the leading whitespace');
 	});
 
-	test('rawInput without = stays on putValue path (existing behavior preserved)', () => {
-		const session = createSession(9003n);
-		addSheet(session, 'S');
+	test('rawInput without = stays on the value path (number preserved)', () => {
+		const session = createWorkbookSession();
+		session.addSheet('S', 1000);
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 		dispatchIncomingMessage(
 			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: '42.5' },
@@ -6361,10 +6155,10 @@ suite('quantbook V3.6.0.X audit-of-D5 OPUS-HIGH-1 -- dispatcher routes = prefix 
 		);
 		assert.strictEqual(getCommitCount(), 1);
 		assert.strictEqual(errorReplies.length, 0);
-		const snap = workbookSnapshot(session);
+		const snap = session.snapshot();
 		const cell = snap.sheets[0].cells[0];
 		assert.strictEqual(cell.formula, undefined,
-			'non-formula input routes to PutValue; formula absent');
+			'non-formula input routes to setValue; formula absent');
 		assert.ok(cell.value !== undefined, 'value populated');
 		assert.strictEqual(cell.value!.kind, 'number');
 		assert.strictEqual(cell.value!.number, 42.5);
@@ -7107,107 +6901,11 @@ suite('quantbook V3.6.0.10 D8 -- restoreSheet in workbookSnapshotDelta triggers 
 // level watchdog re-arm (resetTypingWatchdog method on CellGridPanel) is
 // behavior-tested separately; this suite covers the dispatcher contract.
 
-suite('quantbook V3.6.0.11 D9 -- dispatcher fires onTypingStroke (typing-stroke watchdog reset contract)', function () {
-	suiteSetup(function () {
-		const r = shouldSkip();
-		if (r.skip) { this.skip(); }
-	});
-
-	function makeDeps(session: CollabSessionInstance, sheet: number) {
-		const strokeCount = { n: 0 };
-		const errorReplies: ErrorReplyMessage[] = [];
-		const deps = {
-			session,
-			sheet,
-			onCommit: () => {},
-			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
-			onTypingStroke: () => { strokeCount.n += 1; },
-		};
-		return { deps, strokeCount, errorReplies };
-	}
-
-	test('typing_stroke envelope fires onTypingStroke exactly once', () => {
-		const session = createSession(9001n);
-		const { deps, strokeCount } = makeDeps(session, 0);
-		dispatchIncomingMessage({ type: 'typing_stroke' }, deps);
-		assert.strictEqual(strokeCount.n, 1,
-			'one typing_stroke envelope -> one onTypingStroke call');
-	});
-
-	test('sequence of 5 typing_stroke envelopes fires onTypingStroke 5 times', () => {
-		const session = createSession(9002n);
-		const { deps, strokeCount } = makeDeps(session, 0);
-		for (let i = 0; i < 5; i++) {
-			dispatchIncomingMessage({ type: 'typing_stroke' }, deps);
-		}
-		assert.strictEqual(strokeCount.n, 5);
-	});
-
-	test('typing_stroke does NOT emit errorReply (fire-and-forget)', () => {
-		const session = createSession(9003n);
-		const { deps, errorReplies } = makeDeps(session, 0);
-		dispatchIncomingMessage({ type: 'typing_stroke' }, deps);
-		assert.strictEqual(errorReplies.length, 0,
-			'typing_stroke is fire-and-forget; no errorReply path');
-	});
-
-	test('typing_stroke with extra payload fields is still accepted (the type is the signal)', () => {
-		const session = createSession(9004n);
-		const { deps, strokeCount, errorReplies } = makeDeps(session, 0);
-		dispatchIncomingMessage({ type: 'typing_stroke', extraField: 'ignored' }, deps);
-		assert.strictEqual(strokeCount.n, 1);
-		assert.strictEqual(errorReplies.length, 0);
-	});
-
-	test('onTypingStroke optional -- omitting it does NOT crash the dispatcher', () => {
-		// Backward-compat: pre-V3.6.0.11 test suites + production wirings
-		// without the field MUST keep working.
-		const session = createSession(9005n);
-		const deps = {
-			session,
-			sheet: 0,
-			onCommit: () => {},
-			onError: (_reply: ErrorReplyMessage) => {},
-			// no onTypingStroke
-		};
-		assert.doesNotThrow(() => {
-			dispatchIncomingMessage({ type: 'typing_stroke' }, deps);
-		}, 'dispatcher must no-op silently when onTypingStroke is omitted');
-	});
-
-	test('unknown type still warns + drops (typing_stroke does not become a catch-all)', () => {
-		// Sanity: the typing_stroke arm must NOT swallow unrelated envelopes.
-		const session = createSession(9006n);
-		const { deps, strokeCount, errorReplies } = makeDeps(session, 0);
-		dispatchIncomingMessage({ type: 'completely_unknown_type' }, deps);
-		assert.strictEqual(strokeCount.n, 0,
-			'unknown type must not fire onTypingStroke');
-		assert.strictEqual(errorReplies.length, 0,
-			'unknown type is logged + dropped, not an errorReply (per V3.2.b.1 B1)');
-	});
-
-	test('typing_stroke does NOT fire onLocalTyping (different envelope, different callback)', () => {
-		// Defensive: typing_stroke must not promote false -> true; it
-		// only resets the deadline IFF flag is already set (panel-level
-		// check in resetTypingWatchdog).  At the dispatcher layer, this
-		// means typing_stroke does NOT call onLocalTyping.
-		const session = createSession(9007n);
-		const typingHistory: boolean[] = [];
-		const strokeCount = { n: 0 };
-		const deps = {
-			session,
-			sheet: 0,
-			onCommit: () => {},
-			onError: (_reply: ErrorReplyMessage) => {},
-			onLocalTyping: (typing: boolean) => { typingHistory.push(typing); },
-			onTypingStroke: () => { strokeCount.n += 1; },
-		};
-		dispatchIncomingMessage({ type: 'typing_stroke' }, deps);
-		assert.strictEqual(strokeCount.n, 1);
-		assert.strictEqual(typingHistory.length, 0,
-			'typing_stroke must NOT fire onLocalTyping (separate concerns)');
-	});
-});
+// FE-0a Part B (B1): the "dispatcher fires onTypingStroke" suite was REMOVED --
+// the typing-stroke watchdog reset was part of the collab presence path
+// (v1.5-dormant). The owning Session dispatch has no onTypingStroke callback and
+// drops typing_stroke silently (asserted by the drop-test in the
+// "dispatchIncomingMessage (host-side commit path, owning Session)" suite).
 
 // =====================================================================
 // Phase 5.7 V3.6.1 (2026-05-26) -- workbookSnapshotDelta IDE consumer
@@ -7350,16 +7048,19 @@ suite('quantbook V3.6.1 -- mergeWorkbookDelta (pure, OPUS-PT-B10)', function () 
 suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (pure mock; no engine)', function () {
 	test('missing version on the seed snapshot forces re-seed (never threads undefined into the delta wrapper)', () => {
 		let snapshotCalls = 0;
+		// FE-0a Part B (B1): acquireWorkbookSnapshotViaDelta now drives the owning
+		// Session, so it calls snapshot()/snapshotDelta() (not the CollabSession
+		// workbookSnapshot/workbookSnapshotDelta names).
 		const mock = {
-			workbookSnapshot() {
+			snapshot() {
 				snapshotCalls++;
 				// No `version` field (TS-optional) -- exercise the GAP-4 guard.
 				return { sheets: [], formats: [], dateSystem: 'Excel1900' as const };
 			},
-			workbookSnapshotDelta() {
-				throw new Error('workbookSnapshotDelta must NOT be called when no version captured');
+			snapshotDelta() {
+				throw new Error('snapshotDelta must NOT be called when no version captured');
 			},
-		} as unknown as CollabSessionInstance;
+		} as unknown as SessionInstance;
 		const cache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
 		acquireWorkbookSnapshotViaDelta(mock, cache);
 		assert.strictEqual(cache.version, undefined, 'no version captured -> stays undefined');
@@ -7374,40 +7075,43 @@ suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (engine)', f
 		if (r.skip) { this.skip(); }
 	});
 
-	// `acquireWorkbookSnapshotViaDelta` only ever calls workbookSnapshot +
-	// workbookSnapshotDelta, so a thin counting delegate distinguishes the
-	// fast (delta) path from the full-fetch path without a Proxy.
-	function counting(real: CollabSessionInstance) {
+	// FE-0a Part B (B1): acquireWorkbookSnapshotViaDelta now drives the owning
+	// Session, calling snapshot() + snapshotDelta(). A thin counting delegate
+	// distinguishes the fast (delta) path from the full-fetch path without a Proxy.
+	// (The collab pollRemote-merge invalidation test was removed -- transport sync
+	// is v1.5-dormant; the undo-invalidation test below still covers the
+	// fullRebuildRequired path.)
+	function counting(real: SessionInstance) {
 		let snap = 0;
 		let deltaN = 0;
 		const session = {
-			workbookSnapshot() { snap++; return real.workbookSnapshot(); },
-			workbookSnapshotDelta(v: Buffer) { deltaN++; return real.workbookSnapshotDelta(v); },
-		} as unknown as CollabSessionInstance;
+			snapshot() { snap++; return real.snapshot(); },
+			snapshotDelta(v: Uint8Array) { deltaN++; return real.snapshotDelta(v); },
+		} as unknown as SessionInstance;
 		return { session, snaps: () => snap, deltas: () => deltaN };
 	}
 
 	test('first acquisition full-fetches + captures a version', () => {
-		const s = createSession(1n);
+		const s = createWorkbookSession();
 		s.addSheet('S', 16384);
-		s.appendPutValue(0, 0, 0, 42);
+		setValueValidated(s, 0, 0, 0, { kind: 'number', number: 42 });
 		const c = counting(s);
 		const cache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
 		const snap = acquireWorkbookSnapshotViaDelta(c.session, cache);
-		assert.strictEqual(c.snaps(), 1, 'seed via workbookSnapshot');
+		assert.strictEqual(c.snaps(), 1, 'seed via snapshot');
 		assert.strictEqual(c.deltas(), 0, 'no delta call on the seed');
 		assert.ok(Buffer.isBuffer(cache.version), 'version captured');
 		assert.strictEqual(b10FindCell(snap, 0, 0, 0)!.value!.number, 42);
 	});
 
-	test('a local PutValue after seed takes the fast delta path (no full re-fetch)', () => {
-		const s = createSession(1n);
+	test('a local setValue after seed takes the fast delta path (no full re-fetch)', () => {
+		const s = createWorkbookSession();
 		s.addSheet('S', 16384);
-		s.appendPutValue(0, 0, 0, 1);
+		setValueValidated(s, 0, 0, 0, { kind: 'number', number: 1 });
 		const c = counting(s);
 		const cache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
 		acquireWorkbookSnapshotViaDelta(c.session, cache); // seed
-		s.appendPutValue(0, 1, 0, 2); // local edit -- append_op does NOT invalidate the cache
+		setValueValidated(s, 0, 1, 0, { kind: 'number', number: 2 }); // local edit does NOT invalidate the cache
 		const merged = acquireWorkbookSnapshotViaDelta(c.session, cache);
 		assert.strictEqual(c.snaps(), 1, 'fast path -> NO full re-fetch');
 		assert.strictEqual(c.deltas(), 1, 'took the delta path');
@@ -7416,39 +7120,18 @@ suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (engine)', f
 	});
 
 	test('undo invalidates the cache -> next acquisition full-rebuilds + matches engine truth', () => {
-		const s = createSession(1n);
+		const s = createWorkbookSession();
 		s.addSheet('S', 16384);
-		s.appendPutValue(0, 0, 0, 1);
+		setValueValidated(s, 0, 0, 0, { kind: 'number', number: 1 });
 		const c = counting(s);
 		const cache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
 		acquireWorkbookSnapshotViaDelta(c.session, cache); // seed (snaps=1)
-		s.appendPutValue(0, 1, 0, 2);
+		setValueValidated(s, 0, 1, 0, { kind: 'number', number: 2 });
 		acquireWorkbookSnapshotViaDelta(c.session, cache); // fast delta
-		s.undo(); // force_clear_workbook_cache (R-V3.6-14)
+		s.undo(); // force_clear_workbook_cache
 		const afterUndo = acquireWorkbookSnapshotViaDelta(c.session, cache);
 		assert.ok(c.snaps() >= 2, 'undo -> fullRebuildRequired -> full re-fetch');
-		assert.deepStrictEqual(afterUndo, s.workbookSnapshot(), 'matches a fresh engine snapshot');
-	});
-
-	test('collab pollRemote merge force-clears the cache -> next acquisition full-rebuilds + reflects the peer op', () => {
-		const a = createSession(1n);
-		const b = createSession(2n);
-		const [ta, tb] = loopbackTransportPair();
-		a.attachTransport(ta);
-		b.attachTransport(tb);
-		a.addSheet('S', 16384);
-		a.appendPutValue(0, 0, 0, 1);
-		a.flushDeltaToTransport();
-		assert.strictEqual(b.pollRemote(), 1, 'B drains A baseline');
-		const c = counting(b);
-		const cache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
-		acquireWorkbookSnapshotViaDelta(c.session, cache); // B seeds (snaps=1)
-		a.appendPutValue(0, 1, 0, 2);
-		a.flushDeltaToTransport();
-		b.pollRemote(); // drain -> force_clear B's engine cache
-		const merged = acquireWorkbookSnapshotViaDelta(c.session, cache);
-		assert.ok(c.snaps() >= 2, 'pollRemote merge -> fullRebuildRequired -> full re-fetch');
-		assert.strictEqual(b10FindCell(merged, 0, 1, 0)!.value!.number, 2, 'peer op reflected after merge');
+		assert.deepStrictEqual(afterUndo, s.snapshot(), 'matches a fresh engine snapshot');
 	});
 
 	test('SEPARATE caches: first fast, second sees staleness, both converge (per-cache correctness)', () => {
@@ -7457,16 +7140,16 @@ suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (engine)', f
 		// this -- panels share one per-session cache (see getSharedDeltaCache
 		// + the shared-cache test below), so both panels actually ride the
 		// fast path.  Separate caches remain a supported function input.
-		const s = createSession(1n);
+		const s = createWorkbookSession();
 		s.addSheet('S', 16384);
-		s.appendPutValue(0, 0, 0, 1);
+		setValueValidated(s, 0, 0, 0, { kind: 'number', number: 1 });
 		const ca = counting(s);
 		const cb = counting(s);
 		const cacheA: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
 		const cacheB: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
 		acquireWorkbookSnapshotViaDelta(ca.session, cacheA); // A seed
 		acquireWorkbookSnapshotViaDelta(cb.session, cacheB); // B seed
-		s.appendPutValue(0, 1, 0, 2); // one change advances the single per-session VV
+		setValueValidated(s, 0, 1, 0, { kind: 'number', number: 2 }); // one change advances the single per-session VV
 		const mergedA = acquireWorkbookSnapshotViaDelta(ca.session, cacheA);
 		const mergedB = acquireWorkbookSnapshotViaDelta(cb.session, cacheB);
 		// A polled first -> fast delta (advances the engine cache VV); B's
@@ -7484,15 +7167,15 @@ suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (engine)', f
 		// Production behavior: getSharedDeltaCache returns ONE cache per
 		// session, so a sibling panel's render sees a same-VV empty delta
 		// instead of a staleness-driven full rebuild.
-		const s = createSession(1n);
+		const s = createWorkbookSession();
 		s.addSheet('S', 16384);
-		s.appendPutValue(0, 0, 0, 1);
+		setValueValidated(s, 0, 0, 0, { kind: 'number', number: 1 });
 		// getSharedDeltaCache returns the SAME object for the same session.
 		assert.strictEqual(getSharedDeltaCache(s), getSharedDeltaCache(s), 'one cache per session');
 		const shared = getSharedDeltaCache(s);
 		const c = counting(s);
 		acquireWorkbookSnapshotViaDelta(c.session, shared); // panel A render: seed (snaps=1)
-		s.appendPutValue(0, 1, 0, 2);
+		setValueValidated(s, 0, 1, 0, { kind: 'number', number: 2 });
 		const mergedA = acquireWorkbookSnapshotViaDelta(c.session, shared); // panel A: fast delta -> advances shared cache
 		const mergedB = acquireWorkbookSnapshotViaDelta(c.session, shared); // panel B: same-VV empty delta (NOT a rebuild)
 		assert.strictEqual(c.snaps(), 1, 'no full re-fetch beyond the seed -- both panels fast');
@@ -7502,19 +7185,16 @@ suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (engine)', f
 		assert.deepStrictEqual(mergedA.sheets, mergedB.sheets, 'identical (same shared snapshot object)');
 	});
 
-	test('shape equivalence: delta-merged data === fresh workbookSnapshot across an op sequence (divergence guard)', () => {
-		const s = createSession(1n);
+	test('shape equivalence: delta-merged data === fresh snapshot across an op sequence (divergence guard)', () => {
+		const s = createWorkbookSession();
 		s.addSheet('A', 16384);
 		s.addSheet('B', 16384);
 		const cache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
-		// Compare the consumer-visible DATA (sheets/formats/dateSystem).
-		// The opaque `version` Buffer is intentionally excluded: the
-		// orchestrator threads the exact engine-returned token forward, so
-		// it never depends on two independent encode() calls producing
-		// byte-identical output (an engine concern covered elsewhere).
+		// Compare the consumer-visible DATA (sheets/formats/dateSystem). The
+		// opaque `version` Buffer is intentionally excluded.
 		const step = (label: string) => {
 			const merged = acquireWorkbookSnapshotViaDelta(s, cache);
-			const fresh = s.workbookSnapshot();
+			const fresh = s.snapshot();
 			assert.deepStrictEqual(
 				{ sheets: merged.sheets, formats: merged.formats, dateSystem: merged.dateSystem },
 				{ sheets: fresh.sheets, formats: fresh.formats, dateSystem: fresh.dateSystem },
@@ -7522,16 +7202,17 @@ suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (engine)', f
 			);
 			assert.ok(Buffer.isBuffer(merged.version), `merged carries a version after: ${label}`);
 		};
+		const num = (n: number): { kind: 'number'; number: number } => ({ kind: 'number', number: n });
 		step('seed (no ops)');
-		s.appendPutValue(0, 0, 0, 1); step('put A!(0,0)=1 (delta)');
-		s.appendPutValue(0, 1, 1, 2); step('put A!(1,1)=2 (delta)');
-		s.appendPutValue(1, 0, 0, 10); step('put B!(0,0)=10 (delta)');
+		setValueValidated(s, 0, 0, 0, num(1)); step('put A!(0,0)=1 (delta)');
+		setValueValidated(s, 0, 1, 1, num(2)); step('put A!(1,1)=2 (delta)');
+		setValueValidated(s, 1, 0, 0, num(10)); step('put B!(0,0)=10 (delta)');
 		s.deleteSheet(1); step('deleteSheet B (sheetsRemoved delta)');
-		s.appendPutValue(0, 2, 2, 3); step('put A!(2,2)=3 (delta)');
+		setValueValidated(s, 0, 2, 2, num(3)); step('put A!(2,2)=3 (delta)');
 		s.renameSheet(0, 'A2'); step('renameSheet A (fullRebuild)');
-		s.appendPutValue(0, 0, 1, 4); step('put A!(0,1)=4 (delta after rebuild)');
+		setValueValidated(s, 0, 0, 1, num(4)); step('put A!(0,1)=4 (delta after rebuild)');
 		s.undo(); step('undo (fullRebuild)');
-		s.appendPutValue(0, 3, 3, 5); step('put A!(3,3)=5 (delta after rebuild)');
+		setValueValidated(s, 0, 3, 3, num(5)); step('put A!(3,3)=5 (delta after rebuild)');
 	});
 });
 

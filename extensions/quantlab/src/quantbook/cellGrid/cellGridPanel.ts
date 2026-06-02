@@ -4,287 +4,111 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * Phase 5.7 V3.2.a scaffold (2026-05-22) -- read-only cell-grid
- * webview panel.
+ * Cell-grid webview panel.
  *
- * Phase 5.7 V3.2.b.3 (2026-05-22) -- writable cell-edit flow.
+ * Render-then-edit panel that displays a sheet from the owning single-writer
+ * `Session` and commits edits back to it. The user clicks a cell, types a
+ * number / text / `=formula`, and commits via Enter; the host parses +
+ * validates + writes via `Session.setValue`/`setFormula`, runs an incremental
+ * recalc, and re-renders. Failures post a structured `errorReply` back to the
+ * webview which decorates the offending cell.
  *
- * Renders the engine snapshot via {@link exportCellSnapshot} as an
- * HTML table.  V3.2.b allows the user to click any cell, type a
- * numeric value, and commit via Enter -- the panel parses + validates
- * + appends `PutValue` + re-renders.  Failure path posts a structured
- * `errorReply` back to the webview which decorates the offending
- * cell.
+ * **FE-0a Part B / B1 (2026-06-02) -- migrated off `CollabSession`.** This panel
+ * previously bound the collaborative `CollabSession` (op-log append + transport
+ * sync + peer presence + a pollRemote loop + a mid-edit-render watchdog). The
+ * product is single-writer/local-first for v1; real-time collab is v1.5-deferred
+ * ("CRDT built, transport unwired"). So the transport/presence/pollRemote glue
+ * was removed here and the panel now binds the owning `Session`
+ * (`createWorkbookSession`), which also exposes the ENG-FUSION fusion primitives
+ * (publishDataset/bindRange/recalcDirty) FE-1.5 builds on. The reusable collab
+ * primitives (`CollabSession`/`Transport`/`LoopbackPair`, the `session.ts`
+ * collab helpers, `classifyPollTick`, `multiWindowDemo`) remain in the codebase,
+ * dormant, for the v1.5 re-enable; the `quantbookCellGridCollab` command is
+ * disabled for v1.
  *
- * Out-of-scope for V3.2.b (still): virtualization (V3.3), live
- * remote-peer propagation (V3.2.c).  V3.2.a.1 `quantlab.quantbookCell
- * GridRefresh` remains the workaround for cross-window updates.
- *
- * The vscode-free pure helpers live in companion files so unit tests
- * can exercise them without a vscode shim:
- * - {@link buildHtml} / {@link formatCellValue} in `cellGridHtml.ts`.
- * - {@link parseCellRawInput} / {@link dispatchIncomingMessage} /
- *   envelope types in `cellGridLogic.ts`.
+ * The vscode-free pure helpers live in companion files so unit tests can
+ * exercise them without a vscode shim:
+ * - {@link buildHtml} / `formatCellValue` in `cellGridHtml.ts`.
+ * - {@link dispatchIncomingMessage} / {@link classifyCellInput} / envelope types
+ *   in `cellGridLogic.ts`.
  */
 
-import * as childProcess from 'child_process';
 import * as vscode from 'vscode';
 
-import { buildPresenceSnapshotJson, parseQuantbookError } from '../session';
-import type { CollabSessionInstance, QuantbookCellSnapshot, QuantbookNativeModule, TransportInstance, WorkbookSnapshotJson } from '../types';
-import { reconnectWithBackoff } from '../multiWindowDemo';
+import type { QuantbookCellSnapshot, SessionInstance, WorkbookSnapshotJson } from '../types';
 import { buildHtml } from './cellGridHtml';
-import { acquireWorkbookSnapshotViaDelta, classifyPollTick, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache } from './cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache } from './cellGridLogic';
 
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
 
 /**
- * Module-level registries of live panels keyed by sheet number.  Lets
- * the `quantlab.quantbookCellGridRefresh` command find the active
- * panel(s) without the user having to remember which window spawned
- * them.  Removed on panel dispose.
+ * Module-level registry of live panels keyed by sheet number. Lets the
+ * `quantlab.quantbookCellGridRefresh` command find the active panel(s) without
+ * the user having to remember which window spawned them. Removed on dispose.
  *
- * **V3.2.a.1 enhancement (2026-05-22)** -- pre-enhancement the command
- * surface was "Open Cell Grid" only; closing + re-opening was the only
- * way to refresh the snapshot.  The registry + Refresh command lets
- * users re-render in place.
- *
- * **V3.2.d closure (HIGH-1, 2026-05-22)** -- pre-V3.2.d a SINGLE
- * `activePanels: Map<number, CellGridPanel>` keyed by sheet held BOTH
- * local + collab panels.  The V3.2.d audit (Opus Lane B HIGH-1 + Codex
- * Lane A MEDIUM-2 convergent) flagged three latent correctness gaps:
- *
- * 1. **collab-then-local**: user runs the LOCAL command after a collab
- *    panel exists; the cache check found the collab panel + revealed
- *    it, silently overriding the user's explicit local-mode intent +
- *    leaking the sample-data session created at command-invocation.
- * 2. **collab-then-collab**: pre-V3.2.d this overwrote the cache slot
- *    with a SECOND collab panel + left the first orphaned from
- *    refreshAll AND alive with its own session + transport.  Two
- *    concurrent collab sessions in one window flush under the SAME
- *    `peerId = BigInt(process.pid)` -- violating the V3.1.b PeerId-
- *    uniqueness contract (Loro CRDT accepts the merge but the per-peer
- *    VV math is now ambiguous between two writers).
- * 3. **local-then-collab**: pre-V3.2.d the local panel was silently
- *    evicted from refreshAll coverage even though it stayed visible.
- *
- * **Fix**: separate `Map`s for the two modes.  Local + collab CAN
- * coexist for the same sheet (different sessions, different intent).
- * Refresh iterates BOTH maps.  Collab-then-collab now reveals the
- * existing collab panel + surfaces an `showInformationMessage` rather
- * than spawning a duplicate -- preserving PeerId-uniqueness.
+ * **B1**: a single map (was a local/collab dual map before the collab path was
+ * disabled) -- one panel per sheet, single-tab-per-sheet (reveal + refresh an
+ * existing panel rather than spawn a duplicate).
  */
-const localPanels: Map<number, CellGridPanel> = new Map();
-const collabPanels: Map<number, CellGridPanel> = new Map();
+const panels: Map<number, CellGridPanel> = new Map();
 
 /**
- * V3.2.c.3 (2026-05-22): everything the panel needs to drive the
- * collab lifecycle.  The collab command (`quantlab.quantbookCellGrid
- * Collab`) constructs this via {@link multiWindowDemo.connectOrSpawn}
- * and hands it to {@link CellGridPanel.show}.  The panel OWNS the
- * lifetime of all fields here:
- * - `transport` -> attached on open, detached on dispose
- * - `spawnedRelay` -> killed on dispose if this window spawned it
- * - `engine` -> retained for reconnect (`websocketConnect` calls)
- * - `log` -> for state-transition log lines (decision C4)
- */
-export interface CollabAttachment {
-	readonly engine: QuantbookNativeModule;
-	readonly transport: TransportInstance;
-	readonly spawnedRelay: childProcess.ChildProcess | undefined;
-	readonly log: vscode.OutputChannel;
-}
-
-const POLL_REMOTE_INTERVAL_MS = 1000;
-
-/**
- * **Phase 5.7 V3.5.0.7 (2026-05-24)** -- watchdog timeout for the
- * mid-edit-render guard.  If a `presenceUpdate { typing: true }` is
- * received but no matching `typing: false` arrives within this window,
- * the `_presenceRepaintInFlight` flag auto-clears (covering the
- * "user closed window mid-edit / panel hung / webview crashed without
- * firing endEdit" edge cases).  30 seconds is generous for typical
- * cell edits (Excel-class users finish a cell entry in <5s on average)
- * but short enough that a stuck flag doesn't block merged-tick renders
- * indefinitely.  Tunable; lower bound is whatever the longest
- * legitimate edit might be (consider 60s if formula entry surfaces in
- * user feedback).
- */
-const PRESENCE_TYPING_WATCHDOG_MS = 30_000;
-
-/**
- * Render-then-edit webview panel that displays the given session's
- * cell snapshot for the given sheet.  The panel binds the session for
- * its lifetime -- the dispatcher commits via this session, `render()`
- * reads via this session.
+ * Render-then-edit webview panel for the given session's sheet. The panel binds
+ * the session for its lifetime -- the dispatcher commits via this session,
+ * `render()` reads via this session.
  */
 export class CellGridPanel {
 	static show(
 		context: vscode.ExtensionContext,
-		session: CollabSessionInstance,
+		session: SessionInstance,
 		sheet: number,
-		attachment?: CollabAttachment,
 	): CellGridPanel {
-		// V3.2.a.1 single-tab-per-sheet + V3.2.d HIGH-1 closure
-		// (2026-05-22): two separate cache maps for local + collab
-		// modes.  A local + a collab panel for the SAME sheet are
-		// LEGITIMATELY distinct surfaces (different sessions,
-		// different intent) and CAN coexist; the cache returns the
-		// existing same-mode panel (reveal + refresh) and NEVER
-		// silently swaps mode under the user.
-		//
-		// Specifically:
-		//   - LOCAL open + LOCAL panel exists: reveal + refresh.
-		//   - LOCAL open + only COLLAB panel exists: create new local.
-		//   - COLLAB open + COLLAB panel exists: reveal existing +
-		//     showInformationMessage (V3.1.b PeerId-uniqueness:
-		//     don't spawn a second concurrent collab session under
-		//     the same PID).
-		//   - COLLAB open + only LOCAL panel exists: create new collab.
-		const mode = attachment === undefined ? 'local' : 'collab';
-		const panels = mode === 'local' ? localPanels : collabPanels;
+		// Single-tab-per-sheet: reveal + refresh an existing panel for this sheet
+		// rather than spawning a duplicate.
 		const existing = panels.get(sheet);
 		if (existing !== undefined) {
-			if (mode === 'collab') {
-				// V3.2.d HIGH-1 closure: surface that the collab
-				// panel is already open in this window.  The local
-				// mode silently reuses (it's a fast-start dev
-				// surface; less noise wanted).
-				void vscode.window.showInformationMessage(
-					`Cell Grid (Collab) is already open for sheet ${sheet} in this window.`,
-				);
-			}
 			existing.panel.reveal(vscode.ViewColumn.Active, false);
 			existing.render();
 			return existing;
 		}
-		// V3.3.0.5 (2026-05-22): include sheet count in the title when
-		// the session has multiple sheets ("Sheet N of M" reads as
-		// "you're on sheet N, M total in this session").  Single-sheet
-		// sessions show just "Sheet N" (avoids "of 1" noise).
-		//
-		// **V3.5.0.4b (2026-05-24)**: title here is the INITIAL value
-		// shown while the panel is being created; `render()` (called
-		// below at line ~218) immediately updates the title via
-		// `this.panel.title = ...` using `workbookSnapshot()` data,
-		// so subsequent sheet ops + cell edits keep the title
-		// reactive.  Clears the V3.3.0.X reactive-panel-title backlog
-		// item.  This initial value uses `listSheets()` (V3.3.0.X
-		// cache-based; misses addSheet'd-but-empty sheets); render()
-		// will correct the count within milliseconds via
-		// `workbookSnapshot.sheets.length` (counts all sheets).
-		//
-		// **V3.3.0.X audit closure (HIGH-2, 2026-05-23, Opus
-		// adversarial lane)**: pre-closure this call was wrapped in
-		// `try { ... } catch { /* best-effort fall-through */ }`
-		// which violated CLAUDE.md "No Fallbacks -- Errors Must Be
-		// Visible" hard rule: silently swallowing a `listSheets()`
-		// failure hid a corrupt-op-log signal that the user needed
-		// to see.  Now: errors propagate; `show()` callers wrap in
-		// try/catch and surface via `showErrorMessage`.  The user
-		// gets the diagnostic immediately rather than seeing a
-		// healthy-looking "Sheet N" title on a broken session.
-		//
-		// **Cost note**: this is ONE napi roundtrip per `show()`
-		// (bounded by user action).  Post-V3.3.0.X audit MEDIUM-3
-		// closure, `listSheets()` reads from the V3.3.0.3 cache so
-		// the cost is O(cells-in-cache) instead of O(N) in op count.
+		// Initial title; render() (below) immediately corrects the count via
+		// `snapshot.sheets.length`. listSheets() is ONE napi roundtrip per show()
+		// (bounded by user action). Per CLAUDE.md No-Fallbacks, a failure here
+		// propagates -- the command caller surfaces it via showErrorMessage rather
+		// than showing a healthy-looking title on a broken session.
 		const totalSheets = session.listSheets().length;
 		const titleSuffix = totalSheets > 1 ? ` of ${totalSheets}` : '';
 		const panel = vscode.window.createWebviewPanel(
 			VIEW_TYPE,
-			attachment !== undefined
-				? `Cell Grid -- Collab (Sheet ${sheet}${titleSuffix})`
-				: `Cell Grid (Sheet ${sheet}${titleSuffix})`,
+			`Cell Grid (Sheet ${sheet}${titleSuffix})`,
 			vscode.ViewColumn.Active,
 			{
-				// V3.2.b.3: scripts ON for click-to-edit flow.  CSP +
-				// nonce enforce that only the host-emitted inline
-				// script can execute.  Any future `<script src=>`
-				// remote load would need a `localResourceRoots`-
-				// relative URI + a CSP widen, which we DO NOT add
-				// here.
+				// Scripts ON for the click-to-edit flow. CSP + nonce enforce that
+				// only the host-emitted inline script can execute; no remote
+				// `<script src=>` and no localResourceRoots widen beyond the
+				// extension root.
 				enableScripts: true,
 				retainContextWhenHidden: false,
 				localResourceRoots: [context.extensionUri],
 			},
 		);
-		const instance = new CellGridPanel(panel, session, sheet, attachment);
-		// Attach the message handler BEFORE the first render() -- if
-		// the webview script were ever to postMessage during initial
-		// load (it doesn't today, but defensive), we don't want to
-		// miss it.  The handler survives across `webview.html = ...`
-		// rebuilds because it's attached to the PANEL, not the
-		// document.
+		const instance = new CellGridPanel(panel, session, sheet);
+		// Attach the message handler BEFORE the first render(). It survives across
+		// `webview.html = ...` rebuilds because it's attached to the PANEL, not
+		// the document.
 		panel.webview.onDidReceiveMessage(
 			(raw: unknown) => instance.handleIncoming(raw),
 			undefined,
 			context.subscriptions,
 		);
-		// V3.2.c.3: wire transport (if collab-attached) BEFORE first
-		// render so the panel starts in a fully-attached state.
-		// `wireAttachment` calls setAutoFlushPolicy + attachTransport
-		// + starts the pollRemote timer.  Any error here is fatal --
-		// surface via showErrorMessage + dispose the panel.
-		if (attachment !== undefined) {
-			try {
-				instance.wireAttachment(attachment);
-			} catch (err) {
-				const info = parseQuantbookError(err);
-				attachment.log.appendLine(`[collab] FATAL wireAttachment: code=${info.code} msg=${info.message}`);
-				void vscode.window.showErrorMessage(`Cell Grid collab attach failed: ${info.message}`);
-				panel.dispose();
-				throw err;
-			}
-		}
-		// **Phase 5.7 V3.5.0.X audit-closure Opus-M2 (2026-05-24)** -- defensive
-		// reinit of the mid-edit-render guard before the first render.  The
-		// `_presenceRepaintInFlight` field-level docstring claims this reset
-		// happens in show(); pre-closure the reset existed ONLY in the
-		// constructor (init false) + on dispose (setPresenceTyping(false))
-		// so the docstring drifted from the code.  This call closes the
-		// gap and matches the V3.4.0.X-established "reinit on show +
-		// attachTransport" pattern.  No-op on a freshly constructed
-		// instance (flag already false), but defensive against future
-		// refactors that might reuse instances or pass a non-default
-		// initial state.
-		instance.setPresenceTyping(false);
 		instance.render();
 		panels.set(sheet, instance);
 		panel.onDidDispose(() => {
-			// V3.2.b.3: set _disposed BEFORE disposeAttachment so any
-			// postMessage racing with disposal early-returns from the
-			// onError guard added at V3.2.d Opus MEDIUM-1 closure.
+			// Set _disposed BEFORE anything else so a postMessage racing with
+			// disposal early-returns from the onError guard.
 			instance._disposed = true;
-			// **Phase 5.7 V3.5.0.7 (2026-05-24)** -- D5 / R-V3.4-3
-			// closure: cancel any pending presence-typing watchdog so
-			// the timer can't fire on a disposed panel.
-			// `setPresenceTyping(false)` handles both the flag-clear
-			// + the watchdog-cancel atomically.
-			instance.setPresenceTyping(false);
-			// V3.4.0.5b (2026-05-23): clear this peer's presence on
-			// panel dispose so remote peers see this peer's cursor
-			// disappear when the window closes.  Runs BEFORE
-			// disposeAttachment so the auto-flush has a transport to
-			// flush through.
-			//
-			// **No-Fallbacks compliance**: dispose-handler cleanup is a
-			// system-boundary fire-and-forget surface (no caller to
-			// throw to; panel is being torn down regardless), but the
-			// error MUST be visible per CLAUDE.md "No Fallbacks --
-			// Errors Must Be Visible".  Log via console.warn so the
-			// extension host's debug console shows it; remote presence
-			// entry will eventually be swept by a future
-			// fromSnapshot+sweepPresence cycle (V1 known limitation
-			// per engine docstring).
-			try {
-				instance.session.clearPresence();
-			} catch (err) {
-				console.warn('[cellGrid] clearPresence on dispose failed:', err);
-			}
-			instance.disposeAttachment();
-			// Only clear the cache entry if we still own it (a fresh
-			// open for the same sheet + mode may have replaced us).
+			// Only clear the cache entry if we still own it (a fresh open for the
+			// same sheet may have replaced us).
 			if (panels.get(sheet) === instance) {
 				panels.delete(sheet);
 			}
@@ -294,22 +118,12 @@ export class CellGridPanel {
 	}
 
 	/**
-	 * Refresh ALL currently-open cell-grid panels (both local + collab
-	 * modes).  Called by the `quantlab.quantbookCellGridRefresh`
-	 * command.  Returns the number of panels refreshed (0 if none open).
-	 *
-	 * V3.2.d HIGH-1 closure: iterates BOTH maps so panels of either
-	 * mode are covered.  Pre-V3.2.d this iterated a single
-	 * `activePanels` map that silently lost the previously-evicted
-	 * panel on local-then-collab / collab-then-collab transitions.
+	 * Refresh ALL currently-open cell-grid panels. Called by
+	 * `quantlab.quantbookCellGridRefresh`. Returns the number refreshed.
 	 */
 	static refreshAll(): number {
 		let count = 0;
-		for (const instance of localPanels.values()) {
-			instance.safeRender();
-			count += 1;
-		}
-		for (const instance of collabPanels.values()) {
+		for (const instance of panels.values()) {
 			instance.safeRender();
 			count += 1;
 		}
@@ -317,547 +131,104 @@ export class CellGridPanel {
 	}
 
 	/**
-	 * **Phase 5.7 V3.5.0.X follow-up audit CLOSURE-CODEX-MED-3 (2026-05-24)**
-	 * -- guard-aware render wrapper.
-	 *
-	 * Invoked by {@link refreshAll} (and any future caller that needs to
-	 * trigger a render via the same policy).  Respects the V3.5.0.7
-	 * mid-edit-render guard: if `_presenceRepaintInFlight` is set
-	 * (some peer's local typing is in flight on THIS panel), defer
-	 * the render via the V3.5.0.X `_pendingRenderAfterTyping` dirty
-	 * flag instead of destroying the in-progress `<input>` element.
-	 *
-	 * **Why this matters**: pre-fix `refreshAll()` called `render()`
-	 * unconditionally, which BYPASSED the A-HIGH-4 guard for collab
-	 * panels.  A user running a LOCAL sheet command (e.g., "Add Sheet")
-	 * would trigger refreshAll, which would iterate BOTH local and
-	 * collab panel maps and force a render on a collab panel that
-	 * happens to be mid-edit.  This re-opened R-V3.4-3 in a new code
-	 * path (cross-finding regression between A-HIGH-3 and A-HIGH-4
-	 * closures).  Codex found this in the follow-up audit
-	 * (`docs/audits/2026-05-24-phase-5-7-v3-5-0-x-closure-codex.md`,
-	 * CLOSURE-CODEX-MED-3).
-	 *
-	 * Local panels never set `_presenceRepaintInFlight` (no transport
-	 * presence; the field stays at its constructor-init `false`), so
-	 * for them this is equivalent to a direct `render()`.
-	 *
-	 * Try/catch around the render mirrors `tickPollRemote` 'idle'
-	 * branch + the V3.5.0.X follow-up B-FINDING-3 closures (try/catch
-	 * + log on failure).
-	 *
-	 * Returns nothing (callers' counts include the call even if it
-	 * deferred; the deferred render eventually fires).
+	 * Render wrapper that never throws into the caller (refreshAll iterates many
+	 * panels). A render failure is logged (visible per No-Fallbacks) but does not
+	 * abort the refresh of sibling panels.
 	 */
 	private safeRender(): void {
 		if (this._disposed) {
-			return;
-		}
-		if (this._presenceRepaintInFlight) {
-			this._pendingRenderAfterTyping = true;
-			const state = this.attachmentState;
-			if (state !== undefined && !state.disposed) {
-				state.log.appendLine(
-					`[collab] safeRender: skipping render (presenceRepaintInFlight; local user mid-edit). ` +
-					`Deferred render flagged; will fire on typing:false / watchdog / next idle tick.`,
-				);
-			}
 			return;
 		}
 		try {
 			this.render();
 		} catch (err) {
 			const detail = err instanceof Error ? err.message : String(err);
-			const state = this.attachmentState;
-			if (state !== undefined && !state.disposed) {
-				state.log.appendLine(`[collab] safeRender render() failed: ${detail}`);
-			} else {
-				console.warn(`[quantbook] safeRender render() failed on local panel: ${detail}`);
-			}
+			console.warn(`[quantbook] cell-grid safeRender failed: ${detail}`);
 		}
 	}
 
 	/**
-	 * V3.3.0.5 (2026-05-22) -- enumerate active LOCAL panels for the
-	 * switch-sheet command.
-	 *
-	 * Returns a snapshot of `{ session, sheet }` for every currently-
-	 * open LOCAL panel.  Collab panels are NOT included (per V3.2.d
-	 * HIGH-1 mode-split rationale: collab sessions have their own
-	 * peerId + transport state; switching sheets within a collab
-	 * session needs different UX considerations and is deferred to
-	 * V3.x).
-	 *
-	 * The returned array's `session` references are live -- mutations
-	 * on the session via the original panel are visible through these
-	 * references.  Callers should NOT cache the array across event
+	 * Enumerate active panels for the switch-sheet / save commands. The returned
+	 * `session` references are live; callers must NOT cache the array across event
 	 * loop ticks (panels can dispose at any time).
-	 *
-	 * Empty array if no local panels are open.
 	 */
-	static activeLocalPanels(): Array<{ session: CollabSessionInstance; sheet: number }> {
-		const result: Array<{ session: CollabSessionInstance; sheet: number }> = [];
-		for (const instance of localPanels.values()) {
+	static activeLocalPanels(): Array<{ session: SessionInstance; sheet: number }> {
+		const result: Array<{ session: SessionInstance; sheet: number }> = [];
+		for (const instance of panels.values()) {
 			result.push({ session: instance.session, sheet: instance.sheet });
 		}
 		return result;
 	}
 
 	/**
-	 * V3.2.c.3: when the panel is collab-attached, this holds the
-	 * current Transport + the pollRemote timer + spawned-relay
-	 * handle + engine ref for reconnect.  Mutable across reconnects:
-	 * `attachment.transport` changes (via {@link reconnectWithBackoff})
-	 * but `attachment.engine` + `attachment.log` + `attachment.spawnedRelay`
-	 * stay constant for the panel's lifetime.
-	 *
-	 * `undefined` for local-mode (V3.2.a / V3.2.b unattached) panels.
-	 */
-	private attachmentState: {
-		engine: QuantbookNativeModule;
-		transport: TransportInstance;
-		spawnedRelay: childProcess.ChildProcess | undefined;
-		log: vscode.OutputChannel;
-		pollTimer: NodeJS.Timeout;
-		reconnectInFlight: boolean;
-		disposed: boolean;
-	} | undefined;
-
-	/**
-	 * V3.2.d Opus MEDIUM-1 closure (2026-05-22): tracks whether
-	 * `panel.dispose()` has fired.  `webview.postMessage` to a
-	 * disposed panel returns a rejected/no-op Thenable and the
-	 * message is silently lost; the user typed a value + saw no
-	 * error decoration.  The errorReply path checks this flag + falls
-	 * back to `vscode.window.showWarningMessage` so the user gets a
-	 * surface for late-arriving validation errors.
-	 *
-	 * Public-readonly because `show()`'s `onDidDispose` handler sets
-	 * it BEFORE calling `disposeAttachment` (so any in-flight
-	 * postMessage early-returns).  Could be `#private` but TS
-	 * downlevel + the existing JSDoc style use `private`/`readonly`
-	 * conventions.
+	 * Tracks whether `panel.dispose()` has fired. `webview.postMessage` to a
+	 * disposed panel is silently dropped; the errorReply path checks this flag and
+	 * falls back to `showWarningMessage` so a late validation error stays visible.
+	 * Public-readonly so the dispose handler + tests can set/inspect it.
 	 */
 	_disposed: boolean = false;
 
-	/**
-	 * **Phase 5.7 V3.5.0.7 (2026-05-24) -- D5 / R-V3.4-3 KNOWN-GAP closure.**
-	 *
-	 * Mid-edit-render guard.  Set to `true` when the LOCAL user is
-	 * mid-typing in a cell (per `presenceUpdate { typing: true }` from
-	 * the webview script's `beginEdit`); cleared on `typing: false`
-	 * (from `endEdit`, regardless of commit/cancel).
-	 *
-	 * Checked by {@link tickPollRemote} BEFORE calling `this.render()`
-	 * on a merged tick.  When `true`, the merged-tick render is SKIPPED
-	 * (logged but not executed); the next pollRemote tick (~1s later)
-	 * re-evaluates.  The merged op stays in the engine cache, so the
-	 * deferred render still surfaces the peer's change once the user
-	 * exits edit mode.
-	 *
-	 * **Why this exists**: V3.4.0.X Opus M2 reclassified R-V3.4-3 from
-	 * DEFERRED to KNOWN-GAP -- a host-driven `webview.html = ...`
-	 * rebuild during the user's mid-edit destroys the in-progress
-	 * `<input>` element (the cell editor).  Reproducible in two-window
-	 * collab smoke: window 1 mid-edit + window 2 commit -> window 1's
-	 * pollRemote-merged tick fires render() -> webview.html reassign
-	 * destroys the input.  V3.5.0.7 closes this gap host-side
-	 * (V3.3.0.4's `activeInput` guard was webview-side and only
-	 * protected the scroll handler).
-	 *
-	 * **Stuck-true mitigation**: the V3.5.0.7 ship relies on
-	 * dispose-time clearPresence + a defensive watchdog -- if a
-	 * `typing: true` is set but no matching `typing: false` arrives
-	 * within {@link PRESENCE_TYPING_WATCHDOG_MS} (30s), the flag
-	 * auto-clears.  Covers the "panel hung mid-edit; user closed window
-	 * with no commit/cancel" edge case.  Watchdog clears + re-firings
-	 * are observable via the output log.
-	 *
-	 * **Initialization**: `false` in the constructor; reset to `false`
-	 * in {@link show} (defensive, before render).  Cleared on dispose
-	 * via the `_disposed` short-circuit in `tickPollRemote`.
-	 *
-	 * pub-readonly so tests via test-fixture seams can inspect.
-	 */
-	_presenceRepaintInFlight: boolean = false;
-
-	/**
-	 * **Phase 5.7 V3.5.0.7 (2026-05-24)** -- watchdog handle for the
-	 * stuck-true mitigation.  Created when `_presenceRepaintInFlight`
-	 * transitions false -> true; cleared on the matching true -> false
-	 * transition OR on dispose.  Fires {@link PRESENCE_TYPING_WATCHDOG_MS}
-	 * after the flag goes true to auto-clear the flag (defensive
-	 * against missing `typing: false`).
-	 */
-	private presenceTypingWatchdog: ReturnType<typeof setTimeout> | undefined = undefined;
-
-	/**
-	 * **Phase 5.7 V3.5.0.X audit-closure A-HIGH-4 (2026-05-24)** --
-	 * deferred-render dirty flag.
-	 *
-	 * Set to `true` by {@link tickPollRemote}'s `'merged'` branch
-	 * whenever a remote-merge render is SKIPPED because
-	 * {@link _presenceRepaintInFlight} is true.  The merged blob was
-	 * ALREADY drained into the engine cache by `pollRemote()` (the
-	 * skip only suppresses the `this.render()` repaint).  Without
-	 * this dirty flag, subsequent pollRemote ticks classify as
-	 * `'idle'` (no NEW blobs arrived) and the idle branch never
-	 * renders -- so the deferred remote change stays invisible
-	 * indefinitely until some other code path triggers a render.
-	 *
-	 * Cleared + a render fires when ANY of:
-	 * 1. `setPresenceTyping(false)` is called (typing transitioned
-	 *    false; safe to render now).
-	 * 2. The presence-typing watchdog fires (auto-clear after 30s);
-	 *    typing:false never arrived but we MUST eventually render
-	 *    the deferred change.
-	 * 3. Defense-in-depth: a subsequent pollRemote tick classifies
-	 *    as `'idle'` AND the guard is no longer in-flight.  This
-	 *    catches edge cases where setPresenceTyping(false) didn't
-	 *    fire (e.g., webview crashed without sending endEdit).
-	 *
-	 * R-V3.4-3 closure (V3.5.0.7) was INCOMPLETE without this flag:
-	 * the merged-tick skip prevented `<input>` destruction during
-	 * mid-edit, but did NOT preserve the requirement that the
-	 * remote change become visible "on the next tick" per the
-	 * ide-consumer-contract.md 4.1.z5 D5 guarantee.  V3.5.0.X audit-closure A-HIGH-4
-	 * caught this and added the dirty flag for true closure.
-	 *
-	 * pub-readonly so tests via test-fixture seams can inspect.
-	 */
-	_pendingRenderAfterTyping: boolean = false;
-
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
-		private readonly session: CollabSessionInstance,
+		private readonly session: SessionInstance,
 		private readonly sheet: number,
-		_attachment: CollabAttachment | undefined,
-	) {
-		// attachment wiring happens in show() after construction so
-		// dispose() flow can call disposeAttachment() consistently
-		// even if wireAttachment throws.
-		this.attachmentState = undefined;
-	}
+	) { }
 
 	/**
-	 * **Phase 5.7 V3.5.0.7 (2026-05-24)** -- atomic typing-flag setter.
-	 *
-	 * Wires the {@link _presenceRepaintInFlight} flag + the watchdog
-	 * timer together.  Called by the dispatcher's `presenceUpdate` arm
-	 * via {@link DispatchDeps.onLocalTyping}.
-	 *
-	 * - `typing: true`: set flag; arm a one-shot setTimeout that
-	 *   auto-clears the flag after {@link PRESENCE_TYPING_WATCHDOG_MS}.
-	 *   If a prior watchdog is pending, clear it first (the new
-	 *   true-write resets the deadline).  Stuck-true edge case
-	 *   (typing:true with no matching typing:false): the watchdog
-	 *   eventually auto-clears + logs a warning.
-	 * - `typing: false`: clear flag + cancel any pending watchdog.
-	 *
-	 * Idempotent: setting the same value twice is a no-op (the
-	 * watchdog deadline is reset on each true-write, which is harmless
-	 * if the value was already true).
-	 */
-	setPresenceTyping(typing: boolean): void {
-		// Always clear any pending watchdog first -- both transitions
-		// (true->true reset; true->false; false->false) want the prior
-		// timer cancelled before evaluating the new state.
-		if (this.presenceTypingWatchdog !== undefined) {
-			clearTimeout(this.presenceTypingWatchdog);
-			this.presenceTypingWatchdog = undefined;
-		}
-		// **Phase 5.7 V3.5.0.X audit-closure A-HIGH-4 (2026-05-24)**:
-		// capture whether we were guarding BEFORE updating the flag,
-		// so the false-transition arm can fire the deferred render.
-		const wasInFlight = this._presenceRepaintInFlight;
-		this._presenceRepaintInFlight = typing;
-		if (typing) {
-			this.presenceTypingWatchdog = setTimeout(() => {
-				// Watchdog fired: typing:false never arrived.  Auto-
-				// clear + log via the attachment state's output channel
-				// if available (collab-attached panels only have the
-				// log channel; local panels just clear silently).
-				if (this._presenceRepaintInFlight) {
-					this._presenceRepaintInFlight = false;
-					this.presenceTypingWatchdog = undefined;
-					const state = this.attachmentState;
-					if (state !== undefined && !state.disposed) {
-						state.log.appendLine(
-							`[collab] presenceRepaintInFlight watchdog fired after ${PRESENCE_TYPING_WATCHDOG_MS}ms; ` +
-							`auto-cleared (typing:false never arrived; merged-tick renders will resume).`,
-						);
-					}
-					// V3.5.0.X audit-closure A-HIGH-4: even on watchdog
-					// auto-clear we MUST flush any deferred merged-tick
-					// render that was skipped during the typing-true
-					// window.  Without this, the remote change stays
-					// invisible until the user takes another action.
-					//
-					// **B-FINDING-3 (V3.5.0.X follow-up audit)**: wrap
-					// in try/catch to mirror the tickPollRemote 'idle'
-					// branch's policy.  Pre-fix a render() throw here
-					// would propagate up to vscode's setTimeout handler
-					// (unhandled); the deferred render would be lost
-					// silently.  Post-fix: log via the attachment's
-					// output channel + clear the flag (next genuine
-					// merge will re-trigger if needed).
-					if (this._pendingRenderAfterTyping && !this._disposed) {
-						this._pendingRenderAfterTyping = false;
-						try {
-							this.render();
-						} catch (err) {
-							const detail = err instanceof Error ? err.message : String(err);
-							const inner = this.attachmentState;
-							if (inner !== undefined && !inner.disposed) {
-								inner.log.appendLine(`[collab] watchdog deferred render() failed: ${detail}`);
-							}
-						}
-					}
-				}
-			}, PRESENCE_TYPING_WATCHDOG_MS);
-		} else if (wasInFlight) {
-			// V3.5.0.X audit-closure A-HIGH-4 (2026-05-24): typing
-			// transitioned true -> false.  If a merged-tick render was
-			// deferred during the typing window, fire it now so the
-			// remote change becomes visible.  This restores the ide-consumer-contract.md
-			// 4.1.z5 D5 guarantee that "deferred render fires on next
-			// 1s tick" (we choose to fire IMMEDIATELY on typing:false
-			// rather than wait for the next pollRemote tick -- the
-			// user just exited edit mode and is most likely to look
-			// at remote changes RIGHT NOW).
-			//
-			// **B-FINDING-3 (V3.5.0.X follow-up audit)**: try/catch around
-			// the render call mirrors the tickPollRemote 'idle' branch's
-			// policy.  Pre-fix a render() throw here would propagate up
-			// through the dispatcher's onLocalTyping callback to vscode's
-			// onDidReceiveMessage handler (unhandled); the deferred render
-			// would be lost silently.  Post-fix: log + flag stays cleared
-			// (next genuine merge re-triggers if needed).
-			if (this._pendingRenderAfterTyping && !this._disposed) {
-				this._pendingRenderAfterTyping = false;
-				try {
-					this.render();
-				} catch (err) {
-					const detail = err instanceof Error ? err.message : String(err);
-					const inner = this.attachmentState;
-					if (inner !== undefined && !inner.disposed) {
-						inner.log.appendLine(`[collab] typing:false deferred render() failed: ${detail}`);
-					}
-				}
-			}
-		}
-	}
-
-	/**
-	 * **Phase 5.7 V3.6.0.11 D9 (2026-05-26)** -- typing-stroke watchdog
-	 * reset.  Called from the dispatcher's `typing_stroke` arm via
-	 * {@link DispatchDeps.onTypingStroke}.
-	 *
-	 * The webview emits one `typing_stroke` per text-change input event
-	 * while the active edit `<input>` is open (see cellGridHtml.ts
-	 * `beginEdit` 'input' event listener).  This method re-arms the
-	 * {@link PRESENCE_TYPING_WATCHDOG_MS} timer IFF
-	 * {@link _presenceRepaintInFlight} is true (we are actively typing
-	 * per the engine view).  If the flag is false, this is a no-op
-	 * (defensive: webview may emit stray typing_stroke after endEdit; we
-	 * MUST NOT promote false → true without a proper presenceUpdate).
-	 *
-	 * Closes R-V3.5-7 "long formula entry hits 30s" false-negative: pre-
-	 * V3.6.0.11 the watchdog fired after 30s of "elapsed real time since
-	 * presenceUpdate(typing:true)" even if the user was still actively
-	 * typing.  Post-V3.6.0.11 the watchdog deadline is 30s of "elapsed
-	 * real time since the LAST keystroke" -- the user can type a 5-minute
-	 * formula and the watchdog never fires unless they pause for 30s.
-	 *
-	 * pub for the dispatcher wire-up + test-fixture seam.
-	 */
-	resetTypingWatchdog(): void {
-		// Only re-arm if we believe we ARE typing.  Otherwise a stray
-		// typing_stroke (e.g., race between endEdit + 'input' event) would
-		// silently flip the cache from "rendering allowed" to "rendering
-		// blocked for 30s" -- worst kind of latent bug.
-		if (!this._presenceRepaintInFlight) {
-			return;
-		}
-		// Clear + re-arm the watchdog.  Cancellation of a pending timer
-		// is safe (no-op if undefined).  Same setTimeout body as
-		// setPresenceTyping's typing=true branch -- we deliberately
-		// duplicate the closure rather than refactor (the setTimeout
-		// capture closure references `this` + the attachment state,
-		// and the duplication keeps the deadline-reset path independent
-		// of the flag-set path).
-		if (this.presenceTypingWatchdog !== undefined) {
-			clearTimeout(this.presenceTypingWatchdog);
-			this.presenceTypingWatchdog = undefined;
-		}
-		this.presenceTypingWatchdog = setTimeout(() => {
-			if (this._presenceRepaintInFlight) {
-				this._presenceRepaintInFlight = false;
-				this.presenceTypingWatchdog = undefined;
-				const state = this.attachmentState;
-				if (state !== undefined && !state.disposed) {
-					state.log.appendLine(
-						`[collab] presenceRepaintInFlight watchdog fired after ${PRESENCE_TYPING_WATCHDOG_MS}ms ` +
-						`since last typing_stroke; auto-cleared (user paused for 30s+; merged-tick renders resume).`,
-					);
-				}
-				if (this._pendingRenderAfterTyping && !this._disposed) {
-					this._pendingRenderAfterTyping = false;
-					try {
-						this.render();
-					} catch (err) {
-						const detail = err instanceof Error ? err.message : String(err);
-						const inner = this.attachmentState;
-						if (inner !== undefined && !inner.disposed) {
-							inner.log.appendLine(`[collab] watchdog deferred render() failed: ${detail}`);
-						}
-					}
-				}
-			}
-		}, PRESENCE_TYPING_WATCHDOG_MS);
-	}
-
-	/**
-	 * **Phase 5.7 V3.6.1 (2026-05-26) -- acquire the workbook snapshot via
-	 * the incremental delta protocol (OPUS-PT-B10).**
-	 *
-	 * Realizes the V3.6.0.8 D6 engine win: instead of a full O(N)
-	 * `workbookSnapshot()` (rebuild_workbook over the whole op log --
-	 * ~246 ms at 100k cells) on every repaint, this seeds once via a full
-	 * snapshot, then fetches incremental deltas (~1 ms at 100 new cells;
-	 * 228x faster) and merges them into {@link _cachedWorkbookSnapshot}
-	 * via {@link mergeWorkbookDelta}.
-	 *
-	 * **Two-call protocol** (engine contract; see {@link workbookSnapshotDelta}):
-	 * - No cached version -> full `workbookSnapshot()` (seed); capture its
-	 *   `version`.
-	 * - Else -> `workbookSnapshotDelta(version)`.  If `fullRebuildRequired`
-	 *   (cache miss / staleness / rename / metadata op / malformed token)
-	 *   -> full `workbookSnapshot()` re-fetch.  Else -> merge the delta.
-	 *
-	 * `fullRebuildRequired` is an EXPLICIT designed protocol signal, not a
-	 * swallowed error.  There is deliberately NO hidden periodic full
-	 * resync: per CLAUDE.md No-Fallbacks a merge divergence (if one could
-	 * occur) must surface loudly, not be silently papered over.  The
-	 * engine's conservative fullRebuild allowlist + 5 cache-invalidation
-	 * sites form a complete divergence safety net (every structural change
-	 * trips fullRebuild); the `quantbook V3.6.1 -- delta-merge shape
-	 * equivalence` mocha suite pins fast-path === full-path.
-	 *
-	 * **Where the win actually lands** (so future readers don't chase the
-	 * expected full rebuilds as a regression):
-	 * - LOCAL-edit `onCommit` repaint: fast delta (`append_op` does not
-	 *   invalidate the engine cache).  This is the typing-latency path.
-	 * - COLLAB merged-tick repaint: `pollRemote` force-clears the engine
-	 *   cache on a merge, so the next delta returns `fullRebuildRequired`
-	 *   -> full fetch.  Same cost as pre-V3.6.1 (no regression).
-	 * - MULTIPLE panels on ONE session: all ride the fast path.  The client
-	 *   cache is shared per session (see {@link getSharedDeltaCache}) to
-	 *   mirror the engine's per-session cache, so the first panel's delta
-	 *   advances the shared snapshot + version and siblings then observe a
-	 *   same-VV empty delta (not a full rebuild).  A panel opened later
-	 *   piggybacks on the already-seeded shared snapshot.
+	 * Acquire the workbook snapshot via the incremental delta protocol
+	 * (OPUS-PT-B10), seeding once via a full `snapshot()` then merging
+	 * `snapshotDelta()` results. The cache is shared per session (mutated in
+	 * place) so multiple panels on one session ride the delta fast path.
+	 * `fullRebuildRequired` is an explicit designed protocol signal handled in
+	 * {@link acquireWorkbookSnapshotViaDelta}, not a swallowed error.
 	 */
 	private acquireWorkbookSnapshot(): WorkbookSnapshotJson {
-		// Delegates to the pure, vscode-free orchestrator so the two-call
-		// protocol is mocha-testable without a panel.  The cache is shared
-		// per session (mutated in place: snapshot + version advance) so all
-		// panels bound to this session ride the delta fast path.
 		return acquireWorkbookSnapshotViaDelta(this.session, getSharedDeltaCache(this.session));
 	}
 
 	/**
-	 * Compute the snapshot, generate a fresh nonce, AND set the
-	 * webview's HTML.  Re-rendering blows away any prior webview
-	 * script + state; the host's `onDidReceiveMessage` handler
-	 * survives because it's attached to the panel, not the document.
+	 * Compute the snapshot, generate a fresh nonce, and set the webview HTML.
+	 * Re-rendering blows away the prior webview script; the host's
+	 * `onDidReceiveMessage` handler survives (attached to the panel, not the
+	 * document). The title is reactive (sheet count + name from the snapshot).
 	 *
-	 * V3.2.b.2: nonce is regenerated each call so refreshes get a
-	 * fresh script-src CSP token.
-	 *
-	 * **V3.5.0.4b (2026-05-24)**: migrated from `exportSnapshot(sheet)`
-	 * to `workbookSnapshot()`.  Routes through engine `rebuild_workbook`
-	 * which reflects V3.5.0.3 sheet ops (rename/delete/move) IMMEDIATELY
-	 * -- no pollRemote tick wait.  Bonus: panel title sheet-count is
-	 * now reactive (was point-in-time at `show()` per V3.3.0.X reactive-
-	 * panel-title backlog item; backlog cleared here).
-	 *
-	 * **V3.6.1 (2026-05-26)**: the snapshot is now acquired via
-	 * {@link acquireWorkbookSnapshot} (incremental delta protocol;
-	 * OPUS-PT-B10) instead of an unconditional full `workbookSnapshot()`.
-	 * The local-edit repaint path drops from O(N) op-log replay to an
-	 * O(changed-cells) delta + merge.  Everything downstream of the
-	 * snapshot (active-sheet extract, title, presence, buildHtml) is
-	 * unchanged -- it consumes the same {@link WorkbookSnapshotJson} shape.
-	 *
-	 * **Sheet-not-found (tombstone race)**: if the active sheet was
-	 * deleted via V3.5.0.4a `quantlab.quantbookSheetDelete` while the
-	 * panel is open, `extractSheetSnapshot` returns null.  We render
-	 * an empty cell-grid + log a warning -- the user sees the panel
-	 * is now showing a deleted sheet (cells empty), and can close it.
-	 * V3.6+ may auto-dispose the panel on its sheet's tombstoning.
-	 * (The delta path reaches the same state: `deleteSheet` arrives as a
-	 * `sheetsRemoved` delta that drops the sheet from the merged cache.)
+	 * **Tombstone race**: if the active sheet was deleted while the panel is open,
+	 * `extractSheetSnapshot` returns null; we render an empty grid + log a warning
+	 * (visible per No-Fallbacks) rather than throwing on every render forever.
 	 */
 	render(): void {
 		const wbSnapshot = this.acquireWorkbookSnapshot();
 		const sheetSnapshot: QuantbookCellSnapshot | null = extractSheetSnapshot(wbSnapshot, this.sheet);
 		const snapshot: QuantbookCellSnapshot = sheetSnapshot ?? {
-			// Tombstoned-mid-lifetime fallback: render empty.  CLAUDE.md
-			// No-Fallbacks tension: we deliberately render an empty
-			// frame rather than throw, BUT the warning below makes the
-			// state visible.  Without this branch, a stale panel that
-			// outlived its sheet's deletion would throw on every render
-			// -- worse UX (red error banner forever) than the empty
-			// frame + warning here.
 			snapshot_format_version: 1,
 			sheet: this.sheet,
 			entries: [],
 		};
 		if (sheetSnapshot === null) {
 			console.warn(
-				`[cellGrid] active sheet ${this.sheet} not found in workbookSnapshot ` +
-				`(likely tombstoned by quantbookSheetDelete).  Rendering empty cell grid; close the panel.`,
+				`[cellGrid] active sheet ${this.sheet} not found in snapshot ` +
+				`(likely deleted via quantbookSheetDelete). Rendering empty cell grid; close the panel.`,
 			);
 		}
-		// V3.5.0.4b: reactive panel title -- reflects current sheet
-		// count from workbookSnapshot (includes empty addSheet'd sheets,
-		// unlike the show()-time listSheets() call which was cache-
-		// based per V3.3.0.X MEDIUM-3).  Clears the V3.3.0.X reactive-
-		// panel-title backlog item.
 		const totalSheets = wbSnapshot.sheets.length;
 		const titleSuffix = totalSheets > 1 ? ` of ${totalSheets}` : '';
 		const sheetName = sheetSnapshot !== null
 			? wbSnapshot.sheets.find(s => s.id === this.sheet)?.name
 			: undefined;
-		const baseTitle = this.attachmentState !== undefined ? 'Cell Grid -- Collab' : 'Cell Grid';
 		const sheetLabel = sheetName !== undefined
 			? `Sheet ${this.sheet} "${sheetName}"`
 			: `Sheet ${this.sheet}`;
-		this.panel.title = `${baseTitle} (${sheetLabel}${titleSuffix})`;
+		this.panel.title = `Cell Grid (${sheetLabel}${titleSuffix})`;
 		const nonce = buildPanelNonce();
-		// V3.4.0.5b (2026-05-23): build presence snapshot at render time.
-		// Presence is non-critical decoration; if the engine throws,
-		// render the cell grid WITHOUT presence rather than failing the
-		// whole render.  Per CLAUDE.md No-Fallbacks rule the error MUST
-		// be visible -- console.warn the exception so the extension
-		// host's debug console catches it.  The user sees: cells render
-		// correctly, peer presence borders absent.
-		let presence;
-		try {
-			presence = buildPresenceSnapshotJson(this.session, this.sheet);
-		} catch (err) {
-			console.warn('[cellGrid] buildPresenceSnapshotJson failed; rendering without presence:', err);
-			presence = undefined;
-		}
-		this.panel.webview.html = buildHtml(snapshot, { nonce, presence });
+		this.panel.webview.html = buildHtml(snapshot, { nonce });
 	}
 
 	/**
-	 * Thin wrapper around the vscode-free {@link dispatchIncomingMessage}
-	 * dispatcher.  Captures `this.session` / `this.sheet` / `this.render`
-	 * / `this.panel.webview.postMessage` as closures.  Lives here
-	 * (NOT in `cellGridLogic.ts`) because it references `this`.
+	 * Thin wrapper around the vscode-free {@link dispatchIncomingMessage}. Lives
+	 * here (not in cellGridLogic.ts) because it captures `this`. The dispatcher
+	 * handles `putValue` (number/text/formula -> write -> recalc -> render),
+	 * `undo`/`redo`, and silently drops the dormant collab `presenceUpdate`/
+	 * `typing_stroke` envelopes.
 	 */
 	private handleIncoming(raw: unknown): void {
 		dispatchIncomingMessage(raw, {
@@ -865,12 +236,10 @@ export class CellGridPanel {
 			sheet: this.sheet,
 			onCommit: () => this.render(),
 			onError: reply => {
-				// V3.2.d Opus MEDIUM-1 closure (2026-05-22): if the
-				// panel has been disposed (or is hidden with
-				// retainContextWhenHidden: false, which the V3.2
-				// panel config is), `webview.postMessage` silently
-				// drops the message.  Fall back to
-				// `showWarningMessage` so the user sees the error.
+				// If the panel is disposed (or hidden with
+				// retainContextWhenHidden:false), `webview.postMessage` is silently
+				// dropped -- fall back to showWarningMessage so the user sees the
+				// error.
 				if (this._disposed) {
 					void vscode.window.showWarningMessage(
 						`Cell Grid (sheet ${reply.sheet}, row ${reply.row}, col ${reply.col}): [${reply.code}] ${reply.message}`,
@@ -879,295 +248,7 @@ export class CellGridPanel {
 				}
 				void this.panel.webview.postMessage(reply);
 			},
-			// **Phase 5.7 V3.5.0.7 (2026-05-24)** -- D5 / R-V3.4-3
-			// closure: dispatch's presenceUpdate arm fires this
-			// callback on the LOCAL peer's typing transitions.  Routed
-			// to setPresenceTyping which wires the flag + watchdog.
-			// Dispose check: skip if the panel is disposed (a
-			// late-arriving presenceUpdate after dispose shouldn't
-			// arm a watchdog on a dead panel).
-			onLocalTyping: typing => {
-				if (this._disposed) {
-					return;
-				}
-				this.setPresenceTyping(typing);
-			},
-			// **Phase 5.7 V3.6.0.11 D9 (2026-05-26)** -- dispatch's
-			// typing_stroke arm fires this callback on each text-change
-			// input event from the webview's active edit `<input>`.
-			// Routed to resetTypingWatchdog which re-arms the 30s timer
-			// IFF the flag is set.  Dispose check: skip if the panel is
-			// disposed (a late-arriving typing_stroke after dispose
-			// shouldn't arm a watchdog on a dead panel; the dispose path
-			// already cleared `presenceTypingWatchdog` via
-			// setPresenceTyping(false)).
-			onTypingStroke: () => {
-				if (this._disposed) {
-					return;
-				}
-				this.resetTypingWatchdog();
-			},
 		});
-	}
-
-	/**
-	 * V3.2.c.3: set auto-flush + attach transport + start the 1s
-	 * pollRemote timer.  Called by `show()` AFTER the panel +
-	 * message handler are constructed so the dispose flow can run
-	 * cleanly even on partial wireup.
-	 *
-	 * Throws only on the engine-side calls (`setAutoFlushPolicy` /
-	 * `attachTransport`); the timer setup itself is infallible.
-	 * `show()` translates a throw here into showErrorMessage + panel
-	 * dispose.
-	 */
-	private wireAttachment(attachment: CollabAttachment): void {
-		this.session.setAutoFlushPolicy('onAppend');
-		this.session.attachTransport(attachment.transport);
-		attachment.log.appendLine(`[collab] attached transport (sheet ${this.sheet}); pollRemote every ${POLL_REMOTE_INTERVAL_MS}ms`);
-		const pollTimer = setInterval(() => this.tickPollRemote(), POLL_REMOTE_INTERVAL_MS);
-		this.attachmentState = {
-			engine: attachment.engine,
-			transport: attachment.transport,
-			spawnedRelay: attachment.spawnedRelay,
-			log: attachment.log,
-			pollTimer,
-			reconnectInFlight: false,
-			disposed: false,
-		};
-	}
-
-	/**
-	 * V3.2.c.3: tick of the pollRemote loop.  Called every
-	 * POLL_REMOTE_INTERVAL_MS by the setInterval timer.
-	 *
-	 * - If a reconnect is in flight: skip (cheap idempotency).
-	 * - Try `session.pollRemote()`; if `n > 0`, re-render the panel
-	 *   so freshly-merged remote ops surface in the grid.
-	 * - On `transport_closed` from pollRemote or its observation
-	 *   path: trigger {@link handleTransportClosed} (reconnect with
-	 *   backoff per decision C6).
-	 * - On any other error: log + skip the tick.  Pollloop survives
-	 *   one bad tick.
-	 */
-	private tickPollRemote(): void {
-		const state = this.attachmentState;
-		if (state === undefined || state.disposed || state.reconnectInFlight) {
-			return;
-		}
-		const result = classifyPollTick(this.session);
-		switch (result.kind) {
-			case 'idle':
-				// **Phase 5.7 V3.5.0.X audit-closure A-HIGH-4 (2026-05-24)**:
-				// defense-in-depth.  classifyPollTick returns 'idle' when
-				// no NEW remote blobs arrived since the last tick.  If a
-				// previous merged-tick render was SKIPPED (deferred via
-				// `_pendingRenderAfterTyping`) AND the guard has since
-				// cleared, fire the deferred render NOW.  This covers
-				// edge cases where setPresenceTyping(false) never fired
-				// (e.g., webview crashed mid-edit) and the watchdog
-				// hasn't fired yet either.
-				if (this._pendingRenderAfterTyping && !this._presenceRepaintInFlight && !this._disposed) {
-					this._pendingRenderAfterTyping = false;
-					state.log.appendLine(
-						`[collab] pollRemote idle tick: firing deferred render (presence guard cleared since last merged-skip).`,
-					);
-					try {
-						this.render();
-					} catch (err) {
-						const info = parseQuantbookError(err);
-						state.log.appendLine(`[collab] deferred render() failed: code=${info.code} msg=${info.message}`);
-						// Match the merged-branch policy: fatal codes ->
-						// caller surfaces; transient -> swallow + log.
-						// (Don't re-set the dirty flag on failure -- the
-						// next genuine merge will re-trigger.)
-					}
-				}
-				return;
-			case 'merged':
-				// **Phase 5.7 V3.5.0.7 (2026-05-24)** -- D5 / R-V3.4-3
-				// closure: skip the merged-tick render when the local
-				// user is mid-editing a cell.  Without this skip, the
-				// `this.render()` call below would reassign
-				// `this.panel.webview.html`, destroying the in-progress
-				// `<input>` element (the cell editor).  The merged op
-				// stays in the engine's last_snapshot cache (it was
-				// merged via mergeBytes/pollRemote into the LoroDoc
-				// before classifyPollTick returned 'merged').
-				//
-				// **V3.5.0.X audit-closure A-HIGH-4 (2026-05-24)**:
-				// pre-closure the merged-skip set NO dirty flag, so
-				// the deferred render was lost (subsequent ticks would
-				// classify as 'idle' and never fire).  Now: set the
-				// `_pendingRenderAfterTyping` dirty flag so the render
-				// fires when ANY of (a) setPresenceTyping(false) is
-				// called, (b) the watchdog auto-clears, (c) defense-
-				// in-depth in the idle branch above.
-				//
-				// Watchdog mitigates the stuck-true edge case (panel
-				// hung mid-edit / window closed without endEdit);
-				// PRESENCE_TYPING_WATCHDOG_MS auto-clears after 30s.
-				if (this._presenceRepaintInFlight) {
-					this._pendingRenderAfterTyping = true;
-					state.log.appendLine(
-						`[collab] pollRemote merged ${result.count} remote blob(s); ` +
-						`SKIPPING render (presenceRepaintInFlight; local user mid-edit). ` +
-						`Deferred render flagged; will fire on typing:false / watchdog / next idle tick.`,
-					);
-					return;
-				}
-				// V3.5.0.X audit-closure A-HIGH-4: a new merged tick
-				// supersedes any prior deferred render (we're about to
-				// render NOW with fresher data), so clear the flag.
-				this._pendingRenderAfterTyping = false;
-				state.log.appendLine(`[collab] pollRemote merged ${result.count} remote blob(s); re-rendering`);
-				// V3.2.d Codex M3 closure (2026-05-22): wrap render()
-				// in try/catch.  exportCellSnapshot can throw at the
-				// engine boundary (op log iteration / JSON decode of
-				// a maliciously-formed merged blob).  Pre-V3.2.d a
-				// throw here bubbled into setInterval which silently
-				// swallowed it AND kept ticking -- the panel
-				// continued to fire merged ticks that did no visible
-				// work.  Now: log the structured code; on a
-				// `bad_argument` / `session_oplog` (semantic engine
-				// failure) tear down the panel cleanly via
-				// handleTransportClosed-style dispose; on transient
-				// errors skip this tick.
-				try {
-					this.render();
-				} catch (err) {
-					const info = parseQuantbookError(err);
-					state.log.appendLine(`[collab] render() failed after merged tick: code=${info.code} msg=${info.message}`);
-					if (info.code === 'bad_argument' || info.code === 'session_oplog') {
-						state.log.appendLine('[collab] render() error is fatal; disposing panel');
-						void vscode.window.showWarningMessage(
-							`Cell Grid (Collab) failed to render after a remote merge: [${info.code}] ${info.message}.`,
-							'Restart Cell Grid (Collab)',
-						).then(choice => {
-							if (choice === 'Restart Cell Grid (Collab)') {
-								void vscode.commands.executeCommand('quantlab.quantbookCellGridCollab');
-							}
-						});
-						this.panel.dispose();
-					}
-				}
-				return;
-			case 'transportClosed':
-				state.log.appendLine(`[collab] pollRemote saw transport_closed; reconnecting`);
-				void this.handleTransportClosed();
-				return;
-			case 'error':
-				state.log.appendLine(`[collab] pollRemote error (skipping tick): code=${result.code} msg=${result.message}`);
-				return;
-		}
-	}
-
-	/**
-	 * V3.2.c.3 + decision C6: reconnect on transport_closed via the
-	 * V3.1.c {@link reconnectWithBackoff} contract.  Reuses the
-	 * multiWindowDemo.ts implementation verbatim (exported via
-	 * V3.2.c.2).
-	 *
-	 * - Detach the dead transport from the session.
-	 * - Run reconnectWithBackoff (3 tries at 500/1000/2000ms).
-	 * - On success: attach the fresh transport, log, resume polling.
-	 * - On exhaustion: log, dispose the panel + spawned relay,
-	 *   surface `showWarningMessage('Restart Cell Grid (Collab)')`.
-	 */
-	private async handleTransportClosed(): Promise<void> {
-		const state = this.attachmentState;
-		if (state === undefined || state.disposed || state.reconnectInFlight) {
-			return;
-		}
-		state.reconnectInFlight = true;
-		try {
-			this.session.detachTransport();
-		} catch { /* best-effort */ }
-		try {
-			const fresh = await reconnectWithBackoff(state.engine, state.log);
-			if (state.disposed) {
-				return;
-			}
-			this.session.attachTransport(fresh);
-			state.transport = fresh;
-			// V3.2.d Codex M1 closure (2026-05-22): engine contract
-			// is mutate-then-flush -- if a cell commit's OnAppend
-			// auto-flush failed with `transport_closed` BEFORE this
-			// reconnect, the local PutValue op is already in the log
-			// but unflushed.  Just attaching a fresh transport does
-			// NOT flush pending ops (see
-			// `crates/ql-collab/src/session.rs:723-736`).  Check
-			// `hasPendingFlush()` and explicitly flush after attach
-			// so the local commit reaches the peer rather than
-			// staying buffered until the next user mutation.
-			if (this.session.hasPendingFlush()) {
-				try {
-					const flushed = this.session.flushDeltaToTransport();
-					state.log.appendLine(`[collab] post-reconnect flushDeltaToTransport returned ${flushed} (cleared pending op)`);
-				} catch (flushErr) {
-					const flushInfo = parseQuantbookError(flushErr);
-					state.log.appendLine(`[collab] post-reconnect flush failed: code=${flushInfo.code} msg=${flushInfo.message}`);
-					// Don't escalate: the next pollRemote / user
-					// edit cycle has another chance.  If the
-					// transport is closed again, handleTransportClosed
-					// re-fires on the next tick.
-				}
-			}
-			state.log.appendLine(`[collab] reconnect succeeded; resuming pollRemote`);
-		} catch (err) {
-			const info = parseQuantbookError(err);
-			state.log.appendLine(`[collab] reconnect EXHAUSTED: ${info.message}`);
-			// Dispose BEFORE prompting so the panel stops ticking
-			// before the user makes a choice (same pattern as
-			// multiWindowDemo's V3.1.c handler).
-			this.panel.dispose();
-			const choice = await vscode.window.showWarningMessage(
-				`Cell Grid collab lost connection: ${info.message}.`,
-				'Restart Cell Grid (Collab)',
-			);
-			if (choice === 'Restart Cell Grid (Collab)') {
-				void vscode.commands.executeCommand('quantlab.quantbookCellGridCollab');
-			}
-		} finally {
-			state.reconnectInFlight = false;
-		}
-	}
-
-	/**
-	 * V3.2.c.3: tear down the collab lifecycle.  Idempotent.
-	 *
-	 * - Clear the pollRemote timer.
-	 * - Detach transport (best-effort -- session may already have a
-	 *   dead transport).
-	 * - Kill the spawned relay child process IF this window spawned
-	 *   it (mirrors multiWindowDemo's V3.1.e signal-aware predicate).
-	 *
-	 * Called from `panel.onDidDispose`.  Safe to call on a panel
-	 * that was never wired (no-op via `attachmentState === undefined`
-	 * guard).
-	 */
-	private disposeAttachment(): void {
-		const state = this.attachmentState;
-		if (state === undefined || state.disposed) {
-			return;
-		}
-		state.disposed = true;
-		clearInterval(state.pollTimer);
-		try {
-			this.session.detachTransport();
-		} catch { /* best-effort */ }
-		if (
-			state.spawnedRelay !== undefined &&
-			state.spawnedRelay.exitCode === null &&
-			state.spawnedRelay.signalCode === null &&
-			!state.spawnedRelay.killed
-		) {
-			state.log.appendLine('[collab] killing spawned relay child process');
-			try {
-				state.spawnedRelay.kill();
-			} catch { /* best-effort */ }
-		}
-		state.log.appendLine(`[collab] disposed (sheet ${this.sheet}).`);
 	}
 }
 
@@ -1175,16 +256,10 @@ const NONCE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123
 const NONCE_LENGTH = 32;
 
 /**
- * 32-char alphanumeric nonce.  Matches `LoginWebviewPanel._nonce`'s
- * shape so any future audit reviewing webview security across the
- * extension sees consistent token shapes.
- *
- * `Math.random()` is adequate here.  The threat model is "prevent
- * inline `<script>` injection via snapshot data leaking past
- * `escapeHtml`", NOT "resist a determined attacker with crypto-grade
- * brute force."  62^32 ~= 10^57 possibilities; Math.random()'s 53
- * bits of entropy per call have well-over-cryptographic margin
- * against snapshot-content collisions.
+ * 32-char alphanumeric nonce for the webview CSP + inline `<script nonce=...>`.
+ * `Math.random()` is adequate: the threat model is "prevent inline script
+ * injection via snapshot data leaking past escapeHtml", not crypto-grade brute
+ * force. 62^32 ~= 10^57 possibilities.
  */
 function buildPanelNonce(): string {
 	let out = '';

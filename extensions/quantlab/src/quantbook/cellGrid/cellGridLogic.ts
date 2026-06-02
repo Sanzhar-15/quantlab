@@ -27,8 +27,8 @@
  * - `panel.webview.postMessage` -> wired as `DispatchDeps.onError`.
  */
 
-import type { CellSnapshotJson, CollabSessionInstance, EventJson, FormatIdJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
-import { appendPutFormulaValidated, appendPutValueValidated, assertSupportedSchemaVersion, parseQuantbookError, workbookSnapshot, workbookSnapshotDelta } from '../session';
+import type { CellSnapshotJson, CollabSessionInstance, EventJson, FormatIdJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SessionCellValueInput, SessionInstance, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
+import { assertSupportedSchemaVersion, parseQuantbookError, recalcDirtyChecked, setFormulaValidated, setValueValidated } from '../session';
 
 /**
  * V3.2.c.3 / V3.2.c.5 (2026-05-22) -- classification of a single
@@ -178,12 +178,41 @@ export function parseCellRawInput(raw: string): number {
 }
 
 /**
+ * **FE-0a Part B (B1, 2026-06-02)** -- classify a raw user-typed literal into a
+ * {@link SessionCellValueInput} for the owning `Session.setValue` path. This is
+ * the text-cell fix: unlike {@link parseCellRawInput} (numeric-only, throws on a
+ * string), a non-numeric literal now becomes a `text` cell instead of a
+ * `[bad_argument]` rejection -- string columns finally round-trip into the grid.
+ *
+ * Classification (formula `=...` is handled by the caller BEFORE this):
+ * - empty / whitespace-only -> `{ kind: 'blank' }` (clears the cell -- friendlier
+ *   than the old "cell value cannot be empty" throw),
+ * - a finite `Number(trimmed)` (hex / scientific accepted; Infinity / NaN are NOT
+ *   finite so they fall through) -> `{ kind: 'number', number }`,
+ * - anything else -> `{ kind: 'text', text }` preserving the literal verbatim.
+ *
+ * Boolean parsing ("TRUE"/"FALSE") and Excel's leading-apostrophe force-text are
+ * deliberate v1.x refinements, not B1.
+ */
+export function classifyCellInput(raw: string): SessionCellValueInput {
+	const trimmed = raw.trim();
+	if (trimmed === '') {
+		return { kind: 'blank' };
+	}
+	const n = Number(trimmed);
+	if (Number.isFinite(n)) {
+		return { kind: 'number', number: n };
+	}
+	return { kind: 'text', text: raw };
+}
+
+/**
  * Wiring contract for {@link dispatchIncomingMessage}.  The real panel
  * passes `(session, sheet, () => this.render(), reply => panel.webview.
  * postMessage(reply))`; the test passes spies.
  */
 export interface DispatchDeps {
-	readonly session: CollabSessionInstance;
+	readonly session: SessionInstance;
 	readonly sheet: number;
 	readonly onCommit: () => void;
 	readonly onError: (reply: ErrorReplyMessage) => void;
@@ -256,11 +285,13 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 	// failed.
 	if (msg.type === 'undo' || msg.type === 'redo') {
 		try {
-			const consumed = msg.type === 'undo' ? deps.session.undo() : deps.session.redo();
-			if (consumed) {
+			// FE-0a Part B (B1): the owning Session's undo/redo return
+			// `UndoRedoResultJson { consumed, version }` (vs CollabSession's bare
+			// boolean). consumed=false is an empty stack -> silent no-op.
+			const result = msg.type === 'undo' ? deps.session.undo() : deps.session.redo();
+			if (result.consumed) {
 				deps.onCommit();
 			}
-			// consumed === false: silent no-op (empty stack).
 			return;
 		} catch (err) {
 			const info = parseQuantbookError(err);
@@ -275,118 +306,14 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			return;
 		}
 	}
-	// V3.4.0.5b (2026-05-23): presenceUpdate envelope.  Webview posts on
-	// every beginEdit/endEdit; payload carries the full PresenceStateJson
-	// (sheet, row, col, selectionEnd*, typing).  Route to
-	// session.updatePresence (auto-flush per policy if attached).
-	//
-	// **No onCommit on success**: presence updates don't affect the cell
-	// snapshot, so re-rendering the panel on every cursor move would
-	// thrash.  Remote peers see this peer's presence on their next
-	// pollRemote tick + V3.2.c-integrated render (cache invalidation
-	// fires render via the dispatcher's existing onCommit path for the
-	// REMOTE side's cell ops, not this side's presence write).
-	//
-	// **Defensive runtime validation** (V3.2.d HIGH-2 + V3.4.0.3
-	// pattern): trust the webview script's payload but check the shape
-	// before calling the engine.  Missing/malformed state -> bad_argument
-	// errorReply.
-	if (msg.type === 'presenceUpdate') {
-		const presenceReq = raw as { type: 'presenceUpdate'; state?: unknown };
-		const state = presenceReq.state;
-		// V3.4.0.X MEDIUM-3 closure (2026-05-24, single-lane Codex):
-		// runtime type-shape check (was here pre-closure) + numeric-range
-		// validation (added in this closure).  V3.4.0.5b shipped with
-		// typeof-only checks, which let NaN/Infinity/negative/fractional/
-		// out-of-u16-or-u32-range values through to napi's ToUint32
-		// coercion path.  This is the same boundary class V3.2.d closed
-		// for cell writes (HIGH-2); extending it here for symmetry.
-		if (
-			typeof state !== 'object'
-			|| state === null
-			|| typeof (state as { sheet?: unknown }).sheet !== 'number'
-			|| typeof (state as { row?: unknown }).row !== 'number'
-			|| typeof (state as { col?: unknown }).col !== 'number'
-			|| typeof (state as { selectionEndRow?: unknown }).selectionEndRow !== 'number'
-			|| typeof (state as { selectionEndCol?: unknown }).selectionEndCol !== 'number'
-			|| typeof (state as { typing?: unknown }).typing !== 'boolean'
-		) {
-			deps.onError({
-				type: 'errorReply',
-				sheet: deps.sheet,
-				row: 0,
-				col: 0,
-				code: 'bad_argument',
-				message: '[presenceUpdate] state must be a PresenceStateJson object with all 6 fields',
-			});
-			return;
-		}
-		const s = state as {
-			sheet: number;
-			row: number;
-			col: number;
-			selectionEndRow: number;
-			selectionEndCol: number;
-			typing: boolean;
-		};
-		// V3.4.0.X MEDIUM-3 numeric validators -- mirror appendPutValueValidated:
-		// sheet must fit in u16 [0, 65535]; row/col/selectionEnd* must fit
-		// in u32 [0, 4294967295]; all integers + finite.
-		const numericInvalid = validatePresenceNumeric(s);
-		if (numericInvalid !== null) {
-			deps.onError({
-				type: 'errorReply',
-				sheet: deps.sheet,
-				row: 0,
-				col: 0,
-				code: 'bad_argument',
-				message: `[presenceUpdate] ${numericInvalid}`,
-			});
-			return;
-		}
-		try {
-			deps.session.updatePresence(s);
-			// **Phase 5.7 V3.5.0.7 (2026-05-24)** -- D5 / R-V3.4-3
-			// closure: fire onLocalTyping AFTER updatePresence succeeds
-			// so the host-side `_presenceRepaintInFlight` flag stays in
-			// sync with the engine's presence state.  If updatePresence
-			// throws (engine-level failure), we DON'T toggle the host
-			// flag (the engine never received the state; the webview
-			// would see the stale prior presence; the host should
-			// match).  Validation failures above ALSO bypass this fire.
-			//
-			// Only the LOCAL peer's presenceUpdate (typing field) maps
-			// to the host flag.  Remote peers' typing state is observed
-			// via the per-cell `data-peer` decoration in the webview
-			// (V3.4.0.5b) -- their typing does NOT block this panel's
-			// merged-tick render.
-			deps.onLocalTyping?.(s.typing);
-			// Intentional: no onCommit().  See block comment above.
-			return;
-		} catch (err) {
-			const info = parseQuantbookError(err);
-			deps.onError({
-				type: 'errorReply',
-				sheet: deps.sheet,
-				row: 0,
-				col: 0,
-				code: info.code,
-				message: `[presenceUpdate] ${info.message}`,
-			});
-			return;
-		}
-	}
-	// **Phase 5.7 V3.6.0.11 D9 (2026-05-26)** -- typing-stroke watchdog
-	// reset envelope.  Webview emits one `typing_stroke` per text-change
-	// input event while the active edit `<input>` is open (see
-	// cellGridHtml.ts beginEdit 'input' event listener).  Host resets
-	// the 30s presence-typing watchdog IFF the host-side flag is set.
-	// No payload (typing-stroke is fire-and-forget; the envelope itself
-	// is the signal).  No errorReply path: a malformed extra field would
-	// just be ignored downstream.  Closes R-V3.5-7 "long formula entry
-	// hits 30s" false-negative case documented in V3.6.0.1 D9 lock.
-	if (msg.type === 'typing_stroke') {
-		deps.onTypingStroke?.();
+	// FE-0a Part B (B1, 2026-06-02): presence + the typing-watchdog are
+	// COLLAB-ONLY (the owning single-writer `Session` has no presence channel;
+	// `updatePresence` does not exist on it). Real-time collab is v1.5-deferred
+	// ("CRDT built, transport unwired"), so silently DROP these envelopes if the
+	// dormant webview still emits them -- no engine call, no error. The full
+	// presence logic (validatePresenceNumeric, classifyPollTick, onLocalTyping/
+	// onTypingStroke) is preserved exported/dormant for the v1.5 collab re-enable.
+	if (msg.type === 'presenceUpdate' || msg.type === 'typing_stroke') {
 		return;
 	}
 	if (msg.type !== 'putValue') {
@@ -440,14 +367,19 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		// the engine surfaces it via `#NAME?` evaluation, not a JS
 		// throw -- matches the appendPutFormulaValidated docstring's
 		// "any string is a valid formula at the wire level" semantic.
+		// FE-0a Part B (B1): write via the owning Session. `=`-prefix ->
+		// setFormula; else classify the literal as number/text/blank
+		// (classifyCellInput -- the text-cell fix) and setValue. Unlike
+		// CollabSession's appendPut* (which recomputed during op-apply),
+		// Session.setValue/setFormula only mark dependents dirty, so we MUST
+		// recalc before the re-snapshot or formulas stay stale.
 		if (req.rawInput.trimStart().startsWith('=')) {
-			appendPutFormulaValidated(deps.session, req.sheet, req.row, req.col, req.rawInput);
-			deps.onCommit();
+			setFormulaValidated(deps.session, req.sheet, req.row, req.col, req.rawInput);
 		} else {
-			const parsed = parseCellRawInput(req.rawInput);
-			appendPutValueValidated(deps.session, req.sheet, req.row, req.col, parsed);
-			deps.onCommit();
+			setValueValidated(deps.session, req.sheet, req.row, req.col, classifyCellInput(req.rawInput));
 		}
+		recalcDirtyChecked(deps.session);
+		deps.onCommit();
 	} catch (err) {
 		const info = parseQuantbookError(err);
 		deps.onError({
@@ -1207,25 +1139,25 @@ export interface DeltaSnapshotCache {
  * {@link WorkbookSnapshotJson}, identical in shape to a full fetch).
  */
 export function acquireWorkbookSnapshotViaDelta(
-	session: CollabSessionInstance,
+	session: SessionInstance,
 	cache: DeltaSnapshotCache,
 ): WorkbookSnapshotJson {
 	const cachedSnapshot = cache.snapshot;
 	const cachedVersion = cache.version;
 	if (cachedVersion === undefined || cachedSnapshot === undefined) {
-		const seed = workbookSnapshot(session);
+		const seed = session.snapshot();
 		cache.snapshot = seed;
 		cache.version = seed.version;
 		return seed;
 	}
-	const delta = workbookSnapshotDelta(session, cachedVersion);
+	const delta = session.snapshotDelta(cachedVersion);
 	// **Phase 6.3-1c closure-audit (Opus MED-1):** assert the delta DTO's schema
 	// version at the delta ingest too -- not just the full-snapshot path. Without
 	// this a drifted DELTA would surface as a downstream mergeWorkbookDelta shape
 	// mismatch rather than a clean fail-loud unsupported_schema_version.
 	assertSupportedSchemaVersion(delta.schemaVersion);
 	if (delta.fullRebuildRequired) {
-		const full = workbookSnapshot(session);
+		const full = session.snapshot();
 		cache.snapshot = full;
 		cache.version = full.version;
 		return full;
@@ -1257,13 +1189,13 @@ export function acquireWorkbookSnapshotViaDelta(
  * teardown.  A panel created later piggybacks on the already-seeded shared
  * snapshot (skips its own full seed).
  */
-const SESSION_DELTA_CACHES = new WeakMap<CollabSessionInstance, DeltaSnapshotCache>();
+const SESSION_DELTA_CACHES = new WeakMap<SessionInstance, DeltaSnapshotCache>();
 
 /**
  * Get (or lazily create) the shared {@link DeltaSnapshotCache} for
  * `session`.  See {@link SESSION_DELTA_CACHES}.
  */
-export function getSharedDeltaCache(session: CollabSessionInstance): DeltaSnapshotCache {
+export function getSharedDeltaCache(session: SessionInstance): DeltaSnapshotCache {
 	let cache = SESSION_DELTA_CACHES.get(session);
 	if (cache === undefined) {
 		cache = { snapshot: undefined, version: undefined };
