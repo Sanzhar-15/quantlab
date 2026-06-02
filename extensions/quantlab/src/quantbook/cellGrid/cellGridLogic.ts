@@ -374,7 +374,16 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		// Session.setValue/setFormula only mark dependents dirty, so we MUST
 		// recalc before the re-snapshot or formulas stay stale.
 		if (req.rawInput.trimStart().startsWith('=')) {
-			setFormulaValidated(deps.session, req.sheet, req.row, req.col, req.rawInput);
+			// Session.setFormula takes the formula BODY without the leading `=`
+			// (the `=` is the spreadsheet-UI convention; the engine parser rejects
+			// it: `parse error: unexpected token in prefix: Op(Eq)`). Strip the
+			// leading whitespace + `=`; the engine eagerly parses+binds and stores
+			// a normalized form (e.g. `A1*2` -> `A1 * 2`). Unlike CollabSession's
+			// lazy appendPutFormula, an invalid/unsupported formula throws
+			// [formula_parse]/[formula_bind] here and surfaces as a loud errorReply
+			// (No-Fallbacks) instead of a deferred #ERROR cell value.
+			const formula = req.rawInput.trimStart().slice(1);
+			setFormulaValidated(deps.session, req.sheet, req.row, req.col, formula);
 		} else {
 			setValueValidated(deps.session, req.sheet, req.row, req.col, classifyCellInput(req.rawInput));
 		}

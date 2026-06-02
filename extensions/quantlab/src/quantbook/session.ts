@@ -265,11 +265,18 @@ export function setFormulaValidated(
 export function recalcDirtyChecked(session: SessionInstance): void {
 	const op = session.recalcDirty();
 	const status = session.operationStatus(op);
-	if (status.state === 'failed') {
+	// In-engine recalc is synchronous (recalc_dirty start+awaits before returning),
+	// so the op is terminal == 'completed' on a healthy run. Treat ANY other state
+	// as loud failure (No-Fallbacks): 'failed' is an engine error; 'running'/
+	// 'canceled' would mean the synchronous contract broke (e.g. a future async
+	// recalc or a stray cancel) and the grid must NOT silently render stale cells.
+	if (status.state !== 'completed') {
 		const e = status.error;
-		const code = e?.code ?? 'panic';
+		const code = e?.code ?? (status.state === 'failed' ? 'panic' : 'invalid_state');
 		const detail = e?.details ? `: ${e.details}` : '';
-		throw new Error(`[${code}] recalcDirty operation failed (class=${e?.class ?? 'Internal'})${detail}`);
+		throw new Error(
+			`[${code}] recalcDirty did not complete (state=${status.state}, class=${e?.class ?? 'Internal'})${detail}`,
+		);
 	}
 }
 

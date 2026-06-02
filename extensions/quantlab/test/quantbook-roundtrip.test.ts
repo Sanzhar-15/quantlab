@@ -2508,9 +2508,12 @@ suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', f
 		);
 		assert.strictEqual(getCommitCount(), 1);
 		assert.strictEqual(errorReplies.length, 0);
-		assert.deepStrictEqual(cellAt(session, 0, 0, 1), {
-			row: 0, col: 1, value: { kind: 'number', value: 10 },
-		});
+		// The dispatch strips the leading `=` before setFormula; B1 = A1*2 = 10.
+		// (A formula cell's snapshot entry also carries a normalized `formula`
+		// field, so assert the value rather than the whole entry.)
+		const b1 = cellAt(session, 0, 0, 1);
+		assert.deepStrictEqual(b1?.value, { kind: 'number', value: 10 });
+		assert.ok(typeof b1?.formula === 'string' && b1.formula.length > 0, 'B1 is a formula cell');
 	});
 
 	test('putValue with sheet mismatch: dropped (no commit, no errorReply)', () => {
@@ -6125,24 +6128,33 @@ suite('quantbook V3.6.0.X audit-of-D5 OPUS-HIGH-1 -- dispatcher routes = prefix 
 		const snap = session.snapshot();
 		const cell = snap.sheets[0].cells.find(c => c.row === 0 && c.col === 0);
 		assert.ok(cell !== undefined, 'PutFormula cell present in snapshot');
-		assert.strictEqual(cell!.formula, '=A2+1',
-			'rawInput=A2+1 routed to setFormula not setValue; formula text surfaces verbatim');
+		// The dispatch strips the leading `=`; Session.setFormula stores a NORMALIZED
+		// formula (no `=`, e.g. `A2 + 1`) -- unlike CollabSession's verbatim store. So
+		// assert it routed to a formula cell + computed (A2 blank -> 0, so A2+1 = 1).
+		assert.ok(typeof cell!.formula === 'string' && cell!.formula.length > 0,
+			'rawInput =A2+1 routed to setFormula not setValue (formula text present)');
+		assert.deepStrictEqual(cell!.value, { kind: 'number', number: 1 });
 	});
 
 	test('rawInput with leading whitespace + = still detected as formula (trimStart)', () => {
 		const session = createWorkbookSession();
 		session.addSheet('S', 1000);
+		setValueValidated(session, 0, 0, 0, { kind: 'number', number: 4 }); // A1 = 4
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+		// Leading whitespace then `=` is still a formula (trimStart). A single
+		// cell-ref binds in v1 (a literal RangeRef like SUM(A1:B10) does NOT --
+		// that is a v1 formula_bind limitation, surfaced as a loud errorReply).
 		dispatchIncomingMessage(
-			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: '   =SUM(A1:B10)' },
+			{ type: 'putValue', sheet: 0, row: 0, col: 1, rawInput: '   =A1+1' },
 			deps,
 		);
 		assert.strictEqual(getCommitCount(), 1);
 		assert.strictEqual(errorReplies.length, 0);
 		const snap = session.snapshot();
-		const cell = snap.sheets[0].cells[0];
-		assert.strictEqual(cell.formula, '   =SUM(A1:B10)',
-			'engine stores formula text verbatim including the leading whitespace');
+		const cell = snap.sheets[0].cells.find(c => c.row === 0 && c.col === 1);
+		assert.ok(cell?.formula !== undefined,
+			'leading-whitespace + = detected as formula (trimStart) -> setFormula');
+		assert.deepStrictEqual(cell!.value, { kind: 'number', number: 5 });
 	});
 
 	test('rawInput without = stays on the value path (number preserved)', () => {
@@ -7134,12 +7146,14 @@ suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (engine)', f
 		assert.deepStrictEqual(afterUndo, s.snapshot(), 'matches a fresh engine snapshot');
 	});
 
-	test('SEPARATE caches: first fast, second sees staleness, both converge (per-cache correctness)', () => {
-		// This pins the orchestrator's staleness-correctness when two
-		// callers hold SEPARATE caches.  NOTE: production no longer does
-		// this -- panels share one per-session cache (see getSharedDeltaCache
-		// + the shared-cache test below), so both panels actually ride the
-		// fast path.  Separate caches remain a supported function input.
+	test('SEPARATE caches both acquire correctly and converge (per-cache correctness)', () => {
+		// Two callers holding SEPARATE caches must both end with identical data.
+		// On the owning Session, snapshotDelta computes the delta from the version
+		// the CALLER passes, so each separate cache rides the fast delta path from
+		// its own seed version (no single-slot last-snapshot cache forcing one of
+		// them into a full rebuild, as CollabSession did). Production shares ONE
+		// per-session cache (getSharedDeltaCache, tested below); separate caches
+		// remain a supported function input. The invariant here is CONVERGENCE.
 		const s = createWorkbookSession();
 		s.addSheet('S', 16384);
 		setValueValidated(s, 0, 0, 0, { kind: 'number', number: 1 });
@@ -7149,15 +7163,13 @@ suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (engine)', f
 		const cacheB: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
 		acquireWorkbookSnapshotViaDelta(ca.session, cacheA); // A seed
 		acquireWorkbookSnapshotViaDelta(cb.session, cacheB); // B seed
-		setValueValidated(s, 0, 1, 0, { kind: 'number', number: 2 }); // one change advances the single per-session VV
+		setValueValidated(s, 0, 1, 0, { kind: 'number', number: 2 });
 		const mergedA = acquireWorkbookSnapshotViaDelta(ca.session, cacheA);
 		const mergedB = acquireWorkbookSnapshotViaDelta(cb.session, cacheB);
-		// A polled first -> fast delta (advances the engine cache VV); B's
-		// separate cache then sees staleness -> full re-fetch.
-		assert.strictEqual(ca.snaps(), 1, 'cache A took the fast path (no re-fetch)');
+		assert.strictEqual(ca.snaps(), 1, 'cache A took the fast path (no full re-fetch beyond seed)');
 		assert.strictEqual(ca.deltas(), 1);
-		assert.ok(cb.snaps() >= 2, 'separate cache B observed staleness -> full re-fetch');
-		// Correctness despite the perf split: both converge.
+		assert.ok(cb.snaps() >= 1, 'cache B acquired');
+		// The correctness invariant: both caches converge to identical data.
 		assert.deepStrictEqual(mergedA.sheets, mergedB.sheets, 'both converge to identical sheet data');
 		assert.strictEqual(b10FindCell(mergedA, 0, 1, 0)!.value!.number, 2);
 		assert.strictEqual(b10FindCell(mergedB, 0, 1, 0)!.value!.number, 2);
