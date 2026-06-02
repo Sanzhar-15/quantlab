@@ -1595,6 +1595,45 @@ export interface UndoRedoResultJson {
 }
 
 /**
+ * **6.5-0**: result of {@link SessionInstance.writeRange} (mirrors the engine
+ * `WriteRangeResult` / napi `WriteRangeResultJson`). `written` is the cell count;
+ * `version` is the opaque post-write token (round-trip into the next `snapshotDelta`).
+ */
+export interface WriteRangeResultJson {
+	written: number;
+	version: Uint8Array;
+}
+
+/**
+ * **6.5-1 / ENG-FUSION**: reference to a published artifact -- the result of
+ * {@link SessionInstance.materializeQuery} (`id` = the `queryId`) and
+ * {@link SessionInstance.publishDataset} (`id` = the `name`). Mirrors the engine
+ * `PublishedRef`.
+ */
+export interface PublishedRefJson {
+	id: string;
+}
+
+/**
+ * **ENG-FUSION**: a bound overlay range -- the result of
+ * {@link SessionInstance.bindRange} (mirrors the engine `BoundRange`). `bindingId`
+ * is the caller's id echoed back; round-trip reads of the bound range use `queryRange`.
+ */
+export interface BoundRangeJson {
+	bindingId: string;
+}
+
+/**
+ * **6.5-2**: result of {@link SessionInstance.refreshSource} (mirrors the engine
+ * `DirtyResult`). `dirtied` is the count of dependents dirtied; `version` is the
+ * opaque post-refresh token. A `revision` <= the stored one is a no-op (`dirtied: 0`).
+ */
+export interface DirtyResultJson {
+	dirtied: number;
+	version: Uint8Array;
+}
+
+/**
  * **6.4-2 (mirrored 6.3-2 hardening, 2026-05-30)**: JS-facing `Arity` -- a strict
  * tagged union on `kind`. `fixed` carries only `n`; `range` carries `min` and
  * optionally `max` (absent means unbounded); `variadic` carries no payload. Omit the
@@ -2037,30 +2076,46 @@ export interface SessionInstance {
 	 */
 	rollbackTransaction(txn: bigint): void;
 
-	// Reserved (Section 3.5) capability stubs -- real impls land in 6.4 (publish/bind)
-	// / 6.5 (SQL materialize) / a future bulk-write. In v1 each ALWAYS throws
-	// `[not_implemented_in_v1_core]` (a malformed arg throws `[bad_argument]` first).
-
-	/** Reserved: bulk-write a value matrix. Always throws `[not_implemented_in_v1_core]` in v1. */
-	writeRange(range: CellRangeJson, values: CellValueJson[][]): void;
+	// Section 3.5 bulk methods -- all LIVE (writeRange 6.5-0, materializeQuery 6.5-1,
+	// refreshSource 6.5-2, publishDataset + bindRange ENG-FUSION). A malformed arg
+	// throws `[bad_argument]`; off a Ready session, `[invalid_state]`.
 
 	/**
-	 * Reserved (`qb.publish()`): publish a dataset. `data` is a JSON string (opaque payload).
-	 * Always throws `[not_implemented_in_v1_core]` in v1.
+	 * Bulk-write a rectangular value matrix; dirties dependents (one BatchCommit / undo
+	 * unit). `[bad_argument]` for an inverted/out-of-bounds range, a shape mismatch, or a
+	 * size over the 1<<20-cell cap.
 	 */
-	publishDataset(name: string, data: string, target: CellRangeJson): void;
-
-	/** Reserved (`qb.bind()`): bind an overlay range. Always throws `[not_implemented_in_v1_core]` in v1. */
-	bindRange(bindingId: string, target: CellRangeJson): void;
-
-	/** Reserved: refresh an external source by revision. Always throws `[not_implemented_in_v1_core]` in v1. */
-	refreshSource(sourceId: string, revision: bigint): void;
+	writeRange(range: CellRangeJson, values: CellValueJson[][]): WriteRangeResultJson;
 
 	/**
-	 * Reserved (SQL): materialize a query result into a target. `data` is a JSON string.
-	 * Always throws `[not_implemented_in_v1_core]` in v1.
+	 * `qb.publish()`: publish a JSON value-matrix `data` (a string carrying
+	 * `{"values":[[scalar|null,...],...]}`, per-cell) into `target`; records provenance
+	 * keyed by `name` and (on re-publish) dirties vacated dependents. `[bad_argument]`
+	 * for an inverted/out-of-bounds target, a result that does not fit, or
+	 * malformed/non-rectangular/non-scalar/non-finite `data`. Returns `{ id: name }`.
 	 */
-	materializeQuery(queryId: string, target: CellRangeJson, data: string): void;
+	publishDataset(name: string, data: string, target: CellRangeJson): PublishedRefJson;
+
+	/**
+	 * `qb.bind()`: register `bindingId -> target` as a `BoundFrame` overlay region
+	 * (round-trip reads go through `queryRange`). `[bad_argument]` for an inverted/
+	 * out-of-bounds target; `[sheet_not_found]` for an unknown sheet. Returns `{ bindingId }`.
+	 */
+	bindRange(bindingId: string, target: CellRangeJson): BoundRangeJson;
+
+	/**
+	 * Refresh an external source by revision; dirties dependent cells. A `revision` <= the
+	 * stored one is a no-op (`dirtied: 0`). `[source_not_found]` if never materialized;
+	 * `[bad_argument]` if `sourceId` is a published dataset (re-publish to update).
+	 */
+	refreshSource(sourceId: string, revision: bigint): DirtyResultJson;
+
+	/**
+	 * Materialize a SQL query into `target`. `data` is a JSON string `{"sql":"..."}`.
+	 * `[sql_error]`/`[sql_table_build]` on query failure, `[bad_argument]` for a result
+	 * that does not fit / malformed data. Returns `{ id: queryId }`.
+	 */
+	materializeQuery(queryId: string, target: CellRangeJson, data: string): PublishedRefJson;
 
 	// --- Parity backfill (2026-05-30, megaudit X1/X2): pre-existing bound methods
 	// (close = 6.1C M8; the UDF-registration surface = 6.4-2) that lacked a typed
@@ -2409,9 +2464,18 @@ export type QuantbookErrorCode =
 	| 'csv_parse'
 	| 'csv_exceeds_limits'
 	| 'csv_sheet_not_found'
+	// SQL surface (`materialize_query`, 6.5-1): a query that fails to parse/plan/execute
+	// or whose result does not fit / uses rejected DDL-DML-statements -> `sql_error`
+	// (BadArgument); a workbook->Arrow table build / result-shape failure -> `sql_table_build`
+	// (Internal). `source_not_found` (NotFound): `refresh_source` on a source never
+	// materialized in this session (6.5-2). (Cross-repo D-H1/H2 sync, 2026-06-02.)
+	| 'sql_error'
+	| 'sql_table_build'
+	| 'source_not_found'
 	// Capability -- a surface that is not implemented in the v1 core yet
 	// (`not_implemented`, `session.rs`; a visible `Capability` error, never a silent
-	// fallback). Emitted today by the reserved `publish_dataset` / `bind_range`.
+	// fallback). Emitted today by `query_range` column extras + `export("xlsx")` w/o the
+	// feature (the reserved sec-3.5 bulk methods are all LIVE since 6.5 / ENG-FUSION).
 	| 'not_implemented_in_v1_core'
 	// Unmapped catch-alls: the No-Fallbacks loud-Internal arms in the foreign
 	// `#[non_exhaustive]` mappers (`map_oplog_err` / `map_persistence_err` /

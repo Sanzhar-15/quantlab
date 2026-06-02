@@ -883,6 +883,12 @@ const KNOWN_QUANTBOOK_ERROR_CODE_RECORD: Record<Exclude<QuantbookErrorCode, 'unk
 	csv_parse: true,
 	csv_exceeds_limits: true,
 	csv_sheet_not_found: true,
+	// SQL surface + source refresh (`materialize_query` 6.5-1 / `refresh_source` 6.5-2).
+	// Cross-repo D-H1/H2 sync (2026-06-02): the engine emits these over the napi Session
+	// surface but the IDE allowlist + union were stale.
+	sql_error: true,
+	sql_table_build: true,
+	source_not_found: true,
 	// Capability (reserved-surface `not_implemented`).
 	not_implemented_in_v1_core: true,
 	// Unmapped catch-alls (No-Fallbacks loud-Internal arms of the foreign
