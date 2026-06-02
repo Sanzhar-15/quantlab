@@ -3242,13 +3242,114 @@ impl EngineSession for WorkbookSession {
         })
     }
 
+    /// **ENG-FUSION:** publish a Python (or any caller) value into `target`. `data` is
+    /// a JSON object `{"values": [[scalar|null, ...], ...]}` — a rectangular, row-major
+    /// matrix of JSON scalars converted PER CELL (heterogeneous): finite number ->
+    /// `Number`, string -> `Text`, bool -> `Boolean`, null -> `Blank`; a non-scalar
+    /// element or a non-rectangular `values` is a loud `bad_argument` (No-Fallbacks).
+    /// (Distinct from `materialize_query`'s per-COLUMN Arrow inference — Arrow ingestion
+    /// is an FE-side concern and can be added later as another `data` variant.) The block
+    /// is written anchored at `target`'s top-left via the [`write_range`] substrate (ONE
+    /// `Op::BatchCommit`, dirties dependents, one version bump); it must FIT within
+    /// `target` (else loud `bad_argument`) and `target` cells beyond the block are left
+    /// unchanged. A zero-row value writes nothing.
+    ///
+    /// Provenance is recorded keyed by `name` (the dual index, exactly like
+    /// `materialize_query`), so the dataset is `refresh_source`-able and attributable.
+    ///
+    /// **Reactive dirty-notify (the moat):** on RE-publish under the same `name`, after
+    /// writing the new block this also dirties the dependents of cells the previous value
+    /// covered but the new one does not (the `refresh_source` old-cell fan-out, which
+    /// `materialize_query` alone does not perform). The caller drives recomputation with
+    /// a following `recalc_dirty`. Returns `PublishedRef { id }` (the caller's `name`).
+    ///
+    /// [`write_range`]: WorkbookSession::write_range
     fn publish_dataset(
         &mut self,
-        _name: &str,
-        _data: serde_json::Value,
-        _target: CellRange,
+        name: &str,
+        data: serde_json::Value,
+        target: CellRange,
     ) -> EngineResult<PublishedRef> {
-        Err(not_implemented("publish_dataset"))
+        self.ensure_ready()?;
+        self.require_live_sheet(target.sheet, "publish_dataset")?;
+        if target.end_row < target.start_row || target.end_col < target.start_col {
+            return Err(EngineError::bad_argument(
+                "publish_dataset: target range end coordinate is before its start",
+            ));
+        }
+        Self::require_in_bounds(target.start_row, target.start_col, "publish_dataset")?;
+        Self::require_in_bounds(target.end_row, target.end_col, "publish_dataset")?;
+        let target_rows = (target.end_row - target.start_row + 1) as usize;
+        let target_cols = (target.end_col - target.start_col + 1) as usize;
+
+        // Convert the JSON value-matrix to a row-major cell matrix (loud bad_argument on
+        // malformed / non-rectangular / non-finite / non-scalar input) BEFORE any mutation.
+        let values = json_block_to_cell_values(&data)?;
+
+        // Cells this name produced on a prior publish — captured BEFORE the write so the
+        // re-publish shrink fan-out can dirty the dependents of any vacated cells.
+        let old_cells: Vec<CellAddr> = self
+            .provenance
+            .get(name)
+            .map(|e| e.cells.clone())
+            .unwrap_or_default();
+
+        let n_rows = values.len();
+        if n_rows == 0 {
+            // Zero-row publish: write nothing, record an (empty, refresh-able) provenance
+            // entry, but still dirty the dependents of any previously-produced cells so a
+            // shrink-to-zero reactively invalidates downstream formulas.
+            self.record_block_provenance(name, target, Vec::new(), data);
+            for cell in &old_cells {
+                self.graph.on_set_value(cell.sheet, cell.row, cell.col);
+            }
+            return Ok(PublishedRef {
+                id: name.to_string(),
+            });
+        }
+        let n_cols = values[0].len();
+        if n_rows > target_rows || n_cols > target_cols {
+            return Err(EngineError::bad_argument(format!(
+                "publish_dataset: data {n_rows}x{n_cols} does not fit the target range \
+                 {target_rows}x{target_cols}"
+            )));
+        }
+
+        // Write the block anchored at the target's top-left (validation + one BatchCommit
+        // + dependent dirtying of the newly-written cells).
+        let block = CellRange {
+            sheet: target.sheet,
+            start_row: target.start_row,
+            start_col: target.start_col,
+            end_row: target.start_row + (n_rows as RowId) - 1,
+            end_col: target.start_col + (n_cols as ColId) - 1,
+        };
+        self.write_range(block, values)?;
+
+        // Record the dual-index provenance (row-major produced cells) keyed by `name`.
+        let mut produced: Vec<CellAddr> = Vec::with_capacity(n_rows * n_cols);
+        for r in 0..n_rows as RowId {
+            for c in 0..n_cols as ColId {
+                produced.push(CellAddr {
+                    sheet: target.sheet,
+                    row: target.start_row + r,
+                    col: target.start_col + c,
+                });
+            }
+        }
+        self.record_block_provenance(name, target, produced, data);
+
+        // Reactive dirty-notify: fan out over the PREVIOUS produced cells so dependents of
+        // cells the new value no longer covers are dirtied. `write_range` already fired
+        // `on_set_value` at every newly-written cell; firing again over the overlap is
+        // idempotent, and the non-overlap (vacated) cells are exactly the shrink case.
+        for cell in &old_cells {
+            self.graph.on_set_value(cell.sheet, cell.row, cell.col);
+        }
+
+        Ok(PublishedRef {
+            id: name.to_string(),
+        })
     }
 
     fn bind_range(&mut self, _binding_id: &str, _target: CellRange) -> EngineResult<BoundRange> {
@@ -3415,34 +3516,10 @@ impl EngineSession for WorkbookSession {
         let n_rows = result.num_rows();
         if n_rows == 0 {
             // A zero-row result materializes nothing (no write, no version advance).
-            // Evict per-cell entries from a prior non-empty run of this same source
-            // (shrinking to zero), guarded by ownership so we don't remove cells
-            // another source has since claimed via last-writer-wins.
-            let old_cells: Vec<CellAddr> = self
-                .provenance
-                .get(query_id)
-                .map(|e| e.cells.clone())
-                .unwrap_or_default();
-            for old_cell in old_cells {
-                if self
-                    .cell_provenance
-                    .get(&old_cell)
-                    .map(|cp| cp.source_id.as_str())
-                    == Some(query_id)
-                {
-                    self.cell_provenance.remove(&old_cell);
-                }
-            }
-            // Still record a provenance entry so refresh_source can re-run the query.
-            self.provenance.insert(
-                query_id.to_string(),
-                ProvenanceEntry {
-                    revision: 0,
-                    data,
-                    target,
-                    cells: Vec::new(),
-                },
-            );
+            // record_block_provenance still records an (empty) entry so refresh_source
+            // can re-run, and evicts per-cell entries from a prior non-empty run of this
+            // same source (shrink-to-zero), ownership-guarded.
+            self.record_block_provenance(query_id, target, Vec::new(), data);
             return Ok(PublishedRef {
                 id: query_id.to_string(),
             });
@@ -3468,61 +3545,81 @@ impl EngineSession for WorkbookSession {
         };
         self.write_range(block, values)?;
 
-        // 6.5-2: record per-cell provenance and emit Event::Provenance for each
-        // produced cell. The dual index (source_id→cells reverse + cell→source forward)
-        // lets refresh_source dirty all produced cells' dependents and supports per-cell
-        // attribution queries.
+        // 6.5-2: record the dual-index provenance (source_id->cells reverse + cell->source
+        // forward) so refresh_source dirties all produced cells' dependents and per-cell
+        // attribution works. Shared with publish_dataset via record_block_provenance.
         let mut produced: Vec<CellAddr> = Vec::with_capacity(n_rows * n_cols);
         for r in 0..n_rows as RowId {
             for c in 0..n_cols as ColId {
-                let cell_addr = CellAddr {
+                produced.push(CellAddr {
                     sheet: target.sheet,
                     row: target.start_row + r,
                     col: target.start_col + c,
-                };
-                produced.push(cell_addr);
-                self.events.push(Event::Provenance {
-                    addr: cell_addr,
-                    source: query_id.to_string(),
                 });
-                // Per-cell typed provenance (cell → {source_id, revision}).
-                // revision=0 baseline; refresh_source advances it after a successful
-                // re-run. Overwrites any prior entry if a different source now owns
-                // this cell (last-writer-wins).
-                self.cell_provenance.insert(
-                    cell_addr,
-                    CellProvenance {
-                        source_id: query_id.to_string(),
-                        revision: 0,
-                    },
-                );
             }
         }
+        self.record_block_provenance(query_id, target, produced, data);
 
-        // Evict per-cell entries for cells this source produced before but no longer
-        // produces now (e.g. target shrunk or query returns fewer columns). Clone old
-        // cells before replacing the entry; guard removal so we don't evict a cell
-        // that another source has since claimed via last-writer-wins.
-        let new_produced_set: HashSet<CellAddr> = produced.iter().copied().collect();
+        Ok(PublishedRef {
+            id: query_id.to_string(),
+        })
+    }
+}
+
+impl WorkbookSession {
+    /// **ENG-FUSION (extracted from `materialize_query`, 6.5-2 logic):** record the
+    /// dual-index provenance for a freshly produced block under `source_id`, and evict
+    /// the per-cell entries this source produced before but no longer produces (target
+    /// shrank / fewer columns), guarded by ownership (last-writer-wins) so a cell another
+    /// source now owns is never clobbered. `produced` is the row-major list of cells
+    /// written (empty for a zero-row producer); `data` is the producer payload stored so
+    /// `refresh_source` / re-publish can re-run. Emits `Event::Provenance` per produced
+    /// cell. Does NOT touch the dependency graph — callers fan out `on_set_value`
+    /// themselves for reactive shrink (publish_dataset / refresh_source).
+    fn record_block_provenance(
+        &mut self,
+        source_id: &str,
+        target: CellRange,
+        produced: Vec<CellAddr>,
+        data: serde_json::Value,
+    ) {
+        for &cell_addr in &produced {
+            self.events.push(Event::Provenance {
+                addr: cell_addr,
+                source: source_id.to_string(),
+            });
+            // Per-cell typed provenance (cell -> {source_id, revision}); revision=0
+            // baseline (refresh_source advances it). Last-writer-wins overwrite.
+            self.cell_provenance.insert(
+                cell_addr,
+                CellProvenance {
+                    source_id: source_id.to_string(),
+                    revision: 0,
+                },
+            );
+        }
+        // Evict cells this source produced before but not now. Read old cells from the
+        // still-PRIOR provenance entry (the new entry is inserted last); guard removal so
+        // we don't evict a cell another source has since claimed via last-writer-wins.
+        let new_set: HashSet<CellAddr> = produced.iter().copied().collect();
         let old_cells: Vec<CellAddr> = self
             .provenance
-            .get(query_id)
+            .get(source_id)
             .map(|e| e.cells.clone())
             .unwrap_or_default();
         for old_cell in old_cells {
-            if !new_produced_set.contains(&old_cell)
+            if !new_set.contains(&old_cell)
                 && self
                     .cell_provenance
                     .get(&old_cell)
                     .map(|cp| cp.source_id.as_str())
-                    == Some(query_id)
+                    == Some(source_id)
             {
                 self.cell_provenance.remove(&old_cell);
             }
         }
-
         self.provenance.insert(
-            query_id.to_string(),
+            source_id.to_string(),
             ProvenanceEntry {
                 revision: 0,
                 data,
@@ -3530,10 +3627,6 @@ impl EngineSession for WorkbookSession {
                 cells: produced,
             },
         );
-
-        Ok(PublishedRef {
-            id: query_id.to_string(),
-        })
     }
 }
 
@@ -3987,6 +4080,87 @@ fn parse_materialize_sql(data: &serde_json::Value) -> EngineResult<String> {
         ));
     }
     Ok(sql.to_string())
+}
+
+/// **ENG-FUSION:** convert a `publish_dataset` `data` payload — a JSON object
+/// `{"values": [[scalar|null, ...], ...]}` — into a row-major `Vec<Vec<CellValue>>`.
+/// Per-CELL conversion (heterogeneous, unlike `materialize_query`'s per-column Arrow
+/// inference). Loud `bad_argument` (No-Fallbacks) on: missing/non-array `values`, a
+/// non-array row, a non-rectangular shape, an empty row (zero columns with rows
+/// present), or a non-scalar / non-finite element. An empty `values` array -> zero
+/// rows (the caller's zero-row publish path).
+fn json_block_to_cell_values(data: &serde_json::Value) -> EngineResult<Vec<Vec<CellValue>>> {
+    let rows = data.get("values").and_then(|v| v.as_array()).ok_or_else(|| {
+        EngineError::bad_argument(
+            "publish_dataset: `data` must be a JSON object with a `values` array of rows",
+        )
+    })?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<Vec<CellValue>> = Vec::with_capacity(rows.len());
+    let mut width: Option<usize> = None;
+    for (r, row) in rows.iter().enumerate() {
+        let cells = row.as_array().ok_or_else(|| {
+            EngineError::bad_argument(format!(
+                "publish_dataset: `data.values[{r}]` must be an array (a row of scalars)"
+            ))
+        })?;
+        match width {
+            None => {
+                if cells.is_empty() {
+                    return Err(EngineError::bad_argument(
+                        "publish_dataset: `data.values` rows must have at least one column",
+                    ));
+                }
+                width = Some(cells.len());
+            }
+            Some(w) if cells.len() != w => {
+                return Err(EngineError::bad_argument(format!(
+                    "publish_dataset: `data.values` is not rectangular (row {r} has {} \
+                     cells, expected {w})",
+                    cells.len()
+                )));
+            }
+            _ => {}
+        }
+        let mut out_row: Vec<CellValue> = Vec::with_capacity(cells.len());
+        for (c, cell) in cells.iter().enumerate() {
+            out_row.push(json_scalar_to_cell_value(cell, r, c)?);
+        }
+        out.push(out_row);
+    }
+    Ok(out)
+}
+
+/// **ENG-FUSION:** one JSON scalar -> `CellValue`. null -> Blank, bool -> Boolean,
+/// finite number -> Number, string -> Text; a JSON array/object or a non-finite number
+/// is a loud `bad_argument`. (JSON cannot represent NaN/Inf, but the finiteness guard
+/// is kept defensively so the engine never receives a non-finite f64.)
+fn json_scalar_to_cell_value(v: &serde_json::Value, r: usize, c: usize) -> EngineResult<CellValue> {
+    use serde_json::Value as J;
+    match v {
+        J::Null => Ok(CellValue::Blank),
+        J::Bool(b) => Ok(CellValue::Boolean { boolean: *b }),
+        J::Number(n) => {
+            let f = n.as_f64().ok_or_else(|| {
+                EngineError::bad_argument(format!(
+                    "publish_dataset: `data.values[{r}][{c}]` is not a representable number"
+                ))
+            })?;
+            if !f.is_finite() {
+                return Err(EngineError::bad_argument(format!(
+                    "publish_dataset: `data.values[{r}][{c}]` must be a finite number"
+                )));
+            }
+            Ok(CellValue::Number { number: f })
+        }
+        J::String(s) => Ok(CellValue::Text { text: s.clone() }),
+        J::Array(_) | J::Object(_) => Err(EngineError::bad_argument(format!(
+            "publish_dataset: `data.values[{r}][{c}]` must be a scalar (number, string, \
+             bool, or null)"
+        ))),
+    }
 }
 
 /// Excel column letters for a 0-based column index (0 -> "A", 25 -> "Z", 26 -> "AA").
@@ -5475,6 +5649,259 @@ mod tests {
             !s.cell_provenance.contains_key(&addr(sheet, 2, 1)),
             "B3 (owned by q1, not in new result) must be evicted"
         );
+    }
+
+    // --- ENG-FUSION: publish_dataset ---
+
+    /// publish_dataset writes a JSON value-matrix per cell (text/number/bool) and records
+    /// the dual-index provenance keyed by `name`.
+    #[test]
+    fn publish_dataset_writes_and_tracks_provenance() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let data = serde_json::json!({"values": [["AAPL", 192.5, true]]});
+        let r = s
+            .publish_dataset("prices", data, rng(sheet, 0, 0, 0, 2))
+            .unwrap();
+        assert_eq!(r.id, "prices");
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 0)),
+            CellValue::Text {
+                text: "AAPL".into()
+            }
+        );
+        assert_eq!(cell_value(&s, addr(sheet, 0, 1)), num(192.5));
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 2)),
+            CellValue::Boolean { boolean: true }
+        );
+        // Dual provenance index: source reverse + per-cell forward.
+        assert_eq!(s.provenance["prices"].cells.len(), 3);
+        assert_eq!(s.cell_provenance[&addr(sheet, 0, 0)].source_id, "prices");
+        assert_eq!(s.cell_provenance[&addr(sheet, 0, 2)].source_id, "prices");
+    }
+
+    /// A JSON null publishes as a Blank (cleared) cell.
+    #[test]
+    fn publish_dataset_null_is_blank() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), num(5.0)).unwrap();
+        s.publish_dataset(
+            "d",
+            serde_json::json!({"values": [[null]]}),
+            rng(sheet, 0, 0, 0, 0),
+        )
+        .unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap();
+        assert!(
+            c.is_none() || c.unwrap().value.is_none(),
+            "a JSON null publishes as a Blank (cleared) cell"
+        );
+    }
+
+    /// publish_dataset dirties dependents; recalc recomputes them, and re-publishing a
+    /// new value at the same cell reactively updates the dependent (the core moat path).
+    #[test]
+    fn publish_dataset_dirties_dependents() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_formula(addr(sheet, 0, 2), "B1*2").unwrap(); // C1 = B1*2; B1 blank -> 0
+        assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(0.0));
+        s.publish_dataset(
+            "v",
+            serde_json::json!({"values": [[5.0]]}),
+            rng(sheet, 0, 1, 0, 1),
+        )
+        .unwrap(); // B1 = 5
+        let op = s.recalc_dirty().unwrap();
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
+        assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(10.0)); // C1 = 5*2
+
+        // Re-publish a new value -> the dependent reactively updates.
+        s.publish_dataset(
+            "v",
+            serde_json::json!({"values": [[8.0]]}),
+            rng(sheet, 0, 1, 0, 1),
+        )
+        .unwrap();
+        let op = s.recalc_dirty().unwrap();
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
+        assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(16.0)); // C1 = 8*2
+    }
+
+    /// THE moat behaviour: re-publishing a SHRUNK value dirties the dependents of cells
+    /// the previous value covered but the new one does not (the refresh_source fan-out),
+    /// and evicts their per-cell provenance. (Vacated cells keep their value, exactly
+    /// like materialize_query / refresh_source — clearing is the caller's job.)
+    #[test]
+    fn publish_dataset_republish_shrink_dirties_vacated_dependents() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // D1 depends ONLY on B3 (vacated on shrink); nothing depends on B1.
+        s.set_formula(addr(sheet, 0, 3), "B3*10").unwrap();
+        s.publish_dataset(
+            "px",
+            serde_json::json!({"values": [[1.0], [2.0], [3.0]]}),
+            rng(sheet, 0, 1, 2, 1),
+        )
+        .unwrap(); // B1=1, B2=2, B3=3
+        let op = s.recalc_dirty().unwrap();
+        assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
+        assert_eq!(cell_value(&s, addr(sheet, 0, 3)), num(30.0)); // D1 = B3*10 = 30
+        assert!(s.cell_provenance.contains_key(&addr(sheet, 2, 1))); // B3 owned by px
+        let dirty_before = s.graph.dirty_formulas().len();
+
+        // Re-publish a 1-row value -> writes only B1; B2/B3 are vacated.
+        s.publish_dataset(
+            "px",
+            serde_json::json!({"values": [[7.0]]}),
+            rng(sheet, 0, 1, 2, 1),
+        )
+        .unwrap();
+        // The vacated-cell fan-out dirtied D1 (depends on B3). Nothing depends on B1, so
+        // the increase is attributable to the shrink fan-out.
+        assert!(
+            s.graph.dirty_formulas().len() > dirty_before,
+            "shrink re-publish must dirty the dependents of vacated cells (D1)"
+        );
+        // B3's per-cell provenance is evicted (px no longer produces it); B1 still owned.
+        assert!(
+            !s.cell_provenance.contains_key(&addr(sheet, 2, 1)),
+            "B3 must be evicted from cell_provenance after the shrink re-publish"
+        );
+        assert_eq!(s.cell_provenance[&addr(sheet, 0, 1)].source_id, "px");
+    }
+
+    /// publish_dataset is ONE BatchCommit; a single undo reverts the whole block.
+    #[test]
+    fn publish_dataset_is_one_batch_commit_and_undo_reverts() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let log_before = s.oplog.len();
+        s.publish_dataset(
+            "d",
+            serde_json::json!({"values": [[1.0, 2.0], [3.0, 4.0]]}),
+            rng(sheet, 0, 0, 1, 1),
+        )
+        .unwrap();
+        assert_eq!(
+            s.oplog.len() - log_before,
+            1,
+            "a 4-cell publish must log ONE BatchCommit"
+        );
+        assert!(s.undo().unwrap().consumed);
+        for (r, c) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)] {
+            assert!(
+                s.cell(addr(sheet, r, c)).unwrap().is_none(),
+                "cell ({r},{c}) reverts to empty after one undo"
+            );
+        }
+    }
+
+    /// A value larger than the target range is a loud bad_argument (No-Fallbacks).
+    #[test]
+    fn publish_dataset_result_exceeds_target_is_bad_argument() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // 3-row value into a 2x1 target -> does not fit.
+        let err = s
+            .publish_dataset(
+                "d",
+                serde_json::json!({"values": [[1.0], [2.0], [3.0]]}),
+                rng(sheet, 0, 0, 1, 0),
+            )
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert!(err.message.contains("does not fit"), "got: {}", err.message);
+    }
+
+    /// Malformed `data` is loud bad_argument with no write: missing `values`, a
+    /// non-rectangular matrix, and a non-scalar element.
+    #[test]
+    fn publish_dataset_bad_data_is_loud() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let t = rng(sheet, 0, 0, 4, 4);
+        assert_eq!(
+            s.publish_dataset("d", serde_json::json!({"nope": 1}), t)
+                .unwrap_err()
+                .class,
+            ErrorClass::BadArgument
+        );
+        assert_eq!(
+            s.publish_dataset("d", serde_json::json!({"values": [[1.0, 2.0], [3.0]]}), t)
+                .unwrap_err()
+                .class,
+            ErrorClass::BadArgument
+        );
+        assert_eq!(
+            s.publish_dataset("d", serde_json::json!({"values": [[{"a": 1}]]}), t)
+                .unwrap_err()
+                .class,
+            ErrorClass::BadArgument
+        );
+        assert!(
+            s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
+            "nothing is written on malformed data"
+        );
+    }
+
+    /// A zero-row value writes nothing and leaves the target + version unchanged, but
+    /// records a refresh-able provenance entry.
+    #[test]
+    fn publish_dataset_zero_rows_writes_nothing() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), num(99.0)).unwrap();
+        let seq0 = token_seq(&s.snapshot().unwrap().version);
+        let r = s
+            .publish_dataset(
+                "d",
+                serde_json::json!({"values": []}),
+                rng(sheet, 0, 0, 0, 0),
+            )
+            .unwrap();
+        assert_eq!(r.id, "d");
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 0)),
+            num(99.0),
+            "target untouched on a 0-row publish"
+        );
+        assert_eq!(
+            token_seq(&s.snapshot().unwrap().version),
+            seq0,
+            "no version advance"
+        );
+        assert!(
+            s.provenance.contains_key("d"),
+            "still records a refresh-able entry"
+        );
+    }
+
+    /// Lifecycle + target gating: unknown sheet -> sheet_not_found; closed ->
+    /// invalid_state (both before any conversion).
+    #[test]
+    fn publish_dataset_gating() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let miss = s
+            .publish_dataset(
+                "d",
+                serde_json::json!({"values": [[1.0]]}),
+                rng(99, 0, 0, 0, 0),
+            )
+            .unwrap_err();
+        assert_eq!(miss.code, "sheet_not_found");
+        s.close().unwrap();
+        let closed = s
+            .publish_dataset(
+                "d",
+                serde_json::json!({"values": [[1.0]]}),
+                rng(sheet, 0, 0, 0, 0),
+            )
+            .unwrap_err();
+        assert_eq!(closed.code, "invalid_state");
     }
 
     // --- 6.4-2: register_function / unregister_function / list_functions ---

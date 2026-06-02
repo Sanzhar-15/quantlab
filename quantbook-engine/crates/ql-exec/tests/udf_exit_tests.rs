@@ -4,9 +4,9 @@
 //! codec, 6.4-3b real worker, 6.4-3c eval dispatch, 6.4-3d blockers and
 //! diagnostics). The production code shipped across those increments; this proves it
 //! against the contract's eight exit tests, each test below labeled with its
-//! §10.4 number. Of the eight, this suite proves SIX as positive exits (1, 2, 3,
-//! 6, 7, 8) and guards the remaining TWO (4, 5) as reserved-capability tripwires
-//! — see the note below. It is a **public-API integration test** (parallel to
+//! §10.4 number. Of the eight, this suite proves SEVEN as positive exits (1, 2,
+//! 3, 4, 6, 7, 8) and guards the remaining ONE (5) as a reserved-capability
+//! tripwire — see the note below. It is a **public-API integration test** (parallel to
 //! `udf_e2e.rs`) — it touches `WorkbookSession` only through `EngineSession` +
 //! the inherent `set_udf_worker`, so it doubles as a no-private-access contract
 //! check.
@@ -22,15 +22,17 @@
 //!   (8) registering a UDF dirties formulas that referenced its (previously-
 //!       unknown) name.
 //!
-//! **Tests 4 and 5 target reserved-tier producers (`publish_dataset` /
-//! `bind_range`) that are `not_implemented_in_v1_core` today** (session-api.md
-//! §11 reserved row; `WorkbookSession` returns `not_implemented`). They are NOT
-//! silently skipped: the tests assert the not-implemented status and document
-//! the deferral, so the moment a producer is wired without its dirty path, the
-//! documented expectation is right here to update. The reactivity-dirty
-//! mechanics they would exercise are themselves covered: dependent fanout by
-//! tests (1)/(8), and the `mark_volatiles_dirty` volatile re-eval by test (3)
-//! (its fanout-to-dependents is proven separately by
+//! **Test 4 (`publish_dataset`) is now a positive exit** — ENG-FUSION shipped
+//! the producer, so test 4 asserts the publish->dirty->recompute path directly.
+//! **Test 5 still targets a reserved-tier producer (`bind_range`) that is
+//! `not_implemented_in_v1_core` today** (session-api.md §11 reserved row;
+//! `WorkbookSession` returns `not_implemented`). It is NOT silently skipped: the
+//! test asserts the not-implemented status and documents the deferral, so the
+//! moment `bind_range` is wired without its dirty path, the documented
+//! expectation is right here to update. The reactivity-dirty mechanics it would
+//! exercise are themselves covered: dependent fanout by tests (1)/(4)/(8), and
+//! the `mark_volatiles_dirty` volatile re-eval by test (3) (its
+//! fanout-to-dependents is proven separately by
 //! `session.rs::mark_volatiles_dirty_fans_out_to_dependents_of_volatile_udf`).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -256,18 +258,15 @@ fn exit_test_3_volatile_udf_recomputes_on_volatile_pass() {
 }
 
 // ---------------------------------------------------------------------------
-// §10.4 (4) — publish dirties dependents  [DEFERRED — reserved-tier producer]
+// §10.4 (4) — publish dirties dependents
 // ---------------------------------------------------------------------------
 
-/// `publish_dataset` is a reserved-tier producer (session-api.md §11), today
-/// `not_implemented_in_v1_core`. There is no published-dataset producer to
-/// dirty dependents OF, so this exit test cannot be positively asserted at
-/// 6.4-4. We assert the not-implemented status (fail-loud, never a silent
-/// no-op) and DOCUMENT the deferral: when a real `publish_dataset` lands, its
-/// commit MUST dirty dependent formulas (the same fanout exit tests 1 and 8
-/// already prove for cell deps), and this test becomes the positive assertion.
+/// `publish_dataset` (ENG-FUSION) commits a value into its target via the
+/// `write_range` substrate, so a formula referencing the published cell is
+/// dirtied and recomputes on the next `recalc_dirty`. Re-publishing a new value
+/// drives the dependent again — the reactive Python->grid path (the moat).
 #[test]
-fn exit_test_4_publish_dirties_dependents_deferred_until_publish_implemented() {
+fn exit_test_4_publish_dirties_dependents() {
     let mut s = WorkbookSession::new();
     let sheet = s.add_sheet("S", 16384).unwrap();
     let target = CellRange {
@@ -277,13 +276,22 @@ fn exit_test_4_publish_dirties_dependents_deferred_until_publish_implemented() {
         end_row: 0,
         end_col: 0,
     };
-    let err = s
-        .publish_dataset("ds", serde_json::json!({"rows": []}), target)
-        .expect_err("publish_dataset is reserved-tier (not implemented in v1 core)");
+    // A1 fed by publish_dataset; B1 = A1 * 2 depends on it.
+    s.publish_dataset("ds", serde_json::json!({"values": [[21.0]]}), target)
+        .expect("publish_dataset commits a value into the target");
+    s.set_formula(addr(sheet, 0, 1), "A1*2").unwrap(); // B1 = 42
     assert_eq!(
-        err.code, "not_implemented_in_v1_core",
-        "publish_dataset must fail loud as not-implemented until the producer ships; \
-         when it ships, its commit MUST dirty dependents and this test asserts that"
+        cell_value(&s, addr(sheet, 0, 1)),
+        CellValue::Number { number: 42.0 }
+    );
+    // Re-publish a new value -> B1 is dirtied and recomputes to track it.
+    s.publish_dataset("ds", serde_json::json!({"values": [[50.0]]}), target)
+        .expect("re-publish commits the new value");
+    s.recalc_dirty().unwrap();
+    assert_eq!(
+        cell_value(&s, addr(sheet, 0, 1)),
+        CellValue::Number { number: 100.0 },
+        "re-publishing the source value must dirty + recompute the dependent"
     );
 }
 
