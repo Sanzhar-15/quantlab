@@ -841,6 +841,61 @@ This session counted **2 plan-implement-audit cycles** (V3.6.0.6 D5 ship + V3.6.
 - `docs/api/session-api.md`.
 - `docs/security/udf-ai-connectors.md`.
 
+## ENG-FUSION - Reactive Fusion Primitives
+
+**Purpose:** Unblock the product moat (a live reactive Python<->grid fusion workspace). Implement the two
+reserved section 3.5 stubs `publish_dataset` and `bind_range` (`crates/ql-exec/src/session.rs:3245/3254`,
+currently `not_implemented_in_v1_core`) plus the re-publish dirty-notify path, so a Python value can be
+pushed into the sheet and reactively dirty dependent cells. This is a pre-Phase-7 insertion: the
+"beyond Excel/Sheets" megaudit (2026-06-02) found the moat engine-blocked by these two stubs. The FE build
+plan v2 section ENG-FUSION is the cross-repo authority; this engine mini-phase is the half that lives here.
+
+**Entry State Required**
+
+- Phase 6 complete (SQL surface + the provenance reverse-index shipped at 6.5-2).
+- The frozen section 3.5 contract + reserved DTOs (`PublishedRef`, `BoundRange`) in place; no re-freeze.
+
+**Dependencies**
+
+- Builds on the shipped 6.5 machinery: the `write_range` substrate, `materialize_query`, `refresh_source`,
+  and the dual provenance index (`provenance` / `cell_provenance`).
+
+**Sub-items**
+
+1. **EF-publish_dataset**
+   Push a JSON value-matrix (`data = {"values": [[scalar|null, ...], ...]}`, per-cell JSON->CellValue) into
+   a target range via the `write_range` substrate, record provenance keyed by `name`, and on re-publish
+   dirty the dependents of vacated cells (the `refresh_source` old-cell fan-out).
+   References: `crates/ql-exec/src/session.rs` (`materialize_query` 3381, `refresh_source` 3272, `write_range` 3168).
+   Acceptance: FUSION-01 publish writes + tracks provenance; FUSION-03 re-publish dirties dependents and `recalc_dirty` updates them.
+   Effort: ~1 week.
+
+2. **EF-bind_range**
+   Register `binding_id -> CellRange` (a session-local `bindings` map, kept across undo/redo) for BoundFrame
+   round-trip; reads go through the existing `query_range`/snapshot path.
+   References: `crates/ql-exec/src/session.rs` (`write_range` validation 3168).
+   Acceptance: FUSION-02 a bound range round-trips edits.
+   Effort: ~2 days.
+
+3. **EF-bindings**
+   Expose `publish_dataset`/`bind_range` over all three transports (napi real return DTOs, new pyo3
+   wrappers, service wire DTOs) + a cross-transport reactive smoke.
+   References: `crates/ql-bindings-node/src/lib.rs`; `crates/quantbook-py/src/lib.rs`; `crates/ql-service/src/{router,wire}.rs`.
+   Acceptance: FUSION-04 all three transports return the same semantics.
+   Effort: ~3-5 days.
+
+**Exit Criteria**
+
+- Publishing a named dataset writes + tracks provenance; a bound range round-trips edits; re-publishing a
+  value dirties dependents and `recalc_dirty` updates them.
+- All three bindings share one contract (the Phase-6 exit criterion holds for the new methods).
+- Tests + doc-sync; parallel Codex + fresh-Opus closure audit, every HIGH verified at source.
+
+**Documentation Deliverables**
+
+- `docs/eng-fusion/entry-plan.md`.
+- `docs/api/session-api.md` section 3.5 amendment (publish/bind LIVE, the `{"values":...}` shape, FUSION codes).
+
 ## Phase 7 - Hardening And Ship
 
 **Purpose:** Turn a feature-complete engine into a release candidate through performance hardening, observability, scale tests, audits, packaging, signing, and final IDE polish.
