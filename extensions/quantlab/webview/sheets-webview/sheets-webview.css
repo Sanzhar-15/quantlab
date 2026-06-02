@@ -4,11 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 /*
- * FE-0b-1 (2026-06-02) -- bundled sheets-webview styles. Ported from the inline
- * CSS array in cellGridHtml.ts (the DOM-table look is preserved). The dormant
- * collab `.cell-peer-presence` rule is intentionally dropped (presence is
- * v1.5-deferred and the host no longer emits it). All colours are VS Code theme
- * variables so the grid tracks the active theme.
+ * FE-0b-2+3 (2026-06-02) -- bundled sheets-webview styles for the Canvas2D renderer + overlay
+ * editor. The grid itself (header, rows, cells, borders) is painted on the canvas using VS Code
+ * theme colours read in JS; this stylesheet only positions the scroller, the scroll-spacer, the
+ * overlay canvas, and the edit input. The FE-0b-1 DOM-table rules are gone.
  */
 
 body {
@@ -23,80 +22,50 @@ h2 {
 	margin-top: 0;
 }
 
-table {
-	border-collapse: collapse;
-	width: auto;
-}
-
-th,
-td {
-	padding: 4px 12px;
-	border: 1px solid var(--vscode-panel-border);
-	text-align: left;
-}
-
-th {
-	background: var(--vscode-toolbar-hoverBackground);
-	font-weight: 600;
-}
-
 .meta {
 	color: var(--vscode-descriptionForeground);
 	font-size: 12px;
 	margin-bottom: 12px;
 }
 
-.empty {
-	color: var(--vscode-descriptionForeground);
-	font-style: italic;
-}
-
-.kind {
-	color: var(--vscode-descriptionForeground);
-	font-size: 11px;
-	margin-left: 8px;
-}
-
-.cell-value {
-	cursor: cell;
-}
-
-.cell-value.cell-edit-error {
-	border: 2px solid var(--vscode-errorForeground);
-	background: var(--vscode-inputValidation-errorBackground);
-}
-
-.cell-edit-input {
-	width: 8em;
-	font-family: var(--vscode-editor-font-family);
-	font-size: inherit;
-	color: var(--vscode-input-foreground);
-	background: var(--vscode-input-background);
-	border: 1px solid var(--vscode-focusBorder);
-	padding: 2px 4px;
-	box-sizing: border-box;
-}
-
+/* The scroller. The in-flow spacer gives it scroll extent; the canvas overlays the viewport. */
 .cell-grid-viewport {
+	position: relative;
+	overflow: auto;
 	max-height: 80vh;
-	overflow-y: auto;
+	/* Don't collapse to the spacer height when there are few/zero entries -- the viewport (and
+	 * therefore the canvas, sized to it) must stay tall enough to show the header + empty message. */
+	min-height: 120px;
 	border: 1px solid var(--vscode-panel-border);
 }
 
-.cell-grid-viewport thead th {
-	position: sticky;
+/* Sized in JS to the total content (header + rows) x total column width -- drives the scrollbars.
+ * Out of the way of clicks; the canvas (positioned, paints above) is the hit-test target. */
+#sheets-spacer {
+	pointer-events: none;
+}
+
+/* Overlay canvas: pinned to the content origin, transform-translated to the scroll offset in JS so
+ * it always covers the visible viewport; repainted on scroll. */
+#sheets-canvas {
+	position: absolute;
 	top: 0;
-	z-index: 1;
+	left: 0;
+	display: block;
 }
 
-.cell-grid-spacer-top,
-.cell-grid-spacer-bottom {
-	padding: 0;
-	border: none;
-}
-
-.cell-grid-spacer-top td,
-.cell-grid-spacer-bottom td {
-	padding: 0;
-	border: none;
+/* Overlay editor: an absolute child of the scroller in CONTENT coordinates (top/left/size set in
+ * JS from the cell's content rect), so it scrolls with the grid. Sits above the canvas. */
+.cell-edit-input {
+	position: absolute;
+	z-index: 2;
+	box-sizing: border-box;
+	/* Match the canvas value font (--vscode-font-family @ 12px) so text doesn't shift on edit entry. */
+	font-family: var(--vscode-font-family);
+	font-size: 12px;
+	color: var(--vscode-input-foreground);
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-focusBorder);
+	padding: 2px 6px;
+	margin: 0;
 }

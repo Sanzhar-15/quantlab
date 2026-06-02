@@ -4,26 +4,17 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * **FE-0b-1 (2026-06-02) -- pure cell-render helpers for the bundled sheets webview.**
+ * **FE-0b (2026-06-02) -- pure value/window helpers for the bundled sheets webview.**
  *
- * These functions previously lived as MIRROR copies inside the inline `<script>`
- * string built by `cellGridHtml.ts:buildClientScript`
- * (`formatCellValueClient` / `renderRowsClient` / `computeRange`). FE-0b moves
- * the webview from host-built inline HTML to a bundled (esbuild) module, so the
- * mirrors become real, type-checked, unit-testable TS here.
+ * `formatCellValue` (value-default display string) and `computeVisibleRowRange` (the scroll
+ * window) are shared by the Canvas2D renderer (`canvasGrid.ts`) and the layout math
+ * (`gridLayout.ts`). FE-0b-1's DOM-table-only helpers (`renderRowsHtml`, `escapeHtml`) were
+ * removed in FE-0b-2 when the canvas replaced the DOM table -- canvas text is drawn directly, so
+ * there is no HTML-escaping / attribute-contract surface.
  *
- * **Drift hazard ELIMINATED**: pre-FE-0b there were TWO renderers -- the
- * host-side `renderRows`/`formatCellValue` in `cellGridHtml.ts` (server-side
- * initial paint) and the inline-script mirrors (scroll repaints) -- and they had
- * to be kept byte-identical by hand (see the long drift-hazard note in
- * `cellGridHtml.ts:buildClientScript`). In the FE-0b model the host posts the
- * RAW snapshot via `postMessage` and ALL rendering happens here, in one place.
- * `cellGridHtml.ts` is no longer called by the panel (retired in FE-0b-2).
- *
- * Pure functions only: no `vscode`, no `document`/`window`, no `this`, no side
- * effects. Browser-bundle-safe (esbuild) AND mocha-importable (tsc -> out/).
- * The snapshot type is `import type` only, so esbuild erases the import and does
- * NOT drag any host runtime (`session.ts` napi binding) into the webview bundle.
+ * Pure functions only: no `vscode`, no `document`/`window`, no `this`, no side effects.
+ * Browser-bundle-safe (esbuild) AND mocha-importable. The snapshot type is `import type` only, so
+ * esbuild erases the import and does NOT drag host runtime (`session.ts` napi) into the bundle.
  */
 
 import type { QuantbookCellSnapshot, QuantbookCellValue } from '../../src/quantbook/types';
@@ -32,10 +23,10 @@ import type { QuantbookCellSnapshot, QuantbookCellValue } from '../../src/quantb
 export type CellSnapshotEntry = QuantbookCellSnapshot['entries'][number];
 
 /**
- * Render a cell value for display. Mirrors the (now-retired) host-side
- * `formatCellValue` in `cellGridHtml.ts`. The `switch` is exhaustive over the
- * {@link QuantbookCellValue} tagged union -- TS infers `never` in any
- * unreachable branch as a compile-time correctness pin.
+ * Render a cell value for its default display string. The `switch` is exhaustive over the
+ * {@link QuantbookCellValue} tagged union -- TS infers `never` in any unreachable branch as a
+ * compile-time correctness pin. The canvas renderer prefers the engine-`rendered` string when
+ * present and falls back to this; the overlay editor uses this as the editable raw literal.
  */
 export function formatCellValue(value: QuantbookCellValue): string {
 	switch (value.kind) {
@@ -50,25 +41,6 @@ export function formatCellValue(value: QuantbookCellValue): string {
 		case 'pending':
 			return '(pending)';
 	}
-}
-
-/**
- * HTML-escape a string for safe interpolation into element text / attribute
- * values. The webview NEVER trusts engine-rendered strings or cell text as
- * pre-escaped HTML (CSP is defence-in-depth, this is the primary guard).
- * Identical to the host-side `escapeHtml` in `cellGridHtml.ts`.
- */
-export function escapeHtml(s: string): string {
-	return String(s).replace(/[&<>"']/g, c => {
-		switch (c) {
-			case '&': return '&amp;';
-			case '<': return '&lt;';
-			case '>': return '&gt;';
-			case '"': return '&quot;';
-			case '\'': return '&#39;';
-			default: return c;
-		}
-	});
 }
 
 /**
@@ -113,52 +85,4 @@ export function computeVisibleRowRange(
 	const startIdx = Math.max(0, firstVisible - overscan);
 	const endIdx = Math.min(totalRows, firstVisible + visibleCount + overscan);
 	return { startIdx, endIdx };
-}
-
-/**
- * Render a window of snapshot entries to the `<tbody>` `<tr>` HTML string.
- *
- * Faithful port of the (retired) inline-script `renderRowsClient`. The emitted
- * per-cell `data-*` attributes are the click-to-edit contract the webview's
- * `beginEdit`/`endEdit` depend on:
- * - `data-row` / `data-col`: cell identity (Number()-coerced; non-numeric -> "NaN",
- *   a safe attribute value -- defence-in-depth mirroring the host renderer).
- * - `data-raw-formula` (when the entry has formula text), `data-raw-value`
- *   (the parseable literal), `data-original-text` (the displayed text): the
- *   `beginEdit` precedence chain (formula > raw value > displayed text).
- * - `data-original-kind`: the value kind, for the Escape-cancel restore.
- * - `title` (when the entry has a diagnostic): hover explanation for a failed UDF.
- *
- * Every interpolated value is `escapeHtml`d.
- */
-export function renderRowsHtml(entries: ReadonlyArray<CellSnapshotEntry>): string {
-	let html = '';
-	for (const e of entries) {
-		// Use the engine-pre-rendered string for DISPLAY when present; fall back
-		// to the value-default. The RAW value for editing is always the
-		// value-default representation (so parseCellRawInput / classifyCellInput
-		// sees a parseable literal, not a formatted "$1,234.56").
-		const displayStr = typeof e.rendered === 'string' ? e.rendered : formatCellValue(e.value);
-		const rawValueStr = formatCellValue(e.value);
-		const kind = e.value.kind;
-		const formulaAttr = typeof e.formula === 'string'
-			? ` data-raw-formula="${escapeHtml(e.formula)}"`
-			: '';
-		const titleAttr = (typeof e.diagnostic === 'string' && e.diagnostic.length > 0)
-			? ` title="${escapeHtml(e.diagnostic)}"`
-			: '';
-		const rowSafe = Number(e.row);
-		const colSafe = Number(e.col);
-		html += '<tr><td>' + rowSafe + '</td><td>' + colSafe +
-			'</td><td class="cell-value" data-row="' + rowSafe +
-			'" data-col="' + colSafe +
-			'" data-original-text="' + escapeHtml(displayStr) +
-			'" data-raw-value="' + escapeHtml(rawValueStr) + '"' +
-			formulaAttr +
-			titleAttr +
-			' data-original-kind="' + escapeHtml(kind) + '">' +
-			escapeHtml(displayStr) +
-			'<span class="kind">[' + escapeHtml(kind) + ']</span></td></tr>';
-	}
-	return html;
 }

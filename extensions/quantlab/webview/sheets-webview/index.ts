@@ -4,35 +4,30 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * **FE-0b-1 (2026-06-02) -- bundled sheets webview entry (DOM table).**
+ * **FE-0b-2+3 (2026-06-02) -- bundled sheets webview entry: Canvas2D renderer + overlay editor.**
  *
- * The cell-grid webview was previously host-built inline HTML: the host called
- * `cellGridHtml.ts:buildHtml(snapshot, {nonce})` and assigned the whole string
- * to `webview.html` on EVERY render (a full document + script reload per commit).
+ * Supersedes the FE-0b-1 DOM table. The sheet snapshot (a list of populated cells) is painted onto
+ * a `<canvas>` by {@link CanvasGridRenderer}; geometry comes from the pure `gridLayout.ts`. Editing
+ * uses a DOM-overlay `<input>` positioned over the clicked Value cell (folds in FE-0b-3 so editing
+ * never regresses).
  *
- * FE-0b makes the webview a PERSISTENT bundled (esbuild) module. The host sets
- * `webview.html` ONCE (a thin shell: nonce CSP + `<script src>` + a root div),
- * and pushes data via `postMessage`:
- *   - host -> webview: `{ type: 'render', snapshot }` on first paint + after each
- *     commit; `{ type: 'errorReply', sheet, row, col, code, message }` on a
- *     failed edit.
- *   - webview -> host: `{ type: 'putValue', sheet, row, col, rawInput }`,
- *     `{ type: 'undo' }`, `{ type: 'redo' }` (the UNCHANGED dispatch contract in
- *     `cellGridLogic.ts:dispatchIncomingMessage`), plus `{ type: 'webviewReady' }`
- *     ONCE on load so the host knows the message channel is live and (re)sends the
- *     current snapshot (handshake -- avoids the post-before-load race).
+ * Layout: a scroller (`#sheets-viewport`, overflow:auto) holds an in-flow `#sheets-spacer` sized to
+ * the total content (drives the native scrollbar), an absolute `<canvas>` transformed by the scroll
+ * offset to overlay the viewport (redrawn on scroll), and an absolute `#sheets-edit-input` in the
+ * scroller's CONTENT layer (so it tracks scroll naturally -- no manual reposition).
  *
- * **Collab presence/typing is DROPPED here** (it was v1.5-dormant and the host
- * dispatcher already drops `presenceUpdate`/`typing_stroke`). FE-0b-2 replaces
- * the DOM table below with a Canvas2D renderer; this file proves the
- * bundled-webview + message pipeline first.
+ * Wire protocol UNCHANGED from FE-0b-1 (host `cellGridPanel.ts` is untouched):
+ *   host -> webview: `{type:'render', snapshot}`, `{type:'errorReply', sheet,row,col,code,message}`
+ *   webview -> host: `{type:'putValue', sheet,row,col,rawInput}`, `{type:'undo'}`, `{type:'redo'}`,
+ *                    `{type:'webviewReady'}` (once on load).
  *
- * This is a SIDE-EFFECTING entry module (no top-level `export`s) so the esm
- * bundle loads cleanly via a classic `<script nonce src>` tag (mirrors qviz-spec).
+ * Side-effecting entry (no top-level exports) so the esm bundle loads via a classic `<script>`.
  */
 
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
-import { computeVisibleRowRange, renderRowsHtml } from './cellRender';
+import { formatCellValue } from './cellRender';
+import { CanvasGridRenderer } from './canvasGrid';
+import { cellContentRect, hitTestViewport, totalContentHeight, totalContentWidth } from './gridLayout';
 
 /** Minimal VS Code webview API surface (mirrors qviz-spec/index.ts). */
 interface VSCodeApi {
@@ -41,10 +36,6 @@ interface VSCodeApi {
 	setState(state: unknown): void;
 }
 declare function acquireVsCodeApi(): VSCodeApi;
-
-// --- Wire contracts (source of truth: cellGridLogic.ts). Re-declared locally
-// so the browser bundle never imports host runtime (`cellGridLogic.ts` pulls
-// `session.ts`'s napi binding). Kept byte-compatible with the host envelopes. ---
 
 /** host -> webview: full sheet snapshot to paint. */
 interface RenderMessage {
@@ -61,22 +52,16 @@ interface ErrorReplyMessage {
 	readonly message: string;
 }
 
-const ROW_HEIGHT = 25;
-const OVERSCAN = 5;
+const VALUE_COL_INDEX = 2; // only the Value column is editable
 
-// Cache the VS Code API handle on `window`. `acquireVsCodeApi()` may be called
-// at most ONCE per webview context and THROWS on a second call. With the
-// persistent webview (retainContextWhenHidden) a re-evaluation of this bundle
-// (e.g. the "Developer: Reload Webviews" command, or a future HMR path) would
-// otherwise throw at module top-level and leave a blank grid. Mirrors the
-// qviz-spec guard.
+// Cache the VS Code API handle on `window`: acquireVsCodeApi() may be called at most ONCE per
+// webview context and throws on a second call (the persistent webview could re-evaluate this
+// bundle, e.g. "Developer: Reload Webviews"). Mirrors the FE-0b-1 guard.
 type SheetsWindow = Window & { __sheetsVscodeApi?: VSCodeApi };
 const vscode: VSCodeApi = (window as SheetsWindow).__sheetsVscodeApi ?? acquireVsCodeApi();
 (window as SheetsWindow).__sheetsVscodeApi = vscode;
 
-// --- Persistent skeleton (built once; render() only repaints the tbody so the
-// viewport element -- and therefore scroll position -- survives across commits). ---
-
+// --- Persistent skeleton (built once). ---
 const root = document.getElementById('sheets-root');
 if (root === null) {
 	throw new Error('sheets-webview: #sheets-root missing from DOM');
@@ -84,165 +69,176 @@ if (root === null) {
 root.innerHTML =
 	'<h2 id="sheets-title">Quantbook Cell Grid</h2>' +
 	'<div class="meta" id="sheets-meta"></div>' +
-	'<div class="empty" id="sheets-empty" hidden>(empty -- no PutValue ops on this sheet)</div>' +
 	'<div class="cell-grid-viewport" id="sheets-viewport">' +
-	'<table><thead><tr><th>Row</th><th>Col</th><th>Value</th></tr></thead>' +
-	'<tbody id="sheets-tbody"></tbody></table></div>';
+	'<div id="sheets-spacer"></div>' +
+	'<canvas id="sheets-canvas"></canvas>' +
+	'<input id="sheets-edit-input" class="cell-edit-input" type="text" aria-label="Edit cell value" hidden />' +
+	'</div>';
 
 const titleEl = document.getElementById('sheets-title') as HTMLElement;
 const metaEl = document.getElementById('sheets-meta') as HTMLElement;
-const emptyEl = document.getElementById('sheets-empty') as HTMLElement;
 const viewportEl = document.getElementById('sheets-viewport') as HTMLElement;
-const tbodyEl = document.getElementById('sheets-tbody') as HTMLElement;
+const spacerEl = document.getElementById('sheets-spacer') as HTMLElement;
+const canvasEl = document.getElementById('sheets-canvas') as HTMLCanvasElement;
+const inputEl = document.getElementById('sheets-edit-input') as HTMLInputElement;
+
+const renderer = new CanvasGridRenderer(canvasEl);
 
 let fullSnapshot: QuantbookCellSnapshot | null = null;
-let activeInput: HTMLInputElement | null = null;
-let activeCell: HTMLElement | null = null;
+// "row,col" -> "[code] message" for cells whose last edit failed (errorReply). Map (not Set) so the
+// structured error text is preserved + surfaced on hover (parity with the FE-0b-1 DOM title tooltip).
+const errorCells = new Map<string, string>();
 
-/**
- * Repaint the visible window of `fullSnapshot.entries` into the tbody, sandwiched
- * between top/bottom spacer rows that preserve the full table's scroll geometry.
- * Mid-edit guard: skipped while an edit `<input>` is open (repainting would
- * clobber it + lose unsaved text); the post-commit render() resets edit state
- * BEFORE calling this, so a successful commit still repaints.
- */
-function repaintForScroll(): void {
-	if (activeInput !== null) {
-		return;
-	}
+interface EditState {
+	readonly entryIndex: number;
+	readonly entry: QuantbookCellSnapshot['entries'][number];
+	pendingCommit: boolean;
+}
+let editState: EditState | null = null;
+
+/** Re-transform the canvas to overlay the viewport at the current scroll, then repaint. */
+function redraw(): void {
+	const scrollTop = viewportEl.scrollTop;
+	const scrollLeft = viewportEl.scrollLeft;
+	renderer.resize(viewportEl.clientWidth, viewportEl.clientHeight);
+	canvasEl.style.transform = 'translate(' + scrollLeft + 'px, ' + scrollTop + 'px)';
+	renderer.draw(viewportEl.clientWidth, viewportEl.clientHeight, scrollTop, scrollLeft, errorCells);
+}
+
+/** Apply a fresh snapshot: update title/meta + spacer, clear edit/error state, repaint. */
+function applyRender(snapshot: QuantbookCellSnapshot): void {
+	fullSnapshot = snapshot;
+	renderer.setSnapshot(snapshot);
+	// A render is a committed state change (or first paint): drop any in-flight edit + errors.
+	cancelEdit();
+	errorCells.clear();
+	renderer.refreshTheme();
+	titleEl.textContent = 'Quantbook Cell Grid -- Sheet ' + String(snapshot.sheet);
+	metaEl.textContent = 'snapshot_format_version=' + String(snapshot.snapshot_format_version) + '; entries=' + String(snapshot.entries.length);
+	spacerEl.style.height = totalContentHeight(snapshot.entries.length) + 'px';
+	spacerEl.style.width = totalContentWidth() + 'px';
+	redraw();
+}
+
+// --- Overlay editor ---
+
+function beginEdit(entryIndex: number): void {
 	if (fullSnapshot === null) {
 		return;
 	}
-	const entries = fullSnapshot.entries;
-	const range = computeVisibleRowRange(viewportEl.scrollTop, viewportEl.clientHeight, entries.length, ROW_HEIGHT, OVERSCAN);
-	const visible = entries.slice(range.startIdx, range.endIdx);
-	const topHeight = range.startIdx * ROW_HEIGHT;
-	const bottomHeight = (entries.length - range.endIdx) * ROW_HEIGHT;
-	const topSpacer = '<tr class="cell-grid-spacer-top" style="height: ' + topHeight + 'px;"><td colspan="3" aria-hidden="true"></td></tr>';
-	const bottomSpacer = '<tr class="cell-grid-spacer-bottom" style="height: ' + bottomHeight + 'px;"><td colspan="3" aria-hidden="true"></td></tr>';
-	tbodyEl.innerHTML = topSpacer + renderRowsHtml(visible) + bottomSpacer;
-}
-
-/** Apply a fresh snapshot: update title/meta, reset edit state, repaint. */
-function applyRender(snapshot: QuantbookCellSnapshot): void {
-	fullSnapshot = snapshot;
-	// A render means a committed state change (or first paint): any in-flight
-	// edit input is now stale -- drop it so the repaint shows the new values.
-	activeInput = null;
-	activeCell = null;
-	titleEl.textContent = 'Quantbook Cell Grid -- Sheet ' + String(snapshot.sheet);
-	metaEl.textContent = 'snapshot_format_version=' + String(snapshot.snapshot_format_version) + '; entries=' + String(snapshot.entries.length);
-	const isEmpty = snapshot.entries.length === 0;
-	emptyEl.hidden = !isEmpty;
-	viewportEl.hidden = isEmpty;
-	if (isEmpty) {
-		tbodyEl.innerHTML = '';
+	const entry = fullSnapshot.entries[entryIndex];
+	if (entry === undefined) {
 		return;
 	}
-	repaintForScroll();
+	if (editState !== null) {
+		cancelEdit();
+	}
+	// Position the input over the Value cell in CONTENT coords (it is an absolute child of the
+	// scroller, so it scrolls with the grid -- no manual tracking needed).
+	const rect = cellContentRect(entryIndex, VALUE_COL_INDEX);
+	inputEl.style.left = rect.x + 'px';
+	inputEl.style.top = rect.y + 'px';
+	inputEl.style.width = rect.width + 'px';
+	inputEl.style.height = rect.height + 'px';
+	// Edit source precedence: formula text (if any) over the value-default literal -- matches the
+	// FE-0b-1 data-raw-formula > data-raw-value chain.
+	inputEl.value = typeof entry.formula === 'string' ? entry.formula : formatCellValue(entry.value);
+	inputEl.hidden = false;
+	editState = { entryIndex, entry, pendingCommit: false };
+	inputEl.focus();
+	inputEl.select();
 }
 
-// --- Click-to-edit ---
-
-function endEdit(commit: boolean): void {
-	if (activeInput === null || activeCell === null) {
+function cancelEdit(): void {
+	if (editState === null) {
 		return;
 	}
-	const cell = activeCell;
-	const input = activeInput;
-	const raw = input.value;
-	activeInput = null;
-	activeCell = null;
-	if (commit) {
-		// Pessimistic: leave the input in place + post to host. The host will
-		// either send a fresh `render` (success -> applyRender repaints + drops
-		// the input) or an `errorReply` (failure -> decorate the cell, input
-		// stays for correction). Keep both refs so errorReply can find the cell.
-		activeInput = input;
-		activeCell = cell;
-		vscode.postMessage({
-			type: 'putValue',
-			sheet: fullSnapshot !== null ? fullSnapshot.sheet : 0,
-			row: Number(cell.getAttribute('data-row')),
-			col: Number(cell.getAttribute('data-col')),
-			rawInput: raw,
-		});
-		return;
-	}
-	// Cancel (Escape / blur): restore the cell's prior text + kind annotation.
-	cell.innerHTML = '';
-	cell.appendChild(document.createTextNode(cell.getAttribute('data-original-text') || ''));
-	const kindSpan = document.createElement('span');
-	kindSpan.className = 'kind';
-	kindSpan.appendChild(document.createTextNode('[' + (cell.getAttribute('data-original-kind') || '') + ']'));
-	cell.appendChild(kindSpan);
-	cell.classList.remove('cell-edit-error');
-	cell.removeAttribute('title');
+	editState = null;
+	inputEl.hidden = true;
+	inputEl.value = '';
 }
 
-function beginEdit(cell: HTMLElement): void {
-	if (activeInput !== null) {
-		endEdit(false);
+function commitEdit(): void {
+	if (editState === null || fullSnapshot === null) {
+		return;
 	}
-	// Precedence: formula source > parseable raw value > displayed text. A cell
-	// with both a formula and a value has two raw representations; the formula is
-	// the authoritative edit source (it's what the user typed).
-	let rawValue = cell.getAttribute('data-raw-formula');
-	if (rawValue === null) {
-		rawValue = cell.getAttribute('data-raw-value');
+	if (editState.pendingCommit) {
+		return; // a commit is already in flight -- don't send a duplicate putValue on repeated Enter
 	}
-	if (rawValue === null) {
-		rawValue = cell.getAttribute('data-original-text') || '';
-	}
-	const input = document.createElement('input');
-	input.type = 'text';
-	input.className = 'cell-edit-input';
-	input.value = rawValue;
-	input.setAttribute('aria-label', 'Edit cell value');
-	cell.innerHTML = '';
-	cell.appendChild(input);
-	cell.classList.remove('cell-edit-error');
-	cell.removeAttribute('title');
-	activeInput = input;
-	activeCell = cell;
-	input.addEventListener('keydown', ev => {
-		if (ev.key === 'Enter') {
-			ev.preventDefault();
-			endEdit(true);
-		} else if (ev.key === 'Escape') {
-			ev.preventDefault();
-			endEdit(false);
-		}
+	const entry = editState.entry;
+	editState.pendingCommit = true;
+	// Pessimistic: keep the input visible/focused until the host responds. A success `render`
+	// hides it (applyRender -> cancelEdit); an `errorReply` decorates the cell + leaves it for
+	// correction. row/col are the ENTRY's sheet coordinates (NOT the display index).
+	vscode.postMessage({
+		type: 'putValue',
+		sheet: fullSnapshot.sheet,
+		row: Number(entry.row),
+		col: Number(entry.col),
+		rawInput: inputEl.value,
 	});
-	input.addEventListener('blur', () => {
-		// Conservative: blur cancels; Enter explicitly commits. Avoids accidental
-		// commits when the user clicks elsewhere.
-		if (activeInput === input) {
-			endEdit(false);
-		}
-	});
-	input.focus();
-	input.select();
 }
 
-document.addEventListener('click', ev => {
-	let target = ev.target as Node | null;
-	while (target && target !== document.body) {
-		const el = target as HTMLElement;
-		if (el.classList && el.classList.contains('cell-value') && el.getAttribute('data-row') !== null) {
-			if (activeCell !== el) {
-				beginEdit(el);
-			}
-			return;
+inputEl.addEventListener('keydown', ev => {
+	if (ev.key === 'Enter') {
+		ev.preventDefault();
+		commitEdit();
+	} else if (ev.key === 'Escape') {
+		ev.preventDefault();
+		cancelEdit();
+	}
+});
+inputEl.addEventListener('blur', () => {
+	// Conservative: blur cancels an UNcommitted edit. A pending commit waits for the host's
+	// render/errorReply rather than cancelling (the user may have clicked away after Enter).
+	if (editState !== null && !editState.pendingCommit) {
+		cancelEdit();
+	}
+});
+
+// --- Canvas click -> hit-test -> edit ---
+
+canvasEl.addEventListener('click', ev => {
+	if (fullSnapshot === null) {
+		return;
+	}
+	const rect = canvasEl.getBoundingClientRect();
+	// The canvas overlays the viewport (transformed), so client-minus-canvasRect = viewport-LOCAL.
+	// hitTestViewport rejects the sticky-header band in local coords BEFORE adding scroll (a header
+	// click must never map to a body row), then converts to content coords.
+	const localX = ev.clientX - rect.left;
+	const localY = ev.clientY - rect.top;
+	const hit = hitTestViewport(localX, localY, viewportEl.scrollLeft, viewportEl.scrollTop, fullSnapshot.entries.length);
+	if (hit !== null && hit.colIndex === VALUE_COL_INDEX) {
+		beginEdit(hit.entryIndex);
+	}
+});
+
+// Hover tooltip: surface a cell's errorReply message or its engine diagnostic via the native
+// `title` (canvas has no per-cell tooltip) -- restores the FE-0b-1 DOM `title=` behavior for both
+// the `#CALC!`/`#TIMEOUT!` diagnostic and a failed-edit error.
+let lastHoverTitle = '';
+canvasEl.addEventListener('mousemove', ev => {
+	let title = '';
+	if (fullSnapshot !== null) {
+		const rect = canvasEl.getBoundingClientRect();
+		const hit = hitTestViewport(ev.clientX - rect.left, ev.clientY - rect.top, viewportEl.scrollLeft, viewportEl.scrollTop, fullSnapshot.entries.length);
+		if (hit !== null) {
+			const entry = fullSnapshot.entries[hit.entryIndex];
+			const key = Number(entry.row) + ',' + Number(entry.col);
+			title = errorCells.get(key) ?? (typeof entry.diagnostic === 'string' ? entry.diagnostic : '');
 		}
-		target = target.parentNode;
+	}
+	if (title !== lastHoverTitle) {
+		canvasEl.title = title;
+		lastHoverTitle = title;
 	}
 });
 
 // --- Undo / redo (webview-scoped; mid-edit lets the browser handle text-undo) ---
 
 document.addEventListener('keydown', ev => {
-	if (activeInput !== null) {
+	if (editState !== null) {
 		return;
 	}
 	const isMeta = ev.metaKey || ev.ctrlKey;
@@ -270,25 +266,38 @@ window.addEventListener('message', (event: MessageEvent) => {
 		return;
 	}
 	if (msg.type === 'render') {
-		const rm = msg as RenderMessage;
-		applyRender(rm.snapshot);
+		applyRender((msg as RenderMessage).snapshot);
 		return;
 	}
 	if (msg.type === 'errorReply') {
 		const er = msg as ErrorReplyMessage;
-		const sel = '.cell-value[data-row="' + Number(er.row) + '"][data-col="' + Number(er.col) + '"]';
-		const cell = document.querySelector(sel);
-		if (cell !== null) {
-			cell.classList.add('cell-edit-error');
-			cell.setAttribute('title', '[' + String(er.code) + '] ' + String(er.message));
+		errorCells.set(Number(er.row) + ',' + Number(er.col), '[' + String(er.code) + '] ' + String(er.message));
+		// The commit failed, so the edit is no longer "pending": re-arm blur-cancel (a click away
+		// now dismisses) while the input stays for correction + re-commit.
+		if (editState !== null) {
+			editState.pendingCommit = false;
 		}
+		redraw();
 		return;
 	}
 	console.warn('[sheets-webview] unknown inbound message type:', msg.type);
 });
 
-viewportEl.addEventListener('scroll', repaintForScroll);
+// Redraw on scroll (re-transform the canvas + repaint the new window). The content-anchored input
+// scrolls with the content automatically.
+viewportEl.addEventListener('scroll', redraw);
 
-// Handshake: announce the channel is live so the host (re)sends the snapshot.
-// Sent AFTER all listeners are wired so the host's reply is never missed.
+// Redraw on viewport resize (HiDPI backing-store resize happens inside redraw()).
+if (typeof ResizeObserver !== 'undefined') {
+	new ResizeObserver(() => redraw()).observe(viewportEl);
+}
+
+// Repaint on theme change: VS Code re-classes <body>; refresh the cached palette/fonts.
+new MutationObserver(() => {
+	renderer.refreshTheme();
+	redraw();
+}).observe(document.body, { attributes: true, attributeFilter: ['class'] });
+
+// Handshake: announce the channel is live so the host (re)sends the snapshot. Sent AFTER all
+// listeners are wired so the host's reply is never missed.
 vscode.postMessage({ type: 'webviewReady' });

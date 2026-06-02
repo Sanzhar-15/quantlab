@@ -4,20 +4,21 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * FE-0b-1 (2026-06-02) -- unit tests for the bundled sheets-webview pure render
- * helpers (`webview/sheets-webview/cellRender.ts`). In the FE-0b model these are
- * the SOLE renderer (the host posts the raw snapshot; all rendering is
- * client-side), so this suite is the correctness pin the old server/client
- * mirror drift hazard used to need two copies for.
+ * FE-0b (2026-06-02) -- unit tests for the bundled sheets-webview pure value/window helpers
+ * (`webview/sheets-webview/cellRender.ts`): `formatCellValue` (the value-default display string)
+ * and `computeVisibleRowRange` (the scroll window). The FE-0b-1 DOM-table helpers
+ * (`renderRowsHtml`/`escapeHtml`) were removed in FE-0b-2 (the canvas draws text directly), so
+ * their suites are gone; the canvas LAYOUT math is golden-tested in
+ * `quantbook-sheets-grid-layout.test.ts`.
  *
  * Pure functions -- no vscode, no DOM -- so they import + run under plain mocha.
  */
 
 import * as assert from 'assert';
 
-import { computeVisibleRowRange, escapeHtml, formatCellValue, renderRowsHtml, type CellSnapshotEntry } from '../webview/sheets-webview/cellRender';
+import { computeVisibleRowRange, formatCellValue } from '../webview/sheets-webview/cellRender';
 
-suite('FE-0b-1 sheets-webview cellRender -- formatCellValue', function () {
+suite('FE-0b sheets-webview cellRender -- formatCellValue', function () {
 	test('number renders its String() form', () => {
 		assert.strictEqual(formatCellValue({ kind: 'number', value: 42 }), '42');
 		assert.strictEqual(formatCellValue({ kind: 'number', value: -3.5 }), '-3.5');
@@ -33,13 +34,7 @@ suite('FE-0b-1 sheets-webview cellRender -- formatCellValue', function () {
 	});
 });
 
-suite('FE-0b-1 sheets-webview cellRender -- escapeHtml', function () {
-	test('escapes the five HTML-significant characters', () => {
-		assert.strictEqual(escapeHtml('<a href="x">&\'</a>'), '&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;');
-	});
-});
-
-suite('FE-0b-1 sheets-webview cellRender -- computeVisibleRowRange', function () {
+suite('FE-0b sheets-webview cellRender -- computeVisibleRowRange', function () {
 	test('empty table -> [0,0)', () => {
 		assert.deepStrictEqual(computeVisibleRowRange(0, 100, 0, 25, 5), { startIdx: 0, endIdx: 0 });
 	});
@@ -67,47 +62,5 @@ suite('FE-0b-1 sheets-webview cellRender -- computeVisibleRowRange', function ()
 		assert.deepStrictEqual(r, { startIdx: 4, endIdx: 10 });
 		assert.ok(r.startIdx <= r.endIdx, 'startIdx never exceeds endIdx');
 		assert.ok(r.endIdx - r.startIdx > 0, 'window is non-empty -> grid is not blank');
-	});
-});
-
-suite('FE-0b-1 sheets-webview cellRender -- renderRowsHtml', function () {
-	test('renders row/col cells with the click-to-edit data-* contract', () => {
-		const entries: CellSnapshotEntry[] = [{ row: 3, col: 1, value: { kind: 'number', value: 42 } }];
-		const html = renderRowsHtml(entries);
-		assert.ok(html.includes('<td>3</td><td>1</td>'), 'row/col header cells');
-		assert.ok(html.includes('class="cell-value"'), 'cell-value hit-test class');
-		assert.ok(html.includes('data-row="3"'), 'data-row');
-		assert.ok(html.includes('data-col="1"'), 'data-col');
-		assert.ok(html.includes('data-raw-value="42"'), 'data-raw-value = parseable literal');
-		assert.ok(html.includes('data-original-kind="number"'), 'data-original-kind');
-		assert.ok(html.includes('<span class="kind">[number]</span>'), 'kind annotation');
-		assert.ok(!html.includes('data-raw-formula'), 'no formula attr for a pure literal');
-	});
-
-	test('HTML-escapes cell text (no injection past the renderer)', () => {
-		const entries: CellSnapshotEntry[] = [{ row: 0, col: 0, value: { kind: 'text', value: '<script>x</script>' } }];
-		const html = renderRowsHtml(entries);
-		assert.ok(html.includes('&lt;script&gt;x&lt;/script&gt;'), 'text is escaped');
-		assert.ok(!html.includes('<script>x</script>'), 'no raw script tag survives');
-	});
-
-	test('display uses engine-rendered string but raw-value stays the parseable literal', () => {
-		const entries: CellSnapshotEntry[] = [{ row: 1, col: 2, value: { kind: 'number', value: 1234 }, rendered: '$1,234' }];
-		const html = renderRowsHtml(entries);
-		assert.ok(html.includes('data-original-text="$1,234"'), 'display text = engine-rendered');
-		assert.ok(html.includes('data-raw-value="1234"'), 'raw value = value-default (editable literal)');
-		assert.ok(html.includes('>$1,234<span class="kind">'), 'visible text = engine-rendered');
-	});
-
-	test('formula cells emit data-raw-formula (the edit precedence source)', () => {
-		const entries: CellSnapshotEntry[] = [{ row: 0, col: 0, value: { kind: 'number', value: 42 }, formula: 'A1*2' }];
-		const html = renderRowsHtml(entries);
-		assert.ok(html.includes('data-raw-formula="A1*2"'), 'formula attr present');
-	});
-
-	test('diagnostic surfaces as an escaped title tooltip', () => {
-		const entries: CellSnapshotEntry[] = [{ row: 0, col: 0, value: { kind: 'error', value: '#CALC!' }, diagnostic: 'boom & <fail>' }];
-		const html = renderRowsHtml(entries);
-		assert.ok(html.includes('title="boom &amp; &lt;fail&gt;"'), 'diagnostic title escaped');
 	});
 });
