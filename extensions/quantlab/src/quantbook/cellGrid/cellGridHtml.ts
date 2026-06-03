@@ -4,6 +4,23 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
+ * ============================================================================
+ * **DEAD CODE -- slated for retirement (FE megaudit S5-H4 / S6, 2026-06-03).**
+ *
+ * `buildHtml` + the inline-client-script builder here render the OLD host-built
+ * DOM-table webview. The cell grid moved to a bundled Canvas2D renderer in
+ * FE-0b (`webview/sheets-webview/`), and `cellGridPanel.ts` NO LONGER calls
+ * `buildHtml`. The ONLY remaining consumers are ~74 references in
+ * `test/quantbook-roundtrip.test.ts` + `test/quantbook-udf-worker.test.ts` (they
+ * test this dead path -> a "false coverage signal"). Retirement (delete this file
+ * + migrate `formatCellValue` tests to `webview/sheets-webview/cellRender.ts` +
+ * delete the `buildHtml` tests) is a bounded cleanup increment, DEFERRED per the
+ * megaudit (docs/fe/2026-06-03-fe-megaudit/SYNTHESIS.md, "DEFERRED forward-work").
+ * Do NOT extend this file or use it as the reference for the v1.5 collab re-enable
+ * -- the inline script's presence/typing message shape is the WRONG architecture
+ * for the persistent bundle (S6 M-4).
+ * ============================================================================
+ *
  * Phase 5.7 V3.2.a scaffold (2026-05-22) -- pure HTML-building
  * functions for the cell-grid webview.
  *

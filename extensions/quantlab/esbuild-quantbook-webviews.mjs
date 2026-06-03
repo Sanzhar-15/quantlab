@@ -22,6 +22,16 @@
  *         `node ./esbuild-quantbook-webviews.mjs --watch`.
  * Wrapped by the `build:webviews:quantbook` / `watch:webviews:quantbook`
  * package.json scripts.
+ *
+ * **DEFERRED -- F5 (FE megaudit, docs/fe/2026-06-03-fe-megaudit/SYNTHESIS.md):** this
+ * script is NOT yet wired into any aggregate / CI / `vscode:prepublish` build path
+ * (`build/lib/extensions.ts` `esbuildMediaScripts` does not list it) -- so a packaged
+ * build that doesn't run `npm run build:webviews:quantbook` ships a missing bundle
+ * (the panel's `readyWatchdog` then shows a loud "rebuild it" error after 6s). This
+ * matches the existing chart/action/trade webview pattern (they are also manual). When
+ * wiring it in, reconcile the `--outputRoot` basename-flatten in `esbuild-webview-common.mjs`
+ * `run()` (it would land the bundle at `<root>/quantbook`, NOT the nested
+ * `dist/webview/quantbook/` the runtime hardcodes in `cellGridPanel.ts`).
  */
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
