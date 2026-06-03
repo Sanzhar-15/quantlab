@@ -218,3 +218,29 @@ Then the remaining MEDs (M1 undo-refreshAll, M2 watch-build, M3 delta-throw, M8 
 - **Cross-repo / wire protocol (C3): error-code sync complete.** The TS union includes the D-H1/H2 `sql_error`/`sql_table_build`/`source_not_found` codes; `parseQuantbookError` reads native structured `code/class/details/retryable`; the napi DTO mirrors (`CellValueJson`, `WorkbookSnapshotJson`, delta DTOs, `BoundRangeJson.bindingId`) are faithful; fusion primitives (`publishDataset`/`bindRange`/`writeRange`/`refreshSource`/`materializeQuery`) are present and required by the loader (no silent no-op stubs).
 - **Architecture (O1): sound foundation, no dead-ends.** All load-bearing locked decisions honored (own Canvas2D behind a usable seam; persistent bundled webview; build isolation; reuse engine snapshot/delta path; loader cdylib guard; text-cell fix); `gridLayout` is pure and golden-tested; module boundaries are right; FE-1/1.5 reactive chain (`publishDataset → recalcDirty → refreshAll()`) is wireable today without touching the webview contract.
 - **The happy-path single-panel loop** (click → hit-test → edit → Enter → putValue → classify → setValue/setFormula → recalc → render → repaint) is correct, including the `webviewReady` handshake race (render-before-ready is buffered and re-sent) and the delta/`fullRebuildRequired` re-fetch.
+
+---
+
+## CLOSURE (2026-06-03) — all findings fixed + re-audited
+
+Fixes landed on `feat/visualise-v1` in two commits: **`e6730e7a3ff`** (batch 1: v1 blockers
+F1/F2/F4 + M1/M2/M6/L-l) and **`c9871601b3d`** (batch 2: F3, M3/M4/M5/M7/M8/M9, L-g/L-k/L-b/L-d/L-e/L-i,
+classifyCellInput trim, S5 tests, S6 labels).
+
+**Dual fix re-audit** (Codex + fresh-Opus, reports `REAUDIT-codex.md` / `REAUDIT-opus.md`):
+Opus SHIP (0H/0M/3L); Codex SHIP-WITH-FIXES (0H/2M/2L). The 2 MED **regressions the fixes
+introduced** were folded: MED-1 (M1's session-wide refresh cancelled a sibling panel's in-progress
+edit -> `applyRender` is now edit-aware) and MED-2 (F2's show() reorder could orphan a panel on a
+failing first render -> register + dispose-on-throw before render). Re-verified after folding:
+**tsc clean, webview build green, 480 passing / 1 pre-existing-V2.8 fail.**
+
+**DEFERRED (documented forward-work, not skipped):**
+- **F5** — aggregate/CI build wiring of `build:webviews:quantbook`. Risky to do blind (the
+  `--outputRoot` basename-flatten mismatch); matches the existing chart/action/trade webview pattern;
+  the readyWatchdog makes a missing bundle loud-after-6s. Do it deliberately with packaging setup.
+- **Full `cellGridHtml.ts` retirement** (~74 test refs) — its own bounded cleanup increment.
+- **O1 FE-2 readiness seams** — a named `GridRenderer` interface + a `renderDelta` partial-update
+  message. These are FE-2/FE-1.5 FEATURES, not fixes.
+- **Residual LOWs:** accumulated-diagnostic growth bound + error->error staleness (needs an engine
+  diagnostic-clear event); M5 toast dedup-under-storm.
+- **L-a** was REFUTED (not a bug).
