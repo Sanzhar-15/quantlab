@@ -1498,6 +1498,22 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 			// **Phase 6.4-3d Step 5 (2026-05-29):** the loader now also checks
 			// these owning-Session methods, so a "complete" fake must carry them.
 			'setUdfWorker', 'pollEvents',
+			// **2026-06-03 (w39):** sync the fake to the loader's FULL current
+			// owning-Session contract -- the loader's 6.3-1b/6.3-1c, 6.3-2a..2e,
+			// 6.1C/6.4-2 parity, and 6.3-3 method checks all landed after this
+			// fake was last updated, so a "Session-complete" fake must carry them
+			// or the boundary check rejects it. This test pins the
+			// BlockingTransportFixture optionality, NOT Session completeness, so
+			// the fake must stay loader-complete.
+			'startRecalcDirty', 'startRecalcAll', 'awaitRecalc', 'cancel', 'operationStatus',
+			'lifecycleState', 'validateFormula', 'queryRange', 'markVolatilesDirty', 'setFormat', 'registerFormat',
+			'open', 'save', 'import', 'export',
+			'renameSheet', 'deleteSheet', 'restoreSheet', 'moveSheet', 'setName',
+			'createTable', 'renameTable', 'renameColumn', 'resizeTable', 'dropTable',
+			'batch', 'beginTransaction', 'txnAdd', 'commitTransaction', 'rollbackTransaction',
+			'writeRange', 'publishDataset', 'bindRange', 'refreshSource', 'materializeQuery',
+			'close', 'registerFunction', 'unregisterFunction', 'listFunctions',
+			'snapshotDelta', 'undo', 'redo', 'canUndo', 'canRedo',
 		]) {
 			(fakeSession.prototype as Record<string, unknown>)[m] = function () { /* */ };
 		}
