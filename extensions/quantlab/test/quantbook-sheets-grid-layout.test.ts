@@ -110,6 +110,22 @@ suite('FE-0b-2 gridLayout -- truncateToWidth', function () {
 	test('when not even the ellipsis fits, returns empty', () => {
 		assert.strictEqual(truncateToWidth('abcdefghij', 5, measure), '');
 	});
+	// FE megaudit L-e (2026-06-03): never slice mid-surrogate. An astral char (emoji)
+	// is 2 UTF-16 code units; a cut between them would leave a lone high surrogate.
+	test('does not split a surrogate pair (drops the whole astral char)', () => {
+		// '😀' is 2 UTF-16 units. 'a😀bc' has length 5. measure(len)=len*10; maxWidth 35
+		// -> largest prefix len with (len+1)*10<=35 is 2, which cuts BETWEEN the
+		// surrogate pair (units 1 and 2). The L-e backoff must drop to len 1 -> 'a…',
+		// never 'a\uD83D…'.
+		const out = truncateToWidth('a😀bc', 35, measure);
+		// The result must not end with a lone high surrogate before the ellipsis.
+		const beforeEllipsis = out.slice(0, -1);
+		const lastUnit = beforeEllipsis.charCodeAt(beforeEllipsis.length - 1);
+		assert.ok(
+			!(lastUnit >= 0xD800 && lastUnit <= 0xDBFF),
+			`truncated result "${out}" must not end with a lone high surrogate`,
+		);
+	});
 });
 
 suite('FE-0b-2 gridLayout -- column contract', function () {

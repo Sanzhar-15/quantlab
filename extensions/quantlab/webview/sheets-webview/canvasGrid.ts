@@ -30,6 +30,28 @@ const KIND_GAP = 6;
 const OVERSCAN = 2;
 const MEASURE_CACHE_MAX = 5000;
 
+/**
+ * **FE megaudit M7 (2026-06-03)** -- module-level "already warned" guard for the
+ * theme/font CSS-var reads. VS Code always injects the `--vscode-*` variables, so
+ * a missing one signals a broken host/theme context; the renderer still falls back
+ * to a hardcoded default (so it draws SOMETHING rather than throwing every frame),
+ * but a SILENT `value || default` would mask the broken state (No-Fallbacks). We
+ * `console.warn` ONCE per missing var (the guard keeps it from spamming on every
+ * theme refresh / snapshot push). The font fallback is the worst case -- wrong
+ * metrics silently corrupt `truncateToWidth` -- so it warns too.
+ */
+const warnedMissingVars = new Set<string>();
+function warnMissingThemeVar(name: string, fallback: string): void {
+	if (warnedMissingVars.has(name)) {
+		return;
+	}
+	warnedMissingVars.add(name);
+	console.warn(
+		`[sheets-webview] theme variable "${name}" is missing/empty; falling back to "${fallback}". ` +
+		`VS Code normally injects this -- the host/theme context may be broken.`,
+	);
+}
+
 interface Palette {
 	foreground: string;
 	background: string;
@@ -64,7 +86,16 @@ export class CanvasGridRenderer {
 	}
 
 	private static resolveDpr(): number {
-		return Math.min(2, Math.max(1, Math.ceil(window.devicePixelRatio || 1)));
+		// FE megaudit M7: a 0 / undefined devicePixelRatio is anomalous (every real
+		// browser reports >= 1). Warn ONCE before defaulting to 1 rather than silently
+		// masking it (No-Fallbacks) -- a wrong DPR corrupts the HiDPI backing-store
+		// scale.
+		const raw = window.devicePixelRatio;
+		if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) {
+			warnMissingThemeVar('window.devicePixelRatio', '1');
+			return 1;
+		}
+		return Math.min(2, Math.max(1, Math.ceil(raw)));
 	}
 
 	setSnapshot(snapshot: QuantbookCellSnapshot): void {
@@ -249,7 +280,18 @@ export class CanvasGridRenderer {
 			w = this.ctx.measureText(text).width;
 			this.measureCache.set(text, w);
 			if (this.measureCache.size > MEASURE_CACHE_MAX) {
-				this.measureCache.clear();
+				// FE megaudit L-i: evict the OLDEST half (Map preserves insertion order)
+				// instead of clear-all, so a cache overflow doesn't cause a thundering
+				// re-measure of every still-visible string on the very next frame.
+				const evictCount = Math.floor(this.measureCache.size / 2);
+				let i = 0;
+				for (const key of this.measureCache.keys()) {
+					if (i >= evictCount) {
+						break;
+					}
+					this.measureCache.delete(key);
+					i += 1;
+				}
 			}
 		}
 		return w;
@@ -259,7 +301,12 @@ export class CanvasGridRenderer {
 		const cs = getComputedStyle(document.body);
 		const v = (name: string, fallback: string): string => {
 			const raw = cs.getPropertyValue(name).trim();
-			return raw.length > 0 ? raw : fallback;
+			if (raw.length > 0) {
+				return raw;
+			}
+			// FE megaudit M7: warn ONCE before falling back (No-Fallbacks).
+			warnMissingThemeVar(name, fallback);
+			return fallback;
 		};
 		return {
 			foreground: v('--vscode-foreground', '#cccccc'),
@@ -273,7 +320,14 @@ export class CanvasGridRenderer {
 	}
 
 	private readFonts(): { body: string; header: string } {
-		const family = getComputedStyle(document.body).getPropertyValue('--vscode-font-family').trim() || 'sans-serif';
+		// FE megaudit M7: the font fallback is the most damaging silent fallback --
+		// wrong metrics corrupt truncateToWidth. Warn ONCE before defaulting.
+		const rawFamily = getComputedStyle(document.body).getPropertyValue('--vscode-font-family').trim();
+		let family = rawFamily;
+		if (family.length === 0) {
+			warnMissingThemeVar('--vscode-font-family', 'sans-serif');
+			family = 'sans-serif';
+		}
 		return { body: '12px ' + family, header: '600 12px ' + family };
 	}
 }

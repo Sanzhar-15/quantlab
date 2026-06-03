@@ -669,6 +669,14 @@ export function redo(session: CollabSessionInstance): boolean {
 
 // ============================================================================
 // Phase 5.7 V3.4.0.5 (2026-05-23) -- presence typed wrappers (engine napi only)
+//
+// **DORMANT (FE megaudit S6, 2026-06-03)** -- the entire presence/collab surface
+// below (updatePresence / peerPresence / clearPresence / sweepPresence /
+// peersWithPresence / buildPresenceSnapshotJson + the Transport/LoopbackPair
+// wrappers further down) is CollabSession-only and DEAD in v1. The v1 grid runs on
+// the owning single-writer `Session` (no presence channel, no transport). Retained,
+// exported, and tested for the v1.5 real-time-collab re-enable ("CRDT built,
+// transport unwired"). No live v1 caller.
 // ============================================================================
 
 /**

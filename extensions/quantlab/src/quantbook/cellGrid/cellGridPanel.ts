@@ -43,7 +43,7 @@
 import * as vscode from 'vscode';
 
 import type { QuantbookCellSnapshot, SessionInstance, WorkbookSnapshotJson } from '../types';
-import { acquireWorkbookSnapshotViaDelta, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache } from './cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache } from './cellGridLogic';
 import { getNonce, getWebviewUri } from '../../utils/webview';
 
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
@@ -141,10 +141,10 @@ export class CellGridPanel {
 		// postMessage in render() (gated on the webviewReady handshake), NOT by
 		// rebuilding webview.html.
 		panel.webview.html = buildShellHtml(panel.webview, context.extensionUri);
-		instance.render();
-		// Watch for the webviewReady handshake; surface a loud error if the bundle
-		// never loads (else render() silently withholds every paint -> blank grid).
-		instance.armReadyWatchdog();
+		// FE re-audit MED-2: register the panel in the lifecycle structures + its dispose
+		// handler BEFORE the first render. If the initial render() throws, the dispose path
+		// must still run (dispose listeners + ref-counted session.close) -- otherwise the
+		// webview + message listener + napi Session orphan outside the registry.
 		allPanels.add(instance);
 		let sheetMap = bySession.get(session);
 		if (sheetMap === undefined) {
@@ -176,10 +176,10 @@ export class CellGridPanel {
 					bySession.delete(session);
 					// F4: the LAST panel for this session has closed -> close the
 					// owning napi Session to release the engine handle (ref-counted:
-					// sibling panels on other sheets keep it alive). Log on failure
-					// (No-Fallbacks -- never swallow); do not rethrow from a dispose
-					// callback. Skipped on the Open-replaces-workbook path, which
-					// closes the displaced session explicitly via closeSessionQuietly.
+					// sibling panels on other sheets keep it alive). The Open-replaces-
+					// workbook command relies on THIS path (its disposeAll closes the
+					// displaced sessions here). Log on failure (No-Fallbacks -- never
+					// swallow); do not rethrow from a dispose callback.
 					try {
 						session.close();
 					} catch (err) {
@@ -189,6 +189,17 @@ export class CellGridPanel {
 			}
 		});
 		context.subscriptions.push(panel);
+		// First paint + the webviewReady watchdog (surfaces a loud error if the bundle never
+		// loads). If the initial render throws, dispose the panel -- which runs the cleanup
+		// above (registry + ref-counted session.close) -- then rethrow so the command surfaces
+		// the error rather than leaving an orphaned panel/session (FE re-audit MED-2).
+		try {
+			instance.render();
+			instance.armReadyWatchdog();
+		} catch (err) {
+			panel.dispose();
+			throw err;
+		}
 		return instance;
 	}
 
@@ -334,6 +345,41 @@ export class CellGridPanel {
 	 */
 	private readyWatchdog: ReturnType<typeof setTimeout> | undefined;
 
+	/**
+	 * **FE megaudit F3 (2026-06-03)** -- per-panel cursor into the session's event
+	 * ring (contract section 9). `render()` drains `session.pollEvents(cursor)` each
+	 * paint to surface `cell_diagnostic` events (the UDF no-worker/raised/timeout/
+	 * died sink) as cell tooltips. Reading does NOT drain the ring -- we advance this
+	 * cursor by the returned `nextCursor` so each render only sees NEW events.
+	 *
+	 * The cursor is PER PANEL (not shared via the session delta cache): two panels on
+	 * one session each maintain their own ring position, so neither double-drains nor
+	 * starves the other (the engine ring is append-only + cursor-addressed, not
+	 * consume-on-read). Starts at `0n` (read from the ring start on first render).
+	 */
+	private eventCursor: bigint = 0n;
+
+	/**
+	 * **FE megaudit F3 (2026-06-03)** -- accumulated per-cell diagnostic messages
+	 * keyed `"row,col"`, folded across renders. `pollEvents` only returns events SINCE
+	 * the cursor, so a diagnostic emitted on an earlier render's page would be lost if
+	 * we rebuilt the map from only the latest page; instead we fold each page's
+	 * messages onto this persistent map (last-wins). {@link attachCellDiagnostics}
+	 * then surfaces a message ONLY on a cell whose CURRENT value is an error, so a
+	 * cell that later recomputes to a real value naturally drops its (stale) tooltip.
+	 */
+	private readonly accumulatedDiagnostics: Map<string, string> = new Map();
+
+	/**
+	 * **FE megaudit M4 (2026-06-03)** -- guards the one-time deleted-sheet warning.
+	 * A tombstoned active sheet (`extractSheetSnapshot === null`) must surface a
+	 * VISIBLE warning (not just `console.warn`), but render() runs on every commit /
+	 * refresh, so this flag suppresses the toast after the first so the user is not
+	 * spammed once per paint. Reset to `false` if the sheet ever reappears (e.g. a
+	 * future restore), so a re-delete warns again.
+	 */
+	private deletedSheetWarned: boolean = false;
+
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly session: SessionInstance,
@@ -361,9 +407,14 @@ export class CellGridPanel {
 	 * channel is live or the handshake sends it on bundle load. The title is
 	 * reactive (sheet count + name from the snapshot).
 	 *
-	 * **Tombstone race**: if the active sheet was deleted while the panel is open,
-	 * `extractSheetSnapshot` returns null; we render an empty grid + log a warning
-	 * (visible per No-Fallbacks) rather than throwing on every render forever.
+	 * **Tombstone race (M4)**: if the active sheet was deleted while the panel is
+	 * open, `extractSheetSnapshot` returns null; we render an empty grid + surface a
+	 * ONE-TIME visible warning (No-Fallbacks) rather than throwing on every render
+	 * forever or masking the tombstone as a benign empty sheet.
+	 *
+	 * **Diagnostics (F3)**: each render drains the session event ring and attaches
+	 * `cell_diagnostic` messages so the webview hover tooltip explains `#CALC!`/
+	 * `#TIMEOUT!` cells.
 	 */
 	render(): void {
 		const wbSnapshot = this.acquireWorkbookSnapshot();
@@ -378,7 +429,29 @@ export class CellGridPanel {
 				`[cellGrid] active sheet ${this.sheet} not found in snapshot ` +
 				`(likely deleted via quantbookSheetDelete). Rendering empty cell grid; close the panel.`,
 			);
+			// FE megaudit M4: a deleted active sheet previously rendered as an
+			// ordinary empty grid with only a console.warn -- the user could not tell
+			// a tombstoned sheet from a genuinely empty one. Surface a VISIBLE warning
+			// ONCE (the guard avoids one toast per paint), telling them to switch or
+			// close.
+			if (!this.deletedSheetWarned) {
+				this.deletedSheetWarned = true;
+				void vscode.window.showWarningMessage(
+					`Quantbook: sheet ${this.sheet} was deleted; this Cell Grid is now empty. ` +
+					`Switch sheets ("Quantbook: Switch Cell Grid Sheet") or close this panel.`,
+				);
+			}
+		} else {
+			// The sheet exists again (or never was deleted) -- re-arm the M4 warning so
+			// a future delete of this sheet warns afresh.
+			this.deletedSheetWarned = false;
 		}
+		// FE megaudit F3: drain the session's event ring for cell_diagnostic events
+		// and attach them to the snapshot so the webview's hover tooltip explains WHY
+		// a cell is `#CALC!`/`#TIMEOUT!` (the apparatus existed end-to-end but was
+		// never fed). pollEvents does NOT drain the ring; advance the per-panel cursor
+		// by nextCursor so each render only folds NEW events into the accumulated map.
+		const decorated = this.drainAndAttachDiagnostics(snapshot);
 		const totalSheets = wbSnapshot.sheets.length;
 		const titleSuffix = totalSheets > 1 ? ` of ${totalSheets}` : '';
 		const sheetName = sheetSnapshot !== null
@@ -389,10 +462,42 @@ export class CellGridPanel {
 			: `Sheet ${this.sheet}`;
 		this.panel.title = `Cell Grid (${sheetLabel}${titleSuffix})`;
 		// FE-0b: push the snapshot to the persistent bundle via postMessage (no
-		// webview.html rebuild). Store it first so the webviewReady handshake can
-		// (re)send the latest snapshot once the bundle's channel is live.
-		this.latestSnapshot = snapshot;
+		// webview.html rebuild). Store the DIAGNOSTIC-DECORATED snapshot (F3) first so
+		// the webviewReady handshake can (re)send the latest snapshot once the
+		// bundle's channel is live.
+		this.latestSnapshot = decorated;
 		this.postRenderIfReady();
+	}
+
+	/**
+	 * **FE megaudit F3 (2026-06-03)** -- drain new `cell_diagnostic` events from the
+	 * session's event ring and return a copy of `snapshot` with the per-cell
+	 * diagnostic tooltips attached.
+	 *
+	 * Reads `session.pollEvents(this.eventCursor)` (a non-draining cursor read),
+	 * folds this sheet's `cell_diagnostic` messages into {@link accumulatedDiagnostics}
+	 * (last-wins, persisted across renders so an earlier page's diagnostic is not
+	 * lost), advances {@link eventCursor} to the page's `nextCursor`, then attaches
+	 * the accumulated messages via {@link attachCellDiagnostics} (which surfaces a
+	 * message ONLY on a CURRENTLY error-valued cell, so recovered cells drop their
+	 * tooltip). A `dropped` page (consumer fell behind -- v1's ring is unbounded so
+	 * this never fires) is logged loud (No-Fallbacks) since a missed diagnostic could
+	 * leave a stale tooltip; the snapshot still renders.
+	 */
+	private drainAndAttachDiagnostics(snapshot: QuantbookCellSnapshot): QuantbookCellSnapshot {
+		const page = this.session.pollEvents(this.eventCursor);
+		if (page.dropped) {
+			console.warn(
+				`[cellGrid] pollEvents reported a dropped event page (sheet ${this.sheet}); ` +
+				`some cell diagnostics may be missing until the next recompute.`,
+			);
+		}
+		const pageMessages = buildCellDiagnosticMessages(page.events, this.sheet);
+		for (const [key, message] of pageMessages) {
+			this.accumulatedDiagnostics.set(key, message);
+		}
+		this.eventCursor = page.nextCursor;
+		return attachCellDiagnostics(snapshot, this.accumulatedDiagnostics);
 	}
 
 	/**
@@ -405,16 +510,32 @@ export class CellGridPanel {
 		if (!this.webviewReady || this.latestSnapshot === undefined || this._disposed) {
 			return;
 		}
-		// Log a non-delivered render (No-Fallbacks): postMessage resolves false /
-		// rejects when the channel can't accept the message; a dropped paint must
-		// not pass silently.
+		// FE megaudit M5 (2026-06-03): a dropped post-commit render must surface a
+		// VISIBLE signal, not just console.warn -- the asymmetry with the errorReply
+		// path (which already toasts on non-delivery) meant a committed edit whose
+		// repaint was dropped left STALE values on screen with no user cue. Treat a
+		// dropped render like a dropped errorReply: a warning that the grid may be
+		// stale + how to recover (No-Fallbacks). postMessage resolves false / rejects
+		// when the channel can't accept the message.
 		this.panel.webview.postMessage({ type: 'render', snapshot: this.latestSnapshot }).then(
 			delivered => {
 				if (!delivered && !this._disposed) {
 					console.warn('[cellGrid] render postMessage was not delivered to the webview.');
+					void vscode.window.showWarningMessage(
+						'Quantbook: the cell grid may be showing stale values (a repaint was not delivered). ' +
+						'Run "Quantbook: Refresh Cell Grid".',
+					);
 				}
 			},
-			err => console.error('[cellGrid] render postMessage rejected:', err),
+			err => {
+				console.error('[cellGrid] render postMessage rejected:', err);
+				if (!this._disposed) {
+					void vscode.window.showWarningMessage(
+						'Quantbook: the cell grid may be showing stale values (a repaint failed). ' +
+						'Run "Quantbook: Refresh Cell Grid".',
+					);
+				}
+			},
 		);
 	}
 
@@ -477,10 +598,11 @@ export class CellGridPanel {
 				}
 			},
 			onError: reply => {
-				// If the panel is disposed (or hidden with
-				// retainContextWhenHidden:false), `webview.postMessage` is silently
-				// dropped -- fall back to showWarningMessage so the user sees the
-				// error.
+				// If the panel is disposed, `webview.postMessage` is silently dropped
+				// -- fall back to showWarningMessage so the user sees the error. (The
+				// panel uses retainContextWhenHidden:true, so a HIDDEN panel still
+				// retains its channel; non-delivery is therefore rare but still
+				// handled below.)
 				if (this._disposed) {
 					void vscode.window.showWarningMessage(
 						`Cell Grid (sheet ${reply.sheet}, row ${reply.row}, col ${reply.col}): [${reply.code}] ${reply.message}`,
@@ -488,8 +610,10 @@ export class CellGridPanel {
 					return;
 				}
 				// Post the cell decoration. If delivery fails (channel busy /
-				// transient) fall back to a visible warning so the validation error
-				// is never silently lost (No-Fallbacks).
+				// transient) OR the promise rejects, fall back to a visible warning so
+				// the validation error is never silently lost (No-Fallbacks). FE
+				// megaudit M5: the rejection arm previously only console.error'd --
+				// asymmetric with the non-delivery arm; now both toast.
 				this.panel.webview.postMessage(reply).then(
 					delivered => {
 						if (!delivered && !this._disposed) {
@@ -498,7 +622,14 @@ export class CellGridPanel {
 							);
 						}
 					},
-					err => console.error('[cellGrid] errorReply postMessage rejected:', err),
+					err => {
+						console.error('[cellGrid] errorReply postMessage rejected:', err);
+						if (!this._disposed) {
+							void vscode.window.showWarningMessage(
+								`Cell Grid (sheet ${reply.sheet}, row ${reply.row}, col ${reply.col}): [${reply.code}] ${reply.message}`,
+							);
+						}
+					},
 				);
 			},
 		});
@@ -512,7 +643,8 @@ export class CellGridPanel {
  * `<script nonce src>` + `<link>` loaded via `asWebviewUri`, and a nonce-based
  * CSP. Snapshot DATA never appears in this HTML (it arrives via postMessage), so
  * there is no user-controlled content in the shell -- only the nonce
- * (alphanumeric, from {@link getNonce}) and the webview's own resource URIs.
+ * (base64url `[A-Za-z0-9_-]`, CSPRNG, from {@link getNonce}) and the webview's own
+ * resource URIs.
  *
  * CSP: `default-src 'none'` (deny by default); `style-src ${cspSource}
  * 'unsafe-inline'` (the bundled stylesheet is served from the webview's resource

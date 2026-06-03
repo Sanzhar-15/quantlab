@@ -157,5 +157,17 @@ export function truncateToWidth(text: string, maxWidth: number, measure: (s: str
 			hi = mid - 1;
 		}
 	}
+	// FE megaudit L-e: don't slice mid-surrogate. `text.length` counts UTF-16 code
+	// units, so a cut at `lo` could land BETWEEN a high+low surrogate of an astral
+	// character (emoji, etc.), leaving a lone high surrogate that renders as the
+	// replacement glyph. If the last kept code unit is a high surrogate (0xD800-
+	// 0xDBFF) followed by a low surrogate, back off one unit to drop the whole pair.
+	if (lo > 0 && lo < text.length) {
+		const lastKept = text.charCodeAt(lo - 1);
+		const nextDropped = text.charCodeAt(lo);
+		if (lastKept >= 0xD800 && lastKept <= 0xDBFF && nextDropped >= 0xDC00 && nextDropped <= 0xDFFF) {
+			lo -= 1;
+		}
+	}
 	return text.slice(0, lo) + ellipsis;
 }

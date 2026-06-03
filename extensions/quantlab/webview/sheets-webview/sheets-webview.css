@@ -66,6 +66,10 @@ h2 {
 	color: var(--vscode-input-foreground);
 	background: var(--vscode-input-background);
 	border: 1px solid var(--vscode-focusBorder);
-	padding: 2px 6px;
+	/* FE megaudit L-d: align the editor's text x-offset to the canvas CELL_PAD (8px in
+	 * canvasGrid.ts) so the value doesn't jump 2px when the overlay editor opens. The
+	 * input is box-sizing:border-box with a 1px border, so 7px left padding + 1px
+	 * border = 8px to the text, matching the canvas fillText origin (x + CELL_PAD). */
+	padding: 2px 7px;
 	margin: 0;
 }

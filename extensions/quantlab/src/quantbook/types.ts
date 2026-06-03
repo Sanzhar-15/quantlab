@@ -160,17 +160,18 @@ export interface CellSnapshotJson {
 	 *   malformed grammar)
 	 * - cell value carries an unknown error sigil
 	 *
-	 * **CSP-safe consumer contract**: IDE renderers MUST `escapeHtml`
-	 * the rendered string before inserting into innerHTML (per the
-	 * V3.2.a webview discipline).
+	 * **CSP-safe consumer contract**: the live FE-0b Canvas2D renderer draws this
+	 * string via `fillText` (no innerHTML), so there is no HTML-injection surface.
+	 * (The `escapeHtml`-into-innerHTML discipline below applied to the RETIRED
+	 * `cellGridHtml.ts` DOM table.)
 	 *
-	 * **Edit-flow note** (V3.6.0.X audit-of-D4 OPUS-HIGH-2 closure):
-	 * IDE consumers presenting click-to-edit MUST source the input
-	 * value from `data-raw-value` (the parseable raw representation),
-	 * NOT from the rendered display string -- `parseCellRawInput` does
-	 * `Number(trimmed)` which NaN's on `"$1,234.56"` / `"50.00%"` /
-	 * `"1,234"` / date strings.  See `cellGridHtml.ts` `renderRows`
-	 * + `beginEdit` client function for the pattern.
+	 * **Edit-flow note** (V3.6.0.X audit-of-D4 OPUS-HIGH-2 closure; DRIFT-CORRECTED
+	 * FE megaudit S6 2026-06-03): click-to-edit MUST source the input value from the
+	 * cell's `formula` (when present) / raw value, NOT the rendered display string --
+	 * a `Number(trimmed)` parse NaN's on `"$1,234.56"` / `"50.00%"` / date strings.
+	 * The LIVE pattern is `webview/sheets-webview/index.ts::beginEdit` (it reads
+	 * `entry.formula` / `entry.value`); the old `data-raw-value` DOM attribute +
+	 * `cellGridHtml.ts renderRows` named here are gone.
 	 */
 	rendered?: string;
 }
@@ -1155,8 +1156,9 @@ export interface QuantbookCellSnapshot {
 		 * formatted string (mirrors {@link CellSnapshotJson.rendered}).
 		 * `undefined` = no format-aware rendering available (see
 		 * CellSnapshotJson.rendered docstring for the fallback cases).
-		 * `buildHtml` consumers use this if present, fall back to
-		 * `formatCellValue(value)` otherwise.
+		 * The live FE-0b Canvas2D renderer uses this if present, falling back to
+		 * `formatCellValue(value)` otherwise (drift note S6 2026-06-03: NOT the
+		 * retired `buildHtml`).
 		 */
 		readonly rendered?: string;
 		/**
@@ -1172,9 +1174,11 @@ export interface QuantbookCellSnapshot {
 		 * surface as the new sheet name).
 		 *
 		 * **Edit-flow contract** (V3.6.0.X audit-of-D4 OPUS-HIGH-2
-		 * section G.2): `buildHtml` consumers MUST emit `data-raw-formula`
-		 * when this field is set so click-to-edit's `beginEdit` shows
-		 * formula source, NOT the cached literal value.
+		 * section G.2; DRIFT-CORRECTED S6 2026-06-03): the live
+		 * `webview/sheets-webview/index.ts::beginEdit` pre-fills the editor from this
+		 * `formula` field (re-prefixing `=`) when set, so click-to-edit shows formula
+		 * source, NOT the cached literal value. (The old `data-raw-formula` DOM
+		 * attribute + `buildHtml` named here are retired.)
 		 *
 		 * `extractSheetSnapshot` (which produces this shape) only
 		 * sets the property when the engine populates it; absent
@@ -1188,9 +1192,12 @@ export interface QuantbookCellSnapshot {
 		 * `"ValueError: boom"`), sourced from `Event::CellDiagnostic` via
 		 * {@link SessionInstance.pollEvents} and merged onto error-valued cells
 		 * by `attachCellDiagnostics` (in `cellGrid/cellGridLogic`). `undefined`
-		 * for the common case (no diagnostic / non-error cell). `buildHtml`'s
-		 * `renderRows` surfaces it as a `title=` tooltip while KEEPING the
-		 * `#CALC!`/`#TIMEOUT!` text -- so a failed UDF explains WHY on hover.
+		 * for the common case (no diagnostic / non-error cell). The live FE-0b webview
+		 * (`index.ts` mousemove handler) surfaces it as the canvas `title=` tooltip
+		 * while KEEPING the `#CALC!`/`#TIMEOUT!` cell text -- so a failed UDF explains
+		 * WHY on hover (drift note S6 2026-06-03: NOT the retired `buildHtml`/
+		 * `renderRows`). FE megaudit F3 (2026-06-03) wired this end-to-end: the panel
+		 * now drains `pollEvents` and attaches these in `render()`.
 		 *
 		 * NOT produced by `extractSheetSnapshot` (the snapshot carries values,
 		 * not events); the conditional-key discipline (absent when unset) keeps

@@ -2314,7 +2314,7 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 // Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
 // ============================================================================
 
-import { acquireWorkbookSnapshotViaDelta, buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, mergeWorkbookDelta, parseCellRawInput, validatePresenceNumeric, type DeltaSnapshotCache, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyCellInput, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, mergeWorkbookDelta, parseCellRawInput, validatePresenceNumeric, type DeltaSnapshotCache, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
 
 suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
 	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
@@ -2519,15 +2519,22 @@ suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', f
 		assert.ok(typeof b1?.formula === 'string' && b1.formula.length > 0, 'B1 is a formula cell');
 	});
 
-	test('putValue with sheet mismatch: dropped (no commit, no errorReply)', () => {
+	// FE megaudit L-g (2026-06-03): a sheet-mismatched putValue now sends a
+	// bad_argument errorReply (instead of a silent drop) so the webview editor
+	// un-sticks from its pessimistic pendingCommit state. Still no commit.
+	test('putValue with sheet mismatch: no commit, errorReply un-sticks the editor', () => {
 		const session = freshSession();
 		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
 		dispatchIncomingMessage(
 			{ type: 'putValue', sheet: 99, row: 0, col: 0, rawInput: '1.0' },
 			deps,
 		);
-		assert.strictEqual(getCommitCount(), 0);
-		assert.strictEqual(errorReplies.length, 0);
+		assert.strictEqual(getCommitCount(), 0, 'no commit on sheet mismatch');
+		assert.strictEqual(errorReplies.length, 1, 'a sheet-mismatch sends one errorReply');
+		assert.strictEqual(errorReplies[0].code, 'bad_argument');
+		assert.strictEqual(errorReplies[0].sheet, 99, 'echoes the requested sheet');
+		assert.strictEqual(errorReplies[0].row, 0);
+		assert.strictEqual(errorReplies[0].col, 0);
 	});
 
 	test('unknown + dormant-collab message types: dropped silently', () => {
@@ -2546,6 +2553,94 @@ suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', f
 		dispatchIncomingMessage({ type: 'typing_stroke' }, deps);
 		assert.strictEqual(getCommitCount(), 0);
 		assert.strictEqual(errorReplies.length, 0);
+	});
+});
+
+// ============================================================================
+// FE megaudit S5 (2026-06-03) -- focused pure-helper coverage for the edit path:
+//   classifyCellInput (number/hex/Infinity/text/blank/whitespace),
+//   the dispatch formula-ERROR path (=BADFORMULA -> errorReply, zero commit),
+//   and the extractSheetSnapshot blank-cell throw.
+// These pin the No-Fallbacks edit semantics that the FE megaudit verified.
+// ============================================================================
+
+suite('FE megaudit S5 -- classifyCellInput (pure)', function () {
+	test('blank + whitespace-only -> {kind:blank} (clears the cell)', () => {
+		assert.deepStrictEqual(classifyCellInput(''), { kind: 'blank' });
+		assert.deepStrictEqual(classifyCellInput('   '), { kind: 'blank' });
+		assert.deepStrictEqual(classifyCellInput('\t \n'), { kind: 'blank' });
+	});
+	test('finite numbers (incl. hex / scientific / negative) -> {kind:number}', () => {
+		assert.deepStrictEqual(classifyCellInput('42'), { kind: 'number', number: 42 });
+		assert.deepStrictEqual(classifyCellInput('-3.5'), { kind: 'number', number: -3.5 });
+		assert.deepStrictEqual(classifyCellInput('0xFF'), { kind: 'number', number: 255 });
+		assert.deepStrictEqual(classifyCellInput('1e3'), { kind: 'number', number: 1000 });
+		// Surrounding whitespace is trimmed before the numeric parse.
+		assert.deepStrictEqual(classifyCellInput('  7  '), { kind: 'number', number: 7 });
+	});
+	test('Infinity / NaN are NOT finite -> fall through to text', () => {
+		assert.deepStrictEqual(classifyCellInput('Infinity'), { kind: 'text', text: 'Infinity' });
+		assert.deepStrictEqual(classifyCellInput('-Infinity'), { kind: 'text', text: '-Infinity' });
+		assert.deepStrictEqual(classifyCellInput('NaN'), { kind: 'text', text: 'NaN' });
+	});
+	test('non-numeric literal -> {kind:text}; the text is TRIMMED (S2-M3)', () => {
+		assert.deepStrictEqual(classifyCellInput('hello'), { kind: 'text', text: 'hello' });
+		// S2-M3: text branch returns the TRIMMED literal, consistent with the number
+		// branch (which classifies on trimmed). Was previously the un-trimmed raw.
+		assert.deepStrictEqual(classifyCellInput('  hi  '), { kind: 'text', text: 'hi' });
+	});
+});
+
+suite('FE megaudit S5 -- dispatch formula-error path + blank-throw', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('=BADFORMULA (unbindable) -> errorReply with a formula error code, ZERO commit', () => {
+		const session = createWorkbookSession();
+		session.addSheet('S', 1000);
+		const errorReplies: ErrorReplyMessage[] = [];
+		let commitCount = 0;
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: '=BADFORMULA(' },
+			{
+				session,
+				sheet: 0,
+				onCommit: () => { commitCount += 1; },
+				onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
+			},
+		);
+		assert.strictEqual(commitCount, 0, 'a malformed formula must NOT commit');
+		assert.strictEqual(errorReplies.length, 1, 'exactly one errorReply');
+		assert.strictEqual(errorReplies[0].row, 0);
+		assert.strictEqual(errorReplies[0].col, 0);
+		// The engine surfaces a parse/bind failure; either is a recognized formula
+		// error code (No-Fallbacks -- a loud errorReply, not a deferred #ERROR cell).
+		assert.ok(
+			errorReplies[0].code === 'formula_parse' || errorReplies[0].code === 'formula_bind',
+			`expected a formula error code, got "${errorReplies[0].code}"`,
+		);
+		// The cell was NOT written.
+		const cell = extractSheetSnapshot(session.snapshot(), 0)?.entries.find(e => e.row === 0 && e.col === 0);
+		assert.strictEqual(cell, undefined, 'no cell written on the formula error');
+	});
+
+	test('extractSheetSnapshot throws on a kind=blank snapshot cell (No-Fallbacks)', () => {
+		// A workbook snapshot never carries blank cells (the engine omits empties); a
+		// blank surfacing in a snapshot entry is anomalous and must fail loud rather
+		// than be coerced to pending/empty.
+		const snap = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					{ row: 0, col: 0, value: { kind: 'blank' } },
+				],
+			}],
+			formats: [],
+			dateSystem: 'Excel1900',
+		} as unknown as WorkbookSnapshotJson;
+		assert.throws(() => extractSheetSnapshot(snap, 0),
+			/\[bad_argument\] extractSheetSnapshot: kind='blank' is unexpected/);
 	});
 });
 
@@ -7057,6 +7152,26 @@ suite('quantbook V3.6.1 -- mergeWorkbookDelta (pure, OPUS-PT-B10)', function () 
 		const merged = mergeWorkbookDelta(cached, b10MkDelta({ sheetsRemoved: [1] }));
 		assert.strictEqual(extractSheetSnapshot(merged, 1), null, 'active sheet gone -> render empty-frame branch fires');
 		assert.notStrictEqual(extractSheetSnapshot(merged, 0), null, 'surviving sheet still extractable');
+	});
+
+	// FE megaudit M3 (2026-06-03): a changedCell/removedCell for a sheet ABSENT from
+	// the cache must THROW [invalid_state] -- never skip-then-advance-version (silent
+	// permanent divergence). AddSheet trips fullRebuildRequired, so this only fires on
+	// engine contract drift.
+	test('changedCell for an unknown sheet throws [invalid_state] (No-Fallbacks)', () => {
+		const cached = b10MkWb([{ id: 0, name: 'A', cells: [] }]);
+		assert.throws(
+			() => mergeWorkbookDelta(cached, b10MkDelta({ changedCells: [{ sheet: 9, cell: b10NumCell(0, 0, 1) }] })),
+			/\[invalid_state\] mergeWorkbookDelta: changedCell references unknown sheet 9/,
+		);
+	});
+
+	test('removedCell for an unknown sheet throws [invalid_state] (No-Fallbacks)', () => {
+		const cached = b10MkWb([{ id: 0, name: 'A', cells: [] }]);
+		assert.throws(
+			() => mergeWorkbookDelta(cached, b10MkDelta({ removedCells: [{ sheet: 9, row: 0, col: 0 }] })),
+			/\[invalid_state\] mergeWorkbookDelta: removedCell references unknown sheet 9/,
+		);
 	});
 });
 

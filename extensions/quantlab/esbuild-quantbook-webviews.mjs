@@ -37,15 +37,24 @@ const sheetsDir = path.join(srcDir, 'sheets-webview');
 const outDir = path.join(baseDir, 'dist', 'webview', 'quantbook');
 
 // Build-isolation guard: the browser bundle must NEVER import host runtime
-// (`src/quantbook/session.ts` pulls the napi binding) or a native `.node` addon.
+// (`src/quantbook/session.ts`/`loader.ts` pull the napi binding) or a native addon.
 // Today the only real import is `./cellRender`; the snapshot type is `import type`
 // (erased by esbuild before resolution), so this never fires. But if a future edit
-// adds a *value* import resolving into the host session module or a native addon,
-// the build FAILS LOUDLY here instead of silently shipping napi into the webview.
+// adds a *value* import resolving into a host module or a native addon, the build
+// FAILS LOUDLY here instead of silently shipping napi into the webview.
+//
+// **FE megaudit L-k (2026-06-03)**: the prior denylist was narrow -- it caught only
+// `session(.[cm][jt]s)` + `.node`, missing `.tsx`/`.d.ts` host modules and the other
+// native binary extensions (`.dylib`/`.so`/`.dll`) plus the `loader` host module that
+// resolves the napi binding. Broadened to:
+//   - host modules by name: `session` / `loader` with any ts/js extension (incl. .tsx, .d.ts),
+//   - any `src/quantbook/` host-source path,
+//   - native binaries: `.node` / `.dylib` / `.so` / `.dll`.
+const HOST_RUNTIME_FILTER = /(^|\/)(session|loader)(\.d\.ts|\.[cm]?[jt]sx?)?$|\/src\/quantbook\/|\.(node|dylib|so|dll)$/;
 const noHostRuntimePlugin = {
 	name: 'no-host-runtime',
 	setup(build) {
-		build.onResolve({ filter: /(^|\/)session(\.[cm]?[jt]s)?$|\.node$/ }, args => ({
+		build.onResolve({ filter: HOST_RUNTIME_FILTER }, args => ({
 			errors: [{
 				text: `FE-0b build isolation: the sheets webview bundle must not import host runtime `
 					+ `("${args.path}" from "${args.importer}"). Browser bundles are vscode/napi-free -- `

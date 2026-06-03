@@ -55,6 +55,12 @@ export type PollTickResult =
  *   -> `{kind:'transportClosed'}` (V3.1.c reconnect cue).
  * - Any other throw -> `{kind:'error', code, message}` (log + skip).
  */
+/**
+ * **DORMANT (FE megaudit S6, 2026-06-03)** -- DEAD in v1. `pollRemote` is a
+ * CollabSession (real-time collab) primitive; the v1 grid runs on the owning
+ * single-writer `Session` and never polls a transport. Retained, exported, and
+ * unit-tested for the v1.5 collab re-enable. No live caller today.
+ */
 export function classifyPollTick(session: CollabSessionInstance): PollTickResult {
 	try {
 		const n = session.pollRemote();
@@ -160,6 +166,12 @@ export function validatePresenceNumeric(s: {
 	return null;
 }
 
+/**
+ * **DORMANT (FE megaudit S6, 2026-06-03)** -- DEAD in v1. The live cell-input path
+ * is {@link classifyCellInput} (number/text/blank for the owning `Session`); this
+ * numeric-only parser predates the text-cell fix and has no live caller. Retained +
+ * unit-tested for reference. Do not wire into the dispatch path (it throws on text).
+ */
 export function parseCellRawInput(raw: string): number {
 	const trimmed = raw.trim();
 	if (trimmed === '') {
@@ -203,7 +215,11 @@ export function classifyCellInput(raw: string): SessionCellValueInput {
 	if (Number.isFinite(n)) {
 		return { kind: 'number', number: n };
 	}
-	return { kind: 'text', text: raw };
+	// **FE megaudit S2-M3 (2026-06-03)**: return the TRIMMED literal for consistency
+	// with the number branch (which classifies on `trimmed`). Returning the un-trimmed
+	// `raw` here meant `"  hi  "` round-tripped as a text cell with surrounding
+	// whitespace while `"  5  "` became the clean number 5 -- an inconsistency.
+	return { kind: 'text', text: trimmed };
 }
 
 /**
@@ -244,6 +260,33 @@ export interface DispatchDeps {
 	 * omitted, the dispatcher just doesn't fire it.
 	 */
 	readonly onTypingStroke?: () => void;
+}
+
+/**
+ * **FE megaudit M9 (2026-06-03)** -- maximum accepted length of a single
+ * `putValue.rawInput` at the host dispatch boundary. Excel caps a formula at 8192
+ * chars; a literal cell value is far shorter. Anything larger is rejected with a
+ * `bad_argument` errorReply before it reaches the synchronous napi parse (DoS
+ * defense-in-depth against a tampered local webview bundle). The engine should
+ * mirror this cap at the napi boundary.
+ */
+const MAX_RAW_INPUT_LENGTH = 8192;
+
+/**
+ * **FE megaudit L-k (2026-06-03)** -- sanitize a coordinate echoed back in an
+ * `errorReply`. The reply's row/col flow to the webview (a Map key) and to the
+ * host's warning toast; a tampered bundle could post a non-finite / fractional /
+ * negative coord. Number-coerce to a finite non-negative integer, defaulting to 0
+ * for anything that does not coerce cleanly, so the echoed envelope never carries
+ * garbage. (This is defense-in-depth -- the engine validators already reject bad
+ * coords on the write path; this only sanitizes the ECHO.)
+ */
+function sanitizeCoord(value: unknown): number {
+	const n = typeof value === 'number' ? value : Number(value);
+	if (!Number.isFinite(n) || n < 0) {
+		return 0;
+	}
+	return Math.floor(n);
 }
 
 /**
@@ -334,15 +377,50 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		deps.onError({
 			type: 'errorReply',
 			sheet: typeof req.sheet === 'number' ? req.sheet : deps.sheet,
-			row: typeof req.row === 'number' ? req.row : 0,
-			col: typeof req.col === 'number' ? req.col : 0,
+			row: sanitizeCoord(req.row),
+			col: sanitizeCoord(req.col),
 			code: 'bad_argument',
 			message: `rawInput must be a string, got ${typeof req.rawInput}`,
 		});
 		return;
 	}
+	// **FE megaudit M9 (2026-06-03)**: cap cell-input length at the host boundary
+	// BEFORE parsing/formula-binding (engine DoS defense-in-depth). The napi
+	// setValue/setFormula parse the whole string synchronously; a hostile/tampered
+	// local webview bundle could post a multi-MB rawInput and stall the extension
+	// host on the parse. A real cell value / formula is far under this bound
+	// (Excel's own formula limit is 8192 chars), so reject over-limit loud rather
+	// than feed it to the engine. NOTE: the engine should mirror this cap at the
+	// napi boundary (it is the ultimate trust boundary; this TS guard only protects
+	// the in-process host path).
+	if (req.rawInput.length > MAX_RAW_INPUT_LENGTH) {
+		deps.onError({
+			type: 'errorReply',
+			sheet: typeof req.sheet === 'number' ? req.sheet : deps.sheet,
+			row: sanitizeCoord(req.row),
+			col: sanitizeCoord(req.col),
+			code: 'bad_argument',
+			message: `rawInput is ${req.rawInput.length} chars, exceeding the ${MAX_RAW_INPUT_LENGTH}-char limit; the edit was not applied.`,
+		});
+		return;
+	}
 	if (req.sheet !== deps.sheet) {
+		// **FE megaudit L-g (2026-06-03)**: do NOT drop a sheet-mismatched putValue with
+		// only a console.warn -- the webview editor stays in its pessimistic
+		// `pendingCommit` state forever (no render, no errorReply), so the user's
+		// edit input is stuck. Send a `bad_argument` errorReply so the editor un-sticks
+		// (re-arms blur-cancel + surfaces the reason). This is a defense path: the
+		// webview bakes its sheet as a const today, but a future multi-sheet panel
+		// could multiplex.
 		console.warn(`[cellGrid] putValue sheet mismatch: req.sheet=${req.sheet} deps.sheet=${deps.sheet}`);
+		deps.onError({
+			type: 'errorReply',
+			sheet: req.sheet,
+			row: sanitizeCoord(req.row),
+			col: sanitizeCoord(req.col),
+			code: 'bad_argument',
+			message: `putValue sheet ${req.sheet} does not match this panel's sheet ${deps.sheet}; the edit was not applied.`,
+		});
 		return;
 	}
 	try {
@@ -394,8 +472,9 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		deps.onError({
 			type: 'errorReply',
 			sheet: req.sheet,
-			row: req.row,
-			col: req.col,
+			// FE megaudit L-k: sanitize the echoed coords (defense-in-depth).
+			row: sanitizeCoord(req.row),
+			col: sanitizeCoord(req.col),
 			code: info.code,
 			message: info.message,
 		});
@@ -407,6 +486,14 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 // ============================================================================
 
 /**
+ * **DORMANT / DEAD (FE megaudit S6 + L-f, 2026-06-03)** -- this HOST-side
+ * `computeVisibleRange` has NO live caller. The live virtualization math is the
+ * webview's `cellRender.computeVisibleRowRange` (which the Canvas2D renderer drives);
+ * this host copy was for the retired DOM-table path. **L-f**: unlike the live
+ * `computeVisibleRowRange`, this copy LACKS the shrink-clamp on `firstVisible`, so a
+ * stale large `scrollTop` after the data shrinks could return an empty window -- do
+ * NOT re-wire it without porting that clamp. Retained + unit-tested for reference.
+ *
  * V3.3.0.4 -- compute the visible-row index range given scroll geometry.
  *
  * Per V3.3.0.1 decision D1 (custom-inline virtualization; no library).
@@ -458,17 +545,20 @@ export function computeVisibleRange(
 }
 
 /**
+ * **DORMANT / DEAD (FE megaudit S6, 2026-06-03)** -- NO live caller. This fed the
+ * retired DOM-table `cellGridHtml.ts::buildHtml` slice path; the Canvas2D renderer
+ * windows rows itself (it draws directly from `snapshot.entries`, no host-side
+ * pre-slice). The `data-row`/`data-original-*` attributes named below belong to the
+ * dead DOM table, NOT the live canvas. Retained + unit-tested for reference.
+ *
  * V3.3.0.4 -- slice a snapshot's entries to the index range
  * `[startIdx, endIdx)`.
  *
- * Pure function over snapshot data.  Mocha tests use this to verify
- * that virtualization preserves the V3.2.a/b/c data-row + data-col +
- * data-original-text + data-original-kind invariants on the rendered
- * subset (which is what `cellGridHtml.ts::buildHtml` consumes).
+ * Pure function over snapshot data.  (Historically verified that the slice
+ * preserved the V3.2.a/b/c data-row + data-col + data-original-text +
+ * data-original-kind invariants the retired `cellGridHtml.ts::buildHtml` consumed.)
  *
- * Returns the sliced sub-array (NOT mutating the input).  The HTML
- * builder downstream renders these as `<tr>` rows; top + bottom
- * spacer rows sandwich them.
+ * Returns the sliced sub-array (NOT mutating the input).
  *
  * @param entries  the full sorted ascending `snapshot.entries`.
  * @param startIdx inclusive start index; clamped to `[0, entries.length]`.
@@ -658,10 +748,14 @@ export function buildSheetMovePositionItems(
  *
  * Bridges the V3.5.0.2 `WorkbookSnapshotJson` shape (multi-sheet, with
  * optional value/formula per cell) into the V3.2.a `QuantbookCellSnapshot`
- * shape (single-sheet, required-value entries) that {@link buildHtml}
- * has consumed since V3.2.a.  Lets `cellGridPanel.ts::render()` switch
- * from `exportSnapshot(sheet)` to `workbookSnapshot()` WITHOUT changing
- * the html-building layer (which is a much larger surface).
+ * shape (single-sheet, required-value entries) that the renderer consumes.
+ *
+ * **LIVE function** (drift note, FE megaudit S6 2026-06-03): this is called by
+ * `cellGridPanel.ts::render()`. The CURRENT consumer of the returned snapshot is the
+ * FE-0b Canvas2D renderer (pushed via postMessage), NOT the retired
+ * `cellGridHtml.ts::buildHtml`/`renderRows` DOM-table layer some comments below still
+ * name. The `rendered`/`formula` passthrough fields feed the canvas value display +
+ * the overlay editor's formula source (the old `data-raw-*` DOM attributes are gone).
  *
  * **Sheet-not-found**: returns `null` when `sheetId` is absent from
  * `snapshot.sheets` -- happens if the active sheet was tombstoned
@@ -1062,12 +1156,22 @@ export function mergeWorkbookDelta(
 	// changedCells: upsert by (sheet, row, col) in sorted position.
 	for (const changed of delta.changedCells) {
 		const sheet = cached.sheets.find(s => s.id === changed.sheet);
-		// A changedCell for an unknown sheet should not occur: AddSheet
-		// trips fullRebuildRequired, so any sheet a delta references is
-		// already in the cache.  Skip defensively rather than synthesize a
-		// nameless sheet (which would diverge from a fresh snapshot).
+		// **FE megaudit M3 (2026-06-03)**: a changedCell for a sheet absent from the
+		// cache must NOT be skipped-then-version-advanced. AddSheet trips
+		// fullRebuildRequired, so on the current engine any sheet a delta references
+		// is already in the cache; an unknown sheet here is an engine-contract
+		// violation/drift. The prior `continue` DROPPED the cell yet still let
+		// `cached.version` advance below -- the next delta would start AFTER the lost
+		// update, so the cache could stay PERMANENTLY divergent from a fresh
+		// snapshot() with no signal. Fail loud (No-Fallbacks) so the producerless
+		// divergence becomes a recognized `[invalid_state]` the caller can re-seed on,
+		// rather than a silent corruption.
 		if (sheet === undefined) {
-			continue;
+			throw new Error(
+				`[invalid_state] mergeWorkbookDelta: changedCell references unknown sheet ${changed.sheet} ` +
+				`(not in the cached snapshot). AddSheet trips fullRebuildRequired, so a delta should never ` +
+				`reference an uncached sheet -- the engine + IDE binding may be out of sync; full-resync required.`,
+			);
 		}
 		upsertCellSorted(sheet.cells, changed.cell);
 	}
@@ -1075,8 +1179,14 @@ export function mergeWorkbookDelta(
 	// removedCells (forward-compat; engine emits [] today): drop the cell.
 	for (const removed of delta.removedCells) {
 		const sheet = cached.sheets.find(s => s.id === removed.sheet);
+		// **FE megaudit M3 (2026-06-03)**: same as changedCells -- an unknown sheet on
+		// a removedCell is contract drift, not a benign skip. Throw rather than
+		// skip-then-advance-version (silent permanent divergence).
 		if (sheet === undefined) {
-			continue;
+			throw new Error(
+				`[invalid_state] mergeWorkbookDelta: removedCell references unknown sheet ${removed.sheet} ` +
+				`(not in the cached snapshot). The engine + IDE binding may be out of sync; full-resync required.`,
+			);
 		}
 		const idx = sheet.cells.findIndex(c => c.row === removed.row && c.col === removed.col);
 		if (idx >= 0) {
