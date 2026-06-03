@@ -27,6 +27,7 @@
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { formatCellValue } from './cellRender';
 import { CanvasGridRenderer } from './canvasGrid';
+import { type ScrollState, computeScrollBlit, diffSnapshots, errorRowsFlipped } from './gridBlit';
 import { cellContentRect, hitTestViewport, totalContentHeight, totalContentWidth } from './gridLayout';
 
 /** Minimal VS Code webview API surface (mirrors qviz-spec/index.ts). */
@@ -104,19 +105,141 @@ interface EditState {
 }
 let editState: EditState | null = null;
 
-/** Re-transform the canvas to overlay the viewport at the current scroll, then repaint. */
-function redraw(): void {
-	const scrollTop = viewportEl.scrollTop;
-	const scrollLeft = viewportEl.scrollLeft;
-	renderer.resize(viewportEl.clientWidth, viewportEl.clientHeight);
+// --- FE-0b-4 partial-redraw state ---
+// `prevScroll` = the scroll/size/dpr of the last painted frame (the blit baseline); `prevSnapshot`
+// + `prevErrorKeys` = the damage-diff baseline. All are refreshed by every paint.
+let prevScroll: ScrollState | null = null;
+let prevSnapshot: QuantbookCellSnapshot | null = null;
+let prevErrorKeys = new Set<string>();
+
+// Above this many changed rows a full redraw beats N clipped row paints (e.g. a bulk write_range /
+// SQL materialize). An interactive edit changes a handful, so it stays on the damage path.
+const DAMAGE_FULL_THRESHOLD = 64;
+
+// Compile-time-false debug self-check: when true, every partial paint is followed by a full redraw
+// + a pixel compare. No-Fallbacks -- it SHOUTS on mismatch (console.error + a magenta marker),
+// never silently masks it. esbuild constant-folds the `false` so the body is dropped (zero prod cost).
+const DEBUG_BLIT_VERIFY = false;
+
+interface Viewport {
+	readonly scrollTop: number;
+	readonly scrollLeft: number;
+	readonly cssW: number;
+	readonly cssH: number;
+}
+function currentViewport(): Viewport {
+	return {
+		scrollTop: viewportEl.scrollTop,
+		scrollLeft: viewportEl.scrollLeft,
+		cssW: viewportEl.clientWidth,
+		cssH: viewportEl.clientHeight,
+	};
+}
+/** Pin the absolute canvas over the viewport at the current scroll (the content scrolls under it). */
+function applyCanvasTransform(scrollTop: number, scrollLeft: number): void {
 	canvasEl.style.transform = 'translate(' + scrollLeft + 'px, ' + scrollTop + 'px)';
-	renderer.draw(viewportEl.clientWidth, viewportEl.clientHeight, scrollTop, scrollLeft, errorCells);
+}
+function scrollStateOf(v: Viewport): ScrollState {
+	return { scrollTop: v.scrollTop, scrollLeft: v.scrollLeft, cssW: v.cssW, cssH: v.cssH, dpr: renderer.backingScale };
 }
 
-// FE megaudit L-b: coalesce high-frequency redraw triggers (scroll) to ONE redraw
-// per animation frame. A fast scroll fires many `scroll` events per frame; calling
-// redraw() synchronously on each does redundant canvas work. scheduleRedraw() reads
-// the LATEST scroll offset inside the rAF callback, so no intermediate frame is lost.
+/**
+ * True iff the last painted frame (`prevScroll`) was at EXACTLY the viewport's current scroll/size/dpr.
+ * This is the precondition for a DAMAGE paint (FE-0b-5 Codex H3): damage repaints only changed rows on
+ * top of the existing backing store, so that store must already be a full render at the current scroll.
+ * Scroll repaints are rAF-coalesced, so a `render`/`errorReply` arriving between a scroll and its pending
+ * rAF would otherwise damage-paint changed rows at the new offset while unchanged rows still show the old
+ * one. When this returns false (the user scrolled since the last paint), the caller full-draws instead.
+ */
+function scrollUnchanged(prev: ScrollState | null, v: Viewport): boolean {
+	return (
+		prev !== null &&
+		prev.scrollTop === v.scrollTop &&
+		prev.scrollLeft === v.scrollLeft &&
+		prev.cssW === v.cssW &&
+		prev.cssH === v.cssH &&
+		prev.dpr === renderer.backingScale
+	);
+}
+
+/** Union two ascending index lists into one ascending, de-duplicated list. */
+function unionSortedUnique(a: readonly number[], b: readonly number[]): number[] {
+	if (b.length === 0) {
+		return a.slice();
+	}
+	if (a.length === 0) {
+		return b.slice();
+	}
+	const set = new Set<number>(a);
+	for (const x of b) {
+		set.add(x);
+	}
+	return Array.from(set).sort((p, q) => p - q);
+}
+
+/** Full redraw at the current viewport; refreshes the blit baseline. The snapshot/error baselines
+ * are left to the caller (a scroll/resize/theme repaint does not change them). */
+function fullDraw(): void {
+	const v = currentViewport();
+	renderer.resize(v.cssW, v.cssH);
+	applyCanvasTransform(v.scrollTop, v.scrollLeft);
+	renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells);
+	prevScroll = scrollStateOf(v);
+}
+
+/** DEBUG_BLIT_VERIFY: redraw fully + compare to the partial paint; SHOUT on any mismatch. The full
+ * redraw leaves the canvas in its always-correct state (so the marker, if any, sits over truth). */
+function verifyPartialAgainstFull(v: Viewport): void {
+	if (!DEBUG_BLIT_VERIFY) {
+		return;
+	}
+	const ctx = canvasEl.getContext('2d');
+	if (ctx === null) {
+		return;
+	}
+	const before = ctx.getImageData(0, 0, canvasEl.width, canvasEl.height);
+	renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells);
+	const after = ctx.getImageData(0, 0, canvasEl.width, canvasEl.height);
+	let mismatch = 0;
+	for (let i = 0; i < before.data.length; i += 1) {
+		if (before.data[i] !== after.data[i]) {
+			mismatch += 1;
+		}
+	}
+	if (mismatch > 0) {
+		console.error('[sheets-webview] DEBUG_BLIT_VERIFY: partial paint differs from full redraw by ' + mismatch + ' byte(s)');
+		ctx.save();
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.fillStyle = 'magenta';
+		ctx.fillRect(0, 0, 16, 16);
+		ctx.restore();
+	}
+}
+
+/** Scroll repaint: reuse painted pixels via a blit when possible, else a full redraw. */
+function scrollRedraw(): void {
+	const v = currentViewport();
+	renderer.resize(v.cssW, v.cssH); // updates dpr; resets `painted` if the size changed
+	applyCanvasTransform(v.scrollTop, v.scrollLeft);
+	const next = scrollStateOf(v);
+	// FE-0b-5 (Codex H1): never blit an EMPTY sheet -- `paintWindow`'s placeholder is drawn at a FIXED
+	// viewport x (NOT content-anchored), so a horizontal blit would shift/duplicate it instead of
+	// leaving it pinned the way a full redraw does. Full-draw empty sheets (they are tiny anyway).
+	const blit = renderer.painted && renderer.entryCount > 0 ? computeScrollBlit(prevScroll, next) : null;
+	if (blit !== null) {
+		renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells);
+	} else {
+		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells);
+	}
+	prevScroll = next;
+	if (blit !== null) {
+		verifyPartialAgainstFull(v);
+	}
+}
+
+// FE megaudit L-b: coalesce high-frequency scroll events to ONE repaint per animation frame. A fast
+// scroll fires many `scroll` events per frame; scrollRedraw() reads the LATEST scroll offset inside
+// the rAF callback, so no intermediate frame is lost.
 let redrawScheduled = false;
 function scheduleRedraw(): void {
 	if (redrawScheduled) {
@@ -125,12 +248,20 @@ function scheduleRedraw(): void {
 	redrawScheduled = true;
 	requestAnimationFrame(() => {
 		redrawScheduled = false;
-		redraw();
+		scrollRedraw();
 	});
 }
 
-/** Apply a fresh snapshot: update title/meta + spacer, clear edit/error state, repaint. */
+/**
+ * Apply a fresh snapshot: update title/meta + spacer, clear edit/error state, then paint. Paints via
+ * the damage path (only changed rows) when possible, else a full redraw. `renderer.painted` is the
+ * OUTER gate: a webview reload zeroes the backing store, so an identical re-sent snapshot (empty
+ * diff) must STILL full-draw rather than trust stale pixels (FE-0b-4 R3).
+ */
 function applyRender(snapshot: QuantbookCellSnapshot): void {
+	const prevSnap = prevSnapshot;
+	const prevErr = prevErrorKeys;
+
 	fullSnapshot = snapshot;
 	renderer.setSnapshot(snapshot);
 	// FE re-audit MED-1 (regression from M1's session-wide refresh): a render that is NOT the
@@ -148,7 +279,37 @@ function applyRender(snapshot: QuantbookCellSnapshot): void {
 	metaEl.textContent = 'snapshot_format_version=' + String(snapshot.snapshot_format_version) + '; entries=' + String(snapshot.entries.length);
 	spacerEl.style.height = totalContentHeight(snapshot.entries.length) + 'px';
 	spacerEl.style.width = totalContentWidth() + 'px';
-	redraw();
+
+	const v = currentViewport();
+	renderer.resize(v.cssW, v.cssH); // resets `painted` if the viewport resized since the last paint
+	applyCanvasTransform(v.scrollTop, v.scrollLeft);
+
+	let didPartial = false;
+	// FE-0b-5 (Codex H3): the damage path only repaints CHANGED rows on top of the existing backing
+	// store, so that store must already be a full render at the CURRENT scroll. If the user scrolled
+	// since the last paint (a coalesced scroll rAF is still pending), `scrollUnchanged` is false and we
+	// full-draw -- otherwise unchanged rows would be left at the stale pre-scroll offset.
+	if (renderer.painted && scrollUnchanged(prevScroll, v)) {
+		const diff = diffSnapshots(prevSnap, snapshot);
+		if (diff !== null) {
+			// errorCells may have been cleared above -> union the rows whose tint flipped.
+			const nextErrKeys = new Set<string>(errorCells.keys());
+			const union = unionSortedUnique(diff, errorRowsFlipped(prevErr, nextErrKeys, snapshot.entries));
+			if (union.length === 0) {
+				didPartial = true; // structurally identical + no error flip: pixels already valid
+			} else if (union.length <= DAMAGE_FULL_THRESHOLD) {
+				renderer.drawDamage(union, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells);
+				verifyPartialAgainstFull(v);
+				didPartial = true;
+			}
+		}
+	}
+	if (!didPartial) {
+		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells);
+	}
+	prevScroll = scrollStateOf(v);
+	prevSnapshot = snapshot;
+	prevErrorKeys = new Set<string>(errorCells.keys());
 }
 
 // --- Overlay editor ---
@@ -356,25 +517,45 @@ window.addEventListener('message', (event: MessageEvent) => {
 			// click away now dismisses) while the input stays for correction + re-commit.
 			editState.pendingCommit = false;
 		}
-		redraw();
+		// FE-0b-4: an errorReply only flips ONE cell's tint (and carries no new snapshot), so damage
+		// just that row when we can locate it + have painted; else full-draw. prevSnapshot is left
+		// unchanged; prevErrorKeys is refreshed (the new key participates in the next diff's union).
+		const v = currentViewport();
+		renderer.resize(v.cssW, v.cssH);
+		applyCanvasTransform(v.scrollTop, v.scrollLeft);
+		const idx = fullSnapshot
+			? fullSnapshot.entries.findIndex(e => Number(e.row) === Number(er.row) && Number(e.col) === Number(er.col))
+			: -1;
+		// FE-0b-5 (Codex H3): same scroll-match precondition as applyRender -- only damage-paint when the
+		// backing store is already a full render at the current scroll; else full-draw.
+		if (renderer.painted && idx >= 0 && scrollUnchanged(prevScroll, v)) {
+			renderer.drawDamage([idx], v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells);
+			verifyPartialAgainstFull(v);
+		} else {
+			renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells);
+		}
+		prevScroll = scrollStateOf(v);
+		prevErrorKeys = new Set<string>(errorCells.keys());
 		return;
 	}
 	console.warn('[sheets-webview] unknown inbound message type:', msg.type);
 });
 
-// Redraw on scroll (re-transform the canvas + repaint the new window). The content-anchored input
-// scrolls with the content automatically. FE megaudit L-b: rAF-coalesced to one redraw per frame.
+// Repaint on scroll (blit-reuse + re-transform the canvas). The content-anchored input scrolls with
+// the content automatically. FE megaudit L-b: rAF-coalesced to one repaint per frame.
 viewportEl.addEventListener('scroll', scheduleRedraw);
 
-// Redraw on viewport resize (HiDPI backing-store resize happens inside redraw()).
+// Full redraw on viewport resize: the backing store is re-sized + cleared inside fullDraw()->resize()
+// (which resets `painted`), so a blit/damage over the stale pixels is impossible here.
 if (typeof ResizeObserver !== 'undefined') {
-	new ResizeObserver(() => redraw()).observe(viewportEl);
+	new ResizeObserver(() => fullDraw()).observe(viewportEl);
 }
 
-// Repaint on theme change: VS Code re-classes <body>; refresh the cached palette/fonts.
+// Full redraw on theme change: VS Code re-classes <body>; refresh the cached palette/fonts then
+// repaint everything (every cell's colour may have changed -- not a partial-paintable delta).
 new MutationObserver(() => {
 	renderer.refreshTheme();
-	redraw();
+	fullDraw();
 }).observe(document.body, { attributes: true, attributeFilter: ['class'] });
 
 // Handshake: announce the channel is live so the host (re)sends the snapshot. Sent AFTER all

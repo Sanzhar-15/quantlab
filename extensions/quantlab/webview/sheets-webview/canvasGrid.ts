@@ -23,6 +23,7 @@
 
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { computeVisibleRowRange, formatCellValue } from './cellRender';
+import type { ScrollBlit } from './gridBlit';
 import { COLUMNS, HEADER_HEIGHT, ROW_HEIGHT, columnX, totalContentWidth, truncateToWidth } from './gridLayout';
 
 const CELL_PAD = 8;
@@ -71,6 +72,15 @@ export class CanvasGridRenderer {
 	private bodyFont: string;
 	private headerFont: string;
 	private readonly measureCache = new Map<string, number>();
+	/**
+	 * **FE-0b-4** -- true once a full {@link draw} has painted the current backing store. The
+	 * partial paths ({@link drawScroll}/{@link drawDamage}) reuse existing pixels, so they are only
+	 * valid AFTER a full paint. It is reset to `false` whenever {@link resize} actually changes the
+	 * backing-store dimensions (which clears it) -- including the same-size-but-zeroed canvas a
+	 * webview reload produces, where a re-sent identical snapshot would otherwise diff to "no change"
+	 * against a blank canvas (FE-0b-4 R3).
+	 */
+	private hasPaintedOnce = false;
 
 	constructor(private readonly canvas: HTMLCanvasElement) {
 		const ctx = canvas.getContext('2d');
@@ -78,6 +88,10 @@ export class CanvasGridRenderer {
 			throw new Error('sheets-webview: 2D canvas context unavailable');
 		}
 		this.ctx = ctx;
+		// FE-0b-4: the blit self-`drawImage` copies axis-aligned, same-size rects -- smoothing must
+		// be OFF or the copy resamples and blurs. It is persistent context state; set it once here
+		// (and defensively in drawScroll).
+		this.ctx.imageSmoothingEnabled = false;
 		this.dpr = CanvasGridRenderer.resolveDpr();
 		this.palette = this.readPalette();
 		const fonts = this.readFonts();
@@ -106,6 +120,18 @@ export class CanvasGridRenderer {
 		return this.snapshot?.entries.length ?? 0;
 	}
 
+	/** **FE-0b-4** -- whether a full {@link draw} has painted the current backing store (the
+	 * precondition for {@link drawScroll}/{@link drawDamage}; see {@link hasPaintedOnce}). */
+	get painted(): boolean {
+		return this.hasPaintedOnce;
+	}
+
+	/** **FE-0b-4** -- the device-pixel ratio the backing store is currently scaled at (always 1 or
+	 * 2). The caller passes it to `computeScrollBlit` so the blit copy math matches `resize()`. */
+	get backingScale(): number {
+		return this.dpr;
+	}
+
 	/** Re-read theme palette + fonts (call on snapshot push + on a body-class/theme change). */
 	refreshTheme(): void {
 		this.palette = this.readPalette();
@@ -124,6 +150,12 @@ export class CanvasGridRenderer {
 		if (this.canvas.width !== bw || this.canvas.height !== bh) {
 			this.canvas.width = bw;
 			this.canvas.height = bh;
+			// FE-0b-4: assigning canvas.width/height CLEARS the backing store, so any reused pixels
+			// are gone -- the next paint MUST be a full draw, not a blit/damage over a blank canvas.
+			this.hasPaintedOnce = false;
+			// Setting the backing store also resets context state (imageSmoothingEnabled, transform);
+			// re-disable smoothing so the next blit copies crisply.
+			this.ctx.imageSmoothingEnabled = false;
 		}
 		this.canvas.style.width = cssWidth + 'px';
 		this.canvas.style.height = cssHeight + 'px';
@@ -135,9 +167,29 @@ export class CanvasGridRenderer {
 	 * `errorReply`). Full redraw (blit/damage is FE-0b-4).
 	 */
 	draw(cssWidth: number, cssHeight: number, scrollTop: number, scrollLeft: number, errorCells: ReadonlyMap<string, string>): void {
+		// Full redraw -- the always-correct path AND the fallback for every partial path (FE-0b-4).
+		// Reset the transform (NOT cumulative scale) then scale for HiDPI; paint the whole viewport.
+		this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells);
+		this.hasPaintedOnce = true;
+	}
+
+	/**
+	 * Paint the background + the visible entry window + the sticky header for `scrollTop/scrollLeft`.
+	 * The **single source of cell pixels**: {@link draw} calls it un-clipped (full viewport); the
+	 * partial paths ({@link drawScroll}/{@link drawDamage}) call it under a `ctx.clip()` so only the
+	 * damaged region is repainted -- which GUARANTEES the partial pixels are identical to a full
+	 * redraw (same code, only the clip differs). Assumes the caller has set the dpr transform.
+	 * `fillRect(0,0,w,h)` under an active clip fills only the clipped area.
+	 */
+	private paintWindow(
+		cssWidth: number,
+		cssHeight: number,
+		scrollTop: number,
+		scrollLeft: number,
+		errorCells: ReadonlyMap<string, string>,
+	): void {
 		const ctx = this.ctx;
-		// Reset the transform each frame (NOT cumulative scale) then scale for HiDPI.
-		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
 		ctx.fillStyle = this.palette.background;
 		ctx.fillRect(0, 0, cssWidth, cssHeight);
 
@@ -164,6 +216,80 @@ export class CanvasGridRenderer {
 			this.drawRow(entries[i], HEADER_HEIGHT + i * ROW_HEIGHT - scrollTop, scrollLeft, errorCells);
 		}
 		this.drawHeader(scrollLeft, cssWidth);
+	}
+
+	/**
+	 * **FE-0b-4 blit-scroll.** Reuse the previous frame's overlapping pixels: copy them shifted by
+	 * the scroll delta (a self-`drawImage` in device px), then repaint only the newly-exposed
+	 * strip(s) via the clipped {@link paintWindow}. `blit` is from `computeScrollBlit` (a device-px
+	 * copy rect + CSS-px damage rects). The caller guarantees `painted` + an unchanged size/dpr.
+	 */
+	drawScroll(
+		blit: ScrollBlit,
+		cssWidth: number,
+		cssHeight: number,
+		scrollTop: number,
+		scrollLeft: number,
+		errorCells: ReadonlyMap<string, string>,
+	): void {
+		const ctx = this.ctx;
+		// The copy rect is already device-scaled -> issue drawImage under the IDENTITY transform
+		// (issuing it under the dpr transform would scale the device rect a second time).
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.imageSmoothingEnabled = false;
+		const c = blit.copy;
+		ctx.drawImage(this.canvas, c.sx, c.sy, c.sw, c.sh, c.dx, c.dy, c.dw, c.dh);
+		// Repaint the exposed strip(s) in CSS px under the restored dpr transform.
+		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+		for (const r of blit.damageRects) {
+			ctx.save();
+			ctx.beginPath();
+			ctx.rect(r.x, r.y, r.width, r.height);
+			ctx.clip();
+			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells);
+			ctx.restore();
+		}
+	}
+
+	/**
+	 * **FE-0b-4 damage-clip.** Repaint ONLY the changed entry rows (by index), each via the clipped
+	 * {@link paintWindow} so the pixels match a full redraw. The sticky header never changes on an
+	 * edit, so it is not repainted (the body-row clip excludes it). Off-screen rows are skipped.
+	 * `changedIdx` is the union of `diffSnapshots` + `errorRowsFlipped` from the caller.
+	 */
+	drawDamage(
+		changedIdx: readonly number[],
+		cssWidth: number,
+		cssHeight: number,
+		scrollTop: number,
+		scrollLeft: number,
+		errorCells: ReadonlyMap<string, string>,
+	): void {
+		const ctx = this.ctx;
+		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+		// FE-0b-5 (Codex M4): build ONE clip region spanning ALL visible changed rows, then paint the
+		// window ONCE. A per-row paintWindow() would re-run the whole visible-window draw loop once per
+		// damaged row (N loops for N rows) -- correct pixels, but the wrong cost for a perf path.
+		ctx.save();
+		ctx.beginPath();
+		let anyVisible = false;
+		for (const idx of changedIdx) {
+			const rowTop = HEADER_HEIGHT + idx * ROW_HEIGHT - scrollTop;
+			// Clamp to the body viewport [HEADER_HEIGHT, cssHeight); +1 captures the row's bottom
+			// border. Skip rows fully off-screen or fully under the sticky header.
+			const top = Math.max(rowTop, HEADER_HEIGHT);
+			const bottom = Math.min(rowTop + ROW_HEIGHT + 1, cssHeight);
+			if (bottom <= top) {
+				continue;
+			}
+			ctx.rect(0, top, cssWidth, bottom - top); // accumulates into the union clip path
+			anyVisible = true;
+		}
+		if (anyVisible) {
+			ctx.clip();
+			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells);
+		}
+		ctx.restore();
 	}
 
 	private drawRow(
