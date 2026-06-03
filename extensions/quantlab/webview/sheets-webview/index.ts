@@ -141,8 +141,11 @@ function beginEdit(entryIndex: number): void {
 	inputEl.style.width = rect.width + 'px';
 	inputEl.style.height = rect.height + 'px';
 	// Edit source precedence: formula text (if any) over the value-default literal -- matches the
-	// FE-0b-1 data-raw-formula > data-raw-value chain.
-	inputEl.value = typeof entry.formula === 'string' ? entry.formula : formatCellValue(entry.value);
+	// FE-0b-1 data-raw-formula > data-raw-value chain. The stored `entry.formula` is the engine's
+	// NORMALIZED BODY (no leading `=`), so we MUST re-add the `=`: the host dispatch only routes
+	// input back to `setFormula` when it starts with `=`. Without the prefix, a no-op re-submit of a
+	// formula cell is classified as TEXT and silently destroys the formula (megaudit F1, data loss).
+	inputEl.value = typeof entry.formula === 'string' ? '=' + entry.formula : formatCellValue(entry.value);
 	inputEl.hidden = false;
 	editState = { entryIndex, entry, pendingCommit: false };
 	inputEl.focus();

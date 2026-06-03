@@ -46,6 +46,11 @@ async function tryBuild(options, didBuild) {
 	try {
 		await build(options, didBuild);
 	} catch (err) {
+		// No-Fallbacks: a watch-mode build failure must be UNMISTAKABLE. The prior bare
+		// `console.error(err)` could scroll past, leaving a STALE bundle served with no
+		// clear signal. Emit a loud banner; keep the watcher alive (exiting would kill
+		// the watch -- the point of watch mode is to rebuild on the next save).
+		console.error('\n=== esbuild WATCH BUILD FAILED -- the previous (STALE) bundle is still in use; fix the error and save to rebuild ===');
 		console.error(err);
 	}
 }

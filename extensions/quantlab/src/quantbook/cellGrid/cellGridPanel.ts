@@ -58,15 +58,25 @@ const VIEW_TYPE = 'quantlab.quantbookCellGrid';
 const READY_WATCHDOG_MS = 6000;
 
 /**
- * Module-level registry of live panels keyed by sheet number. Lets the
- * `quantlab.quantbookCellGridRefresh` command find the active panel(s) without
- * the user having to remember which window spawned them. Removed on dispose.
+ * Registries of live panels.
  *
- * **B1**: a single map (was a local/collab dual map before the collab path was
- * disabled) -- one panel per sheet, single-tab-per-sheet (reveal + refresh an
- * existing panel rather than spawn a duplicate).
+ * **FE megaudit F2 (2026-06-03)**: keyed by SESSION IDENTITY, not sheet number
+ * alone. The prior `Map<number, CellGridPanel>` revealed a *different* session's
+ * panel when a second workbook opened on the same sheet id -- leaking the new
+ * session (never shown/closed) and showing the wrong workbook, breaking the
+ * single-writer model the FE-0a migration established.
+ *
+ * - `allPanels`: every live panel, iterable -- for refreshAll / disposeAll / enumerate.
+ * - `bySession`: `session -> (sheet -> panel)`, for single-tab-per-(session,sheet)
+ *   reveal. ONE session may own SEVERAL panels (different sheets via switch-sheet),
+ *   so the owning napi `Session` is closed only when its LAST panel disposes (F4).
+ * - `focusedPanel`: the last-activated panel -- the target for sheet-management /
+ *   Save-As commands when multiple sessions are open (replaces the old arbitrary
+ *   "oldest open panel" pick that could mutate the wrong workbook).
  */
-const panels: Map<number, CellGridPanel> = new Map();
+const allPanels: Set<CellGridPanel> = new Set();
+const bySession: Map<SessionInstance, Map<number, CellGridPanel>> = new Map();
+let focusedPanel: CellGridPanel | undefined;
 
 /**
  * Render-then-edit webview panel for the given session's sheet. The panel binds
@@ -79,12 +89,14 @@ export class CellGridPanel {
 		session: SessionInstance,
 		sheet: number,
 	): CellGridPanel {
-		// Single-tab-per-sheet: reveal + refresh an existing panel for this sheet
-		// rather than spawning a duplicate.
-		const existing = panels.get(sheet);
+		// Single-tab-per-(session,sheet): reveal + refresh an EXISTING panel only when
+		// it belongs to THIS session (F2 -- never reveal a different session's panel
+		// just because it shares a sheet id).
+		const existing = bySession.get(session)?.get(sheet);
 		if (existing !== undefined) {
 			existing.panel.reveal(vscode.ViewColumn.Active, false);
 			existing.render();
+			focusedPanel = existing;
 			return existing;
 		}
 		// Initial title; render() (below) immediately corrects the count via
@@ -112,14 +124,19 @@ export class CellGridPanel {
 			},
 		);
 		const instance = new CellGridPanel(panel, session, sheet);
-		// Attach the message handler BEFORE mounting the shell so the webview's
-		// `webviewReady` handshake (posted on bundle load) is never missed. It
-		// survives for the panel's lifetime (attached to the PANEL, not the doc).
-		panel.webview.onDidReceiveMessage(
-			(raw: unknown) => instance.handleIncoming(raw),
-			undefined,
-			context.subscriptions,
-		);
+		// F4: PANEL-SCOPED disposables. The message + view-state listeners MUST NOT
+		// outlive the panel -- registering them on `context.subscriptions` (extension
+		// lifetime) lets a late buffered webview message reach `handleIncoming` on a
+		// disposed panel / closed session. These are disposed in `onDidDispose`.
+		// Attached BEFORE mounting the shell so the `webviewReady` handshake (posted
+		// on bundle load) is never missed.
+		const panelDisposables: vscode.Disposable[] = [];
+		panel.webview.onDidReceiveMessage((raw: unknown) => instance.handleIncoming(raw), undefined, panelDisposables);
+		panel.onDidChangeViewState(e => {
+			if (e.webviewPanel.active) {
+				focusedPanel = instance;
+			}
+		}, undefined, panelDisposables);
 		// Mount the persistent bundle shell ONCE. Snapshots are pushed via
 		// postMessage in render() (gated on the webviewReady handshake), NOT by
 		// rebuilding webview.html.
@@ -128,16 +145,47 @@ export class CellGridPanel {
 		// Watch for the webviewReady handshake; surface a loud error if the bundle
 		// never loads (else render() silently withholds every paint -> blank grid).
 		instance.armReadyWatchdog();
-		panels.set(sheet, instance);
+		allPanels.add(instance);
+		let sheetMap = bySession.get(session);
+		if (sheetMap === undefined) {
+			sheetMap = new Map();
+			bySession.set(session, sheetMap);
+		}
+		sheetMap.set(sheet, instance);
+		focusedPanel = instance;
 		panel.onDidDispose(() => {
 			// Set _disposed BEFORE anything else so a postMessage racing with
 			// disposal early-returns from the onError guard.
 			instance._disposed = true;
 			instance.clearReadyWatchdog();
-			// Only clear the cache entry if we still own it (a fresh open for the
-			// same sheet may have replaced us).
-			if (panels.get(sheet) === instance) {
-				panels.delete(sheet);
+			// F4: dispose the panel-scoped listeners so they cannot fire after the
+			// panel is gone.
+			for (const d of panelDisposables) {
+				d.dispose();
+			}
+			allPanels.delete(instance);
+			if (focusedPanel === instance) {
+				focusedPanel = undefined;
+			}
+			// Only clear the registry entry if we still own it (a fresh open for the
+			// same (session,sheet) may have replaced us).
+			const sheetMapNow = bySession.get(session);
+			if (sheetMapNow !== undefined && sheetMapNow.get(sheet) === instance) {
+				sheetMapNow.delete(sheet);
+				if (sheetMapNow.size === 0) {
+					bySession.delete(session);
+					// F4: the LAST panel for this session has closed -> close the
+					// owning napi Session to release the engine handle (ref-counted:
+					// sibling panels on other sheets keep it alive). Log on failure
+					// (No-Fallbacks -- never swallow); do not rethrow from a dispose
+					// callback. Skipped on the Open-replaces-workbook path, which
+					// closes the displaced session explicitly via closeSessionQuietly.
+					try {
+						session.close();
+					} catch (err) {
+						console.error('[cellGrid] session.close() on last-panel dispose failed:', err);
+					}
+				}
 			}
 		});
 		context.subscriptions.push(panel);
@@ -152,17 +200,36 @@ export class CellGridPanel {
 	 * (it does not silently masquerade as success). `safeRender` still isolates the
 	 * failure so one bad panel does not abort the refresh of its siblings.
 	 */
-	static refreshAll(): { refreshed: number; failed: number } {
+	static refreshAll(): { refreshed: number; failed: number; skipped: number } {
+		return CellGridPanel.refreshIterable(allPanels);
+	}
+
+	/**
+	 * Refresh every live panel bound to `session` (FE megaudit M1). undo/redo and
+	 * any commit are session-wide (and a formula edit can change dependents on a
+	 * SIBLING sheet), so the post-commit re-render must cover all of the session's
+	 * panels, not just the one that dispatched. Same honest `{refreshed,failed,skipped}`.
+	 */
+	static refreshSession(session: SessionInstance): { refreshed: number; failed: number; skipped: number } {
+		const sheetMap = bySession.get(session);
+		return CellGridPanel.refreshIterable(sheetMap !== undefined ? sheetMap.values() : []);
+	}
+
+	private static refreshIterable(it: Iterable<CellGridPanel>): { refreshed: number; failed: number; skipped: number } {
 		let refreshed = 0;
 		let failed = 0;
-		for (const instance of panels.values()) {
-			if (instance.safeRender()) {
+		let skipped = 0;
+		for (const instance of it) {
+			const outcome = instance.safeRender();
+			if (outcome === 'ok') {
 				refreshed += 1;
-			} else {
+			} else if (outcome === 'failed') {
 				failed += 1;
+			} else {
+				skipped += 1;
 			}
 		}
-		return { refreshed, failed };
+		return { refreshed, failed, skipped };
 	}
 
 	/**
@@ -177,7 +244,7 @@ export class CellGridPanel {
 	 * Returns the number of panels disposed.
 	 */
 	static disposeAll(): number {
-		const live = Array.from(panels.values());
+		const live = Array.from(allPanels);
 		for (const instance of live) {
 			instance.panel.dispose();
 		}
@@ -189,19 +256,23 @@ export class CellGridPanel {
 	 * panels). Returns `true` on success, `false` if `render()` threw -- the caller
 	 * (refreshAll) aggregates the failure count so the command layer can surface it
 	 * LOUD (No-Fallbacks); `console.warn` keeps the per-panel detail. A failure does
-	 * not abort the refresh of sibling panels. A disposed panel is a no-op success.
+	 * not abort the refresh of sibling panels.
+	 *
+	 * Returns `'ok'` on success, `'failed'` if `render()` threw, and `'skipped'` for
+	 * a disposed panel (FE megaudit M6: a disposed panel did NOT re-render, so it
+	 * must not be counted as `refreshed` -- the count would over-report success).
 	 */
-	private safeRender(): boolean {
+	private safeRender(): 'ok' | 'failed' | 'skipped' {
 		if (this._disposed) {
-			return true;
+			return 'skipped';
 		}
 		try {
 			this.render();
-			return true;
+			return 'ok';
 		} catch (err) {
 			const detail = err instanceof Error ? err.message : String(err);
 			console.warn(`[quantbook] cell-grid safeRender failed: ${detail}`);
-			return false;
+			return 'failed';
 		}
 	}
 
@@ -212,10 +283,23 @@ export class CellGridPanel {
 	 */
 	static activeLocalPanels(): Array<{ session: SessionInstance; sheet: number }> {
 		const result: Array<{ session: SessionInstance; sheet: number }> = [];
-		for (const instance of panels.values()) {
+		for (const instance of allPanels) {
 			result.push({ session: instance.session, sheet: instance.sheet });
 		}
 		return result;
+	}
+
+	/**
+	 * The last-focused panel's `(session, sheet)`, or `undefined` if none is focused.
+	 * **FE megaudit F2**: sheet-management / Save-As commands must target the panel
+	 * the user is actually looking at, NOT an arbitrary "oldest open panel" -- with
+	 * multiple sessions open the old pick could rename/save the WRONG workbook.
+	 */
+	static focusedLocalPanel(): { session: SessionInstance; sheet: number } | undefined {
+		if (focusedPanel === undefined || focusedPanel._disposed) {
+			return undefined;
+		}
+		return { session: focusedPanel.session, sheet: focusedPanel.sheet };
 	}
 
 	/**
@@ -380,7 +464,18 @@ export class CellGridPanel {
 		dispatchIncomingMessage(raw, {
 			session: this.session,
 			sheet: this.sheet,
-			onCommit: () => this.render(),
+			// FE megaudit M1: re-render EVERY panel of this session, not just this one.
+			// undo/redo is session-wide, and a formula edit can change dependents on a
+			// SIBLING sheet -- a panel-local render would leave those stale. A render
+			// failure is surfaced LOUD (No-Fallbacks) rather than swallowed.
+			onCommit: () => {
+				const { failed } = CellGridPanel.refreshSession(this.session);
+				if (failed > 0) {
+					void vscode.window.showWarningMessage(
+						`Quantbook: the edit committed but ${failed} cell-grid panel(s) failed to re-render. Run "Quantbook: Refresh Cell Grid".`,
+					);
+				}
+			},
 			onError: reply => {
 				// If the panel is disposed (or hidden with
 				// retainContextWhenHidden:false), `webview.postMessage` is silently
@@ -440,7 +535,7 @@ function buildShellHtml(webview: vscode.Webview, extensionUri: vscode.Uri): stri
 </head>
 <body>
 <div id="sheets-root">Loading Quantbook cell grid&hellip;</div>
-<script nonce="${nonce}" src="${scriptUri}"></script>
+<script type="module" nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
 }
