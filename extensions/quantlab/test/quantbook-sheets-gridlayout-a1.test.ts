@@ -33,6 +33,7 @@ import {
 	scrollToReveal,
 	totalContentHeight,
 	totalContentWidth,
+	truncateToWidth,
 } from '../webview/sheets-webview/gridLayoutA1';
 
 suite('FE-2-0 gridLayoutA1 -- columnLabel (bijective base-26)', function () {
@@ -252,5 +253,40 @@ suite('FE-2-0 Phase 1 -- scrollToReveal (one-axis reveal + tiny-viewport clamp)'
 		assert.strictEqual(scrollToReveal(rowY(0), ROW_HEIGHT, HEADER_HEIGHT, 0, 400), 0); // row 0 at top, visible
 		const s = scrollToReveal(rowY(40), ROW_HEIGHT, HEADER_HEIGHT, 0, 200); // far below
 		assert.strictEqual(s, rowY(40) + ROW_HEIGHT - 200);
+	});
+});
+
+// **FE-2-0 Phase 4 (2026-06-04)** -- migrated from the retired `test/quantbook-sheets-grid-layout.test.ts`
+// when `truncateToWidth` moved out of the FE-0b `gridLayout.ts` into `gridLayoutA1.ts`. Body unchanged.
+suite('FE-2-0 gridLayoutA1 -- truncateToWidth (migrated from FE-0b gridLayout)', function () {
+	// Fake monospace measurer: each char (incl. the ellipsis) is 10px wide.
+	const measure = (s: string): number => s.length * 10;
+
+	test('text that fits is returned unchanged', () => {
+		assert.strictEqual(truncateToWidth('abc', 100, measure), 'abc');
+	});
+	test('text too wide is cut to the longest prefix + ellipsis that fits', () => {
+		// '…' = 10px; longest prefix len with (len+1)*10 <= 45 is 3 -> 'abc…' (40px), 'abcd…' (50px) overflows.
+		assert.strictEqual(truncateToWidth('abcdefghij', 45, measure), 'abc…');
+	});
+	test('empty string stays empty', () => {
+		assert.strictEqual(truncateToWidth('', 100, measure), '');
+	});
+	test('when not even the ellipsis fits, returns empty', () => {
+		assert.strictEqual(truncateToWidth('abcdefghij', 5, measure), '');
+	});
+	// FE megaudit L-e (2026-06-03): never slice mid-surrogate. An astral char (emoji) is 2 UTF-16 code
+	// units; a cut between them would leave a lone high surrogate.
+	test('does not split a surrogate pair (drops the whole astral char)', () => {
+		// '😀' is 2 UTF-16 units. 'a😀bc' has length 5. measure(len)=len*10; maxWidth 35 -> largest prefix
+		// len with (len+1)*10<=35 is 2, which cuts BETWEEN the surrogate pair (units 1 and 2). The L-e
+		// backoff must drop to len 1 -> 'a…', never 'a\uD83D…'.
+		const out = truncateToWidth('a😀bc', 35, measure);
+		const beforeEllipsis = out.slice(0, -1);
+		const lastUnit = beforeEllipsis.charCodeAt(beforeEllipsis.length - 1);
+		assert.ok(
+			!(lastUnit >= 0xD800 && lastUnit <= 0xDBFF),
+			`truncated result "${out}" must not end with a lone high surrogate`,
+		);
 	});
 });

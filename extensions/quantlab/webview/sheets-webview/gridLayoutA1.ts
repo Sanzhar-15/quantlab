@@ -6,8 +6,8 @@
 /**
  * **FE-2-0 (2026-06-03) -- pure layout math for the A1 spreadsheet renderer.**
  *
- * Supersedes the FE-0b cell-LIST geometry (`gridLayout.ts`, retained as a green oracle until the
- * fast-follow retirement). The A1 grid is a real spreadsheet: a sticky **column-letter band**
+ * Supersedes (and, as of FE-2-0 Phase 4, fully REPLACES) the retired FE-0b cell-LIST geometry module
+ * `gridLayout.ts`. The A1 grid is a real spreadsheet: a sticky **column-letter band**
  * (A,B,C,…) across the top, a sticky **row-number gutter** (1,2,3,…) down the left, a **corner box**
  * at their intersection, and a full grid of fixed-size cells spanning the Excel extent
  * (`MAX_ROWS` × `MAX_COLS`). The sparse snapshot's populated cells paint at their (row,col); every
@@ -32,10 +32,50 @@
  */
 
 /**
- * Re-export the surrogate-pair-safe width-bounded truncation from the FE-0b layout module (shared,
- * not forked). When `gridLayout.ts` is retired in the fast-follow, move this function here.
+ * Truncate `text` to fit `maxWidth` px (per the injected `measure`), appending an ellipsis when it
+ * must be cut. Pure: `measure` is the only environment dependency, so this is golden-testable with
+ * a fake monospace measurer. Returns `''` if not even the ellipsis fits. Binary-searches the
+ * longest prefix whose `prefix + '…'` still fits.
+ *
+ * **FE-2-0 Phase 4 (2026-06-04):** moved here from the retired FE-0b `gridLayout.ts` (it was the only
+ * symbol that module still provided, via a re-export). Body unchanged; the surrogate-safe backoff is
+ * the FE megaudit L-e fix.
  */
-export { truncateToWidth } from './gridLayout';
+export function truncateToWidth(text: string, maxWidth: number, measure: (s: string) => number): string {
+	if (text === '') {
+		return '';
+	}
+	if (measure(text) <= maxWidth) {
+		return text;
+	}
+	const ellipsis = '…';
+	if (measure(ellipsis) > maxWidth) {
+		return '';
+	}
+	let lo = 0;
+	let hi = text.length;
+	// Largest `len` with measure(text.slice(0,len) + '…') <= maxWidth.
+	while (lo < hi) {
+		const mid = Math.ceil((lo + hi) / 2);
+		if (measure(text.slice(0, mid) + ellipsis) <= maxWidth) {
+			lo = mid;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	// FE megaudit L-e: don't slice mid-surrogate. `text.length` counts UTF-16 code units, so a cut at
+	// `lo` could land BETWEEN a high+low surrogate of an astral character (emoji, etc.), leaving a lone
+	// high surrogate that renders as the replacement glyph. If the last kept code unit is a high
+	// surrogate (0xD800-0xDBFF) followed by a low surrogate, back off one unit to drop the whole pair.
+	if (lo > 0 && lo < text.length) {
+		const lastKept = text.charCodeAt(lo - 1);
+		const nextDropped = text.charCodeAt(lo);
+		if (lastKept >= 0xD800 && lastKept <= 0xDBFF && nextDropped >= 0xDC00 && nextDropped <= 0xDFFF) {
+			lo -= 1;
+		}
+	}
+	return text.slice(0, lo) + ellipsis;
+}
 
 /** Pixel width of one data column (Excel default ~64px). */
 export const COL_WIDTH = 64;

@@ -7,8 +7,8 @@
  * **FE-0b (2026-06-02) -- pure value/window helpers for the bundled sheets webview.**
  *
  * `formatCellValue` (value-default display string) and `computeVisibleRowRange` (the scroll
- * window) are shared by the Canvas2D renderer (`canvasGrid.ts`) and the layout math
- * (`gridLayout.ts`). FE-0b-1's DOM-table-only helpers (`renderRowsHtml`, `escapeHtml`) were
+ * window) are the value/row-window helpers consumed by the Canvas2D renderer (`canvasGrid.ts`) and
+ * the A1 layout math (`gridLayoutA1.ts`). FE-0b-1's DOM-table-only helpers (`renderRowsHtml`, `escapeHtml`) were
  * removed in FE-0b-2 when the canvas replaced the DOM table -- canvas text is drawn directly, so
  * there is no HTML-escaping / attribute-contract surface.
  *
