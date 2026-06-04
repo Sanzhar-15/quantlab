@@ -50,6 +50,7 @@ import {
 	cellContentRect,
 	colX,
 	hitTestViewport,
+	isInExtent,
 	rowY,
 	scrollToReveal,
 	totalContentHeight,
@@ -114,7 +115,8 @@ root.innerHTML =
 	'<div class="cell-grid-viewport" id="sheets-viewport" tabindex="0">' +
 	'<div id="sheets-spacer"></div>' +
 	'<canvas id="sheets-canvas"></canvas>' +
-	'<input id="sheets-edit-input" class="cell-edit-input" type="text" aria-label="Edit cell value" hidden />' +
+	'<input id="sheets-edit-input" class="cell-edit-input" type="text" aria-label="Edit cell value" ' +
+	'spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" hidden />' +
 	'</div>';
 
 const titleEl = document.getElementById('sheets-title') as HTMLElement;
@@ -187,6 +189,17 @@ interface EditState {
 	commitId?: number;
 	// Where to move the selection once THIS commit's matching commitResult arrives (Enter=down, Tab=right).
 	navAfterCommit?: { dr: number; dc: number };
+	// **Megaudit (B2, 2026-06-04)**: the rawInput value of the LAST commit that FAILED (set on a matching
+	// `errorReply`). While the editor still holds exactly this string (the user hasn't edited it), a nav key
+	// (arrow / Tab / Enter) ABANDONS the edit + navigates instead of re-posting the same failing value --
+	// so the user can leave a known-bad cell with the keys they reach for, and Tab can never re-fail-loop.
+	// Cleared on any real input edit (so "edited then typed back to the same string" still commits).
+	lastFailedRawInput?: string;
+	// **Megaudit re-audit (HIGH, 2026-06-04)**: the rawInput posted by the in-flight commit. After the
+	// watchdog (or a malformed render) recovers a stalled commit and the user types a correction, a
+	// genuinely-LATE success ack must NOT close the editor + discard that typing -- `resolvePendingCommit`
+	// only honors a late ack when `inputEl.value` still equals this submitted value.
+	submittedRawInput?: string;
 }
 let editState: EditState | null = null;
 // FE-2-0 Phase 2: monotonic source of per-commit ids (never reused within a webview lifetime).
@@ -212,6 +225,8 @@ function armCommitWatchdog(commitId: number): void {
 		if (editState !== null && editState.pendingCommit && editState.commitId === commitId) {
 			editState.pendingCommit = false; // un-stick: re-arm Escape / blur / re-edit
 			editState.navAfterCommit = undefined;
+			inputEl.readOnly = false; // megaudit H1/MED: unlock + refocus so the user can act on the un-stuck editor
+			inputEl.focus();
 			showError(
 				'The edit could not be confirmed by the host (no response). It may or may not have been ' +
 				'saved -- check the cell value, then press Escape or re-enter it.',
@@ -362,6 +377,29 @@ function setActiveClamped(row: number, col: number): void {
 	ensureActiveVisible();
 }
 
+/** **Megaudit (B2)** -- the selection delta for a commit/nav key, or `null` for any other key. Enter and
+ * Tab always carry a vector (they commit+move); the arrow keys carry one too, but the editor only ACTS on
+ * an arrow when leaving a known-bad cell (see the input keydown handler) -- a normal edit keeps arrows as
+ * text-caret movement. Escape is handled separately (cancel). */
+function navVector(key: string, shift: boolean): { dr: number; dc: number } | null {
+	switch (key) {
+		case 'Enter':
+			return { dr: 1, dc: 0 }; // Excel: Enter commits + moves down
+		case 'Tab':
+			return { dr: 0, dc: shift ? -1 : 1 }; // Tab right, Shift+Tab left
+		case 'ArrowUp':
+			return { dr: -1, dc: 0 };
+		case 'ArrowDown':
+			return { dr: 1, dc: 0 };
+		case 'ArrowLeft':
+			return { dr: 0, dc: -1 };
+		case 'ArrowRight':
+			return { dr: 0, dc: 1 };
+		default:
+			return null;
+	}
+}
+
 /** Audit O2-MED3: clear the active cell (Delete/Backspace when NOT editing). The host classifies an
  * empty `rawInput` as `{ kind: 'blank' }` = clear (`cellGridLogic.classifyCellInput`), so this reuses
  * the coordinate-addressed putValue path -- no editState involved (we are not in an edit). */
@@ -392,16 +430,19 @@ function beginEdit(row: number, col: number, initialChar?: string): void {
 	if (editState !== null) {
 		cancelEdit();
 	}
+	// Select + reveal the cell on ANY entry point (click / F2 / type-to-edit). Megaudit MED-1 (re-audit):
+	// this MUST happen BEFORE the oversize bail below -- a CLICK on an over-length cell still SELECTS it (the
+	// editor just doesn't open). For F2/type the cell is already active, so this is a no-op there.
 	active = { row, col };
 	// Audit O2-MED2: F2 / type-to-edit on a scrolled-away active cell must bring it into view first,
 	// otherwise the overlay editor opens off-screen (content-layer child positioned at the cell rect).
 	ensureActiveVisible();
 	const entry = renderer.entryAt(row, col);
-	// Compute the pre-fill BEFORE touching the DOM. Re-audit HIGH-2: a malformed/drifted snapshot can
-	// carry a multi-MB value/formula; assigning it to `inputEl.value` + `select()` would freeze the
-	// webview (the canvas measure path is capped, but the editor is a real <input>). Such a value also
-	// could never be committed (the host + client cap rawInput at MAX_RAW_INPUT_LENGTH). So we refuse to
-	// open the editor and surface a visible error -- No-Fallbacks: we do NOT silently truncate the value.
+	// Compute the pre-fill. Re-audit HIGH-2: a malformed/drifted snapshot can carry a multi-MB value/formula;
+	// assigning it to `inputEl.value` + `select()` would freeze the webview (the canvas measure path is
+	// capped, but the editor is a real <input>). Such a value also could never be committed (the host +
+	// client cap rawInput at MAX_RAW_INPUT_LENGTH). So we refuse to OPEN the editor (the cell stays selected
+	// + revealed) and surface a visible error -- No-Fallbacks: we never silently truncate the value.
 	let prefill: string;
 	if (initialChar !== undefined) {
 		prefill = initialChar; // type-to-edit: a single char, never oversize
@@ -412,19 +453,21 @@ function beginEdit(row: number, col: number, initialChar?: string): void {
 		prefill = ''; // empty cell
 	}
 	if (prefill.length > MAX_RAW_INPUT_LENGTH) {
+		// The cell IS now selected + revealed; we just won't open the editor. (No "selection unchanged"
+		// claim -- a click here moves the selection; only F2/type leave it where it was.)
 		showError(
 			`This cell's value is ${prefill.length} characters, over the ${MAX_RAW_INPUT_LENGTH}-character ` +
-			`editable limit, so it cannot be edited here. (The cell selection is unchanged.)`,
+			`editable limit, so it cannot be edited here.`,
 			'transient',
 		);
-		redraw();
-		return; // leave the cell selected (active set above) but do NOT open the editor
+		return; // do NOT open the editor (the cell is selected + scrolled into view)
 	}
 	const rect = cellContentRect(row, col, renderer.gutterWidthPx);
 	inputEl.style.left = rect.x + 'px';
 	inputEl.style.top = rect.y + 'px';
 	inputEl.style.width = rect.width + 'px';
 	inputEl.style.height = rect.height + 'px';
+	inputEl.readOnly = false; // megaudit H1: a fresh editor is editable (a prior pending edit set readOnly)
 	inputEl.value = prefill;
 	inputEl.hidden = false;
 	editState = { row, col, entry, pendingCommit: false };
@@ -432,6 +475,8 @@ function beginEdit(row: number, col: number, initialChar?: string): void {
 	if (initialChar === undefined) {
 		inputEl.select();
 	}
+	// NOTE: the call sites (click / F2 / type-to-edit) redraw() right after beginEdit to move the
+	// selection box; beginEdit itself does not, to avoid a double paint.
 }
 
 function cancelEdit(): void {
@@ -441,6 +486,7 @@ function cancelEdit(): void {
 	editState = null;
 	inputEl.hidden = true;
 	inputEl.value = '';
+	inputEl.readOnly = false; // megaudit H1: clear the pending-commit lock so the next editor is editable
 	clearCommitWatchdog(); // the editor is gone -- no pending commit to recover (re-audit HIGH)
 	clearError(); // closing the editor resolves any 'edit'-source banner (re-audit MED-4)
 }
@@ -484,6 +530,11 @@ function commitEdit(nav?: { dr: number; dc: number }): void {
 	editState.pendingCommit = true;
 	editState.commitId = commitId;
 	editState.navAfterCommit = nav;
+	editState.lastFailedRawInput = undefined; // megaudit B2: this is a fresh attempt, not the known-bad value
+	editState.submittedRawInput = inputEl.value; // re-audit HIGH: the value posted (for the late-ack guard)
+	// Megaudit H1: lock the input while the commit is in flight, so a keystroke before the ack can't be
+	// silently discarded when `resolvePendingCommit` closes the editor. Unlocked on resolve/error/cancel/watchdog.
+	inputEl.readOnly = true;
 	armCommitWatchdog(commitId); // re-audit HIGH: recover the editor if no commitResult/errorReply arrives
 	// Pessimistic: keep the input visible/focused until the host responds. FE-2-0 Phase 2: resolution is
 	// now driven ONLY by a matching `commitResult` (success -> resolvePendingCommit hides the editor +
@@ -499,6 +550,13 @@ inputEl.addEventListener('input', () => {
 	if (errorSource === 'edit' && inputEl.value.length <= MAX_RAW_INPUT_LENGTH) {
 		clearError();
 	}
+	// Megaudit re-audit LOW: ANY real edit clears the "known-bad" marker, so a value the user changed (even
+	// if changed back to the exact failed string) commits normally on Enter/Tab instead of being treated as
+	// "still bad" and abandoned. The arrow/Tab "leave a bad cell" affordance only applies to an UNTOUCHED
+	// failure (the moment after it fails); once you start correcting, arrows are caret + Enter commits.
+	if (editState !== null) {
+		editState.lastFailedRawInput = undefined;
+	}
 });
 inputEl.addEventListener('keydown', ev => {
 	// Audit MED-4: while an IME composition is active, Enter/Tab ACCEPT the candidate -- they must not
@@ -506,24 +564,56 @@ inputEl.addEventListener('keydown', ev => {
 	if (ev.isComposing || ev.keyCode === 229) {
 		return;
 	}
-	if (ev.key === 'Enter') {
-		ev.preventDefault();
-		commitEdit({ dr: 1, dc: 0 }); // Excel: Enter commits + moves down
-	} else if (ev.key === 'Tab') {
-		ev.preventDefault();
-		commitEdit({ dr: 0, dc: ev.shiftKey ? -1 : 1 }); // Tab commits + moves right (Shift+Tab left)
-	} else if (ev.key === 'Escape') {
+	if (editState === null) {
+		return;
+	}
+	if (ev.key === 'Escape') {
 		ev.preventDefault();
 		// Audit O2-MED1: Escape is inert while a commit is in flight (matches commitEdit/blur). Cancelling
 		// here would NOT recall the already-posted putValue but WOULD wipe editState -- enabling a
 		// same-cell double-put and dropping the host's pending reply on the floor.
-		if (editState !== null && editState.pendingCommit) {
+		if (editState.pendingCommit) {
 			return;
 		}
 		cancelEdit();
 		redraw();
 		viewportEl.focus();
+		return;
 	}
+	if (editState.pendingCommit) {
+		// A commit is in flight: the input is readOnly. Megaudit re-audit MED: SWALLOW nav/commit keys so
+		// Tab can't tab-order focus OUT of the readOnly input (blur is ignored while pending + the document
+		// handler is dead while editing -> the keyboard would be stranded). Inert until the host replies.
+		if (navVector(ev.key, ev.shiftKey) !== null) {
+			ev.preventDefault();
+		}
+		return;
+	}
+	const vec = navVector(ev.key, ev.shiftKey);
+	if (vec === null) {
+		return; // a normal editing key -- let the <input> handle it
+	}
+	// **Megaudit B2**: if the editor still holds exactly the value that just FAILED to commit, the user is
+	// trying to leave a known-bad cell. ABANDON the edit + navigate on ANY nav key (arrow / Tab / Enter) --
+	// never re-post the same failing value (that was the Tab re-fail loop). A CHANGED value falls through
+	// and commits (the user fixed it). This is what lets arrows AND Tab "get you out" of a bad formula.
+	if (editState.lastFailedRawInput !== undefined && inputEl.value === editState.lastFailedRawInput) {
+		ev.preventDefault();
+		const { row, col } = editState;
+		cancelEdit();
+		setActiveClamped(row + vec.dr, col + vec.dc);
+		redraw();
+		viewportEl.focus();
+		return;
+	}
+	if (ev.key.startsWith('Arrow')) {
+		// A normal (not-known-bad) edit: arrows move the text caret inside the <input>. (Excel's
+		// "enter-mode" arrows-commit-and-move is a deliberate follow-up -- it changes how every edit feels
+		// and warrants its own behavioral smoke; not folded into this fix.)
+		return;
+	}
+	ev.preventDefault();
+	commitEdit(vec); // Enter = commit + down; Tab = commit + right (Shift+Tab left)
 });
 inputEl.addEventListener('blur', () => {
 	// Conservative: blur cancels an UNcommitted edit; a pending commit waits for the host's reply.
@@ -715,6 +805,13 @@ function applyRender(snapshot: QuantbookCellSnapshot): void {
 	fullSnapshot = snapshot;
 	renderer.setSnapshot(snapshot);
 
+	// Megaudit MED: `errorCells` is keyed by (row,col) for the CURRENT sheet only. Clear it when the
+	// snapshot's sheet changes (a Switch Sheet), else a failed A1 on sheet 0 would keep tinting A1 after
+	// switching to sheet 1. (A sheet change also makes `diffSnapshotsA1` return null -> full redraw below.)
+	if (prevSnapshot !== null && prevSnapshot.sheet !== snapshot.sheet) {
+		errorCells.clear();
+	}
+
 	// Audit LOW-3: do NOT refreshTheme() here -- a render is not a theme change. Theme/font changes are
 	// handled by the body-class MutationObserver (and the initial read is in the renderer constructor);
 	// refreshing per render needlessly cleared the measure cache + recomputed the gutter every snapshot.
@@ -755,7 +852,17 @@ function applyRender(snapshot: QuantbookCellSnapshot): void {
  * non-matching id (a stale ack / an ack for a different in-flight edit).
  */
 function resolvePendingCommit(commitId: number): void {
-	if (editState === null || !editState.pendingCommit || editState.commitId !== commitId) {
+	// Megaudit MED: match on commitId EVEN IF `pendingCommit` was already cleared by the 10s watchdog -- a
+	// genuinely-late success ack must still close the editor + apply the nav (the prior `!pendingCommit`
+	// guard dropped it on the floor, leaving the editor open under a false "could not confirm" banner).
+	if (editState === null || editState.commitId !== commitId) {
+		return;
+	}
+	// Re-audit HIGH: if the watchdog (or a malformed-render) already recovered this edit (`pendingCommit`
+	// cleared) and the user has since typed a correction, a genuinely-LATE success ack must NOT close the
+	// editor + discard that typing. Only honor a late ack when the editor still shows the submitted value.
+	// (On the normal fast path `pendingCommit` is still true, so this is skipped.)
+	if (!editState.pendingCommit && inputEl.value !== editState.submittedRawInput) {
 		return;
 	}
 	clearCommitWatchdog(); // resolved -- cancel the recovery net (cancelEdit below also clears it)
@@ -768,6 +875,7 @@ function resolvePendingCommit(commitId: number): void {
 		setActiveClamped(row + nav.dr, col + nav.dc);
 	}
 	redraw();
+	viewportEl.focus(); // megaudit LOW: keep keyboard focus on the grid so arrow-nav continues after a commit
 }
 
 window.addEventListener('message', (event: MessageEvent) => {
@@ -788,10 +896,22 @@ window.addEventListener('message', (event: MessageEvent) => {
 			// snapshot, but we MUST release the editor from `pendingCommit` so Escape/blur/re-edit work
 			// again (otherwise the editor is permanently uncancellable). The commit's true fate is unknown
 			// -- the banner says the update was dropped; the user can re-check + re-commit.
-			if (editState !== null && editState.pendingCommit) {
-				editState.pendingCommit = false;
-				editState.navAfterCommit = undefined;
-				clearCommitWatchdog(); // we un-stuck manually -- the watchdog is no longer needed
+			if (editState !== null) {
+				// Re-audit #2/#3 MED: a malformed render means the grid is STALE (this snapshot was dropped),
+				// unlike the watchdog case (where the valid render already arrived). CLEAR the commit token
+				// UNCONDITIONALLY -- whether the commit is still pending OR was already recovered by the
+				// watchdog (pendingCommit already false) -- so NO genuinely-late `commitResult`/`errorReply`
+				// can auto-close the editor (which would clear this "grid was not updated" warning + mask the
+				// stale grid). The editor stays open with the warning; the user re-commits (fresh commitId)
+				// or Escapes. The pending-specific un-stick stays conditional on `pendingCommit`.
+				editState.commitId = undefined;
+				editState.submittedRawInput = undefined;
+				if (editState.pendingCommit) {
+					editState.pendingCommit = false;
+					editState.navAfterCommit = undefined;
+					inputEl.readOnly = false; // megaudit H1: unlock the editor we just un-stuck
+					clearCommitWatchdog(); // we un-stuck manually -- the watchdog is no longer needed
+				}
 			}
 			return;
 		}
@@ -800,32 +920,60 @@ window.addEventListener('message', (event: MessageEvent) => {
 	}
 	if (msg.type === 'commitResult') {
 		// FE-2-0 Phase 2: the host's success ack for a tokened commit -- resolve exactly that edit.
+		// Megaudit MED: require `ok === true` AND an integer commitId -- a `{ ok:false }` or NaN-id ack must
+		// NOT resolve an edit as successful (it would close the editor + nav as if the write landed).
 		const cr = msg as CommitResultMessage;
-		if (typeof cr.commitId === 'number') {
+		if (cr.ok === true && typeof cr.commitId === 'number' && Number.isInteger(cr.commitId)) {
 			resolvePendingCommit(cr.commitId);
 		} else {
-			// Re-audit HIGH: a malformed ack (version skew / tamper) must NOT be silently dropped -- it
-			// would leave the editor pending until the watchdog fires. Surface it (No-Fallbacks).
-			console.warn('[sheets-webview] commitResult with non-numeric commitId ignored:', cr);
+			// A malformed ack (version skew / tamper) must NOT be silently dropped -- surface it (No-Fallbacks).
+			// The editor stays pending until the watchdog recovers it.
+			console.warn('[sheets-webview] ignored a malformed commitResult (need ok:true + integer commitId):', cr);
 		}
 		return;
 	}
 	if (msg.type === 'errorReply') {
 		const er = msg as ErrorReplyMessage;
 		const prevErrorKeys = new Set(errorCells.keys()); // Phase 3: for the error-tint flip diff
-		errorCells.set(Number(er.row) + ',' + Number(er.col), '[' + String(er.code) + '] ' + String(er.message));
+		// Megaudit MED + re-audit LOW: only tint when sheet/row/col are REAL integers (NOT `Number()`-coerced
+		// -- `''`/`null` would coerce to 0 and wrongly tint A1) AND the sheet is the CURRENT one AND the coord
+		// is in the A1 extent. A stale/cross-sheet/malformed reply must never tint. The un-stick below is
+		// independent of whether we tint (it keys only on commitId).
+		const tintable =
+			fullSnapshot !== null &&
+			typeof er.sheet === 'number' && er.sheet === fullSnapshot.sheet &&
+			typeof er.row === 'number' && typeof er.col === 'number' &&
+			isInExtent(er.row, er.col);
+		if (tintable) {
+			errorCells.set(er.row + ',' + er.col, '[' + String(er.code) + '] ' + String(er.message));
+		}
 		// FE-2-0 Phase 2: un-stick the in-flight edit ONLY when the reply's commitId matches THIS edit's
 		// token (replaces the M8 (sheet,row,col) match -- a unique token can't collide). The matched edit
 		// stays OPEN for correction + re-commit; the cell is decorated above regardless of the match.
+		// Match the normal in-flight case (pendingCommit) OR a genuinely-LATE failure after the watchdog
+		// recovered the edit, but ONLY if the user hasn't edited since submit (re-audit #2 LOW -- mirrors
+		// the success-ack guard in resolvePendingCommit). A late error on an edited value just tints; an
+		// edit recovered via a MALFORMED render cleared its commitId above, so it won't match here either.
 		if (
 			editState !== null &&
-			editState.pendingCommit &&
 			typeof er.commitId === 'number' &&
-			editState.commitId === er.commitId
+			editState.commitId === er.commitId &&
+			(editState.pendingCommit || inputEl.value === editState.submittedRawInput)
 		) {
 			editState.pendingCommit = false;
 			editState.navAfterCommit = undefined; // the commit failed -- do not advance the selection
+			editState.lastFailedRawInput = inputEl.value; // megaudit B2: a nav key may now leave the bad cell
+			inputEl.readOnly = false; // H1: unlock for correction
 			clearCommitWatchdog(); // the host responded (with a failure) -- no recovery needed
+			// Megaudit B2: refocus + select so a retype REPLACES the bad value, and surface the way out
+			// (the user reflexively tries arrows/Tab -- those now leave the cell; spell it out anyway).
+			inputEl.focus();
+			inputEl.select();
+			showError(
+				'Cell rejected -- [' + String(er.code) + '] ' + String(er.message) +
+				'. Fix it and press Enter, or press Esc / an arrow key to discard.',
+				'edit',
+			);
 		}
 		// **FE-2-0 Phase 3** -- damage only the rows whose error tint FLIPPED (the rare failed-edit path),
 		// at the same scroll; else full `redraw()`. Re-erroring an already-tinted cell flips nothing -> []
@@ -843,16 +991,26 @@ window.addEventListener('message', (event: MessageEvent) => {
 	console.warn('[sheets-webview] unknown inbound message type:', msg.type);
 });
 
-// Repaint on scroll (full redraw; rAF-coalesced). The content-anchored input scrolls with the content.
-// Audit MED-5 (known FE-2-0 limitation): the overlay `<input>` is a content-layer child, so scrolling
-// WHILE editing can slide it visually over the sticky header/gutter (it commits to the right cell -- not
-// data-losing -- it just overlaps the bands). The proper fix (clip the editor to the body pane / hide it
-// when its cell moves under a band) is FE-2-proper; editing normally pins the view (you clicked the cell).
-viewportEl.addEventListener('scroll', scheduleRedraw);
+// **Megaudit B1**: pin the canvas to the viewport SYNCHRONOUSLY on every scroll event. The canvas is an
+// absolutely-positioned child of the scroller, so it scrolls natively with the content; the compensating
+// `translate(scrollLeft, scrollTop)` MUST be written in the scroll event, not deferred to the rAF -- else
+// the sticky header/gutter (painted at canvas-local 0) lag the native scroll by up to one frame and visibly
+// shake. The expensive blit/redraw stays rAF-coalesced via scheduleRedraw (the body's <=1-frame latency is
+// imperceptible; a jittering sticky band is not). The content-anchored `<input>` scrolls with the content.
+// Audit MED-5 (known FE-2-0 limitation, deferred): the overlay `<input>` is a content-layer child, so
+// scrolling WHILE editing can slide it over the sticky bands (it still commits to the right cell -- not
+// data-losing). Clipping the editor to the body pane is FE-2-proper.
+viewportEl.addEventListener('scroll', () => {
+	applyCanvasTransform(viewportEl.scrollTop, viewportEl.scrollLeft);
+	scheduleRedraw();
+});
 
-// Full redraw on viewport resize.
+// Repaint on viewport resize. Megaudit (Opus-1): route through the SAME coalescing scheduler as scroll so a
+// simultaneous resize+scroll is ONE rAF, not two competing repaints. `scrollRedraw` resize()s first and
+// falls back to a full draw whenever the backing store changed (it does on a real resize), so a pure resize
+// still fully repaints; a same-size "resize" with no scroll delta cleanly no-ops to a full draw.
 if (typeof ResizeObserver !== 'undefined') {
-	new ResizeObserver(() => redraw()).observe(viewportEl);
+	new ResizeObserver(() => scheduleRedraw()).observe(viewportEl);
 }
 
 // Full redraw on theme change: refresh the cached palette/fonts/gutter, reposition an open editor (the
