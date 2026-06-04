@@ -13,11 +13,12 @@
  * **selection box**. Geometry comes from the pure `gridLayoutA1.ts`; values format via
  * `cellRender.formatCellValue`.
  *
- * **Full redraw only.** FE-2-0 repaints the whole visible window on every scroll/commit (the blit +
- * damage-clip partial-redraw machinery from FE-0b-4/5 is entry-index-keyed and does not map to A1
- * coordinates -- it returns as a clean `gridBlitA1.ts` fast-follow). A full draw paints only the
- * bounded visible window (~viewport rows × cols), and empty cells are gridlines-only (no `fillText`),
- * so it is a few hundred ops per frame -- imperceptible at FE-2-0 scale.
+ * **Paint paths.** {@link draw} is the always-correct full redraw of the visible window (~viewport
+ * rows × cols; empty cells are gridlines-only, so a few hundred ops per frame). FE-2-0 Phase 3 adds two
+ * partial-redraw fast paths over it, driven by the pure `gridBlitA1.ts` math: {@link drawScroll}
+ * (self-blit the overlap of a pure-axis scroll, repaint only the exposed strip) and {@link drawDamage}
+ * (repaint only the A1 rows whose snapshot/error state changed). Both fall back to a full {@link draw}
+ * whenever the pure math returns `null`, and `DEBUG_BLIT_VERIFY` checks partial==full pixel-for-pixel.
  *
  * DOM/canvas-touching -- not unit-tested (no headless 2D context); the pure layout math is golden-
  * tested in `gridLayoutA1.ts` and the drawing is covered by the behavioral smoke + the closure audit.
@@ -25,6 +26,7 @@
 
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { clampDisplayString, computeVisibleRowRange, formatCellValue, isRenderableValue } from './cellRender';
+import type { ScrollBlit } from './gridBlitA1';
 import {
 	COL_WIDTH,
 	HEADER_HEIGHT,
@@ -44,6 +46,20 @@ const CELL_PAD = 8;
 const OVERSCAN = 2;
 const MEASURE_CACHE_MAX = 5000;
 const SELECTION_BORDER_PX = 2;
+
+/**
+ * **FE-2-0 Phase 3 (2026-06-04)** -- when true, every partial paint ({@link CanvasGridRenderer.drawScroll}
+ * / {@link CanvasGridRenderer.drawDamage}) is followed by a full repaint and a pixel-for-pixel compare;
+ * any mismatch is `console.error`-ed LOUD (No-Fallbacks: a blit/damage that diverges from the full draw
+ * is a BUG, surfaced, never silently shipped). Off in production (the verify defeats the optimization +
+ * uses `getImageData`); a developer flips it to validate the partial paths against the full-draw oracle.
+ */
+const DEBUG_BLIT_VERIFY = false;
+
+/** One extra CSS px padded around a damage band's clip so a fractional `rowY-scrollTop` (the renderer
+ * rounds paint origins) can never leave a sub-pixel sliver of the band's edge unpainted. Over-painting
+ * 1px into an adjacent row is idempotent (that row repaints to its identical current value). */
+const DAMAGE_CLIP_PAD = 1;
 
 /** The active (selected) cell. */
 export interface ActiveCell {
@@ -223,6 +239,18 @@ export class CanvasGridRenderer {
 		return this.dpr;
 	}
 
+	/**
+	 * **FE-2-0 Phase 3 (re-audit / Opus LOW-1)** -- true when the live `devicePixelRatio` no longer matches
+	 * the backing store's scale: a monitor-density change that did NOT change the CSS viewport size, so
+	 * neither `resize()` nor the ResizeObserver ran. The damage fast paths (`applyRender` / `errorReply`)
+	 * skip `resize()`, so they consult this and fall back to a full `redraw()` -- which re-resolves the dpr
+	 * + rebuilds the backing store -- rather than paint at the stale scale (parity with the pre-Phase-3
+	 * always-resize-on-render model). The scroll path already `resize()`s, so it self-corrects.
+	 */
+	get backingScaleStale(): boolean {
+		return this.dpr !== CanvasGridRenderer.resolveDpr();
+	}
+
 	/** Re-read theme palette + fonts (call on snapshot push + on a body-class/theme change). */
 	refreshTheme(): void {
 		this.palette = this.readPalette();
@@ -264,6 +292,151 @@ export class CanvasGridRenderer {
 		this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
 		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active);
 		this.hasPaintedOnce = true;
+	}
+
+	/**
+	 * **FE-2-0 Phase 3** -- blit-scroll fast path. Reuse the overlapping pixels of the previous frame
+	 * via a self-`drawImage` (the `blit.copy` rect, DEVICE px, identity transform), then repaint only
+	 * the newly-exposed `blit.damageRects` (CSS px, dpr transform, clipped). `blit` MUST come from
+	 * {@link computeScrollBlitA1} for the SAME `scrollTop/scrollLeft` passed here -- the caller computes
+	 * it from the prev/next scroll state and only reaches this method when the math returned non-null.
+	 * The sticky header (vertical scroll) / gutter+corner (horizontal scroll) are neither copied nor
+	 * damaged, so they are preserved exactly from the previous frame.
+	 */
+	drawScroll(
+		blit: ScrollBlit,
+		cssWidth: number,
+		cssHeight: number,
+		scrollTop: number,
+		scrollLeft: number,
+		errorCells: ReadonlyMap<string, string>,
+		active: ActiveCell | null,
+	): void {
+		const ctx = this.ctx;
+		const c = blit.copy;
+		// 1. Self-blit the overlap in DEVICE px (identity transform). Source/dest overlap within the same
+		// canvas is well-defined (the spec reads the full source region first).
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.drawImage(this.canvas, c.sx, c.sy, c.sw, c.sh, c.dx, c.dy, c.dw, c.dh);
+		// 2. Repaint the exposed strip(s) in CSS px (dpr transform), clipped to each rect. paintWindow is
+		// the SAME source of pixels as a full draw, so the strip is identical to a full redraw there.
+		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+		for (const d of blit.damageRects) {
+			ctx.save();
+			ctx.beginPath();
+			ctx.rect(d.x, d.y, d.width, d.height);
+			ctx.clip();
+			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active);
+			ctx.restore();
+		}
+		this.hasPaintedOnce = true;
+		if (DEBUG_BLIT_VERIFY) {
+			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, 'drawScroll');
+		}
+	}
+
+	/**
+	 * **FE-2-0 Phase 3** -- damage-clip fast path. Repaint ONLY the given A1 `rows` (their full-width
+	 * bands), clipped to the union of those bands so the rest of the frame is preserved. Contiguous rows
+	 * merge into one band; the clip is built as a single multi-rect path (one `paintWindow`, not one per
+	 * row). Used by `applyRender` (snapshot diff) at the SAME scroll the previous frame painted -- the
+	 * caller gates on `painted` + scroll-unchanged, since a damage paint assumes the un-damaged pixels are
+	 * already correct at the current offset. A no-op for an empty `rows`.
+	 */
+	drawDamage(
+		rows: readonly number[],
+		cssWidth: number,
+		cssHeight: number,
+		scrollTop: number,
+		scrollLeft: number,
+		errorCells: ReadonlyMap<string, string>,
+		active: ActiveCell | null,
+	): void {
+		if (rows.length === 0) {
+			return;
+		}
+		const ctx = this.ctx;
+		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+		ctx.save();
+		ctx.beginPath();
+		// Sort + merge contiguous rows into bands so far-apart changes do NOT clip a giant bounding box
+		// (the clip is the UNION of the per-band rects, not their hull).
+		const sorted = [...rows].sort((a, b) => a - b);
+		let runStart = sorted[0];
+		let runEnd = sorted[0];
+		const addBand = (r0: number, r1: number): void => {
+			const yTop = rowY(r0) - scrollTop;
+			const h = (r1 - r0 + 1) * ROW_HEIGHT;
+			// Pad so the rounded paint origins sit fully inside the clip (see DAMAGE_CLIP_PAD).
+			ctx.rect(0, yTop - DAMAGE_CLIP_PAD, cssWidth, h + DAMAGE_CLIP_PAD * 2);
+		};
+		for (let i = 1; i < sorted.length; i += 1) {
+			if (sorted[i] === runEnd + 1) {
+				runEnd = sorted[i];
+				continue;
+			}
+			if (sorted[i] === runEnd) {
+				continue; // duplicate row index
+			}
+			addBand(runStart, runEnd);
+			runStart = sorted[i];
+			runEnd = sorted[i];
+		}
+		addBand(runStart, runEnd);
+		ctx.clip();
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active);
+		ctx.restore();
+		this.hasPaintedOnce = true;
+		if (DEBUG_BLIT_VERIFY) {
+			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, 'drawDamage');
+		}
+	}
+
+	/**
+	 * **FE-2-0 Phase 3 / `DEBUG_BLIT_VERIFY`** -- capture the just-produced partial frame, full-repaint
+	 * over it, and compare pixel-for-pixel; `console.error` LOUD on ANY divergence (with the first
+	 * differing device pixel). The canvas is left in the correct full-draw state. Dev-only: `getImageData`
+	 * is unavailable headlessly + the full repaint defeats the optimization. The pure blit/damage MATH is
+	 * golden-tested in `gridBlitA1.ts`; this guards the renderer's wiring of it.
+	 */
+	private verifyAgainstFull(
+		cssWidth: number,
+		cssHeight: number,
+		scrollTop: number,
+		scrollLeft: number,
+		errorCells: ReadonlyMap<string, string>,
+		active: ActiveCell | null,
+		path: string,
+	): void {
+		const ctx = this.ctx;
+		const bw = this.canvas.width;
+		const bh = this.canvas.height;
+		const partial = ctx.getImageData(0, 0, bw, bh);
+		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active);
+		const full = ctx.getImageData(0, 0, bw, bh);
+		const pa = partial.data;
+		const fu = full.data;
+		let diffs = 0;
+		let firstX = -1;
+		let firstY = -1;
+		for (let i = 0; i < pa.length; i += 4) {
+			if (pa[i] !== fu[i] || pa[i + 1] !== fu[i + 1] || pa[i + 2] !== fu[i + 2] || pa[i + 3] !== fu[i + 3]) {
+				diffs += 1;
+				if (firstX < 0) {
+					const px = i / 4;
+					firstX = px % bw;
+					firstY = Math.floor(px / bw);
+				}
+			}
+		}
+		if (diffs > 0) {
+			console.error(
+				`[sheets-webview] DEBUG_BLIT_VERIFY: ${path} produced a frame that differs from a full redraw ` +
+				`by ${diffs} device px (first at ${firstX},${firstY}). The partial-paint path is INCORRECT for ` +
+				`this input -- it must return null/[] and fall back to a full draw.`,
+			);
+		}
 	}
 
 	/**

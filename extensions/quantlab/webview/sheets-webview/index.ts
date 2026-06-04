@@ -18,9 +18,11 @@
  * scroll offset to overlay the viewport (redrawn on scroll), and an absolute `#sheets-edit-input` in
  * the scroller's CONTENT layer (so it tracks scroll naturally).
  *
- * **Full redraw only** (FE-2-0): every scroll / commit / nav repaints the whole visible window. The
- * FE-0b-4/5 blit + damage-clip machinery is entry-index-keyed and returns as a `gridBlitA1.ts`
- * fast-follow.
+ * **Paint paths** (FE-2-0 Phase 3): a scroll takes the blit fast path ({@link scrollRedraw} -> the
+ * renderer's `drawScroll`); a commit `render` / failed `errorReply` damages only the changed A1 rows
+ * (`diffSnapshotsA1` / `errorRowsFlippedA1` -> the renderer's `drawDamage`); nav / type / resize / theme
+ * full-`redraw()`. The pure blit + damage math lives in `gridBlitA1.ts`; a full redraw is always the
+ * correct fallback (taken whenever the pure math declines, or the scroll/size changed since last paint).
  *
  * Wire protocol (**FE-2-0 Phase 2 commit-token** added a per-commit ack; the host `cellGridPanel.ts` +
  * `cellGridLogic.ts` changed to match -- the webview's local message interfaces here MUST stay in sync):
@@ -38,6 +40,7 @@
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { clampDisplayString, formatCellValue } from './cellRender';
 import { CanvasGridRenderer, type ActiveCell } from './canvasGrid';
+import { computeScrollBlitA1, diffSnapshotsA1, errorRowsFlippedA1, type ScrollState } from './gridBlitA1';
 import {
 	COL_WIDTH,
 	HEADER_HEIGHT,
@@ -240,18 +243,63 @@ function applyCanvasTransform(scrollTop: number, scrollLeft: number): void {
 	canvasEl.style.transform = 'translate(' + scrollLeft + 'px, ' + scrollTop + 'px)';
 }
 
+// FE-2-0 Phase 3: the scroll/size/dpr state of the LAST painted frame -- the basis for the blit delta
+// (scrollRedraw) and the damage-path scroll-equality gate. `null` until the first paint and after any
+// backing-store resize (which clears `renderer.painted`, forcing a full draw before the next fast path).
+let prevPaint: ScrollState | null = null;
+/** Snapshot the current paint state. `renderer.backingScale` is read here, so callers that may resize
+ * MUST `renderer.resize()` first (resize is what changes the dpr). */
+function scrollStateNow(v: Viewport): ScrollState {
+	return { scrollTop: v.scrollTop, scrollLeft: v.scrollLeft, cssW: v.cssW, cssH: v.cssH, dpr: renderer.backingScale };
+}
+/** True iff the viewport scroll/size/dpr is identical to the last painted frame -- the precondition for
+ * a damage paint (the UN-damaged pixels are only valid if nothing scrolled/resized since last paint). */
+function scrollUnchangedSince(v: Viewport): boolean {
+	return (
+		prevPaint !== null &&
+		prevPaint.scrollTop === v.scrollTop &&
+		prevPaint.scrollLeft === v.scrollLeft &&
+		prevPaint.cssW === v.cssW &&
+		prevPaint.cssH === v.cssH &&
+		prevPaint.dpr === renderer.backingScale
+	);
+}
+
 /** Size the in-flow spacer to the full Excel extent (drives the native scrollbars). */
 function updateSpacer(): void {
 	spacerEl.style.height = totalContentHeight() + 'px';
 	spacerEl.style.width = totalContentWidth(renderer.gutterWidthPx) + 'px';
 }
 
-/** Full redraw at the current viewport (the only paint path in FE-2-0). */
+/** Full redraw at the current viewport -- the always-correct paint path AND the fallback for both fast
+ * paths (nav / type / resize / theme / first paint / any declined fast path route here). */
 function redraw(): void {
 	const v = currentViewport();
 	renderer.resize(v.cssW, v.cssH);
 	applyCanvasTransform(v.scrollTop, v.scrollLeft);
 	renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
+	prevPaint = scrollStateNow(v);
+}
+
+/**
+ * **FE-2-0 Phase 3** -- the scroll fast path: blit the overlap of a pure-axis scroll + repaint only the
+ * exposed strip, falling back to a full {@link redraw} whenever the pure math declines (no prior frame,
+ * resize/dpr change, diagonal or sub-device-pixel move, or too little reusable area). ONLY the scroll
+ * handler calls this: a scroll changes neither the snapshot nor the active cell nor errorCells, so the
+ * blitted (shifted) pixels stay correct -- any path that changes content/selection must full-`redraw()`.
+ */
+function scrollRedraw(): void {
+	const v = currentViewport();
+	renderer.resize(v.cssW, v.cssH); // a coalesced frame may straddle a resize -> resize first (clears `painted`)
+	applyCanvasTransform(v.scrollTop, v.scrollLeft);
+	const next = scrollStateNow(v);
+	const blit = renderer.painted ? computeScrollBlitA1(prevPaint, next, renderer.gutterWidthPx) : null;
+	if (blit === null) {
+		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
+	} else {
+		renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
+	}
+	prevPaint = next;
 }
 
 // FE megaudit L-b: coalesce high-frequency scroll events to ONE repaint per animation frame.
@@ -263,7 +311,7 @@ function scheduleRedraw(): void {
 	redrawScheduled = true;
 	requestAnimationFrame(() => {
 		redrawScheduled = false;
-		redraw();
+		scrollRedraw();
 	});
 }
 
@@ -663,6 +711,7 @@ function applyRender(snapshot: QuantbookCellSnapshot): void {
 	// but must NOT hide an active 'edit' banner -- a sibling render repaints under an open editor whose
 	// over-length value is still invalid; clearing it would mask the bad pending state until next commit.
 	clearTransientError();
+	const prevSnapshot = fullSnapshot; // captured BEFORE replacement for the Phase 3 damage diff
 	fullSnapshot = snapshot;
 	renderer.setSnapshot(snapshot);
 
@@ -673,7 +722,25 @@ function applyRender(snapshot: QuantbookCellSnapshot): void {
 	metaEl.textContent =
 		'snapshot_format_version=' + String(snapshot.snapshot_format_version) + '; entries=' + String(snapshot.entries.length);
 	updateSpacer();
-	redraw();
+
+	// **FE-2-0 Phase 3** -- damage fast path: with a prior frame at the SAME scroll, repaint ONLY the A1
+	// rows whose paint changed (`diffSnapshotsA1`); else full `redraw()` (the always-correct fallback,
+	// taken on the first render, a sheet switch, or any scroll/size change since the last paint). A commit
+	// re-renders the whole session snapshot but only the edited cell's row repaints.
+	const v = currentViewport();
+	// `backingScaleStale` (Opus LOW-1): a dpr change with no CSS-size change skips resize() -> full redraw.
+	const damageRows =
+		renderer.painted && !renderer.backingScaleStale && scrollUnchangedSince(v)
+			? diffSnapshotsA1(prevSnapshot, snapshot)
+			: null;
+	if (damageRows === null) {
+		redraw();
+		return;
+	}
+	// Scroll is unchanged (gated above), so the canvas transform + prevPaint stay valid; drawDamage is a
+	// no-op for an empty row set (nothing painted changed).
+	applyCanvasTransform(v.scrollTop, v.scrollLeft);
+	renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
 }
 
 /**
@@ -745,6 +812,7 @@ window.addEventListener('message', (event: MessageEvent) => {
 	}
 	if (msg.type === 'errorReply') {
 		const er = msg as ErrorReplyMessage;
+		const prevErrorKeys = new Set(errorCells.keys()); // Phase 3: for the error-tint flip diff
 		errorCells.set(Number(er.row) + ',' + Number(er.col), '[' + String(er.code) + '] ' + String(er.message));
 		// FE-2-0 Phase 2: un-stick the in-flight edit ONLY when the reply's commitId matches THIS edit's
 		// token (replaces the M8 (sheet,row,col) match -- a unique token can't collide). The matched edit
@@ -759,7 +827,17 @@ window.addEventListener('message', (event: MessageEvent) => {
 			editState.navAfterCommit = undefined; // the commit failed -- do not advance the selection
 			clearCommitWatchdog(); // the host responded (with a failure) -- no recovery needed
 		}
-		redraw();
+		// **FE-2-0 Phase 3** -- damage only the rows whose error tint FLIPPED (the rare failed-edit path),
+		// at the same scroll; else full `redraw()`. Re-erroring an already-tinted cell flips nothing -> []
+		// -> a no-op (the tint + the tooltip-on-hover are already correct).
+		const v = currentViewport();
+		if (renderer.painted && !renderer.backingScaleStale && scrollUnchangedSince(v)) {
+			const rows = errorRowsFlippedA1(prevErrorKeys, new Set(errorCells.keys()));
+			applyCanvasTransform(v.scrollTop, v.scrollLeft);
+			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
+		} else {
+			redraw();
+		}
 		return;
 	}
 	console.warn('[sheets-webview] unknown inbound message type:', msg.type);
