@@ -2570,6 +2570,82 @@ suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', f
 		assert.strictEqual(getCommitCount(), 0);
 		assert.strictEqual(errorReplies.length, 0);
 	});
+
+	// ---- FE-2-0 Phase 2 (commit-token edit-resolution protocol) ----
+	function makeDepsP2(session: SessionInstance, sheet: number) {
+		const errorReplies: ErrorReplyMessage[] = [];
+		const acks: number[] = [];
+		const opErrors: string[] = [];
+		let commitCount = 0;
+		const deps = {
+			session,
+			sheet,
+			onCommit: () => { commitCount += 1; },
+			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
+			onAck: (commitId: number) => { acks.push(commitId); },
+			onOperationError: (message: string) => { opErrors.push(message); },
+		};
+		return { deps, errorReplies, acks, opErrors, getCommitCount: () => commitCount };
+	}
+
+	test('Phase 2: a tokened putValue success acks THIS commit (onAck) in addition to the session render', () => {
+		const session = freshSession();
+		const { deps, errorReplies, acks, getCommitCount } = makeDepsP2(session, 0);
+		dispatchIncomingMessage({ type: 'putValue', sheet: 0, row: 1, col: 1, rawInput: '42', commitId: 7 }, deps);
+		assert.strictEqual(getCommitCount(), 1, 'the session-wide render (onCommit) still fires');
+		assert.deepStrictEqual(acks, [7], 'the originating commit is acked with its exact token');
+		assert.strictEqual(errorReplies.length, 0);
+	});
+
+	test('Phase 2: a putValue WITHOUT a commitId does not ack (pre-token / Delete-clear path)', () => {
+		const session = freshSession();
+		const { deps, acks, getCommitCount } = makeDepsP2(session, 0);
+		dispatchIncomingMessage({ type: 'putValue', sheet: 0, row: 1, col: 1, rawInput: '42' }, deps);
+		assert.strictEqual(getCommitCount(), 1, 'still commits + renders');
+		assert.deepStrictEqual(acks, [], 'no commitId -> no targeted ack (only the session render)');
+	});
+
+	test('Phase 2: a FAILED tokened putValue echoes the commitId in the errorReply + no ack', () => {
+		const session = freshSession();
+		const { deps, errorReplies, acks, getCommitCount } = makeDepsP2(session, 0);
+		// =BADFORMULA( is unbindable -> the dispatch catch arm emits an errorReply, zero commit.
+		dispatchIncomingMessage({ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: '=BADFORMULA(', commitId: 11 }, deps);
+		assert.strictEqual(getCommitCount(), 0, 'no commit on a formula error');
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].commitId, 11, 'the failed commit echoes its token so the editor un-sticks + decorates');
+		assert.deepStrictEqual(acks, [], 'no ack on failure');
+	});
+
+	test('Phase 2 (C1-MED5): a putValue outside the A1 extent is rejected with the commitId, never committed', () => {
+		const session = freshSession();
+		const { deps, errorReplies, acks, getCommitCount } = makeDepsP2(session, 0);
+		dispatchIncomingMessage({ type: 'putValue', sheet: 0, row: 2_000_000, col: 0, rawInput: '1', commitId: 5 }, deps);
+		assert.strictEqual(getCommitCount(), 0, 'an off-extent cell is never committed (would be invisible)');
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].code, 'bad_argument');
+		assert.match(errorReplies[0].message, /outside the A1 grid extent/);
+		assert.strictEqual(errorReplies[0].commitId, 5, 'echoes the token so the editor un-sticks');
+		assert.deepStrictEqual(acks, []);
+	});
+
+	test('Phase 2 (C1-MED5): a fractional IN-RANGE row is NOT intercepted -> the engine integer validator runs', () => {
+		const session = freshSession();
+		const { deps, errorReplies } = makeDepsP2(session, 0);
+		dispatchIncomingMessage({ type: 'putValue', sheet: 0, row: 1.5, col: 0, rawInput: '1', commitId: 3 }, deps);
+		assert.strictEqual(errorReplies.length, 1);
+		assert.match(errorReplies[0].message, /integer/, 'integrality is the engine validators job, not the extent check');
+	});
+
+	test('Phase 2 (S2-MED1): an undo throw routes to onOperationError, NOT a cell errorReply (no A1 mis-tint)', () => {
+		const { deps, errorReplies, opErrors } = makeDepsP2(freshSession(), 0);
+		// A session whose undo() throws -- exercises the catch arm deterministically.
+		const throwingSession = { undo: () => { throw new Error('[invalid_state] cannot undo'); } } as unknown as SessionInstance;
+		dispatchIncomingMessage({ type: 'undo' }, { ...deps, session: throwingSession });
+		assert.strictEqual(errorReplies.length, 0, 'a session-wide failure is NOT a cell errorReply (no row=0/col=0 A1 mis-decoration)');
+		assert.strictEqual(opErrors.length, 1, 'it goes to onOperationError (a plain warning toast)');
+		assert.match(opErrors[0], /\[undo\]/, 'prefixed with the failed action');
+		assert.match(opErrors[0], /invalid_state/, 'carries the structured error code');
+	});
 });
 
 // ============================================================================

@@ -43,7 +43,7 @@
 import * as vscode from 'vscode';
 
 import type { QuantbookCellSnapshot, SessionInstance, WorkbookSnapshotJson } from '../types';
-import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache } from './cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, type CommitResultMessage } from './cellGridLogic';
 import { getNonce, getWebviewUri } from '../../utils/webview';
 
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
@@ -596,6 +596,34 @@ export class CellGridPanel {
 						`Quantbook: the edit committed but ${failed} cell-grid panel(s) failed to re-render. Run "Quantbook: Refresh Cell Grid".`,
 					);
 				}
+			},
+			// **FE-2-0 Phase 2 (commit-token)**: ack a successful tokened commit to THIS panel only
+			// (the originating webview), NOT a session fan-out -- `onCommit` above already pushed the
+			// session-wide render. The webview resolves exactly this edit on the matching commitId; a
+			// bare `render` no longer closes a pending editor (kills the sibling-render false-ack HIGH).
+			onAck: commitId => {
+				if (this._disposed) {
+					return; // the editor is gone with the panel -- nothing to resolve
+				}
+				const ack: CommitResultMessage = { type: 'commitResult', commitId, ok: true };
+				this.panel.webview.postMessage(ack).then(
+					delivered => {
+						if (!delivered && !this._disposed) {
+							// The commit DID land (data is correct); only the ack didn't reach the editor, so
+							// it stays pending until reload. Surface it (No-Fallbacks) rather than hide it.
+							console.warn(`[cellGrid] commitResult (commitId ${commitId}) was not delivered; the editor may stay pending.`);
+						}
+					},
+					err => console.error('[cellGrid] commitResult postMessage rejected:', err),
+				);
+			},
+			// **FE-2-0 Phase 2 (S2-MED1)**: a session-wide op failure (undo/redo throw) with no cell --
+			// a plain warning toast, NOT a cell-decorating errorReply (which mis-tinted A1).
+			onOperationError: message => {
+				if (this._disposed) {
+					return;
+				}
+				void vscode.window.showWarningMessage(`Quantbook cell grid: ${message}`);
 			},
 			onError: reply => {
 				// If the panel is disposed, `webview.postMessage` is silently dropped

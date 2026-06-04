@@ -89,6 +89,16 @@ export interface PutValueRequest {
 	row: number;
 	col: number;
 	rawInput: string;
+	/**
+	 * **FE-2-0 Phase 2 (commit-token, 2026-06-04)** -- a per-commit id minted by the
+	 * webview (`index.ts` monotonic counter). Echoed back in the success
+	 * {@link CommitResultMessage} and the failure {@link ErrorReplyMessage} so the
+	 * webview resolves THIS edit and only this edit -- replacing the old "any render
+	 * acks the pending commit" rule (which let a sibling-panel/refresh render falsely
+	 * close an unrelated panel's editor). Optional for backward compat with the
+	 * pre-token wire + tests that post bare envelopes.
+	 */
+	commitId?: number;
 }
 
 /**
@@ -103,6 +113,23 @@ export interface ErrorReplyMessage {
 	col: number;
 	code: QuantbookErrorCode;
 	message: string;
+	/** **FE-2-0 Phase 2** -- the {@link PutValueRequest.commitId} of the failed commit, when the
+	 * failure is for a tokened putValue. Lets the webview un-stick + decorate exactly the originating
+	 * edit. Absent for non-commit errors (e.g. a pre-token envelope). */
+	commitId?: number;
+}
+
+/**
+ * **FE-2-0 Phase 2 (commit-token, 2026-06-04)** -- incoming (extension host -> the ORIGINATING
+ * webview only) success ack for a tokened {@link PutValueRequest}. The host posts this to the panel
+ * that sent the putValue (NOT a session-wide fan-out -- that is the separate `render` push), so the
+ * webview can close its editor + apply its post-commit nav + clear that cell's error tint with the
+ * certainty that the engine accepted THIS commit. A bare `render` no longer resolves a pending edit.
+ */
+export interface CommitResultMessage {
+	type: 'commitResult';
+	commitId: number;
+	ok: true;
 }
 
 /**
@@ -260,7 +287,35 @@ export interface DispatchDeps {
 	 * omitted, the dispatcher just doesn't fire it.
 	 */
 	readonly onTypingStroke?: () => void;
+	/**
+	 * **FE-2-0 Phase 2 (commit-token, 2026-06-04)** -- success ack for a tokened
+	 * `putValue`. Fired (in addition to {@link onCommit}'s session-wide render) ONLY
+	 * when the committing envelope carried a `commitId`; the panel posts a
+	 * {@link CommitResultMessage} to the ORIGINATING webview so it resolves exactly
+	 * this edit. Optional for backward compat with tests + pre-token envelopes.
+	 */
+	readonly onAck?: (commitId: number) => void;
+	/**
+	 * **FE-2-0 Phase 2 (S2-MED1, 2026-06-04)** -- a SESSION-WIDE operation failure
+	 * (undo/redo throw) that is NOT tied to a cell. Previously routed through
+	 * {@link onError} with `row=0,col=0` sentinels, which mis-decorated cell A1 as
+	 * errored. The panel now surfaces this as a plain warning toast (no cell tint, no
+	 * commitId). Optional for backward compat; when omitted the failure is dropped
+	 * (tests that don't wire it don't exercise the undo/redo-throw path).
+	 */
+	readonly onOperationError?: (message: string) => void;
 }
+
+/**
+ * **FE-2-0 Phase 2 (C1-MED5, 2026-06-04)** -- the A1 renderable extent the grid panel accepts. The
+ * engine validates coordinates to u32 (`4294967295`), but the A1 grid only renders `[0,A1_MAX_ROWS) x
+ * [0,A1_MAX_COLS)`; a putValue outside it (only reachable from a tampered webview bundle -- the live
+ * webview clamps nav to this extent) would commit an INVISIBLE cell. The dispatcher rejects it with a
+ * `bad_argument` errorReply instead. **These MUST match `webview/sheets-webview/gridLayoutA1.ts`'s
+ * `MAX_ROWS`/`MAX_COLS`** (kept as a host-local pin rather than a cross-bundle import, since the
+ * webview module is esbuild-isolated from the host runtime). */
+const A1_MAX_ROWS = 1_048_576;
+const A1_MAX_COLS = 16_384;
 
 /**
  * **FE megaudit M9 (2026-06-03)** -- maximum accepted length of a single
@@ -320,12 +375,11 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 	// deps.onCommit() to trigger panel re-render via the V3.3.0.3
 	// cache.  On consumed=false (empty undo/redo stack) silent no-op
 	// -- the user pressed Cmd-Z with nothing to undo, no UX feedback
-	// needed.  On engine throw route through deps.onError with
-	// structured code; sheet=deps.sheet/row=0/col=0 sentinels because
-	// undo/redo is session-wide and the errorReply schema requires
-	// cell coordinates (V3.2.b.1 B1 envelope contract).  Message
-	// prefixed with [undo]/[redo] so the user sees which action
-	// failed.
+	// needed.  On engine throw: FE-2-0 Phase 2 (S2-MED1) routes through
+	// deps.onOperationError -- a SESSION-WIDE failure with no cell, so a
+	// plain warning toast (NOT an errorReply with row=0/col=0 sentinels,
+	// which mis-decorated cell A1 as errored). Message prefixed with
+	// [undo]/[redo] so the user sees which action failed.
 	if (msg.type === 'undo' || msg.type === 'redo') {
 		try {
 			// FE-0a Part B (B1): the owning Session's undo/redo return
@@ -338,14 +392,7 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			return;
 		} catch (err) {
 			const info = parseQuantbookError(err);
-			deps.onError({
-				type: 'errorReply',
-				sheet: deps.sheet,
-				row: 0,
-				col: 0,
-				code: info.code,
-				message: `[${msg.type}] ${info.message}`,
-			});
+			deps.onOperationError?.(`[${msg.type}] [${info.code}] ${info.message}`);
 			return;
 		}
 	}
@@ -381,6 +428,7 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			col: sanitizeCoord(req.col),
 			code: 'bad_argument',
 			message: `rawInput must be a string, got ${typeof req.rawInput}`,
+			commitId: req.commitId, // FE-2-0 Phase 2: echo so the originating edit un-sticks
 		});
 		return;
 	}
@@ -401,6 +449,7 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			col: sanitizeCoord(req.col),
 			code: 'bad_argument',
 			message: `rawInput is ${req.rawInput.length} chars, exceeding the ${MAX_RAW_INPUT_LENGTH}-char limit; the edit was not applied.`,
+			commitId: req.commitId,
 		});
 		return;
 	}
@@ -420,6 +469,24 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			col: sanitizeCoord(req.col),
 			code: 'bad_argument',
 			message: `putValue sheet ${req.sheet} does not match this panel's sheet ${deps.sheet}; the edit was not applied.`,
+			commitId: req.commitId,
+		});
+		return;
+	}
+	// **FE-2-0 Phase 2 (C1-MED5)**: reject a putValue whose coordinate is outside the A1 renderable
+	// EXTENT. The engine accepts any u32 coord and would store an INVISIBLE cell; the live webview clamps
+	// nav to this extent, so an off-extent coord is only reachable from a tampered bundle. Range-only --
+	// integrality/NaN/finiteness are left to the engine validator (its "row must be an integer" message
+	// is clearer); this only adds the extent bound the engine lacks. Echo commitId so the editor un-sticks.
+	if (req.row < 0 || req.row >= A1_MAX_ROWS || req.col < 0 || req.col >= A1_MAX_COLS) {
+		deps.onError({
+			type: 'errorReply',
+			sheet: req.sheet,
+			row: sanitizeCoord(req.row),
+			col: sanitizeCoord(req.col),
+			code: 'bad_argument',
+			message: `cell (row ${req.row}, col ${req.col}) is outside the A1 grid extent (${A1_MAX_ROWS}x${A1_MAX_COLS}); the edit was not applied.`,
+			commitId: req.commitId,
 		});
 		return;
 	}
@@ -467,6 +534,12 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		}
 		recalcDirtyChecked(deps.session);
 		deps.onCommit();
+		// FE-2-0 Phase 2 (commit-token): ack THIS commit to the originating panel (in addition to the
+		// session-wide render `onCommit` triggers), so its webview resolves exactly this edit. Only when
+		// the envelope carried a commitId (the live webview always stamps one; pre-token/tests may not).
+		if (typeof req.commitId === 'number') {
+			deps.onAck?.(req.commitId);
+		}
 	} catch (err) {
 		const info = parseQuantbookError(err);
 		deps.onError({
@@ -477,6 +550,7 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			col: sanitizeCoord(req.col),
 			code: info.code,
 			message: info.message,
+			commitId: req.commitId, // FE-2-0 Phase 2: echo so the originating edit un-sticks + decorates
 		});
 	}
 }

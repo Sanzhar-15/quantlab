@@ -22,10 +22,15 @@
  * FE-0b-4/5 blit + damage-clip machinery is entry-index-keyed and returns as a `gridBlitA1.ts`
  * fast-follow.
  *
- * Wire protocol UNCHANGED from FE-0b (host `cellGridPanel.ts` is untouched):
- *   host -> webview: `{type:'render', snapshot}`, `{type:'errorReply', sheet,row,col,code,message}`
- *   webview -> host: `{type:'putValue', sheet,row,col,rawInput}`, `{type:'undo'}`, `{type:'redo'}`,
- *                    `{type:'webviewReady'}` (once on load).
+ * Wire protocol (**FE-2-0 Phase 2 commit-token** added a per-commit ack; the host `cellGridPanel.ts` +
+ * `cellGridLogic.ts` changed to match -- the webview's local message interfaces here MUST stay in sync):
+ *   host -> webview: `{type:'render', snapshot}`,
+ *                    `{type:'errorReply', sheet,row,col,code,message, commitId?}`,
+ *                    `{type:'commitResult', commitId, ok:true}` (Phase 2 -- success ack to THIS panel).
+ *   webview -> host: `{type:'putValue', sheet,row,col,rawInput, commitId?}` (Phase 2 -- the token),
+ *                    `{type:'undo'}`, `{type:'redo'}`, `{type:'webviewReady'}` (once on load).
+ *   Resolution: a pending edit closes ONLY on a matching `commitResult`/`errorReply` (by commitId) or the
+ *   commit-watchdog timeout -- NEVER on a bare `render` (which is why a sibling render can't false-ack).
  *
  * Side-effecting entry (no top-level exports) so the esm bundle loads via a classic `<script>`.
  */
@@ -76,6 +81,16 @@ interface ErrorReplyMessage {
 	readonly col: number;
 	readonly code: string;
 	readonly message: string;
+	/** FE-2-0 Phase 2: the commitId of the failed putValue (echoed by the host), so we un-stick exactly
+	 * the originating edit. Absent for a non-tokened error. */
+	readonly commitId?: number;
+}
+
+/** host -> the originating webview: success ack for a tokened commit (FE-2-0 Phase 2 commit-token). */
+interface CommitResultMessage {
+	readonly type: 'commitResult';
+	readonly commitId: number;
+	readonly ok: true;
 }
 
 // Cache the VS Code API handle on `window`: acquireVsCodeApi() may be called at most ONCE per
@@ -161,15 +176,48 @@ interface EditState {
 	// The populated entry under the cell at edit-start (formula/value pre-fill); undefined for an empty cell.
 	readonly entry?: QuantbookCellSnapshot['entries'][number];
 	pendingCommit: boolean;
-	// FE megaudit M8: the (sheet,row,col) identity of the in-flight commit, so a late errorReply for a
-	// PREVIOUS edit can't mutate the CURRENT edit's state. Undefined until commitEdit() fires.
-	commitSheet?: number;
-	commitRow?: number;
-	commitCol?: number;
-	// Where to move the selection after THIS commit's success render acks (Enter=down, Tab=right, …).
+	// FE-2-0 Phase 2 (commit-token): the unique id of THIS in-flight commit, stamped by commitEdit and
+	// echoed by the host in `commitResult` (success) / `errorReply` (failure). Replaces the FE megaudit
+	// M8 (sheet,row,col) match -- a monotonic token can't collide, and (the HIGH this kills) a bare
+	// `render` no longer resolves a pending edit, so a sibling-panel/refresh render can't falsely close
+	// this editor. Undefined until commitEdit() fires.
+	commitId?: number;
+	// Where to move the selection once THIS commit's matching commitResult arrives (Enter=down, Tab=right).
 	navAfterCommit?: { dr: number; dc: number };
 }
 let editState: EditState | null = null;
+// FE-2-0 Phase 2: monotonic source of per-commit ids (never reused within a webview lifetime).
+let nextCommitId = 0;
+// FE-2-0 Phase 2 (re-audit HIGH): a pending edit now resolves ONLY on a matching commitResult/errorReply
+// -- a bare render no longer releases it. So a LOST/dropped/malformed completion would strand the editor
+// forever (Escape/blur inert). This watchdog is the recovery net: if neither reply arrives in time, it
+// surfaces the unknown status LOUD + un-sticks pendingCommit so Escape/blur/re-edit work again. Generous
+// (10s >> any real local-engine round-trip) so it never false-fires on a slow-but-valid commit.
+const COMMIT_WATCHDOG_MS = 10000;
+let commitWatchdog: ReturnType<typeof setTimeout> | undefined;
+function clearCommitWatchdog(): void {
+	if (commitWatchdog !== undefined) {
+		clearTimeout(commitWatchdog);
+		commitWatchdog = undefined;
+	}
+}
+function armCommitWatchdog(commitId: number): void {
+	clearCommitWatchdog();
+	commitWatchdog = setTimeout(() => {
+		commitWatchdog = undefined;
+		// Only fire if THIS commit is still unresolved (a late reply may have already resolved it).
+		if (editState !== null && editState.pendingCommit && editState.commitId === commitId) {
+			editState.pendingCommit = false; // un-stick: re-arm Escape / blur / re-edit
+			editState.navAfterCommit = undefined;
+			showError(
+				'The edit could not be confirmed by the host (no response). It may or may not have been ' +
+				'saved -- check the cell value, then press Escape or re-enter it.',
+				'transient',
+			);
+			redraw();
+		}
+	}, COMMIT_WATCHDOG_MS);
+}
 
 // --- Viewport / draw ---
 
@@ -273,7 +321,13 @@ function clearActiveCell(): void {
 	if (fullSnapshot === null || active === null) {
 		return;
 	}
+	// FE-2-0 Phase 2: optimistically drop this cell's error tint. The blanket `errorCells.clear()` on
+	// render is gone (errors are now per-cell), and a Delete carries no editor/commit-token to resolve --
+	// so without this a Delete'd cell would keep a stale error tint. Clearing to blank is essentially
+	// always valid; if it DOES fail, the host's `errorReply` re-decorates the cell (No-Fallbacks).
+	errorCells.delete(active.row + ',' + active.col);
 	vscode.postMessage({ type: 'putValue', sheet: fullSnapshot.sheet, row: active.row, col: active.col, rawInput: '' });
+	redraw();
 }
 
 // --- Overlay editor ---
@@ -339,6 +393,7 @@ function cancelEdit(): void {
 	editState = null;
 	inputEl.hidden = true;
 	inputEl.value = '';
+	clearCommitWatchdog(); // the editor is gone -- no pending commit to recover (re-audit HIGH)
 	clearError(); // closing the editor resolves any 'edit'-source banner (re-audit MED-4)
 }
 
@@ -355,7 +410,7 @@ function repositionEdit(): void {
 	inputEl.style.height = rect.height + 'px';
 }
 
-/** Commit the edit; `nav` (optional) moves the selection once the success render acks. */
+/** Commit the edit; `nav` (optional) moves the selection once the matching `commitResult` arrives. */
 function commitEdit(nav?: { dr: number; dc: number }): void {
 	if (editState === null || fullSnapshot === null) {
 		return;
@@ -377,14 +432,16 @@ function commitEdit(nav?: { dr: number; dc: number }): void {
 	const sheet = fullSnapshot.sheet;
 	const row = editState.row;
 	const col = editState.col;
+	const commitId = ++nextCommitId; // FE-2-0 Phase 2: stamp a unique token for THIS commit
 	editState.pendingCommit = true;
-	editState.commitSheet = sheet;
-	editState.commitRow = row;
-	editState.commitCol = col;
+	editState.commitId = commitId;
 	editState.navAfterCommit = nav;
-	// Pessimistic: keep the input visible/focused until the host responds. A success `render` hides it
-	// (applyRender -> cancelEdit) + applies `nav`; an `errorReply` decorates the cell + leaves it open.
-	vscode.postMessage({ type: 'putValue', sheet, row, col, rawInput: inputEl.value });
+	armCommitWatchdog(commitId); // re-audit HIGH: recover the editor if no commitResult/errorReply arrives
+	// Pessimistic: keep the input visible/focused until the host responds. FE-2-0 Phase 2: resolution is
+	// now driven ONLY by a matching `commitResult` (success -> resolvePendingCommit hides the editor +
+	// applies `nav`) or `errorReply` (failure -> decorate the cell + leave the editor open). A bare
+	// `render` no longer resolves -- so a sibling-panel render can't falsely close this editor.
+	vscode.postMessage({ type: 'putValue', sheet, row, col, rawInput: inputEl.value, commitId });
 }
 
 // Re-audit MED-4: clear the over-length ('edit') banner as soon as the user shortens the value back to
@@ -593,9 +650,13 @@ function isValidSnapshot(snapshot: unknown): snapshot is QuantbookCellSnapshot {
 }
 
 /**
- * Apply a fresh snapshot: update title/meta + spacer, resolve any in-flight commit (close the editor
- * + apply its nav), then full-redraw. A SIBLING render mid-edit (no pending commit of ours) preserves
- * the open editor (FE re-audit MED-1) -- the canvas repaints underneath it.
+ * Apply a fresh snapshot: update title/meta + spacer, then full-redraw. **FE-2-0 Phase 2 (commit-token):
+ * a bare `render` NO LONGER resolves a pending commit** -- it only refreshes the snapshot + repaints; an
+ * open editor (pending or not) is PRESERVED and the canvas repaints underneath it. Pending edits resolve
+ * ONLY on a matching `commitResult` (success -> {@link resolvePendingCommit}) / `errorReply` (failure),
+ * keyed by the unique commitId. This kills the sibling-render false-ack HIGH (a render from a sibling
+ * panel / session refresh can't close or mis-resolve this editor) AND the errorCells-clear-on-idle-render
+ * + (sheet,row,col) false-match items -- errorCells is now mutated only by a matching reply.
  */
 function applyRender(snapshot: QuantbookCellSnapshot): void {
 	// Re-audit MED-4: a valid render supersedes a TRANSIENT banner (malformed-render / un-editable cell)
@@ -605,32 +666,6 @@ function applyRender(snapshot: QuantbookCellSnapshot): void {
 	fullSnapshot = snapshot;
 	renderer.setSnapshot(snapshot);
 
-	// Audit MED-2 (known limitation, inherited from FE-0b; structural): a `render` carries NO cell
-	// identity, so a SIBLING-panel commit on the same session (which re-renders every panel, M1) can
-	// resolve THIS panel's in-flight commit early -- closing the editor + applying its nav before our
-	// own putValue is processed. Non-data-losing (our putValue is still queued) but a premature
-	// editor-close + nav glitch with multi-panel-same-session. The fix (a monotonic commit token echoed
-	// by the host) needs a host wire-protocol change, deferred to the gridBlitA1.ts fast-follow.
-	const wasOurCommit = editState !== null && editState.pendingCommit;
-	let navRow = 0;
-	let navCol = 0;
-	let hasNav = false;
-	if (wasOurCommit && editState !== null) {
-		const nav = editState.navAfterCommit;
-		if (nav !== undefined) {
-			navRow = editState.row + nav.dr;
-			navCol = editState.col + nav.dc;
-			hasNav = true;
-		}
-	}
-	if (editState === null || editState.pendingCommit) {
-		cancelEdit();
-		errorCells.clear();
-	}
-	if (hasNav) {
-		setActiveClamped(navRow, navCol);
-	}
-
 	// Audit LOW-3: do NOT refreshTheme() here -- a render is not a theme change. Theme/font changes are
 	// handled by the body-class MutationObserver (and the initial read is in the renderer constructor);
 	// refreshing per render needlessly cleared the measure cache + recomputed the gutter every snapshot.
@@ -638,6 +673,33 @@ function applyRender(snapshot: QuantbookCellSnapshot): void {
 	metaEl.textContent =
 		'snapshot_format_version=' + String(snapshot.snapshot_format_version) + '; entries=' + String(snapshot.entries.length);
 	updateSpacer();
+	redraw();
+}
+
+/**
+ * **FE-2-0 Phase 2 (commit-token)** -- resolve the in-flight edit whose token matches a host
+ * `commitResult` success ack: clear that cell's error tint (the commit succeeded), close the editor, and
+ * apply the queued post-commit nav. The host posts the session-wide `render` (snapshot updated) BEFORE
+ * this ack on the SAME FIFO channel, so in the normal path the committed value is already on screen when
+ * the editor closes. **Re-audit MED:** if THIS panel's render failed (threw -> `onCommit`'s failed-count
+ * "run Refresh" toast; or non-delivered -> `postRenderIfReady`'s non-delivery toast), the canvas is
+ * briefly stale after the editor closes -- but the host has ALREADY surfaced a visible "refresh" warning
+ * in both those cases, so the staleness is explained + recoverable (it is not silent). Ignores a
+ * non-matching id (a stale ack / an ack for a different in-flight edit).
+ */
+function resolvePendingCommit(commitId: number): void {
+	if (editState === null || !editState.pendingCommit || editState.commitId !== commitId) {
+		return;
+	}
+	clearCommitWatchdog(); // resolved -- cancel the recovery net (cancelEdit below also clears it)
+	const row = editState.row;
+	const col = editState.col;
+	const nav = editState.navAfterCommit;
+	errorCells.delete(row + ',' + col); // success -> this cell is no longer errored (per-cell, not blanket)
+	cancelEdit();
+	if (nav !== undefined) {
+		setActiveClamped(row + nav.dr, col + nav.dc);
+	}
 	redraw();
 }
 
@@ -662,26 +724,40 @@ window.addEventListener('message', (event: MessageEvent) => {
 			if (editState !== null && editState.pendingCommit) {
 				editState.pendingCommit = false;
 				editState.navAfterCommit = undefined;
+				clearCommitWatchdog(); // we un-stuck manually -- the watchdog is no longer needed
 			}
 			return;
 		}
 		applyRender(snapshot);
 		return;
 	}
+	if (msg.type === 'commitResult') {
+		// FE-2-0 Phase 2: the host's success ack for a tokened commit -- resolve exactly that edit.
+		const cr = msg as CommitResultMessage;
+		if (typeof cr.commitId === 'number') {
+			resolvePendingCommit(cr.commitId);
+		} else {
+			// Re-audit HIGH: a malformed ack (version skew / tamper) must NOT be silently dropped -- it
+			// would leave the editor pending until the watchdog fires. Surface it (No-Fallbacks).
+			console.warn('[sheets-webview] commitResult with non-numeric commitId ignored:', cr);
+		}
+		return;
+	}
 	if (msg.type === 'errorReply') {
 		const er = msg as ErrorReplyMessage;
 		errorCells.set(Number(er.row) + ',' + Number(er.col), '[' + String(er.code) + '] ' + String(er.message));
-		// FE megaudit M8: only clear pendingCommit when the reply matches the CURRENT in-flight edit's
-		// cell identity. The matched edit stays open for correction + re-commit.
+		// FE-2-0 Phase 2: un-stick the in-flight edit ONLY when the reply's commitId matches THIS edit's
+		// token (replaces the M8 (sheet,row,col) match -- a unique token can't collide). The matched edit
+		// stays OPEN for correction + re-commit; the cell is decorated above regardless of the match.
 		if (
 			editState !== null &&
 			editState.pendingCommit &&
-			editState.commitSheet === Number(er.sheet) &&
-			editState.commitRow === Number(er.row) &&
-			editState.commitCol === Number(er.col)
+			typeof er.commitId === 'number' &&
+			editState.commitId === er.commitId
 		) {
 			editState.pendingCommit = false;
 			editState.navAfterCommit = undefined; // the commit failed -- do not advance the selection
+			clearCommitWatchdog(); // the host responded (with a failure) -- no recovery needed
 		}
 		redraw();
 		return;
