@@ -31,7 +31,7 @@
  */
 
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
-import { formatCellValue } from './cellRender';
+import { clampDisplayString, formatCellValue } from './cellRender';
 import { CanvasGridRenderer, type ActiveCell } from './canvasGrid';
 import {
 	COL_WIDTH,
@@ -43,9 +43,19 @@ import {
 	colX,
 	hitTestViewport,
 	rowY,
+	scrollToReveal,
 	totalContentHeight,
 	totalContentWidth,
 } from './gridLayoutA1';
+
+/**
+ * **FE-2-0 Phase 1 (C1-MED6, 2026-06-03)** -- client mirror of the host's `MAX_RAW_INPUT_LENGTH`
+ * (`cellGrid/cellGridLogic.ts`, kept in sync). The host rejects an over-length `putValue.rawInput`,
+ * but we block it BEFORE `postMessage` so a multi-MB payload is never serialized across the bridge
+ * (a tampered/buggy editor). On hit we surface a visible error and keep the editor open for the user
+ * to shorten -- No-Fallbacks: the bad input is rejected loudly, never silently truncated or dropped.
+ */
+const MAX_RAW_INPUT_LENGTH = 8192;
 
 /** Minimal VS Code webview API surface (mirrors qviz-spec/index.ts). */
 interface VSCodeApi {
@@ -55,11 +65,9 @@ interface VSCodeApi {
 }
 declare function acquireVsCodeApi(): VSCodeApi;
 
-/** host -> webview: full sheet snapshot to paint. */
-interface RenderMessage {
-	readonly type: 'render';
-	readonly snapshot: QuantbookCellSnapshot;
-}
+// host -> webview: `{ type: 'render', snapshot }` (the snapshot is validated by `isValidSnapshot`
+// at the message boundary before it is applied -- see the message handler below).
+
 /** host -> webview: a failed edit; decorate the offending cell. */
 interface ErrorReplyMessage {
 	readonly type: 'errorReply';
@@ -84,6 +92,7 @@ if (root === null) {
 root.innerHTML =
 	'<h2 id="sheets-title">Quantbook Cell Grid</h2>' +
 	'<div class="meta" id="sheets-meta"></div>' +
+	'<div class="sheets-error" id="sheets-error" role="alert" hidden></div>' +
 	'<div class="cell-grid-viewport" id="sheets-viewport" tabindex="0">' +
 	'<div id="sheets-spacer"></div>' +
 	'<canvas id="sheets-canvas"></canvas>' +
@@ -92,10 +101,50 @@ root.innerHTML =
 
 const titleEl = document.getElementById('sheets-title') as HTMLElement;
 const metaEl = document.getElementById('sheets-meta') as HTMLElement;
+const errorEl = document.getElementById('sheets-error') as HTMLElement;
 const viewportEl = document.getElementById('sheets-viewport') as HTMLElement;
 const spacerEl = document.getElementById('sheets-spacer') as HTMLElement;
 const canvasEl = document.getElementById('sheets-canvas') as HTMLCanvasElement;
 const inputEl = document.getElementById('sheets-edit-input') as HTMLInputElement;
+
+/**
+ * **FE-2-0 Phase 1 (C1-MED3 / C1-MED6, 2026-06-03; re-audit MED-4)** -- the visible in-webview error
+ * banner. No-Fallbacks: a bad render / rejected edit is surfaced here (and `console.error`-ed for the
+ * render case) -- never silently dropped, never an opaque throw that freezes the grid with no message.
+ *
+ * The banner has a SOURCE so a valid render cannot HIDE an active edit-validation error (re-audit
+ * MED-4): a `'transient'` error (malformed render, un-editable oversize cell) is cleared by the next
+ * valid render; an `'edit'` error (the open editor holds an over-length value) is cleared ONLY when
+ * that editor resolves -- shortened below the cap, cancelled, or committed -- so a sibling render
+ * repainting underneath the editor never masks the still-invalid pending input.
+ */
+type ErrorSource = 'transient' | 'edit';
+let errorSource: ErrorSource | null = null;
+function showError(message: string, source: ErrorSource): void {
+	// Re-audit finding 4: an active 'edit' banner (the open editor holds an over-length value the user
+	// must fix) outranks a 'transient' notice. A malformed render still gets `console.error`-ed at its
+	// call site, but it must NOT overwrite the edit banner -- otherwise a later valid render's
+	// `clearTransientError()` would clear it and hide the still-invalid pending edit (the MED-4 class).
+	if (source === 'transient' && errorSource === 'edit') {
+		return;
+	}
+	errorEl.textContent = message;
+	errorEl.hidden = false;
+	errorSource = source;
+}
+function clearError(): void {
+	if (!errorEl.hidden) {
+		errorEl.hidden = true;
+		errorEl.textContent = '';
+	}
+	errorSource = null;
+}
+/** Clear only a `'transient'` banner (a valid render supersedes it); preserve an `'edit'` banner. */
+function clearTransientError(): void {
+	if (errorSource === 'transient') {
+		clearError();
+	}
+}
 
 const renderer = new CanvasGridRenderer(canvasEl);
 
@@ -179,26 +228,28 @@ function clampCol(c: number): number {
 	return Math.max(0, Math.min(MAX_COLS - 1, c));
 }
 
-/** Scroll so the active cell is fully visible below the header band + right of the row gutter. */
+/** Scroll so the active cell is fully visible below the header band + right of the row gutter.
+ * Audit C2-MED2: the tiny-viewport clamp (a viewport narrower/shorter than one cell would otherwise
+ * park the cell under the sticky band) lives in the pure {@link scrollToReveal}. */
 function ensureActiveVisible(): void {
 	if (active === null) {
 		return;
 	}
 	const gutterW = renderer.gutterWidthPx;
-	const cellLeft = colX(active.col, gutterW);
-	const cellTop = rowY(active.row);
-	const localLeft = cellLeft - viewportEl.scrollLeft;
-	if (localLeft < gutterW) {
-		viewportEl.scrollLeft = cellLeft - gutterW;
-	} else if (localLeft + COL_WIDTH > viewportEl.clientWidth) {
-		viewportEl.scrollLeft = cellLeft + COL_WIDTH - viewportEl.clientWidth;
-	}
-	const localTop = cellTop - viewportEl.scrollTop;
-	if (localTop < HEADER_HEIGHT) {
-		viewportEl.scrollTop = cellTop - HEADER_HEIGHT;
-	} else if (localTop + ROW_HEIGHT > viewportEl.clientHeight) {
-		viewportEl.scrollTop = cellTop + ROW_HEIGHT - viewportEl.clientHeight;
-	}
+	viewportEl.scrollLeft = scrollToReveal(
+		colX(active.col, gutterW),
+		COL_WIDTH,
+		gutterW,
+		viewportEl.scrollLeft,
+		viewportEl.clientWidth,
+	);
+	viewportEl.scrollTop = scrollToReveal(
+		rowY(active.row),
+		ROW_HEIGHT,
+		HEADER_HEIGHT,
+		viewportEl.scrollTop,
+		viewportEl.clientHeight,
+	);
 }
 
 /** Move the selection by (dr,dc), scroll it into view, repaint. No-op while editing. */
@@ -213,6 +264,16 @@ function moveActive(dr: number, dc: number): void {
 function setActiveClamped(row: number, col: number): void {
 	active = { row: clampRow(row), col: clampCol(col) };
 	ensureActiveVisible();
+}
+
+/** Audit O2-MED3: clear the active cell (Delete/Backspace when NOT editing). The host classifies an
+ * empty `rawInput` as `{ kind: 'blank' }` = clear (`cellGridLogic.classifyCellInput`), so this reuses
+ * the coordinate-addressed putValue path -- no editState involved (we are not in an edit). */
+function clearActiveCell(): void {
+	if (fullSnapshot === null || active === null) {
+		return;
+	}
+	vscode.postMessage({ type: 'putValue', sheet: fullSnapshot.sheet, row: active.row, col: active.col, rawInput: '' });
 }
 
 // --- Overlay editor ---
@@ -230,20 +291,39 @@ function beginEdit(row: number, col: number, initialChar?: string): void {
 		cancelEdit();
 	}
 	active = { row, col };
+	// Audit O2-MED2: F2 / type-to-edit on a scrolled-away active cell must bring it into view first,
+	// otherwise the overlay editor opens off-screen (content-layer child positioned at the cell rect).
+	ensureActiveVisible();
 	const entry = renderer.entryAt(row, col);
+	// Compute the pre-fill BEFORE touching the DOM. Re-audit HIGH-2: a malformed/drifted snapshot can
+	// carry a multi-MB value/formula; assigning it to `inputEl.value` + `select()` would freeze the
+	// webview (the canvas measure path is capped, but the editor is a real <input>). Such a value also
+	// could never be committed (the host + client cap rawInput at MAX_RAW_INPUT_LENGTH). So we refuse to
+	// open the editor and surface a visible error -- No-Fallbacks: we do NOT silently truncate the value.
+	let prefill: string;
+	if (initialChar !== undefined) {
+		prefill = initialChar; // type-to-edit: a single char, never oversize
+	} else if (entry !== undefined) {
+		// Formula text (re-add the leading `=` the host dispatch keys on) over the value-default literal.
+		prefill = typeof entry.formula === 'string' ? '=' + entry.formula : formatCellValue(entry.value);
+	} else {
+		prefill = ''; // empty cell
+	}
+	if (prefill.length > MAX_RAW_INPUT_LENGTH) {
+		showError(
+			`This cell's value is ${prefill.length} characters, over the ${MAX_RAW_INPUT_LENGTH}-character ` +
+			`editable limit, so it cannot be edited here. (The cell selection is unchanged.)`,
+			'transient',
+		);
+		redraw();
+		return; // leave the cell selected (active set above) but do NOT open the editor
+	}
 	const rect = cellContentRect(row, col, renderer.gutterWidthPx);
 	inputEl.style.left = rect.x + 'px';
 	inputEl.style.top = rect.y + 'px';
 	inputEl.style.width = rect.width + 'px';
 	inputEl.style.height = rect.height + 'px';
-	if (initialChar !== undefined) {
-		inputEl.value = initialChar; // type-to-edit: overwrite, cursor at end (no select)
-	} else if (entry !== undefined) {
-		// Formula text (re-add the leading `=` the host dispatch keys on) over the value-default literal.
-		inputEl.value = typeof entry.formula === 'string' ? '=' + entry.formula : formatCellValue(entry.value);
-	} else {
-		inputEl.value = ''; // empty cell
-	}
+	inputEl.value = prefill;
 	inputEl.hidden = false;
 	editState = { row, col, entry, pendingCommit: false };
 	inputEl.focus();
@@ -259,6 +339,7 @@ function cancelEdit(): void {
 	editState = null;
 	inputEl.hidden = true;
 	inputEl.value = '';
+	clearError(); // closing the editor resolves any 'edit'-source banner (re-audit MED-4)
 }
 
 /** Re-position the open editor over its cell. Audit LOW-7: the gutter width can change on a theme/font
@@ -282,6 +363,17 @@ function commitEdit(nav?: { dr: number; dc: number }): void {
 	if (editState.pendingCommit) {
 		return; // a commit is already in flight
 	}
+	// Audit C1-MED6: reject an over-length input HERE (visible error, editor stays open for the user to
+	// shorten) rather than serialize a multi-MB payload across the bridge for the host to reject anyway.
+	if (inputEl.value.length > MAX_RAW_INPUT_LENGTH) {
+		showError(
+			`Cell value is ${inputEl.value.length} characters, over the ${MAX_RAW_INPUT_LENGTH}-character limit. ` +
+			`Shorten it and commit again.`,
+			'edit',
+		);
+		return;
+	}
+	clearError();
 	const sheet = fullSnapshot.sheet;
 	const row = editState.row;
 	const col = editState.col;
@@ -295,6 +387,14 @@ function commitEdit(nav?: { dr: number; dc: number }): void {
 	vscode.postMessage({ type: 'putValue', sheet, row, col, rawInput: inputEl.value });
 }
 
+// Re-audit MED-4: clear the over-length ('edit') banner as soon as the user shortens the value back to
+// the cap, so the guidance disappears the moment it no longer applies (instead of lingering until the
+// next commit/cancel).
+inputEl.addEventListener('input', () => {
+	if (errorSource === 'edit' && inputEl.value.length <= MAX_RAW_INPUT_LENGTH) {
+		clearError();
+	}
+});
 inputEl.addEventListener('keydown', ev => {
 	// Audit MED-4: while an IME composition is active, Enter/Tab ACCEPT the candidate -- they must not
 	// commit/move the cell. Let the input handle composition natively until it completes.
@@ -309,6 +409,12 @@ inputEl.addEventListener('keydown', ev => {
 		commitEdit({ dr: 0, dc: ev.shiftKey ? -1 : 1 }); // Tab commits + moves right (Shift+Tab left)
 	} else if (ev.key === 'Escape') {
 		ev.preventDefault();
+		// Audit O2-MED1: Escape is inert while a commit is in flight (matches commitEdit/blur). Cancelling
+		// here would NOT recall the already-posted putValue but WOULD wipe editState -- enabling a
+		// same-cell double-put and dropping the host's pending reply on the floor.
+		if (editState !== null && editState.pendingCommit) {
+			return;
+		}
 		cancelEdit();
 		redraw();
 		viewportEl.focus();
@@ -359,7 +465,11 @@ function updateHoverTitle(): void {
 		if (hit !== null) {
 			const entry = renderer.entryAt(hit.row, hit.col);
 			const key = hit.row + ',' + hit.col;
-			title = errorCells.get(key) ?? (entry && typeof entry.diagnostic === 'string' ? entry.diagnostic : '');
+			// Audit C1-HIGH2: cap the tooltip string (a pathological diagnostic/error message shouldn't
+			// stall the native `title` rendering).
+			title = clampDisplayString(
+				errorCells.get(key) ?? (entry && typeof entry.diagnostic === 'string' ? entry.diagnostic : ''),
+			);
 		}
 	}
 	if (title !== lastHoverTitle) {
@@ -438,6 +548,13 @@ document.addEventListener('keydown', ev => {
 				redraw();
 			}
 			return;
+		case 'Delete':
+		case 'Backspace':
+			// Audit O2-MED3: clear the selected cell. preventDefault is load-bearing for Backspace --
+			// otherwise it triggers webview history-back navigation.
+			ev.preventDefault();
+			clearActiveCell();
+			return;
 		default:
 			break;
 	}
@@ -452,11 +569,39 @@ document.addEventListener('keydown', ev => {
 // --- Inbound host messages ---
 
 /**
+ * Audit C1-MED3: validate a host `render` payload before applying it. The host is trusted, but a
+ * binding/version drift or a tampered bundle could deliver a non-conforming object; `applyRender`
+ * would then throw opaquely (e.g. `snapshot.entries.length` on undefined) and leave the grid frozen
+ * with no explanation. We accept only the pinned shape (`snapshot_format_version === 1`, numeric
+ * sheet, array entries) and otherwise surface a visible error (No-Fallbacks -- not a silent return).
+ */
+function isValidSnapshot(snapshot: unknown): snapshot is QuantbookCellSnapshot {
+	if (typeof snapshot !== 'object' || snapshot === null) {
+		return false;
+	}
+	const s = snapshot as { snapshot_format_version?: unknown; sheet?: unknown; entries?: unknown };
+	// `sheet` threads into `commitEdit`'s putValue, so require a finite non-negative integer (a NaN/string
+	// would post garbage to the host). Per-entry coord/value validation happens in `renderer.setSnapshot`
+	// (Codex HIGH-1) -- it skip+warns malformed entries rather than dropping the whole render.
+	return (
+		s.snapshot_format_version === 1 &&
+		typeof s.sheet === 'number' &&
+		Number.isInteger(s.sheet) &&
+		s.sheet >= 0 &&
+		Array.isArray(s.entries)
+	);
+}
+
+/**
  * Apply a fresh snapshot: update title/meta + spacer, resolve any in-flight commit (close the editor
  * + apply its nav), then full-redraw. A SIBLING render mid-edit (no pending commit of ours) preserves
  * the open editor (FE re-audit MED-1) -- the canvas repaints underneath it.
  */
 function applyRender(snapshot: QuantbookCellSnapshot): void {
+	// Re-audit MED-4: a valid render supersedes a TRANSIENT banner (malformed-render / un-editable cell)
+	// but must NOT hide an active 'edit' banner -- a sibling render repaints under an open editor whose
+	// over-length value is still invalid; clearing it would mask the bad pending state until next commit.
+	clearTransientError();
 	fullSnapshot = snapshot;
 	renderer.setSnapshot(snapshot);
 
@@ -502,7 +647,25 @@ window.addEventListener('message', (event: MessageEvent) => {
 		return;
 	}
 	if (msg.type === 'render') {
-		applyRender((msg as RenderMessage).snapshot);
+		const snapshot = (msg as { snapshot?: unknown }).snapshot;
+		if (!isValidSnapshot(snapshot)) {
+			const detail =
+				snapshot && typeof snapshot === 'object'
+					? 'snapshot_format_version=' + String((snapshot as { snapshot_format_version?: unknown }).snapshot_format_version)
+					: typeof snapshot;
+			console.error('[sheets-webview] dropped a malformed render snapshot:', snapshot);
+			showError('The host sent a cell-grid snapshot this view cannot render (' + detail + '). The grid was not updated.', 'transient');
+			// Re-audit MED-3: a malformed render must not strand an in-flight commit. We can't apply the
+			// snapshot, but we MUST release the editor from `pendingCommit` so Escape/blur/re-edit work
+			// again (otherwise the editor is permanently uncancellable). The commit's true fate is unknown
+			// -- the banner says the update was dropped; the user can re-check + re-commit.
+			if (editState !== null && editState.pendingCommit) {
+				editState.pendingCommit = false;
+				editState.navAfterCommit = undefined;
+			}
+			return;
+		}
+		applyRender(snapshot);
 		return;
 	}
 	if (msg.type === 'errorReply') {

@@ -23,6 +23,29 @@ import type { QuantbookCellSnapshot, QuantbookCellValue } from '../../src/quantb
 export type CellSnapshotEntry = QuantbookCellSnapshot['entries'][number];
 
 /**
+ * **FE-2-0 Phase 1 (C1-HIGH2, 2026-06-03)** -- maximum length of any string fed into the canvas
+ * text-measure / truncation path or a hover tooltip. A pathologically long `rendered`/`text`/
+ * `diagnostic` string (a malformed or tampered snapshot) would freeze `measureText` /
+ * `truncateToWidth` (a binary search that measures the FULL string first) and the native `title`
+ * tooltip. We cap the DISPLAY string only -- never the stored cell value, and never the editor
+ * pre-fill (capping an editable value would silently corrupt it on re-commit; legitimate values are
+ * already bounded by the host's `MAX_RAW_INPUT_LENGTH`, and the webview mirrors that cap at commit).
+ * 4096 chars is far beyond what a 64px cell or a tooltip can ever show.
+ */
+export const MAX_DISPLAY_CHARS = 4096;
+
+/**
+ * Clamp a string to {@link MAX_DISPLAY_CHARS} for safe canvas measurement / tooltip display. Returns
+ * the input unchanged when already within the cap (the overwhelmingly common path). The truncation is
+ * code-unit-based (a possible mid-surrogate cut here is harmless: the downstream `truncateToWidth`
+ * re-truncates to the cell width and is itself surrogate-safe; the tooltip is plain text). This is a
+ * display-only safety bound, NOT a semantic value transform.
+ */
+export function clampDisplayString(text: string): string {
+	return text.length > MAX_DISPLAY_CHARS ? text.slice(0, MAX_DISPLAY_CHARS) : text;
+}
+
+/**
  * Render a cell value for its default display string. The `switch` is exhaustive over the
  * {@link QuantbookCellValue} tagged union -- TS infers `never` in any unreachable branch as a
  * compile-time correctness pin. The canvas renderer prefers the engine-`rendered` string when
@@ -40,6 +63,37 @@ export function formatCellValue(value: QuantbookCellValue): string {
 			return value.value;
 		case 'pending':
 			return '(pending)';
+	}
+}
+
+/**
+ * **FE-2-0 Phase 1 re-audit (finding 1, 2026-06-03)** -- runtime validator for an inbound snapshot
+ * cell value, the guard that makes {@link formatCellValue} total. The renderer's `setSnapshot` uses
+ * this to skip+warn any malformed entry, so a drifted/tampered host can never feed `formatCellValue`
+ * an `undefined`-yielding value (which would then crash `clampDisplayString`/`prefill.length`).
+ *
+ * Checking only `kind` is INSUFFICIENT: `{ kind: 'text' }` (no `value` field) has a recognized kind
+ * but a missing payload, so `formatCellValue` returns `undefined`. We validate the FULL tagged-union
+ * payload per kind -- mirroring the `formatCellValue` switch exactly (the `default` rejects an unknown
+ * kind). Pure (no DOM); golden-tested.
+ */
+export function isRenderableValue(value: unknown): value is QuantbookCellValue {
+	if (value === null || typeof value !== 'object') {
+		return false;
+	}
+	const v = value as { kind?: unknown; value?: unknown };
+	switch (v.kind) {
+		case 'number':
+			return typeof v.value === 'number';
+		case 'boolean':
+			return typeof v.value === 'boolean';
+		case 'text':
+		case 'error':
+			return typeof v.value === 'string';
+		case 'pending':
+			return true; // no `value` payload -- `formatCellValue` returns a fixed '(pending)'
+		default:
+			return false;
 	}
 }
 

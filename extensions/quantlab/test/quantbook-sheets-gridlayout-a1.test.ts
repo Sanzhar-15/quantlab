@@ -28,7 +28,9 @@ import {
 	gutterWidth,
 	hitTestContent,
 	hitTestViewport,
+	isInExtent,
 	rowY,
+	scrollToReveal,
 	totalContentHeight,
 	totalContentWidth,
 } from '../webview/sheets-webview/gridLayoutA1';
@@ -119,6 +121,14 @@ suite('FE-2-0 gridLayoutA1 -- computeVisibleColRange', function () {
 	test('zero columns -> empty window', () => {
 		assert.deepStrictEqual(computeVisibleColRange(0, 320, 0, COL_WIDTH, 2), { startIdx: 0, endIdx: 0 });
 	});
+	test('zero/negative colWidth -> the whole extent (avoids divide-by-zero)', () => {
+		assert.deepStrictEqual(computeVisibleColRange(0, 320, MAX_COLS, 0, 2), { startIdx: 0, endIdx: MAX_COLS });
+		assert.deepStrictEqual(computeVisibleColRange(640, 320, MAX_COLS, -5, 2), { startIdx: 0, endIdx: MAX_COLS });
+	});
+	test('zero viewportWidth -> at least one visible column (+ overscan)', () => {
+		// visibleCount clamps to >= 1, so a degenerate 0-wide viewport still yields a non-empty window.
+		assert.deepStrictEqual(computeVisibleColRange(0, 0, MAX_COLS, COL_WIDTH, 2), { startIdx: 0, endIdx: 3 });
+	});
 });
 
 suite('FE-2-0 gridLayoutA1 -- hitTestContent (content coords)', function () {
@@ -190,5 +200,57 @@ suite('FE-2-0 gridLayoutA1 -- boundary + extent-edge exactness (audit follow-ups
 	test('cell extents tile exactly to the totals at the far edge (float64 exactness)', () => {
 		assert.strictEqual(colX(MAX_COLS - 1, G) + COL_WIDTH, totalContentWidth(G));
 		assert.strictEqual(rowY(MAX_ROWS - 1) + ROW_HEIGHT, totalContentHeight());
+	});
+});
+
+suite('FE-2-0 Phase 1 -- isInExtent (NaN/extent guard for snapshot entries)', function () {
+	test('accepts integer coordinates inside the Excel extent', () => {
+		assert.strictEqual(isInExtent(0, 0), true);
+		assert.strictEqual(isInExtent(10, 20), true);
+		assert.strictEqual(isInExtent(MAX_ROWS - 1, MAX_COLS - 1), true);
+	});
+	test('rejects out-of-extent coordinates (negative or >= the max)', () => {
+		assert.strictEqual(isInExtent(-1, 0), false);
+		assert.strictEqual(isInExtent(0, -1), false);
+		assert.strictEqual(isInExtent(MAX_ROWS, 0), false);
+		assert.strictEqual(isInExtent(0, MAX_COLS), false);
+	});
+	test('rejects NaN / Infinity / fractional coordinates (the load-bearing Number.isInteger)', () => {
+		// A bare `r < 0 || r >= MAX_ROWS` range check is FALSE for NaN -- the whole reason for the guard.
+		assert.strictEqual(isInExtent(NaN, 0), false);
+		assert.strictEqual(isInExtent(0, NaN), false);
+		assert.strictEqual(isInExtent(Infinity, 0), false);
+		assert.strictEqual(isInExtent(0.5, 0), false);
+		assert.strictEqual(isInExtent(0, 1.9), false);
+	});
+});
+
+suite('FE-2-0 Phase 1 -- scrollToReveal (one-axis reveal + tiny-viewport clamp)', function () {
+	// Representative band sizes: the gutter (≈50px) horizontally; HEADER_HEIGHT vertically.
+	const BAND = 50;
+	test('an already-visible cell leaves the scroll unchanged', () => {
+		assert.strictEqual(scrollToReveal(200, COL_WIDTH, BAND, 100, 400), 100);
+	});
+	test('a cell off the near edge (under the band) scrolls so its start sits at the band edge', () => {
+		const s = scrollToReveal(200, COL_WIDTH, BAND, 180, 400); // localStart 20 < band 50
+		assert.strictEqual(s, 200 - BAND);
+		assert.strictEqual(200 - s, BAND); // cell start now exactly at the band edge
+	});
+	test('a cell off the far edge scrolls so its end sits at the viewport edge', () => {
+		const s = scrollToReveal(500, COL_WIDTH, BAND, 100, 400); // localEnd 464 > client 400
+		assert.strictEqual(s, 500 + COL_WIDTH - 400);
+		assert.strictEqual(500 - s + COL_WIDTH, 400); // cell end now exactly at the viewport edge
+	});
+	test('tiny viewport (body narrower than a cell): left-align, never park the cell under the band', () => {
+		// client 80 - band 50 = 30 visible body < COL_WIDTH 64. The old far-edge branch would push the
+		// cell start to localX = client - COL_WIDTH = 16 < band 50 -> UNDER the gutter. The clamp left-aligns.
+		const s = scrollToReveal(300, COL_WIDTH, BAND, 290, 80);
+		assert.strictEqual(s, 300 - BAND);
+		assert.strictEqual(300 - s, BAND); // cell start at the band edge, not under it
+	});
+	test('vertical axis behaves identically with HEADER_HEIGHT as the band', () => {
+		assert.strictEqual(scrollToReveal(rowY(0), ROW_HEIGHT, HEADER_HEIGHT, 0, 400), 0); // row 0 at top, visible
+		const s = scrollToReveal(rowY(40), ROW_HEIGHT, HEADER_HEIGHT, 0, 200); // far below
+		assert.strictEqual(s, rowY(40) + ROW_HEIGHT - 200);
 	});
 });

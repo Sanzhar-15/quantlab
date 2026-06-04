@@ -16,7 +16,7 @@
 
 import * as assert from 'assert';
 
-import { computeVisibleRowRange, formatCellValue } from '../webview/sheets-webview/cellRender';
+import { computeVisibleRowRange, formatCellValue, isRenderableValue } from '../webview/sheets-webview/cellRender';
 
 suite('FE-0b sheets-webview cellRender -- formatCellValue', function () {
 	test('number renders its String() form', () => {
@@ -31,6 +31,34 @@ suite('FE-0b sheets-webview cellRender -- formatCellValue', function () {
 		assert.strictEqual(formatCellValue({ kind: 'text', value: 'hello' }), 'hello');
 		assert.strictEqual(formatCellValue({ kind: 'error', value: '#DIV/0!' }), '#DIV/0!');
 		assert.strictEqual(formatCellValue({ kind: 'pending' }), '(pending)');
+	});
+});
+
+suite('FE-2-0 Phase 1 cellRender -- isRenderableValue (the formatCellValue guard)', function () {
+	test('accepts each well-formed tagged-union value', () => {
+		assert.strictEqual(isRenderableValue({ kind: 'number', value: 42 }), true);
+		assert.strictEqual(isRenderableValue({ kind: 'boolean', value: false }), true);
+		assert.strictEqual(isRenderableValue({ kind: 'text', value: 'hi' }), true);
+		assert.strictEqual(isRenderableValue({ kind: 'error', value: '#DIV/0!' }), true);
+		assert.strictEqual(isRenderableValue({ kind: 'pending' }), true);
+	});
+	test('rejects a recognized kind with a MISSING/wrong-typed payload (the re-audit crash case)', () => {
+		// `{kind:'text'}` has a valid kind but no `value` -> formatCellValue would return undefined.
+		assert.strictEqual(isRenderableValue({ kind: 'text' }), false);
+		assert.strictEqual(isRenderableValue({ kind: 'number' }), false);
+		assert.strictEqual(isRenderableValue({ kind: 'number', value: '42' }), false); // string, not number
+		assert.strictEqual(isRenderableValue({ kind: 'boolean', value: 1 }), false); // number, not boolean
+		assert.strictEqual(isRenderableValue({ kind: 'text', value: 7 }), false); // number, not string
+		assert.strictEqual(isRenderableValue({ kind: 'error', value: null }), false);
+	});
+	test('rejects an unknown kind and non-object values', () => {
+		assert.strictEqual(isRenderableValue({ kind: 'blank' }), false); // host rejects blank in snapshots
+		assert.strictEqual(isRenderableValue({ kind: 'whatever', value: 'x' }), false);
+		assert.strictEqual(isRenderableValue({}), false);
+		assert.strictEqual(isRenderableValue(null), false);
+		assert.strictEqual(isRenderableValue(undefined), false);
+		assert.strictEqual(isRenderableValue('text'), false);
+		assert.strictEqual(isRenderableValue(42), false);
 	});
 });
 

@@ -24,7 +24,7 @@
  */
 
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
-import { computeVisibleRowRange, formatCellValue } from './cellRender';
+import { clampDisplayString, computeVisibleRowRange, formatCellValue, isRenderableValue } from './cellRender';
 import {
 	COL_WIDTH,
 	HEADER_HEIGHT,
@@ -35,6 +35,7 @@ import {
 	columnLabel,
 	computeVisibleColRange,
 	gutterWidth,
+	isInExtent,
 	rowY,
 	truncateToWidth,
 } from './gridLayoutA1';
@@ -70,23 +71,43 @@ function warnMissingThemeVar(name: string, fallback: string): void {
 }
 
 /**
- * **Audit HIGH-1** -- one-time loud warning for a snapshot entry whose (row,col) is OUTSIDE the A1
- * extent. The host validates coordinates to u32 (4294967295), but the renderable grid is the Excel
- * extent (`MAX_ROWS × MAX_COLS`). Such a cell can never be drawn in the A1 grid; we skip it from the
- * lookup AND warn rather than silently fold it (No-Fallbacks) -- and the lookup uses a string key so
- * an out-of-extent coordinate can never COLLIDE with a visible cell.
+ * **Audit HIGH-1 / C1-MED4 (Phase 1 re-audit, 2026-06-03)** -- one-time loud warning for a snapshot
+ * entry that cannot be rendered: its (row,col) is non-integer / out of the Excel extent, OR its value
+ * is not a recognized {@link QuantbookCellValue}. The host validates coordinates to u32 and emits only
+ * well-formed values, so a violation here signals a binding/version drift or a tampered bundle. We
+ * skip the entry from the lookup AND warn (No-Fallbacks: surface, don't silently coerce) -- critically
+ * WITHOUT `Number()`-coercing the coordinate first (`Number("")===0`, `Number(null)===0` would
+ * silently paint a malformed cell at A1; `Number.isInteger` inside {@link isInExtent} rejects the
+ * non-number outright).
  */
-let warnedOutOfExtent = false;
-function warnOutOfExtentEntry(row: number, col: number): void {
-	if (warnedOutOfExtent) {
+let warnedSkippedEntry = false;
+function warnSkippedEntry(reason: string, entry: unknown): void {
+	if (warnedSkippedEntry) {
 		return;
 	}
-	warnedOutOfExtent = true;
+	warnedSkippedEntry = true;
 	console.warn(
-		`[sheets-webview] snapshot entry (row=${row}, col=${col}) is outside the A1 extent ` +
-		`(${MAX_ROWS}x${MAX_COLS}); it cannot be rendered and is skipped. The engine/host should not ` +
-		`produce off-extent cells -- this signals an upstream contract violation.`,
+		`[sheets-webview] a snapshot entry was skipped (${reason}); it cannot be rendered in the A1 ` +
+		`extent (${MAX_ROWS}x${MAX_COLS}). The engine/host should not produce such entries -- this ` +
+		`signals an upstream contract violation. Offending entry:`,
+		entry,
 	);
+}
+
+/** Whether a snapshot entry can be rendered: a non-null object at an in-extent integer (row,col) whose
+ * value is a well-formed {@link QuantbookCellValue} (see `isRenderableValue` -- re-audit finding 1: the
+ * value payload, not just its `kind`, must be valid or `formatCellValue`/`clampDisplayString` crash). */
+function isRenderableEntry(entry: unknown): entry is QuantbookCellSnapshot['entries'][number] {
+	if (entry === null || typeof entry !== 'object') {
+		return false;
+	}
+	const e = entry as { row?: unknown; col?: unknown; value?: unknown };
+	// RAW typeof checks BEFORE isInExtent -- isInExtent expects numbers, and a non-number coord must be
+	// rejected here (not `Number()`-coerced, which would silently map ""/null to A1).
+	if (typeof e.row !== 'number' || typeof e.col !== 'number' || !isInExtent(e.row, e.col)) {
+		return false;
+	}
+	return isRenderableValue(e.value);
 }
 
 interface Palette {
@@ -105,9 +126,9 @@ interface Palette {
 export class CanvasGridRenderer {
 	private readonly ctx: CanvasRenderingContext2D;
 	private dpr: number;
-	private snapshot: QuantbookCellSnapshot | null = null;
-	/** `"row,col" -> entry` for O(1) paint + hover lookup (replaces entry-index access). A STRING key
-	 * (not `row*MAX_COLS+col`) so an out-of-extent coordinate can never collide with a visible cell. */
+	/** `"row,col" -> entry` for O(1) paint + hover lookup AND the single source the windowed paint
+	 * iterates (Audit C1-HIGH1: no separate `snapshot.entries` scan). A STRING key (not
+	 * `row*MAX_COLS+col`) so an out-of-extent coordinate can never collide with a visible cell. */
 	private entryByCell = new Map<string, QuantbookCellSnapshot['entries'][number]>();
 	private palette: Palette;
 	private bodyFont: string;
@@ -171,19 +192,19 @@ export class CanvasGridRenderer {
 	}
 
 	setSnapshot(snapshot: QuantbookCellSnapshot): void {
-		this.snapshot = snapshot;
-		// Rebuild the (row,col) lookup (snapshot is sparse -- populated cells only). Audit HIGH-1: bound
-		// an entry to the A1 extent before inserting + use a string key, so a host u32 coordinate
-		// outside [0,MAX_ROWS)x[0,MAX_COLS) cannot alias a visible cell.
+		// Rebuild the (row,col) lookup (snapshot is sparse -- populated cells only). Phase-1 re-audit
+		// (Codex HIGH-1): validate each entry's RAW coordinate + value WITHOUT `Number()`-coercing first
+		// (that turned ""/null into a silent A1 paint) and skip+warn any malformed entry, so neither the
+		// windowed paint nor the hover/edit lookup can ever see a bad coordinate or an unrenderable value
+		// (the latter would crash `formatCellValue`/`clampDisplayString` mid-paint). The string key
+		// (`row + ',' + col`) keeps an off-extent coordinate from aliasing a visible cell.
 		this.entryByCell = new Map();
 		for (const entry of snapshot.entries) {
-			const r = Number(entry.row);
-			const c = Number(entry.col);
-			if (r < 0 || r >= MAX_ROWS || c < 0 || c >= MAX_COLS) {
-				warnOutOfExtentEntry(r, c);
+			if (!isRenderableEntry(entry)) {
+				warnSkippedEntry('non-integer/off-extent coord or unrenderable value', entry);
 				continue;
 			}
-			this.entryByCell.set(r + ',' + c, entry);
+			this.entryByCell.set(entry.row + ',' + entry.col, entry);
 		}
 	}
 
@@ -271,14 +292,15 @@ export class CanvasGridRenderer {
 		const bodyWidth = Math.max(0, cssWidth - gutterW);
 		const colRange = computeVisibleColRange(scrollLeft, bodyWidth, MAX_COLS, COL_WIDTH, OVERSCAN);
 
-		// 1. Error-cell background tints (under the gridlines + text, like Excel).
+		// 1. Error-cell background tints (under the gridlines + text, like Excel). Audit S1-LOW: snap the
+		// fill origin to a device pixel so the tint aligns with the (rounded) gridlines on non-Electron/test.
 		if (errorCells.size > 0) {
 			ctx.fillStyle = this.palette.errorBg;
 			for (let r = rowRange.startIdx; r < rowRange.endIdx; r += 1) {
-				const ly = rowY(r) - scrollTop;
+				const ly = Math.round(rowY(r) - scrollTop);
 				for (let c = colRange.startIdx; c < colRange.endIdx; c += 1) {
 					if (errorCells.has(r + ',' + c)) {
-						ctx.fillRect(colX(c, gutterW) - scrollLeft, ly, COL_WIDTH, ROW_HEIGHT);
+						ctx.fillRect(Math.round(colX(c, gutterW) - scrollLeft), ly, COL_WIDTH, ROW_HEIGHT);
 					}
 				}
 			}
@@ -301,30 +323,34 @@ export class CanvasGridRenderer {
 		}
 		ctx.stroke();
 
-		// 3. Values for the populated cells in the window (sparse -- iterate entries, not every cell).
+		// 3. Values for the populated cells in the window. Audit C1-HIGH1: iterate the VISIBLE WINDOW
+		// (bounded ~viewport rows x cols) and look up each cell in the sparse map -- O(visible cells), a hard
+		// per-frame ceiling independent of the snapshot's entry count (a dense FE-1 `qb.show` could be huge).
 		ctx.font = this.bodyFont;
 		ctx.textBaseline = 'middle';
 		ctx.textAlign = 'left';
-		const entries = this.snapshot?.entries ?? [];
 		const valueMax = COL_WIDTH - CELL_PAD * 2;
-		for (const entry of entries) {
-			const r = Number(entry.row);
-			const c = Number(entry.col);
-			if (r < rowRange.startIdx || r >= rowRange.endIdx || c < colRange.startIdx || c >= colRange.endIdx) {
-				continue;
+		for (let r = rowRange.startIdx; r < rowRange.endIdx; r += 1) {
+			const y = Math.round(rowY(r) - scrollTop);
+			for (let c = colRange.startIdx; c < colRange.endIdx; c += 1) {
+				const entry = this.entryByCell.get(r + ',' + c);
+				if (entry === undefined) {
+					continue; // empty cell -- gridlines only, no fillText
+				}
+				const x = Math.round(colX(c, gutterW) - scrollLeft);
+				const isError = errorCells.has(r + ',' + c);
+				// Audit C1-HIGH2: cap the display string BEFORE measure/truncate so a pathological `rendered`
+				// can't freeze the binary search (which measures the full string first).
+				const raw = typeof entry.rendered === 'string' ? entry.rendered : formatCellValue(entry.value);
+				const shown = truncateToWidth(clampDisplayString(raw), valueMax, s => this.measure(s));
+				ctx.fillStyle = isError ? this.palette.errorFg : this.palette.foreground;
+				ctx.save();
+				ctx.beginPath();
+				ctx.rect(x, y, COL_WIDTH, ROW_HEIGHT);
+				ctx.clip();
+				ctx.fillText(shown, x + CELL_PAD, y + ROW_HEIGHT / 2);
+				ctx.restore();
 			}
-			const x = colX(c, gutterW) - scrollLeft;
-			const y = rowY(r) - scrollTop;
-			const isError = errorCells.has(r + ',' + c);
-			const display = typeof entry.rendered === 'string' ? entry.rendered : formatCellValue(entry.value);
-			const shown = truncateToWidth(display, valueMax, s => this.measure(s));
-			ctx.fillStyle = isError ? this.palette.errorFg : this.palette.foreground;
-			ctx.save();
-			ctx.beginPath();
-			ctx.rect(x, y, COL_WIDTH, ROW_HEIGHT);
-			ctx.clip();
-			ctx.fillText(shown, x + CELL_PAD, y + ROW_HEIGHT / 2);
-			ctx.restore();
 		}
 
 		// 4. Active-cell selection box (2px accent border), if the selected cell is in the window. Audit
@@ -336,8 +362,9 @@ export class CanvasGridRenderer {
 			active.col >= colRange.startIdx &&
 			active.col < colRange.endIdx
 		) {
-			const x = colX(active.col, gutterW) - scrollLeft;
-			const y = rowY(active.row) - scrollTop;
+			// Audit S1-MED1: snap the box origin to a device pixel (crisp on non-Electron/test).
+			const x = Math.round(colX(active.col, gutterW) - scrollLeft);
+			const y = Math.round(rowY(active.row) - scrollTop);
 			ctx.strokeStyle = this.palette.selectionBorder;
 			ctx.lineWidth = SELECTION_BORDER_PX;
 			// Inset by half the border so the 2px stroke sits inside the cell rect.
@@ -369,8 +396,14 @@ export class CanvasGridRenderer {
 		ctx.font = this.headerFont;
 		ctx.textBaseline = 'middle';
 		ctx.textAlign = 'right';
+		// Audit S1-LOW2: clip the label region to the gutter (mirrors drawHeader's per-cell clip) so a
+		// wider-than-gutter row number can never bleed right over the body. Snap each row origin too.
+		ctx.save();
+		ctx.beginPath();
+		ctx.rect(0, 0, gutterW, cssHeight);
+		ctx.clip();
 		for (let r = startRow; r < endRow; r += 1) {
-			const y = rowY(r) - scrollTop;
+			const y = Math.round(rowY(r) - scrollTop);
 			if (active !== null && active.row === r) {
 				ctx.fillStyle = this.palette.headerActiveBg;
 				ctx.fillRect(0, y, gutterW, ROW_HEIGHT);
@@ -378,6 +411,7 @@ export class CanvasGridRenderer {
 			ctx.fillStyle = this.palette.foreground;
 			ctx.fillText(String(r + 1), gutterW - CELL_PAD, y + ROW_HEIGHT / 2);
 		}
+		ctx.restore();
 		// Gutter right border + per-row bottom borders.
 		ctx.strokeStyle = this.palette.border;
 		ctx.lineWidth = 1;
@@ -413,7 +447,9 @@ export class CanvasGridRenderer {
 		ctx.textAlign = 'center';
 		const textY = HEADER_HEIGHT / 2;
 		for (let c = startCol; c < endCol; c += 1) {
-			const x = colX(c, gutterW) - scrollLeft;
+			// Audit S1-LOW3: snap the column origin so the active-col tint + label clip align with the
+			// (rounded) header separators.
+			const x = Math.round(colX(c, gutterW) - scrollLeft);
 			if (active !== null && active.col === c) {
 				ctx.fillStyle = this.palette.headerActiveBg;
 				ctx.fillRect(x, 0, COL_WIDTH, HEADER_HEIGHT);

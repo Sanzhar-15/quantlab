@@ -149,6 +149,58 @@ export function computeVisibleColRange(
 }
 
 /**
+ * **FE-2-0 Phase 1 (C1-MED4, 2026-06-03)** -- whether `(row,col)` is a renderable A1 cell: an
+ * INTEGER inside `[0,MAX_ROWS) × [0,MAX_COLS)`. The explicit `Number.isInteger` is load-bearing: a
+ * bare `r < 0 || r >= MAX_ROWS` comparison is FALSE for `NaN`, so a `NaN`/fractional coordinate from
+ * a malformed snapshot would slip past a range-only check into the paint/lookup math. Pure +
+ * golden-tested so the renderer's `setSnapshot` extent guard is verified headlessly.
+ */
+export function isInExtent(row: number, col: number): boolean {
+	return (
+		Number.isInteger(row) &&
+		Number.isInteger(col) &&
+		row >= 0 &&
+		row < MAX_ROWS &&
+		col >= 0 &&
+		col < MAX_COLS
+	);
+}
+
+/**
+ * **FE-2-0 Phase 1 (C2-MED2, 2026-06-03)** -- the new scroll offset (one axis) that reveals a cell
+ * below/right of a sticky band, given the cell's content-start, its size, the sticky band size
+ * (header/gutter), the current scroll, and the viewport client size. Keeps the "ALL viewport math
+ * lives here" doctrine + is golden-testable (the old inline version read the DOM).
+ *
+ * - **Tiny viewport** (visible body `client - band <= size`, i.e. narrower/shorter than one cell):
+ *   align the cell's start to the band edge (`start - band`) and accept clipping on the far edge.
+ *   Without this, the far-edge branch parks the cell PARTLY UNDER the sticky band.
+ * - Cell starts before the band edge -> scroll so its start sits at the band edge.
+ * - Cell ends past the viewport -> scroll so its end sits at the viewport edge.
+ * - Otherwise already fully visible -> scroll unchanged.
+ */
+export function scrollToReveal(
+	cellStart: number,
+	cellSize: number,
+	bandSize: number,
+	scroll: number,
+	clientSize: number,
+): number {
+	const bodyVisible = clientSize - bandSize;
+	if (bodyVisible <= cellSize) {
+		return cellStart - bandSize; // viewport too small for a whole cell: align to the band edge
+	}
+	const localStart = cellStart - scroll;
+	if (localStart < bandSize) {
+		return cellStart - bandSize;
+	}
+	if (localStart + cellSize > clientSize) {
+		return cellStart + cellSize - clientSize;
+	}
+	return scroll;
+}
+
+/**
  * Map a CONTENT-coordinate point to the cell `(row,col)` under it, or `null` if it lands in the
  * header band, the gutter, the corner, or outside the `MAX_ROWS × MAX_COLS` extent. Callers with a
  * VIEWPORT-local point must use {@link hitTestViewport} instead (the bands are sticky).
