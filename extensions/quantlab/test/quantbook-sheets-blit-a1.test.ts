@@ -311,16 +311,28 @@ suite('FE-2-0 polish staleTintKeysA1 -- clear a stale error tint on a real conte
 		assert.deepStrictEqual(staleTintKeysA1(prev, next, ['0,0', '0,1']), ['0,1']);
 	});
 	test('a FORMULA change with the same displayed value -> returned (a real write landed)', () => {
-		// entryVisualEqual compares formula text too, so re-pointing a formula (even to the same value) is a
+		// cellContentEqual compares formula text too, so re-pointing a formula (even to the same value) is a
 		// real edit -> the tint should clear. (Audit fix: the prior fixture used an identical formula.)
 		const prev = snap([entry(0, 0, num(3), { formula: 'A2+1', rendered: '3' })]);
 		const next = snap([entry(0, 0, num(3), { formula: 'A3+2', rendered: '3' })]);
 		assert.deepStrictEqual(staleTintKeysA1(prev, next, ['0,0']), ['0,0']);
 	});
-	test('an identical entry (same value/formula/rendered) -> not returned (no write landed)', () => {
+	test('an identical entry (same value/formula) -> not returned (no write landed)', () => {
 		const e = { formula: 'A2+1', rendered: '3' };
 		const prev = snap([entry(0, 0, num(3), e)]);
 		const next = snap([entry(0, 0, num(3), { ...e })]);
+		assert.deepStrictEqual(staleTintKeysA1(prev, next, ['0,0']), []);
+	});
+	test('a DIAGNOSTIC-only change (same value+formula) -> NOT returned (megaudit MED: not a write)', () => {
+		// `diagnostic` is attached host-side from the event ring and can change with no cell write -- it must
+		// NOT clear the error tint. staleTintKeysA1 uses cellContentEqual (value+formula), not entryVisualEqual.
+		const prev = snap([entry(0, 0, num(3), { diagnostic: undefined })]);
+		const next = snap([entry(0, 0, num(3), { diagnostic: '#CALC! recompute touched it' })]);
+		assert.deepStrictEqual(staleTintKeysA1(prev, next, ['0,0']), []);
+	});
+	test('a RENDERED-only change (same value+formula) -> NOT returned (display projection, not a write)', () => {
+		const prev = snap([entry(0, 0, num(3), { rendered: '3' })]);
+		const next = snap([entry(0, 0, num(3), { rendered: '3.00' })]);
 		assert.deepStrictEqual(staleTintKeysA1(prev, next, ['0,0']), []);
 	});
 	test('a malformed entry in prev/next does not throw (cellKey guards it, like diffSnapshotsA1)', () => {

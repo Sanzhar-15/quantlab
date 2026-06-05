@@ -526,14 +526,17 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			if (opSucceeded) {
 				try {
-					const { refreshed, failed } = CellGridPanel.refreshAll();
+					// Megaudit (2026-06-05) M1: refresh THIS session's panels, not every open workbook's
+					// (refreshAll) -- matches the session-scoped onCommit path + stops misattributing an unrelated
+					// workbook's render failure to this sheet op.
+					const { refreshed, failed } = CellGridPanel.refreshSession(target.session);
 					log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
 					if (failed > 0) {
 						void vscode.window.showWarningMessage(`Quantbook: the sheet change succeeded, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
 					}
 				} catch (err) {
 					const detail = err instanceof Error ? err.message : String(err);
-					log.appendLine(`refreshAll after addSheet failed (non-fatal): ${detail}`);
+					log.appendLine(`refreshSession after addSheet failed (non-fatal): ${detail}`);
 				}
 			}
 		}),
@@ -597,14 +600,17 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			if (opSucceeded) {
 				try {
-					const { refreshed, failed } = CellGridPanel.refreshAll();
+					// Megaudit (2026-06-05) M1: refresh THIS session's panels, not every open workbook's
+					// (refreshAll) -- matches the session-scoped onCommit path + stops misattributing an unrelated
+					// workbook's render failure to this sheet op.
+					const { refreshed, failed } = CellGridPanel.refreshSession(target.session);
 					log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
 					if (failed > 0) {
 						void vscode.window.showWarningMessage(`Quantbook: the sheet change succeeded, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
 					}
 				} catch (err) {
 					const detail = err instanceof Error ? err.message : String(err);
-					log.appendLine(`refreshAll after renameSheet failed (non-fatal): ${detail}`);
+					log.appendLine(`refreshSession after renameSheet failed (non-fatal): ${detail}`);
 				}
 			}
 		}),
@@ -662,14 +668,17 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			if (opSucceeded) {
 				try {
-					const { refreshed, failed } = CellGridPanel.refreshAll();
+					// Megaudit (2026-06-05) M1: refresh THIS session's panels, not every open workbook's
+					// (refreshAll) -- matches the session-scoped onCommit path + stops misattributing an unrelated
+					// workbook's render failure to this sheet op.
+					const { refreshed, failed } = CellGridPanel.refreshSession(target.session);
 					log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
 					if (failed > 0) {
 						void vscode.window.showWarningMessage(`Quantbook: the sheet change succeeded, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
 					}
 				} catch (err) {
 					const detail = err instanceof Error ? err.message : String(err);
-					log.appendLine(`refreshAll after deleteSheet failed (non-fatal): ${detail}`);
+					log.appendLine(`refreshSession after deleteSheet failed (non-fatal): ${detail}`);
 				}
 			}
 		}),
@@ -723,14 +732,17 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			if (opSucceeded) {
 				try {
-					const { refreshed, failed } = CellGridPanel.refreshAll();
+					// Megaudit (2026-06-05) M1: refresh THIS session's panels, not every open workbook's
+					// (refreshAll) -- matches the session-scoped onCommit path + stops misattributing an unrelated
+					// workbook's render failure to this sheet op.
+					const { refreshed, failed } = CellGridPanel.refreshSession(target.session);
 					log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
 					if (failed > 0) {
 						void vscode.window.showWarningMessage(`Quantbook: the sheet change succeeded, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
 					}
 				} catch (err) {
 					const detail = err instanceof Error ? err.message : String(err);
-					log.appendLine(`refreshAll after moveSheet failed (non-fatal): ${detail}`);
+					log.appendLine(`refreshSession after moveSheet failed (non-fatal): ${detail}`);
 				}
 			}
 		}),

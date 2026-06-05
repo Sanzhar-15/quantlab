@@ -278,6 +278,14 @@ function entryVisualEqual(a: Entry, b: Entry): boolean {
 	);
 }
 
+/** Equal iff two entries have the same STORED CONTENT (value + formula) -- the "a real write landed"
+ * signal for {@link staleTintKeysA1}. Deliberately EXCLUDES `diagnostic` (attached host-side from the
+ * event ring, can change with NO cell write -- megaudit MED: a diagnostic-only delta must not clear an
+ * error tint) and `rendered` (a derived display projection of `value`, not an independent write). */
+function cellContentEqual(a: Entry, b: Entry): boolean {
+	return valueEqual(a.value, b.value) && optEqual(a.formula, b.formula);
+}
+
 /** The renderer's `(row,col)` lookup key for an entry, or `null` if the entry is not renderable -- it
  * mirrors `canvasGrid.isRenderableEntry` FULLY (coordinate AND value), so the diff sees exactly the
  * painted set. An unrenderable entry paints nothing, so it can never contribute damage on its own. */
@@ -403,7 +411,8 @@ export function errorRowsFlippedA1(
  * This returns the subset of `tintedKeys` (`"row,col"`) whose STORED CONTENT actually changed between
  * `prev` and `next` -- i.e. a real write landed on that cell -- so the caller can drop only those tints.
  * Because a rejected edit was never stored, "the snapshot shows a valid value" is ALWAYS true and cannot
- * be the signal; the CHANGE between renders is. Reuses the same visual equality as {@link diffSnapshotsA1}.
+ * be the signal; the CHANGE between renders is. Uses {@link cellContentEqual} (value + formula only) -- a
+ * diagnostic-only or rendered-only delta is NOT a write and must not clear the tint.
  *
  * The cell with an OPEN editor is INTENTIONALLY not special-cased: clearing the tint of the very cell the
  * user is fixing when a SIBLING repairs it is exactly the point of this feature, and the editor (a real
@@ -440,11 +449,12 @@ export function staleTintKeysA1(
 	for (const key of tintedKeys) {
 		const pe = prevByKey.get(key);
 		const ne = nextByKey.get(key);
-		// Content changed iff the cell's RENDERABLE presence flipped, or both renders carry the cell but it
-		// now paints differently (a real write -- value/formula/rendered/diagnostic changed).
+		// Content changed iff the cell's RENDERABLE presence flipped, or both renders carry the cell but its
+		// STORED CONTENT (value + formula) now differs -- a real write. (NOT entryVisualEqual: a diagnostic-
+		// only or rendered-only change is not a write and must not clear the tint -- megaudit MED.)
 		const changed =
 			(pe === undefined) !== (ne === undefined) ||
-			(pe !== undefined && ne !== undefined && !entryVisualEqual(pe, ne));
+			(pe !== undefined && ne !== undefined && !cellContentEqual(pe, ne));
 		if (changed) {
 			out.push(key);
 		}

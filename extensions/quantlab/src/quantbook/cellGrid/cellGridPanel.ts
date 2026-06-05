@@ -135,6 +135,14 @@ export class CellGridPanel {
 		panel.onDidChangeViewState(e => {
 			if (e.webviewPanel.active) {
 				focusedPanel = instance;
+			} else if (focusedPanel === instance) {
+				// Megaudit (2026-06-05) MED: clear the focus pointer when THIS panel stops being active (the
+				// user clicked a source file / another editor). Otherwise `focusedLocalPanel()` keeps returning
+				// this no-longer-focused panel, and a sheet-management / Save-As command with multiple workbooks
+				// open would silently target it instead of hitting the intended ambiguous-abort (resolveTargetOrWarn).
+				// Switching grid B -> grid A still ends with focusedPanel === A regardless of the activate/
+				// deactivate event order (A's activate sets it; B's deactivate only clears it if it is still B).
+				focusedPanel = undefined;
 			}
 		}, undefined, panelDisposables);
 		// Mount the persistent bundle shell ONCE. Snapshots are pushed via
@@ -205,8 +213,9 @@ export class CellGridPanel {
 	}
 
 	/**
-	 * Refresh ALL currently-open cell-grid panels. Called by
-	 * `quantlab.quantbookCellGridRefresh` + the B2 sheet-management commands.
+	 * Refresh ALL currently-open cell-grid panels. Called by the explicit
+	 * `quantlab.quantbookCellGridRefresh` command. (The B2 sheet-management commands use the
+	 * session-scoped {@link refreshSession} instead -- megaudit M1, 2026-06-05.)
 	 * Returns `{ refreshed, failed }` so callers can surface a render failure LOUD
 	 * (No-Fallbacks): a panel whose `render()` throws is NOT counted as refreshed
 	 * (it does not silently masquerade as success). `safeRender` still isolates the

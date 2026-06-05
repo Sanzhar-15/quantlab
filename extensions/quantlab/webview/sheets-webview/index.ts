@@ -184,9 +184,10 @@ interface EditState {
 	col: number;
 	// The populated entry under the cell at edit-start (formula/value pre-fill); undefined for an empty cell.
 	readonly entry?: QuantbookCellSnapshot['entries'][number];
-	// **FE-2-0 polish (2026-06-05)**: the editor's value at edit-start (the prefill). `blur` commits only a
-	// CHANGED value (Excel: clicking/Tabbing away saves an edit) and cancels an unchanged one -- this is the
-	// baseline it compares against.
+	// **FE-2-0 polish (2026-06-05)**: the cell's PRE-edit content -- the baseline `blur` compares against to
+	// commit (changed) vs cancel (unchanged). For F2/click this equals the prefill; for type-to-edit it is the
+	// PRIOR content (NOT the injected char -- megaudit MED-1), or the {@link OVERSIZE_BASELINE} sentinel when
+	// the prior content is over the editable cap (so it is never built/held).
 	readonly initialValue: string;
 	pendingCommit: boolean;
 	// FE-2-0 Phase 2 (commit-token): the unique id of THIS in-flight commit, stamped by commitEdit and
@@ -426,6 +427,45 @@ function clearActiveCell(): void {
 
 // --- Overlay editor ---
 
+/** A sentinel `blur` baseline for an over-cap cell reached via type-to-edit. Its runtime value begins with a
+ * NUL char (a `\u0000` escape in source, so the file stays plain text) -- a char an `<input>` cannot
+ * produce -- so blur always treats the typed value as a CHANGE (and commits it). Used INSTEAD of the real
+ * (possibly multi-MB) prior content so that string is never built or held (megaudit MED: keep the oversize
+ * defense on the type-to-edit path). Worst case if somehow matched, blur reads "unchanged" and abandons --
+ * benign. */
+const OVERSIZE_BASELINE = '\u0000-oversize-prior-value';
+
+/**
+ * The cell's pre-edit content for {@link beginEdit}: the F2/click prefill AND the `blur` baseline.
+ *
+ * Returns `oversize:true` (with empty `text`) when the prior value exceeds {@link MAX_RAW_INPUT_LENGTH},
+ * determined from the RAW formula/text length BEFORE concatenating/formatting -- so a multi-MB value is
+ * NEVER materialized (re-audit HIGH-2 + megaudit MED: the editor cannot host such a value, and we must not
+ * build or hold it). Pure; no DOM.
+ */
+function priorCellContent(entry: QuantbookCellSnapshot['entries'][number] | undefined): { text: string; oversize: boolean } {
+	if (entry === undefined) {
+		return { text: '', oversize: false };
+	}
+	if (typeof entry.formula === 'string') {
+		// The editor shows `'=' + formula`; check the raw length first so an over-cap formula is flagged
+		// WITHOUT building the concatenation.
+		if (entry.formula.length + 1 > MAX_RAW_INPUT_LENGTH) {
+			return { text: '', oversize: true };
+		}
+		return { text: '=' + entry.formula, oversize: false };
+	}
+	// Only a `text` value can realistically be multi-MB; check its raw length before `formatCellValue` builds it.
+	if (entry.value.kind === 'text' && entry.value.value.length > MAX_RAW_INPUT_LENGTH) {
+		return { text: '', oversize: true };
+	}
+	const lit = formatCellValue(entry.value);
+	if (lit.length > MAX_RAW_INPUT_LENGTH) {
+		return { text: '', oversize: true }; // defensive: a pathological number/error projection
+	}
+	return { text: lit, oversize: false };
+}
+
 /** Open the editor over (row,col). `initialChar` (type-to-edit) replaces the cell content. */
 function beginEdit(row: number, col: number, initialChar?: string): void {
 	if (fullSnapshot === null) {
@@ -446,31 +486,26 @@ function beginEdit(row: number, col: number, initialChar?: string): void {
 	// otherwise the overlay editor opens off-screen (content-layer child positioned at the cell rect).
 	ensureActiveVisible();
 	const entry = renderer.entryAt(row, col);
-	// Compute the pre-fill. Re-audit HIGH-2: a malformed/drifted snapshot can carry a multi-MB value/formula;
-	// assigning it to `inputEl.value` + `select()` would freeze the webview (the canvas measure path is
-	// capped, but the editor is a real <input>). Such a value also could never be committed (the host +
-	// client cap rawInput at MAX_RAW_INPUT_LENGTH). So we refuse to OPEN the editor (the cell stays selected
-	// + revealed) and surface a visible error -- No-Fallbacks: we never silently truncate the value.
-	// The cell's content BEFORE this edit -- the baseline `blur` compares against to decide commit-vs-cancel.
-	// **Audit MED-1 (2026-06-05)**: for type-to-edit the editor SHOWS `initialChar`, but the blur baseline
-	// must be the PRIOR content (empty / the existing value), not the injected char -- else typing one char
-	// into an empty cell then clicking away computes `value === initialValue` and SILENTLY DISCARDS the
-	// keystroke. So `initialValue` is always `existingContent`; only the visible `prefill` differs.
-	const existingContent: string = entry !== undefined
-		// Formula text (re-add the leading `=` the host dispatch keys on) over the value-default literal.
-		? (typeof entry.formula === 'string' ? '=' + entry.formula : formatCellValue(entry.value))
-		: ''; // empty cell
-	const prefill: string = initialChar !== undefined ? initialChar : existingContent;
-	if (prefill.length > MAX_RAW_INPUT_LENGTH) {
-		// The cell IS now selected + revealed; we just won't open the editor. (No "selection unchanged"
-		// claim -- a click here moves the selection; only F2/type leave it where it was.)
+	// The cell's content BEFORE this edit -- both the F2/click prefill AND the `blur` baseline.
+	// Re-audit HIGH-2 + megaudit MED: a malformed/drifted snapshot can carry a multi-MB value/formula;
+	// {@link priorCellContent} returns `oversize:true` WITHOUT building (or holding) that string -- it checks
+	// the raw formula/text length first. F2/click on an oversize cell refuses to open the editor + surfaces a
+	// visible error (No-Fallbacks); type-to-edit shows just the injected char with a sentinel blur baseline.
+	const prior = priorCellContent(entry);
+	if (initialChar === undefined && prior.oversize) {
+		// F2 / click on an over-cap cell: refuse to OPEN the editor (the cell stays selected + revealed) and
+		// surface a visible error -- No-Fallbacks: we never silently truncate the value.
 		showError(
-			`This cell's value is ${prefill.length} characters, over the ${MAX_RAW_INPUT_LENGTH}-character ` +
-			`editable limit, so it cannot be edited here.`,
+			`This cell's value is over the ${MAX_RAW_INPUT_LENGTH}-character editable limit, so it cannot be edited here.`,
 			'transient',
 		);
 		return; // do NOT open the editor (the cell is selected + scrolled into view)
 	}
+	const prefill: string = initialChar !== undefined ? initialChar : prior.text;
+	// The blur baseline. For an over-cap cell reached via type-to-edit we use a sentinel (the prior value is
+	// never built/held); it can't equal any in-cap editor value, so blur correctly sees the typed char as a
+	// change. Otherwise it is the real prior content (megaudit MED-1: NOT the injected char).
+	const initialValue: string = prior.oversize ? OVERSIZE_BASELINE : prior.text;
 	const rect = cellContentRect(row, col, renderer.gutterWidthPx);
 	inputEl.style.left = rect.x + 'px';
 	inputEl.style.top = rect.y + 'px';
@@ -480,7 +515,7 @@ function beginEdit(row: number, col: number, initialChar?: string): void {
 	inputEl.value = prefill;
 	inputEl.hidden = false;
 	inputEl.style.clipPath = ''; // FE-2-0 polish: start unclipped; updateEditClip below sets it for this cell
-	editState = { sheet: fullSnapshot.sheet, row, col, entry, initialValue: existingContent, pendingCommit: false };
+	editState = { sheet: fullSnapshot.sheet, row, col, entry, initialValue, pendingCommit: false };
 	updateEditClip(); // FE-2-0 polish: clip to the body pane (the cell may open partly under a sticky band)
 	inputEl.focus();
 	if (initialChar === undefined) {
@@ -1091,6 +1126,7 @@ window.addEventListener('message', (event: MessageEvent) => {
 			}
 			active = { row: editState.row, col: editState.col };
 			ensureActiveVisible();
+			updateEditClip(); // megaudit LOW: ensureActiveVisible may have scrolled -- re-clip the still-open editor
 			// Megaudit B2: refocus + select so a retype REPLACES the bad value, and surface the way out
 			// (the user reflexively tries arrows/Tab -- those now leave the cell; spell it out anyway).
 			inputEl.focus();
@@ -1123,10 +1159,9 @@ window.addEventListener('message', (event: MessageEvent) => {
 // `translate(scrollLeft, scrollTop)` MUST be written in the scroll event, not deferred to the rAF -- else
 // the sticky header/gutter (painted at canvas-local 0) lag the native scroll by up to one frame and visibly
 // shake. The expensive blit/redraw stays rAF-coalesced via scheduleRedraw (the body's <=1-frame latency is
-// imperceptible; a jittering sticky band is not). The content-anchored `<input>` scrolls with the content.
-// Audit MED-5 (known FE-2-0 limitation, deferred): the overlay `<input>` is a content-layer child, so
-// scrolling WHILE editing can slide it over the sticky bands (it still commits to the right cell -- not
-// data-losing). Clipping the editor to the body pane is FE-2-proper.
+// imperceptible; a jittering sticky band is not). The content-anchored `<input>` scrolls with the content,
+// so {@link updateEditClip} is called SYNCHRONOUSLY below (FE-2-0 polish 2026-06-05, resolving the former
+// MED-5) to clip the open editor to the body pane as it scrolls under the sticky header/gutter bands.
 viewportEl.addEventListener('scroll', () => {
 	applyCanvasTransform(viewportEl.scrollTop, viewportEl.scrollLeft);
 	// FE-2-0 polish: keep the open editor's body-pane clip in lockstep with the scroll (SYNCHRONOUSLY, like
