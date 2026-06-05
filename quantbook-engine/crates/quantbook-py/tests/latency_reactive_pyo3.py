@@ -88,6 +88,12 @@ def _row_sum_formula(a1_row):
     return "+".join(f"{chr(65 + c)}{a1_row}" for c in range(lc.BATCH_COLS))
 
 
+def _rows_at_col(changed, col):
+    """Set of rows whose changed cell is in `col` (the dependent column for Workload B)."""
+    return {cc["cell"]["row"] for cc in changed
+            if cc.get("cell") and cc["cell"].get("col") == col}
+
+
 def main():
     qb = _load_quantbook()
     s = qb.Session()
@@ -151,6 +157,7 @@ def main():
     # ---- Workload B: reactive 1000-cell frame publish ----
     B_TGT = {"sheet": sheet, "startRow": lc.BATCH_BASE_ROW, "startCol": 0,
              "endRow": lc.BATCH_BASE_ROW + lc.BATCH_ROWS - 1, "endCol": lc.BATCH_COLS - 1}
+    B_DEP_ROWS = frozenset(range(lc.BATCH_BASE_ROW, lc.BATCH_BASE_ROW + lc.BATCH_ROWS))  # all 100 K-cells
     b_totals, b_write, b_recalc, b_delta = [], [], [], []
     b_dep_seen = 0
     last_base = 0
@@ -172,13 +179,14 @@ def main():
         if timed:
             b_totals.append(t3 - t0); b_write.append(t1 - t0)
             b_recalc.append(t2 - t1); b_delta.append(t3 - t2)
-            # REACTIVE PROOF: the first row's SUM dependent must reactively recompute.
-            if _find_cell(delta["changedCells"], lc.BATCH_BASE_ROW, B_DEP_COL) is not None:
+            # REACTIVE PROOF: ALL 100 row-sum dependents (the entire K column) must
+            # reactively recompute each publish -- not just the first (untimed; after t3).
+            if _rows_at_col(delta["changedCells"], B_DEP_COL) == B_DEP_ROWS:
                 b_dep_seen += 1
     if b_dep_seen != lc.ITERS_B:
         raise SystemExit(
-            f"[reactive-pyo3] invalid: row-SUM dependent reactively recomputed in only "
-            f"{b_dep_seen}/{lc.ITERS_B} Workload-B deltas (expected all)"
+            f"[reactive-pyo3] invalid: not all {lc.BATCH_ROWS} row-SUM dependents reactively "
+            f"recomputed in {lc.ITERS_B - b_dep_seen}/{lc.ITERS_B} Workload-B deltas (expected all)"
         )
     # first published row = [base..base+9]; its SUM = 10*base + 45
     dep = s.cell(sheet, lc.BATCH_BASE_ROW, B_DEP_COL)
