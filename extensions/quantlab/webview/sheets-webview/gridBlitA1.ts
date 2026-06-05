@@ -390,3 +390,64 @@ export function errorRowsFlippedA1(
 	}
 	return [...rows];
 }
+
+/**
+ * **FE-2-0 polish (2026-06-05) -- clear a STALE error tint when a cell is fixed elsewhere.**
+ *
+ * `errorCells` tints a cell red after an `errorReply` (an edit this panel posted was REJECTED -- the bad
+ * value was NEVER stored, so the snapshot keeps showing the cell's prior valid content). Phase 2 made a
+ * bare `render` deliberately NOT touch `errorCells` (that invariant killed the sibling-render false-ack
+ * HIGH). But that left a stale tint when the cell is FIXED by another writer (a sibling panel / a
+ * recompute) -- the underlying content changes yet the red tint lingers.
+ *
+ * This returns the subset of `tintedKeys` (`"row,col"`) whose STORED CONTENT actually changed between
+ * `prev` and `next` -- i.e. a real write landed on that cell -- so the caller can drop only those tints.
+ * Because a rejected edit was never stored, "the snapshot shows a valid value" is ALWAYS true and cannot
+ * be the signal; the CHANGE between renders is. Reuses the same visual equality as {@link diffSnapshotsA1}.
+ *
+ * The cell with an OPEN editor is INTENTIONALLY not special-cased: clearing the tint of the very cell the
+ * user is fixing when a SIBLING repairs it is exactly the point of this feature, and the editor (a real
+ * `<input>` painted on top) covers the cell so the tint under it is not even visible; on editor-close the
+ * correct, untinted, sibling-written value shows. (The cell's tint can never be cleared by the user's OWN
+ * rejected edit, which is never stored -- so `prev`/`next` for that cell are equal and it isn't returned.)
+ *
+ * Returns `[]` when there is no prior frame or the sheet changed (the caller clears `errorCells`
+ * wholesale on a sheet switch). Pure -> golden-testable.
+ */
+export function staleTintKeysA1(
+	prev: QuantbookCellSnapshot | null,
+	next: QuantbookCellSnapshot,
+	tintedKeys: Iterable<string>,
+): string[] {
+	if (prev === null || prev.sheet !== next.sheet) {
+		return [];
+	}
+	const prevByKey = new Map<string, Entry>();
+	for (const e of prev.entries) {
+		const k = cellKey(e);
+		if (k !== null) {
+			prevByKey.set(k, e);
+		}
+	}
+	const nextByKey = new Map<string, Entry>();
+	for (const e of next.entries) {
+		const k = cellKey(e);
+		if (k !== null) {
+			nextByKey.set(k, e);
+		}
+	}
+	const out: string[] = [];
+	for (const key of tintedKeys) {
+		const pe = prevByKey.get(key);
+		const ne = nextByKey.get(key);
+		// Content changed iff the cell's RENDERABLE presence flipped, or both renders carry the cell but it
+		// now paints differently (a real write -- value/formula/rendered/diagnostic changed).
+		const changed =
+			(pe === undefined) !== (ne === undefined) ||
+			(pe !== undefined && ne !== undefined && !entryVisualEqual(pe, ne));
+		if (changed) {
+			out.push(key);
+		}
+	}
+	return out;
+}

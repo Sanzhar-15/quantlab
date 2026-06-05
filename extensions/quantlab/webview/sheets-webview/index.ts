@@ -40,7 +40,7 @@
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { clampDisplayString, formatCellValue } from './cellRender';
 import { CanvasGridRenderer, type ActiveCell } from './canvasGrid';
-import { computeScrollBlitA1, diffSnapshotsA1, errorRowsFlippedA1, type ScrollState } from './gridBlitA1';
+import { computeScrollBlitA1, diffSnapshotsA1, errorRowsFlippedA1, staleTintKeysA1, type ScrollState } from './gridBlitA1';
 import {
 	COL_WIDTH,
 	HEADER_HEIGHT,
@@ -176,10 +176,18 @@ const errorCells = new Map<string, string>();
 let active: ActiveCell | null = { row: 0, col: 0 };
 
 interface EditState {
+	// **Audit MED-2 (2026-06-05)**: the sheet captured at edit-start. `commitEdit` posts to THIS sheet, not
+	// the live `fullSnapshot.sheet`, so an edit can never be mis-targeted if the snapshot's sheet changes
+	// while the editor is open (defensive -- a panel's sheet is fixed today, but this removes the coupling).
+	readonly sheet: number;
 	row: number;
 	col: number;
 	// The populated entry under the cell at edit-start (formula/value pre-fill); undefined for an empty cell.
 	readonly entry?: QuantbookCellSnapshot['entries'][number];
+	// **FE-2-0 polish (2026-06-05)**: the editor's value at edit-start (the prefill). `blur` commits only a
+	// CHANGED value (Excel: clicking/Tabbing away saves an edit) and cancels an unchanged one -- this is the
+	// baseline it compares against.
+	readonly initialValue: string;
 	pendingCommit: boolean;
 	// FE-2-0 Phase 2 (commit-token): the unique id of THIS in-flight commit, stamped by commitEdit and
 	// echoed by the host in `commitResult` (success) / `errorReply` (failure). Replaces the FE megaudit
@@ -443,15 +451,16 @@ function beginEdit(row: number, col: number, initialChar?: string): void {
 	// capped, but the editor is a real <input>). Such a value also could never be committed (the host +
 	// client cap rawInput at MAX_RAW_INPUT_LENGTH). So we refuse to OPEN the editor (the cell stays selected
 	// + revealed) and surface a visible error -- No-Fallbacks: we never silently truncate the value.
-	let prefill: string;
-	if (initialChar !== undefined) {
-		prefill = initialChar; // type-to-edit: a single char, never oversize
-	} else if (entry !== undefined) {
+	// The cell's content BEFORE this edit -- the baseline `blur` compares against to decide commit-vs-cancel.
+	// **Audit MED-1 (2026-06-05)**: for type-to-edit the editor SHOWS `initialChar`, but the blur baseline
+	// must be the PRIOR content (empty / the existing value), not the injected char -- else typing one char
+	// into an empty cell then clicking away computes `value === initialValue` and SILENTLY DISCARDS the
+	// keystroke. So `initialValue` is always `existingContent`; only the visible `prefill` differs.
+	const existingContent: string = entry !== undefined
 		// Formula text (re-add the leading `=` the host dispatch keys on) over the value-default literal.
-		prefill = typeof entry.formula === 'string' ? '=' + entry.formula : formatCellValue(entry.value);
-	} else {
-		prefill = ''; // empty cell
-	}
+		? (typeof entry.formula === 'string' ? '=' + entry.formula : formatCellValue(entry.value))
+		: ''; // empty cell
+	const prefill: string = initialChar !== undefined ? initialChar : existingContent;
 	if (prefill.length > MAX_RAW_INPUT_LENGTH) {
 		// The cell IS now selected + revealed; we just won't open the editor. (No "selection unchanged"
 		// claim -- a click here moves the selection; only F2/type leave it where it was.)
@@ -470,7 +479,9 @@ function beginEdit(row: number, col: number, initialChar?: string): void {
 	inputEl.readOnly = false; // megaudit H1: a fresh editor is editable (a prior pending edit set readOnly)
 	inputEl.value = prefill;
 	inputEl.hidden = false;
-	editState = { row, col, entry, pendingCommit: false };
+	inputEl.style.clipPath = ''; // FE-2-0 polish: start unclipped; updateEditClip below sets it for this cell
+	editState = { sheet: fullSnapshot.sheet, row, col, entry, initialValue: existingContent, pendingCommit: false };
+	updateEditClip(); // FE-2-0 polish: clip to the body pane (the cell may open partly under a sticky band)
 	inputEl.focus();
 	if (initialChar === undefined) {
 		inputEl.select();
@@ -487,6 +498,7 @@ function cancelEdit(): void {
 	inputEl.hidden = true;
 	inputEl.value = '';
 	inputEl.readOnly = false; // megaudit H1: clear the pending-commit lock so the next editor is editable
+	inputEl.style.clipPath = ''; // FE-2-0 polish: drop any body-pane clip so a future editor starts clean
 	clearCommitWatchdog(); // the editor is gone -- no pending commit to recover (re-audit HIGH)
 	clearError(); // closing the editor resolves any 'edit'-source banner (re-audit MED-4)
 }
@@ -502,15 +514,51 @@ function repositionEdit(): void {
 	inputEl.style.top = rect.y + 'px';
 	inputEl.style.width = rect.width + 'px';
 	inputEl.style.height = rect.height + 'px';
+	updateEditClip(); // a gutter-width change shifts the cell -> recompute the body-pane clip too
 }
 
-/** Commit the edit; `nav` (optional) moves the selection once the matching `commitResult` arrives. */
-function commitEdit(nav?: { dr: number; dc: number }): void {
-	if (editState === null || fullSnapshot === null) {
+/**
+ * **FE-2-0 polish (2026-06-05) -- clip the open editor to the BODY pane (MED-5).**
+ *
+ * The overlay `<input>` is a content-layer child positioned at CONTENT coordinates, so it scrolls with the
+ * grid; the sticky header (top `HEADER_HEIGHT`) + row gutter (left `gutterWidthPx`) are painted on the
+ * pinned canvas. Without clipping, an editor scrolled under a band slides visibly ON TOP of it. A
+ * `clip-path` inset hides exactly the portion overlapping the bands -- and unlike hiding the element
+ * (`hidden`/`display:none`, which would blur the input and fire the cancel/commit path), `clip-path`
+ * PRESERVES focus + the live edit. Only the top/left bands occlude (there is no bottom/right frozen band);
+ * a cell fully in the body pane gets a zero inset (no-op). Pointer events over a clipped region pass
+ * through to the band, as desired.
+ */
+function updateEditClip(): void {
+	if (editState === null) {
 		return;
 	}
+	const gutterW = renderer.gutterWidthPx;
+	const rect = cellContentRect(editState.row, editState.col, gutterW);
+	// The input's on-screen position = content coord - scroll (it scrolls with the content layer).
+	const viewX = rect.x - viewportEl.scrollLeft;
+	const viewY = rect.y - viewportEl.scrollTop;
+	// Hide the part of the input that lies under the left gutter / top header band (clamped to the input box).
+	const clipLeft = Math.max(0, Math.min(rect.width, gutterW - viewX));
+	const clipTop = Math.max(0, Math.min(rect.height, HEADER_HEIGHT - viewY));
+	inputEl.style.clipPath = 'inset(' + clipTop + 'px 0px 0px ' + clipLeft + 'px)';
+}
+
+/**
+ * Commit the edit; `nav` (optional) moves the selection once the matching `commitResult` arrives.
+ * **Audit MED-B (2026-06-05)**: returns `true` iff the edit was POSTED (now pending), `false` on a LOCAL
+ * reject (no editState/snapshot, already pending, or over-limit). Callers that fire on focus-out (`blur`)
+ * use this to fall back to `cancelEdit` -- otherwise a locally-rejected blur would leave a non-pending
+ * editor open+blurred and strand the keyboard (the document keyhandler is inert while `editState` is set).
+ * The Enter/Tab callers ignore the return: an over-limit value keeps the editor OPEN with the banner so the
+ * user can shorten it in place.
+ */
+function commitEdit(nav?: { dr: number; dc: number }): boolean {
+	if (editState === null || fullSnapshot === null) {
+		return false;
+	}
 	if (editState.pendingCommit) {
-		return; // a commit is already in flight
+		return false; // a commit is already in flight
 	}
 	// Audit C1-MED6: reject an over-length input HERE (visible error, editor stays open for the user to
 	// shorten) rather than serialize a multi-MB payload across the bridge for the host to reject anyway.
@@ -520,10 +568,11 @@ function commitEdit(nav?: { dr: number; dc: number }): void {
 			`Shorten it and commit again.`,
 			'edit',
 		);
-		return;
+		return false;
 	}
 	clearError();
-	const sheet = fullSnapshot.sheet;
+	// Audit MED-2: post to the sheet captured at edit-start (not the live `fullSnapshot.sheet`).
+	const sheet = editState.sheet;
 	const row = editState.row;
 	const col = editState.col;
 	const commitId = ++nextCommitId; // FE-2-0 Phase 2: stamp a unique token for THIS commit
@@ -541,6 +590,7 @@ function commitEdit(nav?: { dr: number; dc: number }): void {
 	// applies `nav`) or `errorReply` (failure -> decorate the cell + leave the editor open). A bare
 	// `render` no longer resolves -- so a sibling-panel render can't falsely close this editor.
 	vscode.postMessage({ type: 'putValue', sheet, row, col, rawInput: inputEl.value, commitId });
+	return true; // posted -> the editor is now pending
 }
 
 // Re-audit MED-4: clear the over-length ('edit') banner as soon as the user shortens the value back to
@@ -616,27 +666,80 @@ inputEl.addEventListener('keydown', ev => {
 	commitEdit(vec); // Enter = commit + down; Tab = commit + right (Shift+Tab left)
 });
 inputEl.addEventListener('blur', () => {
-	// Conservative: blur cancels an UNcommitted edit; a pending commit waits for the host's reply.
-	if (editState !== null && !editState.pendingCommit) {
-		cancelEdit();
-		redraw();
-	}
-});
-
-// --- Canvas click -> hit-test -> select + edit ---
-
-canvasEl.addEventListener('click', ev => {
-	if (fullSnapshot === null) {
+	// **FE-2-0 polish (2026-06-05)**: blur COMMITS a changed value (Excel: clicking / Tabbing away saves
+	// your edit) but CANCELS an unchanged one. A pending commit is left to resolve on the host reply (as
+	// before). NOTE: cancelEdit()/resolvePendingCommit() null `editState` BEFORE hiding the input, so the
+	// blur THEY trigger early-returns here (editState === null) -- this only fires on a genuine focus-out.
+	if (editState === null || editState.pendingCommit) {
 		return;
 	}
-	const rect = canvasEl.getBoundingClientRect();
-	const localX = ev.clientX - rect.left;
-	const localY = ev.clientY - rect.top;
-	const hit = hitTestViewport(localX, localY, viewportEl.scrollLeft, viewportEl.scrollTop, renderer.gutterWidthPx);
-	if (hit !== null) {
-		beginEdit(hit.row, hit.col);
+	const value = inputEl.value;
+	const changed = value !== editState.initialValue;
+	// Still EXACTLY the value that just failed to commit (untouched since the errorReply): committing would
+	// re-post the same rejected value (the B2 re-fail loop). Abandon instead -- mirrors the B2 nav affordance.
+	const knownBad = editState.lastFailedRawInput !== undefined && value === editState.lastFailedRawInput;
+	if (changed && !knownBad) {
+		// Commit a genuine change with NO nav (blur doesn't move the selection).
+		if (commitEdit()) {
+			return; // posted -> editor is now pending
+		}
+		// **Audit MED (2026-06-05)**: commitEdit LOCALLY rejected (an over-limit value). We must NOT keep the
+		// editor open+blurred (the document keyhandler is inert while editState is set -> stranded keyboard),
+		// so we abandon it -- but NOT silently (No-Fallbacks): commitEdit's own 'edit' banner is cleared by
+		// cancelEdit below, so re-surface the discard as a 'transient' notice that survives to the next render.
+		const len = value.length;
+		cancelEdit();
+		showError(
+			'Edit discarded: the value was ' + len + ' characters, over the ' + MAX_RAW_INPUT_LENGTH +
+			'-character limit. Re-open the cell to shorten it.',
+			'transient',
+		);
 		redraw();
+		return;
 	}
+	// Unchanged or known-bad -> abandon the edit outright.
+	cancelEdit();
+	redraw();
+});
+
+// --- Canvas pointer: single click SELECTS, double click EDITS (FE-2-0 polish 2026-06-05) ---
+
+/** Hit-test a pointer event against the body grid; returns the (row,col) or null (band / gutter / empty). */
+function hitTestCanvas(ev: MouseEvent): { row: number; col: number } | null {
+	if (fullSnapshot === null) {
+		return null;
+	}
+	const rect = canvasEl.getBoundingClientRect();
+	return hitTestViewport(
+		ev.clientX - rect.left,
+		ev.clientY - rect.top,
+		viewportEl.scrollLeft,
+		viewportEl.scrollTop,
+		renderer.gutterWidthPx,
+	);
+}
+
+// Single click SELECTS the cell (Excel). It does NOT open the editor -- double-click / F2 / type-to-edit do.
+// If an editor was open, the focus-out it caused already committed/cancelled it via the blur handler above;
+// here we only move the selection. (A pending commit keeps its editor; the click still just reselects.)
+canvasEl.addEventListener('click', ev => {
+	const hit = hitTestCanvas(ev);
+	if (hit === null) {
+		return;
+	}
+	active = { row: hit.row, col: hit.col };
+	redraw();
+});
+
+// Double click opens the editor on the cell (Excel). beginEdit re-asserts the selection + reveal; it bails
+// if a commit is still in flight (M8), consistent with every other edit entry point.
+canvasEl.addEventListener('dblclick', ev => {
+	const hit = hitTestCanvas(ev);
+	if (hit === null) {
+		return;
+	}
+	beginEdit(hit.row, hit.col);
+	redraw();
 });
 
 // Hover tooltip: surface a cell's errorReply message or its engine diagnostic via the native `title`.
@@ -810,6 +913,17 @@ function applyRender(snapshot: QuantbookCellSnapshot): void {
 	// switching to sheet 1. (A sheet change also makes `diffSnapshotsA1` return null -> full redraw below.)
 	if (prevSnapshot !== null && prevSnapshot.sheet !== snapshot.sheet) {
 		errorCells.clear();
+	} else if (errorCells.size > 0) {
+		// FE-2-0 polish (2026-06-05): clear a STALE tint when the cell's STORED content changed between
+		// renders -- i.e. a real write landed (a sibling panel / a recompute FIXED the cell this panel had
+		// tinted from a rejected edit). This is the ONLY errorCells mutation a render performs, and it touches
+		// neither the editor nor the commit resolution (it only deletes a red tint) -- so the Phase 2 "a bare
+		// render never resolves a pending commit / can't false-ack a sibling" invariant holds. The open-editor
+		// cell is deliberately NOT exempt: a sibling fixing the cell you're editing SHOULD drop its tint
+		// (audit MED-A: exempting it left the tint permanent, and the editor covers the cell anyway).
+		for (const key of staleTintKeysA1(prevSnapshot, snapshot, errorCells.keys())) {
+			errorCells.delete(key);
+		}
 	}
 
 	// Audit LOW-3: do NOT refreshTheme() here -- a render is not a theme change. Theme/font changes are
@@ -935,6 +1049,7 @@ window.addEventListener('message', (event: MessageEvent) => {
 	if (msg.type === 'errorReply') {
 		const er = msg as ErrorReplyMessage;
 		const prevErrorKeys = new Set(errorCells.keys()); // Phase 3: for the error-tint flip diff
+		let activeMoved = false; // re-audit LOW: a selection realign below needs a FULL redraw, not a tint-flip damage
 		// Megaudit MED + re-audit LOW: only tint when sheet/row/col are REAL integers (NOT `Number()`-coerced
 		// -- `''`/`null` would coerce to 0 and wrongly tint A1) AND the sheet is the CURRENT one AND the coord
 		// is in the A1 extent. A stale/cross-sheet/malformed reply must never tint. The un-stick below is
@@ -965,6 +1080,17 @@ window.addEventListener('message', (event: MessageEvent) => {
 			editState.lastFailedRawInput = inputEl.value; // megaudit B2: a nav key may now leave the bad cell
 			inputEl.readOnly = false; // H1: unlock for correction
 			clearCommitWatchdog(); // the host responded (with a failure) -- no recovery needed
+			// **Audit LOW (2026-06-05)**: realign the selection with the editor demanding attention. A
+			// blur-commit can fail AFTER a click moved `active` to another cell -- without this, the editor
+			// refocuses on the failed cell while the selection box paints the clicked one (keyboard edits would
+			// apply to the editor's cell, not the painted selection). Put `active` back on the edited cell.
+			// re-audit LOW: if this actually MOVES the selection, the tint-flip damage path below is
+			// insufficient (it wouldn't clear the old selection box / draw the new one), so force a full redraw.
+			if (active === null || active.row !== editState.row || active.col !== editState.col) {
+				activeMoved = true;
+			}
+			active = { row: editState.row, col: editState.col };
+			ensureActiveVisible();
 			// Megaudit B2: refocus + select so a retype REPLACES the bad value, and surface the way out
 			// (the user reflexively tries arrows/Tab -- those now leave the cell; spell it out anyway).
 			inputEl.focus();
@@ -979,11 +1105,12 @@ window.addEventListener('message', (event: MessageEvent) => {
 		// at the same scroll; else full `redraw()`. Re-erroring an already-tinted cell flips nothing -> []
 		// -> a no-op (the tint + the tooltip-on-hover are already correct).
 		const v = currentViewport();
-		if (renderer.painted && !renderer.backingScaleStale && scrollUnchangedSince(v)) {
+		if (!activeMoved && renderer.painted && !renderer.backingScaleStale && scrollUnchangedSince(v)) {
 			const rows = errorRowsFlippedA1(prevErrorKeys, new Set(errorCells.keys()));
 			applyCanvasTransform(v.scrollTop, v.scrollLeft);
 			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
 		} else {
+			// A selection realign (activeMoved) repaints both the old + new selection rows -> full redraw.
 			redraw();
 		}
 		return;
@@ -1002,6 +1129,11 @@ window.addEventListener('message', (event: MessageEvent) => {
 // data-losing). Clipping the editor to the body pane is FE-2-proper.
 viewportEl.addEventListener('scroll', () => {
 	applyCanvasTransform(viewportEl.scrollTop, viewportEl.scrollLeft);
+	// FE-2-0 polish: keep the open editor's body-pane clip in lockstep with the scroll (SYNCHRONOUSLY, like
+	// the canvas pin above) so the editor never momentarily slides un-clipped over the sticky bands.
+	if (editState !== null) {
+		updateEditClip();
+	}
 	scheduleRedraw();
 });
 

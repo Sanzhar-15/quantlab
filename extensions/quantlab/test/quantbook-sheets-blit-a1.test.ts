@@ -23,6 +23,7 @@ import {
 	computeScrollBlitA1,
 	diffSnapshotsA1,
 	errorRowsFlippedA1,
+	staleTintKeysA1,
 } from '../webview/sheets-webview/gridBlitA1';
 
 // --- fixtures ---
@@ -267,5 +268,64 @@ suite('FE-2-0 Phase 3 errorRowsFlippedA1 -- damaged rows from error-tint flips',
 	test('a malformed key (no comma / non-integer row) is ignored', () => {
 		assert.deepStrictEqual(errorRowsFlippedA1(new Set(), new Set(['nonsense'])), []);
 		assert.deepStrictEqual(errorRowsFlippedA1(new Set(), new Set(['x,2'])), []);
+	});
+});
+
+// --- staleTintKeysA1 (FE-2-0 polish 2026-06-05: clear a stale tint when a cell is fixed elsewhere) ---
+
+suite('FE-2-0 polish staleTintKeysA1 -- clear a stale error tint on a real content change', function () {
+	test('no prior frame -> [] (nothing to compare)', () => {
+		assert.deepStrictEqual(staleTintKeysA1(null, snap([entry(0, 0, num(1))]), ['0,0']), []);
+	});
+	test('sheet switch -> [] (caller clears errorCells wholesale)', () => {
+		const prev = snap([entry(0, 0, num(1))], 0);
+		const next = snap([entry(0, 0, num(9))], 1);
+		assert.deepStrictEqual(staleTintKeysA1(prev, next, ['0,0']), []);
+	});
+	test('a tinted cell whose value CHANGED between renders -> returned (a real write landed)', () => {
+		// A1 was tinted from a rejected edit (never stored); a sibling then wrote a new value to A1.
+		const prev = snap([entry(0, 0, num(1))]);
+		const next = snap([entry(0, 0, num(2))]);
+		assert.deepStrictEqual(staleTintKeysA1(prev, next, ['0,0']), ['0,0']);
+	});
+	test('a tinted cell whose content is UNCHANGED -> not returned (rejected edit was never stored)', () => {
+		// The classic errorReply case: the bad edit was rejected, so A1 still shows its prior value.
+		const same = [entry(0, 0, num(1))];
+		assert.deepStrictEqual(staleTintKeysA1(snap(same), snap([entry(0, 0, num(1))]), ['0,0']), []);
+	});
+	test('presence flip (cell added) -> returned; (cell removed) -> returned', () => {
+		assert.deepStrictEqual(staleTintKeysA1(snap([]), snap([entry(0, 0, num(5))]), ['0,0']), ['0,0']);
+		assert.deepStrictEqual(staleTintKeysA1(snap([entry(0, 0, num(5))]), snap([]), ['0,0']), ['0,0']);
+	});
+	test('the open-editor cell IS cleared when a sibling fixes it (audit MED-A: no permanent tint)', () => {
+		// A1 has the open editor + is tinted; a sibling changed A1's stored value. It must STILL be returned
+		// (the editor covers it; on close the untinted sibling value shows) -- exempting it left a permanent tint.
+		const prev = snap([entry(0, 0, num(1)), entry(1, 0, num(1))]);
+		const next = snap([entry(0, 0, num(2)), entry(1, 0, num(2))]);
+		assert.deepStrictEqual(staleTintKeysA1(prev, next, ['0,0', '1,0']), ['0,0', '1,0']);
+	});
+	test('only the CHANGED tinted cells are returned (an unrelated sibling change does not clear others)', () => {
+		// A1 tinted + unchanged; B1 changed (a sibling fixed B1). A1 keeps its tint; only B1 clears.
+		const prev = snap([entry(0, 0, num(1)), entry(0, 1, num(1))]);
+		const next = snap([entry(0, 0, num(1)), entry(0, 1, num(9))]);
+		assert.deepStrictEqual(staleTintKeysA1(prev, next, ['0,0', '0,1']), ['0,1']);
+	});
+	test('a FORMULA change with the same displayed value -> returned (a real write landed)', () => {
+		// entryVisualEqual compares formula text too, so re-pointing a formula (even to the same value) is a
+		// real edit -> the tint should clear. (Audit fix: the prior fixture used an identical formula.)
+		const prev = snap([entry(0, 0, num(3), { formula: 'A2+1', rendered: '3' })]);
+		const next = snap([entry(0, 0, num(3), { formula: 'A3+2', rendered: '3' })]);
+		assert.deepStrictEqual(staleTintKeysA1(prev, next, ['0,0']), ['0,0']);
+	});
+	test('an identical entry (same value/formula/rendered) -> not returned (no write landed)', () => {
+		const e = { formula: 'A2+1', rendered: '3' };
+		const prev = snap([entry(0, 0, num(3), e)]);
+		const next = snap([entry(0, 0, num(3), { ...e })]);
+		assert.deepStrictEqual(staleTintKeysA1(prev, next, ['0,0']), []);
+	});
+	test('a malformed entry in prev/next does not throw (cellKey guards it, like diffSnapshotsA1)', () => {
+		const prev = snap([null as unknown as Entry, entry(0, 0, num(1))]);
+		const next = snap([entry(0, 0, num(2)), 'garbage' as unknown as Entry]);
+		assert.deepStrictEqual(staleTintKeysA1(prev, next, ['0,0']), ['0,0']);
 	});
 });
