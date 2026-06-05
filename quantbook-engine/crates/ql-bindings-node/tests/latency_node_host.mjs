@@ -10,7 +10,7 @@
 // The delta-version cursor is kept HERE (as the Node grid host would), never sent
 // to Python. Protocol: one JSON object per line in, one per line out.
 //   {op:"addSheet",name,chunkRows} -> {sheetId}
-//   {op:"setFormula"|"setValue"|"recalc"|"writeRange"|"snapshotDelta"|"cell"|"close"}
+//   {op:"setFormula"|"setValue"|"recalc"|"writeRange"|"publishDataset"|"snapshotDelta"|"cell"|"close"}
 //   snapshotDelta -> {changedCells:[...]}  (the real render payload the grid receives)
 
 import { existsSync } from "node:fs";
@@ -53,6 +53,10 @@ function handle(req) {
       return { ok: true };
     case "writeRange":
       return { written: Number(s.writeRange(req.range, req.values).written) };
+    case "publishDataset":
+      // FE-1.5-0 reactive leg: publish a value-matrix; the engine writes the target
+      // AND dirties its dependents in-place (the moat's reactive invalidation).
+      return { id: s.publishDataset(req.name, req.data, req.target).id };
     case "recalc":
       s.recalcDirty();
       return { ok: true };
