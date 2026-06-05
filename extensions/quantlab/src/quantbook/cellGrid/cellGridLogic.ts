@@ -812,6 +812,114 @@ export function buildSheetMovePositionItems(
 }
 
 // ============================================================================
+// Smoke-megaudit host batch (2026-06-05) -- pure command-target selection helpers.
+// These back the sheet-management / Save-As commands in `quantbookCommands.ts`.
+// Extracted as pure functions so the targeting + deleted-active-sheet recovery
+// logic (previously inline in the vscode command closures) is unit-testable.
+// ============================================================================
+
+/**
+ * The panel a sheet-management / Save-As command should act on.
+ *
+ * - `target`: an unambiguous (session, sheet) to operate on.
+ * - `ambiguous`: more than one DISTINCT workbook (session) is open and none is
+ *   focused -- there is no safe automatic pick, so the command must ask the user
+ *   to focus the grid they mean (rather than silently mutating an arbitrary one).
+ */
+export type CommandTargetResolution =
+	| { kind: 'target'; session: SessionInstance; sheet: number }
+	| { kind: 'ambiguous' };
+
+/**
+ * **Smoke-megaudit host MED (2026-06-05) -- centralized command target selection.**
+ *
+ * Replaces the per-command `focusedLocalPanel() ?? localPanels[0]` fallback, which
+ * silently targeted an ARBITRARY (oldest) workbook when no panel was focused and
+ * several workbooks were open -- so a sheet add/rename/delete/move/save could land
+ * on the WRONG workbook. Now:
+ *
+ * - a focused panel always wins (the grid the user is looking at);
+ * - with no focus, a pick is unambiguous ONLY if every open panel belongs to the
+ *   SAME session (one workbook, possibly several sheet tabs) -- then any of its
+ *   panels is the same workbook, so `panels[0]` is safe;
+ * - with no focus AND two or more distinct sessions open, the result is `ambiguous`
+ *   and the caller must prompt the user to focus a grid (No-Fallbacks: never guess
+ *   which workbook to mutate).
+ *
+ * Pure: identity-compares `SessionInstance` references; no vscode, mocha-testable.
+ *
+ * @param panels  the currently-open panels' (session, sheet) pairs
+ *                (`CellGridPanel.activeLocalPanels()`); MUST be non-empty (callers
+ *                handle the no-panel case before calling).
+ * @param focused the focused panel's (session, sheet), or `undefined`
+ *                (`CellGridPanel.focusedLocalPanel()`).
+ */
+export function resolveCommandTargetPanel(
+	panels: ReadonlyArray<{ session: SessionInstance; sheet: number }>,
+	focused: { session: SessionInstance; sheet: number } | undefined,
+): CommandTargetResolution {
+	if (focused !== undefined) {
+		return { kind: 'target', session: focused.session, sheet: focused.sheet };
+	}
+	const distinctSessions = new Set<SessionInstance>(panels.map(p => p.session));
+	if (distinctSessions.size === 1 && panels.length > 0) {
+		return { kind: 'target', session: panels[0].session, sheet: panels[0].sheet };
+	}
+	// Zero panels (precondition violated) or 2+ distinct workbooks with no focus.
+	return { kind: 'ambiguous' };
+}
+
+/**
+ * The plan for the "Switch Cell Grid Sheet" command given the session's LIVE sheet
+ * ids and the panel's current sheet.
+ *
+ * - `no-sheets`: the session has no live sheets at all.
+ * - `only-current`: exactly one live sheet and it is the one already shown -- there
+ *   is nothing to switch to.
+ * - `auto`: exactly one live sheet and it is NOT the current one -- the active sheet
+ *   was deleted out from under the panel; switch straight to the sole survivor.
+ * - `pick`: two or more live sheets -- show the quick-pick.
+ */
+export type SwitchSheetPlan =
+	| { kind: 'no-sheets' }
+	| { kind: 'only-current' }
+	| { kind: 'auto'; sheet: number }
+	| { kind: 'pick' };
+
+/**
+ * **Smoke-megaudit host MED (2026-06-05) -- Switch Sheet recovers from a deleted
+ * active sheet.**
+ *
+ * The prior command blocked on `sheetInfos.length === 1` with "nothing to switch to"
+ * even when that sole live sheet was NOT the current one -- i.e. when the active
+ * sheet had been tombstoned via "Delete Sheet" and the panel was stranded on an
+ * empty grid. Now a single live sheet that differs from `currentSheet` yields an
+ * `auto` switch to it; `only-current` is reserved for the genuinely-nothing-to-do
+ * case (the one live sheet IS the current one).
+ *
+ * Pure: no vscode, mocha-testable.
+ *
+ * @param sheetIds    live sheet ids for the session (tombstones already filtered by
+ *                    the engine; order as returned by `listSheets`).
+ * @param currentSheet the sheet the panel is currently showing (may be a tombstone,
+ *                    i.e. absent from `sheetIds`).
+ */
+export function classifySwitchSheetTarget(
+	sheetIds: ReadonlyArray<number>,
+	currentSheet: number,
+): SwitchSheetPlan {
+	if (sheetIds.length === 0) {
+		return { kind: 'no-sheets' };
+	}
+	if (sheetIds.length === 1) {
+		return sheetIds[0] === currentSheet
+			? { kind: 'only-current' }
+			: { kind: 'auto', sheet: sheetIds[0] };
+	}
+	return { kind: 'pick' };
+}
+
+// ============================================================================
 // Phase 5.7 V3.5.0.4b (2026-05-24) -- WorkbookSnapshot -> single-sheet
 // QuantbookCellSnapshot transformer
 // ============================================================================

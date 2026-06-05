@@ -66,7 +66,7 @@ const READY_WATCHDOG_MS = 6000;
  * session (never shown/closed) and showing the wrong workbook, breaking the
  * single-writer model the FE-0a migration established.
  *
- * - `allPanels`: every live panel, iterable -- for refreshAll / disposeAll / enumerate.
+ * - `allPanels`: every live panel, iterable -- for refreshAll / enumerate.
  * - `bySession`: `session -> (sheet -> panel)`, for single-tab-per-(session,sheet)
  *   reveal. ONE session may own SEVERAL panels (different sheets via switch-sheet),
  *   so the owning napi `Session` is closed only when its LAST panel disposes (F4).
@@ -176,10 +176,11 @@ export class CellGridPanel {
 					bySession.delete(session);
 					// F4: the LAST panel for this session has closed -> close the
 					// owning napi Session to release the engine handle (ref-counted:
-					// sibling panels on other sheets keep it alive). The Open-replaces-
-					// workbook command relies on THIS path (its disposeAll closes the
-					// displaced sessions here). Log on failure (No-Fallbacks -- never
-					// swallow); do not rethrow from a dispose callback.
+					// sibling panels on other sheets keep it alive). This fires when the
+					// user closes the last tab of a workbook (Open is additive as of the
+					// 2026-06-05 host fix -- it never disposes other workbooks). Log on
+					// failure (No-Fallbacks -- never swallow); do not rethrow from a
+					// dispose callback.
 					try {
 						session.close();
 					} catch (err) {
@@ -241,25 +242,6 @@ export class CellGridPanel {
 			}
 		}
 		return { refreshed, failed, skipped };
-	}
-
-	/**
-	 * Dispose ALL live cell-grid panels. Used by the Open command (FE-0a Part B2):
-	 * opening a `.qbook` REPLACES the current workbook, so any panel still bound to
-	 * the previous session must be torn down BEFORE the new session is shown.
-	 * Otherwise {@link show} -- which reveals an existing panel keyed by the same
-	 * sheet id before binding the new session -- would surface the stale panel and
-	 * leave the newly-opened workbook inaccessible (reviewer HIGH). Calling
-	 * `panel.dispose()` fires `onDidDispose`, which clears the registry entry; we
-	 * snapshot `panels.values()` first so the dispose-time mutation is safe.
-	 * Returns the number of panels disposed.
-	 */
-	static disposeAll(): number {
-		const live = Array.from(allPanels);
-		for (const instance of live) {
-			instance.panel.dispose();
-		}
-		return live.length;
 	}
 
 	/**

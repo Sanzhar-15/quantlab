@@ -304,10 +304,24 @@ export function saveSessionToQbook(session: SessionInstance, path: string): void
  * CollabSession {@link sessionFromQbook} pattern but WITHOUT a `peerIdOverride`
  * (the owning session is not a CRDT peer). A missing file / bad envelope / corrupt
  * op-log sidecar throws a structured `[persistence]` error.
+ *
+ * **Smoke-megaudit host LOW (2026-06-05)**: a failed `open()` must not leak the
+ * freshly-created native `Session` handle. Close it before rethrowing the PRIMARY
+ * open error. A secondary close failure is surfaced (`console.error`) but never
+ * masks the open error the caller needs to see (No-Fallbacks: logged, not swallowed).
  */
 export function openWorkbookFromQbook(path: string): SessionInstance {
 	const session = createWorkbookSession();
-	session.open(path);
+	try {
+		session.open(path);
+	} catch (openErr) {
+		try {
+			session.close();
+		} catch (closeErr) {
+			console.error('[quantbook] session.close() after a failed openWorkbookFromQbook() also failed:', closeErr);
+		}
+		throw openErr;
+	}
 	return session;
 }
 

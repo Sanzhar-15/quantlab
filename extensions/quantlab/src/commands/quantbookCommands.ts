@@ -16,8 +16,9 @@
  * `.qbook` persistence commands on `Session`: switch/add/rename/delete/move sheet
  * (via `Session.listSheets`/`addSheet`/`renameSheet`/`deleteSheet`/`moveSheet`),
  * Save As (`Session.save` via {@link saveSessionToQbook}), and Open
- * (`Session.open` via {@link openWorkbookFromQbook}; Open REPLACES the current
- * workbook -- it disposes prior panels first). The collaborative path
+ * (`Session.open` via {@link openWorkbookFromQbook}; Open is ADDITIVE as of the
+ * 2026-06-05 host fix -- it shows the opened workbook in a new tab and never closes
+ * the others). The collaborative path
  * (`quantbookCellGridCollab`) is a loud stub (real-time collab is v1.5-deferred:
  * "CRDT built, transport unwired"). The CollabSession demo commands
  * (quantbookDemo / quantbookDemoMultiWindow) remain dormant on `CollabSession`.
@@ -38,7 +39,7 @@ import { addSheet, appendPutValueValidated, createSession, createWorkbookSession
 import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
 import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
-import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems } from '../quantbook/cellGrid/cellGridLogic';
+import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, classifySwitchSheetTarget, resolveCommandTargetPanel } from '../quantbook/cellGrid/cellGridLogic';
 import type { CollabSessionInstance, SessionInstance } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
@@ -64,6 +65,33 @@ function closeSessionQuietly(session: SessionInstance, log: vscode.OutputChannel
 		const detail = err instanceof Error ? err.message : String(err);
 		log.appendLine(`(non-fatal) closing session failed during ${when}: ${detail}`);
 	}
+}
+
+/**
+ * Resolve the (session, sheet) a sheet-management / Save-As command should act on,
+ * surfacing the no-panel / ambiguous cases as user-facing messages and returning
+ * `undefined` so the caller aborts.
+ *
+ * **Smoke-megaudit host MED (2026-06-05)**: consolidates the per-command no-panel
+ * check + the `focusedLocalPanel() ?? localPanels[0]` fallback into one place that
+ * NEVER silently picks an arbitrary workbook. With several workbooks open and none
+ * focused, {@link resolveCommandTargetPanel} returns `ambiguous`; we ask the user to
+ * focus the grid they mean rather than mutate/save the oldest one (No-Fallbacks).
+ */
+function resolveTargetOrWarn(): { session: SessionInstance; sheet: number } | undefined {
+	const localPanels = CellGridPanel.activeLocalPanels();
+	if (localPanels.length === 0) {
+		void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+		return undefined;
+	}
+	const resolution = resolveCommandTargetPanel(localPanels, CellGridPanel.focusedLocalPanel());
+	if (resolution.kind === 'ambiguous') {
+		void vscode.window.showInformationMessage(
+			'Multiple Cell Grids are open and none is focused. Click the Cell Grid you want, then re-run this command.',
+		);
+		return undefined;
+	}
+	return { session: resolution.session, sheet: resolution.sheet };
 }
 
 function describe(label: string, session: CollabSessionInstance): string {
@@ -230,9 +258,14 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookCellGrid', () => {
 			const log = getOutput();
+			// Smoke-megaudit host LOW (2026-06-05): hold the session in an outer binding
+			// so a seed-write / recalc / initial-show failure can close it (the native
+			// Session owns an engine handle). On the happy path `CellGridPanel.show` takes
+			// ownership and the panel's ref-counted dispose closes it later.
+			let session: SessionInstance | undefined;
 			try {
 				// FE-0a Part B (B1): bind the owning single-writer Session.
-				const session = createWorkbookSession();
+				session = createWorkbookSession();
 				// Seed sample data on THREE sheets (0, 1, 2). addSheet MUST precede
 				// any setValue on a sheet (the engine rejects a write to a sheet that
 				// does not exist yet). Sheet ids are assigned in append order: first
@@ -252,8 +285,23 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				setValueValidated(session, 2, 0, 0, num(99));
 				recalcDirtyChecked(session);
 				CellGridPanel.show(context, session, 0);
+				// Ownership has transferred to the live registered panel (its ref-counted
+				// dispose will close the session). Clear our binding NOW so that if any
+				// post-show statement below throws, the catch does NOT close a session that
+				// is owned by a live panel (Codex host-batch audit MED). Must come BEFORE
+				// any further statement that can throw.
+				session = undefined;
 				log.appendLine('Cell Grid (sheet 0) opened with sample data on sheets 0/1/2.');
 			} catch (err) {
+				// Close the session only if the failure happened BEFORE the panel took
+				// ownership (seed write / recalc / show-before-registration) -- on success
+				// `session` was cleared above. If show() failed AFTER registering the panel,
+				// its dispose path already closed the session and this is a benign idempotent
+				// no-op -- same contract as the Open command (No-Fallbacks: closeSessionQuietly
+				// logs, never swallows).
+				if (session !== undefined) {
+					closeSessionQuietly(session, log, 'cell-grid seed/display failure');
+				}
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL cell-grid error: ${detail}`);
 				vscode.window.showErrorMessage(`Quantbook cell grid failed: ${detail}`);
@@ -275,23 +323,21 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	);
 
 	// --- FE-0a Part B2 (2026-06-02): sheet-management + .qbook persistence on the
-	// owning single-writer Session. All operate on the OLDEST open local panel
-	// (panels[0]); a panel-picker for multi-panel sessions is a v1.x refinement.
-	// Engine ops fail loud (No-Fallbacks); the refreshAll repaint is in a SEPARATE
-	// try so a render failure is not misreported as an engine-op failure.
+	// owning single-writer Session. Each command targets the panel via
+	// {@link resolveTargetOrWarn} (smoke-megaudit host MED, 2026-06-05): the FOCUSED
+	// panel wins; with no focus it falls back to the sole workbook ONLY when every open
+	// panel shares one session, otherwise it aborts and asks the user to focus a grid
+	// (it NEVER silently mutates an arbitrary "oldest" workbook). Engine ops fail loud
+	// (No-Fallbacks); the refreshAll repaint is in a SEPARATE try so a render failure is
+	// not misreported as an engine-op failure.
 
 	// Switch the active panel to another sheet of the same session.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookCellGridSwitchSheet', async () => {
-			const localPanels = CellGridPanel.activeLocalPanels();
-			if (localPanels.length === 0) {
-				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+			const target = resolveTargetOrWarn();
+			if (target === undefined) {
 				return;
 			}
-			// FE megaudit F2: target the FOCUSED panel (the one the user is looking at),
-			// not an arbitrary "oldest open panel" -- with multiple sessions open the old
-			// pick could mutate/save the WRONG workbook. Falls back to the sole panel.
-			const target = CellGridPanel.focusedLocalPanel() ?? localPanels[0];
 			// SessionInstance.listSheets() returns SheetInfoJson[]; the number-only
 			// switch builder takes ids -> map to ids (FE-0a Part B2 reviewer fix).
 			// listSheets() can throw off an unreadable lifecycle state -> report loud
@@ -305,14 +351,31 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				void vscode.window.showErrorMessage(`Quantbook cell grid switch failed: ${detail}`);
 				return;
 			}
-			if (sheetInfos.length === 0) {
+			const plan = classifySwitchSheetTarget(sheetInfos.map(s => s.id), target.sheet);
+			if (plan.kind === 'no-sheets') {
 				void vscode.window.showInformationMessage('This session has no sheets yet.');
 				return;
 			}
-			if (sheetInfos.length === 1) {
-				void vscode.window.showInformationMessage(`Only sheet ${sheetInfos[0].id} exists in this session; nothing to switch to.`);
+			if (plan.kind === 'only-current') {
+				void vscode.window.showInformationMessage(`Only sheet ${target.sheet} exists in this session; nothing to switch to.`);
 				return;
 			}
+			if (plan.kind === 'auto') {
+				// Smoke-megaudit host MED (2026-06-05): the active sheet was deleted out from
+				// under the panel and exactly one live sheet remains -- switch straight to it.
+				// The prior `length === 1` branch dead-ended with "nothing to switch to",
+				// stranding the panel on an empty tombstoned grid. No quick-pick: one destination.
+				try {
+					CellGridPanel.show(context, target.session, plan.sheet);
+					getOutput().appendLine(`Switched Cell Grid view to the only remaining sheet ${plan.sheet} (active sheet ${target.sheet} was deleted).`);
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					getOutput().appendLine(`FATAL switch-sheet error: ${detail}`);
+					void vscode.window.showErrorMessage(`Quantbook cell grid switch failed: ${detail}`);
+				}
+				return;
+			}
+			// plan.kind === 'pick': two or more live sheets -- show the quick-pick.
 			const items = buildSheetQuickPickItems(sheetInfos.map(s => s.id), target.sheet);
 			const selection = await vscode.window.showQuickPick(items, {
 				title: 'Switch Cell Grid Sheet',
@@ -335,15 +398,10 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// Save As: persist the active panel's Session to a `.qbook` directory.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookSaveAs', async () => {
-			const localPanels = CellGridPanel.activeLocalPanels();
-			if (localPanels.length === 0) {
-				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+			const target = resolveTargetOrWarn();
+			if (target === undefined) {
 				return;
 			}
-			// FE megaudit F2: target the FOCUSED panel (the one the user is looking at),
-			// not an arbitrary "oldest open panel" -- with multiple sessions open the old
-			// pick could mutate/save the WRONG workbook. Falls back to the sole panel.
-			const target = CellGridPanel.focusedLocalPanel() ?? localPanels[0];
 			const uri = await vscode.window.showSaveDialog({
 				title: 'Save Quantbook As',
 				filters: { Quantbook: ['qbook'] },
@@ -365,10 +423,16 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 		}),
 	);
 
-	// Open: load a `.qbook` into a fresh Session. Opening REPLACES the current
-	// workbook, so dispose panels bound to the previous session BEFORE showing the
-	// new one (else show() would reveal a stale panel keyed by the same sheet id
-	// and the opened workbook would be inaccessible -- FE-0a Part B2 reviewer fix).
+	// Open: load a `.qbook` into a fresh Session shown in its OWN new Cell Grid tab.
+	// **Smoke-megaudit host HIGH fix (2026-06-05): additive open.** Open used to call
+	// `CellGridPanel.disposeAll()`, which closed EVERY open workbook (not just the one
+	// being replaced) -- multi-workbook data loss. It is now additive: it disposes
+	// nothing and shows the opened workbook alongside the others, matching Excel/Sheets
+	// (Open adds a window; it never closes your current file). This is safe because the
+	// FE megaudit F2 panel registry keys by SESSION IDENTITY, so `show(newSession, ...)`
+	// for the brand-new session always creates a fresh tab and can never reveal a stale
+	// panel of another workbook (the original reason disposeAll was added -- a
+	// sheet-id-keyed registry collision -- no longer exists).
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookOpen', async () => {
 			const uris = await vscode.window.showOpenDialog({
@@ -416,18 +480,12 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				void vscode.window.showErrorMessage(`Quantbook open failed: ${detail}`);
 				return;
 			}
-			// 3) Replace the current workbook: dispose the prior panels, THEN show the
-			// new session. Disposing each panel closes its owning Session via the
-			// ref-counted last-panel `onDidDispose` close (FE megaudit F4), so the
-			// displaced workbooks' engine handles are released WITHOUT an explicit
-			// close here (the prior manual close would now double-close). The new
-			// session has no panel yet, so disposeAll does not touch it. A display
-			// failure is reported AS a display failure and the new session is closed.
+			// 3) Show the opened workbook in a NEW tab (additive -- no other workbook is
+			// touched). The new session has no panel yet, so show() creates a fresh one
+			// (F2 keys by session identity -- no collision with the tabs of other open
+			// workbooks). A display failure is reported AS a display failure and the new,
+			// never-shown session is closed so its engine handle is not leaked.
 			try {
-				const disposed = CellGridPanel.disposeAll();
-				if (disposed > 0) {
-					log.appendLine(`Closed ${disposed} panel(s) from the previous workbook (their sessions are closed on dispose).`);
-				}
 				CellGridPanel.show(context, session, firstSheet);
 			} catch (err) {
 				const detail = err instanceof Error ? err.message : String(err);
@@ -441,15 +499,10 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// Add a sheet to the active panel's session.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookSheetAdd', async () => {
-			const localPanels = CellGridPanel.activeLocalPanels();
-			if (localPanels.length === 0) {
-				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+			const target = resolveTargetOrWarn();
+			if (target === undefined) {
 				return;
 			}
-			// FE megaudit F2: target the FOCUSED panel (the one the user is looking at),
-			// not an arbitrary "oldest open panel" -- with multiple sessions open the old
-			// pick could mutate/save the WRONG workbook. Falls back to the sole panel.
-			const target = CellGridPanel.focusedLocalPanel() ?? localPanels[0];
 			const name = await vscode.window.showInputBox({
 				title: 'Add Quantbook Sheet',
 				prompt: 'Enter a name for the new sheet',
@@ -489,15 +542,10 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// Rename a sheet of the active panel's session.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookSheetRename', async () => {
-			const localPanels = CellGridPanel.activeLocalPanels();
-			if (localPanels.length === 0) {
-				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+			const target = resolveTargetOrWarn();
+			if (target === undefined) {
 				return;
 			}
-			// FE megaudit F2: target the FOCUSED panel (the one the user is looking at),
-			// not an arbitrary "oldest open panel" -- with multiple sessions open the old
-			// pick could mutate/save the WRONG workbook. Falls back to the sole panel.
-			const target = CellGridPanel.focusedLocalPanel() ?? localPanels[0];
 			const log = getOutput();
 			let sheetInfos;
 			try {
@@ -565,15 +613,10 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// Delete (tombstone) a sheet of the active panel's session.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookSheetDelete', async () => {
-			const localPanels = CellGridPanel.activeLocalPanels();
-			if (localPanels.length === 0) {
-				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+			const target = resolveTargetOrWarn();
+			if (target === undefined) {
 				return;
 			}
-			// FE megaudit F2: target the FOCUSED panel (the one the user is looking at),
-			// not an arbitrary "oldest open panel" -- with multiple sessions open the old
-			// pick could mutate/save the WRONG workbook. Falls back to the sole panel.
-			const target = CellGridPanel.focusedLocalPanel() ?? localPanels[0];
 			const log = getOutput();
 			let sheetInfos;
 			try {
@@ -635,15 +678,10 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// Move (reorder) a sheet of the active panel's session.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookSheetMove', async () => {
-			const localPanels = CellGridPanel.activeLocalPanels();
-			if (localPanels.length === 0) {
-				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+			const target = resolveTargetOrWarn();
+			if (target === undefined) {
 				return;
 			}
-			// FE megaudit F2: target the FOCUSED panel (the one the user is looking at),
-			// not an arbitrary "oldest open panel" -- with multiple sessions open the old
-			// pick could mutate/save the WRONG workbook. Falls back to the sole panel.
-			const target = CellGridPanel.focusedLocalPanel() ?? localPanels[0];
 			const log = getOutput();
 			let sheetInfos;
 			try {

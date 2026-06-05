@@ -2330,7 +2330,7 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 // Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
 // ============================================================================
 
-import { acquireWorkbookSnapshotViaDelta, buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyCellInput, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, mergeWorkbookDelta, parseCellRawInput, validatePresenceNumeric, type DeltaSnapshotCache, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyCellInput, classifyPollTick, classifySwitchSheetTarget, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, mergeWorkbookDelta, parseCellRawInput, resolveCommandTargetPanel, validatePresenceNumeric, type DeltaSnapshotCache, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
 
 suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
 	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
@@ -2680,6 +2680,84 @@ suite('FE megaudit S5 -- classifyCellInput (pure)', function () {
 		// S2-M3: text branch returns the TRIMMED literal, consistent with the number
 		// branch (which classifies on trimmed). Was previously the un-trimmed raw.
 		assert.deepStrictEqual(classifyCellInput('  hi  '), { kind: 'text', text: 'hi' });
+	});
+});
+
+// ============================================================================
+// Smoke-megaudit host batch (2026-06-05) -- pure command-target helpers.
+// resolveCommandTargetPanel (MED: never silently mutate the wrong workbook) +
+// classifySwitchSheetTarget (MED: Switch Sheet recovers from a deleted active
+// sheet). Pure functions -- no engine, identity-compare on SessionInstance.
+// ============================================================================
+
+suite('host-megaudit -- resolveCommandTargetPanel (pure)', function () {
+	// Distinct sentinel SessionInstance references (identity is all the helper reads).
+	const sA = { id: 'A' } as unknown as SessionInstance;
+	const sB = { id: 'B' } as unknown as SessionInstance;
+
+	test('a focused panel always wins (even with several workbooks open)', () => {
+		const panels = [
+			{ session: sA, sheet: 0 },
+			{ session: sB, sheet: 3 },
+		];
+		assert.deepStrictEqual(
+			resolveCommandTargetPanel(panels, { session: sB, sheet: 3 }),
+			{ kind: 'target', session: sB, sheet: 3 },
+		);
+	});
+
+	test('no focus + one workbook (multiple sheet tabs) -> unambiguous first panel', () => {
+		const panels = [
+			{ session: sA, sheet: 0 },
+			{ session: sA, sheet: 1 },
+			{ session: sA, sheet: 2 },
+		];
+		assert.deepStrictEqual(
+			resolveCommandTargetPanel(panels, undefined),
+			{ kind: 'target', session: sA, sheet: 0 },
+		);
+	});
+
+	test('no focus + two distinct workbooks -> ambiguous (do NOT guess)', () => {
+		const panels = [
+			{ session: sA, sheet: 0 },
+			{ session: sB, sheet: 0 },
+		];
+		assert.deepStrictEqual(
+			resolveCommandTargetPanel(panels, undefined),
+			{ kind: 'ambiguous' },
+		);
+	});
+
+	test('no focus + single panel -> that panel', () => {
+		assert.deepStrictEqual(
+			resolveCommandTargetPanel([{ session: sA, sheet: 5 }], undefined),
+			{ kind: 'target', session: sA, sheet: 5 },
+		);
+	});
+
+	test('precondition violation (empty panels, no focus) -> ambiguous, never throws', () => {
+		assert.deepStrictEqual(resolveCommandTargetPanel([], undefined), { kind: 'ambiguous' });
+	});
+});
+
+suite('host-megaudit -- classifySwitchSheetTarget (pure)', function () {
+	test('no live sheets -> no-sheets', () => {
+		assert.deepStrictEqual(classifySwitchSheetTarget([], 0), { kind: 'no-sheets' });
+	});
+
+	test('one live sheet that IS the current one -> only-current (nothing to do)', () => {
+		assert.deepStrictEqual(classifySwitchSheetTarget([2], 2), { kind: 'only-current' });
+	});
+
+	test('one live sheet that is NOT the current (active deleted) -> auto-switch to it', () => {
+		// The active sheet (0) was tombstoned; sheet 1 is the sole survivor.
+		assert.deepStrictEqual(classifySwitchSheetTarget([1], 0), { kind: 'auto', sheet: 1 });
+	});
+
+	test('two or more live sheets -> pick (show the quick-pick)', () => {
+		assert.deepStrictEqual(classifySwitchSheetTarget([0, 1], 0), { kind: 'pick' });
+		assert.deepStrictEqual(classifySwitchSheetTarget([0, 1, 2], 5), { kind: 'pick' });
 	});
 });
 
