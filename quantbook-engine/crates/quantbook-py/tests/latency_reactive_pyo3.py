@@ -188,11 +188,19 @@ def main():
             f"[reactive-pyo3] invalid: not all {lc.BATCH_ROWS} row-SUM dependents reactively "
             f"recomputed in {lc.ITERS_B - b_dep_seen}/{lc.ITERS_B} Workload-B deltas (expected all)"
         )
-    # first published row = [base..base+9]; its SUM = 10*base + 45
-    dep = s.cell(sheet, lc.BATCH_BASE_ROW, B_DEP_COL)
-    expected = 10 * last_base + 45
-    if _num(dep) != expected:
-        raise SystemExit(f"[reactive-pyo3] invalid: row-SUM dependent expected {expected}, got {_num(dep)}")
+    # untimed completeness check: ALL 100 row-sum dependents carry the right recomputed
+    # value (row r sum = 10*base + 100*r + 45), AND the published frame's own corners are
+    # correct (so we validate the published inputs directly, not only the derived sums).
+    for r in range(lc.BATCH_ROWS):
+        dep = s.cell(sheet, lc.BATCH_BASE_ROW + r, B_DEP_COL)
+        expected = 10 * last_base + 100 * r + 45
+        if _num(dep) != expected:
+            raise SystemExit(f"[reactive-pyo3] invalid: K-row {r} sum expected {expected}, got {_num(dep)}")
+    first = s.cell(sheet, lc.BATCH_BASE_ROW, 0)
+    last = s.cell(sheet, lc.BATCH_BASE_ROW + lc.BATCH_ROWS - 1, lc.BATCH_COLS - 1)
+    last_val = last_base + (lc.BATCH_ROWS - 1) * lc.BATCH_COLS + (lc.BATCH_COLS - 1)
+    if _num(first) != last_base or _num(last) != last_val:
+        raise SystemExit(f"[reactive-pyo3] invalid: published frame corners {_num(first)},{_num(last)} != {last_base},{last_val}")
 
     report = lc.build_report(
         "reactive-pyo3", "engine-in-python (publish->recalc)",

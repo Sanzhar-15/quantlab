@@ -67,7 +67,7 @@ def _path_group(heading, legs, reports, floor_leg):
         print(f"\noverhead over the in-process floor ({floor_leg} A.p50={floor}ms):")
         for leg in legs:
             d = reports[leg]["workloadA"]["p50"] - floor
-            print(f"  {leg:18} +{round(d, 4)}ms")
+            print(f"  {leg:18} {d:+.4f}ms")
 
 
 def main():

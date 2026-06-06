@@ -53,8 +53,8 @@ class Host:
     def close(self):
         try:
             self.call(op="close")
-        except Exception:
-            pass
+        except Exception as e:  # teardown only (post-measurement) -- log, never swallow silently
+            print(f"[reactive-nodehost] host close() error (non-fatal, teardown): {e}", file=sys.stderr)
         try:
             self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -172,10 +172,18 @@ def main():
                 f"[reactive-nodehost] invalid: not all {lc.BATCH_ROWS} row-SUM dependents reactively "
                 f"recomputed in {lc.ITERS_B - b_dep_seen}/{lc.ITERS_B} Workload-B deltas (expected all)"
             )
-        dep = h.call(op="cell", sheet=sheet, row=lc.BATCH_BASE_ROW, col=B_DEP_COL)["cell"]
-        expected = 10 * last_base + 45
-        if _num(dep) != expected:
-            raise SystemExit(f"[reactive-nodehost] invalid: row-SUM dependent expected {expected}, got {_num(dep)}")
+        # untimed completeness check: ALL 100 row-sum dependents (row r = 10*base + 100*r + 45)
+        # AND the published frame's own corners (validate the published inputs directly).
+        for r in range(lc.BATCH_ROWS):
+            dep = h.call(op="cell", sheet=sheet, row=lc.BATCH_BASE_ROW + r, col=B_DEP_COL)["cell"]
+            expected = 10 * last_base + 100 * r + 45
+            if _num(dep) != expected:
+                raise SystemExit(f"[reactive-nodehost] invalid: K-row {r} sum expected {expected}, got {_num(dep)}")
+        first = h.call(op="cell", sheet=sheet, row=lc.BATCH_BASE_ROW, col=0)["cell"]
+        last = h.call(op="cell", sheet=sheet, row=lc.BATCH_BASE_ROW + lc.BATCH_ROWS - 1, col=lc.BATCH_COLS - 1)["cell"]
+        last_val = last_base + (lc.BATCH_ROWS - 1) * lc.BATCH_COLS + (lc.BATCH_COLS - 1)
+        if _num(first) != last_base or _num(last) != last_val:
+            raise SystemExit(f"[reactive-nodehost] invalid: published frame corners {_num(first)},{_num(last)} != {last_base},{last_val}")
 
         report = lc.build_report(
             "reactive-nodehost", "python->node-napi (publish->recalc)",
