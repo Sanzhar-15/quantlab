@@ -1,4 +1,4 @@
-// FE-1.5-1c-1 — acid #1 end-to-end through a REAL ipykernel + the napi host.
+// FE-1.5-1c-1/1c-2 — acid #1 end-to-end through a REAL ipykernel + the napi host (+ fullRebuild reseed).
 //
 // This is the 1c-0 Node host (`reactive_kernel_host.mjs`) EVOLVED for the real-kernel topology
 // decided in 1c-0.5: instead of spawning the embedded-IPython child, it spawns the Python
@@ -20,6 +20,17 @@
 //     and sends `{epoch_change}` to the kernel (a REVERSE control message). The kernel marks every
 //     binding force_check; the NEXT touched published var republishes even with an unchanged
 //     fingerprint -> healing the grid the undo reverted.
+//
+// FE-1.5-1c-2 retires the spike's LAST production-incompatible behavior: applyRepublish used to THROW
+// on snapshotDelta().fullRebuildRequired. That signal is a DESIGNED engine event (an undo bumps the
+// engine epoch, so a cursor token from before the undo epoch-mismatches -> the engine returns a full
+// rebuild rather than a silently-incomplete delta, session.rs EpochMismatch), and the SHIPPED extension
+// RESEEDS on it via acquireWorkbookSnapshotViaDelta (cellGridLogic.ts:1460-1465) — "an explicit
+// designed signal, NOT a swallowed error." This host now does the same: on a legitimate fullRebuild it
+// re-fetches a full snapshot and re-threads the cursor. To keep this a RECOVERY path and not a
+// bug-masking fallback, every 1c-1 scenario asserts no reseed occurred (reseedTotal === 0) — an
+// UNEXPECTED reseed in the incremental path is a cursor-threading bug and still fails loud. Only the
+// dedicated RESEED scenario induces (and expects) exactly one.
 //
 // Acceptance (command_exit_zero, headless, the §12.2 bar): T1-positive (reassign -> dependent
 // recomputes) + T5-negative (engine-quiet) run through a REAL ipykernel, plus fan-out, mutate,
@@ -66,6 +77,10 @@ const { Session } = mod.exports;
 const s = new Session();
 const sheetIds = new Map();
 let version = null;
+// 1c-2: count of republish frames the host handled via the RESEED path (a LEGITIMATE fullRebuild).
+// Every 1c-1 scenario asserts this stays 0, so an UNEXPECTED reseed on the incremental path (a real
+// cursor-threading bug) fails loud — the reseed is a recovery path, NOT a bug-masking fallback.
+let reseedTotal = 0;
 
 function colLetters(letters) {
   let col = 0;
@@ -104,8 +119,9 @@ function formulaInRange(range) {
 }
 
 // Apply ONE republish frame: G3 preflight, then publishDataset + recalcDirty + snapshotDelta.
-// Returns {delta} on apply, or {g3refused} when the host refuses to overwrite a formula (surfaced,
-// not silent). No-Fallbacks: a publish/serialize error or a fullRebuild THROWS (FATAL).
+// Returns {delta} on the incremental path, {reseed} on a LEGITIMATE fullRebuild (1c-2 — re-fetch a
+// full snapshot, mirroring the shipped reseed), or {g3refused} when the host refuses to overwrite a
+// formula (surfaced, not silent). No-Fallbacks: a publish/serialize error still THROWS (FATAL).
 function applyRepublish(frame) {
   const range = resolveTarget(frame.target);
   if (!frame.overwrite) {
@@ -116,8 +132,16 @@ function applyRepublish(frame) {
   s.recalcDirty();
   const d = s.snapshotDelta(version);
   if (d.fullRebuildRequired) {
-    throw new Error(`snapshotDelta required a FULL REBUILD (${frame.name}/${d.fullRebuildReason}) — ` +
-      `incremental reactive delta cannot be trusted; cursor not threaded correctly`);
+    // 1c-2: a LEGITIMATE fullRebuild (the designed engine signal — e.g. an undo bumped the epoch so a
+    // pre-undo cursor token epoch-mismatches). RESEED, mirroring the shipped
+    // acquireWorkbookSnapshotViaDelta (cellGridLogic.ts:1460-1465): re-fetch a full snapshot and
+    // re-thread the cursor to its version. NOT a swallowed error — `fullRebuildRequired` is an explicit
+    // signal, and the no-stray-reseed invariant (reseedTotal asserted 0 across every incremental
+    // scenario) means a cursor-threading BUG still surfaces as an unexpected reseed and fails loud.
+    reseedTotal++;
+    const full = s.snapshot();
+    version = full.version;
+    return { reseed: full };
   }
   version = d.version;
   return { delta: d };
@@ -210,7 +234,15 @@ ctrl.on("line", (line) => {
       try {
         const res = applyRepublish(f);
         if (res.g3refused) { pending.g3refused.push(res.g3refused); }
-        else { pending.frames.push(f); pending.deltas.push(res.delta); pending.republishCount++; }
+        else {
+          pending.frames.push(f);
+          pending.republishCount++;
+          // a frame applied via the RESEED path carries no incremental delta (full re-fetch);
+          // a frame applied via the normal path carries one. Track them separately so a scenario
+          // can assert WHICH path applied it (the no-stray-reseed invariant).
+          if (res.reseed) { pending.reseeds.push(res.reseed); pending.reseedCount++; }
+          else { pending.deltas.push(res.delta); }
+        }
       } catch (e) { const p = pending; pending = null; p.reject(e); }
       break;
     }
@@ -223,7 +255,7 @@ ctrl.on("line", (line) => {
     case "unpublished": {
       if (!pending) { failProtocol(new Error(`stray '${f.type}' frame`)); break; }
       const p = pending; pending = null;
-      p.resolve({ deltas: p.deltas, frames: p.frames, republishCount: p.republishCount, staleNames: p.staleNames, g3refused: p.g3refused });
+      p.resolve({ deltas: p.deltas, frames: p.frames, republishCount: p.republishCount, staleNames: p.staleNames, g3refused: p.g3refused, reseeds: p.reseeds, reseedCount: p.reseedCount });
       break;
     }
     case "error": {
@@ -251,7 +283,7 @@ function sendOp(frame) {
       CELL_TIMEOUT_MS,
     );
     pending = {
-      deltas: [], frames: [], republishCount: 0, staleNames: [], g3refused: [],
+      deltas: [], frames: [], republishCount: 0, staleNames: [], g3refused: [], reseeds: [], reseedCount: 0,
       resolve: (v) => { clearTimeout(timer); resolve(v); },
       reject: (e) => { clearTimeout(timer); reject(e); },
     };
@@ -394,6 +426,39 @@ async function main() {
   r = await execute("z2 = x");   // force_check cleared -> a same-value touch is QUIET again
   assert(r.republishCount === 0, `R7: force_check must clear after the heal (a later same-value touch is quiet)`);
 
+  // ===== 1c-2 RESEED (FOLD) — a kernel republish that LEGITIMATELY trips fullRebuild heals via reseed =====
+  // No-stray-reseed invariant: every scenario so far rode the INCREMENTAL delta path. Prove it — a
+  // reseed in any of them would be a cursor-threading bug the reseed could otherwise mask.
+  assert(reseedTotal === 0, `RESEED: all 1c-1 scenarios must stay on the incremental path, got reseedTotal=${reseedTotal}`);
+  // Make x live again on the incremental path (B1=5, C1=10).
+  r = await execute("x = 5");
+  assert(r.republishCount === 1 && r.reseedCount === 0 && groundNum(sheet, 0, 1) === 5 && groundNum(sheet, 0, 2) === 10,
+    `RESEED setup: x=5 -> B1=5/C1=10 on the incremental path, got reseedCount=${r.reseedCount} B1=${groundNum(sheet, 0, 1)} C1=${groundNum(sheet, 0, 2)}`);
+  // The host undoes that publish but — unlike R7 — deliberately does NOT resync its cursor. The undo
+  // bumps the engine epoch, so the NEXT snapshotDelta on the now-stale (pre-undo) cursor token
+  // epoch-mismatches and legitimately returns fullRebuildRequired: the signal the host must RESEED on.
+  const undoReseed = s.undo();
+  assert(undoReseed.consumed === true, `RESEED: undo of x=5 must be consumed, got ${JSON.stringify(undoReseed)}`);
+  s.recalcDirty();
+  // (intentionally NO `version = s.snapshot().version` here — that resync is exactly what R7 does to
+  //  AVOID a full rebuild; omitting it is what makes the next delta legitimately full-rebuild.)
+  await epochChange();                       // force_check every binding; the next touched var republishes
+  assert(reseedTotal === 0, `RESEED: still no reseed before the trigger, got ${reseedTotal}`);
+  // Touching x republishes (force_check) even though x's fingerprint is unchanged; applyRepublish then
+  // hits the stale cursor -> fullRebuild -> RESEED (re-fetch full snapshot, re-thread the cursor).
+  r = await execute("y2 = x");
+  assert(r.republishCount === 1 && r.reseedCount === 1,
+    `RESEED: the force_check republish must reseed on the legitimate fullRebuild, got republished=${r.republishCount} reseeded=${r.reseedCount}`);
+  assert(reseedTotal === 1, `RESEED: exactly one reseed total, got ${reseedTotal}`);
+  // The grid HEALED to x's current kernel value (5) even though the delta full-rebuilt.
+  assert(groundNum(sheet, 0, 1) === 5 && groundNum(sheet, 0, 2) === 10,
+    `RESEED: the grid must heal to x=5/C1=10 after the reseed, got B1=${groundNum(sheet, 0, 1)} C1=${groundNum(sheet, 0, 2)}`);
+  // The cursor RECOVERED: the reseed re-threaded `version`, so a later quiet cell rides the incremental
+  // delta again (the engine is NOT stuck full-rebuilding forever).
+  r = await execute("q9 = 1");
+  assert(r.republishCount === 0 && r.reseedCount === 0 && probeQuiet() === 0,
+    `RESEED: cursor must recover -> incremental deltas work again after the reseed`);
+
   // ---- clean shutdown ----
   closing = true;
   await new Promise((resolve, reject) => {
@@ -403,7 +468,7 @@ async function main() {
     child.stdin.write(JSON.stringify({ type: "close" }) + "\n");
   });
 
-  console.log("[reactive-kernel-host-real 1c-1] PASS — acid #1 end-to-end through a REAL ipykernel");
+  console.log("[reactive-kernel-host-real 1c-2] PASS — acid #1 end-to-end through a REAL ipykernel (+ fullRebuild reseed)");
   console.log("  B/C   publish + reassign -> hook fires in the REAL kernel -> C1=14 AND D1=107 (fan-out)");
   console.log("  neg   z=x+1 / w=99 / x=7 -> 0 frames + independent snapshotDelta empty (engine-quiet ×3)");
   console.log("  G     vec[1]=99          -> mutate-in-place across the real kernel -> D3=139");
@@ -413,11 +478,12 @@ async function main() {
   console.log("  G1/G2 dup / overlap      -> kernel-side guard rejects propagate over the wire");
   console.log("  G3    publish over F5     -> host REFUSES (no clobber); overwrite=True replaces it (FOLD)");
   console.log("  R7    x=8; undo; u=1; y=x -> epoch force_check: u=1 no overfire; y=x heals C1=16 incrementally (FOLD)");
+  console.log("  RES   x=5; undo (no resync); y2=x -> LEGITIMATE fullRebuild -> host RESEEDS -> grid heals; cursor recovers (1c-2 FOLD)");
   process.exit(0);
 }
 
 main().catch(async (e) => {
-  console.error(`[reactive-kernel-host-real 1c-1] FAIL: ${e && e.stack ? e.stack : e}`);
+  console.error(`[reactive-kernel-host-real 1c-2] FAIL: ${e && e.stack ? e.stack : e}`);
   await gracefulKill();  // tear the kernel down via the supervisor; never orphan the ipykernel
   process.exit(1);
 });
