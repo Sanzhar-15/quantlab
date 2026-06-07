@@ -251,12 +251,17 @@ _SENTINEL = object()
 
 class Quantbook:
     """The `qb` the notebook author calls, KERNEL-SIDE. Owns the name->target/fingerprint
-    registry, serializes + blank-fills, and emits a `republish` frame on fd 3 for the host to
-    apply. It is NOT the engine writer (the host is) -- it only SIGNALS (plan R8). No fallbacks:
-    every failure raises and is re-surfaced to the host as a FATAL `error` frame."""
+    registry, serializes + blank-fills, and EMITS a `republish` frame for the host to apply. It is
+    NOT the engine writer (the host is) -- it only SIGNALS (plan R8). No fallbacks: every failure
+    raises and is re-surfaced to the host as a FATAL `error` frame.
 
-    def __init__(self, shell):
+    The emit SINK is injectable (`emit` callable, taking the frame dict): FE-1.5-1c-0 passes the
+    default fd-3 writer (`_emit`); FE-1.5-1c-1 injects a Jupyter-Comm sender so the SAME glue runs
+    unchanged inside a REAL ipykernel. The frame schema is identical on either channel."""
+
+    def __init__(self, shell, emit=_emit):
         self._shell = shell
+        self._emit = emit         # the channel sink: fd-3 writer (1c-0) or Comm.send (1c-1)
         self._reg = {}            # name -> binding record
         self._hook_error = None
 
@@ -266,11 +271,10 @@ class Quantbook:
           - G1 duplicate name (unless the SAME owner_cell re-runs, or replace=True);
           - G2 the envelope overlaps another published region;
           - replace may NOT move the target (range-follows-cells is a v1 cut).
-        G3 (formula-overwrite) needs a host cell-state query -> DEFERRED to 1c-1. LOW-3 (1c-0
-        Codex fold): `overwrite` is accepted for API compatibility with 1.B but is NOT threaded
-        to the host and NOT enforced here (this kernel holds no Session). Until 1c-1 wires a
-        host-side cell-state preflight, a target over a user formula WOULD be clobbered by the
-        host's publishDataset -- a known, declared 1c-0 gap, not a silent fallback."""
+        G3 (formula-overwrite) is enforced HOST-SIDE (the host owns the Session): `overwrite` is
+        threaded into the republish frame and the host rejects a target that covers a user FORMULA
+        unless `overwrite=True`. In 1c-0 (fd-3 transport) no host enforced it yet; FE-1.5-1c-1
+        adds the host-side preflight at apply-time."""
         sheet_name, env_rows, env_cols, env_cells, _ = _parse_envelope(target)
 
         # GUARD 1 -- duplicate name.
@@ -303,16 +307,27 @@ class Quantbook:
         self._reg[name] = {
             "target": target, "sheet": sheet_name, "cells": env_cells,
             "env_rows": env_rows, "env_cols": env_cols, "fp": fp,
-            "owner_cell_id": owner_cell_id, "force_check": False, "stale": False,
+            "owner_cell_id": owner_cell_id, "overwrite": overwrite,
+            "force_check": False, "stale": False,
         }
         self._write(name, value)
 
     def _write(self, name, value):
-        """Where 1.B called session.publish_dataset, 1c emits a republish FRAME on fd 3. The host
-        applies it: publishDataset + recalcDirty + snapshotDelta (cursor host-side)."""
+        """Where 1.B called session.publish_dataset, 1c emits a republish FRAME on the injected
+        sink (fd 3 for 1c-0; a Jupyter Comm for 1c-1). The host applies it: publishDataset +
+        recalcDirty + snapshotDelta (cursor host-side). `overwrite` is threaded so the host can
+        enforce the G3 formula-overwrite guard at apply-time (it owns the Session)."""
         rec = self._reg[name]
         filled = _blank_fill(_to_matrix(value), rec["env_rows"], rec["env_cols"])
-        _emit({"type": "republish", "name": name, "values": filled, "target": rec["target"]})
+        self._emit({"type": "republish", "name": name, "values": filled,
+                    "target": rec["target"], "overwrite": rec["overwrite"]})
+
+    def unpublish(self, name):
+        """Remove a binding from the registry. FE-1.5-1c-1 (Codex MED): the host enforces G3
+        formula-overwrite at apply-time and may REFUSE a publish the kernel already registered;
+        the host then calls this (a reverse control message) to roll the ghost binding back, so a
+        later publish can't trip G1/G2 against a target the host never accepted."""
+        self._reg.pop(name, None)
 
     # ---- epoch / undo (faithful to 1.B; NOT exercised in 1c-0) -------------
     def on_epoch_change(self):
@@ -338,7 +353,7 @@ class Quantbook:
                     # MED-2 (1.B Codex fold): a touched-but-GONE var (`del x`) is marked stale +
                     # surfaced, never silently skipped. Full unpublish/clear is a v1 cut.
                     rec["stale"] = True
-                    _emit({"type": "stale", "name": name})
+                    self._emit({"type": "stale", "name": name})
                     continue
                 fp = _fingerprint(cur)
                 changed = fp != rec["fp"]
