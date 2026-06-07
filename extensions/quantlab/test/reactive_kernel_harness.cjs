@@ -24,6 +24,7 @@ const path = require('node:path');
 const HERE = __dirname;
 const EXT_ROOT = path.resolve(HERE, '..');
 const CLIENT = path.join(EXT_ROOT, 'out', 'src', 'quantbook', 'reactiveKernel', 'reactiveKernelClient.js');
+const PYTHONPATH_MOD = path.join(EXT_ROOT, 'out', 'src', 'qviz', 'pythonPath.js');
 const SUPERVISOR = path.join(EXT_ROOT, 'python', 'reactive_kernel', 'reactive_kernel_supervisor.py');
 
 function resolveCdylib() {
@@ -42,6 +43,10 @@ function resolveKernelPython() {
 }
 
 const { ReactiveKernelClient } = require(CLIENT);
+// FE-1.5-1d-2: spawn under the EXACT hardened env the shipped factory uses (scrubs PYTHONPATH/
+// PYTHONHOME, disables user site-packages) -- so this harness proves the kernel's deps resolve under
+// the scrub, not just under an unhardened inherited env.
+const { buildReactiveKernelEnv } = require(PYTHONPATH_MOD);
 
 // napi Session -- owned HERE (throwaway), exactly like the shipped CellGridPanel owns one.
 const mod = { exports: {} };
@@ -116,6 +121,7 @@ async function main() {
 	const client = new ReactiveKernelClient({
 		pythonPath: resolveKernelPython(),
 		supervisorScript: SUPERVISOR,
+		env: buildReactiveKernelEnv(),
 		session: s,
 		resolveTarget,
 		onChanged: () => {

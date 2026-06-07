@@ -168,13 +168,17 @@ export type PythonVersionResult =
 export function verifyPythonVersion(
 	pythonPath: string,
 	minMajor: number, minMinor: number,
+	env?: NodeJS.ProcessEnv,
 ): PythonVersionResult {
 	let raw: string;
 	try {
 		const out = execFileSync(
 			pythonPath,
 			['-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'],
-			{ timeout: 5_000, encoding: 'utf-8' },
+			// FE-1.5-1d-2 (Codex MED-1): run under the SAME env the dep probe + spawn use, so a live
+			// PYTHONHOME/PYTHONPATH cannot make the version check see a different interpreter view than
+			// the kernel will. `undefined` => execFileSync inherits process.env (the pre-1d-2 callers).
+			{ timeout: 5_000, encoding: 'utf-8', env },
 		);
 		raw = out.trim();
 	} catch (e) {
@@ -199,4 +203,92 @@ export function verifyPythonVersion(
 		};
 	}
 	return { ok: true, version: raw, major, minor };
+}
+
+// ---------------------------------------------------------------------------
+// reactive-kernel spawn env + dependency probe (FE-1.5-1d-2)
+// ---------------------------------------------------------------------------
+
+// Mirrors the daemon-client spawn scrub (`daemon-client.ts:478-501`): a reactive kernel runs
+// arbitrary workspace Python, so the spawn strips loader/interpreter-hijack vars and disables user
+// site-packages. UNLIKE the daemon, the reactive supervisor is launched as a SCRIPT (`python -u
+// <supervisor.py>`) and the kernel bootstrap self-inserts its own dir onto `sys.path`
+// (`reactive_kernel_supervisor.py:57-58`), so PYTHONPATH is scrubbed and NOT re-added -- the kernel's
+// ipykernel/jupyter_client/pyzmq/comm must live on the resolved interpreter's OWN site-packages.
+const REACTIVE_SCRUBBED_ENV_VARS = [
+	'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'LD_DEBUG', 'LD_BIND_NOW',
+	'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH',
+	'DYLD_FRAMEWORK_PATH', 'DYLD_FALLBACK_LIBRARY_PATH',
+	'DYLD_PRINT_STATISTICS', 'DYLD_PRINT_LIBRARIES',
+	'PYTHONSTARTUP', 'PYTHONHOME', 'PYTHONPATH',
+];
+
+/**
+ * Build the hardened environment the reactive kernel supervisor is spawned with. THE SAME builder
+ * must produce the env the dependency probe (`verifyPythonModules`) runs under -- otherwise the probe
+ * checks a different interpreter view than the spawn and mis-reports (Codex 1d plan-review MED-5).
+ *
+ * Returns a copy of `base` with the scrub set removed and `PYTHONNOUSERSITE=1`. No `||`/default
+ * masking: the caller's `base` (normally `process.env`) is the single source.
+ */
+export function buildReactiveKernelEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...base };
+	for (const v of REACTIVE_SCRUBBED_ENV_VARS) {
+		delete env[v];
+	}
+	// Defense-in-depth: a malicious `~/.local/.../site-packages` cannot shadow the kernel's modules.
+	env.PYTHONNOUSERSITE = '1';
+	return env;
+}
+
+export type PythonModulesResult =
+	| { readonly ok: true }
+	| { readonly ok: false; readonly missing: readonly string[]; readonly error?: string };
+
+/**
+ * Pre-flight: verify the resolved interpreter can ACTUALLY import every required target, RUN UNDER THE
+ * EXACT spawn env (`buildReactiveKernelEnv`) so it reflects what the supervisor will see.
+ *
+ * Codex 1d-2 MED-2: `importlib.util.find_spec` only checks a spec EXISTS -- it green-lights a broken
+ * install whose package dir is present but whose import raises. So this does a REAL
+ * `importlib.import_module` (executing module init) and, for `"module:attr"` entries, asserts the
+ * attribute is present too -- probing the EXACT things the runtime uses (the supervisor imports
+ * `jupyter_client.kernelspec.KernelSpec` / `jupyter_client.manager.KernelManager`, the bootstrap uses
+ * `comm.create_comm`, the kernel launches `-m ipykernel_launcher`). Any import/attr failure counts as
+ * missing (No-Fallbacks -- a broken install is a miss, not a silent pass).
+ *
+ * `imports` are import targets, NOT pip names (e.g. `zmq` not `pyzmq`); the caller maps them to an
+ * install hint. Returns the missing targets so the caller can fail loud with one actionable message
+ * instead of letting the supervisor crash at first import.
+ */
+export function verifyPythonModules(
+	pythonPath: string,
+	imports: readonly string[],
+	env: NodeJS.ProcessEnv,
+): PythonModulesResult {
+	const probe = [
+		'import importlib, sys',
+		`targets = ${JSON.stringify([...imports])}`,
+		'missing = []',
+		'for t in targets:',
+		'    mod, _, attr = t.partition(":")',
+		'    try:',
+		'        m = importlib.import_module(mod)',
+		'        if attr and not hasattr(m, attr):',
+		'            missing.append(t)',
+		'    except Exception:',
+		'        missing.append(t)',
+		'sys.stdout.write(",".join(missing))',
+	].join('\n');
+	let raw: string;
+	try {
+		raw = execFileSync(pythonPath, ['-c', probe], { timeout: 10_000, encoding: 'utf-8', env }).trim();
+	} catch (e) {
+		// The interpreter could not even run the probe -- treat ALL targets as unverified, surface why.
+		return { ok: false, missing: [...imports], error: `failed to run the dependency probe with ${pythonPath}: ${(e as Error).message}` };
+	}
+	if (raw === '') {
+		return { ok: true };
+	}
+	return { ok: false, missing: raw.split(',') };
 }

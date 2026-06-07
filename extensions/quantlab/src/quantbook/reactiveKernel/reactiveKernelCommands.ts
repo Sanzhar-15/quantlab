@@ -20,13 +20,28 @@
 
 import * as vscode from 'vscode';
 
-import { resolveQuantlabPython, verifyPythonVersion } from '../../qviz/pythonPath';
+import { buildReactiveKernelEnv, resolveQuantlabPython, verifyPythonModules, verifyPythonVersion } from '../../qviz/pythonPath';
 import { TrustManager } from '../../core/trust/TrustManager';
 import { CellGridPanel } from '../cellGrid/cellGridPanel';
 import { resolveCommandTargetPanel } from '../cellGrid/cellGridLogic';
 import type { CellRangeJson, SessionInstance } from '../types';
 import { ReactiveKernelClient } from './reactiveKernelClient';
 import { ReactiveKernelManager } from './reactiveKernelManager';
+
+// The EXACT import targets the supervisor + kernel bootstrap use at runtime (Codex 1d-2 MED-2: probe
+// real imports/attrs, not just top-level specs). `ipykernel_launcher` is the `-m` kernel-launch target;
+// `jupyter_client.kernelspec:KernelSpec` + `.manager:KernelManager` are the supervisor's imports
+// (reactive_kernel_supervisor.py:43-44); `zmq` is pyzmq; `comm:create_comm` is the bootstrap's exact
+// use (reactive_kernel_supervisor.py:60). Probed under the SCRUBBED spawn env so the check matches
+// what the supervisor will see.
+const REACTIVE_KERNEL_IMPORTS = [
+	'ipykernel_launcher',
+	'jupyter_client.kernelspec:KernelSpec',
+	'jupyter_client.manager:KernelManager',
+	'zmq',
+	'comm:create_comm',
+] as const;
+const REACTIVE_KERNEL_PIP_HINT = 'ipykernel jupyter_client pyzmq comm';
 
 /** Resolve the focused Cell Grid's owning Session, or show a hint + return undefined. */
 function resolveReactiveTarget(): { session: SessionInstance; sheet: number } | undefined {
@@ -135,13 +150,28 @@ function makeClientFactory(
 				+ 'python.defaultInterpreterPath, ~/.quantlab/venv). Configure one to run a reactive kernel.',
 			);
 		}
-		const versionCheck = verifyPythonVersion(resolved.pythonPath, 3, 10);
+		// FE-1.5-1d-2: build the hardened spawn env ONCE and use it for the version check, the dep
+		// probe, AND the supervisor spawn -- so all three see exactly what the kernel will (the scrub
+		// strips PYTHONPATH/PYTHONHOME + disables user site-packages; Codex MED-1: the version check
+		// must not run with those vars live). On any miss, fail loud with one actionable install hint --
+		// never fall through to a kernel that crashes at first import.
+		const spawnEnv = buildReactiveKernelEnv();
+		const versionCheck = verifyPythonVersion(resolved.pythonPath, 3, 10, spawnEnv);
 		if (!versionCheck.ok) {
 			throw new Error(`[kernel_bad_python] ${resolved.pythonPath} is not usable: ${versionCheck.error}`);
+		}
+		const depCheck = verifyPythonModules(resolved.pythonPath, REACTIVE_KERNEL_IMPORTS, spawnEnv);
+		if (!depCheck.ok) {
+			const why = depCheck.error !== undefined ? ` (${depCheck.error})` : '';
+			throw new Error(
+				`[kernel_missing_deps] ${resolved.pythonPath} is missing required modules: ${depCheck.missing.join(', ')}${why}. `
+				+ `Install them into that interpreter: "${resolved.pythonPath}" -m pip install ${REACTIVE_KERNEL_PIP_HINT}`,
+			);
 		}
 		return new ReactiveKernelClient({
 			pythonPath: resolved.pythonPath,
 			supervisorScript,
+			env: spawnEnv,
 			session,
 			resolveTarget: (a1: string): CellRangeJson => resolveA1OnSession(session, a1),
 			onChanged: (): void => {

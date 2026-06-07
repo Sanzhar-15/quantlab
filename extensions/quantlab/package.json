@@ -9,6 +9,12 @@
   "engines": {
     "vscode": "^1.108.0"
   },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "The reactive Quantbook kernel runs arbitrary workspace Python and is gated behind workspace trust. Other features work in Restricted Mode."
+    }
+  },
   "categories": [
     "Other"
   ],
