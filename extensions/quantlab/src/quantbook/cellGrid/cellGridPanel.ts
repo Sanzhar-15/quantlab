@@ -78,6 +78,20 @@ const allPanels: Set<CellGridPanel> = new Set();
 const bySession: Map<SessionInstance, Map<number, CellGridPanel>> = new Map();
 let focusedPanel: CellGridPanel | undefined;
 
+// FE-1.5-1d-1: listeners fired right before a session's LAST panel closes + the owning Session is
+// closed. Lets a bound reactive kernel tear down (dispose) BEFORE session.close(), so no republish
+// can write to a closing Session and no ipykernel is orphaned.
+const sessionClosingListeners: Array<(session: SessionInstance) => void> = [];
+function fireSessionClosing(session: SessionInstance): void {
+	for (const listener of sessionClosingListeners) {
+		try {
+			listener(session);
+		} catch (err) {
+			console.error('[cellGrid] sessionClosing listener threw:', err);
+		}
+	}
+}
+
 /**
  * Render-then-edit webview panel for the given session's sheet. The panel binds
  * the session for its lifetime -- the dispatcher commits via this session,
@@ -182,6 +196,9 @@ export class CellGridPanel {
 				sheetMapNow.delete(sheet);
 				if (sheetMapNow.size === 0) {
 					bySession.delete(session);
+					// 1d-1: tear down a reactive kernel bound to this Session BEFORE closing it, so an
+					// in-flight republish cannot write to a closing Session and the ipykernel is not orphaned.
+					fireSessionClosing(session);
 					// F4: the LAST panel for this session has closed -> close the
 					// owning napi Session to release the engine handle (ref-counted:
 					// sibling panels on other sheets keep it alive). This fires when the
@@ -234,6 +251,21 @@ export class CellGridPanel {
 	static refreshSession(session: SessionInstance): { refreshed: number; failed: number; skipped: number } {
 		const sheetMap = bySession.get(session);
 		return CellGridPanel.refreshIterable(sheetMap !== undefined ? sheetMap.values() : []);
+	}
+
+	/** Register a listener fired before a session's LAST panel closes (1d-1: tear down its kernel).
+	 *  Returns a disposable that unregisters it (push into context.subscriptions to avoid a stale
+	 *  listener across a same-host re-activation). */
+	static onSessionClosing(listener: (session: SessionInstance) => void): { dispose(): void } {
+		sessionClosingListeners.push(listener);
+		return {
+			dispose: (): void => {
+				const i = sessionClosingListeners.indexOf(listener);
+				if (i >= 0) {
+					sessionClosingListeners.splice(i, 1);
+				}
+			},
+		};
 	}
 
 	private static refreshIterable(it: Iterable<CellGridPanel>): { refreshed: number; failed: number; skipped: number } {

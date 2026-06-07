@@ -296,7 +296,9 @@ export class ReactiveKernelClient {
 	// ---- internals -------------------------------------------------------
 
 	private onControlLine(line: string): void {
-		if (this.fatal) {
+		// `killed` (set by dispose()/gracefulKill) makes this a no-op so a stray republish arriving
+		// between SIGTERM and exit cannot write to a Session the caller is about to close (1d-1).
+		if (this.fatal || this.killed) {
 			return;
 		}
 		if (line === '') {
@@ -532,6 +534,27 @@ export class ReactiveKernelClient {
 	private onExit(code: number | null, sig: NodeJS.Signals | null): void {
 		if (this.readyTimer) {
 			clearTimeout(this.readyTimer);
+		}
+		if (this.killed) {
+			// dispose()/gracefulKill (e.g. a user Stop or a last-panel close) initiated this exit -- it
+			// is EXPECTED, not a kernel error. Reject any waiters QUIETLY (no onError toast) and notify
+			// close listeners with no error. (MED Codex fold: avoid a false "kernel error" on dispose.)
+			const err = new Error('reactive kernel disposed');
+			if (!this.readyDone) {
+				this.readyReject(err);
+			}
+			if (this.pending) {
+				const p = this.pending;
+				this.pending = undefined;
+				p.reject(err);
+			}
+			if (this.closeReject) {
+				const r = this.closeReject;
+				this.closeResolve = this.closeReject = undefined;
+				r(err);
+			}
+			this.notifyClose(undefined);
+			return;
 		}
 		if (this.closing) {
 			if (code === 0 && sig === null) {

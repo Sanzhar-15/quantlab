@@ -235,6 +235,21 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.quantbookReactiveStart",
+        "title": "%command.quantbookReactiveStart.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookReactiveExecuteCell",
+        "title": "%command.quantbookReactiveExecuteCell.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookReactiveStop",
+        "title": "%command.quantbookReactiveStop.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.openRiskSettings",
         "title": "%command.openRiskSettings.title%",
         "category": "%command.category%"

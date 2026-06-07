@@ -6,6 +6,9 @@
 import * as vscode from 'vscode';
 import { registerDataCommands } from './commands/dataCommands';
 import { registerQuantbookCommands } from './commands/quantbookCommands';
+import { registerReactiveKernelCommands } from './quantbook/reactiveKernel/reactiveKernelCommands';
+import type { ReactiveKernelManager } from './quantbook/reactiveKernel/reactiveKernelManager';
+import type { SessionInstance } from './quantbook/types';
 import { registerGlobalStateCommands } from './commands/globalStateCommands';
 import { registerHistoryCommands } from './commands/historyCommands';
 import { registerPanelCommands } from './commands/panelCommands';
@@ -279,6 +282,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	registerDashboardCommands(context);
 	// Phase 5.7 V1 (2026-05-22): Quantbook engine demo round-trip.
 	registerQuantbookCommands(context);
+	// FE-1.5-1d-1: the reactive-kernel commands. Trust MUST be initialized first -- nothing called
+	// TrustManager.initialize before (so the trust store never loaded); the kernel's trust gate
+	// depends on it. Fail-closed: if init throws, the store stays empty -> the kernel refuses to
+	// spawn (the safe direction), never a silent ungated spawn.
+	let reactiveTrustReady = false;
+	try {
+		await TrustManager.getInstance().initialize(context);
+		reactiveTrustReady = true;
+	} catch (e) {
+		console.warn('Quantlab: TrustManager.initialize failed; the reactive kernel will treat the workspace as untrusted:', e);
+	}
+	// Pass a getter (not the bool) so the gate reads the final value even though init is awaited above.
+	reactiveKernelManager = registerReactiveKernelCommands(context, () => reactiveTrustReady);
 
 	new DataPanelProvider(context, globalState, watchlistManager);
 	const catalogService = ResourcesCatalogService.initialize(context);
@@ -607,6 +623,8 @@ async function initializeServerConnection(
  * C megaudit C1 regression -- fixed by awaiting in deactivate).
  */
 let qvizLifecycleManager: LifecycleManager | null = null;
+// FE-1.5-1d-1: reactive-kernel manager; disposed (awaited) in deactivate so no ipykernel is orphaned.
+let reactiveKernelManager: ReactiveKernelManager<SessionInstance> | null = null;
 
 /**
  * Wire the qviz daemon lifecycle MANAGER. The manager creates one
@@ -697,6 +715,17 @@ export async function deactivate(): Promise<void> {
 			console.warn('Quantlab: qviz lifecycle dispose threw during deactivate:', e);
 		}
 		qvizLifecycleManager = null;
+	}
+
+	// FE-1.5-1d-1: await the reactive-kernel teardown (SIGTERM-grace per supervisor) so no ipykernel
+	// is orphaned past extension shutdown -- same reason the qviz lifecycle is awaited here.
+	if (reactiveKernelManager !== null) {
+		try {
+			await reactiveKernelManager.disposeAll();
+		} catch (e) {
+			console.warn('Quantlab: reactive kernel dispose threw during deactivate:', e);
+		}
+		reactiveKernelManager = null;
 	}
 
 	// Cleanup server connection with proper disposal
