@@ -77,4 +77,11 @@ suite('qnb format', () => {
 			/workbookPath must be a string/,
 		);
 	});
+
+	test('stringify refuses a non-v1 in-memory doc (no silent downgrade)', () => {
+		assert.throws(
+			() => stringifyQnb({ qnbVersion: 2, cells: [] } as unknown as QnbDoc),
+			/cannot serialize qnbVersion 2/,
+		);
+	});
 });

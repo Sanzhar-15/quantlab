@@ -73,8 +73,15 @@ export function parseQnb(text: string): QnbDoc {
 	return doc;
 }
 
-/** Serialize a QnbDoc to canonical `.qnb` text (2-space JSON, trailing newline). */
+/** Serialize a QnbDoc to canonical `.qnb` text (2-space JSON, trailing newline). v1 is a closed
+ *  schema: only `qnbVersion`, optional `workbookPath`, and `{kind,source}` cells are written -- there
+ *  is no per-cell language or metadata field in v1, so a code cell always reconstructs as `python`
+ *  and a markdown cell as `markdown` on reopen (intentional for a Python-only reactive notebook). */
 export function stringifyQnb(doc: QnbDoc): string {
+	if (doc.qnbVersion !== QNB_VERSION) {
+		// No-Fallbacks (Codex N-0 LOW): never silently down/upgrade an in-memory doc to v1 on save.
+		throw new Error(`[qnb_serialize] cannot serialize qnbVersion ${JSON.stringify(doc.qnbVersion)} (only ${QNB_VERSION} is supported)`);
+	}
 	const out: Record<string, unknown> = { qnbVersion: QNB_VERSION };
 	if (doc.workbookPath !== undefined) {
 		out.workbookPath = doc.workbookPath;

@@ -21,7 +21,9 @@ export const QNB_NOTEBOOK_TYPE = 'quantlab-reactive-notebook';
 
 export class QnbSerializer implements vscode.NotebookSerializer {
 	deserializeNotebook(content: Uint8Array, _token: vscode.CancellationToken): vscode.NotebookData {
-		const text = new TextDecoder().decode(content);
+		// fatal:true so invalid UTF-8 throws a loud deserialize error rather than decoding to U+FFFD
+		// replacement chars and slipping through parseQnb as a "valid" string (Codex N-0 MED).
+		const text = new TextDecoder('utf-8', { fatal: true }).decode(content);
 		const doc = parseQnb(text);
 		const cells = doc.cells.map((c): vscode.NotebookCellData => {
 			const kind = c.kind === 'code' ? vscode.NotebookCellKind.Code : vscode.NotebookCellKind.Markup;
@@ -41,8 +43,15 @@ export class QnbSerializer implements vscode.NotebookSerializer {
 			source: c.value,
 		}));
 		const doc: QnbDoc = { qnbVersion: QNB_VERSION, cells };
-		const wb = data.metadata?.[QNB_WORKBOOK_PATH_META];
-		if (typeof wb === 'string') {
+		// Only the workbook path round-trips from notebook metadata; if the key is PRESENT but not a
+		// string it is corrupt -- throw, mirroring parseQnb's strictness (Codex N-0 MED: do not silently
+		// drop it). Other notebook/cell metadata + outputs are intentionally not persisted (transient).
+		const meta = data.metadata;
+		if (meta !== undefined && Object.prototype.hasOwnProperty.call(meta, QNB_WORKBOOK_PATH_META)) {
+			const wb = meta[QNB_WORKBOOK_PATH_META];
+			if (typeof wb !== 'string') {
+				throw new Error(`[qnb_serialize] ${QNB_WORKBOOK_PATH_META} metadata must be a string, got ${typeof wb}`);
+			}
 			doc.workbookPath = wb;
 		}
 		return new TextEncoder().encode(stringifyQnb(doc));
