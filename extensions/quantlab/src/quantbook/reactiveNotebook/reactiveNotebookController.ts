@@ -28,6 +28,7 @@ import type { SessionInstance } from '../types';
 import type { ReactiveKernelManager } from '../reactiveKernel/reactiveKernelManager';
 import { QNB_NOTEBOOK_TYPE } from './qnbSerializer';
 import { formatOpStatus, NotebookWorkbookClosedError, partialStatusFromError, ReactiveNotebookRegistry } from './reactiveNotebookRegistry';
+import { buildBindPublishCellSource, formatCellTarget, isPublishableSheetName, isValidPublishVariableName } from './bindVariableLogic';
 
 const CONTROLLER_ID = 'quantlab-reactive-kernel';
 const CONTROLLER_LABEL = 'Quantbook Reactive Kernel';
@@ -292,6 +293,98 @@ export function registerReactiveNotebookController(
 				void vscode.window.showInformationMessage('Quantbook: this reactive notebook is now bound to the chosen grid.');
 			} catch (e) {
 				void vscode.window.showErrorMessage(`Quantbook: could not bind the reactive notebook: ${e instanceof Error ? e.message : String(e)}`);
+			}
+		}),
+	);
+
+	// N-2 "Bind Variable to Selected Cell": BIND the active reactive notebook to the focused grid AND append
+	// a reactive `qb.publish(var, var, "Sheet!A1")` cell, with the A1 target computed from the focused grid's
+	// SELECTION (W-G-2b, CellGridPanel.focusedGridSelection) so the operator never hand-types the ref. The
+	// command writes notebook TEXT only -- the actual grid write still flows through the single live
+	// `qb.publish -> publishDataset` path when the operator runs the cell (No second writer). It EAGER-BINDS
+	// the notebook to the selection's grid (Codex HIGH): without that, an unbound notebook would bind on
+	// first run to the then-focused grid, which may differ from the grid the target ref was built for (a
+	// same-named sheet on another workbook -> wrong write). Eager-binding also clears a tombstone, so this is
+	// the sanctioned recovery for a detached notebook (Codex MED). v1 binds the selection's single FOCUS
+	// cell; a range/DataFrame publish is a later increment.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookBindVariableToSelectedCell', async () => {
+			try {
+				const editor = vscode.window.activeNotebookEditor;
+				if (editor === undefined || editor.notebook.notebookType !== QNB_NOTEBOOK_TYPE) {
+					void vscode.window.showInformationMessage('Open a reactive notebook (.qnb), keep it focused, then run this command.');
+					return;
+				}
+				// W-G-2b: the focused grid's selection persists even though the notebook is now the active editor
+				// (it keys off CellGridPanel's focusedPanel, which notebook focus does not change).
+				const sel = CellGridPanel.focusedGridSelection();
+				if (sel === undefined) {
+					void vscode.window.showInformationMessage('Select a cell in a Cell Grid first -- the binding targets the focused grid\'s selection.');
+					return;
+				}
+				const uri = editor.notebook.uri.toString();
+				// Fail-fast (good UX): refuse upfront if this notebook is DELIBERATELY bound to a DIFFERENT live
+				// grid -- do not silently steal it (use "Bind Reactive Notebook to Grid" to rebind). `boundSession`
+				// never returns a dead session (a closed session is deleted + tombstoned -> undefined), so a
+				// non-undefined value here is a live grid. (Re-checked authoritatively after the input box below.)
+				const boundBefore = registry.boundSession(uri);
+				if (boundBefore !== undefined && boundBefore !== sel.session) {
+					void vscode.window.showErrorMessage('Quantbook: this notebook is bound to a different Cell Grid. Rebind it ("Quantbook: Bind Reactive Notebook to Grid"), or select a cell in the bound grid, then try again.');
+					return;
+				}
+				// Resolve the sheet NAME (the publish target is name-qualified). Throws loud if the sheet id is
+				// gone -- focusedGridSelection() can return a valid-but-tombstoned sheet (Codex W-G-2b note).
+				const sheetName = activeSheetName(sel.session, sel.sheet);
+				// Codex MED: the kernel resolver splits a target on the FIRST `!`, so a sheet name containing `!`
+				// (which the engine permits) would be mis-parsed. Refuse rather than append a mis-targeting cell.
+				if (!isPublishableSheetName(sheetName)) {
+					void vscode.window.showErrorMessage(`Quantbook: sheet name "${sheetName}" contains a "!", which the publish target syntax cannot express. Rename the sheet, then try again.`);
+					return;
+				}
+				const target = formatCellTarget(sheetName, sel.selection.focusRow, sel.selection.focusCol);
+				// No-Fallbacks (Codex LOW): validate + use the RAW input -- never trim-coerce (so " x" is rejected
+				// in the box, not silently accepted as "x").
+				const name = await vscode.window.showInputBox({
+					prompt: `Variable to bind to ${target} (a Python name defined in this notebook)`,
+					placeHolder: 'x',
+					validateInput: (value) =>
+						isValidPublishVariableName(value)
+							? undefined
+							: 'Enter a valid Python variable name (letters, digits, underscore; not starting with a digit; not a keyword; no spaces).',
+				});
+				if (name === undefined) {
+					return; // operator dismissed the input box
+				}
+				// Authoritative TOCTOU re-check + EAGER-BIND, all synchronous (NO await between the live-check and
+				// bindNotebook, so the check cannot itself race -- the isLiveGridSession discipline). Re-read the
+				// binding too: it could have changed during the input-box await. Then bind THIS notebook to the
+				// selection's grid so the appended target always resolves on the grid it was built for.
+				const boundNow = registry.boundSession(uri);
+				if (boundNow !== undefined && boundNow !== sel.session) {
+					void vscode.window.showErrorMessage('Quantbook: this notebook is bound to a different Cell Grid. Rebind it ("Quantbook: Bind Reactive Notebook to Grid"), or select a cell in the bound grid, then try again.');
+					return;
+				}
+				if (!isLiveGridSession(sel.session)) {
+					void vscode.window.showErrorMessage('Quantbook: the target Cell Grid closed before the variable could be bound. Open a grid, select a cell, and try again.');
+					return;
+				}
+				registry.bindNotebook(uri, sel.session);
+				const source = buildBindPublishCellSource(name, sheetName, sel.selection.focusRow, sel.selection.focusCol);
+				const cell = new vscode.NotebookCellData(vscode.NotebookCellKind.Code, source, 'python');
+				const edit = new vscode.WorkspaceEdit();
+				const insertAt = editor.notebook.cellCount;
+				edit.set(editor.notebook.uri, [vscode.NotebookEdit.insertCells(insertAt, [cell])]);
+				const applied = await vscode.workspace.applyEdit(edit);
+				if (!applied) {
+					// No-Fallbacks: surface the failure rather than claim success on a no-op edit. (The notebook is
+					// now correctly bound to the selected grid regardless -- harmless.)
+					void vscode.window.showErrorMessage('Quantbook: bound the notebook, but could not append the binding cell. Try the command again.');
+					return;
+				}
+				editor.revealRange(new vscode.NotebookRange(insertAt, insertAt + 1), vscode.NotebookEditorRevealType.Default);
+				void vscode.window.showInformationMessage(`Quantbook: bound "${name}" to ${target}. Define ${name} above, then run the new cell to publish.`);
+			} catch (e) {
+				void vscode.window.showErrorMessage(`Quantbook: could not bind the variable: ${e instanceof Error ? e.message : String(e)}`);
 			}
 		}),
 	);
