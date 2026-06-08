@@ -144,6 +144,27 @@ export function translateFormulaRefs(formula: string, dRow: number, dCol: number
 	const n = formula.length;
 	while (i < n) {
 		const ch = formula[i];
+		// 0. Bracketed structured / external reference -- e.g. a table ref `Table1[Amount]` or an external
+		// `[1]Sheet1!A1`. The text inside `[...]` is a column/workbook token, NOT an A1 cell ref to offset
+		// (megaudit LOW); copy it verbatim. Depth-counted so a nested `[[#Headers],[Col]]` is handled.
+		if (ch === '[') {
+			const start = i;
+			let depth = 0;
+			while (i < n) {
+				if (formula[i] === '[') {
+					depth += 1;
+				} else if (formula[i] === ']') {
+					depth -= 1;
+					if (depth === 0) {
+						i += 1;
+						break;
+					}
+				}
+				i += 1;
+			}
+			out += formula.slice(start, i);
+			continue;
+		}
 		// 1. Double-quoted string literal -- copy verbatim ("" is an escaped quote inside it).
 		if (ch === '"') {
 			const start = i;
@@ -185,8 +206,12 @@ export function translateFormulaRefs(formula: string, dRow: number, dCol: number
 			const m = matchRefAt(formula, i);
 			if (m !== null) {
 				const after = formula[m.end];
-				// Not a clean ref if it is glued to a trailing identifier char or is a function call `(`.
-				const gluedAfter = isAlnum(after) || after === '_' || after === '(';
+				// Not a clean cell ref if the token is glued to a trailing identifier char, is a function
+				// call `(`, OR is followed by `!` -- a real cell ref is NEVER followed by `!`, so a
+				// ref-shaped token before `!` is a SHEET name (e.g. `S1` in `S1!A1`; the product seeds
+				// sheets S0/S1/S2, so this is common). Offsetting it would corrupt the sheet reference
+				// (megaudit HIGH). The coordinate AFTER the `!` is still offset (it is a separate token).
+				const gluedAfter = isAlnum(after) || after === '_' || after === '(' || after === '!';
 				if (!gluedAfter) {
 					out += offsetRef(m, dRow, dCol);
 					i = m.end;

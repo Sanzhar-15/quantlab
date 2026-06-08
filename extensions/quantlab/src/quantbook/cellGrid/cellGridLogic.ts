@@ -315,6 +315,11 @@ export const MAX_BATCH_CELLS = 100_000;
  * coord) -- the caller rejects the whole batch, never a partial write (No-Fallbacks + batch atomicity).
  */
 export function buildBatchOps(sheet: number, cells: readonly { row: number; col: number; rawInput: string }[]): SessionOpJson[] {
+	// Parity with setValueValidated (megaudit LOW): bound the sheet id to u16 like the single-cell path,
+	// rather than relying on the engine to reject an out-of-range sheet.
+	if (!Number.isInteger(sheet) || sheet < 0 || sheet > 0xFFFF) {
+		throw new Error(`[bad_argument] putCells: sheet must be an integer in [0, 65535], got ${sheet}.`);
+	}
 	if (cells.length === 0) {
 		throw new Error('[bad_argument] putCells: the batch is empty.');
 	}

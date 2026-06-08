@@ -91,4 +91,24 @@ suite('FE-1.5 a1FormulaRefs -- translateFormulaRefs', () => {
 		// XFC (16382) + 1 col -> XFD (16383, the last column); +1 more -> #REF! (covered above).
 		assert.strictEqual(translateFormulaRefs('=XFC1', 0, 1), '=XFD1');
 	});
+
+	test('megaudit HIGH: an UNQUOTED ref-shaped sheet name (S1!, Q1!) is NOT offset', () => {
+		// `S1` is ref-shaped (col S, row 1) but is a SHEET name here; the `!` guard leaves it alone, and
+		// only the coordinate after `!` moves. The product seeds sheets S0/S1/S2, so this is the real case.
+		assert.strictEqual(translateFormulaRefs('=S1!A1', 1, 0), '=S1!A2');
+		assert.strictEqual(translateFormulaRefs('=S1!A1', 0, 1), '=S1!B1');
+		assert.strictEqual(translateFormulaRefs('=Q1!A1', 0, 1), '=Q1!B1');
+		assert.strictEqual(translateFormulaRefs('=S1!B2*2', 1, 0), '=S1!B3*2');
+	});
+
+	test('megaudit: bottom-edge overflow (past MAX_ROWS) is #REF!', () => {
+		assert.strictEqual(translateFormulaRefs('=A1048576', 1, 0), '=#REF!');
+		// An absolute row at the max never overflows under an offset.
+		assert.strictEqual(translateFormulaRefs('=A$1048576', 5, 0), '=A$1048576');
+	});
+
+	test('megaudit LOW: bracketed structured/external refs are copied verbatim (A1 inside not offset)', () => {
+		assert.strictEqual(translateFormulaRefs('=Table1[Amount]+A1', 1, 0), '=Table1[Amount]+A2');
+		assert.strictEqual(translateFormulaRefs('=SUM(Table1[[#Data],[A1]])+A1', 1, 0), '=SUM(Table1[[#Data],[A1]])+A2');
+	});
 });

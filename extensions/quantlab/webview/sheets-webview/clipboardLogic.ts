@@ -19,11 +19,13 @@ export interface ClipboardCell {
 }
 
 /**
- * A snapshot of a copied (or cut) grid rectangle. `top`/`left` are the 0-based source origin (needed to
+ * A snapshot of a copied (or cut) grid rectangle. `sheet` is the source sheet (so a cross-sheet CUT does
+ * not clear the wrong sheet -- megaudit HIGH); `top`/`left` are the 0-based source origin (needed to
  * compute the paste offset for ref translation); `cells[i][j]` is the cell at source (`top+i`, `left+j`).
  * `isCut` requests move semantics: a paste also clears the source cells it did not overwrite.
  */
 export interface GridClipboard {
+	readonly sheet: number;
 	readonly top: number;
 	readonly left: number;
 	readonly rows: number;

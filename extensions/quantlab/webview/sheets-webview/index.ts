@@ -528,28 +528,30 @@ function currentSelection(): SelectionRect | null {
 }
 
 /**
- * **W-G copy/paste** -- snapshot the current selection (or the single active cell) into the internal grid
- * {@link gridClipboard}. Each copied cell holds its UNDERLYING content (formula-with-`=` or literal) read
- * via {@link priorCellContent}; an oversize cell copies as empty (it is never materialized -- the same
- * oversize discipline as editing). `isCut` requests move semantics for the next paste (no immediate
- * clear). v1 cut (documented): internal only; no marching-ants overlay.
- */
-/**
  * **W-G copy/paste + fill** -- snapshot a grid rectangle's UNDERLYING content into a {@link GridClipboard}
- * (each cell's formula-with-`=` or literal, via {@link priorCellContent}; an oversize cell -> empty, never
- * materialized). Shared by copy/cut (the selection) and the fill handle (the drag source).
+ * (each cell's formula-with-`=` or literal, via {@link priorCellContent}). Shared by copy/cut (the
+ * selection) and the fill handle (the drag source). Returns `null` if ANY cell is OVERSIZE: such a cell's
+ * value is never materialized, so it cannot be copied -- and silently storing `''` would CLEAR the paste
+ * target (No-Fallbacks: the caller surfaces a visible error instead, megaudit HIGH). `sheet` is recorded
+ * so a cross-sheet cut clears the correct sheet.
  */
-function readRectClipboard(top: number, left: number, rows: number, cols: number, isCut: boolean): GridClipboard {
+function readRectClipboard(top: number, left: number, rows: number, cols: number, isCut: boolean): GridClipboard | null {
+	if (fullSnapshot === null) {
+		return null;
+	}
 	const cells: { rawInput: string }[][] = [];
 	for (let r = 0; r < rows; r += 1) {
 		const rowCells: { rawInput: string }[] = [];
 		for (let c = 0; c < cols; c += 1) {
 			const pc = priorCellContent(renderer.entryAt(top + r, left + c));
-			rowCells.push({ rawInput: pc.oversize ? '' : pc.text });
+			if (pc.oversize) {
+				return null; // cannot copy an over-cap value (would otherwise silently clear the target)
+			}
+			rowCells.push({ rawInput: pc.text });
 		}
 		cells.push(rowCells);
 	}
-	return { top, left, rows, cols, cells, isCut };
+	return { sheet: fullSnapshot.sheet, top, left, rows, cols, cells, isCut };
 }
 
 function copyGridSelection(isCut: boolean): void {
@@ -561,7 +563,12 @@ function copyGridSelection(isCut: boolean): void {
 	const left = sel === null ? active.col : sel.minCol;
 	const rows = sel === null ? 1 : sel.maxRow - sel.minRow + 1;
 	const cols = sel === null ? 1 : sel.maxCol - sel.minCol + 1;
-	gridClipboard = readRectClipboard(top, left, rows, cols, isCut);
+	const clip = readRectClipboard(top, left, rows, cols, isCut);
+	if (clip === null) {
+		showError('A cell in this selection is too large to copy; nothing was copied.', 'transient');
+		return;
+	}
+	gridClipboard = clip;
 }
 
 /**
@@ -595,6 +602,10 @@ function applyFill(): void {
 		return; // no extension
 	}
 	const clip = readRectClipboard(src.minRow, src.minCol, srcRows, srcCols, false);
+	if (clip === null) {
+		showError('A cell in the fill source is too large to fill; nothing was filled.', 'transient');
+		return;
+	}
 	const cells = planFill(clip, fillRows, fillCols);
 	if (cells.length === 0) {
 		return;
@@ -603,6 +614,7 @@ function applyFill(): void {
 	// Select the filled rect (anchor at the source top-left, focus at the extension's bottom-right).
 	anchor = { row: src.minRow, col: src.minCol };
 	active = { row: fillPreview.maxRow, col: fillPreview.maxCol };
+	ensureActiveVisible();
 }
 
 /**
@@ -613,6 +625,13 @@ function applyFill(): void {
  */
 function pasteGridClipboard(): void {
 	if (fullSnapshot === null || active === null || gridClipboard === null) {
+		return;
+	}
+	// megaudit HIGH: a CUT moves cells, clearing the SOURCE. The source clears are posted to the current
+	// sheet's putCells, so a cross-sheet cut would clear the wrong sheet. Refuse it loudly (No-Fallbacks)
+	// rather than corrupt the active sheet; a cross-sheet COPY is fine (it never clears the source).
+	if (gridClipboard.isCut && gridClipboard.sheet !== fullSnapshot.sheet) {
+		showError('Cut-paste across sheets is not supported yet -- copy instead, or paste on the source sheet.', 'transient');
 		return;
 	}
 	const sel = currentSelection();
@@ -1171,6 +1190,10 @@ function isOnFillHandle(ev: MouseEvent): boolean {
 // W-G fill handle: a pointer press on the handle starts a drag-to-fill (pointer events so setPointerCapture
 // keeps move/up firing if the pointer leaves the canvas). A press elsewhere is left to the click handler.
 canvasEl.addEventListener('pointerdown', ev => {
+	// megaudit MED: clear any leftover suppress flag at the START of every interaction so it can never
+	// linger to swallow a later legitimate click (on platforms where preventDefault below already
+	// suppresses the drag's own synthetic click, the flag would otherwise never be consumed).
+	fillSuppressClick = false;
 	if (editState !== null || active === null || !isOnFillHandle(ev)) {
 		return;
 	}
@@ -1203,6 +1226,19 @@ canvasEl.addEventListener('pointerup', ev => {
 	fillSource = null;
 	fillPreview = null;
 	fillSuppressClick = true; // the click that follows this pointerup must not re-select
+	redraw();
+});
+// megaudit MED: if the drag is CANCELED (pointercancel -- a touch/pen hijack, a system overlay), there is
+// no pointerup, so clear the drag state here too. Otherwise `fillSource`/`fillPreview` stay set (a frozen
+// preview, and a later unrelated pointerup would apply an unintended fill). No fill is committed on a
+// cancel. (Only pointercancel, NOT lostpointercapture -- the latter also fires on the normal post-pointerup
+// release and could race applyFill.)
+canvasEl.addEventListener('pointercancel', () => {
+	if (fillSource === null) {
+		return;
+	}
+	fillSource = null;
+	fillPreview = null;
 	redraw();
 });
 

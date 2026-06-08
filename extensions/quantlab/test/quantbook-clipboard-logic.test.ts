@@ -13,6 +13,7 @@ import { planFill, planPaste, type GridClipboard } from '../webview/sheets-webvi
 
 function clip(top: number, left: number, cells: string[][], isCut = false): GridClipboard {
 	return {
+		sheet: 0,
 		top,
 		left,
 		rows: cells.length,
@@ -73,6 +74,15 @@ suite('FE-1.5 clipboardLogic -- planPaste', () => {
 			{ row: 0, col: 5, rawInput: '20' },
 			{ row: 0, col: 0, rawInput: '' }, // source A1 cleared
 			{ row: 0, col: 1, rawInput: '' }, // source B1 cleared
+		]);
+	});
+
+	test('cut-move of a FORMULA: the target is ref-translated AND the source is cleared', () => {
+		const c = clip(0, 0, [['=B1']], /*isCut*/ true); // cut A1 = "=B1"
+		const out = planPaste(c, 2, 2, 1, 1); // paste at C3 -> offset (2,2)
+		assert.deepStrictEqual(out, [
+			{ row: 2, col: 2, rawInput: '=D3' }, // =B1 translated by (2,2)
+			{ row: 0, col: 0, rawInput: '' }, // source A1 cleared (move)
 		]);
 	});
 
