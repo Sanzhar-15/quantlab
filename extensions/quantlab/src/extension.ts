@@ -9,6 +9,7 @@ import { registerQuantbookCommands } from './commands/quantbookCommands';
 import { registerReactiveKernelCommands } from './quantbook/reactiveKernel/reactiveKernelCommands';
 import type { ReactiveKernelManager } from './quantbook/reactiveKernel/reactiveKernelManager';
 import { QNB_NOTEBOOK_TYPE, QnbSerializer } from './quantbook/reactiveNotebook/qnbSerializer';
+import { registerReactiveNotebookController } from './quantbook/reactiveNotebook/reactiveNotebookController';
 import type { SessionInstance } from './quantbook/types';
 import { registerGlobalStateCommands } from './commands/globalStateCommands';
 import { registerHistoryCommands } from './commands/historyCommands';
@@ -295,13 +296,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		console.warn('Quantlab: TrustManager.initialize failed; the reactive kernel will treat the workspace as untrusted:', e);
 	}
 	// Pass a getter (not the bool) so the gate reads the final value even though init is awaited above.
-	reactiveKernelManager = registerReactiveKernelCommands(context, () => reactiveTrustReady);
+	const builtKernelManager = registerReactiveKernelCommands(context, () => reactiveTrustReady);
+	reactiveKernelManager = builtKernelManager;
 
 	// FE-1.5 W-N: the `.qnb` reactive-notebook serializer (the controller is registered in N-1).
 	// Outputs are transient (the kernel re-runs), so they are never written to disk.
 	context.subscriptions.push(
 		vscode.workspace.registerNotebookSerializer(QNB_NOTEBOOK_TYPE, new QnbSerializer(), { transientOutputs: true }),
 	);
+	// FE-1.5 W-N (N-1): the NotebookController that runs `.qnb` Python cells against the focused grid's
+	// reactive kernel (bind-on-first-execute, serialized, lifetime-safe). Built after the manager exists.
+	registerReactiveNotebookController(context, builtKernelManager);
 
 	new DataPanelProvider(context, globalState, watchlistManager);
 	const catalogService = ResourcesCatalogService.initialize(context);
