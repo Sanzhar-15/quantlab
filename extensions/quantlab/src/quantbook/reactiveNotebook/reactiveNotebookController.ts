@@ -41,11 +41,13 @@ function resolveFocusedGridSession(): SessionInstance {
 	}
 	const resolution = resolveCommandTargetPanel(panels, CellGridPanel.focusedLocalPanel());
 	if (resolution.kind === 'ambiguous') {
-		// Clicking the notebook Run button blurs the grid, so "click the grid then re-run" can loop back to
-		// ambiguous. The honest recovery is the N-2 "Bind to Focused Grid" command, or leaving one grid open.
+		// Clicking the notebook Run button blurs the grid, so "click the grid then re-run" loops back to
+		// ambiguous (and clicking the grid de-focuses the notebook, which the Bind command needs active).
+		// The honest recovery: keep THIS notebook focused and run the Bind command -- it prompts for the grid.
 		throw new Error(
 			'[ambiguous_cell_grid] multiple Cell Grids are open; this notebook cannot tell which to bind to. '
-			+ 'Click the grid you want and run "Quantbook: Bind Reactive Notebook to Focused Grid", or close all but the target grid, then run the cell again',
+			+ 'With this notebook focused, run "Quantbook: Bind Reactive Notebook to Grid" (it prompts you to pick the grid), '
+			+ 'or leave only the target grid open, then run the cell again',
 		);
 	}
 	return resolution.session;
@@ -97,6 +99,15 @@ function activeSheetName(session: SessionInstance, sheet: number): string {
 		throw new Error(`[bad_sheet] the focused grid has no sheet with id ${sheet}`);
 	}
 	return found.name;
+}
+
+/** True iff `session` is still backed by a live (non-disposed) Cell Grid panel. The bind commands await a
+ *  QuickPick / openNotebookDocument; the chosen grid can CLOSE during that gap, and binding a closed
+ *  Session would clear the tombstone and store a dead handle that `resolveForExecute` then hands out as
+ *  "live" -- the explicit-bind analog of the HIGH-1 dead-session hazard (megaudit). Callers re-validate
+ *  with this immediately before `bindNotebook`, with NO await in between, so the check cannot itself race. */
+function isLiveGridSession(session: SessionInstance): boolean {
+	return CellGridPanel.activeLocalPanels().some((p) => p.session === session);
 }
 
 /** The seed cells for a newly opened reactive notebook: a one-line how-it-works note + a runnable publish
@@ -228,23 +239,32 @@ export function registerReactiveNotebookController(
 	// changes -- the operator never has to keep the grid focused to run a cell.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookOpenReactiveNotebook', async () => {
-			const target = await pickTargetGrid();
-			if (target === undefined) {
-				return;
-			}
-			let sheetName: string;
+			// All failure paths surface a clean message (No-Fallbacks system boundary -- a command error is
+			// user-facing, the underlying error is shown, never swallowed). Without this an unexpected throw
+			// (e.g. session.snapshot() on a broken grid) becomes a cryptic "command rejected" notification.
 			try {
-				sheetName = activeSheetName(target.session, target.sheet);
+				const target = await pickTargetGrid();
+				if (target === undefined) {
+					return;
+				}
+				const sheetName = activeSheetName(target.session, target.sheet);
+				const data = new vscode.NotebookData(seedNotebookCells(sheetName));
+				const notebook = await vscode.workspace.openNotebookDocument(QNB_NOTEBOOK_TYPE, data);
+				// TOCTOU (megaudit HIGH): the grid may have CLOSED during the awaits above. Re-validate the
+				// chosen Session is still a live panel immediately before binding -- NO await between here and
+				// bindNotebook -- else we would clear the tombstone and store a dead Session that
+				// resolveForExecute hands out as "live".
+				if (!isLiveGridSession(target.session)) {
+					void vscode.window.showErrorMessage('Quantbook: the target Cell Grid closed before the notebook could be bound. Open a grid, then run "Quantbook: Bind Reactive Notebook to Grid".');
+					return;
+				}
+				registry.bindNotebook(notebook.uri.toString(), target.session);
+				controller.updateNotebookAffinity(notebook, vscode.NotebookControllerAffinity.Preferred);
+				await vscode.window.showNotebookDocument(notebook, { viewColumn: vscode.ViewColumn.Beside });
+				void vscode.window.showInformationMessage('Quantbook: reactive notebook opened and bound to the grid. Run the cell to publish a variable.');
 			} catch (e) {
-				void vscode.window.showErrorMessage(`Quantbook: ${e instanceof Error ? e.message : String(e)}`);
-				return;
+				void vscode.window.showErrorMessage(`Quantbook: could not open the reactive notebook: ${e instanceof Error ? e.message : String(e)}`);
 			}
-			const data = new vscode.NotebookData(seedNotebookCells(sheetName));
-			const notebook = await vscode.workspace.openNotebookDocument(QNB_NOTEBOOK_TYPE, data);
-			registry.bindNotebook(notebook.uri.toString(), target.session);
-			controller.updateNotebookAffinity(notebook, vscode.NotebookControllerAffinity.Preferred);
-			await vscode.window.showNotebookDocument(notebook, { viewColumn: vscode.ViewColumn.Beside });
-			void vscode.window.showInformationMessage('Quantbook: reactive notebook opened and bound to the focused grid. Run the cell to publish a variable.');
 		}),
 	);
 
@@ -252,17 +272,27 @@ export function registerReactiveNotebookController(
 	// closed-workbook tombstone (Codex HIGH-1 keeps the implicit path tombstoned) -- no close+reopen needed.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookBindReactiveNotebook', async () => {
-			const editor = vscode.window.activeNotebookEditor;
-			if (editor === undefined || editor.notebook.notebookType !== QNB_NOTEBOOK_TYPE) {
-				void vscode.window.showInformationMessage('Open a reactive notebook (.qnb) and make it the active editor, then run this command.');
-				return;
+			try {
+				const editor = vscode.window.activeNotebookEditor;
+				if (editor === undefined || editor.notebook.notebookType !== QNB_NOTEBOOK_TYPE) {
+					void vscode.window.showInformationMessage('Open a reactive notebook (.qnb), keep it focused, then run this command (you will be prompted to pick the grid).');
+					return;
+				}
+				const target = await pickTargetGrid();
+				if (target === undefined) {
+					return;
+				}
+				// TOCTOU (megaudit HIGH): the chosen grid may have closed during the pick -- re-validate before
+				// binding (no await between here and bindNotebook) so we never bind a dead Session.
+				if (!isLiveGridSession(target.session)) {
+					void vscode.window.showErrorMessage('Quantbook: the chosen Cell Grid is no longer open. Open a grid and try again.');
+					return;
+				}
+				registry.bindNotebook(editor.notebook.uri.toString(), target.session);
+				void vscode.window.showInformationMessage('Quantbook: this reactive notebook is now bound to the chosen grid.');
+			} catch (e) {
+				void vscode.window.showErrorMessage(`Quantbook: could not bind the reactive notebook: ${e instanceof Error ? e.message : String(e)}`);
 			}
-			const target = await pickTargetGrid();
-			if (target === undefined) {
-				return;
-			}
-			registry.bindNotebook(editor.notebook.uri.toString(), target.session);
-			void vscode.window.showInformationMessage('Quantbook: this reactive notebook is now bound to the chosen grid.');
 		}),
 	);
 

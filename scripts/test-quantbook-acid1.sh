@@ -12,6 +12,12 @@
 # Requires QUANTBOOK_ENGINE_PATH (engine dylib) and QUANTLAB_PYTHON (an interpreter with
 # ipykernel/jupyter_client/pyzmq/comm) -- the test self-skips if they are unset/missing.
 #
+# This script BUILDS the extension (out/) AND the bundled sheets webview (dist/) before launching, so the
+# gate is self-consistent. NOTE (megaudit): the webview bundle (dist/webview/quantbook) is gitignored and
+# is NOT produced by `npm run compile`, `npm test`, `vscode:prepublish`, or the aggregate CI build -- only
+# by `build:webviews:quantbook`. A fresh checkout therefore has no Cell Grid / formula bar until that runs.
+# Wiring the webview build into the packaging/CI path is a separate, pre-existing infra decision.
+#
 # Usage:
 #   QUANTBOOK_ENGINE_PATH=<engine>/target/release/libql_bindings_node.dylib \
 #   QUANTLAB_PYTHON=$HOME/.fe15-spike-venv/bin/python3.12 \
@@ -25,6 +31,9 @@ else
 fi
 
 cd "$ROOT" || exit 1
+
+# Build the extension + the (otherwise-unbuilt, gitignored) webview bundle so the host loads a fresh grid.
+( cd "$ROOT/extensions/quantlab" && npm run compile && npm run build:webviews:quantbook ) || exit 1
 
 VSCODEUSERDATADIR=$(mktemp -d 2>/dev/null)
 WS=$(mktemp -d 2>/dev/null)

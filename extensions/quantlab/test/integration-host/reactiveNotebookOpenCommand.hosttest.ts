@@ -55,7 +55,6 @@ suite('Quantbook "Open Reactive Notebook" command (real extension host)', () => 
 			this.skip(); // honest green-skip: engine dylib / kernel interpreter absent
 			return;
 		}
-		kernelPidsBefore = ipykernelPids();
 		const ext = vscode.extensions.getExtension('quantlab.quantlab');
 		assert.ok(ext, 'the quantlab extension must be installed in the host');
 		await ext.activate();
@@ -70,6 +69,11 @@ suite('Quantbook "Open Reactive Notebook" command (real extension host)', () => 
 		while (CellGridPanel.activeLocalPanels().length > 0 && Date.now() < drainDeadline) {
 			await delay(50);
 		}
+		// Snapshot the kernel-PID baseline AFTER closing prior grids + a SIGTERM-grace settle, so a kernel a
+		// PRIOR suite left mid-teardown is reaped first and not absorbed into the baseline -- otherwise this
+		// suite's orphan check would be lenient toward a cross-suite leak (megaudit LOW).
+		await delay(1500);
+		kernelPidsBefore = ipykernelPids();
 	});
 
 	test('Open Reactive Notebook seeds a bound notebook whose cell recomputes the grid', async function () {
