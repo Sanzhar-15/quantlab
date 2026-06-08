@@ -22,6 +22,7 @@ import {
 	MAX_ROWS,
 	ROW_HEIGHT,
 	cellContentRect,
+	cellRefA1,
 	colX,
 	columnLabel,
 	computeVisibleColRange,
@@ -55,6 +56,24 @@ suite('FE-2-0 gridLayoutA1 -- columnLabel (bijective base-26)', function () {
 	});
 	test('negative index yields empty string (defensive, never reached via hit-test)', () => {
 		assert.strictEqual(columnLabel(-1), '');
+	});
+});
+
+suite('W-G gridLayoutA1 -- cellRefA1 (formula-bar name box)', function () {
+	test('origin + diagonal', () => {
+		assert.strictEqual(cellRefA1(0, 0), 'A1');
+		assert.strictEqual(cellRefA1(1, 1), 'B2');
+		assert.strictEqual(cellRefA1(9, 2), 'C10');
+	});
+	test('multi-letter columns keep the 1-based row', () => {
+		assert.strictEqual(cellRefA1(0, 26), 'AA1');
+		assert.strictEqual(cellRefA1(99, 701), 'ZZ100');
+	});
+	test('the Excel max cell', () => {
+		assert.strictEqual(cellRefA1(MAX_ROWS - 1, MAX_COLS - 1), 'XFD1048576');
+	});
+	test('a negative row clamps to row 1 (defensive)', () => {
+		assert.strictEqual(cellRefA1(-1, 0), 'A1');
 	});
 });
 

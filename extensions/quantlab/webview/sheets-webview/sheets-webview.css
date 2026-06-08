@@ -41,6 +41,51 @@ h2 {
 	margin-bottom: 12px;
 }
 
+/* W-G formula bar: a name box (the active cell's A1 ref) + a read-only field showing that cell's
+ * underlying content (formula or literal). Sits above the grid viewport; theme-styled to match VS Code
+ * inputs. The input is read-only in this slice (editing is a later increment) but stays selectable so the
+ * user can copy a formula out of it. */
+.cell-grid-formula-bar {
+	display: flex;
+	align-items: stretch;
+	gap: 6px;
+	margin-bottom: 8px;
+}
+
+.cell-grid-name-box {
+	flex: 0 0 auto;
+	min-width: 72px;
+	box-sizing: border-box;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	padding: 2px 8px;
+	font-family: var(--vscode-font-family);
+	font-size: 12px;
+	color: var(--vscode-foreground);
+	background: var(--vscode-editorWidget-background, var(--vscode-input-background));
+	border: 1px solid var(--vscode-panel-border);
+	border-radius: 3px;
+}
+
+.cell-grid-formula-input {
+	flex: 1 1 auto;
+	min-width: 0;
+	box-sizing: border-box;
+	font-family: var(--vscode-font-family);
+	font-size: 12px;
+	color: var(--vscode-input-foreground);
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-panel-border);
+	border-radius: 3px;
+	padding: 2px 7px;
+}
+
+.cell-grid-formula-input:focus {
+	outline: none;
+	border-color: var(--vscode-focusBorder);
+}
+
 /* The scroller. The in-flow spacer gives it scroll extent; the canvas overlays the viewport. */
 .cell-grid-viewport {
 	position: relative;

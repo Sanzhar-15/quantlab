@@ -117,6 +117,15 @@ export function columnLabel(colIndex: number): string {
 }
 
 /**
+ * A1 cell reference for a 0-based `(row, col)`: `(0,0)`->"A1", `(1,1)`->"B2", `(0,26)`->"AA1",
+ * `(1048575,16383)`->"XFD1048576". The column uses {@link columnLabel} (bijective base-26); the row is
+ * 1-based. A negative row clamps to row 1. Pure -- the formula bar's cell-name box reads this (W-G).
+ */
+export function cellRefA1(row: number, col: number): string {
+	return columnLabel(col) + String(Math.max(0, Math.floor(row)) + 1);
+}
+
+/**
  * Width of the sticky row-number gutter for a given measured text width (the px width of the WIDEST
  * row-number string currently in view, from `ctx.measureText`). Pure: the measurement is injected so
  * this stays headless-testable. The renderer recomputes it per frame so the gutter tracks the digit

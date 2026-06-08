@@ -48,6 +48,7 @@ import {
 	MAX_ROWS,
 	ROW_HEIGHT,
 	cellContentRect,
+	cellRefA1,
 	colX,
 	hitTestViewport,
 	isInExtent,
@@ -112,6 +113,15 @@ root.innerHTML =
 	'<h2 id="sheets-title">Quantbook Cell Grid</h2>' +
 	'<div class="meta" id="sheets-meta"></div>' +
 	'<div class="sheets-error" id="sheets-error" role="alert" hidden></div>' +
+	// W-G formula bar: a name box (the active cell's A1 ref) + a read-only field showing that cell's
+	// UNDERLYING content (a formula with its leading '=', or the raw literal) -- so selecting a computed
+	// cell reveals its formula. Read-only in this slice; editing comes next (W-G-1b).
+	'<div class="cell-grid-formula-bar" id="sheets-formula-bar">' +
+	'<span class="cell-grid-name-box" id="sheets-name-box" title="Selected cell"></span>' +
+	'<input id="sheets-formula-input" class="cell-grid-formula-input" type="text" readonly ' +
+	'aria-label="Formula bar (selected cell contents)" spellcheck="false" autocomplete="off" ' +
+	'autocorrect="off" autocapitalize="off" />' +
+	'</div>' +
 	'<div class="cell-grid-viewport" id="sheets-viewport" tabindex="0">' +
 	'<div id="sheets-spacer"></div>' +
 	'<canvas id="sheets-canvas"></canvas>' +
@@ -122,6 +132,8 @@ root.innerHTML =
 const titleEl = document.getElementById('sheets-title') as HTMLElement;
 const metaEl = document.getElementById('sheets-meta') as HTMLElement;
 const errorEl = document.getElementById('sheets-error') as HTMLElement;
+const nameBoxEl = document.getElementById('sheets-name-box') as HTMLElement;
+const formulaInputEl = document.getElementById('sheets-formula-input') as HTMLInputElement;
 const viewportEl = document.getElementById('sheets-viewport') as HTMLElement;
 const spacerEl = document.getElementById('sheets-spacer') as HTMLElement;
 const canvasEl = document.getElementById('sheets-canvas') as HTMLCanvasElement;
@@ -174,6 +186,8 @@ let fullSnapshot: QuantbookCellSnapshot | null = null;
 const errorCells = new Map<string, string>();
 // The active (selected) cell. Starts at A1 (like Excel) so the grid always shows a selection.
 let active: ActiveCell | null = { row: 0, col: 0 };
+// Seed the formula bar with the initial selection (A1, empty content) before the first render arrives.
+updateFormulaBar();
 
 interface EditState {
 	// **Audit MED-2 (2026-06-05)**: the sheet captured at edit-start. `commitEdit` posts to THIS sheet, not
@@ -303,6 +317,7 @@ function redraw(): void {
 	applyCanvasTransform(v.scrollTop, v.scrollLeft);
 	renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
 	prevPaint = scrollStateNow(v);
+	updateFormulaBar(); // selection/content changed -> reflect the active cell in the formula bar
 }
 
 /**
@@ -448,12 +463,17 @@ function priorCellContent(entry: QuantbookCellSnapshot['entries'][number] | unde
 		return { text: '', oversize: false };
 	}
 	if (typeof entry.formula === 'string') {
-		// The editor shows `'=' + formula`; check the raw length first so an over-cap formula is flagged
-		// WITHOUT building the concatenation.
-		if (entry.formula.length + 1 > MAX_RAW_INPUT_LENGTH) {
+		// The engine stores formula text VERBATIM, which may or may not carry the leading '=' (the napi
+		// putFormula example is "=SUM(...)"; a snapshot may also carry a bare "A1+1"). Emit exactly one '='
+		// so neither the editor prefill nor the formula bar double-prefixes (Codex W-G MED). Measure the
+		// DISPLAYED length first (startsWith is O(1)) so an over-cap formula is still flagged WITHOUT building
+		// the concatenation.
+		const hasEq = entry.formula.startsWith('=');
+		const displayLen = hasEq ? entry.formula.length : entry.formula.length + 1;
+		if (displayLen > MAX_RAW_INPUT_LENGTH) {
 			return { text: '', oversize: true };
 		}
-		return { text: '=' + entry.formula, oversize: false };
+		return { text: hasEq ? entry.formula : '=' + entry.formula, oversize: false };
 	}
 	// Only a `text` value can realistically be multi-MB; check its raw length before `formatCellValue` builds it.
 	if (entry.value.kind === 'text' && entry.value.value.length > MAX_RAW_INPUT_LENGTH) {
@@ -464,6 +484,25 @@ function priorCellContent(entry: QuantbookCellSnapshot['entries'][number] | unde
 		return { text: '', oversize: true }; // defensive: a pathological number/error projection
 	}
 	return { text: lit, oversize: false };
+}
+
+/**
+ * W-G -- refresh the formula bar from the active cell: its A1 ref in the name box and its UNDERLYING
+ * content (a formula with its leading '=' or the raw literal) in the read-only field, so a computed cell
+ * reveals its formula. An over-cap value is shown as a placeholder, never materialized (the same oversize
+ * discipline as {@link priorCellContent}). Called on every content/selection repaint (`redraw` + the damage
+ * fast path); a pure scroll changes neither selection nor content, so the scroll path deliberately omits it.
+ */
+function updateFormulaBar(): void {
+	if (active === null) {
+		nameBoxEl.textContent = '';
+		formulaInputEl.value = '';
+		return;
+	}
+	nameBoxEl.textContent = cellRefA1(active.row, active.col);
+	const entry = fullSnapshot === null ? undefined : renderer.entryAt(active.row, active.col);
+	const content = priorCellContent(entry);
+	formulaInputEl.value = content.oversize ? '(value too large to display)' : content.text;
 }
 
 /** Open the editor over (row,col). `initialChar` (type-to-edit) replaces the cell content. */
@@ -823,6 +862,13 @@ canvasEl.addEventListener('mousemove', ev => {
 // --- Keyboard: navigation + type-to-edit + undo/redo (only when NOT editing) ---
 
 document.addEventListener('keydown', ev => {
+	// W-G: the formula bar input is focusable (read-only, but selectable so a formula can be copied out).
+	// Its keystrokes bubble to this document handler -- ignore them, or arrows/Delete/printable keys would
+	// drive grid navigation / clear / type-to-edit on the active cell while the user is in the formula bar
+	// (Codex W-G HIGH). Copy (Ctrl+C of a selected formula) still works: the browser handles it natively.
+	if (ev.target === formulaInputEl) {
+		return;
+	}
 	if (editState !== null) {
 		return; // the editor has its own handler
 	}
@@ -987,6 +1033,9 @@ function applyRender(snapshot: QuantbookCellSnapshot): void {
 	// no-op for an empty row set (nothing painted changed).
 	applyCanvasTransform(v.scrollTop, v.scrollLeft);
 	renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
+	// The damage path bypasses redraw(); if the active cell's content changed (e.g. a commit re-render),
+	// the formula bar must still follow it.
+	updateFormulaBar();
 }
 
 /**
