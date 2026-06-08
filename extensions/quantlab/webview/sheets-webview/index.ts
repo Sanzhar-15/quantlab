@@ -41,7 +41,7 @@ import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { clampDisplayString, formatCellValue } from './cellRender';
 import { CanvasGridRenderer, type ActiveCell, type PublishedRange } from './canvasGrid';
 import { computeScrollBlitA1, diffSnapshotsA1, errorRowsFlippedA1, staleTintKeysA1, type ScrollState } from './gridBlitA1';
-import { planPaste, type GridClipboard } from './clipboardLogic';
+import { planFill, planPaste, type GridClipboard } from './clipboardLogic';
 import {
 	COL_WIDTH,
 	HEADER_HEIGHT,
@@ -206,6 +206,15 @@ let publishedRangesKey = '';
 // Ctrl/Cmd+C (isCut=false) / Ctrl/Cmd+X (isCut=true), consumed by Ctrl/Cmd+V. `null` = nothing copied.
 // Internal-only for v1 (no OS-clipboard interop); persists across renders + sheet switches like Excel.
 let gridClipboard: GridClipboard | null = null;
+// **W-G fill handle**: drag-to-fill state. `fillSource` is the selection rect captured at the start of a
+// fill-handle drag (null = not dragging); `fillPreview` is the rect the fill will cover (source extended
+// down/right under the pointer), painted as a dashed outline and passed to every renderer draw call.
+// `fillSuppressClick` swallows the click that fires after a fill-drag pointerup (so it doesn't re-select).
+let fillSource: SelectionRect | null = null;
+let fillPreview: SelectionRect | null = null;
+let fillSuppressClick = false;
+// Click tolerance (CSS px) for grabbing the fill-handle square at the selection's bottom-right corner.
+const FILL_HANDLE_HIT_PX = 5;
 // The active (selected) cell -- the FOCUS of the selection. Starts at A1 (like Excel) so the grid
 // always shows a selection. `active` is the editable/formula-bar cell; all single-cell logic keys off it.
 let active: ActiveCell | null = { row: 0, col: 0 };
@@ -359,7 +368,7 @@ function redraw(): void {
 	const v = currentViewport();
 	renderer.resize(v.cssW, v.cssH);
 	applyCanvasTransform(v.scrollTop, v.scrollLeft);
-	renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection(), publishedRanges);
+	renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection(), publishedRanges, fillPreview);
 	prevPaint = scrollStateNow(v);
 	updateFormulaBar(); // selection/content changed -> reflect the active cell in the formula bar
 	postSelectionIfChanged(); // W-G-2b: report the selection to the host (deduped)
@@ -412,9 +421,9 @@ function scrollRedraw(): void {
 	// selection to paint the range in the exposed strip / full-fallback.
 	const sel = currentSelection();
 	if (blit === null) {
-		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel, publishedRanges);
+		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel, publishedRanges, fillPreview);
 	} else {
-		renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel, publishedRanges);
+		renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel, publishedRanges, fillPreview);
 	}
 	prevPaint = next;
 	scheduleHoverTitle(); // W-G name display: a scroll moves a new cell under a stationary pointer -> refresh the hover title
@@ -525,15 +534,12 @@ function currentSelection(): SelectionRect | null {
  * oversize discipline as editing). `isCut` requests move semantics for the next paste (no immediate
  * clear). v1 cut (documented): internal only; no marching-ants overlay.
  */
-function copyGridSelection(isCut: boolean): void {
-	if (fullSnapshot === null || active === null) {
-		return;
-	}
-	const sel = currentSelection();
-	const top = sel === null ? active.row : sel.minRow;
-	const left = sel === null ? active.col : sel.minCol;
-	const rows = sel === null ? 1 : sel.maxRow - sel.minRow + 1;
-	const cols = sel === null ? 1 : sel.maxCol - sel.minCol + 1;
+/**
+ * **W-G copy/paste + fill** -- snapshot a grid rectangle's UNDERLYING content into a {@link GridClipboard}
+ * (each cell's formula-with-`=` or literal, via {@link priorCellContent}; an oversize cell -> empty, never
+ * materialized). Shared by copy/cut (the selection) and the fill handle (the drag source).
+ */
+function readRectClipboard(top: number, left: number, rows: number, cols: number, isCut: boolean): GridClipboard {
 	const cells: { rawInput: string }[][] = [];
 	for (let r = 0; r < rows; r += 1) {
 		const rowCells: { rawInput: string }[] = [];
@@ -543,7 +549,60 @@ function copyGridSelection(isCut: boolean): void {
 		}
 		cells.push(rowCells);
 	}
-	gridClipboard = { top, left, rows, cols, cells, isCut };
+	return { top, left, rows, cols, cells, isCut };
+}
+
+function copyGridSelection(isCut: boolean): void {
+	if (fullSnapshot === null || active === null) {
+		return;
+	}
+	const sel = currentSelection();
+	const top = sel === null ? active.row : sel.minRow;
+	const left = sel === null ? active.col : sel.minCol;
+	const rows = sel === null ? 1 : sel.maxRow - sel.minRow + 1;
+	const cols = sel === null ? 1 : sel.maxCol - sel.minCol + 1;
+	gridClipboard = readRectClipboard(top, left, rows, cols, isCut);
+}
+
+/**
+ * **W-G fill handle** -- the rect a fill drag will cover: the source extended in the DOMINANT axis (down
+ * or right) to the dragged cell, growth-only (v1 does not fill up/left). A pure helper of the drag.
+ */
+function computeFillPreview(source: SelectionRect, dragRow: number, dragCol: number): SelectionRect {
+	const downDist = Math.max(0, dragRow - source.maxRow);
+	const rightDist = Math.max(0, dragCol - source.maxCol);
+	if (downDist >= rightDist) {
+		return { minRow: source.minRow, maxRow: source.maxRow + downDist, minCol: source.minCol, maxCol: source.maxCol };
+	}
+	return { minRow: source.minRow, maxRow: source.maxRow, minCol: source.minCol, maxCol: source.maxCol + rightDist };
+}
+
+/**
+ * **W-G fill handle** -- on drag end, fill the extension cells (source replicated with relative-ref offset)
+ * as ONE atomic `putCells` batch, then select the filled rect (Excel selects the result). No-op when the
+ * preview did not extend past the source.
+ */
+function applyFill(): void {
+	if (fullSnapshot === null || fillSource === null || fillPreview === null) {
+		return;
+	}
+	const src = fillSource;
+	const srcRows = src.maxRow - src.minRow + 1;
+	const srcCols = src.maxCol - src.minCol + 1;
+	const fillRows = fillPreview.maxRow - src.minRow + 1;
+	const fillCols = fillPreview.maxCol - src.minCol + 1;
+	if (fillRows <= srcRows && fillCols <= srcCols) {
+		return; // no extension
+	}
+	const clip = readRectClipboard(src.minRow, src.minCol, srcRows, srcCols, false);
+	const cells = planFill(clip, fillRows, fillCols);
+	if (cells.length === 0) {
+		return;
+	}
+	vscode.postMessage({ type: 'putCells', sheet: fullSnapshot.sheet, cells, undoLabel: 'Fill' });
+	// Select the filled rect (anchor at the source top-left, focus at the extension's bottom-right).
+	anchor = { row: src.minRow, col: src.minCol };
+	active = { row: fillPreview.maxRow, col: fillPreview.maxCol };
 }
 
 /**
@@ -1090,10 +1149,71 @@ function hitTestCanvas(ev: MouseEvent): { row: number; col: number } | null {
 	);
 }
 
+/**
+ * **W-G fill handle** -- is `ev` over the fill-handle square (the selection's bottom-right corner)? The
+ * handle is painted at the bottom-right pixel corner of the selection (or the active cell); a press within
+ * {@link FILL_HANDLE_HIT_PX} of it starts a fill drag instead of a selection click.
+ */
+function isOnFillHandle(ev: MouseEvent): boolean {
+	if (active === null) {
+		return false;
+	}
+	const sel = currentSelection();
+	const brRow = sel === null ? active.row : sel.maxRow;
+	const brCol = sel === null ? active.col : sel.maxCol;
+	const rect = canvasEl.getBoundingClientRect();
+	const cornerX = colX(brCol + 1, renderer.gutterWidthPx) - viewportEl.scrollLeft;
+	const cornerY = rowY(brRow + 1) - viewportEl.scrollTop;
+	return Math.abs(ev.clientX - rect.left - cornerX) <= FILL_HANDLE_HIT_PX
+		&& Math.abs(ev.clientY - rect.top - cornerY) <= FILL_HANDLE_HIT_PX;
+}
+
+// W-G fill handle: a pointer press on the handle starts a drag-to-fill (pointer events so setPointerCapture
+// keeps move/up firing if the pointer leaves the canvas). A press elsewhere is left to the click handler.
+canvasEl.addEventListener('pointerdown', ev => {
+	if (editState !== null || active === null || !isOnFillHandle(ev)) {
+		return;
+	}
+	ev.preventDefault();
+	const sel = currentSelection();
+	fillSource = sel ?? { minRow: active.row, maxRow: active.row, minCol: active.col, maxCol: active.col };
+	fillPreview = fillSource;
+	canvasEl.setPointerCapture(ev.pointerId);
+});
+canvasEl.addEventListener('pointermove', ev => {
+	if (fillSource === null) {
+		return;
+	}
+	const hit = hitTestCanvas(ev);
+	if (hit === null) {
+		return;
+	}
+	const next = computeFillPreview(fillSource, hit.row, hit.col);
+	if (fillPreview === null || next.minRow !== fillPreview.minRow || next.maxRow !== fillPreview.maxRow || next.minCol !== fillPreview.minCol || next.maxCol !== fillPreview.maxCol) {
+		fillPreview = next;
+		redraw();
+	}
+});
+canvasEl.addEventListener('pointerup', ev => {
+	if (fillSource === null) {
+		return;
+	}
+	canvasEl.releasePointerCapture?.(ev.pointerId);
+	applyFill();
+	fillSource = null;
+	fillPreview = null;
+	fillSuppressClick = true; // the click that follows this pointerup must not re-select
+	redraw();
+});
+
 // Single click SELECTS the cell (Excel). It does NOT open the editor -- double-click / F2 / type-to-edit do.
 // If an editor was open, the focus-out it caused already committed/cancelled it via the blur handler above;
 // here we only move the selection. (A pending commit keeps its editor; the click still just reselects.)
 canvasEl.addEventListener('click', ev => {
+	if (fillSuppressClick) {
+		fillSuppressClick = false; // W-G fill handle: swallow the click synthesized after a fill drag
+		return;
+	}
 	const hit = hitTestCanvas(ev);
 	if (hit === null) {
 		return;
@@ -1428,7 +1548,7 @@ function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean)
 	// Scroll is unchanged (gated above), so the canvas transform + prevPaint stay valid; drawDamage is a
 	// no-op for an empty row set (nothing painted changed).
 	applyCanvasTransform(v.scrollTop, v.scrollLeft);
-	renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection(), publishedRanges);
+	renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection(), publishedRanges, fillPreview);
 	// The damage path bypasses redraw(); if the active cell's content changed (e.g. a commit re-render),
 	// the formula bar must still follow it.
 	updateFormulaBar();
@@ -1608,7 +1728,7 @@ window.addEventListener('message', (event: MessageEvent) => {
 		if (!activeMoved && renderer.painted && !renderer.backingScaleStale && scrollUnchangedSince(v)) {
 			const rows = errorRowsFlippedA1(prevErrorKeys, new Set(errorCells.keys()));
 			applyCanvasTransform(v.scrollTop, v.scrollLeft);
-			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection(), publishedRanges);
+			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection(), publishedRanges, fillPreview);
 		} else {
 			// A selection realign (activeMoved) repaints both the old + new selection rows -> full redraw.
 			redraw();

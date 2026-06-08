@@ -106,3 +106,35 @@ export function planPaste(
 	}
 	return planned;
 }
+
+/**
+ * **W-G fill handle** -- plan the cell writes for extending a source rectangle (`clip`) to fill a larger
+ * `fillRows` x `fillCols` rect anchored at the same top-left (the user dragged the fill handle down or
+ * right). Returns ONLY the EXTENSION cells (those outside the source); each repeats the source by modular
+ * position and offsets a formula's relative refs by its distance from the cell it repeats (Excel COPY-fill:
+ * `=A1` filled down becomes `=A2`, `=A3`, ...). A multi-row/col source TILES (the pattern repeats), each
+ * tile offset by its cycle distance. v1 cuts (documented): COPY-fill only -- no numeric/date SERIES
+ * detection (a single "1" fills "1,1,1", not "1,2,3"); the caller constrains the drag to one axis.
+ */
+export function planFill(clip: GridClipboard, fillRows: number, fillCols: number): PlannedCell[] {
+	const planned: PlannedCell[] = [];
+	for (let r = 0; r < fillRows; r += 1) {
+		for (let c = 0; c < fillCols; c += 1) {
+			if (r < clip.rows && c < clip.cols) {
+				continue; // inside the source -- left as-is, not rewritten
+			}
+			const srcI = r % clip.rows;
+			const srcJ = c % clip.cols;
+			const srcRow = clip.top + srcI;
+			const srcCol = clip.left + srcJ;
+			const targetRow = clip.top + r;
+			const targetCol = clip.left + c;
+			planned.push({
+				row: targetRow,
+				col: targetCol,
+				rawInput: retargetRawInput(clip.cells[srcI][srcJ].rawInput, targetRow - srcRow, targetCol - srcCol),
+			});
+		}
+	}
+	return planned;
+}

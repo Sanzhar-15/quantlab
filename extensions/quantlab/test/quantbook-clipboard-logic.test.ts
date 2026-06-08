@@ -9,7 +9,7 @@
 
 import * as assert from 'assert';
 
-import { planPaste, type GridClipboard } from '../webview/sheets-webview/clipboardLogic';
+import { planFill, planPaste, type GridClipboard } from '../webview/sheets-webview/clipboardLogic';
 
 function clip(top: number, left: number, cells: string[][], isCut = false): GridClipboard {
 	return {
@@ -92,5 +92,47 @@ suite('FE-1.5 clipboardLogic -- planPaste', () => {
 		const c = clip(5, 5, [['=A1']]); // a ref well left/up of the source
 		const out = planPaste(c, 0, 0, 1, 1); // paste up-left by (-5,-5): A1 -> off-grid
 		assert.deepStrictEqual(out, [{ row: 0, col: 0, rawInput: '=#REF!' }]);
+	});
+});
+
+suite('FE-1.5 clipboardLogic -- planFill (drag-to-fill, copy semantics)', () => {
+	test('fill a single source row DOWN: only the extension rows, formulas offset, literals verbatim', () => {
+		const c = clip(0, 0, [['=A1', '5']]); // source row A1:B1
+		const out = planFill(c, 3, 2); // extend to 3 rows x 2 cols
+		assert.deepStrictEqual(out, [
+			{ row: 1, col: 0, rawInput: '=A2' }, { row: 1, col: 1, rawInput: '5' },
+			{ row: 2, col: 0, rawInput: '=A3' }, { row: 2, col: 1, rawInput: '5' },
+		]);
+	});
+
+	test('fill a single source col RIGHT: only the extension cols, formulas offset across', () => {
+		const c = clip(0, 0, [['=A1'], ['10']]); // source col A1:A2
+		const out = planFill(c, 2, 3); // extend to 2 rows x 3 cols (row-major output order)
+		assert.deepStrictEqual(out, [
+			{ row: 0, col: 1, rawInput: '=B1' }, { row: 0, col: 2, rawInput: '=C1' },
+			{ row: 1, col: 1, rawInput: '10' }, { row: 1, col: 2, rawInput: '10' },
+		]);
+	});
+
+	test('a multi-row source TILES, each repeat offset by its cycle distance', () => {
+		const c = clip(0, 0, [['=A1'], ['=A2']]); // 2-row source
+		const out = planFill(c, 4, 1); // extend to 4 rows (rows 2,3 are the new tile)
+		assert.deepStrictEqual(out, [
+			{ row: 2, col: 0, rawInput: '=A3' }, // repeats row0 (=A1) offset +2
+			{ row: 3, col: 0, rawInput: '=A4' }, // repeats row1 (=A2) offset +2
+		]);
+	});
+
+	test('no extension (fill rect equals the source) writes nothing', () => {
+		const c = clip(0, 0, [['=A1', '5']]);
+		assert.deepStrictEqual(planFill(c, 1, 2), []);
+	});
+
+	test('an absolute ref stays fixed across a fill', () => {
+		const c = clip(0, 0, [['=$A$1']]);
+		assert.deepStrictEqual(planFill(c, 3, 1), [
+			{ row: 1, col: 0, rawInput: '=$A$1' },
+			{ row: 2, col: 0, rawInput: '=$A$1' },
+		]);
 	});
 });

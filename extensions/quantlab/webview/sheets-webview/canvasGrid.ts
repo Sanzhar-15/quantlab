@@ -47,6 +47,9 @@ const CELL_PAD = 8;
 const OVERSCAN = 2;
 const MEASURE_CACHE_MAX = 5000;
 const SELECTION_BORDER_PX = 2;
+// W-G fill handle: side length (CSS px) of the small solid square at the selection's bottom-right corner
+// the user drags to fill, and the dash period of the drag-preview outline.
+const FILL_HANDLE_PX = 6;
 // W-G bound-cell indicator: side length (CSS px) of the filled corner triangle marking a cell a reactive
 // published variable drives. A small top-right marker (the Excel note-marker convention).
 const PUBLISHED_BADGE_PX = 7;
@@ -314,9 +317,10 @@ export class CanvasGridRenderer {
 		active: ActiveCell | null,
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
+		fillPreview: SelectionRect | null,
 	): void {
 		this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
 		this.hasPaintedOnce = true;
 	}
 
@@ -339,6 +343,7 @@ export class CanvasGridRenderer {
 		active: ActiveCell | null,
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
+		fillPreview: SelectionRect | null,
 	): void {
 		const ctx = this.ctx;
 		const c = blit.copy;
@@ -354,12 +359,12 @@ export class CanvasGridRenderer {
 			ctx.beginPath();
 			ctx.rect(d.x, d.y, d.width, d.height);
 			ctx.clip();
-			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges);
+			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
 			ctx.restore();
 		}
 		this.hasPaintedOnce = true;
 		if (DEBUG_BLIT_VERIFY) {
-			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, 'drawScroll');
+			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, 'drawScroll');
 		}
 	}
 
@@ -381,6 +386,7 @@ export class CanvasGridRenderer {
 		active: ActiveCell | null,
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
+		fillPreview: SelectionRect | null,
 	): void {
 		if (rows.length === 0) {
 			return;
@@ -414,11 +420,11 @@ export class CanvasGridRenderer {
 		}
 		addBand(runStart, runEnd);
 		ctx.clip();
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
 		ctx.restore();
 		this.hasPaintedOnce = true;
 		if (DEBUG_BLIT_VERIFY) {
-			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, 'drawDamage');
+			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, 'drawDamage');
 		}
 	}
 
@@ -438,6 +444,7 @@ export class CanvasGridRenderer {
 		active: ActiveCell | null,
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
+		fillPreview: SelectionRect | null,
 		path: string,
 	): void {
 		const ctx = this.ctx;
@@ -445,7 +452,7 @@ export class CanvasGridRenderer {
 		const bh = this.canvas.height;
 		const partial = ctx.getImageData(0, 0, bw, bh);
 		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
 		const full = ctx.getImageData(0, 0, bw, bh);
 		const pa = partial.data;
 		const fu = full.data;
@@ -486,6 +493,7 @@ export class CanvasGridRenderer {
 		active: ActiveCell | null,
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
+		fillPreview: SelectionRect | null,
 	): void {
 		const ctx = this.ctx;
 		ctx.fillStyle = this.palette.background;
@@ -630,6 +638,45 @@ export class CanvasGridRenderer {
 					}
 				}
 			}
+		}
+
+		// 4c. W-G fill handle: the drag-PREVIEW outline -- a dashed accent border around the rect the fill
+		// will cover (the source extended down/right under the pointer). Painted only while a fill drag is
+		// active (`fillPreview !== null`) and only when it intersects the visible window. Drawn before the
+		// handle square so the square sits on top of the dashes at the shared corner.
+		if (
+			fillPreview !== null &&
+			fillPreview.maxRow >= rowRange.startIdx && fillPreview.minRow < rowRange.endIdx &&
+			fillPreview.maxCol >= colRange.startIdx && fillPreview.minCol < colRange.endIdx
+		) {
+			const px = Math.round(colX(fillPreview.minCol, gutterW) - scrollLeft);
+			const py = Math.round(rowY(fillPreview.minRow) - scrollTop);
+			const pw = Math.round(colX(fillPreview.maxCol + 1, gutterW) - scrollLeft) - px;
+			const ph = Math.round(rowY(fillPreview.maxRow + 1) - scrollTop) - py;
+			ctx.save();
+			ctx.strokeStyle = this.palette.selectionBorder;
+			ctx.lineWidth = 1;
+			ctx.setLineDash([FILL_HANDLE_PX / 2, FILL_HANDLE_PX / 2]);
+			ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
+			ctx.restore();
+		}
+
+		// 4d. W-G fill handle: a small solid square at the bottom-right corner of the selection (or the
+		// active cell) -- the Excel drag-to-fill affordance. A background-coloured halo keeps it visible
+		// against a selected (filled) range. Painted only when that corner cell is in the visible window.
+		const handleBR = selection !== null ? { row: selection.maxRow, col: selection.maxCol } : active;
+		if (
+			handleBR !== null &&
+			handleBR.row >= rowRange.startIdx && handleBR.row < rowRange.endIdx &&
+			handleBR.col >= colRange.startIdx && handleBR.col < colRange.endIdx
+		) {
+			const cx = Math.round(colX(handleBR.col + 1, gutterW) - scrollLeft);
+			const cy = Math.round(rowY(handleBR.row + 1) - scrollTop);
+			const half = FILL_HANDLE_PX / 2;
+			ctx.fillStyle = this.palette.background;
+			ctx.fillRect(cx - half - 1, cy - half - 1, FILL_HANDLE_PX + 2, FILL_HANDLE_PX + 2);
+			ctx.fillStyle = this.palette.selectionBorder;
+			ctx.fillRect(cx - half, cy - half, FILL_HANDLE_PX, FILL_HANDLE_PX);
 		}
 
 		// 5. Sticky row gutter (covers cells that scrolled left under it), then header, then corner.
