@@ -247,9 +247,10 @@ export function isInExtent(row: number, col: number): boolean {
  * for the active sheet, each an inclusive 0-based rect carrying its `.name`) and returns the FIRST
  * containing range's name. The param is STRUCTURAL (not the webview `PublishedRange` interface) so
  * this leaf geometry module stays free of any dependency on `canvasGrid.ts`. First-match-wins is the
- * documented v1 behaviour: publishes are single cells, so ranges never overlap; a future range-aware
- * bind that does overlap would surface the first match (registration order). Pure + unit-tested so
- * the formula-bar chip and the hover tooltip read it headlessly-verified.
+ * defined behaviour: a publish may target a range (range-aware bind), but the kernel's G2 guard rejects
+ * overlapping published regions, so at most one range contains a cell -- first-match is unambiguous, and
+ * is the rule if that ever changes. Pure + unit-tested so the formula-bar chip and the hover tooltip read
+ * it headlessly-verified.
  */
 export function publishedNameAt(
 	ranges: readonly {

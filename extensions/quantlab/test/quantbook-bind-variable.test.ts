@@ -12,10 +12,13 @@ import * as assert from 'assert';
 
 import {
 	buildBindPublishCellSource,
+	buildBindPublishRangeCellSource,
 	columnLabelA1,
 	formatCellTarget,
+	formatRangeTarget,
 	isPublishableSheetName,
 	isValidPublishVariableName,
+	normalizeSelectionRect,
 } from '../src/quantbook/reactiveNotebook/bindVariableLogic';
 
 suite('N-2 bindVariableLogic -- columnLabelA1 (bijective base-26)', () => {
@@ -119,5 +122,71 @@ suite('N-2 bindVariableLogic -- buildBindPublishCellSource (injection-safe)', ()
 	test('the variable name is used both as the string key and the bare value expression', () => {
 		const src = buildBindPublishCellSource('returns', 'S1', 2, 3);
 		assert.ok(src.includes('qb.publish("returns", returns, "S1!D3")'), `got: ${src}`);
+	});
+});
+
+// FE-1.5 N-2 follow-up (range-aware bind): a multi-cell selection publishes a 2D value across a RANGE.
+suite('N-2 bindVariableLogic -- normalizeSelectionRect (anchor/focus, any corner order)', () => {
+	const norm = { startRow: 0, startCol: 1, endRow: 2, endCol: 3 }; // the B1:D3 rect every order must yield
+	test('anchor top-left, focus bottom-right', () => {
+		assert.deepStrictEqual(normalizeSelectionRect(0, 1, 2, 3), norm);
+	});
+	test('anchor bottom-right, focus top-left (reversed)', () => {
+		assert.deepStrictEqual(normalizeSelectionRect(2, 3, 0, 1), norm);
+	});
+	test('anchor top-right, focus bottom-left', () => {
+		assert.deepStrictEqual(normalizeSelectionRect(0, 3, 2, 1), norm);
+	});
+	test('anchor bottom-left, focus top-right', () => {
+		assert.deepStrictEqual(normalizeSelectionRect(2, 1, 0, 3), norm);
+	});
+	test('a collapsed selection (anchor === focus) yields a single-cell rect (start === end)', () => {
+		assert.deepStrictEqual(normalizeSelectionRect(4, 2, 4, 2), { startRow: 4, startCol: 2, endRow: 4, endCol: 2 });
+	});
+});
+
+suite('N-2 bindVariableLogic -- formatRangeTarget (normalized rect -> A1 range)', () => {
+	test('a single-cell rect (start === end) collapses to a bare cell, identical to formatCellTarget', () => {
+		assert.strictEqual(formatRangeTarget('S0', 0, 1, 0, 1), 'S0!B1');
+		assert.strictEqual(formatRangeTarget('S0', 0, 1, 0, 1), formatCellTarget('S0', 0, 1));
+		assert.strictEqual(formatRangeTarget('Sheet1', 4, 2, 4, 2), formatCellTarget('Sheet1', 4, 2));
+	});
+	test('a multi-cell rect renders top-left:bottom-right, rows 1-based', () => {
+		assert.strictEqual(formatRangeTarget('S0', 0, 1, 2, 3), 'S0!B1:D3');
+	});
+	test('a single-row strip and a single-column strip', () => {
+		assert.strictEqual(formatRangeTarget('S0', 0, 0, 0, 4), 'S0!A1:E1'); // one row, five cols
+		assert.strictEqual(formatRangeTarget('S0', 0, 0, 4, 0), 'S0!A1:A5'); // five rows, one col
+	});
+	test('a far-extent range exercises bijective column rollover', () => {
+		assert.strictEqual(formatRangeTarget('S2', 9, 26, 99, 27), 'S2!AA10:AB100');
+	});
+});
+
+suite('N-2 bindVariableLogic -- buildBindPublishRangeCellSource (range, injection-safe)', () => {
+	test('a single-cell rect is byte-identical to buildBindPublishCellSource (N-2 regression guard)', () => {
+		assert.strictEqual(
+			buildBindPublishRangeCellSource('price', 'S0', 0, 1, 0, 1),
+			buildBindPublishCellSource('price', 'S0', 0, 1),
+		);
+	});
+	test('a multi-cell range publishes to the range target with a 2D-value hint comment', () => {
+		const src = buildBindPublishRangeCellSource('m', 'S0', 0, 1, 2, 3);
+		const lines = src.split('\n');
+		assert.strictEqual(lines.length, 2, 'comment line + call line');
+		assert.ok(lines[0].startsWith('# '), 'first line is a comment');
+		assert.ok(lines[0].includes('2D value'), `comment hints a 2D value; got: ${lines[0]}`);
+		assert.ok(lines[0].includes('"S0!B1:D3"'), 'comment names the range target');
+		assert.strictEqual(lines[1], 'qb.publish("m", m, "S0!B1:D3")');
+	});
+	test('a single-cell rect keeps the plain (no 2D-hint) comment', () => {
+		const src = buildBindPublishRangeCellSource('x', 'S0', 0, 0, 0, 0);
+		assert.ok(!src.includes('2D value'), `single-cell comment has no 2D hint; got: ${src}`);
+		assert.ok(src.includes('qb.publish("x", x, "S0!A1")'), `got: ${src}`);
+	});
+	test('a hostile sheet name stays a valid Python string literal on a range target (no break-out)', () => {
+		const src = buildBindPublishRangeCellSource('x', 'My"Sheet', 0, 0, 1, 1);
+		assert.ok(src.includes('qb.publish("x", x, "My\\"Sheet!A1:B2")'), `got: ${src}`);
+		assert.strictEqual(src.split('\n').length, 2, 'no stray newline injected from the target');
 	});
 });

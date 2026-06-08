@@ -28,7 +28,7 @@ import type { SessionInstance } from '../types';
 import type { ReactiveKernelManager } from '../reactiveKernel/reactiveKernelManager';
 import { QNB_NOTEBOOK_TYPE } from './qnbSerializer';
 import { formatOpStatus, NotebookWorkbookClosedError, partialStatusFromError, ReactiveNotebookRegistry } from './reactiveNotebookRegistry';
-import { buildBindPublishCellSource, formatCellTarget, isPublishableSheetName, isValidPublishVariableName } from './bindVariableLogic';
+import { buildBindPublishRangeCellSource, formatRangeTarget, isPublishableSheetName, isValidPublishVariableName, normalizeSelectionRect } from './bindVariableLogic';
 
 const CONTROLLER_ID = 'quantlab-reactive-kernel';
 const CONTROLLER_LABEL = 'Quantbook Reactive Kernel';
@@ -305,8 +305,10 @@ export function registerReactiveNotebookController(
 	// the notebook to the selection's grid (Codex HIGH): without that, an unbound notebook would bind on
 	// first run to the then-focused grid, which may differ from the grid the target ref was built for (a
 	// same-named sheet on another workbook -> wrong write). Eager-binding also clears a tombstone, so this is
-	// the sanctioned recovery for a detached notebook (Codex MED). v1 binds the selection's single FOCUS
-	// cell; a range/DataFrame publish is a later increment.
+	// the sanctioned recovery for a detached notebook (Codex MED). The target is the selection's full
+	// rectangle (anchor+focus, normalized): a single-cell selection binds one cell (byte-identical to N-2);
+	// a multi-cell selection binds a RANGE, so a 2D value (list-of-lists / numpy / DataFrame) publishes
+	// across it (the runtime spreads + blank-fills the envelope -- no engine change here).
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookBindVariableToSelectedCell', async () => {
 			try {
@@ -341,7 +343,10 @@ export function registerReactiveNotebookController(
 					void vscode.window.showErrorMessage(`Quantbook: sheet name "${sheetName}" contains a "!", which the publish target syntax cannot express. Rename the sheet, then try again.`);
 					return;
 				}
-				const target = formatCellTarget(sheetName, sel.selection.focusRow, sel.selection.focusCol);
+				// Normalize the selection's two corners (anchor + focus, in any order) into a top-left ->
+				// bottom-right rect; formatRangeTarget / buildBindPublishRangeCellSource assume start <= end.
+				const rect = normalizeSelectionRect(sel.selection.anchorRow, sel.selection.anchorCol, sel.selection.focusRow, sel.selection.focusCol);
+				const target = formatRangeTarget(sheetName, rect.startRow, rect.startCol, rect.endRow, rect.endCol);
 				// No-Fallbacks (Codex LOW): validate + use the RAW input -- never trim-coerce (so " x" is rejected
 				// in the box, not silently accepted as "x").
 				const name = await vscode.window.showInputBox({
@@ -369,7 +374,7 @@ export function registerReactiveNotebookController(
 					return;
 				}
 				registry.bindNotebook(uri, sel.session);
-				const source = buildBindPublishCellSource(name, sheetName, sel.selection.focusRow, sel.selection.focusCol);
+				const source = buildBindPublishRangeCellSource(name, sheetName, rect.startRow, rect.startCol, rect.endRow, rect.endCol);
 				const cell = new vscode.NotebookCellData(vscode.NotebookCellKind.Code, source, 'python');
 				const edit = new vscode.WorkspaceEdit();
 				const insertAt = editor.notebook.cellCount;

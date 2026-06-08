@@ -33,14 +33,55 @@ export function columnLabelA1(col: number): string {
 	return label;
 }
 
+/** A normalized 0-based INCLUSIVE rect: `start <= end` on both axes. */
+export interface NormalizedRect {
+	readonly startRow: number;
+	readonly startCol: number;
+	readonly endRow: number;
+	readonly endCol: number;
+}
+
 /**
- * Format a sheet-qualified, 1-based A1 cell target -- e.g. `formatCellTarget("S0", 0, 1)` -> `"S0!B1"`.
- * This is the exact string shape the reactive kernel's `resolveTarget` (resolveA1OnSession) parses back
- * into a range. `row`/`col` are 0-based grid coordinates (the selection's focus cell); the row is
- * rendered 1-based.
+ * Normalize a selection's two corners -- `anchor` + `focus`, in ANY order -- into a top-left ->
+ * bottom-right rect (`start <= end` on both axes), so {@link formatRangeTarget} /
+ * {@link buildBindPublishRangeCellSource} always receive a well-ordered rect (an un-normalized rect would
+ * yield a reversed `D3:B1` target, which the kernel's `_parse_envelope` rejects). Pure + unit-tested (the
+ * command in reactiveNotebookController.ts is a thin vscode shell over this); mirrors the webview
+ * `selectionRect` (gridLayoutA1.ts), which is esbuild-isolated from the host and so cannot be imported here.
+ */
+export function normalizeSelectionRect(anchorRow: number, anchorCol: number, focusRow: number, focusCol: number): NormalizedRect {
+	return {
+		startRow: Math.min(anchorRow, focusRow),
+		startCol: Math.min(anchorCol, focusCol),
+		endRow: Math.max(anchorRow, focusRow),
+		endCol: Math.max(anchorCol, focusCol),
+	};
+}
+
+/**
+ * Format a sheet-qualified, 1-based A1 RANGE target from a NORMALIZED 0-based rect (the caller min/maxes
+ * the selection's anchor+focus first via {@link normalizeSelectionRect}) -- e.g.
+ * `formatRangeTarget("S0", 0, 1, 2, 3)` -> `"S0!B1:D3"`. A
+ * single-cell rect (start === end on both axes) collapses to a bare cell (`"S0!B1"`), byte-identical to the
+ * N-2 single-cell target. This is the exact string shape the reactive kernel's `_parse_envelope` parses
+ * back into an envelope (it splits a colon range into top-left:bottom-right). The row is rendered 1-based.
+ */
+export function formatRangeTarget(sheetName: string, startRow: number, startCol: number, endRow: number, endCol: number): string {
+	const tl = `${columnLabelA1(startCol)}${Math.floor(startRow) + 1}`;
+	if (startRow === endRow && startCol === endCol) {
+		return `${sheetName}!${tl}`;
+	}
+	const br = `${columnLabelA1(endCol)}${Math.floor(endRow) + 1}`;
+	return `${sheetName}!${tl}:${br}`;
+}
+
+/**
+ * Format a sheet-qualified, 1-based A1 single-CELL target -- e.g. `formatCellTarget("S0", 0, 1)` -> `"S0!B1"`.
+ * A thin single-cell specialization of {@link formatRangeTarget} (kept so single-cell call sites/tests read
+ * intent-first; the output is byte-identical to N-2). `row`/`col` are 0-based grid coordinates.
  */
 export function formatCellTarget(sheetName: string, row: number, col: number): string {
-	return `${sheetName}!${columnLabelA1(col)}${Math.floor(row) + 1}`;
+	return formatRangeTarget(sheetName, row, col, row, col);
 }
 
 // Python reserved words: a name equal to one of these is a syntax error as a variable, so reject it up
@@ -79,7 +120,11 @@ export function isPublishableSheetName(sheetName: string): boolean {
 /**
  * Build the Python source for the appended reactive cell: a one-line guidance comment plus the
  * `qb.publish(name, value, target)` call that, on run, writes `varName`'s current value into the target
- * cell (and re-runs update it -- the reactive binding).
+ * RANGE (and re-runs update it -- the reactive binding). The rect is NORMALIZED (start <= end; the caller
+ * min/maxes the selection's anchor+focus). A single-cell rect (start === end) yields the exact N-2
+ * single-cell comment + a bare-cell target; a multi-cell rect yields a range target (`S0!B1:D3`) and a
+ * comment that hints `varName` must be a 2D value (the runtime spreads a list-of-lists / numpy / DataFrame
+ * across the envelope, blank-filling any shortfall).
  *
  * Injection-safety: the name-string and target-string ARGUMENTS use JSON.stringify, which produces a
  * valid Python string literal for any sheet name (quotes / backslashes are escaped; JSON has no raw
@@ -88,10 +133,21 @@ export function isPublishableSheetName(sheetName: string): boolean {
  * JSON-quoted target (never a raw sheet name) and is single-line, so a hostile sheet name cannot break
  * out of the comment either.
  */
-export function buildBindPublishCellSource(varName: string, sheetName: string, row: number, col: number): string {
-	const target = formatCellTarget(sheetName, row, col);
+export function buildBindPublishRangeCellSource(varName: string, sheetName: string, startRow: number, startCol: number, endRow: number, endCol: number): string {
+	const target = formatRangeTarget(sheetName, startRow, startCol, endRow, endCol);
 	const nameLit = JSON.stringify(varName);
 	const targetLit = JSON.stringify(target);
-	const comment = `# Bound ${nameLit} to ${targetLit} -- define ${varName} above, then run to publish; re-run to update.`;
+	const isRange = startRow !== endRow || startCol !== endCol;
+	const comment = isRange
+		? `# Bound ${nameLit} to ${targetLit} -- define ${varName} (a 2D value: list-of-lists, numpy array, or DataFrame) above, then run to publish; re-run to update.`
+		: `# Bound ${nameLit} to ${targetLit} -- define ${varName} above, then run to publish; re-run to update.`;
 	return `${comment}\nqb.publish(${nameLit}, ${varName}, ${targetLit})`;
+}
+
+/**
+ * Single-CELL specialization of {@link buildBindPublishRangeCellSource} (kept so single-cell call
+ * sites/tests read intent-first; the output is byte-identical to N-2).
+ */
+export function buildBindPublishCellSource(varName: string, sheetName: string, row: number, col: number): string {
+	return buildBindPublishRangeCellSource(varName, sheetName, row, col, row, col);
 }

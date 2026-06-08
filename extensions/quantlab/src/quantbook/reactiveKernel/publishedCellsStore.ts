@@ -27,8 +27,9 @@ import type { CellRangeJson } from '../types';
 
 /**
  * One published target on a single sheet, in the host->webview wire shape. Coordinates are 0-based and
- * INCLUSIVE (mirroring CellRangeJson); v1 publishes are single cells (start === end). `name` is the
- * driving variable, carried for a future hover/name surface (v1 paints a marker only).
+ * INCLUSIVE (mirroring CellRangeJson); a publish may target a single cell OR a range (range-aware bind).
+ * `name` is the driving variable -- the badge marks the cells, and the formula-bar chip + hover tooltip
+ * surface the name (W-G bound-cell name display).
  */
 export interface PublishedRange {
 	startRow: number;

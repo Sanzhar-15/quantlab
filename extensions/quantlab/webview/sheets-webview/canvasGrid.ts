@@ -608,7 +608,8 @@ export class CanvasGridRenderer {
 		// (the Excel note-marker convention). Painted AFTER the value + selection visuals (so it is never
 		// hidden) but BEFORE the sticky bands (item 5), which correctly cover a cell scrolled under them.
 		// Iterate each published range intersected with the visible window -- O(published cells in view),
-		// independent of the snapshot size; v1 publishes are single cells.
+		// independent of the snapshot size; published ranges are small (and the kernel's G2 guard keeps
+		// them non-overlapping).
 		if (publishedRanges.length > 0) {
 			ctx.fillStyle = this.palette.publishedBadge;
 			for (const pr of publishedRanges) {
