@@ -263,6 +263,21 @@ export function registerReactiveKernelCommands(
 				void vscode.window.showWarningMessage(`Quantbook reactive cell error: ${m}`);
 			}
 		}),
+		// Programmatic (non-interactive) twin of "Reactive Cell": takes the code as an ARGUMENT,
+		// RETURNS the ReactiveOpResult, and RETHROWS failures (no swallowing). This is the headless
+		// automation seam (the W-T acid#1 integration test drives it via executeCommand(id, code)) --
+		// the interactive command above keeps the showInputBox + toast UX for humans. No-Fallbacks:
+		// a missing target or empty code is a programmer error and throws loudly, never silent.
+		vscode.commands.registerCommand('quantlab.quantbookExecuteReactiveCode', async (codeArg?: string) => {
+			const target = resolveReactiveTarget();
+			if (target === undefined) {
+				throw new Error('[no_cell_grid] no Cell Grid panel to target; open one before executing reactive code');
+			}
+			if (typeof codeArg !== 'string' || codeArg.trim() === '') {
+				throw new Error('[empty_code] quantbookExecuteReactiveCode requires a non-empty code string argument');
+			}
+			return manager.executeCell(target.session, codeArg);
+		}),
 		vscode.commands.registerCommand('quantlab.quantbookReactiveStop', async () => {
 			const target = resolveReactiveTarget();
 			if (target === undefined) {
