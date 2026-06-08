@@ -2330,7 +2330,7 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 // Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
 // ============================================================================
 
-import { acquireWorkbookSnapshotViaDelta, buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyCellInput, classifyPollTick, classifySwitchSheetTarget, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, mergeWorkbookDelta, parseCellRawInput, resolveCommandTargetPanel, validatePresenceNumeric, type DeltaSnapshotCache, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyCellInput, classifyPollTick, classifySwitchSheetTarget, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, mergeWorkbookDelta, parseCellRawInput, resolveCommandTargetPanel, validatePresenceNumeric, type DeltaSnapshotCache, type ErrorReplyMessage, type GridSelection } from '../src/quantbook/cellGrid/cellGridLogic';
 
 suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
 	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
@@ -2645,6 +2645,86 @@ suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', f
 		assert.strictEqual(opErrors.length, 1, 'it goes to onOperationError (a plain warning toast)');
 		assert.match(opErrors[0], /\[undo\]/, 'prefixed with the failed action');
 		assert.match(opErrors[0], /invalid_state/, 'carries the structured error code');
+	});
+
+	// ---- FE-1.5 W-G-2b (selection report -> host) ----
+	// The selection arm is INFORMATIONAL: it stores the validated selection (onSelectionChange) and
+	// NEVER commits or emits an errorReply. Invalid/mismatched envelopes are dropped silently.
+	function makeDepsSel(session: SessionInstance, sheet: number) {
+		const errorReplies: ErrorReplyMessage[] = [];
+		const selections: GridSelection[] = [];
+		let commitCount = 0;
+		const deps = {
+			session,
+			sheet,
+			onCommit: () => { commitCount += 1; },
+			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
+			onSelectionChange: (sel: GridSelection) => { selections.push(sel); },
+		};
+		return { deps, errorReplies, selections, getCommitCount: () => commitCount };
+	}
+
+	test('W-G-2b: a valid single-cell selection (anchor==focus) is stored, no commit, no errorReply', () => {
+		const { deps, errorReplies, selections, getCommitCount } = makeDepsSel(freshSession(), 0);
+		dispatchIncomingMessage(
+			{ type: 'selection', sheet: 0, anchorRow: 3, anchorCol: 5, focusRow: 3, focusCol: 5 },
+			deps,
+		);
+		assert.deepStrictEqual(selections, [{ sheet: 0, anchorRow: 3, anchorCol: 5, focusRow: 3, focusCol: 5 }]);
+		assert.strictEqual(getCommitCount(), 0, 'a selection never commits');
+		assert.strictEqual(errorReplies.length, 0, 'a selection never errors');
+	});
+
+	test('W-G-2b: a valid multi-cell range (anchor!=focus) is stored with the exact coords', () => {
+		const { deps, selections } = makeDepsSel(freshSession(), 0);
+		dispatchIncomingMessage(
+			{ type: 'selection', sheet: 0, anchorRow: 1, anchorCol: 2, focusRow: 4, focusCol: 6 },
+			deps,
+		);
+		assert.deepStrictEqual(selections, [{ sheet: 0, anchorRow: 1, anchorCol: 2, focusRow: 4, focusCol: 6 }]);
+	});
+
+	test('W-G-2b: a sheet-mismatched selection is DROPPED (no store, no errorReply)', () => {
+		const { deps, errorReplies, selections } = makeDepsSel(freshSession(), 0);
+		dispatchIncomingMessage(
+			{ type: 'selection', sheet: 1, anchorRow: 0, anchorCol: 0, focusRow: 0, focusCol: 0 },
+			deps,
+		);
+		assert.deepStrictEqual(selections, [], 'a selection for another sheet is not stored');
+		assert.strictEqual(errorReplies.length, 0, 'a selection mismatch is dropped, NOT an errorReply (informational)');
+	});
+
+	test('W-G-2b: an out-of-extent coord is dropped', () => {
+		const { deps, selections } = makeDepsSel(freshSession(), 0);
+		dispatchIncomingMessage(
+			{ type: 'selection', sheet: 0, anchorRow: 0, anchorCol: 0, focusRow: 1_048_576, focusCol: 0 },
+			deps,
+		);
+		dispatchIncomingMessage(
+			{ type: 'selection', sheet: 0, anchorRow: 0, anchorCol: 16_384, focusRow: 0, focusCol: 0 },
+			deps,
+		);
+		assert.deepStrictEqual(selections, [], 'a coord at/over the A1 extent is rejected');
+	});
+
+	test('W-G-2b: non-integer / negative / non-finite coords are dropped', () => {
+		const { deps, selections } = makeDepsSel(freshSession(), 0);
+		dispatchIncomingMessage({ type: 'selection', sheet: 0, anchorRow: 1.5, anchorCol: 0, focusRow: 0, focusCol: 0 }, deps);
+		dispatchIncomingMessage({ type: 'selection', sheet: 0, anchorRow: -1, anchorCol: 0, focusRow: 0, focusCol: 0 }, deps);
+		dispatchIncomingMessage({ type: 'selection', sheet: 0, anchorRow: 0, anchorCol: 0, focusRow: Number.NaN, focusCol: 0 }, deps);
+		dispatchIncomingMessage({ type: 'selection', sheet: 0, anchorRow: 0, anchorCol: 0, focusRow: 0, focusCol: '2' as unknown as number }, deps);
+		assert.deepStrictEqual(selections, [], 'every malformed coord is dropped');
+	});
+
+	test('W-G-2b: onSelectionChange omitted -> a valid selection is a safe no-op (optional arm)', () => {
+		const session = freshSession();
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'selection', sheet: 0, anchorRow: 2, anchorCol: 2, focusRow: 2, focusCol: 2 },
+			deps,
+		);
+		assert.strictEqual(getCommitCount(), 0);
+		assert.strictEqual(errorReplies.length, 0, 'no callback wired -> nothing happens, no error');
 	});
 });
 

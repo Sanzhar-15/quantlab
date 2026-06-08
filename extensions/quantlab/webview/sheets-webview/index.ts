@@ -196,6 +196,12 @@ let active: ActiveCell | null = { row: 0, col: 0 };
 // (today's behavior, unchanged). The range is `selectionRect(anchor, active)`. Edits/Delete/plain-click
 // collapse it back to a single cell (range-aware editing is a later increment).
 let anchor: ActiveCell | null = null;
+// **W-G-2b**: the last selection envelope posted to the host (a `sheet:anchor:focus` key), or `null`
+// before the first post. `postSelectionIfChanged` dedupes against this so content-only redraws (an
+// `errorReply` realign onto the same cell, a render push that did not move the selection) don't spam
+// the host. `null` initial value is read only inside `postSelectionIfChanged`, which is called from
+// `redraw()` (well after module load), so there is no pre-init hazard (the W-G-1b lesson).
+let lastPostedSelectionKey: string | null = null;
 
 interface EditState {
 	// **W-G-1b**: the live editor input + which surface it is. Editing runs in EITHER the in-cell overlay
@@ -338,6 +344,36 @@ function redraw(): void {
 	renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection());
 	prevPaint = scrollStateNow(v);
 	updateFormulaBar(); // selection/content changed -> reflect the active cell in the formula bar
+	postSelectionIfChanged(); // W-G-2b: report the selection to the host (deduped)
+}
+
+/**
+ * **W-G-2b** -- report the current selection to the host as a `{type:'selection',...}` envelope so the
+ * host can track the focused grid's selection (the hook the "bind variable to selected cell" flow
+ * consumes). `redraw()` is the single funnel for every focus/anchor change, so calling this there
+ * catches them all; the dedupe (against {@link lastPostedSelectionKey}) makes content-only redraws
+ * (e.g. an `errorReply` realign onto the same cell) no-ops. The anchor coords collapse to the focus
+ * when there is no range, so the host always receives a well-formed rect. No-op until the first
+ * snapshot + an active cell exist.
+ */
+function postSelectionIfChanged(): void {
+	if (fullSnapshot === null || active === null) {
+		return;
+	}
+	const anc = anchor ?? active;
+	const key = `${fullSnapshot.sheet}:${anc.row},${anc.col}:${active.row},${active.col}`;
+	if (key === lastPostedSelectionKey) {
+		return;
+	}
+	lastPostedSelectionKey = key;
+	vscode.postMessage({
+		type: 'selection',
+		sheet: fullSnapshot.sheet,
+		anchorRow: anc.row,
+		anchorCol: anc.col,
+		focusRow: active.row,
+		focusCol: active.col,
+	});
 }
 
 /**

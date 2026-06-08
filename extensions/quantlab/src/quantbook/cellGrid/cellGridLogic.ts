@@ -133,6 +133,41 @@ export interface CommitResultMessage {
 }
 
 /**
+ * **FE-1.5 W-G-2b (selection, 2026-06-08)** -- incoming (webview -> extension host) report of the
+ * grid's current selection: the rectangular range spanning `anchor`..`focus` (single-cell when the
+ * two endpoints coincide). Posted by the webview on every selection change (deduped). Purely
+ * INFORMATIONAL -- it never touches the engine, carries no `commitId`, and has no editor to un-stick;
+ * an invalid/mismatched envelope is DROPPED with a warning (like the dormant `presenceUpdate`), NOT
+ * answered with an {@link ErrorReplyMessage}. The host stores the latest valid one per panel
+ * ({@link DispatchDeps.onSelectionChange}) so the focused grid's selection is queryable
+ * (`CellGridPanel.focusedGridSelection()`) -- the hook the reactive-notebook "bind variable to
+ * selected cell" flow consumes.
+ */
+export interface SelectionMessage {
+	type: 'selection';
+	sheet: number;
+	anchorRow: number;
+	anchorCol: number;
+	focusRow: number;
+	focusCol: number;
+}
+
+/**
+ * **FE-1.5 W-G-2b** -- the VALIDATED selection payload handed to the host via
+ * {@link DispatchDeps.onSelectionChange}. Same shape as {@link SelectionMessage} minus the `type`
+ * wire tag: a clean domain type for the host + downstream consumers (vs the raw envelope). The
+ * dispatcher guarantees `sheet === deps.sheet` and all four coords are integers in the A1 extent
+ * before constructing this, so consumers can rely on those invariants.
+ */
+export interface GridSelection {
+	sheet: number;
+	anchorRow: number;
+	anchorCol: number;
+	focusRow: number;
+	focusCol: number;
+}
+
+/**
  * Parse + validate the raw user-typed string into a finite number.
  *
  * V3.2.b ONLY supports numeric cells -- the V1 napi `appendPutValue`
@@ -304,6 +339,15 @@ export interface DispatchDeps {
 	 * (tests that don't wire it don't exercise the undo/redo-throw path).
 	 */
 	readonly onOperationError?: (message: string) => void;
+	/**
+	 * **FE-1.5 W-G-2b (2026-06-08)** -- the webview reported a new grid selection
+	 * ({@link SelectionMessage}). Fired ONLY after the dispatcher validates the envelope (sheet match +
+	 * all four coords integer + in the A1 extent); the panel stores it for
+	 * {@link CellGridPanel.focusedGridSelection}. Purely informational -- no engine call, no render.
+	 * Optional for backward compat (tests + the pre-W-G-2b webview that never posts `selection`); when
+	 * omitted the `selection` arm is a safe no-op.
+	 */
+	readonly onSelectionChange?: (selection: GridSelection) => void;
 }
 
 /**
@@ -404,6 +448,34 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 	// presence logic (validatePresenceNumeric, classifyPollTick, onLocalTyping/
 	// onTypingStroke) is preserved exported/dormant for the v1.5 collab re-enable.
 	if (msg.type === 'presenceUpdate' || msg.type === 'typing_stroke') {
+		return;
+	}
+	// **FE-1.5 W-G-2b (2026-06-08)**: the webview's selection report. INFORMATIONAL -- it never
+	// touches the engine and has no editor to un-stick, so an invalid/mismatched envelope is DROPPED
+	// with a warning (like presenceUpdate), NOT answered with an errorReply. Validate strictly (sheet
+	// match + all four coords finite integers in the A1 extent) and store the clean payload via
+	// onSelectionChange; the panel then exposes it for the "bind variable to selected cell" flow.
+	if (msg.type === 'selection') {
+		const sel = raw as SelectionMessage;
+		const coordOk = (v: unknown, max: number): boolean =>
+			typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < max;
+		if (
+			sel.sheet !== deps.sheet ||
+			!coordOk(sel.anchorRow, A1_MAX_ROWS) ||
+			!coordOk(sel.focusRow, A1_MAX_ROWS) ||
+			!coordOk(sel.anchorCol, A1_MAX_COLS) ||
+			!coordOk(sel.focusCol, A1_MAX_COLS)
+		) {
+			console.warn('[cellGrid] dropped invalid selection message:', sel);
+			return;
+		}
+		deps.onSelectionChange?.({
+			sheet: sel.sheet,
+			anchorRow: sel.anchorRow,
+			anchorCol: sel.anchorCol,
+			focusRow: sel.focusRow,
+			focusCol: sel.focusCol,
+		});
 		return;
 	}
 	if (msg.type !== 'putValue') {

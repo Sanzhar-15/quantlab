@@ -43,7 +43,7 @@
 import * as vscode from 'vscode';
 
 import type { QuantbookCellSnapshot, SessionInstance, WorkbookSnapshotJson } from '../types';
-import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, type CommitResultMessage } from './cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, type CommitResultMessage, type GridSelection } from './cellGridLogic';
 import { getNonce, getWebviewUri } from '../../utils/webview';
 
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
@@ -337,6 +337,20 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **FE-1.5 W-G-2b (2026-06-08)** -- the last-focused panel's reported grid SELECTION
+	 * (`session`, `sheet`, and the {@link GridSelection} range), or `undefined` if no panel is focused,
+	 * the focused panel is disposed, OR it has not reported a selection yet (no interaction since open).
+	 * Mirrors {@link focusedLocalPanel} -- the parallel hook the reactive-notebook "bind variable to
+	 * selected cell" flow will consume. The dispatcher guarantees `selection.sheet === sheet`.
+	 */
+	static focusedGridSelection(): { session: SessionInstance; sheet: number; selection: GridSelection } | undefined {
+		if (focusedPanel === undefined || focusedPanel._disposed || focusedPanel.latestSelection === undefined) {
+			return undefined;
+		}
+		return { session: focusedPanel.session, sheet: focusedPanel.sheet, selection: focusedPanel.latestSelection };
+	}
+
+	/**
 	 * Tracks whether `panel.dispose()` has fired. `webview.postMessage` to a
 	 * disposed panel is silently dropped; the errorReply path checks this flag and
 	 * falls back to `showWarningMessage` so a late validation error stays visible.
@@ -350,6 +364,14 @@ export class CellGridPanel {
 	 * is live (render() may run before the bundle has loaded).
 	 */
 	private latestSnapshot: QuantbookCellSnapshot | undefined;
+
+	/**
+	 * **FE-1.5 W-G-2b (2026-06-08)** -- the latest grid selection the webview reported, or `undefined`
+	 * until the first `selection` message. Stored (last-wins) by the {@link DispatchDeps.onSelectionChange}
+	 * arm; surfaced via the static {@link CellGridPanel.focusedGridSelection}. The dispatcher validated
+	 * `selection.sheet === this.sheet` + integer/in-extent coords before this is set.
+	 */
+	private latestSelection: GridSelection | undefined;
 
 	/**
 	 * True once the bundled webview has posted `{type:'webviewReady'}`. Before
@@ -601,6 +623,13 @@ export class CellGridPanel {
 		// outbound type.
 		if (typeof raw === 'object' && raw !== null && (raw as { type?: unknown }).type === 'webviewReady') {
 			this.webviewReady = true;
+			// **FE-1.5 W-G-2b (Codex MED)**: a reload re-inits the webview's selection to A1 and re-posts it
+			// on the first redraw -- but until that arrives, a STALE pre-reload `latestSelection` would let
+			// `focusedGridSelection()` return the wrong cell (binding the wrong cell for the N-2 flow). Clear
+			// it on every `webviewReady` so the gap returns `undefined` (no selection yet) rather than a stale
+			// one. No-op on the initial load (already undefined). The webview's `lastPostedSelectionKey` resets
+			// on reload too, so the fresh A1 post is never deduped away.
+			this.latestSelection = undefined;
 			this.clearReadyWatchdog();
 			this.postRenderIfReady();
 			return;
@@ -647,6 +676,12 @@ export class CellGridPanel {
 					return;
 				}
 				void vscode.window.showWarningMessage(`Quantbook cell grid: ${message}`);
+			},
+			// **FE-1.5 W-G-2b**: store the validated selection (last-wins). Pure store -- no engine call,
+			// no render; the dispatcher already guaranteed `sel.sheet === this.sheet`. Surfaced via the
+			// static `focusedGridSelection()` for the "bind variable to selected cell" flow.
+			onSelectionChange: sel => {
+				this.latestSelection = sel;
 			},
 			onError: reply => {
 				// If the panel is disposed, `webview.postMessage` is silently dropped
