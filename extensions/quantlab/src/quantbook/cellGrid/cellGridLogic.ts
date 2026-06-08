@@ -102,18 +102,22 @@ export interface PutValueRequest {
 }
 
 /**
- * **FE-1.5 W-G copy/paste + fill (2026-06-08)** -- a MULTI-cell write (webview -> host). Paste and fill
- * are fire-and-forget (no open editor to un-stick, so unlike {@link PutValueRequest} there is no
- * `commitId` / pending-commit dance): the host writes every cell atomically via `Session.batch` (one
- * undo unit), recalcs, and re-renders. `undoLabel` names the undo step ("Paste" / "Fill"); each cell's
- * `rawInput` is classified exactly like a single `putValue` (`=`-prefix -> formula, else literal, empty
- * -> clear). The batch is ALL-OR-NOTHING: any invalid cell rejects the whole op loudly (No-Fallbacks).
+ * **FE-1.5 W-G copy/paste + fill (2026-06-08)** -- a MULTI-cell write (webview -> host). No open editor
+ * backs it, so unlike {@link PutValueRequest} there is no pending-commit dance: the host writes every cell
+ * atomically via `Session.batch` (one undo unit), recalcs, and re-renders. `undoLabel` names the undo step
+ * ("Paste" / "Fill"); each cell's `rawInput` is classified exactly like a single `putValue` (`=`-prefix ->
+ * formula, else literal, empty -> clear). The batch is ALL-OR-NOTHING: any invalid cell rejects the whole
+ * op loudly (No-Fallbacks). `commitId` (deep-audit MED) is an OPTIONAL success-ack token: on success the
+ * dispatcher echoes it via `onAck` -> `commitResult`, letting the originating webview clear the written
+ * cells' error tints even when the write did NOT change stored content (a content-changed render wouldn't).
+ * A FAILED putCells gets no ack, so a stale tint correctly stays (No-Fallbacks). Optional for back-compat.
  */
 export interface PutCellsRequest {
 	type: 'putCells';
 	sheet: number;
 	cells: { row: number; col: number; rawInput: string }[];
 	undoLabel?: string;
+	commitId?: number;
 }
 
 /**
@@ -546,11 +550,12 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		return;
 	}
 	// **FE-1.5 W-G copy/paste + fill (2026-06-08)**: a multi-cell atomic write (paste / fill). No open
-	// editor backs it, so there is no commitId/pending-commit to resolve -- the host writes every cell in
-	// ONE `Session.batch` (a single undo unit), recalcs, and re-renders via onCommit. A failure (bad
-	// envelope, an off-extent / over-length cell, or an engine batch reject) is surfaced via
-	// onOperationError (a toast -- there is no cell editor to un-stick), never silently dropped
-	// (No-Fallbacks). The batch is all-or-nothing, so a single bad cell applies NOTHING.
+	// editor backs it, so there is no pending-commit to resolve -- the host writes every cell in ONE
+	// `Session.batch` (a single undo unit), recalcs, and re-renders via onCommit. An OPTIONAL `commitId`
+	// only drives the success tint-ack below (deep-audit MED). A failure (bad envelope, an off-extent /
+	// over-length cell, or an engine batch reject) is surfaced via onOperationError (a toast -- there is no
+	// cell editor to un-stick), never silently dropped (No-Fallbacks). The batch is all-or-nothing, so a
+	// single bad cell applies NOTHING.
 	if (msg.type === 'putCells') {
 		const req = raw as PutCellsRequest;
 		const label = typeof req.undoLabel === 'string' && req.undoLabel.length > 0 ? req.undoLabel : 'Edit cells';
@@ -574,6 +579,12 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			deps.session.batch(ops, { undoLabel: label });
 			recalcDirtyChecked(deps.session);
 			deps.onCommit();
+			// deep-audit MED: ack the originating webview (when it stamped a token) so it can clear the written
+			// cells' error tints -- a putCells whose write does not change stored content produces an identical
+			// render, which the webview's content-changed tint-clear would miss. Mirrors putValue's onAck.
+			if (typeof req.commitId === 'number') {
+				deps.onAck?.(req.commitId);
+			}
 		} catch (err) {
 			const info = parseQuantbookError(err);
 			deps.onOperationError?.(`[${label}] [${info.code}] ${info.message}`);

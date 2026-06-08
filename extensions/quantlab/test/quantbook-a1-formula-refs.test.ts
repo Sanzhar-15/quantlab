@@ -101,6 +101,23 @@ suite('FE-1.5 a1FormulaRefs -- translateFormulaRefs', () => {
 		assert.strictEqual(translateFormulaRefs('=S1!B2*2', 1, 0), '=S1!B3*2');
 	});
 
+	test('deep-audit HIGH: an UNQUOTED DOTTED sheet name (Q1.2024!, A1.2024!) is NOT offset', () => {
+		// The engine emits `[A-Za-z0-9_.]` names UNQUOTED (printer.rs print_sheet_name), and quant sheets are
+		// commonly named with a ref-shaped first segment (`Q1.2024`, `H1.2025`, `Q2.2024`). The `!` guard must
+		// look PAST the inner dot, else `=Q1.2024!A1` would offset to `=R2.2024!B2` -- a wrong/nonexistent sheet.
+		assert.strictEqual(translateFormulaRefs('=Q1.2024!A1', 1, 1), '=Q1.2024!B2');
+		assert.strictEqual(translateFormulaRefs('=A1.2024!A1', 1, 1), '=A1.2024!B2');
+		assert.strictEqual(translateFormulaRefs('=Q1.2024!A1', 1, 0), '=Q1.2024!A2', 'fill-down keeps the sheet');
+		assert.strictEqual(
+			translateFormulaRefs('=H1.2025!C3+Q2.2024!D4', 1, 1),
+			'=H1.2025!D4+Q2.2024!E5',
+		);
+		// A range under a dotted sheet prefix: only the coordinates move.
+		assert.strictEqual(translateFormulaRefs('=SUM(Q1.2024!A1:B2)', 1, 0), '=SUM(Q1.2024!A2:B3)');
+		// A non-ref-shaped dotted sheet (`Data.2024`) was already safe -- guard it against regressions.
+		assert.strictEqual(translateFormulaRefs('=Data.2024!B5', 2, 0), '=Data.2024!B7');
+	});
+
 	test('megaudit: bottom-edge overflow (past MAX_ROWS) is #REF!', () => {
 		assert.strictEqual(translateFormulaRefs('=A1048576', 1, 0), '=#REF!');
 		// An absolute row at the max never overflows under an offset.

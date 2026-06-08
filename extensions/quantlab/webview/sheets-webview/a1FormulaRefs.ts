@@ -130,6 +130,28 @@ function offsetRef(m: RefMatch, dRow: number, dCol: number): string {
 }
 
 /**
+ * If an UNQUOTED sheet-name qualifier starts at `i` -- a run of sheet-name-legal chars `[A-Za-z0-9_.]`
+ * terminated by `!` -- return the index of that `!` (the exclusive end of the name); else -1. Mirrors the
+ * engine's CANONICAL PRINTER output (ql-formula-syntax printer.rs `print_sheet_name`: a name of only
+ * `[A-Za-z0-9_.]` that does not start with a digit is emitted WITHOUT quotes), so `S1!A1`, `Q1.2024!A1`,
+ * and `Data.2024!B5` all reach the grid unquoted and must be preserved verbatim. The canonical printed form
+ * is the only shape a stored formula round-trips to -- hence the only shape the formula bar / clipboard ever
+ * carries -- so matching the printer (not the looser lexer, which also accepts whitespace-padded `S1 ! A1`
+ * the printer never emits; deep-audit LOW) is exactly right here. The caller invokes this only at a letter
+ * (the not-digit-initial rule holds) and never at a `$` (which forces a cell ref).
+ */
+function unquotedSheetNameEnd(s: string, i: number): number {
+	let j = i;
+	while (j < s.length && (isAlnum(s[j]) || s[j] === '_' || s[j] === '.')) {
+		j += 1;
+	}
+	if (j > i && s[j] === '!') {
+		return j;
+	}
+	return -1;
+}
+
+/**
  * Translate the RELATIVE A1 references in `formula` by `(dRow, dCol)` (in 0-based cell units: the target
  * cell minus the source cell), leaving `$`-absolute components fixed. `formula` is the raw formula body
  * (with or without a leading `=`; the `=` -- like any non-ref char -- is copied verbatim). A no-op offset
@@ -203,15 +225,26 @@ export function translateFormulaRefs(formula: string, dRow: number, dCol: number
 		}
 		// 3. A letter or `$` may begin a cell reference.
 		if (isLetter(ch) || ch === '$') {
+			// 3a. An UNQUOTED sheet-name qualifier -- a `[A-Za-z0-9_.]` run ending in `!` -- is copied
+			// verbatim, never offset. A real cell ref is NEVER followed by `!`, so a ref-shaped run before a
+			// `!` is a SHEET name (`S1!A1`; the product seeds S0/S1/S2). This must look PAST inner dots/digits:
+			// the engine emits a dotted name like `Q1.2024` UNQUOTED (printer.rs print_sheet_name), and
+			// `Q1`/`H1` are themselves ref-shaped, so offsetting `=Q1.2024!A1` would silently retarget it to
+			// `=R2.2024!B2` -- a wrong/nonexistent sheet (HIGH). A `$`-led token can never be a sheet name.
+			if (ch !== '$') {
+				const sheetEnd = unquotedSheetNameEnd(formula, i);
+				if (sheetEnd >= 0) {
+					out += formula.slice(i, sheetEnd);
+					i = sheetEnd;
+					continue;
+				}
+			}
 			const m = matchRefAt(formula, i);
 			if (m !== null) {
 				const after = formula[m.end];
-				// Not a clean cell ref if the token is glued to a trailing identifier char, is a function
-				// call `(`, OR is followed by `!` -- a real cell ref is NEVER followed by `!`, so a
-				// ref-shaped token before `!` is a SHEET name (e.g. `S1` in `S1!A1`; the product seeds
-				// sheets S0/S1/S2, so this is common). Offsetting it would corrupt the sheet reference
-				// (megaudit HIGH). The coordinate AFTER the `!` is still offset (it is a separate token).
-				const gluedAfter = isAlnum(after) || after === '_' || after === '(' || after === '!';
+				// Not a clean cell ref if the token is glued to a trailing identifier char or is a function
+				// call `(`. (The sheet-name `!` case is handled by 3a above.)
+				const gluedAfter = isAlnum(after) || after === '_' || after === '(';
 				if (!gluedAfter) {
 					out += offsetRef(m, dRow, dCol);
 					i = m.end;

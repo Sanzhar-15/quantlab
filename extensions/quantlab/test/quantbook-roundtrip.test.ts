@@ -2859,6 +2859,44 @@ suite('FE-1.5 W-G -- dispatchIncomingMessage putCells (atomic multi-cell write)'
 		assert.strictEqual(opErrors.length, 1);
 		assert.ok(opErrors[0].includes('does not match'), opErrors[0]);
 	});
+
+	test('deep-audit MED: a tokened putCells success ACKs the commitId (onAck) so the webview clears tints', () => {
+		const session = freshSession();
+		const acks: number[] = [];
+		const { deps } = makeDeps(session, 0);
+		const depsWithAck = { ...deps, onAck: (id: number) => { acks.push(id); } };
+		dispatchIncomingMessage({
+			type: 'putCells', sheet: 0, undoLabel: 'Paste', commitId: 42,
+			cells: [{ row: 0, col: 0, rawInput: '1' }],
+		}, depsWithAck);
+		assert.deepStrictEqual(acks, [42], 'success echoes the token so the webview can clear the written cells\' tints');
+	});
+
+	test('deep-audit MED: a FAILED putCells does NOT ack (the stale tint must stay -- No-Fallbacks)', () => {
+		const session = freshSession();
+		const acks: number[] = [];
+		const { deps, opErrors } = makeDeps(session, 0);
+		const depsWithAck = { ...deps, onAck: (id: number) => { acks.push(id); } };
+		dispatchIncomingMessage({
+			type: 'putCells', sheet: 0, undoLabel: 'Paste', commitId: 7,
+			cells: [{ row: 1_048_576, col: 0, rawInput: '2' }], // off-extent -> whole batch rejected
+		}, depsWithAck);
+		assert.strictEqual(opErrors.length, 1, 'failure surfaced as a toast');
+		assert.deepStrictEqual(acks, [], 'no ack on failure -> the webview keeps the tint (the write did not land)');
+	});
+
+	test('a putCells WITHOUT a commitId still applies (back-compat: the tint-ack is optional)', () => {
+		const session = freshSession();
+		const acks: number[] = [];
+		const { deps, getCommitCount } = makeDeps(session, 0);
+		const depsWithAck = { ...deps, onAck: (id: number) => { acks.push(id); } };
+		dispatchIncomingMessage({
+			type: 'putCells', sheet: 0, undoLabel: 'Paste',
+			cells: [{ row: 0, col: 0, rawInput: '9' }],
+		}, depsWithAck);
+		assert.strictEqual(getCommitCount(), 1, 'committed');
+		assert.deepStrictEqual(acks, [], 'no token -> no ack (and no error)');
+	});
 });
 
 suite('FE megaudit S5 -- classifyCellInput (pure)', function () {
