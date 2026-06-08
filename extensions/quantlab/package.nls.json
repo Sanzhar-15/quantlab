@@ -34,6 +34,8 @@
 	"command.quantbookReactiveStart.title": "Quantbook: Start Reactive Kernel",
 	"command.quantbookReactiveExecuteCell.title": "Quantbook: Reactive Cell",
 	"command.quantbookReactiveStop.title": "Quantbook: Stop Reactive Kernel",
+	"command.quantbookOpenReactiveNotebook.title": "Quantbook: Open Reactive Notebook",
+	"command.quantbookBindReactiveNotebook.title": "Quantbook: Bind Reactive Notebook to Focused Grid",
 	"command.quantbookCellGridCollab.title": "Quantbook: Open Cell Grid (Collab)",
 	"command.quantbookCellGridSwitchSheet.title": "Quantbook: Switch Cell Grid Sheet",
 	"command.quantbookSaveAs.title": "Quantbook: Save As...",

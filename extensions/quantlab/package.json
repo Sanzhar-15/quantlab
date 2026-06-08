@@ -269,6 +269,16 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.quantbookOpenReactiveNotebook",
+        "title": "%command.quantbookOpenReactiveNotebook.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookBindReactiveNotebook",
+        "title": "%command.quantbookBindReactiveNotebook.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.openRiskSettings",
         "title": "%command.openRiskSettings.title%",
         "category": "%command.category%"

@@ -121,6 +121,46 @@ suite('ReactiveNotebookRegistry binding + lifetime', () => {
 		assert.strictEqual(reg.resolveForExecute('nb1', () => fresh), fresh);
 	});
 
+	test('N-2 bindNotebook: explicit bind sets the session for later executes', () => {
+		const reg = new ReactiveNotebookRegistry<object>();
+		const s = { id: 'S' };
+		reg.bindNotebook('nb1', s);
+		assert.strictEqual(reg.boundSession('nb1'), s);
+		// resolveForExecute reuses the explicit binding without calling resolveFresh
+		let freshCalls = 0;
+		assert.strictEqual(reg.resolveForExecute('nb1', () => {
+			freshCalls++;
+			return { id: 'other' };
+		}), s);
+		assert.strictEqual(freshCalls, 0, 'an explicitly bound notebook does not re-resolve');
+	});
+
+	test('N-2 bindNotebook: clears a persistent tombstone (recovery without close+reopen)', () => {
+		const reg = new ReactiveNotebookRegistry<object>();
+		const closed = { id: 'closed' };
+		reg.resolveForExecute('nb1', () => closed);
+		reg.invalidateSession(closed); // the grid closed -> nb1 tombstoned
+		assert.throws(() => reg.resolveForExecute('nb1', () => closed), NotebookWorkbookClosedError);
+
+		// An explicit operator bind to a fresh grid recovers the notebook WITHOUT closing+reopening it.
+		const reopened = { id: 'reopened' };
+		reg.bindNotebook('nb1', reopened);
+		assert.strictEqual(reg.boundSession('nb1'), reopened, 'the tombstone is cleared and nb1 rebinds');
+		assert.strictEqual(reg.resolveForExecute('nb1', () => closed), reopened, 'execute now targets the new grid');
+		assert.strictEqual(reg.isLiveBinding('nb1', reopened), true);
+	});
+
+	test('N-2 bindNotebook: overrides an existing live binding', () => {
+		const reg = new ReactiveNotebookRegistry<object>();
+		const a = { id: 'A' };
+		const b = { id: 'B' };
+		reg.bindNotebook('nb1', a);
+		reg.bindNotebook('nb1', b);
+		assert.strictEqual(reg.boundSession('nb1'), b);
+		assert.strictEqual(reg.isLiveBinding('nb1', a), false);
+		assert.strictEqual(reg.isLiveBinding('nb1', b), true);
+	});
+
 	test('isLiveBinding reflects the current binding (closes the resolve->close race)', () => {
 		const reg = new ReactiveNotebookRegistry<object>();
 		const s = { id: 'S' };

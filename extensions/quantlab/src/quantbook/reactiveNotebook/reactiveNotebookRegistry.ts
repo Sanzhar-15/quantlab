@@ -45,7 +45,8 @@ export class NotebookWorkbookClosedError extends Error {
 	constructor() {
 		super(
 			'[notebook_workbook_closed] the workbook this notebook was bound to has closed; '
-			+ 'close and reopen this notebook to rebind it to a grid',
+			+ 'run "Quantbook: Bind Reactive Notebook to Focused Grid" to rebind it to an open grid '
+			+ '(or close and reopen this notebook)',
 		);
 		this.name = 'NotebookWorkbookClosedError';
 	}
@@ -84,6 +85,18 @@ export class ReactiveNotebookRegistry<S = object> {
 		const fresh = resolveFresh();
 		this.bindings.set(uri, fresh);
 		return fresh;
+	}
+
+	/**
+	 * Explicitly bind a notebook to a Session (N-2: "Open Reactive Notebook" eager-binds the new notebook
+	 * to the focused grid; "Bind to Focused Grid" rebinds an existing one). Unlike bind-on-first-execute
+	 * this is operator-driven, so it CLEARS any persistent tombstone -- the only recovery from a closed
+	 * workbook other than closing+reopening the notebook (Codex HIGH-1 keeps the tombstone for the implicit
+	 * path; an explicit operator bind is the sanctioned override). Overrides any current binding.
+	 */
+	bindNotebook(uri: string, session: S): void {
+		this.detached.delete(uri);
+		this.bindings.set(uri, session);
 	}
 
 	/** Whether `uri` is currently bound to exactly `session` (the live-binding check the serialized task

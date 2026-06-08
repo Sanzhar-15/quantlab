@@ -22,7 +22,11 @@ export function run(testsRoot: string, clb: (error: Error | null, failures?: num
 	const mocha = new Mocha({ ui: 'tdd', color: true, timeout: 120000 });
 	let files: string[];
 	try {
-		files = fs.readdirSync(testsRoot).filter((f) => f.endsWith('.hosttest.js'));
+		// Sort for a DETERMINISTIC run order: these suites share one extension host, and some leave a grid
+		// open (reactiveAcid1 asserts exactly one grid on a clean host, so it must run first). readdir order
+		// is filesystem-dependent, so an explicit sort -- not the OS -- guarantees the alphabetical order the
+		// suites assume (Codex N-2 MED).
+		files = fs.readdirSync(testsRoot).filter((f) => f.endsWith('.hosttest.js')).sort();
 	} catch (error) {
 		clb(error as Error);
 		return;

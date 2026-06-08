@@ -41,15 +41,81 @@ function resolveFocusedGridSession(): SessionInstance {
 	}
 	const resolution = resolveCommandTargetPanel(panels, CellGridPanel.focusedLocalPanel());
 	if (resolution.kind === 'ambiguous') {
-		// LOW (Codex fold): clicking the notebook Run button blurs the grid, so "click the grid then
-		// re-run" can loop back to ambiguous. Until N-2 adds an explicit bind command, the honest
-		// recovery is to leave exactly one grid open.
+		// Clicking the notebook Run button blurs the grid, so "click the grid then re-run" can loop back to
+		// ambiguous. The honest recovery is the N-2 "Bind to Focused Grid" command, or leaving one grid open.
 		throw new Error(
 			'[ambiguous_cell_grid] multiple Cell Grids are open; this notebook cannot tell which to bind to. '
-			+ 'Close all but the target grid (an explicit bind command comes in a later version), then run the cell again',
+			+ 'Click the grid you want and run "Quantbook: Bind Reactive Notebook to Focused Grid", or close all but the target grid, then run the cell again',
 		);
 	}
 	return resolution.session;
+}
+
+/** Resolve the Cell Grid an operator COMMAND should target. Returns the single / focused grid directly;
+ *  with multiple grids and none focused -- which is the norm when binding FROM an active notebook editor,
+ *  because focusing a grid de-focuses the notebook (and vice versa) -- it offers a QuickPick so the command
+ *  is never a dead end (Codex N-2 MED-1). Returns undefined + an info toast when no grid is open or the
+ *  operator dismisses the pick. */
+async function pickTargetGrid(): Promise<{ session: SessionInstance; sheet: number } | undefined> {
+	const panels = CellGridPanel.activeLocalPanels();
+	if (panels.length === 0) {
+		void vscode.window.showInformationMessage('No Cell Grid is open. Run "Quantbook: Open Cell Grid" first.');
+		return undefined;
+	}
+	if (panels.length === 1) {
+		return panels[0];
+	}
+	const focused = CellGridPanel.focusedLocalPanel();
+	if (focused !== undefined) {
+		return focused;
+	}
+	// More than one panel and none focused (the norm when acting from an active notebook, which de-focuses
+	// every grid): let the operator choose the exact panel. We do NOT defer to resolveCommandTargetPanel
+	// here -- it auto-picks panels[0] for multiple panels of the SAME workbook (correct for workbook-level
+	// commands), but the seed/bind here is SHEET-specific, so two sheet panels of one workbook are distinct
+	// choices the operator must make (Codex N-2 re-audit MED). Label each by its active sheet; snapshot() is
+	// NOT wrapped in a fallback -- a broken session must surface, not be silently labelled blank.
+	const items = panels.map((p, i) => {
+		const snap = p.session.snapshot();
+		const sh = snap.sheets.find((s) => s.id === p.sheet);
+		const detail = sh !== undefined
+			? `active sheet ${sh.name} (${snap.sheets.length} sheet${snap.sheets.length === 1 ? '' : 's'})`
+			: `${snap.sheets.length} sheet${snap.sheets.length === 1 ? '' : 's'}`;
+		return { label: `Cell Grid ${i + 1}`, detail, panel: p };
+	});
+	const chosen = await vscode.window.showQuickPick(items, {
+		placeHolder: 'Multiple Cell Grids are open -- choose which to bind this reactive notebook to',
+	});
+	return chosen?.panel;
+}
+
+/** The name of `sheet` on `session` (e.g. "S0"), used to pre-fill a publish target so the seeded cell is
+ *  correct out of the box (the operator-stalling S0-vs-Sheet1 gotcha). Throws loud if the id is gone. */
+function activeSheetName(session: SessionInstance, sheet: number): string {
+	const found = session.snapshot().sheets.find((s) => s.id === sheet);
+	if (found === undefined) {
+		throw new Error(`[bad_sheet] the focused grid has no sheet with id ${sheet}`);
+	}
+	return found.name;
+}
+
+/** The seed cells for a newly opened reactive notebook: a one-line how-it-works note + a runnable publish
+ *  template targeting the focused grid's active sheet so the very first Run mutates the grid (no guessing).
+ *  The sheet name is interpolated via JSON.stringify so a name containing a quote / backslash / newline
+ *  produces a valid Python string literal rather than breaking the cell source (Codex N-2 MED-2); it is
+ *  NOT placed raw in the comment for the same reason. */
+function seedNotebookCells(sheetName: string): vscode.NotebookCellData[] {
+	const intro = '# Reactive Python -- bound to the focused Quantbook grid\n\n'
+		+ 'Edit a value below and run the cell. `qb.publish(name, value, "Sheet!Cell")` writes a variable '
+		+ 'into the grid; dependent cells recompute live. Re-running with a new value updates them.';
+	const target = JSON.stringify(`${sheetName}!B1`);
+	const code = '# Change x, then run this cell -- the target cell (and anything that references it) updates.\n'
+		+ 'x = 42\n'
+		+ `qb.publish("x", x, ${target})`;
+	return [
+		new vscode.NotebookCellData(vscode.NotebookCellKind.Markup, intro, 'markdown'),
+		new vscode.NotebookCellData(vscode.NotebookCellKind.Code, code, 'python'),
+	];
 }
 
 /**
@@ -156,6 +222,49 @@ export function registerReactiveNotebookController(
 		markPreferred(doc);
 	}
 	context.subscriptions.push(vscode.workspace.onDidOpenNotebookDocument(markPreferred));
+
+	// N-2a: open a reactive notebook bound to the focused grid, pre-seeded with a runnable publish template.
+	// Eager-binds (registry.bindNotebook) so the FIRST cell run targets this grid regardless of later focus
+	// changes -- the operator never has to keep the grid focused to run a cell.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookOpenReactiveNotebook', async () => {
+			const target = await pickTargetGrid();
+			if (target === undefined) {
+				return;
+			}
+			let sheetName: string;
+			try {
+				sheetName = activeSheetName(target.session, target.sheet);
+			} catch (e) {
+				void vscode.window.showErrorMessage(`Quantbook: ${e instanceof Error ? e.message : String(e)}`);
+				return;
+			}
+			const data = new vscode.NotebookData(seedNotebookCells(sheetName));
+			const notebook = await vscode.workspace.openNotebookDocument(QNB_NOTEBOOK_TYPE, data);
+			registry.bindNotebook(notebook.uri.toString(), target.session);
+			controller.updateNotebookAffinity(notebook, vscode.NotebookControllerAffinity.Preferred);
+			await vscode.window.showNotebookDocument(notebook, { viewColumn: vscode.ViewColumn.Beside });
+			void vscode.window.showInformationMessage('Quantbook: reactive notebook opened and bound to the focused grid. Run the cell to publish a variable.');
+		}),
+	);
+
+	// N-2b: rebind the active reactive notebook to the focused grid. This is the sanctioned recovery from a
+	// closed-workbook tombstone (Codex HIGH-1 keeps the implicit path tombstoned) -- no close+reopen needed.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookBindReactiveNotebook', async () => {
+			const editor = vscode.window.activeNotebookEditor;
+			if (editor === undefined || editor.notebook.notebookType !== QNB_NOTEBOOK_TYPE) {
+				void vscode.window.showInformationMessage('Open a reactive notebook (.qnb) and make it the active editor, then run this command.');
+				return;
+			}
+			const target = await pickTargetGrid();
+			if (target === undefined) {
+				return;
+			}
+			registry.bindNotebook(editor.notebook.uri.toString(), target.session);
+			void vscode.window.showInformationMessage('Quantbook: this reactive notebook is now bound to the chosen grid.');
+		}),
+	);
 
 	context.subscriptions.push(controller);
 	return controller;
