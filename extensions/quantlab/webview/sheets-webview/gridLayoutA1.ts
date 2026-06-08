@@ -242,6 +242,35 @@ export function isInExtent(row: number, col: number): boolean {
 }
 
 /**
+ * **FE-1.5 W-G (bound-cell name display)** -- the reactive variable NAME driving cell `(row, col)`,
+ * or `null` if the cell is not a published target. Scans `ranges` (the host->webview published set
+ * for the active sheet, each an inclusive 0-based rect carrying its `.name`) and returns the FIRST
+ * containing range's name. The param is STRUCTURAL (not the webview `PublishedRange` interface) so
+ * this leaf geometry module stays free of any dependency on `canvasGrid.ts`. First-match-wins is the
+ * documented v1 behaviour: publishes are single cells, so ranges never overlap; a future range-aware
+ * bind that does overlap would surface the first match (registration order). Pure + unit-tested so
+ * the formula-bar chip and the hover tooltip read it headlessly-verified.
+ */
+export function publishedNameAt(
+	ranges: readonly {
+		readonly startRow: number;
+		readonly startCol: number;
+		readonly endRow: number;
+		readonly endCol: number;
+		readonly name: string;
+	}[],
+	row: number,
+	col: number,
+): string | null {
+	for (const r of ranges) {
+		if (row >= r.startRow && row <= r.endRow && col >= r.startCol && col <= r.endCol) {
+			return r.name;
+		}
+	}
+	return null;
+}
+
+/**
  * **FE-2-0 Phase 1 (C2-MED2, 2026-06-03)** -- the new scroll offset (one axis) that reveals a cell
  * below/right of a sticky band, given the cell's content-start, its size, the sticky band size
  * (header/gutter), the current scroll, and the viewport client size. Keeps the "ALL viewport math

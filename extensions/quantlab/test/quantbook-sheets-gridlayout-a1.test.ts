@@ -30,6 +30,7 @@ import {
 	hitTestContent,
 	hitTestViewport,
 	isInExtent,
+	publishedNameAt,
 	rowY,
 	scrollToReveal,
 	selectionRect,
@@ -339,5 +340,50 @@ suite('FE-2-0 gridLayoutA1 -- truncateToWidth (migrated from FE-0b gridLayout)',
 			!(lastUnit >= 0xD800 && lastUnit <= 0xDBFF),
 			`truncated result "${out}" must not end with a lone high surrogate`,
 		);
+	});
+});
+
+// FE-1.5 W-G (bound-cell name display): publishedNameAt resolves which reactive variable drives a
+// cell, for the formula-bar chip + the hover tooltip. The chip/hover DOM is operator-smoke-only;
+// this pins the pure membership predicate (inclusive rect, first-match-wins, structural param).
+suite('FE-1.5 W-G gridLayoutA1 -- publishedNameAt (driving-variable lookup)', function () {
+	test('empty ranges -> null everywhere', function () {
+		assert.strictEqual(publishedNameAt([], 0, 0), null);
+		assert.strictEqual(publishedNameAt([], 5, 9), null);
+	});
+	test('a single-cell range names its cell and nothing else', function () {
+		const ranges = [{ startRow: 0, startCol: 1, endRow: 0, endCol: 1, name: 'x' }]; // S0!B1
+		assert.strictEqual(publishedNameAt(ranges, 0, 1), 'x', 'on the published cell');
+		assert.strictEqual(publishedNameAt(ranges, 0, 0), null, 'one column left');
+		assert.strictEqual(publishedNameAt(ranges, 0, 2), null, 'one column right');
+		assert.strictEqual(publishedNameAt(ranges, 1, 1), null, 'one row below');
+	});
+	test('a multi-cell range matches its interior and every inclusive boundary corner', function () {
+		// B2:D4 -> rows 1..3, cols 1..3 (a future range-aware bind shape).
+		const ranges = [{ startRow: 1, startCol: 1, endRow: 3, endCol: 3, name: 'm' }];
+		assert.strictEqual(publishedNameAt(ranges, 2, 2), 'm', 'interior');
+		assert.strictEqual(publishedNameAt(ranges, 1, 1), 'm', 'top-left corner (inclusive)');
+		assert.strictEqual(publishedNameAt(ranges, 1, 3), 'm', 'top-right corner (inclusive)');
+		assert.strictEqual(publishedNameAt(ranges, 3, 1), 'm', 'bottom-left corner (inclusive)');
+		assert.strictEqual(publishedNameAt(ranges, 3, 3), 'm', 'bottom-right corner (inclusive)');
+		assert.strictEqual(publishedNameAt(ranges, 0, 1), null, 'one row above the top edge');
+		assert.strictEqual(publishedNameAt(ranges, 4, 3), null, 'one row below the bottom edge');
+		assert.strictEqual(publishedNameAt(ranges, 2, 4), null, 'one column past the right edge');
+	});
+	test('first-match-wins when ranges overlap (documented v1 registration order)', function () {
+		const ranges = [
+			{ startRow: 0, startCol: 0, endRow: 2, endCol: 2, name: 'first' },
+			{ startRow: 0, startCol: 0, endRow: 2, endCol: 2, name: 'second' },
+		];
+		assert.strictEqual(publishedNameAt(ranges, 1, 1), 'first');
+	});
+	test('multiple disjoint ranges each resolve to their own name', function () {
+		const ranges = [
+			{ startRow: 0, startCol: 1, endRow: 0, endCol: 1, name: 'a' }, // B1
+			{ startRow: 4, startCol: 2, endRow: 4, endCol: 2, name: 'b' }, // C5
+		];
+		assert.strictEqual(publishedNameAt(ranges, 0, 1), 'a');
+		assert.strictEqual(publishedNameAt(ranges, 4, 2), 'b');
+		assert.strictEqual(publishedNameAt(ranges, 2, 2), null, 'a gap between them');
 	});
 });

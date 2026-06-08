@@ -68,6 +68,35 @@ h2 {
 	border-radius: 3px;
 }
 
+/* W-G bound-cell name display: a chip naming the reactive variable that drives the active cell. Sits
+ * between the name box and the formula input; shown (via the `hidden` attribute toggled in JS) only
+ * when the active cell is a published target. The green border ties it to the corner badge
+ * (--vscode-charts-green, the same accent), while the text stays in the normal foreground so a variable
+ * name is always legible. A long name single-lines with an ellipsis rather than growing the bar. */
+.cell-grid-published-chip {
+	flex: 0 0 auto;
+	box-sizing: border-box;
+	display: inline-flex;
+	align-items: center;
+	max-width: 160px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	padding: 2px 8px;
+	font-family: var(--vscode-font-family);
+	font-size: 12px;
+	color: var(--vscode-foreground);
+	background: var(--vscode-editorWidget-background, var(--vscode-input-background));
+	border: 1px solid var(--vscode-charts-green, #89d185);
+	border-radius: 3px;
+}
+
+/* The base rule sets `display: inline-flex`, which would override the `hidden` attribute's default
+ * `display: none`; restore it explicitly so a non-published active cell truly hides the chip. */
+.cell-grid-published-chip[hidden] {
+	display: none;
+}
+
 .cell-grid-formula-input {
 	flex: 1 1 auto;
 	min-width: 0;

@@ -52,6 +52,7 @@ import {
 	colX,
 	hitTestViewport,
 	isInExtent,
+	publishedNameAt,
 	type SelectionRect,
 	rowY,
 	scrollToReveal,
@@ -122,6 +123,9 @@ root.innerHTML =
 	// as the in-cell editor (single writer); Esc reverts.
 	'<div class="cell-grid-formula-bar" id="sheets-formula-bar">' +
 	'<span class="cell-grid-name-box" id="sheets-name-box" title="Selected cell"></span>' +
+	// W-G bound-cell name display: an always-visible chip naming the reactive variable that drives the
+	// active cell (shown only when the active cell is a published target; `hidden` otherwise).
+	'<span class="cell-grid-published-chip" id="sheets-published-chip" hidden></span>' +
 	'<input id="sheets-formula-input" class="cell-grid-formula-input" type="text" readonly ' +
 	'aria-label="Formula bar (selected cell contents)" spellcheck="false" autocomplete="off" ' +
 	'autocorrect="off" autocapitalize="off" />' +
@@ -137,6 +141,7 @@ const titleEl = document.getElementById('sheets-title') as HTMLElement;
 const metaEl = document.getElementById('sheets-meta') as HTMLElement;
 const errorEl = document.getElementById('sheets-error') as HTMLElement;
 const nameBoxEl = document.getElementById('sheets-name-box') as HTMLElement;
+const publishedChipEl = document.getElementById('sheets-published-chip') as HTMLElement;
 const formulaInputEl = document.getElementById('sheets-formula-input') as HTMLInputElement;
 const viewportEl = document.getElementById('sheets-viewport') as HTMLElement;
 const spacerEl = document.getElementById('sheets-spacer') as HTMLElement;
@@ -353,6 +358,7 @@ function redraw(): void {
 	prevPaint = scrollStateNow(v);
 	updateFormulaBar(); // selection/content changed -> reflect the active cell in the formula bar
 	postSelectionIfChanged(); // W-G-2b: report the selection to the host (deduped)
+	scheduleHoverTitle(); // W-G name display: a publish retraction repaints here -> refresh the stale hover title
 }
 
 /**
@@ -406,6 +412,7 @@ function scrollRedraw(): void {
 		renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel, publishedRanges);
 	}
 	prevPaint = next;
+	scheduleHoverTitle(); // W-G name display: a scroll moves a new cell under a stationary pointer -> refresh the hover title
 }
 
 // FE megaudit L-b: coalesce high-frequency scroll events to ONE repaint per animation frame.
@@ -595,6 +602,32 @@ function priorCellContent(entry: QuantbookCellSnapshot['entries'][number] | unde
 }
 
 /**
+ * **W-G bound-cell name display** -- show/hide the formula-bar chip naming the reactive variable that
+ * drives the active cell. The driving name is read from {@link publishedRanges} (the host->webview
+ * published set already carries it) via the pure {@link publishedNameAt}; `null` (no active cell, or the
+ * active cell is not a published target) hides the chip. The displayed name + the explanatory title are
+ * clamped (C1-HIGH2 cap discipline) so a pathological variable name can neither blow the chip layout nor
+ * the native title. Called UNCONDITIONALLY from {@link updateFormulaBar} -- BEFORE its formula-edit /
+ * null-active guards -- so the chip never goes stale (e.g. a render that retracts the active cell's
+ * publish mid formula-edit still clears it; the chip is metadata, separate from the editable input).
+ */
+function refreshPublishedChip(): void {
+	const name = active === null ? null : publishedNameAt(publishedRanges, active.row, active.col);
+	if (name === null) {
+		publishedChipEl.hidden = true;
+		publishedChipEl.textContent = '';
+		publishedChipEl.removeAttribute('title');
+		publishedChipEl.removeAttribute('aria-label');
+		return;
+	}
+	const label = clampDisplayString('Driven by reactive variable "' + name + '"');
+	publishedChipEl.textContent = clampDisplayString(name);
+	publishedChipEl.title = label;
+	publishedChipEl.setAttribute('aria-label', label);
+	publishedChipEl.hidden = false;
+}
+
+/**
  * W-G -- refresh the formula bar from the active cell: its A1 ref in the name box and its UNDERLYING
  * content (a formula with its leading '=' or the raw literal) in the read-only field, so a computed cell
  * reveals its formula. An over-cap value is shown as a placeholder, never materialized (the same oversize
@@ -604,9 +637,12 @@ function priorCellContent(entry: QuantbookCellSnapshot['entries'][number] | unde
  * **W-G-1b**: while the formula bar IS the live editor, this is a no-op -- a `redraw()` mid-typing (e.g. an
  * `errorReply` realign) must NOT overwrite the value the user is editing. The active cell is fixed during a
  * formula edit, so the name box need not update either. On edit close, `cancelEdit` nulls `editState` first,
- * then calls this to restore the committed display value.
+ * then calls this to restore the committed display value. The published-cell chip ({@link refreshPublishedChip})
+ * is refreshed first, unconditionally -- it is metadata next to the bar, not the edited value, so it stays
+ * correct even while the bar is the live editor.
  */
 function updateFormulaBar(): void {
+	refreshPublishedChip();
 	if (editState !== null && editState.surface === 'formula') {
 		return;
 	}
@@ -1050,9 +1086,16 @@ function updateHoverTitle(): void {
 			const key = hit.row + ',' + hit.col;
 			// Audit C1-HIGH2: cap the tooltip string (a pathological diagnostic/error message shouldn't
 			// stall the native `title` rendering).
-			title = clampDisplayString(
+			const errPart = clampDisplayString(
 				errorCells.get(key) ?? (entry && typeof entry.diagnostic === 'string' ? entry.diagnostic : ''),
 			);
+			// W-G bound-cell name display: if this cell is a published target, add a line naming the reactive
+			// variable that drives it. Each part is clamped first (so a pathological diagnostic/name never
+			// builds a huge join), then the COMPOSED title is clamped once more so the whole string still
+			// honors the single C1-HIGH2 cap (Codex LOW) -- realistic short errors keep both lines intact.
+			const drivenBy = publishedNameAt(publishedRanges, hit.row, hit.col);
+			const pubPart = drivenBy === null ? '' : clampDisplayString('Driven by reactive variable "' + drivenBy + '"');
+			title = clampDisplayString([errPart, pubPart].filter(part => part.length > 0).join('\n'));
 		}
 	}
 	if (title !== lastHoverTitle) {
@@ -1060,14 +1103,23 @@ function updateHoverTitle(): void {
 		lastHoverTitle = title;
 	}
 }
-canvasEl.addEventListener('mousemove', ev => {
-	hoverClientX = ev.clientX;
-	hoverClientY = ev.clientY;
+// Coalesce a native-title recompute to ONE hit-test per animation frame. Called on pointer move AND
+// (W-G bound-cell name display, Codex MED) after any repaint -- a publish retraction (-> redraw) or a
+// scroll (-> scrollRedraw) can move a different cell, or a now-unpublished cell, under a STATIONARY
+// pointer, so the title must be recomputed from the last pointer position, not only on the next move.
+// Safe to call from redraw()/scrollRedraw(): both run well after module load, so `hoverScheduled` (a
+// module `let` initialized above) is always defined by then (the W-G-1b init-order lesson).
+function scheduleHoverTitle(): void {
 	if (hoverScheduled) {
 		return;
 	}
 	hoverScheduled = true;
 	requestAnimationFrame(updateHoverTitle);
+}
+canvasEl.addEventListener('mousemove', ev => {
+	hoverClientX = ev.clientX;
+	hoverClientY = ev.clientY;
+	scheduleHoverTitle();
 });
 
 // --- Keyboard: navigation + type-to-edit + undo/redo (only when NOT editing) ---
