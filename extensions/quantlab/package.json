@@ -31,9 +31,22 @@
     "test:py:dev": "python -m pytest python/qviz/tests/ -q"
   },
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onNotebook:quantlab-reactive-notebook"
   ],
   "contributes": {
+    "notebooks": [
+      {
+        "type": "quantlab-reactive-notebook",
+        "displayName": "Quantbook Reactive Notebook",
+        "selector": [
+          {
+            "filenamePattern": "*.qnb"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
     "commands": [
       {
         "command": "quantlab.signIn",

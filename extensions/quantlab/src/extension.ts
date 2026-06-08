@@ -8,6 +8,7 @@ import { registerDataCommands } from './commands/dataCommands';
 import { registerQuantbookCommands } from './commands/quantbookCommands';
 import { registerReactiveKernelCommands } from './quantbook/reactiveKernel/reactiveKernelCommands';
 import type { ReactiveKernelManager } from './quantbook/reactiveKernel/reactiveKernelManager';
+import { QNB_NOTEBOOK_TYPE, QnbSerializer } from './quantbook/reactiveNotebook/qnbSerializer';
 import type { SessionInstance } from './quantbook/types';
 import { registerGlobalStateCommands } from './commands/globalStateCommands';
 import { registerHistoryCommands } from './commands/historyCommands';
@@ -295,6 +296,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	}
 	// Pass a getter (not the bool) so the gate reads the final value even though init is awaited above.
 	reactiveKernelManager = registerReactiveKernelCommands(context, () => reactiveTrustReady);
+
+	// FE-1.5 W-N: the `.qnb` reactive-notebook serializer (the controller is registered in N-1).
+	// Outputs are transient (the kernel re-runs), so they are never written to disk.
+	context.subscriptions.push(
+		vscode.workspace.registerNotebookSerializer(QNB_NOTEBOOK_TYPE, new QnbSerializer(), { transientOutputs: true }),
+	);
 
 	new DataPanelProvider(context, globalState, watchlistManager);
 	const catalogService = ResourcesCatalogService.initialize(context);
