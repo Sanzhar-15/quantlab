@@ -52,8 +52,10 @@ import {
 	colX,
 	hitTestViewport,
 	isInExtent,
+	type SelectionRect,
 	rowY,
 	scrollToReveal,
+	selectionRect,
 	totalContentHeight,
 	totalContentWidth,
 } from './gridLayoutA1';
@@ -186,8 +188,14 @@ let fullSnapshot: QuantbookCellSnapshot | null = null;
 // "row,col" -> "[code] message" for cells whose last edit failed (errorReply). Map preserves the
 // structured error text for the hover tooltip.
 const errorCells = new Map<string, string>();
-// The active (selected) cell. Starts at A1 (like Excel) so the grid always shows a selection.
+// The active (selected) cell -- the FOCUS of the selection. Starts at A1 (like Excel) so the grid
+// always shows a selection. `active` is the editable/formula-bar cell; all single-cell logic keys off it.
 let active: ActiveCell | null = { row: 0, col: 0 };
+// **W-G-2a**: the selection ANCHOR -- the fixed corner of a multi-cell range (shift-click / shift-arrow
+// set it; `active` is the moving focus). `null` means the selection is just the single `active` cell
+// (today's behavior, unchanged). The range is `selectionRect(anchor, active)`. Edits/Delete/plain-click
+// collapse it back to a single cell (range-aware editing is a later increment).
+let anchor: ActiveCell | null = null;
 
 interface EditState {
 	// **W-G-1b**: the live editor input + which surface it is. Editing runs in EITHER the in-cell overlay
@@ -327,7 +335,7 @@ function redraw(): void {
 	const v = currentViewport();
 	renderer.resize(v.cssW, v.cssH);
 	applyCanvasTransform(v.scrollTop, v.scrollLeft);
-	renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
+	renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection());
 	prevPaint = scrollStateNow(v);
 	updateFormulaBar(); // selection/content changed -> reflect the active cell in the formula bar
 }
@@ -345,10 +353,13 @@ function scrollRedraw(): void {
 	applyCanvasTransform(v.scrollTop, v.scrollLeft);
 	const next = scrollStateNow(v);
 	const blit = renderer.painted ? computeScrollBlitA1(prevPaint, next, renderer.gutterWidthPx) : null;
+	// W-G-2a: a pure scroll changes neither selection nor content, but the renderer still needs the current
+	// selection to paint the range in the exposed strip / full-fallback.
+	const sel = currentSelection();
 	if (blit === null) {
-		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
+		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel);
 	} else {
-		renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
+		renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel);
 	}
 	prevPaint = next;
 }
@@ -399,18 +410,56 @@ function ensureActiveVisible(): void {
 	);
 }
 
-/** Move the selection by (dr,dc), scroll it into view, repaint. No-op while editing. */
+/** Move the selection by (dr,dc), scroll it into view, repaint. No-op while editing. A plain (non-shift)
+ *  move COLLAPSES any range back to the single focus cell (W-G-2a). */
 function moveActive(dr: number, dc: number): void {
 	const base = active ?? { row: 0, col: 0 };
+	anchor = null; // a plain move clears the range
 	active = { row: clampRow(base.row + dr), col: clampCol(base.col + dc) };
 	ensureActiveVisible();
 	redraw();
 }
 
-/** Set the selection to an absolute (clamped) cell + scroll it into view (used after a commit nav). */
+/** Set the selection to an absolute (clamped) SINGLE cell + scroll it into view (used after a commit nav
+ *  or a known-bad arrow-discard). W-G-2a: clears any anchor -- this is a single-cell landing, and a stale
+ *  anchor set by a shift-click during a pending edit would otherwise resurrect as a range on the next
+ *  redraw (Codex W-G-2a re-audit LOW). */
 function setActiveClamped(row: number, col: number): void {
+	anchor = null;
 	active = { row: clampRow(row), col: clampCol(col) };
 	ensureActiveVisible();
+}
+
+/** **W-G-2a** -- collapse any multi-cell range back to the single focus cell (clear the anchor). */
+function collapseSelection(): void {
+	anchor = null;
+}
+
+/** **W-G-2a** -- extend the selection by moving the FOCUS by (dr,dc), keeping (or establishing) the anchor
+ *  at the cell the focus started from. Shift+Arrow drives this; the range is anchor..focus. */
+function extendActive(dr: number, dc: number): void {
+	const base = active ?? { row: 0, col: 0 };
+	if (anchor === null) {
+		anchor = base; // the focus's current cell becomes the fixed corner
+	}
+	active = { row: clampRow(base.row + dr), col: clampCol(base.col + dc) };
+	ensureActiveVisible();
+	redraw();
+}
+
+/** **W-G-2a** -- the current selection rect, or `null` for a single-cell selection. Passed to every
+ *  renderer draw call; `null` keeps the single-cell paint path byte-identical to pre-W-G-2a. Returns
+ *  `null` for a DEGENERATE range too (anchor === focus -- reachable via shift-click on the current cell
+ *  or shift-arrow at a clamped boundary), so a no-op shift gesture never paints a 1-cell "range" box
+ *  (Codex W-G-2a LOW). The anchor stays set, so a subsequent shift-extend still grows from it. */
+function currentSelection(): SelectionRect | null {
+	if (anchor === null || active === null) {
+		return null;
+	}
+	if (anchor.row === active.row && anchor.col === active.col) {
+		return null;
+	}
+	return selectionRect(anchor, active);
 }
 
 /** **Megaudit (B2)** -- the selection delta for a commit/nav key, or `null` for any other key. Enter and
@@ -447,6 +496,9 @@ function clearActiveCell(): void {
 	// render is gone (errors are now per-cell), and a Delete carries no editor/commit-token to resolve --
 	// so without this a Delete'd cell would keep a stale error tint. Clearing to blank is essentially
 	// always valid; if it DOES fail, the host's `errorReply` re-decorates the cell (No-Fallbacks).
+	// W-G-2a: Delete clears only the FOCUS cell this increment (range-aware clear is a later increment);
+	// collapse any range so the UI doesn't imply a multi-cell clear happened.
+	collapseSelection();
 	errorCells.delete(active.row + ',' + active.col);
 	vscode.postMessage({ type: 'putValue', sheet: fullSnapshot.sheet, row: active.row, col: active.col, rawInput: '' });
 	redraw();
@@ -540,6 +592,8 @@ function beginEdit(row: number, col: number, initialChar?: string): void {
 	// Select + reveal the cell on ANY entry point (click / F2 / type-to-edit). Megaudit MED-1 (re-audit):
 	// this MUST happen BEFORE the oversize bail below -- a CLICK on an over-length cell still SELECTS it (the
 	// editor just doesn't open). For F2/type the cell is already active, so this is a no-op there.
+	// W-G-2a: editing is single-cell, so collapse any selection range to this focus cell.
+	collapseSelection();
 	active = { row, col };
 	// Audit O2-MED2: F2 / type-to-edit on a scrolled-away active cell must bring it into view first,
 	// otherwise the overlay editor opens off-screen (content-layer child positioned at the cell rect).
@@ -625,6 +679,12 @@ function beginEditFormula(): void {
 	}
 	if (editState !== null) {
 		cancelEdit(); // an unchanged overlay edit still open -- close it before the bar takes over
+	}
+	// W-G-2a: editing the focus cell is single-cell; collapse any range first (repaint to clear the range
+	// paint before the edit begins). A no-op when there is no range.
+	if (anchor !== null) {
+		collapseSelection();
+		redraw();
 	}
 	const entry = renderer.entryAt(active.row, active.col);
 	const prior = priorCellContent(entry);
@@ -899,6 +959,15 @@ canvasEl.addEventListener('click', ev => {
 	if (hit === null) {
 		return;
 	}
+	// W-G-2a: Shift+click EXTENDS the selection -- the click cell becomes the focus, the anchor stays (or is
+	// established at the prior focus). A plain click COLLAPSES to the single clicked cell.
+	if (ev.shiftKey) {
+		if (anchor === null) {
+			anchor = active ?? { row: hit.row, col: hit.col };
+		}
+	} else {
+		anchor = null;
+	}
 	active = { row: hit.row, col: hit.col };
 	redraw();
 });
@@ -995,28 +1064,41 @@ document.addEventListener('keydown', ev => {
 	if (ev.altKey) {
 		return;
 	}
-	// Navigation.
+	// Navigation. W-G-2a: Shift+Arrow EXTENDS the selection range (anchor stays, focus moves); a plain
+	// arrow COLLAPSES the range and moves. Tab/Enter always move a single cell (collapse) -- Shift+Tab is
+	// reverse-Tab (move left), NOT range extension, matching Excel.
 	switch (ev.key) {
 		case 'ArrowUp':
 			ev.preventDefault();
-			moveActive(-1, 0);
+			(ev.shiftKey ? extendActive : moveActive)(-1, 0);
 			return;
 		case 'ArrowDown':
+			ev.preventDefault();
+			(ev.shiftKey ? extendActive : moveActive)(1, 0);
+			return;
 		case 'Enter': // Excel: Enter on a selected cell moves down (typing/F2 edits)
 			ev.preventDefault();
 			moveActive(1, 0);
 			return;
 		case 'ArrowLeft':
 			ev.preventDefault();
-			moveActive(0, -1);
+			(ev.shiftKey ? extendActive : moveActive)(0, -1);
 			return;
 		case 'ArrowRight':
 			ev.preventDefault();
-			moveActive(0, 1);
+			(ev.shiftKey ? extendActive : moveActive)(0, 1);
 			return;
 		case 'Tab':
 			ev.preventDefault();
 			moveActive(0, ev.shiftKey ? -1 : 1);
+			return;
+		case 'Escape':
+			// W-G-2a: collapse a multi-cell range back to the focus cell (no-op when already single-cell).
+			if (anchor !== null) {
+				ev.preventDefault();
+				collapseSelection();
+				redraw();
+			}
 			return;
 		case 'F2':
 			ev.preventDefault();
@@ -1130,7 +1212,7 @@ function applyRender(snapshot: QuantbookCellSnapshot): void {
 	// Scroll is unchanged (gated above), so the canvas transform + prevPaint stay valid; drawDamage is a
 	// no-op for an empty row set (nothing painted changed).
 	applyCanvasTransform(v.scrollTop, v.scrollLeft);
-	renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
+	renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection());
 	// The damage path bypasses redraw(); if the active cell's content changed (e.g. a commit re-render),
 	// the formula bar must still follow it.
 	updateFormulaBar();
@@ -1277,6 +1359,16 @@ window.addEventListener('message', (event: MessageEvent) => {
 			if (active === null || active.row !== editState.row || active.col !== editState.col) {
 				activeMoved = true;
 			}
+			// W-G-2a: this is a single-cell realign onto the failed edit cell; clear any anchor a shift-click
+			// set while the commit was pending, else it would resurrect as a range on the redraw below
+			// (Codex W-G-2a re-audit LOW). Edits are single-cell, so collapsing here is always correct.
+			// Codex re-audit #3: clearing the anchor REMOVES a painted range -- but the row-only `drawDamage`
+			// fast path below clips to the error rows and can't erase range fill on other rows. So if a range
+			// was visible, force the full-redraw path (treat it like an `activeMoved`).
+			if (currentSelection() !== null) {
+				activeMoved = true;
+			}
+			anchor = null;
 			active = { row: editState.row, col: editState.col };
 			ensureActiveVisible();
 			updateEditClip(); // megaudit LOW: ensureActiveVisible may have scrolled -- re-clip the still-open editor
@@ -1297,7 +1389,7 @@ window.addEventListener('message', (event: MessageEvent) => {
 		if (!activeMoved && renderer.painted && !renderer.backingScaleStale && scrollUnchangedSince(v)) {
 			const rows = errorRowsFlippedA1(prevErrorKeys, new Set(errorCells.keys()));
 			applyCanvasTransform(v.scrollTop, v.scrollLeft);
-			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active);
+			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection());
 		} else {
 			// A selection realign (activeMoved) repaints both the old + new selection rows -> full redraw.
 			redraw();

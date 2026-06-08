@@ -32,6 +32,7 @@ import {
 	isInExtent,
 	rowY,
 	scrollToReveal,
+	selectionRect,
 	totalContentHeight,
 	totalContentWidth,
 	truncateToWidth,
@@ -74,6 +75,37 @@ suite('W-G gridLayoutA1 -- cellRefA1 (formula-bar name box)', function () {
 	});
 	test('a negative row clamps to row 1 (defensive)', () => {
 		assert.strictEqual(cellRefA1(-1, 0), 'A1');
+	});
+});
+
+suite('W-G-2a gridLayoutA1 -- selectionRect (anchor/focus normalization)', function () {
+	test('a single cell (anchor === focus) yields a degenerate rect', () => {
+		assert.deepStrictEqual(selectionRect({ row: 3, col: 5 }, { row: 3, col: 5 }), {
+			minRow: 3, maxRow: 3, minCol: 5, maxCol: 5,
+		});
+	});
+	test('focus down-right of anchor', () => {
+		assert.deepStrictEqual(selectionRect({ row: 1, col: 2 }, { row: 4, col: 6 }), {
+			minRow: 1, maxRow: 4, minCol: 2, maxCol: 6,
+		});
+	});
+	test('inverted: focus up-left of anchor normalizes the same', () => {
+		assert.deepStrictEqual(selectionRect({ row: 4, col: 6 }, { row: 1, col: 2 }), {
+			minRow: 1, maxRow: 4, minCol: 2, maxCol: 6,
+		});
+	});
+	test('mixed: anchor low-row/high-col, focus high-row/low-col', () => {
+		assert.deepStrictEqual(selectionRect({ row: 1, col: 9 }, { row: 7, col: 3 }), {
+			minRow: 1, maxRow: 7, minCol: 3, maxCol: 9,
+		});
+	});
+	test('a single-row band and a single-col band', () => {
+		assert.deepStrictEqual(selectionRect({ row: 2, col: 0 }, { row: 2, col: 4 }), {
+			minRow: 2, maxRow: 2, minCol: 0, maxCol: 4,
+		});
+		assert.deepStrictEqual(selectionRect({ row: 0, col: 3 }, { row: 5, col: 3 }), {
+			minRow: 0, maxRow: 5, minCol: 3, maxCol: 3,
+		});
 	});
 });
 

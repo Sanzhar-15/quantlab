@@ -33,6 +33,7 @@ import {
 	MAX_COLS,
 	MAX_ROWS,
 	ROW_HEIGHT,
+	type SelectionRect,
 	colX,
 	columnLabel,
 	computeVisibleColRange,
@@ -136,6 +137,9 @@ interface Palette {
 	errorFg: string;
 	errorBg: string;
 	selectionBorder: string;
+	// W-G-2a: translucent fill painted over a multi-cell selection range (the focus cell keeps its
+	// crisp border on top). Must be translucent so cell contents show through.
+	rangeFill: string;
 }
 
 /** Renders a {@link QuantbookCellSnapshot} as an A1 grid onto a canvas. One instance per panel. */
@@ -288,9 +292,10 @@ export class CanvasGridRenderer {
 		scrollLeft: number,
 		errorCells: ReadonlyMap<string, string>,
 		active: ActiveCell | null,
+		selection: SelectionRect | null,
 	): void {
 		this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection);
 		this.hasPaintedOnce = true;
 	}
 
@@ -311,6 +316,7 @@ export class CanvasGridRenderer {
 		scrollLeft: number,
 		errorCells: ReadonlyMap<string, string>,
 		active: ActiveCell | null,
+		selection: SelectionRect | null,
 	): void {
 		const ctx = this.ctx;
 		const c = blit.copy;
@@ -326,12 +332,12 @@ export class CanvasGridRenderer {
 			ctx.beginPath();
 			ctx.rect(d.x, d.y, d.width, d.height);
 			ctx.clip();
-			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active);
+			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection);
 			ctx.restore();
 		}
 		this.hasPaintedOnce = true;
 		if (DEBUG_BLIT_VERIFY) {
-			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, 'drawScroll');
+			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, 'drawScroll');
 		}
 	}
 
@@ -351,6 +357,7 @@ export class CanvasGridRenderer {
 		scrollLeft: number,
 		errorCells: ReadonlyMap<string, string>,
 		active: ActiveCell | null,
+		selection: SelectionRect | null,
 	): void {
 		if (rows.length === 0) {
 			return;
@@ -384,11 +391,11 @@ export class CanvasGridRenderer {
 		}
 		addBand(runStart, runEnd);
 		ctx.clip();
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection);
 		ctx.restore();
 		this.hasPaintedOnce = true;
 		if (DEBUG_BLIT_VERIFY) {
-			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, 'drawDamage');
+			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, 'drawDamage');
 		}
 	}
 
@@ -406,6 +413,7 @@ export class CanvasGridRenderer {
 		scrollLeft: number,
 		errorCells: ReadonlyMap<string, string>,
 		active: ActiveCell | null,
+		selection: SelectionRect | null,
 		path: string,
 	): void {
 		const ctx = this.ctx;
@@ -413,7 +421,7 @@ export class CanvasGridRenderer {
 		const bh = this.canvas.height;
 		const partial = ctx.getImageData(0, 0, bw, bh);
 		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection);
 		const full = ctx.getImageData(0, 0, bw, bh);
 		const pa = partial.data;
 		const fu = full.data;
@@ -452,6 +460,7 @@ export class CanvasGridRenderer {
 		scrollLeft: number,
 		errorCells: ReadonlyMap<string, string>,
 		active: ActiveCell | null,
+		selection: SelectionRect | null,
 	): void {
 		const ctx = this.ctx;
 		ctx.fillStyle = this.palette.background;
@@ -526,6 +535,31 @@ export class CanvasGridRenderer {
 			}
 		}
 
+		// 3b. W-G-2a: multi-cell selection range -- a translucent fill + an outer accent border over the
+		// rect spanning anchor..focus. Painted UNDER the focus box (item 4) so the active cell stays crisp.
+		// `selection` is non-null only for a real range (the caller passes null for a single cell, so the
+		// single-cell path below is unchanged). Skip when the whole range is scrolled out of the visible
+		// window (mirror the focus-box LOW-2 guard -- don't stroke/fill at far-off coords); a partially
+		// visible range is fine (the sticky gutter/header repaint over any bleed under the bands).
+		if (
+			selection !== null &&
+			selection.maxRow >= rowRange.startIdx &&
+			selection.minRow < rowRange.endIdx &&
+			selection.maxCol >= colRange.startIdx &&
+			selection.minCol < colRange.endIdx
+		) {
+			const rx = Math.round(colX(selection.minCol, gutterW) - scrollLeft);
+			const ry = Math.round(rowY(selection.minRow) - scrollTop);
+			const rw = Math.round(colX(selection.maxCol + 1, gutterW) - scrollLeft) - rx;
+			const rh = Math.round(rowY(selection.maxRow + 1) - scrollTop) - ry;
+			ctx.fillStyle = this.palette.rangeFill;
+			ctx.fillRect(rx, ry, rw, rh);
+			ctx.strokeStyle = this.palette.selectionBorder;
+			ctx.lineWidth = SELECTION_BORDER_PX;
+			const ro = SELECTION_BORDER_PX / 2;
+			ctx.strokeRect(rx + ro, ry + ro, rw - SELECTION_BORDER_PX, rh - SELECTION_BORDER_PX);
+		}
+
 		// 4. Active-cell selection box (2px accent border), if the selected cell is in the window. Audit
 		// LOW-2: skip entirely when the active cell is scrolled off-screen (don't stroke at far-off coords).
 		if (
@@ -546,8 +580,8 @@ export class CanvasGridRenderer {
 		}
 
 		// 5. Sticky row gutter (covers cells that scrolled left under it), then header, then corner.
-		this.drawGutter(scrollTop, gutterW, cssHeight, rowRange.startIdx, rowRange.endIdx, active);
-		this.drawHeader(scrollLeft, gutterW, cssWidth, colRange.startIdx, colRange.endIdx, active);
+		this.drawGutter(scrollTop, gutterW, cssHeight, rowRange.startIdx, rowRange.endIdx, active, selection);
+		this.drawHeader(scrollLeft, gutterW, cssWidth, colRange.startIdx, colRange.endIdx, active, selection);
 		this.drawCorner(gutterW);
 	}
 
@@ -558,6 +592,7 @@ export class CanvasGridRenderer {
 		startRow: number,
 		endRow: number,
 		active: ActiveCell | null,
+		selection: SelectionRect | null,
 	): void {
 		const ctx = this.ctx;
 		// Audit MED-3: opaque base FIRST (headerBg may be translucent; without it the gridlines drawn
@@ -577,7 +612,11 @@ export class CanvasGridRenderer {
 		ctx.clip();
 		for (let r = startRow; r < endRow; r += 1) {
 			const y = Math.round(rowY(r) - scrollTop);
-			if (active !== null && active.row === r) {
+			// W-G-2a: tint every row in the selection range (or just the active row when there is no range).
+			const tinted = selection !== null
+				? r >= selection.minRow && r <= selection.maxRow
+				: active !== null && active.row === r;
+			if (tinted) {
 				ctx.fillStyle = this.palette.headerActiveBg;
 				ctx.fillRect(0, y, gutterW, ROW_HEIGHT);
 			}
@@ -608,6 +647,7 @@ export class CanvasGridRenderer {
 		startCol: number,
 		endCol: number,
 		active: ActiveCell | null,
+		selection: SelectionRect | null,
 	): void {
 		const ctx = this.ctx;
 		// Opaque base FIRST (the headerBg may be translucent; cells/gridlines must not bleed through).
@@ -623,7 +663,11 @@ export class CanvasGridRenderer {
 			// Audit S1-LOW3: snap the column origin so the active-col tint + label clip align with the
 			// (rounded) header separators.
 			const x = Math.round(colX(c, gutterW) - scrollLeft);
-			if (active !== null && active.col === c) {
+			// W-G-2a: tint every column in the selection range (or just the active col when there is no range).
+			const tinted = selection !== null
+				? c >= selection.minCol && c <= selection.maxCol
+				: active !== null && active.col === c;
+			if (tinted) {
 				ctx.fillStyle = this.palette.headerActiveBg;
 				ctx.fillRect(x, 0, COL_WIDTH, HEADER_HEIGHT);
 			}
@@ -714,6 +758,9 @@ export class CanvasGridRenderer {
 			errorFg: v('--vscode-errorForeground', '#f48771'),
 			errorBg: v('--vscode-inputValidation-errorBackground', 'rgba(190,40,40,0.25)'),
 			selectionBorder: v('--vscode-focusBorder', '#007fd4'),
+			// The dimmed editor-selection color: themed AND typically translucent, so the range fill never
+			// hides cell values (translucent rgba fallback if the theme omits it).
+			rangeFill: v('--vscode-editor-inactiveSelectionBackground', 'rgba(9,71,113,0.25)'),
 		};
 	}
 

@@ -125,6 +125,32 @@ export function cellRefA1(row: number, col: number): string {
 	return columnLabel(col) + String(Math.max(0, Math.floor(row)) + 1);
 }
 
+/** An inclusive rectangular cell range, in 0-based grid coordinates. */
+export interface SelectionRect {
+	readonly minRow: number;
+	readonly maxRow: number;
+	readonly minCol: number;
+	readonly maxCol: number;
+}
+
+/**
+ * Normalize a selection's two endpoints -- `anchor` (the fixed end) and `focus` (the moving end) -- into
+ * an inclusive {@link SelectionRect}, regardless of which end is up/left. `anchor === focus` yields a
+ * single-cell rect (`min === max`). Pure -- the renderer paints from this and the host (W-G-2b) reports
+ * it. The W-G selection model keeps `focus` as the editable/active cell; `anchor` is the other corner.
+ */
+export function selectionRect(
+	anchor: { row: number; col: number },
+	focus: { row: number; col: number },
+): SelectionRect {
+	return {
+		minRow: Math.min(anchor.row, focus.row),
+		maxRow: Math.max(anchor.row, focus.row),
+		minCol: Math.min(anchor.col, focus.col),
+		maxCol: Math.max(anchor.col, focus.col),
+	};
+}
+
 /**
  * Width of the sticky row-number gutter for a given measured text width (the px width of the WIDEST
  * row-number string currently in view, from `ctx.measureText`). Pure: the measurement is injected so
