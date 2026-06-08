@@ -113,9 +113,11 @@ root.innerHTML =
 	'<h2 id="sheets-title">Quantbook Cell Grid</h2>' +
 	'<div class="meta" id="sheets-meta"></div>' +
 	'<div class="sheets-error" id="sheets-error" role="alert" hidden></div>' +
-	// W-G formula bar: a name box (the active cell's A1 ref) + a read-only field showing that cell's
-	// UNDERLYING content (a formula with its leading '=', or the raw literal) -- so selecting a computed
-	// cell reveals its formula. Read-only in this slice; editing comes next (W-G-1b).
+	// W-G formula bar: a name box (the active cell's A1 ref) + a field showing that cell's UNDERLYING
+	// content (a formula with its leading '=', or the raw literal) -- so selecting a computed cell reveals
+	// its formula. W-G-1b: the field is EDITABLE -- focusing it enters an edit (the `readonly` attr is the
+	// display-mode default; `beginEditFormula` clears it). Enter commits through the SAME commit machinery
+	// as the in-cell editor (single writer); Esc reverts.
 	'<div class="cell-grid-formula-bar" id="sheets-formula-bar">' +
 	'<span class="cell-grid-name-box" id="sheets-name-box" title="Selected cell"></span>' +
 	'<input id="sheets-formula-input" class="cell-grid-formula-input" type="text" readonly ' +
@@ -186,10 +188,15 @@ let fullSnapshot: QuantbookCellSnapshot | null = null;
 const errorCells = new Map<string, string>();
 // The active (selected) cell. Starts at A1 (like Excel) so the grid always shows a selection.
 let active: ActiveCell | null = { row: 0, col: 0 };
-// Seed the formula bar with the initial selection (A1, empty content) before the first render arrives.
-updateFormulaBar();
 
 interface EditState {
+	// **W-G-1b**: the live editor input + which surface it is. Editing runs in EITHER the in-cell overlay
+	// (`inputEl`, positioned over the cell) OR the formula bar (`formulaInputEl`, the always-visible bar) --
+	// never both (single-active-editor model). The shared commit machinery (`commitEdit`, the watchdog,
+	// `resolvePendingCommit`, the `errorReply` un-stick) operates on `editEl` so there is ONE writer; only the
+	// presentation (position/clip/hide vs readOnly-toggle) branches on `surface`.
+	readonly editEl: HTMLInputElement;
+	readonly surface: 'overlay' | 'formula';
 	// **Audit MED-2 (2026-06-05)**: the sheet captured at edit-start. `commitEdit` posts to THIS sheet, not
 	// the live `fullSnapshot.sheet`, so an edit can never be mis-targeted if the snapshot's sheet changes
 	// while the editor is open (defensive -- a panel's sheet is fixed today, but this removes the coupling).
@@ -221,10 +228,15 @@ interface EditState {
 	// **Megaudit re-audit (HIGH, 2026-06-04)**: the rawInput posted by the in-flight commit. After the
 	// watchdog (or a malformed render) recovers a stalled commit and the user types a correction, a
 	// genuinely-LATE success ack must NOT close the editor + discard that typing -- `resolvePendingCommit`
-	// only honors a late ack when `inputEl.value` still equals this submitted value.
+	// only honors a late ack when `editEl.value` still equals this submitted value.
 	submittedRawInput?: string;
 }
 let editState: EditState | null = null;
+// Seed the formula bar with the initial selection (A1, empty content) before the first render arrives.
+// **W-G-1b**: this MUST run AFTER `editState` is initialized -- `updateFormulaBar` now reads `editState`,
+// and esbuild down-levels the module-level `let` to a hoisted `var` (undefined until this point), so calling
+// it earlier would hit `undefined.surface` (the `!== null` guard does not catch `undefined`).
+updateFormulaBar();
 // FE-2-0 Phase 2: monotonic source of per-commit ids (never reused within a webview lifetime).
 let nextCommitId = 0;
 // FE-2-0 Phase 2 (re-audit HIGH): a pending edit now resolves ONLY on a matching commitResult/errorReply
@@ -248,8 +260,8 @@ function armCommitWatchdog(commitId: number): void {
 		if (editState !== null && editState.pendingCommit && editState.commitId === commitId) {
 			editState.pendingCommit = false; // un-stick: re-arm Escape / blur / re-edit
 			editState.navAfterCommit = undefined;
-			inputEl.readOnly = false; // megaudit H1/MED: unlock + refocus so the user can act on the un-stuck editor
-			inputEl.focus();
+			editState.editEl.readOnly = false; // megaudit H1/MED: unlock + refocus so the user can act on the un-stuck editor
+			editState.editEl.focus();
 			showError(
 				'The edit could not be confirmed by the host (no response). It may or may not have been ' +
 				'saved -- check the cell value, then press Escape or re-enter it.',
@@ -492,8 +504,16 @@ function priorCellContent(entry: QuantbookCellSnapshot['entries'][number] | unde
  * reveals its formula. An over-cap value is shown as a placeholder, never materialized (the same oversize
  * discipline as {@link priorCellContent}). Called on every content/selection repaint (`redraw` + the damage
  * fast path); a pure scroll changes neither selection nor content, so the scroll path deliberately omits it.
+ *
+ * **W-G-1b**: while the formula bar IS the live editor, this is a no-op -- a `redraw()` mid-typing (e.g. an
+ * `errorReply` realign) must NOT overwrite the value the user is editing. The active cell is fixed during a
+ * formula edit, so the name box need not update either. On edit close, `cancelEdit` nulls `editState` first,
+ * then calls this to restore the committed display value.
  */
 function updateFormulaBar(): void {
+	if (editState !== null && editState.surface === 'formula') {
+		return;
+	}
 	if (active === null) {
 		nameBoxEl.textContent = '';
 		formulaInputEl.value = '';
@@ -554,7 +574,7 @@ function beginEdit(row: number, col: number, initialChar?: string): void {
 	inputEl.value = prefill;
 	inputEl.hidden = false;
 	inputEl.style.clipPath = ''; // FE-2-0 polish: start unclipped; updateEditClip below sets it for this cell
-	editState = { sheet: fullSnapshot.sheet, row, col, entry, initialValue, pendingCommit: false };
+	editState = { editEl: inputEl, surface: 'overlay', sheet: fullSnapshot.sheet, row, col, entry, initialValue, pendingCommit: false };
 	updateEditClip(); // FE-2-0 polish: clip to the body pane (the cell may open partly under a sticky band)
 	inputEl.focus();
 	if (initialChar === undefined) {
@@ -568,19 +588,73 @@ function cancelEdit(): void {
 	if (editState === null) {
 		return;
 	}
+	const surface = editState.surface; // capture before nulling -- the teardown branch depends on it
 	editState = null;
-	inputEl.hidden = true;
-	inputEl.value = '';
-	inputEl.readOnly = false; // megaudit H1: clear the pending-commit lock so the next editor is editable
-	inputEl.style.clipPath = ''; // FE-2-0 polish: drop any body-pane clip so a future editor starts clean
+	if (surface === 'overlay') {
+		inputEl.hidden = true;
+		inputEl.value = '';
+		inputEl.readOnly = false; // megaudit H1: clear the pending-commit lock so the next editor is editable
+		inputEl.style.clipPath = ''; // FE-2-0 polish: drop any body-pane clip so a future editor starts clean
+	} else {
+		// W-G-1b formula bar: it is always visible (never hidden). Return it to display mode (readOnly) and
+		// restore the committed content via updateFormulaBar -- editState is already null, so its
+		// surface guard lets this write through. Do NOT clear/hide it.
+		formulaInputEl.readOnly = true;
+		updateFormulaBar();
+	}
 	clearCommitWatchdog(); // the editor is gone -- no pending commit to recover (re-audit HIGH)
 	clearError(); // closing the editor resolves any 'edit'-source banner (re-audit MED-4)
 }
 
+/**
+ * **W-G-1b** -- enter an edit in the FORMULA BAR (the single-active-editor model: the in-cell overlay stays
+ * closed). Mirrors {@link beginEdit}'s FE-megaudit-M8 pending guard + the oversize refusal, but the bar is
+ * always-visible, so there is no positioning / show -- it just flips `readOnly` off and becomes the live
+ * `editEl`. The bar already shows the active cell's content (via {@link updateFormulaBar}), which is the blur
+ * baseline. Triggered by focusing the bar (Excel: focusing the formula bar enters edit).
+ */
+function beginEditFormula(): void {
+	if (fullSnapshot === null || active === null) {
+		return;
+	}
+	if (editState !== null && editState.surface === 'formula') {
+		return; // already the live formula editor (a focus that never left)
+	}
+	if (editState !== null && editState.pendingCommit) {
+		return; // FE megaudit M8: never start a new edit while a commit is in flight
+	}
+	if (editState !== null) {
+		cancelEdit(); // an unchanged overlay edit still open -- close it before the bar takes over
+	}
+	const entry = renderer.entryAt(active.row, active.col);
+	const prior = priorCellContent(entry);
+	if (prior.oversize) {
+		// Refuse to edit an over-cap value in the bar (No-Fallbacks: never silently truncate). The bar keeps
+		// showing the '(value too large...)' placeholder and stays readOnly; the user can still copy it out.
+		showError(
+			`This cell's value is over the ${MAX_RAW_INPUT_LENGTH}-character editable limit, so it cannot be edited here.`,
+			'transient',
+		);
+		return;
+	}
+	formulaInputEl.readOnly = false;
+	editState = {
+		editEl: formulaInputEl,
+		surface: 'formula',
+		sheet: fullSnapshot.sheet,
+		row: active.row,
+		col: active.col,
+		entry,
+		initialValue: prior.text, // the displayed content == the blur baseline (megaudit MED-1: the prior value)
+		pendingCommit: false,
+	};
+}
+
 /** Re-position the open editor over its cell. Audit LOW-7: the gutter width can change on a theme/font
- * change, which shifts every cell's x -- a preserved editor must follow or it misaligns. */
+ * change, which shifts every cell's x -- a preserved editor must follow or it misaligns.
+ * W-G-1b: only the OVERLAY editor is positioned over a cell; a formula-bar edit is a no-op here. */
 function repositionEdit(): void {
-	if (editState === null) {
+	if (editState === null || editState.surface !== 'overlay') {
 		return;
 	}
 	const rect = cellContentRect(editState.row, editState.col, renderer.gutterWidthPx);
@@ -604,7 +678,9 @@ function repositionEdit(): void {
  * through to the band, as desired.
  */
 function updateEditClip(): void {
-	if (editState === null) {
+	// W-G-1b: only the overlay editor is a content-layer child that can slide under a sticky band; a
+	// formula-bar edit lives in the fixed bar above the grid and never needs clipping.
+	if (editState === null || editState.surface !== 'overlay') {
 		return;
 	}
 	const gutterW = renderer.gutterWidthPx;
@@ -636,9 +712,11 @@ function commitEdit(nav?: { dr: number; dc: number }): boolean {
 	}
 	// Audit C1-MED6: reject an over-length input HERE (visible error, editor stays open for the user to
 	// shorten) rather than serialize a multi-MB payload across the bridge for the host to reject anyway.
-	if (inputEl.value.length > MAX_RAW_INPUT_LENGTH) {
+	// W-G-1b: read from the live editor (`editEl` -- overlay or formula bar), the single committed source.
+	const editEl = editState.editEl;
+	if (editEl.value.length > MAX_RAW_INPUT_LENGTH) {
 		showError(
-			`Cell value is ${inputEl.value.length} characters, over the ${MAX_RAW_INPUT_LENGTH}-character limit. ` +
+			`Cell value is ${editEl.value.length} characters, over the ${MAX_RAW_INPUT_LENGTH}-character limit. ` +
 			`Shorten it and commit again.`,
 			'edit',
 		);
@@ -654,41 +732,48 @@ function commitEdit(nav?: { dr: number; dc: number }): boolean {
 	editState.commitId = commitId;
 	editState.navAfterCommit = nav;
 	editState.lastFailedRawInput = undefined; // megaudit B2: this is a fresh attempt, not the known-bad value
-	editState.submittedRawInput = inputEl.value; // re-audit HIGH: the value posted (for the late-ack guard)
+	editState.submittedRawInput = editEl.value; // re-audit HIGH: the value posted (for the late-ack guard)
 	// Megaudit H1: lock the input while the commit is in flight, so a keystroke before the ack can't be
 	// silently discarded when `resolvePendingCommit` closes the editor. Unlocked on resolve/error/cancel/watchdog.
-	inputEl.readOnly = true;
+	editEl.readOnly = true;
 	armCommitWatchdog(commitId); // re-audit HIGH: recover the editor if no commitResult/errorReply arrives
 	// Pessimistic: keep the input visible/focused until the host responds. FE-2-0 Phase 2: resolution is
 	// now driven ONLY by a matching `commitResult` (success -> resolvePendingCommit hides the editor +
 	// applies `nav`) or `errorReply` (failure -> decorate the cell + leave the editor open). A bare
 	// `render` no longer resolves -- so a sibling-panel render can't falsely close this editor.
-	vscode.postMessage({ type: 'putValue', sheet, row, col, rawInput: inputEl.value, commitId });
+	vscode.postMessage({ type: 'putValue', sheet, row, col, rawInput: editEl.value, commitId });
 	return true; // posted -> the editor is now pending
 }
+
+// **W-G-1b**: the three edit listeners below are SHARED by both edit surfaces -- the in-cell overlay
+// (`inputEl`) and the formula bar (`formulaInputEl`) -- and attached to both at the bottom of this block.
+// Each early-returns unless the event came from the CURRENTLY-LIVE editor (`ev.target === editState.editEl`),
+// so the inactive input is inert. This is what gives the formula bar the full commit/nav/known-bad/late-ack
+// behavior through the SAME code (the single-writer requirement) with no second putValue path.
 
 // Re-audit MED-4: clear the over-length ('edit') banner as soon as the user shortens the value back to
 // the cap, so the guidance disappears the moment it no longer applies (instead of lingering until the
 // next commit/cancel).
-inputEl.addEventListener('input', () => {
-	if (errorSource === 'edit' && inputEl.value.length <= MAX_RAW_INPUT_LENGTH) {
+function onEditInput(ev: Event): void {
+	if (editState === null || ev.target !== editState.editEl) {
+		return;
+	}
+	if (errorSource === 'edit' && editState.editEl.value.length <= MAX_RAW_INPUT_LENGTH) {
 		clearError();
 	}
 	// Megaudit re-audit LOW: ANY real edit clears the "known-bad" marker, so a value the user changed (even
 	// if changed back to the exact failed string) commits normally on Enter/Tab instead of being treated as
 	// "still bad" and abandoned. The arrow/Tab "leave a bad cell" affordance only applies to an UNTOUCHED
 	// failure (the moment after it fails); once you start correcting, arrows are caret + Enter commits.
-	if (editState !== null) {
-		editState.lastFailedRawInput = undefined;
-	}
-});
-inputEl.addEventListener('keydown', ev => {
+	editState.lastFailedRawInput = undefined;
+}
+function onEditKeydown(ev: KeyboardEvent): void {
 	// Audit MED-4: while an IME composition is active, Enter/Tab ACCEPT the candidate -- they must not
 	// commit/move the cell. Let the input handle composition natively until it completes.
 	if (ev.isComposing || ev.keyCode === 229) {
 		return;
 	}
-	if (editState === null) {
+	if (editState === null || ev.target !== editState.editEl) {
 		return;
 	}
 	if (ev.key === 'Escape') {
@@ -721,7 +806,7 @@ inputEl.addEventListener('keydown', ev => {
 	// trying to leave a known-bad cell. ABANDON the edit + navigate on ANY nav key (arrow / Tab / Enter) --
 	// never re-post the same failing value (that was the Tab re-fail loop). A CHANGED value falls through
 	// and commits (the user fixed it). This is what lets arrows AND Tab "get you out" of a bad formula.
-	if (editState.lastFailedRawInput !== undefined && inputEl.value === editState.lastFailedRawInput) {
+	if (editState.lastFailedRawInput !== undefined && editState.editEl.value === editState.lastFailedRawInput) {
 		ev.preventDefault();
 		const { row, col } = editState;
 		cancelEdit();
@@ -738,16 +823,16 @@ inputEl.addEventListener('keydown', ev => {
 	}
 	ev.preventDefault();
 	commitEdit(vec); // Enter = commit + down; Tab = commit + right (Shift+Tab left)
-});
-inputEl.addEventListener('blur', () => {
+}
+function onEditBlur(ev: FocusEvent): void {
 	// **FE-2-0 polish (2026-06-05)**: blur COMMITS a changed value (Excel: clicking / Tabbing away saves
 	// your edit) but CANCELS an unchanged one. A pending commit is left to resolve on the host reply (as
 	// before). NOTE: cancelEdit()/resolvePendingCommit() null `editState` BEFORE hiding the input, so the
 	// blur THEY trigger early-returns here (editState === null) -- this only fires on a genuine focus-out.
-	if (editState === null || editState.pendingCommit) {
+	if (editState === null || editState.pendingCommit || ev.target !== editState.editEl) {
 		return;
 	}
-	const value = inputEl.value;
+	const value = editState.editEl.value;
 	const changed = value !== editState.initialValue;
 	// Still EXACTLY the value that just failed to commit (untouched since the errorReply): committing would
 	// re-post the same rejected value (the B2 re-fail loop). Abandon instead -- mirrors the B2 nav affordance.
@@ -774,6 +859,19 @@ inputEl.addEventListener('blur', () => {
 	// Unchanged or known-bad -> abandon the edit outright.
 	cancelEdit();
 	redraw();
+}
+
+// W-G-1b: attach the shared edit listeners to BOTH surfaces. The overlay (`inputEl`) and the formula bar
+// (`formulaInputEl`) run the same commit/nav/blur logic; each handler keys off `editState.editEl`, so only
+// the live editor acts. Focusing the formula bar enters an edit (Excel: the formula bar is an edit surface).
+inputEl.addEventListener('input', onEditInput);
+inputEl.addEventListener('keydown', onEditKeydown);
+inputEl.addEventListener('blur', onEditBlur);
+formulaInputEl.addEventListener('input', onEditInput);
+formulaInputEl.addEventListener('keydown', onEditKeydown);
+formulaInputEl.addEventListener('blur', onEditBlur);
+formulaInputEl.addEventListener('focus', () => {
+	beginEditFormula();
 });
 
 // --- Canvas pointer: single click SELECTS, double click EDITS (FE-2-0 polish 2026-06-05) ---
@@ -1060,7 +1158,7 @@ function resolvePendingCommit(commitId: number): void {
 	// cleared) and the user has since typed a correction, a genuinely-LATE success ack must NOT close the
 	// editor + discard that typing. Only honor a late ack when the editor still shows the submitted value.
 	// (On the normal fast path `pendingCommit` is still true, so this is skipped.)
-	if (!editState.pendingCommit && inputEl.value !== editState.submittedRawInput) {
+	if (!editState.pendingCommit && editState.editEl.value !== editState.submittedRawInput) {
 		return;
 	}
 	clearCommitWatchdog(); // resolved -- cancel the recovery net (cancelEdit below also clears it)
@@ -1107,7 +1205,13 @@ window.addEventListener('message', (event: MessageEvent) => {
 				if (editState.pendingCommit) {
 					editState.pendingCommit = false;
 					editState.navAfterCommit = undefined;
-					inputEl.readOnly = false; // megaudit H1: unlock the editor we just un-stuck
+					editState.editEl.readOnly = false; // megaudit H1: unlock the editor we just un-stuck
+					// W-G-1b (Codex MED): refocus the un-stuck editor, mirroring the watchdog + errorReply
+					// recovery paths. The document keyhandler is inert while `editState !== null`, so without
+					// this an editor un-stuck after a blur-commit (focus already left the input) would strand
+					// the keyboard until a mouse click. Matters most for the formula bar (a bare bar gives no
+					// visual "still editing" cue); also closes the same latent gap for the overlay.
+					editState.editEl.focus();
 					clearCommitWatchdog(); // we un-stuck manually -- the watchdog is no longer needed
 				}
 			}
@@ -1157,12 +1261,12 @@ window.addEventListener('message', (event: MessageEvent) => {
 			editState !== null &&
 			typeof er.commitId === 'number' &&
 			editState.commitId === er.commitId &&
-			(editState.pendingCommit || inputEl.value === editState.submittedRawInput)
+			(editState.pendingCommit || editState.editEl.value === editState.submittedRawInput)
 		) {
 			editState.pendingCommit = false;
 			editState.navAfterCommit = undefined; // the commit failed -- do not advance the selection
-			editState.lastFailedRawInput = inputEl.value; // megaudit B2: a nav key may now leave the bad cell
-			inputEl.readOnly = false; // H1: unlock for correction
+			editState.lastFailedRawInput = editState.editEl.value; // megaudit B2: a nav key may now leave the bad cell
+			editState.editEl.readOnly = false; // H1: unlock for correction
 			clearCommitWatchdog(); // the host responded (with a failure) -- no recovery needed
 			// **Audit LOW (2026-06-05)**: realign the selection with the editor demanding attention. A
 			// blur-commit can fail AFTER a click moved `active` to another cell -- without this, the editor
@@ -1178,8 +1282,8 @@ window.addEventListener('message', (event: MessageEvent) => {
 			updateEditClip(); // megaudit LOW: ensureActiveVisible may have scrolled -- re-clip the still-open editor
 			// Megaudit B2: refocus + select so a retype REPLACES the bad value, and surface the way out
 			// (the user reflexively tries arrows/Tab -- those now leave the cell; spell it out anyway).
-			inputEl.focus();
-			inputEl.select();
+			editState.editEl.focus();
+			editState.editEl.select();
 			showError(
 				'Cell rejected -- [' + String(er.code) + '] ' + String(er.message) +
 				'. Fix it and press Enter, or press Esc / an arrow key to discard.',
