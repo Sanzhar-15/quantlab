@@ -27,7 +27,7 @@
  * - `panel.webview.postMessage` -> wired as `DispatchDeps.onError`.
  */
 
-import type { CellSnapshotJson, CollabSessionInstance, EventJson, FormatIdJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SessionCellValueInput, SessionInstance, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
+import type { CellSnapshotJson, CollabSessionInstance, EventJson, FormatIdJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SessionCellValueInput, SessionInstance, SessionOpJson, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
 import { assertSupportedSchemaVersion, parseQuantbookError, recalcDirtyChecked, setFormulaValidated, setValueValidated } from '../session';
 
 /**
@@ -99,6 +99,21 @@ export interface PutValueRequest {
 	 * pre-token wire + tests that post bare envelopes.
 	 */
 	commitId?: number;
+}
+
+/**
+ * **FE-1.5 W-G copy/paste + fill (2026-06-08)** -- a MULTI-cell write (webview -> host). Paste and fill
+ * are fire-and-forget (no open editor to un-stick, so unlike {@link PutValueRequest} there is no
+ * `commitId` / pending-commit dance): the host writes every cell atomically via `Session.batch` (one
+ * undo unit), recalcs, and re-renders. `undoLabel` names the undo step ("Paste" / "Fill"); each cell's
+ * `rawInput` is classified exactly like a single `putValue` (`=`-prefix -> formula, else literal, empty
+ * -> clear). The batch is ALL-OR-NOTHING: any invalid cell rejects the whole op loudly (No-Fallbacks).
+ */
+export interface PutCellsRequest {
+	type: 'putCells';
+	sheet: number;
+	cells: { row: number; col: number; rawInput: string }[];
+	undoLabel?: string;
 }
 
 /**
@@ -282,6 +297,53 @@ export function classifyCellInput(raw: string): SessionCellValueInput {
 	// `raw` here meant `"  hi  "` round-tripped as a text cell with surrounding
 	// whitespace while `"  5  "` became the clean number 5 -- an inconsistency.
 	return { kind: 'text', text: trimmed };
+}
+
+/**
+ * **FE-1.5 W-G copy/paste + fill** -- upper bound on a single {@link PutCellsRequest} batch (a paste/fill
+ * is bounded by the selection size; this caps a tampered/runaway bundle before the engine parses every
+ * op synchronously). A 1000-row x 100-col region is well under it.
+ */
+export const MAX_BATCH_CELLS = 100_000;
+
+/**
+ * **FE-1.5 W-G copy/paste + fill** -- map a multi-cell `putCells` request to validated `Session.batch`
+ * ops, classifying each cell's `rawInput` exactly like a single `putValue` (`=`-prefix -> `setFormula`
+ * with the body; empty/whitespace -> `clear`; else a literal `setValue` via {@link classifyCellInput}).
+ * Pure (no session) so it is unit-tested headlessly. THROWS a structured `[bad_argument]` error on the
+ * FIRST invalid cell (empty batch, over-cap count, non-string/over-length input, or an out-of-extent
+ * coord) -- the caller rejects the whole batch, never a partial write (No-Fallbacks + batch atomicity).
+ */
+export function buildBatchOps(sheet: number, cells: readonly { row: number; col: number; rawInput: string }[]): SessionOpJson[] {
+	if (cells.length === 0) {
+		throw new Error('[bad_argument] putCells: the batch is empty.');
+	}
+	if (cells.length > MAX_BATCH_CELLS) {
+		throw new Error(`[bad_argument] putCells: ${cells.length} cells exceeds the ${MAX_BATCH_CELLS}-cell batch limit.`);
+	}
+	const ops: SessionOpJson[] = [];
+	for (const c of cells) {
+		if (typeof c.rawInput !== 'string') {
+			throw new Error(`[bad_argument] putCells: cell (row ${c.row}, col ${c.col}) rawInput must be a string, got ${typeof c.rawInput}.`);
+		}
+		if (c.rawInput.length > MAX_RAW_INPUT_LENGTH) {
+			throw new Error(`[bad_argument] putCells: cell (row ${c.row}, col ${c.col}) rawInput is ${c.rawInput.length} chars, exceeding the ${MAX_RAW_INPUT_LENGTH}-char limit.`);
+		}
+		if (!Number.isInteger(c.row) || c.row < 0 || c.row >= A1_MAX_ROWS || !Number.isInteger(c.col) || c.col < 0 || c.col >= A1_MAX_COLS) {
+			throw new Error(`[bad_argument] putCells: cell (row ${c.row}, col ${c.col}) is outside the A1 grid extent (${A1_MAX_ROWS}x${A1_MAX_COLS}).`);
+		}
+		if (c.rawInput.trimStart().startsWith('=')) {
+			ops.push({ kind: 'setFormula', sheet, row: c.row, col: c.col, text: c.rawInput.trimStart().slice(1) });
+		} else {
+			const value = classifyCellInput(c.rawInput);
+			if (value.kind === 'blank') {
+				ops.push({ kind: 'clear', sheet, row: c.row, col: c.col });
+			} else {
+				ops.push({ kind: 'setValue', sheet, row: c.row, col: c.col, value });
+			}
+		}
+	}
+	return ops;
 }
 
 /**
@@ -476,6 +538,41 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			focusRow: sel.focusRow,
 			focusCol: sel.focusCol,
 		});
+		return;
+	}
+	// **FE-1.5 W-G copy/paste + fill (2026-06-08)**: a multi-cell atomic write (paste / fill). No open
+	// editor backs it, so there is no commitId/pending-commit to resolve -- the host writes every cell in
+	// ONE `Session.batch` (a single undo unit), recalcs, and re-renders via onCommit. A failure (bad
+	// envelope, an off-extent / over-length cell, or an engine batch reject) is surfaced via
+	// onOperationError (a toast -- there is no cell editor to un-stick), never silently dropped
+	// (No-Fallbacks). The batch is all-or-nothing, so a single bad cell applies NOTHING.
+	if (msg.type === 'putCells') {
+		const req = raw as PutCellsRequest;
+		const label = typeof req.undoLabel === 'string' && req.undoLabel.length > 0 ? req.undoLabel : 'Edit cells';
+		if (req.sheet !== deps.sheet) {
+			deps.onOperationError?.(`[${label}] [bad_argument] putCells sheet ${req.sheet} does not match this panel's sheet ${deps.sheet}; nothing was applied.`);
+			return;
+		}
+		if (!Array.isArray(req.cells)) {
+			deps.onOperationError?.(`[${label}] [bad_argument] putCells: cells must be an array; nothing was applied.`);
+			return;
+		}
+		let ops: SessionOpJson[];
+		try {
+			ops = buildBatchOps(req.sheet, req.cells);
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			deps.onOperationError?.(`[${label}] [${info.code}] ${info.message}`);
+			return;
+		}
+		try {
+			deps.session.batch(ops, { undoLabel: label });
+			recalcDirtyChecked(deps.session);
+			deps.onCommit();
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			deps.onOperationError?.(`[${label}] [${info.code}] ${info.message}`);
+		}
 		return;
 	}
 	if (msg.type !== 'putValue') {

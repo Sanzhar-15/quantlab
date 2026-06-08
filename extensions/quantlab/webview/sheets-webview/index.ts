@@ -41,6 +41,7 @@ import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { clampDisplayString, formatCellValue } from './cellRender';
 import { CanvasGridRenderer, type ActiveCell, type PublishedRange } from './canvasGrid';
 import { computeScrollBlitA1, diffSnapshotsA1, errorRowsFlippedA1, staleTintKeysA1, type ScrollState } from './gridBlitA1';
+import { planPaste, type GridClipboard } from './clipboardLogic';
 import {
 	COL_WIDTH,
 	HEADER_HEIGHT,
@@ -201,6 +202,10 @@ const errorCells = new Map<string, string>();
 // not clear the badge). Threaded into every `renderer.draw*` call alongside `errorCells`.
 let publishedRanges: PublishedRange[] = [];
 let publishedRangesKey = '';
+// **W-G copy/paste**: the internal grid clipboard (a copied/cut rectangle's underlying content). Set by
+// Ctrl/Cmd+C (isCut=false) / Ctrl/Cmd+X (isCut=true), consumed by Ctrl/Cmd+V. `null` = nothing copied.
+// Internal-only for v1 (no OS-clipboard interop); persists across renders + sheet switches like Excel.
+let gridClipboard: GridClipboard | null = null;
 // The active (selected) cell -- the FOCUS of the selection. Starts at A1 (like Excel) so the grid
 // always shows a selection. `active` is the editable/formula-bar cell; all single-cell logic keys off it.
 let active: ActiveCell | null = { row: 0, col: 0 };
@@ -511,6 +516,60 @@ function currentSelection(): SelectionRect | null {
 		return null;
 	}
 	return selectionRect(anchor, active);
+}
+
+/**
+ * **W-G copy/paste** -- snapshot the current selection (or the single active cell) into the internal grid
+ * {@link gridClipboard}. Each copied cell holds its UNDERLYING content (formula-with-`=` or literal) read
+ * via {@link priorCellContent}; an oversize cell copies as empty (it is never materialized -- the same
+ * oversize discipline as editing). `isCut` requests move semantics for the next paste (no immediate
+ * clear). v1 cut (documented): internal only; no marching-ants overlay.
+ */
+function copyGridSelection(isCut: boolean): void {
+	if (fullSnapshot === null || active === null) {
+		return;
+	}
+	const sel = currentSelection();
+	const top = sel === null ? active.row : sel.minRow;
+	const left = sel === null ? active.col : sel.minCol;
+	const rows = sel === null ? 1 : sel.maxRow - sel.minRow + 1;
+	const cols = sel === null ? 1 : sel.maxCol - sel.minCol + 1;
+	const cells: { rawInput: string }[][] = [];
+	for (let r = 0; r < rows; r += 1) {
+		const rowCells: { rawInput: string }[] = [];
+		for (let c = 0; c < cols; c += 1) {
+			const pc = priorCellContent(renderer.entryAt(top + r, left + c));
+			rowCells.push({ rawInput: pc.oversize ? '' : pc.text });
+		}
+		cells.push(rowCells);
+	}
+	gridClipboard = { top, left, rows, cols, cells, isCut };
+}
+
+/**
+ * **W-G copy/paste** -- paste {@link gridClipboard} into the current selection: {@link planPaste} computes
+ * the (ref-translated) target writes, which are sent as ONE atomic `putCells` batch (a single undo unit;
+ * the host validates extent + applies). A cut is consumed by its paste (move): the clipboard is cleared so
+ * a second paste does not re-clear the -- now moved -- source. No-op when nothing is on the clipboard.
+ */
+function pasteGridClipboard(): void {
+	if (fullSnapshot === null || active === null || gridClipboard === null) {
+		return;
+	}
+	const sel = currentSelection();
+	const selTop = sel === null ? active.row : sel.minRow;
+	const selLeft = sel === null ? active.col : sel.minCol;
+	const selRows = sel === null ? 1 : sel.maxRow - sel.minRow + 1;
+	const selCols = sel === null ? 1 : sel.maxCol - sel.minCol + 1;
+	const cells = planPaste(gridClipboard, selTop, selLeft, selRows, selCols);
+	if (cells.length === 0) {
+		return;
+	}
+	const undoLabel = gridClipboard.isCut ? 'Cut' : 'Paste';
+	vscode.postMessage({ type: 'putCells', sheet: fullSnapshot.sheet, cells, undoLabel });
+	if (gridClipboard.isCut) {
+		gridClipboard = null;
+	}
 }
 
 /** **Megaudit (B2)** -- the selection delta for a commit/nav key, or `null` for any other key. Enter and
@@ -1155,7 +1214,25 @@ document.addEventListener('keydown', ev => {
 			vscode.postMessage({ type: 'redo' });
 			return;
 		}
-		return; // leave other meta combos (copy, etc.) alone
+		// W-G copy/paste: Ctrl/Cmd + C (copy) / X (cut) / V (paste) on the grid selection. Reached only when
+		// NOT editing and NOT focused in the formula bar (both guarded at the top of this handler), so a
+		// native text copy/paste inside an input is unaffected.
+		if (k === 'c') {
+			ev.preventDefault();
+			copyGridSelection(false);
+			return;
+		}
+		if (k === 'x') {
+			ev.preventDefault();
+			copyGridSelection(true);
+			return;
+		}
+		if (k === 'v') {
+			ev.preventDefault();
+			pasteGridClipboard();
+			return;
+		}
+		return; // leave other meta combos alone
 	}
 	if (ev.altKey) {
 		return;

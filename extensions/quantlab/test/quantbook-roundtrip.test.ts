@@ -2330,7 +2330,7 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 // Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
 // ============================================================================
 
-import { acquireWorkbookSnapshotViaDelta, buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyCellInput, classifyPollTick, classifySwitchSheetTarget, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, mergeWorkbookDelta, parseCellRawInput, resolveCommandTargetPanel, validatePresenceNumeric, type DeltaSnapshotCache, type ErrorReplyMessage, type GridSelection } from '../src/quantbook/cellGrid/cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, buildBatchOps, buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyCellInput, classifyPollTick, classifySwitchSheetTarget, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, MAX_BATCH_CELLS, mergeWorkbookDelta, parseCellRawInput, resolveCommandTargetPanel, validatePresenceNumeric, type DeltaSnapshotCache, type ErrorReplyMessage, type GridSelection } from '../src/quantbook/cellGrid/cellGridLogic';
 
 suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
 	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
@@ -2735,6 +2735,131 @@ suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', f
 //   and the extractSheetSnapshot blank-cell throw.
 // These pin the No-Fallbacks edit semantics that the FE megaudit verified.
 // ============================================================================
+
+// ============================================================================
+// FE-1.5 W-G copy/paste + fill -- the multi-cell batch write (buildBatchOps pure + the putCells arm)
+// ============================================================================
+suite('FE-1.5 W-G -- buildBatchOps (pure)', function () {
+	test('classifies each cell: formula (= -> setFormula body), number/text literal -> setValue, empty -> clear', () => {
+		const ops = buildBatchOps(0, [
+			{ row: 0, col: 0, rawInput: '5' },
+			{ row: 0, col: 1, rawInput: '=A1*2' },
+			{ row: 1, col: 0, rawInput: 'hello' },
+			{ row: 1, col: 1, rawInput: '' },
+		]);
+		assert.deepStrictEqual(ops, [
+			{ kind: 'setValue', sheet: 0, row: 0, col: 0, value: { kind: 'number', number: 5 } },
+			{ kind: 'setFormula', sheet: 0, row: 0, col: 1, text: 'A1*2' },
+			{ kind: 'setValue', sheet: 0, row: 1, col: 0, value: { kind: 'text', text: 'hello' } },
+			{ kind: 'clear', sheet: 0, row: 1, col: 1 },
+		]);
+	});
+	test('an empty batch throws [bad_argument]', () => {
+		assert.throws(() => buildBatchOps(0, []), /\[bad_argument\].*empty/);
+	});
+	test('over the cell cap throws [bad_argument] (atomic: nothing built)', () => {
+		const tooMany = Array.from({ length: MAX_BATCH_CELLS + 1 }, (_unused, i) => ({ row: i, col: 0, rawInput: '1' }));
+		assert.throws(() => buildBatchOps(0, tooMany), /\[bad_argument\].*exceeds/);
+	});
+	test('an out-of-extent coord throws (the whole batch is rejected, not partially built)', () => {
+		assert.throws(() => buildBatchOps(0, [
+			{ row: 0, col: 0, rawInput: '1' },
+			{ row: 1_048_576, col: 0, rawInput: '2' }, // row == A1_MAX_ROWS -> out of extent
+		]), /\[bad_argument\].*extent/);
+	});
+	test('an over-length rawInput throws', () => {
+		const big = 'x'.repeat(8193);
+		assert.throws(() => buildBatchOps(0, [{ row: 0, col: 0, rawInput: big }]), /\[bad_argument\].*char/);
+	});
+});
+
+suite('FE-1.5 W-G -- dispatchIncomingMessage putCells (atomic multi-cell write)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	function freshSession(): SessionInstance {
+		const s = createWorkbookSession();
+		s.addSheet('S', 1000);
+		return s;
+	}
+	function cellAt(session: SessionInstance, sheet: number, row: number, col: number) {
+		return extractSheetSnapshot(session.snapshot(), sheet)?.entries.find(e => e.row === row && e.col === col);
+	}
+	function makeDeps(session: SessionInstance, sheet: number) {
+		const opErrors: string[] = [];
+		let commitCount = 0;
+		const deps = {
+			session,
+			sheet,
+			onCommit: () => { commitCount += 1; },
+			onError: () => { /* unused for putCells */ },
+			onOperationError: (m: string) => { opErrors.push(m); },
+		};
+		return { deps, opErrors, getCommitCount: () => commitCount };
+	}
+
+	test('writes all cells atomically (one onCommit), recomputing a pasted formula', () => {
+		const session = freshSession();
+		const { deps, opErrors, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage({
+			type: 'putCells', sheet: 0, undoLabel: 'Paste',
+			cells: [
+				{ row: 0, col: 0, rawInput: '5' },
+				{ row: 0, col: 1, rawInput: '=A1*2' },
+				{ row: 1, col: 0, rawInput: 'note' },
+			],
+		}, deps);
+		assert.strictEqual(opErrors.length, 0, 'no operation error');
+		assert.strictEqual(getCommitCount(), 1, 'one render for the whole batch');
+		assert.deepStrictEqual(cellAt(session, 0, 0, 0)?.value, { kind: 'number', value: 5 });
+		assert.deepStrictEqual(cellAt(session, 0, 0, 1)?.value, { kind: 'number', value: 10 }, 'pasted formula recomputed');
+		assert.deepStrictEqual(cellAt(session, 0, 1, 0)?.value, { kind: 'text', value: 'note' });
+	});
+
+	test('undo reverts the whole batch as ONE unit', () => {
+		const session = freshSession();
+		const { deps } = makeDeps(session, 0);
+		dispatchIncomingMessage({
+			type: 'putCells', sheet: 0, undoLabel: 'Paste',
+			cells: [
+				{ row: 0, col: 0, rawInput: '1' },
+				{ row: 0, col: 1, rawInput: '2' },
+				{ row: 0, col: 2, rawInput: '3' },
+			],
+		}, deps);
+		const undone = session.undo();
+		assert.strictEqual(undone.consumed, true, 'the batch is undoable');
+		assert.strictEqual(cellAt(session, 0, 0, 0), undefined, 'cell 1 reverted');
+		assert.strictEqual(cellAt(session, 0, 0, 1), undefined, 'cell 2 reverted');
+		assert.strictEqual(cellAt(session, 0, 0, 2), undefined, 'cell 3 reverted -> one undo unit');
+	});
+
+	test('an out-of-extent cell rejects the WHOLE batch (no partial write, onOperationError)', () => {
+		const session = freshSession();
+		const { deps, opErrors, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage({
+			type: 'putCells', sheet: 0, undoLabel: 'Fill',
+			cells: [
+				{ row: 0, col: 0, rawInput: '1' },
+				{ row: 1_048_576, col: 0, rawInput: '2' }, // off-extent -> whole batch rejected
+			],
+		}, deps);
+		assert.strictEqual(getCommitCount(), 0, 'nothing committed');
+		assert.strictEqual(opErrors.length, 1, 'one operation-error toast');
+		assert.ok(opErrors[0].includes('[Fill]') && opErrors[0].includes('extent'), opErrors[0]);
+		assert.strictEqual(cellAt(session, 0, 0, 0), undefined, 'the valid sibling was NOT written (atomic)');
+	});
+
+	test('a sheet mismatch is rejected with no commit', () => {
+		const session = freshSession();
+		const { deps, opErrors, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage({ type: 'putCells', sheet: 99, cells: [{ row: 0, col: 0, rawInput: '1' }] }, deps);
+		assert.strictEqual(getCommitCount(), 0);
+		assert.strictEqual(opErrors.length, 1);
+		assert.ok(opErrors[0].includes('does not match'), opErrors[0]);
+	});
+});
 
 suite('FE megaudit S5 -- classifyCellInput (pure)', function () {
 	test('blank + whitespace-only -> {kind:blank} (clears the cell)', () => {
