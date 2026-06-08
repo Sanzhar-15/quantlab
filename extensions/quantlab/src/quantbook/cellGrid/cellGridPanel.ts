@@ -45,6 +45,7 @@ import * as vscode from 'vscode';
 import type { QuantbookCellSnapshot, SessionInstance, WorkbookSnapshotJson } from '../types';
 import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, type CommitResultMessage, type GridSelection } from './cellGridLogic';
 import { getNonce, getWebviewUri } from '../../utils/webview';
+import type { PublishedRange } from '../reactiveKernel/publishedCellsStore';
 
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
 
@@ -77,6 +78,14 @@ const READY_WATCHDOG_MS = 6000;
 const allPanels: Set<CellGridPanel> = new Set();
 const bySession: Map<SessionInstance, Map<number, CellGridPanel>> = new Map();
 let focusedPanel: CellGridPanel | undefined;
+
+/**
+ * **FE-1.5 W-G** -- a panel pulls the cells its session's published variables drive (the bound-cell
+ * badge) via this provider, registered by the reactive-kernel layer at activation. `undefined` (no
+ * reactive kernel wired, or post-deactivate) means "no badges" -- the render path stays unconditional.
+ */
+type PublishedCellsProvider = (session: SessionInstance, sheet: number) => PublishedRange[];
+let publishedCellsProvider: PublishedCellsProvider | undefined;
 
 // FE-1.5-1d-1: listeners fired right before a session's LAST panel closes + the owning Session is
 // closed. Lets a bound reactive kernel tear down (dispose) BEFORE session.close(), so no republish
@@ -351,6 +360,17 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **FE-1.5 W-G (2026-06-08)** -- register (or clear with `undefined`) the provider every panel consults
+	 * at render time for the cells its session's published variables drive (the bound-cell badge). The
+	 * reactive-kernel layer wires this to {@link ReactiveKernelManager.publishedCellsForSheet} at activation
+	 * and clears it on deactivate. A provider hook (not a direct manager import) keeps the panel decoupled
+	 * from the reactive layer, mirroring how that layer already calls {@link CellGridPanel.refreshSession}.
+	 */
+	static setPublishedCellsProvider(provider: PublishedCellsProvider | undefined): void {
+		publishedCellsProvider = provider;
+	}
+
+	/**
 	 * Tracks whether `panel.dispose()` has fired. `webview.postMessage` to a
 	 * disposed panel is silently dropped; the errorReply path checks this flag and
 	 * falls back to `showWarningMessage` so a late validation error stays visible.
@@ -562,7 +582,11 @@ export class CellGridPanel {
 		// dropped render like a dropped errorReply: a warning that the grid may be
 		// stale + how to recover (No-Fallbacks). postMessage resolves false / rejects
 		// when the channel can't accept the message.
-		this.panel.webview.postMessage({ type: 'render', snapshot: this.latestSnapshot }).then(
+		// W-G bound-cell indicator: query the cells this session's published variables drive on THIS sheet
+		// fresh on every post (covers both render() and the webviewReady re-send -- no stale-on-reload
+		// issue, unlike the webview->host selection). `[]` when no reactive kernel is wired to the session.
+		const publishedCells = publishedCellsProvider?.(this.session, this.sheet) ?? [];
+		this.panel.webview.postMessage({ type: 'render', snapshot: this.latestSnapshot, publishedCells }).then(
 			delivered => {
 				if (!delivered && !this._disposed) {
 					console.warn('[cellGrid] render postMessage was not delivered to the webview.');

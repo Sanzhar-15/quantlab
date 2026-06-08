@@ -210,7 +210,22 @@ export function registerReactiveKernelCommands(
 		}
 		assertReactiveTrusted();
 	};
-	const manager = new ReactiveKernelManager<SessionInstance>(gate, makeClientFactory(context, output));
+	const manager = new ReactiveKernelManager<SessionInstance>(
+		gate,
+		makeClientFactory(context, output),
+		// W-G: when a session's kernel is stopped or lost, its published-cells store is gone -- refresh the
+		// still-open panels so their bound-cell badges clear (the provider now returns []). Mirrors the
+		// onChanged refresh path; refreshSession is a no-op for a session whose panels have all closed.
+		(session) => {
+			CellGridPanel.refreshSession(session);
+		},
+	);
+
+	// W-G bound-cell indicator: let every CellGridPanel pull the cells its session's published variables
+	// drive (keeps the panel decoupled from the manager -- it knows only this provider signature, default
+	// none). Cleared on deactivate so a same-host re-activation does not leave a stale captured manager.
+	CellGridPanel.setPublishedCellsProvider((session, sheet) => manager.publishedCellsForSheet(session, sheet));
+	context.subscriptions.push({ dispose: () => CellGridPanel.setPublishedCellsProvider(undefined) });
 
 	// Tear a Session's kernel down when its LAST Cell Grid panel closes (before session.close()).
 	// The disposable is pushed so a same-host re-activation does not leak a stale listener (LOW fold).

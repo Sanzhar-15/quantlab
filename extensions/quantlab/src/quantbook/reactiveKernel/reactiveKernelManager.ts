@@ -18,6 +18,7 @@
 // (No-Fallbacks: an untrusted workspace throws, never silently spawns).
 
 import type { ReactiveOpResult } from './reactiveKernelClient';
+import type { PublishedRange } from './publishedCellsStore';
 
 /** The transport surface the manager drives (ReactiveKernelClient implements it; tests fake it). */
 export interface ReactiveKernelClientLike {
@@ -27,6 +28,8 @@ export interface ReactiveKernelClientLike {
 	close(): Promise<void>;
 	dispose(): Promise<void>;
 	onClose(listener: (err: Error | undefined) => void): void;
+	/** W-G bound-cell indicator: the cells each published variable drives on `sheet`. */
+	publishedCellsForSheet(sheet: number): PublishedRange[];
 }
 
 /**
@@ -42,10 +45,16 @@ export class ReactiveKernelManager<S = object> {
 	/**
 	 * @param assertTrusted throws (gate-first) when the workspace is not trusted to run kernel code.
 	 * @param clientFactory builds (does NOT start) a client bound to `session`.
+	 * @param onClientRemoved **W-G**: invoked (once) when a REGISTERED client is removed from the registry
+	 *   -- explicitly disposed (`disposeSession`) or lost on an unexpected close. The store dies with the
+	 *   client, so the host must refresh the session's still-open panels to clear now-orphaned bound-cell
+	 *   badges (else a stale marker lingers until some unrelated render). Not fired for a still-STARTING
+	 *   client (it published nothing) nor on `disposeAll` (deactivate -- panels are going away too).
 	 */
 	constructor(
 		private readonly assertTrusted: () => void,
 		private readonly clientFactory: (session: S) => ReactiveKernelClientLike,
+		private readonly onClientRemoved?: (session: S) => void,
 	) { }
 
 	/** Start (or reuse) the kernel for `session`. Trust-gated; rejects loud if spawn/bootstrap fails. */
@@ -66,6 +75,17 @@ export class ReactiveKernelManager<S = object> {
 		return this.clients.has(session);
 	}
 
+	/**
+	 * W-G bound-cell indicator: the cells each published variable drives on (`session`, `sheet`), for a
+	 * CellGridPanel to forward to its webview as badges. `[]` when no kernel is registered for the session
+	 * (a grid with no reactive notebook, or one whose kernel is only still-starting and has published
+	 * nothing yet) -- never throws, so the render path is unconditionally safe.
+	 */
+	publishedCellsForSheet(session: S, sheet: number): PublishedRange[] {
+		const client = this.clients.get(session);
+		return client === undefined ? [] : client.publishedCellsForSheet(sheet);
+	}
+
 	/** Dispose the kernel bound to `session` (no-op if none). Used on last-panel-close. Disposes a
 	 *  STILL-STARTING kernel too (cancels the in-flight ensure so it tears down + does not register). */
 	async disposeSession(session: S): Promise<void> {
@@ -78,6 +98,10 @@ export class ReactiveKernelManager<S = object> {
 		if (client !== undefined) {
 			this.clients.delete(session);
 			await client.dispose();
+			// W-G: the store died with the client -> refresh the session's panels so orphaned badges clear.
+			// (dispose() may fire the client's onClose, but the ensure() listener's `clients.get === client`
+			// guard is already false here, so onClientRemoved fires exactly once -- from this call.)
+			this.onClientRemoved?.(session);
 		}
 	}
 
@@ -117,6 +141,10 @@ export class ReactiveKernelManager<S = object> {
 				client.onClose(() => {
 					if (this.clients.get(session) === client) {
 						this.clients.delete(session);
+						// W-G: an UNEXPECTED close (crash/EOF) removed a live client -> refresh the session's
+						// panels so orphaned bound-cell badges clear. The guard above ensures this does NOT
+						// double-fire with disposeSession (which deletes first, so this branch is skipped then).
+						this.onClientRemoved?.(session);
 					}
 				});
 				await client.start();

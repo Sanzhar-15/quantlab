@@ -33,6 +33,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import * as readline from 'node:readline';
 
 import type { CellRangeJson, CellSnapshotJson, OperationStateJson } from '../types';
+import { PublishedCellsStore, type PublishedRange } from './publishedCellsStore';
 
 /** The minimal napi Session surface the client writes. `SessionInstance` satisfies it structurally. */
 export interface ReactiveSession {
@@ -132,6 +133,9 @@ export class ReactiveKernelClient {
 	private killed = false;
 	private readonly cellStdout: string[] = [];
 	private readonly closeListeners: Array<(err: Error | undefined) => void> = [];
+	// W-G bound-cell indicator: tracks which cells each published variable currently drives (recorded in
+	// applyRepublish, retracted on stale/refused at the op boundary). Read per-sheet by the CellGridPanel.
+	private readonly publishedCells = new PublishedCellsStore();
 
 	constructor(options: ReactiveKernelClientOptions) {
 		this.opts = {
@@ -233,8 +237,13 @@ export class ReactiveKernelClient {
 				}
 			}
 		}
-		// Repaint if ANY republish applied (even on a publish-then-raise cell), THEN rethrow.
-		if (result.republishCount > 0) {
+		// W-G bound-cell indicator: a publish that did NOT land (G3-refused -- the rollback above
+		// unpublished it) or a variable the kernel marked STALE drives nothing now, so drop its badge.
+		// Records happen per-frame in applyRepublish; retractions are applied here at the op boundary.
+		const boundSetChanged = this.retractBadges(result);
+		// Repaint if cell DATA changed (a republish landed, even on a publish-then-raise cell) OR the
+		// bound-set changed (a badge must clear though no value moved), THEN rethrow.
+		if (result.republishCount > 0 || boundSetChanged) {
 			this.opts.onChanged();
 		}
 		if (thrown) {
@@ -246,10 +255,34 @@ export class ReactiveKernelClient {
 	/** R7: signal an undo/redo epoch so the kernel marks every binding force_check. */
 	async epochChange(): Promise<ReactiveOpResult> {
 		const r = await this.sendOp('epoch_done', { type: 'epoch_change' });
-		if (r.republishCount > 0) {
+		const boundSetChanged = this.retractBadges(r);
+		if (r.republishCount > 0 || boundSetChanged) {
 			this.opts.onChanged();
 		}
 		return r;
+	}
+
+	/**
+	 * W-G bound-cell indicator: drop the badge for every variable that, this op, the kernel marked STALE
+	 * (deleted/undefined) or whose publish was G3-REFUSED (re-targeted onto a user formula -> it landed
+	 * nowhere). Returns whether the tracked set actually changed (so the caller repaints to clear the
+	 * badge even when no cell value moved). A name and its successful republish never co-occur in one op
+	 * (a variable publishes one target per run), so this never erases a fresh record.
+	 */
+	private retractBadges(result: ReactiveOpResult): boolean {
+		let changed = false;
+		for (const ref of result.refused) {
+			changed = this.publishedCells.markStale(ref.name) || changed;
+		}
+		for (const name of result.stale) {
+			changed = this.publishedCells.markStale(name) || changed;
+		}
+		return changed;
+	}
+
+	/** W-G: the cells each published variable drives on `sheet`, for the CellGridPanel's badge paint. */
+	publishedCellsForSheet(sheet: number): PublishedRange[] {
+		return this.publishedCells.rangesForSheet(sheet);
 	}
 
 	/** Graceful shutdown: ask the supervisor to close, require a `closed` frame AND a clean exit. */
@@ -435,6 +468,10 @@ export class ReactiveKernelClient {
 		this.opts.session.publishDataset(f.name, JSON.stringify({ values: f.values }), range);
 		this.recalcChecked();
 		this.pending!.republishCount++;
+		// W-G bound-cell indicator: the publish landed -- record (latest-wins) that `f.name` now drives
+		// `range` so the panel can badge it. In lockstep with republishCount++ (a frame that fails
+		// recalcChecked above neither counts nor badges); a G3 refusal returned before reaching here.
+		this.publishedCells.recordPublish(f.name, range);
 	}
 
 	// HIGH (1d-0 Codex fold): mirror the shipped `recalcDirtyChecked` (session.ts) -- a recalc that

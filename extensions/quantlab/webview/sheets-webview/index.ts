@@ -39,7 +39,7 @@
 
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { clampDisplayString, formatCellValue } from './cellRender';
-import { CanvasGridRenderer, type ActiveCell } from './canvasGrid';
+import { CanvasGridRenderer, type ActiveCell, type PublishedRange } from './canvasGrid';
 import { computeScrollBlitA1, diffSnapshotsA1, errorRowsFlippedA1, staleTintKeysA1, type ScrollState } from './gridBlitA1';
 import {
 	COL_WIDTH,
@@ -188,6 +188,14 @@ let fullSnapshot: QuantbookCellSnapshot | null = null;
 // "row,col" -> "[code] message" for cells whose last edit failed (errorReply). Map preserves the
 // structured error text for the hover tooltip.
 const errorCells = new Map<string, string>();
+// **W-G bound-cell indicator**: the published-target ranges for THIS sheet (host->webview, on every
+// `render`). Rebuilt + validated wholesale per render (the host sends the authoritative set), so a sheet
+// switch or retraction is reflected without incremental bookkeeping. `publishedRangesKey` is a canonical
+// digest used to detect a change between renders -- a change forces a FULL redraw (the damage fast path
+// only repaints rows whose VALUE changed, so a stale-only retraction with no value move would otherwise
+// not clear the badge). Threaded into every `renderer.draw*` call alongside `errorCells`.
+let publishedRanges: PublishedRange[] = [];
+let publishedRangesKey = '';
 // The active (selected) cell -- the FOCUS of the selection. Starts at A1 (like Excel) so the grid
 // always shows a selection. `active` is the editable/formula-bar cell; all single-cell logic keys off it.
 let active: ActiveCell | null = { row: 0, col: 0 };
@@ -341,7 +349,7 @@ function redraw(): void {
 	const v = currentViewport();
 	renderer.resize(v.cssW, v.cssH);
 	applyCanvasTransform(v.scrollTop, v.scrollLeft);
-	renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection());
+	renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection(), publishedRanges);
 	prevPaint = scrollStateNow(v);
 	updateFormulaBar(); // selection/content changed -> reflect the active cell in the formula bar
 	postSelectionIfChanged(); // W-G-2b: report the selection to the host (deduped)
@@ -393,9 +401,9 @@ function scrollRedraw(): void {
 	// selection to paint the range in the exposed strip / full-fallback.
 	const sel = currentSelection();
 	if (blit === null) {
-		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel);
+		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel, publishedRanges);
 	} else {
-		renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel);
+		renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel, publishedRanges);
 	}
 	prevPaint = next;
 }
@@ -1196,7 +1204,48 @@ function isValidSnapshot(snapshot: unknown): snapshot is QuantbookCellSnapshot {
  * panel / session refresh can't close or mis-resolve this editor) AND the errorCells-clear-on-idle-render
  * + (sheet,row,col) false-match items -- errorCells is now mutated only by a matching reply.
  */
-function applyRender(snapshot: QuantbookCellSnapshot): void {
+/**
+ * **W-G bound-cell indicator** -- rebuild {@link publishedRanges} from a `render` message's `publishedCells`
+ * field, validating each item at the trust boundary (mirrors the host selection-drop discipline: a
+ * malformed / out-of-extent / mis-ordered item is DROPPED with a `console.warn`, never blanking the grid
+ * or throwing). The host sends the authoritative set for this sheet on every render, so we rebuild
+ * wholesale. Returns whether the validated set CHANGED since the last render -- the caller forces a FULL
+ * redraw on a change, because the damage fast path repaints only rows whose VALUE moved and a stale-only
+ * retraction (badge clears, no value change) would otherwise leave the marker on screen.
+ */
+function rebuildPublishedRanges(raw: unknown): boolean {
+	const coordOk = (v: unknown, max: number): v is number =>
+		typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < max;
+	const next: PublishedRange[] = [];
+	if (Array.isArray(raw)) {
+		for (const item of raw) {
+			if (item === null || typeof item !== 'object') {
+				console.warn('[sheets-webview] dropped a non-object publishedCells item:', item);
+				continue;
+			}
+			const pr = item as { startRow?: unknown; startCol?: unknown; endRow?: unknown; endCol?: unknown; name?: unknown };
+			if (
+				coordOk(pr.startRow, MAX_ROWS) && coordOk(pr.endRow, MAX_ROWS) &&
+				coordOk(pr.startCol, MAX_COLS) && coordOk(pr.endCol, MAX_COLS) &&
+				pr.startRow <= pr.endRow && pr.startCol <= pr.endCol &&
+				typeof pr.name === 'string' && pr.name.length > 0
+			) {
+				next.push({ startRow: pr.startRow, startCol: pr.startCol, endRow: pr.endRow, endCol: pr.endCol, name: pr.name });
+			} else {
+				console.warn('[sheets-webview] dropped a malformed publishedCells item:', item);
+			}
+		}
+	} else if (raw !== undefined) {
+		console.warn('[sheets-webview] render.publishedCells was not an array; ignoring:', raw);
+	}
+	const key = next.map(r => r.startRow + ':' + r.startCol + ':' + r.endRow + ':' + r.endCol + ':' + r.name).join('|');
+	const changed = key !== publishedRangesKey;
+	publishedRanges = next;
+	publishedRangesKey = key;
+	return changed;
+}
+
+function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean): void {
 	// Re-audit MED-4: a valid render supersedes a TRANSIENT banner (malformed-render / un-editable cell)
 	// but must NOT hide an active 'edit' banner -- a sibling render repaints under an open editor whose
 	// over-length value is still invalid; clearing it would mask the bad pending state until next commit.
@@ -1237,8 +1286,10 @@ function applyRender(snapshot: QuantbookCellSnapshot): void {
 	// re-renders the whole session snapshot but only the edited cell's row repaints.
 	const v = currentViewport();
 	// `backingScaleStale` (Opus LOW-1): a dpr change with no CSS-size change skips resize() -> full redraw.
+	// W-G: a change in the published set forces the full path (`null`) -- the damage diff only covers rows
+	// whose value moved, so a badge that appears/clears/relocates without a value change needs a full redraw.
 	const damageRows =
-		renderer.painted && !renderer.backingScaleStale && scrollUnchangedSince(v)
+		renderer.painted && !renderer.backingScaleStale && scrollUnchangedSince(v) && !publishedChanged
 			? diffSnapshotsA1(prevSnapshot, snapshot)
 			: null;
 	if (damageRows === null) {
@@ -1248,7 +1299,7 @@ function applyRender(snapshot: QuantbookCellSnapshot): void {
 	// Scroll is unchanged (gated above), so the canvas transform + prevPaint stay valid; drawDamage is a
 	// no-op for an empty row set (nothing painted changed).
 	applyCanvasTransform(v.scrollTop, v.scrollLeft);
-	renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection());
+	renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection(), publishedRanges);
 	// The damage path bypasses redraw(); if the active cell's content changed (e.g. a commit re-render),
 	// the formula bar must still follow it.
 	updateFormulaBar();
@@ -1335,7 +1386,10 @@ window.addEventListener('message', (event: MessageEvent) => {
 			}
 			return;
 		}
-		applyRender(snapshot);
+		// W-G bound-cell indicator: validate + rebuild the published-cell badges for this sheet BEFORE
+		// applying the snapshot, so the same render paints both. A change in the set forces a full redraw.
+		const publishedChanged = rebuildPublishedRanges((msg as { publishedCells?: unknown }).publishedCells);
+		applyRender(snapshot, publishedChanged);
 		return;
 	}
 	if (msg.type === 'commitResult') {
@@ -1425,7 +1479,7 @@ window.addEventListener('message', (event: MessageEvent) => {
 		if (!activeMoved && renderer.painted && !renderer.backingScaleStale && scrollUnchangedSince(v)) {
 			const rows = errorRowsFlippedA1(prevErrorKeys, new Set(errorCells.keys()));
 			applyCanvasTransform(v.scrollTop, v.scrollLeft);
-			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection());
+			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection(), publishedRanges);
 		} else {
 			// A selection realign (activeMoved) repaints both the old + new selection rows -> full redraw.
 			redraw();

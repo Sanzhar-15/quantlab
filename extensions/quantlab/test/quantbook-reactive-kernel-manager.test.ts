@@ -16,11 +16,14 @@ import * as assert from 'assert';
 
 import { ReactiveKernelManager, type ReactiveKernelClientLike } from '../src/quantbook/reactiveKernel/reactiveKernelManager';
 import type { ReactiveOpResult } from '../src/quantbook/reactiveKernel/reactiveKernelClient';
+import type { PublishedRange } from '../src/quantbook/reactiveKernel/publishedCellsStore';
 
 class FakeClient implements ReactiveKernelClientLike {
 	started = false;
 	disposeCount = 0;
 	executed: string[] = [];
+	// W-G: per-sheet published ranges the test seeds to verify the manager delegates per (session, sheet).
+	publishedBySheet = new Map<number, PublishedRange[]>();
 	private closeListener: ((err: Error | undefined) => void) | undefined;
 	private startGate: Promise<void> | undefined;
 	private releaseStartGate: (() => void) | undefined;
@@ -54,6 +57,9 @@ class FakeClient implements ReactiveKernelClientLike {
 	}
 	async epochChange(): Promise<ReactiveOpResult> {
 		return { republishCount: 0, refused: [], stale: [] };
+	}
+	publishedCellsForSheet(sheet: number): PublishedRange[] {
+		return this.publishedBySheet.get(sheet) ?? [];
 	}
 	async close(): Promise<void> {
 		/* no-op fake */
@@ -287,5 +293,50 @@ suite('ReactiveKernelManager', () => {
 		assert.strictEqual(made[1].disposeCount, 1);
 		assert.strictEqual(mgr.hasKernel(a), false);
 		assert.strictEqual(mgr.hasKernel(b), false);
+	});
+
+	test('publishedCellsForSheet delegates to the session client per sheet; [] when no kernel', async () => {
+		const made: FakeClient[] = [];
+		const mgr = new ReactiveKernelManager<object>(
+			() => {},
+			() => {
+				const c = new FakeClient();
+				made.push(c);
+				return c;
+			},
+		);
+		const sess = {};
+		// No kernel registered yet for the session -> [] (the render path stays safe before any start).
+		assert.deepStrictEqual(mgr.publishedCellsForSheet(sess, 0), []);
+		await mgr.start(sess);
+		const ranges: PublishedRange[] = [{ startRow: 0, startCol: 1, endRow: 0, endCol: 1, name: 'x' }];
+		made[0].publishedBySheet.set(0, ranges);
+		assert.deepStrictEqual(mgr.publishedCellsForSheet(sess, 0), ranges, 'surfaces the client ranges for the sheet');
+		assert.deepStrictEqual(mgr.publishedCellsForSheet(sess, 1), [], 'another sheet has none');
+		assert.deepStrictEqual(mgr.publishedCellsForSheet({}, 0), [], 'an unknown session has no kernel');
+	});
+
+	test('onClientRemoved fires once on disposeSession and on an unexpected close (badge cleanup hook)', async () => {
+		const removed: object[] = [];
+		const made: FakeClient[] = [];
+		const mgr = new ReactiveKernelManager<object>(
+			() => {},
+			() => {
+				const c = new FakeClient();
+				made.push(c);
+				return c;
+			},
+			(s) => removed.push(s),
+		);
+		const a = {};
+		await mgr.start(a);
+		await mgr.disposeSession(a);
+		assert.deepStrictEqual(removed, [a], 'disposeSession of a registered client fires the hook once');
+
+		const b = {};
+		await mgr.start(b);
+		made[1].simulateClose(); // crash/EOF: the manager's onClose listener removes + fires the hook
+		assert.deepStrictEqual(removed, [a, b], 'an unexpected close fires the hook');
+		assert.strictEqual(mgr.hasKernel(b), false, 'the closed client is deregistered');
 	});
 });

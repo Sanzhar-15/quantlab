@@ -47,6 +47,9 @@ const CELL_PAD = 8;
 const OVERSCAN = 2;
 const MEASURE_CACHE_MAX = 5000;
 const SELECTION_BORDER_PX = 2;
+// W-G bound-cell indicator: side length (CSS px) of the filled corner triangle marking a cell a reactive
+// published variable drives. A small top-right marker (the Excel note-marker convention).
+const PUBLISHED_BADGE_PX = 7;
 
 /**
  * **FE-2-0 Phase 3 (2026-06-04)** -- when true, every partial paint ({@link CanvasGridRenderer.drawScroll}
@@ -66,6 +69,20 @@ const DAMAGE_CLIP_PAD = 1;
 export interface ActiveCell {
 	readonly row: number;
 	readonly col: number;
+}
+
+/**
+ * **FE-1.5 W-G** -- one published target range on the active sheet, in the host->webview wire shape
+ * (0-based, INCLUSIVE). The renderer paints a corner badge on each cell inside it. The webview defines
+ * this shape itself (the bundle is esbuild-isolated from host runtime); it mirrors the host
+ * `PublishedRange` and is validated at the message boundary before it reaches the renderer.
+ */
+export interface PublishedRange {
+	readonly startRow: number;
+	readonly startCol: number;
+	readonly endRow: number;
+	readonly endCol: number;
+	readonly name: string;
 }
 
 /**
@@ -140,6 +157,9 @@ interface Palette {
 	// W-G-2a: translucent fill painted over a multi-cell selection range (the focus cell keeps its
 	// crisp border on top). Must be translucent so cell contents show through.
 	rangeFill: string;
+	// W-G bound-cell indicator: the (opaque) accent for the top-right corner badge on a reactively
+	// published cell. A distinct hue from selectionBorder so a selected published cell shows both.
+	publishedBadge: string;
 }
 
 /** Renders a {@link QuantbookCellSnapshot} as an A1 grid onto a canvas. One instance per panel. */
@@ -293,9 +313,10 @@ export class CanvasGridRenderer {
 		errorCells: ReadonlyMap<string, string>,
 		active: ActiveCell | null,
 		selection: SelectionRect | null,
+		publishedRanges: readonly PublishedRange[],
 	): void {
 		this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges);
 		this.hasPaintedOnce = true;
 	}
 
@@ -317,6 +338,7 @@ export class CanvasGridRenderer {
 		errorCells: ReadonlyMap<string, string>,
 		active: ActiveCell | null,
 		selection: SelectionRect | null,
+		publishedRanges: readonly PublishedRange[],
 	): void {
 		const ctx = this.ctx;
 		const c = blit.copy;
@@ -332,12 +354,12 @@ export class CanvasGridRenderer {
 			ctx.beginPath();
 			ctx.rect(d.x, d.y, d.width, d.height);
 			ctx.clip();
-			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection);
+			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges);
 			ctx.restore();
 		}
 		this.hasPaintedOnce = true;
 		if (DEBUG_BLIT_VERIFY) {
-			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, 'drawScroll');
+			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, 'drawScroll');
 		}
 	}
 
@@ -358,6 +380,7 @@ export class CanvasGridRenderer {
 		errorCells: ReadonlyMap<string, string>,
 		active: ActiveCell | null,
 		selection: SelectionRect | null,
+		publishedRanges: readonly PublishedRange[],
 	): void {
 		if (rows.length === 0) {
 			return;
@@ -391,11 +414,11 @@ export class CanvasGridRenderer {
 		}
 		addBand(runStart, runEnd);
 		ctx.clip();
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges);
 		ctx.restore();
 		this.hasPaintedOnce = true;
 		if (DEBUG_BLIT_VERIFY) {
-			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, 'drawDamage');
+			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, 'drawDamage');
 		}
 	}
 
@@ -414,6 +437,7 @@ export class CanvasGridRenderer {
 		errorCells: ReadonlyMap<string, string>,
 		active: ActiveCell | null,
 		selection: SelectionRect | null,
+		publishedRanges: readonly PublishedRange[],
 		path: string,
 	): void {
 		const ctx = this.ctx;
@@ -421,7 +445,7 @@ export class CanvasGridRenderer {
 		const bh = this.canvas.height;
 		const partial = ctx.getImageData(0, 0, bw, bh);
 		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges);
 		const full = ctx.getImageData(0, 0, bw, bh);
 		const pa = partial.data;
 		const fu = full.data;
@@ -461,6 +485,7 @@ export class CanvasGridRenderer {
 		errorCells: ReadonlyMap<string, string>,
 		active: ActiveCell | null,
 		selection: SelectionRect | null,
+		publishedRanges: readonly PublishedRange[],
 	): void {
 		const ctx = this.ctx;
 		ctx.fillStyle = this.palette.background;
@@ -577,6 +602,33 @@ export class CanvasGridRenderer {
 			// Inset by half the border so the 2px stroke sits inside the cell rect.
 			const o = SELECTION_BORDER_PX / 2;
 			ctx.strokeRect(x + o, y + o, COL_WIDTH - SELECTION_BORDER_PX, ROW_HEIGHT - SELECTION_BORDER_PX);
+		}
+
+		// 4b. W-G bound-cell indicator: a small filled triangle in each published cell's TOP-RIGHT corner
+		// (the Excel note-marker convention). Painted AFTER the value + selection visuals (so it is never
+		// hidden) but BEFORE the sticky bands (item 5), which correctly cover a cell scrolled under them.
+		// Iterate each published range intersected with the visible window -- O(published cells in view),
+		// independent of the snapshot size; v1 publishes are single cells.
+		if (publishedRanges.length > 0) {
+			ctx.fillStyle = this.palette.publishedBadge;
+			for (const pr of publishedRanges) {
+				const r0 = Math.max(pr.startRow, rowRange.startIdx);
+				const r1 = Math.min(pr.endRow, rowRange.endIdx - 1);
+				const c0 = Math.max(pr.startCol, colRange.startIdx);
+				const c1 = Math.min(pr.endCol, colRange.endIdx - 1);
+				for (let r = r0; r <= r1; r += 1) {
+					const by = Math.round(rowY(r) - scrollTop);
+					for (let c = c0; c <= c1; c += 1) {
+						const right = Math.round(colX(c, gutterW) - scrollLeft) + COL_WIDTH;
+						ctx.beginPath();
+						ctx.moveTo(right - PUBLISHED_BADGE_PX, by);
+						ctx.lineTo(right, by);
+						ctx.lineTo(right, by + PUBLISHED_BADGE_PX);
+						ctx.closePath();
+						ctx.fill();
+					}
+				}
+			}
 		}
 
 		// 5. Sticky row gutter (covers cells that scrolled left under it), then header, then corner.
@@ -761,6 +813,9 @@ export class CanvasGridRenderer {
 			// The dimmed editor-selection color: themed AND typically translucent, so the range fill never
 			// hides cell values (translucent rgba fallback if the theme omits it).
 			rangeFill: v('--vscode-editor-inactiveSelectionBackground', 'rgba(9,71,113,0.25)'),
+			// W-G bound-cell badge: a "live data" green, distinct from the blue focus/selection border so a
+			// selected published cell shows both markers. Themed via the standard chart palette.
+			publishedBadge: v('--vscode-charts-green', '#89d185'),
 		};
 	}
 
