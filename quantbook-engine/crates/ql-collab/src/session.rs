@@ -255,6 +255,35 @@ enum CacheEffect {
         id: FormatId,
         string: Arc<str>,
     },
+    /// **HIGH-1 (megaudit, Codex) closure**: a structural row/column
+    /// insert/delete on `sheet`.  Pre-fix the cache walker dropped the
+    /// `Op::InsertRows/DeleteRows/InsertColumns/DeleteColumns` variants via
+    /// `collect_cache_effects`'s `_ => {}` arm (even when recursed inside a
+    /// `BatchCommit`), so `last_snapshot` kept STALE cell positions/values
+    /// after a structural edit.  `workbookSnapshot()` reads VALUES + positions
+    /// from this cache (formula TEXT comes from the replayed Workbook), so the
+    /// two disagreed → corruption.
+    ///
+    /// Apply: re-key every `last_snapshot` entry on `sheet` via
+    /// `ql_storage::AxisShift::map_public` (drop on `None` = deleted/off-grid).
+    /// Uses the SAME verified shift fn the storage layer's `apply_axis_shift`
+    /// uses, applied through the ONE shared walker so `append_op` and
+    /// `rebuild_snapshot_cache` cannot drift.
+    ///
+    /// NOTE: this effect deliberately does NOT re-key `cell_op_index` /
+    /// `sheet_op_index`.  Those buckets carry RAW op-log coordinates (the
+    /// indices point at ops whose `(sheet,row,col)` are pre-shift).  The undo
+    /// `invalidate_cell` fast path filters effects by `raw_key == target_key`,
+    /// which would break if the index keys were shifted while the op
+    /// coordinates were not.  Instead, `undo`/`redo` fall back to a full
+    /// `rebuild_snapshot_cache` whenever the visible log contains ANY
+    /// structural op (see `log_has_structural_op`), so `invalidate_cell` is
+    /// never used under a structural history.
+    AxisShift {
+        sheet: u16,
+        is_row: bool,
+        shift: ql_storage::AxisShift,
+    },
 }
 
 /// **Phase 5.7 V3.6.0.4 D3 (2026-05-23) -- bundle the 5 cache-walker
@@ -1478,6 +1507,46 @@ impl CollabSession {
                     string: Arc::<str>::from(string.as_str()),
                 });
             }
+            // **HIGH-1 (megaudit, Codex) closure**: structural row/column
+            // edits re-key the positional `last_snapshot` cache.  Map the
+            // op-log variant into the storage-layer `AxisShift` (the SAME type
+            // the verified `apply_axis_shift` uses).  Inside a `BatchCommit`,
+            // these are reached via the recursion above, BEFORE the batch's
+            // post-shift `PutFormula` effects, so existing cache cells shift
+            // first and the rewrites land on top (matching the producer's
+            // batch assembly order in ql-bindings-node).
+            Op::InsertRows { sheet, at, count } => out.push(CacheEffect::AxisShift {
+                sheet: *sheet,
+                is_row: true,
+                shift: ql_storage::AxisShift::Insert {
+                    at: *at,
+                    count: *count,
+                },
+            }),
+            Op::DeleteRows { sheet, start, end } => out.push(CacheEffect::AxisShift {
+                sheet: *sheet,
+                is_row: true,
+                shift: ql_storage::AxisShift::Delete {
+                    start: *start,
+                    end: *end,
+                },
+            }),
+            Op::InsertColumns { sheet, at, count } => out.push(CacheEffect::AxisShift {
+                sheet: *sheet,
+                is_row: false,
+                shift: ql_storage::AxisShift::Insert {
+                    at: *at,
+                    count: *count,
+                },
+            }),
+            Op::DeleteColumns { sheet, start, end } => out.push(CacheEffect::AxisShift {
+                sheet: *sheet,
+                is_row: false,
+                shift: ql_storage::AxisShift::Delete {
+                    start: *start,
+                    end: *end,
+                },
+            }),
             _ => {}
         }
     }
@@ -1526,6 +1595,13 @@ impl CollabSession {
             CacheEffect::RemoveSheet { .. } => None,
             CacheEffect::RestoreSheet { .. } => None,
             CacheEffect::RegisterFormat { .. } => None,
+            // **HIGH-1**: an AxisShift IS sheet-targeted.  Gating it through
+            // the tombstone check makes a structural edit on a tombstoned
+            // sheet a cache no-op, mirroring the storage replay's silent
+            // no-op for structural edits on tombstoned sheets
+            // (apply_structural).  The Workbook side did nothing; the cache
+            // must match.
+            CacheEffect::AxisShift { sheet, .. } => Some(*sheet),
         };
         if let Some(sheet) = target_sheet {
             if buckets.tombstones.contains(&sheet) {
@@ -1551,6 +1627,10 @@ impl CollabSession {
             CacheEffect::RemoveSheet { .. } => None,
             CacheEffect::RestoreSheet { .. } => None,
             CacheEffect::RegisterFormat { .. } => None,
+            // **HIGH-1**: AxisShift is sheet-level, not a single cell → no
+            // per-cell index push.  (It also does NOT re-key cell_op_index;
+            // see the AxisShift apply arm + the undo/redo structural gate.)
+            CacheEffect::AxisShift { .. } => None,
         };
         if let Some(key) = cell_key_for_index {
             let v = buckets.cell_op_index.entry(key).or_default();
@@ -1723,6 +1803,51 @@ impl CollabSession {
             // independent).
             CacheEffect::RegisterFormat { id, string } => {
                 buckets.format_cache.entry(id).or_insert(string);
+            }
+            // **HIGH-1 (megaudit, Codex) closure**: re-key every snapshot
+            // entry on `sheet` by the structural shift.  We reach here only if
+            // the sheet is NOT tombstoned (the `target_sheet` gate above
+            // early-returns otherwise — a no-op mirroring storage replay).
+            //
+            // Build a FRESH map and swap (collision-safe): an in-place shift
+            // could clobber a key that a surviving key maps onto (e.g. an
+            // insert moves r→r+1 while r+1 also survives).  `map_public` is
+            // injective on its surviving domain — Insert moves survivors to
+            // strictly higher coords, Delete drops the band and compresses —
+            // so no two survivors collide.  `None` (deleted / off-grid) drops
+            // the entry, matching `apply_axis_shift`'s formula_cells re-key.
+            //
+            // Entries on OTHER sheets are carried through untouched.  We do
+            // NOT touch `cell_op_index` / `sheet_op_index` here (see the
+            // AxisShift variant docstring + the undo/redo structural gate).
+            CacheEffect::AxisShift {
+                sheet,
+                is_row,
+                shift,
+            } => {
+                let axis_max = if is_row {
+                    ql_types::MAX_ROW
+                } else {
+                    ql_types::MAX_COLUMN
+                };
+                let mut next: HashMap<(u16, u32, u32), CellState> =
+                    HashMap::with_capacity(buckets.snapshot.len());
+                for ((s, r, c), state) in buckets.snapshot.drain() {
+                    if s != sheet {
+                        next.insert((s, r, c), state);
+                        continue;
+                    }
+                    let mapped = if is_row {
+                        shift.map_public(r, axis_max).map(|nr| (s, nr, c))
+                    } else {
+                        shift.map_public(c, axis_max).map(|nc| (s, r, nc))
+                    };
+                    if let Some(key) = mapped {
+                        next.insert(key, state);
+                    }
+                    // None → the cell was deleted / pushed off-grid → drop it.
+                }
+                *buckets.snapshot = next;
             }
         }
     }
@@ -2557,6 +2682,21 @@ impl CollabSession {
                     // tombstone effect; mirrors RemoveSheet.
                     CacheEffect::RestoreSheet { .. } => true,
                     CacheEffect::RegisterFormat { .. } => false,
+                    // **HIGH-1**: `invalidate_cell` is the partial undo/redo
+                    // path, which is NEVER taken while the visible log holds
+                    // a structural op (the undo/redo gate forces a full
+                    // `rebuild_snapshot_cache` instead).  An AxisShift effect
+                    // therefore cannot legitimately reach here.  debug_assert
+                    // surfaces a violated invariant loudly in tests rather
+                    // than silently mis-replaying; never silently skip.
+                    CacheEffect::AxisShift { .. } => {
+                        debug_assert!(
+                            false,
+                            "invalidate_cell reached an AxisShift effect; the undo/redo \
+                             structural-op gate should have forced a full rebuild"
+                        );
+                        false
+                    }
                 };
                 if apply {
                     Self::apply_cache_effect(&mut local_buckets, effect, op_log_index);
@@ -2657,6 +2797,48 @@ impl CollabSession {
             // cell-keyed walker.  Conservative fallback.
             _ => false,
         }
+    }
+
+    /// **HIGH-1 (megaudit, Codex) closure**: true iff `op` is a structural
+    /// row/column insert/delete, recursing into `BatchCommit` (the producer
+    /// always wraps a structural edit in a `BatchCommit { Insert/Delete, ...
+    /// PutFormula }`).
+    fn op_is_structural(op: &Op) -> bool {
+        match op {
+            Op::InsertRows { .. }
+            | Op::DeleteRows { .. }
+            | Op::InsertColumns { .. }
+            | Op::DeleteColumns { .. } => true,
+            Op::BatchCommit { ops } => ops.iter().any(Self::op_is_structural),
+            _ => false,
+        }
+    }
+
+    /// **HIGH-1 (megaudit, Codex) closure**: true iff the VISIBLE op log
+    /// contains ANY structural op.  Used by `undo` / `redo` to decide between
+    /// the partial `invalidate_cell` path and a full `rebuild_snapshot_cache`.
+    ///
+    /// Under a structural history the partial path is UNSOUND: the
+    /// `cell_op_index` keys carry post-shift positions (re-keyed alongside
+    /// `last_snapshot`'s shift would break the `raw_key == target_key` filter
+    /// — we deliberately do NOT re-key the index), so `invalidate_cell` would
+    /// mis-replay.  A structural op present anywhere in the visible log forces
+    /// the full rebuild, which replays the `AxisShift` effects in order and
+    /// reproduces the shifted cache exactly (append/rebuild equivalence).
+    ///
+    /// O(N) over the visible log — acceptable: `undo`/`redo` already pay an
+    /// O(N) `rebuild_op_indices_only` on the partial path.  Deliberately NOT a
+    /// cached session flag: merges / poll / discard / undo / redo / import all
+    /// mutate visibility and a flag would be easy to desync (Codex design
+    /// audit 1b).
+    fn log_has_structural_op(&self) -> Result<bool, CollabSessionError> {
+        for op_result in self.log.iter() {
+            let op = op_result.map_err(CollabSessionError::OpLog)?;
+            if Self::op_is_structural(&op) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// **Phase 5.3 step 5b + 5b audit closure + step 5c (2026-05-20) —
@@ -3923,8 +4105,15 @@ impl CollabSession {
         // gate, `undo` on an empty stack stays `Ok(false)` regardless
         // of transport state (no mutation, no flush attempt).
         if consumed {
+            // **HIGH-1 (megaudit, Codex) closure**: the partial
+            // `invalidate_cell` path is UNSOUND whenever the visible log holds
+            // any structural op (its `cell_op_index` carries raw op-log coords
+            // that the `AxisShift` re-key intentionally leaves un-shifted).
+            // Force the full rebuild — which replays the `AxisShift` effects in
+            // order and reproduces the shifted cache exactly.
+            let has_structural = self.log_has_structural_op()?;
             match captured_cells {
-                Some(cells) if !cells.is_empty() => {
+                Some(cells) if !cells.is_empty() && !has_structural => {
                     // **V3.6.0.4 D3 (2026-05-23)**: Loro's UndoManager
                     // retract COMPACTS the visible list (positional
                     // indices shift down).  Refresh `cell_op_index` +
@@ -3940,11 +4129,11 @@ impl CollabSession {
                     }
                 }
                 _ => {
-                    // Empty cells OR decode failed -- non-cell-keyed op
-                    // OR legacy/malformed meta.  Conservative full
-                    // rebuild (matches the V3.5.0.6 fallback semantic).
-                    // `rebuild_snapshot_cache` also rebuilds the
-                    // V3.6.0.4 D3 cell + sheet indices.
+                    // Empty cells OR decode failed (non-cell-keyed op OR
+                    // legacy/malformed meta) OR a structural op is visible
+                    // (HIGH-1).  Conservative full rebuild (matches the
+                    // V3.5.0.6 fallback semantic).  `rebuild_snapshot_cache`
+                    // also rebuilds the V3.6.0.4 D3 cell + sheet indices.
                     self.rebuild_snapshot_cache()?;
                 }
             }
@@ -4016,8 +4205,12 @@ impl CollabSession {
         let consumed = self.undo.redo()?;
         // Phase 5.5 V2 V2 audit closure (Codex M2): gate matches `undo`.
         if consumed {
+            // **HIGH-1 (megaudit, Codex) closure**: mirror `undo()`'s
+            // structural-op gate — force a full rebuild when the visible log
+            // holds any structural op (the partial path's index is un-shifted).
+            let has_structural = self.log_has_structural_op()?;
             match captured_cells {
-                Some(cells) if !cells.is_empty() => {
+                Some(cells) if !cells.is_empty() && !has_structural => {
                     // **V3.6.0.4 D3 (2026-05-23)**: mirror `undo()`'s
                     // post-retract index refresh.  Loro's redo also
                     // mutates the visible list (pushes the previously-
@@ -4540,6 +4733,186 @@ mod tests {
         let reborn = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
         assert_eq!(reborn.peer_id(), PeerId::new(2));
         assert_eq!(reborn.op_count(), 2);
+    }
+
+    // ===== HIGH-1 (megaudit, Codex): structural ops re-key the snapshot cache =====
+    // The JS-facing `snapshot_cells()` reads the op-log-derived `last_snapshot`
+    // cache.  Pre-fix the cache walker DROPPED structural ops (Insert/Delete
+    // rows/columns, even inside a BatchCommit), so after a structural edit the
+    // cache showed cells at STALE positions while `workbookSnapshot()` read
+    // formula text at the NEW positions → corruption.
+
+    /// Helper: a structural BatchCommit mirroring the napi producer shape
+    /// (structural op first, optional post-shift PutFormula ops after).
+    fn structural_batch(structural: Op, follow: Vec<Op>) -> Op {
+        let mut ops = vec![structural];
+        ops.extend(follow);
+        Op::BatchCommit { ops }
+    }
+
+    fn snapshot_value_at(s: &CollabSession, sheet: u16, row: u32, col: u32) -> Option<f64> {
+        s.snapshot_cell(sheet, row, col)
+            .and_then(|st| match st.value {
+                Some(CellWireValue::Number(n)) => Some(n),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn insert_rows_shifts_snapshot_cache_live_append() {
+        // Live `append_op` incremental path.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 11.0)).unwrap(); // A1
+        s.append_op(put_value(0, 1, 0, 22.0)).unwrap(); // A2
+                                                        // Insert 1 row at the top via a BatchCommit (producer shape).
+        s.append_op(structural_batch(
+            Op::InsertRows {
+                sheet: 0,
+                at: 0,
+                count: 1,
+            },
+            vec![],
+        ))
+        .unwrap();
+        // Values shifted down by one row; old positions are now empty.
+        assert_eq!(snapshot_value_at(&s, 0, 1, 0), Some(11.0), "A1 -> A2");
+        assert_eq!(snapshot_value_at(&s, 0, 2, 0), Some(22.0), "A2 -> A3");
+        assert_eq!(snapshot_value_at(&s, 0, 0, 0), None, "old A1 now empty");
+        // snapshot_cells reflects exactly two shifted cells.
+        let cells = s.snapshot_cells(0);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].0, (1, 0));
+        assert_eq!(cells[1].0, (2, 0));
+    }
+
+    #[test]
+    fn delete_rows_drops_and_shifts_snapshot_cache() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap(); // A1
+        s.append_op(put_value(0, 1, 0, 2.0)).unwrap(); // A2 (will be deleted)
+        s.append_op(put_value(0, 2, 0, 3.0)).unwrap(); // A3
+        s.append_op(structural_batch(
+            Op::DeleteRows {
+                sheet: 0,
+                start: 1,
+                end: 1,
+            },
+            vec![],
+        ))
+        .unwrap();
+        // A2 deleted; A3 shifts up into A2's slot. A1 unchanged.
+        assert_eq!(snapshot_value_at(&s, 0, 0, 0), Some(1.0));
+        assert_eq!(snapshot_value_at(&s, 0, 1, 0), Some(3.0), "A3 -> A2");
+        assert_eq!(s.snapshot_cells(0).len(), 2);
+    }
+
+    #[test]
+    fn insert_columns_shifts_snapshot_cache() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 5.0)).unwrap(); // A1
+        s.append_op(put_value(0, 0, 1, 6.0)).unwrap(); // B1
+        s.append_op(structural_batch(
+            Op::InsertColumns {
+                sheet: 0,
+                at: 0,
+                count: 2,
+            },
+            vec![],
+        ))
+        .unwrap();
+        assert_eq!(snapshot_value_at(&s, 0, 0, 2), Some(5.0), "A1 -> C1");
+        assert_eq!(snapshot_value_at(&s, 0, 0, 3), Some(6.0), "B1 -> D1");
+        assert_eq!(snapshot_value_at(&s, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn structural_batch_with_followup_putformula_lands_at_post_shift_position() {
+        // Mirrors the producer: the structural op shifts existing cache cells
+        // FIRST, then a post-shift PutFormula effect lands on top.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 1, 0, 7.0)).unwrap(); // A2 (a value)
+                                                       // Insert a row at top + a PutFormula at the POST-shift position A3
+                                                       // (row 2) — what the producer emits for a formula that moved from A2.
+        s.append_op(structural_batch(
+            Op::InsertRows {
+                sheet: 0,
+                at: 0,
+                count: 1,
+            },
+            vec![put_formula(0, 2, 0, "=1+1")],
+        ))
+        .unwrap();
+        // The value shifted A2 -> A3 (row 2). The PutFormula effect set the
+        // formula on the SAME shifted cell.
+        let st = s.snapshot_cell(0, 2, 0).expect("A3 present");
+        assert_eq!(st.value, Some(CellWireValue::Number(7.0)));
+        assert_eq!(st.formula.as_deref(), Some("=1+1"));
+    }
+
+    #[test]
+    fn structural_shift_append_and_rebuild_agree() {
+        // append/rebuild equivalence: a from_snapshot round-trip (which walks
+        // the WHOLE log via rebuild_snapshot_cache) reproduces the same
+        // shifted cache the live append path produced.
+        let mut origin = CollabSession::new(PeerId::new(1)).unwrap();
+        origin.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        origin.append_op(put_value(0, 5, 0, 2.0)).unwrap();
+        origin
+            .append_op(structural_batch(
+                Op::InsertRows {
+                    sheet: 0,
+                    at: 0,
+                    count: 3,
+                },
+                vec![],
+            ))
+            .unwrap();
+        let live = origin.snapshot_cells(0);
+
+        let bytes = origin.export_bytes().unwrap();
+        let reborn = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+        let rebuilt = reborn.snapshot_cells(0);
+
+        assert_eq!(
+            live, rebuilt,
+            "append path and full-rebuild path must agree"
+        );
+        // Sanity: both show the shifted positions (rows +3).
+        assert_eq!(rebuilt[0].0, (3, 0));
+        assert_eq!(rebuilt[1].0, (8, 0));
+    }
+
+    #[test]
+    fn undo_cell_edit_after_prior_structural_shift_is_correct() {
+        // **Codex's exact failure case for the partial-invalidate path.**
+        // 1. PutValue A1 = 1.  2. InsertRows(at=0,count=1) → A1 shifts to A2.
+        // 3. PutValue A2 = 2 (overwrites the shifted value).  4. Undo step 3.
+        // The partial invalidate_cell path would mis-restore (its cell_op_index
+        // op carries the PRE-shift raw coord A1). The structural-op gate forces
+        // a full rebuild → A2 correctly restored to 1 (the shifted original).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap(); // A1 = 1
+        s.append_op(structural_batch(
+            Op::InsertRows {
+                sheet: 0,
+                at: 0,
+                count: 1,
+            },
+            vec![],
+        ))
+        .unwrap();
+        // After the shift, the original value is at A2 (row 1).
+        assert_eq!(snapshot_value_at(&s, 0, 1, 0), Some(1.0));
+        s.append_op(put_value(0, 1, 0, 2.0)).unwrap(); // A2 = 2 (overwrite)
+        assert_eq!(snapshot_value_at(&s, 0, 1, 0), Some(2.0));
+        // Undo the A2=2 write.
+        assert!(s.undo().unwrap());
+        // A2 must be restored to the shifted original (1.0), NOT emptied.
+        assert_eq!(
+            snapshot_value_at(&s, 0, 1, 0),
+            Some(1.0),
+            "undo after a structural shift must restore the shifted original, not corrupt the cell"
+        );
     }
 
     #[test]
@@ -8634,10 +9007,4 @@ mod tests {
         assert_eq!(
             cells.len(),
             2,
-            "post-restore writes stack atop preserved pre-tombstone cells"
-        );
-        // Sorted (row, col) per snapshot_cells docstring contract.
-        assert_eq!(cells[0].0, (0, 0));
-        assert_eq!(cells[1].0, (5, 5));
-    }
-}
+            "post-restore writes stack at
