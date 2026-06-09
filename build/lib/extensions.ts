@@ -567,8 +567,20 @@ const esbuildMediaScripts = [
 	'markdown-math/esbuild.mjs',
 	'mermaid-chat-features/esbuild-chat-webview.mjs',
 	'notebook-renderers/esbuild.mjs',
+	// Quantbook Cell Grid webview (FE-1.5). Emits to the NESTED `dist/webview/quantbook/`
+	// (isolated from the shared `dist/webview/` bundles), so the script passes an
+	// `outputRootSubpath` to survive the `--outputRoot` basename-flatten under the build task.
+	'quantlab/esbuild-quantbook-webviews.mjs',
 	'simple-browser/esbuild-preview.mjs',
 ];
+
+// Media scripts whose extension is desktop-only (declares `main`, no `browser`), so they must
+// NOT be built into the web artifact: the web `packageTask` copies `.build/web/extensions/**`
+// wholesale, which would otherwise ship a dead, never-loaded bundle. Quantbook's host loads the
+// engine via napi, so the extension cannot run on web at all.
+const desktopOnlyMediaScripts = new Set<string>([
+	'quantlab/esbuild-quantbook-webviews.mjs',
+]);
 
 export async function webpackExtensions(taskName: string, isWatch: boolean, webpackConfigLocations: { configPath: string; outputRoot?: string }[]) {
 	const webpack = require('webpack') as typeof import('webpack');
@@ -668,8 +680,9 @@ async function esbuildExtensions(taskName: string, isWatch: boolean, scripts: { 
 	return Promise.all(tasks);
 }
 
-export async function buildExtensionMedia(isWatch: boolean, outputRoot?: string) {
-	return esbuildExtensions('esbuilding extension media', isWatch, esbuildMediaScripts.map(p => ({
+export async function buildExtensionMedia(isWatch: boolean, outputRoot?: string, forWeb = false) {
+	const scripts = forWeb ? esbuildMediaScripts.filter(p => !desktopOnlyMediaScripts.has(p)) : esbuildMediaScripts;
+	return esbuildExtensions('esbuilding extension media', isWatch, scripts.map(p => ({
 		script: path.join(extensionsPath, p),
 		outputRoot: outputRoot ? path.join(root, outputRoot, path.dirname(p)) : undefined
 	})));

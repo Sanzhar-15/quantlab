@@ -23,15 +23,15 @@
  * Wrapped by the `build:webviews:quantbook` / `watch:webviews:quantbook`
  * package.json scripts.
  *
- * **DEFERRED -- F5 (FE megaudit, docs/fe/2026-06-03-fe-megaudit/SYNTHESIS.md):** this
- * script is NOT yet wired into any aggregate / CI / `vscode:prepublish` build path
- * (`build/lib/extensions.ts` `esbuildMediaScripts` does not list it) -- so a packaged
- * build that doesn't run `npm run build:webviews:quantbook` ships a missing bundle
- * (the panel's `readyWatchdog` then shows a loud "rebuild it" error after 6s). This
- * matches the existing chart/action/trade webview pattern (they are also manual). When
- * wiring it in, reconcile the `--outputRoot` basename-flatten in `esbuild-webview-common.mjs`
- * `run()` (it would land the bundle at `<root>/quantbook`, NOT the nested
- * `dist/webview/quantbook/` the runtime hardcodes in `cellGridPanel.ts`).
+ * **WIRED INTO THE PACKAGED/CI BUILD (2026-06-09):** this script is now listed in
+ * `build/lib/extensions.ts` `esbuildMediaScripts`, so `compile-extension-media`
+ * (dev) and `compile-extension-media-build` / `extensions-ci` (packaged) build it
+ * automatically -- a fresh clone / `.vsix` no longer ships a missing Cell Grid bundle.
+ * The `--outputRoot` basename-flatten in `esbuild-webview-common.mjs` `run()` (which
+ * keeps only `path.basename(outdir)` and would land the bundle at `<extRoot>/quantbook`,
+ * NOT the nested `dist/webview/quantbook/` the runtime resolves in `cellGridPanel.ts`)
+ * is reconciled WITHOUT a runtime change: we pass the full extension-relative
+ * `outputRootSubpath` below so the packaged bundle lands at `<extRoot>/dist/webview/quantbook/`.
  */
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -81,6 +81,11 @@ run({
 	},
 	srcDir: sheetsDir,
 	outdir: outDir,
+	// Under `--outputRoot` (packaged/CI build) preserve the FULL extension-relative nesting
+	// `dist/webview/quantbook` -- the shared `run()` would otherwise basename-flatten it to
+	// `quantbook` and the runtime (`cellGridPanel.ts` `dist/webview/quantbook/`) would not find
+	// the bundle. Must stay in lockstep with `outDir`'s tail + the `cellGridPanel.ts` resolution.
+	outputRootSubpath: path.join('dist', 'webview', 'quantbook'),
 	additionalOptions: {
 		plugins: [noHostRuntimePlugin],
 	},

@@ -59,6 +59,7 @@ async function tryBuild(options, didBuild) {
  * @param {{
  * 	srcDir: string;
  *  outdir: string;
+ *  outputRootSubpath?: string;
  *  entryPoints: string[] | Record<string, string> | { in: string, out: string }[];
  * 	additionalOptions?: Partial<import('esbuild').BuildOptions>
  * }} config
@@ -70,8 +71,16 @@ export async function run(config, args, didBuild) {
 	const outputRootIndex = args.indexOf('--outputRoot');
 	if (outputRootIndex >= 0) {
 		const outputRoot = args[outputRootIndex + 1];
-		const outputDirName = path.basename(outdir);
-		outdir = path.join(outputRoot, outputDirName);
+		// Under `--outputRoot` the build relocates the bundle into the packaged extension root.
+		// Most webviews emit to a SINGLE-level outdir (e.g. `notebook-out`), so `path.basename`
+		// reconstructs the full extension-relative path losslessly. A webview whose outdir is
+		// NESTED under the extension (e.g. Quantbook's `dist/webview/quantbook`) would lose the
+		// intermediate dirs to `path.basename`, landing the bundle where the runtime cannot find
+		// it -- such a caller passes its full extension-relative `outputRootSubpath` to preserve
+		// the nesting. Omitted -> the prior basename behavior, so every existing caller is
+		// byte-identical.
+		const outputSubpath = config.outputRootSubpath ?? path.basename(outdir);
+		outdir = path.join(outputRoot, outputSubpath);
 	}
 
 	/** @type {BuildOptions} */
