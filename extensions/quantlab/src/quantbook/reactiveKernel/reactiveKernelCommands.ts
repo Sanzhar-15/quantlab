@@ -43,6 +43,25 @@ const REACTIVE_KERNEL_IMPORTS = [
 ] as const;
 const REACTIVE_KERNEL_PIP_HINT = 'ipykernel jupyter_client pyzmq comm';
 
+/**
+ * **W2 error-surface (2026-06-09)** -- the host-side sink a reactive error is reported to so it surfaces
+ * WORKBOOK-LEVEL in the Problems panel. A reactive `onError` carries NO cell address (a bare string), so
+ * it is NEVER pinned to a guessed cell (No-Fallbacks) -- it is recorded per session and cleared when the
+ * kernel recovers (a publish frame lands) or stops. Only the two methods this layer needs are declared;
+ * the concrete bridge (`QuantbookDiagnostics`) implements more. `undefined` (no bridge wired / post-
+ * deactivate) makes every report a no-op. Injected at activation via {@link setReactiveDiagnosticsSink}.
+ */
+interface ReactiveDiagnosticsSink {
+	setReactiveError(session: SessionInstance, message: string): void;
+	clearReactiveError(session: SessionInstance): void;
+}
+let reactiveDiagnosticsSink: ReactiveDiagnosticsSink | undefined;
+
+/** Register (or clear with `undefined`) the workbook-level reactive-error sink (W2 error-surface). */
+export function setReactiveDiagnosticsSink(sink: ReactiveDiagnosticsSink | undefined): void {
+	reactiveDiagnosticsSink = sink;
+}
+
 /** Resolve the focused Cell Grid's owning Session, or show a hint + return undefined. */
 function resolveReactiveTarget(): { session: SessionInstance; sheet: number } | undefined {
 	const localPanels = CellGridPanel.activeLocalPanels();
@@ -183,6 +202,10 @@ function makeClientFactory(
 						`Quantbook reactive: ${failed} panel(s) failed to re-render -- see the Quantbook Reactive Kernel output.`,
 					);
 				}
+				// W2 error-surface: a publish frame landed/retracted means the kernel produced a healthy
+				// result -> clear any workbook-level reactive error from the Problems panel (No-Fallbacks: a
+				// recovered kernel must clear its diagnostic). A no-op when none was set.
+				reactiveDiagnosticsSink?.clearReactiveError(session);
 				// FE-5: a publish frame landed/retracted -> the published-variable set may have changed;
 				// refresh the Live-Python sidebar. (refreshSession above repaints the grid badges; this
 				// pumps the sidebar, which reads the kernel's published cells.)
@@ -190,6 +213,9 @@ function makeClientFactory(
 			},
 			onError: (message: string): void => {
 				output.appendLine(message);
+				// W2 error-surface: a reactive error has no cell address -> surface it WORKBOOK-LEVEL in the
+				// Problems panel (never pinned to a guessed cell). The toast stays for immediacy.
+				reactiveDiagnosticsSink?.setReactiveError(session, message);
 				void vscode.window.showWarningMessage(`Quantbook reactive kernel: ${message}`);
 			},
 		});
@@ -230,6 +256,9 @@ export function registerReactiveKernelCommands(
 		// onChanged refresh path; refreshSession is a no-op for a session whose panels have all closed.
 		(session) => {
 			CellGridPanel.refreshSession(session);
+			// W2 error-surface: the kernel is gone -> clear any workbook-level reactive error from the
+			// Problems panel (No-Fallbacks: a stopped kernel leaves no stale reactive diagnostic).
+			reactiveDiagnosticsSink?.clearReactiveError(session);
 		},
 	);
 	managerHolder.manager = manager;

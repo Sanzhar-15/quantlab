@@ -87,6 +87,22 @@ let focusedPanel: CellGridPanel | undefined;
 type PublishedCellsProvider = (session: SessionInstance, sheet: number) => PublishedRange[];
 let publishedCellsProvider: PublishedCellsProvider | undefined;
 
+/**
+ * **W2 error-surface** -- the host-side sink a panel reports its cell errors to so they surface in VS
+ * Code's Problems panel via the `quantbook` DiagnosticCollection. Injected at activation (mirrors
+ * {@link publishedCellsProvider}); `undefined` (no bridge wired, or post-deactivate) makes every report
+ * a no-op so the render/edit paths stay unconditional. Only the methods a panel needs are declared --
+ * the concrete bridge (`QuantbookDiagnostics`) implements more (reactive errors, session-wide clears).
+ */
+interface CellDiagnosticsSink {
+	setSheetCellDiagnostics(session: SessionInstance, sheet: number, snapshot: QuantbookCellSnapshot): void;
+	setCellErrorReply(session: SessionInstance, sheet: number, row: number, col: number, code: string, message: string): void;
+	clearCellErrorReply(session: SessionInstance, sheet: number, row: number, col: number): void;
+	clearSheet(session: SessionInstance, sheet: number): void;
+	clearSessionAll(session: SessionInstance): void;
+}
+let diagnosticsSink: CellDiagnosticsSink | undefined;
+
 // FE-1.5-1d-1: listeners fired right before a session's LAST panel closes + the owning Session is
 // closed. Lets a bound reactive kernel tear down (dispose) BEFORE session.close(), so no republish
 // can write to a closing Session and no ipykernel is orphaned.
@@ -231,8 +247,18 @@ export class CellGridPanel {
 			const sheetMapNow = bySession.get(session);
 			if (sheetMapNow !== undefined && sheetMapNow.get(sheet) === instance) {
 				sheetMapNow.delete(sheet);
+				// W2 error-surface: this panel is the last view of (session, sheet) in the registry -> drop the
+				// sheet's diagnostics from the Problems panel (a closed sheet leaves no stale error entries).
+				// Guarded by the same own-the-registry-entry check so a replaced panel does not clear a fresh
+				// panel's diagnostics.
+				diagnosticsSink?.clearSheet(session, sheet);
 				if (sheetMapNow.size === 0) {
 					bySession.delete(session);
+					// W2 error-surface (Codex MED): the session's LAST panel closed -> drop ALL its diagnostics
+					// (every sheet's cell errors + the workbook-level reactive error). `clearSheet` above only
+					// dropped THIS sheet; a sibling sheet's panel that already closed left its diagnostics, and
+					// the reactive uri is session-scoped, not sheet-scoped. Idempotent with the clearSheet above.
+					diagnosticsSink?.clearSessionAll(session);
 					// 1d-1: tear down a reactive kernel bound to this Session BEFORE closing it, so an
 					// in-flight republish cannot write to a closing Session and the ipykernel is not orphaned.
 					fireSessionClosing(session);
@@ -428,6 +454,18 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **W2 error-surface (2026-06-09)** -- register (or clear with `undefined`) the sink every panel
+	 * reports its cell errors to so they surface in the Problems panel via the `quantbook`
+	 * DiagnosticCollection. Wired at activation to the `QuantbookDiagnostics` bridge and cleared on
+	 * deactivate. A sink hook (not a direct bridge import) keeps the panel decoupled from the diagnostics
+	 * layer, mirroring {@link setPublishedCellsProvider}. When unset, every report is a no-op (the
+	 * render/edit paths are unconditional).
+	 */
+	static setDiagnosticsSink(sink: CellDiagnosticsSink | undefined): void {
+		diagnosticsSink = sink;
+	}
+
+	/**
 	 * Tracks whether `panel.dispose()` has fired. `webview.postMessage` to a
 	 * disposed panel is silently dropped; the errorReply path checks this flag and
 	 * falls back to `showWarningMessage` so a late validation error stays visible.
@@ -588,6 +626,11 @@ export class CellGridPanel {
 		// the webviewReady handshake can (re)send the latest snapshot once the
 		// bundle's channel is live.
 		this.latestSnapshot = decorated;
+		// W2 error-surface: mirror this sheet's CURRENT stored cell errors (the diagnostic-decorated
+		// snapshot's `kind:'error'` cells) into the Problems panel. Authoritative + auto-clearing: a cell
+		// that recovered to a real value is no longer an error entry, so the bridge replaces this sheet's
+		// diagnostics without it (No-Fallbacks -- no stale Problems entry). A no-op when no bridge is wired.
+		diagnosticsSink?.setSheetCellDiagnostics(this.session, this.sheet, decorated);
 		this.postRenderIfReady();
 	}
 
@@ -757,6 +800,12 @@ export class CellGridPanel {
 			// change. Echo the REQUEST's webviewId (a stale post-reload report can't clear a fresh webview) and
 			// the sheet (a cross-sheet report is dropped). Panel-targeted only -- NOT a session fan-out.
 			onCellsWritten: (sheet, cells, webviewId) => {
+				// W2 error-surface: a paste/fill batch committed cleanly -> clear each written cell's sticky
+				// `errorReply` diagnostic from the Problems panel. Done host-side regardless of `_disposed`
+				// (the diagnostic is not webview-bound) and BEFORE the disposed early-return below.
+				for (const c of cells) {
+					diagnosticsSink?.clearCellErrorReply(this.session, sheet, c.row, c.col);
+				}
 				if (this._disposed) {
 					return;
 				}
@@ -787,7 +836,37 @@ export class CellGridPanel {
 			onSelectionChange: sel => {
 				this.latestSelection = sel;
 			},
+			// W2 error-surface: a single putValue committed cleanly -> clear that cell's sticky `errorReply`
+			// diagnostic from the Problems panel. Host-side; the imminent onCommit render reconciles the
+			// stored-error set. A no-op when no diagnostics bridge is wired.
+			onCellCommitted: (sheet, row, col) => {
+				diagnosticsSink?.clearCellErrorReply(this.session, sheet, row, col);
+			},
 			onError: reply => {
+				// W2 error-surface: an `errorReply` is an INPUT REJECTION (a putValue/formula that failed to
+				// parse/bind) -- the cell was NOT written, so it is ABSENT from the snapshot and would never
+				// surface via the render path. Record it as a STICKY cell diagnostic in the Problems panel
+				// (cleared when the cell next commits cleanly via onCellCommitted/onCellsWritten, or its panel
+				// disposes). Done on BOTH the live and disposed paths (the diagnostic is host-side, not
+				// webview-bound). Codex MED: ONLY persist when the reply targets THIS panel's sheet -- a
+				// defensive cross-sheet/malformed reply (the dispatcher already validates, but No-Fallbacks
+				// keeps the guard) would otherwise create a Problems entry under a sheet no panel owns, which
+				// `clearSheet(this.sheet)` could never clear. Such a reply still surfaces below as a toast.
+				if (reply.sheet === this.sheet) {
+					diagnosticsSink?.setCellErrorReply(this.session, reply.sheet, reply.row, reply.col, reply.code, reply.message);
+				} else {
+					// Codex re-audit MED: a cross-sheet reply is NOT persisted as a diagnostic (no panel owns
+					// that sheet here), and the webview decoration below targets THIS sheet -- so the cross-sheet
+					// error could be silently lost if the post is accepted but ignored. Surface it as a toast now
+					// so it is never swallowed (No-Fallbacks), then RETURN: the decoration/ack path below is for
+					// THIS sheet only, so there is nothing more to do for a cross-sheet reply (the return also
+					// avoids the disposed-path double-toast Codex flagged). This is a defensive path (the
+					// dispatcher already drops sheet-mismatched putValue requests before they reach onError).
+					void vscode.window.showWarningMessage(
+						`Cell Grid (sheet ${reply.sheet}, row ${reply.row}, col ${reply.col}): [${reply.code}] ${reply.message}`,
+					);
+					return;
+				}
 				// If the panel is disposed, `webview.postMessage` is silently dropped
 				// -- fall back to showWarningMessage so the user sees the error. (The
 				// panel uses retainContextWhenHidden:true, so a HIDDEN panel still

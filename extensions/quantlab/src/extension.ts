@@ -6,7 +6,9 @@
 import * as vscode from 'vscode';
 import { registerDataCommands } from './commands/dataCommands';
 import { registerQuantbookCommands } from './commands/quantbookCommands';
-import { registerReactiveKernelCommands } from './quantbook/reactiveKernel/reactiveKernelCommands';
+import { CellGridPanel } from './quantbook/cellGrid/cellGridPanel';
+import { QuantbookDiagnostics, QUANTBOOK_DIAGNOSTICS_SCHEME } from './quantbook/diagnostics/quantbookDiagnostics';
+import { registerReactiveKernelCommands, setReactiveDiagnosticsSink } from './quantbook/reactiveKernel/reactiveKernelCommands';
 import type { ReactiveKernelManager } from './quantbook/reactiveKernel/reactiveKernelManager';
 import { QNB_NOTEBOOK_TYPE, QnbSerializer } from './quantbook/reactiveNotebook/qnbSerializer';
 import { registerReactiveNotebookController } from './quantbook/reactiveNotebook/reactiveNotebookController';
@@ -335,6 +337,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// `quantbook.hasOpenGrid` context key gating the quantbook views). Registered AFTER the panel
 	// providers + AFTER the reactive-kernel manager exists (the sidebar's data source).
 	registerQuantbookShell(context, builtKernelManager);
+
+	// W2 error-surface: the dedicated Quantbook error surface -- ONE `quantbook` DiagnosticCollection that
+	// mirrors cell errors into VS Code's Problems panel. The Cell Grid panel reports its stored cell errors
+	// (each render's diagnostic-decorated snapshot) + input rejections (errorReply), and the reactive layer
+	// reports workbook-level reactive errors; the bridge auto-clears on recovery (No-Fallbacks). The
+	// `quantbook://` TextDocumentContentProvider serves a readable virtual doc per uri so a Problems-panel
+	// click opens a real document. Injected via static sinks (mirrors setPublishedCellsProvider), cleared on
+	// deactivate. Registered AFTER the reactive-kernel manager + the panel registry exist.
+	const quantbookDiagnostics = new QuantbookDiagnostics();
+	context.subscriptions.push(quantbookDiagnostics);
+	context.subscriptions.push(
+		vscode.workspace.registerTextDocumentContentProvider(QUANTBOOK_DIAGNOSTICS_SCHEME, quantbookDiagnostics),
+	);
+	CellGridPanel.setDiagnosticsSink(quantbookDiagnostics);
+	context.subscriptions.push({ dispose: () => CellGridPanel.setDiagnosticsSink(undefined) });
+	setReactiveDiagnosticsSink(quantbookDiagnostics);
+	context.subscriptions.push({ dispose: () => setReactiveDiagnosticsSink(undefined) });
 
 	const validationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	moduleValidationTimers = validationTimers;

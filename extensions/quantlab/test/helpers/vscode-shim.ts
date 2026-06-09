@@ -63,6 +63,17 @@ export class Uri {
 		return new Uri(base.scheme, base.authority, joined, base.query, base.fragment);
 	}
 
+	// W2 error-surface: the Quantbook diagnostics bridge builds `quantbook://` uris via `Uri.from`.
+	static from(components: { scheme: string; authority?: string; path?: string; query?: string; fragment?: string }): Uri {
+		return new Uri(
+			components.scheme,
+			components.authority ?? '',
+			components.path ?? '',
+			components.query ?? '',
+			components.fragment ?? '',
+		);
+	}
+
 	get fsPath(): string {
 		return this.path;
 	}
@@ -125,11 +136,76 @@ export class EventEmitter<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Position / Range / Diagnostic / DiagnosticCollection (W2 error-surface)
+// ---------------------------------------------------------------------------
+
+export class Position {
+	constructor(readonly line: number, readonly character: number) { }
+}
+
+export class Range {
+	readonly start: Position;
+	readonly end: Position;
+	constructor(startLine: number, startCharacter: number, endLine: number, endCharacter: number) {
+		this.start = new Position(startLine, startCharacter);
+		this.end = new Position(endLine, endCharacter);
+	}
+}
+
+export enum DiagnosticSeverity {
+	Error = 0,
+	Warning = 1,
+	Information = 2,
+	Hint = 3,
+}
+
+export class Diagnostic {
+	source?: string;
+	code?: string | number;
+	constructor(
+		readonly range: Range,
+		readonly message: string,
+		readonly severity: DiagnosticSeverity = DiagnosticSeverity.Error,
+	) { }
+}
+
+/** Minimal in-memory DiagnosticCollection mirroring the real set/get/delete semantics. */
+export class FakeDiagnosticCollection {
+	private readonly map = new Map<string, Diagnostic[]>();
+	constructor(readonly name: string) { }
+	set(uri: Uri, diagnostics: Diagnostic[]): void {
+		this.map.set(uri.toString(), [...diagnostics]);
+	}
+	get(uri: Uri): readonly Diagnostic[] | undefined {
+		return this.map.get(uri.toString());
+	}
+	delete(uri: Uri): void {
+		this.map.delete(uri.toString());
+	}
+	clear(): void {
+		this.map.clear();
+	}
+	dispose(): void {
+		this.map.clear();
+	}
+	/** Test-only: total number of uris currently holding diagnostics. */
+	_uriCount(): number {
+		return this.map.size;
+	}
+}
+
+export const languages = {
+	createDiagnosticCollection(name: string): FakeDiagnosticCollection {
+		return new FakeDiagnosticCollection(name);
+	},
+};
+
+// ---------------------------------------------------------------------------
 // RelativePattern
 // ---------------------------------------------------------------------------
 
 export class RelativePattern {
-	constructor(readonly base: Uri, readonly pattern: string) {}
+	constructor(readonly base: Uri, readonly pattern: string) { }
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +220,7 @@ export class FakeFileSystemWatcher {
 	readonly onDidCreate = this._onDidCreate.event;
 	readonly onDidDelete = this._onDidDelete.event;
 	disposed = false;
-	constructor(readonly pattern: RelativePattern) {}
+	constructor(readonly pattern: RelativePattern) { }
 	dispose(): void {
 		this.disposed = true;
 		this._onDidChange.dispose();
