@@ -327,6 +327,9 @@ mod tests {
             "MAXIFS",
             "COUNTBLANK",
             "TEXTJOIN",
+            // B2 (native quant fns) — range-aware quant aggregates.
+            "SHARPE",
+            "MAX_DRAWDOWN",
         ] {
             assert!(
                 reg.lookup_range_aware(name).is_some(),
@@ -526,6 +529,170 @@ mod tests {
             Value::Number(n) => assert!((n - 0.0).abs() < 1e-12, "got {n}"),
             other => panic!("expected Number(0.0), got {other:?}"),
         }
+    }
+
+    /// **B2 (native quant fns) — full-path lex→parse→bind→eval armor for
+    /// `=SHARPE(...)`.** This is the test the audit rule (#3: range-aware fns
+    /// need coverage at all four stages) requires beyond the direct unit
+    /// tests in `ql-functions`. A named range over the data is typed into a
+    /// formula, recalc runs, and the cell value is asserted — the SAME path
+    /// every existing range-aware aggregate e2e test uses (SUBTOTAL, CORREL,
+    /// PERCENTILE.* in `w5_d_13_1_*`).
+    ///
+    /// A pre-B2 build (missing the `ArgContext::Aggregate` admission in the
+    /// Phase-1.5 override list) would route the named range through
+    /// `BindContext::Scalar` and surface `Bind(NamedRangeInScalarContext)`
+    /// rather than binding the `AggregateNameRef`. So this test IS the
+    /// bind-step armor the Codex correction called for.
+    ///
+    /// **Engine note (verified, pre-existing):** a *literal* colon range
+    /// (`=SHARPE(A1:A4)`) does NOT bind in v1 — the binder rejects a literal
+    /// `Expr::RangeRef` in `BindContext::AggregateArg` with
+    /// `UnsupportedVariant` (`plan.rs:706`). This is a GLOBAL engine
+    /// limitation affecting EVERY aggregate (`SUM(A1:A4)` is identically
+    /// unsupported; only `SUM(NamedRange)` works), tracked in the binder
+    /// design § 5.4 — NOT specific to SHARPE/MAX_DRAWDOWN. The named-range
+    /// path is the supported production surface; the literal-range gap is
+    /// flagged in the handoff for the conductor. `b2_literal_range_arg_to_
+    /// aggregate_is_unsupported_pre_existing` below pins that limitation so
+    /// a future binder extension that lifts it is noticed.
+    #[test]
+    fn b2_sharpe_full_path_named_range() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+
+        let mut wb = make_runtime_workbook();
+        // Returns series in A1:A4 = [0.01, 0.02, 0.03, 0.04].
+        wb.put_at(0, 0, 0, Value::Number(0.01));
+        wb.put_at(0, 1, 0, Value::Number(0.02));
+        wb.put_at(0, 2, 0, Value::Number(0.03));
+        wb.put_at(0, 3, 0, Value::Number(0.04));
+        wb.set_name("Returns", NamedTarget::Range(Range::new(0, 0, 0, 3, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // mean=0.025, sample stdev=sqrt(0.0005/3)=0.0129099445,
+        // SHARPE (Rf=0) = 1.9364916731.
+        let v = rt.set_formula(0, 0, 5, "SHARPE(Returns)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 1.9364916731).abs() < 1e-9, "got {n}"),
+            other => panic!("expected Number(~1.9365), got {other:?}"),
+        }
+
+        // With a risk-free rate: (0.025-0.01)/0.0129099445 = 1.1618950039.
+        let v = rt.set_formula(0, 1, 5, "SHARPE(Returns, 0.01)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 1.1618950039).abs() < 1e-9, "got {n}"),
+            other => panic!("expected Number(~1.1619), got {other:?}"),
+        }
+
+        // With sqrt-periods annualization: 1.9364916731*sqrt(4)=3.8729833462.
+        let v = rt.set_formula(0, 2, 5, "SHARPE(Returns, 0, 4)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 3.8729833462).abs() < 1e-9, "got {n}"),
+            other => panic!("expected Number(~3.8730), got {other:?}"),
+        }
+    }
+
+    /// **B2 (native quant fns) — full-path armor for `=MAX_DRAWDOWN(...)`.**
+    /// Doubles as proof the lexer admits the underscore-bearing function name
+    /// (`MAX_DRAWDOWN` is letters+`_`, consumed as one Ident) — without that,
+    /// it would never reach the binder. Uses the named-range path (see the
+    /// engine note on `b2_sharpe_full_path_named_range`).
+    #[test]
+    fn b2_max_drawdown_full_path_named_range() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+
+        let mut wb = make_runtime_workbook();
+        // Equity series A1:A6 = [100, 120, 90, 110, 80, 130].
+        let prices = [100.0, 120.0, 90.0, 110.0, 80.0, 130.0];
+        for (i, p) in prices.iter().enumerate() {
+            wb.put_at(0, i as u32, 0, Value::Number(*p));
+        }
+        wb.set_name("Equity", NamedTarget::Range(Range::new(0, 0, 0, 5, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // MDD = 80/120 - 1 = -1/3.
+        let v = rt.set_formula(0, 0, 5, "MAX_DRAWDOWN(Equity)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - (-1.0 / 3.0)).abs() < 1e-12, "got {n}"),
+            other => panic!("expected Number(~-0.3333), got {other:?}"),
+        }
+    }
+
+    /// **B2 — full-path error contract (named-range path).** Empty range ⇒
+    /// `#NUM!`; a single-cell range to SHARPE ⇒ `#DIV/0!` (n<2 sample stdev
+    /// undefined). Pins that the No-Fallbacks error semantics survive the
+    /// bind+eval round-trip.
+    #[test]
+    fn b2_sharpe_max_drawdown_error_contract_full_path() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+
+        let mut wb = make_runtime_workbook();
+        // A1 holds the only value; A10:A12 are left blank → empty range.
+        wb.put_at(0, 0, 0, Value::Number(0.05));
+        // **Note (W5-D-13.1 gotcha):** named ranges must use >3-letter names
+        // or they lex as a BareColumn (a whole-column literal range) instead
+        // of a NameRef. `Single` / `EmptyRng` are safe; a 3-letter name like
+        // `One` would lex as column `ONE` → literal RangeRef → unsupported.
+        wb.set_name("Single", NamedTarget::Range(Range::new(0, 0, 0, 0, 0)))
+            .unwrap();
+        wb.set_name("EmptyRng", NamedTarget::Range(Range::new(0, 9, 0, 11, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Single-cell range to SHARPE → n=1 → #DIV/0!.
+        let v = rt.set_formula(0, 0, 5, "SHARPE(Single)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::DivZero));
+
+        // All-blank range → 0 numeric values → #NUM! for both.
+        let v = rt.set_formula(0, 1, 5, "SHARPE(EmptyRng)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::Num));
+        let v = rt.set_formula(0, 2, 5, "MAX_DRAWDOWN(EmptyRng)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::Num));
+    }
+
+    /// **B2 — pin the PRE-EXISTING engine limitation: a literal colon range
+    /// argument to an aggregate is unsupported in v1.** This is NOT specific
+    /// to SHARPE/MAX_DRAWDOWN — the binder rejects a literal `Expr::RangeRef`
+    /// in `BindContext::AggregateArg` for every aggregate (the same
+    /// `UnsupportedVariant` error fires for `SUM(A1:A4)`), tracked in the
+    /// binder design § 5.4. We pin it here for SHARPE so that if a future
+    /// binder change lifts the limitation (literal ranges in aggregate args),
+    /// this test fails loudly and the conductor knows the literal-range
+    /// surface — the exact `=SHARPE(A1:A10)` shape — has become available.
+    #[test]
+    fn b2_literal_range_arg_to_aggregate_is_unsupported_pre_existing() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(0.01));
+        wb.put_at(0, 1, 0, Value::Number(0.02));
+        wb.put_at(0, 2, 0, Value::Number(0.03));
+        wb.put_at(0, 3, 0, Value::Number(0.04));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Literal `A1:A4` in aggregate-arg position is rejected at BIND time.
+        let err = rt.set_formula(0, 0, 5, "SHARPE(A1:A4)").unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("UnsupportedVariant") && msg.contains("literal RangeRef"),
+            "expected the pre-existing literal-RangeRef-in-aggregate rejection, got: {msg}"
+        );
+
+        // Cross-check: `SUM(A1:A4)` — a builtin aggregate — fails identically,
+        // proving the limitation is engine-global, not a SHARPE defect.
+        let sum_err = rt.set_formula(0, 1, 5, "SUM(A1:A4)").unwrap_err();
+        let sum_msg = format!("{sum_err:?}");
+        assert!(
+            sum_msg.contains("UnsupportedVariant") && sum_msg.contains("literal RangeRef"),
+            "expected SUM to share the literal-range limitation, got: {sum_msg}"
+        );
     }
 
     /// **W5-D-13.1 (Phase 4.10 V1-260 megaudit closure — Codex MEDIUM-003

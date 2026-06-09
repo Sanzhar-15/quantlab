@@ -1102,6 +1102,18 @@ pub fn default_registry() -> FunctionRegistry {
     // (reinvestment) cash flows. RangeAwareFn; first arg must be range.
     r.register_range_aware("MIRR", financial_fns::mirr);
 
+    // B2 (native quant fns) — beyond-Excel quant aggregates built on the
+    // engine's welford stddev/mean primitives. Both RangeAwareFn; arg 0 is
+    // the series range. SHARPE = mean(excess returns) / sample-stdev, with
+    // optional sqrt(periods) annualization; MAX_DRAWDOWN = max peak-to-trough
+    // decline of an equity/price series (negative fraction). See the
+    // doc-comments in `financial_fns.rs` for the exact semantics + error
+    // contract. Admitted to `is_aggregate_function` via the Phase-1.5
+    // ArgContext::Aggregate override list below (otherwise the range arg
+    // collapses to an implicitly-intersected scalar at bind time).
+    r.register_range_aware("SHARPE", financial_fns::sharpe);
+    r.register_range_aware("MAX_DRAWDOWN", financial_fns::max_drawdown);
+
     // **W5-D-7 (Wave 3 closure — CLOSES Wave 3):** XNPV / XIRR —
     // date-indexed cash flow. Both RangeAwareFn with 2 ranges
     // (values + dates). XIRR uses Newton-Raphson on XNPV's
@@ -1549,6 +1561,14 @@ fn register_builtin_metadata(r: &mut FunctionRegistry) {
         "MAXIFS",
         "COUNTBLANK",
         "TEXTJOIN",
+        // B2 (native quant fns) — range-aware quant aggregates. NOT part of
+        // the pre-6.4-1 byte-for-byte whitelist (they postdate it); the
+        // dedicated `b2_quant_fns_admitted_to_is_aggregate_function` test and
+        // the `validate.rs` invariants pin them. Without these two names the
+        // binder hands SHARPE/MAX_DRAWDOWN an implicitly-intersected scalar
+        // instead of the range, silently breaking `=SHARPE(A1:A10)`.
+        "SHARPE",
+        "MAX_DRAWDOWN",
     ] {
         // Some of these names overlap Phase-1 overrides (none currently —
         // Phase 1 covers NOW/TODAY/RAND/RANDBETWEEN/RANDARRAY +
@@ -1758,7 +1778,12 @@ mod tests {
         // aware conditional aggregate dispatcher (function_num 1..=11
         // and 101..=111). v1 normalizes 101..=111 to 1..=11 (no hidden-
         // row metadata in engine). **CLOSES Phase 4.10 V1-260 at 260.**
-        assert_eq!(r.len(), 260);
+        // B2 (native quant fns, post-V1-260): SHARPE, MAX_DRAWDOWN = 2 —
+        // range-aware tier; built on the welford stddev/mean primitives.
+        // SHARPE = mean(excess returns)/sample-stdev with optional
+        // sqrt(periods) annualization; MAX_DRAWDOWN = max peak-to-trough
+        // decline of an equity/price series (negative fraction). => 262.
+        assert_eq!(r.len(), 262);
     }
 
     #[test]
@@ -2748,20 +2773,59 @@ mod tests {
         // Direction B (sanity): no name OUTSIDE the pre-6.4-1 whitelist
         // should silently flip to ArgContext::Aggregate via a Phase-1.5 typo
         // / accidental extra entry. Walk every metadata entry; any
-        // Aggregate-tagged name must be in the whitelist.
-        let pre_set: std::collections::HashSet<&&str> =
-            pre_6_4_1_aggregate_whitelist.iter().collect();
+        // Aggregate-tagged name must be in the whitelist OR in the explicit
+        // post-6.4-1 additions allowlist below (legitimate extensions added
+        // AFTER the byte-for-byte migration — each must be pinned here so a
+        // typo'd extra entry still fails loudly).
+        //
+        // **B2 (native quant fns):** SHARPE + MAX_DRAWDOWN are new range-aware
+        // quant aggregates that postdate the pre-6.4-1 whitelist. They are
+        // legitimately Aggregate (the binder must hand them the range), so
+        // they are listed here as explicit post-migration extensions.
+        let post_6_4_1_aggregate_additions: &[&str] = &["SHARPE", "MAX_DRAWDOWN"];
+        let mut allowed: std::collections::HashSet<&str> =
+            pre_6_4_1_aggregate_whitelist.iter().copied().collect();
+        allowed.extend(post_6_4_1_aggregate_additions.iter().copied());
         for m in r.iter_metadata() {
             if m.arg_context == ArgContext::Aggregate {
                 assert!(
-                    pre_set.contains(&m.canonical_name.as_str()),
+                    allowed.contains(m.canonical_name.as_str()),
                     "{}: registered with arg_context=Aggregate but is NOT in the \
-                     pre-6.4-1 `is_aggregate_function` whitelist — Phase 1.5 \
-                     silently added a name (extension OK, but cycle-1 H1 claimed \
-                     byte-for-byte; this test pins that claim)",
+                     pre-6.4-1 `is_aggregate_function` whitelist nor the explicit \
+                     post-6.4-1 additions allowlist — a name was silently added \
+                     to the Phase-1.5 override list. If intentional, add it to \
+                     `post_6_4_1_aggregate_additions`.",
                     m.canonical_name,
                 );
             }
+        }
+    }
+
+    /// **B2 (native quant fns):** SHARPE + MAX_DRAWDOWN must register
+    /// `ArgContext::Aggregate` so the binder routes their range arg through
+    /// `AggregateNameRef` / `RangeRef` instead of an implicitly-intersected
+    /// scalar. Mirrors `arg_context_overrides_match_pre_6_4_1_whitelists` for
+    /// the two new names (which are deliberately excluded from the
+    /// byte-for-byte pre-6.4-1 fixture). The full lex→parse→bind→eval armor
+    /// lives in `ql-exec::workbook_runtime::validate::b2_*`.
+    #[test]
+    fn b2_quant_fns_admitted_to_is_aggregate_function() {
+        let r = default_registry();
+        for name in ["SHARPE", "MAX_DRAWDOWN"] {
+            assert_eq!(
+                r.metadata(name).map(|m| m.arg_context),
+                Some(ArgContext::Aggregate),
+                "{name} must register ArgContext::Aggregate (binder admits the \
+                 range arg; otherwise =SHARPE(A1:A10) collapses to a scalar)",
+            );
+            assert!(
+                r.lookup_range_aware(name).is_some(),
+                "{name} must be registered in the range-aware dispatch table",
+            );
+            assert!(
+                r.lookup(name).is_none(),
+                "{name} is range-aware ONLY; must not also appear in the scalar table",
+            );
         }
     }
 

@@ -510,6 +510,17 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "IRR",
         "W5-168; unit tests pin Newton-Raphson + bisection fallback + sign-change requirement",
     ),
+    // B2 (native quant fns) — range-aware quant aggregates built on the
+    // welford stddev/mean primitives. Direct unit tests in financial_fns +
+    // full-path lex/parse/bind/eval tests in ql-exec::validate.
+    (
+        "SHARPE",
+        "B2; unit tests pin mean(excess)/sample-stdev + sqrt(periods) annualization + Rf + sample-vs-population pin + empty #NUM! / n<2 #DIV/0! / zero-dispersion #DIV/0! / non-positive periods #NUM! / non-finite-input #NUM! + skip text/bool + error propagation + scalar/range-position #VALUE! + arity; full-path =SHARPE(NamedRange[,Rf,periods]) in ql-exec::validate (literal A1:A4 is a pre-existing engine-global aggregate limitation)",
+    ),
+    (
+        "MAX_DRAWDOWN",
+        "B2; unit tests pin running-peak max peak-to-trough decline (negative fraction) + monotonic/single-value 0.0 + full-wipeout -1.0 + zero-after-peak full-loss + empty #NUM! / non-positive-peak #DIV/0! / negative-level #NUM! / non-finite-input #NUM! + skip text/bool + error propagation + scalar-arg/arity #VALUE!; full-path =MAX_DRAWDOWN(NamedRange) (incl. underscore-ident lex) in ql-exec::validate",
+    ),
     // W5-169 (Phase 4.10.G) — modern lookups + ADDRESS.
     (
         "XLOOKUP",

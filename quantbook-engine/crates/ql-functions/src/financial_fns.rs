@@ -1450,6 +1450,239 @@ pub fn mirr(args: &[FnArg]) -> Value {
     finish(compute_mirr(&values, finance_rate, reinvest_rate))
 }
 
+// ===== B2 (native quant fns): SHARPE / MAX_DRAWDOWN =====
+//
+// The cheapest tangible "beyond-Excel" win: native, range-aware quant
+// functions that build directly on the engine's existing numerically-stable
+// stddev/mean primitives (`crate::welford`) rather than reimplementing the
+// math. Both are range-aware aggregates — the first arg MUST bind as a
+// `FnArg::Range` (admitted to `is_aggregate_function` via the Phase-1.5
+// `ArgContext::Aggregate` override list in `registry.rs`, otherwise the range
+// collapses to an implicitly-intersected scalar at bind time).
+//
+// **Coercion canon (matches NPV/IRR/MIRR — W5-171):** within the data range,
+// blank / text / boolean cells are SKIPPED; a cell error propagates as the
+// function result. This is the documented Excel-financial convention reused
+// verbatim — a returns series with a stray label row or a blank gap behaves
+// like Excel's NPV/IRR rather than erroring on the whole range.
+
+/// Collect the numeric values of a single range argument, applying the
+/// NPV/IRR coercion canon (skip blank/text/bool, propagate cell errors).
+/// `Ok(values)` preserves source order (row-major flatten of the range);
+/// a scalar arg is rejected with `#VALUE!` (these functions operate on a
+/// series, not a single value).
+///
+/// **Codex MED (B2 audit) — No-Fallbacks:** a non-finite numeric cell
+/// (`NaN` / `±Inf`) is surfaced loudly as `#NUM!` rather than carried into
+/// the kernel. `finish()` only sanitizes the *final* result, so a non-finite
+/// input that produces a finite-but-bogus intermediate (e.g. `Inf/Inf = NaN`
+/// in the drawdown ratio, then ignored by a `<` comparison) would otherwise
+/// escape unnoticed. Rejecting at ingestion keeps the contract honest: the
+/// inputs to a Sharpe/drawdown statistic must be real, finite numbers.
+fn collect_series(arg: &FnArg) -> Result<Vec<f64>, ErrorValue> {
+    match arg {
+        FnArg::Range { values, .. } => {
+            let mut out = Vec::with_capacity(values.len());
+            for v in values {
+                match v {
+                    Value::Number(n) => {
+                        if !n.is_finite() {
+                            return Err(ErrorValue::Num); // No-Fallbacks: NaN/Inf is bad data
+                        }
+                        out.push(*n);
+                    }
+                    Value::Blank => {}                 // skip per Excel canon
+                    Value::Error(e) => return Err(*e), // propagate
+                    _ => {}                            // skip text/bool per Excel canon
+                }
+            }
+            Ok(out)
+        }
+        FnArg::Scalar(_) => Err(ErrorValue::Value),
+    }
+}
+
+/// **B2:** `SHARPE` core — the (ex-post) Sharpe ratio of a periodic return
+/// series.
+///
+/// Definition (Sharpe 1966 "Mutual Fund Performance"; revised Sharpe 1994
+/// "The Sharpe Ratio", J. Portfolio Management):
+///
+/// ```text
+/// SR = mean(R - Rf) / stdev(R)
+/// ```
+///
+/// where `R` is the per-period return series and `Rf` is the (constant)
+/// per-period risk-free rate. Since `Rf` is constant, `mean(R - Rf) =
+/// mean(R) - Rf`, so we subtract `Rf` from the mean of returns rather than
+/// from every element.
+///
+/// **Decisions (documented contract):**
+/// - **Sample** standard deviation (Bessel-corrected, denominator `n-1`) — the
+///   ex-post Sharpe estimated from a *sample* of returns; matches Excel
+///   `STDEV.S` and the quant-standard estimator. Reuses
+///   `crate::welford::sample_stdev` (NIST-numacc-accurate two-pass).
+/// - **Annualization:** if `periods_per_year` is provided (> 0), the ratio is
+///   scaled by `sqrt(periods_per_year)` — the standard Sharpe annualization
+///   (a per-period Sharpe times √frequency). Omitted ⇒ raw per-period Sharpe.
+/// - `Rf` is interpreted as a per-period rate matching the return series'
+///   frequency (not annualized internally — the caller supplies it in the
+///   series' own units).
+///
+/// **Errors (No-Fallbacks):**
+/// - empty series (0 numeric values) ⇒ `#NUM!`
+/// - `n < 2` (sample stdev undefined) ⇒ `#DIV/0!` (mirrors CONFIDENCE.T)
+/// - zero dispersion (`stdev == 0`, a constant series) ⇒ `#DIV/0!`
+/// - `periods_per_year <= 0` ⇒ `#NUM!` (a non-positive frequency has no √)
+fn compute_sharpe(
+    returns: &[f64],
+    risk_free: f64,
+    periods_per_year: Option<f64>,
+) -> Result<f64, ErrorValue> {
+    if returns.is_empty() {
+        return Err(ErrorValue::Num);
+    }
+    if returns.len() < 2 {
+        return Err(ErrorValue::DivZero);
+    }
+    let sd = match crate::welford::sample_stdev(returns) {
+        Some(sd) => sd,
+        None => return Err(ErrorValue::DivZero), // n < 2 (already guarded)
+    };
+    if sd == 0.0 {
+        return Err(ErrorValue::DivZero);
+    }
+    let mean = match crate::welford::mean(returns) {
+        Some(m) => m,
+        None => return Err(ErrorValue::Num), // empty (already guarded)
+    };
+    let mut sr = (mean - risk_free) / sd;
+    if let Some(ppy) = periods_per_year {
+        if ppy <= 0.0 {
+            return Err(ErrorValue::Num);
+        }
+        sr *= ppy.sqrt();
+    }
+    Ok(sr)
+}
+
+/// **B2:** `MAX_DRAWDOWN` core — the maximum peak-to-trough decline of an
+/// equity / price / NAV series.
+///
+/// Definition (Bacon, "Practical Portfolio Performance Measurement and
+/// Attribution", 2nd ed.; the same quantity `empyrical.max_drawdown` reports):
+///
+/// ```text
+/// MDD = min_t ( value_t / running_peak_t  -  1 )
+/// ```
+///
+/// **Decisions (documented contract):**
+/// - **Input is an equity / price level series** (a NAV / cumulative-value
+///   curve), NOT a periodic-return series. We compute the running peak and the
+///   largest fractional decline from it. (Compounding a returns series first is
+///   a deliberately-deferred follow-on — see the plan; here the series is the
+///   level itself, which is the conventional MDD input.)
+/// - **Sign convention: a negative fraction.** A 25% peak-to-trough loss
+///   returns `-0.25`; a monotonically non-decreasing series returns `0.0`.
+///   This matches empyrical / common quant tooling (drawdown is a loss, so it
+///   is signed negative).
+///
+/// **Errors (No-Fallbacks) — Codex LOW (B2 audit) closure, doc + impl aligned:**
+/// - empty series (0 numeric values) ⇒ `#NUM!`
+/// - a **negative** level (`value < 0`) is invalid data for a price/NAV series
+///   ⇒ `#NUM!`. Without this guard a negative trough after a positive peak
+///   would silently produce a drawdown below `-100%` (a meaningless ratio).
+/// - a non-positive running **peak** (`peak <= 0`, i.e. the first level is `0`)
+///   makes the fractional decline undefined (division by a non-positive
+///   level) ⇒ `#DIV/0!`.
+/// - a level of exactly `0` *after* a positive peak is a legitimate full loss
+///   ⇒ contributes `-1.0` (a 100% drawdown); it is NOT rejected. So the only
+///   accepted levels are `>= 0`, with `0` meaningful only once a positive peak
+///   exists.
+fn compute_max_drawdown(series: &[f64]) -> Result<f64, ErrorValue> {
+    if series.is_empty() {
+        return Err(ErrorValue::Num);
+    }
+    let mut peak = f64::NEG_INFINITY;
+    let mut max_dd = 0.0_f64; // most-negative drawdown seen (0 if never below peak)
+    for &v in series {
+        // A negative price/NAV level is invalid input — surface loudly so a
+        // sub-(-100%) drawdown can never be silently produced.
+        if v < 0.0 {
+            return Err(ErrorValue::Num);
+        }
+        if v > peak {
+            peak = v;
+        }
+        // The first element sets the peak to itself ⇒ dd = 0 there. A
+        // non-positive peak (first level == 0) makes the ratio undefined.
+        if peak <= 0.0 {
+            return Err(ErrorValue::DivZero);
+        }
+        let dd = v / peak - 1.0; // in [-1, 0]
+        if dd < max_dd {
+            max_dd = dd;
+        }
+    }
+    Ok(max_dd)
+}
+
+/// `SHARPE(returns_range, [risk_free_rate=0], [periods_per_year])` —
+/// ex-post Sharpe ratio. See [`compute_sharpe`] for the exact semantics
+/// (sample stdev, optional √-frequency annualization, error contract).
+///
+/// RangeAwareFn: arg 0 MUST be a range (the return series); args 1–2 are
+/// scalars. A range in a scalar position, or a missing/extra arg, is
+/// `#VALUE!`.
+pub fn sharpe(args: &[FnArg]) -> Value {
+    if !(1..=3).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let returns = match collect_series(&args[0]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let risk_free = if args.len() >= 2 {
+        match &args[1] {
+            FnArg::Scalar(v) => match arg_num(v) {
+                Ok(n) => n,
+                Err(e) => return Value::Error(e),
+            },
+            FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+        }
+    } else {
+        0.0
+    };
+    let periods_per_year = if args.len() == 3 {
+        match &args[2] {
+            FnArg::Scalar(v) => match arg_num(v) {
+                Ok(n) => Some(n),
+                Err(e) => return Value::Error(e),
+            },
+            FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+        }
+    } else {
+        None
+    };
+    finish(compute_sharpe(&returns, risk_free, periods_per_year))
+}
+
+/// `MAX_DRAWDOWN(series_range)` — maximum peak-to-trough decline of an
+/// equity/price level series, as a negative fraction. See
+/// [`compute_max_drawdown`] for the exact semantics + error contract.
+///
+/// RangeAwareFn: arg 0 MUST be a range; exactly one arg.
+pub fn max_drawdown(args: &[FnArg]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let series = match collect_series(&args[0]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    finish(compute_max_drawdown(&series))
+}
+
 // ===== W5-D-7 (Wave 3 closure — date-indexed cash flow): XNPV / XIRR =====
 //
 // XNPV is closed-form. XIRR uses Newton-Raphson on XNPV's derivative
@@ -2212,6 +2445,279 @@ mod tests {
             mirr(&[cash, s(n(-1.5)), s(n(0.12))]),
             Value::Error(ErrorValue::Num)
         );
+    }
+
+    // --- B2: SHARPE ---
+
+    #[test]
+    fn sharpe_basic_rf_zero() {
+        // returns [0.01, 0.02, 0.03, 0.04]; mean=0.025;
+        // sample stdev = sqrt(0.0005/3) = 0.0129099445;
+        // SHARPE (Rf=0) = 0.025 / 0.0129099445 = 1.9364916731.
+        let ret = r(vec![n(0.01), n(0.02), n(0.03), n(0.04)]);
+        approx(sharpe(std::slice::from_ref(&ret)), 1.9364916731, 1e-9);
+    }
+
+    #[test]
+    fn sharpe_with_risk_free() {
+        // (0.025 - 0.01) / 0.0129099445 = 1.1618950039.
+        let ret = r(vec![n(0.01), n(0.02), n(0.03), n(0.04)]);
+        approx(sharpe(&[ret, s(n(0.01))]), 1.1618950039, 1e-9);
+    }
+
+    #[test]
+    fn sharpe_annualized_sqrt_periods() {
+        // 1.9364916731 * sqrt(4) = 3.8729833462.
+        let ret = r(vec![n(0.01), n(0.02), n(0.03), n(0.04)]);
+        approx(sharpe(&[ret, s(n(0.0)), s(n(4.0))]), 3.8729833462, 1e-9);
+    }
+
+    #[test]
+    fn sharpe_uses_sample_stdev_not_population() {
+        // Two-point series [1.0, 3.0]: mean=2, sample stdev = sqrt(2) ≈
+        // 1.4142135624 (population stdev would be 1.0). SHARPE = 2/sqrt(2)
+        // = sqrt(2) ≈ 1.4142135624. If population stdev were used the
+        // answer would be 2.0 — this pins the sample-vs-population choice.
+        let ret = r(vec![n(1.0), n(3.0)]);
+        approx(
+            sharpe(std::slice::from_ref(&ret)),
+            std::f64::consts::SQRT_2,
+            1e-12,
+        );
+    }
+
+    #[test]
+    fn sharpe_empty_range_is_num() {
+        let empty = FnArg::Range {
+            values: vec![],
+            rows: 0,
+            cols: 0,
+        };
+        assert_eq!(sharpe(&[empty]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn sharpe_single_value_is_div_zero() {
+        // n=1: sample stdev undefined → #DIV/0! (mirrors CONFIDENCE.T).
+        let ret = r(vec![n(0.05)]);
+        assert_eq!(sharpe(&[ret]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn sharpe_zero_dispersion_is_div_zero() {
+        // Constant series: stdev=0 → division by zero, surfaced loudly.
+        let ret = r(vec![n(0.02), n(0.02), n(0.02)]);
+        assert_eq!(sharpe(&[ret]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn sharpe_non_positive_periods_is_num() {
+        let ret = r(vec![n(0.01), n(0.02), n(0.03)]);
+        assert_eq!(
+            sharpe(&[ret.clone(), s(n(0.0)), s(n(0.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            sharpe(&[ret, s(n(0.0)), s(n(-12.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn sharpe_skips_text_and_bool_per_excel_canon() {
+        // Text + bool skipped; computation runs on [0.01,0.02,0.03,0.04].
+        let ret = r(vec![
+            n(0.01),
+            Value::text("label"),
+            n(0.02),
+            Value::Boolean(true),
+            n(0.03),
+            n(0.04),
+        ]);
+        approx(sharpe(std::slice::from_ref(&ret)), 1.9364916731, 1e-9);
+    }
+
+    #[test]
+    fn sharpe_error_in_range_propagates() {
+        let ret = r(vec![n(0.01), Value::Error(ErrorValue::Ref), n(0.02)]);
+        assert_eq!(
+            sharpe(std::slice::from_ref(&ret)),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn sharpe_scalar_first_arg_is_value_error() {
+        assert_eq!(sharpe(&[s(n(0.02))]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn sharpe_range_in_scalar_position_is_value_error() {
+        let ret = r(vec![n(0.01), n(0.02), n(0.03)]);
+        let bad = r(vec![n(0.01)]);
+        // risk_free as a range.
+        assert_eq!(
+            sharpe(&[ret.clone(), bad.clone()]),
+            Value::Error(ErrorValue::Value)
+        );
+        // periods_per_year as a range.
+        assert_eq!(
+            sharpe(&[ret, s(n(0.0)), bad]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn sharpe_wrong_arity() {
+        let ret = r(vec![n(0.01), n(0.02), n(0.03)]);
+        assert_eq!(sharpe(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            sharpe(&[ret, s(n(0.0)), s(n(12.0)), s(n(1.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- B2: MAX_DRAWDOWN ---
+
+    #[test]
+    fn max_drawdown_basic() {
+        // Equity series [100, 120, 90, 110, 80, 130]:
+        // running peak 100,120,120,120,120,130.
+        // drawdowns 0, 0, -0.25, -0.0833, -0.3333, 0.
+        // MDD = 80/120 - 1 = -1/3 = -0.3333333...
+        let eq = r(vec![
+            n(100.0),
+            n(120.0),
+            n(90.0),
+            n(110.0),
+            n(80.0),
+            n(130.0),
+        ]);
+        approx(max_drawdown(std::slice::from_ref(&eq)), -1.0 / 3.0, 1e-12);
+    }
+
+    #[test]
+    fn max_drawdown_monotonic_is_zero() {
+        // Non-decreasing series never dips below its running peak ⇒ 0.0.
+        let eq = r(vec![n(100.0), n(110.0), n(120.0)]);
+        assert_eq!(max_drawdown(&[eq]), Value::Number(0.0));
+    }
+
+    #[test]
+    fn max_drawdown_single_value_is_zero() {
+        // One observation: peak = itself, dd = 0 ⇒ 0.0 (NOT an error;
+        // a single level has no decline, unlike a stdev which needs n≥2).
+        let eq = r(vec![n(50.0)]);
+        assert_eq!(max_drawdown(&[eq]), Value::Number(0.0));
+    }
+
+    #[test]
+    fn max_drawdown_full_wipeout() {
+        // Drop to zero from a positive peak ⇒ -1.0 (a 100% drawdown).
+        let eq = r(vec![n(100.0), n(0.0)]);
+        approx(max_drawdown(&[eq]), -1.0, 1e-12);
+    }
+
+    #[test]
+    fn max_drawdown_empty_range_is_num() {
+        let empty = FnArg::Range {
+            values: vec![],
+            rows: 0,
+            cols: 0,
+        };
+        assert_eq!(max_drawdown(&[empty]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn max_drawdown_non_positive_peak_is_div_zero() {
+        // A non-positive running peak makes the fractional decline undefined.
+        // Leading zero → peak 0 on the first element ⇒ #DIV/0! (0 is NOT
+        // rejected by the value<0 guard; only the peak<=0 guard fires).
+        let eq = r(vec![n(0.0), n(10.0)]);
+        assert_eq!(max_drawdown(&[eq]), Value::Error(ErrorValue::DivZero));
+        // A leading NEGATIVE level is invalid data → #NUM! (the value<0 guard
+        // fires before the peak guard; see max_drawdown_negative_level_is_num).
+        let eq2 = r(vec![n(-5.0), n(10.0)]);
+        assert_eq!(max_drawdown(&[eq2]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn max_drawdown_skips_text_and_bool_per_excel_canon() {
+        // Text + bool skipped; runs on [100, 80] ⇒ -0.2.
+        let eq = r(vec![
+            n(100.0),
+            Value::text("hdr"),
+            Value::Boolean(false),
+            n(80.0),
+        ]);
+        approx(max_drawdown(std::slice::from_ref(&eq)), -0.2, 1e-12);
+    }
+
+    #[test]
+    fn max_drawdown_error_in_range_propagates() {
+        let eq = r(vec![n(100.0), Value::Error(ErrorValue::Num), n(80.0)]);
+        assert_eq!(max_drawdown(&[eq]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn max_drawdown_scalar_arg_is_value_error() {
+        assert_eq!(
+            max_drawdown(&[s(n(100.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn max_drawdown_wrong_arity() {
+        let eq = r(vec![n(100.0), n(90.0)]);
+        assert_eq!(max_drawdown(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            max_drawdown(&[eq, s(n(1.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- B2: non-finite + negative-level guards (Codex MED + LOW closure) ---
+
+    #[test]
+    fn max_drawdown_non_finite_input_is_num() {
+        // **Codex MED:** ±Inf / NaN in the series is bad data → #NUM!, not a
+        // silently-finite bogus result. Without the collect_series guard,
+        // [+Inf] gives Inf/Inf = NaN → ignored by `<` → returns 0.0.
+        let eq = r(vec![n(100.0), n(f64::INFINITY), n(80.0)]);
+        assert_eq!(max_drawdown(&[eq]), Value::Error(ErrorValue::Num));
+        let eq2 = r(vec![n(f64::NAN)]);
+        assert_eq!(max_drawdown(&[eq2]), Value::Error(ErrorValue::Num));
+        let eq3 = r(vec![n(100.0), n(f64::NEG_INFINITY)]);
+        assert_eq!(max_drawdown(&[eq3]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn max_drawdown_negative_level_is_num() {
+        // **Codex LOW:** a negative price/NAV level is invalid input → #NUM!
+        // (would otherwise produce a sub-(-100%) drawdown). A leading negative
+        // is also #NUM! (caught by the value<0 guard before the peak guard).
+        let eq = r(vec![n(100.0), n(120.0), n(-10.0)]);
+        assert_eq!(max_drawdown(&[eq]), Value::Error(ErrorValue::Num));
+        let eq2 = r(vec![n(-5.0), n(10.0)]);
+        assert_eq!(max_drawdown(&[eq2]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn max_drawdown_zero_after_positive_peak_is_full_loss() {
+        // A level of exactly 0 AFTER a positive peak is a legitimate 100%
+        // loss → -1.0 (NOT rejected; only NEGATIVE levels error).
+        let eq = r(vec![n(100.0), n(50.0), n(0.0), n(0.0)]);
+        approx(max_drawdown(&[eq]), -1.0, 1e-12);
+    }
+
+    #[test]
+    fn sharpe_non_finite_input_is_num() {
+        // **Codex MED:** ±Inf / NaN in the returns range → #NUM!.
+        let ret = r(vec![n(0.01), n(f64::INFINITY), n(0.03)]);
+        assert_eq!(sharpe(&[ret]), Value::Error(ErrorValue::Num));
+        let ret2 = r(vec![n(0.01), n(f64::NAN), n(0.02), n(0.03)]);
+        assert_eq!(sharpe(&[ret2]), Value::Error(ErrorValue::Num));
     }
 
     #[test]
