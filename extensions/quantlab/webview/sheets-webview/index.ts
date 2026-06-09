@@ -542,6 +542,45 @@ function setActiveClamped(row: number, col: number): void {
 	ensureActiveVisible();
 }
 
+/** **Excel nav keys** -- jump the selection to an absolute (clamped) SINGLE cell, scroll it into view, and
+ *  repaint. The absolute-landing counterpart of {@link moveActive} (which moves by a delta): Home / End /
+ *  Ctrl+Home / Ctrl+End all land on a known cell rather than stepping. Collapses any range (clears the
+ *  anchor, via {@link setActiveClamped}) -- these are single-cell landings, matching a plain arrow move. */
+function jumpActive(row: number, col: number): void {
+	setActiveClamped(row, col);
+	redraw();
+}
+
+/** **Excel nav keys** -- the last USED cell from the current snapshot's extent: the intersection of the
+ *  greatest populated row and the greatest populated column (Excel's Ctrl+End target). An empty / absent
+ *  snapshot has no used cells, so this returns A1 `{row:0,col:0}`. Coordinates are clamped to the grid by
+ *  the caller's {@link jumpActive}. Computed lazily on keypress (not cached) -- the snapshot can change on
+ *  any render, and a stale extent would jump to the wrong cell. */
+function usedExtent(): { row: number; col: number } {
+	if (fullSnapshot === null || fullSnapshot.entries.length === 0) {
+		return { row: 0, col: 0 };
+	}
+	let maxRow = 0;
+	let maxCol = 0;
+	for (const e of fullSnapshot.entries) {
+		if (e.row > maxRow) {
+			maxRow = e.row;
+		}
+		if (e.col > maxCol) {
+			maxCol = e.col;
+		}
+	}
+	return { row: maxRow, col: maxCol };
+}
+
+/** **Excel nav keys** -- the number of whole data rows currently visible below the sticky header, for
+ *  PageUp / PageDown (which move the active cell by one screenful). At least 1 so a tiny viewport still
+ *  advances by a cell rather than stalling. */
+function visibleRowSpan(): number {
+	const usable = viewportEl.clientHeight - HEADER_HEIGHT;
+	return Math.max(1, Math.floor(usable / ROW_HEIGHT));
+}
+
 /** **W-G-2a** -- collapse any multi-cell range back to the single focus cell (clear the anchor). */
 function collapseSelection(): void {
 	anchor = null;
@@ -1944,6 +1983,13 @@ document.addEventListener('keydown', ev => {
 	if (editState !== null) {
 		return; // the editor has its own handler
 	}
+	// W1 formula-intel: if the completion dropdown is showing, it owns the keyboard (its keys are intercepted
+	// on the editor's own handler). `completion` is only non-null during a formula edit, so `editState !== null`
+	// above already covers this -- but guard explicitly so a future change that can leave `completion` set
+	// outside an edit never lets a nav key fire underneath an open dropdown.
+	if (completion !== null) {
+		return;
+	}
 	// megaudit Lane C: ignore document shortcuts (undo/redo, copy/cut/paste, nav, type-to-edit) WHILE a
 	// fill-handle drag is in flight. A Ctrl+X mid-drag would replace the clipboard and silently discard a
 	// pending CUT; arrow/nav keys would move the selection under the drag. The drag owns input until
@@ -1989,6 +2035,20 @@ document.addEventListener('keydown', ev => {
 			pasteGridClipboard();
 			return;
 		}
+		// Excel nav keys (meta variants). Ctrl/Cmd+Home -> A1; Ctrl/Cmd+End -> the last used cell (snapshot
+		// extent). Mirror the arrow path's setActive/clamp/scroll-into-view via jumpActive (no new movement
+		// mechanism). `ev.key` for these is 'Home' / 'End' regardless of the meta modifier.
+		if (ev.key === 'Home') {
+			ev.preventDefault();
+			jumpActive(0, 0);
+			return;
+		}
+		if (ev.key === 'End') {
+			ev.preventDefault();
+			const end = usedExtent();
+			jumpActive(end.row, end.col);
+			return;
+		}
 		return; // leave other meta combos alone
 	}
 	if (ev.altKey) {
@@ -2017,6 +2077,32 @@ document.addEventListener('keydown', ev => {
 		case 'ArrowRight':
 			ev.preventDefault();
 			(ev.shiftKey ? extendActive : moveActive)(0, 1);
+			return;
+		case 'Home':
+			// Excel: Home -> column A of the current row (plain; the Ctrl/Cmd+Home -> A1 variant is handled in
+			// the isMeta block above).
+			ev.preventDefault();
+			jumpActive(active === null ? 0 : active.row, 0);
+			return;
+		case 'End':
+			// Excel: End / Ctrl+End -> the last used cell (snapshot extent). The plain-End variant lands here;
+			// the meta variant is handled above. Both target the same cell per the spec.
+			ev.preventDefault();
+			{
+				const end = usedExtent();
+				jumpActive(end.row, end.col);
+			}
+			return;
+		case 'PageUp':
+			// Move the active cell UP by one screenful of rows (+ scroll into view, via moveActive's
+			// ensureActiveVisible). Mirrors the arrow path; clamps at row 0.
+			ev.preventDefault();
+			moveActive(-visibleRowSpan(), 0);
+			return;
+		case 'PageDown':
+			// Move the active cell DOWN by one screenful of rows (+ scroll into view). Mirrors the arrow path.
+			ev.preventDefault();
+			moveActive(visibleRowSpan(), 0);
 			return;
 		case 'Tab':
 			ev.preventDefault();
