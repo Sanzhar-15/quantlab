@@ -25,7 +25,7 @@
  */
 
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
-import { clampDisplayString, computeVisibleRowRange, formatCellValue, isRenderableValue } from './cellRender';
+import { clampDisplayString, formatCellValue, isRenderableValue } from './cellRender';
 import type { ScrollBlit } from './gridBlitA1';
 import {
 	COL_WIDTH,
@@ -34,9 +34,13 @@ import {
 	MAX_ROWS,
 	ROW_HEIGHT,
 	type SelectionRect,
+	clampFrozenCount,
 	colX,
 	columnLabel,
-	computeVisibleColRange,
+	computeVisibleBodyColRange,
+	computeVisibleBodyRowRange,
+	frozenColsWidth,
+	frozenRowsHeight,
 	gutterWidth,
 	isInExtent,
 	rowY,
@@ -183,6 +187,16 @@ export class CanvasGridRenderer {
 	 * scroll-dependent one. A few px wider than needed at low row numbers; that is fine.
 	 */
 	private gutterW: number;
+	/**
+	 * **W3 frozen panes (2026-06-09)** -- the number of leading rows / columns PINNED below the header /
+	 * right of the gutter (Excel "Freeze Panes"). 0 = no freeze (the byte-identical pre-W3 paint path). The
+	 * host sets these via {@link setFrozen} on a `freeze`/`unfreeze` message; the renderer paints the four
+	 * panes (body + frozen-rows + frozen-cols + frozen-corner) and the orchestrator threads the counts into
+	 * the blit math so a scroll still blits (the frozen bands are excluded from the copy + repainted each
+	 * frame, like the sticky header/gutter). Always sane integers in `[0, MAX-1]` (validated in setFrozen).
+	 */
+	private frozenRowCount = 0;
+	private frozenColCount = 0;
 	private readonly measureCache = new Map<string, number>();
 	/**
 	 * **FE-0b-4** -- true once a full {@link draw} has painted the current backing store. Reset to
@@ -223,6 +237,27 @@ export class CanvasGridRenderer {
 	/** The stable sticky-gutter width in CSS px (for the overlay editor, hit-test, spacer, nav). */
 	get gutterWidthPx(): number {
 		return this.gutterW;
+	}
+
+	/**
+	 * **W3 frozen panes** -- set the freeze (N leading rows + N leading cols pinned). Counts are clamped to
+	 * sane non-negative integers in `[0, MAX-1]` (a full-axis freeze would leave no scrollable body, so the
+	 * last index can never be frozen). Does NOT repaint -- the host calls this then `redraw()`. `setFrozen(0,0)`
+	 * restores the byte-identical no-freeze paint path (Unfreeze).
+	 */
+	setFrozen(rows: number, cols: number): void {
+		this.frozenRowCount = clampFrozenCount(rows, MAX_ROWS);
+		this.frozenColCount = clampFrozenCount(cols, MAX_COLS);
+	}
+
+	/** **W3 frozen panes** -- the current pinned-row count (the orchestrator's blit gate reads this via the host). */
+	get frozenRows(): number {
+		return this.frozenRowCount;
+	}
+
+	/** **W3 frozen panes** -- the current pinned-col count. */
+	get frozenCols(): number {
+		return this.frozenColCount;
 	}
 
 	private static resolveDpr(): number {
@@ -400,11 +435,31 @@ export class CanvasGridRenderer {
 		const sorted = [...rows].sort((a, b) => a - b);
 		let runStart = sorted[0];
 		let runEnd = sorted[0];
-		const addBand = (r0: number, r1: number): void => {
-			const yTop = rowY(r0) - scrollTop;
+		const fRows = this.frozenRowCount;
+		// **Codex HIGH-1**: a FROZEN row paints PINNED at `rowY(r)-0` (in the frozen-row band), NOT at the
+		// scrolled `rowY(r)-scrollTop`. Clipping a frozen row's damage at the scrolled Y (offscreen once the
+		// body has scrolled) would leave its cell value / error tint STALE until a full redraw. So a damaged
+		// run that straddles the frozen boundary is added as TWO clip rects: the frozen part at effScroll 0,
+		// the body part at scrollTop. `paintWindow` repaints every pane inside the clip, so covering each
+		// part's pinned/scrolled viewport band is sufficient.
+		const addRect = (r0: number, r1: number, effScrollTop: number): void => {
+			const yTop = rowY(r0) - effScrollTop;
 			const h = (r1 - r0 + 1) * ROW_HEIGHT;
 			// Pad so the rounded paint origins sit fully inside the clip (see DAMAGE_CLIP_PAD).
 			ctx.rect(0, yTop - DAMAGE_CLIP_PAD, cssWidth, h + DAMAGE_CLIP_PAD * 2);
+		};
+		const addBand = (r0: number, r1: number): void => {
+			if (fRows <= 0 || r0 >= fRows) {
+				addRect(r0, r1, scrollTop); // wholly in the scrolling body
+				return;
+			}
+			if (r1 < fRows) {
+				addRect(r0, r1, 0); // wholly in the frozen-row band (pinned)
+				return;
+			}
+			// Straddles the boundary: frozen part [r0, fRows-1] pinned, body part [fRows, r1] scrolled.
+			addRect(r0, fRows - 1, 0);
+			addRect(fRows, r1, scrollTop);
 		};
 		for (let i = 1; i < sorted.length; i += 1) {
 			if (sorted[i] === runEnd + 1) {
@@ -479,10 +534,19 @@ export class CanvasGridRenderer {
 	}
 
 	/**
-	 * Paint the A1 grid for `scrollTop/scrollLeft`. The **single source of cell pixels**. Paint order
-	 * (so the sticky bands own every overlapping seam): background -> error-cell tints -> gridlines ->
-	 * values -> selection box -> row gutter (sticky left) -> column header (sticky top) -> corner box.
-	 * Cells that scroll under a band are simply covered by the band's later paint (no clipping needed).
+	 * Paint the A1 grid for `scrollTop/scrollLeft`. The **single source of cell pixels**.
+	 *
+	 * **W3 frozen panes (2026-06-09)**: the cell area is split into up to FOUR panes by the frozen bands --
+	 * the scrolling BODY (bottom-right), the FROZEN-ROWS strip (top-right, pinned on Y), the FROZEN-COLS
+	 * strip (bottom-left, pinned on X), and the FROZEN CORNER (top-left, pinned on both). Each pane paints
+	 * the SAME cell content ({@link paintCellRegion}) but with an EFFECTIVE scroll of 0 on whichever axis is
+	 * frozen, so a pinned cell stays put while the body scrolls under it. With `frozenRowCount === 0 &&
+	 * frozenColCount === 0` there is exactly ONE pane (the body) covering the whole grid at the real scroll,
+	 * so the paint is byte-identical to the pre-W3 single-region path. Each pane is clipped to its viewport
+	 * rectangle so a body cell scrolled under a frozen strip cannot bleed into it.
+	 *
+	 * Paint order (later paints own overlapping seams): background -> body pane -> frozen-cols pane ->
+	 * frozen-rows pane -> frozen corner -> sticky row gutter (left) -> column header (top) -> corner box.
 	 */
 	private paintWindow(
 		cssWidth: number,
@@ -499,60 +563,164 @@ export class CanvasGridRenderer {
 		ctx.fillStyle = this.palette.background;
 		ctx.fillRect(0, 0, cssWidth, cssHeight);
 
-		// Visible window. Rows are independent of the gutter; the gutter width then depends on the
-		// largest visible row, and the visible columns depend on the gutter -- compute in that order.
-		const bodyHeight = Math.max(0, cssHeight - HEADER_HEIGHT);
-		const rowRange = computeVisibleRowRange(scrollTop, bodyHeight, MAX_ROWS, ROW_HEIGHT, OVERSCAN);
 		const gutterW = this.gutterW;
+		const fRows = this.frozenRowCount;
+		const fCols = this.frozenColCount;
+		const frozenRowsPx = frozenRowsHeight(fRows);
+		const frozenColsPx = frozenColsWidth(fCols);
+
+		// The body pane's top-left viewport corner (just past the header+frozen-rows band / gutter+frozen-cols
+		// band). Cells in the body scroll under those bands.
+		const bodyTop = HEADER_HEIGHT + frozenRowsPx;
+		const bodyLeft = gutterW + frozenColsPx;
+
+		// Visible ranges. The SCROLLING body skips the frozen rows/cols (they paint pinned). The frozen rows
+		// span [0, fRows); the frozen cols span [0, fCols). `bodyHeight`/`bodyWidth` are the full bands below
+		// the header / right of the gutter (the frozen-band subtraction happens inside the body-range fns).
+		const bodyHeight = Math.max(0, cssHeight - HEADER_HEIGHT);
 		const bodyWidth = Math.max(0, cssWidth - gutterW);
-		const colRange = computeVisibleColRange(scrollLeft, bodyWidth, MAX_COLS, COL_WIDTH, OVERSCAN);
+		const bodyRowRange = computeVisibleBodyRowRange(scrollTop, bodyHeight, MAX_ROWS, ROW_HEIGHT, OVERSCAN, fRows);
+		const bodyColRange = computeVisibleBodyColRange(scrollLeft, bodyWidth, MAX_COLS, COL_WIDTH, OVERSCAN, fCols);
+		// **Codex HIGH-3**: cap the FROZEN ranges to what is actually ON SCREEN. A deep freeze (e.g. row 500k)
+		// makes `frozenRowsPx` far exceed the viewport; the frozen band is clipped to `[HEADER_HEIGHT,
+		// min(bodyTop, cssHeight))`, so at most `ceil((cssHeight-HEADER_HEIGHT)/ROW_HEIGHT)+1` rows are visible.
+		// Looping all `fRows` (or `fRows*fCols` for the corner) would be O(100k+) per frame for nothing painted.
+		// The band is exactly `fRows*ROW_HEIGHT` tall, so when it fits the cap is a no-op (== fRows). +1 covers a
+		// partially-visible last row at the band/viewport edge.
+		const visFrozenRows = Math.min(fRows, Math.max(0, Math.ceil((cssHeight - HEADER_HEIGHT) / ROW_HEIGHT) + 1));
+		const visFrozenCols = Math.min(fCols, Math.max(0, Math.ceil((cssWidth - gutterW) / COL_WIDTH) + 1));
+		const frozenRowEnd = visFrozenRows; // [0, visFrozenRows) -- only the on-screen frozen rows
+		const frozenColEnd = visFrozenCols; // [0, visFrozenCols) -- only the on-screen frozen cols
+
+		// 1. BODY pane (bottom-right): scrolls both axes. Clipped to [bodyLeft, cssWidth) x [bodyTop, cssHeight)
+		// so a body cell scrolled under a frozen strip never paints into it. (When fRows===fCols===0, bodyTop
+		// ===HEADER_HEIGHT and bodyLeft===gutterW: the clip is the whole grid below+right of the sticky bands,
+		// and paintCellRegion runs once at the real scroll -- byte-identical to the pre-W3 path.)
+		this.paintCellRegion(
+			bodyRowRange, bodyColRange, scrollTop, scrollLeft, gutterW,
+			bodyLeft, bodyTop, cssWidth, cssHeight,
+			errorCells, active, selection, publishedRanges, fillPreview,
+		);
+
+		// 2. FROZEN-COLS pane (bottom-left): cols [0, fCols) pinned on X (effScrollLeft=0), rows scroll. Only
+		// when there is a frozen-col band. Clipped to [gutterW, bodyLeft) x [bodyTop, cssHeight).
+		if (fCols > 0) {
+			this.paintCellRegion(
+				bodyRowRange, { startIdx: 0, endIdx: frozenColEnd }, scrollTop, 0, gutterW,
+				gutterW, bodyTop, bodyLeft, cssHeight,
+				errorCells, active, selection, publishedRanges, fillPreview,
+			);
+		}
+
+		// 3. FROZEN-ROWS pane (top-right): rows [0, visFrozenRows) pinned on Y (effScrollTop=0), cols scroll.
+		// Clipped to [bodyLeft, cssWidth) x [HEADER_HEIGHT, bodyTop).
+		if (fRows > 0) {
+			this.paintCellRegion(
+				{ startIdx: 0, endIdx: frozenRowEnd }, bodyColRange, 0, scrollLeft, gutterW,
+				bodyLeft, HEADER_HEIGHT, cssWidth, bodyTop,
+				errorCells, active, selection, publishedRanges, fillPreview,
+			);
+		}
+
+		// 4. FROZEN CORNER (top-left): rows [0, visFrozenRows) x cols [0, visFrozenCols), pinned on BOTH axes.
+		// Clipped to [gutterW, bodyLeft) x [HEADER_HEIGHT, bodyTop).
+		if (fRows > 0 && fCols > 0) {
+			this.paintCellRegion(
+				{ startIdx: 0, endIdx: frozenRowEnd }, { startIdx: 0, endIdx: frozenColEnd }, 0, 0, gutterW,
+				gutterW, HEADER_HEIGHT, bodyLeft, bodyTop,
+				errorCells, active, selection, publishedRanges, fillPreview,
+			);
+		}
+
+		// 5. Sticky row gutter (covers cells that scrolled left under it), then header, then corner. The
+		// gutter/header paint BOTH the frozen labels (pinned, capped to the visible count) and the body labels
+		// (scrolled), so the row numbers / column letters line up with each pane.
+		this.drawGutter(scrollTop, gutterW, cssHeight, bodyRowRange.startIdx, bodyRowRange.endIdx, active, selection, visFrozenRows, bodyTop);
+		this.drawHeader(scrollLeft, gutterW, cssWidth, bodyColRange.startIdx, bodyColRange.endIdx, active, selection, visFrozenCols, bodyLeft);
+		this.drawCorner(gutterW);
+	}
+
+	/**
+	 * **W3 frozen panes** -- paint the cell CONTENT (error tints, gridlines, values, selection range +
+	 * focus box, published badges, fill preview + handle) for one rectangular PANE, clipped to its viewport
+	 * rect `[clipX0, clipX1) x [clipY0, clipY1)`. `effScrollTop`/`effScrollLeft` are the EFFECTIVE scroll for
+	 * the pane (0 on a frozen axis, the real scroll on a scrolling axis), so a cell `(r,c)` paints at
+	 * `colX(c)-effScrollLeft` / `rowY(r)-effScrollTop`. This is the pre-W3 `paintWindow` body, lifted
+	 * VERBATIM into a per-pane routine: the body pane (one call, real scroll, full-grid clip) reproduces it
+	 * exactly. Selection/badges/fill use INCLUSIVE-rect intersection against the pane's visible range so a
+	 * range spanning a frozen boundary renders correctly in each pane it touches.
+	 */
+	private paintCellRegion(
+		rowRange: { startIdx: number; endIdx: number },
+		colRange: { startIdx: number; endIdx: number },
+		effScrollTop: number,
+		effScrollLeft: number,
+		gutterW: number,
+		clipX0: number,
+		clipY0: number,
+		clipX1: number,
+		clipY1: number,
+		errorCells: ReadonlyMap<string, string>,
+		active: ActiveCell | null,
+		selection: SelectionRect | null,
+		publishedRanges: readonly PublishedRange[],
+		fillPreview: SelectionRect | null,
+	): void {
+		const ctx = this.ctx;
+		if (clipX1 <= clipX0 || clipY1 <= clipY0 || rowRange.endIdx <= rowRange.startIdx || colRange.endIdx <= colRange.startIdx) {
+			return; // empty pane (no frozen band, or a zero-size viewport)
+		}
+		ctx.save();
+		ctx.beginPath();
+		ctx.rect(clipX0, clipY0, clipX1 - clipX0, clipY1 - clipY0);
+		ctx.clip();
 
 		// 1. Error-cell background tints (under the gridlines + text, like Excel). Audit S1-LOW: snap the
 		// fill origin to a device pixel so the tint aligns with the (rounded) gridlines on non-Electron/test.
 		if (errorCells.size > 0) {
 			ctx.fillStyle = this.palette.errorBg;
 			for (let r = rowRange.startIdx; r < rowRange.endIdx; r += 1) {
-				const ly = Math.round(rowY(r) - scrollTop);
+				const ly = Math.round(rowY(r) - effScrollTop);
 				for (let c = colRange.startIdx; c < colRange.endIdx; c += 1) {
 					if (errorCells.has(r + ',' + c)) {
-						ctx.fillRect(Math.round(colX(c, gutterW) - scrollLeft), ly, COL_WIDTH, ROW_HEIGHT);
+						ctx.fillRect(Math.round(colX(c, gutterW) - effScrollLeft), ly, COL_WIDTH, ROW_HEIGHT);
 					}
 				}
 			}
 		}
 
-		// 2. Gridlines: batched vertical + horizontal lines across the visible body (half-pixel-aligned
-		// for crisp 1px). The bands painted later cover the segments that fall under the gutter/header.
+		// 2. Gridlines: batched vertical + horizontal lines across the pane (half-pixel-aligned for crisp
+		// 1px). Drawn over the pane clip, so a line never bleeds past the frozen seam into the next pane.
 		ctx.strokeStyle = this.palette.border;
 		ctx.lineWidth = 1;
 		ctx.beginPath();
 		for (let c = colRange.startIdx; c <= colRange.endIdx; c += 1) {
-			const x = Math.round(colX(c, gutterW) - scrollLeft) - 0.5;
-			ctx.moveTo(x, 0);
-			ctx.lineTo(x, cssHeight);
+			const x = Math.round(colX(c, gutterW) - effScrollLeft) - 0.5;
+			ctx.moveTo(x, clipY0);
+			ctx.lineTo(x, clipY1);
 		}
 		for (let r = rowRange.startIdx; r <= rowRange.endIdx; r += 1) {
-			const y = Math.round(rowY(r) - scrollTop) - 0.5;
-			ctx.moveTo(0, y);
-			ctx.lineTo(cssWidth, y);
+			const y = Math.round(rowY(r) - effScrollTop) - 0.5;
+			ctx.moveTo(clipX0, y);
+			ctx.lineTo(clipX1, y);
 		}
 		ctx.stroke();
 
-		// 3. Values for the populated cells in the window. Audit C1-HIGH1: iterate the VISIBLE WINDOW
-		// (bounded ~viewport rows x cols) and look up each cell in the sparse map -- O(visible cells), a hard
-		// per-frame ceiling independent of the snapshot's entry count (a dense FE-1 `qb.show` could be huge).
+		// 3. Values for the populated cells in the pane. Audit C1-HIGH1: iterate the VISIBLE WINDOW (bounded
+		// ~viewport rows x cols) and look up each cell in the sparse map -- O(visible cells), a hard per-frame
+		// ceiling independent of the snapshot's entry count (a dense FE-1 `qb.show` could be huge).
 		ctx.font = this.bodyFont;
 		ctx.textBaseline = 'middle';
 		ctx.textAlign = 'left';
 		const valueMax = COL_WIDTH - CELL_PAD * 2;
 		for (let r = rowRange.startIdx; r < rowRange.endIdx; r += 1) {
-			const y = Math.round(rowY(r) - scrollTop);
+			const y = Math.round(rowY(r) - effScrollTop);
 			for (let c = colRange.startIdx; c < colRange.endIdx; c += 1) {
 				const entry = this.entryByCell.get(r + ',' + c);
 				if (entry === undefined) {
 					continue; // empty cell -- gridlines only, no fillText
 				}
-				const x = Math.round(colX(c, gutterW) - scrollLeft);
+				const x = Math.round(colX(c, gutterW) - effScrollLeft);
 				const isError = errorCells.has(r + ',' + c);
 				// Audit C1-HIGH2: cap the display string BEFORE measure/truncate so a pathological `rendered`
 				// can't freeze the binary search (which measures the full string first).
@@ -570,10 +738,8 @@ export class CanvasGridRenderer {
 
 		// 3b. W-G-2a: multi-cell selection range -- a translucent fill + an outer accent border over the
 		// rect spanning anchor..focus. Painted UNDER the focus box (item 4) so the active cell stays crisp.
-		// `selection` is non-null only for a real range (the caller passes null for a single cell, so the
-		// single-cell path below is unchanged). Skip when the whole range is scrolled out of the visible
-		// window (mirror the focus-box LOW-2 guard -- don't stroke/fill at far-off coords); a partially
-		// visible range is fine (the sticky gutter/header repaint over any bleed under the bands).
+		// `selection` is non-null only for a real range. Skip when the range does not intersect this pane's
+		// visible window (mirror the focus-box LOW-2 guard); the pane clip keeps any bleed inside the pane.
 		if (
 			selection !== null &&
 			selection.maxRow >= rowRange.startIdx &&
@@ -581,10 +747,10 @@ export class CanvasGridRenderer {
 			selection.maxCol >= colRange.startIdx &&
 			selection.minCol < colRange.endIdx
 		) {
-			const rx = Math.round(colX(selection.minCol, gutterW) - scrollLeft);
-			const ry = Math.round(rowY(selection.minRow) - scrollTop);
-			const rw = Math.round(colX(selection.maxCol + 1, gutterW) - scrollLeft) - rx;
-			const rh = Math.round(rowY(selection.maxRow + 1) - scrollTop) - ry;
+			const rx = Math.round(colX(selection.minCol, gutterW) - effScrollLeft);
+			const ry = Math.round(rowY(selection.minRow) - effScrollTop);
+			const rw = Math.round(colX(selection.maxCol + 1, gutterW) - effScrollLeft) - rx;
+			const rh = Math.round(rowY(selection.maxRow + 1) - effScrollTop) - ry;
 			ctx.fillStyle = this.palette.rangeFill;
 			ctx.fillRect(rx, ry, rw, rh);
 			ctx.strokeStyle = this.palette.selectionBorder;
@@ -593,7 +759,7 @@ export class CanvasGridRenderer {
 			ctx.strokeRect(rx + ro, ry + ro, rw - SELECTION_BORDER_PX, rh - SELECTION_BORDER_PX);
 		}
 
-		// 4. Active-cell selection box (2px accent border), if the selected cell is in the window. Audit
+		// 4. Active-cell selection box (2px accent border), if the selected cell is in the pane window. Audit
 		// LOW-2: skip entirely when the active cell is scrolled off-screen (don't stroke at far-off coords).
 		if (
 			active !== null &&
@@ -603,8 +769,8 @@ export class CanvasGridRenderer {
 			active.col < colRange.endIdx
 		) {
 			// Audit S1-MED1: snap the box origin to a device pixel (crisp on non-Electron/test).
-			const x = Math.round(colX(active.col, gutterW) - scrollLeft);
-			const y = Math.round(rowY(active.row) - scrollTop);
+			const x = Math.round(colX(active.col, gutterW) - effScrollLeft);
+			const y = Math.round(rowY(active.row) - effScrollTop);
 			ctx.strokeStyle = this.palette.selectionBorder;
 			ctx.lineWidth = SELECTION_BORDER_PX;
 			// Inset by half the border so the 2px stroke sits inside the cell rect.
@@ -614,10 +780,8 @@ export class CanvasGridRenderer {
 
 		// 4b. W-G bound-cell indicator: a small filled triangle in each published cell's TOP-RIGHT corner
 		// (the Excel note-marker convention). Painted AFTER the value + selection visuals (so it is never
-		// hidden) but BEFORE the sticky bands (item 5), which correctly cover a cell scrolled under them.
-		// Iterate each published range intersected with the visible window -- O(published cells in view),
-		// independent of the snapshot size; published ranges are small (and the kernel's G2 guard keeps
-		// them non-overlapping).
+		// hidden) but BEFORE the sticky bands, which correctly cover a cell scrolled under them. Iterate each
+		// published range intersected with the pane window -- O(published cells in view).
 		if (publishedRanges.length > 0) {
 			ctx.fillStyle = this.palette.publishedBadge;
 			for (const pr of publishedRanges) {
@@ -626,9 +790,9 @@ export class CanvasGridRenderer {
 				const c0 = Math.max(pr.startCol, colRange.startIdx);
 				const c1 = Math.min(pr.endCol, colRange.endIdx - 1);
 				for (let r = r0; r <= r1; r += 1) {
-					const by = Math.round(rowY(r) - scrollTop);
+					const by = Math.round(rowY(r) - effScrollTop);
 					for (let c = c0; c <= c1; c += 1) {
-						const right = Math.round(colX(c, gutterW) - scrollLeft) + COL_WIDTH;
+						const right = Math.round(colX(c, gutterW) - effScrollLeft) + COL_WIDTH;
 						ctx.beginPath();
 						ctx.moveTo(right - PUBLISHED_BADGE_PX, by);
 						ctx.lineTo(right, by);
@@ -641,18 +805,16 @@ export class CanvasGridRenderer {
 		}
 
 		// 4c. W-G fill handle: the drag-PREVIEW outline -- a dashed accent border around the rect the fill
-		// will cover (the source extended down/right under the pointer). Painted only while a fill drag is
-		// active (`fillPreview !== null`) and only when it intersects the visible window. Drawn before the
-		// handle square so the square sits on top of the dashes at the shared corner.
+		// will cover. Painted only while a fill drag is active and only when it intersects this pane window.
 		if (
 			fillPreview !== null &&
 			fillPreview.maxRow >= rowRange.startIdx && fillPreview.minRow < rowRange.endIdx &&
 			fillPreview.maxCol >= colRange.startIdx && fillPreview.minCol < colRange.endIdx
 		) {
-			const px = Math.round(colX(fillPreview.minCol, gutterW) - scrollLeft);
-			const py = Math.round(rowY(fillPreview.minRow) - scrollTop);
-			const pw = Math.round(colX(fillPreview.maxCol + 1, gutterW) - scrollLeft) - px;
-			const ph = Math.round(rowY(fillPreview.maxRow + 1) - scrollTop) - py;
+			const px = Math.round(colX(fillPreview.minCol, gutterW) - effScrollLeft);
+			const py = Math.round(rowY(fillPreview.minRow) - effScrollTop);
+			const pw = Math.round(colX(fillPreview.maxCol + 1, gutterW) - effScrollLeft) - px;
+			const ph = Math.round(rowY(fillPreview.maxRow + 1) - effScrollTop) - py;
 			ctx.save();
 			ctx.strokeStyle = this.palette.selectionBorder;
 			ctx.lineWidth = 1;
@@ -663,15 +825,15 @@ export class CanvasGridRenderer {
 
 		// 4d. W-G fill handle: a small solid square at the bottom-right corner of the selection (or the
 		// active cell) -- the Excel drag-to-fill affordance. A background-coloured halo keeps it visible
-		// against a selected (filled) range. Painted only when that corner cell is in the visible window.
+		// against a selected (filled) range. Painted only when that corner cell is in the pane window.
 		const handleBR = selection !== null ? { row: selection.maxRow, col: selection.maxCol } : active;
 		if (
 			handleBR !== null &&
 			handleBR.row >= rowRange.startIdx && handleBR.row < rowRange.endIdx &&
 			handleBR.col >= colRange.startIdx && handleBR.col < colRange.endIdx
 		) {
-			const cx = Math.round(colX(handleBR.col + 1, gutterW) - scrollLeft);
-			const cy = Math.round(rowY(handleBR.row + 1) - scrollTop);
+			const cx = Math.round(colX(handleBR.col + 1, gutterW) - effScrollLeft);
+			const cy = Math.round(rowY(handleBR.row + 1) - effScrollTop);
 			const half = FILL_HANDLE_PX / 2;
 			ctx.fillStyle = this.palette.background;
 			ctx.fillRect(cx - half - 1, cy - half - 1, FILL_HANDLE_PX + 2, FILL_HANDLE_PX + 2);
@@ -679,12 +841,16 @@ export class CanvasGridRenderer {
 			ctx.fillRect(cx - half, cy - half, FILL_HANDLE_PX, FILL_HANDLE_PX);
 		}
 
-		// 5. Sticky row gutter (covers cells that scrolled left under it), then header, then corner.
-		this.drawGutter(scrollTop, gutterW, cssHeight, rowRange.startIdx, rowRange.endIdx, active, selection);
-		this.drawHeader(scrollLeft, gutterW, cssWidth, colRange.startIdx, colRange.endIdx, active, selection);
-		this.drawCorner(gutterW);
+		ctx.restore();
 	}
 
+	/**
+	 * Sticky row-number gutter. **W3 frozen panes**: paints the row numbers for BOTH the FROZEN rows
+	 * `[0, fRows)` (pinned at `rowY(r)-0`, clipped to `[HEADER_HEIGHT, bodyTop)`) AND the SCROLLING body
+	 * rows `[startRow, endRow)` (at `rowY(r)-scrollTop`, clipped to `[bodyTop, cssHeight)`), so each row
+	 * number lines up with its cell pane. With `fRows===0`, `bodyTop===HEADER_HEIGHT` and the frozen loop is
+	 * empty -> byte-identical to the pre-W3 single clip from HEADER_HEIGHT down.
+	 */
 	private drawGutter(
 		scrollTop: number,
 		gutterW: number,
@@ -693,6 +859,8 @@ export class CanvasGridRenderer {
 		endRow: number,
 		active: ActiveCell | null,
 		selection: SelectionRect | null,
+		fRows: number,
+		bodyTop: number,
 	): void {
 		const ctx = this.ctx;
 		// Audit MED-3: opaque base FIRST (headerBg may be translucent; without it the gridlines drawn
@@ -704,27 +872,35 @@ export class CanvasGridRenderer {
 		ctx.font = this.headerFont;
 		ctx.textBaseline = 'middle';
 		ctx.textAlign = 'right';
-		// Audit S1-LOW2: clip the label region to the gutter (mirrors drawHeader's per-cell clip) so a
-		// wider-than-gutter row number can never bleed right over the body. Snap each row origin too.
-		ctx.save();
-		ctx.beginPath();
-		ctx.rect(0, 0, gutterW, cssHeight);
-		ctx.clip();
-		for (let r = startRow; r < endRow; r += 1) {
-			const y = Math.round(rowY(r) - scrollTop);
-			// W-G-2a: tint every row in the selection range (or just the active row when there is no range).
-			const tinted = selection !== null
-				? r >= selection.minRow && r <= selection.maxRow
-				: active !== null && active.row === r;
-			if (tinted) {
-				ctx.fillStyle = this.palette.headerActiveBg;
-				ctx.fillRect(0, y, gutterW, ROW_HEIGHT);
+		// Paint the row labels for a band of rows at an effective scroll, clipped to its viewport Y span.
+		// Audit S1-LOW2: clip to the gutter width too so a wider-than-gutter row number can never bleed right.
+		const paintRowLabels = (rowStart: number, rowEnd: number, effScrollTop: number, clipY0: number, clipY1: number): void => {
+			if (rowEnd <= rowStart || clipY1 <= clipY0) {
+				return;
 			}
-			ctx.fillStyle = this.palette.foreground;
-			ctx.fillText(String(r + 1), gutterW - CELL_PAD, y + ROW_HEIGHT / 2);
-		}
-		ctx.restore();
-		// Gutter right border + per-row bottom borders.
+			ctx.save();
+			ctx.beginPath();
+			ctx.rect(0, clipY0, gutterW, clipY1 - clipY0);
+			ctx.clip();
+			for (let r = rowStart; r < rowEnd; r += 1) {
+				const y = Math.round(rowY(r) - effScrollTop);
+				// W-G-2a: tint every row in the selection range (or just the active row when there is no range).
+				const tinted = selection !== null
+					? r >= selection.minRow && r <= selection.maxRow
+					: active !== null && active.row === r;
+				if (tinted) {
+					ctx.fillStyle = this.palette.headerActiveBg;
+					ctx.fillRect(0, y, gutterW, ROW_HEIGHT);
+				}
+				ctx.fillStyle = this.palette.foreground;
+				ctx.fillText(String(r + 1), gutterW - CELL_PAD, y + ROW_HEIGHT / 2);
+			}
+			ctx.restore();
+		};
+		// Scrolling body rows (below the frozen band), then the pinned frozen rows ON TOP of any body bleed.
+		paintRowLabels(startRow, endRow, scrollTop, bodyTop, cssHeight);
+		paintRowLabels(0, fRows, 0, HEADER_HEIGHT, bodyTop);
+		// Gutter right border + per-row bottom borders (frozen rows at effScroll 0, body rows at scrollTop).
 		ctx.strokeStyle = this.palette.border;
 		ctx.lineWidth = 1;
 		ctx.beginPath();
@@ -733,6 +909,13 @@ export class CanvasGridRenderer {
 		ctx.lineTo(rx, cssHeight);
 		for (let r = startRow; r <= endRow; r += 1) {
 			const y = Math.round(rowY(r) - scrollTop) - 0.5;
+			if (y >= bodyTop - 0.5) {
+				ctx.moveTo(0, y);
+				ctx.lineTo(gutterW, y);
+			}
+		}
+		for (let r = 0; r <= fRows; r += 1) {
+			const y = Math.round(rowY(r) - 0) - 0.5;
 			ctx.moveTo(0, y);
 			ctx.lineTo(gutterW, y);
 		}
@@ -740,6 +923,12 @@ export class CanvasGridRenderer {
 		ctx.textAlign = 'left';
 	}
 
+	/**
+	 * Sticky column-letter header. **W3 frozen panes**: paints the labels for BOTH the FROZEN cols
+	 * `[0, fCols)` (pinned at `colX(c)-0`, clipped to `[gutterW, bodyLeft)`) AND the SCROLLING body cols
+	 * `[startCol, endCol)` (at `colX(c)-scrollLeft`, clipped to `[bodyLeft, cssWidth)`). With `fCols===0`,
+	 * `bodyLeft===gutterW` and the frozen loop is empty -> byte-identical to the pre-W3 path.
+	 */
 	private drawHeader(
 		scrollLeft: number,
 		gutterW: number,
@@ -748,6 +937,8 @@ export class CanvasGridRenderer {
 		endCol: number,
 		active: ActiveCell | null,
 		selection: SelectionRect | null,
+		fCols: number,
+		bodyLeft: number,
 	): void {
 		const ctx = this.ctx;
 		// Opaque base FIRST (the headerBg may be translucent; cells/gridlines must not bleed through).
@@ -759,26 +950,39 @@ export class CanvasGridRenderer {
 		ctx.textBaseline = 'middle';
 		ctx.textAlign = 'center';
 		const textY = HEADER_HEIGHT / 2;
-		for (let c = startCol; c < endCol; c += 1) {
-			// Audit S1-LOW3: snap the column origin so the active-col tint + label clip align with the
-			// (rounded) header separators.
-			const x = Math.round(colX(c, gutterW) - scrollLeft);
-			// W-G-2a: tint every column in the selection range (or just the active col when there is no range).
-			const tinted = selection !== null
-				? c >= selection.minCol && c <= selection.maxCol
-				: active !== null && active.col === c;
-			if (tinted) {
-				ctx.fillStyle = this.palette.headerActiveBg;
-				ctx.fillRect(x, 0, COL_WIDTH, HEADER_HEIGHT);
+		// Paint the column labels for a band of cols at an effective scroll, clipped to its viewport X span.
+		const paintColLabels = (colStart: number, colEnd: number, effScrollLeft: number, clipX0: number, clipX1: number): void => {
+			if (colEnd <= colStart || clipX1 <= clipX0) {
+				return;
 			}
 			ctx.save();
 			ctx.beginPath();
-			ctx.rect(x, 0, COL_WIDTH, HEADER_HEIGHT);
+			ctx.rect(clipX0, 0, clipX1 - clipX0, HEADER_HEIGHT);
 			ctx.clip();
-			ctx.fillStyle = this.palette.foreground;
-			ctx.fillText(columnLabel(c), x + COL_WIDTH / 2, textY);
+			for (let c = colStart; c < colEnd; c += 1) {
+				// Audit S1-LOW3: snap the column origin so the active-col tint + label clip align with the
+				// (rounded) header separators.
+				const x = Math.round(colX(c, gutterW) - effScrollLeft);
+				// W-G-2a: tint every column in the selection range (or just the active col when there is no range).
+				const tinted = selection !== null
+					? c >= selection.minCol && c <= selection.maxCol
+					: active !== null && active.col === c;
+				if (tinted) {
+					ctx.fillStyle = this.palette.headerActiveBg;
+					ctx.fillRect(x, 0, COL_WIDTH, HEADER_HEIGHT);
+				}
+				ctx.save();
+				ctx.beginPath();
+				ctx.rect(x, 0, COL_WIDTH, HEADER_HEIGHT);
+				ctx.clip();
+				ctx.fillStyle = this.palette.foreground;
+				ctx.fillText(columnLabel(c), x + COL_WIDTH / 2, textY);
+				ctx.restore();
+			}
 			ctx.restore();
-		}
+		};
+		paintColLabels(startCol, endCol, scrollLeft, bodyLeft, cssWidth);
+		paintColLabels(0, fCols, 0, gutterW, bodyLeft);
 		// Header bottom border + per-column separators.
 		ctx.strokeStyle = this.palette.border;
 		ctx.lineWidth = 1;
@@ -788,6 +992,13 @@ export class CanvasGridRenderer {
 		ctx.lineTo(cssWidth, by);
 		for (let c = startCol; c <= endCol; c += 1) {
 			const sx = Math.round(colX(c, gutterW) - scrollLeft) - 0.5;
+			if (sx >= bodyLeft - 0.5) {
+				ctx.moveTo(sx, 0);
+				ctx.lineTo(sx, HEADER_HEIGHT);
+			}
+		}
+		for (let c = 0; c <= fCols; c += 1) {
+			const sx = Math.round(colX(c, gutterW) - 0) - 0.5;
 			ctx.moveTo(sx, 0);
 			ctx.lineTo(sx, HEADER_HEIGHT);
 		}

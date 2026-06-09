@@ -852,4 +852,43 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 		}),
 	);
+
+	// **W3 frozen panes (2026-06-09)** -- Excel "Freeze Panes": pin the rows above + columns left of the
+	// focused grid's active cell so they stay visible on scroll. The freeze STATE lives in the webview (a
+	// paint/geometry concern); these commands compute the counts from the focused grid's selection and post
+	// them via the panel. Session-local (re-applied on a reload); DISK persistence is deferred.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookFreezePanes', () => {
+			const result = CellGridPanel.freezeFocusedPanesAtSelection();
+			if (!result.ok) {
+				if (result.reason === 'no-panel') {
+					void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+				} else {
+					void vscode.window.showInformationMessage(
+						'Select a cell in a Cell Grid first -- "Freeze Panes" pins the rows above + columns left of the focused grid\'s active cell.',
+					);
+				}
+				return;
+			}
+			const log = getOutput();
+			if (result.rows === 0 && result.cols === 0) {
+				// Active cell is A1 -> nothing above/left to freeze; Excel treats this as Unfreeze.
+				void vscode.window.showInformationMessage('Quantbook: nothing to freeze (the active cell is A1). The grid is now unfrozen.');
+				log.appendLine('Freeze Panes at A1 -> unfrozen (no rows/cols above/left of the active cell).');
+				return;
+			}
+			void vscode.window.showInformationMessage(`Quantbook: froze ${result.rows} row(s) and ${result.cols} column(s).`);
+			log.appendLine(`Froze panes: ${result.rows} row(s), ${result.cols} column(s).`);
+		}),
+	);
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookUnfreezePanes', () => {
+			if (!CellGridPanel.unfreezeFocusedPanes()) {
+				void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+				return;
+			}
+			void vscode.window.showInformationMessage('Quantbook: unfroze all panes.');
+			getOutput().appendLine('Unfroze panes.');
+		}),
+	);
 }

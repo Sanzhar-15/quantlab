@@ -443,6 +443,42 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **W3 frozen panes (2026-06-09)** -- freeze the focused Cell Grid AT its current selection's FOCUS cell
+	 * (Excel "Freeze Panes"): pin rows `[0, focusRow)` + cols `[0, focusCol)` so everything above/left of the
+	 * active cell stays visible on scroll. Returns the applied `{rows, cols}` for the command's toast, or a
+	 * `reason` the command surfaces (no focused panel, or no selection reported yet). The focus cell becomes
+	 * the top-left of the scrollable body; selecting A1 (`0,0`) freezes nothing (the natural Unfreeze gesture,
+	 * matching Excel). The webview re-clamps, so an out-of-range count can never corrupt the paint.
+	 */
+	static freezeFocusedPanesAtSelection(): { ok: true; rows: number; cols: number } | { ok: false; reason: 'no-panel' | 'no-selection' } {
+		if (focusedPanel === undefined || focusedPanel._disposed) {
+			return { ok: false, reason: 'no-panel' };
+		}
+		if (focusedPanel.latestSelection === undefined) {
+			return { ok: false, reason: 'no-selection' };
+		}
+		const sel = focusedPanel.latestSelection;
+		// Freeze above+left of the FOCUS cell. The dispatcher validated focusRow/focusCol are integers in the
+		// A1 extent, so these are already sane; the webview clamps again (defence in depth).
+		const rows = Math.max(0, sel.focusRow);
+		const cols = Math.max(0, sel.focusCol);
+		focusedPanel.setFrozenPanes(rows, cols);
+		return { ok: true, rows, cols };
+	}
+
+	/**
+	 * **W3 frozen panes** -- Unfreeze the focused Cell Grid (clear all pinned rows/cols). Returns `false` when
+	 * no panel is focused (the command surfaces it), else applies `0/0` and returns `true`.
+	 */
+	static unfreezeFocusedPanes(): boolean {
+		if (focusedPanel === undefined || focusedPanel._disposed) {
+			return false;
+		}
+		focusedPanel.setFrozenPanes(0, 0);
+		return true;
+	}
+
+	/**
 	 * **FE-1.5 W-G (2026-06-08)** -- register (or clear with `undefined`) the provider every panel consults
 	 * at render time for the cells its session's published variables drive (the bound-cell badge). The
 	 * reactive-kernel layer wires this to {@link ReactiveKernelManager.publishedCellsForSheet} at activation
@@ -487,6 +523,16 @@ export class CellGridPanel {
 	 * `selection.sheet === this.sheet` + integer/in-extent coords before this is set.
 	 */
 	private latestSelection: GridSelection | undefined;
+
+	/**
+	 * **W3 frozen panes (2026-06-09)** -- the session-local freeze state (N pinned leading rows + cols) this
+	 * panel last applied, mirrored host-side ONLY so a webview reload re-applies it (the bundle's freeze is
+	 * cleared on reload). The webview is the authority for the PAINT (it clamps these to `[0, MAX-1]`); the
+	 * host just remembers + re-posts. DISK persistence of the freeze is deferred (a `.qbook` sidecar later) --
+	 * this is the in-memory session-local v1 the brief scopes. `0/0` = no freeze (the default).
+	 */
+	private frozenRowCount: number = 0;
+	private frozenColCount: number = 0;
 
 	/**
 	 * True once the bundled webview has posted `{type:'webviewReady'}`. Before
@@ -709,6 +755,47 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **W3 frozen panes (2026-06-09)** -- set this panel's freeze (N pinned leading rows + cols) and push it
+	 * to the bundled webview. Stores the counts session-locally (mirrored so a reload re-applies them via
+	 * `postFreezeIfReady` in the `webviewReady` handshake) and posts a `{type:'freeze', rows, cols}` message.
+	 * The webview clamps the counts to `[0, MAX-1]` and full-redraws. `setFrozenPanes(0,0)` is Unfreeze.
+	 * Throws on a non-finite count (the caller validates first; this is a defensive No-Fallbacks guard).
+	 */
+	setFrozenPanes(rows: number, cols: number): void {
+		if (!Number.isFinite(rows) || !Number.isFinite(cols)) {
+			throw new Error(`setFrozenPanes requires finite counts (got rows=${rows}, cols=${cols})`);
+		}
+		this.frozenRowCount = Math.max(0, Math.floor(rows));
+		this.frozenColCount = Math.max(0, Math.floor(cols));
+		this.postFreezeIfReady();
+	}
+
+	/**
+	 * Post the stored freeze state to the bundled webview IFF the `webviewReady` handshake completed and the
+	 * panel is live. Called by {@link setFrozenPanes} and on the `webviewReady` handshake (so a reload
+	 * re-applies the session-local freeze). A non-delivery is surfaced LOUD (No-Fallbacks): the grid would
+	 * show the wrong freeze otherwise. A no-op `0/0` re-send on a fresh load is harmless (the webview starts
+	 * unfrozen anyway).
+	 */
+	private postFreezeIfReady(): void {
+		if (!this.webviewReady || this._disposed) {
+			return;
+		}
+		this.panel.webview.postMessage({ type: 'freeze', rows: this.frozenRowCount, cols: this.frozenColCount }).then(
+			delivered => {
+				if (!delivered && !this._disposed) {
+					console.warn('[cellGrid] freeze postMessage was not delivered to the webview.');
+					void vscode.window.showWarningMessage(
+						'Quantbook: the cell grid freeze may not have applied (a message was not delivered). '
+						+ 'Re-run "Quantbook: Freeze Panes at Selection" or reopen the grid.',
+					);
+				}
+			},
+			err => console.error('[cellGrid] freeze postMessage rejected:', err),
+		);
+	}
+
+	/**
 	 * Start the {@link readyWatchdog}. Called once from `show()` after the shell
 	 * is mounted; on timeout (no `webviewReady`) it surfaces a loud error rather
 	 * than leaving a silently-blank grid.
@@ -756,6 +843,9 @@ export class CellGridPanel {
 			this.latestSelection = undefined;
 			this.clearReadyWatchdog();
 			this.postRenderIfReady();
+			// W3 frozen panes: a reload re-inits the webview unfrozen; re-apply the session-local freeze so a
+			// reload does not silently lose it. A no-op when nothing is frozen (0/0).
+			this.postFreezeIfReady();
 			return;
 		}
 		dispatchIncomingMessage(raw, {

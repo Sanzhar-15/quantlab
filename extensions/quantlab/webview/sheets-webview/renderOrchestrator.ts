@@ -31,7 +31,7 @@
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import type { ActiveCell, PublishedRange } from './canvasGrid';
 import { computeScrollBlitA1, diffSnapshotsA1, errorRowsFlippedA1, type ScrollBlit, type ScrollState } from './gridBlitA1';
-import type { SelectionRect } from './gridLayoutA1';
+import { frozenColsWidth, frozenRowsHeight, type SelectionRect } from './gridLayoutA1';
 
 /** The viewport scroll/size the paint reads. Mirrors `index.ts`'s `Viewport` (CSS px). */
 export interface Viewport {
@@ -111,6 +111,14 @@ export interface RenderHost {
 	publishedRanges(): readonly PublishedRange[];
 	/** The fill-handle drag preview rect, or null. */
 	fillPreview(): SelectionRect | null;
+	/**
+	 * **W3 frozen panes** -- the number of PINNED leading rows / cols. The blit decision reads these to
+	 * exclude the frozen bands from the scroll copy + repaint them as part of the exposed strip; `0/0` keeps
+	 * the pre-W3 blit byte-identical. In `index.ts` these mirror `renderer.frozenRows`/`renderer.frozenCols`
+	 * (one source of truth -- the host setter writes both); the bench supplies `0/0`.
+	 */
+	frozenRowCount(): number;
+	frozenColCount(): number;
 	/** Pin the absolute canvas over the viewport at the given scroll. */
 	applyCanvasTransform(scrollTop: number, scrollLeft: number): void;
 	/** Fired at the END of a full {@link RenderOrchestrator.redraw} (formula bar + selection post + hover). */
@@ -195,7 +203,15 @@ export class RenderOrchestrator {
 		renderer.resize(v.cssW, v.cssH); // a coalesced frame may straddle a resize -> resize first (clears `painted`)
 		host.applyCanvasTransform(v.scrollTop, v.scrollLeft);
 		const next = this.scrollStateNow(v);
-		const blit = renderer.painted ? computeScrollBlitA1(this.prevPaint, next, renderer.gutterWidthPx) : null;
+		// W3 frozen panes: thread the pinned-band sizes (CSS px) so the blit excludes the frozen row band
+		// (vertical scroll) / frozen col band (horizontal scroll) from the copy + repaints them in the strip,
+		// instead of falling back to a full redraw on every scroll (which would undo the wave-1 bench gates).
+		// `0/0` => the pre-W3 byte-identical blit.
+		const frozenRowsCssH = frozenRowsHeight(host.frozenRowCount());
+		const frozenColsCssW = frozenColsWidth(host.frozenColCount());
+		const blit = renderer.painted
+			? computeScrollBlitA1(this.prevPaint, next, renderer.gutterWidthPx, frozenRowsCssH, frozenColsCssW)
+			: null;
 		// W-G-2a: a pure scroll changes neither selection nor content, but the renderer still needs the
 		// current selection to paint the range in the exposed strip / full-fallback.
 		const sel = host.selection();

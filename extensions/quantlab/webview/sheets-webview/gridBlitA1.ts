@@ -110,18 +110,28 @@ function isFiniteScrollState(s: ScrollState): boolean {
  * `gutterCssW` is the sticky row-gutter width (CSS px) -- used ONLY by the horizontal branch (the
  * gutter stays in place on a horizontal scroll); the vertical branch shifts the full width.
  *
+ * **W3 frozen panes (2026-06-09)**: `frozenRowsCssH` (= `frozenRowCount * ROW_HEIGHT`) and
+ * `frozenColsCssW` (= `frozenColCount * COL_WIDTH`) are the pinned-band sizes (CSS px). The body that
+ * SCROLLS starts past them: vertically at `HEADER_HEIGHT + frozenRowsCssH`, horizontally at `gutterCssW +
+ * frozenColsCssW`. The frozen-row band (vertical scroll) and frozen-col band (horizontal scroll) are
+ * EXCLUDED from the copy and stay put from the previous frame -- exactly like the header/gutter (their
+ * content is pinned, so a pure scroll never changes them). The OTHER frozen band scrolls WITH the body on
+ * that axis (frozen cols scroll vertically; frozen rows scroll horizontally), so it is inside the shifted
+ * body rect -- matching how the gutter row numbers / header column letters already scroll with their
+ * rows/cols. With both frozen sizes 0 this is byte-identical to the pre-W3 blit (the brief's
+ * "non-frozen == identical" requirement): the body origins reduce to `HEADER_HEIGHT` / `gutterCssW`.
+ *
  * `null` (a legitimate precondition miss, NOT an error) is returned when: there is no prior frame; the
  * dpr or viewport size changed (the backing store was cleared/resized); the scroll is DIAGONAL
  * (`dx!==0 && dy!==0` -- two self-blits in one frame compound the seam error); the move is zero or
  * sub-device-pixel; or the reusable region is `< MIN_BLIT_PX` (cheaper to just redraw).
  *
- * - **Vertical** (`dy!==0`): the header band `[0, HEADER_HEIGHT)` is STICKY, so only the body sub-rect
- *   `[HEADER_HEIGHT, cssH)` shifts (FULL width -- the gutter row numbers scroll with their rows). The
- *   damage strip is full-width at the exposed edge.
- * - **Horizontal** (`dx!==0`): the row gutter `[0, gutterW)` is STICKY, so only the body sub-rect
- *   `[gutterW, cssW)` shifts (FULL height -- the header column labels scroll with their columns). The
- *   damage strip is full-height at the exposed edge and starts at `gutterW` (never overwrites the gutter
- *   or corner).
+ * - **Vertical** (`dy!==0`): the header band + frozen-row band `[0, HEADER_HEIGHT + frozenRowsCssH)` are
+ *   PINNED, so only the body sub-rect `[bodyTop, cssH)` shifts (FULL width -- the gutter row numbers AND
+ *   the frozen COLUMNS scroll with their rows). The damage strip is full-width at the exposed edge.
+ * - **Horizontal** (`dx!==0`): the row gutter + frozen-col band `[0, gutterW + frozenColsCssW)` are
+ *   PINNED, so only the body sub-rect `[bodyLeft, cssW)` shifts (FULL height). The damage strip is
+ *   full-height at the exposed edge and starts at `bodyLeft` (never overwrites the gutter/frozen cols).
  *
  * All copy math is in device px via `round(css*dpr)` -- identical to the renderer's `resize()`
  * backing-store sizing -- and the CSS damage strip is re-derived from the ROUNDED device delta so it
@@ -132,6 +142,8 @@ export function computeScrollBlitA1(
 	prev: ScrollState | null,
 	next: ScrollState,
 	gutterCssW: number,
+	frozenRowsCssH: number,
+	frozenColsCssW: number,
 ): ScrollBlit | null {
 	if (prev === null) {
 		return null;
@@ -143,6 +155,10 @@ export function computeScrollBlitA1(
 	}
 	if (!Number.isFinite(gutterCssW) || gutterCssW < 0) {
 		return null; // a garbage gutter width would corrupt the horizontal copy origin
+	}
+	// W3 frozen panes: a garbage frozen-band size would corrupt the body copy origin -> fail closed.
+	if (!Number.isFinite(frozenRowsCssH) || frozenRowsCssH < 0 || !Number.isFinite(frozenColsCssW) || frozenColsCssW < 0) {
+		return null;
 	}
 	if (prev.dpr !== next.dpr) {
 		return null; // dpr change -> backing store rescaled, pixels invalid
@@ -164,9 +180,20 @@ export function computeScrollBlitA1(
 	const bh = Math.max(1, Math.round(next.cssH * dpr));
 
 	if (dy !== 0) {
-		// Vertical: shift the body region [headerDev, bh) only; the sticky header is left in place.
+		// Vertical: shift the body region [bodyTopDev, bh) only; the header + frozen-row band are pinned.
+		// W3: `frozenRowCount * ROW_HEIGHT` rows below the header stay put (their cells don't scroll), so the
+		// scrolling body begins at `HEADER_HEIGHT + frozenRowsCssH`. The frozen-row band [headerDev, bodyTopDev)
+		// is neither copied nor damaged -- it is preserved from the previous frame, exactly like the header.
 		const headerDev = Math.round(HEADER_HEIGHT * dpr);
-		const bodyDevH = bh - headerDev;
+		// W3: the frozen-row band must land on a WHOLE device pixel so the copy boundary never rounds INTO it
+		// (overlapping the pinned region) or out of it (reading a frozen-edge pixel into the body). `frozenRowsCssH`
+		// is `frozenRowCount * ROW_HEIGHT` (integer CSS px); guard explicitly so a future fractional ROW_HEIGHT
+		// fails closed rather than corrupting the seam (No-Fallbacks; mirrors the gutter-boundary guard below).
+		if (!Number.isInteger(frozenRowsCssH * dpr)) {
+			return null;
+		}
+		const bodyTopDev = headerDev + Math.round(frozenRowsCssH * dpr);
+		const bodyDevH = bh - bodyTopDev;
 		// **Phase 3 re-audit HIGH-1**: the renderer snaps each row's paint origin to a WHOLE CSS px
 		// (`Math.round(rowY(r)-scrollTop)`), and rounding commutes with subtracting an INTEGER delta -- so a
 		// uniform device-px blit matches a full redraw IFF `dy` is a whole CSS px. A fractional `dy` is
@@ -192,22 +219,26 @@ export function computeScrollBlitA1(
 		// Repaint the exposed strip + one ROW_HEIGHT of over-row on the leading edge so the seam row's
 		// half-pixel bottom border is owned by exactly one paint (never half-copied).
 		const stripH = dyDev / dpr + ROW_HEIGHT;
+		// W3: the body top in CSS px (just below the header + frozen-row band) -- the scrolling-up strip
+		// starts here, and the copy source/dest origins are `bodyTopDev`. With no frozen rows this is
+		// `HEADER_HEIGHT` (byte-identical to the pre-W3 blit).
+		const bodyTopCss = HEADER_HEIGHT + frozenRowsCssH;
 		if (dy > 0) {
 			// Scrolling down: content moves up; new rows appear at the BOTTOM.
 			return {
-				copy: { sx: 0, sy: headerDev + dyDev, sw: bw, sh: reusable, dx: 0, dy: headerDev, dw: bw, dh: reusable },
+				copy: { sx: 0, sy: bodyTopDev + dyDev, sw: bw, sh: reusable, dx: 0, dy: bodyTopDev, dw: bw, dh: reusable },
 				damageRects: [{ x: 0, y: next.cssH - stripH, width: next.cssW, height: stripH }],
 			};
 		}
-		// Scrolling up: content moves down; new rows appear at the TOP (just below the header).
+		// Scrolling up: content moves down; new rows appear at the TOP (just below the header + frozen band).
 		return {
-			copy: { sx: 0, sy: headerDev, sw: bw, sh: reusable, dx: 0, dy: headerDev + dyDev, dw: bw, dh: reusable },
-			damageRects: [{ x: 0, y: HEADER_HEIGHT, width: next.cssW, height: stripH }],
+			copy: { sx: 0, sy: bodyTopDev, sw: bw, sh: reusable, dx: 0, dy: bodyTopDev + dyDev, dw: bw, dh: reusable },
+			damageRects: [{ x: 0, y: bodyTopCss, width: next.cssW, height: stripH }],
 		};
 	}
 
-	// Horizontal: shift the body region [gutterDev, bw) only; the sticky gutter (and corner) stay in
-	// place. FULL height (the header column labels scroll with their columns).
+	// Horizontal: shift the body region [bodyLeftDev, bw) only; the sticky gutter + frozen-col band (and the
+	// corner) stay in place. FULL height (the header column labels + frozen ROWS scroll with their columns).
 	// **Phase 3 re-audit HIGH-1**: gate on the integer CSS-px delta (see the vertical branch) -- the
 	// renderer rounds each column's x origin in CSS px too, so a fractional `dx` (dpr 2) would diverge.
 	if (!Number.isInteger(dx)) {
@@ -221,8 +252,15 @@ export function computeScrollBlitA1(
 	if (!Number.isInteger(gutterCssW * dpr)) {
 		return null;
 	}
-	const gutterDev = Math.round(gutterCssW * dpr);
-	const bodyDevW = bw - gutterDev;
+	// W3: same WHOLE-device-pixel requirement for the frozen-col band boundary (`frozenColCount * COL_WIDTH`
+	// is an integer CSS px today; guard so a future fractional COL_WIDTH fails closed instead of corrupting
+	// the seam). The body left = gutter + frozen-col band.
+	if (!Number.isInteger(frozenColsCssW * dpr)) {
+		return null;
+	}
+	const bodyLeftCss = gutterCssW + frozenColsCssW;
+	const bodyLeftDev = Math.round(gutterCssW * dpr) + Math.round(frozenColsCssW * dpr);
+	const bodyDevW = bw - bodyLeftDev;
 	const dxDev = Math.abs(dx) * dpr;
 	// **Phase 3 re-audit #2 LOW**: also require an integer DEVICE-px shift (see the vertical branch) -- the
 	// pure helper must not assume the caller's dpr is in {1,2}; a non-integer dpr -> fractional copy rect.
@@ -237,15 +275,15 @@ export function computeScrollBlitA1(
 	if (dx > 0) {
 		// Scrolling right: body content moves left; new columns appear at the RIGHT edge.
 		return {
-			copy: { sx: gutterDev + dxDev, sy: 0, sw: reusable, sh: bh, dx: gutterDev, dy: 0, dw: reusable, dh: bh },
+			copy: { sx: bodyLeftDev + dxDev, sy: 0, sw: reusable, sh: bh, dx: bodyLeftDev, dy: 0, dw: reusable, dh: bh },
 			damageRects: [{ x: next.cssW - stripW, y: 0, width: stripW, height: next.cssH }],
 		};
 	}
-	// Scrolling left: body content moves right; new columns appear at the LEFT edge of the body (just
-	// right of the sticky gutter -- the strip starts at gutterCssW, NOT 0).
+	// Scrolling left: body content moves right; new columns appear at the LEFT edge of the body (just right
+	// of the sticky gutter + frozen-col band -- the strip starts at bodyLeftCss, NOT 0 or gutterCssW).
 	return {
-		copy: { sx: gutterDev, sy: 0, sw: reusable, sh: bh, dx: gutterDev + dxDev, dy: 0, dw: reusable, dh: bh },
-		damageRects: [{ x: gutterCssW, y: 0, width: stripW, height: next.cssH }],
+		copy: { sx: bodyLeftDev, sy: 0, sw: reusable, sh: bh, dx: bodyLeftDev + dxDev, dy: 0, dw: reusable, dh: bh },
+		damageRects: [{ x: bodyLeftCss, y: 0, width: stripW, height: next.cssH }],
 	};
 }
 

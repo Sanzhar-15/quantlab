@@ -64,17 +64,66 @@ const outDir = path.join(baseDir, 'dist', 'webview', 'quantbook');
 //   - host modules by name: `session` / `loader` with any ts/js extension (incl. .tsx, .d.ts),
 //   - any `src/quantbook/` host-source path,
 //   - native binaries: `.node` / `.dylib` / `.so` / `.dll`.
+//
 const HOST_RUNTIME_FILTER = /(^|\/)(session|loader)(\.d\.ts|\.[cm]?[jt]sx?)?$|\/src\/quantbook\/|\.(node|dylib|so|dll)$/;
+// **W3 frozen-panes promotion (2026-06-09)**: the `src/quantbook/shared/` subtree is the EXCEPTION to the
+// `\/src\/quantbook\/` arm -- it holds PURE, DOM/vscode-free, napi-free modules (`gridLayoutA1.ts`,
+// `a1FormulaRefs.ts`) promoted out of the webview so the host-side dep-graph window imports ONE copy, not a
+// fork. The webview re-exports them via thin shims, so esbuild must RESOLVE (bundle) those imports rather
+// than fail-loud. esbuild's `onResolve` filter is a Go RE2 regex (NO lookahead), so the exclusion can't live
+// in the regex; we keep the broad filter and EXEMPT `src/quantbook/shared/` INSIDE the callback. Every other
+// `src/quantbook/` path (session.ts, loader.ts, reactiveKernel, ...) still fails the build loudly. The
+// pure-only invariant of `shared/` holds because anything napi/vscode-touching there would re-trip the
+// `session`/`loader`/native arms above (and break the host bundle's own purity tests).
+const SHARED_SUBTREE = /\/src\/quantbook\/shared\//;
+// Absolute path of the shared subtree, for the importer-origin guard below.
+const SHARED_DIR = path.join(baseDir, 'src', 'quantbook', 'shared') + path.sep;
 const noHostRuntimePlugin = {
 	name: 'no-host-runtime',
 	setup(build) {
-		build.onResolve({ filter: HOST_RUNTIME_FILTER }, args => ({
-			errors: [{
-				text: `FE-0b build isolation: the sheets webview bundle must not import host runtime `
-					+ `("${args.path}" from "${args.importer}"). Browser bundles are vscode/napi-free -- `
-					+ `move shared logic into a pure module (e.g. cellRender.ts) or import it with \`import type\`.`,
-			}],
-		}));
+		build.onResolve({ filter: HOST_RUNTIME_FILTER }, args => {
+			// **Codex MED-5**: test the NORMALIZED ABSOLUTE target, not the raw specifier. A raw match like
+			// `../../src/quantbook/shared/../session` contains `/src/quantbook/shared/` (so a raw-string exempt
+			// would pass it) yet resolves to host `session` -- a path-traversal bypass. Resolve against the
+			// importer dir (or the configured resolveDir for an entry) + normalize, THEN check the shared subtree.
+			const fromDir = args.resolveDir || (args.importer ? path.dirname(args.importer) : baseDir);
+			const abs = args.path.startsWith('.') ? path.normalize(path.resolve(fromDir, args.path)) : args.path;
+			if (SHARED_SUBTREE.test(abs)) {
+				return undefined; // pure shared module (verified on the normalized path) -- bundle it normally
+			}
+			return {
+				errors: [{
+					text: `FE-0b build isolation: the sheets webview bundle must not import host runtime `
+						+ `("${args.path}" from "${args.importer}", resolved "${abs}"). Browser bundles are `
+						+ `vscode/napi-free -- move shared logic into a pure module (e.g. cellRender.ts or `
+						+ `src/quantbook/shared/) or import it with \`import type\`.`,
+				}],
+			};
+		});
+		// **W3 frozen-panes promotion -- Codex MED-2**: the broad filter above matches the import SPECIFIER, so
+		// a RELATIVE escape from inside the shared subtree (`import ... from '../session'` in a `shared/` file)
+		// would NOT match `/src/quantbook/` on its specifier and could be bundled -- re-leaking napi. Guard the
+		// IMPORTER boundary: any RELATIVE import whose importer lives under `src/quantbook/shared/` MUST resolve
+		// to a target still inside `shared/` (a type-only import is already erased by esbuild before resolution,
+		// so anything reaching here is a VALUE import). Resolve the specifier against the importer dir and fail
+		// loud if it escapes the shared subtree -- keeping `shared/`'s pure-only invariant enforced, not assumed.
+		build.onResolve({ filter: /^\.\.?\// }, args => {
+			if (!args.importer.startsWith(SHARED_DIR)) {
+				return undefined; // not a shared-subtree importer -- the normal rules apply
+			}
+			const resolved = path.resolve(path.dirname(args.importer), args.path);
+			if (resolved.startsWith(SHARED_DIR)) {
+				return undefined; // stays inside shared/ -- fine (another pure shared module)
+			}
+			return {
+				errors: [{
+					text: `FE-0b build isolation: a src/quantbook/shared/ module must stay PURE -- it may not `
+						+ `relative-import OUT of the shared subtree ("${args.path}" from "${args.importer}" `
+						+ `resolves to "${resolved}"). That would risk re-leaking host runtime (napi/vscode) into the `
+						+ `browser bundle. Keep shared/ self-contained or use \`import type\` for a type-only need.`,
+				}],
+			};
+		});
 	},
 };
 

@@ -23,12 +23,18 @@ import {
 	ROW_HEIGHT,
 	cellContentRect,
 	cellRefA1,
+	clampFrozenCount,
 	colX,
 	columnLabel,
+	computeVisibleBodyColRange,
+	computeVisibleBodyRowRange,
 	computeVisibleColRange,
+	frozenColsWidth,
+	frozenRowsHeight,
 	gutterWidth,
 	hitTestContent,
 	hitTestViewport,
+	hitTestViewportFrozen,
 	isInExtent,
 	publishedNameAt,
 	rowY,
@@ -38,6 +44,7 @@ import {
 	totalContentWidth,
 	truncateToWidth,
 } from '../webview/sheets-webview/gridLayoutA1';
+import { computeVisibleRowRange } from '../webview/sheets-webview/cellRender';
 
 suite('FE-2-0 gridLayoutA1 -- columnLabel (bijective base-26)', function () {
 	test('single-letter columns', () => {
@@ -385,5 +392,143 @@ suite('FE-1.5 W-G gridLayoutA1 -- publishedNameAt (driving-variable lookup)', fu
 		assert.strictEqual(publishedNameAt(ranges, 0, 1), 'a');
 		assert.strictEqual(publishedNameAt(ranges, 4, 2), 'b');
 		assert.strictEqual(publishedNameAt(ranges, 2, 2), null, 'a gap between them');
+	});
+});
+
+// --- W3 frozen panes (2026-06-09) ------------------------------------------------------------------
+
+suite('W3 frozen panes -- clampFrozenCount / band sizes', function () {
+	test('a positive integer count passes through, bounded to [0, max-1]', function () {
+		assert.strictEqual(clampFrozenCount(3, MAX_ROWS), 3);
+		assert.strictEqual(clampFrozenCount(1, MAX_COLS), 1);
+		assert.strictEqual(clampFrozenCount(MAX_ROWS, MAX_ROWS), MAX_ROWS - 1, 'a full-axis freeze clamps to max-1');
+		assert.strictEqual(clampFrozenCount(MAX_ROWS + 10, MAX_ROWS), MAX_ROWS - 1);
+	});
+	test('non-positive / non-integer / NaN -> 0 (no freeze)', function () {
+		assert.strictEqual(clampFrozenCount(0, MAX_ROWS), 0);
+		assert.strictEqual(clampFrozenCount(-2, MAX_ROWS), 0);
+		assert.strictEqual(clampFrozenCount(1.5, MAX_ROWS), 0);
+		assert.strictEqual(clampFrozenCount(Number.NaN, MAX_ROWS), 0);
+		assert.strictEqual(clampFrozenCount(Number.POSITIVE_INFINITY, MAX_ROWS), 0);
+	});
+	test('band pixel sizes are count * ROW_HEIGHT / COL_WIDTH (0 for no freeze)', function () {
+		assert.strictEqual(frozenRowsHeight(0), 0);
+		assert.strictEqual(frozenRowsHeight(2), 2 * ROW_HEIGHT);
+		assert.strictEqual(frozenColsWidth(0), 0);
+		assert.strictEqual(frozenColsWidth(3), 3 * COL_WIDTH);
+		assert.strictEqual(frozenRowsHeight(-1), 0, 'a negative count is treated as 0');
+	});
+});
+
+suite('W3 frozen panes -- computeVisibleBodyRowRange (== computeVisibleRowRange at fRows=0)', function () {
+	const GUTTERLESS_BODY_H = 600 - HEADER_HEIGHT;
+	test('fRows=0 is byte-identical to the legacy computeVisibleRowRange', function () {
+		for (const scrollTop of [0, 25, 137, 5000, 1_000_000]) {
+			const body = computeVisibleBodyRowRange(scrollTop, GUTTERLESS_BODY_H, MAX_ROWS, ROW_HEIGHT, 2, 0);
+			const legacy = computeVisibleRowRange(scrollTop, GUTTERLESS_BODY_H, MAX_ROWS, ROW_HEIGHT, 2);
+			assert.deepStrictEqual(body, legacy, `scrollTop=${scrollTop}`);
+		}
+	});
+	test('fRows>0: the body starts at frozenCount + floor(scroll/rowHeight) (never re-paints a frozen row)', function () {
+		// At scrollTop 0 with 2 frozen rows, the first scrolling body row is row 2.
+		const r0 = computeVisibleBodyRowRange(0, GUTTERLESS_BODY_H, MAX_ROWS, ROW_HEIGHT, 0, 2);
+		assert.strictEqual(r0.startIdx, 2, 'body never starts before the frozen offset');
+		// Scroll down by 10 rows: the body's first row is 2 + 10 = 12.
+		const r1 = computeVisibleBodyRowRange(10 * ROW_HEIGHT, GUTTERLESS_BODY_H, MAX_ROWS, ROW_HEIGHT, 0, 2);
+		assert.strictEqual(r1.startIdx, 12);
+	});
+	test('overscan never pulls the body start below the frozen offset', function () {
+		const r = computeVisibleBodyRowRange(0, GUTTERLESS_BODY_H, MAX_ROWS, ROW_HEIGHT, 5, 3);
+		assert.ok(r.startIdx >= 3, `start ${r.startIdx} >= frozen 3`);
+	});
+	test('a stale large scrollTop (data shrank) clamps to the last row, never an empty window', function () {
+		const r = computeVisibleBodyRowRange(99 * ROW_HEIGHT, GUTTERLESS_BODY_H, 10, ROW_HEIGHT, 0, 2);
+		assert.ok(r.startIdx < r.endIdx, 'non-empty');
+		assert.ok(r.endIdx <= 10);
+	});
+});
+
+suite('W3 frozen panes -- computeVisibleBodyColRange (== computeVisibleColRange at fCols=0)', function () {
+	const BODY_W = 800 - 50; // viewport width minus a representative gutter
+	test('fCols=0 is byte-identical to the legacy computeVisibleColRange', function () {
+		for (const scrollLeft of [0, 64, 200, 5000, 900_000]) {
+			const body = computeVisibleBodyColRange(scrollLeft, BODY_W, MAX_COLS, COL_WIDTH, 2, 0);
+			const legacy = computeVisibleColRange(scrollLeft, BODY_W, MAX_COLS, COL_WIDTH, 2);
+			assert.deepStrictEqual(body, legacy, `scrollLeft=${scrollLeft}`);
+		}
+	});
+	test('fCols>0: the body starts at frozenCount + floor(scroll/colWidth)', function () {
+		const c0 = computeVisibleBodyColRange(0, BODY_W, MAX_COLS, COL_WIDTH, 0, 1);
+		assert.strictEqual(c0.startIdx, 1);
+		const c1 = computeVisibleBodyColRange(5 * COL_WIDTH, BODY_W, MAX_COLS, COL_WIDTH, 0, 1);
+		assert.strictEqual(c1.startIdx, 6);
+	});
+});
+
+suite('W3 frozen panes -- hitTestViewportFrozen', function () {
+	const GUTTER = 50;
+	test('with 0 frozen rows+cols it is byte-identical to hitTestViewport at any scroll', function () {
+		const cases: [number, number, number, number][] = [
+			[100, 100, 0, 0],
+			[300, 200, 500, 1000],
+			[60, 60, 0, 0], // just inside the body
+			[10, 10, 0, 0], // header/gutter -> null
+			[60, 10, 0, 0], // sticky gutter
+			[10, 60, 0, 0], // sticky header
+		];
+		for (const [lx, ly, sl, st] of cases) {
+			assert.deepStrictEqual(
+				hitTestViewportFrozen(lx, ly, sl, st, GUTTER, 0, 0),
+				hitTestViewport(lx, ly, sl, st, GUTTER),
+				`local(${lx},${ly}) scroll(${sl},${st})`,
+			);
+		}
+	});
+	test('a click in the FROZEN row band maps to the pinned row WITHOUT adding scrollTop', function () {
+		// 2 frozen rows: band is [HEADER_HEIGHT, HEADER_HEIGHT + 2*ROW_HEIGHT). A click at y just into row 0 of
+		// the band, with a large scrollTop, must still resolve to row 0 (pinned), col from X past the gutter.
+		const hit = hitTestViewportFrozen(GUTTER + 5, HEADER_HEIGHT + 3, 0, 100_000, GUTTER, 2, 0);
+		assert.deepStrictEqual(hit, { row: 0, col: 0 });
+		// A click in the 2nd frozen row.
+		const hit2 = hitTestViewportFrozen(GUTTER + 5, HEADER_HEIGHT + ROW_HEIGHT + 3, 0, 100_000, GUTTER, 2, 0);
+		assert.deepStrictEqual(hit2, { row: 1, col: 0 });
+	});
+	test('a click in the FROZEN col band maps to the pinned col WITHOUT adding scrollLeft', function () {
+		const hit = hitTestViewportFrozen(GUTTER + 3, HEADER_HEIGHT + 3, 50_000, 0, GUTTER, 0, 2);
+		assert.deepStrictEqual(hit, { row: 0, col: 0 });
+		const hit2 = hitTestViewportFrozen(GUTTER + COL_WIDTH + 3, HEADER_HEIGHT + 3, 50_000, 0, GUTTER, 0, 2);
+		assert.deepStrictEqual(hit2, { row: 0, col: 1 });
+	});
+	test('a click in the scrolling BODY adds the scroll + offsets by the frozen count', function () {
+		// 2 frozen rows + 1 frozen col. The body starts at viewport (gutter + COL_WIDTH, HEADER_HEIGHT +
+		// 2*ROW_HEIGHT). A click just inside the body, scrolled by 10 rows + 5 cols, resolves to the scrolled cell.
+		const bodyX = GUTTER + COL_WIDTH + 3;
+		const bodyY = HEADER_HEIGHT + 2 * ROW_HEIGHT + 3;
+		const hit = hitTestViewportFrozen(bodyX, bodyY, 5 * COL_WIDTH, 10 * ROW_HEIGHT, GUTTER, 2, 1);
+		// row = fRows(2) + floor((bodyLocalY + scrollTop)/ROW_HEIGHT) = 2 + floor((3 + 250)/25) = 2 + 10 = 12.
+		// col = fCols(1) + floor((bodyLocalX + scrollLeft)/COL_WIDTH) = 1 + floor((3 + 320)/64) = 1 + 5 = 6.
+		assert.deepStrictEqual(hit, { row: 12, col: 6 });
+	});
+	test('the top-frozen strip over a scrolled column: row pinned, col scrolled (four-pane independence)', function () {
+		// Y in the frozen-row band, X in the scrolling body: row from the pinned band, col from the scroll.
+		const hit = hitTestViewportFrozen(GUTTER + COL_WIDTH + 3, HEADER_HEIGHT + 3, 5 * COL_WIDTH, 9999, GUTTER, 2, 1);
+		assert.strictEqual(hit!.row, 0, 'frozen row pinned');
+		assert.strictEqual(hit!.col, 1 + 5, 'body col scrolled');
+	});
+	test('a click in the sticky header / gutter is still null with frozen bands present', function () {
+		assert.strictEqual(hitTestViewportFrozen(GUTTER + 5, HEADER_HEIGHT - 1, 0, 0, GUTTER, 2, 2), null, 'header');
+		assert.strictEqual(hitTestViewportFrozen(GUTTER - 1, HEADER_HEIGHT + 5, 0, 0, GUTTER, 2, 2), null, 'gutter');
+	});
+});
+
+suite('W3 frozen panes -- scrollToReveal with a frozen-extended band', function () {
+	test('a body cell reveals BELOW the frozen strip (band = header + frozen rows)', function () {
+		const band = HEADER_HEIGHT + frozenRowsHeight(2);
+		// A cell whose content-Y is just under the frozen band, currently scrolled out -> scroll so its start
+		// sits at the (frozen-extended) band edge.
+		const cellStart = rowY(50); // far down
+		const reveal = scrollToReveal(cellStart, ROW_HEIGHT, band, 0, 600);
+		// localStart (cellStart - 0) is way past the viewport bottom -> align end to viewport edge.
+		assert.strictEqual(reveal, cellStart + ROW_HEIGHT - 600);
 	});
 });
