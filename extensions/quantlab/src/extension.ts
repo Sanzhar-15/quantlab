@@ -13,6 +13,7 @@ import type { ReactiveKernelManager } from './quantbook/reactiveKernel/reactiveK
 import { QNB_NOTEBOOK_TYPE, QnbSerializer } from './quantbook/reactiveNotebook/qnbSerializer';
 import { registerReactiveNotebookController } from './quantbook/reactiveNotebook/reactiveNotebookController';
 import { registerQuantbookShell } from './quantbook/shell/quantbookShell';
+import { registerDepGraphSidebar } from './quantbook/shell/registerDepGraphSidebar';
 import { registerQuantbookMcpServer } from './quantbook/mcp/mcpServer';
 import type { SessionInstance } from './quantbook/types';
 import { registerGlobalStateCommands } from './commands/globalStateCommands';
@@ -337,6 +338,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// `quantbook.hasOpenGrid` context key gating the quantbook views). Registered AFTER the panel
 	// providers + AFTER the reactive-kernel manager exists (the sidebar's data source).
 	registerQuantbookShell(context, builtKernelManager);
+
+	// W3 B3: the dependency-graph "Dependencies" sidebar -- shows the focused cell's cross-language
+	// dependencies (formula precedents + the reactive Python variable driving it). Registered AFTER the
+	// shell (which drives the `quantbook.hasOpenGrid` context key gating both quantbook views) and shares
+	// the same reactive-kernel manager data source. Kept as a separate registration (not folded into
+	// registerQuantbookShell) so the W3 increment is additive.
+	registerDepGraphSidebar(context, builtKernelManager);
 
 	// W2 error-surface: the dedicated Quantbook error surface -- ONE `quantbook` DiagnosticCollection that
 	// mirrors cell errors into VS Code's Problems panel. The Cell Grid panel reports its stored cell errors

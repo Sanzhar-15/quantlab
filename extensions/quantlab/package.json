@@ -774,6 +774,11 @@
           "id": "quantlab.livePythonView",
           "name": "%view.livePython.title%",
           "when": "quantbook.hasOpenGrid"
+        },
+        {
+          "id": "quantlab.depGraphView",
+          "name": "%view.depGraph.title%",
+          "when": "quantbook.hasOpenGrid"
         }
       ]
     },
