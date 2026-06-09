@@ -136,9 +136,11 @@ pub fn eval_scalar<E: CellEnv>(plan: &ExprPlan, env: &E) -> Value {
         // semantics must go through `eval_scalar_with_registry` or
         // `eval_scalar_with_cache`.
         ExprPlan::AggregateNameRef { .. } => Value::Error(ErrorValue::Calc),
-        // **W5-RT-1 (RT-V1-01):** literal range refs only reach reference-
-        // aware functions; in this no-registry path there's no dispatcher
-        // to consume them. Mirrors the `AggregateNameRef` precedent.
+        // **W5-RT-1 (RT-V1-01) / W2-literal-range:** literal range refs
+        // only reach reference-aware OR aggregate functions via their arg
+        // materialization loops; in this no-registry path there's no
+        // dispatcher to consume them. Mirrors the `AggregateNameRef`
+        // precedent.
         ExprPlan::RangeRef { .. } => Value::Error(ErrorValue::Calc),
         // **W5-99 (Phase 4.7.F):** error literal — return the error
         // value directly. Used by `=#REF!` formulas and error literals
@@ -246,7 +248,20 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                     let mut fn_args: Vec<FnArg> = Vec::with_capacity(args.len());
                     for a in args {
                         match a {
-                            ExprPlan::AggregateNameRef { range, .. } => {
+                            // **W2-literal-range (2026-06-09):** a literal
+                            // colon range (`ExprPlan::RangeRef`, e.g.
+                            // `SUMIF(A1:A4, ">0")`) reads exactly like an
+                            // `AggregateNameRef` here — both carry a resolved
+                            // `Range`. This makes the *IF* family accept a
+                            // literal range in its range-arg slots. A literal
+                            // range in a CRITERIA slot binds as a
+                            // `FnArg::Range` too; each *IF* impl explicitly
+                            // returns `#VALUE!` for a Range criteria (verified
+                            // safe — no panic). SHARPE / MAX_DRAWDOWN are also
+                            // RangeAware-tier and resolve their literal range
+                            // here.
+                            ExprPlan::AggregateNameRef { range, .. }
+                            | ExprPlan::RangeRef { range } => {
                                 // W5-54: shape-aware Range so VLOOKUP /
                                 // HLOOKUP / INDEX can address by (row,
                                 // col). SUMIF / COUNTIF ignore shape.
@@ -306,7 +321,16 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                     let mut f_args: Vec<FunctionArg> = Vec::with_capacity(args.len());
                     for a in args {
                         match a {
-                            ExprPlan::AggregateNameRef { range, .. } => {
+                            // **W2-literal-range (2026-06-09):** literal range
+                            // reads as a `FunctionArg::Range`, same as a named
+                            // range. No production Unified-tier aggregate
+                            // caller binds a literal range today (SEQUENCE /
+                            // FILTER / TRANSPOSE take it via the cell-boundary
+                            // path), so this arm is forward-compat — it keeps
+                            // the Unified scalar arm in lockstep with the
+                            // RangeAware / Scalar arms.
+                            ExprPlan::AggregateNameRef { range, .. }
+                            | ExprPlan::RangeRef { range } => {
                                 let (values, rows, cols) = env.read_range_with_shape(*range);
                                 f_args.push(FunctionArg::Range { values, rows, cols });
                             }
@@ -389,7 +413,15 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                     // aggregates (`SUM(Sales, Discount)`) fall back to no-
                     // cache (compute on every call) — V1 limitation.
                     let single_range_arg = match args.as_slice() {
-                        [ExprPlan::AggregateNameRef { range, .. }] => Some(*range),
+                        // **W2-literal-range (2026-06-09):** `=SUM(A1:A4)` keys
+                        // the aggregate cache on the resolved `(range, fn)`,
+                        // exactly like `=SUM(Sales)` when `Sales` covers the
+                        // same cells — `resolve_range_ref_to_range` and the
+                        // NameTable yield byte-identical `Range`s, so the two
+                        // call shapes share one cache slot (no collision: the
+                        // key is the cells, not the syntax).
+                        [ExprPlan::AggregateNameRef { range, .. }]
+                        | [ExprPlan::RangeRef { range }] => Some(*range),
                         // **W5-116/117 (Phase 4.8.G + G.2):** single-StructuredRef
                         // fast path. `SUM(Sales[Qty])` uses the same
                         // (range, function_name) aggregate cache key as
@@ -428,10 +460,15 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                     // iterate a named-range arg's cells. Without this, the
                     // pre-W5-100 path evaluated the Array as scalar (→
                     // #CALC!) and SUM saw a single error value.
+                    // **W2-literal-range (2026-06-09):** a literal range
+                    // (`ExprPlan::RangeRef`) is range-like too, so a
+                    // multi-arg aggregate such as `SUM(A1:A4, B1:B4)` or
+                    // `SUM(A1:A4, 10)` takes the materialization path below.
                     let has_range_or_array_arg = args.iter().any(|a| {
                         matches!(
                             a,
                             ExprPlan::AggregateNameRef { .. }
+                                | ExprPlan::RangeRef { .. }
                                 | ExprPlan::Array(_)
                                 | ExprPlan::StructuredRef { .. }
                         )
@@ -447,7 +484,12 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                         let mut flat: Vec<Value> = Vec::new();
                         for a in args {
                             match a {
-                                ExprPlan::AggregateNameRef { range, .. } => {
+                                // **W2-literal-range:** literal range flattens
+                                // exactly like a named range — `read_range`
+                                // clamps whole-column / whole-row to populated
+                                // bounds, so `SUM(A:A, B1:B4)` is safe.
+                                ExprPlan::AggregateNameRef { range, .. }
+                                | ExprPlan::RangeRef { range } => {
                                     flat.extend(env.read_range(*range));
                                 }
                                 // **W5-116/117 (Phase 4.8.G + G.2):** structured-ref
@@ -543,12 +585,12 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
         // supposed to surface `BindError::NamedRangeInScalarContext`
         // before we ever evaluate. Defensive fallback: `#CALC!`.
         ExprPlan::AggregateNameRef { .. } => Value::Error(ErrorValue::Calc),
-        // **W5-RT-1 (RT-V1-01):** literal range refs only reach reference-
-        // aware functions via the materializer. Outside that context
-        // (e.g., a stray RangeRef arg to a non-reference-aware fn that
-        // accepted it through some future change) returns #CALC!. The
-        // binder gates this — `BindContext::ReferenceArg` is the only
-        // context that produces `ExprPlan::RangeRef`.
+        // **W5-RT-1 (RT-V1-01) / W2-literal-range:** literal range refs
+        // only reach reference-aware OR aggregate functions via the
+        // materializer arms above. Outside a function arg list (a stray
+        // bare `RangeRef`) returns #CALC!. The binder gates this — only
+        // `BindContext::ReferenceArg` / `AggregateArg` produce
+        // `ExprPlan::RangeRef`, and both are always inside a Function.
         ExprPlan::RangeRef { .. } => Value::Error(ErrorValue::Calc),
         // **W5-99 (Phase 4.7.F):** error literal — return the error
         // value directly. Same shape as the no-registry `eval_scalar`
@@ -872,7 +914,12 @@ pub fn eval_at_cell_boundary<E: CellEnv>(
             let mut f_args: Vec<FunctionArg> = Vec::with_capacity(args.len());
             for a in args {
                 match a {
-                    ExprPlan::AggregateNameRef { range, .. } => {
+                    // **W2-literal-range (2026-06-09):** keep the cell-boundary
+                    // Unified arm in lockstep with the scalar Unified arm — a
+                    // literal range arg to a top-level array-returning Unified
+                    // fn (e.g. `=TRANSPOSE(A1:B3)`) reads as a
+                    // `FunctionArg::Range`, same as a named range.
+                    ExprPlan::AggregateNameRef { range, .. } | ExprPlan::RangeRef { range } => {
                         let (values, rows, cols) = env.read_range_with_shape(*range);
                         f_args.push(FunctionArg::Range { values, rows, cols });
                     }

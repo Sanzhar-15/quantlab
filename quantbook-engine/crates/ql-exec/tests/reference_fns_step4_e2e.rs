@@ -276,17 +276,16 @@ fn formulatext_of_named_cell_pointing_at_formula_returns_text() {
 }
 
 #[test]
-fn formulatext_of_sum_literal_range_bind_fails_v1_scope() {
-    // S2-HIGH-3 propagation: literal-range nested SUM bind-fails per
-    // S1-MED-γ AggregateArg defer.
-    let tokens = lex("FORMULATEXT(SUM(A1:A3))").expect("lex");
-    let ast = parse(tokens).expect("parse");
-    let reg = default_registry();
-    let result = ql_exec::bind(&ast, 0, &reg);
-    assert!(
-        result.is_err(),
-        "v1 scope: FORMULATEXT(SUM(A1:A3)) bind-fails per S1-MED-γ \
-         AggregateArg defer; got Ok({result:?})"
+fn formulatext_of_sum_literal_range_now_binds_and_returns_na() {
+    // **W2-literal-range (2026-06-09):** the inner `SUM(A1:A3)` literal range
+    // now binds; `FORMULATEXT(SUM(A1:A3))` evaluates to `#N/A` because its
+    // arg is a function-call (non-reference) shape — Microsoft canon returns
+    // `#N/A` for any non-reference arg. Previously
+    // `formulatext_of_sum_literal_range_bind_fails_v1_scope` pinned the
+    // now-lifted S1-MED-γ AggregateArg defer.
+    assert_eq!(
+        eval_with_map("FORMULATEXT(SUM(A1:A3))"),
+        Value::Error(ErrorValue::NA)
     );
 }
 

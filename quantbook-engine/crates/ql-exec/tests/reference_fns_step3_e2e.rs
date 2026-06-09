@@ -269,33 +269,28 @@ fn isformula_of_named_cell_pointing_at_formula_returns_true() {
 // Step 3.1 audit closures
 // ---------------------------------------------------------------------
 
-/// **S3-HIGH-4 closure:** ISREF with literal-range SUM arg bind-fails per
-/// S1-MED-γ AggregateArg defer. Pin v1 stance — a future commit that
-/// enables AggregateArg literal-RangeRef lowering must update this test.
+/// **W2-literal-range (2026-06-09):** ISREF with a literal-range SUM arg now
+/// BINDS (the inner `SUM(A1:A3)` accepts the literal range) and evaluates to
+/// FALSE — SUM does not return a reference, so the arg shape is
+/// `PlanKind::Function { returns_reference: false }`. Previously
+/// `isref_of_sum_literal_range_bind_fails_v1_scope` pinned the now-lifted
+/// S1-MED-γ AggregateArg defer.
 #[test]
-fn isref_of_sum_literal_range_bind_fails_v1_scope() {
-    let tokens = lex("ISREF(SUM(A1:A3))").expect("lex");
-    let ast = parse(tokens).expect("parse");
-    let reg = default_registry();
-    let result = ql_exec::bind(&ast, 0, &reg);
-    assert!(
-        result.is_err(),
-        "v1 scope: ISREF(SUM(A1:A3)) bind-fails per S1-MED-γ AggregateArg \
-         defer; got Ok({result:?})"
-    );
+fn isref_of_sum_literal_range_now_binds_and_returns_false() {
+    assert_eq!(eval_with_map("ISREF(SUM(A1:A3))"), Value::Boolean(false));
 }
 
-/// **S3-HIGH-4 closure:** ISFORMULA with literal-range SUM arg bind-fails.
+/// **W2-literal-range (2026-06-09):** ISFORMULA with a literal-range SUM arg
+/// now BINDS and evaluates to `#N/A` — `SUM(A1:A3)` is a function-call arg
+/// (a non-reference shape), and ISFORMULA returns `#N/A` for any
+/// non-reference arg per Microsoft canon. Previously
+/// `isformula_of_sum_literal_range_bind_fails_v1_scope` pinned the now-lifted
+/// S1-MED-γ AggregateArg defer.
 #[test]
-fn isformula_of_sum_literal_range_bind_fails_v1_scope() {
-    let tokens = lex("ISFORMULA(SUM(A1:A3))").expect("lex");
-    let ast = parse(tokens).expect("parse");
-    let reg = default_registry();
-    let result = ql_exec::bind(&ast, 0, &reg);
-    assert!(
-        result.is_err(),
-        "v1 scope: ISFORMULA(SUM(A1:A3)) bind-fails per S1-MED-γ \
-         AggregateArg defer; got Ok({result:?})"
+fn isformula_of_sum_literal_range_now_binds_and_returns_na() {
+    assert_eq!(
+        eval_with_map("ISFORMULA(SUM(A1:A3))"),
+        Value::Error(ErrorValue::NA)
     );
 }
 

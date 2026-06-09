@@ -230,27 +230,37 @@ fn row_zero_arg_evaluates_per_cell_via_plan_cache_sharing() {
 }
 
 // ---------------------------------------------------------------------
-// S2-HIGH-3 closure: pin `ROW(SUM(A1:A3))` as a documented v1 bind-error
+// W2-literal-range: `ROW(SUM(A1:A3))` now BINDS (literal range in the
+// inner aggregate is accepted) and evaluates to #VALUE! — matching the
+// named-range sibling below and the Microsoft-canon result.
 // ---------------------------------------------------------------------
 
 #[test]
-fn row_of_sum_literal_range_bind_fails_v1_scope() {
-    // Step 2 audit S2-HIGH-3: the design's Microsoft-canon example
-    // `ROW(SUM(A1:A3)) → #VALUE!` does NOT work in v1. The inner
-    // SUM gets `BindContext::AggregateArg`; `Expr::RangeRef` is rejected
-    // in that context per S1-MED-γ defer. This test pins the v1 stance
-    // — a regression that ENABLES this case (by lifting the AggregateArg
-    // defer) should NOT silently flip the result without updating the
-    // test + design + matrix.
-    let wb = workbook_with_two_sheets();
+fn row_of_sum_literal_range_now_binds_and_evaluates_to_value_error() {
+    // **W2-literal-range (2026-06-09):** previously
+    // `row_of_sum_literal_range_bind_fails_v1_scope` pinned the S1-MED-γ
+    // AggregateArg defer — the inner `A1:A3` was rejected in
+    // `BindContext::AggregateArg`. W2 lifts that defer, so the inner
+    // `SUM(A1:A3)` now binds (literal range → `ExprPlan::RangeRef`),
+    // evaluates to a scalar, and the outer `ROW(scalar)` returns #VALUE!
+    // per the Microsoft-canon `ROW(SUM(A1:A3)) → #VALUE!`. This is now
+    // byte-identical to the named-range form
+    // (`row_of_sum_named_range_works_via_existing_aggregate_path`).
+    use ql_exec::WorkbookEnv;
+    let mut wb = workbook_with_two_sheets();
+    wb.sheet_mut(0).unwrap().put(0, 0, Value::number(1.0));
+    wb.sheet_mut(0).unwrap().put(1, 0, Value::number(2.0));
+    wb.sheet_mut(0).unwrap().put(2, 0, Value::number(3.0));
     let tokens = lex("ROW(SUM(A1:A3))").expect("lex");
     let ast = parse(tokens).expect("parse");
     let reg = default_registry();
-    let result = bind_with_names_and_sheets(&ast, 0, &wb, &wb, &reg);
-    assert!(
-        result.is_err(),
-        "v1 scope: ROW(SUM(A1:A3)) bind-fails per S1-MED-γ AggregateArg defer; \
-         got Ok({result:?})"
+    let plan = bind_with_names_and_sheets(&ast, 0, &wb, &wb, &reg)
+        .expect("W2: ROW(SUM(A1:A3)) now binds — literal range in aggregate arg");
+    let env = WorkbookEnv::with_formula_cell(&wb, Address::new(0, 0, 1));
+    // SUM(A1:A3) = 6 (scalar); ROW(scalar) = #VALUE!.
+    assert_eq!(
+        eval_scalar_with_cache(&plan, &env, &reg, &NoAggregateCache),
+        Value::Error(ErrorValue::Value)
     );
 }
 

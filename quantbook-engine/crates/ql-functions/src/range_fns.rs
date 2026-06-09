@@ -1926,17 +1926,16 @@ pub fn quartile_exc(args: &[FnArg]) -> Value {
 // visibility + nested-skip semantics differ. Microsoft docs:
 // support.microsoft.com/en-us/office/subtotal-function-7b027003-f060-4ade-9040-e478765b9939
 //
-// **W5-D-12.1 (binder admission — partial; NOT a full literal-range
-// lift):** SUBTOTAL was added to `is_aggregate_function` in
-// `ql-exec::plan` so NAMED-RANGE args (`SUBTOTAL(9, SalesRange)`) bind
-// through `AggregateNameRef`. Literal range refs in arg position
-// (`SUBTOTAL(9, A1:A10)`) remain unbindable in v1 — this is a
-// pre-existing engine-wide gap (see `plan.rs:706-731` and the
-// `AggregateArg`-side deferral doc-comment at `plan.rs:380-383`) that
-// affects every aggregate including standalone `SUM(A1:A10)`. Scalar
-// args (`SUBTOTAL(9, A1, A2, A3)`) and named-range args work today;
-// literal range lifting is tracked as a follow-up across all
-// aggregates, not as SUBTOTAL-specific work.
+// **W5-D-12.1 (binder admission):** SUBTOTAL was added to
+// `is_aggregate_function` in `ql-exec::plan` so NAMED-RANGE args
+// (`SUBTOTAL(9, SalesRange)`) bind through `AggregateNameRef`.
+// **W2-literal-range (2026-06-09):** literal range refs in arg position
+// (`SUBTOTAL(9, A1:A10)`) now ALSO bind — the engine-wide `AggregateArg`-
+// side deferral was lifted (the binder lowers `Expr::RangeRef` to
+// `ExprPlan::RangeRef { range }`, which every aggregate dispatcher arm
+// now consumes). Scalar args (`SUBTOTAL(9, A1, A2, A3)`), named-range
+// args, AND literal-range args all work today (pinned by
+// `w2_literal_range_subtotal_full_path` in `ql-exec`).
 //
 // Edge cases:
 // - args.len() < 2 → `#VALUE!` (Excel canon: needs function_num + ≥1 ref).

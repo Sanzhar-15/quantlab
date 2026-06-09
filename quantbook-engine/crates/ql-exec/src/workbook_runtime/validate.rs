@@ -545,17 +545,14 @@ mod tests {
     /// rather than binding the `AggregateNameRef`. So this test IS the
     /// bind-step armor the Codex correction called for.
     ///
-    /// **Engine note (verified, pre-existing):** a *literal* colon range
-    /// (`=SHARPE(A1:A4)`) does NOT bind in v1 — the binder rejects a literal
-    /// `Expr::RangeRef` in `BindContext::AggregateArg` with
-    /// `UnsupportedVariant` (`plan.rs:706`). This is a GLOBAL engine
-    /// limitation affecting EVERY aggregate (`SUM(A1:A4)` is identically
-    /// unsupported; only `SUM(NamedRange)` works), tracked in the binder
-    /// design § 5.4 — NOT specific to SHARPE/MAX_DRAWDOWN. The named-range
-    /// path is the supported production surface; the literal-range gap is
-    /// flagged in the handoff for the conductor. `b2_literal_range_arg_to_
-    /// aggregate_is_unsupported_pre_existing` below pins that limitation so
-    /// a future binder extension that lifts it is noticed.
+    /// **Engine note (W2-literal-range, 2026-06-09):** a *literal* colon
+    /// range (`=SHARPE(A1:A4)`) now ALSO binds + evaluates — the binder
+    /// lowers a literal `Expr::RangeRef` in `BindContext::AggregateArg` to
+    /// `ExprPlan::RangeRef { range }` (same downstream shape as a named
+    /// range), engine-global for EVERY aggregate (`SUM(A1:A4)` too). This
+    /// test keeps the named-range path as the reference; the literal-range
+    /// equivalence is pinned by
+    /// `b2_literal_range_arg_to_aggregate_now_binds_and_evaluates` below.
     #[test]
     fn b2_sharpe_full_path_named_range() {
         use ql_storage::NamedTarget;
@@ -658,17 +655,20 @@ mod tests {
         assert_eq!(v, Value::Error(ErrorValue::Num));
     }
 
-    /// **B2 — pin the PRE-EXISTING engine limitation: a literal colon range
-    /// argument to an aggregate is unsupported in v1.** This is NOT specific
-    /// to SHARPE/MAX_DRAWDOWN — the binder rejects a literal `Expr::RangeRef`
-    /// in `BindContext::AggregateArg` for every aggregate (the same
-    /// `UnsupportedVariant` error fires for `SUM(A1:A4)`), tracked in the
-    /// binder design § 5.4. We pin it here for SHARPE so that if a future
-    /// binder change lifts the limitation (literal ranges in aggregate args),
-    /// this test fails loudly and the conductor knows the literal-range
-    /// surface — the exact `=SHARPE(A1:A10)` shape — has become available.
+    /// **B2 / W2-literal-range (2026-06-09) — a literal colon range argument
+    /// to an aggregate now BINDS and EVALUATES.** This was previously a
+    /// pre-existing v1 limitation (`b2_literal_range_arg_to_aggregate_is_
+    /// unsupported_pre_existing`, which asserted REJECTION); the W2 binder +
+    /// dispatcher change lifts it. The binder now lowers a literal
+    /// `Expr::RangeRef` in `BindContext::AggregateArg` to
+    /// `ExprPlan::RangeRef { range }` (the same downstream shape an
+    /// `AggregateNameRef` produces), and every scalar / range-aware / unified
+    /// dispatcher arm reads it as a `FnArg::Range` / `FunctionArg::Range`.
+    /// We pin the SUCCESS here for both SHARPE (RangeAware tier) and SUM
+    /// (Scalar tier) to prove the literal-range surface — the exact
+    /// `=SHARPE(A1:A10)` / `=SUM(A1:A4)` shape — is now live engine-global.
     #[test]
-    fn b2_literal_range_arg_to_aggregate_is_unsupported_pre_existing() {
+    fn b2_literal_range_arg_to_aggregate_now_binds_and_evaluates() {
         let mut wb = make_runtime_workbook();
         wb.put_at(0, 0, 0, Value::Number(0.01));
         wb.put_at(0, 1, 0, Value::Number(0.02));
@@ -677,21 +677,341 @@ mod tests {
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
-        // Literal `A1:A4` in aggregate-arg position is rejected at BIND time.
-        let err = rt.set_formula(0, 0, 5, "SHARPE(A1:A4)").unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("UnsupportedVariant") && msg.contains("literal RangeRef"),
-            "expected the pre-existing literal-RangeRef-in-aggregate rejection, got: {msg}"
+        // Literal `A1:A4` in aggregate-arg position now binds + evaluates.
+        // SHARPE over [0.01,0.02,0.03,0.04]: mean=0.025,
+        // sample stdev=sqrt(0.0005/3)=0.0129099445, SHARPE(Rf=0)=1.9364916731
+        // — IDENTICAL to the named-range path (`b2_sharpe_full_path_named_range`).
+        let v = rt.set_formula(0, 0, 5, "SHARPE(A1:A4)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 1.9364916731).abs() < 1e-9, "got {n}"),
+            other => panic!("expected Number(~1.9365), got {other:?}"),
+        }
+
+        // `SUM(A1:A4)` — a builtin Scalar-tier aggregate — also binds:
+        // 0.01+0.02+0.03+0.04 = 0.10.
+        let sum = rt.set_formula(0, 1, 5, "SUM(A1:A4)").unwrap();
+        match sum {
+            Value::Number(n) => assert!((n - 0.10).abs() < 1e-12, "got {n}"),
+            other => panic!("expected Number(0.10), got {other:?}"),
+        }
+    }
+
+    /// **W2-literal-range — Scalar-tier aggregates over a literal range
+    /// (SUM / AVERAGE / COUNT / MIN / MAX).** Full lex→parse→bind→eval; the
+    /// computed VALUE is asserted (not just that it binds). The data lives in
+    /// A1:A5 = [1, 2, 3, 4, 5].
+    #[test]
+    fn w2_literal_range_scalar_aggregates_full_path() {
+        let mut wb = make_runtime_workbook();
+        for (i, v) in [1.0, 2.0, 3.0, 4.0, 5.0].iter().enumerate() {
+            wb.put_at(0, i as u32, 0, Value::Number(*v));
+        }
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        assert_eq!(
+            rt.set_formula(0, 0, 5, "SUM(A1:A5)").unwrap(),
+            Value::Number(15.0)
+        );
+        assert_eq!(
+            rt.set_formula(0, 1, 5, "AVERAGE(A1:A5)").unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            rt.set_formula(0, 2, 5, "COUNT(A1:A5)").unwrap(),
+            Value::Number(5.0)
+        );
+        assert_eq!(
+            rt.set_formula(0, 3, 5, "MIN(A1:A5)").unwrap(),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            rt.set_formula(0, 4, 5, "MAX(A1:A5)").unwrap(),
+            Value::Number(5.0)
         );
 
-        // Cross-check: `SUM(A1:A4)` — a builtin aggregate — fails identically,
-        // proving the limitation is engine-global, not a SHARPE defect.
-        let sum_err = rt.set_formula(0, 1, 5, "SUM(A1:A4)").unwrap_err();
-        let sum_msg = format!("{sum_err:?}");
+        // Multi-range literal aggregate: SUM(A1:A2, A4:A5) = 1+2+4+5 = 12.
+        assert_eq!(
+            rt.set_formula(0, 5, 5, "SUM(A1:A2, A4:A5)").unwrap(),
+            Value::Number(12.0)
+        );
+        // Mixed literal-range + scalar arg: SUM(A1:A5, 100) = 115.
+        assert_eq!(
+            rt.set_formula(0, 6, 5, "SUM(A1:A5, 100)").unwrap(),
+            Value::Number(115.0)
+        );
+    }
+
+    /// **W2-literal-range — RangeAware-tier quant fns (SHARPE / MAX_DRAWDOWN)
+    /// over a literal range.** These resolve BEFORE the Scalar arms, so this
+    /// exercises the RangeAware dispatch arm specifically. Values match the
+    /// named-range full-path tests exactly.
+    #[test]
+    fn w2_literal_range_range_aware_quant_fns_full_path() {
+        let mut wb = make_runtime_workbook();
+        // Equity series A1:A6 = [100, 120, 90, 110, 80, 130] for MAX_DRAWDOWN.
+        for (i, p) in [100.0, 120.0, 90.0, 110.0, 80.0, 130.0].iter().enumerate() {
+            wb.put_at(0, i as u32, 0, Value::Number(*p));
+        }
+        // Returns series B1:B4 = [0.01, 0.02, 0.03, 0.04] for SHARPE.
+        for (i, r) in [0.01, 0.02, 0.03, 0.04].iter().enumerate() {
+            wb.put_at(0, i as u32, 1, Value::Number(*r));
+        }
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // MAX_DRAWDOWN(A1:A6) = 80/120 - 1 = -1/3 (matches named-range path).
+        let mdd = rt.set_formula(0, 0, 5, "MAX_DRAWDOWN(A1:A6)").unwrap();
+        match mdd {
+            Value::Number(n) => assert!((n - (-1.0 / 3.0)).abs() < 1e-12, "got {n}"),
+            other => panic!("expected ~-0.3333, got {other:?}"),
+        }
+
+        // SHARPE(B1:B4) = 1.9364916731 (matches named-range path).
+        let sh = rt.set_formula(0, 1, 5, "SHARPE(B1:B4)").unwrap();
+        match sh {
+            Value::Number(n) => assert!((n - 1.9364916731).abs() < 1e-9, "got {n}"),
+            other => panic!("expected ~1.9365, got {other:?}"),
+        }
+
+        // SHARPE with a risk-free-rate scalar arg ALONGSIDE the literal range:
+        // (0.025-0.01)/0.0129099445 = 1.1618950039.
+        let sh_rf = rt.set_formula(0, 2, 5, "SHARPE(B1:B4, 0.01)").unwrap();
+        match sh_rf {
+            Value::Number(n) => assert!((n - 1.1618950039).abs() < 1e-9, "got {n}"),
+            other => panic!("expected ~1.1619, got {other:?}"),
+        }
+    }
+
+    /// **W2-literal-range — the *IF* family with literal ranges, INCLUDING
+    /// the criteria-arg safety contract.** SUMIF / COUNTIF / AVERAGEIF /
+    /// SUMIFS read their range slots as `FnArg::Range`. CRITICAL: a literal
+    /// range handed to the CRITERIA slot must surface `#VALUE!`, NOT panic —
+    /// each impl explicitly pattern-matches `FnArg::Range` in the criteria
+    /// position and returns `Value::Error(ErrorValue::Value)`. This test
+    /// pins that no-panic contract.
+    #[test]
+    fn w2_literal_range_if_family_full_path_incl_criteria_safety() {
+        let mut wb = make_runtime_workbook();
+        // A1:A5 = [1, 2, 3, 4, 5]; B1:B5 = [10, 20, 30, 40, 50].
+        for (i, v) in [1.0, 2.0, 3.0, 4.0, 5.0].iter().enumerate() {
+            wb.put_at(0, i as u32, 0, Value::Number(*v));
+        }
+        for (i, v) in [10.0, 20.0, 30.0, 40.0, 50.0].iter().enumerate() {
+            wb.put_at(0, i as u32, 1, Value::Number(*v));
+        }
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // COUNTIF(A1:A5, ">2") = {3,4,5} = 3.
+        assert_eq!(
+            rt.set_formula(0, 0, 5, "COUNTIF(A1:A5, \">2\")").unwrap(),
+            Value::Number(3.0)
+        );
+        // SUMIF(A1:A5, ">2") = 3+4+5 = 12.
+        assert_eq!(
+            rt.set_formula(0, 1, 5, "SUMIF(A1:A5, \">2\")").unwrap(),
+            Value::Number(12.0)
+        );
+        // SUMIF(A1:A5, ">2", B1:B5) = 30+40+50 = 120 (both literal ranges).
+        assert_eq!(
+            rt.set_formula(0, 2, 5, "SUMIF(A1:A5, \">2\", B1:B5)")
+                .unwrap(),
+            Value::Number(120.0)
+        );
+        // AVERAGEIF(A1:A5, ">2", B1:B5) = (30+40+50)/3 = 40.
+        assert_eq!(
+            rt.set_formula(0, 3, 5, "AVERAGEIF(A1:A5, \">2\", B1:B5)")
+                .unwrap(),
+            Value::Number(40.0)
+        );
+        // SUMIFS(B1:B5, A1:A5, ">2") = 120 (sum_range FIRST in IFS canon).
+        assert_eq!(
+            rt.set_formula(0, 4, 5, "SUMIFS(B1:B5, A1:A5, \">2\")")
+                .unwrap(),
+            Value::Number(120.0)
+        );
+        // COUNTIFS(A1:A5, ">2") = {3,4,5} = 3.
+        assert_eq!(
+            rt.set_formula(0, 8, 5, "COUNTIFS(A1:A5, \">2\")").unwrap(),
+            Value::Number(3.0)
+        );
+        // AVERAGEIFS(B1:B5, A1:A5, ">2") = (30+40+50)/3 = 40.
+        assert_eq!(
+            rt.set_formula(0, 9, 5, "AVERAGEIFS(B1:B5, A1:A5, \">2\")")
+                .unwrap(),
+            Value::Number(40.0)
+        );
+        // MINIFS(B1:B5, A1:A5, ">2") = min(30,40,50) = 30.
+        assert_eq!(
+            rt.set_formula(0, 10, 5, "MINIFS(B1:B5, A1:A5, \">2\")")
+                .unwrap(),
+            Value::Number(30.0)
+        );
+        // MAXIFS(B1:B5, A1:A5, ">2") = max(30,40,50) = 50.
+        assert_eq!(
+            rt.set_formula(0, 11, 5, "MAXIFS(B1:B5, A1:A5, \">2\")")
+                .unwrap(),
+            Value::Number(50.0)
+        );
+
+        // CRITICAL safety: a literal range in the CRITERIA slot must NOT
+        // panic — it binds to FnArg::Range and the impl returns #VALUE!.
+        // `COUNTIF(A1:A5, B1:B5)` — B1:B5 is a non-Excel range criteria.
+        assert_eq!(
+            rt.set_formula(0, 5, 5, "COUNTIF(A1:A5, B1:B5)").unwrap(),
+            Value::Error(ErrorValue::Value)
+        );
+        // `SUMIF(A1:A5, B1:B5, B1:B5)` — criteria slot is a range.
+        assert_eq!(
+            rt.set_formula(0, 6, 5, "SUMIF(A1:A5, B1:B5, B1:B5)")
+                .unwrap(),
+            Value::Error(ErrorValue::Value)
+        );
+        // `SUMIFS(B1:B5, A1:A5, B1:B5)` — IFS criteria slot is a range.
+        assert_eq!(
+            rt.set_formula(0, 7, 5, "SUMIFS(B1:B5, A1:A5, B1:B5)")
+                .unwrap(),
+            Value::Error(ErrorValue::Value)
+        );
+        // The remaining IFS variants share `parse_ifs_pairs`, but pin each
+        // explicitly so a future refactor can't regress criteria safety.
+        // `COUNTIFS(A1:A5, B1:B5)` — criteria slot is a range.
+        assert_eq!(
+            rt.set_formula(0, 12, 5, "COUNTIFS(A1:A5, B1:B5)").unwrap(),
+            Value::Error(ErrorValue::Value)
+        );
+        // `AVERAGEIFS(B1:B5, A1:A5, B1:B5)` — criteria slot is a range.
+        assert_eq!(
+            rt.set_formula(0, 13, 5, "AVERAGEIFS(B1:B5, A1:A5, B1:B5)")
+                .unwrap(),
+            Value::Error(ErrorValue::Value)
+        );
+        // `MINIFS(B1:B5, A1:A5, B1:B5)` — criteria slot is a range.
+        assert_eq!(
+            rt.set_formula(0, 14, 5, "MINIFS(B1:B5, A1:A5, B1:B5)")
+                .unwrap(),
+            Value::Error(ErrorValue::Value)
+        );
+        // `MAXIFS(B1:B5, A1:A5, B1:B5)` — criteria slot is a range.
+        assert_eq!(
+            rt.set_formula(0, 15, 5, "MAXIFS(B1:B5, A1:A5, B1:B5)")
+                .unwrap(),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    /// **W2-literal-range — SUBTOTAL with a literal range.** SUBTOTAL is
+    /// range-aware (dispatches `function_num` to a scalar aggregate); the
+    /// W5-D-12.1 closure only admitted the NAMED-range form. With the W2
+    /// binder open, `SUBTOTAL(9, A1:A3)` now binds the literal range too.
+    #[test]
+    fn w2_literal_range_subtotal_full_path() {
+        let mut wb = make_runtime_workbook();
+        for (i, v) in [10.0, 20.0, 30.0].iter().enumerate() {
+            wb.put_at(0, i as u32, 0, Value::Number(*v));
+        }
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // SUBTOTAL(9, A1:A3) = SUM = 60.
+        assert_eq!(
+            rt.set_formula(0, 0, 5, "SUBTOTAL(9, A1:A3)").unwrap(),
+            Value::Number(60.0)
+        );
+        // SUBTOTAL(1, A1:A3) = AVERAGE = 20.
+        assert_eq!(
+            rt.set_formula(0, 1, 5, "SUBTOTAL(1, A1:A3)").unwrap(),
+            Value::Number(20.0)
+        );
+    }
+
+    /// **W2-literal-range — a CROSS-SHEET literal range (`S2!A1:A4`).** The
+    /// `resolve_sheet_ref` path inside `resolve_range_ref_to_range` resolves
+    /// the sheet by name; the aggregate then reads cells from the OTHER
+    /// sheet. Proves the literal-range binder is sheet-qualified.
+    #[test]
+    fn w2_literal_range_cross_sheet_full_path() {
+        let mut wb = make_runtime_workbook(); // adds "S" at index 0.
+        let s2 = wb.add_sheet("S2");
+        // S2!A1:A4 = [2, 4, 6, 8]; sum = 20, average = 5.
+        for (i, v) in [2.0, 4.0, 6.0, 8.0].iter().enumerate() {
+            wb.put_at(s2, i as u32, 0, Value::Number(*v));
+        }
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Formula lives on sheet S (index 0), references S2's literal range.
+        assert_eq!(
+            rt.set_formula(0, 0, 5, "SUM(S2!A1:A4)").unwrap(),
+            Value::Number(20.0)
+        );
+        assert_eq!(
+            rt.set_formula(0, 1, 5, "AVERAGE(S2!A1:A4)").unwrap(),
+            Value::Number(5.0)
+        );
+        // An unknown sheet in a literal range fails LOUD at bind (no silent
+        // fallback) — `BindError::UnknownSheet`.
+        let err = rt.set_formula(0, 2, 5, "SUM(Nope!A1:A4)").unwrap_err();
+        let msg = format!("{err:?}");
         assert!(
-            sum_msg.contains("UnsupportedVariant") && sum_msg.contains("literal RangeRef"),
-            "expected SUM to share the literal-range limitation, got: {sum_msg}"
+            msg.contains("UnknownSheet"),
+            "expected UnknownSheet for a bad sheet in a literal range, got: {msg}"
+        );
+    }
+
+    /// **W2-literal-range — a WHOLE-COLUMN literal range (`A:A`).** A bare
+    /// column lexes as `RangeRef::WholeColumn`, resolving to a range with
+    /// `end_row = MAX_ROW`; `read_range` clamps to populated bounds, so
+    /// `SUM(A:A)` scans only the populated cells (no 4-billion-row hang).
+    #[test]
+    fn w2_literal_range_whole_column_full_path() {
+        let mut wb = make_runtime_workbook();
+        // A1:A3 = [10, 20, 30]; rest of column A is blank.
+        for (i, v) in [10.0, 20.0, 30.0].iter().enumerate() {
+            wb.put_at(0, i as u32, 0, Value::Number(*v));
+        }
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // SUM(A:A) = 60 over the populated subset.
+        assert_eq!(
+            rt.set_formula(0, 0, 5, "SUM(A:A)").unwrap(),
+            Value::Number(60.0)
+        );
+        // COUNT(A:A) = 3 numeric cells.
+        assert_eq!(
+            rt.set_formula(0, 1, 5, "COUNT(A:A)").unwrap(),
+            Value::Number(3.0)
+        );
+    }
+
+    /// **W2-literal-range — a bare `A1:A4` in SCALAR position still REJECTS.**
+    /// The fix is aggregate-/reference-arg-position only; a literal range at
+    /// the cell root (scalar context) must still surface the bind error so
+    /// implicit-intersection-over-a-literal-range is not silently accepted.
+    #[test]
+    fn w2_literal_range_in_scalar_position_still_rejects() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(1.0));
+        wb.put_at(0, 1, 0, Value::Number(2.0));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // `=A1:A2` at the cell root is scalar context → rejects.
+        let err = rt.set_formula(0, 5, 5, "A1:A2").unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("UnsupportedVariant") && msg.contains("scalar context"),
+            "expected scalar-context literal-range rejection, got: {msg}"
+        );
+
+        // `=A1:A2 + 1` — literal range as a binary operand is scalar too.
+        let err2 = rt.set_formula(0, 6, 5, "A1:A2 + 1").unwrap_err();
+        let msg2 = format!("{err2:?}");
+        assert!(
+            msg2.contains("UnsupportedVariant") && msg2.contains("scalar context"),
+            "expected scalar-context rejection for a range binary operand, got: {msg2}"
         );
     }
 

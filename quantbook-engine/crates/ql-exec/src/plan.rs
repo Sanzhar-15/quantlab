@@ -372,18 +372,27 @@ enum BindContext {
     /// `accepts_special_arg_at_bind`; that rename did not ship (see
     /// S1-HIGH-D — parallel-matcher approach kept instead). Doc-comment
     /// reverted to reference the actual matcher.
+    ///
+    /// **W2-literal-range (2026-06-09):** a *literal* colon range
+    /// (`Expr::RangeRef`, e.g. `A1:A10` / `Sheet2!A1:A4` / `A:A`) in this
+    /// context now binds to `ExprPlan::RangeRef { range }` — the same
+    /// downstream shape as `AggregateNameRef`, so `=SUM(A1:A10)` /
+    /// `=SHARPE(A1:A10)` evaluate identically to their named-range form.
+    /// Previously this surfaced `BindError::UnsupportedVariant`.
     AggregateArg,
     /// **W5-RT-1 (RT-V1-01):** inside the argument list of a reference-aware
     /// function (ROW, COLUMN, ROWS, COLUMNS, ISREF, ISFORMULA, FORMULATEXT).
     /// Same shape as `AggregateArg` for NameRef-resolves-to-range AND
     /// (NEW) accepts literal `Expr::RangeRef` lowering to
     /// `ExprPlan::RangeRef { range }`. CellRef args bind as
-    /// `ExprPlan::CellRef` unchanged. The scope of the `RangeRef`
-    /// lowering is intentionally narrow in v1: only this context accepts
-    /// literal ranges. `AggregateArg`-side enabling (which would make
-    /// `SUM(A1:B3)` work — currently a `BindError::UnsupportedVariant`)
-    /// is a separate follow-up since the multi-tier dispatcher (scalar /
-    /// range-aware / unified) would also need new `RangeRef` arms.
+    /// `ExprPlan::CellRef` unchanged.
+    ///
+    /// **W2-literal-range (2026-06-09):** `AggregateArg` now ALSO accepts
+    /// literal ranges with the same `ExprPlan::RangeRef` lowering, so
+    /// `SUM(A1:B3)` works. The multi-tier dispatcher (scalar / range-aware /
+    /// unified) gained the matching `RangeRef` arms. Both `ReferenceArg`
+    /// and `AggregateArg` produce `ExprPlan::RangeRef`; `Scalar` still
+    /// rejects a literal range.
     ReferenceArg,
 }
 
@@ -695,22 +704,32 @@ fn bind_with_context_v2<L: NameLookup>(
             // context the rejection stands (W5-108 / Phase 4.7.O message
             // preserved).
             //
-            // AggregateArg-side enabling (which would let `SUM(A1:B3)` bind)
-            // is deferred: every Scalar/RangeAware/Unified dispatcher arm
-            // would also need new `ExprPlan::RangeRef` handling, which is
-            // out of scope for the reference-tier mini-phase. Tracked as a
-            // follow-up in the design doc § 5.4.
-            if ctx == BindContext::ReferenceArg {
+            // **W2-literal-range (2026-06-09):** `AggregateArg` is now ALSO
+            // accepted, so `=SUM(A1:A10)` / `=SHARPE(A1:A10)` bind to the same
+            // `ExprPlan::RangeRef { range }` shape (downstream-identical to the
+            // `AggregateNameRef` a named range produces). The scalar/range-
+            // aware/unified dispatcher arms were extended in lockstep to read
+            // `ExprPlan::RangeRef` as a `FnArg::Range`/`FunctionArg::Range`.
+            // This lifts the deferral noted in the binder design § 5.4.
+            //
+            // Only these two arg contexts accept a literal range:
+            // `BindContext::Scalar` (a bare `A1:A10` in scalar position, or a
+            // literal range arg to a plain scalar fn) still rejects — implicit
+            // intersection over a range literal is not a v1 surface.
+            if ctx == BindContext::ReferenceArg || ctx == BindContext::AggregateArg {
                 let range = resolve_range_ref_to_range(rr, owning_sheet, sheets)?;
                 Ok(ExprPlan::RangeRef { range })
             } else {
                 Err(BindError::UnsupportedVariant(
-                    "literal RangeRef in non-Function context is unsupported in v1; \
+                    "literal RangeRef in scalar context is unsupported in v1; \
                      use a named range (Phase 2B.4 AggregateNameRef) or wrap in an \
-                     aggregate function. (Updated W5-108 / Phase 4.7.O; original \
-                     Phase 0 W4-1 message referenced \"no function dispatch yet\" \
-                     which has been in place since Phase 2A. W5-RT-1 added literal \
-                     RangeRef support inside reference-aware fn arg lists only.)",
+                     aggregate / reference-aware function. (Updated W5-108 / Phase \
+                     4.7.O; original Phase 0 W4-1 message referenced \"no function \
+                     dispatch yet\" which has been in place since Phase 2A. W5-RT-1 \
+                     added literal RangeRef support inside reference-aware fn arg \
+                     lists; W2-literal-range extended it to aggregate-arg position \
+                     so SUM/AVERAGE/SHARPE(A1:A10) bind — only bare scalar position \
+                     still rejects.)",
                 ))
             }
         }

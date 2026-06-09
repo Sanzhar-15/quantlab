@@ -53,16 +53,14 @@ use crate::reference_aware_fns::{PlanKind, RefArg, RefContext};
 /// - `ROW(#REF!)` → `#REF!` (error propagation).
 /// - `ROW(arg1, arg2)` → `#N/A` (arity).
 ///
-/// **v1 scope reduction (S2-HIGH-3 documentation closure):**
-/// `ROW(SUM(A1:A3))` does NOT reach the design's `#VALUE!` outcome —
-/// the inner `SUM(A1:A3)` literal-range argument bind-fails because
-/// S1-MED-γ deferred AggregateArg-side `Expr::RangeRef` lowering (the
-/// scalar/range-aware/unified dispatcher arms would each need new
-/// consumer logic for `ExprPlan::RangeRef`). The named-range form —
-/// `ROW(SUM(NamedRange))` — DOES work via the existing
-/// `AggregateNameRef` path and evaluates eagerly; ROW receives a
-/// Scalar arg and returns `#VALUE!` per the design. Lifting the
-/// AggregateArg defer is a post-RT-V1 follow-up.
+/// **W2-literal-range (2026-06-09):** `ROW(SUM(A1:A3))` now reaches the
+/// design's `#VALUE!` outcome — the W2 binder change lowers the inner
+/// `SUM(A1:A3)` literal range to `ExprPlan::RangeRef` (the
+/// scalar/range-aware/unified dispatcher arms each gained the matching
+/// consumer logic), SUM evaluates eagerly to a Scalar, and ROW receives a
+/// Scalar arg → `#VALUE!`. This is now byte-identical to the named-range
+/// form `ROW(SUM(NamedRange))`. (Previously this bind-failed under the
+/// S1-MED-γ AggregateArg defer, which W2 lifted.)
 pub fn row(args: &[RefArg], ctx: &RefContext) -> Value {
     match args.len() {
         0 => match ctx.formula_cell {
@@ -191,8 +189,9 @@ pub fn columns(args: &[RefArg], _ctx: &RefContext) -> Value {
 /// - `ISREF(A1:B3)` → TRUE.
 /// - `ISREF(NamedCell)` → TRUE (resolves to AggregateNameRef → RangeRef).
 /// - `ISREF(SUM(NamedRange))` → FALSE (SUM does not return a reference).
-///   Note: `ISREF(SUM(A1:A3))` literal-range form bind-fails per
-///   S1-MED-γ AggregateArg defer (pinned by `isref_of_sum_literal_range_bind_fails_v1_scope`).
+///   `ISREF(SUM(A1:A3))` (literal range) also → FALSE since W2-literal-range
+///   lifted the AggregateArg defer (pinned by
+///   `isref_of_sum_literal_range_now_binds_and_returns_false`).
 /// - `ISREF(1+2)` → FALSE.
 /// - `ISREF(123)` / `ISREF("text")` → FALSE.
 /// - `ISREF(1/0)` → FALSE (no eval; div-by-zero not surfaced).
@@ -233,9 +232,9 @@ pub fn isref(args: &[RefArg], _ctx: &RefContext) -> Value {
 /// - `ISFORMULA("text")` / `ISFORMULA(123)` / `ISFORMULA(SUM(NamedRange))`
 ///   → `#N/A` (non-reference arg). The design diverges here from the
 ///   `#VALUE!` IronCalc returns; Microsoft canon says `#N/A` for any
-///   non-reference arg (Microsoft 2024). Note: `ISFORMULA(SUM(A1:A3))`
-///   literal-range form bind-fails per S1-MED-γ AggregateArg defer
-///   (pinned by `isformula_of_sum_literal_range_bind_fails_v1_scope`).
+///   non-reference arg (Microsoft 2024). `ISFORMULA(SUM(A1:A3))` (literal
+///   range) also → `#N/A` since W2-literal-range lifted the AggregateArg
+///   defer (pinned by `isformula_of_sum_literal_range_now_binds_and_returns_na`).
 /// - `ISFORMULA(#REF!)` → `#REF!` (error propagation).
 /// - `ISFORMULA()` / `ISFORMULA(a, b)` → `#N/A` (arity).
 ///
@@ -290,10 +289,11 @@ pub fn isformula(args: &[RefArg], ctx: &RefContext) -> Value {
 ///   documented).
 /// - `FORMULATEXT(#REF!)` → `#REF!` (error propagation).
 /// - `FORMULATEXT()` / arity > 1 → `#N/A`.
-/// - Note: `FORMULATEXT(SUM(A1:A3))` literal-range form bind-fails per
-///   S1-MED-γ AggregateArg defer (pinned in `reference_fns_step4_e2e`).
-///   The named-range form `FORMULATEXT(SUM(NamedRange))` evaluates
-///   eagerly and returns `#N/A` (SUM result is Scalar, not Reference).
+/// - `FORMULATEXT(SUM(A1:A3))` (literal range) now binds since
+///   W2-literal-range lifted the AggregateArg defer, and returns `#N/A`
+///   (SUM result is a Scalar / function-call shape, not a Reference) —
+///   pinned in `reference_fns_step4_e2e`. Same result as the named-range
+///   form `FORMULATEXT(SUM(NamedRange))`.
 ///
 /// **Producer API canonicalization divergence (S4-HIGH-1 doc closure):**
 /// the stored formula text depends on which producer API wrote it:

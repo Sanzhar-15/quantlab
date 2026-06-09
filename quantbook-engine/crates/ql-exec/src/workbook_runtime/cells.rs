@@ -2207,11 +2207,14 @@ mod tests {
         );
     }
 
-    // NOTE: `SUM(Sheet2!A1:A3)` (range literal as function arg) is a
-    // Phase 4.7 feature — the binder currently rejects `Expr::RangeRef`
-    // outside a Function context, and only NameRef→Range pairs reach
-    // the AggregateNameRef path. Cross-sheet ranges through named
-    // ranges DO work; verified by the named-target tests below.
+    // NOTE: as of W2-literal-range (2026-06-09), `SUM(Sheet2!A1:A3)`
+    // (a literal cross-sheet range as a function arg) now BINDS — the
+    // binder lowers `Expr::RangeRef` in `BindContext::AggregateArg` to
+    // `ExprPlan::RangeRef { range }` (sheet resolved via
+    // `resolve_range_ref_to_range` → `resolve_sheet_ref`). Pinned by
+    // `w2_literal_range_cross_sheet_full_path` in `validate.rs`.
+    // Cross-sheet ranges through named ranges also work; verified by the
+    // named-target tests below.
 
     #[test]
     fn cross_sheet_quoted_name_with_space_evaluates() {
