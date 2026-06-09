@@ -444,6 +444,15 @@ export interface DispatchDeps {
 	 */
 	readonly onCellsWritten?: (sheet: number, cells: { row: number; col: number }[], webviewId?: string) => void;
 	/**
+	 * **W2 error-surface (2026-06-09)** -- fired on a SUCCESSFUL single `putValue` commit (after recalc),
+	 * carrying the written cell so the host can clear that cell's sticky `errorReply` diagnostic from the
+	 * Problems panel (a cell that committed cleanly no longer has a pending input rejection). Distinct from
+	 * {@link onAck} (which carries only the commitId for the webview-editor handshake, not the cell) and
+	 * {@link onCellsWritten} (the paste/fill batch). Optional for backward compat; when omitted the
+	 * Problems-clear simply relies on the next render's stored-error reconciliation.
+	 */
+	readonly onCellCommitted?: (sheet: number, row: number, col: number) => void;
+	/**
 	 * **FE-2-0 Phase 2 (S2-MED1, 2026-06-04)** -- a SESSION-WIDE operation failure
 	 * (undo/redo throw) that is NOT tied to a cell. Previously routed through
 	 * {@link onError} with `row=0,col=0` sentinels, which mis-decorated cell A1 as
@@ -766,6 +775,10 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		}
 		recalcDirtyChecked(deps.session);
 		deps.onCommit();
+		// W2 error-surface: this cell committed cleanly -> clear any sticky `errorReply` diagnostic it had
+		// in the Problems panel (the prior input rejection no longer applies). Fired unconditionally on
+		// success (no commitId gate -- the diagnostic clear is independent of the webview-editor handshake).
+		deps.onCellCommitted?.(req.sheet, req.row, req.col);
 		// FE-2-0 Phase 2 (commit-token): ack THIS commit to the originating panel (in addition to the
 		// session-wide render `onCommit` triggers), so its webview resolves exactly this edit. Only when
 		// the envelope carried a commitId (the live webview always stamps one; pre-token/tests may not).
