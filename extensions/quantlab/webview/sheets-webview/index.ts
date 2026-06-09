@@ -42,8 +42,9 @@
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { clampDisplayString, formatCellValue } from './cellRender';
 import { CanvasGridRenderer, type ActiveCell, type PublishedRange } from './canvasGrid';
-import { computeScrollBlitA1, diffSnapshotsA1, errorRowsFlippedA1, staleTintKeysA1, type ScrollState } from './gridBlitA1';
+import { staleTintKeysA1 } from './gridBlitA1';
 import { pasteAreaMismatch, planFill, planPaste, type GridClipboard } from './clipboardLogic';
+import { RenderOrchestrator, type RenderHost, type Viewport } from './renderOrchestrator';
 import {
 	COL_WIDTH,
 	HEADER_HEIGHT,
@@ -349,12 +350,10 @@ function armCommitWatchdog(commitId: number): void {
 
 // --- Viewport / draw ---
 
-interface Viewport {
-	readonly scrollTop: number;
-	readonly scrollLeft: number;
-	readonly cssW: number;
-	readonly cssH: number;
-}
+// FE-2 BAKEOFF (2026-06-09): the scroll/damage/full-redraw decision is now in the DOM-free shared
+// `RenderOrchestrator` (so a benchmark can drive the REAL paint path + a unit test can drive it with a
+// fake renderer). `Viewport` + the `prevPaint`/`scrollStateNow`/`scrollUnchangedSince` machinery moved
+// THERE; this file keeps only the live DOM seam below (the `RenderHost`). Behavior is byte-identical.
 function currentViewport(): Viewport {
 	return {
 		scrollTop: viewportEl.scrollTop,
@@ -368,27 +367,35 @@ function applyCanvasTransform(scrollTop: number, scrollLeft: number): void {
 	canvasEl.style.transform = 'translate(' + scrollLeft + 'px, ' + scrollTop + 'px)';
 }
 
-// FE-2-0 Phase 3: the scroll/size/dpr state of the LAST painted frame -- the basis for the blit delta
-// (scrollRedraw) and the damage-path scroll-equality gate. `null` until the first paint and after any
-// backing-store resize (which clears `renderer.painted`, forcing a full draw before the next fast path).
-let prevPaint: ScrollState | null = null;
-/** Snapshot the current paint state. `renderer.backingScale` is read here, so callers that may resize
- * MUST `renderer.resize()` first (resize is what changes the dpr). */
-function scrollStateNow(v: Viewport): ScrollState {
-	return { scrollTop: v.scrollTop, scrollLeft: v.scrollLeft, cssW: v.cssW, cssH: v.cssH, dpr: renderer.backingScale };
-}
-/** True iff the viewport scroll/size/dpr is identical to the last painted frame -- the precondition for
- * a damage paint (the UN-damaged pixels are only valid if nothing scrolled/resized since last paint). */
-function scrollUnchangedSince(v: Viewport): boolean {
-	return (
-		prevPaint !== null &&
-		prevPaint.scrollTop === v.scrollTop &&
-		prevPaint.scrollLeft === v.scrollLeft &&
-		prevPaint.cssW === v.cssW &&
-		prevPaint.cssH === v.cssH &&
-		prevPaint.dpr === renderer.backingScale
-	);
-}
+// FE-2 BAKEOFF: the shared orchestrator instance for THIS webview. It OWNS `prevPaint` (the only paint
+// state both fast paths read+write); every other input arrives live through the `RenderHost` getters
+// below + the DOM side effects through its callbacks, so the module-level `let` bindings (fullSnapshot,
+// active, anchor, publishedRanges, errorCells, fillPreview) stay owned HERE. The host is built once;
+// its getters/callbacks close over those bindings, so each call sees the current value -- identical to
+// the old in-place closures. `redraw`/`scrollRedraw` below are thin shims onto the orchestrator (kept so
+// the ~30 existing call sites in this file are untouched).
+const renderHost: RenderHost = {
+	renderer,
+	errorCells,
+	viewport: currentViewport,
+	active: () => active,
+	selection: currentSelection,
+	publishedRanges: () => publishedRanges,
+	fillPreview: () => fillPreview,
+	applyCanvasTransform,
+	onAfterFullRedraw: () => {
+		updateFormulaBar(); // selection/content changed -> reflect the active cell in the formula bar
+		postSelectionIfChanged(); // W-G-2b: report the selection to the host (deduped)
+		scheduleHoverTitle(); // W-G name display: a publish retraction repaints here -> refresh the stale hover title
+	},
+	onAfterScroll: () => {
+		scheduleHoverTitle(); // W-G name display: a scroll moves a new cell under a stationary pointer -> refresh the hover title
+	},
+	onAfterDamage: () => {
+		updateFormulaBar();
+	},
+};
+const orchestrator = new RenderOrchestrator(renderHost);
 
 /** Size the in-flow spacer to the full Excel extent (drives the native scrollbars). */
 function updateSpacer(): void {
@@ -397,16 +404,11 @@ function updateSpacer(): void {
 }
 
 /** Full redraw at the current viewport -- the always-correct paint path AND the fallback for both fast
- * paths (nav / type / resize / theme / first paint / any declined fast path route here). */
+ * paths (nav / type / resize / theme / first paint / any declined fast path route here). FE-2 BAKEOFF:
+ * a thin shim onto the shared {@link RenderOrchestrator}, which paints + writes prevPaint and fires the
+ * `onAfterFullRedraw` host callback (the formula-bar / selection-post / hover-title triplet). */
 function redraw(): void {
-	const v = currentViewport();
-	renderer.resize(v.cssW, v.cssH);
-	applyCanvasTransform(v.scrollTop, v.scrollLeft);
-	renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection(), publishedRanges, fillPreview);
-	prevPaint = scrollStateNow(v);
-	updateFormulaBar(); // selection/content changed -> reflect the active cell in the formula bar
-	postSelectionIfChanged(); // W-G-2b: report the selection to the host (deduped)
-	scheduleHoverTitle(); // W-G name display: a publish retraction repaints here -> refresh the stale hover title
+	orchestrator.redraw();
 }
 
 /**
@@ -444,23 +446,11 @@ function postSelectionIfChanged(): void {
  * resize/dpr change, diagonal or sub-device-pixel move, or too little reusable area). ONLY the scroll
  * handler calls this: a scroll changes neither the snapshot nor the active cell nor errorCells, so the
  * blitted (shifted) pixels stay correct -- any path that changes content/selection must full-`redraw()`.
+ * FE-2 BAKEOFF: a thin shim onto the shared {@link RenderOrchestrator} (the blit/draw decision + the
+ * prevPaint write + the `onAfterScroll` hover-title refresh live there now).
  */
 function scrollRedraw(): void {
-	const v = currentViewport();
-	renderer.resize(v.cssW, v.cssH); // a coalesced frame may straddle a resize -> resize first (clears `painted`)
-	applyCanvasTransform(v.scrollTop, v.scrollLeft);
-	const next = scrollStateNow(v);
-	const blit = renderer.painted ? computeScrollBlitA1(prevPaint, next, renderer.gutterWidthPx) : null;
-	// W-G-2a: a pure scroll changes neither selection nor content, but the renderer still needs the current
-	// selection to paint the range in the exposed strip / full-fallback.
-	const sel = currentSelection();
-	if (blit === null) {
-		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel, publishedRanges, fillPreview);
-	} else {
-		renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, sel, publishedRanges, fillPreview);
-	}
-	prevPaint = next;
-	scheduleHoverTitle(); // W-G name display: a scroll moves a new cell under a stationary pointer -> refresh the hover title
+	orchestrator.scrollRedraw();
 }
 
 // FE megaudit L-b: coalesce high-frequency scroll events to ONE repaint per animation frame.
@@ -1650,29 +1640,14 @@ function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean)
 		'snapshot_format_version=' + String(snapshot.snapshot_format_version) + '; entries=' + String(snapshot.entries.length);
 	updateSpacer();
 
-	// **FE-2-0 Phase 3** -- damage fast path: with a prior frame at the SAME scroll, repaint ONLY the A1
-	// rows whose paint changed (`diffSnapshotsA1`); else full `redraw()` (the always-correct fallback,
-	// taken on the first render, a sheet switch, or any scroll/size change since the last paint). A commit
-	// re-renders the whole session snapshot but only the edited cell's row repaints.
-	const v = currentViewport();
-	// `backingScaleStale` (Opus LOW-1): a dpr change with no CSS-size change skips resize() -> full redraw.
-	// W-G: a change in the published set forces the full path (`null`) -- the damage diff only covers rows
-	// whose value moved, so a badge that appears/clears/relocates without a value change needs a full redraw.
-	const damageRows =
-		renderer.painted && !renderer.backingScaleStale && scrollUnchangedSince(v) && !publishedChanged
-			? diffSnapshotsA1(prevSnapshot, snapshot)
-			: null;
-	if (damageRows === null) {
-		redraw();
-		return;
-	}
-	// Scroll is unchanged (gated above), so the canvas transform + prevPaint stay valid; drawDamage is a
-	// no-op for an empty row set (nothing painted changed).
-	applyCanvasTransform(v.scrollTop, v.scrollLeft);
-	renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection(), publishedRanges, fillPreview);
-	// The damage path bypasses redraw(); if the active cell's content changed (e.g. a commit re-render),
-	// the formula bar must still follow it.
-	updateFormulaBar();
+	// **FE-2-0 Phase 3 / FE-2 BAKEOFF** -- the paint decision now lives in the shared orchestrator:
+	// damage fast path (a prior frame at the SAME scroll, dpr fresh, published set unchanged -> repaint
+	// ONLY the A1 rows whose paint changed via `diffSnapshotsA1`); else a full `redraw()` (the
+	// always-correct fallback, taken on the first render, a sheet switch, or any scroll/size change since
+	// the last paint). The non-paint prep above (set fullSnapshot, clear/stale-tint errorCells, title/meta,
+	// spacer) stays here -- those are DOM/binding writes this file owns. `commitSnapshot` fires the
+	// `onAfterDamage` host callback (the formula-bar follow) on the damage path.
+	orchestrator.commitSnapshot(prevSnapshot, snapshot, publishedChanged);
 }
 
 /**
@@ -1878,18 +1853,12 @@ window.addEventListener('message', (event: MessageEvent) => {
 				'edit',
 			);
 		}
-		// **FE-2-0 Phase 3** -- damage only the rows whose error tint FLIPPED (the rare failed-edit path),
-		// at the same scroll; else full `redraw()`. Re-erroring an already-tinted cell flips nothing -> []
-		// -> a no-op (the tint + the tooltip-on-hover are already correct).
-		const v = currentViewport();
-		if (!activeMoved && renderer.painted && !renderer.backingScaleStale && scrollUnchangedSince(v)) {
-			const rows = errorRowsFlippedA1(prevErrorKeys, new Set(errorCells.keys()));
-			applyCanvasTransform(v.scrollTop, v.scrollLeft);
-			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, errorCells, active, currentSelection(), publishedRanges, fillPreview);
-		} else {
-			// A selection realign (activeMoved) repaints both the old + new selection rows -> full redraw.
-			redraw();
-		}
+		// **FE-2-0 Phase 3 / FE-2 BAKEOFF** -- damage only the rows whose error tint FLIPPED (the rare
+		// failed-edit path), at the same scroll; else a full `redraw()`. Re-erroring an already-tinted cell
+		// flips nothing -> [] -> a no-op (the tint + the tooltip-on-hover are already correct). The gate +
+		// the `errorRowsFlippedA1` diff live in the orchestrator now; `activeMoved` (the selection-realign
+		// decision, computed above from this file's edit/selection state) forces the full path.
+		orchestrator.commitErrorDamage(prevErrorKeys, activeMoved);
 		return;
 	}
 	console.warn('[sheets-webview] unknown inbound message type:', msg.type);
