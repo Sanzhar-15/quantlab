@@ -102,4 +102,21 @@ export class PublishedCellsStore {
 		}
 		return out;
 	}
+
+	/**
+	 * EVERY tracked published range, paired with its (possibly now-deleted) target sheet id. Unlike
+	 * {@link rangesForSheet} this does NOT filter to a live sheet -- the MCP `get_published_variables`
+	 * tool needs the COMPLETE set so a variable still tracked on a tombstoned sheet surfaces (as a
+	 * `#REF!` ref) rather than being silently omitted. Iteration follows Map insertion order.
+	 */
+	allRangesWithSheet(): Array<{ sheet: number; range: PublishedRange }> {
+		const out: Array<{ sheet: number; range: PublishedRange }> = [];
+		for (const [name, range] of this.byName) {
+			out.push({
+				sheet: range.sheet,
+				range: { startRow: range.startRow, startCol: range.startCol, endRow: range.endRow, endCol: range.endCol, name },
+			});
+		}
+		return out;
+	}
 }

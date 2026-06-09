@@ -285,6 +285,12 @@ export class ReactiveKernelClient {
 		return this.publishedCells.rangesForSheet(sheet);
 	}
 
+	/** B1 MCP: EVERY published range (any sheet, incl. a now-deleted one), for `get_published_variables`
+	 *  to enumerate the COMPLETE set rather than only the cells on live sheets. */
+	publishedCellsForAllSheets(): Array<{ sheet: number; range: PublishedRange }> {
+		return this.publishedCells.allRangesWithSheet();
+	}
+
 	/** Graceful shutdown: ask the supervisor to close, require a `closed` frame AND a clean exit. */
 	async close(): Promise<void> {
 		if (this.fatal) {

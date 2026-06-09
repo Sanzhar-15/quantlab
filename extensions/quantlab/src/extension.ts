@@ -11,6 +11,7 @@ import type { ReactiveKernelManager } from './quantbook/reactiveKernel/reactiveK
 import { QNB_NOTEBOOK_TYPE, QnbSerializer } from './quantbook/reactiveNotebook/qnbSerializer';
 import { registerReactiveNotebookController } from './quantbook/reactiveNotebook/reactiveNotebookController';
 import { registerQuantbookShell } from './quantbook/shell/quantbookShell';
+import { registerQuantbookMcpServer } from './quantbook/mcp/mcpServer';
 import type { SessionInstance } from './quantbook/types';
 import { registerGlobalStateCommands } from './commands/globalStateCommands';
 import { registerHistoryCommands } from './commands/historyCommands';
@@ -308,6 +309,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// FE-1.5 W-N (N-1): the NotebookController that runs `.qnb` Python cells against the focused grid's
 	// reactive kernel (bind-on-first-execute, serialized, lifetime-safe). Built after the manager exists.
 	registerReactiveNotebookController(context, builtKernelManager);
+
+	// FE-BEYOND B1 (W3): the read-only Quantbook MCP server. Runs IN this host so its tools read the
+	// SAME live per-panel Session the grid renders (the shared-state requirement). Registered AFTER the
+	// reactive notebook controller (W3 anchor; W4/FE-5 uses the later panel-providers anchor) so the two
+	// parallel windows never edit overlapping lines here.
+	registerQuantbookMcpServer(context, builtKernelManager);
 
 	new DataPanelProvider(context, globalState, watchlistManager);
 	const catalogService = ResourcesCatalogService.initialize(context);
