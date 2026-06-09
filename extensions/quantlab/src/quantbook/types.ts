@@ -2211,11 +2211,12 @@ export interface SessionInstance {
 	insertRows(sheet: number, row: number, count: number): void;
 
 	/**
-	 * Delete `count` rows from `sheet` starting at index `row` (0-based). Rows below
-	 * shift up; references into the deleted band re-bind to `#REF!` on the next
-	 * recompute (Excel canon). `count >= 1`.
+	 * Delete rows `[start, end]` (0-based, INCLUSIVE) from `sheet`. Rows below shift
+	 * up; references into the deleted band re-bind to `#REF!` on the next recompute
+	 * (Excel canon). Conductor-reconciled to the W1 engine signature (`start`/`end`,
+	 * NOT `index`/`count`) at wave-3 integration.
 	 */
-	deleteRows(sheet: number, row: number, count: number): void;
+	deleteRows(sheet: number, start: number, end: number): void;
 
 	/**
 	 * Insert `count` blank columns into `sheet` at index `col` (0-based). Columns at
@@ -2224,11 +2225,12 @@ export interface SessionInstance {
 	insertColumns(sheet: number, col: number, count: number): void;
 
 	/**
-	 * Delete `count` columns from `sheet` starting at index `col` (0-based). Columns
-	 * to the right shift left; references into the deleted band re-bind to `#REF!`
-	 * on the next recompute. `count >= 1`.
+	 * Delete columns `[start, end]` (0-based, INCLUSIVE) from `sheet`. Columns to the
+	 * right shift left; references into the deleted band re-bind to `#REF!` on the next
+	 * recompute. Conductor-reconciled to the W1 engine signature (`start`/`end`, NOT
+	 * `index`/`count`) at wave-3 integration.
 	 */
-	deleteColumns(sheet: number, col: number, count: number): void;
+	deleteColumns(sheet: number, start: number, end: number): void;
 }
 
 export interface SessionConstructor {

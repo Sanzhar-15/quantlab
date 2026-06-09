@@ -1050,13 +1050,16 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 							session.insertRows(sheet, plan.index, plan.count);
 							break;
 						case 'deleteRows':
-							session.deleteRows(sheet, plan.index, plan.count);
+							// Conductor-reconciled (wave-3): the W1 engine `deleteRows` takes (start, end) INCLUSIVE,
+							// not (index, count). Delete `count` rows from `index` -> [index, index + count - 1].
+							session.deleteRows(sheet, plan.index, plan.index + plan.count - 1);
 							break;
 						case 'insertColumns':
 							session.insertColumns(sheet, plan.index, plan.count);
 							break;
 						case 'deleteColumns':
-							session.deleteColumns(sheet, plan.index, plan.count);
+							// Conductor-reconciled (wave-3): W1 `deleteColumns` is (start, end) INCLUSIVE.
+							session.deleteColumns(sheet, plan.index, plan.index + plan.count - 1);
 							break;
 						default: {
 							const unreachable: never = plan.method;
