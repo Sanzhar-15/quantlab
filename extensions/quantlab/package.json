@@ -290,9 +290,21 @@
         "category": "%command.category%"
       },
       {
-        "_comment": "FE-BEYOND B1 (W3): start the read-only Quantbook MCP server.",
+        "_comment": "FE-BEYOND B1 (W3): start the Quantbook MCP server (read + write tools).",
         "command": "quantlab.quantbookStartMcpServer",
         "title": "%command.quantbookStartMcpServer.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "W3 (MCP writes): grant workspace trust required for MCP write tools.",
+        "command": "quantlab.quantbookTrustWorkspaceForMcpWrites",
+        "title": "%command.quantbookTrustWorkspaceForMcpWrites.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "W3 (MCP writes): revoke the workspace trust grant used by MCP write tools.",
+        "command": "quantlab.quantbookRevokeMcpWriteTrust",
+        "title": "%command.quantbookRevokeMcpWriteTrust.title%",
         "category": "%command.category%"
       },
       {

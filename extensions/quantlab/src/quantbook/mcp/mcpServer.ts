@@ -36,6 +36,8 @@ import * as vscode from 'vscode';
 
 import { CellGridPanel } from '../cellGrid/cellGridPanel';
 import type { ReactiveKernelManager } from '../reactiveKernel/reactiveKernelManager';
+import { recalcDirtyChecked } from '../session';
+import { TrustManager } from '../../core/trust/TrustManager';
 import type { SessionInstance } from '../types';
 import {
 	McpToolError,
@@ -50,6 +52,19 @@ import {
 	type McpTargetGrid,
 	type PublishedVariableTargets,
 } from './mcpToolLogic';
+import {
+	classifyWriteRisk,
+	formatAuditLine,
+	prepareSetCell,
+	prepareWriteCells,
+	WriteQueue,
+	type McpWriteSessionPort,
+	type PreparedWrite,
+	type SetCellArgs,
+	type WriteAuditRecord,
+	type WriteCellsArgs,
+	type WriteOutcome,
+} from './mcpWriteLogic';
 
 // The ESM-import hatch: a Function-constructed dynamic import so the TypeScript CommonJS emit does NOT
 // rewrite it to require() (which would throw on the ESM-only SDK). Resolves bare specifiers relative to
@@ -92,6 +107,8 @@ interface ZodLike {
 	string(): ZodSchemaLike;
 	number(): ZodSchemaLike;
 	union(options: ZodSchemaLike[]): ZodSchemaLike;
+	array(element: ZodSchemaLike): ZodSchemaLike;
+	object(shape: Record<string, ZodSchemaLike>): ZodSchemaLike;
 }
 
 interface LoadedSdk {
@@ -254,6 +271,285 @@ function registerReadOnlyTools(server: McpServerLike, sdk: LoadedSdk, kernelMana
 	);
 }
 
+// --- WRITE tools (W3) --------------------------------------------------------------------------
+
+/**
+ * The ONE per-host write queue: every MCP write serializes per Session through this. Module-level (not
+ * per-POST) because the stateless transport mints a fresh server per request -- only a host-lifetime
+ * singleton can serialize writes that arrive on independent POSTs. Keyed by the live SessionInstance
+ * identity (a WeakMap inside, so a closed session's chain is GC'd). See {@link WriteQueue} for the
+ * Arc<Mutex> concurrency invariant.
+ */
+const mcpWriteQueue = new WriteQueue<SessionInstance>();
+
+/**
+ * Trust gate for WRITES (gate-first; mirrors `reactiveKernelCommands.assertReactiveTrusted`). A write
+ * mutates the live, possibly-unsaved financial workbook, so it requires BOTH VS Code Restricted-Mode
+ * trust AND QuantLab's own {@link TrustManager} grant for the workspace folder -- the SAME mechanism the
+ * reactive kernel uses (the grant persists in `context.globalState` per-workspace; verified -- NOT
+ * SecureStorage). Reuses TrustManager rather than forking a parallel consent store (no split-brain).
+ * Reads stay ungated. No-Fallbacks: an untrusted workspace throws a loud, agent-visible error.
+ */
+function assertMcpWriteTrusted(): void {
+	const folder = vscode.workspace.workspaceFolders?.[0];
+	if (folder === undefined) {
+		throw new McpToolError('mcp_write_untrusted_workspace', 'open a workspace folder and trust it to enable MCP writes');
+	}
+	const uri = folder.uri.toString();
+	if (!(vscode.workspace.isTrusted && TrustManager.getInstance().isWorkspaceTrusted(uri))) {
+		throw new McpToolError(
+			'mcp_write_untrusted_workspace',
+			'an MCP write mutates the live workbook -- trust the workspace (Quantbook: Trust Workspace for MCP Writes) to enable it',
+		);
+	}
+}
+
+/** A monotonic counter that backs the audit timestamp when the host has no wall clock to trust (it does;
+ *  the ISO time is primary). Kept as a tie-breaker so two writes in the same millisecond stay ordered. */
+let auditSeq = 0;
+
+/** Whether `session` is STILL a live open Cell Grid panel (mirror reactiveNotebookController.isLiveGridSession).
+ *  A write is `prepare()`d on the request tick but applied later inside the queue (after the modal await);
+ *  in that window the panel can close. Re-checking here means a write to a since-closed grid fails LOUD
+ *  (No-Fallbacks) instead of mutating an orphaned, no-longer-rendered workbook handle invisibly. */
+function isLiveGridSession(session: SessionInstance): boolean {
+	return CellGridPanel.activeLocalPanels().some((p) => p.session === session);
+}
+
+/** Append one structured audit line to the MCP output channel (No-Fallbacks: every attempt is recorded). */
+function appendAudit(output: vscode.OutputChannel, record: WriteAuditRecord): void {
+	output.appendLine(formatAuditLine(record));
+}
+
+/**
+ * Apply a prepared write end-to-end ON the queue: re-validate trust + re-classify risk LIVE (the grid
+ * state can change between prepare() at request time and apply() here, behind the modal + other queued
+ * rounds) -> (optional) modal confirmation -> the LIVE write discipline (`batch(ops, { undoLabel })` ->
+ * {@link recalcDirtyChecked} -> {@link CellGridPanel.refreshSession}) -> audit. Runs inside
+ * {@link WriteQueue.enqueue} so concurrent agent rounds serialize per session. Returns the agent result;
+ * a declined confirmation returns a declined result (not an error -- the operator's choice is a normal
+ * outcome the agent sees); a failed batch / lost-trust / closed-grid throws (No-Fallbacks; the engine
+ * reverts atomically). EVERY terminal outcome (applied / declined / failed) is audited.
+ */
+async function applyPreparedWrite(
+	prepared: PreparedWrite,
+	tool: string,
+	output: vscode.OutputChannel,
+): Promise<{ applied: number; declined: boolean; risk: string }> {
+	// The real SessionInstance: buildHostContext set `grid.session = p.session` (the napi SessionInstance),
+	// narrowed to the read port. It satisfies McpWriteSessionPort structurally; the cast restores `batch`.
+	const writeSession = prepared.grid.session as unknown as McpWriteSessionPort;
+	const realSession = prepared.grid.session as unknown as SessionInstance;
+	const reclassify = (): ReturnType<typeof classifyWriteRisk> =>
+		classifyWriteRisk(prepared.ops, (sheet, row, col) => prepared.grid.session.cell(sheet, row, col));
+	const recordFor = (risk: string): Omit<WriteAuditRecord, 'outcome' | 'detail'> => ({
+		timestamp: `${new Date().toISOString()}#${auditSeq++}`,
+		tool,
+		sessionId: prepared.grid.id,
+		undoLabel: prepared.undoLabel,
+		opCount: prepared.ops.length,
+		target: prepared.target,
+		risk,
+	});
+
+	// Codex HIGH-1: RE-CLASSIFY risk against the CURRENT cell state, not the request-time snapshot, so the
+	// modal shows the live risk. An earlier queued write / live grid edit / reactive publish could have
+	// turned a target into a formula AFTER prepare(); the stale verdict would skip the modal.
+	const preModalRisk = reclassify();
+
+	// Codex HIGH-2 (pre-modal): fail-fast if trust was already lost before we even prompt.
+	try {
+		assertMcpWriteTrusted();
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		appendAudit(output, { ...recordFor(preModalRisk.summary), outcome: 'failed' satisfies WriteOutcome, detail: `trust lost before apply: ${detail}` });
+		throw err;
+	}
+
+	// Risk-based confirmation: a large / destructive / formula-overwrite batch needs an explicit modal OK.
+	// This await runs INSIDE the per-session queue, so while the modal is open the SAME session's later
+	// write rounds STALL behind it (the documented queue stall) -- exactly what we want: we never apply a
+	// queued round B's batch while round A is still awaiting operator consent. (Other sessions proceed.)
+	// The SPECIFIC risk reasons the operator actually saw + OK'd in the modal (empty if no modal was shown).
+	// We compare the FINAL reasons against THIS set, not a coarse boolean -- see the uncovered-reason check.
+	let confirmedReasons: ReadonlySet<string> = new Set();
+	if (preModalRisk.requiresConfirmation) {
+		const choice = await vscode.window.showWarningMessage(
+			`An AI agent wants to write to the live workbook: ${preModalRisk.summary}.\n\nUndo label: "${prepared.undoLabel}".\n\nAllow this write?`,
+			{ modal: true },
+			'Allow Write',
+		);
+		if (choice !== 'Allow Write') {
+			appendAudit(output, { ...recordFor(preModalRisk.summary), outcome: 'declined' satisfies WriteOutcome, detail: 'operator declined the confirmation' });
+			return { applied: 0, declined: true, risk: preModalRisk.summary };
+		}
+		confirmedReasons = new Set(preModalRisk.reasons);
+	}
+
+	// Codex re-audit HIGH/MED: the modal await reopened the TOCTOU window. Re-validate trust AND re-classify
+	// risk a SECOND time, immediately before the engine write -- this is the AUTHORITATIVE check. Anything
+	// granted/computed before the await may now be stale (trust revoked while the dialog was open; a formula
+	// appeared under a target during the dialog). This recompute + re-check happens with NO further await
+	// before batch(), so it cannot itself go stale (the engine lock + the per-session queue keep other
+	// writes out until this round's batch lands).
+	try {
+		assertMcpWriteTrusted();
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		appendAudit(output, { ...recordFor(preModalRisk.summary), outcome: 'failed' satisfies WriteOutcome, detail: `trust lost before apply: ${detail}` });
+		throw err;
+	}
+	const finalRisk = reclassify();
+	// Codex re-audit2 HIGH: refuse if the FINAL risk carries ANY reason the shown modal did NOT cover -- a
+	// coarse `requiresConfirmation && !confirmed` would let, say, a `formula_overwrite` that appeared during
+	// a modal shown only for `large` slip through. Compare the specific reason SETS: any final reason not in
+	// `confirmedReasons` is an unconfirmed elevated write -> refuse LOUD (No-Fallbacks). The agent retries;
+	// the next round prompts on the now-current state. (When no modal was shown, confirmedReasons is empty,
+	// so ANY final reason refuses -- the original "risk appeared from nothing" case.)
+	const uncovered = finalRisk.reasons.filter((r) => !confirmedReasons.has(r));
+	if (uncovered.length > 0) {
+		const detail = `risk changed during the confirmation step (uncovered: ${uncovered.join(', ')}; now: ${finalRisk.summary}); refused unconfirmed -- retry the write`;
+		appendAudit(output, { ...recordFor(finalRisk.summary), outcome: 'failed' satisfies WriteOutcome, detail });
+		throw new McpToolError('risk_escalated', detail);
+	}
+
+	// TOCTOU guard: the grid was resolved at request time but we apply here (possibly after the modal
+	// await + behind other queued rounds). If its panel closed in that window, refuse LOUD rather than
+	// mutate an orphaned workbook no panel renders (No-Fallbacks).
+	if (!isLiveGridSession(realSession)) {
+		const detail = 'the target Cell Grid was closed before the write could be applied';
+		appendAudit(output, { ...recordFor(finalRisk.summary), outcome: 'failed' satisfies WriteOutcome, detail });
+		throw new McpToolError('grid_closed', detail);
+	}
+
+	// The LIVE write discipline (mirror cellGridLogic.ts:620-623): ONE atomic batch (a single undo unit),
+	// then recalc dirty (throws loud on a failed recompute), then re-render every panel of the session.
+	// A failed batch throws -> the queued round rejects -> the tool returns an MCP error (No-Fallbacks;
+	// the engine's batch is all-or-nothing, so NOTHING is partially applied).
+	try {
+		const result = writeSession.batch(prepared.ops.map((o) => o.op), { undoLabel: prepared.undoLabel });
+		recalcDirtyChecked(realSession);
+		// Codex MED-2: refreshSession reports a per-panel render failure count; the live edit path surfaces
+		// it LOUD (No-Fallbacks). The engine write already landed atomically (it cannot be un-applied), so
+		// a render failure is an applied-but-stale-view outcome: warn the operator + audit it, never silently
+		// report a clean success.
+		const { failed } = CellGridPanel.refreshSession(realSession);
+		if (failed > 0) {
+			const detail = `applied, but ${failed} cell-grid panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid"`;
+			appendAudit(output, { ...recordFor(finalRisk.summary), outcome: 'applied' satisfies WriteOutcome, detail });
+			void vscode.window.showWarningMessage(`Quantbook MCP: ${detail}.`);
+		} else {
+			appendAudit(output, { ...recordFor(finalRisk.summary), outcome: 'applied' satisfies WriteOutcome });
+		}
+		return { applied: result.applied, declined: false, risk: finalRisk.summary };
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		appendAudit(output, { ...recordFor(finalRisk.summary), outcome: 'failed' satisfies WriteOutcome, detail });
+		throw err;
+	}
+}
+
+/** Audit a write that was REJECTED before it could be prepared/applied (Codex MED-1): a trust-gate
+ *  failure, or a prepare/op-build failure (bad A1, unknown sheet, duplicate cell, over-cap batch, no grid
+ *  open). These return `isError` to the agent; without this line they would be invisible in the audit
+ *  channel, violating "EVERY write attempt is recorded". The target/session may be unresolved, so the
+ *  record carries `(unresolved)` placeholders -- the detail names the actual failure. */
+function auditRejected(output: vscode.OutputChannel, tool: string, detail: string): void {
+	appendAudit(output, {
+		timestamp: `${new Date().toISOString()}#${auditSeq++}`,
+		tool,
+		sessionId: '(unresolved)',
+		undoLabel: '(none)',
+		opCount: 0,
+		target: '(unresolved)',
+		risk: '(not classified -- rejected before apply)',
+		outcome: 'failed' satisfies WriteOutcome,
+		detail,
+	});
+}
+
+/**
+ * Run a prepared-write tool: gate trust (sync, before enqueue), prepare (pure), then enqueue the apply on
+ * the per-session queue. The trust gate + the pure `prepare` run on the calling tick so an untrusted /
+ * malformed write fails fast WITHOUT taking a queue slot. A pre-enqueue failure is AUDITED (Codex MED-1)
+ * then returned as an MCP in-band error result (the agent sees it). The post-enqueue path audits its own
+ * terminal outcome inside {@link applyPreparedWrite} (so it is not double-logged here). A declined
+ * confirmation -> a non-error text result stating the operator declined.
+ */
+async function runWriteTool(
+	prepare: (ctx: McpHostContext) => PreparedWrite,
+	tool: string,
+	kernelManager: ReactiveKernelManager<SessionInstance>,
+	output: vscode.OutputChannel,
+): Promise<McpToolContent> {
+	let prepared: PreparedWrite;
+	try {
+		// Pre-enqueue (trust gate + pure prepare). A failure here is audited as a rejected attempt, since
+		// applyPreparedWrite (which owns the post-enqueue audit) never runs for it.
+		assertMcpWriteTrusted();
+		prepared = prepare(buildHostContext(kernelManager));
+	} catch (err) {
+		const message = err instanceof McpToolError ? err.message : err instanceof Error ? err.message : String(err);
+		auditRejected(output, tool, message);
+		return { content: [{ type: 'text', text: message }], isError: true };
+	}
+	try {
+		const realSession = prepared.grid.session as unknown as SessionInstance;
+		// `risk` is the LIVE verdict computed inside the queue (Codex LOW: NOT prepared.risk, which was the
+		// stale request-time snapshot) -- so the agent's response mirrors what the modal/audit actually used.
+		const { applied, declined, risk } = await mcpWriteQueue.enqueue(realSession, () => applyPreparedWrite(prepared, tool, output));
+		if (declined) {
+			return { content: [{ type: 'text', text: JSON.stringify({ ok: false, declined: true, reason: 'operator declined the write confirmation', risk }, null, 2) }] };
+		}
+		return { content: [{ type: 'text', text: JSON.stringify({ ok: true, sessionId: prepared.grid.id, applied, target: prepared.target, undoLabel: prepared.undoLabel, risk }, null, 2) }] };
+	} catch (err) {
+		// applyPreparedWrite already audited this terminal failure; just surface it to the agent.
+		const message = err instanceof McpToolError ? err.message : err instanceof Error ? err.message : String(err);
+		return { content: [{ type: 'text', text: message }], isError: true };
+	}
+}
+
+/** Register the WRITE tools (set_cell, write_cells) on a fresh McpServer. Each gates trust + serializes
+ *  on the per-session write queue. The kernel manager is captured so the host context (grids) resolves. */
+function registerWriteTools(server: McpServerLike, sdk: LoadedSdk, kernelManager: ReactiveKernelManager<SessionInstance>, output: vscode.OutputChannel): void {
+	const { z } = sdk;
+	const sessionIdArg = { sessionId: z.string().describe('Optional Cell Grid id to target when several are open (from a prior tool result).').optional() };
+	const sheetArg = { sheet: z.union([z.string(), z.number()]).describe('Optional sheet name or id (ignored if the A1 is sheet-qualified).').optional() };
+
+	server.registerTool(
+		'set_cell',
+		{
+			title: 'Set cell (write)',
+			description: 'Write ONE cell of the live workbook. `text` is classified like a grid edit: a leading "=" is a FORMULA (e.g. "=SUM(A1:A9)"); an empty string CLEARS the cell; any other text is a literal value (number if numeric, else text). Address it sheet-qualified ("S0!B1") or pass a sheet arg; with neither, the grid\'s focused sheet is used. Requires a trusted workspace. A large/destructive/formula-overwrite write prompts the operator. The edit is one Ctrl+Z undo step.',
+			inputSchema: {
+				a1: z.string().describe('The A1 cell to write, e.g. "B1" or sheet-qualified "S0!B1".'),
+				text: z.string().describe('The value or formula. "=..." is a formula; "" clears the cell; else a literal value.'),
+				...sheetArg,
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareSetCell(ctx, args as unknown as SetCellArgs), 'set_cell', kernelManager, output),
+	);
+
+	server.registerTool(
+		'write_cells',
+		{
+			title: 'Write cells (batch write)',
+			description: 'Write MANY cells atomically in ONE undo step. `cells` is an array of { a1, text } where each `text` is classified like set_cell ("=..." formula / "" clear / literal). Cells may be bare A1 (with a sheet arg) or sheet-qualified. The whole batch applies all-or-nothing: one bad cell rejects everything. Requires a trusted workspace; a large/destructive/formula-overwrite batch prompts the operator.',
+			inputSchema: {
+				cells: z.array(z.object({
+					a1: z.string().describe('The A1 cell, e.g. "B1" or "S0!B1".'),
+					text: z.string().describe('The value or formula for this cell.'),
+				})).describe('The cells to write (each { a1, text }).'),
+				undoLabel: z.string().describe('Optional short label for the single undo unit (e.g. "fill returns column").').optional(),
+				...sheetArg,
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareWriteCells(ctx, args as unknown as WriteCellsArgs), 'write_cells', kernelManager, output),
+	);
+}
+
 /**
  * A running MCP HTTP server instance. Closing it stops the listener and is idempotent.
  */
@@ -373,6 +669,9 @@ async function handleHttpRequest(
 	}
 	const server = new sdk.McpServer({ name: 'quantbook-mcp', version: '0.1.0' });
 	registerReadOnlyTools(server, sdk, kernelManager);
+	// W3: the WRITE tools share the SAME per-host write queue (module-level) so writes across independent
+	// stateless POSTs still serialize per session. The trust gate runs per-call inside each tool.
+	registerWriteTools(server, sdk, kernelManager, output);
 	const transport = new sdk.StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
 	const teardown = (): void => {
 		void transport.close();
@@ -471,11 +770,12 @@ export function registerQuantbookMcpServer(
 				const configuredPort = vscode.workspace.getConfiguration('quantlab').get<number>('quantbookMcpPort');
 				const port = typeof configuredPort === 'number' && Number.isInteger(configuredPort) && configuredPort >= 0 ? configuredPort : 0;
 				running = await startMcpHttpServer(kernelManager, output, port);
-				output.appendLine(`[mcp] read-only Quantbook MCP server listening at ${running.url}`);
+				output.appendLine(`[mcp] Quantbook MCP server listening at ${running.url}`);
 				output.appendLine('[mcp] connect an MCP client over Streamable HTTP (stateless JSON). EVERY request must send the bearer token below.');
 				output.appendLine(`[mcp]   URL:    ${running.url}`);
 				output.appendLine(`[mcp]   Header: Authorization: Bearer ${running.token}`);
-				output.appendLine('[mcp] tools: list_sheets, get_cell, query_range, get_snapshot, list_functions, get_published_variables.');
+				output.appendLine('[mcp] read tools:  list_sheets, get_cell, query_range, get_snapshot, list_functions, get_published_variables.');
+				output.appendLine('[mcp] write tools: set_cell, write_cells (REQUIRE a trusted workspace -- run "Quantbook: Trust Workspace for MCP Writes"; large/destructive/formula-overwrite writes prompt for confirmation; each write is one undo step; every write is audited to this channel).');
 				output.show(true);
 				const action = await vscode.window.showInformationMessage(
 					`Quantbook MCP server running at ${running.url} (bearer token printed to the Quantbook MCP Server output).`,
@@ -494,6 +794,35 @@ export function registerQuantbookMcpServer(
 				output.appendLine(`[mcp] start failed: ${message}`);
 				void vscode.window.showErrorMessage(`Quantbook MCP server failed to start: ${message}`);
 			}
+		}),
+	);
+
+	// W3: trust + revoke entry points for MCP writes. They DELEGATE to the SAME TrustManager the reactive
+	// kernel uses (per-workspace grant in context.globalState) -- NOT a parallel consent store. "Trust"
+	// prompts the workspace-trust modal; "Revoke" clears the grant so subsequent writes fail the gate.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookTrustWorkspaceForMcpWrites', async () => {
+			const folder = vscode.workspace.workspaceFolders?.[0];
+			if (folder === undefined) {
+				void vscode.window.showWarningMessage('Open a workspace folder first, then trust it to enable MCP writes.');
+				return;
+			}
+			if (!vscode.workspace.isTrusted) {
+				void vscode.window.showWarningMessage('This window is in Restricted Mode. Trust the workspace in VS Code (Manage Workspace Trust) first, then re-run this command.');
+				return;
+			}
+			const granted = await TrustManager.getInstance().promptWorkspaceTrust(folder.uri.toString());
+			output.appendLine(`[mcp] workspace trust for writes ${granted ? 'GRANTED' : 'declined'}: ${folder.uri.toString()}`);
+		}),
+		vscode.commands.registerCommand('quantlab.quantbookRevokeMcpWriteTrust', async () => {
+			const folder = vscode.workspace.workspaceFolders?.[0];
+			if (folder === undefined) {
+				void vscode.window.showWarningMessage('No workspace folder is open.');
+				return;
+			}
+			await TrustManager.getInstance().revokeWorkspaceTrust(folder.uri.toString());
+			output.appendLine(`[mcp] workspace trust REVOKED (MCP writes now require re-granting): ${folder.uri.toString()}`);
+			void vscode.window.showInformationMessage('Quantbook MCP write trust revoked. Reads still work; writes now require re-granting trust.');
 		}),
 	);
 }
