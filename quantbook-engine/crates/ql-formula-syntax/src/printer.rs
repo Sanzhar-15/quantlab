@@ -148,14 +148,15 @@ fn column_index_to_letters(mut col: u32) -> String {
 }
 
 /// **W5-141 (Phase 4.9.D):** emit a `CellAddr` in either A1 or R1C1
-/// form, driven by `ctx.mode`. The sheet prefix is mode-agnostic
-/// (same `Sheet1!` glyph in both modes per Excel canon).
+/// form, driven by `ctx.mode`. The sheet prefix GLYPH (`Sheet1!`) is the
+/// same in both modes per Excel canon, but its QUOTING is mode-aware (an
+/// `R1C1`-shaped name is quoted in R1C1 mode -- see print_sheet_name).
 fn print_cell_addr_ctx(
     addr: &CellAddr,
     ctx: &PrintCtx,
     out: &mut String,
 ) -> Result<(), PrintError> {
-    print_sheet_prefix(&addr.sheet, out);
+    print_sheet_prefix(&addr.sheet, ctx.mode, out);
     match ctx.mode {
         ReferenceMode::A1 => {
             if addr.abs_col {
@@ -330,11 +331,14 @@ fn axis_spec_to_absolute_coord(
 /// The current `rewrite_sheet_name_in_expr` path walks pre-bind
 /// ASTs only, so the panic isn't reachable through any production
 /// code path today.
-fn print_sheet_prefix(sheet: &SheetRef, out: &mut String) {
+fn print_sheet_prefix(sheet: &SheetRef, mode: ReferenceMode, out: &mut String) {
     match sheet {
         SheetRef::Current => {}
         SheetRef::Name(name) => {
-            print_sheet_name(name, out);
+            // `mode` is needed because the unquoted-name SET is mode-dependent: in R1C1 mode an
+            // `R1C1`-shaped name would be (mis)lexed as a reference, so it must be quoted (see
+            // print_sheet_name). The `!` separator glyph itself is mode-agnostic.
+            print_sheet_name(name, mode, out);
             out.push('!');
         }
         SheetRef::Id(id) => panic!(
@@ -350,13 +354,41 @@ fn print_sheet_prefix(sheet: &SheetRef, out: &mut String) {
 }
 
 /// **W5-89 (Phase 4.6.A part 3):** emit a sheet name in its canonical
-/// source form. Quotes the name if it contains any character outside
-/// `[A-Za-z0-9_.]`, starts with a digit (would lex as a number/row),
-/// or is empty (defensive — empty names are rejected at registry time
-/// anyway). Embedded `'` is escaped as `''`.
-fn print_sheet_name(name: &str, out: &mut String) {
-    let needs_quoting = name.is_empty()
-        || name.starts_with(|c: char| c.is_ascii_digit())
+/// source form. Emitted UNQUOTED only when it re-lexes as an unquoted
+/// sheet-name prefix IN THE TARGET `mode`: the FIRST char is `[A-Za-z_]`
+/// (the lexer starts an unquoted name only there, `lexer.rs`) AND every
+/// char is in `[A-Za-z0-9_.]` AND -- in R1C1 mode only -- the name is not
+/// shaped like an R1C1 reference start. Quoted otherwise — empty
+/// (defensive; empty names are rejected at registry time anyway), a leading
+/// DIGIT (would lex as a number/row), a leading DOT (`.foo` — the prior rule
+/// emitted it unquoted but the lexer cannot re-lex it; printer/lexer
+/// round-trip mismatch, Codex Lane A 2026-06-09), an R1C1-shadow name in
+/// R1C1 mode (`R1`, `R1C1`, `RC` — the R1C1 lexer consumes `R`+(`[`|digit|`C`)
+/// as a reference BEFORE the sheet-name arm; Codex 2026-06-09), or any other
+/// char. Embedded `'` is escaped as `''`.
+fn print_sheet_name(name: &str, mode: ReferenceMode, out: &mut String) {
+    // The first char must be `[A-Za-z_]` to match the lexer's unquoted-name start; a leading
+    // digit OR a leading `.` (both otherwise in the allowed set) would print unquoted yet fail
+    // to re-lex, so they force quoting.
+    let first_char_ok = matches!(
+        name.chars().next(),
+        Some(c) if c.is_ascii_alphabetic() || c == '_'
+    );
+    // R1C1 mode only: the lexer dispatches `R`/`r` followed by `[`, an ASCII digit, or `C`/`c`
+    // to the R1C1 reference lexer BEFORE `try_lex_sheet_name_prefix` (lexer.rs `try_lex_r1c1_ref`
+    // `should_commit`), so such a name would be (mis)consumed as a reference, not a sheet prefix.
+    // Quote it. (A leading `[` is already outside the `[A-Za-z0-9_.]` body set below; the live
+    // unquoted-but-unsafe cases are `R`+digit / `R`+`C`. A1 mode never triggers this.)
+    let r1c1_shadow = mode == ReferenceMode::R1C1 && {
+        let mut cs = name.chars();
+        let starts_r = matches!(cs.next(), Some(r) if r.eq_ignore_ascii_case(&'R'));
+        let second = cs.next();
+        starts_r
+            && (matches!(second, Some('[') | Some('0'..='9'))
+                || matches!(second, Some(c) if c.eq_ignore_ascii_case(&'C')))
+    };
+    let needs_quoting = !first_char_ok
+        || r1c1_shadow
         || name
             .chars()
             .any(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'));
@@ -391,7 +423,7 @@ fn print_range_ctx(r: &RangeRef, ctx: &PrintCtx, out: &mut String) -> Result<(),
             abs_end_row,
         } => {
             // Sheet prefix applies to the WHOLE range; emit once.
-            print_sheet_prefix(sheet, out);
+            print_sheet_prefix(sheet, ctx.mode, out);
             // Both endpoints get SheetRef::Current so the inner cell
             // print doesn't double the sheet prefix.
             let start = CellAddr {
@@ -420,7 +452,7 @@ fn print_range_ctx(r: &RangeRef, ctx: &PrintCtx, out: &mut String) -> Result<(),
             abs_start,
             abs_end,
         } => {
-            print_sheet_prefix(sheet, out);
+            print_sheet_prefix(sheet, ctx.mode, out);
             match ctx.mode {
                 ReferenceMode::A1 => {
                     if *abs_start {
@@ -460,7 +492,7 @@ fn print_range_ctx(r: &RangeRef, ctx: &PrintCtx, out: &mut String) -> Result<(),
             abs_start,
             abs_end,
         } => {
-            print_sheet_prefix(sheet, out);
+            print_sheet_prefix(sheet, ctx.mode, out);
             match ctx.mode {
                 ReferenceMode::A1 => {
                     if *abs_start {
@@ -502,7 +534,7 @@ fn print_range_ctx(r: &RangeRef, ctx: &PrintCtx, out: &mut String) -> Result<(),
             end_row,
             end_col,
         } => {
-            print_sheet_prefix(sheet, out);
+            print_sheet_prefix(sheet, ctx.mode, out);
             match ctx.mode {
                 ReferenceMode::R1C1 => {
                     emit_r1c1_axis_from_spec(*start_row, 'R', out);
@@ -758,7 +790,8 @@ fn print_expr_ctx(
         //
         // - `R1C1`: emit directly from `AxisSpec` verbatim — `R1C1`,
         //   `R[-1]C[2]`, `RC` etc. Sheet prefix uses the existing
-        //   `print_sheet_prefix` (mode-agnostic glyph).
+        //   `print_sheet_prefix` (mode-aware quoting: an `R1C1`-shaped sheet
+        //   name is quoted here so it does not re-lex as a reference).
         // - `A1`: resolve each `AxisSpec` to an absolute 0-indexed
         //   coord (relative axes need `ctx.site`), then emit as a
         //   regular A1 `CellAddr`. `AxisSpec::Abs(n)` → `$<letter><row>`
@@ -770,7 +803,7 @@ fn print_expr_ctx(
             row_axis,
             col_axis,
         } => {
-            print_sheet_prefix(sheet, out);
+            print_sheet_prefix(sheet, ctx.mode, out);
             match ctx.mode {
                 ReferenceMode::R1C1 => {
                     emit_r1c1_axis_from_spec(*row_axis, 'R', out);
@@ -1313,6 +1346,42 @@ mod tests {
     }
 
     #[test]
+    fn print_dot_initial_sheet_name_is_quoted() {
+        // Codex Lane A (2026-06-09): a DOT-INITIAL name is in `[A-Za-z0-9_.]` and not digit-initial,
+        // so the prior rule emitted `.foo` UNQUOTED -- but the lexer starts an unquoted sheet name
+        // only on `[A-Za-z_]`, so the printed `.foo!A1` would FAIL to re-lex. Quote it (the lexer
+        // accepts a quoted name) to close the printer/lexer round-trip mismatch. Built via direct AST
+        // because the lexer would not produce a dot-initial name unquoted at the source.
+        let e = Expr::CellRef(CellAddr {
+            sheet: SheetRef::Name(Arc::from(".foo")),
+            col: 0,
+            row: 0,
+            abs_col: false,
+            abs_row: false,
+        });
+        assert_eq!(print(&e), "'.foo'!A1");
+    }
+
+    #[test]
+    fn print_dot_initial_sheet_name_round_trips_quoted() {
+        // The QUOTED source `'.foo'!B2` (name `.foo`) must print back QUOTED so it re-lexes. The
+        // round-trip property parse(print(parse(src))) == parse(src) PANICS at re-lex on the prior
+        // unquoted output. Also cover the degenerate `.` and a `._1`.
+        round_trip("'.foo'!B2", "'.foo'!B2");
+        rt_roundtrip("'.foo'!B2");
+        rt_roundtrip("'.'!A1");
+        rt_roundtrip("'._1'!C3");
+    }
+
+    #[test]
+    fn print_underscore_initial_sheet_name_stays_unquoted() {
+        // Regression guard: a `_`-initial name is a valid unquoted lexer start, so it stays unquoted
+        // (the fix adds quoting only for digit-/dot-initial names). `Data.2024` is covered above.
+        round_trip("_foo!A1", "_foo!A1");
+        round_trip("_1.2!B2", "_1.2!B2");
+    }
+
+    #[test]
     fn print_quoted_sheet_name_with_space() {
         round_trip("'Q3 2025'!A1", "'Q3 2025'!A1");
     }
@@ -1646,6 +1715,59 @@ mod tests {
             let via_with = print_with(&expr, ReferenceMode::A1, Locale::EnUs, None).unwrap();
             assert_eq!(legacy, via_with, "diverged for {src:?}");
         }
+    }
+
+    /// **Codex 2026-06-09 (R1C1 under-quoting).** In R1C1 mode the lexer dispatches
+    /// `R`+(`[`|digit|`C`) to the R1C1 reference lexer BEFORE the sheet-name arm, so an
+    /// `R1C1`-shaped sheet name printed UNQUOTED would mis-lex (`R1C1!R3C5` would not re-lex as
+    /// `SheetName("R1C1") + Bang + R1C1Ref`). It must be quoted in R1C1 mode. The SAME name is a
+    /// valid unquoted A1 sheet name (no A1 ambiguity), so A1 mode leaves it unquoted. NOTE: an
+    /// `R1C1`-shaped name can only appear QUOTED in R1C1 source, so the round-trip starts from the
+    /// quoted source (which parses to the mode-native `R1C1Ref`, not a `CellRef`).
+    #[test]
+    fn print_r1c1_mode_quotes_r1c1_shaped_sheet_name() {
+        let e = parse_r1c1("'R1C1'!R1C1");
+        let printed = print_with(&e, ReferenceMode::R1C1, Locale::EnUs, None).unwrap();
+        // Pre-fix this printed `R1C1!R1C1` (unquoted) and would not re-lex.
+        assert_eq!(
+            printed, "'R1C1'!R1C1",
+            "an R1C1-shaped sheet name must stay quoted in R1C1 mode"
+        );
+        assert_eq!(
+            parse_r1c1(&printed),
+            e,
+            "the quoted R1C1-mode form round-trips"
+        );
+        // In A1 mode the SAME name is a valid unquoted sheet name (no A1 ambiguity) -> stays unquoted.
+        let a1 = parse_a1("R1C1!A1");
+        assert_eq!(
+            print(&a1),
+            "R1C1!A1",
+            "A1 mode does not quote an R1C1-shaped name"
+        );
+    }
+
+    /// Regression guard against over-quoting: an `R`-initial name whose 2nd char is NOT a
+    /// `[`/digit/`C` (so the R1C1 lexer does NOT dispatch it) stays UNQUOTED even in R1C1 mode;
+    /// `RC` (an `R`+`C` trigger) stays QUOTED.
+    #[test]
+    fn print_r1c1_mode_leaves_non_trigger_r_name_unquoted() {
+        // `Roster` = `R` + `o` -> not an R1C1 trigger -> lexes + prints unquoted in R1C1 mode.
+        let e = parse_r1c1("Roster!R1C1");
+        let printed = print_with(&e, ReferenceMode::R1C1, Locale::EnUs, None).unwrap();
+        assert_eq!(
+            printed, "Roster!R1C1",
+            "a non-trigger R-name is not quoted in R1C1 mode"
+        );
+        assert_eq!(parse_r1c1(&printed), e);
+        // `RC` = `R` + `C` -> trigger -> can only appear quoted, and must re-quote on print.
+        let rc = parse_r1c1("'RC'!R1C1");
+        let printed_rc = print_with(&rc, ReferenceMode::R1C1, Locale::EnUs, None).unwrap();
+        assert_eq!(
+            printed_rc, "'RC'!R1C1",
+            "`RC` is an R1C1 trigger -> stays quoted"
+        );
+        assert_eq!(parse_r1c1(&printed_rc), rc);
     }
 
     /// **R1C1 mode + absolute CellRef.** `$A$1` parses to
