@@ -41,6 +41,8 @@ import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
 import { showRenderBenchPanel } from '../quantbook/bench/renderBenchPanel';
 import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, classifySwitchSheetTarget, resolveCommandTargetPanel } from '../quantbook/cellGrid/cellGridLogic';
+import { FORMAT_PRESET_CHOICES, buildFormatUndoLabel, buildSetFormatOps, formatStringForPreset, presetLabel, type FormatPreset } from '../quantbook/cellGrid/formatPickerLogic';
+import { formatRangeTarget, normalizeSelectionRect } from '../quantbook/reactiveNotebook/bindVariableLogic';
 import type { CollabSessionInstance, SessionInstance } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
@@ -754,6 +756,98 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				} catch (err) {
 					const detail = err instanceof Error ? err.message : String(err);
 					log.appendLine(`refreshSession after moveSheet failed (non-fatal): ${detail}`);
+				}
+			}
+		}),
+	);
+
+	// FE-1.5 W-G "Set Cell Format": apply an Excel number format to the focused grid's SELECTION. Pure
+	// host UI -- the engine already renders the formatted string (the snapshot carries `entry.rendered`,
+	// painted by canvasGrid.ts), so this command only registers the format + sets it on each selected
+	// cell; the grid re-renders automatically via refreshSession. The pure preset->format-string map +
+	// the setFormat op-builder live in formatPickerLogic.ts (unit-tested); this is a thin vscode shell.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookSetFormat', async () => {
+			const sel = CellGridPanel.focusedGridSelection();
+			if (sel === undefined) {
+				void vscode.window.showInformationMessage('Select one or more cells in a Cell Grid first -- the format applies to the focused grid\'s selection.');
+				return;
+			}
+			const presetPick = await vscode.window.showQuickPick(
+				FORMAT_PRESET_CHOICES.map(c => ({ label: c.label, detail: c.detail, preset: c.preset })),
+				{ title: 'Set Cell Format', placeHolder: 'Choose a number format for the selected cells' },
+			);
+			if (presetPick === undefined) {
+				return; // operator dismissed the picker
+			}
+			const preset: FormatPreset = presetPick.preset;
+			// Resolve the format string: a fixed map for every non-custom preset, or a free-text input box
+			// for Custom. No-Fallbacks: an empty custom string is rejected in the box (never coerced).
+			let formatString: string;
+			let appliedLabel: string;
+			if (preset === 'Custom') {
+				const raw = await vscode.window.showInputBox({
+					title: 'Custom Cell Format',
+					prompt: 'Enter a raw Excel number-format string',
+					placeHolder: 'e.g. 0.000 or #,##0;(#,##0)',
+					validateInput: (value) => (value.trim().length === 0 ? 'A format string cannot be empty.' : null),
+				});
+				if (raw === undefined) {
+					return; // operator dismissed the input box
+				}
+				formatString = raw;
+				appliedLabel = raw;
+			} else {
+				formatString = formatStringForPreset(preset);
+				appliedLabel = presetLabel(preset);
+			}
+			const log = getOutput();
+			// Best-effort context for the undo label / toast: the selection's sheet NAME + A1 range. This
+			// throws loud if the sheet id is gone (a valid-but-tombstoned selection -- mirrors the bind
+			// command's activeSheetName), surfacing the failure rather than silently mis-labelling.
+			let target: string;
+			try {
+				const found = sel.session.snapshot().sheets.find((s) => s.id === sel.sheet);
+				if (found === undefined) {
+					throw new Error(`the focused grid has no sheet with id ${sel.sheet}`);
+				}
+				const labelRect = normalizeSelectionRect(sel.selection.anchorRow, sel.selection.anchorCol, sel.selection.focusRow, sel.selection.focusCol);
+				target = formatRangeTarget(found.name, labelRect.startRow, labelRect.startCol, labelRect.endRow, labelRect.endCol);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL setFormat sheet-name resolve error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook set format failed: ${detail}`);
+				return;
+			}
+			const undoLabel = buildFormatUndoLabel(appliedLabel, target);
+			// Register the format, build ONE batch of setFormat ops over the whole selection rect, apply it
+			// atomically (one undo unit), recalc, and refresh THIS session's panels. Any throw surfaces as a
+			// toast (No-Fallbacks) -- never swallowed.
+			let opSucceeded = false;
+			try {
+				const formatId = sel.session.registerFormat(formatString);
+				const rect = normalizeSelectionRect(sel.selection.anchorRow, sel.selection.anchorCol, sel.selection.focusRow, sel.selection.focusCol);
+				const ops = buildSetFormatOps(sel.sheet, rect, formatId);
+				sel.session.batch(ops, { undoLabel });
+				recalcDirtyChecked(sel.session);
+				opSucceeded = true;
+				log.appendLine(`${undoLabel} (${ops.length} cell(s), format "${formatString}").`);
+				void vscode.window.showInformationMessage(`${undoLabel}.`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL setFormat error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook set format failed: ${detail}`);
+			}
+			if (opSucceeded) {
+				try {
+					const { refreshed, failed } = CellGridPanel.refreshSession(sel.session);
+					log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
+					if (failed > 0) {
+						void vscode.window.showWarningMessage(`Quantbook: the format applied, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
+					}
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`refreshSession after setFormat failed (non-fatal): ${detail}`);
 				}
 			}
 		}),

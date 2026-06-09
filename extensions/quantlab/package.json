@@ -290,6 +290,11 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.quantbookSetFormat",
+        "title": "%command.quantbookSetFormat.title%",
+        "category": "%command.category%"
+      },
+      {
         "_comment": "FE-BEYOND B1 (W3): start the Quantbook MCP server (read + write tools).",
         "command": "quantlab.quantbookStartMcpServer",
         "title": "%command.quantbookStartMcpServer.title%",

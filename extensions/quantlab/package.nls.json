@@ -37,6 +37,7 @@
 	"command.quantbookOpenReactiveNotebook.title": "Quantbook: Open Reactive Notebook",
 	"command.quantbookBindReactiveNotebook.title": "Quantbook: Bind Reactive Notebook to Grid",
 	"command.quantbookBindVariableToSelectedCell.title": "Quantbook: Bind Variable to Selected Cell",
+	"command.quantbookSetFormat.title": "Quantbook: Set Cell Format",
 	"command.quantbookStartMcpServer.title": "Quantbook: Start MCP Server",
 	"command.quantbookTrustWorkspaceForMcpWrites.title": "Quantbook: Trust Workspace for MCP Writes",
 	"command.quantbookRevokeMcpWriteTrust.title": "Quantbook: Revoke MCP Write Trust",
