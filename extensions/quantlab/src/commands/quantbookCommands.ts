@@ -39,6 +39,7 @@ import { addSheet, appendPutValueValidated, createSession, createWorkbookSession
 import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
 import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
+import { showRenderBenchPanel } from '../quantbook/bench/renderBenchPanel';
 import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, classifySwitchSheetTarget, resolveCommandTargetPanel } from '../quantbook/cellGrid/cellGridLogic';
 import type { CollabSessionInstance, SessionInstance } from '../quantbook/types';
 
@@ -319,6 +320,16 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				'Quantbook: real-time collaborative editing is deferred to v1.5. ' +
 				'The cell grid is single-writer in v1.',
 			);
+		}),
+	);
+
+	// --- FE-2 BAKEOFF (2026-06-09): the render-bench panel. Drives the REAL paint path (the extracted
+	// RenderOrchestrator + CanvasGridRenderer) against synthetic datasets to measure the FE-2 perf gates,
+	// so the Canvas2D-vs-GPU decision rests on evidence. No session/write path -- the bench synthesizes
+	// its own data webview-side; the host only loads the shell + logs the posted results.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookRenderBench', () => {
+			showRenderBenchPanel(context, getOutput());
 		}),
 	);
 

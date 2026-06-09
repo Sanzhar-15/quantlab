@@ -43,6 +43,10 @@ const baseDir = typeof import.meta.dirname === 'string'
 
 const srcDir = path.join(baseDir, 'webview');
 const sheetsDir = path.join(srcDir, 'sheets-webview');
+// FE-2 BAKEOFF (2026-06-09): the render-bench webview source. A SECOND entry alongside the sheets
+// webview (below). It imports the sheets webview's renderer + the extracted RenderOrchestrator from
+// `../sheets-webview/*`, which esbuild bundles transitively (the bundle is self-contained).
+const benchDir = path.join(srcDir, 'render-bench');
 // Namespaced under dist/webview/quantbook/ -- isolated from the shared bundles.
 const outDir = path.join(baseDir, 'dist', 'webview', 'quantbook');
 
@@ -75,11 +79,20 @@ const noHostRuntimePlugin = {
 };
 
 run({
+	// Record-form entryPoints: the KEY is the output basename (esbuild ignores outbase nesting for
+	// named entries), so every bundle lands FLAT at `dist/webview/quantbook/<key>.js` regardless of
+	// which subdir its source lives in. That is what lets the render-bench source live in a sibling
+	// `render-bench/` dir yet emit next to the sheets bundle (`cellGridPanel.ts` / `renderBenchPanel.ts`
+	// each resolve their own flat name).
 	entryPoints: {
 		'sheets-webview': path.join(sheetsDir, 'index.ts'),
 		'sheets-webview-style': path.join(sheetsDir, 'sheets-webview.css'),
+		// FE-2 BAKEOFF: the render-bench webview + its stylesheet.
+		'render-bench': path.join(benchDir, 'index.ts'),
+		'render-bench-style': path.join(benchDir, 'render-bench.css'),
 	},
-	srcDir: sheetsDir,
+	// Watch the whole `webview/` tree so a bench edit triggers a rebuild too (was `sheetsDir`).
+	srcDir,
 	outdir: outDir,
 	// Under `--outputRoot` (packaged/CI build) preserve the FULL extension-relative nesting
 	// `dist/webview/quantbook` -- the shared `run()` would otherwise basename-flatten it to

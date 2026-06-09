@@ -1,0 +1,87 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/*
+ * FE-2 BAKEOFF render-bench webview styles. Mirrors the sheets-webview scroller/canvas geometry so
+ * the renderer paints into the same layout it does live (absolute canvas over an overflow:auto
+ * scroller, in-flow spacer sized to the full extent).
+ */
+
+html, body {
+	margin: 0;
+	padding: 0;
+	height: 100%;
+	font-family: var(--vscode-font-family);
+	font-size: var(--vscode-font-size);
+	color: var(--vscode-foreground);
+	background: var(--vscode-editor-background);
+}
+
+#bench-root {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	box-sizing: border-box;
+	padding: 8px;
+}
+
+#bench-title {
+	margin: 0 0 6px 0;
+	font-size: 1.1em;
+}
+
+.bench-controls {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin-bottom: 8px;
+}
+
+.bench-controls button {
+	color: var(--vscode-button-foreground);
+	background: var(--vscode-button-background);
+	border: none;
+	padding: 4px 12px;
+	cursor: pointer;
+}
+
+.bench-controls button:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+
+.bench-status {
+	color: var(--vscode-descriptionForeground);
+}
+
+.bench-viewport {
+	position: relative;
+	flex: 0 0 480px;
+	overflow: auto;
+	border: 1px solid var(--vscode-panel-border);
+}
+
+#bench-spacer {
+	position: relative;
+}
+
+#bench-canvas {
+	position: absolute;
+	top: 0;
+	left: 0;
+	transform-origin: top left;
+}
+
+.bench-report {
+	flex: 1 1 auto;
+	overflow: auto;
+	margin: 8px 0 0 0;
+	padding: 8px;
+	white-space: pre;
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: 12px;
+	background: var(--vscode-textCodeBlock-background);
+	border: 1px solid var(--vscode-panel-border);
+}

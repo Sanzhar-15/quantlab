@@ -220,6 +220,11 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.quantbookRenderBench",
+        "title": "%command.quantbookRenderBench.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.quantbookCellGridSwitchSheet",
         "title": "%command.quantbookCellGridSwitchSheet.title%",
         "category": "%command.category%"
