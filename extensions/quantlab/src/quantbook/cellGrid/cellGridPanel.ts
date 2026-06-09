@@ -677,11 +677,13 @@ export class CellGridPanel {
 			// (the originating webview), NOT a session fan-out -- `onCommit` above already pushed the
 			// session-wide render. The webview resolves exactly this edit on the matching commitId; a
 			// bare `render` no longer closes a pending editor (kills the sibling-render false-ack HIGH).
-			onAck: commitId => {
+			onAck: (commitId, webviewId) => {
 				if (this._disposed) {
 					return; // the editor is gone with the panel -- nothing to resolve
 				}
-				const ack: CommitResultMessage = { type: 'commitResult', commitId, ok: true };
+				// megaudit (webview-instance token): echo the REQUEST's webviewId so a stale post-reload ack
+				// (whose numeric commitId reset to 0 and could collide) can't resolve a fresh webview's editor.
+				const ack: CommitResultMessage = { type: 'commitResult', commitId, ok: true, webviewId };
 				this.panel.webview.postMessage(ack).then(
 					delivered => {
 						if (!delivered && !this._disposed) {

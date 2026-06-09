@@ -27,12 +27,14 @@
  * Wire protocol (**FE-2-0 Phase 2 commit-token** added a per-commit ack; the host `cellGridPanel.ts` +
  * `cellGridLogic.ts` changed to match -- the webview's local message interfaces here MUST stay in sync):
  *   host -> webview: `{type:'render', snapshot}`,
- *                    `{type:'errorReply', sheet,row,col,code,message, commitId?}`,
- *                    `{type:'commitResult', commitId, ok:true}` (Phase 2 -- success ack to THIS panel).
- *   webview -> host: `{type:'putValue', sheet,row,col,rawInput, commitId?}` (Phase 2 -- the token),
+ *                    `{type:'errorReply', sheet,row,col,code,message, commitId?, webviewId?}`,
+ *                    `{type:'commitResult', commitId, ok:true, webviewId?}` (Phase 2 -- success ack to THIS panel).
+ *   webview -> host: `{type:'putValue', sheet,row,col,rawInput, commitId?, webviewId?}` (Phase 2 -- the token),
  *                    `{type:'undo'}`, `{type:'redo'}`, `{type:'webviewReady'}` (once on load).
- *   Resolution: a pending edit closes ONLY on a matching `commitResult`/`errorReply` (by commitId) or the
- *   commit-watchdog timeout -- NEVER on a bare `render` (which is why a sibling render can't false-ack).
+ *   `webviewId` (megaudit 2026-06-09) is this webview's per-load instance id, echoed by the host so a stale
+ *   PRE-reload `commitResult`/`errorReply` is dropped (its reused commitId would otherwise hit a fresh edit).
+ *   Resolution: a pending edit closes ONLY on a matching `commitResult`/`errorReply` (by commitId, same
+ *   `webviewId`) or the commit-watchdog timeout -- NEVER on a bare `render` (so a sibling render can't false-ack).
  *
  * Side-effecting entry (no top-level exports) so the esm bundle loads via a classic `<script>`.
  */
@@ -93,6 +95,10 @@ interface ErrorReplyMessage {
 	/** FE-2-0 Phase 2: the commitId of the failed putValue (echoed by the host), so we un-stick exactly
 	 * the originating edit. Absent for a non-tokened error. */
 	readonly commitId?: number;
+	/** megaudit (webview-instance token, 2026-06-09): the originating webview's instance id (echoed by the
+	 * host). A reply whose id is present-but != this webview's WEBVIEW_ID is a stale PRE-reload reply and is
+	 * dropped before un-stick/tint (the numeric commitId resets on reload and could otherwise collide). */
+	readonly webviewId?: string;
 }
 
 /** host -> the originating webview: success ack for a tokened commit (FE-2-0 Phase 2 commit-token). */
@@ -100,6 +106,9 @@ interface CommitResultMessage {
 	readonly type: 'commitResult';
 	readonly commitId: number;
 	readonly ok: true;
+	/** megaudit (webview-instance token, 2026-06-09): the originating webview's instance id (echoed); a
+	 * present-but-mismatched id is a stale PRE-reload ack and is dropped before resolvePendingCommit. */
+	readonly webviewId?: string;
 }
 
 /**
@@ -296,12 +305,14 @@ updateFormulaBar();
 // host-driven `cellsWritten` report below, not a commit token.
 let nextCommitId = 0;
 // megaudit (webview-instance token, 2026-06-09): a token minted ONCE per webview load (a NEW value after
-// every reload). Sent on `putCells` (and `webviewReady`) and echoed back by the host in `cellsWritten`, so a
-// stale tint-clear from a PRE-reload paste cannot clear a freshly-reloaded webview. This REPLACES the prior
-// webview-side pending-ack Map (which reset its numeric token on reload and was not sheet-scoped): the HOST
-// now authoritatively lists the written cells + sheet on success, and the webview clears those tints guarded
-// by this id + the current sheet. A FAILED putCells produces no `cellsWritten`, so a stale tint correctly
-// stays (No-Fallbacks). Uniqueness (not cryptographic strength) is the only requirement.
+// every reload). Stamped on `putCells` (paste/fill) AND `putValue` (the editor commit + the Delete-clear),
+// and echoed back by the host in `cellsWritten` / `commitResult` / `errorReply`, so a stale reply from a
+// PRE-reload op cannot clear a tint or resolve/un-stick a freshly-reloaded webview's editor (the numeric
+// commitId / pending-ack token resets on reload and would otherwise collide with a fresh op). For putCells
+// this REPLACES the prior webview-side pending-ack Map (which reset its numeric token on reload and was not
+// sheet-scoped): the HOST now authoritatively lists the written cells + sheet on success. A FAILED op
+// produces no success message, so a stale tint correctly stays (No-Fallbacks). Uniqueness (not
+// cryptographic strength) is the only requirement.
 const WEBVIEW_ID = 'wv-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
 // FE-2-0 Phase 2 (re-audit HIGH): a pending edit now resolves ONLY on a matching commitResult/errorReply
 // -- a bare render no longer releases it. So a LOST/dropped/malformed completion would strand the editor
@@ -725,7 +736,9 @@ function clearActiveCell(): void {
 	// collapse any range so the UI doesn't imply a multi-cell clear happened.
 	collapseSelection();
 	errorCells.delete(active.row + ',' + active.col);
-	vscode.postMessage({ type: 'putValue', sheet: fullSnapshot.sheet, row: active.row, col: active.col, rawInput: '' });
+	// megaudit (webview-instance token): stamp WEBVIEW_ID so a stale post-reload errorReply for this Delete
+	// (which carries no commitId, only a tint) is dropped by the errorReply guard instead of tinting a fresh cell.
+	vscode.postMessage({ type: 'putValue', sheet: fullSnapshot.sheet, row: active.row, col: active.col, rawInput: '', webviewId: WEBVIEW_ID });
 	redraw();
 }
 
@@ -1055,7 +1068,10 @@ function commitEdit(nav?: { dr: number; dc: number }): boolean {
 	// now driven ONLY by a matching `commitResult` (success -> resolvePendingCommit hides the editor +
 	// applies `nav`) or `errorReply` (failure -> decorate the cell + leave the editor open). A bare
 	// `render` no longer resolves -- so a sibling-panel render can't falsely close this editor.
-	vscode.postMessage({ type: 'putValue', sheet, row, col, rawInput: editEl.value, commitId });
+	// megaudit (webview-instance token): stamp WEBVIEW_ID so the host echoes it in the commitResult/errorReply
+	// and a stale PRE-reload reply (whose reused low commitId could collide -- the counter resets on reload) is
+	// dropped instead of resolving this edit.
+	vscode.postMessage({ type: 'putValue', sheet, row, col, rawInput: editEl.value, commitId, webviewId: WEBVIEW_ID });
 	return true; // posted -> the editor is now pending
 }
 
@@ -1751,6 +1767,13 @@ window.addEventListener('message', (event: MessageEvent) => {
 		// Megaudit MED: require `ok === true` AND an integer commitId -- a `{ ok:false }` or NaN-id ack must
 		// NOT resolve an edit as successful (it would close the editor + nav as if the write landed).
 		const cr = msg as CommitResultMessage;
+		// megaudit (webview-instance token, 2026-06-09) -- reload-race guard: a commitResult from a PRE-reload
+		// generation carries the OLD instance id, and its numeric commitId (reset to 0 on reload) could collide
+		// with a fresh edit's token -> drop it so a stale ack can't resolve/close the wrong edit. Present-but-
+		// mismatched only; absent webviewId = the pre-token wire / tests, processed as before (back-compat).
+		if (cr.webviewId !== undefined && cr.webviewId !== WEBVIEW_ID) {
+			return;
+		}
 		if (cr.ok === true && typeof cr.commitId === 'number' && Number.isInteger(cr.commitId)) {
 			resolvePendingCommit(cr.commitId);
 		} else {
@@ -1784,6 +1807,13 @@ window.addEventListener('message', (event: MessageEvent) => {
 	}
 	if (msg.type === 'errorReply') {
 		const er = msg as ErrorReplyMessage;
+		// megaudit (webview-instance token, 2026-06-09) -- reload-race guard: a stale PRE-reload errorReply
+		// carries the OLD instance id; its commitId (reset on reload) could un-stick a fresh edit, and its
+		// (sheet,row,col) could tint a live cell. Drop it before BOTH the tint and the un-stick below.
+		// Present-but-mismatched only; absent = the pre-token wire / tests (processed as before).
+		if (er.webviewId !== undefined && er.webviewId !== WEBVIEW_ID) {
+			return;
+		}
 		const prevErrorKeys = new Set(errorCells.keys()); // Phase 3: for the error-tint flip diff
 		let activeMoved = false; // re-audit LOW: a selection realign below needs a FULL redraw, not a tint-flip damage
 		// Megaudit MED + re-audit LOW: only tint when sheet/row/col are REAL integers (NOT `Number()`-coerced

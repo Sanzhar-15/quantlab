@@ -2636,6 +2636,34 @@ suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', f
 		assert.match(errorReplies[0].message, /integer/, 'integrality is the engine validators job, not the extent check');
 	});
 
+	test('megaudit token: a tokened putValue success echoes BOTH commitId AND webviewId via onAck (reload-race guard)', () => {
+		const session = freshSession();
+		const { deps } = makeDepsP2(session, 0);
+		const acks: { commitId: number; webviewId?: string }[] = [];
+		const depsWithId = { ...deps, onAck: (commitId: number, webviewId?: string) => { acks.push({ commitId, webviewId }); } };
+		dispatchIncomingMessage({ type: 'putValue', sheet: 0, row: 1, col: 1, rawInput: '42', commitId: 7, webviewId: 'wv-A' }, depsWithId);
+		assert.deepStrictEqual(acks, [{ commitId: 7, webviewId: 'wv-A' }], 'the ack echoes the request webviewId so a stale post-reload ack (a different id) is dropped by the webview');
+	});
+
+	test('megaudit token: a FAILED tokened putValue echoes the webviewId in the errorReply (reload-race guard)', () => {
+		const session = freshSession();
+		const { deps, errorReplies } = makeDepsP2(session, 0);
+		// =BADFORMULA( is unbindable -> the dispatch catch arm emits an errorReply, zero commit.
+		dispatchIncomingMessage({ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: '=BADFORMULA(', commitId: 11, webviewId: 'wv-B' }, deps);
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].webviewId, 'wv-B', 'the failed reply echoes the webviewId so a stale post-reload errorReply is dropped by the webview');
+		assert.strictEqual(errorReplies[0].commitId, 11, 'commitId is still echoed too');
+	});
+
+	test('megaudit token: a putValue WITHOUT a webviewId still acks with undefined (back-compat: the token is optional)', () => {
+		const session = freshSession();
+		const { deps } = makeDepsP2(session, 0);
+		const acks: { commitId: number; webviewId?: string }[] = [];
+		const depsWithId = { ...deps, onAck: (commitId: number, webviewId?: string) => { acks.push({ commitId, webviewId }); } };
+		dispatchIncomingMessage({ type: 'putValue', sheet: 0, row: 1, col: 1, rawInput: '42', commitId: 9 }, depsWithId);
+		assert.deepStrictEqual(acks, [{ commitId: 9, webviewId: undefined }], 'no webviewId -> ack with undefined (a pre-token webview never matches it, so the guard is a no-op)');
+	});
+
 	test('Phase 2 (S2-MED1): an undo throw routes to onOperationError, NOT a cell errorReply (no A1 mis-tint)', () => {
 		const { deps, errorReplies, opErrors } = makeDepsP2(freshSession(), 0);
 		// A session whose undo() throws -- exercises the catch arm deterministically.

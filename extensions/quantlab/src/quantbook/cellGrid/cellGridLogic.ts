@@ -99,6 +99,14 @@ export interface PutValueRequest {
 	 * pre-token wire + tests that post bare envelopes.
 	 */
 	commitId?: number;
+	/**
+	 * **megaudit (webview-instance token, 2026-06-09)** -- the originating webview's instance token
+	 * (minted ONCE per load; a fresh value after every reload). Echoed in the {@link CommitResultMessage}
+	 * success ack and the {@link ErrorReplyMessage} failure so the webview can DROP a stale reply from a
+	 * PRE-reload edit: the numeric `commitId` resets to 0 on reload and would otherwise collide with a fresh
+	 * edit's token, letting a stale ack resolve/tint the wrong edit. Optional for back-compat / tests.
+	 */
+	webviewId?: string;
 }
 
 /**
@@ -137,6 +145,9 @@ export interface ErrorReplyMessage {
 	 * failure is for a tokened putValue. Lets the webview un-stick + decorate exactly the originating
 	 * edit. Absent for non-commit errors (e.g. a pre-token envelope). */
 	commitId?: number;
+	/** **megaudit (webview-instance token, 2026-06-09)** -- the {@link PutValueRequest.webviewId} of the
+	 * failed commit, echoed so a stale post-reload errorReply cannot un-stick/tint a fresh webview. */
+	webviewId?: string;
 }
 
 /**
@@ -150,6 +161,9 @@ export interface CommitResultMessage {
 	type: 'commitResult';
 	commitId: number;
 	ok: true;
+	/** **megaudit (webview-instance token, 2026-06-09)** -- the {@link PutValueRequest.webviewId} of the
+	 * acked commit, echoed so a stale post-reload commitResult cannot resolve a fresh webview's editor. */
+	webviewId?: string;
 }
 
 /**
@@ -415,9 +429,11 @@ export interface DispatchDeps {
 	 * `putValue`. Fired (in addition to {@link onCommit}'s session-wide render) ONLY
 	 * when the committing envelope carried a `commitId`; the panel posts a
 	 * {@link CommitResultMessage} to the ORIGINATING webview so it resolves exactly
-	 * this edit. Optional for backward compat with tests + pre-token envelopes.
+	 * this edit. `webviewId` (megaudit 2026-06-09) is the request's instance token, echoed in
+	 * the ack so a stale post-reload commitResult cannot resolve a fresh webview's editor.
+	 * Optional for backward compat with tests + pre-token envelopes.
 	 */
-	readonly onAck?: (commitId: number) => void;
+	readonly onAck?: (commitId: number, webviewId?: string) => void;
 	/**
 	 * **megaudit (webview-instance token, 2026-06-09)** -- fired on a SUCCESSFUL
 	 * {@link PutCellsRequest} (after `Session.batch` + recalc) so the panel posts a
@@ -641,6 +657,7 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			code: 'bad_argument',
 			message: `rawInput must be a string, got ${typeof req.rawInput}`,
 			commitId: req.commitId, // FE-2-0 Phase 2: echo so the originating edit un-sticks
+			webviewId: req.webviewId, // megaudit: echo so a stale post-reload reply is dropped
 		});
 		return;
 	}
@@ -662,6 +679,7 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			code: 'bad_argument',
 			message: `rawInput is ${req.rawInput.length} chars, exceeding the ${MAX_RAW_INPUT_LENGTH}-char limit; the edit was not applied.`,
 			commitId: req.commitId,
+			webviewId: req.webviewId, // megaudit: echo so a stale post-reload reply is dropped
 		});
 		return;
 	}
@@ -682,6 +700,7 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			code: 'bad_argument',
 			message: `putValue sheet ${req.sheet} does not match this panel's sheet ${deps.sheet}; the edit was not applied.`,
 			commitId: req.commitId,
+			webviewId: req.webviewId, // megaudit: echo so a stale post-reload reply is dropped
 		});
 		return;
 	}
@@ -699,6 +718,7 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			code: 'bad_argument',
 			message: `cell (row ${req.row}, col ${req.col}) is outside the A1 grid extent (${A1_MAX_ROWS}x${A1_MAX_COLS}); the edit was not applied.`,
 			commitId: req.commitId,
+			webviewId: req.webviewId, // megaudit: echo so a stale post-reload reply is dropped
 		});
 		return;
 	}
@@ -750,7 +770,7 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		// session-wide render `onCommit` triggers), so its webview resolves exactly this edit. Only when
 		// the envelope carried a commitId (the live webview always stamps one; pre-token/tests may not).
 		if (typeof req.commitId === 'number') {
-			deps.onAck?.(req.commitId);
+			deps.onAck?.(req.commitId, req.webviewId);
 		}
 	} catch (err) {
 		const info = parseQuantbookError(err);
@@ -763,6 +783,7 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			code: info.code,
 			message: info.message,
 			commitId: req.commitId, // FE-2-0 Phase 2: echo so the originating edit un-sticks + decorates
+			webviewId: req.webviewId, // megaudit: echo so a stale post-reload reply is dropped
 		});
 	}
 }
