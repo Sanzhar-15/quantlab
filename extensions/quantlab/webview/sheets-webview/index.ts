@@ -102,6 +102,19 @@ interface CommitResultMessage {
 	readonly ok: true;
 }
 
+/**
+ * host -> the originating webview: the cells a SUCCESSFUL putCells (paste/fill) wrote (megaudit
+ * webview-instance token, 2026-06-09). The webview clears each cell's error tint even when stored content
+ * did not change. `webviewId` is echoed from the request so a stale post-reload report is dropped; `sheet`
+ * scopes the clear to the current sheet. Only success produces this -- a failed putCells reports nothing.
+ */
+interface CellsWrittenMessage {
+	readonly type: 'cellsWritten';
+	readonly sheet: number;
+	readonly cells: readonly { readonly row: number; readonly col: number }[];
+	readonly webviewId?: string;
+}
+
 // Cache the VS Code API handle on `window`: acquireVsCodeApi() may be called at most ONCE per
 // webview context and throws on a second call (the persistent webview could re-evaluate this bundle).
 type SheetsWindow = Window & { __sheetsVscodeApi?: VSCodeApi };
@@ -278,53 +291,18 @@ let editState: EditState | null = null;
 // and esbuild down-levels the module-level `let` to a hoisted `var` (undefined until this point), so calling
 // it earlier would hit `undefined.surface` (the `!== null` guard does not catch `undefined`).
 updateFormulaBar();
-// FE-2-0 Phase 2: monotonic source of per-commit ids (never reused within a webview lifetime). Shared by
-// the single-cell editor commits AND the W-G putCells (paste/fill) tint-ack, so a given id is unique to one
-// or the other -- never both -- and the two `commitResult` consumers can never collide on an id.
+// FE-2-0 Phase 2: monotonic source of per-commit ids for the single-cell editor commit token (never reused
+// within a webview lifetime). Used ONLY by the editor `putValue` commit path; paste/fill (`putCells`) use the
+// host-driven `cellsWritten` report below, not a commit token.
 let nextCommitId = 0;
-// FE-1.5 W-G (deep-audit MED): a putCells (paste/fill) write lands via the host's commit-token ack
-// (`commitResult`), NOT via a content-changed render -- so a write that does not change stored content (e.g.
-// paste an empty cell onto an empty-but-error-tinted cell) would otherwise keep the stale error tint. We
-// record the to-be-cleared cell keys PER putCells token; its matching ack clears exactly those tints. ONLY
-// the ack clears them (No-Fallbacks: a FAILED putCells gets no ack -> the tint correctly stays). A Map (NOT
-// a single slot) so OVERLAPPING pastes each get their own tint-clear -- paste A then paste B before A's ack
-// must not drop A's clear. On any putCells ack for id N, every earlier putCells (id < N) is already resolved
-// (its ack arrived before N's on the per-panel FIFO channel, or it FAILED -> no ack ever comes), so the ack
-// handler sweeps all entries with id <= N (failures' tints correctly stay).
-const pendingPutCellsAcks = new Map<number, readonly string[]>();
-// re-audit #2: hard ceiling so the Map cannot grow unboundedly under a pathological run of FAILED pastes (a
-// failed putCells never acks). Combined with {@link recordPendingPutCellsAck} storing ONLY currently-tinted
-// keys, this bounds both the entry COUNT and each entry's SIZE.
-const MAX_PENDING_PUTCELLS_ACKS = 128;
-
-/**
- * Record the cells a paste/fill (token `commitId`) may need to un-tint on its success ack. re-audit #2:
- * store ONLY keys that are CURRENTLY error-tinted -- the sole cells an ack could clear -- and record nothing
- * when none are. So an ordinary paste, or a large / rejected paste over untinted cells, stores NOTHING (a
- * rejected 100k-cell paste targets no tints -> no entry, no huge key array). A hard cap evicts the oldest
- * (lowest-id) bookkeeping entry as a strict backstop; a failed entry is otherwise reclaimed by the FIFO
- * sweep on the next successful ack.
- */
-function recordPendingPutCellsAck(commitId: number, cells: readonly { row: number; col: number }[]): void {
-	const tinted: string[] = [];
-	for (const c of cells) {
-		const key = c.row + ',' + c.col;
-		if (errorCells.has(key)) {
-			tinted.push(key); // re-audit #3: push ONLY tinted keys -- no transient full-array alloc on a huge paste
-		}
-	}
-	if (tinted.length === 0) {
-		return;
-	}
-	while (pendingPutCellsAcks.size >= MAX_PENDING_PUTCELLS_ACKS) {
-		const oldest = pendingPutCellsAcks.keys().next().value;
-		if (oldest === undefined) {
-			break;
-		}
-		pendingPutCellsAcks.delete(oldest);
-	}
-	pendingPutCellsAcks.set(commitId, tinted);
-}
+// megaudit (webview-instance token, 2026-06-09): a token minted ONCE per webview load (a NEW value after
+// every reload). Sent on `putCells` (and `webviewReady`) and echoed back by the host in `cellsWritten`, so a
+// stale tint-clear from a PRE-reload paste cannot clear a freshly-reloaded webview. This REPLACES the prior
+// webview-side pending-ack Map (which reset its numeric token on reload and was not sheet-scoped): the HOST
+// now authoritatively lists the written cells + sheet on success, and the webview clears those tints guarded
+// by this id + the current sheet. A FAILED putCells produces no `cellsWritten`, so a stale tint correctly
+// stays (No-Fallbacks). Uniqueness (not cryptographic strength) is the only requirement.
+const WEBVIEW_ID = 'wv-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
 // FE-2-0 Phase 2 (re-audit HIGH): a pending edit now resolves ONLY on a matching commitResult/errorReply
 // -- a bare render no longer releases it. So a LOST/dropped/malformed completion would strand the editor
 // forever (Escape/blur inert). This watchdog is the recovery net: if neither reply arrives in time, it
@@ -662,9 +640,7 @@ function applyFill(): boolean {
 	if (cells.length === 0) {
 		return false;
 	}
-	const commitId = ++nextCommitId; // deep-audit MED: token this fill so its success ack can clear tints
-	recordPendingPutCellsAck(commitId, cells);
-	vscode.postMessage({ type: 'putCells', sheet: fullSnapshot.sheet, cells, undoLabel: 'Fill', commitId });
+	vscode.postMessage({ type: 'putCells', sheet: fullSnapshot.sheet, cells, undoLabel: 'Fill', webviewId: WEBVIEW_ID });
 	// Select the filled rect (anchor at the source top-left, focus at the extension's bottom-right).
 	anchor = { row: src.minRow, col: src.minCol };
 	active = { row: fillPreview.maxRow, col: fillPreview.maxCol };
@@ -705,9 +681,7 @@ function pasteGridClipboard(): void {
 		return;
 	}
 	const undoLabel = gridClipboard.isCut ? 'Cut' : 'Paste';
-	const commitId = ++nextCommitId; // deep-audit MED: token this paste so its success ack can clear tints
-	recordPendingPutCellsAck(commitId, cells);
-	vscode.postMessage({ type: 'putCells', sheet: fullSnapshot.sheet, cells, undoLabel, commitId });
+	vscode.postMessage({ type: 'putCells', sheet: fullSnapshot.sheet, cells, undoLabel, webviewId: WEBVIEW_ID });
 	if (gridClipboard.isCut) {
 		gridClipboard = null;
 	}
@@ -1771,45 +1745,33 @@ window.addEventListener('message', (event: MessageEvent) => {
 		// NOT resolve an edit as successful (it would close the editor + nav as if the write landed).
 		const cr = msg as CommitResultMessage;
 		if (cr.ok === true && typeof cr.commitId === 'number' && Number.isInteger(cr.commitId)) {
-			// deep-audit MED: a putCells (paste/fill) success ack -- clear the written cells' error tints even
-			// when the write did not change stored content (no editor backs it, so this is separate from
-			// resolvePendingCommit). Ids are unique across editor commits and putCells, so at most one of these
-			// branches fires for a given id; resolvePendingCommit is a no-op for a non-editor id anyway.
-			const ackedKeys = pendingPutCellsAcks.get(cr.commitId);
-			if (ackedKeys !== undefined) {
-				let cleared = false;
-				for (const key of ackedKeys) {
-					if (errorCells.delete(key)) {
-						cleared = true;
-					}
-				}
-				// FIFO sweep (re-audit): every earlier putCells (id <= this one) is now resolved -- this one by
-				// the clear above, any other still-present entry by having FAILED (a failed putCells never acks,
-				// and on the FIFO channel a successful earlier ack would already have removed its entry). Drop
-				// them so a failed paste can't leak an entry; failures' tints correctly stay (we don't clear them).
-				for (const id of pendingPutCellsAcks.keys()) {
-					if (id <= cr.commitId) {
-						pendingPutCellsAcks.delete(id);
-					}
-				}
-				if (cleared) {
-					redraw();
-				}
-				return;
-			}
-			// re-audit #3: an editor / untinted-paste ack also reclaims dead failed-paste bookkeeping (by FIFO,
-			// id < N is resolved-or-failed), so the Map drains between tinted-target successes instead of only on
-			// one -- failures can't accrete up to the cap. Bookkeeping only; no tint is touched here.
-			for (const id of pendingPutCellsAcks.keys()) {
-				if (id < cr.commitId) {
-					pendingPutCellsAcks.delete(id);
-				}
-			}
 			resolvePendingCommit(cr.commitId);
 		} else {
 			// A malformed ack (version skew / tamper) must NOT be silently dropped -- surface it (No-Fallbacks).
 			// The editor stays pending until the watchdog recovers it.
 			console.warn('[sheets-webview] ignored a malformed commitResult (need ok:true + integer commitId):', cr);
+		}
+		return;
+	}
+	if (msg.type === 'cellsWritten') {
+		// megaudit (webview-instance token, 2026-06-09): the host's report of the cells a SUCCESSFUL putCells
+		// (paste/fill) wrote. Clear each listed cell's error tint even when stored content did not change (a
+		// content-identical render would miss it). Drop the report unless it carries THIS webview's instance id
+		// (a stale post-reload report carries the old id) AND the CURRENT sheet (a cross-sheet report would
+		// clear the wrong sheet's tint -- errorCells is keyed row,col only). Only a SUCCESS produces this
+		// message, so clearing here can never mask a failed write (No-Fallbacks).
+		const cw = msg as CellsWrittenMessage;
+		if (cw.webviewId !== WEBVIEW_ID || fullSnapshot === null || cw.sheet !== fullSnapshot.sheet || !Array.isArray(cw.cells)) {
+			return;
+		}
+		let cleared = false;
+		for (const cell of cw.cells) {
+			if (cell && typeof cell.row === 'number' && typeof cell.col === 'number' && errorCells.delete(cell.row + ',' + cell.col)) {
+				cleared = true;
+			}
+		}
+		if (cleared) {
+			redraw();
 		}
 		return;
 	}

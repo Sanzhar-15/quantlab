@@ -43,7 +43,7 @@
 import * as vscode from 'vscode';
 
 import type { QuantbookCellSnapshot, SessionInstance, WorkbookSnapshotJson } from '../types';
-import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, type CommitResultMessage, type GridSelection } from './cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, type CellsWrittenMessage, type CommitResultMessage, type GridSelection } from './cellGridLogic';
 import { getNonce, getWebviewUri } from '../../utils/webview';
 import type { PublishedRange } from '../reactiveKernel/publishedCellsStore';
 
@@ -691,6 +691,27 @@ export class CellGridPanel {
 						}
 					},
 					err => console.error('[cellGrid] commitResult postMessage rejected:', err),
+				);
+			},
+			// megaudit (webview-instance token, 2026-06-09): report a successful putCells (paste/fill)'s WRITTEN
+			// cells to THIS panel's webview so it clears their error tints even when stored content did not
+			// change. Echo the REQUEST's webviewId (a stale post-reload report can't clear a fresh webview) and
+			// the sheet (a cross-sheet report is dropped). Panel-targeted only -- NOT a session fan-out.
+			onCellsWritten: (sheet, cells, webviewId) => {
+				if (this._disposed) {
+					return;
+				}
+				const msg: CellsWrittenMessage = { type: 'cellsWritten', sheet, cells, webviewId };
+				this.panel.webview.postMessage(msg).then(
+					delivered => {
+						if (!delivered && !this._disposed) {
+							// The write DID land (data is correct); only the tint-clear report didn't reach the
+							// webview, so a stale error tint may linger until the next edit/render. Surface it
+							// (No-Fallbacks) rather than hide it.
+							console.warn('[cellGrid] cellsWritten was not delivered; a stale error tint may linger.');
+						}
+					},
+					err => console.error('[cellGrid] cellsWritten postMessage rejected:', err),
 				);
 			},
 			// **FE-2-0 Phase 2 (S2-MED1)**: a session-wide op failure (undo/redo throw) with no cell --

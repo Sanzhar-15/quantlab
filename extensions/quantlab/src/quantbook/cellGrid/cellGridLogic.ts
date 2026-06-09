@@ -107,17 +107,18 @@ export interface PutValueRequest {
  * atomically via `Session.batch` (one undo unit), recalcs, and re-renders. `undoLabel` names the undo step
  * ("Paste" / "Fill"); each cell's `rawInput` is classified exactly like a single `putValue` (`=`-prefix ->
  * formula, else literal, empty -> clear). The batch is ALL-OR-NOTHING: any invalid cell rejects the whole
- * op loudly (No-Fallbacks). `commitId` (deep-audit MED) is an OPTIONAL success-ack token: on success the
- * dispatcher echoes it via `onAck` -> `commitResult`, letting the originating webview clear the written
- * cells' error tints even when the write did NOT change stored content (a content-changed render wouldn't).
- * A FAILED putCells gets no ack, so a stale tint correctly stays (No-Fallbacks). Optional for back-compat.
+ * op loudly (No-Fallbacks). `webviewId` (megaudit, 2026-06-09) is the originating webview's instance token:
+ * on success the dispatcher posts a {@link CellsWrittenMessage} echoing it + the written coords, letting the
+ * webview clear those cells' error tints even when the write did NOT change stored content (a content-changed
+ * render wouldn't). A FAILED putCells posts nothing, so a stale tint correctly stays (No-Fallbacks). The
+ * host echoes the REQUEST's `webviewId`, so a stale post-reload ack cannot clear a fresh webview's tint.
  */
 export interface PutCellsRequest {
 	type: 'putCells';
 	sheet: number;
 	cells: { row: number; col: number; rawInput: string }[];
 	undoLabel?: string;
-	commitId?: number;
+	webviewId?: string;
 }
 
 /**
@@ -149,6 +150,22 @@ export interface CommitResultMessage {
 	type: 'commitResult';
 	commitId: number;
 	ok: true;
+}
+
+/**
+ * **megaudit (webview-instance token, 2026-06-09)** -- incoming (extension host -> the ORIGINATING webview
+ * only) report of the cells a {@link PutCellsRequest} (paste/fill) actually WROTE, posted ONLY on success
+ * (after `Session.batch` + recalc). The webview clears each listed cell's error tint -- even when stored
+ * content did not change (so the content-changed render-clear would miss it) -- guarded by `webviewId` ===
+ * its own instance token AND `sheet` === its current sheet. This is the authoritative, host-driven
+ * replacement for the prior webview-side pending-ack Map (which reset its numeric token on reload and was
+ * not sheet-scoped). A FAILED putCells posts NOTHING, so a stale tint correctly stays (No-Fallbacks).
+ */
+export interface CellsWrittenMessage {
+	type: 'cellsWritten';
+	sheet: number;
+	cells: { row: number; col: number }[];
+	webviewId?: string;
 }
 
 /**
@@ -402,6 +419,15 @@ export interface DispatchDeps {
 	 */
 	readonly onAck?: (commitId: number) => void;
 	/**
+	 * **megaudit (webview-instance token, 2026-06-09)** -- fired on a SUCCESSFUL
+	 * {@link PutCellsRequest} (after `Session.batch` + recalc) so the panel posts a
+	 * {@link CellsWrittenMessage} to the ORIGINATING webview, which clears the written
+	 * cells' error tints even when stored content did not change. `webviewId` is the
+	 * request's instance token (echoed); a FAILED putCells does NOT fire this. Optional
+	 * for backward compat with tests + pre-token envelopes.
+	 */
+	readonly onCellsWritten?: (sheet: number, cells: { row: number; col: number }[], webviewId?: string) => void;
+	/**
 	 * **FE-2-0 Phase 2 (S2-MED1, 2026-06-04)** -- a SESSION-WIDE operation failure
 	 * (undo/redo throw) that is NOT tied to a cell. Previously routed through
 	 * {@link onError} with `row=0,col=0` sentinels, which mis-decorated cell A1 as
@@ -579,12 +605,13 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			deps.session.batch(ops, { undoLabel: label });
 			recalcDirtyChecked(deps.session);
 			deps.onCommit();
-			// deep-audit MED: ack the originating webview (when it stamped a token) so it can clear the written
-			// cells' error tints -- a putCells whose write does not change stored content produces an identical
-			// render, which the webview's content-changed tint-clear would miss. Mirrors putValue's onAck.
-			if (typeof req.commitId === 'number') {
-				deps.onAck?.(req.commitId);
-			}
+			// megaudit (webview-instance token, 2026-06-09): report the WRITTEN cells to the originating webview
+			// so it clears their error tints even when the write did not change stored content (a
+			// content-identical render would miss them). Echoes the request's webviewId so a stale post-reload
+			// report can't clear a fresh webview's tint, and carries the sheet so a cross-sheet ack is dropped.
+			// Reached ONLY on success (after batch + recalc); a FAILED putCells (catch below) reports nothing,
+			// so a stale tint correctly stays (No-Fallbacks).
+			deps.onCellsWritten?.(req.sheet, req.cells.map(c => ({ row: c.row, col: c.col })), req.webviewId);
 		} catch (err) {
 			const info = parseQuantbookError(err);
 			deps.onOperationError?.(`[${label}] [${info.code}] ${info.message}`);

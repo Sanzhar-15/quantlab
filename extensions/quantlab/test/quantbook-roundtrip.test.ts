@@ -2860,42 +2860,67 @@ suite('FE-1.5 W-G -- dispatchIncomingMessage putCells (atomic multi-cell write)'
 		assert.ok(opErrors[0].includes('does not match'), opErrors[0]);
 	});
 
-	test('deep-audit MED: a tokened putCells success ACKs the commitId (onAck) so the webview clears tints', () => {
+	test('megaudit token: a successful putCells reports its written cells via onCellsWritten (echoing webviewId + sheet)', () => {
 		const session = freshSession();
-		const acks: number[] = [];
+		const reports: { sheet: number; cells: { row: number; col: number }[]; webviewId?: string }[] = [];
 		const { deps } = makeDeps(session, 0);
-		const depsWithAck = { ...deps, onAck: (id: number) => { acks.push(id); } };
+		const depsWithReport = {
+			...deps,
+			onCellsWritten: (sheet: number, cells: { row: number; col: number }[], webviewId?: string) => {
+				reports.push({ sheet, cells, webviewId });
+			},
+		};
 		dispatchIncomingMessage({
-			type: 'putCells', sheet: 0, undoLabel: 'Paste', commitId: 42,
-			cells: [{ row: 0, col: 0, rawInput: '1' }],
-		}, depsWithAck);
-		assert.deepStrictEqual(acks, [42], 'success echoes the token so the webview can clear the written cells\' tints');
+			type: 'putCells', sheet: 0, undoLabel: 'Paste', webviewId: 'wv-abc',
+			cells: [{ row: 0, col: 0, rawInput: '1' }, { row: 1, col: 2, rawInput: '=A1' }],
+		}, depsWithReport);
+		assert.deepStrictEqual(
+			reports,
+			[{ sheet: 0, webviewId: 'wv-abc', cells: [{ row: 0, col: 0 }, { row: 1, col: 2 }] }],
+			'success reports the written coords + echoes the request webviewId + sheet so the webview clears exactly those tints',
+		);
 	});
 
-	test('deep-audit MED: a FAILED putCells does NOT ack (the stale tint must stay -- No-Fallbacks)', () => {
+	test('megaudit token: a FAILED putCells adds NO cellsWritten (only the prior SUCCESS reported) -- No-Fallbacks', () => {
+		// Codex re-verify: a failure-only assertion is vacuous (the failure path is unchanged, so it passes on
+		// the prior onAck code too). Pair a SUCCESS (which the new host-driven path reports but the old onAck
+		// path did NOT) with the failure, so the test discriminates AND pins that a failed putCells reports
+		// nothing -> the webview keeps the tint.
 		const session = freshSession();
-		const acks: number[] = [];
+		const reports: number[] = [];
 		const { deps, opErrors } = makeDeps(session, 0);
-		const depsWithAck = { ...deps, onAck: (id: number) => { acks.push(id); } };
+		const depsWithReport = { ...deps, onCellsWritten: (_sheet: number, cells: { row: number; col: number }[]) => { reports.push(cells.length); } };
+		// 1) a SUCCESS reports its written cells (old onAck code would leave `reports` empty here).
 		dispatchIncomingMessage({
-			type: 'putCells', sheet: 0, undoLabel: 'Paste', commitId: 7,
+			type: 'putCells', sheet: 0, undoLabel: 'Paste', webviewId: 'wv-1',
+			cells: [{ row: 0, col: 0, rawInput: '1' }],
+		}, depsWithReport);
+		assert.deepStrictEqual(reports, [1], 'a successful putCells reports its written cells');
+		// 2) a subsequent FAILURE adds nothing (the stale tint must stay).
+		dispatchIncomingMessage({
+			type: 'putCells', sheet: 0, undoLabel: 'Paste', webviewId: 'wv-1',
 			cells: [{ row: 1_048_576, col: 0, rawInput: '2' }], // off-extent -> whole batch rejected
-		}, depsWithAck);
-		assert.strictEqual(opErrors.length, 1, 'failure surfaced as a toast');
-		assert.deepStrictEqual(acks, [], 'no ack on failure -> the webview keeps the tint (the write did not land)');
+		}, depsWithReport);
+		assert.strictEqual(opErrors.length, 1, 'the failure surfaced as a toast');
+		assert.deepStrictEqual(reports, [1], 'still only the success reported -- a failed putCells reports nothing (No-Fallbacks)');
 	});
 
-	test('a putCells WITHOUT a commitId still applies (back-compat: the tint-ack is optional)', () => {
+	test('a putCells WITHOUT a webviewId still applies + reports (back-compat: the token is optional)', () => {
 		const session = freshSession();
-		const acks: number[] = [];
+		const reports: { webviewId?: string }[] = [];
 		const { deps, getCommitCount } = makeDeps(session, 0);
-		const depsWithAck = { ...deps, onAck: (id: number) => { acks.push(id); } };
+		const depsWithReport = {
+			...deps,
+			onCellsWritten: (_sheet: number, _cells: { row: number; col: number }[], webviewId?: string) => {
+				reports.push({ webviewId });
+			},
+		};
 		dispatchIncomingMessage({
 			type: 'putCells', sheet: 0, undoLabel: 'Paste',
 			cells: [{ row: 0, col: 0, rawInput: '9' }],
-		}, depsWithAck);
+		}, depsWithReport);
 		assert.strictEqual(getCommitCount(), 1, 'committed');
-		assert.deepStrictEqual(acks, [], 'no token -> no ack (and no error)');
+		assert.deepStrictEqual(reports, [{ webviewId: undefined }], 'reports with webviewId undefined (a pre-token webview just never matches it)');
 	});
 });
 
