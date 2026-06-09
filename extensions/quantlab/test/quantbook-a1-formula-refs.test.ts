@@ -118,6 +118,22 @@ suite('FE-1.5 a1FormulaRefs -- translateFormulaRefs', () => {
 		assert.strictEqual(translateFormulaRefs('=Data.2024!B5', 2, 0), '=Data.2024!B7');
 	});
 
+	test('audit HIGH: an UNQUOTED ref-shaped sheet name with WHITESPACE before the ! (S1 !A1) is NOT offset', () => {
+		// The lexer skips whitespace between a sheet name and `!` (lexer.rs "per design section 4.3") and the engine
+		// stores the formula text VERBATIM (the printer is not exposed at napi), so `=S1 !A1` reaches the
+		// clipboard WITH the space. Without the whitespace skip, the ref-shaped `S1` is mistaken for a cell ref
+		// and offset to `S2` -- a wrong/nonexistent sheet (same class as the dotted-name HIGH).
+		assert.strictEqual(translateFormulaRefs('=S1 !A1', 1, 0), '=S1 !A2', 'fill-down keeps the spaced sheet name');
+		assert.strictEqual(translateFormulaRefs('=S1 !A1', 0, 1), '=S1 !B1');
+		assert.strictEqual(translateFormulaRefs('=Q1 !A1', 1, 1), '=Q1 !B2');
+		// A tab is also lexer whitespace.
+		assert.strictEqual(translateFormulaRefs('=S1\t!A1', 1, 0), '=S1\t!A2');
+		// A spaced range under a spaced sheet prefix -- only the coordinates move.
+		assert.strictEqual(translateFormulaRefs('=SUM(S1 !A1:S1 !B2)', 1, 0), '=SUM(S1 !A2:S1 !B3)');
+		// Whitespace AFTER the `!` was already correct (the coordinate is the cell part) -- guard it.
+		assert.strictEqual(translateFormulaRefs('=S1! A1', 1, 0), '=S1! A2');
+	});
+
 	test('Lane C: a #REF! error literal is preserved verbatim across an offset (re-copy identity)', () => {
 		// When a ref overflows it becomes `#REF!`; re-copying that cell must NOT mangle it. `#` is copied
 		// verbatim and `REF` is consumed as a sheet-name-shaped run before `!`, so the whole token round-trips.

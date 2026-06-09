@@ -130,23 +130,37 @@ function offsetRef(m: RefMatch, dRow: number, dCol: number): string {
 }
 
 /**
- * If an UNQUOTED sheet-name qualifier starts at `i` -- a run of sheet-name-legal chars `[A-Za-z0-9_.]`
- * terminated by `!` -- return the index of that `!` (the exclusive end of the name); else -1. Mirrors the
- * engine's CANONICAL PRINTER output (ql-formula-syntax printer.rs `print_sheet_name`: a name of only
- * `[A-Za-z0-9_.]` that does not start with a digit is emitted WITHOUT quotes), so `S1!A1`, `Q1.2024!A1`,
- * and `Data.2024!B5` all reach the grid unquoted and must be preserved verbatim. The canonical printed form
- * is the only shape a stored formula round-trips to -- hence the only shape the formula bar / clipboard ever
- * carries -- so matching the printer (not the looser lexer, which also accepts whitespace-padded `S1 ! A1`
- * the printer never emits; deep-audit LOW) is exactly right here. The caller invokes this only at a letter
- * (the not-digit-initial rule holds) and never at a `$` (which forces a cell ref).
+ * If an UNQUOTED sheet-name qualifier starts at `i` -- a run of sheet-name-legal chars `[A-Za-z0-9_.]`,
+ * then OPTIONAL ASCII whitespace, then `!` -- return the index of that `!` (the exclusive end of the
+ * qualifier text the caller copies verbatim); else -1. The shape mirrors the engine LEXER, NOT the printer:
+ * `try_lex_sheet_name_prefix` (ql-formula-syntax lexer.rs) lexes a `[A-Za-z_][A-Za-z0-9_.]*` name, then
+ * "skips whitespace between name and `!` per design section 4.3", then requires `!`. We must match the LEXER
+ * because the engine stores a formula's text VERBATIM (ql-bindings-node `appendPutFormula`: the snapshot
+ * carries the user's raw source, repaired only for sheet RENAMES, and the printer is NOT exposed at the napi
+ * boundary -- so the clipboard never sees canonical printer output), meaning `S1!A1`, `Q1.2024!A1`, AND a
+ * whitespace-padded `S1 !A1` each reach the clipboard exactly as typed. Omitting the whitespace skip would
+ * let a ref-shaped name before a spaced `!` (`S1`/`Q1`; the product seeds S0/S1/S2) be mistaken for a cell
+ * ref and silently offset to a WRONG sheet on copy/fill (HIGH; same class as the dotted-name case). The
+ * caller invokes this only at a letter (the not-digit-initial rule holds) and never at a `$` (cell ref).
  */
 function unquotedSheetNameEnd(s: string, i: number): number {
 	let j = i;
 	while (j < s.length && (isAlnum(s[j]) || s[j] === '_' || s[j] === '.')) {
 		j += 1;
 	}
-	if (j > i && s[j] === '!') {
-		return j;
+	if (j === i) {
+		return -1; // no sheet-name run
+	}
+	// Skip ASCII whitespace between the name and `!`: the lexer accepts it (section 4.3) and the engine stores it
+	// verbatim, so `S1 !A1` arrives here with the space. Match the lexer's EXACT set (space/tab/LF/CR -- NOT
+	// Unicode whitespace, per opus arch F14). The intervening whitespace is copied verbatim by the caller
+	// (it slices up to this `!`), so the sheet name and its spacing round-trip unchanged.
+	let k = j;
+	while (k < s.length && (s[k] === ' ' || s[k] === '\t' || s[k] === '\n' || s[k] === '\r')) {
+		k += 1;
+	}
+	if (s[k] === '!') {
+		return k;
 	}
 	return -1;
 }
@@ -225,9 +239,10 @@ export function translateFormulaRefs(formula: string, dRow: number, dCol: number
 		}
 		// 3. A letter or `$` may begin a cell reference.
 		if (isLetter(ch) || ch === '$') {
-			// 3a. An UNQUOTED sheet-name qualifier -- a `[A-Za-z0-9_.]` run ending in `!` -- is copied
-			// verbatim, never offset. A real cell ref is NEVER followed by `!`, so a ref-shaped run before a
-			// `!` is a SHEET name (`S1!A1`; the product seeds S0/S1/S2). This must look PAST inner dots/digits:
+			// 3a. An UNQUOTED sheet-name qualifier -- a `[A-Za-z0-9_.]` run ending in `!` (optionally after
+			// whitespace, which the lexer accepts and the engine stores verbatim) -- is copied verbatim, never
+			// offset. A real cell ref is NEVER followed by `!`, so a ref-shaped run before a (possibly spaced)
+			// `!` is a SHEET name (`S1!A1` / `S1 !A1`; the product seeds S0/S1/S2). This must look PAST inner dots/digits:
 			// the engine emits a dotted name like `Q1.2024` UNQUOTED (printer.rs print_sheet_name), and
 			// `Q1`/`H1` are themselves ref-shaped, so offsetting `=Q1.2024!A1` would silently retarget it to
 			// `=R2.2024!B2` -- a wrong/nonexistent sheet (HIGH). A `$`-led token can never be a sheet name.
