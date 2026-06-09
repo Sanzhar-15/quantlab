@@ -349,13 +349,17 @@ async function handleHttpRequest(
 		body = await readBodyCapped(req);
 	} catch (err) {
 		// A stream error or an over-cap body is a loud reject (Codex LOW: do NOT resolve as if the
-		// request ended normally; do NOT buffer unbounded). Send the status, then destroy the (paused)
-		// request so the rest of the oversize upload is not read.
+		// request ended normally; do NOT buffer unbounded). Send the status, and destroy the request
+		// ONLY AFTER the response has flushed (re-audit LOW: an immediate req.destroy() could reset the
+		// socket before the 413 reaches the client). `Connection: close` since we abandon the body.
 		const tooLarge = err instanceof Error && err.message === 'body_too_large';
 		if (!res.headersSent) {
-			res.writeHead(tooLarge ? 413 : 400, { 'content-type': 'text/plain' }).end(tooLarge ? 'payload too large' : 'bad request: stream error');
+			res.writeHead(tooLarge ? 413 : 400, { 'content-type': 'text/plain', connection: 'close' });
+			res.once('finish', () => req.destroy());
+			res.end(tooLarge ? 'payload too large' : 'bad request: stream error');
+		} else {
+			req.destroy();
 		}
-		req.destroy();
 		return;
 	}
 	let parsedBody: unknown;
