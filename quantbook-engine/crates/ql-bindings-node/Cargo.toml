@@ -76,6 +76,12 @@ ql-types     = { path = "../ql-types" }
 ql-io        = { path = "../ql-io" }
 ql-functions = { path = "../ql-functions" }
 ql-storage   = { path = "../ql-storage" }
+# **W3 (insert/delete rows & columns):** the structural-edit producer
+# (`insertRows` / `deleteRows` / `insertColumns` / `deleteColumns`) computes
+# the formula-text shift (`=A5` -> `=A6`) via `shift_formula_text` before
+# emitting the `Op::Insert/Delete*` + `Op::PutFormula` BatchCommit (the
+# `renameSheet` producer model). Pure lex->parse->shift->print; no FFI types.
+ql-formula-syntax = { path = "../ql-formula-syntax" }
 
 # **Phase 6.1B inc.2d (2026-05-27) — owning `WorkbookSession` over napi.**
 # The product-neutral engine session contract (`ql-session`: the `EngineSession`

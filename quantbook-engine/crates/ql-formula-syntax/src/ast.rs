@@ -682,6 +682,402 @@ fn rewrite_range_ref(r: &RangeRef, old_canonical: &str, new_name: &Arc<str>) -> 
     }
 }
 
+// ============================================================================
+// W3 (insert/delete rows & columns) — structural coordinate-shift rewriter.
+// ============================================================================
+//
+// When a user inserts or deletes rows/columns, every formula reference whose
+// resolved sheet is the structurally-edited sheet must have its row (or col)
+// COORDINATE shifted. This is the AST-level half of the lex→parse→shift→print
+// round-trip (mirroring `rewrite_sheet_name_in_expr` in spirit).
+//
+// ## Excel-correct semantics (DELIBERATE deviation from the brief)
+//
+// The brief lists "$A$1 never shifts" as a trap. That is the COPY/FILL
+// semantic of `$`. For **structural insert/delete**, Excel shifts the
+// coordinate of EVERY reference at-or-after the edit point REGARDLESS of the
+// `$` absolute marker — the `$` is preserved (re-printed) but the numeric
+// coordinate moves. Deleting the row/col a reference points AT yields `#REF!`.
+// We implement the Excel-correct structural semantics here; the four
+// fixed/relative combinations are still exhaustively tested (each prints back
+// with its `$` markers intact AND its coordinate shifted).
+//
+// ## Scope
+//
+// A reference is shifted iff its resolved sheet is the edited sheet. The
+// producer supplies a [`ShiftScope`] that captures BOTH the "owning sheet"
+// (so `SheetRef::Current` refs on the edited sheet match) and the edited
+// sheet's canonical name + id (so `Sheet1!A5` refs — on ANY sheet — that
+// point INTO the edited sheet also shift). `SheetRef::Current` on a formula
+// owned by a DIFFERENT sheet never matches (Current = the formula's own
+// sheet, which by definition is not the edited sheet in that case).
+
+/// The axis a structural insert/delete operates on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShiftAxis {
+    Row,
+    Col,
+}
+
+/// A structural shift operation on one axis. Coordinates are 0-indexed
+/// (`RowId`/`ColId` convention; A1 == row 0, col 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShiftOp {
+    /// Insert `count` new lines starting AT index `at`. Coordinates `>= at`
+    /// move up by `count`; coordinates `< at` are unchanged.
+    Insert { at: u32, count: u32 },
+    /// Delete the INCLUSIVE block `[start, end]` (so `end - start + 1` lines).
+    /// Coordinates inside the block are removed (→ `#REF!` for single refs;
+    /// range endpoints collapse); coordinates `> end` move down by the block
+    /// size; coordinates `< start` are unchanged.
+    Delete { start: u32, end: u32 },
+}
+
+/// Identifies WHICH sheet's references to shift, and how to resolve
+/// `SheetRef::Current` on the formula being rewritten.
+///
+/// - `edited_canonical`: ASCII-uppercase canonical name of the edited sheet.
+///   `SheetRef::Name(n)` refs match when `n.eq_ignore_ascii_case(edited_canonical)`.
+/// - `edited_id`: the edited sheet's id. `SheetRef::Id(id)` refs match when
+///   `id == edited_id`.
+/// - `owner_is_edited`: true iff the formula being rewritten lives ON the
+///   edited sheet. Only then do bare (`SheetRef::Current`) refs shift.
+#[derive(Clone, Copy, Debug)]
+pub struct ShiftScope<'a> {
+    pub edited_canonical: &'a str,
+    pub edited_id: SheetId,
+    pub owner_is_edited: bool,
+}
+
+/// Outcome of shifting a single 0-indexed coordinate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShiftCoord {
+    /// New coordinate (possibly unchanged).
+    Moved(u32),
+    /// The coordinate was deleted or overflowed past the axis max → `#REF!`.
+    Ref,
+}
+
+/// Axis maximum for overflow detection (Excel limits).
+fn axis_max(axis: ShiftAxis) -> u32 {
+    match axis {
+        ShiftAxis::Row => crate::lexer::MAX_ROW,
+        ShiftAxis::Col => crate::lexer::MAX_COLUMN,
+    }
+}
+
+/// Shift one 0-indexed coordinate per the op. The single source of truth for
+/// the shift math; every cell/range endpoint routes through here.
+fn shift_one(coord: u32, op: ShiftOp, axis: ShiftAxis) -> ShiftCoord {
+    match op {
+        ShiftOp::Insert { at, count } => {
+            if coord < at {
+                ShiftCoord::Moved(coord)
+            } else {
+                match coord.checked_add(count) {
+                    Some(c) if c <= axis_max(axis) => ShiftCoord::Moved(c),
+                    // Pushed past the axis maximum → the cell falls off the
+                    // sheet. Excel surfaces `#REF!` for such a reference.
+                    _ => ShiftCoord::Ref,
+                }
+            }
+        }
+        ShiftOp::Delete { start, end } => {
+            // Invariant: producers construct `Delete` with `start <= end`
+            // (validated at the napi boundary, L5). A malformed `start > end`
+            // is a programmer/op-log-corruption bug; surface it loudly in
+            // debug builds. Release uses saturating arithmetic so it cannot
+            // panic on FFI-reachable corruption — the `> end` branch is
+            // unreachable when `start > end` because `coord >= start > end`
+            // takes the deleted-block branch first.
+            debug_assert!(
+                start <= end,
+                "ShiftOp::Delete requires start <= end (got {start} > {end})"
+            );
+            if coord < start {
+                ShiftCoord::Moved(coord)
+            } else if coord <= end {
+                // Inside the deleted block → gone.
+                ShiftCoord::Ref
+            } else {
+                // Below the block: slide up by the block size. `end >= start`
+                // by the invariant, so `end - start + 1 >= 1`; saturating_sub
+                // is defensive against a corrupt `start > end` op only.
+                let n = end.saturating_sub(start) + 1;
+                ShiftCoord::Moved(coord - n)
+            }
+        }
+    }
+}
+
+/// Map a range START endpoint that fell INSIDE a deleted block to the
+/// post-deletion collapse point. After deleting `[start, end]`, the first
+/// surviving line at-or-after the block is at index `start` (the line that
+/// slid up into the block's position). So a start endpoint inside the block
+/// clamps to `start`. (The caller decides `#REF!` if the whole range
+/// collapsed — start > end after both endpoints map.)
+fn shift_range_start(coord: u32, op: ShiftOp, axis: ShiftAxis) -> ShiftCoord {
+    match (op, shift_one(coord, op, axis)) {
+        // Endpoint deleted under a Delete: clamp to the collapse point.
+        (ShiftOp::Delete { start, .. }, ShiftCoord::Ref) => ShiftCoord::Moved(start),
+        (_, other) => other,
+    }
+}
+
+/// Map a range END endpoint that fell INSIDE a deleted block to the last
+/// surviving line BEFORE the block, i.e. `start - 1`. If `start == 0` the
+/// block reaches the sheet origin and the end has no surviving predecessor →
+/// the caller collapses the range to `#REF!`.
+fn shift_range_end(coord: u32, op: ShiftOp, axis: ShiftAxis) -> ShiftCoord {
+    match (op, shift_one(coord, op, axis)) {
+        (ShiftOp::Delete { start, .. }, ShiftCoord::Ref) => {
+            if start == 0 {
+                ShiftCoord::Ref
+            } else {
+                ShiftCoord::Moved(start - 1)
+            }
+        }
+        (_, other) => other,
+    }
+}
+
+/// True iff a reference whose `SheetRef` is `sheet` (on a formula scoped by
+/// `scope`) targets the edited sheet and must be shifted.
+fn ref_targets_edited(sheet: &SheetRef, scope: ShiftScope<'_>) -> bool {
+    match sheet {
+        SheetRef::Current => scope.owner_is_edited,
+        SheetRef::Name(n) => n.eq_ignore_ascii_case(scope.edited_canonical),
+        SheetRef::Id(id) => *id == scope.edited_id,
+    }
+}
+
+/// **W3 (insert/delete):** recursively shift the row/col coordinate of every
+/// reference in `expr` that resolves to the edited sheet. Returns a new
+/// `Expr`; the input is not mutated. References on other sheets, constants,
+/// function names, defined-name references, and structured (table) references
+/// pass through unchanged (table footprints + named ranges are re-keyed at the
+/// metadata layer, not here). A reference whose coordinate is deleted or
+/// overflows becomes `Expr::Error(ErrorValue::Ref)` (`#REF!`).
+///
+/// `axis` selects which coordinate moves (the other is untouched). `op`
+/// is the insert/delete. `scope` decides which refs target the edited sheet.
+///
+/// **R1C1 refs are left UNCHANGED in v1** (the IDE drives A1 mode only; R1C1
+/// offsets are anchor-relative and need separate handling — documented gap).
+pub fn shift_cell_refs(expr: &Expr, axis: ShiftAxis, op: ShiftOp, scope: ShiftScope<'_>) -> Expr {
+    match expr {
+        Expr::Number(n) => Expr::Number(*n),
+        Expr::String(s) => Expr::String(s.clone()),
+        Expr::Bool(b) => Expr::Bool(*b),
+        Expr::NameRef(n) => Expr::NameRef(n.clone()),
+        Expr::Error(ev) => Expr::Error(*ev),
+        Expr::CellRef(addr) => shift_cell_addr(addr, axis, op, scope),
+        Expr::RangeRef(r) => shift_range_ref_struct(r, axis, op, scope),
+        Expr::Binary { op: o, lhs, rhs } => Expr::Binary {
+            op: *o,
+            lhs: Box::new(shift_cell_refs(lhs, axis, op, scope)),
+            rhs: Box::new(shift_cell_refs(rhs, axis, op, scope)),
+        },
+        Expr::Unary { op: o, operand } => Expr::Unary {
+            op: *o,
+            operand: Box::new(shift_cell_refs(operand, axis, op, scope)),
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| shift_cell_refs(a, axis, op, scope))
+                .collect(),
+        },
+        Expr::Array(rows) => Expr::Array(
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| shift_cell_refs(cell, axis, op, scope))
+                        .collect()
+                })
+                .collect(),
+        ),
+        Expr::Spill(inner) => Expr::Spill(Box::new(shift_cell_refs(inner, axis, op, scope))),
+        // v1: R1C1 refs left unchanged (anchor-relative; A1-only product).
+        Expr::R1C1Ref {
+            sheet,
+            row_axis,
+            col_axis,
+        } => Expr::R1C1Ref {
+            sheet: sheet.clone(),
+            row_axis: *row_axis,
+            col_axis: *col_axis,
+        },
+        // Table footprints re-keyed at metadata layer; text unchanged.
+        Expr::StructuredRef { table_name, spec } => Expr::StructuredRef {
+            table_name: table_name.clone(),
+            spec: spec.clone(),
+        },
+        Expr::ImplicitIntersection(inner) => {
+            Expr::ImplicitIntersection(Box::new(shift_cell_refs(inner, axis, op, scope)))
+        }
+    }
+}
+
+/// Shift a single `CellRef`. A deleted/overflowed coordinate collapses the
+/// whole ref to `#REF!`. The `$` absolute markers are preserved.
+fn shift_cell_addr(addr: &CellAddr, axis: ShiftAxis, op: ShiftOp, scope: ShiftScope<'_>) -> Expr {
+    if !ref_targets_edited(&addr.sheet, scope) {
+        return Expr::CellRef(addr.clone());
+    }
+    let coord = match axis {
+        ShiftAxis::Row => addr.row,
+        ShiftAxis::Col => addr.col,
+    };
+    match shift_one(coord, op, axis) {
+        ShiftCoord::Ref => Expr::Error(ql_types::ErrorValue::Ref),
+        ShiftCoord::Moved(new_coord) => {
+            let mut out = addr.clone();
+            match axis {
+                ShiftAxis::Row => out.row = new_coord,
+                ShiftAxis::Col => out.col = new_coord,
+            }
+            Expr::CellRef(out)
+        }
+    }
+}
+
+/// Shift a `RangeRef`. Each endpoint shifts independently; a fully-collapsed
+/// range (start > end after the shift, or both endpoints deleted) becomes
+/// `#REF!`. Partial deletion shrinks the range (Excel canon).
+fn shift_range_ref_struct(
+    r: &RangeRef,
+    axis: ShiftAxis,
+    op: ShiftOp,
+    scope: ShiftScope<'_>,
+) -> Expr {
+    let sheet = range_sheet(r);
+    if !ref_targets_edited(sheet, scope) {
+        return Expr::RangeRef(r.clone());
+    }
+    match r {
+        RangeRef::Cells {
+            sheet,
+            start_col,
+            start_row,
+            end_col,
+            end_row,
+            abs_start_col,
+            abs_start_row,
+            abs_end_col,
+            abs_end_row,
+        } => {
+            // Shift only the relevant axis; the other axis passes through.
+            let (ns_row, ne_row, ns_col, ne_col) = match axis {
+                ShiftAxis::Row => {
+                    let s = shift_range_start(*start_row, op, axis);
+                    let e = shift_range_end(*end_row, op, axis);
+                    match collapse_pair(s, e) {
+                        None => return Expr::Error(ql_types::ErrorValue::Ref),
+                        Some((s, e)) => (s, e, *start_col, *end_col),
+                    }
+                }
+                ShiftAxis::Col => {
+                    let s = shift_range_start(*start_col, op, axis);
+                    let e = shift_range_end(*end_col, op, axis);
+                    match collapse_pair(s, e) {
+                        None => return Expr::Error(ql_types::ErrorValue::Ref),
+                        Some((s, e)) => (*start_row, *end_row, s, e),
+                    }
+                }
+            };
+            Expr::RangeRef(RangeRef::Cells {
+                sheet: sheet.clone(),
+                start_col: ns_col,
+                start_row: ns_row,
+                end_col: ne_col,
+                end_row: ne_row,
+                abs_start_col: *abs_start_col,
+                abs_start_row: *abs_start_row,
+                abs_end_col: *abs_end_col,
+                abs_end_row: *abs_end_row,
+            })
+        }
+        RangeRef::WholeColumn {
+            sheet,
+            start_col,
+            end_col,
+            abs_start,
+            abs_end,
+        } => {
+            // A whole-column range only shifts on the COL axis; a row
+            // insert/delete leaves it unchanged (it already spans all rows).
+            if axis == ShiftAxis::Row {
+                return Expr::RangeRef(r.clone());
+            }
+            let s = shift_range_start(*start_col, op, axis);
+            let e = shift_range_end(*end_col, op, axis);
+            match collapse_pair(s, e) {
+                None => Expr::Error(ql_types::ErrorValue::Ref),
+                Some((s, e)) => Expr::RangeRef(RangeRef::WholeColumn {
+                    sheet: sheet.clone(),
+                    start_col: s,
+                    end_col: e,
+                    abs_start: *abs_start,
+                    abs_end: *abs_end,
+                }),
+            }
+        }
+        RangeRef::WholeRow {
+            sheet,
+            start_row,
+            end_row,
+            abs_start,
+            abs_end,
+        } => {
+            if axis == ShiftAxis::Col {
+                return Expr::RangeRef(r.clone());
+            }
+            let s = shift_range_start(*start_row, op, axis);
+            let e = shift_range_end(*end_row, op, axis);
+            match collapse_pair(s, e) {
+                None => Expr::Error(ql_types::ErrorValue::Ref),
+                Some((s, e)) => Expr::RangeRef(RangeRef::WholeRow {
+                    sheet: sheet.clone(),
+                    start_row: s,
+                    end_row: e,
+                    abs_start: *abs_start,
+                    abs_end: *abs_end,
+                }),
+            }
+        }
+        // v1: R1C1 ranges unchanged (A1-only product).
+        RangeRef::R1C1Cells { .. } => Expr::RangeRef(r.clone()),
+    }
+}
+
+/// Combine a shifted (start, end) pair: `None` if the range fully collapsed
+/// (either endpoint became `#REF!` with no survivor, or start > end), else
+/// the normalized `(start, end)`.
+fn collapse_pair(start: ShiftCoord, end: ShiftCoord) -> Option<(u32, u32)> {
+    match (start, end) {
+        (ShiftCoord::Moved(s), ShiftCoord::Moved(e)) => {
+            if s > e {
+                None
+            } else {
+                Some((s, e))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Borrow a range's `SheetRef` regardless of variant.
+fn range_sheet(r: &RangeRef) -> &SheetRef {
+    match r {
+        RangeRef::Cells { sheet, .. }
+        | RangeRef::WholeColumn { sheet, .. }
+        | RangeRef::WholeRow { sheet, .. }
+        | RangeRef::R1C1Cells { sheet, .. } => sheet,
+    }
+}
+
 /// Address inside an `Expr`. `sheet: SheetRef::Current` means "the
 /// formula's containing sheet" (resolved during binding). Sheet-
 /// qualified refs (`Sheet1!A1`, `'Q3 2025'!A1`) populate

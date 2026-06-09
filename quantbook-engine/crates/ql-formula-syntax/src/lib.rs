@@ -49,14 +49,15 @@ pub mod rewrite_text;
 pub mod token;
 
 pub use ast::{
-    rewrite_column_ref, rewrite_sheet_name_in_expr, rewrite_table_ref, CellAddr, Expr, RangeRef,
-    SheetRef, SpecialItem, TableSpecItem, TableSpecSubtree,
+    rewrite_column_ref, rewrite_sheet_name_in_expr, rewrite_table_ref, shift_cell_refs, CellAddr,
+    Expr, RangeRef, SheetRef, ShiftAxis, ShiftOp, ShiftScope, SpecialItem, TableSpecItem,
+    TableSpecSubtree,
 };
 pub use lexer::{column_letters_to_index, lex, lex_with, LexError, MAX_COLUMN, MAX_ROW};
 pub use locale::{locale_data, LocaleData};
 pub use parser::{parse, ParseError};
 pub use printer::{print, print_with, FormulaSite, PrintError};
-pub use rewrite_text::{rewrite_formula_text, NameRewrite};
+pub use rewrite_text::{rewrite_formula_text, shift_formula_text, NameRewrite};
 pub use token::{AxisSpec, Operator, Token};
 
 #[cfg(test)]

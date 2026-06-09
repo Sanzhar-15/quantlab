@@ -387,6 +387,58 @@ pub enum Op {
         id: Option<crate::wire::FormatIdWire>,
     },
 
+    /// **W3 (insert/delete rows & columns):** insert `count` blank rows at
+    /// row index `at` on `sheet` (0-indexed; `at` is the row that the new
+    /// blank rows push DOWN). Replays to `Workbook::insert_rows`, which
+    /// performs the POSITIONAL shift only: cell storage, format overlay,
+    /// `formula_cells` KEYS, named-range targets + table footprints all move.
+    ///
+    /// The formula-TEXT rewrite (so `=A5` becomes `=A6`) rides as separate
+    /// `Op::PutFormula` ops emitted by the producer in the SAME `BatchCommit`
+    /// as this op (the `RenameSheet` model). Replay applies this op first
+    /// (shifting the formula cell's KEY) then the `PutFormula` (writing the
+    /// rewritten TEXT at the new key); the two are complementary.
+    ///
+    /// Tombstoned sheet → silent no-op (mirrors `PutValue`). A table-footprint
+    /// split or off-grid overflow surfaces as `ReplayError::StructuralEdit`.
+    ///
+    /// **Wire format compatibility**: additive new variant on the serde-tagged
+    /// enum; `OPLOG_SCHEMA_VERSION` NOT bumped (consistent with every prior
+    /// variant addition). Forward-compat caveat per the `RemoveSheet` docstring.
+    InsertRows {
+        sheet: SheetId,
+        at: RowId,
+        count: u32,
+    },
+
+    /// **W3 (insert/delete rows & columns):** delete the INCLUSIVE row block
+    /// `[start, end]` on `sheet`. Rows below `end` shift up; refs into the
+    /// deleted block become `#REF!` (via the accompanying `PutFormula` text
+    /// rewrites). Replays to `Workbook::delete_rows`. See `InsertRows`.
+    DeleteRows {
+        sheet: SheetId,
+        start: RowId,
+        end: RowId,
+    },
+
+    /// **W3 (insert/delete rows & columns):** insert `count` blank columns at
+    /// column index `at` on `sheet`. Replays to `Workbook::insert_columns`.
+    /// See `InsertRows`.
+    InsertColumns {
+        sheet: SheetId,
+        at: ColId,
+        count: u32,
+    },
+
+    /// **W3 (insert/delete rows & columns):** delete the INCLUSIVE column
+    /// block `[start, end]` on `sheet`. Replays to `Workbook::delete_columns`.
+    /// See `InsertRows` / `DeleteRows`.
+    DeleteColumns {
+        sheet: SheetId,
+        start: ColId,
+        end: ColId,
+    },
+
     /// One transaction's ops applied atomically at replay time. Produced
     /// by `WorkbookTransaction::commit` in 2A.3.b. Replay applies each
     /// inner op in order; on failure, replay reports the inner op's
