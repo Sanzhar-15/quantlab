@@ -1523,14 +1523,25 @@ impl CollabSession {
                     count: *count,
                 },
             }),
-            Op::DeleteRows { sheet, start, end } => out.push(CacheEffect::AxisShift {
-                sheet: *sheet,
-                is_row: true,
-                shift: ql_storage::AxisShift::Delete {
-                    start: *start,
-                    end: *end,
-                },
-            }),
+            // **Codex re-audit MED closure (megaudit fold)**: a malformed
+            // delete (`start > end`) is REJECTED by the storage layer at replay
+            // (`StructuralEditError::InvalidRange` → the Workbook never shifts).
+            // `AxisShift::Delete`'s `map` has a `start <= end` precondition
+            // (debug-panics; release-wraps `coord - (end - start + 1)`).  Skip
+            // emitting the effect for a malformed delete so the cache matches
+            // the authoritative Workbook (which did nothing) and never feeds
+            // `map_public` an out-of-contract range.  A hostile / corrupt
+            // op-log (e.g. a merged remote op) cannot panic or mis-re-key here.
+            Op::DeleteRows { sheet, start, end } if start <= end => {
+                out.push(CacheEffect::AxisShift {
+                    sheet: *sheet,
+                    is_row: true,
+                    shift: ql_storage::AxisShift::Delete {
+                        start: *start,
+                        end: *end,
+                    },
+                })
+            }
             Op::InsertColumns { sheet, at, count } => out.push(CacheEffect::AxisShift {
                 sheet: *sheet,
                 is_row: false,
@@ -1539,14 +1550,18 @@ impl CollabSession {
                     count: *count,
                 },
             }),
-            Op::DeleteColumns { sheet, start, end } => out.push(CacheEffect::AxisShift {
-                sheet: *sheet,
-                is_row: false,
-                shift: ql_storage::AxisShift::Delete {
-                    start: *start,
-                    end: *end,
-                },
-            }),
+            Op::DeleteColumns { sheet, start, end } if start <= end => {
+                out.push(CacheEffect::AxisShift {
+                    sheet: *sheet,
+                    is_row: false,
+                    shift: ql_storage::AxisShift::Delete {
+                        start: *start,
+                        end: *end,
+                    },
+                })
+            }
+            // Malformed `Delete{start>end}` (storage rejects it) + any other op
+            // → no cache effect.
             _ => {}
         }
     }
@@ -1638,11 +1653,27 @@ impl CollabSession {
                 v.push(op_log_index);
             }
         }
-        if let CacheEffect::RemoveSheet { id } = &effect {
-            let v = buckets.sheet_op_index.entry(*id).or_default();
-            if v.last().copied() != Some(op_log_index) {
-                v.push(op_log_index);
+        // **Codex re-audit HIGH closure (megaudit fold)**: index BOTH
+        // `RemoveSheet` AND `RestoreSheet` into `sheet_op_index`.  Pre-fix only
+        // `RemoveSheet` was indexed, yet `invalidate_cell` applies a
+        // `RestoreSheet` effect when it sees one (its filter has a
+        // `RestoreSheet => true` arm).  Because the restore op was never in
+        // `sheet_op_index`, the partial undo/redo per-cell walk fetched only
+        // the `RemoveSheet` for the cell's sheet, re-applied the tombstone
+        // locally, and DROPPED any post-restore cell write — corrupting the
+        // cache after a `RemoveSheet → RestoreSheet → PutValue` history that
+        // is then undone/redone.  Indexing the restore lets the per-cell walk
+        // replay it and un-tombstone before the later write applies.
+        // (Pre-existing bug surfaced by the HIGH-1 re-audit; unrelated to the
+        // AxisShift change but in the same undo/redo cache path.)
+        match &effect {
+            CacheEffect::RemoveSheet { id } | CacheEffect::RestoreSheet { id } => {
+                let v = buckets.sheet_op_index.entry(*id).or_default();
+                if v.last().copied() != Some(op_log_index) {
+                    v.push(op_log_index);
+                }
             }
+            _ => {}
         }
         match effect {
             CacheEffect::PutValue { key, value } => {
@@ -4913,6 +4944,58 @@ mod tests {
             Some(1.0),
             "undo after a structural shift must restore the shifted original, not corrupt the cell"
         );
+    }
+
+    #[test]
+    fn undo_redo_after_remove_restore_sheet_preserves_post_restore_write() {
+        // **Codex re-audit HIGH fold**: RestoreSheet must be indexed in
+        // sheet_op_index so the partial invalidate_cell path replays it.
+        // Pre-fix: PutValue → RemoveSheet → RestoreSheet → PutValue, then
+        // undo+redo, dropped the post-restore write (the per-cell walk saw the
+        // RemoveSheet tombstone but never the RestoreSheet, so the later write
+        // was filtered out). Cache stayed at 1 instead of 2.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap(); // A1 = 1
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        s.append_op(Op::RestoreSheet { id: 0 }).unwrap();
+        s.append_op(put_value(0, 0, 0, 2.0)).unwrap(); // A1 = 2 (post-restore)
+        assert_eq!(snapshot_value_at(&s, 0, 0, 0), Some(2.0));
+        // Undo the A1=2 write then redo it — exercises the partial path
+        // (no structural row/col op present → log_has_structural_op is false).
+        assert!(s.undo().unwrap());
+        assert!(s.redo().unwrap());
+        assert_eq!(
+            snapshot_value_at(&s, 0, 0, 0),
+            Some(2.0),
+            "post-restore write must survive undo+redo (RestoreSheet indexed in sheet_op_index)"
+        );
+    }
+
+    #[test]
+    fn malformed_delete_op_does_not_shift_or_panic() {
+        // **Codex re-audit MED fold**: a malformed DeleteRows{start>end} (which
+        // the storage layer rejects at replay) must NOT emit an AxisShift —
+        // otherwise map_public's `start <= end` precondition would debug-panic
+        // / release-wrap. The cache must match the Workbook (which did nothing).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 9.0)).unwrap(); // A1
+                                                       // A malformed delete inside a batch (the producer would never emit
+                                                       // this, but a corrupt / hostile merged op-log could).
+        s.append_op(Op::BatchCommit {
+            ops: vec![Op::DeleteRows {
+                sheet: 0,
+                start: 10,
+                end: 5, // start > end → malformed
+            }],
+        })
+        .unwrap();
+        // No panic; the cell stays exactly where it was (no shift applied).
+        assert_eq!(snapshot_value_at(&s, 0, 0, 0), Some(9.0));
+        assert_eq!(s.snapshot_cells(0).len(), 1);
+        // The full-rebuild path agrees (also skips the malformed delete).
+        let bytes = s.export_bytes().unwrap();
+        let reborn = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+        assert_eq!(reborn.snapshot_cells(0), s.snapshot_cells(0));
     }
 
     #[test]
@@ -9007,4 +9090,6 @@ mod tests {
         assert_eq!(
             cells.len(),
             2,
-            "post-restore writes stack at
+            "post-restore writes stack atop preserved pre-tombstone cells"
+        );
+        // Sorted (row, col) per snapshot_cells docstring cont
