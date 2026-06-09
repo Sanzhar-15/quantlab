@@ -10,6 +10,7 @@ import { registerReactiveKernelCommands } from './quantbook/reactiveKernel/react
 import type { ReactiveKernelManager } from './quantbook/reactiveKernel/reactiveKernelManager';
 import { QNB_NOTEBOOK_TYPE, QnbSerializer } from './quantbook/reactiveNotebook/qnbSerializer';
 import { registerReactiveNotebookController } from './quantbook/reactiveNotebook/reactiveNotebookController';
+import { registerQuantbookShell } from './quantbook/shell/quantbookShell';
 import type { SessionInstance } from './quantbook/types';
 import { registerGlobalStateCommands } from './commands/globalStateCommands';
 import { registerHistoryCommands } from './commands/historyCommands';
@@ -322,6 +323,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	new HistoryPanelProvider(context, historyState);
 	new TradePanelProvider(context, badgeManager);
 	new SettingsPanelProvider(context);
+
+	// FE-5 (W4 product shell): the Quantbook Activity Bar surface (Live-Python sidebar + the
+	// `quantbook.hasOpenGrid` context key gating the quantbook views). Registered AFTER the panel
+	// providers + AFTER the reactive-kernel manager exists (the sidebar's data source).
+	registerQuantbookShell(context, builtKernelManager);
 
 	const validationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	moduleValidationTimers = validationTimers;

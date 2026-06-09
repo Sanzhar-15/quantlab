@@ -126,10 +126,12 @@ function resolveA1OnSession(session: SessionInstance, a1: string): CellRangeJson
 }
 
 /** Build the client factory: each session gets a client bound to it, with the interpreter resolved
- *  + version-checked at spawn time (fail-loud, No-Fallbacks). */
+ *  + version-checked at spawn time (fail-loud, No-Fallbacks). `onPublishedCellsChanged` is pumped to
+ *  the manager (FE-5) so the Live-Python sidebar refreshes when a publish frame lands/retracts. */
 function makeClientFactory(
 	context: vscode.ExtensionContext,
 	output: vscode.OutputChannel,
+	onPublishedCellsChanged: () => void,
 ): (session: SessionInstance) => ReactiveKernelClient {
 	const supervisorScript = vscode.Uri.joinPath(
 		context.extensionUri,
@@ -181,6 +183,10 @@ function makeClientFactory(
 						`Quantbook reactive: ${failed} panel(s) failed to re-render -- see the Quantbook Reactive Kernel output.`,
 					);
 				}
+				// FE-5: a publish frame landed/retracted -> the published-variable set may have changed;
+				// refresh the Live-Python sidebar. (refreshSession above repaints the grid badges; this
+				// pumps the sidebar, which reads the kernel's published cells.)
+				onPublishedCellsChanged();
 			},
 			onError: (message: string): void => {
 				output.appendLine(message);
@@ -210,9 +216,15 @@ export function registerReactiveKernelCommands(
 		}
 		assertReactiveTrusted();
 	};
+	// FE-5: the factory's per-session `onChanged` pumps the manager's change event so the Live-Python
+	// sidebar refreshes on a publish frame. The manager does not exist yet when the factory is built
+	// (the factory is a constructor arg), so route through a mutable holder whose field is set right after
+	// construction. The factory closure only RUNS lazily when a session starts -- always after assignment;
+	// the `?.` guard keeps the (unreachable) pre-assignment call a no-op rather than a TDZ throw.
+	const managerHolder: { manager?: ReactiveKernelManager<SessionInstance> } = {};
 	const manager = new ReactiveKernelManager<SessionInstance>(
 		gate,
-		makeClientFactory(context, output),
+		makeClientFactory(context, output, () => managerHolder.manager?.notifyChanged()),
 		// W-G: when a session's kernel is stopped or lost, its published-cells store is gone -- refresh the
 		// still-open panels so their bound-cell badges clear (the provider now returns []). Mirrors the
 		// onChanged refresh path; refreshSession is a no-op for a session whose panels have all closed.
@@ -220,6 +232,7 @@ export function registerReactiveKernelCommands(
 			CellGridPanel.refreshSession(session);
 		},
 	);
+	managerHolder.manager = manager;
 
 	// W-G bound-cell indicator: let every CellGridPanel pull the cells its session's published variables
 	// drive (keeps the panel decoupled from the manager -- it knows only this provider signature, default

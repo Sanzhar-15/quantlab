@@ -84,6 +84,8 @@
 	"view.history.title": "History",
 	"view.trade.title": "Trade",
 	"view.settings.title": "Settings",
+	"viewContainer.quantbook.title": "Quantbook",
+	"view.livePython.title": "Live Python",
 	"command.switchToVisualise.title": "Switch to Visualise View",
 	"command.switchToDataEditor.title": "Switch to Data Editor",
 	"command.openDataAction.title": "Open Data Action",

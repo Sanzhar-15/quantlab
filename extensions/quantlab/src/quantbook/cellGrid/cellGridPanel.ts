@@ -101,6 +101,24 @@ function fireSessionClosing(session: SessionInstance): void {
 	}
 }
 
+// FE-5 (W4 product shell, SHARED EDIT): listeners fired whenever the live-panel landscape changes --
+// a panel opens, a panel disposes, or the focused panel changes. The Live-Python sidebar consults
+// `focusedLocalPanel()` + the reactive kernel for the focused workbook, and the shell drives the
+// `quantbook.hasOpenGrid` context key off `hasAnyPanel()`; both need a pull signal when that state
+// changes (there is no VS Code event for "a quantbook grid opened/focused"). Plain listener array +
+// try/guard (mirrors `sessionClosingListeners`) -- vscode-free, fires synchronously after the
+// registry mutation so a listener reading `focusedLocalPanel()`/`hasAnyPanel()` sees the new state.
+const gridsChangedListeners: Array<() => void> = [];
+function fireGridsChanged(): void {
+	for (const listener of gridsChangedListeners) {
+		try {
+			listener();
+		} catch (err) {
+			console.error('[cellGrid] gridsChanged listener threw:', err);
+		}
+	}
+}
+
 /**
  * Render-then-edit webview panel for the given session's sheet. The panel binds
  * the session for its lifetime -- the dispatcher commits via this session,
@@ -120,6 +138,8 @@ export class CellGridPanel {
 			existing.panel.reveal(vscode.ViewColumn.Active, false);
 			existing.render();
 			focusedPanel = existing;
+			// FE-5: re-opening an existing grid changes the focused workbook -> tell the shell.
+			fireGridsChanged();
 			return existing;
 		}
 		// Initial title; render() (below) immediately corrects the count via
@@ -167,6 +187,10 @@ export class CellGridPanel {
 				// deactivate event order (A's activate sets it; B's deactivate only clears it if it is still B).
 				focusedPanel = undefined;
 			}
+			// FE-5: the focused workbook may have changed -> the Live-Python sidebar re-reads focus + its
+			// kernel's published variables. (A no-op activate that does not move focus still fires, which is
+			// harmless -- the listener recomputes idempotently.)
+			fireGridsChanged();
 		}, undefined, panelDisposables);
 		// Mount the persistent bundle shell ONCE. Snapshots are pushed via
 		// postMessage in render() (gated on the webviewReady handshake), NOT by
@@ -184,6 +208,10 @@ export class CellGridPanel {
 		}
 		sheetMap.set(sheet, instance);
 		focusedPanel = instance;
+		// FE-5: a new grid is now open + focused -> drive the `quantbook.hasOpenGrid` context key and
+		// refresh the Live-Python sidebar. Fired AFTER the registry mutation so a listener that reads
+		// `hasAnyPanel()`/`focusedLocalPanel()` sees this panel.
+		fireGridsChanged();
 		panel.onDidDispose(() => {
 			// Set _disposed BEFORE anything else so a postMessage racing with
 			// disposal early-returns from the onError guard.
@@ -222,6 +250,10 @@ export class CellGridPanel {
 					}
 				}
 			}
+			// FE-5: a grid closed (and possibly the focused one / the last one) -> re-evaluate
+			// `quantbook.hasOpenGrid` + refresh the sidebar. Fired AFTER the registry mutation so a
+			// listener sees the post-close `hasAnyPanel()`/`focusedLocalPanel()` state.
+			fireGridsChanged();
 		});
 		context.subscriptions.push(panel);
 		// First paint + the webviewReady watchdog (surfaces a loud error if the bundle never
@@ -275,6 +307,31 @@ export class CellGridPanel {
 				}
 			},
 		};
+	}
+
+	/**
+	 * **FE-5 (W4 product shell)** -- register a listener fired whenever the live-grid landscape changes:
+	 * a panel opens, a panel disposes, or the focused panel changes. The shell drives the
+	 * `quantbook.hasOpenGrid` context key off {@link hasAnyPanel} and the Live-Python sidebar re-reads
+	 * {@link focusedLocalPanel} + its reactive kernel on this signal. Returns a disposable that
+	 * unregisters it (push into context.subscriptions to avoid a stale listener across a same-host
+	 * re-activation). The listener fires AFTER the registry mutation, so it observes the new state.
+	 */
+	static onDidChangeGrids(listener: () => void): { dispose(): void } {
+		gridsChangedListeners.push(listener);
+		return {
+			dispose: (): void => {
+				const i = gridsChangedListeners.indexOf(listener);
+				if (i >= 0) {
+					gridsChangedListeners.splice(i, 1);
+				}
+			},
+		};
+	}
+
+	/** **FE-5** -- whether ANY Cell Grid panel is currently open (drives `quantbook.hasOpenGrid`). */
+	static hasAnyPanel(): boolean {
+		return allPanels.size > 0;
 	}
 
 	private static refreshIterable(it: Iterable<CellGridPanel>): { refreshed: number; failed: number; skipped: number } {
