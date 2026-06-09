@@ -61,6 +61,15 @@ class FakeClient implements ReactiveKernelClientLike {
 	publishedCellsForSheet(sheet: number): PublishedRange[] {
 		return this.publishedBySheet.get(sheet) ?? [];
 	}
+	publishedCellsForAllSheets(): Array<{ sheet: number; range: PublishedRange }> {
+		const out: Array<{ sheet: number; range: PublishedRange }> = [];
+		for (const [sheet, ranges] of this.publishedBySheet) {
+			for (const range of ranges) {
+				out.push({ sheet, range });
+			}
+		}
+		return out;
+	}
 	async close(): Promise<void> {
 		/* no-op fake */
 	}

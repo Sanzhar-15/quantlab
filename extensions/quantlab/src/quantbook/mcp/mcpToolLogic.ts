@@ -114,10 +114,21 @@ export interface ParsedA1Cell {
 }
 
 /**
+ * The A1 grid extent. A host-local pin mirroring `A1_MAX_ROWS`/`A1_MAX_COLS` in cellGridLogic.ts (kept
+ * local rather than cross-imported, the same discipline that file uses). An A1 ref outside this is
+ * rejected loud -- without this cap, `get_cell` on an off-grid ref (`A1048577`) reads `cell() === null`
+ * and would MASK the invalid target as an "empty cell" (a No-Fallbacks violation Codex flagged).
+ */
+export const A1_MAX_ROWS = 1_048_576;
+export const A1_MAX_COLS = 16_384;
+
+/**
  * Parse a bare A1 cell reference ("B1", "AA10") into 0-based {row,col}. No-Fallbacks: a malformed ref
- * (lowercase ok, but empty / wrong shape / row 0) throws {@link McpToolError} `[bad_a1]`. Mirrors the
- * `a1Cell` parser in reactiveKernelCommands.ts (1-based input row -> 0-based). Rejects a `$`-anchored
- * ref (`$A$1`) -- those are formula refs, not addressing targets, so the agent must pass a plain A1.
+ * (lowercase ok, but empty / wrong shape / row 0) OR a ref outside the grid extent throws
+ * {@link McpToolError} `[bad_a1]`. Mirrors the `a1Cell` parser in reactiveKernelCommands.ts (1-based
+ * input row -> 0-based). Rejects a `$`-anchored ref (`$A$1`) -- those are formula refs, not addressing
+ * targets, so the agent must pass a plain A1. Rejecting off-grid coords here means an out-of-extent
+ * `get_cell` fails loud instead of masquerading as an empty cell.
  */
 export function parseA1Cell(ref: string): ParsedA1Cell {
 	const m = /^([A-Za-z]+)([0-9]+)$/.exec(ref);
@@ -128,7 +139,15 @@ export function parseA1Cell(ref: string): ParsedA1Cell {
 	if (row < 1) {
 		throw new McpToolError('bad_a1', `A1 row must be >= 1: "${ref}"`);
 	}
-	return { row: row - 1, col: colLettersToIndex(m[1]) };
+	const row0 = row - 1;
+	const col0 = colLettersToIndex(m[1]);
+	if (row0 >= A1_MAX_ROWS) {
+		throw new McpToolError('bad_a1', `A1 row out of grid extent (max ${A1_MAX_ROWS}): "${ref}"`);
+	}
+	if (col0 >= A1_MAX_COLS) {
+		throw new McpToolError('bad_a1', `A1 column out of grid extent (max ${A1_MAX_COLS} columns): "${ref}"`);
+	}
+	return { row: row0, col: col0 };
 }
 
 /** A parsed A1 range as 0-based, normalized (start <= end on both axes), INCLUSIVE coordinates. */

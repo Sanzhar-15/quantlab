@@ -28,6 +28,7 @@
 // verbatim -- the agent SEES the failure; nothing is masked or defaulted. A bind/listen failure on
 // start rejects loud.
 
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
 
@@ -100,7 +101,9 @@ interface LoadedSdk {
 }
 
 let sdkPromise: Promise<LoadedSdk> | undefined;
-/** Load (once, memoized) the ESM-only SDK + zod. A failure here is fatal to starting the server. */
+/** Load (once, memoized) the ESM-only SDK + zod. A failure here is fatal to THIS start attempt, but the
+ *  memoized promise is CLEARED on failure (Codex LOW) so a later Start retries the load rather than
+ *  replaying a permanently-rejected promise. The memoization holds only a SUCCESSFUL load. */
 async function loadSdk(): Promise<LoadedSdk> {
 	if (sdkPromise === undefined) {
 		sdkPromise = (async (): Promise<LoadedSdk> => {
@@ -113,6 +116,9 @@ async function loadSdk(): Promise<LoadedSdk> {
 			}
 			return { McpServer: mcpMod.McpServer, StreamableHTTPServerTransport: trMod.StreamableHTTPServerTransport, z };
 		})();
+		sdkPromise.catch(() => {
+			sdkPromise = undefined;
+		});
 	}
 	return sdkPromise;
 }
@@ -123,23 +129,36 @@ const MCP_HOST = '127.0.0.1';
 const MCP_PATH = '/mcp';
 
 /**
+ * STABLE per-Session id assignment (Codex HIGH fold). A grid id MUST identify the SAME workbook for the
+ * life of the host, never recycling a closed session's number onto a new one -- else a client reusing a
+ * stale `sessionId` would silently read a DIFFERENT workbook (a No-Fallbacks "silent retarget"). The id
+ * is derived from the napi Session IDENTITY via a WeakMap + a monotonic counter that never reuses a
+ * value; the WeakMap lets a closed Session's entry be GC'd without ever re-minting its ordinal.
+ */
+const sessionIdByInstance = new WeakMap<SessionInstance, number>();
+let nextSessionOrdinal = 0;
+function stableSessionOrdinal(session: SessionInstance): number {
+	let ordinal = sessionIdByInstance.get(session);
+	if (ordinal === undefined) {
+		ordinal = nextSessionOrdinal++;
+		sessionIdByInstance.set(session, ordinal);
+	}
+	return ordinal;
+}
+
+/**
  * Build the per-call host context from the LIVE CellGridPanel registry + the reactive kernel manager.
- * Resolved fresh on every tool invocation (panels open/close between calls). The grid `id` is the
- * panel's `sheet:<n>` plus a session ordinal so two workbooks showing the same sheet get distinct ids.
+ * Resolved fresh on every tool invocation (panels open/close between calls). The grid `id` is a
+ * monotonic per-Session ordinal (never recycled -- see {@link stableSessionOrdinal}) plus the sheet, so
+ * two workbooks showing the same sheet get distinct ids and a stale id never resolves to a new workbook.
  */
 function buildHostContext(kernelManager: ReactiveKernelManager<SessionInstance>): McpHostContext {
 	const panels = CellGridPanel.activeLocalPanels();
-	// Assign a stable-per-call id per (session, sheet). Sessions are identity-keyed; number them in
-	// first-seen order so the id is human-namable ("grid-0-sheet-0") without leaking the napi handle.
-	const sessionOrdinal = new Map<SessionInstance, number>();
-	const grids: McpTargetGrid[] = panels.map((p) => {
-		let ordinal = sessionOrdinal.get(p.session);
-		if (ordinal === undefined) {
-			ordinal = sessionOrdinal.size;
-			sessionOrdinal.set(p.session, ordinal);
-		}
-		return { id: `grid-${ordinal}-sheet-${p.sheet}`, session: p.session as McpSessionPort, sheet: p.sheet };
-	});
+	const grids: McpTargetGrid[] = panels.map((p) => ({
+		id: `grid-${stableSessionOrdinal(p.session)}-sheet-${p.sheet}`,
+		session: p.session as McpSessionPort,
+		sheet: p.sheet,
+	}));
 	const focused = CellGridPanel.focusedLocalPanel();
 	let focusedId: string | undefined;
 	if (focused !== undefined) {
@@ -157,14 +176,13 @@ function buildHostContext(kernelManager: ReactiveKernelManager<SessionInstance>)
 			if (real === undefined) {
 				return [];
 			}
-			// Enumerate published variables across every live sheet of the session (the manager is per-sheet).
-			const out: PublishedVariableTargets[] = [];
-			for (const sheet of session.listSheets()) {
-				for (const r of kernelManager.publishedCellsForSheet(real, sheet.id)) {
-					out.push({ name: r.name, range: { sheet: sheet.id, startRow: r.startRow, startCol: r.startCol, endRow: r.endRow, endCol: r.endCol } });
-				}
-			}
-			return out;
+			// Enumerate the COMPLETE published set (every sheet, incl. a now-deleted one -- Codex MED:
+			// the prior per-live-sheet walk silently dropped a variable on a tombstoned sheet, which the
+			// pure formatter's #REF! path then never saw). The accessor carries each range's sheet id.
+			return kernelManager.publishedCellsForAllSheets(real).map((e) => ({
+				name: e.range.name,
+				range: { sheet: e.sheet, startRow: e.range.startRow, startCol: e.range.startCol, endRow: e.range.endRow, endCol: e.range.endCol },
+			}));
 		},
 	};
 }
@@ -242,13 +260,21 @@ function registerReadOnlyTools(server: McpServerLike, sdk: LoadedSdk, kernelMana
 interface RunningMcpServer {
 	readonly url: string;
 	readonly port: number;
+	/** The per-start bearer token every request must present (`Authorization: Bearer <token>`). */
+	readonly token: string;
 	close(): Promise<void>;
 }
+
+/** Max request body the server will buffer. The MCP JSON-RPC payloads are tiny (a tool call is a few
+ *  hundred bytes); cap well above that and reject larger bodies loud (Codex LOW: no unbounded buffer). */
+const MAX_REQUEST_BODY_BYTES = 1 << 20; // 1 MiB
 
 /**
  * Start the localhost MCP HTTP server. Stateless: each POST gets a fresh McpServer + transport,
  * connected, handled, and torn down on response close. `port: 0` lets the OS pick a free port (the
- * resolved URL is returned + logged). Rejects loud on a bind/listen failure (No-Fallbacks).
+ * resolved URL is returned + logged). Mints a per-start random bearer `token` REQUIRED on every request
+ * (Codex HIGH: a localhost port is otherwise readable by any local process -- the token gates access to
+ * live, possibly-unsaved workbook data). Rejects loud on a bind/listen failure (No-Fallbacks).
  */
 async function startMcpHttpServer(
 	kernelManager: ReactiveKernelManager<SessionInstance>,
@@ -256,8 +282,9 @@ async function startMcpHttpServer(
 	port: number,
 ): Promise<RunningMcpServer> {
 	const sdk = await loadSdk();
+	const token = randomBytes(32).toString('hex');
 	const httpServer = http.createServer((req, res) => {
-		void handleHttpRequest(req, res, sdk, kernelManager, output);
+		void handleHttpRequest(req, res, sdk, kernelManager, output, token);
 	});
 	await new Promise<void>((resolve, reject) => {
 		const onError = (err: Error): void => {
@@ -275,20 +302,22 @@ async function startMcpHttpServer(
 	return {
 		url,
 		port: resolvedPort,
+		token,
 		close: (): Promise<void> => new Promise<void>((resolve) => {
 			httpServer.close(() => resolve());
 		}),
 	};
 }
 
-/** Per-request handler: validate Host + method + path, parse the JSON body, drive a fresh stateless
- *  McpServer/transport, and tear it down when the response closes. */
+/** Per-request handler: validate Host + method + path + bearer token, parse the JSON body (size-capped),
+ *  drive a fresh stateless McpServer/transport, and tear it down when the response closes. */
 async function handleHttpRequest(
 	req: http.IncomingMessage,
 	res: http.ServerResponse,
 	sdk: LoadedSdk,
 	kernelManager: ReactiveKernelManager<SessionInstance>,
 	output: vscode.OutputChannel,
+	token: string,
 ): Promise<void> {
 	// Loopback + Host-header guard: the StreamableHTTP DNS-rebinding option is deprecated in favor of
 	// external middleware, so we enforce it here -- reject any request whose Host header is not a
@@ -297,20 +326,38 @@ async function handleHttpRequest(
 		res.writeHead(403, { 'content-type': 'text/plain' }).end('forbidden: non-loopback Host header');
 		return;
 	}
+	// Bearer-token auth (Codex HIGH): any local process can reach the loopback port, so require the
+	// per-start token. Constant-time compare so a wrong token cannot be timing-probed.
+	if (!hasValidBearerToken(req.headers.authorization, token)) {
+		res.writeHead(401, { 'content-type': 'text/plain', 'www-authenticate': 'Bearer' }).end('unauthorized: missing or invalid bearer token');
+		return;
+	}
+	// POST-only (Codex MED): the stateless JSON contract is POST. Reject GET/DELETE so a client cannot
+	// open a long-lived SSE stream / session-delete against a server that holds none.
+	if (req.method !== 'POST') {
+		res.writeHead(405, { 'content-type': 'text/plain', allow: 'POST' }).end('method not allowed: POST only');
+		return;
+	}
 	const url = req.url ?? '';
 	const pathOnly = url.split('?')[0];
 	if (pathOnly !== MCP_PATH) {
 		res.writeHead(404, { 'content-type': 'text/plain' }).end('not found');
 		return;
 	}
-	let body = '';
-	req.on('data', (chunk) => {
-		body += chunk;
-	});
-	await new Promise<void>((resolve) => {
-		req.on('end', () => resolve());
-		req.on('error', () => resolve());
-	});
+	let body: string | undefined;
+	try {
+		body = await readBodyCapped(req);
+	} catch (err) {
+		// A stream error or an over-cap body is a loud reject (Codex LOW: do NOT resolve as if the
+		// request ended normally; do NOT buffer unbounded). Send the status, then destroy the (paused)
+		// request so the rest of the oversize upload is not read.
+		const tooLarge = err instanceof Error && err.message === 'body_too_large';
+		if (!res.headersSent) {
+			res.writeHead(tooLarge ? 413 : 400, { 'content-type': 'text/plain' }).end(tooLarge ? 'payload too large' : 'bad request: stream error');
+		}
+		req.destroy();
+		return;
+	}
 	let parsedBody: unknown;
 	if (body.length > 0) {
 		try {
@@ -338,6 +385,45 @@ async function handleHttpRequest(
 		}
 		teardown();
 	}
+}
+
+/** Read the request body as a string, rejecting (loud) over {@link MAX_REQUEST_BODY_BYTES} or on a
+ *  stream error -- never resolving as if a truncated/errored stream ended normally. */
+function readBodyCapped(req: http.IncomingMessage): Promise<string> {
+	return new Promise<string>((resolve, reject) => {
+		const chunks: Buffer[] = [];
+		let size = 0;
+		req.on('data', (chunk: Buffer) => {
+			size += chunk.length;
+			if (size > MAX_REQUEST_BODY_BYTES) {
+				// Stop reading + reject; the handler sends the 413 THEN destroys the request (so the
+				// status line reaches the client before the socket tears down).
+				req.pause();
+				reject(new Error('body_too_large'));
+				return;
+			}
+			chunks.push(chunk);
+		});
+		req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+		req.on('error', (err) => reject(err));
+	});
+}
+
+/** Constant-time check that the Authorization header carries the expected `Bearer <token>`. */
+function hasValidBearerToken(authorization: string | undefined, token: string): boolean {
+	if (authorization === undefined) {
+		return false;
+	}
+	const match = /^Bearer\s+(.+)$/.exec(authorization);
+	if (match === null) {
+		return false;
+	}
+	const presented = Buffer.from(match[1], 'utf8');
+	const expected = Buffer.from(token, 'utf8');
+	if (presented.length !== expected.length) {
+		return false;
+	}
+	return timingSafeEqual(presented, expected);
 }
 
 /** Whether a Host header names a loopback address (no DNS-rebinding host). Accepts an optional :port. */
@@ -382,14 +468,22 @@ export function registerQuantbookMcpServer(
 				const port = typeof configuredPort === 'number' && Number.isInteger(configuredPort) && configuredPort >= 0 ? configuredPort : 0;
 				running = await startMcpHttpServer(kernelManager, output, port);
 				output.appendLine(`[mcp] read-only Quantbook MCP server listening at ${running.url}`);
-				output.appendLine('[mcp] connect an MCP client to that URL (Streamable HTTP, stateless JSON). Tools: list_sheets, get_cell, query_range, get_snapshot, list_functions, get_published_variables.');
+				output.appendLine('[mcp] connect an MCP client over Streamable HTTP (stateless JSON). EVERY request must send the bearer token below.');
+				output.appendLine(`[mcp]   URL:    ${running.url}`);
+				output.appendLine(`[mcp]   Header: Authorization: Bearer ${running.token}`);
+				output.appendLine('[mcp] tools: list_sheets, get_cell, query_range, get_snapshot, list_functions, get_published_variables.');
 				output.show(true);
 				const action = await vscode.window.showInformationMessage(
-					`Quantbook MCP server running at ${running.url}`,
+					`Quantbook MCP server running at ${running.url} (bearer token printed to the Quantbook MCP Server output).`,
 					'Copy URL',
+					'Copy Token',
 				);
-				if (action === 'Copy URL' && running !== undefined) {
-					await vscode.env.clipboard.writeText(running.url);
+				if (running !== undefined) {
+					if (action === 'Copy URL') {
+						await vscode.env.clipboard.writeText(running.url);
+					} else if (action === 'Copy Token') {
+						await vscode.env.clipboard.writeText(running.token);
+					}
 				}
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);

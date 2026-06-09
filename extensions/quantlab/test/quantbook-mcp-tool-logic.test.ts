@@ -158,6 +158,13 @@ suite('B1 MCP -- A1 parsing', () => {
 		assert.throws(() => parseA1Range('A1:B2:C3'), McpToolError);
 		assert.throws(() => parseA1Range('A1:'), McpToolError);
 	});
+
+	test('parseA1Cell accepts the grid bounds and rejects off-grid refs loud (No-Fallbacks)', () => {
+		// Bottom-right corner of the A1 grid (1,048,576 rows x 16,384 cols = XFD1048576) is in-extent.
+		assert.deepStrictEqual(parseA1Cell('XFD1048576'), { row: 1048575, col: 16383 });
+		assert.throws(() => parseA1Cell('A1048577'), McpToolError, 'row past the extent');
+		assert.throws(() => parseA1Cell('XFE1'), McpToolError, 'column past the extent');
+	});
 });
 
 // --- sheet resolution -------------------------------------------------------------------------
@@ -378,6 +385,19 @@ suite('B1 MCP -- tool handlers', () => {
 		const ctx = makeCtx([singleGrid(s)], 'grid-0-sheet-0');
 		const out = toolGetPublishedVariables(ctx, {});
 		assert.deepStrictEqual(out.variables, []);
+	});
+
+	test('toolGetPublishedVariables surfaces a dangling (deleted-sheet) variable as #REF!', () => {
+		const s = fixtureSession();
+		const published = new Map<McpSessionPort, PublishedVariableTargets[]>();
+		// sheet 9 is NOT a live sheet of the fixture (only 0 and 1) -- a variable left tracked on a
+		// since-deleted sheet must still surface, visibly, not be silently omitted.
+		published.set(s, [{ name: 'ghost', range: { sheet: 9, startRow: 0, startCol: 0, endRow: 0, endCol: 0 } }]);
+		const ctx = makeCtx([singleGrid(s)], 'grid-0-sheet-0', published);
+		const out = toolGetPublishedVariables(ctx, {});
+		assert.strictEqual(out.variables.length, 1);
+		assert.strictEqual(out.variables[0].name, 'ghost');
+		assert.strictEqual(out.variables[0].a1Range, '#REF!9!A1');
 	});
 
 	test('every tool rejects loud when no grid is open', () => {
