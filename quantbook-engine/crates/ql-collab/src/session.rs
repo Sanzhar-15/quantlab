@@ -1523,16 +1523,21 @@ impl CollabSession {
                     count: *count,
                 },
             }),
-            // **Codex re-audit MED closure (megaudit fold)**: a malformed
-            // delete (`start > end`) is REJECTED by the storage layer at replay
-            // (`StructuralEditError::InvalidRange` → the Workbook never shifts).
-            // `AxisShift::Delete`'s `map` has a `start <= end` precondition
-            // (debug-panics; release-wraps `coord - (end - start + 1)`).  Skip
-            // emitting the effect for a malformed delete so the cache matches
-            // the authoritative Workbook (which did nothing) and never feeds
-            // `map_public` an out-of-contract range.  A hostile / corrupt
-            // op-log (e.g. a merged remote op) cannot panic or mis-re-key here.
-            Op::DeleteRows { sheet, start, end } if start <= end => {
+            // **Codex re-audit MED closure (megaudit fold, hardened in round
+            // 2)**: only emit a Delete AxisShift for a delete the storage layer
+            // ACCEPTS — i.e. `start <= end AND end <= axis_max`.  Storage
+            // rejects `start > end` AND `end > MAX_ROW/MAX_COLUMN`
+            // (`StructuralEditError::InvalidRange`), so the Workbook never
+            // shifts for those.  If the cache shifted anyway it would diverge:
+            // `start > end` underflow-wraps / debug-panics in `map_public`'s
+            // `coord - (end - start + 1)`, and `end > axis_max` would DROP
+            // every on-grid cell the Workbook actually KEPT.  A hostile /
+            // corrupt op-log (e.g. a merged remote op) thus cannot panic OR
+            // mis-re-key here.  (Insert malformed cases — `count == 0`,
+            // `at > axis_max` — are identity maps through `map_public`, so
+            // they are harmless no-ops that match the rejected Workbook; no
+            // guard needed on the Insert arms.)
+            Op::DeleteRows { sheet, start, end } if start <= end && *end <= ql_types::MAX_ROW => {
                 out.push(CacheEffect::AxisShift {
                     sheet: *sheet,
                     is_row: true,
@@ -1550,7 +1555,9 @@ impl CollabSession {
                     count: *count,
                 },
             }),
-            Op::DeleteColumns { sheet, start, end } if start <= end => {
+            Op::DeleteColumns { sheet, start, end }
+                if start <= end && *end <= ql_types::MAX_COLUMN =>
+            {
                 out.push(CacheEffect::AxisShift {
                     sheet: *sheet,
                     is_row: false,
@@ -1560,8 +1567,8 @@ impl CollabSession {
                     },
                 })
             }
-            // Malformed `Delete{start>end}` (storage rejects it) + any other op
-            // → no cache effect.
+            // Malformed delete (`start > end` OR `end > axis_max`; storage
+            // rejects either) + any other op → no cache effect.
             _ => {}
         }
     }
@@ -4996,6 +5003,40 @@ mod tests {
         let bytes = s.export_bytes().unwrap();
         let reborn = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
         assert_eq!(reborn.snapshot_cells(0), s.snapshot_cells(0));
+    }
+
+    #[test]
+    fn out_of_grid_delete_op_does_not_drop_on_grid_cells() {
+        // **Codex re-audit round-2 MED fold**: a delete whose `end > MAX_ROW`
+        // is ALSO rejected by storage (InvalidRange). The cache must NOT shift
+        // -- otherwise map_public would DROP every on-grid cell the Workbook
+        // actually kept. Guard is `start <= end AND end <= axis_max`.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 7.0)).unwrap(); // A1
+        s.append_op(put_value(0, 3, 0, 8.0)).unwrap(); // A4
+        s.append_op(Op::BatchCommit {
+            ops: vec![Op::DeleteRows {
+                sheet: 0,
+                start: 0,
+                end: ql_types::MAX_ROW + 1, // end > MAX_ROW -> rejected by storage
+            }],
+        })
+        .unwrap();
+        // Both cells survive at their original positions (no shift / no drop).
+        assert_eq!(snapshot_value_at(&s, 0, 0, 0), Some(7.0));
+        assert_eq!(snapshot_value_at(&s, 0, 3, 0), Some(8.0));
+        assert_eq!(s.snapshot_cells(0).len(), 2);
+        // Column variant: end > MAX_COLUMN likewise leaves cells intact.
+        s.append_op(Op::BatchCommit {
+            ops: vec![Op::DeleteColumns {
+                sheet: 0,
+                start: 0,
+                end: ql_types::MAX_COLUMN + 1,
+            }],
+        })
+        .unwrap();
+        assert_eq!(snapshot_value_at(&s, 0, 0, 0), Some(7.0));
+        assert_eq!(s.snapshot_cells(0).len(), 2);
     }
 
     #[test]
@@ -9092,4 +9133,8 @@ mod tests {
             2,
             "post-restore writes stack atop preserved pre-tombstone cells"
         );
-        // Sorted (row, col) per snapshot_cells docstring cont
+        // Sorted (row, col) per snapshot_cells docstring contract.
+        assert_eq!(cells[0].0, (0, 0));
+        assert_eq!(cells[1].0, (5, 5));
+    }
+}
