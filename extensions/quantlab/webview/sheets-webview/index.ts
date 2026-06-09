@@ -41,7 +41,7 @@ import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { clampDisplayString, formatCellValue } from './cellRender';
 import { CanvasGridRenderer, type ActiveCell, type PublishedRange } from './canvasGrid';
 import { computeScrollBlitA1, diffSnapshotsA1, errorRowsFlippedA1, staleTintKeysA1, type ScrollState } from './gridBlitA1';
-import { planFill, planPaste, type GridClipboard } from './clipboardLogic';
+import { pasteAreaMismatch, planFill, planPaste, type GridClipboard } from './clipboardLogic';
 import {
 	COL_WIDTH,
 	HEADER_HEIGHT,
@@ -639,9 +639,11 @@ function computeFillPreview(source: SelectionRect, dragRow: number, dragCol: num
  * as ONE atomic `putCells` batch, then select the filled rect (Excel selects the result). No-op when the
  * preview did not extend past the source.
  */
-function applyFill(): void {
+// Returns true iff a fill was actually committed (a real extension). The caller suppresses the post-drag
+// click ONLY when true, so a no-op handle tap (no extension) still selects the clicked cell (Lane C).
+function applyFill(): boolean {
 	if (fullSnapshot === null || fillSource === null || fillPreview === null) {
-		return;
+		return false;
 	}
 	const src = fillSource;
 	const srcRows = src.maxRow - src.minRow + 1;
@@ -649,16 +651,16 @@ function applyFill(): void {
 	const fillRows = fillPreview.maxRow - src.minRow + 1;
 	const fillCols = fillPreview.maxCol - src.minCol + 1;
 	if (fillRows <= srcRows && fillCols <= srcCols) {
-		return; // no extension
+		return false; // no extension
 	}
 	const clip = readRectClipboard(src.minRow, src.minCol, srcRows, srcCols, false);
 	if (clip === null) {
 		showError('A cell in the fill source is too large to fill; nothing was filled.', 'transient');
-		return;
+		return false;
 	}
 	const cells = planFill(clip, fillRows, fillCols);
 	if (cells.length === 0) {
-		return;
+		return false;
 	}
 	const commitId = ++nextCommitId; // deep-audit MED: token this fill so its success ack can clear tints
 	recordPendingPutCellsAck(commitId, cells);
@@ -667,6 +669,7 @@ function applyFill(): void {
 	anchor = { row: src.minRow, col: src.minCol };
 	active = { row: fillPreview.maxRow, col: fillPreview.maxCol };
 	ensureActiveVisible();
+	return true;
 }
 
 /**
@@ -691,6 +694,12 @@ function pasteGridClipboard(): void {
 	const selLeft = sel === null ? active.col : sel.minCol;
 	const selRows = sel === null ? 1 : sel.maxRow - sel.minRow + 1;
 	const selCols = sel === null ? 1 : sel.maxCol - sel.minCol + 1;
+	// megaudit Lane C: refuse a size-mismatched paste (a multi-cell block into a LARGER selection that is not a
+	// whole multiple) instead of silently pasting a partial block (No-Fallbacks; Excel "areas not same size").
+	if (pasteAreaMismatch(gridClipboard, selRows, selCols)) {
+		showError('Cannot paste: the copy and paste areas are not the same size. Select a single cell, or a selection that is a whole multiple of the copied block.', 'transient');
+		return;
+	}
 	const cells = planPaste(gridClipboard, selTop, selLeft, selRows, selCols);
 	if (cells.length === 0) {
 		return;
@@ -1244,6 +1253,12 @@ function isOnFillHandle(ev: MouseEvent): boolean {
 // W-G fill handle: a pointer press on the handle starts a drag-to-fill (pointer events so setPointerCapture
 // keeps move/up firing if the pointer leaves the canvas). A press elsewhere is left to the click handler.
 canvasEl.addEventListener('pointerdown', ev => {
+	// megaudit Lane C: ignore a re-entrant pointerdown while a drag is already in flight (a second touch /
+	// stylus). It must not reset the suppress flag, restart the drag, or rebind `fillSource` to a different
+	// rect -- the first pointer owns the drag until its pointerup/pointercancel.
+	if (fillSource !== null) {
+		return;
+	}
 	// megaudit MED: clear any leftover suppress flag at the START of every interaction so it can never
 	// linger to swallow a later legitimate click (on platforms where preventDefault below already
 	// suppresses the drag's own synthetic click, the flag would otherwise never be consumed).
@@ -1263,6 +1278,16 @@ canvasEl.addEventListener('pointermove', ev => {
 	}
 	const hit = hitTestCanvas(ev);
 	if (hit === null) {
+		// megaudit Lane C: the pointer left the grid into a header/gutter band -- snap the preview back to the
+		// source so RELEASING here is a visible no-op (a cancel), not a commit of the last in-grid extent.
+		if (
+			fillPreview === null ||
+			fillPreview.minRow !== fillSource.minRow || fillPreview.maxRow !== fillSource.maxRow ||
+			fillPreview.minCol !== fillSource.minCol || fillPreview.maxCol !== fillSource.maxCol
+		) {
+			fillPreview = fillSource;
+			redraw();
+		}
 		return;
 	}
 	const next = computeFillPreview(fillSource, hit.row, hit.col);
@@ -1276,10 +1301,12 @@ canvasEl.addEventListener('pointerup', ev => {
 		return;
 	}
 	canvasEl.releasePointerCapture?.(ev.pointerId);
-	applyFill();
+	const filled = applyFill();
 	fillSource = null;
 	fillPreview = null;
-	fillSuppressClick = true; // the click that follows this pointerup must not re-select
+	// Lane C: suppress the synthesized post-drag click ONLY when a fill actually committed; a no-op handle
+	// tap must let its click through to select the cell.
+	fillSuppressClick = filled;
 	redraw();
 });
 // megaudit MED: if the drag is CANCELED (pointercancel -- a touch/pen hijack, a system overlay), there is
@@ -1403,6 +1430,13 @@ document.addEventListener('keydown', ev => {
 	}
 	if (editState !== null) {
 		return; // the editor has its own handler
+	}
+	// megaudit Lane C: ignore document shortcuts (undo/redo, copy/cut/paste, nav, type-to-edit) WHILE a
+	// fill-handle drag is in flight. A Ctrl+X mid-drag would replace the clipboard and silently discard a
+	// pending CUT; arrow/nav keys would move the selection under the drag. The drag owns input until
+	// pointerup/pointercancel clears `fillSource`.
+	if (fillSource !== null) {
+		return;
 	}
 	// Audit MED-1: ignore IME composition / dead-key keystrokes (keyCode 229 or `isComposing`). Without
 	// this, the FIRST composition keystroke would open the editor pre-filled with a raw intermediate char

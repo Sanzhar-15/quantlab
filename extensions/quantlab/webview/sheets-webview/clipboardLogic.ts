@@ -52,11 +52,17 @@ function retargetRawInput(rawInput: string, dRow: number, dCol: number): string 
  * writes for a `putCells` batch; the caller posts them (the host validates extent + applies them
  * atomically). Empty results are possible only for a degenerate clipboard (0 cells).
  *
- * Cases (Excel-faithful for v1):
- * - a SINGLE copied cell into a MULTI-cell selection -> fill every selected cell, each with the copied
- *   content offset by that cell's distance from the source (a relative formula increments down/across);
- * - otherwise -> paste the block once, top-left at the selection origin, every cell offset by the SAME
- *   (selTop-top, selLeft-left);
+ * Cases (Excel-faithful):
+ * - a SINGLE copied cell into a MULTI-cell selection (COPY only) -> fill every selected cell, each with the
+ *   copied content offset by that cell's distance from the source (a relative formula increments down/across);
+ * - a multi-cell COPY into a selection that is an EXACT MULTIPLE of the block (and larger) -> TILE the block
+ *   to fill the selection, each tile offset by its own (selectionOrigin + tileOffset - source);
+ * - otherwise (equal/smaller selection, a single target cell, or any CUT) -> paste the block once, top-left
+ *   at the selection origin, every cell offset by the SAME (selTop-top, selLeft-left). A CUT is a MOVE: the
+ *   selection size is ignored (it always lands once at the origin), never filled or tiled.
+ * - a multi-cell COPY into a LARGER selection that is NOT an exact multiple is a size mismatch: the caller
+ *   must check {@link pasteAreaMismatch} and refuse loudly BEFORE calling this (Excel "areas not the same
+ *   size"); No-Fallbacks -- never silently paste a partial block.
  * - `isCut` -> additionally clear each source cell the paste did not overwrite (move semantics); a source
  *   cell that is also a target keeps the pasted value (no clear), so no cell is written twice (the host
  *   batch rejects same-cell conflicts).
@@ -71,7 +77,7 @@ export function planPaste(
 	const planned: PlannedCell[] = [];
 	const written = new Set<string>();
 	const single = clip.rows === 1 && clip.cols === 1;
-	if (single && (selRows > 1 || selCols > 1)) {
+	if (single && !clip.isCut && (selRows > 1 || selCols > 1)) {
 		const src = clip.cells[0][0].rawInput;
 		for (let r = 0; r < selRows; r += 1) {
 			for (let c = 0; c < selCols; c += 1) {
@@ -82,14 +88,25 @@ export function planPaste(
 			}
 		}
 	} else {
-		const dRow = selTop - clip.top;
-		const dCol = selLeft - clip.left;
-		for (let i = 0; i < clip.rows; i += 1) {
-			for (let j = 0; j < clip.cols; j += 1) {
-				const tr = selTop + i;
-				const tc = selLeft + j;
-				planned.push({ row: tr, col: tc, rawInput: retargetRawInput(clip.cells[i][j].rawInput, dRow, dCol) });
-				written.add(tr + ',' + tc);
+		// TILE a COPY across an exact-multiple, larger selection (each axis independently); otherwise a single
+		// tile (= paste once at the origin). A CUT is always a single tile (move semantics, selection ignored).
+		const tile = !clip.isCut;
+		const tilesDown = tile && selRows > clip.rows && selRows % clip.rows === 0 ? selRows / clip.rows : 1;
+		const tilesRight = tile && selCols > clip.cols && selCols % clip.cols === 0 ? selCols / clip.cols : 1;
+		for (let td = 0; td < tilesDown; td += 1) {
+			for (let tc2 = 0; tc2 < tilesRight; tc2 += 1) {
+				const baseRow = selTop + td * clip.rows;
+				const baseCol = selLeft + tc2 * clip.cols;
+				const dRow = baseRow - clip.top;
+				const dCol = baseCol - clip.left;
+				for (let i = 0; i < clip.rows; i += 1) {
+					for (let j = 0; j < clip.cols; j += 1) {
+						const tr = baseRow + i;
+						const tc = baseCol + j;
+						planned.push({ row: tr, col: tc, rawInput: retargetRawInput(clip.cells[i][j].rawInput, dRow, dCol) });
+						written.add(tr + ',' + tc);
+					}
+				}
 			}
 		}
 	}
@@ -107,6 +124,32 @@ export function planPaste(
 		}
 	}
 	return planned;
+}
+
+/**
+ * True when pasting `clip` into a `selRows` x `selCols` selection is a size MISMATCH that must be refused
+ * loudly (Excel: "The copy and paste areas are not the same size"). This is exactly the case where a
+ * multi-cell COPY is pasted into a selection that is LARGER in some axis but NOT an exact multiple of the
+ * block, so it can neither tile cleanly nor be a single block paste. A CUT (move -- selection ignored), a
+ * single-cell clip (fills any selection), and a selection that fits the block (<= in both axes, or an exact
+ * multiple) are all NOT mismatches. The caller checks this BEFORE {@link planPaste} and shows a visible error
+ * instead of silently pasting a partial block (No-Fallbacks).
+ */
+export function pasteAreaMismatch(clip: GridClipboard, selRows: number, selCols: number): boolean {
+	if (clip.isCut) {
+		return false; // a CUT is a move: it always lands once at the origin, selection size ignored
+	}
+	if (clip.rows === 1 && clip.cols === 1) {
+		return false; // a single copied cell fills any selection
+	}
+	const largerR = selRows > clip.rows;
+	const largerC = selCols > clip.cols;
+	if (!largerR && !largerC) {
+		return false; // selection fits within the block in both axes -> paste once at the origin
+	}
+	const exactR = selRows % clip.rows === 0;
+	const exactC = selCols % clip.cols === 0;
+	return !(exactR && exactC); // larger in some axis but not an exact tiling -> mismatch
 }
 
 /**

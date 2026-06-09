@@ -9,7 +9,7 @@
 
 import * as assert from 'assert';
 
-import { planFill, planPaste, type GridClipboard } from '../webview/sheets-webview/clipboardLogic';
+import { pasteAreaMismatch, planFill, planPaste, type GridClipboard } from '../webview/sheets-webview/clipboardLogic';
 
 function clip(top: number, left: number, cells: string[][], isCut = false): GridClipboard {
 	return {
@@ -144,5 +144,51 @@ suite('FE-1.5 clipboardLogic -- planFill (drag-to-fill, copy semantics)', () => 
 			{ row: 1, col: 0, rawInput: '=$A$1' },
 			{ row: 2, col: 0, rawInput: '=$A$1' },
 		]);
+	});
+
+	test('Lane C: planFill uses the source origin (NOT 0,0) for target rows + ref offset', () => {
+		// Source at (5,3): a single formula =A1 filled down 2 rows must target rows 6,7 (clip.top+r), and the
+		// ref offset is target-minus-source, so =A1 stays =A1 at the repeat cell (same col, +0 rel within tile).
+		const c = clip(5, 3, [['=B6']]); // =B6 is the cell to the right of the source's own position-ish
+		const out = planFill(c, 3, 1); // extend rows 6,7 (origin row 5)
+		assert.deepStrictEqual(out, [
+			{ row: 6, col: 3, rawInput: '=B7' }, // =B6 repeated +1 row
+			{ row: 7, col: 3, rawInput: '=B8' }, // =B6 repeated +2 rows
+		]);
+	});
+});
+
+suite('FE-1.5 clipboardLogic -- planPaste tiling + pasteAreaMismatch (Lane C)', () => {
+	test('a multi-cell COPY tiles across a selection that is an exact multiple', () => {
+		// Copy A1:B2 = [[=A1, 5],[7, =B2]] at (0,0); paste into a 4x2 selection (2 tiles down).
+		const c = clip(0, 0, [['=A1', '5'], ['7', '=B2']]);
+		const out = planPaste(c, 0, 0, 4, 2);
+		assert.deepStrictEqual(out, [
+			{ row: 0, col: 0, rawInput: '=A1' }, { row: 0, col: 1, rawInput: '5' },
+			{ row: 1, col: 0, rawInput: '7' }, { row: 1, col: 1, rawInput: '=B2' },
+			{ row: 2, col: 0, rawInput: '=A3' }, { row: 2, col: 1, rawInput: '5' }, // tile 2 (offset +2 rows): =A1 -> =A3
+			{ row: 3, col: 0, rawInput: '7' }, { row: 3, col: 1, rawInput: '=B4' }, // =B2 -> =B4
+		]);
+	});
+
+	test('a CUT never tiles (move = paste once at the origin), selection size ignored', () => {
+		const c = clip(0, 0, [['=A1', '5'], ['7', '8']], true);
+		const out = planPaste(c, 0, 0, 4, 2); // a 4x2 selection
+		// pasted once at the origin; sources are all overwritten by the paste -> no extra cut-clears
+		assert.deepStrictEqual(out, [
+			{ row: 0, col: 0, rawInput: '=A1' }, { row: 0, col: 1, rawInput: '5' },
+			{ row: 1, col: 0, rawInput: '7' }, { row: 1, col: 1, rawInput: '8' },
+		]);
+	});
+
+	test('pasteAreaMismatch: larger non-multiple COPY = mismatch; multiples / fits / single / cut = ok', () => {
+		const block = clip(0, 0, [['1', '2'], ['3', '4']]); // 2x2 COPY
+		assert.strictEqual(pasteAreaMismatch(block, 3, 2), true, '3x2 is larger but not a multiple of 2 rows');
+		assert.strictEqual(pasteAreaMismatch(block, 2, 3), true, '2x3 is larger but not a multiple of 2 cols');
+		assert.strictEqual(pasteAreaMismatch(block, 4, 2), false, '4x2 is an exact multiple -> tile');
+		assert.strictEqual(pasteAreaMismatch(block, 2, 2), false, 'equal size -> paste once');
+		assert.strictEqual(pasteAreaMismatch(block, 1, 1), false, 'single target cell -> paste once');
+		assert.strictEqual(pasteAreaMismatch(clip(0, 0, [['x']]), 5, 5), false, 'a single copied cell fills any selection');
+		assert.strictEqual(pasteAreaMismatch(clip(0, 0, [['1', '2'], ['3', '4']], true), 3, 2), false, 'a CUT is a move -> never a mismatch');
 	});
 });

@@ -118,6 +118,13 @@ suite('FE-1.5 a1FormulaRefs -- translateFormulaRefs', () => {
 		assert.strictEqual(translateFormulaRefs('=Data.2024!B5', 2, 0), '=Data.2024!B7');
 	});
 
+	test('Lane C: a #REF! error literal is preserved verbatim across an offset (re-copy identity)', () => {
+		// When a ref overflows it becomes `#REF!`; re-copying that cell must NOT mangle it. `#` is copied
+		// verbatim and `REF` is consumed as a sheet-name-shaped run before `!`, so the whole token round-trips.
+		assert.strictEqual(translateFormulaRefs('=#REF!', 1, 0), '=#REF!');
+		assert.strictEqual(translateFormulaRefs('=A1+#REF!', 1, 0), '=A2+#REF!', 'a real ref beside #REF! still moves');
+	});
+
 	test('megaudit: bottom-edge overflow (past MAX_ROWS) is #REF!', () => {
 		assert.strictEqual(translateFormulaRefs('=A1048576', 1, 0), '=#REF!');
 		// An absolute row at the max never overflows under an offset.
