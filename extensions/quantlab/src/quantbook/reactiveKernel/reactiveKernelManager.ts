@@ -42,6 +42,13 @@ export class ReactiveKernelManager<S = object> {
 	// a kernel that is still starting -- the HIGH-fold for the startup/dispose race.
 	private readonly starting = new Map<S, { client: ReactiveKernelClientLike; promise: Promise<ReactiveKernelClientLike> }>();
 
+	// FE-5 (W4 product shell): observers (e.g. the Live-Python sidebar) notified whenever the set of
+	// live kernels OR a kernel's published variables change. The manager fires this on a successful
+	// start and on a client removal (disposeSession / unexpected close); the publish-frame change is
+	// pumped in by the command layer via notifyChanged() (it owns the client's onChanged callback).
+	// vscode-free (a plain listener array + dispose handle), mirroring the manager's DI style.
+	private readonly changeListeners: Array<() => void> = [];
+
 	/**
 	 * @param assertTrusted throws (gate-first) when the workspace is not trusted to run kernel code.
 	 * @param clientFactory builds (does NOT start) a client bound to `session`.
@@ -56,6 +63,44 @@ export class ReactiveKernelManager<S = object> {
 		private readonly clientFactory: (session: S) => ReactiveKernelClientLike,
 		private readonly onClientRemoved?: (session: S) => void,
 	) { }
+
+	/**
+	 * **FE-5 (W4 product shell)** -- subscribe to kernel-set / published-variable changes (the
+	 * Live-Python sidebar's refresh signal). Fired on a successful {@link start}, on a client removal
+	 * ({@link disposeSession} / unexpected close), and whenever the command layer calls
+	 * {@link notifyChanged} for a publish frame. Returns a disposable that unregisters the listener.
+	 */
+	onChange(listener: () => void): { dispose(): void } {
+		this.changeListeners.push(listener);
+		return {
+			dispose: (): void => {
+				const i = this.changeListeners.indexOf(listener);
+				if (i >= 0) {
+					this.changeListeners.splice(i, 1);
+				}
+			},
+		};
+	}
+
+	/**
+	 * **FE-5** -- pump a change notification to {@link onChange} observers. The command layer calls this
+	 * from the client's `onChanged` callback (a published-variable frame landed/retracted) -- the manager
+	 * cannot observe that itself (the publish-tracking store lives on the client and the change callback
+	 * is wired by the command shell). Lifecycle changes (start/remove) fire internally.
+	 */
+	notifyChanged(): void {
+		this.fireChanged();
+	}
+
+	private fireChanged(): void {
+		for (const listener of this.changeListeners) {
+			try {
+				listener();
+			} catch (err) {
+				console.error('[reactiveKernelManager] onChange listener threw:', err);
+			}
+		}
+	}
 
 	/** Start (or reuse) the kernel for `session`. Trust-gated; rejects loud if spawn/bootstrap fails. */
 	async start(session: S): Promise<void> {
@@ -102,6 +147,9 @@ export class ReactiveKernelManager<S = object> {
 			// (dispose() may fire the client's onClose, but the ensure() listener's `clients.get === client`
 			// guard is already false here, so onClientRemoved fires exactly once -- from this call.)
 			this.onClientRemoved?.(session);
+			// FE-5: the live-kernel set shrank -> the Live-Python sidebar re-reads it (the focused
+			// workbook may now have no kernel -> explicit empty state).
+			this.fireChanged();
 		}
 	}
 
@@ -145,6 +193,8 @@ export class ReactiveKernelManager<S = object> {
 						// panels so orphaned bound-cell badges clear. The guard above ensures this does NOT
 						// double-fire with disposeSession (which deletes first, so this branch is skipped then).
 						this.onClientRemoved?.(session);
+						// FE-5: a kernel was lost -> the Live-Python sidebar re-reads the kernel set.
+						this.fireChanged();
 					}
 				});
 				await client.start();
@@ -154,6 +204,9 @@ export class ReactiveKernelManager<S = object> {
 					throw new Error('[kernel_disposed] reactive kernel start was cancelled by disposal');
 				}
 				this.clients.set(session, client);
+				// FE-5: a new kernel is live -> the Live-Python sidebar shows it (status "running",
+				// published variables as they land).
+				this.fireChanged();
 				resolveStart(client);
 			} catch (e) {
 				rejectStart(e);

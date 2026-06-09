@@ -316,6 +316,55 @@ suite('ReactiveKernelManager', () => {
 		assert.deepStrictEqual(mgr.publishedCellsForSheet({}, 0), [], 'an unknown session has no kernel');
 	});
 
+	test('FE-5 onChange fires on start, dispose, unexpected close, and notifyChanged', async () => {
+		let changes = 0;
+		const made: FakeClient[] = [];
+		const mgr = new ReactiveKernelManager<object>(
+			() => {},
+			() => {
+				const c = new FakeClient();
+				made.push(c);
+				return c;
+			},
+		);
+		const sub = mgr.onChange(() => {
+			changes++;
+		});
+		const a = {};
+		await mgr.start(a); // a kernel came up
+		assert.strictEqual(changes, 1, 'a successful start fires onChange');
+		mgr.notifyChanged(); // a publish frame landed (pumped by the command layer)
+		assert.strictEqual(changes, 2, 'notifyChanged pumps a change');
+		await mgr.disposeSession(a); // a kernel was stopped
+		assert.strictEqual(changes, 3, 'disposeSession of a live kernel fires onChange');
+
+		const b = {};
+		await mgr.start(b);
+		assert.strictEqual(changes, 4, 'a second start fires onChange');
+		made[1].simulateClose(); // crash/EOF
+		assert.strictEqual(changes, 5, 'an unexpected close fires onChange');
+
+		sub.dispose();
+		await mgr.start({}); // no longer observed
+		assert.strictEqual(changes, 5, 'a disposed onChange subscription stops receiving');
+	});
+
+	test('FE-5 onChange does NOT fire for a no-op disposeSession (no kernel) or a failed start', async () => {
+		let changes = 0;
+		const mgr = new ReactiveKernelManager<object>(
+			() => {},
+			() => new FakeClient(true /* failStart */),
+		);
+		mgr.onChange(() => {
+			changes++;
+		});
+		const a = {};
+		await mgr.disposeSession(a); // nothing registered -> no change
+		assert.strictEqual(changes, 0, 'disposing a session with no kernel fires nothing');
+		await assert.rejects(() => mgr.start(a), /spawn failed/);
+		assert.strictEqual(changes, 0, 'a failed start (never registered) fires no change');
+	});
+
 	test('onClientRemoved fires once on disposeSession and on an unexpected close (badge cleanup hook)', async () => {
 		const removed: object[] = [];
 		const made: FakeClient[] = [];

@@ -701,6 +701,11 @@
           "id": "quantlab-settings",
           "title": "%viewContainer.settings.title%",
           "icon": "media/icons/settings.svg"
+        },
+        {
+          "id": "quantlab-quantbook",
+          "title": "%viewContainer.quantbook.title%",
+          "icon": "media/icons/quantbook.svg"
         }
       ]
     },
@@ -734,6 +739,13 @@
         {
           "id": "quantlab.settingsView",
           "name": "%view.settings.title%"
+        }
+      ],
+      "quantlab-quantbook": [
+        {
+          "id": "quantlab.livePythonView",
+          "name": "%view.livePython.title%",
+          "when": "quantbook.hasOpenGrid"
         }
       ]
     },
