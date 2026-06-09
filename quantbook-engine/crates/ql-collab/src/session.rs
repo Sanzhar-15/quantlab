@@ -1454,10 +1454,38 @@ impl CollabSession {
                 key: (*sheet, *row, *col),
                 format: id.map(|wire| wire.to_storage()),
             }),
+            // **Codex re-audit round-3 closure (megaudit fold) — batch
+            // atomicity.** MED-1 made REPLAY apply a BatchCommit all-or-
+            // nothing (stage on a clone, swap only on full success). The cache
+            // walker must mirror that: if any inner op would ABORT the replay
+            // batch, the cache must apply NONE of the batch's effects —
+            // otherwise the surviving inner effects diverge from the (rolled-
+            // back) Workbook. The walker has no Workbook, so it can only detect
+            // the STATICALLY-decidable replay rejects (malformed structural
+            // ops, off-grid cell coords) via `op_statically_aborts_batch`;
+            // workbook-state rejects (invalid/tombstoned sheet, table split,
+            // duplicate name, ...) are NOT detectable here and are handled at
+            // the canonical read boundary — `workbookSnapshot` /
+            // `workbookSnapshotDelta` call `rebuild_workbook` first and FAIL
+            // CLOSED on a rejecting log before reading the cache. (A residual
+            // gap on the legacy cache-only napi reads `exportSnapshot` /
+            // `listSheets` for hostile merged logs is flagged for the
+            // conductor; out of scope for the W3 structural fix.)
+            //
+            // Locally-appended batches are pre-flighted on a workbook clone by
+            // the napi producer, so this only bites a corrupt / hostile merged
+            // op-log; the buffer-and-conditionally-extend keeps the common case
+            // a single Vec extend.
             Op::BatchCommit { ops } => {
-                for inner in ops {
-                    Self::collect_cache_effects(inner, out);
+                if ops.iter().any(Self::op_statically_aborts_batch) {
+                    // The whole batch would roll back at replay → emit nothing.
+                    return;
                 }
+                let mut batch_effects: Vec<CacheEffect> = Vec::new();
+                for inner in ops {
+                    Self::collect_cache_effects(inner, &mut batch_effects);
+                }
+                out.extend(batch_effects);
             }
             // **V3.5.0.X audit-closure Opus-H1 extension (2026-05-24)**:
             // sheet tombstone effect.  Pre-closure, Op::RemoveSheet was
@@ -2848,6 +2876,41 @@ impl CollabSession {
             | Op::InsertColumns { .. }
             | Op::DeleteColumns { .. } => true,
             Op::BatchCommit { ops } => ops.iter().any(Self::op_is_structural),
+            _ => false,
+        }
+    }
+
+    /// **Codex re-audit round-3 closure (megaudit fold)**: true iff `op` would
+    /// abort a replay `BatchCommit` by a check the cache walker can make WITHOUT
+    /// a `Workbook` — i.e. a STATICALLY-decidable replay reject. Used by the
+    /// `collect_cache_effects` `BatchCommit` arm to mirror MED-1's all-or-
+    /// nothing replay semantics: if any inner op statically aborts, the cache
+    /// emits NO effects for the batch (matching the rolled-back Workbook).
+    ///
+    /// Covers the storage layer's workbook-free `StructuralEditError` /
+    /// out-of-range rejects:
+    /// - delete: `start > end` OR `end > axis_max`
+    /// - insert: `count == 0` OR `at > axis_max`
+    /// - cell op: `row > MAX_ROW` OR `col > MAX_COLUMN`
+    ///
+    /// Workbook-STATE rejects (invalid / tombstoned sheet, table split, name
+    /// collision, off-grid table overflow) are NOT decidable here; the
+    /// canonical napi read path (`workbookSnapshot`) rebuilds the Workbook
+    /// first and fails closed on those, so the diverged cache is never read.
+    fn op_statically_aborts_batch(op: &Op) -> bool {
+        match op {
+            Op::DeleteRows { start, end, .. } => *start > *end || *end > ql_types::MAX_ROW,
+            Op::DeleteColumns { start, end, .. } => *start > *end || *end > ql_types::MAX_COLUMN,
+            Op::InsertRows { at, count, .. } => *count == 0 || *at > ql_types::MAX_ROW,
+            Op::InsertColumns { at, count, .. } => *count == 0 || *at > ql_types::MAX_COLUMN,
+            Op::PutValue { row, col, .. }
+            | Op::PutFormula { row, col, .. }
+            | Op::ClearFormula { row, col, .. }
+            | Op::ClearValue { row, col, .. }
+            | Op::SetCellFormat { row, col, .. } => {
+                *row > ql_types::MAX_ROW || *col > ql_types::MAX_COLUMN
+            }
+            Op::BatchCommit { ops } => ops.iter().any(Self::op_statically_aborts_batch),
             _ => false,
         }
     }
@@ -5000,6 +5063,42 @@ mod tests {
         assert_eq!(snapshot_value_at(&s, 0, 0, 0), Some(9.0));
         assert_eq!(s.snapshot_cells(0).len(), 1);
         // The full-rebuild path agrees (also skips the malformed delete).
+        let bytes = s.export_bytes().unwrap();
+        let reborn = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+        assert_eq!(reborn.snapshot_cells(0), s.snapshot_cells(0));
+    }
+
+    #[test]
+    fn batch_with_aborting_inner_op_applies_no_effects_to_cache() {
+        // **Codex re-audit round-3 fold — batch atomicity.** A BatchCommit
+        // whose 2nd inner op would ABORT the replay batch (a malformed delete)
+        // must apply NONE of the batch's effects to the cache, mirroring MED-1's
+        // all-or-nothing replay (clone discarded). Pre-fix the surviving
+        // PutValue(A1=9) landed in the cache while the Workbook rolled the whole
+        // batch back → divergence.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap(); // A1 = 1 (top-level, applies)
+        s.append_op(Op::BatchCommit {
+            ops: vec![
+                put_value(0, 5, 0, 9.0), // would write A6 = 9 ...
+                Op::DeleteRows {
+                    sheet: 0,
+                    start: 10,
+                    end: 5, // ... but this malformed delete aborts the batch
+                },
+            ],
+        })
+        .unwrap();
+        // The in-batch A6 write must NOT have landed (whole batch dropped).
+        assert_eq!(
+            snapshot_value_at(&s, 0, 5, 0),
+            None,
+            "aborted batch must apply nothing"
+        );
+        // The top-level A1 write survives (it is not part of the batch).
+        assert_eq!(snapshot_value_at(&s, 0, 0, 0), Some(1.0));
+        assert_eq!(s.snapshot_cells(0).len(), 1);
+        // Append/rebuild equivalence holds for the aborted batch too.
         let bytes = s.export_bytes().unwrap();
         let reborn = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
         assert_eq!(reborn.snapshot_cells(0), s.snapshot_cells(0));
