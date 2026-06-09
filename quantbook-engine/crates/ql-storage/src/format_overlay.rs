@@ -81,6 +81,29 @@ impl CellFormatOverlay {
     pub fn count_refs(&self, id: FormatId) -> usize {
         self.entries.values().filter(|fid| **fid == id).count()
     }
+
+    /// **W3 (insert/delete rows & columns):** re-key every entry by `remap`
+    /// applied to the given axis. `remap(coord)` returns the new coordinate,
+    /// or `None` if the cell was deleted (its entry is DROPPED — no orphans).
+    /// `is_row = true` re-keys the row coordinate; `false` re-keys the column.
+    /// Rebuilds the map so collisions resolve to last-writer (which cannot
+    /// happen for a valid shift, since the remap is injective on survivors).
+    pub fn shift_axis(&mut self, is_row: bool, remap: impl Fn(u32) -> Option<u32>) {
+        let mut next: HashMap<(RowId, ColId), FormatId> =
+            HashMap::with_capacity(self.entries.len());
+        for ((row, col), id) in self.entries.iter() {
+            let new_key = if is_row {
+                remap(*row).map(|r| (r, *col))
+            } else {
+                remap(*col).map(|c| (*row, c))
+            };
+            if let Some(key) = new_key {
+                next.insert(key, *id);
+            }
+            // None → cell deleted → entry dropped (no orphan).
+        }
+        self.entries = next;
+    }
 }
 
 #[cfg(test)]

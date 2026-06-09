@@ -39,6 +39,55 @@ use crate::overlay::SparseOverlay;
 /// Default chunk size in rows. Override via `QBOOK_CHUNK_ROWS` env var.
 pub const DEFAULT_CHUNK_ROWS: u32 = 16_384;
 
+/// **W3 (insert/delete rows & columns):** a structural shift of one axis,
+/// expressed in storage-local terms (no dependency on `ql-formula-syntax`).
+/// Coordinates are 0-indexed. `Delete` is INCLUSIVE `[start, end]`.
+///
+/// This drives both the per-column row shift ([`ColumnStore::shift_rows`])
+/// and the sheet-level column splice ([`crate::Sheet::shift_columns`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AxisShift {
+    /// Insert `count` new lines at index `at`; lines `>= at` move up.
+    Insert { at: u32, count: u32 },
+    /// Delete the inclusive block `[start, end]`; lines `> end` move down.
+    Delete { start: u32, end: u32 },
+}
+
+impl AxisShift {
+    /// Public coordinate map (re-key helper for callers like the format
+    /// overlay + metadata layer). Delegates to [`Self::map`].
+    pub fn map_public(self, coord: u32, axis_max: u32) -> Option<u32> {
+        self.map(coord, axis_max)
+    }
+
+    /// Map a 0-indexed coordinate. `None` if the coordinate is deleted or
+    /// overflows past `axis_max` (the cell falls off the sheet).
+    fn map(self, coord: u32, axis_max: u32) -> Option<u32> {
+        match self {
+            AxisShift::Insert { at, count } => {
+                if coord < at {
+                    Some(coord)
+                } else {
+                    match coord.checked_add(count) {
+                        Some(c) if c <= axis_max => Some(c),
+                        _ => None,
+                    }
+                }
+            }
+            AxisShift::Delete { start, end } => {
+                debug_assert!(start <= end, "AxisShift::Delete requires start <= end");
+                if coord < start {
+                    Some(coord)
+                } else if coord <= end {
+                    None
+                } else {
+                    Some(coord - (end - start + 1))
+                }
+            }
+        }
+    }
+}
+
 /// Resolve a chunk-rows value from an optional env-var string.
 ///
 /// `None` (var unset) → `DEFAULT_CHUNK_ROWS`.
@@ -450,6 +499,73 @@ impl ColumnStore {
             }
         }
         max_row
+    }
+
+    /// **W3 (insert/delete rows & columns):** structurally shift every cell in
+    /// this column by `shift` along the ROW axis. Cells inside a deleted block
+    /// (or pushed past `MAX_ROW` by an insert) are dropped; surviving cells
+    /// move to their new row. The user-vs-computed lane distinction is
+    /// preserved so a later recompute regenerates formula outputs correctly.
+    ///
+    /// Implementation: snapshot every populated cell (base-non-null + both
+    /// overlays) as `(row, value, is_computed)`, remap rows, and rebuild the
+    /// column from scratch (base reset to all-null; values replayed into the
+    /// overlays via `put` / `put_computed`). This sidesteps in-place Arrow
+    /// chunk surgery and naturally handles the Float64-only base limitation
+    /// (richer values already live in the overlays).
+    pub fn shift_rows(&mut self, shift: AxisShift) {
+        // 1. Snapshot every populated cell, preserving the lane.
+        //    A base-non-null cell not shadowed by an overlay is a user
+        //    literal (the loader path). A user-overlay entry is a user
+        //    literal. A computed-overlay entry is a formula output.
+        let mut user_cells: Vec<(RowId, Value)> = Vec::new();
+        let mut computed_cells: Vec<(RowId, Value)> = Vec::new();
+        for (chunk_idx, base, user, computed) in self.iter_chunks() {
+            let chunk_base = chunk_idx as RowId * self.chunk_rows;
+            let base_arr = base
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("ColumnStore::shift_rows: Phase 0 base must be Float64Array");
+            // Base cells where no overlay shadows them.
+            for idx in 0..base_arr.len() {
+                let rel = idx as RowId;
+                if user.get(rel).is_some() || computed.get(rel).is_some() {
+                    continue;
+                }
+                if base_arr.is_null(idx) {
+                    continue;
+                }
+                user_cells.push((chunk_base + rel, Value::number(base_arr.value(idx))));
+            }
+            // User overlay (wins the cascade; Blank entries are skipped — a
+            // Blank overlay reads as empty, so it carries no value to move).
+            for (rel, v) in user.iter() {
+                if !v.is_blank() {
+                    user_cells.push((chunk_base + rel, v.clone()));
+                }
+            }
+            // Computed overlay where the user lane does not shadow it.
+            for (rel, v) in computed.iter() {
+                if user.get(rel).is_none() && !v.is_blank() {
+                    computed_cells.push((chunk_base + rel, v.clone()));
+                }
+            }
+        }
+        // 2. Reset the column to a fresh empty state (same chunk size).
+        self.base_chunks.clear();
+        self.user_overlays.clear();
+        self.computed_overlays.clear();
+        // 3. Replay each surviving cell at its remapped row.
+        for (row, value) in user_cells {
+            if let Some(new_row) = shift.map(row, MAX_ROW) {
+                self.put(new_row, value);
+            }
+        }
+        for (row, value) in computed_cells {
+            if let Some(new_row) = shift.map(row, MAX_ROW) {
+                self.put_computed(new_row, value);
+            }
+        }
     }
 
     /// Locate `(chunk_idx, rel_row)` for an absolute `row`.

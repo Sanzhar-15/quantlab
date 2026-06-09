@@ -295,6 +295,100 @@ impl Sheet {
             self.bounds.row_extent = row_extent;
         }
     }
+
+    /// **W3 (insert/delete rows & columns):** structurally shift every cell in
+    /// every column along the ROW axis, then re-key the format overlay's row
+    /// coordinate and recompute bounds. Cells inside a deleted block (or
+    /// pushed past `MAX_ROW`) are dropped. The user/computed lane distinction
+    /// is preserved (see [`ColumnStore::shift_rows`]).
+    ///
+    /// Bounds are recomputed from the post-shift data: unlike `put` (which
+    /// grows-and-never-shrinks), a structural delete legitimately shrinks the
+    /// sheet's row extent. Column count (and thus `col_extent`) is unchanged.
+    pub fn shift_rows(&mut self, shift: crate::column::AxisShift) {
+        for col in &mut self.columns {
+            col.shift_rows(shift);
+        }
+        self.format_overlay
+            .shift_axis(true, |r| shift.map_public(r, ql_types::MAX_ROW));
+        self.recompute_bounds();
+    }
+
+    /// **W3 (insert/delete rows & columns):** structurally shift columns along
+    /// the COL axis by splicing the `Vec<ColumnStore>`, then re-key the format
+    /// overlay's column coordinate and recompute bounds.
+    ///
+    /// - Insert: splice `count` fresh empty columns in at index `at`. Columns
+    ///   pushed past `MAX_COLUMN` are dropped (they fall off the sheet).
+    /// - Delete: remove the inclusive `[start, end]` column block.
+    pub fn shift_columns(&mut self, shift: crate::column::AxisShift) {
+        match shift {
+            crate::column::AxisShift::Insert { at, count } => {
+                let at = at as usize;
+                let max_cols = ql_types::MAX_COLUMN as usize + 1;
+                // **Codex L2 MED-4 closure:** cap the number of fresh columns
+                // we physically splice so a huge `count` (e.g. u32::MAX) can't
+                // OOM before the truncate. We never need more physical columns
+                // than fit on the sheet from `at`.
+                let count = (count as usize).min(max_cols.saturating_sub(at));
+                if at <= self.columns.len() {
+                    let fresh = (0..count).map(|_| ColumnStore::with_chunk_rows(self.chunk_rows));
+                    self.columns.splice(at..at, fresh);
+                }
+                // Drop any existing column pushed past MAX_COLUMN.
+                if self.columns.len() > max_cols {
+                    self.columns.truncate(max_cols);
+                }
+            }
+            crate::column::AxisShift::Delete { start, end } => {
+                let start = start as usize;
+                let end = end as usize;
+                if start < self.columns.len() {
+                    let stop = (end + 1).min(self.columns.len());
+                    self.columns.drain(start..stop);
+                }
+            }
+        }
+        self.format_overlay
+            .shift_axis(false, |c| shift.map_public(c, ql_types::MAX_COLUMN));
+        self.recompute_bounds();
+    }
+
+    /// Recompute bounds from current column data. Used after a structural
+    /// shift, which (unlike `put`'s grow-and-never-shrink contract) may shrink
+    /// the extent — a row/column delete legitimately removes the bottom/right
+    /// of the used region.
+    ///
+    /// **Codex L2 LOW-5 note (intentional):** this computes the EFFECTIVE
+    /// VALUE extent (the same metric as [`Self::effective_value_bounds`]), not
+    /// the conservative "ever-touched" extent. After a structural edit there is
+    /// no meaningful "touched-but-blank" history to preserve — the shift
+    /// rebuilds the columns — so the value extent is the correct post-edit
+    /// bound for viewport sizing + the calcgraph. A cell that was `put(.., Blank)`
+    /// then shifted contributes nothing to the new extent, which is the
+    /// desired behavior for a structural edit.
+    fn recompute_bounds(&mut self) {
+        let mut max_row: Option<RowId> = None;
+        for col in &self.columns {
+            if let Some(r) = col.effective_max_row() {
+                max_row = Some(max_row.map_or(r, |m| m.max(r)));
+            }
+        }
+        let row_extent = max_row.map_or(0, |r| r + 1);
+        // Column extent: one past the last NON-empty column. A structural
+        // column delete can shrink this; an insert of empty columns does not
+        // grow the effective extent (empty trailing columns carry no data).
+        let mut col_extent: ColId = 0;
+        for (idx, col) in self.columns.iter().enumerate() {
+            if col.effective_max_row().is_some() {
+                col_extent = idx as ColId + 1;
+            }
+        }
+        self.bounds = Bounds {
+            row_extent,
+            col_extent,
+        };
+    }
 }
 
 #[cfg(test)]
@@ -473,7 +567,8 @@ mod tests {
     fn effective_value_bounds_ignores_format_only_cells() {
         // A format-bearing but value-blank cell is NOT a value cell.
         let mut s = Sheet::with_chunk_rows("S", 4);
-        s.format_overlay_mut().set(9, 9, crate::FormatId::Builtin(14));
+        s.format_overlay_mut()
+            .set(9, 9, crate::FormatId::Builtin(14));
         assert_eq!(s.effective_value_bounds(), Bounds::default());
     }
 
@@ -603,5 +698,119 @@ mod tests {
         let r2 = s2.scoped_names().lookup_ci("Rate");
         assert!(matches!(r1, Some(NamedTarget::Constant(Value::Number(n))) if n == 0.21));
         assert!(matches!(r2, Some(NamedTarget::Constant(Value::Number(n))) if n == 0.10));
+    }
+
+    // ========================================================================
+    // W3 (insert/delete rows & columns) — storage shift.
+    // ========================================================================
+
+    use crate::column::AxisShift;
+
+    #[test]
+    fn insert_rows_shifts_values_down() {
+        let mut s = Sheet::with_chunk_rows("S", 8);
+        s.put(2, 0, Value::Number(10.0)); // A3
+        s.put(5, 1, Value::Number(20.0)); // B6
+        s.put(0, 0, Value::Number(1.0)); // A1 (above insert point)
+        s.shift_rows(AxisShift::Insert { at: 1, count: 2 });
+        // A1 unchanged (above the insert point).
+        assert_eq!(s.read(0, 0), Value::Number(1.0));
+        // A3 (row 2) → row 4.
+        assert_eq!(s.read(4, 0), Value::Number(10.0));
+        assert_eq!(s.read(2, 0), Value::Blank);
+        // B6 (row 5) → row 7.
+        assert_eq!(s.read(7, 1), Value::Number(20.0));
+    }
+
+    #[test]
+    fn delete_rows_removes_and_shifts_up() {
+        let mut s = Sheet::with_chunk_rows("S", 8);
+        s.put(1, 0, Value::Number(2.0)); // A2 (index 1) — will be deleted
+        s.put(4, 0, Value::Number(5.0)); // A5 (index 4) — shifts up by 2
+        s.put(0, 0, Value::Number(1.0)); // A1 (index 0) — unchanged
+        s.shift_rows(AxisShift::Delete { start: 1, end: 2 }); // delete indices 1,2
+        assert_eq!(s.read(0, 0), Value::Number(1.0));
+        // A2 (index 1) gone; index 1 now reads blank.
+        assert_eq!(s.read(1, 0), Value::Blank);
+        // A5 (index 4) → index 2.
+        assert_eq!(s.read(2, 0), Value::Number(5.0));
+    }
+
+    #[test]
+    fn delete_rows_shift_math_exact() {
+        let mut s = Sheet::with_chunk_rows("S", 16);
+        s.put(9, 0, Value::Number(99.0)); // A10 (index 9)
+        s.shift_rows(AxisShift::Delete { start: 1, end: 2 }); // delete 2 rows
+                                                              // index 9 → 9 - 2 = 7.
+        assert_eq!(s.read(7, 0), Value::Number(99.0));
+        assert_eq!(s.read(9, 0), Value::Blank);
+    }
+
+    #[test]
+    fn insert_columns_splices_blank_columns() {
+        let mut s = Sheet::with_chunk_rows("S", 8);
+        s.put(0, 0, Value::Number(1.0)); // A1
+        s.put(0, 1, Value::Number(2.0)); // B1
+        s.shift_columns(AxisShift::Insert { at: 1, count: 1 });
+        // A1 unchanged; B1 → C1; new blank column at B.
+        assert_eq!(s.read(0, 0), Value::Number(1.0));
+        assert_eq!(s.read(0, 1), Value::Blank);
+        assert_eq!(s.read(0, 2), Value::Number(2.0));
+    }
+
+    #[test]
+    fn delete_columns_removes_block() {
+        let mut s = Sheet::with_chunk_rows("S", 8);
+        s.put(0, 0, Value::Number(1.0)); // A1
+        s.put(0, 1, Value::Number(2.0)); // B1 (deleted)
+        s.put(0, 2, Value::Number(3.0)); // C1 (shifts to B)
+        s.shift_columns(AxisShift::Delete { start: 1, end: 1 });
+        assert_eq!(s.read(0, 0), Value::Number(1.0));
+        assert_eq!(s.read(0, 1), Value::Number(3.0));
+        assert_eq!(s.read(0, 2), Value::Blank);
+    }
+
+    #[test]
+    fn shift_rows_recomputes_bounds() {
+        let mut s = Sheet::with_chunk_rows("S", 16);
+        s.put(5, 0, Value::Number(1.0)); // row_extent 6
+        assert_eq!(s.bounds().row_extent, 6);
+        s.shift_rows(AxisShift::Delete { start: 0, end: 2 }); // remove 3 rows
+                                                              // row 5 → row 2 → extent 3.
+        assert_eq!(s.bounds().row_extent, 3);
+    }
+
+    #[test]
+    fn shift_rows_preserves_string_values() {
+        // Strings live only in the user overlay (base is Float64-only).
+        let mut s = Sheet::with_chunk_rows("S", 8);
+        s.put(2, 0, Value::Text(Arc::from("hi")));
+        s.shift_rows(AxisShift::Insert { at: 0, count: 1 });
+        assert_eq!(s.read(3, 0), Value::Text(Arc::from("hi")));
+    }
+
+    #[test]
+    fn shift_rows_rekeys_format_overlay_no_orphans() {
+        use crate::FormatId;
+        let mut s = Sheet::with_chunk_rows("S", 16);
+        s.put(3, 0, Value::Number(1.0));
+        s.format_overlay_mut().set(3, 0, FormatId::Builtin(5));
+        let before = s.format_overlay().len();
+        assert_eq!(before, 1);
+        s.shift_rows(AxisShift::Insert { at: 0, count: 1 });
+        // Entry must have moved to row 4, not orphaned at row 3.
+        assert_eq!(s.format_overlay().get(4, 0), Some(FormatId::Builtin(5)));
+        assert_eq!(s.format_overlay().get(3, 0), None);
+        assert_eq!(s.format_overlay().len(), 1);
+    }
+
+    #[test]
+    fn delete_rows_drops_format_overlay_entry_in_block() {
+        use crate::FormatId;
+        let mut s = Sheet::with_chunk_rows("S", 16);
+        s.format_overlay_mut().set(2, 0, FormatId::Builtin(7));
+        s.shift_rows(AxisShift::Delete { start: 2, end: 2 });
+        // The format entry's cell was deleted → no orphan.
+        assert_eq!(s.format_overlay().len(), 0);
     }
 }

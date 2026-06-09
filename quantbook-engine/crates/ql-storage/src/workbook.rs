@@ -106,6 +106,28 @@ pub enum SheetNameError {
     Duplicate { name: String },
 }
 
+/// **W3 (insert/delete rows & columns):** failure modes of a structural
+/// row/column insert or delete at the storage layer.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum StructuralEditError {
+    /// The target sheet id does not exist (or is tombstoned).
+    #[error("structural edit: sheet {sheet} does not exist (have {sheet_count})")]
+    InvalidSheet { sheet: SheetId, sheet_count: usize },
+
+    /// `at`/`start`/`end`/`count` are out of the valid Excel range, or
+    /// `start > end` for a delete.
+    #[error("structural edit: invalid range ({why})")]
+    InvalidRange { why: &'static str },
+
+    /// The op would split a table footprint (the insertion/deletion line
+    /// falls inside a table's interior on the relevant axis). v1 rejects
+    /// rather than performing a partial-table shift. The table is named so
+    /// the caller can surface an actionable message.
+    #[error("structural edit: would split table {table:?} (v1 refuses partial-table shifts)")]
+    WouldSplitTable { table: String },
+}
+
 /// Phase 2A.9 audit M6: the canonical-uppercase reserved-name list. Names
 /// here cannot be registered via `NameTable::set` or `Workbook::set_name`.
 /// Keep small; document each entry.
@@ -1082,6 +1104,356 @@ impl Workbook {
             .iter()
             .map(|((s, r, c), f)| (*s, *r, *c, f))
     }
+
+    // ========================================================================
+    // W3 (insert/delete rows & columns) — structural edit orchestration.
+    // ========================================================================
+    //
+    // These perform the POSITIONAL half of a structural edit: shift the cell
+    // storage, re-key the per-sheet format overlay, re-key `formula_cells`
+    // KEYS (the cell POSITIONS move; the formula TEXT rewrite rides as separate
+    // `Op::PutFormula` ops emitted by the producer), shift named-range targets
+    // and table footprints. A recompute after this regenerates computed values.
+    //
+    // **These are LOW-LEVEL.** They bypass the op log + formula-text rewrite.
+    // Production callers route through the napi producer (which emits the
+    // `Op::Insert/Delete*` op + the accompanying `Op::PutFormula` text
+    // rewrites in one `BatchCommit`) and op-log replay (which calls these).
+
+    /// Insert `count` blank rows at row index `at` on `sheet`. Rows at or
+    /// below `at` shift down. See module note above for what this does + does
+    /// not do.
+    pub fn insert_rows(
+        &mut self,
+        sheet: SheetId,
+        at: RowId,
+        count: u32,
+    ) -> Result<(), StructuralEditError> {
+        if count == 0 {
+            return Err(StructuralEditError::InvalidRange { why: "count == 0" });
+        }
+        if at > ql_types::MAX_ROW {
+            return Err(StructuralEditError::InvalidRange {
+                why: "at > MAX_ROW",
+            });
+        }
+        self.apply_axis_shift(sheet, true, crate::AxisShift::Insert { at, count })
+    }
+
+    /// Delete the inclusive row block `[start, end]` on `sheet`. Rows below
+    /// `end` shift up; refs into the deleted block become `#REF!`.
+    pub fn delete_rows(
+        &mut self,
+        sheet: SheetId,
+        start: RowId,
+        end: RowId,
+    ) -> Result<(), StructuralEditError> {
+        if start > end {
+            return Err(StructuralEditError::InvalidRange { why: "start > end" });
+        }
+        if end > ql_types::MAX_ROW {
+            return Err(StructuralEditError::InvalidRange {
+                why: "end > MAX_ROW",
+            });
+        }
+        self.apply_axis_shift(sheet, true, crate::AxisShift::Delete { start, end })
+    }
+
+    /// Insert `count` blank columns at column index `at` on `sheet`.
+    pub fn insert_columns(
+        &mut self,
+        sheet: SheetId,
+        at: ColId,
+        count: u32,
+    ) -> Result<(), StructuralEditError> {
+        if count == 0 {
+            return Err(StructuralEditError::InvalidRange { why: "count == 0" });
+        }
+        if at > ql_types::MAX_COLUMN {
+            return Err(StructuralEditError::InvalidRange {
+                why: "at > MAX_COLUMN",
+            });
+        }
+        self.apply_axis_shift(sheet, false, crate::AxisShift::Insert { at, count })
+    }
+
+    /// Delete the inclusive column block `[start, end]` on `sheet`.
+    pub fn delete_columns(
+        &mut self,
+        sheet: SheetId,
+        start: ColId,
+        end: ColId,
+    ) -> Result<(), StructuralEditError> {
+        if start > end {
+            return Err(StructuralEditError::InvalidRange { why: "start > end" });
+        }
+        if end > ql_types::MAX_COLUMN {
+            return Err(StructuralEditError::InvalidRange {
+                why: "end > MAX_COLUMN",
+            });
+        }
+        self.apply_axis_shift(sheet, false, crate::AxisShift::Delete { start, end })
+    }
+
+    /// Shared positional-shift driver. `is_row` selects the axis. Validates
+    /// the sheet + the table-split guard, then shifts storage + every piece of
+    /// position-keyed metadata.
+    fn apply_axis_shift(
+        &mut self,
+        sheet: SheetId,
+        is_row: bool,
+        shift: crate::AxisShift,
+    ) -> Result<(), StructuralEditError> {
+        let sheet_count = self.sheets.len();
+        if (sheet as usize) >= sheet_count {
+            return Err(StructuralEditError::InvalidSheet { sheet, sheet_count });
+        }
+
+        // --- Table-split guard (v1: refuse to split a footprint) ----------
+        // A table is split if the edit line crosses its INTERIOR on the
+        // relevant axis. "Entirely before" (shift the whole table) and
+        // "entirely after" (untouched) are fine; an insert/delete strictly
+        // inside the footprint's span is refused.
+        let axis_max = if is_row {
+            ql_types::MAX_ROW
+        } else {
+            ql_types::MAX_COLUMN
+        };
+        for (_, meta) in self.tables.iter() {
+            if meta.sheet != sheet {
+                continue;
+            }
+            let (lo, span) = if is_row {
+                (meta.top_row, meta.rows)
+            } else {
+                (meta.top_col, meta.cols)
+            };
+            if span == 0 {
+                continue;
+            }
+            let hi = lo + span - 1; // last interior line (inclusive)
+            let splits = match shift {
+                // Insert strictly inside (after the first line, at-or-before
+                // the last) splits the footprint. Insert AT `lo` pushes the
+                // whole table down — allowed.
+                crate::AxisShift::Insert { at, .. } => at > lo && at <= hi,
+                // Delete overlaps the footprint but does not fully cover it
+                // → partial-table shift → refuse. (Full cover is also refused
+                // in v1 for simplicity; document.)
+                crate::AxisShift::Delete { start, end } => start <= hi && end >= lo,
+            };
+            if splits {
+                return Err(StructuralEditError::WouldSplitTable {
+                    table: meta.name.to_string(),
+                });
+            }
+            // **Codex L2 HIGH-1 closure:** an insert that pushes the table's
+            // footprint (top OR bottom edge) past the axis maximum would
+            // silently corrupt the table metadata (the shift maps the corner
+            // to `None` and leaves the stale coordinate). Refuse it. Only
+            // inserts can overflow; a delete only shrinks coordinates.
+            if let crate::AxisShift::Insert { at, count } = shift {
+                if at <= lo {
+                    // The whole table shifts; its new bottom edge would be
+                    // `hi + count`. If that exceeds the grid, refuse.
+                    let new_hi = (hi as u64) + (count as u64);
+                    if new_hi > axis_max as u64 {
+                        return Err(StructuralEditError::WouldSplitTable {
+                            table: meta.name.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // --- 1. Cell storage + format overlay (per-sheet) -----------------
+        let target = self
+            .sheets
+            .get_mut(sheet as usize)
+            .expect("apply_axis_shift: sheet bounds checked above");
+        if is_row {
+            target.shift_rows(shift);
+        } else {
+            target.shift_columns(shift);
+        }
+
+        // --- 2. formula_cells KEY re-key (positions move; text is the
+        //        producer's PutFormula job) ------------------------------
+        let mut next_formulas: HashMap<(SheetId, RowId, ColId), Arc<str>> =
+            HashMap::with_capacity(self.formula_cells.len());
+        for ((s, r, c), text) in self.formula_cells.iter() {
+            if *s != sheet {
+                next_formulas.insert((*s, *r, *c), text.clone());
+                continue;
+            }
+            let new_key = if is_row {
+                shift.map_public(*r, axis_max).map(|nr| (*s, nr, *c))
+            } else {
+                shift.map_public(*c, axis_max).map(|nc| (*s, *r, nc))
+            };
+            if let Some(key) = new_key {
+                next_formulas.insert(key, text.clone());
+            }
+            // None → the formula's cell was deleted → drop it.
+        }
+        self.formula_cells = next_formulas;
+
+        // --- 3. Named ranges (workbook + sheet-scoped) --------------------
+        shift_name_table(&mut self.names, sheet, is_row, shift, axis_max);
+        if let Some(s) = self.sheets.get_mut(sheet as usize) {
+            shift_name_table(s.scoped_names_mut(), sheet, is_row, shift, axis_max);
+        }
+
+        // --- 4. Table footprints (only "entirely before" survives the
+        //        split guard, so just shift the top-left corner) ----------
+        let table_names: Vec<Arc<str>> = self
+            .tables
+            .iter()
+            .filter(|(_, m)| m.sheet == sheet)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in table_names {
+            if let Some(meta) = self.tables.get_mut(&name) {
+                if is_row {
+                    if let Some(nr) = shift.map_public(meta.top_row, axis_max) {
+                        meta.top_row = nr;
+                    }
+                } else if let Some(nc) = shift.map_public(meta.top_col, axis_max) {
+                    meta.top_col = nc;
+                }
+            }
+        }
+        if !self.tables.is_empty() {
+            self.tables.bump_generation();
+        }
+        // Note: `shift_name_table`'s set/clear calls already bump the
+        // NameTable generation for any name that moved; no extra bump needed.
+
+        Ok(())
+    }
+}
+
+/// **W3 (insert/delete rows & columns):** re-key every `NamedTarget::Cell` /
+/// `::Range` in `table` that targets `sheet` by shifting its axis coordinate.
+/// A name whose target is fully deleted is DROPPED (Excel keeps the name with
+/// a `#REF!` body; v1 drops the binding + the producer's recompute surfaces
+/// `#NAME?` for references — documented v1 simplification). `Constant` /
+/// `Formula` targets are sheet-agnostic and pass through.
+fn shift_name_table(
+    table: &mut NameTable,
+    sheet: SheetId,
+    is_row: bool,
+    shift: crate::AxisShift,
+    axis_max: u32,
+) {
+    // Collect re-keys first (can't mutate while iterating).
+    let mut updates: Vec<(String, Option<NamedTarget>)> = Vec::new();
+    for (name, target) in table.iter() {
+        match target {
+            NamedTarget::Cell(addr) if addr.sheet == sheet => {
+                let coord = if is_row { addr.row } else { addr.col };
+                match shift.map_public(coord, axis_max) {
+                    Some(nc) => {
+                        let mut na = *addr;
+                        if is_row {
+                            na.row = nc;
+                        } else {
+                            na.col = nc;
+                        }
+                        updates.push((name.to_string(), Some(NamedTarget::Cell(na))));
+                    }
+                    None => updates.push((name.to_string(), None)),
+                }
+            }
+            NamedTarget::Range(range) if range.sheet == sheet => {
+                let (lo, hi) = if is_row {
+                    (range.start_row, range.end_row)
+                } else {
+                    (range.start_col, range.end_col)
+                };
+                // **Codex L2 HIGH-2 closure:** a whole-column range is stored
+                // `start_row=0, end_row=u32::MAX` (the spanning-axis sentinel);
+                // a whole-row range likewise spans the column axis. When the
+                // edit is on the SPANNING axis, the sentinel must stay intact
+                // (a row insert/delete never narrows a whole-COLUMN range's row
+                // span). Detect the sentinel and leave that axis untouched.
+                let edited_axis_spans = lo == 0 && hi == u32::MAX;
+                if edited_axis_spans {
+                    // The edited axis is the full-sheet span → unchanged. The
+                    // OTHER axis (bounded) is handled when that axis is edited
+                    // in a separate call; nothing to do for this axis.
+                    // (No update pushed: leaving the binding as-is.)
+                    continue;
+                }
+                let new_lo = shift_range_endpoint_low(lo, shift, axis_max);
+                // **Codex L2 MED-3 closure:** an insert that pushes the HIGH
+                // endpoint past `axis_max` clamps it to the grid edge (shrink),
+                // rather than dropping the whole binding. A delete that reaches
+                // the origin still drops (no surviving span).
+                let new_hi = shift_range_endpoint_high(hi, shift, axis_max);
+                match (new_lo, new_hi) {
+                    (Some(s), Some(e)) if s <= e => {
+                        let mut nr = *range;
+                        if is_row {
+                            nr.start_row = s;
+                            nr.end_row = e;
+                        } else {
+                            nr.start_col = s;
+                            nr.end_col = e;
+                        }
+                        updates.push((name.to_string(), Some(NamedTarget::Range(nr))));
+                    }
+                    // Fully collapsed (e.g. the entire range deleted) → drop.
+                    _ => updates.push((name.to_string(), None)),
+                }
+            }
+            _ => {}
+        }
+    }
+    for (name, new_target) in updates {
+        match new_target {
+            Some(t) => {
+                // `set` validates; a re-key of an existing valid name cannot
+                // fail (same name, valid target). Swallow only the
+                // already-validated path; surface nothing new.
+                let _ = table.set(&name, t);
+            }
+            None => table.clear(&name),
+        }
+    }
+}
+
+/// Map a range's LOW endpoint. A low endpoint inside a deleted block clamps to
+/// the collapse point (`start`); otherwise it shifts normally. An insert that
+/// pushes the LOW endpoint past `axis_max` means the entire range moved off the
+/// grid → `None` (drop). (`shift.map_public` returns `None` on that overflow.)
+fn shift_range_endpoint_low(coord: u32, shift: crate::AxisShift, axis_max: u32) -> Option<u32> {
+    match shift {
+        crate::AxisShift::Delete { start, end } if coord >= start && coord <= end => Some(start),
+        _ => shift.map_public(coord, axis_max),
+    }
+}
+
+/// Map a range's HIGH endpoint. A high endpoint inside a deleted block clamps
+/// to the last surviving line before the block (`start - 1`); `None` if the
+/// block reaches the origin (`start == 0`). An INSERT that pushes the high
+/// endpoint past `axis_max` CLAMPS to `axis_max` (the range shrinks to the grid
+/// edge) rather than dropping the binding — Codex L2 MED-3.
+fn shift_range_endpoint_high(coord: u32, shift: crate::AxisShift, axis_max: u32) -> Option<u32> {
+    match shift {
+        crate::AxisShift::Delete { start, end } if coord >= start && coord <= end => {
+            if start == 0 {
+                None
+            } else {
+                Some(start - 1)
+            }
+        }
+        crate::AxisShift::Insert { at, count } if coord >= at => {
+            // Clamp on overflow instead of dropping.
+            Some((coord as u64 + count as u64).min(axis_max as u64) as u32)
+        }
+        _ => shift.map_public(coord, axis_max),
+    }
 }
 
 #[cfg(test)]
@@ -1813,5 +2185,285 @@ mod tests {
         wb.set_reference_mode(ql_types::ReferenceMode::A1);
         // Locale unchanged.
         assert_eq!(wb.locale(), ql_types::Locale::De);
+    }
+
+    // ========================================================================
+    // W3 (insert/delete rows & columns) — metadata re-key.
+    // ========================================================================
+
+    #[test]
+    fn insert_rows_rekeys_formula_cell_positions() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        wb.put_formula(s, 4, 0, "=A1"); // formula at A5
+        wb.insert_rows(s, 0, 1).unwrap();
+        // The formula's POSITION moved A5 → A6 (text rewrite is the producer's
+        // job; this layer only re-keys the position).
+        assert!(wb.formula_at(s, 4, 0).is_none());
+        assert_eq!(wb.formula_at(s, 5, 0).map(|t| t.as_ref()), Some("=A1"));
+    }
+
+    #[test]
+    fn delete_rows_drops_formula_in_deleted_block() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        wb.put_formula(s, 2, 0, "=1"); // A3
+        wb.delete_rows(s, 2, 2).unwrap();
+        assert!(wb.formula_at(s, 2, 0).is_none());
+        assert_eq!(wb.formula_count(), 0);
+    }
+
+    #[test]
+    fn insert_rows_shifts_named_cell_target() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        wb.set_name("MyCell", NamedTarget::Cell(Address::new(s, 4, 0)))
+            .unwrap(); // A5
+        wb.insert_rows(s, 0, 2).unwrap();
+        match wb.names().lookup_ci("MyCell") {
+            Some(NamedTarget::Cell(a)) => {
+                assert_eq!(a.row, 6); // 4 + 2
+                assert_eq!(a.col, 0);
+            }
+            other => panic!("expected shifted Cell target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_rows_shifts_named_range_target() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        wb.set_name("R", NamedTarget::Range(ql_types::Range::new(s, 1, 0, 4, 0)))
+            .unwrap(); // A2:A5
+        wb.insert_rows(s, 0, 1).unwrap();
+        match wb.names().lookup_ci("R") {
+            Some(NamedTarget::Range(r)) => {
+                assert_eq!((r.start_row, r.end_row), (2, 5)); // A3:A6
+            }
+            other => panic!("expected shifted Range, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_rows_collapsing_named_range_drops_it() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        wb.set_name("R", NamedTarget::Range(ql_types::Range::new(s, 1, 0, 3, 0)))
+            .unwrap(); // A2:A4
+        wb.delete_rows(s, 1, 3).unwrap(); // delete the whole range
+        assert!(wb.names().lookup_ci("R").is_none());
+    }
+
+    #[test]
+    fn named_range_on_other_sheet_unchanged() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        let s1 = wb.add_sheet("S1");
+        wb.set_name("Other", NamedTarget::Cell(Address::new(s1, 4, 0)))
+            .unwrap();
+        wb.insert_rows(s0, 0, 5).unwrap();
+        match wb.names().lookup_ci("Other") {
+            Some(NamedTarget::Cell(a)) => assert_eq!(a.row, 4), // untouched
+            other => panic!("expected untouched Cell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_rows_above_table_shifts_footprint() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        // Table at rows 5..=8 (top_row 5, 4 rows).
+        let meta = crate::TableMetadata {
+            name: Arc::from("T"),
+            display_name: Arc::from("T"),
+            sheet: s,
+            top_row: 5,
+            top_col: 0,
+            rows: 4,
+            cols: 2,
+            has_header: true,
+            has_totals: false,
+            columns: vec![],
+        };
+        wb.tables_mut().insert(Arc::from("T"), meta);
+        wb.insert_rows(s, 0, 2).unwrap(); // insert entirely above the table
+        let t = wb.lookup_table("T").unwrap();
+        assert_eq!(t.top_row, 7); // 5 + 2
+    }
+
+    #[test]
+    fn insert_inside_table_footprint_is_refused() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        let meta = crate::TableMetadata {
+            name: Arc::from("T"),
+            display_name: Arc::from("T"),
+            sheet: s,
+            top_row: 2,
+            top_col: 0,
+            rows: 4, // rows 2..=5
+            cols: 2,
+            has_header: true,
+            has_totals: false,
+            columns: vec![],
+        };
+        wb.tables_mut().insert(Arc::from("T"), meta);
+        // Insert at row 4 (strictly inside 2..=5) → split → refuse.
+        let err = wb.insert_rows(s, 4, 1).unwrap_err();
+        assert!(matches!(err, StructuralEditError::WouldSplitTable { .. }));
+        // Table footprint unchanged after refusal.
+        assert_eq!(wb.lookup_table("T").unwrap().top_row, 2);
+    }
+
+    #[test]
+    fn delete_overlapping_table_is_refused() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        let meta = crate::TableMetadata {
+            name: Arc::from("T"),
+            display_name: Arc::from("T"),
+            sheet: s,
+            top_row: 2,
+            top_col: 0,
+            rows: 4, // rows 2..=5
+            cols: 2,
+            has_header: true,
+            has_totals: false,
+            columns: vec![],
+        };
+        wb.tables_mut().insert(Arc::from("T"), meta);
+        let err = wb.delete_rows(s, 3, 4).unwrap_err();
+        assert!(matches!(err, StructuralEditError::WouldSplitTable { .. }));
+    }
+
+    #[test]
+    fn insert_rows_invalid_sheet_errors() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S0");
+        let err = wb.insert_rows(9, 0, 1).unwrap_err();
+        assert!(matches!(err, StructuralEditError::InvalidSheet { .. }));
+    }
+
+    #[test]
+    fn delete_rows_start_after_end_errors() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        let err = wb.delete_rows(s, 5, 2).unwrap_err();
+        assert!(matches!(err, StructuralEditError::InvalidRange { .. }));
+    }
+
+    #[test]
+    fn insert_columns_shifts_named_cell_col() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        wb.set_name("C", NamedTarget::Cell(Address::new(s, 0, 2)))
+            .unwrap(); // C1
+        wb.insert_columns(s, 0, 1).unwrap();
+        match wb.names().lookup_ci("C") {
+            Some(NamedTarget::Cell(a)) => assert_eq!(a.col, 3), // 2 + 1
+            other => panic!("expected shifted col, got {other:?}"),
+        }
+    }
+
+    // --- Codex L2 audit folds --------------------------------------------
+
+    #[test]
+    fn whole_column_named_range_row_edit_preserves_sentinel() {
+        // Codex L2 HIGH-2: A:A is stored as rows [0, u32::MAX]. A ROW insert
+        // must NOT narrow the row span (a whole-column range still spans all
+        // rows after a row insert).
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        let whole_col = ql_types::Range {
+            sheet: s,
+            start_row: 0,
+            end_row: u32::MAX,
+            start_col: 0,
+            end_col: 0,
+        };
+        wb.set_name("ColA", NamedTarget::Range(whole_col)).unwrap();
+        wb.insert_rows(s, 5, 1).unwrap();
+        match wb.names().lookup_ci("ColA") {
+            Some(NamedTarget::Range(r)) => {
+                assert_eq!((r.start_row, r.end_row), (0, u32::MAX)); // sentinel intact
+                assert_eq!((r.start_col, r.end_col), (0, 0));
+            }
+            other => panic!("expected preserved whole-column range, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whole_column_named_range_col_edit_shifts_columns() {
+        // A col edit on a whole-column range shifts the (bounded) col axis.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        let whole_col = ql_types::Range {
+            sheet: s,
+            start_row: 0,
+            end_row: u32::MAX,
+            start_col: 1, // B:B
+            end_col: 1,
+        };
+        wb.set_name("ColB", NamedTarget::Range(whole_col)).unwrap();
+        wb.insert_columns(s, 0, 1).unwrap(); // insert before A → B:B becomes C:C
+        match wb.names().lookup_ci("ColB") {
+            Some(NamedTarget::Range(r)) => {
+                assert_eq!((r.start_col, r.end_col), (2, 2));
+                assert_eq!((r.start_row, r.end_row), (0, u32::MAX)); // span intact
+            }
+            other => panic!("expected col-shifted whole-column range, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_pushing_table_off_grid_is_refused() {
+        // Codex L2 HIGH-1: a table near MAX_ROW whose footprint would be pushed
+        // past the grid by an insert must be refused, not silently corrupted.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        let meta = crate::TableMetadata {
+            name: Arc::from("T"),
+            display_name: Arc::from("T"),
+            sheet: s,
+            top_row: ql_types::MAX_ROW, // single row at the very bottom
+            top_col: 0,
+            rows: 1,
+            cols: 1,
+            has_header: false,
+            has_totals: false,
+            columns: vec![],
+        };
+        wb.tables_mut().insert(Arc::from("T"), meta);
+        let err = wb.insert_rows(s, 0, 1).unwrap_err();
+        assert!(matches!(err, StructuralEditError::WouldSplitTable { .. }));
+        // Footprint unchanged.
+        assert_eq!(wb.lookup_table("T").unwrap().top_row, ql_types::MAX_ROW);
+    }
+
+    #[test]
+    fn insert_overflowing_named_range_high_endpoint_clamps() {
+        // Codex L2 MED-3: an insert that pushes a bounded range's HIGH endpoint
+        // past MAX_ROW clamps to the grid edge rather than dropping the name.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        let r = ql_types::Range {
+            sheet: s,
+            start_row: ql_types::MAX_ROW - 1,
+            end_row: ql_types::MAX_ROW,
+            start_col: 0,
+            end_col: 0,
+        };
+        wb.set_name("Near", NamedTarget::Range(r)).unwrap();
+        wb.insert_rows(s, 0, 1).unwrap();
+        match wb.names().lookup_ci("Near") {
+            Some(NamedTarget::Range(r)) => {
+                // start: MAX_ROW-1 +1 = MAX_ROW; end clamps to MAX_ROW.
+                assert_eq!(
+                    (r.start_row, r.end_row),
+                    (ql_types::MAX_ROW, ql_types::MAX_ROW)
+                );
+            }
+            other => panic!("expected clamped range, got {other:?}"),
+        }
     }
 }
