@@ -37,6 +37,7 @@
 	"command.quantbookOpenReactiveNotebook.title": "Quantbook: Open Reactive Notebook",
 	"command.quantbookBindReactiveNotebook.title": "Quantbook: Bind Reactive Notebook to Grid",
 	"command.quantbookBindVariableToSelectedCell.title": "Quantbook: Bind Variable to Selected Cell",
+	"command.quantbookStartMcpServer.title": "Quantbook: Start MCP Server (read-only)",
 	"command.quantbookCellGridCollab.title": "Quantbook: Open Cell Grid (Collab)",
 	"command.quantbookCellGridSwitchSheet.title": "Quantbook: Switch Cell Grid Sheet",
 	"command.quantbookSaveAs.title": "Quantbook: Save As...",
