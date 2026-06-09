@@ -63,7 +63,9 @@ import {
 	cellContentRect,
 	cellRefA1,
 	colX,
-	hitTestViewport,
+	frozenColsWidth,
+	frozenRowsHeight,
+	hitTestViewportFrozen,
 	isInExtent,
 	publishedNameAt,
 	type SelectionRect,
@@ -405,6 +407,10 @@ const renderHost: RenderHost = {
 	selection: currentSelection,
 	publishedRanges: () => publishedRanges,
 	fillPreview: () => fillPreview,
+	// W3 frozen panes: the renderer is the single source of truth for the (clamped) frozen counts; the
+	// orchestrator's blit gate reads them through here. `setFrozen` clamped them, so these are always sane.
+	frozenRowCount: () => renderer.frozenRows,
+	frozenColCount: () => renderer.frozenCols,
 	applyCanvasTransform,
 	onAfterFullRedraw: () => {
 		updateFormulaBar(); // selection/content changed -> reflect the active cell in the formula bar
@@ -500,26 +506,36 @@ function clampCol(c: number): number {
 
 /** Scroll so the active cell is fully visible below the header band + right of the row gutter.
  * Audit C2-MED2: the tiny-viewport clamp (a viewport narrower/shorter than one cell would otherwise
- * park the cell under the sticky band) lives in the pure {@link scrollToReveal}. */
+ * park the cell under the sticky band) lives in the pure {@link scrollToReveal}.
+ * **W3 frozen panes**: a cell INSIDE a frozen band is always on screen (pinned) -- never scroll that axis.
+ * For a BODY cell, the effective band size = sticky band + the frozen-band pixels, so the cell reveals
+ * BELOW/RIGHT of the frozen strip (not under it). With 0 frozen rows/cols this is the pre-W3 behaviour. */
 function ensureActiveVisible(): void {
 	if (active === null) {
 		return;
 	}
 	const gutterW = renderer.gutterWidthPx;
-	viewportEl.scrollLeft = scrollToReveal(
-		colX(active.col, gutterW),
-		COL_WIDTH,
-		gutterW,
-		viewportEl.scrollLeft,
-		viewportEl.clientWidth,
-	);
-	viewportEl.scrollTop = scrollToReveal(
-		rowY(active.row),
-		ROW_HEIGHT,
-		HEADER_HEIGHT,
-		viewportEl.scrollTop,
-		viewportEl.clientHeight,
-	);
+	const fRows = renderer.frozenRows;
+	const fCols = renderer.frozenCols;
+	// Only scroll the column axis for a BODY column (a frozen column is always visible at its pinned X).
+	if (active.col >= fCols) {
+		viewportEl.scrollLeft = scrollToReveal(
+			colX(active.col, gutterW),
+			COL_WIDTH,
+			gutterW + frozenColsWidth(fCols),
+			viewportEl.scrollLeft,
+			viewportEl.clientWidth,
+		);
+	}
+	if (active.row >= fRows) {
+		viewportEl.scrollTop = scrollToReveal(
+			rowY(active.row),
+			ROW_HEIGHT,
+			HEADER_HEIGHT + frozenRowsHeight(fRows),
+			viewportEl.scrollTop,
+			viewportEl.clientHeight,
+		);
+	}
 }
 
 /** Move the selection by (dr,dc), scroll it into view, repaint. No-op while editing. A plain (non-shift)
@@ -938,11 +954,13 @@ function beginEdit(row: number, col: number, initialChar?: string): void {
 	// never built/held); it can't equal any in-cap editor value, so blur correctly sees the typed char as a
 	// change. Otherwise it is the real prior content (megaudit MED-1: NOT the injected char).
 	const initialValue: string = prior.oversize ? OVERSIZE_BASELINE : prior.text;
-	const rect = cellContentRect(row, col, renderer.gutterWidthPx);
-	inputEl.style.left = rect.x + 'px';
-	inputEl.style.top = rect.y + 'px';
-	inputEl.style.width = rect.width + 'px';
-	inputEl.style.height = rect.height + 'px';
+	// W3 frozen panes (Codex HIGH-2): pin a frozen cell's editor (add back the frozen-axis scroll) so it stays
+	// over its pinned cell; a body cell gets the plain content position (unchanged).
+	const pos = overlayCellContentPos(row, col);
+	inputEl.style.left = pos.left + 'px';
+	inputEl.style.top = pos.top + 'px';
+	inputEl.style.width = pos.width + 'px';
+	inputEl.style.height = pos.height + 'px';
 	inputEl.readOnly = false; // megaudit H1: a fresh editor is editable (a prior pending edit set readOnly)
 	inputEl.value = prefill;
 	inputEl.hidden = false;
@@ -1436,18 +1454,38 @@ function teardownFormulaAssist(): void {
 	hintEl.classList.remove('is-error');
 }
 
+/**
+ * **W3 frozen panes (Codex HIGH-2)** -- the CONTENT-layer position of the overlay editor for cell
+ * `(row, col)`. The overlay `<input>` is a child of the content layer, so an element at content `top=Y`
+ * renders at viewport `Y - scrollTop`. A BODY cell wants to scroll with the grid, so its content position
+ * IS `cellContentRect` (the pre-W3 behaviour). A FROZEN cell must stay PINNED at its viewport position
+ * (`rowY(r)` / `colX(c)`), so we ADD BACK the live scroll on the frozen axis (`+ scrollTop` / `+ scrollLeft`),
+ * cancelling the content layer's scroll -- the cell then appears fixed below the header / right of the gutter
+ * just like its painted pane. Re-evaluated on every scroll (the `scroll` handler calls `repositionEdit`),
+ * so a frozen-cell editor tracks its pinned cell as the body scrolls. With no freeze this returns the bare
+ * `cellContentRect` position (byte-identical to the pre-W3 path).
+ */
+function overlayCellContentPos(row: number, col: number): { left: number; top: number; width: number; height: number } {
+	const rect = cellContentRect(row, col, renderer.gutterWidthPx);
+	const pinLeft = col < renderer.frozenCols ? viewportEl.scrollLeft : 0;
+	const pinTop = row < renderer.frozenRows ? viewportEl.scrollTop : 0;
+	return { left: rect.x + pinLeft, top: rect.y + pinTop, width: rect.width, height: rect.height };
+}
+
 /** Re-position the open editor over its cell. Audit LOW-7: the gutter width can change on a theme/font
  * change, which shifts every cell's x -- a preserved editor must follow or it misaligns.
- * W-G-1b: only the OVERLAY editor is positioned over a cell; a formula-bar edit is a no-op here. */
+ * W-G-1b: only the OVERLAY editor is positioned over a cell; a formula-bar edit is a no-op here.
+ * W3 frozen panes: a frozen cell's editor is pinned (see {@link overlayCellContentPos}), so this is also
+ * called on every scroll so the pin tracks the live scroll. */
 function repositionEdit(): void {
 	if (editState === null || editState.surface !== 'overlay') {
 		return;
 	}
-	const rect = cellContentRect(editState.row, editState.col, renderer.gutterWidthPx);
-	inputEl.style.left = rect.x + 'px';
-	inputEl.style.top = rect.y + 'px';
-	inputEl.style.width = rect.width + 'px';
-	inputEl.style.height = rect.height + 'px';
+	const pos = overlayCellContentPos(editState.row, editState.col);
+	inputEl.style.left = pos.left + 'px';
+	inputEl.style.top = pos.top + 'px';
+	inputEl.style.width = pos.width + 'px';
+	inputEl.style.height = pos.height + 'px';
 	updateEditClip(); // a gutter-width change shifts the cell -> recompute the body-pane clip too
 }
 
@@ -1459,9 +1497,16 @@ function repositionEdit(): void {
  * pinned canvas. Without clipping, an editor scrolled under a band slides visibly ON TOP of it. A
  * `clip-path` inset hides exactly the portion overlapping the bands -- and unlike hiding the element
  * (`hidden`/`display:none`, which would blur the input and fire the cancel/commit path), `clip-path`
- * PRESERVES focus + the live edit. Only the top/left bands occlude (there is no bottom/right frozen band);
- * a cell fully in the body pane gets a zero inset (no-op). Pointer events over a clipped region pass
- * through to the band, as desired.
+ * PRESERVES focus + the live edit. Only the top/left bands occlude; a cell fully in the body pane gets a
+ * zero inset (no-op). Pointer events over a clipped region pass through to the band, as desired.
+ *
+ * **W3 frozen panes**: the occluding band on each axis = sticky band + the frozen-band pixels. A BODY-cell
+ * editor scrolled up/left under the FROZEN strip is clipped at the frozen-band edge (not just the
+ * header/gutter), so it never slides visibly over the pinned rows/cols. A FROZEN-cell editor is PINNED
+ * (see {@link overlayCellContentPos}), so its on-screen position is `rowY(r)` / `colX(c)` -- above/left of
+ * the body-pane band edge, so it is clipped only at the sticky gutter/header edge (clipLeft/clipTop clamp
+ * to 0). The on-screen position is derived from the PINNED content position so it stays correct as the body
+ * scrolls under a frozen-cell editor.
  */
 function updateEditClip(): void {
 	// W-G-1b: only the overlay editor is a content-layer child that can slide under a sticky band; a
@@ -1470,13 +1515,20 @@ function updateEditClip(): void {
 		return;
 	}
 	const gutterW = renderer.gutterWidthPx;
-	const rect = cellContentRect(editState.row, editState.col, gutterW);
-	// The input's on-screen position = content coord - scroll (it scrolls with the content layer).
-	const viewX = rect.x - viewportEl.scrollLeft;
-	const viewY = rect.y - viewportEl.scrollTop;
-	// Hide the part of the input that lies under the left gutter / top header band (clamped to the input box).
-	const clipLeft = Math.max(0, Math.min(rect.width, gutterW - viewX));
-	const clipTop = Math.max(0, Math.min(rect.height, HEADER_HEIGHT - viewY));
+	// The input's on-screen position = its CONTENT position - scroll. For a frozen cell the content position
+	// adds back the frozen-axis scroll (overlayCellContentPos), so on-screen it lands at the pinned rowY/colX.
+	const pos = overlayCellContentPos(editState.row, editState.col);
+	const viewX = pos.left - viewportEl.scrollLeft;
+	const viewY = pos.top - viewportEl.scrollTop;
+	// W3: the occluding band edge depends on which pane the edited cell is in. A BODY cell (col >= fCols /
+	// row >= fRows) can scroll under the frozen strip, so it is clipped at `band + frozen-band pixels`. A
+	// FROZEN cell lives IN the frozen strip (left of `leftBand` / above `topBand`); clipping it there would
+	// wrongly hide a pinned cell, so it is clipped only at the sticky gutter/header edge.
+	const leftBand = editState.col < renderer.frozenCols ? gutterW : gutterW + frozenColsWidth(renderer.frozenCols);
+	const topBand = editState.row < renderer.frozenRows ? HEADER_HEIGHT : HEADER_HEIGHT + frozenRowsHeight(renderer.frozenRows);
+	// Hide the part of the input that lies under the occluding band on each axis (clamped to the input box).
+	const clipLeft = Math.max(0, Math.min(pos.width, leftBand - viewX));
+	const clipTop = Math.max(0, Math.min(pos.height, topBand - viewY));
 	inputEl.style.clipPath = 'inset(' + clipTop + 'px 0px 0px ' + clipLeft + 'px)';
 }
 
@@ -1767,12 +1819,16 @@ function hitTestCanvas(ev: MouseEvent): { row: number; col: number } | null {
 		return null;
 	}
 	const rect = canvasEl.getBoundingClientRect();
-	return hitTestViewport(
+	// W3 frozen panes: thread the pinned counts so a click in a frozen band maps to the pinned cell (no
+	// scroll added on that axis); 0/0 reduces to the pre-W3 hit-test.
+	return hitTestViewportFrozen(
 		ev.clientX - rect.left,
 		ev.clientY - rect.top,
 		viewportEl.scrollLeft,
 		viewportEl.scrollTop,
 		renderer.gutterWidthPx,
+		renderer.frozenRows,
+		renderer.frozenCols,
 	);
 }
 
@@ -1789,8 +1845,13 @@ function isOnFillHandle(ev: MouseEvent): boolean {
 	const brRow = sel === null ? active.row : sel.maxRow;
 	const brCol = sel === null ? active.col : sel.maxCol;
 	const rect = canvasEl.getBoundingClientRect();
-	const cornerX = colX(brCol + 1, renderer.gutterWidthPx) - viewportEl.scrollLeft;
-	const cornerY = rowY(brRow + 1) - viewportEl.scrollTop;
+	// W3 frozen panes: the handle is painted at the bottom-right corner of (brRow, brCol). A FROZEN corner
+	// cell paints at its pinned position (no scroll on the frozen axis), so the hit-test must use the SAME
+	// effective scroll the paint used, or the handle would be unreachable when the corner cell is frozen.
+	const effScrollLeft = brCol < renderer.frozenCols ? 0 : viewportEl.scrollLeft;
+	const effScrollTop = brRow < renderer.frozenRows ? 0 : viewportEl.scrollTop;
+	const cornerX = colX(brCol + 1, renderer.gutterWidthPx) - effScrollLeft;
+	const cornerY = rowY(brRow + 1) - effScrollTop;
 	return Math.abs(ev.clientX - rect.left - cornerX) <= FILL_HANDLE_HIT_PX
 		&& Math.abs(ev.clientY - rect.top - cornerY) <= FILL_HANDLE_HIT_PX;
 }
@@ -1922,12 +1983,14 @@ function updateHoverTitle(): void {
 	let title = '';
 	if (fullSnapshot !== null) {
 		const rect = canvasEl.getBoundingClientRect();
-		const hit = hitTestViewport(
+		const hit = hitTestViewportFrozen(
 			hoverClientX - rect.left,
 			hoverClientY - rect.top,
 			viewportEl.scrollLeft,
 			viewportEl.scrollTop,
 			renderer.gutterWidthPx,
+			renderer.frozenRows,
+			renderer.frozenCols,
 		);
 		if (hit !== null) {
 			const entry = renderer.entryAt(hit.row, hit.col);
@@ -2571,6 +2634,33 @@ window.addEventListener('message', (event: MessageEvent) => {
 		orchestrator.commitErrorDamage(prevErrorKeys, activeMoved);
 		return;
 	}
+	if (msg.type === 'freeze') {
+		// **W3 frozen panes** -- the host's "Freeze Panes at Selection" / "Unfreeze" command. Set the pinned
+		// row/col counts and FULL-redraw (the geometry changed; the damage/blit fast paths assume a stable
+		// freeze). `renderer.setFrozen` CLAMPS to sane integers in `[0, MAX-1]` (defence in depth at the trust
+		// boundary). **Codex MED-1 (No-Fallbacks)**: a MALFORMED envelope (rows/cols not finite numbers) is a
+		// host/webview WIRING bug, not a freeze of 0 -- so surface it LOUD and leave the CURRENT freeze state
+		// UNCHANGED rather than silently unfreezing (which would mask the bug + lose the user's freeze).
+		// **Codex MED-4**: require non-negative INTEGERS, not merely finite numbers. The host always sends
+		// `Math.floor`-ed counts, so a fractional value (e.g. 1.5) is a wiring bug -- `clampFrozenCount` would
+		// silently coerce it to 0 (a stealth unfreeze). Reject it LOUD + leave the freeze unchanged, same as
+		// a non-finite value (No-Fallbacks: surface the bad wire, don't mask it as "freeze 0").
+		const fz = msg as { rows?: unknown; cols?: unknown };
+		if (
+			typeof fz.rows !== 'number' || !Number.isInteger(fz.rows) || fz.rows < 0 ||
+			typeof fz.cols !== 'number' || !Number.isInteger(fz.cols) || fz.cols < 0
+		) {
+			console.warn('[sheets-webview] dropped a malformed freeze message (rows/cols must be non-negative integers):', msg);
+			showError('The host sent a malformed Freeze Panes command; the freeze was not changed.', 'transient');
+			return;
+		}
+		renderer.setFrozen(fz.rows, fz.cols);
+		// A freeze shifts every cell's pane, so an open overlay editor must be re-pinned + its clip recomputed
+		// (a frozen cell's editor pins; a cell now under a frozen band clips there). repositionEdit handles both.
+		repositionEdit();
+		redraw();
+		return;
+	}
 	console.warn('[sheets-webview] unknown inbound message type:', msg.type);
 });
 
@@ -2586,8 +2676,11 @@ viewportEl.addEventListener('scroll', () => {
 	applyCanvasTransform(viewportEl.scrollTop, viewportEl.scrollLeft);
 	// FE-2-0 polish: keep the open editor's body-pane clip in lockstep with the scroll (SYNCHRONOUSLY, like
 	// the canvas pin above) so the editor never momentarily slides un-clipped over the sticky bands.
+	// W3 frozen panes (Codex HIGH-2): repositionEdit re-PINS a frozen-cell editor as the body scrolls (it adds
+	// back the live frozen-axis scroll); for a body-cell editor it writes the same content position (a no-op)
+	// and re-clips. So this both pins the frozen case and keeps the body-pane clip in lockstep.
 	if (editState !== null) {
-		updateEditClip();
+		repositionEdit();
 	}
 	scheduleRedraw();
 });

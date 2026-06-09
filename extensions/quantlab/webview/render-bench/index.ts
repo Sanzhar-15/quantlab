@@ -108,6 +108,9 @@ const benchHost: RenderHost = {
 	selection: () => null,
 	publishedRanges: () => publishedRanges,
 	fillPreview: () => fillPreview,
+	// W3 frozen panes: the bench never freezes (it measures the scrolling-body blit), so 0/0.
+	frozenRowCount: () => 0,
+	frozenColCount: () => 0,
 	applyCanvasTransform,
 	onAfterFullRedraw: () => undefined,
 	onAfterScroll: () => undefined,

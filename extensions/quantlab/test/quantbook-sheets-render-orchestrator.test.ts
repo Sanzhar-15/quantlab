@@ -75,6 +75,8 @@ class FakeHost implements RenderHost {
 	sel: SelectionRect | null = null;
 	published: PublishedRange[] = [];
 	fill: SelectionRect | null = null;
+	frozenRows = 0; // W3 frozen panes: settable so a test can drive the frozen-aware blit gate
+	frozenCols = 0;
 	transforms: { scrollTop: number; scrollLeft: number }[] = [];
 	afterFull = 0;
 	afterScroll = 0;
@@ -97,6 +99,12 @@ class FakeHost implements RenderHost {
 	}
 	fillPreview(): SelectionRect | null {
 		return this.fill;
+	}
+	frozenRowCount(): number {
+		return this.frozenRows;
+	}
+	frozenColCount(): number {
+		return this.frozenCols;
 	}
 	applyCanvasTransform(scrollTop: number, scrollLeft: number): void {
 		this.transforms.push({ scrollTop, scrollLeft });

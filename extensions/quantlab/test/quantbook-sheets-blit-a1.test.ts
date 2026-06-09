@@ -16,11 +16,12 @@
 import * as assert from 'assert';
 
 import type { QuantbookCellSnapshot, QuantbookCellValue } from '../src/quantbook/types';
-import { HEADER_HEIGHT } from '../webview/sheets-webview/gridLayoutA1';
+import { COL_WIDTH, HEADER_HEIGHT, ROW_HEIGHT } from '../webview/sheets-webview/gridLayoutA1';
 import {
 	MIN_BLIT_PX,
 	ScrollState,
-	computeScrollBlitA1,
+	type ScrollBlit,
+	computeScrollBlitA1 as computeScrollBlitA1Raw,
 	diffSnapshotsA1,
 	errorRowsFlippedA1,
 	staleTintKeysA1,
@@ -29,6 +30,17 @@ import {
 // --- fixtures ---
 
 const GUTTER = 50; // a representative sticky row-gutter width (CSS px)
+
+/**
+ * **W3 frozen panes** -- the EXISTING golden tests below call the 3-arg form (no freeze). This wrapper
+ * forwards to the W3 5-arg `computeScrollBlitA1` with `frozenRowsCssH = frozenColsCssW = 0`, so every one of
+ * those assertions doubles as the "non-frozen == byte-identical to the pre-W3 blit" guarantee the brief
+ * requires (the body origins reduce to `HEADER_HEIGHT` / `gutterCssW`). The new W3 suite below calls the raw
+ * 5-arg form directly with non-zero frozen bands.
+ */
+function computeScrollBlitA1(prev: ScrollState | null, next: ScrollState, gutterCssW: number): ScrollBlit | null {
+	return computeScrollBlitA1Raw(prev, next, gutterCssW, 0, 0);
+}
 
 function state(scrollTop: number, scrollLeft: number, cssW = 800, cssH = 600, dpr = 1): ScrollState {
 	return { scrollTop, scrollLeft, cssW, cssH, dpr };
@@ -168,6 +180,84 @@ suite('FE-2-0 Phase 3 computeScrollBlitA1 -- HORIZONTAL (sticky gutter EXCLUDED,
 	});
 	test('MIN_BLIT_PX is the documented threshold (regression pin)', () => {
 		assert.strictEqual(MIN_BLIT_PX, 64);
+	});
+});
+
+suite('W3 frozen panes -- computeScrollBlitA1 frozen bands', function () {
+	test('non-frozen (0,0) is byte-identical to the 3-arg wrapper across many scrolls', () => {
+		const cases: [ScrollState, ScrollState][] = [
+			[state(0, 0), state(100, 0)],
+			[state(100, 0), state(0, 0)],
+			[state(0, 0), state(0, 100)],
+			[state(0, 100), state(0, 0)],
+			[state(0, 0, 800, 600, 2), state(40, 0, 800, 600, 2)],
+		];
+		for (const [prev, next] of cases) {
+			assert.deepStrictEqual(
+				computeScrollBlitA1Raw(prev, next, GUTTER, 0, 0),
+				computeScrollBlitA1(prev, next, GUTTER),
+				`prev/next scroll ${JSON.stringify([prev.scrollTop, prev.scrollLeft, next.scrollTop, next.scrollLeft])}`,
+			);
+		}
+	});
+	test('VERTICAL scroll with 2 frozen ROWS: the body copy starts BELOW the frozen band, not the header', () => {
+		// 2 frozen rows -> frozenRowsCssH = 2*ROW_HEIGHT = 50. bodyTop = HEADER_HEIGHT(28)+50 = 78.
+		const frozenH = 2 * ROW_HEIGHT;
+		const blit = computeScrollBlitA1Raw(state(0, 0), state(100, 0), GUTTER, frozenH, 0)!;
+		assert.notStrictEqual(blit, null);
+		const bodyTop = HEADER_HEIGHT + frozenH; // 78
+		// bodyDevH = 600 - 78 = 522; reusable = 522 - 100 = 422.
+		assert.deepStrictEqual(blit.copy, { sx: 0, sy: bodyTop + 100, sw: 800, sh: 422, dx: 0, dy: bodyTop, dw: 800, dh: 422 });
+		// The frozen-row band [HEADER_HEIGHT, bodyTop) is NEVER copied or damaged (pinned, like the header).
+		assert.ok(blit.copy.dy >= bodyTop, 'copy dest at/below the frozen band');
+		assert.ok(blit.copy.sy >= bodyTop, 'copy source at/below the frozen band');
+	});
+	test('VERTICAL scroll UP with frozen rows: the exposed strip starts at the frozen-band edge', () => {
+		const frozenH = 2 * ROW_HEIGHT; // 50
+		const bodyTop = HEADER_HEIGHT + frozenH; // 78
+		const blit = computeScrollBlitA1Raw(state(100, 0), state(0, 0), GUTTER, frozenH, 0)!;
+		assert.strictEqual(blit.damageRects[0].y, bodyTop, 'top strip starts below the frozen rows, not at HEADER_HEIGHT');
+	});
+	test('HORIZONTAL scroll with 1 frozen COL: the body copy starts RIGHT of the gutter + frozen col', () => {
+		const frozenW = 1 * COL_WIDTH; // 64
+		const bodyLeft = GUTTER + frozenW; // 114
+		const blit = computeScrollBlitA1Raw(state(0, 0), state(0, 100), GUTTER, 0, frozenW)!;
+		// bodyDevW = 800 - 114 = 686; reusable = 686 - 100 = 586.
+		assert.deepStrictEqual(blit.copy, { sx: bodyLeft + 100, sy: 0, sw: 586, sh: 600, dx: bodyLeft, dy: 0, dw: 586, dh: 600 });
+		assert.ok(blit.copy.dx >= bodyLeft, 'copy dest right of the frozen-col band');
+	});
+	test('HORIZONTAL scroll LEFT with frozen cols: the exposed strip starts at the frozen-col-band edge', () => {
+		const frozenW = 1 * COL_WIDTH; // 64
+		const bodyLeft = GUTTER + frozenW; // 114
+		const blit = computeScrollBlitA1Raw(state(0, 100), state(0, 0), GUTTER, 0, frozenW)!;
+		assert.strictEqual(blit.damageRects[0].x, bodyLeft, 'left strip starts right of the frozen cols, not at gutterW');
+	});
+	test('a vertical scroll is unaffected by frozen COLS (frozen cols scroll with their rows on Y)', () => {
+		// Frozen cols only affect the HORIZONTAL branch; a vertical scroll shifts the full width including them.
+		const frozenW = 2 * COL_WIDTH;
+		const withCols = computeScrollBlitA1Raw(state(0, 0), state(100, 0), GUTTER, 0, frozenW);
+		const noCols = computeScrollBlitA1Raw(state(0, 0), state(100, 0), GUTTER, 0, 0);
+		assert.deepStrictEqual(withCols, noCols, 'frozen cols do not change the vertical blit');
+	});
+	test('a horizontal scroll is unaffected by frozen ROWS', () => {
+		const frozenH = 3 * ROW_HEIGHT;
+		const withRows = computeScrollBlitA1Raw(state(0, 0), state(0, 100), GUTTER, frozenH, 0);
+		const noRows = computeScrollBlitA1Raw(state(0, 0), state(0, 100), GUTTER, 0, 0);
+		assert.deepStrictEqual(withRows, noRows, 'frozen rows do not change the horizontal blit');
+	});
+	test('a large frozen band that leaves < MIN_BLIT_PX reusable -> null (fail closed to full draw)', () => {
+		// bodyDevH = 600 - (28 + frozenH); with a big frozen band + a moderate scroll the reusable region drops
+		// below 64 -> null. frozenH = 500 -> bodyDevH = 72; a 20px scroll leaves 52 (< 64).
+		assert.strictEqual(computeScrollBlitA1Raw(state(0, 0), state(20, 0), GUTTER, 500, 0), null);
+	});
+	test('a negative / non-finite frozen band -> null (would corrupt the body copy origin)', () => {
+		assert.strictEqual(computeScrollBlitA1Raw(state(0, 0), state(100, 0), GUTTER, -1, 0), null);
+		assert.strictEqual(computeScrollBlitA1Raw(state(0, 0), state(0, 100), GUTTER, 0, Number.NaN), null);
+	});
+	test('a fractional frozen-row device boundary -> null (dpr 2)', () => {
+		// frozenRowsCssH = 0.25 at dpr 2 -> *2 = 0.5 (non-integer device px) -> fail closed. (Real counts are
+		// integer * ROW_HEIGHT, so this only guards a future fractional ROW_HEIGHT.)
+		assert.strictEqual(computeScrollBlitA1Raw(state(0, 0, 800, 600, 2), state(40, 0, 800, 600, 2), GUTTER, 0.25, 0), null);
 	});
 });
 
