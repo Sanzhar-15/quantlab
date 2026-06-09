@@ -1058,3 +1058,154 @@ fn composed_save_load_then_rename_column_roundtrip() {
     assert!(meta.lookup_column("Quantity").is_some());
     assert!(meta.lookup_column("Qty").is_none());
 }
+
+// ============================================================================
+// W3 (insert/delete rows & columns) — full producer → replay → recompute
+// round-trip. Mirrors the napi producer: rebuild, compute the formula-text
+// shift, assemble BatchCommit { [structural op, PutFormula × N] }, replay,
+// recompute, verify values + undo.
+// ============================================================================
+
+use ql_formula_syntax::{shift_formula_text, ShiftAxis, ShiftOp, ShiftScope};
+use ql_oplog::Op;
+
+/// Simulate the napi producer's BatchCommit assembly for a ROW insert on the
+/// single sheet "S" (id 0). Returns the BatchCommit op.
+fn producer_insert_rows(wb: &Workbook, sheet: u16, at: u32, count: u32) -> Op {
+    let edited_canonical = ql_storage::Workbook::canonical_sheet_name(wb.sheet(sheet).unwrap().name());
+    let shift_op = ShiftOp::Insert { at, count };
+    let mut ops: Vec<Op> = vec![Op::InsertRows { sheet, at, count }];
+    for (s, r, c, text) in wb.iter_formulas() {
+        let scope = ShiftScope {
+            edited_canonical: &edited_canonical,
+            edited_id: sheet,
+            owner_is_edited: s == sheet,
+        };
+        if let Some(new_text) = shift_formula_text(text.as_ref(), ShiftAxis::Row, shift_op, scope) {
+            // Post-shift position for a formula on the edited sheet.
+            let pr = if s == sheet && r >= at { r + count } else { r };
+            ops.push(Op::PutFormula { sheet: s, row: pr, col: c, text: new_text });
+        }
+    }
+    Op::BatchCommit { ops }
+}
+
+#[test]
+fn w3_insert_rows_producer_replay_recompute_shifts_formula_value() {
+    // S!A1 = 10, S!A2 = A1 * 2 = 20. Insert 1 row at index 0 (top).
+    // A1 → A2 (value 10), the formula A1*2 → A2 → A3, and its TEXT A1*2 → A2*2.
+    // After recompute, A3 = A2 * 2 = 20 still.
+    let reg = default_registry();
+    let mut wb = fresh_wb();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_value(0, 0, 0, Value::Number(10.0)).unwrap(); // A1
+        rt.set_formula(0, 1, 0, "A1 * 2").unwrap(); // A2 = A1*2
+        assert!(rt.recompute_all().is_complete());
+    }
+    assert_eq!(wb.read(Address::new(0, 1, 0)), Value::Number(20.0));
+
+    // Producer assembles the BatchCommit against the current state.
+    let batch = producer_insert_rows(&wb, 0, 0, 1);
+
+    // Replay into the SAME workbook (the structural op shifts storage + keys;
+    // the PutFormula rewrites the text at the new position).
+    let mut log = OpLog::new();
+    log.append(batch).unwrap();
+    replay_into(&log, &mut wb, &reg).unwrap();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        assert!(rt.recompute_all().is_complete());
+    }
+
+    // A1 (value 10) moved to A2.
+    assert_eq!(wb.read(Address::new(0, 1, 0)), Value::Number(10.0));
+    // The formula moved A2 → A3, its text A1*2 → A2*2 (the engine stores
+    // formula text WITHOUT the leading `=`, so the rewrite preserves that),
+    // recomputes to 20.
+    assert_eq!(
+        wb.formula_at(0, 2, 0).map(|t| t.as_ref().to_owned()),
+        Some("A2 * 2".to_string())
+    );
+    assert_eq!(wb.read(Address::new(0, 2, 0)), Value::Number(20.0));
+}
+
+#[test]
+fn w3_insert_rows_undo_round_trip_restores_original() {
+    // Insert → "undo" (replay the log WITHOUT the structural batch into a fresh
+    // workbook rebuilt from the original op stream) yields the original state.
+    // We model undo as: the canonical op stream minus the structural BatchCommit.
+    let reg = default_registry();
+
+    // Original op stream: A1=10, A2=A1*2.
+    let mut base_log = OpLog::new();
+    base_log.append(Op::PutValue { sheet: 0, row: 0, col: 0, value: ql_oplog::CellWireValue::Number(10.0) }).unwrap();
+    base_log.append(Op::PutFormula { sheet: 0, row: 1, col: 0, text: "A1 * 2".to_string() }).unwrap();
+
+    // Build the workbook from base, then assemble + apply the insert.
+    let mut wb = fresh_wb();
+    replay_into(&base_log, &mut wb, &reg).unwrap();
+    { let mut rt = WorkbookRuntime::new(&mut wb, &reg); assert!(rt.recompute_all().is_complete()); }
+    let batch = producer_insert_rows(&wb, 0, 0, 1);
+
+    // State AFTER insert.
+    let mut after = fresh_wb();
+    let mut after_log = OpLog::new();
+    after_log.append(Op::PutValue { sheet: 0, row: 0, col: 0, value: ql_oplog::CellWireValue::Number(10.0) }).unwrap();
+    after_log.append(Op::PutFormula { sheet: 0, row: 1, col: 0, text: "A1 * 2".to_string() }).unwrap();
+    after_log.append(batch).unwrap();
+    replay_into(&after_log, &mut after, &reg).unwrap();
+    { let mut rt = WorkbookRuntime::new(&mut after, &reg); assert!(rt.recompute_all().is_complete()); }
+    assert_eq!(after.read(Address::new(0, 1, 0)), Value::Number(10.0)); // shifted down
+
+    // UNDO = rebuild from the base log only (drop the structural batch). The
+    // canonical undo path in the engine is replay-from-truncated-log.
+    let mut undone = fresh_wb();
+    replay_into(&base_log, &mut undone, &reg).unwrap();
+    { let mut rt = WorkbookRuntime::new(&mut undone, &reg); assert!(rt.recompute_all().is_complete()); }
+    // Original: A1=10, A2=20.
+    assert_eq!(undone.read(Address::new(0, 0, 0)), Value::Number(10.0));
+    assert_eq!(undone.read(Address::new(0, 1, 0)), Value::Number(20.0));
+    assert_eq!(undone.formula_at(0, 1, 0).map(|t| t.as_ref().to_owned()), Some("A1 * 2".to_string()));
+}
+
+#[test]
+fn w3_delete_row_produces_ref_error_in_dependent_formula() {
+    // S!A1 = 10, S!B1 = A1 + 5. Delete row 0 (containing A1). The B1 formula's
+    // ref to A1 becomes #REF! (and B1 itself shifts up to B... wait, row 0
+    // deleted means B1 is gone too). Use A2 dependent on A1 instead.
+    // S!A1 = 10, S!A3 = A1 + 5 = 15. Delete row index 0 (A1). A3 → A2, and its
+    // ref A1 → #REF!, so it recomputes to #REF!.
+    let reg = default_registry();
+    let mut wb = fresh_wb();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_value(0, 0, 0, Value::Number(10.0)).unwrap(); // A1
+        rt.set_formula(0, 2, 0, "A1 + 5").unwrap(); // A3 = A1 + 5
+        assert!(rt.recompute_all().is_complete());
+    }
+    assert_eq!(wb.read(Address::new(0, 2, 0)), Value::Number(15.0));
+
+    // Producer for a DELETE of row index 0.
+    let edited_canonical = ql_storage::Workbook::canonical_sheet_name(wb.sheet(0).unwrap().name());
+    let shift_op = ShiftOp::Delete { start: 0, end: 0 };
+    let mut ops: Vec<Op> = vec![Op::DeleteRows { sheet: 0, start: 0, end: 0 }];
+    for (s, r, c, text) in wb.iter_formulas() {
+        let scope = ShiftScope { edited_canonical: &edited_canonical, edited_id: 0, owner_is_edited: s == 0 };
+        if let Some(new_text) = shift_formula_text(text.as_ref(), ShiftAxis::Row, shift_op, scope) {
+            // A3 (row 2) → row 1 after deleting row 0.
+            let pr = r - 1;
+            ops.push(Op::PutFormula { sheet: s, row: pr, col: c, text: new_text });
+        }
+    }
+    let mut log = OpLog::new();
+    log.append(Op::BatchCommit { ops }).unwrap();
+    replay_into(&log, &mut wb, &reg).unwrap();
+    { let mut rt = WorkbookRuntime::new(&mut wb, &reg); let _ = rt.recompute_all(); }
+
+    // The formula moved to A2 (row 1); its text now references #REF!.
+    let new_text = wb.formula_at(0, 1, 0).map(|t| t.as_ref().to_owned()).unwrap_or_default();
+    assert!(new_text.contains("#REF!"), "expected #REF! in rewritten formula, got {new_text:?}");
+    // It recomputes to a #REF! error value.
+    assert_eq!(wb.read(Address::new(0, 1, 0)), Value::Error(ql_types::ErrorValue::Ref));
+}

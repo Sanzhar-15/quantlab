@@ -99,7 +99,9 @@ fn snapshot_equivalent(
     session: &CollabSession,
     registry: &ql_functions::FunctionRegistry,
 ) -> usize {
-    let (workbook, _report) = session.rebuild_workbook(registry).expect("rebuild_workbook");
+    let (workbook, _report) = session
+        .rebuild_workbook(registry)
+        .expect("rebuild_workbook");
     let workbook_date_system = workbook.date_system();
     let eval_ctx = ql_types::EvalContext {
         date_system: workbook_date_system,
@@ -135,26 +137,24 @@ fn snapshot_equivalent(
                 let _repaired_formula = workbook
                     .formula_at(sheet_id, row, col)
                     .map(|s| s.as_ref().to_string());
-                let _rendered: Option<String> =
-                    match (state.format.as_ref(), state.value.as_ref()) {
-                        (Some(fmt_id), Some(wire_value)) if !wire_value.is_pending() => {
-                            let fmt_id_copy = *fmt_id;
-                            wire_value.to_value().ok().and_then(|value| {
-                                if let Some(fmt) = parsed_format_cache.get(&fmt_id_copy) {
-                                    return Some(ql_functions::format::render(
-                                        &value, fmt, &eval_ctx,
-                                    ));
-                                }
-                                let fmt_str = workbook.formats().lookup(fmt_id_copy)?;
-                                let fmt = ql_functions::format::parse(fmt_str).ok()?;
-                                let rendered_str =
-                                    ql_functions::format::render(&value, &fmt, &eval_ctx);
-                                parsed_format_cache.insert(fmt_id_copy, fmt);
-                                Some(rendered_str)
-                            })
-                        }
-                        _ => None,
-                    };
+                let _rendered: Option<String> = match (state.format.as_ref(), state.value.as_ref())
+                {
+                    (Some(fmt_id), Some(wire_value)) if !wire_value.is_pending() => {
+                        let fmt_id_copy = *fmt_id;
+                        wire_value.to_value().ok().and_then(|value| {
+                            if let Some(fmt) = parsed_format_cache.get(&fmt_id_copy) {
+                                return Some(ql_functions::format::render(&value, fmt, &eval_ctx));
+                            }
+                            let fmt_str = workbook.formats().lookup(fmt_id_copy)?;
+                            let fmt = ql_functions::format::parse(fmt_str).ok()?;
+                            let rendered_str =
+                                ql_functions::format::render(&value, &fmt, &eval_ctx);
+                            parsed_format_cache.insert(fmt_id_copy, fmt);
+                            Some(rendered_str)
+                        })
+                    }
+                    _ => None,
+                };
                 // Track ONE per cell so callers can sum cell counts.
                 1
             })
@@ -163,8 +163,7 @@ fn snapshot_equivalent(
         total_cells += cell_count;
         sheets_out.push((sheet_id, name, cell_count));
     }
-    let mut format_pairs: Vec<(ql_storage::FormatId, &str)> =
-        workbook.formats().iter().collect();
+    let mut format_pairs: Vec<(ql_storage::FormatId, &str)> = workbook.formats().iter().collect();
     format_pairs.sort_by_key(|(id, _)| *id);
     let _formats: Vec<(ql_storage::FormatId, String)> = format_pairs
         .into_iter()
@@ -208,16 +207,12 @@ fn bench_workbook_snapshot(c: &mut Criterion) {
                     "cells={} fmt={}% sheets={}",
                     expected_cells, format_pct, n_sheets
                 );
-                group.bench_with_input(
-                    BenchmarkId::from_parameter(&label),
-                    &session,
-                    |b, s| {
-                        b.iter(|| {
-                            let n = snapshot_equivalent(s, &registry);
-                            black_box(n);
-                        });
-                    },
-                );
+                group.bench_with_input(BenchmarkId::from_parameter(&label), &session, |b, s| {
+                    b.iter(|| {
+                        let n = snapshot_equivalent(s, &registry);
+                        black_box(n);
+                    });
+                });
             }
         }
     }
@@ -365,15 +360,20 @@ fn snapshot_delta_equivalent(
     }
     // Walk ops to collect changed cell coords (no rename in this
     // bench so we don't need has_rename; cells are the only output).
-    let mut changed: std::collections::HashSet<(u16, u32, u32)> =
-        std::collections::HashSet::new();
+    let mut changed: std::collections::HashSet<(u16, u32, u32)> = std::collections::HashSet::new();
     for index in cached_op_count..current_op_count {
         let op_result = session.log().get(index).expect("index in measured range");
         let op = op_result.expect("op decode");
-        if let Op::PutValue { sheet, row, col, .. }
-        | Op::PutFormula { sheet, row, col, .. }
+        if let Op::PutValue {
+            sheet, row, col, ..
+        }
+        | Op::PutFormula {
+            sheet, row, col, ..
+        }
         | Op::ClearFormula { sheet, row, col }
-        | Op::SetCellFormat { sheet, row, col, .. } = op
+        | Op::SetCellFormat {
+            sheet, row, col, ..
+        } = op
         {
             changed.insert((sheet, row, col));
         }
@@ -409,26 +409,22 @@ fn snapshot_delta_equivalent(
             let _repaired_formula = next_workbook
                 .formula_at(sheet, row, col)
                 .map(|s| s.as_ref().to_string());
-            let _rendered: Option<String> =
-                match (state.format.as_ref(), state.value.as_ref()) {
-                    (Some(fmt_id), Some(wire_value)) if !wire_value.is_pending() => {
-                        let fmt_id_copy = *fmt_id;
-                        wire_value.to_value().ok().and_then(|value| {
-                            if let Some(fmt) = parsed_format_cache.get(&fmt_id_copy) {
-                                return Some(ql_functions::format::render(
-                                    &value, fmt, &eval_ctx,
-                                ));
-                            }
-                            let fmt_str = next_workbook.formats().lookup(fmt_id_copy)?;
-                            let fmt = ql_functions::format::parse(fmt_str).ok()?;
-                            let rendered_str =
-                                ql_functions::format::render(&value, &fmt, &eval_ctx);
-                            parsed_format_cache.insert(fmt_id_copy, fmt);
-                            Some(rendered_str)
-                        })
-                    }
-                    _ => None,
-                };
+            let _rendered: Option<String> = match (state.format.as_ref(), state.value.as_ref()) {
+                (Some(fmt_id), Some(wire_value)) if !wire_value.is_pending() => {
+                    let fmt_id_copy = *fmt_id;
+                    wire_value.to_value().ok().and_then(|value| {
+                        if let Some(fmt) = parsed_format_cache.get(&fmt_id_copy) {
+                            return Some(ql_functions::format::render(&value, fmt, &eval_ctx));
+                        }
+                        let fmt_str = next_workbook.formats().lookup(fmt_id_copy)?;
+                        let fmt = ql_functions::format::parse(fmt_str).ok()?;
+                        let rendered_str = ql_functions::format::render(&value, &fmt, &eval_ctx);
+                        parsed_format_cache.insert(fmt_id_copy, fmt);
+                        Some(rendered_str)
+                    })
+                }
+                _ => None,
+            };
             count += 1;
         }
     }
