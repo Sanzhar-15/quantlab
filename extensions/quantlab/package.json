@@ -295,6 +295,64 @@
         "category": "%command.category%"
       },
       {
+        "_comment": "W3 (Wave 3): Cell Grid context-menu clipboard commands -- route to the focused webview's clipboard logic.",
+        "command": "quantlab.quantbookCellGridCut",
+        "title": "%command.quantbookCellGridCut.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookCellGridCopy",
+        "title": "%command.quantbookCellGridCopy.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookCellGridPaste",
+        "title": "%command.quantbookCellGridPaste.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookCellGridClearContents",
+        "title": "%command.quantbookCellGridClearContents.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "W3 (Wave 3): Cell Grid context-menu insert/delete -- types-first handshake with the W1 engine window.",
+        "command": "quantlab.quantbookInsertRowAbove",
+        "title": "%command.quantbookInsertRowAbove.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookInsertRowBelow",
+        "title": "%command.quantbookInsertRowBelow.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookInsertColumnLeft",
+        "title": "%command.quantbookInsertColumnLeft.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookInsertColumnRight",
+        "title": "%command.quantbookInsertColumnRight.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookDeleteRow",
+        "title": "%command.quantbookDeleteRow.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookDeleteColumn",
+        "title": "%command.quantbookDeleteColumn.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "W3 (Wave 3): Freeze Panes Here -- the frozen-panes lead OWNS the real implementation. W3 declares it (so the context-menu item is never a broken command path standalone) + registers a loud placeholder that the conductor REPLACES with the lead's command at integration.",
+        "command": "quantlab.quantbookFreezePanesHere",
+        "title": "%command.quantbookFreezePanesHere.title%",
+        "category": "%command.category%"
+      },
+      {
         "_comment": "FE-BEYOND B1 (W3): start the Quantbook MCP server (read + write tools).",
         "command": "quantlab.quantbookStartMcpServer",
         "title": "%command.quantbookStartMcpServer.title%",
@@ -778,6 +836,53 @@
       ]
     },
     "menus": {
+      "commandPalette": [
+        {
+          "_comment": "W3 (Wave 3): the Cell Grid context-menu items are right-click-only. Hide them from the Command Palette -- their generic titles (Cut/Copy/Insert Row Above) are meaningful only in the grid's right-click menu, and they act on the focused grid (no palette affordance).",
+          "command": "quantlab.quantbookCellGridCut",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookCellGridCopy",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookCellGridPaste",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookCellGridClearContents",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookInsertRowAbove",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookInsertRowBelow",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookInsertColumnLeft",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookInsertColumnRight",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookDeleteRow",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookDeleteColumn",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookFreezePanesHere",
+          "when": "false"
+        }
+      ],
       "accountsMenu": [
         {
           "command": "quantlab.signIn",
@@ -889,6 +994,70 @@
           "command": "quantlab.openDataAction",
           "when": "resourceExtname =~ /\\.(csv|parquet|xlsx)$/i",
           "group": "navigation@11"
+        }
+      ],
+      "webview/context": [
+        {
+          "_comment": "W3 (Wave 3): the Cell Grid right-click menu. Gated on the quantbook grid webview + the body-cell section (set via data-vscode-context on right-click). Excel-style groups: 1=clipboard, 2=clear, 3=format/freeze, 4=insert/delete. The conductor merges this section across the 3 wave-3 windows.",
+          "command": "quantlab.quantbookCellGridCut",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "1_clipboard@1"
+        },
+        {
+          "command": "quantlab.quantbookCellGridCopy",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "1_clipboard@2"
+        },
+        {
+          "command": "quantlab.quantbookCellGridPaste",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "1_clipboard@3"
+        },
+        {
+          "command": "quantlab.quantbookCellGridClearContents",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "2_edit@1"
+        },
+        {
+          "command": "quantlab.quantbookSetFormat",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "3_format@1"
+        },
+        {
+          "_comment": "W3: routes to the frozen-panes lead's Freeze command. The command id is the W3-assumed name; the conductor reconciles it with the lead's actual id at integration (runtime-pending the lead's command).",
+          "command": "quantlab.quantbookFreezePanesHere",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "3_format@2"
+        },
+        {
+          "command": "quantlab.quantbookInsertRowAbove",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "4_structure@1"
+        },
+        {
+          "command": "quantlab.quantbookInsertRowBelow",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "4_structure@2"
+        },
+        {
+          "command": "quantlab.quantbookInsertColumnLeft",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "4_structure@3"
+        },
+        {
+          "command": "quantlab.quantbookInsertColumnRight",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "4_structure@4"
+        },
+        {
+          "command": "quantlab.quantbookDeleteRow",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "4_structure@5"
+        },
+        {
+          "command": "quantlab.quantbookDeleteColumn",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "4_structure@6"
         }
       ]
     },

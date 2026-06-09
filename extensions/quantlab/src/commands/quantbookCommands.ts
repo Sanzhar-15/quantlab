@@ -43,6 +43,10 @@ import { showRenderBenchPanel } from '../quantbook/bench/renderBenchPanel';
 import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, classifySwitchSheetTarget, resolveCommandTargetPanel } from '../quantbook/cellGrid/cellGridLogic';
 import { FORMAT_PRESET_CHOICES, buildFormatUndoLabel, buildSetFormatOps, formatStringForPreset, presetLabel, type FormatPreset } from '../quantbook/cellGrid/formatPickerLogic';
 import { formatRangeTarget, normalizeSelectionRect } from '../quantbook/reactiveNotebook/bindVariableLogic';
+// W3 (Wave 3, 2026-06-09): the pure structural-op planner (selection -> engine insert/delete call) + the
+// data-vscode-context argument validator (Codex HIGH-1/HIGH-2 fold: plan from the carried selection,
+// route by the carried panel token).
+import { describeStructuralPlan, parseContextMenuArg, planStructuralOp, type StructuralOp } from '../quantbook/cellGrid/contextMenuLogic';
 import type { CollabSessionInstance, SessionInstance } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
@@ -761,18 +765,74 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 		}),
 	);
 
+	// **W3 (Codex re-audit HIGH + 2nd re-audit MED)** -- resolve the `{session, sheet, selection}` a
+	// selection-driven command should act on, from EITHER the native-menu context argument (the authoritative
+	// right-click-time payload: route to the EXACT panel by token + use the carried selection) OR -- when
+	// invoked with NO argument (palette / keyboard) -- the focused grid's reported selection. This makes the
+	// `Set Cell Format` menu item immune to the same stale-selection / wrong-panel race the W3 structural
+	// commands already avoid, without breaking its palette/keyboard entry point.
+	//
+	// Returns a DISCRIMINATED result so the caller distinguishes (No-Fallbacks -- a malformed menu arg must
+	// NOT silently fall back to the focused grid):
+	//   - `ok`: a resolved selection.
+	//   - `no-selection`: invoked with no arg and no focused-grid selection -> "select a cell first".
+	//   - `invalid-arg`: invoked WITH a context arg that failed validation (tampered / version-skewed
+	//     `data-vscode-context`) -> a distinct error, never a focused-grid fallback.
+	//   - `panel-gone`: a valid arg whose raising panel has since closed.
+	type MenuSelection = { session: SessionInstance; sheet: number; selection: { anchorRow: number; anchorCol: number; focusRow: number; focusCol: number } };
+	const resolveMenuOrFocusedSelection = (
+		hasArg: boolean,
+		contextArg: unknown,
+	): { kind: 'ok'; value: MenuSelection } | { kind: 'no-selection' } | { kind: 'invalid-arg' } | { kind: 'panel-gone' } => {
+		if (hasArg) {
+			// A context argument WAS provided (menu invocation): it MUST validate. A malformed one fails
+			// visibly rather than formatting the focused grid (which may be a DIFFERENT panel/selection).
+			const arg = parseContextMenuArg(contextArg);
+			if (arg === undefined) {
+				return { kind: 'invalid-arg' };
+			}
+			const panel = CellGridPanel.panelByToken(arg.panelToken);
+			if (panel === undefined) {
+				return { kind: 'panel-gone' };
+			}
+			const { session, sheet } = panel.target;
+			return { kind: 'ok', value: { session, sheet, selection: arg.selection } };
+		}
+		// No argument (palette / keyboard): use the focused grid's reported selection.
+		const focused = CellGridPanel.focusedGridSelection();
+		if (focused === undefined) {
+			return { kind: 'no-selection' };
+		}
+		return { kind: 'ok', value: { session: focused.session, sheet: focused.sheet, selection: focused.selection } };
+	};
+
 	// FE-1.5 W-G "Set Cell Format": apply an Excel number format to the focused grid's SELECTION. Pure
 	// host UI -- the engine already renders the formatted string (the snapshot carries `entry.rendered`,
 	// painted by canvasGrid.ts), so this command only registers the format + sets it on each selected
 	// cell; the grid re-renders automatically via refreshSession. The pure preset->format-string map +
 	// the setFormat op-builder live in formatPickerLogic.ts (unit-tested); this is a thin vscode shell.
+	// **W3 (Codex re-audit HIGH)**: when invoked from the native context menu it receives the
+	// `data-vscode-context` payload (token + authoritative selection) and acts on THAT exact panel+rect;
+	// from the palette/keyboard it falls back to the focused grid's selection.
 	context.subscriptions.push(
-		vscode.commands.registerCommand('quantlab.quantbookSetFormat', async () => {
-			const sel = CellGridPanel.focusedGridSelection();
-			if (sel === undefined) {
+		vscode.commands.registerCommand('quantlab.quantbookSetFormat', async (...args: unknown[]) => {
+			// `args.length > 0` distinguishes a menu invocation (VS Code passes the parsed data-vscode-context)
+			// from a palette/keyboard invocation (no argument) -- so a malformed menu arg fails visibly instead
+			// of silently formatting the focused grid (Codex 2nd re-audit MED).
+			const resolved = resolveMenuOrFocusedSelection(args.length > 0, args[0]);
+			if (resolved.kind === 'invalid-arg') {
+				void vscode.window.showErrorMessage('Quantbook: set format failed -- the right-click menu sent an invalid cell context. Try selecting the cell and re-running.');
+				return;
+			}
+			if (resolved.kind === 'panel-gone') {
+				void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+				return;
+			}
+			if (resolved.kind === 'no-selection') {
 				void vscode.window.showInformationMessage('Select one or more cells in a Cell Grid first -- the format applies to the focused grid\'s selection.');
 				return;
 			}
+			const sel = resolved.value;
 			const presetPick = await vscode.window.showQuickPick(
 				FORMAT_PRESET_CHOICES.map(c => ({ label: c.label, detail: c.detail, preset: c.preset })),
 				{ title: 'Set Cell Format', placeHolder: 'Choose a number format for the selected cells' },
@@ -850,6 +910,168 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 					log.appendLine(`refreshSession after setFormat failed (non-fatal): ${detail}`);
 				}
 			}
+		}),
+	);
+
+	// --- W3 (Wave 3, 2026-06-09): the Cell Grid right-click context menu's host commands. ---------------
+	//
+	// **SHARED-FILE FLAG (conductor):** this additive block + the import above are the W3 footprint in
+	// quantbookCommands.ts (the frozen-panes lead also adds a `Freeze Panes` command here -- distinct block).
+	//
+	// Each native menu item runs a host command invoked with the PARSED `data-vscode-context` the webview set
+	// on right-click as its FIRST argument. That payload carries (Codex W3 HIGH-1 + HIGH-2):
+	//   - `panelToken`: routes the action to the EXACT panel that raised the menu (not merely the focused one,
+	//     which can differ in split editors / focus edge cases -> wrong grid).
+	//   - `selection`: the authoritative right-click-time selection rect, so the insert/delete command plans
+	//     from THIS rect, not the async-updated host selection (a fast menu command could read it stale).
+	// `parseContextMenuArg` validates the payload; a malformed / missing arg is a clear toast (No-Fallbacks),
+	// never a guessed action.
+	//
+	// Two kinds of command:
+	//   1. Clipboard (Cut/Copy/Paste/Clear Contents) -- the clipboard state lives in the WEBVIEW, so these
+	//      post a `contextMenuAction` to the raising panel's webview (the SAME code as the keyboard shortcuts);
+	//      delivery is AWAITED + a failure toasts (No-Fallbacks). FULLY LIVE now.
+	//   2. Insert/Delete row/column -- a TYPES-FIRST HANDSHAKE with the W1 engine window. The command plans
+	//      the structural call (pure planStructuralOp) from the carried selection and invokes the typed
+	//      `SessionInstance.insert/delete{Rows,Columns}` method + recalc + refresh (mirroring setValue ->
+	//      recalcDirtyChecked -> refreshSession). TYPED now; the runtime lights up once W1's engine dylib
+	//      merges (the conductor sequences this). No fakery: it calls the REAL typed method; if it is absent
+	//      at runtime the command throws loud.
+
+	// The toast for a missing / malformed context argument (right-click did not yield a valid grid cell).
+	const contextArgToast = (): void => {
+		void vscode.window.showInformationMessage('Quantbook: right-click a cell in a Cell Grid to use this action.');
+	};
+
+	// 1. CLIPBOARD: route the menu item to the RAISING panel's webview clipboard logic (by panelToken).
+	const registerClipboardCommand = (commandId: string, action: 'cut' | 'copy' | 'paste' | 'clear', verb: string): void => {
+		context.subscriptions.push(
+			vscode.commands.registerCommand(commandId, async (contextArg?: unknown) => {
+				const arg = parseContextMenuArg(contextArg);
+				if (arg === undefined) {
+					contextArgToast();
+					return;
+				}
+				// AWAIT delivery (No-Fallbacks): a torn-down panel or an undelivered post is a clear toast, never
+				// a silent no-op (the webview owns the clipboard, so a dropped message means the action did NOT run).
+				const outcome = await CellGridPanel.postContextMenuAction(arg.panelToken, action);
+				if (outcome === 'no-panel') {
+					void vscode.window.showInformationMessage(`Quantbook: the Cell Grid for this menu is no longer open, so it could not ${verb}.`);
+				} else if (outcome === 'undelivered') {
+					void vscode.window.showWarningMessage(`Quantbook: could not ${verb} -- the Cell Grid did not receive the action. Try again.`);
+				}
+			}),
+		);
+	};
+	registerClipboardCommand('quantlab.quantbookCellGridCut', 'cut', 'cut');
+	registerClipboardCommand('quantlab.quantbookCellGridCopy', 'copy', 'copy');
+	registerClipboardCommand('quantlab.quantbookCellGridPaste', 'paste', 'paste');
+	// "Clear Contents" clears the SELECTION when a range is active (Codex MED-3): the webview's `clear` action
+	// is range-aware so the label never overstates what happened.
+	registerClipboardCommand('quantlab.quantbookCellGridClearContents', 'clear', 'clear contents');
+
+	// 2. INSERT / DELETE rows + columns (types-first handshake with W1). One shared implementation over the
+	// pure planStructuralOp; each command id binds a single StructuralOp. The structural call mutates ONE
+	// sheet's row/column structure + dirties dependents -> recalc + refresh THIS session's panels, exactly
+	// like setFormat. Any engine throw (out-of-range index, off-Ready session, or -- until W1 merges -- a
+	// missing method) surfaces as a loud toast (No-Fallbacks).
+	const registerStructuralCommand = (commandId: string, op: StructuralOp): void => {
+		context.subscriptions.push(
+			vscode.commands.registerCommand(commandId, (contextArg?: unknown) => {
+				const arg = parseContextMenuArg(contextArg);
+				if (arg === undefined) {
+					contextArgToast();
+					return;
+				}
+				// Codex HIGH-2: resolve the EXACT panel that raised the menu (by token), not the focused one.
+				const panel = CellGridPanel.panelByToken(arg.panelToken);
+				if (panel === undefined) {
+					void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+					return;
+				}
+				const { session, sheet } = panel.target;
+				const log = getOutput();
+				// Codex HIGH-1: plan from the AUTHORITATIVE selection the payload carried (synchronous), not the
+				// async-updated host selection.
+				const plan = planStructuralOp(op, arg.selection);
+				// Codex LOW-1: detect a missing engine capability BY DIRECT FEATURE-CHECK (not by parsing a
+				// TypeError message, which is brittle across native/proxy error shapes). Still loud (No-Fallbacks).
+				const method = (session as unknown as Record<string, unknown>)[plan.method];
+				if (typeof method !== 'function') {
+					const msg = `Quantbook ${plan.method} failed: the engine's insert/delete capability is not available in the loaded build yet.`;
+					log.appendLine(`FATAL ${plan.method} unavailable: method is not a function on the loaded Session.`);
+					void vscode.window.showErrorMessage(msg);
+					return;
+				}
+				let opSucceeded = false;
+				try {
+					// Invoke the typed (W1-handshake) structural method. The method name is chosen by the plan; the
+					// index is a row index (row ops) or column index (column ops).
+					switch (plan.method) {
+						case 'insertRows':
+							session.insertRows(sheet, plan.index, plan.count);
+							break;
+						case 'deleteRows':
+							session.deleteRows(sheet, plan.index, plan.count);
+							break;
+						case 'insertColumns':
+							session.insertColumns(sheet, plan.index, plan.count);
+							break;
+						case 'deleteColumns':
+							session.deleteColumns(sheet, plan.index, plan.count);
+							break;
+						default: {
+							const unreachable: never = plan.method;
+							throw new Error(`unhandled structural method ${String(unreachable)}`);
+						}
+					}
+					recalcDirtyChecked(session);
+					opSucceeded = true;
+					const label = describeStructuralPlan(plan);
+					log.appendLine(`${label} on sheet ${sheet} at index ${plan.index}.`);
+					void vscode.window.showInformationMessage(`Quantbook: ${label}.`);
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`FATAL ${plan.method} error: ${detail}`);
+					void vscode.window.showErrorMessage(`Quantbook ${plan.method} failed: ${detail}`);
+				}
+				if (opSucceeded) {
+					try {
+						const { refreshed, failed } = CellGridPanel.refreshSession(session);
+						log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
+						if (failed > 0) {
+							void vscode.window.showWarningMessage(`Quantbook: the structural change succeeded, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
+						}
+					} catch (err) {
+						// Codex MED-2: the mutation landed but the repaint threw -> the grid on screen may be STALE.
+						// Surface a VISIBLE warning (not just a log line), mirroring the dropped-render path elsewhere.
+						const detail = err instanceof Error ? err.message : String(err);
+						log.appendLine(`refreshSession after ${plan.method} failed: ${detail}`);
+						void vscode.window.showWarningMessage(`Quantbook: the change applied, but the grid may be showing stale values (a repaint failed) -- run "Quantbook: Refresh Cell Grid".`);
+					}
+				}
+			}),
+		);
+	};
+	registerStructuralCommand('quantlab.quantbookInsertRowAbove', 'insertRowAbove');
+	registerStructuralCommand('quantlab.quantbookInsertRowBelow', 'insertRowBelow');
+	registerStructuralCommand('quantlab.quantbookInsertColumnLeft', 'insertColumnLeft');
+	registerStructuralCommand('quantlab.quantbookInsertColumnRight', 'insertColumnRight');
+	registerStructuralCommand('quantlab.quantbookDeleteRow', 'deleteRow');
+	registerStructuralCommand('quantlab.quantbookDeleteColumn', 'deleteColumn');
+
+	// 3. FREEZE PANES HERE -- a LOUD PLACEHOLDER (Codex re-audit MED). The frozen-panes lead OWNS the real
+	// implementation in this same wave; W3 only references the command in the context menu. To keep THIS
+	// branch standalone-safe (a menu command with no registered handler is a broken command path -- worse
+	// than a clear message), W3 registers this placeholder that explains the feature is pending. **The
+	// conductor REPLACES this registration + the package.json command declaration with the lead's real
+	// `quantlab.quantbookFreezePanesHere` at integration** (a duplicate registerCommand would throw, so the
+	// conductor drops exactly one). No-Fallbacks: the placeholder is a clear message, never a silent no-op.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookFreezePanesHere', () => {
+			void vscode.window.showInformationMessage(
+				'Quantbook: Freeze Panes is not available in this build yet (it ships with the frozen-panes change in this wave).',
+			);
 		}),
 	);
 }
