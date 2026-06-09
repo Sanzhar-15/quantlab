@@ -39,8 +39,17 @@
  * Side-effecting entry (no top-level exports) so the esm bundle loads via a classic `<script>`.
  */
 
-import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
+import type { DiagnosticJson, FunctionMetadataJson, QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { clampDisplayString, formatCellValue } from './cellRender';
+import {
+	buildSignatureLabel,
+	extractCompletionPrefix,
+	filterFunctions,
+	findSignatureContext,
+	moveActiveIndex,
+	type CompletionFunction,
+	type CompletionItem,
+} from './formulaIntel';
 import { CanvasGridRenderer, type ActiveCell, type PublishedRange } from './canvasGrid';
 import { staleTintKeysA1 } from './gridBlitA1';
 import { pasteAreaMismatch, planFill, planPaste, type GridClipboard } from './clipboardLogic';
@@ -152,8 +161,18 @@ root.innerHTML =
 	'<span class="cell-grid-published-chip" id="sheets-published-chip" hidden></span>' +
 	'<input id="sheets-formula-input" class="cell-grid-formula-input" type="text" readonly ' +
 	'aria-label="Formula bar (selected cell contents)" spellcheck="false" autocomplete="off" ' +
-	'autocorrect="off" autocapitalize="off" />' +
+	'autocorrect="off" autocapitalize="off" aria-autocomplete="list" aria-expanded="false" ' +
+	'aria-controls="sheets-formula-suggest" />' +
+	// W2 formula intelligence: the function-completion dropdown (populated + positioned in JS; hidden by
+	// default). A listbox of candidate function names, keyboard-navigable; Enter/Tab inserts the name + '('.
+	'<ul id="sheets-formula-suggest" class="cell-grid-formula-suggest" role="listbox" ' +
+	'aria-label="Function suggestions" hidden></ul>' +
 	'</div>' +
+	// W2 formula intelligence: a subtle line UNDER the bar that shows either the inline validation error
+	// (parse/bind diagnostic from the engine) or the signature hint (the function's parameter list when the
+	// caret is inside FN(...) ). Hidden when there is nothing to show. role=status so a screen reader
+	// announces a new validation message without stealing focus.
+	'<div id="sheets-formula-hint" class="cell-grid-formula-hint" role="status" hidden></div>' +
 	'<div class="cell-grid-viewport" id="sheets-viewport" tabindex="0">' +
 	'<div id="sheets-spacer"></div>' +
 	'<canvas id="sheets-canvas"></canvas>' +
@@ -171,6 +190,10 @@ const viewportEl = document.getElementById('sheets-viewport') as HTMLElement;
 const spacerEl = document.getElementById('sheets-spacer') as HTMLElement;
 const canvasEl = document.getElementById('sheets-canvas') as HTMLCanvasElement;
 const inputEl = document.getElementById('sheets-edit-input') as HTMLInputElement;
+// W2 formula intelligence: the completion dropdown (a <ul> listbox) + the hint line (validation error /
+// signature). Both are part of the formula bar; populated + toggled by the formula-assist logic below.
+const suggestEl = document.getElementById('sheets-formula-suggest') as HTMLUListElement;
+const hintEl = document.getElementById('sheets-formula-hint') as HTMLElement;
 
 /**
  * **FE-2-0 Phase 1 (C1-MED3 / C1-MED6, 2026-06-03; re-audit MED-4)** -- the visible in-webview error
@@ -911,6 +934,10 @@ function cancelEdit(): void {
 		// restore the committed content via updateFormulaBar -- editState is already null, so its
 		// surface guard lets this write through. Do NOT clear/hide it.
 		formulaInputEl.readOnly = true;
+		// W2 formula intelligence: tear down the dropdown + hint + any pending validate (editState is already
+		// nulled, so the assist functions' formulaBarIsEditing() guard reads false -- this is the explicit
+		// cleanup). Done before updateFormulaBar so the bar returns to a clean display state.
+		teardownFormulaAssist();
 		updateFormulaBar();
 	}
 	clearCommitWatchdog(); // the editor is gone -- no pending commit to recover (re-audit HIGH)
@@ -965,6 +992,409 @@ function beginEditFormula(): void {
 		initialValue: prior.text, // the displayed content == the blur baseline (megaudit MED-1: the prior value)
 		pendingCommit: false,
 	};
+	// W2 formula intelligence: the formula bar is now the live editor. Fetch the function catalog (once) for
+	// the completion dropdown, and seed the validation + signature hint off the current content (e.g. opening
+	// the bar on an already-invalid formula shows its diagnostic). No dropdown opens until the user types.
+	ensureFunctionListRequested();
+	scheduleValidate();
+	updateSignatureHint();
+}
+
+// ============================================================================
+// W2 formula intelligence (2026-06-09) -- lightweight assist on the formula bar.
+//
+// Three affordances, all driven by the pure `formulaIntel.ts` core, all scoped to the FORMULA BAR editor
+// (`editState.surface === 'formula'`) so they never interfere with the in-cell overlay edit path:
+//   1. an inline validation HINT (debounced `validateFormula` -> the engine's parse/bind diagnostics);
+//   2. a function-completion DROPDOWN (`listFunctions` -> a prefix-filtered listbox; Enter/Tab inserts);
+//   3. a signature HINT (the function's parameter list when the caret is inside `FN(`).
+//
+// The dropdown's keyboard handling is interleaved with the SHARED `onEditKeydown` (see the guard at the top
+// of that handler): when the dropdown is OPEN, Up/Down/Enter/Tab/Esc drive the LIST (and are swallowed
+// before the grid-nav / commit logic); when CLOSED, every key falls through to the existing edit machinery
+// unchanged. This preserves Enter-commit-and-move, Esc-revert, Tab-nav, the single-active-editor model, the
+// oversize refusal, and the reload-race guards.
+// ============================================================================
+
+/** The function catalog (built-ins + UDFs) fetched once from the host after the handshake; null until it
+ * arrives. The completion dropdown shows NOTHING until this is populated (No-Fallbacks: no fabricated list). */
+let functionCatalog: CompletionFunction[] | null = null;
+/** Canonical-name -> metadata, for the signature hint (built alongside `functionCatalog`). */
+let functionMetaByName: Map<string, FunctionMetadataJson> = new Map();
+/** Set once so we don't spam `listFunctions` requests (one fetch is enough -- the catalog is session-stable). */
+let functionListRequested = false;
+
+/** The open completion dropdown's state, or null when closed. `items` is the filtered candidate list;
+ * `activeIndex` is the highlighted row (-1 = none); `replaceStart`/`replaceEnd` are the [start,end) offsets
+ * in the input value that an accepted completion REPLACES (the typed prefix). */
+interface CompletionState {
+	items: CompletionItem[];
+	activeIndex: number;
+	replaceStart: number;
+	replaceEnd: number;
+}
+let completion: CompletionState | null = null;
+
+/** How many completion candidates to render at once (an empty-prefix "show all" is capped to this). */
+const MAX_COMPLETION_ITEMS = 50;
+
+/** Debounce (ms) before a formula-bar keystroke triggers `validateFormula` -- keeps the engine off the
+ * per-keystroke hot path while staying responsive. */
+const VALIDATE_DEBOUNCE_MS = 250;
+let validateTimer: ReturnType<typeof setTimeout> | undefined;
+/** Monotonic per-request token: a debounced validate stamps the next id; only the reply whose id equals
+ * `latestValidateReqId` is applied (a superseded in-flight validate is dropped -- the user kept typing). */
+let nextValidateReqId = 0;
+let latestValidateReqId = -1;
+/** Monotonic token for the one-shot `listFunctions` request (matched in the reply to drop a stale answer). */
+let nextFuncReqId = 0;
+let latestFuncReqId = -1;
+
+/** Is the formula bar the LIVE editor right now? All assist affordances are gated on this. */
+function formulaBarIsEditing(): boolean {
+	return editState !== null && editState.surface === 'formula';
+}
+
+/** Request the function catalog from the host (once). Called when the formula bar first enters edit -- by
+ * then the channel + session are live. Idempotent. */
+function ensureFunctionListRequested(): void {
+	if (functionListRequested) {
+		return;
+	}
+	functionListRequested = true;
+	const reqId = ++nextFuncReqId;
+	latestFuncReqId = reqId;
+	vscode.postMessage({ type: 'listFunctions', reqId, webviewId: WEBVIEW_ID });
+}
+
+/** Close the completion dropdown (state + DOM + ARIA). Safe to call when already closed. */
+function closeCompletion(): void {
+	if (completion === null && suggestEl.hidden) {
+		return;
+	}
+	completion = null;
+	suggestEl.hidden = true;
+	suggestEl.replaceChildren();
+	formulaInputEl.setAttribute('aria-expanded', 'false');
+	formulaInputEl.removeAttribute('aria-activedescendant');
+}
+
+/** Paint the dropdown from `completion` (assumed non-null). Renders each candidate as an <li role=option>;
+ * the active row gets the `is-active` class + aria-selected. Positions the listbox under the input. */
+function renderCompletion(): void {
+	if (completion === null) {
+		return;
+	}
+	suggestEl.replaceChildren();
+	completion.items.forEach((item, idx) => {
+		const li = document.createElement('li');
+		li.className = 'cell-grid-suggest-item' + (idx === completion!.activeIndex ? ' is-active' : '');
+		li.id = 'sheets-suggest-opt-' + idx;
+		li.setAttribute('role', 'option');
+		li.setAttribute('aria-selected', idx === completion!.activeIndex ? 'true' : 'false');
+		// The matched name (canonical or the alias the user typed toward). A via-alias hit annotates the
+		// canonical name so the user knows what it resolves to.
+		const nameSpan = document.createElement('span');
+		nameSpan.className = 'cell-grid-suggest-name';
+		nameSpan.textContent = clampDisplayString(item.matchedName);
+		li.appendChild(nameSpan);
+		if (item.viaAlias) {
+			const aliasNote = document.createElement('span');
+			aliasNote.className = 'cell-grid-suggest-note';
+			aliasNote.textContent = '= ' + clampDisplayString(item.fn.canonicalName);
+			li.appendChild(aliasNote);
+		}
+		// mousedown (NOT click): fire BEFORE the input's blur so accepting a suggestion does not first
+		// commit/cancel the edit via the blur handler. preventDefault keeps focus in the input.
+		li.addEventListener('mousedown', ev => {
+			ev.preventDefault();
+			acceptCompletion(idx);
+		});
+		suggestEl.appendChild(li);
+	});
+	suggestEl.hidden = false;
+	formulaInputEl.setAttribute('aria-expanded', 'true');
+	if (completion.activeIndex >= 0) {
+		formulaInputEl.setAttribute('aria-activedescendant', 'sheets-suggest-opt-' + completion.activeIndex);
+	} else {
+		formulaInputEl.removeAttribute('aria-activedescendant');
+	}
+}
+
+/**
+ * Recompute the completion dropdown from the live input value + caret. Opens/updates it when the caret is on
+ * a function-name prefix (non-empty) AND the catalog has candidates; closes it otherwise. Pure decisions
+ * (prefix extraction, filtering) come from `formulaIntel.ts`; this only does the DOM + state plumbing.
+ *
+ * `allowEmptyPrefix` (the explicit Ctrl+Space trigger) shows the full list right after `=`/`(`; the default
+ * (typing) requires a >=1-char prefix so the dropdown does not pop on every `=`.
+ */
+function updateCompletion(allowEmptyPrefix: boolean): void {
+	if (!formulaBarIsEditing() || functionCatalog === null) {
+		closeCompletion();
+		return;
+	}
+	const value = formulaInputEl.value;
+	const caret = formulaInputEl.selectionStart ?? value.length;
+	const ctx = extractCompletionPrefix(value, caret);
+	if (ctx === null || (ctx.prefix.length === 0 && !allowEmptyPrefix)) {
+		closeCompletion();
+		return;
+	}
+	const items = filterFunctions(functionCatalog, ctx.prefix, MAX_COMPLETION_ITEMS);
+	if (items.length === 0) {
+		closeCompletion();
+		return;
+	}
+	// Preserve the highlighted name across a filter narrowing when it survives; otherwise default to the
+	// first item (the closest prefix match), matching editor type-ahead.
+	let activeIndex = 0;
+	if (completion !== null && completion.activeIndex >= 0 && completion.activeIndex < completion.items.length) {
+		const prevName = completion.items[completion.activeIndex].matchedName;
+		const found = items.findIndex(it => it.matchedName === prevName);
+		if (found >= 0) {
+			activeIndex = found;
+		}
+	}
+	completion = { items, activeIndex, replaceStart: ctx.start, replaceEnd: ctx.end };
+	renderCompletion();
+}
+
+/** Accept the completion at `idx`: replace the typed prefix with the function name + `(`, move the caret
+ * inside the parens, close the dropdown, and refresh the validation + signature hint. */
+function acceptCompletion(idx: number): void {
+	if (completion === null || idx < 0 || idx >= completion.items.length || !formulaBarIsEditing()) {
+		return;
+	}
+	const item = completion.items[idx];
+	const value = formulaInputEl.value;
+	const insert = item.matchedName + '(';
+	const before = value.slice(0, completion.replaceStart);
+	const after = value.slice(completion.replaceEnd);
+	const next = before + insert + after;
+	formulaInputEl.value = next;
+	// Caret goes right after the inserted '(' so the user types args next (and the signature hint shows).
+	const caret = before.length + insert.length;
+	formulaInputEl.setSelectionRange(caret, caret);
+	closeCompletion();
+	formulaInputEl.focus();
+	// The value changed structurally -> re-validate (debounced) + recompute the signature hint.
+	scheduleValidate();
+	updateSignatureHint();
+}
+
+/** Step the dropdown highlight (delta = -1 up / +1 down), wrapping. Re-renders only the affected rows' state
+ * via a full repaint (the list is short). No-op when closed. */
+function moveCompletion(delta: number): void {
+	if (completion === null || completion.items.length === 0) {
+		return;
+	}
+	completion.activeIndex = moveActiveIndex(completion.activeIndex, delta, completion.items.length);
+	renderCompletion();
+	scrollActiveCompletionIntoView();
+}
+
+/** Keep the highlighted dropdown row visible when navigating a long list. */
+function scrollActiveCompletionIntoView(): void {
+	if (completion === null || completion.activeIndex < 0) {
+		return;
+	}
+	const el = document.getElementById('sheets-suggest-opt-' + completion.activeIndex);
+	el?.scrollIntoView({ block: 'nearest' });
+}
+
+// --- The validation + signature hint line (shared #sheets-formula-hint, error takes priority) ---
+
+/** The current inline validation message (engine diagnostic), or '' when valid / not validated. */
+let validationMessage = '';
+/** Is the current hint an ERROR (vs the neutral signature)? Drives the styling + priority. */
+let validationIsError = false;
+
+/** Render the hint line: the validation error (if any) takes priority; otherwise the signature hint (if the
+ * caret is inside a known FN(). Hidden when there is nothing to show. */
+function renderHint(): void {
+	if (!formulaBarIsEditing()) {
+		hintEl.hidden = true;
+		hintEl.textContent = '';
+		hintEl.classList.remove('is-error');
+		return;
+	}
+	if (validationMessage.length > 0) {
+		hintEl.textContent = clampDisplayString(validationMessage);
+		hintEl.classList.toggle('is-error', validationIsError);
+		hintEl.hidden = false;
+		return;
+	}
+	const sig = currentSignatureText();
+	if (sig.length > 0) {
+		hintEl.textContent = clampDisplayString(sig);
+		hintEl.classList.remove('is-error');
+		hintEl.hidden = false;
+		return;
+	}
+	hintEl.hidden = true;
+	hintEl.textContent = '';
+	hintEl.classList.remove('is-error');
+}
+
+/** Build the signature hint text for the caret's enclosing FN(, or '' when there is none / the function is
+ * unknown to the catalog. The current argument (by comma index) is wrapped in brackets for emphasis. */
+function currentSignatureText(): string {
+	if (functionCatalog === null) {
+		return '';
+	}
+	const value = formulaInputEl.value;
+	const caret = formulaInputEl.selectionStart ?? value.length;
+	const ctx = findSignatureContext(value, caret);
+	if (ctx === null) {
+		return '';
+	}
+	const meta = functionMetaByName.get(ctx.name.toUpperCase());
+	if (meta === undefined) {
+		return ''; // an unknown name (typo / a name not yet typed in full) -- no signature to show
+	}
+	const label = buildSignatureLabel(meta.canonicalName, meta.arity);
+	const parts = label.params.map((p, i) => (i === ctx.argIndex ? '[' + p + ']' : p));
+	if (label.unbounded) {
+		// Mark the variadic tail; if the caret is past the listed params, emphasize the trailing '...'.
+		const tail = ctx.argIndex >= label.params.length ? '[...]' : '...';
+		parts.push(tail);
+	}
+	return label.name + '(' + parts.join(', ') + ')';
+}
+
+/** Recompute + render the signature hint (only meaningful while the formula bar is editing). */
+function updateSignatureHint(): void {
+	renderHint();
+}
+
+/**
+ * **Codex HIGH fold**: invalidate any IN-FLIGHT validate request. `latestValidateReqId` is the ONLY id a
+ * reply may match (the message arm drops `reqId !== latestValidateReqId`); resetting it to a sentinel that
+ * no real reqId equals (-1, while all minted ids are >= 0) means a reply for superseded text is dropped on
+ * arrival. Previously the id only advanced inside the debounce timer, so an already-SENT request's reply
+ * could still apply after the user edited to a literal / committed / switched sheets before the next
+ * keystroke re-scheduled. Also clears the pending timer so a queued send never fires for stale text.
+ */
+function invalidateValidate(): void {
+	if (validateTimer !== undefined) {
+		clearTimeout(validateTimer);
+		validateTimer = undefined;
+	}
+	latestValidateReqId = -1;
+}
+
+/** Schedule a debounced `validateFormula`. Only fires while the formula bar is the live editor and the
+ * value is a formula (`=`-prefixed); a literal value has nothing to validate -> clear any prior message.
+ * Codex HIGH fold: every entry point first INVALIDATES any in-flight validate (so a superseded reply is
+ * dropped), then re-schedules only when the value is a formula. */
+function scheduleValidate(): void {
+	invalidateValidate();
+	if (!formulaBarIsEditing()) {
+		return;
+	}
+	const value = formulaInputEl.value;
+	if (!value.trimStart().startsWith('=')) {
+		// A literal value: no formula to validate. Clear any stale error so the hint reflects reality.
+		clearValidation();
+		return;
+	}
+	validateTimer = setTimeout(() => {
+		validateTimer = undefined;
+		if (!formulaBarIsEditing() || editState === null) {
+			return;
+		}
+		const text = formulaInputEl.value;
+		if (!text.trimStart().startsWith('=')) {
+			clearValidation();
+			return;
+		}
+		// The engine wants the formula BODY without the leading '=' (engine convention). Strip leading
+		// whitespace + the '=' (matches the host putValue formula path).
+		const body = text.trimStart().slice(1);
+		const reqId = ++nextValidateReqId;
+		latestValidateReqId = reqId;
+		vscode.postMessage({
+			type: 'validateFormula',
+			sheet: editState.sheet,
+			row: editState.row,
+			col: editState.col,
+			text: body,
+			reqId,
+			webviewId: WEBVIEW_ID,
+		});
+	}, VALIDATE_DEBOUNCE_MS);
+}
+
+/** Clear the validation message + re-render the hint (the signature may still show). Codex HIGH fold: also
+ * invalidate any in-flight validate so a reply for the now-cleared text can't reapply a stale message. */
+function clearValidation(): void {
+	invalidateValidate();
+	if (validationMessage.length === 0 && !validationIsError) {
+		renderHint();
+		return;
+	}
+	validationMessage = '';
+	validationIsError = false;
+	renderHint();
+}
+
+/**
+ * Apply a `validateFormulaResult` from the host: pick the worst diagnostic as the inline message (or clear
+ * on a clean validate). A `ok:false` (the engine threw) is surfaced as an error (No-Fallbacks). Stale
+ * (superseded) replies are dropped by the reqId match before this is called.
+ *
+ * **Codex MED fold (No-Fallbacks at the webview boundary)**: `diagnostics` is taken as `unknown`. When
+ * `ok === true` the host contract REQUIRES a `DiagnosticJson[]` (an empty array means valid). A reply that
+ * claims `ok:true` but carries a missing / non-array `diagnostics` is a PROTOCOL violation (version skew /
+ * tamper) -- it is surfaced as a validation error, NOT silently coerced to `[]` (which would falsely show
+ * the formula as valid).
+ */
+function applyValidationResult(ok: boolean, diagnostics: unknown, error: string | undefined): void {
+	if (!formulaBarIsEditing()) {
+		// The edit closed while the validate was in flight -- nothing to show.
+		clearValidation();
+		return;
+	}
+	if (!ok) {
+		validationMessage = error !== undefined && error.length > 0 ? error : 'The formula could not be validated.';
+		validationIsError = true;
+		renderHint();
+		return;
+	}
+	if (!Array.isArray(diagnostics)) {
+		// ok:true MUST carry a diagnostics array. A malformed reply is surfaced, not treated as valid.
+		validationMessage = 'The validation reply was malformed (no diagnostics); the formula could not be validated.';
+		validationIsError = true;
+		renderHint();
+		return;
+	}
+	const list = diagnostics as DiagnosticJson[];
+	// Show the first error; else the first warning; else clear (valid). The engine returns diagnostics as
+	// DATA (an empty array means valid) -- we never fabricate a problem.
+	const err = list.find(d => d !== null && typeof d === 'object' && d.severity === 'error');
+	const warn = list.find(d => d !== null && typeof d === 'object' && d.severity === 'warning');
+	const pick = err ?? warn;
+	if (pick === undefined) {
+		clearValidation();
+		return;
+	}
+	validationMessage = '[' + String(pick.code) + '] ' + String(pick.message);
+	validationIsError = pick.severity === 'error';
+	renderHint();
+}
+
+/** Tear down all formula-assist UI (dropdown + hint + pending validate). Called from `cancelEdit` when a
+ * formula-bar edit closes so no stale dropdown/hint lingers over a non-editing bar. Codex HIGH fold:
+ * `invalidateValidate` resets the validate token so a reply in flight when the edit closed is dropped. */
+function teardownFormulaAssist(): void {
+	invalidateValidate();
+	closeCompletion();
+	validationMessage = '';
+	validationIsError = false;
+	hintEl.hidden = true;
+	hintEl.textContent = '';
+	hintEl.classList.remove('is-error');
 }
 
 /** Re-position the open editor over its cell. Audit LOW-7: the gutter width can change on a theme/font
@@ -1053,6 +1483,14 @@ function commitEdit(nav?: { dr: number; dc: number }): boolean {
 	// Megaudit H1: lock the input while the commit is in flight, so a keystroke before the ack can't be
 	// silently discarded when `resolvePendingCommit` closes the editor. Unlocked on resolve/error/cancel/watchdog.
 	editEl.readOnly = true;
+	// W2 formula intelligence: a commit is now in flight -- close the dropdown, invalidate any pending/in-flight
+	// validate (Codex HIGH: drop a reply that returns after the commit), AND hide the already-rendered
+	// validation/signature hint (re-audit LOW: a stale hint should not linger over the pending edit). A
+	// successful commit's resolvePendingCommit -> cancelEdit re-establishes a clean bar. teardownFormulaAssist
+	// does all three (it invalidates the validate token, closes completion, and hides the hint).
+	if (editState.surface === 'formula') {
+		teardownFormulaAssist();
+	}
 	armCommitWatchdog(commitId); // re-audit HIGH: recover the editor if no commitResult/errorReply arrives
 	// Pessimistic: keep the input visible/focused until the host responds. FE-2-0 Phase 2: resolution is
 	// now driven ONLY by a matching `commitResult` (success -> resolvePendingCommit hides the editor +
@@ -1086,6 +1524,14 @@ function onEditInput(ev: Event): void {
 	// "still bad" and abandoned. The arrow/Tab "leave a bad cell" affordance only applies to an UNTOUCHED
 	// failure (the moment after it fails); once you start correcting, arrows are caret + Enter commits.
 	editState.lastFailedRawInput = undefined;
+	// W2 formula intelligence: drive the completion dropdown + debounced validation + signature hint on every
+	// keystroke, but ONLY for the formula-bar editor (the in-cell overlay has no assist UI). A 1+ char prefix
+	// is required to open the dropdown (allowEmptyPrefix=false) so it does not pop on a bare '='.
+	if (editState.surface === 'formula') {
+		updateCompletion(false);
+		scheduleValidate();
+		updateSignatureHint();
+	}
 }
 function onEditKeydown(ev: KeyboardEvent): void {
 	// Audit MED-4: while an IME composition is active, Enter/Tab ACCEPT the candidate -- they must not
@@ -1095,6 +1541,45 @@ function onEditKeydown(ev: KeyboardEvent): void {
 	}
 	if (editState === null || ev.target !== editState.editEl) {
 		return;
+	}
+	// **W2 formula intelligence -- dropdown keyboard interception (CRITICAL).** When the completion dropdown
+	// is OPEN (only possible on the formula-bar editor), Up/Down/Enter/Tab/Esc drive the LIST and are
+	// swallowed BEFORE the shared edit machinery below (so Enter picks an item instead of committing+moving,
+	// Esc closes the list instead of reverting the edit, Tab inserts instead of nav). A non-pending guard:
+	// while a commit is in flight the dropdown is force-closed elsewhere, but be defensive and only intercept
+	// when not pending. Any key NOT handled here (typing, Home/End, etc.) falls through to the existing logic
+	// unchanged, and the dropdown is closed/refreshed by the `input` handler. When the dropdown is CLOSED
+	// this whole block is skipped and the edit core behaves exactly as before.
+	if (completion !== null && editState.surface === 'formula' && !editState.pendingCommit) {
+		if (ev.key === 'ArrowDown') {
+			ev.preventDefault();
+			moveCompletion(1);
+			return;
+		}
+		if (ev.key === 'ArrowUp') {
+			ev.preventDefault();
+			moveCompletion(-1);
+			return;
+		}
+		if (ev.key === 'Enter' || ev.key === 'Tab') {
+			// Accept the highlighted item. There is always a highlighted item while open (activeIndex defaults
+			// to 0), so Enter/Tab here NEVER commits the cell -- the list wins. If somehow nothing is
+			// highlighted, fall through to the normal commit/nav path.
+			if (completion.activeIndex >= 0) {
+				ev.preventDefault();
+				acceptCompletion(completion.activeIndex);
+				return;
+			}
+		}
+		if (ev.key === 'Escape') {
+			// Close the dropdown WITHOUT cancelling the edit (Excel: Esc dismisses the suggestion list first;
+			// a second Esc reverts the edit). preventDefault + stop so the edit-Escape below does not also run.
+			ev.preventDefault();
+			closeCompletion();
+			return;
+		}
+		// Other keys (printable, Backspace, Home/End, Left/Right caret moves) fall through: the input edits
+		// natively, then the `input`/`keyup` handlers recompute or close the dropdown.
 	}
 	if (ev.key === 'Escape') {
 		ev.preventDefault();
@@ -1192,6 +1677,47 @@ formulaInputEl.addEventListener('keydown', onEditKeydown);
 formulaInputEl.addEventListener('blur', onEditBlur);
 formulaInputEl.addEventListener('focus', () => {
 	beginEditFormula();
+});
+// W2 formula intelligence -- explicit trigger + caret-tracking + focus-out cleanup on the FORMULA BAR only.
+// Ctrl/Cmd+Space opens the dropdown with the full list (the empty-prefix affordance) at the caret. This is a
+// keydown (it must preventDefault before the browser inserts a space) and runs BEFORE onEditKeydown's
+// dropdown block on the same target, so it's registered first below.
+formulaInputEl.addEventListener('keydown', ev => {
+	if ((ev.ctrlKey || ev.metaKey) && (ev.key === ' ' || ev.code === 'Space') && formulaBarIsEditing()) {
+		ev.preventDefault();
+		updateCompletion(true); // allowEmptyPrefix -> show all functions at the caret
+	}
+});
+// A caret move via arrow keys / Home / End / a mouse click inside the input does NOT fire `input`, so refresh
+// the signature hint (and re-evaluate the dropdown, which closes if the caret left a name token) on keyup +
+// click. Guarded to the formula-bar editor. The dropdown's own Up/Down are already handled (and returned) in
+// onEditKeydown, so a keyup for those arrives with the dropdown still open -- updateCompletion preserves it.
+function refreshAssistOnCaretMove(): void {
+	if (!formulaBarIsEditing()) {
+		return;
+	}
+	updateSignatureHint();
+	// Only RE-EVALUATE the dropdown for caret moves while it is already open (so a Left/Right that leaves the
+	// name token closes it). Do NOT auto-open on a bare caret move -- opening is driven by typing / Ctrl+Space.
+	if (completion !== null) {
+		updateCompletion(false);
+	}
+}
+formulaInputEl.addEventListener('keyup', ev => {
+	if (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight' || ev.key === 'Home' || ev.key === 'End') {
+		refreshAssistOnCaretMove();
+	}
+});
+formulaInputEl.addEventListener('click', () => {
+	refreshAssistOnCaretMove();
+});
+// Focus-out: close the dropdown (and cancel any pending validate) so it never lingers over a non-focused
+// bar. A click ON a suggestion preventDefaults its mousedown so focus never leaves -> this does not fire for
+// an accept. The shared onEditBlur (registered above) still runs to commit/cancel the edit itself; this only
+// tears down the assist OVERLAY. Use a capture-phase-safe ordering: this listener is added AFTER onEditBlur,
+// but both fire on the same blur; closing the dropdown here is independent of the commit/cancel decision.
+formulaInputEl.addEventListener('blur', () => {
+	closeCompletion();
 });
 
 // --- Canvas pointer: single click SELECTS, double click EDITS (FE-2-0 polish 2026-06-05) ---
@@ -1619,6 +2145,19 @@ function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean)
 	// switching to sheet 1. (A sheet change also makes `diffSnapshotsA1` return null -> full redraw below.)
 	if (prevSnapshot !== null && prevSnapshot.sheet !== snapshot.sheet) {
 		errorCells.clear();
+		// **Codex MED fold (+ re-audit MED)**: a Switch Sheet re-renders THIS panel onto a different sheet. An
+		// open formula-bar edit's dropdown/hint targeted the OLD sheet's cell; `updateFormulaBar` is a no-op
+		// while editing, so without this the dropdown/hint (and an in-flight validate keyed to the old coords)
+		// would survive onto the new sheet. Tear down the ASSIST UI + invalidate the validate token always.
+		// But do NOT cancel a PENDING commit (re-audit MED): cancelEdit would clear `editState` + the watchdog,
+		// so a late matching `commitResult`/`errorReply` would be dropped (the reload-race / pending-commit
+		// invariant). When pending, leave the edit alive for the normal ack/error/watchdog path; only the
+		// assist overlay is torn down. When NOT pending we can safely cancel the (now cross-sheet) edit.
+		if (formulaBarIsEditing() && editState !== null && !editState.pendingCommit) {
+			cancelEdit();
+		} else {
+			teardownFormulaAssist();
+		}
 	} else if (errorCells.size > 0) {
 		// FE-2-0 polish (2026-06-05): clear a STALE tint when the cell's STORED content changed between
 		// renders -- i.e. a real write landed (a sibling panel / a recompute FIXED the cell this panel had
@@ -1777,6 +2316,91 @@ window.addEventListener('message', (event: MessageEvent) => {
 		}
 		if (cleared) {
 			redraw();
+		}
+		return;
+	}
+	if (msg.type === 'validateFormulaResult') {
+		// W2 formula intelligence: the host's reply to a debounced validateFormula. Drop a stale reply (a
+		// later keystroke already superseded it -> its reqId != the latest we sent) or a reply from a PRE-
+		// reload generation (webviewId mismatch) so an outdated diagnostic can't flash. Present-but-mismatched
+		// webviewId only; absent = pre-token wire / tests.
+		const vr = msg as {
+			reqId?: unknown; ok?: unknown; diagnostics?: unknown; error?: unknown; webviewId?: unknown;
+		};
+		if (typeof vr.webviewId === 'string' && vr.webviewId !== WEBVIEW_ID) {
+			return;
+		}
+		if (typeof vr.reqId !== 'number' || vr.reqId !== latestValidateReqId) {
+			return; // a superseded (stale) validate -- the user kept typing
+		}
+		// Codex MED: pass `diagnostics` RAW (unknown) so applyValidationResult can No-Fallbacks-reject an
+		// `ok:true` reply that lacks a real array (rather than this pre-coercing a bad value to []/valid).
+		applyValidationResult(
+			vr.ok === true,
+			vr.diagnostics,
+			typeof vr.error === 'string' ? vr.error : undefined,
+		);
+		return;
+	}
+	if (msg.type === 'functionList') {
+		// W2 formula intelligence: the host's reply with the function catalog for completions. Drop a stale /
+		// pre-reload reply. On `ok:false` (the engine threw), leave the catalog null so no dropdown ever opens
+		// (No-Fallbacks: no fabricated list); surface the reason on the console.
+		const fl = msg as {
+			reqId?: unknown; ok?: unknown; functions?: unknown; error?: unknown; webviewId?: unknown;
+		};
+		if (typeof fl.webviewId === 'string' && fl.webviewId !== WEBVIEW_ID) {
+			return;
+		}
+		if (typeof fl.reqId !== 'number' || fl.reqId !== latestFuncReqId) {
+			return;
+		}
+		if (fl.ok !== true || !Array.isArray(fl.functions)) {
+			console.warn('[sheets-webview] listFunctions failed; completions disabled:', fl.error);
+			// Allow a future re-request (e.g. the next time the bar is focused) by re-arming the flag.
+			functionListRequested = false;
+			return;
+		}
+		const metas = fl.functions as FunctionMetadataJson[];
+		// Build the lean completion list + the by-name metadata map for the signature hint. Defensive: skip a
+		// malformed entry rather than throw on the whole catalog.
+		const catalog: CompletionFunction[] = [];
+		const byName = new Map<string, FunctionMetadataJson>();
+		const wellFormed: { meta: FunctionMetadataJson; aliases: string[] }[] = [];
+		for (const meta of metas) {
+			if (meta === null || typeof meta !== 'object' || typeof meta.canonicalName !== 'string' || meta.canonicalName.length === 0) {
+				continue;
+			}
+			const aliases = Array.isArray(meta.aliases) ? meta.aliases.filter((a): a is string => typeof a === 'string') : [];
+			catalog.push({
+				canonicalName: meta.canonicalName,
+				displayName: typeof meta.displayName === 'string' ? meta.displayName : undefined,
+				aliases,
+			});
+			wellFormed.push({ meta, aliases });
+		}
+		// **Codex LOW fold**: index canonical names FIRST (a canonical name always wins), THEN aliases (so the
+		// signature hint resolves when a completion inserted an alias, e.g. `AVG(` -> AVERAGE's signature).
+		// Two-pass so a canonical name that collides with another function's alias is never shadowed; an
+		// alias-vs-alias collision is first-wins (deterministic given the engine sorts ascending by name).
+		for (const { meta } of wellFormed) {
+			byName.set(meta.canonicalName.toUpperCase(), meta);
+		}
+		for (const { meta, aliases } of wellFormed) {
+			for (const alias of aliases) {
+				const key = alias.toUpperCase();
+				if (!byName.has(key)) {
+					byName.set(key, meta);
+				}
+			}
+		}
+		functionCatalog = catalog;
+		functionMetaByName = byName;
+		// If the bar is already editing, refresh the affordances now that the catalog is live (the user may
+		// have typed a prefix before the catalog arrived).
+		if (formulaBarIsEditing()) {
+			updateCompletion(false);
+			updateSignatureHint();
 		}
 		return;
 	}
