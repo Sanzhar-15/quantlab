@@ -80,6 +80,16 @@ const bySession: Map<SessionInstance, Map<number, CellGridPanel>> = new Map();
 let focusedPanel: CellGridPanel | undefined;
 
 /**
+ * **W3 (Wave 3, 2026-06-09; Codex HIGH-2)** -- maps a webview instance token (`WEBVIEW_ID`, reported in
+ * the `webviewReady` handshake) to its {@link CellGridPanel}. The native right-click context menu carries
+ * the raising webview's token in `data-vscode-context`; the host commands resolve the EXACT panel via this
+ * map (NOT merely the focused one -- which can differ in split editors / focus edge cases, hitting the
+ * wrong grid). An entry is set on `webviewReady` and cleared on dispose; a stale pre-reload token never
+ * resolves (the reloaded webview re-handshakes with a fresh token, last-wins).
+ */
+const byWebviewToken: Map<string, CellGridPanel> = new Map();
+
+/**
  * **FE-1.5 W-G** -- a panel pulls the cells its session's published variables drive (the bound-cell
  * badge) via this provider, registered by the reactive-kernel layer at activation. `undefined` (no
  * reactive kernel wired, or post-deactivate) means "no badges" -- the render path stays unconditional.
@@ -239,6 +249,12 @@ export class CellGridPanel {
 				d.dispose();
 			}
 			allPanels.delete(instance);
+			// W3 (Codex HIGH-2): drop this panel's webview-token map entry so a context-menu command can never
+			// resolve a disposed panel. Guard on identity (a fresh panel may have re-used the string after a
+			// reload) so we only clear our own.
+			if (instance.webviewToken !== undefined && byWebviewToken.get(instance.webviewToken) === instance) {
+				byWebviewToken.delete(instance.webviewToken);
+			}
 			if (focusedPanel === instance) {
 				focusedPanel = undefined;
 			}
@@ -479,6 +495,56 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **W3 (Wave 3, 2026-06-09; Codex HIGH-2)** -- resolve the live panel that raised a context menu by the
+	 * `panelToken` its `data-vscode-context` carried. Returns `undefined` for an unknown / disposed token so
+	 * the command surfaces a clear toast (No-Fallbacks). This is the EXACT panel that raised the menu, not
+	 * merely the focused one -- the structural insert/delete commands act on it + the selection the payload
+	 * carried, eliminating both the wrong-grid and the stale-selection races.
+	 */
+	static panelByToken(token: string): CellGridPanel | undefined {
+		const panel = byWebviewToken.get(token);
+		if (panel === undefined || panel._disposed) {
+			return undefined;
+		}
+		return panel;
+	}
+
+	/** This panel's owning session + active sheet (for the token-resolved structural commands). */
+	get target(): { session: SessionInstance; sheet: number } {
+		return { session: this.session, sheet: this.sheet };
+	}
+
+	/**
+	 * **W3 (Wave 3, 2026-06-09; Codex HIGH-2 + MED-1)** -- post a context-menu clipboard action
+	 * (`cut`/`copy`/`paste`/`clear`) to the panel identified by `token` (the webview that raised the menu),
+	 * where the grid clipboard + active-cell state live. Cut/Copy/Paste/Clear Contents thus route to the
+	 * SAME webview functions as the Ctrl/Cmd+C/X/V/Delete keystrokes (the host never owns the clipboard).
+	 *
+	 * AWAITS delivery (No-Fallbacks, MED-1): returns `'no-panel'` when the token is unknown/disposed,
+	 * `'undelivered'` when `postMessage` resolved false or rejected (the channel could not accept it), and
+	 * `'ok'` on a delivered post -- so the caller can surface a precise toast rather than silently assuming
+	 * success. A context menu can only have been raised over a fully-loaded grid, so the ready webview makes
+	 * `'undelivered'` rare, but a panel torn down between the right-click and the menu click is handled.
+	 */
+	static async postContextMenuAction(token: string, action: 'cut' | 'copy' | 'paste' | 'clear'): Promise<'ok' | 'no-panel' | 'undelivered'> {
+		const panel = CellGridPanel.panelByToken(token);
+		if (panel === undefined) {
+			return 'no-panel';
+		}
+		try {
+			const delivered = await panel.panel.webview.postMessage({ type: 'contextMenuAction', action });
+			if (!delivered) {
+				console.warn('[cellGrid] contextMenuAction postMessage was not delivered to the webview.');
+				return 'undelivered';
+			}
+			return 'ok';
+		} catch (err) {
+			console.error('[cellGrid] contextMenuAction postMessage rejected:', err);
+			return 'undelivered';
+		}
+	}
+
+	/**
 	 * **FE-1.5 W-G (2026-06-08)** -- register (or clear with `undefined`) the provider every panel consults
 	 * at render time for the cells its session's published variables drive (the bound-cell badge). The
 	 * reactive-kernel layer wires this to {@link ReactiveKernelManager.publishedCellsForSheet} at activation
@@ -533,6 +599,14 @@ export class CellGridPanel {
 	 */
 	private frozenRowCount: number = 0;
 	private frozenColCount: number = 0;
+
+	/**
+	 * **W3 (Wave 3, 2026-06-09; Codex HIGH-2)** -- this panel's current webview instance token, learned from
+	 * the `webviewReady` handshake. Used to maintain the module {@link byWebviewToken} map (set on handshake,
+	 * cleared on dispose / re-handshake) so the context menu's host commands route to THIS exact panel.
+	 * `undefined` before the first handshake.
+	 */
+	private webviewToken: string | undefined;
 
 	/**
 	 * True once the bundled webview has posted `{type:'webviewReady'}`. Before
@@ -841,6 +915,19 @@ export class CellGridPanel {
 			// one. No-op on the initial load (already undefined). The webview's `lastPostedSelectionKey` resets
 			// on reload too, so the fresh A1 post is never deduped away.
 			this.latestSelection = undefined;
+			// W3 (Codex HIGH-2): record this webview's instance token so the context menu's host commands can
+			// route to THIS exact panel. A reload re-handshakes with a fresh token: drop our PRIOR token's map
+			// entry if it still points at us (a different panel may have already claimed the old string -- only
+			// clear our own), then claim the new one. Validated to a non-empty string (No-Fallbacks: a missing
+			// token leaves the map untouched rather than inserting an `undefined` key).
+			const incomingToken = (raw as { webviewId?: unknown }).webviewId;
+			if (typeof incomingToken === 'string' && incomingToken.length > 0) {
+				if (this.webviewToken !== undefined && this.webviewToken !== incomingToken && byWebviewToken.get(this.webviewToken) === this) {
+					byWebviewToken.delete(this.webviewToken);
+				}
+				this.webviewToken = incomingToken;
+				byWebviewToken.set(incomingToken, this);
+			}
 			this.clearReadyWatchdog();
 			this.postRenderIfReady();
 			// W3 frozen panes: a reload re-inits the webview unfrozen; re-apply the session-local freeze so a

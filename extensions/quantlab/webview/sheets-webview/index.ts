@@ -53,6 +53,8 @@ import {
 import { CanvasGridRenderer, type ActiveCell, type PublishedRange } from './canvasGrid';
 import { staleTintKeysA1 } from './gridBlitA1';
 import { pasteAreaMismatch, planFill, planPaste, type GridClipboard } from './clipboardLogic';
+// W3 (Wave 3): the pure data-vscode-context payload builder for the native right-click context menu.
+import { buildCellContextPayload, buildEmptyContextPayload } from './contextMenuPayload';
 import { RenderOrchestrator, type RenderHost, type Viewport } from './renderOrchestrator';
 import {
 	COL_WIDTH,
@@ -1972,6 +1974,134 @@ canvasEl.addEventListener('dblclick', ev => {
 	redraw();
 });
 
+// ============================================================================================
+// W3 (Wave 3, 2026-06-09) -- NATIVE RIGHT-CLICK CONTEXT MENU.
+//
+// **SHARED-FILE FLAG (conductor):** this is the ONE additive W3 block in index.ts (the frozen-panes lead
+// also edits this file for paint/layout). It is event-handler-only -- it touches NO paint/layout code and
+// no module state beyond the existing selection (`active`/`anchor`) it reuses for the click-to-select.
+//
+// Mechanism: on `contextmenu` we hit-test the clicked cell and set `data-vscode-context` (a JSON string)
+// on the canvas. VS Code reads that attribute and shows the `menus["webview/context"]` items contributed
+// in package.json (gated on `webviewId == 'quantlab.quantbookCellGrid'` + the section). We do NOT call
+// `preventDefault()`: the native menu needs the default contextmenu to proceed; `preventDefaultContextMenuItems`
+// in the payload suppresses VS Code's own built-in items. The pure payload builder is contextMenuPayload.ts.
+// ============================================================================================
+canvasEl.addEventListener('contextmenu', ev => {
+	const hit = hitTestCanvas(ev);
+	if (hit === null) {
+		// A right-click on the sticky header band / row gutter / corner / empty space: no target cell ->
+		// tag NO quantbook section so none of the grid menu items appear (No-Fallbacks: never offer an
+		// action with no cell to act on). VS Code still reads the attribute for `preventDefaultContextMenuItems`.
+		canvasEl.setAttribute('data-vscode-context', buildEmptyContextPayload());
+		return;
+	}
+	// Excel semantics: right-clicking OUTSIDE the current selection moves the selection to the clicked
+	// cell (so the menu acts on what the user just clicked); right-clicking INSIDE a multi-cell selection
+	// keeps it (so "Delete Row" removes the whole selected band). This keeps the host-tracked selection --
+	// which the insert/delete + clipboard commands act on -- consistent with the right-clicked cell.
+	const sel = currentSelection();
+	const insideSelection =
+		sel !== null &&
+		hit.row >= sel.minRow && hit.row <= sel.maxRow &&
+		hit.col >= sel.minCol && hit.col <= sel.maxCol;
+	if (!insideSelection) {
+		anchor = null;
+		active = { row: hit.row, col: hit.col };
+		redraw();
+	}
+	// Codex W3 HIGH-1: carry the AUTHORITATIVE selection (the anchor+focus AFTER the click-to-select above)
+	// directly in the payload, so the insert/delete command plans from THIS rect rather than the
+	// async-updated host selection (which a fast menu command could read stale -> wrong band). `active` is
+	// non-null here (set above or pre-existing). The anchor collapses to the focus when there is no range.
+	// Codex W3 HIGH-2: carry WEBVIEW_ID so the host routes the command to the EXACT panel that raised the
+	// menu (not merely the focused one). `hasSelection` (advisory, for labelling) is the post-click state.
+	const focusCell = active ?? { row: hit.row, col: hit.col };
+	const anchorCell = anchor ?? focusCell;
+	const selectionPayload = {
+		anchorRow: anchorCell.row,
+		anchorCol: anchorCell.col,
+		focusRow: focusCell.row,
+		focusCol: focusCell.col,
+	};
+	canvasEl.setAttribute(
+		'data-vscode-context',
+		buildCellContextPayload(hit, selectionPayload, WEBVIEW_ID, currentSelection() !== null),
+	);
+});
+
+// W3 (Wave 3): host -> webview bridge for the clipboard menu items. Cut/Copy/Paste/Clear Contents live in
+// the WEBVIEW (the grid clipboard + the active-cell clear are webview state), so the native menu's host
+// commands post `{type:'contextMenuAction', action}` down to the focused panel's webview, which routes to
+// the SAME functions as the Ctrl/Cmd+C/X/V/Delete keystrokes. Declared here next to the menu wiring; the
+// dispatch arm is added to the `message` listener below (one place owns inbound routing).
+type ContextMenuAction = 'cut' | 'copy' | 'paste' | 'clear';
+function runContextMenuAction(action: ContextMenuAction): void {
+	switch (action) {
+		case 'copy':
+			copyGridSelection(false);
+			return;
+		case 'cut':
+			copyGridSelection(true);
+			return;
+		case 'paste':
+			pasteGridClipboard();
+			return;
+		case 'clear':
+			// Codex W3 MED-3: the menu keeps a multi-cell selection (right-click inside it), so "Clear
+			// Contents" must clear the WHOLE selection -- otherwise the label overstates what happened. A
+			// single-cell selection routes to the existing single-cell clear (byte-identical to Delete).
+			clearContextSelection();
+			return;
+		default: {
+			// No-Fallbacks: an unknown action from the host is a wiring bug, not a silent no-op.
+			const unreachable: never = action;
+			console.warn('[sheets-webview] ignored unknown contextMenuAction:', unreachable);
+		}
+	}
+}
+
+// Codex W3 re-audit MED: the webview-side cap on a single "Clear Contents" batch, mirroring the host's
+// `MAX_BATCH_CELLS` (cellGridLogic.ts). Preflighted before the array is built so an oversize selection is
+// refused with a visible message instead of materializing a huge array.
+const CLEAR_SELECTION_MAX_CELLS = 100_000;
+
+/**
+ * **W3 (Codex MED-3)** -- "Clear Contents" over the current selection. Clears every cell in the selection
+ * rect as ONE atomic `putCells` batch (a single undo unit; the host applies via `Session.batch`), so the
+ * action matches the visible selection. A single-cell selection delegates to {@link clearActiveCell} (the
+ * existing Delete path) so the simple case is unchanged. Each cleared cell drops its optimistic error tint
+ * (the host's `cellsWritten` ack confirms; an `errorReply` re-decorates on failure -- No-Fallbacks).
+ */
+function clearContextSelection(): void {
+	if (fullSnapshot === null || active === null) {
+		return;
+	}
+	const sel = currentSelection();
+	if (sel === null) {
+		clearActiveCell();
+		return;
+	}
+	// Codex W3 re-audit MED: PREFLIGHT the cell count BEFORE materializing the array, so a pathologically
+	// large selection surfaces a visible error here rather than building a huge array + hanging the webview
+	// (the host's MAX_BATCH_CELLS rejection would otherwise only fire after the array exists). Mirrors the
+	// host cap (cellGridLogic.MAX_BATCH_CELLS = 100_000); No-Fallbacks -- a refused clear is a clear message.
+	const cellCount = (sel.maxRow - sel.minRow + 1) * (sel.maxCol - sel.minCol + 1);
+	if (cellCount > CLEAR_SELECTION_MAX_CELLS) {
+		showError(`The selection is too large to clear at once (${cellCount} cells; max ${CLEAR_SELECTION_MAX_CELLS}). Select a smaller range.`, 'transient');
+		return;
+	}
+	const cells: { row: number; col: number; rawInput: string }[] = [];
+	for (let r = sel.minRow; r <= sel.maxRow; r += 1) {
+		for (let c = sel.minCol; c <= sel.maxCol; c += 1) {
+			errorCells.delete(r + ',' + c);
+			cells.push({ row: r, col: c, rawInput: '' });
+		}
+	}
+	vscode.postMessage({ type: 'putCells', sheet: fullSnapshot.sheet, cells, undoLabel: 'Clear Contents', webviewId: WEBVIEW_ID });
+	redraw();
+}
+
 // Hover tooltip: surface a cell's errorReply message or its engine diagnostic via the native `title`.
 // FE megaudit L-b: coalesce mousemove to ONE hit-test per animation frame.
 let lastHoverTitle = '';
@@ -2661,6 +2791,18 @@ window.addEventListener('message', (event: MessageEvent) => {
 		redraw();
 		return;
 	}
+	if (msg.type === 'contextMenuAction') {
+		// W3 (Wave 3): the native context menu's clipboard items (Cut/Copy/Paste/Clear Contents) run host
+		// commands that post this down to the focused panel's webview, where the clipboard state lives. Route
+		// to the SAME functions as the keyboard shortcuts. A malformed action is dropped loud (No-Fallbacks).
+		const action = (msg as { action?: unknown }).action;
+		if (action === 'cut' || action === 'copy' || action === 'paste' || action === 'clear') {
+			runContextMenuAction(action);
+		} else {
+			console.warn('[sheets-webview] ignored contextMenuAction with a bad action:', action);
+		}
+		return;
+	}
 	console.warn('[sheets-webview] unknown inbound message type:', msg.type);
 });
 
@@ -2712,5 +2854,8 @@ new MutationObserver(() => {
 // Initial spacer sizing (before the first render).
 updateSpacer();
 
-// Handshake: announce the channel is live so the host (re)sends the snapshot.
-vscode.postMessage({ type: 'webviewReady' });
+// Handshake: announce the channel is live so the host (re)sends the snapshot. W3 (Codex HIGH-2): carry
+// this webview's instance token so the host can map `panelToken -> CellGridPanel` and route a context-menu
+// command to the EXACT panel that raised the menu (not merely the focused one). Re-sent on every reload
+// (WEBVIEW_ID is regenerated per load), so the host's map always reflects the live token.
+vscode.postMessage({ type: 'webviewReady', webviewId: WEBVIEW_ID });

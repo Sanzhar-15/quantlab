@@ -2181,6 +2181,54 @@ export interface SessionInstance {
 
 	/** Whether a redo step is available. */
 	canRedo(): boolean;
+
+	// --- W3 (Wave 3, 2026-06-09): structural row/column insert + delete ---------
+	//
+	// **TYPES-FIRST HANDSHAKE WITH THE W1 ENGINE WINDOW.** These four signatures are
+	// the contract the W3 context-menu insert/delete commands code against; the
+	// runtime methods light up once W1's engine dylib (which publishes the matching
+	// napi methods on the owning `WorkbookSession`) is merged by the conductor.
+	//
+	// **Added BY W3 as a minimal forward declaration** (W1's `types.ts` was not yet
+	// present in the w3/context-menu branch at implementation time). The conductor
+	// RECONCILES this block with W1's authoritative signatures at integration --
+	// if W1's shape differs (e.g. a returned count, or a `bigint` op id), the W3
+	// commands adapt then. Coordinates here are 0-based: `row`/`col` is the index AT
+	// which rows/columns are inserted (existing rows/cols at and below/right shift),
+	// and the index of the row/column to delete. Each mutates the structure of one
+	// sheet and dirties dependents; the caller MUST `recalcDirty()` + refresh after.
+	//
+	// No-Fallbacks: an out-of-range index / tombstoned or unknown sheet / off-Ready
+	// session is expected to throw a structured engine error (e.g. `[bad_argument]`,
+	// `[sheet_not_found]`, `[invalid_state]`) -- never a silent clamp or no-op. The
+	// W3 commands surface any throw as a loud toast.
+
+	/**
+	 * Insert `count` blank rows into `sheet` at index `row` (0-based). Rows at and
+	 * below `row` shift down by `count`; formulas with relative references are
+	 * adjusted by the engine (Excel canon). `count >= 1`.
+	 */
+	insertRows(sheet: number, row: number, count: number): void;
+
+	/**
+	 * Delete `count` rows from `sheet` starting at index `row` (0-based). Rows below
+	 * shift up; references into the deleted band re-bind to `#REF!` on the next
+	 * recompute (Excel canon). `count >= 1`.
+	 */
+	deleteRows(sheet: number, row: number, count: number): void;
+
+	/**
+	 * Insert `count` blank columns into `sheet` at index `col` (0-based). Columns at
+	 * and right of `col` shift right by `count`. `count >= 1`.
+	 */
+	insertColumns(sheet: number, col: number, count: number): void;
+
+	/**
+	 * Delete `count` columns from `sheet` starting at index `col` (0-based). Columns
+	 * to the right shift left; references into the deleted band re-bind to `#REF!`
+	 * on the next recompute. `count >= 1`.
+	 */
+	deleteColumns(sheet: number, col: number, count: number): void;
 }
 
 export interface SessionConstructor {
