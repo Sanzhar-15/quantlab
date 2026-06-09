@@ -923,8 +923,20 @@ export class CellGridPanel {
 			// **FE-1.5 W-G-2b**: store the validated selection (last-wins). Pure store -- no engine call,
 			// no render; the dispatcher already guaranteed `sel.sheet === this.sheet`. Surfaced via the
 			// static `focusedGridSelection()` for the "bind variable to selected cell" flow.
+			//
+			// **W3 B3 dep-graph**: a selection move on the FOCUSED panel changes the "focused cell" the
+			// Dependencies sidebar reads, so fire the grids-changed signal too (its single "focused state may
+			// have changed" pull event). Fire ONLY when (a) this is the focused panel and (b) the focus cell
+			// actually moved -- so a redundant re-report (same cell) or a background panel's echo does not
+			// churn the focused-cell view. The Live-Python sidebar keys off (session, sheet) which is
+			// unchanged here, so its rebuild is idempotent (same nodes, a harmless re-render).
 			onSelectionChange: sel => {
+				const prev = this.latestSelection;
 				this.latestSelection = sel;
+				const focusMoved = prev === undefined || prev.focusRow !== sel.focusRow || prev.focusCol !== sel.focusCol;
+				if (focusMoved && focusedPanel === this) {
+					fireGridsChanged();
+				}
 			},
 			// W2 error-surface: a single putValue committed cleanly -> clear that cell's sticky `errorReply`
 			// diagnostic from the Problems panel. Host-side; the imminent onCommit render reconciles the
