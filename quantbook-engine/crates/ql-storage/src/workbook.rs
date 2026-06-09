@@ -1275,6 +1275,71 @@ impl Workbook {
             }
         }
 
+        // --- 0. Spill anchors (HIGH-2, megaudit Opus) --------------------
+        // `apply_axis_shift` historically re-keyed formula_cells / names /
+        // tables / format overlay but NOT `spill_anchors`, leaving a GHOST
+        // anchor at the old position after a structural edit → future writes
+        // to those cells got a spurious `#SPILL!`.
+        //
+        // Spill bodies are pure computed-overlay cells: `shift_rows` /
+        // `shift_columns` (step 1) moves them in storage automatically. So we
+        // only need to keep the anchor/target MAP consistent. We do it in
+        // three phases so a moved survivor can't collide with another
+        // survivor's stale pre-shift target map (Codex design-audit 2a):
+        //   0a. PRE-shift, classify every anchor on the edited sheet:
+        //       - DISSOLVE (edit intersects the footprint OR a rigid move
+        //         would push it off-grid): `clear_spill_at` NOW — clears the
+        //         table entry AND the computed overlays at the still-pre-shift
+        //         body positions; the runtime re-registers on next recompute.
+        //       - RIGID-MOVE survivor (edit entirely before/after the whole
+        //         footprint, stays on-grid): record (old_anchor, shape).
+        //   0b. (after step 1) unregister ALL survivor old anchors (map-only,
+        //       overlays already moved by the shift), THEN register them at
+        //       the shifted anchors with the same shape.
+        let edited_axis_span_for =
+            |anchor: (SheetId, RowId, ColId), shape: &crate::SpillShape| -> (u32, u32) {
+                // Footprint span on the EDITED axis only.
+                if is_row {
+                    (anchor.1, shape.rows)
+                } else {
+                    (anchor.2, shape.cols)
+                }
+            };
+        let mut spills_to_dissolve: Vec<(SheetId, RowId, ColId)> = Vec::new();
+        let mut spills_to_rekey: Vec<((SheetId, RowId, ColId), crate::SpillShape)> = Vec::new();
+        for (anchor, shape) in self.spill_anchors.iter_anchors() {
+            if anchor.0 != sheet {
+                continue; // spills never span sheets (anchor.sheet == target.sheet)
+            }
+            let (lo, span) = edited_axis_span_for(anchor, shape);
+            if span == 0 {
+                // Degenerate (register rejects these, but be defensive): drop.
+                spills_to_dissolve.push(anchor);
+                continue;
+            }
+            let hi = lo + span - 1; // last footprint line on the edited axis
+                                    // The edit "misses" the footprint iff it is entirely before or
+                                    // entirely after the whole `[lo, hi]` span.
+            let entirely_before_or_after = match shift {
+                crate::AxisShift::Insert { at, .. } => at <= lo || at > hi,
+                crate::AxisShift::Delete { start, end } => end < lo || start > hi,
+            };
+            // A surviving rigid move requires BOTH the anchor and the far edge
+            // to stay on-grid after the shift.
+            let both_on_grid = shift.map_public(lo, axis_max).is_some()
+                && shift.map_public(hi, axis_max).is_some();
+            if entirely_before_or_after && both_on_grid {
+                spills_to_rekey.push((anchor, *shape));
+            } else {
+                spills_to_dissolve.push(anchor);
+            }
+        }
+        // 0a. Dissolve (clears table entry + pre-shift computed overlays).
+        for anchor in spills_to_dissolve {
+            // Anchor came from `iter_anchors`, so it is registered → Ok.
+            let _ = self.clear_spill_at(anchor);
+        }
+
         // --- 1. Cell storage + format overlay (per-sheet) -----------------
         let target = self
             .sheets
@@ -1284,6 +1349,40 @@ impl Workbook {
             target.shift_rows(shift);
         } else {
             target.shift_columns(shift);
+        }
+
+        // 0b. Re-key surviving rigid-move spill anchors AFTER the storage
+        // shift (the body overlays already moved). Unregister ALL old anchors
+        // first (map-only; does NOT touch the already-moved overlays), then
+        // register at the shifted anchors. Two-phase to avoid a moved anchor
+        // colliding with another survivor's stale pre-shift target rect.
+        let mut rekeyed: Vec<((SheetId, RowId, ColId), crate::SpillShape)> =
+            Vec::with_capacity(spills_to_rekey.len());
+        for (old_anchor, shape) in &spills_to_rekey {
+            // Map the anchor coord on the edited axis. Classification
+            // guaranteed Some for survivors.
+            let new_anchor = if is_row {
+                shift
+                    .map_public(old_anchor.1, axis_max)
+                    .map(|nr| (old_anchor.0, nr, old_anchor.2))
+            } else {
+                shift
+                    .map_public(old_anchor.2, axis_max)
+                    .map(|nc| (old_anchor.0, old_anchor.1, nc))
+            };
+            // unregister is map-only; overlays were already shifted in step 1.
+            let _ = self.spill_anchors.unregister(*old_anchor);
+            if let Some(new_anchor) = new_anchor {
+                rekeyed.push((new_anchor, *shape));
+            }
+        }
+        for (new_anchor, shape) in rekeyed {
+            // Re-register at the shifted position. On the off chance a
+            // post-shift collision exists (should not for survivors — their
+            // footprints were non-overlapping pre-shift and the shift is
+            // order-preserving), the spill is simply not re-registered; the
+            // runtime recompute reconciles. We surface nothing here.
+            let _ = self.spill_anchors.register(new_anchor, shape);
         }
 
         // --- 2. formula_cells KEY re-key (positions move; text is the
@@ -1445,7 +1544,31 @@ fn shift_name_table(
                     _ => updates.push((name.to_string(), None)),
                 }
             }
-            _ => {}
+            // **HIGH-3 (megaudit, Opus) closure — explicit, exhaustive arms.**
+            // Pre-fix a single `_ => {}` silently passed THREE distinct cases
+            // through unchanged; one of them (`Formula`) is a latent
+            // corruption hazard. Spell them out:
+            //
+            // - Cross-sheet `Cell` / `Range` (the guarded arms above only fire
+            //   when `.sheet == sheet`): a name targeting ANOTHER sheet is
+            //   position-stable under THIS sheet's edit → correct passthrough.
+            NamedTarget::Cell(_) | NamedTarget::Range(_) => {}
+            // - `Constant`: genuinely position-agnostic (a number / bool /
+            //   text literal) → correct passthrough.
+            NamedTarget::Constant(_) => {}
+            // - `Formula`: stored as opaque raw source whose body MAY contain
+            //   refs to the edited sheet. We CANNOT rewrite it here: `ql-storage`
+            //   must not depend on `ql-formula-syntax` (the formula-text shift
+            //   lives there). The binder rejects Formula targets today
+            //   (`BindError::NamedFormulaUnsupported`, ql-exec/src/plan.rs), so a
+            //   stale body cannot reach eval → this is LATENT, not live.
+            //   PHASE-3 GAP: when named-formula targets are enabled, the
+            //   producer-side formula-text rewrite (which already rewrites every
+            //   `formula_cells` body) MUST be extended to named-formula bodies.
+            //   We PASS THROUGH (keep the user's binding) rather than drop it
+            //   (data loss) — the binder's rejection is the safety net until
+            //   Phase 3 wires the rewrite.
+            NamedTarget::Formula(_) => {}
         }
     }
     for (name, new_target) in updates {
@@ -2173,6 +2296,165 @@ mod tests {
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(42.0));
         wb.clear_spill_at((0, 0, 0)).unwrap();
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Blank);
+    }
+
+    // ===== HIGH-3 (megaudit, Opus): shift_name_table explicit arms =====
+
+    #[test]
+    fn shift_does_not_disturb_named_constant() {
+        // A `Constant` target is position-agnostic — a structural edit must
+        // leave it byte-identical (regression guard for the explicit arm that
+        // replaced the catch-all `_ => {}`).
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+        wb.insert_rows(s, 0, 5).unwrap();
+        match wb.names().lookup_ci("TaxRate") {
+            Some(NamedTarget::Constant(Value::Number(n))) if n == 0.21 => {}
+            other => panic!("expected unchanged Constant 0.21, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shift_does_not_disturb_cross_sheet_named_cell() {
+        // A name targeting a DIFFERENT sheet must be untouched by this sheet's
+        // edit (cross-sheet Cell falls through the explicit passthrough arm).
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        let s1 = wb.add_sheet("S1");
+        wb.set_name("OnS1", NamedTarget::Cell(Address::new(s1, 7, 0)))
+            .unwrap();
+        wb.insert_rows(s0, 0, 3).unwrap(); // edit S0; name targets S1
+        match wb.names().lookup_ci("OnS1") {
+            Some(NamedTarget::Cell(a)) => {
+                assert_eq!(a.sheet, s1);
+                assert_eq!(a.row, 7); // untouched
+            }
+            other => panic!("expected untouched cross-sheet Cell, got {other:?}"),
+        }
+    }
+
+    // ===== HIGH-2 (megaudit, Opus): apply_axis_shift re-keys spill anchors =====
+    // Pre-fix `apply_axis_shift` did NOT touch `spill_anchors`, leaving a
+    // GHOST anchor at the old position after a structural edit → future writes
+    // to those cells got a spurious `#SPILL!`.
+
+    #[test]
+    fn insert_rows_above_spill_rekeys_anchor_no_ghost() {
+        // `=SEQUENCE(3,1)` at A2 spills A2:A4 (anchor (0,1,0), shape 3x1).
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        wb.register_spill((s, 1, 0), crate::SpillShape::new(3, 1))
+            .unwrap();
+        // Insert 1 row at the very top (entirely above the footprint).
+        wb.insert_rows(s, 0, 1).unwrap();
+        // No GHOST at the old anchor position.
+        assert!(
+            wb.spill_anchor_at(s, 1, 0).is_none(),
+            "ghost anchor left at old position"
+        );
+        // Anchor moved to (0, 2, 0) with the same shape.
+        assert_eq!(
+            wb.spill_anchor_at(s, 2, 0),
+            Some(&crate::SpillShape::new(3, 1))
+        );
+        // Reverse map follows: new body cells claim the new anchor.
+        assert_eq!(wb.spill_target_anchor(s, 2, 0), Some((s, 2, 0)));
+        assert_eq!(wb.spill_target_anchor(s, 4, 0), Some((s, 2, 0)));
+        // The freed old top cell is NOT claimed by any spill (a write there
+        // would NOT get a spurious #SPILL!).
+        assert!(wb.spill_target_anchor(s, 1, 0).is_none());
+    }
+
+    #[test]
+    fn delete_rows_above_spill_rekeys_anchor_no_ghost() {
+        // Spill anchor at A5 (row 4), shape 3x1 → A5:A7.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        wb.register_spill((s, 4, 0), crate::SpillShape::new(3, 1))
+            .unwrap();
+        // Delete rows 0..=1 (entirely above the footprint) → footprint moves up 2.
+        wb.delete_rows(s, 0, 1).unwrap();
+        assert!(wb.spill_anchor_at(s, 4, 0).is_none(), "ghost at old anchor");
+        assert_eq!(
+            wb.spill_anchor_at(s, 2, 0),
+            Some(&crate::SpillShape::new(3, 1))
+        );
+        assert_eq!(wb.spill_target_anchor(s, 4, 0), Some((s, 2, 0)));
+        // Old top body cell (A5 → now A3) no longer at old position.
+        assert!(wb.spill_target_anchor(s, 5, 0).is_none());
+    }
+
+    #[test]
+    fn delete_rows_through_spill_dissolves_it() {
+        // Spill anchor at A2 (row 1), shape 3x1 → A2:A4. A computed value
+        // sits at each body cell.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        wb.register_spill((s, 1, 0), crate::SpillShape::new(3, 1))
+            .unwrap();
+        wb.put_computed_at(s, 1, 0, Value::Number(1.0));
+        wb.put_computed_at(s, 2, 0, Value::Number(2.0));
+        wb.put_computed_at(s, 3, 0, Value::Number(3.0));
+        // Delete row 2 (strictly inside the footprint) → DISSOLVE the spill.
+        wb.delete_rows(s, 2, 2).unwrap();
+        // No anchor survives anywhere on the sheet.
+        assert_eq!(wb.spill_anchors().len(), 0, "spill must be dissolved");
+        // The anchor's old position is free → a write there is not #SPILL!.
+        assert!(wb.spill_target_anchor(s, 1, 0).is_none());
+    }
+
+    #[test]
+    fn insert_rows_pushing_spill_off_grid_dissolves_it() {
+        // Spill whose bottom edge is the last grid row; inserting above would
+        // push the far edge off-grid → must DISSOLVE, not corrupt.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        let last = ql_types::MAX_ROW;
+        // 2-row spill anchored at MAX_ROW-1 → footprint [MAX_ROW-1, MAX_ROW].
+        wb.register_spill((s, last - 1, 0), crate::SpillShape::new(2, 1))
+            .unwrap();
+        // Insert 1 row at the top: a rigid move would push the far edge to
+        // MAX_ROW+1 (off-grid) → dissolve.
+        wb.insert_rows(s, 0, 1).unwrap();
+        assert_eq!(
+            wb.spill_anchors().len(),
+            0,
+            "off-grid spill must be dissolved, not left as a ghost"
+        );
+    }
+
+    #[test]
+    fn insert_columns_left_of_spill_rekeys_anchor() {
+        // Column-axis variant: spill at B1 (col 1), shape 1x3 → B1:D1.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        wb.register_spill((s, 0, 1), crate::SpillShape::new(1, 3))
+            .unwrap();
+        // Insert 2 columns at col 0 (entirely left) → anchor col shifts +2.
+        wb.insert_columns(s, 0, 2).unwrap();
+        assert!(wb.spill_anchor_at(s, 0, 1).is_none(), "ghost at old col");
+        assert_eq!(
+            wb.spill_anchor_at(s, 0, 3),
+            Some(&crate::SpillShape::new(1, 3))
+        );
+        assert_eq!(wb.spill_target_anchor(s, 0, 5), Some((s, 0, 3)));
+    }
+
+    #[test]
+    fn insert_rows_below_spill_leaves_it_untouched() {
+        // An edit entirely AFTER the footprint leaves the anchor in place.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        wb.register_spill((s, 1, 0), crate::SpillShape::new(3, 1))
+            .unwrap();
+        // Insert at row 10 (well below A2:A4) → footprint untouched.
+        wb.insert_rows(s, 10, 1).unwrap();
+        assert_eq!(
+            wb.spill_anchor_at(s, 1, 0),
+            Some(&crate::SpillShape::new(3, 1))
+        );
     }
 
     // ===== W5-133 (Phase 4.9.A) — reference_mode + locale accessors =====
