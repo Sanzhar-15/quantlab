@@ -1237,10 +1237,19 @@ impl Workbook {
                 // the last) splits the footprint. Insert AT `lo` pushes the
                 // whole table down — allowed.
                 crate::AxisShift::Insert { at, .. } => at > lo && at <= hi,
-                // Delete overlaps the footprint but does not fully cover it
-                // → partial-table shift → refuse. (Full cover is also refused
-                // in v1 for simplicity; document.)
-                crate::AxisShift::Delete { start, end } => start <= hi && end >= lo,
+                // **MED-2 (megaudit, Opus) closure:** a delete that OVERLAPS
+                // the footprint but does NOT fully cover it splits the table
+                // → refuse. A delete that FULLY covers `[lo, hi]`
+                // (`start <= lo && end >= hi`) is Excel's "delete the whole
+                // table" → ALLOWED here (the table is removed in step 4
+                // below). Pre-fix this arm was `start <= hi && end >= lo`,
+                // which also fired on a full cover and wrongly refused the
+                // whole-table delete.
+                crate::AxisShift::Delete { start, end } => {
+                    let overlaps = start <= hi && end >= lo;
+                    let full_cover = start <= lo && end >= hi;
+                    overlaps && !full_cover
+                }
             };
             if splits {
                 return Err(StructuralEditError::WouldSplitTable {
@@ -1304,15 +1313,44 @@ impl Workbook {
             shift_name_table(s.scoped_names_mut(), sheet, is_row, shift, axis_max);
         }
 
-        // --- 4. Table footprints (only "entirely before" survives the
-        //        split guard, so just shift the top-left corner) ----------
-        let table_names: Vec<Arc<str>> = self
+        // --- 4. Table footprints. After the split guard, a table on this
+        //        sheet is one of: (a) entirely before the edit → shift its
+        //        top-left corner; (b) entirely after → untouched (shift is a
+        //        no-op on its coords); (c) **MED-2:** FULLY covered by a
+        //        delete → remove the table (Excel "delete the whole table").
+        //        A partial overlap was already refused by the split guard, so
+        //        only these three cases reach here.
+        // Capture each table's edited-axis span alongside its name so the
+        // full-cover check below needs no second lookup.
+        let tables_on_sheet: Vec<(Arc<str>, RowId, u32)> = self
             .tables
             .iter()
             .filter(|(_, m)| m.sheet == sheet)
-            .map(|(n, _)| n.clone())
+            .map(|(n, m)| {
+                let (lo, span) = if is_row {
+                    (m.top_row, m.rows)
+                } else {
+                    (m.top_col, m.cols)
+                };
+                (n.clone(), lo, span)
+            })
             .collect();
-        for name in table_names {
+        for (name, lo, span) in tables_on_sheet {
+            // **MED-2 (megaudit, Opus) closure:** a delete that FULLY covers
+            // the table's edited-axis span removes the whole table (Excel
+            // semantic) rather than shifting a corner off the deleted band
+            // (which would leave a stale / corrupt footprint). A partial
+            // overlap was already refused by the split guard.
+            let fully_deleted = match shift {
+                crate::AxisShift::Delete { start, end } => {
+                    span > 0 && start <= lo && end >= lo + span - 1
+                }
+                crate::AxisShift::Insert { .. } => false,
+            };
+            if fully_deleted {
+                self.tables.remove(&name);
+                continue;
+            }
             if let Some(meta) = self.tables.get_mut(&name) {
                 if is_row {
                     if let Some(nr) = shift.map_public(meta.top_row, axis_max) {
@@ -2334,6 +2372,126 @@ mod tests {
         wb.tables_mut().insert(Arc::from("T"), meta);
         let err = wb.delete_rows(s, 3, 4).unwrap_err();
         assert!(matches!(err, StructuralEditError::WouldSplitTable { .. }));
+    }
+
+    // ===== MED-2 (megaudit, Opus): whole-table delete is ALLOWED =====
+    // A delete that FULLY covers a table's edited-axis span removes the
+    // table (Excel semantic); a delete that only PARTIALLY overlaps still
+    // splits the footprint and is refused.
+
+    fn table_meta_at(
+        sheet: SheetId,
+        top_row: RowId,
+        rows: u32,
+        top_col: ColId,
+        cols: u32,
+    ) -> crate::TableMetadata {
+        crate::TableMetadata {
+            name: Arc::from("T"),
+            display_name: Arc::from("T"),
+            sheet,
+            top_row,
+            top_col,
+            rows,
+            cols,
+            has_header: true,
+            has_totals: false,
+            columns: vec![],
+        }
+    }
+
+    #[test]
+    fn delete_rows_fully_covering_table_removes_it() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        // Table at rows 2..=5.
+        wb.tables_mut()
+            .insert(Arc::from("T"), table_meta_at(s, 2, 4, 0, 2));
+        // Delete rows 2..=5 — exact full cover.
+        wb.delete_rows(s, 2, 5).unwrap();
+        assert!(
+            wb.lookup_table("T").is_none(),
+            "fully-covered table must be removed"
+        );
+    }
+
+    #[test]
+    fn delete_rows_over_covering_table_removes_it() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        // Table at rows 2..=5; delete rows 1..=6 (covers + extends past both edges).
+        wb.tables_mut()
+            .insert(Arc::from("T"), table_meta_at(s, 2, 4, 0, 2));
+        wb.delete_rows(s, 1, 6).unwrap();
+        assert!(
+            wb.lookup_table("T").is_none(),
+            "over-covered table must be removed"
+        );
+    }
+
+    #[test]
+    fn delete_rows_partial_top_overlap_still_refused() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        // Table at rows 2..=5; delete 1..=3 covers the top edge but not the
+        // bottom (end=3 < hi=5) → split → refuse.
+        wb.tables_mut()
+            .insert(Arc::from("T"), table_meta_at(s, 2, 4, 0, 2));
+        let err = wb.delete_rows(s, 1, 3).unwrap_err();
+        assert!(matches!(err, StructuralEditError::WouldSplitTable { .. }));
+        assert!(
+            wb.lookup_table("T").is_some(),
+            "refused delete must leave the table intact"
+        );
+    }
+
+    #[test]
+    fn delete_rows_partial_bottom_overlap_still_refused() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        // Table at rows 2..=5; delete 4..=7 covers the bottom edge but not the
+        // top (start=4 > lo=2) → split → refuse.
+        wb.tables_mut()
+            .insert(Arc::from("T"), table_meta_at(s, 2, 4, 0, 2));
+        let err = wb.delete_rows(s, 4, 7).unwrap_err();
+        assert!(matches!(err, StructuralEditError::WouldSplitTable { .. }));
+        assert!(wb.lookup_table("T").is_some());
+    }
+
+    #[test]
+    fn delete_columns_fully_covering_table_removes_it() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        // Table at cols 1..=3 (top_col 1, 3 cols).
+        wb.tables_mut()
+            .insert(Arc::from("T"), table_meta_at(s, 0, 4, 1, 3));
+        wb.delete_columns(s, 1, 3).unwrap();
+        assert!(
+            wb.lookup_table("T").is_none(),
+            "fully-covered table must be removed (columns)"
+        );
+    }
+
+    #[test]
+    fn delete_columns_partial_overlap_still_refused() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        // Table at cols 1..=3; delete cols 2..=4 (start=2 > lo=1) → split.
+        wb.tables_mut()
+            .insert(Arc::from("T"), table_meta_at(s, 0, 4, 1, 3));
+        let err = wb.delete_columns(s, 2, 4).unwrap_err();
+        assert!(matches!(err, StructuralEditError::WouldSplitTable { .. }));
+    }
+
+    #[test]
+    fn delete_rows_below_table_still_shifts_nothing() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S0");
+        // Table at rows 2..=5; delete rows 8..=9 (entirely after) → untouched.
+        wb.tables_mut()
+            .insert(Arc::from("T"), table_meta_at(s, 2, 4, 0, 2));
+        wb.delete_rows(s, 8, 9).unwrap();
+        assert_eq!(wb.lookup_table("T").unwrap().top_row, 2);
     }
 
     #[test]
