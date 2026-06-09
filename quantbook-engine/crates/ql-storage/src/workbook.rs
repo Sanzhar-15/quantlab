@@ -1562,12 +1562,15 @@ fn shift_name_table(
             //   lives there). The binder rejects Formula targets today
             //   (`BindError::NamedFormulaUnsupported`, ql-exec/src/plan.rs), so a
             //   stale body cannot reach eval → this is LATENT, not live.
-            //   PHASE-3 GAP: when named-formula targets are enabled, the
-            //   producer-side formula-text rewrite (which already rewrites every
-            //   `formula_cells` body) MUST be extended to named-formula bodies.
-            //   We PASS THROUGH (keep the user's binding) rather than drop it
-            //   (data loss) — the binder's rejection is the safety net until
-            //   Phase 3 wires the rewrite.
+            //   PHASE-4.7 GAP (GAP-B-09 — the insert/delete axis-shift sibling
+            //   of GAP-B-06's rename case): when named-formula targets are
+            //   enabled, the producer-side formula-text rewrite (which already
+            //   rewrites every `formula_cells` body via `shift_formula_text`)
+            //   MUST be extended to named-formula bodies. We PASS THROUGH (keep
+            //   the user's binding) rather than drop it (data loss) — the
+            //   binder's rejection (`NamedFormulaUnsupported`, locked by the
+            //   `named_formula_surfaces_distinct_bind_error` tripwire) is the
+            //   safety net until Phase 4.7 wires the rewrite.
             NamedTarget::Formula(_) => {}
         }
     }

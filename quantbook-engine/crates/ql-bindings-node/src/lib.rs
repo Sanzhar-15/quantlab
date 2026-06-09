@@ -1958,9 +1958,28 @@ impl CollabSession {
     /// `merge_bytes` in deterministic order so this iteration is
     /// CRDT-consistent for V3.2.a's PutValue-only scope.
     ///
-    /// V3.2.b+ may upgrade this to route through `rebuild_workbook`
-    /// once the full Op enum (formulas, format, etc.) lands. See
-    /// `.plans/_active.md` (V3.2 entry plan) Decision 1.
+    /// **DEAD / LEGACY SURFACE + HARDENING GUARDRAIL (conductor follow-up,
+    /// 2026-06).** This napi (and `listSheets`) is a dormant V3.2-V3.3
+    /// surface: the product reaches snapshots through
+    /// `SessionInstance`/CoreWorkbookSession (`workbookSnapshot`), which
+    /// independently rebuilds via `replay_into` and fails closed. **Do NOT
+    /// "harden" this read by routing it through `rebuild_workbook`** -- an
+    /// earlier revision of this very doc suggested exactly that ("V3.2.b+
+    /// may upgrade this to route through `rebuild_workbook`"), and a later
+    /// re-megaudit echoed it as a "~2-line fix". It does not work:
+    /// `rebuild_workbook` -> `replay_into` -> `validate_cell` REJECTS
+    /// `sheet >= sheet_count`, but this surface accepts LENIENT logs --
+    /// bare `PutValue` to arbitrary sheet ids with NO `AddSheet` (the mocha
+    /// `listSheets` suite + `appendPutValue` both depend on this) -- so
+    /// routing through rebuild returns `Err` on its own valid inputs. The
+    /// cache IS the correct lenient reader for this surface; its
+    /// correctness rests on the op-walker (`collect_cache_effects` in
+    /// ql-collab), which is locked for structural ops by the W3 AxisShift
+    /// arms + `insert_rows_shifts_snapshot_cache_live_append`. Fail-closed
+    /// behavior here is bounded to op-log DECODE errors (below); a
+    /// walker-LOGIC gap (a new Op kind with no `CacheEffect`) is the
+    /// silent-corruption risk, guarded at `collect_cache_effects`'s
+    /// `_ => {}` arm, not here.
     ///
     /// # Errors
     ///
@@ -2079,6 +2098,15 @@ impl CollabSession {
     /// (<1ms on local dev).  V3.4+ may add an incremental cache if
     /// profiling justifies (mirrors the V3.2.d Opus M4 -> V3.3.0.3
     /// `exportSnapshot` incremental-cache decision).
+    ///
+    /// **DEAD / LEGACY SURFACE (2026-06).** Dormant V3.2-V3.3 napi; the
+    /// product enumerates sheets via `SessionInstance`/CoreWorkbookSession.
+    /// Reads the value-bearing-sheet set from the cache (empty `AddSheet`
+    /// sheets are intentionally NOT enumerated -- this surface's contract).
+    /// **Do NOT route through `rebuild_workbook` to "harden" it** -- see the
+    /// `exportSnapshot` docstring for why (lenient bare-`PutValue` logs that
+    /// strict replay rejects); the cache is the correct lenient reader and
+    /// its consistency is locked at `collect_cache_effects`.
     #[napi(js_name = "listSheets")]
     pub fn list_sheets(&self) -> Result<Vec<u16>> {
         // **V3.3.0.X audit closure (MEDIUM-3, 2026-05-23, Opus

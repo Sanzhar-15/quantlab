@@ -1467,10 +1467,24 @@ impl CollabSession {
             // duplicate name, ...) are NOT detectable here and are handled at
             // the canonical read boundary — `workbookSnapshot` /
             // `workbookSnapshotDelta` call `rebuild_workbook` first and FAIL
-            // CLOSED on a rejecting log before reading the cache. (A residual
-            // gap on the legacy cache-only napi reads `exportSnapshot` /
-            // `listSheets` for hostile merged logs is flagged for the
-            // conductor; out of scope for the W3 structural fix.)
+            // CLOSED on a rejecting log before reading the cache.
+            //
+            // RESOLVED (conductor follow-up, 2026-06): the "residual gap" on
+            // the legacy cache-only napi reads `exportSnapshot` / `listSheets`
+            // CANNOT be closed the same way. Those napi are a DEAD V3.2-V3.3
+            // surface (the product reaches sheets/snapshots through
+            // `SessionInstance`/CoreWorkbookSession, which already rebuilds),
+            // and they accept LENIENT op logs — bare `PutValue` to arbitrary
+            // sheet ids with no `AddSheet` (their mocha `listSheets` suite +
+            // `appendPutValue` depend on this) — that `rebuild_workbook` ->
+            // `replay_into` -> `validate_cell` REJECTS (`sheet >=
+            // sheet_count`). Routing them through `rebuild_workbook` would
+            // make them `Err` on their own valid inputs. The cache IS the
+            // correct lenient reader for this surface; its correctness rests
+            // entirely on the walker (`collect_cache_effects`, locked by the
+            // AxisShift arms + the live-append tests). See the
+            // `export_snapshot` / `list_sheets` napi docstrings for the full
+            // rationale + the do-NOT-rebuild_workbook guardrail.
             //
             // Locally-appended batches are pre-flighted on a workbook clone by
             // the napi producer, so this only bites a corrupt / hostile merged
@@ -1597,6 +1611,22 @@ impl CollabSession {
             }
             // Malformed delete (`start > end` OR `end > axis_max`; storage
             // rejects either) + any other op → no cache effect.
+            //
+            // !! WALKER-COMPLETENESS GUARDRAIL (the insert/delete megaudit
+            // bug, 2026-06). ANY new `Op` variant that mutates cell VALUES,
+            // formulas, sheet existence/tombstones, or cell POSITIONS MUST
+            // get an explicit arm ABOVE that emits the matching
+            // `CacheEffect` — falling through to this `_ => {}` silently
+            // desyncs `last_snapshot` from the op log. The cache-only napi
+            // reads `exportSnapshot` / `listSheets` serve that cache
+            // DIRECTLY and (by design — they accept lenient bare-`PutValue`
+            // logs) have NO independent `rebuild_workbook` to fail closed
+            // against, so a missing arm here is a SILENT-DATA-CORRUPTION
+            // class bug for them. `Op::InsertRows/DeleteRows/InsertColumns/
+            // DeleteColumns` were exactly this gap until the W3 AxisShift
+            // arms above were added. For every such new op: add an arm here
+            // + an `insert_rows_shifts_snapshot_cache_live_append`-style
+            // live-append test.
             _ => {}
         }
     }
