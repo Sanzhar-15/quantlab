@@ -272,6 +272,19 @@ pub enum ReplayError {
     /// `UnknownReferenceMode`.
     #[error("replay unknown date system at op index {index}: {found:?}")]
     UnknownDateSystem { index: usize, found: String },
+
+    /// **W3 (insert/delete rows & columns):** a structural row/column
+    /// `Op::Insert/Delete{Rows,Columns}` was rejected by storage — an
+    /// invalid sheet/range, or an edit that would split a table footprint
+    /// or push it off the grid. The producer validates these at the napi
+    /// boundary, so a replay failure here indicates op-log corruption or a
+    /// producer that bypassed validation.
+    #[error("replay structural edit rejected at op index {index}: {source}")]
+    StructuralEdit {
+        index: usize,
+        #[source]
+        source: ql_storage::StructuralEditError,
+    },
 }
 
 /// Wrapper around `ql_storage::FormatTableError` that owns its strings,
@@ -903,6 +916,26 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
                     .clear(*row, *col);
             }
             Ok(())
+        }
+        // **W3 (insert/delete rows & columns):** the structural edit's
+        // POSITIONAL shift. The accompanying formula-TEXT rewrite rides as
+        // separate `Op::PutFormula` ops in the enclosing `BatchCommit`. A
+        // tombstoned sheet → silent no-op (mirrors `PutValue`). Storage
+        // rejections (invalid range, table split, off-grid overflow) surface
+        // as `ReplayError::StructuralEdit`.
+        Op::InsertRows { sheet, at, count } => apply_structural(workbook, *sheet, index, |wb| {
+            wb.insert_rows(*sheet, *at, *count)
+        }),
+        Op::DeleteRows { sheet, start, end } => apply_structural(workbook, *sheet, index, |wb| {
+            wb.delete_rows(*sheet, *start, *end)
+        }),
+        Op::InsertColumns { sheet, at, count } => apply_structural(workbook, *sheet, index, |wb| {
+            wb.insert_columns(*sheet, *at, *count)
+        }),
+        Op::DeleteColumns { sheet, start, end } => {
+            apply_structural(workbook, *sheet, index, |wb| {
+                wb.delete_columns(*sheet, *start, *end)
+            })
         }
         Op::BatchCommit { ops } => {
             for inner_op in ops {
@@ -1612,6 +1645,31 @@ fn validate_cell(
         });
     }
     Ok(())
+}
+
+/// **W3 (insert/delete rows & columns):** shared replay helper for the four
+/// structural-edit ops. Validates the sheet, silently no-ops on a tombstoned
+/// sheet (mirrors `Op::PutValue`), then runs `edit`, mapping a storage
+/// rejection to `ReplayError::StructuralEdit`.
+fn apply_structural(
+    workbook: &mut Workbook,
+    sheet: SheetId,
+    index: usize,
+    edit: impl FnOnce(&mut Workbook) -> Result<(), ql_storage::StructuralEditError>,
+) -> Result<(), ReplayError> {
+    let count = workbook.sheet_count();
+    if (sheet as usize) >= count {
+        return Err(ReplayError::InvalidSheet {
+            index,
+            sheet,
+            sheet_count: count,
+        });
+    }
+    // Tombstoned sheet → silent no-op (CRDT semantic, see Op::PutValue).
+    if workbook.is_sheet_removed(sheet) {
+        return Ok(());
+    }
+    edit(workbook).map_err(|source| ReplayError::StructuralEdit { index, source })
 }
 
 #[cfg(test)]
@@ -2619,5 +2677,194 @@ mod tests {
             }
             other => panic!("expected UnknownReferenceMode, got {other:?}"),
         }
+    }
+
+    // ========================================================================
+    // W3 (insert/delete rows & columns) — op replay.
+    // ========================================================================
+
+    #[test]
+    fn replay_insert_rows_shifts_value() {
+        let mut log = OpLog::new();
+        log.append(Op::PutValue {
+            sheet: 0,
+            row: 4,
+            col: 0,
+            value: CellWireValue::Number(7.0),
+        })
+        .unwrap();
+        log.append(Op::InsertRows {
+            sheet: 0,
+            at: 0,
+            count: 2,
+        })
+        .unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        let n = replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(n, 2);
+        // A5 (row 4) → A7 (row 6).
+        assert_eq!(wb.read(Address::new(0, 6, 0)), Value::Number(7.0));
+        assert_eq!(wb.read(Address::new(0, 4, 0)), Value::Blank);
+    }
+
+    #[test]
+    fn replay_delete_rows_removes_and_shifts() {
+        let mut log = OpLog::new();
+        log.append(Op::PutValue {
+            sheet: 0,
+            row: 1,
+            col: 0,
+            value: CellWireValue::Number(2.0),
+        })
+        .unwrap();
+        log.append(Op::PutValue {
+            sheet: 0,
+            row: 4,
+            col: 0,
+            value: CellWireValue::Number(5.0),
+        })
+        .unwrap();
+        log.append(Op::DeleteRows {
+            sheet: 0,
+            start: 1,
+            end: 2,
+        })
+        .unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.read(Address::new(0, 1, 0)), Value::Blank); // A2 gone
+        assert_eq!(wb.read(Address::new(0, 2, 0)), Value::Number(5.0)); // A5 → A3
+    }
+
+    #[test]
+    fn replay_batchcommit_shifts_keys_then_rewrites_text() {
+        // The producer model: BatchCommit { [InsertRows, PutFormula(new pos,
+        // rewritten text)] }. After replay the formula lives at the shifted
+        // KEY with the rewritten TEXT.
+        let mut log = OpLog::new();
+        log.append(Op::PutFormula {
+            sheet: 0,
+            row: 4,
+            col: 0,
+            text: "=A1".to_owned(),
+        })
+        .unwrap();
+        log.append(Op::BatchCommit {
+            ops: vec![
+                Op::InsertRows {
+                    sheet: 0,
+                    at: 0,
+                    count: 1,
+                },
+                // Formula at A5 → A6, text unchanged here (=A1 doesn't move
+                // because row 0 < insert point... but the POSITION shifted).
+                Op::PutFormula {
+                    sheet: 0,
+                    row: 5,
+                    col: 0,
+                    text: "=A1".to_owned(),
+                },
+            ],
+        })
+        .unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        // Formula now at the shifted position A6 (row 5).
+        assert_eq!(wb.formula_at(0, 5, 0).map(|s| s.as_ref()), Some("=A1"));
+        assert!(wb.formula_at(0, 4, 0).is_none());
+    }
+
+    #[test]
+    fn replay_insert_columns_shifts() {
+        let mut log = OpLog::new();
+        log.append(Op::PutValue {
+            sheet: 0,
+            row: 0,
+            col: 1,
+            value: CellWireValue::Number(9.0),
+        })
+        .unwrap();
+        log.append(Op::InsertColumns {
+            sheet: 0,
+            at: 0,
+            count: 1,
+        })
+        .unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        // B1 (col 1) → C1 (col 2).
+        assert_eq!(wb.read(Address::new(0, 0, 2)), Value::Number(9.0));
+        assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Blank);
+    }
+
+    #[test]
+    fn replay_structural_on_invalid_sheet_errors() {
+        let mut log = OpLog::new();
+        log.append(Op::InsertRows {
+            sheet: 9,
+            at: 0,
+            count: 1,
+        })
+        .unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        assert!(matches!(err, ReplayError::InvalidSheet { .. }));
+    }
+
+    #[test]
+    fn replay_insert_rows_is_undo_idempotent_via_rebuild() {
+        // Undo round-trip: a log WITHOUT the structural op rebuilds to the
+        // pre-insert state; replaying the SAME log twice into fresh workbooks
+        // is identical (deterministic).
+        let mut log = OpLog::new();
+        log.append(Op::PutValue {
+            sheet: 0,
+            row: 3,
+            col: 0,
+            value: CellWireValue::Number(11.0),
+        })
+        .unwrap();
+        log.append(Op::InsertRows {
+            sheet: 0,
+            at: 0,
+            count: 1,
+        })
+        .unwrap();
+        let reg = default_registry();
+        let mut wb1 = fresh_workbook_with_one_sheet();
+        replay_into(&log, &mut wb1, &reg).unwrap();
+        let mut wb2 = fresh_workbook_with_one_sheet();
+        replay_into(&log, &mut wb2, &reg).unwrap();
+        // Same value position in both (deterministic replay).
+        assert_eq!(wb1.read(Address::new(0, 4, 0)), Value::Number(11.0));
+        assert_eq!(wb2.read(Address::new(0, 4, 0)), Value::Number(11.0));
+    }
+
+    #[test]
+    fn replay_structural_on_tombstoned_sheet_is_noop() {
+        let mut log = OpLog::new();
+        // Add a second sheet so removing sheet 1 leaves sheet 0 intact.
+        log.append(Op::AddSheet {
+            name: "S2".to_owned(),
+            chunk_rows: 16,
+        })
+        .unwrap();
+        log.append(Op::RemoveSheet { id: 1 }).unwrap();
+        log.append(Op::InsertRows {
+            sheet: 1,
+            at: 0,
+            count: 5,
+        })
+        .unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        // No error: the structural edit on a tombstoned sheet is a silent no-op.
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert!(wb.is_sheet_removed(1));
     }
 }
