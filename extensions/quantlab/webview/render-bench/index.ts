@@ -168,10 +168,23 @@ async function scrollScenario(ds: BenchDataset, frames: number): Promise<number[
 	const frameMs: number[] = [];
 	const maxScrollTop = Math.max(0, viewportEl.scrollHeight - viewportEl.clientHeight);
 	const maxScrollLeft = Math.max(0, viewportEl.scrollWidth - viewportEl.clientWidth);
-	// A per-frame step that traverses a good chunk of the sheet over the run (so the blit fast path is
-	// exercised on real deltas, not a 1px nudge). Vertical for the first half, horizontal for the rest.
-	const vStep = Math.max(ROW_HEIGHT, Math.floor(maxScrollTop / Math.max(1, frames)) || ROW_HEIGHT * 3);
-	const hStep = Math.max(COL_WIDTH, Math.floor(maxScrollLeft / Math.max(1, frames)) || COL_WIDTH);
+	// Codex MED: the per-frame step MUST stay inside `computeScrollBlitA1`'s reusable-region precondition
+	// (a move that exposes the whole body has NO reusable pixels -> the blit declines -> a full draw, which
+	// would make this scenario silently measure the FULL path instead of the scroll fast path it claims).
+	// A naive `maxScrollTop / frames` is ~10k+ px/frame on the 50k-row sheet -> always declines. So bound
+	// the step to a SMALL whole-cell multiple that leaves most of the body reusable. Fail LOUD (No-Fallbacks)
+	// if the viewport is too small to exercise the blit path at all (a tiny pane would measure only full draws).
+	const bodyH = viewportEl.clientHeight - HEADER_HEIGHT;
+	const bodyW = viewportEl.clientWidth - renderer.gutterWidthPx;
+	if (bodyH <= 96 || bodyW <= 96) {
+		throw new Error('render-bench: viewport too small (' + viewportEl.clientWidth + 'x' + viewportEl.clientHeight +
+			') to exercise the scroll blit path -- enlarge the bench panel and re-run.');
+	}
+	// Step a few rows / one column per frame: small enough that the blit keeps a large reusable region (so
+	// the fast path is what we time), large enough to be a real multi-cell delta (not a 1px nudge that the
+	// pure math would also decline as sub-cell). Clamp below the body extent so a reusable region survives.
+	const vStep = Math.min(ROW_HEIGHT * 3, bodyH - 96);
+	const hStep = Math.min(COL_WIDTH, bodyW - 96);
 	for (let i = 0; i < frames; i += 1) {
 		if (i < frames / 2) {
 			viewportEl.scrollTop = Math.min(maxScrollTop, viewportEl.scrollTop + vStep);
@@ -331,6 +344,14 @@ async function runAll(): Promise<void> {
 		statusEl.textContent = 'done';
 		// Post the structured results to the host so the operator/CI can persist them.
 		vscode.postMessage({ type: 'benchResults', text, reports });
+	} catch (err) {
+		// Codex MED / No-Fallbacks: a thrown bench error (e.g. the too-small-viewport guard, a renderer
+		// failure) must be VISIBLE -- surface it in the panel AND post it to the host, never leave a blank
+		// webview with no explanation. The button is re-enabled in `finally` so the operator can retry.
+		const text = err instanceof Error ? (err.stack ?? err.message) : String(err);
+		statusEl.textContent = 'failed';
+		reportEl.textContent = 'BENCH FAILED\n\n' + text;
+		vscode.postMessage({ type: 'benchError', text });
 	} finally {
 		runBtn.disabled = false;
 	}

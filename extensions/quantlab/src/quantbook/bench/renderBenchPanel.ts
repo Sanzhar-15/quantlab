@@ -70,6 +70,14 @@ export function showRenderBenchPanel(
 			}
 			return;
 		}
+		if (msg.type === 'benchError') {
+			// Codex MED / No-Fallbacks: the bench threw mid-run. Surface it loudly (output channel + a
+			// warning toast) so a failed run is never mistaken for "no results yet".
+			const text = typeof msg.text === 'string' ? msg.text : JSON.stringify(raw);
+			log.appendLine('[render-bench] RUN FAILED:\n' + text);
+			void vscode.window.showWarningMessage('Quantbook render bench failed -- see the Quantbook output channel.');
+			return;
+		}
 		log.appendLine('[render-bench] unknown message from the bench webview: ' + String(msg.type));
 	}, undefined, disposables);
 
