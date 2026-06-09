@@ -8,8 +8,10 @@
 // at the active cell, translating each FORMULA's relative refs by the move offset (literals are copied
 // verbatim -- a text cell "A1" must stay "A1"). `planPaste` is pure (no DOM, no engine) so the offset
 // math, the single-cell-fill-into-a-selection case, and cut-move source clears are unit-tested headlessly.
-// v1 cuts (documented): no OS-clipboard interop (internal copy/paste only); a block is NOT tiled to fill
-// a larger selection (pasted once at the active cell).
+// v1 cuts (documented): no OS-clipboard interop (internal copy/paste only). A multi-cell COPY into a larger
+// selection that is an EXACT MULTIPLE of the block now TILES (Excel-faithful); a larger NON-multiple selection
+// is refused via {@link pasteAreaMismatch} (No-Fallbacks -- never a silent partial paste); a CUT is always a
+// single move (selection size ignored).
 
 import { translateFormulaRefs } from './a1FormulaRefs';
 

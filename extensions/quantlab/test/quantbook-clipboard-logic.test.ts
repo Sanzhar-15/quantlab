@@ -181,6 +181,17 @@ suite('FE-1.5 clipboardLogic -- planPaste tiling + pasteAreaMismatch (Lane C)', 
 		]);
 	});
 
+	test('a SINGLE-cell CUT into a multi-cell selection moves ONCE, never fills (discriminates pre-tiling)', () => {
+		// Lane C final audit: the prior code filled a single-cell source into the whole selection regardless
+		// of cut; a CUT must MOVE once (the single-cell-fill path is now gated on !isCut). `=B6` cut from
+		// (2,3) to (5,5) -> offset (3,2) -> `=D9`; the source (2,3) is cleared (move). One paste + one clear.
+		const one = clip(2, 3, [['=B6']], true);
+		assert.deepStrictEqual(planPaste(one, 5, 5, 3, 2), [
+			{ row: 5, col: 5, rawInput: '=D9' },
+			{ row: 2, col: 3, rawInput: '' }, // move: clear the source
+		]);
+	});
+
 	test('pasteAreaMismatch: larger non-multiple COPY = mismatch; multiples / fits / single / cut = ok', () => {
 		const block = clip(0, 0, [['1', '2'], ['3', '4']]); // 2x2 COPY
 		assert.strictEqual(pasteAreaMismatch(block, 3, 2), true, '3x2 is larger but not a multiple of 2 rows');

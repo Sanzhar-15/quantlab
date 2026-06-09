@@ -1275,6 +1275,13 @@ canvasEl.addEventListener('pointerup', ev => {
 		return;
 	}
 	canvasEl.releasePointerCapture?.(ev.pointerId);
+	// Lane C final audit: a pointerup can fire over a header/gutter band (or at a position the last
+	// pointermove never reported), so re-evaluate the RELEASE position here -- it is authoritative for what
+	// commits. A release outside the grid snaps back to the source (cancel, no extension); an in-grid release
+	// recomputes the extent from the actual release cell. Closes the "release-over-band commits a stale
+	// preview" hole that the pointermove snap-back alone did not cover.
+	const releaseHit = hitTestCanvas(ev);
+	fillPreview = releaseHit === null ? fillSource : computeFillPreview(fillSource, releaseHit.row, releaseHit.col);
 	const filled = applyFill();
 	fillSource = null;
 	fillPreview = null;
