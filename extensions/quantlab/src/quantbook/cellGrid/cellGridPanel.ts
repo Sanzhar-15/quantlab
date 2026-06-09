@@ -43,7 +43,7 @@
 import * as vscode from 'vscode';
 
 import type { QuantbookCellSnapshot, SessionInstance, WorkbookSnapshotJson } from '../types';
-import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, type CellsWrittenMessage, type CommitResultMessage, type GridSelection } from './cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, type CellsWrittenMessage, type CommitResultMessage, type FunctionListMessage, type GridSelection, type ValidateFormulaResultMessage } from './cellGridLogic';
 import { getNonce, getWebviewUri } from '../../utils/webview';
 import type { PublishedRange } from '../reactiveKernel/publishedCellsStore';
 
@@ -841,6 +841,39 @@ export class CellGridPanel {
 			// stored-error set. A no-op when no diagnostics bridge is wired.
 			onCellCommitted: (sheet, row, col) => {
 				diagnosticsSink?.clearCellErrorReply(this.session, sheet, row, col);
+			},
+			// **W2 formula intelligence (2026-06-09)**: post a formula-validation result back to THIS panel's
+			// webview (the formula-bar inline error hint). Panel-targeted (NOT a session fan-out) -- it answers
+			// exactly the requesting webview's debounced keystroke. A non-delivery is logged (the hint just
+			// won't update); No-Fallbacks -- the result already carries `ok:false` + the engine error when the
+			// validate threw, so a failed validate is surfaced in the webview, never hidden here.
+			onValidateFormula: (result: ValidateFormulaResultMessage) => {
+				if (this._disposed) {
+					return;
+				}
+				this.panel.webview.postMessage(result).then(
+					delivered => {
+						if (!delivered && !this._disposed) {
+							console.warn('[cellGrid] validateFormulaResult was not delivered to the webview.');
+						}
+					},
+					err => console.error('[cellGrid] validateFormulaResult postMessage rejected:', err),
+				);
+			},
+			// **W2 formula intelligence (2026-06-09)**: post the function catalog back for the completion
+			// dropdown. Panel-targeted. A non-delivery means the dropdown stays empty (logged, not hidden).
+			onListFunctions: (result: FunctionListMessage) => {
+				if (this._disposed) {
+					return;
+				}
+				this.panel.webview.postMessage(result).then(
+					delivered => {
+						if (!delivered && !this._disposed) {
+							console.warn('[cellGrid] functionList was not delivered to the webview.');
+						}
+					},
+					err => console.error('[cellGrid] functionList postMessage rejected:', err),
+				);
 			},
 			onError: reply => {
 				// W2 error-surface: an `errorReply` is an INPUT REJECTION (a putValue/formula that failed to

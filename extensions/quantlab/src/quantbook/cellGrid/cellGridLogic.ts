@@ -27,7 +27,7 @@
  * - `panel.webview.postMessage` -> wired as `DispatchDeps.onError`.
  */
 
-import type { CellSnapshotJson, CollabSessionInstance, EventJson, FormatIdJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SessionCellValueInput, SessionInstance, SessionOpJson, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
+import type { CellSnapshotJson, CollabSessionInstance, DiagnosticJson, EventJson, FormatIdJson, FunctionMetadataJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SessionCellValueInput, SessionInstance, SessionOpJson, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
 import { assertSupportedSchemaVersion, parseQuantbookError, recalcDirtyChecked, setFormulaValidated, setValueValidated } from '../session';
 
 /**
@@ -215,6 +215,62 @@ export interface GridSelection {
 	anchorCol: number;
 	focusRow: number;
 	focusCol: number;
+}
+
+/**
+ * **W2 formula intelligence (2026-06-09)** -- incoming (webview -> host) request to validate a formula
+ * body WITHOUT mutating, for the formula-bar inline error hint. The webview debounces keystrokes and posts
+ * this with the formula BODY (no leading `=` -- engine convention; the webview strips it). `reqId` is a
+ * per-webview monotonic token echoed in the reply so a stale (superseded) debounced response is dropped.
+ * `webviewId` is this webview's instance token, echoed so a stale post-reload reply is dropped. The host
+ * answers with a {@link ValidateFormulaResultMessage}; an engine THROW is surfaced as `ok:false`, never
+ * swallowed into "no diagnostics" (No-Fallbacks).
+ */
+export interface ValidateFormulaRequest {
+	type: 'validateFormula';
+	sheet: number;
+	row: number;
+	col: number;
+	text: string;
+	reqId: number;
+	webviewId?: string;
+}
+
+/** **W2** -- host -> originating webview: the result of a {@link ValidateFormulaRequest}. */
+export interface ValidateFormulaResultMessage {
+	type: 'validateFormulaResult';
+	reqId: number;
+	/** True when the engine ran the validate (diagnostics may be empty = valid); false when it THREW. */
+	ok: boolean;
+	/** The engine diagnostics (empty = valid). Present iff `ok`. */
+	diagnostics?: DiagnosticJson[];
+	/** A structured `[code] message` when `ok:false` (the engine threw running validateFormula). */
+	error?: string;
+	webviewId?: string;
+}
+
+/**
+ * **W2 formula intelligence (2026-06-09)** -- incoming (webview -> host) request for the function catalog
+ * (built-ins + UDFs), for the completion dropdown. The webview requests it ONCE after the handshake (the
+ * catalog is session-stable in v1) and caches it. `reqId`/`webviewId` are echoed for the same dedupe /
+ * reload-race discipline as the validate request. The host answers with a {@link FunctionListMessage};
+ * an engine THROW surfaces as `ok:false` (No-Fallbacks -- no fabricated list).
+ */
+export interface ListFunctionsRequest {
+	type: 'listFunctions';
+	reqId: number;
+	webviewId?: string;
+}
+
+/** **W2** -- host -> originating webview: the function catalog answering a {@link ListFunctionsRequest}. */
+export interface FunctionListMessage {
+	type: 'functionList';
+	reqId: number;
+	ok: boolean;
+	/** The function metadata (sorted ascending by canonicalName per the engine). Present iff `ok`. */
+	functions?: FunctionMetadataJson[];
+	error?: string;
+	webviewId?: string;
 }
 
 /**
@@ -470,6 +526,20 @@ export interface DispatchDeps {
 	 * omitted the `selection` arm is a safe no-op.
 	 */
 	readonly onSelectionChange?: (selection: GridSelection) => void;
+	/**
+	 * **W2 formula intelligence (2026-06-09)** -- the webview requested a non-mutating formula validation
+	 * ({@link ValidateFormulaRequest}). The panel posts a {@link ValidateFormulaResultMessage} back to the
+	 * originating webview. Fired ONLY after the dispatcher validates the envelope (sheet match + coords in
+	 * the A1 extent + a string `text`). Optional for backward compat (tests + the pre-W2 webview that never
+	 * posts `validateFormula`); when omitted the arm is a safe no-op.
+	 */
+	readonly onValidateFormula?: (result: ValidateFormulaResultMessage) => void;
+	/**
+	 * **W2 formula intelligence (2026-06-09)** -- the webview requested the function catalog
+	 * ({@link ListFunctionsRequest}). The panel posts a {@link FunctionListMessage} back. Optional for
+	 * backward compat; when omitted the arm is a safe no-op.
+	 */
+	readonly onListFunctions?: (result: FunctionListMessage) => void;
 }
 
 /**
@@ -598,6 +668,94 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			focusRow: sel.focusRow,
 			focusCol: sel.focusCol,
 		});
+		return;
+	}
+	// **W2 formula intelligence (2026-06-09)**: a non-mutating formula validation request from the formula
+	// bar (debounced keystroke-validation). It does NOT touch persisted state -- `session.validateFormula`
+	// parses + binds WITHOUT applying -- so this is REQUEST/REPLY, not a write: validate the envelope, call
+	// the engine, and post the diagnostics (or the engine error) back to the originating webview. A bad
+	// envelope (wrong sheet, off-extent coord, non-string text) is answered with `ok:true, diagnostics:[]`
+	// only if it is well-formed; otherwise it is DROPPED with a warning (there is no cell to decorate and no
+	// editor to un-stick -- this is an advisory read). No-Fallbacks: an engine THROW is reported as
+	// `ok:false` with the structured error, never swallowed into an empty (falsely-valid) diagnostics list.
+	if (msg.type === 'validateFormula') {
+		const req = raw as ValidateFormulaRequest;
+		if (typeof req.reqId !== 'number' || !Number.isInteger(req.reqId)) {
+			console.warn('[cellGrid] dropped validateFormula with a non-integer reqId:', req);
+			return;
+		}
+		if (
+			req.sheet !== deps.sheet ||
+			typeof req.row !== 'number' || !Number.isInteger(req.row) || req.row < 0 || req.row >= A1_MAX_ROWS ||
+			typeof req.col !== 'number' || !Number.isInteger(req.col) || req.col < 0 || req.col >= A1_MAX_COLS ||
+			typeof req.text !== 'string'
+		) {
+			console.warn('[cellGrid] dropped invalid validateFormula request:', req);
+			return;
+		}
+		// Mirror the putValue cap (engine DoS defense-in-depth): the validate path also parses synchronously.
+		if (req.text.length > MAX_RAW_INPUT_LENGTH) {
+			deps.onValidateFormula?.({
+				type: 'validateFormulaResult',
+				reqId: req.reqId,
+				ok: false,
+				error: `[bad_argument] formula is ${req.text.length} chars, over the ${MAX_RAW_INPUT_LENGTH}-char limit`,
+				webviewId: req.webviewId,
+			});
+			return;
+		}
+		try {
+			const diagnostics = deps.session.validateFormula(req.sheet, req.row, req.col, req.text);
+			deps.onValidateFormula?.({
+				type: 'validateFormulaResult',
+				reqId: req.reqId,
+				ok: true,
+				diagnostics,
+				webviewId: req.webviewId,
+			});
+		} catch (err) {
+			// No-Fallbacks: surface the engine failure (do NOT report "valid"). The webview shows the error
+			// hint reason; the user is not misled into thinking a broken formula validated.
+			const info = parseQuantbookError(err);
+			deps.onValidateFormula?.({
+				type: 'validateFormulaResult',
+				reqId: req.reqId,
+				ok: false,
+				error: `[${info.code}] ${info.message}`,
+				webviewId: req.webviewId,
+			});
+		}
+		return;
+	}
+	// **W2 formula intelligence (2026-06-09)**: the function-catalog request for the completion dropdown.
+	// Read-only (`session.listFunctions` lists built-ins + UDFs). REQUEST/REPLY like validateFormula. The
+	// webview requests it once after the handshake and caches it. No-Fallbacks: an engine THROW is reported
+	// as `ok:false`, never an empty list that would silently disable completions with no explanation.
+	if (msg.type === 'listFunctions') {
+		const req = raw as ListFunctionsRequest;
+		if (typeof req.reqId !== 'number' || !Number.isInteger(req.reqId)) {
+			console.warn('[cellGrid] dropped listFunctions with a non-integer reqId:', req);
+			return;
+		}
+		try {
+			const functions = deps.session.listFunctions();
+			deps.onListFunctions?.({
+				type: 'functionList',
+				reqId: req.reqId,
+				ok: true,
+				functions,
+				webviewId: req.webviewId,
+			});
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			deps.onListFunctions?.({
+				type: 'functionList',
+				reqId: req.reqId,
+				ok: false,
+				error: `[${info.code}] ${info.message}`,
+				webviewId: req.webviewId,
+			});
+		}
 		return;
 	}
 	// **FE-1.5 W-G copy/paste + fill (2026-06-08)**: a multi-cell atomic write (paste / fill). No open
