@@ -442,11 +442,21 @@ pub enum Op {
     /// One transaction's ops applied atomically at replay time. Produced
     /// by `WorkbookTransaction::commit` in 2A.3.b. Replay applies each
     /// inner op in order; on failure, replay reports the inner op's
-    /// index relative to the BatchCommit's parent index. No implicit
-    /// rollback at replay (commits are committed).
+    /// index relative to the BatchCommit's parent index.
+    ///
+    /// **MED-1 (megaudit, Codex) closure — rollback-atomic.** Replay applies
+    /// the whole batch to a CLONE of the workbook and swaps it in only if
+    /// EVERY inner op succeeds; a mid-batch failure returns the error with the
+    /// workbook unchanged (no half-applied structural edit / no torn cell
+    /// state). The clone is shallow over Arrow chunk Arcs and all id / counter
+    /// state lives inside the workbook, so the swap is deterministic. (Replay
+    /// as a whole remains non-transactional ACROSS top-level ops — only each
+    /// BatchCommit is atomic over its own clone.) The previous "no implicit
+    /// rollback at replay" contract is retired.
     ///
     /// Nested BatchCommits are permitted by the schema but produced
-    /// nowhere in production; replay handles them via recursion.
+    /// nowhere in production; replay handles them via recursion (each nested
+    /// commit is itself atomic over its own clone).
     BatchCommit { ops: Vec<Op> },
 
     /// **W5-118 (Phase 4.8.H):** create a workbook-scoped table.

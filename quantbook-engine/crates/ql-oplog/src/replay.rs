@@ -938,13 +938,30 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             })
         }
         Op::BatchCommit { ops } => {
+            // **MED-1 (megaudit, Codex) closure — rollback atomicity.**
+            // Pre-fix this applied each inner op DIRECTLY to `workbook`, so a
+            // batch that half-failed (e.g. a structural inner op the storage
+            // rejects, or a malformed cell op) left storage half-mutated — the
+            // op.rs "atomically" claim was a lie. Now apply the whole batch to
+            // a CLONE, then swap on success: a mid-batch failure returns the
+            // error with `workbook` byte-identical to its pre-batch state.
+            //
+            // `Workbook::clone` is shallow over Arrow chunk Arcs (refcount
+            // bumps; no buffer copy — see the Workbook Clone contract), and
+            // all id allocators / format + table counters live INSIDE the
+            // Workbook, so cloning isolates every inner-op side effect until
+            // the batch commits as a unit. Determinism is preserved: the inner
+            // ops apply in the same order to the clone, and the same fresh
+            // column ids / format ids are allocated.
+            //
+            // Phase 2A.3.a: nested ops flatten to the parent's index for error
+            // reporting (a nested BatchCommit recurses through this same arm,
+            // so it is itself atomic over its own clone).
+            let mut staged = workbook.clone();
             for inner_op in ops {
-                // Phase 2A.3.a: nested ops flatten to the parent's index
-                // for error reporting. Phase 5+ may extend with
-                // (outer, inner) tuple indexing once the producer side
-                // emits nested commits in practice.
-                apply_op(inner_op, workbook, index)?;
+                apply_op(inner_op, &mut staged, index)?;
             }
+            *workbook = staged;
             Ok(())
         }
         Op::CreateTable {
@@ -2775,6 +2792,116 @@ mod tests {
         // Formula now at the shifted position A6 (row 5).
         assert_eq!(wb.formula_at(0, 5, 0).map(|s| s.as_ref()), Some("=A1"));
         assert!(wb.formula_at(0, 4, 0).is_none());
+    }
+
+    // ===== MED-1 (megaudit, Codex): BatchCommit replay is rollback-atomic =====
+
+    #[test]
+    fn structural_batchcommit_half_failure_leaves_no_mutation() {
+        // A batch whose FIRST op is a valid structural InsertRows and whose
+        // SECOND op fails (PutValue on an out-of-range sheet). Pre-fix the
+        // InsertRows would already have shifted storage when the second op
+        // failed → half-applied structural edit. Post-fix: the whole batch is
+        // staged on a clone; the failure leaves the workbook UNCHANGED.
+        let mut log = OpLog::new();
+        // A value at A1 so we can detect whether the insert shifted it.
+        log.append(Op::PutValue {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: CellWireValue::Number(42.0),
+        })
+        .unwrap();
+        log.append(Op::BatchCommit {
+            ops: vec![
+                Op::InsertRows {
+                    sheet: 0,
+                    at: 0,
+                    count: 1,
+                },
+                // Out-of-range sheet → ReplayError::InvalidSheet mid-batch.
+                Op::PutValue {
+                    sheet: 9,
+                    row: 0,
+                    col: 0,
+                    value: CellWireValue::Number(1.0),
+                },
+            ],
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        let result = replay_into(&log, &mut wb, &reg);
+        assert!(
+            matches!(result, Err(ReplayError::InvalidSheet { .. })),
+            "expected the batch's second inner op to fail, got {result:?}"
+        );
+        // The InsertRows must NOT have taken effect: A1 stays at row 0 (no
+        // shift to row 1), proving no half-applied structural edit.
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(42.0));
+        assert_eq!(wb.read(Address::new(0, 1, 0)), Value::Blank);
+    }
+
+    #[test]
+    fn cell_batchcommit_half_failure_leaves_no_torn_state() {
+        // Broader coverage: a non-structural batch that half-fails also leaves
+        // no torn cell state. First op writes A1; second op fails on a bad
+        // sheet → the A1 write inside the batch is rolled back.
+        let mut log = OpLog::new();
+        log.append(Op::BatchCommit {
+            ops: vec![
+                Op::PutValue {
+                    sheet: 0,
+                    row: 0,
+                    col: 0,
+                    value: CellWireValue::Number(5.0),
+                },
+                Op::PutValue {
+                    sheet: 9, // invalid → fail
+                    row: 0,
+                    col: 0,
+                    value: CellWireValue::Number(6.0),
+                },
+            ],
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        let result = replay_into(&log, &mut wb, &reg);
+        assert!(matches!(result, Err(ReplayError::InvalidSheet { .. })));
+        // The in-batch A1 write must have been rolled back (clone discarded).
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Blank);
+    }
+
+    #[test]
+    fn successful_batchcommit_still_commits_atomically() {
+        // Regression guard: a batch where ALL inner ops succeed still applies
+        // (the clone is swapped in).
+        let mut log = OpLog::new();
+        log.append(Op::BatchCommit {
+            ops: vec![
+                Op::PutValue {
+                    sheet: 0,
+                    row: 0,
+                    col: 0,
+                    value: CellWireValue::Number(1.0),
+                },
+                Op::PutValue {
+                    sheet: 0,
+                    row: 1,
+                    col: 0,
+                    value: CellWireValue::Number(2.0),
+                },
+            ],
+        })
+        .unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(Address::new(0, 1, 0)), Value::Number(2.0));
     }
 
     #[test]
