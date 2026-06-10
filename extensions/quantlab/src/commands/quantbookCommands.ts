@@ -47,6 +47,11 @@ import { formatRangeTarget, normalizeSelectionRect } from '../quantbook/reactive
 // data-vscode-context argument validator (Codex HIGH-1/HIGH-2 fold: plan from the carried selection,
 // route by the carried panel token).
 import { describeStructuralPlan, parseContextMenuArg, planStructuralOp, type StructuralOp } from '../quantbook/cellGrid/contextMenuLogic';
+// FE-4 W1 (2026-06-10): the pure cores for Find/Replace-All (snapshot-read -> hit list + replace op
+// batch) and Define Name (Excel name validation + selection -> CellRangeJson). The commands below are
+// thin vscode shells over these (the established cellGrid logic/command split).
+import { buildReplaceAllOps, findHitsInWorkbook, type FindHit, type FindReplaceQuery } from '../quantbook/cellGrid/findReplaceLogic';
+import { buildDefineNameToast, buildNameRange, definedNameRejectionReason, isValidDefinedName } from '../quantbook/cellGrid/nameDefineLogic';
 import type { CollabSessionInstance, SessionInstance } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
@@ -1208,6 +1213,278 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			void vscode.window.showInformationMessage(`Quantbook: froze ${result.rows} row(s) and ${result.cols} column(s).`);
 			log.appendLine(`Froze panes: ${result.rows} row(s), ${result.cols} column(s).`);
+		}),
+	);
+
+	// =====================================================================================================
+	// FE-4 W1 (2026-06-10): Find / Replace-All in Workbook + Define Name.
+	// =====================================================================================================
+
+	// Shared QuickInput step: collect the FIND text + the three Excel-style options (match case, whole
+	// cell, search formulas) from the operator. Returns the assembled options (find text NOT yet included
+	// -- the caller passes it in) or `undefined` if dismissed. The booleans are gathered as a multi-select
+	// QuickPick so the operator toggles them in one step (mirrors the format-picker QuickPick style).
+	const promptFindOptions = async (): Promise<{ matchCase: boolean; wholeCell: boolean; inFormulas: boolean } | undefined> => {
+		const OPTIONS = [
+			{ label: 'Match case', key: 'matchCase' as const, detail: 'Case-sensitive search' },
+			{ label: 'Match entire cell contents', key: 'wholeCell' as const, detail: 'The find text must equal the whole cell' },
+			{ label: 'Search in formulas', key: 'inFormulas' as const, detail: 'Search (and replace in) formula source text, not just values' },
+		];
+		const picked = await vscode.window.showQuickPick(
+			OPTIONS.map(o => ({ label: o.label, detail: o.detail, key: o.key })),
+			{ title: 'Find Options', placeHolder: 'Toggle options, then press Enter (none selected = default match)', canPickMany: true },
+		);
+		if (picked === undefined) {
+			return undefined; // dismissed
+		}
+		const keys = new Set(picked.map(p => p.key));
+		return { matchCase: keys.has('matchCase'), wholeCell: keys.has('wholeCell'), inFormulas: keys.has('inFormulas') };
+	};
+
+	// Resolve the focused grid's session (the WHOLE-WORKBOOK target for find/replace) + a loud toast when
+	// no grid is focused. Find/Replace operate on the entire workbook snapshot, so only the session is
+	// needed (no selection rect). No-Fallbacks: no focused grid -> a clear "open/focus a grid" message.
+	const resolveFocusedSessionForFind = (): SessionInstance | undefined => {
+		const focused = CellGridPanel.focusedLocalPanel();
+		if (focused === undefined) {
+			void vscode.window.showInformationMessage('Quantbook: open and focus a Cell Grid first -- Find/Replace searches the focused workbook.');
+			return undefined;
+		}
+		return focused.session;
+	};
+
+	// Build a short, decorated QuickPick label for a hit: the A1 address + sheet, a "(formula)" tag when
+	// it matched the formula source, and a truncated preview of the matching string. Pure shaping for the
+	// hit-list UI (the full preview lives on the FindHit; we truncate here so a long cell does not blow out
+	// the QuickPick row).
+	const hitQuickPickLabel = (hit: FindHit): { label: string; description: string; detail: string; hit: FindHit } => {
+		const a1 = formatRangeTarget(hit.sheetName, hit.row, hit.col, hit.row, hit.col);
+		const previewRaw = hit.preview.length > 80 ? `${hit.preview.slice(0, 77)}...` : hit.preview;
+		// Tag formula-source hits and formula cells matched on their (read-only) cached value, so the
+		// operator understands the latter are listed but a Replace All will NOT write to them.
+		const tag = hit.field === 'formula' ? '(formula)' : (!hit.replaceable ? '(formula result -- not replaced)' : '');
+		return {
+			label: a1,
+			description: tag,
+			detail: previewRaw,
+			hit,
+		};
+	};
+
+	// FE-4 W1 "Find in Workbook": search the focused workbook's snapshot for the find text + options and
+	// show the hits as a QuickPick. v1 is a HIT-LIST only (Find-Next/F3 navigation is FE-5 -- it needs a
+	// navigateTo handler in the webview). Picking a hit just shows its address (selecting/scrolling the
+	// grid to it is the FE-5 navigateTo work); the value here is the cross-sheet "where does X appear?"
+	// answer the operator cannot get any other way today. Snapshot-READ only (No flagged queryRange --
+	// that is a hard [not_implemented_in_v1_core] on the owning Session).
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookFindInWorkbook', async () => {
+			const session = resolveFocusedSessionForFind();
+			if (session === undefined) {
+				return;
+			}
+			const find = await vscode.window.showInputBox({
+				title: 'Find in Workbook',
+				prompt: 'Text to find across every sheet',
+				placeHolder: 'e.g. #REF! or SHARPE or 1234',
+				validateInput: (value) => (value.length === 0 ? 'Enter text to find.' : null),
+			});
+			if (find === undefined || find.length === 0) {
+				return; // dismissed / empty (the box rejects empty, but guard anyway -- No-Fallbacks)
+			}
+			const opts = await promptFindOptions();
+			if (opts === undefined) {
+				return;
+			}
+			const query: FindReplaceQuery = { find, matchCase: opts.matchCase, wholeCell: opts.wholeCell, inFormulas: opts.inFormulas };
+			const log = getOutput();
+			let hits: FindHit[];
+			try {
+				// Snapshot the WHOLE workbook (the same DTO the renderer reads) and scan it in the pure core.
+				hits = findHitsInWorkbook(session.snapshot(), query);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL findInWorkbook error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook find failed: ${detail}`);
+				return;
+			}
+			if (hits.length === 0) {
+				void vscode.window.showInformationMessage(`Quantbook: no cells match "${find}".`);
+				return;
+			}
+			log.appendLine(`Find "${find}": ${hits.length} hit(s) (matchCase=${opts.matchCase}, wholeCell=${opts.wholeCell}, inFormulas=${opts.inFormulas}).`);
+			// The hit-list QuickPick. Picking a hit is informational in v1 (FE-5 wires grid navigation); we
+			// surface the chosen address as a toast so the pick is not a silent no-op.
+			const chosen = await vscode.window.showQuickPick(
+				hits.map(hitQuickPickLabel),
+				{ title: `Find in Workbook -- ${hits.length} hit(s) for "${find}"`, placeHolder: 'Select a match to see its address (grid navigation lands in a later update)', matchOnDetail: true },
+			);
+			if (chosen === undefined) {
+				return;
+			}
+			const a1 = formatRangeTarget(chosen.hit.sheetName, chosen.hit.row, chosen.hit.col, chosen.hit.row, chosen.hit.col);
+			void vscode.window.showInformationMessage(`Quantbook: match at ${a1}.`);
+		}),
+	);
+
+	// FE-4 W1 "Replace All in Workbook": find + replace EVERY match across the focused workbook in ONE
+	// session.batch (one undo unit) -> recalcDirtyChecked -> refreshSession (the SAME mutate/recalc/refresh
+	// path setFormat + the structural commands use). Bound to Ctrl/Cmd+H when the grid panel is focused
+	// (Ctrl+F is owned by the webview's in-sheet find bar -- plan amendment 2026-06-10). Over-cap (> the
+	// pure core's MAX_REPLACE_OPS) is refused loud by the core. Snapshot-READ for the matches; the replace
+	// re-types each touched cell (value vs formula) per the core's locked rules.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookReplaceAll', async () => {
+			const session = resolveFocusedSessionForFind();
+			if (session === undefined) {
+				return;
+			}
+			const find = await vscode.window.showInputBox({
+				title: 'Replace All in Workbook (1/2): Find',
+				prompt: 'Text to find across every sheet',
+				placeHolder: 'e.g. #REF! or old_name',
+				validateInput: (value) => (value.length === 0 ? 'Enter text to find.' : null),
+			});
+			if (find === undefined || find.length === 0) {
+				return;
+			}
+			// The replacement MAY be empty (Replace All with an empty replacement deletes the matched text --
+			// a valid Excel operation), so this input box does NOT reject an empty string.
+			const replace = await vscode.window.showInputBox({
+				title: 'Replace All in Workbook (2/2): Replace with',
+				prompt: 'Replacement text (leave empty to delete the matched text)',
+				placeHolder: 'e.g. new_name',
+			});
+			if (replace === undefined) {
+				return; // dismissed (an empty string is allowed; undefined means cancelled)
+			}
+			const opts = await promptFindOptions();
+			if (opts === undefined) {
+				return;
+			}
+			const query: FindReplaceQuery = { find, replace, matchCase: opts.matchCase, wholeCell: opts.wholeCell, inFormulas: opts.inFormulas };
+			const log = getOutput();
+			// Build the op batch from the snapshot in the pure core (which enforces the over-cap refusal +
+			// the value/formula re-typing rules). Any throw (empty find, over-cap, malformed snapshot,
+			// formula-replaced-to-empty) surfaces as a toast (No-Fallbacks), never swallowed.
+			let ops: ReturnType<typeof buildReplaceAllOps>;
+			try {
+				ops = buildReplaceAllOps(session.snapshot(), query);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL replaceAll build error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook replace all failed: ${detail}`);
+				return;
+			}
+			if (ops.length === 0) {
+				void vscode.window.showInformationMessage(`Quantbook: no cells match "${find}" -- nothing replaced.`);
+				return;
+			}
+			// Confirm before a mutating bulk edit (it is one undo unit, but a workbook-wide replace warrants
+			// an explicit OK -- mirrors VS Code's own "Replace All" confirmation discipline).
+			const undoLabel = `Replace all: "${find}" -> "${replace}" (${ops.length} cell(s))`;
+			const confirm = await vscode.window.showWarningMessage(
+				`Replace all "${find}" with "${replace}" in ${ops.length} cell(s) across the workbook?`,
+				{ modal: true },
+				'Replace All',
+			);
+			if (confirm !== 'Replace All') {
+				return;
+			}
+			let opSucceeded = false;
+			try {
+				session.batch(ops, { undoLabel });
+				recalcDirtyChecked(session);
+				opSucceeded = true;
+				log.appendLine(`${undoLabel}.`);
+				void vscode.window.showInformationMessage(`Quantbook: replaced ${ops.length} cell(s).`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL replaceAll batch error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook replace all failed: ${detail}`);
+			}
+			if (opSucceeded) {
+				try {
+					const { refreshed, failed } = CellGridPanel.refreshSession(session);
+					log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
+					if (failed > 0) {
+						void vscode.window.showWarningMessage(`Quantbook: the replace applied, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
+					}
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`refreshSession after replaceAll failed: ${detail}`);
+					void vscode.window.showWarningMessage('Quantbook: the replace applied, but the grid may be showing stale values (a repaint failed) -- run "Quantbook: Refresh Cell Grid".');
+				}
+			}
+		}),
+	);
+
+	// FE-4 W1 "Define Name": bind a workbook name to the focused grid's current selection rect via
+	// SessionInstance.setName. GROUND TRUTH: setName emits NO SessionChange (a defined name is
+	// delta-invisible -- not in the snapshot/delta DTOs), so there is nothing to refresh; the confirmation
+	// TOAST is the only feedback. v1 is DEFINE only (no list/delete/manager -- that is FE-5). Excel name
+	// rules + the selection -> CellRangeJson normalization live in nameDefineLogic.ts (unit-tested). Both a
+	// palette entry and a webview/context menu entry (group 6_names) invoke it; from the context menu it
+	// uses the carried right-click selection (the EXACT panel + rect), else the focused grid's selection.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookDefineName', async (...args: unknown[]) => {
+			const resolved = resolveMenuOrFocusedSelection(args.length > 0, args[0]);
+			if (resolved.kind === 'invalid-arg') {
+				void vscode.window.showErrorMessage('Quantbook: define name failed -- the right-click menu sent an invalid cell context. Try selecting the range and re-running.');
+				return;
+			}
+			if (resolved.kind === 'panel-gone') {
+				void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+				return;
+			}
+			if (resolved.kind === 'no-selection') {
+				void vscode.window.showInformationMessage('Select a range in a Cell Grid first -- the name binds to the focused grid\'s selection.');
+				return;
+			}
+			const sel = resolved.value;
+			const name = await vscode.window.showInputBox({
+				title: 'Define Name',
+				prompt: 'Name for the selected range',
+				placeHolder: 'e.g. returns or tax_rate',
+				// Per-keystroke validation with a SPECIFIC reason (No-Fallbacks: the operator sees WHY).
+				validateInput: (value) => definedNameRejectionReason(value),
+			});
+			if (name === undefined) {
+				return; // dismissed
+			}
+			// Re-validate (defense in depth -- the box already enforced it, but never trust a single gate).
+			if (!isValidDefinedName(name)) {
+				void vscode.window.showErrorMessage(`Quantbook: "${name}" is not a valid name.`);
+				return;
+			}
+			const log = getOutput();
+			// Resolve the selection's sheet NAME for the toast/target (throws loud if the sheet id is gone --
+			// a tombstoned selection -- surfacing the failure rather than mislabelling).
+			let target: string;
+			let range: ReturnType<typeof buildNameRange>;
+			try {
+				const found = sel.session.snapshot().sheets.find((s) => s.id === sel.sheet);
+				if (found === undefined) {
+					throw new Error(`the focused grid has no sheet with id ${sel.sheet}`);
+				}
+				range = buildNameRange(sel.sheet, sel.selection.anchorRow, sel.selection.anchorCol, sel.selection.focusRow, sel.selection.focusCol);
+				target = formatRangeTarget(found.name, range.startRow, range.startCol, range.endRow, range.endCol);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL defineName range-resolve error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook define name failed: ${detail}`);
+				return;
+			}
+			try {
+				sel.session.setName(name, range);
+				log.appendLine(buildDefineNameToast(name, target) + '.');
+				// setName is delta-invisible -> the toast is the ONLY feedback (no grid refresh to do).
+				void vscode.window.showInformationMessage(buildDefineNameToast(name, target) + '.');
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL setName error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook define name failed: ${detail}`);
+			}
 		}),
 	);
 }
