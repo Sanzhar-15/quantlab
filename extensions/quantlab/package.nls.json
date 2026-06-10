@@ -41,6 +41,8 @@
 	"command.quantbookFindInWorkbook.title": "Quantbook: Find in Workbook...",
 	"command.quantbookReplaceAll.title": "Quantbook: Replace All in Workbook...",
 	"command.quantbookDefineName.title": "Quantbook: Define Name...",
+	"command.quantbookSortRangeAsc.title": "Quantbook: Sort Range A to Z",
+	"command.quantbookSortRangeDesc.title": "Quantbook: Sort Range Z to A",
 	"command.quantbookFreezePanes.title": "Quantbook: Freeze Panes at Selection",
 	"command.quantbookUnfreezePanes.title": "Quantbook: Unfreeze Panes",
 	"command.quantbookCellGridCut.title": "Cut",

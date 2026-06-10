@@ -42,7 +42,10 @@ import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
 import { showRenderBenchPanel } from '../quantbook/bench/renderBenchPanel';
 import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, classifySwitchSheetTarget, resolveCommandTargetPanel } from '../quantbook/cellGrid/cellGridLogic';
 import { FORMAT_PRESET_CHOICES, buildFormatUndoLabel, buildSetFormatOps, formatStringForPreset, presetLabel, type FormatPreset } from '../quantbook/cellGrid/formatPickerLogic';
-import { formatRangeTarget, normalizeSelectionRect } from '../quantbook/reactiveNotebook/bindVariableLogic';
+// FE-4 W2 (2026-06-10): the pure, vscode-free sort core (read snapshot rect -> refuse-on-formula -> row
+// permutation -> setValue batch). The command below is a thin vscode shell over it (the established N-1/N-2 split).
+import { buildSortBatch, buildSortKeyChoices, buildSortUndoLabel, isAlreadySorted, readRectGrid, type SortDirection } from '../quantbook/cellGrid/sortLogic';
+import { columnLabelA1, formatRangeTarget, normalizeSelectionRect } from '../quantbook/reactiveNotebook/bindVariableLogic';
 // W3 (Wave 3, 2026-06-09): the pure structural-op planner (selection -> engine insert/delete call) + the
 // data-vscode-context argument validator (Codex HIGH-1/HIGH-2 fold: plan from the carried selection,
 // route by the carried panel token).
@@ -993,6 +996,115 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				}
 			}
 		}),
+	);
+
+	// **FE-4 W2 "Sort range by column" (2026-06-10)** -- sort the rows of the focused grid's SELECTION by a key
+	// column, A->Z or Z->A. CORRUPTION-SENSITIVE + host-only: the pure core (sortLogic.ts) reads the OWNING
+	// Session snapshot's rect, REFUSES (loud, ZERO writes) if any rect cell carries a formula (sort would move it
+	// without translating its refs -> silent corruption; ref-translation is FE-5), computes the stable row
+	// permutation (blanks-last in both directions; numbers < text < booleans), and emits ONE `setValue` batch
+	// that rewrites the rect. This command is the thin vscode shell: resolve the selection (native-menu arg or
+	// focused grid, via resolveMenuOrFocusedSelection -- same wrong-panel-immune path as Set Cell Format), pick
+	// the key column (a QuickPick only when the selection spans >1 column), apply the batch -> recalc -> refresh.
+	//
+	// DOCUMENTED v1 LIMITATIONS (see sortLogic.ts): number-formats/styles do NOT travel with sorted rows;
+	// external relative refs pointing INTO the rect are NOT translated; named ranges into the rect go stale.
+	const runSortCommand = async (direction: SortDirection, args: unknown[]): Promise<void> => {
+		// `args.length > 0` distinguishes a native-menu invocation (VS Code passes the parsed
+		// data-vscode-context) from a palette/keyboard invocation -- so a malformed menu arg fails visibly
+		// instead of silently sorting the focused grid (mirrors Set Cell Format).
+		const resolved = resolveMenuOrFocusedSelection(args.length > 0, args[0]);
+		if (resolved.kind === 'invalid-arg') {
+			void vscode.window.showErrorMessage('Quantbook: sort failed -- the right-click menu sent an invalid cell context. Try selecting the range and re-running.');
+			return;
+		}
+		if (resolved.kind === 'panel-gone') {
+			void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+			return;
+		}
+		if (resolved.kind === 'no-selection') {
+			void vscode.window.showInformationMessage('Select a range in a Cell Grid first -- the sort applies to the focused grid\'s selection.');
+			return;
+		}
+		const sel = resolved.value;
+		const rect = normalizeSelectionRect(sel.selection.anchorRow, sel.selection.anchorCol, sel.selection.focusRow, sel.selection.focusCol);
+		// Pick the sort-KEY column: a single-column selection sorts itself (no pick); a multi-column selection
+		// asks which column is the key, labelled by A1 letter. The QuickPick is dismissable (-> abort, no write).
+		const keyChoices = buildSortKeyChoices(rect);
+		let keyCol: number;
+		if (keyChoices.length === 1) {
+			keyCol = keyChoices[0].col;
+		} else {
+			const arrow = direction === 'asc' ? 'A to Z' : 'Z to A';
+			const keyPick = await vscode.window.showQuickPick(
+				keyChoices.map(c => ({ label: `Column ${c.label}`, col: c.col })),
+				{ title: `Sort range ${arrow}`, placeHolder: 'Choose the column to sort by' },
+			);
+			if (keyPick === undefined) {
+				return; // operator dismissed the picker -> no write
+			}
+			keyCol = keyPick.col;
+		}
+		const log = getOutput();
+		// Best-effort sheet NAME for the undo label / toast (mirrors the setFormat command's resolve). Throws
+		// loud if the sheet id is gone (a tombstoned selection), surfaced rather than silently mis-labelled.
+		let target: string;
+		try {
+			const found = sel.session.snapshot().sheets.find((s) => s.id === sel.sheet);
+			if (found === undefined) {
+				throw new Error(`the focused grid has no sheet with id ${sel.sheet}`);
+			}
+			target = formatRangeTarget(found.name, rect.startRow, rect.startCol, rect.endRow, rect.endCol);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			log.appendLine(`FATAL sort sheet-name resolve error: ${detail}`);
+			void vscode.window.showErrorMessage(`Quantbook sort failed: ${detail}`);
+			return;
+		}
+		const undoLabel = buildSortUndoLabel(direction, columnLabelA1(keyCol), target);
+		// Read the snapshot, build the ONE setValue batch (the refuse-on-formula guard fires INSIDE
+		// buildSortBatch/readRectGrid BEFORE any op is built -> a loud throw, never a partial write), apply it
+		// atomically (one undo unit), recalc, refresh. Any throw surfaces as a toast (No-Fallbacks).
+		let opSucceeded = false;
+		try {
+			const snapshot = sel.session.snapshot();
+			// Skip a no-op sort (already sorted) so we never push an empty undo unit. readRectGrid also enforces
+			// the formula-refuse + validation; a throw here (e.g. [refuse_formula]) is surfaced below.
+			const { keys } = readRectGrid(snapshot, sel.sheet, rect, keyCol);
+			if (isAlreadySorted(keys, direction)) {
+				void vscode.window.showInformationMessage(`Quantbook: ${target} is already sorted ${direction === 'asc' ? 'A->Z' : 'Z->A'} on column ${columnLabelA1(keyCol)}.`);
+				log.appendLine(`${undoLabel} -- already sorted, no change.`);
+				return;
+			}
+			const ops = buildSortBatch(sel.sheet, rect, keyCol, direction, snapshot);
+			sel.session.batch(ops, { undoLabel });
+			recalcDirtyChecked(sel.session);
+			opSucceeded = true;
+			log.appendLine(`${undoLabel} (${ops.length} cell(s) rewritten).`);
+			void vscode.window.showInformationMessage(`${undoLabel}.`);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			log.appendLine(`FATAL sort error: ${detail}`);
+			void vscode.window.showErrorMessage(`Quantbook sort failed: ${detail}`);
+		}
+		if (opSucceeded) {
+			try {
+				const { refreshed, failed } = CellGridPanel.refreshSession(sel.session);
+				log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
+				if (failed > 0) {
+					void vscode.window.showWarningMessage(`Quantbook: the sort applied, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
+				}
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`refreshSession after sort failed (non-fatal): ${detail}`);
+			}
+		}
+	};
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookSortRangeAsc', (...args: unknown[]) => runSortCommand('asc', args)),
+	);
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookSortRangeDesc', (...args: unknown[]) => runSortCommand('desc', args)),
 	);
 
 	// **W3 frozen panes (2026-06-09)** -- Excel "Freeze Panes": pin the rows above + columns left of the
