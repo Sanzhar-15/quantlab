@@ -117,6 +117,7 @@ pub mod plan_cache;
 pub mod scalar;
 pub mod session;
 pub mod simd;
+pub mod structural;
 pub mod transaction;
 pub mod workbook_runtime;
 pub mod xlsx_recompute;
@@ -150,6 +151,9 @@ pub use simd::{
     scalar_sub,
     sub_array,
     sub_scalar,
+};
+pub use structural::{
+    build_structural_batch, shifted_position, StructuralAxis, StructuralError, StructuralKind,
 };
 pub use transaction::WorkbookTransaction;
 pub use workbook_runtime::{RecomputeFailure, RecomputeResult, RuntimeError, WorkbookRuntime};
