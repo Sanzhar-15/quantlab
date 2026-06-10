@@ -136,6 +136,9 @@ use ql_collab::TransportError;
 use ql_collab_ws::WebSocketError;
 use ql_collab_ws::WebSocketTransport;
 // **inc.2d (2026-05-27):** the owning single-writer session + its contract.
+use ql_exec::structural::{
+    build_structural_batch, StructuralAxis, StructuralError, StructuralKind,
+};
 use ql_exec::WorkbookSession as CoreWorkbookSession;
 use ql_functions::default_registry;
 use ql_io::oplog_persistence::{
@@ -196,65 +199,11 @@ fn validate_u32_index(method: &str, name: &str, value: f64) -> Result<u32> {
     Ok(value as u32)
 }
 
-/// **W3 (insert/delete rows & columns):** which axis a structural edit
-/// operates on (binding-local; mirrors `ql_formula_syntax::ShiftAxis`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StructuralAxis {
-    Row,
-    Col,
-}
-
-/// **W3 (insert/delete rows & columns):** the kind of structural edit
-/// (binding-local; mirrors `ql_formula_syntax::ShiftOp`). Coordinates are
-/// 0-indexed; `Delete` is INCLUSIVE `[start, end]`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StructuralKind {
-    Insert { at: u32, count: u32 },
-    Delete { start: u32, end: u32 },
-}
-
-/// **W3 (insert/delete rows & columns):** compute the POST-shift `(row, col)`
-/// of a formula cell that lives ON the edited sheet. `None` if the cell falls
-/// inside a deleted block or is pushed off-grid (the structural op drops its
-/// `formula_cells` key, so no `PutFormula` should be emitted for it).
-fn shifted_position(
-    row: u32,
-    col: u32,
-    axis: StructuralAxis,
-    kind: StructuralKind,
-    axis_max: u32,
-) -> Option<(u32, u32)> {
-    let coord = match axis {
-        StructuralAxis::Row => row,
-        StructuralAxis::Col => col,
-    };
-    let new_coord = match kind {
-        StructuralKind::Insert { at, count } => {
-            if coord < at {
-                coord
-            } else {
-                let c = coord as u64 + count as u64;
-                if c > axis_max as u64 {
-                    return None;
-                }
-                c as u32
-            }
-        }
-        StructuralKind::Delete { start, end } => {
-            if coord < start {
-                coord
-            } else if coord <= end {
-                return None; // deleted
-            } else {
-                coord - (end - start + 1)
-            }
-        }
-    };
-    Some(match axis {
-        StructuralAxis::Row => (new_coord, col),
-        StructuralAxis::Col => (row, new_coord),
-    })
-}
+// **W3 (insert/delete rows & columns):** `StructuralAxis`, `StructuralKind`,
+// and `shifted_position` were lifted to `ql_exec::structural` (imported above)
+// so the OWNING `Session` path can reuse the SAME audited producer core that
+// the `CollabSession` path uses, instead of re-deriving it. See
+// `crates/ql-exec/src/structural.rs` for the (7-audit-pass) logic.
 
 /// **Phase 5.7 V3.6.0.X audit-of-D5 OPUS-HIGH-3 closure (2026-05-24)**:
 /// u16 equivalent of [`validate_u32_index`].  Used by `appendPutValue` +
@@ -633,6 +582,17 @@ fn persistence_error_to_napi(e: PersistenceError) -> Error {
 /// - `auto_flush_policy_to_string` (engine drift)
 fn bad_argument_error(message: String) -> Error {
     Error::from_reason(format!("[bad_argument] {message}"))
+}
+
+/// **W3 (insert/delete rows & columns):** map a [`StructuralError`] from the
+/// shared `ql_exec::structural` producer back to a `[bad_argument]` napi error,
+/// prefixed with the calling napi `method` name. Every `StructuralError` variant
+/// (missing sheet / tombstoned sheet / preflight rejection) is a caller-input
+/// problem, so they all map to `[bad_argument]` — matching the pre-extraction
+/// inline behavior byte-for-byte (the `{method}:` prefix is preserved). No
+/// fallback: there is no swallow path — a producer rejection always surfaces.
+fn structural_error_to_napi(method: &str, e: StructuralError) -> Error {
+    bad_argument_error(format!("{method}: {}", e.message()))
 }
 
 /// **Phase 5.7 V3.5.0.2 (2026-05-24) -- JS-facing cell value mirror.**
@@ -1632,127 +1592,17 @@ impl CollabSession {
         let (workbook, _report) = inner
             .rebuild_workbook(&registry)
             .map_err(collab_session_error_to_napi)?;
-        if workbook.sheet(sheet_id).is_none() {
-            return Err(bad_argument_error(format!(
-                "{method}: sheet {sheet} does not exist (workbook has {} sheets)",
-                workbook.sheet_count()
-            )));
-        }
-        // **Codex L5 MED-2 closure:** a structural edit on a tombstoned sheet
-        // is a replay no-op, but the cross-sheet formula-text rewrites below
-        // would still shift refs INTO the (deleted) sheet — corrupting other
-        // sheets' formulas as if the deleted sheet changed. Refuse it.
-        if workbook.is_sheet_removed(sheet_id) {
-            return Err(bad_argument_error(format!(
-                "{method}: sheet {sheet} is deleted (tombstoned); structural edits on a \
-                 removed sheet are not permitted"
-            )));
-        }
-        // **Codex L5 MED-3 closure:** preflight the POSITIONAL edit on a CLONE
-        // of the rebuilt workbook so a table-split / off-grid / invalid-range
-        // rejection surfaces as a clean `[bad_argument]` HERE, instead of
-        // appending an op that fails later at replay time. `Workbook::clone`
-        // is shallow over Arrow chunk Arcs (cheap refcount bumps).
-        {
-            let mut probe = workbook.clone();
-            let probe_result = match (axis, kind) {
-                (StructuralAxis::Row, StructuralKind::Insert { at, count }) => {
-                    probe.insert_rows(sheet_id, at, count)
-                }
-                (StructuralAxis::Row, StructuralKind::Delete { start, end }) => {
-                    probe.delete_rows(sheet_id, start, end)
-                }
-                (StructuralAxis::Col, StructuralKind::Insert { at, count }) => {
-                    probe.insert_columns(sheet_id, at, count)
-                }
-                (StructuralAxis::Col, StructuralKind::Delete { start, end }) => {
-                    probe.delete_columns(sheet_id, start, end)
-                }
-            };
-            if let Err(e) = probe_result {
-                return Err(bad_argument_error(format!("{method}: {e}")));
-            }
-        }
 
-        // Build the shift descriptors for the formula-text rewrite + the op.
-        let edited_canonical =
-            ql_storage::Workbook::canonical_sheet_name(workbook.sheet(sheet_id).unwrap().name());
-        let shift_op = match (axis, kind) {
-            (_, StructuralKind::Insert { at, count }) => {
-                ql_formula_syntax::ShiftOp::Insert { at, count }
-            }
-            (_, StructuralKind::Delete { start, end }) => {
-                ql_formula_syntax::ShiftOp::Delete { start, end }
-            }
-        };
-        let shift_axis = match axis {
-            StructuralAxis::Row => ql_formula_syntax::ShiftAxis::Row,
-            StructuralAxis::Col => ql_formula_syntax::ShiftAxis::Col,
-        };
-
-        // Compute formula-text rewrites for every formula referencing the
-        // edited sheet (refs that resolve to it shift; others pass through).
-        let mut put_formula_ops: Vec<Op> = Vec::new();
-        for (s, r, c, text) in workbook.iter_formulas() {
-            let scope = ql_formula_syntax::ShiftScope {
-                edited_canonical: &edited_canonical,
-                edited_id: sheet_id,
-                owner_is_edited: s == sheet_id,
-            };
-            if let Some(new_text) =
-                ql_formula_syntax::shift_formula_text(text.as_ref(), shift_axis, shift_op, scope)
-            {
-                // Emit at the formula's POST-shift position so the op lands on
-                // the cell after the structural op re-keys it. A formula ON the
-                // edited sheet moves with the shift; one on ANOTHER sheet keeps
-                // its position (only its TEXT changed).
-                let (pr, pc) = if s == sheet_id {
-                    match shifted_position(r, c, axis, kind, axis_max) {
-                        Some(pos) => pos,
-                        // The formula's own cell was deleted by this edit — the
-                        // structural op drops its formula_cells key, so emitting
-                        // a PutFormula here would resurrect it. Skip it.
-                        None => continue,
-                    }
-                } else {
-                    (r, c)
-                };
-                put_formula_ops.push(Op::PutFormula {
-                    sheet: s,
-                    row: pr,
-                    col: pc,
-                    text: new_text,
-                });
-            }
-        }
-
-        // Assemble the BatchCommit: structural op first, then the text
-        // rewrites at their post-shift positions.
-        let structural_op = match (axis, kind) {
-            (StructuralAxis::Row, StructuralKind::Insert { at, count }) => Op::InsertRows {
-                sheet: sheet_id,
-                at,
-                count,
-            },
-            (StructuralAxis::Row, StructuralKind::Delete { start, end }) => Op::DeleteRows {
-                sheet: sheet_id,
-                start,
-                end,
-            },
-            (StructuralAxis::Col, StructuralKind::Insert { at, count }) => Op::InsertColumns {
-                sheet: sheet_id,
-                at,
-                count,
-            },
-            (StructuralAxis::Col, StructuralKind::Delete { start, end }) => Op::DeleteColumns {
-                sheet: sheet_id,
-                start,
-                end,
-            },
-        };
-        let mut ops: Vec<Op> = Vec::with_capacity(put_formula_ops.len() + 1);
-        ops.push(structural_op);
-        ops.extend(put_formula_ops);
+        // **Audited producer core (7 audit passes).** The sheet-existence +
+        // tombstone refusal (Codex L5 MED-2), the clone-preflight (Codex L5
+        // MED-3), the per-formula text-shift, and the `[structural_op,
+        // PutFormula×N]` assembly all live in `ql_exec::structural` now so the
+        // owning `Session` path reuses the SAME logic. The `{method}:` prefix
+        // keeps the binding's error strings byte-identical to the pre-extraction
+        // behavior (the napi-arg validation above already covers the
+        // count==0 / bounds-order class with the historical messages).
+        let ops = build_structural_batch(&workbook, sheet_id, axis, kind, axis_max)
+            .map_err(|e| structural_error_to_napi(method, e))?;
         inner
             .append_op(Op::BatchCommit { ops })
             .map_err(collab_session_error_to_napi)?;
@@ -4515,91 +4365,9 @@ mod tests {
         assert_eq!(session_b.op_count(), session_a.op_count());
     }
 
-    // ========================================================================
-    // W3 (insert/delete rows & columns) — shifted_position producer helper.
-    // (Pure; no napi types, so it links in `cargo test`.)
-    // ========================================================================
-
-    #[test]
-    fn shifted_position_row_insert() {
-        // Row 4 (A5), insert 1 at index 0 → row 5.
-        assert_eq!(
-            shifted_position(
-                4,
-                0,
-                StructuralAxis::Row,
-                StructuralKind::Insert { at: 0, count: 1 },
-                ql_types::MAX_ROW
-            ),
-            Some((5, 0))
-        );
-        // Above the insert point → unchanged.
-        assert_eq!(
-            shifted_position(
-                2,
-                0,
-                StructuralAxis::Row,
-                StructuralKind::Insert { at: 3, count: 1 },
-                ql_types::MAX_ROW
-            ),
-            Some((2, 0))
-        );
-    }
-
-    #[test]
-    fn shifted_position_row_delete_drops_in_block() {
-        // Row 2 deleted in [2,2] → None (cell gone).
-        assert_eq!(
-            shifted_position(
-                2,
-                0,
-                StructuralAxis::Row,
-                StructuralKind::Delete { start: 2, end: 2 },
-                ql_types::MAX_ROW
-            ),
-            None
-        );
-        // Row 9 below the block [1,2] → 9 - 2 = 7.
-        assert_eq!(
-            shifted_position(
-                9,
-                0,
-                StructuralAxis::Row,
-                StructuralKind::Delete { start: 1, end: 2 },
-                ql_types::MAX_ROW
-            ),
-            Some((7, 0))
-        );
-    }
-
-    #[test]
-    fn shifted_position_col_insert() {
-        assert_eq!(
-            shifted_position(
-                0,
-                1,
-                StructuralAxis::Col,
-                StructuralKind::Insert { at: 0, count: 1 },
-                ql_types::MAX_COLUMN
-            ),
-            Some((0, 2))
-        );
-    }
-
-    #[test]
-    fn shifted_position_row_insert_overflow_is_none() {
-        // The last row pushed past MAX_ROW → None.
-        assert_eq!(
-            shifted_position(
-                ql_types::MAX_ROW,
-                0,
-                StructuralAxis::Row,
-                StructuralKind::Insert { at: 0, count: 1 },
-                ql_types::MAX_ROW
-            ),
-            None
-        );
-    }
+    // **W3 (insert/delete rows & columns):** the `shifted_position` unit tests
+    // moved WITH the helper to `ql_exec::structural` (the audited coverage
+    // travels with the audited code). See `crates/ql-exec/src/structural.rs`.
 }
 
 // ===========================================================================
@@ -6710,6 +6478,91 @@ impl Session {
             self.inner
                 .lock()
                 .set_name(&name, range)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    // ============================================================================
+    // W3 (insert/delete rows & columns) — structural-axis edits over napi.
+    //
+    // These bind the owning `WorkbookSession::{insert,delete}_{rows,columns}`
+    // (the audited producer core lives in `ql_exec::structural`). This is the
+    // PATH THE PRODUCT GRID RUNS ON — the IDE's `quantbookCommands` structural
+    // op calls `session.insertRows/deleteRows/insertColumns/deleteColumns`
+    // directly on this owning `Session` (the dormant `CollabSession` is v1.5).
+    //
+    // Args follow the locked 6.3-1 contract: `sheet` validated to the `SheetId`
+    // (u16) range via `validate_u16_index`; the row/col indices to u32 via
+    // `validate_u32_index` (both avoid JS `ToUint32` silent coercion). Engine
+    // rejections (NotFound / BadArgument / invalid_state) map natively through
+    // `engine_error_to_napi`. `guarded(env,..)` + `catch_unwind` make a panic a
+    // structured `[panic]` error rather than a Node abort.
+    //
+    // **deleteRows/deleteColumns take `end` INCLUSIVE** — the IDE command passes
+    // `(index, index + count - 1)` (quantbookCommands.ts), matching the engine
+    // `Op::Delete{Rows,Columns}` `[start, end]` inclusive contract.
+    // ============================================================================
+
+    /// Insert `count` blank rows at row index `at` on `sheet`. Rows at/below
+    /// `at` shift down; formula refs into the edited sheet are rewritten to
+    /// follow. `count == 0` / off-grid / table-split → `[bad_argument]`; unknown
+    /// sheet → `[sheet_not_found]`; off a Ready session → `[invalid_state]`.
+    #[napi(js_name = "insertRows", catch_unwind)]
+    pub fn insert_rows(&self, env: Env, sheet: f64, at: f64, count: f64) -> Result<()> {
+        guarded(env, "insertRows", || {
+            let sheet = validate_u16_index("insertRows", "sheet", sheet)?;
+            let at = validate_u32_index("insertRows", "at", at)?;
+            let count = validate_u32_index("insertRows", "count", count)?;
+            self.inner
+                .lock()
+                .insert_rows(sheet, at, count)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Delete the INCLUSIVE row block `[start, end]` on `sheet`. Rows below
+    /// `end` shift up; refs into the deleted block become `#REF!`. `start > end`
+    /// / off-grid → `[bad_argument]`. `end` is INCLUSIVE (the IDE passes
+    /// `index, index + count - 1`).
+    #[napi(js_name = "deleteRows", catch_unwind)]
+    pub fn delete_rows(&self, env: Env, sheet: f64, start: f64, end: f64) -> Result<()> {
+        guarded(env, "deleteRows", || {
+            let sheet = validate_u16_index("deleteRows", "sheet", sheet)?;
+            let start = validate_u32_index("deleteRows", "start", start)?;
+            let end = validate_u32_index("deleteRows", "end", end)?;
+            self.inner
+                .lock()
+                .delete_rows(sheet, start, end)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Insert `count` blank columns at column index `at` on `sheet`. See
+    /// [`Self::insert_rows`].
+    #[napi(js_name = "insertColumns", catch_unwind)]
+    pub fn insert_columns(&self, env: Env, sheet: f64, at: f64, count: f64) -> Result<()> {
+        guarded(env, "insertColumns", || {
+            let sheet = validate_u16_index("insertColumns", "sheet", sheet)?;
+            let at = validate_u32_index("insertColumns", "at", at)?;
+            let count = validate_u32_index("insertColumns", "count", count)?;
+            self.inner
+                .lock()
+                .insert_columns(sheet, at, count)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Delete the INCLUSIVE column block `[start, end]` on `sheet`. See
+    /// [`Self::delete_rows`]. `end` is INCLUSIVE.
+    #[napi(js_name = "deleteColumns", catch_unwind)]
+    pub fn delete_columns(&self, env: Env, sheet: f64, start: f64, end: f64) -> Result<()> {
+        guarded(env, "deleteColumns", || {
+            let sheet = validate_u16_index("deleteColumns", "sheet", sheet)?;
+            let start = validate_u32_index("deleteColumns", "start", start)?;
+            let end = validate_u32_index("deleteColumns", "end", end)?;
+            self.inner
+                .lock()
+                .delete_columns(sheet, start, end)
                 .map_err(|e| engine_error_to_napi(env, e))
         })
     }
