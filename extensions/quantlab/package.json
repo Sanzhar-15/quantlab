@@ -295,6 +295,24 @@
         "category": "%command.category%"
       },
       {
+        "_comment": "FE-4 W1: workbook-wide Find (hit-list QuickPick; snapshot-read; Find-Next is FE-5).",
+        "command": "quantlab.quantbookFindInWorkbook",
+        "title": "%command.quantbookFindInWorkbook.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "FE-4 W1: workbook-wide Replace All (one session.batch undo unit; Ctrl/Cmd+H over the focused grid).",
+        "command": "quantlab.quantbookReplaceAll",
+        "title": "%command.quantbookReplaceAll.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "FE-4 W1: Define Name over the current selection (setName; delta-invisible -> confirmation toast).",
+        "command": "quantlab.quantbookDefineName",
+        "title": "%command.quantbookDefineName.title%",
+        "category": "%command.category%"
+      },
+      {
         "_comment": "W3 frozen panes: Excel Freeze Panes at the focused grid's active cell.",
         "command": "quantlab.quantbookFreezePanes",
         "title": "%command.quantbookFreezePanes.title%",
@@ -1072,10 +1090,23 @@
           "command": "quantlab.quantbookDeleteColumn",
           "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@6"
+        },
+        {
+          "_comment": "FE-4 W1: Define Name over the right-clicked selection. New group 6_names (after 4_structure) so it sits below insert/delete without renumbering W2/W3 groups.",
+          "command": "quantlab.quantbookDefineName",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "6_names@1"
         }
       ]
     },
     "keybindings": [
+      {
+        "_comment": "FE-4 W1: Replace All in the focused Cell Grid. Ctrl+H (Cmd+H on mac), the Sheets/Excel Replace convention. Scoped to the grid webview panel being active (activeWebviewPanelId == the grid viewType) so it never shadows the editor's own Find/Replace. Ctrl+F is NOT bound here -- the webview owns the in-sheet find bar (plan amendment 2026-06-10).",
+        "command": "quantlab.quantbookReplaceAll",
+        "key": "ctrl+h",
+        "mac": "cmd+h",
+        "when": "activeWebviewPanelId == 'quantlab.quantbookCellGrid'"
+      },
       {
         "command": "quantlab.switchToChart",
         "key": "ctrl+q c",
