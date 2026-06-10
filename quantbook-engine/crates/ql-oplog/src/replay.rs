@@ -131,6 +131,27 @@ pub enum ReplayError {
         id: ql_storage::FormatId,
     },
 
+    /// **FE-4 W4 (2026-06-10):** `StyleTable::register_at` refused a replayed
+    /// `Op::RegisterStyle` — the id is already taken with a different style, or
+    /// the style is already at a different id, or the counter would overflow.
+    /// Mirrors [`Self::FormatRejected`].
+    #[error("replay style rejected at op index {index}: {source:?}")]
+    StyleRejected {
+        index: usize,
+        #[source]
+        source: StyleRejectedSource,
+    },
+
+    /// **FE-4 W4 (2026-06-10):** `Op::SetCellStyle` referenced a style id that
+    /// hasn't been registered yet. The producer SHOULD always emit
+    /// `RegisterStyle` BEFORE `SetCellStyle`; replay enforces that. Mirrors
+    /// [`Self::FormatNotRegistered`].
+    #[error("replay set-cell-style references unregistered style id {id:?} at op index {index}")]
+    StyleNotRegistered {
+        index: usize,
+        id: ql_storage::StyleId,
+    },
+
     /// **W5-91 (Phase 4.6.C):** `Op::RenameSheet` referenced a sheet
     /// whose current name matches neither `old_name` nor `new_name`
     /// (i.e. the replay state has diverged from what the op recorded).
@@ -363,6 +384,46 @@ impl From<ql_storage::FormatTableError> for FormatRejectedSource {
             _ => unreachable!(
                 "FormatTableError gained a variant — extend FormatRejectedSource::From"
             ),
+        }
+    }
+}
+
+/// **FE-4 W4 (2026-06-10):** wrapper around `ql_storage::StyleTableError` that
+/// owns its data so `ReplayError` stays `Clone + std::error::Error` without
+/// borrowing into the table. Mirrors [`FormatRejectedSource`].
+#[derive(Clone, Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StyleRejectedSource {
+    #[error("style id {id:?} already bound to a different style, can't re-bind")]
+    IdCollision { id: ql_storage::StyleId },
+    #[error("style already at id {existing_id:?}, can't bind to id {attempted_id:?}")]
+    StyleCollision {
+        existing_id: ql_storage::StyleId,
+        attempted_id: ql_storage::StyleId,
+    },
+    #[error("style counter overflow for peer {peer:?} (counter == u32::MAX)")]
+    CounterOverflow { peer: ql_types::PeerId },
+}
+
+impl From<ql_storage::StyleTableError> for StyleRejectedSource {
+    fn from(e: ql_storage::StyleTableError) -> Self {
+        match e {
+            ql_storage::StyleTableError::IdCollision { id, .. } => {
+                StyleRejectedSource::IdCollision { id }
+            }
+            ql_storage::StyleTableError::StyleCollision {
+                existing_id,
+                attempted_id,
+            } => StyleRejectedSource::StyleCollision {
+                existing_id,
+                attempted_id,
+            },
+            ql_storage::StyleTableError::CounterOverflow { peer } => {
+                StyleRejectedSource::CounterOverflow { peer }
+            }
+            _ => {
+                unreachable!("StyleTableError gained a variant — extend StyleRejectedSource::From")
+            }
         }
     }
 }
@@ -913,6 +974,55 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
                     .sheet_mut(*sheet)
                     .expect("sheet validated above")
                     .format_overlay_mut()
+                    .clear(*row, *col);
+            }
+            Ok(())
+        }
+        // **FE-4 W4 (2026-06-10):** register a style value at its id. Mirrors
+        // `Op::RegisterFormat`: route through `StyleTable::register_at` so
+        // id/value collisions + counter overflow surface as `StyleRejected`
+        // (idempotent on a same-id-same-style replay).
+        Op::RegisterStyle { id, style } => {
+            let sid = id.to_storage();
+            let style = style.to_storage();
+            workbook.styles_mut().register_at(sid, style).map_err(|e| {
+                ReplayError::StyleRejected {
+                    index,
+                    source: e.into(),
+                }
+            })?;
+            Ok(())
+        }
+        // **FE-4 W4 (2026-06-10):** set or clear a cell's style id. Mirrors
+        // `Op::SetCellFormat` exactly: tombstone no-op, unknown-id refused,
+        // `None` clears the overlay entry.
+        Op::SetCellStyle {
+            sheet,
+            row,
+            col,
+            id,
+        } => {
+            validate_cell(workbook, *sheet, *row, *col, index)?;
+            // Tombstone guard (mirrors SetCellFormat): a style write on a
+            // tombstoned sheet is a silent no-op.
+            if workbook.is_sheet_removed(*sheet) {
+                return Ok(());
+            }
+            if let Some(wire_id) = id {
+                let sid = wire_id.to_storage();
+                if workbook.styles().lookup(sid).is_none() {
+                    return Err(ReplayError::StyleNotRegistered { index, id: sid });
+                }
+                workbook
+                    .sheet_mut(*sheet)
+                    .expect("sheet validated above")
+                    .style_overlay_mut()
+                    .set(*row, *col, sid);
+            } else {
+                workbook
+                    .sheet_mut(*sheet)
+                    .expect("sheet validated above")
+                    .style_overlay_mut()
                     .clear(*row, *col);
             }
             Ok(())
@@ -2223,6 +2333,173 @@ mod tests {
             wb.sheet(0).unwrap().format_overlay().get(0, 0),
             Some(ql_storage::FormatId::Builtin(14))
         );
+    }
+
+    // ===== FE-4 W4 — style op replay tests =====
+
+    fn bold_style_wire() -> crate::StyleWire {
+        crate::StyleWire::from_storage(ql_storage::Style {
+            bold: true,
+            ..ql_storage::Style::default()
+        })
+    }
+
+    #[test]
+    fn replay_register_and_set_cell_style_binds_overlay() {
+        let sid = crate::StyleIdWire {
+            peer: ql_types::LEGACY_PEER,
+            counter: 0,
+        };
+        let mut log = OpLog::new();
+        log.append(Op::RegisterStyle {
+            id: sid,
+            style: bold_style_wire(),
+        })
+        .unwrap();
+        log.append(Op::SetCellStyle {
+            sheet: 0,
+            row: 3,
+            col: 5,
+            id: Some(sid),
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(
+            wb.sheet(0).unwrap().style_overlay().get(3, 5),
+            Some(sid.to_storage())
+        );
+        assert_eq!(
+            wb.styles().lookup(sid.to_storage()),
+            Some(bold_style_wire().to_storage())
+        );
+    }
+
+    #[test]
+    fn replay_set_cell_style_none_clears_overlay() {
+        let sid = crate::StyleIdWire {
+            peer: ql_types::LEGACY_PEER,
+            counter: 0,
+        };
+        let mut log = OpLog::new();
+        log.append(Op::RegisterStyle {
+            id: sid,
+            style: bold_style_wire(),
+        })
+        .unwrap();
+        log.append(Op::SetCellStyle {
+            sheet: 0,
+            row: 3,
+            col: 5,
+            id: Some(sid),
+        })
+        .unwrap();
+        log.append(Op::SetCellStyle {
+            sheet: 0,
+            row: 3,
+            col: 5,
+            id: None,
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.sheet(0).unwrap().style_overlay().get(3, 5), None);
+    }
+
+    #[test]
+    fn replay_set_cell_style_unregistered_id_errors() {
+        let mut log = OpLog::new();
+        log.append(Op::SetCellStyle {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            id: Some(crate::StyleIdWire {
+                peer: ql_types::LEGACY_PEER,
+                counter: 99,
+            }),
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        match replay_into(&log, &mut wb, &reg) {
+            Err(ReplayError::StyleNotRegistered { index, id }) => {
+                assert_eq!(index, 0);
+                assert_eq!(id, ql_storage::StyleId::new(ql_types::LEGACY_PEER, 99));
+            }
+            other => panic!("expected StyleNotRegistered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_register_style_id_collision_errors() {
+        let sid = crate::StyleIdWire {
+            peer: ql_types::LEGACY_PEER,
+            counter: 0,
+        };
+        let mut log = OpLog::new();
+        log.append(Op::RegisterStyle {
+            id: sid,
+            style: bold_style_wire(),
+        })
+        .unwrap();
+        // Re-register the SAME id with a DIFFERENT style → StyleRejected.
+        log.append(Op::RegisterStyle {
+            id: sid,
+            style: crate::StyleWire::from_storage(ql_storage::Style {
+                italic: true,
+                ..ql_storage::Style::default()
+            }),
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        match replay_into(&log, &mut wb, &reg) {
+            Err(ReplayError::StyleRejected { index, source }) => {
+                assert_eq!(index, 1);
+                assert!(matches!(source, StyleRejectedSource::IdCollision { .. }));
+            }
+            other => panic!("expected StyleRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_set_cell_style_on_tombstoned_sheet_is_noop() {
+        let sid = crate::StyleIdWire {
+            peer: ql_types::LEGACY_PEER,
+            counter: 0,
+        };
+        let mut log = OpLog::new();
+        log.append(Op::AddSheet {
+            name: "S2".to_owned(),
+            chunk_rows: 1024,
+        })
+        .unwrap();
+        log.append(Op::RegisterStyle {
+            id: sid,
+            style: bold_style_wire(),
+        })
+        .unwrap();
+        log.append(Op::RemoveSheet { id: 1 }).unwrap();
+        // SetCellStyle on the tombstoned sheet 1 → silent no-op.
+        log.append(Op::SetCellStyle {
+            sheet: 1,
+            row: 0,
+            col: 0,
+            id: Some(sid),
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        // No overlay entry written on the tombstoned sheet.
+        assert_eq!(wb.sheet(1).unwrap().style_overlay().get(0, 0), None);
     }
 
     // ===== W5-91 (Phase 4.6.C) Op::RenameSheet replay =====

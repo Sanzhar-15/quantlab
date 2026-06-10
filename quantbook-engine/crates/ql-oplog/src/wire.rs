@@ -346,6 +346,207 @@ impl FormatIdWire {
     }
 }
 
+/// **FE-4 W4 (2026-06-10):** wire-format mirror of `ql_storage::StyleId`
+/// (a peer-allocated `(peer, counter)` tuple — NO `Builtin` variant, unlike
+/// [`FormatIdWire`], because styles have no Excel-canonical global registry).
+///
+/// Serde shape: `{ "peer": 42, "counter": 7 }` (`peer` is a raw `u64`;
+/// `PeerId` is `#[serde(transparent)]`). The op-log payload for
+/// `Op::RegisterStyle` / `Op::SetCellStyle`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct StyleIdWire {
+    pub peer: PeerId,
+    pub counter: u32,
+}
+
+impl StyleIdWire {
+    /// Project the storage-side [`ql_storage::StyleId`] into the wire shape.
+    pub fn from_storage(id: ql_storage::StyleId) -> Self {
+        StyleIdWire {
+            peer: id.peer,
+            counter: id.counter,
+        }
+    }
+
+    /// Decode the wire shape into the storage-side [`ql_storage::StyleId`].
+    /// Inverse of [`from_storage`]; lossless.
+    pub fn to_storage(self) -> ql_storage::StyleId {
+        ql_storage::StyleId {
+            peer: self.peer,
+            counter: self.counter,
+        }
+    }
+}
+
+/// **FE-4 W4 (2026-06-10):** wire-format mirror of `ql_storage::Rgb`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RgbWire {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl RgbWire {
+    fn from_storage(c: ql_storage::Rgb) -> Self {
+        RgbWire {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+        }
+    }
+    fn to_storage(self) -> ql_storage::Rgb {
+        ql_storage::Rgb {
+            r: self.r,
+            g: self.g,
+            b: self.b,
+        }
+    }
+}
+
+/// **FE-4 W4 (2026-06-10):** wire-format mirror of `ql_storage::HAlign`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HAlignWire {
+    #[default]
+    General,
+    Left,
+    Center,
+    Right,
+}
+
+impl HAlignWire {
+    fn from_storage(a: ql_storage::HAlign) -> Self {
+        match a {
+            ql_storage::HAlign::General => HAlignWire::General,
+            ql_storage::HAlign::Left => HAlignWire::Left,
+            ql_storage::HAlign::Center => HAlignWire::Center,
+            ql_storage::HAlign::Right => HAlignWire::Right,
+        }
+    }
+    fn to_storage(self) -> ql_storage::HAlign {
+        match self {
+            HAlignWire::General => ql_storage::HAlign::General,
+            HAlignWire::Left => ql_storage::HAlign::Left,
+            HAlignWire::Center => ql_storage::HAlign::Center,
+            HAlignWire::Right => ql_storage::HAlign::Right,
+        }
+    }
+}
+
+/// **FE-4 W4 (2026-06-10):** wire-format mirror of `ql_storage::BorderStyle`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BorderStyleWire {
+    #[default]
+    None,
+    Thin,
+    Medium,
+    Thick,
+    Dashed,
+    Dotted,
+    Double,
+}
+
+impl BorderStyleWire {
+    fn from_storage(s: ql_storage::BorderStyle) -> Self {
+        match s {
+            ql_storage::BorderStyle::None => BorderStyleWire::None,
+            ql_storage::BorderStyle::Thin => BorderStyleWire::Thin,
+            ql_storage::BorderStyle::Medium => BorderStyleWire::Medium,
+            ql_storage::BorderStyle::Thick => BorderStyleWire::Thick,
+            ql_storage::BorderStyle::Dashed => BorderStyleWire::Dashed,
+            ql_storage::BorderStyle::Dotted => BorderStyleWire::Dotted,
+            ql_storage::BorderStyle::Double => BorderStyleWire::Double,
+        }
+    }
+    fn to_storage(self) -> ql_storage::BorderStyle {
+        match self {
+            BorderStyleWire::None => ql_storage::BorderStyle::None,
+            BorderStyleWire::Thin => ql_storage::BorderStyle::Thin,
+            BorderStyleWire::Medium => ql_storage::BorderStyle::Medium,
+            BorderStyleWire::Thick => ql_storage::BorderStyle::Thick,
+            BorderStyleWire::Dashed => ql_storage::BorderStyle::Dashed,
+            BorderStyleWire::Dotted => ql_storage::BorderStyle::Dotted,
+            BorderStyleWire::Double => ql_storage::BorderStyle::Double,
+        }
+    }
+}
+
+/// **FE-4 W4 (2026-06-10):** wire-format mirror of `ql_storage::BorderEdge`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BorderEdgeWire {
+    pub style: BorderStyleWire,
+    pub color: RgbWire,
+}
+
+impl BorderEdgeWire {
+    fn from_storage(e: ql_storage::BorderEdge) -> Self {
+        BorderEdgeWire {
+            style: BorderStyleWire::from_storage(e.style),
+            color: RgbWire::from_storage(e.color),
+        }
+    }
+    fn to_storage(self) -> ql_storage::BorderEdge {
+        ql_storage::BorderEdge {
+            style: self.style.to_storage(),
+            color: self.color.to_storage(),
+        }
+    }
+}
+
+/// **FE-4 W4 (2026-06-10):** wire-format mirror of `ql_storage::Style`
+/// (bold/italic/fill/align + per-edge borders). Serde shape carries every
+/// sub-field explicitly so the op-log + `.qbook` envelope round-trip every
+/// edge {style,color} losslessly (acceptance #11).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(deny_unknown_fields)]
+pub struct StyleWire {
+    pub bold: bool,
+    pub italic: bool,
+    pub fill: Option<RgbWire>,
+    pub align: HAlignWire,
+    pub border_top: BorderEdgeWire,
+    pub border_bottom: BorderEdgeWire,
+    pub border_left: BorderEdgeWire,
+    pub border_right: BorderEdgeWire,
+}
+
+impl StyleWire {
+    /// Project the storage-side [`ql_storage::Style`] into the wire shape.
+    pub fn from_storage(s: ql_storage::Style) -> Self {
+        StyleWire {
+            bold: s.bold,
+            italic: s.italic,
+            fill: s.fill.map(RgbWire::from_storage),
+            align: HAlignWire::from_storage(s.align),
+            border_top: BorderEdgeWire::from_storage(s.borders.top),
+            border_bottom: BorderEdgeWire::from_storage(s.borders.bottom),
+            border_left: BorderEdgeWire::from_storage(s.borders.left),
+            border_right: BorderEdgeWire::from_storage(s.borders.right),
+        }
+    }
+
+    /// Decode the wire shape into the storage-side [`ql_storage::Style`].
+    /// Inverse of [`from_storage`]; lossless.
+    pub fn to_storage(self) -> ql_storage::Style {
+        ql_storage::Style {
+            bold: self.bold,
+            italic: self.italic,
+            fill: self.fill.map(RgbWire::to_storage),
+            align: self.align.to_storage(),
+            borders: ql_storage::Borders {
+                top: self.border_top.to_storage(),
+                bottom: self.border_bottom.to_storage(),
+                left: self.border_left.to_storage(),
+                right: self.border_right.to_storage(),
+            },
+        }
+    }
+}
+
 /// Map `ErrorValue` to its canonical Excel-style text form (`#REF!`, `#VALUE!`, etc.).
 /// Used by both wire-format serialization and the user-visible representation per spec.
 pub fn error_to_canonical_text(e: ErrorValue) -> String {
@@ -640,5 +841,83 @@ mod format_id_wire_tests {
             let back = FormatIdWire::from_storage(storage);
             assert_eq!(back, original, "wire→storage→wire identity");
         }
+    }
+}
+
+#[cfg(test)]
+mod style_wire_tests {
+    //! FE-4 W4 (2026-06-10): tests for `StyleWire` / `StyleIdWire` and the
+    //! lossless storage ↔ wire round-trips (incl. every per-edge border
+    //! sub-field — acceptance #11's wire half).
+    use super::*;
+
+    fn rich_style() -> ql_storage::Style {
+        let edge = ql_storage::BorderEdge {
+            style: ql_storage::BorderStyle::Double,
+            color: ql_storage::Rgb::new(1, 2, 3),
+        };
+        ql_storage::Style {
+            bold: true,
+            italic: true,
+            fill: Some(ql_storage::Rgb::new(0xab, 0xcd, 0xef)),
+            align: ql_storage::HAlign::Center,
+            borders: ql_storage::Borders {
+                top: edge,
+                bottom: ql_storage::BorderEdge {
+                    style: ql_storage::BorderStyle::Thin,
+                    color: ql_storage::Rgb::new(9, 9, 9),
+                },
+                left: ql_storage::BorderEdge::NONE,
+                right: edge,
+            },
+        }
+    }
+
+    #[test]
+    fn style_id_wire_round_trips_storage() {
+        let sid = ql_storage::StyleId::new(ql_types::PeerId::new(77), 13);
+        let wire = StyleIdWire::from_storage(sid);
+        assert_eq!(wire.to_storage(), sid);
+    }
+
+    #[test]
+    fn style_id_wire_round_trips_json() {
+        let wire = StyleIdWire {
+            peer: PeerId::new(42),
+            counter: 7,
+        };
+        let json = serde_json::to_string(&wire).unwrap();
+        assert_eq!(json, r#"{"peer":42,"counter":7}"#);
+        let back: StyleIdWire = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, wire);
+    }
+
+    #[test]
+    fn style_wire_round_trips_storage_every_subfield() {
+        let s = rich_style();
+        let wire = StyleWire::from_storage(s);
+        let back = wire.to_storage();
+        assert_eq!(back, s, "wire→storage must preserve every style sub-field");
+        // Spot-check borders explicitly (acceptance #11 wire half).
+        assert_eq!(back.borders.top.style, ql_storage::BorderStyle::Double);
+        assert_eq!(back.borders.top.color, ql_storage::Rgb::new(1, 2, 3));
+        assert_eq!(back.borders.bottom.style, ql_storage::BorderStyle::Thin);
+        assert!(back.borders.left.is_none());
+        assert_eq!(back.borders.right, back.borders.top);
+    }
+
+    #[test]
+    fn style_wire_round_trips_json() {
+        let wire = StyleWire::from_storage(rich_style());
+        let json = serde_json::to_string(&wire).unwrap();
+        let back: StyleWire = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, wire);
+    }
+
+    #[test]
+    fn default_style_wire_round_trips() {
+        let wire = StyleWire::from_storage(ql_storage::Style::default());
+        assert_eq!(wire.to_storage(), ql_storage::Style::default());
+        assert!(wire.fill.is_none());
     }
 }

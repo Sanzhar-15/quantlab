@@ -150,6 +150,14 @@ pub struct CellState {
     pub value: Option<CellWireValue>,
     pub formula: Option<String>,
     pub format: Option<FormatId>,
+    /// **FE-4 W4 (2026-06-10):** cell visual-STYLE id, written by
+    /// `Op::SetCellStyle` (the visual-formatting analog of `format`). Keeping
+    /// the id IN `CellState` means the `AxisShift` re-key moves it for free
+    /// (no separate per-cell style map to shift). Per-field LWW: a
+    /// `SetCellStyle` writes `style` and preserves value/formula/format.
+    /// `StyleId` is `{ peer: PeerId, counter: u32 }` — all-Copy, Send + Sync,
+    /// so `Option<StyleId>` adds no new Rule 4 trigger (arc terminus stays 6).
+    pub style: Option<StyleId>,
 }
 
 /// **Phase 5.7 V3.4.0.X HIGH-1 + MEDIUM-1 closure (2026-05-24)**: internal
@@ -195,6 +203,15 @@ enum CacheEffect {
     SetCellFormat {
         key: (u16, u32, u32),
         format: Option<FormatId>,
+    },
+    /// **FE-4 W4 (2026-06-10):** cell-keyed style set/clear from
+    /// `Op::SetCellStyle`. `style: Some(_)` writes `state.style`;
+    /// `style: None` clears it. Mirrors `SetCellFormat`'s ghost-entry
+    /// avoidance — `get_mut` + skip-if-absent on clear; if value, formula,
+    /// format AND style are all None after the apply, the entry is removed.
+    SetCellStyle {
+        key: (u16, u32, u32),
+        style: Option<StyleId>,
     },
     /// **V3.5.0.X audit-closure Opus-H1 extension (2026-05-24)**:
     /// sheet tombstoned via `Op::RemoveSheet`.  Apply: insert the id
@@ -254,6 +271,14 @@ enum CacheEffect {
     RegisterFormat {
         id: FormatId,
         string: Arc<str>,
+    },
+    /// **FE-4 W4 (2026-06-10):** session-wide style-table cache update from
+    /// `Op::RegisterStyle`. Apply: `entry().or_insert(style)` (first-write-wins,
+    /// mirroring `RegisterFormat`'s `IdCollision`-rejection semantic at the
+    /// cache layer). Sheet-independent; no tombstone check.
+    RegisterStyle {
+        id: StyleId,
+        style: Style,
     },
     /// **HIGH-1 (megaudit, Codex) closure**: a structural row/column
     /// insert/delete on `sheet`.  Pre-fix the cache walker dropped the
@@ -328,10 +353,14 @@ struct CacheBuckets<'a> {
     snapshot: &'a mut HashMap<(u16, u32, u32), CellState>,
     tombstones: &'a mut HashSet<u16>,
     format_cache: &'a mut HashMap<FormatId, Arc<str>>,
+    /// **FE-4 W4 (2026-06-10):** session-wide style-table cache
+    /// (`StyleId → Style`), the visual-formatting analog of `format_cache`,
+    /// fed by `CacheEffect::RegisterStyle`.
+    style_cache: &'a mut HashMap<StyleId, Style>,
     cell_op_index: &'a mut HashMap<(u16, u32, u32), Vec<usize>>,
     sheet_op_index: &'a mut HashMap<u16, Vec<usize>>,
 }
-use ql_storage::{FormatId, Workbook};
+use ql_storage::{FormatId, Style, StyleId, Workbook};
 
 use crate::presence::{self, PresenceError, PresenceState};
 use crate::repair::{
@@ -928,6 +957,15 @@ pub struct CollabSession {
     /// (std inherent impl).  0 new triggers; arc terminus stays at 6.
     format_table_cache: HashMap<FormatId, Arc<str>>,
 
+    /// **FE-4 W4 (2026-06-10):** session-wide style-table cache mirror
+    /// (`StyleId → Style`), the visual-formatting analog of
+    /// `format_table_cache`. Tracks `Op::RegisterStyle` registrations
+    /// incrementally in `append_op` (via `CacheEffect::RegisterStyle`) and is
+    /// rebuilt during `rebuild_snapshot_cache`. `Style` is all-`Copy` flat
+    /// fields (Send + Sync); `StyleId` is `{ PeerId, u32 }` (Send + Sync); 0
+    /// new Rule 4 triggers, arc terminus stays at 6.
+    style_table_cache: HashMap<StyleId, Style>,
+
     /// **Phase 5.7 V3.6.0.4 D3 (2026-05-23)** -- per-cell op-log index
     /// for O(ops-for-this-cell) `invalidate_cell` walks.
     ///
@@ -1168,6 +1206,7 @@ impl CollabSession {
             undo_merge_interval_ms: 0,
             // V3.6.0.3 D2: empty cache; no RegisterFormat ops yet.
             format_table_cache: HashMap::new(),
+            style_table_cache: HashMap::new(),
             // V3.6.0.4 D3: empty indices; no ops -> no cells / sheets
             // touched.
             cell_op_index: HashMap::new(),
@@ -1255,6 +1294,7 @@ impl CollabSession {
             // `CacheEffect::RegisterFormat` for each `Op::RegisterFormat`
             // it sees, which apply_cache_effect inserts here.
             format_table_cache: HashMap::new(),
+            style_table_cache: HashMap::new(),
             // V3.6.0.4 D3: populated by `rebuild_snapshot_cache` below
             // alongside `last_snapshot` -- the walker pushes the op-log
             // index per emitted cell-keyed effect (cell_op_index) and
@@ -1390,6 +1430,7 @@ impl CollabSession {
             snapshot: &mut self.last_snapshot,
             tombstones: &mut self.removed_sheets,
             format_cache: &mut self.format_table_cache,
+            style_cache: &mut self.style_table_cache,
             cell_op_index: &mut self.cell_op_index,
             sheet_op_index: &mut self.sheet_op_index,
         };
@@ -1453,6 +1494,21 @@ impl CollabSession {
             } => out.push(CacheEffect::SetCellFormat {
                 key: (*sheet, *row, *col),
                 format: id.map(|wire| wire.to_storage()),
+            }),
+            // **FE-4 W4 (2026-06-10):** cell-keyed `SetCellStyle` joins the
+            // cache walker (mirrors SetCellFormat). `id: Some(_)` → set
+            // state.style; `id: None` → clear state.style. WALKER-COMPLETENESS:
+            // this op mutates cell style state, so it MUST have an explicit arm
+            // here or it silently desyncs `last_snapshot` (see the `_ => {}`
+            // guardrail below).
+            Op::SetCellStyle {
+                sheet,
+                row,
+                col,
+                id,
+            } => out.push(CacheEffect::SetCellStyle {
+                key: (*sheet, *row, *col),
+                style: id.map(|wire| wire.to_storage()),
             }),
             // **Codex re-audit round-3 closure (megaudit fold) — batch
             // atomicity.** MED-1 made REPLAY apply a BatchCommit all-or-
@@ -1547,6 +1603,15 @@ impl CollabSession {
                 out.push(CacheEffect::RegisterFormat {
                     id: fid,
                     string: Arc::<str>::from(string.as_str()),
+                });
+            }
+            // **FE-4 W4 (2026-06-10):** session-wide style registration joins
+            // the cache walker (mirrors RegisterFormat). No Builtin filter —
+            // styles have no built-in variant.
+            Op::RegisterStyle { id, style } => {
+                out.push(CacheEffect::RegisterStyle {
+                    id: id.to_storage(),
+                    style: style.to_storage(),
                 });
             }
             // **HIGH-1 (megaudit, Codex) closure**: structural row/column
@@ -1672,9 +1737,13 @@ impl CollabSession {
             CacheEffect::PutFormula { key, .. } => Some(key.0),
             CacheEffect::ClearFormula { key } => Some(key.0),
             CacheEffect::SetCellFormat { key, .. } => Some(key.0),
+            // FE-4 W4: SetCellStyle is cell-keyed (tombstone-gated like format).
+            CacheEffect::SetCellStyle { key, .. } => Some(key.0),
             CacheEffect::RemoveSheet { .. } => None,
             CacheEffect::RestoreSheet { .. } => None,
             CacheEffect::RegisterFormat { .. } => None,
+            // FE-4 W4: RegisterStyle is session-wide (not sheet-targeted).
+            CacheEffect::RegisterStyle { .. } => None,
             // **HIGH-1**: an AxisShift IS sheet-targeted.  Gating it through
             // the tombstone check makes a structural edit on a tombstoned
             // sheet a cache no-op, mirroring the storage replay's silent
@@ -1704,9 +1773,13 @@ impl CollabSession {
             CacheEffect::PutFormula { key, .. } => Some(*key),
             CacheEffect::ClearFormula { key } => Some(*key),
             CacheEffect::SetCellFormat { key, .. } => Some(*key),
+            // FE-4 W4: SetCellStyle is cell-keyed → index it for invalidate_cell.
+            CacheEffect::SetCellStyle { key, .. } => Some(*key),
             CacheEffect::RemoveSheet { .. } => None,
             CacheEffect::RestoreSheet { .. } => None,
             CacheEffect::RegisterFormat { .. } => None,
+            // FE-4 W4: RegisterStyle is session-wide; no per-cell index push.
+            CacheEffect::RegisterStyle { .. } => None,
             // **HIGH-1**: AxisShift is sheet-level, not a single cell → no
             // per-cell index push.  (It also does NOT re-key cell_op_index;
             // see the AxisShift apply arm + the undo/redo structural gate.)
@@ -1753,7 +1826,11 @@ impl CollabSession {
             CacheEffect::ClearValue { key } => {
                 if let Some(state) = buckets.snapshot.get_mut(&key) {
                     state.value = None;
-                    if state.value.is_none() && state.formula.is_none() && state.format.is_none() {
+                    if state.value.is_none()
+                        && state.formula.is_none()
+                        && state.format.is_none()
+                        && state.style.is_none()
+                    {
                         buckets.snapshot.remove(&key);
                     }
                 }
@@ -1775,7 +1852,11 @@ impl CollabSession {
                 // `list_sheets_from_cache` either.
                 if let Some(state) = buckets.snapshot.get_mut(&key) {
                     state.formula = None;
-                    if state.value.is_none() && state.formula.is_none() && state.format.is_none() {
+                    if state.value.is_none()
+                        && state.formula.is_none()
+                        && state.format.is_none()
+                        && state.style.is_none()
+                    {
                         buckets.snapshot.remove(&key);
                     }
                 }
@@ -1801,6 +1882,31 @@ impl CollabSession {
                         if state.value.is_none()
                             && state.formula.is_none()
                             && state.format.is_none()
+                            && state.style.is_none()
+                        {
+                            buckets.snapshot.remove(&key);
+                        }
+                    }
+                }
+            },
+            // **FE-4 W4 (2026-06-10):** cell-keyed style set/clear. Mirrors
+            // SetCellFormat's ghost-entry-avoidance discipline exactly:
+            // - `style: Some(_)` → entry().or_default().style = Some(id).
+            // - `style: None` → get_mut + skip-if-absent; if value, formula,
+            //   format AND style are all None after, remove the entry.
+            // CRDT per-cell LWW: concurrent SetCellStyle converges via Loro's
+            // causal-merge order (same invariant as SetCellFormat).
+            CacheEffect::SetCellStyle { key, style } => match style {
+                Some(id) => {
+                    buckets.snapshot.entry(key).or_default().style = Some(id);
+                }
+                None => {
+                    if let Some(state) = buckets.snapshot.get_mut(&key) {
+                        state.style = None;
+                        if state.value.is_none()
+                            && state.formula.is_none()
+                            && state.format.is_none()
+                            && state.style.is_none()
                         {
                             buckets.snapshot.remove(&key);
                         }
@@ -1899,6 +2005,13 @@ impl CollabSession {
             // independent).
             CacheEffect::RegisterFormat { id, string } => {
                 buckets.format_cache.entry(id).or_insert(string);
+            }
+            // **FE-4 W4 (2026-06-10):** session-wide style-table cache mirror.
+            // First-write-wins (`entry().or_insert`), mirroring RegisterFormat's
+            // `IdCollision`-rejection semantic at the cache layer. No tombstone
+            // check (RegisterStyle is sheet-independent).
+            CacheEffect::RegisterStyle { id, style } => {
+                buckets.style_cache.entry(id).or_insert(style);
             }
             // **HIGH-1 (megaudit, Codex) closure**: re-key every snapshot
             // entry on `sheet` by the structural shift.  We reach here only if
@@ -2327,6 +2440,8 @@ impl CollabSession {
         // atomically in the canonical pattern; defensive reset for
         // tests using force_clear in isolation.
         self.format_table_cache.clear();
+        // FE-4 W4: also clear the style-table cache (same test-seam rationale).
+        self.style_table_cache.clear();
         // V3.6.0.4 D3: also clear the cell + sheet op-log indices.
         // Without this, a test that calls force_clear and then
         // appends new ops would see stale indices from the pre-
@@ -2501,6 +2616,8 @@ impl CollabSession {
         // cell cache.  Atomic-swap with `self.format_table_cache` after
         // rebuild succeeds.  Same pattern as `fresh_tombstones`.
         let mut fresh_format_cache: HashMap<FormatId, Arc<str>> = HashMap::new();
+        // FE-4 W4: rebuild the style-table cache alongside the format cache.
+        let mut fresh_style_cache: HashMap<StyleId, Style> = HashMap::new();
         // V3.6.0.4 D3: rebuild the cell + sheet op-log indices
         // alongside the cell cache.  Atomic-swap with the session
         // fields after rebuild succeeds.
@@ -2518,6 +2635,7 @@ impl CollabSession {
                 snapshot: &mut fresh,
                 tombstones: &mut fresh_tombstones,
                 format_cache: &mut fresh_format_cache,
+                style_cache: &mut fresh_style_cache,
                 cell_op_index: &mut fresh_cell_op_index,
                 sheet_op_index: &mut fresh_sheet_op_index,
             };
@@ -2528,6 +2646,7 @@ impl CollabSession {
         self.last_snapshot = fresh;
         self.removed_sheets = fresh_tombstones;
         self.format_table_cache = fresh_format_cache;
+        self.style_table_cache = fresh_style_cache;
         self.cell_op_index = fresh_cell_op_index;
         self.sheet_op_index = fresh_sheet_op_index;
         Ok(())
@@ -2600,6 +2719,7 @@ impl CollabSession {
         //   pattern; iter-Err mid-walk leaves session state intact).
         let mut local_snapshot: HashMap<(u16, u32, u32), CellState> = HashMap::new();
         let mut local_format_cache: HashMap<FormatId, Arc<str>> = HashMap::new();
+        let mut local_style_cache: HashMap<StyleId, Style> = HashMap::new();
         let mut local_tombstones: HashSet<u16> = HashSet::new();
         let mut fresh_cell_op_index: HashMap<(u16, u32, u32), Vec<usize>> = HashMap::new();
         let mut fresh_sheet_op_index: HashMap<u16, Vec<usize>> = HashMap::new();
@@ -2612,6 +2732,7 @@ impl CollabSession {
                 snapshot: &mut local_snapshot,
                 tombstones: &mut local_tombstones,
                 format_cache: &mut local_format_cache,
+                style_cache: &mut local_style_cache,
                 cell_op_index: &mut fresh_cell_op_index,
                 sheet_op_index: &mut fresh_sheet_op_index,
             };
@@ -2727,6 +2848,7 @@ impl CollabSession {
         // CacheBuckets struct's fields the per-cell walk doesn't own;
         // they accumulate harmlessly and drop when this method returns.
         let mut local_format_cache: HashMap<FormatId, Arc<str>> = HashMap::new();
+        let mut local_style_cache: HashMap<StyleId, Style> = HashMap::new();
         let mut local_cell_op_index: HashMap<(u16, u32, u32), Vec<usize>> = HashMap::new();
         let mut local_sheet_op_index: HashMap<u16, Vec<usize>> = HashMap::new();
 
@@ -2753,6 +2875,7 @@ impl CollabSession {
                 snapshot: &mut local_snapshot,
                 tombstones: &mut local_tombstones,
                 format_cache: &mut local_format_cache,
+                style_cache: &mut local_style_cache,
                 cell_op_index: &mut local_cell_op_index,
                 sheet_op_index: &mut local_sheet_op_index,
             };
@@ -2771,6 +2894,8 @@ impl CollabSession {
                     CacheEffect::PutFormula { key, .. } => *key == target_key,
                     CacheEffect::ClearFormula { key } => *key == target_key,
                     CacheEffect::SetCellFormat { key, .. } => *key == target_key,
+                    // FE-4 W4: SetCellStyle applies iff it targets this cell.
+                    CacheEffect::SetCellStyle { key, .. } => *key == target_key,
                     CacheEffect::RemoveSheet { .. } => true,
                     // V3.6.0.10 D8: RestoreSheet is sheet-keyed (not
                     // cell-keyed) but always-apply locally so the
@@ -2778,6 +2903,9 @@ impl CollabSession {
                     // tombstone effect; mirrors RemoveSheet.
                     CacheEffect::RestoreSheet { .. } => true,
                     CacheEffect::RegisterFormat { .. } => false,
+                    // FE-4 W4: RegisterStyle is session-wide; not invalidated
+                    // per-cell (mirrors RegisterFormat).
+                    CacheEffect::RegisterStyle { .. } => false,
                     // **HIGH-1**: `invalidate_cell` is the partial undo/redo
                     // path, which is NEVER taken while the visible log holds
                     // a structural op (the undo/redo gate forces a full
@@ -2879,6 +3007,14 @@ impl CollabSession {
                 out.push((*sheet, *row, *col));
                 true
             }
+            // FE-4 W4: SetCellStyle is cell-keyed → partially-invalidatable
+            // like SetCellFormat (no full rebuild forced).
+            Op::SetCellStyle {
+                sheet, row, col, ..
+            } => {
+                out.push((*sheet, *row, *col));
+                true
+            }
             Op::BatchCommit { ops } => {
                 for inner in ops {
                     if !Self::collect_affected_cells_recursive(inner, out) {
@@ -2937,7 +3073,8 @@ impl CollabSession {
             | Op::PutFormula { row, col, .. }
             | Op::ClearFormula { row, col, .. }
             | Op::ClearValue { row, col, .. }
-            | Op::SetCellFormat { row, col, .. } => {
+            | Op::SetCellFormat { row, col, .. }
+            | Op::SetCellStyle { row, col, .. } => {
                 *row > ql_types::MAX_ROW || *col > ql_types::MAX_COLUMN
             }
             Op::BatchCommit { ops } => ops.iter().any(Self::op_statically_aborts_batch),
@@ -4811,6 +4948,42 @@ mod tests {
     /// "clear overlay" semantic.
     fn clear_cell_format(sheet: u16, row: u32, col: u32) -> Op {
         Op::SetCellFormat {
+            sheet,
+            row,
+            col,
+            id: None,
+        }
+    }
+
+    /// **FE-4 W4 test helpers (2026-06-10).**
+    fn style_id_wire(counter: u32) -> ql_oplog::wire::StyleIdWire {
+        ql_oplog::wire::StyleIdWire {
+            peer: PeerId::new(1),
+            counter,
+        }
+    }
+
+    fn register_bold_style(counter: u32) -> Op {
+        Op::RegisterStyle {
+            id: style_id_wire(counter),
+            style: ql_oplog::wire::StyleWire::from_storage(Style {
+                bold: true,
+                ..Style::default()
+            }),
+        }
+    }
+
+    fn set_cell_style(sheet: u16, row: u32, col: u32, counter: u32) -> Op {
+        Op::SetCellStyle {
+            sheet,
+            row,
+            col,
+            id: Some(style_id_wire(counter)),
+        }
+    }
+
+    fn clear_cell_style(sheet: u16, row: u32, col: u32) -> Op {
+        Op::SetCellStyle {
             sheet,
             row,
             col,
@@ -7173,6 +7346,101 @@ mod tests {
             state.format,
             Some(FormatId::Builtin(2)),
             "BatchCommit nested SetCellFormat surfaces (recursion works for new variant)"
+        );
+    }
+
+    // ===== FE-4 W4 — style cache walker live-append tests (wave-3 class) =====
+
+    fn bold_style_id() -> StyleId {
+        StyleId::new(PeerId::new(1), 0)
+    }
+
+    #[test]
+    fn set_cell_style_live_append_surfaces_in_cache() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 1, 1, 5.0)).unwrap();
+        s.append_op(register_bold_style(0)).unwrap();
+        s.append_op(set_cell_style(0, 1, 1, 0)).unwrap();
+        let state = s.snapshot_cell(0, 1, 1).unwrap();
+        assert_eq!(state.value, Some(CellWireValue::Number(5.0)));
+        assert_eq!(
+            state.style,
+            Some(bold_style_id()),
+            "style surfaces in the live cache"
+        );
+    }
+
+    #[test]
+    fn clear_cell_style_removes_ghost_entry() {
+        // A style-only cell, then clear it → entry removed (ghost-entry
+        // avoidance over all four fields incl. style).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(register_bold_style(0)).unwrap();
+        s.append_op(set_cell_style(0, 2, 2, 0)).unwrap();
+        assert!(s.snapshot_cell(0, 2, 2).is_some());
+        s.append_op(clear_cell_style(0, 2, 2)).unwrap();
+        assert!(
+            s.snapshot_cell(0, 2, 2).is_none(),
+            "style-only cell with cleared style must remove the ghost entry"
+        );
+    }
+
+    #[test]
+    fn insert_rows_shifts_style_in_snapshot_cache_live_append() {
+        // The wave-3 AxisShift class: a styled cell re-keys with the row shift
+        // (style lives in CellState so it moves for free).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(register_bold_style(0)).unwrap();
+        s.append_op(set_cell_style(0, 3, 0, 0)).unwrap();
+        s.append_op(Op::InsertRows {
+            sheet: 0,
+            at: 0,
+            count: 1,
+        })
+        .unwrap();
+        // Cell moved from row 3 to row 4; the style moved with it.
+        assert!(s.snapshot_cell(0, 3, 0).is_none(), "old key cleared");
+        let moved = s.snapshot_cell(0, 4, 0).unwrap();
+        assert_eq!(
+            moved.style,
+            Some(bold_style_id()),
+            "style re-keyed via AxisShift"
+        );
+    }
+
+    #[test]
+    fn batch_commit_with_set_cell_style_recurses_into_cache() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(register_bold_style(0)).unwrap();
+        s.append_op(Op::BatchCommit {
+            ops: vec![put_value(0, 0, 0, 5.0), set_cell_style(0, 0, 0, 0)],
+        })
+        .unwrap();
+        let state = s.snapshot_cell(0, 0, 0).unwrap();
+        assert_eq!(state.value, Some(CellWireValue::Number(5.0)));
+        assert_eq!(
+            state.style,
+            Some(bold_style_id()),
+            "BatchCommit nested SetCellStyle surfaces (walker recursion)"
+        );
+    }
+
+    #[test]
+    fn rebuild_snapshot_cache_round_trip_preserves_style() {
+        // export_bytes + from_snapshot rebuilds the cache from the log; the
+        // style must survive (the rebuild path uses the same walker).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(2, 1, 1, 11.0)).unwrap();
+        s.append_op(register_bold_style(0)).unwrap();
+        s.append_op(set_cell_style(2, 1, 1, 0)).unwrap();
+        let bytes = s.export_bytes().unwrap();
+        let s2 = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+        let state = s2.snapshot_cell(2, 1, 1).unwrap();
+        assert_eq!(state.value, Some(CellWireValue::Number(11.0)));
+        assert_eq!(
+            state.style,
+            Some(bold_style_id()),
+            "style round-trips through rebuild_snapshot_cache"
         );
     }
 

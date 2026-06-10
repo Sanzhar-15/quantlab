@@ -29,6 +29,8 @@ pub mod format_overlay;
 pub mod overlay;
 pub mod sheet;
 pub mod spill;
+pub mod style;
+pub mod style_overlay;
 pub mod tables;
 pub mod workbook;
 
@@ -38,6 +40,10 @@ pub use format_overlay::CellFormatOverlay;
 pub use overlay::SparseOverlay;
 pub use sheet::{Bounds, Sheet};
 pub use spill::{SpillAnchorTable, SpillBlockError, SpillNotFoundError, SpillShape};
+pub use style::{
+    BorderEdge, BorderStyle, Borders, HAlign, Rgb, Style, StyleId, StyleTable, StyleTableError,
+};
+pub use style_overlay::CellStyleOverlay;
 pub use tables::{TableColumn, TableMetadata, TableTable, TotalsFunction};
 pub use workbook::{
     NameTable, NameTableError, NamedTarget, SheetNameError, StructuralEditError, Workbook,

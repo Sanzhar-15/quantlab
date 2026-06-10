@@ -100,11 +100,13 @@ use ql_formula_syntax::{lex, lex_with, parse, print_with, FormulaSite};
 use ql_io::CellWireValue;
 use ql_oplog::Op;
 use ql_session::dto::{
-    BatchOptions, BatchResult, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue,
-    ChangedCell, DateSystem, Diagnostic, DirtyResult, FormatDef, FormatId, FullRebuildReason,
-    PublishedRef, RangeColumn, RangeQueryOptions, RangeResult, RemovedCell, SessionVersion,
-    Severity, SheetInfo, SheetSnapshot, TableSpec, UndoRedoResult, WorkbookSnapshot,
-    WorkbookSnapshotDelta, WriteRangeResult,
+    BatchOptions, BatchResult, BorderEdge as BorderEdgeDto, BorderStyle as BorderStyleDto,
+    Borders as BordersDto, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue, ChangedCell,
+    DateSystem, Diagnostic, DirtyResult, FormatDef, FormatId, FullRebuildReason,
+    HAlign as HAlignDto, PublishedRef, RangeColumn, RangeQueryOptions, RangeResult, RemovedCell,
+    Rgb as RgbDto, SessionVersion, Severity, SheetInfo, SheetSnapshot, Style as StyleDto, StyleDef,
+    StyleId as StyleIdDto, TableSpec, UndoRedoResult, WorkbookSnapshot, WorkbookSnapshotDelta,
+    WriteRangeResult,
 };
 use ql_session::error::{EngineError, EngineResult, ErrorClass};
 use ql_session::function_meta::FunctionMetadata;
@@ -156,6 +158,9 @@ enum SessionChange {
     SheetRemoved { id: SheetId },
     /// A format registered (resolved to a `FormatDef` at delta time).
     FormatAdded { id: ql_storage::FormatId },
+    /// **FE-4 W4 (2026-06-10):** a style registered (resolved to a `StyleDef`
+    /// at delta time — the visual-formatting analog of `FormatAdded`).
+    StyleAdded { id: ql_storage::StyleId },
 }
 
 struct ChangeRecord {
@@ -1105,6 +1110,7 @@ impl WorkbookSession {
             sheets_changed: Vec::new(),
             sheets_removed: Vec::new(),
             formats_added: Vec::new(),
+            styles_added: Vec::new(),
             version: self.current_version(),
             full_rebuild_required: true,
             full_rebuild_reason: Some(reason),
@@ -1287,6 +1293,13 @@ impl WorkbookSession {
             for ((row, c), _fmt) in sheet.format_overlay().iter() {
                 set.insert((row, c));
             }
+            // **FE-4 W4:** style-only cells (a cell carrying only a visual style,
+            // no value/formula/format, must still surface in the snapshot —
+            // else `build_cell_snapshot` never runs for it and the style is
+            // invisible to the IDE).
+            for ((row, c), _sid) in sheet.style_overlay().iter() {
+                set.insert((row, c));
+            }
         }
         // Formula cells (a formula cell can be Blank-valued but still present).
         for (s, row, col, _text) in self.workbook.iter_formulas() {
@@ -1373,7 +1386,13 @@ impl WorkbookSession {
         // only for the snapshot payload.
         let storage_format = sheet.format_overlay().get(row, col);
         let format = storage_format.map(storage_format_id_to_dto);
-        if value.is_none() && formula.is_none() && format.is_none() {
+        // **FE-4 W4:** the cell-style id, if any. Carried inline as a DTO
+        // StyleId; the `styles` snapshot table resolves it to a `Style`.
+        let style = sheet
+            .style_overlay()
+            .get(row, col)
+            .map(storage_style_id_to_dto);
+        if value.is_none() && formula.is_none() && format.is_none() && style.is_none() {
             return None;
         }
         // The D4 gate, in owning-session vocabulary: render iff the cell has
@@ -1418,6 +1437,7 @@ impl WorkbookSession {
             value,
             formula,
             format,
+            style,
             rendered,
         })
     }
@@ -1907,6 +1927,30 @@ impl EngineSession for WorkbookSession {
             .map_err(map_runtime_err)?;
         self.record_changes([SessionChange::FormatAdded { id }]);
         Ok(storage_format_id_to_dto(id))
+    }
+
+    fn set_style(&mut self, addr: CellAddr, style: StyleIdDto) -> EngineResult<()> {
+        self.ensure_ready()?;
+        self.require_live_sheet(addr.sheet, "set_style")?;
+        let id = dto_style_id_to_storage(style);
+        self.with_runtime(|rt| rt.set_cell_style(addr.sheet, addr.row, addr.col, Some(id)))
+            .map_err(map_runtime_err)?;
+        self.record_changes([SessionChange::Cell {
+            sheet: addr.sheet,
+            row: addr.row,
+            col: addr.col,
+        }]);
+        Ok(())
+    }
+
+    fn register_style(&mut self, style: StyleDto) -> EngineResult<StyleIdDto> {
+        self.ensure_ready()?;
+        let storage_style = dto_style_to_storage(style);
+        let id = self
+            .with_runtime(|rt| rt.intern_style(storage_style))
+            .map_err(map_runtime_err)?;
+        self.record_changes([SessionChange::StyleAdded { id }]);
+        Ok(storage_style_id_to_dto(id))
     }
 
     fn validate_formula(&self, addr: CellAddr, text: &str) -> EngineResult<Vec<Diagnostic>> {
@@ -2465,6 +2509,31 @@ impl EngineSession for WorkbookSession {
                         col: addr.col,
                     });
                 }
+                SessionOp::SetStyle { addr, style } => {
+                    self.require_live_sheet(addr.sheet, "batch.set_style")?;
+                    Self::require_in_bounds(addr.row, addr.col, "batch.set_style")?;
+                    let id = dto_style_id_to_storage(*style);
+                    // Mirror `set_cell_style`'s producer-side gate: refuse an
+                    // unregistered id up front (BadArgument), pre-mutation.
+                    if self.workbook.styles().lookup(id).is_none() {
+                        return Err(EngineError::new(
+                            ErrorClass::BadArgument,
+                            "unknown_style_id",
+                            format!("batch.set_style: style id {id:?} is not registered"),
+                        ));
+                    }
+                    inner_ops.push(Op::SetCellStyle {
+                        sheet: addr.sheet,
+                        row: addr.row,
+                        col: addr.col,
+                        id: Some(ql_oplog::StyleIdWire::from_storage(id)),
+                    });
+                    changes.push(SessionChange::Cell {
+                        sheet: addr.sheet,
+                        row: addr.row,
+                        col: addr.col,
+                    });
+                }
             }
         }
 
@@ -2524,6 +2593,10 @@ impl EngineSession for WorkbookSession {
                     SessionOp::SetFormat { addr, format } => {
                         let id = dto_format_id_to_storage(*format);
                         rt.set_cell_format(addr.sheet, addr.row, addr.col, Some(id))?;
+                    }
+                    SessionOp::SetStyle { addr, style } => {
+                        let id = dto_style_id_to_storage(*style);
+                        rt.set_cell_style(addr.sheet, addr.row, addr.col, Some(id))?;
                     }
                 }
             }
@@ -2856,11 +2929,24 @@ impl EngineSession for WorkbookSession {
             })
             .collect();
         formats.sort_by_key(|fd| fd.id);
+        // **FE-4 W4:** the session-wide style table, sorted by StyleId for a
+        // stable wire order (mirrors `formats` above).
+        let mut styles: Vec<StyleDef> = self
+            .workbook
+            .styles()
+            .iter()
+            .map(|(id, style)| StyleDef {
+                id: storage_style_id_to_dto(id),
+                style: storage_style_to_dto(style),
+            })
+            .collect();
+        styles.sort_by_key(|sd| sd.id);
         let date_system = date_system_to_dto(self.workbook.date_system());
         Ok(WorkbookSnapshot {
             schema_version: SCHEMA_VERSION,
             sheets,
             formats,
+            styles,
             date_system,
             version: self.current_version(),
         })
@@ -2910,6 +2996,7 @@ impl EngineSession for WorkbookSession {
         let mut changed_sheets: HashSet<SheetId> = HashSet::new();
         let mut removed_sheets: HashSet<SheetId> = HashSet::new();
         let mut added_formats: HashSet<ql_storage::FormatId> = HashSet::new();
+        let mut added_styles: HashSet<ql_storage::StyleId> = HashSet::new();
         for rec in self.change_log.iter().filter(|r| r.seq > last_seq) {
             match rec.change {
                 SessionChange::Cell { sheet, row, col } => {
@@ -2923,6 +3010,9 @@ impl EngineSession for WorkbookSession {
                 }
                 SessionChange::FormatAdded { id } => {
                     added_formats.insert(id);
+                }
+                SessionChange::StyleAdded { id } => {
+                    added_styles.insert(id);
                 }
             }
         }
@@ -2982,6 +3072,18 @@ impl EngineSession for WorkbookSession {
             })
             .collect();
 
+        // **FE-4 W4:** resolve added styles to their current `StyleDef`
+        // (mirrors `formats_added`).
+        let mut styles_added: Vec<StyleDef> = added_styles
+            .into_iter()
+            .filter_map(|id| {
+                self.workbook.styles().lookup(id).map(|style| StyleDef {
+                    id: storage_style_id_to_dto(id),
+                    style: storage_style_to_dto(style),
+                })
+            })
+            .collect();
+
         // **6.1C audit-fix H2 — deterministic ordering across all five delta
         // collections.** The HashSet walks above (`changed_coords`,
         // `changed_sheets`, `removed_sheets`, `added_formats`) produce arbitrary
@@ -2996,6 +3098,7 @@ impl EngineSession for WorkbookSession {
         sheets_changed.sort_by_key(|s| s.id);
         sheets_removed.sort_unstable();
         formats_added.sort_by_key(|fd| fd.id);
+        styles_added.sort_by_key(|sd| sd.id);
 
         Ok(WorkbookSnapshotDelta {
             schema_version: SCHEMA_VERSION,
@@ -3004,6 +3107,7 @@ impl EngineSession for WorkbookSession {
             sheets_changed,
             sheets_removed,
             formats_added,
+            styles_added,
             version: self.current_version(),
             full_rebuild_required: false,
             full_rebuild_reason: None,
@@ -4061,6 +4165,121 @@ fn dto_format_id_to_storage(id: FormatId) -> ql_storage::FormatId {
     }
 }
 
+// ===== FE-4 W4 (2026-06-10): Style DTO ↔ storage conversions =====
+
+fn storage_style_id_to_dto(id: ql_storage::StyleId) -> StyleIdDto {
+    StyleIdDto {
+        peer: id.peer.as_u64(),
+        counter: id.counter,
+    }
+}
+
+fn dto_style_id_to_storage(id: StyleIdDto) -> ql_storage::StyleId {
+    ql_storage::StyleId::new(ql_types::PeerId::new(id.peer), id.counter)
+}
+
+fn storage_rgb_to_dto(c: ql_storage::Rgb) -> RgbDto {
+    RgbDto {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+    }
+}
+
+fn dto_rgb_to_storage(c: RgbDto) -> ql_storage::Rgb {
+    ql_storage::Rgb {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+    }
+}
+
+fn storage_halign_to_dto(a: ql_storage::HAlign) -> HAlignDto {
+    match a {
+        ql_storage::HAlign::General => HAlignDto::General,
+        ql_storage::HAlign::Left => HAlignDto::Left,
+        ql_storage::HAlign::Center => HAlignDto::Center,
+        ql_storage::HAlign::Right => HAlignDto::Right,
+    }
+}
+
+fn dto_halign_to_storage(a: HAlignDto) -> ql_storage::HAlign {
+    match a {
+        HAlignDto::General => ql_storage::HAlign::General,
+        HAlignDto::Left => ql_storage::HAlign::Left,
+        HAlignDto::Center => ql_storage::HAlign::Center,
+        HAlignDto::Right => ql_storage::HAlign::Right,
+    }
+}
+
+fn storage_border_style_to_dto(s: ql_storage::BorderStyle) -> BorderStyleDto {
+    match s {
+        ql_storage::BorderStyle::None => BorderStyleDto::None,
+        ql_storage::BorderStyle::Thin => BorderStyleDto::Thin,
+        ql_storage::BorderStyle::Medium => BorderStyleDto::Medium,
+        ql_storage::BorderStyle::Thick => BorderStyleDto::Thick,
+        ql_storage::BorderStyle::Dashed => BorderStyleDto::Dashed,
+        ql_storage::BorderStyle::Dotted => BorderStyleDto::Dotted,
+        ql_storage::BorderStyle::Double => BorderStyleDto::Double,
+    }
+}
+
+fn dto_border_style_to_storage(s: BorderStyleDto) -> ql_storage::BorderStyle {
+    match s {
+        BorderStyleDto::None => ql_storage::BorderStyle::None,
+        BorderStyleDto::Thin => ql_storage::BorderStyle::Thin,
+        BorderStyleDto::Medium => ql_storage::BorderStyle::Medium,
+        BorderStyleDto::Thick => ql_storage::BorderStyle::Thick,
+        BorderStyleDto::Dashed => ql_storage::BorderStyle::Dashed,
+        BorderStyleDto::Dotted => ql_storage::BorderStyle::Dotted,
+        BorderStyleDto::Double => ql_storage::BorderStyle::Double,
+    }
+}
+
+fn storage_border_edge_to_dto(e: ql_storage::BorderEdge) -> BorderEdgeDto {
+    BorderEdgeDto {
+        style: storage_border_style_to_dto(e.style),
+        color: storage_rgb_to_dto(e.color),
+    }
+}
+
+fn dto_border_edge_to_storage(e: BorderEdgeDto) -> ql_storage::BorderEdge {
+    ql_storage::BorderEdge {
+        style: dto_border_style_to_storage(e.style),
+        color: dto_rgb_to_storage(e.color),
+    }
+}
+
+fn storage_style_to_dto(s: ql_storage::Style) -> StyleDto {
+    StyleDto {
+        bold: s.bold,
+        italic: s.italic,
+        fill: s.fill.map(storage_rgb_to_dto),
+        align: storage_halign_to_dto(s.align),
+        borders: BordersDto {
+            top: storage_border_edge_to_dto(s.borders.top),
+            bottom: storage_border_edge_to_dto(s.borders.bottom),
+            left: storage_border_edge_to_dto(s.borders.left),
+            right: storage_border_edge_to_dto(s.borders.right),
+        },
+    }
+}
+
+fn dto_style_to_storage(s: StyleDto) -> ql_storage::Style {
+    ql_storage::Style {
+        bold: s.bold,
+        italic: s.italic,
+        fill: s.fill.map(dto_rgb_to_storage),
+        align: dto_halign_to_storage(s.align),
+        borders: ql_storage::Borders {
+            top: dto_border_edge_to_storage(s.borders.top),
+            bottom: dto_border_edge_to_storage(s.borders.bottom),
+            left: dto_border_edge_to_storage(s.borders.left),
+            right: dto_border_edge_to_storage(s.borders.right),
+        },
+    }
+}
+
 fn date_system_to_dto(ds: ql_types::DateSystem) -> DateSystem {
     match ds {
         ql_types::DateSystem::Excel1900 => DateSystem::Excel1900,
@@ -4109,6 +4328,13 @@ fn map_runtime_err(e: RuntimeError) -> EngineError {
         }
         R::FormatCounterExhausted { .. } => {
             EngineError::new(ErrorClass::Internal, "format_counter_exhausted", display)
+        }
+        // FE-4 W4: style-overlay errors mirror the format-overlay ones.
+        R::UnknownStyleId(_) => {
+            EngineError::new(ErrorClass::BadArgument, "unknown_style_id", display)
+        }
+        R::StyleCounterExhausted { .. } => {
+            EngineError::new(ErrorClass::Internal, "style_counter_exhausted", display)
         }
         R::RecomputeIterationCap => {
             EngineError::new(ErrorClass::Internal, "recompute_iteration_cap", display)
@@ -8712,7 +8938,10 @@ mod tests {
         let b1 = s.cell(addr(s2, 0, 1)).unwrap().unwrap();
         assert_eq!(b1.value, Some(CellValue::Number { number: 300.0 }));
         let pre = b1.formula.as_deref().unwrap().to_string();
-        assert!(pre.contains("A3"), "precondition: ref is to A3, got {pre:?}");
+        assert!(
+            pre.contains("A3"),
+            "precondition: ref is to A3, got {pre:?}"
+        );
 
         // Insert a blank row at index 1 on SHEET1. Sheet1!A3(30) → Sheet1!A4.
         s.insert_rows(s1, 1, 1).unwrap();
@@ -11194,6 +11423,285 @@ mod tests {
         assert_eq!(
             ids_a, ids_b,
             "two consecutive snapshots must produce identical formats order"
+        );
+    }
+
+    // =========================================================================
+    // FE-4 W4 — cell-style foundation acceptance tests on the REAL owning
+    // WorkbookSession (NOT a mock; NOT the dormant CollabSession). These are
+    // the 11 mandatory acceptance tests from the LAUNCH-LOCKED fe4-plan.
+    // =========================================================================
+
+    fn bold_style() -> StyleDto {
+        StyleDto {
+            bold: true,
+            ..StyleDto::default()
+        }
+    }
+
+    fn fully_bordered_style() -> StyleDto {
+        use ql_session::dto::{BorderEdge, BorderStyle, Borders, Rgb};
+        let edge = BorderEdge {
+            style: BorderStyle::Double,
+            color: Rgb {
+                r: 0x11,
+                g: 0x22,
+                b: 0x33,
+            },
+        };
+        StyleDto {
+            bold: true,
+            italic: true,
+            fill: Some(Rgb {
+                r: 0xab,
+                g: 0xcd,
+                b: 0xef,
+            }),
+            align: ql_session::dto::HAlign::Center,
+            borders: Borders {
+                top: edge,
+                bottom: BorderEdge {
+                    style: BorderStyle::Thin,
+                    color: Rgb { r: 1, g: 2, b: 3 },
+                },
+                left: BorderEdge {
+                    style: BorderStyle::Medium,
+                    color: Rgb { r: 4, g: 5, b: 6 },
+                },
+                right: edge,
+            },
+        }
+    }
+
+    /// (1) setStyle → snapshot → styleId set.
+    #[test]
+    fn fe4_setstyle_snapshot_has_style_id() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let sid = s.register_style(bold_style()).unwrap();
+        s.set_style(addr(sheet, 2, 1), sid).unwrap();
+        let cell = s.cell(addr(sheet, 2, 1)).unwrap().unwrap();
+        assert_eq!(cell.style, Some(sid));
+        // The snapshot's styles table resolves the id.
+        let snap = s.snapshot().unwrap();
+        let def = snap.styles.iter().find(|sd| sd.id == sid).unwrap();
+        assert_eq!(def.style, bold_style());
+    }
+
+    /// (2) setStyle → insert row → assert style MOVED + original cleared
+    /// (the wave-3 overlay-orphan bug analog).
+    #[test]
+    fn fe4_setstyle_insert_row_moves_style_clears_original() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let sid = s.register_style(bold_style()).unwrap();
+        s.set_style(addr(sheet, 3, 0), sid).unwrap();
+        // Insert one row at row 0 → the styled cell at row 3 moves to row 4.
+        s.insert_rows(sheet, 0, 1).unwrap();
+        let moved = s.cell(addr(sheet, 4, 0)).unwrap();
+        assert_eq!(
+            moved.and_then(|c| c.style),
+            Some(sid),
+            "style moved to row 4"
+        );
+        let original = s.cell(addr(sheet, 3, 0)).unwrap();
+        assert!(
+            original.is_none() || original.unwrap().style.is_none(),
+            "original row-3 style must be cleared (no orphan)"
+        );
+    }
+
+    /// (3) delete row → entry dropped.
+    #[test]
+    fn fe4_setstyle_delete_row_drops_entry() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let sid = s.register_style(bold_style()).unwrap();
+        s.set_style(addr(sheet, 2, 0), sid).unwrap();
+        s.delete_rows(sheet, 2, 2).unwrap();
+        // Row 2's styled cell was deleted → no overlay entry there.
+        let cell = s.cell(addr(sheet, 2, 0)).unwrap();
+        assert!(cell.is_none() || cell.unwrap().style.is_none());
+    }
+
+    /// (4) `.qbook` round-trip preserves the style + overlay.
+    #[test]
+    fn fe4_setstyle_qbook_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("style-rt.qbook");
+        let path_str = path.to_str().unwrap();
+
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("Sheet1", 16384).unwrap();
+        let sid = s.register_style(bold_style()).unwrap();
+        s.set_style(addr(sheet, 2, 1), sid).unwrap();
+        s.save(path_str).unwrap();
+
+        let mut s2 = WorkbookSession::new();
+        s2.open(path_str).unwrap();
+        let cell = s2.cell(addr(sheet, 2, 1)).unwrap().unwrap();
+        assert_eq!(cell.style, Some(sid));
+        let snap = s2.snapshot().unwrap();
+        let def = snap.styles.iter().find(|sd| sd.id == sid).unwrap();
+        assert_eq!(def.style, bold_style());
+    }
+
+    /// (5) undo → cleared.
+    #[test]
+    fn fe4_setstyle_undo_clears() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let sid = s.register_style(bold_style()).unwrap();
+        s.set_style(addr(sheet, 0, 0), sid).unwrap();
+        assert_eq!(s.cell(addr(sheet, 0, 0)).unwrap().unwrap().style, Some(sid));
+        let res = s.undo().unwrap();
+        assert!(res.consumed);
+        let cell = s.cell(addr(sheet, 0, 0)).unwrap();
+        assert!(
+            cell.is_none() || cell.unwrap().style.is_none(),
+            "undo must clear the style"
+        );
+    }
+
+    /// (6) redo → restored.
+    #[test]
+    fn fe4_setstyle_redo_restores() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let sid = s.register_style(bold_style()).unwrap();
+        s.set_style(addr(sheet, 0, 0), sid).unwrap();
+        s.undo().unwrap();
+        let res = s.redo().unwrap();
+        assert!(res.consumed);
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().style,
+            Some(sid),
+            "redo must restore the style"
+        );
+    }
+
+    /// (7) batch([setStyle, setValue]) → both set (BatchCommit walker).
+    #[test]
+    fn fe4_batch_setstyle_and_setvalue_both_set() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let sid = s.register_style(bold_style()).unwrap();
+        s.batch(
+            vec![
+                SessionOp::SetStyle {
+                    addr: addr(sheet, 0, 0),
+                    style: sid,
+                },
+                SessionOp::SetValue {
+                    addr: addr(sheet, 0, 0),
+                    value: CellValue::Number { number: 42.0 },
+                },
+            ],
+            BatchOptions::default(),
+        )
+        .unwrap();
+        let cell = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(cell.style, Some(sid));
+        assert_eq!(cell.value, Some(CellValue::Number { number: 42.0 }));
+    }
+
+    /// (8) setStyle → snapshotDelta → styleId in changedCells.
+    #[test]
+    fn fe4_setstyle_snapshot_delta_carries_style() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // Baseline version BEFORE the style edit.
+        let v0 = s.snapshot().unwrap().version;
+        let sid = s.register_style(bold_style()).unwrap();
+        s.set_style(addr(sheet, 1, 1), sid).unwrap();
+        let delta = s.snapshot_delta(&v0).unwrap();
+        assert!(!delta.full_rebuild_required);
+        let changed = delta
+            .changed_cells
+            .iter()
+            .find(|c| c.sheet == sheet && c.cell.row == 1 && c.cell.col == 1)
+            .expect("changed cell for the styled cell");
+        assert_eq!(changed.cell.style, Some(sid));
+        // The style def is also surfaced in styles_added.
+        assert!(delta.styles_added.iter().any(|sd| sd.id == sid));
+    }
+
+    /// (9) setStyle → from_snapshot rebuild (op-log replay) → preserved.
+    #[test]
+    fn fe4_setstyle_oplog_replay_rebuild_preserves() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let sid = s.register_style(fully_bordered_style()).unwrap();
+        s.set_style(addr(sheet, 0, 0), sid).unwrap();
+        // rematerialize() (undo+redo cycle) rebuilds the workbook by replaying
+        // the op-log into a fresh workbook — the op-log replay path that
+        // from_snapshot also uses. A redo after undo round-trips through it.
+        s.undo().unwrap();
+        s.redo().unwrap();
+        let cell = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(cell.style, Some(sid));
+        let snap = s.snapshot().unwrap();
+        let def = snap.styles.iter().find(|sd| sd.id == sid).unwrap();
+        assert_eq!(def.style, fully_bordered_style());
+    }
+
+    /// (10) removeSheet → restoreSheet → styled cells reappear.
+    #[test]
+    fn fe4_setstyle_remove_restore_sheet_styles_reappear() {
+        let mut s = WorkbookSession::new();
+        let keep = s.add_sheet("Keep", 16384).unwrap();
+        let sheet = s.add_sheet("Styled", 16384).unwrap();
+        let _ = keep;
+        let sid = s.register_style(bold_style()).unwrap();
+        s.set_style(addr(sheet, 0, 0), sid).unwrap();
+        s.delete_sheet(sheet).unwrap();
+        s.restore_sheet(sheet).unwrap();
+        let cell = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(
+            cell.style,
+            Some(sid),
+            "styled cell must reappear on restore"
+        );
+    }
+
+    /// (11) BORDERS-SPECIFIC: a Style with all four per-edge borders set
+    /// survives the full round-trip — distinct intern + insert/delete re-key +
+    /// every edge {style,color} survives the `.qbook` save→load.
+    #[test]
+    fn fe4_full_borders_survive_round_trip_and_shift() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("borders.qbook");
+        let path_str = path.to_str().unwrap();
+
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // Distinct intern: a borderless bold style + the fully-bordered one.
+        let plain = s.register_style(bold_style()).unwrap();
+        let bordered = s.register_style(fully_bordered_style()).unwrap();
+        assert_ne!(
+            plain, bordered,
+            "bordered interns distinctly from borderless"
+        );
+        s.set_style(addr(sheet, 5, 2), bordered).unwrap();
+        // Re-key through an insert: row 5 → row 6.
+        s.insert_rows(sheet, 0, 1).unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 6, 2)).unwrap().unwrap().style,
+            Some(bordered),
+            "bordered style re-keys through AxisShift"
+        );
+        // Now save → load and confirm every edge survives.
+        s.save(path_str).unwrap();
+        let mut s2 = WorkbookSession::new();
+        s2.open(path_str).unwrap();
+        let cell = s2.cell(addr(sheet, 6, 2)).unwrap().unwrap();
+        assert_eq!(cell.style, Some(bordered));
+        let snap = s2.snapshot().unwrap();
+        let def = snap.styles.iter().find(|sd| sd.id == bordered).unwrap();
+        assert_eq!(
+            def.style,
+            fully_bordered_style(),
+            "every per-edge border {{style,color}} survives .qbook save→load"
         );
     }
 }

@@ -143,6 +143,19 @@ pub enum RuntimeError {
     #[error("format counter for peer {peer:?} is exhausted (u32::MAX per-peer custom formats)")]
     FormatCounterExhausted { peer: ql_types::PeerId },
 
+    /// **FE-4 W4 (2026-06-10):** `WorkbookRuntime::set_cell_style` was given a
+    /// `StyleId` that isn't registered in the workbook's `StyleTable`. Mirrors
+    /// [`Self::UnknownFormatId`]: producer-side enforcement so an op log that
+    /// reaches the wire is well-formed (replay does the same check).
+    #[error("style id {0:?} is not registered in the workbook StyleTable")]
+    UnknownStyleId(ql_storage::StyleId),
+
+    /// **FE-4 W4 (2026-06-10):** `WorkbookRuntime::intern_style` was called when
+    /// the local peer's style counter is at `u32::MAX`. Mirrors
+    /// [`Self::FormatCounterExhausted`] — refuse before the op is appended.
+    #[error("style counter for peer {peer:?} is exhausted (u32::MAX per-peer styles)")]
+    StyleCounterExhausted { peer: ql_types::PeerId },
+
     /// **W5-106-AUDIT (Codex MEDIUM closure):** recompute_dirty's
     /// fixed-point loop hit its MAX_ITERATIONS bound with cells still
     /// dirty. Signals a runaway spill shape transition or workbook

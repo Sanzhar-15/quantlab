@@ -17,6 +17,8 @@
 //! | `AddSheet`           | `Workbook::add_sheet_with_chunk_rows`            |
 //! | `RegisterFormat`     | `FormatTable::register_at` (W5-80)               |
 //! | `SetCellFormat`      | `CellFormatOverlay::set` / `::clear` (W5-80)     |
+//! | `RegisterStyle`      | `StyleTable::register_at` (FE-4 W4)              |
+//! | `SetCellStyle`       | `CellStyleOverlay::set` / `::clear` (FE-4 W4)    |
 //! | `BatchCommit`        | (recursive — applies each inner op in order)     |
 //! | `RenameSheet`        | `Workbook::rename_sheet` (Phase 4.6.C / 5.3 step 3) |
 //! | `RemoveSheet`        | `Workbook::remove_sheet` (V3.5.0.3b tombstone)   |
@@ -385,6 +387,39 @@ pub enum Op {
         /// `None` ⇒ clear the overlay entry (cell falls back to General).
         /// `Some(id)` ⇒ bind the cell to that format id.
         id: Option<crate::wire::FormatIdWire>,
+    },
+
+    /// **FE-4 W4 (2026-06-10):** register a cell-STYLE value at a specific id.
+    /// Mirrors `Op::RegisterFormat` for the visual-style overlay. Emitted when
+    /// `WorkbookRuntime::intern_style` allocates a NEW id; idempotent on replay
+    /// (re-registering an existing id with the same style is a no-op).
+    /// Re-registering at the same id with a DIFFERENT style fails at
+    /// `StyleTable::register_at` and surfaces as `ReplayError::StyleRejected`.
+    /// Replays to `StyleTable::register_at`.
+    ///
+    /// **Wire format compatibility:** additive new variant on the serde-tagged
+    /// enum; `OPLOG_SCHEMA_VERSION` NOT bumped (consistent with every prior
+    /// variant addition — the tag-based decode skips unknown tags only for
+    /// forward-compat readers that explicitly tolerate them; see the
+    /// `RemoveSheet` docstring's forward-compat caveat).
+    RegisterStyle {
+        id: crate::wire::StyleIdWire,
+        style: crate::wire::StyleWire,
+    },
+
+    /// **FE-4 W4 (2026-06-10):** set or clear a cell's style id. Mirrors
+    /// `Op::SetCellFormat`: `id` MUST resolve in the workbook's `StyleTable` at
+    /// replay time (an unknown id surfaces as `ReplayError::StyleNotRegistered`);
+    /// `None` clears the overlay entry (cell falls back to `Style::default()`).
+    /// A tombstoned sheet → silent no-op (mirrors `PutValue` / `SetCellFormat`).
+    /// Replays to `CellStyleOverlay::set` / `::clear`.
+    SetCellStyle {
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        /// `None` ⇒ clear the overlay entry (cell falls back to default).
+        /// `Some(id)` ⇒ bind the cell to that style id.
+        id: Option<crate::wire::StyleIdWire>,
     },
 
     /// **W3 (insert/delete rows & columns):** insert `count` blank rows at

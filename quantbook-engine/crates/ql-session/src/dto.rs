@@ -156,6 +156,118 @@ pub struct FormatDef {
     pub string: String,
 }
 
+/// **FE-4 W4 (2026-06-10):** a cell-STYLE id — a peer-allocated
+/// `(peer, counter)` tuple (the visual-formatting analog of [`FormatId`];
+/// NO `Builtin` variant, because styles have no Excel-canonical registry).
+/// `Ord` derived for stable snapshot ordering, matching `FormatId`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StyleId {
+    /// Registering peer id.
+    pub peer: u64,
+    /// Per-peer counter.
+    pub counter: u32,
+}
+
+/// **FE-4 W4:** a 24-bit RGB color (no alpha; cell fills + border colors).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Rgb {
+    /// Red channel.
+    pub r: u8,
+    /// Green channel.
+    pub g: u8,
+    /// Blue channel.
+    pub b: u8,
+}
+
+/// **FE-4 W4:** horizontal alignment of a cell's content.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HAlign {
+    /// Excel default — value-type-driven (numbers right, text left).
+    #[default]
+    General,
+    /// Force left alignment.
+    Left,
+    /// Force center alignment.
+    Center,
+    /// Force right alignment.
+    Right,
+}
+
+/// **FE-4 W4:** the stroke style of a single cell-border edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BorderStyle {
+    /// No border drawn on this edge (the default).
+    #[default]
+    None,
+    /// Thin solid line.
+    Thin,
+    /// Medium solid line.
+    Medium,
+    /// Thick solid line.
+    Thick,
+    /// Dashed line.
+    Dashed,
+    /// Dotted line.
+    Dotted,
+    /// Double line.
+    Double,
+}
+
+/// **FE-4 W4:** a single border edge — stroke style + color.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BorderEdge {
+    /// The stroke style. `None` ⇒ no border drawn on this edge.
+    pub style: BorderStyle,
+    /// The stroke color. Ignored when `style == BorderStyle::None`.
+    pub color: Rgb,
+}
+
+/// **FE-4 W4:** the four per-edge borders of a cell.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Borders {
+    /// Top edge.
+    pub top: BorderEdge,
+    /// Bottom edge.
+    pub bottom: BorderEdge,
+    /// Left edge.
+    pub left: BorderEdge,
+    /// Right edge.
+    pub right: BorderEdge,
+}
+
+/// **FE-4 W4 (2026-06-10):** a cell's VISUAL style — bold/italic/fill/align
+/// plus per-edge borders (operator decision #4 schema). The DTO mirror of
+/// `ql_storage::Style`; carried inline in [`StyleDef`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Style {
+    /// Bold font weight.
+    pub bold: bool,
+    /// Italic font slant.
+    pub italic: bool,
+    /// Background fill color; `None` = no fill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Rgb>,
+    /// Horizontal alignment.
+    #[serde(default)]
+    pub align: HAlign,
+    /// Per-edge borders.
+    #[serde(default)]
+    pub borders: Borders,
+}
+
+/// **FE-4 W4 (2026-06-10):** a registered style definition (`{id, style}`) —
+/// the workbook-snapshot `styles` table entry resolving a [`StyleId`] to its
+/// [`Style`] value (the visual-formatting analog of [`FormatDef`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyleDef {
+    /// The style id.
+    pub id: StyleId,
+    /// The style value.
+    pub style: Style,
+}
+
 /// One cell in a sheet snapshot.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CellSnapshot {
@@ -172,6 +284,11 @@ pub struct CellSnapshot {
     /// Cell format, if set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<FormatId>,
+    /// **FE-4 W4 (2026-06-10):** cell visual-style id, if set. `None` = no
+    /// explicit style (renders unstyled). Resolved against
+    /// [`WorkbookSnapshot::styles`] / [`WorkbookSnapshotDelta::styles_added`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<StyleId>,
     /// Pre-rendered display string (format applied), if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rendered: Option<String>,
@@ -243,6 +360,12 @@ pub struct WorkbookSnapshot {
     pub sheets: Vec<SheetSnapshot>,
     /// Session-wide format table (builtin + custom).
     pub formats: Vec<FormatDef>,
+    /// **FE-4 W4 (2026-06-10):** session-wide cell-style table. Resolves each
+    /// cell's [`CellSnapshot::style`] id to its [`Style`] value (the
+    /// visual-formatting analog of [`Self::formats`]). Empty when no styles
+    /// are registered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub styles: Vec<StyleDef>,
     /// Workbook date epoch.
     pub date_system: DateSystem,
     /// Opaque version token (round-trip into `snapshot_delta`).
@@ -300,6 +423,10 @@ pub struct WorkbookSnapshotDelta {
     pub sheets_removed: Vec<SheetId>,
     /// Formats registered since `last_version`.
     pub formats_added: Vec<FormatDef>,
+    /// **FE-4 W4 (2026-06-10):** styles registered since `last_version` (the
+    /// visual-formatting analog of [`Self::formats_added`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub styles_added: Vec<StyleDef>,
     /// Current version token (store for the next call).
     pub version: SessionVersion,
     /// When true the caller MUST reseed via `snapshot()` (see `full_rebuild_reason`).

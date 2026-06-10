@@ -73,7 +73,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use ql_oplog::wire::{CellWireValue, FormatIdWire, NamedTargetWire, WireDecodeError};
+use ql_oplog::wire::{
+    CellWireValue, FormatIdWire, NamedTargetWire, StyleIdWire, StyleWire, WireDecodeError,
+};
 use ql_storage::{Sheet, Workbook};
 use ql_types::{ColId, RowId, SheetId, Value, MAX_COLUMN, MAX_ROW};
 use serde::{Deserialize, Serialize};
@@ -195,7 +197,13 @@ use thiserror::Error;
 ///   - v7 reader loading v8: refused via the two-phase probe →
 ///     loud `UnsupportedSchema { found: 8 }`. A v7 reader cannot
 ///     deserialize the tagged-tuple `id` field as bare `u32`.
-pub const WORKBOOK_SCHEMA_VERSION: u32 = 8;
+///   - **v9 (FE-4 W4, 2026-06-10):** adds the workbook-level `styles`
+///     section + the per-sheet `style_overlay` section (cell-style
+///     foundation). Both are additive `Option`s with `#[serde(default)]`, so
+///     a v9 reader loads v1-v8 envelopes (treating the absent sections as "no
+///     styles"); a v<9 reader loading v9 is refused at the schema-version gate
+///     (the envelope's `deny_unknown_fields` would also reject the new keys).
+pub const WORKBOOK_SCHEMA_VERSION: u32 = 9;
 
 /// The earliest schema version this reader still accepts. v1 fixtures (Phase 1)
 /// continue to load on v2 binaries; older versions would need explicit handling.
@@ -326,6 +334,28 @@ pub enum QbookError {
         why: &'static str,
     },
 
+    /// **FE-4 W4 (2026-06-10; v9):** envelope's `styles` section references an
+    /// id whose registration collides at the StyleTable (same id → different
+    /// style, or same style → different id). The visual-formatting analog of
+    /// [`Self::MalformedFormat`]. `details` is the `StyleTableError`'s `Debug`.
+    #[error("malformed style entry id={id:?}: {details}")]
+    MalformedStyle {
+        id: ql_storage::StyleId,
+        details: String,
+    },
+
+    /// **FE-4 W4 (2026-06-10; v9):** per-sheet `style_overlay` carries
+    /// out-of-bounds coordinates OR binds a cell to a style id not registered
+    /// in the StyleTable. The visual-formatting analog of
+    /// [`Self::MalformedFormatOverlay`].
+    #[error("malformed style overlay entry on sheet {sheet}: row={row}, col={col} ({why})")]
+    MalformedStyleOverlay {
+        sheet: u16,
+        row: u32,
+        col: u32,
+        why: &'static str,
+    },
+
     /// **W5-93 (Phase 4.6.E closure):** sheet name in the envelope's
     /// `[[sheets]]` section failed `Workbook::validate_sheet_name`
     /// (empty, duplicate under canonical comparison, or contains an
@@ -414,6 +444,12 @@ pub struct WorkbookEnvelope {
     /// as "no custom formats registered" and proceeds with defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formats: Option<FormatsSection>,
+    /// **FE-4 W4 (2026-06-10; schema v9):** workbook-level cell-STYLE interning
+    /// table. v9 envelopes carry every registered style; v1-v8 omit the field
+    /// (loader treats `None` as "no styles registered"). Styles have no Excel
+    /// built-ins to re-seed, so every entry is persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub styles: Option<StylesSection>,
     /// **W5-123 (Phase 4.8.L):** workbook-scoped table metadata. v6
     /// envelopes carry the section when at least one table is
     /// registered; v1-v5 omit (and v6 omits an empty `TableTable` to
@@ -588,6 +624,12 @@ pub struct SheetEnvelope {
     /// overlay to keep TOML minimal. Loader maps `None` → empty overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format_overlay: Option<Vec<FormatOverlayEntry>>,
+    /// **FE-4 W4 (2026-06-10; schema v9):** per-sheet sparse cell-STYLE
+    /// overlay (the visual-formatting analog of `format_overlay`). `None` ≡
+    /// "no styles on this sheet"; omitted on save for an empty overlay.
+    /// v1-v8 envelopes lack the field; the loader maps `None` → empty overlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_overlay: Option<Vec<StyleOverlayEntry>>,
 }
 
 /// **W5-81 (Phase 4.5.D part 5):** workbook-level format-table wire format.
@@ -679,6 +721,41 @@ pub struct FormatOverlayEntry {
     pub row: u32,
     pub col: u32,
     pub id: FormatEntryId,
+}
+
+/// **FE-4 W4 (2026-06-10; schema v9):** workbook-level cell-STYLE interning
+/// table (the visual-formatting analog of [`FormatsSection`]). Persists EVERY
+/// registered style (styles have no Excel built-ins, so unlike formats there
+/// is nothing to re-seed on load — all entries are written). Entries sorted by
+/// `StyleId` for deterministic diffs. Omitted (`None`) when no styles exist.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StylesSection {
+    pub entries: Vec<StyleEntry>,
+}
+
+/// **FE-4 W4 (2026-06-10):** one row in the workbook StyleTable. `id` is the
+/// op-log wire shape ([`StyleIdWire`] — `{peer, counter}`); `style` is the
+/// full [`StyleWire`] value (bold/italic/fill/align + per-edge borders). Both
+/// reuse the op-log wire types (mirrors how [`FormatEntry`] reuses
+/// `FormatIdWire`), so the `.qbook` envelope and the op log share one wire
+/// vocabulary and round-trip every sub-field losslessly.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StyleEntry {
+    pub id: StyleIdWire,
+    pub style: StyleWire,
+}
+
+/// **FE-4 W4 (2026-06-10):** one entry in a sheet's cell-style overlay —
+/// `(row, col)` ↦ StyleId. Sorted by `(row, col)` on save (mirrors
+/// [`FormatOverlayEntry`]).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StyleOverlayEntry {
+    pub row: u32,
+    pub col: u32,
+    pub id: StyleIdWire,
 }
 
 /// **W5-123 (Phase 4.8.L):** workbook-scoped table metadata. Mirror of
@@ -1259,6 +1336,25 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
                 Some(entries)
             }
         };
+        // **FE-4 W4 (2026-06-10):** serialize the per-sheet cell-style overlay
+        // if non-empty (mirrors format_overlay). Sorted by (row, col).
+        let style_overlay = {
+            let overlay = sheet.style_overlay();
+            if overlay.is_empty() {
+                None
+            } else {
+                let mut entries: Vec<StyleOverlayEntry> = overlay
+                    .iter()
+                    .map(|((r, c), sid)| StyleOverlayEntry {
+                        row: r,
+                        col: c,
+                        id: StyleIdWire::from_storage(sid),
+                    })
+                    .collect();
+                entries.sort_by_key(|e| (e.row, e.col));
+                Some(entries)
+            }
+        };
         sheet_envelopes.push(SheetEnvelope {
             id: sheet_id,
             name: sheet.name().to_owned(),
@@ -1266,6 +1362,7 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
             row_extent: env_row_extent,
             col_extent: env_col_extent,
             format_overlay,
+            style_overlay,
         });
     }
 
@@ -1353,6 +1450,26 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         }
     };
 
+    // **FE-4 W4 (2026-06-10):** serialize the StyleTable. Unlike formats there
+    // are no built-ins to skip — persist EVERY registered style. Sorted by
+    // `StyleId`. None if no styles are registered (typical for the common case).
+    let styles_section = {
+        let mut pairs: Vec<(ql_storage::StyleId, ql_storage::Style)> = wb.styles().iter().collect();
+        if pairs.is_empty() {
+            None
+        } else {
+            pairs.sort_by_key(|(id, _)| *id);
+            let entries: Vec<StyleEntry> = pairs
+                .into_iter()
+                .map(|(id, style)| StyleEntry {
+                    id: StyleIdWire::from_storage(id),
+                    style: StyleWire::from_storage(style),
+                })
+                .collect();
+            Some(StylesSection { entries })
+        }
+    };
+
     // **W5-123 (Phase 4.8.L):** serialize `TableTable` if non-empty.
     // Sorted ascending by canonical (uppercase) name for deterministic
     // diffs. Empty TableTable → `None` so v1-v5 readers don't see an
@@ -1418,6 +1535,8 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         date_system: Some(DateSystemWire::from_runtime(wb.date_system())),
         // **W5-81 (Phase 4.5.D part 5):** persist custom format entries.
         formats: formats_section,
+        // **FE-4 W4 (2026-06-10; v9):** persist cell-style entries.
+        styles: styles_section,
         // **W5-123 (Phase 4.8.L):** persist workbook tables.
         tables: tables_section,
         // **W5-145 (Phase 4.9.I):** persist non-default reference_mode + locale.
@@ -1731,6 +1850,20 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                 })?;
         }
     }
+    // **FE-4 W4 (2026-06-10; v9):** apply the envelope's StylesSection. v9
+    // envelopes carry every registered style; v1-v8 omit the field (None →
+    // no styles). `register_at` surfaces collisions as `MalformedStyle`.
+    if let Some(ref ss) = envelope.styles {
+        for entry in &ss.entries {
+            let sid = entry.id.to_storage();
+            wb.styles_mut()
+                .register_at(sid, entry.style.to_storage())
+                .map_err(|err| QbookError::MalformedStyle {
+                    id: sid,
+                    details: format!("{err:?}"),
+                })?;
+        }
+    }
     let sheets_dir = path.join("sheets");
     for (expected_id, sheet_env) in envelope.sheets.iter().enumerate() {
         if sheet_env.id as usize != expected_id {
@@ -1803,6 +1936,36 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                 sheet_mut
                     .format_overlay_mut()
                     .set(entry.row, entry.col, fid);
+            }
+        }
+
+        // **FE-4 W4 (2026-06-10; v9):** apply the per-sheet cell-style overlay
+        // (mirrors format_overlay). Each id MUST resolve in the workbook's
+        // StyleTable (validated above), else `MalformedStyleOverlay`. v1-v8
+        // envelopes lack the field (None → no styles on this sheet).
+        if let Some(ref overlay_entries) = sheet_env.style_overlay {
+            let known_style_ids: std::collections::HashSet<ql_storage::StyleId> =
+                wb.styles().iter().map(|(id, _)| id).collect();
+            let sheet_mut = wb.sheet_mut(sheet_id).expect("just-added sheet must exist");
+            for entry in overlay_entries {
+                if entry.row > MAX_ROW || entry.col > MAX_COLUMN {
+                    return Err(QbookError::MalformedStyleOverlay {
+                        sheet: sheet_id,
+                        row: entry.row,
+                        col: entry.col,
+                        why: "out-of-range row/col",
+                    });
+                }
+                let sid = entry.id.to_storage();
+                if !known_style_ids.contains(&sid) {
+                    return Err(QbookError::MalformedStyleOverlay {
+                        sheet: sheet_id,
+                        row: entry.row,
+                        col: entry.col,
+                        why: "style id not registered in StyleTable",
+                    });
+                }
+                sheet_mut.style_overlay_mut().set(entry.row, entry.col, sid);
             }
         }
 
@@ -3309,8 +3472,14 @@ sheets = [
         let toml_str = fs::read_to_string(path.join("workbook.toml")).unwrap();
         let env: WorkbookEnvelope = toml::from_str(&toml_str).unwrap();
         // Union of value bbox {1,1} and formula at (3,4) -> {4,5}; the far Blank is excluded.
-        assert_eq!(env.sheets[0].row_extent, 4, "envelope row_extent must be the tight union");
-        assert_eq!(env.sheets[0].col_extent, 5, "envelope col_extent must be the tight union");
+        assert_eq!(
+            env.sheets[0].row_extent, 4,
+            "envelope row_extent must be the tight union"
+        );
+        assert_eq!(
+            env.sheets[0].col_extent, 5,
+            "envelope col_extent must be the tight union"
+        );
     }
 
     #[test]
@@ -3352,6 +3521,102 @@ sheets = [
         let loaded_id = loaded.sheet(s).unwrap().format_overlay().get(2, 1).unwrap();
         assert_eq!(loaded_id, id);
         assert_eq!(loaded.formats().lookup(loaded_id), Some("\"€\" #,##0.00"));
+    }
+
+    // ===== FE-4 W4 — style table + overlay .qbook round-trip (v9) =====
+
+    #[test]
+    fn full_style_round_trip_with_all_borders() {
+        // Acceptance #4 + #11 (.qbook half): intern a fully-bordered style,
+        // bind a cell, round-trip, verify the StyleTable interns it distinctly
+        // AND every per-edge {style,color} survives save→load.
+        use ql_storage::{BorderEdge, BorderStyle, Borders, HAlign, Rgb, Style};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("styles.qbook");
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        let edge = BorderEdge {
+            style: BorderStyle::Double,
+            color: Rgb::new(0x11, 0x22, 0x33),
+        };
+        let rich = Style {
+            bold: true,
+            italic: true,
+            fill: Some(Rgb::new(0xab, 0xcd, 0xef)),
+            align: HAlign::Center,
+            borders: Borders {
+                top: edge,
+                bottom: BorderEdge {
+                    style: BorderStyle::Thin,
+                    color: Rgb::new(1, 2, 3),
+                },
+                left: BorderEdge {
+                    style: BorderStyle::Medium,
+                    color: Rgb::new(4, 5, 6),
+                },
+                right: edge,
+            },
+        };
+        let borderless = wb.styles_mut().intern(Style {
+            bold: true,
+            ..Style::default()
+        });
+        let rich_id = wb.styles_mut().intern(rich);
+        assert_ne!(borderless, rich_id, "bordered interns distinctly");
+        wb.sheet_mut(s)
+            .unwrap()
+            .style_overlay_mut()
+            .set(2, 1, rich_id);
+        wb.sheet_mut(s)
+            .unwrap()
+            .style_overlay_mut()
+            .set(0, 0, borderless);
+
+        save_workbook(&wb, "styles", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        // Overlay survives.
+        assert_eq!(
+            loaded.sheet(s).unwrap().style_overlay().get(2, 1),
+            Some(rich_id)
+        );
+        assert_eq!(
+            loaded.sheet(s).unwrap().style_overlay().get(0, 0),
+            Some(borderless)
+        );
+        // The full rich style (every border edge) survives.
+        let got = loaded.styles().lookup(rich_id).unwrap();
+        assert_eq!(got, rich, "every style sub-field must survive save→load");
+        assert_eq!(got.borders.top.style, BorderStyle::Double);
+        assert_eq!(got.borders.top.color, Rgb::new(0x11, 0x22, 0x33));
+        assert_eq!(got.borders.bottom.style, BorderStyle::Thin);
+        assert_eq!(got.borders.left.style, BorderStyle::Medium);
+        assert_eq!(got.borders.right, edge);
+        assert_eq!(got.fill, Some(Rgb::new(0xab, 0xcd, 0xef)));
+        assert_eq!(got.align, HAlign::Center);
+    }
+
+    #[test]
+    fn v8_envelope_without_styles_loads_clean() {
+        // A v8 envelope (no styles/style_overlay sections) loads on the v9
+        // reader with an empty StyleTable — backward compat.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy_v8.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let v8_toml = r#"
+schema_version = 8
+name = "legacy_v8"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "S", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+"#;
+        fs::write(path.join("workbook.toml"), v8_toml).unwrap();
+        fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
+
+        let loaded = load_workbook(&path).unwrap();
+        assert!(loaded.styles().is_empty());
+        assert!(loaded.sheet(0).unwrap().style_overlay().is_empty());
     }
 
     #[test]
@@ -4247,7 +4512,7 @@ col_extent = 1
         let path = dir.path().join("future.qbook");
         fs::create_dir_all(path.join("sheets")).unwrap();
         let toml = r#"
-schema_version = 9
+schema_version = 10
 name = "future"
 
 [[sheets]]
@@ -4262,7 +4527,7 @@ col_extent = 0
 
         let result = load_workbook(&path);
         assert!(
-            matches!(result, Err(QbookError::UnsupportedSchema { found: 9 })),
+            matches!(result, Err(QbookError::UnsupportedSchema { found: 10 })),
             "expected UnsupportedSchema, got {result:?}"
         );
     }
@@ -4404,7 +4669,7 @@ col_extent = 0
     // ===== W5-92 (Phase 4.6.D) sheet-scoped names + schema v5 =====
 
     #[test]
-    fn schema_version_constant_is_eight() {
+    fn schema_version_constant_is_nine() {
         // Sanity check so future bumps trip this test until the doc is updated.
         // W5-145 (Phase 4.9.I) bumped from 6 to 7 (workbook reference_mode + locale).
         // Phase 5.2 D-1 step 5 (2026-05-20) bumped from 7 to 8: FormatEntry.id
@@ -4412,7 +4677,9 @@ col_extent = 0
         // (Wire(FormatIdWire) | LegacyU32(u32)). v8 envelopes carry tagged-tuple
         // FormatIds losslessly (multi-peer); v<8 envelopes route through
         // FormatId::legacy_from_u32 at load time.
-        assert_eq!(WORKBOOK_SCHEMA_VERSION, 8);
+        // FE-4 W4 (2026-06-10) bumped from 8 to 9: added the workbook `styles`
+        // section + per-sheet `style_overlay` section (cell-style foundation).
+        assert_eq!(WORKBOOK_SCHEMA_VERSION, 9);
     }
 
     #[test]

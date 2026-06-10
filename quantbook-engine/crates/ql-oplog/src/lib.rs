@@ -52,7 +52,10 @@ pub use replay::{apply_ops_in_range, replay_into, ReplayError};
 // flows through napi as opaque bytes (encode/decode) so the
 // re-export is purely an ergonomics + dep-graph hygiene choice.
 pub use loro::VersionVector;
-pub use wire::{CellWireValue, FormatIdWire, NamedTargetWire, WireDecodeError};
+pub use wire::{
+    BorderEdgeWire, BorderStyleWire, CellWireValue, FormatIdWire, HAlignWire, NamedTargetWire,
+    RgbWire, StyleIdWire, StyleWire, WireDecodeError,
+};
 
 // Phase 5.2 D-1 step 1.1 (2026-05-19) — re-export `ql_types::PeerId`
 // for ergonomics. PeerId lived briefly at `ql_oplog::PeerId` in step 1

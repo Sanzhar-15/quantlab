@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::dto::{
     BatchOptions, BatchResult, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue,
     Diagnostic, DirtyResult, FormatId, PublishedRef, RangeQueryOptions, RangeResult,
-    SessionVersion, SheetInfo, TableSpec, UndoRedoResult, WorkbookSnapshot, WorkbookSnapshotDelta,
-    WriteRangeResult,
+    SessionVersion, SheetInfo, Style, StyleId, TableSpec, UndoRedoResult, WorkbookSnapshot,
+    WorkbookSnapshotDelta, WriteRangeResult,
 };
 use crate::error::EngineResult;
 use crate::function_meta::FunctionMetadata;
@@ -63,6 +63,14 @@ pub enum SessionOp {
         addr: CellAddr,
         /// Format id.
         format: FormatId,
+    },
+    /// **FE-4 W4 (2026-06-10):** set a cell visual STYLE id (the
+    /// visual-formatting analog of [`Self::SetFormat`]).
+    SetStyle {
+        /// Target cell.
+        addr: CellAddr,
+        /// Style id (from [`EngineSession::register_style`]).
+        style: StyleId,
     },
 }
 
@@ -169,6 +177,15 @@ pub trait EngineSession {
     fn set_format(&mut self, addr: CellAddr, format: FormatId) -> EngineResult<()>;
     /// Register a session-wide custom format, returning its id.
     fn register_format(&mut self, format_string: &str) -> EngineResult<FormatId>;
+    /// **FE-4 W4 (2026-06-10):** set a cell's visual style to a registered
+    /// [`StyleId`] (from [`Self::register_style`]). `bad_argument` for an
+    /// unknown id. The visual-formatting analog of [`Self::set_format`].
+    fn set_style(&mut self, addr: CellAddr, style: StyleId) -> EngineResult<()>;
+    /// **FE-4 W4 (2026-06-10):** register a session-wide cell style, returning
+    /// its [`StyleId`] (the visual-formatting analog of
+    /// [`Self::register_format`]). Idempotent — re-registering an identical
+    /// style returns the same id.
+    fn register_style(&mut self, style: Style) -> EngineResult<StyleId>;
     /// Parse+bind a formula WITHOUT mutating (keystroke path); returns diagnostics.
     fn validate_formula(&self, addr: CellAddr, text: &str) -> EngineResult<Vec<Diagnostic>>;
 

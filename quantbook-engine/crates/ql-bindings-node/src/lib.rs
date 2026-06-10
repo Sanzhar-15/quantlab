@@ -388,6 +388,7 @@ fn empty_delta(
         sheets_changed: Vec::new(),
         sheets_removed: Vec::new(),
         formats_added: Vec::new(),
+        styles_added: Vec::new(),
         version,
         full_rebuild_required,
         full_rebuild_reason: full_rebuild_reason.map(|r| full_rebuild_reason_str(r).to_string()),
@@ -430,17 +431,23 @@ fn classify_delta_op(
     changed_cells: &mut std::collections::HashSet<(u16, u32, u32)>,
     removed_sheets: &mut Vec<u16>,
     new_formats: &mut Vec<ql_storage::FormatId>,
+    new_styles: &mut Vec<ql_storage::StyleId>,
 ) {
     match op {
         // **F2 Blank-durability closure (2026-05-27)**: Op::ClearValue
         // joins the cell-keyed fast path. The delta's changedCells
         // entry for the cleared cell carries its new (Blank) value when
         // the IDE re-reads it; no full rebuild needed.
+        //
+        // **FE-4 W4 (2026-06-10):** Op::SetCellStyle is cell-keyed too
+        // (mirrors SetCellFormat) — the delta's changedCells entry carries
+        // the cell's new style_id when the IDE re-reads it.
         Op::PutValue { sheet, row, col, .. }
         | Op::ClearValue { sheet, row, col }
         | Op::PutFormula { sheet, row, col, .. }
         | Op::ClearFormula { sheet, row, col }
-        | Op::SetCellFormat { sheet, row, col, .. } => {
+        | Op::SetCellFormat { sheet, row, col, .. }
+        | Op::SetCellStyle { sheet, row, col, .. } => {
             changed_cells.insert((*sheet, *row, *col));
         }
         Op::RenameSheet { .. } | Op::RenameTable { .. } | Op::RenameColumn { .. } => {
@@ -452,6 +459,11 @@ fn classify_delta_op(
         Op::RegisterFormat { id, .. } => {
             new_formats.push((*id).to_storage());
         }
+        // **FE-4 W4 (2026-06-10):** style registration → stylesAdded (mirrors
+        // RegisterFormat).
+        Op::RegisterStyle { id, .. } => {
+            new_styles.push((*id).to_storage());
+        }
         Op::BatchCommit { ops } => {
             for inner in ops {
                 classify_delta_op(
@@ -460,6 +472,7 @@ fn classify_delta_op(
                     changed_cells,
                     removed_sheets,
                     new_formats,
+                    new_styles,
                 );
                 if *has_rename {
                     return;
@@ -739,6 +752,131 @@ impl From<ql_storage::FormatId> for FormatIdJson {
     }
 }
 
+/// **FE-4 W4 (2026-06-10):** JS-facing cell-STYLE id (the visual-formatting
+/// analog of [`FormatIdJson`]). A peer-allocated `(peer, counter)` tuple —
+/// NO `kind`/`builtin` discriminant, because styles have no Excel-canonical
+/// registry. `peer` is a `BigInt` (widened from the engine's `u64`); `counter`
+/// is `f64` (the 6.3-2-hardening no-coercion discipline — validated via
+/// `validate_u32_index`, never silently `ToUint32`-coerced).
+#[napi(object)]
+pub struct StyleIdJson {
+    /// Registering peer id (u64 widened to BigInt).
+    pub peer: BigInt,
+    /// Per-peer counter (u32-domain, typed f64 for no-coercion validation).
+    pub counter: f64,
+}
+
+impl From<ql_storage::StyleId> for StyleIdJson {
+    fn from(id: ql_storage::StyleId) -> Self {
+        Self {
+            peer: BigInt::from(id.peer.0),
+            counter: id.counter as f64,
+        }
+    }
+}
+
+/// **FE-4 W4 (2026-06-10):** map a storage `ql_storage::Style` directly to the
+/// JS [`StyleJson`] (used by the dormant `CollabSession` snapshot path, which
+/// reads the Workbook's `StyleTable` rather than the `ql_session` DTOs).
+fn style_json_from_storage(s: ql_storage::Style) -> StyleJson {
+    fn rgb(c: ql_storage::Rgb) -> RgbJson {
+        RgbJson {
+            r: c.r as f64,
+            g: c.g as f64,
+            b: c.b as f64,
+        }
+    }
+    fn border_style_str(s: ql_storage::BorderStyle) -> &'static str {
+        match s {
+            ql_storage::BorderStyle::None => "none",
+            ql_storage::BorderStyle::Thin => "thin",
+            ql_storage::BorderStyle::Medium => "medium",
+            ql_storage::BorderStyle::Thick => "thick",
+            ql_storage::BorderStyle::Dashed => "dashed",
+            ql_storage::BorderStyle::Dotted => "dotted",
+            ql_storage::BorderStyle::Double => "double",
+        }
+    }
+    fn edge(e: ql_storage::BorderEdge) -> BorderEdgeJson {
+        BorderEdgeJson {
+            style: border_style_str(e.style).to_string(),
+            color: rgb(e.color),
+        }
+    }
+    let align = match s.align {
+        ql_storage::HAlign::General => "general",
+        ql_storage::HAlign::Left => "left",
+        ql_storage::HAlign::Center => "center",
+        ql_storage::HAlign::Right => "right",
+    };
+    StyleJson {
+        bold: s.bold,
+        italic: s.italic,
+        fill: s.fill.map(rgb),
+        align: Some(align.to_string()),
+        border_top: Some(edge(s.borders.top)),
+        border_bottom: Some(edge(s.borders.bottom)),
+        border_left: Some(edge(s.borders.left)),
+        border_right: Some(edge(s.borders.right)),
+    }
+}
+
+/// **FE-4 W4 (2026-06-10):** JS-facing RGB color (`{ r, g, b }`, each a
+/// u8-domain `f64` for no-coercion validation).
+#[napi(object)]
+pub struct RgbJson {
+    pub r: f64,
+    pub g: f64,
+    pub b: f64,
+}
+
+/// **FE-4 W4 (2026-06-10):** JS-facing border edge (`{ style, color }`).
+/// `style` is one of `none|thin|medium|thick|dashed|dotted|double`.
+#[napi(object)]
+pub struct BorderEdgeJson {
+    /// Stroke style string (`none` ⇒ no border on this edge).
+    pub style: String,
+    /// Stroke color.
+    pub color: RgbJson,
+}
+
+/// **FE-4 W4 (2026-06-10):** JS-facing cell VISUAL style — bold/italic/fill/
+/// align + per-edge borders (operator decision #4 schema). The input DTO for
+/// [`Session::register_style`] and the value carried in [`StyleDefJson`].
+/// `align` is one of `general|left|center|right`. `fill`/border fields are
+/// optional (absent ⇒ no fill / no border on that edge).
+#[napi(object)]
+pub struct StyleJson {
+    /// Bold font weight.
+    pub bold: bool,
+    /// Italic font slant.
+    pub italic: bool,
+    /// Background fill color; absent ⇒ no fill.
+    pub fill: Option<RgbJson>,
+    /// Horizontal alignment string (`general|left|center|right`); absent ⇒ general.
+    pub align: Option<String>,
+    /// Top border edge; absent ⇒ no top border.
+    pub border_top: Option<BorderEdgeJson>,
+    /// Bottom border edge; absent ⇒ no bottom border.
+    pub border_bottom: Option<BorderEdgeJson>,
+    /// Left border edge; absent ⇒ no left border.
+    pub border_left: Option<BorderEdgeJson>,
+    /// Right border edge; absent ⇒ no right border.
+    pub border_right: Option<BorderEdgeJson>,
+}
+
+/// **FE-4 W4 (2026-06-10):** one style registration in a
+/// `WorkbookSnapshotJson.styles` array — pairs a [`StyleIdJson`] with its
+/// [`StyleJson`] value (the visual-formatting analog of [`FormatDefJson`]).
+/// The IDE resolves each cell's `style_id` against this list to render.
+#[napi(object)]
+pub struct StyleDefJson {
+    /// The style id.
+    pub id: StyleIdJson,
+    /// The style value (bold/italic/fill/align/borders).
+    pub style: StyleJson,
+}
+
 /// **Phase 5.7 V3.5.0.2 (2026-05-24) -- JS-facing cell snapshot.**
 ///
 /// One cell entry in a sheet's snapshot.  `value: None` means the cell has
@@ -775,6 +913,12 @@ pub struct CellSnapshotJson {
     /// **V3.5.0.5 (2026-05-24)**: format passthrough.  `None` = no
     /// explicit format (cell renders with FormatId::GENERAL default).
     pub format: Option<FormatIdJson>,
+    /// **FE-4 W4 (2026-06-10):** cell visual-STYLE id passthrough. `None` =
+    /// no explicit style (renders unstyled). Resolve against
+    /// `WorkbookSnapshotJson.styles` / `WorkbookSnapshotDeltaJson.stylesAdded`
+    /// to get the `StyleJson` value. (FE-5 consumes this for canvas rendering;
+    /// FE-4 ships engine-only — the field round-trips through the snapshot.)
+    pub style_id: Option<StyleIdJson>,
     /// **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: pre-rendered formatted
     /// string for the cell value, produced by the engine via
     /// `ql_functions::format::render(value, parsed_format,
@@ -928,6 +1072,13 @@ pub struct WorkbookSnapshotJson {
     /// via `.formats`.  Mirrors the V3.5.0.5 per-cell format additive
     /// extension on CellSnapshotJson.
     pub formats: Vec<FormatDefJson>,
+
+    /// **FE-4 W4 (2026-06-10):** session-wide cell-style registry (the
+    /// visual-formatting analog of `formats`). Resolves each cell's
+    /// `style_id` to a `StyleJson` value. Sorted by `StyleId`. Empty when no
+    /// styles are registered. Consumed by FE-5 canvas rendering; FE-4 ships
+    /// the passthrough only.
+    pub styles: Vec<StyleDefJson>,
 
     /// **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: workbook-level date
     /// system, propagated to the engine `EvalContext` used by
@@ -1107,6 +1258,11 @@ pub struct WorkbookSnapshotDeltaJson {
     /// V3.6.0.X audit-of-D2 closure).  The IDE merges each into its
     /// `formats` table by `FormatId`.
     pub formats_added: Vec<FormatDefJson>,
+
+    /// **FE-4 W4 (2026-06-10):** styles registered since `lastSeenVersion`
+    /// (the visual-formatting analog of `formats_added`). The IDE merges each
+    /// into its `styles` table by `StyleId`.
+    pub styles_added: Vec<StyleDefJson>,
 
     /// Opaque version-vector token.  IDE stores it and passes back on
     /// the next call as `lastSeenVersion`.  Encoded via
@@ -2611,6 +2767,8 @@ impl CollabSession {
                         // absent JS property (napi-rs Option::None
                         // serialization).
                         format: state.format.map(FormatIdJson::from),
+                        // FE-4 W4: cell-style id passthrough (CollabSession cache path).
+                        style_id: state.style.map(StyleIdJson::from),
                         // **V3.6.0.5 D4 (2026-05-23)**: pre-rendered
                         // formatted value (see field docstring +
                         // CellSnapshotJson.rendered docstring for the
@@ -2661,6 +2819,19 @@ impl CollabSession {
                 string: s.to_string(),
             })
             .collect();
+        // **FE-4 W4 (2026-06-10):** populate `styles` from the rebuilt
+        // Workbook's StyleTable (authoritative; same rationale as `formats`).
+        // Sorted by StyleId for a stable wire shape across snapshots.
+        let mut style_pairs: Vec<(ql_storage::StyleId, ql_storage::Style)> =
+            workbook.styles().iter().collect();
+        style_pairs.sort_by_key(|(id, _)| *id);
+        let styles: Vec<StyleDefJson> = style_pairs
+            .into_iter()
+            .map(|(id, style)| StyleDefJson {
+                id: StyleIdJson::from(id),
+                style: style_json_from_storage(style),
+            })
+            .collect();
         // **V3.6.0.5 D4 (2026-05-23)**: map ql_types::DateSystem
         // to the napi String discriminator (matches the
         // FormatIdJson / CellValueJson `kind: String` pattern).
@@ -2687,6 +2858,7 @@ impl CollabSession {
         Ok(WorkbookSnapshotJson {
             sheets,
             formats,
+            styles,
             date_system,
             version: version_bytes,
             // 6.3-1c M5: stamp the contract schema version on every snapshot DTO.
@@ -2856,6 +3028,8 @@ impl CollabSession {
             std::collections::HashSet::new();
         let mut removed_sheet_ids: Vec<u16> = Vec::new();
         let mut new_format_ids: Vec<ql_storage::FormatId> = Vec::new();
+        // FE-4 W4: style registrations in the new-ops window → stylesAdded.
+        let mut new_style_ids: Vec<ql_storage::StyleId> = Vec::new();
         // Collect the slice of ops into an owned Vec so the borrow on
         // `inner.log()` ends before any potential mutable callback
         // (force_clear_workbook_cache).  Bounded by N_new_ops which is
@@ -2933,6 +3107,7 @@ impl CollabSession {
                 &mut changed_cell_coords,
                 &mut removed_sheet_ids,
                 &mut new_format_ids,
+                &mut new_style_ids,
             );
             if has_rename {
                 break;
@@ -3057,6 +3232,8 @@ impl CollabSession {
                 value: state.value.map(CellValueJson::from),
                 formula: repaired_formula,
                 format: state.format.map(FormatIdJson::from),
+                // FE-4 W4: cell-style id passthrough (CollabSession cache path).
+                style_id: state.style.map(StyleIdJson::from),
                 rendered,
             };
             changed_cells.push(ChangedCellJson {
@@ -3093,6 +3270,19 @@ impl CollabSession {
                 });
             }
         }
+        // **FE-4 W4 (2026-06-10):** resolve style registrations → stylesAdded
+        // (mirrors formats_added; sorted by StyleId for a stable shape).
+        new_style_ids.sort();
+        new_style_ids.dedup();
+        let mut styles_added: Vec<StyleDefJson> = Vec::new();
+        for style_id in new_style_ids {
+            if let Some(style) = next_workbook.styles().lookup(style_id) {
+                styles_added.push(StyleDefJson {
+                    id: StyleIdJson::from(style_id),
+                    style: style_json_from_storage(style),
+                });
+            }
+        }
 
         // Build sheets_removed (already collected; just widen u16->u32
         // for napi).
@@ -3111,6 +3301,7 @@ impl CollabSession {
             sheets_changed: Vec::new(),
             sheets_removed,
             formats_added,
+            styles_added,
             version: current_version_bytes,
             full_rebuild_required: false,
             // 6.3-1c: a successful incremental delta — no rebuild, no reason.
@@ -4755,6 +4946,182 @@ fn session_format_id_from_json(id: FormatIdJson) -> Result<ql_session::FormatId>
     }
 }
 
+// ===== FE-4 W4 (2026-06-10): Style DTO conversions (napi ↔ ql_session) =====
+
+/// Map a [`ql_session::StyleId`] to the JS [`StyleIdJson`] (peer widened to
+/// BigInt; counter as f64).
+fn style_id_json_from_session(id: ql_session::StyleId) -> StyleIdJson {
+    StyleIdJson {
+        peer: BigInt::from(id.peer),
+        counter: id.counter as f64,
+    }
+}
+
+/// Build a validated [`ql_session::StyleId`] from a JS [`StyleIdJson`]
+/// (`setStyle` path). `peer` is a non-negative, lossless `u64`; `counter` is a
+/// `u32` validated via [`validate_u32_index`] (No-Fallbacks — no silent
+/// coercion). Mirrors the `custom` arm of [`session_format_id_from_json`].
+fn session_style_id_from_json(id: StyleIdJson) -> Result<ql_session::StyleId> {
+    let StyleIdJson { peer, counter } = id;
+    let (sign_bit, peer, lossless) = peer.get_u64();
+    if sign_bit {
+        return Err(bad_argument_error(
+            "setStyle: style id peer must be a non-negative BigInt".into(),
+        ));
+    }
+    if !lossless {
+        return Err(bad_argument_error(
+            "setStyle: style id peer exceeds u64::MAX (lossy conversion rejected)".into(),
+        ));
+    }
+    let counter = validate_u32_index("setStyle", "counter", counter)?;
+    Ok(ql_session::StyleId { peer, counter })
+}
+
+/// Validate a single u8 color channel from an f64 (no-coercion discipline).
+fn validate_u8_channel(method: &str, name: &str, value: f64) -> Result<u8> {
+    let v = validate_u32_index(method, name, value)?;
+    if v > u8::MAX as u32 {
+        return Err(bad_argument_error(format!(
+            "{method}: {name} must be in [0, 255], got {v}"
+        )));
+    }
+    Ok(v as u8)
+}
+
+fn rgb_json_from_session(c: ql_session::Rgb) -> RgbJson {
+    RgbJson {
+        r: c.r as f64,
+        g: c.g as f64,
+        b: c.b as f64,
+    }
+}
+
+fn session_rgb_from_json(method: &str, c: RgbJson) -> Result<ql_session::Rgb> {
+    Ok(ql_session::Rgb {
+        r: validate_u8_channel(method, "color.r", c.r)?,
+        g: validate_u8_channel(method, "color.g", c.g)?,
+        b: validate_u8_channel(method, "color.b", c.b)?,
+    })
+}
+
+fn halign_str_from_session(a: ql_session::HAlign) -> &'static str {
+    match a {
+        ql_session::HAlign::General => "general",
+        ql_session::HAlign::Left => "left",
+        ql_session::HAlign::Center => "center",
+        ql_session::HAlign::Right => "right",
+    }
+}
+
+fn session_halign_from_str(method: &str, s: &str) -> Result<ql_session::HAlign> {
+    match s {
+        "general" => Ok(ql_session::HAlign::General),
+        "left" => Ok(ql_session::HAlign::Left),
+        "center" => Ok(ql_session::HAlign::Center),
+        "right" => Ok(ql_session::HAlign::Right),
+        other => Err(bad_argument_error(format!(
+            "{method}: unsupported align '{other}' (expected general|left|center|right)"
+        ))),
+    }
+}
+
+fn border_style_str_from_session(s: ql_session::BorderStyle) -> &'static str {
+    match s {
+        ql_session::BorderStyle::None => "none",
+        ql_session::BorderStyle::Thin => "thin",
+        ql_session::BorderStyle::Medium => "medium",
+        ql_session::BorderStyle::Thick => "thick",
+        ql_session::BorderStyle::Dashed => "dashed",
+        ql_session::BorderStyle::Dotted => "dotted",
+        ql_session::BorderStyle::Double => "double",
+    }
+}
+
+fn session_border_style_from_str(method: &str, s: &str) -> Result<ql_session::BorderStyle> {
+    match s {
+        "none" => Ok(ql_session::BorderStyle::None),
+        "thin" => Ok(ql_session::BorderStyle::Thin),
+        "medium" => Ok(ql_session::BorderStyle::Medium),
+        "thick" => Ok(ql_session::BorderStyle::Thick),
+        "dashed" => Ok(ql_session::BorderStyle::Dashed),
+        "dotted" => Ok(ql_session::BorderStyle::Dotted),
+        "double" => Ok(ql_session::BorderStyle::Double),
+        other => Err(bad_argument_error(format!(
+            "{method}: unsupported border style '{other}' \
+             (expected none|thin|medium|thick|dashed|dotted|double)"
+        ))),
+    }
+}
+
+fn border_edge_json_from_session(e: ql_session::BorderEdge) -> BorderEdgeJson {
+    BorderEdgeJson {
+        style: border_style_str_from_session(e.style).to_string(),
+        color: rgb_json_from_session(e.color),
+    }
+}
+
+/// Convert an optional JS border edge → DTO. Absent ⇒ a no-border edge (the
+/// `BorderEdge::default()` equivalent).
+fn session_border_edge_from_json(
+    method: &str,
+    e: Option<BorderEdgeJson>,
+) -> Result<ql_session::BorderEdge> {
+    match e {
+        None => Ok(ql_session::BorderEdge::default()),
+        Some(e) => Ok(ql_session::BorderEdge {
+            style: session_border_style_from_str(method, &e.style)?,
+            color: session_rgb_from_json(method, e.color)?,
+        }),
+    }
+}
+
+fn style_json_from_session(s: ql_session::Style) -> StyleJson {
+    StyleJson {
+        bold: s.bold,
+        italic: s.italic,
+        fill: s.fill.map(rgb_json_from_session),
+        align: Some(halign_str_from_session(s.align).to_string()),
+        border_top: Some(border_edge_json_from_session(s.borders.top)),
+        border_bottom: Some(border_edge_json_from_session(s.borders.bottom)),
+        border_left: Some(border_edge_json_from_session(s.borders.left)),
+        border_right: Some(border_edge_json_from_session(s.borders.right)),
+    }
+}
+
+/// Build a validated [`ql_session::Style`] from a JS [`StyleJson`]
+/// (`registerStyle` path). Absent optional fields default to no-fill /
+/// general / no-border (No-Fallbacks: present-but-malformed values throw).
+fn session_style_from_json(method: &str, s: StyleJson) -> Result<ql_session::Style> {
+    let fill = match s.fill {
+        None => None,
+        Some(c) => Some(session_rgb_from_json(method, c)?),
+    };
+    let align = match s.align.as_deref() {
+        None => ql_session::HAlign::General,
+        Some(a) => session_halign_from_str(method, a)?,
+    };
+    Ok(ql_session::Style {
+        bold: s.bold,
+        italic: s.italic,
+        fill,
+        align,
+        borders: ql_session::Borders {
+            top: session_border_edge_from_json(method, s.border_top)?,
+            bottom: session_border_edge_from_json(method, s.border_bottom)?,
+            left: session_border_edge_from_json(method, s.border_left)?,
+            right: session_border_edge_from_json(method, s.border_right)?,
+        },
+    })
+}
+
+fn style_def_json_from_session(sd: ql_session::StyleDef) -> StyleDefJson {
+    StyleDefJson {
+        id: style_id_json_from_session(sd.id),
+        style: style_json_from_session(sd.style),
+    }
+}
+
 /// **Phase 6.3-2a (2026-05-30):** build a validated [`ql_session::CellRange`]
 /// from a JS-supplied [`CellRangeJson`] for `queryRange`. `sheet` is a `u16`
 /// `SheetId`; the four bounds are `u32` `RowId`/`ColId` — same
@@ -4826,6 +5193,7 @@ fn session_op_from_json(method: &str, op: SessionOpJson) -> Result<ql_session::s
         value,
         text,
         format,
+        style,
         ..
     } = op;
     let reject_extra = |present: bool, field: &str, kind: &str| -> Result<()> {
@@ -4840,6 +5208,7 @@ fn session_op_from_json(method: &str, op: SessionOpJson) -> Result<ql_session::s
         "setValue" => {
             reject_extra(text.is_some(), "text", "setValue")?;
             reject_extra(format.is_some(), "format", "setValue")?;
+            reject_extra(style.is_some(), "style", "setValue")?;
             let value = value.ok_or_else(|| {
                 bad_argument_error(format!(
                     "{method}: SessionOp kind 'setValue' requires a 'value' field"
@@ -4851,6 +5220,7 @@ fn session_op_from_json(method: &str, op: SessionOpJson) -> Result<ql_session::s
         "setFormula" => {
             reject_extra(value.is_some(), "value", "setFormula")?;
             reject_extra(format.is_some(), "format", "setFormula")?;
+            reject_extra(style.is_some(), "style", "setFormula")?;
             let text = text.ok_or_else(|| {
                 bad_argument_error(format!(
                     "{method}: SessionOp kind 'setFormula' requires a 'text' field"
@@ -4862,11 +5232,13 @@ fn session_op_from_json(method: &str, op: SessionOpJson) -> Result<ql_session::s
             reject_extra(value.is_some(), "value", "clear")?;
             reject_extra(text.is_some(), "text", "clear")?;
             reject_extra(format.is_some(), "format", "clear")?;
+            reject_extra(style.is_some(), "style", "clear")?;
             Ok(SessionOp::Clear { addr })
         }
         "setFormat" => {
             reject_extra(value.is_some(), "value", "setFormat")?;
             reject_extra(text.is_some(), "text", "setFormat")?;
+            reject_extra(style.is_some(), "style", "setFormat")?;
             let format = format.ok_or_else(|| {
                 bad_argument_error(format!(
                     "{method}: SessionOp kind 'setFormat' requires a 'format' field"
@@ -4875,9 +5247,22 @@ fn session_op_from_json(method: &str, op: SessionOpJson) -> Result<ql_session::s
             let format = session_format_id_from_json(format)?;
             Ok(SessionOp::SetFormat { addr, format })
         }
+        // **FE-4 W4 (2026-06-10):** the cell-style op (mirrors setFormat).
+        "setStyle" => {
+            reject_extra(value.is_some(), "value", "setStyle")?;
+            reject_extra(text.is_some(), "text", "setStyle")?;
+            reject_extra(format.is_some(), "format", "setStyle")?;
+            let style = style.ok_or_else(|| {
+                bad_argument_error(format!(
+                    "{method}: SessionOp kind 'setStyle' requires a 'style' field"
+                ))
+            })?;
+            let style = session_style_id_from_json(style)?;
+            Ok(SessionOp::SetStyle { addr, style })
+        }
         other => Err(bad_argument_error(format!(
             "{method}: unknown SessionOp kind '{other}' \
-             (expected setValue|setFormula|clear|setFormat)"
+             (expected setValue|setFormula|clear|setFormat|setStyle)"
         ))),
     }
 }
@@ -4967,6 +5352,8 @@ fn cell_snapshot_json_from_session(c: ql_session::CellSnapshot) -> CellSnapshotJ
         value: c.value.map(cell_value_json_from_session),
         formula: c.formula,
         format: c.format.map(format_id_json_from_session),
+        // FE-4 W4: the cell-style id passthrough (owning-Session path).
+        style_id: c.style.map(style_id_json_from_session),
         rendered: c.rendered,
     }
 }
@@ -5005,6 +5392,12 @@ fn workbook_snapshot_json_from_session(snap: ql_session::WorkbookSnapshot) -> Wo
                 id: format_id_json_from_session(fd.id),
                 string: fd.string,
             })
+            .collect(),
+        // FE-4 W4: the session-wide style table.
+        styles: snap
+            .styles
+            .into_iter()
+            .map(style_def_json_from_session)
             .collect(),
         date_system: date_system.to_string(),
         version: Buffer::from(snap.version.0),
@@ -5057,6 +5450,12 @@ fn workbook_snapshot_delta_json_from_session(
                 id: format_id_json_from_session(fd.id),
                 string: fd.string,
             })
+            .collect(),
+        // FE-4 W4: styles registered since lastSeenVersion.
+        styles_added: delta
+            .styles_added
+            .into_iter()
+            .map(style_def_json_from_session)
             .collect(),
         version: Buffer::from(delta.version.0),
         full_rebuild_required: delta.full_rebuild_required,
@@ -5289,6 +5688,9 @@ pub struct SessionOpJson {
     pub value: Option<CellValueJson>,
     pub text: Option<String>,
     pub format: Option<FormatIdJson>,
+    /// **FE-4 W4 (2026-06-10):** required for `kind == "setStyle"`; the
+    /// registered style id to bind (from `registerStyle`).
+    pub style: Option<StyleIdJson>,
 }
 
 /// **Phase 6.3-2e (2026-05-30):** options for `batch` (mirrors
@@ -6309,6 +6711,48 @@ impl Session {
                 .register_format(&format_string)
                 .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(format_id_json_from_session(id))
+        })
+    }
+
+    /// **FE-4 W4 (2026-06-10):** set a cell's visual style to a registered
+    /// [`StyleIdJson`] (from [`Self::register_style`]). `bad_argument` for
+    /// invalid coords or an unknown/malformed style id. The visual-formatting
+    /// analog of [`Self::set_format`]; lands on the OWNING `Session` (the
+    /// product grid's session — NOT the dormant `CollabSession`).
+    #[napi(js_name = "setStyle", catch_unwind)]
+    pub fn set_style(
+        &self,
+        env: Env,
+        sheet: f64,
+        row: f64,
+        col: f64,
+        style_id: StyleIdJson,
+    ) -> Result<()> {
+        guarded(env, "setStyle", || {
+            let addr = session_addr_from_f64("setStyle", sheet, row, col)?;
+            let id = session_style_id_from_json(style_id)?;
+            self.inner
+                .lock()
+                .set_style(addr, id)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// **FE-4 W4 (2026-06-10):** register a session-wide cell style, returning
+    /// its [`StyleIdJson`] for use with [`Self::set_style`]. `bad_argument` for
+    /// a malformed style (e.g. an unknown align/border-style string). The
+    /// visual-formatting analog of [`Self::register_format`]. Idempotent —
+    /// re-registering an identical style returns the same id.
+    #[napi(js_name = "registerStyle", catch_unwind)]
+    pub fn register_style(&self, env: Env, style: StyleJson) -> Result<StyleIdJson> {
+        guarded(env, "registerStyle", || {
+            let style = session_style_from_json("registerStyle", style)?;
+            let id = self
+                .inner
+                .lock()
+                .register_style(style)
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(style_id_json_from_session(id))
         })
     }
 

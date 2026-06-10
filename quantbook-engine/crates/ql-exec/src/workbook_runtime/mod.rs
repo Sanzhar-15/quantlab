@@ -61,6 +61,7 @@ mod formats;
 mod names;
 mod recompute;
 mod sheets;
+mod styles;
 mod tables;
 mod validate;
 pub use error::{RecomputeFailure, RecomputeResult, RuntimeError};

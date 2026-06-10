@@ -332,6 +332,13 @@ pub struct Workbook {
     /// `docs/architecture/2026-05-13-format-string-grammar.md` § 10
     /// (parser-relevant subset).
     formats: crate::FormatTable,
+    /// **FE-4 W4 (2026-06-10):** workbook-level cell-STYLE interning table
+    /// (the visual-formatting analog of `formats`). Cells with a non-default
+    /// style reference a [`crate::StyleId`] into this table via the per-sheet
+    /// [`crate::CellStyleOverlay`]. Empty by default (no Excel built-in styles
+    /// to pre-seed, unlike `formats`). Mutation goes through
+    /// `WorkbookRuntime::intern_style`; direct access is for the loader + tests.
+    styles: crate::StyleTable,
     /// **W5-101 (Phase 4.7.H):** spill-anchor table. Workbook-level
     /// because spills can theoretically span sheets (rare in Excel; v1
     /// keeps single-sheet but the table doesn't assume). Map-only by
@@ -484,6 +491,20 @@ impl Workbook {
     /// op log; direct access stays available for the loader + tests.
     pub fn formats_mut(&mut self) -> &mut crate::FormatTable {
         &mut self.formats
+    }
+
+    /// **FE-4 W4 (2026-06-10):** read access to the workbook's cell-style
+    /// interning table.
+    pub fn styles(&self) -> &crate::StyleTable {
+        &self.styles
+    }
+
+    /// **FE-4 W4 (2026-06-10):** mutable access for `intern` / `register_at`.
+    /// Production callers route through `WorkbookRuntime::intern_style` so
+    /// allocations land in the op log; direct access stays available for the
+    /// loader + tests (mirrors [`Self::formats_mut`]).
+    pub fn styles_mut(&mut self) -> &mut crate::StyleTable {
+        &mut self.styles
     }
 
     pub fn sheet_count(&self) -> usize {

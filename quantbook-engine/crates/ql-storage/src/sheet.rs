@@ -33,6 +33,12 @@ pub struct Sheet {
     /// `workbook.formats().lookup(id)` to get the format-string, parse,
     /// and render.
     format_overlay: crate::CellFormatOverlay,
+    /// **FE-4 W4 (2026-06-10):** per-sheet sparse cell-STYLE overlay (the
+    /// visual-formatting analog of `format_overlay`). Cells without an entry
+    /// render via `Style::default()` (no styling). Resolution: lookup the id
+    /// here, then `workbook.styles().lookup(id)` to get the `Style` value.
+    /// Re-keyed by `shift_rows`/`shift_columns` exactly like `format_overlay`.
+    style_overlay: crate::CellStyleOverlay,
     /// **W5-92 (Phase 4.6.D):** sheet-scoped defined names. Lookup
     /// resolves sheet-scoped names first, then falls back to the
     /// workbook-scoped table; this is the storage half of that chain.
@@ -56,6 +62,7 @@ impl Sheet {
             bounds: Bounds::default(),
             chunk_rows,
             format_overlay: crate::CellFormatOverlay::new(),
+            style_overlay: crate::CellStyleOverlay::new(),
             scoped_names: NameTable::new(),
         }
     }
@@ -73,6 +80,20 @@ impl Sheet {
     /// loader + tests.
     pub fn format_overlay_mut(&mut self) -> &mut crate::CellFormatOverlay {
         &mut self.format_overlay
+    }
+
+    /// **FE-4 W4 (2026-06-10):** read access to the per-sheet cell-STYLE
+    /// overlay (the visual-formatting analog of [`Self::format_overlay`]).
+    pub fn style_overlay(&self) -> &crate::CellStyleOverlay {
+        &self.style_overlay
+    }
+
+    /// **FE-4 W4 (2026-06-10):** mutable access for `set` / `clear`.
+    /// Production callers route through `WorkbookRuntime::set_cell_style` so
+    /// they emit `Op::SetCellStyle`; direct access stays available for the
+    /// loader + tests (mirrors [`Self::format_overlay_mut`]).
+    pub fn style_overlay_mut(&mut self) -> &mut crate::CellStyleOverlay {
+        &mut self.style_overlay
     }
 
     pub fn name(&self) -> &str {
@@ -311,6 +332,11 @@ impl Sheet {
         }
         self.format_overlay
             .shift_axis(true, |r| shift.map_public(r, ql_types::MAX_ROW));
+        // **FE-4 W4:** the cell-style overlay re-keys on the SAME axis or
+        // styles orphan on every row insert/delete (the wave-3 overlay-orphan
+        // class). MUST stay paired with the format_overlay shift above.
+        self.style_overlay
+            .shift_axis(true, |r| shift.map_public(r, ql_types::MAX_ROW));
         self.recompute_bounds();
     }
 
@@ -350,6 +376,11 @@ impl Sheet {
             }
         }
         self.format_overlay
+            .shift_axis(false, |c| shift.map_public(c, ql_types::MAX_COLUMN));
+        // **FE-4 W4:** the cell-style overlay re-keys on the column axis too,
+        // or styles orphan on every column insert/delete. MUST stay paired
+        // with the format_overlay shift above.
+        self.style_overlay
             .shift_axis(false, |c| shift.map_public(c, ql_types::MAX_COLUMN));
         self.recompute_bounds();
     }
@@ -812,5 +843,57 @@ mod tests {
         s.shift_rows(AxisShift::Delete { start: 2, end: 2 });
         // The format entry's cell was deleted → no orphan.
         assert_eq!(s.format_overlay().len(), 0);
+    }
+
+    // ===== FE-4 W4 — style overlay re-keys on row + column shifts =====
+
+    #[test]
+    fn shift_rows_rekeys_style_overlay_no_orphans() {
+        use crate::StyleId;
+        use ql_types::LEGACY_PEER;
+        let mut s = Sheet::with_chunk_rows("S", 16);
+        let sid = StyleId::new(LEGACY_PEER, 0);
+        s.put(3, 0, Value::Number(1.0));
+        s.style_overlay_mut().set(3, 0, sid);
+        s.shift_rows(AxisShift::Insert { at: 0, count: 1 });
+        // Entry must have moved to row 4, not orphaned at row 3.
+        assert_eq!(s.style_overlay().get(4, 0), Some(sid));
+        assert_eq!(s.style_overlay().get(3, 0), None);
+        assert_eq!(s.style_overlay().len(), 1);
+    }
+
+    #[test]
+    fn delete_rows_drops_style_overlay_entry_in_block() {
+        use crate::StyleId;
+        use ql_types::LEGACY_PEER;
+        let mut s = Sheet::with_chunk_rows("S", 16);
+        s.style_overlay_mut()
+            .set(2, 0, StyleId::new(LEGACY_PEER, 0));
+        s.shift_rows(AxisShift::Delete { start: 2, end: 2 });
+        assert_eq!(s.style_overlay().len(), 0);
+    }
+
+    #[test]
+    fn shift_columns_rekeys_style_overlay_no_orphans() {
+        use crate::StyleId;
+        use ql_types::LEGACY_PEER;
+        let mut s = Sheet::with_chunk_rows("S", 16);
+        let sid = StyleId::new(LEGACY_PEER, 2);
+        s.style_overlay_mut().set(0, 3, sid);
+        s.shift_columns(AxisShift::Insert { at: 0, count: 1 });
+        assert_eq!(s.style_overlay().get(0, 4), Some(sid));
+        assert_eq!(s.style_overlay().get(0, 3), None);
+        assert_eq!(s.style_overlay().len(), 1);
+    }
+
+    #[test]
+    fn delete_columns_drops_style_overlay_entry_in_block() {
+        use crate::StyleId;
+        use ql_types::LEGACY_PEER;
+        let mut s = Sheet::with_chunk_rows("S", 16);
+        s.style_overlay_mut()
+            .set(0, 2, StyleId::new(LEGACY_PEER, 0));
+        s.shift_columns(AxisShift::Delete { start: 2, end: 2 });
+        assert_eq!(s.style_overlay().len(), 0);
     }
 }
