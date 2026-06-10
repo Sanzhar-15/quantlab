@@ -67,11 +67,24 @@ Option B (code-driven chart view):
 - **OS clipboard**: copy a range → paste into Excel/Sheets/Numbers (TSV of display values);
   paste TSV from another app into the grid. (A cut pastes ONCE, like Excel.)
 
+## What WORKS since FE-4 (2026-06-10 — these are real, via menu/keyboard NOT the toolbar buttons)
+
+- **Replace-All**: **Ctrl/Cmd+H** → workbook find/replace (formula cells matched on value are listed but
+  NOT clobbered unless "in formulas" is on; modal confirm before applying).
+- **Sort a range**: select a rect → **right-click → "Sort Range A→Z / Z→A"** (or the palette). REFUSES
+  (loud, no writes) if any cell in the rect is a formula — so it never silently corrupts. Number-formats do
+  not travel with sorted rows yet (FE-5).
+- **Define Name**: select a range → **palette "Quantbook: Define Name…"** or **right-click → Define Name**
+  (this was palette-invisible until the `ca0fadd9e23` fix — confirm it shows). Define only; no manager yet.
+- **Fill**: **Ctrl/Cmd+D** (down) / **Ctrl/Cmd+R** (right) over a selection — formulas translate their refs.
+- **F4** in the formula editor cycles a ref's `$` anchors (`A1→$A$1→A$1→$A1`).
+
 ## DO NOT touch during the demo (preview-only; they show a small toast)
 
-- Toolbar: **borders / merge / wrap / vertical-align / font selects / filter / sort / zoom /
-  decimals / paint-format / print** — clicking shows a neutral "not available in this
-  preview" toast (engine-greenfield; FE-4/FE-5).
+- Toolbar **buttons**: **borders / merge / wrap / vertical-align / font selects / filter / zoom /
+  decimals / paint-format / print** — clicking shows a neutral "not available in this preview" toast
+  (engine-greenfield; FE-5). NOTE: the toolbar **sort** button is also a preview toast, but sort itself
+  WORKS via the right-click menu (above) — use that, not the toolbar button, on stage.
 - Column/row **resize** is not wired (the resize cursor was removed on purpose).
 - Don't switch sheets while a cell editor is open (guarded, but don't tempt it).
 - Don't use cross-sheet references in formulas unless rehearsed.
