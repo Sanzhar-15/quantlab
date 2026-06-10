@@ -310,6 +310,9 @@
         "_comment": "FE-4 W1: Define Name over the current selection (setName; delta-invisible -> confirmation toast).",
         "command": "quantlab.quantbookDefineName",
         "title": "%command.quantbookDefineName.title%",
+        "category": "%command.category%"
+      },
+      {
         "_comment": "FE-4 W2: sort the focused grid's selected range by a key column, ascending (A to Z).",
         "command": "quantlab.quantbookSortRangeAsc",
         "title": "%command.quantbookSortRangeAsc.title%",

@@ -72,7 +72,7 @@ interface LocatedRef {
 	readonly start: number; // index of the first char of the ref (a `$` or the first column letter)
 	readonly end: number; // index just past the last row digit
 	readonly colAbs: boolean;
-	readonly colLetters: string; // the column letters AS WRITTEN (case preserved on re-emit via columnLabel)
+	readonly colLetters: string; // the column letters AS WRITTEN (re-emitted UPPERCASE-canonical via columnLabel, matching the toolchain)
 	readonly rowAbs: boolean;
 	readonly rowDigits: string; // the row digits as written
 }
