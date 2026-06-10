@@ -331,6 +331,9 @@
         "_comment": "W3 frozen panes: clear all frozen rows/columns in the focused grid.",
         "command": "quantlab.quantbookUnfreezePanes",
         "title": "%command.quantbookUnfreezePanes.title%",
+        "category": "%command.category%"
+      },
+      {
         "_comment": "W3 (Wave 3): Cell Grid context-menu clipboard commands -- route to the focused webview's clipboard logic.",
         "command": "quantlab.quantbookCellGridCut",
         "title": "%command.quantbookCellGridCut.title%",
