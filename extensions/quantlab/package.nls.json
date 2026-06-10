@@ -38,6 +38,8 @@
 	"command.quantbookBindReactiveNotebook.title": "Quantbook: Bind Reactive Notebook to Grid",
 	"command.quantbookBindVariableToSelectedCell.title": "Quantbook: Bind Variable to Selected Cell",
 	"command.quantbookSetFormat.title": "Quantbook: Set Cell Format",
+	"command.quantbookSortRangeAsc.title": "Quantbook: Sort Range A to Z",
+	"command.quantbookSortRangeDesc.title": "Quantbook: Sort Range Z to A",
 	"command.quantbookFreezePanes.title": "Quantbook: Freeze Panes at Selection",
 	"command.quantbookUnfreezePanes.title": "Quantbook: Unfreeze Panes",
 	"command.quantbookCellGridCut.title": "Cut",

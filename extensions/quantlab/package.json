@@ -295,6 +295,18 @@
         "category": "%command.category%"
       },
       {
+        "_comment": "FE-4 W2: sort the focused grid's selected range by a key column, ascending (A to Z).",
+        "command": "quantlab.quantbookSortRangeAsc",
+        "title": "%command.quantbookSortRangeAsc.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "FE-4 W2: sort the focused grid's selected range by a key column, descending (Z to A).",
+        "command": "quantlab.quantbookSortRangeDesc",
+        "title": "%command.quantbookSortRangeDesc.title%",
+        "category": "%command.category%"
+      },
+      {
         "_comment": "W3 frozen panes: Excel Freeze Panes at the focused grid's active cell.",
         "command": "quantlab.quantbookFreezePanes",
         "title": "%command.quantbookFreezePanes.title%",
@@ -1072,6 +1084,17 @@
           "command": "quantlab.quantbookDeleteColumn",
           "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@6"
+        },
+        {
+          "_comment": "FE-4 W2: sort the selected range by a key column. Group 5_data is the new data-ops group below structure (1=clipboard, 2=edit, 3=format, 4=structure, 5=data). Palette-visible (NOT in the commandPalette when:false list).",
+          "command": "quantlab.quantbookSortRangeAsc",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "5_data@1"
+        },
+        {
+          "command": "quantlab.quantbookSortRangeDesc",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "5_data@2"
         }
       ]
     },
