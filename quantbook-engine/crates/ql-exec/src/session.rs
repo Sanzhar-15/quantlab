@@ -114,6 +114,7 @@ use ql_session::session::{
 };
 use ql_session::SCHEMA_VERSION;
 
+use crate::structural::{build_structural_batch, StructuralAxis, StructuralError, StructuralKind};
 use crate::{bind_with_site, BindSite, CalcgraphSession, PlanCache, RuntimeError, WorkbookRuntime};
 
 /// Process-global epoch source. A fresh epoch is minted per session
@@ -3432,7 +3433,13 @@ impl EngineSession for WorkbookSession {
                     ),
                 ))
             }
-            Some(e) => (e.kind, e.revision, e.data.clone(), e.target, e.cells.clone()),
+            Some(e) => (
+                e.kind,
+                e.revision,
+                e.data.clone(),
+                e.target,
+                e.cells.clone(),
+            ),
         };
 
         // ENG-FUSION: a published dataset (`qb.publish`) has an EXTERNAL producer (a
@@ -3625,6 +3632,136 @@ impl EngineSession for WorkbookSession {
 }
 
 impl WorkbookSession {
+    // ========================================================================
+    // W3 (insert/delete rows & columns) — structural-axis edits on the OWNING
+    // session.
+    //
+    // These are the methods the PRODUCT grid actually runs on (the napi
+    // `Session` wraps this `WorkbookSession`; the dormant `CollabSession` is
+    // v1.5). They mirror the structural-SHEET-op pattern (`delete_sheet` /
+    // `restore_sheet` / `move_sheet`): append the op to the session's own
+    // op-log under a `FaultGuard`, then `rematerialize` (replay the log →
+    // fresh workbook with the structural edit + the rewritten formula text
+    // applied, rebuild the calcgraph, recompute, and bump the epoch so the
+    // grid full-re-snapshots — the change is not delta-expressible).
+    //
+    // The op vector is built by `crate::structural::build_structural_batch`,
+    // the SAME 7-audit-pass producer core the `CollabSession` napi path uses —
+    // it validates the sheet, clone-preflights the positional edit, and emits
+    // `[structural_op, PutFormula×N]` where each PutFormula carries the
+    // ref-FOLLOWED rewritten text at the cell's POST-shift position. Reusing it
+    // (rather than re-deriving) is deliberate: this is silent-data-corruption-
+    // class logic and duplication re-opens the bug surface.
+    //
+    // No-Fallbacks: a malformed edit (count==0 / off-grid / table-split /
+    // missing/tombstoned sheet) is surfaced loud as a `[bad_argument]`
+    // `EngineError` by the preflight — never a silent no-op.
+    // ========================================================================
+
+    /// Insert `count` blank rows at row index `at` on `sheet`. Rows at/below
+    /// `at` shift down; formulas referencing the edited sheet have their refs
+    /// rewritten to follow. `count == 0` / off-grid / table-split → loud
+    /// `[bad_argument]`. `[invalid_state]` off a Ready session; `[sheet_not_found]`
+    /// for an unknown sheet.
+    pub fn insert_rows(&mut self, sheet: SheetId, at: RowId, count: u32) -> EngineResult<()> {
+        self.apply_structural_edit(
+            sheet,
+            StructuralAxis::Row,
+            StructuralKind::Insert { at, count },
+            ql_types::MAX_ROW,
+        )
+    }
+
+    /// Delete the INCLUSIVE row block `[start, end]` on `sheet`. Rows below
+    /// `end` shift up; refs into the deleted block become `#REF!`. `start > end`
+    /// / off-grid / table-split → loud `[bad_argument]`.
+    pub fn delete_rows(&mut self, sheet: SheetId, start: RowId, end: RowId) -> EngineResult<()> {
+        self.apply_structural_edit(
+            sheet,
+            StructuralAxis::Row,
+            StructuralKind::Delete { start, end },
+            ql_types::MAX_ROW,
+        )
+    }
+
+    /// Insert `count` blank columns at column index `at` on `sheet`. See
+    /// [`Self::insert_rows`] for the producer model.
+    pub fn insert_columns(&mut self, sheet: SheetId, at: ColId, count: u32) -> EngineResult<()> {
+        self.apply_structural_edit(
+            sheet,
+            StructuralAxis::Col,
+            StructuralKind::Insert { at, count },
+            ql_types::MAX_COLUMN,
+        )
+    }
+
+    /// Delete the INCLUSIVE column block `[start, end]` on `sheet`. See
+    /// [`Self::delete_rows`] for the producer model.
+    pub fn delete_columns(&mut self, sheet: SheetId, start: ColId, end: ColId) -> EngineResult<()> {
+        self.apply_structural_edit(
+            sheet,
+            StructuralAxis::Col,
+            StructuralKind::Delete { start, end },
+            ql_types::MAX_COLUMN,
+        )
+    }
+
+    /// Shared driver for the four structural-axis edits. Gate Ready, require the
+    /// sheet exists, build the audited `[structural_op, PutFormula×N]` batch,
+    /// append it as a single `Op::BatchCommit` under a `FaultGuard`, then
+    /// `rematerialize` (replay → recompute → epoch bump).
+    fn apply_structural_edit(
+        &mut self,
+        sheet: SheetId,
+        axis: StructuralAxis,
+        kind: StructuralKind,
+        axis_max: u32,
+    ) -> EngineResult<()> {
+        self.ensure_ready()?;
+        // Fail-loud: an unknown sheet id → NotFound (consistent with the
+        // sheet-op surface). `build_structural_batch` ALSO rejects a missing /
+        // tombstoned sheet, but checking here keeps the error class identical
+        // (`sheet_not_found` NotFound) to the rest of the structure surface and
+        // short-circuits before the clone-preflight allocation.
+        self.require_sheet_exists(sheet, "structural_edit")?;
+        // Build the audited op batch (validate + clone-preflight + per-formula
+        // text-shift + assembly). A rejection here is a caller-input problem →
+        // map to `[bad_argument]` (No-Fallbacks: never a silent no-op).
+        let ops = build_structural_batch(&self.workbook, sheet, axis, kind, axis_max)
+            .map_err(map_structural_err)?;
+        // **6.1C audit-fix M3 pattern (see `delete_sheet`):** bracket the op-log
+        // append with a `FaultGuard` so a panic mid-flight transitions the
+        // session → `Faulted` rather than leaving `state = Ready` with the
+        // op-log torn from the workbook. A graceful `Err` from `oplog.append`
+        // disarms before propagating; only an actual unwind trips the fault.
+        {
+            let mut guard = FaultGuard {
+                state: &mut self.state,
+                armed: true,
+            };
+            match self
+                .oplog
+                .append(Op::BatchCommit { ops })
+                .map_err(oplog_append_err)
+            {
+                Ok(()) => {
+                    guard.armed = false;
+                }
+                Err(e) => {
+                    guard.armed = false;
+                    return Err(e);
+                }
+            }
+        }
+        // Replay the op-log → fresh workbook with the structural edit + the
+        // rewritten formula TEXT applied, rebuild the calcgraph, recompute
+        // computed values, and bump the epoch. A structural edit moves many
+        // cells the delta DTO cannot express, so the epoch bump → full
+        // re-snapshot is the correct delta behavior (like `restore_sheet`).
+        self.rematerialize()?;
+        Ok(())
+    }
+
     /// **ENG-FUSION:** the `CellRange` a `binding_id` is bound to, if any — the read
     /// accessor for the `bind_range` registry (used by tests and the FE/kernel to
     /// resolve a `BoundFrame`'s region for round-trip reads).
@@ -3922,6 +4059,24 @@ fn oplog_append_err(e: ql_oplog::OpLogError) -> EngineError {
     map_oplog_err(e, msg)
 }
 
+/// **W3 (insert/delete rows & columns):** map a [`StructuralError`] from the
+/// shared `structural::build_structural_batch` producer to an `EngineError`.
+///
+/// Every variant is a caller-input rejection (a missing sheet, a tombstoned
+/// sheet, or a positional preflight failure — count==0, off-grid, table-split,
+/// inverted range) surfaced loudly BEFORE any op is appended, so all map to
+/// `BadArgument` (No-Fallbacks: a producer rejection always surfaces, never a
+/// silent no-op). The `code` distinguishes the class for IDE diagnostics; the
+/// `message` carries the precise detail from the producer.
+fn map_structural_err(e: StructuralError) -> EngineError {
+    let code = match e {
+        StructuralError::SheetMissing { .. } => "sheet_not_found",
+        StructuralError::SheetTombstoned { .. } => "sheet_tombstoned",
+        StructuralError::Preflight { .. } => "structural_edit_rejected",
+    };
+    EngineError::new(ErrorClass::BadArgument, code, e.message().to_string())
+}
+
 /// Map a `ql_oplog::OpLogError` (surfaced via `RuntimeError::OpLog`) to an
 /// `EngineError`. `display` is the outer RuntimeError's message (preserves the
 /// "op log error: …" prefix).
@@ -4157,11 +4312,14 @@ fn parse_materialize_sql(data: &serde_json::Value) -> EngineResult<String> {
 /// present), or a non-scalar / non-finite element. An empty `values` array -> zero
 /// rows (the caller's zero-row publish path).
 fn json_block_to_cell_values(data: &serde_json::Value) -> EngineResult<Vec<Vec<CellValue>>> {
-    let rows = data.get("values").and_then(|v| v.as_array()).ok_or_else(|| {
-        EngineError::bad_argument(
-            "publish_dataset: `data` must be a JSON object with a `values` array of rows",
-        )
-    })?;
+    let rows = data
+        .get("values")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            EngineError::bad_argument(
+                "publish_dataset: `data` must be a JSON object with a `values` array of rows",
+            )
+        })?;
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -5287,11 +5445,8 @@ mod tests {
     fn provenance_recorded_after_materialize_query() {
         let mut s = WorkbookSession::new();
         let sheet = s.add_sheet("S", 16384).unwrap();
-        s.write_range(
-            rng(sheet, 0, 0, 1, 0),
-            vec![vec![num(1.0)], vec![num(2.0)]],
-        )
-        .unwrap();
+        s.write_range(rng(sheet, 0, 0, 1, 0), vec![vec![num(1.0)], vec![num(2.0)]])
+            .unwrap();
         let cursor0 = s.poll_events(EventCursor(0)).unwrap().next_cursor;
         s.materialize_query(
             "src1",
@@ -5306,7 +5461,11 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, Event::Provenance { .. }))
             .collect();
-        assert_eq!(prov_events.len(), 2, "one Provenance event per produced cell");
+        assert_eq!(
+            prov_events.len(),
+            2,
+            "one Provenance event per produced cell"
+        );
         for ev in &prov_events {
             match ev {
                 Event::Provenance { source, .. } => assert_eq!(source, "src1"),
@@ -5399,7 +5558,7 @@ mod tests {
         s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(3.0)]])
             .unwrap();
         s.set_formula(addr(sheet, 0, 2), "B1 * 10").unwrap(); // C1 = B1*10
-        // First materialization: B1 = 3 (from SELECT A FROM S).
+                                                              // First materialization: B1 = 3 (from SELECT A FROM S).
         s.materialize_query("src", rng(sheet, 0, 1, 0, 1), sql_data("SELECT A FROM S"))
             .unwrap();
         assert_eq!(cell_value(&s, addr(sheet, 0, 1)), num(3.0));
@@ -5495,7 +5654,11 @@ mod tests {
         assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(10.0));
         assert_eq!(cell_value(&s, addr(sheet, 1, 2)), num(20.0));
         assert_eq!(cell_value(&s, addr(sheet, 2, 2)), num(30.0));
-        assert_eq!(s.graph.dirty_formulas().len(), 0, "no dirty formulas after recalc");
+        assert_eq!(
+            s.graph.dirty_formulas().len(),
+            0,
+            "no dirty formulas after recalc"
+        );
 
         // Shrink: A2 = -1, A3 = -2 (both negative, filtered out by WHERE A>0).
         // C1/C2/C3 depend on B1/B2/B3, not on A2/A3, so no formula is dirtied here.
@@ -5538,7 +5701,7 @@ mod tests {
         let op2 = s.recalc_dirty().unwrap();
         assert_eq!(s.operation_status(op2).unwrap(), OperationState::Completed);
         assert_eq!(cell_value(&s, addr(sheet, 0, 2)), num(10.0)); // B1=1 → C1=10
-        // B2 was not overwritten by the shrinking refresh, so it keeps its old value.
+                                                                  // B2 was not overwritten by the shrinking refresh, so it keeps its old value.
         assert_eq!(cell_value(&s, addr(sheet, 1, 2)), num(20.0)); // B2 still=2 → C2=20
         assert_eq!(cell_value(&s, addr(sheet, 2, 2)), num(30.0)); // B3 still=3 → C3=30
     }
@@ -5557,10 +5720,16 @@ mod tests {
         )
         .unwrap();
         // Both produced cells must be in the per-cell map with source="qp", revision=0.
-        let cp0 = s.cell_provenance.get(&addr(sheet, 0, 2)).expect("cell (0,2) in map");
+        let cp0 = s
+            .cell_provenance
+            .get(&addr(sheet, 0, 2))
+            .expect("cell (0,2) in map");
         assert_eq!(cp0.source_id, "qp");
         assert_eq!(cp0.revision, 0);
-        let cp1 = s.cell_provenance.get(&addr(sheet, 1, 2)).expect("cell (1,2) in map");
+        let cp1 = s
+            .cell_provenance
+            .get(&addr(sheet, 1, 2))
+            .expect("cell (1,2) in map");
         assert_eq!(cp1.source_id, "qp");
         assert_eq!(cp1.revision, 0);
     }
@@ -5651,8 +5820,11 @@ mod tests {
 
         // Second run of q1 with a 1-row result: B1 still owned, B2 now owned by q2
         // (must not be evicted), B3 owned by q1 (must be evicted).
-        s.write_range(rng(sheet, 1, 0, 2, 0), vec![vec![num(-1.0)], vec![num(-2.0)]])
-            .unwrap();
+        s.write_range(
+            rng(sheet, 1, 0, 2, 0),
+            vec![vec![num(-1.0)], vec![num(-2.0)]],
+        )
+        .unwrap();
         s.materialize_query(
             "q1",
             rng(sheet, 0, 1, 2, 1),
@@ -5698,7 +5870,7 @@ mod tests {
         let op = s.recalc_dirty().unwrap();
         assert_eq!(s.operation_status(op).unwrap(), OperationState::Completed);
         assert_eq!(cell_value(&s, addr(sheet, 0, 3)), num(30.0)); // D1=3*10=30
-        // q2 takes over B2.
+                                                                  // q2 takes over B2.
         s.materialize_query(
             "q2",
             rng(sheet, 1, 1, 1, 1),
@@ -6013,7 +6185,11 @@ mod tests {
         // not a silent dirtied=0.
         let err0 = s.refresh_source("ds", 0).unwrap_err();
         assert_eq!(err0.class, ErrorClass::BadArgument);
-        assert!(err0.message.contains("published dataset"), "got: {}", err0.message);
+        assert!(
+            err0.message.contains("published dataset"),
+            "got: {}",
+            err0.message
+        );
     }
 
     /// A value-matrix exceeding the 1<<20-cell cap is a loud bad_argument BEFORE the
@@ -8323,6 +8499,253 @@ mod tests {
             ErrorClass::NotFound
         );
         assert_eq!(s.restore_sheet(9999).unwrap_err().code, "sheet_not_found");
+    }
+
+    // ========================================================================
+    // W3 (insert/delete rows & columns) — the REAL owning-session test.
+    //
+    // THIS is the test that would have caught the production bug: insert/delete
+    // were only wired to the dormant `CollabSession`, never to the owning
+    // `WorkbookSession` the product grid runs on. These drive the REAL
+    // `WorkbookSession` (not a mock) and assert the SILENT-CORRUPTION-class
+    // invariant: after a structural edit a formula ref FOLLOWS its target cell
+    // (a ref that stayed pointing at the old coordinate would be silent data
+    // corruption) AND the recomputed value is still correct.
+    // ========================================================================
+
+    /// Insert a blank row ABOVE a value + a formula: the value moves, the
+    /// formula cell moves, its TEXT re-points to follow its input, and the
+    /// recomputed value is preserved. The headline anti-silent-corruption test.
+    #[test]
+    fn owning_session_insert_rows_shifts_values_and_repoints_formula() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("Sheet1", 16384).unwrap();
+        // A1 = 10 (row 0), A3 = 30 (row 2), D3 = `=A3*10` (row 2, col 3) → 300.
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 2, 0), CellValue::Number { number: 30.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 2, 3), "A3*10").unwrap();
+        // Sanity: D3 == 300, text canonicalized to "A3 * 10".
+        let d3 = s.cell(addr(sheet, 2, 3)).unwrap().unwrap();
+        assert_eq!(d3.value, Some(CellValue::Number { number: 300.0 }));
+        assert_eq!(d3.formula.as_deref(), Some("A3 * 10"));
+
+        // Insert 1 blank row at index 1 (above the 2nd row). Rows >= 1 shift +1.
+        s.insert_rows(sheet, 1, 1).unwrap();
+
+        // The blank inserted row 1 is empty; A1 (row 0) is untouched.
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 10.0 })
+        );
+        assert!(
+            s.cell(addr(sheet, 1, 0)).unwrap().is_none(),
+            "inserted row 1 must be blank"
+        );
+        // The value 30 moved A3(row2) → A4(row3); the OLD A3 is now blank.
+        assert!(
+            s.cell(addr(sheet, 2, 0)).unwrap().is_none(),
+            "old A3 (row 2) must be vacated by the insert"
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 3, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 30.0 }),
+            "value 30 must move A3 → A4"
+        );
+        // The formula cell moved D3(row2) → D4(row3); its TEXT now reads
+        // "A4 * 10" (the ref FOLLOWED the cell — NOT still "A3 * 10", which
+        // would be the silent corruption), and it recomputes to 300.
+        assert!(
+            s.cell(addr(sheet, 2, 3)).unwrap().is_none(),
+            "old D3 (row 2) must be vacated by the insert"
+        );
+        let d4 = s.cell(addr(sheet, 3, 3)).unwrap().unwrap();
+        assert_eq!(
+            d4.formula.as_deref(),
+            Some("A4 * 10"),
+            "formula ref must FOLLOW its target cell (A3 → A4), not stay stale"
+        );
+        assert_eq!(
+            d4.value,
+            Some(CellValue::Number { number: 300.0 }),
+            "recomputed value must still be 300 after the shift"
+        );
+    }
+
+    /// Delete the inserted row to shift everything back: the inverse of the
+    /// insert test. The formula ref must follow the cell back (A4 → A3).
+    #[test]
+    fn owning_session_delete_rows_shifts_back_and_repoints_formula() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("Sheet1", 16384).unwrap();
+        // Author the POST-insert state directly: A1=10, A4=30, D4=`=A4*10`.
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 3, 0), CellValue::Number { number: 30.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 3, 3), "A4*10").unwrap();
+
+        // Delete the INCLUSIVE block [1, 1] (the blank row 1). Rows > 1 shift -1.
+        s.delete_rows(sheet, 1, 1).unwrap();
+
+        // A1 untouched; value 30 moved A4(row3) → A3(row2); formula D4 → D3
+        // with text "A3 * 10" (ref followed back), still 300.
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 10.0 })
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 2, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 30.0 }),
+            "value 30 must move A4 → A3 on delete"
+        );
+        let d3 = s.cell(addr(sheet, 2, 3)).unwrap().unwrap();
+        assert_eq!(
+            d3.formula.as_deref(),
+            Some("A3 * 10"),
+            "formula ref must follow the cell back (A4 → A3)"
+        );
+        assert_eq!(d3.value, Some(CellValue::Number { number: 300.0 }));
+    }
+
+    /// Insert a blank COLUMN to the left of a value + formula: the column
+    /// analog of the row insert test (refs shift on the col axis).
+    #[test]
+    fn owning_session_insert_columns_shifts_values_and_repoints_formula() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("Sheet1", 16384).unwrap();
+        // C1 = 30 (row 0, col 2), E1 = `=C1*10` (row 0, col 4) → 300.
+        s.set_value(addr(sheet, 0, 2), CellValue::Number { number: 30.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 4), "C1*10").unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 4)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 300.0 })
+        );
+
+        // Insert 1 blank column at index 1 (col B). Cols >= 1 shift +1: C → D,
+        // E → F; the C1 ref becomes D1.
+        s.insert_columns(sheet, 1, 1).unwrap();
+
+        // Value 30 moved C1(col2) → D1(col3).
+        assert!(s.cell(addr(sheet, 0, 2)).unwrap().is_none());
+        assert_eq!(
+            s.cell(addr(sheet, 0, 3)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 30.0 }),
+            "value 30 must move C1 → D1"
+        );
+        // Formula moved E1(col4) → F1(col5) with text "D1 * 10", still 300.
+        let f1 = s.cell(addr(sheet, 0, 5)).unwrap().unwrap();
+        assert_eq!(
+            f1.formula.as_deref(),
+            Some("D1 * 10"),
+            "formula ref must FOLLOW C1 → D1 on a column insert"
+        );
+        assert_eq!(f1.value, Some(CellValue::Number { number: 300.0 }));
+    }
+
+    /// Deleting the row a formula REFERENCES turns the ref into `#REF!`; the
+    /// referencing cell survives (it's outside the deleted block) and its text
+    /// records the broken ref. Deleting the row a formula LIVES ON drops the
+    /// formula entirely (its own cell is gone — must NOT be resurrected).
+    #[test]
+    fn owning_session_delete_rows_ref_into_block_becomes_ref_error() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("Sheet1", 16384).unwrap();
+        // A3 = 30 (row 2); D1 = `=A3*10` (row 0, col 3) references A3.
+        s.set_value(addr(sheet, 2, 0), CellValue::Number { number: 30.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 3), "A3*10").unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 3)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 300.0 })
+        );
+
+        // Delete the INCLUSIVE block [2, 2] (the row A3 lives on). The ref into
+        // the deleted block becomes #REF!; D1 (row 0) is above the block, so it
+        // stays put but its text now carries the broken ref.
+        s.delete_rows(sheet, 2, 2).unwrap();
+
+        let d1 = s.cell(addr(sheet, 0, 3)).unwrap().unwrap();
+        assert_eq!(
+            d1.formula.as_deref(),
+            Some("#REF! * 10"),
+            "a ref into the deleted block must become #REF!"
+        );
+        assert_eq!(
+            d1.value,
+            Some(CellValue::Error {
+                error: "#REF!".to_string()
+            }),
+            "a formula over a #REF! ref must evaluate to the #REF! error value"
+        );
+        // The vacated A3 cell is gone.
+        assert!(s.cell(addr(sheet, 2, 0)).unwrap().is_none());
+    }
+
+    /// Deleting the row a formula LIVES ON drops the formula — its own cell is
+    /// gone, and the producer must NOT resurrect it via a stale `PutFormula`.
+    #[test]
+    fn owning_session_delete_rows_drops_formula_on_deleted_own_cell() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("Sheet1", 16384).unwrap();
+        // A1 = 5 (row 0); D2 = `=A1*10` (row 1, col 3) → 50, lives on row 1.
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 5.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 1, 3), "A1*10").unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 1, 3)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 50.0 })
+        );
+
+        // Delete the row the formula LIVES ON ([1, 1]).
+        s.delete_rows(sheet, 1, 1).unwrap();
+
+        // The formula cell is gone — NOT resurrected at row 0 or anywhere.
+        assert!(
+            s.cell(addr(sheet, 1, 3)).unwrap().is_none(),
+            "deleted formula's old cell must be empty"
+        );
+        assert!(
+            s.cell(addr(sheet, 0, 3)).unwrap().is_none(),
+            "deleted formula must NOT be resurrected at the shifted-up position"
+        );
+        // A1 (above the deleted block) is untouched.
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 5.0 })
+        );
+    }
+
+    /// A structural edit on the owning session is gated like every mutation:
+    /// off a Ready session it is `[invalid_state]`; an unknown sheet is
+    /// NotFound; a malformed edit (count==0) is a loud `[bad_argument]`.
+    #[test]
+    fn owning_session_structural_edit_validation() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // Unknown sheet → NotFound (not a silent no-op).
+        assert_eq!(
+            s.insert_rows(9999, 0, 1).unwrap_err().class,
+            ErrorClass::NotFound
+        );
+        // count == 0 → loud BadArgument (the preflight rejects it).
+        assert_eq!(
+            s.insert_rows(sheet, 0, 0).unwrap_err().class,
+            ErrorClass::BadArgument
+        );
+        // start > end → loud BadArgument.
+        assert_eq!(
+            s.delete_rows(sheet, 5, 2).unwrap_err().class,
+            ErrorClass::BadArgument
+        );
+        // Closed session → invalid_state for a structural edit.
+        s.close().unwrap();
+        assert_eq!(
+            s.insert_rows(sheet, 0, 1).unwrap_err().code,
+            "invalid_state"
+        );
     }
 
     #[test]
