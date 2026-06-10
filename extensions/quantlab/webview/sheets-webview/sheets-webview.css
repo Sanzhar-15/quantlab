@@ -233,3 +233,105 @@ h2 {
 	padding: 2px 7px;
 	margin: 0;
 }
+
+/* ============================================================================
+ * Sheet-tabs (2026-06-10): the Excel-style bottom tab strip. A horizontal,
+ * scrollable row of tabs below the viewport. Colors use VS Code's own editor-tab
+ * theme variables so the strip harmonizes with the active theme (Dark+/Light+/...).
+ * ========================================================================== */
+.cell-grid-tab-bar {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	margin-top: 6px;
+	padding: 2px 4px;
+	border-top: 1px solid var(--vscode-panel-border);
+	background: var(--vscode-editorGroupHeader-tabsBackground, var(--vscode-editor-background));
+	overflow-x: auto;
+	overflow-y: hidden;
+	min-height: 26px;
+	white-space: nowrap;
+}
+
+.cell-grid-tab {
+	flex: 0 0 auto;
+	max-width: 200px;
+	padding: 3px 12px;
+	font-family: var(--vscode-font-family);
+	font-size: 12px;
+	line-height: 18px;
+	color: var(--vscode-tab-inactiveForeground, var(--vscode-foreground));
+	background: var(--vscode-tab-inactiveBackground, var(--vscode-editor-background));
+	border: 1px solid var(--vscode-panel-border);
+	border-bottom: none;
+	border-radius: 4px 4px 0 0;
+	cursor: pointer;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.cell-grid-tab:hover {
+	background: var(--vscode-tab-hoverBackground, var(--vscode-list-hoverBackground));
+}
+
+.cell-grid-tab.is-active {
+	color: var(--vscode-tab-activeForeground, var(--vscode-foreground));
+	background: var(--vscode-tab-activeBackground, var(--vscode-editor-background));
+	border-color: var(--vscode-focusBorder, var(--vscode-panel-border));
+	font-weight: 600;
+}
+
+.cell-grid-tab:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
+.cell-grid-tab-add {
+	flex: 0 0 auto;
+	margin-left: 2px;
+	padding: 3px 9px;
+	font-size: 13px;
+	line-height: 18px;
+	color: var(--vscode-foreground);
+	background: transparent;
+	border: 1px solid transparent;
+	border-radius: 4px;
+	cursor: pointer;
+}
+
+.cell-grid-tab-add:hover {
+	background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+}
+
+/* The minimal right-click menu (Rename / Delete / Move Left / Move Right). Absolutely positioned at
+ * the cursor by sheetTabBar.ts; styled as a small floating widget. */
+.cell-grid-tab-menu {
+	position: fixed;
+	z-index: 1000;
+	display: flex;
+	flex-direction: column;
+	min-width: 132px;
+	padding: 4px 0;
+	background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+	color: var(--vscode-menu-foreground, var(--vscode-foreground));
+	border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border));
+	border-radius: 4px;
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.36);
+}
+
+.cell-grid-tab-menu-item {
+	text-align: left;
+	padding: 4px 14px;
+	font-family: var(--vscode-font-family);
+	font-size: 12px;
+	color: inherit;
+	background: transparent;
+	border: none;
+	cursor: pointer;
+}
+
+.cell-grid-tab-menu-item:hover {
+	color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground));
+	background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
+}

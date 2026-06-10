@@ -530,10 +530,9 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				return;
 			}
 			const log = getOutput();
-			let opSucceeded = false;
+			let newId: number | undefined;
 			try {
-				const newId = target.session.addSheet(name.trim(), 1000);
-				opSucceeded = true;
+				newId = target.session.addSheet(name.trim(), 1000);
 				log.appendLine(`Added sheet "${name.trim()}" (id ${newId}) to session.`);
 				void vscode.window.showInformationMessage(`Sheet "${name.trim()}" added (id ${newId}).`);
 			} catch (err) {
@@ -541,19 +540,17 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				log.appendLine(`FATAL addSheet error: ${detail}`);
 				void vscode.window.showErrorMessage(`Quantbook add sheet failed: ${detail}`);
 			}
-			if (opSucceeded) {
+			if (newId !== undefined) {
 				try {
-					// Megaudit (2026-06-05) M1: refresh THIS session's panels, not every open workbook's
-					// (refreshAll) -- matches the session-scoped onCommit path + stops misattributing an unrelated
-					// workbook's render failure to this sheet op.
-					const { refreshed, failed } = CellGridPanel.refreshSession(target.session);
-					log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
-					if (failed > 0) {
-						void vscode.window.showWarningMessage(`Quantbook: the sheet change succeeded, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
-					}
+					// D6 (sheet-tabs, 2026-06-10): adding a sheet switches the workbook's single panel to it
+					// (Excel behavior). show() reveals the session's panel + switches it IN PLACE (re-rendering,
+					// which also repaints the bottom tab strip); under one-panel-per-session it never opens a
+					// second tab. Replaces the prior bare refreshSession, which left you on the old sheet.
+					CellGridPanel.show(context, target.session, newId);
 				} catch (err) {
 					const detail = err instanceof Error ? err.message : String(err);
-					log.appendLine(`refreshSession after addSheet failed (non-fatal): ${detail}`);
+					log.appendLine(`switch-to-new-sheet after addSheet failed: ${detail}`);
+					void vscode.window.showWarningMessage(`Quantbook: sheet added, but the view could not switch to it -- run "Quantbook: Switch Cell Grid Sheet". (${detail})`);
 				}
 			}
 		}),
@@ -654,6 +651,12 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				void vscode.window.showInformationMessage('This session has no sheets to delete.');
 				return;
 			}
+			if (sheetInfos.length <= 1) {
+				// D4 (sheet-tabs, 2026-06-10): a workbook must keep at least one live sheet -- under
+				// one-panel-per-session, deleting the last sheet would leave an empty, unswitchable grid.
+				void vscode.window.showInformationMessage('Cannot delete the last sheet of a workbook.');
+				return;
+			}
 			const pick = await vscode.window.showQuickPick(buildSheetManagementQuickPickItems(sheetInfos, target.sheet), {
 				title: 'Delete Quantbook Sheet',
 				placeHolder: 'Select a sheet to delete',
@@ -685,17 +688,27 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			if (opSucceeded) {
 				try {
-					// Megaudit (2026-06-05) M1: refresh THIS session's panels, not every open workbook's
-					// (refreshAll) -- matches the session-scoped onCommit path + stops misattributing an unrelated
-					// workbook's render failure to this sheet op.
-					const { refreshed, failed } = CellGridPanel.refreshSession(target.session);
-					log.appendLine(`Refreshed ${refreshed} panel(s)${failed > 0 ? ` (${failed} failed to render)` : ''}.`);
-					if (failed > 0) {
-						void vscode.window.showWarningMessage(`Quantbook: the sheet change succeeded, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
+					if (pick.sheet === target.sheet) {
+						// D-active (sheet-tabs, 2026-06-10): the deleted sheet was the ACTIVE one -> switch the
+						// workbook's single panel to the first survivor (the D4 guard above guaranteed >= 1 remains)
+						// rather than stranding it on the empty tombstoned grid. show() switches in place.
+						const survivors = target.session.listSheets();
+						if (survivors.length > 0) {
+							CellGridPanel.show(context, target.session, survivors[0].id);
+						} else {
+							CellGridPanel.refreshSession(target.session);
+						}
+					} else {
+						// A background sheet was deleted; the active sheet is unaffected -- just repaint (the strip
+						// drops the deleted tab). Megaudit M1: session-scoped, not refreshAll.
+						const { failed } = CellGridPanel.refreshSession(target.session);
+						if (failed > 0) {
+							void vscode.window.showWarningMessage(`Quantbook: the sheet was deleted, but the panel failed to re-render -- run "Quantbook: Refresh Cell Grid".`);
+						}
 					}
 				} catch (err) {
 					const detail = err instanceof Error ? err.message : String(err);
-					log.appendLine(`refreshSession after deleteSheet failed (non-fatal): ${detail}`);
+					log.appendLine(`refresh/switch after deleteSheet failed (non-fatal): ${detail}`);
 				}
 			}
 		}),

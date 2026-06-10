@@ -68,15 +68,17 @@ const READY_WATCHDOG_MS = 6000;
  * single-writer model the FE-0a migration established.
  *
  * - `allPanels`: every live panel, iterable -- for refreshAll / enumerate.
- * - `bySession`: `session -> (sheet -> panel)`, for single-tab-per-(session,sheet)
- *   reveal. ONE session may own SEVERAL panels (different sheets via switch-sheet),
- *   so the owning napi `Session` is closed only when its LAST panel disposes (F4).
+ * - `bySession`: `session -> panel`. **Sheet-tabs refactor (2026-06-10): ONE panel per
+ *   WORKBOOK (session), not per (session, sheet).** A workbook now opens as a single
+ *   editor whose active sheet is switched IN PLACE by the bottom tab strip (`switchToSheet`),
+ *   so a session owns exactly one panel and disposing it closes the owning napi `Session`.
+ *   (Prior model: `session -> (sheet -> panel)` -- each sheet was its own editor tab.)
  * - `focusedPanel`: the last-activated panel -- the target for sheet-management /
  *   Save-As commands when multiple sessions are open (replaces the old arbitrary
  *   "oldest open panel" pick that could mutate the wrong workbook).
  */
 const allPanels: Set<CellGridPanel> = new Set();
-const bySession: Map<SessionInstance, Map<number, CellGridPanel>> = new Map();
+const bySession: Map<SessionInstance, CellGridPanel> = new Map();
 let focusedPanel: CellGridPanel | undefined;
 
 /**
@@ -156,13 +158,20 @@ export class CellGridPanel {
 		session: SessionInstance,
 		sheet: number,
 	): CellGridPanel {
-		// Single-tab-per-(session,sheet): reveal + refresh an EXISTING panel only when
-		// it belongs to THIS session (F2 -- never reveal a different session's panel
-		// just because it shares a sheet id).
-		const existing = bySession.get(session)?.get(sheet);
+		// Sheet-tabs refactor (2026-06-10): ONE panel per workbook (session). If this session
+		// already has a panel, reveal it and SWITCH IT to the requested sheet IN PLACE (the
+		// bottom tab strip's model) rather than opening a second editor tab. F2 still holds --
+		// the lookup is by session identity, never another workbook's panel.
+		const existing = bySession.get(session);
 		if (existing !== undefined) {
 			existing.panel.reveal(vscode.ViewColumn.Active, false);
-			existing.render();
+			// switchToSheet is a no-op when already on `sheet` (it still re-renders only if it
+			// changed); a fresh reveal of the same sheet must still repaint, so render() when unchanged.
+			if (existing.sheet === sheet) {
+				existing.render();
+			} else {
+				existing.switchToSheet(sheet);
+			}
 			focusedPanel = existing;
 			// FE-5: re-opening an existing grid changes the focused workbook -> tell the shell.
 			fireGridsChanged();
@@ -227,12 +236,8 @@ export class CellGridPanel {
 		// must still run (dispose listeners + ref-counted session.close) -- otherwise the
 		// webview + message listener + napi Session orphan outside the registry.
 		allPanels.add(instance);
-		let sheetMap = bySession.get(session);
-		if (sheetMap === undefined) {
-			sheetMap = new Map();
-			bySession.set(session, sheetMap);
-		}
-		sheetMap.set(sheet, instance);
+		// Sheet-tabs refactor: one panel per session (the workbook), keyed by session identity.
+		bySession.set(session, instance);
 		focusedPanel = instance;
 		// FE-5: a new grid is now open + focused -> drive the `quantbook.hasOpenGrid` context key and
 		// refresh the Live-Python sidebar. Fired AFTER the registry mutation so a listener that reads
@@ -258,38 +263,25 @@ export class CellGridPanel {
 			if (focusedPanel === instance) {
 				focusedPanel = undefined;
 			}
-			// Only clear the registry entry if we still own it (a fresh open for the
-			// same (session,sheet) may have replaced us).
-			const sheetMapNow = bySession.get(session);
-			if (sheetMapNow !== undefined && sheetMapNow.get(sheet) === instance) {
-				sheetMapNow.delete(sheet);
-				// W2 error-surface: this panel is the last view of (session, sheet) in the registry -> drop the
-				// sheet's diagnostics from the Problems panel (a closed sheet leaves no stale error entries).
-				// Guarded by the same own-the-registry-entry check so a replaced panel does not clear a fresh
-				// panel's diagnostics.
-				diagnosticsSink?.clearSheet(session, sheet);
-				if (sheetMapNow.size === 0) {
-					bySession.delete(session);
-					// W2 error-surface (Codex MED): the session's LAST panel closed -> drop ALL its diagnostics
-					// (every sheet's cell errors + the workbook-level reactive error). `clearSheet` above only
-					// dropped THIS sheet; a sibling sheet's panel that already closed left its diagnostics, and
-					// the reactive uri is session-scoped, not sheet-scoped. Idempotent with the clearSheet above.
-					diagnosticsSink?.clearSessionAll(session);
-					// 1d-1: tear down a reactive kernel bound to this Session BEFORE closing it, so an
-					// in-flight republish cannot write to a closing Session and the ipykernel is not orphaned.
-					fireSessionClosing(session);
-					// F4: the LAST panel for this session has closed -> close the
-					// owning napi Session to release the engine handle (ref-counted:
-					// sibling panels on other sheets keep it alive). This fires when the
-					// user closes the last tab of a workbook (Open is additive as of the
-					// 2026-06-05 host fix -- it never disposes other workbooks). Log on
-					// failure (No-Fallbacks -- never swallow); do not rethrow from a
-					// dispose callback.
-					try {
-						session.close();
-					} catch (err) {
-						console.error('[cellGrid] session.close() on last-panel dispose failed:', err);
-					}
+			// Sheet-tabs refactor: one panel per session. Only clear the registry entry if we
+			// still own it (a fresh open for the same session may have replaced us -- e.g. close
+			// racing a reopen). Closing this panel closes the whole workbook (no sibling sheet
+			// panels exist anymore), so dispose == close, unconditionally.
+			if (bySession.get(session) === instance) {
+				bySession.delete(session);
+				// W2 error-surface: the workbook's panel closed -> drop ALL its diagnostics (every
+				// sheet's cell errors + the workbook-level reactive error, which is session-scoped).
+				diagnosticsSink?.clearSessionAll(session);
+				// 1d-1: tear down a reactive kernel bound to this Session BEFORE closing it, so an
+				// in-flight republish cannot write to a closing Session and the ipykernel is not orphaned.
+				fireSessionClosing(session);
+				// The workbook's panel has closed -> close the owning napi Session to release the
+				// engine handle. Open is additive (2026-06-05) -- it never disposes other workbooks.
+				// Log on failure (No-Fallbacks -- never swallow); do not rethrow from a dispose callback.
+				try {
+					session.close();
+				} catch (err) {
+					console.error('[cellGrid] session.close() on panel dispose failed:', err);
 				}
 			}
 			// FE-5: a grid closed (and possibly the focused one / the last one) -> re-evaluate
@@ -332,8 +324,8 @@ export class CellGridPanel {
 	 * panels, not just the one that dispatched. Same honest `{refreshed,failed,skipped}`.
 	 */
 	static refreshSession(session: SessionInstance): { refreshed: number; failed: number; skipped: number } {
-		const sheetMap = bySession.get(session);
-		return CellGridPanel.refreshIterable(sheetMap !== undefined ? sheetMap.values() : []);
+		const panel = bySession.get(session);
+		return CellGridPanel.refreshIterable(panel !== undefined ? [panel] : []);
 	}
 
 	/** Register a listener fired before a session's LAST panel closes (1d-1: tear down its kernel).
@@ -583,6 +575,14 @@ export class CellGridPanel {
 	private latestSnapshot: QuantbookCellSnapshot | undefined;
 
 	/**
+	 * **Sheet-tabs (2026-06-10)** -- the workbook's live sheet list `{id,name}` in display order,
+	 * captured from the workbook snapshot on each `render()` and pushed to the webview's bottom tab
+	 * strip in the `render` message (alongside the active sheet id). `undefined` before the first
+	 * render. The `webviewReady` re-send reuses it so the strip repaints on a reload.
+	 */
+	private latestSheets: Array<{ id: number; name: string }> | undefined;
+
+	/**
 	 * **FE-1.5 W-G-2b (2026-06-08)** -- the latest grid selection the webview reported, or `undefined`
 	 * until the first `selection` message. Stored (last-wins) by the {@link DispatchDeps.onSelectionChange}
 	 * arm; surfaced via the static {@link CellGridPanel.focusedGridSelection}. The dispatcher validated
@@ -663,7 +663,10 @@ export class CellGridPanel {
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly session: SessionInstance,
-		private readonly sheet: number,
+		// Sheet-tabs refactor (2026-06-10): MUTABLE -- the bottom tab strip switches the active
+		// sheet in place via `switchToSheet`. Every reader (render, the dispatch deps, the `target`
+		// getter, focusedGridSelection) reads it fresh, so they always reflect the active sheet.
+		private sheet: number,
 	) { }
 
 	/**
@@ -732,6 +735,10 @@ export class CellGridPanel {
 		// never fed). pollEvents does NOT drain the ring; advance the per-panel cursor
 		// by nextCursor so each render only folds NEW events into the accumulated map.
 		const decorated = this.drainAndAttachDiagnostics(snapshot);
+		// Sheet-tabs (2026-06-10): capture the workbook's live sheet list (display order, {id,name})
+		// for the bottom tab strip. `wbSnapshot.sheets` is already in `sheet_display_order` and
+		// excludes tombstoned sheets, so the strip renders exactly the live tabs in order.
+		this.latestSheets = wbSnapshot.sheets.map(s => ({ id: s.id, name: s.name }));
 		const totalSheets = wbSnapshot.sheets.length;
 		const titleSuffix = totalSheets > 1 ? ` of ${totalSheets}` : '';
 		const sheetName = sheetSnapshot !== null
@@ -806,7 +813,17 @@ export class CellGridPanel {
 		// fresh on every post (covers both render() and the webviewReady re-send -- no stale-on-reload
 		// issue, unlike the webview->host selection). `[]` when no reactive kernel is wired to the session.
 		const publishedCells = publishedCellsProvider?.(this.session, this.sheet) ?? [];
-		this.panel.webview.postMessage({ type: 'render', snapshot: this.latestSnapshot, publishedCells }).then(
+		// Sheet-tabs (2026-06-10): carry the live sheet list + the active sheet id so the webview's
+		// bottom tab strip can render the tabs and highlight the active one. The snapshot already
+		// determines "sheet changed" (the webview resets on `snapshot.sheet` change); these fields
+		// are purely for the strip. `?? []` keeps the payload well-formed before the first render.
+		this.panel.webview.postMessage({
+			type: 'render',
+			snapshot: this.latestSnapshot,
+			publishedCells,
+			sheets: this.latestSheets ?? [],
+			activeSheet: this.sheet,
+		}).then(
 			delivered => {
 				if (!delivered && !this._disposed) {
 					console.warn('[cellGrid] render postMessage was not delivered to the webview.');
@@ -895,6 +912,142 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **Sheet-tabs (2026-06-10)** -- switch this panel's ACTIVE sheet IN PLACE (the bottom tab strip
+	 * / the Switch-Sheet command, via {@link show}). No-op if already on `sheetId`. Validates the id
+	 * is a LIVE sheet of this workbook (No-Fallbacks -- a stale click on a just-deleted tab throws
+	 * rather than stranding the panel on a tombstone), resets the per-sheet transient host state, then
+	 * re-renders. The webview detects `snapshot.sheet` changed and resets its own selection/scroll to A1.
+	 *
+	 * `eventCursor` is INTENTIONALLY kept: the session event ring is workbook-scoped + append-only, so
+	 * rewinding it would re-fold old diagnostics. `accumulatedDiagnostics` (the per-render fold) is what
+	 * clears so the new sheet starts clean. Freeze resets on switch (v1; per-sheet freeze memory -> v2).
+	 */
+	switchToSheet(sheetId: number): void {
+		if (sheetId === this.sheet) {
+			return;
+		}
+		const live = this.session.listSheets();
+		if (!live.some(s => s.id === sheetId)) {
+			throw new Error(`Cannot switch to sheet ${sheetId}: it is not a live sheet of this workbook.`);
+		}
+		this.sheet = sheetId;
+		// Reset per-sheet transient host state so the new sheet starts clean (no stale-state leak --
+		// the UI-state analog of the corruption class: diagnostics fold, reported selection, the
+		// one-time deleted-sheet warning, and the frozen panes).
+		this.accumulatedDiagnostics.clear();
+		this.latestSelection = undefined;
+		this.deletedSheetWarned = false;
+		this.frozenRowCount = 0;
+		this.frozenColCount = 0;
+		this.render();
+		// Re-post the (now-cleared) freeze so the webview unfreezes for the new sheet.
+		this.postFreezeIfReady();
+		// The focused workbook's active sheet changed -> the dep-graph / Live-Python sidebars re-read.
+		if (focusedPanel === this) {
+			fireGridsChanged();
+		}
+	}
+
+	/**
+	 * **Sheet-tabs (2026-06-10)** -- handle a sheet-management action raised from the bottom tab strip:
+	 * `+` (add), or right-click / double-click `rename` / `delete` / `moveLeft` / `moveRight` on a
+	 * specific tab. Acts on the SPECIFIED `sheet` directly (the strip already identified it -- no
+	 * QuickPick), reusing the owning Session's sheet napi + the palette commands' validation rules.
+	 * Errors surface LOUD (No-Fallbacks). The QuickPick-based palette commands remain for keyboard access.
+	 */
+	private async handleSheetCommand(command: string, sheet: number | undefined): Promise<void> {
+		try {
+			if (command === 'add') {
+				const name = await vscode.window.showInputBox({
+					title: 'Add Quantbook Sheet',
+					prompt: 'Enter a name for the new sheet',
+					placeHolder: 'e.g., "Q4 Returns" or "Sheet3"',
+					validateInput: (value) => (value.trim() === '' ? 'Sheet name cannot be empty' : null),
+				});
+				if (name === undefined) {
+					return;
+				}
+				const newId = this.session.addSheet(name.trim(), 1000);
+				this.switchToSheet(newId); // D6: adding a sheet switches to it (Excel behavior).
+				return;
+			}
+			if (sheet === undefined) {
+				return;
+			}
+			if (command === 'rename') {
+				const current = this.latestSheets?.find(s => s.id === sheet)?.name ?? '';
+				const newName = await vscode.window.showInputBox({
+					title: `Rename Sheet ${sheet}`,
+					prompt: `Enter a new name for sheet ${sheet}`,
+					value: current,
+					validateInput: (value) => {
+						if (value.trim() === '') {
+							return 'Sheet name cannot be empty';
+						}
+						if (value.trim() === current) {
+							return 'New name is the same as the current name';
+						}
+						return null;
+					},
+				});
+				if (newName === undefined) {
+					return;
+				}
+				this.session.renameSheet(sheet, newName.trim());
+				CellGridPanel.refreshSession(this.session);
+				return;
+			}
+			if (command === 'delete') {
+				const live = this.session.listSheets();
+				if (live.length <= 1) {
+					void vscode.window.showInformationMessage('Cannot delete the last sheet of a workbook.'); // D4
+					return;
+				}
+				const name = live.find(s => s.id === sheet)?.name ?? String(sheet);
+				const confirm = await vscode.window.showWarningMessage(
+					`Delete sheet ${sheet} ("${name}")? It is tombstoned (cells preserved internally) but disappears from the grid.`,
+					{ modal: true },
+					'Delete',
+				);
+				if (confirm !== 'Delete') {
+					return;
+				}
+				this.session.deleteSheet(sheet);
+				if (sheet === this.sheet) {
+					// Deleted the active sheet -> switch to the first survivor (the empty-tombstone render
+					// path is the safety net if none remain, which the D4 guard above already prevents).
+					const survivors = this.session.listSheets();
+					if (survivors.length > 0) {
+						this.switchToSheet(survivors[0].id);
+						return;
+					}
+				}
+				CellGridPanel.refreshSession(this.session);
+				return;
+			}
+			if (command === 'moveLeft' || command === 'moveRight') {
+				const order = this.session.listSheets().map(s => s.id);
+				const idx = order.indexOf(sheet);
+				if (idx < 0) {
+					return;
+				}
+				// moveSheet(id, newIndex) removes the source then inserts at newIndex in the remaining
+				// array, so one step left = idx-1, one step right = idx+1 (skip at the ends).
+				const newIndex = command === 'moveLeft' ? idx - 1 : idx + 1;
+				if (newIndex < 0 || newIndex >= order.length) {
+					return;
+				}
+				this.session.moveSheet(sheet, newIndex);
+				CellGridPanel.refreshSession(this.session);
+				return;
+			}
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			void vscode.window.showErrorMessage(`Quantbook sheet ${command} failed: ${detail}`);
+		}
+	}
+
+	/**
 	 * Thin wrapper around the vscode-free {@link dispatchIncomingMessage}. Lives
 	 * here (not in cellGridLogic.ts) because it captures `this`. The dispatcher
 	 * handles `putValue` (number/text/formula -> write -> recalc -> render),
@@ -934,6 +1087,25 @@ export class CellGridPanel {
 			// reload does not silently lose it. A no-op when nothing is frozen (0/0).
 			this.postFreezeIfReady();
 			return;
+		}
+		// Sheet-tabs (2026-06-10): intercept the bottom tab strip's messages BEFORE delegating --
+		// `dispatchIncomingMessage` would log them as unknown types. `switchSheet` switches the active
+		// sheet in place; `sheetCommand` runs an add/rename/delete/move-left/move-right on a tab.
+		if (typeof raw === 'object' && raw !== null) {
+			const m = raw as { type?: unknown; sheet?: unknown; command?: unknown };
+			if (m.type === 'switchSheet' && typeof m.sheet === 'number') {
+				try {
+					this.switchToSheet(m.sheet);
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					void vscode.window.showErrorMessage(`Quantbook switch sheet failed: ${detail}`);
+				}
+				return;
+			}
+			if (m.type === 'sheetCommand' && typeof m.command === 'string') {
+				void this.handleSheetCommand(m.command, typeof m.sheet === 'number' ? m.sheet : undefined);
+				return;
+			}
 		}
 		dispatchIncomingMessage(raw, {
 			session: this.session,

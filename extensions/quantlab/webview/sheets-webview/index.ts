@@ -53,6 +53,8 @@ import {
 import { CanvasGridRenderer, type ActiveCell, type PublishedRange } from './canvasGrid';
 import { staleTintKeysA1 } from './gridBlitA1';
 import { pasteAreaMismatch, planFill, planPaste, type GridClipboard } from './clipboardLogic';
+// Sheet-tabs (2026-06-10): the Excel-style bottom tab strip (presentation only; the host owns mutation).
+import { renderSheetTabs, type SheetTabHandlers, type SheetTabInfo } from './sheetTabBar';
 // W3 (Wave 3): the pure data-vscode-context payload builder for the native right-click context menu.
 import { buildCellContextPayload, buildEmptyContextPayload } from './contextMenuPayload';
 import { RenderOrchestrator, type RenderHost, type Viewport } from './renderOrchestrator';
@@ -182,7 +184,10 @@ root.innerHTML =
 	'<canvas id="sheets-canvas"></canvas>' +
 	'<input id="sheets-edit-input" class="cell-edit-input" type="text" aria-label="Edit cell value" ' +
 	'spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" hidden />' +
-	'</div>';
+	'</div>' +
+	// Sheet-tabs (2026-06-10): the Excel-style bottom tab strip, a sibling BELOW the viewport. Painted by
+	// `renderSheetTabs` from the host's `render` payload (sheets + activeSheet); empty until the first render.
+	'<div id="sheets-tab-bar" class="cell-grid-tab-bar" role="tablist" aria-label="Sheets"></div>';
 
 const titleEl = document.getElementById('sheets-title') as HTMLElement;
 const metaEl = document.getElementById('sheets-meta') as HTMLElement;
@@ -191,6 +196,8 @@ const nameBoxEl = document.getElementById('sheets-name-box') as HTMLElement;
 const publishedChipEl = document.getElementById('sheets-published-chip') as HTMLElement;
 const formulaInputEl = document.getElementById('sheets-formula-input') as HTMLInputElement;
 const viewportEl = document.getElementById('sheets-viewport') as HTMLElement;
+// Sheet-tabs (2026-06-10): the bottom tab strip container (painted by `applySheetTabs` on each render).
+const tabBarEl = document.getElementById('sheets-tab-bar') as HTMLElement;
 const spacerEl = document.getElementById('sheets-spacer') as HTMLElement;
 const canvasEl = document.getElementById('sheets-canvas') as HTMLCanvasElement;
 const inputEl = document.getElementById('sheets-edit-input') as HTMLInputElement;
@@ -2422,7 +2429,8 @@ function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean)
 	// Megaudit MED: `errorCells` is keyed by (row,col) for the CURRENT sheet only. Clear it when the
 	// snapshot's sheet changes (a Switch Sheet), else a failed A1 on sheet 0 would keep tinting A1 after
 	// switching to sheet 1. (A sheet change also makes `diffSnapshotsA1` return null -> full redraw below.)
-	if (prevSnapshot !== null && prevSnapshot.sheet !== snapshot.sheet) {
+	const sheetChanged = prevSnapshot !== null && prevSnapshot.sheet !== snapshot.sheet;
+	if (sheetChanged) {
 		errorCells.clear();
 		// **Codex MED fold (+ re-audit MED)**: a Switch Sheet re-renders THIS panel onto a different sheet. An
 		// open formula-bar edit's dropdown/hint targeted the OLD sheet's cell; `updateFormulaBar` is a no-op
@@ -2437,6 +2445,15 @@ function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean)
 		} else {
 			teardownFormulaAssist();
 		}
+		// Sheet-tabs (2026-06-10): a switch to a DIFFERENT sheet resets the active cell to A1 and scrolls to
+		// the top-left, so the new sheet never inherits the previous sheet's selection or scroll (the
+		// stale-state guard -- the UI-state analog of the corruption class). The full redraw below paints the
+		// A1 selection; `updateFormulaBar` + `postSelectionIfChanged` run after it (gated on `sheetChanged`)
+		// so the formula bar + the host's focused-cell reflect the new sheet's A1.
+		active = { row: 0, col: 0 };
+		anchor = null;
+		viewportEl.scrollTop = 0;
+		viewportEl.scrollLeft = 0;
 	} else if (errorCells.size > 0) {
 		// FE-2-0 polish (2026-06-05): clear a STALE tint when the cell's STORED content changed between
 		// renders -- i.e. a real write landed (a sibling panel / a recompute FIXED the cell this panel had
@@ -2466,6 +2483,13 @@ function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean)
 	// spacer) stays here -- those are DOM/binding writes this file owns. `commitSnapshot` fires the
 	// `onAfterDamage` host callback (the formula-bar follow) on the damage path.
 	orchestrator.commitSnapshot(prevSnapshot, snapshot, publishedChanged);
+	// Sheet-tabs (2026-06-10): after a sheet switch repaints, sync the formula bar to the new sheet's A1
+	// and report the reset selection to the host (deduped via `lastPostedSelectionKey`, so a same-sheet
+	// render is a no-op). Gated on `sheetChanged` so a normal content render is untouched.
+	if (sheetChanged) {
+		updateFormulaBar();
+		postSelectionIfChanged();
+	}
 }
 
 /**
@@ -2504,6 +2528,40 @@ function resolvePendingCommit(commitId: number): void {
 	}
 	redraw();
 	viewportEl.focus(); // megaudit LOW: keep keyboard focus on the grid so arrow-nav continues after a commit
+}
+
+// Sheet-tabs (2026-06-10): the strip's interactions post to the host (which owns ALL sheet mutation).
+// `switchSheet` switches the active sheet in place; `sheetCommand` runs add/rename/delete/move on a tab.
+const sheetTabHandlers: SheetTabHandlers = {
+	switchTo: (id) => vscode.postMessage({ type: 'switchSheet', sheet: id }),
+	add: () => vscode.postMessage({ type: 'sheetCommand', command: 'add' }),
+	rename: (id) => vscode.postMessage({ type: 'sheetCommand', command: 'rename', sheet: id }),
+	remove: (id) => vscode.postMessage({ type: 'sheetCommand', command: 'delete', sheet: id }),
+	moveLeft: (id) => vscode.postMessage({ type: 'sheetCommand', command: 'moveLeft', sheet: id }),
+	moveRight: (id) => vscode.postMessage({ type: 'sheetCommand', command: 'moveRight', sheet: id }),
+};
+
+/**
+ * **Sheet-tabs** -- paint the bottom strip from a `render` payload's `sheets` + `activeSheet`. Validates
+ * the shape defensively (No-Fallbacks: a malformed list is logged + the strip left untouched, never a
+ * silently wrong strip). A well-formed empty list paints just the `+`. Called on every `render`.
+ */
+function applySheetTabs(sheetsRaw: unknown, activeRaw: unknown): void {
+	if (!Array.isArray(sheetsRaw) || typeof activeRaw !== 'number') {
+		if (sheetsRaw !== undefined) {
+			console.warn('[sheets-webview] render payload had a malformed sheets/activeSheet; tab strip not updated.');
+		}
+		return;
+	}
+	const sheets: SheetTabInfo[] = [];
+	for (const s of sheetsRaw) {
+		if (s !== null && typeof s === 'object'
+			&& typeof (s as { id?: unknown }).id === 'number'
+			&& typeof (s as { name?: unknown }).name === 'string') {
+			sheets.push({ id: (s as { id: number }).id, name: (s as { name: string }).name });
+		}
+	}
+	renderSheetTabs(tabBarEl, sheets, activeRaw, sheetTabHandlers);
 }
 
 window.addEventListener('message', (event: MessageEvent) => {
@@ -2553,6 +2611,10 @@ window.addEventListener('message', (event: MessageEvent) => {
 		// applying the snapshot, so the same render paints both. A change in the set forces a full redraw.
 		const publishedChanged = rebuildPublishedRanges((msg as { publishedCells?: unknown }).publishedCells);
 		applyRender(snapshot, publishedChanged);
+		// Sheet-tabs (2026-06-10): repaint the bottom strip from the live sheet list + active id the host
+		// carries on every render. Done after applyRender so a sheet-switch render updates the grid AND the
+		// active-tab highlight together.
+		applySheetTabs((msg as { sheets?: unknown }).sheets, (msg as { activeSheet?: unknown }).activeSheet);
 		return;
 	}
 	if (msg.type === 'commitResult') {
