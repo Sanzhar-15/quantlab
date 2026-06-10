@@ -6,6 +6,17 @@
 **Scope:** engine-internal sequencing for all 24 workspace crates  
 **Authored:** Claude Opus 4.7 + Codex (co-thinking session, 2026-05-12)
 
+> ⚠️ **STALENESS NOTE (2026-06-10).** The Status/Date/HEAD above are from 2026-05-13 and the engine has
+> advanced FAR past them. Phase 4 SHIPPED; RT-V1 + Wave-3 distributions shipped; the FE pivot drove
+> ENG-FUSION (`publish_dataset`/`bind_range`), owning-`Session` insert/delete, and the **FE-4 W4 cell-style
+> ENGINE FOUNDATION** (`ql-storage` `Style`/`StyleTable`/`CellStyleOverlay`, `ql-oplog`
+> RegisterStyle/SetCellStyle, `SessionOp::SetStyle`, `register_style`/`set_style` napi on the owning Session,
+> `.qbook` **schema v8→v9** `style_overlay`). **Current engine HEAD: `feat/quantbook-engine` @ `9ce475b1fce`.**
+> For the up-to-date state, read (in order): the memory handoffs `current_work.md` (w57) + the
+> `quantbook_engine_*` memory files, and the IDE-side `.plans/active/fe4-plan.md` (W4 detail + the FE-5
+> backlog). This phase roadmap below has NOT been re-baselined to that reality — treat it as the engine's
+> long-range plan, not its current-state ledger. (Documentation freeze 2026-06-10; quantbook resumes Sat 2026-06-13.)
+
 This is the long path. There is no MVP shortcut in this plan. The v1 target is a real spreadsheet engine backing Quantlab: correct scalar semantics, fast graph-driven recomputation, Excel coverage, collaboration, import/export, bindings, service mode, Python UDFs, SQL, connectors, AI(), and an exercised IDE integration.
 
 ---
