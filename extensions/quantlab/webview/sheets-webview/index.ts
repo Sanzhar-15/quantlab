@@ -60,6 +60,11 @@ import { CanvasGridRenderer, type ActiveCell, type PublishedRange } from './canv
 import { ICONS } from './icons';
 import { staleTintKeysA1 } from './gridBlitA1';
 import { pasteAreaMismatch, planFill, planPaste, type GridClipboard } from './clipboardLogic';
+// FE-4 keyboard STATE MACHINE: the pure key->action dispatcher (nav/range/edit/formula). The document
+// keydown + onEditKeydown classify through this; the imperative layer below executes the actions.
+import { gridKeyDispatch, type GridMode, type KeyModifiers } from './gridKeyDispatch';
+// FE-4 F4: pure abs/rel ref-cycle helper (A1 -> $A$1 -> A$1 -> $A1 -> A1) for the formula editor.
+import { cycleRefAbsRel } from './f4Logic';
 import { CellStyleStore, MAX_STYLE_CELLS, type StyleRect, type StyleToggle } from './cellStyleModel';
 // Sheet-tabs (2026-06-10): the Excel-style bottom tab strip (presentation only; the host owns mutation).
 import { renderSheetTabs, type SheetTabHandlers, type SheetTabInfo } from './sheetTabBar';
@@ -2188,6 +2193,114 @@ function pasteFromOsClipboard(): void {
 		.catch((err) => console.warn('[sheets-webview] OS clipboard read failed:', err));
 }
 
+/**
+ * **FE-4 Ctrl-D / Ctrl-R (fill down / fill right).** REUSE the shipped fill machinery -- `readRectClipboard`
+ * (which reads each source cell's formula TEXT via `priorCellContent`, so a formula's relative refs travel)
+ * + `planFill` (which offsets each filled cell's refs by its distance from the source it repeats). NO
+ * re-implemented ref translation. Mode-gated by the document keydown handler so they fire ONLY in nav/range
+ * mode (an editor can never be open then), and capped by `MAX_PUT_CELLS` exactly like paste/fill-drag.
+ *
+ * `axis` selects down vs right. Semantics (Excel-faithful):
+ *   - a MULTI-cell selection along the fill axis: the TOP row (Ctrl-D) / LEFT column (Ctrl-R) of the
+ *     selection is the source; it fills DOWN / RIGHT through the rest of the selection. The other axis of
+ *     the selection is filled in parallel (every column of a multi-column Ctrl-D fills down independently).
+ *   - a SINGLE cell (no fill-axis extent): Excel fills from the cell ABOVE (Ctrl-D) / to the LEFT (Ctrl-R)
+ *     into the active cell. A no-op at the top row (Ctrl-D) / left column (Ctrl-R) -- nothing to fill from.
+ *
+ * Like `clearActiveCell`, this is a nav-mode mutation that does NOT route through `runAfterResolvingEdit`:
+ * the document handler's `editState !== null` early-return guarantees no editor is open here. A pending
+ * commit cannot exist either (a pending editor IS an open `editState`).
+ */
+function fillSelection(axis: 'down' | 'right'): void {
+	if (fullSnapshot === null || active === null) {
+		return;
+	}
+	const sel = currentSelection();
+	// The selection rect (or the single active cell). minRow/minCol is the fill SOURCE origin.
+	const minRow = sel === null ? active.row : sel.minRow;
+	const minCol = sel === null ? active.col : sel.minCol;
+	const maxRow = sel === null ? active.row : sel.maxRow;
+	const maxCol = sel === null ? active.col : sel.maxCol;
+	const selRows = maxRow - minRow + 1;
+	const selCols = maxCol - minCol + 1;
+
+	// Resolve the SOURCE rect (top/left/rows/cols) + the FILL rect (fillRows/fillCols) anchored at the source
+	// top-left, both in absolute coordinates. `planFill` returns the cells OUTSIDE the source rect.
+	let srcTop: number;
+	let srcLeft: number;
+	let srcRows: number;
+	let srcCols: number;
+	let fillRows: number;
+	let fillCols: number;
+	if (axis === 'down') {
+		if (selRows > 1) {
+			// Multi-row selection: top row is the source, fill down through the selection.
+			srcTop = minRow;
+			srcLeft = minCol;
+			srcRows = 1;
+			srcCols = selCols;
+			fillRows = selRows;
+			fillCols = selCols;
+		} else {
+			// Single row (a single cell, or a single-row range): fill from the row ABOVE into it.
+			if (minRow === 0) {
+				return; // no row above -- nothing to fill from (Excel no-ops)
+			}
+			srcTop = minRow - 1;
+			srcLeft = minCol;
+			srcRows = 1;
+			srcCols = selCols;
+			fillRows = 2; // the source row + the target row below it
+			fillCols = selCols;
+		}
+	} else {
+		if (selCols > 1) {
+			// Multi-column selection: left column is the source, fill right through the selection.
+			srcTop = minRow;
+			srcLeft = minCol;
+			srcRows = selRows;
+			srcCols = 1;
+			fillRows = selRows;
+			fillCols = selCols;
+		} else {
+			// Single column (a single cell, or a single-column range): fill from the column to the LEFT into it.
+			if (minCol === 0) {
+				return; // no column to the left -- nothing to fill from (Excel no-ops)
+			}
+			srcTop = minRow;
+			srcLeft = minCol - 1;
+			srcRows = selRows;
+			srcCols = 1;
+			fillRows = selRows;
+			fillCols = 2; // the source column + the target column to its right
+		}
+	}
+
+	// Cap the fill target BEFORE planFill builds the array (mirrors paste + the fill-drag cap). Loud refusal,
+	// never a silent truncation (No-Fallbacks).
+	if (fillRows * fillCols > MAX_PUT_CELLS) {
+		showError('That fill area is too large (' + (fillRows * fillCols).toLocaleString() + ' cells; the limit is ' + MAX_PUT_CELLS.toLocaleString() + '). Select a smaller range.', 'transient');
+		return;
+	}
+	const clip = readRectClipboard(srcTop, srcLeft, srcRows, srcCols, false);
+	if (clip === null) {
+		showError('A cell in the fill source is too large to fill; nothing was filled.', 'transient');
+		return;
+	}
+	const cells = planFill(clip, fillRows, fillCols);
+	if (cells.length === 0) {
+		return; // nothing outside the source -- no-op (e.g. a single cell at row 0 already returned above)
+	}
+	vscode.postMessage({
+		type: 'putCells',
+		sheet: fullSnapshot.sheet,
+		cells,
+		undoLabel: axis === 'down' ? 'Fill down' : 'Fill right',
+		webviewId: WEBVIEW_ID,
+	});
+	redraw();
+}
+
 /** **Megaudit (B2)** -- the selection delta for a commit/nav key, or `null` for any other key. Enter and
  * Tab always carry a vector (they commit+move); the arrow keys carry one too, but the editor only ACTS on
  * an arrow when leaving a known-bad cell (see the input keydown handler) -- a normal edit keeps arrows as
@@ -3053,6 +3166,40 @@ function onEditInput(ev: Event): void {
 		updateSignatureHint();
 	}
 }
+/**
+ * **FE-4 F4** -- cycle the abs/rel anchoring of the ref the caret is on, in the LIVE editor (either surface).
+ * Reads `editState.editEl.value` + `selectionStart`, runs the pure {@link cycleRefAbsRel}, and writes the
+ * result back + repositions the caret. A no-op (returns false, no write) when the caret is not on a ref --
+ * the caller then leaves the key as a passthrough (No-Fallbacks: F4 off a ref does nothing, never guesses).
+ *
+ * After a rewrite it refreshes the formula-bar assist (validate + signature hint + dropdown) exactly as a
+ * keystroke would, since changing `value` programmatically does not fire the `input` event. On the overlay
+ * surface there is no assist, so the refresh is a guarded no-op there (the helpers gate on `formulaBarIsEditing`).
+ */
+function applyRefCycle(): boolean {
+	if (editState === null) {
+		return false;
+	}
+	const el = editState.editEl;
+	const caret = el.selectionStart ?? el.value.length;
+	const result = cycleRefAbsRel(el.value, caret);
+	if (result === null) {
+		return false; // caret not on a ref -- F4 is a no-op
+	}
+	el.value = result.formula;
+	el.setSelectionRange(result.caretPos, result.caretPos);
+	// Mirror the `input` path's assist refresh (formula bar only; no-ops on the overlay). The value changed,
+	// so a debounced re-validate + signature hint + dropdown re-eval keep the bar's diagnostics in sync.
+	if (formulaBarIsEditing()) {
+		scheduleValidate();
+		updateSignatureHint();
+		if (completion !== null) {
+			updateCompletion(false);
+		}
+	}
+	return true;
+}
+
 function onEditKeydown(ev: KeyboardEvent): void {
 	// Audit MED-4: while an IME composition is active, Enter/Tab ACCEPT the candidate -- they must not
 	// commit/move the cell. Let the input handle composition natively until it completes.
@@ -3100,6 +3247,22 @@ function onEditKeydown(ev: KeyboardEvent): void {
 		}
 		// Other keys (printable, Backspace, Home/End, Left/Right caret moves) fall through: the input edits
 		// natively, then the `input`/`keyup` handlers recompute or close the dropdown.
+	}
+	// **FE-4 F4 (abs/rel ref cycle).** Classify through the shared dispatcher so the editor-mode F4 is in the
+	// table: `formula` mode (the value starts with `=`) -> `cycleRef`; plain `edit` mode -> passthrough (no ref
+	// to cycle). Inert while a commit is in flight (the input is readOnly) -- the pending swallow below also
+	// guards nav keys; F4 must not mutate a read-only editor either. A no-op cycle (caret off any ref) falls
+	// through to native handling (No-Fallbacks: never a silent eat).
+	if (ev.key === 'F4' && !editState.pendingCommit) {
+		const editMode: GridMode = editState.editEl.value.startsWith('=') ? 'formula' : 'edit';
+		const action = gridKeyDispatch(editMode, ev.key, { meta: ev.metaKey || ev.ctrlKey, shift: ev.shiftKey, alt: ev.altKey });
+		if (action.kind === 'cycleRef') {
+			if (applyRefCycle()) {
+				ev.preventDefault();
+				return;
+			}
+			// caret not on a ref -- fall through (passthrough); F4 does nothing visible
+		}
 	}
 	if (ev.key === 'Escape') {
 		ev.preventDefault();
@@ -3793,150 +3956,134 @@ document.addEventListener('keydown', ev => {
 	if (ev.isComposing || ev.keyCode === 229) {
 		return;
 	}
-	const isMeta = ev.metaKey || ev.ctrlKey;
-	// Undo / redo.
-	if (isMeta) {
-		const k = ev.key.toLowerCase();
-		if (k === 'z' && !ev.shiftKey) {
+	// **FE-4 keyboard STATE MACHINE.** The guards above own WHETHER this key reaches the keyboard core (the
+	// formula-bar bubble, the find-bar key ownership, the `editState`/`completion`/`fillSource` early-returns,
+	// and IME). Past them, we are in a NAV-LIKE mode -- `range` if a multi-cell selection exists, else `nav`.
+	// The pure `gridKeyDispatch` CLASSIFIES the key into a descriptive action; the switch below EXECUTES it
+	// through the unchanged machinery. This is the post-guard flat-switch refactored into one tested table.
+	const mode: GridMode = currentSelection() !== null ? 'range' : 'nav';
+	const mods: KeyModifiers = { meta: ev.metaKey || ev.ctrlKey, shift: ev.shiftKey, alt: ev.altKey };
+	const action = gridKeyDispatch(mode, ev.key, mods);
+	switch (action.kind) {
+		case 'nav':
+			// W-G-2a: Shift+Arrow EXTENDS the range (anchor stays, focus moves); a plain arrow/Enter/Tab
+			// COLLAPSES + moves. `extend` is true only for the shift-arrows (Enter/Tab carry extend:false).
 			ev.preventDefault();
-			vscode.postMessage({ type: 'undo' });
+			(action.extend ? extendActive : moveActive)(action.dr, action.dc);
 			return;
-		}
-		if ((k === 'z' && ev.shiftKey) || k === 'y') {
+		case 'jump':
+			// Ctrl+Home -> A1; End / Ctrl+End -> the last used cell; plain Home -> column A of the current row.
 			ev.preventDefault();
-			vscode.postMessage({ type: 'redo' });
-			return;
-		}
-		// W-G copy/paste: Ctrl/Cmd + C (copy) / X (cut) / V (paste) on the grid selection. Reached only when
-		// NOT editing and NOT focused in the formula bar (both guarded at the top of this handler), so a
-		// native text copy/paste inside an input is unaffected.
-		if (k === 'c') {
-			ev.preventDefault();
-			copyGridSelection(false);
-			return;
-		}
-		if (k === 'x') {
-			ev.preventDefault();
-			copyGridSelection(true);
-			return;
-		}
-		if (k === 'v') {
-			ev.preventDefault();
-			pasteGridClipboard();
-			return;
-		}
-		// Round 5: Ctrl/Cmd+F opens the in-sheet find bar (the VS Code editor find has no meaning over a
-		// canvas grid; this is the spreadsheet-native find every user reaches for).
-		if (k === 'f') {
-			ev.preventDefault();
-			openFindBar();
-			return;
-		}
-		// Excel nav keys (meta variants). Ctrl/Cmd+Home -> A1; Ctrl/Cmd+End -> the last used cell (snapshot
-		// extent). Mirror the arrow path's setActive/clamp/scroll-into-view via jumpActive (no new movement
-		// mechanism). `ev.key` for these is 'Home' / 'End' regardless of the meta modifier.
-		if (ev.key === 'Home') {
-			ev.preventDefault();
-			jumpActive(0, 0);
-			return;
-		}
-		if (ev.key === 'End') {
-			ev.preventDefault();
-			const end = usedExtent();
-			jumpActive(end.row, end.col);
-			return;
-		}
-		return; // leave other meta combos alone
-	}
-	if (ev.altKey) {
-		return;
-	}
-	// Navigation. W-G-2a: Shift+Arrow EXTENDS the selection range (anchor stays, focus moves); a plain
-	// arrow COLLAPSES the range and moves. Tab/Enter always move a single cell (collapse) -- Shift+Tab is
-	// reverse-Tab (move left), NOT range extension, matching Excel.
-	switch (ev.key) {
-		case 'ArrowUp':
-			ev.preventDefault();
-			(ev.shiftKey ? extendActive : moveActive)(-1, 0);
-			return;
-		case 'ArrowDown':
-			ev.preventDefault();
-			(ev.shiftKey ? extendActive : moveActive)(1, 0);
-			return;
-		case 'Enter': // Excel: Enter on a selected cell moves down (typing/F2 edits)
-			ev.preventDefault();
-			moveActive(1, 0);
-			return;
-		case 'ArrowLeft':
-			ev.preventDefault();
-			(ev.shiftKey ? extendActive : moveActive)(0, -1);
-			return;
-		case 'ArrowRight':
-			ev.preventDefault();
-			(ev.shiftKey ? extendActive : moveActive)(0, 1);
-			return;
-		case 'Home':
-			// Excel: Home -> column A of the current row (plain; the Ctrl/Cmd+Home -> A1 variant is handled in
-			// the isMeta block above).
-			ev.preventDefault();
-			jumpActive(active === null ? 0 : active.row, 0);
-			return;
-		case 'End':
-			// Excel: End / Ctrl+End -> the last used cell (snapshot extent). The plain-End variant lands here;
-			// the meta variant is handled above. Both target the same cell per the spec.
-			ev.preventDefault();
-			{
+			if (action.target === 'a1') {
+				jumpActive(0, 0);
+			} else if (action.target === 'usedEnd') {
 				const end = usedExtent();
 				jumpActive(end.row, end.col);
+			} else {
+				jumpActive(active === null ? 0 : active.row, 0);
 			}
 			return;
-		case 'PageUp':
-			// Move the active cell UP by one screenful of rows (+ scroll into view, via moveActive's
-			// ensureActiveVisible). Mirrors the arrow path; clamps at row 0.
+		case 'pageMove':
+			// Move the active cell by one screenful of rows (+ scroll into view, via moveActive). Mirrors the
+			// arrow path; clamps at the grid edge.
 			ev.preventDefault();
-			moveActive(-visibleRowSpan(), 0);
+			moveActive(action.dir * visibleRowSpan(), 0);
 			return;
-		case 'PageDown':
-			// Move the active cell DOWN by one screenful of rows (+ scroll into view). Mirrors the arrow path.
-			ev.preventDefault();
-			moveActive(visibleRowSpan(), 0);
-			return;
-		case 'Tab':
-			ev.preventDefault();
-			moveActive(0, ev.shiftKey ? -1 : 1);
-			return;
-		case 'Escape':
-			// W-G-2a: collapse a multi-cell range back to the focus cell (no-op when already single-cell).
+		case 'collapse':
+			// W-G-2a: collapse a multi-cell range back to the focus cell. In `nav` mode there is no anchor, so
+			// this is a no-op that does NOT preventDefault (preserving the shipped Escape arm exactly).
 			if (anchor !== null) {
 				ev.preventDefault();
 				collapseSelection();
 				redraw();
 			}
 			return;
-		case 'F2':
-			ev.preventDefault();
-			if (active !== null) {
-				beginEdit(active.row, active.col);
+		case 'beginEdit':
+			// F2 (char undefined) opens the editor with the prior content; type-to-edit (char set) seeds it.
+			// PreventDefault semantics preserved EXACTLY from the shipped flat switch: F2 preventDefaulted
+			// UNCONDITIONALLY (then edited only when `active !== null`); type-to-edit preventDefaulted ONLY when
+			// `active !== null` (so a printable key with no active cell fell through to the browser). `active` is
+			// never null in normal operation, but this keeps the divergence byte-identical.
+			if (action.char === undefined) {
+				ev.preventDefault(); // F2: unconditional, matching the shipped `case 'F2'`
+				if (active !== null) {
+					beginEdit(active.row, active.col);
+					redraw();
+				}
+			} else if (active !== null) {
+				ev.preventDefault(); // type-to-edit: only when there is a cell to seed (the shipped tail guard)
+				beginEdit(active.row, active.col, action.char);
 				redraw();
 			}
 			return;
-		case 'Delete':
-		case 'Backspace':
-			// Audit O2-MED3: clear the selected cell. preventDefault is load-bearing for Backspace --
-			// otherwise it triggers webview history-back navigation.
+		case 'clear':
+			// Audit O2-MED3: clear the selected cell. preventDefault is load-bearing for Backspace -- otherwise
+			// it triggers webview history-back navigation.
 			ev.preventDefault();
 			clearActiveCell();
 			return;
+		case 'copy':
+			// W-G copy/paste: reached only when NOT editing + NOT in the formula bar (guarded above), so a
+			// native text copy inside an input is unaffected.
+			ev.preventDefault();
+			copyGridSelection(false);
+			return;
+		case 'cut':
+			ev.preventDefault();
+			copyGridSelection(true);
+			return;
+		case 'paste':
+			ev.preventDefault();
+			pasteGridClipboard();
+			return;
+		case 'find':
+			// Round 5: Ctrl/Cmd+F opens the in-sheet find bar (the VS Code editor find has no meaning over a
+			// canvas grid).
+			ev.preventDefault();
+			openFindBar();
+			return;
+		case 'undo':
+			ev.preventDefault();
+			vscode.postMessage({ type: 'undo' });
+			return;
+		case 'redo':
+			ev.preventDefault();
+			vscode.postMessage({ type: 'redo' });
+			return;
+		case 'fillDown':
+			// FE-4: Ctrl/Cmd+D fills down over the selection (multi-row) or from the cell above (single cell).
+			ev.preventDefault();
+			fillSelection('down');
+			return;
+		case 'fillRight':
+			// FE-4: Ctrl/Cmd+R fills right over the selection (multi-col) or from the cell to the left (single).
+			ev.preventDefault();
+			fillSelection('right');
+			return;
+		case 'passthrough':
+			// No-Fallbacks: an unhandled key (an unbound meta combo, an alt chord, a non-printable key like a
+			// bare Shift, or a printable char with no active cell) is left for the browser -- NEVER preventDefaulted.
+			return;
+		case 'commitMove':
+		case 'editEscape':
+		case 'editArrow':
+		case 'cycleRef':
+			// UNREACHABLE in a nav-like mode: these are editor-only action kinds (`onEditKeydown` handles them).
+			// The dispatcher never returns them for `nav`/`range`. Throw loudly if a future change makes one
+			// reachable here (No-Fallbacks: a silent drop would eat a key). Casing them explicitly lets the
+			// `default` below narrow to `never`, proving the union is exhausted at compile time.
+			throw new Error('[sheets-webview] editor-only grid action reached the document keydown switch: ' + action.kind);
 		default:
-			break;
-	}
-	// Type-to-edit: a single printable character opens the editor pre-filled with it.
-	if (ev.key.length === 1 && active !== null) {
-		ev.preventDefault();
-		beginEdit(active.row, active.col, ev.key);
-		redraw();
+			assertNeverAction(action);
 	}
 });
+
+/** Compile-time exhaustiveness guard for the document keydown action switch: every {@link GridAction} kind
+ *  is cased above, so `action` narrows to `never` here. If a future change adds a kind the switch misses,
+ *  TypeScript flags it AND it throws loudly at runtime (No-Fallbacks: no silent drop). */
+function assertNeverAction(action: never): never {
+	throw new Error('[sheets-webview] unhandled grid action in the document keydown switch: ' + JSON.stringify(action));
+}
 
 // --- Inbound host messages ---
 
