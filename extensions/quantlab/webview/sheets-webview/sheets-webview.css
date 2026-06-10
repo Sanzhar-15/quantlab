@@ -57,8 +57,98 @@ body {
 	display: none !important;
 }
 
+/* ============================================================================
+ * Demo-prep (2026-06-10): the Google-Sheets-style MENU BAR (the very top row,
+ * above the toolbar) + the shared anchored dropdown it and the toolbar
+ * insert/delete buttons open. Same surface/border/hover vocabulary as the
+ * toolbar + tab strip (VS Code theme variables, --qb-accent blue) so the whole
+ * chrome reads as one product. The bar is a fixed-height flex row (flex: 0 0
+ * auto), so the viewport's `flex: 1 1 0%` math below is untouched -- the grid
+ * still takes exactly the free space and the tab strip stays pinned at the
+ * bottom (the prior flex-basis bug class).
+ * ========================================================================== */
+.cell-grid-menubar {
+	flex: 0 0 auto;
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	padding: 3px 8px 1px 8px;
+	background: var(--vscode-editor-background);
+	user-select: none;
+	white-space: nowrap;
+	overflow: hidden;
+}
+
+/* A menu title: a quiet 13px text button that gets the Sheets-style gray hover pill; the open menu
+ * keeps the pill (`.is-open`, toggled in JS) so the active menu stays marked while its panel shows. */
+.qb-menu-btn {
+	flex: 0 0 auto;
+	padding: 3px 10px;
+	font-family: var(--vscode-font-family);
+	font-size: 13px;
+	line-height: 18px;
+	color: var(--vscode-foreground);
+	background: transparent;
+	border: none;
+	border-radius: 4px;
+	cursor: pointer;
+}
+
+.qb-menu-btn:hover,
+.qb-menu-btn.is-open {
+	background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+}
+
+/* The shared dropdown panel: a fixed-position floating menu under its anchor (menu-bar title or
+ * toolbar insert/delete button), themed like the tab strip's right-click menu (1px border + subtle
+ * shadow, VS Code menu colors). Built + positioned in JS; one panel at a time. */
+.qb-menu-dropdown {
+	position: fixed;
+	z-index: 1000;
+	display: flex;
+	flex-direction: column;
+	min-width: 180px;
+	max-width: 320px;
+	padding: 5px 0;
+	background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+	color: var(--vscode-menu-foreground, var(--vscode-foreground));
+	border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border));
+	border-radius: 4px;
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.36);
+}
+
+/* An item row. `.is-active` is the keyboard/hover highlight painted in JS (hover routes through the
+ * same highlight so arrows + mouse never show two competing selections). */
+.qb-menu-item {
+	display: block;
+	text-align: left;
+	padding: 5px 16px;
+	font-family: var(--vscode-font-family);
+	font-size: 13px;
+	color: inherit;
+	background: transparent;
+	border: none;
+	cursor: pointer;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.qb-menu-item:hover,
+.qb-menu-item.is-active {
+	color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground));
+	background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
+}
+
+.qb-menu-sep {
+	height: 1px;
+	margin: 5px 0;
+	background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border));
+}
+
 /* UI-parity (2026-06-10): the Excel / Google-Sheets-style top toolbar -- grouped icon buttons with
- * thin dividers. Undo/redo are wired; the rest are visual for now (cell-style ops are engine-greenfield). */
+ * thin dividers. Demo-prep: undo/redo, number-format (select + the three fmt buttons), freeze, and
+ * insert/delete (anchored dropdowns) are wired; the style buttons are visual until FE-4/FE-5. */
 .cell-grid-toolbar {
 	flex: 0 0 auto;
 	display: flex;

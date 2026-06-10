@@ -11,7 +11,8 @@
  * injected {@link SheetTabHandlers} (index.ts wires them to `vscode.postMessage`): click = switch,
  * double-click = rename, right-click = a small menu (Rename / Delete / Move Left / Move Right),
  * `+` = add. The host owns ALL sheet mutation (this module is presentation only); it is vscode-free
- * so the pure model builders ({@link buildSheetStripModel} / {@link moveIndex}) are unit-tested.
+ * so the pure helpers ({@link buildSheetStripModel} / {@link moveIndex} / {@link placeTabContextMenu})
+ * are unit-tested.
  */
 
 export interface SheetTabInfo {
@@ -52,6 +53,35 @@ export interface SheetTabHandlers {
 	remove(id: number): void;
 	moveLeft(id: number): void;
 	moveRight(id: number): void;
+}
+
+/**
+ * Pure: viewport-clamped placement for the tab context menu (Codex HIGH, 2026-06-10). The strip sits at
+ * the BOTTOM of the window, so the naive `left/top = clientX/clientY` opened the menu DOWNWARD, off-screen
+ * below the viewport on every right-click. Geometry (the menu is `position: fixed`, so the click point and
+ * the viewport size share the same coordinate frame):
+ *   - **Vertical**: open downward (`top = clickY`, the platform-menu default) when the menu FITS below the
+ *     click; otherwise FLIP UPWARD, anchoring the menu's BOTTOM just above the cursor (`top = clickY -
+ *     menuH`), then clamp to the top edge (a menu taller than the viewport overflows the bottom, never the
+ *     top -- the first items stay reachable).
+ *   - **Horizontal**: `left = clickX` clamped so the menu's right edge never passes the viewport's
+ *     (`viewportW - menuW`), then clamped to the left edge (a menu wider than the viewport pins at 0).
+ * No fallbacks hide here: the caller measures the REAL menu via getBoundingClientRect after appending it;
+ * this function is total over finite inputs and unit-tested in `test/quantbook-sheet-tabs.test.ts`.
+ */
+export function placeTabContextMenu(
+	clickX: number,
+	clickY: number,
+	menuW: number,
+	menuH: number,
+	viewportW: number,
+	viewportH: number,
+): { left: number; top: number } {
+	const left = Math.max(0, Math.min(clickX, viewportW - menuW));
+	const top = clickY + menuH > viewportH
+		? Math.max(0, clickY - menuH) // flip upward: bottom edge just above the cursor
+		: clickY;
+	return { left, top };
 }
 
 // A single reusable right-click menu element (created lazily). One-at-a-time so a right-click never
@@ -109,9 +139,20 @@ function openContextMenu(x: number, y: number, id: number, handlers: SheetTabHan
 		});
 		menu.appendChild(b);
 	}
-	menu.style.left = String(x) + 'px';
-	menu.style.top = String(y) + 'px';
+	// Codex HIGH (2026-06-10): position AFTER appending. The menu must be in the document for
+	// getBoundingClientRect to yield its real laid-out size (the CSS min-width + the item labels decide
+	// it; hardcoding a guess would drift the moment the menu items change). Appended hidden so the
+	// measure can never flash an unpositioned menu at the viewport origin, then placed via the pure
+	// clamp ({@link placeTabContextMenu}) -- near the bottom edge (the strip's home) it flips UPWARD,
+	// and it never overflows the right edge. Dismiss wiring is untouched: the capture-phase
+	// pointerdown / Escape / blur handlers key off `menuEl`, set below exactly as before.
+	menu.style.visibility = 'hidden';
 	document.body.appendChild(menu);
+	const rect = menu.getBoundingClientRect();
+	const pos = placeTabContextMenu(x, y, rect.width, rect.height, window.innerWidth, window.innerHeight);
+	menu.style.left = String(pos.left) + 'px';
+	menu.style.top = String(pos.top) + 'px';
+	menu.style.visibility = '';
 	menuEl = menu;
 }
 

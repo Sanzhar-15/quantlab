@@ -444,6 +444,18 @@ export class CanvasGridRenderer {
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
 	): void {
+		// **Codex MED (2026-06-10) -- stale header hover on scroll.** The hover wash only updates on canvas
+		// mousemove/mouseleave; when the grid SCROLLS under a stationary pointer, the remembered header index
+		// still names the OLD row/col, which now sits at a different screen position -- the wash would paint
+		// on a header cell the pointer is no longer over. Cheapest correct fix: CLEAR the hover state on any
+		// scroll-driven repaint (scroll differs from the last painted frame's); the next mousemove recomputes
+		// and restores it. Cleared by direct field write, NOT setHeaderHover -- we are already inside the
+		// repaint that will reflect the clear; scheduling another rAF replay here would just burn a frame.
+		// A hover REPLAY (setHeaderHover's rAF) re-draws at the SAME scroll, so it never trips this clear.
+		if (this.hasPaintedOnce && (scrollTop !== this.lastScrollTop || scrollLeft !== this.lastScrollLeft)) {
+			this.hoveredHeaderCol = -1;
+			this.hoveredHeaderRow = -1;
+		}
 		this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
 		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
 		this.hasPaintedOnce = true;
@@ -475,6 +487,17 @@ export class CanvasGridRenderer {
 	): void {
 		const ctx = this.ctx;
 		const c = blit.copy;
+		// **Codex MED (2026-06-10) -- stale header hover on scroll (blit path).** A blittable scroll has a
+		// non-zero delta by construction (computeScrollBlitA1 returns null for dx===dy===0), so the hover
+		// state is ALWAYS stale here -- clear it unconditionally (direct field write; see draw() for why not
+		// setHeaderHover). But clearing the STATE is not enough on this path: the copy rect includes the
+		// gutter's row numbers (vertical scroll) / the header's column letters (horizontal scroll), so a
+		// hover wash painted last frame TRAVELS with the blit -- and the damage strips only repaint the
+		// exposed edge, not the band the wash moved within. Remember whether a wash was on screen so step 3
+		// below can erase it.
+		const hadHoverWash = this.hoveredHeaderCol !== -1 || this.hoveredHeaderRow !== -1;
+		this.hoveredHeaderCol = -1;
+		this.hoveredHeaderRow = -1;
 		// 1. Self-blit the overlap in DEVICE px (identity transform). Source/dest overlap within the same
 		// canvas is well-defined (the spec reads the full source region first).
 		ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -486,6 +509,23 @@ export class CanvasGridRenderer {
 			ctx.save();
 			ctx.beginPath();
 			ctx.rect(d.x, d.y, d.width, d.height);
+			ctx.clip();
+			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
+			ctx.restore();
+		}
+		// 3. Codex MED (stale hover): when the previous frame carried a hover wash, repaint the FULL sticky
+		// gutter + header bands (clipped to exactly those two rects) so the blit-carried wash pixels are
+		// erased -- the post-clear paintWindow paints both bands wash-free, restoring parity with a full
+		// redraw (DEBUG_BLIT_VERIFY would flag any leftover wash as a partial!=full divergence). Bounded
+		// cost (one column of row numbers + one row of column letters) on a RARE path (scrolling while the
+		// pointer rests on a header); the wash-free common case skips it entirely. The clip union also
+		// covers the PINNED frozen-band labels (not copied by the blit), so a preserved wash there is erased
+		// in the same pass -- the pixels always match the now-cleared hover state.
+		if (hadHoverWash) {
+			ctx.save();
+			ctx.beginPath();
+			ctx.rect(0, 0, this.gutterW, cssHeight); // the row-number gutter (full height, incl. frozen labels)
+			ctx.rect(0, 0, cssWidth, HEADER_HEIGHT); // the column-letter band (full width)
 			ctx.clip();
 			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
 			ctx.restore();
@@ -814,6 +854,8 @@ export class CanvasGridRenderer {
 		// ceiling independent of the snapshot's entry count (a dense FE-1 `qb.show` could be huge).
 		ctx.font = this.bodyFont;
 		ctx.textBaseline = 'middle';
+		// Codex HIGH (2026-06-10): alignment is PER VALUE KIND below (the Excel/Sheets convention), set
+		// inside each cell's save/clip/restore bracket; 'left' here is just the loop's baseline state.
 		ctx.textAlign = 'left';
 		const valueMax = COL_WIDTH - CELL_PAD * 2;
 		for (let r = rowRange.startIdx; r < rowRange.endIdx; r += 1) {
@@ -834,7 +876,33 @@ export class CanvasGridRenderer {
 				ctx.beginPath();
 				ctx.rect(x, y, COL_WIDTH, ROW_HEIGHT);
 				ctx.clip();
-				ctx.fillText(shown, x + CELL_PAD, y + ROW_HEIGHT / 2);
+				// **Codex HIGH (2026-06-10) -- per-kind text alignment, the Excel/Sheets convention** (the
+				// product bar is "looks like a real spreadsheet"): NUMBERS right-align at the cell's right
+				// edge minus CELL_PAD; TEXT left-aligns at left edge + CELL_PAD (the pre-fix behavior);
+				// BOOLEANS and ERRORS (#NUM! etc.) center at the cell midpoint. `pending` is a transient
+				// status placeholder ('(pending)'), not a value -- centered like an error so it reads as a
+				// status, not data. Switched on the VALUE's `kind` (the QuantbookCellValue discriminant),
+				// NOT on the display string: a formatted number carries an engine-`rendered` string (e.g.
+				// "$1,234.00") but keeps `kind:'number'`, and must still right-align. This is the SINGLE
+				// cell-text paint site -- every pane (body + frozen rows/cols/corner) and every paint path
+				// (full draw / drawScroll strips / drawDamage bands) funnels through paintCellRegion, so the
+				// rule holds everywhere. textAlign mutates inside this save/restore bracket (canvas state
+				// includes textAlign), so the loop's 'left' baseline is restored each iteration.
+				switch (entry.value.kind) {
+					case 'number':
+						ctx.textAlign = 'right';
+						ctx.fillText(shown, x + COL_WIDTH - CELL_PAD, y + ROW_HEIGHT / 2);
+						break;
+					case 'text':
+						ctx.fillText(shown, x + CELL_PAD, y + ROW_HEIGHT / 2);
+						break;
+					case 'boolean':
+					case 'error':
+					case 'pending':
+						ctx.textAlign = 'center';
+						ctx.fillText(shown, x + COL_WIDTH / 2, y + ROW_HEIGHT / 2);
+						break;
+				}
 				ctx.restore();
 			}
 		}

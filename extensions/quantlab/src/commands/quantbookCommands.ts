@@ -35,7 +35,7 @@ import * as vscode from 'vscode';
 // / deleteSheet / moveSheet / workbookSnapshot, the buildSheet* quickpick
 // builders, connectOrSpawn) belong to the B2-stubbed grid commands and are no
 // longer imported here.
-import { addSheet, appendPutValueValidated, createSession, createWorkbookSession, openWorkbookFromQbook, quantbookEngineVersion, recalcDirtyChecked, saveSessionToQbook, sessionFromSnapshot, setValueValidated } from '../quantbook/session';
+import { addSheet, appendPutValueValidated, createSession, createWorkbookSession, openWorkbookFromQbook, quantbookEngineVersion, recalcDirtyChecked, saveSessionToQbook, sessionFromSnapshot, setFormulaValidated, setValueValidated } from '../quantbook/session';
 import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
 import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
@@ -262,6 +262,15 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// Opens a single-writer Session-backed grid seeded with sample data so the
 	// scaffold shows something. The user can edit number / text / `=formula`
 	// cells; the host writes via Session.setValue/setFormula, recalcs, re-renders.
+	//
+	// **Demo-prep (2026-06-10)**: the seed is a compelling QUANT demo workbook (not
+	// toy numbers): a monthly-returns sheet with a native-=SHARPE stats block, a
+	// price sheet with =MAX_DRAWDOWN, and an empty Scratch sheet as the live-typing
+	// demo surface. Function choices are pinned by a release-dylib smoke
+	// (2026-06-10): SHARPE/SUM/AVERAGE/STDEV.S/MIN/MAX/MEDIAN bind literal ranges;
+	// MAX_DRAWDOWN is defined over a PRICE series (it returns #NUM! on a returns
+	// series, hence the dedicated Prices sheet); VOLATILITY does NOT bind literal
+	// ranges and is deliberately absent (STDEV.S serves as the volatility stat).
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookCellGrid', () => {
 			const log = getOutput();
@@ -273,23 +282,78 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			try {
 				// FE-0a Part B (B1): bind the owning single-writer Session.
 				session = createWorkbookSession();
-				// Seed sample data on THREE sheets (0, 1, 2). addSheet MUST precede
-				// any setValue on a sheet (the engine rejects a write to a sheet that
-				// does not exist yet). Sheet ids are assigned in append order: first
-				// addSheet -> 0, second -> 1, third -> 2.
-				session.addSheet('S0', 1000);
-				session.addSheet('S1', 1000);
-				session.addSheet('S2', 1000);
-				const num = (n: number): { kind: 'number'; number: number } => ({ kind: 'number', number: n });
-				setValueValidated(session, 0, 0, 0, num(42));
-				setValueValidated(session, 0, 0, 1, num(100));
-				setValueValidated(session, 0, 1, 0, num(3.14));
-				setValueValidated(session, 0, 1, 1, num(2.718));
-				setValueValidated(session, 0, 2, 0, num(0));
-				setValueValidated(session, 1, 0, 0, num(11));
-				setValueValidated(session, 1, 0, 1, num(12));
-				setValueValidated(session, 1, 1, 0, num(13));
-				setValueValidated(session, 2, 0, 0, num(99));
+				// Seed THREE sheets. addSheet MUST precede any setValue on a sheet (the
+				// engine rejects a write to a sheet that does not exist yet). Sheet ids are
+				// assigned in append order: 'Returns' -> 0, 'Prices' -> 1, 'Scratch' -> 2.
+				session.addSheet('Returns', 1000);
+				session.addSheet('Prices', 1000);
+				session.addSheet('Scratch', 1000);
+				// Local write helpers over the validated session wrappers (the helpers
+				// capture the non-undefined binding so the closures stay narrow-typed).
+				const s = session;
+				const num = (sheet: number, row: number, col: number, n: number): void =>
+					setValueValidated(s, sheet, row, col, { kind: 'number', number: n });
+				const txt = (sheet: number, row: number, col: number, t: string): void =>
+					setValueValidated(s, sheet, row, col, { kind: 'text', text: t });
+				// Formula BODY without the leading '=' (engine convention -- setFormulaValidated
+				// passes the text through; the grid renders it with the '=' prefix).
+				const fx = (sheet: number, row: number, col: number, body: string): void =>
+					setFormulaValidated(s, sheet, row, col, body);
+				const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+				// --- Sheet 0 'Returns': a monthly return series (B2:B13) + a stats block in D/E. ---
+				const RETURNS = [0.021, -0.013, 0.034, 0.008, -0.022, 0.041, 0.015, -0.007, 0.026, 0.012, -0.018, 0.029];
+				txt(0, 0, 0, 'Month');
+				txt(0, 0, 1, 'Return');
+				MONTHS.forEach((month, i) => {
+					txt(0, i + 1, 0, month);
+					num(0, i + 1, 1, RETURNS[i]);
+				});
+				txt(0, 1, 3, 'Sharpe');
+				fx(0, 1, 4, 'SHARPE(B2:B13)'); // 0.4959 on this series (smoke-verified)
+				txt(0, 2, 3, 'Avg return');
+				fx(0, 2, 4, 'AVERAGE(B2:B13)');
+				txt(0, 3, 3, 'Volatility');
+				fx(0, 3, 4, 'STDEV.S(B2:B13)');
+				txt(0, 4, 3, 'Best month');
+				fx(0, 4, 4, 'MAX(B2:B13)');
+				txt(0, 5, 3, 'Worst month');
+				fx(0, 5, 4, 'MIN(B2:B13)');
+				txt(0, 6, 3, 'Total');
+				fx(0, 6, 4, 'SUM(B2:B13)');
+				// --- Sheet 1 'Prices': a price path (B2:B13) + the drawdown block in D/E. ---
+				const PRICES = [100, 104, 109, 112, 106, 101, 97, 103, 110, 115, 113, 118];
+				txt(1, 0, 0, 'Month');
+				txt(1, 0, 1, 'Price');
+				MONTHS.forEach((month, i) => {
+					txt(1, i + 1, 0, month);
+					num(1, i + 1, 1, PRICES[i]);
+				});
+				txt(1, 1, 3, 'Max drawdown');
+				fx(1, 1, 4, 'MAX_DRAWDOWN(B2:B13)'); // -0.1339 on this path (smoke-verified; PRICES, not returns)
+				txt(1, 2, 3, 'High');
+				fx(1, 2, 4, 'MAX(B2:B13)');
+				txt(1, 3, 3, 'Low');
+				fx(1, 3, 4, 'MIN(B2:B13)');
+				txt(1, 4, 3, 'Median');
+				fx(1, 4, 4, 'MEDIAN(B2:B13)');
+				// Sheet 2 'Scratch' stays EMPTY -- the live-typing demo surface.
+				// --- Seed-time number formats: the same registerFormat -> buildSetFormatOps ->
+				// batch pattern as the Set Cell Format command (the engine renders the formatted
+				// string; the grid just paints `entry.rendered`). ONE batch per sheet = one undo
+				// unit each; coordinates are 0-based (A2 = row 1, E2 = row 1 / col 4).
+				const percentId = s.registerFormat(formatStringForPreset('Percent')); // 0.00%
+				const ratioId = s.registerFormat(formatStringForPreset('Number')); // 0.00 (Sharpe is a ratio, not a percent)
+				const thousandsId = s.registerFormat(formatStringForPreset('NumberThousands')); // #,##0.00
+				s.batch([
+					...buildSetFormatOps(0, normalizeSelectionRect(1, 1, 12, 1), percentId), // Returns!B2:B13
+					...buildSetFormatOps(0, normalizeSelectionRect(1, 4, 1, 4), ratioId), // Returns!E2 (Sharpe)
+					...buildSetFormatOps(0, normalizeSelectionRect(2, 4, 6, 4), percentId), // Returns!E3:E7 (stats are return-units)
+				], { undoLabel: 'Seed demo formats on Returns' });
+				s.batch([
+					...buildSetFormatOps(1, normalizeSelectionRect(1, 1, 12, 1), thousandsId), // Prices!B2:B13
+					...buildSetFormatOps(1, normalizeSelectionRect(1, 4, 1, 4), percentId), // Prices!E2 (drawdown is a fraction)
+					...buildSetFormatOps(1, normalizeSelectionRect(2, 4, 4, 4), thousandsId), // Prices!E3:E5
+				], { undoLabel: 'Seed demo formats on Prices' });
 				recalcDirtyChecked(session);
 				CellGridPanel.show(context, session, 0);
 				// Ownership has transferred to the live registered panel (its ref-counted
@@ -298,7 +362,7 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				// is owned by a live panel (Codex host-batch audit MED). Must come BEFORE
 				// any further statement that can throw.
 				session = undefined;
-				log.appendLine('Cell Grid (sheet 0) opened with sample data on sheets 0/1/2.');
+				log.appendLine('Cell Grid opened with the demo workbook: Returns (=SHARPE stats block) / Prices (=MAX_DRAWDOWN) / Scratch (empty), percent + number formats seeded.');
 			} catch (err) {
 				// Close the session only if the failure happened BEFORE the panel took
 				// ownership (seed write / recalc / show-before-registration) -- on success
@@ -1114,18 +1178,36 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	registerStructuralCommand('quantlab.quantbookDeleteRow', 'deleteRow');
 	registerStructuralCommand('quantlab.quantbookDeleteColumn', 'deleteColumn');
 
-	// 3. FREEZE PANES HERE -- a LOUD PLACEHOLDER (Codex re-audit MED). The frozen-panes lead OWNS the real
-	// implementation in this same wave; W3 only references the command in the context menu. To keep THIS
-	// branch standalone-safe (a menu command with no registered handler is a broken command path -- worse
-	// than a clear message), W3 registers this placeholder that explains the feature is pending. **The
-	// conductor REPLACES this registration + the package.json command declaration with the lead's real
-	// `quantlab.quantbookFreezePanesHere` at integration** (a duplicate registerCommand would throw, so the
-	// conductor drops exactly one). No-Fallbacks: the placeholder is a clear message, never a silent no-op.
+	// 3. FREEZE PANES HERE (Codex HIGH, 2026-06-10) -- the context menu's freeze, over the SAME carried
+	// `{panelToken, selection}` payload as the structural commands above. The earlier conductor-reconciled
+	// wiring delegated to the palette `quantlab.quantbookFreezePanes`, which freezes from the FOCUSED
+	// panel's async-updated `latestSelection` -- reintroducing exactly the stale-selection + wrong-grid
+	// races (Codex HIGH-1 + HIGH-2) the structural commands solved by carrying the right-click-time
+	// selection in the context arg. So this command parses the payload and freezes the EXACT raising panel
+	// at the payload's focus cell via `CellGridPanel.freezePanesAtContextSelection` (same semantics as the
+	// palette command: pin the rows above + columns left of the focus cell; a focus of A1 -> unfreeze,
+	// matching Excel). The palette command stays selection-by-focus BY DESIGN (it has no context arg).
 	context.subscriptions.push(
-		vscode.commands.registerCommand('quantlab.quantbookFreezePanesHere', () => {
-			// Conductor-reconciled (wave-3 integration): the frozen-panes lead's real `quantbookFreezePanes`
-			// command now exists, so the context menu's "Freeze Panes Here" item invokes it directly.
-			void vscode.commands.executeCommand('quantlab.quantbookFreezePanes');
+		vscode.commands.registerCommand('quantlab.quantbookFreezePanesHere', (contextArg?: unknown) => {
+			const arg = parseContextMenuArg(contextArg);
+			if (arg === undefined) {
+				contextArgToast();
+				return;
+			}
+			const result = CellGridPanel.freezePanesAtContextSelection(arg.panelToken, arg.selection);
+			if (!result.ok) {
+				void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+				return;
+			}
+			const log = getOutput();
+			if (result.rows === 0 && result.cols === 0) {
+				// The right-clicked focus cell is A1 -> nothing above/left to freeze; Excel treats this as Unfreeze.
+				void vscode.window.showInformationMessage('Quantbook: nothing to freeze (the active cell is A1). The grid is now unfrozen.');
+				log.appendLine('Freeze Panes at A1 -> unfrozen (no rows/cols above/left of the active cell).');
+				return;
+			}
+			void vscode.window.showInformationMessage(`Quantbook: froze ${result.rows} row(s) and ${result.cols} column(s).`);
+			log.appendLine(`Froze panes: ${result.rows} row(s), ${result.cols} column(s).`);
 		}),
 	);
 }

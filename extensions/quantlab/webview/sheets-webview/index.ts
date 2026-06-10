@@ -30,7 +30,10 @@
  *                    `{type:'errorReply', sheet,row,col,code,message, commitId?, webviewId?}`,
  *                    `{type:'commitResult', commitId, ok:true, webviewId?}` (Phase 2 -- success ack to THIS panel).
  *   webview -> host: `{type:'putValue', sheet,row,col,rawInput, commitId?, webviewId?}` (Phase 2 -- the token),
- *                    `{type:'undo'}`, `{type:'redo'}`, `{type:'webviewReady'}` (once on load).
+ *                    `{type:'undo'}`, `{type:'redo'}`, `{type:'webviewReady'}` (once on load),
+ *                    `{type:'toolbarCommand', command}` / `{type:'toolbarCommand', command:'setNumberFormat', preset}`
+ *                    (demo-prep 2026-06-10 -- the menu bar + wired toolbar; the host `cellGridPanel.ts` routes
+ *                    these to the freeze / structural / save-open / number-format commands).
  *   `webviewId` (megaudit 2026-06-09) is this webview's per-load instance id, echoed by the host so a stale
  *   PRE-reload `commitResult`/`errorReply` is dropped (its reused commitId would otherwise hit a fresh edit).
  *   Resolution: a pending edit closes ONLY on a matching `commitResult`/`errorReply` (by commitId, same
@@ -154,15 +157,42 @@ if (root === null) {
 root.innerHTML =
 	'<h2 id="sheets-title">Quantbook Cell Grid</h2>' +
 	'<div class="meta" id="sheets-meta"></div>' +
+	// Demo-prep (2026-06-10): the Google-Sheets-style MENU BAR -- the very top row, above the toolbar.
+	// Five menus, ONLY functional items (no dead entries): File (save/open), Edit (undo/redo), View
+	// (freeze/unfreeze), Insert (rows/cols + new sheet), Format (number-format presets). The dropdown
+	// panel is built lazily in JS (one shared component with the toolbar insert/delete dropdowns); the
+	// buttons here are just the always-visible bar. ARIA: menubar/menuitem here, menu/menuitem on the
+	// dropdown. Buttons never steal focus from the grid (mousedown preventDefault in the delegated handler).
+	'<div id="sheets-menubar" class="cell-grid-menubar" role="menubar" aria-label="Spreadsheet menu bar">' +
+	'<button type="button" class="qb-menu-btn" data-menu="file" role="menuitem" aria-haspopup="true" aria-expanded="false">File</button>' +
+	'<button type="button" class="qb-menu-btn" data-menu="edit" role="menuitem" aria-haspopup="true" aria-expanded="false">Edit</button>' +
+	'<button type="button" class="qb-menu-btn" data-menu="view" role="menuitem" aria-haspopup="true" aria-expanded="false">View</button>' +
+	'<button type="button" class="qb-menu-btn" data-menu="insert" role="menuitem" aria-haspopup="true" aria-expanded="false">Insert</button>' +
+	'<button type="button" class="qb-menu-btn" data-menu="format" role="menuitem" aria-haspopup="true" aria-expanded="false">Format</button>' +
+	'</div>' +
 	'<div class="sheets-error" id="sheets-error" role="alert" hidden></div>' +
-	// UI-parity (2026-06-10): an Excel/Sheets-style top toolbar. Undo/redo are wired (native webview
-	// messages); the rest are visual for the demo (styling exists; cell-style ops are engine-greenfield,
-	// FE-4/FE-5). Buttons carry a `data-cmd` the delegated handler reads.
+	// UI-parity (2026-06-10): an Excel/Sheets-style top toolbar. Demo-prep wiring: undo/redo (native
+	// webview messages), the number-format select + fmt-currency/percent/decimal ('toolbarCommand'
+	// setNumberFormat), freeze ('toolbarCommand' freezePanes), and insert/delete (anchored dropdowns ->
+	// the structural 'toolbarCommand's). Bold/italic/underline/colors/borders/align/sort/find/zoom stay
+	// VISUAL-ONLY (cell-style ops are engine-greenfield, FE-4/FE-5) -- deliberately no handler, so a click
+	// is a silent no-op (not an error). Buttons carry a `data-cmd` the delegated handler reads.
 	'<div id="sheets-toolbar" class="cell-grid-toolbar" role="toolbar" aria-label="Spreadsheet toolbar">' +
 	'<button type="button" class="cgt-btn" data-cmd="undo" title="Undo"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 6.5H8.5C10.71 6.5 12.5 8.29 12.5 10.5C12.5 12.71 10.71 14.5 8.5 14.5H5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 3.5L2.5 6.5L5 9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
 	'<button type="button" class="cgt-btn" data-cmd="redo" title="Redo"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13.5 6.5H7.5C5.29 6.5 3.5 8.29 3.5 10.5C3.5 12.71 5.29 14.5 7.5 14.5H11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M11 3.5L13.5 6.5L11 9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
 	'<span class="cgt-sep"></span>' +
-	'<select class="cgt-select" data-cmd="numfmt" title="Number format" aria-label="Number format"><option>General</option><option>Number</option><option>Percent</option><option>Currency</option><option>Date</option><option>Scientific</option></select>' +
+	// Demo-prep (2026-06-10): the option VALUES are the engine's exact preset ids (the host contract's
+	// `setNumberFormat.preset`); the labels are the user-facing names. NO 'Scientific' -- the engine
+	// preset list does not have it, so offering it would be a dead entry (No-Fallbacks: never offer an
+	// action that cannot land). 'Number with thousands' carries the 'NumberThousands' preset id.
+	'<select class="cgt-select" data-cmd="numfmt" title="Number format" aria-label="Number format">' +
+	'<option value="General">General</option>' +
+	'<option value="Number">Number</option>' +
+	'<option value="NumberThousands">Number with thousands</option>' +
+	'<option value="Currency">Currency</option>' +
+	'<option value="Percent">Percent</option>' +
+	'<option value="Date">Date</option>' +
+	'</select>' +
 	'<span class="cgt-sep"></span>' +
 	'<button type="button" class="cgt-btn" data-cmd="fmt-currency" title="Currency format"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2V14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M10.5 4.5C10.5 4.5 9.8 3.5 8 3.5C6.2 3.5 5 4.5 5 5.75C5 7 6 7.5 8 8C10 8.5 11 9.25 11 10.5C11 11.75 9.8 12.5 8 12.5C6.2 12.5 5.5 11.5 5.5 11.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
 	'<button type="button" class="cgt-btn" data-cmd="fmt-percent" title="Percent format"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="4.5" cy="5" r="1.8" stroke="currentColor" stroke-width="1.3"/><circle cx="11.5" cy="11" r="1.8" stroke="currentColor" stroke-width="1.3"/><line x1="13" y1="3" x2="3" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>' +
@@ -181,8 +211,8 @@ root.innerHTML =
 	'<button type="button" class="cgt-btn" data-cmd="align-right" title="Align right"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><line x1="2.5" y1="4" x2="13.5" y2="4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="6.5" y1="7" x2="13.5" y2="7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="2.5" y1="10" x2="13.5" y2="10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="6.5" y1="13" x2="13.5" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>' +
 	'<span class="cgt-sep"></span>' +
 	'<button type="button" class="cgt-btn" data-cmd="freeze" title="Freeze panes"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="0.5" stroke="currentColor" stroke-width="1.1"/><line x1="8" y1="6" x2="14" y2="6" stroke="currentColor" stroke-width="0.9" stroke-dasharray="1.5 1.5"/><line x1="5" y1="6" x2="5" y2="14" stroke="currentColor" stroke-width="0.9" stroke-dasharray="1.5 1.5"/><line x1="2" y1="6" x2="14" y2="6" stroke="currentColor" stroke-width="2"/><line x1="5" y1="2" x2="5" y2="14" stroke="currentColor" stroke-width="2"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="insert" title="Insert row/column"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="10" height="8" rx="0.75" stroke="currentColor" stroke-width="1.2"/><line x1="1.5" y1="5.5" x2="11.5" y2="5.5" stroke="currentColor" stroke-width="1.2"/><line x1="6.5" y1="2.5" x2="6.5" y2="10.5" stroke="currentColor" stroke-width="1.2"/><circle cx="12.5" cy="11.5" r="3" fill="#188038"/><line x1="12.5" y1="9.5" x2="12.5" y2="13.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/><line x1="10.5" y1="11.5" x2="14.5" y2="11.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="delete" title="Delete row/column"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="10" height="8" rx="0.75" stroke="currentColor" stroke-width="1.2"/><line x1="1.5" y1="5.5" x2="11.5" y2="5.5" stroke="currentColor" stroke-width="1.2"/><line x1="6.5" y1="2.5" x2="6.5" y2="10.5" stroke="currentColor" stroke-width="1.2"/><circle cx="12.5" cy="11.5" r="3" fill="#ea4335"/><line x1="10.5" y1="11.5" x2="14.5" y2="11.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="insert" title="Insert row/column" aria-haspopup="true" aria-expanded="false"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="10" height="8" rx="0.75" stroke="currentColor" stroke-width="1.2"/><line x1="1.5" y1="5.5" x2="11.5" y2="5.5" stroke="currentColor" stroke-width="1.2"/><line x1="6.5" y1="2.5" x2="6.5" y2="10.5" stroke="currentColor" stroke-width="1.2"/><circle cx="12.5" cy="11.5" r="3" fill="#188038"/><line x1="12.5" y1="9.5" x2="12.5" y2="13.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/><line x1="10.5" y1="11.5" x2="14.5" y2="11.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="delete" title="Delete row/column" aria-haspopup="true" aria-expanded="false"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="10" height="8" rx="0.75" stroke="currentColor" stroke-width="1.2"/><line x1="1.5" y1="5.5" x2="11.5" y2="5.5" stroke="currentColor" stroke-width="1.2"/><line x1="6.5" y1="2.5" x2="6.5" y2="10.5" stroke="currentColor" stroke-width="1.2"/><circle cx="12.5" cy="11.5" r="3" fill="#ea4335"/><line x1="10.5" y1="11.5" x2="14.5" y2="11.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/></svg></button>' +
 	'<span class="cgt-sep"></span>' +
 	'<button type="button" class="cgt-btn" data-cmd="sort" title="Sort A-Z"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><line x1="2" y1="4" x2="9" y2="4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="2" y1="7.5" x2="7.5" y2="7.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="2" y1="11" x2="6" y2="11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="12" y1="3" x2="12" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M9.5 10.5L12 13L14.5 10.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
 	'<button type="button" class="cgt-btn" data-cmd="find" title="Find"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="4" stroke="currentColor" stroke-width="1.3"/><line x1="10" y1="10" x2="13.5" y2="13.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>' +
@@ -234,21 +264,460 @@ const formulaInputEl = document.getElementById('sheets-formula-input') as HTMLIn
 const viewportEl = document.getElementById('sheets-viewport') as HTMLElement;
 // Sheet-tabs (2026-06-10): the bottom tab strip container (painted by `applySheetTabs` on each render).
 const tabBarEl = document.getElementById('sheets-tab-bar') as HTMLElement;
-// UI-parity (2026-06-10): the top toolbar. Undo/redo post the existing native messages; the other
-// buttons are visual for the demo (cell-style ops are engine-greenfield -- FE-4/FE-5). Delegated click.
+// UI-parity (2026-06-10) + demo-prep wiring: the top toolbar and the menu bar above it. The wired
+// controls post the HOST CONTRACT message `{type:'toolbarCommand', command}` (or `{..., command:
+// 'setNumberFormat', preset}`); the host `cellGridPanel.ts` owns the receiving side. The remaining
+// style buttons stay visual-only (engine-greenfield, FE-4/FE-5) -- deliberately NO handler, so a
+// click is a quiet no-op, never a console error.
 const toolbarEl = document.getElementById('sheets-toolbar') as HTMLElement;
+const menubarEl = document.getElementById('sheets-menubar') as HTMLElement;
+
+// ============================================================================================
+// Demo-prep (2026-06-10) -- MENU BAR + shared anchored dropdown + toolbar command wiring.
+//
+// One dropdown COMPONENT serves both surfaces: the Google-Sheets-style menu bar (File / Edit /
+// View / Insert / Format) and the toolbar's insert/delete buttons (anchored mini-menus). The
+// panel is a single lazily-created `position:fixed` element on document.body (the same pattern as
+// sheetTabBar.ts's right-click menu), positioned under its anchor, dismissed on click-away /
+// Escape / window blur, and rebuilt per open (the item lists are static, so there is no state to
+// preserve). ARIA: the panel is role=menu, items role=menuitem; the anchor's `aria-expanded`
+// tracks open/close.
+//
+// FOCUS MODEL (the "buttons must not steal persistent focus" requirement): every mousedown on a
+// menubar button, toolbar button, or dropdown item is preventDefault-ed, so keyboard focus stays
+// wherever it was (normally #sheets-viewport) for the whole interaction; after an item ACTIVATES
+// we explicitly `viewportEl.focus()` so keyboard nav always lands back on the grid even if focus
+// was on the body (e.g. before the first click). The number-format <select> is the one exception:
+// a select must take focus to open natively, so its `change` handler restores the viewport focus
+// instead. The formula-suggest dropdown (renderCompletion) uses the same mousedown-preventDefault
+// pattern; the sheet-tab strip's buttons do not, but the tab strip sits below the grid and a tab
+// switch re-renders anyway -- the menu/toolbar chrome must NOT have that excuse.
+//
+// KEYBOARD: while a dropdown is open, a capture-phase document keydown owns the keys BEFORE the
+// grid's bubble-phase nav handler (focus is still on the viewport, so without the capture gate an
+// ArrowDown would move the grid selection under an open menu): Escape closes (and re-focuses the
+// grid), Up/Down move the highlight (wrapping, via the same pure `moveActiveIndex` the formula
+// completion uses), Home/End jump, Enter/Space activate, Left/Right step between menu-bar menus
+// (menubar-opened panels only). Any OTHER key closes the menu and falls through to the grid
+// handler (type-to-edit etc. behave as if the menu were never open).
+// ============================================================================================
+
+/** The host-contract command ids (cellGridPanel.ts implements the receiving side; keep in sync). */
+type ToolbarCommand =
+	| 'freezePanes'
+	| 'unfreezePanes'
+	| 'insertRowAbove'
+	| 'insertRowBelow'
+	| 'insertColumnLeft'
+	| 'insertColumnRight'
+	| 'deleteRow'
+	| 'deleteColumn'
+	| 'saveAs'
+	| 'openWorkbook';
+
+/** The engine's number-format preset ids (the host contract's `setNumberFormat.preset`). There is NO
+ * 'Scientific' -- the engine preset list does not have it (the old visual-only select offered it; the
+ * wired select must not offer an action that cannot land). */
+const NUMBER_FORMAT_PRESETS = ['General', 'Number', 'NumberThousands', 'Currency', 'Percent', 'Date'] as const;
+type NumberFormatPreset = (typeof NUMBER_FORMAT_PRESETS)[number];
+function isNumberFormatPreset(v: string): v is NumberFormatPreset {
+	return (NUMBER_FORMAT_PRESETS as readonly string[]).includes(v);
+}
+
+/** Post a plain toolbar command to the host (the exact contract shape -- no extra fields). */
+function postToolbarCommand(command: ToolbarCommand): void {
+	vscode.postMessage({ type: 'toolbarCommand', command });
+}
+/** Post the number-format variant (the contract's only parameterized command). */
+function postSetNumberFormat(preset: NumberFormatPreset): void {
+	vscode.postMessage({ type: 'toolbarCommand', command: 'setNumberFormat', preset });
+}
+
+/** One actionable dropdown entry; `'separator'` draws a thin divider (non-interactive). */
+interface MenuItemSpec {
+	readonly label: string;
+	readonly run: () => void;
+}
+type MenuEntrySpec = MenuItemSpec | 'separator';
+
+// The toolbar insert/delete mini-menus reuse the same specs the menu bar's Insert menu is built from.
+const INSERT_ROW_COL_ITEMS: readonly MenuItemSpec[] = [
+	{ label: 'Row above', run: () => postToolbarCommand('insertRowAbove') },
+	{ label: 'Row below', run: () => postToolbarCommand('insertRowBelow') },
+	{ label: 'Column left', run: () => postToolbarCommand('insertColumnLeft') },
+	{ label: 'Column right', run: () => postToolbarCommand('insertColumnRight') },
+];
+const DELETE_ROW_COL_ITEMS: readonly MenuItemSpec[] = [
+	{ label: 'Delete row', run: () => postToolbarCommand('deleteRow') },
+	{ label: 'Delete column', run: () => postToolbarCommand('deleteColumn') },
+];
+
+// The menu bar's five menus. ONLY functional items -- every entry posts a message the host
+// implements TODAY (no dead entries that would make the demo look broken). 'New sheet' reuses the
+// EXACT message the tab strip's `+` posts (`sheetTabHandlers.add` below: `{type:'sheetCommand',
+// command:'add'}`) so both entry points are indistinguishable to the host.
+const MENUBAR_MENUS: ReadonlyArray<{ readonly id: string; readonly entries: readonly MenuEntrySpec[] }> = [
+	{
+		id: 'file',
+		entries: [
+			{ label: 'Save As…', run: () => postToolbarCommand('saveAs') },
+			{ label: 'Open Workbook…', run: () => postToolbarCommand('openWorkbook') },
+		],
+	},
+	{
+		id: 'edit',
+		entries: [
+			// Undo/redo post the SAME native messages as the toolbar buttons + Ctrl/Cmd+Z|Y (one host path).
+			{ label: 'Undo', run: () => vscode.postMessage({ type: 'undo' }) },
+			{ label: 'Redo', run: () => vscode.postMessage({ type: 'redo' }) },
+		],
+	},
+	{
+		id: 'view',
+		entries: [
+			{ label: 'Freeze panes', run: () => postToolbarCommand('freezePanes') },
+			{ label: 'Unfreeze panes', run: () => postToolbarCommand('unfreezePanes') },
+		],
+	},
+	{
+		id: 'insert',
+		entries: [
+			...INSERT_ROW_COL_ITEMS,
+			'separator',
+			{ label: 'New sheet', run: () => vscode.postMessage({ type: 'sheetCommand', command: 'add' }) },
+		],
+	},
+	{
+		id: 'format',
+		entries: [
+			{ label: 'General', run: () => postSetNumberFormat('General') },
+			{ label: 'Number', run: () => postSetNumberFormat('Number') },
+			{ label: 'Number with thousands', run: () => postSetNumberFormat('NumberThousands') },
+			{ label: 'Currency', run: () => postSetNumberFormat('Currency') },
+			{ label: 'Percent', run: () => postSetNumberFormat('Percent') },
+			{ label: 'Date', run: () => postSetNumberFormat('Date') },
+		],
+	},
+];
+
+/** The open dropdown's state, or null when closed. `menuId` is the menubar menu id, or null for a
+ * toolbar-anchored dropdown (Left/Right menu-stepping only applies to menubar panels). `items` is the
+ * flattened ACTIONABLE list (separators excluded) in display order; `itemEls` are their buttons (same
+ * indexing) for highlight painting; `activeIndex` is the keyboard highlight (-1 = none, the initial
+ * state -- like Sheets, nothing is highlighted until hover/arrow). */
+interface OpenMenuState {
+	readonly anchor: HTMLElement;
+	readonly menuId: string | null;
+	readonly items: readonly MenuItemSpec[];
+	readonly itemEls: readonly HTMLButtonElement[];
+	activeIndex: number;
+}
+// NOTE (the W-G-1b esbuild lesson): these module-level `let`s are only READ inside event callbacks,
+// which all fire well after module evaluation -- no pre-init hazard.
+let openMenu: OpenMenuState | null = null;
+let dropdownEl: HTMLDivElement | null = null;
+
+/** Close the open dropdown (DOM + state + the anchor's open styling/ARIA). Safe when already closed. */
+function closeMenuDropdown(): void {
+	if (dropdownEl !== null) {
+		dropdownEl.remove();
+		dropdownEl = null;
+	}
+	if (openMenu !== null) {
+		openMenu.anchor.classList.remove('is-open');
+		openMenu.anchor.setAttribute('aria-expanded', 'false');
+		openMenu = null;
+	}
+}
+
+/** Paint the keyboard/hover highlight onto item `idx` (-1 clears). Hover and arrows share this so the
+ * two never show competing highlights. */
+function setMenuHighlight(idx: number): void {
+	if (openMenu === null) {
+		return;
+	}
+	openMenu.activeIndex = idx;
+	openMenu.itemEls.forEach((el, i) => {
+		el.classList.toggle('is-active', i === idx);
+	});
+}
+
+/** Activate item `idx`: close FIRST (so a host-triggered re-render never races an open panel), run
+ * the action, then put keyboard focus back on the grid so arrow-nav continues immediately. */
+function activateMenuItem(idx: number): void {
+	if (openMenu === null || idx < 0 || idx >= openMenu.items.length) {
+		return;
+	}
+	const item = openMenu.items[idx];
+	closeMenuDropdown();
+	item.run();
+	viewportEl.focus();
+}
+
+/**
+ * Open (or move) the shared dropdown under `anchor` with `entries`. Replaces any open panel
+ * (one-at-a-time, like the tab-strip menu). The panel is `position:fixed` on document.body so it
+ * floats over the toolbar/canvas without disturbing the root flex column; after append it is
+ * clamped to the window's right edge (a near-edge toolbar anchor must not spill off-screen).
+ */
+function openMenuDropdown(anchor: HTMLElement, entries: readonly MenuEntrySpec[], menuId: string | null): void {
+	closeMenuDropdown();
+	const panel = document.createElement('div');
+	panel.className = 'qb-menu-dropdown';
+	panel.setAttribute('role', 'menu');
+	const items: MenuItemSpec[] = [];
+	const itemEls: HTMLButtonElement[] = [];
+	for (const entry of entries) {
+		if (entry === 'separator') {
+			const sep = document.createElement('div');
+			sep.className = 'qb-menu-sep';
+			sep.setAttribute('role', 'separator');
+			panel.appendChild(sep);
+			continue;
+		}
+		const idx = items.length;
+		const b = document.createElement('button');
+		b.type = 'button';
+		b.className = 'qb-menu-item';
+		b.setAttribute('role', 'menuitem');
+		b.textContent = entry.label;
+		// mousedown preventDefault: keep focus on the grid for the whole interaction (the focus model above).
+		b.addEventListener('mousedown', (ev) => {
+			ev.preventDefault();
+		});
+		b.addEventListener('mouseover', () => {
+			setMenuHighlight(idx);
+		});
+		b.addEventListener('click', () => {
+			activateMenuItem(idx);
+		});
+		items.push(entry);
+		itemEls.push(b);
+		panel.appendChild(b);
+	}
+	const rect = anchor.getBoundingClientRect();
+	panel.style.top = rect.bottom + 2 + 'px';
+	document.body.appendChild(panel);
+	// Clamp to the window's right edge AFTER append (offsetWidth needs layout). Left edge can't
+	// underflow: every anchor sits at x >= the bar padding.
+	const left = Math.min(rect.left, Math.max(4, window.innerWidth - panel.offsetWidth - 4));
+	panel.style.left = left + 'px';
+	dropdownEl = panel;
+	openMenu = { anchor, menuId, items, itemEls, activeIndex: -1 };
+	anchor.classList.add('is-open');
+	anchor.setAttribute('aria-expanded', 'true');
+}
+
+/** Open the menubar menu for `btn` (its `data-menu` id). A missing/unknown id is a TEMPLATE bug --
+ * surfaced loud (No-Fallbacks), never a silently dead menu. */
+function openMenubarMenu(btn: HTMLElement): void {
+	const id = btn.getAttribute('data-menu');
+	const def = MENUBAR_MENUS.find((m) => m.id === id);
+	if (def === undefined) {
+		console.error('[sheets-webview] menu bar button has an unknown data-menu id (template bug):', id);
+		return;
+	}
+	openMenuDropdown(btn, def.entries, def.id);
+}
+
+// Menu bar: open on MOUSEDOWN (Sheets-feel -- a click-wait feels laggy), toggle-close on the open
+// anchor. preventDefault on every mousedown so the buttons never take focus from the grid.
+menubarEl.addEventListener('mousedown', (e) => {
+	e.preventDefault();
+	const btn = (e.target as HTMLElement).closest('.qb-menu-btn') as HTMLElement | null;
+	if (btn === null) {
+		return;
+	}
+	if (openMenu !== null && openMenu.anchor === btn) {
+		closeMenuDropdown();
+		return;
+	}
+	openMenubarMenu(btn);
+});
+// Sheets behavior: while a MENUBAR menu is open, hovering a sibling menu button moves the open
+// panel there (no click needed). Toolbar-anchored dropdowns (menuId === null) do not hover-move.
+menubarEl.addEventListener('mouseover', (e) => {
+	if (openMenu === null || openMenu.menuId === null) {
+		return;
+	}
+	const btn = (e.target as HTMLElement).closest('.qb-menu-btn') as HTMLElement | null;
+	if (btn === null || btn === openMenu.anchor) {
+		return;
+	}
+	openMenubarMenu(btn);
+});
+
+// Click-away dismissal (capture-phase pointerdown, the sheetTabBar pattern). Presses INSIDE the
+// panel are left to the item handlers; a press on the OPEN anchor is left to its own toggle logic
+// (closing here too would make the anchor's mousedown immediately re-open -- an untoggleable menu);
+// a press on a SIBLING menubar button is left to the menubar mousedown (which moves the panel).
+document.addEventListener(
+	'pointerdown',
+	(e) => {
+		if (openMenu === null) {
+			return;
+		}
+		const t = e.target;
+		if (t instanceof Node) {
+			if (dropdownEl !== null && dropdownEl.contains(t)) {
+				return;
+			}
+			if (openMenu.anchor.contains(t)) {
+				return;
+			}
+			if (openMenu.menuId !== null && menubarEl.contains(t)) {
+				return;
+			}
+		}
+		closeMenuDropdown();
+	},
+	true,
+);
+// A webview losing window focus must not leave a floating panel behind (matches the tab-strip menu).
+window.addEventListener('blur', closeMenuDropdown);
+
+// Keyboard ownership while a dropdown is open -- CAPTURE phase so it wins over the grid's
+// bubble-phase document nav handler (focus stays on the viewport during the whole interaction, so
+// without this an ArrowDown would move the grid selection underneath the open menu).
+document.addEventListener(
+	'keydown',
+	(ev) => {
+		if (openMenu === null) {
+			return;
+		}
+		const swallow = (): void => {
+			ev.preventDefault();
+			ev.stopPropagation();
+		};
+		switch (ev.key) {
+			case 'Escape':
+				swallow();
+				closeMenuDropdown();
+				viewportEl.focus();
+				return;
+			case 'ArrowDown':
+				swallow();
+				// The same pure wrap-step the formula completion uses (formulaIntel.moveActiveIndex).
+				setMenuHighlight(moveActiveIndex(openMenu.activeIndex, 1, openMenu.items.length));
+				return;
+			case 'ArrowUp':
+				swallow();
+				setMenuHighlight(moveActiveIndex(openMenu.activeIndex, -1, openMenu.items.length));
+				return;
+			case 'Home':
+				swallow();
+				setMenuHighlight(0);
+				return;
+			case 'End':
+				swallow();
+				setMenuHighlight(openMenu.items.length - 1);
+				return;
+			case 'Enter':
+			case ' ':
+				swallow();
+				if (openMenu.activeIndex >= 0) {
+					activateMenuItem(openMenu.activeIndex);
+				}
+				return;
+			case 'ArrowLeft':
+			case 'ArrowRight': {
+				// Step between menubar menus (wrapping) -- only for a panel opened FROM the menu bar.
+				if (openMenu.menuId === null) {
+					return;
+				}
+				swallow();
+				const buttons = Array.from(menubarEl.querySelectorAll<HTMLElement>('.qb-menu-btn'));
+				const cur = buttons.indexOf(openMenu.anchor);
+				if (cur < 0 || buttons.length === 0) {
+					return;
+				}
+				const next = (cur + (ev.key === 'ArrowRight' ? 1 : -1) + buttons.length) % buttons.length;
+				openMenubarMenu(buttons[next]);
+				return;
+			}
+			default:
+				// Any other key: the menu is no longer what the user is operating -- close it and let the
+				// event fall through to the grid handler (type-to-edit etc. behave normally).
+				closeMenuDropdown();
+				return;
+		}
+	},
+	true,
+);
+
+// Toolbar: mousedown preventDefault on the BUTTONS so they never steal focus from the grid. The
+// number-format <select> is excluded -- a select must take focus to open its native picker; its
+// `change` handler restores the viewport focus instead.
+toolbarEl.addEventListener('mousedown', (e) => {
+	const btn = (e.target as HTMLElement).closest('.cgt-btn');
+	if (btn !== null) {
+		e.preventDefault();
+	}
+});
 toolbarEl.addEventListener('click', (e) => {
 	const btn = (e.target as HTMLElement).closest('.cgt-btn') as HTMLElement | null;
 	if (btn === null) {
 		return;
 	}
-	const cmd = btn.getAttribute('data-cmd');
-	if (cmd === 'undo') {
-		vscode.postMessage({ type: 'undo' });
-	} else if (cmd === 'redo') {
-		vscode.postMessage({ type: 'redo' });
+	switch (btn.getAttribute('data-cmd')) {
+		case 'undo':
+			vscode.postMessage({ type: 'undo' });
+			return;
+		case 'redo':
+			vscode.postMessage({ type: 'redo' });
+			return;
+		case 'fmt-currency':
+			postSetNumberFormat('Currency');
+			viewportEl.focus();
+			return;
+		case 'fmt-percent':
+			postSetNumberFormat('Percent');
+			viewportEl.focus();
+			return;
+		case 'fmt-decimal':
+			postSetNumberFormat('Number');
+			viewportEl.focus();
+			return;
+		case 'freeze':
+			postToolbarCommand('freezePanes');
+			viewportEl.focus();
+			return;
+		case 'insert':
+			// Toggle the anchored mini-menu (same component as the menu bar; menuId null = no hover-move).
+			if (openMenu !== null && openMenu.anchor === btn) {
+				closeMenuDropdown();
+			} else {
+				openMenuDropdown(btn, INSERT_ROW_COL_ITEMS, null);
+			}
+			return;
+		case 'delete':
+			if (openMenu !== null && openMenu.anchor === btn) {
+				closeMenuDropdown();
+			} else {
+				openMenuDropdown(btn, DELETE_ROW_COL_ITEMS, null);
+			}
+			return;
+		default:
+			// Visual-only buttons (bold/italic/underline/colors/borders/align/sort/find/zoom): engine-
+			// greenfield style ops land in FE-4/FE-5. Deliberately a quiet no-op -- no error, no handler.
+			return;
 	}
-	// Remaining buttons are visual-only for now (engine-greenfield style ops land in FE-4/FE-5).
+});
+
+// The number-format <select>: post the chosen preset, then hand keyboard focus back to the grid so
+// arrow-nav keeps working (the select legitimately took focus to open -- see the focus model above).
+// The host re-renders the grid with the new formatting; the webview keeps no optimistic state.
+const numberFormatSelectEl = toolbarEl.querySelector('select.cgt-select') as HTMLSelectElement;
+numberFormatSelectEl.addEventListener('change', () => {
+	const v = numberFormatSelectEl.value;
+	if (!isNumberFormatPreset(v)) {
+		// The option values are authored in the template above, so this is unreachable unless the
+		// template drifts from NUMBER_FORMAT_PRESETS -- a wiring bug, surfaced loud (No-Fallbacks).
+		console.error('[sheets-webview] number-format select produced an unknown preset (template bug):', v);
+		return;
+	}
+	postSetNumberFormat(v);
+	viewportEl.focus();
 });
 const spacerEl = document.getElementById('sheets-spacer') as HTMLElement;
 const canvasEl = document.getElementById('sheets-canvas') as HTMLCanvasElement;
@@ -424,12 +893,102 @@ function armCommitWatchdog(commitId: number): void {
 			editState.navAfterCommit = undefined;
 			editState.editEl.readOnly = false; // megaudit H1/MED: unlock + refocus so the user can act on the un-stuck editor
 			editState.editEl.focus();
+			// Sheet-tabs cross-sheet guard (2026-06-10): the commit's fate is unknown -- do NOT carry out a
+			// deferred sheet switch over it (the banner below explains; the user can re-click the tab).
+			pendingSheetSwitch = null;
 			showError(
 				'The edit could not be confirmed by the host (no response). It may or may not have been ' +
 				'saved -- check the cell value, then press Escape or re-enter it.',
 				'transient',
 			);
 			redraw();
+		}
+	}, COMMIT_WATCHDOG_MS);
+}
+
+// ============================================================================
+// Sheet-tabs cross-sheet edit guard (2026-06-10, Codex HIGH).
+//
+// **INVARIANT: no editor (overlay or formula bar) ever survives a sheet change.** `editState`'s
+// row/col/sheet are captured on the OLD sheet; if the editor outlived a switch, a late `commitResult`
+// would close/navigate against the NEW sheet using old-sheet coordinates (and the overlay would sit
+// over the wrong sheet's cells). Two halves enforce it:
+//
+//   1. USER-initiated switch (tab-strip click -> `requestSheetSwitch`): resolve the editor FIRST.
+//      Not pending -> commit a changed value (Sheets/Excel commit-on-navigation) / cancel an unchanged
+//      or known-bad one, then switch. Pending (typical: the tab click's own blur just posted the
+//      commit) -> DEFER the switch in `pendingSheetSwitch` until the ack resolves -- never switch
+//      under an in-flight commit. The deferred switch is POSTED on commit success
+//      (`resolvePendingCommit`) and DROPPED on every failure/unknown path (matched `errorReply`,
+//      commit watchdog, malformed-render un-stick) -- each of those already surfaces a visible banner
+//      and keeps/reopens the editor on the OLD sheet, so navigating away would orphan it.
+//   2. HOST-initiated switch (a `render` whose snapshot.sheet differs -- another panel/command):
+//      `applyRender` closes ANY open editor. A non-pending edit is cancelled (its un-committed value
+//      cannot survive onto the wrong sheet; this matches Escape/blur-unchanged). A PENDING commit is
+//      DETACHED into `detachedCommit` below, then the editor UI is closed: the putValue was already
+//      posted (to the sheet captured at edit-start, so it lands on the OLD sheet correctly); only the
+//      UI resolution remains, and it must not touch the new sheet. The detached record keeps the
+//      outcome VISIBLE (No-Fallbacks -- a posted edit's fate is never silently dropped):
+//        - matching `commitResult` ok  -> success; nothing to show, clear the record;
+//        - matching `errorReply`       -> LOUD banner: the edit was rejected and NOT saved;
+//        - neither within the watchdog -> LOUD banner: the edit's fate is unknown, check that cell.
+// ============================================================================
+
+/** A user-initiated sheet switch deferred until the in-flight commit resolves (null = none). Last
+ * click wins. Set ONLY while a commit is pending; cleared at every commit-resolution point. */
+let pendingSheetSwitch: number | null = null;
+
+/** The in-flight commit whose editor a HOST-initiated sheet change closed (null = none). Carries
+ * everything needed to report its outcome after `editState` is gone. */
+let detachedCommit: { commitId: number; sheet: number; row: number; col: number } | null = null;
+let detachedWatchdog: ReturnType<typeof setTimeout> | undefined;
+
+function clearDetachedCommit(): void {
+	detachedCommit = null;
+	if (detachedWatchdog !== undefined) {
+		clearTimeout(detachedWatchdog);
+		detachedWatchdog = undefined;
+	}
+}
+
+/** Format a detached commit's target for a banner: "B7 on sheet 0" (matches the title's sheet-number
+ * convention -- the strip's display names live in the host payload, not here). */
+function describeDetachedTarget(d: { sheet: number; row: number; col: number }): string {
+	return cellRefA1(d.row, d.col) + ' on sheet ' + String(d.sheet);
+}
+
+/** Park the captured in-flight commit in `detachedCommit` + arm its outcome watchdog. Called ONLY from
+ * `applyRender`'s sheet-changed path, AFTER `cancelEdit` closed the editor UI (the record is captured
+ * from `editState` BEFORE the cancel; ordering matters -- cancelEdit's `clearError` would wipe the
+ * superseded-record banner below if this ran first). */
+function detachPendingCommit(record: { commitId: number; sheet: number; row: number; col: number }): void {
+	if (detachedCommit !== null) {
+		// A SECOND sheet change with a SECOND unresolved commit inside one watchdog window (host wedged
+		// twice) -- the older record is about to be overwritten, so surface its unknown fate NOW rather
+		// than silently dropping it (No-Fallbacks).
+		console.warn('[sheets-webview] a detached commit was superseded before resolving:', detachedCommit);
+		showError(
+			'An earlier edit to ' + describeDetachedTarget(detachedCommit) +
+			' was never confirmed by the host. Check that cell.',
+			'transient',
+		);
+	}
+	detachedCommit = record;
+	if (detachedWatchdog !== undefined) {
+		clearTimeout(detachedWatchdog);
+	}
+	detachedWatchdog = setTimeout(() => {
+		detachedWatchdog = undefined;
+		if (detachedCommit !== null) {
+			// Same recovery contract as the commit watchdog, minus the editor (it is gone): the host never
+			// answered, so the edit may or may not have been saved -- say so LOUDLY.
+			showError(
+				'The edit to ' + describeDetachedTarget(detachedCommit) +
+				' (submitted before the sheet switched) was never confirmed by the host. ' +
+				'It may or may not have been saved -- check that cell.',
+				'transient',
+			);
+			detachedCommit = null;
 		}
 	}, COMMIT_WATCHDOG_MS);
 }
@@ -2484,18 +3043,49 @@ function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean)
 	const sheetChanged = prevSnapshot !== null && prevSnapshot.sheet !== snapshot.sheet;
 	if (sheetChanged) {
 		errorCells.clear();
-		// **Codex MED fold (+ re-audit MED)**: a Switch Sheet re-renders THIS panel onto a different sheet. An
-		// open formula-bar edit's dropdown/hint targeted the OLD sheet's cell; `updateFormulaBar` is a no-op
-		// while editing, so without this the dropdown/hint (and an in-flight validate keyed to the old coords)
-		// would survive onto the new sheet. Tear down the ASSIST UI + invalidate the validate token always.
-		// But do NOT cancel a PENDING commit (re-audit MED): cancelEdit would clear `editState` + the watchdog,
-		// so a late matching `commitResult`/`errorReply` would be dropped (the reload-race / pending-commit
-		// invariant). When pending, leave the edit alive for the normal ack/error/watchdog path; only the
-		// assist overlay is torn down. When NOT pending we can safely cancel the (now cross-sheet) edit.
-		if (formulaBarIsEditing() && editState !== null && !editState.pendingCommit) {
+		// **Sheet-tabs cross-sheet edit guard (2026-06-10, Codex HIGH)** -- the INVARIANT (see the guard
+		// block above `pendingSheetSwitch`): NO editor survives a sheet change. This supersedes the earlier
+		// Codex-MED fold, which only cancelled a NON-pending FORMULA-BAR edit -- a non-pending OVERLAY
+		// editor and ANY pending edit (both surfaces) survived with old-sheet row/col, so a late
+		// `commitResult` could close/navigate against the NEW sheet using old-sheet coordinates, and the
+		// overlay sat over the wrong sheet's cells. Now:
+		//   - PENDING commit: DETACH it (the putValue is already posted to the sheet captured at
+		//     edit-start, so the write itself targets the OLD sheet correctly; `detachedCommit` keeps its
+		//     ack/error/timeout outcome VISIBLE -- No-Fallbacks), then close the editor UI. The old
+		//     re-audit-MED concern (cancelEdit drops the late ack) is answered by the detached record,
+		//     which now OWNS that late reply instead of `editState`.
+		//   - NOT pending: cancel outright (both surfaces). The un-committed value cannot survive onto a
+		//     different sheet; this matches the Escape/blur-unchanged contract. (A USER-initiated switch
+		//     never reaches here with a changed value -- `requestSheetSwitch` commits it first; this path
+		//     is another panel/command switching the sheet under us.)
+		// cancelEdit on the formula surface tears down the assist UI itself; for the overlay/no-editor
+		// cases the explicit teardown below clears the dropdown/hint + invalidates an in-flight validate
+		// keyed to the old coords (the original Codex-MED fold). The pending record is captured BEFORE
+		// cancelEdit (which nulls editState) and parked AFTER it (whose clearError would wipe the
+		// detach path's superseded-record banner).
+		const hadFormulaEditor = formulaBarIsEditing();
+		const pendingToDetach =
+			editState !== null && editState.pendingCommit && editState.commitId !== undefined
+				? { commitId: editState.commitId, sheet: editState.sheet, row: editState.row, col: editState.col }
+				: null;
+		if (editState !== null) {
 			cancelEdit();
-		} else {
+		}
+		if (!hadFormulaEditor) {
 			teardownFormulaAssist();
+		}
+		if (pendingToDetach !== null) {
+			detachPendingCommit(pendingToDetach);
+		}
+		// A deferred USER switch overtaken by this host-initiated change: honor the user's click if it
+		// targeted a DIFFERENT sheet than the one we just landed on (their intent stands); clear it
+		// either way so it can't fire later against yet another state.
+		if (pendingSheetSwitch !== null) {
+			const target = pendingSheetSwitch;
+			pendingSheetSwitch = null;
+			if (target !== snapshot.sheet) {
+				vscode.postMessage({ type: 'switchSheet', sheet: target });
+			}
 		}
 		// Sheet-tabs (2026-06-10): a switch to a DIFFERENT sheet resets the active cell to A1 and scrolls to
 		// the top-left, so the new sheet never inherits the previous sheet's selection or scroll (the
@@ -2580,12 +3170,60 @@ function resolvePendingCommit(commitId: number): void {
 	}
 	redraw();
 	viewportEl.focus(); // megaudit LOW: keep keyboard focus on the grid so arrow-nav continues after a commit
+	// Sheet-tabs cross-sheet guard (2026-06-10): the commit this switch was deferred behind has now
+	// RESOLVED successfully and the editor is closed -- carry out the user's sheet switch. (The nav/redraw
+	// above ran on the still-current sheet; the host's switch render then resets selection to A1.)
+	if (pendingSheetSwitch !== null) {
+		const target = pendingSheetSwitch;
+		pendingSheetSwitch = null;
+		vscode.postMessage({ type: 'switchSheet', sheet: target });
+	}
+}
+
+/**
+ * **Sheet-tabs cross-sheet edit guard (2026-06-10, Codex HIGH)** -- the USER-initiated half of the
+ * "no editor survives a sheet change" invariant (see the guard block above `pendingSheetSwitch`).
+ * Resolve any open editor BEFORE posting `switchSheet`:
+ *   - PENDING commit (the typical tab-click case: the strip uses `click`, so the editor's `blur`
+ *     already fired and posted a changed value): DEFER the switch until the ack resolves. Posted on
+ *     success (`resolvePendingCommit`); dropped, with the existing visible banners, on `errorReply` /
+ *     watchdog / malformed-render recovery (each keeps or reopens the editor on the OLD sheet).
+ *     Last click wins if the user clicks another tab while still deferred.
+ *   - Open, NOT pending (reachable when focus was not in the editor, so no blur ran): Sheets/Excel
+ *     commit-on-navigation -- commit a changed value (then defer the switch behind it exactly as
+ *     above); cancel an unchanged or known-bad one (the B2 "abandon a failing value on nav" contract)
+ *     and switch immediately. A LOCAL commit reject (over-limit) keeps the editor open with its
+ *     'edit' banner and does NOT switch -- never silently discard the user's typed value.
+ */
+function requestSheetSwitch(id: number): void {
+	if (editState !== null) {
+		if (editState.pendingCommit) {
+			pendingSheetSwitch = id; // defer behind the in-flight commit (resolved/dropped at its resolution points)
+			return;
+		}
+		const value = editState.editEl.value;
+		const changed = value !== editState.initialValue;
+		const knownBad = editState.lastFailedRawInput !== undefined && value === editState.lastFailedRawInput;
+		if (changed && !knownBad) {
+			if (commitEdit()) {
+				pendingSheetSwitch = id; // committed -> now pending; switch when the ack resolves
+				return;
+			}
+			// LOCAL reject (over-limit): commitEdit surfaced its 'edit' banner and the editor stays open
+			// for shortening. Do NOT switch -- the editor must not cross sheets, and the banner explains.
+			return;
+		}
+		cancelEdit(); // unchanged / known-bad -> abandon (Escape/blur-unchanged semantics), then switch
+		redraw();
+	}
+	vscode.postMessage({ type: 'switchSheet', sheet: id });
 }
 
 // Sheet-tabs (2026-06-10): the strip's interactions post to the host (which owns ALL sheet mutation).
-// `switchSheet` switches the active sheet in place; `sheetCommand` runs add/rename/delete/move on a tab.
+// `switchSheet` switches the active sheet in place (via `requestSheetSwitch`, which first resolves any
+// open editor -- the cross-sheet edit guard); `sheetCommand` runs add/rename/delete/move on a tab.
 const sheetTabHandlers: SheetTabHandlers = {
-	switchTo: (id) => vscode.postMessage({ type: 'switchSheet', sheet: id }),
+	switchTo: (id) => requestSheetSwitch(id),
 	add: () => vscode.postMessage({ type: 'sheetCommand', command: 'add' }),
 	rename: (id) => vscode.postMessage({ type: 'sheetCommand', command: 'rename', sheet: id }),
 	remove: (id) => vscode.postMessage({ type: 'sheetCommand', command: 'delete', sheet: id }),
@@ -2647,6 +3285,9 @@ window.addEventListener('message', (event: MessageEvent) => {
 				if (editState.pendingCommit) {
 					editState.pendingCommit = false;
 					editState.navAfterCommit = undefined;
+					// Sheet-tabs cross-sheet guard (2026-06-10): this commit's fate is unknown (the grid is
+					// stale) -- drop any deferred sheet switch rather than navigate away from the warning.
+					pendingSheetSwitch = null;
 					editState.editEl.readOnly = false; // megaudit H1: unlock the editor we just un-stuck
 					// W-G-1b (Codex MED): refocus the un-stuck editor, mirroring the watchdog + errorReply
 					// recovery paths. The document keyhandler is inert while `editState !== null`, so without
@@ -2682,6 +3323,13 @@ window.addEventListener('message', (event: MessageEvent) => {
 			return;
 		}
 		if (cr.ok === true && typeof cr.commitId === 'number' && Number.isInteger(cr.commitId)) {
+			// Sheet-tabs cross-sheet guard (2026-06-10): a commit DETACHED by a sheet change resolves here,
+			// never through the (closed) editor -- the write landed on its old sheet; nothing to show or
+			// navigate (commitIds are unique per webview lifetime, so this can never shadow a live edit).
+			if (detachedCommit !== null && cr.commitId === detachedCommit.commitId) {
+				clearDetachedCommit();
+				return;
+			}
 			resolvePendingCommit(cr.commitId);
 		} else {
 			// A malformed ack (version skew / tamper) must NOT be silently dropped -- surface it (No-Fallbacks).
@@ -2806,6 +3454,20 @@ window.addEventListener('message', (event: MessageEvent) => {
 		if (er.webviewId !== undefined && er.webviewId !== WEBVIEW_ID) {
 			return;
 		}
+		// Sheet-tabs cross-sheet guard (2026-06-10): a commit DETACHED by a sheet change FAILED. Its editor
+		// is closed and its cell is on the OLD sheet (the tint below is sheet-guarded and would skip it),
+		// so without this branch the rejection would be SILENT (No-Fallbacks). Report it LOUDLY; the value
+		// was not saved and cannot be re-opened for correction across the sheet boundary.
+		if (detachedCommit !== null && typeof er.commitId === 'number' && er.commitId === detachedCommit.commitId) {
+			showError(
+				'The edit to ' + describeDetachedTarget(detachedCommit) +
+				' (submitted before the sheet switched) was rejected and NOT saved -- [' +
+				String(er.code) + '] ' + String(er.message) + '. Switch back to re-enter it.',
+				'transient',
+			);
+			clearDetachedCommit();
+			return; // fully handled -- this reply belongs to the closed (detached) editor
+		}
 		const prevErrorKeys = new Set(errorCells.keys()); // Phase 3: for the error-tint flip diff
 		let activeMoved = false; // re-audit LOW: a selection realign below needs a FULL redraw, not a tint-flip damage
 		// Megaudit MED + re-audit LOW: only tint when sheet/row/col are REAL integers (NOT `Number()`-coerced
@@ -2835,6 +3497,10 @@ window.addEventListener('message', (event: MessageEvent) => {
 		) {
 			editState.pendingCommit = false;
 			editState.navAfterCommit = undefined; // the commit failed -- do not advance the selection
+			// Sheet-tabs cross-sheet guard (2026-06-10): the commit this switch was deferred behind FAILED
+			// and the editor reopens below for correction -- switching away now would orphan it onto the
+			// wrong sheet. Drop the deferral (the rejected banner explains; the user can re-click the tab).
+			pendingSheetSwitch = null;
 			editState.lastFailedRawInput = editState.editEl.value; // megaudit B2: a nav key may now leave the bad cell
 			editState.editEl.readOnly = false; // H1: unlock for correction
 			clearCommitWatchdog(); // the host responded (with a failure) -- no recovery needed

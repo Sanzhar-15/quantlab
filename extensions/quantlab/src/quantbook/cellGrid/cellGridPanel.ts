@@ -43,9 +43,19 @@
 import * as vscode from 'vscode';
 
 import type { QuantbookCellSnapshot, SessionInstance, WorkbookSnapshotJson } from '../types';
-import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, type CellsWrittenMessage, type CommitResultMessage, type FunctionListMessage, type GridSelection, type ValidateFormulaResultMessage } from './cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, parseToolbarCommandMessage, type CellsWrittenMessage, type CommitResultMessage, type FunctionListMessage, type GridSelection, type ToolbarFormatPreset, type ValidateFormulaResultMessage } from './cellGridLogic';
 import { getNonce, getWebviewUri } from '../../utils/webview';
 import type { PublishedRange } from '../reactiveKernel/publishedCellsStore';
+// Demo-prep toolbar (2026-06-10): the webview toolbar's `setNumberFormat` applies a preset directly to
+// this panel's selection -- the same registerFormat -> buildSetFormatOps -> batch -> recalc -> refresh
+// core as the `quantlab.quantbookSetFormat` command (which keeps the QuickPick/Custom path).
+import { buildFormatUndoLabel, buildSetFormatOps, formatStringForPreset, presetLabel } from './formatPickerLogic';
+// fe/sheet-tabs (2026-06-10; Codex HIGH): "Freeze Panes Here" carries the right-click-time
+// `{panelToken, selection}` like the structural commands -- the pure planFreezeAtSelection pins the
+// focus-cell -> freeze-counts math shared by the palette and the context-menu freeze paths.
+import { planFreezeAtSelection, type GridSelectionInput } from './contextMenuLogic';
+import { formatRangeTarget, normalizeSelectionRect } from '../reactiveNotebook/bindVariableLogic';
+import { recalcDirtyChecked } from '../session';
 
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
 
@@ -466,11 +476,34 @@ export class CellGridPanel {
 			return { ok: false, reason: 'no-selection' };
 		}
 		const sel = focusedPanel.latestSelection;
-		// Freeze above+left of the FOCUS cell. The dispatcher validated focusRow/focusCol are integers in the
-		// A1 extent, so these are already sane; the webview clamps again (defence in depth).
-		const rows = Math.max(0, sel.focusRow);
-		const cols = Math.max(0, sel.focusCol);
+		// Freeze above+left of the FOCUS cell (the pure planFreezeAtSelection -- shared with the context
+		// menu's "Freeze Panes Here" so the two paths cannot drift). The dispatcher validated focusRow/
+		// focusCol are integers in the A1 extent, so these are already sane; the webview clamps again
+		// (defence in depth).
+		const { rows, cols } = planFreezeAtSelection(sel);
 		focusedPanel.setFrozenPanes(rows, cols);
+		return { ok: true, rows, cols };
+	}
+
+	/**
+	 * **fe/sheet-tabs (2026-06-10; Codex HIGH)** -- freeze the panel that RAISED the context menu
+	 * (resolved by its `panelToken`) at the CARRIED right-click-time selection's focus cell: the
+	 * "Freeze Panes Here" path. Same semantics as {@link freezeFocusedPanesAtSelection} (rows above +
+	 * cols left of the focus cell via the shared {@link planFreezeAtSelection}; a focus of A1 applies
+	 * `0/0` = Unfreeze, matching Excel) but over the authoritative `{panelToken, selection}` payload --
+	 * NOT the focused panel's async-updated `latestSelection`, which would reintroduce the
+	 * stale-selection + wrong-grid races the structural commands eliminated (Codex HIGH-1 + HIGH-2).
+	 * Applies through the same {@link setFrozenPanes} -> postFreezeIfReady path. Returns the applied
+	 * `{rows, cols}` for the command's toast, or `'no-panel'` for an unknown/disposed token so the
+	 * command surfaces a clear toast (No-Fallbacks).
+	 */
+	static freezePanesAtContextSelection(token: string, selection: GridSelectionInput): { ok: true; rows: number; cols: number } | { ok: false; reason: 'no-panel' } {
+		const panel = CellGridPanel.panelByToken(token);
+		if (panel === undefined) {
+			return { ok: false, reason: 'no-panel' };
+		}
+		const { rows, cols } = planFreezeAtSelection(selection);
+		panel.setFrozenPanes(rows, cols);
 		return { ok: true, rows, cols };
 	}
 
@@ -971,6 +1004,14 @@ export class CellGridPanel {
 				this.switchToSheet(newId); // D6: adding a sheet switches to it (Excel behavior).
 				return;
 			}
+			if (command !== 'rename' && command !== 'delete' && command !== 'moveLeft' && command !== 'moveRight') {
+				// No-Fallbacks: an off-whitelist command string from the strip is surfaced (console + toast),
+				// never a silent fall-through -- mirroring handleToolbarCommand's off-whitelist rejection.
+				// Checked BEFORE the sheet guard so an unknown command without a sheet is loud too.
+				console.warn(`[cellGrid] Quantbook sheet command ignored: unsupported command "${command}"`);
+				void vscode.window.showWarningMessage(`Quantbook sheet command ignored: unsupported command "${command}".`);
+				return;
+			}
 			if (sheet === undefined) {
 				return;
 			}
@@ -1048,6 +1089,135 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **Demo-prep toolbar (2026-06-10)** -- handle a `{type:'toolbarCommand', command, preset?}` message
+	 * from this panel's webview toolbar. The webview is UNTRUSTED input: the message is validated against
+	 * the pure {@link parseToolbarCommandMessage} whitelists FIRST -- nothing off-whitelist reaches
+	 * `executeCommand` (it is rejected LOUD: a console line + a warning toast, never silent, never
+	 * executed). Three execution shapes:
+	 * - `simple` (freeze/unfreeze, Save As, Open): fire the host command with NO argument. The freeze
+	 *   commands act on the FOCUSED panel -- a toolbar click just focused this webview's panel, so they
+	 *   target this grid; Save As / Open resolve their own target panel.
+	 * - `structural` (the six insert/delete commands): fire the W3 context-menu host command with the
+	 *   `{panelToken, selection}` argument it validates via `parseContextMenuArg`, built from THIS panel's
+	 *   webview token + latest reported selection -- so the toolbar routes to this exact panel like the
+	 *   right-click menu does (never the merely-focused one).
+	 * - `setNumberFormat`: apply the preset directly via {@link applyToolbarNumberFormat} (no QuickPick).
+	 * A missing token/selection (no interaction since open / mid-reload) is a clear "select a cell first"
+	 * information message (loud, not silent), mirroring the palette commands' no-selection path.
+	 */
+	private handleToolbarCommand(raw: unknown): void {
+		const parsed = parseToolbarCommandMessage(raw);
+		if (parsed === undefined) {
+			// No-Fallbacks: an off-whitelist command / malformed preset is surfaced, never dropped silently
+			// (and never executed). JSON.stringify is safe here -- postMessage payloads are structured-clonable.
+			console.warn(`[cellGrid] rejected toolbarCommand from the webview (off-whitelist command or malformed preset): ${JSON.stringify(raw)}`);
+			void vscode.window.showWarningMessage('Quantbook: the grid toolbar sent an unrecognized command -- it was not executed.');
+			return;
+		}
+		// executeCommand failures surface loud (No-Fallbacks). The target commands toast their own
+		// engine/validation errors; this rejection handler catches the command-level failures they cannot
+		// (an unregistered command id, a throw before their own try).
+		const execute = (commandId: string, arg?: unknown): void => {
+			const thenable = arg === undefined ? vscode.commands.executeCommand(commandId) : vscode.commands.executeCommand(commandId, arg);
+			thenable.then(undefined, (err: unknown) => {
+				const detail = err instanceof Error ? err.message : String(err);
+				console.error(`[cellGrid] toolbar command ${commandId} failed: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook toolbar action failed: ${detail}`);
+			});
+		};
+		if (parsed.kind === 'simple') {
+			execute(parsed.commandId);
+			return;
+		}
+		if (parsed.kind === 'structural') {
+			if (this.webviewToken === undefined || this.latestSelection === undefined) {
+				// No token (handshake not completed) or no selection reported yet -- the structural commands
+				// need both to build the validated `{panelToken, selection}` argument. Loud, not silent.
+				void vscode.window.showInformationMessage(
+					'Select a cell in the Cell Grid first -- the toolbar insert/delete acts on the current selection.',
+				);
+				return;
+			}
+			const sel = this.latestSelection;
+			// The exact ContextMenuArg shape parseContextMenuArg validates host-side (panelToken + the four
+			// selection corners). Built from the dispatcher-validated latestSelection, so it always passes.
+			execute(parsed.commandId, {
+				panelToken: this.webviewToken,
+				selection: { anchorRow: sel.anchorRow, anchorCol: sel.anchorCol, focusRow: sel.focusRow, focusCol: sel.focusCol },
+			});
+			return;
+		}
+		// parsed.kind === 'setNumberFormat'
+		if (this.latestSelection === undefined) {
+			void vscode.window.showInformationMessage(
+				'Select one or more cells in the Cell Grid first -- the toolbar format applies to the current selection.',
+			);
+			return;
+		}
+		this.applyToolbarNumberFormat(parsed.preset, this.latestSelection);
+	}
+
+	/**
+	 * **Demo-prep toolbar (2026-06-10)** -- apply a (non-Custom) number-format preset to THIS panel's
+	 * session/sheet over the given selection rect: the core of the `quantlab.quantbookSetFormat` command
+	 * without its QuickPick/Custom UI. Same discipline: registerFormat -> normalizeSelectionRect ->
+	 * buildSetFormatOps -> ONE `session.batch` (one undo unit) -> recalcDirtyChecked -> refreshSession.
+	 * `General` interns to the engine's built-in id 0 (clears the explicit format). Every throw surfaces
+	 * as a toast (No-Fallbacks); a post-apply repaint failure warns that the grid may be STALE (the
+	 * mutation landed), mirroring the structural commands' stale-render warning.
+	 */
+	private applyToolbarNumberFormat(preset: ToolbarFormatPreset, sel: GridSelection): void {
+		const formatString = formatStringForPreset(preset);
+		const appliedLabel = presetLabel(preset);
+		// Best-effort context for the undo label / toast: the sheet NAME + A1 range. Throws loud if the
+		// active sheet id is gone (a tombstoned-sheet race) -- surfacing the failure rather than silently
+		// mis-labelling (same contract as the command's sheet-name resolve).
+		let target: string;
+		try {
+			const found = this.session.listSheets().find(s => s.id === this.sheet);
+			if (found === undefined) {
+				throw new Error(`this grid has no live sheet with id ${this.sheet}`);
+			}
+			const labelRect = normalizeSelectionRect(sel.anchorRow, sel.anchorCol, sel.focusRow, sel.focusCol);
+			target = formatRangeTarget(found.name, labelRect.startRow, labelRect.startCol, labelRect.endRow, labelRect.endCol);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error(`[cellGrid] toolbar setNumberFormat sheet-name resolve failed: ${detail}`);
+			void vscode.window.showErrorMessage(`Quantbook set format failed: ${detail}`);
+			return;
+		}
+		const undoLabel = buildFormatUndoLabel(appliedLabel, target);
+		let opSucceeded = false;
+		try {
+			const formatId = this.session.registerFormat(formatString);
+			const rect = normalizeSelectionRect(sel.anchorRow, sel.anchorCol, sel.focusRow, sel.focusCol);
+			const ops = buildSetFormatOps(this.sheet, rect, formatId);
+			this.session.batch(ops, { undoLabel });
+			recalcDirtyChecked(this.session);
+			opSucceeded = true;
+			void vscode.window.showInformationMessage(`${undoLabel}.`);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error(`[cellGrid] toolbar setNumberFormat failed: ${detail}`);
+			void vscode.window.showErrorMessage(`Quantbook set format failed: ${detail}`);
+		}
+		if (opSucceeded) {
+			// Repaint in a SEPARATE try so a render failure is not misreported as a format failure: the
+			// format DID apply; the on-screen grid may be stale (same split as the command path).
+			try {
+				const { failed } = CellGridPanel.refreshSession(this.session);
+				if (failed > 0) {
+					void vscode.window.showWarningMessage(`Quantbook: the format applied, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
+				}
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				console.error(`[cellGrid] refreshSession after toolbar setNumberFormat failed: ${detail}`);
+				void vscode.window.showWarningMessage('Quantbook: the format applied, but the grid may be showing stale values (a repaint failed) -- run "Quantbook: Refresh Cell Grid".');
+			}
+		}
+	}
+
+	/**
 	 * Thin wrapper around the vscode-free {@link dispatchIncomingMessage}. Lives
 	 * here (not in cellGridLogic.ts) because it captures `this`. The dispatcher
 	 * handles `putValue` (number/text/formula -> write -> recalc -> render),
@@ -1104,6 +1274,14 @@ export class CellGridPanel {
 			}
 			if (m.type === 'sheetCommand' && typeof m.command === 'string') {
 				void this.handleSheetCommand(m.command, typeof m.sheet === 'number' ? m.sheet : undefined);
+				return;
+			}
+			// Demo-prep toolbar (2026-06-10): intercept the webview toolbar's commands BEFORE delegating --
+			// dispatchIncomingMessage would log them as unknown types. handleToolbarCommand validates the
+			// UNTRUSTED payload against the pure parseToolbarCommandMessage whitelists; anything
+			// off-whitelist is rejected LOUD (toast + console), never executed.
+			if (m.type === 'toolbarCommand') {
+				this.handleToolbarCommand(raw);
 				return;
 			}
 		}

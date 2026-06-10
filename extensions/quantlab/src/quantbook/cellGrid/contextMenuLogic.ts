@@ -128,6 +128,20 @@ export function describeStructuralPlan(plan: StructuralPlan): string {
 }
 
 /**
+ * **fe/sheet-tabs (2026-06-10; Codex HIGH)** -- the freeze counts for "Freeze Panes Here" over a
+ * context-menu selection: pin the rows ABOVE + columns LEFT of the selection's FOCUS cell (Excel
+ * "Freeze Panes" canon), i.e. `rows = focusRow`, `cols = focusCol`. This pins the SAME math
+ * `CellGridPanel.freezeFocusedPanesAtSelection` applies to the focused panel's live selection, so the
+ * menu path (which carries the authoritative right-click-time selection, like the structural commands
+ * above) cannot drift from the palette path. The ANCHOR is deliberately ignored (Excel freezes at the
+ * active cell, not the selection rect); a focus of A1 (`0,0`) yields `0/0` -- the natural Unfreeze.
+ * Pure; no I/O. The webview re-clamps the counts on apply (defence in depth).
+ */
+export function planFreezeAtSelection(sel: GridSelectionInput): { rows: number; cols: number } {
+	return { rows: Math.max(0, sel.focusRow), cols: Math.max(0, sel.focusCol) };
+}
+
+/**
  * The validated context argument a context-menu command receives. VS Code passes the PARSED
  * `data-vscode-context` object as the command's first argument; {@link parseContextMenuArg} validates it
  * into this shape (or `undefined` if malformed). `panelToken` routes to the exact raising panel

@@ -29,6 +29,12 @@
 
 import type { CellSnapshotJson, CollabSessionInstance, DiagnosticJson, EventJson, FormatIdJson, FunctionMetadataJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SessionCellValueInput, SessionInstance, SessionOpJson, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
 import { assertSupportedSchemaVersion, parseQuantbookError, recalcDirtyChecked, setFormulaValidated, setValueValidated } from '../session';
+// Demo-prep toolbar (2026-06-10): type-only imports so the toolbar-command parser's whitelists stay
+// pinned to the canonical unions (a preset added to FormatPreset / an op added to StructuralOp forces
+// an explicit decision in the Record whitelists below). Type-only -- no runtime coupling, no cycle
+// (neither module imports cellGridLogic).
+import type { FormatPreset } from './formatPickerLogic';
+import type { StructuralOp } from './contextMenuLogic';
 
 /**
  * V3.2.c.3 / V3.2.c.5 (2026-05-22) -- classification of a single
@@ -1907,4 +1913,133 @@ export function getSharedDeltaCache(session: SessionInstance): DeltaSnapshotCach
 		SESSION_DELTA_CACHES.set(session, cache);
 	}
 	return cache;
+}
+
+// ============================================================================
+// Demo-prep toolbar (2026-06-10) -- the webview toolbar's command bridge.
+//
+// The sheets webview gains a toolbar whose buttons post
+// `{type:'toolbarCommand', command, preset?}` to the host. The panel intercepts
+// it in `handleIncoming` (alongside switchSheet/sheetCommand) and routes each
+// VALIDATED command to an existing host command (freeze/unfreeze, the six W3
+// structural insert/delete commands, Save As / Open) or applies a number-format
+// preset directly to the panel's selection.
+//
+// SECURITY: the webview is UNTRUSTED input. NOTHING outside the explicit
+// whitelists below may reach `vscode.commands.executeCommand` -- the parser is
+// the single chokepoint, pure + unit-tested (mirrors parseContextMenuArg). An
+// unknown command / malformed preset returns `undefined` and the panel surfaces
+// it LOUD (a warning toast + a console line, No-Fallbacks), never executes it.
+// ============================================================================
+
+/**
+ * The toolbar commands that map 1:1 to an ARGUMENT-LESS host command (freeze
+ * panes act on the focused panel; Save As / Open resolve their own target).
+ */
+export type ToolbarSimpleCommand = 'freezePanes' | 'unfreezePanes' | 'saveAs' | 'openWorkbook';
+
+/**
+ * The number-format presets the toolbar may apply: every {@link FormatPreset}
+ * EXCEPT `Custom` (which needs a free-text input box -- the QuickPick command
+ * path owns that; the toolbar rejects it like any unknown preset).
+ */
+export type ToolbarFormatPreset = Exclude<FormatPreset, 'Custom'>;
+
+/**
+ * A validated toolbar command, discriminated by how the panel executes it:
+ * - `simple`: fire `commandId` with NO argument.
+ * - `structural`: fire `commandId` with the W3 context-menu argument
+ *   (`{panelToken, selection}`) built from the panel's token + latest selection.
+ * - `setNumberFormat`: apply the preset directly to the panel's session/sheet
+ *   over its latest selection (no QuickPick).
+ */
+export type ParsedToolbarCommand =
+	| { kind: 'simple'; command: ToolbarSimpleCommand; commandId: string }
+	| { kind: 'structural'; command: StructuralOp; commandId: string }
+	| { kind: 'setNumberFormat'; preset: ToolbarFormatPreset };
+
+/**
+ * Whitelist: toolbar command -> argument-less host command id. A `Record` over
+ * the union so adding a member without a mapping is a compile error (never a
+ * silent drop). Wrapped in {@link hasOwnKey} lookups at parse time so an
+ * untrusted string like `"constructor"` can never resolve via the prototype
+ * chain.
+ */
+const TOOLBAR_SIMPLE_COMMAND_IDS: Record<ToolbarSimpleCommand, string> = {
+	freezePanes: 'quantlab.quantbookFreezePanes',
+	unfreezePanes: 'quantlab.quantbookUnfreezePanes',
+	saveAs: 'quantlab.quantbookSaveAs',
+	openWorkbook: 'quantlab.quantbookOpen',
+};
+
+/**
+ * Whitelist: toolbar structural command -> the W3 context-menu host command id
+ * (each takes the `{panelToken, selection}` argument `parseContextMenuArg`
+ * validates). Pinned to {@link StructuralOp} so the toolbar and the context
+ * menu can never drift apart silently.
+ */
+const TOOLBAR_STRUCTURAL_COMMAND_IDS: Record<StructuralOp, string> = {
+	insertRowAbove: 'quantlab.quantbookInsertRowAbove',
+	insertRowBelow: 'quantlab.quantbookInsertRowBelow',
+	insertColumnLeft: 'quantlab.quantbookInsertColumnLeft',
+	insertColumnRight: 'quantlab.quantbookInsertColumnRight',
+	deleteRow: 'quantlab.quantbookDeleteRow',
+	deleteColumn: 'quantlab.quantbookDeleteColumn',
+};
+
+/**
+ * Whitelist of the format presets the toolbar may send. A `Record` (not an
+ * array) so a future {@link FormatPreset} member forces an explicit
+ * include/exclude decision here at compile time. `Custom` is structurally
+ * excluded by {@link ToolbarFormatPreset}.
+ */
+const TOOLBAR_FORMAT_PRESETS: Record<ToolbarFormatPreset, true> = {
+	General: true,
+	Number: true,
+	NumberThousands: true,
+	Currency: true,
+	Percent: true,
+	Date: true,
+};
+
+/** Own-property membership test that narrows `key` to the record's key type (prototype-chain-safe). */
+function hasOwnKey<K extends string>(record: Record<K, unknown>, key: string): key is K {
+	return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+/**
+ * Validate a raw webview `toolbarCommand` message into a {@link ParsedToolbarCommand},
+ * or `undefined` if anything about it is off-whitelist (No-Fallbacks: the panel
+ * surfaces the rejection loud; it NEVER guesses a command). Exhaustive rules:
+ * - must be an object with `type === 'toolbarCommand'` and a string `command`;
+ * - `setNumberFormat` additionally requires a string `preset` in
+ *   {@link TOOLBAR_FORMAT_PRESETS} (so `Custom`, unknown strings, and a missing
+ *   preset are all rejected);
+ * - every other `command` must be a key of one of the two command-id whitelists.
+ * Extraneous fields are TOLERATED (ignored) -- consistent with the other webview
+ * envelopes (which carry e.g. `webviewId` the dispatcher ignores); the security
+ * boundary is the whitelisted `command`/`preset` values, not field absence.
+ * Pure; no vscode.
+ */
+export function parseToolbarCommandMessage(raw: unknown): ParsedToolbarCommand | undefined {
+	if (typeof raw !== 'object' || raw === null) {
+		return undefined;
+	}
+	const m = raw as { type?: unknown; command?: unknown; preset?: unknown };
+	if (m.type !== 'toolbarCommand' || typeof m.command !== 'string') {
+		return undefined;
+	}
+	if (m.command === 'setNumberFormat') {
+		if (typeof m.preset !== 'string' || !hasOwnKey(TOOLBAR_FORMAT_PRESETS, m.preset)) {
+			return undefined;
+		}
+		return { kind: 'setNumberFormat', preset: m.preset };
+	}
+	if (hasOwnKey(TOOLBAR_SIMPLE_COMMAND_IDS, m.command)) {
+		return { kind: 'simple', command: m.command, commandId: TOOLBAR_SIMPLE_COMMAND_IDS[m.command] };
+	}
+	if (hasOwnKey(TOOLBAR_STRUCTURAL_COMMAND_IDS, m.command)) {
+		return { kind: 'structural', command: m.command, commandId: TOOLBAR_STRUCTURAL_COMMAND_IDS[m.command] };
+	}
+	return undefined;
 }

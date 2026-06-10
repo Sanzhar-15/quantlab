@@ -14,6 +14,7 @@ import * as assert from 'assert';
 import {
 	describeStructuralPlan,
 	parseContextMenuArg,
+	planFreezeAtSelection,
 	planStructuralOp,
 	type GridSelectionInput,
 	type StructuralOp,
@@ -197,5 +198,38 @@ suite('W3 contextMenuLogic -- parseContextMenuArg (Codex HIGH-1/HIGH-2 fold)', (
 		assert.deepStrictEqual(planStructuralOp('deleteRow', arg!.selection), {
 			method: 'deleteRows', axis: 'row', index: 1, count: 3,
 		});
+	});
+});
+
+suite('fe/sheet-tabs contextMenuLogic -- planFreezeAtSelection (Freeze Panes Here, Codex HIGH)', () => {
+	test('freezes the rows above + columns left of the FOCUS cell', () => {
+		assert.deepStrictEqual(planFreezeAtSelection(cell(3, 5)), { rows: 3, cols: 5 });
+	});
+
+	test('uses the FOCUS corner, not the normalized rect (Excel freezes at the active cell)', () => {
+		// Anchor at (5,4), focus at (3,2): the freeze comes from the focus, not min/max of the corners.
+		assert.deepStrictEqual(planFreezeAtSelection(rect(5, 4, 3, 2)), { rows: 3, cols: 2 });
+		// And the reverse orientation (focus at the bottom-right) freezes there instead.
+		assert.deepStrictEqual(planFreezeAtSelection(rect(3, 2, 5, 4)), { rows: 5, cols: 4 });
+	});
+
+	test('a focus of A1 yields 0/0 -- the natural Unfreeze (Excel canon)', () => {
+		assert.deepStrictEqual(planFreezeAtSelection(cell(0, 0)), { rows: 0, cols: 0 });
+		// Anchor elsewhere does not matter; only the focus drives the counts.
+		assert.deepStrictEqual(planFreezeAtSelection(rect(7, 9, 0, 0)), { rows: 0, cols: 0 });
+	});
+
+	test('a focus on row 0 or column 0 freezes only the other axis', () => {
+		assert.deepStrictEqual(planFreezeAtSelection(cell(0, 7)), { rows: 0, cols: 7 });
+		assert.deepStrictEqual(planFreezeAtSelection(cell(4, 0)), { rows: 4, cols: 0 });
+	});
+
+	test('the parsed context argument feeds planFreezeAtSelection end-to-end', () => {
+		const arg = parseContextMenuArg({
+			panelToken: 'wv-1',
+			selection: { anchorRow: 1, anchorCol: 2, focusRow: 3, focusCol: 4 },
+		});
+		assert.notStrictEqual(arg, undefined);
+		assert.deepStrictEqual(planFreezeAtSelection(arg!.selection), { rows: 3, cols: 4 });
 	});
 });
