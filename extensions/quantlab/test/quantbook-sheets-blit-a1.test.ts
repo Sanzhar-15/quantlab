@@ -75,7 +75,7 @@ suite('FE-2-0 Phase 3 computeScrollBlitA1 -- null (full-draw) preconditions', fu
 		assert.strictEqual(computeScrollBlitA1(state(0, 0), state(40, 40), GUTTER), null);
 	});
 	test('reusable region below MIN_BLIT_PX -> null', () => {
-		// Vertical: bodyDevH = 600-28 = 572; a 560px move leaves 12px reusable (< 64).
+		// Vertical: bodyDevH = 600-24 = 576; a 560px move leaves 16px reusable (< 64).
 		assert.strictEqual(computeScrollBlitA1(state(0, 0), state(560, 0), GUTTER), null);
 	});
 	test('non-integer DEVICE-pixel move -> null (fail closed)', () => {
@@ -102,16 +102,17 @@ suite('FE-2-0 Phase 3 computeScrollBlitA1 -- VERTICAL (sticky header, full width
 	test('scroll DOWN: copy the body region up, repaint the bottom strip', () => {
 		const blit = computeScrollBlitA1(state(0, 0), state(100, 0), GUTTER);
 		assert.notStrictEqual(blit, null);
-		// bodyDevH = 600-28 = 572; reusable = 572-100 = 472.
-		assert.deepStrictEqual(blit!.copy, { sx: 0, sy: 128, sw: 800, sh: 472, dx: 0, dy: 28, dw: 800, dh: 472 });
-		// stripH = 100 + ROW_HEIGHT(25) = 125; bottom strip, FULL width (the gutter scrolls with rows).
-		assert.deepStrictEqual(blit!.damageRects, [{ x: 0, y: 600 - 125, width: 800, height: 125 }]);
+		// Sheets-parity geometry (2026-06-10): HEADER_HEIGHT 28->24, ROW_HEIGHT 25->24.
+		// bodyDevH = 600-24 = 576; reusable = 576-100 = 476; copy source = header(24)+dy(100) = 124.
+		assert.deepStrictEqual(blit!.copy, { sx: 0, sy: 124, sw: 800, sh: 476, dx: 0, dy: 24, dw: 800, dh: 476 });
+		// stripH = 100 + ROW_HEIGHT(24) = 124; bottom strip, FULL width (the gutter scrolls with rows).
+		assert.deepStrictEqual(blit!.damageRects, [{ x: 0, y: 600 - 124, width: 800, height: 124 }]);
 	});
 	test('scroll UP: copy the body region down, repaint the top strip just below the header', () => {
 		const blit = computeScrollBlitA1(state(100, 0), state(0, 0), GUTTER);
 		assert.notStrictEqual(blit, null);
-		assert.deepStrictEqual(blit!.copy, { sx: 0, sy: 28, sw: 800, sh: 472, dx: 0, dy: 128, dw: 800, dh: 472 });
-		assert.deepStrictEqual(blit!.damageRects, [{ x: 0, y: HEADER_HEIGHT, width: 800, height: 125 }]);
+		assert.deepStrictEqual(blit!.copy, { sx: 0, sy: 24, sw: 800, sh: 476, dx: 0, dy: 124, dw: 800, dh: 476 });
+		assert.deepStrictEqual(blit!.damageRects, [{ x: 0, y: HEADER_HEIGHT, width: 800, height: 124 }]);
 	});
 	test('the header band [0,HEADER_HEIGHT) is never copied or damaged (sticky)', () => {
 		const blit = computeScrollBlitA1(state(0, 0), state(120, 0), GUTTER)!;
@@ -120,14 +121,14 @@ suite('FE-2-0 Phase 3 computeScrollBlitA1 -- VERTICAL (sticky header, full width
 	});
 	test('HiDPI (dpr 2): device-px copy, CSS-px strip', () => {
 		const blit = computeScrollBlitA1(state(0, 0, 800, 600, 2), state(50, 0, 800, 600, 2), GUTTER)!;
-		// headerDev = 56; bodyDevH = 1200-56 = 1144; dyDev = 100; reusable = 1044.
-		assert.deepStrictEqual(blit.copy, { sx: 0, sy: 156, sw: 1600, sh: 1044, dx: 0, dy: 56, dw: 1600, dh: 1044 });
-		// stripH = 100/2 + 25 = 75 CSS px.
-		assert.deepStrictEqual(blit.damageRects, [{ x: 0, y: 600 - 75, width: 800, height: 75 }]);
+		// headerDev = 48; bodyDevH = 1200-48 = 1152; dyDev = 100; reusable = 1052.
+		assert.deepStrictEqual(blit.copy, { sx: 0, sy: 148, sw: 1600, sh: 1052, dx: 0, dy: 48, dw: 1600, dh: 1052 });
+		// stripH = 100/2 + 24 = 74 CSS px.
+		assert.deepStrictEqual(blit.damageRects, [{ x: 0, y: 600 - 74, width: 800, height: 74 }]);
 	});
 	test('re-audit HIGH-1: a fractional CSS-px scroll at dpr 2 -> null (the renderer rounds CSS px)', () => {
 		// dy 0.5 at dpr 2 is 1 WHOLE device px (the old |dy|*dpr guard accepted it), but the renderer rounds
-		// each paint origin in whole CSS px -> a full draw would NOT move (round(28-0.5)===round(28-0)===28),
+		// each paint origin in whole CSS px -> a full draw would NOT move (round(24-0.5)===round(24-0)===24),
 		// so the blit must fail closed. This is the bug Codex caught.
 		assert.strictEqual(computeScrollBlitA1(state(0, 0, 800, 600, 2), state(0.5, 0, 800, 600, 2), GUTTER), null);
 		assert.strictEqual(computeScrollBlitA1(state(0.5, 0, 800, 600, 2), state(1, 0, 800, 600, 2), GUTTER), null);
@@ -201,34 +202,34 @@ suite('W3 frozen panes -- computeScrollBlitA1 frozen bands', function () {
 		}
 	});
 	test('VERTICAL scroll with 2 frozen ROWS: the body copy starts BELOW the frozen band, not the header', () => {
-		// 2 frozen rows -> frozenRowsCssH = 2*ROW_HEIGHT = 50. bodyTop = HEADER_HEIGHT(28)+50 = 78.
+		// 2 frozen rows -> frozenRowsCssH = 2*ROW_HEIGHT = 48. bodyTop = HEADER_HEIGHT(24)+48 = 72.
 		const frozenH = 2 * ROW_HEIGHT;
 		const blit = computeScrollBlitA1Raw(state(0, 0), state(100, 0), GUTTER, frozenH, 0)!;
 		assert.notStrictEqual(blit, null);
-		const bodyTop = HEADER_HEIGHT + frozenH; // 78
-		// bodyDevH = 600 - 78 = 522; reusable = 522 - 100 = 422.
-		assert.deepStrictEqual(blit.copy, { sx: 0, sy: bodyTop + 100, sw: 800, sh: 422, dx: 0, dy: bodyTop, dw: 800, dh: 422 });
+		const bodyTop = HEADER_HEIGHT + frozenH; // 72
+		// bodyDevH = 600 - 72 = 528; reusable = 528 - 100 = 428.
+		assert.deepStrictEqual(blit.copy, { sx: 0, sy: bodyTop + 100, sw: 800, sh: 428, dx: 0, dy: bodyTop, dw: 800, dh: 428 });
 		// The frozen-row band [HEADER_HEIGHT, bodyTop) is NEVER copied or damaged (pinned, like the header).
 		assert.ok(blit.copy.dy >= bodyTop, 'copy dest at/below the frozen band');
 		assert.ok(blit.copy.sy >= bodyTop, 'copy source at/below the frozen band');
 	});
 	test('VERTICAL scroll UP with frozen rows: the exposed strip starts at the frozen-band edge', () => {
-		const frozenH = 2 * ROW_HEIGHT; // 50
-		const bodyTop = HEADER_HEIGHT + frozenH; // 78
+		const frozenH = 2 * ROW_HEIGHT; // 48
+		const bodyTop = HEADER_HEIGHT + frozenH; // 72
 		const blit = computeScrollBlitA1Raw(state(100, 0), state(0, 0), GUTTER, frozenH, 0)!;
 		assert.strictEqual(blit.damageRects[0].y, bodyTop, 'top strip starts below the frozen rows, not at HEADER_HEIGHT');
 	});
 	test('HORIZONTAL scroll with 1 frozen COL: the body copy starts RIGHT of the gutter + frozen col', () => {
-		const frozenW = 1 * COL_WIDTH; // 64
-		const bodyLeft = GUTTER + frozenW; // 114
+		const frozenW = 1 * COL_WIDTH; // 100
+		const bodyLeft = GUTTER + frozenW; // 150
 		const blit = computeScrollBlitA1Raw(state(0, 0), state(0, 100), GUTTER, 0, frozenW)!;
-		// bodyDevW = 800 - 114 = 686; reusable = 686 - 100 = 586.
-		assert.deepStrictEqual(blit.copy, { sx: bodyLeft + 100, sy: 0, sw: 586, sh: 600, dx: bodyLeft, dy: 0, dw: 586, dh: 600 });
+		// bodyDevW = 800 - 150 = 650; reusable = 650 - 100 = 550.
+		assert.deepStrictEqual(blit.copy, { sx: bodyLeft + 100, sy: 0, sw: 550, sh: 600, dx: bodyLeft, dy: 0, dw: 550, dh: 600 });
 		assert.ok(blit.copy.dx >= bodyLeft, 'copy dest right of the frozen-col band');
 	});
 	test('HORIZONTAL scroll LEFT with frozen cols: the exposed strip starts at the frozen-col-band edge', () => {
-		const frozenW = 1 * COL_WIDTH; // 64
-		const bodyLeft = GUTTER + frozenW; // 114
+		const frozenW = 1 * COL_WIDTH; // 100
+		const bodyLeft = GUTTER + frozenW; // 150
 		const blit = computeScrollBlitA1Raw(state(0, 100), state(0, 0), GUTTER, 0, frozenW)!;
 		assert.strictEqual(blit.damageRects[0].x, bodyLeft, 'left strip starts right of the frozen cols, not at gutterW');
 	});
@@ -246,8 +247,8 @@ suite('W3 frozen panes -- computeScrollBlitA1 frozen bands', function () {
 		assert.deepStrictEqual(withRows, noRows, 'frozen rows do not change the horizontal blit');
 	});
 	test('a large frozen band that leaves < MIN_BLIT_PX reusable -> null (fail closed to full draw)', () => {
-		// bodyDevH = 600 - (28 + frozenH); with a big frozen band + a moderate scroll the reusable region drops
-		// below 64 -> null. frozenH = 500 -> bodyDevH = 72; a 20px scroll leaves 52 (< 64).
+		// bodyDevH = 600 - (24 + frozenH); with a big frozen band + a moderate scroll the reusable region drops
+		// below 64 -> null. frozenH = 500 -> bodyDevH = 76; a 20px scroll leaves 56 (< 64).
 		assert.strictEqual(computeScrollBlitA1Raw(state(0, 0), state(20, 0), GUTTER, 500, 0), null);
 	});
 	test('a negative / non-finite frozen band -> null (would corrupt the body copy origin)', () => {

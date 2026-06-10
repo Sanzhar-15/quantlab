@@ -54,6 +54,10 @@ import {
 	type CompletionItem,
 } from './formulaIntel';
 import { CanvasGridRenderer, type ActiveCell, type PublishedRange } from './canvasGrid';
+// Icon overhaul (2026-06-10): every toolbar/menu glyph is a Google Material Symbols outlined icon
+// (the design system Google Sheets itself uses) -- see icons.ts for the Apache-2.0 attribution +
+// the normalization rules. The old hand-drawn 16px SVGs are gone.
+import { ICONS } from './icons';
 import { staleTintKeysA1 } from './gridBlitA1';
 import { pasteAreaMismatch, planFill, planPaste, type GridClipboard } from './clipboardLogic';
 // Sheet-tabs (2026-06-10): the Excel-style bottom tab strip (presentation only; the host owns mutation).
@@ -157,73 +161,93 @@ if (root === null) {
 root.innerHTML =
 	'<h2 id="sheets-title">Quantbook Cell Grid</h2>' +
 	'<div class="meta" id="sheets-meta"></div>' +
-	// Demo-prep (2026-06-10): the Google-Sheets-style MENU BAR -- the very top row, above the toolbar.
-	// Five menus, ONLY functional items (no dead entries): File (save/open), Edit (undo/redo), View
-	// (freeze/unfreeze), Insert (rows/cols + new sheet), Format (number-format presets). The dropdown
-	// panel is built lazily in JS (one shared component with the toolbar insert/delete dropdowns); the
-	// buttons here are just the always-visible bar. ARIA: menubar/menuitem here, menu/menuitem on the
-	// dropdown. Buttons never steal focus from the grid (mousedown preventDefault in the delegated handler).
+	// Demo-prep (2026-06-10) + menu breadth (toolbar-quality overhaul): the Google-Sheets-style MENU
+	// BAR -- the very top row, above the toolbar. Six menus, ONLY functional items (no dead entries):
+	// File (save/open), Edit (undo/redo + the clipboard quartet, reusing the context menu's guarded
+	// webview actions), View (freeze/unfreeze), Insert (rows/cols + new sheet), Format (number-format
+	// presets), Data (the wave-3 Dependencies + Live Python sidebars, via the host bridge's
+	// view-reveal commands). A 'Help' menu was DELIBERATELY not added: its only candidate item (a
+	// function-list command) does not exist host-side, and a menu of dead entries is worse than no
+	// menu (No-Fallbacks). The dropdown panel is built lazily in JS (one shared component with the
+	// toolbar dropdowns); the buttons here are just the always-visible bar. ARIA: menubar/menuitem
+	// here, menu/menuitem on the dropdown. Buttons never steal focus from the grid (mousedown
+	// preventDefault in the delegated handler).
 	'<div id="sheets-menubar" class="cell-grid-menubar" role="menubar" aria-label="Spreadsheet menu bar">' +
 	'<button type="button" class="qb-menu-btn" data-menu="file" role="menuitem" aria-haspopup="true" aria-expanded="false">File</button>' +
 	'<button type="button" class="qb-menu-btn" data-menu="edit" role="menuitem" aria-haspopup="true" aria-expanded="false">Edit</button>' +
 	'<button type="button" class="qb-menu-btn" data-menu="view" role="menuitem" aria-haspopup="true" aria-expanded="false">View</button>' +
 	'<button type="button" class="qb-menu-btn" data-menu="insert" role="menuitem" aria-haspopup="true" aria-expanded="false">Insert</button>' +
 	'<button type="button" class="qb-menu-btn" data-menu="format" role="menuitem" aria-haspopup="true" aria-expanded="false">Format</button>' +
+	'<button type="button" class="qb-menu-btn" data-menu="data" role="menuitem" aria-haspopup="true" aria-expanded="false">Data</button>' +
 	'</div>' +
 	'<div class="sheets-error" id="sheets-error" role="alert" hidden></div>' +
-	// UI-parity (2026-06-10): an Excel/Sheets-style top toolbar. Demo-prep wiring: undo/redo (native
-	// webview messages), the number-format select + fmt-currency/percent/decimal ('toolbarCommand'
-	// setNumberFormat), freeze ('toolbarCommand' freezePanes), and insert/delete (anchored dropdowns ->
-	// the structural 'toolbarCommand's). Bold/italic/underline/colors/borders/align/sort/find/zoom stay
-	// VISUAL-ONLY (cell-style ops are engine-greenfield, FE-4/FE-5) -- deliberately no handler, so a click
-	// is a silent no-op (not an error). Buttons carry a `data-cmd` the delegated handler reads.
+	// UI-parity (2026-06-10) + toolbar-quality overhaul: an Excel/Google-Sheets-style top toolbar
+	// rebuilt to SHEETS' OWN inventory, grouping, and order, with Material Symbols glyphs (icons.ts)
+	// throughout -- the operator's demo requirement is that the chrome READS like Sheets. WIRED
+	// controls: undo/redo (native webview messages), fmt-currency/fmt-percent + the '123' number-
+	// format dropdown ('toolbarCommand' setNumberFormat -- the dropdown replaced the old native
+	// <select>, unifying the look AND deleting the select's special-case focus machinery), freeze
+	// ('toolbarCommand' freezePanes), insert/delete (anchored dropdowns -> the structural
+	// 'toolbarCommand's), and the sigma functions dropdown (opens the in-cell editor on the active
+	// cell prefilled '=FN(' -- see startFunctionInsert). Everything else (print, paint-format, zoom,
+	// the decimal pair, font family/size, B/I/U/S, colors, borders, merge, align, vertical-align,
+	// wrap, filter, sort, search) is VISUAL-ONLY by explicit operator decision ('it must LOOK
+	// complete'; cell-style ops land FE-4/FE-5) -- deliberately NO handler case, so a click is a
+	// silent no-op (zero console errors), exactly like the pre-existing bold button. Buttons carry a
+	// `data-cmd` the delegated click handler reads; dropdown anchors carry aria-haspopup/-expanded.
 	'<div id="sheets-toolbar" class="cell-grid-toolbar" role="toolbar" aria-label="Spreadsheet toolbar">' +
-	'<button type="button" class="cgt-btn" data-cmd="undo" title="Undo"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 6.5H8.5C10.71 6.5 12.5 8.29 12.5 10.5C12.5 12.71 10.71 14.5 8.5 14.5H5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 3.5L2.5 6.5L5 9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="redo" title="Redo"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13.5 6.5H7.5C5.29 6.5 3.5 8.29 3.5 10.5C3.5 12.71 5.29 14.5 7.5 14.5H11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M11 3.5L13.5 6.5L11 9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="undo" title="Undo (Ctrl+Z)">' + ICONS.undo + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="redo" title="Redo (Ctrl+Y)">' + ICONS.redo + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="print" title="Print">' + ICONS.print + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="paint-format" title="Paint format">' + ICONS.format_paint + '</button>' +
 	'<span class="cgt-sep"></span>' +
-	// Demo-prep (2026-06-10): the option VALUES are the engine's exact preset ids (the host contract's
-	// `setNumberFormat.preset`); the labels are the user-facing names. NO 'Scientific' -- the engine
-	// preset list does not have it, so offering it would be a dead entry (No-Fallbacks: never offer an
-	// action that cannot land). 'Number with thousands' carries the 'NumberThousands' preset id.
-	'<select class="cgt-select" data-cmd="numfmt" title="Number format" aria-label="Number format">' +
-	// Codex LOW fix (2026-06-10): the select is a COMMAND PICKER, not a state mirror -- formats are
-	// per-cell, so a single resting value could never be truthful, and a value-holding select silently
-	// EATS a re-pick of the same preset for a NEW selection ('change' only fires on a value CHANGE).
-	// It rests on this hidden+disabled placeholder ('123', the Sheets number-format glyph) and is reset
-	// to it after every pick (see the change handler below), so EVERY pick is a value change and fires.
-	'<option value="" hidden disabled selected>123</option>' +
-	'<option value="General">General</option>' +
-	'<option value="Number">Number</option>' +
-	'<option value="NumberThousands">Number with thousands</option>' +
-	'<option value="Currency">Currency</option>' +
-	'<option value="Percent">Percent</option>' +
-	'<option value="Date">Date</option>' +
-	'</select>' +
+	// Zoom: Sheets keeps it here, right of the history group. Visual-only ('100%' is the resting
+	// label, not live state -- the webview has no zoom model yet).
+	'<button type="button" class="cgt-btn cgt-text cgt-zoom" data-cmd="zoom" title="Zoom">100%<span class="cgt-dd">' + ICONS.arrow_drop_down + '</span></button>' +
 	'<span class="cgt-sep"></span>' +
-	'<button type="button" class="cgt-btn" data-cmd="fmt-currency" title="Currency format"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2V14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M10.5 4.5C10.5 4.5 9.8 3.5 8 3.5C6.2 3.5 5 4.5 5 5.75C5 7 6 7.5 8 8C10 8.5 11 9.25 11 10.5C11 11.75 9.8 12.5 8 12.5C6.2 12.5 5.5 11.5 5.5 11.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="fmt-percent" title="Percent format"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="4.5" cy="5" r="1.8" stroke="currentColor" stroke-width="1.3"/><circle cx="11.5" cy="11" r="1.8" stroke="currentColor" stroke-width="1.3"/><line x1="13" y1="3" x2="3" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="fmt-decimal" title="Decimal places"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M5 8L2 8M2 8L4 6M2 8L4 10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><circle cx="7.5" cy="11.5" r="0.8" fill="currentColor"/><rect x="9.5" y="5.5" width="3" height="5" rx="1.5" stroke="currentColor" stroke-width="1.2"/></svg></button>' +
+	// Number formats: $ and % are WIRED one-click presets (the same setNumberFormat contract as the
+	// '123' dropdown); the decimal pair is visual-only (the engine has no per-cell decimal nudge yet).
+	'<button type="button" class="cgt-btn" data-cmd="fmt-currency" title="Format as currency">' + ICONS.attach_money + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="fmt-percent" title="Format as percent">' + ICONS.percent + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="decimal-decrease" title="Decrease decimal places">' + ICONS.decimal_decrease + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="decimal-increase" title="Increase decimal places">' + ICONS.decimal_increase + '</button>' +
+	// The '123' number-format menu (Sheets' iconic control), WIRED: the shared anchored dropdown
+	// (same component as the menubar + insert/delete) whose items post the 6 engine preset ids
+	// through the chrome guard. NO 'Scientific' -- the engine preset list does not have it, so
+	// offering it would be a dead entry (No-Fallbacks: never offer an action that cannot land).
+	'<button type="button" class="cgt-btn cgt-text" data-cmd="numfmt" title="More number formats" aria-haspopup="true" aria-expanded="false">123<span class="cgt-dd">' + ICONS.arrow_drop_down + '</span></button>' +
 	'<span class="cgt-sep"></span>' +
-	'<button type="button" class="cgt-btn" data-cmd="bold" title="Bold"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4.5 3H9C10.38 3 11.5 4.12 11.5 5.5C11.5 6.88 10.38 8 9 8H4.5V3Z" fill="currentColor"/><path d="M4.5 8H9.5C11.16 8 12.5 9.12 12.5 10.5C12.5 11.88 11.16 13 9.5 13H4.5V8Z" fill="currentColor"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="italic" title="Italic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><line x1="6" y1="3" x2="10" y2="3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="6" y1="13" x2="10" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="9.5" y1="3" x2="6.5" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="underline" title="Underline"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4.5 3V8.5C4.5 10.71 6.07 12.5 8 12.5C9.93 12.5 11.5 10.71 11.5 8.5V3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="3" y1="14.5" x2="13" y2="14.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>' +
+	// Font family + size: visual-only (font styling is FE-4/FE-5 engine work); the resting labels
+	// mirror Sheets' defaults so the bar reads complete.
+	'<button type="button" class="cgt-btn cgt-text cgt-font" data-cmd="font-family" title="Font">Default (Arial)<span class="cgt-dd">' + ICONS.arrow_drop_down + '</span></button>' +
+	'<button type="button" class="cgt-btn cgt-text cgt-fontsize" data-cmd="font-size" title="Font size">10</button>' +
 	'<span class="cgt-sep"></span>' +
-	'<button type="button" class="cgt-btn" data-cmd="textcolor" title="Text color"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 13L8 3L12 13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><line x1="5.5" y1="10" x2="10.5" y2="10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><rect x="3" y="14" width="10" height="1.5" rx="0.75" fill="#ea4335"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="fill" title="Fill color"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 11.5L7 4L10 7L4.5 12.5C3.67 13.33 2.33 13.33 1.5 12.5C1.09 12.09 1.09 11.41 1.5 11L2.5 11.5Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><line x1="5.5" y1="5.5" x2="9" y2="9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><path d="M10 7L12 5L11 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 10.5C14 12 13 13 12.5 13C12 13 11 12 11 10.5C11 9.5 12.5 7.5 12.5 7.5C12.5 7.5 14 9.5 14 10.5Z" fill="currentColor"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="borders" title="Borders"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="0.5" stroke="currentColor" stroke-width="1.3"/><line x1="8" y1="2" x2="8" y2="14" stroke="currentColor" stroke-width="1.3"/><line x1="2" y1="8" x2="14" y2="8" stroke="currentColor" stroke-width="1.3"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="bold" title="Bold">' + ICONS.format_bold + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="italic" title="Italic">' + ICONS.format_italic + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="underline" title="Underline">' + ICONS.format_underlined + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="strikethrough" title="Strikethrough">' + ICONS.strikethrough_s + '</button>' +
 	'<span class="cgt-sep"></span>' +
-	'<button type="button" class="cgt-btn" data-cmd="align-left" title="Align left"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><line x1="2.5" y1="4" x2="13.5" y2="4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="2.5" y1="7" x2="9.5" y2="7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="2.5" y1="10" x2="13.5" y2="10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="2.5" y1="13" x2="9.5" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="align-center" title="Align center"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><line x1="2.5" y1="4" x2="13.5" y2="4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="4.5" y1="7" x2="11.5" y2="7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="2.5" y1="10" x2="13.5" y2="10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="4.5" y1="13" x2="11.5" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="align-right" title="Align right"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><line x1="2.5" y1="4" x2="13.5" y2="4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="6.5" y1="7" x2="13.5" y2="7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="2.5" y1="10" x2="13.5" y2="10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="6.5" y1="13" x2="13.5" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="text-color" title="Text color">' + ICONS.format_color_text + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="fill-color" title="Fill color">' + ICONS.format_color_fill + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="borders" title="Borders">' + ICONS.border_all + '</button>' +
 	'<span class="cgt-sep"></span>' +
-	'<button type="button" class="cgt-btn" data-cmd="freeze" title="Freeze panes"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="0.5" stroke="currentColor" stroke-width="1.1"/><line x1="8" y1="6" x2="14" y2="6" stroke="currentColor" stroke-width="0.9" stroke-dasharray="1.5 1.5"/><line x1="5" y1="6" x2="5" y2="14" stroke="currentColor" stroke-width="0.9" stroke-dasharray="1.5 1.5"/><line x1="2" y1="6" x2="14" y2="6" stroke="currentColor" stroke-width="2"/><line x1="5" y1="2" x2="5" y2="14" stroke="currentColor" stroke-width="2"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="insert" title="Insert row/column" aria-haspopup="true" aria-expanded="false"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="10" height="8" rx="0.75" stroke="currentColor" stroke-width="1.2"/><line x1="1.5" y1="5.5" x2="11.5" y2="5.5" stroke="currentColor" stroke-width="1.2"/><line x1="6.5" y1="2.5" x2="6.5" y2="10.5" stroke="currentColor" stroke-width="1.2"/><circle cx="12.5" cy="11.5" r="3" fill="#188038"/><line x1="12.5" y1="9.5" x2="12.5" y2="13.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/><line x1="10.5" y1="11.5" x2="14.5" y2="11.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="delete" title="Delete row/column" aria-haspopup="true" aria-expanded="false"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="10" height="8" rx="0.75" stroke="currentColor" stroke-width="1.2"/><line x1="1.5" y1="5.5" x2="11.5" y2="5.5" stroke="currentColor" stroke-width="1.2"/><line x1="6.5" y1="2.5" x2="6.5" y2="10.5" stroke="currentColor" stroke-width="1.2"/><circle cx="12.5" cy="11.5" r="3" fill="#ea4335"/><line x1="10.5" y1="11.5" x2="14.5" y2="11.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="merge" title="Merge cells">' + ICONS.cell_merge + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="align-left" title="Align left">' + ICONS.format_align_left + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="align-center" title="Align center">' + ICONS.format_align_center + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="align-right" title="Align right">' + ICONS.format_align_right + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="vertical-align" title="Vertical align">' + ICONS.vertical_align_bottom + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="wrap" title="Text wrapping">' + ICONS.wrap_text + '</button>' +
 	'<span class="cgt-sep"></span>' +
-	'<button type="button" class="cgt-btn" data-cmd="sort" title="Sort A-Z"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><line x1="2" y1="4" x2="9" y2="4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="2" y1="7.5" x2="7.5" y2="7.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="2" y1="11" x2="6" y2="11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="12" y1="3" x2="12" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M9.5 10.5L12 13L14.5 10.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
-	'<button type="button" class="cgt-btn" data-cmd="find" title="Find"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="4" stroke="currentColor" stroke-width="1.3"/><line x1="10" y1="10" x2="13.5" y2="13.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>' +
-	'<span class="cgt-spacer"></span>' +
-	'<button type="button" class="cgt-btn cgt-zoom" data-cmd="zoom" title="Zoom">100%</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="freeze" title="Freeze panes at selection">' + ICONS.splitscreen + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="insert" title="Insert row/column" aria-haspopup="true" aria-expanded="false">' + ICONS.add_row_below + '<span class="cgt-dd">' + ICONS.arrow_drop_down + '</span></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="delete" title="Delete row/column" aria-haspopup="true" aria-expanded="false">' + ICONS.delete + '<span class="cgt-dd">' + ICONS.arrow_drop_down + '</span></button>' +
+	'<span class="cgt-sep"></span>' +
+	// The sigma Functions menu, WIRED: each item opens the in-cell editor on the active cell
+	// prefilled with '=FN(' (caret at the end, ready for the range) -- see startFunctionInsert.
+	'<button type="button" class="cgt-btn" data-cmd="functions" title="Functions" aria-haspopup="true" aria-expanded="false">' + ICONS.functions + '<span class="cgt-dd">' + ICONS.arrow_drop_down + '</span></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="filter" title="Create a filter">' + ICONS.filter_alt + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="sort" title="Sort range">' + ICONS.swap_vert + '</button>' +
+	'<button type="button" class="cgt-btn" data-cmd="search" title="Find in sheet">' + ICONS.search + '</button>' +
 	'</div>' +
 	// W-G formula bar: a name box (the active cell's A1 ref) + a field showing that cell's UNDERLYING
 	// content (a formula with its leading '=', or the raw literal) -- so selecting a computed cell reveals
@@ -282,7 +306,9 @@ const menubarEl = document.getElementById('sheets-menubar') as HTMLElement;
 // Demo-prep (2026-06-10) -- MENU BAR + shared anchored dropdown + toolbar command wiring.
 //
 // One dropdown COMPONENT serves both surfaces: the Google-Sheets-style menu bar (File / Edit /
-// View / Insert / Format) and the toolbar's insert/delete buttons (anchored mini-menus). The
+// View / Insert / Format / Data) and the toolbar's anchored mini-menus (insert/delete, the '123'
+// number-format picker, and the sigma Functions menu -- the latter two added by the toolbar-quality
+// overhaul, 2026-06-10). The
 // panel is a single lazily-created `position:fixed` element on document.body (the same pattern as
 // sheetTabBar.ts's right-click menu), positioned under its anchor, dismissed on click-away /
 // Escape / window blur, and rebuilt per open (the item lists are static, so there is no state to
@@ -295,13 +321,13 @@ const menubarEl = document.getElementById('sheets-menubar') as HTMLElement;
 // interaction. Because no blur ever fires, EVERY chrome ACTION must route through
 // `runAfterResolvingEdit` (the Codex demo-blocker guard below the commit machinery), which resolves
 // any open editor FIRST and then owns the focus hand-back: the grid viewport when the action ran,
-// the still-open editor when the action queued behind / was blocked by that editor's commit. The
-// number-format <select> is the one control allowed to TAKE focus (a select must, to open its
-// native picker) -- but only over a RESOLVED editor: its own mousedown gate (Codex r3 fix-verify
-// MED, 2026-06-10 -- {@link resolveEditForNativeSurface}) cancels/commits an open editor first and
-// keeps the picker SHUT over an unresolved commit, so the select's focus-steal can never trigger
-// the blur-path local-reject hole; its `change` handler still routes through the shared guard
-// (which restores the viewport focus for it). The formula-suggest dropdown (renderCompletion) uses
+// the still-open editor when the action queued behind / was blocked by that editor's commit -- or
+// the FRESH editor the action itself opened (the sigma Functions items open the in-cell editor
+// prefilled '=FN('; see the guard's doc). The toolbar-quality overhaul (2026-06-10) removed the
+// one historical exception: the native number-format <select> (which had to TAKE focus to open its
+// picker, and carried its own mousedown gate for it) is now the '123' shared dropdown, so EVERY
+// toolbar control preventDefaults its mousedown and the chrome never steals focus, full stop. The
+// formula-suggest dropdown (renderCompletion) uses
 // the same mousedown-preventDefault pattern; the sheet-tab strip's buttons do not (a tab click may
 // move real focus -- the strip sits below the grid and a switch re-renders anyway), but the strip's
 // MUTATING commands are nonetheless guarded: every handler in `sheetTabHandlers` except `switchTo`
@@ -317,7 +343,10 @@ const menubarEl = document.getElementById('sheets-menubar') as HTMLElement;
 // handler (type-to-edit etc. behave as if the menu were never open).
 // ============================================================================================
 
-/** The host-contract command ids (cellGridPanel.ts implements the receiving side; keep in sync). */
+/** The host-contract command ids (cellGridPanel.ts implements the receiving side; keep in sync).
+ * `showDepGraph`/`showLivePython` (menu breadth, 2026-06-10) reveal the wave-3 Dependencies /
+ * Live Python sidebars via the auto-registered `<viewId>.focus` commands -- see the host
+ * whitelist's rationale in cellGridLogic.ts `TOOLBAR_SIMPLE_COMMAND_IDS`. */
 type ToolbarCommand =
 	| 'freezePanes'
 	| 'unfreezePanes'
@@ -328,16 +357,18 @@ type ToolbarCommand =
 	| 'deleteRow'
 	| 'deleteColumn'
 	| 'saveAs'
-	| 'openWorkbook';
+	| 'openWorkbook'
+	| 'showDepGraph'
+	| 'showLivePython';
 
 /** The engine's number-format preset ids (the host contract's `setNumberFormat.preset`). There is NO
- * 'Scientific' -- the engine preset list does not have it (the old visual-only select offered it; the
- * wired select must not offer an action that cannot land). */
+ * 'Scientific' -- the engine preset list does not have it; offering it would be a dead entry
+ * (No-Fallbacks: never offer an action that cannot land). The toolbar-quality overhaul replaced the
+ * old native `<select>` with the shared dropdown component, so the runtime membership guard the
+ * select needed (`isNumberFormatPreset`) is gone: every picker item now carries a TYPED literal
+ * preset straight into {@link postSetNumberFormat}, checked at compile time. */
 const NUMBER_FORMAT_PRESETS = ['General', 'Number', 'NumberThousands', 'Currency', 'Percent', 'Date'] as const;
 type NumberFormatPreset = (typeof NUMBER_FORMAT_PRESETS)[number];
-function isNumberFormatPreset(v: string): v is NumberFormatPreset {
-	return (NUMBER_FORMAT_PRESETS as readonly string[]).includes(v);
-}
 
 /** Post a plain toolbar command to the host (the exact contract shape -- no extra fields). */
 function postToolbarCommand(command: ToolbarCommand): void {
@@ -370,7 +401,75 @@ const DELETE_ROW_COL_ITEMS: readonly MenuItemSpec[] = [
 	{ label: 'Delete column', run: () => postToolbarCommand('deleteColumn') },
 ];
 
-// The menu bar's five menus. ONLY functional items -- every entry posts a message the host
+// The 6 engine number-format presets, shared by the toolbar's '123' dropdown AND the menubar's
+// Format menu (one list, so the two surfaces can never drift). Labels are the user-facing names;
+// each run posts the engine's exact preset id. Activation routes through `activateMenuItem` ->
+// `runAfterResolvingEdit` like every dropdown item, so no spec wraps itself in the guard.
+const NUMBER_FORMAT_MENU_ITEMS: readonly MenuItemSpec[] = [
+	{ label: 'General', run: () => postSetNumberFormat('General') },
+	{ label: 'Number', run: () => postSetNumberFormat('Number') },
+	{ label: 'Number with thousands', run: () => postSetNumberFormat('NumberThousands') },
+	{ label: 'Currency', run: () => postSetNumberFormat('Currency') },
+	{ label: 'Percent', run: () => postSetNumberFormat('Percent') },
+	{ label: 'Date', run: () => postSetNumberFormat('Date') },
+];
+
+/**
+ * **Sigma Functions menu (toolbar-quality overhaul, 2026-06-10)** -- start a formula edit on the
+ * ACTIVE cell prefilled `=FN(` with the caret at the end, ready for the range/arguments. Reuses
+ * {@link beginEdit}'s existing type-to-edit entry (its `initialChar` parameter is a plain string
+ * prefill -- the single-char name is historical), so the editor opened here is byte-identical to a
+ * typed one: same blur-commit baseline (the cell's PRIOR content, so blurring the untouched prefill
+ * still commits-or-errors through the normal machinery), same Escape/Enter/commit-token paths, same
+ * oversize sentinel. Activation routes through `activateMenuItem` -> `runAfterResolvingEdit`, which
+ * resolves any OPEN editor first -- so by the time this runs there is no editor (or the action was
+ * queued behind a commit and runs after `resolvePendingCommit` closed it), and `beginEdit`'s M8
+ * pending guard cannot decline... but we still VERIFY the editor actually opened rather than assume
+ * (No-Fallbacks: a silent no-click would read as a dead menu): `beginEdit` returns void and bails
+ * on a null snapshot / an in-flight commit, so a missing editState afterwards is surfaced loud.
+ * The caret is then pinned to the end (type-to-edit relies on engine default caret placement for a
+ * single char; a multi-char prefill must not gamble on it). The chrome guard's focus logic keeps
+ * the keyboard ON this fresh editor (it checks `editState` after the action ran -- see
+ * {@link runAfterResolvingEdit}).
+ */
+function startFunctionInsert(fnName: string): void {
+	if (fullSnapshot === null || active === null) {
+		// No snapshot yet (the host has not rendered) or no active cell -- there is nothing to edit.
+		// Loud, never a silently dead menu item (No-Fallbacks).
+		showError('The grid is not ready yet -- select a cell, then pick a function.', 'transient');
+		return;
+	}
+	const prefill = '=' + fnName + '(';
+	beginEdit(active.row, active.col, prefill);
+	if (editState === null || editState.surface !== 'overlay') {
+		// beginEdit declined (a commit raced in between the guard's resolution and this run, or the
+		// snapshot vanished). The guard's banners/M8 path own the user-facing story for the race; this
+		// console line keeps the decline diagnosable rather than a mystery dead click.
+		console.warn('[sheets-webview] function insert "' + fnName + '" could not open the cell editor');
+		return;
+	}
+	// Caret at the END of the prefill (after the '('), so typing continues the argument list.
+	editState.editEl.setSelectionRange(prefill.length, prefill.length);
+	redraw(); // beginEdit's contract: the CALLER repaints (moves the selection box) -- see its NOTE
+}
+
+// The sigma dropdown's items: the 5 Excel staples, then the 2 native quant functions (the wave-1
+// engine additions -- the demo's beyond-Excel beat). All open the in-cell editor via
+// startFunctionInsert; the function NAMES are the engine's registered ids.
+const FUNCTION_INSERT_ITEMS: readonly MenuEntrySpec[] = [
+	{ label: 'SUM', run: () => startFunctionInsert('SUM') },
+	{ label: 'AVERAGE', run: () => startFunctionInsert('AVERAGE') },
+	{ label: 'COUNT', run: () => startFunctionInsert('COUNT') },
+	{ label: 'MAX', run: () => startFunctionInsert('MAX') },
+	{ label: 'MIN', run: () => startFunctionInsert('MIN') },
+	'separator',
+	{ label: 'SHARPE', run: () => startFunctionInsert('SHARPE') },
+	{ label: 'MAX_DRAWDOWN', run: () => startFunctionInsert('MAX_DRAWDOWN') },
+];
+
+// The menu bar's six menus (menu breadth 2026-06-10 added Data; a Help menu was deliberately
+// SKIPPED -- its only candidate, a function-list command, does not exist host-side). ONLY
+// functional items -- every entry posts a message the host
 // implements TODAY (no dead entries that would make the demo look broken). 'New sheet' reuses the
 // EXACT message the tab strip's `+` posts (`sheetTabHandlers.add` below: `{type:'sheetCommand',
 // command:'add'}`) so both entry points are indistinguishable to the host -- and both run through
@@ -390,6 +489,17 @@ const MENUBAR_MENUS: ReadonlyArray<{ readonly id: string; readonly entries: read
 			// Undo/redo post the SAME native messages as the toolbar buttons + Ctrl/Cmd+Z|Y (one host path).
 			{ label: 'Undo', run: () => vscode.postMessage({ type: 'undo' }) },
 			{ label: 'Redo', run: () => vscode.postMessage({ type: 'redo' }) },
+			'separator',
+			// Menu breadth (2026-06-10): the clipboard quartet reuses EXACTLY the right-click context
+			// menu's webview-side actions (`runContextMenuAction` -> copyGridSelection / pasteGridClipboard
+			// / clearContextSelection -- the same functions Ctrl/Cmd+C|X|V and Delete drive), so all four
+			// entry points are indistinguishable to the grid state. Guarding is inherited: these run via
+			// `activateMenuItem` -> `runAfterResolvingEdit`, the SAME guard the host-posted
+			// `contextMenuAction` replies route through -- one clipboard path, one edit-race story.
+			{ label: 'Cut', run: () => runContextMenuAction('cut') },
+			{ label: 'Copy', run: () => runContextMenuAction('copy') },
+			{ label: 'Paste', run: () => runContextMenuAction('paste') },
+			{ label: 'Clear contents', run: () => runContextMenuAction('clear') },
 		],
 	},
 	{
@@ -409,13 +519,20 @@ const MENUBAR_MENUS: ReadonlyArray<{ readonly id: string; readonly entries: read
 	},
 	{
 		id: 'format',
+		// The SAME item list as the toolbar's '123' dropdown (one source, no drift).
+		entries: NUMBER_FORMAT_MENU_ITEMS,
+	},
+	{
+		id: 'data',
+		// Menu breadth (2026-06-10): the wave-3 sidebars. Both are host-side VIEWS (package.json
+		// contributes.views, gated `quantbook.hasOpenGrid` -- true here, a grid is open), revealed via
+		// the `<viewId>.focus` commands VS Code auto-registers for every contributed view; the host
+		// whitelist maps showDepGraph/showLivePython to those exact ids (cellGridLogic.ts). NO other
+		// Data items: dep-graph + Live Python are the only genuinely functional candidates today
+		// (sort/filter/pivot are engine-greenfield), and dead entries are worse than a short menu.
 		entries: [
-			{ label: 'General', run: () => postSetNumberFormat('General') },
-			{ label: 'Number', run: () => postSetNumberFormat('Number') },
-			{ label: 'Number with thousands', run: () => postSetNumberFormat('NumberThousands') },
-			{ label: 'Currency', run: () => postSetNumberFormat('Currency') },
-			{ label: 'Percent', run: () => postSetNumberFormat('Percent') },
-			{ label: 'Date', run: () => postSetNumberFormat('Date') },
+			{ label: 'Dependencies', run: () => postToolbarCommand('showDepGraph') },
+			{ label: 'Live Python', run: () => postToolbarCommand('showLivePython') },
 		],
 	},
 ];
@@ -676,11 +793,11 @@ document.addEventListener(
 	true,
 );
 
-// Toolbar: mousedown preventDefault on the BUTTONS so they never steal focus from the grid. The
-// number-format <select> is excluded from THIS blanket preventDefault -- a select must take focus
-// to open its native picker -- but it is NOT unguarded: its own mousedown gate (registered on the
-// element below) only lets it take focus over a RESOLVED editor, and its `change` handler restores
-// the viewport focus after a pick.
+// Toolbar: mousedown preventDefault on the BUTTONS so they never steal focus from the grid. Since
+// the toolbar-quality overhaul (2026-06-10) EVERY toolbar control is a `.cgt-btn` -- the old
+// number-format <select> (the one control that legitimately took focus, and needed its own
+// mousedown gate for it) is now the shared '123' dropdown -- so this blanket preventDefault covers
+// the whole bar with no exclusions.
 toolbarEl.addEventListener('mousedown', (e) => {
 	const btn = (e.target as HTMLElement).closest('.cgt-btn');
 	if (btn !== null) {
@@ -713,11 +830,30 @@ toolbarEl.addEventListener('click', (e) => {
 		case 'fmt-percent':
 			runAfterResolvingEdit('number format "Percent"', () => postSetNumberFormat('Percent'));
 			return;
-		case 'fmt-decimal':
-			runAfterResolvingEdit('number format "Number"', () => postSetNumberFormat('Number'));
-			return;
 		case 'freeze':
 			runAfterResolvingEdit('Freeze panes', () => postToolbarCommand('freezePanes'));
+			return;
+		case 'numfmt':
+			// The '123' number-format menu -- the shared anchored dropdown that REPLACED the old native
+			// <select> (toolbar-quality overhaul, 2026-06-10): one dropdown look across the whole chrome,
+			// and the select's special-case machinery (its focus-stealing mousedown gate + the hidden
+			// '123' placeholder/reset dance) is deleted with it. Toggle semantics + guard inheritance are
+			// identical to insert/delete below: OPENING posts nothing, the ITEMS run through
+			// `activateMenuItem` -> `runAfterResolvingEdit`.
+			if (openMenu !== null && openMenu.anchor === btn) {
+				closeMenuDropdown();
+			} else {
+				openMenuDropdown(btn, NUMBER_FORMAT_MENU_ITEMS, null);
+			}
+			return;
+		case 'functions':
+			// The sigma Functions menu (wired): items open the in-cell editor prefilled '=FN(' via
+			// startFunctionInsert, through the same activateMenuItem guard seam.
+			if (openMenu !== null && openMenu.anchor === btn) {
+				closeMenuDropdown();
+			} else {
+				openMenuDropdown(btn, FUNCTION_INSERT_ITEMS, null);
+			}
 			return;
 		case 'insert':
 			// Toggle the anchored mini-menu (same component as the menu bar; menuId null = no hover-move).
@@ -737,67 +873,34 @@ toolbarEl.addEventListener('click', (e) => {
 			}
 			return;
 		default:
-			// Visual-only buttons (bold/italic/underline/colors/borders/align/sort/find/zoom): engine-
-			// greenfield style ops land in FE-4/FE-5. Deliberately a quiet no-op -- no error, no handler.
+			// Visual-only buttons (print / paint-format / zoom / the decimal pair / font family+size /
+			// bold / italic / underline / strikethrough / colors / borders / merge / align / vertical-
+			// align / wrap / filter / sort / search): engine-greenfield style ops land in FE-4/FE-5; the
+			// operator chose look-complete over hide-incomplete. Deliberately a quiet no-op -- no error,
+			// no handler, zero console output.
 			return;
 	}
 });
 
-// The number-format <select> is a COMMAND PICKER (Codex LOW fix, 2026-06-10): it always rests on the
-// hidden '123' placeholder option and is reset to it after every pick, so choosing the SAME preset for
-// a new selection still fires 'change' (a value-holding select silently ate the re-pick -- 'change'
-// only fires on a value CHANGE -- and formats are per-cell, so no resting value could be truthful
-// anyway). The pick routes through `runAfterResolvingEdit` (the demo-blocker guard) like every other
-// chrome action; the guard owns the focus hand-back (the select legitimately took focus to open
-// natively -- see the focus model above). The host re-renders the grid with the new formatting; the
-// webview keeps no optimistic state.
-const numberFormatSelectEl = toolbarEl.querySelector('select.cgt-select') as HTMLSelectElement;
-// **Codex r3 fix-verify MED (2026-06-10) -- the select may only OPEN over a RESOLVED editor.**
-// The select is the one chrome control that takes focus (it must, to open its native picker), so
-// pressing it BLURS an open editor BEFORE the `change` handler's `runAfterResolvingEdit` ever sees
-// it -- and the blur path has a hole the guard cannot close after the fact: a blur-commit that
-// LOCALLY rejects (over-limit) makes `onEditBlur` cancel + discard the editor, so by `change` time
-// `editState` is null and the resolver reads 'ran' -- the format then applies despite the guard's
-// 'blocked' contract (the user was just told their edit was discarded, and chrome acted anyway).
-// Fix at the FOCUS boundary, mirroring the rest of the chrome focus model: on mousedown (the event
-// whose default action focuses the select AND opens the picker in Chromium -- the same seam the
-// toolbar buttons preventDefault), resolve the editor FIRST via the shared native-surface resolver:
-//   - no editor / unchanged / known-bad -> resolved synchronously (cancel, Escape-semantics) -> let
-//     THIS SAME gesture open the picker natively (no preventDefault) -- the pick then lands over a
-//     resolved grid and the placeholder/command-picker behavior below is untouched;
-//   - changed -> commit NOW; pending -> nothing to do but wait. Both: preventDefault, so the select
-//     NEVER takes focus (no blur ever fires -> the local-reject hole is unreachable) and the picker
-//     stays shut over an unresolved commit. The resolver banners the suppression (No-Fallbacks:
-//     never a silently dead control); the user re-clicks once the commit resolves. Deliberately NOT
-//     `resolveEditThen`-with-a-no-op: a queued no-op cannot re-open a native picker, and it would
-//     SUPERSEDE (destroy) a real queued action such as a deferred 'Delete row' (see the resolver's
-//     doc for the full rationale).
-// The `change` guard below STAYS as defense-in-depth (e.g. a keyboard-focused select changing value
-// via arrow keys never passes through this mousedown gate).
-numberFormatSelectEl.addEventListener('mousedown', (ev) => {
-	if (editState === null) {
-		return; // nothing to resolve: the select takes focus + opens natively (the documented exception)
-	}
-	if (!resolveEditForNativeSurface('pick a number format again once it settles.')) {
-		ev.preventDefault(); // keep focus on the editor; the picker must not open over an unresolved commit
-	}
-});
-numberFormatSelectEl.addEventListener('change', () => {
-	const v = numberFormatSelectEl.value;
-	// Reset to the placeholder FIRST (a programmatic value write fires no 'change'), so the select never
-	// rests on a preset value and every future pick -- same preset included -- is a value change.
-	numberFormatSelectEl.value = '';
-	if (!isNumberFormatPreset(v)) {
-		// The pickable option values are authored in the template above (the placeholder is hidden+disabled,
-		// so a user can never produce its ''), so this is unreachable unless the template drifts from
-		// NUMBER_FORMAT_PRESETS -- a wiring bug, surfaced loud (No-Fallbacks).
-		console.error('[sheets-webview] number-format select produced an unknown preset (template bug):', v);
-		// Still hand focus back to the grid: a select left focused turns arrow keys into more change events.
-		viewportEl.focus();
-		return;
-	}
-	runAfterResolvingEdit('number format "' + v + '"', () => postSetNumberFormat(v));
-});
+// Toolbar-quality overhaul (2026-06-10): the number-format <select> -- and ALL of its special-case
+// machinery -- is GONE, replaced by the '123' shared-dropdown anchor handled in the click handler
+// above. What was deleted with it, and why it is safe to delete:
+//   - the select's mousedown gate (the Codex r3 fix-verify MED): it existed ONLY because a native
+//     <select> must TAKE focus to open its picker, which blurred an open editor before the change
+//     handler's guard could see it. The dropdown button preventDefaults its mousedown like every
+//     other `.cgt-btn` (the blanket toolbar handler above), so the editor is never blurred and the
+//     blur-path local-reject hole the gate plugged is structurally unreachable.
+//   - the hidden '123' placeholder + reset-after-pick dance (the Codex LOW command-picker fix): a
+//     dropdown ITEM fires `activateMenuItem` on every click -- there is no 'change'-only-fires-on-
+//     value-CHANGE event model to outsmart, so re-picking the same preset for a new selection just
+//     works.
+//   - the `isNumberFormatPreset` runtime membership check: dropdown items carry TYPED literal
+//     presets straight into postSetNumberFormat (compile-time checked); there is no untyped
+//     `select.value` string to validate.
+// Guarding is INHERITED, not re-implemented: the items route through `activateMenuItem` ->
+// `runAfterResolvingEdit`, the exact seam every menubar/toolbar dropdown item already uses. The
+// grid's right-click context menu is now the ONLY native surface, and it keeps
+// `resolveEditForNativeSurface` (see its doc -- updated for the select's removal).
 const spacerEl = document.getElementById('sheets-spacer') as HTMLElement;
 const canvasEl = document.getElementById('sheets-canvas') as HTMLCanvasElement;
 const inputEl = document.getElementById('sheets-edit-input') as HTMLInputElement;
@@ -1017,12 +1120,13 @@ function armCommitWatchdog(commitId: number): void {
 // ============================================================================
 // Deferred-action slot (2026-06-10, Codex DEMO-BLOCKER) -- ONE coherent "wait for the edit to
 // resolve, then act" story shared by USER sheet switches (the tab strip) and EVERY chrome action
-// (toolbar buttons incl. undo/redo, the number-format select, all dropdown + menubar items, the
-// tab strip's sheet commands add/rename/delete/move, and the host-posted `contextMenuAction`
-// clipboard replies -- the last two added by the Codex r3 fix-verify round). The two NATIVE
-// surfaces that cannot defer their action (the grid's right-click context menu and the select's
-// native picker -- neither can be re-opened programmatically at a later resolution point) use the
-// sibling RESOLVE-OR-SUPPRESS resolver instead ({@link resolveEditForNativeSurface}).
+// (toolbar buttons incl. undo/redo, all dropdown + menubar items -- the number-format presets now
+// among them, the '123' dropdown having replaced the native select in the toolbar-quality
+// overhaul -- the tab strip's sheet commands add/rename/delete/move, and the host-posted
+// `contextMenuAction` clipboard replies -- the last two added by the Codex r3 fix-verify round).
+// The ONE remaining NATIVE surface that cannot defer its action (the grid's right-click context
+// menu -- it cannot be re-opened programmatically at a later resolution point) uses the sibling
+// RESOLVE-OR-SUPPRESS resolver instead ({@link resolveEditForNativeSurface}).
 //
 // WHY chrome actions need it: all chrome controls preventDefault their mousedown so the grid (or an
 // OPEN cell/formula editor) keeps focus -- which also means clicking chrome NEVER blurs an open
@@ -1157,42 +1261,47 @@ function resolveEditThen(action: DeferredEditResolvedAction): 'ran' | 'queued' |
 
 /**
  * **The chrome-action guard (Codex DEMO-BLOCKER fix, 2026-06-10).** EVERY wired chrome control --
- * all posting toolbar buttons (incl. undo/redo), the number-format select, every dropdown /
- * menubar item (via `activateMenuItem`, the single dropdown seam), the tab strip's sheet commands
+ * all posting toolbar buttons (incl. undo/redo), every dropdown / menubar item (via
+ * `activateMenuItem`, the single dropdown seam -- the number-format presets among them, since the
+ * '123' dropdown replaced the old native select), the tab strip's sheet commands
  * (add/rename/delete/moveLeft/moveRight via `sheetTabHandlers`), and the host-posted
  * `contextMenuAction` clipboard replies (Codex r3 fix-verify) -- posts THROUGH this, never
  * directly, so a host mutation can never race an open editor's stale coordinates. Also owns the
  * focus restoration the chrome focus model requires (see the FOCUS MODEL comment up top):
- *   - 'ran'              -> the action fired with no editor in the way: keyboard back to the grid
- *                           viewport (this is what gives undo/redo the restoration the other wired
- *                           buttons already had);
- *   - 'queued'/'blocked' -> the editor owns the interaction: keep/restore focus ON the editor (a
- *                           pending editor is readOnly and its resolution re-asserts focus; a
- *                           blocked editor needs the keyboard so the user can shorten the value).
- *                           Focus must never land on chrome here -- a focused <select> would turn
- *                           arrow keys into a stream of further change events. (Focusing the
- *                           formula bar while it IS the live editor is a no-op: `beginEditFormula`
- *                           early-returns on its own surface.)
+ *   - editor open AFTER the action -> focus IT. Two distinct cases share this arm:
+ *       (a) 'queued'/'blocked': the PRE-existing editor owns the interaction (a pending editor is
+ *           readOnly and its resolution re-asserts focus; a blocked editor needs the keyboard so
+ *           the user can shorten the value). Focus must never land on chrome here.
+ *       (b) 'ran' where the ACTION ITSELF opened a fresh editor (the sigma Functions items ->
+ *           `startFunctionInsert` -> `beginEdit`): the old unconditional `viewportEl.focus()` on
+ *           'ran' would BLUR that brand-new editor, and its blur-commit would write the bare
+ *           '=FN(' prefill into the cell -- the exact stale-state class this guard exists to kill.
+ *           The resolver cancelled/closed any prior editor before running, so a non-null
+ *           `editState` after 'ran' can ONLY be one the action just opened, on purpose.
+ *       (Focusing the formula bar while it IS the live editor is a no-op: `beginEditFormula`
+ *       early-returns on its own surface.)
+ *   - 'ran' with no editor -> keyboard back to the grid viewport (this is what gives undo/redo the
+ *     restoration the other wired buttons already had).
  */
 function runAfterResolvingEdit(label: string, run: () => void): void {
 	const outcome = resolveEditThen({ kind: 'chrome', label, run });
-	if (outcome === 'ran') {
-		viewportEl.focus();
-	} else if (editState !== null) {
+	if (editState !== null) {
 		editState.editEl.focus();
+	} else if (outcome === 'ran') {
+		viewportEl.focus();
 	}
 }
 
 /**
- * **The NATIVE-surface edit resolver (Codex r3 fix-verify, 2026-06-10).** Two chrome surfaces are
- * NATIVE -- owned by the browser / VS Code, not by this webview -- so their "action" cannot route
- * through the deferred-action slot:
+ * **The NATIVE-surface edit resolver (Codex r3 fix-verify, 2026-06-10).** A chrome surface that is
+ * NATIVE -- owned by the browser / VS Code, not by this webview -- cannot route its "action"
+ * through the deferred-action slot. Since the toolbar-quality overhaul replaced the number-format
+ * <select> (whose native picker was the second such surface; `showPicker()` needs a live user
+ * gesture a commit-ack resolution point no longer has) with the shared '123' dropdown, exactly ONE
+ * native surface remains:
  *   - the grid's right-click CONTEXT MENU: VS Code shows it from the `data-vscode-context` payload
  *     the moment the `contextmenu` event completes (the injected pre/index.html handler), and there
- *     is no API to re-open it when a queued commit later resolves;
- *   - the number-format <select>'s native PICKER: no reliable programmatic re-open
- *     (`showPicker()` requires a live user gesture, which a commit-ack resolution point no longer
- *     has).
+ *     is no API to re-open it when a queued commit later resolves.
  * Queueing a NO-OP through `resolveEditThen` instead would be actively harmful: the no-op cannot
  * re-open the surface (the user must re-gesture anyway), and setting it would SUPERSEDE -- i.e.
  * destroy, loudly but pointlessly -- a REAL queued action such as a deferred 'Delete row'. So these

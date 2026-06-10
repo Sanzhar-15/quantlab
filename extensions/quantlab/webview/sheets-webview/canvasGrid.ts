@@ -73,27 +73,34 @@ const DEBUG_BLIT_VERIFY = false;
 const DAMAGE_CLIP_PAD = 1;
 
 /**
- * **Sheets retheme (2026-06-10)** -- the accent that drives the clean Google-Sheets look: active
- * row/col header highlight, the selection box border + handle, and the multi-cell range outline. Sheets
- * uses its signature blue `#1a73e8`; we use it as a tasteful CONSTANT (not a theme var) so the grid reads
- * like a spreadsheet on every VS Code theme rather than picking up a brown/orange editor accent. The theme
- * read in {@link CanvasGridRenderer.readPalette} prefers `--vscode-charts-blue` when present (so a theme
- * with a coherent blue still wins) and falls back to this. The header text on an active row/col goes this
- * color + bold (the Sheets "current column letter" treatment). To prefer the Sheets GREEN look instead,
- * swap this constant (+ the two translucent washes below) to `#188038` / its rgba -- a one-line retheme. */
-const SHEETS_ACCENT_BLUE = '#1a73e8';
-/** Translucent accent for the active row/col header band -- a faint blue wash (Sheets tints the active
- * header a pale accent, not a heavy fill). Low alpha so the header letter stays legible on top. */
-const SHEETS_ACCENT_HEADER_FILL = 'rgba(26,115,232,0.16)';
-/** **Sheets retheme (2026-06-10) -- header HOVER wash.** A FAINTER accent wash painted on the column-letter
- * / row-number cell the pointer is currently over (the Sheets "hover a header" cue). Deliberately lower
- * alpha than {@link SHEETS_ACCENT_HEADER_FILL} so it reads as a transient hover, distinct from the persistent
- * active-selection highlight -- and so the active highlight always wins when both would apply (the draw code
- * only paints the hover wash on a header cell that is NOT in the active/selection tint). */
-const SHEETS_ACCENT_HEADER_HOVER = 'rgba(26,115,232,0.07)';
-/** Translucent accent for the multi-cell selection RANGE fill -- a faint blue, Sheets' selection wash.
- * Must stay translucent so cell contents read through. */
-const SHEETS_ACCENT_RANGE_FILL = 'rgba(26,115,232,0.10)';
+ * **Brand accent (2026-06-10, supersedes the Sheets-blue constant)** -- the accent that drives every
+ * spreadsheet accent surface, the way Excel uses its green and Sheets its blue: the active-cell ring,
+ * the multi-cell selection border + translucent fill, the row/col header highlight band for the selected
+ * range, the active header letter/number text + underline, the fill handle + fill-preview dash, and the
+ * select-all corner triangle. It is **Quantlab's BRAND color, resolved from the theme** -- the
+ * `--vscode-quantlabAccent` theme var with this `#FF7331` orange fallback, the exact pattern the rest of
+ * the product uses (`extensions/quantlab/media/tokens.css`: `--ql-accent: var(--vscode-quantlabAccent,
+ * #FF7331)`; hover `#E5672C` / active `#CC5C22` exist there too, but the grid derives its hover/active
+ * states as ALPHA TINTS of the base instead -- canvas paints, not CSS pseudo-states). Resolved in
+ * {@link CanvasGridRenderer.readPalette} through the SAME `getComputedStyle` read as every other theme
+ * color (cached in the palette, refreshed by {@link CanvasGridRenderer.refreshTheme}), so a theme that
+ * overrides the brand accent wins and the grid follows live theme switches. The OPAQUE accent is
+ * theme-provided (contrast on light AND dark themes is the theme author's contract); only the translucent
+ * washes below are derived from it, via {@link CanvasGridRenderer.parseCssColorRgb}.
+ */
+const QUANTLAB_ACCENT_FALLBACK = '#FF7331';
+/** Alpha for the active row/col HEADER highlight band (Excel tints the selected range's headers; Sheets
+ * uses a pale accent wash). Low so the header letter/number stays legible on top of the wash. */
+const ACCENT_HEADER_FILL_ALPHA = 0.16;
+/** **Header HOVER wash** -- a FAINTER accent wash painted on the column-letter / row-number cell the
+ * pointer is currently over (the Sheets "hover a header" cue). Deliberately lower alpha than
+ * {@link ACCENT_HEADER_FILL_ALPHA} so it reads as a transient hover, distinct from the persistent
+ * active-selection highlight -- and so the active highlight always wins when both would apply (the draw
+ * code only paints the hover wash on a header cell that is NOT in the active/selection tint). */
+const ACCENT_HEADER_HOVER_ALPHA = 0.07;
+/** Alpha for the multi-cell selection RANGE fill (~15%, per the brand-accent spec). Translucent so cell
+ * contents read through the wash -- the focus cell keeps its crisp opaque-accent ring on top. */
+const ACCENT_RANGE_FILL_ALPHA = 0.15;
 /** Very light gridline (`~#e0e0e0` on white) -- the Sheets gridline on a light theme. On a dark theme the
  * palette derives a faint low-contrast line from `--vscode-panel-border` instead (see readPalette). */
 const SHEETS_GRIDLINE_LIGHT = 'rgba(0,0,0,0.10)';
@@ -1426,55 +1433,68 @@ export class CanvasGridRenderer {
 		};
 		const background = v('--vscode-editor-background', '#1e1e1e');
 		const isDark = CanvasGridRenderer.isDarkColor(background);
-		// Sheets retheme: the accent prefers a coherent themed blue when present, else the Sheets-blue
-		// constant -- so the active-header highlight + selection box read GREEN/BLUE, never the old brown.
-		const accent = v('--vscode-charts-blue', SHEETS_ACCENT_BLUE);
+		// Brand accent (2026-06-10): Quantlab's brand color from the theme, the SAME var+fallback pattern
+		// tokens.css uses for `--ql-accent`. This replaces the previous hardcoded Sheets-blue / charts-blue
+		// read -- the operator wants the BRAND color wherever Excel/Sheets show theirs. Cached in the palette
+		// like every other theme color; refreshTheme() re-resolves it on a theme change.
+		const accent = v('--vscode-quantlabAccent', QUANTLAB_ACCENT_FALLBACK);
+		// Derive the translucent accent washes from the RESOLVED accent (theme-provided or fallback), so a
+		// theme that overrides the brand color tints consistently. accentTint handles #rgb/#rrggbb/rgb()/
+		// rgba() (the forms a theme var can carry) and warns ONCE + tints the known-good fallback if the
+		// theme hands us something unparseable (No-Fallbacks: surfaced, never silent).
+		const tint = (alpha: number): string => CanvasGridRenderer.accentTint(accent, alpha);
 		return {
 			foreground: v('--vscode-foreground', '#cccccc'),
 			background,
 			// Sheets retheme: the header band / row gutter sit on a subtle wash distinct from the cell area
 			// (Sheets greys the headers a touch). A faint foreground-tinted overlay on either theme.
 			headerBg: isDark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)',
-			// Sheets retheme: the ACTIVE row/col header band -- a faint accent wash (was a heavy
-			// list-activeSelection fill that read brown on warm themes).
-			headerActiveBg: SHEETS_ACCENT_HEADER_FILL,
+			// Brand accent: the ACTIVE row/col header band -- a faint accent wash over the headers of the
+			// selected range (the Excel-style "selected range tints its headers" treatment; was a heavy
+			// list-activeSelection fill that read brown on warm themes, then a hardcoded Sheets-blue rgba).
+			headerActiveBg: tint(ACCENT_HEADER_FILL_ALPHA),
 			// Sheets retheme: a LIGHT, low-contrast gridline. On a light theme the Sheets `~#e0e0e0` look
 			// (a faint black overlay); on a dark theme a faint white overlay so lines stay subtle, not heavy.
 			border: isDark ? 'rgba(255,255,255,0.08)' : SHEETS_GRIDLINE_LIGHT,
 			descriptionFg: v('--vscode-descriptionForeground', '#9d9d9d'),
 			errorFg: v('--vscode-errorForeground', '#f48771'),
 			errorBg: v('--vscode-inputValidation-errorBackground', 'rgba(190,40,40,0.25)'),
-			// Sheets retheme: the selection box border IS the accent (clean blue, not the editor focusBorder
-			// which can be brown/teal on some themes).
+			// Brand accent: the active-cell ring + selection-rect border + fill handle + fill-preview dash all
+			// stroke/fill `selectionBorder`, which IS the opaque brand accent (the Excel "selected cell
+			// outline in the product color" treatment -- not the editor focusBorder, which varies per theme).
 			selectionBorder: accent,
-			// Sheets retheme: a faint accent wash over a multi-cell range (translucent so values read through).
-			rangeFill: SHEETS_ACCENT_RANGE_FILL,
-			// W-G bound-cell badge: a "live data" green, distinct from the blue focus/selection border so a
-			// selected published cell shows both markers. Themed via the standard chart palette.
+			// Brand accent: a ~15% accent wash over a multi-cell range (translucent so values read through).
+			rangeFill: tint(ACCENT_RANGE_FILL_ALPHA),
+			// W-G bound-cell badge: a "live data" green, deliberately NOT the brand accent -- a distinct hue
+			// from the accent focus/selection border so a selected published cell shows both markers.
 			publishedBadge: v('--vscode-charts-green', '#89d185'),
-			// Sheets retheme: muted header letters / row numbers (the active one overrides to `accent`+bold).
+			// Sheets-parity: muted header letters / row numbers (the active one overrides to `accent`+bold).
 			headerText: v('--vscode-descriptionForeground', isDark ? '#9d9d9d' : '#5f6368'),
 			accent,
-			// Sheets retheme (header hover): a faint accent wash, strictly lighter than `headerActiveBg` so the
+			// Brand accent (header hover): a faint accent wash, strictly lighter than `headerActiveBg` so the
 			// active-selection highlight always wins when a hovered header is also the active row/col.
-			headerHoverBg: SHEETS_ACCENT_HEADER_HOVER,
-			// Sheets retheme: the muted select-all corner triangle, the dimmed header text color.
-			cornerTriangle: v('--vscode-descriptionForeground', isDark ? '#8c8c8c' : '#9aa0a6'),
+			headerHoverBg: tint(ACCENT_HEADER_HOVER_ALPHA),
+			// Brand accent: the select-all corner triangle in the OPAQUE accent (per the brand-accent spec --
+			// Excel/Sheets accent their select-all affordance; ours is the brand mark in the corner box). A
+			// tiny glyph, so the full-strength accent reads as a deliberate accent, not noise.
+			cornerTriangle: accent,
 		};
 	}
 
 	/**
-	 * **Sheets retheme** -- perceived-luminance check so the palette can pick a LIGHT gridline on a light
-	 * theme (`~#e0e0e0`) vs a faint WHITE line on a dark theme. Parses `#rgb`/`#rrggbb`/`rgb()`/`rgba()`
-	 * (the only forms VS Code injects for `--vscode-editor-background`); an unparseable value defaults to
-	 * "dark" (the common VS Code default), which keeps the line subtle either way. Pure-ish (string in,
-	 * boolean out; no `this`).
+	 * **Brand accent (2026-06-10)** -- parse a CSS color string into its RGB channels, or `null` when the
+	 * form is not one we handle. Handles `#rgb`, `#rrggbb`, `#rrggbbaa` (alpha ignored -- the caller
+	 * supplies its own), `rgb()` and `rgba()` -- the forms a VS Code theme var / our fallbacks carry.
+	 * Extracted from the body of {@link isDarkColor} (the file's pre-existing color parser, per the
+	 * brand-accent spec: reuse it, don't duplicate) so BOTH the dark-gridline adaptation and the
+	 * accent-tint derivation ({@link accentTint}) share one parser. Pure (string in, channels out; no
+	 * `this`), so the two call sites cannot drift.
 	 */
-	private static isDarkColor(color: string): boolean {
+	private static parseCssColorRgb(color: string): { r: number; g: number; b: number } | null {
 		const c = color.trim();
-		let r = 0;
-		let g = 0;
-		let b = 0;
+		let r: number;
+		let g: number;
+		let b: number;
 		const hex = c.startsWith('#') ? c.slice(1) : '';
 		if (hex.length === 3) {
 			r = parseInt(hex[0] + hex[0], 16);
@@ -1487,17 +1507,62 @@ export class CanvasGridRenderer {
 		} else {
 			const m = c.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
 			if (m === null) {
-				return true; // unparseable -> assume dark (VS Code's default family)
+				return null;
 			}
 			r = Number(m[1]);
 			g = Number(m[2]);
 			b = Number(m[3]);
 		}
 		if (!Number.isFinite(r) || !Number.isFinite(g) || !Number.isFinite(b)) {
-			return true;
+			return null;
+		}
+		return { r, g, b };
+	}
+
+	/**
+	 * **Brand accent (2026-06-10)** -- an `rgba()` string of the resolved accent at the given alpha, for
+	 * the derived translucent washes (selection range fill, header highlight band, header hover). The
+	 * accent itself comes from the theme (`--vscode-quantlabAccent`) so it can be ANY parseable CSS color;
+	 * when the theme hands us a form {@link parseCssColorRgb} cannot read (e.g. `hsl()`), we `console.warn`
+	 * ONCE (No-Fallbacks: a silent default would mask a broken/exotic theme value) and tint the canonical
+	 * `#FF7331` fallback instead -- which is statically known to parse, so the wash NEVER silently
+	 * disappears (an un-tinted selection would be invisible, far worse than an off-brand hue).
+	 */
+	private static accentTint(accent: string, alpha: number): string {
+		let rgb = CanvasGridRenderer.parseCssColorRgb(accent);
+		if (rgb === null) {
+			if (!warnedMissingVars.has('quantlabAccent-unparseable')) {
+				warnedMissingVars.add('quantlabAccent-unparseable');
+				console.warn(
+					`[sheets-webview] the resolved brand accent "${accent}" is not a #rgb/#rrggbb/rgb()/rgba() ` +
+					`color; deriving the translucent accent washes from the canonical fallback ` +
+					`"${QUANTLAB_ACCENT_FALLBACK}" instead. The theme's --vscode-quantlabAccent value should use ` +
+					`one of the supported forms.`,
+				);
+			}
+			rgb = CanvasGridRenderer.parseCssColorRgb(QUANTLAB_ACCENT_FALLBACK);
+			if (rgb === null) {
+				// Unreachable: the fallback is a compile-time #rrggbb literal. Throw rather than paint garbage.
+				throw new Error('sheets-webview: QUANTLAB_ACCENT_FALLBACK failed to parse -- constant corrupted');
+			}
+		}
+		return `rgba(${rgb.r},${rgb.g},${rgb.b},${alpha})`;
+	}
+
+	/**
+	 * **Sheets retheme** -- perceived-luminance check so the palette can pick a LIGHT gridline on a light
+	 * theme (`~#e0e0e0`) vs a faint WHITE line on a dark theme. Parses via {@link parseCssColorRgb} (the
+	 * shared parser; only the forms VS Code injects for `--vscode-editor-background`); an unparseable value
+	 * defaults to "dark" (the common VS Code default), which keeps the line subtle either way. Pure-ish
+	 * (string in, boolean out; no `this`).
+	 */
+	private static isDarkColor(color: string): boolean {
+		const rgb = CanvasGridRenderer.parseCssColorRgb(color);
+		if (rgb === null) {
+			return true; // unparseable -> assume dark (VS Code's default family)
 		}
 		// Rec. 601 luma; < 128 reads as a dark background.
-		return 0.299 * r + 0.587 * g + 0.114 * b < 128;
+		return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b < 128;
 	}
 
 	private readFonts(): { body: string; header: string; headerActive: string } {

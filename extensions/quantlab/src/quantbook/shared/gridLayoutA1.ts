@@ -85,15 +85,32 @@ export function truncateToWidth(text: string, maxWidth: number, measure: (s: str
 	return text.slice(0, lo) + ellipsis;
 }
 
-/** Pixel width of one data column (Excel default ~64px). */
-export const COL_WIDTH = 64;
+/**
+ * Pixel width of one data column. **Sheets-parity (2026-06-10): 100px**, Google Sheets' default column
+ * width (was 64, the Excel-ish default -- a 2026-06-10 screenshot audit showed the grid reading less
+ * spreadsheet-like than Sheets AND truncating long labels at 64). Every consumer derives from this one
+ * constant (renderer paint, hit-testing, frozen-band widths, blit math, the scroll spacer via
+ * {@link totalContentWidth}, the overlay editor via {@link cellContentRect}), so this single edit
+ * re-geometries the whole grid consistently. Width has no Chromium-element-cap concern
+ * (`MAX_COLS * 100 = ~1.64M px`, far under the ~33.5M cap that constrains ROW_HEIGHT).
+ */
+export const COL_WIDTH = 100;
 
-/** Pixel height of one data row. **Must stay <= 31**: `MAX_ROWS*ROW_HEIGHT` must remain under the
- * ~33.5M-px Chromium/Electron max element height (at 25 → 26.2M px, 78% of the cap). */
-export const ROW_HEIGHT = 25;
+/** Pixel height of one data row. **Sheets-parity (2026-06-10): 24px** (was 25; Google Sheets uses ~21).
+ * 21 was rejected deliberately: the renderer's body font is 13px (`canvasGrid.readFonts`), and a 13px
+ * glyph box centered in a 21px row leaves ~3px of leading per side -- visibly cramped next to Sheets,
+ * whose default cell font is smaller (10pt). 24 keeps the tightened "spreadsheet density" read while
+ * giving the 13px font ~5px of leading, and stays an INTEGER CSS px (the blit math in `gridBlitA1.ts`
+ * fails closed on a fractional frozen-band height). **Must stay <= 31**: `MAX_ROWS*ROW_HEIGHT` must
+ * remain under the ~33.5M-px Chromium/Electron max element height (at 24 → 25.2M px, 75% of the cap). */
+export const ROW_HEIGHT = 24;
 
-/** Pixel height of the sticky column-letter band (A,B,C,…). */
-export const HEADER_HEIGHT = 28;
+/** Pixel height of the sticky column-letter band (A,B,C,…). **Sheets-parity (2026-06-10): 24px** (was
+ * 28) -- proportional to the tightened ROW_HEIGHT (Sheets' column band is the same height as its rows),
+ * and ample for the renderer's 11px header font. The row-number gutter needs no analogous constant: its
+ * width derives from the measured widest row number + `GUTTER_PAD` ({@link gutterWidth}), so it stays
+ * proportional by construction. */
+export const HEADER_HEIGHT = 24;
 
 /** Horizontal padding inside the row-number gutter (each side of the number). */
 export const GUTTER_PAD = 8;

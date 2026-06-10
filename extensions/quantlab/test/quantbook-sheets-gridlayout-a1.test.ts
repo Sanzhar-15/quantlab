@@ -166,12 +166,15 @@ suite('FE-2-0 gridLayoutA1 -- extent totals (full Excel extent)', function () {
 
 suite('FE-2-0 gridLayoutA1 -- computeVisibleColRange', function () {
 	test('from the left edge with overscan', () => {
-		// viewport 320px wide / 64px cols = 5 visible; +2 overscan each side; firstVisible 0.
-		assert.deepStrictEqual(computeVisibleColRange(0, 320, MAX_COLS, COL_WIDTH, 2), { startIdx: 0, endIdx: 7 });
+		// Sheets-parity geometry (2026-06-10, COL_WIDTH 64 -> 100): viewport 320px / 100px cols =
+		// ceil(320/100) = 4 visible; +2 overscan; firstVisible 0 -> [0, 0+4+2).
+		assert.deepStrictEqual(computeVisibleColRange(0, 320, MAX_COLS, COL_WIDTH, 2), { startIdx: 0, endIdx: 6 });
 	});
 	test('scrolled right', () => {
-		// scrollLeft 640 / 64 = firstVisible 10; start 10-2=8; end 10+5+2=17.
-		assert.deepStrictEqual(computeVisibleColRange(640, 320, MAX_COLS, COL_WIDTH, 2), { startIdx: 8, endIdx: 17 });
+		// scrollLeft 10*COL_WIDTH -> firstVisible 10; start 10-2=8; end 10+4+2=16 (4 visible at 320/100).
+		// Expressed in COL_WIDTH multiples (not a px literal) so the scroll stays "exactly 10 columns"
+		// under any future geometry change; the expected window still pins the absolute math.
+		assert.deepStrictEqual(computeVisibleColRange(10 * COL_WIDTH, 320, MAX_COLS, COL_WIDTH, 2), { startIdx: 8, endIdx: 16 });
 	});
 	test('clamps a stale large scrollLeft to the last column (no empty window)', () => {
 		const r = computeVisibleColRange(1e9, 320, MAX_COLS, COL_WIDTH, 2);
@@ -227,10 +230,12 @@ suite('FE-2-0 gridLayoutA1 -- hitTestViewport (TWO-AXIS sticky bands)', function
 		assert.strictEqual(hitTestViewport(G - 1, HEADER_HEIGHT - 1, 5000, 9000, G), null);
 	});
 	test('a body click maps correctly after BOTH-axis scroll', () => {
-		// scrollLeft 640 (=10 cols), scrollTop 250 (=10 rows). Local point at the band/gutter origin
-		// + one cell in -> content (gutter+640+1, header+250+1) -> col 10, row 10.
+		// Scrolled exactly 10 columns + 10 rows (expressed in the geometry constants, not px literals --
+		// Sheets-parity 2026-06-10 changed COL_WIDTH/ROW_HEIGHT and the old 640/250 were 64/25-derived).
+		// Local point at the band/gutter origin + one px in -> content (gutter+10cols+1, header+10rows+1)
+		// -> col 10, row 10.
 		assert.deepStrictEqual(
-			hitTestViewport(G + 1, HEADER_HEIGHT + 1, 640, 250, G),
+			hitTestViewport(G + 1, HEADER_HEIGHT + 1, 10 * COL_WIDTH, 10 * ROW_HEIGHT, G),
 			{ row: 10, col: 10 },
 		);
 	});
@@ -302,8 +307,8 @@ suite('FE-2-0 Phase 1 -- scrollToReveal (one-axis reveal + tiny-viewport clamp)'
 		assert.strictEqual(500 - s + COL_WIDTH, 400); // cell end now exactly at the viewport edge
 	});
 	test('tiny viewport (body narrower than a cell): left-align, never park the cell under the band', () => {
-		// client 80 - band 50 = 30 visible body < COL_WIDTH 64. The old far-edge branch would push the
-		// cell start to localX = client - COL_WIDTH = 16 < band 50 -> UNDER the gutter. The clamp left-aligns.
+		// client 80 - band 50 = 30 visible body < COL_WIDTH (100). The old far-edge branch would push the
+		// cell start to localX = client - COL_WIDTH < band 50 -> UNDER the gutter. The clamp left-aligns.
 		const s = scrollToReveal(300, COL_WIDTH, BAND, 290, 80);
 		assert.strictEqual(s, 300 - BAND);
 		assert.strictEqual(300 - s, BAND); // cell start at the band edge, not under it
@@ -505,8 +510,8 @@ suite('W3 frozen panes -- hitTestViewportFrozen', function () {
 		const bodyX = GUTTER + COL_WIDTH + 3;
 		const bodyY = HEADER_HEIGHT + 2 * ROW_HEIGHT + 3;
 		const hit = hitTestViewportFrozen(bodyX, bodyY, 5 * COL_WIDTH, 10 * ROW_HEIGHT, GUTTER, 2, 1);
-		// row = fRows(2) + floor((bodyLocalY + scrollTop)/ROW_HEIGHT) = 2 + floor((3 + 250)/25) = 2 + 10 = 12.
-		// col = fCols(1) + floor((bodyLocalX + scrollLeft)/COL_WIDTH) = 1 + floor((3 + 320)/64) = 1 + 5 = 6.
+		// row = fRows(2) + floor((bodyLocalY + scrollTop)/ROW_HEIGHT) = 2 + floor((3 + 10*RH)/RH) = 2 + 10 = 12.
+		// col = fCols(1) + floor((bodyLocalX + scrollLeft)/COL_WIDTH) = 1 + floor((3 + 5*CW)/CW) = 1 + 5 = 6.
 		assert.deepStrictEqual(hit, { row: 12, col: 6 });
 	});
 	test('the top-frozen strip over a scrolled column: row pinned, col scrolled (four-pane independence)', function () {

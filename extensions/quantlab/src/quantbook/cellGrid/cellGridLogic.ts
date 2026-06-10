@@ -1935,8 +1935,16 @@ export function getSharedDeltaCache(session: SessionInstance): DeltaSnapshotCach
 /**
  * The toolbar commands that map 1:1 to an ARGUMENT-LESS host command (freeze
  * panes act on the focused panel; Save As / Open resolve their own target).
+ * `showDepGraph`/`showLivePython` (menu breadth, 2026-06-10) reveal the wave-3
+ * sidebars from the webview's Data menu -- see the id-map note below.
  */
-export type ToolbarSimpleCommand = 'freezePanes' | 'unfreezePanes' | 'saveAs' | 'openWorkbook';
+export type ToolbarSimpleCommand =
+	| 'freezePanes'
+	| 'unfreezePanes'
+	| 'saveAs'
+	| 'openWorkbook'
+	| 'showDepGraph'
+	| 'showLivePython';
 
 /**
  * The number-format presets the toolbar may apply: every {@link FormatPreset}
@@ -1970,6 +1978,17 @@ const TOOLBAR_SIMPLE_COMMAND_IDS: Record<ToolbarSimpleCommand, string> = {
 	unfreezePanes: 'quantlab.quantbookUnfreezePanes',
 	saveAs: 'quantlab.quantbookSaveAs',
 	openWorkbook: 'quantlab.quantbookOpen',
+	// Menu breadth (2026-06-10): the webview Data menu's sidebar-reveal entries. The wave-3
+	// Dependencies + Live Python features are contributed as VIEWS (package.json contributes.views,
+	// `quantlab.depGraphView` / `quantlab.livePythonView`, gated `quantbook.hasOpenGrid`), NOT as
+	// commands -- so the ids here are the `<viewId>.focus` commands VS Code itself auto-registers for
+	// every contributed view (the standard programmatic reveal; there is no quantlab.quantbook*
+	// command for either). The views' `when` gate is true whenever this bridge can receive a message
+	// (a grid panel exists -- quantbookShell drives the key off CellGridPanel.hasAnyPanel()); if the
+	// command nonetheless fails, the panel's execute() rejection handler surfaces it as a LOUD toast
+	// (No-Fallbacks), never a silent dead menu item.
+	showDepGraph: 'quantlab.depGraphView.focus',
+	showLivePython: 'quantlab.livePythonView.focus',
 };
 
 /**

@@ -34,11 +34,33 @@ body {
 	 * a scrollbar's width and clip the bottom tab strip. */
 	height: 100%;
 	box-sizing: border-box;
-	/* Sheets/Excel accent (active tab underline, fx, etc.) -- matches the canvas grid's selection blue. */
-	--qb-accent: var(--vscode-charts-blue, #1a73e8);
+	/* ============================================================================
+	 * BRAND ACCENT (2026-06-10, operator: 'where Excel/Sheets show their brand
+	 * colours we show ours'). Quantlab's accent tokens, MIRRORING the canonical
+	 * definitions in extensions/quantlab/media/tokens.css (same variable names,
+	 * same theme-override seam `--vscode-quantlab*`, same fallback hexes) -- the
+	 * file itself is not importable here (the sheets webview loads only this
+	 * stylesheet), so the pattern is replicated verbatim and MUST be kept in sync
+	 * with tokens.css if the brand ever changes. `--ql-accent-muted` is the 15%-
+	 * alpha wash used for hover/selection tints: color-mix against `transparent`
+	 * keeps it readable over BOTH light and dark editor backgrounds (no baked-in
+	 * luminance assumption).
+	 * `--qb-accent` (the pre-existing chrome accent consumed by the tab strip
+	 * below) now POINTS AT the brand accent -- this single line retires the old
+	 * Google-blue #1a73e8 chrome accent everywhere it was consumed. (The canvas-
+	 * painted selection accent lives in canvasGrid.ts -- the concurrent renderer
+	 * agent owns that side.)
+	 * ========================================================================== */
+	--ql-accent: var(--vscode-quantlabAccent, #FF7331);
+	--ql-accent-hover: var(--vscode-quantlabAccentHover, #E5672C);
+	--ql-accent-active: var(--vscode-quantlabAccentActive, #CC5C22);
+	--ql-accent-muted: color-mix(in srgb, var(--ql-accent) 15%, transparent);
+	--qb-accent: var(--ql-accent);
 }
 
-/* UI-parity: the "fx" function marker in the formula bar (Excel/Sheets cue, left of the input). */
+/* UI-parity: the "fx" function marker in the formula bar (Excel/Sheets cue, left of the input).
+ * Brand (2026-06-10): the glyph carries the Quantlab accent -- it is exactly where Sheets shows a
+ * branded marker, and a single small glyph stays tasteful (an accent, not a repaint). */
 .cell-grid-fx {
 	flex: 0 0 auto;
 	display: inline-flex;
@@ -47,7 +69,7 @@ body {
 	font-style: italic;
 	font-family: Georgia, "Times New Roman", serif;
 	font-size: 13px;
-	color: var(--vscode-descriptionForeground);
+	color: var(--ql-accent);
 }
 
 /* Dev chrome hidden for the spreadsheet look: the editor TAB already names the sheet, and the
@@ -61,7 +83,7 @@ body {
  * Demo-prep (2026-06-10): the Google-Sheets-style MENU BAR (the very top row,
  * above the toolbar) + the shared anchored dropdown it and the toolbar
  * insert/delete buttons open. Same surface/border/hover vocabulary as the
- * toolbar + tab strip (VS Code theme variables, --qb-accent blue) so the whole
+ * toolbar + tab strip (VS Code theme variables, the --ql-accent brand) so the whole
  * chrome reads as one product. The bar is a fixed-height flex row (flex: 0 0
  * auto), so the viewport's `flex: 1 1 0%` math below is untouched -- the grid
  * still takes exactly the free space and the tab strip stays pinned at the
@@ -94,9 +116,12 @@ body {
 	cursor: pointer;
 }
 
+/* Brand (2026-06-10): the hover/open pill is the muted (15%-alpha) accent wash -- the menubar is a
+ * place Sheets/Excel tint with THEIR brand, so we tint with ours. The text keeps the theme
+ * foreground (the wash is translucent), so it stays readable on light AND dark themes. */
 .qb-menu-btn:hover,
 .qb-menu-btn.is-open {
-	background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+	background: var(--ql-accent-muted);
 }
 
 /* The shared dropdown panel: a fixed-position floating menu under its anchor (menu-bar title or
@@ -134,10 +159,13 @@ body {
 	text-overflow: ellipsis;
 }
 
+/* Brand (2026-06-10): dropdown item hover/keyboard highlight is the muted accent wash (replacing
+ * the VS Code menu-selection colors) -- Sheets' menus tint rows with its brand on hover; the
+ * inherited foreground stays, so a translucent wash is theme-safe in both light and dark. */
 .qb-menu-item:hover,
 .qb-menu-item.is-active {
-	color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground));
-	background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
+	color: inherit;
+	background: var(--ql-accent-muted);
 }
 
 .qb-menu-sep {
@@ -178,18 +206,27 @@ body {
 	cursor: pointer;
 }
 
+/* Material Symbols glyphs (icons.ts) are normalized to 18x18 with fill=currentColor -- size them
+ * here too (CSS wins over the width/height attributes), at Sheets' icon-to-button ratio (18px glyph
+ * in a 28px button). The old hand-drawn icons were 16px; 18px is the Material 20px-optical-size
+ * artwork at toolbar density. */
 .cgt-btn svg {
 	display: block;
-	width: 16px;
-	height: 16px;
+	width: 18px;
+	height: 18px;
 }
 
 .cgt-btn:hover {
 	background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
 }
 
-.cgt-btn:active {
-	background: var(--vscode-toolbar-activeBackground, var(--vscode-list-activeSelectionBackground, var(--vscode-list-hoverBackground)));
+/* Brand (2026-06-10): the PRESSED/active state is the muted accent wash, and an OPEN dropdown
+ * anchor (`.is-open`, toggled by openMenuDropdown in index.ts) keeps it while its panel shows --
+ * the Sheets pattern of marking the engaged control with the product accent. Translucent wash =
+ * readable on light and dark themes. */
+.cgt-btn:active,
+.cgt-btn.is-open {
+	background: var(--ql-accent-muted);
 }
 
 .cgt-sep {
@@ -200,36 +237,45 @@ body {
 	background: var(--vscode-panel-border);
 }
 
-/* Number-format dropdown (the iconic Sheets "123" control). A COMMAND PICKER (2026-06-10): it always
- * rests on a hidden+disabled '123' placeholder option and is reset to it after every pick (index.ts),
- * so 'change' fires even when the user re-picks the same preset. The closed control therefore always
- * shows '123'; no extra placeholder styling is needed (a hidden <option> needs no rule -- `hidden`
- * keeps it out of the native popup, and the closed select renders its label with the rules below). */
-.cgt-select {
-	flex: 0 0 auto;
-	height: 26px;
-	min-width: 96px;
-	margin: 0 2px;
+/* A TEXT toolbar control ('100%' zoom, the '123' number-format menu, font family/size): same quiet
+ * button vocabulary as the icon buttons, sized by its label instead of the 28px square. */
+.cgt-text {
+	width: auto;
 	padding: 0 6px;
 	font-family: var(--vscode-font-family);
 	font-size: 12px;
-	color: var(--vscode-foreground);
-	background: var(--vscode-dropdown-background, var(--vscode-editor-background));
-	border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
-	border-radius: 4px;
-	cursor: pointer;
 }
 
-/* Pushes the trailing controls (zoom) to the far right, like Sheets. */
-.cgt-spacer {
-	flex: 1 1 auto;
+/* The dropdown-anchor chevron (Material arrow_drop_down) sitting after a button's icon/label.
+ * Smaller than the main glyph and pulled in tight so the pair reads as ONE control, like Sheets'
+ * combined button+arrow anchors. The higher-specificity svg rule overrides the 18px base above. */
+.cgt-dd {
+	display: inline-flex;
+	align-items: center;
+	margin-left: 1px;
+	margin-right: -3px;
+}
+
+.cgt-btn .cgt-dd svg {
+	width: 14px;
+	height: 14px;
+}
+
+/* Font-family: Sheets shows the resting face name; cap the width so the toolbar density holds. */
+.cgt-font {
+	min-width: 96px;
+	max-width: 132px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.cgt-fontsize {
+	min-width: 30px;
 }
 
 .cgt-zoom {
-	width: auto;
 	min-width: 46px;
-	padding: 0 8px;
-	font-size: 12px;
 }
 
 /* FE-2-0 Phase 1: visible error banner for a malformed inbound snapshot or a rejected over-length
@@ -318,9 +364,16 @@ body {
 	padding: 2px 7px;
 }
 
+/* Brand (2026-06-10): an ACTIVE formula edit is marked with the Quantlab accent (Sheets outlines
+ * its formula bar with Google blue while editing) -- the input border and, via :focus-within on the
+ * bar, the name box's border tint together, so the whole bar reads engaged. */
 .cell-grid-formula-input:focus {
 	outline: none;
-	border-color: var(--vscode-focusBorder);
+	border-color: var(--ql-accent);
+}
+
+.cell-grid-formula-bar:focus-within .cell-grid-name-box {
+	border-color: var(--ql-accent);
 }
 
 /* W2 formula intelligence: the function-completion dropdown. Absolutely positioned under the formula input
@@ -503,6 +556,8 @@ body {
 	outline-offset: -1px;
 }
 
+/* Brand (2026-06-10): the circular '+' (new sheet) is a primary affordance Sheets renders in its
+ * brand color -- ours carries the Quantlab accent, with the muted wash on hover. */
 .cell-grid-tab-add {
 	flex: 0 0 auto;
 	display: inline-flex;
@@ -514,7 +569,7 @@ body {
 	padding: 0;
 	font-size: 16px;
 	line-height: 1;
-	color: var(--vscode-foreground);
+	color: var(--ql-accent);
 	background: transparent;
 	border: none;
 	border-radius: 50%;
@@ -522,7 +577,8 @@ body {
 }
 
 .cell-grid-tab-add:hover {
-	background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+	color: var(--ql-accent-hover);
+	background: var(--ql-accent-muted);
 }
 
 /* The minimal right-click menu (Rename / Delete / Move Left / Move Right). Absolutely positioned at
@@ -552,7 +608,9 @@ body {
 	cursor: pointer;
 }
 
+/* Brand (2026-06-10): same muted-accent hover wash as the shared dropdown (.qb-menu-item) so the
+ * tab strip's right-click menu and the chrome dropdowns read as one product. */
 .cell-grid-tab-menu-item:hover {
-	color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground));
-	background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
+	color: inherit;
+	background: var(--ql-accent-muted);
 }

@@ -29,6 +29,11 @@ suite('toolbar-command parser -- simple (argument-less) commands', () => {
 		['unfreezePanes', 'quantlab.quantbookUnfreezePanes'],
 		['saveAs', 'quantlab.quantbookSaveAs'],
 		['openWorkbook', 'quantlab.quantbookOpen'],
+		// Menu breadth (2026-06-10): the webview Data menu's sidebar reveals. The targets are the
+		// `<viewId>.focus` commands VS Code auto-registers for the contributed wave-3 views (there is
+		// no quantlab.quantbook* command for either sidebar) -- see TOOLBAR_SIMPLE_COMMAND_IDS.
+		['showDepGraph', 'quantlab.depGraphView.focus'],
+		['showLivePython', 'quantlab.livePythonView.focus'],
 	];
 
 	test('each simple command maps to its exact host command id', () => {
@@ -124,6 +129,12 @@ suite('toolbar-command parser -- off-whitelist rejection (the security boundary)
 		assert.strictEqual(parseToolbarCommandMessage(msg('open')), undefined);
 		assert.strictEqual(parseToolbarCommandMessage(msg('quantlab.quantbookSaveAs')), undefined); // raw ids are not commands
 		assert.strictEqual(parseToolbarCommandMessage(msg('workbench.action.terminal.new')), undefined); // arbitrary-command injection
+		// Menu breadth (2026-06-10): the view-reveal additions widen the whitelist by exactly two
+		// member names -- their near-misses and raw `<viewId>.focus` ids must stay rejected.
+		assert.strictEqual(parseToolbarCommandMessage(msg('showdepgraph')), undefined); // exact-case only
+		assert.strictEqual(parseToolbarCommandMessage(msg('showLivepython')), undefined);
+		assert.strictEqual(parseToolbarCommandMessage(msg('quantlab.depGraphView.focus')), undefined); // raw ids are not commands
+		assert.strictEqual(parseToolbarCommandMessage(msg('quantlab.dataView.focus')), undefined); // arbitrary-view injection
 	});
 
 	test('prototype-chain command names never resolve to a commandId (own-property whitelist only)', () => {
@@ -133,11 +144,24 @@ suite('toolbar-command parser -- off-whitelist rejection (the security boundary)
 		assert.strictEqual(parseToolbarCommandMessage(msg('__proto__')), undefined);
 	});
 
-	test('every parsed commandId stays inside the quantlab.quantbook* namespace', () => {
+	test('every parsed commandId stays inside an exact pinned allowlist', () => {
 		// Belt-and-braces over the per-command maps above: the panel passes parser-returned ids straight
-		// to executeCommand, so pin the namespace invariant for ALL accepted commands.
+		// to executeCommand, so pin EVERY id the parser may ever emit. Menu breadth (2026-06-10) widened
+		// the old quantlab.quantbook*-prefix invariant: the two Data-menu sidebar reveals target the
+		// auto-registered `<viewId>.focus` commands of the contributed wave-3 views (still quantlab.-
+		// namespaced, but not quantbook-prefixed) -- so the invariant is now an EXACT id set, which is
+		// strictly tighter than the prefix check it replaces (a rogue quantlab.quantbook* id would have
+		// passed the old assertion; it fails this one).
+		const allowedIds = new Set([
+			'quantlab.quantbookFreezePanes', 'quantlab.quantbookUnfreezePanes',
+			'quantlab.quantbookSaveAs', 'quantlab.quantbookOpen',
+			'quantlab.depGraphView.focus', 'quantlab.livePythonView.focus',
+			'quantlab.quantbookInsertRowAbove', 'quantlab.quantbookInsertRowBelow',
+			'quantlab.quantbookInsertColumnLeft', 'quantlab.quantbookInsertColumnRight',
+			'quantlab.quantbookDeleteRow', 'quantlab.quantbookDeleteColumn',
+		]);
 		const accepted = [
-			'freezePanes', 'unfreezePanes', 'saveAs', 'openWorkbook',
+			'freezePanes', 'unfreezePanes', 'saveAs', 'openWorkbook', 'showDepGraph', 'showLivePython',
 			'insertRowAbove', 'insertRowBelow', 'insertColumnLeft', 'insertColumnRight', 'deleteRow', 'deleteColumn',
 		];
 		for (const command of accepted) {
@@ -145,7 +169,7 @@ suite('toolbar-command parser -- off-whitelist rejection (the security boundary)
 			assert.notStrictEqual(parsed, undefined);
 			assert.notStrictEqual(parsed!.kind, 'setNumberFormat');
 			const commandId = (parsed as { commandId: string }).commandId;
-			assert.ok(commandId.startsWith('quantlab.quantbook'), `${command} -> ${commandId}`);
+			assert.ok(allowedIds.has(commandId), `${command} -> ${commandId}`);
 		}
 	});
 });

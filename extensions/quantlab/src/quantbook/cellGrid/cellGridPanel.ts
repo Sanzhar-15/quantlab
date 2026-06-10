@@ -1094,9 +1094,12 @@ export class CellGridPanel {
 	 * the pure {@link parseToolbarCommandMessage} whitelists FIRST -- nothing off-whitelist reaches
 	 * `executeCommand` (it is rejected LOUD: a console line + a warning toast, never silent, never
 	 * executed). Three execution shapes:
-	 * - `simple` (freeze/unfreeze, Save As, Open): fire the host command with NO argument. The freeze
-	 *   commands act on the FOCUSED panel -- a toolbar click just focused this webview's panel, so they
-	 *   target this grid; Save As / Open resolve their own target panel.
+	 * - `simple` (freeze/unfreeze, Save As, Open, and -- menu breadth 2026-06-10 -- the Data menu's
+	 *   showDepGraph/showLivePython sidebar reveals, which map to the auto-registered
+	 *   `<viewId>.focus` commands; see TOOLBAR_SIMPLE_COMMAND_IDS' rationale): fire the host command
+	 *   with NO argument. The freeze commands act on the FOCUSED panel -- a toolbar click just
+	 *   focused this webview's panel, so they target this grid; Save As / Open resolve their own
+	 *   target panel; the view reveals are panel-independent.
 	 * - `structural` (the six insert/delete commands): fire the W3 context-menu host command with the
 	 *   `{panelToken, selection}` argument it validates via `parseContextMenuArg`, built from THIS panel's
 	 *   webview token + latest reported selection -- so the toolbar routes to this exact panel like the
