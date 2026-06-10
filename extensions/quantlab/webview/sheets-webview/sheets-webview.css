@@ -10,22 +10,104 @@
  * overlay canvas, and the edit input. The FE-0b-1 DOM-table rules are gone.
  */
 
+html,
+body {
+	height: 100%;
+	margin: 0;
+	padding: 0;
+	overflow: hidden;
+}
+
 body {
 	font-family: var(--vscode-font-family);
 	color: var(--vscode-foreground);
 	background: var(--vscode-editor-background);
-	margin: 0;
-	padding: 16px;
 }
 
-h2 {
-	margin-top: 0;
+/* UI-parity (2026-06-10): the webview is a full-height flex COLUMN -- toolbar + formula bar (fixed)
+ * on top, the grid viewport filling the middle, the sheet-tab strip pinned flush at the very bottom --
+ * so it reads like Excel / Google Sheets rather than a scrolling document. */
+#sheets-root {
+	display: flex;
+	flex-direction: column;
+	/* 100% of the (100%-height) body -- robust to the webview chrome vs `100vh`, which can overflow by
+	 * a scrollbar's width and clip the bottom tab strip. */
+	height: 100%;
+	box-sizing: border-box;
+	/* Sheets/Excel accent (active tab underline, fx, etc.) -- matches the canvas grid's selection blue. */
+	--qb-accent: var(--vscode-charts-blue, #1a73e8);
 }
 
-.meta {
+/* UI-parity: the "fx" function marker in the formula bar (Excel/Sheets cue, left of the input). */
+.cell-grid-fx {
+	flex: 0 0 auto;
+	display: inline-flex;
+	align-items: center;
+	padding: 0 8px;
+	font-style: italic;
+	font-family: Georgia, "Times New Roman", serif;
+	font-size: 13px;
 	color: var(--vscode-descriptionForeground);
-	font-size: 12px;
-	margin-bottom: 12px;
+}
+
+/* Dev chrome hidden for the spreadsheet look: the editor TAB already names the sheet, and the
+ * snapshot-format debug line is development-only. */
+#sheets-title,
+#sheets-meta {
+	display: none !important;
+}
+
+/* UI-parity (2026-06-10): the Excel / Google-Sheets-style top toolbar -- grouped icon buttons with
+ * thin dividers. Undo/redo are wired; the rest are visual for now (cell-style ops are engine-greenfield). */
+.cell-grid-toolbar {
+	flex: 0 0 auto;
+	display: flex;
+	align-items: center;
+	gap: 1px;
+	padding: 4px 8px;
+	background: var(--vscode-editor-background);
+	border-bottom: 1px solid var(--vscode-panel-border);
+	overflow-x: auto;
+	overflow-y: hidden;
+	white-space: nowrap;
+	user-select: none;
+}
+
+.cgt-btn {
+	flex: 0 0 auto;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 28px;
+	height: 28px;
+	padding: 0;
+	color: var(--vscode-foreground);
+	background: transparent;
+	border: 1px solid transparent;
+	border-radius: 4px;
+	cursor: pointer;
+}
+
+.cgt-btn svg {
+	display: block;
+	width: 16px;
+	height: 16px;
+}
+
+.cgt-btn:hover {
+	background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+}
+
+.cgt-btn:active {
+	background: var(--vscode-toolbar-activeBackground, var(--vscode-list-activeSelectionBackground, var(--vscode-list-hoverBackground)));
+}
+
+.cgt-sep {
+	flex: 0 0 auto;
+	width: 1px;
+	height: 18px;
+	margin: 0 5px;
+	background: var(--vscode-panel-border);
 }
 
 /* FE-2-0 Phase 1: visible error banner for a malformed inbound snapshot or a rejected over-length
@@ -46,10 +128,14 @@ h2 {
  * inputs. The input is read-only in this slice (editing is a later increment) but stays selectable so the
  * user can copy a formula out of it. */
 .cell-grid-formula-bar {
+	/* UI-parity: a fixed-height row between the toolbar and the grid (no longer a document margin). */
+	flex: 0 0 auto;
 	display: flex;
 	align-items: stretch;
 	gap: 6px;
-	margin-bottom: 8px;
+	padding: 4px 8px;
+	margin: 0;
+	border-bottom: 1px solid var(--vscode-panel-border);
 }
 
 .cell-grid-name-box {
@@ -192,11 +278,16 @@ h2 {
 .cell-grid-viewport {
 	position: relative;
 	overflow: auto;
-	max-height: 80vh;
-	/* Don't collapse to the spacer height when there are few/zero entries -- the viewport (and
-	 * therefore the canvas, sized to it) must stay tall enough to show the header + empty message. */
-	min-height: 120px;
-	border: 1px solid var(--vscode-panel-border);
+	/* UI-parity: FILL the remaining height between the formula bar and the tab strip (no 80vh cap),
+	 * so the grid occupies the window like a real spreadsheet. `min-height: 0` lets the flex child
+	 * shrink below its content; the canvas is sized to this box. */
+	/* flex-basis 0% (NOT auto): the canvas spacer is sized to the FULL content height, so an `auto`
+	 * basis balloons the viewport and pushes the tab strip off-screen. With basis 0 + min-height 0 +
+	 * overflow auto, the viewport takes exactly the free space and scrolls internally. */
+	flex: 1 1 0%;
+	min-height: 0;
+	border-top: 1px solid var(--vscode-panel-border);
+	border-bottom: 1px solid var(--vscode-panel-border);
 }
 
 /* Sized in JS to the total content (header + rows) x total column width -- drives the scrollbars.
@@ -240,16 +331,17 @@ h2 {
  * theme variables so the strip harmonizes with the active theme (Dark+/Light+/...).
  * ========================================================================== */
 .cell-grid-tab-bar {
+	/* UI-parity: pinned flush at the very bottom of the window (last flex child, fixed height). */
+	flex: 0 0 auto;
 	display: flex;
 	align-items: center;
 	gap: 2px;
-	margin-top: 6px;
-	padding: 2px 4px;
+	padding: 3px 6px;
 	border-top: 1px solid var(--vscode-panel-border);
 	background: var(--vscode-editorGroupHeader-tabsBackground, var(--vscode-editor-background));
 	overflow-x: auto;
 	overflow-y: hidden;
-	min-height: 26px;
+	min-height: 28px;
 	white-space: nowrap;
 }
 
@@ -276,9 +368,11 @@ h2 {
 }
 
 .cell-grid-tab.is-active {
-	color: var(--vscode-tab-activeForeground, var(--vscode-foreground));
+	color: var(--qb-accent);
 	background: var(--vscode-tab-activeBackground, var(--vscode-editor-background));
-	border-color: var(--vscode-focusBorder, var(--vscode-panel-border));
+	border-color: var(--vscode-panel-border);
+	/* Sheets active-sheet cue: the accent underline at the bottom of the active tab. */
+	border-bottom: 2px solid var(--qb-accent);
 	font-weight: 600;
 }
 

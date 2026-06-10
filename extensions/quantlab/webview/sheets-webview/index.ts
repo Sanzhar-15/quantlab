@@ -155,6 +155,32 @@ root.innerHTML =
 	'<h2 id="sheets-title">Quantbook Cell Grid</h2>' +
 	'<div class="meta" id="sheets-meta"></div>' +
 	'<div class="sheets-error" id="sheets-error" role="alert" hidden></div>' +
+	// UI-parity (2026-06-10): an Excel/Sheets-style top toolbar. Undo/redo are wired (native webview
+	// messages); the rest are visual for the demo (styling exists; cell-style ops are engine-greenfield,
+	// FE-4/FE-5). Buttons carry a `data-cmd` the delegated handler reads.
+	'<div id="sheets-toolbar" class="cell-grid-toolbar" role="toolbar" aria-label="Spreadsheet toolbar">' +
+	'<button type="button" class="cgt-btn" data-cmd="undo" title="Undo"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 6.5H8.5C10.71 6.5 12.5 8.29 12.5 10.5C12.5 12.71 10.71 14.5 8.5 14.5H5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 3.5L2.5 6.5L5 9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="redo" title="Redo"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13.5 6.5H7.5C5.29 6.5 3.5 8.29 3.5 10.5C3.5 12.71 5.29 14.5 7.5 14.5H11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M11 3.5L13.5 6.5L11 9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
+	'<span class="cgt-sep"></span>' +
+	'<button type="button" class="cgt-btn" data-cmd="fmt-currency" title="Currency format"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2V14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M10.5 4.5C10.5 4.5 9.8 3.5 8 3.5C6.2 3.5 5 4.5 5 5.75C5 7 6 7.5 8 8C10 8.5 11 9.25 11 10.5C11 11.75 9.8 12.5 8 12.5C6.2 12.5 5.5 11.5 5.5 11.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="fmt-percent" title="Percent format"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="4.5" cy="5" r="1.8" stroke="currentColor" stroke-width="1.3"/><circle cx="11.5" cy="11" r="1.8" stroke="currentColor" stroke-width="1.3"/><line x1="13" y1="3" x2="3" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="fmt-decimal" title="Decimal places"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M5 8L2 8M2 8L4 6M2 8L4 10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><circle cx="7.5" cy="11.5" r="0.8" fill="currentColor"/><rect x="9.5" y="5.5" width="3" height="5" rx="1.5" stroke="currentColor" stroke-width="1.2"/></svg></button>' +
+	'<span class="cgt-sep"></span>' +
+	'<button type="button" class="cgt-btn" data-cmd="bold" title="Bold"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4.5 3H9C10.38 3 11.5 4.12 11.5 5.5C11.5 6.88 10.38 8 9 8H4.5V3Z" fill="currentColor"/><path d="M4.5 8H9.5C11.16 8 12.5 9.12 12.5 10.5C12.5 11.88 11.16 13 9.5 13H4.5V8Z" fill="currentColor"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="italic" title="Italic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><line x1="6" y1="3" x2="10" y2="3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="6" y1="13" x2="10" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="9.5" y1="3" x2="6.5" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="underline" title="Underline"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4.5 3V8.5C4.5 10.71 6.07 12.5 8 12.5C9.93 12.5 11.5 10.71 11.5 8.5V3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="3" y1="14.5" x2="13" y2="14.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>' +
+	'<span class="cgt-sep"></span>' +
+	'<button type="button" class="cgt-btn" data-cmd="textcolor" title="Text color"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 13L8 3L12 13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><line x1="5.5" y1="10" x2="10.5" y2="10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><rect x="3" y="14" width="10" height="1.5" rx="0.75" fill="#ea4335"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="fill" title="Fill color"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 11.5L7 4L10 7L4.5 12.5C3.67 13.33 2.33 13.33 1.5 12.5C1.09 12.09 1.09 11.41 1.5 11L2.5 11.5Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><line x1="5.5" y1="5.5" x2="9" y2="9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><path d="M10 7L12 5L11 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 10.5C14 12 13 13 12.5 13C12 13 11 12 11 10.5C11 9.5 12.5 7.5 12.5 7.5C12.5 7.5 14 9.5 14 10.5Z" fill="currentColor"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="borders" title="Borders"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="0.5" stroke="currentColor" stroke-width="1.3"/><line x1="8" y1="2" x2="8" y2="14" stroke="currentColor" stroke-width="1.3"/><line x1="2" y1="8" x2="14" y2="8" stroke="currentColor" stroke-width="1.3"/></svg></button>' +
+	'<span class="cgt-sep"></span>' +
+	'<button type="button" class="cgt-btn" data-cmd="freeze" title="Freeze panes"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="0.5" stroke="currentColor" stroke-width="1.1"/><line x1="8" y1="6" x2="14" y2="6" stroke="currentColor" stroke-width="0.9" stroke-dasharray="1.5 1.5"/><line x1="5" y1="6" x2="5" y2="14" stroke="currentColor" stroke-width="0.9" stroke-dasharray="1.5 1.5"/><line x1="2" y1="6" x2="14" y2="6" stroke="currentColor" stroke-width="2"/><line x1="5" y1="2" x2="5" y2="14" stroke="currentColor" stroke-width="2"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="insert" title="Insert row/column"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="10" height="8" rx="0.75" stroke="currentColor" stroke-width="1.2"/><line x1="1.5" y1="5.5" x2="11.5" y2="5.5" stroke="currentColor" stroke-width="1.2"/><line x1="6.5" y1="2.5" x2="6.5" y2="10.5" stroke="currentColor" stroke-width="1.2"/><circle cx="12.5" cy="11.5" r="3" fill="#188038"/><line x1="12.5" y1="9.5" x2="12.5" y2="13.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/><line x1="10.5" y1="11.5" x2="14.5" y2="11.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="delete" title="Delete row/column"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="10" height="8" rx="0.75" stroke="currentColor" stroke-width="1.2"/><line x1="1.5" y1="5.5" x2="11.5" y2="5.5" stroke="currentColor" stroke-width="1.2"/><line x1="6.5" y1="2.5" x2="6.5" y2="10.5" stroke="currentColor" stroke-width="1.2"/><circle cx="12.5" cy="11.5" r="3" fill="#ea4335"/><line x1="10.5" y1="11.5" x2="14.5" y2="11.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/></svg></button>' +
+	'<span class="cgt-sep"></span>' +
+	'<button type="button" class="cgt-btn" data-cmd="sort" title="Sort A-Z"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><line x1="2" y1="4" x2="9" y2="4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="2" y1="7.5" x2="7.5" y2="7.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="2" y1="11" x2="6" y2="11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><line x1="12" y1="3" x2="12" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M9.5 10.5L12 13L14.5 10.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
+	'<button type="button" class="cgt-btn" data-cmd="find" title="Find"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="4" stroke="currentColor" stroke-width="1.3"/><line x1="10" y1="10" x2="13.5" y2="13.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>' +
+	'</div>' +
 	// W-G formula bar: a name box (the active cell's A1 ref) + a field showing that cell's UNDERLYING
 	// content (a formula with its leading '=', or the raw literal) -- so selecting a computed cell reveals
 	// its formula. W-G-1b: the field is EDITABLE -- focusing it enters an edit (the `readonly` attr is the
@@ -165,6 +191,8 @@ root.innerHTML =
 	// W-G bound-cell name display: an always-visible chip naming the reactive variable that drives the
 	// active cell (shown only when the active cell is a published target; `hidden` otherwise).
 	'<span class="cell-grid-published-chip" id="sheets-published-chip" hidden></span>' +
+	// UI-parity: the Excel/Sheets "fx" function marker just left of the formula input.
+	'<span class="cell-grid-fx" aria-hidden="true">fx</span>' +
 	'<input id="sheets-formula-input" class="cell-grid-formula-input" type="text" readonly ' +
 	'aria-label="Formula bar (selected cell contents)" spellcheck="false" autocomplete="off" ' +
 	'autocorrect="off" autocapitalize="off" aria-autocomplete="list" aria-expanded="false" ' +
@@ -198,6 +226,22 @@ const formulaInputEl = document.getElementById('sheets-formula-input') as HTMLIn
 const viewportEl = document.getElementById('sheets-viewport') as HTMLElement;
 // Sheet-tabs (2026-06-10): the bottom tab strip container (painted by `applySheetTabs` on each render).
 const tabBarEl = document.getElementById('sheets-tab-bar') as HTMLElement;
+// UI-parity (2026-06-10): the top toolbar. Undo/redo post the existing native messages; the other
+// buttons are visual for the demo (cell-style ops are engine-greenfield -- FE-4/FE-5). Delegated click.
+const toolbarEl = document.getElementById('sheets-toolbar') as HTMLElement;
+toolbarEl.addEventListener('click', (e) => {
+	const btn = (e.target as HTMLElement).closest('.cgt-btn') as HTMLElement | null;
+	if (btn === null) {
+		return;
+	}
+	const cmd = btn.getAttribute('data-cmd');
+	if (cmd === 'undo') {
+		vscode.postMessage({ type: 'undo' });
+	} else if (cmd === 'redo') {
+		vscode.postMessage({ type: 'redo' });
+	}
+	// Remaining buttons are visual-only for now (engine-greenfield style ops land in FE-4/FE-5).
+});
 const spacerEl = document.getElementById('sheets-spacer') as HTMLElement;
 const canvasEl = document.getElementById('sheets-canvas') as HTMLCanvasElement;
 const inputEl = document.getElementById('sheets-edit-input') as HTMLInputElement;

@@ -72,6 +72,31 @@ const DEBUG_BLIT_VERIFY = false;
  * 1px into an adjacent row is idempotent (that row repaints to its identical current value). */
 const DAMAGE_CLIP_PAD = 1;
 
+/**
+ * **Sheets retheme (2026-06-10)** -- the accent that drives the clean Google-Sheets look: active
+ * row/col header highlight, the selection box border + handle, and the multi-cell range outline. Sheets
+ * uses its signature blue `#1a73e8`; we use it as a tasteful CONSTANT (not a theme var) so the grid reads
+ * like a spreadsheet on every VS Code theme rather than picking up a brown/orange editor accent. The theme
+ * read in {@link CanvasGridRenderer.readPalette} prefers `--vscode-charts-blue` when present (so a theme
+ * with a coherent blue still wins) and falls back to this. The header text on an active row/col goes this
+ * color + bold (the Sheets "current column letter" treatment). To prefer the Sheets GREEN look instead,
+ * swap this constant (+ the two translucent washes below) to `#188038` / its rgba -- a one-line retheme. */
+const SHEETS_ACCENT_BLUE = '#1a73e8';
+/** Translucent accent for the active row/col header band -- a faint blue wash (Sheets tints the active
+ * header a pale accent, not a heavy fill). Low alpha so the header letter stays legible on top. */
+const SHEETS_ACCENT_HEADER_FILL = 'rgba(26,115,232,0.16)';
+/** Translucent accent for the multi-cell selection RANGE fill -- a faint blue, Sheets' selection wash.
+ * Must stay translucent so cell contents read through. */
+const SHEETS_ACCENT_RANGE_FILL = 'rgba(26,115,232,0.10)';
+/** Very light gridline (`~#e0e0e0` on white) -- the Sheets gridline on a light theme. On a dark theme the
+ * palette derives a faint low-contrast line from `--vscode-panel-border` instead (see readPalette). */
+const SHEETS_GRIDLINE_LIGHT = 'rgba(0,0,0,0.10)';
+
+/** Half the hit-test band (CSS px) around a header separator within which the cursor turns to
+ * `col-resize` / `row-resize`. ~4px each side sells the resizable-column illusion even though resize is
+ * not yet functional. */
+const RESIZE_HOVER_PX = 4;
+
 /** The active (selected) cell. */
 export interface ActiveCell {
 	readonly row: number;
@@ -167,6 +192,14 @@ interface Palette {
 	// W-G bound-cell indicator: the (opaque) accent for the top-right corner badge on a reactively
 	// published cell. A distinct hue from selectionBorder so a selected published cell shows both.
 	publishedBadge: string;
+	// Sheets retheme: the muted color for INACTIVE header letters / row numbers (Sheets greys the
+	// non-active headers; the active one goes `accent`+bold). Derived from `--vscode-descriptionForeground`.
+	headerText: string;
+	// Sheets retheme: the opaque accent for the ACTIVE row/col header text (the current column letter /
+	// row number goes accent + bold, Sheets-style). Same hue as `selectionBorder`.
+	accent: string;
+	// Sheets retheme: the muted fill for the small select-all corner triangle (top-left corner box).
+	cornerTriangle: string;
 }
 
 /** Renders a {@link QuantbookCellSnapshot} as an A1 grid onto a canvas. One instance per panel. */
@@ -180,6 +213,8 @@ export class CanvasGridRenderer {
 	private palette: Palette;
 	private bodyFont: string;
 	private headerFont: string;
+	/** **Sheets retheme** -- bold header font for the ACTIVE row/col label (drawn in `accent`). */
+	private headerActiveFont: string;
 	/**
 	 * Width of the sticky row-number gutter, in CSS px. Computed ONCE (and on theme/font change) to fit
 	 * the widest POSSIBLE row number (`MAX_ROWS`), so it never shifts as you scroll -- the overlay
@@ -197,6 +232,15 @@ export class CanvasGridRenderer {
 	 */
 	private frozenRowCount = 0;
 	private frozenColCount = 0;
+	/**
+	 * **Sheets retheme (2026-06-10)** -- the scroll offset the LAST frame painted at, recorded by
+	 * {@link paintWindow}. The cursor hit-test ({@link installCursorHitTest}) reads it to place the column /
+	 * row header separators under the pointer at the same offset the visible frame shows (the renderer is
+	 * not otherwise told the scroll; it threads it per-draw). Purely for the cursor affordance -- never used
+	 * by the paint geometry, which always receives the live scroll as a parameter.
+	 */
+	private lastScrollTop = 0;
+	private lastScrollLeft = 0;
 	private readonly measureCache = new Map<string, number>();
 	/**
 	 * **FE-0b-4** -- true once a full {@link draw} has painted the current backing store. Reset to
@@ -218,7 +262,9 @@ export class CanvasGridRenderer {
 		const fonts = this.readFonts();
 		this.bodyFont = fonts.body;
 		this.headerFont = fonts.header;
+		this.headerActiveFont = fonts.headerActive;
 		this.gutterW = this.computeGutterWidth();
+		this.installCursorHitTest();
 	}
 
 	/** Gutter width sized to the widest possible row label, at the current header font. Audit LOW-6:
@@ -319,6 +365,7 @@ export class CanvasGridRenderer {
 		const fonts = this.readFonts();
 		this.bodyFont = fonts.body;
 		this.headerFont = fonts.header;
+		this.headerActiveFont = fonts.headerActive;
 		this.measureCache.clear();
 		this.gutterW = this.computeGutterWidth();
 	}
@@ -560,6 +607,10 @@ export class CanvasGridRenderer {
 		fillPreview: SelectionRect | null,
 	): void {
 		const ctx = this.ctx;
+		// Sheets retheme: remember the scroll this frame painted at, so the cursor hit-test can place the
+		// header separators under the pointer at the matching offset (cursor-only; never read by paint math).
+		this.lastScrollTop = scrollTop;
+		this.lastScrollLeft = scrollLeft;
 		ctx.fillStyle = this.palette.background;
 		ctx.fillRect(0, 0, cssWidth, cssHeight);
 
@@ -888,11 +939,15 @@ export class CanvasGridRenderer {
 				const tinted = selection !== null
 					? r >= selection.minRow && r <= selection.maxRow
 					: active !== null && active.row === r;
+				// Sheets retheme: the FOCUS row (the active cell's own row number) gets the accent + bold;
+				// other tinted rows in a range get the accent (not bold); untinted rows are muted.
+				const isFocusRow = active !== null && active.row === r;
 				if (tinted) {
 					ctx.fillStyle = this.palette.headerActiveBg;
 					ctx.fillRect(0, y, gutterW, ROW_HEIGHT);
 				}
-				ctx.fillStyle = this.palette.foreground;
+				ctx.font = isFocusRow ? this.headerActiveFont : this.headerFont;
+				ctx.fillStyle = tinted ? this.palette.accent : this.palette.headerText;
 				ctx.fillText(String(r + 1), gutterW - CELL_PAD, y + ROW_HEIGHT / 2);
 			}
 			ctx.restore();
@@ -967,15 +1022,23 @@ export class CanvasGridRenderer {
 				const tinted = selection !== null
 					? c >= selection.minCol && c <= selection.maxCol
 					: active !== null && active.col === c;
+				// Sheets retheme: the FOCUS column letter (the active cell's own column) goes accent + bold;
+				// the rest of a range goes accent (normal weight); untinted letters are muted.
+				const isFocusCol = active !== null && active.col === c;
 				if (tinted) {
 					ctx.fillStyle = this.palette.headerActiveBg;
 					ctx.fillRect(x, 0, COL_WIDTH, HEADER_HEIGHT);
+					// Sheets retheme: a 2px accent UNDERLINE beneath the active column letter (the Sheets
+					// "selected column" affordance). Sits at the header's bottom edge, inside the band.
+					ctx.fillStyle = this.palette.accent;
+					ctx.fillRect(x, HEADER_HEIGHT - 2, COL_WIDTH, 2);
 				}
 				ctx.save();
 				ctx.beginPath();
 				ctx.rect(x, 0, COL_WIDTH, HEADER_HEIGHT);
 				ctx.clip();
-				ctx.fillStyle = this.palette.foreground;
+				ctx.font = isFocusCol ? this.headerActiveFont : this.headerFont;
+				ctx.fillStyle = tinted ? this.palette.accent : this.palette.headerText;
 				ctx.fillText(columnLabel(c), x + COL_WIDTH / 2, textY);
 				ctx.restore();
 			}
@@ -1026,6 +1089,106 @@ export class CanvasGridRenderer {
 		ctx.moveTo(0, by);
 		ctx.lineTo(gutterW, by);
 		ctx.stroke();
+		// Sheets retheme: the small "select-all" triangle in the corner box's bottom-right (the Sheets/Excel
+		// affordance). A right triangle hugging the bottom-right inner edge, pointing up-left. Sized to a 9px
+		// leg inset ~7px from the gutter/header seam so it never touches the borders. Adapts the Codex snippet
+		// to the real corner geometry (`gutterW`, `HEADER_HEIGHT`), and is clamped so a narrow gutter can't push
+		// it off the left edge.
+		const tri = 9; // leg length (CSS px)
+		const inset = 7; // gap from the bottom-right seam
+		const xR = gutterW - inset; // triangle's right edge
+		const yB = HEADER_HEIGHT - inset; // triangle's bottom edge
+		const xL = Math.max(2, xR - tri); // left vertex, clamped inside the corner box
+		const yT = Math.max(2, yB - tri); // top vertex, clamped inside the corner box
+		ctx.fillStyle = this.palette.cornerTriangle;
+		ctx.beginPath();
+		ctx.moveTo(xL, yB);
+		ctx.lineTo(xR, yT);
+		ctx.lineTo(xR, yB);
+		ctx.closePath();
+		ctx.fill();
+	}
+
+	/**
+	 * **Sheets retheme (2026-06-10)** -- the single touch that sells the spreadsheet illusion: a live
+	 * `cursor` over the canvas. Attaches ONE `mousemove` listener to the canvas (the renderer owns the
+	 * element) that sets `canvas.style.cursor` from a cheap geometric hit-test of the pointer:
+	 *   - **`cell`** over the grid BODY (below the header, right of the gutter) -- the Sheets/Excel block cursor;
+	 *   - **`col-resize`** within ~{@link RESIZE_HOVER_PX}px of a COLUMN separator inside the column header band;
+	 *   - **`row-resize`** within ~{@link RESIZE_HOVER_PX}px of a ROW separator inside the row-number gutter;
+	 *   - **`default`** elsewhere in the header / gutter / corner box.
+	 *
+	 * The resize cursors are a VISUAL affordance only (column/row resize is not yet functional) -- but the
+	 * hover cursor change alone makes the headers read as resizable, the way Sheets does. Separator positions
+	 * are derived from the SAME pure layout math the paint uses ({@link colX}/{@link rowY}), at the scroll
+	 * offset the last frame painted ({@link lastScrollTop}/{@link lastScrollLeft}), with the frozen bands
+	 * pinned at effective-scroll 0 -- so the cursor lines up with the gridlines the user sees. Sets a baseline
+	 * `cell` cursor immediately so the body shows the block cursor before the first pointer move. This is the
+	 * ONLY cursor the renderer sets; the `#sheets-canvas` CSS rule sets none (confirmed -- nothing to defer).
+	 */
+	private installCursorHitTest(): void {
+		// Baseline: the grid body is the dominant surface; show the Sheets block cursor up front.
+		this.canvas.style.cursor = 'cell';
+		this.canvas.addEventListener('mousemove', ev => {
+			const rect = this.canvas.getBoundingClientRect();
+			const localX = ev.clientX - rect.left;
+			const localY = ev.clientY - rect.top;
+			this.canvas.style.cursor = this.cursorAt(localX, localY);
+		});
+	}
+
+	/**
+	 * **Sheets retheme** -- the cursor string for a VIEWPORT-LOCAL pointer (canvas px). Pure (no DOM read;
+	 * the caller supplies the local point), so it stays unit-reasoned. See {@link installCursorHitTest}.
+	 */
+	private cursorAt(localX: number, localY: number): string {
+		const gutterW = this.gutterW;
+		const inHeaderBand = localY < HEADER_HEIGHT;
+		const inGutter = localX < gutterW;
+		// Corner box (both bands): no resize affordance, plain arrow (the select-all triangle lives here).
+		if (inHeaderBand && inGutter) {
+			return 'default';
+		}
+		const fColsPx = frozenColsWidth(this.frozenColCount);
+		const fRowsPx = frozenRowsHeight(this.frozenRowCount);
+		if (inHeaderBand) {
+			// Column header band: near a COLUMN separator -> col-resize, else a plain arrow over the letters.
+			// Frozen cols are pinned (effScroll 0); body cols scroll by lastScrollLeft.
+			const effScrollLeft = localX < gutterW + fColsPx ? 0 : this.lastScrollLeft;
+			return this.nearColSeparator(localX, gutterW, effScrollLeft) ? 'col-resize' : 'default';
+		}
+		if (inGutter) {
+			// Row-number gutter: near a ROW separator -> row-resize, else a plain arrow over the numbers.
+			const effScrollTop = localY < HEADER_HEIGHT + fRowsPx ? 0 : this.lastScrollTop;
+			return this.nearRowSeparator(localY, effScrollTop) ? 'row-resize' : 'default';
+		}
+		// Grid body (below the header, right of the gutter): the Sheets/Excel block cursor.
+		return 'cell';
+	}
+
+	/** True when `localX` (canvas px, in the column header band) is within {@link RESIZE_HOVER_PX} of a
+	 * column boundary at the given effective scroll. The nearest boundary's screen-x is the nearest
+	 * multiple of `COL_WIDTH` in content space, mapped back through `colX` minus the effective scroll. */
+	private nearColSeparator(localX: number, gutterW: number, effScrollLeft: number): boolean {
+		const contentX = localX + effScrollLeft;
+		const nearestCol = Math.round((contentX - gutterW) / COL_WIDTH);
+		if (nearestCol < 0 || nearestCol > MAX_COLS) {
+			return false;
+		}
+		const sepScreenX = colX(nearestCol, gutterW) - effScrollLeft;
+		return Math.abs(sepScreenX - localX) <= RESIZE_HOVER_PX;
+	}
+
+	/** True when `localY` (canvas px, in the row gutter) is within {@link RESIZE_HOVER_PX} of a row
+	 * boundary at the given effective scroll (mirror of {@link nearColSeparator} for rows). */
+	private nearRowSeparator(localY: number, effScrollTop: number): boolean {
+		const contentY = localY + effScrollTop;
+		const nearestRow = Math.round((contentY - HEADER_HEIGHT) / ROW_HEIGHT);
+		if (nearestRow < 0 || nearestRow > MAX_ROWS) {
+			return false;
+		}
+		const sepScreenY = rowY(nearestRow) - effScrollTop;
+		return Math.abs(sepScreenY - localY) <= RESIZE_HOVER_PX;
 	}
 
 	/** Cached `measureText().width` at the current BODY font (cache cleared on font change). */
@@ -1059,32 +1222,89 @@ export class CanvasGridRenderer {
 			warnMissingThemeVar(name, fallback);
 			return fallback;
 		};
+		const background = v('--vscode-editor-background', '#1e1e1e');
+		const isDark = CanvasGridRenderer.isDarkColor(background);
+		// Sheets retheme: the accent prefers a coherent themed blue when present, else the Sheets-blue
+		// constant -- so the active-header highlight + selection box read GREEN/BLUE, never the old brown.
+		const accent = v('--vscode-charts-blue', SHEETS_ACCENT_BLUE);
 		return {
 			foreground: v('--vscode-foreground', '#cccccc'),
-			background: v('--vscode-editor-background', '#1e1e1e'),
-			headerBg: v('--vscode-keybindingTable-headerBackground', 'rgba(128,128,128,0.2)'),
-			headerActiveBg: v('--vscode-list-activeSelectionBackground', 'rgba(9,71,113,0.5)'),
-			border: v('--vscode-panel-border', 'rgba(128,128,128,0.35)'),
+			background,
+			// Sheets retheme: the header band / row gutter sit on a subtle wash distinct from the cell area
+			// (Sheets greys the headers a touch). A faint foreground-tinted overlay on either theme.
+			headerBg: isDark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)',
+			// Sheets retheme: the ACTIVE row/col header band -- a faint accent wash (was a heavy
+			// list-activeSelection fill that read brown on warm themes).
+			headerActiveBg: SHEETS_ACCENT_HEADER_FILL,
+			// Sheets retheme: a LIGHT, low-contrast gridline. On a light theme the Sheets `~#e0e0e0` look
+			// (a faint black overlay); on a dark theme a faint white overlay so lines stay subtle, not heavy.
+			border: isDark ? 'rgba(255,255,255,0.08)' : SHEETS_GRIDLINE_LIGHT,
 			descriptionFg: v('--vscode-descriptionForeground', '#9d9d9d'),
 			errorFg: v('--vscode-errorForeground', '#f48771'),
 			errorBg: v('--vscode-inputValidation-errorBackground', 'rgba(190,40,40,0.25)'),
-			selectionBorder: v('--vscode-focusBorder', '#007fd4'),
-			// The dimmed editor-selection color: themed AND typically translucent, so the range fill never
-			// hides cell values (translucent rgba fallback if the theme omits it).
-			rangeFill: v('--vscode-editor-inactiveSelectionBackground', 'rgba(9,71,113,0.25)'),
+			// Sheets retheme: the selection box border IS the accent (clean blue, not the editor focusBorder
+			// which can be brown/teal on some themes).
+			selectionBorder: accent,
+			// Sheets retheme: a faint accent wash over a multi-cell range (translucent so values read through).
+			rangeFill: SHEETS_ACCENT_RANGE_FILL,
 			// W-G bound-cell badge: a "live data" green, distinct from the blue focus/selection border so a
 			// selected published cell shows both markers. Themed via the standard chart palette.
 			publishedBadge: v('--vscode-charts-green', '#89d185'),
+			// Sheets retheme: muted header letters / row numbers (the active one overrides to `accent`+bold).
+			headerText: v('--vscode-descriptionForeground', isDark ? '#9d9d9d' : '#5f6368'),
+			accent,
+			// Sheets retheme: the muted select-all corner triangle, the dimmed header text color.
+			cornerTriangle: v('--vscode-descriptionForeground', isDark ? '#8c8c8c' : '#9aa0a6'),
 		};
 	}
 
-	private readFonts(): { body: string; header: string } {
+	/**
+	 * **Sheets retheme** -- perceived-luminance check so the palette can pick a LIGHT gridline on a light
+	 * theme (`~#e0e0e0`) vs a faint WHITE line on a dark theme. Parses `#rgb`/`#rrggbb`/`rgb()`/`rgba()`
+	 * (the only forms VS Code injects for `--vscode-editor-background`); an unparseable value defaults to
+	 * "dark" (the common VS Code default), which keeps the line subtle either way. Pure-ish (string in,
+	 * boolean out; no `this`).
+	 */
+	private static isDarkColor(color: string): boolean {
+		const c = color.trim();
+		let r = 0;
+		let g = 0;
+		let b = 0;
+		const hex = c.startsWith('#') ? c.slice(1) : '';
+		if (hex.length === 3) {
+			r = parseInt(hex[0] + hex[0], 16);
+			g = parseInt(hex[1] + hex[1], 16);
+			b = parseInt(hex[2] + hex[2], 16);
+		} else if (hex.length === 6 || hex.length === 8) {
+			r = parseInt(hex.slice(0, 2), 16);
+			g = parseInt(hex.slice(2, 4), 16);
+			b = parseInt(hex.slice(4, 6), 16);
+		} else {
+			const m = c.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+			if (m === null) {
+				return true; // unparseable -> assume dark (VS Code's default family)
+			}
+			r = Number(m[1]);
+			g = Number(m[2]);
+			b = Number(m[3]);
+		}
+		if (!Number.isFinite(r) || !Number.isFinite(g) || !Number.isFinite(b)) {
+			return true;
+		}
+		// Rec. 601 luma; < 128 reads as a dark background.
+		return 0.299 * r + 0.587 * g + 0.114 * b < 128;
+	}
+
+	private readFonts(): { body: string; header: string; headerActive: string } {
 		const rawFamily = getComputedStyle(document.body).getPropertyValue('--vscode-font-family').trim();
 		let family = rawFamily;
 		if (family.length === 0) {
 			warnMissingThemeVar('--vscode-font-family', 'sans-serif');
 			family = 'sans-serif';
 		}
-		return { body: '12px ' + family, header: '600 12px ' + family };
+		// Sheets retheme: cell text at a comfortable 13px (was 12); the header letters / row numbers slightly
+		// SMALLER (11px) + normal weight so they read muted next to the cells. The ACTIVE row/col header goes
+		// bold (the Sheets "current column" treatment), drawn with `headerActive`.
+		return { body: '13px ' + family, header: '11px ' + family, headerActive: '600 11px ' + family };
 	}
 }
