@@ -46,6 +46,16 @@ export function moveIndex(order: ReadonlyArray<number>, id: number, dir: -1 | 1)
 	return target;
 }
 
+/**
+ * The strip's outbound commands, injected by index.ts. **Contract (Codex r3 fix-verify HIGH,
+ * 2026-06-10): every implementation must resolve any open cell/formula editor BEFORE its post
+ * reaches the host** -- index.ts satisfies this by wrapping the five mutating handlers in
+ * `runAfterResolvingEdit` and routing `switchTo` through `requestSheetSwitch` (the same resolver,
+ * `sheetSwitch` kind). This module stays presentation-only and guard-free BY DESIGN: it is
+ * vscode-free so its pure helpers unit-test without the editor state machine, and wrapping at the
+ * handler-construction seam covers every call site here ('+' click, double-click rename, and the
+ * right-click menu items) in one audited place instead of five.
+ */
 export interface SheetTabHandlers {
 	switchTo(id: number): void;
 	add(): void;

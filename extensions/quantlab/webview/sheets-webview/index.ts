@@ -296,11 +296,17 @@ const menubarEl = document.getElementById('sheets-menubar') as HTMLElement;
 // `runAfterResolvingEdit` (the Codex demo-blocker guard below the commit machinery), which resolves
 // any open editor FIRST and then owns the focus hand-back: the grid viewport when the action ran,
 // the still-open editor when the action queued behind / was blocked by that editor's commit. The
-// number-format <select> is the one mousedown exception: a select must take focus to open natively;
-// its `change` handler routes through the same guard (which restores the viewport focus for it).
-// The formula-suggest dropdown (renderCompletion) uses the same mousedown-preventDefault
-// pattern; the sheet-tab strip's buttons do not, but the tab strip sits below the grid and a tab
-// switch re-renders anyway -- the menu/toolbar chrome must NOT have that excuse.
+// number-format <select> is the one control allowed to TAKE focus (a select must, to open its
+// native picker) -- but only over a RESOLVED editor: its own mousedown gate (Codex r3 fix-verify
+// MED, 2026-06-10 -- {@link resolveEditForNativeSurface}) cancels/commits an open editor first and
+// keeps the picker SHUT over an unresolved commit, so the select's focus-steal can never trigger
+// the blur-path local-reject hole; its `change` handler still routes through the shared guard
+// (which restores the viewport focus for it). The formula-suggest dropdown (renderCompletion) uses
+// the same mousedown-preventDefault pattern; the sheet-tab strip's buttons do not (a tab click may
+// move real focus -- the strip sits below the grid and a switch re-renders anyway), but the strip's
+// MUTATING commands are nonetheless guarded: every handler in `sheetTabHandlers` except `switchTo`
+// wraps its post in `runAfterResolvingEdit` (Codex r3 fix-verify HIGH), and `switchTo` runs the
+// same resolver via `requestSheetSwitch`.
 //
 // KEYBOARD: while a dropdown is open, a capture-phase document keydown owns the keys BEFORE the
 // grid's bubble-phase nav handler (focus is still on the viewport, so without the capture gate an
@@ -367,7 +373,9 @@ const DELETE_ROW_COL_ITEMS: readonly MenuItemSpec[] = [
 // The menu bar's five menus. ONLY functional items -- every entry posts a message the host
 // implements TODAY (no dead entries that would make the demo look broken). 'New sheet' reuses the
 // EXACT message the tab strip's `+` posts (`sheetTabHandlers.add` below: `{type:'sheetCommand',
-// command:'add'}`) so both entry points are indistinguishable to the host.
+// command:'add'}`) so both entry points are indistinguishable to the host -- and both run through
+// `runAfterResolvingEdit` (this one via `activateMenuItem`, the strip's via its handler wrapper),
+// so they share the edit-resolution semantics too.
 const MENUBAR_MENUS: ReadonlyArray<{ readonly id: string; readonly entries: readonly MenuEntrySpec[] }> = [
 	{
 		id: 'file',
@@ -669,8 +677,10 @@ document.addEventListener(
 );
 
 // Toolbar: mousedown preventDefault on the BUTTONS so they never steal focus from the grid. The
-// number-format <select> is excluded -- a select must take focus to open its native picker; its
-// `change` handler restores the viewport focus instead.
+// number-format <select> is excluded from THIS blanket preventDefault -- a select must take focus
+// to open its native picker -- but it is NOT unguarded: its own mousedown gate (registered on the
+// element below) only lets it take focus over a RESOLVED editor, and its `change` handler restores
+// the viewport focus after a pick.
 toolbarEl.addEventListener('mousedown', (e) => {
 	const btn = (e.target as HTMLElement).closest('.cgt-btn');
 	if (btn !== null) {
@@ -742,6 +752,36 @@ toolbarEl.addEventListener('click', (e) => {
 // natively -- see the focus model above). The host re-renders the grid with the new formatting; the
 // webview keeps no optimistic state.
 const numberFormatSelectEl = toolbarEl.querySelector('select.cgt-select') as HTMLSelectElement;
+// **Codex r3 fix-verify MED (2026-06-10) -- the select may only OPEN over a RESOLVED editor.**
+// The select is the one chrome control that takes focus (it must, to open its native picker), so
+// pressing it BLURS an open editor BEFORE the `change` handler's `runAfterResolvingEdit` ever sees
+// it -- and the blur path has a hole the guard cannot close after the fact: a blur-commit that
+// LOCALLY rejects (over-limit) makes `onEditBlur` cancel + discard the editor, so by `change` time
+// `editState` is null and the resolver reads 'ran' -- the format then applies despite the guard's
+// 'blocked' contract (the user was just told their edit was discarded, and chrome acted anyway).
+// Fix at the FOCUS boundary, mirroring the rest of the chrome focus model: on mousedown (the event
+// whose default action focuses the select AND opens the picker in Chromium -- the same seam the
+// toolbar buttons preventDefault), resolve the editor FIRST via the shared native-surface resolver:
+//   - no editor / unchanged / known-bad -> resolved synchronously (cancel, Escape-semantics) -> let
+//     THIS SAME gesture open the picker natively (no preventDefault) -- the pick then lands over a
+//     resolved grid and the placeholder/command-picker behavior below is untouched;
+//   - changed -> commit NOW; pending -> nothing to do but wait. Both: preventDefault, so the select
+//     NEVER takes focus (no blur ever fires -> the local-reject hole is unreachable) and the picker
+//     stays shut over an unresolved commit. The resolver banners the suppression (No-Fallbacks:
+//     never a silently dead control); the user re-clicks once the commit resolves. Deliberately NOT
+//     `resolveEditThen`-with-a-no-op: a queued no-op cannot re-open a native picker, and it would
+//     SUPERSEDE (destroy) a real queued action such as a deferred 'Delete row' (see the resolver's
+//     doc for the full rationale).
+// The `change` guard below STAYS as defense-in-depth (e.g. a keyboard-focused select changing value
+// via arrow keys never passes through this mousedown gate).
+numberFormatSelectEl.addEventListener('mousedown', (ev) => {
+	if (editState === null) {
+		return; // nothing to resolve: the select takes focus + opens natively (the documented exception)
+	}
+	if (!resolveEditForNativeSurface('pick a number format again once it settles.')) {
+		ev.preventDefault(); // keep focus on the editor; the picker must not open over an unresolved commit
+	}
+});
 numberFormatSelectEl.addEventListener('change', () => {
 	const v = numberFormatSelectEl.value;
 	// Reset to the placeholder FIRST (a programmatic value write fires no 'change'), so the select never
@@ -977,7 +1017,12 @@ function armCommitWatchdog(commitId: number): void {
 // ============================================================================
 // Deferred-action slot (2026-06-10, Codex DEMO-BLOCKER) -- ONE coherent "wait for the edit to
 // resolve, then act" story shared by USER sheet switches (the tab strip) and EVERY chrome action
-// (toolbar buttons incl. undo/redo, the number-format select, all dropdown + menubar items).
+// (toolbar buttons incl. undo/redo, the number-format select, all dropdown + menubar items, the
+// tab strip's sheet commands add/rename/delete/move, and the host-posted `contextMenuAction`
+// clipboard replies -- the last two added by the Codex r3 fix-verify round). The two NATIVE
+// surfaces that cannot defer their action (the grid's right-click context menu and the select's
+// native picker -- neither can be re-opened programmatically at a later resolution point) use the
+// sibling RESOLVE-OR-SUPPRESS resolver instead ({@link resolveEditForNativeSurface}).
 //
 // WHY chrome actions need it: all chrome controls preventDefault their mousedown so the grid (or an
 // OPEN cell/formula editor) keeps focus -- which also means clicking chrome NEVER blurs an open
@@ -1112,8 +1157,10 @@ function resolveEditThen(action: DeferredEditResolvedAction): 'ran' | 'queued' |
 
 /**
  * **The chrome-action guard (Codex DEMO-BLOCKER fix, 2026-06-10).** EVERY wired chrome control --
- * all posting toolbar buttons (incl. undo/redo), the number-format select, and every dropdown /
- * menubar item (via `activateMenuItem`, the single dropdown seam) -- posts THROUGH this, never
+ * all posting toolbar buttons (incl. undo/redo), the number-format select, every dropdown /
+ * menubar item (via `activateMenuItem`, the single dropdown seam), the tab strip's sheet commands
+ * (add/rename/delete/moveLeft/moveRight via `sheetTabHandlers`), and the host-posted
+ * `contextMenuAction` clipboard replies (Codex r3 fix-verify) -- posts THROUGH this, never
  * directly, so a host mutation can never race an open editor's stale coordinates. Also owns the
  * focus restoration the chrome focus model requires (see the FOCUS MODEL comment up top):
  *   - 'ran'              -> the action fired with no editor in the way: keyboard back to the grid
@@ -1134,6 +1181,73 @@ function runAfterResolvingEdit(label: string, run: () => void): void {
 	} else if (editState !== null) {
 		editState.editEl.focus();
 	}
+}
+
+/**
+ * **The NATIVE-surface edit resolver (Codex r3 fix-verify, 2026-06-10).** Two chrome surfaces are
+ * NATIVE -- owned by the browser / VS Code, not by this webview -- so their "action" cannot route
+ * through the deferred-action slot:
+ *   - the grid's right-click CONTEXT MENU: VS Code shows it from the `data-vscode-context` payload
+ *     the moment the `contextmenu` event completes (the injected pre/index.html handler), and there
+ *     is no API to re-open it when a queued commit later resolves;
+ *   - the number-format <select>'s native PICKER: no reliable programmatic re-open
+ *     (`showPicker()` requires a live user gesture, which a commit-ack resolution point no longer
+ *     has).
+ * Queueing a NO-OP through `resolveEditThen` instead would be actively harmful: the no-op cannot
+ * re-open the surface (the user must re-gesture anyway), and setting it would SUPERSEDE -- i.e.
+ * destroy, loudly but pointlessly -- a REAL queued action such as a deferred 'Delete row'. So these
+ * surfaces get RESOLVE-OR-SUPPRESS: the same edit-resolution branches as {@link resolveEditThen},
+ * byte-for-byte on the resolution side, but the cannot-run-now outcomes SUPPRESS the surface (the
+ * caller preventDefaults the native default action) instead of queueing:
+ *   - no editor open                  -> `true`: the surface may open; nothing to resolve;
+ *   - open, UNCHANGED or known-bad    -> `cancelEdit()` + repaint (Escape/blur-unchanged semantics)
+ *                                        -> `true`: the surface opens over a RESOLVED grid, in the
+ *                                        SAME user gesture (no re-gesture needed);
+ *   - open, CHANGED, not pending      -> `commitEdit()` NOW (the typed value is saved, never
+ *                                        dropped) -> `false` + a transient banner naming the retry
+ *                                        gesture: the surface must not offer mutation over an
+ *                                        in-flight commit, and there is nothing to queue (the user
+ *                                        has not picked an action yet);
+ *       LOCAL reject (over-limit)     -> `false`, no transient banner from here: commitEdit's own
+ *                                        'edit' banner explains and the editor stays open + focused
+ *                                        for shortening -- exactly the resolver's 'blocked'
+ *                                        semantics (and `showError`'s source priority would have
+ *                                        suppressed a 'transient' write under the 'edit' banner
+ *                                        anyway);
+ *   - already PENDING a commit        -> `false` + the banner: suppress; the user re-gestures once
+ *                                        the commit resolves (every resolution point -- ack,
+ *                                        errorReply, watchdog, malformed render -- re-enables the
+ *                                        surface by resolving/un-sticking the editor).
+ * `retryHint` is the surface-specific retry gesture, appended to the suppression banner so a shut
+ * surface is never silent (No-Fallbacks). The suppressed paths keep/restore focus ON the editor
+ * (mirroring `runAfterResolvingEdit`'s 'queued'/'blocked' arms): it owns the interaction until its
+ * commit resolves.
+ */
+function resolveEditForNativeSurface(retryHint: string): boolean {
+	if (editState === null) {
+		return true;
+	}
+	if (!editState.pendingCommit) {
+		const value = editState.editEl.value;
+		const changed = value !== editState.initialValue;
+		const knownBad = editState.lastFailedRawInput !== undefined && value === editState.lastFailedRawInput;
+		if (!changed || knownBad) {
+			cancelEdit(); // Escape/blur-unchanged semantics -- identical to resolveEditThen's cancel arm
+			redraw();
+			return true;
+		}
+		if (!commitEdit()) {
+			// LOCAL reject (over-limit): 'blocked'. The 'edit' banner commitEdit just showed is the story;
+			// keep the keyboard on the editor so the user can shorten the value in place.
+			editState.editEl.focus();
+			return false;
+		}
+	}
+	// A commit is (now) in flight: the editor is readOnly until the host's ack/errorReply/watchdog
+	// resolves it. Suppress the surface this once and say how to retry -- never a silent dead control.
+	showError('The open edit is still being committed -- ' + retryHint, 'transient');
+	editState.editEl.focus();
+	return false;
 }
 
 /** The in-flight commit whose editor a HOST-initiated sheet change closed (null = none). Carries
@@ -2799,9 +2913,24 @@ canvasEl.addEventListener('dblclick', ev => {
 //
 // Mechanism: on `contextmenu` we hit-test the clicked cell and set `data-vscode-context` (a JSON string)
 // on the canvas. VS Code reads that attribute and shows the `menus["webview/context"]` items contributed
-// in package.json (gated on `webviewId == 'quantlab.quantbookCellGrid'` + the section). We do NOT call
-// `preventDefault()`: the native menu needs the default contextmenu to proceed; `preventDefaultContextMenuItems`
-// in the payload suppresses VS Code's own built-in items. The pure payload builder is contextMenuPayload.ts.
+// in package.json (gated on `webviewId == 'quantlab.quantbookCellGrid'` + the section). On the LET-THROUGH
+// path we do NOT call `preventDefault()`: the native menu needs the default contextmenu to proceed;
+// `preventDefaultContextMenuItems` in the payload suppresses VS Code's own built-in items. The pure payload
+// builder is contextMenuPayload.ts.
+//
+// **Codex r3 fix-verify BLOCKER (2026-06-10) -- the menu may only open over a RESOLVED editor.** The
+// payload is a LIVE hand-off: the host runs structural insert/delete directly from it (and the clipboard
+// items post `{type:'contextMenuAction'}` back into write paths), so priming it while an editor is still
+// open re-creates the demo-blocker stale-coordinate class -- the host mutates, then the editor's later
+// blur-commit posts its PRE-mutation row/col into the shifted grid. The webview cannot defer the HOST's
+// menu (VS Code shows it the instant this event completes; nothing can re-open it at a later commit-ack),
+// so the editor is resolved AT MENU TIME via {@link resolveEditForNativeSurface}: unchanged/known-bad ->
+// cancelled (Escape semantics) and the menu proceeds over the resolved grid; CHANGED -> committed NOW and
+// the menu is SUPPRESSED this once; PENDING -> suppressed likewise. Suppression = `ev.preventDefault()`:
+// the injected webview script (src/vs/workbench/contrib/webview/browser/pre/index.html, the contextmenu
+// forwarder) returns early on `e.defaultPrevented` -- "extension code has already handled this event" --
+// so VS Code never posts `did-context-menu` and no menu shows. The resolver's banner tells the user to
+// right-click again (No-Fallbacks: a suppressed menu is explained, never a silently dead right-click).
 // ============================================================================================
 canvasEl.addEventListener('contextmenu', ev => {
 	const hit = hitTestCanvas(ev);
@@ -2809,9 +2938,25 @@ canvasEl.addEventListener('contextmenu', ev => {
 		// A right-click on the sticky header band / row gutter / corner / empty space: no target cell ->
 		// tag NO quantbook section so none of the grid menu items appear (No-Fallbacks: never offer an
 		// action with no cell to act on). VS Code still reads the attribute for `preventDefaultContextMenuItems`.
+		// An open editor is deliberately NOT resolved here: the empty payload offers NO mutations, so there
+		// is no stale-coordinate risk -- and cancelling/committing an edit for an empty menu would be a
+		// surprising side effect of a band right-click (a LEFT band click leaves the editor alone too).
 		canvasEl.setAttribute('data-vscode-context', buildEmptyContextPayload());
 		return;
 	}
+	// Codex r3 fix-verify BLOCKER: resolve any open editor BEFORE priming the live payload (see the block
+	// comment above). `false` = the editor could not be resolved synchronously (its changed value is now
+	// committing, or a commit was already in flight): suppress the native menu this once and clear the
+	// payload to the empty (no-mutations) shape as defense-in-depth -- if some future VS Code build showed
+	// a menu despite `defaultPrevented`, it would offer NO grid actions rather than stale-coordinate ones.
+	if (!resolveEditForNativeSurface('right-click again once it settles to open the menu.')) {
+		ev.preventDefault(); // pre/index.html honors defaultPrevented -> no native menu for this click
+		canvasEl.setAttribute('data-vscode-context', buildEmptyContextPayload());
+		return;
+	}
+	// From here down the editor is RESOLVED (none was open, or it was cancelled above), so the selection
+	// reads below -- `currentSelection()` / `active` / `anchor`, possibly moved by the click-to-select --
+	// are settled state, and the payload they produce stays correct for the menu VS Code is about to show.
 	// Excel semantics: right-clicking OUTSIDE the current selection moves the selection to the clicked
 	// cell (so the menu acts on what the user just clicked); right-clicking INSIDE a multi-cell selection
 	// keeps it (so "Delete Row" removes the whole selected band). This keeps the host-tracked selection --
@@ -3421,13 +3566,32 @@ function requestSheetSwitch(id: number): void {
 // Sheet-tabs (2026-06-10): the strip's interactions post to the host (which owns ALL sheet mutation).
 // `switchSheet` switches the active sheet in place (via `requestSheetSwitch`, which first resolves any
 // open editor -- the cross-sheet edit guard); `sheetCommand` runs add/rename/delete/move on a tab.
+//
+// **Codex r3 fix-verify HIGH (2026-06-10): the five MUTATING commands route through the shared chrome
+// guard** (`runAfterResolvingEdit`), closing the last unguarded posting controls: previously they posted
+// `sheetCommand` directly, so e.g. '+' or 'Delete' could fire while a blur-commit was still in flight
+// (a tab click moves real focus, so the editor's blur posts FIRST, then the click lands mid-commit) and
+// were never dropped on `errorReply`/watchdog like every other action. Wrapping at THIS seam covers all
+// of sheetTabBar.ts's call sites in one place ('+' click, double-click rename, and the right-click menu's
+// Rename/Delete/Move Left/Move Right -- the strip stays presentation-only and guard-free by design; see
+// the `SheetTabHandlers` contract note there). Per-command effects under the guard:
+//   - add/delete change the ACTIVE sheet host-side -> the resulting render takes `applyRender`'s
+//     HOST-initiated sheet-change path (editor invariant, A1 reset) exactly as before; the guard's job
+//     here is only that the POST never fires over an unresolved commit and drops on commit failure;
+//   - a queued command can be superseded (loudly) by a later queued action -- e.g. tab-click(switch) then
+//     fast double-click(rename) while a commit is pending keeps only the rename, which is the user's
+//     last expressed intent (the documented last-gesture-wins of the slot);
+//   - `switchTo` deliberately stays on `requestSheetSwitch` (the `sheetSwitch` deferred KIND, not
+//     `chrome`): a deferred SWITCH survives a host-initiated sheet change by re-posting (the user's
+//     destination stands), whereas a chrome action must drop there -- and the switch path also skips the
+//     guard's viewport re-focus (a tab click moves real focus to the tab button by design).
 const sheetTabHandlers: SheetTabHandlers = {
 	switchTo: (id) => requestSheetSwitch(id),
-	add: () => vscode.postMessage({ type: 'sheetCommand', command: 'add' }),
-	rename: (id) => vscode.postMessage({ type: 'sheetCommand', command: 'rename', sheet: id }),
-	remove: (id) => vscode.postMessage({ type: 'sheetCommand', command: 'delete', sheet: id }),
-	moveLeft: (id) => vscode.postMessage({ type: 'sheetCommand', command: 'moveLeft', sheet: id }),
-	moveRight: (id) => vscode.postMessage({ type: 'sheetCommand', command: 'moveRight', sheet: id }),
+	add: () => runAfterResolvingEdit('add sheet', () => vscode.postMessage({ type: 'sheetCommand', command: 'add' })),
+	rename: (id) => runAfterResolvingEdit('rename sheet', () => vscode.postMessage({ type: 'sheetCommand', command: 'rename', sheet: id })),
+	remove: (id) => runAfterResolvingEdit('delete sheet', () => vscode.postMessage({ type: 'sheetCommand', command: 'delete', sheet: id })),
+	moveLeft: (id) => runAfterResolvingEdit('move sheet left', () => vscode.postMessage({ type: 'sheetCommand', command: 'moveLeft', sheet: id })),
+	moveRight: (id) => runAfterResolvingEdit('move sheet right', () => vscode.postMessage({ type: 'sheetCommand', command: 'moveRight', sheet: id })),
 };
 
 /**
@@ -3777,7 +3941,14 @@ window.addEventListener('message', (event: MessageEvent) => {
 		// to the SAME functions as the keyboard shortcuts. A malformed action is dropped loud (No-Fallbacks).
 		const action = (msg as { action?: unknown }).action;
 		if (action === 'cut' || action === 'copy' || action === 'paste' || action === 'clear') {
-			runContextMenuAction(action);
+			// Codex r3 fix-verify BLOCKER (defense-in-depth half): route the reply through the shared chrome
+			// guard, labelled like every other chrome action. The contextmenu handler above already ensures
+			// the menu only OPENS over a resolved editor -- but this reply arrives ASYNC (menu click -> host
+			// command -> postMessage), and an editor can re-open in the gap (the native menu does not trap
+			// the webview's keyboard state machine), so the write paths behind paste/clear must not trust
+			// that gap. The guard resolves any such editor first, queues the action behind an in-flight
+			// commit, and drops it on commit failure -- identical semantics to the toolbar/menubar items.
+			runAfterResolvingEdit('context menu "' + action + '"', () => runContextMenuAction(action));
 		} else {
 			console.warn('[sheets-webview] ignored contextMenuAction with a bad action:', action);
 		}
