@@ -1113,11 +1113,18 @@ impl WorkbookSession {
 
     /// Build a full `SheetSnapshot` for one live sheet (shared by `snapshot` and
     /// `snapshot_delta`'s `sheets_changed`). `None` if the sheet is gone.
-    fn build_sheet_snapshot(&self, sheet_id: SheetId) -> Option<SheetSnapshot> {
+    /// `parsed_format_cache` is the caller's per-read-call render cache (see
+    /// `build_cell_snapshot`); threading it through keeps `format::parse` at
+    /// once-per-unique-`FormatId` per top-level call even across sheets.
+    fn build_sheet_snapshot(
+        &self,
+        sheet_id: SheetId,
+        parsed_format_cache: &mut HashMap<ql_storage::FormatId, ql_functions::format::FormatString>,
+    ) -> Option<SheetSnapshot> {
         let name = self.workbook.sheet(sheet_id)?.name().to_string();
         let mut cells = Vec::new();
         for (row, col) in self.populated_coords(sheet_id) {
-            if let Some(cell) = self.build_cell_snapshot(sheet_id, row, col) {
+            if let Some(cell) = self.build_cell_snapshot(sheet_id, row, col, parsed_format_cache) {
                 cells.push(cell);
             }
         }
@@ -1294,32 +1301,124 @@ impl WorkbookSession {
 
     /// Build a `CellSnapshot` for one cell, or `None` if the cell is truly empty
     /// (no value, formula, or format).
+    ///
+    /// **Display-path gap closure (2026-06-10)**: `rendered` is now populated
+    /// (pre-closure it was hardcoded `None`, so the IDE grid showed RAW
+    /// numbers for format-carrying cells — a percent-formatted `0.021`
+    /// displayed `"0.021"` instead of `"2.10%"`). The format-rendering logic
+    /// existed but ONLY on the dormant `CollabSession` napi paths
+    /// (`ql-bindings-node/src/lib.rs` `workbook_snapshot` D4 + the
+    /// `workbook_snapshot_delta` changed-cells path) — the same
+    /// wrong-session-class trap as the w54 insert/delete bug: a feature built
+    /// on `CollabSession` that the product (owning `WorkbookSession`) never
+    /// got. This is the single per-cell choke point for ALL owning-session
+    /// read paths (`snapshot` → `build_sheet_snapshot`, `snapshot_delta`'s
+    /// `changed_cells` AND `sheets_changed`, and single-cell `cell()`), so
+    /// populating it here fixes every product render path at once.
+    ///
+    /// **Semantics are a 1:1 MIRROR of the `CollabSession` D4 contract**
+    /// (`CellSnapshotJson.rendered` docstring + the gating at the
+    /// `workbook_snapshot` / delta render sites in
+    /// `ql-bindings-node/src/lib.rs`), translated from the collab cache's
+    /// `Option<CellWireValue>` vocabulary to the owning session's direct
+    /// `ql_types::Value` read:
+    /// - format `None` → rendered `None` (IDE falls back to value-based
+    ///   default rendering). NOTE: a cell EXPLICITLY formatted with
+    ///   `Builtin(0)` ("General", pre-registered in `FormatTable::new`) is
+    ///   `Some` here and DOES render through `SectionKind::General` — exactly
+    ///   what the CollabSession path does (no special-casing of builtin-0).
+    /// - value `None` → rendered `None`. `value_to_cell_value` maps
+    ///   `Value::Blank` → `None`, which covers BOTH collab gates at once: the
+    ///   "no value" gate AND the `is_pending()` gate (the collab cache's
+    ///   `Pending` sentinel marks a formula awaiting evaluation; the owning
+    ///   session's storage read for that state IS `Value::Blank`). Mirrors
+    ///   the audit-of-D4 CONVERGENT-HIGH-3 closure: never render a
+    ///   not-yet-evaluated formula as a formatted zero.
+    /// - format-id lookup miss in `Workbook::formats()` → `None` (should not
+    ///   happen for well-formed sessions: `set_format` rejects unregistered
+    ///   ids — but the delta/replay surface keeps the guard).
+    /// - format-string parse failure (`ql_functions::format::parse` err —
+    ///   V2 token, malformed grammar) → `None` (IDE value-default fallback,
+    ///   per the Phase 5.6 conservative discipline the collab path follows).
+    /// - `Value::Error` DOES render: `ql_functions::format::render`
+    ///   short-circuits errors to their canonical sigils (Excel canon —
+    ///   errors never honor the format string), identical to the collab path
+    ///   where a known sigil wire-decodes to `Value::Error` and renders. The
+    ///   collab-only "unknown error sigil → wire-decode err → None" gate has
+    ///   NO owning-session analog (`Value::Error` is a closed enum; every
+    ///   sigil is canonical), so nothing is lost in the translation.
+    ///
+    /// `parsed_format_cache` mirrors the collab path's audit-of-D4
+    /// CONVERGENT-MED-2 closure: `format::parse` runs ONCE per unique
+    /// `FormatId` per top-level read call (snapshot / delta / cell), not per
+    /// cell. Callers own the cache so its lifetime matches the collab
+    /// per-snapshot-call granularity.
     fn build_cell_snapshot(
         &self,
         sheet_id: SheetId,
         row: RowId,
         col: ColId,
+        parsed_format_cache: &mut HashMap<ql_storage::FormatId, ql_functions::format::FormatString>,
     ) -> Option<CellSnapshot> {
         let sheet = self.workbook.sheet(sheet_id)?;
-        let value = value_to_cell_value(&sheet.read(row, col));
+        // Keep the RAW `ql_types::Value` for rendering (render takes `&Value`;
+        // the DTO `CellValue` is wire-shaped, not render-shaped).
+        let raw_value = sheet.read(row, col);
+        let value = value_to_cell_value(&raw_value);
         let formula = self
             .workbook
             .formula_at(sheet_id, row, col)
             .map(|f| f.to_string());
-        let format = sheet
-            .format_overlay()
-            .get(row, col)
-            .map(storage_format_id_to_dto);
+        // Keep the STORAGE-side id for the `FormatTable` lookup; the DTO id is
+        // only for the snapshot payload.
+        let storage_format = sheet.format_overlay().get(row, col);
+        let format = storage_format.map(storage_format_id_to_dto);
         if value.is_none() && formula.is_none() && format.is_none() {
             return None;
         }
+        // The D4 gate, in owning-session vocabulary: render iff the cell has
+        // BOTH an explicit format AND a committed non-Blank value (see the
+        // docstring above for the full None-fallback contract mirror).
+        let rendered: Option<String> = match (storage_format, value.is_some()) {
+            (Some(fmt_id), true) => {
+                // Same render/eval context as the CollabSession sites: the
+                // workbook's date system + locale, system clock. `render`
+                // ignores `locale` today (English month names hardcoded) but
+                // the passthrough mirrors the audit-of-D4 CONVERGENT-MED-1
+                // closure (no silent forward-compat regression when
+                // locale-aware rendering lands).
+                let eval_ctx = ql_types::EvalContext {
+                    date_system: self.workbook.date_system(),
+                    locale: self.workbook.locale(),
+                    now_provider: ql_types::NowProvider::System,
+                };
+                if let Some(fmt) = parsed_format_cache.get(&fmt_id) {
+                    // CONVERGENT-MED-2 parse cache hit: reuse the
+                    // `FormatString` across cells sharing a `FormatId`.
+                    Some(ql_functions::format::render(&raw_value, fmt, &eval_ctx))
+                } else {
+                    // Cache miss: lookup + parse + insert. `?`-style fallthrough
+                    // to `None` on lookup miss / parse error is the documented
+                    // IDE value-default fallback, NOT a swallowed engine error
+                    // (the contract docstring above enumerates every arm).
+                    self.workbook.formats().lookup(fmt_id).and_then(|fmt_str| {
+                        let fmt = ql_functions::format::parse(fmt_str).ok()?;
+                        let rendered_str =
+                            ql_functions::format::render(&raw_value, &fmt, &eval_ctx);
+                        parsed_format_cache.insert(fmt_id, fmt);
+                        Some(rendered_str)
+                    })
+                }
+            }
+            _ => None,
+        };
         Some(CellSnapshot {
             row,
             col,
             value,
             formula,
             format,
-            rendered: None,
+            rendered,
         })
     }
 
@@ -2724,11 +2823,18 @@ impl EngineSession for WorkbookSession {
     fn snapshot(&self) -> EngineResult<WorkbookSnapshot> {
         self.ensure_readable()?;
         let mut sheets = Vec::new();
+        // Per-snapshot-call render cache (CONVERGENT-MED-2 mirror): one
+        // `format::parse` per unique `FormatId` for the WHOLE snapshot — the
+        // same granularity as the CollabSession `workbook_snapshot` path.
+        let mut parsed_format_cache: HashMap<
+            ql_storage::FormatId,
+            ql_functions::format::FormatString,
+        > = HashMap::new();
         for &sheet_id in self.workbook.sheet_display_order() {
             if self.workbook.is_sheet_removed(sheet_id) {
                 continue;
             }
-            if let Some(snap) = self.build_sheet_snapshot(sheet_id) {
+            if let Some(snap) = self.build_sheet_snapshot(sheet_id, &mut parsed_format_cache) {
                 sheets.push(snap);
             }
         }
@@ -2821,6 +2927,15 @@ impl EngineSession for WorkbookSession {
             }
         }
 
+        // Per-delta-call render cache (CONVERGENT-MED-2 mirror — the
+        // CollabSession delta path keeps one `parsed_format_cache` per
+        // `workbook_snapshot_delta` call); shared across BOTH the per-cell
+        // `changed_cells` walk and the `sheets_changed` full-sheet rebuilds.
+        let mut parsed_format_cache: HashMap<
+            ql_storage::FormatId,
+            ql_functions::format::FormatString,
+        > = HashMap::new();
+
         // Resolve cell changes to current committed state: present → changed,
         // absent → removed. A cell on a now-tombstoned sheet is conveyed via
         // `sheets_removed`, so skip it here (avoids a redundant per-cell entry).
@@ -2830,7 +2945,7 @@ impl EngineSession for WorkbookSession {
             if self.workbook.is_sheet_removed(sheet) {
                 continue;
             }
-            match self.build_cell_snapshot(sheet, row, col) {
+            match self.build_cell_snapshot(sheet, row, col, &mut parsed_format_cache) {
                 Some(cell) => changed_cells.push(ChangedCell { sheet, cell }),
                 None => removed_cells.push(RemovedCell { sheet, row, col }),
             }
@@ -2843,7 +2958,7 @@ impl EngineSession for WorkbookSession {
             if removed_sheets.contains(&id) || self.workbook.is_sheet_removed(id) {
                 continue;
             }
-            if let Some(snap) = self.build_sheet_snapshot(id) {
+            if let Some(snap) = self.build_sheet_snapshot(id, &mut parsed_format_cache) {
                 sheets_changed.push(snap);
             }
         }
@@ -2899,7 +3014,10 @@ impl EngineSession for WorkbookSession {
         self.ensure_readable()?;
         self.require_live_sheet(addr.sheet, "cell")?;
         Self::require_in_bounds(addr.row, addr.col, "cell")?; // F4
-        Ok(self.build_cell_snapshot(addr.sheet, addr.row, addr.col))
+
+        // Single-cell read: a throwaway render cache (at most one parse).
+        let mut parsed_format_cache = HashMap::new();
+        Ok(self.build_cell_snapshot(addr.sheet, addr.row, addr.col, &mut parsed_format_cache))
     }
 
     fn list_sheets(&self) -> EngineResult<Vec<SheetInfo>> {
@@ -8888,6 +9006,162 @@ mod tests {
             s.set_format(addr(sheet, 0, 0), bogus).unwrap_err().class,
             ErrorClass::BadArgument
         );
+    }
+
+    // --- Display-path gap closure (2026-06-10): `rendered` on the OWNING
+    // session's snapshot paths. Pre-closure `build_cell_snapshot` hardcoded
+    // `rendered: None` (the format-rendering existed only on the dormant
+    // `CollabSession` napi paths — the w54 wrong-session-class trap), so the
+    // IDE grid showed raw `0.021` for a percent-formatted cell. These tests
+    // pin the D4-contract mirror on the product (`WorkbookSession`) path. ---
+
+    /// The headline repro: value `0.021` + format `"0.00%"` → the full
+    /// `snapshot()`, the single-cell `cell()`, and the value DTO must agree,
+    /// with `rendered` carrying the ENGINE renderer's exact output. The
+    /// expected string is DERIVED from `ql_functions::format::render` itself
+    /// (same renderer, same parse) and pinned to the literal `"2.10%"` —
+    /// consistent with the renderer's own suite (`0.123→"12.30%"`,
+    /// `0.25→"25.00%"` in `ql-functions/src/format/render.rs`).
+    #[test]
+    fn format_carrying_cell_snapshot_includes_engine_rendered_string() {
+        // Derive the renderer's real output first (the session builds its
+        // EvalContext from the workbook: Excel1900 + EnUs + System — the
+        // `EvalContext` default; percent rendering is date-system-agnostic).
+        let fmt = ql_functions::format::parse("0.00%").unwrap();
+        let expected = ql_functions::format::render(
+            &Value::Number(0.021),
+            &fmt,
+            &ql_types::EvalContext {
+                date_system: ql_types::DateSystem::Excel1900,
+                locale: ql_types::Locale::EnUs,
+                now_provider: ql_types::NowProvider::System,
+            },
+        );
+        assert_eq!(expected, "2.10%", "renderer contract moved under us");
+
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 1, 1), CellValue::Number { number: 0.021 })
+            .unwrap();
+        let fmt_id = s.register_format("0.00%").unwrap();
+        s.set_format(addr(sheet, 1, 1), fmt_id).unwrap();
+        s.recalc_dirty().unwrap();
+
+        // Full-snapshot path (snapshot → build_sheet_snapshot → build_cell_snapshot).
+        let snap = s.snapshot().unwrap();
+        let cell = snap.sheets[0]
+            .cells
+            .iter()
+            .find(|c| c.row == 1 && c.col == 1)
+            .expect("the formatted cell must be in the snapshot");
+        assert_eq!(cell.rendered.as_deref(), Some(expected.as_str()));
+        assert_eq!(cell.format, Some(fmt_id));
+        assert_eq!(cell.value, Some(CellValue::Number { number: 0.021 }));
+
+        // Single-cell path (`cell()`) goes through the same choke point.
+        let single = s.cell(addr(sheet, 1, 1)).unwrap().unwrap();
+        assert_eq!(single.rendered.as_deref(), Some(expected.as_str()));
+    }
+
+    /// A format-only cell (format set, NO committed value) is the owning-
+    /// session value-kind that the D4 contract maps to `rendered: None`
+    /// (collab vocabulary: `state.value == None` / `Pending` — both read as
+    /// `Value::Blank` here). The IDE falls back to its own default display.
+    #[test]
+    fn format_only_cell_renders_none() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let fmt_id = s.register_format("0.00%").unwrap();
+        s.set_format(addr(sheet, 0, 0), fmt_id).unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(c.format, Some(fmt_id));
+        assert_eq!(c.value, None);
+        assert_eq!(c.rendered, None, "no value → no pre-render (D4 mirror)");
+    }
+
+    /// An ERROR-valued format-carrying cell renders its CANONICAL SIGIL —
+    /// mirroring the CollabSession path exactly: a known sigil wire-decodes
+    /// to `Value::Error` and `ql_functions::format::render` short-circuits
+    /// errors to their sigils (Excel canon: errors never honor the format
+    /// string). The collab contract's only error→None arm is the UNKNOWN-
+    /// sigil wire-decode failure, which has no owning-session analog
+    /// (`Value::Error` is a closed enum). Mirror, don't invent.
+    #[test]
+    fn error_valued_format_carrying_cell_renders_canonical_sigil() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_formula(addr(sheet, 0, 0), "1/0").unwrap();
+        let fmt_id = s.register_format("0.00%").unwrap();
+        s.set_format(addr(sheet, 0, 0), fmt_id).unwrap();
+        s.recalc_dirty().unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(
+            c.value,
+            Some(CellValue::Error {
+                error: "#DIV/0!".to_string()
+            })
+        );
+        assert_eq!(
+            c.rendered.as_deref(),
+            Some("#DIV/0!"),
+            "errors render as their sigil (render short-circuit), not None"
+        );
+    }
+
+    /// An unformatted number cell pre-renders nothing (format `None` →
+    /// `rendered None`; the IDE's value-based default rendering applies).
+    #[test]
+    fn unformatted_number_cell_renders_none() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 0.021 })
+            .unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(c.format, None);
+        assert_eq!(c.rendered, None, "no explicit format → no pre-render");
+    }
+
+    /// A cell EXPLICITLY formatted with builtin-0 ("General", pre-registered
+    /// in `FormatTable::new`) DOES pre-render, through `SectionKind::General`
+    /// — exactly what the CollabSession path does (lookup → "General" →
+    /// parse → render; no builtin-0 special-casing). `render_general_number`
+    /// of a non-integer is the shortest-round-trip `f64` text.
+    #[test]
+    fn builtin_general_format_renders_via_general_section() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 0.021 })
+            .unwrap();
+        s.set_format(addr(sheet, 0, 0), FormatId::Builtin { builtin: 0 })
+            .unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(c.rendered.as_deref(), Some("0.021"));
+    }
+
+    /// The delta path: a changed format-carrying cell arrives in
+    /// `snapshot_delta().changed_cells` WITH `rendered` populated (the delta
+    /// walk funnels through the same `build_cell_snapshot` choke point —
+    /// pre-closure the IDE's incremental refresh showed raw values even if a
+    /// full reseed would have, post-closure, rendered them).
+    #[test]
+    fn snapshot_delta_changed_cells_carry_rendered() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        s.set_value(addr(sheet, 1, 1), CellValue::Number { number: 0.021 })
+            .unwrap();
+        let fmt_id = s.register_format("0.00%").unwrap();
+        s.set_format(addr(sheet, 1, 1), fmt_id).unwrap();
+        s.recalc_dirty().unwrap();
+        let delta = s.snapshot_delta(&v0).unwrap();
+        assert!(!delta.full_rebuild_required);
+        let changed = delta
+            .changed_cells
+            .iter()
+            .find(|c| c.sheet == sheet && c.cell.row == 1 && c.cell.col == 1)
+            .expect("the formatted cell must be in changed_cells");
+        assert_eq!(changed.cell.rendered.as_deref(), Some("2.10%"));
+        assert_eq!(changed.cell.format, Some(fmt_id));
     }
 
     #[test]
