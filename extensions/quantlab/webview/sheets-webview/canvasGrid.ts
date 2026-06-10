@@ -85,6 +85,12 @@ const SHEETS_ACCENT_BLUE = '#1a73e8';
 /** Translucent accent for the active row/col header band -- a faint blue wash (Sheets tints the active
  * header a pale accent, not a heavy fill). Low alpha so the header letter stays legible on top. */
 const SHEETS_ACCENT_HEADER_FILL = 'rgba(26,115,232,0.16)';
+/** **Sheets retheme (2026-06-10) -- header HOVER wash.** A FAINTER accent wash painted on the column-letter
+ * / row-number cell the pointer is currently over (the Sheets "hover a header" cue). Deliberately lower
+ * alpha than {@link SHEETS_ACCENT_HEADER_FILL} so it reads as a transient hover, distinct from the persistent
+ * active-selection highlight -- and so the active highlight always wins when both would apply (the draw code
+ * only paints the hover wash on a header cell that is NOT in the active/selection tint). */
+const SHEETS_ACCENT_HEADER_HOVER = 'rgba(26,115,232,0.07)';
 /** Translucent accent for the multi-cell selection RANGE fill -- a faint blue, Sheets' selection wash.
  * Must stay translucent so cell contents read through. */
 const SHEETS_ACCENT_RANGE_FILL = 'rgba(26,115,232,0.10)';
@@ -198,6 +204,10 @@ interface Palette {
 	// Sheets retheme: the opaque accent for the ACTIVE row/col header text (the current column letter /
 	// row number goes accent + bold, Sheets-style). Same hue as `selectionBorder`.
 	accent: string;
+	// Sheets retheme (header HOVER): the FAINT accent wash painted on the single header letter / row number
+	// the pointer is over. Lower alpha than `headerActiveBg` so the active highlight always reads on top and
+	// wins (the draw only paints this on a header cell NOT already in the active/selection tint).
+	headerHoverBg: string;
 	// Sheets retheme: the muted fill for the small select-all corner triangle (top-left corner box).
 	cornerTriangle: string;
 }
@@ -241,6 +251,39 @@ export class CanvasGridRenderer {
 	 */
 	private lastScrollTop = 0;
 	private lastScrollLeft = 0;
+	/**
+	 * **Sheets retheme (2026-06-10) -- header hover highlight.** The column / row index the pointer is
+	 * currently hovering in the COLUMN-letter band / ROW-number gutter, or `-1` for "no header hovered"
+	 * (pointer is over the body / corner, or has left the canvas). Set by the {@link installCursorHitTest}
+	 * mousemove + the mouseleave clear; read by {@link drawHeader} / {@link drawGutter} to paint a faint
+	 * hover wash on that one header cell (the Sheets "hover a header" cue). Purely a paint hint -- the
+	 * active-selection tint is checked FIRST so it always wins (no fight between hover and active). Repaints
+	 * are coalesced to the next animation frame and fire ONLY when the hovered index actually changes.
+	 */
+	private hoveredHeaderCol = -1;
+	private hoveredHeaderRow = -1;
+	/** rAF handle for the debounced hover repaint (0 = none scheduled), so a rapid mousemove burst across
+	 * one header cell repaints at most once per frame. */
+	private hoverRepaintRaf = 0;
+	/**
+	 * **Sheets retheme (header hover)** -- the exact argument tuple the LAST full {@link draw} painted with,
+	 * captured so a hover-only change can REPLAY that same full redraw without the orchestrator (this
+	 * renderer owns its only mutated input -- the hovered header index). `null` until the first {@link draw}.
+	 * Holds the live references the host passed (errorCells / active / selection / publishedRanges /
+	 * fillPreview); a subsequent host-driven `draw()` overwrites the tuple, so a stale hover replay can never
+	 * paint older state than the last frame the host asked for.
+	 */
+	private lastDrawArgs: {
+		cssWidth: number;
+		cssHeight: number;
+		scrollTop: number;
+		scrollLeft: number;
+		errorCells: ReadonlyMap<string, string>;
+		active: ActiveCell | null;
+		selection: SelectionRect | null;
+		publishedRanges: readonly PublishedRange[];
+		fillPreview: SelectionRect | null;
+	} | null = null;
 	private readonly measureCache = new Map<string, number>();
 	/**
 	 * **FE-0b-4** -- true once a full {@link draw} has painted the current backing store. Reset to
@@ -404,6 +447,9 @@ export class CanvasGridRenderer {
 		this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
 		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
 		this.hasPaintedOnce = true;
+		// Sheets retheme (header hover): remember this full-draw's inputs so a hover-only change can replay an
+		// identical full redraw with the new hovered-header index, without routing back through the host.
+		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview };
 	}
 
 	/**
@@ -445,6 +491,9 @@ export class CanvasGridRenderer {
 			ctx.restore();
 		}
 		this.hasPaintedOnce = true;
+		// Sheets retheme (header hover): a scroll updates the inputs a hover replay must use (new scrollTop/
+		// scrollLeft). Capture the post-scroll tuple so a hover wash lands on the correct header at this offset.
+		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview };
 		if (DEBUG_BLIT_VERIFY) {
 			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, 'drawScroll');
 		}
@@ -525,6 +574,9 @@ export class CanvasGridRenderer {
 		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
 		ctx.restore();
 		this.hasPaintedOnce = true;
+		// Sheets retheme (header hover): keep the replay tuple current with the latest host-driven state (a
+		// damage paint can change errorCells / active / selection at the same scroll the hover replay reuses).
+		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview };
 		if (DEBUG_BLIT_VERIFY) {
 			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, 'drawDamage');
 		}
@@ -945,6 +997,11 @@ export class CanvasGridRenderer {
 				if (tinted) {
 					ctx.fillStyle = this.palette.headerActiveBg;
 					ctx.fillRect(0, y, gutterW, ROW_HEIGHT);
+				} else if (r === this.hoveredHeaderRow) {
+					// Sheets retheme (header hover): a faint hover wash on the pointed-at row number. Painted ONLY
+					// when the row is NOT active/selected -- the active highlight (above) always wins.
+					ctx.fillStyle = this.palette.headerHoverBg;
+					ctx.fillRect(0, y, gutterW, ROW_HEIGHT);
 				}
 				ctx.font = isFocusRow ? this.headerActiveFont : this.headerFont;
 				ctx.fillStyle = tinted ? this.palette.accent : this.palette.headerText;
@@ -1032,6 +1089,11 @@ export class CanvasGridRenderer {
 					// "selected column" affordance). Sits at the header's bottom edge, inside the band.
 					ctx.fillStyle = this.palette.accent;
 					ctx.fillRect(x, HEADER_HEIGHT - 2, COL_WIDTH, 2);
+				} else if (c === this.hoveredHeaderCol) {
+					// Sheets retheme (header hover): a faint hover wash on the pointed-at column letter. Painted
+					// ONLY when the column is NOT active/selected -- the active highlight (above) always wins.
+					ctx.fillStyle = this.palette.headerHoverBg;
+					ctx.fillRect(x, 0, COL_WIDTH, HEADER_HEIGHT);
 				}
 				ctx.save();
 				ctx.beginPath();
@@ -1134,6 +1196,78 @@ export class CanvasGridRenderer {
 			const localX = ev.clientX - rect.left;
 			const localY = ev.clientY - rect.top;
 			this.canvas.style.cursor = this.cursorAt(localX, localY);
+			// Sheets retheme (header hover): also update which header letter / row number is under the pointer
+			// (the Sheets "hover a header" cue) and repaint that one cell's wash when it changes.
+			this.updateHeaderHover(localX, localY);
+		});
+		// Clear the hover wash the instant the pointer leaves the canvas (Sheets drops the cue immediately).
+		this.canvas.addEventListener('mouseleave', () => {
+			this.setHeaderHover(-1, -1);
+		});
+	}
+
+	/**
+	 * **Sheets retheme (header hover)** -- map a VIEWPORT-LOCAL pointer (canvas px) to the column-letter cell
+	 * / row-number cell it is over (or none) and update {@link hoveredHeaderCol} / {@link hoveredHeaderRow}.
+	 * The column header band hovers a COLUMN (never a row); the row gutter hovers a ROW (never a column); the
+	 * body and the corner box hover NOTHING (the body has the block cursor, the corner is the select-all box).
+	 * Reuses the SAME effective-scroll-per-band geometry as {@link cursorAt} so the highlighted header lines up
+	 * with the gridlines the user sees. Pure index math -- the repaint is debounced + change-gated in
+	 * {@link setHeaderHover}.
+	 */
+	private updateHeaderHover(localX: number, localY: number): void {
+		const gutterW = this.gutterW;
+		const inHeaderBand = localY < HEADER_HEIGHT;
+		const inGutter = localX < gutterW;
+		if (inHeaderBand && inGutter) {
+			this.setHeaderHover(-1, -1); // corner box -- no header hover
+			return;
+		}
+		if (inHeaderBand) {
+			// Column-letter band: which column is under the pointer (frozen cols pinned, body cols scrolled).
+			const fColsPx = frozenColsWidth(this.frozenColCount);
+			const effScrollLeft = localX < gutterW + fColsPx ? 0 : this.lastScrollLeft;
+			const contentX = localX + effScrollLeft - gutterW;
+			const col = Math.floor(contentX / COL_WIDTH);
+			this.setHeaderHover(col >= 0 && col < MAX_COLS ? col : -1, -1);
+			return;
+		}
+		if (inGutter) {
+			// Row-number gutter: which row is under the pointer (frozen rows pinned, body rows scrolled).
+			const fRowsPx = frozenRowsHeight(this.frozenRowCount);
+			const effScrollTop = localY < HEADER_HEIGHT + fRowsPx ? 0 : this.lastScrollTop;
+			const contentY = localY + effScrollTop - HEADER_HEIGHT;
+			const row = Math.floor(contentY / ROW_HEIGHT);
+			this.setHeaderHover(-1, row >= 0 && row < MAX_ROWS ? row : -1);
+			return;
+		}
+		// Grid body: no header hover.
+		this.setHeaderHover(-1, -1);
+	}
+
+	/**
+	 * **Sheets retheme (header hover)** -- set the hovered header col/row and, ONLY when it actually changed,
+	 * schedule a single coalesced repaint on the next animation frame (guard against mousemove churn -- a burst
+	 * of moves across one header cell repaints at most once). The repaint REPLAYS the last full {@link draw}
+	 * with the new hover index (the renderer's only self-mutated input); a no-op until the first draw recorded
+	 * {@link lastDrawArgs}.
+	 */
+	private setHeaderHover(col: number, row: number): void {
+		if (col === this.hoveredHeaderCol && row === this.hoveredHeaderRow) {
+			return;
+		}
+		this.hoveredHeaderCol = col;
+		this.hoveredHeaderRow = row;
+		if (this.hoverRepaintRaf !== 0 || this.lastDrawArgs === null) {
+			return; // a repaint is already queued, or nothing has been drawn yet to replay
+		}
+		this.hoverRepaintRaf = requestAnimationFrame(() => {
+			this.hoverRepaintRaf = 0;
+			const a = this.lastDrawArgs;
+			if (a === null) {
+				return;
+			}
+			this.draw(a.cssWidth, a.cssHeight, a.scrollTop, a.scrollLeft, a.errorCells, a.active, a.selection, a.publishedRanges, a.fillPreview);
 		});
 	}
 
@@ -1253,6 +1387,9 @@ export class CanvasGridRenderer {
 			// Sheets retheme: muted header letters / row numbers (the active one overrides to `accent`+bold).
 			headerText: v('--vscode-descriptionForeground', isDark ? '#9d9d9d' : '#5f6368'),
 			accent,
+			// Sheets retheme (header hover): a faint accent wash, strictly lighter than `headerActiveBg` so the
+			// active-selection highlight always wins when a hovered header is also the active row/col.
+			headerHoverBg: SHEETS_ACCENT_HEADER_HOVER,
 			// Sheets retheme: the muted select-all corner triangle, the dimmed header text color.
 			cornerTriangle: v('--vscode-descriptionForeground', isDark ? '#8c8c8c' : '#9aa0a6'),
 		};

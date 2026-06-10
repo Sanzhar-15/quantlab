@@ -110,6 +110,34 @@ body {
 	background: var(--vscode-panel-border);
 }
 
+/* Number-format dropdown (the iconic Sheets "General v" control). */
+.cgt-select {
+	flex: 0 0 auto;
+	height: 26px;
+	min-width: 96px;
+	margin: 0 2px;
+	padding: 0 6px;
+	font-family: var(--vscode-font-family);
+	font-size: 12px;
+	color: var(--vscode-foreground);
+	background: var(--vscode-dropdown-background, var(--vscode-editor-background));
+	border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
+	border-radius: 4px;
+	cursor: pointer;
+}
+
+/* Pushes the trailing controls (zoom) to the far right, like Sheets. */
+.cgt-spacer {
+	flex: 1 1 auto;
+}
+
+.cgt-zoom {
+	width: auto;
+	min-width: 46px;
+	padding: 0 8px;
+	font-size: 12px;
+}
+
 /* FE-2-0 Phase 1: visible error banner for a malformed inbound snapshot or a rejected over-length
  * edit (No-Fallbacks -- the failure is surfaced, never silently swallowed). Hidden via the `hidden`
  * attribute until something goes wrong. */
@@ -383,14 +411,19 @@ body {
 
 .cell-grid-tab-add {
 	flex: 0 0 auto;
-	margin-left: 2px;
-	padding: 3px 9px;
-	font-size: 13px;
-	line-height: 18px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	margin-left: 6px;
+	padding: 0;
+	font-size: 16px;
+	line-height: 1;
 	color: var(--vscode-foreground);
 	background: transparent;
-	border: 1px solid transparent;
-	border-radius: 4px;
+	border: none;
+	border-radius: 50%;
 	cursor: pointer;
 }
 
