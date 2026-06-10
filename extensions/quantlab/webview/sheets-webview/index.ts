@@ -194,13 +194,14 @@ root.innerHTML =
 	// format dropdown ('toolbarCommand' setNumberFormat -- the dropdown replaced the old native
 	// <select>, unifying the look AND deleting the select's special-case focus machinery), freeze
 	// ('toolbarCommand' freezePanes), insert/delete (anchored dropdowns -> the structural
-	// 'toolbarCommand's), and the sigma functions dropdown (opens the in-cell editor on the active
-	// cell prefilled '=FN(' -- see startFunctionInsert). Everything else (print, paint-format, zoom,
-	// the decimal pair, font family/size, B/I/U/S, colors, borders, merge, align, vertical-align,
-	// wrap, filter, sort, search) is VISUAL-ONLY by explicit operator decision ('it must LOOK
-	// complete'; cell-style ops land FE-4/FE-5) -- deliberately NO handler case, so a click is a
-	// silent no-op (zero console errors), exactly like the pre-existing bold button. Buttons carry a
-	// `data-cmd` the delegated click handler reads; dropdown anchors carry aria-haspopup/-expanded.
+	// 'toolbarCommand's), the sigma functions dropdown (opens the in-cell editor on the active
+	// cell prefilled '=FN(' -- see startFunctionInsert), and -- since round 5 (2026-06-10) -- the
+	// REAL client-side style controls (B/I/U/S, align L/C/R, text/fill color via the swatch popover;
+	// see cellStyleModel) plus Search (the in-sheet find bar). The remainder (print, paint-format,
+	// zoom, the decimal pair, font family/size, borders, merge, vertical-align, wrap, filter, sort)
+	// is PREVIEW-ONLY: the default arm shows a neutral toast (notifyPreviewOnly) -- the round-5 audit
+	// killed the former silent no-op. Buttons carry a `data-cmd` the delegated click handler reads;
+	// dropdown anchors carry aria-haspopup/-expanded.
 	'<div id="sheets-toolbar" class="cell-grid-toolbar" role="toolbar" aria-label="Spreadsheet toolbar">' +
 	'<button type="button" class="cgt-btn" data-cmd="undo" title="Undo (Ctrl+Z)">' + ICONS.undo + '</button>' +
 	'<button type="button" class="cgt-btn" data-cmd="redo" title="Redo (Ctrl+Y)">' + ICONS.redo + '</button>' +
@@ -916,15 +917,20 @@ toolbarEl.addEventListener('click', (e) => {
 			openColorPicker(btn, 'fillColor');
 			return;
 		case 'search':
-			// Round 5: the (previously dead) Search button opens the in-sheet find bar -- the audit's #1
-			// cheap, high-credibility wiring.
-			openFindBar();
+			// Round 5: the (previously dead) Search button opens the in-sheet find bar. Round-5 audit
+			// (lane B HIGH): it MUST resolve any open editor first like every other chrome control --
+			// the toolbar mousedown preventDefault keeps the editor focused through the click, and an
+			// unresolved (esp. PENDING) editor would otherwise sit at its old cell while the find jump
+			// moves the selection. resolveEditThen directly -- NOT runAfterResolvingEdit -- because its
+			// 'ran' focus postlude (viewportEl.focus) would steal the focus openFindBar just gave the
+			// find input.
+			resolveEditThen({ kind: 'chrome', label: 'Find', run: openFindBar });
 			return;
 		default:
 			// Still visual-only (print / paint-format / zoom / decimal pair / font family+size / borders /
-			// merge / vertical-align / wrap / filter / sort / search): genuinely engine-greenfield or
-			// out-of-scope for this preview. Surfaced honestly via a neutral "preview" toast rather than a
-			// silent no-op (the round-5 audit's #1 finding -- a click that does nothing reads as fake).
+			// merge / vertical-align / wrap / filter / sort): genuinely engine-greenfield or out-of-scope
+			// for this preview. Surfaced honestly via a neutral "preview" toast rather than a silent
+			// no-op (the round-5 audit's #1 finding -- a click that does nothing reads as fake).
 			notifyPreviewOnly(btn.getAttribute('title') ?? 'This control');
 			return;
 	}
@@ -1028,7 +1034,10 @@ function notifyPreviewOnly(label: string): void {
 // handler would otherwise leave the canvas mid-frame with NO user signal -- a silently dead grid in the
 // middle of a live demo, indistinguishable from "still working". Surface it as a transient banner +
 // console.error so the presenter sees recovery guidance instead of a frozen grid. Defensive only: no
-// normal path throws uncaught (this is the insurance, not a load-bearing handler).
+// normal path throws uncaught (this is the insurance, not a load-bearing handler). Round-5 audit LOW
+// (accepted): showError suppresses a 'transient' under an active 'edit' banner, so an uncaught error
+// thrown WHILE an over-limit edit banner is up reaches only the console -- deliberate: the 'edit'
+// banner's guidance (shorten the value) outranks generic recovery text, and console.error still fires.
 window.addEventListener('error', (e) => {
 	console.error('[sheets-webview] uncaught error:', e.error ?? e.message);
 	showError('The grid hit an unexpected error -- press Cmd/Ctrl+R to reload if it stops responding.', 'transient');
@@ -1185,7 +1194,11 @@ let gridClipboard: GridClipboard | null = null;
 // next Ctrl/Cmd+V would fall through to the OS path and re-paste the moved values -- Excel no-ops a
 // second paste after a cut, so we must too. `pendingCutOsTsv` remembers the TSV the live cut wrote;
 // consumption moves it into `consumedCutOsTsv`, which the OS-paste path treats as "already moved".
-// Any NEW copy/cut overwrites the OS clipboard, so both reset then.
+// Any NEW copy/cut overwrites the OS clipboard, so both reset then. Round-5 audit notes (deliberate,
+// documented): (a) a FAILED later copy/cut leaves the guard ARMED -- correct, because the failed op
+// never wrote the OS clipboard, so the consumed cut's TSV is still what a paste would read; (b) a
+// byte-identical TSV copied in ANOTHER app while the guard is armed is suppressed too -- accepted, a
+// coincidence this narrow (exact TSV match) is overwhelmingly the consumed cut itself.
 let pendingCutOsTsv: string | null = null;
 let consumedCutOsTsv: string | null = null;
 // **W-G fill handle**: drag-to-fill state. `fillSource` is the selection rect captured at the start of a
@@ -2135,10 +2148,28 @@ function pasteFromOsClipboard(): void {
 	if (clip === undefined || fullSnapshot === null || active === null) {
 		return;
 	}
+	// Round-5 audit (lane A MED): capture the paste TARGET at Ctrl+V time -- `readText` is async (a
+	// permission prompt can stall it), and reading the LIVE active/sheet inside the .then would land
+	// the paste wherever the user has navigated to in the meantime (wrong sheet / wrong anchor).
+	const targetSheet = fullSnapshot.sheet;
+	const top = active.row;
+	const left = active.col;
 	clip
 		.readText()
 		.then((text) => {
 			if (typeof text !== 'string' || text.length === 0 || fullSnapshot === null || active === null) {
+				return;
+			}
+			// Round-5 audit (lane A MED): the sheet changed while the read was in flight -- the captured
+			// target no longer exists on screen. Refuse loudly rather than write to a sheet the user left.
+			if (fullSnapshot.sheet !== targetSheet) {
+				showError('Paste cancelled: the sheet changed while the clipboard was being read. Paste again on the sheet you want.', 'transient');
+				return;
+			}
+			// Round-5 audit (lane B HIGH): an editor opened while the read was in flight (type-to-edit is
+			// one keystroke). Never mutate the grid under an open editor -- the round-3 invariant.
+			if (editState !== null) {
+				showError('Paste cancelled: finish the open cell edit first, then paste again.', 'transient');
 				return;
 			}
 			// Round-5 LOW fix (cut-paste echo): this TSV is a CONSUMED Quantbook cut -- the move already
@@ -2158,8 +2189,6 @@ function pasteFromOsClipboard(): void {
 				showError('That paste is too large (' + (rows * cols).toLocaleString() + ' cells; the limit is ' + MAX_PUT_CELLS.toLocaleString() + ').', 'transient');
 				return;
 			}
-			const top = active.row;
-			const left = active.col;
 			const cells: { row: number; col: number; rawInput: string }[] = [];
 			// Round-5 LOW fix: count cells clipped at the grid edge and SAY so (No-Fallbacks: a paste
 			// that silently drops part of the block reads as data loss).
@@ -2183,7 +2212,7 @@ function pasteFromOsClipboard(): void {
 			if (cells.length === 0) {
 				return;
 			}
-			vscode.postMessage({ type: 'putCells', sheet: fullSnapshot.sheet, cells, undoLabel: 'Paste', webviewId: WEBVIEW_ID });
+			vscode.postMessage({ type: 'putCells', sheet: targetSheet, cells, undoLabel: 'Paste', webviewId: WEBVIEW_ID });
 			// Select the pasted block (anchor at the origin, focus at the bottom-right).
 			anchor = { row: top, col: left };
 			active = { row: clampRow(top + rows - 1), col: clampCol(left + cols - 1) };
@@ -3310,7 +3339,19 @@ function onEditKeydown(ev: KeyboardEvent): void {
 		return;
 	}
 	ev.preventDefault();
-	commitEdit(vec); // Enter = commit + down; Tab = commit + right (Shift+Tab left)
+	// Round-5 audit (lane A LOW-MED): capture the coordinates BEFORE the commit -- an untouched
+	// sigma-prefill makes commitEdit ABORT via cancelEdit (returns false, editState nulled), and the
+	// abandoned key must still NAVIGATE (Enter moves down, Tab right) + refocus the grid, mirroring
+	// the known-bad arm above. A `false` with the editor STILL OPEN is the over-limit local reject
+	// (its 'edit' banner owns the story; the editor keeps focus for shortening) -- no nav then.
+	const fromRow = editState.row;
+	const fromCol = editState.col;
+	const committed = commitEdit(vec); // Enter = commit + down; Tab = commit + right (Shift+Tab left)
+	if (!committed && editState === null) {
+		setActiveClamped(fromRow + vec.dr, fromCol + vec.dc);
+		redraw();
+		viewportEl.focus();
+	}
 }
 function onEditBlur(ev: FocusEvent): void {
 	// **FE-2-0 polish (2026-06-05)**: blur COMMITS a changed value (Excel: clicking / Tabbing away saves
@@ -3896,14 +3937,31 @@ function stepFind(dir: number): void {
 	if (findMatches.length === 0) {
 		return;
 	}
-	findIndex = (findIndex + dir + findMatches.length) % findMatches.length;
-	gotoFindMatch();
-	updateFindCount();
+	// Round-5 audit (lane B HIGH): the find bar's prev/next buttons preventDefault their mousedown, so an
+	// OPEN editor keeps focus through the click -- stepping must resolve it first (cancel-if-unchanged
+	// / commit-and-queue), exactly like every other chrome action, or the jump moves the selection out
+	// from under it. With no editor this runs synchronously (the common case).
+	resolveEditThen({
+		kind: 'chrome',
+		label: 'Find next',
+		run: () => {
+			findIndex = (findIndex + dir + findMatches.length) % findMatches.length;
+			gotoFindMatch();
+			updateFindCount();
+		},
+	});
 }
 
 function gotoFindMatch(): void {
 	const m = findMatches[findIndex];
 	if (m === undefined) {
+		return;
+	}
+	// Round-5 audit (lane B HIGH, the narrow window): never move the selection while an editor exists
+	// (a PENDING one survives the find input's focus-steal blur -- onEditBlur early-returns on
+	// pendingCommit). The match list + count still update; the jump simply doesn't happen until the
+	// editor resolves and the user steps again.
+	if (editState !== null) {
 		return;
 	}
 	anchor = null;
@@ -4231,6 +4289,13 @@ function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean)
 					'transient',
 				);
 			}
+		}
+		// Round-5 audit (lanes A+B MED): the find bar's matches are coordinates on the PREVIOUS sheet --
+		// stepping them on the new sheet would jump the selection to stale cross-sheet coordinates and
+		// the "N of M" count would lie. Close it (only if it is actually open, so a sheet change never
+		// steals focus through closeFindBar's viewport refocus when find was never used).
+		if (findBarEl !== null && findBarEl.classList.contains('is-visible')) {
+			closeFindBar();
 		}
 		// Sheet-tabs (2026-06-10): a switch to a DIFFERENT sheet resets the active cell to A1 and scrolls to
 		// the top-left, so the new sheet never inherits the previous sheet's selection or scroll (the
