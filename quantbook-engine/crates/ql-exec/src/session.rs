@@ -8573,6 +8573,59 @@ mod tests {
         );
     }
 
+    /// **CROSS-SHEET on the owning session (megaudit L2 closure).** A formula
+    /// on Sheet2 that references Sheet1!A3 must, when a row is inserted on
+    /// Sheet1, have its TEXT rewritten (Sheet1!A3 → Sheet1!A4) while its own
+    /// POSITION on Sheet2 stays put (Sheet2 was not edited). This is the exact
+    /// "correct in one session class but broken in the path the product runs
+    /// on" blind spot that left insert/delete a no-op on the owning Session —
+    /// so it is pinned here against the REAL `WorkbookSession`, not a mock.
+    #[test]
+    fn owning_session_insert_rows_repoints_cross_sheet_ref_and_keeps_position() {
+        let mut s = WorkbookSession::new();
+        let s1 = s.add_sheet("Sheet1", 16384).unwrap();
+        let s2 = s.add_sheet("Sheet2", 16384).unwrap();
+        // Sheet1: A1=10 (row0), A3=30 (row2). Sheet2: B1 = `=Sheet1!A3*10` → 300.
+        s.set_value(addr(s1, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_value(addr(s1, 2, 0), CellValue::Number { number: 30.0 })
+            .unwrap();
+        s.set_formula(addr(s2, 0, 1), "Sheet1!A3*10").unwrap();
+        let b1 = s.cell(addr(s2, 0, 1)).unwrap().unwrap();
+        assert_eq!(b1.value, Some(CellValue::Number { number: 300.0 }));
+        let pre = b1.formula.as_deref().unwrap().to_string();
+        assert!(pre.contains("A3"), "precondition: ref is to A3, got {pre:?}");
+
+        // Insert a blank row at index 1 on SHEET1. Sheet1!A3(30) → Sheet1!A4.
+        s.insert_rows(s1, 1, 1).unwrap();
+
+        // Sheet1 side moved: old A3 (row2) blank, value 30 now at A4 (row3).
+        assert!(
+            s.cell(addr(s1, 2, 0)).unwrap().is_none(),
+            "Sheet1 A3 (row2) must be vacated"
+        );
+        assert_eq!(
+            s.cell(addr(s1, 3, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 30.0 }),
+            "Sheet1 value 30 must move A3 → A4"
+        );
+        // Sheet2's formula cell did NOT move (Sheet2 was not the edited sheet),
+        // but its TEXT followed the cross-sheet ref (A3 → A4), and it recomputes
+        // to 300 against the moved Sheet1!A4. A stale ref would read the now-blank
+        // Sheet1!A3 → 0 (the silent cross-sheet corruption).
+        let b1_after = s.cell(addr(s2, 0, 1)).unwrap().unwrap();
+        let post = b1_after.formula.as_deref().unwrap().to_string();
+        assert!(
+            post.contains("A4") && !post.contains("A3"),
+            "cross-sheet ref text must follow A3 → A4 (no longer stale); got {post:?}"
+        );
+        assert_eq!(
+            b1_after.value,
+            Some(CellValue::Number { number: 300.0 }),
+            "cross-sheet formula must recompute to 300 against the moved Sheet1!A4"
+        );
+    }
+
     /// Delete the inserted row to shift everything back: the inverse of the
     /// insert test. The formula ref must follow the cell back (A4 → A3).
     #[test]
