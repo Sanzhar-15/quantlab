@@ -185,10 +185,19 @@ body {
 	padding: 4px 8px;
 	background: var(--vscode-editor-background);
 	border-bottom: 1px solid var(--vscode-panel-border);
+	/* Round 5 (2026-06-10): keep horizontal scrollability for a narrow window, but HIDE the scrollbar --
+	 * a visible scrollbar across a spreadsheet toolbar reads cheap (Codex design finding). At a normal demo
+	 * width the whole bar fits; on a narrow window it scrolls (trackpad/shift-wheel) with no ugly track. */
 	overflow-x: auto;
 	overflow-y: hidden;
+	scrollbar-width: none; /* Firefox */
 	white-space: nowrap;
 	user-select: none;
+}
+
+/* Round 5: hide the WebKit/Chromium toolbar scrollbar (see .cell-grid-toolbar above). */
+.cell-grid-toolbar::-webkit-scrollbar {
+	display: none;
 }
 
 .cgt-btn {
@@ -461,7 +470,8 @@ body {
 	 * overflow auto, the viewport takes exactly the free space and scrolls internally. */
 	flex: 1 1 0%;
 	min-height: 0;
-	border-top: 1px solid var(--vscode-panel-border);
+	/* Round 5 (2026-06-10): the viewport's border-top was removed -- the formula bar already carries a
+	 * border-bottom, so the two stacked to a DOUBLE line under the formula row (Codex design finding). */
 	border-bottom: 1px solid var(--vscode-panel-border);
 }
 
@@ -486,9 +496,11 @@ body {
 	position: absolute;
 	z-index: 2;
 	box-sizing: border-box;
-	/* Match the canvas value font (--vscode-font-family @ 12px) so text doesn't shift on edit entry. */
+	/* Match the canvas value font so text doesn't shift on edit entry. Round 5 (2026-06-10): the canvas
+	 * body font is 13px (canvasGrid.readFonts, Sheets retheme) but this stayed 12px, so a cell's text
+	 * visibly shrank the instant you started editing it (Codex font-fidelity finding). Bumped to 13px. */
 	font-family: var(--vscode-font-family);
-	font-size: 12px;
+	font-size: 13px;
 	color: var(--vscode-input-foreground);
 	background: var(--vscode-input-background);
 	border: 1px solid var(--vscode-focusBorder);
@@ -612,5 +624,155 @@ body {
  * tab strip's right-click menu and the chrome dropdowns read as one product. */
 .cell-grid-tab-menu-item:hover {
 	color: inherit;
+	background: var(--ql-accent-muted);
+}
+
+/* --- Round 5 (2026-06-10): client-side cell styling chrome --------------------------------------- */
+
+/* The text/fill color swatch popover. Shares the dropdown's surface treatment (.qb-menu-dropdown) but
+ * lays the swatches out in a grid; tracked via the same `dropdownEl`/`openMenu` lifecycle so the
+ * capture-phase click-away + window-blur + Escape all dismiss it. */
+.qb-color-popover {
+	position: fixed;
+	z-index: 1000;
+	padding: 8px;
+	background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+	color: var(--vscode-menu-foreground, var(--vscode-foreground));
+	border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border));
+	border-radius: 4px;
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.36);
+}
+
+.qb-swatch-grid {
+	display: grid;
+	grid-template-columns: repeat(9, 18px);
+	gap: 4px;
+}
+
+.qb-swatch {
+	width: 18px;
+	height: 18px;
+	padding: 0;
+	border: 1px solid var(--vscode-menu-border, rgba(127, 127, 127, 0.5));
+	border-radius: 3px;
+	cursor: pointer;
+}
+
+.qb-swatch:hover {
+	outline: 2px solid var(--ql-accent);
+	outline-offset: 1px;
+}
+
+/* The "Automatic" / "No fill" reset row under the swatch grid. */
+.qb-color-reset {
+	display: block;
+	width: 100%;
+	margin-top: 8px;
+	padding: 5px 8px;
+	text-align: center;
+	font-family: var(--vscode-font-family);
+	font-size: 12px;
+	color: inherit;
+	background: transparent;
+	border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border));
+	border-radius: 3px;
+	cursor: pointer;
+}
+
+.qb-color-reset:hover {
+	background: var(--ql-accent-muted);
+}
+
+/* Subtle, auto-dismissing toast for intentionally preview-only controls (honest no-silent-no-op).
+ * Bottom-right, neutral (NOT the red error banner), fades via opacity. */
+.qb-preview-toast {
+	position: fixed;
+	right: 16px;
+	bottom: 40px;
+	z-index: 1200;
+	max-width: 320px;
+	padding: 8px 14px;
+	font-family: var(--vscode-font-family);
+	font-size: 12px;
+	color: var(--vscode-notifications-foreground, var(--vscode-foreground));
+	background: var(--vscode-notifications-background, var(--vscode-editorWidget-background));
+	border: 1px solid var(--vscode-notifications-border, var(--vscode-panel-border));
+	border-radius: 5px;
+	box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+	opacity: 0;
+	transform: translateY(6px);
+	transition: opacity 120ms ease, transform 120ms ease;
+	pointer-events: none;
+}
+
+.qb-preview-toast.is-visible {
+	opacity: 1;
+	transform: translateY(0);
+}
+
+/* Round 5 (2026-06-10): in-sheet Find bar -- floats at the top-right of the grid (Sheets/Chrome find UX). */
+.qb-find-bar {
+	position: fixed;
+	top: 92px;
+	right: 18px;
+	z-index: 1100;
+	display: none;
+	align-items: center;
+	gap: 4px;
+	padding: 5px 6px;
+	background: var(--vscode-editorWidget-background, var(--vscode-menu-background));
+	color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+	border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+	border-radius: 5px;
+	box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+}
+
+.qb-find-bar.is-visible {
+	display: flex;
+}
+
+.qb-find-input {
+	width: 180px;
+	padding: 3px 6px;
+	font-family: var(--vscode-font-family);
+	font-size: 12px;
+	color: var(--vscode-input-foreground, var(--vscode-foreground));
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: 3px;
+	outline: none;
+}
+
+.qb-find-input:focus {
+	border-color: var(--ql-accent);
+}
+
+.qb-find-count {
+	min-width: 56px;
+	padding: 0 4px;
+	font-family: var(--vscode-font-family);
+	font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+	text-align: center;
+	white-space: nowrap;
+}
+
+.qb-find-btn {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 22px;
+	height: 22px;
+	padding: 0;
+	font-size: 13px;
+	line-height: 1;
+	color: inherit;
+	background: transparent;
+	border: none;
+	border-radius: 3px;
+	cursor: pointer;
+}
+
+.qb-find-btn:hover {
 	background: var(--ql-accent-muted);
 }

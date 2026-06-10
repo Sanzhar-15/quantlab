@@ -60,6 +60,7 @@ import { CanvasGridRenderer, type ActiveCell, type PublishedRange } from './canv
 import { ICONS } from './icons';
 import { staleTintKeysA1 } from './gridBlitA1';
 import { pasteAreaMismatch, planFill, planPaste, type GridClipboard } from './clipboardLogic';
+import { CellStyleStore, MAX_STYLE_CELLS, type StyleRect, type StyleToggle } from './cellStyleModel';
 // Sheet-tabs (2026-06-10): the Excel-style bottom tab strip (presentation only; the host owns mutation).
 import { renderSheetTabs, type SheetTabHandlers, type SheetTabInfo } from './sheetTabBar';
 // W3 (Wave 3): the pure data-vscode-context payload builder for the native right-click context menu.
@@ -440,7 +441,10 @@ function startFunctionInsert(fnName: string): void {
 		return;
 	}
 	const prefill = '=' + fnName + '(';
-	beginEdit(active.row, active.col, prefill);
+	// Pass the prefill as BOTH the editor's initial value AND its abort-baseline: if the presenter picks a
+	// function then clicks/navigates away without completing it, commitEdit aborts rather than writing the
+	// incomplete `=SUM(` (which would render a visible #ERROR mid-demo -- round-5 audit stability finding).
+	beginEdit(active.row, active.col, prefill, prefill);
 	if (editState === null || editState.surface !== 'overlay') {
 		// beginEdit declined (a commit raced in between the guard's resolution and this run, or the
 		// snapshot vanished). The guard's banners/M8 path own the user-facing story for the race; this
@@ -872,12 +876,51 @@ toolbarEl.addEventListener('click', (e) => {
 				openMenuDropdown(btn, DELETE_ROW_COL_ITEMS, null);
 			}
 			return;
+		// **Round 5 (2026-06-10) -- the toolbar's style controls are now REAL** (client-side render-layer
+		// styling; the engine has no style model, so these paint via `styleStore` + the canvas, scoped to
+		// the session). Each routes through `runAfterResolvingEdit` like every other mutating chrome action
+		// (resolve the open editor first), operates on the active selection (or active cell), and toggles
+		// with Excel/Sheets semantics (B/I/U/S flip the whole selection off only if ALL cells already on).
+		case 'bold':
+			runAfterResolvingEdit('Bold', () => toggleSelectionStyle('bold'));
+			return;
+		case 'italic':
+			runAfterResolvingEdit('Italic', () => toggleSelectionStyle('italic'));
+			return;
+		case 'underline':
+			runAfterResolvingEdit('Underline', () => toggleSelectionStyle('underline'));
+			return;
+		case 'strikethrough':
+			runAfterResolvingEdit('Strikethrough', () => toggleSelectionStyle('strike'));
+			return;
+		case 'align-left':
+			runAfterResolvingEdit('Align left', () => applyStyleToSelection((sheet, rect) => styleStore.setAlign(sheet, rect, 'left')));
+			return;
+		case 'align-center':
+			runAfterResolvingEdit('Align center', () => applyStyleToSelection((sheet, rect) => styleStore.setAlign(sheet, rect, 'center')));
+			return;
+		case 'align-right':
+			runAfterResolvingEdit('Align right', () => applyStyleToSelection((sheet, rect) => styleStore.setAlign(sheet, rect, 'right')));
+			return;
+		case 'text-color':
+			// The swatch popover opens immediately (a picker, not a mutation); the chosen swatch resolves
+			// the editor + applies. Toggle-closes if already open on this anchor.
+			openColorPicker(btn, 'textColor');
+			return;
+		case 'fill-color':
+			openColorPicker(btn, 'fillColor');
+			return;
+		case 'search':
+			// Round 5: the (previously dead) Search button opens the in-sheet find bar -- the audit's #1
+			// cheap, high-credibility wiring.
+			openFindBar();
+			return;
 		default:
-			// Visual-only buttons (print / paint-format / zoom / the decimal pair / font family+size /
-			// bold / italic / underline / strikethrough / colors / borders / merge / align / vertical-
-			// align / wrap / filter / sort / search): engine-greenfield style ops land in FE-4/FE-5; the
-			// operator chose look-complete over hide-incomplete. Deliberately a quiet no-op -- no error,
-			// no handler, zero console output.
+			// Still visual-only (print / paint-format / zoom / decimal pair / font family+size / borders /
+			// merge / vertical-align / wrap / filter / sort / search): genuinely engine-greenfield or
+			// out-of-scope for this preview. Surfaced honestly via a neutral "preview" toast rather than a
+			// silent no-op (the round-5 audit's #1 finding -- a click that does nothing reads as fake).
+			notifyPreviewOnly(btn.getAttribute('title') ?? 'This control');
 			return;
 	}
 });
@@ -948,7 +991,173 @@ function clearTransientError(): void {
 	}
 }
 
+// **Round 5 (2026-06-10)** -- a subtle, auto-dismissing toast for controls that are intentionally
+// preview-only (engine-greenfield / out-of-scope: print, paint-format, borders, merge, wrap, filter,
+// sort, font selects, decimals, zoom). Surfaces the gap HONESTLY (No-Fallbacks: never a silent no-op,
+// the round-5 audit's #1 finding) while staying unobtrusive -- bottom-right, neutral, fades after ~1.6s,
+// one at a time. Distinct from the red `errorEl` banner (reserved for genuine errors / pending-edit).
+let previewToastEl: HTMLDivElement | null = null;
+let previewToastTimer: ReturnType<typeof setTimeout> | undefined;
+function notifyPreviewOnly(label: string): void {
+	if (previewToastEl === null) {
+		previewToastEl = document.createElement('div');
+		previewToastEl.className = 'qb-preview-toast';
+		previewToastEl.setAttribute('role', 'status');
+		document.body.appendChild(previewToastEl);
+	}
+	const name = label.replace(/\s*\([^)]*\)\s*$/, '').trim(); // strip a "(Ctrl+...)" suffix from the title
+	previewToastEl.textContent = (name.length > 0 ? name : 'This control') + ' is not available in this preview yet.';
+	previewToastEl.classList.add('is-visible');
+	if (previewToastTimer !== undefined) {
+		clearTimeout(previewToastTimer);
+	}
+	previewToastTimer = setTimeout(() => {
+		if (previewToastEl !== null) {
+			previewToastEl.classList.remove('is-visible');
+		}
+	}, 1600);
+}
+
+// **Round 5 (2026-06-10) -- global error net (audit finding C1).** The render path is already validated
+// (isValidSnapshot + per-entry isRenderableEntry), but ANY uncaught throw in a hot pointer/keyboard
+// handler would otherwise leave the canvas mid-frame with NO user signal -- a silently dead grid in the
+// middle of a live demo, indistinguishable from "still working". Surface it as a transient banner +
+// console.error so the presenter sees recovery guidance instead of a frozen grid. Defensive only: no
+// normal path throws uncaught (this is the insurance, not a load-bearing handler).
+window.addEventListener('error', (e) => {
+	console.error('[sheets-webview] uncaught error:', e.error ?? e.message);
+	showError('The grid hit an unexpected error -- press Cmd/Ctrl+R to reload if it stops responding.', 'transient');
+});
+window.addEventListener('unhandledrejection', (e) => {
+	console.error('[sheets-webview] unhandled promise rejection:', e.reason);
+	showError('The grid hit an unexpected error -- press Cmd/Ctrl+R to reload if it stops responding.', 'transient');
+});
+
 const renderer = new CanvasGridRenderer(canvasEl);
+
+// **Round 5 (2026-06-10) -- client-side cell styling.** The webview-owned per-cell visual style map
+// (bold/italic/underline/strike/halign/text+fill color). The engine has NO style model, so this is the
+// sole source of cell styling; it persists in `vscode.setState` (survives a Reload Window this session)
+// but is NOT written to the .qnb file -- a documented session-scoped render-layer feature (FE-4 will
+// engine-back it). The renderer reads it via a bound lookup that closes over the live `fullSnapshot.sheet`
+// (set just below `fullSnapshot`'s declaration, since the closure references it).
+const styleStore = CellStyleStore.deserialize(readPersistedStyles());
+
+/** Read the persisted `cellStyles` blob from the webview state (or undefined if absent/foreign). */
+function readPersistedStyles(): unknown {
+	const raw = vscode.getState();
+	if (typeof raw === 'object' && raw !== null) {
+		return (raw as { cellStyles?: unknown }).cellStyles;
+	}
+	return undefined;
+}
+
+/** Persist the style map back into the webview state, preserving any other state keys. */
+function persistStyles(): void {
+	const prev = vscode.getState();
+	const base = typeof prev === 'object' && prev !== null ? (prev as Record<string, unknown>) : {};
+	vscode.setState({ ...base, cellStyles: styleStore.serialize() });
+}
+
+/** The rect a style op applies to: the active range, or the single active cell. `null` when there is
+ *  no active cell / snapshot (nothing to style). */
+function styleTargetRect(): StyleRect | null {
+	if (fullSnapshot === null || active === null) {
+		return null;
+	}
+	const sel = currentSelection();
+	return sel ?? { minRow: active.row, maxRow: active.row, minCol: active.col, maxCol: active.col };
+}
+
+/** Apply a style mutation to the current selection, then persist + redraw. Clamps a giant (whole-axis)
+ *  selection to {@link MAX_STYLE_CELLS} with a loud warn (No-Fallbacks: never silently truncate). */
+function applyStyleToSelection(mutate: (sheet: number, rect: StyleRect) => void): void {
+	const raw = styleTargetRect();
+	if (raw === null || fullSnapshot === null) {
+		return;
+	}
+	const { rect, clamped } = CellStyleStore.clampRect(raw);
+	if (clamped) {
+		console.warn('[sheets-webview] style op clamped to ' + MAX_STYLE_CELLS + ' cells (selection too large)');
+	}
+	mutate(fullSnapshot.sheet, rect);
+	persistStyles();
+	redraw();
+}
+
+/** Toggle a boolean style (bold/italic/underline/strike) over the current selection. */
+function toggleSelectionStyle(prop: StyleToggle): void {
+	applyStyleToSelection((sheet, rect) => {
+		styleStore.toggleBool(sheet, rect, prop);
+	});
+}
+
+/** Sheets-like color palette for the text/fill swatch popover (greys row + a hue row incl. brand orange). */
+const COLOR_SWATCHES: readonly string[] = [
+	'#000000', '#434343', '#666666', '#999999', '#b7b7b7', '#cccccc', '#d9d9d9', '#efefef', '#ffffff',
+	'#e6194b', '#FF7331', '#f1c232', '#6aa84f', '#45818e', '#3d85c6', '#674ea7', '#a64d79', '#cc4125',
+];
+
+/**
+ * Open the text/fill color swatch popover anchored under `anchor`. Reuses the shared dropdown lifecycle
+ * (tracked via `dropdownEl`/`openMenu` so the capture-phase click-away + window-blur + Escape all close
+ * it); `items` is empty so the arrow-key menu nav is a no-op. Each swatch + the reset row applies through
+ * `runAfterResolvingEdit` (consistency with every other mutating chrome action).
+ */
+function openColorPicker(anchor: HTMLElement, which: 'textColor' | 'fillColor'): void {
+	if (openMenu !== null && openMenu.anchor === anchor) {
+		closeMenuDropdown();
+		return;
+	}
+	closeMenuDropdown();
+	const panel = document.createElement('div');
+	panel.className = 'qb-color-popover';
+	panel.setAttribute('role', 'menu');
+	const grid = document.createElement('div');
+	grid.className = 'qb-swatch-grid';
+	for (const color of COLOR_SWATCHES) {
+		const b = document.createElement('button');
+		b.type = 'button';
+		b.className = 'qb-swatch';
+		b.style.background = color;
+		b.title = color;
+		b.setAttribute('aria-label', (which === 'fillColor' ? 'Fill color ' : 'Text color ') + color);
+		b.addEventListener('mousedown', (ev) => ev.preventDefault());
+		b.addEventListener('click', () => {
+			closeMenuDropdown();
+			runAfterResolvingEdit(which === 'fillColor' ? 'Fill color' : 'Text color', () =>
+				applyStyleToSelection((sheet, rect) => styleStore.setColor(sheet, rect, which, color)),
+			);
+		});
+		grid.appendChild(b);
+	}
+	panel.appendChild(grid);
+	const reset = document.createElement('button');
+	reset.type = 'button';
+	reset.className = 'qb-menu-item qb-color-reset';
+	reset.textContent = which === 'fillColor' ? 'No fill' : 'Automatic';
+	reset.addEventListener('mousedown', (ev) => ev.preventDefault());
+	reset.addEventListener('click', () => {
+		closeMenuDropdown();
+		runAfterResolvingEdit(which === 'fillColor' ? 'No fill' : 'Automatic text', () =>
+			applyStyleToSelection((sheet, rect) => styleStore.setColor(sheet, rect, which, null)),
+		);
+	});
+	panel.appendChild(reset);
+	const rect = anchor.getBoundingClientRect();
+	panel.style.top = rect.bottom + 2 + 'px';
+	document.body.appendChild(panel);
+	const left = Math.min(rect.left, Math.max(4, window.innerWidth - panel.offsetWidth - 4));
+	panel.style.left = left + 'px';
+	dropdownEl = panel;
+	openMenu = { anchor, menuId: null, items: [], itemEls: [], activeIndex: -1 };
+	anchor.classList.add('is-open');
+	anchor.setAttribute('aria-expanded', 'true');
+}
+
+// Bind the renderer's per-cell style lookup ONCE: it reads the live `fullSnapshot.sheet`, so a sheet
+// switch (which replaces `fullSnapshot`) needs no rebind. A style edit calls `redraw()` directly.
+renderer.setStyleLookup((row, col) => (fullSnapshot === null ? undefined : styleStore.get(fullSnapshot.sheet, row, col)));
 
 let fullSnapshot: QuantbookCellSnapshot | null = null;
 // "row,col" -> "[code] message" for cells whose last edit failed (errorReply). Map preserves the
@@ -1011,6 +1220,11 @@ interface EditState {
 	// PRIOR content (NOT the injected char -- megaudit MED-1), or the {@link OVERSIZE_BASELINE} sentinel when
 	// the prior content is over the editable cap (so it is never built/held).
 	readonly initialValue: string;
+	// **Round 5 (2026-06-10)** -- set ONLY for a Sigma-functions prefill insert (e.g. `"=SUM("`). If the editor
+	// is committed while its value is STILL exactly this untouched prefill (the presenter picked a function
+	// then navigated away without completing the range), the commit is aborted instead of writing an
+	// incomplete formula that the engine would surface as a visible #ERROR. Undefined for every normal edit.
+	readonly prefillBaseline?: string;
 	pendingCommit: boolean;
 	// FE-2-0 Phase 2 (commit-token): the unique id of THIS in-flight commit, stamped by commitEdit and
 	// echoed by the host in `commitResult` (success) / `errorReply` (failure). Replaces the FE megaudit
@@ -1717,6 +1931,42 @@ function copyGridSelection(isCut: boolean): void {
 		return;
 	}
 	gridClipboard = clip;
+	// Round 5: ALSO write the selection to the OS clipboard as TSV (display values), so a Quantbook copy
+	// can paste into Excel / Google Sheets / Numbers. The internal clipboard above stays the source of
+	// truth for an in-grid paste (it preserves formula-ref translation + the cut-move); the OS write is
+	// the cross-app bridge only.
+	writeOsClipboard(buildSelectionTsv(top, left, rows, cols));
+}
+
+/** Build a TSV block of the DISPLAY values over a rect (Excel pastes shown text, not formulas). Tabs and
+ *  newlines inside a cell are flattened to spaces so they cannot corrupt the row/column structure. */
+function buildSelectionTsv(top: number, left: number, rows: number, cols: number): string {
+	const lines: string[] = [];
+	for (let r = 0; r < rows; r += 1) {
+		const rowCells: string[] = [];
+		for (let c = 0; c < cols; c += 1) {
+			const e = renderer.entryAt(top + r, left + c);
+			const disp = e === undefined ? '' : typeof e.rendered === 'string' ? e.rendered : formatCellValue(e.value);
+			rowCells.push(disp.replace(/[\t\r\n]+/g, ' '));
+		}
+		lines.push(rowCells.join('\t'));
+	}
+	return lines.join('\n');
+}
+
+/** Write text to the OS clipboard. The OS clipboard is a SYSTEM BOUNDARY: a permission denial / absent API
+ *  must not break the internal copy that already succeeded -- log it (No-Fallbacks: never silently swallow)
+ *  and continue. */
+function writeOsClipboard(text: string): void {
+	try {
+		const clip = navigator.clipboard;
+		if (clip === undefined) {
+			return;
+		}
+		clip.writeText(text).catch((err) => console.warn('[sheets-webview] OS clipboard write failed:', err));
+	} catch (err) {
+		console.warn('[sheets-webview] OS clipboard write threw:', err);
+	}
 }
 
 /**
@@ -1751,6 +2001,12 @@ function applyFill(): boolean {
 	if (fillRows <= srcRows && fillCols <= srcCols) {
 		return false; // no extension
 	}
+	// Round 5 (audit stability): cap the fill target BEFORE planFill builds the array (mirrors the paste cap +
+	// the host's MAX_BATCH_CELLS) so an autoscroll-extended fill can't construct an unbounded cell array.
+	if (fillRows * fillCols > MAX_PUT_CELLS) {
+		showError('That fill area is too large (' + (fillRows * fillCols).toLocaleString() + ' cells; the limit is ' + MAX_PUT_CELLS.toLocaleString() + '). Drag a smaller range.', 'transient');
+		return false;
+	}
 	const clip = readRectClipboard(src.minRow, src.minCol, srcRows, srcCols, false);
 	if (clip === null) {
 		showError('A cell in the fill source is too large to fill; nothing was filled.', 'transient');
@@ -1774,8 +2030,18 @@ function applyFill(): boolean {
  * the host validates extent + applies). A cut is consumed by its paste (move): the clipboard is cleared so
  * a second paste does not re-clear the -- now moved -- source. No-op when nothing is on the clipboard.
  */
+// **Round 5 (2026-06-10)** -- webview-side cell cap for paste + fill, mirroring the host's MAX_BATCH_CELLS
+// (cellGridLogic). Preflighted BEFORE planPaste/planFill builds the array (audit stability finding).
+const MAX_PUT_CELLS = 100_000;
 function pasteGridClipboard(): void {
-	if (fullSnapshot === null || active === null || gridClipboard === null) {
+	if (fullSnapshot === null || active === null) {
+		return;
+	}
+	// Round 5: with no internal Quantbook clipboard, paste from the OS clipboard (TSV from Excel / Sheets /
+	// Numbers). A Quantbook copy populates BOTH, so the internal path below wins for in-grid paste (formula
+	// refs + cut-move); the OS path is the cross-app bridge for data that originated elsewhere.
+	if (gridClipboard === null) {
+		pasteFromOsClipboard();
 		return;
 	}
 	// megaudit HIGH: a CUT moves cells, clearing the SOURCE. The source clears are posted to the current
@@ -1796,6 +2062,13 @@ function pasteGridClipboard(): void {
 		showError('Cannot paste: the copy and paste areas are not the same size. Select a single cell, or a selection that is a whole multiple of the copied block.', 'transient');
 		return;
 	}
+	// Round 5 (audit stability): cap the paste target BEFORE planPaste builds the cell array, so a paste into
+	// a whole-column/whole-sheet selection can't freeze the webview constructing 1M+ cells only for the host
+	// to reject them past its own cap. Mirrors the host's MAX_BATCH_CELLS; loud, never a silent truncation.
+	if (selRows * selCols > MAX_PUT_CELLS) {
+		showError('That paste area is too large (' + (selRows * selCols).toLocaleString() + ' cells; the limit is ' + MAX_PUT_CELLS.toLocaleString() + '). Select a smaller range.', 'transient');
+		return;
+	}
 	const cells = planPaste(gridClipboard, selTop, selLeft, selRows, selCols);
 	if (cells.length === 0) {
 		return;
@@ -1805,6 +2078,68 @@ function pasteGridClipboard(): void {
 	if (gridClipboard.isCut) {
 		gridClipboard = null;
 	}
+}
+
+/** Parse an OS-clipboard TSV block into a row-major grid of cell strings (tab = column, newline = row). */
+function parseTsv(text: string): string[][] {
+	const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+	const lines = normalized.split('\n');
+	// A trailing newline yields a final empty line -- drop it so paste height matches the visible block.
+	if (lines.length > 1 && lines[lines.length - 1] === '') {
+		lines.pop();
+	}
+	return lines.map((line) => line.split('\t'));
+}
+
+/**
+ * Paste from the OS clipboard (TSV) at the active cell. The OS clipboard is a SYSTEM BOUNDARY: `readText`
+ * is permission-gated + async, so failures are caught + logged (No-Fallbacks exception: a system boundary)
+ * and degrade to a no-op (the prior behavior when nothing was on the internal clipboard). Pasted cells are
+ * LITERAL strings -- a pasted "=SUM(A1:A2)" becomes a formula (host parses rawInput), numbers become
+ * numbers, exactly as typing them would.
+ */
+function pasteFromOsClipboard(): void {
+	const clip = navigator.clipboard;
+	if (clip === undefined || fullSnapshot === null || active === null) {
+		return;
+	}
+	clip
+		.readText()
+		.then((text) => {
+			if (typeof text !== 'string' || text.length === 0 || fullSnapshot === null || active === null) {
+				return;
+			}
+			const grid = parseTsv(text);
+			const rows = grid.length;
+			const cols = grid.reduce((m, r) => Math.max(m, r.length), 0);
+			if (rows === 0 || cols === 0) {
+				return;
+			}
+			if (rows * cols > MAX_PUT_CELLS) {
+				showError('That paste is too large (' + (rows * cols).toLocaleString() + ' cells; the limit is ' + MAX_PUT_CELLS.toLocaleString() + ').', 'transient');
+				return;
+			}
+			const top = active.row;
+			const left = active.col;
+			const cells: { row: number; col: number; rawInput: string }[] = [];
+			for (let r = 0; r < rows; r += 1) {
+				for (let c = 0; c < grid[r].length; c += 1) {
+					if (top + r < MAX_ROWS && left + c < MAX_COLS) {
+						cells.push({ row: top + r, col: left + c, rawInput: grid[r][c] });
+					}
+				}
+			}
+			if (cells.length === 0) {
+				return;
+			}
+			vscode.postMessage({ type: 'putCells', sheet: fullSnapshot.sheet, cells, undoLabel: 'Paste', webviewId: WEBVIEW_ID });
+			// Select the pasted block (anchor at the origin, focus at the bottom-right).
+			anchor = { row: top, col: left };
+			active = { row: clampRow(top + rows - 1), col: clampCol(left + cols - 1) };
+			ensureActiveVisible();
+			redraw();
+		})
+		.catch((err) => console.warn('[sheets-webview] OS clipboard read failed:', err));
 }
 
 /** **Megaudit (B2)** -- the selection delta for a commit/nav key, or `null` for any other key. Enter and
@@ -1954,7 +2289,7 @@ function updateFormulaBar(): void {
 }
 
 /** Open the editor over (row,col). `initialChar` (type-to-edit) replaces the cell content. */
-function beginEdit(row: number, col: number, initialChar?: string): void {
+function beginEdit(row: number, col: number, initialChar?: string, prefillBaseline?: string): void {
 	if (fullSnapshot === null) {
 		return;
 	}
@@ -2006,7 +2341,7 @@ function beginEdit(row: number, col: number, initialChar?: string): void {
 	inputEl.value = prefill;
 	inputEl.hidden = false;
 	inputEl.style.clipPath = ''; // FE-2-0 polish: start unclipped; updateEditClip below sets it for this cell
-	editState = { editEl: inputEl, surface: 'overlay', sheet: fullSnapshot.sheet, row, col, entry, initialValue, pendingCommit: false };
+	editState = { editEl: inputEl, surface: 'overlay', sheet: fullSnapshot.sheet, row, col, entry, initialValue, prefillBaseline, pendingCommit: false };
 	updateEditClip(); // FE-2-0 polish: clip to the body pane (the cell may open partly under a sticky band)
 	inputEl.focus();
 	if (initialChar === undefined) {
@@ -2593,6 +2928,13 @@ function commitEdit(nav?: { dr: number; dc: number }): boolean {
 	// shorten) rather than serialize a multi-MB payload across the bridge for the host to reject anyway.
 	// W-G-1b: read from the live editor (`editEl` -- overlay or formula bar), the single committed source.
 	const editEl = editState.editEl;
+	// Round 5: an untouched Sigma-functions prefill ("=SUM(") must NOT commit -- it is an incomplete formula
+	// the engine would surface as a visible #ERROR. The user picked a function then left without completing
+	// it -> abort (close the editor, leave the cell unchanged). Covers Enter / Tab / blur / sheet-switch.
+	if (editState.prefillBaseline !== undefined && editEl.value === editState.prefillBaseline) {
+		cancelEdit();
+		return false;
+	}
 	if (editEl.value.length > MAX_RAW_INPUT_LENGTH) {
 		showError(
 			`Cell value is ${editEl.value.length} characters, over the ${MAX_RAW_INPUT_LENGTH}-character limit. ` +
@@ -3235,12 +3577,141 @@ canvasEl.addEventListener('mousemove', ev => {
 
 // --- Keyboard: navigation + type-to-edit + undo/redo (only when NOT editing) ---
 
+// ---- Round 5 (2026-06-10): in-sheet Find (Ctrl/Cmd+F + the toolbar Search button) --------------------
+// A floating find bar over the grid. Scans the CURRENT sheet's snapshot entries (display string AND the
+// underlying formula) for a case-insensitive substring, collects matches row-major, and jumps the
+// selection to each (Enter / Shift+Enter step; Escape closes). Webview-only -- the snapshot is already in
+// memory, so no host round-trip. Wiring the previously-dead Search button was the audit's #1 cheap win.
+let findBarEl: HTMLDivElement | null = null;
+let findInputEl: HTMLInputElement | null = null;
+let findCountEl: HTMLSpanElement | null = null;
+let findMatches: ActiveCell[] = [];
+let findIndex = -1;
+
+function buildFindBar(): void {
+	const bar = document.createElement('div');
+	bar.className = 'qb-find-bar';
+	const input = document.createElement('input');
+	input.className = 'qb-find-input';
+	input.type = 'text';
+	input.placeholder = 'Find in sheet';
+	input.setAttribute('aria-label', 'Find in sheet');
+	input.spellcheck = false;
+	const count = document.createElement('span');
+	count.className = 'qb-find-count';
+	const mkBtn = (glyph: string, title: string, onClick: () => void): HTMLButtonElement => {
+		const b = document.createElement('button');
+		b.type = 'button';
+		b.className = 'qb-find-btn';
+		b.title = title;
+		b.setAttribute('aria-label', title);
+		b.textContent = glyph;
+		b.addEventListener('mousedown', (e) => e.preventDefault());
+		b.addEventListener('click', onClick);
+		return b;
+	};
+	const prev = mkBtn('\u2191', 'Previous match (Shift+Enter)', () => stepFind(-1));
+	const next = mkBtn('\u2193', 'Next match (Enter)', () => stepFind(1));
+	const close = mkBtn('\u2715', 'Close (Esc)', () => closeFindBar());
+	bar.append(input, count, prev, next, close);
+	input.addEventListener('input', () => runFind(input.value));
+	input.addEventListener('keydown', (e) => {
+		if (e.key === 'Enter') {
+			e.preventDefault();
+			stepFind(e.shiftKey ? -1 : 1);
+		} else if (e.key === 'Escape') {
+			e.preventDefault();
+			closeFindBar();
+		}
+	});
+	document.body.appendChild(bar);
+	findBarEl = bar;
+	findInputEl = input;
+	findCountEl = count;
+}
+
+function openFindBar(): void {
+	if (findBarEl === null || findInputEl === null) {
+		buildFindBar();
+	}
+	if (findBarEl === null || findInputEl === null) {
+		return; // unreachable (buildFindBar sets both) -- keeps strict-null-checks happy without `!`
+	}
+	findBarEl.classList.add('is-visible');
+	findInputEl.focus();
+	findInputEl.select();
+	runFind(findInputEl.value);
+}
+
+function closeFindBar(): void {
+	if (findBarEl !== null) {
+		findBarEl.classList.remove('is-visible');
+	}
+	findMatches = [];
+	findIndex = -1;
+	viewportEl.focus();
+}
+
+function runFind(queryRaw: string): void {
+	const q = queryRaw.trim().toLowerCase();
+	findMatches = [];
+	findIndex = -1;
+	if (q.length > 0 && fullSnapshot !== null) {
+		for (const e of fullSnapshot.entries) {
+			const disp = (typeof e.rendered === 'string' ? e.rendered : formatCellValue(e.value)).toLowerCase();
+			const formula = typeof e.formula === 'string' ? e.formula.toLowerCase() : '';
+			if (disp.includes(q) || formula.includes(q)) {
+				findMatches.push({ row: e.row, col: e.col });
+			}
+		}
+		findMatches.sort((a, b) => a.row - b.row || a.col - b.col);
+		if (findMatches.length > 0) {
+			findIndex = 0;
+			gotoFindMatch();
+		}
+	}
+	updateFindCount();
+}
+
+function stepFind(dir: number): void {
+	if (findMatches.length === 0) {
+		return;
+	}
+	findIndex = (findIndex + dir + findMatches.length) % findMatches.length;
+	gotoFindMatch();
+	updateFindCount();
+}
+
+function gotoFindMatch(): void {
+	const m = findMatches[findIndex];
+	if (m === undefined) {
+		return;
+	}
+	anchor = null;
+	active = { row: m.row, col: m.col };
+	ensureActiveVisible();
+	redraw();
+}
+
+function updateFindCount(): void {
+	if (findCountEl === null) {
+		return;
+	}
+	const q = findInputEl?.value.trim() ?? '';
+	findCountEl.textContent =
+		q.length === 0 ? '' : findMatches.length === 0 ? 'No results' : findIndex + 1 + ' of ' + findMatches.length;
+}
+
 document.addEventListener('keydown', ev => {
 	// W-G: the formula bar input is focusable (read-only, but selectable so a formula can be copied out).
 	// Its keystrokes bubble to this document handler -- ignore them, or arrows/Delete/printable keys would
 	// drive grid navigation / clear / type-to-edit on the active cell while the user is in the formula bar
 	// (Codex W-G HIGH). Copy (Ctrl+C of a selected formula) still works: the browser handles it natively.
 	if (ev.target === formulaInputEl) {
+		return;
+	}
+	// Round 5: the find bar owns its own keys (Enter/Shift+Enter/Esc) -- never drive grid nav from them.
+	if (findBarEl !== null && ev.target instanceof Node && findBarEl.contains(ev.target)) {
 		return;
 	}
 	if (editState !== null) {
@@ -3296,6 +3767,13 @@ document.addEventListener('keydown', ev => {
 		if (k === 'v') {
 			ev.preventDefault();
 			pasteGridClipboard();
+			return;
+		}
+		// Round 5: Ctrl/Cmd+F opens the in-sheet find bar (the VS Code editor find has no meaning over a
+		// canvas grid; this is the spreadsheet-native find every user reaches for).
+		if (k === 'f') {
+			ev.preventDefault();
+			openFindBar();
 			return;
 		}
 		// Excel nav keys (meta variants). Ctrl/Cmd+Home -> A1; Ctrl/Cmd+End -> the last used cell (snapshot

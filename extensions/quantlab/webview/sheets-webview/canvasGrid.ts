@@ -26,6 +26,7 @@
 
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { clampDisplayString, formatCellValue, isRenderableValue } from './cellRender';
+import type { CellStyle } from './cellStyleModel';
 import type { ScrollBlit } from './gridBlitA1';
 import {
 	COL_WIDTH,
@@ -104,11 +105,6 @@ const ACCENT_RANGE_FILL_ALPHA = 0.15;
 /** Very light gridline (`~#e0e0e0` on white) -- the Sheets gridline on a light theme. On a dark theme the
  * palette derives a faint low-contrast line from `--vscode-panel-border` instead (see readPalette). */
 const SHEETS_GRIDLINE_LIGHT = 'rgba(0,0,0,0.10)';
-
-/** Half the hit-test band (CSS px) around a header separator within which the cursor turns to
- * `col-resize` / `row-resize`. ~4px each side sells the resizable-column illusion even though resize is
- * not yet functional. */
-const RESIZE_HOVER_PX = 4;
 
 /** The active (selected) cell. */
 export interface ActiveCell {
@@ -299,6 +295,16 @@ export class CanvasGridRenderer {
 	 * the gate is retained so the upcoming `gridBlitA1.ts` fast-follow can rely on it.)
 	 */
 	private hasPaintedOnce = false;
+	/**
+	 * **Round 5 (2026-06-10) -- client-side cell styling.** A bound lookup of the per-cell VISUAL style
+	 * (`bold`/`italic`/`underline`/`strike`/`halign`/`textColor`/`fillColor`) for the CURRENT sheet,
+	 * supplied by the controller ({@link setStyleLookup}). The renderer stays sheet-agnostic -- it just
+	 * paints the snapshot it was given -- so the controller closes over the active sheet id and rebinds
+	 * this on every sheet switch + after any style edit, then `redraw()`s. Default = "no styling".
+	 * Read at the single cell-paint site ({@link paintCellRegion}); the engine has no style model, so
+	 * this is the only source of cell styling (a documented session-scoped render-layer feature).
+	 */
+	private styleAt: (row: number, col: number) => CellStyle | undefined = () => undefined;
 
 	constructor(private readonly canvas: HTMLCanvasElement) {
 		const ctx = canvas.getContext('2d');
@@ -385,6 +391,25 @@ export class CanvasGridRenderer {
 	/** The populated entry at (row,col), or undefined for an empty cell (hover + edit pre-fill). */
 	entryAt(row: number, col: number): QuantbookCellSnapshot['entries'][number] | undefined {
 		return this.entryByCell.get(row + ',' + col);
+	}
+
+	/**
+	 * **Round 5 (2026-06-10) -- client-side cell styling.** Bind the per-cell visual-style lookup for the
+	 * CURRENT sheet. The controller calls this (then `redraw()`) on sheet switch + after any toolbar
+	 * style edit; the lookup closes over the active sheet id so the renderer never needs to know it.
+	 */
+	setStyleLookup(fn: (row: number, col: number) => CellStyle | undefined): void {
+		this.styleAt = fn;
+	}
+
+	/** Compose the body font with optional bold/italic prefixes (Sheets weights: 700 bold). The base
+	 *  `bodyFont` is `"13px <family>"`; we splice the CSS `font` shorthand's leading style/weight tokens. */
+	private styledFont(style: CellStyle | undefined): string {
+		if (style === undefined || (!style.bold && !style.italic)) {
+			return this.bodyFont;
+		}
+		const prefix = (style.italic ? 'italic ' : '') + (style.bold ? '700 ' : '');
+		return prefix + this.bodyFont;
 	}
 
 	/** **FE-0b-4** -- whether a full {@link draw} has painted the current backing store. */
@@ -825,6 +850,21 @@ export class CanvasGridRenderer {
 		ctx.rect(clipX0, clipY0, clipX1 - clipX0, clipY1 - clipY0);
 		ctx.clip();
 
+		// 0. Round 5 (2026-06-10) -- client-side cell FILL color, painted UNDER the gridlines + error tint +
+		// text (Excel cell shading), for EVERY styled cell in the pane INCLUDING empty ones (a fill on a
+		// blank cell must show -- so this is independent of `entryByCell`). One style lookup per visible
+		// cell; bounded by the windowed range, like the value loop below.
+		for (let r = rowRange.startIdx; r < rowRange.endIdx; r += 1) {
+			const fy = Math.round(rowY(r) - effScrollTop);
+			for (let c = colRange.startIdx; c < colRange.endIdx; c += 1) {
+				const fill = this.styleAt(r, c)?.fillColor;
+				if (fill !== undefined) {
+					ctx.fillStyle = fill;
+					ctx.fillRect(Math.round(colX(c, gutterW) - effScrollLeft), fy, COL_WIDTH, ROW_HEIGHT);
+				}
+			}
+		}
+
 		// 1. Error-cell background tints (under the gridlines + text, like Excel). Audit S1-LOW: snap the
 		// fill origin to a device pixel so the tint aligns with the (rounded) gridlines on non-Electron/test.
 		if (errorCells.size > 0) {
@@ -877,12 +917,21 @@ export class CanvasGridRenderer {
 				// Audit C1-HIGH2: cap the display string BEFORE measure/truncate so a pathological `rendered`
 				// can't freeze the binary search (which measures the full string first).
 				const raw = typeof entry.rendered === 'string' ? entry.rendered : formatCellValue(entry.value);
-				const shown = truncateToWidth(clampDisplayString(raw), valueMax, s => this.measure(s));
-				ctx.fillStyle = isError ? this.palette.errorFg : this.palette.foreground;
+				// Round 5 (2026-06-10): per-cell client-side style (bold/italic font, text color, halign
+				// override, underline/strike). `styledFont` falls back to bodyFont when no bold/italic, so
+				// `measure`/`truncateToWidth` (which cache on the string, not the font) stay correct for the
+				// common unstyled path; a bold cell measures a touch narrow, acceptable for the demo.
+				const style = this.styleAt(r, c);
 				ctx.save();
 				ctx.beginPath();
 				ctx.rect(x, y, COL_WIDTH, ROW_HEIGHT);
 				ctx.clip();
+				if (style !== undefined && (style.bold || style.italic)) {
+					ctx.font = this.styledFont(style); // restored by the per-cell ctx.restore() below
+				}
+				const shown = truncateToWidth(clampDisplayString(raw), valueMax, s => this.measure(s));
+				ctx.fillStyle =
+					style?.textColor ?? (isError ? this.palette.errorFg : this.palette.foreground);
 				// **Codex HIGH (2026-06-10) -- per-kind text alignment, the Excel/Sheets convention** (the
 				// product bar is "looks like a real spreadsheet"): NUMBERS right-align at the cell's right
 				// edge minus CELL_PAD; TEXT left-aligns at left edge + CELL_PAD (the pre-fix behavior);
@@ -895,20 +944,47 @@ export class CanvasGridRenderer {
 				// (full draw / drawScroll strips / drawDamage bands) funnels through paintCellRegion, so the
 				// rule holds everywhere. textAlign mutates inside this save/restore bracket (canvas state
 				// includes textAlign), so the loop's 'left' baseline is restored each iteration.
-				switch (entry.value.kind) {
-					case 'number':
-						ctx.textAlign = 'right';
-						ctx.fillText(shown, x + COL_WIDTH - CELL_PAD, y + ROW_HEIGHT / 2);
-						break;
-					case 'text':
-						ctx.fillText(shown, x + CELL_PAD, y + ROW_HEIGHT / 2);
-						break;
-					case 'boolean':
-					case 'error':
-					case 'pending':
-						ctx.textAlign = 'center';
-						ctx.fillText(shown, x + COL_WIDTH / 2, y + ROW_HEIGHT / 2);
-						break;
+				// Per-kind default alignment (the Excel/Sheets convention), OVERRIDABLE by an explicit
+				// client-side `halign` (round 5): NUMBERS right, TEXT left, BOOLEAN/ERROR/pending center.
+				const kindAlign: 'left' | 'right' | 'center' =
+					entry.value.kind === 'number'
+						? 'right'
+						: entry.value.kind === 'text'
+							? 'left'
+							: 'center';
+				const halign: 'left' | 'right' | 'center' = style?.halign ?? kindAlign;
+				const midY = y + ROW_HEIGHT / 2;
+				let textX: number;
+				if (halign === 'right') {
+					ctx.textAlign = 'right';
+					textX = x + COL_WIDTH - CELL_PAD;
+				} else if (halign === 'center') {
+					ctx.textAlign = 'center';
+					textX = x + COL_WIDTH / 2;
+				} else {
+					ctx.textAlign = 'left';
+					textX = x + CELL_PAD;
+				}
+				ctx.fillText(shown, textX, midY);
+				// Round 5: underline / strikethrough drawn in the (possibly overridden) text color across
+				// the measured glyph run. `lineStart` derives from the alignment so the rule tracks the text.
+				if (style !== undefined && (style.underline === true || style.strike === true) && shown.length > 0) {
+					const w = this.measure(shown);
+					const lineStart = halign === 'right' ? textX - w : halign === 'center' ? textX - w / 2 : textX;
+					ctx.strokeStyle = ctx.fillStyle as string;
+					ctx.lineWidth = 1;
+					ctx.beginPath();
+					if (style.underline === true) {
+						const uy = Math.round(midY + 6) - 0.5;
+						ctx.moveTo(lineStart, uy);
+						ctx.lineTo(lineStart + w, uy);
+					}
+					if (style.strike === true) {
+						const sy = Math.round(midY) - 0.5;
+						ctx.moveTo(lineStart, sy);
+						ctx.lineTo(lineStart + w, sy);
+					}
+					ctx.stroke();
 				}
 				ctx.restore();
 			}
@@ -1251,17 +1327,12 @@ export class CanvasGridRenderer {
 	 * `cursor` over the canvas. Attaches ONE `mousemove` listener to the canvas (the renderer owns the
 	 * element) that sets `canvas.style.cursor` from a cheap geometric hit-test of the pointer:
 	 *   - **`cell`** over the grid BODY (below the header, right of the gutter) -- the Sheets/Excel block cursor;
-	 *   - **`col-resize`** within ~{@link RESIZE_HOVER_PX}px of a COLUMN separator inside the column header band;
-	 *   - **`row-resize`** within ~{@link RESIZE_HOVER_PX}px of a ROW separator inside the row-number gutter;
-	 *   - **`default`** elsewhere in the header / gutter / corner box.
+	 *   - **`default`** in the header band / row gutter / corner box.
 	 *
-	 * The resize cursors are a VISUAL affordance only (column/row resize is not yet functional) -- but the
-	 * hover cursor change alone makes the headers read as resizable, the way Sheets does. Separator positions
-	 * are derived from the SAME pure layout math the paint uses ({@link colX}/{@link rowY}), at the scroll
-	 * offset the last frame painted ({@link lastScrollTop}/{@link lastScrollLeft}), with the frozen bands
-	 * pinned at effective-scroll 0 -- so the cursor lines up with the gridlines the user sees. Sets a baseline
-	 * `cell` cursor immediately so the body shows the block cursor before the first pointer move. This is the
-	 * ONLY cursor the renderer sets; the `#sheets-canvas` CSS rule sets none (confirmed -- nothing to defer).
+	 * Round 5 (2026-06-10): the `col-resize`/`row-resize` cursors were REMOVED -- they implied a header
+	 * resize that was never wired (the audit's "the resize cursor is a lie" finding). Sets a baseline `cell`
+	 * cursor immediately so the body shows the block cursor before the first pointer move. This is the ONLY
+	 * cursor the renderer sets; the `#sheets-canvas` CSS rule sets none (confirmed -- nothing to defer).
 	 */
 	private installCursorHitTest(): void {
 		// Baseline: the grid body is the dominant surface; show the Sheets block cursor up front.
@@ -1351,53 +1422,19 @@ export class CanvasGridRenderer {
 	 * the caller supplies the local point), so it stays unit-reasoned. See {@link installCursorHitTest}.
 	 */
 	private cursorAt(localX: number, localY: number): string {
-		const gutterW = this.gutterW;
 		const inHeaderBand = localY < HEADER_HEIGHT;
-		const inGutter = localX < gutterW;
-		// Corner box (both bands): no resize affordance, plain arrow (the select-all triangle lives here).
-		if (inHeaderBand && inGutter) {
+		const inGutter = localX < this.gutterW;
+		// Round 5 (2026-06-10) -- the column header band, the row-number gutter, and the corner box all show
+		// a plain arrow. The previous `col-resize`/`row-resize` affordance was REMOVED: it implied a column/
+		// row resize that is NOT wired (the round-5 audit's "the resize cursor is a lie" finding -- an
+		// investor who drags a header border and sees nothing happen reads it as broken). True per-column/row
+		// resize requires the variable-geometry refactor (137 uniform-COL_WIDTH call sites across the
+		// hit-test / blit / frozen-pane core); it is a tracked follow-up and will restore this cursor.
+		if (inHeaderBand || inGutter) {
 			return 'default';
-		}
-		const fColsPx = frozenColsWidth(this.frozenColCount);
-		const fRowsPx = frozenRowsHeight(this.frozenRowCount);
-		if (inHeaderBand) {
-			// Column header band: near a COLUMN separator -> col-resize, else a plain arrow over the letters.
-			// Frozen cols are pinned (effScroll 0); body cols scroll by lastScrollLeft.
-			const effScrollLeft = localX < gutterW + fColsPx ? 0 : this.lastScrollLeft;
-			return this.nearColSeparator(localX, gutterW, effScrollLeft) ? 'col-resize' : 'default';
-		}
-		if (inGutter) {
-			// Row-number gutter: near a ROW separator -> row-resize, else a plain arrow over the numbers.
-			const effScrollTop = localY < HEADER_HEIGHT + fRowsPx ? 0 : this.lastScrollTop;
-			return this.nearRowSeparator(localY, effScrollTop) ? 'row-resize' : 'default';
 		}
 		// Grid body (below the header, right of the gutter): the Sheets/Excel block cursor.
 		return 'cell';
-	}
-
-	/** True when `localX` (canvas px, in the column header band) is within {@link RESIZE_HOVER_PX} of a
-	 * column boundary at the given effective scroll. The nearest boundary's screen-x is the nearest
-	 * multiple of `COL_WIDTH` in content space, mapped back through `colX` minus the effective scroll. */
-	private nearColSeparator(localX: number, gutterW: number, effScrollLeft: number): boolean {
-		const contentX = localX + effScrollLeft;
-		const nearestCol = Math.round((contentX - gutterW) / COL_WIDTH);
-		if (nearestCol < 0 || nearestCol > MAX_COLS) {
-			return false;
-		}
-		const sepScreenX = colX(nearestCol, gutterW) - effScrollLeft;
-		return Math.abs(sepScreenX - localX) <= RESIZE_HOVER_PX;
-	}
-
-	/** True when `localY` (canvas px, in the row gutter) is within {@link RESIZE_HOVER_PX} of a row
-	 * boundary at the given effective scroll (mirror of {@link nearColSeparator} for rows). */
-	private nearRowSeparator(localY: number, effScrollTop: number): boolean {
-		const contentY = localY + effScrollTop;
-		const nearestRow = Math.round((contentY - HEADER_HEIGHT) / ROW_HEIGHT);
-		if (nearestRow < 0 || nearestRow > MAX_ROWS) {
-			return false;
-		}
-		const sepScreenY = rowY(nearestRow) - effScrollTop;
-		return Math.abs(sepScreenY - localY) <= RESIZE_HOVER_PX;
 	}
 
 	/** Cached `measureText().width` at the current BODY font (cache cleared on font change). */
@@ -1437,7 +1474,13 @@ export class CanvasGridRenderer {
 		// tokens.css uses for `--ql-accent`. This replaces the previous hardcoded Sheets-blue / charts-blue
 		// read -- the operator wants the BRAND color wherever Excel/Sheets show theirs. Cached in the palette
 		// like every other theme color; refreshTheme() re-resolves it on a theme change.
-		const accent = v('--vscode-quantlabAccent', QUANTLAB_ACCENT_FALLBACK);
+		const rawAccent = v('--vscode-quantlabAccent', QUANTLAB_ACCENT_FALLBACK);
+		// Round-5 audit (finding D): the translucent washes already fall back to the canonical hex when the
+		// accent is unparseable (via accentTint), but the OPAQUE uses (selectionBorder / cornerTriangle /
+		// the `accent` header text) assigned the raw string directly -- an unparseable theme value would
+		// make `ctx.strokeStyle = accent` a silent no-op and leave the selection ring in a STALE color.
+		// Normalize ONCE here so every accent use (opaque + tint) shares the same known-good value.
+		const accent = CanvasGridRenderer.parseCssColorRgb(rawAccent) === null ? QUANTLAB_ACCENT_FALLBACK : rawAccent;
 		// Derive the translucent accent washes from the RESOLVED accent (theme-provided or fallback), so a
 		// theme that overrides the brand color tints consistently. accentTint handles #rgb/#rrggbb/rgb()/
 		// rgba() (the forms a theme var can carry) and warns ONCE + tints the known-good fallback if the
