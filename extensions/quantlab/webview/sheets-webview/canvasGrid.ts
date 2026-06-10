@@ -402,14 +402,20 @@ export class CanvasGridRenderer {
 		this.styleAt = fn;
 	}
 
+	/** The CSS `font` shorthand prefix a cell's style adds to the body font ('' when none). Shared by
+	 *  {@link styledFont} and the measure-cache key so a width is never reused across fonts. */
+	private stylePrefix(style: CellStyle | undefined): string {
+		if (style === undefined) {
+			return '';
+		}
+		return (style.italic ? 'italic ' : '') + (style.bold ? '700 ' : '');
+	}
+
 	/** Compose the body font with optional bold/italic prefixes (Sheets weights: 700 bold). The base
 	 *  `bodyFont` is `"13px <family>"`; we splice the CSS `font` shorthand's leading style/weight tokens. */
 	private styledFont(style: CellStyle | undefined): string {
-		if (style === undefined || (!style.bold && !style.italic)) {
-			return this.bodyFont;
-		}
-		const prefix = (style.italic ? 'italic ' : '') + (style.bold ? '700 ' : '');
-		return prefix + this.bodyFont;
+		const prefix = this.stylePrefix(style);
+		return prefix === '' ? this.bodyFont : prefix + this.bodyFont;
 	}
 
 	/** **FE-0b-4** -- whether a full {@link draw} has painted the current backing store. */
@@ -918,18 +924,19 @@ export class CanvasGridRenderer {
 				// can't freeze the binary search (which measures the full string first).
 				const raw = typeof entry.rendered === 'string' ? entry.rendered : formatCellValue(entry.value);
 				// Round 5 (2026-06-10): per-cell client-side style (bold/italic font, text color, halign
-				// override, underline/strike). `styledFont` falls back to bodyFont when no bold/italic, so
-				// `measure`/`truncateToWidth` (which cache on the string, not the font) stay correct for the
-				// common unstyled path; a bold cell measures a touch narrow, acceptable for the demo.
+				// override, underline/strike). The measure cache is keyed by the style's font PREFIX so a
+				// bold cell's width can never poison the plain entry for the same text -- and vice-versa
+				// (round-5 audit MED: the string-only key shared widths across fonts within a frame).
 				const style = this.styleAt(r, c);
+				const fontKey = this.stylePrefix(style);
 				ctx.save();
 				ctx.beginPath();
 				ctx.rect(x, y, COL_WIDTH, ROW_HEIGHT);
 				ctx.clip();
-				if (style !== undefined && (style.bold || style.italic)) {
+				if (fontKey !== '') {
 					ctx.font = this.styledFont(style); // restored by the per-cell ctx.restore() below
 				}
-				const shown = truncateToWidth(clampDisplayString(raw), valueMax, s => this.measure(s));
+				const shown = truncateToWidth(clampDisplayString(raw), valueMax, s => this.measure(s, fontKey));
 				ctx.fillStyle =
 					style?.textColor ?? (isError ? this.palette.errorFg : this.palette.foreground);
 				// **Codex HIGH (2026-06-10) -- per-kind text alignment, the Excel/Sheets convention** (the
@@ -969,7 +976,7 @@ export class CanvasGridRenderer {
 				// Round 5: underline / strikethrough drawn in the (possibly overridden) text color across
 				// the measured glyph run. `lineStart` derives from the alignment so the rule tracks the text.
 				if (style !== undefined && (style.underline === true || style.strike === true) && shown.length > 0) {
-					const w = this.measure(shown);
+					const w = this.measure(shown, fontKey);
 					const lineStart = halign === 'right' ? textX - w : halign === 'center' ? textX - w / 2 : textX;
 					ctx.strokeStyle = ctx.fillStyle as string;
 					ctx.lineWidth = 1;
@@ -1437,12 +1444,16 @@ export class CanvasGridRenderer {
 		return 'cell';
 	}
 
-	/** Cached `measureText().width` at the current BODY font (cache cleared on font change). */
-	private measure(text: string): number {
-		let w = this.measureCache.get(text);
+	/** Cached `measureText().width` at the font the caller has set on the ctx (cache cleared on font
+	 *  change). `fontKey` is the style prefix active on the ctx ('' = the plain body font) -- round-5
+	 *  audit MED: keying on the string alone let a BOLD cell's width poison the entry a later plain
+	 *  cell with the same text read (and vice-versa), skewing truncation. The key carries the font. */
+	private measure(text: string, fontKey: string = ''): number {
+		const key = fontKey === '' ? text : fontKey + '\u0000' + text;
+		let w = this.measureCache.get(key);
 		if (w === undefined) {
 			w = this.ctx.measureText(text).width;
-			this.measureCache.set(text, w);
+			this.measureCache.set(key, w);
 			if (this.measureCache.size > MEASURE_CACHE_MAX) {
 				const evictCount = Math.floor(this.measureCache.size / 2);
 				let i = 0;

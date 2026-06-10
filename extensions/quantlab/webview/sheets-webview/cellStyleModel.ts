@@ -79,6 +79,22 @@ function cellKey(sheet: number, row: number, col: number): string {
 	return sheet + '|' + row + '|' + col;
 }
 
+/**
+ * Round-5 audit LOW: validate a persisted color before trusting it. A corrupt/foreign string assigned
+ * to `ctx.fillStyle` is a SILENT no-op -- the canvas keeps the PREVIOUS iteration's color, so one bad
+ * persisted value would paint a neighbor's fill onto the wrong cell. Accept only the shapes the style
+ * layer itself produces (swatch hex) plus the rgb()/rgba() forms a theme var could have injected.
+ */
+export function isValidCssColor(value: unknown): value is string {
+	if (typeof value !== 'string') {
+		return false;
+	}
+	return (
+		/^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(value) ||
+		/^rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*(?:,\s*(?:0|1|0?\.\d+)\s*)?\)$/.test(value)
+	);
+}
+
 /** Hard ceiling on cells touched by one style op, mirroring the engine's batch cap so a pathological
  *  whole-column/whole-sheet selection can't build an unbounded map (the selection rect can span the
  *  full Excel extent). A selection larger than this is clamped to its top-left corner (the common
@@ -208,6 +224,11 @@ export class CellStyleStore {
 			if (typeof value !== 'object' || value === null) {
 				continue;
 			}
+			// Round-5 audit LOW: validate the KEY too -- `get()` reconstructs `sheet|row|col` so a foreign
+			// key is never read, but without this it would be re-persisted forever (dead state).
+			if (!/^\d+\|\d+\|\d+$/.test(key)) {
+				continue;
+			}
 			const v = value as CellStyle;
 			const clean: CellStyle = {
 				bold: v.bold === true ? true : undefined,
@@ -215,8 +236,8 @@ export class CellStyleStore {
 				underline: v.underline === true ? true : undefined,
 				strike: v.strike === true ? true : undefined,
 				halign: v.halign === 'left' || v.halign === 'center' || v.halign === 'right' ? v.halign : undefined,
-				textColor: typeof v.textColor === 'string' ? v.textColor : undefined,
-				fillColor: typeof v.fillColor === 'string' ? v.fillColor : undefined,
+				textColor: isValidCssColor(v.textColor) ? v.textColor : undefined,
+				fillColor: isValidCssColor(v.fillColor) ? v.fillColor : undefined,
 			};
 			if (!isEmptyStyle(clean)) {
 				store.map.set(key, clean);

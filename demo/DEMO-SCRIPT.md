@@ -55,10 +55,24 @@ Option B (code-driven chart view):
 - Open **`demo/portfolio_chart.py`** → press **Ctrl+Q Shift+C** ("Open as Chart") → pick
   `demo/portfolio.csv` as the data source → portfolio curve + SMA(10)/SMA(30) overlays.
 
-## DO NOT touch during the demo (visual-only until FE-4/FE-5)
+## What WORKS since round 5 (demo these — they are real)
 
-- Toolbar: **bold / italic / underline / text-color / fill / borders / align / sort /
-  find / zoom** — they render but do nothing (cell styling is the next engine wave).
+- Toolbar styling: **Bold / Italic / Underline / Strikethrough / Align L-C-R / Text color /
+  Fill color** — select cells, click, they paint live on the grid. NOTE the honest boundary:
+  styling is **session-scoped** (survives a webview reload, NOT an app relaunch; it is not
+  saved into the workbook file yet — that engine work is FE-4/FE-5). Don't promise file
+  persistence on stage.
+- **Find**: Ctrl/Cmd+F or the toolbar Search button → in-sheet find bar (Enter / Shift+Enter
+  steps matches, Esc closes).
+- **OS clipboard**: copy a range → paste into Excel/Sheets/Numbers (TSV of display values);
+  paste TSV from another app into the grid. (A cut pastes ONCE, like Excel.)
+
+## DO NOT touch during the demo (preview-only; they show a small toast)
+
+- Toolbar: **borders / merge / wrap / vertical-align / font selects / filter / sort / zoom /
+  decimals / paint-format / print** — clicking shows a neutral "not available in this
+  preview" toast (engine-greenfield; FE-4/FE-5).
+- Column/row **resize** is not wired (the resize cursor was removed on purpose).
 - Don't switch sheets while a cell editor is open (guarded, but don't tempt it).
 - Don't use cross-sheet references in formulas unless rehearsed.
 
