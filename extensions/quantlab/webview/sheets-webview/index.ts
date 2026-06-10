@@ -1175,6 +1175,14 @@ let publishedRangesKey = '';
 // Ctrl/Cmd+C (isCut=false) / Ctrl/Cmd+X (isCut=true), consumed by Ctrl/Cmd+V. `null` = nothing copied.
 // Internal-only for v1 (no OS-clipboard interop); persists across renders + sheet switches like Excel.
 let gridClipboard: GridClipboard | null = null;
+// Round-5 LOW fix (cut-paste echo): a CUT also writes its TSV to the OS clipboard (the cross-app
+// bridge). After the cut is CONSUMED by its paste (move complete, internal clipboard cleared), the
+// next Ctrl/Cmd+V would fall through to the OS path and re-paste the moved values -- Excel no-ops a
+// second paste after a cut, so we must too. `pendingCutOsTsv` remembers the TSV the live cut wrote;
+// consumption moves it into `consumedCutOsTsv`, which the OS-paste path treats as "already moved".
+// Any NEW copy/cut overwrites the OS clipboard, so both reset then.
+let pendingCutOsTsv: string | null = null;
+let consumedCutOsTsv: string | null = null;
 // **W-G fill handle**: drag-to-fill state. `fillSource` is the selection rect captured at the start of a
 // fill-handle drag (null = not dragging); `fillPreview` is the rect the fill will cover (source extended
 // down/right under the pointer), painted as a dashed outline and passed to every renderer draw call.
@@ -1456,7 +1464,13 @@ function resolveEditThen(action: DeferredEditResolvedAction): 'ran' | 'queued' |
 		const value = editState.editEl.value;
 		const changed = value !== editState.initialValue;
 		const knownBad = editState.lastFailedRawInput !== undefined && value === editState.lastFailedRawInput;
-		if (changed && !knownBad) {
+		// Round-5 LOW fix: an UNTOUCHED sigma-functions prefill ("=SUM(") reads as `changed` (the cell's
+		// prior content is the baseline, not the prefill), but commitEdit would ABORT it via
+		// `prefillBaseline` and return false -- which the `changed` arm below would misread as a LOCAL
+		// reject ('blocked'), silently dropping the chrome action even though the editor was in fact
+		// cancelled. Route it through the cancel arm instead: abandon the prefill AND run the action.
+		const untouchedPrefill = editState.prefillBaseline !== undefined && value === editState.prefillBaseline;
+		if (changed && !knownBad && !untouchedPrefill) {
 			if (commitEdit()) {
 				setDeferredAction(action); // committed -> now pending; act when the ack resolves
 				return 'queued';
@@ -1466,7 +1480,7 @@ function resolveEditThen(action: DeferredEditResolvedAction): 'ran' | 'queued' |
 			// user has just been told to fix (the banner explains; they can re-issue the action after).
 			return 'blocked';
 		}
-		cancelEdit(); // unchanged / known-bad -> abandon (Escape/blur-unchanged semantics), then act
+		cancelEdit(); // unchanged / known-bad / untouched-prefill -> abandon (Escape/blur-unchanged semantics), then act
 		redraw();
 	}
 	runDeferredActionNow(action);
@@ -1554,7 +1568,11 @@ function resolveEditForNativeSurface(retryHint: string): boolean {
 		const value = editState.editEl.value;
 		const changed = value !== editState.initialValue;
 		const knownBad = editState.lastFailedRawInput !== undefined && value === editState.lastFailedRawInput;
-		if (!changed || knownBad) {
+		// Round-5 LOW fix (mirrors resolveEditThen byte-for-byte): an untouched sigma prefill must take
+		// the cancel arm here too -- commitEdit would abort it (return false) and this function would
+		// misreport 'blocked' + suppress the surface over an editor that no longer exists.
+		const untouchedPrefill = editState.prefillBaseline !== undefined && value === editState.prefillBaseline;
+		if (!changed || knownBad || untouchedPrefill) {
 			cancelEdit(); // Escape/blur-unchanged semantics -- identical to resolveEditThen's cancel arm
 			redraw();
 			return true;
@@ -1935,7 +1953,12 @@ function copyGridSelection(isCut: boolean): void {
 	// can paste into Excel / Google Sheets / Numbers. The internal clipboard above stays the source of
 	// truth for an in-grid paste (it preserves formula-ref translation + the cut-move); the OS write is
 	// the cross-app bridge only.
-	writeOsClipboard(buildSelectionTsv(top, left, rows, cols));
+	const tsv = buildSelectionTsv(top, left, rows, cols);
+	writeOsClipboard(tsv);
+	// Round-5 LOW fix (cut-paste echo): arm the consumed-cut guard for a CUT; a plain COPY supersedes
+	// any prior cut's TSV on the OS clipboard, so both trackers reset (see their declaration).
+	pendingCutOsTsv = isCut ? tsv : null;
+	consumedCutOsTsv = null;
 }
 
 /** Build a TSV block of the DISPLAY values over a rect (Excel pastes shown text, not formulas). Tabs and
@@ -2077,6 +2100,10 @@ function pasteGridClipboard(): void {
 	vscode.postMessage({ type: 'putCells', sheet: fullSnapshot.sheet, cells, undoLabel, webviewId: WEBVIEW_ID });
 	if (gridClipboard.isCut) {
 		gridClipboard = null;
+		// Round-5 LOW fix (cut-paste echo): the cut is consumed -- its TSV still sits on the OS
+		// clipboard, so mark it "already moved" and the OS-paste path will no-op on it (Excel semantics).
+		consumedCutOsTsv = pendingCutOsTsv;
+		pendingCutOsTsv = null;
 	}
 }
 
@@ -2109,6 +2136,13 @@ function pasteFromOsClipboard(): void {
 			if (typeof text !== 'string' || text.length === 0 || fullSnapshot === null || active === null) {
 				return;
 			}
+			// Round-5 LOW fix (cut-paste echo): this TSV is a CONSUMED Quantbook cut -- the move already
+			// happened; a second paste must no-op (Excel semantics; a deliberate, documented no-op, not a
+			// fallback). Diagnosable via the debug line.
+			if (consumedCutOsTsv !== null && text === consumedCutOsTsv) {
+				console.warn('[sheets-webview] OS paste skipped: the clipboard still holds an already-consumed cut');
+				return;
+			}
 			const grid = parseTsv(text);
 			const rows = grid.length;
 			const cols = grid.reduce((m, r) => Math.max(m, r.length), 0);
@@ -2122,12 +2156,24 @@ function pasteFromOsClipboard(): void {
 			const top = active.row;
 			const left = active.col;
 			const cells: { row: number; col: number; rawInput: string }[] = [];
+			// Round-5 LOW fix: count cells clipped at the grid edge and SAY so (No-Fallbacks: a paste
+			// that silently drops part of the block reads as data loss).
+			let clipped = 0;
 			for (let r = 0; r < rows; r += 1) {
 				for (let c = 0; c < grid[r].length; c += 1) {
 					if (top + r < MAX_ROWS && left + c < MAX_COLS) {
 						cells.push({ row: top + r, col: left + c, rawInput: grid[r][c] });
+					} else {
+						clipped += 1;
 					}
 				}
+			}
+			if (clipped > 0) {
+				showError(
+					String(clipped) + (clipped === 1 ? ' cell of the pasted block fell' : ' cells of the pasted block fell') +
+					' beyond the grid edge and ' + (clipped === 1 ? 'was' : 'were') + ' not pasted.',
+					'transient',
+				);
 			}
 			if (cells.length === 0) {
 				return;
@@ -3622,6 +3668,12 @@ function buildFindBar(): void {
 		} else if (e.key === 'Escape') {
 			e.preventDefault();
 			closeFindBar();
+		} else if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')) {
+			// Round-5 LOW fix: a SECOND Ctrl/Cmd+F while the find input is focused must not fall through
+			// to the webview default (the document handler ignores find-bar targets on purpose) -- it
+			// re-selects the query, the browser-find convention.
+			e.preventDefault();
+			input.select();
 		}
 	});
 	document.body.appendChild(bar);
@@ -3637,6 +3689,10 @@ function openFindBar(): void {
 	if (findBarEl === null || findInputEl === null) {
 		return; // unreachable (buildFindBar sets both) -- keeps strict-null-checks happy without `!`
 	}
+	// Round-5 LOW fix: anchor the bar under the live chrome (menu bar + toolbar + formula bar) instead
+	// of the former hardcoded `top: 92px` -- the viewport's rect IS that boundary, whatever the chrome
+	// stack currently measures (theme/zoom/density changes included).
+	findBarEl.style.top = String(Math.round(viewportEl.getBoundingClientRect().top) + 8) + 'px';
 	findBarEl.classList.add('is-visible');
 	findInputEl.focus();
 	findInputEl.select();

@@ -710,10 +710,11 @@ body {
 	transform: translateY(0);
 }
 
-/* Round 5 (2026-06-10): in-sheet Find bar -- floats at the top-right of the grid (Sheets/Chrome find UX). */
+/* Round 5 (2026-06-10): in-sheet Find bar -- floats at the top-right of the grid (Sheets/Chrome find
+ * UX). `top` is set by openFindBar from the live viewport rect (the chrome stack's real height), not
+ * hardcoded here (round-5 LOW fix). */
 .qb-find-bar {
 	position: fixed;
-	top: 92px;
 	right: 18px;
 	z-index: 1100;
 	display: none;
