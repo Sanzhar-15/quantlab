@@ -174,6 +174,15 @@ export interface CellSnapshotJson {
 	 * `cellGridHtml.ts renderRows` named here are gone.
 	 */
 	rendered?: string;
+	/**
+	 * **FE-4 W4 (2026-06-10)** -- the cell's registered visual-style id, or absent
+	 * when the cell carries no style. Resolve against
+	 * {@link WorkbookSnapshotJson.styles} / {@link WorkbookSnapshotDeltaJson.stylesAdded}.
+	 * ENGINE FOUNDATION ONLY this wave: no IDE surface consumes it yet (the webview's
+	 * session-scoped `cellStyleModel` remains the render-layer style source until the
+	 * FE-5 render wave switches to engine-backed styles).
+	 */
+	styleId?: StyleIdJson;
 }
 
 /**
@@ -196,6 +205,67 @@ export interface FormatIdJson {
 	customPeer?: bigint;
 	/** Set when `kind === 'custom'`; undefined otherwise. */
 	customCounter?: number;
+}
+
+/**
+ * **FE-4 W4 (2026-06-10)** -- JS-side mirror of the engine `StyleIdJson` napi struct
+ * (mirrors `ql_storage::StyleId`). Unlike {@link FormatIdJson} there is NO builtin
+ * variant: styles have no Excel-canonical registry, so every id is peer-allocated
+ * `{peer, counter}` (idempotent re-registration of an identical style returns the
+ * same id).
+ */
+export interface StyleIdJson {
+	/** Registering peer id (engine u64 widened to bigint). */
+	peer: bigint;
+	/** Per-peer counter (u32 domain). */
+	counter: number;
+}
+
+/** **FE-4 W4 (2026-06-10)** -- RGB color (`r`/`g`/`b` each in the u8 domain 0..=255). */
+export interface RgbJson {
+	r: number;
+	g: number;
+	b: number;
+}
+
+/**
+ * **FE-4 W4 (2026-06-10)** -- one border edge of a cell style. `style` is one of
+ * `none|thin|medium|thick|dashed|dotted|double` (`none` = no border on this edge).
+ */
+export interface BorderEdgeJson {
+	style: string;
+	color: RgbJson;
+}
+
+/**
+ * **FE-4 W4 (2026-06-10)** -- a cell VISUAL style: bold/italic/fill/align + per-edge
+ * borders (operator decision #4: borders are IN the v1 engine schema so FE-5 only
+ * renders, never re-migrates the overlay). The input DTO for
+ * {@link SessionInstance.registerStyle} and the value carried in {@link StyleDefJson}.
+ * `align` is one of `general|left|center|right`; absent fill/border fields mean
+ * no fill / no border on that edge (napi `Option::None` -> absent property).
+ */
+export interface StyleJson {
+	bold: boolean;
+	italic: boolean;
+	fill?: RgbJson;
+	align?: string;
+	borderTop?: BorderEdgeJson;
+	borderBottom?: BorderEdgeJson;
+	borderLeft?: BorderEdgeJson;
+	borderRight?: BorderEdgeJson;
+}
+
+/**
+ * **FE-4 W4 (2026-06-10)** -- one style registration in
+ * {@link WorkbookSnapshotJson.styles} / {@link WorkbookSnapshotDeltaJson.stylesAdded}:
+ * pairs a {@link StyleIdJson} with its {@link StyleJson} value (the visual-formatting
+ * analog of `FormatDefJson`). The IDE resolves each cell's
+ * {@link CellSnapshotJson.styleId} against this list to render.
+ */
+export interface StyleDefJson {
+	id: StyleIdJson;
+	style: StyleJson;
 }
 
 /**
@@ -272,6 +342,15 @@ export interface WorkbookSnapshotJson {
 	 *     external rendering pipelines.
 	 */
 	formats: FormatDefJson[];
+	/**
+	 * **FE-4 W4 (2026-06-10)**: session-wide cell-style registry -- every style
+	 * registered via {@link SessionInstance.registerStyle} (or replayed from the
+	 * op-log / a `.qbook` `style_overlay` section), sorted by `StyleId`. Empty when
+	 * no styles exist. Resolve {@link CellSnapshotJson.styleId} against this.
+	 * Declared OPTIONAL in this mirror only so the pre-W4 test-fixture literals
+	 * stay valid; the live engine ALWAYS returns it -- consumers treat absent as [].
+	 */
+	styles?: StyleDefJson[];
 	/**
 	 * **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: workbook-level date system.
 	 *
@@ -422,6 +501,14 @@ export interface WorkbookSnapshotDeltaJson {
 	 * table by FormatId.
 	 */
 	formatsAdded: FormatDefJson[];
+	/**
+	 * **FE-4 W4 (2026-06-10)**: styles registered since `lastSeenVersion`
+	 * (Op::RegisterStyle). IDE merges each into its `styles` table by StyleId
+	 * (the visual-style analog of {@link formatsAdded}). Declared OPTIONAL in this
+	 * mirror only for the pre-W4 test-fixture literals; the live engine ALWAYS
+	 * returns it -- consumers treat absent as [].
+	 */
+	stylesAdded?: StyleDefJson[];
 	/**
 	 * Opaque version-vector token.  IDE stores + passes back as
 	 * `lastSeenVersion` on the next call.  Encoded via Loro's
@@ -1562,13 +1649,15 @@ export interface TableSpecJson {
  * 0-indexed and validated to u16/u32 at the boundary.
  */
 export interface SessionOpJson {
-	kind: 'setValue' | 'setFormula' | 'clear' | 'setFormat';
+	kind: 'setValue' | 'setFormula' | 'clear' | 'setFormat' | 'setStyle';
 	sheet: number;
 	row: number;
 	col: number;
 	value?: CellValueJson;
 	text?: string;
 	format?: FormatIdJson;
+	/** **FE-4 W4 (2026-06-10)**: required for `kind: 'setStyle'` (a registered style id); rejected on every other kind. */
+	style?: StyleIdJson;
 }
 
 /**
@@ -1893,6 +1982,23 @@ export interface SessionInstance {
 	 * well-known string to a builtin index. `[bad_argument]` for an invalid string.
 	 */
 	registerFormat(formatString: string): FormatIdJson;
+
+	/**
+	 * **FE-4 W4 (2026-06-10)**: set a cell's visual style to a registered
+	 * {@link StyleIdJson} (from {@link registerStyle}). `[bad_argument]` for invalid
+	 * coords or an unknown/malformed style id. The visual-formatting analog of
+	 * {@link setFormat}; lands on the OWNING `Session` (the product grid's session).
+	 */
+	setStyle(sheet: number, row: number, col: number, styleId: StyleIdJson): void;
+
+	/**
+	 * **FE-4 W4 (2026-06-10)**: register a session-wide cell style
+	 * (bold/italic/fill/align/borders), returning its {@link StyleIdJson} for use
+	 * with {@link setStyle} / a `setStyle` batch op. Idempotent -- re-registering an
+	 * identical style returns the same id. `[bad_argument]` for a malformed style
+	 * (unknown align/border-style string, out-of-domain color channel).
+	 */
+	registerStyle(style: StyleJson): StyleIdJson;
 
 	/**
 	 * **Phase 6.4-3d Step 5**: attach an out-of-process Python-UDF worker built
