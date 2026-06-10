@@ -200,7 +200,11 @@ body {
 	background: var(--vscode-panel-border);
 }
 
-/* Number-format dropdown (the iconic Sheets "General v" control). */
+/* Number-format dropdown (the iconic Sheets "123" control). A COMMAND PICKER (2026-06-10): it always
+ * rests on a hidden+disabled '123' placeholder option and is reset to it after every pick (index.ts),
+ * so 'change' fires even when the user re-picks the same preset. The closed control therefore always
+ * shows '123'; no extra placeholder styling is needed (a hidden <option> needs no rule -- `hidden`
+ * keeps it out of the native popup, and the closed select renders its label with the rules below). */
 .cgt-select {
 	flex: 0 0 auto;
 	height: 26px;

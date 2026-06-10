@@ -186,6 +186,12 @@ root.innerHTML =
 	// preset list does not have it, so offering it would be a dead entry (No-Fallbacks: never offer an
 	// action that cannot land). 'Number with thousands' carries the 'NumberThousands' preset id.
 	'<select class="cgt-select" data-cmd="numfmt" title="Number format" aria-label="Number format">' +
+	// Codex LOW fix (2026-06-10): the select is a COMMAND PICKER, not a state mirror -- formats are
+	// per-cell, so a single resting value could never be truthful, and a value-holding select silently
+	// EATS a re-pick of the same preset for a NEW selection ('change' only fires on a value CHANGE).
+	// It rests on this hidden+disabled placeholder ('123', the Sheets number-format glyph) and is reset
+	// to it after every pick (see the change handler below), so EVERY pick is a value change and fires.
+	'<option value="" hidden disabled selected>123</option>' +
 	'<option value="General">General</option>' +
 	'<option value="Number">Number</option>' +
 	'<option value="NumberThousands">Number with thousands</option>' +
@@ -285,11 +291,14 @@ const menubarEl = document.getElementById('sheets-menubar') as HTMLElement;
 //
 // FOCUS MODEL (the "buttons must not steal persistent focus" requirement): every mousedown on a
 // menubar button, toolbar button, or dropdown item is preventDefault-ed, so keyboard focus stays
-// wherever it was (normally #sheets-viewport) for the whole interaction; after an item ACTIVATES
-// we explicitly `viewportEl.focus()` so keyboard nav always lands back on the grid even if focus
-// was on the body (e.g. before the first click). The number-format <select> is the one exception:
-// a select must take focus to open natively, so its `change` handler restores the viewport focus
-// instead. The formula-suggest dropdown (renderCompletion) uses the same mousedown-preventDefault
+// wherever it was (normally #sheets-viewport -- possibly an OPEN cell/formula editor) for the whole
+// interaction. Because no blur ever fires, EVERY chrome ACTION must route through
+// `runAfterResolvingEdit` (the Codex demo-blocker guard below the commit machinery), which resolves
+// any open editor FIRST and then owns the focus hand-back: the grid viewport when the action ran,
+// the still-open editor when the action queued behind / was blocked by that editor's commit. The
+// number-format <select> is the one mousedown exception: a select must take focus to open natively;
+// its `change` handler routes through the same guard (which restores the viewport focus for it).
+// The formula-suggest dropdown (renderCompletion) uses the same mousedown-preventDefault
 // pattern; the sheet-tab strip's buttons do not, but the tab strip sits below the grid and a tab
 // switch re-renders anyway -- the menu/toolbar chrome must NOT have that excuse.
 //
@@ -341,6 +350,9 @@ interface MenuItemSpec {
 type MenuEntrySpec = MenuItemSpec | 'separator';
 
 // The toolbar insert/delete mini-menus reuse the same specs the menu bar's Insert menu is built from.
+// NOTE (demo-blocker guard, 2026-06-10): every item's `run` here and in MENUBAR_MENUS is the BARE host
+// post -- `activateMenuItem` is the ONE seam that routes ALL dropdown/menubar activations through
+// `runAfterResolvingEdit` (resolve any open editor first), so no spec wraps itself.
 const INSERT_ROW_COL_ITEMS: readonly MenuItemSpec[] = [
 	{ label: 'Row above', run: () => postToolbarCommand('insertRowAbove') },
 	{ label: 'Row below', run: () => postToolbarCommand('insertRowBelow') },
@@ -442,16 +454,22 @@ function setMenuHighlight(idx: number): void {
 	});
 }
 
-/** Activate item `idx`: close FIRST (so a host-triggered re-render never races an open panel), run
- * the action, then put keyboard focus back on the grid so arrow-nav continues immediately. */
+/** Activate item `idx`: close FIRST (so a host-triggered re-render never races an open panel), then
+ * run the action THROUGH the open-editor guard ({@link runAfterResolvingEdit}) -- the Codex
+ * DEMO-BLOCKER fix. This is the ONE seam every dropdown item activates through (toolbar insert/delete
+ * mini-menus AND all menubar items: Save As / Open Workbook / Undo / Redo / Freeze / Unfreeze /
+ * structural insert-delete / New sheet / Format presets), so a structural command can never execute
+ * while a cell/formula editor still holds pre-mutation coordinates. The guard also owns the focus
+ * restoration (grid viewport on an immediate run; the still-open editor when the action queued behind
+ * / was blocked by its commit) -- the old unconditional `viewportEl.focus()` here is gone because it
+ * would have stolen focus from a pending editor the guard deliberately keeps focused. */
 function activateMenuItem(idx: number): void {
 	if (openMenu === null || idx < 0 || idx >= openMenu.items.length) {
 		return;
 	}
 	const item = openMenu.items[idx];
 	closeMenuDropdown();
-	item.run();
-	viewportEl.focus();
+	runAfterResolvingEdit(item.label, item.run);
 }
 
 /**
@@ -621,11 +639,16 @@ document.addEventListener(
 				return;
 			case 'ArrowLeft':
 			case 'ArrowRight': {
-				// Step between menubar menus (wrapping) -- only for a panel opened FROM the menu bar.
+				// Step between menubar menus (wrapping) -- only for a panel opened FROM the menu bar. For a
+				// TOOLBAR-anchored dropdown (menuId === null) there are no sibling menus to step to, but the
+				// keys must still be SWALLOWED as a no-op (Codex HIGH, 2026-06-10): previously they fell
+				// through to the grid's bubble-phase nav handler and moved the SELECTION under the open menu
+				// -- exactly the leak this capture-phase gate exists to stop (Up/Down/Home/End above already
+				// swallow for both anchor kinds).
+				swallow();
 				if (openMenu.menuId === null) {
 					return;
 				}
-				swallow();
 				const buttons = Array.from(menubarEl.querySelectorAll<HTMLElement>('.qb-menu-btn'));
 				const cur = buttons.indexOf(openMenu.anchor);
 				if (cur < 0 || buttons.length === 0) {
@@ -659,31 +682,37 @@ toolbarEl.addEventListener('click', (e) => {
 	if (btn === null) {
 		return;
 	}
+	// Codex DEMO-BLOCKER fix (2026-06-10): every POSTING button below routes through
+	// `runAfterResolvingEdit`. The mousedown preventDefault above means clicking chrome NEVER blurs an
+	// open cell/formula editor -- so without the guard a command would execute against the host while
+	// the editor still held PRE-mutation state, and the editor's LATER blur/commit would post its OLD
+	// coordinates into the shifted grid (silent corruption); undo/redo additionally never refocused, so
+	// the editor SURVIVED over mutated state. The guard commits/cancels the editor first (or queues the
+	// action behind an in-flight commit, dropping it on any failure) and owns the focus restoration --
+	// which also gives undo/redo the grid-refocus the other wired buttons already had.
 	switch (btn.getAttribute('data-cmd')) {
 		case 'undo':
-			vscode.postMessage({ type: 'undo' });
+			runAfterResolvingEdit('Undo', () => vscode.postMessage({ type: 'undo' }));
 			return;
 		case 'redo':
-			vscode.postMessage({ type: 'redo' });
+			runAfterResolvingEdit('Redo', () => vscode.postMessage({ type: 'redo' }));
 			return;
 		case 'fmt-currency':
-			postSetNumberFormat('Currency');
-			viewportEl.focus();
+			runAfterResolvingEdit('number format "Currency"', () => postSetNumberFormat('Currency'));
 			return;
 		case 'fmt-percent':
-			postSetNumberFormat('Percent');
-			viewportEl.focus();
+			runAfterResolvingEdit('number format "Percent"', () => postSetNumberFormat('Percent'));
 			return;
 		case 'fmt-decimal':
-			postSetNumberFormat('Number');
-			viewportEl.focus();
+			runAfterResolvingEdit('number format "Number"', () => postSetNumberFormat('Number'));
 			return;
 		case 'freeze':
-			postToolbarCommand('freezePanes');
-			viewportEl.focus();
+			runAfterResolvingEdit('Freeze panes', () => postToolbarCommand('freezePanes'));
 			return;
 		case 'insert':
 			// Toggle the anchored mini-menu (same component as the menu bar; menuId null = no hover-move).
+			// OPENING a menu posts nothing, so it needs no guard -- the ITEMS go through it on activation
+			// (`activateMenuItem`), by which point the editor is resolved exactly once, at the real action.
 			if (openMenu !== null && openMenu.anchor === btn) {
 				closeMenuDropdown();
 			} else {
@@ -704,20 +733,30 @@ toolbarEl.addEventListener('click', (e) => {
 	}
 });
 
-// The number-format <select>: post the chosen preset, then hand keyboard focus back to the grid so
-// arrow-nav keeps working (the select legitimately took focus to open -- see the focus model above).
-// The host re-renders the grid with the new formatting; the webview keeps no optimistic state.
+// The number-format <select> is a COMMAND PICKER (Codex LOW fix, 2026-06-10): it always rests on the
+// hidden '123' placeholder option and is reset to it after every pick, so choosing the SAME preset for
+// a new selection still fires 'change' (a value-holding select silently ate the re-pick -- 'change'
+// only fires on a value CHANGE -- and formats are per-cell, so no resting value could be truthful
+// anyway). The pick routes through `runAfterResolvingEdit` (the demo-blocker guard) like every other
+// chrome action; the guard owns the focus hand-back (the select legitimately took focus to open
+// natively -- see the focus model above). The host re-renders the grid with the new formatting; the
+// webview keeps no optimistic state.
 const numberFormatSelectEl = toolbarEl.querySelector('select.cgt-select') as HTMLSelectElement;
 numberFormatSelectEl.addEventListener('change', () => {
 	const v = numberFormatSelectEl.value;
+	// Reset to the placeholder FIRST (a programmatic value write fires no 'change'), so the select never
+	// rests on a preset value and every future pick -- same preset included -- is a value change.
+	numberFormatSelectEl.value = '';
 	if (!isNumberFormatPreset(v)) {
-		// The option values are authored in the template above, so this is unreachable unless the
-		// template drifts from NUMBER_FORMAT_PRESETS -- a wiring bug, surfaced loud (No-Fallbacks).
+		// The pickable option values are authored in the template above (the placeholder is hidden+disabled,
+		// so a user can never produce its ''), so this is unreachable unless the template drifts from
+		// NUMBER_FORMAT_PRESETS -- a wiring bug, surfaced loud (No-Fallbacks).
 		console.error('[sheets-webview] number-format select produced an unknown preset (template bug):', v);
+		// Still hand focus back to the grid: a select left focused turns arrow keys into more change events.
+		viewportEl.focus();
 		return;
 	}
-	postSetNumberFormat(v);
-	viewportEl.focus();
+	runAfterResolvingEdit('number format "' + v + '"', () => postSetNumberFormat(v));
 });
 const spacerEl = document.getElementById('sheets-spacer') as HTMLElement;
 const canvasEl = document.getElementById('sheets-canvas') as HTMLCanvasElement;
@@ -893,9 +932,9 @@ function armCommitWatchdog(commitId: number): void {
 			editState.navAfterCommit = undefined;
 			editState.editEl.readOnly = false; // megaudit H1/MED: unlock + refocus so the user can act on the un-stuck editor
 			editState.editEl.focus();
-			// Sheet-tabs cross-sheet guard (2026-06-10): the commit's fate is unknown -- do NOT carry out a
-			// deferred sheet switch over it (the banner below explains; the user can re-click the tab).
-			pendingSheetSwitch = null;
+			// Deferred-action guard (2026-06-10): the commit's fate is unknown -- do NOT carry out a deferred
+			// sheet switch OR chrome action over it (the banner below explains; the user can re-issue it).
+			dropDeferredAction('the commit was never confirmed (watchdog timeout)');
 			showError(
 				'The edit could not be confirmed by the host (no response). It may or may not have been ' +
 				'saved -- check the cell value, then press Escape or re-enter it.',
@@ -917,11 +956,12 @@ function armCommitWatchdog(commitId: number): void {
 //   1. USER-initiated switch (tab-strip click -> `requestSheetSwitch`): resolve the editor FIRST.
 //      Not pending -> commit a changed value (Sheets/Excel commit-on-navigation) / cancel an unchanged
 //      or known-bad one, then switch. Pending (typical: the tab click's own blur just posted the
-//      commit) -> DEFER the switch in `pendingSheetSwitch` until the ack resolves -- never switch
-//      under an in-flight commit. The deferred switch is POSTED on commit success
-//      (`resolvePendingCommit`) and DROPPED on every failure/unknown path (matched `errorReply`,
-//      commit watchdog, malformed-render un-stick) -- each of those already surfaces a visible banner
-//      and keeps/reopens the editor on the OLD sheet, so navigating away would orphan it.
+//      commit) -> DEFER the switch in the shared deferred-action slot (`pendingEditResolvedAction`,
+//      below -- since the Codex demo-blocker fix it also carries chrome actions) until the ack
+//      resolves -- never switch under an in-flight commit. The deferred switch is POSTED on commit
+//      success (`resolvePendingCommit`) and DROPPED on every failure/unknown path (matched
+//      `errorReply`, commit watchdog, malformed-render un-stick) -- each of those already surfaces a
+//      visible banner and keeps/reopens the editor on the OLD sheet, so navigating away would orphan it.
 //   2. HOST-initiated switch (a `render` whose snapshot.sheet differs -- another panel/command):
 //      `applyRender` closes ANY open editor. A non-pending edit is cancelled (its un-committed value
 //      cannot survive onto the wrong sheet; this matches Escape/blur-unchanged). A PENDING commit is
@@ -934,9 +974,167 @@ function armCommitWatchdog(commitId: number): void {
 //        - neither within the watchdog -> LOUD banner: the edit's fate is unknown, check that cell.
 // ============================================================================
 
-/** A user-initiated sheet switch deferred until the in-flight commit resolves (null = none). Last
- * click wins. Set ONLY while a commit is pending; cleared at every commit-resolution point. */
-let pendingSheetSwitch: number | null = null;
+// ============================================================================
+// Deferred-action slot (2026-06-10, Codex DEMO-BLOCKER) -- ONE coherent "wait for the edit to
+// resolve, then act" story shared by USER sheet switches (the tab strip) and EVERY chrome action
+// (toolbar buttons incl. undo/redo, the number-format select, all dropdown + menubar items).
+//
+// WHY chrome actions need it: all chrome controls preventDefault their mousedown so the grid (or an
+// OPEN cell/formula editor) keeps focus -- which also means clicking chrome NEVER blurs an open
+// editor. Without a guard, "editing B2 -> click toolbar-dropdown 'Delete row'" posted the structural
+// command while the editor was still open holding B2's coordinates; the host deleted the row, and the
+// editor's LATER blur/commit posted the OLD coordinate -- a silent write into the shifted row (the
+// demo-blocker). Toolbar undo/redo were worse: they posted and never refocused, so the editor
+// SURVIVED over mutated state. Every chrome action therefore resolves the editor FIRST with EXACTLY
+// `requestSheetSwitch`'s edit-resolution semantics -- one resolver (`resolveEditThen`) serves both,
+// so there is one deferral story, one supersede rule, and one set of resolution points.
+//
+// THE SLOT: at most ONE deferred action exists (`pendingEditResolvedAction`), set ONLY while a
+// commit is in flight, and consumed/dropped at EVERY commit-resolution point -- the exhaustive set:
+//   - `resolvePendingCommit` (matching `commitResult` ok) -> RUN it (the only RUN point);
+//   - matched `errorReply` un-stick                       -> DROP it (the rejection banner explains);
+//   - the commit watchdog                                 -> DROP it (the unknown-fate banner explains);
+//   - the malformed-render un-stick                       -> DROP it (the stale-grid banner explains);
+//   - `applyRender`'s HOST-initiated sheet change         -> a deferred USER switch to a DIFFERENT
+//     sheet is re-posted (the user's intent stands); a deferred CHROME action is DROPPED LOUDLY --
+//     it was aimed at the OLD sheet's selection and must not fire against the new one.
+// A chrome action NEVER runs after a failed/unknown commit (No-Fallbacks: the failure banners are the
+// story; acting on top of them would mutate state the user was just told is uncertain).
+//
+// SUPERSEDE rule: a second deferred request while one is queued REPLACES it -- LOUDLY (console.warn
+// + the visible banner) whenever a chrome action is involved on either side; silently ONLY for
+// sheet-switch-over-sheet-switch (the tab strip's documented "last click wins"). Never a silent
+// overwrite of an action the user was promised.
+// ============================================================================
+
+/** The two deferrable kinds. `sheetSwitch` posts `{type:'switchSheet'}` on resolution (the tab
+ * strip); `chrome` runs a wired chrome control's post (`label` is the human-readable name used by
+ * the supersede/drop banners + warns). */
+type DeferredEditResolvedAction =
+	| { readonly kind: 'sheetSwitch'; readonly sheet: number }
+	| { readonly kind: 'chrome'; readonly label: string; readonly run: () => void };
+
+/** The single deferred action awaiting the in-flight commit's resolution (null = none). Set ONLY
+ * while a commit is pending; consumed/dropped at every commit-resolution point (see the block
+ * comment above). Generalizes the former sheet-switch-only `pendingSheetSwitch`. */
+let pendingEditResolvedAction: DeferredEditResolvedAction | null = null;
+
+/** Human-readable name for the supersede/drop banners + console warns. */
+function describeDeferredAction(a: DeferredEditResolvedAction): string {
+	return a.kind === 'sheetSwitch' ? 'switch to sheet ' + String(a.sheet) : a.label;
+}
+
+/** Queue `next` behind the in-flight commit. A supersede is LOUD (console.warn + the existing banner
+ * pattern) unless it is the tab strip's documented silent sheet-over-sheet "last click wins" --
+ * never a silent overwrite of a queued chrome action (No-Fallbacks). */
+function setDeferredAction(next: DeferredEditResolvedAction): void {
+	if (
+		pendingEditResolvedAction !== null &&
+		!(pendingEditResolvedAction.kind === 'sheetSwitch' && next.kind === 'sheetSwitch')
+	) {
+		const oldDesc = describeDeferredAction(pendingEditResolvedAction);
+		const newDesc = describeDeferredAction(next);
+		console.warn('[sheets-webview] deferred action superseded before the pending edit resolved:', oldDesc, '->', newDesc);
+		showError(
+			'"' + oldDesc + '" was superseded by "' + newDesc + '" while an edit was committing; only "' +
+			newDesc + '" will run.',
+			'transient',
+		);
+	}
+	pendingEditResolvedAction = next;
+}
+
+/** Drop the deferred action at a FAILED/unknown commit-resolution point. The caller's banner is the
+ * user-facing story (each drop point already shows one); the warn keeps the dropped action
+ * diagnosable -- never a silent disappearance. Safe when nothing is queued. */
+function dropDeferredAction(reason: string): void {
+	if (pendingEditResolvedAction === null) {
+		return;
+	}
+	console.warn(
+		'[sheets-webview] dropped the deferred action "' + describeDeferredAction(pendingEditResolvedAction) + '": ' + reason,
+	);
+	pendingEditResolvedAction = null;
+}
+
+/** Execute a deferred (or immediately-runnable) action NOW. The editor is resolved/closed by the
+ * time this runs -- callers guarantee it (`resolveEditThen` immediately after cancel/no-editor;
+ * `resolvePendingCommit` after the success ack closed the editor). */
+function runDeferredActionNow(action: DeferredEditResolvedAction): void {
+	if (action.kind === 'sheetSwitch') {
+		vscode.postMessage({ type: 'switchSheet', sheet: action.sheet });
+	} else {
+		action.run();
+	}
+}
+
+/**
+ * THE shared edit resolver (the demo-blocker fix's core): resolve any open editor, then run `action`
+ * -- immediately when possible, deferred behind the commit otherwise. Mirrors the original
+ * `requestSheetSwitch` semantics EXACTLY (that function now delegates here):
+ *   - no editor open                        -> run NOW ('ran');
+ *   - editor open, value UNCHANGED or
+ *     known-locally-bad (the B2 contract)   -> `cancelEdit()` (Escape/blur-unchanged semantics),
+ *                                              repaint, run NOW ('ran');
+ *   - editor open, CHANGED, not pending     -> commit through the normal machinery (`commitEdit`)
+ *                                              and QUEUE the action ('queued'); a LOCAL reject
+ *                                              (over-limit) keeps the editor open with its 'edit'
+ *                                              banner and the action does NOT run ('blocked');
+ *   - editor already PENDING a commit       -> QUEUE behind that commit ('queued').
+ * A queued action resolves at the slot's resolution points (run on success, dropped on every
+ * failure/unknown path -- see the block comment above).
+ */
+function resolveEditThen(action: DeferredEditResolvedAction): 'ran' | 'queued' | 'blocked' {
+	if (editState !== null) {
+		if (editState.pendingCommit) {
+			setDeferredAction(action); // defer behind the in-flight commit (its resolution points consume/drop)
+			return 'queued';
+		}
+		const value = editState.editEl.value;
+		const changed = value !== editState.initialValue;
+		const knownBad = editState.lastFailedRawInput !== undefined && value === editState.lastFailedRawInput;
+		if (changed && !knownBad) {
+			if (commitEdit()) {
+				setDeferredAction(action); // committed -> now pending; act when the ack resolves
+				return 'queued';
+			}
+			// LOCAL reject (over-limit): commitEdit surfaced its 'edit' banner and the editor stays open
+			// for shortening. Do NOT act -- never run a chrome action / switch sheets over a value the
+			// user has just been told to fix (the banner explains; they can re-issue the action after).
+			return 'blocked';
+		}
+		cancelEdit(); // unchanged / known-bad -> abandon (Escape/blur-unchanged semantics), then act
+		redraw();
+	}
+	runDeferredActionNow(action);
+	return 'ran';
+}
+
+/**
+ * **The chrome-action guard (Codex DEMO-BLOCKER fix, 2026-06-10).** EVERY wired chrome control --
+ * all posting toolbar buttons (incl. undo/redo), the number-format select, and every dropdown /
+ * menubar item (via `activateMenuItem`, the single dropdown seam) -- posts THROUGH this, never
+ * directly, so a host mutation can never race an open editor's stale coordinates. Also owns the
+ * focus restoration the chrome focus model requires (see the FOCUS MODEL comment up top):
+ *   - 'ran'              -> the action fired with no editor in the way: keyboard back to the grid
+ *                           viewport (this is what gives undo/redo the restoration the other wired
+ *                           buttons already had);
+ *   - 'queued'/'blocked' -> the editor owns the interaction: keep/restore focus ON the editor (a
+ *                           pending editor is readOnly and its resolution re-asserts focus; a
+ *                           blocked editor needs the keyboard so the user can shorten the value).
+ *                           Focus must never land on chrome here -- a focused <select> would turn
+ *                           arrow keys into a stream of further change events. (Focusing the
+ *                           formula bar while it IS the live editor is a no-op: `beginEditFormula`
+ *                           early-returns on its own surface.)
+ */
+function runAfterResolvingEdit(label: string, run: () => void): void {
+	const outcome = resolveEditThen({ kind: 'chrome', label, run });
+	if (outcome === 'ran') {
+		viewportEl.focus();
+	} else if (editState !== null) {
+		editState.editEl.focus();
+	}
+}
 
 /** The in-flight commit whose editor a HOST-initiated sheet change closed (null = none). Carries
  * everything needed to report its outcome after `editState` is gone. */
@@ -3044,7 +3242,7 @@ function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean)
 	if (sheetChanged) {
 		errorCells.clear();
 		// **Sheet-tabs cross-sheet edit guard (2026-06-10, Codex HIGH)** -- the INVARIANT (see the guard
-		// block above `pendingSheetSwitch`): NO editor survives a sheet change. This supersedes the earlier
+		// block above `pendingEditResolvedAction`): NO editor survives a sheet change. This supersedes the earlier
 		// Codex-MED fold, which only cancelled a NON-pending FORMULA-BAR edit -- a non-pending OVERLAY
 		// editor and ANY pending edit (both surfaces) survived with old-sheet row/col, so a late
 		// `commitResult` could close/navigate against the NEW sheet using old-sheet coordinates, and the
@@ -3077,14 +3275,26 @@ function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean)
 		if (pendingToDetach !== null) {
 			detachPendingCommit(pendingToDetach);
 		}
-		// A deferred USER switch overtaken by this host-initiated change: honor the user's click if it
-		// targeted a DIFFERENT sheet than the one we just landed on (their intent stands); clear it
-		// either way so it can't fire later against yet another state.
-		if (pendingSheetSwitch !== null) {
-			const target = pendingSheetSwitch;
-			pendingSheetSwitch = null;
-			if (target !== snapshot.sheet) {
-				vscode.postMessage({ type: 'switchSheet', sheet: target });
+		// A deferred action overtaken by this HOST-initiated sheet change. A USER sheet switch: honor
+		// the click if it targeted a DIFFERENT sheet than the one we just landed on (their intent
+		// stands); clear it either way so it can't fire later against yet another state. A CHROME
+		// action (demo-blocker slot): DROP IT LOUDLY -- it was aimed at the OLD sheet's host-tracked
+		// selection, and this switch just replaced both the active sheet and the selection (reset to
+		// A1 above), so running it now would mutate the WRONG sheet. Never silently (No-Fallbacks).
+		if (pendingEditResolvedAction !== null) {
+			const act = pendingEditResolvedAction;
+			pendingEditResolvedAction = null;
+			if (act.kind === 'sheetSwitch') {
+				if (act.sheet !== snapshot.sheet) {
+					vscode.postMessage({ type: 'switchSheet', sheet: act.sheet });
+				}
+			} else {
+				console.warn('[sheets-webview] dropped the deferred action "' + act.label + '": the sheet changed before its edit resolved');
+				showError(
+					'"' + act.label + '" was cancelled: the sheet changed before the pending edit resolved. ' +
+					'Re-issue it on the sheet you want it to act on.',
+					'transient',
+				);
 			}
 		}
 		// Sheet-tabs (2026-06-10): a switch to a DIFFERENT sheet resets the active cell to A1 and scrolls to
@@ -3170,53 +3380,42 @@ function resolvePendingCommit(commitId: number): void {
 	}
 	redraw();
 	viewportEl.focus(); // megaudit LOW: keep keyboard focus on the grid so arrow-nav continues after a commit
-	// Sheet-tabs cross-sheet guard (2026-06-10): the commit this switch was deferred behind has now
-	// RESOLVED successfully and the editor is closed -- carry out the user's sheet switch. (The nav/redraw
-	// above ran on the still-current sheet; the host's switch render then resets selection to A1.)
-	if (pendingSheetSwitch !== null) {
-		const target = pendingSheetSwitch;
-		pendingSheetSwitch = null;
-		vscode.postMessage({ type: 'switchSheet', sheet: target });
+	// Deferred-action slot (2026-06-10): the commit this action was deferred behind has now RESOLVED
+	// successfully and the editor is closed -- carry out the user's queued intent: a tab-strip sheet
+	// switch (the host's switch render then resets selection to A1), or a chrome action (structural /
+	// undo / redo / format / file command -- the demo-blocker guard). This is the ONLY point a deferred
+	// action RUNS; every failure/unknown resolution point drops it instead. The nav/redraw above ran on
+	// the still-current sheet, so the action posts against that settled state, AFTER the committed value
+	// (FIFO on the postMessage channel) -- the exact ordering the corruption fix requires.
+	if (pendingEditResolvedAction !== null) {
+		const act = pendingEditResolvedAction;
+		pendingEditResolvedAction = null;
+		runDeferredActionNow(act);
 	}
 }
 
 /**
  * **Sheet-tabs cross-sheet edit guard (2026-06-10, Codex HIGH)** -- the USER-initiated half of the
- * "no editor survives a sheet change" invariant (see the guard block above `pendingSheetSwitch`).
- * Resolve any open editor BEFORE posting `switchSheet`:
+ * "no editor survives a sheet change" invariant (see the guard block above
+ * `pendingEditResolvedAction`). Since the Codex demo-blocker fix the body is a one-line delegation to
+ * {@link resolveEditThen} (the shared resolver -- chrome actions run the SAME semantics through
+ * `runAfterResolvingEdit`); behavior is unchanged:
  *   - PENDING commit (the typical tab-click case: the strip uses `click`, so the editor's `blur`
  *     already fired and posted a changed value): DEFER the switch until the ack resolves. Posted on
  *     success (`resolvePendingCommit`); dropped, with the existing visible banners, on `errorReply` /
  *     watchdog / malformed-render recovery (each keeps or reopens the editor on the OLD sheet).
- *     Last click wins if the user clicks another tab while still deferred.
+ *     Last click wins if the user clicks another tab while still deferred (silent for
+ *     sheet-over-sheet; LOUD if it supersedes a queued chrome action -- see `setDeferredAction`).
  *   - Open, NOT pending (reachable when focus was not in the editor, so no blur ran): Sheets/Excel
  *     commit-on-navigation -- commit a changed value (then defer the switch behind it exactly as
  *     above); cancel an unchanged or known-bad one (the B2 "abandon a failing value on nav" contract)
  *     and switch immediately. A LOCAL commit reject (over-limit) keeps the editor open with its
  *     'edit' banner and does NOT switch -- never silently discard the user's typed value.
+ * The outcome is deliberately ignored: a tab click moves real focus to the tab button (the strip does
+ * not preventDefault its mousedown), so the chrome guard's focus restoration does not apply here.
  */
 function requestSheetSwitch(id: number): void {
-	if (editState !== null) {
-		if (editState.pendingCommit) {
-			pendingSheetSwitch = id; // defer behind the in-flight commit (resolved/dropped at its resolution points)
-			return;
-		}
-		const value = editState.editEl.value;
-		const changed = value !== editState.initialValue;
-		const knownBad = editState.lastFailedRawInput !== undefined && value === editState.lastFailedRawInput;
-		if (changed && !knownBad) {
-			if (commitEdit()) {
-				pendingSheetSwitch = id; // committed -> now pending; switch when the ack resolves
-				return;
-			}
-			// LOCAL reject (over-limit): commitEdit surfaced its 'edit' banner and the editor stays open
-			// for shortening. Do NOT switch -- the editor must not cross sheets, and the banner explains.
-			return;
-		}
-		cancelEdit(); // unchanged / known-bad -> abandon (Escape/blur-unchanged semantics), then switch
-		redraw();
-	}
-	vscode.postMessage({ type: 'switchSheet', sheet: id });
+	resolveEditThen({ kind: 'sheetSwitch', sheet: id });
 }
 
 // Sheet-tabs (2026-06-10): the strip's interactions post to the host (which owns ALL sheet mutation).
@@ -3285,9 +3484,9 @@ window.addEventListener('message', (event: MessageEvent) => {
 				if (editState.pendingCommit) {
 					editState.pendingCommit = false;
 					editState.navAfterCommit = undefined;
-					// Sheet-tabs cross-sheet guard (2026-06-10): this commit's fate is unknown (the grid is
-					// stale) -- drop any deferred sheet switch rather than navigate away from the warning.
-					pendingSheetSwitch = null;
+					// Deferred-action guard (2026-06-10): this commit's fate is unknown (the grid is stale) --
+					// drop any deferred sheet switch OR chrome action rather than act on top of the warning.
+					dropDeferredAction('the commit fate is unknown (malformed render)');
 					editState.editEl.readOnly = false; // megaudit H1: unlock the editor we just un-stuck
 					// W-G-1b (Codex MED): refocus the un-stuck editor, mirroring the watchdog + errorReply
 					// recovery paths. The document keyhandler is inert while `editState !== null`, so without
@@ -3497,10 +3696,11 @@ window.addEventListener('message', (event: MessageEvent) => {
 		) {
 			editState.pendingCommit = false;
 			editState.navAfterCommit = undefined; // the commit failed -- do not advance the selection
-			// Sheet-tabs cross-sheet guard (2026-06-10): the commit this switch was deferred behind FAILED
-			// and the editor reopens below for correction -- switching away now would orphan it onto the
-			// wrong sheet. Drop the deferral (the rejected banner explains; the user can re-click the tab).
-			pendingSheetSwitch = null;
+			// Deferred-action guard (2026-06-10): the commit this action was deferred behind FAILED and the
+			// editor reopens below for correction -- a sheet switch would orphan it onto the wrong sheet,
+			// and a chrome action must NEVER run on top of a rejected commit. Drop it (the rejection
+			// banner below explains; the user can re-click the tab / re-issue the action).
+			dropDeferredAction('the commit was rejected (errorReply)');
 			editState.lastFailedRawInput = editState.editEl.value; // megaudit B2: a nav key may now leave the bad cell
 			editState.editEl.readOnly = false; // H1: unlock for correction
 			clearCommitWatchdog(); // the host responded (with a failure) -- no recovery needed
