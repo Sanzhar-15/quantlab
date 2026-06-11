@@ -24,12 +24,13 @@
     "watch": "tsc -watch -p ./",
     "build:webviews:quantbook": "node ./esbuild-quantbook-webviews.mjs",
     "watch:webviews:quantbook": "node ./esbuild-quantbook-webviews.mjs --watch",
-    "vscode:prepublish": "npm run compile && npm run build:webviews:quantbook",
+    "vscode:prepublish": "npm run compile && npm run build:webviews && npm run build:webviews:quantbook",
     "lint": "eslint src --ext ts",
     "test": "npm run compile && node node_modules/mocha/bin/mocha.js 'out/test/qviz*.test.js' 'out/test/quantbook*.test.js' --ui tdd --timeout 10000 --require source-map-support/register --require out/test/helpers/mocha-setup.js",
     "test:all": "npm run compile && node node_modules/mocha/bin/mocha.js 'out/test/**/*.test.js' 'out/src/test/**/*.test.js' --ui tdd --timeout 10000 --require source-map-support/register --require out/test/helpers/mocha-setup.js",
     "test:py": "QUANTLAB_REQUIRE_FIXTURES=1 python -m pytest python/qviz/tests/ -q",
-    "test:py:dev": "python -m pytest python/qviz/tests/ -q"
+    "test:py:dev": "python -m pytest python/qviz/tests/ -q",
+    "build:webviews": "node ./esbuild-webview.mjs"
   },
   "activationEvents": [
     "onStartupFinished",
@@ -453,11 +454,6 @@
         "category": "%command.category%"
       },
       {
-        "command": "quantlab.prioritizeHistoryRun",
-        "title": "%command.prioritizeHistoryRun.title%",
-        "category": "%command.category%"
-      },
-      {
         "command": "quantlab.searchHistory",
         "title": "%command.searchHistory.title%",
         "category": "%command.category%"
@@ -508,11 +504,6 @@
         "category": "%command.category%"
       },
       {
-        "command": "quantlab.chart.screenshot",
-        "title": "%command.chart.screenshot.title%",
-        "category": "%command.category%"
-      },
-      {
         "command": "quantlab.chart.applyParameters",
         "title": "%command.chart.applyParameters.title%",
         "category": "%command.category%"
@@ -528,18 +519,8 @@
         "category": "%command.category%"
       },
       {
-        "command": "quantlab.chart.openSettings",
-        "title": "%command.chart.openSettings.title%",
-        "category": "%command.category%"
-      },
-      {
         "command": "quantlab.chart.addVisualizationTemplate",
         "title": "%command.chart.addVisualizationTemplate.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.chart.generateVisualization",
-        "title": "%command.chart.generateVisualization.title%",
         "category": "%command.category%"
       },
       {
@@ -784,10 +765,10 @@
             "filenamePattern": "*.csv"
           },
           {
-            "filenamePattern": "*.parquet"
+            "filenamePattern": "*.tsv"
           },
           {
-            "filenamePattern": "*.xlsx"
+            "filenamePattern": "*.parquet"
           }
         ],
         "priority": "option"

@@ -26,9 +26,9 @@ interface WatermarkEntry {
 	};
 }
 
-const showChatContextKey = ContextKeyExpr.and(ContextKeyExpr.equals('chatSetupHidden', false), ContextKeyExpr.equals('chatSetupDisabled', false));
-
-const openChat: WatermarkEntry = { text: localize('watermark.openChat', "Open Chat"), id: 'workbench.action.chat.open', when: { native: showChatContextKey, web: showChatContextKey } };
+// Quantlab: the watermark chat hint points at Orion (the product's AI panel), not the
+// stock VS Code chat -- which has no configured agent in this fork and would open dead UI.
+const openChat: WatermarkEntry = { text: localize('watermark.openChat', "Open Orion"), id: 'workbench.view.qic' };
 const showCommands: WatermarkEntry = { text: localize('watermark.showCommands', "Show All Commands"), id: 'workbench.action.showCommands' };
 const gotoFile: WatermarkEntry = { text: localize('watermark.quickAccess', "Go to File"), id: 'workbench.action.quickOpen' };
 const openFile: WatermarkEntry = { text: localize('watermark.openFile', "Open File"), id: 'workbench.action.files.openFile' };

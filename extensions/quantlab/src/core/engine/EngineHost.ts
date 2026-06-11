@@ -51,13 +51,15 @@ export class EngineHost {
 		runner.start();
 	}
 
-	cancelJob(jobId: string): void {
+	/** Returns true if a running job was found and cancelled, false if no such job is active. */
+	cancelJob(jobId: string): boolean {
 		const runner = this.queue.get(jobId);
 		if (!runner) {
-			return;
+			return false;
 		}
 		runner.cancel();
 		this.queue.remove(jobId);
+		return true;
 	}
 
 	completeJob(jobId: string): void {
@@ -128,7 +130,7 @@ export class EngineHost {
 					return candidate;
 				}
 			} catch {
-				// Permission or path error — skip
+				// Permission or path error -- skip
 			}
 		}
 

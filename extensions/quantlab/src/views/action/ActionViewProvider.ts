@@ -416,7 +416,10 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 		let artifactPath = '';
 		try {
 			artifactPath = await this.writeConfigArtifact(runId, config);
-		} catch {
+		} catch (error) {
+			// The run can proceed without the config artifact, but a failed write must be
+			// visible -- it means the run's config won't be reproducible from History.
+			console.error(`Failed to write config artifact for run ${runId}:`, error);
 			artifactPath = '';
 		}
 		const historyEntry = this.historyState.createEntry({
@@ -879,7 +882,7 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 								columnField.options = numeric.map(c => ({ label: c.name, value: c.name }));
 							}
 						}
-					} catch { /* Column discovery failed — user can still type column name */ }
+					} catch { /* Column discovery failed -- user can still type column name */ }
 				}
 			} else {
 				// Strategy resources: extract parameters and build defaults
@@ -1370,13 +1373,13 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 		for (const param of parameters) {
 			const key = `param.${param.id}`;
 			if (source === 'custom') {
-				if (!(key in next)) {
+				if (!Object.prototype.hasOwnProperty.call(next, key)) {
 					next[key] = param.default;
 				}
 				continue;
 			}
 
-			if (source === 'chart' && param.id in overrides) {
+			if (source === 'chart' && Object.prototype.hasOwnProperty.call(overrides, param.id)) {
 				next[key] = overrides[param.id];
 				continue;
 			}

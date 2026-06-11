@@ -1,8 +1,13 @@
 /*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/*
  *  ResourcesCatalogService
  *  Singleton service managing catalog fetch, two-tier cache, search, and context filtering.
- *  Cache: memory (5min TTL) → extension storage (persisted across sessions).
- *--------------------------------------------------------------------------------------------*/
+ *  Cache: memory (5min TTL) -> extension storage (persisted across sessions).
+ */
 
 import * as vscode from 'vscode';
 import { ServerApiClient } from '../../core/server/ServerApiClient';
@@ -41,12 +46,12 @@ export class ResourcesCatalogService {
 
 	static getInstance(): ResourcesCatalogService {
 		if (!ResourcesCatalogService.instance) {
-			throw new Error('ResourcesCatalogService not initialized — call initialize(context) first');
+			throw new Error('ResourcesCatalogService not initialized -- call initialize(context) first');
 		}
 		return ResourcesCatalogService.instance;
 	}
 
-	// ── Fetch ─────────────────────────────────────────────────────────────────
+	// ---- Fetch ----
 
 	async getCatalog(forceRefresh?: boolean): Promise<CatalogState | null> {
 		// 1. Check memory cache (with TTL)
@@ -77,13 +82,15 @@ export class ResourcesCatalogService {
 				await this.persistToStorage(catalog);
 				return catalog;
 			}
-			// Server returned null (version match) — memory cache is still valid
+			// Server returned null (version match) -- memory cache is still valid
 			if (this.catalog) {
 				this.catalog.fetchedAt = Date.now();
 				return this.catalog;
 			}
-		} catch {
-			// Server unreachable — fall through to storage
+		} catch (err) {
+			// Server unreachable -- fall through to storage (the provider shows a
+			// stale-cache banner), but the underlying reason must not vanish.
+			console.error('Resources catalog fetch from server failed:', err);
 		}
 
 		// 2. Try extension storage (persisted from a previous fetch)
@@ -151,7 +158,7 @@ export class ResourcesCatalogService {
 		};
 	}
 
-	// ── Cache helpers ─────────────────────────────────────────────────────────
+	// ---- Cache helpers ----
 
 	private isCacheFresh(): boolean {
 		if (!this.catalog || this.catalog.fetchedAt === 0) {
@@ -163,8 +170,10 @@ export class ResourcesCatalogService {
 	private async persistToStorage(catalog: CatalogState): Promise<void> {
 		try {
 			await this.globalState.update(ResourcesCatalogService.STORAGE_KEY, catalog);
-		} catch {
-			// Storage write failure is non-fatal
+		} catch (err) {
+			// Non-fatal (the in-memory catalog still works this session), but a failed
+			// persist means no offline cache next launch -- log it.
+			console.error('Resources catalog persist to globalState failed:', err);
 		}
 	}
 
@@ -173,7 +182,7 @@ export class ResourcesCatalogService {
 		return stored ?? null;
 	}
 
-	// ── Search ────────────────────────────────────────────────────────────────
+	// ---- Search ----
 
 	search(query: string, section: ClientSection): SearchResult[] {
 		if (!this.catalog || !query.trim()) {
@@ -215,7 +224,7 @@ export class ResourcesCatalogService {
 		return results;
 	}
 
-	// ── Contextual Filtering ──────────────────────────────────────────────────
+	// ---- Contextual Filtering ----
 
 	getCategoriesForContext(section: ClientSection, context: DataContextHint): string[] {
 		if (!this.catalog) { return []; }
@@ -225,7 +234,7 @@ export class ResourcesCatalogService {
 			.map(cat => cat.id);
 	}
 
-	// ── Lookup ────────────────────────────────────────────────────────────────
+	// ---- Lookup ----
 
 	getToolById(toolId: string): ResourceTool | undefined {
 		if (!this.catalog) { return undefined; }
@@ -263,13 +272,13 @@ export class ResourcesCatalogService {
 		return this.getSectionForCategory(category.id);
 	}
 
-	// ── Offline check ────────────────────────────────────────────────────────
+	// ---- Offline check ----
 
 	isOfflineResource(toolId: string): boolean {
 		return isOfflineResource(toolId);
 	}
 
-	// ── Dispose ───────────────────────────────────────────────────────────────
+	// ---- Dispose ----
 
 	dispose(): void {
 		this.catalog = null;

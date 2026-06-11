@@ -45,6 +45,13 @@ export class ChatStatusBarEntry extends Disposable implements IWorkbenchContribu
 
 		this.runningSessionsCount = this.chatSessionsService.getInProgress().reduce((total, item) => total + item.count, 0);
 
+		// Quantlab: without a defaultChatAgent in product.json the Copilot status entry is
+		// meaningless (entitlements never initialize, chatSetupHidden stays at its false
+		// default) -- it would render a dangling "Copilot" item in the status bar. Bail.
+		if (!product.defaultChatAgent) {
+			return;
+		}
+
 		this.update();
 
 		this.registerListeners();

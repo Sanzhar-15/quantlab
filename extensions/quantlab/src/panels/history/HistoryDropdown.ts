@@ -99,10 +99,6 @@ export class HistoryDropdown {
 			if (e.button.tooltip === 'Cancel') {
 				void vscode.commands.executeCommand('quantlab.cancelHistoryRun', e.item.entryId);
 			}
-
-			if (e.button.tooltip === 'Prioritize') {
-				void vscode.commands.executeCommand('quantlab.prioritizeHistoryRun', e.item.entryId);
-			}
 		});
 
 		quickPick.onDidHide(() => {
@@ -152,13 +148,12 @@ export class HistoryDropdown {
 	}
 
 	private createEntryItem(entry: HistoryEntry, isRunning: boolean): HistoryQuickPickItem {
-		const label = `${this.formatRunType(entry.type)} — ${path.basename(entry.strategyPath)}`;
+		const label = `${this.formatRunType(entry.type)} -- ${path.basename(entry.strategyPath)}`;
 		const description = entry.status;
 		const detail = entry.progressMessage ?? (entry.progress !== undefined ? `Progress ${entry.progress}%` : undefined);
 		const buttons = isRunning
 			? [
-				{ iconPath: new vscode.ThemeIcon('close'), tooltip: 'Cancel' },
-				{ iconPath: new vscode.ThemeIcon('chevron-up'), tooltip: 'Prioritize' }
+				{ iconPath: new vscode.ThemeIcon('close'), tooltip: 'Cancel' }
 			]
 			: undefined;
 

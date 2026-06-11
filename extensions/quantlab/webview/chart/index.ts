@@ -95,19 +95,14 @@ const refreshButton = document.createElement('button');
 refreshButton.textContent = 'Refresh';
 refreshButton.addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
 
-const screenshotButton = document.createElement('button');
-screenshotButton.textContent = 'Screenshot';
-screenshotButton.addEventListener('click', () => vscode.postMessage({ type: 'screenshot' }));
-
+// Quantlab: the Screenshot and Settings toolbar buttons were removed -- their host
+// handlers are unimplemented stubs ("not available yet" toasts). Re-add them together
+// with real implementations.
 const fullscreenButton = document.createElement('button');
 fullscreenButton.className = 'toolbar-icon-button';
 fullscreenButton.title = 'Toggle Fullscreen';
 fullscreenButton.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 5V2h3M11 2h3v3M14 11v3h-3M5 14H2v-3"/></svg>';
 fullscreenButton.addEventListener('click', () => vscode.postMessage({ type: 'toggleFullscreen' }));
-
-const settingsButton = document.createElement('button');
-settingsButton.textContent = 'Settings';
-settingsButton.addEventListener('click', () => vscode.postMessage({ type: 'openSettings' }));
 
 const leftGroup = document.createElement('div');
 leftGroup.className = 'toolbar-group';
@@ -115,7 +110,7 @@ leftGroup.append(dataSourceContainer, timeframeLabel, strategyButton, dateStart,
 
 const rightGroup = document.createElement('div');
 rightGroup.className = 'toolbar-group';
-rightGroup.append(refreshButton, screenshotButton, fullscreenButton, settingsButton);
+rightGroup.append(refreshButton, fullscreenButton);
 
 const spacer = document.createElement('div');
 spacer.className = 'spacer';
@@ -139,12 +134,11 @@ const addVizButton = document.createElement('button');
 addVizButton.textContent = 'Add visualize()';
 addVizButton.addEventListener('click', () => vscode.postMessage({ type: 'addVisualization' }));
 
-const generateVizButton = document.createElement('button');
-generateVizButton.textContent = 'Generate with AI';
-generateVizButton.classList.add('primary');
-generateVizButton.addEventListener('click', () => vscode.postMessage({ type: 'generateVisualization' }));
+// Quantlab: the "Generate with AI" button was removed -- its host handler is an
+// unimplemented stub ("not available yet" toast). Re-add it when generation is real.
+addVizButton.classList.add('primary');
 
-noVizActions.append(addVizButton, generateVizButton);
+noVizActions.append(addVizButton);
 noVizPrompt.append(noVizText, noVizActions);
 
 const chartContainer = document.createElement('div');
@@ -164,8 +158,15 @@ errorOverlay.appendChild(errorContent);
 chartContainer.appendChild(errorOverlay);
 
 // --- LHS Chart Tools Toolbar ---
+// Quantlab: HIDDEN until drawing tools are wired -- the host 'selectTool' handler is a
+// reserved no-op stub, so the buttons would highlight as active and draw nothing.
+// Flip this to false when ChartViewProvider implements tool selection.
+const LHS_TOOLS_HIDDEN = true;
 const lhsToolbar = document.createElement('div');
 lhsToolbar.className = 'lhs-toolbar';
+if (LHS_TOOLS_HIDDEN) {
+	lhsToolbar.style.display = 'none';
+}
 
 const lhsToggle = document.createElement('button');
 lhsToggle.className = 'lhs-toolbar-toggle';

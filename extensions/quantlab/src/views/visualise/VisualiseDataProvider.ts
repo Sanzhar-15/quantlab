@@ -5,7 +5,9 @@
 
 /**
  * VisualiseDataProvider -- VS Code CustomReadonlyEditorProvider for
- * `*.csv | *.parquet | *.xlsx`.
+ * `*.csv | *.tsv | *.parquet` (the same set the qviz daemon's
+ * ALLOWED_EXTENSIONS and persist.ts allowlist accept -- keep all three in sync;
+ * xlsx was removed from the selector because the daemon rejects it).
  *
  * Phase 5 step A.3 (audit-merged plan). This is the data-file entry point
  * for the Visualise builder. Unlike `VisualiseSpecProvider` (which edits

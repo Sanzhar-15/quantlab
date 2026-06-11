@@ -6,6 +6,7 @@
 import * as vscode from 'vscode';
 import { HistoryDropdown } from '../panels/history/HistoryDropdown';
 import { HistoryState } from '../core/state/HistoryState';
+import { EngineHost } from '../core/engine/EngineHost';
 
 export function registerHistoryCommands(context: vscode.ExtensionContext): void {
 	const dropdown = HistoryDropdown.getInstance();
@@ -31,13 +32,13 @@ export function registerHistoryCommands(context: vscode.ExtensionContext): void 
 			if (!entryId) {
 				return;
 			}
-			void vscode.window.showInformationMessage(`Cancel requested for ${entryId}.`);
-		}),
-		vscode.commands.registerCommand('quantlab.prioritizeHistoryRun', (entryId?: string) => {
-			if (!entryId) {
-				return;
+			// History entry ids ARE EngineHost job ids (ActionViewProvider seeds both from runId).
+			const cancelled = EngineHost.getInstance().cancelJob(entryId);
+			if (cancelled) {
+				void vscode.window.showInformationMessage(`Run ${entryId} cancelled.`);
+			} else {
+				void vscode.window.showWarningMessage(`Run ${entryId} is not active -- nothing to cancel.`);
 			}
-			void vscode.window.showInformationMessage(`Prioritize requested for ${entryId}.`);
 		}),
 		vscode.commands.registerCommand('quantlab.searchHistory', async () => {
 			// CODEX-009: Implement actual history search
