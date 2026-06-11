@@ -13,6 +13,7 @@ import type {
 	SeriesMarker,
 	ThemeTokensInput
 } from '@charts-plus/chart-core';
+import { formatCompactVolume, formatPrice } from './formatters';
 
 export interface OhlcvBar {
 	t: number;
@@ -190,8 +191,48 @@ export class ChartClient {
 	private strategyPaneKeys = new Set<string>();
 	private strategyPaneVisible = true;
 	private ordinalMap: OrdinalTimeMap | null = null;
+	private hoverListener: ((barIndex: number | null) => void) | undefined;
+	private watermarkText: string | null = null;
+	private volumeAxisFormatted = false;
 
 	constructor(private readonly container: HTMLElement) { }
+
+	/**
+	 * Crosshair hover subscription (W4.1 OHLC legend). The callback receives
+	 * the hovered BAR INDEX into the last setData() array, or null when the
+	 * pointer leaves the chart (callers fall back to the last bar).
+	 */
+	setHoverListener(listener: (barIndex: number | null) => void): void {
+		this.hoverListener = listener;
+	}
+
+	/**
+	 * Symbol watermark behind the series (W4.2). Pass null to clear.
+	 * Stored and re-applied across chart creation and theme changes.
+	 */
+	setWatermark(text: string | null): void {
+		this.watermarkText = text;
+		this.applyWatermark();
+	}
+
+	private applyWatermark(): void {
+		if (!this.chart) {
+			return;
+		}
+		if (!this.watermarkText) {
+			this.chart.setWatermark(null);
+			return;
+		}
+		const width = this.container.clientWidth || 800;
+		const fontSizePx = Math.round(Math.min(160, Math.max(48, width / 6)));
+		this.chart.setWatermark({
+			text: this.watermarkText,
+			color: this.resolveColorVar('--ql-fg', '#e7edf8'),
+			opacity: 0.08,
+			fontSizePx,
+			position: 'center'
+		});
+	}
 
 	private snapTime(t: number): number {
 		return this.ordinalMap ? this.ordinalMap.snapToFake(t) : t;
@@ -260,6 +301,13 @@ export class ChartClient {
 				priceLineVisible: false
 			});
 		}
+		if (!this.volumeAxisFormatted) {
+			// W4.4: compact volume axis (12.3M) instead of raw price formatting.
+			this.chart.setPaneAxisOptions(paneId, 'right', {
+				formatter: (value: number) => formatCompactVolume(value)
+			});
+			this.volumeAxisFormatted = true;
+		}
 
 		const up = withAlpha(this.colors.positive, 0.45);
 		const down = withAlpha(this.colors.negative, 0.45);
@@ -307,6 +355,18 @@ export class ChartClient {
 		this.updateMarkers();
 	}
 
+	/**
+	 * Appends a single live signal (H15: host 'addSignal' fills during live
+	 * trading sessions) without replacing the existing signal set. Markers
+	 * are re-snapped through the ordinal map like every other marker source.
+	 */
+	async addSignal(signal: SignalPoint): Promise<void> {
+		await this.ensureChart();
+		this.lastSignals = [...this.lastSignals, signal];
+		this.signalMarkers = this.buildSignalMarkers(this.lastSignals);
+		this.updateMarkers();
+	}
+
 	setTimeframe(timeframe: string): void {
 		const normalized = timeframe.trim();
 		if (!normalized) {
@@ -327,7 +387,7 @@ export class ChartClient {
 
 		const entries: SignalPoint[] = [];
 		const exits: SignalPoint[] = [];
-		const pendingEquity: OhlcvBar[][] = [];
+		const pendingEquity: EquityPoint[][] = [];
 
 		this.chart.batch(() => {
 			this.resetVisualizationSeries();
@@ -453,6 +513,8 @@ export class ChartClient {
 		this.paneDividerColor = this.resolveColorVar('--vscode-editorGroup-border', 'rgba(255, 255, 255, 0.2)');
 		this.applyThemeTokens();
 		this.rebuildMarkers();
+		// Watermark color is resolved from --ql-fg at apply time -- re-resolve.
+		this.applyWatermark();
 	}
 
 	refreshLayout(): void {
@@ -507,6 +569,35 @@ export class ChartClient {
 			downColor: this.colors.negative,
 			axis: 'right'
 		});
+
+		// W4.4: the right price axis (default pane) renders with the same
+		// precision as the market header / OHLC legend, so axis and legend agree.
+		const defaultPane = this.chart.getPanes()[0];
+		if (defaultPane) {
+			this.chart.setPaneAxisOptions(defaultPane.id, 'right', {
+				formatter: (value: number) => formatPrice(value)
+			});
+		}
+
+		// W4.1: crosshair-move events map the chart's ordinal (fake) time back
+		// to a bar index for the OHLC legend; pointer leaving the chart falls
+		// back to the last bar (null).
+		this.chart.onCrosshairMove(event => {
+			if (!this.hoverListener) {
+				return;
+			}
+			if (!this.lastBars.length) {
+				this.hoverListener(null);
+				return;
+			}
+			const index = Math.max(0, Math.min(Math.round(event.time / ORD_STEP_MS), this.lastBars.length - 1));
+			this.hoverListener(index);
+		});
+		this.container.addEventListener('pointerleave', () => {
+			this.hoverListener?.(null);
+		});
+
+		this.applyWatermark();
 	}
 
 	private ensurePane(key: string, height?: number): string {
@@ -634,7 +725,12 @@ export class ChartClient {
 				break; // All active -- allow temporary overflow
 			}
 			const evicted = this.visualizationSeries.splice(inactiveIdx, 1)[0];
-			this.chart?.removeSeries(evicted.series);
+			// The chart library has NO series-removal API (Chart exposes only
+			// destroy()). The previous `this.chart?.removeSeries(...)` call
+			// would have thrown a TypeError the first time eviction fired.
+			// Empty + hide the evicted series and drop our handle instead.
+			evicted.series.setData([]);
+			evicted.series.setVisible(false);
 			// Prune pane entry only if no remaining series reference it AND
 			// the new handle being added doesn't share the same paneKey
 			if (evicted.paneKey !== undefined && evicted.paneKey !== paneKey) {
@@ -720,24 +816,38 @@ export class ChartClient {
 			return;
 		}
 
-		this.chart.addPlugin({
+		this.chart.addPlugin<CanvasRenderingContext2D>({
 			onRenderOverlay: (ctx, state) => {
 				const panes = state.layout.panes ?? [];
-				if (panes.length <= 1) {
-					return;
+				if (panes.length > 1) {
+					ctx.save();
+					ctx.strokeStyle = this.paneDividerColor;
+					ctx.lineWidth = 2;
+					for (let i = 0; i < panes.length - 1; i++) {
+						const pane = panes[i];
+						const y = state.snapY(pane.plotRect.y + pane.plotRect.height);
+						ctx.beginPath();
+						ctx.moveTo(state.plotRect.x, y);
+						ctx.lineTo(state.plotRect.x + state.plotRect.width, y);
+						ctx.stroke();
+					}
+					ctx.restore();
 				}
-				ctx.save();
-				ctx.strokeStyle = this.paneDividerColor;
-				ctx.lineWidth = 2;
-				for (let i = 0; i < panes.length - 1; i++) {
-					const pane = panes[i];
-					const y = state.snapY(pane.plotRect.y + pane.plotRect.height);
-					ctx.beginPath();
-					ctx.moveTo(state.plotRect.x, y);
-					ctx.lineTo(state.plotRect.x + state.plotRect.width, y);
-					ctx.stroke();
+
+				// W4.4: 'Vol' tag identifying the volume pane (data mode).
+				const volumePaneId = this.volumeEnabled ? this.paneMap.get('volume') : undefined;
+				if (volumePaneId) {
+					const volumePane = panes.find(pane => pane.id === volumePaneId);
+					if (volumePane) {
+						ctx.save();
+						ctx.font = `600 ${Math.max(9, Math.round(state.theme.fontSizePx * 0.85))}px ${state.theme.fontFamily}`;
+						ctx.fillStyle = withAlpha(state.theme.axisText, 0.6);
+						ctx.textBaseline = 'top';
+						ctx.textAlign = 'left';
+						ctx.fillText('Vol', volumePane.plotRect.x + 6, volumePane.plotRect.y + 5);
+						ctx.restore();
+					}
 				}
-				ctx.restore();
 			}
 		});
 	}
@@ -977,17 +1087,5 @@ export class ChartClient {
 			priceLineVisible: options.priceLineVisible ?? null
 		};
 		return JSON.stringify(key);
-	}
-
-	private async applyClearCommand(target: 'signals' | 'equity' | 'indicators' | 'all'): Promise<void> {
-		if (target === 'signals' || target === 'all') {
-			this.clearSignals();
-		}
-		if (target === 'equity' || target === 'all') {
-			await this.setEquityCurve([]);
-		}
-		if (target === 'indicators' || target === 'all') {
-			this.resetVisualizationSeries();
-		}
 	}
 }

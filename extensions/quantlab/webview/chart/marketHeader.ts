@@ -17,6 +17,7 @@
  */
 
 import type { OhlcvBar } from './chartApi';
+import { formatPrice } from './formatters';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -46,6 +47,13 @@ export interface MarketHeader {
 	setSource(symbol: string | undefined, displayName: string | undefined, assetClass?: string): void;
 	setTimeframe(timeframe: string | undefined): void;
 	updateFromBars(bars: OhlcvBar[]): void;
+	/**
+	 * Reflects the tab's CURRENT date-range override so the matching preset
+	 * highlights without a click (W4.4): no override = the host's widest
+	 * default window = 'All'; a range posted by a preset keeps that preset
+	 * active across toolbar refreshes; any other range clears the highlight.
+	 */
+	setRange(range: { start: string; end: string } | undefined): void;
 }
 
 export function createMarketHeader(
@@ -92,6 +100,9 @@ export function createMarketHeader(
 	let earliestT: number | undefined;
 	let timeframe = '1D';
 	let currentSymbol: string | undefined;
+	// Last range POSTED by a preset click, so setRange() can keep that preset
+	// highlighted when the host echoes the override back via setToolbar.
+	let lastPosted: { id: string; range: { start: string; end: string } | undefined } | undefined;
 	const presetButtons = new Map<string, HTMLButtonElement>();
 
 	const setActive = (id: string | null) => {
@@ -109,6 +120,7 @@ export function createMarketHeader(
 
 		if (preset.id === 'all') {
 			// Clear the override -> the host falls back to its widest default window.
+			lastPosted = { id: 'all', range: undefined };
 			postMessage({ type: 'overrideDateRange', range: undefined });
 			setActive('all');
 			return;
@@ -125,10 +137,9 @@ export function createMarketHeader(
 			return;
 		}
 
-		postMessage({
-			type: 'overrideDateRange',
-			range: { start: toIsoDate(start), end: toIsoDate(end) }
-		});
+		const range = { start: toIsoDate(start), end: toIsoDate(end) };
+		lastPosted = { id: preset.id, range };
+		postMessage({ type: 'overrideDateRange', range });
 		setActive(preset.id);
 	};
 
@@ -143,12 +154,6 @@ export function createMarketHeader(
 	}
 
 	root.append(identitySlot, ticker, quote, meta, spacer, presetGroup, actionsSlot);
-
-	const formatPrice = (value: number): string => {
-		const abs = Math.abs(value);
-		const digits = abs >= 1000 ? 2 : abs >= 1 ? 2 : 4;
-		return value.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
-	};
 
 	const formatAsOf = (t: number): string =>
 		new Date(t).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
@@ -191,6 +196,20 @@ export function createMarketHeader(
 			if (tf) {
 				timeframe = tf;
 			}
+		},
+		setRange(range) {
+			if (!range) {
+				// No override = the host's widest default window ('All').
+				setActive('all');
+				return;
+			}
+			if (lastPosted?.range && lastPosted.range.start === range.start && lastPosted.range.end === range.end) {
+				setActive(lastPosted.id);
+				return;
+			}
+			// A range this header did not post (e.g. restored from a previous
+			// session or set via the strategy date inputs) -- no preset matches.
+			setActive(null);
 		},
 		updateFromBars(bars) {
 			if (!bars.length) {

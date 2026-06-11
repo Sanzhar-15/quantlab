@@ -1,6 +1,9 @@
 /*---------------------------------------------------------------------------------------------
- *  DataViewManager - Handles view switching for data files
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+// DataViewManager - Handles view switching for data files
 
 import * as vscode from 'vscode';
 import * as path from 'path';
@@ -16,297 +19,331 @@ import {
 import { serializeSpec } from '../qviz/specCore';
 
 export class DataViewManager {
-    private static instance: DataViewManager;
+	private static instance: DataViewManager;
 
-    // Track which data file was active when Action was clicked
-    private lastActiveDataFile: vscode.Uri | undefined;
+	// Track which data file was active when Action was clicked
+	private lastActiveDataFile: vscode.Uri | undefined;
 
-    // Pending test to configure (solves race condition when opening Stats view)
-    private readonly pendingTestByUri = new Map<string, string>();
+	// Pending test to configure (solves race condition when opening Stats view)
+	private readonly pendingTestByUri = new Map<string, string>();
 
-    private constructor() {}
+	private constructor() { }
 
-    static getInstance(): DataViewManager {
-        if (!DataViewManager.instance) {
-            DataViewManager.instance = new DataViewManager();
-        }
-        return DataViewManager.instance;
-    }
+	static getInstance(): DataViewManager {
+		if (!DataViewManager.instance) {
+			DataViewManager.instance = new DataViewManager();
+		}
+		return DataViewManager.instance;
+	}
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // View Switching
-    // ─────────────────────────────────────────────────────────────────────────
+	// -------------------------------------------------------------------------
+	// View Switching
+	// -------------------------------------------------------------------------
 
-    /**
-     * Switch to Visualise view for a data file
-     */
-    async switchToVisualise(resource: vscode.Uri): Promise<void> {
-        if (!this.isDataFile(resource)) {
-            void vscode.window.showWarningMessage('This file is not a supported data file.');
-            return;
-        }
+	/**
+	 * Switch to Visualise view for a data file
+	 */
+	async switchToVisualise(resource: vscode.Uri): Promise<void> {
+		if (!this.isDataFile(resource)) {
+			void vscode.window.showWarningMessage('This file is not a supported data file.');
+			return;
+		}
+		// Megaudit 2026-06-11 (M73): the qviz daemon's pyarrow reader has
+		// no xlsx support (persist.ts ALLOWED_EXTENSIONS = parquet/csv/tsv).
+		// Without this gate we would create a companion .qviz.json whose
+		// first schema() RPC fails with `extension-not-allowed` and whose
+		// save is permanently refused. Refuse up front instead.
+		if (this.getDataFileType(resource) === 'xlsx') {
+			void vscode.window.showWarningMessage(
+				'Visualise does not support .xlsx files (the data daemon cannot read Excel). '
+				+ 'Export the sheet as CSV, or use the Stats view.',
+			);
+			return;
+		}
 
-        // Step D (Phase 5 bridge, 2026-05-11): "Visualise" on a CSV/parquet/xlsx
-        // now routes to the NEW qviz-spec builder (Phase 5) rather than the legacy
-        // `quantlab.visualiseView` data stub. We do that by ensuring a companion
-        // `.qviz.json` exists next to the data file and opening THAT with the spec
-        // editor's viewType. Pattern mirrors how Tableau "Save Workbook" produces
-        // a `.twb` next to the source data -- except we create the spec on the
-        // first Visualise click rather than on first save, so the file is visible
-        // in the explorer immediately and the user can rename / delete it like
-        // any other artifact in the workspace.
-        const specUri = await this.ensureCompanionSpec(resource);
-        if (specUri === null) {
-            // ensureCompanionSpec already surfaced a user-facing error notification.
-            return;
-        }
-        await vscode.commands.executeCommand('vscode.openWith', specUri, 'quantlab.visualiseSpecView');
-        this.updateContextKeys('visualise', this.getDataFileType(resource));
-    }
+		// Step D (Phase 5 bridge, 2026-05-11): "Visualise" on a CSV/TSV/parquet
+		// file now routes to the NEW qviz-spec builder (Phase 5) rather than the
+		// legacy `quantlab.visualiseView` data stub. We do that by ensuring a companion
+		// `.qviz.json` exists next to the data file and opening THAT with the spec
+		// editor's viewType. Pattern mirrors how Tableau "Save Workbook" produces
+		// a `.twb` next to the source data -- except we create the spec on the
+		// first Visualise click rather than on first save, so the file is visible
+		// in the explorer immediately and the user can rename / delete it like
+		// any other artifact in the workspace.
+		const specUri = await this.ensureCompanionSpec(resource);
+		if (specUri === null) {
+			// ensureCompanionSpec already surfaced a user-facing error notification.
+			return;
+		}
+		await vscode.commands.executeCommand('vscode.openWith', specUri, 'quantlab.visualiseSpecView');
+		this.updateContextKeys('visualise', this.getDataFileType(resource));
+	}
 
-    /**
-     * Step D helper: returns the URI of the companion `.qviz.json` for a
-     * given data file, creating it on disk with a valid draft spec if it
-     * doesn't exist yet. Returns null on failure (and surfaces the error
-     * to the user via `showErrorMessage`).
-     *
-     * Idempotent: if the companion already exists (e.g. the user clicked
-     * "Visualise" before, edited the chart, saved), this returns that
-     * existing URI WITHOUT touching the file -- the prior edits are
-     * preserved and the builder re-opens with the saved state.
-     */
-    private async ensureCompanionSpec(dataUri: vscode.Uri): Promise<vscode.Uri | null> {
-        const dataFsPath = dataUri.fsPath;
-        const specFsPath = companionSpecPath(dataFsPath);
-        const specUri = vscode.Uri.file(specFsPath);
+	/**
+	 * Step D helper: returns the URI of the companion `.qviz.json` for a
+	 * given data file, creating it on disk with a valid draft spec if it
+	 * doesn't exist yet. Returns null on failure (and surfaces the error
+	 * to the user via `showErrorMessage`).
+	 *
+	 * Idempotent: if the companion already exists (e.g. the user clicked
+	 * "Visualise" before, edited the chart, saved), this returns that
+	 * existing URI WITHOUT touching the file -- the prior edits are
+	 * preserved and the builder re-opens with the saved state.
+	 */
+	private async ensureCompanionSpec(dataUri: vscode.Uri): Promise<vscode.Uri | null> {
+		const dataFsPath = dataUri.fsPath;
+		const specFsPath = companionSpecPath(dataFsPath);
+		const specUri = vscode.Uri.file(specFsPath);
 
-        // If a companion exists already, just open it. The spec's own
-        // validator catches malformed prior content; we don't validate
-        // here so an existing-but-invalid file surfaces its error
-        // through the normal `VisualiseSpecProvider.openCustomDocument`
-        // path (which the user already knows how to debug).
-        try {
-            await vscode.workspace.fs.stat(specUri);
-            return specUri;
-        } catch (e) {
-            const code = (e as { code?: string })?.code;
-            if (code !== 'FileNotFound' && code !== 'ENOENT') {
-                // Some other stat failure (permission, transient FS issue).
-                // Surface and refuse so the user knows the open didn't land.
-                void vscode.window.showErrorMessage(
-                    `Quantlab: cannot inspect ${specFsPath}: ${(e as Error)?.message ?? String(e)}`,
-                );
-                return null;
-            }
-            // Fall through to create.
-        }
+		// If a companion exists already, just open it. The spec's own
+		// validator catches malformed prior content; we don't validate
+		// here so an existing-but-invalid file surfaces its error
+		// through the normal `VisualiseSpecProvider.openCustomDocument`
+		// path (which the user already knows how to debug).
+		try {
+			await vscode.workspace.fs.stat(specUri);
+			return specUri;
+		} catch (e) {
+			const code = (e as { code?: string })?.code;
+			if (code !== 'FileNotFound' && code !== 'ENOENT') {
+				// Some other stat failure (permission, transient FS issue).
+				// Surface and refuse so the user knows the open didn't land.
+				void vscode.window.showErrorMessage(
+					`Quantlab: cannot inspect ${specFsPath}: ${(e as Error)?.message ?? String(e)}`,
+				);
+				return null;
+			}
+			// Fall through to create.
+		}
 
-        // Compute the dataset URI as workspace-relative. Walk every
-        // workspace folder and pick the first one that contains the data
-        // file. Refusing to fall through to absolute paths matches the
-        // qviz daemon's own contract.
-        const folders = vscode.workspace.workspaceFolders;
-        if (!folders || folders.length === 0) {
-            void vscode.window.showErrorMessage(
-                'Quantlab: cannot create a Visualise spec without an open workspace folder.',
-            );
-            return null;
-        }
-        let datasetRelUri: string | null = null;
-        for (const f of folders) {
-            datasetRelUri = workspaceRelativeDatasetUri(dataFsPath, f.uri.fsPath);
-            if (datasetRelUri !== null) { break; }
-        }
-        if (datasetRelUri === null) {
-            void vscode.window.showErrorMessage(
-                `Quantlab: cannot Visualise ${dataFsPath} -- it lives outside every open workspace folder.`,
-            );
-            return null;
-        }
+		// Compute the dataset URI as workspace-relative. Walk every
+		// workspace folder and pick the first one that contains the data
+		// file. Refusing to fall through to absolute paths matches the
+		// qviz daemon's own contract.
+		const folders = vscode.workspace.workspaceFolders;
+		if (!folders || folders.length === 0) {
+			void vscode.window.showErrorMessage(
+				'Quantlab: cannot create a Visualise spec without an open workspace folder.',
+			);
+			return null;
+		}
+		let datasetRelUri: string | null = null;
+		for (const f of folders) {
+			datasetRelUri = workspaceRelativeDatasetUri(dataFsPath, f.uri.fsPath);
+			if (datasetRelUri !== null) { break; }
+		}
+		if (datasetRelUri === null) {
+			void vscode.window.showErrorMessage(
+				`Quantlab: cannot Visualise ${dataFsPath} -- it lives outside every open workspace folder.`,
+			);
+			return null;
+		}
 
-        const draft = buildDraftSpecForDataset(datasetRelUri);
-        const bytes = serializeSpec(draft);
-        try {
-            await vscode.workspace.fs.writeFile(specUri, bytes);
-        } catch (e) {
-            void vscode.window.showErrorMessage(
-                `Quantlab: failed to create ${specFsPath}: ${(e as Error)?.message ?? String(e)}`,
-            );
-            return null;
-        }
-        return specUri;
-    }
+		const draft = buildDraftSpecForDataset(datasetRelUri);
+		const bytes = serializeSpec(draft);
+		try {
+			await vscode.workspace.fs.writeFile(specUri, bytes);
+		} catch (e) {
+			void vscode.window.showErrorMessage(
+				`Quantlab: failed to create ${specFsPath}: ${(e as Error)?.message ?? String(e)}`,
+			);
+			return null;
+		}
+		return specUri;
+	}
 
-    /**
-     * Open Data Action - opens Action view tab and focuses Resources panel
-     */
-    async openDataAction(resource: vscode.Uri): Promise<void> {
-        if (!this.isDataFile(resource)) {
-            void vscode.window.showWarningMessage('This file is not a supported data file.');
-            return;
-        }
+	/**
+	 * Open Data Action - opens Action view tab and focuses Resources panel
+	 */
+	async openDataAction(resource: vscode.Uri): Promise<void> {
+		if (!this.isDataFile(resource)) {
+			void vscode.window.showWarningMessage('This file is not a supported data file.');
+			return;
+		}
+		// Megaudit 2026-06-11 (H40): TSV is a Visualise-only format. The
+		// Action view classifies non-csv/parquet/xlsx files as strategies
+		// and its custom-editor selector excludes *.tsv -- refuse loudly
+		// instead of opening a view that misparses the file.
+		if (this.getDataFileType(resource) === 'tsv') {
+			void vscode.window.showWarningMessage(
+				'The Action view does not support .tsv files. Use Visualise instead.',
+			);
+			return;
+		}
 
-        // Remember which data file was active
-        this.lastActiveDataFile = resource;
+		// Remember which data file was active
+		this.lastActiveDataFile = resource;
 
-        // Open Action view tab on the data file
-        await vscode.commands.executeCommand('vscode.openWith', resource, 'quantlab.actionView');
+		// Open Action view tab on the data file
+		await vscode.commands.executeCommand('vscode.openWith', resource, 'quantlab.actionView');
 
-        // Focus Resources panel on stats section
-        await vscode.commands.executeCommand('quantlab.setResourcesSection', 'stats');
-        await vscode.commands.executeCommand('workbench.view.extension.quantlab-resources');
+		// Focus Resources panel on stats section
+		await vscode.commands.executeCommand('quantlab.setResourcesSection', 'stats');
+		await vscode.commands.executeCommand('workbench.view.extension.quantlab-resources');
 
-        this.updateContextKeys('action', this.getDataFileType(resource));
-    }
+		this.updateContextKeys('action', this.getDataFileType(resource));
+	}
 
-    /**
-     * Open a specific stats test - called when user clicks test in Resources panel
-     */
-    async openStatsTest(testId: string): Promise<void> {
-        const resource = this.lastActiveDataFile ?? this.getActiveDataFileFromEditor();
+	/**
+	 * Open a specific stats test - called when user clicks test in Resources panel
+	 */
+	async openStatsTest(testId: string): Promise<void> {
+		const resource = this.lastActiveDataFile ?? this.getActiveDataFileFromEditor();
 
-        if (!resource) {
-            void vscode.window.showWarningMessage(
-                'No data file selected. Please open a data file first.'
-            );
-            return;
-        }
+		if (!resource) {
+			void vscode.window.showWarningMessage(
+				'No data file selected. Please open a data file first.'
+			);
+			return;
+		}
 
-        // Store pending test BEFORE opening editor (solves race condition)
-        this.pendingTestByUri.set(resource.toString(), testId);
+		// Megaudit 2026-06-11 (H40): the Stats view has no TSV parser and
+		// its custom-editor selector excludes *.tsv -- refuse loudly.
+		if (this.getDataFileType(resource) === 'tsv') {
+			void vscode.window.showWarningMessage(
+				'The Stats view does not support .tsv files. Use Visualise instead.',
+			);
+			return;
+		}
 
-        // Open Stats view as custom editor
-        await vscode.commands.executeCommand('vscode.openWith', resource, 'quantlab.statsView');
+		// Store pending test BEFORE opening editor (solves race condition)
+		this.pendingTestByUri.set(resource.toString(), testId);
 
-        this.updateContextKeys('stats', this.getDataFileType(resource));
-    }
+		// Open Stats view as custom editor
+		await vscode.commands.executeCommand('vscode.openWith', resource, 'quantlab.statsView');
 
-    /**
-     * Switch to Editor view for a data file (with binary file handling)
-     */
-    async switchToEditor(resource: vscode.Uri): Promise<void> {
-        const fileType = this.getDataFileType(resource);
+		this.updateContextKeys('stats', this.getDataFileType(resource));
+	}
 
-        // Binary files can't be viewed as text
-        if (fileType === 'parquet' || fileType === 'xlsx') {
-            const choice = await vscode.window.showWarningMessage(
-                'Binary data files cannot be viewed as text. Use Visualise view to explore the data.',
-                'Open Visualise',
-                'Cancel'
-            );
-            if (choice === 'Open Visualise') {
-                await this.switchToVisualise(resource);
-            }
-            return;
-        }
+	/**
+	 * Switch to Editor view for a data file (with binary file handling)
+	 */
+	async switchToEditor(resource: vscode.Uri): Promise<void> {
+		const fileType = this.getDataFileType(resource);
 
-        // CSV can be viewed as text
-        await vscode.commands.executeCommand('vscode.openWith', resource, 'default');
-        this.updateContextKeys('editor', fileType);
-    }
+		// Binary files can't be viewed as text
+		if (fileType === 'parquet' || fileType === 'xlsx') {
+			const choice = await vscode.window.showWarningMessage(
+				'Binary data files cannot be viewed as text. Use Visualise view to explore the data.',
+				'Open Visualise',
+				'Cancel'
+			);
+			if (choice === 'Open Visualise') {
+				await this.switchToVisualise(resource);
+			}
+			return;
+		}
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Pending Test Pattern (for Stats view initialization)
-    // ─────────────────────────────────────────────────────────────────────────
+		// CSV/TSV can be viewed as text
+		await vscode.commands.executeCommand('vscode.openWith', resource, 'default');
+		this.updateContextKeys('editor', fileType);
+	}
 
-    /**
-     * Consume pending test for a resource
-     * Called by StatsViewProvider when the view initializes
-     */
-    consumePendingTest(resource: vscode.Uri): string | undefined {
-        const key = resource.toString();
-        const testId = this.pendingTestByUri.get(key);
-        if (testId) {
-            this.pendingTestByUri.delete(key);
-        }
-        return testId;
-    }
+	// -------------------------------------------------------------------------
+	// Pending Test Pattern (for Stats view initialization)
+	// -------------------------------------------------------------------------
 
-    /**
-     * Check if there's a pending test for a resource
-     */
-    hasPendingTest(resource: vscode.Uri): boolean {
-        return this.pendingTestByUri.has(resource.toString());
-    }
+	/**
+	 * Consume pending test for a resource
+	 * Called by StatsViewProvider when the view initializes
+	 */
+	consumePendingTest(resource: vscode.Uri): string | undefined {
+		const key = resource.toString();
+		const testId = this.pendingTestByUri.get(key);
+		if (testId) {
+			this.pendingTestByUri.delete(key);
+		}
+		return testId;
+	}
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Active Data Source (for server-side tool execution)
-    // ─────────────────────────────────────────────────────────────────────────
+	/**
+	 * Check if there's a pending test for a resource
+	 */
+	hasPendingTest(resource: vscode.Uri): boolean {
+		return this.pendingTestByUri.has(resource.toString());
+	}
 
-    /**
-     * Set the active data source (server symbol or local file).
-     * Called from the Data panel when a user selects a server symbol or opens a local file.
-     *
-     * NOTE: This now delegates to GlobalState to maintain a single source of truth.
-     */
-    setActiveDataSource(source: DataSourceDescriptor): void {
-        GlobalState.getInstance().setDataSource(source);
-    }
+	// -------------------------------------------------------------------------
+	// Active Data Source (for server-side tool execution)
+	// -------------------------------------------------------------------------
 
-    /**
-     * Get the currently active data source for tool execution.
-     *
-     * NOTE: This now delegates to GlobalState to maintain a single source of truth.
-     */
-    getActiveDataSource(): DataSourceDescriptor | undefined {
-        return GlobalState.getInstance().getDataSource();
-    }
+	/**
+	 * Set the active data source (server symbol or local file).
+	 * Called from the Data panel when a user selects a server symbol or opens a local file.
+	 *
+	 * NOTE: This now delegates to GlobalState to maintain a single source of truth.
+	 */
+	setActiveDataSource(source: DataSourceDescriptor): void {
+		GlobalState.getInstance().setDataSource(source);
+	}
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Helpers
-    // ─────────────────────────────────────────────────────────────────────────
+	/**
+	 * Get the currently active data source for tool execution.
+	 *
+	 * NOTE: This now delegates to GlobalState to maintain a single source of truth.
+	 */
+	getActiveDataSource(): DataSourceDescriptor | undefined {
+		return GlobalState.getInstance().getDataSource();
+	}
 
-    /**
-     * Get the data file type from URI
-     */
-    getDataFileType(resource: vscode.Uri): DataFileType | null {
-        const ext = path.extname(resource.path).toLowerCase();
-        switch (ext) {
-            case '.csv': return 'csv';
-            case '.parquet': return 'parquet';
-            case '.xlsx': return 'xlsx';
-            default: return null;
-        }
-    }
+	// -------------------------------------------------------------------------
+	// Helpers
+	// -------------------------------------------------------------------------
 
-    /**
-     * Check if a resource is a data file
-     */
-    isDataFile(resource: vscode.Uri): boolean {
-        return this.getDataFileType(resource) !== null;
-    }
+	/**
+	 * Get the data file type from URI
+	 */
+	getDataFileType(resource: vscode.Uri): DataFileType | null {
+		const ext = path.extname(resource.path).toLowerCase();
+		switch (ext) {
+			case '.csv': return 'csv';
+			case '.tsv': return 'tsv';
+			case '.parquet': return 'parquet';
+			case '.xlsx': return 'xlsx';
+			default: return null;
+		}
+	}
 
-    /**
-     * Get the currently active data file from editor (if any)
-     */
-    getActiveDataFile(): vscode.Uri | undefined {
-        return this.lastActiveDataFile ?? this.getActiveDataFileFromEditor();
-    }
+	/**
+	 * Check if a resource is a data file
+	 */
+	isDataFile(resource: vscode.Uri): boolean {
+		return this.getDataFileType(resource) !== null;
+	}
 
-    private getActiveDataFileFromEditor(): vscode.Uri | undefined {
-        const activeTab = vscode.window.tabGroups.activeTabGroup?.activeTab;
-        if (!activeTab) return undefined;
+	/**
+	 * Get the currently active data file from editor (if any)
+	 */
+	getActiveDataFile(): vscode.Uri | undefined {
+		return this.lastActiveDataFile ?? this.getActiveDataFileFromEditor();
+	}
 
-        let uri: vscode.Uri | undefined;
+	private getActiveDataFileFromEditor(): vscode.Uri | undefined {
+		const activeTab = vscode.window.tabGroups.activeTabGroup?.activeTab;
+		if (!activeTab) {
+			return undefined;
+		}
 
-        if (activeTab.input instanceof vscode.TabInputText) {
-            uri = activeTab.input.uri;
-        } else if (activeTab.input instanceof vscode.TabInputCustom) {
-            uri = activeTab.input.uri;
-        }
+		let uri: vscode.Uri | undefined;
 
-        if (uri && this.isDataFile(uri)) {
-            return uri;
-        }
+		if (activeTab.input instanceof vscode.TabInputText) {
+			uri = activeTab.input.uri;
+		} else if (activeTab.input instanceof vscode.TabInputCustom) {
+			uri = activeTab.input.uri;
+		}
 
-        return undefined;
-    }
+		if (uri && this.isDataFile(uri)) {
+			return uri;
+		}
 
-    private updateContextKeys(view: DataViewType, fileType: DataFileType | null): void {
-        void vscode.commands.executeCommand('setContext', 'quantlab.currentView', view);
-        void vscode.commands.executeCommand('setContext', 'quantlab.isDataFile', Boolean(fileType));
-        void vscode.commands.executeCommand('setContext', 'quantlab.dataFileType', fileType);
-        // Clear strategy flag when on data file
-        void vscode.commands.executeCommand('setContext', 'quantlab.isStrategy', false);
-    }
+		return undefined;
+	}
+
+	private updateContextKeys(view: DataViewType, fileType: DataFileType | null): void {
+		void vscode.commands.executeCommand('setContext', 'quantlab.currentView', view);
+		void vscode.commands.executeCommand('setContext', 'quantlab.isDataFile', Boolean(fileType));
+		void vscode.commands.executeCommand('setContext', 'quantlab.dataFileType', fileType);
+		// Clear strategy flag when on data file
+		void vscode.commands.executeCommand('setContext', 'quantlab.isStrategy', false);
+	}
 }

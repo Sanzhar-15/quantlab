@@ -1,8 +1,15 @@
 /*---------------------------------------------------------------------------------------------
- *  Copyright (c) Quantlab. All rights reserved.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+// NOTE: 'strategy-generation' is deliberately NOT a LaneName. It is a
+// PROMPT_TEMPLATES overlay key applied by ContextAssembler on top of a host
+// lane (chat-ask/chat-act/chat-plan/chat-gather) when a strategy-generation
+// request is detected. The LaneRouter never produces it, the server's lane
+// vocabulary (see DeltaPlusAdapter.LANE_MAP) does not include it, and budgets/
+// tools/models always come from the host lane. Do not add it here: a routable
+// 'strategy-generation' lane would be sent verbatim to the server and rejected.
 export type LaneName =
 	| 'completion'
 	| 'chat-ask'

@@ -5,15 +5,11 @@
 
 /*  Resources Panel Styles  */
 
-/* ---- Theme-aware accent ---- */
-:root {
-	--ql-accent: #FF7331;
-	--ql-accent-fg: #1A0A00;
-}
-.vscode-light {
-	--ql-accent: #d35400;
-	--ql-accent-fg: #ffffff;
-}
+/* ---- Accent ----
+ * Megaudit M96/M125: --ql-accent / --ql-accent-fg come from media/tokens.css
+ * (loaded by ResourcesWebviewProvider before this file) so the Resources panel
+ * uses the SAME brand orange as every other webview in both themes. No
+ * per-view redefinition, no divergent .vscode-light override. */
 
 /* ---- Container ---- */
 .resources-container {
@@ -131,7 +127,7 @@
 
 .filter-toggle.active {
 	background: var(--ql-accent);
-	color: #000;
+	color: var(--ql-accent-fg);
 	border-color: var(--ql-accent);
 }
 
@@ -380,6 +376,11 @@
 .catalog-error-banner.error {
 	background: var(--vscode-inputValidation-errorBackground);
 	border: 1px solid var(--vscode-inputValidation-errorBorder, transparent);
+}
+
+.catalog-error-banner.info {
+	background: var(--vscode-inputValidation-infoBackground);
+	border: 1px solid var(--vscode-inputValidation-infoBorder, transparent);
 }
 
 .catalog-error-banner .retry-btn {

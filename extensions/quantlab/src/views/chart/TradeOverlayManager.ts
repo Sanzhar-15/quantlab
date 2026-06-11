@@ -54,6 +54,10 @@ export class TradeOverlayManager {
 				this.bindings.delete(key);
 			}
 		}
+		// M19: prune the fill buffer when the trading session ends -- without
+		// this the map grows forever AND a future attach for a reused
+		// sessionId would replay the previous run's fills onto the new chart.
+		this.fillsBySession.delete(sessionId);
 	}
 
 	private sendSnapshot(sessionId: string, postMessage: (message: ChartOutboundMessage) => void): void {

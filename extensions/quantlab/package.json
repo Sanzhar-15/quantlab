@@ -61,6 +61,11 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.openHome",
+        "title": "%command.openHome.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.switchToChart",
         "title": "%command.switchToChart.title%",
         "category": "%command.category%"
@@ -500,7 +505,7 @@
       },
       {
         "command": "quantlab.visualise.promoteToChart",
-        "title": "Visualise: Promote to Chart",
+        "title": "%command.visualise.promoteToChart.title%",
         "category": "%command.category%"
       },
       {
@@ -1068,7 +1073,7 @@
         },
         {
           "command": "quantlab.switchToVisualise",
-          "when": "resourceExtname =~ /\\.(csv|parquet|xlsx)$/i",
+          "when": "resourceExtname =~ /\\.(csv|tsv|parquet|xlsx)$/i",
           "group": "1_open@10"
         },
         {
@@ -1080,7 +1085,7 @@
       "explorer/context": [
         {
           "command": "quantlab.switchToVisualise",
-          "when": "resourceExtname =~ /\\.(csv|parquet|xlsx)$/i",
+          "when": "resourceExtname =~ /\\.(csv|tsv|parquet|xlsx)$/i",
           "group": "navigation@10"
         },
         {
@@ -1201,7 +1206,7 @@
         "command": "quantlab.switchToEditor",
         "key": "ctrl+q e",
         "mac": "ctrl+q e",
-        "when": "editorTextFocus"
+        "when": "editorTextFocus && !quantlab.isDataFile"
       },
       {
         "command": "quantlab.switchToEditor",

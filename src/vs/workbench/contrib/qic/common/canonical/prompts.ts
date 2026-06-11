@@ -354,7 +354,7 @@ chart.plot_equity(pane="equity")
 
 **Canonical example** (mirrors the proven RSI showcase strategy):
 \`\`\`python
-from quantlab import ql
+import quantlab as ql
 
 rsi = None
 
@@ -484,7 +484,7 @@ Before returning strategy code, verify:
 - [OK] Imports: \`import quantlab as ql\`
 - [OK] NO type hints in function signatures
 - [OK] NO forbidden patterns (eval, exec, subprocess, wrong inheritance)
-- [OK] Returns \`ql.Signals()\` for vectorized strategies
+- [OK] Returns \`ql.signals(entry=..., exit=...)\` (or a \`ql.Signals()\` object built via \`.buy()\` / \`.sell()\`) for vectorized strategies
 - [OK] Uses \`ctx.orders\` for event-driven strategies
 - [OK] Class-based strategies inherit from \`ql.Strategy\`
 - [OK] If visualize() exists: signature is \`def visualize(chart):\`, it plots ONLY \`ql.*\`-assigned variables or constants, and uses ONLY chart.plot / chart.add_pane / chart.mark_entries / chart.mark_exits / chart.plot_equity

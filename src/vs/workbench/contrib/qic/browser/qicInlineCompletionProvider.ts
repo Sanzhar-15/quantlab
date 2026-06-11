@@ -1,5 +1,5 @@
 /*---------------------------------------------------------------------------------------------
- *  Copyright (c) Quantlab. All rights reserved.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
@@ -31,11 +31,11 @@ export interface TrackedCompletion {
  * Registers QIC as a standard InlineCompletionProvider via
  * languageFeaturesService.inlineCompletionsProvider.register().
  *
- * Does NOT create a second InlineCompletionsController — Quantlab already has one.
+ * Does NOT create a second InlineCompletionsController -- Quantlab already has one.
  * QIC plugs into the existing controller as a registered provider.
  *
  * groupId: 'qic-ai'
- * yieldsToGroupIds: ['copilot']  (cooperates with GitHub Copilot)
+ * yieldsToGroupIds: []  (Quantlab ships no other inline-completion provider group to yield to)
  *
  * Quality signal integration: tracks completion shown/accepted/rejected
  * for Phase 5 data pipeline prerequisites.
@@ -43,7 +43,7 @@ export interface TrackedCompletion {
 export class QicInlineCompletionProvider {
 
 	static readonly groupId = 'qic-ai';
-	static readonly yieldsToGroupIds = ['copilot'];
+	static readonly yieldsToGroupIds: string[] = [];
 
 	/** Most recent completion for tracking acceptance */
 	private _lastCompletion: TrackedCompletion | null = null;
@@ -51,7 +51,7 @@ export class QicInlineCompletionProvider {
 	constructor(
 		private readonly completionEngine: CompletionEngine,
 		private readonly qualitySignalService?: QualitySignalService,
-	) {}
+	) { }
 
 	/**
 	 * Get the last completion for acceptance tracking.

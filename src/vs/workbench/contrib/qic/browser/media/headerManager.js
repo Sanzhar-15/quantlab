@@ -1,5 +1,5 @@
 /*---------------------------------------------------------------------------------------------
- *  Copyright (c) Quantlab. All rights reserved.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
@@ -12,9 +12,9 @@
 (function() {
 	'use strict';
 
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 	// Elements
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 
 	let statusBtn = null;
 	let menuBtn = null;
@@ -24,9 +24,9 @@
 	let unsubscribe = null;
 	let menuItemHandlers = [];
 
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 	// Initialization
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 
 	function init() {
 		// Check if new header exists (feature flag enabled)
@@ -71,7 +71,7 @@
 
 		// Status button aria-label (ISSUE #008)
 		if (statusBtn && !statusBtn.getAttribute('aria-label')) {
-			statusBtn.setAttribute('aria-label', 'QIC status');
+			statusBtn.setAttribute('aria-label', 'Orion status');
 		}
 
 		// New chat button aria-label (ISSUE #008)
@@ -152,9 +152,9 @@
 		updateButtonStates();
 	}
 
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 	// Event Handlers
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 
 	function handleStatusClick(e) {
 		e.preventDefault();
@@ -182,7 +182,7 @@
 		// Check if allowed
 		const serviceStatus = window.qicState?.selectors?.getServiceStatus?.() ?? 'ready';
 		if (serviceStatus === 'error') {
-			showToast('Cannot create new chat while QIC is in error state');
+			showToast('Cannot create new chat while Orion is in error state');
 			return;
 		}
 
@@ -256,12 +256,12 @@
 		}
 	}
 
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 	// Menu Management
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 
 	function toggleMenu() {
-		if (!menuDropdown) return;
+		if (!menuDropdown) { return; }
 
 		const isOpen = !menuDropdown.hidden;
 		if (isOpen) {
@@ -272,7 +272,7 @@
 	}
 
 	function openMenu() {
-		if (!menuDropdown) return;
+		if (!menuDropdown) { return; }
 
 		menuDropdown.hidden = false;
 		if (menuBtn) {
@@ -296,7 +296,7 @@
 	}
 
 	function closeMenu() {
-		if (!menuDropdown) return;
+		if (!menuDropdown) { return; }
 
 		menuDropdown.hidden = true;
 		if (menuBtn) {
@@ -307,13 +307,13 @@
 		menuBtn?.focus();
 	}
 
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 	// State Updates
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 
 	function updateStatusIndicator() {
-		if (!statusIndicator && !statusBtn) return;
-		if (!window.qicState) return;
+		if (!statusIndicator && !statusBtn) { return; }
+		if (!window.qicState) { return; }
 
 		const serviceStatus = window.qicState.selectors?.getServiceStatus?.() ?? 'initializing';
 		const agentState = window.qicState.selectors?.getAgentState?.() ?? 'idle';
@@ -341,7 +341,7 @@
 	}
 
 	function updateButtonStates() {
-		if (!window.qicState) return;
+		if (!window.qicState) { return; }
 
 		const serviceStatus = window.qicState.selectors?.getServiceStatus?.() ?? 'ready';
 		const isError = serviceStatus === 'error';
@@ -350,16 +350,16 @@
 		if (newChatBtn) {
 			newChatBtn.disabled = isError;
 			const mod = navigator.platform?.toLowerCase().includes('mac') ? 'Cmd' : 'Ctrl';
-			newChatBtn.title = isError ? 'QIC is in error state' : `New conversation (${mod}+Shift+N)`;
+			newChatBtn.title = isError ? 'Orion is in error state' : `New conversation (${mod}+Alt+N)`;
 		}
 	}
 
 	function getStatusText(serviceStatus, agentState) {
 		const serviceTexts = {
-			'initializing': 'QIC is starting up...',
-			'ready': 'QIC is ready',
-			'degraded': 'QIC is running with limited functionality',
-			'error': 'QIC encountered an error',
+			'initializing': 'Orion is starting up...',
+			'ready': 'Orion is ready',
+			'degraded': 'Orion is running with limited functionality',
+			'error': 'Orion encountered an error',
 		};
 
 		const agentTexts = {
@@ -370,7 +370,7 @@
 			'suspended': ' - Suspended',
 		};
 
-		return (serviceTexts[serviceStatus] || 'QIC') + (agentTexts[agentState] || '');
+		return (serviceTexts[serviceStatus] || 'Orion') + (agentTexts[agentState] || '');
 	}
 
 	function showToast(message) {
@@ -382,7 +382,7 @@
 
 		// Create simple toast
 		const existing = document.querySelector('.qic-toast');
-		if (existing) existing.remove();
+		if (existing) { existing.remove(); }
 
 		const toast = document.createElement('div');
 		toast.className = 'qic-toast';
@@ -401,9 +401,9 @@
 		}, 2000);
 	}
 
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 	// Cleanup
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 
 	function dispose() {
 		if (unsubscribe) {
@@ -433,9 +433,9 @@
 	// Register for global cleanup
 	window.qicUtils?.registerDisposable(dispose);
 
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 	// Public API
-	// ═══════════════════════════════════════════════════════════════════════════
+	// ===========================================================================
 
 	window.qicHeader = {
 		init,

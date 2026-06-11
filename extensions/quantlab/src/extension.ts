@@ -68,6 +68,7 @@ import { StatsEngine } from './stats/StatsEngine';
 import { PythonBootstrap } from './core/engine/PythonBootstrap';
 import { ServerApiClient } from './core/server/ServerApiClient';
 import { DeltaPlusAuthProvider, DELTAPLUS_PROVIDER_ID } from './auth/DeltaPlusAuthProvider';
+import { DataViewManager } from './views/DataViewManager';
 import { QuantLabHome } from './auth/QuantLabHome';
 import { DataService } from './core/engine/DataService';
 import { ToolExecutionService } from './core/server/ToolExecutionService';
@@ -136,10 +137,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	);
 
 	// Reconnect WebSocket when a new session is created (e.g. after sign-in).
+	// Megaudit M87 (No-Fallbacks): a failed reconnect silently kills all
+	// real-time feeds while the UI shows a signed-in state -- log it.
 	context.subscriptions.push(
 		authProvider.onDidChangeSessions(e => {
 			if (e.added && e.added.length > 0) {
-				void serverClient.connectWebSocket().catch(() => { /* non-critical */ });
+				void serverClient.connectWebSocket().catch(err => {
+					getServerOutputChannel().appendLine(
+						`[extension] WebSocket reconnect after sign-in failed: ${err instanceof Error ? err.message : String(err)}`
+					);
+				});
 			}
 		})
 	);
@@ -184,6 +191,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			if (user && !_homeShownThisSession) {
 				_homeShownThisSession = true;
 				QuantLabHome.show(context, { name: user.name, email: user.email, tier: user.tier });
+			} else if (!user) {
+				// Sign-out: re-arm the auto-show so the NEXT sign-in gets a
+				// fresh Home (the panel itself disposes on sign-out; without
+				// this reset it would never auto-reopen in the same session).
+				_homeShownThisSession = false;
 			}
 		})
 	);
@@ -332,9 +344,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		vscode.window.registerWebviewViewProvider(ResourcesWebviewProvider.viewType, resourcesProvider)
 	);
 
-	// Non-blocking catalog pre-fetch
-	void catalogService.getCatalog().catch(() => {
-		// Server unavailable -- cached data or null will be used on first panel open
+	// Non-blocking catalog pre-fetch. Megaudit M88 (No-Fallbacks): the failure
+	// must be logged -- cached/offline data is still used on first panel open,
+	// and the Resources panel surfaces its own error state, but the root cause
+	// must not vanish.
+	void catalogService.getCatalog().catch(err => {
+		getServerOutputChannel().appendLine(
+			`[extension] Resources catalog prefetch failed: ${err instanceof Error ? err.message : String(err)}`
+		);
 	});
 	new HistoryPanelProvider(context, historyState);
 	new TradePanelProvider(context, badgeManager);
@@ -372,8 +389,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const validationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	moduleValidationTimers = validationTimers;
 
+	// Megaudit H49: quantlab.isDataFile was set to true by
+	// DataViewManager.updateContextKeys() when a data view opened but NEVER
+	// cleared when the user activated a non-data tab. Stale true + a Python
+	// editor (editorTextFocus) made the two `ctrl+q e` keybindings
+	// (quantlab.switchToEditor / quantlab.switchToDataEditor) BOTH fire.
+	// Refresh the key on every active editor/tab change, in all three branches.
+	// DataViewManager.getDataFileType is the single source of truth for what
+	// counts as a data file.
+	const updateDataFileContext = (resource?: vscode.Uri): void => {
+		const fileType = resource ? DataViewManager.getInstance().getDataFileType(resource) : null;
+		void vscode.commands.executeCommand('setContext', 'quantlab.isDataFile', Boolean(fileType));
+		void vscode.commands.executeCommand('setContext', 'quantlab.dataFileType', fileType);
+	};
+
 	const updateActiveContext = async (editor?: vscode.TextEditor): Promise<void> => {
 		if (editor) {
+			updateDataFileContext(editor.document.uri);
 			const view = stateManager.getCurrentViewForEditor(editor);
 			const validation = validator.getValidationResult(editor.document) ?? validator.validateDocument(editor.document);
 			updateContextKeys(view, validation);
@@ -381,6 +413,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		}
 
 		const resource = getActiveResource();
+		updateDataFileContext(resource);
 		if (!resource) {
 			updateContextKeys('editor', undefined);
 			return;
@@ -545,9 +578,12 @@ async function checkOrphanedSessions(
 			const sockPath = path.join(sessionsDir, socketFile);
 
 			try {
-				// Quick liveness probe: check if socket file exists and is a socket
+				// Quick liveness probe: check if socket file exists and is a socket.
+				// Megaudit M93 (No-Fallbacks): fs.Stats.isSocket() is always present
+				// in Node.js -- no optional-chaining fallback that would silently
+				// classify an un-probeable socket as absent.
 				const stat = await fs.promises.stat(sockPath);
-				if (stat.isSocket?.() ?? false) {
+				if (stat.isSocket()) {
 					aliveSessions.push(sessionId);
 				}
 			} catch {
@@ -562,17 +598,14 @@ async function checkOrphanedSessions(
 			return;
 		}
 
+		// Megaudit M89: do NOT offer a 'Reconnect' button that immediately answers
+		// 'not yet supported' -- only the two options that actually work.
 		const action = await vscode.window.showWarningMessage(
 			`Found ${aliveSessions.length} running daemon session(s) from a previous instance: ${aliveSessions.join(', ')}`,
-			'Reconnect', 'Stop All', 'Ignore'
+			'Stop All', 'Ignore'
 		);
 
-		if (action === 'Reconnect') {
-			// Reconnection is not yet implemented -- inform the user
-			void vscode.window.showInformationMessage(
-				`Reconnection to orphaned sessions is not yet supported. Found: ${aliveSessions.join(', ')}`
-			);
-		} else if (action === 'Stop All') {
+		if (action === 'Stop All') {
 			for (const sessionId of aliveSessions) {
 				try {
 					const sockPath = path.join(sessionsDir, `${sessionId}.sock`);
@@ -786,12 +819,15 @@ export async function deactivate(): Promise<void> {
 		reactiveKernelManager = null;
 	}
 
-	// Cleanup server connection with proper disposal
+	// Cleanup server connection. Megaudit H50: dispose() alone leaves the
+	// DISPOSED singleton cached on ServerApiClient.instance, so the next
+	// activate() on hot reload reuses a dead client for every auth/WS call.
+	// resetInstance() disposes AND nulls the instance so activate() builds a
+	// fresh one.
 	try {
-		const client = ServerApiClient.getInstance();
-		client.dispose();
-	} catch {
-		// Ignore cleanup errors
+		ServerApiClient.resetInstance();
+	} catch (e) {
+		console.warn('Quantlab: ServerApiClient reset threw during deactivate:', e);
 	}
 
 	// Cleanup catalog service

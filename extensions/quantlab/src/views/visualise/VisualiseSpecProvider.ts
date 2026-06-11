@@ -22,7 +22,7 @@
  *     so the webview's spec/query/persistence/renderer/ui slices are
  *     not clobbered (Step C megaudit C9).
  *   - saveCustomDocument: drift-aware. Drift unknown / detection
- *     in-flight / detection failed → save REFUSED with a structured
+ *     in-flight / detection failed -> save REFUSED with a structured
  *     error (Step C megaudit C5). `same-hash` saves verbatim;
  *     `fields-preserved` writes a refreshed spec atomically via
  *     `saveAsTransformed`; `fields-missing` refuses with a structured
@@ -177,10 +177,10 @@ interface DocumentContext {
 
 /** Provider-side abstraction over daemon lifecycles. The extension
  *  activation supplies an implementation that may be:
- *    - `null`       → no Python found; drift detection disabled.
- *    - `Single`     → one shared lifecycle for all documents
+ *    - `null`       -> no Python found; drift detection disabled.
+ *    - `Single`     -> one shared lifecycle for all documents
  *                     (single-workspace setups).
- *    - `PerFolder`  → one lifecycle per workspace folder; documents
+ *    - `PerFolder`  -> one lifecycle per workspace folder; documents
  *                     route to the lifecycle that owns their folder.
  */
 export interface LifecycleSource {
@@ -333,7 +333,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			let lastStatusForCaps: import('../../qviz/daemon-lifecycle').LifecycleStatus | null = null;
 			const off = source.onStatusChangeForDocument(document.uri, (s) => {
 				this.postOrLog(webviewPanel, this.buildDaemonStatusMessage(document.uri, s));
-				// Audit M-23 (2026-05-11): on a crash → ready transition
+				// Audit M-23 (2026-05-11): on a crash -> ready transition
 				// (daemon respawn), refetch capabilities and re-broadcast
 				// so the webview's inspector gate reflects what the new
 				// daemon actually supports. Without this, a respawned
@@ -392,6 +392,14 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 		document: QvizSpecDocument, target: vscode.Uri, _token: vscode.CancellationToken,
 	): Promise<void> {
 		const attemptedHash = computeSpecHash(document.spec);
+		// Megaudit 2026-06-11 (H41): emit saveStarted BEFORE the
+		// cross-folder refusal below. The webview persistence reducer only
+		// accepts a saveResult whose specHash matches pendingSaveHash, and
+		// pendingSaveHash is set exclusively by saveStarted -- an unpaired
+		// saveResult('failed') is silently dropped and the webview never
+		// learns the save failed. saveStarted emission is idempotent in
+		// the reducer (same hash -> no-op), matching saveCustomDocument.
+		this.broadcastSaveStarted(document, attemptedHash);
 		// Megaudit Theme E (E1, 2026-05-13): refuse Save As across
 		// workspace folders. Drift status, watcher, capabilities, and
 		// daemon lifecycle are all bound to the SOURCE document's
@@ -413,7 +421,6 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			void vscode.window.showErrorMessage(msg);
 			throw new Error(msg);
 		}
-		this.broadcastSaveStarted(document, attemptedHash);
 		try {
 			await this.driftAwareSaveAs(document, target);
 			this.broadcastSaveResult(document, target, 'ok', attemptedHash);
@@ -442,7 +449,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 		// having internally dispatched saveStarted leaves pendingSaveHash
 		// unset, and the persistence reducer drops the saveResult.
 		// Re-emitting saveStarted with the same hash is idempotent in
-		// the reducer (same hash → no-op set). Closes the foot-gun.
+		// the reducer (same hash -> no-op set). Closes the foot-gun.
 		this.broadcastSaveStarted(document, msg.specHash);
 		try {
 			await this.driftAwareSaveAs(document, document.uri);
@@ -568,12 +575,12 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 	 * generation at the time of write.
 	 *
 	 * Failure modes are SURFACED, not swallowed:
-	 *   - Dataset resolution failure → `ctx.driftStatus = failed(...)`,
+	 *   - Dataset resolution failure -> `ctx.driftStatus = failed(...)`,
 	 *     panel notified via daemonStatus 'unavailable' with lastError,
 	 *     `vscode.window.showErrorMessage` for severe path violations.
-	 *   - Daemon unavailable → `ctx.driftStatus = failed(...)`, panel
+	 *   - Daemon unavailable -> `ctx.driftStatus = failed(...)`, panel
 	 *     already informed by lifecycle status events.
-	 *   - Schema fetch failure → `ctx.driftStatus = failed(...)`,
+	 *   - Schema fetch failure -> `ctx.driftStatus = failed(...)`,
 	 *     daemonStatus message synthesized with the underlying error.
 	 *
 	 * Save flow refuses unless `ctx.driftStatus.kind === 'detected'`
@@ -989,9 +996,9 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			ctx.driftStatus = { kind: 'in-flight', generation: ctx.driftGeneration };
 			void this.detectAndRecordDrift(e.document, ctx);
 		}
-		// E4: drop liveSchema when the dataset URI just changed —
+		// E4: drop liveSchema when the dataset URI just changed --
 		// the new schema isn't known yet. The webview shows "loading
-		// schema…" until the follow-up schemaChanged lands.
+		// schema..." until the follow-up schemaChanged lands.
 		const liveSchema = (ctx && !datasetUriChanged && ctx.driftStatus.kind === 'detected')
 			? ctx.driftStatus.liveSchema : null;
 		this.postOrLog(panel, this.buildInitMessage(
@@ -1303,7 +1310,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			// Megaudit CRITICAL-2: error MUST echo the inbound requestId
 			// so the webview's queryState reducer's specHash+requestId
 			// gate accepts it. Without this, the reducer drops it as
-			// stale and the UI stays "computing…" forever.
+			// stale and the UI stays "computing..." forever.
 			this.postEnvelopeError(panel, msg.requestId, msg.specHash,
 				`Cannot run aggregate: spec references missing fields (${ctx.driftStatus.result.missingFields.join(', ')}).`,
 				'compile');
@@ -1321,7 +1328,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			const lifecycle = source.getLifecycleForDocument(document.uri);
 			if (lifecycle === null) {
 				this.postEnvelopeError(panel, msg.requestId, msg.specHash,
-					"No daemon available for this document's workspace folder.", 'internal');
+					`No daemon available for this document's workspace folder.`, 'internal');
 				return;
 			}
 			client = await lifecycle.getClient();
@@ -1334,7 +1341,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 		// H2 (megaudit, 2026-05-12): capability mismatch detection. If
 		// the saved spec uses a transform kind the running daemon does
 		// not advertise, fail with a clear "your daemon doesn't support
-		// X" message BEFORE hitting the daemon — otherwise the user sees
+		// X" message BEFORE hitting the daemon -- otherwise the user sees
 		// a generic CompileError that hides the real cause (daemon age,
 		// not their spec).
 		if (ctx.capabilities !== null) {
@@ -1388,7 +1395,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			// compile-time precision-loss warnings from the daemon's
 			// AggregateMeta to the webview's diagnostics readout. The
 			// previous hardcoded `[]` made the warnings dead wire bytes
-			// — present in the response, never visible to the user.
+			// -- present in the response, never visible to the user.
 			// `diagnostics` is a flat `string[]` per the protocol; if
 			// we ever need structured levels, that's a separate
 			// wire-shape change.
@@ -1404,7 +1411,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			// so the daemon emits attribution indices for the EFFECTIVE
 			// transform list (inspector filters first, then saved
 			// transforms). The webview maps records to cards by
-			// `record.index` against the SAVED transforms — so without
+			// `record.index` against the SAVED transforms -- so without
 			// adjustment, badges/chips point at the wrong transform when
 			// inspector filters are active. Strip the first N records
 			// (one per inspector filter) and subtract N from each
@@ -1441,12 +1448,12 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			const structuredKind = (e as { errorKind?: string }).errorKind;
 			// Megaudit-2 M1 / CODEX-2: 'internal' was missing from the
 			// structuredKind branches, so daemon-internal errors fell
-			// through to the legacy DaemonOpError → 'compile' fallback,
+			// through to the legacy DaemonOpError -> 'compile' fallback,
 			// silently mis-categorizing real Python bugs as user-fixable
 			// compile errors and defeating the MAJOR-34 fix.
 			// Megaudit F3 (2026-05-13): `structuredKind === 'protocol'`
 			// arm added so the new 'protocol' kind round-trips. The
-			// DaemonOpError->compile name-fallback is dropped — strict
+			// DaemonOpError->compile name-fallback is dropped -- strict
 			// decoder at the wire means every DaemonOpError now carries
 			// a real structured kind; a name-fallback would mask
 			// decoder regressions.
@@ -1535,7 +1542,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 					type: 'inspectorError',
 					protocolVersion: PROTOCOL_VERSION,
 					requestId,
-					error: "No daemon available for this document's workspace folder.",
+					error: `No daemon available for this document's workspace folder.`,
 					errorKind: 'internal',
 				});
 				return;
@@ -1655,7 +1662,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 		try {
 			const lifecycle = source.getLifecycleForDocument(document.uri);
 			if (lifecycle === null) {
-				postErr("No daemon available for this document's workspace folder.");
+				postErr(`No daemon available for this document's workspace folder.`);
 				return;
 			}
 			client = await lifecycle.getClient();
@@ -1714,11 +1721,14 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			// subscription already broadcasts the transition through to
 			// the webview, so the banner updates automatically.
 			lifecycle.requestImmediateRetry();
-		} catch {
+		} catch (e) {
 			// requestImmediateRetry throws only when the lifecycle is
 			// already disposed. In that case, the source will report no
 			// lifecycle next time, and the banner already reflects
-			// 'unavailable'. Nothing else to do.
+			// 'unavailable'. Megaudit 2026-06-11 (M75): log the error
+			// instead of swallowing it (No-Fallbacks) so an unexpected
+			// throw from a non-disposed lifecycle stays visible.
+			console.warn('VisualiseSpecProvider: requestImmediateRetry threw:', e);
 		}
 	}
 
@@ -1737,7 +1747,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 		if (workspaceRoot === null) {
 			// Megaudit Theme E (E12, 2026-05-13): the user clicked
 			// "Re-check file" but the doc isn't inside any workspace
-			// folder. Previously we returned silently — the banner
+			// folder. Previously we returned silently -- the banner
 			// appeared frozen. Surface a structured status instead.
 			this.postOrLog(panel, {
 				type: 'datasetStatus',
@@ -1746,7 +1756,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 				status: 'no-workspace',
 				datasetUri: spec.dataset.uri,
 				error: 'No workspace folder owns this Visualise spec. '
-					+ 'Open a folder in VS Code to enable file resolution.',
+					+ 'Open a folder to enable file resolution.',
 			});
 			return;
 		}
@@ -1761,6 +1771,13 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 				status: 'ok',
 				datasetUri: spec.dataset.uri,
 			});
+			// Megaudit 2026-06-11 (H39): re-run drift detection so
+			// ctx.driftStatus leaves its pre-recheck 'failed' state and the
+			// dataset watcher re-attaches (same as the revert path above).
+			// Without this, Save keeps refusing forever after a successful
+			// recheck because decideSave still sees driftStatus 'failed'.
+			const ctx = this.documentContexts.get(document);
+			if (ctx) { void this.detectAndRecordDrift(document, ctx); }
 			return;
 		}
 		// Still failing -- broadcast the (possibly updated) failure kind
@@ -1831,7 +1848,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 	 * `requestId === inflight.requestId && specHash === inflight.specHash`
 	 * to accept the error. Inventing a fresh id (the previous behavior)
 	 * meant the reducer dropped the error as stale and the UI sat at
-	 * "computing…" indefinitely after a daemon failure -- directly
+	 * "computing..." indefinitely after a daemon failure -- directly
 	 * breaking Step I.1's "keep last successful chart visible" promise.
 	 */
 	private postEnvelopeError(
@@ -1934,7 +1951,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			});
 		} catch (e) {
 			// Megaudit Theme E (E7, 2026-05-13): keeping the prior
-			// capability bag re-creates the M-23 bug — the inspector
+			// capability bag re-creates the M-23 bug -- the inspector
 			// gate thinks features are available, the user clicks, and
 			// the daemon errors cryptically. Broadcast a synthetic
 			// "everything off" bag instead so the webview locks down
@@ -1984,12 +2001,12 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			case 'respawning':
 				// retryInMs is 0 (we just fired the timer). lastError
 				// carries the underlying crash context so the UI doesn't
-				// lose it across the crashed→respawning transition.
+				// lose it across the crashed->respawning transition.
 				return { ...base, retryInMs: 0, lastError: s.lastError };
 			case 'disposing':
 				// Megaudit E8 (2026-05-13): surface the reason in
-				// lastError so the banner can show "Shutting down…"
-				// with context. retryInMs intentionally absent — this
+				// lastError so the banner can show "Shutting down..."
+				// with context. retryInMs intentionally absent -- this
 				// is a transient terminal state, not a respawn beat.
 				return { ...base, lastError: s.reason };
 			case 'unavailable':
@@ -2035,7 +2052,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 					// delivered=false, BUT postMessage can return false
 					// for transient delivery failures while the panel is
 					// still alive (e.g. webview busy, window backgrounded).
-					// Eager release orphans the live panel — every
+					// Eager release orphans the live panel -- every
 					// subsequent outbound message becomes a silent no-op
 					// because panelByUri.get(key) returns undefined.
 					// onDidDispose is the SOLE authoritative release path.
@@ -2059,7 +2076,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 
 	// Megaudit Theme E (E3, 2026-05-13): releasePanelSlot used to be
 	// called from postOrLog's `delivered=false` / rejection paths.
-	// That was incorrect — postMessage can transiently fail while the
+	// That was incorrect -- postMessage can transiently fail while the
 	// panel is alive. Cleanup is now exclusively driven by
 	// webviewPanel.onDidDispose. Function removed; per-URI cleanup
 	// happens inline at the dispose hook (resolveCustomEditor:267) and
@@ -2118,10 +2135,10 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
  *  handle is reused (avoids the one-call-only rule).
  *
  *  Exposes:
- *    - `window.__qvizDebugPost(entry)` — direct post for the bundle
- *    - `window.__qvizDebugMark(stage, data?)` — sparse marks at
+ *    - `window.__qvizDebugPost(entry)` -- direct post for the bundle
+ *    - `window.__qvizDebugMark(stage, data?)` -- sparse marks at
  *      high-value pipeline points
- *    - `window.__qvizDebugAcquireVsCodeApi()` — returns the bootstrap's
+ *    - `window.__qvizDebugAcquireVsCodeApi()` -- returns the bootstrap's
  *      pre-acquired handle so the bundle reuses it
  *
  *  Output is appended NDJSON-style to
@@ -2178,7 +2195,7 @@ function buildDebugBridgeInlineScript(nonce: string): string {
 				vscode = acquireVsCodeApi();
 				w.__qvizDebugAcquireVsCodeApi = function() { return vscode; };
 			} catch (e) {
-				// acquireVsCodeApi only callable once — if it was already
+				// acquireVsCodeApi only callable once -- if it was already
 				// called somehow (shouldn't happen since we run first),
 				// fall back to buffering. The bundle's drain logic will
 				// pick up pending and emit via the bundle's handle.
@@ -2299,9 +2316,9 @@ function driftStatusForSave(s: DriftStatus): import('../../qviz/saveDecision').D
 /** Translate the webview's `InspectorFilter` union into the daemon's
  *  `FilterTransform` list. The two shapes diverge:
  *
- *    - `range` → 1 or 2 FilterTransforms (`>=`, `<=`); empty bounds skip.
- *    - `text`  → 1 FilterTransform with `op: 'contains'`.
- *    - `set`   → 1 FilterTransform with `op: 'in'`; empty includes
+ *    - `range` -> 1 or 2 FilterTransforms (`>=`, `<=`); empty bounds skip.
+ *    - `text`  -> 1 FilterTransform with `op: 'contains'`.
+ *    - `set`   -> 1 FilterTransform with `op: 'in'`; empty includes
  *                short-circuits to a filter that matches nothing.
  *
  *  Empty filters (e.g. `text.contains === ''`) are dropped so the daemon
@@ -2421,13 +2438,14 @@ async function previewWithFilters(
 		inspectorFilters,
 		...(applySpecTransforms ? { applySpecTransforms } : {}),
 	});
-	if ('arrow' in raw) {
-		const data = raw.meta as { n?: number; total?: number };
+	const arrowRes = raw as Partial<import('../../qviz/daemon-client').ArrowResponse<unknown>> & { elapsedMs: number };
+	if (arrowRes.arrow !== undefined) {
+		const data = arrowRes.meta as { n?: number; total?: number };
 		return {
-			arrow: raw.arrow,
+			arrow: arrowRes.arrow,
 			n: data.n ?? 0,
 			...(data.total !== undefined ? { total: data.total } : {}),
-			elapsedMs: raw.elapsedMs,
+			elapsedMs: arrowRes.elapsedMs,
 		};
 	}
 	// Audit M-35 (2026-05-11): small filtered (or unfiltered) preview

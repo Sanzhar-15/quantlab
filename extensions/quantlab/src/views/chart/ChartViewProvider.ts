@@ -281,6 +281,10 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			disposable.dispose();
 		}
 
+		// M18: overrides/request-counters may live under EITHER key -- the
+		// timestamp session key (pre-tab-resolution) or the tabInstanceId.
+		// Clear both; clearTab on an absent key is a no-op.
+		this.chartStateStore.clearTab(session.key);
 		if (session.tabInstanceId) {
 			this.chartStateStore.clearTab(session.tabInstanceId);
 		}
@@ -666,14 +670,16 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		const requestId = this.chartStateStore.nextDataRequestId(key);
 
 		if (!toolbar.dataSource) {
-			session.webview.postMessage({
-				type: 'showError',
-				message: 'No data source selected.',
-				detail: 'Select a data file or server symbol to load market data.',
-				actions: ['selectData']
-			});
+			// H17: a friendly get-started state instead of an error overlay --
+			// "no source yet" is the expected first-open state, not a failure.
+			session.webview.postMessage({ type: 'showEmptyState' });
 			return;
 		}
+
+		// H17: visible fetch feedback. The pill is cleared by whichever
+		// terminal message this request produces (setDataBinary / showError /
+		// the empty-bars showError), so it can never spin forever.
+		session.webview.postMessage({ type: 'showLoading', requestId });
 
 		try {
 			let data: OhlcvBar[];
@@ -769,6 +775,13 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				return;
 			}
 
+			// A superseded request's failure (typically the 'Cancelled' throw
+			// from its own CancellationToken) must not paint an error over the
+			// newer request's UI -- the current request owns the overlay.
+			if (!this.chartStateStore.isDataRequestCurrent(key, requestId)) {
+				return;
+			}
+
 			const detail = error instanceof Error ? error.message : String(error ?? '');
 			const isServer = isServerSource(toolbar.dataSource);
 			session.webview.postMessage({
@@ -846,15 +859,14 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 	private refreshFromGlobal(kind: 'dataSource' | 'timeframe'): void {
 		for (const session of this.sessions.values()) {
-			if (!session.tabInstanceId) {
-				continue;
-			}
-
 			if (this.liveSessions.has(session.key)) {
 				continue;
 			}
 
-			const state = this.stateManager.getChartState(session.tabInstanceId);
+			// M17: a session whose tabInstanceId has not resolved yet (startup
+			// race) has no per-tab overrides by definition -- fall through with
+			// state undefined so the global change still reloads it.
+			const state = session.tabInstanceId ? this.stateManager.getChartState(session.tabInstanceId) : undefined;
 			if (kind === 'dataSource' && state?.dataSource) {
 				continue;
 			}
@@ -1104,13 +1116,24 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 	}
 
 	private async readArtifactJson<T>(artifactPath: string, fileName: string): Promise<T | undefined> {
+		const root = vscode.Uri.file(artifactPath);
+		const uri = vscode.Uri.joinPath(root, fileName);
 		try {
-			const root = vscode.Uri.file(artifactPath);
-			const uri = vscode.Uri.joinPath(root, fileName);
 			const data = await vscode.workspace.fs.readFile(uri);
 			return JSON.parse(Buffer.from(data).toString('utf8')) as T;
-		} catch {
-			return undefined;
+		} catch (error) {
+			// A missing artifact file is a legitimate absence (runs emit
+			// signals.json and/or equity.json, not necessarily both). Real
+			// VS Code throws FileSystemError code 'FileNotFound'; node-backed
+			// shims throw ENOENT -- match on code, not class.
+			const code = (error as { code?: string } | null)?.code;
+			if (code === 'FileNotFound' || code === 'ENOENT') {
+				return undefined;
+			}
+			// M23/M25 (No-Fallbacks): anything else (corrupt JSON, permission
+			// errors) must surface, not silently load as "no artifacts".
+			console.error(`ChartViewProvider: failed to read run artifact ${uri.fsPath}:`, error);
+			throw error;
 		}
 	}
 

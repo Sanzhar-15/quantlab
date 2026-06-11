@@ -317,6 +317,10 @@ function handleProviderMessage(data: ProviderMessage): void {
 	switch (data.type) {
 		case 'setCatalog':
 			catalog = data.catalog;
+			// A fresh catalog invalidates any prior error/offline banner; the
+			// provider re-posts catalogError immediately after setCatalog when a
+			// degraded state still applies (postMessage order is preserved).
+			hideErrorBanner();
 			if (data.section) {
 				currentSection = data.section;
 				document.querySelectorAll('.section-btn').forEach(btn => {
@@ -724,16 +728,28 @@ function showUnavailableState(message: string): void {
 	}
 }
 
-// ---- Error banner (stale cache) ----
+// ---- Error banner (stale cache / offline) ----
+
+function hideErrorBanner(): void {
+	const banner = document.querySelector('.catalog-error-banner') as HTMLElement | null;
+	if (banner) {
+		banner.style.display = 'none';
+	}
+}
 
 function showErrorBanner(errorType: string, message: string): void {
 	const banner = document.querySelector('.catalog-error-banner') as HTMLElement;
 	if (!banner) { return; }
 
-	const cssClass = errorType === 'stale-cache' ? 'warning' : 'error';
+	// 'stale-cache' and 'offline' are degraded-but-working states (warning/info);
+	// anything else is a hard error.
+	const cssClass = errorType === 'stale-cache' ? 'warning'
+		: errorType === 'offline' ? 'info'
+			: 'error';
+	const icon = errorType === 'offline' ? 'cloud' : 'warning';
 	banner.className = `catalog-error-banner ${cssClass}`;
 	banner.innerHTML = `
-		<span class="codicon codicon-warning"></span>
+		<span class="codicon codicon-${icon}"></span>
 		<span>${escapeHtml(message)}</span>
 		<button class="retry-btn">Retry</button>
 	`;

@@ -158,7 +158,16 @@ export class TradeViewProvider implements vscode.CustomTextEditorProvider {
 		this.sessions.set(session.key, session);
 
 		session.disposables.push(
-			webview.onMessage(message => this.onMessage(session, message)),
+			// onMessage drops the promise, so a rejection inside any handler
+			// (stop, restart, kill switch, ...) would otherwise vanish as an
+			// unhandled rejection. Surface it loudly -- these are trade
+			// actions; a silent failure is a safety bug.
+			webview.onMessage(message => {
+				void this.onMessage(session, message).catch((error: Error) => {
+					this.sessionManager.getOutputChannel().appendLine(`[trade-view] Message handling failed: ${error.message}`);
+					void vscode.window.showErrorMessage(`Trade action failed: ${error.message}`);
+				});
+			}),
 			panel.onDidDispose(() => this.disposeSession(session))
 		);
 
@@ -180,7 +189,7 @@ export class TradeViewProvider implements vscode.CustomTextEditorProvider {
 
 	private async onMessage(session: TradeEditorSession, message: unknown): Promise<void> {
 		const payload = message as TradeInboundMessage;
-		if (!payload || typeof payload !== 'object' || !('type' in payload)) {
+		if (!payload || typeof payload !== 'object' || typeof (payload as { type?: unknown }).type !== 'string') {
 			return;
 		}
 
@@ -413,18 +422,36 @@ export class TradeViewProvider implements vscode.CustomTextEditorProvider {
 
 		const killSwitch = KillSwitch.getInstance();
 
-		// Use daemon-aware flatten if using daemon, otherwise direct killSwitch
+		// Flatten stage. A failure is surfaced loudly but must NOT abort the
+		// teardown stage below: after a kill switch the session (and, for
+		// daemon sessions, the Python daemon process) must come down even if
+		// flattening failed.
 		if (this.sessionManager.isUsingDaemon(sessionId)) {
 			try {
 				await this.sessionManager.flattenAllPositions(sessionId);
 			} catch (error) {
+				this.sessionManager.getOutputChannel().appendLine(`[${sessionId}] Kill switch flatten failed: ${(error as Error).message}`);
 				void vscode.window.showErrorMessage(`Kill switch flatten failed: ${(error as Error).message}`);
 			}
 		} else {
-			await killSwitch.execute(record.info, record.broker, killSwitch.getConfig(), this.sessionManager.getOutputChannel());
+			try {
+				await killSwitch.execute(record.info, record.broker, killSwitch.getConfig(), this.sessionManager.getOutputChannel());
+			} catch (error) {
+				this.sessionManager.getOutputChannel().appendLine(`[${sessionId}] Kill switch execute failed: ${(error as Error).message}`);
+				void vscode.window.showErrorMessage(`Kill switch failed: ${(error as Error).message}`);
+			}
 		}
 
-		await this.sessionManager.stopSession(sessionId, 'killSwitch');
+		// Teardown stage (H27): stopSession() itself now routes daemon-backed
+		// sessions through stopDaemonSession(), so the daemon process is torn
+		// down on every stop path. A teardown failure must never be silent on
+		// the kill switch -- surface it via showErrorMessage AND the log.
+		try {
+			await this.sessionManager.stopSession(sessionId, 'killSwitch');
+		} catch (error) {
+			this.sessionManager.getOutputChannel().appendLine(`[${sessionId}] Kill switch session teardown FAILED: ${(error as Error).message}`);
+			void vscode.window.showErrorMessage(`Kill switch failed to stop session: ${(error as Error).message}. The strategy may still be running -- check the Quantlab Trading log.`);
+		}
 	}
 
 	private async modifyOrder(sessionId: string, orderId: string, changes: OrderModification): Promise<void> {

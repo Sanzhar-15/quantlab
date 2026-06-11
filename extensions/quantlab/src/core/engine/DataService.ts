@@ -99,12 +99,15 @@ export class DataService {
 			throw new Error('Cancelled');
 		}
 
-		// SECURITY: Validate file is within workspace boundaries
-		this.validateWorkspacePath(filePath);
-
+		// H12: the existence check MUST precede validateWorkspacePath --
+		// fs.realpathSync.native inside it throws a raw ENOENT for missing
+		// paths, masking the friendly message below.
 		if (!fs.existsSync(filePath)) {
 			throw new Error(`File not found: ${filePath}`);
 		}
+
+		// SECURITY: Validate file is within workspace boundaries
+		this.validateWorkspacePath(filePath);
 
 		const ext = path.extname(filePath).toLowerCase();
 

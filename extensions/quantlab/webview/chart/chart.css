@@ -6,11 +6,13 @@
 :root {
 	color-scheme: light dark;
 
-	/* QuantLab Accent Color Overrides */
-	--ql-accent: #FF7331;
-	--ql-accent-hover: #E5672C;
-	--ql-accent-active: #CC5C22;
-	--ql-accent-muted: rgba(255, 115, 49, 0.15);
+	/* Quantlab accent tokens -- MUST keep the --vscode-quantlabAccent chain
+	(H54): tokens.css defines the same chain, but this file loads after it,
+	so a bare hex here would clobber the ThemeProvider override path. */
+	--ql-accent: var(--vscode-quantlabAccent, #FF7331);
+	--ql-accent-hover: var(--vscode-quantlabAccentHover, #E5672C);
+	--ql-accent-active: var(--vscode-quantlabAccentActive, #CC5C22);
+	--ql-accent-muted: color-mix(in srgb, var(--ql-accent) 15%, transparent);
 	--ql-accent-fg: #1A0A00;
 }
 
@@ -33,7 +35,9 @@ body {
 .toolbar {
 	display: flex;
 	align-items: center;
+	flex-wrap: wrap; /* M34: don't clip controls at narrow split-panel widths */
 	gap: 8px;
+	row-gap: 4px;
 	padding: 8px 12px;
 	border-bottom: 1px solid var(--vscode-editorGroup-border);
 	background: var(--vscode-editor-background);
@@ -477,8 +481,9 @@ body {
 	font-weight: 600;
 	padding: 2px 6px;
 	border-radius: 3px;
-	background: color-mix(in srgb, var(--vscode-symbolIcon-fieldForeground, #007acc) 15%, transparent);
-	color: var(--vscode-symbolIcon-fieldForeground, #007acc);
+	/* M31: brand accent, not VS Code blue */
+	background: color-mix(in srgb, var(--ql-accent) 15%, transparent);
+	color: var(--ql-accent);
 	flex-shrink: 0;
 }
 
@@ -497,6 +502,8 @@ body {
 
 /* ---- LHS Chart Tools ---- */
 
+/* H53: theme-aware glass (was hardcoded dark rgba values that rendered as a
+dark blob with invisible white icons in light themes). */
 .lhs-toolbar {
 	position: absolute;
 	left: 8px;
@@ -506,26 +513,14 @@ body {
 	display: flex;
 	flex-direction: column;
 	align-items: center;
-	background:
-		linear-gradient(
-			180deg,
-			rgba(255, 255, 255, 0.03) 0%,
-			transparent 40%,
-			rgba(0, 0, 0, 0.05) 100%
-		),
-		rgba(13, 15, 19, 0.72);
+	background: color-mix(in srgb, var(--vscode-editorWidget-background) 92%, transparent);
 	backdrop-filter: blur(28px) saturate(1.4);
 	-webkit-backdrop-filter: blur(28px) saturate(1.4);
-	border: 1px solid rgba(255, 255, 255, 0.08);
-	border-top-color: rgba(255, 255, 255, 0.13);
+	border: 1px solid var(--vscode-editorWidget-border);
 	border-radius: 12px;
 	box-shadow:
-		0 0 0 0.5px rgba(0, 0, 0, 0.3),
 		0 1px 2px rgba(0, 0, 0, 0.12),
-		0 4px 12px rgba(0, 0, 0, 0.18),
-		0 12px 36px rgba(0, 0, 0, 0.22),
-		inset 0 1px 0 rgba(255, 255, 255, 0.06),
-		inset 0 -1px 0 rgba(0, 0, 0, 0.08);
+		0 4px 12px rgba(0, 0, 0, 0.18);
 	padding: 4px;
 	transition: padding 0.15s ease;
 }
@@ -540,7 +535,7 @@ body {
 	border: none;
 	border-radius: 8px;
 	background: transparent;
-	color: rgba(255, 255, 255, 0.5);
+	color: color-mix(in srgb, var(--vscode-foreground) 55%, transparent);
 	cursor: pointer;
 	display: flex;
 	align-items: center;
@@ -550,8 +545,8 @@ body {
 }
 
 .lhs-toolbar-toggle:hover {
-	background: rgba(255, 255, 255, 0.06);
-	color: rgba(255, 255, 255, 0.85);
+	background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+	color: var(--vscode-foreground);
 }
 
 .lhs-toolbar-toggle-icon {
@@ -581,7 +576,7 @@ body {
 .lhs-toolbar-separator {
 	width: 20px;
 	height: 1px;
-	background: rgba(255, 255, 255, 0.08);
+	background: var(--vscode-editorWidget-border);
 	margin: 2px 0;
 }
 
@@ -591,7 +586,7 @@ body {
 	border: none;
 	border-radius: 6px;
 	background: transparent;
-	color: rgba(255, 255, 255, 0.45);
+	color: color-mix(in srgb, var(--vscode-foreground) 50%, transparent);
 	cursor: pointer;
 	display: flex;
 	align-items: center;
@@ -601,12 +596,12 @@ body {
 }
 
 .lhs-tool-button:hover {
-	background: rgba(255, 255, 255, 0.06);
-	color: rgba(255, 255, 255, 0.85);
+	background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+	color: var(--vscode-foreground);
 }
 
 .lhs-tool-button.active {
-	background: rgba(255, 115, 49, 0.12);
+	background: color-mix(in srgb, var(--ql-accent) 12%, transparent);
 	color: var(--ql-accent);
 }
 
@@ -794,4 +789,180 @@ html[data-chart-mode="data"] .no-viz {
 
 .mh-actions button:hover {
 	background: var(--vscode-input-hoverBackground);
+}
+
+/* ---- OHLC legend (data mode, W4.1) ---- */
+
+.ohlc-legend {
+	display: none;
+	position: absolute;
+	top: 8px;
+	left: 10px;
+	z-index: 40;
+	align-items: baseline;
+	gap: 10px;
+	padding: 4px 10px;
+	border-radius: 6px;
+	background: color-mix(in srgb, var(--ql-bg) 72%, transparent);
+	font-family: var(--ql-font-mono);
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+	color: var(--ql-fg);
+	pointer-events: none;
+	white-space: nowrap;
+}
+
+html[data-chart-mode="data"] .ohlc-legend.show {
+	display: inline-flex;
+}
+
+.ohlc-legend .ol-symbol {
+	font-weight: 700;
+	font-size: 12px;
+	letter-spacing: 0.04em;
+}
+
+.ohlc-legend .ol-field {
+	display: inline-flex;
+	align-items: baseline;
+	gap: 4px;
+}
+
+.ohlc-legend .ol-label {
+	font-size: 10px;
+	color: var(--ql-muted);
+}
+
+.ohlc-legend.up .ol-value,
+.ohlc-legend.up .ol-change {
+	color: var(--ql-status-positive);
+}
+
+.ohlc-legend.down .ol-value,
+.ohlc-legend.down .ol-change {
+	color: var(--ql-status-negative);
+}
+
+/* ---- Loading pill (H17) ---- */
+
+.chart-loading {
+	display: none;
+	position: absolute;
+	top: 10px;
+	left: 50%;
+	transform: translateX(-50%);
+	z-index: 55;
+	align-items: center;
+	gap: 8px;
+	padding: 5px 14px;
+	border-radius: 999px;
+	background: var(--vscode-editorWidget-background);
+	border: 1px solid var(--vscode-editorWidget-border);
+	color: var(--vscode-editorWidget-foreground, var(--ql-fg));
+	font-size: 11px;
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+	pointer-events: none;
+}
+
+.chart-loading.show {
+	display: inline-flex;
+}
+
+.chart-loading-spinner {
+	width: 12px;
+	height: 12px;
+	border-radius: 50%;
+	border: 2px solid color-mix(in srgb, var(--ql-accent) 25%, transparent);
+	border-top-color: var(--ql-accent);
+	animation: chart-loading-spin 0.8s linear infinite;
+}
+
+@keyframes chart-loading-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.chart-loading-spinner {
+		animation: none;
+	}
+}
+
+/* ---- Get-started empty state (H17) ---- */
+
+.chart-empty {
+	display: none;
+	position: absolute;
+	inset: 0;
+	z-index: 45;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	text-align: center;
+	color: var(--vscode-descriptionForeground);
+	background: var(--ql-bg);
+}
+
+.chart-empty.show {
+	display: flex;
+}
+
+.chart-empty-glyph {
+	opacity: 0.3;
+	margin-bottom: 10px;
+}
+
+.chart-empty-title {
+	font-size: 15px;
+	font-weight: 600;
+	color: var(--ql-fg);
+}
+
+.chart-empty-hint {
+	font-size: 12px;
+	max-width: 320px;
+}
+
+.chart-empty-browse {
+	margin-top: 12px;
+	padding: 5px 14px;
+	border: 1px solid var(--vscode-button-border, transparent);
+	border-radius: 4px;
+	background: var(--ql-accent);
+	color: var(--ql-accent-fg);
+	cursor: pointer;
+}
+
+.chart-empty-browse:hover {
+	background: var(--ql-accent-hover);
+}
+
+/* Mode-specific empty-state copy: html[data-chart-mode] picks the wording. */
+.chart-empty .data-only {
+	display: none;
+}
+
+html[data-chart-mode="data"] .chart-empty .data-only {
+	display: block;
+}
+
+html[data-chart-mode="data"] .chart-empty .strategy-only {
+	display: none;
+}
+
+/* ---- Date-range clear (M29) ---- */
+
+.date-clear-button {
+	min-width: 22px;
+	padding: 4px 6px !important;
+	font-size: 13px;
+	line-height: 1;
+	cursor: pointer;
+	color: var(--vscode-descriptionForeground) !important;
+}
+
+.date-clear-button:hover {
+	color: var(--vscode-foreground) !important;
 }

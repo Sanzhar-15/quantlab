@@ -100,9 +100,17 @@ export class ContextAssembler {
 		// System prompt with optional response style modifier
 		let systemPrompt = PROMPT_TEMPLATES[lane] ?? PROMPT_TEMPLATES['chat-ask'];
 
-		// Override system prompt for strategy generation requests
+		// Override system prompt for strategy generation requests.
+		// 'strategy-generation' is a prompt-template overlay on top of the host lane,
+		// NOT a LaneName: the LaneRouter never produces it, and the lane's budget,
+		// tools, and model selection stay those of the host lane. A missing template
+		// is a programming error and must fail loudly (No-Fallbacks).
 		if (this.isStrategyGenerationRequest(userMessage, lane)) {
-			systemPrompt = PROMPT_TEMPLATES['strategy-generation'] ?? systemPrompt;
+			const strategyPrompt = PROMPT_TEMPLATES['strategy-generation'];
+			if (!strategyPrompt) {
+				throw new Error('[ContextAssembler] PROMPT_TEMPLATES is missing the strategy-generation template');
+			}
+			systemPrompt = strategyPrompt;
 		}
 
 		// Inject response style modifier for conversational lanes
@@ -206,8 +214,10 @@ export class ContextAssembler {
 					contextMessages.push({ role: 'system', content: resultText });
 					contextTokens += resultTokens;
 				}
-			} catch {
-				// Context search failed -- proceed without it
+			} catch (e) {
+				// Context search failed -- proceed without it, but keep the
+				// failure visible (Megaudit 2026-06-11 M80, No-Fallbacks).
+				console.warn('[ContextAssembler] BM25 context search failed:', e);
 			}
 		}
 
@@ -260,7 +270,10 @@ export class ContextAssembler {
 			const tree = lines.join('\n');
 			this.workspaceTreeCache = { tree, generatedAt: Date.now() };
 			return tree;
-		} catch {
+		} catch (e) {
+			// Megaudit 2026-06-11 (M80): surface the failure (No-Fallbacks)
+			// before degrading to a tree-less context.
+			console.warn('[ContextAssembler] workspace tree generation failed:', e);
 			return null;
 		}
 	}
@@ -304,8 +317,11 @@ export class ContextAssembler {
 					lines.push(`${prefix}${connector}${entry.name}`);
 				}
 			}
-		} catch {
-			// Skip inaccessible directories
+		} catch (e) {
+			// Skip inaccessible directories, but log them (Megaudit
+			// 2026-06-11 M80, No-Fallbacks) so permission problems are
+			// diagnosable instead of silently producing a truncated tree.
+			console.warn(`[ContextAssembler] cannot read directory ${dir}:`, e);
 		}
 	}
 
@@ -382,18 +398,26 @@ export class ContextAssembler {
 			const uri = URI.file(resolvedPath);
 			const content = await this.fileService.readFile(uri);
 			return content.value.toString();
-		} catch {
+		} catch (e) {
+			// Megaudit 2026-06-11 (M80): log before degrading to null
+			// (No-Fallbacks) -- the caller treats null as "file absent".
+			console.warn(`[ContextAssembler] cannot read file ${filePath}:`, e);
 			return null;
 		}
 	}
 
 	/**
 	 * Detect if the user is requesting strategy generation.
-	 * Only override for chat-act and chat-ask lanes where code generation happens.
+	 * Applies to all conversational lanes the LaneRouter can send a strategy
+	 * request to: chat-act/chat-ask (direct generation), chat-plan (e.g.
+	 * 'Design a Bollinger Band strategy' matches PLAN_PATTERNS) and chat-gather
+	 * (e.g. 'find ... and create a momentum strategy' matches GATHER_PATTERNS).
+	 * The keyword checks below stay strict, so non-generation messages on those
+	 * lanes are unaffected.
 	 */
 	private isStrategyGenerationRequest(userMessage: string, lane: LaneName): boolean {
 		// Only apply to conversational lanes where strategy generation is likely
-		if (lane !== 'chat-act' && lane !== 'chat-ask') {
+		if (lane !== 'chat-act' && lane !== 'chat-ask' && lane !== 'chat-plan' && lane !== 'chat-gather') {
 			return false;
 		}
 
@@ -442,8 +466,10 @@ export class ContextAssembler {
 
 		// Check for strategy indicators combined with action verbs
 		// ('fix'/'repair' cover Fix-with-Orion flows: corrections to an existing
-		// strategy need the same API contract as fresh generation)
-		const actionVerbs = ['create', 'build', 'write', 'make', 'generate', 'develop', 'implement', 'code', 'fix', 'repair'];
+		// strategy need the same API contract as fresh generation; 'design'
+		// covers the chat-plan routing, e.g. 'Design a Bollinger Band strategy'
+		// matches the LaneRouter's PLAN_PATTERNS -- Megaudit 2026-06-11 H43)
+		const actionVerbs = ['create', 'build', 'write', 'make', 'generate', 'develop', 'implement', 'code', 'fix', 'repair', 'design'];
 		for (const indicator of strategyIndicators) {
 			if (lowerMessage.includes(indicator)) {
 				for (const verb of actionVerbs) {

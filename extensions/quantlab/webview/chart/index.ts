@@ -7,6 +7,7 @@ import { ChartClient } from './chartApi';
 import { ParameterPanel } from './parameterPanel';
 import { createMessageHandler } from './messageHandler';
 import { createMarketHeader } from './marketHeader';
+import { createOhlcLegend } from './ohlcLegend';
 import { installErrorBoundary } from './errorBoundary';
 import { applyReducedMotion, applyTheme, ReducedMotionMode, ThemePayload } from '../shared/appearance';
 
@@ -88,6 +89,18 @@ const applyDateRange = () => {
 dateStart.addEventListener('change', applyDateRange);
 dateEnd.addEventListener('change', applyDateRange);
 
+// M29: once a date-range override is set there was no way to remove it --
+// clearing both inputs posts range: undefined so the host drops the override.
+const dateClearButton = document.createElement('button');
+dateClearButton.className = 'date-clear-button';
+dateClearButton.title = 'Clear date range';
+dateClearButton.textContent = '\u00D7';
+dateClearButton.addEventListener('click', () => {
+	dateStart.value = '';
+	dateEnd.value = '';
+	vscode.postMessage({ type: 'overrideDateRange', range: undefined });
+});
+
 const complexityBadge = document.createElement('div');
 complexityBadge.className = 'complexity safe';
 complexityBadge.textContent = 'Complexity: safe';
@@ -107,7 +120,7 @@ fullscreenButton.addEventListener('click', () => vscode.postMessage({ type: 'tog
 
 const leftGroup = document.createElement('div');
 leftGroup.className = 'toolbar-group';
-leftGroup.append(dataSourceContainer, timeframeLabel, strategyButton, dateStart, dateEnd);
+leftGroup.append(dataSourceContainer, timeframeLabel, strategyButton, dateStart, dateEnd, dateClearButton);
 
 const rightGroup = document.createElement('div');
 rightGroup.className = 'toolbar-group';
@@ -234,6 +247,54 @@ lhsToggle.addEventListener('click', () => {
 
 lhsToolbar.append(lhsToggle, lhsTools);
 chartContainer.appendChild(lhsToolbar);
+
+// --- OHLC legend (data mode, W4.1) ---
+const ohlcLegend = createOhlcLegend();
+chartContainer.appendChild(ohlcLegend.root);
+
+// --- Loading pill (H17): visible while a bar fetch is in flight ---
+const loadingPill = document.createElement('div');
+loadingPill.className = 'chart-loading';
+const loadingSpinner = document.createElement('span');
+loadingSpinner.className = 'chart-loading-spinner';
+const loadingText = document.createElement('span');
+loadingText.textContent = 'Loading market data...';
+loadingPill.append(loadingSpinner, loadingText);
+chartContainer.appendChild(loadingPill);
+
+// --- Get-started empty state (H17): no data source selected ---
+// Mirrors the visualise webview's .chart-placeholder pattern. Wording is
+// mode-specific; CSS gated by html[data-chart-mode] shows the right copy.
+const emptyState = document.createElement('div');
+emptyState.className = 'chart-empty';
+
+const emptyGlyph = document.createElement('div');
+emptyGlyph.className = 'chart-empty-glyph';
+emptyGlyph.innerHTML = '<svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M3 3v18h18"/><path d="M6 15l4-5 3 3 5-7"/></svg>';
+
+const emptyTitleData = document.createElement('div');
+emptyTitleData.className = 'chart-empty-title data-only';
+emptyTitleData.textContent = 'Select a symbol to begin';
+
+const emptyHintData = document.createElement('div');
+emptyHintData.className = 'chart-empty-hint data-only';
+emptyHintData.textContent = 'Drag any symbol from the Data panel, or pick one above.';
+
+const emptyTitleStrategy = document.createElement('div');
+emptyTitleStrategy.className = 'chart-empty-title strategy-only';
+emptyTitleStrategy.textContent = 'Select a data source to begin';
+
+const emptyHintStrategy = document.createElement('div');
+emptyHintStrategy.className = 'chart-empty-hint strategy-only';
+emptyHintStrategy.textContent = 'Pick a data file above, or drop a CSV/Parquet here.';
+
+const emptyBrowseButton = document.createElement('button');
+emptyBrowseButton.className = 'chart-empty-browse strategy-only';
+emptyBrowseButton.textContent = 'Browse Local Files...';
+emptyBrowseButton.addEventListener('click', () => vscode.postMessage({ type: 'requestFilePicker' }));
+
+emptyState.append(emptyGlyph, emptyTitleData, emptyHintData, emptyTitleStrategy, emptyHintStrategy, emptyBrowseButton);
+chartContainer.appendChild(emptyState);
 
 const panelRoot = document.createElement('div');
 panelRoot.className = 'params-panel';
@@ -364,6 +425,9 @@ chartContainer.addEventListener('drop', event => {
 	}
 });
 
+// W4.1: crosshair-driven legend updates; null = pointer left -> last bar.
+chartClient.setHoverListener(index => ohlcLegend.showBar(index));
+
 const handler = createMessageHandler({
 	postMessage: message => vscode.postMessage(message),
 	chart: chartClient,
@@ -372,6 +436,9 @@ const handler = createMessageHandler({
 	noViz: noVizPrompt,
 	applyMode,
 	marketHeader,
+	legend: ohlcLegend,
+	loading: loadingPill,
+	emptyState,
 	toolbar: {
 		dataSourceButton,
 		dataSourceDropdown,

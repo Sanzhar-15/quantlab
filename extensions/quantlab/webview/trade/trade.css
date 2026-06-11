@@ -6,11 +6,12 @@
 :root {
 	color-scheme: light dark;
 
-	/* QuantLab Accent Color Overrides */
-	--ql-accent: #FF7331;
-	--ql-accent-hover: #E5672C;
-	--ql-accent-active: #CC5C22;
-	--ql-accent-muted: rgba(255, 115, 49, 0.15);
+	/* QuantLab Accent -- canonical chain. Must mirror tokens.css so the
+		ThemeProvider --vscode-quantlabAccent override is never clobbered. */
+	--ql-accent: var(--vscode-quantlabAccent, #FF7331);
+	--ql-accent-hover: var(--vscode-quantlabAccentHover, #E5672C);
+	--ql-accent-active: var(--vscode-quantlabAccentActive, #CC5C22);
+	--ql-accent-muted: color-mix(in srgb, var(--ql-accent) 15%, transparent);
 	--ql-accent-fg: #1A0A00;
 }
 

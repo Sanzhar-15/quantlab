@@ -1,5 +1,5 @@
 /*---------------------------------------------------------------------------------------------
- *  Copyright (c) Quantlab. All rights reserved.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
@@ -15,24 +15,24 @@
 (function() {
 	'use strict';
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Constants
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	const DOCS_URL = 'https://docs.quantlab.io/qic';
 	const ISSUES_URL = 'https://github.com/quantlab/qic/issues/new';
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// State
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	let modal = null;
 	let focusTrap = null;
 	let previouslyFocused = null;
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Initialization
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	function init() {
 		modal = document.getElementById('help-modal');
@@ -68,10 +68,10 @@
 						<div class="qic-shortcuts-list">
 							<div class="qic-shortcut">
 								<kbd>Cmd+L</kbd>
-								<span>Focus QIC input</span>
+								<span>Focus Orion input</span>
 							</div>
 							<div class="qic-shortcut">
-								<kbd>Cmd+Shift+N</kbd>
+								<kbd>Cmd+Alt+N</kbd>
 								<span>New conversation</span>
 							</div>
 							<div class="qic-shortcut">
@@ -152,7 +152,7 @@
 						<h3>Review Mode</h3>
 						<div class="qic-shortcuts-list">
 							<div class="qic-shortcut">
-								<kbd>↓</kbd> / <kbd>↑</kbd>
+								<kbd>v</kbd> / <kbd>^</kbd>
 								<span>Navigate files</span>
 							</div>
 							<div class="qic-shortcut">
@@ -206,12 +206,12 @@
 		document.body.appendChild(modal);
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Public API
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	function show() {
-		if (!modal) return;
+		if (!modal) { return; }
 
 		modal.hidden = false;
 		previouslyFocused = document.activeElement;
@@ -227,7 +227,7 @@
 	}
 
 	function hide() {
-		if (!modal) return;
+		if (!modal) { return; }
 
 		modal.hidden = true;
 		removeFocusTrap();
@@ -251,16 +251,16 @@
 		return modal && !modal.hidden;
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Focus Trap
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	function setupFocusTrap() {
 		const focusableElements = modal.querySelectorAll(
 			'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
 		);
 
-		if (focusableElements.length === 0) return;
+		if (focusableElements.length === 0) { return; }
 
 		const firstFocusable = focusableElements[0];
 		const lastFocusable = focusableElements[focusableElements.length - 1];
@@ -294,9 +294,9 @@
 		}
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Actions
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	function handleAction(action) {
 		const vscode = window.vscode || window.vscodeApi;
@@ -326,12 +326,12 @@
 		}
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Event Listeners
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	function setupEventListeners() {
-		if (!modal) return;
+		if (!modal) { return; }
 
 		// Action buttons and links
 		modal.addEventListener('click', (e) => {
@@ -349,9 +349,9 @@
 		});
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Helpers
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	function announce(message) {
 		const announcer = document.getElementById('qic-announcer');
@@ -360,9 +360,9 @@
 		}
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Export
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	window.QicHelpModal = {
 		show,

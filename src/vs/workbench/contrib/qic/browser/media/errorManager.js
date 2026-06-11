@@ -1,5 +1,5 @@
 /*---------------------------------------------------------------------------------------------
- *  Copyright (c) Quantlab. All rights reserved.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
@@ -19,9 +19,9 @@
 (function() {
 	'use strict';
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Error Code Map (GAP-07)
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	const ERROR_CODE_MAP = {
 		// Tool Errors
@@ -40,7 +40,7 @@
 		'QIC-P006': { title: 'Authentication Failed', message: 'Your API key is invalid or expired.', severity: 'critical', displayMethod: 'modal' },
 
 		// Network Errors
-		'QIC-N001': { title: 'Connection Failed', message: 'Unable to connect to the QIC service.', severity: 'error', displayMethod: 'banner', recoveryAction: 'Retry' },
+		'QIC-N001': { title: 'Connection Failed', message: 'Unable to connect to the Orion service.', severity: 'error', displayMethod: 'banner', recoveryAction: 'Retry' },
 		'QIC-N002': { title: 'Request Timeout', message: 'The request timed out.', severity: 'warning', displayMethod: 'inline', recoveryAction: 'Retry' },
 		'QIC-N003': { title: 'Offline', message: 'You appear to be offline.', severity: 'warning', displayMethod: 'banner' },
 		'QIC-N004': { title: 'Server Error', message: 'The server encountered an error.', severity: 'error', displayMethod: 'inline' },
@@ -65,18 +65,18 @@
 		'QIC-X002': { title: 'State Sync Error', message: 'State synchronization failed.', severity: 'warning', displayMethod: 'toast' },
 	};
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// State
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	const errors = new Map();
 	let container = null;
 	let announcer = null;
 	let toastContainer = null;
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Initialization
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	function init() {
 		container = document.getElementById('messages');
@@ -126,9 +126,9 @@
 		});
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Public API
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	/**
 	 * Display an error by code
@@ -220,15 +220,15 @@
 		return error.id;
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Display Methods
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	/**
 	 * Show inline error in conversation
 	 */
 	function showInline(error, autoDismiss = 0) {
-		if (!container) return;
+		if (!container) { return; }
 
 		errors.set(error.id, error);
 
@@ -274,7 +274,7 @@
 	 * Show toast notification
 	 */
 	function showToast(error, autoDismiss = 5000) {
-		if (!toastContainer) return;
+		if (!toastContainer) { return; }
 
 		errors.set(error.id, error);
 
@@ -372,7 +372,7 @@
 		if (existing) {
 			const errorId = existing.dataset.errorId;
 			existing.remove();
-			if (errorId) errors.delete(errorId);
+			if (errorId) { errors.delete(errorId); }
 		}
 	}
 
@@ -394,9 +394,9 @@
 		});
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Validation Errors
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	/**
 	 * Show validation error on input
@@ -405,7 +405,7 @@
 		hideValidationError(inputId);
 
 		const input = document.getElementById(inputId);
-		if (!input) return;
+		if (!input) { return; }
 
 		const errorEl = document.createElement('div');
 		errorEl.className = 'qic-validation-error';
@@ -440,15 +440,15 @@
 		errorEl?.remove();
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Error Management
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	/**
 	 * Dismiss an error
 	 */
 	function dismiss(errorId) {
-		if (!errorId) return;
+		if (!errorId) { return; }
 
 		const errorEl = document.querySelector(`[data-error-id="${errorId}"]`);
 		if (errorEl) {
@@ -494,15 +494,15 @@
 		}
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Accessibility
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	/**
 	 * Announce error for screen readers
 	 */
 	function announce(error) {
-		if (!announcer) return;
+		if (!announcer) { return; }
 
 		const announcement = `${error.severity}: ${error.title}. ${error.message}`;
 		announcer.textContent = '';
@@ -511,9 +511,9 @@
 		}, 50);
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Message Handling
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	function handleMessage(message) {
 		switch (message.type) {
@@ -555,7 +555,7 @@
 						id: 'connection_error',
 						severity: 'warning',
 						title: 'Connection Lost',
-						message: message.message || 'Connection to QIC service lost.',
+						message: message.message || 'Connection to Orion service lost.',
 						recoverable: true,
 						retryAction: 'Reconnect',
 					});
@@ -566,9 +566,9 @@
 		}
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Helpers
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	function renderActions(error) {
 		if (!error.recoverable && !error.retryAction) {
@@ -622,9 +622,9 @@
 	const escapeHtml = window.qicUtils.escapeHtml;
 	const escapeAttr = window.qicUtils.escapeAttr;
 
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 	// Export
-	// ═══════════════════════════════════════════════════════════════════
+	// ===================================================================
 
 	window.QicErrorManager = {
 		init,

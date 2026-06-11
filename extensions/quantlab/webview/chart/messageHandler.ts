@@ -3,8 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { ChartClient, type EquityPoint, type OhlcvBar, type SignalPoint, type TradeFillPoint, type TradeOrderPoint, type TradePositionPoint, type VisualizationCommand } from './chartApi';
-import { ParameterPanel, type ParameterDefinition } from './parameterPanel';
+import type { ChartClient, EquityPoint, OhlcvBar, SignalPoint, TradeFillPoint, TradeOrderPoint, TradePositionPoint, VisualizationCommand } from './chartApi';
+import type { ParameterPanel, ParameterDefinition } from './parameterPanel';
 
 interface ComplexityInfo {
 	level: 'safe' | 'partial' | 'viewOnly';
@@ -57,6 +57,9 @@ type ChartMessage =
 	| { type: 'setData'; requestId: number; data: OhlcvBar[] }
 	| { type: 'setDataBinary'; requestId: number; buffer: ArrayBuffer; count: number }
 	| { type: 'setSignals'; requestId: number; signals: SignalPoint[] }
+	| { type: 'addSignal'; signal: SignalPoint }
+	| { type: 'showLoading'; requestId: number }
+	| { type: 'showEmptyState' }
 	| { type: 'setEquityCurve'; requestId: number; equity: EquityPoint[] }
 	| { type: 'setVisualization'; requestId: number; commands: VisualizationCommand[] }
 	| { type: 'setTradeOrders'; sessionId: string; orders: TradeOrderPoint[] }
@@ -84,7 +87,17 @@ interface MessageHandlerContext {
 		setSource(symbol: string | undefined, displayName: string | undefined, assetClass?: string): void;
 		setTimeframe(timeframe: string | undefined): void;
 		updateFromBars(bars: OhlcvBar[]): void;
+		setRange(range: { start: string; end: string } | undefined): void;
 	};
+	/** OHLC legend (data mode): symbol + bar history for hover readouts. */
+	legend: {
+		setSymbol(symbol: string | undefined): void;
+		setBars(bars: OhlcvBar[]): void;
+	};
+	/** Loading pill shown while a bar fetch is in flight (H17). */
+	loading: HTMLElement;
+	/** Get-started placeholder shown when no data source is selected (H17). */
+	emptyState: HTMLElement;
 	toolbar: {
 		dataSourceButton: HTMLButtonElement;
 		dataSourceDropdown: HTMLElement;
@@ -111,6 +124,14 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 		context.banner.dataset.tone = tone ?? 'info';
 	};
 
+	const setLoading = (visible: boolean) => {
+		context.loading.classList.toggle('show', visible);
+	};
+
+	const setEmptyState = (visible: boolean) => {
+		context.emptyState.classList.toggle('show', visible);
+	};
+
 	const setComplexity = (complexity: ComplexityInfo) => {
 		context.toolbar.complexity.textContent = `Complexity: ${complexity.level}`;
 		context.toolbar.complexity.classList.remove('safe', 'partial', 'viewOnly');
@@ -129,6 +150,10 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 			clearError();
 			return;
 		}
+
+		// A real error supersedes the loading pill and the get-started state.
+		setLoading(false);
+		setEmptyState(false);
 
 		context.errorMessage.textContent = message;
 		context.errorMessage.title = detail ?? '';
@@ -250,10 +275,18 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 			const source = toolbar.dataSource;
 			if (source && isServerSource(source)) {
 				context.marketHeader.setSource(source.symbol, source.displayName, source.assetClass);
+				context.legend.setSymbol(source.symbol);
+				context.chart.setWatermark(source.symbol);
 			} else {
 				context.marketHeader.setSource(undefined, undefined);
+				context.legend.setSymbol(undefined);
+				context.chart.setWatermark(null);
 			}
 			context.marketHeader.setTimeframe(toolbar.timeframe);
+			context.marketHeader.setRange(toolbar.dateRange);
+		} else {
+			context.legend.setSymbol(undefined);
+			context.chart.setWatermark(null);
 		}
 		context.toolbar.dataSourceButton.textContent = toolbar.dataSource?.displayName ?? 'No Data';
 		// Set tooltip based on source type
@@ -310,7 +343,10 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 				}
 				lastDataRequestId = data.requestId;
 				clearError();
+				setLoading(false);
+				setEmptyState(false);
 				context.marketHeader.updateFromBars(data.data);
+				context.legend.setBars(data.data);
 				await context.chart.setData(data.data);
 				return;
 			case 'setDataBinary': {
@@ -322,11 +358,37 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 				}
 				lastDataRequestId = data.requestId;
 				clearError();
+				setLoading(false);
+				setEmptyState(false);
 				const decoded = decodeOhlcvBuffer(data.buffer, data.count);
 				context.marketHeader.updateFromBars(decoded);
+				context.legend.setBars(decoded);
 				await context.chart.setData(decoded);
 				return;
 			}
+			case 'showLoading':
+				// H17: visible fetch feedback. A stale id (older than data we
+				// already rendered) must not re-arm the pill.
+				if (typeof data.requestId !== 'number' || data.requestId < lastDataRequestId) {
+					return;
+				}
+				setLoading(true);
+				setEmptyState(false);
+				clearError();
+				return;
+			case 'showEmptyState':
+				// H17: get-started state -- no data source selected.
+				setLoading(false);
+				clearError();
+				setEmptyState(true);
+				return;
+			case 'addSignal':
+				// H15: live trade fill markers appended without replacing the set.
+				if (!data.signal || typeof data.signal.t !== 'number') {
+					return;
+				}
+				await context.chart.addSignal(data.signal);
+				return;
 			case 'setSignals':
 				await context.chart.setSignals(data.signals);
 				return;

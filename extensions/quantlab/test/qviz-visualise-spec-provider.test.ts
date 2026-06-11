@@ -37,14 +37,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-import { installVscodeShim } from './helpers/vscode-shim';
-// Install BEFORE any provider import resolves.
-installVscodeShim();
-
-// Now import the shim's exports for test setup, AND the provider.
-// The provider's `import * as vscode from 'vscode'` will resolve to
-// the same module the next line loads.
+// Install BEFORE any provider import resolves (imports hoist, so the shim
+// module evaluates first regardless of where the call sits).
 import {
+	installVscodeShim,
 	Uri,
 	_resetShimState,
 	_setWorkspaceFolders,
@@ -55,9 +51,12 @@ import {
 	_setWarningMessageResponse,
 	_createdWatchers,
 } from './helpers/vscode-shim';
+installVscodeShim();
 
 import {
 	VisualiseSpecProvider,
+	inspectorFiltersToFilterTransforms,
+	specHasAggregateTransforms,
 	type LifecycleSource,
 } from '../src/views/visualise/VisualiseSpecProvider';
 import type { QvizSpec } from '../src/qviz/spec';
@@ -922,10 +921,6 @@ suite('VisualiseSpecProvider -- lifecycle (dispose, panel teardown)', () => {
 // Phase 6 (6.G.2/6.G.3): inspector-filter translation
 // ---------------------------------------------------------------------------
 
-import {
-	inspectorFiltersToFilterTransforms,
-	specHasAggregateTransforms,
-} from '../src/views/visualise/VisualiseSpecProvider';
 import type { InspectorFilter } from '../src/qviz/messageProtocol';
 
 suite('VisualiseSpecProvider -- inspectorFiltersToFilterTransforms (Phase 6)', () => {
@@ -1227,5 +1222,124 @@ suite('VisualiseSpecProvider -- specHasAggregateTransforms (B-10 cure)', () => {
 			],
 		});
 		assert.strictEqual(specHasAggregateTransforms(spec), false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Megaudit 2026-06-11 H39 -- recheckDataset OK path must refresh driftStatus
+// ---------------------------------------------------------------------------
+
+suite('VisualiseSpecProvider -- recheckDataset drift refresh (H39)', () => {
+
+	test('save succeeds after a successful re-check of a previously missing dataset', async () => {
+		beforeEachReset();
+		const source = new FakeLifecycleSource();
+		// Remove the dataset BEFORE open so initial drift detection FAILS
+		// at resolveDatasetPath (driftStatus = failed).
+		if (fs.existsSync(DATASET_ABS)) { fs.rmSync(DATASET_ABS); }
+		const { provider, document } = await openDocAndDriveDetection({
+			source, skipDataset: true,
+		});
+		// Precondition: save refuses while driftStatus is failed.
+		await assert.rejects(
+			() => provider.saveCustomDocument(document, undefined as unknown as never),
+			/drift detection failed/,
+		);
+		assert.deepStrictEqual(_writesSnapshot(), []);
+
+		// The file reappears; the user clicks "Re-check file".
+		fs.mkdirSync(path.dirname(DATASET_ABS), { recursive: true });
+		fs.writeFileSync(DATASET_ABS, 'dataset-bytes');
+		const panel = makeFakePanel();
+		await provider.resolveCustomEditor(
+			document, panel.panel as unknown as never, undefined as unknown as never,
+		);
+		panel.fireMessage({ type: 'recheckDataset', protocolVersion: 1, requestId: 777 });
+		await drainMicrotasks();
+
+		// The banner-clearing OK status was posted...
+		const okStatuses = panel.postedMessages.filter(
+			(m): m is { type: 'datasetStatus'; status: string } =>
+				typeof m === 'object' && m !== null
+				&& (m as { type?: string }).type === 'datasetStatus'
+				&& (m as { status?: string }).status === 'ok',
+		);
+		assert.ok(okStatuses.length >= 1, 'expected a datasetStatus ok message after recheck');
+
+		// ...AND driftStatus was refreshed, so Cmd+S now succeeds (the
+		// H39 bug left driftStatus at failed forever, refusing every save).
+		await provider.saveCustomDocument(document, undefined as unknown as never);
+		assert.strictEqual(_writesSnapshot().length, 1,
+			'save after a successful recheck must write to disk');
+	});
+
+	test('recheck of a still-missing dataset keeps the failure visible and save refusing', async () => {
+		beforeEachReset();
+		const source = new FakeLifecycleSource();
+		if (fs.existsSync(DATASET_ABS)) { fs.rmSync(DATASET_ABS); }
+		const { provider, document } = await openDocAndDriveDetection({
+			source, skipDataset: true,
+		});
+		const panel = makeFakePanel();
+		await provider.resolveCustomEditor(
+			document, panel.panel as unknown as never, undefined as unknown as never,
+		);
+		panel.fireMessage({ type: 'recheckDataset', protocolVersion: 1, requestId: 778 });
+		await drainMicrotasks();
+		await assert.rejects(
+			() => provider.saveCustomDocument(document, undefined as unknown as never),
+			/drift detection failed/,
+		);
+		assert.deepStrictEqual(_writesSnapshot(), []);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Megaudit 2026-06-11 H41 -- cross-folder Save As refusal must pair
+// saveStarted with saveResult(failed) so the webview reducer accepts it
+// ---------------------------------------------------------------------------
+
+suite('VisualiseSpecProvider -- saveCustomDocumentAs cross-folder refusal (H41)', () => {
+
+	test('refusal emits saveStarted BEFORE saveResult(failed) with the same specHash', async () => {
+		beforeEachReset();
+		const source = new FakeLifecycleSource();
+		const { provider, document } = await openDocAndDriveDetection({ source });
+		const panel = makeFakePanel();
+		await provider.resolveCustomEditor(
+			document, panel.panel as unknown as never, undefined as unknown as never,
+		);
+		// Target OUTSIDE every workspace folder -> crossFolder refusal.
+		const target = Uri.file('/elsewhere/other.qviz.json');
+		await assert.rejects(
+			() => provider.saveCustomDocumentAs(
+				document, target as unknown as never, undefined as unknown as never,
+			),
+			/across workspace folders/,
+		);
+		const started = panel.postedMessages.filter(
+			(m): m is { type: 'saveStarted'; specHash: string } =>
+				typeof m === 'object' && m !== null
+				&& (m as { type?: string }).type === 'saveStarted',
+		);
+		const failed = panel.postedMessages.filter(
+			(m): m is { type: 'saveResult'; status: string; specHash: string } =>
+				typeof m === 'object' && m !== null
+				&& (m as { type?: string }).type === 'saveResult'
+				&& (m as { status?: string }).status === 'failed',
+		);
+		assert.strictEqual(started.length, 1,
+			'cross-folder refusal must emit exactly one saveStarted');
+		assert.strictEqual(failed.length, 1,
+			'cross-folder refusal must emit exactly one saveResult(failed)');
+		assert.strictEqual(started[0].specHash, failed[0].specHash,
+			'saveStarted and saveResult must carry the SAME attempted hash '
+			+ '(the webview reducer gates on pendingSaveHash === specHash)');
+		// Ordering: saveStarted must precede saveResult.
+		const startedIdx = panel.postedMessages.indexOf(started[0]);
+		const failedIdx = panel.postedMessages.indexOf(failed[0]);
+		assert.ok(startedIdx < failedIdx, 'saveStarted must precede saveResult');
+		// And nothing was written to disk.
+		assert.deepStrictEqual(_writesSnapshot(), []);
 	});
 });

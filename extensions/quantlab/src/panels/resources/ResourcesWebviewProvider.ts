@@ -7,7 +7,7 @@ import * as vscode from 'vscode';
 import { getWebviewUri, getNonce } from '../../utils/webview';
 import { ResourcesCatalogService } from './ResourcesCatalogService';
 import { ServerApiClient } from '../../core/server/ServerApiClient';
-import { ClientSection } from '../../types/resources';
+import { ClientSection, TOOL_ID_MAP } from '../../types/resources';
 
 export type ResourcesSection = ClientSection;
 
@@ -34,6 +34,7 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 	private currentSection: ResourcesSection = 'strategy';
 	private pendingSection?: ResourcesSection;
 	private disposables: vscode.Disposable[] = [];
+	private lastAuthSignedIn?: boolean;
 
 	private constructor(
 		private readonly extensionUri: vscode.Uri,
@@ -41,12 +42,26 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 	) {
 		// Sign-in must replace the offline-only catalog with the live one (and
 		// sign-out must drop back) without requiring a panel reopen.
-		ServerApiClient.getInstance().onAuthStateChange(() => {
-			void this.catalogService.getCatalog(true).then(() => {
-				if (this.view) {
-					void this.sendCatalog();
+		// Megaudit M119: ServerApiClient fires onAuthStateChange(true) on EVERY
+		// proactive token refresh (~15min), not only on sign-in -- only a real
+		// signed-in/signed-out TRANSITION may force-redownload the catalog.
+		// Megaudit M38: failures of this refresh chain must be logged, not
+		// swallowed by a bare `void`.
+		ServerApiClient.getInstance().onAuthStateChange((signedIn: boolean) => {
+			if (signedIn === this.lastAuthSignedIn) {
+				return; // token refresh, not an auth transition
+			}
+			this.lastAuthSignedIn = signedIn;
+			void (async () => {
+				try {
+					await this.catalogService.getCatalog(true);
+					if (this.view) {
+						await this.sendCatalog();
+					}
+				} catch (err) {
+					console.error('[ResourcesWebviewProvider] auth-state catalog refresh failed:', err);
 				}
-			});
+			})();
 		});
 	}
 
@@ -108,8 +123,15 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 	private async handleMessage(message: ResourcesMessage): Promise<void> {
 		switch (message.type) {
 			case 'ready':
-			case 'requestCatalog':
 				await this.sendCatalog();
+				break;
+
+			case 'requestCatalog':
+				// Megaudit H20: 'requestCatalog' only arrives from the Retry buttons
+				// (stale-cache banner / unavailable state). Retry must force a fresh
+				// server fetch -- without forceRefresh the 5-minute memory TTL hands
+				// the identical stale catalog straight back.
+				await this.sendCatalog(true);
 				break;
 
 			case 'sectionChange':
@@ -147,14 +169,14 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	private async sendCatalog(): Promise<void> {
+	private async sendCatalog(forceRefresh?: boolean): Promise<void> {
 		try {
-			const catalog = await this.catalogService.getCatalog();
+			const catalog = await this.catalogService.getCatalog(forceRefresh);
 
 			if (!catalog) {
 				this.postMessage({
 					type: 'catalogUnavailable',
-					message: 'Could not load catalog. Connect to the Delta Plus Server and retry.',
+					message: 'Could not load catalog. Connect to Quantlab and retry.',
 				});
 				return;
 			}
@@ -178,8 +200,19 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 					message: 'Using cached catalog. Server unavailable.',
 					lastUpdated: catalog.fetchedAt,
 				});
+			} else if (catalog.version === 'offline') {
+				// Megaudit M37: the offline-only catalog has a fresh fetchedAt, so the
+				// stale-cache banner never fires for it -- without this the user sees
+				// 4 built-in tools with no explanation that the server catalog is gone.
+				this.postMessage({
+					type: 'catalogError',
+					errorType: 'offline',
+					message: 'Offline mode -- built-in tools only. Sign in to load the full catalog.',
+				});
 			}
-		} catch {
+		} catch (err) {
+			// Megaudit H22 (No-Fallbacks): the failure must be logged AND surfaced.
+			console.error('[ResourcesWebviewProvider] sendCatalog failed:', err);
 			this.postMessage({
 				type: 'catalogUnavailable',
 				message: 'Failed to load catalog.',
@@ -198,6 +231,9 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 
 		// Offline resources always route to Action view
 		if (this.catalogService.isOfflineResource(serverToolId)) {
+			if (!this.warnIfNoActionTarget(tool.label)) {
+				return;
+			}
 			void vscode.commands.executeCommand('quantlab.action.openResource', serverToolId);
 			return;
 		}
@@ -209,8 +245,41 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 			// Pass server canonical ID -- StatsViewProvider handles mapping
 			void vscode.commands.executeCommand('quantlab.openStatsTest', serverToolId);
 		} else if (section === 'strategy') {
+			// Megaudit H19: tools whose execution surface is the Stats engine open
+			// the Stats view, even when the server catalog files them under the
+			// strategy section. TOOL_ID_MAP binds 'sharpe-ratio' to the StatsCatalog
+			// 'sharpe' test (Risk-Adjusted Returns); routing it through
+			// quantlab.action.openResource instead would fall into
+			// mapResourceToAction's 'backtest' default and open a Backtest
+			// configuration panel -- the wrong surface for a metric computation.
+			if (Object.prototype.hasOwnProperty.call(TOOL_ID_MAP, serverToolId)) {
+				void vscode.commands.executeCommand('quantlab.openStatsTest', serverToolId);
+				return;
+			}
+			if (!this.warnIfNoActionTarget(tool.label)) {
+				return;
+			}
 			void vscode.commands.executeCommand('quantlab.action.openResource', serverToolId);
 		}
+	}
+
+	/**
+	 * Megaudit H21: quantlab.action.openResource resolves its target from the
+	 * active editor/tab (ActionViewProvider.openForActiveEditor) and returns
+	 * SILENTLY when neither exists. Tell the user what the tool needs instead
+	 * of doing nothing. Returns true when an action target exists.
+	 */
+	private warnIfNoActionTarget(toolLabel: string): boolean {
+		const hasEditor = !!vscode.window.activeTextEditor;
+		const activeTab = vscode.window.tabGroups?.activeTabGroup?.activeTab;
+		const hasCustomTab = !!activeTab && activeTab.input instanceof vscode.TabInputCustom;
+		if (hasEditor || hasCustomTab) {
+			return true;
+		}
+		void vscode.window.showWarningMessage(
+			`"${toolLabel}" needs an open file. Open a strategy (.py) or data file in the editor, then click the tool again.`,
+		);
+		return false;
 	}
 
 	// ---- Workflow click ----
@@ -298,6 +367,11 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 		const scriptUri = getWebviewUri(webview, this.extensionUri, [
 			'dist', 'webview', 'resources.js',
 		]);
+		// Megaudit M97: load the design-system token bus (--ql-*) like the
+		// sibling panels do; resources.css consumes it instead of redefining.
+		const tokensUri = getWebviewUri(webview, this.extensionUri, [
+			'media', 'tokens.css',
+		]);
 		const styleUri = getWebviewUri(webview, this.extensionUri, [
 			'dist', 'webview', 'resources-style.css',
 		]);
@@ -314,6 +388,7 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; font-src ${webview.cspSource};">
 	<link href="${codiconsUri}" rel="stylesheet">
+	<link href="${tokensUri}" rel="stylesheet">
 	<link href="${styleUri}" rel="stylesheet">
 	<title>Resources</title>
 </head>

@@ -28,6 +28,7 @@ import {
 	TradeSessionSummary
 } from '../../types/trading';
 import { DaemonClient, createDaemonClient } from './DaemonClient';
+import { RoundTripBook } from './RoundTripAccounting';
 import { DaemonSecretsSync } from './DaemonSecretsSync';
 import { LiveDaemonManager, DaemonConfig } from './LiveDaemonManager';
 import { TrustManager } from '../trust/TrustManager';
@@ -40,6 +41,10 @@ const SELECTED_ACCOUNT_KEY = 'quantlab.trade.selectedAccount';
 const HEARTBEAT_OK_MS = 10000;
 const HEARTBEAT_STALE_MS = 20000;
 const UPDATE_COALESCE_MS = 200;
+
+// Severity order for heartbeat states (M51): used to combine the
+// time-derived status with the daemon's self-reported health.
+const HEARTBEAT_SEVERITY: Record<'ok' | 'stale' | 'lost', number> = { ok: 0, stale: 1, lost: 2 };
 
 /**
  * Fill reconciler for idempotent fill processing.
@@ -229,9 +234,16 @@ interface SessionRecord {
 	activeRiskAlerts: Set<string>;
 	// Fill reconciliation for idempotency
 	fillReconciler: FillReconciler;
+	// Fill-driven round-trip P&L accounting (H31): feeds totalTrades,
+	// winRate, avgWin, avgLoss and realizedPnL in `performance`.
+	roundTrips: RoundTripBook;
 	// Daemon IPC integration
 	daemonClient?: DaemonClient;
 	useDaemon: boolean;
+	// Last health status self-reported by the daemon (M51). checkHeartbeat
+	// never shows a BETTER status than this, so a degraded/unhealthy daemon
+	// cannot be concealed by recent IPC traffic.
+	daemonHealth?: 'ok' | 'stale' | 'lost';
 }
 
 export class SessionManager {
@@ -580,6 +592,7 @@ export class SessionManager {
 			seq: 0,
 			activeRiskAlerts: new Set(),
 			fillReconciler: new FillReconciler(),
+			roundTrips: new RoundTripBook(),
 			useDaemon: false,
 		};
 
@@ -678,15 +691,35 @@ export class SessionManager {
 			return;
 		}
 
+		// H28: capture the daemon flag BEFORE stopping -- stopSession deletes
+		// the session record. Daemon-backed sessions must restart on the
+		// daemon path (daemon process + IPC + secrets sync), not on the
+		// in-process broker-adapter path.
 		const { strategyPath, type, accountId } = session.info;
+		const useDaemon = session.useDaemon;
 		await this.stopSession(sessionId, 'restart');
-		await this.startSession(strategyPath, type, accountId);
+		if (useDaemon) {
+			await this.startDaemonSession(strategyPath, type, accountId);
+		} else {
+			await this.startSession(strategyPath, type, accountId);
+		}
 	}
 
 	async stopSession(sessionId: string, reason?: string): Promise<void> {
 		const session = this.sessions.get(sessionId);
 		if (!session) {
 			return;
+		}
+
+		// H27 root fix: a daemon-backed session must tear down the Python
+		// daemon process, not just release the broker adapter -- otherwise
+		// the daemon keeps running and can keep placing orders after the
+		// operator believes the session (or the kill switch) stopped it.
+		// Delegating here guarantees EVERY stop path (kill switch, webview
+		// stop, restart, trust revocation, orphan cleanup commands) kills
+		// the daemon, regardless of which entry point the caller used.
+		if (session.useDaemon) {
+			return this.stopDaemonSession(sessionId, reason);
 		}
 
 		session.info.status = 'stopping';
@@ -899,6 +932,7 @@ export class SessionManager {
 		}
 
 		session.lastBrokerUpdate = Date.now();
+		this.applyFillToRoundTrips(session, fill);
 		const seq = this.nextSeq(session);
 		this._onFill.fire({ sessionId, fill: { ...fill }, seq });
 		this.addActivity(sessionId, 'fill', `Fill: ${fill.side.toUpperCase()} ${fill.quantity} ${fill.symbol} @ $${fill.price.toFixed(2)}`);
@@ -908,6 +942,7 @@ export class SessionManager {
 		// Process any buffered fills that are now in sequence
 		const bufferedFills = session.fillReconciler.processBufferedFills();
 		for (const bufferedFill of bufferedFills) {
+			this.applyFillToRoundTrips(session, bufferedFill);
 			const bufferedSeq = this.nextSeq(session);
 			this._onFill.fire({ sessionId, fill: { ...bufferedFill }, seq: bufferedSeq });
 			this.addActivity(sessionId, 'fill', `Fill: ${bufferedFill.side.toUpperCase()} ${bufferedFill.quantity} ${bufferedFill.symbol} @ $${bufferedFill.price.toFixed(2)}`);
@@ -948,6 +983,26 @@ export class SessionManager {
 		}
 		const seq = this.nextSeq(session);
 		this._onActivity.fire({ sessionId, entry, seq });
+	}
+
+	/**
+	 * Feed a processed fill into the session's round-trip book and copy the
+	 * resulting trade statistics into `session.performance` (H31). Realized
+	 * P&L flows from here into updatePerformance's sessionPnL/todayPnL.
+	 */
+	private applyFillToRoundTrips(session: SessionRecord, fill: Fill): void {
+		const stats = session.roundTrips.applyFill({
+			symbol: fill.symbol,
+			side: fill.side,
+			quantity: fill.quantity,
+			price: fill.price,
+			commission: fill.commission,
+		});
+		session.performance.realizedPnL = stats.realizedPnL;
+		session.performance.totalTrades = stats.totalTrades;
+		session.performance.winRate = stats.winRate;
+		session.performance.avgWin = stats.avgWin;
+		session.performance.avgLoss = stats.avgLoss;
 	}
 
 	private updatePerformance(session: SessionRecord): void {
@@ -1037,6 +1092,13 @@ export class SessionManager {
 			status = 'lost';
 		} else if (delta > HEARTBEAT_OK_MS) {
 			status = 'stale';
+		}
+
+		// M51: a daemon session also self-reports health. Never display a
+		// BETTER status than the daemon's own last report -- recent IPC
+		// traffic must not conceal a degraded/unhealthy daemon.
+		if (session.daemonHealth !== undefined && HEARTBEAT_SEVERITY[session.daemonHealth] > HEARTBEAT_SEVERITY[status]) {
+			status = session.daemonHealth;
 		}
 
 		if (status !== session.heartbeatStatus) {
@@ -1328,6 +1390,29 @@ export class SessionManager {
 			}
 		}
 
+		// FIX-CGP-014 / H29: run the SAME pre-trade checklist gate as
+		// startSession -- both start paths must run the identical safety
+		// suite (same condition, same failure behavior).
+		if (type === 'live' || type === 'paper') {
+			const { PreTradeChecklist } = await import('../../ui/dialogs/PreTradeChecklist');
+			const checklist = PreTradeChecklist.getInstance();
+			const checkResult = await checklist.show({
+				strategyPath,
+				symbol: '',
+				timeframe: '',
+				type,
+			});
+
+			if (checkResult && !checkResult.approved) {
+				const failedItems = checkResult.items
+					?.filter((item: { status: string }) => item.status === 'fail')
+					.map((item: { label: string }) => item.label)
+					.join(', ');
+				void vscode.window.showWarningMessage(`Pre-trade checklist failed: ${failedItems ?? 'unknown'}`);
+				return undefined;
+			}
+		}
+
 		const requirements = await this.getRequirementsCheck(strategyPath);
 		const eligibility = await this.checkEligibility(requirements, type);
 		if (!eligibility.ok) {
@@ -1448,6 +1533,7 @@ export class SessionManager {
 				seq: 0,
 				activeRiskAlerts: new Set(),
 				fillReconciler: new FillReconciler(),
+				roundTrips: new RoundTripBook(),
 				daemonClient: client,
 				useDaemon: true,
 			};
@@ -1470,6 +1556,10 @@ export class SessionManager {
 
 			record.info.status = 'running';
 			this.addActivity(sessionId, 'system', `${type === 'paper' ? 'Paper' : 'Live'} daemon session started`);
+			// M51: run the interval heartbeat probe for daemon sessions too,
+			// so a SILENT daemon (no heartbeat events at all) degrades to
+			// 'stale' and then 'lost' instead of staying 'ok' forever.
+			this.startHeartbeat(sessionId);
 
 			this._onSessionStarted.fire({ ...record.info });
 			this._onSessionsChanged.fire();
@@ -1503,16 +1593,19 @@ export class SessionManager {
 		if (client) {
 			try {
 				await client.stopSession();
-			} catch {
-				// Ignore errors during shutdown
+			} catch (error) {
+				// Surface the failure, then CONTINUE the teardown: the daemon
+				// process kill below must still happen even when the IPC stop
+				// failed -- this is the kill-switch path; never leave the
+				// daemon alive, and never fail silently.
+				this.outputChannel.appendLine(`[${sessionId}] Daemon stopSession IPC failed during teardown: ${(error as Error).message}`);
 			}
+			// Remove daemon event handlers BEFORE disconnecting: disconnect()
+			// emits a 'disconnect' event, which would otherwise surface a
+			// spurious 'Daemon connection lost' error on an intentional stop.
+			client.removeAllListeners();
 			client.disconnect();
 			this.daemonClients.delete(sessionId);
-		}
-
-		// Remove daemon event handlers before disconnecting to prevent stale callbacks
-		if (client) {
-			client.removeAllListeners();
 		}
 
 		// Stop daemon process
@@ -1756,7 +1849,12 @@ export class SessionManager {
 			const session = this.sessions.get(sessionId);
 			if (session) {
 				session.lastBrokerUpdate = Date.now();
-				session.heartbeatStatus = health.status === 'healthy' ? 'ok' : 'stale';
+				// M51: map the full daemon health range -- 'unhealthy' (or any
+				// unknown future status) must surface as 'lost', not 'stale'.
+				session.daemonHealth = health.status === 'healthy' ? 'ok'
+					: health.status === 'degraded' ? 'stale'
+						: 'lost';
+				session.heartbeatStatus = session.daemonHealth;
 				this._onHeartbeat.fire({
 					sessionId,
 					status: session.heartbeatStatus,

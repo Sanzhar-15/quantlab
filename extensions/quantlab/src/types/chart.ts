@@ -74,6 +74,9 @@ export type ChartOutboundMessage =
 	| { type: 'setData'; requestId: number; data: OhlcvBar[] }
 	| { type: 'setDataBinary'; requestId: number; buffer: ArrayBuffer; count: number }
 	| { type: 'setSignals'; requestId: number; signals: SignalMarker[] }
+	| { type: 'addSignal'; signal: SignalMarker }
+	| { type: 'showLoading'; requestId: number }
+	| { type: 'showEmptyState' }
 	| { type: 'setEquityCurve'; requestId: number; equity: EquityPoint[] }
 	| { type: 'setVisualization'; requestId: number; commands: VisualizationCommand[] }
 	| { type: 'setTradeOrders'; sessionId: string; orders: Array<{ id: string; symbol: string; side: 'buy' | 'sell'; type: string; quantity: number; price?: number; status: string; createdAt: number; updatedAt: number }> }

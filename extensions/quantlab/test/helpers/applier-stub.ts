@@ -61,13 +61,226 @@ export interface SeriesHandle<TPoint> {
 	setData(data: readonly TPoint[]): void;
 }
 
+// ---------------------------------------------------------------------------
+// W4 (2026-06-11): the chart WEBVIEW (webview/chart/chartApi.ts) is now also
+// typechecked against this stub when chart tests pull it into the tsc graph.
+// The richer series/Chart surface below is regenerated from the sibling
+// Charts repo's chart-core/dist/api.d.ts (the runtime contract). Option types
+// stay all-optional so applier.ts's narrow object literals remain assignable.
+// ---------------------------------------------------------------------------
+
+export type SeriesMarkerShape = 'circle' | 'square' | 'arrowUp' | 'arrowDown';
+export type SeriesMarkerPosition = 'above' | 'below' | 'on';
+
+export type SeriesMarker = {
+	time: number;
+	text?: string;
+	color?: string;
+	textColor?: string;
+	size?: number;
+	shape?: SeriesMarkerShape;
+	position?: SeriesMarkerPosition;
+};
+
+export type ThemeTokens = {
+	background: string;
+	gridMajor: string;
+	gridMinor: string;
+	axisText: string;
+	crosshair: string;
+	focusBand: string;
+	tooltipBackground?: string;
+	tooltipText?: string;
+	tooltipBorder?: string;
+	seriesPrimary: string;
+	seriesSecondary: string;
+	seriesTertiary: string;
+	seriesQuaternary: string;
+	seriesQuinary: string;
+	fontFamily: string;
+	fontSizePx: number;
+};
+
+export type ThemeTokensInput = Partial<ThemeTokens>;
+
+export type WatermarkPosition = 'center' | 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+
+export type WatermarkOptions = {
+	text?: string;
+	color?: string;
+	opacity?: number;
+	fontSizePx?: number;
+	fontFamily?: string;
+	imageSrc?: string;
+	imageWidth?: number;
+	imageHeight?: number;
+	position?: WatermarkPosition;
+};
+
+export type VisibleTimeRange = {
+	from: number;
+	to: number;
+};
+
+export type CrosshairMoveEvent = {
+	time: number;
+	formattedTime: string;
+	x: number;
+	y: number;
+	paneId?: string;
+	seriesValues: Map<string, { value: number | null; formatted: string }>;
+};
+
+export type Rect = {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+};
+
+export type PaneLayout = {
+	id: string;
+	plotRect: Rect;
+	leftAxisRect: Rect | null;
+	rightAxisRect: Rect | null;
+};
+
+export type LayoutResult = {
+	chartRect: Rect;
+	plotRect: Rect;
+	leftAxisRect: Rect | null;
+	rightAxisRect: Rect | null;
+	timeAxisRect: Rect | null;
+	panes?: PaneLayout[];
+};
+
+export type PluginRenderState = {
+	layout: LayoutResult;
+	plotRect: Rect;
+	visibleRange: VisibleTimeRange;
+	panOffset?: number;
+	theme: ThemeTokens;
+	timeToX: (time: number) => number;
+	xToTime: (x: number) => number;
+	valueToY: (value: number) => number;
+	valueToYLeft: (value: number) => number;
+	valueToYRight: (value: number) => number;
+	yToValue: (y: number) => number;
+	snapX: (x: number) => number;
+	snapY: (y: number) => number;
+};
+
+export type PluginPointerEvent = {
+	type: 'down' | 'move' | 'up' | 'leave';
+	x: number;
+	y: number;
+	time: number | null;
+	inPlot: boolean;
+};
+
+export type ChartPlugin<Ctx = unknown> = {
+	onInit?: (chart: Chart) => void;
+	onRenderUnderlay?: (ctx: Ctx, state: PluginRenderState) => void;
+	onRenderOverlay?: (ctx: Ctx, state: PluginRenderState) => void;
+	onPointer?: (event: PluginPointerEvent, state: PluginRenderState) => boolean | void;
+};
+
+export type LineSeriesOptions = {
+	id?: string;
+	paneId?: string;
+	axis?: 'left' | 'right';
+	title?: string;
+	color?: string;
+	width?: number;
+	dash?: number[];
+	opacity?: number;
+	visible?: boolean;
+	lastValueVisible?: boolean;
+	priceLineVisible?: boolean;
+	isVolume?: boolean;
+	valueFormatter?: (value: number) => string;
+};
+
+export type HistogramSeriesOptions = LineSeriesOptions;
+export type AreaSeriesOptions = LineSeriesOptions;
+export type CandlestickSeriesOptions = LineSeriesOptions & {
+	upColor?: string;
+	downColor?: string;
+};
+
+export interface LineSeries {
+	readonly id: string;
+	setData(points: readonly DataPoint[]): void;
+	setMarkers(markers: SeriesMarker[]): void;
+	setVisible(visible: boolean): void;
+	getVisible(): boolean;
+}
+
+export interface AreaSeries {
+	readonly id: string;
+	setData(points: readonly DataPoint[]): void;
+	setMarkers(markers: SeriesMarker[]): void;
+	setVisible(visible: boolean): void;
+	getVisible(): boolean;
+}
+
+export interface HistogramSeries {
+	readonly id: string;
+	setData(points: readonly HistogramDataPoint[]): void;
+	setMarkers(markers: SeriesMarker[]): void;
+	setVisible(visible: boolean): void;
+	getVisible(): boolean;
+}
+
+export interface CandlestickSeries {
+	readonly id: string;
+	setData(points: readonly OhlcDataPoint[]): void;
+	setMarkers(markers: SeriesMarker[]): void;
+	setVisible(visible: boolean): void;
+	getVisible(): boolean;
+}
+
+export type AxisOptions = {
+	formatter?: (value: number) => string;
+	decimals?: number;
+	tickCount?: number;
+	minWidth?: number;
+};
+
+export interface PaneApi {
+	readonly id: string;
+	setHeight(height: number): void;
+	getHeight(): number | null;
+	setStretchFactor(stretchFactor: number): void;
+	getStretchFactor(): number;
+	setVisible(visible: boolean): void;
+	isVisible(): boolean;
+	moveTo(index: number): void;
+	setPreserveEmptyPane(preserve: boolean): void;
+	preserveEmptyPane(): boolean;
+}
+
 export interface Chart {
-	addLineSeries(opts?: { readonly color?: string }): SeriesHandle<DataPoint>;
-	addAreaSeries(opts?: { readonly color?: string }): SeriesHandle<DataPoint>;
+	addLineSeries(opts?: LineSeriesOptions): LineSeries;
+	addAreaSeries(opts?: AreaSeriesOptions): AreaSeries;
 	addBarSeries(opts?: { readonly color?: string }): SeriesHandle<DataPoint>;
-	addHistogramSeries(opts?: { readonly color?: string }): SeriesHandle<HistogramDataPoint>;
+	addHistogramSeries(opts?: HistogramSeriesOptions): HistogramSeries;
 	addBaselineSeries(opts?: BaselineSeriesOptions): SeriesHandle<DataPoint>;
-	addCandlestickSeries(opts?: Record<string, unknown>): SeriesHandle<OhlcDataPoint>;
+	addCandlestickSeries(opts?: CandlestickSeriesOptions): CandlestickSeries;
+	addPane(preserveEmptyPane?: boolean): string;
+	getPane(id: string): PaneApi | null;
+	getPanes(): PaneApi[];
+	batch(fn: () => void): void;
+	addPlugin<Ctx>(plugin: ChartPlugin<Ctx>): void;
+	setAxisOptions(axis: 'left' | 'right', options: AxisOptions): void;
+	setPaneAxisOptions(paneId: string, axis: 'left' | 'right', options: AxisOptions): void;
+	setVisibleTimeRange(range: VisibleTimeRange): void;
+	getVisibleTimeRange(): VisibleTimeRange;
+	onVisibleTimeRangeChange(cb: (range: VisibleTimeRange) => void): () => void;
+	setCrosshair(state: { time: number; paneId?: string; yRatio?: number } | null): void;
+	onCrosshairMove(cb: (event: CrosshairMoveEvent) => void): () => void;
+	setTheme(theme: ThemeTokensInput): void;
+	setWatermark(options: WatermarkOptions | null): void;
 	// Disposal methods: the real chart-core's API has migrated across
 	// `remove` / `destroy` / `dispose` over versions; `applier.disposeChart`
 	// probes for the first one defined. All three are optional here so
