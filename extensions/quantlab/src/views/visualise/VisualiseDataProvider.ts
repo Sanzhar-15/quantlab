@@ -263,7 +263,10 @@ export class VisualiseDataProvider implements vscode.CustomReadonlyEditorProvide
 			// notification AND an empty panel -- not a silent blank.
 		}
 		const numericColumns = columns.filter(c => c.dtype === 'float64' || c.dtype === 'int64');
-		const selectedColumns = numericColumns.length > 0 ? [numericColumns[0].name] : [];
+		// Default selection: prefer the column a quant actually wants to see first
+		// (close/price/value), falling back to the first numeric column.
+		const preferred = numericColumns.find(c => /^(adj[ _]?close|close|price|value)$/i.test(c.name.trim()));
+		const selectedColumns = preferred ? [preferred.name] : (numericColumns.length > 0 ? [numericColumns[0].name] : []);
 		this.stateByUri.set(uri.toString(), {
 			dataFile: uri.fsPath,
 			columns,

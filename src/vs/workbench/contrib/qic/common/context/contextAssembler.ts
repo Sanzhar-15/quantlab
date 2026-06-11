@@ -1,5 +1,5 @@
 /*---------------------------------------------------------------------------------------------
- *  Copyright (c) Quantlab. All rights reserved.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
@@ -41,7 +41,7 @@ export interface ContextOptions {
 	selectedText?: string;
 	recentFiles?: string[];
 	responseStyle?: ResponseStyle;
-	/** If true, skip expensive operations (workspace tree, search) — used for context refresh between rounds */
+	/** If true, skip expensive operations (workspace tree, search) -- used for context refresh between rounds */
 	lightweight?: boolean;
 }
 
@@ -88,7 +88,7 @@ export class ContextAssembler {
 		private readonly fileService?: IFileService,
 		private readonly workspaceRoot?: string,
 		private readonly markerService?: IMarkerService,
-	) {}
+	) { }
 
 	async assemble(
 		lane: LaneName,
@@ -150,8 +150,8 @@ export class ContextAssembler {
 				const truncated = lines.length > maxLines;
 				const displayLines = truncated ? lines.slice(0, maxLines) : lines;
 				const numbered = displayLines.map((line, i) => `${String(i + 1).padStart(4)} | ${line}`).join('\n');
-				const suffix = truncated ? `\n... (${lines.length - maxLines} more lines — use read_file with startLine/endLine)` : '';
-				const activeCtx = `[Active file: ${options.activeFile} — ${lines.length} lines]\n${numbered}${suffix}`;
+				const suffix = truncated ? `\n... (${lines.length - maxLines} more lines -- use read_file with startLine/endLine)` : '';
+				const activeCtx = `[Active file: ${options.activeFile} -- ${lines.length} lines]\n${numbered}${suffix}`;
 				const activeTokens = tokenCounter.count(activeCtx);
 
 				if (contextTokens + activeTokens <= contextBudget * 0.6) { // Cap at 60% of budget
@@ -207,7 +207,7 @@ export class ContextAssembler {
 					contextTokens += resultTokens;
 				}
 			} catch {
-				// Context search failed — proceed without it
+				// Context search failed -- proceed without it
 			}
 		}
 
@@ -290,8 +290,8 @@ export class ContextAssembler {
 
 				const entry = entries[i];
 				const isLast = i === entries.length - 1;
-				const connector = isLast ? '└── ' : '├── ';
-				const childPrefix = isLast ? '    ' : '│   ';
+				const connector = isLast ? '`-- ' : '|-- ';
+				const childPrefix = isLast ? '    ' : '|   ';
 
 				if (entry.isDirectory) {
 					if (SKIP_DIRS.has(entry.name) || entry.name.startsWith('.')) {
@@ -319,8 +319,8 @@ export class ContextAssembler {
 		const lines: string[] = [];
 		const severityLabel = (s: MarkerSeverity) =>
 			s === MarkerSeverity.Error ? 'ERROR' :
-			s === MarkerSeverity.Warning ? 'WARNING' :
-			s === MarkerSeverity.Info ? 'INFO' : 'HINT';
+				s === MarkerSeverity.Warning ? 'WARNING' :
+					s === MarkerSeverity.Info ? 'INFO' : 'HINT';
 
 		// Active file diagnostics (errors + warnings only)
 		if (activeFile && this.workspaceRoot) {
@@ -441,7 +441,9 @@ export class ContextAssembler {
 		}
 
 		// Check for strategy indicators combined with action verbs
-		const actionVerbs = ['create', 'build', 'write', 'make', 'generate', 'develop', 'implement', 'code'];
+		// ('fix'/'repair' cover Fix-with-Orion flows: corrections to an existing
+		// strategy need the same API contract as fresh generation)
+		const actionVerbs = ['create', 'build', 'write', 'make', 'generate', 'develop', 'implement', 'code', 'fix', 'repair'];
 		for (const indicator of strategyIndicators) {
 			if (lowerMessage.includes(indicator)) {
 				for (const verb of actionVerbs) {

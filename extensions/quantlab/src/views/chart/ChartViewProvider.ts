@@ -629,11 +629,21 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 		const fileName = path.basename(session.document.uri.fsPath);
 		const message = `${fileName} visualization: ${joined}`;
-		if (severity === 'error') {
-			void vscode.window.showErrorMessage(message);
-		} else {
-			void vscode.window.showWarningMessage(message);
-		}
+		const fixAction = 'Fix with Orion';
+		const show = severity === 'error' ? vscode.window.showErrorMessage : vscode.window.showWarningMessage;
+		void show(message, fixAction).then(choice => {
+			if (choice !== fixAction) {
+				return;
+			}
+			const prompt = [
+				`Fix the visualize() function in the Quantlab trading strategy file ${session.document.uri.fsPath}.`,
+				`The Chart view reported these issues: ${joined}`,
+				'Read the file and apply minimal corrections so the visualization renders; keep the strategy logic unchanged.'
+			].join('\n');
+			vscode.commands.executeCommand('qic.openWithPrompt', prompt).then(undefined, err => {
+				void vscode.window.showErrorMessage(`Could not hand off to Orion: ${err instanceof Error ? err.message : String(err)}`);
+			});
+		});
 	}
 
 	private async reloadData(session: ChartSession): Promise<void> {

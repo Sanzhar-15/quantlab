@@ -1,12 +1,12 @@
 /*---------------------------------------------------------------------------------------------
- *  Copyright (c) Quantlab. All rights reserved.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
 import './media/qicSkin.css';
 
 import { localize } from '../../../../nls.js';
-import { $, addDisposableListener } from '../../../../base/browser/dom.js';
+import { $, addDisposableListener, getWindow } from '../../../../base/browser/dom.js';
 import { IAction } from '../../../../base/common/actions.js';
 import { IViewPaneOptions, ViewPane } from '../../../browser/parts/views/viewPane.js';
 import { IKeybindingService } from '../../../../platform/keybinding/common/keybinding.js';
@@ -22,7 +22,6 @@ import { IStorageService, StorageScope, StorageTarget } from '../../../../platfo
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { ServiceCollection } from '../../../../platform/instantiation/common/serviceCollection.js';
 import { MutableDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
-import { getWindow } from '../../../../base/browser/dom.js';
 import { editorBackground } from '../../../../platform/theme/common/colorRegistry.js';
 import { inputBackground } from '../../../../platform/theme/common/colors/inputColors.js';
 import { EDITOR_DRAG_AND_DROP_BACKGROUND, SIDE_BAR_FOREGROUND } from '../../../common/theme.js';
@@ -61,7 +60,7 @@ interface IQicViewPaneState {
 }
 
 /**
- * QIC Chat ViewPane — hosts the native ChatWidget (Phase 1 MVP).
+ * QIC Chat ViewPane -- hosts the native ChatWidget (Phase 1 MVP).
  *
  * Replaces the previous webview-based implementation. The ChatWidget
  * provides native theming, virtual scrolling, and zero serialization
@@ -105,7 +104,7 @@ export class QicChatViewPane extends ViewPane {
 		@IWorkbenchLayoutService private readonly layoutService: IWorkbenchLayoutService,
 		@ISecretStorageService private readonly secretStorageService: ISecretStorageService,
 		@INotificationService private readonly notificationService: INotificationService,
-		) {
+	) {
 		super(options, keybindingService, contextMenuService, configurationService, contextKeyService, viewDescriptorService, instantiationService, openerService, themeService, hoverService);
 
 		// Memento for persisting session across reloads
@@ -118,14 +117,14 @@ export class QicChatViewPane extends ViewPane {
 			panelVisibleKey.set(visible);
 			this._widget?.setVisible(visible);
 
-			// Re-apply layout when becoming visible again (e.g. fullscreen → window transition)
+			// Re-apply layout when becoming visible again (e.g. fullscreen -> window transition)
 			// The widget needs an explicit layout() call after setVisible(true) to recover dimensions
 			if (visible && this._lastDimensions) {
 				this.layoutBody(this._lastDimensions.height, this._lastDimensions.width);
 			}
 		}));
 
-		// Listen for agent registration — only attempt restore if the widget is
+		// Listen for agent registration -- only attempt restore if the widget is
 		// already rendered. If not, renderBody() will call _tryRestoreSession() directly.
 		this._register(this.chatAgentService.onDidChangeAgents(() => {
 			if (this._widgetRendered) {
@@ -187,7 +186,7 @@ export class QicChatViewPane extends ViewPane {
 				supportsFileReferences: true,
 				clear: () => this._clear(),
 				rendererOptions: {
-					renderTextEditsAsSummary: (_uri: any) => true,
+					renderTextEditsAsSummary: (_uri: unknown) => true,
 					referencesExpandedWhenEmptyResponse: false,
 					progressMessageAtBottomOfResponse: (mode: ChatModeKind) => mode !== ChatModeKind.Ask,
 				},
@@ -211,7 +210,8 @@ export class QicChatViewPane extends ViewPane {
 	}
 
 	private _injectInputActions(chatContainer: HTMLElement): void {
-		// Fast path: toolbars already in DOM (the common case — no observer needed)
+		// Fast path: toolbars already in DOM (the common case -- no observer needed).
+		// eslint-disable-next-line no-restricted-syntax -- querying the ChatWidget's internal DOM, which this pane does not build
 		const toolbars = chatContainer.querySelector('.chat-input-toolbars');
 		if (toolbars) {
 			this._doInjectActions(chatContainer, toolbars as HTMLElement);
@@ -221,6 +221,7 @@ export class QicChatViewPane extends ViewPane {
 		// RAF path: ChatWidget may append toolbars asynchronously. Check after one frame.
 		const win = getWindow(chatContainer);
 		const rafHandle = win.requestAnimationFrame(() => {
+			// eslint-disable-next-line no-restricted-syntax -- ChatWidget-internal DOM
 			const tb = chatContainer.querySelector('.chat-input-toolbars');
 			if (tb) {
 				this._doInjectActions(chatContainer, tb as HTMLElement);
@@ -229,6 +230,7 @@ export class QicChatViewPane extends ViewPane {
 			// Fallback observer: only created if both synchronous and rAF checks miss.
 			// Guaranteed to disconnect on success or on pane dispose.
 			const observer = new MutationObserver((_mutations, obs) => {
+				// eslint-disable-next-line no-restricted-syntax -- ChatWidget-internal DOM
 				const found = chatContainer.querySelector('.chat-input-toolbars');
 				if (found) {
 					obs.disconnect();
@@ -244,14 +246,14 @@ export class QicChatViewPane extends ViewPane {
 	private _doInjectActions(chatContainer: HTMLElement, toolbars: HTMLElement): void {
 		const actionsContainer = $('div.qic-input-actions');
 
-		// Connection icon button — always visible
+		// Connection icon button -- always visible
 		this._connectionBtn = this._createIconButton(actionsContainer, 'Connect', createConnectionIcon());
 		this._register(addDisposableListener(this._connectionBtn, 'click', (e) => {
 			e.stopPropagation(); // Prevent native toolbars handler from stealing focus
 			this._showConnectionMenu();
 		}));
 
-		// Reasoning icon button — hidden unless deltaplus is selected
+		// Reasoning icon button -- hidden unless deltaplus is selected
 		this._reasoningBtn = this._createIconButton(actionsContainer, 'Reasoning', createBrainIcon());
 		// visible by default since default connection is deltaplus
 		this._register(addDisposableListener(this._reasoningBtn, 'click', (e) => {
@@ -367,10 +369,10 @@ export class QicChatViewPane extends ViewPane {
 	private async _loginToDeltaPlus(): Promise<void> {
 		const existing = await this.secretStorageService.get(QIC_SECRET_KEYS.DELTAPLUS_ACCESS_TOKEN);
 		if (existing) {
-			// Token already present — adapter will pick it up via onDidChangeSecret.
+			// Token already present -- adapter will pick it up via onDidChangeSecret.
 			return;
 		}
-		this.logService.info('[QicPanel] No Delta Plus token — prompting user to sign in');
+		this.logService.info('[QicPanel] No Delta Plus token -- prompting user to sign in');
 		this.notificationService.info(
 			localize('qic.signInRequired', 'Sign in to your Delta Plus account to use server mode. Use the Accounts menu or run "QuantLab: Sign In to Delta Plus".')
 		);
@@ -397,7 +399,7 @@ export class QicChatViewPane extends ViewPane {
 			return; // Already initialized
 		}
 
-		// Create a new chat session — the QIC agent is the default agent
+		// Create a new chat session -- the QIC agent is the default agent
 		// so it will be automatically selected
 		const modelRef = this.chatService.startSession(ChatAgentLocation.Chat, undefined);
 		if (modelRef) {
@@ -405,6 +407,25 @@ export class QicChatViewPane extends ViewPane {
 			this._widget.setModel(modelRef.object);
 			this._widget.setInputPlaceholder('Ask Orion anything...');
 		}
+	}
+
+	/**
+	 * Programmatically submit a prompt to Orion (used by "Fix with Orion" style
+	 * entry points). Ensures a session exists, fills the input, and sends it.
+	 * Throws when the widget is not available -- callers surface that loudly.
+	 */
+	async submitPrompt(prompt: string): Promise<void> {
+		// The widget is created in renderBody(); openView(focus) has normally
+		// rendered it by the time we are called, but give layout a few frames.
+		for (let attempt = 0; attempt < 20 && !this._widget; attempt++) {
+			await new Promise<void>(resolve => setTimeout(resolve, 50));
+		}
+		if (!this._widget) {
+			throw new Error('Orion chat is not available (widget not rendered).');
+		}
+		this._tryRestoreSession();
+		this._widget.setInput(prompt);
+		await this._widget.acceptInput();
 	}
 
 	/**

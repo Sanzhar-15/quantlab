@@ -1,5 +1,6 @@
 /*---------------------------------------------------------------------------------------------
- *  Visualise View Webview Script
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
 interface VSCodeApi {
@@ -65,7 +66,7 @@ const CHART_TYPES = [
 
 function init(): void {
 	const root = document.getElementById('visualise-root');
-	if (!root) return;
+	if (!root) { return; }
 
 	// Listen for messages from extension
 	window.addEventListener('message', event => {
@@ -76,13 +77,18 @@ function init(): void {
 		}
 	});
 
+	// Paint immediately: data inspection takes seconds (Python subprocess), and
+	// without this first render the panel sits BLANK until the first setState
+	// arrives -- the "loads empty until I click a chart type" bug.
+	render();
+
 	// Notify extension we're ready
 	vscode.postMessage({ type: 'ready' });
 }
 
 function render(): void {
 	const root = document.getElementById('visualise-root');
-	if (!root) return;
+	if (!root) { return; }
 
 	if (!currentState) {
 		root.innerHTML = renderLoadingState();
@@ -95,92 +101,92 @@ function render(): void {
 
 function renderLoadingState(): string {
 	return `
-        <div class="visualise-loading">
-            <span class="codicon codicon-loading codicon-modifier-spin"></span>
-            <p>Loading data...</p>
-        </div>
-    `;
+		<div class="visualise-loading">
+			<span class="codicon codicon-loading codicon-modifier-spin"></span>
+			<p>Loading data...</p>
+		</div>
+	`;
 }
 
 function renderMainView(): string {
-	if (!currentState) return '';
+	if (!currentState) { return ''; }
 
 	const state = currentState;
 
 	return `
-        <div class="visualise-container">
-            <div class="visualise-sidebar">
-                <div class="sidebar-section">
-                    <h3>Chart Type</h3>
-                    <div class="chart-type-list">
-                        ${CHART_TYPES.map(ct => `
-                            <button class="chart-type-btn ${state.chartType === ct.id ? 'active' : ''}"
-                                    data-chart-type="${ct.id}">
-                                <span class="codicon codicon-${ct.icon}"></span>
-                                ${ct.label}
-                            </button>
-                        `).join('')}
-                    </div>
-                </div>
+		<div class="visualise-container">
+			<div class="visualise-sidebar">
+				<div class="sidebar-section">
+					<h3>Chart Type</h3>
+					<div class="chart-type-list">
+						${CHART_TYPES.map(ct => `
+							<button class="chart-type-btn ${state.chartType === ct.id ? 'active' : ''}"
+									data-chart-type="${ct.id}">
+								<span class="codicon codicon-${ct.icon}"></span>
+								${ct.label}
+							</button>
+						`).join('')}
+					</div>
+				</div>
 
-                <div class="sidebar-section">
-                    <h3>Columns</h3>
-                    <div class="column-list">
-                        ${state.columns.map(col => `
-                            <label class="column-item">
-                                <input type="checkbox"
-                                       data-column="${escapeAttr(col.name)}"
-                                       ${state.selectedColumns.includes(col.name) ? 'checked' : ''}>
-                                <span class="column-name">${escapeHtml(col.name)}</span>
-                                <span class="column-type">${escapeHtml(col.dtype)}</span>
-                            </label>
-                        `).join('')}
-                    </div>
-                </div>
+				<div class="sidebar-section">
+					<h3>Columns</h3>
+					<div class="column-list">
+						${state.columns.map(col => `
+							<label class="column-item">
+								<input type="checkbox"
+										data-column="${escapeAttr(col.name)}"
+										${state.selectedColumns.includes(col.name) ? 'checked' : ''}>
+								<span class="column-name">${escapeHtml(col.name)}</span>
+								<span class="column-type">${escapeHtml(col.dtype)}</span>
+							</label>
+						`).join('')}
+					</div>
+				</div>
 
-                <div class="sidebar-section">
-                    <h3>Data Info</h3>
-                    <div class="data-info">
-                        <div class="info-row">
-                            <span class="label">File:</span>
-                            <span class="value" title="${escapeAttr(state.dataFile)}">${escapeHtml(getFileName(state.dataFile))}</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="label">Rows:</span>
-                            <span class="value">${state.preview?.rows?.toLocaleString() ?? 'Unknown'}</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="label">Columns:</span>
-                            <span class="value">${state.columns.length}</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
+				<div class="sidebar-section">
+					<h3>Data Info</h3>
+					<div class="data-info">
+						<div class="info-row">
+							<span class="label">File:</span>
+							<span class="value" title="${escapeAttr(state.dataFile)}">${escapeHtml(getFileName(state.dataFile))}</span>
+						</div>
+						<div class="info-row">
+							<span class="label">Rows:</span>
+							<span class="value">${state.preview?.rows?.toLocaleString() ?? 'Unknown'}</span>
+						</div>
+						<div class="info-row">
+							<span class="label">Columns:</span>
+							<span class="value">${state.columns.length}</span>
+						</div>
+					</div>
+				</div>
+			</div>
 
-            <div class="visualise-main">
-                ${renderChart()}
-            </div>
-        </div>
-    `;
+			<div class="visualise-main">
+				${renderChart()}
+			</div>
+		</div>
+	`;
 }
 
 function renderChart(): string {
 	if (!currentState || !currentState.preview) {
 		return `
-            <div class="chart-placeholder">
-                <span class="codicon codicon-graph"></span>
-                <p>No data available for visualization</p>
-            </div>
-        `;
+			<div class="chart-placeholder">
+				<span class="codicon codicon-graph"></span>
+				<p>No data available for visualization</p>
+			</div>
+		`;
 	}
 
 	if (currentState.selectedColumns.length === 0) {
 		return `
-            <div class="chart-placeholder">
-                <span class="codicon codicon-graph"></span>
-                <p>Select columns to visualize</p>
-            </div>
-        `;
+			<div class="chart-placeholder">
+				<span class="codicon codicon-graph"></span>
+				<p>Select columns to visualize</p>
+			</div>
+		`;
 	}
 
 	// Render a simple ASCII/text-based preview
@@ -191,24 +197,24 @@ function renderChart(): string {
 
 	// Build a simple table preview
 	return `
-        <div class="chart-area">
-            <div class="chart-header">
-                <h3>${state.chartType.charAt(0).toUpperCase() + state.chartType.slice(1)} Chart</h3>
-                <span class="chart-subtitle">Showing ${selectedCols.map(c => escapeHtml(c)).join(', ')}</span>
-            </div>
-            <div class="chart-canvas">
-                ${renderSimpleVisualization(state.chartType, sample, selectedCols)}
-            </div>
-            <div class="chart-legend">
-                ${selectedCols.map((col, i) => `
-                    <div class="legend-item">
-                        <span class="legend-color" style="background: ${getColor(i)}"></span>
-                        <span class="legend-label">${escapeHtml(col)}</span>
-                    </div>
-                `).join('')}
-            </div>
-        </div>
-    `;
+		<div class="chart-area">
+			<div class="chart-header">
+				<h3>${state.chartType.charAt(0).toUpperCase() + state.chartType.slice(1)} Chart</h3>
+				<span class="chart-subtitle">Showing ${selectedCols.map(c => escapeHtml(c)).join(', ')}</span>
+			</div>
+			<div class="chart-canvas">
+				${renderSimpleVisualization(state.chartType, sample, selectedCols)}
+			</div>
+			<div class="chart-legend">
+				${selectedCols.map((col, i) => `
+					<div class="legend-item">
+						<span class="legend-color" style="background: ${getColor(i)}"></span>
+						<span class="legend-label">${escapeHtml(col)}</span>
+					</div>
+				`).join('')}
+			</div>
+		</div>
+	`;
 }
 
 function renderSimpleVisualization(
@@ -257,10 +263,10 @@ function renderSimpleVisualization(
 		});
 
 		return `
-            <svg class="chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet">
-                ${points.join('')}
-            </svg>
-        `;
+			<svg class="chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet">
+				${points.join('')}
+			</svg>
+		`;
 	}
 
 	if (chartType === 'bar') {
@@ -273,10 +279,10 @@ function renderSimpleVisualization(
 		});
 
 		return `
-            <svg class="chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet">
-                ${bars.join('')}
-            </svg>
-        `;
+			<svg class="chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet">
+				${bars.join('')}
+			</svg>
+		`;
 	}
 
 	if (chartType === 'histogram') {
@@ -301,10 +307,10 @@ function renderSimpleVisualization(
 		});
 
 		return `
-            <svg class="chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet">
-                ${bars.join('')}
-            </svg>
-        `;
+			<svg class="chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet">
+				${bars.join('')}
+			</svg>
+		`;
 	}
 
 	if (chartType === 'heatmap') {
@@ -335,11 +341,11 @@ function renderSimpleVisualization(
 				const y = i * cellSize;
 				cells.push(`
 					<rect x="${x}" y="${y}" width="${cellSize - 1}" height="${cellSize - 1}"
-						  fill="${color}" rx="2">
+						fill="${color}" rx="2">
 						<title>${escapeHtml(columns[i])} vs ${escapeHtml(columns[j])}: ${corr.toFixed(3)}</title>
 					</rect>
 					<text x="${x + cellSize / 2}" y="${y + cellSize / 2 + 4}"
-						  text-anchor="middle" font-size="10" fill="${Math.abs(corr) > 0.5 ? '#fff' : '#000'}">
+						text-anchor="middle" font-size="10" fill="${Math.abs(corr) > 0.5 ? '#fff' : '#000'}">
 						${corr.toFixed(2)}
 					</text>
 				`);
@@ -347,16 +353,16 @@ function renderSimpleVisualization(
 			// Row labels (left)
 			labels.push(`
 				<text x="-5" y="${i * cellSize + cellSize / 2 + 4}"
-					  text-anchor="end" font-size="10" fill="var(--vscode-foreground)">
-					${escapeHtml(columns[i].slice(0, 8))}${columns[i].length > 8 ? '…' : ''}
+					text-anchor="end" font-size="10" fill="var(--vscode-foreground)">
+					${escapeHtml(columns[i].slice(0, 8))}${columns[i].length > 8 ? '...' : ''}
 				</text>
 			`);
 			// Column labels (top)
 			labels.push(`
 				<text x="${i * cellSize + cellSize / 2}" y="-5"
-					  text-anchor="middle" font-size="10" fill="var(--vscode-foreground)"
-					  transform="rotate(-45 ${i * cellSize + cellSize / 2} -5)">
-					${escapeHtml(columns[i].slice(0, 8))}${columns[i].length > 8 ? '…' : ''}
+					text-anchor="middle" font-size="10" fill="var(--vscode-foreground)"
+					transform="rotate(-45 ${i * cellSize + cellSize / 2} -5)">
+					${escapeHtml(columns[i].slice(0, 8))}${columns[i].length > 8 ? '...' : ''}
 				</text>
 			`);
 		}
@@ -426,7 +432,7 @@ function calculateCorrelationMatrix(data: number[][], columns: string[]): number
  */
 function pearsonCorrelation(x: number[], y: number[]): number {
 	const n = Math.min(x.length, y.length);
-	if (n === 0) return 0;
+	if (n === 0) { return 0; }
 
 	let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0, sumY2 = 0;
 
@@ -441,7 +447,7 @@ function pearsonCorrelation(x: number[], y: number[]): number {
 	const numerator = n * sumXY - sumX * sumY;
 	const denominator = Math.sqrt((n * sumX2 - sumX * sumX) * (n * sumY2 - sumY * sumY));
 
-	if (denominator === 0) return 0;
+	if (denominator === 0) { return 0; }
 	return numerator / denominator;
 }
 
@@ -485,7 +491,7 @@ function bindEvents(): void {
 			const selected: string[] = [];
 			document.querySelectorAll('.column-item input:checked').forEach(cb => {
 				const col = (cb as HTMLInputElement).dataset.column;
-				if (col) selected.push(col);
+				if (col) { selected.push(col); }
 			});
 			vscode.postMessage({
 				type: 'updateConfig',

@@ -1,5 +1,5 @@
 /*---------------------------------------------------------------------------------------------
- *  Copyright (c) Quantlab. All rights reserved.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
@@ -50,26 +50,37 @@ import {
 	QIC_SETTINGS,
 	QIC_STORAGE_DIRS,
 	QIC_AUTH,
+	type ConnectionMode,
+	type DataTier,
 } from '../common/constants.js';
-import type { ConnectionMode, DataTier } from '../common/constants.js';
 import { IQicService, QicService } from '../common/qicService.js';
+
+// Structural view of the persisted conversation state used by the change-set actions.
+interface PendingChangesState {
+	conversation?: {
+		pendingChanges?: {
+			id?: string;
+			changes?: Array<{ id: string; status?: string }>;
+		};
+	};
+}
 import { QicChatViewPane } from './qicPanel.js';
 import { IQicChatService, QicChatService } from './qicChatService.js';
 import { QicChatAgent } from './qicChatAgent.js';
 
-// QIC component imports — storage & crash safety
+// QIC component imports -- storage & crash safety
 import { QicDatabase } from '../common/storage/database.js';
 import { StatePersistenceManager } from '../common/storage/statePersistence.js';
 import { JournaledAtomicWriter } from '../common/crashSafe/journaledAtomicWriter.js';
 import { TransactionSafeCheckpointManager } from '../common/crashSafe/checkpointManager.js';
 import { CheckpointValidator } from '../common/crashSafe/checkpointValidity.js';
 
-// QIC component imports — state
+// QIC component imports -- state
 import { PersistentAgentStateMachine } from '../common/state/agentStateMachine.js';
 import { ConversationState } from '../common/state/conversationState.js';
 import { IQicStateService, QicStateService } from '../common/state/qicStateService.js';
 
-// QIC component imports — security
+// QIC component imports -- security
 import { OptimizedSecretScanner } from '../common/security/secretScanner.js';
 import { ConsentStore } from '../common/security/consentStore.js';
 import { EgressBoundaryEnforcer } from '../common/security/egressEnforcer.js';
@@ -78,7 +89,7 @@ import { TerminalSecurityGuard } from '../common/security/terminalGuard.js';
 import { HashChainedAuditLogger } from '../common/security/auditLogger.js';
 import { FirstRunManager } from '../common/security/firstRunManager.js';
 
-// QIC component imports — gateway & providers
+// QIC component imports -- gateway & providers
 import { Gateway } from '../common/gateway/gateway.js';
 import { ModelRegistry } from '../common/gateway/modelRegistry.js';
 import { RateLimiter } from '../common/gateway/rateLimiter.js';
@@ -89,45 +100,47 @@ import { QuantlabCloudAdapter } from '../common/gateway/providers/quantlabCloudA
 import { DeltaPlusAdapter } from '../common/gateway/providers/deltaplusAdapter.js';
 import { CircuitBreaker } from '../common/recovery/circuitBreaker.js';
 
-// QIC component imports — auth
+// QIC component imports -- auth
 import { QuantlabAuth } from './auth/quantlabAuth.js';
 import { QicAuthUriHandler } from './auth/uriHandler.js';
 
-// QIC component imports — context & embeddings
+// QIC component imports -- context & embeddings
 import { SecureEmbeddingService } from '../common/context/secureEmbedding.js';
 import { IncrementalIndexer } from '../common/context/incrementalIndexer.js';
 import { ContextAssembler } from '../common/context/contextAssembler.js';
 
-// QIC component imports — runtime & orchestration
+// QIC component imports -- runtime & orchestration
 import { AgentOrchestrator } from '../common/runtime/agentOrchestrator.js';
 import { DynamicToolSelector } from '../common/context/dynamicToolSelector.js';
 import { ToolRouter } from '../common/runtime/toolRouter.js';
 import { LaneRouter } from '../common/runtime/laneRouter.js';
 import { StepExecutor } from '../common/runtime/stepExecutor.js';
-import { PermissionManager } from '../common/runtime/permissionManager.js';
-import type { PermissionStore } from '../common/runtime/permissionManager.js';
+import { PermissionManager, type PermissionStore } from '../common/runtime/permissionManager.js';
 import type { PermissionCheckResult } from '../common/canonical/types.js';
 import type { ProviderAdapter } from '../common/canonical/interfaces.js';
 
-// QIC component imports — mutation
+// QIC component imports -- mutation
 import { MutationEngine } from '../common/mutation/mutationEngine.js';
 import { ConflictDetector } from '../common/mutation/conflictDetector.js';
 import { FlexibleMatcher } from '../common/mutation/flexibleMatcher.js';
 
-// QIC component imports — resilience & lifecycle
+// QIC component imports -- resilience & lifecycle
 import { MemoryManager } from '../common/resilience/memoryManager.js';
 import { DegradationManager } from '../common/resilience/degradationManager.js';
 import { CancellationManager } from '../common/cancellation/cancellationManager.js';
+import type { CancellationToken } from '../../../../base/common/cancellation.js';
+import type { ITextModel } from '../../../../editor/common/model.js';
+import type { Position } from '../../../../editor/common/core/position.js';
 import { TimeoutManager } from '../common/timeout/timeoutManager.js';
 import { SessionCache } from '../common/telemetry/sessionCache.js';
 import { QualitySignalService } from '../common/telemetry/qualitySignalService.js';
 import { TelemetryService } from '../common/telemetry/telemetryService.js';
 
-// QIC component imports — completion
+// QIC component imports -- completion
 import { CompletionEngine } from '../common/completion/completionEngine.js';
 import { QicInlineCompletionProvider } from './qicInlineCompletionProvider.js';
 
-// QIC component imports — tools
+// QIC component imports -- tools
 import { registerAllTools } from '../common/tools/toolRegistration.js';
 import { FileOperationTools } from '../common/tools/fileOps.js';
 import { SearchTools } from '../common/tools/searchTools.js';
@@ -140,7 +153,7 @@ import { NotebookTools } from '../common/tools/notebookTools.js';
 import { CheckpointTools } from '../common/tools/checkpointTools.js';
 import { GitTools } from '../common/tools/gitTools.js';
 
-// QIC component imports — UI
+// QIC component imports -- UI
 import { QicUIService } from './uiService.js';
 
 // Phase 5: Diff View imports (05-02)
@@ -165,7 +178,7 @@ import { IURLService } from '../../../../platform/url/common/url.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
 
 // ---------------------------------------------------------------------------
-// 1. Register IQicService singleton (delayed — created on first access)
+// 1. Register IQicService singleton (delayed -- created on first access)
 // AUDIT FIX X-PS1: Service identifier via createDecorator (in qicService.ts)
 // ---------------------------------------------------------------------------
 registerSingleton(IQicService, QicService, InstantiationType.Delayed);
@@ -282,10 +295,10 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).regis
 			default: 'server',
 			enum: ['server', 'cloud', 'byok', 'local'],
 			enumDescriptions: [
-				localize('qic.connectionMode.server', "Delta Plus Server — uses your server login, no API key needed (Recommended)"),
-				localize('qic.connectionMode.cloud', "Quantlab Cloud — zero-config, managed infrastructure"),
-				localize('qic.connectionMode.byok', "Bring Your Own Key — direct connections to Anthropic/OpenAI"),
-				localize('qic.connectionMode.local', "Local only — Ollama for offline/air-gapped environments"),
+				localize('qic.connectionMode.server', "Delta Plus Server -- uses your server login, no API key needed (Recommended)"),
+				localize('qic.connectionMode.cloud', "Quantlab Cloud -- zero-config, managed infrastructure"),
+				localize('qic.connectionMode.byok', "Bring Your Own Key -- direct connections to Anthropic/OpenAI"),
+				localize('qic.connectionMode.local', "Local only -- Ollama for offline/air-gapped environments"),
 			],
 			description: localize('qic.connectionMode', "How QIC connects to AI models."),
 		},
@@ -309,9 +322,9 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).regis
 			default: 'private',
 			enum: ['private', 'anonymous-metrics', 'data-contributor'],
 			enumDescriptions: [
-				localize('qic.dataTier.private', "Private — no telemetry data sent"),
-				localize('qic.dataTier.anonymous', "Anonymous Metrics — latency, accept/reject rates, lane usage (no code content)"),
-				localize('qic.dataTier.contributor', "Data Contributor — full interaction data including code (for model improvement)"),
+				localize('qic.dataTier.private', "Private -- no telemetry data sent"),
+				localize('qic.dataTier.anonymous', "Anonymous Metrics -- latency, accept/reject rates, lane usage (no code content)"),
+				localize('qic.dataTier.contributor', "Data Contributor -- full interaction data including code (for model improvement)"),
 			],
 			description: localize('qic.dataTier', "Controls what data QIC shares with Quantlab."),
 		},
@@ -325,7 +338,7 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).regis
 			default: false,
 			description: localize('qic.cloud.enabled', "Enable Quantlab Cloud connection path. Off during development, flipped to true at GA."),
 		},
-		// Removed: qic.experimental.newHeader — no longer relevant after migration to native ChatWidget
+		// Removed: qic.experimental.newHeader -- no longer relevant after migration to native ChatWidget
 	},
 });
 
@@ -352,6 +365,29 @@ registerAction2(class extends Action2 {
 		const qicChatService = accessor.get(IQicChatService);
 		await viewsService.openView(QIC_CHAT_VIEW_ID, true);
 		await qicChatService.startNewConversation();
+	}
+});
+
+// Open Orion with a prompt and submit it (programmatic entry point for
+// "Fix with Orion" style actions from other parts of the product).
+registerAction2(class extends Action2 {
+	constructor() {
+		super({
+			id: 'qic.openWithPrompt',
+			title: localize2('qic.openWithPrompt', "Orion: Open With Prompt"),
+			f1: false,
+		});
+	}
+	async run(accessor: ServicesAccessor, prompt?: unknown): Promise<void> {
+		if (typeof prompt !== 'string' || !prompt.trim()) {
+			throw new Error('qic.openWithPrompt requires a non-empty prompt string.');
+		}
+		const viewsService = accessor.get(IViewsService);
+		const view = await viewsService.openView(QIC_CHAT_VIEW_ID, true);
+		if (!(view instanceof QicChatViewPane)) {
+			throw new Error('Orion chat view is not available.');
+		}
+		await view.submitPrompt(prompt);
 	}
 });
 
@@ -450,12 +486,12 @@ registerAction2(class extends Action2 {
 			const pick = await quickInput.pick(
 				checkpoints.map(cp => ({
 					label: cp.id.slice(0, 8),
-					description: `${cp.createdAt} — ${cp.fileCount} files`,
+					description: `${cp.createdAt} -- ${cp.fileCount} files`,
 					id: cp.id,
 				})),
 				{ placeHolder: localize('qic.selectCheckpoint', "Select a checkpoint to restore") },
 			);
-			if (pick && 'id' in pick) {
+			if (pick && Object.prototype.hasOwnProperty.call(pick, 'id')) {
 				await runtime.checkpointManager.restoreCheckpoint(pick.id as string);
 				notificationService.info(localize('qic.checkpointRestored', "Orion: Checkpoint restored."));
 			}
@@ -558,7 +594,7 @@ registerAction2(class extends Action2 {
 			await secretStorage.set(storageKey, key);
 
 			notificationService.info(
-				localize('qic.apiKeySet', "API key saved. Reload the window (Ctrl+Shift+P → Reload Window) to activate the {0} provider.", provider.label)
+				localize('qic.apiKeySet', "API key saved. Reload the window (Ctrl+Shift+P -> Reload Window) to activate the {0} provider.", provider.label)
 			);
 		}
 	}
@@ -645,7 +681,7 @@ registerAction2(class extends Action2 {
 			notificationService.info(localize('qic.signInSuccess', "Orion: Signed in to Quantlab Cloud. Reload the window to activate."));
 		} catch (err) {
 			notificationService.error(
-				localize('qic.signInFailed', "Orion: Sign-in failed — {0}", err instanceof Error ? err.message : String(err))
+				localize('qic.signInFailed', "Orion: Sign-in failed -- {0}", err instanceof Error ? err.message : String(err))
 			);
 		}
 	}
@@ -727,7 +763,7 @@ registerAction2(class extends Action2 {
 			return;
 		}
 
-		// Decode JWT payload (no verification — just for display)
+		// Decode JWT payload (no verification -- just for display)
 		try {
 			const parts = accessToken.split('.');
 			if (parts.length === 3) {
@@ -770,17 +806,17 @@ registerAction2(class extends Action2 {
 		const current = configService.getValue<string>(QIC_SETTINGS.CONNECTION_MODE) ?? 'cloud';
 
 		const items = [
-			{ label: 'server', description: 'Delta Plus Server — uses your server login, no API key needed', picked: current === 'server' },
-			{ label: 'cloud', description: 'Quantlab Cloud — zero-config, managed infrastructure', picked: current === 'cloud' },
-			{ label: 'byok', description: 'Bring Your Own Key — direct to Anthropic/OpenAI', picked: current === 'byok' },
-			{ label: 'local', description: 'Local only — Ollama for offline environments', picked: current === 'local' },
+			{ label: 'server', description: 'Delta Plus Server -- uses your server login, no API key needed', picked: current === 'server' },
+			{ label: 'cloud', description: 'Quantlab Cloud -- zero-config, managed infrastructure', picked: current === 'cloud' },
+			{ label: 'byok', description: 'Bring Your Own Key -- direct to Anthropic/OpenAI', picked: current === 'byok' },
+			{ label: 'local', description: 'Local only -- Ollama for offline environments', picked: current === 'local' },
 		];
 
 		const pick = await quickInput.pick(items, {
 			placeHolder: localize('qic.switchMode.placeholder', "Select connection mode (current: {0})", current),
 		});
 
-		if (pick && 'label' in pick && pick.label !== current) {
+		if (pick && Object.prototype.hasOwnProperty.call(pick, 'label') && pick.label !== current) {
 			await configService.updateValue(QIC_SETTINGS.CONNECTION_MODE, pick.label);
 			// The hot-swap listener will prompt for reload
 		}
@@ -802,7 +838,7 @@ registerAction2(class extends Action2 {
 		});
 	}
 	async run(accessor: ServicesAccessor, changeId?: string): Promise<void> {
-		if (!changeId) return;
+		if (!changeId) { return; }
 
 		const { IQicDiffService } = await import('./qicDiffService.js');
 		const diffService = accessor.get(IQicDiffService);
@@ -831,7 +867,7 @@ registerAction2(class extends Action2 {
 		const stateService = accessor.get(IQicStateService);
 
 		const changeId = diffService.getCurrentDiffChangeId();
-		if (!changeId) return;
+		if (!changeId) { return; }
 
 		// Apply the change
 		try {
@@ -864,7 +900,7 @@ registerAction2(class extends Action2 {
 		const stateService = accessor.get(IQicStateService);
 
 		const changeId = diffService.getCurrentDiffChangeId();
-		if (!changeId) return;
+		if (!changeId) { return; }
 
 		// Reject the change
 		stateService.rejectChange?.(changeId);
@@ -887,7 +923,7 @@ registerAction2(class extends Action2 {
 		});
 	}
 	async run(accessor: ServicesAccessor, changeSetId?: string): Promise<void> {
-		if (!changeSetId) return;
+		if (!changeSetId) { return; }
 
 		const qicService = accessor.get(IQicService);
 		const stateService = accessor.get(IQicStateService);
@@ -895,7 +931,7 @@ registerAction2(class extends Action2 {
 		const runtime = qicService.getRuntime();
 
 		// Get the change set from state
-		const state = stateService.state as any;
+		const state = stateService.state as unknown as PendingChangesState;
 		const pendingChanges = state.conversation?.pendingChanges;
 		const changeSet = pendingChanges?.id === changeSetId ? pendingChanges : null;
 
@@ -905,7 +941,7 @@ registerAction2(class extends Action2 {
 		}
 
 		// Apply all pending changes
-		const pendingChangesToApply = changeSet.changes?.filter((c: any) => c.status === 'pending') || [];
+		const pendingChangesToApply = changeSet.changes?.filter(c => c.status === 'pending') || [];
 		let successCount = 0;
 		let failCount = 0;
 
@@ -940,7 +976,7 @@ registerAction2(class extends Action2 {
 		});
 	}
 	async run(accessor: ServicesAccessor, changeSetId?: string): Promise<void> {
-		if (!changeSetId) return;
+		if (!changeSetId) { return; }
 
 		const qicService = accessor.get(IQicService);
 		const stateService = accessor.get(IQicStateService);
@@ -948,7 +984,7 @@ registerAction2(class extends Action2 {
 		const runtime = qicService.getRuntime();
 
 		// Get the change set from state
-		const state = stateService.state as any;
+		const state = stateService.state as unknown as PendingChangesState;
 		const pendingChanges = state.conversation?.pendingChanges;
 		const changeSet = pendingChanges?.id === changeSetId ? pendingChanges : null;
 
@@ -958,7 +994,7 @@ registerAction2(class extends Action2 {
 		}
 
 		// Reject all pending changes
-		const pendingChangesToReject = changeSet.changes?.filter((c: any) => c.status === 'pending') || [];
+		const pendingChangesToReject = changeSet.changes?.filter(c => c.status === 'pending') || [];
 		let rejectCount = 0;
 
 		for (const change of pendingChangesToReject) {
@@ -994,7 +1030,7 @@ registerAction2(class extends Action2 {
 
 		// If no changeSetId provided, use current pending changes
 		if (!changeSetId) {
-			const state = stateService.state as any;
+			const state = stateService.state as unknown as PendingChangesState;
 			changeSetId = state.conversation?.pendingChanges?.id;
 		}
 
@@ -1123,7 +1159,7 @@ registerAction2(class extends Action2 {
 });
 
 // ---------------------------------------------------------------------------
-// QicInlineCompletionAdapter — bridges QicInlineCompletionProvider to VS Code's
+// QicInlineCompletionAdapter -- bridges QicInlineCompletionProvider to VS Code's
 // InlineCompletionsProvider interface used by ILanguageFeaturesService.
 // ---------------------------------------------------------------------------
 
@@ -1131,10 +1167,10 @@ class QicInlineCompletionAdapter {
 	readonly groupId = QicInlineCompletionProvider.groupId;
 	readonly yieldsToGroupIds = QicInlineCompletionProvider.yieldsToGroupIds;
 
-	constructor(private readonly inner: QicInlineCompletionProvider) {}
+	constructor(private readonly inner: QicInlineCompletionProvider) { }
 
 	async provideInlineCompletions(
-		model: any, position: any, _context: any, token: any,
+		model: ITextModel, position: Position, _context: unknown, token: CancellationToken,
 	): Promise<{ items: { insertText: string }[] }> {
 		const ac = new AbortController();
 		const listener = token.onCancellationRequested(() => ac.abort());
@@ -1152,11 +1188,11 @@ class QicInlineCompletionAdapter {
 	}
 
 	handleItemDidShow(): void {
-		// Item was shown to user — already tracked in provideInlineCompletions
+		// Item was shown to user -- already tracked in provideInlineCompletions
 	}
 
 	handlePartialAccept(): void {
-		// Partial accept — confirmation requires document change correlation (Phase 5b)
+		// Partial accept -- confirmation requires document change correlation (Phase 5b)
 		// For now, we track "shown" but defer accept/reject determination
 		const completion = this.inner.getLastCompletion();
 		if (completion) {
@@ -1166,13 +1202,13 @@ class QicInlineCompletionAdapter {
 
 	freeInlineCompletions(): void {
 		// Called when completions are dismissed/freed (both accept AND reject cases)
-		// Cannot distinguish here — delegate to provider for cleanup
+		// Cannot distinguish here -- delegate to provider for cleanup
 		this.inner.freeInlineCompletions([]);
 	}
 }
 
 // ---------------------------------------------------------------------------
-// InMemoryPermissionStore — simple in-memory implementation of PermissionStore
+// InMemoryPermissionStore -- simple in-memory implementation of PermissionStore
 // ---------------------------------------------------------------------------
 
 class InMemoryPermissionStore implements PermissionStore {
@@ -1188,7 +1224,7 @@ class InMemoryPermissionStore implements PermissionStore {
 }
 
 // ---------------------------------------------------------------------------
-// 6. QIC Activation — Phase A (sync) + Phase B (async)
+// 6. QIC Activation -- Phase A (sync) + Phase B (async)
 // AUDIT FIX IV-AO3: Split to avoid 60s activation timeout
 // AUDIT FIX XII-AR4: All components in DisposableStore
 // ---------------------------------------------------------------------------
@@ -1279,7 +1315,7 @@ class QicActivation extends Disposable {
 		let checkpointManager: TransactionSafeCheckpointManager;
 		let qualitySignalService: QualitySignalService;
 
-		// Register connection config change listener unconditionally — before the try block
+		// Register connection config change listener unconditionally -- before the try block
 		// so it cannot be skipped by any thrown exception in any initialization step.
 		this._disposableStore.add(
 			this.configurationService.onDidChangeConfiguration(e => {
@@ -1288,7 +1324,7 @@ class QicActivation extends Disposable {
 					e.affectsConfiguration('qic.cloud.baseUrl') ||
 					e.affectsConfiguration('qic.cloud.devMode') ||
 					e.affectsConfiguration('qic.cloud.enabled')) {
-					this.logService.info('[QIC] Connection configuration changed — reload required');
+					this.logService.info('[QIC] Connection configuration changed -- reload required');
 					this.notificationService.prompt(
 						2, // Severity.Info
 						localize('qic.configChanged', "Orion connection settings changed. Reload the window to apply."),
@@ -1311,7 +1347,7 @@ class QicActivation extends Disposable {
 					try {
 						await this.fileService.createFolder(dirUri);
 					} catch {
-						// Directory may already exist — that's fine
+						// Directory may already exist -- that's fine
 					}
 				}
 				// Also create the journal directory
@@ -1325,7 +1361,7 @@ class QicActivation extends Disposable {
 
 			journalDir = URI.joinPath(storageBase, 'journal').fsPath;
 
-			// Step 1: Crash recovery (non-fatal — fs may be unavailable in sandbox)
+			// Step 1: Crash recovery (non-fatal -- fs may be unavailable in sandbox)
 			try {
 				await this.step('crash-recovery', async () => {
 					const recoveryResult = await JournaledAtomicWriter.recoverFromCrash(journalDir);
@@ -1346,7 +1382,7 @@ class QicActivation extends Disposable {
 					}
 				});
 			} catch (err) {
-				this.logService.warn('[QIC] Crash recovery unavailable (sandboxed renderer) — skipping.', err);
+				this.logService.warn('[QIC] Crash recovery unavailable (sandboxed renderer) -- skipping.', err);
 				this.qicService.addCompletedStep('crash-recovery'); // Mark as completed so error reporting is accurate
 			}
 
@@ -1356,7 +1392,7 @@ class QicActivation extends Disposable {
 				db = new QicDatabase(dbPath);
 				await db.initialize();
 				if (db.isInMemory) {
-					this.logService.warn('[QIC] Native SQLite unavailable (sandboxed renderer) — using in-memory storage. Data will not persist across sessions.');
+					this.logService.warn('[QIC] Native SQLite unavailable (sandboxed renderer) -- using in-memory storage. Data will not persist across sessions.');
 				}
 				statePersistence = new StatePersistenceManager(db);
 			});
@@ -1391,7 +1427,7 @@ class QicActivation extends Disposable {
 				const firstRunManager = new FirstRunManager(consentStore);
 				const firstRunResult = await firstRunManager.checkAndPrompt();
 				if (firstRunResult.isFirstRun) {
-					// Show consent dialog — user must explicitly enable AI features
+					// Show consent dialog -- user must explicitly enable AI features
 					const dialogResult = await this.dialogService.confirm({
 						message: localize('qic.firstRun.title', "Welcome to Orion"),
 						detail: localize('qic.firstRun.detail',
@@ -1402,17 +1438,17 @@ class QicActivation extends Disposable {
 						await consentStore.grantConsent('llm', 'workspace');
 						await consentStore.grantConsent('embedding', 'workspace');
 						await consentStore.markFirstRunComplete();
-						this.logService.info('[QIC] First-run consent granted — AI features enabled');
+						this.logService.info('[QIC] First-run consent granted -- AI features enabled');
 					} else {
 						this.qicService.setState('degraded');
 						this.qicService.addDegradedFeature('llm');
-						this.logService.warn('[QIC] First-run consent declined — LLM features degraded');
+						this.logService.warn('[QIC] First-run consent declined -- LLM features degraded');
 						return;
 					}
 				} else if (!firstRunResult.canProceed) {
 					this.qicService.setState('degraded');
 					this.qicService.addDegradedFeature('llm');
-					this.logService.warn('[QIC] Required consent not granted — LLM features degraded');
+					this.logService.warn('[QIC] Required consent not granted -- LLM features degraded');
 					return;
 				}
 			});
@@ -1505,10 +1541,10 @@ class QicActivation extends Disposable {
 							await new Promise(r => setTimeout(r, 500));
 							dpAccessToken = await this.secretStorageService.get(QIC_SECRET_KEYS.DELTAPLUS_ACCESS_TOKEN);
 						}
-						// Token still absent — adapter will be late-registered via onDidChangeSecret
+						// Token still absent -- adapter will be late-registered via onDidChangeSecret
 						// when the user signs in through the QuantLab auth provider.
 						if (!dpAccessToken) {
-							this.logService.info('[QIC] Delta Plus token not available at startup — adapter will register when user signs in');
+							this.logService.info('[QIC] Delta Plus token not available at startup -- adapter will register when user signs in');
 						}
 					}
 
@@ -1534,12 +1570,12 @@ class QicActivation extends Disposable {
 									}
 								},
 								loginFallback: async () => {
-									this.logService.warn('[QIC] Delta Plus token refresh failed — user must re-authenticate');
+									this.logService.warn('[QIC] Delta Plus token refresh failed -- user must re-authenticate');
 									throw new Error('Delta Plus session expired. Please sign in again via the account menu.');
 								},
 							}, this.requestService);
 
-							// Register immediately — blocking startup on a 5-second health check is
+							// Register immediately -- blocking startup on a 5-second health check is
 							// user-visible latency. Actual failures surface via the circuit breaker;
 							// the background check here is diagnostic and notification only.
 							providers.set('deltaplus', deltaplusAdapter);
@@ -1614,11 +1650,11 @@ class QicActivation extends Disposable {
 					[...providers.keys()].map(id => [id, new CircuitBreaker()])
 				);
 
-				// Bug B: Event-driven retry — when Delta Plus token is written or refreshed
+				// Bug B: Event-driven retry -- when Delta Plus token is written or refreshed
 				// (ServerApiClient.persistTokens() writes to the same SecretStorage key),
 				// late-register the adapter if it was absent at startup.
 				// providers and circuitBreakers are shared by reference with Gateway and
-				// ModelRegistry — mutating the Map is all that's needed.
+				// ModelRegistry -- mutating the Map is all that's needed.
 				this._disposableStore.add(
 					this.secretStorageService.onDidChangeSecret(async (changedKey: string) => {
 						if (changedKey !== QIC_SECRET_KEYS.DELTAPLUS_ACCESS_TOKEN) { return; }
@@ -1627,7 +1663,7 @@ class QicActivation extends Disposable {
 						const newToken = await this.secretStorageService.get(QIC_SECRET_KEYS.DELTAPLUS_ACCESS_TOKEN);
 						if (!newToken) { return; }
 						if (providers.has('deltaplus')) {
-							// Adapter already live — push the fresh token into its in-memory config.
+							// Adapter already live -- push the fresh token into its in-memory config.
 							const liveRefresh = await this.secretStorageService.get(QIC_SECRET_KEYS.DELTAPLUS_REFRESH_TOKEN) ?? undefined;
 							const liveExpiry = await this.secretStorageService.get(QIC_SECRET_KEYS.DELTAPLUS_TOKEN_EXPIRES_AT);
 							const liveExpiryMs = liveExpiry ? parseInt(liveExpiry, 10) : undefined;
@@ -1635,8 +1671,8 @@ class QicActivation extends Disposable {
 							this.logService.info('[QIC] Delta Plus adapter tokens updated from SecretStorage');
 							return;
 						}
-						// Server came online after startup failed — late-register the provider.
-						this.logService.info('[QIC] Delta Plus token appeared after startup — registering provider');
+						// Server came online after startup failed -- late-register the provider.
+						this.logService.info('[QIC] Delta Plus token appeared after startup -- registering provider');
 						try {
 							const lateServerUrl = this.configurationService.getValue<string>(QIC_SETTINGS.SERVER_BASE_URL) ?? 'https://api.deltaplus.io';
 							const newRefresh = await this.secretStorageService.get(QIC_SECRET_KEYS.DELTAPLUS_REFRESH_TOKEN) ?? undefined;
@@ -1658,7 +1694,7 @@ class QicActivation extends Disposable {
 									}
 								},
 								loginFallback: async () => {
-									this.logService.warn('[QIC] Delta Plus token refresh failed (late adapter) — user must re-authenticate');
+									this.logService.warn('[QIC] Delta Plus token refresh failed (late adapter) -- user must re-authenticate');
 									throw new Error('Delta Plus session expired. Please sign in again via the account menu.');
 								},
 							}, this.requestService);
@@ -1691,7 +1727,7 @@ class QicActivation extends Disposable {
 				this._hasLocalProvider = providers.has('ollama');
 
 				// --- Provider diagnostics ---
-				this.logService.info(`[QIC] Gateway initialized: ${providers.size} provider(s) — [${[...providers.keys()].join(', ')}]`);
+				this.logService.info(`[QIC] Gateway initialized: ${providers.size} provider(s) -- [${[...providers.keys()].join(', ')}]`);
 				this.logService.info(`[QIC] Connection mode: ${connectionMode}, cloud enabled: ${cloudEnabled}`);
 
 				// --- User guidance ---
@@ -1702,7 +1738,7 @@ class QicActivation extends Disposable {
 					);
 				} else if (!providers.has('deltaplus') && connectionMode === 'server') {
 					this.notificationService.info(
-						localize('qic.serverConnect',
+						localize('qic.serverConnect.notConnected',
 							"Orion: Delta Plus Server not connected. Ensure the server is running and you are logged in, or switch connection mode.")
 					);
 				} else if (!providers.has('quantlab-cloud') && connectionMode === 'cloud') {
@@ -1711,7 +1747,7 @@ class QicActivation extends Disposable {
 							"Orion: Quantlab Cloud not configured. Run 'Orion: Sign In' from the Command Palette, or switch to BYOK mode.")
 					);
 				} else if (providers.size === 1 && providers.has('ollama')) {
-					this.logService.warn('[QIC] No API keys configured — only local Ollama available');
+					this.logService.warn('[QIC] No API keys configured -- only local Ollama available');
 					this.notificationService.info(
 						localize('qic.noApiKeys',
 							"Orion: No API keys configured. Using local Ollama only. To add Anthropic or OpenAI, run 'Orion: Set API Key' from the Command Palette (Ctrl+Shift+P).")
@@ -1790,7 +1826,7 @@ class QicActivation extends Disposable {
 				const toolRouter = new ToolRouter(permissionManager, auditLogger);
 				const stepExecutor = new StepExecutor(toolRouter);
 
-				// Quality signal instrumentation (Phase 5 prerequisite — local-only)
+				// Quality signal instrumentation (Phase 5 prerequisite -- local-only)
 				// Note: Moved before orchestrator to pass as dependency
 				qualitySignalService = new QualitySignalService();
 				qualitySignalService.setDatabase(db);
@@ -1855,7 +1891,7 @@ class QicActivation extends Disposable {
 				);
 				this._disposableStore.add(statusBarEntry);
 
-				// Wire DegradationManager → status bar
+				// Wire DegradationManager -> status bar
 				statusBar.onDidChange(() => {
 					statusBarEntry.update({
 						name: 'Orion',
@@ -1870,7 +1906,7 @@ class QicActivation extends Disposable {
 					statusBar.updateFromDegradation(level);
 				});
 
-				// Wire cloud adapter routing → status bar model name
+				// Wire cloud adapter routing -> status bar model name
 				if (this._cloudAdapter) {
 					this._disposableStore.add(
 						this._cloudAdapter.onRouting(info => {
@@ -1878,7 +1914,7 @@ class QicActivation extends Disposable {
 						})
 					);
 
-					// Wire quota listener → UI notifications
+					// Wire quota listener -> UI notifications
 					this._disposableStore.add(
 						this._cloudAdapter.onQuotaUpdated(quotaInfo => {
 							if (quotaInfo.warning) {
@@ -1954,7 +1990,7 @@ class QicActivation extends Disposable {
 				const qicProvider = new QicInlineCompletionProvider(completionEngine, qualitySignalService);
 				const adapter = new QicInlineCompletionAdapter(qicProvider);
 				this._disposableStore.add(
-					this.languageFeaturesService.inlineCompletionsProvider.register('*', adapter as any)
+					this.languageFeaturesService.inlineCompletionsProvider.register('*', adapter as unknown as Parameters<typeof this.languageFeaturesService.inlineCompletionsProvider.register>[1])
 				);
 
 				// Phase 5 (05-04): Register CodeLens provider for diff views
@@ -1968,7 +2004,7 @@ class QicActivation extends Disposable {
 			}).catch(() => {
 				this.qicService.addDegradedFeature('code-search');
 				this.notificationService.warn(
-					localize('qic.indexingFailed', "Orion: Code search unavailable — indexing failed")
+					localize('qic.indexingFailed', "Orion: Code search unavailable -- indexing failed")
 				);
 			});
 
@@ -2036,7 +2072,7 @@ class QicActivation extends Disposable {
 
 		// Persist last known token expiry (best-effort)
 		if (this._cloudAdapter) {
-			const expiresAt = (this._cloudAdapter as any).config?.tokenExpiresAt;
+			const expiresAt = (this._cloudAdapter as unknown as { config?: { tokenExpiresAt?: unknown } }).config?.tokenExpiresAt;
 			if (expiresAt) {
 				void this.secretStorageService.set(QIC_SECRET_KEYS.CLOUD_TOKEN_EXPIRES_AT, String(expiresAt));
 			}
