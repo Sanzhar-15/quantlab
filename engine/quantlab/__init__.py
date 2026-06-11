@@ -236,6 +236,41 @@ def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 
+def wma(series, period):
+    """Weighted Moving Average (linear weights, newest bar weighted highest)."""
+    import numpy as np
+
+    weights = np.arange(1, period + 1, dtype=float)
+    return series.rolling(window=period).apply(
+        lambda window: float(np.dot(window, weights) / weights.sum()), raw=True
+    )
+
+
+def bbands(series, period=20, std=2.0):
+    """
+    Bollinger Bands.
+
+    Args:
+        series: pandas Series of prices (typically close prices)
+        period: SMA window for the middle band (default: 20)
+        std: Number of standard deviations for the outer bands (default: 2.0)
+
+    Returns:
+        Tuple of (upper, middle, lower) as pandas Series. The deviation uses the
+        population standard deviation (ddof=0), matching the IDE Chart view's
+        renderer so the backtest and the visualization agree.
+
+    Example:
+        >>> upper, middle, lower = ql.bbands(data.close, period=20, std=2)
+        >>> entry = ql.cross_over(data.close, lower)
+    """
+    middle = series.rolling(window=period).mean()
+    deviation = series.rolling(window=period).std(ddof=0)
+    upper = middle + std * deviation
+    lower = middle - std * deviation
+    return upper, middle, lower
+
+
 def macd(series, fast=12, slow=26, signal=9):
     """
     Calculate MACD (Moving Average Convergence Divergence) indicator.
@@ -327,6 +362,8 @@ __all__ = [
     "rsi",
     "sma",
     "ema",
+    "wma",
+    "bbands",
     "macd",
     "cross_over",
     "cross_under",

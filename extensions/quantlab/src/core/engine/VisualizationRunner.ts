@@ -34,6 +34,12 @@ interface MacdDefinition {
 	params: Record<string, number>;
 }
 
+interface BbandsDefinition {
+	component: 'upper' | 'middle' | 'lower';
+	source: SeriesSource;
+	params: Record<string, number>;
+}
+
 interface CrossDefinition {
 	type: 'over' | 'under';
 	left: SeriesSource;
@@ -80,10 +86,16 @@ export class VisualizationRunner {
 				valueByName.set(varName, paramValues.get(paramId));
 			}
 		}
+		// `x = params.get("id", default)` -- common in generated visualize() bodies.
+		for (const [varName, resolved] of this.parseParamsGetAssignments(text, paramValues).entries()) {
+			valueByName.set(varName, resolved);
+		}
 
 		const indicatorDefs = this.parseIndicatorAssignments(text, valueByName, errors);
 		const macdDefs = this.parseMacdAssignments(text, valueByName, errors);
-		const crossDefs = this.parseCrossAssignments(text, indicatorDefs, valueByName, errors);
+		const bbandsDefs = this.parseBbandsAssignments(text, valueByName, errors);
+		const knownSeries = new Set<string>([...indicatorDefs.keys(), ...macdDefs.keys(), ...bbandsDefs.keys()]);
+		const crossDefs = this.parseCrossAssignments(text, knownSeries, valueByName, errors);
 		const seriesCache = new Map<string, number[]>();
 
 		const resolveSource = (source: SeriesSource): number[] | undefined => {
@@ -130,6 +142,19 @@ export class VisualizationRunner {
 				return computed;
 			}
 
+			// Check Bollinger Bands components
+			const bbandsDef = bbandsDefs.get(name);
+			if (bbandsDef) {
+				const source = resolveSource(bbandsDef.source);
+				if (!source) {
+					errors.push(`Unable to resolve bbands input for ${name}.`);
+					return undefined;
+				}
+				const computed = this.computeBbandsComponent(source, bbandsDef.params, bbandsDef.component);
+				seriesCache.set(name, computed);
+				return computed;
+			}
+
 			return undefined;
 		};
 
@@ -155,7 +180,7 @@ export class VisualizationRunner {
 						break;
 					}
 					const seriesArg = args[0]?.value ?? '';
-					const seriesSource = this.parseSeriesSource(seriesArg, indicatorDefs, valueByName);
+					const seriesSource = this.parseSeriesSource(seriesArg, knownSeries, valueByName);
 					if (!seriesSource) {
 						errors.push(`Unable to resolve chart.plot series at line ${call.line}.`);
 						break;
@@ -220,6 +245,9 @@ export class VisualizationRunner {
 					break;
 				}
 				default:
+					// No-Fallbacks: an unknown chart call must not vanish silently -- the
+					// user would see a chart that ignores part of their visualize() body.
+					errors.push(`Unsupported chart.${call.name}(...) at line ${call.line}. Supported: plot, add_pane, mark_entries, mark_exits, plot_equity.`);
 					break;
 			}
 		}
@@ -228,6 +256,13 @@ export class VisualizationRunner {
 		const fallbackExits = exitSignals ?? this.extractSignalMarkers(input.signals, 'exit');
 
 		if (!block) {
+			// No-Fallbacks: if a visualize() exists but we could not extract its body
+			// (e.g. the first parameter is not `chart`), say so instead of silently
+			// rendering a bare chart -- this was exactly how AI-generated strategies
+			// with a `visualize(chart, data, params)` signature failed invisibly.
+			if (/def\s+visualize\s*\(/.test(text)) {
+				errors.push('visualize() was found but could not be parsed. Define it as `def visualize(chart):` -- the first parameter must be `chart` (extra parameters are tolerated but discouraged).');
+			}
 			if (fallbackEntries.length) {
 				commands.push({ type: 'markEntries', entries: fallbackEntries });
 			}
@@ -238,7 +273,7 @@ export class VisualizationRunner {
 				commands.push({ type: 'clear', target: 'signals' });
 			}
 			commands.push({ type: 'clear', target: 'equity' });
-			return { commands, errors: [] };
+			return { commands, errors };
 		}
 
 		const entryMarkers = usedEntries ? fallbackEntries : [];
@@ -270,7 +305,9 @@ export class VisualizationRunner {
 
 	private extractVisualizeBlock(text: string): { body: string; startLine: number } | null {
 		const lines = text.split(/\r\n|\r|\n/);
-		const defPattern = /def\s+visualize\s*\(\s*chart\s*\)\s*:/;
+		// First parameter must be `chart`; extra parameters (data, params, ...) are
+		// tolerated -- AI-generated strategies commonly emit visualize(chart, data, params).
+		const defPattern = /def\s+visualize\s*\(\s*chart\b[^)]*\)\s*:/;
 		let start = -1;
 		for (let i = 0; i < lines.length; i++) {
 			if (defPattern.test(lines[i])) {
@@ -300,7 +337,46 @@ export class VisualizationRunner {
 		return { body: bodyLines.join('\n'), startLine: start + 2 };
 	}
 
-	private parseChartCalls(body: string, startLine: number): ParsedCall[] {
+	/**
+	 * Blanks out `#` comments (preserving string literals and line positions) so that
+	 * commented-out examples -- like the ones in the visualize() template -- are not
+	 * parsed as real chart calls.
+	 */
+	private stripComments(body: string): string {
+		const chars = body.split('');
+		let inString: '"' | '\'' | null = null;
+		let inComment = false;
+		for (let i = 0; i < chars.length; i++) {
+			const ch = chars[i];
+			if (ch === '\n') {
+				inComment = false;
+				inString = null; // visualize bodies do not span strings across lines
+				continue;
+			}
+			if (inComment) {
+				chars[i] = ' ';
+				continue;
+			}
+			if (inString) {
+				if (ch === inString && chars[i - 1] !== '\\') {
+					inString = null;
+				}
+				continue;
+			}
+			if (ch === '"' || ch === '\'') {
+				inString = ch;
+				continue;
+			}
+			if (ch === '#') {
+				inComment = true;
+				chars[i] = ' ';
+			}
+		}
+		return chars.join('');
+	}
+
+	private parseChartCalls(rawBody: string, startLine: number): ParsedCall[] {
+		const body = this.stripComments(rawBody);
 		const calls: ParsedCall[] = [];
 		const needle = 'chart.';
 		let index = 0;
@@ -367,6 +443,30 @@ export class VisualizationRunner {
 		return assignments;
 	}
 
+	/**
+	 * Parses `x = params.get("id", default)` assignments (a shape AI-generated
+	 * visualize() bodies commonly use) and resolves each to the live parameter value,
+	 * falling back to the literal default when the id is unknown.
+	 */
+	private parseParamsGetAssignments(text: string, paramValues: Map<string, unknown>): Map<string, unknown> {
+		const resolved = new Map<string, unknown>();
+		const pattern = /([A-Za-z_][A-Za-z0-9_]*)\s*=\s*params\.get\s*\(\s*['"]([^'"]+)['"]\s*(?:,\s*([^)]+))?\)/g;
+		let match: RegExpExecArray | null;
+		while ((match = pattern.exec(text)) !== null) {
+			const varName = match[1];
+			const paramId = match[2];
+			if (paramValues.has(paramId)) {
+				resolved.set(varName, paramValues.get(paramId));
+				continue;
+			}
+			const fallbackLiteral = match[3] !== undefined ? this.parseNumber(match[3]) : undefined;
+			if (fallbackLiteral !== undefined) {
+				resolved.set(varName, fallbackLiteral);
+			}
+		}
+		return resolved;
+	}
+
 	private parseIndicatorAssignments(text: string, valueByName: Map<string, unknown>, errors: string[]): Map<string, IndicatorDefinition> {
 		const indicators = new Map<string, IndicatorDefinition>();
 		const pattern = /([A-Za-z_][A-Za-z0-9_]*)\s*=\s*ql\.([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
@@ -376,6 +476,15 @@ export class VisualizationRunner {
 			const varName = match[1];
 			const indicator = match[2];
 			if (!this.isSupportedIndicator(indicator)) {
+				continue;
+			}
+			// Skip tuple assignments (`a, b, c = ql.macd(...)`): the regex would otherwise
+			// match the LAST tuple element and shadow the real multi-component definition.
+			let cursor = match.index - 1;
+			while (cursor >= 0 && (text[cursor] === ' ' || text[cursor] === '\t')) {
+				cursor--;
+			}
+			if (cursor >= 0 && text[cursor] === ',') {
 				continue;
 			}
 
@@ -388,7 +497,7 @@ export class VisualizationRunner {
 
 			const args = this.parseArgs(text.slice(openParen + 1, closeParen));
 			const sourceArg = args[0]?.value ?? '';
-			const source = this.parseSeriesSource(sourceArg, indicators, valueByName);
+			const source = this.parseSeriesSource(sourceArg, new Set(indicators.keys()), valueByName);
 			if (!source) {
 				errors.push(`Unable to resolve ${indicator} source for ${varName}.`);
 				continue;
@@ -427,7 +536,7 @@ export class VisualizationRunner {
 
 			const args = this.parseArgs(text.slice(openParen + 1, closeParen));
 			const sourceArg = args[0]?.value ?? '';
-			const source = this.parseSeriesSource(sourceArg, new Map(), valueByName);
+			const source = this.parseSeriesSource(sourceArg, new Set<string>(), valueByName);
 			if (!source) {
 				errors.push(`Unable to resolve macd source for ${macdVar}.`);
 				continue;
@@ -446,9 +555,118 @@ export class VisualizationRunner {
 		return macds;
 	}
 
+	/**
+	 * Pattern: `upper, middle, lower = ql.bbands(source, period=20, std=2.0)`.
+	 * Mirrors parseMacdAssignments: all three components share source/params.
+	 */
+	private parseBbandsAssignments(text: string, valueByName: Map<string, unknown>, errors: string[]): Map<string, BbandsDefinition> {
+		const bbands = new Map<string, BbandsDefinition>();
+		const pattern = /([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*ql\.bbands\s*\(/g;
+		let match: RegExpExecArray | null;
+
+		while ((match = pattern.exec(text)) !== null) {
+			const upperVar = match[1];
+			const middleVar = match[2];
+			const lowerVar = match[3];
+
+			const openParen = match.index + match[0].length - 1;
+			const closeParen = this.findMatchingParen(text, openParen);
+			if (closeParen === -1) {
+				errors.push(`Unclosed bbands call for ${upperVar}.`);
+				continue;
+			}
+
+			const args = this.parseArgs(text.slice(openParen + 1, closeParen));
+			const sourceArg = args[0]?.value ?? '';
+			const source = this.parseSeriesSource(sourceArg, new Set<string>(), valueByName);
+			if (!source) {
+				errors.push(`Unable to resolve bbands source for ${upperVar}.`);
+				continue;
+			}
+
+			const params = this.extractBbandsParams(args.slice(1), valueByName);
+
+			bbands.set(upperVar, { component: 'upper', source, params });
+			bbands.set(middleVar, { component: 'middle', source, params });
+			bbands.set(lowerVar, { component: 'lower', source, params });
+
+			pattern.lastIndex = closeParen + 1;
+		}
+
+		return bbands;
+	}
+
+	private extractBbandsParams(args: ParsedArg[], valueByName: Map<string, unknown>): Record<string, number> {
+		const named = new Map<string, string>();
+		const positional: string[] = [];
+		for (const arg of args) {
+			if (arg.name) {
+				named.set(arg.name, arg.value);
+			} else if (arg.value.trim()) {
+				positional.push(arg.value);
+			}
+		}
+
+		const params: Record<string, number> = {};
+
+		const periodValue = named.get('period') ?? positional[0];
+		if (periodValue) {
+			const period = this.resolveNumericValue(periodValue, valueByName);
+			if (period !== undefined) {
+				params.period = period;
+			}
+		}
+		if (!params.period) {
+			params.period = 20;
+		}
+
+		const stdValue = named.get('std') ?? named.get('std_dev') ?? named.get('num_std') ?? positional[1];
+		if (stdValue) {
+			const std = this.resolveNumericValue(stdValue, valueByName);
+			if (std !== undefined) {
+				params.std = std;
+			}
+		}
+		if (!params.std) {
+			params.std = 2;
+		}
+
+		return params;
+	}
+
+	private computeBbandsComponent(
+		source: number[],
+		params: Record<string, number>,
+		component: 'upper' | 'middle' | 'lower'
+	): number[] {
+		const period = Math.max(1, Math.round(params.period ?? 20));
+		const std = params.std ?? 2;
+
+		const middle = this.computeSma(source, period);
+		if (component === 'middle') {
+			return middle;
+		}
+
+		const result = new Array(source.length).fill(NaN);
+		for (let i = period - 1; i < source.length; i++) {
+			const mean = middle[i];
+			if (!Number.isFinite(mean)) {
+				continue;
+			}
+			let sumSq = 0;
+			for (let j = i - period + 1; j <= i; j++) {
+				const diff = source[j] - mean;
+				sumSq += diff * diff;
+			}
+			const deviation = Math.sqrt(sumSq / period);
+			result[i] = component === 'upper' ? mean + std * deviation : mean - std * deviation;
+		}
+		return result;
+	}
+
 	private parseCrossAssignments(
 		text: string,
-		indicators: Map<string, IndicatorDefinition>,
+		knownSeries: ReadonlySet<string>,
 		valueByName: Map<string, unknown>,
 		errors: string[]
 	): Map<string, CrossDefinition> {
@@ -466,8 +684,8 @@ export class VisualizationRunner {
 			}
 
 			const args = this.parseArgs(text.slice(openParen + 1, closeParen));
-			const left = this.parseSeriesSource(args[0]?.value ?? '', indicators, valueByName);
-			const right = this.parseSeriesSource(args[1]?.value ?? '', indicators, valueByName);
+			const left = this.parseSeriesSource(args[0]?.value ?? '', knownSeries, valueByName);
+			const right = this.parseSeriesSource(args[1]?.value ?? '', knownSeries, valueByName);
 			if (!left || !right) {
 				errors.push(`Unable to resolve cross_${type} inputs for ${varName}.`);
 				continue;
@@ -483,6 +701,16 @@ export class VisualizationRunner {
 	private detectSignalVariables(text: string): { entry?: string; exit?: string } {
 		const callIndex = text.indexOf('ql.signals');
 		if (callIndex === -1) {
+			// Tolerate the `signals.buy(x)` / `signals.sell(y)` shape AI-generated
+			// strategies use (ql.Signals() object style) -- map buy->entry, sell->exit.
+			const buyMatch = /\.buy\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/.exec(text);
+			const sellMatch = /\.sell\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/.exec(text);
+			if (buyMatch || sellMatch) {
+				return {
+					entry: buyMatch?.[1] ?? 'entry',
+					exit: sellMatch?.[1] ?? 'exit'
+				};
+			}
 			return { entry: 'entry', exit: 'exit' };
 		}
 
@@ -573,7 +801,7 @@ export class VisualizationRunner {
 
 	private parseSeriesSource(
 		value: string,
-		indicators: Map<string, IndicatorDefinition>,
+		knownSeries: ReadonlySet<string>,
 		valueByName: Map<string, unknown>
 	): SeriesSource | undefined {
 		const trimmed = value.trim();
@@ -585,7 +813,7 @@ export class VisualizationRunner {
 		if (dataBracket) {
 			return { kind: 'field', field: dataBracket[1] as SeriesField };
 		}
-		if (indicators.has(trimmed)) {
+		if (knownSeries.has(trimmed)) {
 			return { kind: 'series', name: trimmed };
 		}
 		const paramValue = valueByName.get(trimmed);
@@ -852,11 +1080,24 @@ export class VisualizationRunner {
 		if (typeof options.label === 'string' && options.title === undefined) {
 			options.title = options.label;
 		}
+		// `name=` is the label spelling AI-generated strategies tend to use.
+		if (typeof options.name === 'string' && options.title === undefined) {
+			options.title = options.name;
+		}
 		if (options.pane && !options.paneId) {
 			options.paneId = options.pane;
 		}
 		if (options.line_style && !options.lineStyle) {
 			options.lineStyle = options.line_style;
+		}
+		// `style="dashed"|"dotted"|"solid"` is a line style; `style="histogram"` etc.
+		// is consumed by extractSeriesType below.
+		if (typeof options.style === 'string' && !options.lineStyle) {
+			const lowered = options.style.toLowerCase();
+			if (lowered === 'dashed' || lowered === 'dotted' || lowered === 'solid') {
+				options.lineStyle = lowered;
+				delete options.style;
+			}
 		}
 		if (options.linewidth && !options.lineWidth) {
 			options.lineWidth = options.linewidth;
@@ -865,12 +1106,13 @@ export class VisualizationRunner {
 	}
 
 	private extractSeriesType(options: Record<string, unknown>): 'line' | 'histogram' | 'area' {
-		const raw = options.series ?? options.type;
+		const raw = options.series ?? options.type ?? options.style;
 		if (typeof raw === 'string') {
 			const lowered = raw.toLowerCase();
 			if (lowered === 'histogram' || lowered === 'area' || lowered === 'line') {
 				delete options.series;
 				delete options.type;
+				delete options.style;
 				return lowered;
 			}
 		}
@@ -956,7 +1198,7 @@ export class VisualizationRunner {
 				continue;
 			}
 
-			if (char === '"' || char === "'") {
+			if (char === '"' || char === '\'') {
 				inString = true;
 				stringChar = char;
 				current += char;
@@ -1012,7 +1254,7 @@ export class VisualizationRunner {
 			return numeric;
 		}
 
-		if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+		if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith('\'') && trimmed.endsWith('\''))) {
 			return this.unquote(trimmed);
 		}
 
@@ -1049,7 +1291,7 @@ export class VisualizationRunner {
 				continue;
 			}
 
-			if (char === '"' || char === "'") {
+			if (char === '"' || char === '\'') {
 				inString = true;
 				stringChar = char;
 				continue;
@@ -1092,7 +1334,7 @@ export class VisualizationRunner {
 				continue;
 			}
 
-			if (char === '"' || char === "'") {
+			if (char === '"' || char === '\'') {
 				inString = true;
 				stringChar = char;
 				continue;

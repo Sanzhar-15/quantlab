@@ -280,8 +280,9 @@ class Param(Generic[T]):
 
 
 def param(
-    default: T = None,
+    default_or_id: T = None,
     *,
+    default: T = None,
     min: Any = None,
     max: Any = None,
     choices: list[Any] | None = None,
@@ -308,18 +309,31 @@ def param(
     When called from a strategy function (not as class descriptor),
     returns the default value directly for immediate use.
     """
-    # When called with id= keyword, it's being used inside a strategy function
-    # body (e.g., ql.param(id="rsi_period", default=14, ...)).
+    # Resolve the three calling conventions to (id, value):
+    #   1. Engine style:        param(20, min=5, max=100)            -> value=20
+    #   2. UI style:            param(id="x", default=20, ...)       -> id="x", value=20
+    #   3. Id-first positional: param("fast", default=10, ...)       -> id="fast", value=10
+    #      (the shape the IDE's parameter extractor and AI-generated strategies use;
+    #      a genuinely-string default still works because it arrives WITHOUT `default=`)
+    if id is None and isinstance(default_or_id, str) and default is not None:
+        id = default_or_id
+        value = default
+    elif default is not None:
+        value = default
+    else:
+        value = default_or_id
+
+    # When an id is known, it's being used inside a strategy function body.
     # Check for runtime overrides first, then fall back to the default value.
     if id is not None:
         if id in _param_overrides:
             return _param_overrides[id]  # type: ignore
-        return default  # type: ignore
+        return value  # type: ignore
 
     # Otherwise, return a Param descriptor for class-based strategy usage
     # (e.g., lookback = param(20, min=5, max=100))
     return Param(
-        default,
+        value,
         min=min,
         max=max,
         choices=choices,
