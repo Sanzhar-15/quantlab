@@ -30,7 +30,6 @@ let WebSocket: WebSocketConstructor | undefined;
 
 // Try to load ws module dynamically
 try {
-	// eslint-disable-next-line @typescript-eslint/no-require-imports
 	WebSocket = require('ws') as WebSocketConstructor;
 } catch {
 	// ws module not available - WebSocket features will be disabled
@@ -215,7 +214,7 @@ export interface YieldCurveData {
 	data?: Array<{ tenor: string; yield: number }>;
 }
 
-// ─── Calendar interfaces ─────────────────────────────────────────────────────
+// ---- Calendar interfaces ----
 
 export interface CalendarEvent {
 	date?: string;
@@ -279,7 +278,7 @@ export interface CentralBankEvent {
 	[key: string]: unknown;
 }
 
-// ─── Sentiment & News interfaces ─────────────────────────────────────────────
+// ---- Sentiment & News interfaces ----
 
 export interface SentimentData {
 	symbol?: string;
@@ -303,7 +302,7 @@ export interface NewsItem {
 	[key: string]: unknown;
 }
 
-// ─── Fundamentals interfaces ─────────────────────────────────────────────────
+// ---- Fundamentals interfaces ----
 
 export interface FundamentalsProfile {
 	symbol?: string;
@@ -341,7 +340,7 @@ export interface FundamentalsRatios {
 	[key: string]: unknown;
 }
 
-// ─── Institutional interfaces ────────────────────────────────────────────────
+// ---- Institutional interfaces ----
 
 export interface InstitutionalHolding {
 	holder?: string;
@@ -532,7 +531,7 @@ export class ServerApiClient {
 		this._secretStorageDisposable?.dispose();
 		this._secretStorageDisposable = storage.onDidChange(async e => {
 			if (e.key !== 'qic.deltaplusAccessToken') { return; }
-			if (!this.refreshToken) { return; } // not initialized yet — ignore
+			if (!this.refreshToken) { return; } // not initialized yet -- ignore
 			const newAccess = await storage.get('qic.deltaplusAccessToken');
 			if (!newAccess || newAccess === this.accessToken) { return; } // no change
 			const newRefresh = await storage.get('qic.deltaplusRefreshToken');
@@ -555,12 +554,16 @@ export class ServerApiClient {
 				await this.secretStorage.store('qic.deltaplusRefreshToken', this.refreshToken);
 			}
 			await this.secretStorage.store('qic.deltaplusTokenExpiresAt', String(this.tokenExpiresAt));
-		} catch { /* best-effort */ }
+		} catch (err) {
+			// System boundary (OS keychain). Do not swallow: a failed persist means the
+			// session will NOT survive a restart -- say so where the operator can see it.
+			this.log(`Token persistence to SecretStorage FAILED -- sign-in will not survive a restart: ${err instanceof Error ? err.message : String(err)}`);
+		}
 	}
 
 	// Authentication
 
-	/** Sign in with explicit credentials. Both params are required — no demo fallback. */
+	/** Sign in with explicit credentials. Both params are required -- no demo fallback. */
 	async login(email: string, password: string): Promise<AuthResponse> {
 		const response = await this.request<AuthResponse>('POST', '/v1/auth/login', { email, password });
 		this.accessToken = response.access_token;
@@ -578,7 +581,7 @@ export class ServerApiClient {
 	}
 
 	/**
-	 * Register a new user account. Does not set any auth state — the caller
+	 * Register a new user account. Does not set any auth state -- the caller
 	 * must subsequently call login() to obtain tokens.
 	 */
 	async register(email: string, password: string, name: string): Promise<{ message: string }> {
@@ -638,8 +641,8 @@ export class ServerApiClient {
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			if (msg.includes('401') || msg.includes('Unauthorized') || msg.includes('invalid token') || msg.includes('token has expired')) {
-				// Refresh token is expired — session is dead. Clear state and notify.
-				this.log('Refresh token expired — clearing session');
+				// Refresh token is expired -- session is dead. Clear state and notify.
+				this.log('Refresh token expired -- clearing session');
 				this.accessToken = undefined;
 				this.refreshToken = undefined;
 				this.tokenExpiresAt = 0;
@@ -668,7 +671,7 @@ export class ServerApiClient {
 		try {
 			await this.requestOnce<void>('POST', '/v1/auth/logout', { refresh_token: refreshToken });
 		} catch {
-			// Best-effort — local session is cleared regardless.
+			// Best-effort -- local session is cleared regardless.
 		}
 	}
 
@@ -705,7 +708,7 @@ export class ServerApiClient {
 		return this.user;
 	}
 
-	// Token accessors — used by DeltaPlusAuthProvider to sync refreshed tokens back to SecretStorage.
+	// Token accessors -- used by DeltaPlusAuthProvider to sync refreshed tokens back to SecretStorage.
 	getAccessToken(): string | undefined { return this.accessToken; }
 	getRefreshToken(): string | undefined { return this.refreshToken; }
 	getTokenExpiresAt(): number { return this.tokenExpiresAt; }
@@ -759,7 +762,7 @@ export class ServerApiClient {
 	private async ensureAuthenticated(): Promise<void> {
 		if (!this.accessToken) {
 			if (!this.authFlowComplete) {
-				// Startup still in progress — wait up to 5 s for setSessionTokens() to be called.
+				// Startup still in progress -- wait up to 5 s for setSessionTokens() to be called.
 				await Promise.race([
 					this.authReadyPromise,
 					new Promise<void>(r => setTimeout(r, 5000))
@@ -986,9 +989,9 @@ export class ServerApiClient {
 		if (params.limit !== undefined) {
 			query.set('limit', params.limit.toString());
 		}
-		// Note: crypto endpoint ignores from/to params — date-range filtering not supported
+		// Note: crypto endpoint ignores from/to params -- date-range filtering not supported
 
-		interface CryptoRawBar { t: string; o: number; h: number; l: number; c: number; v: number; }
+		interface CryptoRawBar { t: string; o: number; h: number; l: number; c: number; v: number }
 		const response = await this.request<{ bars: CryptoRawBar[] }>('GET', `/v1/crypto/bars/${params.symbol}?${query.toString()}`, undefined, token);
 		const raw = response.bars ?? [];
 
@@ -1243,7 +1246,7 @@ export class ServerApiClient {
 			}, 10000);
 
 			this.ws.on('open', () => {
-				// Send auth message — server validates token and replies with
+				// Send auth message -- server validates token and replies with
 				// {"type":"connected","data":{"authenticated":true,...}}
 				this.ws!.send(JSON.stringify({ type: 'auth', token: this.accessToken }));
 			});
@@ -1388,11 +1391,11 @@ export class ServerApiClient {
 				// If reconnect failed due to auth (session expired), stop retrying.
 				// onAuthStateChange(false) was already fired by refreshAccessToken().
 				if (msg.includes('Not signed in') || msg.includes('session expired') || msg.includes('Refresh token expired')) {
-					this.log('WebSocket reconnect aborted — session expired, user must re-authenticate');
+					this.log('WebSocket reconnect aborted -- session expired, user must re-authenticate');
 					this.wsReconnectAttempts = this.wsMaxReconnectAttempts; // stop loop
 					return;
 				}
-				// Transient error — close handler will schedule the next reconnect
+				// Transient error -- close handler will schedule the next reconnect
 			}
 		}, delay);
 	}
@@ -1413,7 +1416,7 @@ export class ServerApiClient {
 				symbols
 			}));
 		} else if (this.wsConnecting) {
-			// WS is connecting — symbols are tracked in subscribedSymbols
+			// WS is connecting -- symbols are tracked in subscribedSymbols
 			// and will be sent automatically when the connection opens
 			this.log(`Queued ${symbols.length} subscription(s) for pending connection`);
 		}
@@ -1513,7 +1516,7 @@ export class ServerApiClient {
 							if (data) {
 								const parsed = JSON.parse(data);
 								// Server wraps responses in { success: true, data: ... }
-								if (parsed && typeof parsed === 'object' && 'success' in parsed && 'data' in parsed) {
+								if (parsed && typeof parsed === 'object' && Object.prototype.hasOwnProperty.call(parsed, 'success') && Object.prototype.hasOwnProperty.call(parsed, 'data')) {
 									if (parsed.success) {
 										resolve(parsed.data as T);
 									} else {

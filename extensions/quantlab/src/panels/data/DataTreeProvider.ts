@@ -9,7 +9,7 @@ import { ServerApiClient, ServerSymbol, CryptoSymbol, EtfItem, IndexItem } from 
 import { WatchlistManager, Watchlist } from './WatchlistManager';
 import { isServerSource } from '../../types/market';
 
-// ─── Node type union ────────────────────────────────────────────────────────
+// ---- Node type union ----
 
 export type DataNode =
 	| CategoryNode
@@ -110,18 +110,18 @@ export interface PlaceholderNode {
 	collapsibleState: vscode.TreeItemCollapsibleState;
 }
 
-// ─── Category definitions ────────────────────────────────────────────────────
+// ---- Category definitions ----
 
 const CATEGORIES: Array<{ id: AssetCategory; label: string; icon: string }> = [
-	{ id: 'watchlists',   label: 'Watchlists',    icon: 'star'          },
-	{ id: 'equities',     label: 'Equities',       icon: 'graph'         },
-	{ id: 'crypto',       label: 'Crypto',          icon: 'symbol-misc'  },
-	{ id: 'forex',        label: 'Forex',           icon: 'arrow-swap'   },
-	{ id: 'commodities',  label: 'Commodities',     icon: 'package'      },
-	{ id: 'fixedIncome',  label: 'Fixed Income',    icon: 'briefcase'    },
-	{ id: 'macro',        label: 'Macro',           icon: 'globe'        },
-	{ id: 'calendar',     label: 'Calendar',        icon: 'calendar'     },
-	{ id: 'sentiment',    label: 'Sentiment',       icon: 'pulse'        },
+	{ id: 'watchlists', label: 'Watchlists', icon: 'star' },
+	{ id: 'equities', label: 'Equities', icon: 'graph' },
+	{ id: 'crypto', label: 'Crypto', icon: 'symbol-misc' },
+	{ id: 'forex', label: 'Forex', icon: 'arrow-swap' },
+	{ id: 'commodities', label: 'Commodities', icon: 'package' },
+	{ id: 'fixedIncome', label: 'Fixed Income', icon: 'briefcase' },
+	{ id: 'macro', label: 'Macro', icon: 'globe' },
+	{ id: 'calendar', label: 'Calendar', icon: 'calendar' },
+	{ id: 'sentiment', label: 'Sentiment', icon: 'pulse' },
 ];
 
 // Standard GICS-aligned sector display order for equities
@@ -141,7 +141,7 @@ const EQUITY_SECTOR_ORDER = [
 	'Other',
 ];
 
-// ─── Provider ────────────────────────────────────────────────────────────────
+// ---- Provider ----
 
 export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 	private readonly _onDidChangeTreeData = new vscode.EventEmitter<DataNode | void>();
@@ -159,14 +159,17 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 	private cryptoSymbolSet = new Set<string>();
 	private cryptoLoading = false;
 	private cryptoRetryCount = 0;
+	private cryptoError: string | undefined;
 
 	private etfs: EtfItem[] | undefined;
 	private etfsLoading = false;
 	private etfRetryCount = 0;
+	private etfError: string | undefined;
 
 	private indices: IndexItem[] | undefined;
 	private indicesLoading = false;
 	private indexRetryCount = 0;
+	private indexError: string | undefined;
 
 	private retryCount = 0;
 	private readonly maxRetries = 3;
@@ -184,7 +187,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		void this.loadEquitySymbols();
 	}
 
-	// ─── TreeDataProvider interface ───────────────────────────────────────────
+	// ---- TreeDataProvider interface ----
 
 	getTreeItem(element: DataNode): vscode.TreeItem {
 		const item = new vscode.TreeItem(element.label, element.collapsibleState);
@@ -269,7 +272,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		}
 	}
 
-	// ─── Root nodes ───────────────────────────────────────────────────────────
+	// ---- Root nodes ----
 
 	private getRootNodes(): CategoryNode[] {
 		return CATEGORIES.map(c => ({
@@ -282,24 +285,24 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		}));
 	}
 
-	// ─── Category children ────────────────────────────────────────────────────
+	// ---- Category children ----
 
 	private getCategoryChildren(category: AssetCategory): DataNode[] {
 		switch (category) {
-			case 'watchlists':   return this.getWatchlistFolderChildren();
-			case 'equities':     return this.getEquitiesChildren();
-			case 'crypto':       return this.getCryptoChildren();
-			case 'forex':        return this.getForexChildren();
-			case 'commodities':  return this.getCommoditiesChildren();
-			case 'fixedIncome':  return this.getFixedIncomeChildren();
-			case 'macro':        return this.getMacroChildren();
-			case 'calendar':     return this.getCalendarChildren();
-			case 'sentiment':    return this.getSentimentChildren();
-			default:             return [];
+			case 'watchlists': return this.getWatchlistFolderChildren();
+			case 'equities': return this.getEquitiesChildren();
+			case 'crypto': return this.getCryptoChildren();
+			case 'forex': return this.getForexChildren();
+			case 'commodities': return this.getCommoditiesChildren();
+			case 'fixedIncome': return this.getFixedIncomeChildren();
+			case 'macro': return this.getMacroChildren();
+			case 'calendar': return this.getCalendarChildren();
+			case 'sentiment': return this.getSentimentChildren();
+			default: return [];
 		}
 	}
 
-	// ─── Watchlists ───────────────────────────────────────────────────────────
+	// ---- Watchlists ----
 
 	private getWatchlistFolderChildren(): DataNode[] {
 		const watchlists = this.watchlistManager.getWatchlists();
@@ -342,7 +345,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		});
 	}
 
-	// ─── Equities ─────────────────────────────────────────────────────────────
+	// ---- Equities ----
 
 	private getEquitiesChildren(): DataNode[] {
 		return [
@@ -350,7 +353,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 				{ command: 'quantlab.openMarketOverview', title: 'Market Overview' }),
 			this.subCategory('equities.sectors', 'By Sector', 'folder', undefined, undefined,
 				this.equityLoading ? 'loading...' : this.equityError ? 'error' :
-				this.equitySymbols ? `${this.equitySymbols.length} symbols` : undefined),
+					this.equitySymbols ? `${this.equitySymbols.length} symbols` : undefined),
 			this.subCategory('equities.etfs', 'ETFs', 'file', undefined, undefined,
 				this.etfs ? `${this.etfs.length}` : undefined),
 			this.subCategory('equities.indices', 'Indices', 'list-tree'),
@@ -361,7 +364,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		];
 	}
 
-	// ─── Crypto ───────────────────────────────────────────────────────────────
+	// ---- Crypto ----
 
 	private getCryptoChildren(): DataNode[] {
 		return [
@@ -378,7 +381,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		];
 	}
 
-	// ─── Forex ────────────────────────────────────────────────────────────────
+	// ---- Forex ----
 
 	private getForexChildren(): DataNode[] {
 		return [
@@ -395,7 +398,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		];
 	}
 
-	// ─── Commodities ──────────────────────────────────────────────────────────
+	// ---- Commodities ----
 
 	private getCommoditiesChildren(): DataNode[] {
 		return [
@@ -412,7 +415,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		];
 	}
 
-	// ─── Fixed Income ─────────────────────────────────────────────────────────
+	// ---- Fixed Income ----
 
 	private getFixedIncomeChildren(): DataNode[] {
 		return [
@@ -429,7 +432,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		];
 	}
 
-	// ─── Macro ────────────────────────────────────────────────────────────────
+	// ---- Macro ----
 
 	private getMacroChildren(): DataNode[] {
 		return [
@@ -450,7 +453,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		];
 	}
 
-	// ─── Calendar ─────────────────────────────────────────────────────────────
+	// ---- Calendar ----
 
 	private getCalendarChildren(): DataNode[] {
 		return [
@@ -469,7 +472,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		];
 	}
 
-	// ─── Sentiment ────────────────────────────────────────────────────────────
+	// ---- Sentiment ----
 
 	private getSentimentChildren(): DataNode[] {
 		return [
@@ -486,7 +489,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		];
 	}
 
-	// ─── SubCategory children (lazy data loads) ───────────────────────────────
+	// ---- SubCategory children (lazy data loads) ----
 
 	private getSubCategoryChildren(subKey: string): DataNode[] | Thenable<DataNode[]> {
 		switch (subKey) {
@@ -540,7 +543,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		}
 	}
 
-	// ─── Equity sector nodes (lazy) ───────────────────────────────────────────
+	// ---- Equity sector nodes (lazy) ----
 
 	private async getEquitySectorsNodes(): Promise<DataNode[]> {
 		if (!this.equitySymbols) {
@@ -617,7 +620,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		};
 	}
 
-	// ─── ETF nodes (lazy) ────────────────────────────────────────────────────
+	// ---- ETF nodes (lazy) ----
 
 	private async getEtfNodes(): Promise<DataNode[]> {
 		if (!this.etfs) {
@@ -627,6 +630,9 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			return [this.placeholder('equities.etfs.loading', 'Loading ETFs...')];
 		}
 		if (!this.etfs.length) {
+			if (this.etfError) {
+				return [this.placeholder('equities.etfs.error', `Failed to load: ${this.etfError}`)];
+			}
 			return [this.placeholder('equities.etfs.empty', 'No ETFs available')];
 		}
 		return this.etfs.map(etf => ({
@@ -645,7 +651,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		} satisfies InstrumentNode));
 	}
 
-	// ─── Index nodes (lazy) ──────────────────────────────────────────────────
+	// ---- Index nodes (lazy) ----
 
 	private async getIndexNodes(): Promise<DataNode[]> {
 		if (!this.indices) {
@@ -655,6 +661,9 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			return [this.placeholder('equities.indices.loading', 'Loading indices...')];
 		}
 		if (!this.indices.length) {
+			if (this.indexError) {
+				return [this.placeholder('equities.indices.error', `Failed to load: ${this.indexError}`)];
+			}
 			return [this.placeholder('equities.indices.empty', 'No indices available')];
 		}
 		return this.indices.map(idx => {
@@ -676,7 +685,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		});
 	}
 
-	// ─── Crypto spot nodes (lazy) ─────────────────────────────────────────────
+	// ---- Crypto spot nodes (lazy) ----
 
 	private async getCryptoSpotNodes(): Promise<DataNode[]> {
 		if (!this.cryptoSymbols) {
@@ -686,6 +695,9 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			return [this.placeholder('crypto.spot.loading', 'Loading crypto pairs...')];
 		}
 		if (!this.cryptoSymbols.length) {
+			if (this.cryptoError) {
+				return [this.placeholder('crypto.spot.error', `Failed to load: ${this.cryptoError}`)];
+			}
 			return [this.placeholder('crypto.spot.empty', 'No crypto symbols available')];
 		}
 
@@ -750,20 +762,20 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		};
 	}
 
-	// ─── Crypto symbol detection ──────────────────────────────────────────────
+	// ---- Crypto symbol detection ----
 
 	private isCryptoSymbol(symbol: string): boolean {
 		if (this.cryptoSymbolSet.size > 0) {
 			return this.cryptoSymbolSet.has(symbol);
 		}
-		// Lazy load not yet complete — use underscore heuristic (crypto symbols use BTC_USDT format)
+		// Lazy load not yet complete -- use underscore heuristic (crypto symbols use BTC_USDT format)
 		if (!this.cryptoLoading) {
 			void this.loadCryptoSymbols();
 		}
 		return symbol.includes('_');
 	}
 
-	// ─── Coming soon / stub nodes ─────────────────────────────────────────────
+	// ---- Coming soon / stub nodes ----
 
 	private getComingSoonNodes(key: string): DataNode[] {
 		const messages: Record<string, string> = {
@@ -800,7 +812,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		return [this.placeholder(`${key}.soon`, msg, undefined, 'Expanding data coverage')];
 	}
 
-	// ─── Data loaders ─────────────────────────────────────────────────────────
+	// ---- Data loaders ----
 
 	private async loadEquitySymbols(): Promise<void> {
 		if (this.disposed || this.equityLoading) { return; }
@@ -837,7 +849,9 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			this.cryptoSymbols = await client.getCryptoSymbols();
 			this.cryptoSymbolSet = new Set(this.cryptoSymbols.map(s => s.symbol));
 			this.cryptoRetryCount = 0;
-		} catch {
+			this.cryptoError = undefined;
+		} catch (err) {
+			this.cryptoError = err instanceof Error ? err.message : String(err);
 			this.cryptoSymbols = [];
 			if (this.cryptoRetryCount < this.maxRetries) {
 				this.cryptoRetryCount++;
@@ -860,7 +874,9 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			const client = ServerApiClient.getInstance();
 			this.etfs = await client.getEtfs();
 			this.etfRetryCount = 0;
-		} catch {
+			this.etfError = undefined;
+		} catch (err) {
+			this.etfError = err instanceof Error ? err.message : String(err);
 			this.etfs = [];
 			if (this.etfRetryCount < this.maxRetries) {
 				this.etfRetryCount++;
@@ -883,7 +899,9 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			const client = ServerApiClient.getInstance();
 			this.indices = await client.getGlobalIndices();
 			this.indexRetryCount = 0;
-		} catch {
+			this.indexError = undefined;
+		} catch (err) {
+			this.indexError = err instanceof Error ? err.message : String(err);
 			this.indices = [];
 			if (this.indexRetryCount < this.maxRetries) {
 				this.indexRetryCount++;
@@ -899,7 +917,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		}
 	}
 
-	// ─── Helpers ──────────────────────────────────────────────────────────────
+	// ---- Helpers ----
 
 	private subCategory(
 		subKey: string,
@@ -934,7 +952,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		};
 	}
 
-	// ─── Public methods ───────────────────────────────────────────────────────
+	// ---- Public methods ----
 
 	refresh(): void {
 		if (!this.disposed) {

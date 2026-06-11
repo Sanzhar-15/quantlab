@@ -190,7 +190,7 @@ export class DataService {
 		const client = ServerApiClient.getInstance();
 		const batchSize = 500;
 
-		// Crypto endpoint ignores from/to date params — single fetch only
+		// Crypto endpoint ignores from/to date params -- single fetch only
 		if (assetClass?.toLowerCase() === 'crypto') {
 			const bars = await client.getBars(
 				{ symbol, timeframe, limit: Math.min(maxBars, 1000), assetClass },
@@ -203,6 +203,15 @@ export class DataService {
 		const seenTimestamps = new Set<string>(); // Detect duplicates
 		let from = range?.start ? Date.parse(range.start) : undefined;
 		let to = range?.end ? Date.parse(range.end) : undefined;
+
+		// The server requires an explicit window: a request without from/to returns ZERO
+		// bars (verified against the live /v1/bars handler, 2026-06-11) -- it does NOT
+		// default to "latest N". Callers that pass no range (e.g. ServerDataCache) would
+		// silently get an empty chart, so default to the trailing 5 years here.
+		if (from === undefined && to === undefined) {
+			to = Date.now();
+			from = to - 5 * 365 * 24 * 60 * 60 * 1000;
+		}
 
 		// Fetch in batches until we have enough or reach limit
 		while (result.length < maxBars) {
