@@ -32,6 +32,12 @@ export class WatchlistManager {
 		this.watchlists = this.restore();
 		// Sync with server on initialization (non-blocking)
 		void this.syncFromServer();
+		// Re-sync when the user signs in (the startup sync fails while signed out).
+		ServerApiClient.getInstance().onAuthStateChange(signedIn => {
+			if (signedIn) {
+				void this.syncFromServer();
+			}
+		});
 	}
 
 	getWatchlists(): Watchlist[] {
@@ -179,7 +185,7 @@ export class WatchlistManager {
 
 			// Check if local changes occurred during fetch
 			if (this.localVersion !== versionBeforeSync) {
-				// Local changes happened during sync — schedule deferred re-sync
+				// Local changes happened during sync -- schedule deferred re-sync
 				setTimeout(() => void this.syncFromServer(), 2000);
 				return;
 			}
@@ -301,7 +307,7 @@ export class WatchlistManager {
 			const client = ServerApiClient.getInstance();
 			let hasChanges = false;
 
-			// Snapshot version before async work — used to detect concurrent user edits
+			// Snapshot version before async work -- used to detect concurrent user edits
 			const versionAtStart = this.localVersion;
 
 			// Process each local watchlist (create new array to avoid mutation)

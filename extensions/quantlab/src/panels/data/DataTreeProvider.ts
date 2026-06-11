@@ -182,8 +182,32 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		this.disposables.push(
 			this.watchlistManager.onDidChange(() => this.refresh()),
 			this.globalState.onDidChangeDataSource(() => this.refresh()),
+			// Sign-in/out must re-drive the tree: before this, a tree loaded while
+			// signed out kept its "Not signed in" failures forever after sign-in.
+			ServerApiClient.getInstance().onAuthStateChange(() => {
+				this.resetServerCaches();
+				this.refresh();
+			}),
 		);
 		// Pre-load equity symbols (most common access pattern)
+		void this.loadEquitySymbols();
+	}
+
+	/** Drops all server-derived caches/errors so lazy loaders re-fetch with the new auth state. */
+	private resetServerCaches(): void {
+		this.equitySymbols = undefined;
+		this.equityError = undefined;
+		this.retryCount = 0;
+		this.cryptoSymbols = undefined;
+		this.cryptoSymbolSet = new Set();
+		this.cryptoError = undefined;
+		this.cryptoRetryCount = 0;
+		this.etfs = undefined;
+		this.etfError = undefined;
+		this.etfRetryCount = 0;
+		this.indices = undefined;
+		this.indexError = undefined;
+		this.indexRetryCount = 0;
 		void this.loadEquitySymbols();
 	}
 
@@ -553,6 +577,9 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			return [this.placeholder('equities.sectors.loading', 'Loading symbols...')];
 		}
 		if (this.equityError) {
+			if (/not signed in/i.test(this.equityError)) {
+				return [this.errorPlaceholder('equities.sectors.error', this.equityError)];
+			}
 			return [this.placeholder('equities.sectors.error',
 				`Failed to load: ${this.equityError}`,
 				{ command: 'quantlab.reloadServerSymbols', title: 'Retry' })];
@@ -631,7 +658,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		}
 		if (!this.etfs.length) {
 			if (this.etfError) {
-				return [this.placeholder('equities.etfs.error', `Failed to load: ${this.etfError}`)];
+				return [this.errorPlaceholder('equities.etfs.error', this.etfError)];
 			}
 			return [this.placeholder('equities.etfs.empty', 'No ETFs available')];
 		}
@@ -662,7 +689,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		}
 		if (!this.indices.length) {
 			if (this.indexError) {
-				return [this.placeholder('equities.indices.error', `Failed to load: ${this.indexError}`)];
+				return [this.errorPlaceholder('equities.indices.error', this.indexError)];
 			}
 			return [this.placeholder('equities.indices.empty', 'No indices available')];
 		}
@@ -696,7 +723,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		}
 		if (!this.cryptoSymbols.length) {
 			if (this.cryptoError) {
-				return [this.placeholder('crypto.spot.error', `Failed to load: ${this.cryptoError}`)];
+				return [this.errorPlaceholder('crypto.spot.error', this.cryptoError)];
 			}
 			return [this.placeholder('crypto.spot.empty', 'No crypto symbols available')];
 		}
@@ -939,6 +966,18 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			badge,
 			collapsibleState: command ? vscode.TreeItemCollapsibleState.None : collapsibleState,
 		};
+	}
+
+	/**
+	 * Error placeholder for server-backed nodes. A signed-out failure becomes an
+	 * actionable "Sign in" entry instead of a cryptic error string.
+	 */
+	private errorPlaceholder(id: string, error: string): PlaceholderNode {
+		if (/not signed in/i.test(error)) {
+			return this.placeholder(id, 'Sign in to Delta Plus to load live data',
+				{ command: 'quantlab.signIn', title: 'Sign In' });
+		}
+		return this.placeholder(id, `Failed to load: ${error}`);
 	}
 
 	private placeholder(id: string, label: string, command?: vscode.Command, description?: string): PlaceholderNode {

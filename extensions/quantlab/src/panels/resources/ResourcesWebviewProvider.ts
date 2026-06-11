@@ -1,25 +1,25 @@
 /*---------------------------------------------------------------------------------------------
- *  Resources Panel WebviewViewProvider
- *  Renders ~566 quantitative analysis tools from server catalog with search,
- *  tier toggles, implementation status, and collapse persistence.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
 import { getWebviewUri, getNonce } from '../../utils/webview';
 import { ResourcesCatalogService } from './ResourcesCatalogService';
+import { ServerApiClient } from '../../core/server/ServerApiClient';
 import { ClientSection } from '../../types/resources';
 
 export type ResourcesSection = ClientSection;
 
 interface ResourcesMessage {
 	type:
-		| 'ready'
-		| 'sectionChange'
-		| 'toolClick'
-		| 'workflowClick'
-		| 'crossRefClick'
-		| 'toggleImplementedFilter'
-		| 'requestCatalog';
+	| 'ready'
+	| 'sectionChange'
+	| 'toolClick'
+	| 'workflowClick'
+	| 'crossRefClick'
+	| 'toggleImplementedFilter'
+	| 'requestCatalog';
 	section?: ResourcesSection;
 	toolId?: string;
 	workflowId?: string;
@@ -38,7 +38,17 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 	private constructor(
 		private readonly extensionUri: vscode.Uri,
 		private readonly catalogService: ResourcesCatalogService,
-	) {}
+	) {
+		// Sign-in must replace the offline-only catalog with the live one (and
+		// sign-out must drop back) without requiring a panel reopen.
+		ServerApiClient.getInstance().onAuthStateChange(() => {
+			void this.catalogService.getCatalog(true).then(() => {
+				if (this.view) {
+					void this.sendCatalog();
+				}
+			});
+		});
+	}
 
 	static getInstance(): ResourcesWebviewProvider {
 		if (!ResourcesWebviewProvider.instance) {
@@ -93,7 +103,7 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	// ── Message handling ──────────────────────────────────────────────────────
+	// ---- Message handling ----
 
 	private async handleMessage(message: ResourcesMessage): Promise<void> {
 		switch (message.type) {
@@ -177,7 +187,7 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	// ── Tool click routing ────────────────────────────────────────────────────
+	// ---- Tool click routing ----
 
 	private async handleToolClick(serverToolId: string): Promise<void> {
 		const tool = this.catalogService.getToolById(serverToolId);
@@ -196,14 +206,14 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 		const section = this.catalogService.getSectionForTool(serverToolId);
 
 		if (section === 'stats') {
-			// Pass server canonical ID — StatsViewProvider handles mapping
+			// Pass server canonical ID -- StatsViewProvider handles mapping
 			void vscode.commands.executeCommand('quantlab.openStatsTest', serverToolId);
 		} else if (section === 'strategy') {
 			void vscode.commands.executeCommand('quantlab.action.openResource', serverToolId);
 		}
 	}
 
-	// ── Workflow click ────────────────────────────────────────────────────────
+	// ---- Workflow click ----
 
 	private async handleWorkflowClick(workflowId: string): Promise<void> {
 		const catalog = await this.catalogService.getCatalog();
@@ -219,7 +229,7 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 
 		if (implementedSteps.length === 0) {
 			void vscode.window.showInformationMessage(
-				`Workflow "${workflow.label}" — all ${workflow.steps.length} steps are planned for future release.`,
+				`Workflow "${workflow.label}" -- all ${workflow.steps.length} steps are planned for future release.`,
 			);
 			return;
 		}
@@ -237,7 +247,7 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	// ── Cross-reference navigation ────────────────────────────────────────────
+	// ---- Cross-reference navigation ----
 
 	private handleCrossRefClick(targetToolId: string): void {
 		const targetCat = this.catalogService.getCategoryForTool(targetToolId);
@@ -255,7 +265,7 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 		});
 	}
 
-	// ── Public API ────────────────────────────────────────────────────────────
+	// ---- Public API ----
 
 	setSection(section: ResourcesSection): void {
 		this.currentSection = section;
@@ -282,7 +292,7 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	// ── HTML ──────────────────────────────────────────────────────────────────
+	// ---- HTML ----
 
 	private getHtmlForWebview(webview: vscode.Webview): string {
 		const scriptUri = getWebviewUri(webview, this.extensionUri, [
@@ -300,16 +310,16 @@ export class ResourcesWebviewProvider implements vscode.WebviewViewProvider {
 		return `<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; font-src ${webview.cspSource};">
-    <link href="${codiconsUri}" rel="stylesheet">
-    <link href="${styleUri}" rel="stylesheet">
-    <title>Resources</title>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; font-src ${webview.cspSource};">
+	<link href="${codiconsUri}" rel="stylesheet">
+	<link href="${styleUri}" rel="stylesheet">
+	<title>Resources</title>
 </head>
 <body>
-    <div id="resources-root"></div>
-    <script nonce="${nonce}" src="${scriptUri}"></script>
+	<div id="resources-root"></div>
+	<script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
 	}
