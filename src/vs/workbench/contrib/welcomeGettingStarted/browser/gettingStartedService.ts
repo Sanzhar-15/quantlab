@@ -18,7 +18,6 @@ import { joinPath } from '../../../../base/common/resources.js';
 import { FileAccess } from '../../../../base/common/network.js';
 import { EXTENSION_INSTALL_DEP_PACK_CONTEXT, EXTENSION_INSTALL_SKIP_WALKTHROUGH_CONTEXT, IExtensionManagementService } from '../../../../platform/extensionManagement/common/extensionManagement.js';
 import { ThemeIcon } from '../../../../base/common/themables.js';
-import { walkthroughs } from '../common/gettingStartedContent.js';
 import { IWorkbenchAssignmentService } from '../../../services/assignment/common/assignmentService.js';
 import { IHostService } from '../../../services/host/browser/host.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
@@ -28,7 +27,7 @@ import { InstantiationType, registerSingleton } from '../../../../platform/insta
 import { dirname } from '../../../../base/common/path.js';
 import { coalesce } from '../../../../base/common/arrays.js';
 import { IViewsService } from '../../../services/views/common/viewsService.js';
-import { localize, localize2 } from '../../../../nls.js';
+import { localize2 } from '../../../../nls.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
 import { checkGlobFileExists } from '../../../services/extensions/common/workspaceContains.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
@@ -47,8 +46,6 @@ export const hiddenEntriesConfigurationKey = 'workbench.welcomePage.hiddenCatego
 
 export const walkthroughMetadataConfigurationKey = 'workbench.welcomePage.walkthroughMetadata';
 export type WalkthroughMetaDataType = Map<string, { firstSeen: number; stepIDs: string[]; manaullyOpened: boolean }>;
-
-const BUILT_IN_SOURCE = localize('builtin', "Built-In");
 
 export interface IWalkthrough {
 	id: string;
@@ -181,53 +178,9 @@ export class WalkthroughsService extends Disposable implements IWalkthroughsServ
 
 	private registerWalkthroughs() {
 
-		walkthroughs.forEach(async (category, index) => {
-
-			this._registerWalkthrough({
-				...category,
-				icon: { type: 'icon', icon: category.icon },
-				order: walkthroughs.length - index,
-				source: BUILT_IN_SOURCE,
-				when: ContextKeyExpr.deserialize(category.when) ?? ContextKeyExpr.true(),
-				steps:
-					category.content.steps.map((step, index) => {
-						return ({
-							...step,
-							completionEvents: step.completionEvents ?? [],
-							description: parseDescription(step.description),
-							category: category.id,
-							order: index,
-							when: ContextKeyExpr.deserialize(step.when) ?? ContextKeyExpr.true(),
-							media: step.media.type === 'image'
-								? {
-									type: 'image',
-									altText: step.media.altText,
-									path: convertInternalMediaPathsToBrowserURIs(step.media.path)
-								}
-								: step.media.type === 'svg'
-									? {
-										type: 'svg',
-										altText: step.media.altText,
-										path: convertInternalMediaPathToFileURI(step.media.path).with({ query: JSON.stringify({ moduleId: 'vs/workbench/contrib/welcomeGettingStarted/common/media/' + step.media.path }) })
-									}
-									: step.media.type === 'markdown'
-										? {
-											type: 'markdown',
-											path: convertInternalMediaPathToFileURI(step.media.path).with({ query: JSON.stringify({ moduleId: 'vs/workbench/contrib/welcomeGettingStarted/common/media/' + step.media.path }) }),
-											base: FileAccess.asFileUri('vs/workbench/contrib/welcomeGettingStarted/common/media/'),
-											root: FileAccess.asFileUri('vs/workbench/contrib/welcomeGettingStarted/common/media/'),
-										}
-										: {
-											type: 'video',
-											path: convertRelativeMediaPathsToWebviewURIs(FileAccess.asFileUri('vs/workbench/contrib/welcomeGettingStarted/common/media/'), step.media.path),
-											altText: step.media.altText,
-											root: FileAccess.asFileUri('vs/workbench/contrib/welcomeGettingStarted/common/media/'),
-											poster: step.media.poster ? convertRelativeMediaPathsToWebviewURIs(FileAccess.asFileUri('vs/workbench/contrib/welcomeGettingStarted/common/media/'), step.media.poster) : undefined
-										},
-						});
-					})
-			});
-		});
+		// Quantlab: the stock VS Code built-in walkthroughs (Setup, SetupWeb,
+		// SetupAccessibility, Beginner, notebooks) are not registered -- their content
+		// is VS Code-branded. Extension-contributed walkthroughs below still work.
 
 		walkthroughsExtensionPoint.setHandler((_, { added, removed }) => {
 			added.map(e => this.registerExtensionWalkthroughContributions(e.description));
@@ -688,22 +641,8 @@ export const convertInternalMediaPathToFileURI = (path: string) => path.startsWi
 	? URI.parse(path, true)
 	: FileAccess.asFileUri(`vs/workbench/contrib/welcomeGettingStarted/common/media/${path}`);
 
-const convertInternalMediaPathToBrowserURI = (path: string) => path.startsWith('https://')
-	? URI.parse(path, true)
-	: FileAccess.asBrowserUri(`vs/workbench/contrib/welcomeGettingStarted/common/media/${path}`);
-const convertInternalMediaPathsToBrowserURIs = (path: string | { hc: string; hcLight?: string; dark: string; light: string }): { hcDark: URI; hcLight: URI; dark: URI; light: URI } => {
-	if (typeof path === 'string') {
-		const converted = convertInternalMediaPathToBrowserURI(path);
-		return { hcDark: converted, hcLight: converted, dark: converted, light: converted };
-	} else {
-		return {
-			hcDark: convertInternalMediaPathToBrowserURI(path.hc),
-			hcLight: convertInternalMediaPathToBrowserURI(path.hcLight ?? path.light),
-			light: convertInternalMediaPathToBrowserURI(path.light),
-			dark: convertInternalMediaPathToBrowserURI(path.dark)
-		};
-	}
-};
+// Quantlab: convertInternalMediaPathToBrowserURI / convertInternalMediaPathsToBrowserURIs
+// were removed with the built-in walkthrough registration (their only consumer).
 
 const convertRelativeMediaPathsToWebviewURIs = (basePath: URI, path: string | { hc: string; hcLight?: string; dark: string; light: string }): { hcDark: URI; hcLight: URI; dark: URI; light: URI } => {
 	const convertPath = (path: string) => path.startsWith('https://')

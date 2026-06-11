@@ -215,7 +215,7 @@ import './contrib/chat/browser/contextContrib/chatContext.contribution.js';
 // QIC - Quantlab Intelligence Console
 import './contrib/qic/browser/qic.contribution.js';
 
-// QuantLab Auth Gate — full-screen login overlay shown before the workbench when unauthenticated
+// QuantLab Auth Gate -- full-screen login overlay shown before the workbench when unauthenticated
 import './contrib/qic/browser/authGate.js';
 
 // Interactive
@@ -356,7 +356,9 @@ import './contrib/surveys/browser/languageSurveys.contribution.js';
 
 // Welcome
 import './contrib/welcomeGettingStarted/browser/gettingStarted.contribution.js';
-import './contrib/welcomeWalkthrough/browser/walkThrough.contribution.js';
+// Quantlab: the stock VS Code "Interactive Editor Playground" walkthrough is disabled
+// (its embedded tutorial content is VS Code-branded).
+// import './contrib/welcomeWalkthrough/browser/walkThrough.contribution.js';
 import './contrib/welcomeViews/common/viewsWelcome.contribution.js';
 import './contrib/welcomeViews/common/newFile.contribution.js';
 

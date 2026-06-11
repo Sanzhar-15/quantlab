@@ -1,10 +1,10 @@
 # Quantlab
 
-A powerful code editor and development platform built on the foundation of VS Code.
+The IDE for quantitative finance — a full-featured code editor and development platform with live market data, a reactive spreadsheet (Quantbook), charting, and visualisation.
 
 ## The Repository
 
-This repository contains the source code for Quantlab. It is based on VS Code's open-source foundation with customizations for quantitative development workflows.
+This repository contains the source code for Quantlab, built on proven open-source editor technology with deep customizations for quantitative development workflows.
 
 ## Features
 
@@ -53,7 +53,7 @@ npm run gulp vscode-linux-x64-min
 For consistent development environments, use the included Dev Container configuration:
 
 ```bash
-# Open in VS Code with Dev Containers extension
+# Open in an editor with Dev Containers support
 code --new-window .
 # Then: "Dev Containers: Reopen in Container"
 ```
