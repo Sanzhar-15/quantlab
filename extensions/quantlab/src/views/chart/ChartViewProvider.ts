@@ -80,6 +80,10 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 	private readonly visualizationDetector = VisualizationDetector.getInstance();
 	private readonly complexityAnalyzer = ComplexityAnalyzer.getInstance();
+
+	// Last visualization issues notified per session key. Visualization re-runs on every
+	// parameter tweak/refresh, so identical issues must not re-toast each run.
+	private readonly lastNotifiedVizIssues = new Map<string, string>();
 	private readonly dataService = DataService.getInstance();
 	private readonly visualizationRunner = VisualizationRunner.getInstance();
 	private readonly chartStateStore = ChartStateStore.getInstance();
@@ -264,6 +268,7 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		this.dataCache.delete(session.key);
 		this.dataCacheAccessTimes.delete(session.key);
 		this.bannerState.delete(session.key);
+		this.lastNotifiedVizIssues.delete(session.key);
 		this.liveSessions.delete(session.key);
 
 		const uriKey = session.document.uri.toString();
@@ -292,7 +297,7 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				session.webview.markReady();
 				await this.initializeSession(session);
 				return;
-			case 'parameterChange':
+			case 'parameterChange': {
 				this.chartStateStore.setOverride(this.getSessionKey(session), payload.id, payload.value);
 				const overrides = this.chartStateStore.getOverrides(this.getSessionKey(session));
 				session.webview.postMessage({ type: 'setOverrides', overrides });
@@ -302,6 +307,7 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				FeatureDiscovery.getInstance().notifyParameterEdit();
 				session.visualizationDebounced();
 				return;
+			}
 			case 'resetDefaults':
 				this.resetOverrides(session);
 				session.visualizationDebounced();
@@ -335,7 +341,7 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				vscode.commands.executeCommand('workbench.action.toggleZenMode');
 				return;
 			case 'selectTool':
-				// Drawing tools not yet wired — reserved for future use
+				// Drawing tools not yet wired -- reserved for future use
 				return;
 			case 'toggleParameters':
 				this.setPanelCollapsed(session, payload.collapsed);
@@ -574,19 +580,22 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			});
 
 			if (result.errors.length && viz.hasVisualization && result.commands.length === 0) {
-				// No commands at all — show blocking error overlay
+				// No commands at all -- keep the in-place empty-state overlay AND raise a
+				// standard notification (errors surface bottom-right, not as chart chrome).
 				session.webview.postMessage({
 					type: 'showError',
 					message: 'Visualization failed to render.',
 					detail: result.errors.join('\n'),
 					actions: ['editVisualization']
 				});
+				this.notifyVisualizationIssues(session, result.errors, 'error');
 			} else if (result.errors.length && viz.hasVisualization) {
-				// Commands produced but with warnings — show non-blocking banner
+				// Commands produced but with warnings -- standard notification, no chart banner.
 				session.webview.postMessage({ type: 'showError', message: '' });
-				this.setBanner(session, 'data', result.errors.join(' '), 'warning');
+				this.notifyVisualizationIssues(session, result.errors, 'warning');
 			} else {
 				session.webview.postMessage({ type: 'showError', message: '' });
+				this.lastNotifiedVizIssues.delete(session.key);
 			}
 		} catch (error) {
 			// Check if session is still active before showing error
@@ -602,6 +611,28 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				detail,
 				actions: ['editVisualization']
 			});
+			this.notifyVisualizationIssues(session, [detail], 'error');
+		}
+	}
+
+	/**
+	 * Surfaces visualization issues as standard VS Code notifications (bottom-right)
+	 * instead of in-chart chrome. Deduplicated per session: visualize() re-runs on every
+	 * parameter change, and an unchanged issue list must not toast again.
+	 */
+	private notifyVisualizationIssues(session: ChartSession, issues: string[], severity: 'warning' | 'error'): void {
+		const joined = issues.join(' ');
+		if (this.lastNotifiedVizIssues.get(session.key) === joined) {
+			return;
+		}
+		this.lastNotifiedVizIssues.set(session.key, joined);
+
+		const fileName = path.basename(session.document.uri.fsPath);
+		const message = `${fileName} visualization: ${joined}`;
+		if (severity === 'error') {
+			void vscode.window.showErrorMessage(message);
+		} else {
+			void vscode.window.showWarningMessage(message);
 		}
 	}
 
@@ -857,7 +888,7 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				};
 
 				// Guard: check the live binding is still active (this is the invariant,
-				// not this.sessions — if the live binding was removed by disposeSession,
+				// not this.sessions -- if the live binding was removed by disposeSession,
 				// the session no longer participates in fill routing)
 				if (!this.liveSessions.has(key)) {
 					continue;
@@ -1119,9 +1150,9 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		return undefined;
 	}
 
-	// ─────────────────────────────────────────────────────────────────────────
+	// ----
 	// LRU Cache Management (prevent unbounded growth)
-	// ─────────────────────────────────────────────────────────────────────────
+	// ----
 
 	/**
 	 * Set data in cache with LRU eviction
