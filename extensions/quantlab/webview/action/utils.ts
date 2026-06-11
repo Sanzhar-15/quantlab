@@ -60,11 +60,14 @@ export function formatRelativeTime(value?: string | number | Date): string {
 	const diffHours = Math.floor(diffMs / 3600000);
 	const diffDays = Math.floor(diffMs / 86400000);
 
+	if (diffMins < 1) {
+		return 'Just now';
+	}
 	if (diffMins < 60) {
 		return `${diffMins} min ago`;
 	}
 	if (diffHours < 24) {
-		return `${diffHours} hours ago`;
+		return diffHours === 1 ? '1 hour ago' : `${diffHours} hours ago`;
 	}
 	if (diffDays === 1) {
 		return 'Yesterday';

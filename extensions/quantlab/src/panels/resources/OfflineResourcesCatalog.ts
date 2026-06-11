@@ -1,13 +1,16 @@
 /*---------------------------------------------------------------------------------------------
- *  Offline Resources Catalog
- *  Hardcoded resources that work without the Delta Plus Server.
- *  2 statistics + 2 strategy resources.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+// Offline Resources Catalog
+// Hardcoded resources that work without the Delta Plus Server.
+// 2 statistics + 2 strategy resources.
 
 import { ResourceCategory } from '../../types/resources';
 import { ConfigSchema, ResourceMeta } from '../../types/action';
 
-// ── Statistics section ───────────────────────────────────────────────────────
+// -- Statistics section -------------------------------------------------------
 
 export const OFFLINE_STATISTICS: ResourceCategory[] = [
 	{
@@ -21,7 +24,7 @@ export const OFFLINE_STATISTICS: ResourceCategory[] = [
 			{
 				id: 'offline-stationarity',
 				label: 'Stationarity Test',
-				description: 'Test for unit root using ADF, KPSS, or Phillips-Perron',
+				description: 'Test for unit root using ADF, KPSS, or ADF (t-stat autolag)',
 				tier: 'essential',
 				implemented: true,
 				cross_ref: null,
@@ -48,7 +51,7 @@ export const OFFLINE_STATISTICS: ResourceCategory[] = [
 	},
 ];
 
-// ── Strategy section ─────────────────────────────────────────────────────────
+// -- Strategy section ---------------------------------------------------------
 
 export const OFFLINE_STRATEGY: ResourceCategory[] = [
 	{
@@ -89,7 +92,7 @@ export const OFFLINE_STRATEGY: ResourceCategory[] = [
 	},
 ];
 
-// ── Schemas ──────────────────────────────────────────────────────────────────
+// -- Schemas ------------------------------------------------------------------
 
 export function getOfflineResourceSchema(resourceId: string): ConfigSchema | null {
 	switch (resourceId) {
@@ -115,7 +118,7 @@ export function getOfflineResourceSchema(resourceId: string): ConfigSchema | nul
 								options: [
 									{ label: 'ADF (Augmented Dickey-Fuller)', value: 'adf' },
 									{ label: 'KPSS', value: 'kpss' },
-									{ label: 'Phillips-Perron', value: 'pp' },
+									{ label: 'ADF (t-stat autolag)', value: 'pp' },
 								],
 								description: 'ADF/PP test H0: unit root exists. KPSS test H0: series is stationary.',
 							},
@@ -130,6 +133,7 @@ export function getOfflineResourceSchema(resourceId: string): ConfigSchema | nul
 								options: [
 									{ label: 'Constant (c)', value: 'c' },
 									{ label: 'Constant + Trend (ct)', value: 'ct' },
+									// allow-any-unicode-next-line
 									{ label: 'Constant + Trend + Trend² (ctt)', value: 'ctt' },
 									{ label: 'None (n)', value: 'n' },
 								],
@@ -234,7 +238,7 @@ export function getOfflineResourceSchema(resourceId: string): ConfigSchema | nul
 	}
 }
 
-// ── Metadata ─────────────────────────────────────────────────────────────────
+// -- Metadata -----------------------------------------------------------------
 
 export function getOfflineResourceMeta(resourceId: string): ResourceMeta | null {
 	switch (resourceId) {
@@ -244,7 +248,7 @@ export function getOfflineResourceMeta(resourceId: string): ResourceMeta | null 
 				testExplanations: {
 					adf: 'The Augmented Dickey-Fuller test checks for a unit root. Rejecting the null hypothesis suggests the series is stationary.',
 					kpss: 'The KPSS test has stationarity as the null hypothesis. Rejecting it suggests non-stationarity.',
-					pp: 'The Phillips-Perron test is similar to ADF but uses a non-parametric correction for serial correlation.',
+					pp: 'ADF with t-statistic lag selection. A true Phillips-Perron (non-parametric serial-correlation correction) is pending.',
 				},
 				resultHints: ['Check p-value against significance level (typically 0.05)', 'Compare test statistic with critical values'],
 			};

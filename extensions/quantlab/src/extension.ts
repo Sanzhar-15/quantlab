@@ -164,13 +164,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		if (user) {
 			accountStatusItem.text = `$(account) ${user.name || user.email}`;
 			accountStatusItem.tooltip = new vscode.MarkdownString(
-				`**Delta Plus** · ${user.tier} tier\n\n${user.email}\n\n[Sign Out](command:quantlab.signOut)`,
+				`**Quantlab** \u00B7 ${user.tier} tier\n\n${user.email}\n\n[Sign Out](command:quantlab.signOut)`,
 				true
 			);
 			accountStatusItem.command = 'quantlab.signOut';
 		} else {
 			accountStatusItem.text = `$(account) Sign In`;
-			accountStatusItem.tooltip = 'Sign in to Delta Plus';
+			accountStatusItem.tooltip = 'Sign in to Quantlab';
 			accountStatusItem.command = 'quantlab.signIn';
 		}
 		// Only show the item once auth state is known (prevents "Sign In" flash on startup).
@@ -206,7 +206,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		vscode.commands.registerCommand('quantlab.openHome', () => {
 			const user = serverClient.getUser();
 			if (!user) {
-				void vscode.window.showInformationMessage('Sign in to Delta Plus to view your dashboard.');
+				void vscode.window.showInformationMessage('Sign in to Quantlab to view your dashboard.');
 				return;
 			}
 			QuantLabHome.show(context, { name: user.name, email: user.email, tier: user.tier });

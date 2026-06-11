@@ -730,7 +730,8 @@ html[data-chart-mode="data"] .no-viz {
 	flex: 1;
 }
 
-.mh-presets {
+.mh-presets,
+.mh-timeframes {
 	display: inline-flex;
 	align-items: center;
 	gap: 2px;
@@ -739,7 +740,8 @@ html[data-chart-mode="data"] .no-viz {
 	border-radius: 6px;
 }
 
-.mh-preset {
+.mh-preset,
+.mh-tf {
 	height: 22px;
 	min-width: 32px;
 	padding: 0 8px;
@@ -752,23 +754,32 @@ html[data-chart-mode="data"] .no-viz {
 	cursor: pointer;
 }
 
-.mh-preset:hover:not(:disabled) {
+.mh-preset:hover:not(:disabled),
+.mh-tf:hover:not(:disabled) {
 	color: var(--ql-fg);
 	background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
 }
 
-.mh-preset.active {
+.mh-preset.active,
+.mh-tf.active {
 	background: var(--ql-accent);
 	color: var(--ql-accent-fg);
 }
 
-.mh-preset:disabled {
+.mh-preset:disabled,
+.mh-tf:disabled {
 	opacity: 0.45;
 	cursor: default;
 }
 
 .mh-preset-hidden {
 	display: none;
+}
+
+/* M30: bar-interval switcher -- same pill-group look as the range presets,
+	separated from them so the two controls read as distinct groups. */
+.mh-timeframes {
+	margin-right: 8px;
 }
 
 .mh-actions {

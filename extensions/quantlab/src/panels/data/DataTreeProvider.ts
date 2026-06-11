@@ -38,6 +38,8 @@ export interface CategoryNode {
 	label: string;
 	categoryId: AssetCategory;
 	icon: string;
+	/** Dimmed suffix rendered next to the label (e.g. 'coming soon' for unbacked categories, M123). */
+	description?: string;
 	collapsibleState: vscode.TreeItemCollapsibleState;
 }
 
@@ -127,6 +129,19 @@ const CATEGORIES: Array<{ id: AssetCategory; label: string; icon: string }> = [
 	{ id: 'calendar', label: 'Calendar', icon: 'calendar' },
 	{ id: 'sentiment', label: 'Sentiment', icon: 'pulse' },
 ];
+
+/**
+ * Top-level categories where EVERY leaf routes to getComingSoonNodes (M123):
+ * no subcategory is backed by live data or a dashboard command. These are
+ * marked 'coming soon' at the category level so the operator never expands
+ * into a dead end. Partially-backed categories (crypto, fixedIncome,
+ * sentiment) instead carry the suffix on their dead SUBcategory labels.
+ */
+const COMING_SOON_CATEGORIES: ReadonlySet<AssetCategory> = new Set<AssetCategory>([
+	'forex',
+	'commodities',
+	'macro',
+]);
 
 // ---- Provider ----
 
@@ -242,6 +257,10 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			case 'category':
 				item.iconPath = new vscode.ThemeIcon(element.icon);
 				item.contextValue = `quantlab.category.${element.categoryId}`;
+				if (element.description) {
+					item.description = element.description;
+					item.tooltip = `${element.label} data is planned but not yet available`;
+				}
 				break;
 
 			case 'subCategory':
@@ -326,6 +345,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			label: c.label,
 			categoryId: c.id,
 			icon: c.icon,
+			description: COMING_SOON_CATEGORIES.has(c.id) ? 'coming soon' : undefined,
 			collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
 		}));
 	}
@@ -429,11 +449,11 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 				{ command: 'quantlab.openCryptoOverview', title: 'Crypto Overview' }),
 			this.subCategory('crypto.spot', 'Spot Markets', 'symbol-misc', undefined, undefined,
 				this.cryptoSymbols ? `${this.cryptoSymbols.length} pairs` : undefined),
-			this.subCategory('crypto.derivatives', 'Derivatives', 'graph-scatter',
+			this.subCategory('crypto.derivatives', 'Derivatives (coming soon)', 'graph-scatter',
 				'Futures · Funding · OI', undefined, undefined, vscode.TreeItemCollapsibleState.Collapsed),
-			this.subCategory('crypto.onchain', 'On-Chain', 'link',
+			this.subCategory('crypto.onchain', 'On-Chain (coming soon)', 'link',
 				'Flows · Whales · Network', undefined, undefined, vscode.TreeItemCollapsibleState.Collapsed),
-			this.subCategory('crypto.institutional', 'Institutional', 'organization',
+			this.subCategory('crypto.institutional', 'Institutional (coming soon)', 'organization',
 				'ETF Flows · Treasury Holdings', undefined, undefined, vscode.TreeItemCollapsibleState.Collapsed),
 		];
 	}
@@ -478,13 +498,13 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		return [
 			this.subCategory('fi.yieldcurve', 'Yield Curves', 'graph-line',
 				'US · UK · EU · JP', { command: 'quantlab.openYieldCurve', title: 'Yield Curves' }),
-			this.subCategory('fi.government', 'Government Bonds', 'globe',
+			this.subCategory('fi.government', 'Government Bonds (coming soon)', 'globe',
 				'Treasuries · Gilts · Bunds'),
-			this.subCategory('fi.corporate', 'Corporate', 'briefcase',
+			this.subCategory('fi.corporate', 'Corporate (coming soon)', 'briefcase',
 				'Investment Grade · High Yield'),
-			this.subCategory('fi.structured', 'Structured', 'symbol-file',
+			this.subCategory('fi.structured', 'Structured (coming soon)', 'symbol-file',
 				'MBS · ABS · CLOs', undefined, undefined, vscode.TreeItemCollapsibleState.Collapsed),
-			this.subCategory('fi.credit', 'Credit', 'graph-scatter',
+			this.subCategory('fi.credit', 'Credit (coming soon)', 'graph-scatter',
 				'CDS Spreads · Credit Indices', undefined, undefined, vscode.TreeItemCollapsibleState.Collapsed),
 		];
 	}
@@ -537,11 +557,11 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 				undefined, { command: 'quantlab.openSentimentDashboard', title: 'Sentiment' }),
 			this.subCategory('sentiment.news', 'News Flow', 'comment',
 				'Breaking · Trending · By Symbol', { command: 'quantlab.openNewsFlow', title: 'News Flow' }),
-			this.subCategory('sentiment.social', 'Social Buzz', 'megaphone',
+			this.subCategory('sentiment.social', 'Social Buzz (coming soon)', 'megaphone',
 				undefined, undefined, undefined, vscode.TreeItemCollapsibleState.Collapsed),
-			this.subCategory('sentiment.optionsflow', 'Options Flow', 'graph-scatter',
+			this.subCategory('sentiment.optionsflow', 'Options Flow (coming soon)', 'graph-scatter',
 				'Unusual Activity · Dark Pool', undefined, undefined, vscode.TreeItemCollapsibleState.Collapsed),
-			this.subCategory('sentiment.feargreed', 'Fear & Greed', 'symbol-key',
+			this.subCategory('sentiment.feargreed', 'Fear & Greed (coming soon)', 'symbol-key',
 				undefined, undefined, undefined, vscode.TreeItemCollapsibleState.Collapsed),
 		];
 	}
@@ -809,7 +829,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		return {
 			nodeKind: 'instrument',
 			id: `quantlab.instrument.crypto.${s.symbol}`,
-			label: s.symbol.replace('_', '/'),
+			label: s.symbol.replace(/_/g, '/'),
 			description: s.name,
 			symbol: s.symbol,
 			assetClass: 'crypto',

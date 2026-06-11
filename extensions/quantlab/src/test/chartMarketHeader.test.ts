@@ -120,6 +120,111 @@ suite('chart marketHeader (data mode)', () => {
 		assert.notStrictEqual(group.style.display, 'none');
 	});
 
+	function tfButton(header: ReturnType<typeof createMarketHeader>, label: string): HTMLButtonElement {
+		const buttons = Array.from(header.root.querySelectorAll('.mh-tf')) as HTMLButtonElement[];
+		const btn = buttons.find(b => b.textContent === label);
+		assert.ok(btn, `timeframe button ${label} must exist`);
+		return btn;
+	}
+
+	function activeTfLabels(header: ReturnType<typeof createMarketHeader>): string[] {
+		return (Array.from(header.root.querySelectorAll('.mh-tf.active')) as HTMLButtonElement[])
+			.map(b => b.textContent ?? '');
+	}
+
+	test('M30: timeframe switcher renders exactly the server-supported intervals, default 1D active', () => {
+		const header = build();
+		const labels = (Array.from(header.root.querySelectorAll('.mh-tf')) as HTMLButtonElement[])
+			.map(b => b.textContent ?? '');
+		// LIVE SERVER TRUTH (2026-06-11): equities serve 1h/1D/1W/1M only.
+		assert.deepStrictEqual(labels, ['1H', '1D', '1W', '1M']);
+		assert.deepStrictEqual(activeTfLabels(header), ['1D'], '1D is the default interval');
+	});
+
+	test('M30: timeframe buttons are disabled until a source exists, enabled after', () => {
+		const header = build();
+		assert.ok(tfButton(header, '1H').disabled, 'disabled before a source');
+
+		header.setSource('AAPL', 'Apple Inc.', 'equity');
+		assert.ok(!tfButton(header, '1H').disabled, 'enabled once a symbol is set');
+
+		header.setSource(undefined, undefined);
+		assert.ok(tfButton(header, '1H').disabled, 'disabled again when the source clears');
+	});
+
+	test('M30: clicking an interval posts overrideTimeframe and the echo keeps it active', () => {
+		const header = build();
+		header.setSource('AAPL', 'Apple Inc.', 'equity');
+
+		tfButton(header, '1H').click();
+
+		assert.strictEqual(posted.length, 1);
+		assert.deepStrictEqual(posted[0], { type: 'overrideTimeframe', timeframe: '1H' });
+		assert.deepStrictEqual(activeTfLabels(header), ['1H'], 'optimistic highlight');
+
+		// Host stores the override and echoes it back via setToolbar.
+		header.setTimeframe('1H');
+		assert.deepStrictEqual(activeTfLabels(header), ['1H'], '1H stays active after the echo');
+
+		// Clicking the already-active interval must not re-post (no redundant reload).
+		tfButton(header, '1H').click();
+		assert.strictEqual(posted.length, 1, 'no duplicate post for the active interval');
+	});
+
+	test('M30: a timeframe click does not touch the date-range presets', () => {
+		const header = build();
+		header.setSource('AAPL', 'Apple Inc.', 'equity');
+		const endT = Date.UTC(2026, 3, 7);
+		header.updateFromBars(makeBars(800, endT));
+
+		presetButton(header, '1Y').click();
+		assert.deepStrictEqual(activeLabels(header), ['1Y']);
+
+		tfButton(header, '1W').click();
+		header.setTimeframe('1W');
+		assert.deepStrictEqual(activeLabels(header), ['1Y'], 'range preset survives an interval switch');
+		assert.deepStrictEqual(activeTfLabels(header), ['1W']);
+	});
+
+	test('M30: crypto hides 1W/1M intervals but keeps 1H/1D (while presets hide entirely)', () => {
+		const header = build();
+		header.setSource('BTC', 'Bitcoin', 'crypto');
+
+		assert.ok(!tfButton(header, '1H').classList.contains('mh-preset-hidden'), '1H offered for crypto');
+		assert.ok(!tfButton(header, '1D').classList.contains('mh-preset-hidden'), '1D offered for crypto');
+		assert.ok(tfButton(header, '1W').classList.contains('mh-preset-hidden'), '1W hidden for crypto');
+		assert.ok(tfButton(header, '1M').classList.contains('mh-preset-hidden'), '1M hidden for crypto');
+
+		header.setSource('AAPL', 'Apple Inc.', 'equity');
+		assert.ok(!tfButton(header, '1W').classList.contains('mh-preset-hidden'), '1W back for equities');
+		assert.ok(!tfButton(header, '1M').classList.contains('mh-preset-hidden'), '1M back for equities');
+	});
+
+	test('M30: as-of meta shows the bar time on intraday intervals, date-only otherwise', () => {
+		const HOUR_MS = 60 * 60 * 1000;
+		const header = build();
+		header.setSource('AAPL', 'Apple Inc.', 'equity');
+
+		const endT = Date.UTC(2026, 3, 7, 15, 0, 0);
+		const bars: ReturnType<typeof makeBars> = [];
+		for (let i = 0; i < 10; i++) {
+			const t = endT - (9 - i) * HOUR_MS;
+			bars.push({ t, o: 100 + i, h: 101 + i, l: 99 + i, c: 100.5 + i, v: 1000 + i });
+		}
+
+		header.setTimeframe('1H');
+		header.updateFromBars(bars);
+
+		const meta = header.root.querySelector('.mh-meta') as HTMLElement;
+		assert.ok(meta.textContent?.startsWith('1H'), `meta names the interval: ${meta.textContent}`);
+		assert.ok(/15:00 UTC$/.test(meta.textContent ?? ''), `intraday meta includes the bar time: ${meta.textContent}`);
+
+		// Echoing a daily interval re-renders the meta date-only immediately.
+		header.setTimeframe('1D');
+		assert.ok(meta.textContent?.startsWith('1D'), `meta tracks the echo: ${meta.textContent}`);
+		assert.ok(!/UTC$/.test(meta.textContent ?? ''), `daily meta is date-only: ${meta.textContent}`);
+	});
+
 	test('quote renders from the last bar with up/down change chip', () => {
 		const header = build();
 		header.setSource('AAPL', 'Apple Inc.');

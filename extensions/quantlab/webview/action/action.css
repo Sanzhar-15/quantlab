@@ -779,7 +779,7 @@ body {
 .preset-btn.active {
 	border-color: var(--ql-accent);
 	background: var(--ql-accent);
-	color: #000000;
+	color: var(--ql-accent-fg);
 	font-weight: 600;
 }
 

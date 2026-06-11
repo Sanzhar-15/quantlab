@@ -456,6 +456,18 @@
       {
         "command": "quantlab.cancelHistoryRun",
         "title": "%command.cancelHistoryRun.title%",
+        "category": "%command.category%",
+        "icon": "$(close)"
+      },
+      {
+        "_comment": "M56: History-tree right-click wrappers (historyCommands.ts) -- resolve the clicked tree node to a run id, then delegate to quantlab.action.pinRun / quantlab.action.addToCompare.",
+        "command": "quantlab.history.pinRun",
+        "title": "%command.history.pinRun.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.history.addToCompare",
+        "title": "%command.history.addToCompare.title%",
         "category": "%command.category%"
       },
       {
@@ -949,6 +961,15 @@
         {
           "command": "quantlab.watchlist.removeSymbol",
           "when": "false"
+        },
+        {
+          "_comment": "M56: the History-tree pin/compare wrappers act on the right-clicked History-tree node; they are meaningless without one.",
+          "command": "quantlab.history.pinRun",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.history.addToCompare",
+          "when": "false"
         }
       ],
       "accountsMenu": [
@@ -1053,6 +1074,32 @@
           "command": "quantlab.stopSession",
           "when": "view == quantlab.tradeView && viewItem == activeSessionPaused",
           "group": "inline@3"
+        },
+        {
+          "_comment": "M56: History-tree run entries. contextValue is status-aware -- quantlab.history.entry.<status> (HistoryTreeProvider.getTreeItem) -- so Cancel only shows on running/queued runs.",
+          "command": "quantlab.openHistoryEntry",
+          "when": "view == quantlab.historyView && viewItem =~ /^quantlab\\.history\\.entry\\./",
+          "group": "navigation@1"
+        },
+        {
+          "command": "quantlab.cancelHistoryRun",
+          "when": "view == quantlab.historyView && viewItem =~ /^quantlab\\.history\\.entry\\.(running|queued)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "quantlab.cancelHistoryRun",
+          "when": "view == quantlab.historyView && viewItem =~ /^quantlab\\.history\\.entry\\.(running|queued)$/",
+          "group": "1_run@1"
+        },
+        {
+          "command": "quantlab.history.pinRun",
+          "when": "view == quantlab.historyView && viewItem =~ /^quantlab\\.history\\.entry\\./",
+          "group": "1_run@2"
+        },
+        {
+          "command": "quantlab.history.addToCompare",
+          "when": "view == quantlab.historyView && viewItem =~ /^quantlab\\.history\\.entry\\./",
+          "group": "1_run@3"
         }
       ],
       "editor/title/context": [

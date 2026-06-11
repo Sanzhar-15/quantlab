@@ -1,8 +1,11 @@
 /*---------------------------------------------------------------------------------------------
- *  QuantLab — Delta Plus Authentication Provider
- *  Implements vscode.AuthenticationProvider so QuantLab sessions appear in the VS Code
- *  account switcher and persist across restarts via the platform keychain.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+// QuantLab -- Delta Plus Authentication Provider
+// Implements vscode.AuthenticationProvider so QuantLab sessions appear in the VS Code
+// account switcher and persist across restarts via the platform keychain.
 
 import * as vscode from 'vscode';
 import { ServerApiClient, ServerUser, AuthResponse } from '../core/server/ServerApiClient';
@@ -12,7 +15,7 @@ const PROVIDER_ID = 'deltaplus';
 const SESSIONS_KEY = 'deltaplus.sessions';
 const MIGRATION_DONE_KEY = 'deltaplus.migrationV1Done';
 
-// Keys written by ServerApiClient.persistTokens() — used for migration and QIC compat.
+// Keys written by ServerApiClient.persistTokens() -- used for migration and QIC compat.
 const LEGACY_ACCESS_KEY = 'qic.deltaplusAccessToken';
 const LEGACY_REFRESH_KEY = 'qic.deltaplusRefreshToken';
 const LEGACY_EXPIRY_KEY = 'qic.deltaplusTokenExpiresAt';
@@ -51,7 +54,7 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 				if (authenticated) {
 					void this._syncTokensFromClient();
 				} else {
-					// Refresh token invalid / expired — remove the stale session from
+					// Refresh token invalid / expired -- remove the stale session from
 					// SecretStorage so the auth gate detects the cleared state and
 					// re-shows the sign-in screen.
 					void this._purgeExpiredSession();
@@ -69,7 +72,7 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 		);
 	}
 
-	// ── vscode.AuthenticationProvider ──────────────────────────────────────────
+	// -- vscode.AuthenticationProvider ------------------------------------------
 
 	async getSessions(
 		_scopes?: readonly string[],
@@ -117,7 +120,7 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 
 		let session: StoredSession;
 		if (capturedAuth) {
-			// Credentials login — tokens already set by serverClient.login() inside trySignIn.
+			// Credentials login -- tokens already set by serverClient.login() inside trySignIn.
 			const authResponse = capturedAuth as Awaited<ReturnType<typeof this._serverClient.login>>;
 			const sessionId = this._generateId();
 			session = {
@@ -133,12 +136,12 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 			};
 			this._sessions = [session];
 			// Ensure auth gate is resolved (login() may not have resolved it if called
-			// before markAuthFlowComplete — setSessionTokens handles the resolve safely).
+			// before markAuthFlowComplete -- setSessionTokens handles the resolve safely).
 			this._serverClient.setSessionTokens(
 				session.accessToken, session.refreshToken, session.expiresAt, authResponse.user
 			);
 		} else {
-			// Demo login — handled by _performLogin.
+			// Demo login -- handled by _performLogin.
 			session = await this._performLogin(result);
 		}
 
@@ -160,7 +163,7 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 		try {
 			await this._serverClient.logoutSession(removed.refreshToken);
 		} catch {
-			// Best-effort — local session is already cleared.
+			// Best-effort -- local session is already cleared.
 		}
 
 		this._serverClient.clearTokens();
@@ -172,7 +175,7 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 		this._disposables.forEach(d => d.dispose());
 	}
 
-	// ── Public helpers ──────────────────────────────────────────────────────────
+	// -- Public helpers ----------------------------------------------------------
 
 	/**
 	 * Load any persisted session from SecretStorage and push its tokens into
@@ -184,7 +187,7 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 		if (this._sessions.length === 0) { return false; }
 
 		const s = this._sessions[0];
-		// Reconstruct a ServerUser from stored fields (user.id not stored — use email as surrogate).
+		// Reconstruct a ServerUser from stored fields (user.id not stored -- use email as surrogate).
 		this._serverClient.setSessionTokens(
 			s.accessToken,
 			s.refreshToken,
@@ -222,14 +225,14 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 
 		let user: ServerUser | null = null;
 		if (oldExpiry > Date.now()) {
-			// Access token still valid — fetch user info.
+			// Access token still valid -- fetch user info.
 			try {
 				user = await this._serverClient.fetchCurrentUser(oldAccess);
 			} catch {
-				// Token may be from another user or corrupt — discard.
+				// Token may be from another user or corrupt -- discard.
 			}
 		} else {
-			// Access token expired — try to refresh.
+			// Access token expired -- try to refresh.
 			const oldRefresh = await this._context.secrets.get(LEGACY_REFRESH_KEY);
 			if (oldRefresh) {
 				try {
@@ -240,11 +243,13 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 						try {
 							refreshedUser = await this._serverClient.fetchCurrentUser(refreshed.access_token);
 						} catch {
-							// Can't get user info — skip migration.
+							// Can't get user info -- skip migration.
 						}
 					}
-					if (!refreshedUser || refreshedUser.email === 'demo@deltaplus.io') {
-						// Discard — not a real user session.
+					if (!refreshedUser) {
+						// No user info available -- cannot reconstruct the session.
+						// (demo@deltaplus.io is NOT special-cased: it is the real
+						// demo account and migrates like any other user, M134.)
 						await this._context.secrets.store(MIGRATION_DONE_KEY, '1');
 						return;
 					}
@@ -273,13 +278,14 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 					this._sessionChangeEmitter.fire({ added: [this._toVscodeSession(migratedSession)], removed: [], changed: [] });
 					return;
 				} catch {
-					// Refresh failed — discard stale session.
+					// Refresh failed -- discard stale session.
 				}
 			}
 		}
 
-		if (user && user.email !== 'demo@deltaplus.io') {
-			// Migrate the session.
+		if (user) {
+			// Migrate the session (demo@deltaplus.io included -- it is the real
+			// demo account, M134; only sessions with no resolvable user are dropped).
 			const oldRefresh = await this._context.secrets.get(LEGACY_REFRESH_KEY) ?? '';
 			const migratedId = this._generateId();
 			const migratedSession: StoredSession = {
@@ -300,7 +306,7 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 		await this._context.secrets.store(MIGRATION_DONE_KEY, '1');
 	}
 
-	// ── Direct sign-in methods (used by authGate and re-auth flows) ─────────────
+	// -- Direct sign-in methods (used by authGate and re-auth flows) -------------
 
 	/** Sign in with email + password and persist the session. */
 	async signInWithCredentials(email: string, password: string): Promise<void> {
@@ -336,7 +342,7 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 		await this.signInWithCredentials(email, password);
 	}
 
-	// ── Private helpers ─────────────────────────────────────────────────────────
+	// -- Private helpers ---------------------------------------------------------
 
 	private _buildSession(authResponse: AuthResponse): StoredSession {
 		return {
@@ -411,7 +417,7 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 	}
 
 	/**
-	 * Called when ServerApiClient fires onAuthStateChange(false) — typically when the
+	 * Called when ServerApiClient fires onAuthStateChange(false) -- typically when the
 	 * refresh token has expired server-side. Purges the stale session from SecretStorage
 	 * so the auth gate can detect the cleared state and re-show the sign-in screen.
 	 */

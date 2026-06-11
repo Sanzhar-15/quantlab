@@ -1,5 +1,5 @@
 /*---------------------------------------------------------------------------------------------
- *  Copyright (c) Quantlab. All rights reserved.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
@@ -22,7 +22,7 @@ import { IQicChatService } from './qicChatService.js';
 const QIC_AGENT_ID = 'qic';
 
 /**
- * QIC Chat Agent — registers QIC as a native VS Code chat participant.
+ * QIC Chat Agent -- registers QIC as a native VS Code chat participant.
  *
  * This replaces the webview-based chat UI with the native ChatWidget.
  * The agent delegates to QicChatService for actual LLM communication,
@@ -46,7 +46,7 @@ export class QicChatAgent extends Disposable implements IChatAgentImplementation
 	private _registerAgent(): void {
 		const agentData: IChatAgentData = {
 			id: QIC_AGENT_ID,
-			name: 'qic',
+			name: 'orion',
 			fullName: 'Orion Assistant',
 			description: 'Orion AI Assistant for quantitative trading',
 			extensionId: nullExtensionDescription.identifier,
@@ -84,7 +84,7 @@ export class QicChatAgent extends Disposable implements IChatAgentImplementation
 	}
 
 	/**
-	 * Main handler — called when user sends a message targeting the QIC agent.
+	 * Main handler -- called when user sends a message targeting the QIC agent.
 	 * Streams response via the `progress` callback.
 	 */
 	async invoke(

@@ -138,11 +138,21 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 		context.toolbar.complexity.classList.add(complexity.level);
 	};
 
+	// M32: the toolbar's verdict on whether the 'Add visualize()' bar SHOULD
+	// show. Actual visibility additionally requires the error overlay to be
+	// hidden -- the two stacked on strategy tabs whose visualize() errored.
+	let noVizDesired = false;
+	const syncNoViz = () => {
+		const errorVisible = context.errorOverlay.classList.contains('show');
+		context.noViz.classList.toggle('show', noVizDesired && !errorVisible);
+	};
+
 	const clearError = () => {
 		context.errorOverlay.classList.remove('show');
 		context.errorMessage.textContent = '';
 		context.errorMessage.title = '';
 		context.errorActions.innerHTML = '';
+		syncNoViz();
 	};
 
 	const renderError = (message: string, actions: ChartErrorAction[] = [], detail?: string) => {
@@ -185,6 +195,7 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 		}
 
 		context.errorOverlay.classList.add('show');
+		syncNoViz();
 	};
 
 	const populateDropdown = (sources: DataSourceDescriptor[]) => {
@@ -305,7 +316,9 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 		setComplexity(toolbar.complexity);
 		// The visualize() prompt is developer-facing -- never show it on a
 		// market-data tab (the virtual symbol template has no visualize()).
-		context.noViz.classList.toggle('show', !toolbar.hasVisualization && !toolbar.viewOnly && mode !== 'data');
+		// M32: it also yields to the error overlay while one is visible.
+		noVizDesired = !toolbar.hasVisualization && !toolbar.viewOnly && mode !== 'data';
+		syncNoViz();
 
 		if (toolbar.recentSources) {
 			populateDropdown(toolbar.recentSources);

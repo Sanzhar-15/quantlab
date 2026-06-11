@@ -7,6 +7,28 @@ import * as vscode from 'vscode';
 import { HistoryDropdown } from '../panels/history/HistoryDropdown';
 import { HistoryState } from '../core/state/HistoryState';
 import { EngineHost } from '../core/engine/EngineHost';
+import { HistoryEntry } from '../types/history';
+
+/**
+ * Shape of the History tree's entry node as VS Code passes it to
+ * view/item/context menu commands (M56). The same commands stay
+ * callable with a plain entry-id string from code paths that already
+ * do so (dropdown buttons, webview bridges).
+ */
+interface HistoryEntryTreeNodeArg {
+	readonly type?: string;
+	readonly entry?: HistoryEntry;
+}
+
+function resolveEntryId(arg?: string | HistoryEntryTreeNodeArg): string | undefined {
+	if (typeof arg === 'string') {
+		return arg;
+	}
+	if (arg && arg.type === 'entry' && arg.entry && typeof arg.entry.id === 'string') {
+		return arg.entry.id;
+	}
+	return undefined;
+}
 
 export function registerHistoryCommands(context: vscode.ExtensionContext): void {
 	const dropdown = HistoryDropdown.getInstance();
@@ -14,7 +36,8 @@ export function registerHistoryCommands(context: vscode.ExtensionContext): void 
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.toggleHistoryDropdown', () => dropdown.toggle()),
-		vscode.commands.registerCommand('quantlab.openHistoryEntry', async (entryId?: string) => {
+		vscode.commands.registerCommand('quantlab.openHistoryEntry', async (arg?: string | HistoryEntryTreeNodeArg) => {
+			const entryId = resolveEntryId(arg);
 			if (!entryId) {
 				return;
 			}
@@ -28,7 +51,8 @@ export function registerHistoryCommands(context: vscode.ExtensionContext): void 
 			historyState.markAsViewed(entryId);
 			await vscode.commands.executeCommand('quantlab.action.openRun', entryId);
 		}),
-		vscode.commands.registerCommand('quantlab.cancelHistoryRun', (entryId?: string) => {
+		vscode.commands.registerCommand('quantlab.cancelHistoryRun', (arg?: string | HistoryEntryTreeNodeArg) => {
+			const entryId = resolveEntryId(arg);
 			if (!entryId) {
 				return;
 			}
@@ -54,6 +78,26 @@ export function registerHistoryCommands(context: vscode.ExtensionContext): void 
 				return;
 			}
 			void vscode.window.showWarningMessage(`Run ${entryId} is not active -- nothing to cancel.`);
+		}),
+		// M56: History-tree right-click wrappers. The tree passes its node
+		// object; the existing quantlab.action.* commands take a string run
+		// id and would silently misfire on a node, so resolve the id here
+		// and delegate to the already-registered implementations.
+		vscode.commands.registerCommand('quantlab.history.pinRun', async (arg?: string | HistoryEntryTreeNodeArg) => {
+			const entryId = resolveEntryId(arg);
+			if (!entryId) {
+				console.warn('quantlab.history.pinRun: no history entry id in command argument; nothing to pin.');
+				return;
+			}
+			await vscode.commands.executeCommand('quantlab.action.pinRun', entryId);
+		}),
+		vscode.commands.registerCommand('quantlab.history.addToCompare', async (arg?: string | HistoryEntryTreeNodeArg) => {
+			const entryId = resolveEntryId(arg);
+			if (!entryId) {
+				console.warn('quantlab.history.addToCompare: no history entry id in command argument; nothing to add.');
+				return;
+			}
+			await vscode.commands.executeCommand('quantlab.action.addToCompare', entryId);
 		}),
 		vscode.commands.registerCommand('quantlab.searchHistory', async () => {
 			// CODEX-009: Implement actual history search

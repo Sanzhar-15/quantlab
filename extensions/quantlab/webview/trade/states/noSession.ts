@@ -67,7 +67,7 @@ function buildRequirementRow(label: string, met: boolean, required: boolean): HT
 	const row = document.createElement('div');
 	row.className = `requirement-row ${met ? 'ok' : required ? 'blocked' : 'warn'}`;
 	row.innerHTML = `
-		<span class="req-status">${met ? 'OK' : required ? '!' : '?'}</span>
+		<span class="req-status">${met ? '\u2713' : required ? '!' : '?'}</span>
 		<span class="req-label">${label}</span>
 		<span class="req-meta">${required ? 'Required' : 'Recommended'}</span>
 	`;
@@ -80,7 +80,7 @@ function buildComplexityRow(level: RequirementsCheck['complexity']): HTMLElement
 	const label = level === 'safe' ? 'Safe' : level === 'partial' ? 'Partial' : 'View-Only';
 	row.className = `requirement-row ${status}`;
 	row.innerHTML = `
-		<span class="req-status">${level === 'safe' ? 'OK' : level === 'partial' ? '!' : 'X'}</span>
+		<span class="req-status">${level === 'safe' ? '\u2713' : level === 'partial' ? '!' : '\u2715'}</span>
 		<span class="req-label">Complexity: ${label}</span>
 		<span class="req-meta">Live trading</span>
 	`;

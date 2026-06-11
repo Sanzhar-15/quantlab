@@ -227,8 +227,10 @@ suite('WatchlistManager CRUD and lifecycle', () => {
 		const syncErrors: string[] = [];
 		manager.onSyncError(message => { syncErrors.push(message); });
 
-		// Routine signed-out pull: logged, not surfaced.
-		fake.setPullError(new Error('Not signed in to Delta Plus'));
+		// Routine signed-out pull: logged, not surfaced. Uses the exact message
+		// ServerApiClient.ensureAuthenticated throws today (M15 reword kept the
+		// 'Not signed in' prefix the /not signed in/i classifier matches on).
+		fake.setPullError(new Error('Not signed in. Sign in via the account menu to load live data.'));
 		fake.fireAuth(true);
 		await settle();
 		assert.strictEqual(syncErrors.length, 0);

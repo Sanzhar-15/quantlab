@@ -5,8 +5,44 @@
 
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { HistoryEntry } from '../../types/history';
+import { HistoryEntry, RunStatus } from '../../types/history';
 import { HistoryState } from '../../core/state/HistoryState';
+
+/**
+ * Human-readable run-type labels shared by the History tree and the
+ * Ctrl+Q H History dropdown (M57: the two surfaces must render the
+ * same run identically).
+ */
+export function formatRunType(type: string): string {
+	if (type === 'monteCarlo') {
+		return 'Monte Carlo';
+	}
+	if (type === 'wfa') {
+		return 'Walk-forward';
+	}
+	return type.charAt(0).toUpperCase() + type.slice(1);
+}
+
+/**
+ * Status icon per run state (M63): running entries must be visually
+ * distinguishable from completed/failed/cancelled ones at a glance.
+ * Exhaustive over RunStatus -- a new status fails compilation here
+ * instead of silently rendering the default file icon.
+ */
+function statusIcon(status: RunStatus): vscode.ThemeIcon {
+	switch (status) {
+		case 'queued':
+			return new vscode.ThemeIcon('clock');
+		case 'running':
+			return new vscode.ThemeIcon('loading~spin');
+		case 'completed':
+			return new vscode.ThemeIcon('pass', new vscode.ThemeColor('testing.iconPassed'));
+		case 'failed':
+			return new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed'));
+		case 'cancelled':
+			return new vscode.ThemeIcon('circle-slash');
+	}
+}
 
 type HistoryNode = SectionNode | EntryNode | StrategyNode | PlaceholderNode;
 
@@ -57,7 +93,10 @@ export class HistoryTreeProvider implements vscode.TreeDataProvider<HistoryNode>
 			const item = new vscode.TreeItem(element.label, vscode.TreeItemCollapsibleState.None);
 			item.id = element.id;
 			item.description = element.entry.status;
-			item.contextValue = 'quantlab.history.entry';
+			item.iconPath = statusIcon(element.entry.status);
+			// Status-aware contextValue (M56): package.json view/item/context
+			// entries key off this so e.g. Cancel only shows on active runs.
+			item.contextValue = `quantlab.history.entry.${element.entry.status}`;
 			item.command = {
 				command: 'quantlab.openHistoryEntry',
 				title: 'Open History Entry',
@@ -163,7 +202,8 @@ export class HistoryTreeProvider implements vscode.TreeDataProvider<HistoryNode>
 	}
 
 	private createEntryNode(entry: HistoryEntry): EntryNode {
-		const label = `${this.formatRunType(entry.type)} — ${path.basename(entry.strategyPath)}`;
+		// allow-any-unicode-next-line
+		const label = `${formatRunType(entry.type)} — ${path.basename(entry.strategyPath)}`;
 		return {
 			id: `quantlab.history.entry.${entry.id}`,
 			label,
@@ -184,7 +224,7 @@ export class HistoryTreeProvider implements vscode.TreeDataProvider<HistoryNode>
 		const strategyName = path.basename(entry.strategyPath);
 		const metric = this.pickMetric(entry.metrics);
 		const metricPart = metric ? `, ${metric.label} ${metric.value.toFixed(2)}` : '';
-		return `${this.formatRunType(entry.type)} run ${entry.id}, ${entry.status}, strategy ${strategyName}${metricPart}`;
+		return `${formatRunType(entry.type)} run ${entry.id}, ${entry.status}, strategy ${strategyName}${metricPart}`;
 	}
 
 	private pickMetric(metrics?: Record<string, number>): { label: string; value: number } | undefined {
@@ -206,15 +246,5 @@ export class HistoryTreeProvider implements vscode.TreeDataProvider<HistoryNode>
 
 		const [label, value] = entries[0];
 		return { label, value };
-	}
-
-	private formatRunType(type: string): string {
-		if (type === 'monteCarlo') {
-			return 'Monte Carlo';
-		}
-		if (type === 'wfa') {
-			return 'Walk-forward';
-		}
-		return type.charAt(0).toUpperCase() + type.slice(1);
 	}
 }

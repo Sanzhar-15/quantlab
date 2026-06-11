@@ -66,13 +66,18 @@ def kpss_test(df: pd.DataFrame, params: dict) -> dict:
 
 
 def pp_test(df: pd.DataFrame, params: dict) -> dict:
-    """Phillips-Perron test."""
+    """ADF with t-statistic lag selection (NOT Phillips-Perron).
+
+    statsmodels does not provide a Phillips-Perron implementation, and we do
+    not add dependencies (the `arch` package has one). This runs the Augmented
+    Dickey-Fuller test with autolag='t-stat' and labels the output honestly.
+    The routing id stays 'pp' because runner.py and the catalogs key on it.
+    """
     from statsmodels.tsa.stattools import adfuller
 
     col = df.iloc[:, 0].dropna()
     regression = params.get('regression', 'c')
 
-    # PP test in statsmodels is accessed via adfuller with autolag='t-stat'
     result = adfuller(col, regression=regression, autolag='t-stat')
     stat, pvalue, usedlag, nobs, critical_values, icbest = result
 
@@ -80,15 +85,20 @@ def pp_test(df: pd.DataFrame, params: dict) -> dict:
 
     return {
         'testId': 'pp',
-        'testName': 'Phillips-Perron Test',
+        'testName': 'ADF (t-stat autolag)',
         'statistic': float(stat),
         'pValue': float(pvalue),
         'criticalValues': {k: float(v) for k, v in critical_values.items()},
         'conclusion': 'Series is stationary (reject unit root)' if is_stationary else 'Series has unit root (non-stationary)',
-        'interpretation': f'PP statistic: {stat:.4f}. P-value: {pvalue:.4f}.',
+        'interpretation': (
+            f'ADF statistic (t-stat lag selection): {stat:.4f}. P-value: {pvalue:.4f}. '
+            'Note: a true Phillips-Perron test is pending; this is the Augmented '
+            'Dickey-Fuller test with t-statistic-based lag selection.'
+        ),
         'details': {
             'usedLag': int(usedlag),
             'nobs': int(nobs),
-            'regression': regression
+            'regression': regression,
+            'note': 'Phillips-Perron is not implemented; ADF with autolag=t-stat was run instead.'
         }
     }

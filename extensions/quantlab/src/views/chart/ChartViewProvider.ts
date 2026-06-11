@@ -19,6 +19,7 @@ import { debounce } from '../../utils/debounce';
 import { getVisualizationTemplate } from '../../utils/visualizationTemplate';
 import { ChartInboundMessage, ChartToolbarState, EquityPoint, OhlcvBar, SignalMarker } from '../../types/chart';
 import { DataSourceDescriptor, Timeframe, isLocalFileSource, isServerSource, ServerDataSource } from '../../types/market';
+import { ChartState } from '../../types/views';
 import { ChartStateStore } from './ChartStateStore';
 import { ChartWebview } from './ChartWebview';
 import { TradeOverlayManager } from './TradeOverlayManager';
@@ -28,6 +29,15 @@ import { ReducedMotion } from '../../ui/accessibility/ReducedMotion';
 import { FeatureDiscovery } from '../../ui/onboarding/FeatureDiscovery';
 
 type BannerKind = 'viewOnly' | 'run' | 'data';
+
+// Runtime guard for webview-posted timeframe overrides (M30): the message
+// payload is untrusted, so an unknown value must surface as an error, not
+// silently reach the server as a malformed bars request.
+const VALID_TIMEFRAMES: ReadonlySet<string> = new Set<Timeframe>(['1m', '5m', '15m', '30m', '1H', '4H', '1D', '1W', '1M']);
+
+function isValidTimeframe(value: unknown): value is Timeframe {
+	return typeof value === 'string' && VALID_TIMEFRAMES.has(value);
+}
 
 interface BannerMessage {
 	message: string;
@@ -332,6 +342,14 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			case 'overrideDateRange':
 				this.updateChartOverride(session, { dateRange: payload.range });
 				return;
+			case 'overrideTimeframe':
+				// M30: per-tab bar-interval override from the market header.
+				if (!isValidTimeframe(payload.timeframe)) {
+					void vscode.window.showErrorMessage(`Chart: invalid timeframe override '${String((payload as { timeframe?: unknown }).timeframe)}'.`);
+					return;
+				}
+				this.updateChartOverride(session, { timeframe: payload.timeframe });
+				return;
 			case 'refresh':
 				this.reloadData(session);
 				return;
@@ -418,6 +436,17 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		// assetClass routes crypto symbols to /v1/crypto/bars -- dropping it here
 		// would silently chart a crypto recent against the equities endpoint.
 		const source: ServerDataSource = { kind: 'server', symbol, displayName, assetClass };
+
+		// Crypto bars only exist at 1h/1d server-side; a surviving 1W/1M
+		// override from an equity tab would be silently downsampled to 1d
+		// with NO active highlight in the header (the buttons are hidden).
+		// Clamp the per-tab override back to 1D on the switch.
+		if (assetClass?.toLowerCase() === 'crypto' && session.tabInstanceId) {
+			const chartState = this.stateManager.getChartState(session.tabInstanceId);
+			if (chartState?.timeframe === '1W' || chartState?.timeframe === '1M') {
+				this.stateManager.updateChartState(session.tabInstanceId, { timeframe: '1D' });
+			}
+		}
 
 		// Set global state only - refreshFromGlobal will propagate to tabs without overrides
 		this.globalState.setDataSource(source);
@@ -522,6 +551,15 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 	}
 
 	private async refreshVisualization(session: ChartSession, data?: OhlcvBar[]): Promise<void> {
+		// M120: quantlab-server (data-mode) tabs have no visualize() code by
+		// construction -- running the Python visualization path against the
+		// virtual document only produces bogus 'Fix with Orion' toasts (with a
+		// virtual path) whenever the runner hiccups. Skip it entirely; this
+		// also covers notifyVisualizationIssues, whose only caller is here.
+		if (session.document.uri.scheme === 'quantlab-server') {
+			return;
+		}
+
 		const key = this.getSessionKey(session);
 
 		// Generate request ID to prevent race conditions
@@ -841,14 +879,25 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		return `${document.version}:${data.length}:${first}:${last}:${signalsCount}:${signalsHead}:${signalsTail}:${equityCount}:${equityHead}:${equityTail}:${tf}:${overrideKey}`;
 	}
 
-	private updateChartOverride(session: ChartSession, update: Partial<{ dateRange?: ChartToolbarState['dateRange'] }>): void {
+	private updateChartOverride(session: ChartSession, update: Partial<Pick<ChartState, 'dateRange' | 'timeframe'>>): void {
 		if (!session.tabInstanceId) {
 			return;
 		}
 
-		const chartState = this.stateManager.updateChartState(session.tabInstanceId, {
-			dateRange: update.dateRange
-		});
+		// Forward ONLY the keys the caller actually provided: updateChartState
+		// spreads the update object, so passing an always-present dateRange key
+		// would let a timeframe switch silently CLEAR the active range preset
+		// (and vice versa). An own-key check keeps explicit-undefined semantics
+		// for clearing (e.g. overrideDateRange with range: undefined).
+		const stateUpdate: Partial<ChartState> = {};
+		if (Object.prototype.hasOwnProperty.call(update, 'dateRange')) {
+			stateUpdate.dateRange = update.dateRange;
+		}
+		if (Object.prototype.hasOwnProperty.call(update, 'timeframe')) {
+			stateUpdate.timeframe = update.timeframe;
+		}
+
+		const chartState = this.stateManager.updateChartState(session.tabInstanceId, stateUpdate);
 		if (!chartState) {
 			return;
 		}

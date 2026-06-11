@@ -7,6 +7,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { HistoryEntry, RunType } from '../../types/history';
 import { HistoryState } from '../../core/state/HistoryState';
+import { formatRunType } from './HistoryTreeProvider';
 
 const FILTER_KEY = 'quantlab.historyFilter';
 const FILTER_OPTIONS: Array<{ id: HistoryFilter; label: string }> = [
@@ -148,7 +149,9 @@ export class HistoryDropdown {
 	}
 
 	private createEntryItem(entry: HistoryEntry, isRunning: boolean): HistoryQuickPickItem {
-		const label = `${this.formatRunType(entry.type)} -- ${path.basename(entry.strategyPath)}`;
+		// M57: same label shape as the History tree -- shared formatRunType
+		// mapping and the same em-dash separator.
+		const label = `${formatRunType(entry.type)} \u2014 ${path.basename(entry.strategyPath)}`;
 		const description = entry.status;
 		const detail = entry.progressMessage ?? (entry.progress !== undefined ? `Progress ${entry.progress}%` : undefined);
 		const buttons = isRunning
@@ -225,9 +228,5 @@ export class HistoryDropdown {
 			['YESTERDAY', yesterday],
 			['EARLIER', earlier]
 		];
-	}
-
-	private formatRunType(type: string): string {
-		return type.charAt(0).toUpperCase() + type.slice(1);
 	}
 }

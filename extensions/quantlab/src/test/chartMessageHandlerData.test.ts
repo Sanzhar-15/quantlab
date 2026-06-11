@@ -52,17 +52,20 @@ function dataToolbar(overrides: Record<string, unknown> = {}) {
 suite('chart messageHandler: loading / empty / addSignal (H15+H17)', () => {
 	let recorded: Recorded;
 	let setRanges: Array<{ start: string; end: string } | undefined>;
+	let headerTimeframes: Array<string | undefined>;
 	let legendSymbols: Array<string | undefined>;
 	let legendBars: OhlcvBar[][];
 	let handler: (message: unknown) => void;
 	let loading: HTMLElement;
 	let emptyState: HTMLElement;
 	let errorOverlay: HTMLElement;
+	let noViz: HTMLElement;
 
 	setup(() => {
 		resetDom();
 		recorded = { setDataBars: [], addedSignals: [], watermarks: [], timeframes: [] };
 		setRanges = [];
+		headerTimeframes = [];
 		legendSymbols = [];
 		legendBars = [];
 
@@ -90,6 +93,7 @@ suite('chart messageHandler: loading / empty / addSignal (H15+H17)', () => {
 		loading = document.createElement('div');
 		emptyState = document.createElement('div');
 		errorOverlay = document.createElement('div');
+		noViz = document.createElement('div');
 		const errorMessage = document.createElement('div');
 		const errorActions = document.createElement('div');
 
@@ -98,11 +102,11 @@ suite('chart messageHandler: loading / empty / addSignal (H15+H17)', () => {
 			chart: fakeChart,
 			parameterPanel: fakeParameterPanel,
 			banner: document.createElement('div'),
-			noViz: document.createElement('div'),
+			noViz,
 			applyMode: () => { /* no-op */ },
 			marketHeader: {
 				setSource: () => { /* no-op */ },
-				setTimeframe: () => { /* no-op */ },
+				setTimeframe: timeframe => headerTimeframes.push(timeframe),
 				updateFromBars: () => { /* no-op */ },
 				setRange: range => setRanges.push(range)
 			},
@@ -178,6 +182,38 @@ suite('chart messageHandler: loading / empty / addSignal (H15+H17)', () => {
 		handler({ type: 'addSignal', signal: { type: 'entry' } });
 		await flush();
 		assert.strictEqual(recorded.addedSignals.length, 1);
+	});
+
+	test('M32: the noViz bar yields to the error overlay and returns when it clears', async () => {
+		// A strategy tab without visualize(): the noViz prompt shows.
+		handler({ type: 'setToolbar', toolbar: dataToolbar({ mode: 'strategy', hasVisualization: false }) });
+		assert.ok(noViz.classList.contains('show'), 'noViz shows on a viz-less strategy tab');
+
+		// An error overlay supersedes it -- the two must not stack.
+		handler({ type: 'showError', message: 'Visualization failed to render.', actions: ['editVisualization'] });
+		assert.ok(errorOverlay.classList.contains('show'), 'error overlay shown');
+		assert.ok(!noViz.classList.contains('show'), 'noViz hidden while the error overlay is up');
+
+		// A toolbar refresh while the error is still up must NOT re-show it.
+		handler({ type: 'setToolbar', toolbar: dataToolbar({ mode: 'strategy', hasVisualization: false }) });
+		assert.ok(!noViz.classList.contains('show'), 'toolbar refresh does not re-stack noViz over the error');
+
+		// Clearing the error restores the toolbar-desired state.
+		handler({ type: 'showError', message: '' });
+		assert.ok(!errorOverlay.classList.contains('show'), 'error cleared');
+		assert.ok(noViz.classList.contains('show'), 'noViz returns after the error clears');
+
+		// Data resolves the error path too (clearError runs in setDataBinary).
+		handler({ type: 'showError', message: 'boom' });
+		handler({ type: 'setDataBinary', requestId: 9, buffer: encodeBars(BARS), count: BARS.length });
+		await flush();
+		assert.ok(noViz.classList.contains('show'), 'data arrival clears the error and restores noViz');
+	});
+
+	test('M30: data-mode toolbar echoes the timeframe into the market header and chart', () => {
+		handler({ type: 'setToolbar', toolbar: dataToolbar({ timeframe: '1H' }) });
+		assert.deepStrictEqual(headerTimeframes, ['1H'], 'market header receives the echoed interval');
+		assert.deepStrictEqual(recorded.timeframes, ['1H'], 'chart axis formatter follows the toolbar timeframe');
 	});
 
 	test('data-mode toolbar wires watermark + legend symbol; strategy mode clears both', async () => {

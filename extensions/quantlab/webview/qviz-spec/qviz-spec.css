@@ -3,7 +3,17 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-/* Phase 5 step D — builder UI styles. Replaces the Step A placeholder. */
+/* Phase 5 step D -- builder UI styles. Replaces the Step A placeholder. */
+
+/* QuantLab Accent -- canonical chain. Must mirror tokens.css so the
+	ThemeProvider --vscode-quantlabAccent override is never clobbered. */
+:root {
+	--ql-accent: var(--vscode-quantlabAccent, #FF7331);
+	--ql-accent-hover: var(--vscode-quantlabAccentHover, #E5672C);
+	--ql-accent-active: var(--vscode-quantlabAccentActive, #CC5C22);
+	--ql-accent-muted: color-mix(in srgb, var(--ql-accent) 15%, transparent);
+	--ql-accent-fg: #1A0A00;
+}
 
 body {
 	margin: 0;
@@ -42,7 +52,7 @@ body {
 }
 
 /* Phase 8 Step F: unsaved-changes dot in the app header. Hidden by
-   default; shown when state.spec.currentHash !== state.spec.lastSavedHash. */
+	default; shown when state.spec.currentHash !== state.spec.lastSavedHash. */
 .qviz-unsaved-badge {
 	color: var(--vscode-charts-orange, #f48771);
 	font-size: 16px;
@@ -225,8 +235,8 @@ body.qviz-inspector-open .qviz-app-main {
 	background: var(--vscode-button-secondaryHoverBackground);
 }
 .qviz-chart-type-button--active {
-	background: var(--vscode-button-background);
-	color: var(--vscode-button-foreground);
+	background: var(--ql-accent);
+	color: var(--ql-accent-fg);
 }
 
 /* ---------- encoding shelves ---------- */
@@ -414,10 +424,10 @@ body.qviz-inspector-open .qviz-app-main {
 .qviz-histogram-preset { padding: 4px 0; }
 .qviz-histogram-preset-btn {
 	width: 100%; padding: 6px 8px;
-	background: var(--vscode-button-background); color: var(--vscode-button-foreground);
+	background: var(--ql-accent); color: var(--ql-accent-fg);
 	border: 0; border-radius: 3px; font-size: 12px; cursor: pointer;
 }
-.qviz-histogram-preset-btn:hover { background: var(--vscode-button-hoverBackground); }
+.qviz-histogram-preset-btn:hover { background: var(--ql-accent-hover); }
 
 /* ---------- transform form internals ---------- */
 
@@ -631,8 +641,8 @@ body.qviz-inspector-open .qviz-app-main {
 	position: relative;
 }
 /* Phase 8 Step C: chart-area loading skeleton. Positioned absolutely
-   over the chart container so it overlays any in-progress paint. Pure
-   CSS — three pulsing bars suggesting a chart, plus a baseline axis. */
+	over the chart container so it overlays any in-progress paint. Pure
+	CSS -- three pulsing bars suggesting a chart, plus a baseline axis. */
 .qviz-preview-skeleton {
 	position: absolute;
 	inset: 0;
@@ -710,8 +720,8 @@ body.qviz-inspector-open .qviz-app-main {
 	outline-offset: 1px;
 }
 .qviz-inspector-toggle--active {
-	background: var(--vscode-button-background);
-	color: var(--vscode-button-foreground);
+	background: var(--ql-accent);
+	color: var(--ql-accent-fg);
 }
 /* Audit M-38 (2026-05-11): explicit disabled style so capability-gated
  * users see a real visual cue (not just lighter button-default opacity). */
@@ -930,8 +940,8 @@ body.qviz-inspector-open .qviz-app-main {
 /* Audit M-48: retry button next to the error message. */
 .qviz-inspector-retry {
 	padding: 2px 10px;
-	background: var(--vscode-button-background);
-	color: var(--vscode-button-foreground);
+	background: var(--ql-accent);
+	color: var(--ql-accent-fg);
 	border: 0;
 	border-radius: 2px;
 	cursor: pointer;
@@ -939,7 +949,7 @@ body.qviz-inspector-open .qviz-app-main {
 	font-size: 11px;
 }
 .qviz-inspector-retry:hover {
-	background: var(--vscode-button-hoverBackground);
+	background: var(--ql-accent-hover);
 }
 
 /* ---------- Phase 6: column filter chip + popup ---------- */
@@ -973,8 +983,8 @@ body.qviz-inspector-open .qviz-app-main {
 	color: var(--vscode-foreground);
 }
 .qviz-col-filter-btn--active {
-	color: var(--vscode-button-foreground);
-	background: var(--vscode-button-background);
+	color: var(--ql-accent-fg);
+	background: var(--ql-accent);
 }
 
 .qviz-col-filter-popup {

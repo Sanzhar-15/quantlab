@@ -1,6 +1,6 @@
 {
 	"displayName": "Quantlab",
-	"description": "Quantlab core UI, global state, and history panels.",
+	"description": "Quantitative research workbench -- market data, charting, backtesting, stats, and trading for Quantlab.",
 	"command.category": "Quantlab",
 	"command.signIn.title": "Sign In to Delta Plus",
 	"command.signOut.title": "Sign Out of Delta Plus",
@@ -77,6 +77,8 @@
 	"command.toggleHistoryDropdown.title": "Toggle History Dropdown",
 	"command.openHistoryEntry.title": "Open History Entry",
 	"command.cancelHistoryRun.title": "Cancel History Run",
+	"command.history.pinRun.title": "Pin / Unpin Run",
+	"command.history.addToCompare.title": "Add Run to Compare",
 	"command.searchHistory.title": "Search History",
 	"command.focusDataPanel.title": "Focus Data Panel",
 	"command.focusResourcesPanel.title": "Focus Resources Panel",

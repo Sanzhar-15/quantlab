@@ -38,6 +38,30 @@ const PRESETS: PresetDef[] = [
 	{ id: 'all', label: 'All', days: null },
 ];
 
+interface TimeframeDef {
+	/** Client Timeframe id as the host expects it ('1H', not '1h'). */
+	id: string;
+	label: string;
+	/** Sub-day bars: the as-of meta includes the bar's time of day. */
+	intraday: boolean;
+}
+
+/**
+ * Bar-interval switcher options (M30). LIVE SERVER TRUTH (conductor-probed
+ * 2026-06-11, not derived from the Timeframe union): equities have bars at
+ * 1h/1D/1W/1M ONLY -- 4h and every sub-hour interval return zero bars; the
+ * crypto endpoint supports tf=1h/1d and maps sub-hour intervals LOSSILY.
+ * Offer exactly what the server can serve, nothing else.
+ */
+const TIMEFRAMES: TimeframeDef[] = [
+	{ id: '1H', label: '1H', intraday: true },
+	{ id: '1D', label: '1D', intraday: false },
+	{ id: '1W', label: '1W', intraday: false },
+	{ id: '1M', label: '1M', intraday: false },
+];
+
+const CRYPTO_TIMEFRAME_IDS = new Set(['1H', '1D']);
+
 export interface MarketHeader {
 	readonly root: HTMLElement;
 	/** Slot the data-source dropdown container is moved into for data mode. */
@@ -85,6 +109,11 @@ export function createMarketHeader(
 	const spacer = document.createElement('div');
 	spacer.className = 'spacer';
 
+	const tfGroup = document.createElement('div');
+	tfGroup.className = 'mh-timeframes';
+	tfGroup.setAttribute('role', 'group');
+	tfGroup.setAttribute('aria-label', 'Bar interval');
+
 	const presetGroup = document.createElement('div');
 	presetGroup.className = 'mh-presets';
 	presetGroup.setAttribute('role', 'group');
@@ -99,6 +128,9 @@ export function createMarketHeader(
 	// presets would wrongly hide after the first preset click.
 	let earliestT: number | undefined;
 	let timeframe = '1D';
+	// Timestamp of the newest bar of the LAST data load -- backs the as-of
+	// meta so a timeframe echo can re-render it without waiting for bars.
+	let lastBarT: number | undefined;
 	let currentSymbol: string | undefined;
 	// Last range POSTED by a preset click, so setRange() can keep that preset
 	// highlighted when the host echoes the override back via setToolbar.
@@ -153,10 +185,60 @@ export function createMarketHeader(
 		presetGroup.appendChild(btn);
 	}
 
-	root.append(identitySlot, ticker, quote, meta, spacer, presetGroup, actionsSlot);
+	// --- Bar-interval switcher (M30) ---
+	const tfButtons = new Map<string, HTMLButtonElement>();
 
-	const formatAsOf = (t: number): string =>
-		new Date(t).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+	const setActiveTimeframe = (id: string) => {
+		for (const [tid, btn] of tfButtons) {
+			btn.classList.toggle('active', tid === id);
+		}
+	};
+
+	for (const def of TIMEFRAMES) {
+		const btn = document.createElement('button');
+		// Distinct class from .mh-preset: shared styling comes from the CSS
+		// selector lists, while DOM queries for the range presets stay scoped.
+		btn.className = 'mh-tf';
+		btn.textContent = def.label;
+		btn.disabled = true;
+		btn.addEventListener('click', () => {
+			// The active class IS the latest intent (optimistic click or host
+			// echo) -- guarding on it blocks redundant reloads without
+			// mis-blocking a quick revert click during the echo round-trip.
+			if (btn.classList.contains('active')) {
+				return;
+			}
+			// Optimistic highlight (mirrors the preset pattern); the host
+			// stores the per-tab override and echoes it back via setToolbar
+			// -> setTimeframe, which re-asserts the active state.
+			postMessage({ type: 'overrideTimeframe', timeframe: def.id });
+			setActiveTimeframe(def.id);
+		});
+		tfButtons.set(def.id, btn);
+		tfGroup.appendChild(btn);
+	}
+	setActiveTimeframe(timeframe);
+
+	root.append(identitySlot, ticker, quote, meta, spacer, tfGroup, presetGroup, actionsSlot);
+
+	const formatAsOf = (t: number): string => {
+		const date = new Date(t).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+		// Intraday bars: a bare date under-identifies the bar -- show its time.
+		if (TIMEFRAMES.find(def => def.id === timeframe)?.intraday) {
+			// hourCycle h23 (not hour12:false): en-US's h24 cycle renders
+			// midnight as '24:00'.
+			const time = new Date(t).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone: 'UTC' });
+			return `${date} ${time} UTC`;
+		}
+		return date;
+	};
+
+	const renderMeta = () => {
+		if (lastBarT === undefined) {
+			return;
+		}
+		meta.textContent = `${timeframe} \u00B7 as of ${formatAsOf(lastBarT)}`;
+	};
 
 	return {
 		root,
@@ -172,7 +254,18 @@ export function createMarketHeader(
 			// The crypto bars endpoint ignores from/to windows (DataService
 			// routes crypto to a single no-range fetch) -- presets would be
 			// silent no-ops, so hide the control entirely for crypto.
-			presetGroup.style.display = assetClass?.toLowerCase() === 'crypto' ? 'none' : '';
+			const isCrypto = assetClass?.toLowerCase() === 'crypto';
+			presetGroup.style.display = isCrypto ? 'none' : '';
+
+			// M30: the timeframe switcher needs no anchor bar, so it enables as
+			// soon as a symbol exists. Crypto only serves 1h/1d -- hide the rest.
+			for (const def of TIMEFRAMES) {
+				const btn = tfButtons.get(def.id);
+				if (btn) {
+					btn.classList.toggle('mh-preset-hidden', isCrypto && !CRYPTO_TIMEFRAME_IDS.has(def.id));
+					btn.disabled = !symbol;
+				}
+			}
 
 			// Toolbar refreshes fire after every data load; only a SYMBOL
 			// change resets the quote/extent state (a same-symbol refresh
@@ -187,15 +280,22 @@ export function createMarketHeader(
 			meta.textContent = '';
 			anchorT = undefined;
 			earliestT = undefined;
+			lastBarT = undefined;
 			setActive(null);
 			for (const btn of presetButtons.values()) {
 				btn.disabled = true;
 			}
 		},
 		setTimeframe(tf) {
-			if (tf) {
-				timeframe = tf;
+			if (!tf) {
+				return;
 			}
+			timeframe = tf;
+			// M30: the host echo (setToolbar after the override is stored) is
+			// the source of truth for the active interval -- re-assert it and
+			// refresh the as-of meta without waiting for the bar reload.
+			setActiveTimeframe(tf);
+			renderMeta();
 		},
 		setRange(range) {
 			if (!range) {
@@ -234,7 +334,8 @@ export function createMarketHeader(
 				change.classList.remove('up', 'down');
 			}
 
-			meta.textContent = `${timeframe} · as of ${formatAsOf(last.t)}`;
+			lastBarT = last.t;
+			renderMeta();
 
 			for (const btn of presetButtons.values()) {
 				btn.disabled = false;

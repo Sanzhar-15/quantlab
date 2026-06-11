@@ -100,6 +100,7 @@ export type ChartInboundMessage =
 	| { type: 'selectDataSource'; filePath: string }
 	| { type: 'selectServerSymbol'; symbol: string; displayName: string; assetClass?: string }
 	| { type: 'overrideDateRange'; range?: ChartDateRange }
+	| { type: 'overrideTimeframe'; timeframe: Timeframe }
 	| { type: 'refresh' }
 	| { type: 'screenshot' }
 	| { type: 'openSettings' }

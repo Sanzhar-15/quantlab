@@ -792,7 +792,7 @@ export class ServerApiClient {
 				]);
 			}
 			if (!this.accessToken) {
-				throw new Error('Not signed in to Delta Plus. Sign in via the account menu.');
+				throw new Error('Not signed in. Sign in via the account menu to load live data.');
 			}
 		}
 
