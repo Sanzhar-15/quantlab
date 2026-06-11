@@ -152,7 +152,7 @@
 						<h3>Review Mode</h3>
 						<div class="qic-shortcuts-list">
 							<div class="qic-shortcut">
-								<kbd>v</kbd> / <kbd>^</kbd>
+								<kbd>Down</kbd> / <kbd>Up</kbd>
 								<span>Navigate files</span>
 							</div>
 							<div class="qic-shortcut">

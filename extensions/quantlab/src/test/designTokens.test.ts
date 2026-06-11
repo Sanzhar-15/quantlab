@@ -101,7 +101,16 @@ suite('design tokens (webview css accent chain)', () => {
 		'webview/action/action.css',
 		'webview/stats/stats.css',
 		'webview/visualise/visualise.css',
+		'webview/chart/chart.css',
 	]) {
+		test(`${cssFile}: no line-comment syntax (// is invalid CSS and drops the next rule)`, () => {
+			const css = read(cssFile);
+			// A bare // line fuses into the following selector prelude when
+			// bundled, and CSS error recovery then drops the ENTIRE next rule
+			// (this silently killed the :root accent block once).
+			assert.doesNotMatch(css, /^\s*\/\/(?!.*\*\/)/m, `${cssFile} contains a // line comment -- use /* */`);
+		});
+
 		test(`${cssFile}: --ql-accent uses the canonical --vscode-quantlabAccent chain`, () => {
 			const css = read(cssFile);
 			assert.match(

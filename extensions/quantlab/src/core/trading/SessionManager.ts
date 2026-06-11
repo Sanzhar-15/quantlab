@@ -710,6 +710,15 @@ export class SessionManager {
 		if (!session) {
 			return;
 		}
+		// Reentrancy gate: kill switch + webview Stop (or any two stop entry
+		// points) can race -- a second teardown would double the stopSession
+		// RPC / stopDaemon / releaseBroker (disconnecting a shared-account
+		// broker out from under another session) and double-fire
+		// sessionStopped. First caller wins; the loser logs and returns.
+		if (session.info.status === 'stopping') {
+			this.outputChannel.appendLine(`[${sessionId}] stopSession re-entered while already stopping (reason=${reason ?? 'none'}) -- ignored.`);
+			return;
+		}
 
 		// H27 root fix: a daemon-backed session must tear down the Python
 		// daemon process, not just release the broker adapter -- otherwise
@@ -730,7 +739,15 @@ export class SessionManager {
 		if (session.positionsTimer) { clearTimeout(session.positionsTimer); session.positionsTimer = undefined; }
 		if (session.ordersTimer) { clearTimeout(session.ordersTimer); session.ordersTimer = undefined; }
 
-		await this.releaseBroker(session.info.accountId);
+		try {
+			await this.releaseBroker(session.info.accountId);
+		} catch (error) {
+			// A failed broker release must not leave the session stuck in
+			// 'stopping' (the reentrancy gate would then ignore every retry).
+			session.info.status = 'error';
+			this.outputChannel.appendLine(`[${sessionId}] Broker release failed during stop: ${(error as Error).message}`);
+			throw error;
+		}
 
 		session.info.status = 'stopped';
 		session.info.endedAt = Date.now();
@@ -1585,6 +1602,13 @@ export class SessionManager {
 			// Fall back to regular stop
 			return this.stopSession(sessionId, reason);
 		}
+		// Reentrancy gate -- see stopSession. Note stopSession delegates HERE
+		// for daemon sessions BEFORE setting 'stopping', so this single gate
+		// covers both entry points without blocking the delegation.
+		if (session.info.status === 'stopping') {
+			this.outputChannel.appendLine(`[${sessionId}] stopDaemonSession re-entered while already stopping (reason=${reason ?? 'none'}) -- ignored.`);
+			return;
+		}
 
 		session.info.status = 'stopping';
 
@@ -1608,11 +1632,20 @@ export class SessionManager {
 			this.daemonClients.delete(sessionId);
 		}
 
-		// Stop daemon process
-		await this.daemonManager.stopDaemon(sessionId);
+		try {
+			// Stop daemon process
+			await this.daemonManager.stopDaemon(sessionId);
 
-		// Release broker
-		await this.releaseBroker(session.info.accountId);
+			// Release broker
+			await this.releaseBroker(session.info.accountId);
+		} catch (error) {
+			// Must not strand the session in 'stopping' (the reentrancy gate
+			// would then ignore every retry). The daemon may still be alive
+			// here -- surface that loudly; this is the kill-switch path.
+			session.info.status = 'error';
+			this.outputChannel.appendLine(`[${sessionId}] Daemon teardown failed: ${(error as Error).message}`);
+			throw error;
+		}
 
 		session.info.status = 'stopped';
 		session.info.endedAt = Date.now();
@@ -1927,6 +1960,29 @@ export class SessionManager {
 	 * Handle fill from daemon.
 	 */
 	private handleDaemonFill(sessionId: string, daemonFill: DaemonFill): void {
+		// Wire-shape gate: RoundTripAccounting throws on malformed fills
+		// (No-Fallbacks), and this is called synchronously from the IPC
+		// 'fills.update' listener -- an uncaught throw there would abort the
+		// REST of the fill batch and escape into the transport. Validate at
+		// the boundary, surface violations loudly, keep the batch going.
+		const violations: string[] = [];
+		if (daemonFill.side !== 'buy' && daemonFill.side !== 'sell') {
+			violations.push(`side=${String(daemonFill.side)}`);
+		}
+		if (typeof daemonFill.quantity !== 'number' || !Number.isFinite(daemonFill.quantity) || daemonFill.quantity <= 0) {
+			violations.push(`quantity=${String(daemonFill.quantity)}`);
+		}
+		if (typeof daemonFill.price !== 'number' || !Number.isFinite(daemonFill.price)) {
+			violations.push(`price=${String(daemonFill.price)}`);
+		}
+		if (daemonFill.commission !== undefined && (typeof daemonFill.commission !== 'number' || !Number.isFinite(daemonFill.commission))) {
+			violations.push(`commission=${String(daemonFill.commission)}`);
+		}
+		if (violations.length) {
+			this.handleError(sessionId, 'daemon_fill_invalid', `Daemon sent a malformed fill (${daemonFill.fillId ?? 'no id'}: ${violations.join(', ')}) -- fill skipped, performance metrics may undercount.`, false);
+			return;
+		}
+
 		const fill: Fill = {
 			id: daemonFill.fillId,
 			orderId: daemonFill.orderId,
@@ -1934,7 +1990,10 @@ export class SessionManager {
 			side: daemonFill.side,
 			quantity: daemonFill.quantity,
 			price: daemonFill.price,
-			commission: daemonFill.commission,
+			// An absent wire commission means the venue reported none -- zero
+			// commission is the semantic reading, not a masked error (present
+			// but non-finite values are rejected loudly above).
+			commission: daemonFill.commission ?? 0,
 			timestamp: new Date(daemonFill.timestamp).getTime(),
 		};
 

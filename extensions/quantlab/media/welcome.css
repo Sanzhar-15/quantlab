@@ -1,6 +1,8 @@
 /*---------------------------------------------------------------------------------------------
- *  QuantLab — Welcome / First-Run Panel Styles
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
 
 * {
 	box-sizing: border-box;
@@ -16,7 +18,7 @@ html, body {
 	overflow: hidden;
 }
 
-/* ── Two-column shell ── */
+/* -- Two-column shell -- */
 .welcome-shell {
 	display: grid;
 	grid-template-columns: 1fr 1fr;
@@ -31,7 +33,7 @@ html, body {
 	}
 }
 
-/* ── Left: Brand panel ── */
+/* -- Left: Brand panel -- */
 .brand-panel {
 	background: color-mix(in srgb, var(--ql-accent) 8%, var(--ql-bg));
 	border-right: 1px solid var(--ql-border);
@@ -110,7 +112,7 @@ html, body {
 	align-items: center;
 	gap: 10px;
 	font-size: var(--ql-font-size-base);
-	color: var(--ql-secondary);
+	color: var(--ql-muted);
 }
 
 .feature-list li::before {
@@ -122,7 +124,7 @@ html, body {
 	flex-shrink: 0;
 }
 
-/* ── Right: Form panel ── */
+/* -- Right: Form panel -- */
 .form-panel {
 	display: flex;
 	flex-direction: column;
@@ -155,7 +157,7 @@ html, body {
 	margin: 0 0 24px;
 }
 
-/* ── Tabs ── */
+/* -- Tabs -- */
 .tab-bar {
 	display: flex;
 	border-bottom: 1px solid var(--ql-border);
@@ -184,7 +186,7 @@ html, body {
 	font-weight: 600;
 }
 
-/* ── Form fields ── */
+/* -- Form fields -- */
 .login-form {
 	display: flex;
 	flex-direction: column;
@@ -224,7 +226,7 @@ html, body {
 	opacity: 0.7;
 }
 
-/* ── Error ── */
+/* -- Error -- */
 .error-msg {
 	font-size: var(--ql-font-size-small);
 	color: var(--ql-status-negative);
@@ -234,7 +236,7 @@ html, body {
 	border: 1px solid color-mix(in srgb, var(--ql-status-negative) 30%, transparent);
 }
 
-/* ── Buttons ── */
+/* -- Buttons -- */
 .btn {
 	border-radius: var(--ql-radius-md);
 	border: 1px solid transparent;

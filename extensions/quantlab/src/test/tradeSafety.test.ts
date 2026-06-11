@@ -248,6 +248,21 @@ suite('Trade safety (megaudit W5): round-trip accounting', () => {
 		assert.strictEqual(book.openQuantity('AAPL'), 0);
 	});
 
+	test('fractional quantities (crypto) close round trips despite float residue', () => {
+		const book = new RoundTripBook();
+		// 0.1 + 0.2 - 0.3 leaves ~3e-17 of float residue in the second lot;
+		// without epsilon snapping the cycle never closes and totalTrades
+		// freezes at 0 while realizedPnL keeps moving.
+		book.applyFill({ symbol: 'BTC', side: 'buy', quantity: 0.1, price: 80000, commission: 0 });
+		book.applyFill({ symbol: 'BTC', side: 'buy', quantity: 0.2, price: 80000, commission: 0 });
+		const stats = book.applyFill({ symbol: 'BTC', side: 'sell', quantity: 0.3, price: 81000, commission: 0 });
+
+		assert.strictEqual(stats.totalTrades, 1, 'round trip must close despite float residue');
+		assert.strictEqual(book.openQuantity('BTC'), 0, 'position must read flat');
+		assert.ok(Math.abs(stats.realizedPnL - 300) < 1e-6, `realizedPnL ~ +300, got ${stats.realizedPnL}`);
+		assert.strictEqual(stats.winRate, 100);
+	});
+
 	test('position flip closes the long cycle and opens a short cycle', () => {
 		const book = new RoundTripBook();
 		book.applyFill({ symbol: 'AAPL', side: 'buy', quantity: 100, price: 10, commission: 0 });

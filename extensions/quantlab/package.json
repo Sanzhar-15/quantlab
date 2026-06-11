@@ -1073,7 +1073,7 @@
         },
         {
           "command": "quantlab.switchToVisualise",
-          "when": "resourceExtname =~ /\\.(csv|tsv|parquet|xlsx)$/i",
+          "when": "resourceExtname =~ /\\.(csv|tsv|parquet)$/i",
           "group": "1_open@10"
         },
         {
@@ -1085,7 +1085,7 @@
       "explorer/context": [
         {
           "command": "quantlab.switchToVisualise",
-          "when": "resourceExtname =~ /\\.(csv|tsv|parquet|xlsx)$/i",
+          "when": "resourceExtname =~ /\\.(csv|tsv|parquet)$/i",
           "group": "navigation@10"
         },
         {

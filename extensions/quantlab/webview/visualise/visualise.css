@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-// Visualise View Styles
+/* Visualise View Styles */
 
 /* QuantLab Accent -- canonical chain. Must mirror tokens.css so the
 	ThemeProvider --vscode-quantlabAccent override is never clobbered. */

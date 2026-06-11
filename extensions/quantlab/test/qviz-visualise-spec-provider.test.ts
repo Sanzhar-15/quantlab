@@ -37,8 +37,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-// Install BEFORE any provider import resolves (imports hoist, so the shim
-// module evaluates first regardless of where the call sits).
+// Install BEFORE any provider import resolves. This works because the TS
+// CommonJS emit preserves statement interleaving: require(shim) ->
+// installVscodeShim() -> require(provider). Under a future ESM migration
+// the install call would need to move into the shim module itself.
 import {
 	installVscodeShim,
 	Uri,

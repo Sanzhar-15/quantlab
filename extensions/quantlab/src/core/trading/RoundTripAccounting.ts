@@ -70,6 +70,9 @@ interface SymbolBook {
 }
 
 export class RoundTripBook {
+	/** Quantities below this are float residue, not positions (see applyFill). */
+	private static readonly QTY_EPSILON = 1e-9;
+
 	private readonly books = new Map<string, SymbolBook>();
 	private totalTrades = 0;
 	private realizedPnL = 0;
@@ -108,8 +111,12 @@ export class RoundTripBook {
 		this.realizedPnL -= fill.commission;
 		book.cyclePnL -= fill.commission;
 
+		// Fractional quantities (crypto fills) accumulate float residue across
+		// fills: buy 0.1 + buy 0.2 - sell 0.3 leaves ~3e-17 in a lot, which
+		// would keep the cycle open forever and freeze totalTrades/winRate.
+		// Quantities below QTY_EPSILON are snapped to flat.
 		let remaining = fill.side === 'buy' ? fill.quantity : -fill.quantity;
-		while (remaining !== 0) {
+		while (Math.abs(remaining) >= RoundTripBook.QTY_EPSILON) {
 			const front = book.lots[0];
 			if (front === undefined || Math.sign(front.quantity) === Math.sign(remaining)) {
 				// Same direction as the open position (or flat): opens/extends a lot.
@@ -127,7 +134,7 @@ export class RoundTripBook {
 
 			front.quantity -= lotSign * matched;
 			remaining += lotSign * matched;
-			if (front.quantity === 0) {
+			if (Math.abs(front.quantity) < RoundTripBook.QTY_EPSILON) {
 				book.lots.shift();
 			}
 			if (book.lots.length === 0) {
