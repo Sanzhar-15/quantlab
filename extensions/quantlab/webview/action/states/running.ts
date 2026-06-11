@@ -17,6 +17,11 @@ let logCollapsed = false;
 // confirmation survives the full re-render on every progress/log event.
 let cancelConfirmJobId: string | null = null;
 
+// Set when the user confirms a cancel; keeps the button in its disabled
+// "Cancelling..." state across the re-renders that progress/log events
+// trigger while the cancellation is in flight.
+let cancellingJobId: string | null = null;
+
 export function renderRunningState(container: HTMLElement, state: ActionRunningState, context: RunningContext): void {
 	const actionLabel = formatActionLabel(state.action);
 	const elapsed = formatDuration(Date.now() - new Date(state.startedAt).getTime());
@@ -25,7 +30,11 @@ export function renderRunningState(container: HTMLElement, state: ActionRunningS
 	if (cancelConfirmJobId !== state.jobId) {
 		cancelConfirmJobId = null;
 	}
+	if (cancellingJobId !== state.jobId) {
+		cancellingJobId = null;
+	}
 	const confirming = cancelConfirmJobId === state.jobId;
+	const cancelling = cancellingJobId === state.jobId;
 
 	container.innerHTML = `
 		<div class="action-page running-state">
@@ -40,7 +49,8 @@ export function renderRunningState(container: HTMLElement, state: ActionRunningS
 						<button class="btn btn-danger" id="cancel-confirm-yes">Yes, cancel</button>
 						<button class="btn btn-ghost" id="cancel-confirm-no">Keep running</button>
 					</span>
-					<button class="btn btn-secondary" id="action-cancel"${confirming ? ' hidden' : ''}>Cancel</button>
+					<button class="btn btn-secondary" id="action-cancel"${confirming || cancelling ? ' hidden' : ''}${cancelling ? ' disabled' : ''}>Cancel</button>
+					<button class="btn btn-secondary" id="action-cancelling"${cancelling ? ' disabled' : ' hidden'}>Cancelling...</button>
 				</div>
 			</header>
 			<div class="divider"></div>
@@ -85,6 +95,7 @@ export function renderRunningState(container: HTMLElement, state: ActionRunningS
 		if (confirmYes) {
 			confirmYes.addEventListener('click', () => {
 				cancelConfirmJobId = null;
+				cancellingJobId = state.jobId;
 				confirmYes.disabled = true;
 				confirmYes.textContent = 'Cancelling...';
 				context.postMessage({ type: 'cancelJob', jobId: state.jobId });

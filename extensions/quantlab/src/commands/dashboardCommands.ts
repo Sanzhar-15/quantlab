@@ -60,6 +60,20 @@ function formatLargeUsd(value: number): string {
 	return '$' + value.toLocaleString();
 }
 
+/**
+ * Renders a server-sourced numeric field into HTML. The API client checks
+ * envelope shapes, not element field types -- so a non-number here is
+ * rendered ESCAPED (visible bad data, never raw HTML), and null/undefined
+ * render the placeholder dash.
+ */
+function fmtNum(value: unknown, format?: (n: number) => string): string {
+	if (value === undefined || value === null) { return '&mdash;'; }
+	if (typeof value === 'number' && Number.isFinite(value)) {
+		return format ? format(value) : value.toLocaleString();
+	}
+	return escapeHtml(String(value));
+}
+
 const CALENDAR_ROW_CAP = 50;
 
 /**
@@ -79,7 +93,7 @@ function renderCalendarBody(page: CalendarPage, emptyMessage: string): string {
 			<td>${escapeHtml(e.importance)}</td>
 		</tr>`).join('')}</tbody>
 	</table>`;
-	const countNote = `<p class="section-label">Showing ${rows.length} of ${page.total} events</p>`;
+	const countNote = `<p class="section-label">Showing ${rows.length} of ${fmtNum(page.total)} events</p>`;
 	return table + countNote;
 }
 
@@ -138,8 +152,8 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 									<td>${escapeHtml(idx.symbol ?? idx.id ?? '')}</td>
 									<td>${escapeHtml(idx.name ?? '')}</td>
 									<td>${escapeHtml(idx.region ?? '')}</td>
-									<td>${idx.value !== undefined && idx.value !== null ? idx.value.toLocaleString() : '&mdash;'}</td>
-									<td>${idx.change_pct !== undefined && idx.change_pct !== null ? idx.change_pct.toFixed(2) + '%' : '&mdash;'}</td>
+									<td>${fmtNum(idx.value)}</td>
+									<td>${fmtNum(idx.change_pct, n => n.toFixed(2) + '%')}</td>
 								</tr>`).join('')}</tbody>
 							</table>` : '')
 						: unavailableNote('Global Indices', data.indices.error);
@@ -165,12 +179,12 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 						<table class="dashboard-table">
 							<thead><tr><th>Rank</th><th>Symbol</th><th>Name</th><th>Price</th><th>Market Cap</th><th>Exchanges</th></tr></thead>
 							<tbody>${data.slice(0, 100).map(s => `<tr>
-								<td>${s.market_cap_rank}</td>
+								<td>${fmtNum(s.market_cap_rank)}</td>
 								<td>${escapeHtml(s.symbol)}</td>
 								<td>${escapeHtml(s.name)}</td>
-								<td>${'$' + s.current_price.toLocaleString()}</td>
-								<td>${formatLargeUsd(s.market_cap)}</td>
-								<td>${s.exchange_count}</td>
+								<td>${fmtNum(s.current_price, n => '$' + n.toLocaleString())}</td>
+								<td>${fmtNum(s.market_cap, formatLargeUsd)}</td>
+								<td>${fmtNum(s.exchange_count)}</td>
 							</tr>`).join('')}</tbody>
 						</table>
 						${data.length > 100 ? `<p class="section-label">Showing first 100 of ${data.length} coins</p>` : ''}` : '<div class="dash-empty">No crypto symbols available</div>';
@@ -195,7 +209,7 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 						<thead><tr><th>Metric</th><th>Value (%)</th></tr></thead>
 						<tbody>${data.map(d => `<tr>
 							<td>${escapeHtml(prettifySnakeCase(d.metric))}</td>
-							<td>${d.value.toFixed(2)}</td>
+							<td>${fmtNum(d.value, n => n.toFixed(2))}</td>
 						</tr>`).join('')}</tbody>
 					</table>`;
 				},
@@ -251,10 +265,10 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 				renderBody: (data) => {
 					return `<div class="summary-cards">
 						<div class="summary-card"><div class="label">Overall</div><div class="value">${escapeHtml(data.overall_sentiment)}</div><div class="sub">as of ${escapeHtml(formatUtcDate(data.updated_at))}</div></div>
-						<div class="summary-card"><div class="label">Bullish</div><div class="value">${data.bullish_percent.toFixed(1)}%</div></div>
-						<div class="summary-card"><div class="label">Bearish</div><div class="value">${data.bearish_percent.toFixed(1)}%</div></div>
-						<div class="summary-card"><div class="label">Neutral</div><div class="value">${data.neutral_percent.toFixed(1)}%</div></div>
-						<div class="summary-card"><div class="label">News Count</div><div class="value">${data.news_count}</div></div>
+						<div class="summary-card"><div class="label">Bullish</div><div class="value">${fmtNum(data.bullish_percent, n => n.toFixed(1))}%</div></div>
+						<div class="summary-card"><div class="label">Bearish</div><div class="value">${fmtNum(data.bearish_percent, n => n.toFixed(1))}%</div></div>
+						<div class="summary-card"><div class="label">Neutral</div><div class="value">${fmtNum(data.neutral_percent, n => n.toFixed(1))}%</div></div>
+						<div class="summary-card"><div class="label">News Count</div><div class="value">${fmtNum(data.news_count)}</div></div>
 					</div>`;
 				},
 			});
@@ -304,8 +318,8 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 					const p = data.profile;
 					const profileCard = `<div class="summary-cards">
 						<div class="summary-card"><div class="label">Company</div><div class="value">${escapeHtml(String(p.name ?? sym))}</div><div class="sub">${escapeHtml(String(p.sector ?? ''))} · ${escapeHtml(String(p.industry ?? ''))}</div></div>
-						<div class="summary-card"><div class="label">Market Cap</div><div class="value">${p.market_cap !== undefined && p.market_cap !== null ? formatLargeUsd(p.market_cap) : '&mdash;'}</div></div>
-						<div class="summary-card"><div class="label">Employees</div><div class="value">${p.employees !== undefined && p.employees !== null ? p.employees.toLocaleString() : '&mdash;'}</div></div>
+						<div class="summary-card"><div class="label">Market Cap</div><div class="value">${fmtNum(p.market_cap, formatLargeUsd)}</div></div>
+						<div class="summary-card"><div class="label">Employees</div><div class="value">${fmtNum(p.employees)}</div></div>
 						<div class="summary-card"><div class="label">CEO</div><div class="value" style="font-size:14px">${p.ceo !== undefined && p.ceo !== null ? escapeHtml(String(p.ceo)) : '&mdash;'}</div></div>
 					</div>`;
 
@@ -316,19 +330,19 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 					<table class="dashboard-table">
 						<thead><tr><th>Metric</th><th>Value</th></tr></thead>
 						<tbody>
-							<tr><td>Revenue</td><td>${s.revenue !== undefined && s.revenue !== null ? formatLargeUsd(s.revenue) : '&mdash;'}</td></tr>
-							<tr><td>Gross Profit</td><td>${s.gross_profit !== undefined && s.gross_profit !== null ? formatLargeUsd(s.gross_profit) : '&mdash;'}</td></tr>
-							<tr><td>Operating Income</td><td>${s.operating_income !== undefined && s.operating_income !== null ? formatLargeUsd(s.operating_income) : '&mdash;'}</td></tr>
-							<tr><td>Net Income</td><td>${s.net_income !== undefined && s.net_income !== null ? formatLargeUsd(s.net_income) : '&mdash;'}</td></tr>
-							<tr><td>EBITDA</td><td>${s.ebitda !== undefined && s.ebitda !== null ? formatLargeUsd(s.ebitda) : '&mdash;'}</td></tr>
-							<tr><td>EPS</td><td>${s.eps !== undefined && s.eps !== null ? '$' + s.eps.toFixed(2) : '&mdash;'}</td></tr>
+							<tr><td>Revenue</td><td>${fmtNum(s.revenue, formatLargeUsd)}</td></tr>
+							<tr><td>Gross Profit</td><td>${fmtNum(s.gross_profit, formatLargeUsd)}</td></tr>
+							<tr><td>Operating Income</td><td>${fmtNum(s.operating_income, formatLargeUsd)}</td></tr>
+							<tr><td>Net Income</td><td>${fmtNum(s.net_income, formatLargeUsd)}</td></tr>
+							<tr><td>EBITDA</td><td>${fmtNum(s.ebitda, formatLargeUsd)}</td></tr>
+							<tr><td>EPS</td><td>${fmtNum(s.eps, n => '$' + n.toFixed(2))}</td></tr>
 						</tbody>
 					</table>` : '<div class="dash-empty">No financial statements available</div>';
 
 					// Live ratio names are *_ratio suffixed; returns/margins are fractions.
 					const r = data.ratios;
-					const pct = (v: number | undefined): string => v !== undefined && v !== null ? (v * 100).toFixed(2) + '%' : '&mdash;';
-					const num = (v: number | undefined): string => v !== undefined && v !== null ? v.toFixed(2) : '&mdash;';
+					const pct = (v: number | undefined): string => fmtNum(v, n => (n * 100).toFixed(2) + '%');
+					const num = (v: number | undefined): string => fmtNum(v, n => n.toFixed(2));
 					const ratiosTable = `<p class="section-label">Valuation Ratios</p>
 					<table class="dashboard-table">
 						<thead><tr><th>Ratio</th><th>Value</th></tr></thead>
@@ -387,9 +401,9 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 								<thead><tr><th>Holder</th><th>Shares</th><th>Value</th><th>Change</th><th>Date</th></tr></thead>
 								<tbody>${data.holdings.value.map(h => `<tr>
 									<td>${escapeHtml(String(h.holder ?? ''))}</td>
-									<td>${h.shares !== undefined && h.shares !== null ? h.shares.toLocaleString() : '&mdash;'}</td>
-									<td>${h.value !== undefined && h.value !== null ? formatLargeUsd(h.value) : '&mdash;'}</td>
-									<td>${h.change !== undefined && h.change !== null ? h.change.toLocaleString() : '&mdash;'}</td>
+									<td>${fmtNum(h.shares)}</td>
+									<td>${fmtNum(h.value, formatLargeUsd)}</td>
+									<td>${fmtNum(h.change)}</td>
 									<td>${escapeHtml(String(h.date_reported ?? ''))}</td>
 								</tr>`).join('')}</tbody>
 							</table>` : '<div class="dash-empty">No holdings data</div>')
@@ -404,9 +418,9 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 									<td>${escapeHtml(String(i.name ?? ''))}</td>
 									<td>${escapeHtml(String(i.title ?? ''))}</td>
 									<td>${escapeHtml(String(i.transaction_type ?? ''))}</td>
-									<td>${i.shares !== undefined && i.shares !== null ? i.shares.toLocaleString() : '&mdash;'}</td>
-									<td>${i.price !== undefined && i.price !== null ? '$' + i.price.toFixed(2) : '&mdash;'}</td>
-									<td>${i.value !== undefined && i.value !== null ? formatLargeUsd(i.value) : '&mdash;'}</td>
+									<td>${fmtNum(i.shares)}</td>
+									<td>${fmtNum(i.price, n => '$' + n.toFixed(2))}</td>
+									<td>${fmtNum(i.value, formatLargeUsd)}</td>
 									<td>${escapeHtml(String(i.date ?? ''))}</td>
 								</tr>`).join('')}</tbody>
 							</table>` : '<div class="dash-empty">No insider data</div>')

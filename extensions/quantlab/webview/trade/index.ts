@@ -89,17 +89,32 @@ function scheduleRender(): void {
 }
 
 function render(): void {
+	// The full re-render rebuilds the inline order-modify inputs on every
+	// broker broadcast (~2s). Capture which modify input holds keyboard
+	// focus and restore it after the rebuild, or typing is interrupted
+	// mid-edit. (Number inputs do not support setSelectionRange; focus()
+	// alone puts the caret back where the user was typing -- at the end.)
+	const active = document.activeElement;
+	const refocusField = active instanceof HTMLInputElement ? active.dataset.modifyField : undefined;
+
 	container.replaceChildren();
 	if (!state.session) {
 		renderNoSession(container, state, { postMessage });
 		return;
 	}
 	renderActiveSession(container, state, { postMessage });
+
+	if (refocusField) {
+		const input = container.querySelector<HTMLInputElement>(`input[data-modify-field="${refocusField}"]`);
+		if (input) {
+			input.focus();
+		}
+	}
 }
 
 function handleMessage(message: unknown): void {
 	const data = message as TradeOutboundMessage;
-	if (!data || typeof data !== 'object' || !('type' in data)) {
+	if (!data || typeof data !== 'object' || typeof (data as { type?: unknown }).type !== 'string') {
 		return;
 	}
 
@@ -209,17 +224,19 @@ function shouldApplyMessage(data: TradeOutboundMessage): boolean {
 		}
 	}
 
-	if (!('seq' in data) || typeof data.seq !== 'number') {
+	const seq = (data as { seq?: unknown }).seq;
+	const sessionId = (data as { sessionId?: unknown }).sessionId;
+	if (typeof seq !== 'number') {
 		return true;
 	}
-	if (!('sessionId' in data) || typeof data.sessionId !== 'string') {
+	if (typeof sessionId !== 'string') {
 		return true;
 	}
-	const lastSeq = lastSeqBySession.get(data.sessionId) ?? -1;
-	if (data.seq <= lastSeq) {
+	const lastSeq = lastSeqBySession.get(sessionId) ?? -1;
+	if (seq <= lastSeq) {
 		return false;
 	}
-	lastSeqBySession.set(data.sessionId, data.seq);
+	lastSeqBySession.set(sessionId, seq);
 	return true;
 }
 

@@ -145,6 +145,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 	private cryptoSymbols: CryptoSymbol[] | undefined;
 	private cryptoSymbolSet = new Set<string>();
 	private cryptoLoading = false;
+	private cryptoLoadPromise: Promise<void> | undefined;
 	private cryptoRetryCount = 0;
 	private cryptoError: string | undefined;
 	private cryptoRetryTimer: NodeJS.Timeout | undefined;
@@ -365,9 +366,16 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		} satisfies WatchlistNode));
 	}
 
-	private getWatchlistChildren(wl: Watchlist): DataNode[] {
+	private async getWatchlistChildren(wl: Watchlist): Promise<DataNode[]> {
 		if (!wl.symbols.length) {
 			return [this.placeholder(`quantlab.watchlist.${wl.id}.empty`, 'Empty watchlist')];
+		}
+		// Bare crypto symbols (BTC) are indistinguishable from equity tickers
+		// without the server coins list -- resolve it before routing, or a
+		// cold tree would chart crypto against the equities bars endpoint.
+		const hasServerSymbols = wl.symbols.some(sym => !sym.includes('/') && !sym.includes('\\') && !sym.endsWith('.csv'));
+		if (hasServerSymbols && this.cryptoSymbolSet.size === 0) {
+			await this.loadCryptoSymbols();
 		}
 		return wl.symbols.map(sym => {
 			const isServerSymbol = !sym.includes('/') && !sym.includes('\\') && !sym.endsWith('.csv');
@@ -635,15 +643,16 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 				.map(s => this.equityInstrumentNode(s));
 		}
 		if (assetClass === 'crypto' && this.cryptoSymbols) {
-			// Mirror the grouping rule in getCryptoSpotNodes (symbol prefix).
-			// The old filter compared s.category against the BTC/ETH/Other
-			// group keys, so the BTC and ETH groups always came up empty.
+			// Mirror the rank-based grouping rule in getCryptoSpotNodes.
+			const inTop25 = (s: CryptoSymbol) => s.market_cap_rank >= 1 && s.market_cap_rank <= 25;
+			const inTop100 = (s: CryptoSymbol) => s.market_cap_rank > 25 && s.market_cap_rank <= 100;
 			return this.cryptoSymbols
 				.filter(s => {
-					if (sector === 'BTC') { return s.symbol.startsWith('BTC'); }
-					if (sector === 'ETH') { return s.symbol.startsWith('ETH'); }
-					return !s.symbol.startsWith('BTC') && !s.symbol.startsWith('ETH');
+					if (sector === 'crypto-top25') { return inTop25(s); }
+					if (sector === 'crypto-top100') { return inTop100(s); }
+					return !inTop25(s) && !inTop100(s);
 				})
+				.sort((a, b) => a.market_cap_rank - b.market_cap_rank)
 				.map(s => this.cryptoInstrumentNode(s));
 		}
 		return [this.placeholder(`sector.${sector}.empty`, 'No data')];
@@ -750,42 +759,44 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			return [this.placeholder('crypto.spot.empty', 'No crypto symbols available')];
 		}
 
-		// Group by base asset category
-		const btcPairs = this.cryptoSymbols.filter(s => s.symbol.startsWith('BTC'));
-		const ethPairs = this.cryptoSymbols.filter(s => s.symbol.startsWith('ETH'));
-		const altcoins = this.cryptoSymbols.filter(s => !s.symbol.startsWith('BTC') && !s.symbol.startsWith('ETH'));
+		// Group by market-cap rank -- the only ordering field the live coins
+		// carry. (The old BTC/ETH symbol-prefix groups mis-bucketed coins
+		// like ETHFI/BTCS and held a single coin each.)
+		const top25 = this.cryptoSymbols.filter(s => s.market_cap_rank >= 1 && s.market_cap_rank <= 25);
+		const top100 = this.cryptoSymbols.filter(s => s.market_cap_rank > 25 && s.market_cap_rank <= 100);
+		const rest = this.cryptoSymbols.filter(s => !(s.market_cap_rank >= 1 && s.market_cap_rank <= 100));
 
 		const nodes: DataNode[] = [];
 
-		if (btcPairs.length) {
+		if (top25.length) {
 			nodes.push({
 				nodeKind: 'sector',
-				id: 'quantlab.crypto.btc',
-				label: 'Bitcoin (BTC)',
-				description: `${btcPairs.length} pairs`,
-				sector: 'BTC',
+				id: 'quantlab.crypto.top25',
+				label: 'Top 25',
+				description: `${top25.length} coins`,
+				sector: 'crypto-top25',
 				assetClass: 'crypto',
 				collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
 			} satisfies SectorNode);
 		}
-		if (ethPairs.length) {
+		if (top100.length) {
 			nodes.push({
 				nodeKind: 'sector',
-				id: 'quantlab.crypto.eth',
-				label: 'Ethereum (ETH)',
-				description: `${ethPairs.length} pairs`,
-				sector: 'ETH',
+				id: 'quantlab.crypto.top100',
+				label: 'Top 26-100',
+				description: `${top100.length} coins`,
+				sector: 'crypto-top100',
 				assetClass: 'crypto',
 				collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
 			} satisfies SectorNode);
 		}
-		if (altcoins.length) {
+		if (rest.length) {
 			nodes.push({
 				nodeKind: 'sector',
-				id: 'quantlab.crypto.alt',
-				label: 'Altcoins',
-				description: `${altcoins.length} pairs`,
-				sector: 'Other',
+				id: 'quantlab.crypto.rest',
+				label: 'Beyond Top 100',
+				description: `${rest.length} coins`,
+				sector: 'crypto-rest',
 				assetClass: 'crypto',
 				collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
 			} satisfies SectorNode);
@@ -814,14 +825,14 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 	// ---- Crypto symbol detection ----
 
 	private isCryptoSymbol(symbol: string): boolean {
-		if (this.cryptoSymbolSet.size > 0) {
-			return this.cryptoSymbolSet.has(symbol);
-		}
-		// Lazy load not yet complete -- use underscore heuristic (crypto symbols use BTC_USDT format)
-		if (!this.cryptoLoading) {
+		// Live coins are bare symbols (BTC, ETH) -- indistinguishable from
+		// equity tickers without the server coins list, so membership is the
+		// only test. Callers that must route correctly (watchlists) await
+		// loadCryptoSymbols() first.
+		if (this.cryptoSymbolSet.size === 0 && !this.cryptoLoading) {
 			void this.loadCryptoSymbols();
 		}
-		return symbol.includes('_');
+		return this.cryptoSymbolSet.has(symbol);
 	}
 
 	// ---- Coming soon / stub nodes ----
@@ -891,7 +902,17 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		}
 	}
 
-	private async loadCryptoSymbols(): Promise<void> {
+	private loadCryptoSymbols(): Promise<void> {
+		// Hand awaiting callers the in-flight load instead of the
+		// re-entrancy guard's early return.
+		if (this.cryptoLoadPromise) { return this.cryptoLoadPromise; }
+		this.cryptoLoadPromise = this.doLoadCryptoSymbols().finally(() => {
+			this.cryptoLoadPromise = undefined;
+		});
+		return this.cryptoLoadPromise;
+	}
+
+	private async doLoadCryptoSymbols(): Promise<void> {
 		if (this.disposed || this.cryptoLoading) { return; }
 		this.cryptoLoading = true;
 		try {

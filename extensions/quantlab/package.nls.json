@@ -123,5 +123,9 @@
 	"command.openSentimentDashboard.title": "Open Sentiment Dashboard",
 	"command.openNewsFlow.title": "Open News Flow",
 	"command.openFundamentals.title": "Open Fundamentals",
-	"command.openInstitutional.title": "Open Institutional Data"
+	"command.openInstitutional.title": "Open Institutional Data",
+	"command.watchlist.create.title": "New Watchlist...",
+	"command.watchlist.rename.title": "Rename Watchlist...",
+	"command.watchlist.delete.title": "Delete Watchlist",
+	"command.watchlist.removeSymbol.title": "Remove from Watchlist"
 }

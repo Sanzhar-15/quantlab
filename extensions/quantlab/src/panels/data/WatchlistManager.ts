@@ -340,9 +340,6 @@ export class WatchlistManager {
 			const client = ServerApiClient.getInstance();
 			let hasChanges = false;
 
-			// Snapshot version before async work -- used to detect concurrent user edits
-			const versionAtStart = this.localVersion;
-
 			// Process each local watchlist (create new array to avoid mutation)
 			const updatedWatchlists = await Promise.all(
 				this.watchlists.map(async (local) => {
@@ -363,9 +360,22 @@ export class WatchlistManager {
 				})
 			);
 
-			// Update watchlists only if no user edits happened during await
-			if (hasChanges && this.localVersion === versionAtStart) {
-				this.watchlists = updatedWatchlists;
+			// Merge ONLY the new serverId assignments back into the CURRENT
+			// lists, matched by local id. A user edit that raced the create
+			// keeps its name/symbols, but the assigned serverId must never be
+			// dropped -- losing it makes the next push re-create (duplicate)
+			// the same watchlist on the server.
+			if (hasChanges) {
+				const assigned = new Map<string, string>();
+				for (const updated of updatedWatchlists) {
+					if (updated.serverId) {
+						assigned.set(updated.id, updated.serverId);
+					}
+				}
+				this.watchlists = this.watchlists.map(local => {
+					const serverId = assigned.get(local.id);
+					return !local.serverId && serverId ? { ...local, serverId } : local;
+				});
 				this.localVersion++; // Track mutation to prevent syncFromServer race
 				// Persist the updated serverId mappings
 				await this.context.globalState.update(STORAGE_KEY, this.watchlists);

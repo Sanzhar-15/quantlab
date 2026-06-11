@@ -1086,10 +1086,20 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 	private async finishRun(jobId: string, tabId: string, result: JobResult): Promise<void> {
 		const entry = this.historyState.getEntry(jobId);
 		const completedAt = new Date();
-		const artifactPath = await this.writeArtifacts(jobId, result);
+		// Artifact persistence must not gate the terminal History transition:
+		// an fs failure here used to leave the entry 'running' forever (the
+		// phantom-running class this wave kills). A completed run with a
+		// missing artifact -- loudly reported -- beats a phantom.
 		const logs = this.getCachedLogs(jobId);
-		if (logs && logs.length) {
-			await this.persistRunLogs(jobId, logs);
+		let artifactPath = '';
+		try {
+			artifactPath = await this.writeArtifacts(jobId, result);
+			if (logs && logs.length) {
+				await this.persistRunLogs(jobId, logs);
+			}
+		} catch (err) {
+			console.error(`ActionViewProvider: artifact persistence failed for run ${jobId}:`, err);
+			void vscode.window.showWarningMessage('Run completed, but its artifacts could not be saved -- export and rerun-from-config are unavailable for this run.');
 		}
 
 		this.historyState.updateEntry(jobId, {

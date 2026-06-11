@@ -506,6 +506,10 @@ function buildModifyRow(order: Order, state: ActiveSessionState, actions: Active
 	quantityInput.min = '0';
 	quantityInput.step = '1';
 	quantityInput.value = modifyDraft && modifyDraft.orderId === order.id ? modifyDraft.quantity : String(order.quantity);
+	// Focus anchor: the render loop re-focuses this input after the full
+	// re-render every broker broadcast triggers (~2s) -- without it the
+	// keyboard focus is yanked mid-typing.
+	quantityInput.dataset.modifyField = 'quantity';
 	quantityInput.setAttribute('aria-label', `New quantity for order ${order.id}`);
 	quantityInput.addEventListener('input', () => {
 		if (modifyDraft && modifyDraft.orderId === order.id) {
@@ -518,6 +522,7 @@ function buildModifyRow(order: Order, state: ActiveSessionState, actions: Active
 	priceInput.min = '0';
 	priceInput.step = '0.01';
 	priceInput.value = modifyDraft && modifyDraft.orderId === order.id ? modifyDraft.price : (order.price !== undefined ? String(order.price) : '');
+	priceInput.dataset.modifyField = 'price';
 	priceInput.setAttribute('aria-label', `New price for order ${order.id}`);
 	priceInput.addEventListener('input', () => {
 		if (modifyDraft && modifyDraft.orderId === order.id) {

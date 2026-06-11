@@ -23,45 +23,6 @@ export interface ServerDataSource {
 
 export type DataSourceDescriptor = LocalFileDataSource | ServerDataSource;
 
-// Server symbol with metadata
-export interface SymbolInfo {
-	symbol: string;
-	name: string;
-	sector: string;
-	basePrice: number;
-	trend?: string;
-	tradeable?: boolean;
-}
-
-// Server watchlist
-export interface WatchlistInfo {
-	id: string;
-	name: string;
-	symbols: string[];
-	isDefault: boolean;
-	sortOrder: number;
-}
-
-// Server quote for real-time data
-export interface QuoteInfo {
-	symbol: string;
-	timestamp: number;
-	bid: number;
-	bidSize: number;
-	ask: number;
-	askSize: number;
-	last: number;
-	lastSize: number;
-	volume: number;
-	vwap?: number;
-	open?: number;
-	high?: number;
-	low?: number;
-	close?: number;
-	change?: number;
-	changePct?: number;
-}
-
 export interface GlobalMarketState {
 	dataSource?: DataSourceDescriptor;
 	timeframe?: Timeframe;

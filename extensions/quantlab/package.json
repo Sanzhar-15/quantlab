@@ -590,23 +590,23 @@
       },
       {
         "command": "quantlab.watchlist.create",
-        "title": "New Watchlist...",
+        "title": "%command.watchlist.create.title%",
         "category": "%command.category%",
         "icon": "$(add)"
       },
       {
         "command": "quantlab.watchlist.rename",
-        "title": "Rename Watchlist...",
+        "title": "%command.watchlist.rename.title%",
         "category": "%command.category%"
       },
       {
         "command": "quantlab.watchlist.delete",
-        "title": "Delete Watchlist",
+        "title": "%command.watchlist.delete.title%",
         "category": "%command.category%"
       },
       {
         "command": "quantlab.watchlist.removeSymbol",
-        "title": "Remove from Watchlist",
+        "title": "%command.watchlist.removeSymbol.title%",
         "category": "%command.category%",
         "icon": "$(remove)"
       }
