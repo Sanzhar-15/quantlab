@@ -12,10 +12,20 @@ interface RunningContext {
 
 let logCollapsed = false;
 
+// VS Code webviews block window.confirm/prompt/alert, so cancel confirmation
+// is an inline two-button row (megaudit H24). Module-level so the pending
+// confirmation survives the full re-render on every progress/log event.
+let cancelConfirmJobId: string | null = null;
+
 export function renderRunningState(container: HTMLElement, state: ActionRunningState, context: RunningContext): void {
 	const actionLabel = formatActionLabel(state.action);
 	const elapsed = formatDuration(Date.now() - new Date(state.startedAt).getTime());
 	const progress = Math.min(100, Math.max(0, state.progress));
+
+	if (cancelConfirmJobId !== state.jobId) {
+		cancelConfirmJobId = null;
+	}
+	const confirming = cancelConfirmJobId === state.jobId;
 
 	container.innerHTML = `
 		<div class="action-page running-state">
@@ -25,7 +35,12 @@ export function renderRunningState(container: HTMLElement, state: ActionRunningS
 					<p class="page-subtitle">Execution in progress.</p>
 				</div>
 				<div class="header-actions">
-					<button class="btn btn-secondary" id="action-cancel">Cancel</button>
+					<span class="inline-confirm${confirming ? ' show' : ''}" id="cancel-confirm">
+						<span class="inline-confirm-text">Cancel this job?</span>
+						<button class="btn btn-danger" id="cancel-confirm-yes">Yes, cancel</button>
+						<button class="btn btn-ghost" id="cancel-confirm-no">Keep running</button>
+					</span>
+					<button class="btn btn-secondary" id="action-cancel"${confirming ? ' hidden' : ''}>Cancel</button>
 				</div>
 			</header>
 			<div class="divider"></div>
@@ -58,12 +73,32 @@ export function renderRunningState(container: HTMLElement, state: ActionRunningS
 	`;
 
 	const cancelButton = container.querySelector<HTMLButtonElement>('#action-cancel');
-	if (cancelButton) {
+	const confirmRow = container.querySelector<HTMLElement>('#cancel-confirm');
+	if (cancelButton && confirmRow) {
 		cancelButton.addEventListener('click', () => {
-			if (window.confirm('Cancel this job?')) {
-				context.postMessage({ type: 'cancelJob', jobId: state.jobId });
-			}
+			cancelConfirmJobId = state.jobId;
+			cancelButton.hidden = true;
+			confirmRow.classList.add('show');
 		});
+
+		const confirmYes = confirmRow.querySelector<HTMLButtonElement>('#cancel-confirm-yes');
+		if (confirmYes) {
+			confirmYes.addEventListener('click', () => {
+				cancelConfirmJobId = null;
+				confirmYes.disabled = true;
+				confirmYes.textContent = 'Cancelling...';
+				context.postMessage({ type: 'cancelJob', jobId: state.jobId });
+			});
+		}
+
+		const confirmNo = confirmRow.querySelector<HTMLButtonElement>('#cancel-confirm-no');
+		if (confirmNo) {
+			confirmNo.addEventListener('click', () => {
+				cancelConfirmJobId = null;
+				confirmRow.classList.remove('show');
+				cancelButton.hidden = false;
+			});
+		}
 	}
 
 	const toggleButton = container.querySelector<HTMLButtonElement>('#log-toggle');

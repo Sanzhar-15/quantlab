@@ -110,6 +110,15 @@ export function renderResultsState(container: HTMLElement, state: ActionResultsS
 					${!isOfflineResource ? '<button class="btn btn-ghost" id="action-pin">Pin Run</button>' : ''}
 					${!isOfflineResource ? '<button class="btn btn-ghost" id="action-compare">Add to Compare</button>' : ''}
 				</div>
+				${!isOfflineResource && hasArtifacts ? `
+					<div class="export-format-row" id="export-format-row" hidden>
+						<span class="export-format-label">Export as:</span>
+						<button class="btn btn-secondary" data-export-format="json">JSON</button>
+						<button class="btn btn-secondary" data-export-format="csv">CSV</button>
+						<button class="btn btn-secondary" data-export-format="html">HTML</button>
+						<span class="export-status" id="export-status"></span>
+					</div>
+				` : ''}
 			</section>
 		</div>
 	`;
@@ -135,11 +144,28 @@ export function renderResultsState(container: HTMLElement, state: ActionResultsS
 		});
 	}
 
+	// VS Code webviews block window.prompt/alert, so format selection is an
+	// inline button row toggled by the Export button (megaudit H25).
 	const exportButton = container.querySelector<HTMLButtonElement>('#action-export');
-	if (exportButton && hasArtifacts) {
+	const exportRow = container.querySelector<HTMLElement>('#export-format-row');
+	if (exportButton && exportRow && hasArtifacts) {
 		exportButton.addEventListener('click', () => {
-			showExportPrompt(state.runId, context.postMessage);
+			exportRow.hidden = !exportRow.hidden;
 		});
+
+		const exportStatus = exportRow.querySelector<HTMLElement>('#export-status');
+		for (const formatButton of Array.from(exportRow.querySelectorAll<HTMLButtonElement>('button[data-export-format]'))) {
+			formatButton.addEventListener('click', () => {
+				const format = formatButton.dataset.exportFormat;
+				if (format !== 'json' && format !== 'csv' && format !== 'html') {
+					return;
+				}
+				context.postMessage({ type: 'exportResults', runId: state.runId, format });
+				if (exportStatus) {
+					exportStatus.textContent = `Export started (${format.toUpperCase()}).`;
+				}
+			});
+		}
 	}
 
 	const logsButton = container.querySelector<HTMLButtonElement>('#action-view-logs');
@@ -298,19 +324,4 @@ function renderLogEntry(timestamp: string, message: string, level?: string): str
 			<span class="log-message">${escapeHtml(message)}</span>
 		</div>
 	`;
-}
-
-function showExportPrompt(runId: string, postMessage: (message: unknown) => void): void {
-	const format = window.prompt('Export format: json, csv, html', 'json');
-	if (!format) {
-		return;
-	}
-
-	const normalized = format.trim().toLowerCase();
-	if (normalized !== 'json' && normalized !== 'csv' && normalized !== 'html') {
-		window.alert('Unsupported format. Use json, csv, or html.');
-		return;
-	}
-
-	postMessage({ type: 'exportResults', runId, format: normalized });
 }

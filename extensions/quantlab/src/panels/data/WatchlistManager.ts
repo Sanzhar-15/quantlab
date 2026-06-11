@@ -21,19 +21,34 @@ export class WatchlistManager {
 	private readonly _onDidChange = new vscode.EventEmitter<void>();
 	readonly onDidChange = this._onDidChange.event;
 
+	// Server-sync failure surface (M4): callers subscribe and show the message
+	// to the user. Errors are never swallowed silently.
+	private readonly _onSyncError = new vscode.EventEmitter<string>();
+	readonly onSyncError = this._onSyncError.event;
+
 	private watchlists: Watchlist[] = [];
 	private pendingPersist: NodeJS.Timeout | undefined;
 	private pendingServerSync: NodeJS.Timeout | undefined;
 	private serverSyncEnabled: boolean = true;
 	private serverSyncPromise: Promise<void> | null = null;
 	private localVersion: number = 0; // Track local changes
+	private readonly authListener: vscode.Disposable;
+	private lastAuthSignedIn: boolean | undefined;
 
 	constructor(private readonly context: vscode.ExtensionContext) {
 		this.watchlists = this.restore();
 		// Sync with server on initialization (non-blocking)
 		void this.syncFromServer();
 		// Re-sync when the user signs in (the startup sync fails while signed out).
-		ServerApiClient.getInstance().onAuthStateChange(signedIn => {
+		// The Disposable is kept and disposed in dispose() (M1: the dangling
+		// listener used to fire syncFromServer on a disposed manager).
+		this.authListener = ServerApiClient.getInstance().onAuthStateChange(signedIn => {
+			// onAuthStateChange also fires on every token refresh (M119);
+			// only react to an actual signed-in/out transition.
+			if (signedIn === this.lastAuthSignedIn) {
+				return;
+			}
+			this.lastAuthSignedIn = signedIn;
 			if (signedIn) {
 				void this.syncFromServer();
 			}
@@ -205,9 +220,14 @@ export class WatchlistManager {
 				this._onDidChange.fire();
 			}
 		} catch (error) {
-			// Log for debugging but don't interrupt - offline mode will use local watchlists
+			// Offline mode keeps the local watchlists, but the failure must be
+			// visible (M4). A signed-out pull is the routine startup state and is
+			// only logged; anything else is surfaced to subscribers.
 			const message = error instanceof Error ? error.message : String(error);
-			console.debug(`WatchlistManager: Server sync failed - ${message}`);
+			console.warn(`WatchlistManager: server sync (pull) failed - ${message}`);
+			if (!/not signed in/i.test(message)) {
+				this._onSyncError.fire(`Watchlist sync from server failed: ${message}`);
+			}
 		}
 	}
 
@@ -305,7 +325,14 @@ export class WatchlistManager {
 	}
 
 	private async syncToServer(): Promise<void> {
-		if (!this.serverSyncEnabled || this.serverSyncPromise) {
+		if (!this.serverSyncEnabled) {
+			return;
+		}
+		if (this.serverSyncPromise) {
+			// A pull-sync is in flight. Re-schedule the upload instead of
+			// silently dropping it (M5: local changes could never reach the
+			// server when an edit raced the pull).
+			this.scheduleServerSync();
 			return;
 		}
 
@@ -344,9 +371,11 @@ export class WatchlistManager {
 				await this.context.globalState.update(STORAGE_KEY, this.watchlists);
 			}
 		} catch (error) {
-			// Log for debugging but don't interrupt - offline mode will queue changes for later
+			// The upload only runs after a local edit, so a failure means the
+			// user's change did not reach the server. Surface it (M4).
 			const message = error instanceof Error ? error.message : String(error);
-			console.debug(`WatchlistManager: Server sync to failed - ${message}`);
+			console.warn(`WatchlistManager: server sync (push) failed - ${message}`);
+			this._onSyncError.fire(`Watchlist sync to server failed: ${message}`);
 		}
 	}
 
@@ -359,9 +388,11 @@ export class WatchlistManager {
 			const client = ServerApiClient.getInstance();
 			await client.deleteWatchlist(serverId);
 		} catch (error) {
-			// Log for debugging but don't interrupt
+			// The list is already gone locally; a server failure leaves ghost
+			// data on the server. Surface it (M4).
 			const message = error instanceof Error ? error.message : String(error);
-			console.debug(`WatchlistManager: Failed to delete watchlist on server - ${message}`);
+			console.warn(`WatchlistManager: failed to delete watchlist on server - ${message}`);
+			this._onSyncError.fire(`Failed to delete watchlist on server: ${message}`);
 		}
 	}
 
@@ -387,7 +418,11 @@ export class WatchlistManager {
 			clearTimeout(this.pendingServerSync);
 			this.pendingServerSync = undefined;
 		}
-		// Dispose EventEmitter
+		// Unhook the auth listener (M1: it used to outlive the manager and
+		// fire syncFromServer on a disposed instance).
+		this.authListener.dispose();
+		// Dispose EventEmitters
 		this._onDidChange.dispose();
+		this._onSyncError.dispose();
 	}
 }

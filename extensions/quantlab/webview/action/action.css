@@ -180,6 +180,11 @@ body {
 	background: var(--ql-accent-muted);
 }
 
+.btn-danger {
+	background: var(--ql-status-negative);
+	color: var(--ql-text-inverse);
+}
+
 .btn.drop-target {
 	border-color: var(--ql-accent);
 	box-shadow: 0 0 0 1px var(--ql-accent);
@@ -498,7 +503,45 @@ body {
 	gap: 8px;
 }
 
-/* ── Prompt State ───────────────────────────────────────────────────────────── */
+/* Inline confirm row (VS Code webviews block window.confirm) */
+.inline-confirm {
+	display: none;
+	align-items: center;
+	gap: 8px;
+}
+
+.inline-confirm.show {
+	display: inline-flex;
+}
+
+.inline-confirm-text {
+	color: var(--ql-status-warning);
+	font-weight: 600;
+}
+
+/* Inline export format selector (VS Code webviews block window.prompt) */
+.export-format-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+	margin-top: 8px;
+}
+
+.export-format-row[hidden] {
+	display: none;
+}
+
+.export-format-label {
+	color: var(--vscode-descriptionForeground);
+}
+
+.export-status {
+	color: var(--ql-status-positive);
+	font-size: 11px;
+}
+
+/* -- Prompt State ------------------------------------------------------------- */
 
 .prompt-state {
 	display: flex;
@@ -547,7 +590,7 @@ body {
 	opacity: 0.7;
 }
 
-/* ── Resource Header ───────────────────────────────────────────────────────── */
+/* -- Resource Header --------------------------------------------------------- */
 
 .resource-header {
 	padding: 12px 14px;
@@ -563,7 +606,7 @@ body {
 	line-height: 1.5;
 }
 
-/* ── Test Choice Group ─────────────────────────────────────────────────────── */
+/* -- Test Choice Group ------------------------------------------------------- */
 
 .test-choice-group {
 	display: flex;
@@ -600,7 +643,7 @@ body {
 	margin-top: 2px;
 }
 
-/* ── Stats Results ─────────────────────────────────────────────────────────── */
+/* -- Stats Results ----------------------------------------------------------- */
 
 .conclusion-badge {
 	display: inline-block;
@@ -661,7 +704,7 @@ body {
 	font-size: 12px;
 }
 
-/* ── Confidence Table ──────────────────────────────────────────────────────── */
+/* -- Confidence Table -------------------------------------------------------- */
 
 .confidence-table {
 	width: 100%;

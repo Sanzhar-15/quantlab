@@ -105,7 +105,7 @@ export class HistoryState {
 			clearTimeout(this.pendingPersist);
 			this.pendingPersist = undefined;
 		}
-		// Flush any pending state before disposing (fire-and-forget — best effort on synchronous dispose)
+		// Flush any pending state before disposing (fire-and-forget -- best effort on synchronous dispose)
 		void this.persistNow();
 		this._onDidAdd.dispose();
 		this._onDidUpdate.dispose();
@@ -452,16 +452,30 @@ export class HistoryState {
 			return;
 		}
 
+		let interruptedRuns = 0;
 		for (const entry of stored) {
 			const parsed = this.deserialize(entry);
 			if (!parsed) {
 				continue;
+			}
+			if (parsed.status === 'running' || parsed.status === 'queued') {
+				// No engine job survives a host reload, so a persisted
+				// non-terminal status is a phantom: surface the interruption
+				// instead of showing a forever-running entry (megaudit H26/H34).
+				console.warn(`HistoryState: run ${parsed.id} was '${parsed.status}' when the host reloaded; marking it failed.`);
+				parsed.status = 'failed';
+				parsed.errorMessage = 'Run interrupted (host reload)';
+				parsed.completedAt = new Date();
+				interruptedRuns += 1;
 			}
 			this.entries.set(parsed.id, parsed);
 			this.entryOrder.push(parsed.id);
 			if (this.isCounted(parsed)) {
 				this.unviewedCount += 1;
 			}
+		}
+		if (interruptedRuns > 0) {
+			this.schedulePersist();
 		}
 	}
 
@@ -471,7 +485,9 @@ export class HistoryState {
 			return;
 		}
 
-		this.compareOrder = stored.filter(id => typeof id === 'string');
+		// Drop ids whose entries were pruned/cleared so getCompareCount()
+		// matches the entries actually shown (megaudit M59).
+		this.compareOrder = stored.filter(id => typeof id === 'string' && this.entries.has(id));
 	}
 
 	private deserialize(raw: HistoryEntryStored): HistoryEntry | undefined {

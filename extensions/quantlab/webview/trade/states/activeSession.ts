@@ -21,6 +21,27 @@ interface ActiveSessionActions {
 	postMessage: (message: unknown) => void;
 }
 
+// VS Code webviews block window.prompt, so order modification is an inline
+// editing row (megaudit H30). Module-level so the open editor and the typed
+// values survive the full re-render triggered by every broadcast (heartbeat,
+// orders, positions, performance).
+interface ModifyDraft {
+	orderId: string;
+	quantity: string;
+	price: string;
+}
+let modifyDraft: ModifyDraft | null = null;
+
+// Broker-sourced strings (symbols, account names, order fields, activity
+// messages) must not reach innerHTML unescaped (megaudit M49).
+function escapeHtml(value: string): string {
+	return value
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;');
+}
+
 export function renderActiveSession(container: HTMLElement, state: ActiveSessionState, actions: ActiveSessionActions): void {
 	const page = document.createElement('div');
 	page.className = 'trade-page';
@@ -43,7 +64,7 @@ function renderHeader(state: ActiveSessionState, actions: ActiveSessionActions):
 	const title = document.createElement('div');
 	title.innerHTML = `
 		<h1>Trade Session</h1>
-		<p class="page-subtitle">${state.session.type === 'paper' ? 'Paper' : 'Live'} - ${state.session.symbol} ${state.session.timeframe}</p>
+		<p class="page-subtitle">${state.session.type === 'paper' ? 'Paper' : 'Live'} - ${escapeHtml(state.session.symbol)} ${escapeHtml(state.session.timeframe)}</p>
 	`;
 
 	const actionsWrap = document.createElement('div');
@@ -260,7 +281,7 @@ function renderPositions(state: ActiveSessionState, actions: ActiveSessionAction
 	for (const position of state.positions) {
 		const row = document.createElement('tr');
 		row.innerHTML = `
-			<td>${position.symbol}</td>
+			<td>${escapeHtml(position.symbol)}</td>
 			<td>${position.quantity}</td>
 			<td>$${position.avgPrice.toFixed(2)}</td>
 			<td>$${position.currentPrice.toFixed(2)}</td>
@@ -292,6 +313,14 @@ function renderOrders(state: ActiveSessionState, actions: ActiveSessionActions):
 
 	const openOrders = state.orders.filter(order => order.status === 'open' || order.status === 'partial' || order.status === 'pending');
 
+	if (modifyDraft !== null) {
+		const draftId = modifyDraft.orderId;
+		if (!openOrders.some(order => order.id === draftId)) {
+			// The order being edited filled/cancelled out from under the editor.
+			modifyDraft = null;
+		}
+	}
+
 	if (!openOrders.length) {
 		card.appendChild(emptyRow('No open orders.'));
 		return card;
@@ -317,12 +346,12 @@ function renderOrders(state: ActiveSessionState, actions: ActiveSessionActions):
 		const row = document.createElement('tr');
 		const priceLabel = order.price !== undefined ? `$${order.price.toFixed(2)}` : 'Market';
 		row.innerHTML = `
-			<td>${order.symbol}</td>
-			<td>${order.side.toUpperCase()}</td>
+			<td>${escapeHtml(order.symbol)}</td>
+			<td>${escapeHtml(order.side.toUpperCase())}</td>
 			<td>${order.quantity}</td>
-			<td>${order.type}</td>
+			<td>${escapeHtml(order.type)}</td>
 			<td>${priceLabel}</td>
-			<td>${order.status}</td>
+			<td>${escapeHtml(order.status)}</td>
 			<td></td>
 		`;
 		const actionCell = row.lastElementChild as HTMLTableCellElement;
@@ -330,7 +359,23 @@ function renderOrders(state: ActiveSessionState, actions: ActiveSessionActions):
 		modify.className = 'btn btn-ghost';
 		modify.textContent = 'Modify';
 		modify.setAttribute('aria-label', `Modify order ${order.id}`);
-		modify.addEventListener('click', () => promptModify(order, state, actions));
+		modify.addEventListener('click', () => {
+			if (modifyDraft && modifyDraft.orderId === order.id) {
+				return;
+			}
+			modifyDraft = {
+				orderId: order.id,
+				quantity: String(order.quantity),
+				price: order.price !== undefined ? String(order.price) : ''
+			};
+			// Only one order is editable at a time; replace any open editor row
+			// immediately instead of waiting for the next broadcast re-render.
+			const existing = body.querySelector('.modify-row');
+			if (existing) {
+				existing.remove();
+			}
+			row.insertAdjacentElement('afterend', buildModifyRow(order, state, actions));
+		});
 
 		const cancel = document.createElement('button');
 		cancel.className = 'btn btn-ghost';
@@ -342,10 +387,14 @@ function renderOrders(state: ActiveSessionState, actions: ActiveSessionActions):
 		actionCell.appendChild(cancel);
 		body.appendChild(row);
 
+		if (modifyDraft && modifyDraft.orderId === order.id) {
+			body.appendChild(buildModifyRow(order, state, actions));
+		}
+
 		if (order.rejectionReason) {
 			const reason = document.createElement('tr');
 			reason.className = 'row-note';
-			reason.innerHTML = `<td colspan="7">Rejected: ${order.rejectionReason}</td>`;
+			reason.innerHTML = `<td colspan="7">Rejected: ${escapeHtml(order.rejectionReason)}</td>`;
 			body.appendChild(reason);
 		}
 	}
@@ -375,7 +424,7 @@ function renderActivity(entries: ActivityEntry[]): HTMLElement {
 		item.className = 'activity-item';
 		item.innerHTML = `
 			<span class="activity-time">${new Date(entry.timestamp).toLocaleTimeString()}</span>
-			<span class="activity-text">${entry.message}</span>
+			<span class="activity-text">${escapeHtml(entry.message)}</span>
 		`;
 		list.appendChild(item);
 	}
@@ -402,7 +451,7 @@ function formatHeartbeat(heartbeat: ActiveSessionState['heartbeat']): string {
 function makeInfo(label: string, value: string): HTMLElement {
 	const item = document.createElement('div');
 	item.className = 'info-item';
-	item.innerHTML = `<span class="info-label">${label}</span><span class="info-value">${value}</span>`;
+	item.innerHTML = `<span class="info-label">${escapeHtml(label)}</span><span class="info-value">${escapeHtml(value)}</span>`;
 	return item;
 }
 
@@ -443,35 +492,109 @@ function emptyRow(message: string): HTMLElement {
 	return empty;
 }
 
-function promptModify(order: Order, state: ActiveSessionState, actions: ActiveSessionActions): void {
-	const quantityText = window.prompt('New quantity (leave empty to keep):', String(order.quantity));
-	if (quantityText === null) {
-		return;
-	}
-	const priceText = window.prompt('New price (leave empty to keep):', order.price ? String(order.price) : '');
-	if (priceText === null) {
-		return;
-	}
+function buildModifyRow(order: Order, state: ActiveSessionState, actions: ActiveSessionActions): HTMLTableRowElement {
+	const row = document.createElement('tr');
+	row.className = 'modify-row';
+	const cell = document.createElement('td');
+	cell.colSpan = 7;
 
-	const changes: { quantity?: number; price?: number } = {};
-	const quantity = quantityText.trim() ? Number(quantityText) : undefined;
-	const price = priceText.trim() ? Number(priceText) : undefined;
+	const form = document.createElement('div');
+	form.className = 'modify-form';
 
-	if (quantity && !Number.isNaN(quantity)) {
-		changes.quantity = quantity;
-	}
-	if (price && !Number.isNaN(price)) {
-		changes.price = price;
-	}
-
-	if (!changes.quantity && !changes.price) {
-		return;
-	}
-
-	actions.postMessage({
-		type: 'modifyOrder',
-		sessionId: state.session.id,
-		orderId: order.id,
-		changes
+	const quantityInput = document.createElement('input');
+	quantityInput.type = 'number';
+	quantityInput.min = '0';
+	quantityInput.step = '1';
+	quantityInput.value = modifyDraft && modifyDraft.orderId === order.id ? modifyDraft.quantity : String(order.quantity);
+	quantityInput.setAttribute('aria-label', `New quantity for order ${order.id}`);
+	quantityInput.addEventListener('input', () => {
+		if (modifyDraft && modifyDraft.orderId === order.id) {
+			modifyDraft.quantity = quantityInput.value;
+		}
 	});
+
+	const priceInput = document.createElement('input');
+	priceInput.type = 'number';
+	priceInput.min = '0';
+	priceInput.step = '0.01';
+	priceInput.value = modifyDraft && modifyDraft.orderId === order.id ? modifyDraft.price : (order.price !== undefined ? String(order.price) : '');
+	priceInput.setAttribute('aria-label', `New price for order ${order.id}`);
+	priceInput.addEventListener('input', () => {
+		if (modifyDraft && modifyDraft.orderId === order.id) {
+			modifyDraft.price = priceInput.value;
+		}
+	});
+
+	const error = document.createElement('span');
+	error.className = 'modify-error';
+
+	const submit = document.createElement('button');
+	submit.className = 'btn btn-primary';
+	submit.textContent = 'Submit';
+	submit.setAttribute('aria-label', `Submit changes to order ${order.id}`);
+	submit.addEventListener('click', () => {
+		const changes: { quantity?: number; price?: number } = {};
+		const quantityText = quantityInput.value.trim();
+		const priceText = priceInput.value.trim();
+
+		if (quantityText) {
+			const quantity = Number(quantityText);
+			if (!Number.isFinite(quantity) || quantity <= 0) {
+				error.textContent = 'Quantity must be a positive number.';
+				return;
+			}
+			if (quantity !== order.quantity) {
+				changes.quantity = quantity;
+			}
+		}
+		if (priceText) {
+			const price = Number(priceText);
+			if (!Number.isFinite(price) || price <= 0) {
+				error.textContent = 'Price must be a positive number.';
+				return;
+			}
+			if (price !== order.price) {
+				changes.price = price;
+			}
+		}
+
+		modifyDraft = null;
+		row.remove();
+		if (changes.quantity === undefined && changes.price === undefined) {
+			return;
+		}
+		actions.postMessage({
+			type: 'modifyOrder',
+			sessionId: state.session.id,
+			orderId: order.id,
+			changes
+		});
+	});
+
+	const cancel = document.createElement('button');
+	cancel.className = 'btn btn-ghost';
+	cancel.textContent = 'Cancel';
+	cancel.setAttribute('aria-label', `Discard changes to order ${order.id}`);
+	cancel.addEventListener('click', () => {
+		modifyDraft = null;
+		row.remove();
+	});
+
+	form.appendChild(makeModifyField('Qty', quantityInput));
+	form.appendChild(makeModifyField('Price', priceInput));
+	form.appendChild(submit);
+	form.appendChild(cancel);
+	form.appendChild(error);
+	cell.appendChild(form);
+	row.appendChild(cell);
+	return row;
+}
+
+function makeModifyField(text: string, input: HTMLInputElement): HTMLLabelElement {
+	const label = document.createElement('label');
+	const caption = document.createElement('span');
+	caption.textContent = text;
+	label.appendChild(caption);
+	label.appendChild(input);
+	return label;
 }

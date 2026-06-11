@@ -587,6 +587,28 @@
         "command": "quantlab.openInstitutional",
         "title": "%command.openInstitutional.title%",
         "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.watchlist.create",
+        "title": "New Watchlist...",
+        "category": "%command.category%",
+        "icon": "$(add)"
+      },
+      {
+        "command": "quantlab.watchlist.rename",
+        "title": "Rename Watchlist...",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.watchlist.delete",
+        "title": "Delete Watchlist",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.watchlist.removeSymbol",
+        "title": "Remove from Watchlist",
+        "category": "%command.category%",
+        "icon": "$(remove)"
       }
     ],
     "colors": [
@@ -909,6 +931,19 @@
         {
           "command": "quantlab.quantbookFreezePanesHere",
           "when": "false"
+        },
+        {
+          "_comment": "Watchlist rename/delete/removeSymbol act on the right-clicked Data-tree node; they are meaningless without one.",
+          "command": "quantlab.watchlist.rename",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.watchlist.delete",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.watchlist.removeSymbol",
+          "when": "false"
         }
       ],
       "accountsMenu": [
@@ -924,6 +959,36 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "quantlab.watchlist.create",
+          "when": "view == quantlab.dataView && viewItem == quantlab.category.watchlists",
+          "group": "inline@1"
+        },
+        {
+          "command": "quantlab.watchlist.create",
+          "when": "view == quantlab.dataView && viewItem == quantlab.category.watchlists",
+          "group": "1_watchlist@1"
+        },
+        {
+          "command": "quantlab.watchlist.rename",
+          "when": "view == quantlab.dataView && viewItem == quantlab.data.watchlist",
+          "group": "1_watchlist@1"
+        },
+        {
+          "command": "quantlab.watchlist.delete",
+          "when": "view == quantlab.dataView && viewItem == quantlab.data.watchlist",
+          "group": "1_watchlist@2"
+        },
+        {
+          "command": "quantlab.watchlist.removeSymbol",
+          "when": "view == quantlab.dataView && viewItem == quantlab.data.symbol",
+          "group": "inline@1"
+        },
+        {
+          "command": "quantlab.watchlist.removeSymbol",
+          "when": "view == quantlab.dataView && viewItem == quantlab.data.symbol",
+          "group": "1_watchlist@1"
+        },
         {
           "command": "quantlab.switchToChart",
           "when": "view == quantlab.dataView && viewItem == quantlab.data.serverSymbol",

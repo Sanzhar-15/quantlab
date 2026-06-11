@@ -43,6 +43,25 @@ interface ActionSession {
 	disposables: vscode.Disposable[];
 }
 
+/**
+ * The sessions map is keyed by session.key (`uri::timestamp`), while engine
+ * events route by tabInstanceId (`uri::groupIndex::tabIndex`) -- the two key
+ * shapes NEVER match, so a Map.get(tabId) lookup silently drops every event
+ * (megaudit H23/H32). Sessions must be resolved by iterating on
+ * tabInstanceId, the same way postState does.
+ */
+export function findSessionByTabInstanceId<T extends { tabInstanceId?: string }>(
+	sessions: Iterable<T>,
+	tabId: string
+): T | undefined {
+	for (const session of sessions) {
+		if (session.tabInstanceId === tabId) {
+			return session;
+		}
+	}
+	return undefined;
+}
+
 export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 	static readonly viewType = 'quantlab.actionView';
 
@@ -420,6 +439,7 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 			// The run can proceed without the config artifact, but a failed write must be
 			// visible -- it means the run's config won't be reproducible from History.
 			console.error(`Failed to write config artifact for run ${runId}:`, error);
+			void vscode.window.showWarningMessage('Run config could not be saved -- Rerun from History will use current defaults for this run.');
 			artifactPath = '';
 		}
 		const historyEntry = this.historyState.createEntry({
@@ -757,6 +777,11 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 		}
 
 		const config = await this.loadConfig(entry.artifactPath);
+		if (!config) {
+			// Re-running with defaults instead of the recorded config silently
+			// changes run parameters -- the operator must know (megaudit M60).
+			void vscode.window.showWarningMessage('Original run config could not be loaded -- re-running with current defaults.');
+		}
 		const parameters = this.parameterExtractor.extract(session.document);
 		const values = config ?? QuickActions.buildDefaults(action, this.globalState, parameters.parameters);
 		await this.runAction(session, { actionType: action, config: { action, values } });
@@ -771,7 +796,8 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 			const configUri = vscode.Uri.joinPath(uri, 'config.json');
 			const data = await vscode.workspace.fs.readFile(configUri);
 			return JSON.parse(Buffer.from(data).toString('utf8')) as Record<string, unknown>;
-		} catch {
+		} catch (error) {
+			console.error(`ActionViewProvider: failed to load run config from ${artifactPath}:`, error);
 			return undefined;
 		}
 	}
@@ -1008,11 +1034,21 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 			return;
 		}
 
-		// Verify session still exists (prevent memory leaks if tab was closed)
-		const session = this.sessions.get(tabId);
-		if (!session) {
-			// Clean up orphaned job mapping
-			this.jobToTab.delete(event.jobId);
+		// Resolve the session by tabInstanceId (see findSessionByTabInstanceId).
+		// A missing session means the tab was closed; terminal events still
+		// proceed so HistoryState reaches a final status (finishRun/failRun
+		// clean up jobToTab themselves).
+		const session = findSessionByTabInstanceId(this.sessions.values(), tabId);
+
+		if (event.type === 'complete' || event.type === 'failed') {
+			if (!session) {
+				console.warn(`ActionViewProvider: Action tab for job ${event.jobId} is closed; recording terminal state in History only.`);
+			}
+			if (event.type === 'complete') {
+				void this.finishRun(event.jobId, tabId, event.result);
+			} else {
+				void this.failRun(event.jobId, tabId, event.error);
+			}
 			return;
 		}
 
@@ -1044,15 +1080,6 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 			};
 			this.cacheRunLogs(event.jobId, trimmed);
 			this.stateMachine.toRunning(tabId, next);
-		}
-
-		if (event.type === 'complete') {
-			this.finishRun(event.jobId, tabId, event.result);
-			return;
-		}
-
-		if (event.type === 'failed') {
-			this.failRun(event.jobId, tabId, event.error);
 		}
 	}
 

@@ -47,12 +47,17 @@ export interface SubCategoryNode {
 	label: string;
 	description?: string;
 	icon?: string;
-	subKey: string;          // e.g. 'equities.sectors', 'equities.etfs', 'crypto.spot'
+	subKey: string;          // e.g. 'equities.exchanges', 'equities.etfs', 'crypto.spot'
 	command?: vscode.Command;
 	collapsibleState: vscode.TreeItemCollapsibleState;
 	badge?: string;          // e.g. symbol count
 }
 
+/**
+ * Generic instrument-grouping node. `sector` is the group key: the exchange
+ * for equities (the live /v1/symbols payload has no sector field) and the
+ * BTC/ETH/Other buckets for crypto.
+ */
 export interface SectorNode {
 	nodeKind: 'sector';
 	id: string;
@@ -70,7 +75,6 @@ export interface InstrumentNode {
 	description?: string;
 	symbol: string;
 	assetClass: AssetCategory;
-	sector?: string;
 	collapsibleState: vscode.TreeItemCollapsibleState;
 	command?: vscode.Command;
 }
@@ -124,23 +128,6 @@ const CATEGORIES: Array<{ id: AssetCategory; label: string; icon: string }> = [
 	{ id: 'sentiment', label: 'Sentiment', icon: 'pulse' },
 ];
 
-// Standard GICS-aligned sector display order for equities
-const EQUITY_SECTOR_ORDER = [
-	'Tech', 'Technology', 'Information Technology',
-	'Finance', 'Financials',
-	'Healthcare', 'Health Care',
-	'Consumer', 'Consumer Discretionary', 'Consumer Staples',
-	'Industrials',
-	'Energy',
-	'Materials',
-	'Real Estate',
-	'Utilities',
-	'Communication Services', 'Communications',
-	'Crypto',
-	'Indices',
-	'Other',
-];
-
 // ---- Provider ----
 
 export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
@@ -160,20 +147,25 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 	private cryptoLoading = false;
 	private cryptoRetryCount = 0;
 	private cryptoError: string | undefined;
+	private cryptoRetryTimer: NodeJS.Timeout | undefined;
 
 	private etfs: EtfItem[] | undefined;
 	private etfsLoading = false;
 	private etfRetryCount = 0;
 	private etfError: string | undefined;
+	private etfRetryTimer: NodeJS.Timeout | undefined;
 
 	private indices: IndexItem[] | undefined;
 	private indicesLoading = false;
 	private indexRetryCount = 0;
 	private indexError: string | undefined;
+	private indexRetryTimer: NodeJS.Timeout | undefined;
 
 	private retryCount = 0;
 	private readonly maxRetries = 3;
 	private retryTimer: NodeJS.Timeout | undefined;
+
+	private lastAuthSignedIn: boolean | undefined;
 
 	constructor(
 		private readonly globalState: GlobalState,
@@ -184,7 +176,14 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			this.globalState.onDidChangeDataSource(() => this.refresh()),
 			// Sign-in/out must re-drive the tree: before this, a tree loaded while
 			// signed out kept its "Not signed in" failures forever after sign-in.
-			ServerApiClient.getInstance().onAuthStateChange(() => {
+			// onAuthStateChange also fires on every ~15-min token refresh (M119);
+			// only an actual signed-in/out transition wipes the caches, otherwise
+			// the tree visibly flashes to "Loading..." mid-session.
+			ServerApiClient.getInstance().onAuthStateChange(signedIn => {
+				if (signedIn === this.lastAuthSignedIn) {
+					return;
+				}
+				this.lastAuthSignedIn = signedIn;
 				this.resetServerCaches();
 				this.refresh();
 			}),
@@ -195,6 +194,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 
 	/** Drops all server-derived caches/errors so lazy loaders re-fetch with the new auth state. */
 	private resetServerCaches(): void {
+		this.clearRetryTimers();
 		this.equitySymbols = undefined;
 		this.equityError = undefined;
 		this.retryCount = 0;
@@ -209,6 +209,26 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		this.indexError = undefined;
 		this.indexRetryCount = 0;
 		void this.loadEquitySymbols();
+	}
+
+	/** Cancels every pending retry so a stale retry cannot fire after a cache reset or dispose (M2). */
+	private clearRetryTimers(): void {
+		if (this.retryTimer) {
+			clearTimeout(this.retryTimer);
+			this.retryTimer = undefined;
+		}
+		if (this.cryptoRetryTimer) {
+			clearTimeout(this.cryptoRetryTimer);
+			this.cryptoRetryTimer = undefined;
+		}
+		if (this.etfRetryTimer) {
+			clearTimeout(this.etfRetryTimer);
+			this.etfRetryTimer = undefined;
+		}
+		if (this.indexRetryTimer) {
+			clearTimeout(this.indexRetryTimer);
+			this.indexRetryTimer = undefined;
+		}
 	}
 
 	// ---- TreeDataProvider interface ----
@@ -331,7 +351,9 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 	private getWatchlistFolderChildren(): DataNode[] {
 		const watchlists = this.watchlistManager.getWatchlists();
 		if (!watchlists.length) {
-			return [this.placeholder('quantlab.watchlists.empty', 'No watchlists yet')];
+			return [this.placeholder('quantlab.watchlists.empty', 'No watchlists yet',
+				{ command: 'quantlab.watchlist.create', title: 'New Watchlist' },
+				'Click to create one')];
 		}
 		return watchlists.map(wl => ({
 			nodeKind: 'watchlist' as const,
@@ -375,7 +397,10 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		return [
 			this.subCategory('equities.overview', 'Market Overview', 'graph-line', undefined,
 				{ command: 'quantlab.openMarketOverview', title: 'Market Overview' }),
-			this.subCategory('equities.sectors', 'By Sector', 'folder', undefined, undefined,
+			// Grouped by exchange: the live /v1/symbols payload has no sector
+			// field (the old 'By Sector' grouping ran off a synthetic 'Other'
+			// fallback that ServerApiClient no longer fabricates).
+			this.subCategory('equities.exchanges', 'By Exchange', 'folder', undefined, undefined,
 				this.equityLoading ? 'loading...' : this.equityError ? 'error' :
 					this.equitySymbols ? `${this.equitySymbols.length} symbols` : undefined),
 			this.subCategory('equities.etfs', 'ETFs', 'file', undefined, undefined,
@@ -518,8 +543,8 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 	private getSubCategoryChildren(subKey: string): DataNode[] | Thenable<DataNode[]> {
 		switch (subKey) {
 			// Equities
-			case 'equities.sectors':
-				return this.getEquitySectorsNodes();
+			case 'equities.exchanges':
+				return this.getEquityExchangeNodes();
 			case 'equities.etfs':
 				return this.getEtfNodes();
 			case 'equities.indices':
@@ -567,49 +592,37 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		}
 	}
 
-	// ---- Equity sector nodes (lazy) ----
+	// ---- Equity exchange nodes (lazy) ----
 
-	private async getEquitySectorsNodes(): Promise<DataNode[]> {
+	private async getEquityExchangeNodes(): Promise<DataNode[]> {
 		if (!this.equitySymbols) {
 			if (!this.equityLoading) {
 				void this.loadEquitySymbols();
 			}
-			return [this.placeholder('equities.sectors.loading', 'Loading symbols...')];
+			return [this.placeholder('equities.exchanges.loading', 'Loading symbols...')];
 		}
 		if (this.equityError) {
-			if (/not signed in/i.test(this.equityError)) {
-				return [this.errorPlaceholder('equities.sectors.error', this.equityError)];
-			}
-			return [this.placeholder('equities.sectors.error',
-				`Failed to load: ${this.equityError}`,
+			return [this.errorPlaceholder('equities.exchanges.error', this.equityError,
 				{ command: 'quantlab.reloadServerSymbols', title: 'Retry' })];
 		}
 		if (!this.equitySymbols.length) {
-			return [this.placeholder('equities.sectors.empty', 'No symbols available')];
+			return [this.placeholder('equities.exchanges.empty', 'No symbols available')];
 		}
 
-		// Group by sector
-		const sectorMap = new Map<string, number>();
+		// Group by the real exchange field from /v1/symbols
+		const exchangeMap = new Map<string, number>();
 		for (const s of this.equitySymbols) {
-			const sec = s.sector || 'Other';
-			sectorMap.set(sec, (sectorMap.get(sec) ?? 0) + 1);
+			exchangeMap.set(s.exchange, (exchangeMap.get(s.exchange) ?? 0) + 1);
 		}
 
-		const sectors = Array.from(sectorMap.keys()).sort((a, b) => {
-			const ai = EQUITY_SECTOR_ORDER.findIndex(o => o.toLowerCase() === a.toLowerCase());
-			const bi = EQUITY_SECTOR_ORDER.findIndex(o => o.toLowerCase() === b.toLowerCase());
-			if (ai === -1 && bi === -1) { return a.localeCompare(b); }
-			if (ai === -1) { return 1; }
-			if (bi === -1) { return -1; }
-			return ai - bi;
-		});
+		const exchanges = Array.from(exchangeMap.keys()).sort((a, b) => a.localeCompare(b));
 
-		return sectors.map(sec => ({
+		return exchanges.map(exchange => ({
 			nodeKind: 'sector' as const,
-			id: `quantlab.sector.${sec}`,
-			label: sec,
-			description: `${sectorMap.get(sec)} symbols`,
-			sector: sec,
+			id: `quantlab.exchange.${exchange}`,
+			label: exchange,
+			description: `${exchangeMap.get(exchange)} symbols`,
+			sector: exchange,
 			assetClass: 'equities' as AssetCategory,
 			collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
 		} satisfies SectorNode));
@@ -618,12 +631,19 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 	private getSectorChildren(sector: string, assetClass: AssetCategory): DataNode[] {
 		if (assetClass === 'equities' && this.equitySymbols) {
 			return this.equitySymbols
-				.filter(s => (s.sector || 'Other') === sector)
+				.filter(s => s.exchange === sector)
 				.map(s => this.equityInstrumentNode(s));
 		}
 		if (assetClass === 'crypto' && this.cryptoSymbols) {
+			// Mirror the grouping rule in getCryptoSpotNodes (symbol prefix).
+			// The old filter compared s.category against the BTC/ETH/Other
+			// group keys, so the BTC and ETH groups always came up empty.
 			return this.cryptoSymbols
-				.filter(s => (s.category || 'Other') === sector)
+				.filter(s => {
+					if (sector === 'BTC') { return s.symbol.startsWith('BTC'); }
+					if (sector === 'ETH') { return s.symbol.startsWith('ETH'); }
+					return !s.symbol.startsWith('BTC') && !s.symbol.startsWith('ETH');
+				})
 				.map(s => this.cryptoInstrumentNode(s));
 		}
 		return [this.placeholder(`sector.${sector}.empty`, 'No data')];
@@ -637,7 +657,6 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			description: s.name,
 			symbol: s.symbol,
 			assetClass: 'equities',
-			sector: s.sector,
 			collapsibleState: vscode.TreeItemCollapsibleState.None,
 			command: {
 				command: 'quantlab.openServerSymbol',
@@ -658,7 +677,8 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		}
 		if (!this.etfs.length) {
 			if (this.etfError) {
-				return [this.errorPlaceholder('equities.etfs.error', this.etfError)];
+				return [this.errorPlaceholder('equities.etfs.error', this.etfError,
+					{ command: 'quantlab.reloadDataSection', title: 'Retry', arguments: ['etfs'] })];
 			}
 			return [this.placeholder('equities.etfs.empty', 'No ETFs available')];
 		}
@@ -689,7 +709,8 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		}
 		if (!this.indices.length) {
 			if (this.indexError) {
-				return [this.errorPlaceholder('equities.indices.error', this.indexError)];
+				return [this.errorPlaceholder('equities.indices.error', this.indexError,
+					{ command: 'quantlab.reloadDataSection', title: 'Retry', arguments: ['indices'] })];
 			}
 			return [this.placeholder('equities.indices.empty', 'No indices available')];
 		}
@@ -723,7 +744,8 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		}
 		if (!this.cryptoSymbols.length) {
 			if (this.cryptoError) {
-				return [this.errorPlaceholder('crypto.spot.error', this.cryptoError)];
+				return [this.errorPlaceholder('crypto.spot.error', this.cryptoError,
+					{ command: 'quantlab.reloadDataSection', title: 'Retry', arguments: ['crypto'] })];
 			}
 			return [this.placeholder('crypto.spot.empty', 'No crypto symbols available')];
 		}
@@ -858,6 +880,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 				this.retryCount++;
 				const delay = Math.min(1000 * Math.pow(2, this.retryCount), 30000);
 				this.retryTimer = setTimeout(() => {
+					this.retryTimer = undefined;
 					this.equityLoading = false;
 					void this.loadEquitySymbols();
 				}, delay);
@@ -883,7 +906,8 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			if (this.cryptoRetryCount < this.maxRetries) {
 				this.cryptoRetryCount++;
 				const delay = Math.min(1000 * Math.pow(2, this.cryptoRetryCount), 30000);
-				setTimeout(() => {
+				this.cryptoRetryTimer = setTimeout(() => {
+					this.cryptoRetryTimer = undefined;
 					this.cryptoLoading = false;
 					void this.loadCryptoSymbols();
 				}, delay);
@@ -908,7 +932,8 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			if (this.etfRetryCount < this.maxRetries) {
 				this.etfRetryCount++;
 				const delay = Math.min(1000 * Math.pow(2, this.etfRetryCount), 30000);
-				setTimeout(() => {
+				this.etfRetryTimer = setTimeout(() => {
+					this.etfRetryTimer = undefined;
 					this.etfsLoading = false;
 					void this.loadEtfs();
 				}, delay);
@@ -933,7 +958,8 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			if (this.indexRetryCount < this.maxRetries) {
 				this.indexRetryCount++;
 				const delay = Math.min(1000 * Math.pow(2, this.indexRetryCount), 30000);
-				setTimeout(() => {
+				this.indexRetryTimer = setTimeout(() => {
+					this.indexRetryTimer = undefined;
 					this.indicesLoading = false;
 					void this.loadIndices();
 				}, delay);
@@ -970,14 +996,15 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 
 	/**
 	 * Error placeholder for server-backed nodes. A signed-out failure becomes an
-	 * actionable "Sign in" entry instead of a cryptic error string.
+	 * actionable "Sign in" entry instead of a cryptic error string; any other
+	 * failure carries the optional retry command (M7).
 	 */
-	private errorPlaceholder(id: string, error: string): PlaceholderNode {
+	private errorPlaceholder(id: string, error: string, retry?: vscode.Command): PlaceholderNode {
 		if (/not signed in/i.test(error)) {
-			return this.placeholder(id, 'Sign in to Delta Plus to load live data',
+			return this.placeholder(id, 'Sign in to load live data',
 				{ command: 'quantlab.signIn', title: 'Sign In' });
 		}
-		return this.placeholder(id, `Failed to load: ${error}`);
+		return this.placeholder(id, `Failed to load: ${error}`, retry);
 	}
 
 	private placeholder(id: string, label: string, command?: vscode.Command, description?: string): PlaceholderNode {
@@ -1000,19 +1027,60 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 	}
 
 	reloadServerSymbols(): void {
+		this.reloadSection('equities');
+	}
+
+	/** Drops one section's cache/error/backoff state and re-fetches it (M7 retry affordance). */
+	reloadSection(section: 'equities' | 'crypto' | 'etfs' | 'indices'): void {
 		if (this.disposed) { return; }
-		this.equitySymbols = undefined;
-		this.equityError = undefined;
-		this.retryCount = 0;
-		void this.loadEquitySymbols();
+		switch (section) {
+			case 'equities':
+				if (this.retryTimer) {
+					clearTimeout(this.retryTimer);
+					this.retryTimer = undefined;
+				}
+				this.equitySymbols = undefined;
+				this.equityError = undefined;
+				this.retryCount = 0;
+				void this.loadEquitySymbols();
+				break;
+			case 'crypto':
+				if (this.cryptoRetryTimer) {
+					clearTimeout(this.cryptoRetryTimer);
+					this.cryptoRetryTimer = undefined;
+				}
+				this.cryptoSymbols = undefined;
+				this.cryptoSymbolSet = new Set();
+				this.cryptoError = undefined;
+				this.cryptoRetryCount = 0;
+				void this.loadCryptoSymbols();
+				break;
+			case 'etfs':
+				if (this.etfRetryTimer) {
+					clearTimeout(this.etfRetryTimer);
+					this.etfRetryTimer = undefined;
+				}
+				this.etfs = undefined;
+				this.etfError = undefined;
+				this.etfRetryCount = 0;
+				void this.loadEtfs();
+				break;
+			case 'indices':
+				if (this.indexRetryTimer) {
+					clearTimeout(this.indexRetryTimer);
+					this.indexRetryTimer = undefined;
+				}
+				this.indices = undefined;
+				this.indexError = undefined;
+				this.indexRetryCount = 0;
+				void this.loadIndices();
+				break;
+		}
 	}
 
 	dispose(): void {
 		this.disposed = true;
-		if (this.retryTimer) {
-			clearTimeout(this.retryTimer);
-			this.retryTimer = undefined;
-		}
+		this.clearRetryTimers();
 		for (const d of this.disposables) { d.dispose(); }
 		this.disposables.length = 0;
 		this._onDidChangeTreeData.dispose();

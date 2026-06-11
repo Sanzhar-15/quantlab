@@ -35,10 +35,25 @@ export function registerHistoryCommands(context: vscode.ExtensionContext): void 
 			// History entry ids ARE EngineHost job ids (ActionViewProvider seeds both from runId).
 			const cancelled = EngineHost.getInstance().cancelJob(entryId);
 			if (cancelled) {
+				// Update HistoryState directly: the engine's terminal event only
+				// reaches HistoryState through an OPEN Action tab, and the tab may
+				// be closed when cancelling from the History dropdown/tree (H33).
+				console.log(`historyCommands: run ${entryId} cancelled by user; marking history entry cancelled.`);
+				historyState.updateEntry(entryId, { status: 'cancelled', completedAt: new Date(), errorMessage: 'Job cancelled by user.' });
 				void vscode.window.showInformationMessage(`Run ${entryId} cancelled.`);
-			} else {
-				void vscode.window.showWarningMessage(`Run ${entryId} is not active -- nothing to cancel.`);
+				return;
 			}
+			const entry = historyState.getEntry(entryId);
+			if (entry && (entry.status === 'running' || entry.status === 'queued')) {
+				// No live engine job but a non-terminal history status: the entry
+				// is definitionally stale. Resolve it on the user's cancel request
+				// instead of leaving a phantom running entry.
+				console.warn(`historyCommands: run ${entryId} has no active engine job but history status '${entry.status}'; marking it cancelled.`);
+				historyState.updateEntry(entryId, { status: 'cancelled', completedAt: new Date(), errorMessage: 'Cancelled (no active engine job).' });
+				void vscode.window.showInformationMessage(`Run ${entryId} was not active -- marked cancelled.`);
+				return;
+			}
+			void vscode.window.showWarningMessage(`Run ${entryId} is not active -- nothing to cancel.`);
 		}),
 		vscode.commands.registerCommand('quantlab.searchHistory', async () => {
 			// CODEX-009: Implement actual history search

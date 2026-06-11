@@ -413,6 +413,26 @@ export const window = {
 	): Disposable {
 		return new Disposable(() => { /* no-op */ });
 	},
+	createOutputChannel(name: string): {
+		name: string;
+		appendLine(line: string): void;
+		append(text: string): void;
+		clear(): void;
+		show(): void;
+		hide(): void;
+		dispose(): void;
+	} {
+		// Minimal OutputChannel for units that log (e.g. ServerApiClient).
+		return {
+			name,
+			appendLine(_line: string): void { /* discard */ },
+			append(_text: string): void { /* discard */ },
+			clear(): void { /* no-op */ },
+			show(): void { /* no-op */ },
+			hide(): void { /* no-op */ },
+			dispose(): void { /* no-op */ },
+		};
+	},
 };
 
 // ---------------------------------------------------------------------------

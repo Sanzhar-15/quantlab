@@ -316,6 +316,45 @@ body {
 	padding: 4px 8px 8px;
 }
 
+/* Inline order-modify editor (VS Code webviews block window.prompt) */
+.modify-row td {
+	background: var(--vscode-editor-background);
+}
+
+.modify-form {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+	padding: 4px 0;
+}
+
+.modify-form label {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+}
+
+.modify-form input {
+	width: 90px;
+	padding: 4px 6px;
+	border-radius: 4px;
+	border: 1px solid var(--vscode-input-border);
+	background: var(--vscode-input-background);
+	color: var(--vscode-input-foreground);
+}
+
+.modify-form input:focus {
+	outline: 1px solid var(--vscode-focusBorder);
+}
+
+.modify-error {
+	color: var(--ql-status-negative);
+	font-size: 11px;
+}
+
 .activity-list {
 	display: flex;
 	flex-direction: column;

@@ -45,7 +45,12 @@ export class EditorDropProvider implements vscode.DocumentDropEditProvider {
 	}
 
 	private extractData(dataTransfer: vscode.DataTransfer, mime: string): string | undefined {
-		const item = dataTransfer.get(mime) ?? dataTransfer.get('text/plain');
+		// Each MIME type must be checked independently -- NO text/plain fallback.
+		// Every quantlab drag source sets BOTH its typed MIME and text/plain
+		// (utils/dragDrop.ts), so a fallback makes every drag match the FIRST
+		// MIME probed: a History run drag was inserted as a quoted "file path"
+		// instead of reaching the RUN_MIME branch (megaudit H35).
+		const item = dataTransfer.get(mime);
 		if (!item) {
 			return undefined;
 		}

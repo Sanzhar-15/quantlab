@@ -24,6 +24,14 @@ export class DataPanelProvider {
 			this.treeView,
 			vscode.commands.registerCommand('quantlab.reloadServerSymbols', () => {
 				this.provider.reloadServerSymbols();
+			}),
+			vscode.commands.registerCommand('quantlab.reloadDataSection',
+				(section: 'equities' | 'crypto' | 'etfs' | 'indices') => {
+					this.provider.reloadSection(section);
+				}),
+			// Watchlist server-sync failures must be user-visible (M4 / No-Fallbacks).
+			watchlistManager.onSyncError(message => {
+				void vscode.window.showErrorMessage(message);
 			})
 		);
 	}

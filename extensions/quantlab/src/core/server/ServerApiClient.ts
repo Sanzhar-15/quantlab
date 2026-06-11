@@ -85,29 +85,21 @@ export interface AuthResponse {
 	user: ServerUser;
 }
 
+// Live /v1/symbols shape (verified 2026-06-11). The server has NO sector and
+// NO base_price field -- do not re-introduce synthetic defaults for them.
 export interface ServerSymbol {
 	symbol: string;
 	name: string;
-	sector: string;
-	base_price: number;
-	trend?: string;
-	tradeable?: boolean;
-}
-
-interface RawServerSymbol {
-	symbol: string;
-	name?: string;
-	sector?: string;
-	base_price?: number;
-	trend?: string;
-	tradeable?: boolean;
-	price?: number;
-	metadata?: {
-		sector?: string;
-		tradeable?: boolean;
-		base_price?: number;
-		trend?: string;
-	};
+	asset_type: string;
+	exchange: string;
+	currency: string;
+	price_precision: number;
+	size_precision: number;
+	min_tick: number;
+	lot_size: number;
+	is_active: boolean;
+	created_at: string;
+	updated_at: string;
 }
 
 export interface ServerBar {
@@ -160,34 +152,24 @@ export interface ServerAlert {
 	notify_email: boolean;
 	notify_push: boolean;
 	triggered_at?: string;
-}
-
-export interface DemoStatus {
-	running: boolean;
-	paused: boolean;
-	speed: number;
-	elapsed_minutes: number;
-	symbols: string[];
+	created_at?: string;
+	updated_at?: string;
 }
 
 export type ServerTimeframe = '1m' | '5m' | '15m' | '30m' | '1h' | '4h' | '1D' | '1W' | '1M';
 
+// Live /v1/crypto/symbols coin shape (verified 2026-06-11).
 export interface CryptoSymbol {
 	symbol: string;
-	name?: string;
-	base?: string;
-	quote?: string;
-	exchange?: string;
-	category?: string;
-}
-
-export interface CryptoQuote {
-	symbol: string;
-	price: number;
-	change?: number;
-	change_pct?: number;
-	volume?: number;
-	timestamp?: string;
+	name: string;
+	market_cap_rank: number;
+	current_price: number;
+	market_cap: number;
+	circulating_supply: number;
+	image_url?: string;
+	category: string | null;
+	updated_at: string;
+	exchange_count: number;
 }
 
 export interface EtfItem {
@@ -208,98 +190,62 @@ export interface IndexItem {
 	change_pct?: number;
 }
 
-export interface YieldCurveData {
-	date?: string;
-	tenors?: Record<string, number>;
-	data?: Array<{ tenor: string; yield: number }>;
+// Live /v1/fixed-income/yield-curve shape (verified 2026-06-11): a bare array
+// of {metric, value} records -- no date grouping, no tenor map.
+export interface YieldCurvePoint {
+	metric: string;
+	value: number;
 }
 
 // ---- Calendar interfaces ----
 
+// All /v1/calendar/* endpoints share one unified event schema (verified live
+// 2026-06-11). Symbol/company/eps data is embedded in event_name, not split out.
 export interface CalendarEvent {
-	date?: string;
-	time?: string;
-	country?: string;
-	event?: string;
-	actual?: string | number;
-	forecast?: string | number;
-	previous?: string | number;
-	impact?: string;
-	[key: string]: unknown;
+	id: string;
+	event_type: string;
+	event_name: string;
+	datetime_utc: string;
+	importance: string;
+	is_tentative: boolean;
+	country_code?: string;
+	primary_source?: string;
 }
 
-export interface EarningsEvent {
-	date?: string;
-	symbol?: string;
-	company?: string;
-	eps_estimate?: number;
-	eps_actual?: number;
-	revenue_estimate?: number;
-	revenue_actual?: number;
-	[key: string]: unknown;
-}
-
-export interface DividendEvent {
-	date?: string;
-	symbol?: string;
-	company?: string;
-	dividend?: number;
-	ex_date?: string;
-	pay_date?: string;
-	record_date?: string;
-	[key: string]: unknown;
-}
-
-export interface IPOEvent {
-	date?: string;
-	company?: string;
-	symbol?: string;
-	exchange?: string;
-	price_range?: string;
-	shares?: number;
-	[key: string]: unknown;
-}
-
-export interface SplitEvent {
-	date?: string;
-	symbol?: string;
-	company?: string;
-	ratio?: string;
-	[key: string]: unknown;
-}
-
-export interface CentralBankEvent {
-	date?: string;
-	central_bank?: string;
-	event?: string;
-	rate?: number;
-	previous_rate?: number;
-	decision?: string;
-	[key: string]: unknown;
+// The calendar envelope after {success,data} unwrap: {events, total, limit,
+// offset, has_more}. Pagination fields are exposed so callers can page.
+export interface CalendarPage {
+	events: CalendarEvent[];
+	total: number;
+	limit: number;
+	offset: number;
+	has_more: boolean;
 }
 
 // ---- Sentiment & News interfaces ----
 
+// Live /v1/sentiment/:symbol shape (verified 2026-06-11). There is no 'score'
+// field; percentages are 0-100 server-side units.
 export interface SentimentData {
-	symbol?: string;
-	score?: number;
-	label?: string;
-	bullish?: number;
-	bearish?: number;
-	neutral?: number;
-	[key: string]: unknown;
+	symbol: string;
+	overall_sentiment: string;
+	bullish_percent: number;
+	bearish_percent: number;
+	neutral_percent: number;
+	news_count: number;
+	updated_at: string;
 }
 
+// Live /v1/news/ item shape (verified 2026-06-11): has categories, no
+// symbols/sentiment fields.
 export interface NewsItem {
-	id?: string;
-	title?: string;
+	id: string;
+	source: string;
+	title: string;
 	summary?: string;
 	url?: string;
-	source?: string;
-	published_at?: string;
-	symbols?: string[];
-	sentiment?: string;
-	[key: string]: unknown;
+	categories?: string[];
+	published_at: string;
 }
 
 // ---- Fundamentals interfaces ----
@@ -315,29 +261,106 @@ export interface FundamentalsProfile {
 	employees?: number;
 	headquarters?: string;
 	website?: string;
-	[key: string]: unknown;
-}
-
-export interface FundamentalsFinancials {
-	symbol?: string;
-	revenue?: number;
-	net_income?: number;
-	eps?: number;
-	pe_ratio?: number;
-	[key: string]: unknown;
-}
-
-export interface FundamentalsRatios {
-	symbol?: string;
-	pe?: number;
-	pb?: number;
-	ps?: number;
+	exchange?: string;
+	currency?: string;
+	country?: string;
+	founded?: string;
+	ipo_date?: string;
+	asset_type?: string;
+	shares_outstanding?: number;
+	float?: number;
+	avg_volume_30d?: number;
+	high_52w?: number;
+	low_52w?: number;
 	dividend_yield?: number;
+	dividend_per_share?: number;
+	ex_dividend_date?: string;
+	payment_frequency?: string;
+	pe?: number;
+	price_to_book?: number;
+	eps?: number;
+	revenue?: number;
+	profit_margin?: number;
+	operating_margin?: number;
 	roe?: number;
 	roa?: number;
 	debt_to_equity?: number;
 	current_ratio?: number;
+	ev_to_ebitda?: number;
 	[key: string]: unknown;
+}
+
+// Live /v1/fundamentals/financials/:symbol statement entry (verified 2026-06-11).
+export interface FinancialStatement {
+	period: string;
+	period_end: string;
+	filed_at?: string;
+	revenue?: number;
+	cost_of_revenue?: number;
+	gross_profit?: number;
+	gross_margin?: number;
+	research_dev?: number;
+	selling_gen_admin?: number;
+	operating_expenses?: number;
+	operating_income?: number;
+	operating_margin?: number;
+	interest_expense?: number;
+	other_income?: number;
+	pretax_income?: number;
+	income_tax?: number;
+	net_income?: number;
+	net_margin?: number;
+	eps?: number;
+	eps_diluted?: number;
+	shares_outstanding?: number;
+	shares_diluted?: number;
+	ebitda?: number;
+}
+
+// Live shape: financial line items are nested inside statements[], newest first.
+export interface FundamentalsFinancials {
+	symbol: string;
+	type: string;
+	period: string;
+	statements: FinancialStatement[];
+	count: number;
+}
+
+// Live /v1/fundamentals/ratios/:symbol shape (verified 2026-06-11): names are
+// *_ratio suffixed; margins/returns are fractions (0..1).
+export interface FundamentalsRatios {
+	symbol: string;
+	timestamp?: number;
+	pe_ratio?: number;
+	peg_ratio?: number;
+	pb_ratio?: number;
+	ps_ratio?: number;
+	ev_to_ebitda?: number;
+	ev_to_revenue?: number;
+	price_to_fcf?: number;
+	roe?: number;
+	roa?: number;
+	roic?: number;
+	gross_margin?: number;
+	operating_margin?: number;
+	net_margin?: number;
+	debt_to_equity?: number;
+	debt_to_ebitda?: number;
+	current_ratio?: number;
+	quick_ratio?: number;
+	interest_coverage?: number;
+	revenue_growth?: number;
+	earnings_growth?: number;
+	fcf_growth?: number;
+	eps?: number;
+	book_value_per_share?: number;
+	revenue_per_share?: number;
+	fcf_per_share?: number;
+	dividend_yield?: number;
+	payout_ratio?: number;
+	beta?: number;
+	short_float?: number;
+	institutional_ownership?: number;
 }
 
 // ---- Institutional interfaces ----
@@ -441,7 +464,7 @@ export class ServerApiClient {
 	}
 
 	private constructor() {
-		this.outputChannel = vscode.window.createOutputChannel('Delta Plus Server');
+		this.outputChannel = vscode.window.createOutputChannel('Quantlab Server');
 	}
 
 	static getInstance(): ServerApiClient {
@@ -788,79 +811,92 @@ export class ServerApiClient {
 	// REST API - Crypto
 	async getCryptoSymbols(): Promise<CryptoSymbol[]> {
 		await this.ensureAuthenticated();
-		const response = await this.request<{ symbols?: CryptoSymbol[] } | CryptoSymbol[]>('GET', '/v1/crypto/symbols');
-		if (Array.isArray(response)) { return response; }
-		return (response as { symbols?: CryptoSymbol[] }).symbols ?? [];
-	}
-
-	async getCryptoQuote(symbol: string): Promise<CryptoQuote> {
-		await this.ensureAuthenticated();
-		return this.request<CryptoQuote>('GET', `/v1/crypto/quote/${encodeURIComponent(symbol)}`);
+		// Live envelope is { coins: [...], count } -- a bare object with NO
+		// {success,data} wrapper (verified 2026-06-11). The key is 'coins',
+		// not 'symbols'.
+		const res = await this.request<{ coins: CryptoSymbol[]; count: number }>('GET', '/v1/crypto/symbols');
+		if (!res || !Array.isArray(res.coins)) {
+			throw new Error(`Unexpected /v1/crypto/symbols response shape: ${JSON.stringify(res).slice(0, 200)}`);
+		}
+		return res.coins;
 	}
 
 	// REST API - ETFs
 	async getEtfs(): Promise<EtfItem[]> {
 		await this.ensureAuthenticated();
+		// NOTE: /v1/etfs/ currently returns 503 SERVICE_UNAVAILABLE ('asset
+		// classes data not available', verified 2026-06-11) -- request() throws
+		// with the server's message. Callers must surface that error.
 		const response = await this.request<{ etfs?: EtfItem[] } | EtfItem[]>('GET', '/v1/etfs/');
 		if (Array.isArray(response)) { return response; }
-		return (response as { etfs?: EtfItem[] }).etfs ?? [];
+		const wrapped = (response as { etfs?: EtfItem[] }).etfs;
+		if (!Array.isArray(wrapped)) {
+			throw new Error(`Unexpected /v1/etfs/ response shape: ${JSON.stringify(response).slice(0, 200)}`);
+		}
+		return wrapped;
 	}
 
 	// REST API - Indices
 	async getGlobalIndices(): Promise<IndexItem[]> {
 		await this.ensureAuthenticated();
+		// NOTE: /v1/global-indices/ currently returns 503 SERVICE_UNAVAILABLE
+		// ('global indices data not available', verified 2026-06-11).
 		const response = await this.request<{ indices?: IndexItem[] } | IndexItem[]>('GET', '/v1/global-indices/');
 		if (Array.isArray(response)) { return response; }
-		return (response as { indices?: IndexItem[] }).indices ?? [];
+		const wrapped = (response as { indices?: IndexItem[] }).indices;
+		if (!Array.isArray(wrapped)) {
+			throw new Error(`Unexpected /v1/global-indices/ response shape: ${JSON.stringify(response).slice(0, 200)}`);
+		}
+		return wrapped;
 	}
 
 	// REST API - Fixed Income
-	async getYieldCurve(): Promise<YieldCurveData> {
+	async getYieldCurve(): Promise<YieldCurvePoint[]> {
 		await this.ensureAuthenticated();
-		return this.request<YieldCurveData>('GET', '/v1/fixed-income/yield-curve');
+		const res = await this.request<YieldCurvePoint[]>('GET', '/v1/fixed-income/yield-curve');
+		if (!Array.isArray(res)) {
+			throw new Error(`Unexpected /v1/fixed-income/yield-curve response shape: ${JSON.stringify(res).slice(0, 200)}`);
+		}
+		return res;
 	}
 
 	// REST API - Calendar
-	async getCalendarEconomic(): Promise<CalendarEvent[]> {
+	// All calendar endpoints share the unified {events, total, limit, offset,
+	// has_more} envelope and the unified CalendarEvent schema.
+	private async getCalendarPage(path: string): Promise<CalendarPage> {
 		await this.ensureAuthenticated();
-		const response = await this.request<{ events?: CalendarEvent[] } | CalendarEvent[]>('GET', '/v1/calendar/economic');
-		if (Array.isArray(response)) { return response; }
-		return (response as { events?: CalendarEvent[] }).events ?? [];
+		const res = await this.request<CalendarPage>('GET', path);
+		if (!res || !Array.isArray(res.events)) {
+			throw new Error(`Unexpected ${path} response shape: ${JSON.stringify(res).slice(0, 200)}`);
+		}
+		return res;
 	}
 
-	async getCalendarEarnings(): Promise<EarningsEvent[]> {
-		await this.ensureAuthenticated();
-		const response = await this.request<{ events?: EarningsEvent[] } | EarningsEvent[]>('GET', '/v1/calendar/earnings');
-		if (Array.isArray(response)) { return response; }
-		return (response as { events?: EarningsEvent[] }).events ?? [];
+	async getCalendarEconomic(): Promise<CalendarPage> {
+		return this.getCalendarPage('/v1/calendar/economic');
 	}
 
-	async getCalendarDividends(): Promise<DividendEvent[]> {
-		await this.ensureAuthenticated();
-		const response = await this.request<{ events?: DividendEvent[] } | DividendEvent[]>('GET', '/v1/calendar/dividends');
-		if (Array.isArray(response)) { return response; }
-		return (response as { events?: DividendEvent[] }).events ?? [];
+	async getCalendarEarnings(): Promise<CalendarPage> {
+		return this.getCalendarPage('/v1/calendar/earnings');
 	}
 
-	async getCalendarIPOs(): Promise<IPOEvent[]> {
-		await this.ensureAuthenticated();
-		const response = await this.request<{ events?: IPOEvent[] } | IPOEvent[]>('GET', '/v1/calendar/ipos');
-		if (Array.isArray(response)) { return response; }
-		return (response as { events?: IPOEvent[] }).events ?? [];
+	async getCalendarDividends(): Promise<CalendarPage> {
+		return this.getCalendarPage('/v1/calendar/dividends');
 	}
 
-	async getCalendarSplits(): Promise<SplitEvent[]> {
-		await this.ensureAuthenticated();
-		const response = await this.request<{ events?: SplitEvent[] } | SplitEvent[]>('GET', '/v1/calendar/splits');
-		if (Array.isArray(response)) { return response; }
-		return (response as { events?: SplitEvent[] }).events ?? [];
+	async getCalendarIPOs(): Promise<CalendarPage> {
+		return this.getCalendarPage('/v1/calendar/ipos');
 	}
 
-	async getCalendarCentralBank(): Promise<CentralBankEvent[]> {
-		await this.ensureAuthenticated();
-		const response = await this.request<{ events?: CentralBankEvent[] } | CentralBankEvent[]>('GET', '/v1/calendar/central-bank');
-		if (Array.isArray(response)) { return response; }
-		return (response as { events?: CentralBankEvent[] }).events ?? [];
+	async getCalendarSplits(): Promise<CalendarPage> {
+		return this.getCalendarPage('/v1/calendar/splits');
+	}
+
+	async getCalendarCentralBank(): Promise<CalendarPage> {
+		// Verified 2026-06-11: GET /v1/calendar/central-bank returns HTTP 404
+		// plain text ('404 page not found'). Fail loudly and descriptively
+		// instead of letting the generic 404 path mislead callers.
+		throw new Error('Central-bank calendar endpoint /v1/calendar/central-bank is not provisioned on the server (404)');
 	}
 
 	// REST API - Sentiment
@@ -870,18 +906,24 @@ export class ServerApiClient {
 	}
 
 	// REST API - News
+	// Live response (verified 2026-06-11) is a direct array after the
+	// {success,data} unwrap -- there is no {articles} wrapper.
 	async getNews(): Promise<NewsItem[]> {
 		await this.ensureAuthenticated();
-		const response = await this.request<{ articles?: NewsItem[] } | NewsItem[]>('GET', '/v1/news/');
-		if (Array.isArray(response)) { return response; }
-		return (response as { articles?: NewsItem[] }).articles ?? [];
+		const res = await this.request<NewsItem[]>('GET', '/v1/news/');
+		if (!Array.isArray(res)) {
+			throw new Error(`Unexpected /v1/news/ response shape: ${JSON.stringify(res).slice(0, 200)}`);
+		}
+		return res;
 	}
 
 	async getNewsBySymbol(symbol: string): Promise<NewsItem[]> {
 		await this.ensureAuthenticated();
-		const response = await this.request<{ articles?: NewsItem[] } | NewsItem[]>('GET', `/v1/news/symbol/${encodeURIComponent(symbol)}`);
-		if (Array.isArray(response)) { return response; }
-		return (response as { articles?: NewsItem[] }).articles ?? [];
+		const res = await this.request<NewsItem[]>('GET', `/v1/news/symbol/${encodeURIComponent(symbol)}`);
+		if (!Array.isArray(res)) {
+			throw new Error(`Unexpected /v1/news/symbol response shape: ${JSON.stringify(res).slice(0, 200)}`);
+		}
+		return res;
 	}
 
 	// REST API - Fundamentals
@@ -901,18 +943,29 @@ export class ServerApiClient {
 	}
 
 	// REST API - Institutional
+	// NOTE: both institutional endpoints currently return 503 SERVICE_UNAVAILABLE
+	// ('institutional data not available', verified 2026-06-11) -- request()
+	// throws with the server's message. Callers must surface that error.
 	async getInstitutionalHoldings(symbol: string): Promise<InstitutionalHolding[]> {
 		await this.ensureAuthenticated();
 		const response = await this.request<{ holdings?: InstitutionalHolding[] } | InstitutionalHolding[]>('GET', `/v1/institutional/holdings/${encodeURIComponent(symbol)}`);
 		if (Array.isArray(response)) { return response; }
-		return (response as { holdings?: InstitutionalHolding[] }).holdings ?? [];
+		const wrapped = (response as { holdings?: InstitutionalHolding[] }).holdings;
+		if (!Array.isArray(wrapped)) {
+			throw new Error(`Unexpected /v1/institutional/holdings response shape: ${JSON.stringify(response).slice(0, 200)}`);
+		}
+		return wrapped;
 	}
 
 	async getInstitutionalInsiders(symbol: string): Promise<InsiderTransaction[]> {
 		await this.ensureAuthenticated();
 		const response = await this.request<{ transactions?: InsiderTransaction[] } | InsiderTransaction[]>('GET', `/v1/institutional/insiders/${encodeURIComponent(symbol)}`);
 		if (Array.isArray(response)) { return response; }
-		return (response as { transactions?: InsiderTransaction[] }).transactions ?? [];
+		const wrapped = (response as { transactions?: InsiderTransaction[] }).transactions;
+		if (!Array.isArray(wrapped)) {
+			throw new Error(`Unexpected /v1/institutional/insiders response shape: ${JSON.stringify(response).slice(0, 200)}`);
+		}
+		return wrapped;
 	}
 
 	// REST API - Symbols
@@ -920,39 +973,26 @@ export class ServerApiClient {
 		await this.ensureAuthenticated();
 		const PAGE_SIZE = 500;
 		let page = 1;
-		const allRaw: RawServerSymbol[] = [];
+		const all: ServerSymbol[] = [];
 		while (true) {
-			const response = await this.request<{ symbols: RawServerSymbol[] }>(
+			const response = await this.request<{ symbols: ServerSymbol[] }>(
 				'GET', `/v1/symbols?page_size=${PAGE_SIZE}&page=${page}`
 			);
-			const batch = response.symbols ?? [];
-			allRaw.push(...batch);
-			if (batch.length < PAGE_SIZE) { break; }
+			if (!response || !Array.isArray(response.symbols)) {
+				throw new Error(`Unexpected /v1/symbols response shape: ${JSON.stringify(response).slice(0, 200)}`);
+			}
+			all.push(...response.symbols);
+			if (response.symbols.length < PAGE_SIZE) { break; }
 			page++;
 		}
-		return allRaw.map(symbol => this.normalizeServerSymbol(symbol));
+		return all;
 	}
 
 	async getSymbol(symbol: string): Promise<ServerSymbol> {
 		await this.ensureAuthenticated();
-		// Get all symbols and find the specific one
-		const symbols = await this.getSymbols();
-		const found = symbols.find(s => s.symbol === symbol);
-		if (!found) {
-			throw new Error(`Symbol not found: ${symbol}`);
-		}
-		return found;
-	}
-
-	private normalizeServerSymbol(symbol: RawServerSymbol): ServerSymbol {
-		return {
-			symbol: symbol.symbol,
-			name: symbol.name ?? symbol.symbol,
-			sector: symbol.sector ?? symbol.metadata?.sector ?? 'Other',
-			base_price: symbol.base_price ?? symbol.metadata?.base_price ?? symbol.price ?? 0,
-			trend: symbol.trend ?? symbol.metadata?.trend,
-			tradeable: symbol.tradeable ?? symbol.metadata?.tradeable,
-		};
+		// Single-symbol endpoint verified live 2026-06-11 -- no need to page
+		// through the full universe.
+		return this.request<ServerSymbol>('GET', `/v1/symbols/${encodeURIComponent(symbol)}`);
 	}
 
 	// REST API - Bars (Historical Data)
@@ -1056,7 +1096,9 @@ export class ServerApiClient {
 
 	async updateWatchlist(id: string, updates: Partial<Omit<ServerWatchlist, 'id'>>): Promise<ServerWatchlist> {
 		await this.ensureAuthenticated();
-		return this.request<ServerWatchlist>('PUT', `/v1/watchlists/${id}`, updates);
+		// The live server only accepts PATCH here -- PUT returns 405
+		// (Allow: GET, PATCH, DELETE; verified live 2026-06-11).
+		return this.request<ServerWatchlist>('PATCH', `/v1/watchlists/${id}`, updates);
 	}
 
 	async deleteWatchlist(id: string): Promise<void> {
@@ -1067,7 +1109,13 @@ export class ServerApiClient {
 	// REST API - Alerts
 	async getAlerts(): Promise<ServerAlert[]> {
 		await this.ensureAuthenticated();
-		return this.request<ServerAlert[]>('GET', '/v1/alerts');
+		// The list endpoint wraps the array: { alerts: [...], count }
+		// (live shape verified 2026-06-11, same envelope style as watchlists).
+		const res = await this.request<{ alerts: ServerAlert[]; count: number }>('GET', '/v1/alerts');
+		if (!res || !Array.isArray(res.alerts)) {
+			throw new Error(`Unexpected /v1/alerts response shape: ${JSON.stringify(res).slice(0, 200)}`);
+		}
+		return res.alerts;
 	}
 
 	async createAlert(alert: Omit<ServerAlert, 'id' | 'status' | 'triggered_at'>): Promise<ServerAlert> {
@@ -1090,61 +1138,10 @@ export class ServerApiClient {
 		await this.request<void>('DELETE', `/v1/alerts/${id}`);
 	}
 
-	// REST API - Demo Control
-	async getDemoStatus(): Promise<DemoStatus> {
-		await this.ensureAuthenticated();
-		return this.request<DemoStatus>('GET', '/v1/demo/status');
-	}
-
-	async startDemo(): Promise<void> {
-		await this.ensureAuthenticated();
-		await this.request<void>('POST', '/v1/demo/start');
-	}
-
-	async stopDemo(): Promise<void> {
-		await this.ensureAuthenticated();
-		await this.request<void>('POST', '/v1/demo/stop');
-	}
-
-	async resetDemo(): Promise<void> {
-		await this.ensureAuthenticated();
-		await this.request<void>('POST', '/v1/demo/reset');
-	}
-
-	async pauseDemo(): Promise<void> {
-		await this.ensureAuthenticated();
-		await this.request<void>('POST', '/v1/demo/pause');
-	}
-
-	async resumeDemo(): Promise<void> {
-		await this.ensureAuthenticated();
-		await this.request<void>('POST', '/v1/demo/resume');
-	}
-
-	async setDemoSpeed(speed: number): Promise<void> {
-		await this.ensureAuthenticated();
-		await this.request<void>('POST', '/v1/demo/set-speed', { speed });
-	}
-
-	async jumpDemo(minutes: number): Promise<void> {
-		await this.ensureAuthenticated();
-		await this.request<void>('POST', '/v1/demo/jump', { minutes });
-	}
-
-	async getDemoSymbols(): Promise<ServerSymbol[]> {
-		await this.ensureAuthenticated();
-		return this.request<ServerSymbol[]>('GET', '/v1/demo/symbols');
-	}
-
-	async triggerDemoEvent(event: string): Promise<void> {
-		await this.ensureAuthenticated();
-		await this.request<void>('POST', '/v1/demo/trigger-event', { event });
-	}
-
-	async injectDemoPrice(symbol: string, price: number): Promise<void> {
-		await this.ensureAuthenticated();
-		await this.request<void>('POST', '/v1/demo/inject-price', { symbol, price });
-	}
+	// REST API - Demo Control: REMOVED 2026-06-11. All eleven /v1/demo/*
+	// methods (status/start/stop/reset/pause/resume/set-speed/jump/symbols/
+	// trigger-event/inject-price) targeted routes that return HTTP 404 on the
+	// live server and had zero call sites in the extension.
 
 	// REST API - Resources Catalog
 	async getResourcesCatalog(cachedVersion?: string): Promise<ResourcesCatalogResponse | null> {
@@ -1185,19 +1182,17 @@ export class ServerApiClient {
 	}
 
 	// Strategy Validation
-	async validateStrategy(code: string, filename?: string): Promise<import('../../types/strategy').StrategyValidationResponse> {
-		await this.ensureAuthenticated();
-		const payload: import('../../types/strategy').StrategyValidationRequest = {
-			code,
-			filename: filename ?? 'strategy.py'
-		};
-		return this.request<import('../../types/strategy').StrategyValidationResponse>('POST', '/v1/strategies/validate', payload);
+	async validateStrategy(_code: string, _filename?: string): Promise<import('../../types/strategy').StrategyValidationResponse> {
+		// Verified 2026-06-11: POST /v1/strategies/validate returns HTTP 404
+		// plain text. Fail loudly until the server provisions the route.
+		throw new Error('Strategy validation endpoint /v1/strategies/validate is not provisioned on the server (404)');
 	}
 
 	// Strategy Templates
 	async getStrategyTemplates(): Promise<import('../../types/strategy').StrategyTemplatesResponse> {
-		await this.ensureAuthenticated();
-		return this.request<import('../../types/strategy').StrategyTemplatesResponse>('GET', '/v1/strategies/templates');
+		// Verified 2026-06-11: GET /v1/strategies/templates returns HTTP 404
+		// plain text. Fail loudly until the server provisions the route.
+		throw new Error('Strategy templates endpoint /v1/strategies/templates is not provisioned on the server (404)');
 	}
 
 	// WebSocket Connection
@@ -1475,11 +1470,15 @@ export class ServerApiClient {
 				return await this.requestOnce<T>(method, path, body, token);
 			} catch (err: unknown) {
 				const msg = err instanceof Error ? err.message : String(err);
-				if (msg === 'RATE_LIMITED_429' && attempt < maxRetries) {
-					const delay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
-					this.log(`Rate limited (429), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
-					await new Promise(r => setTimeout(r, delay));
-					continue;
+				if (msg === 'RATE_LIMITED_429') {
+					if (attempt < maxRetries) {
+						const delay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+						this.log(`Rate limited (429), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+						await new Promise(r => setTimeout(r, delay));
+						continue;
+					}
+					// Do not let the internal sentinel escape to UI error toasts.
+					throw new Error('Rate limit exceeded, please try again later');
 				}
 				throw err;
 			}
@@ -1535,8 +1534,10 @@ export class ServerApiClient {
 							} else {
 								resolve(undefined as T);
 							}
-						} catch {
-							resolve(data as T);
+						} catch (parseErr) {
+							// A 2xx body that is not JSON is a protocol violation --
+							// surface it instead of silently casting a string to T.
+							reject(new Error(`Invalid JSON response from ${method} ${path}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`));
 						}
 					} else if (res.statusCode === 429) {
 						cleanup();
@@ -1554,6 +1555,11 @@ export class ServerApiClient {
 								}
 							} else if (errorBody.error && typeof errorBody.error === 'string') {
 								errorMessage = errorBody.error.substring(0, 200);
+							} else if (errorBody.error && typeof errorBody.error === 'object' && typeof errorBody.error.message === 'string') {
+								// Live error envelope: { success:false, error:{ code, message } }
+								// (e.g. 503 SERVICE_UNAVAILABLE bodies) -- surface the
+								// server's descriptive message, not the generic status.
+								errorMessage = errorBody.error.message.substring(0, 200);
 							}
 						} catch {
 							// Use generic error message
@@ -1582,7 +1588,7 @@ export class ServerApiClient {
 			req.on('error', (err) => {
 				cleanup();
 				this.log(`Request error: ${method} ${path} - ${err.message}`);
-				reject(new Error('Network error'));
+				reject(new Error(`Network error: ${err.message}`));
 			});
 			req.setTimeout(30000, () => {
 				cleanup();

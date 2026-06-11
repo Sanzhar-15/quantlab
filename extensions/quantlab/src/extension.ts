@@ -5,6 +5,7 @@
 
 import * as vscode from 'vscode';
 import { registerDataCommands } from './commands/dataCommands';
+import { registerWatchlistCommands } from './commands/watchlistCommands';
 import { registerQuantbookCommands } from './commands/quantbookCommands';
 import { CellGridPanel } from './quantbook/cellGrid/cellGridPanel';
 import { QuantbookDiagnostics, QUANTBOOK_DIAGNOSTICS_SCHEME } from './quantbook/diagnostics/quantbookDiagnostics';
@@ -281,6 +282,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	);
 
 	registerDataCommands(context);
+	// W1.3 (megaudit H1): watchlist CRUD commands for the Data tree context menus.
+	registerWatchlistCommands(context, watchlistManager);
 	registerGlobalStateCommands(context);
 	registerHistoryCommands(context);
 	registerPanelCommands(context);
@@ -319,7 +322,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// parallel windows never edit overlapping lines here.
 	registerQuantbookMcpServer(context, builtKernelManager);
 
-	new DataPanelProvider(context, globalState, watchlistManager);
+	// Megaudit H2: the provider was constructed and discarded, so its dispose()
+	// (which tears down the DataTreeProvider's three event subs + retry timer)
+	// never ran. Owned by context.subscriptions now.
+	context.subscriptions.push(new DataPanelProvider(context, globalState, watchlistManager));
 	const catalogService = ResourcesCatalogService.initialize(context);
 	const resourcesProvider = ResourcesWebviewProvider.initialize(context.extensionUri, catalogService);
 	context.subscriptions.push(

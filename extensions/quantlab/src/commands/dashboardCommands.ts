@@ -1,53 +1,156 @@
 /*---------------------------------------------------------------------------------------------
- *  Dashboard commands — registers commands for opening data dashboard webview panels.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+// Dashboard commands -- registers commands for opening data dashboard webview panels.
+// Data truth: every renderer below is written against the LIVE server shapes
+// (verified 2026-06-11). Sections backed by unprovisioned/unavailable
+// endpoints render explicit, honest notes -- never silent empty sections.
+
 import * as vscode from 'vscode';
-import { ServerApiClient } from '../core/server/ServerApiClient';
+import { CalendarPage, ServerApiClient } from '../core/server/ServerApiClient';
 import { DashboardWebviewPanel, escapeHtml } from '../panels/dashboard/DashboardWebviewPanel';
+
+// --- Shared helpers -----------------------------------------------------------
+
+/** Outcome of one independently fetched dashboard section. */
+type SectionResult<T> = { ok: true; value: T } | { ok: false; error: string };
+
+/**
+ * Awaits one section's fetch and captures failure instead of rejecting, so
+ * sibling sections still render (render-boundary handling). The underlying
+ * error is always console.error-logged -- failures must stay visible.
+ */
+async function settleSection<T>(label: string, promise: Promise<T>): Promise<SectionResult<T>> {
+	try {
+		return { ok: true, value: await promise };
+	} catch (err) {
+		console.error(`[quantlab.dashboard] ${label} failed:`, err);
+		return { ok: false, error: err instanceof Error ? err.message : String(err) };
+	}
+}
+
+/** Explicit, styled per-section note for a section whose endpoint failed. */
+function unavailableNote(section: string, serverMessage: string): string {
+	return `<div class="dash-empty">${escapeHtml(section)}: data temporarily unavailable (server: ${escapeHtml(serverMessage)})</div>`;
+}
+
+/** Formats an ISO datetime as a human-readable UTC date, e.g. "Mar 20, 2026". */
+function formatUtcDate(iso: string): string {
+	const d = new Date(iso);
+	if (isNaN(d.getTime())) { return iso; }
+	return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
+}
+
+/** Prettifies snake_case identifiers, e.g. "macro_release" -> "Macro Release", "govt_bond_10y" -> "Govt Bond 10Y". */
+function prettifySnakeCase(value: string): string {
+	return value.split('_').map(part => {
+		if (/^\d+[a-z]$/.test(part)) { return part.toUpperCase(); }
+		return part.charAt(0).toUpperCase() + part.slice(1);
+	}).join(' ');
+}
+
+/** Formats a large USD amount compactly, e.g. 1401897037367 -> "$1.40T". */
+function formatLargeUsd(value: number): string {
+	const abs = Math.abs(value);
+	if (abs >= 1e12) { return '$' + (value / 1e12).toFixed(2) + 'T'; }
+	if (abs >= 1e9) { return '$' + (value / 1e9).toFixed(2) + 'B'; }
+	if (abs >= 1e6) { return '$' + (value / 1e6).toFixed(1) + 'M'; }
+	return '$' + value.toLocaleString();
+}
+
+const CALENDAR_ROW_CAP = 50;
+
+/**
+ * Unified calendar renderer -- all live calendar endpoints share one event
+ * schema: {id, event_type, event_name, datetime_utc, importance, is_tentative}.
+ * Columns: Date | Event | Type | Importance (+ tentative marker).
+ */
+function renderCalendarBody(page: CalendarPage, emptyMessage: string): string {
+	if (!page.events.length) { return `<div class="dash-empty">${escapeHtml(emptyMessage)}</div>`; }
+	const rows = page.events.slice(0, CALENDAR_ROW_CAP);
+	const table = `<table class="dashboard-table">
+		<thead><tr><th>Date</th><th>Event</th><th>Type</th><th>Importance</th></tr></thead>
+		<tbody>${rows.map(e => `<tr>
+			<td>${escapeHtml(formatUtcDate(e.datetime_utc))}</td>
+			<td>${escapeHtml(e.event_name)}${e.is_tentative ? ' <span class="dash-tentative">(tentative)</span>' : ''}</td>
+			<td>${escapeHtml(prettifySnakeCase(e.event_type))}</td>
+			<td>${escapeHtml(e.importance)}</td>
+		</tr>`).join('')}</tbody>
+	</table>`;
+	const countNote = `<p class="section-label">Showing ${rows.length} of ${page.total} events</p>`;
+	return table + countNote;
+}
+
+function registerCalendarDashboard(
+	context: vscode.ExtensionContext,
+	command: string,
+	id: string,
+	title: string,
+	fetchPage: () => Promise<CalendarPage>,
+	emptyMessage: string,
+): void {
+	context.subscriptions.push(
+		vscode.commands.registerCommand(command, () => {
+			void DashboardWebviewPanel.show(context, {
+				id,
+				title,
+				fetchData: fetchPage,
+				renderBody: (page) => renderCalendarBody(page, emptyMessage),
+			});
+		})
+	);
+}
 
 export function registerDashboardCommands(context: vscode.ExtensionContext): void {
 	const client = ServerApiClient.getInstance();
 
-	// ─── Market Overview ──────────────────────────────────────────────────────
+	// --- Market Overview ------------------------------------------------------
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.openMarketOverview', () => {
 			void DashboardWebviewPanel.show(context, {
 				id: 'quantlab.dashboard.marketOverview',
 				title: 'Market Overview',
+				// Sections settle independently: /v1/global-indices/ and /v1/etfs/
+				// are live-503 today; the healthy symbols section must still render.
 				fetchData: async () => {
 					const [symbols, indices, etfs] = await Promise.all([
-						client.getSymbols(),
-						client.getGlobalIndices(),
-						client.getEtfs(),
+						settleSection('Market Overview symbols', client.getSymbols()),
+						settleSection('Market Overview global indices', client.getGlobalIndices()),
+						settleSection('Market Overview ETFs', client.getEtfs()),
 					]);
 					return { symbols, indices, etfs };
 				},
 				renderBody: (data) => {
 					const cards = `<div class="summary-cards">
-						<div class="summary-card"><div class="label">Equities</div><div class="value">${data.symbols.length}</div><div class="sub">symbols tracked</div></div>
-						<div class="summary-card"><div class="label">Global Indices</div><div class="value">${data.indices.length}</div></div>
-						<div class="summary-card"><div class="label">ETFs</div><div class="value">${data.etfs.length}</div></div>
+						${data.symbols.ok ? `<div class="summary-card"><div class="label">Equities</div><div class="value">${data.symbols.value.length}</div><div class="sub">symbols tracked</div></div>` : ''}
+						${data.indices.ok ? `<div class="summary-card"><div class="label">Global Indices</div><div class="value">${data.indices.value.length}</div></div>` : ''}
+						${data.etfs.ok ? `<div class="summary-card"><div class="label">ETFs</div><div class="value">${data.etfs.value.length}</div></div>` : ''}
 					</div>`;
-					const indicesTable = data.indices.length ? `
-						<p class="section-label">Global Indices</p>
-						<table class="dashboard-table">
-							<thead><tr><th>Symbol</th><th>Name</th><th>Region</th><th>Value</th><th>Change %</th></tr></thead>
-							<tbody>${data.indices.map(idx => `<tr>
-								<td>${escapeHtml(idx.symbol ?? idx.id ?? '')}</td>
-								<td>${escapeHtml(idx.name ?? '')}</td>
-								<td>${escapeHtml(idx.region ?? '')}</td>
-								<td>${idx.value != null ? idx.value.toLocaleString() : '—'}</td>
-								<td>${idx.change_pct != null ? idx.change_pct.toFixed(2) + '%' : '—'}</td>
-							</tr>`).join('')}</tbody>
-						</table>` : '';
-					return cards + indicesTable;
+					const symbolsNote = data.symbols.ok ? '' : unavailableNote('Equities', data.symbols.error);
+					const indicesSection = data.indices.ok
+						? (data.indices.value.length ? `
+							<p class="section-label">Global Indices</p>
+							<table class="dashboard-table">
+								<thead><tr><th>Symbol</th><th>Name</th><th>Region</th><th>Value</th><th>Change %</th></tr></thead>
+								<tbody>${data.indices.value.map(idx => `<tr>
+									<td>${escapeHtml(idx.symbol ?? idx.id ?? '')}</td>
+									<td>${escapeHtml(idx.name ?? '')}</td>
+									<td>${escapeHtml(idx.region ?? '')}</td>
+									<td>${idx.value !== undefined && idx.value !== null ? idx.value.toLocaleString() : '&mdash;'}</td>
+									<td>${idx.change_pct !== undefined && idx.change_pct !== null ? idx.change_pct.toFixed(2) + '%' : '&mdash;'}</td>
+								</tr>`).join('')}</tbody>
+							</table>` : '')
+						: unavailableNote('Global Indices', data.indices.error);
+					const etfsNote = data.etfs.ok ? '' : unavailableNote('ETFs', data.etfs.error);
+					return cards + symbolsNote + indicesSection + etfsNote;
 				},
 			});
 		})
 	);
 
-	// ─── Crypto Overview ──────────────────────────────────────────────────────
+	// --- Crypto Overview ------------------------------------------------------
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.openCryptoOverview', () => {
 			void DashboardWebviewPanel.show(context, {
@@ -56,80 +159,43 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 				fetchData: () => client.getCryptoSymbols(),
 				renderBody: (data) => {
 					const cards = `<div class="summary-cards">
-						<div class="summary-card"><div class="label">Crypto Pairs</div><div class="value">${data.length}</div><div class="sub">across exchanges</div></div>
+						<div class="summary-card"><div class="label">Coins</div><div class="value">${data.length}</div><div class="sub">tracked on server</div></div>
 					</div>`;
 					const table = data.length ? `
 						<table class="dashboard-table">
-							<thead><tr><th>Symbol</th><th>Name</th><th>Exchange</th></tr></thead>
+							<thead><tr><th>Rank</th><th>Symbol</th><th>Name</th><th>Price</th><th>Market Cap</th><th>Exchanges</th></tr></thead>
 							<tbody>${data.slice(0, 100).map(s => `<tr>
-								<td>${escapeHtml(s.symbol.replace('_', '/'))}</td>
-								<td>${escapeHtml(s.name ?? '')}</td>
-								<td>${escapeHtml(s.exchange ?? '')}</td>
+								<td>${s.market_cap_rank}</td>
+								<td>${escapeHtml(s.symbol)}</td>
+								<td>${escapeHtml(s.name)}</td>
+								<td>${'$' + s.current_price.toLocaleString()}</td>
+								<td>${formatLargeUsd(s.market_cap)}</td>
+								<td>${s.exchange_count}</td>
 							</tr>`).join('')}</tbody>
 						</table>
-						${data.length > 100 ? `<p class="dash-empty">Showing first 100 of ${data.length} pairs</p>` : ''}` : '';
+						${data.length > 100 ? `<p class="section-label">Showing first 100 of ${data.length} coins</p>` : ''}` : '<div class="dash-empty">No crypto symbols available</div>';
 					return cards + table;
 				},
 			});
 		})
 	);
 
-	// ─── Yield Curve ──────────────────────────────────────────────────────────
+	// --- Yield Curve ----------------------------------------------------------
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.openYieldCurve', () => {
 			void DashboardWebviewPanel.show(context, {
 				id: 'quantlab.dashboard.yieldCurve',
 				title: 'Yield Curve',
 				fetchData: () => client.getYieldCurve(),
+				// Live shape is a bare array of {metric, value} records -- there
+				// is no tenor breakdown or date grouping server-side.
 				renderBody: (data) => {
-					if (data.data && data.data.length) {
-						return `
-							${data.date ? `<p class="section-label">As of ${escapeHtml(data.date)}</p>` : ''}
-							<table class="dashboard-table">
-								<thead><tr><th>Tenor</th><th>Yield (%)</th></tr></thead>
-								<tbody>${data.data.map(d => `<tr>
-									<td>${escapeHtml(d.tenor)}</td>
-									<td>${d.yield.toFixed(3)}</td>
-								</tr>`).join('')}</tbody>
-							</table>`;
-					}
-					if (data.tenors) {
-						const entries = Object.entries(data.tenors);
-						return `
-							${data.date ? `<p class="section-label">As of ${escapeHtml(data.date)}</p>` : ''}
-							<table class="dashboard-table">
-								<thead><tr><th>Tenor</th><th>Yield (%)</th></tr></thead>
-								<tbody>${entries.map(([t, y]) => `<tr>
-									<td>${escapeHtml(t)}</td>
-									<td>${y.toFixed(3)}</td>
-								</tr>`).join('')}</tbody>
-							</table>`;
-					}
-					return '<div class="dash-empty">No yield curve data available</div>';
-				},
-			});
-		})
-	);
-
-	// ─── Calendar: Economic ───────────────────────────────────────────────────
-	context.subscriptions.push(
-		vscode.commands.registerCommand('quantlab.openEconomicCalendar', () => {
-			void DashboardWebviewPanel.show(context, {
-				id: 'quantlab.dashboard.economicCalendar',
-				title: 'Economic Calendar',
-				fetchData: () => client.getCalendarEconomic(),
-				renderBody: (data) => {
-					if (!data.length) { return '<div class="dash-empty">No upcoming economic events</div>'; }
+					if (!data.length) { return '<div class="dash-empty">No yield curve data available</div>'; }
 					return `<table class="dashboard-table">
-						<thead><tr><th>Date</th><th>Time</th><th>Country</th><th>Event</th><th>Actual</th><th>Forecast</th><th>Previous</th></tr></thead>
-						<tbody>${data.map(e => `<tr>
-							<td>${escapeHtml(String(e.date ?? ''))}</td>
-							<td>${escapeHtml(String(e.time ?? ''))}</td>
-							<td>${escapeHtml(String(e.country ?? ''))}</td>
-							<td>${escapeHtml(String(e.event ?? ''))}</td>
-							<td>${escapeHtml(String(e.actual ?? '—'))}</td>
-							<td>${escapeHtml(String(e.forecast ?? '—'))}</td>
-							<td>${escapeHtml(String(e.previous ?? '—'))}</td>
+						<thead><tr><th>Metric</th><th>Value (%)</th></tr></thead>
+						<tbody>${data.map(d => `<tr>
+							<td>${escapeHtml(prettifySnakeCase(d.metric))}</td>
+							<td>${d.value.toFixed(2)}</td>
 						</tr>`).join('')}</tbody>
 					</table>`;
 				},
@@ -137,129 +203,38 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 		})
 	);
 
-	// ─── Calendar: Earnings ───────────────────────────────────────────────────
-	context.subscriptions.push(
-		vscode.commands.registerCommand('quantlab.openEarningsCalendar', () => {
-			void DashboardWebviewPanel.show(context, {
-				id: 'quantlab.dashboard.earningsCalendar',
-				title: 'Earnings Calendar',
-				fetchData: () => client.getCalendarEarnings(),
-				renderBody: (data) => {
-					if (!data.length) { return '<div class="dash-empty">No upcoming earnings</div>'; }
-					return `<table class="dashboard-table">
-						<thead><tr><th>Date</th><th>Symbol</th><th>Company</th><th>EPS Est.</th><th>EPS Act.</th><th>Rev. Est.</th><th>Rev. Act.</th></tr></thead>
-						<tbody>${data.map(e => `<tr>
-							<td>${escapeHtml(String(e.date ?? ''))}</td>
-							<td>${escapeHtml(String(e.symbol ?? ''))}</td>
-							<td>${escapeHtml(String(e.company ?? ''))}</td>
-							<td>${e.eps_estimate != null ? e.eps_estimate.toFixed(2) : '—'}</td>
-							<td>${e.eps_actual != null ? e.eps_actual.toFixed(2) : '—'}</td>
-							<td>${e.revenue_estimate != null ? '$' + (e.revenue_estimate / 1e6).toFixed(1) + 'M' : '—'}</td>
-							<td>${e.revenue_actual != null ? '$' + (e.revenue_actual / 1e6).toFixed(1) + 'M' : '—'}</td>
-						</tr>`).join('')}</tbody>
-					</table>`;
-				},
-			});
-		})
-	);
+	// --- Calendars (unified live event schema) --------------------------------
+	registerCalendarDashboard(context,
+		'quantlab.openEconomicCalendar', 'quantlab.dashboard.economicCalendar', 'Economic Calendar',
+		() => client.getCalendarEconomic(), 'No upcoming economic events');
+	registerCalendarDashboard(context,
+		'quantlab.openEarningsCalendar', 'quantlab.dashboard.earningsCalendar', 'Earnings Calendar',
+		() => client.getCalendarEarnings(), 'No upcoming earnings');
+	registerCalendarDashboard(context,
+		'quantlab.openDividendsCalendar', 'quantlab.dashboard.dividendsCalendar', 'Dividends Calendar',
+		() => client.getCalendarDividends(), 'No upcoming dividends');
+	registerCalendarDashboard(context,
+		'quantlab.openIPOCalendar', 'quantlab.dashboard.ipoCalendar', 'IPO Calendar',
+		() => client.getCalendarIPOs(), 'No upcoming IPOs');
+	registerCalendarDashboard(context,
+		'quantlab.openSplitsCalendar', 'quantlab.dashboard.splitsCalendar', 'Stock Splits',
+		() => client.getCalendarSplits(), 'No upcoming splits');
 
-	// ─── Calendar: Dividends ──────────────────────────────────────────────────
-	context.subscriptions.push(
-		vscode.commands.registerCommand('quantlab.openDividendsCalendar', () => {
-			void DashboardWebviewPanel.show(context, {
-				id: 'quantlab.dashboard.dividendsCalendar',
-				title: 'Dividends Calendar',
-				fetchData: () => client.getCalendarDividends(),
-				renderBody: (data) => {
-					if (!data.length) { return '<div class="dash-empty">No upcoming dividends</div>'; }
-					return `<table class="dashboard-table">
-						<thead><tr><th>Symbol</th><th>Company</th><th>Ex-Date</th><th>Pay Date</th><th>Dividend</th></tr></thead>
-						<tbody>${data.map(e => `<tr>
-							<td>${escapeHtml(String(e.symbol ?? ''))}</td>
-							<td>${escapeHtml(String(e.company ?? ''))}</td>
-							<td>${escapeHtml(String(e.ex_date ?? e.date ?? ''))}</td>
-							<td>${escapeHtml(String(e.pay_date ?? ''))}</td>
-							<td>${e.dividend != null ? '$' + e.dividend.toFixed(2) : '—'}</td>
-						</tr>`).join('')}</tbody>
-					</table>`;
-				},
-			});
-		})
-	);
-
-	// ─── Calendar: IPOs ───────────────────────────────────────────────────────
-	context.subscriptions.push(
-		vscode.commands.registerCommand('quantlab.openIPOCalendar', () => {
-			void DashboardWebviewPanel.show(context, {
-				id: 'quantlab.dashboard.ipoCalendar',
-				title: 'IPO Calendar',
-				fetchData: () => client.getCalendarIPOs(),
-				renderBody: (data) => {
-					if (!data.length) { return '<div class="dash-empty">No upcoming IPOs</div>'; }
-					return `<table class="dashboard-table">
-						<thead><tr><th>Date</th><th>Company</th><th>Symbol</th><th>Exchange</th><th>Price Range</th></tr></thead>
-						<tbody>${data.map(e => `<tr>
-							<td>${escapeHtml(String(e.date ?? ''))}</td>
-							<td>${escapeHtml(String(e.company ?? ''))}</td>
-							<td>${escapeHtml(String(e.symbol ?? ''))}</td>
-							<td>${escapeHtml(String(e.exchange ?? ''))}</td>
-							<td>${escapeHtml(String(e.price_range ?? '—'))}</td>
-						</tr>`).join('')}</tbody>
-					</table>`;
-				},
-			});
-		})
-	);
-
-	// ─── Calendar: Splits ─────────────────────────────────────────────────────
-	context.subscriptions.push(
-		vscode.commands.registerCommand('quantlab.openSplitsCalendar', () => {
-			void DashboardWebviewPanel.show(context, {
-				id: 'quantlab.dashboard.splitsCalendar',
-				title: 'Stock Splits',
-				fetchData: () => client.getCalendarSplits(),
-				renderBody: (data) => {
-					if (!data.length) { return '<div class="dash-empty">No upcoming splits</div>'; }
-					return `<table class="dashboard-table">
-						<thead><tr><th>Date</th><th>Symbol</th><th>Company</th><th>Ratio</th></tr></thead>
-						<tbody>${data.map(e => `<tr>
-							<td>${escapeHtml(String(e.date ?? ''))}</td>
-							<td>${escapeHtml(String(e.symbol ?? ''))}</td>
-							<td>${escapeHtml(String(e.company ?? ''))}</td>
-							<td>${escapeHtml(String(e.ratio ?? '—'))}</td>
-						</tr>`).join('')}</tbody>
-					</table>`;
-				},
-			});
-		})
-	);
-
-	// ─── Calendar: Central Bank ───────────────────────────────────────────────
+	// --- Calendar: Central Bank -----------------------------------------------
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.openCentralBankCalendar', () => {
 			void DashboardWebviewPanel.show(context, {
 				id: 'quantlab.dashboard.centralBankCalendar',
 				title: 'Central Bank Calendar',
-				fetchData: () => client.getCalendarCentralBank(),
-				renderBody: (data) => {
-					if (!data.length) { return '<div class="dash-empty">No upcoming central bank events</div>'; }
-					return `<table class="dashboard-table">
-						<thead><tr><th>Date</th><th>Central Bank</th><th>Event</th><th>Rate</th><th>Previous</th><th>Decision</th></tr></thead>
-						<tbody>${data.map(e => `<tr>
-							<td>${escapeHtml(String(e.date ?? ''))}</td>
-							<td>${escapeHtml(String(e.central_bank ?? ''))}</td>
-							<td>${escapeHtml(String(e.event ?? ''))}</td>
-							<td>${e.rate != null ? e.rate.toFixed(2) + '%' : '—'}</td>
-							<td>${e.previous_rate != null ? e.previous_rate.toFixed(2) + '%' : '—'}</td>
-							<td>${escapeHtml(String(e.decision ?? '—'))}</td>
-						</tr>`).join('')}</tbody>
-					</table>`;
-				},
+				// Honest pane: /v1/calendar/central-bank is 404 on the live
+				// server (verified 2026-06-11). No fetch -- the pane says so.
+				fetchData: async () => null,
+				renderBody: () => '<div class="dash-empty">The central-bank calendar is not yet provisioned server-side (endpoint /v1/calendar/central-bank returns 404). This dashboard will activate once the server provides the data.</div>',
 			});
 		})
 	);
 
-	// ─── Sentiment Dashboard ──────────────────────────────────────────────────
+	// --- Sentiment Dashboard --------------------------------------------------
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.openSentimentDashboard', async () => {
 			const symbol = await vscode.window.showInputBox({
@@ -271,19 +246,22 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 				id: `quantlab.dashboard.sentiment.${symbol.toUpperCase()}`,
 				title: `Sentiment: ${symbol.toUpperCase()}`,
 				fetchData: () => client.getSentiment(symbol.toUpperCase()),
+				// Live fields: overall_sentiment + *_percent (0-100) + news_count.
+				// There is no composite 'score' server-side -- none is fabricated.
 				renderBody: (data) => {
 					return `<div class="summary-cards">
-						<div class="summary-card"><div class="label">Score</div><div class="value">${data.score != null ? data.score.toFixed(2) : '—'}</div><div class="sub">${escapeHtml(String(data.label ?? ''))}</div></div>
-						<div class="summary-card"><div class="label">Bullish</div><div class="value">${data.bullish != null ? (data.bullish * 100).toFixed(1) + '%' : '—'}</div></div>
-						<div class="summary-card"><div class="label">Bearish</div><div class="value">${data.bearish != null ? (data.bearish * 100).toFixed(1) + '%' : '—'}</div></div>
-						<div class="summary-card"><div class="label">Neutral</div><div class="value">${data.neutral != null ? (data.neutral * 100).toFixed(1) + '%' : '—'}</div></div>
+						<div class="summary-card"><div class="label">Overall</div><div class="value">${escapeHtml(data.overall_sentiment)}</div><div class="sub">as of ${escapeHtml(formatUtcDate(data.updated_at))}</div></div>
+						<div class="summary-card"><div class="label">Bullish</div><div class="value">${data.bullish_percent.toFixed(1)}%</div></div>
+						<div class="summary-card"><div class="label">Bearish</div><div class="value">${data.bearish_percent.toFixed(1)}%</div></div>
+						<div class="summary-card"><div class="label">Neutral</div><div class="value">${data.neutral_percent.toFixed(1)}%</div></div>
+						<div class="summary-card"><div class="label">News Count</div><div class="value">${data.news_count}</div></div>
 					</div>`;
 				},
 			});
 		})
 	);
 
-	// ─── News Flow ────────────────────────────────────────────────────────────
+	// --- News Flow ------------------------------------------------------------
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.openNewsFlow', () => {
 			void DashboardWebviewPanel.show(context, {
@@ -293,16 +271,16 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 				renderBody: (data) => {
 					if (!data.length) { return '<div class="dash-empty">No news available</div>'; }
 					return `<ul class="news-list">${data.map(n => `<li>
-						<div class="news-title">${escapeHtml(String(n.title ?? ''))}</div>
-						<div class="news-meta">${escapeHtml(String(n.source ?? ''))} · ${escapeHtml(String(n.published_at ?? ''))}${n.symbols?.length ? ' · ' + n.symbols.map(s => escapeHtml(s)).join(', ') : ''}</div>
-						${n.summary ? `<div class="news-summary">${escapeHtml(String(n.summary))}</div>` : ''}
+						<div class="news-title">${escapeHtml(n.title)}</div>
+						<div class="news-meta">${escapeHtml(n.source)} · ${escapeHtml(formatUtcDate(n.published_at))}${n.categories?.length ? ' · ' + n.categories.map(c => escapeHtml(c)).join(', ') : ''}</div>
+						${n.summary ? `<div class="news-summary">${escapeHtml(n.summary)}</div>` : ''}
 					</li>`).join('')}</ul>`;
 				},
 			});
 		})
 	);
 
-	// ─── Fundamentals ─────────────────────────────────────────────────────────
+	// --- Fundamentals ---------------------------------------------------------
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.openFundamentals', async () => {
 			const symbol = await vscode.window.showInputBox({
@@ -326,36 +304,51 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 					const p = data.profile;
 					const profileCard = `<div class="summary-cards">
 						<div class="summary-card"><div class="label">Company</div><div class="value">${escapeHtml(String(p.name ?? sym))}</div><div class="sub">${escapeHtml(String(p.sector ?? ''))} · ${escapeHtml(String(p.industry ?? ''))}</div></div>
-						<div class="summary-card"><div class="label">Market Cap</div><div class="value">${p.market_cap != null ? '$' + (p.market_cap / 1e9).toFixed(2) + 'B' : '—'}</div></div>
-						<div class="summary-card"><div class="label">Employees</div><div class="value">${p.employees != null ? p.employees.toLocaleString() : '—'}</div></div>
-						<div class="summary-card"><div class="label">CEO</div><div class="value" style="font-size:14px">${escapeHtml(String(p.ceo ?? '—'))}</div></div>
+						<div class="summary-card"><div class="label">Market Cap</div><div class="value">${p.market_cap !== undefined && p.market_cap !== null ? formatLargeUsd(p.market_cap) : '&mdash;'}</div></div>
+						<div class="summary-card"><div class="label">Employees</div><div class="value">${p.employees !== undefined && p.employees !== null ? p.employees.toLocaleString() : '&mdash;'}</div></div>
+						<div class="summary-card"><div class="label">CEO</div><div class="value" style="font-size:14px">${p.ceo !== undefined && p.ceo !== null ? escapeHtml(String(p.ceo)) : '&mdash;'}</div></div>
 					</div>`;
 
+					// Live financials nest line items in statements[], newest first.
 					const f = data.financials;
-					const financialsTable = `<p class="section-label">Financials</p>
+					const s = f.statements.length ? f.statements[0] : undefined;
+					const financialsTable = s ? `<p class="section-label">Financials (${escapeHtml(f.type)}, ${escapeHtml(f.period)}, period ending ${escapeHtml(s.period_end)})</p>
 					<table class="dashboard-table">
 						<thead><tr><th>Metric</th><th>Value</th></tr></thead>
 						<tbody>
-							<tr><td>Revenue</td><td>${f.revenue != null ? '$' + (f.revenue / 1e9).toFixed(2) + 'B' : '—'}</td></tr>
-							<tr><td>Net Income</td><td>${f.net_income != null ? '$' + (f.net_income / 1e9).toFixed(2) + 'B' : '—'}</td></tr>
-							<tr><td>EPS</td><td>${f.eps != null ? '$' + f.eps.toFixed(2) : '—'}</td></tr>
-							<tr><td>P/E Ratio</td><td>${f.pe_ratio != null ? f.pe_ratio.toFixed(2) : '—'}</td></tr>
+							<tr><td>Revenue</td><td>${s.revenue !== undefined && s.revenue !== null ? formatLargeUsd(s.revenue) : '&mdash;'}</td></tr>
+							<tr><td>Gross Profit</td><td>${s.gross_profit !== undefined && s.gross_profit !== null ? formatLargeUsd(s.gross_profit) : '&mdash;'}</td></tr>
+							<tr><td>Operating Income</td><td>${s.operating_income !== undefined && s.operating_income !== null ? formatLargeUsd(s.operating_income) : '&mdash;'}</td></tr>
+							<tr><td>Net Income</td><td>${s.net_income !== undefined && s.net_income !== null ? formatLargeUsd(s.net_income) : '&mdash;'}</td></tr>
+							<tr><td>EBITDA</td><td>${s.ebitda !== undefined && s.ebitda !== null ? formatLargeUsd(s.ebitda) : '&mdash;'}</td></tr>
+							<tr><td>EPS</td><td>${s.eps !== undefined && s.eps !== null ? '$' + s.eps.toFixed(2) : '&mdash;'}</td></tr>
 						</tbody>
-					</table>`;
+					</table>` : '<div class="dash-empty">No financial statements available</div>';
 
+					// Live ratio names are *_ratio suffixed; returns/margins are fractions.
 					const r = data.ratios;
+					const pct = (v: number | undefined): string => v !== undefined && v !== null ? (v * 100).toFixed(2) + '%' : '&mdash;';
+					const num = (v: number | undefined): string => v !== undefined && v !== null ? v.toFixed(2) : '&mdash;';
 					const ratiosTable = `<p class="section-label">Valuation Ratios</p>
 					<table class="dashboard-table">
 						<thead><tr><th>Ratio</th><th>Value</th></tr></thead>
 						<tbody>
-							<tr><td>P/E</td><td>${r.pe != null ? r.pe.toFixed(2) : '—'}</td></tr>
-							<tr><td>P/B</td><td>${r.pb != null ? r.pb.toFixed(2) : '—'}</td></tr>
-							<tr><td>P/S</td><td>${r.ps != null ? r.ps.toFixed(2) : '—'}</td></tr>
-							<tr><td>Dividend Yield</td><td>${r.dividend_yield != null ? (r.dividend_yield * 100).toFixed(2) + '%' : '—'}</td></tr>
-							<tr><td>ROE</td><td>${r.roe != null ? (r.roe * 100).toFixed(2) + '%' : '—'}</td></tr>
-							<tr><td>ROA</td><td>${r.roa != null ? (r.roa * 100).toFixed(2) + '%' : '—'}</td></tr>
-							<tr><td>Debt/Equity</td><td>${r.debt_to_equity != null ? r.debt_to_equity.toFixed(2) : '—'}</td></tr>
-							<tr><td>Current Ratio</td><td>${r.current_ratio != null ? r.current_ratio.toFixed(2) : '—'}</td></tr>
+							<tr><td>P/E</td><td>${num(r.pe_ratio)}</td></tr>
+							<tr><td>PEG</td><td>${num(r.peg_ratio)}</td></tr>
+							<tr><td>P/B</td><td>${num(r.pb_ratio)}</td></tr>
+							<tr><td>P/S</td><td>${num(r.ps_ratio)}</td></tr>
+							<tr><td>EV/EBITDA</td><td>${num(r.ev_to_ebitda)}</td></tr>
+							<tr><td>Price/FCF</td><td>${num(r.price_to_fcf)}</td></tr>
+							<tr><td>Dividend Yield</td><td>${pct(r.dividend_yield)}</td></tr>
+							<tr><td>ROE</td><td>${pct(r.roe)}</td></tr>
+							<tr><td>ROIC</td><td>${pct(r.roic)}</td></tr>
+							<tr><td>ROA</td><td>${pct(r.roa)}</td></tr>
+							<tr><td>Gross Margin</td><td>${pct(r.gross_margin)}</td></tr>
+							<tr><td>Operating Margin</td><td>${pct(r.operating_margin)}</td></tr>
+							<tr><td>Net Margin</td><td>${pct(r.net_margin)}</td></tr>
+							<tr><td>Debt/Equity</td><td>${num(r.debt_to_equity)}</td></tr>
+							<tr><td>Current Ratio</td><td>${num(r.current_ratio)}</td></tr>
+							<tr><td>Beta</td><td>${num(r.beta)}</td></tr>
 						</tbody>
 					</table>`;
 
@@ -365,7 +358,7 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 		})
 	);
 
-	// ─── Institutional ────────────────────────────────────────────────────────
+	// --- Institutional --------------------------------------------------------
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.openInstitutional', async () => {
 			const symbol = await vscode.window.showInputBox({
@@ -377,43 +370,49 @@ export function registerDashboardCommands(context: vscode.ExtensionContext): voi
 			void DashboardWebviewPanel.show(context, {
 				id: `quantlab.dashboard.institutional.${sym}`,
 				title: `Institutional: ${sym}`,
+				// Both endpoints are live-503 today; sections settle independently
+				// so each renders an honest note instead of one red error pane.
 				fetchData: async () => {
 					const [holdings, insiders] = await Promise.all([
-						client.getInstitutionalHoldings(sym),
-						client.getInstitutionalInsiders(sym),
+						settleSection('Institutional holdings', client.getInstitutionalHoldings(sym)),
+						settleSection('Institutional insiders', client.getInstitutionalInsiders(sym)),
 					]);
 					return { holdings, insiders };
 				},
 				renderBody: (data) => {
-					const holdingsTable = data.holdings.length ? `
-						<p class="section-label">Institutional Holdings</p>
-						<table class="dashboard-table">
-							<thead><tr><th>Holder</th><th>Shares</th><th>Value</th><th>Change</th><th>Date</th></tr></thead>
-							<tbody>${data.holdings.map(h => `<tr>
-								<td>${escapeHtml(String(h.holder ?? ''))}</td>
-								<td>${h.shares != null ? h.shares.toLocaleString() : '—'}</td>
-								<td>${h.value != null ? '$' + (h.value / 1e6).toFixed(1) + 'M' : '—'}</td>
-								<td>${h.change != null ? h.change.toLocaleString() : '—'}</td>
-								<td>${escapeHtml(String(h.date_reported ?? ''))}</td>
-							</tr>`).join('')}</tbody>
-						</table>` : '<div class="dash-empty">No holdings data</div>';
+					const holdingsSection = data.holdings.ok
+						? (data.holdings.value.length ? `
+							<p class="section-label">Institutional Holdings</p>
+							<table class="dashboard-table">
+								<thead><tr><th>Holder</th><th>Shares</th><th>Value</th><th>Change</th><th>Date</th></tr></thead>
+								<tbody>${data.holdings.value.map(h => `<tr>
+									<td>${escapeHtml(String(h.holder ?? ''))}</td>
+									<td>${h.shares !== undefined && h.shares !== null ? h.shares.toLocaleString() : '&mdash;'}</td>
+									<td>${h.value !== undefined && h.value !== null ? formatLargeUsd(h.value) : '&mdash;'}</td>
+									<td>${h.change !== undefined && h.change !== null ? h.change.toLocaleString() : '&mdash;'}</td>
+									<td>${escapeHtml(String(h.date_reported ?? ''))}</td>
+								</tr>`).join('')}</tbody>
+							</table>` : '<div class="dash-empty">No holdings data</div>')
+						: unavailableNote('Institutional Holdings', data.holdings.error);
 
-					const insidersTable = data.insiders.length ? `
-						<p class="section-label">Insider Transactions</p>
-						<table class="dashboard-table">
-							<thead><tr><th>Name</th><th>Title</th><th>Type</th><th>Shares</th><th>Price</th><th>Value</th><th>Date</th></tr></thead>
-							<tbody>${data.insiders.map(i => `<tr>
-								<td>${escapeHtml(String(i.name ?? ''))}</td>
-								<td>${escapeHtml(String(i.title ?? ''))}</td>
-								<td>${escapeHtml(String(i.transaction_type ?? ''))}</td>
-								<td>${i.shares != null ? i.shares.toLocaleString() : '—'}</td>
-								<td>${i.price != null ? '$' + i.price.toFixed(2) : '—'}</td>
-								<td>${i.value != null ? '$' + (i.value / 1e6).toFixed(1) + 'M' : '—'}</td>
-								<td>${escapeHtml(String(i.date ?? ''))}</td>
-							</tr>`).join('')}</tbody>
-						</table>` : '<div class="dash-empty">No insider data</div>';
+					const insidersSection = data.insiders.ok
+						? (data.insiders.value.length ? `
+							<p class="section-label">Insider Transactions</p>
+							<table class="dashboard-table">
+								<thead><tr><th>Name</th><th>Title</th><th>Type</th><th>Shares</th><th>Price</th><th>Value</th><th>Date</th></tr></thead>
+								<tbody>${data.insiders.value.map(i => `<tr>
+									<td>${escapeHtml(String(i.name ?? ''))}</td>
+									<td>${escapeHtml(String(i.title ?? ''))}</td>
+									<td>${escapeHtml(String(i.transaction_type ?? ''))}</td>
+									<td>${i.shares !== undefined && i.shares !== null ? i.shares.toLocaleString() : '&mdash;'}</td>
+									<td>${i.price !== undefined && i.price !== null ? '$' + i.price.toFixed(2) : '&mdash;'}</td>
+									<td>${i.value !== undefined && i.value !== null ? formatLargeUsd(i.value) : '&mdash;'}</td>
+									<td>${escapeHtml(String(i.date ?? ''))}</td>
+								</tr>`).join('')}</tbody>
+							</table>` : '<div class="dash-empty">No insider data</div>')
+						: unavailableNote('Insider Transactions', data.insiders.error);
 
-					return holdingsTable + insidersTable;
+					return holdingsSection + insidersSection;
 				},
 			});
 		})
