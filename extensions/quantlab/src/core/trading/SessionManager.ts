@@ -44,7 +44,7 @@ const UPDATE_COALESCE_MS = 200;
 /**
  * Fill reconciler for idempotent fill processing.
  *
- * Spec Reference: Technical Spec §10.6 - Fill Reconciliation
+ * Spec Reference: Technical Spec section 10.6 - Fill Reconciliation
  *
  * Handles:
  * - Duplicate fill detection via fill ID tracking
@@ -315,7 +315,13 @@ export class SessionManager {
 			}),
 			this.historyState.onDidChange(() => this.emitRequirementsForOpenStrategies()),
 			this.validator.onDidValidate(({ uri }) => {
-				this.emitRequirementsForStrategy(uri.fsPath);
+				// Only real on-disk strategies have requirements. Virtual docs
+				// (e.g. quantlab-server:// symbol tabs) must not be re-opened via
+				// fsPath -- that strips the scheme and points at a nonexistent
+				// file:// path (one unhandled rejection per Data-tree click).
+				if (uri.scheme === 'file') {
+					this.emitRequirementsForStrategy(uri.fsPath);
+				}
 			})
 		);
 	}
@@ -1270,14 +1276,16 @@ export class SessionManager {
 	}
 
 	private emitRequirementsForStrategy(strategyPath: string): void {
-		void this.getRequirementsCheck(strategyPath).then(requirements => {
+		this.getRequirementsCheck(strategyPath).then(requirements => {
 			this._onRequirementsChanged.fire({ strategyPath, requirements });
+		}, err => {
+			console.error(`SessionManager: requirements check failed for ${strategyPath}:`, err);
 		});
 	}
 
 	private emitRequirementsForOpenStrategies(): void {
 		const openStrategies = vscode.workspace.textDocuments
-			.filter(doc => doc.languageId === 'python')
+			.filter(doc => doc.languageId === 'python' && doc.uri.scheme === 'file')
 			.map(doc => doc.uri.fsPath);
 
 		for (const path of openStrategies) {
@@ -1471,8 +1479,8 @@ export class SessionManager {
 			// Cleanup on failure
 			this.startingSessionKeys.delete(startKey);
 			this.daemonClients.delete(sessionId);
-			await this.daemonManager.stopDaemon(sessionId).catch(() => {});
-			await this.releaseBroker(account.id).catch(() => {}); // release broker if acquireBroker() succeeded before the throw
+			await this.daemonManager.stopDaemon(sessionId).catch(() => { });
+			await this.releaseBroker(account.id).catch(() => { }); // release broker if acquireBroker() succeeded before the throw
 			void vscode.window.showErrorMessage(`Failed to start daemon session: ${(error as Error).message}`);
 			return undefined;
 		}
@@ -1586,7 +1594,7 @@ export class SessionManager {
 	/**
 	 * Emergency flatten all positions using two-stage protocol.
 	 *
-	 * Spec Reference: Technical Spec §2.6 - Emergency Flatten Protocol
+	 * Spec Reference: Technical Spec section 2.6 - Emergency Flatten Protocol
 	 *
 	 * Stage 1: Marketable Limit IOC
 	 *   - For sells: limit price = bid - slippage allowance

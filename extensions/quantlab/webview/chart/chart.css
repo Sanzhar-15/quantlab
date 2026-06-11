@@ -495,7 +495,7 @@ body {
 	min-width: 24px;
 }
 
-/* ─── LHS Chart Tools ─── */
+/* ---- LHS Chart Tools ---- */
 
 .lhs-toolbar {
 	position: absolute;
@@ -641,4 +641,157 @@ body {
 	.lhs-toolbar-toggle-icon {
 		transition: none;
 	}
+}
+
+/* ---- Market header (data mode: server-symbol tabs) ---- */
+
+.market-header {
+	display: none;
+	align-items: center;
+	gap: 12px;
+	padding: 8px 14px;
+	border-bottom: 1px solid var(--vscode-editorGroup-border);
+	background: var(--vscode-editor-background);
+	min-height: 36px;
+}
+
+html[data-chart-mode="data"] .market-header {
+	display: flex;
+}
+
+/* In data mode the strategy chrome disappears entirely -- the market header
+is the single chrome row (the symbol dropdown and refresh/fullscreen
+buttons are moved into it by the webview shell). */
+html[data-chart-mode="data"] .toolbar,
+html[data-chart-mode="data"] .params-panel,
+html[data-chart-mode="data"] .no-viz {
+	display: none;
+}
+
+.mh-identity .data-source-button {
+	background: transparent;
+	border: 1px solid transparent;
+	font-size: 15px;
+	font-weight: 700;
+	color: var(--ql-fg);
+	padding: 4px 22px 4px 6px !important;
+	max-width: 320px;
+}
+
+.mh-identity .data-source-button:hover {
+	background: var(--vscode-toolbar-hoverBackground, var(--vscode-input-background));
+	border-color: var(--ql-border);
+}
+
+.mh-ticker {
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	color: var(--ql-muted);
+	padding: 2px 7px;
+	border: 1px solid var(--ql-border);
+	border-radius: 4px;
+}
+
+.mh-quote {
+	display: inline-flex;
+	align-items: baseline;
+	gap: 8px;
+}
+
+.mh-price {
+	font-family: var(--ql-font-mono);
+	font-size: 16px;
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+	color: var(--ql-fg);
+}
+
+.mh-change {
+	font-family: var(--ql-font-mono);
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+	padding: 2px 8px;
+	border-radius: 999px;
+}
+
+.mh-change.up {
+	color: var(--ql-status-positive);
+	background: color-mix(in srgb, var(--ql-status-positive) 14%, transparent);
+}
+
+.mh-change.down {
+	color: var(--ql-status-negative);
+	background: color-mix(in srgb, var(--ql-status-negative) 14%, transparent);
+}
+
+.mh-meta {
+	font-size: 11px;
+	color: var(--ql-muted);
+	white-space: nowrap;
+}
+
+.market-header .spacer {
+	flex: 1;
+}
+
+.mh-presets {
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+	padding: 2px;
+	border: 1px solid var(--ql-border);
+	border-radius: 6px;
+}
+
+.mh-preset {
+	height: 22px;
+	min-width: 32px;
+	padding: 0 8px;
+	font-size: 11px;
+	font-weight: 600;
+	border: none;
+	border-radius: 4px;
+	background: transparent;
+	color: var(--ql-muted);
+	cursor: pointer;
+}
+
+.mh-preset:hover:not(:disabled) {
+	color: var(--ql-fg);
+	background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+}
+
+.mh-preset.active {
+	background: var(--ql-accent);
+	color: var(--ql-accent-fg);
+}
+
+.mh-preset:disabled {
+	opacity: 0.45;
+	cursor: default;
+}
+
+.mh-preset-hidden {
+	display: none;
+}
+
+.mh-actions {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.mh-actions button {
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-input-border);
+	color: var(--vscode-input-foreground);
+	border-radius: 4px;
+	padding: 4px 8px;
+	font-size: 12px;
+	cursor: pointer;
+}
+
+.mh-actions button:hover {
+	background: var(--vscode-input-hoverBackground);
 }

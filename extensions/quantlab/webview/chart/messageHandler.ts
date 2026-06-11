@@ -22,6 +22,8 @@ interface ServerDataSource {
 	kind: 'server';
 	symbol: string;
 	displayName: string;
+	/** Routes crypto symbols to the crypto bars endpoint; must round-trip. */
+	assetClass?: string;
 }
 
 type DataSourceDescriptor = LocalFileDataSource | ServerDataSource;
@@ -42,6 +44,8 @@ interface ChartToolbarState {
 	complexity: ComplexityInfo;
 	hasVisualization: boolean;
 	viewOnly: boolean;
+	/** 'data' = market-data viewing (server-symbol tabs); 'strategy' = classic surface. */
+	mode?: 'data' | 'strategy';
 }
 
 type ChartErrorAction = 'selectData' | 'editVisualization' | 'reload';
@@ -73,6 +77,14 @@ interface MessageHandlerContext {
 	parameterPanel: ParameterPanel;
 	banner: HTMLElement;
 	noViz: HTMLElement;
+	/** Applies data/strategy mode to the shell (chrome swap, volume pane). */
+	applyMode: (mode: 'data' | 'strategy') => void;
+	/** Market header (data mode): quote/presets driven by toolbar + bars. */
+	marketHeader: {
+		setSource(symbol: string | undefined, displayName: string | undefined, assetClass?: string): void;
+		setTimeframe(timeframe: string | undefined): void;
+		updateFromBars(bars: OhlcvBar[]): void;
+	};
 	toolbar: {
 		dataSourceButton: HTMLButtonElement;
 		dataSourceDropdown: HTMLElement;
@@ -181,7 +193,7 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 
 				option.addEventListener('click', () => {
 					context.toolbar.dataSourceDropdown.classList.remove('show');
-					context.postMessage({ type: 'selectServerSymbol', symbol: source.symbol, displayName: source.displayName });
+					context.postMessage({ type: 'selectServerSymbol', symbol: source.symbol, displayName: source.displayName, assetClass: source.assetClass });
 				});
 
 				context.toolbar.dataSourceDropdown.appendChild(option);
@@ -232,6 +244,17 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 	};
 
 	const updateToolbar = (toolbar: ChartToolbarState) => {
+		const mode = toolbar.mode ?? 'strategy';
+		context.applyMode(mode);
+		if (mode === 'data') {
+			const source = toolbar.dataSource;
+			if (source && isServerSource(source)) {
+				context.marketHeader.setSource(source.symbol, source.displayName, source.assetClass);
+			} else {
+				context.marketHeader.setSource(undefined, undefined);
+			}
+			context.marketHeader.setTimeframe(toolbar.timeframe);
+		}
 		context.toolbar.dataSourceButton.textContent = toolbar.dataSource?.displayName ?? 'No Data';
 		// Set tooltip based on source type
 		let sourceTooltip = 'Select a data source';
@@ -247,7 +270,9 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 		context.toolbar.dateStart.value = toolbar.dateRange?.start ?? '';
 		context.toolbar.dateEnd.value = toolbar.dateRange?.end ?? '';
 		setComplexity(toolbar.complexity);
-		context.noViz.classList.toggle('show', !toolbar.hasVisualization && !toolbar.viewOnly);
+		// The visualize() prompt is developer-facing -- never show it on a
+		// market-data tab (the virtual symbol template has no visualize()).
+		context.noViz.classList.toggle('show', !toolbar.hasVisualization && !toolbar.viewOnly && mode !== 'data');
 
 		if (toolbar.recentSources) {
 			populateDropdown(toolbar.recentSources);
@@ -256,7 +281,7 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 
 	return async (message: unknown) => {
 		const data = message as ChartMessage;
-		if (!data || typeof data !== 'object' || !('type' in data)) {
+		if (!data || typeof data !== 'object' || typeof (data as { type?: unknown }).type !== 'string') {
 			return;
 		}
 
@@ -285,6 +310,7 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 				}
 				lastDataRequestId = data.requestId;
 				clearError();
+				context.marketHeader.updateFromBars(data.data);
 				await context.chart.setData(data.data);
 				return;
 			case 'setDataBinary': {
@@ -297,6 +323,7 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 				lastDataRequestId = data.requestId;
 				clearError();
 				const decoded = decodeOhlcvBuffer(data.buffer, data.count);
+				context.marketHeader.updateFromBars(decoded);
 				await context.chart.setData(decoded);
 				return;
 			}

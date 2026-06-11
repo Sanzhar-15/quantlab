@@ -1034,7 +1034,14 @@ export class ServerApiClient {
 	// REST API - Watchlists
 	async getWatchlists(): Promise<ServerWatchlist[]> {
 		await this.ensureAuthenticated();
-		return this.request<ServerWatchlist[]>('GET', '/v1/watchlists');
+		// The list endpoint wraps the array: { count, watchlists: [...] }
+		// (live shape verified 2026-06-11; single-watchlist CRUD endpoints
+		// return the bare watchlist object in `data`).
+		const res = await this.request<{ count: number; watchlists: ServerWatchlist[] }>('GET', '/v1/watchlists');
+		if (!res || !Array.isArray(res.watchlists)) {
+			throw new Error(`Unexpected /v1/watchlists response shape: ${JSON.stringify(res).slice(0, 200)}`);
+		}
+		return res.watchlists;
 	}
 
 	async createWatchlist(name: string, symbols: string[] = []): Promise<ServerWatchlist> {

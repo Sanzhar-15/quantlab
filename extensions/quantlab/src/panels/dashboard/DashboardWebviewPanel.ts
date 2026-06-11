@@ -1,7 +1,10 @@
 /*---------------------------------------------------------------------------------------------
- *  DashboardWebviewPanel — Generic reusable webview panel factory for data dashboards.
- *  Pattern follows QuantLabHome.ts: singleton per id, CSP with nonce, tokens.css.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+//  DashboardWebviewPanel -- Generic reusable webview panel factory for data dashboards.
+//  Pattern follows QuantLabHome.ts: singleton per id, CSP with nonce, tokens.css.
 
 import * as vscode from 'vscode';
 import { ThemeProvider } from '../../ui/tokens/ThemeProvider';
@@ -44,30 +47,30 @@ export class DashboardWebviewPanel {
 		themeProvider.registerWebview(themeKey, panel.webview);
 
 		// Show loading state
-		panel.webview.html = buildHtml(tokensUri, themeStyles, config.title,
+		panel.webview.html = buildHtml(panel.webview.cspSource, tokensUri, themeStyles, config.title,
 			'<div class="dash-loading">Loading...</div>');
 
 		// Fetch data and render
 		try {
 			const data = await config.fetchData();
-			panel.webview.html = buildHtml(tokensUri, themeStyles, config.title, config.renderBody(data));
+			panel.webview.html = buildHtml(panel.webview.cspSource, tokensUri, themeStyles, config.title, config.renderBody(data));
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			panel.webview.html = buildHtml(tokensUri, themeStyles, config.title,
+			panel.webview.html = buildHtml(panel.webview.cspSource, tokensUri, themeStyles, config.title,
 				`<div class="dash-error">Failed to load data: ${escapeHtml(msg)}</div>`);
 		}
 
 		// Handle refresh messages
 		panel.webview.onDidReceiveMessage(async (msg: { type: string }) => {
 			if (msg.type === 'refresh') {
-				panel.webview.html = buildHtml(tokensUri, themeStyles, config.title,
+				panel.webview.html = buildHtml(panel.webview.cspSource, tokensUri, themeStyles, config.title,
 					'<div class="dash-loading">Refreshing...</div>');
 				try {
 					const data = await config.fetchData();
-					panel.webview.html = buildHtml(tokensUri, themeStyles, config.title, config.renderBody(data));
+					panel.webview.html = buildHtml(panel.webview.cspSource, tokensUri, themeStyles, config.title, config.renderBody(data));
 				} catch (err) {
 					const msg2 = err instanceof Error ? err.message : String(err);
-					panel.webview.html = buildHtml(tokensUri, themeStyles, config.title,
+					panel.webview.html = buildHtml(panel.webview.cspSource, tokensUri, themeStyles, config.title,
 						`<div class="dash-error">Failed to load data: ${escapeHtml(msg2)}</div>`);
 				}
 			}
@@ -91,12 +94,14 @@ export function escapeHtml(s: string): string {
 	return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function buildHtml(tokensUri: vscode.Uri, themeStyles: string, title: string, body: string): string {
+function buildHtml(cspSource: string, tokensUri: vscode.Uri, themeStyles: string, title: string, body: string): string {
 	const n = nonce();
+	// style-src MUST include cspSource or the linked tokens.css is silently
+	// blocked and every dashboard renders without its design tokens.
 	const csp = [
 		`default-src 'none'`,
-		`img-src data:`,
-		`style-src 'unsafe-inline'`,
+		`img-src ${cspSource} data:`,
+		`style-src ${cspSource} 'unsafe-inline'`,
 		`script-src 'nonce-${n}'`,
 	].join('; ');
 

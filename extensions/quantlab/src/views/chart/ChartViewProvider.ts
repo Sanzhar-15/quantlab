@@ -323,7 +323,7 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				this.handleSelectDataSource(session, payload.filePath);
 				return;
 			case 'selectServerSymbol':
-				this.handleSelectServerSymbol(session, payload.symbol, payload.displayName);
+				this.handleSelectServerSymbol(session, payload.symbol, payload.displayName, payload.assetClass);
 				return;
 			case 'overrideDateRange':
 				this.updateChartOverride(session, { dateRange: payload.range });
@@ -410,8 +410,10 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		this.executeWithErrorBoundary(() => this.reloadData(session), 'reloadData');
 	}
 
-	private handleSelectServerSymbol(session: ChartSession, symbol: string, displayName: string): void {
-		const source: ServerDataSource = { kind: 'server', symbol, displayName };
+	private handleSelectServerSymbol(session: ChartSession, symbol: string, displayName: string, assetClass?: string): void {
+		// assetClass routes crypto symbols to /v1/crypto/bars -- dropping it here
+		// would silently chart a crypto recent against the equities endpoint.
+		const source: ServerDataSource = { kind: 'server', symbol, displayName, assetClass };
 
 		// Set global state only - refreshFromGlobal will propagate to tabs without overrides
 		this.globalState.setDataSource(source);
@@ -796,7 +798,11 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			recentSources,
 			complexity,
 			hasVisualization: viz.hasVisualization,
-			viewOnly: complexity.level === 'viewOnly'
+			viewOnly: complexity.level === 'viewOnly',
+			// Virtual server-symbol tabs are pure market-data viewing -- the
+			// webview swaps to the market header + range presets and hides the
+			// strategy chrome. Real files (.py/.csv) keep the strategy surface.
+			mode: session.document.uri.scheme === 'quantlab-server' ? 'data' : 'strategy'
 		};
 	}
 

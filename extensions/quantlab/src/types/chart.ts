@@ -28,6 +28,13 @@ export interface ChartToolbarState {
 	complexity: ComplexityInfo;
 	hasVisualization: boolean;
 	viewOnly: boolean;
+	/**
+	 * 'data' = market-data viewing (quantlab-server:// symbol tabs): the webview
+	 * shows the market header + range presets and hides the strategy chrome
+	 * (parameters panel, complexity badge, visualize() prompts).
+	 * 'strategy' = the classic strategy-charting surface for real files.
+	 */
+	mode: 'data' | 'strategy';
 }
 
 export type ChartErrorAction = 'selectData' | 'editVisualization' | 'reload';
@@ -88,7 +95,7 @@ export type ChartInboundMessage =
 	| { type: 'applyToCode' }
 	| { type: 'requestFilePicker' }
 	| { type: 'selectDataSource'; filePath: string }
-	| { type: 'selectServerSymbol'; symbol: string; displayName: string }
+	| { type: 'selectServerSymbol'; symbol: string; displayName: string; assetClass?: string }
 	| { type: 'overrideDateRange'; range?: ChartDateRange }
 	| { type: 'refresh' }
 	| { type: 'screenshot' }

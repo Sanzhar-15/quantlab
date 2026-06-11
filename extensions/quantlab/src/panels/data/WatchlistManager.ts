@@ -134,7 +134,13 @@ export class WatchlistManager {
 		return stored.map(list => ({
 			id: list.id ?? this.createId(),
 			name: list.name ?? 'Watchlist',
-			symbols: Array.isArray(list.symbols) ? list.symbols.map(symbol => symbol.toUpperCase()) : []
+			symbols: Array.isArray(list.symbols) ? list.symbols.map(symbol => symbol.toUpperCase()) : [],
+			// Preserve the server linkage -- dropping serverId here made every
+			// server-backed list unmatched in mergeWatchlists() after a reload,
+			// duplicating the whole set on the next sync.
+			isDefault: list.isDefault,
+			sortOrder: list.sortOrder,
+			serverId: list.serverId
 		}));
 	}
 

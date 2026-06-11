@@ -237,14 +237,19 @@ export class TradeTreeProvider implements vscode.TreeDataProvider<TradeNode> {
 	}
 
 	private getActiveStrategyPath(): string | undefined {
+		// Only file:// resources are on-disk strategies -- virtual tabs (e.g.
+		// quantlab-server:// symbols) must not leak their fsPath here.
 		const editor = vscode.window.activeTextEditor;
-		if (editor && this.validator.isStrategyFile(editor.document)) {
+		if (editor && editor.document.uri.scheme === 'file' && this.validator.isStrategyFile(editor.document)) {
 			return editor.document.uri.fsPath;
 		}
 
 		const tab = vscode.window.tabGroups.activeTabGroup?.activeTab;
 		if (tab?.input instanceof vscode.TabInputCustom || tab?.input instanceof vscode.TabInputText) {
 			const uri = tab.input.uri;
+			if (uri.scheme !== 'file') {
+				return undefined;
+			}
 			const doc = vscode.workspace.textDocuments.find(document => document.uri.toString() === uri.toString());
 			if (doc && this.validator.isStrategyFile(doc)) {
 				return doc.uri.fsPath;

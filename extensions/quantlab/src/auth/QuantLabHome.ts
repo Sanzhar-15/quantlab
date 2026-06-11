@@ -1,8 +1,11 @@
 /*---------------------------------------------------------------------------------------------
- *  QuantLab Home — Post-login dashboard tab.
- *  Shown once after first successful login. Accessible any time via "quantlab.openHome".
- *  Two-column layout: Delta Plus brand (left) + personalised dashboard (right).
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+//  QuantLab Home -- Post-login dashboard tab.
+//  Shown once after first successful login. Accessible any time via "quantlab.openHome".
+//  Two-column layout: Delta Plus brand (left) + personalised dashboard (right).
 
 import * as vscode from 'vscode';
 import { ThemeProvider } from '../ui/tokens/ThemeProvider';
@@ -49,7 +52,7 @@ export class QuantLabHome {
 			panel.webview, tokensUri, styleUri, themeStyles, user
 		);
 
-		// Handle quick-action button clicks → execute VS Code commands
+		// Handle quick-action button clicks -> execute VS Code commands
 		panel.webview.onDidReceiveMessage(async (msg: { type: string; cmd?: string }) => {
 			if (msg.type === 'command' && msg.cmd) {
 				await vscode.commands.executeCommand(msg.cmd).then(undefined, () => { /* ignore */ });
@@ -70,20 +73,22 @@ export class QuantLabHome {
 		return QuantLabHome._instance !== undefined;
 	}
 
-	// ── HTML ─────────────────────────────────────────────────────────────────
+	// ---- HTML ----
 
 	private static _buildHtml(
-		_webview: vscode.Webview,
+		webview: vscode.Webview,
 		tokensUri: vscode.Uri,
 		styleUri: vscode.Uri,
 		themeStyles: string,
 		user: HomeUser,
 	): string {
 		const nonce = QuantLabHome._nonce();
+		// style-src MUST include cspSource or the linked tokens.css/welcome.css
+		// are silently blocked and the panel renders unstyled.
 		const csp = [
 			`default-src 'none'`,
-			`img-src data:`,
-			`style-src 'unsafe-inline'`,
+			`img-src ${webview.cspSource} data:`,
+			`style-src ${webview.cspSource} 'unsafe-inline'`,
 			`script-src 'nonce-${nonce}'`,
 		].join('; ');
 
@@ -91,17 +96,21 @@ export class QuantLabHome {
 		const tier = user.tier ? `${user.tier.charAt(0).toUpperCase()}${user.tier.slice(1)}` : 'Free';
 
 		const actions: Array<{ label: string; icon: string; cmd: string; desc: string }> = [
-			{ label: 'Open QIC Chat',   icon: '✦', cmd: 'workbench.view.extension.quantlab-qic',  desc: 'AI trading assistant' },
-			{ label: 'Browse Markets',  icon: '⬡', cmd: 'quantlab.focusDataPanel',                desc: '511 equities · 50 crypto' },
-			{ label: 'View Chart',      icon: '↗', cmd: 'quantlab.chart.refresh',                 desc: 'Drag symbols to chart' },
-			{ label: 'Manage Alerts',   icon: '◈', cmd: 'quantlab.focusDataPanel',                desc: 'Price & volume triggers' },
+			// allow-any-unicode-next-line
+			{ label: 'Open Orion', icon: '✦', cmd: 'workbench.view.extension.quantlab-qic', desc: 'AI trading assistant' },
+			// allow-any-unicode-next-line
+			{ label: 'Browse Markets', icon: '⬡', cmd: 'quantlab.focusDataPanel', desc: '511 equities · 50 crypto' },
+			// allow-any-unicode-next-line
+			{ label: 'View Chart', icon: '↗', cmd: 'quantlab.chart.refresh', desc: 'Drag symbols to chart' },
+			// allow-any-unicode-next-line
+			{ label: 'Manage Alerts', icon: '◈', cmd: 'quantlab.focusDataPanel', desc: 'Price & volume triggers' },
 		];
 
 		const tips: string[] = [
 			'Drag any symbol from the Data panel onto the chart to plot it instantly.',
 			'Use <kbd>Ctrl+Shift+P</kbd> and type <strong>QuantLab</strong> to discover all commands.',
 			'Right-click any data row to add to watchlist, set alerts, or open a chart.',
-			'QIC AI has access to real-time Delta Plus data — just ask it anything.',
+			'QIC AI has access to real-time Delta Plus data -- just ask it anything.',
 		];
 
 		return /* html */`<!DOCTYPE html>
@@ -171,7 +180,7 @@ export class QuantLabHome {
 <body>
 <div class="welcome-shell">
 
-	<!-- ── Left: Brand panel ── -->
+	<!-- ---- Left: Brand panel ---- -->
 	<div class="brand-panel">
 		<div class="brand-lockup">
 			<div class="brand-logo">
@@ -189,7 +198,7 @@ export class QuantLabHome {
 		</ul>
 	</div>
 
-	<!-- ── Right: Dashboard ── -->
+	<!-- ---- Right: Dashboard ---- -->
 	<div class="form-panel">
 		<div class="home-right">
 

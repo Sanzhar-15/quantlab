@@ -6,6 +6,7 @@
 import { ChartClient } from './chartApi';
 import { ParameterPanel } from './parameterPanel';
 import { createMessageHandler } from './messageHandler';
+import { createMarketHeader } from './marketHeader';
 import { installErrorBoundary } from './errorBoundary';
 import { applyReducedMotion, applyTheme, ReducedMotionMode, ThemePayload } from '../shared/appearance';
 
@@ -264,11 +265,35 @@ applyButton.classList.add('primary');
 panelActions.append(resetButton, applyButton);
 panelRoot.append(panelHeader, panelList, panelActions);
 
-root.append(toolbar, banner, noVizPrompt, chartContainer, panelRoot);
+// --- Market header (data mode) ---
+const marketHeader = createMarketHeader(message => vscode.postMessage(message));
+
+root.append(toolbar, marketHeader.root, banner, noVizPrompt, chartContainer, panelRoot);
 
 applyReducedMotion('auto');
 
 const chartClient = new ChartClient(chartContainer);
+
+// Data mode swaps the strategy toolbar for the market header: the symbol
+// dropdown and the refresh/fullscreen actions are MOVED between the two
+// containers so there is exactly one live instance of each control.
+let currentMode: 'data' | 'strategy' = 'strategy';
+const applyMode = (mode: 'data' | 'strategy') => {
+	if (mode === currentMode) {
+		return;
+	}
+	currentMode = mode;
+	document.documentElement.dataset.chartMode = mode;
+	if (mode === 'data') {
+		marketHeader.identitySlot.appendChild(dataSourceContainer);
+		marketHeader.actionsSlot.append(refreshButton, fullscreenButton);
+	} else {
+		leftGroup.prepend(dataSourceContainer);
+		rightGroup.append(refreshButton, fullscreenButton);
+	}
+	chartClient.setVolumeEnabled(mode === 'data');
+};
+document.documentElement.dataset.chartMode = currentMode;
 const storedState = typeof vscode.getState === 'function' ? (vscode.getState() as { strategyPaneVisible?: boolean } | undefined) : undefined;
 let strategyPaneVisible = storedState?.strategyPaneVisible ?? true;
 
@@ -345,6 +370,8 @@ const handler = createMessageHandler({
 	parameterPanel,
 	banner,
 	noViz: noVizPrompt,
+	applyMode,
+	marketHeader,
 	toolbar: {
 		dataSourceButton,
 		dataSourceDropdown,

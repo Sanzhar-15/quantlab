@@ -1,10 +1,13 @@
 /*---------------------------------------------------------------------------------------------
- *  Resources Panel Webview Script
- *  Renders server catalog with per-section state, search, tier toggles,
- *  implementation status, keyboard navigation, and collapse persistence.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-// ── Webview-local type definitions (cannot import from src/) ────────────────
+//  Resources Panel Webview Script
+//  Renders server catalog with per-section state, search, tier toggles,
+//  implementation status, keyboard navigation, and collapse persistence.
+
+// ---- Webview-local type definitions (cannot import from src/) ----
 
 interface ResourceCategory {
 	id: string;
@@ -59,7 +62,7 @@ interface SavedState {
 	}>;
 }
 
-// Provider → Webview message types
+// Provider -> Webview message types
 type ProviderMessage =
 	| { type: 'setCatalog'; catalog: CatalogPayload; section: Section }
 	| { type: 'setSection'; section: Section }
@@ -76,7 +79,7 @@ interface VSCodeApi {
 
 declare function acquireVsCodeApi(): VSCodeApi;
 
-// ── Utilities ───────────────────────────────────────────────────────────────
+// ---- Utilities ----
 
 function escapeHtml(s: string): string {
 	return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -90,7 +93,7 @@ function resolveIcon(serverIcon: string): string {
 	return serverIcon || 'symbol-misc';
 }
 
-// ── State ───────────────────────────────────────────────────────────────────
+// ---- State ----
 
 const vscode = acquireVsCodeApi();
 
@@ -149,7 +152,7 @@ function persistState(): void {
 	} satisfies SavedState);
 }
 
-// ── Initialization ──────────────────────────────────────────────────────────
+// ---- Initialization ----
 
 function init(): void {
 	const root = document.getElementById('resources-root');
@@ -184,12 +187,12 @@ function renderShell(): string {
 				<div class="search-container">
 					<span class="codicon codicon-search"></span>
 					<input type="text" class="search-input" placeholder="Search tools..."
-					       value="${escapeAttr(currentState().searchQuery)}" />
+						value="${escapeAttr(currentState().searchQuery)}" />
 					<span class="codicon codicon-close search-clear"
-					      style="display:${currentState().searchQuery ? 'inline' : 'none'}"></span>
+						style="display:${currentState().searchQuery ? 'inline' : 'none'}"></span>
 				</div>
 				<button class="filter-toggle${showImplementedOnly ? ' active' : ''}"
-				        title="Show implemented tools only">
+					title="Show implemented tools only">
 					<span class="codicon codicon-filter"></span>
 				</button>
 			</div>
@@ -214,7 +217,7 @@ function renderUnavailable(message: string): string {
 	`;
 }
 
-// ── Shell event binding ─────────────────────────────────────────────────────
+// ---- Shell event binding ----
 
 function bindShellEvents(): void {
 	// Section buttons
@@ -280,7 +283,7 @@ function bindShellEvents(): void {
 	}
 }
 
-// ── Section switching ───────────────────────────────────────────────────────
+// ---- Section switching ----
 
 function switchSection(section: Section, notify = true): void {
 	currentSection = section;
@@ -308,7 +311,7 @@ function switchSection(section: Section, notify = true): void {
 	}
 }
 
-// ── Provider message handling ───────────────────────────────────────────────
+// ---- Provider message handling ----
 
 function handleProviderMessage(data: ProviderMessage): void {
 	switch (data.type) {
@@ -345,7 +348,7 @@ function handleProviderMessage(data: ProviderMessage): void {
 	}
 }
 
-// ── Rendering ───────────────────────────────────────────────────────────────
+// ---- Rendering ----
 
 function renderCurrentSection(): void {
 	const content = document.getElementById('section-content');
@@ -426,7 +429,6 @@ function renderCategory(cat: ResourceCategory, searchFilter: string): string {
 				<span class="category-count">${tools.length}</span>
 			</div>
 			<div class="category-tools" style="display: ${isExpanded ? 'block' : 'none'}">
-				${isExpanded ? `<div class="category-description">${escapeHtml(cat.description)}</div>` : ''}
 				${essentialTools.map(t => renderTool(t, showDescription)).join('')}
 				${advancedTools.length > 0 ? renderTierDivider(cat.id, showAdv, advancedTools.length) : ''}
 				${showAdv ? advancedTools.map(t => renderTool(t, showDescription)).join('') : ''}
@@ -446,7 +448,7 @@ function renderTool(tool: ResourceTool, showDescription: boolean): string {
 
 	return `
 		<div class="tool-item ${implClass}" data-tool="${escapeAttr(tool.id)}"${crossRefAttr}
-		     title="${tooltip}" tabindex="-1" role="treeitem">
+			title="${tooltip}" tabindex="-1" role="treeitem">
 			<span class="tool-indicator">${indicator}</span>
 			<span class="tool-label">${escapeHtml(tool.label)}</span>
 			${tool.cross_ref ? `<span class="codicon codicon-link-external cross-ref-icon" data-crossref-btn="${escapeAttr(tool.cross_ref)}" title="Go to cross-reference"></span>` : ''}
@@ -477,7 +479,7 @@ function renderWorkflows(workflows: WorkflowTemplate[]): string {
 			<div class="workflows-list" style="display: ${workflowsExpanded ? 'block' : 'none'}">
 				${workflows.map(w => `
 					<div class="workflow-item" data-workflow="${escapeAttr(w.id)}"
-					     title="${escapeAttr(w.description)}" tabindex="-1" role="treeitem">
+						title="${escapeAttr(w.description)}" tabindex="-1" role="treeitem">
 						<span class="codicon codicon-run-all"></span>
 						<span class="workflow-label">${escapeHtml(w.label)}</span>
 						<span class="workflow-step-count">${w.steps.length} steps</span>
@@ -508,10 +510,10 @@ function renderEmptyFilter(): string {
 	`;
 }
 
-// ── Content event binding ───────────────────────────────────────────────────
+// ---- Content event binding ----
 
 function bindContentEvents(container: HTMLElement): void {
-	// Category header click → expand/collapse
+	// Category header click -> expand/collapse
 	container.querySelectorAll('.category-header').forEach(header => {
 		header.addEventListener('click', () => {
 			const catEl = header.closest('.stats-category');
@@ -520,7 +522,7 @@ function bindContentEvents(container: HTMLElement): void {
 		});
 	});
 
-	// Tool item click → dispatch
+	// Tool item click -> dispatch
 	container.querySelectorAll('.tool-item').forEach(item => {
 		item.addEventListener('click', (e) => {
 			// Don't trigger tool click if cross-ref icon was clicked
@@ -547,7 +549,7 @@ function bindContentEvents(container: HTMLElement): void {
 		});
 	});
 
-	// Tier divider click → toggle advanced
+	// Tier divider click -> toggle advanced
 	container.querySelectorAll('.tier-divider').forEach(divider => {
 		divider.addEventListener('click', () => {
 			const catId = divider.getAttribute('data-tier-category');
@@ -555,7 +557,7 @@ function bindContentEvents(container: HTMLElement): void {
 		});
 	});
 
-	// Workflow header click → expand/collapse
+	// Workflow header click -> expand/collapse
 	const wfHeader = container.querySelector('.workflows-header');
 	if (wfHeader) {
 		wfHeader.addEventListener('click', () => {
@@ -565,7 +567,7 @@ function bindContentEvents(container: HTMLElement): void {
 		});
 	}
 
-	// Workflow item click → dispatch
+	// Workflow item click -> dispatch
 	container.querySelectorAll('.workflow-item').forEach(item => {
 		item.addEventListener('click', (e) => {
 			e.stopPropagation();
@@ -577,7 +579,7 @@ function bindContentEvents(container: HTMLElement): void {
 	});
 }
 
-// ── State toggles ───────────────────────────────────────────────────────────
+// ---- State toggles ----
 
 function toggleCategory(categoryId: string): void {
 	const state = currentState();
@@ -601,7 +603,7 @@ function toggleAdvanced(categoryId: string): void {
 	persistState();
 }
 
-// ── Keyboard navigation ────────────────────────────────────────────────────
+// ---- Keyboard navigation ----
 
 function handleKeyboard(e: KeyboardEvent): void {
 	const target = e.target as HTMLElement;
@@ -683,7 +685,7 @@ function focusNextItem(current: HTMLElement, direction: 'up' | 'down'): void {
 	}
 }
 
-// ── Navigation (cross-ref) ─────────────────────────────────────────────────
+// ---- Navigation (cross-ref) ----
 
 function handleNavigateTo(section: Section, categoryId: string, toolId: string): void {
 	switchSection(section, false);
@@ -704,7 +706,7 @@ function handleNavigateTo(section: Section, categoryId: string, toolId: string):
 	});
 }
 
-// ── Unavailable state ───────────────────────────────────────────────────────
+// ---- Unavailable state ----
 
 function showUnavailableState(message: string): void {
 	const content = document.getElementById('section-content');
@@ -722,7 +724,7 @@ function showUnavailableState(message: string): void {
 	}
 }
 
-// ── Error banner (stale cache) ──────────────────────────────────────────────
+// ---- Error banner (stale cache) ----
 
 function showErrorBanner(errorType: string, message: string): void {
 	const banner = document.querySelector('.catalog-error-banner') as HTMLElement;
@@ -747,7 +749,7 @@ function showErrorBanner(errorType: string, message: string): void {
 	}
 }
 
-// ── Context highlight ───────────────────────────────────────────────────────
+// ---- Context highlight ----
 
 function handleCategoryHighlight(contextHint: string, matchingCategoryIds: string[]): void {
 	const banner = document.querySelector('.context-banner') as HTMLElement;
@@ -784,6 +786,6 @@ function handleCategoryHighlight(contextHint: string, matchingCategoryIds: strin
 	});
 }
 
-// ── Start ───────────────────────────────────────────────────────────────────
+// ---- Start ----
 
 document.addEventListener('DOMContentLoaded', init);

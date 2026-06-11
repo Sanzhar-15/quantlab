@@ -100,6 +100,30 @@ interface ChartBounds {
 
 const ORD_STEP_MS = 86_400_000; // 1 day -- universal step for ordinal spacing
 
+/**
+ * Applies an alpha channel to a resolved CSS color (#rgb, #rrggbb, rgb(),
+ * rgba()). Unrecognized formats are returned unchanged (full opacity).
+ */
+function withAlpha(color: string, alpha: number): string {
+	const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color.trim());
+	if (hex) {
+		const raw = hex[1];
+		const full = raw.length === 3 ? raw.split('').map(ch => ch + ch).join('') : raw;
+		const r = parseInt(full.slice(0, 2), 16);
+		const g = parseInt(full.slice(2, 4), 16);
+		const b = parseInt(full.slice(4, 6), 16);
+		return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+	}
+	const rgb = /^rgba?\(([^)]+)\)$/i.exec(color.trim());
+	if (rgb) {
+		const parts = rgb[1].split(',').map(part => part.trim());
+		if (parts.length >= 3) {
+			return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${alpha})`;
+		}
+	}
+	return color;
+}
+
 class OrdinalTimeMap {
 	readonly realTimes: number[];
 	private readonly _r2f: Map<number, number>;
@@ -140,6 +164,9 @@ export class ChartClient {
 	private chart: Chart | undefined;
 	private candleSeries: CandlestickSeries | undefined;
 	private equitySeries: LineSeries | undefined;
+	private volumeSeries: HistogramSeries | undefined;
+	private volumeEnabled = false;
+	private lastBars: OhlcvBar[] = [];
 	private static readonly MAX_VIZ_SERIES = 64;
 	private visualizationSeries: VisualizationSeriesHandle[] = [];
 	private signalMarkers: SeriesMarker[] = [];
@@ -190,11 +217,58 @@ export class ChartClient {
 		this.ordinalMap = new OrdinalTimeMap(realTimes);
 		const remapped = data.map((bar, i) => ({ ...bar, t: i * ORD_STEP_MS }));
 
+		this.lastBars = data;
 		this.candleSeries.setData(remapped);
+		this.renderVolume(remapped);
 		this.fitToData(remapped);
 
 		// Re-remap existing overlay markers against the new ordinal map
 		this.rebuildMarkers();
+	}
+
+	/**
+	 * Data-mode volume pane: an up/down-colored histogram under the candles.
+	 */
+	setVolumeEnabled(enabled: boolean): void {
+		if (this.volumeEnabled === enabled) {
+			return;
+		}
+		this.volumeEnabled = enabled;
+		if (!enabled) {
+			if (this.volumeSeries) {
+				this.volumeSeries.setData([]);
+				this.volumeSeries.setVisible(false);
+			}
+			return;
+		}
+		if (this.lastBars.length && this.chart) {
+			const remapped = this.lastBars.map((bar, i) => ({ ...bar, t: i * ORD_STEP_MS }));
+			this.renderVolume(remapped);
+		}
+	}
+
+	private renderVolume(remappedBars: OhlcvBar[]): void {
+		if (!this.volumeEnabled || !this.chart) {
+			return;
+		}
+
+		const paneId = this.ensurePane('volume', 0.18);
+		if (!this.volumeSeries) {
+			this.volumeSeries = this.chart.addHistogramSeries({
+				paneId,
+				axis: 'right',
+				priceLineVisible: false
+			});
+		}
+
+		const up = withAlpha(this.colors.positive, 0.45);
+		const down = withAlpha(this.colors.negative, 0.45);
+		this.volumeSeries.setVisible(true);
+		this.volumeSeries.setData(remappedBars.map(bar => ({
+			t: bar.t,
+			v: bar.v ?? 0,
+			color: bar.c >= bar.o ? up : down
+		})));
 	}
 
 	async setEquityCurve(data: EquityPoint[]): Promise<void> {
@@ -480,7 +554,9 @@ export class ChartClient {
 	}
 
 	private isStrategyKey(key: string): boolean {
-		return key !== 'equity';
+		// 'equity' and 'volume' are structural panes, not strategy-visualization
+		// panes -- they must not be hidden by the Strategy toggle.
+		return key !== 'equity' && key !== 'volume';
 	}
 
 	private getStrategyPaneIds(): string[] {
@@ -534,7 +610,7 @@ export class ChartClient {
 		}
 
 		let series: SeriesHandle;
-		const typedOptions = options as any;
+		const typedOptions = options as Parameters<Chart['addLineSeries']>[0];
 		if (type === 'histogram') {
 			series = this.chart.addHistogramSeries(typedOptions);
 		} else if (type === 'area') {

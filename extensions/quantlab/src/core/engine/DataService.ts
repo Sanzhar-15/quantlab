@@ -254,10 +254,31 @@ export class DataService {
 				break;
 			}
 
-			// Update 'to' for next batch (oldest bar's timestamp minus 1ms to avoid overlap)
-			const oldestBar = bars[bars.length - 1];
-			const oldestTime = new Date(oldestBar.timestamp).getTime();
+			// The server returns the MOST RECENT `limit` bars inside the window,
+			// sorted ASCENDING (verified against the live /v1/bars handler,
+			// 2026-06-11) -- so the oldest bar of the batch is the MINIMUM
+			// timestamp, not the last array element. Page backwards from it.
+			// (The previous code took bars[length-1] -- the NEWEST bar -- which
+			// shrank the window by ~1 bar per request: ~700 sequential HTTP
+			// round-trips for a 5y daily history. The chart looked hung.)
+			let oldestTime = Number.POSITIVE_INFINITY;
+			for (const bar of bars) {
+				const t = new Date(bar.timestamp).getTime();
+				if (t < oldestTime) {
+					oldestTime = t;
+				}
+			}
+			if (!Number.isFinite(oldestTime)) {
+				throw new Error(`Unparseable bar timestamps in server response for ${symbol}`);
+			}
 			to = oldestTime - 1;
+
+			// An exact full batch can land precisely on the window's left edge;
+			// the follow-up would then be an inverted (from > to) request.
+			// Terminate instead of asking the server for an invalid window.
+			if (from !== undefined && to < from) {
+				break;
+			}
 		}
 
 		return result;
@@ -276,8 +297,10 @@ export class DataService {
 		}
 
 		const serverTimeframe = toServerTimeframe(timeframe);
-		// Use null character as delimiter
-		const key = ['server', symbol, serverTimeframe, range?.start ?? '', range?.end ?? ''].join('\0');
+		// Use null character as delimiter. assetClass is part of the identity:
+		// the same symbol string can exist as both an equity and a crypto asset,
+		// and they resolve to different server endpoints.
+		const key = ['server', symbol, serverTimeframe, assetClass ?? '', range?.start ?? '', range?.end ?? ''].join('\0');
 		const cached = this.getFromCache(key, SERVER_CACHE_TTL_MS);
 		if (cached) {
 			return { requestId, data: cached.data, meta: cached.meta };

@@ -132,7 +132,9 @@ async function resolveActiveStrategyPath(validator: StrategyValidator): Promise<
 		return undefined;
 	}
 	const doc = editor.document;
-	if (!validator.isStrategyFile(doc)) {
+	// Virtual docs (quantlab-server:// symbol tabs) are not on-disk strategies;
+	// their fsPath points at a nonexistent file:// path.
+	if (doc.uri.scheme !== 'file' || !validator.isStrategyFile(doc)) {
 		return undefined;
 	}
 	return doc.uri.fsPath;
@@ -161,14 +163,17 @@ function resolveSessionInfo(session: SessionInfo | string | undefined, manager: 
 }
 
 function getActiveStrategyPath(): string | undefined {
+	// Only file:// resources are on-disk strategies -- virtual tabs (e.g.
+	// quantlab-server:// symbols) must not leak their fsPath into SessionManager.
 	const tab = vscode.window.tabGroups.activeTabGroup?.activeTab;
-	if (tab?.input instanceof vscode.TabInputText) {
+	if (tab?.input instanceof vscode.TabInputText && tab.input.uri.scheme === 'file') {
 		return tab.input.uri.fsPath;
 	}
-	if (tab?.input instanceof vscode.TabInputCustom) {
+	if (tab?.input instanceof vscode.TabInputCustom && tab.input.uri.scheme === 'file') {
 		return tab.input.uri.fsPath;
 	}
-	return vscode.window.activeTextEditor?.document.uri.fsPath;
+	const activeDoc = vscode.window.activeTextEditor?.document;
+	return activeDoc?.uri.scheme === 'file' ? activeDoc.uri.fsPath : undefined;
 }
 
 async function executeKillSwitch(sessionId: string, manager: SessionManager): Promise<void> {
