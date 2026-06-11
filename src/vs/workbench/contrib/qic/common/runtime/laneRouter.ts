@@ -46,7 +46,7 @@ const TOOL_USE_PATTERNS = [
 	// things, not creation requests -- without the lookbehind this pattern
 	// hijacked planning messages like "plan the architecture for the new
 	// module" into chat-act (the laneRouter.test regression).
-	/(?<!\bthe\s)\b(a|an|empty|new|blank)\s+(empty\s+|new\s+|blank\s+)?(file|script|module|class|component|page|directory|folder)\b/i,
+	/(?<!\bthe\s+)\b(a|an|empty|new|blank)\s+(empty\s+|new\s+|blank\s+)?(file|script|module|class|component|page|directory|folder)\b/i,
 	// "save this/that as", "put this in a file"
 	/\b(save|put|store|dump)\s+(this|that|it).{0,30}\b(file|as)\b/i,
 	// "change X to Y", "replace X with Y", "set X to Y" -- edit intent

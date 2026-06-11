@@ -509,6 +509,27 @@ export class StatsViewProvider implements vscode.CustomTextEditorProvider {
 		}
 		const dataSource = effective.source;
 
+		// The columns the user picked were inspected against a possibly
+		// DIFFERENT source (the Data-panel selection can change between
+		// configure and run). Re-inspect the source we are actually about
+		// to submit and refuse if any selected column no longer exists --
+		// otherwise stale column names go to the engine.
+		const columns = await this.loadColumnsForSource(effective);
+		const available = new Set(columns.map(c => c.name));
+		const missing = state.selectedColumns.filter(c => !available.has(c));
+		if (missing.length > 0 || state.selectedColumns.length === 0) {
+			this.stateByUri.set(uriKey, {
+				type: 'error',
+				testId: state.testId,
+				error: missing.length > 0
+					? `Selected column(s) ${missing.join(', ')} do not exist in the current data source. Re-select columns and run again.`
+					: 'No columns selected for the current data source. Select at least one column.',
+				recoverable: true
+			});
+			this.sendState(uri);
+			return;
+		}
+
 		const startedAt = new Date().toISOString();
 		const serverToolId = this.serverToolIdByUri.get(uriKey) ?? state.testId;
 

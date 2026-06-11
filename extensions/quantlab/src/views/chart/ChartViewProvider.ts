@@ -437,17 +437,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		// would silently chart a crypto recent against the equities endpoint.
 		const source: ServerDataSource = { kind: 'server', symbol, displayName, assetClass };
 
-		// Crypto bars only exist at 1h/1d server-side; a surviving 1W/1M
-		// override from an equity tab would be silently downsampled to 1d
-		// with NO active highlight in the header (the buttons are hidden).
-		// Clamp the per-tab override back to 1D on the switch.
-		if (assetClass?.toLowerCase() === 'crypto' && session.tabInstanceId) {
-			const chartState = this.stateManager.getChartState(session.tabInstanceId);
-			if (chartState?.timeframe === '1W' || chartState?.timeframe === '1M') {
-				this.stateManager.updateChartState(session.tabInstanceId, { timeframe: '1D' });
-			}
-		}
-
 		// Set global state only - refreshFromGlobal will propagate to tabs without overrides
 		this.globalState.setDataSource(source);
 
@@ -754,11 +743,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				throw new Error('Unknown data source type');
 			}
 
-			// Update timeframe from inferred/actual value
-			if (session.tabInstanceId) {
-				this.stateManager.updateChartState(session.tabInstanceId, { timeframe: effectiveTimeframe });
-			}
-
 			// Check if this request is still current (prevent race conditions)
 			if (!this.chartStateStore.isDataRequestCurrent(key, requestId)) {
 				// A newer request has been initiated, abort this one
@@ -768,6 +752,14 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			// Check if session is still active (prevent accessing disposed session)
 			if (!this.isSessionActive(session)) {
 				return;
+			}
+
+			// Update timeframe from inferred/actual value -- ONLY for the
+			// winning request: a slow stale response writing this after a
+			// newer click would silently revert the per-tab timeframe with
+			// no toolbar echo to correct the webview.
+			if (session.tabInstanceId) {
+				this.stateManager.updateChartState(session.tabInstanceId, { timeframe: effectiveTimeframe });
 			}
 
 			if (!data.length) {
@@ -831,11 +823,31 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		}
 	}
 
+	/**
+	 * Bars only exist server-side at 1h/1D/1W/1M for equities and 1h/1d for
+	 * crypto (live-verified 2026-06-11). Clamping at the CONSUMPTION point
+	 * covers every path a stale interval can arrive through -- the chart
+	 * dropdown, refreshFromGlobal, a Data-tree click, the stats symbol
+	 * picker, or a leftover sub-day interval from a local file -- instead of
+	 * patching each origin. An unsupported interval would otherwise fetch
+	 * zero bars (equities) or be silently downsampled to daily (crypto)
+	 * with no active highlight in the header.
+	 */
+	private static clampServerTimeframe(timeframe: Timeframe | undefined, assetClass: string | undefined): Timeframe {
+		const supported = assetClass?.toLowerCase() === 'crypto'
+			? ['1H', '1D']
+			: ['1H', '1D', '1W', '1M'];
+		return timeframe !== undefined && supported.includes(timeframe) ? timeframe : '1D';
+	}
+
 	private buildToolbarState(session: ChartSession): ChartToolbarState {
 		const tabId = session.tabInstanceId;
 		const chartState = tabId ? this.stateManager.getChartState(tabId) : undefined;
 		const dataSource = chartState?.dataSource ?? this.globalState.getDataSource();
-		const timeframe = chartState?.timeframe ?? this.globalState.getTimeframe();
+		let timeframe = chartState?.timeframe ?? this.globalState.getTimeframe();
+		if (dataSource && isServerSource(dataSource)) {
+			timeframe = ChartViewProvider.clampServerTimeframe(timeframe, dataSource.assetClass);
+		}
 		const dateRange = chartState?.dateRange;
 		const params = this.parameterExtractor.extract(session.document);
 		const complexity = this.complexityAnalyzer.analyze(session.document, params);

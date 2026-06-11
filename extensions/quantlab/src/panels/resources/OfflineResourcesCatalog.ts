@@ -120,7 +120,7 @@ export function getOfflineResourceSchema(resourceId: string): ConfigSchema | nul
 									{ label: 'KPSS', value: 'kpss' },
 									{ label: 'ADF (t-stat autolag)', value: 'pp' },
 								],
-								description: 'ADF/PP test H0: unit root exists. KPSS test H0: series is stationary.',
+								description: 'ADF variants H0: unit root exists. KPSS H0: series is stationary.',
 							},
 						],
 					},

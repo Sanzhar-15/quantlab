@@ -178,7 +178,8 @@ function renderDataSourceSection(): string {
 			` : ''}
 			<div class="symbol-picker">
 				<input id="symbol-input" list="symbol-options"
-						placeholder="Server symbol (e.g. AAPL)" />
+						placeholder="Server symbol (e.g. AAPL)"
+						title="Sets the active data source for this workspace (shared with chart tabs, same as clicking a symbol in the Data panel)" />
 				<datalist id="symbol-options">${symbolOptionsHtml()}</datalist>
 				<button id="use-symbol-btn" class="secondary">Use Symbol</button>
 			</div>
