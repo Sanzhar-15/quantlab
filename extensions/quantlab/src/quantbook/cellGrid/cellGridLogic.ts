@@ -1661,6 +1661,33 @@ type SnapshotEntry = {
 };
 
 /**
+ * **FE-5 W-R hotfix (2026-06-12) -- BigInt is NOT `webview.postMessage`-serializable.** The engine widens
+ * `StyleId.peer` (u64) to a JS **bigint** ({@link StyleIdJson}). vscode's `webview.postMessage` serializes
+ * via JSON, and JSON cannot serialize a bigint (`TypeError: Do not know how to serialize a BigInt`) -- so
+ * EVERY render carrying a styleId was REJECTED at the host->webview boundary and the grid never repainted.
+ * The whole headline style feature silently did nothing in the live app; the in-process tests never crossed
+ * the postMessage boundary, so they stayed green (operator smoke caught it).
+ *
+ * The WIRE projection downcasts `peer` to a JS **number**: lossless for any real session (peer ids are
+ * tiny), and a value beyond `MAX_SAFE_INTEGER` throws LOUD (No-Fallbacks -- never silently lose precision).
+ * Every webview consumer compares a styleId structurally (`peer === peer`, `resolveCellStyle`/`styleIdEqual`)
+ * or via `String(peer)` (the damage digest), so the number representation is transparent to them -- BUT the
+ * cell `styleId` AND `styles[].id` must be converted the SAME way (both are, below) or the `===` lookup
+ * would mismatch. Follow-up (tracked): formalize a distinct `WireStyleId` type instead of the contained cast.
+ */
+function styleIdToWire(id: StyleIdJson): StyleIdJson {
+	if (id.peer > BigInt(Number.MAX_SAFE_INTEGER)) {
+		throw new Error(
+			`[invalid_state] styleId.peer ${id.peer} exceeds Number.MAX_SAFE_INTEGER; cannot project it to the ` +
+			`webview without precision loss (StyleId peers are normally tiny -- this indicates engine corruption).`,
+		);
+	}
+	// Runtime: `peer` becomes a number (postMessage-safe). Typed StyleIdJson for the consumers, which only
+	// compare it structurally / stringify it -- the bigint-vs-number distinction is invisible to them.
+	return { peer: Number(id.peer) as unknown as bigint, counter: id.counter };
+}
+
+/**
  * **Phase 5.7 V3.5.0.4b (2026-05-24) -- extract one sheet's
  * QuantbookCellSnapshot from a WorkbookSnapshotJson.**
  *
@@ -1767,7 +1794,7 @@ export function extractSheetSnapshot(
 				entry.rendered = cell.rendered;
 			}
 			if (cell.styleId !== undefined) {
-				entry.styleId = cell.styleId;
+				entry.styleId = styleIdToWire(cell.styleId);
 			}
 			entries.push(entry);
 			continue;
@@ -1867,7 +1894,7 @@ export function extractSheetSnapshot(
 		// discipline (absent when the cell has no style) -- the shape-stability deepStrictEqual
 		// tests assert exact key sets, so a styleId:undefined key would break them.
 		if (cell.styleId !== undefined) {
-			entry.styleId = cell.styleId;
+			entry.styleId = styleIdToWire(cell.styleId);
 		}
 		entries.push(entry);
 	}
@@ -1888,16 +1915,14 @@ export function extractSheetSnapshot(
 	// tests' exact-key-set assertions intact. The webview reads `snapshot.styles` defensively and
 	// treats absent as "no engine styles" (correct semantics, not a fallback).
 	//
-	// **CLOSURE D4 (2026-06-12) -- ALIASING HAZARD (safe today, flagged for the future).** This assigns
-	// the SAME `snapshot.styles` array BY REFERENCE (no copy) into the projection. When the source is the
-	// cached delta snapshot, `mergeWorkbookDelta` MUTATES `cached.styles` IN PLACE on the next merge
-	// (push/replace/sort), so the array referenced here can change AFTER this projection is built. This is
-	// SAFE in the current flow only because every caller CONSUMES the projection synchronously and the host
-	// structured-clones it across the postMessage boundary to the webview before the next merge runs. A
-	// future host change that RETAINS a projected snapshot past the next merge would observe it mutate out
-	// from under it -- copy `snapshot.styles` here (or clone the projection) before retaining it.
+	// **FE-5 W-R hotfix (2026-06-12):** project styles[] with each `id.peer` downcast bigint->number (see
+	// `styleIdToWire` -- BigInt is NOT `webview.postMessage`-serializable; an un-converted styleId rejected
+	// the whole render). The `.map` builds a FRESH array, which ALSO resolves the former CLOSURE-D4 aliasing
+	// hazard: the projection no longer references `cached.styles`, so a later in-place `mergeWorkbookDelta`
+	// mutation cannot change it out from under a retained projection. The per-cell styleIds above are
+	// converted the SAME way, so a cell's id still `===`-matches its styles[] entry on the webview side.
 	if (snapshot.styles !== undefined && snapshot.styles.length > 0) {
-		result.styles = snapshot.styles;
+		result.styles = snapshot.styles.map(d => ({ id: styleIdToWire(d.id), style: d.style }));
 	}
 	return result;
 }

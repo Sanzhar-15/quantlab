@@ -317,9 +317,12 @@ function entryStyleId(e: Entry): { peer: bigint; counter: number } | undefined {
 }
 
 /** Equal iff two entries carry the SAME engine `StyleId` (or both none). A STRUCTURAL compare on
- * `(peer, counter)`, never reference equality -- the snapshot crosses `postMessage` structured-clone every
- * render, so object identity is always fresh and useless (the same discipline as {@link valueEqual}). A
- * style-only edit (same value, new `styleId`) flips this -> the cell's row enters the damage set. */
+ * `(peer, counter)`, never reference equality -- the snapshot crosses the host->webview `postMessage`
+ * boundary every render, so object identity is always fresh and useless (the same discipline as
+ * {@link valueEqual}). NOTE: `peer` is the host-WIRE form (a JS number; the host downcasts the engine's
+ * bigint `peer` in `styleIdToWire` because `webview.postMessage` JSON-serializes and CANNOT serialize a
+ * bigint) -- both sides of this `===` carry the same number form, so the compare is sound. A style-only
+ * edit (same value, new `styleId`) flips this -> the cell's row enters the damage set. */
 function styleIdEqual(a: Entry, b: Entry): boolean {
 	const sa = entryStyleId(a);
 	const sb = entryStyleId(b);

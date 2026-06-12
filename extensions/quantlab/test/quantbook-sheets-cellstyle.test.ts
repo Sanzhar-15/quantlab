@@ -60,6 +60,11 @@ import { diffSnapshotsA1 } from '../webview/sheets-webview/gridBlitA1';
 
 const styleId = (peer: number, counter: number): StyleIdJson => ({ peer: BigInt(peer), counter });
 const def = (peer: number, counter: number, style: StyleDefJson['style']): StyleDefJson => ({ id: styleId(peer, counter), style });
+// WIRE form: what `extractSheetSnapshot` PROJECTS toward the webview -- `peer` is downcast bigint->number
+// for `postMessage`-safety (`styleIdToWire`; BigInt is not JSON-serializable). Tests asserting the
+// PROJECTION OUTPUT compare against these; tests on the engine INPUT / host cache use `styleId`/`def`.
+const wireStyleId = (peer: number, counter: number): StyleIdJson => ({ peer: peer as unknown as bigint, counter });
+const wireDef = (peer: number, counter: number, style: StyleDefJson['style']): StyleDefJson => ({ id: wireStyleId(peer, counter), style });
 
 // =============================================================================================
 // resolveCellStyle -- engine StyleDefJson -> ResolvedCellStyle (the render paint shape)
@@ -251,8 +256,8 @@ suite('FE-5 W-R extractSheetSnapshot -- projects styleId + styles[] (atomically)
 		const out = extractSheetSnapshot(snapshot, 0)!;
 		assert.ok(out !== null);
 		assert.strictEqual(out.entries.length, 1);
-		assert.deepStrictEqual(out.entries[0].styleId, styleId(0, 0));
-		assert.deepStrictEqual(out.styles, styles, 'the styles table travels WITH the per-cell styleId (atomicity)');
+		assert.deepStrictEqual(out.entries[0].styleId, wireStyleId(0, 0));
+		assert.deepStrictEqual(out.styles, [wireDef(0, 0, { bold: true, italic: false, fill: { r: 1, g: 2, b: 3 } })], 'the styles table travels WITH the per-cell styleId (atomicity), in wire form');
 	});
 
 	test('a STYLE-ONLY blank cell (no value, no formula, has styleId) is KEPT (not dropped) -- fill-on-blank renders', () => {
@@ -260,7 +265,7 @@ suite('FE-5 W-R extractSheetSnapshot -- projects styleId + styles[] (atomically)
 		const snapshot = wb([wbCell(5, 5, undefined as unknown as CellSnapshotJson['value'], styleId(0, 0))], styles);
 		const out = extractSheetSnapshot(snapshot, 0)!;
 		assert.strictEqual(out.entries.length, 1, 'the style-only blank cell must NOT be dropped');
-		assert.deepStrictEqual(out.entries[0].styleId, styleId(0, 0));
+		assert.deepStrictEqual(out.entries[0].styleId, wireStyleId(0, 0));
 		assert.strictEqual(out.entries[0].value.kind, 'pending', 'a style-only cell renders as a pending (blank) entry');
 	});
 
@@ -524,6 +529,34 @@ suite('FE-5 W-R D8 -- END-TO-END engine style round-trip (fill + bold + border r
 			assert.notStrictEqual(resolved, 'unresolved');
 			const rs = resolved as Exclude<typeof resolved, 'unresolved' | undefined>;
 			assert.strictEqual(rs.fillColor, 'rgb(200,50,50)', 'fill renders on the blank cell');
+		} finally {
+			s.close();
+		}
+	});
+
+	test('SERIALIZABLE: a projected snapshot carrying a styleId is postMessage-safe (no BigInt) -- the live-app regression', () => {
+		// THE BUG THIS PINS: `StyleId.peer` is an engine u64 -> a JS bigint. vscode `webview.postMessage`
+		// JSON-serializes and THROWS on a bigint ("Do not know how to serialize a BigInt"), so every render
+		// carrying a styleId was rejected and the grid never repainted -- the headline style feature did
+		// nothing in the live app while every in-process test stayed green (they never crossed postMessage).
+		// `extractSheetSnapshot` now downcasts `peer` bigint->number (styleIdToWire). Assert the projection is
+		// genuinely serializable + carries number peers on BOTH the cell styleId and the styles[] entry.
+		const s = createWorkbookSession();
+		try {
+			const sheet = s.addSheet('S', 1000);
+			s.setValue(sheet, 0, 0, { kind: 'text', text: 'hi' });
+			const id = s.registerStyle({ bold: true, italic: false, fill: { r: 1, g: 2, b: 3 } });
+			s.batch([{ kind: 'setStyle', sheet, row: 0, col: 0, style: id }], { undoLabel: 'Format cells' });
+			recalcDirtyChecked(s);
+			const projected = extractSheetSnapshot(s.snapshot(), sheet)!;
+			// The exact live failure mode: JSON.stringify throws on a bigint. This MUST not throw.
+			assert.doesNotThrow(() => JSON.stringify(projected), 'projected snapshot must be JSON/postMessage-serializable (no bigint)');
+			const entry = projected.entries.find(e => e.row === 0 && e.col === 0)!;
+			assert.strictEqual(typeof entry.styleId!.peer, 'number', 'cell styleId.peer must be a number on the wire');
+			assert.ok(projected.styles !== undefined && projected.styles.length >= 1);
+			assert.strictEqual(typeof projected.styles![0].id.peer, 'number', 'styles[].id.peer must be a number on the wire');
+			// And the wire form still resolves (number === number on both sides).
+			assert.notStrictEqual(resolveCellStyle(entry.styleId, projected.styles), 'unresolved');
 		} finally {
 			s.close();
 		}
