@@ -982,6 +982,32 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **FE-5 W-N (2026-06-12)** -- select + reveal the single cell at `(row, col)` on this panel's ACTIVE
+	 * sheet by posting the W-F `navigateTo` message (the documented "Go-To downstream contract" in
+	 * `webview/sheets-webview/index.ts`). The webview selects the cell, clears any range anchor, scrolls it
+	 * into view, and repaints. The CALLER is responsible for switching this panel to the target sheet FIRST
+	 * (via {@link switchToSheet} / {@link show}) when the name lives on another sheet -- this handler does
+	 * NOT switch sheets, matching the webview contract.
+	 *
+	 * Coordinates are validated to in-grid non-negative integers here (a defensive No-Fallbacks guard -- the
+	 * webview also re-validates and DROPS a bad coord loud rather than landing on A1). Returns the
+	 * `postMessage` delivery promise so the command can surface a non-delivery LOUD (a dropped Go-To would
+	 * leave the selection stranded with no cue). Throws on a malformed coordinate (the caller resolves the
+	 * anchor from a real `listNames()` target, but guard anyway).
+	 */
+	navigateToCell(row: number, col: number): Thenable<boolean> {
+		if (!Number.isInteger(row) || row < 0 || !Number.isInteger(col) || col < 0) {
+			throw new Error(`navigateToCell requires non-negative integer coordinates (got row=${row}, col=${col})`);
+		}
+		if (!this.webviewReady || this._disposed) {
+			// Before the handshake / after disposal a postMessage is silently dropped. Surface it as a
+			// non-delivery (false) so the command can warn -- never a silent no-op.
+			return Promise.resolve(false);
+		}
+		return this.panel.webview.postMessage({ type: 'navigateTo', row, col });
+	}
+
+	/**
 	 * **Sheet-tabs (2026-06-10)** -- handle a sheet-management action raised from the bottom tab strip:
 	 * `+` (add), or right-click / double-click `rename` / `delete` / `moveLeft` / `moveRight` on a
 	 * specific tab. Acts on the SPECIFIED `sheet` directly (the strip already identified it -- no

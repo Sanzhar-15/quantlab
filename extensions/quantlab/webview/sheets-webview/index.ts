@@ -65,7 +65,10 @@ import { pasteAreaMismatch, planFill, planPaste, type GridClipboard } from './cl
 import { gridKeyDispatch, type GridMode, type KeyModifiers } from './gridKeyDispatch';
 // FE-4 F4: pure abs/rel ref-cycle helper (A1 -> $A$1 -> A$1 -> $A1 -> A1) for the formula editor.
 import { cycleRefAbsRel } from './f4Logic';
-import { CellStyleStore, MAX_STYLE_CELLS, type StyleRect, type StyleToggle } from './cellStyleModel';
+// FE-5 W-R (2026-06-12): the engine is the SOLE style source -- this module is now just the engine-style
+// render RESOLVER (the retired session `CellStyleStore` + its persistence are gone). The webview resolves
+// each cell's engine `styleId` against the snapshot `styles[]` via `resolveCellStyle` and paints it.
+import { resolveCellStyle, type ResolvedCellStyle } from './cellStyleModel';
 // Sheet-tabs (2026-06-10): the Excel-style bottom tab strip (presentation only; the host owns mutation).
 import { renderSheetTabs, type SheetTabHandlers, type SheetTabInfo } from './sheetTabBar';
 // W3 (Wave 3): the pure data-vscode-context payload builder for the native right-click context menu.
@@ -882,11 +885,15 @@ toolbarEl.addEventListener('click', (e) => {
 				openMenuDropdown(btn, DELETE_ROW_COL_ITEMS, null);
 			}
 			return;
-		// **Round 5 (2026-06-10) -- the toolbar's style controls are now REAL** (client-side render-layer
-		// styling; the engine has no style model, so these paint via `styleStore` + the canvas, scoped to
-		// the session). Each routes through `runAfterResolvingEdit` like every other mutating chrome action
-		// (resolve the open editor first), operates on the active selection (or active cell), and toggles
-		// with Excel/Sheets semantics (B/I/U/S flip the whole selection off only if ALL cells already on).
+		// **FE-5 W-R (2026-06-12) -- the toolbar's style controls write to the ENGINE** (the SOLE style
+		// source). Each routes through `runAfterResolvingEdit` like every other mutating chrome action
+		// (resolve the open editor first), operates on the active selection (or active cell), and POSTs a
+		// `setStyle` mutation the host applies via `registerStyle`/`setStyle` + re-renders. Bold/italic
+		// toggle with Excel/Sheets semantics (off iff ALL cells already on) -- the host inspects the
+		// selection. Underline/strikethrough/text-color are NOT engine-schema attributes (the engine style
+		// is bold/italic/fill/align + per-edge borders), so they are PREVIEW-ONLY -- surfaced honestly via
+		// the neutral toast rather than writing a session store the render no longer reads (that split would
+		// make a write show nothing -- the silent-render-miss this wave eliminates).
 		case 'bold':
 			runAfterResolvingEdit('Bold', () => toggleSelectionStyle('bold'));
 			return;
@@ -894,26 +901,29 @@ toolbarEl.addEventListener('click', (e) => {
 			runAfterResolvingEdit('Italic', () => toggleSelectionStyle('italic'));
 			return;
 		case 'underline':
-			runAfterResolvingEdit('Underline', () => toggleSelectionStyle('underline'));
+			notifyPreviewOnly('Underline');
 			return;
 		case 'strikethrough':
-			runAfterResolvingEdit('Strikethrough', () => toggleSelectionStyle('strike'));
+			notifyPreviewOnly('Strikethrough');
 			return;
 		case 'align-left':
-			runAfterResolvingEdit('Align left', () => applyStyleToSelection((sheet, rect) => styleStore.setAlign(sheet, rect, 'left')));
+			runAfterResolvingEdit('Align left', () => postStyleMutation({ kind: 'align', value: 'left' }, 'Align left'));
 			return;
 		case 'align-center':
-			runAfterResolvingEdit('Align center', () => applyStyleToSelection((sheet, rect) => styleStore.setAlign(sheet, rect, 'center')));
+			runAfterResolvingEdit('Align center', () => postStyleMutation({ kind: 'align', value: 'center' }, 'Align center'));
 			return;
 		case 'align-right':
-			runAfterResolvingEdit('Align right', () => applyStyleToSelection((sheet, rect) => styleStore.setAlign(sheet, rect, 'right')));
+			runAfterResolvingEdit('Align right', () => postStyleMutation({ kind: 'align', value: 'right' }, 'Align right'));
 			return;
 		case 'text-color':
-			// The swatch popover opens immediately (a picker, not a mutation); the chosen swatch resolves
-			// the editor + applies. Toggle-closes if already open on this anchor.
-			openColorPicker(btn, 'textColor');
+			// **FE-5 W-R**: text color is NOT an engine-style attribute (the engine has fill + bold/italic/
+			// align + borders, no glyph color), so this is preview-only -- not a swatch picker that writes a
+			// store the render ignores. (A future engine text-color attribute re-enables a real picker here.)
+			notifyPreviewOnly('Text color');
 			return;
 		case 'fill-color':
+			// Fill color IS an engine-style attribute -- open the swatch picker; the chosen swatch POSTs a
+			// `setStyle` fill mutation the host applies + re-renders.
 			openColorPicker(btn, 'fillColor');
 			return;
 		case 'search':
@@ -1049,33 +1059,30 @@ window.addEventListener('unhandledrejection', (e) => {
 
 const renderer = new CanvasGridRenderer(canvasEl);
 
-// **Round 5 (2026-06-10) -- client-side cell styling.** The webview-owned per-cell visual style map
-// (bold/italic/underline/strike/halign/text+fill color). The engine has NO style model, so this is the
-// sole source of cell styling; it persists in `vscode.setState` (survives a Reload Window this session)
-// but is NOT written to the .qnb file -- a documented session-scoped render-layer feature (FE-4 will
-// engine-back it). The renderer reads it via a bound lookup that closes over the live `fullSnapshot.sheet`
-// (set just below `fullSnapshot`'s declaration, since the closure references it).
-const styleStore = CellStyleStore.deserialize(readPersistedStyles());
+/**
+ * **FE-5 W-R (2026-06-12) -- ENGINE-backed cell styling.** The engine is the SOLE style source: the
+ * toolbar's style controls POST a `setStyle` mutation to the host (which runs `registerStyle`+`setStyle`
+ * as a batch + re-renders), and the canvas READS the resolved style off the render snapshot's
+ * `styles[]`+`styleId` (see `resolveStyleForCell`). The retired session-scoped `cellStyleModel` store +
+ * its `vscode.setState` persistence are GONE -- the engine persists styles to the workbook, and reads +
+ * writes both go through it (so a write always renders, never the read/write-split silent miss).
+ */
 
-/** Read the persisted `cellStyles` blob from the webview state (or undefined if absent/foreign). */
-function readPersistedStyles(): unknown {
-	const raw = vscode.getState();
-	if (typeof raw === 'object' && raw !== null) {
-		return (raw as { cellStyles?: unknown }).cellStyles;
-	}
-	return undefined;
-}
-
-/** Persist the style map back into the webview state, preserving any other state keys. */
-function persistStyles(): void {
-	const prev = vscode.getState();
-	const base = typeof prev === 'object' && prev !== null ? (prev as Record<string, unknown>) : {};
-	vscode.setState({ ...base, cellStyles: styleStore.serialize() });
-}
+/**
+ * **FE-5 W-R (2026-06-12)** -- the wire shape of a `setStyle` mutation (webview -> host). A local mirror
+ * of the host's `StyleMutation` (the webview is esbuild-isolated from the host `cellGridLogic` module, so
+ * the union is pinned here; the host re-validates it at the trust boundary). Only the engine-schema
+ * attributes: bold/italic toggle, horizontal align, fill color. Underline/strike/text-color are NOT
+ * engine attributes -- their toolbar buttons surface as preview-only, NOT through this path.
+ */
+type StyleMutationWire =
+	| { kind: 'toggle'; prop: 'bold' | 'italic' }
+	| { kind: 'align'; value: 'left' | 'center' | 'right' | null }
+	| { kind: 'fill'; value: { r: number; g: number; b: number } | null };
 
 /** The rect a style op applies to: the active range, or the single active cell. `null` when there is
  *  no active cell / snapshot (nothing to style). */
-function styleTargetRect(): StyleRect | null {
+function styleTargetRect(): SelectionRect | null {
 	if (fullSnapshot === null || active === null) {
 		return null;
 	}
@@ -1083,42 +1090,67 @@ function styleTargetRect(): StyleRect | null {
 	return sel ?? { minRow: active.row, maxRow: active.row, minCol: active.col, maxCol: active.col };
 }
 
-/** Apply a style mutation to the current selection, then persist + redraw. Clamps a giant (whole-axis)
- *  selection to {@link MAX_STYLE_CELLS} with a loud warn (No-Fallbacks: never silently truncate). */
-function applyStyleToSelection(mutate: (sheet: number, rect: StyleRect) => void): void {
-	const raw = styleTargetRect();
-	if (raw === null || fullSnapshot === null) {
+/**
+ * **FE-5 W-R (2026-06-12)** -- POST a uniform style mutation over the active selection to the host
+ * (which applies it via the engine `registerStyle`/`setStyle` napi as one undo unit + re-renders). The
+ * host reads each cell's CURRENT engine style, applies the mutation, and persists -- so toggle/align/fill
+ * preserve a cell's other attributes (incl. borders). A whole-axis (over-cap) selection is rejected LOUD
+ * by the host (a toast), never silently truncated (No-Fallbacks). No local redraw -- the host's re-render
+ * carries the new styles back.
+ */
+function postStyleMutation(mutation: StyleMutationWire, undoLabel: string): void {
+	const rect = styleTargetRect();
+	if (rect === null || fullSnapshot === null) {
 		return;
 	}
-	const { rect, clamped } = CellStyleStore.clampRect(raw);
-	if (clamped) {
-		console.warn('[sheets-webview] style op clamped to ' + MAX_STYLE_CELLS + ' cells (selection too large)');
-	}
-	mutate(fullSnapshot.sheet, rect);
-	persistStyles();
-	redraw();
-}
-
-/** Toggle a boolean style (bold/italic/underline/strike) over the current selection. */
-function toggleSelectionStyle(prop: StyleToggle): void {
-	applyStyleToSelection((sheet, rect) => {
-		styleStore.toggleBool(sheet, rect, prop);
+	vscode.postMessage({
+		type: 'setStyle',
+		sheet: fullSnapshot.sheet,
+		rect: { minRow: rect.minRow, maxRow: rect.maxRow, minCol: rect.minCol, maxCol: rect.maxCol },
+		mutation,
+		undoLabel,
+		webviewId: WEBVIEW_ID,
 	});
 }
 
-/** Sheets-like color palette for the text/fill swatch popover (greys row + a hue row incl. brand orange). */
+/** Toggle a boolean style (bold/italic) over the current selection via the engine. */
+function toggleSelectionStyle(prop: 'bold' | 'italic'): void {
+	postStyleMutation({ kind: 'toggle', prop }, prop === 'bold' ? 'Bold' : 'Italic');
+}
+
+/**
+ * **FE-5 W-R (2026-06-12)** -- parse a CSS hex color (`#RGB` / `#RRGGBB`, the swatch palette's forms)
+ * into an `{r,g,b}` the engine `setStyle` fill takes. Returns `null` for an unparseable string (the
+ * caller then drops the op loud rather than sending a malformed fill -- No-Fallbacks). The swatch
+ * palette only emits `#RRGGBB`, so this is total over the real inputs; the guard is defense-in-depth.
+ */
+function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
+	const m3 = /^#([0-9a-fA-F])([0-9a-fA-F])([0-9a-fA-F])$/.exec(hex);
+	if (m3 !== null) {
+		return { r: parseInt(m3[1] + m3[1], 16), g: parseInt(m3[2] + m3[2], 16), b: parseInt(m3[3] + m3[3], 16) };
+	}
+	const m6 = /^#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})$/.exec(hex);
+	if (m6 !== null) {
+		return { r: parseInt(m6[1], 16), g: parseInt(m6[2], 16), b: parseInt(m6[3], 16) };
+	}
+	return null;
+}
+
+/** Sheets-like color palette for the fill swatch popover (greys row + a hue row incl. brand orange). */
 const COLOR_SWATCHES: readonly string[] = [
 	'#000000', '#434343', '#666666', '#999999', '#b7b7b7', '#cccccc', '#d9d9d9', '#efefef', '#ffffff',
 	'#e6194b', '#FF7331', '#f1c232', '#6aa84f', '#45818e', '#3d85c6', '#674ea7', '#a64d79', '#cc4125',
 ];
 
 /**
- * Open the text/fill color swatch popover anchored under `anchor`. Reuses the shared dropdown lifecycle
- * (tracked via `dropdownEl`/`openMenu` so the capture-phase click-away + window-blur + Escape all close
- * it); `items` is empty so the arrow-key menu nav is a no-op. Each swatch + the reset row applies through
- * `runAfterResolvingEdit` (consistency with every other mutating chrome action).
+ * **FE-5 W-R (2026-06-12)** -- open the FILL color swatch popover anchored under `anchor` (text color is
+ * preview-only -- the engine has no glyph-color attribute). Reuses the shared dropdown lifecycle (tracked
+ * via `dropdownEl`/`openMenu` so the capture-phase click-away + window-blur + Escape all close it); `items`
+ * is empty so the arrow-key menu nav is a no-op. Each swatch + the reset row applies through
+ * `runAfterResolvingEdit` then POSTs a `setStyle` fill mutation to the host (the engine is the sole source).
  */
-function openColorPicker(anchor: HTMLElement, which: 'textColor' | 'fillColor'): void {
+function openColorPicker(anchor: HTMLElement, which: 'fillColor'): void {
+	void which; // only 'fillColor' is reachable; the param documents intent + guards a future text-color re-add
 	if (openMenu !== null && openMenu.anchor === anchor) {
 		closeMenuDropdown();
 		return;
@@ -1135,13 +1167,18 @@ function openColorPicker(anchor: HTMLElement, which: 'textColor' | 'fillColor'):
 		b.className = 'qb-swatch';
 		b.style.background = color;
 		b.title = color;
-		b.setAttribute('aria-label', (which === 'fillColor' ? 'Fill color ' : 'Text color ') + color);
+		b.setAttribute('aria-label', 'Fill color ' + color);
 		b.addEventListener('mousedown', (ev) => ev.preventDefault());
 		b.addEventListener('click', () => {
 			closeMenuDropdown();
-			runAfterResolvingEdit(which === 'fillColor' ? 'Fill color' : 'Text color', () =>
-				applyStyleToSelection((sheet, rect) => styleStore.setColor(sheet, rect, which, color)),
-			);
+			const rgb = hexToRgb(color);
+			if (rgb === null) {
+				// No-Fallbacks: a swatch whose hex doesn't parse is dropped LOUD rather than sending a
+				// malformed fill (unreachable -- COLOR_SWATCHES is all #RRGGBB -- but never silently coerce).
+				console.warn('[sheets-webview] dropped a fill swatch with an unparseable hex:', color);
+				return;
+			}
+			runAfterResolvingEdit('Fill color', () => postStyleMutation({ kind: 'fill', value: rgb }, 'Fill color'));
 		});
 		grid.appendChild(b);
 	}
@@ -1149,13 +1186,11 @@ function openColorPicker(anchor: HTMLElement, which: 'textColor' | 'fillColor'):
 	const reset = document.createElement('button');
 	reset.type = 'button';
 	reset.className = 'qb-menu-item qb-color-reset';
-	reset.textContent = which === 'fillColor' ? 'No fill' : 'Automatic';
+	reset.textContent = 'No fill';
 	reset.addEventListener('mousedown', (ev) => ev.preventDefault());
 	reset.addEventListener('click', () => {
 		closeMenuDropdown();
-		runAfterResolvingEdit(which === 'fillColor' ? 'No fill' : 'Automatic text', () =>
-			applyStyleToSelection((sheet, rect) => styleStore.setColor(sheet, rect, which, null)),
-		);
+		runAfterResolvingEdit('No fill', () => postStyleMutation({ kind: 'fill', value: null }, 'No fill'));
 	});
 	panel.appendChild(reset);
 	const rect = anchor.getBoundingClientRect();
@@ -1169,9 +1204,66 @@ function openColorPicker(anchor: HTMLElement, which: 'textColor' | 'fillColor'):
 	anchor.setAttribute('aria-expanded', 'true');
 }
 
-// Bind the renderer's per-cell style lookup ONCE: it reads the live `fullSnapshot.sheet`, so a sheet
-// switch (which replaces `fullSnapshot`) needs no rebind. A style edit calls `redraw()` directly.
-renderer.setStyleLookup((row, col) => (fullSnapshot === null ? undefined : styleStore.get(fullSnapshot.sheet, row, col)));
+/** **FE-5 W-R** -- one-time LOUD warning for a cell whose engine `styleId` does not resolve against the
+ *  snapshot's `styles[]` table. The engine must register every referenced style, so a miss signals a
+ *  binding/threading drift; we render the cell unstyled (visible miss) AND warn once (No-Fallbacks: surface,
+ *  never silently paint a default). Mirrors {@link warnSkippedEntry}'s warn-once discipline. */
+let warnedUnresolvedStyle = false;
+function warnUnresolvedStyle(row: number, col: number, styleId: unknown): void {
+	if (warnedUnresolvedStyle) {
+		return;
+	}
+	warnedUnresolvedStyle = true;
+	console.warn(
+		`[sheets-webview] cell (row=${row}, col=${col}) carries a styleId that does not resolve against the ` +
+		`snapshot styles[] table; rendering it UNSTYLED. The engine should register every referenced style -- ` +
+		`this signals a snapshot/threading drift. Offending styleId:`,
+		styleId,
+	);
+}
+
+/**
+ * **FE-5 W-R (2026-06-12) -- the per-cell render-style SOURCE (engine, the SOLE source).** Resolves one
+ * cell's {@link ResolvedCellStyle} (the shape the canvas paints) by resolving the cell's engine `styleId`
+ * (carried on the per-cell render ENTRY) against the render snapshot's `styles[]` table via
+ * {@link resolveCellStyle}. There is ONE source -- the retired session `cellStyleModel` store is gone, so
+ * there is no per-cell source mix to silently fall back to.
+ *
+ * A STYLE-ONLY blank cell (a fill/border on an otherwise-empty cell -- no value/formula) renders because
+ * the host projection (`extractSheetSnapshot`) KEEPS such cells (carrying the `styleId` on a pending
+ * entry); the engine emits them (verified). An UNRESOLVED `styleId` (one not in `styles[]`) is a contract
+ * violation -- surfaced LOUD (warn-once + render unstyled), NEVER masked with a default (No-Fallbacks).
+ * `styles[]` absent (no styles registered yet -- the common case) means no cell is styled.
+ */
+function resolveStyleForCell(row: number, col: number): ResolvedCellStyle | undefined {
+	if (fullSnapshot === null) {
+		return undefined;
+	}
+	// **CLOSURE F5 (2026-06-12) -- No-Fallbacks ordering.** Read the cell's `styleId` FIRST, BEFORE deciding
+	// on `styles[]` presence. A cell WITHOUT a styleId is unstyled regardless of the styles table -> return
+	// undefined (the common, pre-style-edit case -- no warn). But a cell WITH a styleId while `styles[]` is
+	// ABSENT is a CONTRACT VIOLATION (the engine must ship the table with any referenced id); it must route
+	// through the LOUD `'unresolved'` -> `warnUnresolvedStyle` path, NOT silently render unstyled. The old
+	// `styles === undefined` short-circuit returned undefined before ever reading the styleId, masking that
+	// violation. `resolveCellStyle` already returns `'unresolved'` for a present id with an absent table.
+	const styleId = renderer.entryAt(row, col)?.styleId;
+	if (styleId === undefined) {
+		return undefined; // this cell carries no style -> unstyled (no table lookup needed, no warning)
+	}
+	const styles = fullSnapshot.styles;
+	const resolved = resolveCellStyle(styleId, styles);
+	if (resolved === 'unresolved') {
+		// No-Fallbacks: a styleId the engine never registered is a contract violation -- surface it, do
+		// NOT silently paint a default. Render the cell UNSTYLED so the miss is visible + logged.
+		warnUnresolvedStyle(row, col, styleId);
+		return undefined;
+	}
+	return resolved;
+}
+
+// Bind the renderer's per-cell style lookup ONCE: it reads the live `fullSnapshot` (sheet + styles), so a
+// sheet switch (which replaces `fullSnapshot`) needs no rebind. A style edit re-renders via the host.
+renderer.setStyleLookup((row, col) => resolveStyleForCell(row, col));
 
 let fullSnapshot: QuantbookCellSnapshot | null = null;
 // "row,col" -> "[code] message" for cells whose last edit failed (errorReply). Map preserves the
@@ -1185,6 +1277,15 @@ const errorCells = new Map<string, string>();
 // not clear the badge). Threaded into every `renderer.draw*` call alongside `errorCells`.
 let publishedRanges: PublishedRange[] = [];
 let publishedRangesKey = '';
+// **FE-5 W-R (2026-06-12) -- engine STYLE TABLE change detector.** A canonical digest of the render
+// snapshot's `styles[]` table (the engine `StyleDefJson[]`: each {id:{peer,counter}, style:{...}}), used the
+// SAME way as `publishedRangesKey`: a change between renders forces a FULL redraw via `commitSnapshot`'s
+// `stylesChanged` gate. The per-cell `styleId` term in the damage diff catches a cell REPOINTED to another
+// style, but a style DEFINITION re-edit (an existing id's fill/bold/border changed, no cell's `styleId`
+// moved) is a table-level change the row diff cannot see -- so it is detected here. EMPTY string whenever
+// the render snapshot does not (yet) carry `styles[]` (the conductor cross-boundary field), which makes
+// `stylesChanged` permanently `false` and the gate byte-identical to its pre-W-R behaviour.
+let stylesTableKey = '';
 // **W-G copy/paste**: the internal grid clipboard (a copied/cut rectangle's underlying content). Set by
 // Ctrl/Cmd+C (isCut=false) / Ctrl/Cmd+X (isCut=true), consumed by Ctrl/Cmd+V. `null` = nothing copied.
 // Internal-only for v1 (no OS-clipboard interop); persists across renders + sheet switches like Excel.
@@ -2408,6 +2509,13 @@ function priorCellContent(entry: QuantbookCellSnapshot['entries'][number] | unde
 			return { text: '', oversize: true };
 		}
 		return { text: hasEq ? entry.formula : '=' + entry.formula, oversize: false };
+	}
+	// **FE-5 W-R (2026-06-12)**: a STYLE-ONLY blank cell (a fill/border on an empty cell) is projected as a
+	// `pending` entry with a styleId but NO formula -- it has no content, so click-to-edit pre-fills EMPTY
+	// (NOT the `(pending)` placeholder, which is for a formula cell still computing -- that carries a
+	// `formula`, handled above). Without this, editing a fill-only cell would seed the editor with "(pending)".
+	if (entry.value.kind === 'pending') {
+		return { text: '', oversize: false };
 	}
 	// Only a `text` value can realistically be multi-MB; check its raw length before `formatCellValue` builds it.
 	if (entry.value.kind === 'text' && entry.value.value.length > MAX_RAW_INPUT_LENGTH) {
@@ -3980,6 +4088,16 @@ function updateFindCount(): void {
 }
 
 document.addEventListener('keydown', ev => {
+	// **FE-5 W-F (2026-06-12) -- F3 / Shift-F3 = find next / previous (the browser-find convention).**
+	// Handled BEFORE every other guard so it works regardless of focus (grid, formula bar, or the find input)
+	// -- F3 is an unambiguous dedicated key. Steps the FE-4 find hit list with wrap (`stepFind` resolves any
+	// open editor first, exactly like the find bar's prev/next buttons). A no-op (but still preventDefaulted,
+	// so the browser's native find never opens) when there are no matches. Shift-F3 steps backward.
+	if (ev.key === 'F3') {
+		ev.preventDefault();
+		stepFind(ev.shiftKey ? -1 : 1);
+		return;
+	}
 	// W-G: the formula bar input is focusable (read-only, but selectable so a formula can be copied out).
 	// Its keystrokes bubble to this document handler -- ignore them, or arrows/Delete/printable keys would
 	// drive grid navigation / clear / type-to-edit on the active cell while the user is in the formula bar
@@ -4219,7 +4337,44 @@ function rebuildPublishedRanges(raw: unknown): boolean {
 	return changed;
 }
 
-function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean): void {
+/**
+ * **FE-5 W-R (2026-06-12)** -- detect a change in the render snapshot's engine STYLE TABLE between renders,
+ * updating {@link stylesTableKey}. Returns whether the table changed (the caller forces a FULL redraw on a
+ * change -- see the `stylesTableKey` docstring for WHY the per-cell `styleId` damage term is insufficient).
+ *
+ * The render snapshot's `styles` field is the engine style table (`QuantbookCellSnapshot.styles`, projected
+ * by the host's `extractSheetSnapshot`); it is read defensively (it is absent until the first style is
+ * registered). When ABSENT, the digest is the empty string -- no engine styles, no table change. When
+ * PRESENT, the digest is `peer:counter=<style>` per registered style joined in array order (the engine
+ * sorts `styles[]` by `StyleId`, so equal tables produce equal digests); a re-edited style DEFINITION
+ * changes the digest even though no cell's `styleId` moved. This is NOT a fallback: an absent table is the
+ * genuine "no engine styles" state, and the digest reflects exactly what was sent.
+ */
+function stylesTableChanged(snapshot: QuantbookCellSnapshot): boolean {
+	const styles = (snapshot as { styles?: unknown }).styles;
+	let key = '';
+	if (Array.isArray(styles)) {
+		const parts: string[] = [];
+		for (const def of styles) {
+			if (def === null || typeof def !== 'object') {
+				continue;
+			}
+			const id = (def as { id?: { peer?: unknown; counter?: unknown } }).id;
+			const style = (def as { style?: unknown }).style;
+			// Include the style VALUE in the digest (not just the id): a definition re-edit keeps the same id
+			// but changes the style payload, and that re-color must force a repaint. JSON of the small style
+			// object is a stable canonical form (the engine emits a fixed key set per style).
+			const idKey = id === null || id === undefined ? '?' : String(id.peer) + ':' + String(id.counter);
+			parts.push(idKey + '=' + JSON.stringify(style ?? null));
+		}
+		key = parts.join('|');
+	}
+	const changed = key !== stylesTableKey;
+	stylesTableKey = key;
+	return changed;
+}
+
+function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean, stylesChanged: boolean): void {
 	// Re-audit MED-4: a valid render supersedes a TRANSIENT banner (malformed-render / un-editable cell)
 	// but must NOT hide an active 'edit' banner -- a sibling render repaints under an open editor whose
 	// over-length value is still invalid; clearing it would mask the bad pending state until next commit.
@@ -4334,7 +4489,7 @@ function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean)
 	// the last paint). The non-paint prep above (set fullSnapshot, clear/stale-tint errorCells, title/meta,
 	// spacer) stays here -- those are DOM/binding writes this file owns. `commitSnapshot` fires the
 	// `onAfterDamage` host callback (the formula-bar follow) on the damage path.
-	orchestrator.commitSnapshot(prevSnapshot, snapshot, publishedChanged);
+	orchestrator.commitSnapshot(prevSnapshot, snapshot, publishedChanged, stylesChanged);
 	// Sheet-tabs (2026-06-10): after a sheet switch repaints, sync the formula bar to the new sheet's A1
 	// and report the reset selection to the host (deduped via `lastPostedSelectionKey`, so a same-sheet
 	// render is a no-op). Gated on `sheetChanged` so a normal content render is untouched.
@@ -4521,7 +4676,10 @@ window.addEventListener('message', (event: MessageEvent) => {
 		// W-G bound-cell indicator: validate + rebuild the published-cell badges for this sheet BEFORE
 		// applying the snapshot, so the same render paints both. A change in the set forces a full redraw.
 		const publishedChanged = rebuildPublishedRanges((msg as { publishedCells?: unknown }).publishedCells);
-		applyRender(snapshot, publishedChanged);
+		// FE-5 W-R: detect an engine STYLE-TABLE change (definition re-edit) the per-cell styleId damage term
+		// cannot see -> forces a full redraw. Always `false` until the conductor threads `snapshot.styles[]`.
+		const stylesChanged = stylesTableChanged(snapshot);
+		applyRender(snapshot, publishedChanged, stylesChanged);
 		// Sheet-tabs (2026-06-10): repaint the bottom strip from the live sheet list + active id the host
 		// carries on every render. Done after applyRender so a sheet-switch render updates the grid AND the
 		// active-tab highlight together.
@@ -4807,6 +4965,44 @@ window.addEventListener('message', (event: MessageEvent) => {
 		} else {
 			console.warn('[sheets-webview] ignored contextMenuAction with a bad action:', action);
 		}
+		return;
+	}
+	if (msg.type === 'navigateTo') {
+		// **FE-5 W-F (2026-06-12) -- host->webview "select + reveal cell" handler.**
+		//
+		// WIRE SHAPE: `{ type: 'navigateTo', row: number, col: number }` -- 0-based grid coordinates on the
+		// CURRENTLY-ACTIVE sheet (the host switches the sheet via a normal `render` BEFORE posting this when
+		// the target is on another sheet; this handler does NOT switch sheets). Selects the single cell at
+		// (row, col), clears any range anchor, scrolls it into view, and repaints -- the absolute-landing nav
+		// identical to a Ctrl+Home/End jump, surfaced as a message.
+		//
+		// **REUSABLE CONTRACT (downstream):** the FE-5 Name Manager's "Go-To" reuses THIS exact message to
+		// jump to a named range's anchor cell. Keep it a clean select-and-reveal of a single (row, col); do NOT
+		// special-case find vs name-manager here. Coordinates are validated at the trust boundary (finite
+		// non-negative integers in the Excel extent) and DROPPED loud on a violation (No-Fallbacks: a bad
+		// coordinate must not silently land on A1 via a `Number()` coercion).
+		//
+		// **Edit-race guard (preserve the FE-4 invariant):** route through `runAfterResolvingEdit` so an open
+		// editor is resolved (cancel-if-unchanged / commit-and-queue) BEFORE the selection jumps out from under
+		// it -- exactly like `stepFind` and every other chrome action. With no editor this runs synchronously.
+		const nav = msg as { row?: unknown; col?: unknown };
+		if (
+			typeof nav.row !== 'number' || !Number.isInteger(nav.row) || nav.row < 0 || nav.row >= MAX_ROWS ||
+			typeof nav.col !== 'number' || !Number.isInteger(nav.col) || nav.col < 0 || nav.col >= MAX_COLS
+		) {
+			console.warn('[sheets-webview] dropped a malformed navigateTo (row/col must be in-extent integers):', msg);
+			return;
+		}
+		const targetRow = nav.row;
+		const targetCol = nav.col;
+		runAfterResolvingEdit('navigate to cell', () => {
+			jumpActive(targetRow, targetCol);
+			// Keep the host + formula bar in sync with the landed selection (a host-driven nav is a real
+			// selection change the host should hear back, deduped by `postSelectionIfChanged`).
+			updateFormulaBar();
+			postSelectionIfChanged();
+			viewportEl.focus(); // return keyboard focus to the grid so arrow-nav continues from the landing
+		});
 		return;
 	}
 	console.warn('[sheets-webview] unknown inbound message type:', msg.type);

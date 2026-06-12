@@ -242,11 +242,25 @@ export class RenderOrchestrator {
 	 * @param publishedChanged whether the published-cell set changed (forces the full path -- the
 	 *   damage diff only covers rows whose value moved, so a badge appear/clear/move without a value
 	 *   change needs a full redraw).
+	 * @param stylesChanged **FE-5 W-R (2026-06-12)**: whether the engine STYLE TABLE (`snapshot.styles[]`)
+	 *   changed since the last commit -- forces the full path. The per-cell `styleId` term in
+	 *   `entryVisualEqual` catches a cell REPOINTED to a different style, but a style DEFINITION change (an
+	 *   existing `styleId`'s fill/bold/border re-edited, every cell carrying it unchanged) moves no cell's
+	 *   `styleId`, so the row diff would miss it and the re-colored cells would not repaint until scroll.
+	 *   The table-level analog of `publishedChanged`. `false` whenever the IDE build's render snapshot does
+	 *   not yet carry `styles[]` (the conductor cross-boundary field) -> byte-identical to the pre-W-R gate.
 	 */
 	commitSnapshot(
 		prevSnapshot: QuantbookCellSnapshot | null,
 		snapshot: QuantbookCellSnapshot,
 		publishedChanged: boolean,
+		// Defaulted to `false` ONLY so the pre-W-R callers that legitimately have no engine style table (the
+		// render bench + the orchestrator golden tests, neither of which carries `styles[]`) need no edit --
+		// `false` is the CORRECT value there, not a masked-missing-argument fallback. The LIVE caller
+		// (`index.ts::applyRender`) ALWAYS passes the real derived flag explicitly, so the production path is
+		// never silently defaulted (No-Fallbacks: this is a correct-default for genuinely-style-free callers,
+		// not a swallowed required arg).
+		stylesChanged: boolean = false,
 	): void {
 		const host = this.host;
 		const renderer = host.renderer;
@@ -254,9 +268,15 @@ export class RenderOrchestrator {
 		// `backingScaleStale` (Opus LOW-1): a dpr change with no CSS-size change skips resize() -> full
 		// redraw. W-G: a change in the published set forces the full path (`null`) -- the damage diff only
 		// covers rows whose value moved, so a badge that appears/clears/relocates without a value change
-		// needs a full redraw.
+		// needs a full redraw. W-R (2026-06-12): a style-TABLE change does likewise.
+		// **CLOSURE D3 (2026-06-12) -- NB `stylesChanged` is DEFENSIVE-ONLY and OVER-FIRES.** `registerStyle`
+		// is CONTENT-ADDRESSED (idempotent only for an identical style): editing an existing style's
+		// fill/bold/border yields a NEW StyleId, so the affected cells' `styleId` MOVES to that new id -- which
+		// the per-cell `styleId` term in `entryVisualEqual` already treats as damage. So a real style edit is
+		// already caught by the damage diff; this table-level gate just forces a (redundant) full redraw on top.
+		// Kept as belt-and-braces (cheap, correct), not because the damage diff would otherwise miss it.
 		const damageRows =
-			renderer.painted && !renderer.backingScaleStale && this.scrollUnchangedSince(v) && !publishedChanged
+			renderer.painted && !renderer.backingScaleStale && this.scrollUnchangedSince(v) && !publishedChanged && !stylesChanged
 				? diffSnapshotsA1(prevSnapshot, snapshot)
 				: null;
 		if (damageRows === null) {

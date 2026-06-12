@@ -319,6 +319,30 @@
         "category": "%command.category%"
       },
       {
+        "_comment": "FE-5 W-N: Name Manager -- list/define/rename/delete/Go-To defined names (QuickPick; listNames refresh).",
+        "command": "quantlab.quantbookNameManager",
+        "title": "%command.quantbookNameManager.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "FE-5 W-N: Go to Name -- jump the focused grid to a defined name's anchor (cross-sheet aware).",
+        "command": "quantlab.quantbookGoToName",
+        "title": "%command.quantbookGoToName.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "FE-5 W-T: Create Table from the focused grid's selection (createTable; epoch bump -> reseed).",
+        "command": "quantlab.quantbookCreateTable",
+        "title": "%command.quantbookCreateTable.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "FE-5 W-T: Drop Table by name (dropTable; referencing formulas become #NAME?).",
+        "command": "quantlab.quantbookDropTable",
+        "title": "%command.quantbookDropTable.title%",
+        "category": "%command.category%"
+      },
+      {
         "_comment": "FE-4 W2: sort the focused grid's selected range by a key column, ascending (A to Z).",
         "command": "quantlab.quantbookSortRangeAsc",
         "title": "%command.quantbookSortRangeAsc.title%",

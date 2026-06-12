@@ -93,9 +93,16 @@ export interface CellValueJson {
  * `value` absent = formula-only cell (formula text, no cached literal).
  * `formula` absent = pure literal cell (PutValue, no formula text).
  * Both present = formula evaluated to a literal (formula text + cached
- * value coexist).  All three (value + formula + format) absent cannot
- * occur (V3.4.0.X MEDIUM-1 closure extended at V3.5.0.5 to format --
- * such empty CellState entries are removed from the cache).
+ * value coexist).
+ *
+ * **FE-5 W-R (2026-06-12) correction**: the prior claim "value + formula +
+ * format all absent cannot occur" is NO LONGER TRUE -- a STYLE-ONLY cell
+ * carries value AND formula (and format) undefined while it carries a
+ * `styleId` (a fill/border/bold on an otherwise-empty cell). The engine emits
+ * such cells (proved by a passing test). The live invariant: a cell carries at
+ * least one of {value, formula, styleId}. (The V3.4.0.X MEDIUM-1 / V3.5.0.5
+ * closure that pruned truly-empty CellState entries predates styles; a
+ * style-only cell is not "empty".)
  *
  * **napi-rs absence convention** (V3.5.0.X audit-closure A-LOW-1 doc
  * hygiene, 2026-05-24): Rust `Option<T>::None` serializes to ABSENT
@@ -108,9 +115,17 @@ export interface CellSnapshotJson {
 	col: number;
 	// napi-rs Option<T>::None -> absent (undefined) at the JS layer.  Declared
 	// as optional (?:) to reflect this.  `value: undefined` = formula-only
-	// cell; `formula: undefined` = pure literal cell; ALL THREE undefined
-	// cannot occur (V3.4.0.X MEDIUM-1 closure extended at V3.5.0.5 -- such
-	// empty CellState entries are removed from the cache).
+	// cell; `formula: undefined` = pure literal cell.
+	//
+	// **FE-5 W-R (2026-06-12) correction**: the prior claim "ALL THREE
+	// undefined cannot occur" is NO LONGER TRUE. A STYLE-ONLY cell -- value
+	// AND formula both undefined while it carries a `styleId` (a fill/border/
+	// bold on an otherwise-empty cell) -- IS emitted by the engine (proved by a
+	// passing test). The invariant now: a cell ALWAYS carries at least ONE of
+	// {value, formula, styleId}; value+formula may both be undefined PROVIDED a
+	// styleId is present. (The pre-W-R V3.4.0.X MEDIUM-1 / V3.5.0.5 closure that
+	// removed empty CellState entries predates styles; a style-only cell is not
+	// "empty".)
 	value?: CellValueJson;
 	formula?: string;
 	/**
@@ -178,9 +193,11 @@ export interface CellSnapshotJson {
 	 * **FE-4 W4 (2026-06-10)** -- the cell's registered visual-style id, or absent
 	 * when the cell carries no style. Resolve against
 	 * {@link WorkbookSnapshotJson.styles} / {@link WorkbookSnapshotDeltaJson.stylesAdded}.
-	 * ENGINE FOUNDATION ONLY this wave: no IDE surface consumes it yet (the webview's
-	 * session-scoped `cellStyleModel` remains the render-layer style source until the
-	 * FE-5 render wave switches to engine-backed styles).
+	 * **FE-5 W-R (2026-06-12): this IS now the live render-layer style source** -- the
+	 * host projects it onto {@link QuantbookCellSnapshot.entries}`[].styleId` (via
+	 * {@link extractSheetSnapshot}) and the webview canvas resolves + paints it. The old
+	 * session-scoped `cellStyleModel` style store has been retired; the engine is the SOLE
+	 * style source (writes go through `setStyle`/`registerStyle`, reads through this field).
 	 */
 	styleId?: StyleIdJson;
 }
@@ -408,6 +425,86 @@ export interface WorkbookSnapshotJson {
 	 * need not set it. Real napi calls ALWAYS populate it.
 	 */
 	schemaVersion?: number;
+	/**
+	 * **FE-5 W-N (2026-06-12)**: all defined names in the workbook -- BOTH
+	 * workbook-scoped ({@link NamedRangeJson.scope} absent) AND every sheet's
+	 * sheet-scoped names ({@link NamedRangeJson.scope} = the sheet id). Sorted by
+	 * the engine (workbook-scoped first, then by sheet id, then by name) for a
+	 * stable, diffable shape. Empty when none are defined.
+	 *
+	 * The Name-Manager UI is the consumer. Defined-name changes are
+	 * delta-INVISIBLE (not in {@link WorkbookSnapshotDeltaJson}, and `setName`/
+	 * `deleteName` do NOT advance the version token), so a name list is refreshed
+	 * via a full {@link snapshot} / {@link SessionInstance.listNames} call -- NEVER
+	 * via `snapshotDelta`.
+	 *
+	 * The engine bumped its `SCHEMA_VERSION` 1 -> 2 alongside this ADDITIVE field
+	 * (see {@link QUANTBOOK_SCHEMA_VERSION} in `./session`). Declared OPTIONAL in
+	 * this mirror only so the pre-W-N test-fixture literals stay valid; the live
+	 * engine ALWAYS returns it -- consumers treat absent as [].
+	 */
+	names?: NamedRangeJson[];
+}
+
+/**
+ * **FE-5 W-N (2026-06-12)**: one defined name in the workbook (mirrors the engine
+ * `NamedRangeJson` / `ql_session::NamedRange`) -- its canonical (engine-uppercased)
+ * `name`, its {@link NamedTargetJson}, and its `scope`. Surfaced in
+ * {@link WorkbookSnapshotJson.names} and returned by {@link SessionInstance.listNames}.
+ */
+export interface NamedRangeJson {
+	name: string;
+	target: NamedTargetJson;
+	/**
+	 * Absent for a workbook-scoped name; the sheet id (a `u32`-widened `SheetId`)
+	 * for a sheet-scoped name. The same value passed back to
+	 * {@link SessionInstance.deleteName} to remove a sheet-scoped name.
+	 */
+	scope?: number;
+}
+
+/**
+ * **FE-5 W-N (2026-06-12)**: the TARGET of a defined name (mirrors the engine
+ * `NamedTargetJson` / `ql_session::NamedTargetDto`) -- a discriminated union tagged
+ * by `kind` with a per-variant optional payload (the napi convention shared by
+ * {@link CellValueJson} / {@link FormatIdJson}). Read the field indicated by `kind`;
+ * the others are absent. All four variants round-trip faithfully (a loaded `.qbook`
+ * can carry Constant/Formula names; they are NEVER coerced down to a Range -- the
+ * IDE's `setName` only CREATES Range names, but `listNames` reports every kind):
+ *  - `'cell'`     -> `{ kind: 'cell', cell: CellAddrJson }`
+ *  - `'range'`    -> `{ kind: 'range', range: NamedRangeTargetJson }`
+ *  - `'constant'` -> `{ kind: 'constant', value: CellValueJson }`
+ *  - `'formula'`  -> `{ kind: 'formula', formula: string }` (raw source, no leading `=`)
+ *
+ * Only `cell` / `range` targets have a grid anchor and are "Go-To"-able; `constant`
+ * / `formula` names have no cell (No-Fallbacks: the UI disables Go-To for them
+ * rather than fabricating an A1 landing).
+ */
+export interface NamedTargetJson {
+	kind: 'cell' | 'range' | 'constant' | 'formula';
+	/** Set when `kind === 'cell'`. */
+	cell?: CellAddrJson;
+	/** Set when `kind === 'range'`. */
+	range?: NamedRangeTargetJson;
+	/** Set when `kind === 'constant'`. */
+	value?: CellValueJson;
+	/** Set when `kind === 'formula'` (raw source, no leading `=`). */
+	formula?: string;
+}
+
+/**
+ * **FE-5 W-N (2026-06-12)**: the rectangular range of a `'range'`-kind
+ * {@link NamedTargetJson} (mirrors the engine `NamedRangeTargetJson`). This is the
+ * OUTBOUND read shape (engine -> JS): all coordinates are 0-indexed `u32` ids
+ * (lossless, plain numbers -- unlike the INBOUND {@link CellRangeJson} which uses
+ * `f64` boundaries for validation). Bounds are inclusive.
+ */
+export interface NamedRangeTargetJson {
+	sheet: number;
+	startRow: number;
+	startCol: number;
+	endRow: number;
+	endCol: number;
 }
 
 /**
@@ -1234,10 +1331,34 @@ export type QuantbookCellValue =
 export interface QuantbookCellSnapshot {
 	readonly snapshot_format_version: 1;
 	readonly sheet: number;
+	/**
+	 * **FE-5 W-R (2026-06-12)** -- the session-wide cell-style registry projected from
+	 * {@link WorkbookSnapshotJson.styles}, carried on the RENDER snapshot so the webview can
+	 * resolve each entry's {@link styleId} against it (fill/bold/italic/horizontal-align +
+	 * per-edge borders). Absent when the source workbook snapshot carries no styles (the
+	 * common, pre-any-style-edit case) -- the webview treats absent as "no engine styles, no
+	 * cell is styled", which is the correct semantics, NOT a masking fallback.
+	 *
+	 * **ATOMICITY:** this table and every entry's {@link styleId} are projected TOGETHER by
+	 * {@link extractSheetSnapshot} from the SAME `WorkbookSnapshotJson`, so a `styleId` here
+	 * always resolves against a styles table from the same engine version (never a stale one).
+	 */
+	readonly styles?: ReadonlyArray<StyleDefJson>;
 	readonly entries: ReadonlyArray<{
 		readonly row: number;
 		readonly col: number;
 		readonly value: QuantbookCellValue;
+		/**
+		 * **FE-5 W-R (2026-06-12)** -- the cell's registered visual-style id projected from
+		 * {@link CellSnapshotJson.styleId}, or absent when the cell carries no style. Resolve
+		 * against the snapshot-level {@link QuantbookCellSnapshot.styles} table to render. A
+		 * style-only cell (a `styleId` with no value AND no formula -- e.g. a fill/border on an
+		 * empty cell) carries this with `value: { kind: 'pending' }` (see
+		 * {@link extractSheetSnapshot}); the engine DOES emit such cells (empirically verified
+		 * 2026-06-12), so the projection KEEPS them rather than dropping them as it would a truly
+		 * empty cell.
+		 */
+		readonly styleId?: StyleIdJson;
 		/**
 		 * **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: engine-pre-rendered
 		 * formatted string (mirrors {@link CellSnapshotJson.rendered}).
@@ -2107,6 +2228,30 @@ export interface SessionInstance {
 	 * such hazard.
 	 */
 	setName(name: string, target: CellRangeJson): void;
+
+	/**
+	 * **FE-5 W-N (2026-06-12)**: remove a defined name. `scope` is absent/undefined
+	 * for a workbook-scoped name (the only kind the IDE's {@link setName} creates),
+	 * or the sheet id (the same `scope` carried on a {@link NamedRangeJson}) for a
+	 * sheet-scoped name. A name not registered in the target scope throws
+	 * `[name_not_found]` (NotFound) -- NOT a silent no-op (No-Fallbacks: the
+	 * Name-Manager surfaces the failure). A defined-name change is delta-invisible
+	 * AND does not advance the version token, so the manager refreshes via
+	 * {@link listNames} (or a full {@link snapshot}), never via `snapshotDelta`.
+	 * `[invalid_state]` off a Ready session.
+	 */
+	deleteName(name: string, scope?: number): void;
+
+	/**
+	 * **FE-5 W-N (2026-06-12)**: list every defined name in the workbook -- BOTH
+	 * workbook-scoped ({@link NamedRangeJson.scope} absent) AND every sheet's
+	 * sheet-scoped names (`scope` = the sheet id). Sorted (workbook-scoped first,
+	 * then by sheet id, then by name). The lightweight read backing the
+	 * Name-Manager UI (the same data also rides {@link snapshot}`.names`). All four
+	 * {@link NamedTargetJson} kinds round-trip faithfully. `[invalid_state]` off a
+	 * Ready session.
+	 */
+	listNames(): NamedRangeJson[];
 
 	// --- Phase 6.3-2d (2026-05-30): tables ---
 

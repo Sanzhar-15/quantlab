@@ -305,14 +305,48 @@ function optEqual(a: string | undefined, b: string | undefined): boolean {
 	return a === b;
 }
 
+/**
+ * **FE-5 W-R (2026-06-12)** -- the cell's engine `StyleId` (`{peer, counter}`), or `undefined` for an
+ * unstyled cell. `Entry.styleId` is the host-projected render field (`extractSheetSnapshot` copies
+ * `cell.styleId` onto each render entry). An absent field is the genuine "no style on this cell" state,
+ * not a masked error -- this is part of the painted set, so a style-only change drives a repaint.
+ */
+function entryStyleId(e: Entry): { peer: bigint; counter: number } | undefined {
+	const sid = e.styleId;
+	return sid === undefined ? undefined : { peer: sid.peer, counter: sid.counter };
+}
+
+/** Equal iff two entries carry the SAME engine `StyleId` (or both none). A STRUCTURAL compare on
+ * `(peer, counter)`, never reference equality -- the snapshot crosses `postMessage` structured-clone every
+ * render, so object identity is always fresh and useless (the same discipline as {@link valueEqual}). A
+ * style-only edit (same value, new `styleId`) flips this -> the cell's row enters the damage set. */
+function styleIdEqual(a: Entry, b: Entry): boolean {
+	const sa = entryStyleId(a);
+	const sb = entryStyleId(b);
+	if (sa === undefined || sb === undefined) {
+		return sa === sb; // both absent -> equal; exactly one absent -> a style appeared/cleared -> not equal
+	}
+	return sa.peer === sb.peer && sa.counter === sb.counter;
+}
+
 /** Equal iff two entries paint identically (everything {@link CanvasGridRenderer} reads for a cell).
- * Coordinates are excluded -- they are the diff KEY, not a painted field. */
+ * Coordinates are excluded -- they are the diff KEY, not a painted field.
+ *
+ * **FE-5 W-R (2026-06-12)**: `styleId` is now part of the painted set. The engine-backed render resolves a
+ * cell's fill/bold/italic/align/borders from its `styleId` against the snapshot `styles[]` table, so a
+ * style-only change (bold a cell that already has text -> SAME value/rendered/formula, NEW `styleId`) is a
+ * real visual delta. Without this term the fast repaint diff would judge the cell "equal", its row would
+ * never enter the damage set, and NOTHING would repaint until the user scrolled -- the wave-2/wave-3
+ * silent-render-miss corruption class. A style DEFINITION change (the `styleId` table entry re-colored,
+ * `styleId` unchanged) is the table-level analog and is forced full-redraw by the orchestrator's
+ * `stylesChanged` gate (see {@link RenderOrchestrator.commitSnapshot}), NOT here. */
 function entryVisualEqual(a: Entry, b: Entry): boolean {
 	return (
 		valueEqual(a.value, b.value) &&
 		optEqual(a.rendered, b.rendered) &&
 		optEqual(a.formula, b.formula) &&
-		optEqual(a.diagnostic, b.diagnostic)
+		optEqual(a.diagnostic, b.diagnostic) &&
+		styleIdEqual(a, b)
 	);
 }
 

@@ -27,7 +27,7 @@
  * - `panel.webview.postMessage` -> wired as `DispatchDeps.onError`.
  */
 
-import type { CellSnapshotJson, CollabSessionInstance, DiagnosticJson, EventJson, FormatIdJson, FunctionMetadataJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SessionCellValueInput, SessionInstance, SessionOpJson, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
+import type { CellSnapshotJson, CollabSessionInstance, DiagnosticJson, EventJson, FormatIdJson, FunctionMetadataJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, RgbJson, SessionCellValueInput, SessionInstance, SessionOpJson, SheetSnapshotJson, StyleDefJson, StyleIdJson, StyleJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
 import { assertSupportedSchemaVersion, parseQuantbookError, recalcDirtyChecked, setFormulaValidated, setValueValidated } from '../session';
 // Demo-prep toolbar (2026-06-10): type-only imports so the toolbar-command parser's whitelists stay
 // pinned to the canonical unions (a preset added to FormatPreset / an op added to StructuralOp forces
@@ -134,6 +134,47 @@ export interface PutCellsRequest {
 	undoLabel?: string;
 	webviewId?: string;
 }
+
+/**
+ * **FE-5 W-R (2026-06-12)** -- a cell-STYLE mutation over a rectangle (webview -> host). The engine
+ * is the SOLE style source (the retired session `cellStyleModel` is gone), so the toolbar's
+ * style controls POST this; the host applies it via the engine `registerStyle`/`setStyle` napi as
+ * ONE `Session.batch` (a single undo unit), recalcs, and re-renders.
+ *
+ * **Why a small MUTATION descriptor (not a per-cell full StyleJson):** the toolbar mutations are
+ * uniform deltas over the selection (toggle bold everywhere / set align everywhere / set-or-clear
+ * fill everywhere). Each cell's RESULTING style depends on its CURRENT style, which the host already
+ * has (it reads the workbook snapshot every render). Sending the descriptor (a few bytes) instead of
+ * up to {@link MAX_STYLE_CELLS} full StyleJson objects keeps the wire bounded AND keeps the engine
+ * read-modify-write in ONE authority (the host), with no webview/host style-schema duplication.
+ *
+ * The rect is INCLUSIVE 0-based. The batch is ALL-OR-NOTHING (No-Fallbacks: a single invalid cell or
+ * a malformed style rejects the whole op loudly via {@link DispatchDeps.onOperationError}).
+ */
+export interface SetStyleRequest {
+	type: 'setStyle';
+	sheet: number;
+	rect: { minRow: number; maxRow: number; minCol: number; maxCol: number };
+	mutation: StyleMutation;
+	undoLabel?: string;
+	webviewId?: string;
+}
+
+/**
+ * **FE-5 W-R (2026-06-12)** -- a single uniform style mutation a {@link SetStyleRequest} carries.
+ * Exactly the engine-schema attributes (the SOLE style source): bold/italic toggles, horizontal
+ * align, fill color. (Underline/strike/text-color are NOT engine attributes -- the toolbar surfaces
+ * them as preview-only, not via this path.)
+ *
+ * - `toggle`: flip a boolean style (`bold`/`italic`) over the rect with Excel/Sheets semantics -- if
+ *   EVERY cell in the rect already has it on, the whole rect is turned OFF, else the whole rect ON.
+ * - `align`: set the horizontal align over the rect, or clear it back to `general` with `null`.
+ * - `fill`: set the fill color over the rect, or clear it (no fill) with `null`.
+ */
+export type StyleMutation =
+	| { kind: 'toggle'; prop: 'bold' | 'italic' }
+	| { kind: 'align'; value: 'left' | 'center' | 'right' | null }
+	| { kind: 'fill'; value: RgbJson | null };
 
 /**
  * V3.2.b.1 decision B1 envelope: incoming (extension host -> webview)
@@ -446,6 +487,219 @@ export function buildBatchOps(sheet: number, cells: readonly { row: number; col:
 		}
 	}
 	return ops;
+}
+
+// ============================================================================
+// FE-5 W-R (2026-06-12) -- cell-STYLE mutation -> engine setStyle batch.
+// The engine is the SOLE style source (the session `cellStyleModel` is retired). The toolbar's
+// style controls POST a SetStyleRequest; the host applies the uniform mutation over the rect by
+// reading each cell's CURRENT style from the workbook snapshot, computing the target StyleJson,
+// registering distinct styles, and committing a single setStyle batch. Pure helpers below
+// (`computeStyleTargets`, `styleJsonKey`) are mocha-testable; the napi-touching interning + batch
+// lives in the dispatcher's `setStyle` arm.
+// ============================================================================
+
+/**
+ * **FE-5 W-R (2026-06-12)** -- upper bound on cells a single {@link SetStyleRequest} may touch (the
+ * rect can span the whole Excel extent). Mirrors {@link MAX_BATCH_CELLS} + the retired webview
+ * `MAX_STYLE_CELLS` so a pathological whole-sheet style op is rejected loud rather than building an
+ * unbounded batch. A normal styling target is far under this.
+ */
+export const MAX_STYLE_CELLS = 100_000;
+
+/** All-default {@link StyleJson} (no visible style). The base a mutation patches when a cell carries
+ *  no style yet; also the result of clearing every attribute. */
+function defaultStyleJson(): StyleJson {
+	return { bold: false, italic: false };
+}
+
+/**
+ * **FE-5 W-R (2026-06-12)** -- read a cell's CURRENT {@link StyleJson} from a workbook snapshot:
+ * resolve `cells[].styleId` against `snapshot.styles[]`. Returns a fresh all-default StyleJson when
+ * the cell has no style (or the sheet/cell is absent). The returned object is always a COPY (never an
+ * alias into the snapshot) so the caller can patch it freely.
+ *
+ * No-Fallbacks: a cell whose `styleId` does NOT resolve against `styles[]` is a contract violation
+ * (the engine registers every referenced style); THROW `[invalid_state]` rather than silently
+ * treating it as unstyled -- a mutation must never start from a wrong (default) base and overwrite a
+ * real-but-unresolvable style. (In practice unreachable: the snapshot carries both together.)
+ */
+export function currentCellStyle(
+	snapshot: WorkbookSnapshotJson,
+	sheet: number,
+	row: number,
+	col: number,
+): StyleJson {
+	const sheetSnap = snapshot.sheets.find(s => s.id === sheet);
+	const cell = sheetSnap?.cells.find(c => c.row === row && c.col === col);
+	if (cell === undefined || cell.styleId === undefined) {
+		return defaultStyleJson();
+	}
+	const styles = snapshot.styles ?? [];
+	const def = styles.find(
+		d => d.id.peer === cell.styleId!.peer && d.id.counter === cell.styleId!.counter,
+	);
+	if (def === undefined) {
+		throw new Error(
+			`[invalid_state] currentCellStyle: cell (sheet=${sheet}, row=${row}, col=${col}) carries a styleId ` +
+			`{peer:${cell.styleId.peer}, counter:${cell.styleId.counter}} not present in snapshot.styles[] ` +
+			`(${styles.length} styles). The engine must register every referenced style; the binding may be out of sync.`,
+		);
+	}
+	// Deep-ish copy: the top-level scalars + a fresh copy of each present sub-object so a patch
+	// (e.g. setting fill) cannot mutate the snapshot's shared StyleDefJson.
+	const copy: StyleJson = { bold: def.style.bold === true, italic: def.style.italic === true };
+	if (def.style.fill !== undefined) { copy.fill = { ...def.style.fill }; }
+	if (def.style.align !== undefined) { copy.align = def.style.align; }
+	if (def.style.borderTop !== undefined) { copy.borderTop = { style: def.style.borderTop.style, color: { ...def.style.borderTop.color } }; }
+	if (def.style.borderBottom !== undefined) { copy.borderBottom = { style: def.style.borderBottom.style, color: { ...def.style.borderBottom.color } }; }
+	if (def.style.borderLeft !== undefined) { copy.borderLeft = { style: def.style.borderLeft.style, color: { ...def.style.borderLeft.color } }; }
+	if (def.style.borderRight !== undefined) { copy.borderRight = { style: def.style.borderRight.style, color: { ...def.style.borderRight.color } }; }
+	return copy;
+}
+
+/**
+ * **FE-5 W-R (2026-06-12)** -- compute the per-cell TARGET {@link StyleJson} for a uniform
+ * {@link StyleMutation} over `rect`, reading each cell's current style from `snapshot`. Pure (no
+ * session / napi) so it is mocha-testable; the caller interns the distinct results + batches.
+ *
+ * Excel/Sheets toggle semantics: a `toggle` flips to OFF iff EVERY cell in the rect already has the
+ * prop on, else ON (so a partially-bold selection becomes fully bold). `align`/`fill` set (or clear
+ * with `null`) uniformly. Every OTHER attribute a cell already carries (borders, the untouched
+ * fill/align, bold vs italic) is PRESERVED -- a mutation patches one attribute, never resets the cell.
+ *
+ * THROWS `[bad_argument]` for an empty/inverted rect or an over-{@link MAX_STYLE_CELLS} cell count,
+ * and propagates `currentCellStyle`'s `[invalid_state]` for an unresolvable styleId (No-Fallbacks).
+ */
+export function computeStyleTargets(
+	snapshot: WorkbookSnapshotJson,
+	sheet: number,
+	rect: { minRow: number; maxRow: number; minCol: number; maxCol: number },
+	mutation: StyleMutation,
+): { row: number; col: number; style: StyleJson }[] {
+	if (
+		!Number.isInteger(rect.minRow) || !Number.isInteger(rect.maxRow) ||
+		!Number.isInteger(rect.minCol) || !Number.isInteger(rect.maxCol) ||
+		rect.minRow < 0 || rect.minCol < 0 ||
+		rect.maxRow < rect.minRow || rect.maxCol < rect.minCol ||
+		rect.maxRow >= A1_MAX_ROWS || rect.maxCol >= A1_MAX_COLS
+	) {
+		throw new Error(
+			`[bad_argument] setStyle: rect {minRow:${rect.minRow}, maxRow:${rect.maxRow}, minCol:${rect.minCol}, ` +
+			`maxCol:${rect.maxCol}} is empty/inverted or outside the A1 extent (${A1_MAX_ROWS}x${A1_MAX_COLS}).`,
+		);
+	}
+	const rows = rect.maxRow - rect.minRow + 1;
+	const cols = rect.maxCol - rect.minCol + 1;
+	const count = rows * cols;
+	if (count > MAX_STYLE_CELLS) {
+		throw new Error(`[bad_argument] setStyle: ${count} cells exceeds the ${MAX_STYLE_CELLS}-cell style limit.`);
+	}
+	// For a toggle, first determine the uniform target value (off iff ALL cells already on).
+	let toggleTo = false;
+	if (mutation.kind === 'toggle') {
+		let allOn = true;
+		for (let r = rect.minRow; r <= rect.maxRow && allOn; r += 1) {
+			for (let c = rect.minCol; c <= rect.maxCol; c += 1) {
+				if (currentCellStyle(snapshot, sheet, r, c)[mutation.prop] !== true) {
+					allOn = false;
+					break;
+				}
+			}
+		}
+		toggleTo = !allOn;
+	}
+	const out: { row: number; col: number; style: StyleJson }[] = [];
+	for (let r = rect.minRow; r <= rect.maxRow; r += 1) {
+		for (let c = rect.minCol; c <= rect.maxCol; c += 1) {
+			const style = currentCellStyle(snapshot, sheet, r, c);
+			if (mutation.kind === 'toggle') {
+				style[mutation.prop] = toggleTo;
+			} else if (mutation.kind === 'align') {
+				if (mutation.value === null) {
+					delete style.align;
+				} else {
+					style.align = mutation.value;
+				}
+			} else {
+				// fill
+				if (mutation.value === null) {
+					delete style.fill;
+				} else {
+					style.fill = { r: mutation.value.r, g: mutation.value.g, b: mutation.value.b };
+				}
+			}
+			out.push({ row: r, col: c, style });
+		}
+	}
+	return out;
+}
+
+/** **FE-5 W-R (2026-06-12)** -- validate one RGB channel triple from an UNTRUSTED webview payload:
+ *  each of r/g/b an integer in 0..=255. Returns an error string or null. */
+function validateRgb(v: unknown): string | null {
+	if (typeof v !== 'object' || v === null) {
+		return 'fill must be an {r,g,b} object';
+	}
+	const c = v as { r?: unknown; g?: unknown; b?: unknown };
+	const ok = (n: unknown): boolean => typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= 255;
+	if (!ok(c.r) || !ok(c.g) || !ok(c.b)) {
+		return 'fill r/g/b must each be an integer in 0..=255';
+	}
+	return null;
+}
+
+/**
+ * **FE-5 W-R (2026-06-12)** -- validate an UNTRUSTED {@link StyleMutation} from the webview (defense in
+ * depth -- a tampered bundle could post a malformed mutation). Returns an error message string, or null
+ * when valid. Strict tagged-union check on `kind` + the per-kind payload domain.
+ */
+export function validateStyleMutation(m: unknown): string | null {
+	if (typeof m !== 'object' || m === null) {
+		return 'mutation must be an object';
+	}
+	const mut = m as { kind?: unknown; prop?: unknown; value?: unknown };
+	if (mut.kind === 'toggle') {
+		if (mut.prop !== 'bold' && mut.prop !== 'italic') {
+			return `toggle prop must be 'bold' or 'italic', got ${String(mut.prop)}`;
+		}
+		return null;
+	}
+	if (mut.kind === 'align') {
+		if (mut.value !== null && mut.value !== 'left' && mut.value !== 'center' && mut.value !== 'right') {
+			return `align value must be 'left'|'center'|'right'|null, got ${String(mut.value)}`;
+		}
+		return null;
+	}
+	if (mut.kind === 'fill') {
+		if (mut.value === null) {
+			return null;
+		}
+		return validateRgb(mut.value);
+	}
+	return `unknown mutation kind ${String(mut.kind)}`;
+}
+
+/**
+ * **FE-5 W-R (2026-06-12)** -- canonical dedup key for a {@link StyleJson}, so the `setStyle` handler
+ * interns each DISTINCT style once (registerStyle is idempotent, but deduping avoids N redundant napi
+ * calls for a uniform selection). A border edge serializes as `style@r,g,b`; absent fields collapse to
+ * "". Order is fixed so equal StyleJsons produce equal keys.
+ */
+export function styleJsonKey(s: StyleJson): string {
+	const edge = (e: { style: string; color: RgbJson } | undefined): string =>
+		e === undefined ? '' : `${e.style}@${e.color.r},${e.color.g},${e.color.b}`;
+	const fill = s.fill === undefined ? '' : `${s.fill.r},${s.fill.g},${s.fill.b}`;
+	return [
+		s.bold === true ? 'b' : '',
+		s.italic === true ? 'i' : '',
+		`f:${fill}`,
+		`a:${s.align ?? ''}`,
+		`t:${edge(s.borderTop)}`,
+		`bo:${edge(s.borderBottom)}`,
+		`l:${edge(s.borderLeft)}`,
+		`r:${edge(s.borderRight)}`,
+	].join('|');
 }
 
 /**
@@ -801,6 +1055,63 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			// Reached ONLY on success (after batch + recalc); a FAILED putCells (catch below) reports nothing,
 			// so a stale tint correctly stays (No-Fallbacks).
 			deps.onCellsWritten?.(req.sheet, req.cells.map(c => ({ row: c.row, col: c.col })), req.webviewId);
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			deps.onOperationError?.(`[${label}] [${info.code}] ${info.message}`);
+		}
+		return;
+	}
+	// **FE-5 W-R (2026-06-12)**: a cell-STYLE mutation over a rect. The engine is the SOLE style source,
+	// so the toolbar's style controls POST this; the host reads each cell's current style from the
+	// workbook snapshot, computes the per-cell target StyleJson for the uniform mutation, interns the
+	// DISTINCT styles via `registerStyle`, and commits ONE `setStyle` batch (a single undo unit), then
+	// recalcs + re-renders via onCommit (the render carries the new styles[] + per-cell styleIds, so the
+	// style appears). Like putCells, no open editor backs it; a failure (bad envelope / malformed style /
+	// engine reject) surfaces via onOperationError (a toast), never silently dropped (No-Fallbacks).
+	if (msg.type === 'setStyle') {
+		const req = raw as SetStyleRequest;
+		const label = typeof req.undoLabel === 'string' && req.undoLabel.length > 0 ? req.undoLabel : 'Format cells';
+		if (req.sheet !== deps.sheet) {
+			deps.onOperationError?.(`[${label}] [bad_argument] setStyle sheet ${req.sheet} does not match this panel's sheet ${deps.sheet}; nothing was applied.`);
+			return;
+		}
+		if (typeof req.rect !== 'object' || req.rect === null) {
+			deps.onOperationError?.(`[${label}] [bad_argument] setStyle: rect must be an object; nothing was applied.`);
+			return;
+		}
+		const mutationError = validateStyleMutation(req.mutation);
+		if (mutationError !== null) {
+			deps.onOperationError?.(`[${label}] [bad_argument] setStyle: ${mutationError}; nothing was applied.`);
+			return;
+		}
+		let targets: { row: number; col: number; style: StyleJson }[];
+		try {
+			// Read a fresh full snapshot so the read-modify-write starts from the engine's CURRENT styles
+			// (a user style action, not a keystroke -- the O(N) snapshot cost is fine here).
+			const snapshot = deps.session.snapshot();
+			targets = computeStyleTargets(snapshot, req.sheet, req.rect, req.mutation);
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			deps.onOperationError?.(`[${label}] [${info.code}] ${info.message}`);
+			return;
+		}
+		try {
+			// Intern each DISTINCT StyleJson once (registerStyle is idempotent + interning avoids N
+			// redundant napi calls for a uniform selection), then build one setStyle op per cell.
+			const idByKey = new Map<string, StyleIdJson>();
+			const ops: SessionOpJson[] = [];
+			for (const t of targets) {
+				const key = styleJsonKey(t.style);
+				let id = idByKey.get(key);
+				if (id === undefined) {
+					id = deps.session.registerStyle(t.style);
+					idByKey.set(key, id);
+				}
+				ops.push({ kind: 'setStyle', sheet: req.sheet, row: t.row, col: t.col, style: id });
+			}
+			deps.session.batch(ops, { undoLabel: label });
+			recalcDirtyChecked(deps.session);
+			deps.onCommit();
 		} catch (err) {
 			const info = parseQuantbookError(err);
 			deps.onOperationError?.(`[${label}] [${info.code}] ${info.message}`);
@@ -1335,6 +1646,21 @@ export function classifySwitchSheetTarget(
 // ============================================================================
 
 /**
+ * **FE-5 W-R (2026-06-12)** -- the mutable build-shape of a single {@link QuantbookCellSnapshot}
+ * entry, used by {@link extractSheetSnapshot} as it projects engine cells. Mirrors the (readonly)
+ * entry element of {@link QuantbookCellSnapshot.entries} with the W-R `styleId` field. Pulled into a
+ * named alias (was three inline-repeated annotations) so the `styleId` addition lands in one place.
+ */
+type SnapshotEntry = {
+	row: number;
+	col: number;
+	value: QuantbookCellValue;
+	rendered?: string;
+	formula?: string;
+	styleId?: StyleIdJson;
+};
+
+/**
  * **Phase 5.7 V3.5.0.4b (2026-05-24) -- extract one sheet's
  * QuantbookCellSnapshot from a WorkbookSnapshotJson.**
  *
@@ -1397,7 +1723,7 @@ export function extractSheetSnapshot(
 	if (sheet === undefined) {
 		return null;
 	}
-	const entries: { row: number; col: number; value: QuantbookCellValue; rendered?: string; formula?: string }[] = [];
+	const entries: SnapshotEntry[] = [];
 	for (const cell of sheet.cells) {
 		if (cell.value === undefined) {
 			// **Phase 5.7 V3.6.0.X audit-of-D5 OPUS-HIGH-2 closure (2026-05-24)**:
@@ -1416,21 +1742,32 @@ export function extractSheetSnapshot(
 			// (engine-side pending values short-circuit pre-render so
 			// the IDE fallback fires).
 			//
-			// Cells with value=undefined AND formula=undefined would be
-			// fully-empty CellState entries; V3.4.0.X MEDIUM-1 closure
-			// removes those at the engine layer (extended V3.5.0.5 to
-			// format), so this branch only fires when formula is set.
-			if (cell.formula === undefined) {
+			// **FE-5 W-R (2026-06-12) -- STYLE-ONLY blank cell.** A cell with
+			// value=undefined AND formula=undefined is ALSO emitted by the engine when it
+			// carries ONLY a style (a fill / border set on an otherwise-empty cell --
+			// EMPIRICALLY VERIFIED: `setStyle` on an empty cell produces a snapshot cell
+			// with keys {row, col, styleId}, no value/formula). Pre-W-R this branch
+			// `continue`d such a cell, DROPPING it -> the fill/border on a blank cell never
+			// reached the webview, so it never rendered. Post-W-R: KEEP it (emit a pending
+			// entry that carries the styleId) so the engine-backed fill/border on a blank
+			// cell renders. A cell with NONE of value/formula/styleId is genuinely empty and
+			// is still dropped (nothing to render).
+			if (cell.formula === undefined && cell.styleId === undefined) {
 				continue;
 			}
-			const entry: { row: number; col: number; value: QuantbookCellValue; rendered?: string; formula?: string } = {
+			const entry: SnapshotEntry = {
 				row: cell.row,
 				col: cell.col,
 				value: { kind: 'pending' },
-				formula: cell.formula,
 			};
+			if (cell.formula !== undefined) {
+				entry.formula = cell.formula;
+			}
 			if (cell.rendered !== undefined) {
 				entry.rendered = cell.rendered;
+			}
+			if (cell.styleId !== undefined) {
+				entry.styleId = cell.styleId;
 			}
 			entries.push(entry);
 			continue;
@@ -1514,7 +1851,7 @@ export function extractSheetSnapshot(
 		// engine omits, set otherwise.  buildHtml emits
 		// `data-raw-formula` from this field so click-to-edit
 		// surfaces formula source instead of the cached literal.
-		const entry: { row: number; col: number; value: QuantbookCellValue; rendered?: string; formula?: string } = {
+		const entry: SnapshotEntry = {
 			row: cell.row,
 			col: cell.col,
 			value: typed,
@@ -1525,13 +1862,44 @@ export function extractSheetSnapshot(
 		if (cell.formula !== undefined) {
 			entry.formula = cell.formula;
 		}
+		// **FE-5 W-R (2026-06-12)**: project the cell's engine style id so the webview can
+		// resolve it against the snapshot-level styles[] table (added below). Conditional-key
+		// discipline (absent when the cell has no style) -- the shape-stability deepStrictEqual
+		// tests assert exact key sets, so a styleId:undefined key would break them.
+		if (cell.styleId !== undefined) {
+			entry.styleId = cell.styleId;
+		}
 		entries.push(entry);
 	}
-	return {
+	const result: {
+		snapshot_format_version: 1;
+		sheet: number;
+		entries: SnapshotEntry[];
+		styles?: StyleDefJson[];
+	} = {
 		snapshot_format_version: 1,
 		sheet: sheetId,
 		entries,
 	};
+	// **FE-5 W-R (2026-06-12) -- ATOMICITY:** carry the workbook-level styles[] table on the
+	// SAME projection as the per-cell styleIds above, so a styleId always resolves against a
+	// table from the same engine snapshot (never a stale one). Conditional key (absent when the
+	// source snapshot has no styles -- the common pre-style-edit case) keeps the shape-stability
+	// tests' exact-key-set assertions intact. The webview reads `snapshot.styles` defensively and
+	// treats absent as "no engine styles" (correct semantics, not a fallback).
+	//
+	// **CLOSURE D4 (2026-06-12) -- ALIASING HAZARD (safe today, flagged for the future).** This assigns
+	// the SAME `snapshot.styles` array BY REFERENCE (no copy) into the projection. When the source is the
+	// cached delta snapshot, `mergeWorkbookDelta` MUTATES `cached.styles` IN PLACE on the next merge
+	// (push/replace/sort), so the array referenced here can change AFTER this projection is built. This is
+	// SAFE in the current flow only because every caller CONSUMES the projection synchronously and the host
+	// structured-clones it across the postMessage boundary to the webview before the next merge runs. A
+	// future host change that RETAINS a projected snapshot past the next merge would observe it mutate out
+	// from under it -- copy `snapshot.styles` here (or clone the projection) before retaining it.
+	if (snapshot.styles !== undefined && snapshot.styles.length > 0) {
+		result.styles = snapshot.styles;
+	}
+	return result;
 }
 
 // ---------------------------------------------------------------------
@@ -1616,6 +1984,7 @@ export function attachCellDiagnostics(
 			rendered?: string;
 			formula?: string;
 			diagnostic?: string;
+			styleId?: StyleIdJson;
 		} = { row: entry.row, col: entry.col, value: entry.value };
 		if (entry.rendered !== undefined) {
 			rebuilt.rendered = entry.rendered;
@@ -1625,6 +1994,14 @@ export function attachCellDiagnostics(
 		}
 		if (msg !== undefined) {
 			rebuilt.diagnostic = msg;
+		}
+		// **FE-5 W-R (2026-06-12)**: carry the engine styleId FORWARD. `render()` runs every
+		// snapshot through this BEFORE postMessage, so without re-adding styleId here the
+		// diagnostic-decoration step would STRIP it from every cell -> styles would never reach
+		// the webview (a silent style-render-miss). Conditional key (absent when unstyled) keeps
+		// the shape-stability deepStrictEqual tests' exact-key-set assertions intact.
+		if (entry.styleId !== undefined) {
+			rebuilt.styleId = entry.styleId;
 		}
 		return rebuilt;
 	});
@@ -1651,6 +2028,15 @@ export function attachCellDiagnostics(
  */
 function formatIdKey(id: FormatIdJson): string {
 	return `${id.kind}:${id.builtin ?? ''}:${id.customPeer?.toString() ?? ''}:${id.customCounter ?? ''}`;
+}
+
+/**
+ * **FE-5 W-R (2026-06-12)** -- stable key for a {@link StyleIdJson} (`{peer, counter}`),
+ * the visual-style analog of {@link formatIdKey}. Styles have no builtin variant -- every id
+ * is peer-allocated -- so the key is `peer:counter` (peer is a bigint widened from engine u64).
+ */
+function styleIdKey(id: StyleIdJson): string {
+	return `${id.peer.toString()}:${id.counter}`;
 }
 
 /**
@@ -1795,6 +2181,44 @@ export function mergeWorkbookDelta(
 		} else {
 			cached.formats.push(fmt);
 		}
+	}
+
+	// **FE-5 W-R (2026-06-12) -- stylesAdded: merge the newly-registered styles into the cached
+	// styles[] table by FULL StyleId (replace-or-append, the visual-style analog of formatsAdded).**
+	// EMPIRICALLY VERIFIED (2026-06-12): a `registerStyle`/`setStyle` arrives as a REAL delta
+	// (fullRebuildRequired:false) -- the new style in `stylesAdded`, the cell's new styleId in
+	// `changedCells`. Without this merge the cached styles[] stays empty while cells carry styleIds
+	// pointing at it -> the webview resolver fails LOUD ('unresolved') and every styled cell renders
+	// unstyled after the FIRST incremental style edit (the common case). So this is a real
+	// correctness fix, not forward-compat. Sorted by StyleId (peer asc, counter asc -- the engine's
+	// derived Ord) AFTER merging so the cached table stays structurally identical to a fresh
+	// `workbookSnapshot()` (the mergeWorkbookDelta shape-equivalence invariant). The mirror field is
+	// declared OPTIONAL, so seed it to [] on first style if the seed snapshot had none.
+	//
+	// **CLOSURE D4 (2026-06-12)**: this mutates `cached.styles` IN PLACE (push/replace then sort). The array
+	// `extractSheetSnapshot` aliases BY-REFERENCE into a projection is THIS same array, so a projection built
+	// from this cached snapshot will observe these edits if it is retained past this merge. Safe today
+	// (projections are consumed + structured-cloned synchronously before the next merge runs); see the
+	// matching note at `extractSheetSnapshot`'s `result.styles = snapshot.styles` assignment.
+	const stylesAdded = delta.stylesAdded ?? [];
+	if (stylesAdded.length > 0) {
+		const styles: StyleDefJson[] = cached.styles ?? [];
+		for (const def of stylesAdded) {
+			const key = styleIdKey(def.id);
+			const idx = styles.findIndex(s => styleIdKey(s.id) === key);
+			if (idx >= 0) {
+				styles[idx] = def;
+			} else {
+				styles.push(def);
+			}
+		}
+		styles.sort((a, b) => {
+			if (a.id.peer !== b.id.peer) {
+				return a.id.peer < b.id.peer ? -1 : 1;
+			}
+			return a.id.counter - b.id.counter;
+		});
+		cached.styles = styles;
 	}
 
 	// sheetsRemoved: drop sheet entries.  Applied LAST so a changedCell in

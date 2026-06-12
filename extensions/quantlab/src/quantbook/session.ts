@@ -1114,8 +1114,18 @@ const QUANTBOOK_ERROR_CAUSE_MAX_DEPTH = 8;
  * carries its own `schemaVersion`; {@link assertSupportedSchemaVersion} compares
  * it against this constant at the ingest boundary. Bump in lockstep with the
  * engine when a breaking DTO/error/command change lands.
+ *
+ * **FE-5 W-N (2026-06-12): 1 -> 2.** The engine bumped `SCHEMA_VERSION` to 2 when
+ * it added the ADDITIVE `names: NamedRangeJson[]` field to `WorkbookSnapshotJson`
+ * (the defined-name list backing the Name-Manager UI) plus the new `listNames`/
+ * `deleteName` napi reads. The change is additive (a v1 consumer that destructures
+ * `.sheets`/`.formats` is unaffected) but the schema version still steps because
+ * the wire DTO grew a field -- and this guard is EXACT-match, so the IDE mirrors
+ * and the `.node` must move together. There are no v1-only fixtures to migrate
+ * (snapshot DTOs leave `schemaVersion` undefined in hand-built fixtures, which the
+ * guard tolerates as a no-op -- only a REAL napi snapshot now stamps 2).
  */
-export const QUANTBOOK_SCHEMA_VERSION = 1;
+export const QUANTBOOK_SCHEMA_VERSION = 2;
 
 /**
  * **Phase 6.3-1c M5 (2026-05-30):** fail loud if a DTO's `schemaVersion` does not

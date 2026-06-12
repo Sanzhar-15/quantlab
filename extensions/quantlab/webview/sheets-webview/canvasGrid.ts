@@ -26,7 +26,7 @@
 
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { clampDisplayString, formatCellValue, isRenderableValue } from './cellRender';
-import type { CellStyle } from './cellStyleModel';
+import { borderWidthPx, bordersToPaint, type ResolvedBorderEdge, type ResolvedCellStyle } from './cellStyleModel';
 import type { ScrollBlit } from './gridBlitA1';
 import {
 	COL_WIDTH,
@@ -68,10 +68,16 @@ const PUBLISHED_BADGE_PX = 7;
  */
 const DEBUG_BLIT_VERIFY = false;
 
-/** One extra CSS px padded around a damage band's clip so a fractional `rowY-scrollTop` (the renderer
- * rounds paint origins) can never leave a sub-pixel sliver of the band's edge unpainted. Over-painting
- * 1px into an adjacent row is idempotent (that row repaints to its identical current value). */
-const DAMAGE_CLIP_PAD = 1;
+/** Extra CSS px padded around a damage band's clip so a fractional `rowY-scrollTop` (the renderer rounds
+ * paint origins) can never leave a sub-pixel sliver of the band's edge unpainted. Over-painting into an
+ * adjacent row is idempotent (that row repaints to its identical current value).
+ *
+ * **FE-5 W-R (2026-06-12)**: widened from 1 to 3 (the widest border: `thick`/`double` per `borderWidthPx`)
+ * so a damage repaint of a row whose
+ * cell carries a THICK/DOUBLE bottom or top border (up to 3 CSS px, inside-aligned within the cell) cannot
+ * clip the border's far extent. The old 1px pad would have shaved a 3px border down to a 1px sliver on a
+ * style-only damage repaint -- the exact silent-render-miss this wave guards against. Still bounded + idempotent. */
+const DAMAGE_CLIP_PAD = 3;
 
 /**
  * **Brand accent (2026-06-10, supersedes the Sheets-blue constant)** -- the accent that drives every
@@ -296,15 +302,17 @@ export class CanvasGridRenderer {
 	 */
 	private hasPaintedOnce = false;
 	/**
-	 * **Round 5 (2026-06-10) -- client-side cell styling.** A bound lookup of the per-cell VISUAL style
-	 * (`bold`/`italic`/`underline`/`strike`/`halign`/`textColor`/`fillColor`) for the CURRENT sheet,
-	 * supplied by the controller ({@link setStyleLookup}). The renderer stays sheet-agnostic -- it just
-	 * paints the snapshot it was given -- so the controller closes over the active sheet id and rebinds
-	 * this on every sheet switch + after any style edit, then `redraw()`s. Default = "no styling".
-	 * Read at the single cell-paint site ({@link paintCellRegion}); the engine has no style model, so
-	 * this is the only source of cell styling (a documented session-scoped render-layer feature).
-	 */
-	private styleAt: (row: number, col: number) => CellStyle | undefined = () => undefined;
+	 * **Round 5 (2026-06-10) / FE-5 W-R (2026-06-12) -- per-cell visual styling.** A bound lookup of the
+	 * per-cell {@link ResolvedCellStyle} (`bold`/`italic`/`underline`/`strike`/`halign`/`textColor`/
+	 * `fillColor`/per-edge `borders`) for the CURRENT sheet, supplied by the controller
+	 * ({@link setStyleLookup}). The renderer stays sheet-agnostic + SOURCE-agnostic -- it paints whatever
+	 * {@link ResolvedCellStyle} the lookup returns, whether the controller resolves it from the session
+	 * style store (today's live source) or the engine snapshot's `styles[]`+`styleId` (FE-5's engine-backed
+	 * source, threaded by the conductor). The controller closes over the active sheet id and rebinds this on
+	 * sheet switch + after any style edit, then `redraw()`s. Default = "no styling". Read at the single
+	 * cell-paint site ({@link paintCellRegion}). Borders are an engine-only attribute, so they appear only
+	 * when the lookup resolves from the engine source. */
+	private styleAt: (row: number, col: number) => ResolvedCellStyle | undefined = () => undefined;
 
 	constructor(private readonly canvas: HTMLCanvasElement) {
 		const ctx = canvas.getContext('2d');
@@ -398,13 +406,13 @@ export class CanvasGridRenderer {
 	 * CURRENT sheet. The controller calls this (then `redraw()`) on sheet switch + after any toolbar
 	 * style edit; the lookup closes over the active sheet id so the renderer never needs to know it.
 	 */
-	setStyleLookup(fn: (row: number, col: number) => CellStyle | undefined): void {
+	setStyleLookup(fn: (row: number, col: number) => ResolvedCellStyle | undefined): void {
 		this.styleAt = fn;
 	}
 
 	/** The CSS `font` shorthand prefix a cell's style adds to the body font ('' when none). Shared by
 	 *  {@link styledFont} and the measure-cache key so a width is never reused across fonts. */
-	private stylePrefix(style: CellStyle | undefined): string {
+	private stylePrefix(style: ResolvedCellStyle | undefined): string {
 		if (style === undefined) {
 			return '';
 		}
@@ -413,7 +421,7 @@ export class CanvasGridRenderer {
 
 	/** Compose the body font with optional bold/italic prefixes (Sheets weights: 700 bold). The base
 	 *  `bodyFont` is `"13px <family>"`; we splice the CSS `font` shorthand's leading style/weight tokens. */
-	private styledFont(style: CellStyle | undefined): string {
+	private styledFont(style: ResolvedCellStyle | undefined): string {
 		const prefix = this.stylePrefix(style);
 		return prefix === '' ? this.bodyFont : prefix + this.bodyFont;
 	}
@@ -822,6 +830,100 @@ export class CanvasGridRenderer {
 	}
 
 	/**
+	 * **FE-5 W-R (2026-06-12) -- per-edge cell BORDERS** for every visible cell in the pane. Resolves each
+	 * cell's {@link ResolvedCellStyle} borders and its right/below neighbours' borders, dedups the shared
+	 * seams via {@link bordersToPaint} (own-top+left, cede-bottom+right), and strokes each surviving edge
+	 * INSIDE the cell rect so a thick/double width does not bleed into the neighbour's interior.
+	 *
+	 * Geometry: a cell spans `[x, x+COL_WIDTH) x [y, y+ROW_HEIGHT)` (origins snapped to a whole CSS px,
+	 * matching the gridline/value paint). A border of width `w` is centred `w/2` INSIDE the edge line (top at
+	 * `y + w/2`, bottom at `y + ROW_HEIGHT - w/2`, left/right symmetric), so the whole stroke stays within the
+	 * cell. `double` is two 1px hairlines spanning its 3px nominal width. `dashed`/`dotted` set a dash pattern.
+	 * Each cell's edges paint in their OWN save/restore bracket (strokeStyle/lineWidth/lineDash are cell-local).
+	 *
+	 * O(visible cells) -- one style lookup per cell (plus its two neighbours), bounded by the windowed range
+	 * exactly like the fill + value loops. A no-op when no visible cell carries a border (the common case),
+	 * and entirely a no-op for the session-store render source (which has no borders).
+	 */
+	private paintCellBorders(
+		rowRange: { startIdx: number; endIdx: number },
+		colRange: { startIdx: number; endIdx: number },
+		effScrollTop: number,
+		effScrollLeft: number,
+		gutterW: number,
+	): void {
+		for (let r = rowRange.startIdx; r < rowRange.endIdx; r += 1) {
+			const y = Math.round(rowY(r) - effScrollTop);
+			for (let c = colRange.startIdx; c < colRange.endIdx; c += 1) {
+				const self = this.styleAt(r, c)?.borders;
+				if (self === undefined) {
+					continue; // no border on this cell -- the common case, skip the neighbour lookups
+				}
+				// Dedup the shared seams against the neighbour BELOW (its top == this cell's bottom) and to the
+				// RIGHT (its left == this cell's right). Neighbour-wins keeps one owner per contested seam.
+				const below = this.styleAt(r + 1, c)?.borders;
+				const right = this.styleAt(r, c + 1)?.borders;
+				const toPaint = bordersToPaint(self, below, right);
+				if (toPaint.top === undefined && toPaint.bottom === undefined && toPaint.left === undefined && toPaint.right === undefined) {
+					continue;
+				}
+				const x = Math.round(colX(c, gutterW) - effScrollLeft);
+				this.strokeCellBorders(x, y, toPaint);
+			}
+		}
+	}
+
+	/** Stroke a single cell's surviving border edges INSIDE its `[x, x+COL_WIDTH) x [y, y+ROW_HEIGHT)` rect.
+	 *  Each edge is painted in its own save/restore (strokeStyle/lineWidth/lineDash are per-edge). */
+	private strokeCellBorders(
+		x: number,
+		y: number,
+		edges: { top?: ResolvedBorderEdge; bottom?: ResolvedBorderEdge; left?: ResolvedBorderEdge; right?: ResolvedBorderEdge },
+	): void {
+		const ctx = this.ctx;
+		const x1 = x + COL_WIDTH;
+		const y1 = y + ROW_HEIGHT;
+		// Paint one edge line at the given orientation/position, inside-aligned by its width. `double` draws
+		// two 1px hairlines at the outer + inner extremes of its 3px span; the others a single centred stroke.
+		const paintEdge = (edge: ResolvedBorderEdge, orient: 'h' | 'v', edgeName: 'top' | 'bottom' | 'left' | 'right'): void => {
+			const w = borderWidthPx(edge.style);
+			ctx.save();
+			ctx.strokeStyle = edge.color;
+			if (edge.style === 'dashed') {
+				ctx.setLineDash([4, 2]);
+			} else if (edge.style === 'dotted') {
+				ctx.setLineDash([1, 2]);
+			}
+			// The set of stroke offsets (CSS px, measured INWARD from the edge) -- one centred line for the
+			// solid widths, two hairlines (outer + inner) for `double`.
+			const offsets: Array<{ pos: number; lw: number }> =
+				edge.style === 'double'
+					? [{ pos: 0.5, lw: 1 }, { pos: w - 0.5, lw: 1 }]
+					: [{ pos: w / 2, lw: w }];
+			for (const o of offsets) {
+				ctx.lineWidth = o.lw;
+				ctx.beginPath();
+				if (orient === 'h') {
+					// Top edge measures inward (down) from `y`; bottom edge inward (up) from `y1`.
+					const ly = edgeName === 'top' ? y + o.pos : y1 - o.pos;
+					ctx.moveTo(x, ly);
+					ctx.lineTo(x1, ly);
+				} else {
+					const lx = edgeName === 'left' ? x + o.pos : x1 - o.pos;
+					ctx.moveTo(lx, y);
+					ctx.lineTo(lx, y1);
+				}
+				ctx.stroke();
+			}
+			ctx.restore();
+		};
+		if (edges.top !== undefined) { paintEdge(edges.top, 'h', 'top'); }
+		if (edges.bottom !== undefined) { paintEdge(edges.bottom, 'h', 'bottom'); }
+		if (edges.left !== undefined) { paintEdge(edges.left, 'v', 'left'); }
+		if (edges.right !== undefined) { paintEdge(edges.right, 'v', 'right'); }
+	}
+
+	/**
 	 * **W3 frozen panes** -- paint the cell CONTENT (error tints, gridlines, values, selection range +
 	 * focus box, published badges, fill preview + handle) for one rectangular PANE, clipped to its viewport
 	 * rect `[clipX0, clipX1) x [clipY0, clipY1)`. `effScrollTop`/`effScrollLeft` are the EFFECTIVE scroll for
@@ -902,6 +1004,13 @@ export class CanvasGridRenderer {
 		}
 		ctx.stroke();
 
+		// 2.5 FE-5 W-R (2026-06-12): per-edge cell BORDERS, painted OVER the faint gridlines (so a thin black
+		// border is not washed out by the gridline beneath it) but UNDER the cell text + the selection/range
+		// overlays. Engine-only attribute (borders come only from the engine-style source), so this is a no-op
+		// for the session-store render source. The shared-edge dedup (own-top+left, cede-bottom+right to the
+		// neighbor) prevents a contested seam from double-drawing / phase-mismatching on dashed.
+		this.paintCellBorders(rowRange, colRange, effScrollTop, effScrollLeft, gutterW);
+
 		// 3. Values for the populated cells in the pane. Audit C1-HIGH1: iterate the VISIBLE WINDOW (bounded
 		// ~viewport rows x cols) and look up each cell in the sparse map -- O(visible cells), a hard per-frame
 		// ceiling independent of the snapshot's entry count (a dense FE-1 `qb.show` could be huge).
@@ -917,6 +1026,16 @@ export class CanvasGridRenderer {
 				const entry = this.entryByCell.get(r + ',' + c);
 				if (entry === undefined) {
 					continue; // empty cell -- gridlines only, no fillText
+				}
+				// **FE-5 W-R (2026-06-12) -- style-only blank cell paints NO text.** The host projects a cell
+				// carrying ONLY a style (a fill/border on an otherwise-empty cell) as a `pending` entry with a
+				// `styleId` but NO formula (so its fill/border render -- steps 0 + 2.5 -- and its row enters the
+				// damage diff). Such a cell must NOT show the `(pending)` placeholder text: that text is for a
+				// FORMULA cell still computing (which carries `formula`). So skip the value paint for a pending
+				// entry that has no formula -- it is a fill/border-only cell, not a computing cell. (A real
+				// formula-pending cell keeps its `(pending)` text via the formula presence.)
+				if (entry.value.kind === 'pending' && entry.formula === undefined) {
+					continue;
 				}
 				const x = Math.round(colX(c, gutterW) - effScrollLeft);
 				const isError = errorCells.has(r + ',' + c);

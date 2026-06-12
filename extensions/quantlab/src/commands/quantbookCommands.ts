@@ -55,7 +55,12 @@ import { describeStructuralPlan, parseContextMenuArg, planStructuralOp, type Str
 // thin vscode shells over these (the established cellGrid logic/command split).
 import { buildReplaceAllOps, findHitsInWorkbook, type FindHit, type FindReplaceQuery } from '../quantbook/cellGrid/findReplaceLogic';
 import { buildDefineNameToast, buildNameRange, definedNameRejectionReason, isValidDefinedName } from '../quantbook/cellGrid/nameDefineLogic';
-import type { CollabSessionInstance, SessionInstance } from '../quantbook/types';
+// FE-5 W-N (2026-06-12): the pure cores for the Name Manager (describe a name's target/scope + resolve its
+// Go-To anchor) and the structured-table UI (identifier validation + selection -> TableSpecJson). The
+// commands below are thin vscode shells over these (the established cellGrid logic/command split).
+import { describeScope, describeTarget, goToAnchor, isGoToable } from '../quantbook/cellGrid/nameManagerLogic';
+import { buildTableSpec, isValidTableIdentifier, tableIdentifierRejectionReason } from '../quantbook/cellGrid/tableUiLogic';
+import type { CollabSessionInstance, NamedRangeJson, SessionInstance } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
 
@@ -1599,4 +1604,523 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 		}),
 	);
+
+	// ============================================================================
+	// FE-5 W-N "Name Manager" + Go-To.
+	//
+	// A QuickPick-driven manager over the focused workbook's defined names (the lighter surface that fits
+	// FE-4's QuickPick idiom -- Find/Sort/Switch-Sheet are all QuickPicks). It LISTS every name across BOTH
+	// scopes via `session.listNames()`, then offers a per-name action menu (Go-To / Rename / Delete) plus a
+	// "Define new name..." entry that defers to the existing `quantlab.quantbookDefineName` command.
+	//
+	// **REFRESH CONTRACT (engine GROUND TRUTH)**: `setName`/`deleteName` are delta-, epoch-, AND
+	// token-INVISIBLE -- a `snapshotDelta` after a name change is EMPTY with an UNCHANGED token. So after a
+	// rename/delete this command RE-READS via `listNames()` and re-opens the picker; it NEVER waits on a
+	// delta/token change. The engine sorts the list (workbook-scoped first, then sheetId, then name), so the
+	// re-render order is stable.
+	//
+	// **Go-To** resolves the name's target -> its anchor (top-left) cell (nameManagerLogic.goToAnchor); if
+	// the name is on another sheet it switches the panel to that sheet FIRST (via CellGridPanel.show, which
+	// reveals + switches in place), then posts the W-F `navigateTo` (CellGridPanel.navigateToCell). Only
+	// Cell/Range targets are go-to-able; Constant/Formula names have no anchor and their Go-To action is
+	// disabled (No-Fallbacks: no fabricated A1 landing).
+
+	// Resolve the focused grid's session for the Name Manager (the whole workbook is the scope). A loud
+	// "open/focus a grid" toast when none is focused (No-Fallbacks).
+	const resolveFocusedSessionForNames = (): SessionInstance | undefined => {
+		const focused = CellGridPanel.focusedLocalPanel();
+		if (focused === undefined) {
+			void vscode.window.showInformationMessage('Quantbook: open and focus a Cell Grid first -- the Name Manager lists the focused workbook\'s names.');
+			return undefined;
+		}
+		return focused.session;
+	};
+
+	// Build a `(sheetId) -> sheetName` resolver from a fresh snapshot, for the manager's target/scope labels.
+	// Returns `undefined` for a gone sheet (a dangling target/scope the engine still tracks -- the logic
+	// surfaces `#<id>` rather than inventing a name).
+	const buildSheetNameResolver = (session: SessionInstance): ((sheetId: number) => string | undefined) => {
+		const sheets = session.snapshot().sheets;
+		const byId = new Map<number, string>(sheets.map((s) => [s.id, s.name] as const));
+		return (sheetId: number): string | undefined => byId.get(sheetId);
+	};
+
+	// FE-5 W-N: the Name Manager. Lists every defined name; a pick opens its per-name action menu.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookNameManager', async () => {
+			const session = resolveFocusedSessionForNames();
+			if (session === undefined) {
+				return;
+			}
+			const log = getOutput();
+			// Re-read on every (re)entry so the list reflects the latest define/rename/delete (the
+			// token-invisible refresh contract -- listNames is the ONLY truth, never a cached delta).
+			while (true) {
+				let names: NamedRangeJson[];
+				let sheetNameFor: (sheetId: number) => string | undefined;
+				try {
+					names = session.listNames();
+					sheetNameFor = buildSheetNameResolver(session);
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`FATAL nameManager listNames error: ${detail}`);
+					void vscode.window.showErrorMessage(`Quantbook Name Manager failed: ${detail}`);
+					return;
+				}
+				// A top "Define new name..." entry is always available; the named entries follow. A single
+				// flat item shape (`name` optional, absent on the "define" row) so showQuickPick's overload
+				// resolves to the object form (an intersection-with-union collapses to the string overload).
+				// NB: `kind` is reserved by vscode.QuickPickItem (separator vs default) -- use `itemKind`.
+				interface ManagerItem extends vscode.QuickPickItem {
+					readonly itemKind: 'define' | 'name';
+					readonly name?: NamedRangeJson;
+				}
+				const items: ManagerItem[] = [
+					{ label: '$(add) Define new name...', detail: 'Bind a new name to the current selection', itemKind: 'define' },
+					...names.map((nr): ManagerItem => ({
+						label: nr.name,
+						description: describeScope(nr, sheetNameFor),
+						detail: describeTarget(nr.target, sheetNameFor),
+						itemKind: 'name',
+						name: nr,
+					})),
+				];
+				const picked = await vscode.window.showQuickPick<ManagerItem>(
+					items,
+					{
+						title: names.length === 0 ? 'Name Manager -- no names defined yet' : `Name Manager -- ${names.length} name(s)`,
+						placeHolder: names.length === 0 ? 'Select "Define new name..." to create one' : 'Select a name to Go-To / Rename / Delete it',
+						matchOnDescription: true,
+						matchOnDetail: true,
+					},
+				);
+				if (picked === undefined) {
+					return; // dismissed -> close the manager
+				}
+				if (picked.itemKind === 'define' || picked.name === undefined) {
+					// Defer to the existing Define-Name command (selection-based; its own validation + toast).
+					await vscode.commands.executeCommand('quantlab.quantbookDefineName');
+					continue; // re-read + re-open the manager so the new name shows
+				}
+				const action = await pickNameAction(picked.name, sheetNameFor);
+				if (action === 'back') {
+					continue; // re-open the list
+				}
+				if (action === 'closed') {
+					return; // dismissed the action menu
+				}
+				// goto / rename / delete each handle their own re-read; loop to re-open the manager after.
+				const outcome = await runNameAction(context, session, picked.name, action, log);
+				if (outcome === 'closed') {
+					return;
+				}
+				// 'reopen' (success or recoverable failure already surfaced) -> loop to re-read + re-render.
+			}
+		}),
+	);
+
+	// FE-5 W-N: a direct "Go to Name..." command (palette + keyboard-fast) -- pick a name, jump to its anchor.
+	// Constant/Formula names are filtered OUT of this picker (they have no anchor to go to).
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookGoToName', async () => {
+			const session = resolveFocusedSessionForNames();
+			if (session === undefined) {
+				return;
+			}
+			const log = getOutput();
+			let names: NamedRangeJson[];
+			let sheetNameFor: (sheetId: number) => string | undefined;
+			try {
+				names = session.listNames();
+				sheetNameFor = buildSheetNameResolver(session);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL goToName listNames error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook Go to Name failed: ${detail}`);
+				return;
+			}
+			const goToable = names.filter((nr) => isGoToable(nr.target));
+			if (goToable.length === 0) {
+				void vscode.window.showInformationMessage(
+					names.length === 0
+						? 'Quantbook: no names defined yet -- run "Quantbook: Name Manager..." to define one.'
+						: 'Quantbook: no names point to a cell/range to go to (only constant/formula names exist).',
+				);
+				return;
+			}
+			type NameItem = vscode.QuickPickItem & { name: NamedRangeJson };
+			const picked = await vscode.window.showQuickPick<NameItem>(
+				goToable.map((nr): NameItem => ({
+					label: nr.name,
+					description: describeScope(nr, sheetNameFor),
+					detail: describeTarget(nr.target, sheetNameFor),
+					name: nr,
+				})),
+				{ title: 'Go to Name', placeHolder: 'Select a name to select + reveal its range', matchOnDetail: true },
+			);
+			if (picked === undefined) {
+				return;
+			}
+			await navigateToName(context, session, picked.name, log);
+		}),
+	);
+
+	// FE-5 W-T "Structured Tables": create a table from the focused grid's selection (thin UI over the live
+	// napi createTable). Rename / drop are QuickPick-driven over the existing names. A table op bumps the
+	// epoch, so we refreshSession (reseed from a fresh snapshot) after a successful create/drop.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookCreateTable', async (...args: unknown[]) => {
+			const resolved = resolveMenuOrFocusedSelection(args.length > 0, args[0]);
+			if (resolved.kind === 'invalid-arg') {
+				void vscode.window.showErrorMessage('Quantbook: create table failed -- the right-click menu sent an invalid cell context. Try selecting the range and re-running.');
+				return;
+			}
+			if (resolved.kind === 'panel-gone') {
+				void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+				return;
+			}
+			if (resolved.kind === 'no-selection') {
+				void vscode.window.showInformationMessage('Select the table\'s range in a Cell Grid first (including its header row).');
+				return;
+			}
+			const sel = resolved.value;
+			const name = await vscode.window.showInputBox({
+				title: 'Create Table',
+				prompt: 'Name for the new table (shares the defined-name namespace)',
+				placeHolder: 'e.g. Returns or PriceHistory',
+				validateInput: (value) => tableIdentifierRejectionReason(value),
+			});
+			if (name === undefined) {
+				return; // dismissed
+			}
+			if (!isValidTableIdentifier(name)) {
+				void vscode.window.showErrorMessage(`Quantbook: "${name}" is not a valid table name.`);
+				return;
+			}
+			const log = getOutput();
+			let spec;
+			try {
+				spec = buildTableSpec(name, sel.sheet, sel.selection.anchorRow, sel.selection.anchorCol, sel.selection.focusRow, sel.selection.focusCol);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL createTable spec error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook create table failed: ${detail}`);
+				return;
+			}
+			try {
+				sel.session.createTable(spec);
+				log.appendLine(`Created table "${name}" (${spec.rows}x${spec.cols} at sheet ${spec.sheet}, top ${spec.topRow},${spec.topCol}).`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL createTable error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook create table failed: ${detail}`);
+				return;
+			}
+			// **CLOSURE F1 (2026-06-12)**: recalc BEFORE reseeding, mirroring the dropTable path, so any
+			// dependent the table-create DID dirty is healed before the panel repaints. NB (engine ground
+			// truth): the engine binds name references eagerly at setFormula time and REJECTS a formula over an
+			// unresolved name (`formula_bind`), so there is no stored "#NAME? waiting for this table" formula to
+			// heal on this engine -- the recalc is correct + cheap + harmless either way (we never skip it).
+			recalcDirtyChecked(sel.session);
+			// A table op bumps the epoch -> reseed the panel(s) from a fresh snapshot.
+			const { failed } = CellGridPanel.refreshSession(sel.session);
+			if (failed > 0) {
+				void vscode.window.showWarningMessage('Quantbook: the table was created, but a panel failed to re-render -- run "Quantbook: Refresh Cell Grid".');
+			}
+			void vscode.window.showInformationMessage(`Quantbook: created table "${name}".`);
+		}),
+	);
+
+	// FE-5 W-T: drop a table. QuickPick over the workbook's TABLE-namespaced names is not directly listable
+	// (listNames returns defined names, not tables), so the operator types the table name; the engine raises
+	// `[table_not_found]` for an unknown one (surfaced loud).
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookDropTable', async () => {
+			const session = resolveFocusedSessionForNames();
+			if (session === undefined) {
+				return;
+			}
+			const name = await vscode.window.showInputBox({
+				title: 'Drop Table',
+				prompt: 'Name of the table to drop',
+				placeHolder: 'e.g. Returns',
+				validateInput: (value) => (value.trim().length === 0 ? 'Enter a table name.' : null),
+			});
+			if (name === undefined || name.trim().length === 0) {
+				return;
+			}
+			const confirm = await vscode.window.showWarningMessage(
+				`Drop table "${name}"? Its cells stay in place, but formulas referencing it will become #NAME?.`,
+				{ modal: true },
+				'Drop Table',
+			);
+			if (confirm !== 'Drop Table') {
+				return;
+			}
+			const log = getOutput();
+			try {
+				session.dropTable(name);
+				log.appendLine(`Dropped table "${name}".`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL dropTable error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook drop table failed: ${detail}`);
+				return;
+			}
+			recalcDirtyChecked(session);
+			const { failed } = CellGridPanel.refreshSession(session);
+			if (failed > 0) {
+				void vscode.window.showWarningMessage('Quantbook: the table was dropped, but a panel failed to re-render -- run "Quantbook: Refresh Cell Grid".');
+			}
+			void vscode.window.showInformationMessage(`Quantbook: dropped table "${name}".`);
+		}),
+	);
+}
+
+// FE-5 W-N: present the per-name action menu (Go-To / Rename / Delete). Go-To is DISABLED (and labelled so)
+// for a Constant/Formula name (no anchor). Returns the chosen action, `'back'` to return to the list, or
+// `'closed'` when dismissed.
+async function pickNameAction(
+	name: NamedRangeJson,
+	sheetNameFor: (sheetId: number) => string | undefined,
+): Promise<'goto' | 'rename' | 'delete' | 'back' | 'closed'> {
+	type ActionItem = vscode.QuickPickItem & { action: 'goto' | 'rename' | 'delete' | 'back' };
+	const goToable = isGoToable(name.target);
+	const items: ActionItem[] = [];
+	items.push({
+		label: goToable ? '$(go-to-file) Go to' : '$(go-to-file) Go to (unavailable)',
+		description: goToable ? describeTarget(name.target, sheetNameFor) : 'constant/formula names have no cell to go to',
+		action: 'goto',
+	});
+	items.push({ label: '$(edit) Rename...', action: 'rename' });
+	items.push({ label: '$(trash) Delete', action: 'delete' });
+	items.push({ label: '$(arrow-left) Back to list', action: 'back' });
+	const picked = await vscode.window.showQuickPick(items, {
+		title: `Name: ${name.name}`,
+		placeHolder: `Action for "${name.name}"`,
+	});
+	if (picked === undefined) {
+		return 'closed';
+	}
+	if (picked.action === 'goto' && !goToable) {
+		void vscode.window.showInformationMessage(`Quantbook: "${name.name}" is a ${name.target.kind} name -- it has no cell to go to.`);
+		return 'back';
+	}
+	return picked.action;
+}
+
+// FE-5 W-N: run a Go-To / Rename / Delete action on a name. Returns `'reopen'` to re-read + re-open the
+// manager (the token-invisible refresh contract), or `'closed'` when the manager should close.
+async function runNameAction(
+	context: vscode.ExtensionContext,
+	session: SessionInstance,
+	name: NamedRangeJson,
+	action: 'goto' | 'rename' | 'delete',
+	log: vscode.OutputChannel,
+): Promise<'reopen' | 'closed'> {
+	if (action === 'goto') {
+		await navigateToName(context, session, name, log);
+		return 'closed'; // navigating closes the manager (the user wants the grid now)
+	}
+	if (action === 'delete') {
+		const confirm = await vscode.window.showWarningMessage(
+			`Delete name "${name.name}"?`,
+			{ modal: true },
+			'Delete',
+		);
+		if (confirm !== 'Delete') {
+			return 'reopen';
+		}
+		try {
+			// scope: undefined for workbook-scoped, the sheet id for sheet-scoped (the same value listNames reported).
+			session.deleteName(name.name, name.scope);
+			log.appendLine(`Deleted name "${name.name}"${name.scope === undefined ? ' (workbook)' : ` (sheet ${name.scope})`}.`);
+			// **CLOSURE F1 (2026-06-12)**: recalc + refresh THIS session's panels after a name delete, mirroring
+			// the dropTable path. The refresh reseeds the panel from a fresh snapshot; the recalc heals any
+			// dependent the engine DID dirty. NB (engine ground truth, pinned in the engine test): the current
+			// engine resolves a name reference at setFormula time and does NOT re-bind a deleted name, so a
+			// =SUM(<deleted name>) formula keeps its cached value -- the recalc cannot turn it into #NAME?
+			// (a tracked ENGINE limitation, not an IDE bug). This recalc is still correct + cheap + harmless and
+			// will heal dependents once the engine re-binds; we never silently skip it.
+			recalcDirtyChecked(session);
+			const deleteRefresh = CellGridPanel.refreshSession(session);
+			if (deleteRefresh.failed > 0) {
+				void vscode.window.showWarningMessage('Quantbook: the name was deleted, but a panel failed to re-render -- run "Quantbook: Refresh Cell Grid".');
+			}
+			void vscode.window.showInformationMessage(`Quantbook: deleted name "${name.name}".`);
+		} catch (err) {
+			// `[name_not_found]` (e.g. another window deleted it) surfaces loud -- never swallowed.
+			const detail = err instanceof Error ? err.message : String(err);
+			log.appendLine(`FATAL deleteName error: ${detail}`);
+			void vscode.window.showErrorMessage(`Quantbook delete name failed: ${detail}`);
+		}
+		return 'reopen'; // re-read via listNames (the token-invisible refresh contract)
+	}
+	// action === 'rename'
+	const newName = await vscode.window.showInputBox({
+		title: `Rename "${name.name}"`,
+		prompt: 'New name',
+		value: name.name,
+		validateInput: (value) => definedNameRejectionReason(value),
+	});
+	if (newName === undefined) {
+		return 'reopen';
+	}
+	if (!isValidDefinedName(newName)) {
+		void vscode.window.showErrorMessage(`Quantbook: "${newName}" is not a valid name.`);
+		return 'reopen';
+	}
+	if (newName === name.name) {
+		return 'reopen'; // no-op rename
+	}
+	// Rename is NOT a native engine op for a defined name: it is define-new + delete-old. Only a Range/Cell
+	// name can be re-created from the IDE's `setName` (which takes a CellRangeJson); a Constant/Formula name
+	// has no setName path, so we refuse rather than silently dropping its target (No-Fallbacks).
+	if (name.target.kind !== 'range' && name.target.kind !== 'cell') {
+		void vscode.window.showWarningMessage(`Quantbook: renaming a ${name.target.kind} name is not supported (only cell/range names can be renamed in this version).`);
+		return 'reopen';
+	}
+	// **CLOSURE F2 (2026-06-12)**: REFUSE renaming a SHEET-SCOPED name. The IDE's `setName(newName, range)`
+	// is workbook-scoped ONLY (the engine's `set_name` always emits `scope: None`), so a define-new +
+	// delete-old rename of a sheet-scoped name (reachable: surfaced from a loaded `.qbook`) would silently
+	// re-create the name at WORKBOOK scope -- a silent scope change. Refuse loud, the same way a
+	// Constant/Formula target is refused above (No-Fallbacks: never silently change a name's scope).
+	if (name.scope !== undefined) {
+		void vscode.window.showWarningMessage(`Quantbook: renaming a sheet-scoped name is not supported (the rename would silently move "${name.name}" to workbook scope). Delete it and re-define it on the sheet instead.`);
+		return 'reopen';
+	}
+	const range = namedTargetToCellRange(name.target);
+	if (range === undefined) {
+		void vscode.window.showErrorMessage('Quantbook rename failed: the name\'s target could not be resolved to a range.');
+		return 'reopen';
+	}
+	// **CLOSURE F4 (2026-06-12)**: pre-check for a name COLLISION with the rename target. `NameTable::set` is
+	// a REPLACE, so renaming A -> B when B already exists would silently DESTROY B's binding (define-new
+	// clobbers B, then delete-old removes A). Match the engine's case-INSENSITIVE `lookup_ci` (it stores a
+	// canonical-cased name) -- compare uppercased, excluding the name being renamed itself. On a hit, confirm
+	// before clobbering rather than destroying B's binding silently. (NB: Define-Name -- the
+	// `quantlab.quantbookDefineName` command -- has the SAME latent clobber issue; the rename path is fixed
+	// here, the Define path is a tracked follow-up.)
+	try {
+		const existing = session.listNames();
+		const targetUpper = newName.toUpperCase();
+		const oldUpper = name.name.toUpperCase();
+		const collides = existing.some((nr) => nr.name.toUpperCase() === targetUpper && nr.name.toUpperCase() !== oldUpper);
+		if (collides) {
+			const proceed = await vscode.window.showWarningMessage(
+				`Quantbook: a name "${newName}" already exists. Renaming "${name.name}" to it will REPLACE the existing "${newName}" binding. Continue?`,
+				{ modal: true },
+				'Replace',
+			);
+			if (proceed !== 'Replace') {
+				return 'reopen';
+			}
+		}
+	} catch (err) {
+		// A failed collision read must NOT silently let the rename proceed (it could clobber). Surface loud.
+		const detail = err instanceof Error ? err.message : String(err);
+		log.appendLine(`FATAL rename collision-check (listNames) error: ${detail}`);
+		void vscode.window.showErrorMessage(`Quantbook rename failed: ${detail}`);
+		return 'reopen';
+	}
+	// **CLOSURE F3 (2026-06-12)** -- HONEST non-atomic reporting. Rename is define-new + delete-old. We do
+	// NOT reorder (delete-first would risk data loss if setName then fails): define the new name FIRST so a
+	// `setName` failure leaves the old name intact (no window with neither name). But if `setName` SUCCEEDS
+	// and `deleteName` then THROWS, BOTH names persist (orphan/duplicate) -- a "rename failed" toast would be
+	// a LIE. Track which step committed and report the true outcome.
+	let setNameCommitted = false;
+	try {
+		session.setName(newName, range);
+		setNameCommitted = true;
+		session.deleteName(name.name, name.scope);
+		log.appendLine(`Renamed name "${name.name}" -> "${newName}".`);
+		void vscode.window.showInformationMessage(`Quantbook: renamed "${name.name}" to "${newName}".`);
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		if (setNameCommitted) {
+			// setName landed; deleteName threw -> BOTH names now exist. Report honestly (No-Fallbacks: do not
+			// claim the rename failed when the new name was in fact created). The re-read on 'reopen' shows
+			// both names, so the operator can delete the leftover old one manually.
+			log.appendLine(`PARTIAL rename: setName("${newName}") committed but deleteName("${name.name}") failed: ${detail}`);
+			void vscode.window.showWarningMessage(`Quantbook: renamed to "${newName}", but the old name "${name.name}" could not be removed -- BOTH now exist. Delete "${name.name}" manually. (${detail})`);
+		} else {
+			log.appendLine(`FATAL rename (setName) error: ${detail}`);
+			void vscode.window.showErrorMessage(`Quantbook rename failed: ${detail}`);
+		}
+		return 'reopen';
+	}
+	// **CLOSURE F1 (2026-06-12)**: recalc + refresh THIS session's panels after a name rename, mirroring the
+	// dropTable / delete-name paths. The refresh reseeds the panel from a fresh snapshot. NB (engine ground
+	// truth): the current engine resolves a name reference at setFormula time and does NOT re-bind on a
+	// define-new/delete-old rename, so a formula referencing the OLD name keeps its cached value (a tracked
+	// ENGINE limitation, not an IDE bug). The recalc is correct + cheap + harmless and heals dependents the
+	// engine DID dirty; we never silently skip it.
+	recalcDirtyChecked(session);
+	const renameRefresh = CellGridPanel.refreshSession(session);
+	if (renameRefresh.failed > 0) {
+		void vscode.window.showWarningMessage('Quantbook: the name was renamed, but a panel failed to re-render -- run "Quantbook: Refresh Cell Grid".');
+	}
+	return 'reopen';
+}
+
+// FE-5 W-N: project a Cell/Range named target back into the CellRangeJson `setName` expects (for rename).
+// A single-cell target becomes a 1x1 range. Returns `undefined` for a non-cell/range kind (the caller
+// guards before calling, but this stays total).
+function namedTargetToCellRange(target: NamedRangeJson['target']): import('../quantbook/types').CellRangeJson | undefined {
+	if (target.kind === 'cell' && target.cell !== undefined) {
+		return { sheet: target.cell.sheet, startRow: target.cell.row, startCol: target.cell.col, endRow: target.cell.row, endCol: target.cell.col };
+	}
+	if (target.kind === 'range' && target.range !== undefined) {
+		return { sheet: target.range.sheet, startRow: target.range.startRow, startCol: target.range.startCol, endRow: target.range.endRow, endCol: target.range.endCol };
+	}
+	return undefined;
+}
+
+// FE-5 W-N: GO-TO a name's anchor. Resolves the target's top-left cell; if it lives on another sheet,
+// switches the panel to that sheet FIRST (CellGridPanel.show reveals + switches in place), then posts the
+// W-F `navigateTo`. Constant/Formula names have no anchor -> a loud info toast (No-Fallbacks: never a
+// fabricated A1 landing). A non-delivery of the navigate message is surfaced loud.
+async function navigateToName(
+	context: vscode.ExtensionContext,
+	session: SessionInstance,
+	name: NamedRangeJson,
+	log: vscode.OutputChannel,
+): Promise<void> {
+	let anchor;
+	try {
+		anchor = goToAnchor(name.target);
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		log.appendLine(`FATAL goToName anchor-resolve error: ${detail}`);
+		void vscode.window.showErrorMessage(`Quantbook go to name failed: ${detail}`);
+		return;
+	}
+	if (anchor === undefined) {
+		void vscode.window.showInformationMessage(`Quantbook: "${name.name}" is a ${name.target.kind} name -- it has no cell to go to.`);
+		return;
+	}
+	// Reveal the panel for this session, switching it to the anchor's sheet IN PLACE (show() is a no-op
+	// reveal+render when already on that sheet). This is the cross-sheet focus the navigateTo contract
+	// requires the host to do BEFORE posting.
+	let panel: CellGridPanel;
+	try {
+		panel = CellGridPanel.show(context, session, anchor.sheet);
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		log.appendLine(`FATAL goToName panel-reveal error: ${detail}`);
+		void vscode.window.showErrorMessage(`Quantbook go to name failed: ${detail}`);
+		return;
+	}
+	try {
+		const delivered = await panel.navigateToCell(anchor.row, anchor.col);
+		if (!delivered) {
+			void vscode.window.showWarningMessage('Quantbook: could not navigate to the name (the grid did not accept the message). Try clicking the grid first, then retry.');
+			return;
+		}
+		log.appendLine(`Go to name "${name.name}" -> sheet ${anchor.sheet} (${anchor.row},${anchor.col}).`);
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		log.appendLine(`FATAL goToName navigate error: ${detail}`);
+		void vscode.window.showErrorMessage(`Quantbook go to name failed: ${detail}`);
+	}
 }

@@ -4926,8 +4926,9 @@ suite('quantbook V3.5.0.2 -- workbookSnapshot napi contract', function () {
 		// Phase 6.3-1c M5 (2026-05-30): + schemaVersion (contract section 4.1
 		// schema-version propagation; stamped on every snapshot DTO).
 		// FE-4 W4 (2026-06-10): + styles (the cell-style registry, additive).
-		assert.deepStrictEqual(keys, ['dateSystem', 'formats', 'schemaVersion', 'sheets', 'styles', 'version'],
-			`FE-4 W4 ship shape is {sheets, formats, styles, dateSystem, version, schemaVersion}; if a later phase adds fields, update this test`);
+		// FE-5 W-N (2026-06-12): + names (the defined-name list; additive, schema 1 -> 2).
+		assert.deepStrictEqual(keys, ['dateSystem', 'formats', 'names', 'schemaVersion', 'sheets', 'styles', 'version'],
+			`FE-5 W-N ship shape is {sheets, formats, styles, names, dateSystem, version, schemaVersion}; if a later phase adds fields, update this test`);
 	});
 
 	test('SheetSnapshotJson shape: id + name + cells fields', () => {
@@ -6224,8 +6225,9 @@ suite('quantbook V3.6.0.3 -- WorkbookSnapshotJson.formats field', function () {
 		const snap = workbookSnapshot(session);
 		const topLevelKeys = Object.keys(snap).sort();
 		// - FE-4 W4 (2026-06-10) added: + styles (cell-style registry)
-		assert.deepStrictEqual(topLevelKeys, ['dateSystem', 'formats', 'schemaVersion', 'sheets', 'styles', 'version'],
-			`FE-4 W4: WorkbookSnapshotJson has exactly { sheets, formats, styles, dateSystem, version, schemaVersion }; got ${JSON.stringify(topLevelKeys)}`);
+		// - FE-5 W-N (2026-06-12) added: + names (defined-name list; additive, schema 1 -> 2)
+		assert.deepStrictEqual(topLevelKeys, ['dateSystem', 'formats', 'names', 'schemaVersion', 'sheets', 'styles', 'version'],
+			`FE-5 W-N: WorkbookSnapshotJson has exactly { sheets, formats, styles, names, dateSystem, version, schemaVersion }; got ${JSON.stringify(topLevelKeys)}`);
 	});
 });
 
