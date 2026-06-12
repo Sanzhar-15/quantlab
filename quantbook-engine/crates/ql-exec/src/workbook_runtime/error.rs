@@ -94,6 +94,19 @@ pub enum RuntimeError {
     #[error("name table error: {0}")]
     Name(#[from] ql_storage::NameTableError),
 
+    /// **FE-5 W-N (2026-06-12):** `WorkbookRuntime::delete_name` /
+    /// `delete_sheet_scoped_name` was called with a name that isn't
+    /// registered in the target scope. `NameTable::clear` is idempotent (a
+    /// silent no-op on a missing key), so deleting a non-existent name is a
+    /// caller error surfaced loud rather than silently swallowed
+    /// (No-Fallbacks). `scope` is `None` for the workbook table, `Some(id)`
+    /// for a sheet-scoped table. The carried `name` is canonical upper case.
+    #[error("defined name {name:?} not found (scope: {scope:?})")]
+    NameNotFound {
+        name: String,
+        scope: Option<SheetId>,
+    },
+
     /// **W5-91 (Phase 4.6.C):** sheet-name validation refused — empty
     /// string, Excel-reserved character, or canonical duplicate.
     /// Surfaces from `WorkbookRuntime::rename_sheet` (and future

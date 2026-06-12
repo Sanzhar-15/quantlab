@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dto::{
     BatchOptions, BatchResult, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue,
-    Diagnostic, DirtyResult, FormatId, PublishedRef, RangeQueryOptions, RangeResult,
+    Diagnostic, DirtyResult, FormatId, NamedRange, PublishedRef, RangeQueryOptions, RangeResult,
     SessionVersion, SheetInfo, Style, StyleId, TableSpec, UndoRedoResult, WorkbookSnapshot,
     WorkbookSnapshotDelta, WriteRangeResult,
 };
@@ -205,6 +205,13 @@ pub trait EngineSession {
     fn move_sheet(&mut self, id: SheetId, index: u32) -> EngineResult<()>;
     /// Define a name bound to a range.
     fn set_name(&mut self, name: &str, target: CellRange) -> EngineResult<()>;
+    /// **FE-5 W-N (2026-06-12):** remove a defined name. `scope: None` targets
+    /// the workbook-scoped table; `scope: Some(id)` a sheet-scoped table.
+    /// A name that isn't registered in the target scope → `NotFound`
+    /// (`name_not_found`) — NOT a silent no-op (No-Fallbacks). This emits a
+    /// compensating `Op::RemoveName` so an undo/redo re-materialization does
+    /// not resurrect the deleted name.
+    fn delete_name(&mut self, name: &str, scope: Option<SheetId>) -> EngineResult<()>;
 
     // Table ops — v1 single-writer (contract §3.3). Name-keyed (canonical
     // uppercase), matching `WorkbookRuntime` tables. Collaborative table-merge
@@ -294,6 +301,13 @@ pub trait EngineSession {
     fn cell(&self, addr: CellAddr) -> EngineResult<Option<CellSnapshot>>;
     /// List (non-tombstoned) sheets.
     fn list_sheets(&self) -> EngineResult<Vec<SheetInfo>>;
+    /// **FE-5 W-N (2026-06-12):** list every defined name in the workbook —
+    /// BOTH workbook-scoped (`scope: None`) AND every sheet's sheet-scoped
+    /// names (`scope: Some(id)`). Sorted (workbook-scoped first, then by sheet
+    /// id, then by name) for a stable order. The same data is carried in
+    /// [`WorkbookSnapshot::names`]; this is the lightweight read for the
+    /// Name-Manager UI without a full cell snapshot.
+    fn list_names(&self) -> EngineResult<Vec<NamedRange>>;
 
     // --- Undo / redo (§3.8) ---
 

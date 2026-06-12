@@ -103,10 +103,10 @@ use ql_session::dto::{
     BatchOptions, BatchResult, BorderEdge as BorderEdgeDto, BorderStyle as BorderStyleDto,
     Borders as BordersDto, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue, ChangedCell,
     DateSystem, Diagnostic, DirtyResult, FormatDef, FormatId, FullRebuildReason,
-    HAlign as HAlignDto, PublishedRef, RangeColumn, RangeQueryOptions, RangeResult, RemovedCell,
-    Rgb as RgbDto, SessionVersion, Severity, SheetInfo, SheetSnapshot, Style as StyleDto, StyleDef,
-    StyleId as StyleIdDto, TableSpec, UndoRedoResult, WorkbookSnapshot, WorkbookSnapshotDelta,
-    WriteRangeResult,
+    HAlign as HAlignDto, NamedRange, NamedTargetDto, PublishedRef, RangeColumn, RangeQueryOptions,
+    RangeResult, RemovedCell, Rgb as RgbDto, SessionVersion, Severity, SheetInfo, SheetSnapshot,
+    Style as StyleDto, StyleDef, StyleId as StyleIdDto, TableSpec, UndoRedoResult,
+    WorkbookSnapshot, WorkbookSnapshotDelta, WriteRangeResult,
 };
 use ql_session::error::{EngineError, EngineResult, ErrorClass};
 use ql_session::function_meta::FunctionMetadata;
@@ -2161,8 +2161,28 @@ impl EngineSession for WorkbookSession {
         let range: ql_types::Range = target.into();
         self.with_runtime(|rt| rt.set_name(name, NamedTarget::Range(range)))
             .map_err(map_runtime_err)
-        // No change-log record: defined names are not part of `WorkbookSnapshot`
-        // / `WorkbookSnapshotDelta`, so a name definition is delta-invisible.
+        // No change-log record: defined names are not part of the incremental
+        // delta surface (`WorkbookSnapshotDelta`), so a name definition is
+        // delta-invisible. They DO surface in the FULL `WorkbookSnapshot.names`
+        // field (FE-5 W-N); the IDE Name-Manager refreshes via `snapshot()`.
+    }
+
+    fn delete_name(&mut self, name: &str, scope: Option<SheetId>) -> EngineResult<()> {
+        self.ensure_ready()?;
+        // Routes to the runtime wrapper, which appends the compensating
+        // `Op::RemoveName` BEFORE the in-memory clear (so a re-materialize
+        // doesn't resurrect the name) and fails loud (`name_not_found`) on a
+        // name that isn't registered in the target scope (No-Fallbacks).
+        match scope {
+            None => self
+                .with_runtime(|rt| rt.delete_name(name))
+                .map_err(map_runtime_err),
+            Some(sheet) => self
+                .with_runtime(|rt| rt.delete_sheet_scoped_name(sheet, name))
+                .map_err(map_runtime_err),
+        }
+        // Like `set_name`, no change-log record: defined-name removal is
+        // delta-invisible; the Name-Manager refreshes via a full `snapshot()`.
     }
 
     fn create_table(&mut self, spec: TableSpec) -> EngineResult<()> {
@@ -2942,12 +2962,17 @@ impl EngineSession for WorkbookSession {
             .collect();
         styles.sort_by_key(|sd| sd.id);
         let date_system = date_system_to_dto(self.workbook.date_system());
+        // **FE-5 W-N:** enumerate BOTH workbook-scoped and every sheet's
+        // sheet-scoped defined names (helper walks both — missing either is a
+        // silent data loss). Sorted for a stable wire shape.
+        let names = collect_named_ranges(&self.workbook);
         Ok(WorkbookSnapshot {
             schema_version: SCHEMA_VERSION,
             sheets,
             formats,
             styles,
             date_system,
+            names,
             version: self.current_version(),
         })
     }
@@ -3139,6 +3164,15 @@ impl EngineSession for WorkbookSession {
             }
         }
         Ok(out)
+    }
+
+    fn list_names(&self) -> EngineResult<Vec<NamedRange>> {
+        self.ensure_readable()?;
+        // Walks BOTH workbook-scoped and every sheet's sheet-scoped names
+        // (same helper as `snapshot().names`). Reads the live workbook
+        // directly — no rebuild — so it reflects the current in-memory state
+        // (incl. a just-applied `delete_name`).
+        Ok(collect_named_ranges(&self.workbook))
     }
 
     // --- Undo / redo (§3.8) ---
@@ -4146,6 +4180,69 @@ fn value_to_cell_value_dense(v: &Value) -> CellValue {
     }
 }
 
+/// **FE-5 W-N (2026-06-12):** project a storage `NamedTarget` into the contract
+/// [`NamedTargetDto`]. TOTAL — all four variants are faithfully representable
+/// (No-Fallbacks: never coerces a `Constant`/`Formula` down to a `Range`). The
+/// `Constant` arm uses `value_to_cell_value_dense`, which represents every
+/// `ql_types::Value` case (including `Blank`) — so no lossy case exists at this
+/// boundary. If a future `NamedTarget` variant is added, this match becomes a
+/// compile error here (the storage enum is in another crate, but this is an
+/// owned, wildcard-free match), forcing an explicit faithful mapping.
+fn named_target_to_dto(target: &ql_storage::NamedTarget) -> NamedTargetDto {
+    match target {
+        ql_storage::NamedTarget::Cell(addr) => NamedTargetDto::Cell {
+            cell: CellAddr::from(*addr),
+        },
+        ql_storage::NamedTarget::Range(range) => NamedTargetDto::Range {
+            range: CellRange::from(*range),
+        },
+        ql_storage::NamedTarget::Constant(value) => NamedTargetDto::Constant {
+            value: value_to_cell_value_dense(value),
+        },
+        ql_storage::NamedTarget::Formula(source) => NamedTargetDto::Formula {
+            source: source.as_ref().to_owned(),
+        },
+    }
+}
+
+/// **FE-5 W-N (2026-06-12):** collect ALL defined names from a workbook — BOTH
+/// workbook-scoped (`Workbook::names`) AND every sheet's sheet-scoped names
+/// (`Sheet::scoped_names`). Missing either scope would be a silent data loss
+/// (the Name-Manager would not show sheet-scoped names), so both are walked.
+/// Returns a deterministically sorted `Vec<NamedRange>`: workbook-scoped first
+/// (`scope: None` sorts before `Some`), then by sheet id, then by name — a
+/// stable wire shape across calls (the underlying `NameTable` is HashMap-backed,
+/// so iteration order is otherwise arbitrary).
+fn collect_named_ranges(workbook: &Workbook) -> Vec<NamedRange> {
+    let mut names: Vec<NamedRange> = Vec::new();
+    // Workbook-scoped.
+    for (name, target) in workbook.names().iter() {
+        names.push(NamedRange {
+            name: name.as_ref().to_owned(),
+            target: named_target_to_dto(target),
+            scope: None,
+        });
+    }
+    // Sheet-scoped — walk EVERY sheet's scoped-name table (including
+    // tombstoned sheets: their scoped names remain in storage and the
+    // owning-session persistence/round-trip preserves them, so surfacing them
+    // keeps the read consistent with what a save would write).
+    for sheet_id in 0..workbook.sheet_count() as SheetId {
+        if let Some(sheet) = workbook.sheet(sheet_id) {
+            for (name, target) in sheet.scoped_names().iter() {
+                names.push(NamedRange {
+                    name: name.as_ref().to_owned(),
+                    target: named_target_to_dto(target),
+                    scope: Some(sheet_id),
+                });
+            }
+        }
+    }
+    // Deterministic order: scope (None < Some) then sheet id then name.
+    names.sort_by(|a, b| a.scope.cmp(&b.scope).then_with(|| a.name.cmp(&b.name)));
+    names
+}
+
 fn storage_format_id_to_dto(id: ql_storage::FormatId) -> FormatId {
     match id {
         ql_storage::FormatId::Builtin(n) => FormatId::Builtin { builtin: n },
@@ -4313,6 +4410,9 @@ fn map_runtime_err(e: RuntimeError) -> EngineError {
         R::OpLog(inner) => map_oplog_err(inner, display),
         // Name / sheet-name validation.
         R::Name(_) => EngineError::new(ErrorClass::BadArgument, "name_reserved", display),
+        // FE-5 W-N: deleting a name that doesn't exist → NotFound (fail loud,
+        // never the silent clear no-op).
+        R::NameNotFound { .. } => EngineError::new(ErrorClass::NotFound, "name_not_found", display),
         R::SheetName(ql_storage::SheetNameError::Duplicate { .. }) => {
             EngineError::new(ErrorClass::Conflict, "sheet_name_duplicate", display)
         }
@@ -11703,5 +11803,292 @@ mod tests {
             fully_bordered_style(),
             "every per-edge border {{style,color}} survives .qbook save→load"
         );
+    }
+
+    // ========================================================================
+    // FE-5 W-N (2026-06-12) — Name Manager engine support.
+    // ========================================================================
+
+    fn range(sheet: SheetId, sr: RowId, sc: ColId, er: RowId, ec: ColId) -> CellRange {
+        CellRange {
+            sheet,
+            start_row: sr,
+            start_col: sc,
+            end_row: er,
+            end_col: ec,
+        }
+    }
+
+    /// **THE critical persistence test (resurrect-on-reload).** Define a name,
+    /// delete it, SAVE to `.qbook`, RELOAD, and assert the name is GONE. An
+    /// in-memory list/delete test is INSUFFICIENT — it passes while the disk
+    /// silently resurrects the name on the next replay. This save→reload
+    /// assertion is the whole point of `Op::RemoveName`.
+    #[test]
+    fn fe5_delete_name_does_not_resurrect_after_save_reload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("names.qbook");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let mut s = WorkbookSession::new();
+            let sheet = s.add_sheet("S", 16384).unwrap();
+            // Define two names; delete one.
+            s.set_name("SALES", range(sheet, 0, 0, 9, 0)).unwrap();
+            s.set_name("COSTS", range(sheet, 0, 1, 9, 1)).unwrap();
+            assert_eq!(s.list_names().unwrap().len(), 2);
+            s.delete_name("SALES", None).unwrap();
+            // In-memory: only COSTS remains.
+            let live: Vec<String> = s
+                .list_names()
+                .unwrap()
+                .into_iter()
+                .map(|n| n.name)
+                .collect();
+            assert_eq!(
+                live,
+                vec!["COSTS".to_string()],
+                "in-memory delete removed SALES"
+            );
+            s.save(path_str).unwrap();
+        }
+
+        // Reload from disk — the deleted name MUST stay gone (no resurrect).
+        let mut s2 = WorkbookSession::new();
+        s2.open(path_str).unwrap();
+        let reloaded: Vec<String> = s2
+            .list_names()
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert_eq!(
+            reloaded,
+            vec!["COSTS".to_string()],
+            "RESURRECT BUG: a deleted name must NOT come back after save→reload"
+        );
+        // And it's gone from the full snapshot too.
+        let snap_names: Vec<String> = s2
+            .snapshot()
+            .unwrap()
+            .names
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert_eq!(snap_names, vec!["COSTS".to_string()]);
+    }
+
+    /// **The undo-after-delete resurrect test (the rematerialize path).**
+    /// `WorkbookSession::rematerialize` (run on EVERY undo/redo) re-derives the
+    /// workbook from `baseline + replay(oplog)`. Without a compensating
+    /// `Op::RemoveName`, the original `Op::SetName` keeps replaying and the
+    /// deleted name resurrects after an unrelated undo. This is a live
+    /// (non-persistence) corruption path — stricter than the save→reload case.
+    #[test]
+    fn fe5_delete_name_does_not_resurrect_after_undo() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_name("SALES", range(sheet, 0, 0, 9, 0)).unwrap();
+        s.delete_name("SALES", None).unwrap();
+        assert!(s.list_names().unwrap().is_empty(), "deleted in-memory");
+        // Make an UNRELATED edit, then undo it — this triggers rematerialize
+        // (baseline + replay(oplog)). The SALES name must NOT come back.
+        s.set_value(addr(sheet, 5, 5), CellValue::Number { number: 1.0 })
+            .unwrap();
+        let r = s.undo().unwrap();
+        assert!(r.consumed, "the unrelated edit was undone");
+        assert!(
+            s.list_names().unwrap().is_empty(),
+            "RESURRECT BUG: a deleted name must NOT come back after an undo's rematerialize"
+        );
+    }
+
+    /// **The redo-after-delete resurrect test (sibling to the undo case).**
+    /// `redo` is symmetric to `undo`: it re-applies the previously-undone command
+    /// and then runs `rematerialize` (`baseline + replay(oplog)`) — the SAME
+    /// re-derivation path that resurrects a deleted name if the compensating
+    /// `Op::RemoveName` is missing. Here we delete a name, make an unrelated edit,
+    /// undo it, then REDO it: the deleted name must STAY gone across the redo's
+    /// rematerialize (the redo only re-applies the unrelated edit; it does NOT
+    /// touch the name, and the `RemoveName` op keeps replaying).
+    #[test]
+    fn fe5_delete_name_does_not_resurrect_after_redo() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_name("SALES", range(sheet, 0, 0, 9, 0)).unwrap();
+        s.delete_name("SALES", None).unwrap();
+        assert!(s.list_names().unwrap().is_empty(), "deleted in-memory");
+        // Unrelated edit → undo it → redo it. Each of undo/redo runs
+        // rematerialize, the resurrect-prone re-derivation path.
+        s.set_value(addr(sheet, 5, 5), CellValue::Number { number: 1.0 })
+            .unwrap();
+        let u = s.undo().unwrap();
+        assert!(u.consumed, "the unrelated edit was undone");
+        assert!(
+            s.list_names().unwrap().is_empty(),
+            "deleted name stays gone after undo"
+        );
+        let r = s.redo().unwrap();
+        assert!(r.consumed, "the unrelated edit was redone");
+        // The redo re-applied the F6 edit (observable) …
+        assert_eq!(
+            s.cell(addr(sheet, 5, 5)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 1.0 }),
+            "redo re-applied the unrelated F6 edit"
+        );
+        // … and the deleted name MUST NOT have resurrected on the redo's
+        // rematerialize.
+        assert!(
+            s.list_names().unwrap().is_empty(),
+            "RESURRECT BUG: a deleted name must NOT come back after a redo's rematerialize"
+        );
+    }
+
+    /// `delete_name` of an unknown name is a LOUD `name_not_found` error
+    /// (NotFound), NOT a silent no-op (No-Fallbacks). And it appends nothing.
+    #[test]
+    fn fe5_delete_unknown_name_errors_loud() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_name("SALES", range(sheet, 0, 0, 9, 0)).unwrap();
+        let err = s.delete_name("NOPE", None).unwrap_err();
+        assert_eq!(err.class, ErrorClass::NotFound);
+        assert_eq!(err.code, "name_not_found");
+        // The existing name is untouched.
+        assert_eq!(s.list_names().unwrap().len(), 1);
+    }
+
+    /// `list_names` walks BOTH workbook-scoped AND sheet-scoped tables, and all
+    /// four `NamedTarget` variants round-trip faithfully (no coercion). We use
+    /// the runtime directly to register Constant/Formula/Cell names (the
+    /// session `set_name` only creates Range), then assert the DTO shapes.
+    #[test]
+    fn fe5_list_names_both_scopes_all_four_variants() {
+        let mut s = WorkbookSession::new();
+        let s0 = s.add_sheet("S0", 16384).unwrap();
+        let s1 = s.add_sheet("S1", 16384).unwrap();
+        // Workbook-scoped, all four variants via the runtime (bypasses the
+        // session's Range-only set_name).
+        s.with_runtime(|rt| {
+            rt.set_name(
+                "ANCHOR",
+                NamedTarget::Cell(ql_types::Address::new(s0, 2, 3)),
+            )
+            .unwrap();
+            rt.set_name(
+                "SALES",
+                NamedTarget::Range(ql_types::Range::new(s0, 0, 0, 9, 0)),
+            )
+            .unwrap();
+            rt.set_name("TAXRATE", NamedTarget::Constant(Value::Number(0.21)))
+                .unwrap();
+            rt.set_name(
+                "PROFIT",
+                NamedTarget::Formula(std::sync::Arc::from("REVENUE - COSTS")),
+            )
+            .unwrap();
+        });
+        // Sheet-scoped on s1.
+        s.with_runtime(|rt| {
+            rt.set_sheet_scoped_name(s1, "LOCALRATE", NamedTarget::Constant(Value::Number(0.05)))
+                .unwrap();
+        });
+
+        let names = s.list_names().unwrap();
+        // 4 workbook-scoped + 1 sheet-scoped.
+        assert_eq!(names.len(), 5);
+
+        let find = |n: &str| names.iter().find(|x| x.name == n).unwrap().clone();
+
+        // Cell variant — faithful (NOT coerced to Range).
+        match find("ANCHOR").target {
+            NamedTargetDto::Cell { cell } => {
+                assert_eq!((cell.sheet, cell.row, cell.col), (s0, 2, 3));
+            }
+            other => panic!("ANCHOR should be Cell, got {other:?}"),
+        }
+        // Range variant.
+        match find("SALES").target {
+            NamedTargetDto::Range { range } => {
+                assert_eq!(range.start_row, 0);
+                assert_eq!(range.end_row, 9);
+            }
+            other => panic!("SALES should be Range, got {other:?}"),
+        }
+        // Constant variant — faithful (NOT coerced to Range).
+        match find("TAXRATE").target {
+            NamedTargetDto::Constant {
+                value: CellValue::Number { number },
+            } => assert_eq!(number, 0.21),
+            other => panic!("TAXRATE should be Constant(Number), got {other:?}"),
+        }
+        // Formula variant — faithful (NOT coerced to Range).
+        match find("PROFIT").target {
+            NamedTargetDto::Formula { source } => assert_eq!(source, "REVENUE - COSTS"),
+            other => panic!("PROFIT should be Formula, got {other:?}"),
+        }
+        // Sheet-scoped entry carries scope = Some(s1).
+        let local = find("LOCALRATE");
+        assert_eq!(local.scope, Some(s1));
+        match local.target {
+            NamedTargetDto::Constant {
+                value: CellValue::Number { number },
+            } => assert_eq!(number, 0.05),
+            other => panic!("LOCALRATE should be Constant(Number), got {other:?}"),
+        }
+
+        // Sort order: workbook-scoped (scope None) first, then by name; the
+        // sheet-scoped LOCALRATE comes last (scope Some sorts after None).
+        assert_eq!(names.last().unwrap().name, "LOCALRATE");
+    }
+
+    /// `.qbook` names round-trip: define names (all variants, both scopes) →
+    /// save → reload → `list_names` matches. Exercises the envelope persistence
+    /// path (distinct from the oplog `RemoveName` path).
+    #[test]
+    fn fe5_qbook_names_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rt.qbook");
+        let path_str = path.to_str().unwrap();
+
+        let (s0, s1);
+        {
+            let mut s = WorkbookSession::new();
+            s0 = s.add_sheet("S0", 16384).unwrap();
+            s1 = s.add_sheet("S1", 16384).unwrap();
+            s.with_runtime(|rt| {
+                rt.set_name("TAXRATE", NamedTarget::Constant(Value::Number(0.21)))
+                    .unwrap();
+                rt.set_name(
+                    "SALES",
+                    NamedTarget::Range(ql_types::Range::new(s0, 0, 0, 9, 0)),
+                )
+                .unwrap();
+                rt.set_sheet_scoped_name(
+                    s1,
+                    "LOCALRATE",
+                    NamedTarget::Constant(Value::Number(0.05)),
+                )
+                .unwrap();
+            });
+            s.save(path_str).unwrap();
+        }
+
+        let mut s2 = WorkbookSession::new();
+        s2.open(path_str).unwrap();
+        let names = s2.list_names().unwrap();
+        assert_eq!(names.len(), 3, "all three names survive save→reload");
+
+        let find = |n: &str| names.iter().find(|x| x.name == n).unwrap().clone();
+        assert!(matches!(
+            find("TAXRATE").target,
+            NamedTargetDto::Constant {
+                value: CellValue::Number { number }
+            } if number == 0.21
+        ));
+        assert!(matches!(find("SALES").target, NamedTargetDto::Range { .. }));
+        let local = find("LOCALRATE");
+        assert_eq!(local.scope, Some(s1));
+        let _ = s0; // silence unused on some paths
     }
 }

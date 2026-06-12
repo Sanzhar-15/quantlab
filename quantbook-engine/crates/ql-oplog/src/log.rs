@@ -566,6 +566,17 @@ mod tests {
                     value: CellWireValue::Number(0.21),
                 },
             },
+            // FE-5 W-N: RemoveName (the compensating op for SetName) must round-trip
+            // too. Cover both scope arms, mirroring SetName's shape: workbook-scoped
+            // (`None`) and sheet-scoped (`Some(id)`).
+            Op::RemoveName {
+                scope: None,
+                name: "TaxRate".to_owned(),
+            },
+            Op::RemoveName {
+                scope: Some(1),
+                name: "LocalRate".to_owned(),
+            },
             Op::AddSheet {
                 name: "Inventory".to_owned(),
                 chunk_rows: 16384,

@@ -207,8 +207,8 @@ assert.equal(sheets[0].name, "Sheet1", "sheet name preserved");
 // --- 6.3-1c M5: every snapshot DTO carries schemaVersion (contract section 4.1) -
 {
   const snap = s.snapshot();
-  assert.equal(snap.schemaVersion, 1, "snapshot carries schemaVersion === 1");
-  console.log("[smoke] 6.3-1c M5: snapshot.schemaVersion === 1");
+  assert.equal(snap.schemaVersion, 2, "snapshot carries schemaVersion === 2");
+  console.log("[smoke] 6.3-1c M5: snapshot.schemaVersion === 2");
 }
 
 // --- 6.3-1c: structured engine error carries NATIVE .code/.class/.retryable ----
@@ -249,7 +249,7 @@ assert.equal(sheets[0].name, "Sheet1", "sheet name preserved");
     { sheet: sheetId, startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
     { includeFormulas: false, includeFormats: false, includeRendered: false },
   );
-  assert.equal(rr.schemaVersion, 1, "RangeResult carries schemaVersion === 1");
+  assert.equal(rr.schemaVersion, 2, "RangeResult carries schemaVersion === 2");
   assert.equal(rr.nRows, 1, "queryRange A1:B1 has 1 row");
   assert.equal(rr.nCols, 2, "queryRange A1:B1 has 2 cols");
   assert.equal(rr.columns.length, 2, "columnar: 2 columns");
@@ -330,7 +330,7 @@ assert.equal(sheets[0].name, "Sheet1", "sheet name preserved");
   s.markVolatilesDirty();
 
   console.log(
-    "[smoke] 6.3-2a read/lifecycle/format/validate OK (queryRange schemaVersion=1, diagnostics-as-data)",
+    "[smoke] 6.3-2a read/lifecycle/format/validate OK (queryRange schemaVersion=2, diagnostics-as-data)",
   );
 }
 
@@ -1095,7 +1095,7 @@ console.log("[smoke] 6.4-2 function registration PASS");
   w.setValue(sh, 2, 3, { kind: "number", number: 77 }); // D3 = 77 (first + only undo step)
   w.recalcDirty();
   const d = w.snapshotDelta(snap0.version);
-  assert.equal(d.schemaVersion, 1, "delta schemaVersion === 1");
+  assert.equal(d.schemaVersion, 2, "delta schemaVersion === 2");
   assert.equal(d.fullRebuildRequired, false, "same-epoch seq-advance is an incremental delta");
   assert.ok(d.version instanceof Uint8Array && d.version.length > 0, "delta carries a version token");
   const hit = d.changedCells.find((c) => c.sheet === sh && c.cell.row === 2 && c.cell.col === 3);

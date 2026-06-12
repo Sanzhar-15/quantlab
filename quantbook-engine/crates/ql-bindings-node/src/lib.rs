@@ -506,6 +506,10 @@ fn classify_delta_op(
         | Op::DropTable { .. }
         | Op::ResizeTable { .. }
         | Op::SetName { .. }
+        // **FE-5 W-N (2026-06-12):** Op::RemoveName is a defined-name change,
+        // delta-invisible like SetName — force a full rebuild so the IDE
+        // refetches the names list via workbookSnapshot (mirrors SetName).
+        | Op::RemoveName { .. }
         | Op::SetLocale { .. }
         | Op::SetReferenceMode { .. }
         | Op::SetDateSystem { .. }
@@ -877,6 +881,204 @@ pub struct StyleDefJson {
     pub style: StyleJson,
 }
 
+/// **FE-5 W-N (2026-06-12):** JS-facing defined-name TARGET — a discriminated
+/// union (the napi convention: `kind` tag + per-variant optional payload,
+/// matching [`CellValueJson`] / [`FormatIdJson`]). Mirrors the four
+/// `ql_session::NamedTargetDto` variants; ALL FOUR round-trip faithfully (a
+/// loaded `.qbook` can carry Constant/Formula names even though the IDE's
+/// `setName` only creates Range — they are NOT coerced down to Range).
+///
+/// **Variant → field mapping** (read the field indicated by `kind`; the others
+/// are absent):
+/// - `Cell`     → `{ kind: "cell", cell: CellAddrJson }`
+/// - `Range`    → `{ kind: "range", range: NamedRangeTargetJson }`
+/// - `Constant` → `{ kind: "constant", value: CellValueJson }`
+/// - `Formula`  → `{ kind: "formula", formula: String }`
+#[napi(object)]
+pub struct NamedTargetJson {
+    pub kind: String,
+    /// Set when `kind == "cell"`.
+    pub cell: Option<CellAddrJson>,
+    /// Set when `kind == "range"`.
+    pub range: Option<NamedRangeTargetJson>,
+    /// Set when `kind == "constant"`.
+    pub value: Option<CellValueJson>,
+    /// Set when `kind == "formula"` (raw source, no leading `=`).
+    pub formula: Option<String>,
+}
+
+/// **FE-5 W-N (2026-06-12):** JS-facing rectangular range for a `Range`-kind
+/// defined-name target. OUTBOUND read shape (engine → JS): all coords are plain
+/// `u32` (lossless from the engine ids), unlike the INBOUND [`CellRangeJson`]
+/// which uses `f64` for boundary validation. Inclusive bounds.
+#[napi(object)]
+pub struct NamedRangeTargetJson {
+    pub sheet: u32,
+    pub start_row: u32,
+    pub start_col: u32,
+    pub end_row: u32,
+    pub end_col: u32,
+}
+
+/// **FE-5 W-N (2026-06-12):** one defined name in the workbook — its canonical
+/// (upper-case) `name`, its [`NamedTargetJson`], and its `scope` (`None` =
+/// workbook-scoped; `Some(sheetId)` = sheet-scoped). Surfaced in
+/// `WorkbookSnapshotJson.names` and returned by `Session.listNames`.
+#[napi(object)]
+pub struct NamedRangeJson {
+    pub name: String,
+    pub target: NamedTargetJson,
+    /// Absent for a workbook-scoped name; the sheet id for a sheet-scoped name.
+    pub scope: Option<u32>,
+}
+
+/// **FE-5 W-N (2026-06-12):** project a storage `ql_storage::NamedTarget`
+/// DIRECTLY into the JS [`NamedTargetJson`] — used by the CollabSession
+/// `workbook_snapshot` path (which holds a rebuilt `ql_storage::Workbook`, not a
+/// `ql_session::WorkbookSnapshot`). TOTAL over all four variants (No-Fallbacks:
+/// a Constant/Formula is never collapsed to a Range). `Constant` reuses the
+/// `CellWireValue` vocabulary via the existing `From<CellWireValue>` —
+/// `CellWireValue::from_value` returns `None` only for `Value::Blank`, which a
+/// named Constant practically never is; that case maps to a `blank` cell value.
+fn named_target_json_from_storage(target: &ql_storage::NamedTarget) -> NamedTargetJson {
+    match target {
+        ql_storage::NamedTarget::Cell(addr) => NamedTargetJson {
+            kind: "cell".to_string(),
+            cell: Some(CellAddrJson {
+                sheet: u32::from(addr.sheet),
+                row: addr.row,
+                col: addr.col,
+            }),
+            range: None,
+            value: None,
+            formula: None,
+        },
+        ql_storage::NamedTarget::Range(r) => NamedTargetJson {
+            kind: "range".to_string(),
+            cell: None,
+            range: Some(NamedRangeTargetJson {
+                sheet: u32::from(r.sheet),
+                start_row: r.start_row,
+                start_col: r.start_col,
+                end_row: r.end_row,
+                end_col: r.end_col,
+            }),
+            value: None,
+            formula: None,
+        },
+        ql_storage::NamedTarget::Constant(v) => {
+            // Map the value through the wire vocabulary; Blank (the only None
+            // case) → a "blank" cell value, faithfully (NOT coerced to Range).
+            let value = match CellWireValue::from_value(v) {
+                Some(wire) => CellValueJson::from(wire),
+                None => CellValueJson {
+                    kind: "blank".to_string(),
+                    number: None,
+                    boolean: None,
+                    text: None,
+                    error: None,
+                },
+            };
+            NamedTargetJson {
+                kind: "constant".to_string(),
+                cell: None,
+                range: None,
+                value: Some(value),
+                formula: None,
+            }
+        }
+        ql_storage::NamedTarget::Formula(src) => NamedTargetJson {
+            kind: "formula".to_string(),
+            cell: None,
+            range: None,
+            value: None,
+            formula: Some(src.as_ref().to_owned()),
+        },
+    }
+}
+
+/// **FE-5 W-N (2026-06-12):** walk a rebuilt `ql_storage::Workbook` for ALL its
+/// defined names (BOTH workbook-scoped AND every sheet's sheet-scoped names —
+/// missing either scope is a silent data loss) and produce a sorted
+/// `Vec<NamedRangeJson>`. Used by the CollabSession `workbook_snapshot` path.
+/// Sort order matches the owning-Session `collect_named_ranges`: workbook-scoped
+/// first, then by sheet id, then by name.
+fn collect_named_ranges_json(workbook: &ql_storage::Workbook) -> Vec<NamedRangeJson> {
+    let mut names: Vec<NamedRangeJson> = Vec::new();
+    for (name, target) in workbook.names().iter() {
+        names.push(NamedRangeJson {
+            name: name.as_ref().to_owned(),
+            target: named_target_json_from_storage(target),
+            scope: None,
+        });
+    }
+    for sheet_id in 0..workbook.sheet_count() as u16 {
+        if let Some(sheet) = workbook.sheet(sheet_id) {
+            for (name, target) in sheet.scoped_names().iter() {
+                names.push(NamedRangeJson {
+                    name: name.as_ref().to_owned(),
+                    target: named_target_json_from_storage(target),
+                    scope: Some(u32::from(sheet_id)),
+                });
+            }
+        }
+    }
+    names.sort_by(|a, b| a.scope.cmp(&b.scope).then_with(|| a.name.cmp(&b.name)));
+    names
+}
+
+/// **FE-5 W-N (2026-06-12):** map a contract [`ql_session::NamedRange`] to the
+/// JS [`NamedRangeJson`]. The `target` projection is TOTAL — every
+/// `NamedTargetDto` variant maps to its faithful JS shape (No-Fallbacks: a
+/// Constant/Formula is never silently collapsed to a Range).
+fn named_range_json_from_session(nr: ql_session::NamedRange) -> NamedRangeJson {
+    let target = match nr.target {
+        ql_session::NamedTargetDto::Cell { cell } => NamedTargetJson {
+            kind: "cell".to_string(),
+            cell: Some(CellAddrJson {
+                sheet: u32::from(cell.sheet),
+                row: cell.row,
+                col: cell.col,
+            }),
+            range: None,
+            value: None,
+            formula: None,
+        },
+        ql_session::NamedTargetDto::Range { range } => NamedTargetJson {
+            kind: "range".to_string(),
+            cell: None,
+            range: Some(NamedRangeTargetJson {
+                sheet: u32::from(range.sheet),
+                start_row: range.start_row,
+                start_col: range.start_col,
+                end_row: range.end_row,
+                end_col: range.end_col,
+            }),
+            value: None,
+            formula: None,
+        },
+        ql_session::NamedTargetDto::Constant { value } => NamedTargetJson {
+            kind: "constant".to_string(),
+            cell: None,
+            range: None,
+            value: Some(cell_value_json_from_session(value)),
+            formula: None,
+        },
+        ql_session::NamedTargetDto::Formula { source } => NamedTargetJson {
+            kind: "formula".to_string(),
+            cell: None,
+            range: None,
+            value: None,
+            formula: Some(source),
+        },
+    };
+    NamedRangeJson {
+        name: nr.name,
+        target,
+        scope: nr.scope.map(u32::from),
+    }
+}
+
 /// **Phase 5.7 V3.5.0.2 (2026-05-24) -- JS-facing cell snapshot.**
 ///
 /// One cell entry in a sheet's snapshot.  `value: None` means the cell has
@@ -1140,6 +1342,20 @@ pub struct WorkbookSnapshotJson {
     /// (the IDE is the producer of that code) rather than a silent shape drift.
     /// napi serializes as `schemaVersion`.
     pub schema_version: u16,
+
+    /// **FE-5 W-N (2026-06-12):** all defined names in the workbook — BOTH
+    /// workbook-scoped (`scope` absent) AND every sheet's sheet-scoped names
+    /// (`scope` = the sheet id). Sorted (workbook-scoped first, then by sheet
+    /// id, then by name) for a stable shape. Empty when none are defined.
+    ///
+    /// The Name-Manager UI is the consumer: defined-name changes are
+    /// delta-INVISIBLE (not in `WorkbookSnapshotDeltaJson`), so the IDE
+    /// refreshes the list via a full `workbookSnapshot()` / `snapshot()` call,
+    /// not via `snapshotDelta`.
+    ///
+    /// **Additive field** (the snapshot schema bumped 1 → 2 alongside this):
+    /// `.sheets`/`.formats`-destructuring consumers are unaffected.
+    pub names: Vec<NamedRangeJson>,
 }
 
 /// **Phase 5.7 V3.6.0.3 D2 (2026-05-24)** -- one format registration
@@ -2855,6 +3071,10 @@ impl CollabSession {
         // `lastSeenVersion` for the next workbookSnapshotDelta call.
         let version_bytes: Buffer = cache_vv.encode().into();
         inner.set_workbook_cache(std::sync::Arc::clone(&workbook), cache_vv);
+        // FE-5 W-N: defined names from the rebuilt workbook (both scopes,
+        // sorted). `set_workbook_cache` above only `Arc::clone`d `workbook`
+        // (no move), so borrowing it here is fine.
+        let names = collect_named_ranges_json(&workbook);
         Ok(WorkbookSnapshotJson {
             sheets,
             formats,
@@ -2863,6 +3083,7 @@ impl CollabSession {
             version: version_bytes,
             // 6.3-1c M5: stamp the contract schema version on every snapshot DTO.
             schema_version: ql_session::SCHEMA_VERSION,
+            names,
         })
     }
 
@@ -5404,6 +5625,12 @@ fn workbook_snapshot_json_from_session(snap: ql_session::WorkbookSnapshot) -> Wo
         // 6.3-1c M5: forward the engine snapshot's own schema_version (contract
         // §4.1) rather than re-deriving — single source of truth on the DTO.
         schema_version: snap.schema_version,
+        // FE-5 W-N: defined names (both scopes; already sorted engine-side).
+        names: snap
+            .names
+            .into_iter()
+            .map(named_range_json_from_session)
+            .collect(),
     }
 }
 
@@ -6951,6 +7178,50 @@ impl Session {
                 .lock()
                 .set_name(&name, range)
                 .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// **FE-5 W-N (2026-06-12):** remove a defined name. `scope` is absent/null
+    /// for a workbook-scoped name (the only kind the IDE's `setName` creates) or
+    /// the sheet id (validated to `u16`) for a sheet-scoped name. A name that
+    /// isn't registered in the target scope surfaces a loud `[name_not_found]`
+    /// (NotFound) — NOT a silent no-op (No-Fallbacks). Persists a compensating
+    /// `Op::RemoveName` so an undo/redo re-materialization does not resurrect the
+    /// deleted name. A defined-name change is delta-invisible
+    /// (`WorkbookSnapshot`/-`Delta`), so the IDE Name-Manager refreshes via a
+    /// full `snapshot()` (or `listNames`). `[invalid_state]` off a Ready session.
+    #[napi(js_name = "deleteName", catch_unwind)]
+    pub fn delete_name(&self, env: Env, name: String, scope: Option<f64>) -> Result<()> {
+        guarded(env, "deleteName", || {
+            let scope = match scope {
+                Some(s) => Some(validate_u16_index("deleteName", "scope", s)?),
+                None => None,
+            };
+            self.inner
+                .lock()
+                .delete_name(&name, scope)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// **FE-5 W-N (2026-06-12):** list every defined name in the workbook — BOTH
+    /// workbook-scoped (`scope` absent) AND every sheet's sheet-scoped names
+    /// (`scope` = sheet id). Sorted (workbook-scoped first, then by sheet id,
+    /// then by name). The lightweight read backing the Name-Manager UI (the same
+    /// data also rides `snapshot().names`). All four target kinds round-trip
+    /// faithfully (`cell` / `range` / `constant` / `formula`).
+    #[napi(js_name = "listNames", catch_unwind)]
+    pub fn list_names(&self, env: Env) -> Result<Vec<NamedRangeJson>> {
+        guarded(env, "listNames", || {
+            let names = self
+                .inner
+                .lock()
+                .list_names()
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(names
+                .into_iter()
+                .map(named_range_json_from_session)
+                .collect())
         })
     }
 

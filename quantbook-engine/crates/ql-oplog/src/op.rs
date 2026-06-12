@@ -14,6 +14,7 @@
 //! | `PutFormula`         | `Workbook::put_formula`                          |
 //! | `ClearFormula`       | `Workbook::clear_formula`                        |
 //! | `SetName`            | `Workbook::set_name`                             |
+//! | `RemoveName`         | `NameTable::clear` (FE-5 W-N delete persistence) |
 //! | `AddSheet`           | `Workbook::add_sheet_with_chunk_rows`            |
 //! | `RegisterFormat`     | `FormatTable::register_at` (W5-80)               |
 //! | `SetCellFormat`      | `CellFormatOverlay::set` / `::clear` (W5-80)     |
@@ -144,6 +145,36 @@ pub enum Op {
         scope: Option<SheetId>,
         name: String,
         target: NamedTargetWire,
+    },
+
+    /// **FE-5 W-N (2026-06-12):** remove a defined name. The compensating
+    /// op for `SetName`: replays to `NameTable::clear` for the named scope.
+    ///
+    /// **Why this op MUST exist (the resurrect-on-replay bug).** `delete_name`
+    /// mutates the live in-memory `NameTable` via `NameTable::clear`, but the
+    /// op log is the source of truth that the workbook is RE-DERIVED from on
+    /// every undo/redo (`WorkbookSession::rematerialize` → `baseline +
+    /// replay(oplog)`) and on any oplog-replay reconstruction path. Without a
+    /// compensating `RemoveName`, the original `SetName` keeps replaying and
+    /// the deleted name silently RESURRECTS the next time the workbook is
+    /// re-materialized. So a delete that emits no op is a latent corruption,
+    /// not merely a persistence gap.
+    ///
+    /// Mirrors [`SetName`]'s shape exactly (same `scope` semantics + wire
+    /// compat): `scope: None` = workbook-scoped (`Workbook::names_mut().clear`);
+    /// `scope: Some(sheet)` = sheet-scoped (`Sheet::scoped_names_mut().clear`).
+    /// The `name` is canonicalized to upper case by the producer (matching
+    /// `NameTable`'s on-write canonicalization), so replay's `clear` — which
+    /// also uppercases — hits the right entry regardless of how it was cased.
+    ///
+    /// Replay is idempotent on a missing name (`NameTable::clear` no-ops a
+    /// non-existent key): a merged/replayed log that removes the same name
+    /// twice converges. A `scope: Some(id)` referencing an unknown sheet
+    /// surfaces as `ReplayError::InvalidSheet` (mirroring `SetName`).
+    RemoveName {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<SheetId>,
+        name: String,
     },
 
     /// Create a new sheet. Mirrors `Workbook::add_sheet_with_chunk_rows`.

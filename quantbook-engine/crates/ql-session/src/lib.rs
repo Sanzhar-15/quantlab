@@ -49,7 +49,13 @@ pub use session::EngineSession;
 /// A DTO carrying an unknown `schema_version` is rejected fail-loud with
 /// [`ErrorClass::Protocol`] (`unsupported_schema_version`) — never coerced
 /// (contract §4.1).
-pub const SCHEMA_VERSION: u16 = 1;
+///
+/// **v2 (FE-5 W-N, 2026-06-12):** [`dto::WorkbookSnapshot`] gained the
+/// additive `names: Vec<NamedRange>` field (the Name-Manager read surface).
+/// The IDE-side mirror lane MUST pin its expected version to 2 to match. The
+/// field is `serde(default, skip_serializing_if)` so an old snapshot blob still
+/// deserializes — but the contract version moves because the DTO shape changed.
+pub const SCHEMA_VERSION: u16 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -130,7 +136,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_one() {
-        assert_eq!(SCHEMA_VERSION, 1);
+    fn schema_version_is_two() {
+        // FE-5 W-N (2026-06-12): bumped 1 → 2 for the additive
+        // WorkbookSnapshot.names field. The IDE mirror pins to this value.
+        assert_eq!(SCHEMA_VERSION, 2);
     }
 }

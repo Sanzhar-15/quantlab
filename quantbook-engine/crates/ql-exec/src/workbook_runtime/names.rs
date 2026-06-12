@@ -145,6 +145,103 @@ impl<'a> WorkbookRuntime<'a> {
 
         Ok(())
     }
+
+    /// **FE-5 W-N (2026-06-12):** remove a workbook-scoped defined name
+    /// through the runtime, emitting `Op::RemoveName { scope: None, .. }`
+    /// into the attached op log (if any). This is the compensating wrapper
+    /// for [`set_name`](Self::set_name).
+    ///
+    /// **Why the op MUST be emitted (the resurrect bug).** `NameTable::clear`
+    /// mutates only the live in-memory table. The op log is what the workbook
+    /// is RE-DERIVED from on every undo/redo (`WorkbookSession::rematerialize`
+    /// → `baseline + replay(oplog)`); without a compensating `Op::RemoveName`,
+    /// the original `Op::SetName` keeps replaying and the deleted name silently
+    /// RESURRECTS. So we append `RemoveName` BEFORE the in-memory clear (the
+    /// same validate→append→mutate ordering as `set_name`, Phase 2B.7 audit
+    /// H3): a failed append leaves both the workbook AND the log unmodified.
+    ///
+    /// **Fail-loud on unknown name (No-Fallbacks).** `NameTable::clear` is
+    /// idempotent (silent no-op on a missing key). A `delete_name` for a name
+    /// that doesn't exist is a caller error, not a no-op — it returns
+    /// [`RuntimeError::NameNotFound`] and appends NOTHING to the log. The
+    /// existence check uses `lookup_ci` so the caller need not pre-canonicalize.
+    pub fn delete_name(&mut self, name: &str) -> Result<(), RuntimeError> {
+        // 1. Fail loud if the name isn't registered (no silent clear no-op).
+        if self.workbook.names().lookup_ci(name).is_none() {
+            return Err(RuntimeError::NameNotFound {
+                name: name.to_ascii_uppercase(),
+                scope: None,
+            });
+        }
+        // 2. Append the compensating op BEFORE mutating (so a failed append
+        //    leaves the workbook untouched — see `set_name`'s H3 ordering).
+        //    Canonicalize the name to upper case to match `NameTable`'s
+        //    on-write canonicalization, so replay's `clear` hits the entry.
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            oplog.append(Op::RemoveName {
+                scope: None,
+                name: name.to_ascii_uppercase(),
+            })?;
+        }
+        // 3. Mutate the live table.
+        self.workbook.names_mut().clear(name);
+        // 4. Notify calcgraph — a removed name invalidates any formula that
+        //    referenced it (same fan-out as a set; over-invalidation is the
+        //    conservative direction, matching `set_name`).
+        if let Some(g) = self.graph.as_deref_mut() {
+            g.on_set_name(name);
+        }
+        Ok(())
+    }
+
+    /// **FE-5 W-N (2026-06-12):** remove a sheet-scoped defined name through
+    /// the runtime, emitting `Op::RemoveName { scope: Some(sheet), .. }`. The
+    /// sheet-scoped compensating wrapper for [`set_sheet_scoped_name`].
+    ///
+    /// Same contract as [`delete_name`](Self::delete_name): validate the sheet
+    /// id, fail loud if the name isn't registered on that sheet's table, then
+    /// append-before-mutate. Invalidates the plan cache like
+    /// `set_sheet_scoped_name` (a sheet-scoped change doesn't bump the
+    /// workbook `NameTable::generation`).
+    pub fn delete_sheet_scoped_name(
+        &mut self,
+        sheet: SheetId,
+        name: &str,
+    ) -> Result<(), RuntimeError> {
+        // 1. Validate sheet id exists.
+        let sheet_count = self.workbook.sheet_count();
+        let sheet_ref = self
+            .workbook
+            .sheet(sheet)
+            .ok_or(RuntimeError::InvalidSheet { sheet, sheet_count })?;
+        // 2. Fail loud if the name isn't registered on this sheet's table.
+        if sheet_ref.scoped_names().lookup_ci(name).is_none() {
+            return Err(RuntimeError::NameNotFound {
+                name: name.to_ascii_uppercase(),
+                scope: Some(sheet),
+            });
+        }
+        // 3. Append the compensating op BEFORE mutating.
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            oplog.append(Op::RemoveName {
+                scope: Some(sheet),
+                name: name.to_ascii_uppercase(),
+            })?;
+        }
+        // 4. Mutate the sheet-scoped table. Sheet existence already validated.
+        self.workbook
+            .sheet_mut(sheet)
+            .expect("sheet existence already validated")
+            .scoped_names_mut()
+            .clear(name);
+        // 5. Calcgraph notification (same fan-out as the workbook-scoped path).
+        if let Some(g) = self.graph.as_deref_mut() {
+            g.on_set_name(name);
+        }
+        // 6. Invalidate the plan cache (mirrors `set_sheet_scoped_name`).
+        self.plan_cache.clear();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -491,5 +588,89 @@ mod tests {
         // Lowercased reference still resolves.
         let v = rt.set_formula(0, 0, 0, "mixedcasename + 1").unwrap();
         assert_eq!(v, Value::Number(6.0));
+    }
+
+    // ===== FE-5 W-N (2026-06-12) — delete_name runtime wrapper =====
+
+    #[test]
+    fn delete_name_emits_remove_op_and_clears() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        let reg = default_registry();
+        let mut log = OpLog::new();
+        let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut log);
+        rt.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+        rt.delete_name("TaxRate").unwrap();
+        drop(rt);
+        // In-memory table is clear.
+        assert!(wb.names().lookup_ci("TaxRate").is_none());
+        // The op log carries SetName THEN RemoveName (append-before-mutate).
+        let ops: Vec<Op> = log.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(&ops[0], Op::SetName { name, .. } if name == "TAXRATE"));
+        match &ops[1] {
+            Op::RemoveName { scope, name } => {
+                assert_eq!(*scope, None);
+                assert_eq!(name, "TAXRATE"); // canonical upper case
+            }
+            other => panic!("expected RemoveName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_name_unknown_errors_and_appends_nothing() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        let reg = default_registry();
+        let mut log = OpLog::new();
+        let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut log);
+        let err = rt.delete_name("NOPE").unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::NameNotFound { scope: None, .. }
+        ));
+        drop(rt);
+        // No op appended for the failed delete.
+        let ops: Vec<Op> = log.iter().collect::<Result<_, _>>().unwrap();
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn delete_sheet_scoped_name_emits_scoped_remove_op() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S");
+        let reg = default_registry();
+        let mut log = OpLog::new();
+        let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut log);
+        rt.set_sheet_scoped_name(s0, "R", NamedTarget::Constant(Value::Number(0.5)))
+            .unwrap();
+        rt.delete_sheet_scoped_name(s0, "R").unwrap();
+        drop(rt);
+        assert!(wb
+            .sheet(s0)
+            .unwrap()
+            .scoped_names()
+            .lookup_ci("R")
+            .is_none());
+        let ops: Vec<Op> = log.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 2);
+        match &ops[1] {
+            Op::RemoveName { scope, name } => {
+                assert_eq!(*scope, Some(s0));
+                assert_eq!(name, "R");
+            }
+            other => panic!("expected scoped RemoveName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_sheet_scoped_name_invalid_sheet_errors() {
+        let mut wb = Workbook::new();
+        let _ = wb.add_sheet("S");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.delete_sheet_scoped_name(42, "R").unwrap_err();
+        assert!(matches!(err, RuntimeError::InvalidSheet { sheet: 42, .. }));
     }
 }

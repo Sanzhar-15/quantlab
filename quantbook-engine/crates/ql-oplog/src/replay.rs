@@ -669,6 +669,36 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             }
             Ok(())
         }
+        Op::RemoveName { scope, name } => {
+            // **FE-5 W-N (2026-06-12):** the compensating replay for the
+            // `SetName` arm above. Routes to `NameTable::clear` for the right
+            // scope so a re-materialized workbook (undo/redo's
+            // `baseline + replay(oplog)`) does NOT resurrect a deleted name.
+            // `clear` uppercases the query + is idempotent on a missing key
+            // (a merged log that removes the same name twice converges).
+            match scope {
+                None => {
+                    // Workbook-scoped (mirrors the `SetName { scope: None }` arm).
+                    workbook.names_mut().clear(name);
+                }
+                Some(sheet) => {
+                    // Sheet-scoped. Validate the sheet id first so an unknown
+                    // id surfaces as InvalidSheet (mirrors `SetName`), not a
+                    // silent no-op that would mask a corrupt log.
+                    let sheet_count = workbook.sheet_count();
+                    let sheet_ref =
+                        workbook
+                            .sheet_mut(*sheet)
+                            .ok_or(ReplayError::InvalidSheet {
+                                index,
+                                sheet: *sheet,
+                                sheet_count,
+                            })?;
+                    sheet_ref.scoped_names_mut().clear(name);
+                }
+            }
+            Ok(())
+        }
         Op::AddSheet { name, chunk_rows } => {
             // **W5-93 (Phase 4.6.E closure):** route through the fallible
             // `try_add_sheet_with_chunk_rows` and surface a clean
@@ -2004,6 +2034,108 @@ mod tests {
             wb.names().lookup_ci("TaxRate"),
             Some(NamedTarget::Constant(Value::Number(n))) if n == 0.21
         ));
+    }
+
+    /// **FE-5 W-N (2026-06-12):** SetName followed by RemoveName replays to a
+    /// workbook with the name GONE. This is the resurrect-bug guard at the
+    /// replay layer: `baseline + replay([SetName, RemoveName])` must NOT carry
+    /// the name (without `RemoveName`, the lone `SetName` would resurrect it).
+    #[test]
+    fn replay_remove_name_clears_workbook_scoped() {
+        let mut log = OpLog::new();
+        log.append(Op::SetName {
+            scope: None,
+            name: "SALES".to_owned(),
+            target: NamedTargetWire::Range {
+                sheet: 0,
+                start_row: 0,
+                start_col: 0,
+                end_row: 9,
+                end_col: 0,
+            },
+        })
+        .unwrap();
+        log.append(Op::RemoveName {
+            scope: None,
+            name: "SALES".to_owned(),
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert!(
+            wb.names().lookup_ci("SALES").is_none(),
+            "RemoveName must clear the name on replay (no resurrect)"
+        );
+    }
+
+    /// Sheet-scoped RemoveName clears the sheet's scoped table.
+    #[test]
+    fn replay_remove_name_clears_sheet_scoped() {
+        let mut log = OpLog::new();
+        log.append(Op::AddSheet {
+            name: "S1".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        log.append(Op::SetName {
+            scope: Some(1),
+            name: "LOCALRATE".to_owned(),
+            target: NamedTargetWire::Constant {
+                value: CellWireValue::Number(0.05),
+            },
+        })
+        .unwrap();
+        log.append(Op::RemoveName {
+            scope: Some(1),
+            name: "LOCALRATE".to_owned(),
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert!(
+            wb.sheet(1)
+                .unwrap()
+                .scoped_names()
+                .lookup_ci("LOCALRATE")
+                .is_none(),
+            "sheet-scoped RemoveName must clear the sheet's scoped name"
+        );
+    }
+
+    /// RemoveName with an unknown sheet scope surfaces InvalidSheet (mirrors
+    /// SetName), not a silent no-op that would mask a corrupt log.
+    #[test]
+    fn replay_remove_name_unknown_sheet_errors() {
+        let mut log = OpLog::new();
+        log.append(Op::RemoveName {
+            scope: Some(42),
+            name: "X".to_owned(),
+        })
+        .unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        assert!(matches!(err, ReplayError::InvalidSheet { sheet: 42, .. }));
+    }
+
+    /// RemoveName of a name that was never set is idempotent (NameTable::clear
+    /// no-ops a missing key) — a merged log that removes twice converges.
+    #[test]
+    fn replay_remove_name_idempotent_on_missing() {
+        let mut log = OpLog::new();
+        log.append(Op::RemoveName {
+            scope: None,
+            name: "GHOST".to_owned(),
+        })
+        .unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert!(wb.names().lookup_ci("GHOST").is_none());
     }
 
     #[test]

@@ -82,6 +82,59 @@ impl From<CellRange> for ql_types::Range {
     }
 }
 
+/// **FE-5 W-N (2026-06-12):** the target a defined name is bound to — a
+/// **discriminated union** on `kind` (contract §4.2), mirroring the four
+/// `ql_storage::NamedTarget` variants. A loaded `.qbook` can carry any of the
+/// four even though the IDE's `setName` only ever creates `Range` today; all
+/// four MUST round-trip faithfully (No-Fallbacks: a `Constant`/`Formula` must
+/// NOT be silently coerced down to a `Range`).
+///
+/// `Constant` reuses [`CellValue`] (which can represent every `ql_types::Value`
+/// case, including `Blank`), so the projection from `NamedTarget` is total — no
+/// lossy variant exists at this boundary. The engine-side projection
+/// (`ql-exec`) is where any future unrepresentable case would fail loud.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum NamedTargetDto {
+    /// A single-cell anchor (`MyRef = $A$1`).
+    Cell {
+        /// The anchored cell.
+        cell: CellAddr,
+    },
+    /// A rectangular range (`Sales = $A$2:$A$1000`).
+    Range {
+        /// The bound range.
+        range: CellRange,
+    },
+    /// A constant value (`TaxRate = 0.21`).
+    Constant {
+        /// The bound value.
+        value: CellValue,
+    },
+    /// A raw formula source, without the leading `=` (`Profit = Revenue - Costs`).
+    Formula {
+        /// The formula source text.
+        source: String,
+    },
+}
+
+/// **FE-5 W-N (2026-06-12):** one defined name in the workbook — its canonical
+/// (upper-case) name, its [`NamedTargetDto`], and its scope. `scope: None` is a
+/// workbook-scoped name; `scope: Some(sheet_id)` is a sheet-scoped name (which
+/// shadows a workbook-scoped name with the same identifier on that sheet, per
+/// Excel canon). Surfaced in [`WorkbookSnapshot::names`] and from the session's
+/// `list_names` read.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NamedRange {
+    /// Canonical (upper-case) defined name.
+    pub name: String,
+    /// What the name resolves to.
+    pub target: NamedTargetDto,
+    /// `None` = workbook scope; `Some(id)` = sheet-scoped on that sheet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<SheetId>,
+}
+
 /// A cell value — a **discriminated union** on `kind` (contract §4.2). Bindings
 /// narrow on `kind`; exactly one payload is present. Maps from
 /// [`ql_types::Value`]: `Number`/`Boolean`/`Text`/`Error`/`Blank` correspond 1:1;
@@ -368,6 +421,17 @@ pub struct WorkbookSnapshot {
     pub styles: Vec<StyleDef>,
     /// Workbook date epoch.
     pub date_system: DateSystem,
+    /// **FE-5 W-N (2026-06-12):** all defined names in the workbook — BOTH
+    /// workbook-scoped (`scope: None`) AND every sheet's sheet-scoped names
+    /// (`scope: Some(id)`). Sorted (workbook-scoped first, then by sheet id,
+    /// then by name) for a stable wire shape. Empty when none are defined.
+    /// The Name-Manager UI is refreshed via a full `snapshot()` (defined-name
+    /// changes are delta-invisible — see `snapshot_delta`).
+    ///
+    /// **Additive field** (schema bumped 1 → 2). `serde(default)` keeps any
+    /// pre-bump serialized snapshot deserializing (the field reads as empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<NamedRange>,
     /// Opaque version token (round-trip into `snapshot_delta`).
     pub version: SessionVersion,
 }
