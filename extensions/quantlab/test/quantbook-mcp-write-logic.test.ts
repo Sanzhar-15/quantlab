@@ -528,6 +528,45 @@ suite('FE-6 M -- set_style: currentCellStyleFromSnapshot + mergeStylePatch', () 
 		assert.strictEqual(styleJsonKey(a), styleJsonKey(b));
 		assert.notStrictEqual(styleJsonKey(a), styleJsonKey(c));
 	});
+
+	// FE-7 (2026-06-13) regression: the toolbar can now set underline/strike/text-color. An MCP set_style
+	// read-modify-write MUST preserve those (the patch shape does not set them yet -- FE-7.1 -- but it must
+	// never STRIP them). Caught by the FE-7 re-audit (silent data-loss class).
+	test('FE-7: mergeStylePatch PRESERVES base underline/strike/textColor through a fill-only patch', () => {
+		const base: StyleJson = { bold: false, italic: false, underline: true, strike: true, textColor: { r: 9, g: 8, b: 7 }, fill: { r: 1, g: 1, b: 1 } };
+		const merged = mergeStylePatch(base, { fill: { r: 255, g: 255, b: 255 } });
+		assert.strictEqual(merged.underline, true, 'underline survives an MCP fill patch');
+		assert.strictEqual(merged.strike, true, 'strike survives');
+		assert.deepStrictEqual(merged.textColor, { r: 9, g: 8, b: 7 }, 'text color survives');
+		assert.deepStrictEqual(merged.fill, { r: 255, g: 255, b: 255 }, 'fill overwritten');
+	});
+
+	test('FE-7: currentCellStyleFromSnapshot carries underline/strike/textColor out of the snapshot (a copy)', () => {
+		const id: StyleIdJson = { peer: 2n, counter: 7 };
+		const snap: WorkbookSnapshotJson = {
+			sheets: [{ id: 0, name: 'S0', cells: [{ row: 0, col: 0, value: { kind: 'number', number: 1 }, styleId: id }] }],
+			formats: [],
+			styles: [{ id, style: { bold: false, italic: false, underline: true, strike: true, textColor: { r: 4, g: 5, b: 6 } } }],
+			dateSystem: 'Excel1900',
+		};
+		const style = currentCellStyleFromSnapshot(snap, 0, 0, 0);
+		assert.strictEqual(style.underline, true);
+		assert.strictEqual(style.strike, true);
+		assert.deepStrictEqual(style.textColor, { r: 4, g: 5, b: 6 });
+		style.textColor!.r = 99;
+		assert.strictEqual(snap.styles![0].style.textColor!.r, 4, 'textColor is a copy, not an alias');
+	});
+
+	test('FE-7: styleJsonKey distinguishes underline/strike/textColor (no wrong-render collision)', () => {
+		const base: StyleJson = { bold: false, italic: false };
+		assert.notStrictEqual(styleJsonKey(base), styleJsonKey({ bold: false, italic: false, underline: true }));
+		assert.notStrictEqual(styleJsonKey(base), styleJsonKey({ bold: false, italic: false, strike: true }));
+		assert.notStrictEqual(styleJsonKey(base), styleJsonKey({ bold: false, italic: false, textColor: { r: 1, g: 1, b: 1 } }));
+		assert.notStrictEqual(
+			styleJsonKey({ bold: false, italic: false, textColor: { r: 1, g: 2, b: 3 } }),
+			styleJsonKey({ bold: false, italic: false, textColor: { r: 3, g: 2, b: 1 } }),
+		);
+	});
 });
 
 // --- set_style: prepare + commit (op-building + interning) -------------------------------------

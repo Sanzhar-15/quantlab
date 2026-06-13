@@ -885,15 +885,14 @@ toolbarEl.addEventListener('click', (e) => {
 				openMenuDropdown(btn, DELETE_ROW_COL_ITEMS, null);
 			}
 			return;
-		// **FE-5 W-R (2026-06-12) -- the toolbar's style controls write to the ENGINE** (the SOLE style
-		// source). Each routes through `runAfterResolvingEdit` like every other mutating chrome action
-		// (resolve the open editor first), operates on the active selection (or active cell), and POSTs a
-		// `setStyle` mutation the host applies via `registerStyle`/`setStyle` + re-renders. Bold/italic
-		// toggle with Excel/Sheets semantics (off iff ALL cells already on) -- the host inspects the
-		// selection. Underline/strikethrough/text-color are NOT engine-schema attributes (the engine style
-		// is bold/italic/fill/align + per-edge borders), so they are PREVIEW-ONLY -- surfaced honestly via
-		// the neutral toast rather than writing a session store the render no longer reads (that split would
-		// make a write show nothing -- the silent-render-miss this wave eliminates).
+		// **FE-5 W-R (2026-06-12) / FE-FONT (2026-06-13) -- the toolbar's style controls write to the ENGINE**
+		// (the SOLE style source). Each routes through `runAfterResolvingEdit` like every other mutating chrome
+		// action (resolve the open editor first), operates on the active selection (or active cell), and POSTs a
+		// `setStyle` mutation the host applies via `registerStyle`/`setStyle` + re-renders. Bold/italic/underline/
+		// strikethrough toggle with Excel/Sheets semantics (off iff ALL cells already on) -- the host inspects the
+		// selection. FE-FONT made the four formerly-dead buttons live: underline/strikethrough are engine boolean
+		// toggles, text color opens the same swatch picker as fill (engine `textColor`), and borders opens the
+		// border picker (engine per-edge borders -- the FE-only live SET path over the FE-4/FE-5 render).
 		case 'bold':
 			runAfterResolvingEdit('Bold', () => toggleSelectionStyle('bold'));
 			return;
@@ -901,10 +900,10 @@ toolbarEl.addEventListener('click', (e) => {
 			runAfterResolvingEdit('Italic', () => toggleSelectionStyle('italic'));
 			return;
 		case 'underline':
-			notifyPreviewOnly('Underline');
+			runAfterResolvingEdit('Underline', () => toggleSelectionStyle('underline'));
 			return;
 		case 'strikethrough':
-			notifyPreviewOnly('Strikethrough');
+			runAfterResolvingEdit('Strikethrough', () => toggleSelectionStyle('strike'));
 			return;
 		case 'align-left':
 			runAfterResolvingEdit('Align left', () => postStyleMutation({ kind: 'align', value: 'left' }, 'Align left'));
@@ -916,15 +915,22 @@ toolbarEl.addEventListener('click', (e) => {
 			runAfterResolvingEdit('Align right', () => postStyleMutation({ kind: 'align', value: 'right' }, 'Align right'));
 			return;
 		case 'text-color':
-			// **FE-5 W-R**: text color is NOT an engine-style attribute (the engine has fill + bold/italic/
-			// align + borders, no glyph color), so this is preview-only -- not a swatch picker that writes a
-			// store the render ignores. (A future engine text-color attribute re-enables a real picker here.)
-			notifyPreviewOnly('Text color');
+			// **FE-FONT (2026-06-13)**: text color IS now an engine-style attribute (`StyleJson.textColor`),
+			// so open the SAME swatch picker as fill -- the chosen swatch POSTs a `setStyle` textColor mutation
+			// the host applies + re-renders (the canvas already paints `textColor`). No editor-resolution
+			// wrapper here: openColorPicker just opens the popover; the swatch click itself resolves the edit.
+			openColorPicker(btn, 'textColor');
 			return;
 		case 'fill-color':
 			// Fill color IS an engine-style attribute -- open the swatch picker; the chosen swatch POSTs a
 			// `setStyle` fill mutation the host applies + re-renders.
 			openColorPicker(btn, 'fillColor');
+			return;
+		case 'borders':
+			// **FE-FONT (2026-06-13)**: borders are fully engine-backed (FE-4 W4 schema + FE-5 W-R render) --
+			// open the border picker (line style + color + edge actions); each edge button POSTs a `border`
+			// setStyle mutation the host applies + re-renders. This is the live SET path over the existing render.
+			openBorderPicker(btn);
 			return;
 		case 'search':
 			// Round 5: the (previously dead) Search button opens the in-sheet find bar. Round-5 audit
@@ -937,7 +943,7 @@ toolbarEl.addEventListener('click', (e) => {
 			resolveEditThen({ kind: 'chrome', label: 'Find', run: openFindBar });
 			return;
 		default:
-			// Still visual-only (print / paint-format / zoom / decimal pair / font family+size / borders /
+			// Still visual-only (print / paint-format / zoom / decimal pair / font family+size /
 			// merge / vertical-align / wrap / filter / sort): genuinely engine-greenfield or out-of-scope
 			// for this preview. Surfaced honestly via a neutral "preview" toast rather than a silent
 			// no-op (the round-5 audit's #1 finding -- a click that does nothing reads as fake).
@@ -1069,16 +1075,22 @@ const renderer = new CanvasGridRenderer(canvasEl);
  */
 
 /**
- * **FE-5 W-R (2026-06-12)** -- the wire shape of a `setStyle` mutation (webview -> host). A local mirror
- * of the host's `StyleMutation` (the webview is esbuild-isolated from the host `cellGridLogic` module, so
- * the union is pinned here; the host re-validates it at the trust boundary). Only the engine-schema
- * attributes: bold/italic toggle, horizontal align, fill color. Underline/strike/text-color are NOT
- * engine attributes -- their toolbar buttons surface as preview-only, NOT through this path.
+ * **FE-5 W-R (2026-06-12) / FE-FONT (2026-06-13)** -- the wire shape of a `setStyle` mutation (webview ->
+ * host). A local mirror of the host's `StyleMutation` (the webview is esbuild-isolated from the host
+ * `cellGridLogic` module, so the union is pinned here; the host re-validates it at the trust boundary). The
+ * engine-schema attributes: bold/italic/underline/strike toggle, horizontal align, fill color, text color,
+ * and per-edge BORDERS. FE-FONT wired the four formerly preview-only buttons (Underline, Strikethrough,
+ * Text-color, Borders) through this path; underline/strike fold into the `toggle` prop union.
  */
+type RgbWire = { r: number; g: number; b: number };
+type BorderStyleWire = 'none' | 'thin' | 'medium' | 'thick' | 'dashed' | 'dotted' | 'double';
+type BorderEdgeSetWire = 'all' | 'outer' | 'top' | 'bottom' | 'left' | 'right' | 'none';
 type StyleMutationWire =
-	| { kind: 'toggle'; prop: 'bold' | 'italic' }
+	| { kind: 'toggle'; prop: 'bold' | 'italic' | 'underline' | 'strike' }
 	| { kind: 'align'; value: 'left' | 'center' | 'right' | null }
-	| { kind: 'fill'; value: { r: number; g: number; b: number } | null };
+	| { kind: 'fill'; value: RgbWire | null }
+	| { kind: 'textColor'; value: RgbWire | null }
+	| { kind: 'border'; edges: BorderEdgeSetWire; style: BorderStyleWire; color: RgbWire };
 
 /** The rect a style op applies to: the active range, or the single active cell. `null` when there is
  *  no active cell / snapshot (nothing to style). */
@@ -1113,9 +1125,11 @@ function postStyleMutation(mutation: StyleMutationWire, undoLabel: string): void
 	});
 }
 
-/** Toggle a boolean style (bold/italic) over the current selection via the engine. */
-function toggleSelectionStyle(prop: 'bold' | 'italic'): void {
-	postStyleMutation({ kind: 'toggle', prop }, prop === 'bold' ? 'Bold' : 'Italic');
+/** Toggle a boolean style (bold/italic/underline/strike) over the current selection via the engine.
+ *  FE-FONT (2026-06-13): underline/strike join bold/italic on the engine toggle path. */
+function toggleSelectionStyle(prop: 'bold' | 'italic' | 'underline' | 'strike'): void {
+	const label = prop === 'bold' ? 'Bold' : prop === 'italic' ? 'Italic' : prop === 'underline' ? 'Underline' : 'Strikethrough';
+	postStyleMutation({ kind: 'toggle', prop }, label);
 }
 
 /**
@@ -1143,19 +1157,24 @@ const COLOR_SWATCHES: readonly string[] = [
 ];
 
 /**
- * **FE-5 W-R (2026-06-12)** -- open the FILL color swatch popover anchored under `anchor` (text color is
- * preview-only -- the engine has no glyph-color attribute). Reuses the shared dropdown lifecycle (tracked
- * via `dropdownEl`/`openMenu` so the capture-phase click-away + window-blur + Escape all close it); `items`
- * is empty so the arrow-key menu nav is a no-op. Each swatch + the reset row applies through
- * `runAfterResolvingEdit` then POSTs a `setStyle` fill mutation to the host (the engine is the sole source).
+ * **FE-5 W-R (2026-06-12) / FE-FONT (2026-06-13)** -- open the color swatch popover anchored under `anchor`
+ * for either the FILL or the TEXT (glyph) color (`which`). Both are engine-style attributes now (FE-FONT
+ * added `textColor`), so this one picker drives both: each swatch + the reset row POSTs the matching
+ * `setStyle` mutation (`fill` / `textColor`) through `runAfterResolvingEdit`. Reuses the shared dropdown
+ * lifecycle (tracked via `dropdownEl`/`openMenu` so the capture-phase click-away + window-blur + Escape all
+ * close it); `items` is empty so the arrow-key menu nav is a no-op.
  */
-function openColorPicker(anchor: HTMLElement, which: 'fillColor'): void {
-	void which; // only 'fillColor' is reachable; the param documents intent + guards a future text-color re-add
+function openColorPicker(anchor: HTMLElement, which: 'fillColor' | 'textColor'): void {
 	if (openMenu !== null && openMenu.anchor === anchor) {
 		closeMenuDropdown();
 		return;
 	}
 	closeMenuDropdown();
+	// Per-target labels so the swatch aria + the undo step + the reset row all read correctly for fill vs text.
+	const isText = which === 'textColor';
+	const swatchLabel = isText ? 'Text color' : 'Fill color';
+	const setLabel = isText ? 'Text color' : 'Fill color';
+	const clearLabel = isText ? 'Automatic text color' : 'No fill';
 	const panel = document.createElement('div');
 	panel.className = 'qb-color-popover';
 	panel.setAttribute('role', 'menu');
@@ -1167,18 +1186,21 @@ function openColorPicker(anchor: HTMLElement, which: 'fillColor'): void {
 		b.className = 'qb-swatch';
 		b.style.background = color;
 		b.title = color;
-		b.setAttribute('aria-label', 'Fill color ' + color);
+		b.setAttribute('aria-label', swatchLabel + ' ' + color);
 		b.addEventListener('mousedown', (ev) => ev.preventDefault());
 		b.addEventListener('click', () => {
 			closeMenuDropdown();
 			const rgb = hexToRgb(color);
 			if (rgb === null) {
 				// No-Fallbacks: a swatch whose hex doesn't parse is dropped LOUD rather than sending a
-				// malformed fill (unreachable -- COLOR_SWATCHES is all #RRGGBB -- but never silently coerce).
-				console.warn('[sheets-webview] dropped a fill swatch with an unparseable hex:', color);
+				// malformed color (unreachable -- COLOR_SWATCHES is all #RRGGBB -- but never silently coerce).
+				console.warn('[sheets-webview] dropped a color swatch with an unparseable hex:', color);
 				return;
 			}
-			runAfterResolvingEdit('Fill color', () => postStyleMutation({ kind: 'fill', value: rgb }, 'Fill color'));
+			runAfterResolvingEdit(setLabel, () => postStyleMutation(
+				isText ? { kind: 'textColor', value: rgb } : { kind: 'fill', value: rgb },
+				setLabel,
+			));
 		});
 		grid.appendChild(b);
 	}
@@ -1186,13 +1208,169 @@ function openColorPicker(anchor: HTMLElement, which: 'fillColor'): void {
 	const reset = document.createElement('button');
 	reset.type = 'button';
 	reset.className = 'qb-menu-item qb-color-reset';
-	reset.textContent = 'No fill';
+	reset.textContent = clearLabel;
 	reset.addEventListener('mousedown', (ev) => ev.preventDefault());
 	reset.addEventListener('click', () => {
 		closeMenuDropdown();
-		runAfterResolvingEdit('No fill', () => postStyleMutation({ kind: 'fill', value: null }, 'No fill'));
+		runAfterResolvingEdit(clearLabel, () => postStyleMutation(
+			isText ? { kind: 'textColor', value: null } : { kind: 'fill', value: null },
+			clearLabel,
+		));
 	});
 	panel.appendChild(reset);
+	const rect = anchor.getBoundingClientRect();
+	panel.style.top = rect.bottom + 2 + 'px';
+	document.body.appendChild(panel);
+	const left = Math.min(rect.left, Math.max(4, window.innerWidth - panel.offsetWidth - 4));
+	panel.style.left = left + 'px';
+	dropdownEl = panel;
+	openMenu = { anchor, menuId: null, items: [], itemEls: [], activeIndex: -1 };
+	anchor.classList.add('is-open');
+	anchor.setAttribute('aria-expanded', 'true');
+}
+
+/**
+ * **FE-FONT (2026-06-13)** -- the border picker's STICKY line-style + color, remembered across opens so a
+ * user can pick "medium / blue" once then click several edge buttons. Defaults to a thin black border (the
+ * Excel default). Both are engine-schema values; `'none'` is NOT a sticky style (clearing is a dedicated
+ * action), so the sticky style is the renderable subset.
+ */
+let borderPickStyle: 'thin' | 'medium' | 'thick' | 'dashed' | 'dotted' | 'double' = 'thin';
+let borderPickColor: RgbWire = { r: 0, g: 0, b: 0 };
+
+/** The line-style choices the border picker offers (the engine's renderable border styles). */
+const BORDER_STYLE_CHOICES: readonly ('thin' | 'medium' | 'thick' | 'dashed' | 'dotted' | 'double')[] = [
+	'thin', 'medium', 'thick', 'dashed', 'dotted', 'double',
+];
+/** The edge-apply actions the border picker offers: a label + the {@link BorderEdgeSetWire} it posts. */
+const BORDER_EDGE_ACTIONS: readonly { label: string; edges: BorderEdgeSetWire }[] = [
+	{ label: 'All borders', edges: 'all' },
+	{ label: 'Outer border', edges: 'outer' },
+	{ label: 'Top border', edges: 'top' },
+	{ label: 'Bottom border', edges: 'bottom' },
+	{ label: 'Left border', edges: 'left' },
+	{ label: 'Right border', edges: 'right' },
+];
+
+/**
+ * **FE-FONT (2026-06-13)** -- open the BORDERS picker anchored under `anchor`. Borders are fully
+ * engine-backed (FE-4 W4 schema + FE-5 W-R render); this is the live SET path. The popover has three rows:
+ * (1) a line-STYLE selector (thin..double), (2) a COLOR swatch row (reusing {@link COLOR_SWATCHES}), and
+ * (3) the EDGE-action buttons (All / Outer / each side) + a "Clear borders" row. Style + color are STICKY
+ * (`borderPickStyle`/`borderPickColor`) so picking them once then clicking several edges applies the same
+ * line; each edge button POSTs a `border` `setStyle` mutation through `runAfterResolvingEdit`. "Clear" posts
+ * `edges:'none'` (the host clears all 4 edges of every selected cell). Reuses the shared dropdown lifecycle
+ * (`dropdownEl`/`openMenu`) so click-away / window-blur / Escape all close it.
+ */
+function openBorderPicker(anchor: HTMLElement): void {
+	if (openMenu !== null && openMenu.anchor === anchor) {
+		closeMenuDropdown();
+		return;
+	}
+	closeMenuDropdown();
+	const panel = document.createElement('div');
+	panel.className = 'qb-color-popover qb-border-popover';
+	panel.setAttribute('role', 'menu');
+
+	// Row 1: the line-style selector. Clicking a style sets the sticky style + highlights it (no post -- the
+	// edge buttons below carry the action). mousedown preventDefault keeps the open cell editor focused (the
+	// toolbar's own mousedown guard chain) so the later edge click resolves it exactly once.
+	const styleRow = document.createElement('div');
+	styleRow.className = 'qb-border-style-row';
+	const styleButtons: HTMLButtonElement[] = [];
+	const syncStyleSelection = (): void => {
+		for (let i = 0; i < styleButtons.length; i += 1) {
+			styleButtons[i].classList.toggle('is-active', BORDER_STYLE_CHOICES[i] === borderPickStyle);
+		}
+	};
+	for (const styleName of BORDER_STYLE_CHOICES) {
+		const sb = document.createElement('button');
+		sb.type = 'button';
+		sb.className = 'qb-menu-item qb-border-style-btn';
+		sb.textContent = styleName;
+		sb.setAttribute('aria-label', 'Border line style ' + styleName);
+		sb.addEventListener('mousedown', (ev) => ev.preventDefault());
+		sb.addEventListener('click', () => {
+			borderPickStyle = styleName;
+			syncStyleSelection();
+		});
+		styleButtons.push(sb);
+		styleRow.appendChild(sb);
+	}
+	syncStyleSelection();
+	panel.appendChild(styleRow);
+
+	// Row 2: the color swatch row -- selecting a swatch sets the sticky color (no post; edges carry it).
+	const grid = document.createElement('div');
+	grid.className = 'qb-swatch-grid';
+	const swatchButtons: { el: HTMLButtonElement; color: string }[] = [];
+	const syncColorSelection = (): void => {
+		for (const { el, color } of swatchButtons) {
+			const rgb = hexToRgb(color);
+			const on = rgb !== null && rgb.r === borderPickColor.r && rgb.g === borderPickColor.g && rgb.b === borderPickColor.b;
+			el.classList.toggle('is-active', on);
+		}
+	};
+	for (const color of COLOR_SWATCHES) {
+		const b = document.createElement('button');
+		b.type = 'button';
+		b.className = 'qb-swatch';
+		b.style.background = color;
+		b.title = color;
+		b.setAttribute('aria-label', 'Border color ' + color);
+		b.addEventListener('mousedown', (ev) => ev.preventDefault());
+		b.addEventListener('click', () => {
+			const rgb = hexToRgb(color);
+			if (rgb === null) {
+				// No-Fallbacks: an unparseable swatch is dropped LOUD, never coerced (unreachable; all #RRGGBB).
+				console.warn('[sheets-webview] dropped a border color swatch with an unparseable hex:', color);
+				return;
+			}
+			borderPickColor = rgb;
+			syncColorSelection();
+		});
+		swatchButtons.push({ el: b, color });
+		grid.appendChild(b);
+	}
+	syncColorSelection();
+	panel.appendChild(grid);
+
+	// Row 3: the edge-apply actions. Each posts a `border` mutation with the sticky style + color. A click
+	// CLOSES the popover then applies (matching the swatch/reset idiom) so the user sees the result immediately.
+	const edgeWrap = document.createElement('div');
+	edgeWrap.className = 'qb-border-edge-actions';
+	for (const action of BORDER_EDGE_ACTIONS) {
+		const eb = document.createElement('button');
+		eb.type = 'button';
+		eb.className = 'qb-menu-item';
+		eb.textContent = action.label;
+		eb.addEventListener('mousedown', (ev) => ev.preventDefault());
+		eb.addEventListener('click', () => {
+			closeMenuDropdown();
+			runAfterResolvingEdit(action.label, () => postStyleMutation(
+				{ kind: 'border', edges: action.edges, style: borderPickStyle, color: borderPickColor },
+				action.label,
+			));
+		});
+		edgeWrap.appendChild(eb);
+	}
+	panel.appendChild(edgeWrap);
+
+	// The "Clear borders" reset row -- posts edges:'none' (style/color are ignored by the host on a clear).
+	const clear = document.createElement('button');
+	clear.type = 'button';
+	clear.className = 'qb-menu-item qb-color-reset';
+	clear.textContent = 'Clear borders';
+	clear.addEventListener('mousedown', (ev) => ev.preventDefault());
+	clear.addEventListener('click', () => {
+		closeMenuDropdown();
+		runAfterResolvingEdit('Clear borders', () => postStyleMutation(
+			{ kind: 'border', edges: 'none', style: 'none', color: borderPickColor },
+			'Clear borders',
+		));
+	});
+	panel.appendChild(clear);
+
 	const rect = anchor.getBoundingClientRect();
 	panel.style.top = rect.bottom + 2 + 'px';
 	document.body.appendChild(panel);

@@ -30,11 +30,11 @@ export type HAlign = 'left' | 'center' | 'right';
 // `StyleDefJson` table into the SHAPE the canvas paints. Pure (no DOM/canvas/vscode), golden-testable.
 //
 // WHY a separate resolved shape (not the engine `StyleJson` directly):
-//   - the engine `StyleJson` carries bold/italic/fill/align + per-edge BORDERS; colors are `{r,g,b}` not
-//     CSS strings -- the canvas wants pre-resolved CSS strings it can assign straight to fillStyle/strokeStyle.
-//   - the engine has NO underline/strike/text-color attribute. `ResolvedCellStyle` still DECLARES those
-//     fields (the canvas paint code reads them), but the engine resolver never SETS them, so they are
-//     always absent on an engine-sourced style -- the matching toolbar buttons are preview-only.
+//   - the engine `StyleJson` carries bold/italic/underline/strike + fill/text-color/align + per-edge BORDERS;
+//     colors are `{r,g,b}` not CSS strings -- the canvas wants pre-resolved CSS strings it can assign straight
+//     to fillStyle/strokeStyle.
+//   - FE-FONT (2026-06-13) added the engine `underline`/`strike`/`textColor` attributes, so the resolver now
+//     SETS those fields (previously declared-but-never-set, the matching toolbar buttons preview-only).
 //   `ResolvedCellStyle` decouples the canvas paint site from the engine `StyleJson` schema. The ONLY source
 //   now is the engine table (via {@link resolveCellStyle}); the retired session store is gone.
 // =============================================================================================
@@ -58,10 +58,10 @@ export interface ResolvedBorders {
 }
 
 /** The unified render-layer style the canvas paints at its single cell-paint site. Every field optional;
- *  an absent field means "renderer default". Sourced from the engine {@link StyleDefJson} (fill + bold/
- *  italic/align + per-edge borders). `underline`/`strike`/`textColor` are declared (the canvas reads them)
- *  but the engine resolver never sets them -- the engine has no such attribute (those buttons are
- *  preview-only); they stay for the canvas paint code's shape + a future engine attribute. */
+ *  an absent field means "renderer default". Sourced from the engine {@link StyleDefJson}: fill + bold/
+ *  italic/underline/strike + text-color/align + per-edge borders. FE-FONT (2026-06-13) made
+ *  `underline`/`strike`/`textColor` live engine attributes the resolver populates (the canvas already
+ *  read them). */
 export interface ResolvedCellStyle {
 	readonly bold?: boolean;
 	readonly italic?: boolean;
@@ -159,12 +159,20 @@ export function resolveCellStyle(
 	if (left !== undefined) { borders.left = left; }
 	if (right !== undefined) { borders.right = right; }
 	const resolved: {
-		bold?: boolean; italic?: boolean; halign?: HAlign; fillColor?: string; borders?: ResolvedBorders;
+		bold?: boolean; italic?: boolean; underline?: boolean; strike?: boolean;
+		halign?: HAlign; textColor?: string; fillColor?: string; borders?: ResolvedBorders;
 	} = {};
 	if (found.bold === true) { resolved.bold = true; }
 	if (found.italic === true) { resolved.italic = true; }
+	// FE-FONT (2026-06-13): underline/strike/textColor are now ENGINE attributes -- populate them from the
+	// StyleJson (the canvas already reads these fields). underline/strike are engine bools (default false ->
+	// not stored); textColor is an engine Option -> a CSS color when present, dropped when malformed.
+	if (found.underline === true) { resolved.underline = true; }
+	if (found.strike === true) { resolved.strike = true; }
 	const halign = resolveAlign(found.align);
 	if (halign !== undefined) { resolved.halign = halign; }
+	const textColor = rgbToCss(found.textColor);
+	if (textColor !== null) { resolved.textColor = textColor; }
 	const fill = rgbToCss(found.fill);
 	if (fill !== null) { resolved.fillColor = fill; }
 	if (top !== undefined || bottom !== undefined || left !== undefined || right !== undefined) {

@@ -683,6 +683,56 @@ body {
 	background: var(--ql-accent-muted);
 }
 
+/* --- FE-FONT (2026-06-13): the BORDERS picker -------------------------------------------------- */
+
+/* The border picker reuses .qb-color-popover's surface; it is a touch wider to fit the line-style row +
+ * the edge-action labels comfortably. */
+.qb-border-popover {
+	min-width: 196px;
+}
+
+/* The line-STYLE selector row (thin / medium / thick / dashed / dotted / double): a wrapping flow of small
+ * chips. The active style chip gets the shared accent wash (.is-active, same as .qb-menu-item). */
+.qb-border-style-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	margin-bottom: 8px;
+}
+
+.qb-border-style-btn {
+	flex: 0 0 auto;
+	padding: 3px 7px;
+	font-family: var(--vscode-font-family);
+	font-size: 11px;
+	color: inherit;
+	background: transparent;
+	border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border));
+	border-radius: 3px;
+	cursor: pointer;
+	text-transform: capitalize;
+}
+
+.qb-border-style-btn:hover,
+.qb-border-style-btn.is-active {
+	background: var(--ql-accent-muted);
+}
+
+/* The edge-apply action buttons (All / Outer / Top / Bottom / Left / Right): one full-width row each,
+ * matching the .qb-menu-item / .qb-color-reset idiom so the whole popover reads as one component. */
+.qb-border-edge-actions {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	margin-top: 8px;
+}
+
+.qb-border-edge-actions .qb-menu-item {
+	width: 100%;
+	text-align: left;
+	border-radius: 3px;
+}
+
 /* Subtle, auto-dismissing toast for intentionally preview-only controls (honest no-silent-no-op).
  * Bottom-right, neutral (NOT the red error banner), fades via opacity. */
 .qb-preview-toast {

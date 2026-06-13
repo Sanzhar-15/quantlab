@@ -663,6 +663,11 @@ export function currentCellStyleFromSnapshot(snapshot: WorkbookSnapshotJson, she
 		);
 	}
 	const copy: StyleJson = { bold: def.style.bold === true, italic: def.style.italic === true };
+	// FE-7: preserve the font attrs (carry-only-when-on, mirroring cellGridLogic.currentCellStyle) so an MCP
+	// set_style read-modify-write NEVER strips a user's toolbar-set underline/strike/text-color (data-loss guard).
+	if (def.style.underline === true) { copy.underline = true; }
+	if (def.style.strike === true) { copy.strike = true; }
+	if (def.style.textColor !== undefined) { copy.textColor = { ...def.style.textColor }; }
 	if (def.style.fill !== undefined) { copy.fill = { ...def.style.fill }; }
 	if (def.style.align !== undefined) { copy.align = def.style.align; }
 	if (def.style.borderTop !== undefined) { copy.borderTop = { style: def.style.borderTop.style, color: { ...def.style.borderTop.color } }; }
@@ -676,6 +681,11 @@ export function currentCellStyleFromSnapshot(snapshot: WorkbookSnapshotJson, she
  *  field overwrites; an absent field is preserved. `borders` patches per edge. Pure. */
 export function mergeStylePatch(base: StyleJson, patch: StylePatchJson): StyleJson {
 	const out: StyleJson = { bold: base.bold === true, italic: base.italic === true };
+	// FE-7: carry the base font attrs forward (the patch shape does not SET them yet -- deferred to FE-7.1 --
+	// but the merge MUST preserve any toolbar-set underline/strike/text-color, else set_style silently clears them).
+	if (base.underline === true) { out.underline = true; }
+	if (base.strike === true) { out.strike = true; }
+	if (base.textColor !== undefined) { out.textColor = { ...base.textColor }; }
 	if (base.fill !== undefined) { out.fill = { ...base.fill }; }
 	if (base.align !== undefined) { out.align = base.align; }
 	if (base.borderTop !== undefined) { out.borderTop = { style: base.borderTop.style, color: { ...base.borderTop.color } }; }
@@ -700,10 +710,16 @@ export function mergeStylePatch(base: StyleJson, patch: StylePatchJson): StyleJs
 export function styleJsonKey(s: StyleJson): string {
 	const edge = (e: BorderEdgeJson | undefined): string => (e === undefined ? '' : `${e.style}@${e.color.r},${e.color.g},${e.color.b}`);
 	const fill = s.fill === undefined ? '' : `${s.fill.r},${s.fill.g},${s.fill.b}`;
+	// FE-7: underline/strike/textColor are render-visible -> MUST be in the dedup key, else two cells differing
+	// only in a font attr collide and one renders the other's style.
+	const textColor = s.textColor === undefined ? '' : `${s.textColor.r},${s.textColor.g},${s.textColor.b}`;
 	return [
 		s.bold === true ? 'b' : '',
 		s.italic === true ? 'i' : '',
+		s.underline === true ? 'u' : '',
+		s.strike === true ? 's' : '',
 		`f:${fill}`,
+		`tc:${textColor}`,
 		`a:${s.align ?? ''}`,
 		`t:${edge(s.borderTop)}`,
 		`bo:${edge(s.borderBottom)}`,

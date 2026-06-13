@@ -161,20 +161,34 @@ export interface SetStyleRequest {
 }
 
 /**
- * **FE-5 W-R (2026-06-12)** -- a single uniform style mutation a {@link SetStyleRequest} carries.
- * Exactly the engine-schema attributes (the SOLE style source): bold/italic toggles, horizontal
- * align, fill color. (Underline/strike/text-color are NOT engine attributes -- the toolbar surfaces
- * them as preview-only, not via this path.)
+ * **FE-5 W-R (2026-06-12) / FE-FONT (2026-06-13)** -- a single uniform style mutation a
+ * {@link SetStyleRequest} carries. The engine-schema attributes (the SOLE style source): bold/italic/
+ * underline/strike toggles, horizontal align, fill color, text color, and per-edge BORDERS.
  *
- * - `toggle`: flip a boolean style (`bold`/`italic`) over the rect with Excel/Sheets semantics -- if
- *   EVERY cell in the rect already has it on, the whole rect is turned OFF, else the whole rect ON.
+ * FE-FONT (2026-06-13) added `underline`/`strike` (folded into the `toggle` prop union), `textColor`,
+ * and `border` -- the four formerly preview-only toolbar buttons. Builder G's engine bump adds
+ * `StyleJson.underline`/`.strike`/`.textColor` (camelCase) + bumps the snapshot schema 3->4; borders
+ * already existed in the engine schema (FE-4 W4), so the `border` variant is FE-only.
+ *
+ * - `toggle`: flip a boolean style (`bold`/`italic`/`underline`/`strike`) over the rect with Excel/Sheets
+ *   semantics -- if EVERY cell in the rect already has it on, the whole rect is turned OFF, else ON.
  * - `align`: set the horizontal align over the rect, or clear it back to `general` with `null`.
  * - `fill`: set the fill color over the rect, or clear it (no fill) with `null`.
+ * - `textColor`: set the glyph color over the rect, or clear it (renderer default) with `null`.
+ * - `border`: set or clear cell borders over the rect. `edges` selects which edges the op touches:
+ *   `all` = the 4 edges of every cell; `outer` = only the rect's OUTER box (top row's top, bottom row's
+ *   bottom, left col's left, right col's right); `top`/`bottom`/`left`/`right` = that single edge on every
+ *   cell; `none` = CLEAR all 4 edges of every cell (`style`/`color` are ignored). For the non-`none`
+ *   variants, a `style` of `'none'` CLEARS the named edges (so the picker's "no border" line maps to it).
  */
+export type BorderStyleName = 'none' | 'thin' | 'medium' | 'thick' | 'dashed' | 'dotted' | 'double';
+export type BorderEdgeSet = 'all' | 'outer' | 'top' | 'bottom' | 'left' | 'right' | 'none';
 export type StyleMutation =
-	| { kind: 'toggle'; prop: 'bold' | 'italic' }
+	| { kind: 'toggle'; prop: 'bold' | 'italic' | 'underline' | 'strike' }
 	| { kind: 'align'; value: 'left' | 'center' | 'right' | null }
-	| { kind: 'fill'; value: RgbJson | null };
+	| { kind: 'fill'; value: RgbJson | null }
+	| { kind: 'textColor'; value: RgbJson | null }
+	| { kind: 'border'; edges: BorderEdgeSet; style: BorderStyleName; color: RgbJson };
 
 /**
  * V3.2.b.1 decision B1 envelope: incoming (extension host -> webview)
@@ -508,7 +522,10 @@ export function buildBatchOps(sheet: number, cells: readonly { row: number; col:
 export const MAX_STYLE_CELLS = 100_000;
 
 /** All-default {@link StyleJson} (no visible style). The base a mutation patches when a cell carries
- *  no style yet; also the result of clearing every attribute. */
+ *  no style yet; also the result of clearing every attribute. `underline`/`strike` (FE-FONT, optional like
+ *  the engine's default-false bools) + `textColor` are left ABSENT here -- absent reads as off everywhere
+ *  (`=== true` / `styleJsonKey` collapse), matching the existing `fill`/`align`-absent convention. A toggle
+ *  ON sets the field explicitly; a toggle OFF sets it to `false` (which `styleJsonKey` still collapses). */
 function defaultStyleJson(): StyleJson {
 	return { bold: false, italic: false };
 }
@@ -547,9 +564,14 @@ export function currentCellStyle(
 		);
 	}
 	// Deep-ish copy: the top-level scalars + a fresh copy of each present sub-object so a patch
-	// (e.g. setting fill) cannot mutate the snapshot's shared StyleDefJson.
+	// (e.g. setting fill) cannot mutate the snapshot's shared StyleDefJson. FE-FONT (2026-06-13):
+	// carry underline/strike ONLY when on (optional, like fill/align -- an absent field reads as off
+	// everywhere) + textColor (engine Option, absent = renderer-default glyph color).
 	const copy: StyleJson = { bold: def.style.bold === true, italic: def.style.italic === true };
+	if (def.style.underline === true) { copy.underline = true; }
+	if (def.style.strike === true) { copy.strike = true; }
 	if (def.style.fill !== undefined) { copy.fill = { ...def.style.fill }; }
+	if (def.style.textColor !== undefined) { copy.textColor = { ...def.style.textColor }; }
 	if (def.style.align !== undefined) { copy.align = def.style.align; }
 	if (def.style.borderTop !== undefined) { copy.borderTop = { style: def.style.borderTop.style, color: { ...def.style.borderTop.color } }; }
 	if (def.style.borderBottom !== undefined) { copy.borderBottom = { style: def.style.borderBottom.style, color: { ...def.style.borderBottom.color } }; }
@@ -563,10 +585,12 @@ export function currentCellStyle(
  * {@link StyleMutation} over `rect`, reading each cell's current style from `snapshot`. Pure (no
  * session / napi) so it is mocha-testable; the caller interns the distinct results + batches.
  *
- * Excel/Sheets toggle semantics: a `toggle` flips to OFF iff EVERY cell in the rect already has the
- * prop on, else ON (so a partially-bold selection becomes fully bold). `align`/`fill` set (or clear
- * with `null`) uniformly. Every OTHER attribute a cell already carries (borders, the untouched
- * fill/align, bold vs italic) is PRESERVED -- a mutation patches one attribute, never resets the cell.
+ * Excel/Sheets toggle semantics: a `toggle` (bold/italic/underline/strike) flips to OFF iff EVERY cell in
+ * the rect already has the prop on, else ON (so a partially-bold selection becomes fully bold). `align`/
+ * `fill`/`textColor` set (or clear with `null`) uniformly. `border` sets/clears the edges named by
+ * `mutation.edges` (FE-FONT: `outer` touches only the rect's perimeter; `all`/single-edge touch every cell;
+ * `none` clears all 4 edges of every cell; a `style:'none'` clears the named edges). Every OTHER attribute
+ * a cell already carries is PRESERVED -- a mutation patches its target attribute, never resets the cell.
  *
  * THROWS `[bad_argument]` for an empty/inverted rect or an over-{@link MAX_STYLE_CELLS} cell count,
  * and propagates `currentCellStyle`'s `[invalid_state]` for an unresolvable styleId (No-Fallbacks).
@@ -621,13 +645,24 @@ export function computeStyleTargets(
 				} else {
 					style.align = mutation.value;
 				}
-			} else {
-				// fill
+			} else if (mutation.kind === 'fill') {
 				if (mutation.value === null) {
 					delete style.fill;
 				} else {
 					style.fill = { r: mutation.value.r, g: mutation.value.g, b: mutation.value.b };
 				}
+			} else if (mutation.kind === 'textColor') {
+				if (mutation.value === null) {
+					delete style.textColor;
+				} else {
+					style.textColor = { r: mutation.value.r, g: mutation.value.g, b: mutation.value.b };
+				}
+			} else {
+				// border. Decide which of THIS cell's 4 edges the mutation touches given `edges`, then set
+				// each touched edge to {style, color} -- or DELETE it when the requested style is 'none' (or
+				// the whole `edges:'none'` clear-all). `outer` touches only the rect-perimeter edges of a cell
+				// that sits on that side of the rect (so a 1x1 rect's 4 perimeter edges all apply).
+				applyBorderEdges(style, mutation, r, c, rect);
 			}
 			out.push({ row: r, col: c, style });
 		}
@@ -635,19 +670,72 @@ export function computeStyleTargets(
 	return out;
 }
 
+/** The four cell-edge keys on a {@link StyleJson}, in a fixed order. */
+const BORDER_EDGE_KEYS = ['borderTop', 'borderBottom', 'borderLeft', 'borderRight'] as const;
+type BorderEdgeKey = typeof BORDER_EDGE_KEYS[number];
+
+/**
+ * **FE-FONT (2026-06-13)** -- mutate `style`'s border edges in place for a `border` mutation over one cell
+ * at (r, c) within `rect`. Pure helper of {@link computeStyleTargets}. Maps the {@link BorderEdgeSet} to the
+ * concrete edges this cell touches, then for each touched edge: DELETE it when clearing (`edges:'none'` or
+ * `style:'none'`), else set it to `{style, color}` (a fresh color copy -- never alias the mutation's RGB).
+ *
+ * `outer`: a cell on the rect's top row gets its top edge; on the bottom row its bottom; on the left col its
+ * left; on the right col its right (a 1x1 rect's single cell is on all four sides -> all four edges).
+ */
+function applyBorderEdges(
+	style: StyleJson,
+	mutation: { edges: BorderEdgeSet; style: BorderStyleName; color: RgbJson },
+	r: number,
+	c: number,
+	rect: { minRow: number; maxRow: number; minCol: number; maxCol: number },
+): void {
+	const touched = new Set<BorderEdgeKey>();
+	switch (mutation.edges) {
+		case 'all':
+		case 'none':
+			BORDER_EDGE_KEYS.forEach(k => touched.add(k));
+			break;
+		case 'top': touched.add('borderTop'); break;
+		case 'bottom': touched.add('borderBottom'); break;
+		case 'left': touched.add('borderLeft'); break;
+		case 'right': touched.add('borderRight'); break;
+		case 'outer':
+			if (r === rect.minRow) { touched.add('borderTop'); }
+			if (r === rect.maxRow) { touched.add('borderBottom'); }
+			if (c === rect.minCol) { touched.add('borderLeft'); }
+			if (c === rect.maxCol) { touched.add('borderRight'); }
+			break;
+	}
+	const clear = mutation.edges === 'none' || mutation.style === 'none';
+	for (const key of touched) {
+		if (clear) {
+			delete style[key];
+		} else {
+			style[key] = { style: mutation.style, color: { r: mutation.color.r, g: mutation.color.g, b: mutation.color.b } };
+		}
+	}
+}
+
 /** **FE-5 W-R (2026-06-12)** -- validate one RGB channel triple from an UNTRUSTED webview payload:
- *  each of r/g/b an integer in 0..=255. Returns an error string or null. */
-function validateRgb(v: unknown): string | null {
+ *  each of r/g/b an integer in 0..=255. `what` names the field for the error message (fill / text color /
+ *  border color). Returns an error string or null. */
+function validateRgb(v: unknown, what = 'color'): string | null {
 	if (typeof v !== 'object' || v === null) {
-		return 'fill must be an {r,g,b} object';
+		return `${what} must be an {r,g,b} object`;
 	}
 	const c = v as { r?: unknown; g?: unknown; b?: unknown };
 	const ok = (n: unknown): boolean => typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= 255;
 	if (!ok(c.r) || !ok(c.g) || !ok(c.b)) {
-		return 'fill r/g/b must each be an integer in 0..=255';
+		return `${what} r/g/b must each be an integer in 0..=255`;
 	}
 	return null;
 }
+
+/** **FE-FONT (2026-06-13)** -- the border-edge sets + style names a `border` mutation may carry (the
+ *  untrusted-validation allowlists). MUST match {@link BorderEdgeSet} / {@link BorderStyleName}. */
+const BORDER_EDGE_SETS: ReadonlySet<string> = new Set(['all', 'outer', 'top', 'bottom', 'left', 'right', 'none']);
+const BORDER_STYLE_NAMES: ReadonlySet<string> = new Set(['none', 'thin', 'medium', 'thick', 'dashed', 'dotted', 'double']);
 
 /**
  * **FE-5 W-R (2026-06-12)** -- validate an UNTRUSTED {@link StyleMutation} from the webview (defense in
@@ -658,10 +746,11 @@ export function validateStyleMutation(m: unknown): string | null {
 	if (typeof m !== 'object' || m === null) {
 		return 'mutation must be an object';
 	}
-	const mut = m as { kind?: unknown; prop?: unknown; value?: unknown };
+	const mut = m as { kind?: unknown; prop?: unknown; value?: unknown; edges?: unknown; style?: unknown; color?: unknown };
 	if (mut.kind === 'toggle') {
-		if (mut.prop !== 'bold' && mut.prop !== 'italic') {
-			return `toggle prop must be 'bold' or 'italic', got ${String(mut.prop)}`;
+		// FE-FONT (2026-06-13): underline/strike join bold/italic as engine boolean toggles.
+		if (mut.prop !== 'bold' && mut.prop !== 'italic' && mut.prop !== 'underline' && mut.prop !== 'strike') {
+			return `toggle prop must be 'bold'|'italic'|'underline'|'strike', got ${String(mut.prop)}`;
 		}
 		return null;
 	}
@@ -675,25 +764,49 @@ export function validateStyleMutation(m: unknown): string | null {
 		if (mut.value === null) {
 			return null;
 		}
-		return validateRgb(mut.value);
+		return validateRgb(mut.value, 'fill');
+	}
+	if (mut.kind === 'textColor') {
+		// FE-FONT (2026-06-13): null clears the glyph color (renderer default); else a valid RGB.
+		if (mut.value === null) {
+			return null;
+		}
+		return validateRgb(mut.value, 'text color');
+	}
+	if (mut.kind === 'border') {
+		// FE-FONT (2026-06-13): reject an unknown edge set or border-style name LOUDLY (No-Fallbacks). The
+		// color is required + validated even for a clear op (style:'none') -- the wire shape always carries it
+		// and a malformed color signals a tampered/buggy payload we must surface rather than silently accept.
+		if (typeof mut.edges !== 'string' || !BORDER_EDGE_SETS.has(mut.edges)) {
+			return `border edges must be 'all'|'outer'|'top'|'bottom'|'left'|'right'|'none', got ${String(mut.edges)}`;
+		}
+		if (typeof mut.style !== 'string' || !BORDER_STYLE_NAMES.has(mut.style)) {
+			return `border style must be 'none'|'thin'|'medium'|'thick'|'dashed'|'dotted'|'double', got ${String(mut.style)}`;
+		}
+		return validateRgb(mut.color, 'border color');
 	}
 	return `unknown mutation kind ${String(mut.kind)}`;
 }
 
 /**
- * **FE-5 W-R (2026-06-12)** -- canonical dedup key for a {@link StyleJson}, so the `setStyle` handler
- * interns each DISTINCT style once (registerStyle is idempotent, but deduping avoids N redundant napi
- * calls for a uniform selection). A border edge serializes as `style@r,g,b`; absent fields collapse to
- * "". Order is fixed so equal StyleJsons produce equal keys.
+ * **FE-5 W-R (2026-06-12) / FE-FONT (2026-06-13)** -- canonical dedup key for a {@link StyleJson}, so the
+ * `setStyle` handler interns each DISTINCT style once (registerStyle is idempotent, but deduping avoids N
+ * redundant napi calls for a uniform selection). A border edge / color serializes as `style@r,g,b` / `r,g,b`;
+ * absent fields collapse to "". Order is fixed so equal StyleJsons produce equal keys. Every render-visible
+ * attribute MUST appear here (FE-FONT added underline/strike/textColor) -- else two cells differing only in,
+ * e.g., text color would collide to one styleId and the second would render with the first's color.
  */
 export function styleJsonKey(s: StyleJson): string {
 	const edge = (e: { style: string; color: RgbJson } | undefined): string =>
 		e === undefined ? '' : `${e.style}@${e.color.r},${e.color.g},${e.color.b}`;
-	const fill = s.fill === undefined ? '' : `${s.fill.r},${s.fill.g},${s.fill.b}`;
+	const rgb = (c: RgbJson | undefined): string => c === undefined ? '' : `${c.r},${c.g},${c.b}`;
 	return [
 		s.bold === true ? 'b' : '',
 		s.italic === true ? 'i' : '',
-		`f:${fill}`,
+		s.underline === true ? 'u' : '',
+		s.strike === true ? 's' : '',
+		`f:${rgb(s.fill)}`,
+		`tc:${rgb(s.textColor)}`,
 		`a:${s.align ?? ''}`,
 		`t:${edge(s.borderTop)}`,
 		`bo:${edge(s.borderBottom)}`,

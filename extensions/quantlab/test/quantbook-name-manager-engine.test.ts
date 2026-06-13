@@ -60,8 +60,8 @@ suite('FE-5 W-N -- Name Manager engine contract (schema-2 dylib)', () => {
 		loadQuantbookEngine();
 	});
 
-	test('the IDE schema-version mirror was bumped to 3', () => {
-		assert.strictEqual(QUANTBOOK_SCHEMA_VERSION, 3, 'IDE QUANTBOOK_SCHEMA_VERSION must be 3 for the tables-carrying dylib');
+	test('the IDE schema-version mirror was bumped to 4', () => {
+		assert.strictEqual(QUANTBOOK_SCHEMA_VERSION, 4, 'IDE QUANTBOOK_SCHEMA_VERSION must be 4 for the font-attrs-carrying dylib (text-color/underline/strike)');
 	});
 
 	test('setName -> listNames() reports the new Range name (canonical-cased)', () => {
@@ -112,14 +112,14 @@ suite('FE-5 W-N -- Name Manager engine contract (schema-2 dylib)', () => {
 		assert.strictEqual((after.names ?? []).length, 1, 'a full snapshot().names also sees the new name');
 	});
 
-	test('snapshot().names agrees with listNames() and the schema is 2', () => {
+	test('snapshot().names agrees with listNames() and the schema is 4', () => {
 		const s = createWorkbookSession();
 		const sheetId = s.addSheet('S', 1000);
 		s.setName('alpha', range(sheetId, 0, 0, 2, 0));
 		s.setName('beta', range(sheetId, 0, 1, 0, 1));
 
 		const snap = s.snapshot();
-		assert.strictEqual(snap.schemaVersion, 3, 'a real napi snapshot stamps schemaVersion 3');
+		assert.strictEqual(snap.schemaVersion, 4, 'a real napi snapshot stamps schemaVersion 4');
 		const fromSnap = (snap.names ?? []).map((n) => n.name.toUpperCase()).sort();
 		const fromList = s.listNames().map((n) => n.name.toUpperCase()).sort();
 		assert.deepStrictEqual(fromSnap, fromList, 'snapshot().names and listNames() report the SAME names');

@@ -1132,8 +1132,14 @@ const QUANTBOOK_ERROR_CAUSE_MAX_DEPTH = 8;
  * MUST land in lockstep with the engine's bump (see contract from Builder E) or every real napi snapshot
  * trips `[unsupported_schema_version]`. No v2-only fixtures to migrate (hand-built snapshot literals leave
  * `schemaVersion` undefined, which the guard tolerates).
+ *
+ * **FE-FONT (2026-06-13): 3 -> 4.** The engine added the ADDITIVE font attributes `underline`/`strike`
+ * (booleans) + `textColor` ({@link RgbJson}) to `StyleJson` (the four formerly preview-only toolbar buttons:
+ * Underline, Strikethrough, Text-color, + the FE-only Borders SET path). Same lockstep contract (Builder G's
+ * engine bump): the `.node` and these TS mirrors move together or a real napi snapshot trips
+ * `[unsupported_schema_version]`.
  */
-export const QUANTBOOK_SCHEMA_VERSION = 3;
+export const QUANTBOOK_SCHEMA_VERSION = 4;
 
 /**
  * **Phase 6.3-1c M5 (2026-05-30):** fail loud if a DTO's `schemaVersion` does not

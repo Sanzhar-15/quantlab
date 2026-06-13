@@ -255,17 +255,35 @@ export interface BorderEdgeJson {
 }
 
 /**
- * **FE-4 W4 (2026-06-10)** -- a cell VISUAL style: bold/italic/fill/align + per-edge
- * borders (operator decision #4: borders are IN the v1 engine schema so FE-5 only
- * renders, never re-migrates the overlay). The input DTO for
- * {@link SessionInstance.registerStyle} and the value carried in {@link StyleDefJson}.
- * `align` is one of `general|left|center|right`; absent fill/border fields mean
- * no fill / no border on that edge (napi `Option::None` -> absent property).
+ * **FE-4 W4 (2026-06-10) / FE-FONT (2026-06-13)** -- a cell VISUAL style: bold/italic/
+ * underline/strike + fill/text-color/align + per-edge borders (operator decision #4:
+ * borders are IN the v1 engine schema so FE-5 only renders, never re-migrates the
+ * overlay). The input DTO for {@link SessionInstance.registerStyle} and the value carried
+ * in {@link StyleDefJson}. `align` is one of `general|left|center|right`; absent fill /
+ * textColor / border fields mean no fill / default glyph color / no border on that edge
+ * (napi `Option::None` -> absent property).
+ *
+ * **FE-FONT (2026-06-13) -- Builder G contract:** the engine `StyleJson` gains
+ * `underline`/`strike` (booleans, default false) + `textColor` (optional {@link RgbJson},
+ * absent = renderer-default glyph color), bumping the snapshot {@link QUANTBOOK_SCHEMA_VERSION}
+ * 3->4. These mirrors MUST land in lockstep with that engine bump or a real napi snapshot
+ * trips `[unsupported_schema_version]`.
+ *
+ * `underline`/`strike` are declared OPTIONAL (not required like `bold`/`italic`) DELIBERATELY: the
+ * just-audited MCP write surface (`mcp/mcpWriteLogic.ts`, off-limits this wave) and ~36 hand-built
+ * snapshot fixtures construct `StyleJson` literals as `{ bold, italic, ... }` without the new fields;
+ * a required field would break that untouchable code under tsc. Every consumer (this wave's resolver +
+ * the host read-modify-write + the MCP merge + `styleJsonKey`) tests them with `=== true`, so an absent
+ * field reads as false -- semantically identical to the engine's always-present bool. A real napi
+ * snapshot ALWAYS populates them; only hand-built literals omit them.
  */
 export interface StyleJson {
 	bold: boolean;
 	italic: boolean;
+	underline?: boolean;
+	strike?: boolean;
 	fill?: RgbJson;
+	textColor?: RgbJson;
 	align?: string;
 	borderTop?: BorderEdgeJson;
 	borderBottom?: BorderEdgeJson;

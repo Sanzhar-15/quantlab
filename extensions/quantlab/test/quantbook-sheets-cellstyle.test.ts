@@ -109,6 +109,32 @@ suite('FE-5 W-R resolveCellStyle -- engine StyleDefJson -> ResolvedCellStyle', f
 		assert.strictEqual(rs.borders?.right, undefined, 'an absent edge must not produce a right border');
 	});
 
+	test('FE-FONT: underline/strike/textColor populate from a StyleJson that carries them', () => {
+		const fontStyles: StyleDefJson[] = [
+			def(3, 0, { bold: false, italic: false, underline: true, strike: true, textColor: { r: 12, g: 34, b: 56 } }),
+			def(3, 1, { bold: false, italic: false, underline: false, strike: false }),
+		];
+		const r = resolveCellStyle(styleId(3, 0), fontStyles);
+		const rs = r as Exclude<typeof r, 'unresolved' | undefined>;
+		assert.strictEqual(rs.underline, true, 'underline resolves');
+		assert.strictEqual(rs.strike, true, 'strike resolves');
+		assert.strictEqual(rs.textColor, 'rgb(12,34,56)', 'textColor resolves to a CSS color');
+		// underline/strike:false must NOT be stored as set fields (mirrors bold/italic:false discipline).
+		const off = resolveCellStyle(styleId(3, 1), fontStyles);
+		const offs = off as Exclude<typeof off, 'unresolved' | undefined>;
+		assert.strictEqual(offs.underline, undefined, 'underline:false is not a set field');
+		assert.strictEqual(offs.strike, undefined, 'strike:false is not a set field');
+		assert.strictEqual(offs.textColor, undefined, 'absent textColor is not a set field');
+	});
+
+	test('FE-FONT: a malformed textColor channel drops the textColor (no silent default), other attrs survive', () => {
+		const bad: StyleDefJson[] = [def(4, 0, { bold: true, italic: false, textColor: { r: 999, g: 0, b: 0 } })];
+		const r = resolveCellStyle(styleId(4, 0), bad);
+		const rs = r as Exclude<typeof r, 'unresolved' | undefined>;
+		assert.strictEqual(rs.textColor, undefined, 'a bad-channel textColor is dropped');
+		assert.strictEqual(rs.bold, true, 'the rest of the style still resolves');
+	});
+
 	test('a styleId present but NOT in styles[] returns the LOUD "unresolved" sentinel (No-Fallbacks)', () => {
 		assert.strictEqual(resolveCellStyle(styleId(9, 9), styles), 'unresolved');
 	});
@@ -488,20 +514,141 @@ suite('FE-5 W-R computeStyleTargets -- read-modify-write for a uniform mutation'
 	});
 });
 
+// =============================================================================================
+// FE-FONT (2026-06-13) -- computeStyleTargets for the NEW mutations: underline/strike toggle,
+// textColor set/clear, and the border variants (all / outer / single edge / clear-all).
+// =============================================================================================
+
+suite('FE-FONT (2026-06-13) computeStyleTargets -- underline/strike/textColor/border', function () {
+	// A1 bold+thin-top-border (0,0); B1 underline (0,1); C1 unstyled.
+	const styles = [
+		def(0, 0, { bold: true, italic: false, borderTop: { style: 'thin', color: { r: 0, g: 0, b: 0 } } }),
+		def(0, 1, { bold: false, italic: false, underline: true }),
+	];
+	const snapshot = wb([
+		wbCell(0, 0, { kind: 'number', number: 1 }, styleId(0, 0)),
+		wbCell(0, 1, { kind: 'text', text: 'x' }, styleId(0, 1)),
+		wbCell(0, 2, { kind: 'number', number: 3 }),
+	], styles);
+	const r1 = { minRow: 0, maxRow: 0, minCol: 0, maxCol: 2 }; // A1:C1
+
+	test('underline toggle over a PARTIALLY-underlined selection turns the WHOLE selection underlined', () => {
+		const t = computeStyleTargets(snapshot, 0, r1, { kind: 'toggle', prop: 'underline' });
+		assert.strictEqual(t.length, 3);
+		assert.ok(t.every(x => x.style.underline === true), 'partial -> all on');
+		// A1 keeps its bold + border (toggle patches one attr only).
+		assert.strictEqual(t[0].style.bold, true, 'bold preserved');
+		assert.deepStrictEqual(t[0].style.borderTop, { style: 'thin', color: { r: 0, g: 0, b: 0 } }, 'border preserved');
+	});
+
+	test('underline toggle over a FULLY-underlined selection turns it OFF', () => {
+		const onlyB = { minRow: 0, maxRow: 0, minCol: 1, maxCol: 1 }; // B1 is the only underlined cell
+		const t = computeStyleTargets(snapshot, 0, onlyB, { kind: 'toggle', prop: 'underline' });
+		assert.strictEqual(t[0].style.underline, false, 'all-on -> off');
+	});
+
+	test('strike toggle ON when none are struck (mixed/off -> on)', () => {
+		const t = computeStyleTargets(snapshot, 0, r1, { kind: 'toggle', prop: 'strike' });
+		assert.ok(t.every(x => x.style.strike === true), 'no cell struck -> all on');
+	});
+
+	test('textColor set over the selection; clear on a cell that had it', () => {
+		const setT = computeStyleTargets(snapshot, 0, r1, { kind: 'textColor', value: { r: 200, g: 10, b: 20 } });
+		assert.ok(setT.every(x => x.style.textColor?.r === 200 && x.style.textColor?.g === 10 && x.style.textColor?.b === 20));
+		// Now clear textColor on a snapshot where A1 has a textColor.
+		const withTc = wb([wbCell(0, 0, { kind: 'number', number: 1 }, styleId(0, 0))],
+			[def(0, 0, { bold: false, italic: false, textColor: { r: 5, g: 5, b: 5 } })]);
+		const cleared = computeStyleTargets(withTc, 0, { minRow: 0, maxRow: 0, minCol: 0, maxCol: 0 }, { kind: 'textColor', value: null });
+		assert.strictEqual(cleared[0].style.textColor, undefined, 'textColor cleared');
+	});
+
+	test('border edges:all sets all 4 edges of every cell to {style,color}', () => {
+		const t = computeStyleTargets(snapshot, 0, r1, { kind: 'border', edges: 'all', style: 'medium', color: { r: 3, g: 4, b: 5 } });
+		const edge = { style: 'medium', color: { r: 3, g: 4, b: 5 } };
+		for (const x of t) {
+			assert.deepStrictEqual(x.style.borderTop, edge);
+			assert.deepStrictEqual(x.style.borderBottom, edge);
+			assert.deepStrictEqual(x.style.borderLeft, edge);
+			assert.deepStrictEqual(x.style.borderRight, edge);
+		}
+		// A1 keeps its bold (border patch preserves other attrs).
+		assert.strictEqual(t[0].style.bold, true, 'bold preserved through a border op');
+	});
+
+	test('border edges:outer sets ONLY the rect-perimeter edges (a 1-row rect: every cell top+bottom; ends get the side)', () => {
+		const t = computeStyleTargets(snapshot, 0, r1, { kind: 'border', edges: 'outer', style: 'thin', color: { r: 0, g: 0, b: 0 } });
+		const e = { style: 'thin', color: { r: 0, g: 0, b: 0 } };
+		// A1 (left end, top row, bottom row): top+bottom+left, NOT right.
+		assert.deepStrictEqual(t[0].style.borderTop, e);
+		assert.deepStrictEqual(t[0].style.borderBottom, e);
+		assert.deepStrictEqual(t[0].style.borderLeft, e);
+		assert.strictEqual(t[0].style.borderRight, undefined, 'A1 is not on the rect right edge');
+		// B1 (middle): top+bottom only (no left/right -- it is interior horizontally).
+		assert.deepStrictEqual(t[1].style.borderTop, e);
+		assert.deepStrictEqual(t[1].style.borderBottom, e);
+		assert.strictEqual(t[1].style.borderLeft, undefined, 'B1 is interior -> no left');
+		assert.strictEqual(t[1].style.borderRight, undefined, 'B1 is interior -> no right');
+		// C1 (right end): top+bottom+right, NOT left.
+		assert.deepStrictEqual(t[2].style.borderRight, e);
+		assert.strictEqual(t[2].style.borderLeft, undefined, 'C1 is not on the rect left edge');
+	});
+
+	test('border edges:top sets only the top edge of every cell', () => {
+		const t = computeStyleTargets(snapshot, 0, r1, { kind: 'border', edges: 'top', style: 'thick', color: { r: 1, g: 1, b: 1 } });
+		for (const x of t) {
+			assert.deepStrictEqual(x.style.borderTop, { style: 'thick', color: { r: 1, g: 1, b: 1 } });
+			assert.strictEqual(x.style.borderBottom, undefined);
+			assert.strictEqual(x.style.borderLeft, undefined);
+			assert.strictEqual(x.style.borderRight, undefined);
+		}
+		// A1 retains its PRE-EXISTING thin top border? No -- a top op OVERWRITES it with thick.
+		assert.deepStrictEqual(t[0].style.borderTop, { style: 'thick', color: { r: 1, g: 1, b: 1 } }, 'top op overwrites the prior thin top');
+	});
+
+	test('border edges:none clears all 4 edges of every cell (style/color ignored)', () => {
+		// Start from a snapshot where A1 has a top border; edges:none clears it.
+		const t = computeStyleTargets(snapshot, 0, { minRow: 0, maxRow: 0, minCol: 0, maxCol: 0 }, { kind: 'border', edges: 'none', style: 'none', color: { r: 0, g: 0, b: 0 } });
+		assert.strictEqual(t[0].style.borderTop, undefined, 'the prior top border is cleared');
+		assert.strictEqual(t[0].style.borderBottom, undefined);
+		assert.strictEqual(t[0].style.bold, true, 'clearing borders preserves non-border attrs');
+	});
+
+	test('border with style:none on a named edge CLEARS that edge (the picker "no border" path)', () => {
+		const t = computeStyleTargets(snapshot, 0, { minRow: 0, maxRow: 0, minCol: 0, maxCol: 0 }, { kind: 'border', edges: 'top', style: 'none', color: { r: 0, g: 0, b: 0 } });
+		assert.strictEqual(t[0].style.borderTop, undefined, 'style:none on the top edge clears it');
+	});
+});
+
 suite('FE-5 W-R validateStyleMutation -- untrusted-payload guard', function () {
 	test('valid mutations pass', () => {
 		assert.strictEqual(validateStyleMutation({ kind: 'toggle', prop: 'bold' }), null);
 		assert.strictEqual(validateStyleMutation({ kind: 'toggle', prop: 'italic' }), null);
+		// FE-FONT (2026-06-13): underline/strike are now engine toggles too.
+		assert.strictEqual(validateStyleMutation({ kind: 'toggle', prop: 'underline' }), null);
+		assert.strictEqual(validateStyleMutation({ kind: 'toggle', prop: 'strike' }), null);
 		assert.strictEqual(validateStyleMutation({ kind: 'align', value: 'center' }), null);
 		assert.strictEqual(validateStyleMutation({ kind: 'align', value: null }), null);
 		assert.strictEqual(validateStyleMutation({ kind: 'fill', value: { r: 1, g: 2, b: 3 } }), null);
 		assert.strictEqual(validateStyleMutation({ kind: 'fill', value: null }), null);
+		// FE-FONT: textColor (set + clear) + border (each edge set + a clear) are valid.
+		assert.strictEqual(validateStyleMutation({ kind: 'textColor', value: { r: 1, g: 2, b: 3 } }), null);
+		assert.strictEqual(validateStyleMutation({ kind: 'textColor', value: null }), null);
+		assert.strictEqual(validateStyleMutation({ kind: 'border', edges: 'all', style: 'thin', color: { r: 0, g: 0, b: 0 } }), null);
+		assert.strictEqual(validateStyleMutation({ kind: 'border', edges: 'outer', style: 'medium', color: { r: 1, g: 2, b: 3 } }), null);
+		assert.strictEqual(validateStyleMutation({ kind: 'border', edges: 'top', style: 'double', color: { r: 9, g: 9, b: 9 } }), null);
+		assert.strictEqual(validateStyleMutation({ kind: 'border', edges: 'none', style: 'none', color: { r: 0, g: 0, b: 0 } }), null, 'clear-all is valid');
 	});
 	test('malformed mutations are rejected with a reason', () => {
 		assert.ok(validateStyleMutation(null) !== null);
-		assert.ok(validateStyleMutation({ kind: 'toggle', prop: 'underline' }) !== null, 'underline is not an engine toggle');
+		// FE-FONT: 'big' is not a toggle prop (underline/strike ARE now -- covered in the valid-pass test).
+		assert.ok(validateStyleMutation({ kind: 'toggle', prop: 'big' }) !== null, 'big is not an engine toggle');
 		assert.ok(validateStyleMutation({ kind: 'align', value: 'diagonal' }) !== null);
 		assert.ok(validateStyleMutation({ kind: 'fill', value: { r: 300, g: 0, b: 0 } }) !== null, 'out-of-domain channel');
+		// FE-FONT: bad textColor / border-edge / border-style / border-color rejections.
+		assert.ok(validateStyleMutation({ kind: 'textColor', value: { r: -1, g: 0, b: 0 } }) !== null, 'out-of-domain text color channel');
+		assert.ok(validateStyleMutation({ kind: 'border', edges: 'diagonal', style: 'thin', color: { r: 0, g: 0, b: 0 } }) !== null, 'unknown edge set');
+		assert.ok(validateStyleMutation({ kind: 'border', edges: 'all', style: 'wiggly', color: { r: 0, g: 0, b: 0 } }) !== null, 'unknown border style');
+		assert.ok(validateStyleMutation({ kind: 'border', edges: 'all', style: 'thin', color: { r: 256, g: 0, b: 0 } }) !== null, 'out-of-domain border color');
 		assert.ok(validateStyleMutation({ kind: 'bogus' }) !== null);
 	});
 });
@@ -519,6 +666,19 @@ suite('FE-5 W-R styleJsonKey -- distinct styles intern distinctly; equal styles 
 		assert.notStrictEqual(
 			styleJsonKey({ bold: false, italic: false, borderTop: { style: 'thin', color: { r: 0, g: 0, b: 0 } } }),
 			styleJsonKey({ bold: false, italic: false, borderTop: { style: 'thick', color: { r: 0, g: 0, b: 0 } } }),
+		);
+	});
+	test('FE-FONT: underline/strike/textColor each shift the key (no collision -> no wrong-color render)', () => {
+		const base: StyleJson = { bold: false, italic: false };
+		assert.notStrictEqual(styleJsonKey(base), styleJsonKey({ bold: false, italic: false, underline: true }));
+		assert.notStrictEqual(styleJsonKey(base), styleJsonKey({ bold: false, italic: false, strike: true }));
+		assert.notStrictEqual(styleJsonKey(base), styleJsonKey({ bold: false, italic: false, textColor: { r: 1, g: 1, b: 1 } }));
+		// underline:false collapses to the same key as absent (mirrors bold:false discipline).
+		assert.strictEqual(styleJsonKey({ bold: false, italic: false, underline: false }), styleJsonKey(base));
+		// Two distinct text colors must NOT collide.
+		assert.notStrictEqual(
+			styleJsonKey({ bold: false, italic: false, textColor: { r: 1, g: 2, b: 3 } }),
+			styleJsonKey({ bold: false, italic: false, textColor: { r: 3, g: 2, b: 1 } }),
 		);
 	});
 });
