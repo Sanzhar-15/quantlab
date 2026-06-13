@@ -394,6 +394,47 @@ pub struct TableSpec {
     pub column_names: Vec<String>,
 }
 
+/// **FE-5 W-? (Builder E, 2026-06-13):** one structured table's metadata, surfaced
+/// in [`WorkbookSnapshot::tables`] so the IDE can render table chrome (banded rows,
+/// header/totals styling, the table-name badge).
+///
+/// This is a READ/OUTPUT DTO — distinct from the create-input [`TableSpec`]. They are
+/// deliberately NOT the same struct:
+/// - [`TableSpec`] is the `create_table` INPUT (no `display_name` — the engine
+///   derives the case-preserving display form at create time; carries
+///   `column_names` for the create roster).
+/// - `TableSnapshot` is the snapshot OUTPUT — it carries the engine-resolved
+///   `display_name` (case-preserving) AND the canonical `name`, and it omits the
+///   create-only `column_names`. Mirrors the `NamedRange`(output)-vs-create-input
+///   split already in this module.
+///
+/// **Coordinate model** (mirrors [`ql_storage::TableMetadata`]): `top_row`/`top_col`
+/// is the top-left cell; `rows × cols` is the FULL footprint INCLUDING the header
+/// row (when `has_header`) and totals row (when `has_totals`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSnapshot {
+    /// Canonical (uppercase) table name.
+    pub name: String,
+    /// Display name (case-preserving). Equals `name` when no case-preserving form
+    /// was supplied at create time.
+    pub display_name: String,
+    /// Anchor sheet — the IDE renderer needs this to know which sheet to draw the
+    /// table chrome on (dropping it would be silent data loss).
+    pub sheet: SheetId,
+    /// Top-left row of the full footprint.
+    pub top_row: RowId,
+    /// Top-left column of the full footprint.
+    pub top_col: ColId,
+    /// Total rows (incl. header/totals if present).
+    pub rows: u32,
+    /// Total columns.
+    pub cols: u32,
+    /// `true` iff `top_row` is a header row.
+    pub has_header: bool,
+    /// `true` iff `top_row + rows - 1` is a totals row.
+    pub has_totals: bool,
+}
+
 /// The workbook's date epoch system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -432,6 +473,15 @@ pub struct WorkbookSnapshot {
     /// pre-bump serialized snapshot deserializing (the field reads as empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<NamedRange>,
+    /// **FE-5 W-? (Builder E, 2026-06-13):** every structured table in the workbook
+    /// (across ALL sheets), so the IDE can render table chrome. Enumerated from the
+    /// workbook's name-keyed table table; sorted (by sheet id, then canonical name)
+    /// for a stable wire shape. Empty when no tables are defined.
+    ///
+    /// **Additive field** (schema bumped 2 → 3). `serde(default)` keeps any
+    /// pre-bump serialized snapshot deserializing (the field reads as empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<TableSnapshot>,
     /// Opaque version token (round-trip into `snapshot_delta`).
     pub version: SessionVersion,
 }

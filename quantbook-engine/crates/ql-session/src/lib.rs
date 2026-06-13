@@ -55,7 +55,13 @@ pub use session::EngineSession;
 /// The IDE-side mirror lane MUST pin its expected version to 2 to match. The
 /// field is `serde(default, skip_serializing_if)` so an old snapshot blob still
 /// deserializes — but the contract version moves because the DTO shape changed.
-pub const SCHEMA_VERSION: u16 = 2;
+///
+/// **v3 (FE-5 W-?, Builder E, 2026-06-13):** [`dto::WorkbookSnapshot`] gained the
+/// additive `tables: Vec<TableSnapshot>` field (the structured-table read surface
+/// the IDE renders table chrome from). Same additive `serde(default,
+/// skip_serializing_if)` discipline — old blobs still deserialize — but the
+/// contract version moves because the DTO shape changed. The IDE mirror pins to 3.
+pub const SCHEMA_VERSION: u16 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -136,9 +142,45 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_two() {
+    fn table_snapshot_round_trips() {
+        use crate::dto::TableSnapshot;
+        let t = TableSnapshot {
+            name: "SALES".into(),
+            display_name: "Sales".into(),
+            sheet: 0,
+            top_row: 2,
+            top_col: 1,
+            rows: 5,
+            cols: 3,
+            has_header: true,
+            has_totals: true,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(serde_json::from_str::<TableSnapshot>(&json).unwrap(), t);
+    }
+
+    #[test]
+    fn workbook_snapshot_tables_field_is_additive() {
+        use crate::dto::WorkbookSnapshot;
+        // A pre-v3 snapshot blob (no `tables` key) must still deserialize, with
+        // the new field reading as an empty vec (serde(default)).
+        let blob = serde_json::json!({
+            "schema_version": 2,
+            "sheets": [],
+            "formats": [],
+            "date_system": "Excel1900",
+            "version": []
+        });
+        let snap: WorkbookSnapshot = serde_json::from_value(blob).unwrap();
+        assert!(snap.tables.is_empty(), "missing tables → empty (additive)");
+    }
+
+    #[test]
+    fn schema_version_is_three() {
         // FE-5 W-N (2026-06-12): bumped 1 → 2 for the additive
-        // WorkbookSnapshot.names field. The IDE mirror pins to this value.
-        assert_eq!(SCHEMA_VERSION, 2);
+        // WorkbookSnapshot.names field.
+        // FE-5 W-? (Builder E, 2026-06-13): bumped 2 → 3 for the additive
+        // WorkbookSnapshot.tables field. The IDE mirror pins to this value.
+        assert_eq!(SCHEMA_VERSION, 3);
     }
 }

@@ -105,7 +105,7 @@ use ql_session::dto::{
     DateSystem, Diagnostic, DirtyResult, FormatDef, FormatId, FullRebuildReason,
     HAlign as HAlignDto, NamedRange, NamedTargetDto, PublishedRef, RangeColumn, RangeQueryOptions,
     RangeResult, RemovedCell, Rgb as RgbDto, SessionVersion, Severity, SheetInfo, SheetSnapshot,
-    Style as StyleDto, StyleDef, StyleId as StyleIdDto, TableSpec, UndoRedoResult,
+    Style as StyleDto, StyleDef, StyleId as StyleIdDto, TableSnapshot, TableSpec, UndoRedoResult,
     WorkbookSnapshot, WorkbookSnapshotDelta, WriteRangeResult,
 };
 use ql_session::error::{EngineError, EngineResult, ErrorClass};
@@ -2966,6 +2966,8 @@ impl EngineSession for WorkbookSession {
         // sheet-scoped defined names (helper walks both — missing either is a
         // silent data loss). Sorted for a stable wire shape.
         let names = collect_named_ranges(&self.workbook);
+        // **Builder E (2026-06-13):** every structured table (all sheets), sorted.
+        let tables = collect_tables(&self.workbook);
         Ok(WorkbookSnapshot {
             schema_version: SCHEMA_VERSION,
             sheets,
@@ -2973,6 +2975,7 @@ impl EngineSession for WorkbookSession {
             styles,
             date_system,
             names,
+            tables,
             version: self.current_version(),
         })
     }
@@ -4241,6 +4244,36 @@ fn collect_named_ranges(workbook: &Workbook) -> Vec<NamedRange> {
     // Deterministic order: scope (None < Some) then sheet id then name.
     names.sort_by(|a, b| a.scope.cmp(&b.scope).then_with(|| a.name.cmp(&b.name)));
     names
+}
+
+/// **FE-5 W-? (Builder E, 2026-06-13):** enumerate EVERY structured table in the
+/// workbook (across ALL sheets) into a sorted `Vec<TableSnapshot>` for the
+/// `WorkbookSnapshot.tables` read surface. The table table is workbook-level and
+/// name-keyed (NOT per-sheet) — `tables().iter()` yields every table once; each
+/// `TableMetadata` carries its own anchor `sheet`. Mapping is TOTAL over the
+/// fields the IDE renders (No-Fallbacks: every field is mapped explicitly, never
+/// defaulted). `name`/`display_name` are `Arc<str>` in storage → owned `String`
+/// here. Sorted by `(sheet, name)` for a stable wire shape (the underlying
+/// `TableTable` is HashMap-backed / arbitrary-order, mirroring why
+/// `collect_named_ranges` and the `formats`/`styles` arrays sort).
+fn collect_tables(workbook: &Workbook) -> Vec<TableSnapshot> {
+    let mut tables: Vec<TableSnapshot> = workbook
+        .tables()
+        .iter()
+        .map(|(_canonical, meta)| TableSnapshot {
+            name: meta.name.as_ref().to_owned(),
+            display_name: meta.display_name.as_ref().to_owned(),
+            sheet: meta.sheet,
+            top_row: meta.top_row,
+            top_col: meta.top_col,
+            rows: meta.rows,
+            cols: meta.cols,
+            has_header: meta.has_header,
+            has_totals: meta.has_totals,
+        })
+        .collect();
+    tables.sort_by(|a, b| a.sheet.cmp(&b.sheet).then_with(|| a.name.cmp(&b.name)));
+    tables
 }
 
 fn storage_format_id_to_dto(id: ql_storage::FormatId) -> FormatId {
@@ -11817,6 +11850,101 @@ mod tests {
             end_row: er,
             end_col: ec,
         }
+    }
+
+    // ===== Builder E (2026-06-13): WorkbookSnapshot.tables read surface =====
+
+    /// A created table surfaces in `WorkbookSnapshot.tables` with its full
+    /// range + header/totals flags (the IDE's table-render read surface).
+    #[test]
+    fn fe5_snapshot_carries_a_created_table() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        s.create_table(TableSpec {
+            name: "Sales".into(),
+            sheet: sid,
+            top_row: 2,
+            top_col: 1,
+            rows: 5, // 1 header + 3 data + 1 totals
+            cols: 3,
+            has_header: true,
+            has_totals: true,
+            column_names: vec!["Region".into(), "Q1".into(), "Q2".into()],
+        })
+        .unwrap();
+
+        let snap = s.snapshot().unwrap();
+        assert_eq!(snap.tables.len(), 1, "the one created table is present");
+        let t = &snap.tables[0];
+        // Canonical name is uppercased by the engine; display name preserves case.
+        assert_eq!(t.name, "SALES");
+        assert_eq!(t.display_name, "Sales");
+        assert_eq!(t.sheet, sid);
+        assert_eq!(t.top_row, 2);
+        assert_eq!(t.top_col, 1);
+        assert_eq!(t.rows, 5);
+        assert_eq!(t.cols, 3);
+        assert!(t.has_header);
+        assert!(t.has_totals);
+    }
+
+    /// Two tables on two DIFFERENT sheets both surface (the walker is
+    /// workbook-level, not per-sheet) and come back sorted by `(sheet, name)`.
+    #[test]
+    fn fe5_snapshot_carries_tables_across_two_sheets() {
+        let mut s = WorkbookSession::new();
+        let s0 = s.add_sheet("S0", 16384).unwrap();
+        let s1 = s.add_sheet("S1", 16384).unwrap();
+        // Create on sheet 1 FIRST so we prove the sort (by sheet id) and not
+        // insertion/HashMap order.
+        s.create_table(TableSpec {
+            name: "Beta".into(),
+            sheet: s1,
+            top_row: 0,
+            top_col: 0,
+            rows: 2,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["Col".into()],
+        })
+        .unwrap();
+        s.create_table(TableSpec {
+            name: "Alpha".into(),
+            sheet: s0,
+            top_row: 0,
+            top_col: 0,
+            rows: 2,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["Col".into()],
+        })
+        .unwrap();
+
+        let snap = s.snapshot().unwrap();
+        assert_eq!(snap.tables.len(), 2, "both tables present");
+        // Sorted by (sheet, name): sheet 0's ALPHA before sheet 1's BETA.
+        assert_eq!(snap.tables[0].name, "ALPHA");
+        assert_eq!(snap.tables[0].sheet, s0);
+        assert_eq!(snap.tables[1].name, "BETA");
+        assert_eq!(snap.tables[1].sheet, s1);
+    }
+
+    /// A workbook with no tables → the field is empty (and, being
+    /// `skip_serializing_if = "Vec::is_empty"`, omitted on the wire).
+    #[test]
+    fn fe5_snapshot_tables_empty_when_none_defined() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("S", 16384).unwrap();
+        let snap = s.snapshot().unwrap();
+        assert!(snap.tables.is_empty(), "no tables → empty vec");
+        // The additive field is omitted from the serialized form when empty.
+        let json = serde_json::to_value(&snap).unwrap();
+        assert!(
+            json.get("tables").is_none(),
+            "empty tables is skip-serialized (additive/backward-safe)"
+        );
     }
 
     /// **THE critical persistence test (resurrect-on-reload).** Define a name,

@@ -932,6 +932,40 @@ pub struct NamedRangeJson {
     pub scope: Option<u32>,
 }
 
+/// **FE-5 W-? (Builder E, 2026-06-13):** one structured table's metadata in
+/// `WorkbookSnapshotJson.tables` — the JS read surface the IDE renders table chrome
+/// from (header/totals styling, banded rows, the table-name badge). Mirrors
+/// [`ql_session::TableSnapshot`] (the snapshot OUTPUT DTO — distinct from the
+/// `createTable`-INPUT [`TableSpecJson`], which has no `displayName` / carries the
+/// create-only `columnNames`).
+///
+/// napi-rs serializes the snake_case Rust field names to camelCase JSON:
+/// `display_name`→`displayName`, `top_row`→`topRow`, `top_col`→`topCol`,
+/// `has_header`→`hasHeader`, `has_totals`→`hasTotals` (matching the sibling
+/// `TableSpecJson`/`CellRangeJson` convention). Coordinates are emitted as the
+/// engine's `u32`/`u16` (no `f64` widening — this is an OUTPUT, read directly).
+#[napi(object)]
+pub struct TableSnapshotJson {
+    /// Canonical (uppercase) table name.
+    pub name: String,
+    /// Display name (case-preserving). Equals `name` when none was supplied.
+    pub display_name: String,
+    /// Anchor sheet id — which sheet the IDE draws the table chrome on.
+    pub sheet: u32,
+    /// Top-left row of the full footprint.
+    pub top_row: u32,
+    /// Top-left column of the full footprint.
+    pub top_col: u32,
+    /// Total rows (incl. header/totals if present).
+    pub rows: u32,
+    /// Total columns.
+    pub cols: u32,
+    /// `true` iff the first footprint row is a header row.
+    pub has_header: bool,
+    /// `true` iff the last footprint row is a totals row.
+    pub has_totals: bool,
+}
+
 /// **FE-5 W-N (2026-06-12):** project a storage `ql_storage::NamedTarget`
 /// DIRECTLY into the JS [`NamedTargetJson`] — used by the CollabSession
 /// `workbook_snapshot` path (which holds a rebuilt `ql_storage::Workbook`, not a
@@ -1025,6 +1059,49 @@ fn collect_named_ranges_json(workbook: &ql_storage::Workbook) -> Vec<NamedRangeJ
     }
     names.sort_by(|a, b| a.scope.cmp(&b.scope).then_with(|| a.name.cmp(&b.name)));
     names
+}
+
+/// **FE-5 W-? (Builder E, 2026-06-13):** map a contract [`ql_session::TableSnapshot`]
+/// to the JS [`TableSnapshotJson`] — used by the owning-`Session` snapshot path
+/// (which holds a `ql_session::WorkbookSnapshot`). TOTAL field map (No-Fallbacks).
+fn table_snapshot_json_from_session(t: ql_session::TableSnapshot) -> TableSnapshotJson {
+    TableSnapshotJson {
+        name: t.name,
+        display_name: t.display_name,
+        sheet: u32::from(t.sheet),
+        top_row: t.top_row,
+        top_col: t.top_col,
+        rows: t.rows,
+        cols: t.cols,
+        has_header: t.has_header,
+        has_totals: t.has_totals,
+    }
+}
+
+/// **FE-5 W-? (Builder E, 2026-06-13):** walk a rebuilt `ql_storage::Workbook` for
+/// ALL its structured tables (the table table is workbook-level + name-keyed, so
+/// one `tables().iter()` yields every table once; each carries its own anchor
+/// `sheet`). Used by the CollabSession `workbook_snapshot` path (which holds a
+/// rebuilt `ql_storage::Workbook`, not a `ql_session::WorkbookSnapshot`). Sorted by
+/// `(sheet, name)` to match the owning-Session `collect_tables`. TOTAL field map.
+fn collect_tables_json(workbook: &ql_storage::Workbook) -> Vec<TableSnapshotJson> {
+    let mut tables: Vec<TableSnapshotJson> = workbook
+        .tables()
+        .iter()
+        .map(|(_canonical, meta)| TableSnapshotJson {
+            name: meta.name.as_ref().to_owned(),
+            display_name: meta.display_name.as_ref().to_owned(),
+            sheet: u32::from(meta.sheet),
+            top_row: meta.top_row,
+            top_col: meta.top_col,
+            rows: meta.rows,
+            cols: meta.cols,
+            has_header: meta.has_header,
+            has_totals: meta.has_totals,
+        })
+        .collect();
+    tables.sort_by(|a, b| a.sheet.cmp(&b.sheet).then_with(|| a.name.cmp(&b.name)));
+    tables
 }
 
 /// **FE-5 W-N (2026-06-12):** map a contract [`ql_session::NamedRange`] to the
@@ -1356,6 +1433,19 @@ pub struct WorkbookSnapshotJson {
     /// **Additive field** (the snapshot schema bumped 1 → 2 alongside this):
     /// `.sheets`/`.formats`-destructuring consumers are unaffected.
     pub names: Vec<NamedRangeJson>,
+
+    /// **FE-5 W-? (Builder E, 2026-06-13):** every structured table in the workbook
+    /// (across ALL sheets), so the IDE can render table chrome. Sorted (by sheet id,
+    /// then canonical name) for a stable shape. Empty when no tables are defined.
+    ///
+    /// Like `names`, structured-table changes are delta-INVISIBLE (not in
+    /// `WorkbookSnapshotDeltaJson` — a table op bumps the epoch and forces a full
+    /// reseed), so the IDE refreshes the table list via a full
+    /// `workbookSnapshot()` / `snapshot()` call, not via `snapshotDelta`.
+    ///
+    /// **Additive field** (the snapshot schema bumped 2 → 3 alongside this):
+    /// `.sheets`/`.formats`/`.names`-destructuring consumers are unaffected.
+    pub tables: Vec<TableSnapshotJson>,
 }
 
 /// **Phase 5.7 V3.6.0.3 D2 (2026-05-24)** -- one format registration
@@ -3075,6 +3165,10 @@ impl CollabSession {
         // sorted). `set_workbook_cache` above only `Arc::clone`d `workbook`
         // (no move), so borrowing it here is fine.
         let names = collect_named_ranges_json(&workbook);
+        // Builder E (2026-06-13): structured tables from the rebuilt workbook
+        // (workbook-level table table; both `workbook` borrows are fine — the
+        // earlier `set_workbook_cache` only `Arc::clone`d, no move).
+        let tables = collect_tables_json(&workbook);
         Ok(WorkbookSnapshotJson {
             sheets,
             formats,
@@ -3084,6 +3178,7 @@ impl CollabSession {
             // 6.3-1c M5: stamp the contract schema version on every snapshot DTO.
             schema_version: ql_session::SCHEMA_VERSION,
             names,
+            tables,
         })
     }
 
@@ -5630,6 +5725,13 @@ fn workbook_snapshot_json_from_session(snap: ql_session::WorkbookSnapshot) -> Wo
             .names
             .into_iter()
             .map(named_range_json_from_session)
+            .collect(),
+        // Builder E (2026-06-13): structured tables (all sheets; already sorted
+        // engine-side by collect_tables).
+        tables: snap
+            .tables
+            .into_iter()
+            .map(table_snapshot_json_from_session)
             .collect(),
     }
 }
