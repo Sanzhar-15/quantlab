@@ -434,6 +434,24 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (6.3-3)`);
 				}
 			}
+			// **FE-6 M (2026-06-12):** the MCP write tools' engine surface -- structural
+			// insert/delete rows+columns + the cell-style intern/commit pair. A stale cdylib
+			// (built before FE-6 M) lacks these; a structural/style MCP write would otherwise fail
+			// at the use-site inside `commit` (post-modal) with "X is not a function" instead of
+			// loud at the loader boundary. Validated here (the established per-version discipline,
+			// alongside the 6.3-2a setFormat/registerFormat format-intern pair above).
+			for (const method of [
+				'insertRows',
+				'deleteRows',
+				'insertColumns',
+				'deleteColumns',
+				'registerStyle',
+				'setStyle',
+			]) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (FE-6 M)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

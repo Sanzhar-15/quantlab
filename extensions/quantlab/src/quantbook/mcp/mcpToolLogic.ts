@@ -21,6 +21,7 @@ import type {
 	CellRangeJson,
 	CellSnapshotJson,
 	CellValueJson,
+	DiagnosticJson,
 	FunctionMetadataJson,
 	RangeResultJson,
 	SheetInfoJson,
@@ -40,6 +41,13 @@ export interface McpSessionPort {
 	queryRange(range: CellRangeJson, options: { includeFormulas: boolean; includeFormats: boolean; includeRendered: boolean }): RangeResultJson;
 	snapshot(): WorkbookSnapshotJson;
 	listFunctions(): FunctionMetadataJson[];
+	/**
+	 * **FE-6 M (2026-06-12)**: parse + bind a formula WITHOUT mutating (the keystroke-validation path). A
+	 * malformed formula returns a non-empty {@link DiagnosticJson}`[]` as DATA (NOT a thrown error); an
+	 * empty array means valid. `text` is the formula BODY with NO leading `=` (engine convention). Backs
+	 * the read-only `validate_formula` tool so an agent can dry-run a formula before writing it.
+	 */
+	validateFormula(sheet: number, row: number, col: number, text: string): DiagnosticJson[];
 }
 
 /**
@@ -339,6 +347,21 @@ export interface GetPublishedVariablesResult {
 	variables: PublishedVariableResult[];
 }
 
+/**
+ * **FE-6 M (2026-06-12)**: result of `validate_formula` -- the engine diagnostics for a dry-run parse+bind.
+ * `valid` is `diagnostics.length === 0` (a convenience the agent can branch on). `sheet`/`row`/`col` echo
+ * the position the formula was validated at (relative refs bind relative to it). An empty `diagnostics`
+ * means the formula is well-formed + binds; a non-empty list carries each parse/bind problem.
+ */
+export interface ValidateFormulaResult {
+	sessionId: string;
+	sheet: number;
+	row: number;
+	col: number;
+	valid: boolean;
+	diagnostics: DiagnosticJson[];
+}
+
 // --- the six read-only tool handlers (pure) ----------------------------------------------------
 
 /** list_sheets: every live (non-tombstoned) sheet of the target grid's workbook. */
@@ -453,6 +476,47 @@ export function toolGetPublishedVariables(ctx: McpHostContext, args: { sessionId
 		range: p.range,
 	}));
 	return { sessionId: grid.id, variables };
+}
+
+/**
+ * validate_formula: dry-run a formula through the engine's parse+bind WITHOUT mutating. Returns the
+ * {@link DiagnosticJson}`[]` (empty = valid) so an agent can check a formula before a `set_cell`/`write_cells`
+ * write. The formula is validated AT a position (relative refs bind relative to it): `a1` gives that
+ * position (sheet-qualified or with a `sheet` arg / the grid's focused sheet); with no `a1`, A1 of the
+ * resolved sheet is used. A leading "=" in `formula` is stripped (the engine expects the BODY). The engine
+ * returns diagnostics as DATA -- a malformed formula does NOT throw here; only a resolution failure (bad
+ * sheet / bad a1) throws loud (No-Fallbacks).
+ */
+export function toolValidateFormula(ctx: McpHostContext, args: { sessionId?: string; formula: string; sheet?: number | string; a1?: string }): ValidateFormulaResult {
+	const grid = resolveTargetGrid(ctx, args.sessionId);
+	if (typeof args.formula !== 'string') {
+		throw new McpToolError('bad_argument', 'validate_formula: `formula` must be a string');
+	}
+	const sheets = grid.session.listSheets();
+	// Resolve the validation position. With an a1, reuse the get_cell single-cell resolution (sheet-
+	// qualified or sheet-arg or focused-sheet fallback). With no a1, validate at A1 of the resolved sheet
+	// (the sheet arg, else the focused sheet) -- a stable default position for relative-ref binding.
+	let sheetId: number;
+	let row: number;
+	let col: number;
+	if (args.a1 !== undefined) {
+		const range = resolveCellTarget(grid, sheets, args.a1, args.sheet);
+		sheetId = range.sheet;
+		row = range.startRow;
+		col = range.startCol;
+	} else {
+		sheetId = resolveSheetId(sheets, args.sheet ?? grid.sheet);
+		row = 0;
+		col = 0;
+	}
+	// The engine expects the formula BODY (no leading "="). trimStart FIRST, then strip ONE optional
+	// leading "=", and validate THAT trimmed body in BOTH branches (Opus LOW: the no-"=" branch
+	// previously validated the UN-trimmed original -- inconsistent leading-whitespace handling). So an
+	// agent may pass "=SUM(A1:A9)", "SUM(A1:A9)", or a leading-whitespace variant and get the same body.
+	const trimmed = args.formula.trimStart();
+	const body = trimmed.startsWith('=') ? trimmed.slice(1) : trimmed;
+	const diagnostics = grid.session.validateFormula(sheetId, row, col, body);
+	return { sessionId: grid.id, sheet: sheetId, row, col, valid: diagnostics.length === 0, diagnostics };
 }
 
 /**

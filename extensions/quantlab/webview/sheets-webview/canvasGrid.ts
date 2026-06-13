@@ -24,7 +24,7 @@
  * tested in `gridLayoutA1.ts` and the drawing is covered by the behavioral smoke + the closure audit.
  */
 
-import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
+import type { QuantbookCellSnapshot, TableSnapshotJson } from '../../src/quantbook/types';
 import { clampDisplayString, formatCellValue, isRenderableValue } from './cellRender';
 import { borderWidthPx, bordersToPaint, type ResolvedBorderEdge, type ResolvedCellStyle } from './cellStyleModel';
 import type { ScrollBlit } from './gridBlitA1';
@@ -111,6 +111,35 @@ const ACCENT_RANGE_FILL_ALPHA = 0.15;
 /** Very light gridline (`~#e0e0e0` on white) -- the Sheets gridline on a light theme. On a dark theme the
  * palette derives a faint low-contrast line from `--vscode-panel-border` instead (see readPalette). */
 const SHEETS_GRIDLINE_LIGHT = 'rgba(0,0,0,0.10)';
+
+// ============================================================================
+// Tables wave (2026-06-13) -- structured-table banding colors.
+//
+// A structured table ({@link TableSnapshotJson}) paints, OVER the gridlines + UNDER the cell borders/text, a
+// header band on its first row (when `hasHeader`), an alternating ~10% tint on its data rows (skipping a
+// `hasTotals` last row), and an outer border around the full range. These are RANGE-level paint hints --
+// the cell grid draws them directly from the table spec, NOT via the per-cell `styleAt`/`styleId` path.
+//
+// **Legible on light AND dark.** Defined here as the literal light-theme values the spec named; the dark
+// variants are derived in {@link CanvasGridRenderer.readPalette} (a header/band needs a LIGHTER wash on a
+// dark editor, the same way `headerBg`/`border` flip by theme). The header is the brand accent at a low
+// alpha (so a table reads as a branded block, like Excel's table styles), the band a neutral tint, and the
+// border a mid-strength neutral stroke. All are TRANSLUCENT washes so the cell value reads through.
+// ============================================================================
+/** Alpha for a table HEADER-row band (the brand accent wash on the first row of a table with `hasHeader`).
+ * Higher than the data-row band so the header reads as the heavier block, Excel-table-style. */
+const TABLE_HEADER_ALPHA = 0.22;
+/** Alpha for the ~10% alternating DATA-row band tint (every other data row of a table). Subtle so the
+ * banding aids row-tracking without overpowering the cell values. */
+const TABLE_BAND_ALPHA = 0.10;
+/** The table OUTER-BORDER stroke on a LIGHT theme (a mid-strength neutral, distinctly heavier than the
+ * faint gridline so the table's extent reads as a bounded block). The dark variant is derived in
+ * {@link CanvasGridRenderer.readPalette}. */
+const TABLE_BORDER_COLOR_LIGHT = 'rgba(0,0,0,0.45)';
+/** The table outer-border stroke on a DARK theme (a light neutral, the dark-mode analog of the above). */
+const TABLE_BORDER_COLOR_DARK = 'rgba(255,255,255,0.45)';
+/** The table outer-border stroke WIDTH in CSS px (heavier than the 1px gridline so the extent reads). */
+const TABLE_BORDER_WIDTH_PX = 2;
 
 /** The active (selected) cell. */
 export interface ActiveCell {
@@ -219,6 +248,121 @@ interface Palette {
 	headerHoverBg: string;
 	// Sheets retheme: the muted fill for the small select-all corner triangle (top-left corner box).
 	cornerTriangle: string;
+	// Tables wave (2026-06-13): a structured table's HEADER-row band (brand accent wash). Translucent so
+	// header text reads through; the heavier of the two table washes.
+	tableHeaderBand: string;
+	// Tables wave: a structured table's alternating DATA-row band (~10% neutral tint). Translucent.
+	tableDataBand: string;
+	// Tables wave: a structured table's OUTER border stroke (mid-strength neutral, heavier than gridlines;
+	// flips light/dark like `border`).
+	tableBorder: string;
+}
+
+/** **Tables wave (2026-06-13)** -- a half-open cell-INDEX range of the pane currently being painted (the
+ * windowed `[start, end)` rows + cols `paintCellRegion` iterates). `computeTablePaint` intersects each table
+ * against this. */
+export interface TableVisibleRange {
+	readonly rowStart: number;
+	readonly rowEnd: number;
+	readonly colStart: number;
+	readonly colEnd: number;
+}
+
+/** **Tables wave (2026-06-13)** -- the paint plan for ONE on-pane structured table, in cell-INDEX space (the
+ * renderer converts to device px via `colX`/`rowY`). All ranges are half-open `[start, end)`. */
+export interface TablePaint {
+	/** The header row index, or `null` when the table has no header OR the header row is off-pane. The fill
+	 * spans `[fillColStart, fillColEnd)`. */
+	readonly headerRow: number | null;
+	/** The data-row indices to BAND (the alternating zebra rows), clipped to the visible row window and to
+	 * the table's data rows (excludes the header row and a `hasTotals` final row). */
+	readonly bandRows: readonly number[];
+	/** The visible column span (clipped to the pane) the header/band fills cover -- `[colStart, colEnd)`. */
+	readonly fillColStart: number;
+	readonly fillColEnd: number;
+	/** The FULL table extent in cell indices (NOT clipped to the pane -- the canvas pane clip trims the
+	 * off-pane portion of the stroked outer border). `[rowStart, rowEnd) x [colStart, colEnd)`. */
+	readonly borderRowStart: number;
+	readonly borderRowEnd: number;
+	readonly borderColStart: number;
+	readonly borderColEnd: number;
+}
+
+/**
+ * **Tables wave (2026-06-13)** -- PURE table-paint planner. For each structured table that intersects the
+ * `visible` pane, returns its header row, the alternating data-band rows (clipped to the pane), the visible
+ * column fill span, and the full-extent border rectangle (for the outer stroke; the canvas clip trims it).
+ * A table entirely off-pane yields NOTHING (it is skipped). No canvas/DOM -- golden-testable.
+ *
+ * Conventions matching {@link TableSnapshotJson}: the range is `[topRow, topRow+rows) x [topCol, topCol+cols)`;
+ * the FIRST row is the header iff `hasHeader`; the LAST row is a totals row iff `hasTotals` (it is excluded
+ * from the data banding). Banding is applied to EVERY OTHER data row, starting with the SECOND data row (so
+ * the first data row directly under the header is unbanded, the Excel/Sheets default-table-style cadence).
+ *
+ * **Defensive (No-Fallbacks-adjacent):** a degenerate spec (`rows<=0`, `cols<=0`, or a non-finite/negative
+ * coordinate) is SKIPPED -- it cannot describe a paintable rectangle. This is not masking an error: the
+ * engine owns table validity; the renderer simply does not paint a non-rectangle. (The host already
+ * `console.warn`s a structurally-broken table; here we just no-op it rather than throw mid-paint.)
+ */
+export function computeTablePaint(
+	tables: readonly TableSnapshotJson[],
+	visible: TableVisibleRange,
+): TablePaint[] {
+	const out: TablePaint[] = [];
+	for (const t of tables) {
+		// Degenerate / malformed spec -> not a paintable rectangle. Skip (the host warns on broken specs).
+		if (
+			// `topRow`/`topCol` use `Number.isInteger` (NOT merely `Number.isFinite`) for the SAME reason as
+			// `rows`/`cols`: a fractional coordinate (e.g. topRow=2.5) describes no cell boundary, and feeding it
+			// to the row/col-pitch geometry below would paint a half-row-misaligned band. A grid coordinate is
+			// always a whole, non-negative index; the `< 0` checks below keep the non-negativity guard.
+			!Number.isInteger(t.topRow) || !Number.isInteger(t.topCol) ||
+			!Number.isInteger(t.rows) || !Number.isInteger(t.cols) ||
+			t.rows <= 0 || t.cols <= 0 || t.topRow < 0 || t.topCol < 0
+		) {
+			continue;
+		}
+		const tRowStart = t.topRow;
+		const tRowEnd = t.topRow + t.rows; // half-open
+		const tColStart = t.topCol;
+		const tColEnd = t.topCol + t.cols; // half-open
+		// Off-pane in either axis -> nothing to paint for this table.
+		if (tRowEnd <= visible.rowStart || tRowStart >= visible.rowEnd || tColEnd <= visible.colStart || tColStart >= visible.colEnd) {
+			continue;
+		}
+		// Visible column span the fills cover (clipped to the pane).
+		const fillColStart = Math.max(tColStart, visible.colStart);
+		const fillColEnd = Math.min(tColEnd, visible.colEnd);
+		// Header row: the table's first row, IFF the table has a header AND that row is in the visible window.
+		const headerRowIdx = tRowStart;
+		const headerRow = t.hasHeader && headerRowIdx >= visible.rowStart && headerRowIdx < visible.rowEnd ? headerRowIdx : null;
+		// Data rows: everything between the (optional) header and the (optional) totals row.
+		const dataRowStart = tRowStart + (t.hasHeader ? 1 : 0);
+		const dataRowEnd = tRowEnd - (t.hasTotals ? 1 : 0); // half-open
+		const bandRows: number[] = [];
+		// Band every OTHER data row, starting at the SECOND data row (index parity from dataRowStart). Clip to
+		// the visible window so we never plan a fill for an off-pane row.
+		const visRowStart = Math.max(dataRowStart, visible.rowStart);
+		const visRowEnd = Math.min(dataRowEnd, visible.rowEnd);
+		for (let r = visRowStart; r < visRowEnd; r += 1) {
+			// (r - dataRowStart) is the 0-based data-row ordinal; band the ODD ordinals (1,3,5,...) so the row
+			// directly under the header stays unbanded.
+			if ((r - dataRowStart) % 2 === 1) {
+				bandRows.push(r);
+			}
+		}
+		out.push({
+			headerRow,
+			bandRows,
+			fillColStart,
+			fillColEnd,
+			borderRowStart: tRowStart,
+			borderRowEnd: tRowEnd,
+			borderColStart: tColStart,
+			borderColEnd: tColEnd,
+		});
+	}
+	return out;
 }
 
 /** Renders a {@link QuantbookCellSnapshot} as an A1 grid onto a canvas. One instance per panel. */
@@ -229,6 +373,12 @@ export class CanvasGridRenderer {
 	 * iterates (Audit C1-HIGH1: no separate `snapshot.entries` scan). A STRING key (not
 	 * `row*MAX_COLS+col`) so an out-of-extent coordinate can never collide with a visible cell. */
 	private entryByCell = new Map<string, QuantbookCellSnapshot['entries'][number]>();
+	/**
+	 * **Tables wave (2026-06-13)** -- the structured tables on the CURRENT sheet, set by {@link setSnapshot}
+	 * from {@link QuantbookCellSnapshot.tables} (already filtered to this sheet host-side). Painted as
+	 * header/data bands + an outer border in {@link paintCellRegion} (step 2.25), independent of the per-cell
+	 * `styleAt` path. Empty when the snapshot carries no tables (the common case). */
+	private tables: readonly TableSnapshotJson[] = [];
 	private palette: Palette;
 	private bodyFont: string;
 	private headerFont: string;
@@ -394,6 +544,10 @@ export class CanvasGridRenderer {
 			}
 			this.entryByCell.set(entry.row + ',' + entry.col, entry);
 		}
+		// **Tables wave (2026-06-13)**: store this sheet's structured tables (already host-filtered to the
+		// active sheet). Absent => no tables (`[]`). The values are READ at paint time by `computeTablePaint`;
+		// no validation here -- `computeTablePaint` defensively clips and skips a malformed/degenerate spec.
+		this.tables = Array.isArray(snapshot.tables) ? snapshot.tables : [];
 	}
 
 	/** The populated entry at (row,col), or undefined for an empty cell (hover + edit pre-fill). */
@@ -845,6 +999,70 @@ export class CanvasGridRenderer {
 	 * exactly like the fill + value loops. A no-op when no visible cell carries a border (the common case),
 	 * and entirely a no-op for the session-store render source (which has no borders).
 	 */
+	/**
+	 * **Tables wave (2026-06-13)** -- paint the structured tables intersecting this pane: a header band on
+	 * the first row (when `hasHeader`), an alternating ~10% tint on the data rows (skipping a `hasTotals`
+	 * last row), and an outer border around the full range. RANGE-level metadata -- driven by the pure
+	 * {@link computeTablePaint} plan, NOT the per-cell `styleAt` path. A no-op when this sheet has no tables.
+	 *
+	 * Geometry mirrors the fill/gridline/border loops: a cell spans `[x, x+COL_WIDTH) x [y, y+ROW_HEIGHT)`
+	 * with origins snapped to a whole CSS px. The band fills span the table's VISIBLE column window (clipped
+	 * by `computeTablePaint`); the outer border strokes the table's FULL extent and the caller's pane `clip()`
+	 * trims any off-pane portion. The fills are translucent washes (palette) so cell values read through.
+	 */
+	private paintTables(
+		rowRange: { startIdx: number; endIdx: number },
+		colRange: { startIdx: number; endIdx: number },
+		effScrollTop: number,
+		effScrollLeft: number,
+		gutterW: number,
+	): void {
+		if (this.tables.length === 0) {
+			return; // common case -- no tables on this sheet
+		}
+		const ctx = this.ctx;
+		const plans = computeTablePaint(this.tables, {
+			rowStart: rowRange.startIdx,
+			rowEnd: rowRange.endIdx,
+			colStart: colRange.startIdx,
+			colEnd: colRange.endIdx,
+		});
+		for (const plan of plans) {
+			// X span of the visible fill columns: left edge of fillColStart .. right edge of (fillColEnd-1).
+			const fx0 = Math.round(colX(plan.fillColStart, gutterW) - effScrollLeft);
+			const fx1 = Math.round(colX(plan.fillColEnd, gutterW) - effScrollLeft);
+			const fillW = fx1 - fx0;
+			// Header band (brand accent wash) on the first row, when present + visible.
+			if (plan.headerRow !== null && fillW > 0) {
+				const hy = Math.round(rowY(plan.headerRow) - effScrollTop);
+				ctx.fillStyle = this.palette.tableHeaderBand;
+				ctx.fillRect(fx0, hy, fillW, ROW_HEIGHT);
+			}
+			// Alternating data-row bands (neutral wash).
+			if (plan.bandRows.length > 0 && fillW > 0) {
+				ctx.fillStyle = this.palette.tableDataBand;
+				for (const r of plan.bandRows) {
+					const by = Math.round(rowY(r) - effScrollTop);
+					ctx.fillRect(fx0, by, fillW, ROW_HEIGHT);
+				}
+			}
+			// Outer border around the FULL table extent (the pane clip trims the off-pane portion). Stroke is
+			// inside-aligned by half its width on each edge so the 2px line sits fully within the range rect.
+			const bx0 = Math.round(colX(plan.borderColStart, gutterW) - effScrollLeft);
+			const bx1 = Math.round(colX(plan.borderColEnd, gutterW) - effScrollLeft);
+			const by0 = Math.round(rowY(plan.borderRowStart) - effScrollTop);
+			const by1 = Math.round(rowY(plan.borderRowEnd) - effScrollTop);
+			if (bx1 > bx0 && by1 > by0) {
+				const half = TABLE_BORDER_WIDTH_PX / 2;
+				ctx.save();
+				ctx.strokeStyle = this.palette.tableBorder;
+				ctx.lineWidth = TABLE_BORDER_WIDTH_PX;
+				ctx.strokeRect(bx0 + half, by0 + half, (bx1 - bx0) - TABLE_BORDER_WIDTH_PX, (by1 - by0) - TABLE_BORDER_WIDTH_PX);
+				ctx.restore();
+			}
+		}
+	}
+
 	private paintCellBorders(
 		rowRange: { startIdx: number; endIdx: number },
 		colRange: { startIdx: number; endIdx: number },
@@ -1003,6 +1221,12 @@ export class CanvasGridRenderer {
 			ctx.lineTo(clipX1, y);
 		}
 		ctx.stroke();
+
+		// 2.25 Tables wave (2026-06-13): structured-table banding -- header band, alternating data-row bands,
+		// and an outer border -- painted OVER the gridlines (step 2) but UNDER the per-cell borders (step 2.5)
+		// and the cell text (step 3), so a table's banding sits behind its values + any per-cell borders. This
+		// is RANGE-level metadata (NOT the per-cell `styleAt` path). A no-op when this sheet has no tables.
+		this.paintTables(rowRange, colRange, effScrollTop, effScrollLeft, gutterW);
 
 		// 2.5 FE-5 W-R (2026-06-12): per-edge cell BORDERS, painted OVER the faint gridlines (so a thin black
 		// border is not washed out by the gridline beneath it) but UNDER the cell text + the selection/range
@@ -1651,6 +1875,18 @@ export class CanvasGridRenderer {
 			// Excel/Sheets accent their select-all affordance; ours is the brand mark in the corner box). A
 			// tiny glyph, so the full-strength accent reads as a deliberate accent, not noise.
 			cornerTriangle: accent,
+			// Tables wave (2026-06-13): a table HEADER band is the brand accent wash (Excel-table-style branded
+			// header), derived from the SAME resolved accent as every other accent wash so a themed accent tints
+			// the table too. A translucent wash -> header text reads through; legible on light + dark (the alpha
+			// is what's tuned, not a per-theme hue).
+			tableHeaderBand: tint(TABLE_HEADER_ALPHA),
+			// Tables wave: the alternating DATA-row band is a NEUTRAL foreground-tinted wash (not the accent), so
+			// it reads as a quiet zebra-stripe, not a second accent block. A foreground tint flips with the theme
+			// (dark fg-on-light / light fg-on-dark) the same way `headerBg` does.
+			tableDataBand: isDark ? 'rgba(255,255,255,' + TABLE_BAND_ALPHA + ')' : 'rgba(0,0,0,' + TABLE_BAND_ALPHA + ')',
+			// Tables wave: the outer border flips light/dark (a dark stroke on a light editor, light on dark) so
+			// the table extent stays legible on both -- the same light/dark split as the gridline `border`.
+			tableBorder: isDark ? TABLE_BORDER_COLOR_DARK : TABLE_BORDER_COLOR_LIGHT,
 		};
 	}
 

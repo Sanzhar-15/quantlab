@@ -60,8 +60,8 @@ suite('FE-5 W-N -- Name Manager engine contract (schema-2 dylib)', () => {
 		loadQuantbookEngine();
 	});
 
-	test('the IDE schema-version mirror was bumped to 2', () => {
-		assert.strictEqual(QUANTBOOK_SCHEMA_VERSION, 2, 'IDE QUANTBOOK_SCHEMA_VERSION must be 2 for the names-carrying dylib');
+	test('the IDE schema-version mirror was bumped to 3', () => {
+		assert.strictEqual(QUANTBOOK_SCHEMA_VERSION, 3, 'IDE QUANTBOOK_SCHEMA_VERSION must be 3 for the tables-carrying dylib');
 	});
 
 	test('setName -> listNames() reports the new Range name (canonical-cased)', () => {
@@ -119,7 +119,7 @@ suite('FE-5 W-N -- Name Manager engine contract (schema-2 dylib)', () => {
 		s.setName('beta', range(sheetId, 0, 1, 0, 1));
 
 		const snap = s.snapshot();
-		assert.strictEqual(snap.schemaVersion, 2, 'a real napi snapshot stamps schemaVersion 2');
+		assert.strictEqual(snap.schemaVersion, 3, 'a real napi snapshot stamps schemaVersion 3');
 		const fromSnap = (snap.names ?? []).map((n) => n.name.toUpperCase()).sort();
 		const fromList = s.listNames().map((n) => n.name.toUpperCase()).sort();
 		assert.deepStrictEqual(fromSnap, fromList, 'snapshot().names and listNames() report the SAME names');

@@ -13,6 +13,7 @@ import * as assert from 'assert';
 import type {
 	CellRangeJson,
 	CellSnapshotJson,
+	DiagnosticJson,
 	FunctionMetadataJson,
 	RangeResultJson,
 	SheetInfoJson,
@@ -34,6 +35,7 @@ import {
 	toolListFunctions,
 	toolListSheets,
 	toolQueryRange,
+	toolValidateFormula,
 	type McpHostContext,
 	type McpSessionPort,
 	type McpTargetGrid,
@@ -50,10 +52,20 @@ interface FakeSheet {
 
 /** A minimal in-memory fake implementing McpSessionPort for the tool handlers. */
 class FakeSession implements McpSessionPort {
+	/** FE-6 M: every validateFormula call is recorded so the handler's coordinate/body resolution is testable. */
+	readonly validateCalls: Array<{ sheet: number; row: number; col: number; text: string }> = [];
+	/** FE-6 M: the canned diagnostics validateFormula returns (default empty = valid). */
+	validateResponse: DiagnosticJson[] = [];
+
 	constructor(private readonly sheets: FakeSheet[], private readonly functions: FunctionMetadataJson[] = []) { }
 
 	listSheets(): SheetInfoJson[] {
 		return this.sheets.map((s) => ({ id: s.id, name: s.name }));
+	}
+
+	validateFormula(sheet: number, row: number, col: number, text: string): DiagnosticJson[] {
+		this.validateCalls.push({ sheet, row, col, text });
+		return this.validateResponse;
 	}
 
 	cell(sheet: number, row: number, col: number): CellSnapshotJson | null {
@@ -408,5 +420,90 @@ suite('B1 MCP -- tool handlers', () => {
 		assert.throws(() => toolGetSnapshot(ctx, {}), McpToolError);
 		assert.throws(() => toolListFunctions(ctx, {}), McpToolError);
 		assert.throws(() => toolGetPublishedVariables(ctx, {}), McpToolError);
+		assert.throws(() => toolValidateFormula(ctx, { formula: '=1' }), McpToolError);
+	});
+});
+
+// --- FE-6 M (2026-06-12): validate_formula (read-only dry-run) ---------------------------------
+
+suite('FE-6 M -- validate_formula', () => {
+	function fixtureSession(): FakeSession {
+		return new FakeSession([{ id: 0, name: 'S0', cells: [] }, { id: 1, name: 'S1', cells: [] }], [fn('SUM')]);
+	}
+
+	test('valid formula -> empty diagnostics + valid=true; the engine got the BODY (no leading "=")', () => {
+		const s = fixtureSession();
+		const ctx = makeCtx([singleGrid(s, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
+		const out = toolValidateFormula(ctx, { formula: '=SUM(A1:A9)', a1: 'S0!B2' });
+		assert.strictEqual(out.valid, true);
+		assert.deepStrictEqual(out.diagnostics, []);
+		assert.strictEqual(out.sheet, 0);
+		assert.strictEqual(out.row, 1);
+		assert.strictEqual(out.col, 1);
+		// The leading "=" is stripped to the engine BODY; the position is the resolved a1.
+		assert.deepStrictEqual(s.validateCalls, [{ sheet: 0, row: 1, col: 1, text: 'SUM(A1:A9)' }]);
+	});
+
+	test('a formula WITHOUT a leading "=" is passed through unchanged', () => {
+		const s = fixtureSession();
+		const ctx = makeCtx([singleGrid(s, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
+		toolValidateFormula(ctx, { formula: 'SUM(A1:A9)', a1: 'S0!A1' });
+		assert.strictEqual(s.validateCalls[0].text, 'SUM(A1:A9)');
+	});
+
+	test('leading whitespace is stripped CONSISTENTLY in BOTH the "=" and no-"=" branches (Opus LOW)', () => {
+		// The "=" branch already validated `trimmed.slice(1)`; the no-"=" branch previously validated the
+		// UN-trimmed original. Both branches now validate the trimmed body, so a leading-whitespace formula
+		// reaches the engine with NO leading whitespace whether or not it carries a "=".
+		const s1 = fixtureSession();
+		const ctx1 = makeCtx([singleGrid(s1, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
+		toolValidateFormula(ctx1, { formula: '   SUM(A1:A9)', a1: 'S0!A1' });
+		assert.strictEqual(s1.validateCalls[0].text, 'SUM(A1:A9)', 'no-"=" branch trims leading whitespace');
+
+		const s2 = fixtureSession();
+		const ctx2 = makeCtx([singleGrid(s2, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
+		toolValidateFormula(ctx2, { formula: '   =SUM(A1:A9)', a1: 'S0!A1' });
+		assert.strictEqual(s2.validateCalls[0].text, 'SUM(A1:A9)', '"=" branch also trims leading whitespace');
+	});
+
+	test('invalid formula -> diagnostics returned as DATA (not thrown), valid=false', () => {
+		const s = fixtureSession();
+		s.validateResponse = [{ severity: 'error', code: 'formula_parse', message: 'unexpected token' }];
+		const ctx = makeCtx([singleGrid(s, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
+		const out = toolValidateFormula(ctx, { formula: '=SUM(', a1: 'S0!A1' });
+		assert.strictEqual(out.valid, false);
+		assert.strictEqual(out.diagnostics.length, 1);
+		assert.strictEqual(out.diagnostics[0].code, 'formula_parse');
+	});
+
+	test('with no a1, validates at A1 of the resolved (focused) sheet', () => {
+		const s = fixtureSession();
+		// Focused sheet is 1 -> the default validation position is sheet 1, A1.
+		const ctx = makeCtx([singleGrid(s, 1, 'grid-0-sheet-1')], 'grid-0-sheet-1');
+		const out = toolValidateFormula(ctx, { formula: '=A1+1' });
+		assert.strictEqual(out.sheet, 1);
+		assert.strictEqual(out.row, 0);
+		assert.strictEqual(out.col, 0);
+		assert.deepStrictEqual(s.validateCalls[0], { sheet: 1, row: 0, col: 0, text: 'A1+1' });
+	});
+
+	test('with no a1 but an explicit sheet arg, validates at A1 of that sheet', () => {
+		const s = fixtureSession();
+		const ctx = makeCtx([singleGrid(s, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
+		const out = toolValidateFormula(ctx, { formula: '=1', sheet: 'S1' });
+		assert.strictEqual(out.sheet, 1);
+	});
+
+	test('rejects an unknown sheet / a range a1 loud (No-Fallbacks)', () => {
+		const s = fixtureSession();
+		const ctx = makeCtx([singleGrid(s, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
+		assert.throws(() => toolValidateFormula(ctx, { formula: '=1', sheet: 'Ghost' }), McpToolError);
+		assert.throws(() => toolValidateFormula(ctx, { formula: '=1', a1: 'S0!A1:B2' }), McpToolError, 'a range is not a single position');
+	});
+
+	test('rejects a non-string formula loud', () => {
+		const s = fixtureSession();
+		const ctx = makeCtx([singleGrid(s, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
+		assert.throws(() => toolValidateFormula(ctx, { formula: 5 as unknown as string }), (e: unknown) => e instanceof McpToolError && /must be a string/.test(e.message));
 	});
 });

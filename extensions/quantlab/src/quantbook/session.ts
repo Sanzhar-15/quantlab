@@ -1124,8 +1124,16 @@ const QUANTBOOK_ERROR_CAUSE_MAX_DEPTH = 8;
  * and the `.node` must move together. There are no v1-only fixtures to migrate
  * (snapshot DTOs leave `schemaVersion` undefined in hand-built fixtures, which the
  * guard tolerates as a no-op -- only a REAL napi snapshot now stamps 2).
+ *
+ * **Tables wave (2026-06-13): 2 -> 3.** The engine bumped `SCHEMA_VERSION` to 3 when it added the ADDITIVE
+ * `tables: TableSnapshotJson[]` field to `WorkbookSnapshotJson` (the structured-table banding/header/border
+ * metadata the cell-grid paints). Additive (a v2 consumer that destructures `.sheets`/`.formats`/`.names`
+ * is unaffected) but the EXACT-match guard still steps so the `.node` and these TS mirrors move together.
+ * MUST land in lockstep with the engine's bump (see contract from Builder E) or every real napi snapshot
+ * trips `[unsupported_schema_version]`. No v2-only fixtures to migrate (hand-built snapshot literals leave
+ * `schemaVersion` undefined, which the guard tolerates).
  */
-export const QUANTBOOK_SCHEMA_VERSION = 2;
+export const QUANTBOOK_SCHEMA_VERSION = 3;
 
 /**
  * **Phase 6.3-1c M5 (2026-05-30):** fail loud if a DTO's `schemaVersion` does not

@@ -47,6 +47,7 @@ import type {
 	StyleDefJson,
 	StyleIdJson,
 	StyleJson,
+	TableSnapshotJson,
 	WorkbookSnapshotDeltaJson,
 	WorkbookSnapshotJson,
 } from '../src/quantbook/types';
@@ -280,6 +281,88 @@ suite('FE-5 W-R extractSheetSnapshot -- projects styleId + styles[] (atomically)
 		const out = extractSheetSnapshot(snapshot, 0)!;
 		assert.strictEqual(out.styles, undefined, 'no styles -> no styles field (absent, conditional-key discipline)');
 		assert.strictEqual(out.entries[0].styleId, undefined);
+	});
+});
+
+// =============================================================================================
+// Tables wave (2026-06-13) -- extractSheetSnapshot per-sheet TABLE filter (the wrong-sheet-bleed guard)
+// =============================================================================================
+
+// A camelCase TableSnapshotJson fixture (the engine's outbound snapshot shape). `sheet` carries the owning
+// sheet id; extractSheetSnapshot filters the workbook-level tables[] to the active sheet by `t.sheet === id`.
+function mkTable(over: Partial<TableSnapshotJson> = {}): TableSnapshotJson {
+	return {
+		name: 'Table1',
+		displayName: 'Table 1',
+		sheet: 0,
+		topRow: 0,
+		topCol: 0,
+		rows: 3,
+		cols: 2,
+		hasHeader: true,
+		hasTotals: false,
+		...over,
+	};
+}
+// A workbook with TWO sheets (ids 0 and 1) and a hand-made tables[] list. Both sheets exist in `sheets` so
+// extractSheetSnapshot does not tombstone-return null; the tables[] is the workbook-level list it filters.
+function wbWithTables(tables: TableSnapshotJson[]): WorkbookSnapshotJson {
+	const sheetA: SheetSnapshotJson = { id: 0, name: 'A', cells: [] };
+	const sheetB: SheetSnapshotJson = { id: 1, name: 'B', cells: [] };
+	return { sheets: [sheetA, sheetB], formats: [], dateSystem: 'Excel1900', tables };
+}
+
+suite('Tables wave (2026-06-13) extractSheetSnapshot -- per-sheet table filter (no wrong-sheet bleed)', function () {
+	test('two tables on two sheets -> the projection for sheet A carries ONLY sheet A\'s table', () => {
+		const tableA = mkTable({ name: 'TblA', displayName: 'Table A', sheet: 0, topRow: 0 });
+		const tableB = mkTable({ name: 'TblB', displayName: 'Table B', sheet: 1, topRow: 5 });
+		const snapshot = wbWithTables([tableA, tableB]);
+
+		const outA = extractSheetSnapshot(snapshot, 0)!;
+		assert.ok(outA !== null, 'sheet 0 exists -> a projection is returned');
+		assert.ok(outA.tables !== undefined, 'sheet A has a table -> the tables field is present');
+		assert.strictEqual(outA.tables!.length, 1, 'ONLY sheet A\'s table projects (sheet B\'s does not bleed in)');
+		assert.strictEqual(outA.tables![0].name, 'TblA');
+		assert.strictEqual(outA.tables![0].sheet, 0);
+
+		// And the symmetric case: sheet B carries ONLY sheet B's table.
+		const outB = extractSheetSnapshot(snapshot, 1)!;
+		assert.strictEqual(outB.tables!.length, 1, 'ONLY sheet B\'s table projects');
+		assert.strictEqual(outB.tables![0].name, 'TblB');
+		assert.strictEqual(outB.tables![0].sheet, 1);
+	});
+
+	test('a sheet with NO tables of its own omits the tables field entirely (conditional-key discipline)', () => {
+		// Both tables live on sheet 1; the projection for sheet 0 must have NO tables field (absent, not []).
+		const snapshot = wbWithTables([mkTable({ sheet: 1, name: 'OnlyB1' }), mkTable({ sheet: 1, name: 'OnlyB2', topRow: 10 })]);
+		const outA = extractSheetSnapshot(snapshot, 0)!;
+		assert.strictEqual(outA.tables, undefined, 'a sheet with no tables of its own -> tables field absent (not an empty array)');
+	});
+
+	test('a table whose `sheet` is undefined is DROPPED (sawTableMissingSheet path -- safe no-paint, not a wrong-sheet bleed)', () => {
+		// A TableSnapshotJson the engine failed to stamp with `sheet`. extractSheetSnapshot cannot attribute it
+		// to any sheet, so it is dropped from EVERY sheet's projection (No-Fallbacks: it console.warns rather
+		// than guessing a sheet). Build the missing-sheet via a cast (the typed shape requires `sheet`).
+		const noSheet = { ...mkTable(), name: 'Orphan' } as TableSnapshotJson;
+		delete (noSheet as { sheet?: number }).sheet;
+		const snapshot = wbWithTables([noSheet]);
+
+		const outA = extractSheetSnapshot(snapshot, 0)!;
+		assert.strictEqual(outA.tables, undefined, 'a table with no `sheet` is not attributed to sheet 0 -> no table projected');
+		const outB = extractSheetSnapshot(snapshot, 1)!;
+		assert.strictEqual(outB.tables, undefined, 'a table with no `sheet` is not attributed to sheet 1 either (dropped everywhere)');
+	});
+
+	test('an orphan (missing-sheet) table does NOT suppress a VALID sibling table on the same sheet', () => {
+		// One orphan + one well-formed table on sheet 0: the orphan drops (warn), the valid one still projects.
+		const orphan = { ...mkTable({ name: 'Orphan' }) } as TableSnapshotJson;
+		delete (orphan as { sheet?: number }).sheet;
+		const valid = mkTable({ name: 'Good', sheet: 0, topRow: 4 });
+		const snapshot = wbWithTables([orphan, valid]);
+		const outA = extractSheetSnapshot(snapshot, 0)!;
+		assert.ok(outA.tables !== undefined, 'the valid sibling still projects');
+		assert.strictEqual(outA.tables!.length, 1, 'the orphan dropped; the valid table remained');
+		assert.strictEqual(outA.tables![0].name, 'Good');
 	});
 });
 

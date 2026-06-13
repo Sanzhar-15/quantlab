@@ -444,6 +444,51 @@ export interface WorkbookSnapshotJson {
 	 * engine ALWAYS returns it -- consumers treat absent as [].
 	 */
 	names?: NamedRangeJson[];
+	/**
+	 * **Tables wave (2026-06-13)**: every structured table in the workbook (mirrors the engine
+	 * `TableSnapshotJson[]`). The cell grid paints each table's header band, alternating data-row banding, and
+	 * outer border as RANGE-level metadata (NOT per-cell styles). Sorted by the engine for a stable, diffable
+	 * shape. Empty when no tables are defined.
+	 *
+	 * The engine bumped its `SCHEMA_VERSION` 2 -> 3 alongside this ADDITIVE field (see
+	 * {@link QUANTBOOK_SCHEMA_VERSION} in `./session`). Declared OPTIONAL in this mirror only so the
+	 * pre-tables test-fixture literals stay valid; the live engine ALWAYS returns it -- consumers treat
+	 * absent as [].
+	 */
+	tables?: TableSnapshotJson[];
+}
+
+/**
+ * **Tables wave (2026-06-13)**: one structured table in the workbook (mirrors the engine
+ * `TableSnapshotJson` / `ql_session::TableSnapshot`). A RANGE-level paint hint -- the cell grid draws a
+ * header band, alternating data-row banding, and an outer border over the rectangle
+ * `[topRow, topRow+rows) x [topCol, topCol+cols)`; it is NOT projected through the per-cell
+ * {@link CellSnapshotJson.styleId} path. Surfaced in {@link WorkbookSnapshotJson.tables} and (filtered to
+ * the active sheet) on {@link QuantbookCellSnapshot.tables}. NOTE: distinct from the create-INPUT
+ * {@link TableSpecJson} that `SessionInstance.createTable` consumes -- this is the snapshot OUTPUT shape.
+ *
+ * `sheet` carries the owning sheet id so {@link QuantbookCellSnapshot} can filter the workbook-level list
+ * to the active sheet (Builder E's napi `TableSnapshotJson` includes it).
+ */
+export interface TableSnapshotJson {
+	/** The table's canonical (engine) name -- a stable identifier. */
+	readonly name: string;
+	/** The table's human display name (Excel shows this; may differ from {@link name}). */
+	readonly displayName: string;
+	/** Owning sheet id. REQUIRED for per-sheet filtering -- see the interface CONTRACT note. */
+	readonly sheet: number;
+	/** Zero-based top row of the table range (inclusive). */
+	readonly topRow: number;
+	/** Zero-based left column of the table range (inclusive). */
+	readonly topCol: number;
+	/** Row count of the table range (the header row, if any, is the FIRST of these). */
+	readonly rows: number;
+	/** Column count of the table range. */
+	readonly cols: number;
+	/** Whether the FIRST row of the range is a header row (painted with the header band). */
+	readonly hasHeader: boolean;
+	/** Whether the LAST row of the range is a totals row (excluded from the data-row banding). */
+	readonly hasTotals: boolean;
 }
 
 /**
@@ -1344,6 +1389,15 @@ export interface QuantbookCellSnapshot {
 	 * always resolves against a styles table from the same engine version (never a stale one).
 	 */
 	readonly styles?: ReadonlyArray<StyleDefJson>;
+	/**
+	 * **Tables wave (2026-06-13)** -- the structured tables on THIS sheet, projected from
+	 * {@link WorkbookSnapshotJson.tables} filtered to {@link sheet} by {@link extractSheetSnapshot}. The
+	 * webview paints each as a header band + alternating data-row banding + outer border (RANGE-level
+	 * metadata, NOT per-cell {@link styleId}). Absent when the source workbook snapshot carries no tables on
+	 * this sheet (the common case) -- the webview treats absent as "no tables", which is correct, NOT a
+	 * masking fallback. Coordinates are ABSOLUTE (same A1 space as {@link entries}).
+	 */
+	readonly tables?: ReadonlyArray<TableSnapshotJson>;
 	readonly entries: ReadonlyArray<{
 		readonly row: number;
 		readonly col: number;

@@ -693,6 +693,56 @@ export class CellGridPanel {
 	 */
 	private deletedSheetWarned: boolean = false;
 
+	/**
+	 * **A4 (2026-06-13) -- structural-shift detection.** A digest of the active sheet's OCCUPIED-CELL
+	 * COORDINATE SET (`row,col` keys) from the LAST render, used by {@link render} to detect a STRUCTURAL
+	 * op (insert/delete rows/cols) and force the webview onto its full-redraw path (mirroring
+	 * `publishedChanged`/`stylesChanged`). On insert/delete every cell at/after the cut shifts its
+	 * coordinate, so the occupied-coordinate set changes wholesale -> the digest changes -> the render
+	 * is flagged `structuralChanged`. The webview's damage fast path keys cells by ABSOLUTE A1 coordinate,
+	 * so a styled cell that MOVED row 5->6 can fail to repaint with its style under a partial diff; the
+	 * full redraw is the always-correct repaint.
+	 *
+	 * Like {@link CellGridPanel}'s style gate this is DEFENSIVE + OVER-FIRES (cheaply, correctly): it also
+	 * fires when a single edit ADDS or CLEARS a cell (the coordinate set changed), which forces a (redundant)
+	 * full redraw on those edits. Editing OVER an existing non-empty cell -- the common typing case -- leaves
+	 * the coordinate set unchanged, so the damage fast path is preserved there. `''` before the first render.
+	 * The empty digest is the genuine "no occupied cells" state, not a masked error (No-Fallbacks).
+	 */
+	private structuralOccupancyKey: string = '';
+
+	/**
+	 * **A4 (2026-06-13)** -- whether the MOST RECENT {@link render} detected a structural coordinate shift
+	 * (see {@link structuralOccupancyKey}). Carried into the `render` postMessage so the webview takes its
+	 * full-redraw path. Stored on the instance (not a local) because {@link postRenderIfReady} is also called
+	 * by the `webviewReady` handshake re-send, where the flag must reflect the snapshot being (re)sent. `false`
+	 * before the first render. A handshake re-send forces a full redraw regardless (fresh webview), so reusing
+	 * the last flag there is correct.
+	 */
+	private latestStructuralChanged: boolean = false;
+
+	/**
+	 * **Tables wave (2026-06-13) -- table-metadata-shift detection.** A digest of the active sheet's TABLE
+	 * LIST (name|sheet|topRow|topCol|rows|cols|hasHeader|hasTotals per table, sorted) from the LAST render,
+	 * the table-level analog of {@link structuralOccupancyKey}. Creating/dropping/moving/resizing a table --
+	 * or toggling its header/totals -- is a RANGE-level paint change that touches NO per-cell `entry`, so the
+	 * `diffSnapshotsA1` damage diff (which diffs only `entries`) returns `[]` and `drawDamage([])` no-ops,
+	 * leaving the table band/border STALE until a later full redraw (scroll/resize). Comparing this digest to
+	 * the prior render's lets {@link render} flag the change and force the webview's full-redraw path -- the
+	 * exact class `publishedChanged`/`stylesChanged`/`structuralChanged` already guard. `''` before the first
+	 * render (and the genuine "no tables on this sheet" state, not a masked error -- No-Fallbacks).
+	 */
+	private tableDigestKey: string = '';
+
+	/**
+	 * **Tables wave (2026-06-13)** -- whether the MOST RECENT {@link render} detected a table-list change
+	 * (see {@link tableDigestKey}). Carried into the `render` postMessage (`tablesChanged`) so the webview ORs
+	 * it into its full-redraw gate. Stored on the instance (not a local), mirroring {@link latestStructuralChanged},
+	 * because {@link postRenderIfReady} is also called by the `webviewReady` handshake re-send, where the flag
+	 * must reflect the snapshot being (re)sent. `false` before the first render.
+	 */
+	private latestTablesChanged: boolean = false;
+
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly session: SessionInstance,
@@ -732,6 +782,57 @@ export class CellGridPanel {
 	 * `cell_diagnostic` messages so the webview hover tooltip explains `#CALC!`/
 	 * `#TIMEOUT!` cells.
 	 */
+	/**
+	 * **A4 (2026-06-13)** -- a stable digest of a sheet snapshot's OCCUPIED-CELL COORDINATE SET, used to
+	 * detect a structural coordinate shift (see {@link structuralOccupancyKey}). The digest is the sorted
+	 * `row,col` keys joined by `;`; it depends ONLY on WHICH coordinates are occupied, not their values --
+	 * so a value-only edit over an existing non-empty cell leaves it unchanged (the damage fast path is
+	 * preserved), while an insert/delete (every cell at/after the cut moves to a new coordinate) changes it.
+	 * Sorting makes it order-independent (the engine may emit entries in any order). An entry whose `row`/
+	 * `col` is not a finite number is skipped (defensive -- the snapshot crosses the napi boundary).
+	 */
+	private static occupancyDigest(snapshot: QuantbookCellSnapshot): string {
+		const keys: string[] = [];
+		for (const e of snapshot.entries) {
+			const r = (e as { row?: unknown }).row;
+			const c = (e as { col?: unknown }).col;
+			if (typeof r === 'number' && Number.isFinite(r) && typeof c === 'number' && Number.isFinite(c)) {
+				keys.push(r + ',' + c);
+			}
+		}
+		keys.sort();
+		return keys.join(';');
+	}
+
+	/**
+	 * **Tables wave (2026-06-13)** -- a stable digest of a sheet snapshot's TABLE LIST, used to detect a
+	 * table-metadata shift (see {@link tableDigestKey}). The digest is the sorted per-table
+	 * `name|sheet|topRow|topCol|rows|cols|hasHeader|hasTotals` rows joined by `\n`; it captures every field
+	 * the canvas paints from (position, extent, header/totals banding), so a moved/resized table or a
+	 * header/totals toggle changes it, while a value-only edit elsewhere on the sheet does not. Sorting makes
+	 * it order-independent (the engine sorts tables, but we do not rely on that here). The snapshot we digest
+	 * is the per-sheet-filtered render snapshot (`QuantbookCellSnapshot.tables`, projected by
+	 * {@link extractSheetSnapshot} to this sheet) -- exactly what the panel posts -- so a per-sheet table
+	 * change is detected. `''` when the sheet carries no tables (the common case). A field that is not the
+	 * expected primitive is stringified defensively (the snapshot crosses the napi boundary).
+	 */
+	private static tableDigest(snapshot: QuantbookCellSnapshot): string {
+		const tables = snapshot.tables;
+		if (tables === undefined || tables.length === 0) {
+			return '';
+		}
+		const rows: string[] = [];
+		for (const t of tables) {
+			rows.push(
+				[t.name, t.sheet, t.topRow, t.topCol, t.rows, t.cols, t.hasHeader, t.hasTotals]
+					.map(v => String(v))
+					.join('|'),
+			);
+		}
+		rows.sort();
+		return rows.join('\n');
+	}
+
 	render(): void {
 		const wbSnapshot = this.acquireWorkbookSnapshot();
 		const sheetSnapshot: QuantbookCellSnapshot | null = extractSheetSnapshot(wbSnapshot, this.sheet);
@@ -786,6 +887,24 @@ export class CellGridPanel {
 		// the webviewReady handshake can (re)send the latest snapshot once the
 		// bundle's channel is live.
 		this.latestSnapshot = decorated;
+		// A4 (2026-06-13): detect a STRUCTURAL coordinate shift (insert/delete rows/cols) by comparing the
+		// occupied-cell coordinate digest with the previous render's. On a structural op every cell at/after
+		// the cut moves, so the set changes wholesale; the webview is told to full-redraw so a MOVED styled
+		// cell repaints with its style (the absolute-A1 damage diff can otherwise miss the shift). Computed on
+		// the active-sheet snapshot we are about to send (entries are this sheet's occupied cells).
+		const occupancyKey = CellGridPanel.occupancyDigest(decorated);
+		this.latestStructuralChanged = occupancyKey !== this.structuralOccupancyKey;
+		this.structuralOccupancyKey = occupancyKey;
+		// Tables wave (2026-06-13): detect a TABLE-METADATA shift (create/drop/move/resize a table or toggle
+		// its header/totals) by comparing the table-list digest with the previous render's. A table change
+		// touches NO per-cell `entry`, so the `diffSnapshotsA1` damage diff returns `[]` and `drawDamage([])`
+		// no-ops -- the band/border would stay STALE until a later full redraw. Flagging it (`tablesChanged`)
+		// forces the webview's full-redraw path, mirroring `structuralChanged`/`stylesChanged`. Digested on the
+		// SAME per-sheet-filtered snapshot we are about to post (`decorated.tables`), so a per-sheet table
+		// change is detected.
+		const tableKey = CellGridPanel.tableDigest(decorated);
+		this.latestTablesChanged = tableKey !== this.tableDigestKey;
+		this.tableDigestKey = tableKey;
 		// W2 error-surface: mirror this sheet's CURRENT stored cell errors (the diagnostic-decorated
 		// snapshot's `kind:'error'` cells) into the Problems panel. Authoritative + auto-clearing: a cell
 		// that recovered to a real value is no longer an error entry, so the bridge replaces this sheet's
@@ -856,6 +975,13 @@ export class CellGridPanel {
 			publishedCells,
 			sheets: this.latestSheets ?? [],
 			activeSheet: this.sheet,
+			// A4 (2026-06-13): whether this render follows a structural coordinate shift (insert/delete) -- the
+			// webview ORs it into its full-redraw gate so a moved styled cell repaints. See `latestStructuralChanged`.
+			structuralChanged: this.latestStructuralChanged,
+			// Tables wave (2026-06-13): whether this render follows a TABLE-LIST change (create/drop/move/resize/
+			// header-totals-toggle) -- the webview ORs it into the same full-redraw gate so the table band/border
+			// repaints even when no per-cell entry changed. See `latestTablesChanged`.
+			tablesChanged: this.latestTablesChanged,
 		}).then(
 			delivered => {
 				if (!delivered && !this._disposed) {

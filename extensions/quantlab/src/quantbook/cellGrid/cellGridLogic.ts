@@ -27,7 +27,7 @@
  * - `panel.webview.postMessage` -> wired as `DispatchDeps.onError`.
  */
 
-import type { CellSnapshotJson, CollabSessionInstance, DiagnosticJson, EventJson, FormatIdJson, FunctionMetadataJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, RgbJson, SessionCellValueInput, SessionInstance, SessionOpJson, SheetSnapshotJson, StyleDefJson, StyleIdJson, StyleJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
+import type { CellSnapshotJson, CollabSessionInstance, DiagnosticJson, EventJson, FormatIdJson, FunctionMetadataJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, RgbJson, SessionCellValueInput, SessionInstance, SessionOpJson, SheetSnapshotJson, StyleDefJson, StyleIdJson, StyleJson, TableSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
 import { assertSupportedSchemaVersion, parseQuantbookError, recalcDirtyChecked, setFormulaValidated, setValueValidated } from '../session';
 // Demo-prep toolbar (2026-06-10): type-only imports so the toolbar-command parser's whitelists stay
 // pinned to the canonical unions (a preset added to FormatPreset / an op added to StructuralOp forces
@@ -1903,6 +1903,7 @@ export function extractSheetSnapshot(
 		sheet: number;
 		entries: SnapshotEntry[];
 		styles?: StyleDefJson[];
+		tables?: TableSnapshotJson[];
 	} = {
 		snapshot_format_version: 1,
 		sheet: sheetId,
@@ -1923,6 +1924,50 @@ export function extractSheetSnapshot(
 	// converted the SAME way, so a cell's id still `===`-matches its styles[] entry on the webview side.
 	if (snapshot.styles !== undefined && snapshot.styles.length > 0) {
 		result.styles = snapshot.styles.map(d => ({ id: styleIdToWire(d.id), style: d.style }));
+	}
+	// **Tables wave (2026-06-13)**: project the workbook-level tables FILTERED to this sheet onto the render
+	// snapshot, so the webview paints each table's header band + banding + outer border. Filtered by
+	// `t.sheet === sheetId` -- a table belongs to exactly one sheet; painting another sheet's tables here
+	// would bleed bands onto the wrong grid. The engine `TableSnapshotJson` carries `sheet` for this. If the
+	// engine omits it, `t.sheet` is `undefined`, the filter matches nothing, and NO tables paint on this
+	// sheet -- a SAFE no-paint (never a wrong-sheet bleed), surfaced LOUD here (No-Fallbacks) so the gap is
+	// visible rather than silently mis-rendering. Fresh `.map` (decoupled from the cached snapshot, mirroring
+	// the styles projection's aliasing fix). Conditional key (absent when this sheet has no tables) keeps the
+	// shape-stability deepStrictEqual key-set tests intact.
+	if (Array.isArray(snapshot.tables) && snapshot.tables.length > 0) {
+		const onSheet: TableSnapshotJson[] = [];
+		let sawTableMissingSheet = false;
+		for (const t of snapshot.tables) {
+			if (typeof t.sheet !== 'number') {
+				sawTableMissingSheet = true;
+				continue; // cannot attribute it to a sheet -> drop it (safe no-paint), flagged below
+			}
+			if (t.sheet === sheetId) {
+				onSheet.push({
+					name: t.name,
+					displayName: t.displayName,
+					sheet: t.sheet,
+					topRow: t.topRow,
+					topCol: t.topCol,
+					rows: t.rows,
+					cols: t.cols,
+					hasHeader: t.hasHeader,
+					hasTotals: t.hasTotals,
+				});
+			}
+		}
+		if (sawTableMissingSheet) {
+			// No-Fallbacks: a table whose `sheet` the engine did not stamp cannot be placed; make the
+			// engine/IDE contract gap VISIBLE rather than guessing the sheet.
+			console.warn(
+				`[cellGrid] extractSheetSnapshot: a TableSpec is missing its 'sheet' field; it cannot be ` +
+				`attributed to a sheet and was NOT painted. The engine must stamp TableSpec.sheet (schema v3 ` +
+				`contract). sheetId=${sheetId}.`,
+			);
+		}
+		if (onSheet.length > 0) {
+			result.tables = onSheet;
+		}
 	}
 	return result;
 }

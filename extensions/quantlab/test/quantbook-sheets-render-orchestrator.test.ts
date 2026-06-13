@@ -239,6 +239,59 @@ suite('FE-2 render orchestrator -- commitSnapshot (damage decision)', function (
 		assert.strictEqual(host.afterFull, 1);
 	});
 
+	test('A4: a STRUCTURAL render (insert/delete) forces a full redraw -- the moved styled row repaints', () => {
+		// A4 (2026-06-13): `index.ts::applyRender` ORs its `structuralChanged` flag into `commitSnapshot`'s
+		// first boolean (the same gate `publishedChanged` rides). On a row insert a styled cell shifts row
+		// 5->6; the absolute-A1 damage diff can mis-repaint the move, so a structural render MUST take the
+		// always-correct full-redraw path. Here we drive the orchestrator the way `applyRender` does for a
+		// structural render: first boolean = `publishedChanged(false) || structuralChanged(true)` = true.
+		const { host, renderer, orch } = make();
+		host.vp = { scrollTop: 0, scrollLeft: 0, cssW: 800, cssH: 600 };
+		// Establish a painted prior frame at the same scroll (so ONLY the structural gate could force full).
+		const prev = snap([entry(5, 2, num(9))]);
+		orch.commitSnapshot(null, prev, false); // first -> full redraw, sets painted + prevPaint
+		renderer.calls.length = 0;
+		host.afterFull = 0;
+		host.afterDamage = 0;
+		// The structural render: the styled cell moved 5->6. A tiny diff at the SAME scroll would normally take
+		// the damage fast path; the structural flag (folded into the first boolean) forces a full redraw.
+		const next = snap([entry(6, 2, num(9))]);
+		const structuralChanged = true;
+		orch.commitSnapshot(prev, next, /* publishedChanged */ false || structuralChanged);
+		assert.strictEqual(renderer.calls.length, 1);
+		assert.strictEqual(renderer.calls[0].kind, 'draw', 'structural render takes the FULL redraw path (never drawDamage)');
+		assert.strictEqual(host.afterFull, 1, 'full-redraw path fires onAfterFullRedraw');
+		assert.strictEqual(host.afterDamage, 0, 'structural render does NOT take the damage diff path');
+	});
+
+	test('Tables wave: a TABLE-ONLY render (identical entries) forces a full redraw -- the band repaints', () => {
+		// Tables wave (2026-06-13): `index.ts::applyRender` ORs its `tablesChanged` flag into `commitSnapshot`'s
+		// first boolean (the same gate `publishedChanged`/`structuralChanged` ride). A table create/drop/move/
+		// resize touches NO per-cell `entry`, so `diffSnapshotsA1` returns `[]` and `drawDamage([])` no-ops --
+		// the table band/border would stay STALE until a later full redraw. Here the entries are IDENTICAL
+		// between prev and next (the only thing that changed is the table list, detected host-side and folded
+		// into the first boolean), so the ONLY thing that can force a full redraw is the tables gate. Mirrors
+		// the A4 structural test's assertion style.
+		const { host, renderer, orch } = make();
+		host.vp = { scrollTop: 0, scrollLeft: 0, cssW: 800, cssH: 600 };
+		// Establish a painted prior frame at the same scroll (so ONLY the tables gate could force full).
+		const prev = snap([entry(0, 0, num(1))]);
+		orch.commitSnapshot(null, prev, false); // first -> full redraw, sets painted + prevPaint
+		renderer.calls.length = 0;
+		host.afterFull = 0;
+		host.afterDamage = 0;
+		// IDENTICAL entries: a table-only change produces no value diff at all. Drive the orchestrator the way
+		// `applyRender` does for a tables render: first boolean = publishedChanged(false) || structuralChanged(false)
+		// || tablesChanged(true) = true.
+		const next = snap([entry(0, 0, num(1))]);
+		const tablesChanged = true;
+		orch.commitSnapshot(prev, next, /* publishedChanged */ false || /* structuralChanged */ false || tablesChanged);
+		assert.strictEqual(renderer.calls.length, 1);
+		assert.strictEqual(renderer.calls[0].kind, 'draw', 'a table-only render takes the FULL redraw path (never drawDamage)');
+		assert.strictEqual(host.afterFull, 1, 'full-redraw path fires onAfterFullRedraw');
+		assert.strictEqual(host.afterDamage, 0, 'a table-only render does NOT take the damage diff path (which would no-op on []) ');
+	});
+
 	test('a scroll change since the last paint forces a full redraw (damage pixels would be stale)', () => {
 		const { host, renderer, orch } = make();
 		host.vp = { scrollTop: 0, scrollLeft: 0, cssW: 800, cssH: 600 };

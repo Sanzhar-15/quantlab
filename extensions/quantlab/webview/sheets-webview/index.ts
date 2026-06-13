@@ -4374,7 +4374,7 @@ function stylesTableChanged(snapshot: QuantbookCellSnapshot): boolean {
 	return changed;
 }
 
-function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean, stylesChanged: boolean): void {
+function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean, stylesChanged: boolean, structuralChanged: boolean = false, tablesChanged: boolean = false): void {
 	// Re-audit MED-4: a valid render supersedes a TRANSIENT banner (malformed-render / un-editable cell)
 	// but must NOT hide an active 'edit' banner -- a sibling render repaints under an open editor whose
 	// over-length value is still invalid; clearing it would mask the bad pending state until next commit.
@@ -4489,7 +4489,13 @@ function applyRender(snapshot: QuantbookCellSnapshot, publishedChanged: boolean,
 	// the last paint). The non-paint prep above (set fullSnapshot, clear/stale-tint errorCells, title/meta,
 	// spacer) stays here -- those are DOM/binding writes this file owns. `commitSnapshot` fires the
 	// `onAfterDamage` host callback (the formula-bar follow) on the damage path.
-	orchestrator.commitSnapshot(prevSnapshot, snapshot, publishedChanged, stylesChanged);
+	// A4 (2026-06-13): a STRUCTURAL render (insert/delete rows/cols) shifts cell A1 coordinates, which the
+	// absolute-keyed damage diff can mis-repaint for a MOVED styled cell -> force the full-redraw path the same
+	// way a published-set change does (the orchestrator's first boolean IS the "force full redraw" gate).
+	// Tables wave (2026-06-13): `tablesChanged` (a create/drop/move/resize/header-totals-toggle render) rides the
+	// SAME gate -- a table change touches no per-cell entry, so the damage diff misses it and the band/border
+	// would stay stale until a later full redraw.
+	orchestrator.commitSnapshot(prevSnapshot, snapshot, publishedChanged || structuralChanged || tablesChanged, stylesChanged);
 	// Sheet-tabs (2026-06-10): after a sheet switch repaints, sync the formula bar to the new sheet's A1
 	// and report the reset selection to the host (deduped via `lastPostedSelectionKey`, so a same-sheet
 	// render is a no-op). Gated on `sheetChanged` so a normal content render is untouched.
@@ -4679,7 +4685,21 @@ window.addEventListener('message', (event: MessageEvent) => {
 		// FE-5 W-R: detect an engine STYLE-TABLE change (definition re-edit) the per-cell styleId damage term
 		// cannot see -> forces a full redraw. Always `false` until the conductor threads `snapshot.styles[]`.
 		const stylesChanged = stylesTableChanged(snapshot);
-		applyRender(snapshot, publishedChanged, stylesChanged);
+		// A4 (2026-06-13): the host flags a render that follows a STRUCTURAL op (insert/delete rows/cols). On a
+		// structural op every cell at/after the cut shifts its A1 coordinate, but the webview's damage diff keys
+		// by ABSOLUTE coordinate, so a styled cell that MOVED row 5->6 can fail to repaint with its style under
+		// the partial diff. Treat it like `publishedChanged`/`stylesChanged` -> force the full-redraw path. The
+		// flag is read defensively (a non-boolean from a drifting host wire is treated as `false`, not an error
+		// here -- a missing flag is the genuine "non-structural render" state, matching the pre-A4 behaviour).
+		const structuralChanged = (msg as { structuralChanged?: unknown }).structuralChanged === true;
+		// Tables wave (2026-06-13): the host flags a render that follows a TABLE-LIST change (create/drop/move/
+		// resize a table or toggle header/totals). A table change touches NO per-cell `entry`, so the damage diff
+		// returns `[]` and `drawDamage([])` no-ops -- the table band/border would stay STALE until a later full
+		// redraw. Treat it like `publishedChanged`/`stylesChanged`/`structuralChanged` -> force the full-redraw
+		// path. Read defensively (a non-`true` value is the genuine "no table change" state, matching pre-tables
+		// behaviour -- not a masked error).
+		const tablesChanged = (msg as { tablesChanged?: unknown }).tablesChanged === true;
+		applyRender(snapshot, publishedChanged, stylesChanged, structuralChanged, tablesChanged);
 		// Sheet-tabs (2026-06-10): repaint the bottom strip from the live sheet list + active id the host
 		// carries on every render. Done after applyRender so a sheet-switch render updates the grid AND the
 		// active-tab highlight together.

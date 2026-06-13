@@ -1510,6 +1510,8 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 			'open', 'save', 'import', 'export',
 			'renameSheet', 'deleteSheet', 'restoreSheet', 'moveSheet', 'setName',
 			'createTable', 'renameTable', 'renameColumn', 'resizeTable', 'dropTable',
+			// FE-6 M (2026-06-13): the loader now boundary-checks the structural + style napi methods.
+			'insertRows', 'deleteRows', 'insertColumns', 'deleteColumns', 'registerStyle', 'setStyle',
 			'batch', 'beginTransaction', 'txnAdd', 'commitTransaction', 'rollbackTransaction',
 			'writeRange', 'publishDataset', 'bindRange', 'refreshSource', 'materializeQuery',
 			'close', 'registerFunction', 'unregisterFunction', 'listFunctions',
@@ -4927,8 +4929,9 @@ suite('quantbook V3.5.0.2 -- workbookSnapshot napi contract', function () {
 		// schema-version propagation; stamped on every snapshot DTO).
 		// FE-4 W4 (2026-06-10): + styles (the cell-style registry, additive).
 		// FE-5 W-N (2026-06-12): + names (the defined-name list; additive, schema 1 -> 2).
-		assert.deepStrictEqual(keys, ['dateSystem', 'formats', 'names', 'schemaVersion', 'sheets', 'styles', 'version'],
-			`FE-5 W-N ship shape is {sheets, formats, styles, names, dateSystem, version, schemaVersion}; if a later phase adds fields, update this test`);
+		// FE-6 Tables wave (2026-06-13): + tables (structured-table render metadata; additive, schema 2 -> 3).
+		assert.deepStrictEqual(keys, ['dateSystem', 'formats', 'names', 'schemaVersion', 'sheets', 'styles', 'tables', 'version'],
+			`FE-6 ship shape is {sheets, formats, styles, names, tables, dateSystem, version, schemaVersion}; if a later phase adds fields, update this test`);
 	});
 
 	test('SheetSnapshotJson shape: id + name + cells fields', () => {
@@ -6226,8 +6229,9 @@ suite('quantbook V3.6.0.3 -- WorkbookSnapshotJson.formats field', function () {
 		const topLevelKeys = Object.keys(snap).sort();
 		// - FE-4 W4 (2026-06-10) added: + styles (cell-style registry)
 		// - FE-5 W-N (2026-06-12) added: + names (defined-name list; additive, schema 1 -> 2)
-		assert.deepStrictEqual(topLevelKeys, ['dateSystem', 'formats', 'names', 'schemaVersion', 'sheets', 'styles', 'version'],
-			`FE-5 W-N: WorkbookSnapshotJson has exactly { sheets, formats, styles, names, dateSystem, version, schemaVersion }; got ${JSON.stringify(topLevelKeys)}`);
+		// - FE-6 Tables wave (2026-06-13) added: + tables (structured-table render metadata; additive, schema 2 -> 3)
+		assert.deepStrictEqual(topLevelKeys, ['dateSystem', 'formats', 'names', 'schemaVersion', 'sheets', 'styles', 'tables', 'version'],
+			`FE-6: WorkbookSnapshotJson has exactly { sheets, formats, styles, names, tables, dateSystem, version, schemaVersion }; got ${JSON.stringify(topLevelKeys)}`);
 	});
 });
 

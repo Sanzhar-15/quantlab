@@ -47,6 +47,7 @@ import {
 	toolListFunctions,
 	toolListSheets,
 	toolQueryRange,
+	toolValidateFormula,
 	type McpHostContext,
 	type McpSessionPort,
 	type McpTargetGrid,
@@ -55,12 +56,20 @@ import {
 import {
 	classifyWriteRisk,
 	formatAuditLine,
+	prepareDeleteStructural,
+	prepareInsertStructural,
 	prepareSetCell,
+	prepareSetNumberFormat,
+	prepareSetStyle,
 	prepareWriteCells,
 	WriteQueue,
+	type DeleteStructuralArgs,
+	type InsertStructuralArgs,
 	type McpWriteSessionPort,
 	type PreparedWrite,
 	type SetCellArgs,
+	type SetNumberFormatArgs,
+	type SetStyleArgs,
 	type WriteAuditRecord,
 	type WriteCellsArgs,
 	type WriteOutcome,
@@ -106,6 +115,7 @@ interface ZodSchemaLike {
 interface ZodLike {
 	string(): ZodSchemaLike;
 	number(): ZodSchemaLike;
+	boolean(): ZodSchemaLike;
 	union(options: ZodSchemaLike[]): ZodSchemaLike;
 	array(element: ZodSchemaLike): ZodSchemaLike;
 	object(shape: Record<string, ZodSchemaLike>): ZodSchemaLike;
@@ -269,6 +279,21 @@ function registerReadOnlyTools(server: McpServerLike, sdk: LoadedSdk, kernelMana
 		{ title: 'Get published variables', description: 'List the reactive-kernel variables currently published into the grid and the A1 cells each drives (empty if no reactive notebook is bound).', inputSchema: { ...sessionIdArg } },
 		(args) => runTool(toolGetPublishedVariables, ctx(), args as { sessionId?: string }),
 	);
+
+	server.registerTool(
+		'validate_formula',
+		{
+			title: 'Validate formula (dry-run)',
+			description: 'Parse + bind a formula WITHOUT writing it -- returns engine diagnostics so an agent can dry-run a formula before set_cell/write_cells. `formula` may carry a leading "=" or not. Relative refs bind relative to the validation position: pass `a1` (sheet-qualified "S0!B1" or bare with a sheet arg) -- with none, A1 of the resolved sheet is used. Returns `{ valid, diagnostics[] }`: an empty diagnostics list means the formula is well-formed and binds; otherwise each parse/bind problem is listed (this is DATA, not an error).',
+			inputSchema: {
+				formula: z.string().describe('The formula to validate, e.g. "=SUM(A1:A9)" or "SUM(A1:A9)" (a leading "=" is optional).'),
+				a1: z.string().describe('Optional A1 position the formula is validated at (relative refs bind relative to it), e.g. "B1" or "S0!B1".').optional(),
+				sheet: z.union([z.string(), z.number()]).describe('Optional sheet name or id (ignored if the a1 is sheet-qualified).').optional(),
+				...sessionIdArg,
+			},
+		},
+		(args) => runTool(toolValidateFormula, ctx(), args as { sessionId?: string; formula: string; sheet?: number | string; a1?: string }),
+	);
 }
 
 // --- WRITE tools (W3) --------------------------------------------------------------------------
@@ -340,8 +365,10 @@ async function applyPreparedWrite(
 	// narrowed to the read port. It satisfies McpWriteSessionPort structurally; the cast restores `batch`.
 	const writeSession = prepared.grid.session as unknown as McpWriteSessionPort;
 	const realSession = prepared.grid.session as unknown as SessionInstance;
+	// FE-6 M: thread `prepared.structural` so a structural edit (insert/delete rows/columns) ALWAYS
+	// re-classifies with the SILENT-DATA-CORRUPTION `structural` reason (the modal always shows).
 	const reclassify = (): ReturnType<typeof classifyWriteRisk> =>
-		classifyWriteRisk(prepared.ops, (sheet, row, col) => prepared.grid.session.cell(sheet, row, col));
+		classifyWriteRisk(prepared.ops, (sheet, row, col) => prepared.grid.session.cell(sheet, row, col), { structural: prepared.structural === true });
 	const recordFor = (risk: string): Omit<WriteAuditRecord, 'outcome' | 'detail'> => ({
 		timestamp: `${new Date().toISOString()}#${auditSeq++}`,
 		tool,
@@ -422,12 +449,20 @@ async function applyPreparedWrite(
 		throw new McpToolError('grid_closed', detail);
 	}
 
-	// The LIVE write discipline (mirror cellGridLogic.ts:620-623): ONE atomic batch (a single undo unit),
+	// The LIVE write discipline (mirror cellGridLogic.ts:620-623): ONE atomic write (a single undo unit),
 	// then recalc dirty (throws loud on a failed recompute), then re-render every panel of the session.
-	// A failed batch throws -> the queued round rejects -> the tool returns an MCP error (No-Fallbacks;
+	// A failed write throws -> the queued round rejects -> the tool returns an MCP error (No-Fallbacks;
 	// the engine's batch is all-or-nothing, so NOTHING is partially applied).
+	//
+	// FE-6 M: the APPLY STRATEGY. `prepared.commit` (when present) runs the napi side effect -- a
+	// registerStyle/registerFormat intern + a setStyle/setFormat batch, or a DIRECT structural napi call
+	// (insertRows/deleteColumns/...; the engine has no structural batch-op kind). When absent the default
+	// is the cell-`batch(ops)` path (set_cell / write_cells). Either lands as ONE undo unit; either throw
+	// propagates (the engine reverts atomically). The post-write recalc + refresh are identical for both.
 	try {
-		const result = writeSession.batch(prepared.ops.map((o) => o.op), { undoLabel: prepared.undoLabel });
+		const result = prepared.commit !== undefined
+			? prepared.commit(writeSession)
+			: writeSession.batch(prepared.ops.map((o) => o.op), { undoLabel: prepared.undoLabel });
 		recalcDirtyChecked(realSession);
 		// Codex MED-2: refreshSession reports a per-panel render failure count; the live edit path surfaces
 		// it LOUD (No-Fallbacks). The engine write already landed atomically (it cannot be un-applied), so
@@ -547,6 +582,122 @@ function registerWriteTools(server: McpServerLike, sdk: LoadedSdk, kernelManager
 			},
 		},
 		(args) => runWriteTool((ctx) => prepareWriteCells(ctx, args as unknown as WriteCellsArgs), 'write_cells', kernelManager, output),
+	);
+
+	// FE-6 M: STYLE + NUMBER-FORMAT writes. A single `a1` cell OR a `range`; the visual style / number
+	// format is applied as ONE setStyle/setFormat batch (one undo unit). A style/format op never clears or
+	// clobbers a formula, so only a `large` (>= 50-cell) target prompts the operator.
+	const cellOrRangeArg = {
+		a1: z.string().describe('A single A1 cell, e.g. "B1" or sheet-qualified "S0!B1". Pass EITHER a1 OR range (not both).').optional(),
+		range: z.string().describe('An A1 range, e.g. "B1:D3" or "S0!B1:D3". Pass EITHER a1 OR range (not both).').optional(),
+	};
+	const borderEdgeSchema = z.object({
+		style: z.string().describe('Border style: none|thin|medium|thick|dashed|dotted|double.'),
+		color: z.object({ r: z.number(), g: z.number(), b: z.number() }).describe('RGB color, each channel 0..=255.'),
+	});
+
+	server.registerTool(
+		'set_style',
+		{
+			title: 'Set cell style (write)',
+			description: 'Set the VISUAL style (fill / bold / italic / align / per-edge borders) of a cell or range. Every `style` field is OPTIONAL and PATCHES that one attribute -- an absent field leaves it unchanged on each cell (e.g. setting bold on a red cell keeps the red). `align` is general|left|center|right. `borders` patches per edge {top?,bottom?,left?,right?}, each { style, color }. Does NOT touch cell values or formulas (never a formula-overwrite). Requires a trusted workspace; a large (>= 50-cell) target prompts the operator. One Ctrl+Z undo step.',
+			inputSchema: {
+				...cellOrRangeArg,
+				style: z.object({
+					fill: z.object({ r: z.number(), g: z.number(), b: z.number() }).describe('Fill RGB color, each channel 0..=255.').optional(),
+					bold: z.boolean().describe('true/false to set bold.').optional(),
+					italic: z.boolean().describe('true/false to set italic.').optional(),
+					align: z.string().describe('Horizontal align: general|left|center|right.').optional(),
+					borders: z.object({
+						top: borderEdgeSchema.optional(),
+						bottom: borderEdgeSchema.optional(),
+						left: borderEdgeSchema.optional(),
+						right: borderEdgeSchema.optional(),
+					}).describe('Per-edge border patch.').optional(),
+				}).describe('The partial style patch (set at least one field).'),
+				...sheetArg,
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareSetStyle(ctx, args as unknown as SetStyleArgs), 'set_style', kernelManager, output),
+	);
+
+	server.registerTool(
+		'set_number_format',
+		{
+			title: 'Set number format (write)',
+			description: 'Set the NUMBER FORMAT of a cell or range to a format string, e.g. "0.00%" (percent), "$#,##0.00" (currency), "0.00" (fixed). Applied as ONE setFormat batch (the format is interned once via registerFormat). Does NOT touch cell values or formulas. Requires a trusted workspace; a large (>= 50-cell) target prompts the operator. One Ctrl+Z undo step.',
+			inputSchema: {
+				...cellOrRangeArg,
+				format: z.string().describe('The number-format string, e.g. "0.00%", "$#,##0.00", "0.00", "yyyy-mm-dd".'),
+				...sheetArg,
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareSetNumberFormat(ctx, args as unknown as SetNumberFormatArgs), 'set_number_format', kernelManager, output),
+	);
+
+	// FE-6 M: STRUCTURAL edits (insert/delete rows/columns). SILENT-DATA-CORRUPTION class -- the operator
+	// ALWAYS sees the risk modal (the `structural` reason always fires) and the axis/range is audited.
+	// insert takes { index, count }; delete takes { start, end } INCLUSIVE (matches the engine napi).
+	server.registerTool(
+		'insert_rows',
+		{
+			title: 'Insert rows (structural write)',
+			description: 'Insert `count` blank rows at 0-based `index`; rows at/below shift down and relative formula refs adjust (Excel canon). SILENT-DATA-CORRUPTION class: the operator ALWAYS confirms via a modal. Requires a trusted workspace. One Ctrl+Z undo step.',
+			inputSchema: {
+				index: z.number().describe('0-based row index at which to insert.'),
+				count: z.number().describe('Number of rows to insert (>= 1).'),
+				...sheetArg,
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareInsertStructural(ctx, 'insert_rows', args as unknown as InsertStructuralArgs), 'insert_rows', kernelManager, output),
+	);
+
+	server.registerTool(
+		'delete_rows',
+		{
+			title: 'Delete rows (structural write)',
+			description: 'Delete rows [start, end] (0-based, INCLUSIVE); rows below shift up and refs into the deleted band re-bind to #REF! (Excel canon). SILENT-DATA-CORRUPTION class: the operator ALWAYS confirms via a modal. Requires a trusted workspace. One Ctrl+Z undo step.',
+			inputSchema: {
+				start: z.number().describe('0-based first row to delete (inclusive).'),
+				end: z.number().describe('0-based last row to delete (inclusive).'),
+				...sheetArg,
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareDeleteStructural(ctx, 'delete_rows', args as unknown as DeleteStructuralArgs), 'delete_rows', kernelManager, output),
+	);
+
+	server.registerTool(
+		'insert_columns',
+		{
+			title: 'Insert columns (structural write)',
+			description: 'Insert `count` blank columns at 0-based `index`; columns at/right shift right and relative formula refs adjust (Excel canon). SILENT-DATA-CORRUPTION class: the operator ALWAYS confirms via a modal. Requires a trusted workspace. One Ctrl+Z undo step.',
+			inputSchema: {
+				index: z.number().describe('0-based column index at which to insert.'),
+				count: z.number().describe('Number of columns to insert (>= 1).'),
+				...sheetArg,
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareInsertStructural(ctx, 'insert_columns', args as unknown as InsertStructuralArgs), 'insert_columns', kernelManager, output),
+	);
+
+	server.registerTool(
+		'delete_columns',
+		{
+			title: 'Delete columns (structural write)',
+			description: 'Delete columns [start, end] (0-based, INCLUSIVE); columns to the right shift left and refs into the deleted band re-bind to #REF! (Excel canon). SILENT-DATA-CORRUPTION class: the operator ALWAYS confirms via a modal. Requires a trusted workspace. One Ctrl+Z undo step.',
+			inputSchema: {
+				start: z.number().describe('0-based first column to delete (inclusive).'),
+				end: z.number().describe('0-based last column to delete (inclusive).'),
+				...sheetArg,
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareDeleteStructural(ctx, 'delete_columns', args as unknown as DeleteStructuralArgs), 'delete_columns', kernelManager, output),
 	);
 }
 
@@ -774,8 +925,8 @@ export function registerQuantbookMcpServer(
 				output.appendLine('[mcp] connect an MCP client over Streamable HTTP (stateless JSON). EVERY request must send the bearer token below.');
 				output.appendLine(`[mcp]   URL:    ${running.url}`);
 				output.appendLine(`[mcp]   Header: Authorization: Bearer ${running.token}`);
-				output.appendLine('[mcp] read tools:  list_sheets, get_cell, query_range, get_snapshot, list_functions, get_published_variables.');
-				output.appendLine('[mcp] write tools: set_cell, write_cells (REQUIRE a trusted workspace -- run "Quantbook: Trust Workspace for MCP Writes"; large/destructive/formula-overwrite writes prompt for confirmation; each write is one undo step; every write is audited to this channel).');
+				output.appendLine('[mcp] read tools:  list_sheets, get_cell, query_range, get_snapshot, list_functions, get_published_variables, validate_formula.');
+				output.appendLine('[mcp] write tools: set_cell, write_cells, set_style, set_number_format, insert_rows, delete_rows, insert_columns, delete_columns (REQUIRE a trusted workspace -- run "Quantbook: Trust Workspace for MCP Writes"; large/destructive/formula-overwrite writes AND every structural insert/delete prompt for confirmation; each write is one undo step; every write is audited to this channel).');
 				output.show(true);
 				const action = await vscode.window.showInformationMessage(
 					`Quantbook MCP server running at ${running.url} (bearer token printed to the Quantbook MCP Server output).`,

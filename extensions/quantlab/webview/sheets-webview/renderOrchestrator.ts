@@ -241,7 +241,14 @@ export class RenderOrchestrator {
 	 * @param snapshot the just-applied snapshot.
 	 * @param publishedChanged whether the published-cell set changed (forces the full path -- the
 	 *   damage diff only covers rows whose value moved, so a badge appear/clear/move without a value
-	 *   change needs a full redraw).
+	 *   change needs a full redraw). **A4 (2026-06-13)**: `index.ts::applyRender` also ORs its
+	 *   `structuralChanged` flag (an insert/delete-rows/cols render) into this argument, since a structural
+	 *   op shifts cell A1 coordinates and the absolute-keyed damage diff can mis-repaint a MOVED styled cell
+	 *   -- the same "force full redraw" need as a published-set change, so it rides the same gate.
+	 *   **Tables wave (2026-06-13)**: `applyRender` ALSO ORs its `tablesChanged` flag (a create/drop/move/
+	 *   resize/header-totals-toggle render) into this argument. A table is RANGE-level paint metadata that
+	 *   touches no per-cell `entry`, so the `entries`-only damage diff returns `[]` and `drawDamage([])`
+	 *   no-ops -- the band/border would stay stale until a later full redraw. Same "force full redraw" need.
 	 * @param stylesChanged **FE-5 W-R (2026-06-12)**: whether the engine STYLE TABLE (`snapshot.styles[]`)
 	 *   changed since the last commit -- forces the full path. The per-cell `styleId` term in
 	 *   `entryVisualEqual` catches a cell REPOINTED to a different style, but a style DEFINITION change (an
