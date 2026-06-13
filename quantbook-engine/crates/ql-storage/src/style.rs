@@ -163,9 +163,13 @@ impl Borders {
 /// one unit in [`StyleTable`] (the cell-style analog of a format STRING in
 /// [`crate::FormatTable`]).
 ///
-/// Fields (operator decision #4 schema):
+/// Fields (operator decision #4 schema + FE-7 font attrs):
 /// - `bold` / `italic`: font weight / slant toggles.
+/// - `underline` / `strike`: font underline / strikethrough toggles (FE-7 —
+///   exact clones of `bold` / `italic`).
 /// - `fill`: optional background fill color (`None` = no fill).
+/// - `text_color`: optional font color (`None` = default/inherited color).
+///   FE-7 — exact clone of `fill`'s `Option<Rgb>` shape + plumbing.
 /// - `align`: horizontal alignment ([`HAlign::General`] = value-driven default).
 /// - `borders`: the four per-edge [`BorderEdge`]s.
 ///
@@ -179,8 +183,14 @@ impl Borders {
 pub struct Style {
     pub bold: bool,
     pub italic: bool,
+    /// Underline toggle (FE-7 — clone of `bold`).
+    pub underline: bool,
+    /// Strikethrough toggle (FE-7 — clone of `italic`).
+    pub strike: bool,
     /// Background fill color; `None` = no fill.
     pub fill: Option<Rgb>,
+    /// Font color; `None` = default/inherited color (FE-7 — clone of `fill`).
+    pub text_color: Option<Rgb>,
     pub align: HAlign,
     pub borders: Borders,
 }
@@ -473,6 +483,21 @@ mod tests {
         }
     }
 
+    fn blue_text() -> Style {
+        Style {
+            text_color: Some(Rgb::new(0, 0, 0xff)),
+            ..Style::default()
+        }
+    }
+
+    fn underline_strike() -> Style {
+        Style {
+            underline: true,
+            strike: true,
+            ..Style::default()
+        }
+    }
+
     fn all_borders() -> Style {
         let edge = BorderEdge {
             style: BorderStyle::Thin,
@@ -496,6 +521,28 @@ mod tests {
         assert_eq!(t.len(), 0);
         assert_eq!(t.local_peer(), LEGACY_PEER);
         assert!(Style::default().is_empty());
+        // FE-7: the new font attrs default to off / no-color.
+        assert!(!Style::default().underline);
+        assert!(!Style::default().strike);
+        assert_eq!(Style::default().text_color, None);
+    }
+
+    #[test]
+    fn font_attrs_intern_distinctly_and_round_trip() {
+        // FE-7: text_color (clone of fill), underline (clone of bold),
+        // strike (clone of italic) each intern distinctly + round-trip.
+        let mut t = StyleTable::new();
+        let plain = t.intern(Style::default());
+        let text = t.intern(blue_text());
+        let us = t.intern(underline_strike());
+        assert_ne!(plain, text);
+        assert_ne!(plain, us);
+        assert_ne!(text, us);
+        let got_text = t.lookup(text).unwrap();
+        assert_eq!(got_text.text_color, Some(Rgb::new(0, 0, 0xff)));
+        let got_us = t.lookup(us).unwrap();
+        assert!(got_us.underline);
+        assert!(got_us.strike);
     }
 
     #[test]
@@ -664,7 +711,9 @@ mod tests {
         set.insert(bold());
         set.insert(red_fill());
         set.insert(all_borders());
+        set.insert(blue_text());
+        set.insert(underline_strike());
         set.insert(bold()); // dup
-        assert_eq!(set.len(), 3);
+        assert_eq!(set.len(), 5);
     }
 }

@@ -61,7 +61,14 @@ pub use session::EngineSession;
 /// the IDE renders table chrome from). Same additive `serde(default,
 /// skip_serializing_if)` discipline — old blobs still deserialize — but the
 /// contract version moves because the DTO shape changed. The IDE mirror pins to 3.
-pub const SCHEMA_VERSION: u16 = 3;
+///
+/// **v4 (FE-7, Builder G, 2026-06-13):** [`dto::Style`] (carried in the
+/// `WorkbookSnapshot.styles[]` `StyleDef` value) gained the additive font attrs
+/// `underline` / `strike` / `text_color`. Same additive `serde(default,
+/// skip_serializing_if)` discipline — an old snapshot blob still deserializes
+/// (the absent font attrs default off / no-color) — but the contract version
+/// moves because the DTO shape changed. The IDE mirror pins to 4 in lockstep.
+pub const SCHEMA_VERSION: u16 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -176,11 +183,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_three() {
+    fn schema_version_is_four() {
         // FE-5 W-N (2026-06-12): bumped 1 → 2 for the additive
         // WorkbookSnapshot.names field.
         // FE-5 W-? (Builder E, 2026-06-13): bumped 2 → 3 for the additive
-        // WorkbookSnapshot.tables field. The IDE mirror pins to this value.
-        assert_eq!(SCHEMA_VERSION, 3);
+        // WorkbookSnapshot.tables field.
+        // FE-7 (Builder G, 2026-06-13): bumped 3 → 4 for the additive Style
+        // font attrs (underline / strike / text_color). The IDE mirror pins
+        // to this value.
+        assert_eq!(SCHEMA_VERSION, 4);
     }
 }

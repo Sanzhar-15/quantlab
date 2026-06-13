@@ -816,7 +816,12 @@ fn style_json_from_storage(s: ql_storage::Style) -> StyleJson {
     StyleJson {
         bold: s.bold,
         italic: s.italic,
+        // FE-7: emit absent-when-off (mirrors fill/text_color "absent ⇒ default"); the IDE
+        // resolver reads `=== true`, so None and Some(false) are equivalent — None keeps the wire minimal.
+        underline: if s.underline { Some(true) } else { None },
+        strike: if s.strike { Some(true) } else { None },
         fill: s.fill.map(rgb),
+        text_color: s.text_color.map(rgb),
         align: Some(align.to_string()),
         border_top: Some(edge(s.borders.top)),
         border_bottom: Some(edge(s.borders.bottom)),
@@ -849,14 +854,26 @@ pub struct BorderEdgeJson {
 /// [`Session::register_style`] and the value carried in [`StyleDefJson`].
 /// `align` is one of `general|left|center|right`. `fill`/border fields are
 /// optional (absent ⇒ no fill / no border on that edge).
+///
+/// **FE-7 (2026-06-13):** adds the font attrs `underline` / `strike` (clones
+/// of `bold` / `italic`) and `text_color` (clone of `fill`; camelCase JSON
+/// `textColor`, absent ⇒ no text color). `register_style` round-trips all
+/// three into the engine `Style`, and the snapshot emits them.
 #[napi(object)]
 pub struct StyleJson {
     /// Bold font weight.
     pub bold: bool,
     /// Italic font slant.
     pub italic: bool,
+    /// Underline toggle (FE-7); absent ⇒ off (optional like `fill`, so a caller
+    /// that omits it — the IDE "carry only when on" convention — is valid input).
+    pub underline: Option<bool>,
+    /// Strikethrough toggle (FE-7); absent ⇒ off (optional like `fill`).
+    pub strike: Option<bool>,
     /// Background fill color; absent ⇒ no fill.
     pub fill: Option<RgbJson>,
+    /// Font color (FE-7; camelCase `textColor`); absent ⇒ no text color.
+    pub text_color: Option<RgbJson>,
     /// Horizontal alignment string (`general|left|center|right`); absent ⇒ general.
     pub align: Option<String>,
     /// Top border edge; absent ⇒ no top border.
@@ -5396,7 +5413,11 @@ fn style_json_from_session(s: ql_session::Style) -> StyleJson {
     StyleJson {
         bold: s.bold,
         italic: s.italic,
+        // FE-7: absent-when-off (mirrors style_json_from_storage).
+        underline: if s.underline { Some(true) } else { None },
+        strike: if s.strike { Some(true) } else { None },
         fill: s.fill.map(rgb_json_from_session),
+        text_color: s.text_color.map(rgb_json_from_session),
         align: Some(halign_str_from_session(s.align).to_string()),
         border_top: Some(border_edge_json_from_session(s.borders.top)),
         border_bottom: Some(border_edge_json_from_session(s.borders.bottom)),
@@ -5413,6 +5434,12 @@ fn session_style_from_json(method: &str, s: StyleJson) -> Result<ql_session::Sty
         None => None,
         Some(c) => Some(session_rgb_from_json(method, c)?),
     };
+    // FE-7: text_color mirrors fill's validate-or-error (No-Fallbacks —
+    // present-but-malformed RGB throws, absent ⇒ None).
+    let text_color = match s.text_color {
+        None => None,
+        Some(c) => Some(session_rgb_from_json(method, c)?),
+    };
     let align = match s.align.as_deref() {
         None => ql_session::HAlign::General,
         Some(a) => session_halign_from_str(method, a)?,
@@ -5420,7 +5447,12 @@ fn session_style_from_json(method: &str, s: StyleJson) -> Result<ql_session::Sty
     Ok(ql_session::Style {
         bold: s.bold,
         italic: s.italic,
+        // FE-7: absent ⇒ off (optional input, like fill ⇒ no-fill). Not a masking
+        // fallback — an omitted optional field is a legitimate "off" state, not a swallowed error.
+        underline: s.underline.unwrap_or(false),
+        strike: s.strike.unwrap_or(false),
         fill,
+        text_color,
         align,
         borders: ql_session::Borders {
             top: session_border_edge_from_json(method, s.border_top)?,

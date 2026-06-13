@@ -293,15 +293,30 @@ pub struct Borders {
 /// **FE-4 W4 (2026-06-10):** a cell's VISUAL style — bold/italic/fill/align
 /// plus per-edge borders (operator decision #4 schema). The DTO mirror of
 /// `ql_storage::Style`; carried inline in [`StyleDef`].
+///
+/// **FE-7 (2026-06-13):** adds the font attrs `underline` / `strike` (clones
+/// of `bold` / `italic`) and `text_color` (clone of `fill`). The three new
+/// fields are `#[serde(default)]` so a pre-FE-7 snapshot DTO (lacking these
+/// keys) still deserializes — matching how `align` / `borders` / `fill`
+/// already default-on-absent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Style {
     /// Bold font weight.
     pub bold: bool,
     /// Italic font slant.
     pub italic: bool,
+    /// Underline toggle (FE-7 — clone of `bold`).
+    #[serde(default)]
+    pub underline: bool,
+    /// Strikethrough toggle (FE-7 — clone of `italic`).
+    #[serde(default)]
+    pub strike: bool,
     /// Background fill color; `None` = no fill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill: Option<Rgb>,
+    /// Font color; `None` = default/inherited color (FE-7 — clone of `fill`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_color: Option<Rgb>,
     /// Horizontal alignment.
     #[serde(default)]
     pub align: HAlign,

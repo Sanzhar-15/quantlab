@@ -203,7 +203,17 @@ use thiserror::Error;
 ///     a v9 reader loads v1-v8 envelopes (treating the absent sections as "no
 ///     styles"); a v<9 reader loading v9 is refused at the schema-version gate
 ///     (the envelope's `deny_unknown_fields` would also reject the new keys).
-pub const WORKBOOK_SCHEMA_VERSION: u32 = 9;
+///   - **v10 (FE-7, 2026-06-13):** adds the font attrs `underline` /
+///     `strike` / `text_color` to the `StyleEntry.style` ([`StyleWire`])
+///     value carried in the `styles` section. The three new keys are
+///     `#[serde(default)]` on `StyleWire`, so a v10 reader loads v1-v9
+///     envelopes (the absent keys default to off / off / no-color — a v9
+///     file's styles re-load unchanged with the font attrs cleared). A v<10
+///     reader loading a v10 file is refused at the schema-version gate; even
+///     past the gate, `StylesSection`'s `deny_unknown_fields` would reject the
+///     new `StyleWire` keys, so a stale reader fails loudly rather than
+///     silently dropping the font attrs.
+pub const WORKBOOK_SCHEMA_VERSION: u32 = 10;
 
 /// The earliest schema version this reader still accepts. v1 fixtures (Phase 1)
 /// continue to load on v2 binaries; older versions would need explicit handling.
@@ -3542,7 +3552,10 @@ sheets = [
         let rich = Style {
             bold: true,
             italic: true,
+            underline: true,
+            strike: true,
             fill: Some(Rgb::new(0xab, 0xcd, 0xef)),
+            text_color: Some(Rgb::new(0x77, 0x88, 0x99)),
             align: HAlign::Center,
             borders: Borders {
                 top: edge,
@@ -3593,6 +3606,66 @@ sheets = [
         assert_eq!(got.borders.right, edge);
         assert_eq!(got.fill, Some(Rgb::new(0xab, 0xcd, 0xef)));
         assert_eq!(got.align, HAlign::Center);
+        // FE-7 font attrs survive save→load.
+        assert!(got.underline);
+        assert!(got.strike);
+        assert_eq!(got.text_color, Some(Rgb::new(0x77, 0x88, 0x99)));
+    }
+
+    #[test]
+    fn v9_styles_without_font_attrs_load_with_defaults() {
+        // FE-7 back-compat: a genuine v9 envelope (styles arrived at v9) whose
+        // `styles` section carries a StyleWire WITHOUT the underline / strike /
+        // text_color keys (they didn't exist pre-FE-7). The v10 reader must
+        // accept the older version AND load the StyleWire, defaulting the font
+        // attrs off / no-color — no panic, no corruption. schema_version = 9 so
+        // BOTH the version gate (accepts < current) AND the MISSING StyleWire
+        // keys are exercised — the real pre-FE-7 on-disk shape.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy_styles.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // A StyleWire with only the pre-FE-7 keys (peer 0 / counter 0 = the
+        // LEGACY_PEER id the single-writer session allocates first).
+        let toml = r#"
+schema_version = 9
+name = "legacy_styles"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "S", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[styles.entries]]
+
+[styles.entries.id]
+peer = 0
+counter = 0
+
+[styles.entries.style]
+bold = true
+italic = false
+fill = { r = 10, g = 20, b = 30 }
+align = "left"
+border_top = { style = "none", color = { r = 0, g = 0, b = 0 } }
+border_bottom = { style = "none", color = { r = 0, g = 0, b = 0 } }
+border_left = { style = "none", color = { r = 0, g = 0, b = 0 } }
+border_right = { style = "none", color = { r = 0, g = 0, b = 0 } }
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
+
+        let loaded = load_workbook(&path).unwrap();
+        let sid = ql_storage::StyleId::new(ql_types::LEGACY_PEER, 0);
+        let got = loaded
+            .styles()
+            .lookup(sid)
+            .expect("pre-FE-7 style entry must load");
+        assert!(got.bold);
+        assert_eq!(got.fill, Some(ql_storage::Rgb::new(10, 20, 30)));
+        // The absent FE-7 keys default cleanly.
+        assert!(!got.underline, "absent underline defaults to false");
+        assert!(!got.strike, "absent strike defaults to false");
+        assert_eq!(got.text_color, None, "absent text_color defaults to None");
     }
 
     #[test]
@@ -4506,13 +4579,15 @@ col_extent = 1
     /// `reference_mode` + `locale` for the R1C1/locale preference).
     /// **Phase 5.2 D-1 step 5 (2026-05-20):** v8 is now current; bumped
     /// "future" probe to v9.
+    /// **FE-7 (2026-06-13):** v10 is now current (font attrs); bumped
+    /// "future" probe to v11.
     #[test]
     fn future_schema_version_rejected() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("future.qbook");
         fs::create_dir_all(path.join("sheets")).unwrap();
         let toml = r#"
-schema_version = 10
+schema_version = 11
 name = "future"
 
 [[sheets]]
@@ -4527,7 +4602,7 @@ col_extent = 0
 
         let result = load_workbook(&path);
         assert!(
-            matches!(result, Err(QbookError::UnsupportedSchema { found: 10 })),
+            matches!(result, Err(QbookError::UnsupportedSchema { found: 11 })),
             "expected UnsupportedSchema, got {result:?}"
         );
     }
@@ -4669,7 +4744,7 @@ col_extent = 0
     // ===== W5-92 (Phase 4.6.D) sheet-scoped names + schema v5 =====
 
     #[test]
-    fn schema_version_constant_is_nine() {
+    fn schema_version_constant_is_ten() {
         // Sanity check so future bumps trip this test until the doc is updated.
         // W5-145 (Phase 4.9.I) bumped from 6 to 7 (workbook reference_mode + locale).
         // Phase 5.2 D-1 step 5 (2026-05-20) bumped from 7 to 8: FormatEntry.id
@@ -4679,7 +4754,9 @@ col_extent = 0
         // FormatId::legacy_from_u32 at load time.
         // FE-4 W4 (2026-06-10) bumped from 8 to 9: added the workbook `styles`
         // section + per-sheet `style_overlay` section (cell-style foundation).
-        assert_eq!(WORKBOOK_SCHEMA_VERSION, 9);
+        // FE-7 (2026-06-13) bumped from 9 to 10: added the font attrs
+        // underline / strike / text_color to the StyleWire value in `styles`.
+        assert_eq!(WORKBOOK_SCHEMA_VERSION, 10);
     }
 
     #[test]

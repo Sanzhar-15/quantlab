@@ -501,12 +501,36 @@ impl BorderEdgeWire {
 /// (bold/italic/fill/align + per-edge borders). Serde shape carries every
 /// sub-field explicitly so the op-log + `.qbook` envelope round-trip every
 /// edge {style,color} losslessly (acceptance #11).
+///
+/// **FE-7 (2026-06-13):** adds the font attrs `underline` / `strike`
+/// (clones of `bold` / `italic`) and `text_color` (clone of `fill`). The
+/// three new fields are `#[serde(default)]` so OLD op-logs / OLD `.qbook`
+/// envelopes (written before FE-7, lacking these keys) still decode — the
+/// absent keys default to `false` / `false` / `None`. This is the ONLY
+/// divergence from the `bold`/`italic`/`fill` plumbing: those pre-FE-7 fields
+/// carry no `#[serde(default)]` because no on-disk log ever lacked them; the
+/// new fields MUST default-on-absent or replay/load of pre-FE-7 data would
+/// fail loudly under `deny_unknown_fields`'s sibling missing-field error.
+/// Newly-written data always carries the keys (no `skip_serializing_if`),
+/// exactly as `bold`/`italic`/`fill` always serialize.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(deny_unknown_fields)]
 pub struct StyleWire {
     pub bold: bool,
     pub italic: bool,
+    /// FE-7: underline toggle. `#[serde(default)]` ⇒ absent in pre-FE-7
+    /// data decodes to `false`.
+    #[serde(default)]
+    pub underline: bool,
+    /// FE-7: strikethrough toggle. `#[serde(default)]` ⇒ absent decodes to
+    /// `false`.
+    #[serde(default)]
+    pub strike: bool,
     pub fill: Option<RgbWire>,
+    /// FE-7: font color. `#[serde(default)]` ⇒ absent decodes to `None`
+    /// (clone of `fill`'s `Option` shape).
+    #[serde(default)]
+    pub text_color: Option<RgbWire>,
     pub align: HAlignWire,
     pub border_top: BorderEdgeWire,
     pub border_bottom: BorderEdgeWire,
@@ -520,7 +544,10 @@ impl StyleWire {
         StyleWire {
             bold: s.bold,
             italic: s.italic,
+            underline: s.underline,
+            strike: s.strike,
             fill: s.fill.map(RgbWire::from_storage),
+            text_color: s.text_color.map(RgbWire::from_storage),
             align: HAlignWire::from_storage(s.align),
             border_top: BorderEdgeWire::from_storage(s.borders.top),
             border_bottom: BorderEdgeWire::from_storage(s.borders.bottom),
@@ -535,7 +562,10 @@ impl StyleWire {
         ql_storage::Style {
             bold: self.bold,
             italic: self.italic,
+            underline: self.underline,
+            strike: self.strike,
             fill: self.fill.map(RgbWire::to_storage),
+            text_color: self.text_color.map(RgbWire::to_storage),
             align: self.align.to_storage(),
             borders: ql_storage::Borders {
                 top: self.border_top.to_storage(),
@@ -859,7 +889,10 @@ mod style_wire_tests {
         ql_storage::Style {
             bold: true,
             italic: true,
+            underline: true,
+            strike: true,
             fill: Some(ql_storage::Rgb::new(0xab, 0xcd, 0xef)),
+            text_color: Some(ql_storage::Rgb::new(0x12, 0x34, 0x56)),
             align: ql_storage::HAlign::Center,
             borders: ql_storage::Borders {
                 top: edge,
@@ -904,6 +937,59 @@ mod style_wire_tests {
         assert_eq!(back.borders.bottom.style, ql_storage::BorderStyle::Thin);
         assert!(back.borders.left.is_none());
         assert_eq!(back.borders.right, back.borders.top);
+        // FE-7 font attrs round-trip.
+        assert!(back.underline);
+        assert!(back.strike);
+        assert_eq!(back.text_color, Some(ql_storage::Rgb::new(0x12, 0x34, 0x56)));
+    }
+
+    #[test]
+    fn old_style_wire_without_font_attrs_decodes_with_defaults() {
+        // FE-7 back-compat: a pre-FE-7 op-log / .qbook StyleWire payload has
+        // NO `underline` / `strike` / `text_color` keys. It MUST still decode
+        // (deny_unknown_fields only rejects EXTRA keys; the new fields are
+        // `#[serde(default)]` so absence is legal) — the font attrs default
+        // off / no-color. No silent coercion: a present-but-malformed value
+        // still errors (serde type-checks `bold`, `align`, etc.).
+        let old = r#"{
+            "bold": true,
+            "italic": false,
+            "fill": {"r":1,"g":2,"b":3},
+            "align": "left",
+            "border_top": {"style":"none","color":{"r":0,"g":0,"b":0}},
+            "border_bottom": {"style":"none","color":{"r":0,"g":0,"b":0}},
+            "border_left": {"style":"none","color":{"r":0,"g":0,"b":0}},
+            "border_right": {"style":"none","color":{"r":0,"g":0,"b":0}}
+        }"#;
+        let wire: StyleWire = serde_json::from_str(old).expect("pre-FE-7 payload must decode");
+        let s = wire.to_storage();
+        assert!(s.bold);
+        assert!(!s.underline, "absent underline defaults to false");
+        assert!(!s.strike, "absent strike defaults to false");
+        assert_eq!(s.text_color, None, "absent text_color defaults to None");
+        assert_eq!(s.fill, Some(ql_storage::Rgb::new(1, 2, 3)));
+    }
+
+    #[test]
+    fn malformed_font_attr_errors_loudly() {
+        // FE-7 No-Fallbacks: a present-but-wrong-typed `underline` errors,
+        // never silently coerces to a default.
+        let bad = r#"{
+            "bold": false,
+            "italic": false,
+            "underline": "yes",
+            "fill": null,
+            "align": "general",
+            "border_top": {"style":"none","color":{"r":0,"g":0,"b":0}},
+            "border_bottom": {"style":"none","color":{"r":0,"g":0,"b":0}},
+            "border_left": {"style":"none","color":{"r":0,"g":0,"b":0}},
+            "border_right": {"style":"none","color":{"r":0,"g":0,"b":0}}
+        }"#;
+        let result: std::result::Result<StyleWire, _> = serde_json::from_str(bad);
+        assert!(
+            result.is_err(),
+            "a non-bool `underline` must fail loudly, got {result:?}"
+        );
     }
 
     #[test]

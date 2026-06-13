@@ -4384,7 +4384,10 @@ fn storage_style_to_dto(s: ql_storage::Style) -> StyleDto {
     StyleDto {
         bold: s.bold,
         italic: s.italic,
+        underline: s.underline,
+        strike: s.strike,
         fill: s.fill.map(storage_rgb_to_dto),
+        text_color: s.text_color.map(storage_rgb_to_dto),
         align: storage_halign_to_dto(s.align),
         borders: BordersDto {
             top: storage_border_edge_to_dto(s.borders.top),
@@ -4399,7 +4402,10 @@ fn dto_style_to_storage(s: StyleDto) -> ql_storage::Style {
     ql_storage::Style {
         bold: s.bold,
         italic: s.italic,
+        underline: s.underline,
+        strike: s.strike,
         fill: s.fill.map(dto_rgb_to_storage),
+        text_color: s.text_color.map(dto_rgb_to_storage),
         align: dto_halign_to_storage(s.align),
         borders: ql_storage::Borders {
             top: dto_border_edge_to_storage(s.borders.top),
@@ -11585,10 +11591,17 @@ mod tests {
         StyleDto {
             bold: true,
             italic: true,
+            underline: true,
+            strike: true,
             fill: Some(Rgb {
                 r: 0xab,
                 g: 0xcd,
                 b: 0xef,
+            }),
+            text_color: Some(Rgb {
+                r: 0x77,
+                g: 0x88,
+                b: 0x99,
             }),
             align: ql_session::dto::HAlign::Center,
             borders: Borders {
@@ -11606,6 +11619,22 @@ mod tests {
         }
     }
 
+    /// FE-7: a style exercising the new font attrs (text_color clone of fill,
+    /// underline clone of bold, strike clone of italic) WITHOUT borders.
+    fn font_attr_style() -> StyleDto {
+        use ql_session::dto::Rgb;
+        StyleDto {
+            underline: true,
+            strike: true,
+            text_color: Some(Rgb {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56,
+            }),
+            ..StyleDto::default()
+        }
+    }
+
     /// (1) setStyle → snapshot → styleId set.
     #[test]
     fn fe4_setstyle_snapshot_has_style_id() {
@@ -11619,6 +11648,29 @@ mod tests {
         let snap = s.snapshot().unwrap();
         let def = snap.styles.iter().find(|sd| sd.id == sid).unwrap();
         assert_eq!(def.style, bold_style());
+    }
+
+    /// FE-7: registerStyle with the new font attrs → snapshot styles[] carries
+    /// them (text_color round-trips an Rgb; underline/strike round-trip true).
+    #[test]
+    fn fe7_font_attrs_round_trip_through_snapshot() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let sid = s.register_style(font_attr_style()).unwrap();
+        s.set_style(addr(sheet, 0, 0), sid).unwrap();
+        let snap = s.snapshot().unwrap();
+        let def = snap.styles.iter().find(|sd| sd.id == sid).unwrap();
+        assert_eq!(def.style, font_attr_style(), "font attrs round-trip exactly");
+        assert!(def.style.underline);
+        assert!(def.style.strike);
+        assert_eq!(
+            def.style.text_color,
+            Some(ql_session::dto::Rgb {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56
+            })
+        );
     }
 
     /// (2) setStyle → insert row → assert style MOVED + original cleared
