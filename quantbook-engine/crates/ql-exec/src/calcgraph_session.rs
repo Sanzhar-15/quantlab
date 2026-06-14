@@ -22,8 +22,9 @@
 //! - `walk_plan_for_deps` recursively walks a bound `ExprPlan`,
 //!   producing a `FormulaDeps` collection of (a) direct cell refs,
 //!   (b) named-range refs (from `AggregateNameRef`), (c) names
-//!   referenced (currently only via `AggregateNameRef`; see below),
-//!   (d) volatile-function presence.
+//!   referenced — from `AggregateNameRef` AND (FE-10 / FE-10.x)
+//!   `ScalarNameRef`, across the normal / address-only / lazy-shape
+//!   dep policies — (d) volatile-function presence.
 //! - `on_set_formula` now takes `&ExprPlan` and runs the extraction.
 //!   The session updates per-formula `formula_deps`, the volatile
 //!   set, and a name→formulas reverse index.
@@ -310,9 +311,12 @@ pub struct FormulaDeps {
     /// entry pairs the canonical (uppercase) name with the resolved
     /// `Range` payload.
     pub named_ranges: Vec<(Arc<str>, Range)>,
-    /// Names referenced by the formula. Currently only names that
-    /// resolve to ranges populate this (via `AggregateNameRef`); see
-    /// module docs for the limitation around scalar-resolved names.
+    /// Names referenced by the formula. Populated for `AggregateNameRef`
+    /// (range-target names) AND — since FE-10 / FE-10.x — for
+    /// `ScalarNameRef` (scalar- and `@name`-narrowed targets) in the normal
+    /// and address-only walkers, plus the LazyShape policy's top-level
+    /// name args. So delete/retarget of ANY referenced name re-dirties this
+    /// formula via the `name_to_formulas` reverse index.
     pub names: Vec<Arc<str>>,
     /// **W5-154 (Phase 4.8.G.3 foundation):** table names referenced by
     /// the formula (via `ExprPlan::StructuredRef.table_name`). Used by
@@ -642,6 +646,18 @@ fn walk_plan_for_address_only_deps(
         // Structural-dep only: rename / retarget invalidates this
         // formula, but cell-stripe values inside the range don't.
         ExprPlan::AggregateNameRef { name, .. } => {
+            deps.names.push(Arc::clone(name));
+        }
+        // **FE-10.x (2026-06-14):** a `@<name>`-narrowed scalar-name wrapper.
+        // Like `AggregateNameRef`, a reference-aware fn (`ROW(@SALES)` etc.)
+        // over it depends on the NAME (retarget re-narrows) but NOT on the
+        // narrowed cell's VALUE — so record name-only, mirroring the sibling
+        // `AggregateNameRef` arm. (The `_` fall-through would route to
+        // `walk_plan_for_deps`, which also records a value cell-dep on the
+        // anchor cell — harmless over-invalidation, but asymmetric. This keeps
+        // all three dep policies — normal / address-only / lazy-shape —
+        // recording the name uniformly.)
+        ExprPlan::ScalarNameRef { name, .. } => {
             deps.names.push(Arc::clone(name));
         }
         ExprPlan::StructuredRef { table_name, .. } => {

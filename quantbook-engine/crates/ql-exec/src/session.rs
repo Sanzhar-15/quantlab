@@ -4491,6 +4491,11 @@ fn map_runtime_err(e: RuntimeError) -> EngineError {
         R::OpLog(inner) => map_oplog_err(inner, display),
         // Name / sheet-name validation.
         R::Name(_) => EngineError::new(ErrorClass::BadArgument, "name_reserved", display),
+        // FE-10.x: a name no formula could reference (cell-ref shape like `A1`/`Q1`,
+        // a number, a boolean, or whitespace-carrying) → BadArgument.
+        R::NameNotReferenceable { .. } => {
+            EngineError::new(ErrorClass::BadArgument, "name_not_referenceable", display)
+        }
         // FE-5 W-N: deleting a name that doesn't exist → NotFound (fail loud,
         // never the silent clear no-op).
         R::NameNotFound { .. } => EngineError::new(ErrorClass::NotFound, "name_not_found", display),
@@ -11702,7 +11707,11 @@ mod tests {
         s.set_style(addr(sheet, 0, 0), sid).unwrap();
         let snap = s.snapshot().unwrap();
         let def = snap.styles.iter().find(|sd| sd.id == sid).unwrap();
-        assert_eq!(def.style, font_attr_style(), "font attrs round-trip exactly");
+        assert_eq!(
+            def.style,
+            font_attr_style(),
+            "font attrs round-trip exactly"
+        );
         assert!(def.style.underline);
         assert!(def.style.strike);
         assert_eq!(
@@ -12532,7 +12541,11 @@ mod tests {
         s.set_formula(addr(sheet, 0, 4), "SUM(TAX)").unwrap();
         s.recalc_dirty().unwrap();
         assert_eq!(
-            s.cell(addr(sheet, 0, 4)).unwrap().unwrap().formula.as_deref(),
+            s.cell(addr(sheet, 0, 4))
+                .unwrap()
+                .unwrap()
+                .formula
+                .as_deref(),
             Some("SUM(TAX)"),
             "precondition: formula stored canonically as SUM(TAX)"
         );
@@ -12542,17 +12555,24 @@ mod tests {
         s.recalc_dirty().unwrap();
         // The formula cell moved from col 4 to col 5; its text must be unchanged.
         assert_eq!(
-            s.cell(addr(sheet, 0, 5)).unwrap().unwrap().formula.as_deref(),
+            s.cell(addr(sheet, 0, 5))
+                .unwrap()
+                .unwrap()
+                .formula
+                .as_deref(),
             Some("SUM(TAX)"),
             "FE-10: insert-column must NOT shift the NAME `TAX` in the formula text"
         );
     }
 
     /// **FE-10 — a 3-letter name under `@` evals IDENTICALLY to a 4+ letter name.**
-    /// FE-10 routes `@OLD` through the same NameRef path `@SALES` already used. The
-    /// `@`-over-a-named-range narrowing ("rule 10") is unimplemented for BOTH (deferred
-    /// FE-10.x) — this pins CONSISTENCY: FE-10 introduces no divergence between the
-    /// previously-shadowed 3-letter case and the established 4+ letter case.
+    /// FE-10 routes `@OLD` through the same NameRef path `@SALES` already used.
+    /// **FE-10.x (2026-06-14)** then IMPLEMENTED the `@`-over-a-named-range narrowing
+    /// ("rule 10") for BOTH: `SUM(@OLD)` / `SUM(@SALES)` now narrow the single-column
+    /// named range to the formula-row cell instead of summing the full range. This
+    /// pins CONSISTENCY (no divergence between the 3-letter and 4+ letter case) AND
+    /// the narrowed value: the formula is at row 0, so `@` narrows the range A1:A2 to
+    /// A1 (= 3), NOT the full-range sum (7).
     #[test]
     fn fe10_at_name_eval_consistency() {
         let mut s = WorkbookSession::new();
@@ -12569,9 +12589,10 @@ mod tests {
         s.recalc_dirty().unwrap();
         let v_old = s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value;
         let v_sales = s.cell(addr(sheet, 0, 3)).unwrap().unwrap().value;
-        assert!(
-            matches!(v_old, Some(CellValue::Number { .. })),
-            "FE-10: SUM(@OLD) must eval to a number (the named range), got {v_old:?}"
+        assert_eq!(
+            v_old,
+            Some(CellValue::Number { number: 3.0 }),
+            "FE-10.x: SUM(@OLD) at row 0 must NARROW A1:A2 to A1 (= 3), not sum the full range (= 7); got {v_old:?}"
         );
         assert_eq!(
             v_old, v_sales,
@@ -12716,11 +12737,16 @@ mod tests {
         let sheet = s.add_sheet("S", 16384).unwrap();
         // Both names target C5 (0-indexed row 4, col 2) → ROW = 5, COLUMN = 3.
         s.with_runtime(|rt| {
-            rt.set_name("ANCHOR", NamedTarget::Cell(ql_types::Address::new(sheet, 4, 2)))
+            rt.set_name(
+                "ANCHOR",
+                NamedTarget::Cell(ql_types::Address::new(sheet, 4, 2)),
+            )
         })
         .unwrap();
-        s.with_runtime(|rt| rt.set_name("K", NamedTarget::Cell(ql_types::Address::new(sheet, 4, 2))))
-            .unwrap();
+        s.with_runtime(|rt| {
+            rt.set_name("K", NamedTarget::Cell(ql_types::Address::new(sheet, 4, 2)))
+        })
+        .unwrap();
         s.set_formula(addr(sheet, 0, 0), "ROW(ANCHOR)").unwrap();
         s.set_formula(addr(sheet, 1, 0), "ROW(K)").unwrap();
         s.set_formula(addr(sheet, 2, 0), "COLUMN(K)").unwrap();
@@ -12784,13 +12810,417 @@ mod tests {
             "precondition: ISREF(K) where K is a Constant = FALSE"
         );
         // Retarget K from Constant → Cell: its resolved shape becomes a reference.
-        s.with_runtime(|rt| rt.set_name("K", NamedTarget::Cell(ql_types::Address::new(sheet, 4, 2))))
-            .unwrap();
+        s.with_runtime(|rt| {
+            rt.set_name("K", NamedTarget::Cell(ql_types::Address::new(sheet, 4, 2)))
+        })
+        .unwrap();
         s.recalc_dirty().unwrap();
         assert_eq!(
             s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
             Some(CellValue::Boolean { boolean: true }),
             "FE-10: retargeting K to a Cell must re-dirty ISREF(K) → TRUE (not stale FALSE)"
+        );
+    }
+
+    // ===== FE-10.x (2026-06-14): Part A — reject non-referenceable names =====
+
+    /// **FE-10.x — `set_name` rejects names no formula could reference.** A name
+    /// must lex+parse to a single `NameRef` whose canonical text equals the stored
+    /// key. Cell-ref shapes (`A1`/`Q1`/`FY1`/`XFD1048576`/`RC1`/`ABC123`), numbers
+    /// (`123`), booleans (`TRUE`/`FALSE`), illegal-char (`$A`/`A B`) and
+    /// whitespace-carrying (`" A "` — the lexer skips the spaces but the stored key
+    /// keeps them) names are all REJECTED. The reserved `AI` sentinel is rejected
+    /// too (by `would_accept`, a different error). NB: `R1C1` is NOT here — under
+    /// A1-canonical parsing it lexes as a NAME (the trailing `C` breaks the cell-ref
+    /// shape), so it is referenceable; see `fe10x_accepts_referenceable_names`.
+    #[test]
+    fn fe10x_rejects_non_referenceable_names() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let r = range(sheet, 0, 0, 1, 0);
+        for bad in [
+            "A1",
+            "Q1",
+            "FY1",
+            "XFD1048576",
+            "RC1",
+            "ABC123",
+            "123",
+            "TRUE",
+            "FALSE",
+            " A ",
+            "$A",
+            "A B",
+        ] {
+            assert!(
+                s.set_name(bad, r).is_err(),
+                "FE-10.x: name {bad:?} must be REJECTED (not referenceable)"
+            );
+        }
+        assert!(
+            s.set_name("AI", r).is_err(),
+            "FE-10.x: reserved name AI must be rejected"
+        );
+    }
+
+    /// **FE-10.x — `set_name` ACCEPTS referenceable names, incl. column-shaped ones.**
+    /// We are intentionally MORE permissive than Excel: anything that references fine
+    /// in our A1-canonical engine is allowed. That includes `R`/`C` (Excel reserves
+    /// them only for a Name-Box keyboard shortcut we lack), bare columns
+    /// (`K`/`OLD`/`TAX`/`XFC`/`RC`), leading-underscore and dotted identifiers
+    /// (`_foo`/`My.Range`), bare function names (`SUM`), and even `R1C1` (under
+    /// A1-canonical parsing the trailing `C` breaks the cell-ref shape, so it lexes
+    /// as a NAME — and our stored formulas are canonical A1, so it references fine).
+    #[test]
+    fn fe10x_accepts_referenceable_names() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let r = range(sheet, 0, 0, 0, 0);
+        for good in [
+            "R",
+            "C",
+            "K",
+            "OLD",
+            "TAX",
+            "XFC",
+            "RC",
+            "R1C1",
+            "Sales_2025",
+            "_foo",
+            "My.Range",
+            "SUM",
+            "Sheet1",
+            "MyRange",
+            "Data",
+        ] {
+            assert!(
+                s.set_name(good, r).is_ok(),
+                "FE-10.x: name {good:?} must be ACCEPTED (referenceable)"
+            );
+        }
+    }
+
+    /// **FE-10.x — the validator fires on BOTH runtime name-creation paths.**
+    /// `set_sheet_scoped_name` (the second producer method) rejects a cell-ref-shaped
+    /// name and accepts a referenceable one, identically to `set_name`. Also covers a
+    /// SCALAR target (`Constant`), confirming the check is target-kind-agnostic.
+    #[test]
+    fn fe10x_sheet_scoped_and_scalar_set_name_validate() {
+        use ql_storage::NamedTarget;
+        use ql_types::Value;
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // Sheet-scoped path.
+        assert!(
+            s.with_runtime(|rt| rt.set_sheet_scoped_name(
+                sheet,
+                "B2",
+                NamedTarget::Constant(Value::Number(1.0))
+            ))
+            .is_err(),
+            "FE-10.x: set_sheet_scoped_name must reject the cell-ref-shaped name B2"
+        );
+        assert!(
+            s.with_runtime(|rt| rt.set_sheet_scoped_name(
+                sheet,
+                "MyRate",
+                NamedTarget::Constant(Value::Number(1.0))
+            ))
+            .is_ok(),
+            "FE-10.x: set_sheet_scoped_name must accept MyRate"
+        );
+        // Workbook-scoped scalar (Constant) path.
+        assert!(
+            s.with_runtime(|rt| rt.set_name("Q4", NamedTarget::Constant(Value::Number(1.0))))
+                .is_err(),
+            "FE-10.x: set_name must reject the cell-ref-shaped scalar name Q4"
+        );
+    }
+
+    // ===== FE-10.x: Part B — `@` over a named range narrows (rule 10) =====
+
+    /// **FE-10.x — `SUM(@SALES)` narrows the single-column named range to the
+    /// formula-row cell.** Pre-FE-10.x this summed the FULL range (the `@` was
+    /// silently ignored → wrong answer).
+    #[test]
+    fn fe10x_at_named_range_narrows_single_column() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (rr, v) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            s.set_value(addr(sheet, rr, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_name("SALES", range(sheet, 0, 0, 2, 0)).unwrap(); // A1:A3
+        s.set_formula(addr(sheet, 1, 2), "SUM(@SALES)").unwrap(); // row 1 → A2
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 1, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 20.0 }),
+            "FE-10.x: SUM(@SALES) at row 1 must narrow A1:A3 to A2 (= 20), not sum the full range (= 60)"
+        );
+    }
+
+    /// **FE-10.x — `@SALES` outside the range's row span → `#VALUE!`.**
+    #[test]
+    fn fe10x_at_named_range_out_of_span_is_value_error() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 20.0 })
+            .unwrap();
+        s.set_name("SALES", range(sheet, 0, 0, 1, 0)).unwrap(); // A1:A2 (rows 0-1)
+        s.set_formula(addr(sheet, 5, 2), "@SALES").unwrap(); // row 5 is outside
+        s.recalc_dirty().unwrap();
+        let v = s.cell(addr(sheet, 5, 2)).unwrap().unwrap().value;
+        assert!(
+            matches!(&v, Some(CellValue::Error { error }) if error == "#VALUE!"),
+            "FE-10.x: @SALES outside the range's row span must be #VALUE!, got {v:?}"
+        );
+    }
+
+    /// **FE-10.x — `@<2-D named range>` → `#VALUE!`.**
+    #[test]
+    fn fe10x_at_named_range_2d_is_value_error() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        s.set_name("GRID", range(sheet, 0, 0, 1, 1)).unwrap(); // A1:B2 (2-D)
+        s.set_formula(addr(sheet, 0, 3), "@GRID").unwrap();
+        s.recalc_dirty().unwrap();
+        let v = s.cell(addr(sheet, 0, 3)).unwrap().unwrap().value;
+        assert!(
+            matches!(&v, Some(CellValue::Error { error }) if error == "#VALUE!"),
+            "FE-10.x: @<2-D named range> must be #VALUE!, got {v:?}"
+        );
+    }
+
+    /// **FE-10.x — bare `=@SALES` narrows to a single cell** (was the
+    /// `NamedRangeInScalarContext` error before — `@` is the scalarization operator).
+    #[test]
+    fn fe10x_bare_at_named_range_narrows_not_error() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 7.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 8.0 })
+            .unwrap();
+        s.set_name("SALES", range(sheet, 0, 0, 1, 0)).unwrap();
+        s.set_formula(addr(sheet, 1, 2), "@SALES").unwrap(); // row 1 → A2 = 8
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 1, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 8.0 }),
+            "FE-10.x: bare =@SALES must narrow to the anchor-row cell (A2 = 8), not error"
+        );
+    }
+
+    /// **FE-10.x — the narrowed `@SALES` preserves the name-dep (the crux).** The
+    /// narrowed result is wrapped in `ScalarNameRef`, so RETARGETING `SALES`
+    /// re-dirties + re-narrows the formula (and the Error inner re-dirties too):
+    /// retargeting to A2:A3 puts the row-0 formula OUT of span → `#VALUE!`. Without
+    /// the wrapper the bare CellRef would drop the dep and stay stale at 10.
+    #[test]
+    fn fe10x_at_named_range_redirties_on_retarget() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (rr, v) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            s.set_value(addr(sheet, rr, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_name("SALES", range(sheet, 0, 0, 2, 0)).unwrap(); // A1:A3
+        s.set_formula(addr(sheet, 0, 2), "@SALES").unwrap(); // row 0 → A1 = 10
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 10.0 }),
+            "precondition: @SALES at row 0 narrows A1:A3 to A1 = 10"
+        );
+        // Retarget SALES to A2:A3 — row 0 is now OUTSIDE the span.
+        s.set_name("SALES", range(sheet, 1, 0, 2, 0)).unwrap();
+        s.recalc_dirty().unwrap();
+        let v = s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value;
+        assert!(
+            matches!(&v, Some(CellValue::Error { error }) if error == "#VALUE!"),
+            "FE-10.x: retargeting SALES to A2:A3 must re-dirty @SALES at row 0 → #VALUE! \
+             (dep preserved via ScalarNameRef, incl. the Error inner), got {v:?}"
+        );
+    }
+
+    /// **FE-10.x — deleting the name makes `@SALES` go `#NAME?`** (dep preserved →
+    /// reachable FE-9 `#NAME?` net).
+    #[test]
+    fn fe10x_at_named_range_delete_is_name_error() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 5.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 6.0 })
+            .unwrap();
+        s.set_name("SALES", range(sheet, 0, 0, 1, 0)).unwrap();
+        s.set_formula(addr(sheet, 0, 2), "@SALES").unwrap(); // row 0 → A1 = 5
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 5.0 }),
+            "precondition: @SALES = A1 = 5"
+        );
+        s.delete_name("SALES", None).unwrap();
+        s.recalc_dirty().unwrap();
+        let v = s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value;
+        assert!(
+            matches!(&v, Some(CellValue::Error { error }) if error == "#NAME?"),
+            "FE-10.x: deleting SALES must turn @SALES into #NAME?, got {v:?}"
+        );
+    }
+
+    /// **FE-10.x — the same `@SALES` text in two rows narrows to DIFFERENT cells.**
+    /// Guards the `@` cell-anchor cache: the bound plan must key on the formula
+    /// anchor, not just the text, or both rows would collapse to one cell.
+    #[test]
+    fn fe10x_at_named_range_anchor_cache_two_rows() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (rr, v) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            s.set_value(addr(sheet, rr, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_name("SALES", range(sheet, 0, 0, 2, 0)).unwrap(); // A1:A3
+        s.set_formula(addr(sheet, 0, 2), "@SALES").unwrap(); // row 0 → A1 = 10
+        s.set_formula(addr(sheet, 1, 2), "@SALES").unwrap(); // row 1 → A2 = 20
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 10.0 }),
+            "FE-10.x: @SALES at row 0 → A1 = 10"
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 1, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 20.0 }),
+            "FE-10.x: @SALES at row 1 → A2 = 20 (anchor-keyed, not collapsed to A1)"
+        );
+    }
+
+    /// **FE-10.x — a reference-aware fn over `@<named range>` sees a REFERENCE.**
+    /// `@SALES` narrows to a `CellRef` (wrapped in `ScalarNameRef`), so `ROW(@SALES)`
+    /// returns the anchor row's 1-indexed number (NOT `#VALUE!` — the FE-10 round-3
+    /// "wrapper mishandled by a ref-arg materializer" class). Retargeting `SALES` out
+    /// of the anchor's span re-dirties → `#VALUE!`, proving the name-dep survives
+    /// through the address-only dep walker.
+    #[test]
+    fn fe10x_reference_aware_fn_over_at_name() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (rr, v) in [(0u32, 10.0), (1, 20.0), (2, 30.0), (3, 40.0)] {
+            s.set_value(addr(sheet, rr, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_name("SALES", range(sheet, 0, 0, 3, 0)).unwrap(); // A1:A4 (rows 0-3)
+        s.set_formula(addr(sheet, 2, 2), "ROW(@SALES)").unwrap(); // row 2 → A3 → ROW = 3
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 2, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 3.0 }),
+            "FE-10.x: ROW(@SALES) at row 2 must be the 1-indexed anchor row (3), not #VALUE!"
+        );
+        // Retarget SALES to the single-column A4:A5 (rows 3-4) → row 2 is now out of
+        // span → re-dirty → #VALUE! (a single CELL would be idempotent, not out of
+        // span — so use a multi-row column that excludes the anchor row).
+        s.set_name("SALES", range(sheet, 3, 0, 4, 0)).unwrap();
+        s.recalc_dirty().unwrap();
+        let v = s.cell(addr(sheet, 2, 2)).unwrap().unwrap().value;
+        assert!(
+            matches!(&v, Some(CellValue::Error { error }) if error == "#VALUE!"),
+            "FE-10.x: retargeting SALES to A4:A5 must re-dirty ROW(@SALES) at row 2 → #VALUE!, got {v:?}"
+        );
+    }
+
+    /// **FE-10.x — `@<single-row name>` narrows to the anchor COLUMN; `@<single-cell
+    /// name>` is idempotent.** Covers the rule-3 and rule-5 branches of
+    /// `narrow_concrete_range` for a NAMED range (the single-column case is covered
+    /// elsewhere).
+    #[test]
+    fn fe10x_at_named_range_single_row_and_single_cell() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 100.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 0, 1), CellValue::Number { number: 200.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 0, 2), CellValue::Number { number: 300.0 })
+            .unwrap();
+        // Single ROW A1:C1 → @ narrows to the anchor col.
+        s.set_name("ROWRANGE", range(sheet, 0, 0, 0, 2)).unwrap();
+        s.set_formula(addr(sheet, 5, 1), "@ROWRANGE").unwrap(); // col 1 → B1 = 200
+                                                                // Single CELL A1:A1 → @ idempotent → A1 regardless of anchor.
+        s.set_name("ONECELL", range(sheet, 0, 0, 0, 0)).unwrap();
+        s.set_formula(addr(sheet, 7, 7), "@ONECELL").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 5, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 200.0 }),
+            "FE-10.x: @<single-row name> at col 1 must narrow to B1 (= 200)"
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 7, 7)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 100.0 }),
+            "FE-10.x: @<single-cell name> must be idempotent → A1 (= 100), regardless of anchor"
+        );
+    }
+
+    /// **FE-10.x — `@<cross-sheet named range>` narrows on the NAME's sheet.** A
+    /// workbook-scoped name whose range lives on a different sheet than the formula:
+    /// narrowing uses the name's sheet (`r.sheet`) with the FORMULA's anchor row.
+    #[test]
+    fn fe10x_at_named_range_cross_sheet() {
+        let mut s = WorkbookSession::new();
+        let s0 = s.add_sheet("S0", 16384).unwrap();
+        let s1 = s.add_sheet("S1", 16384).unwrap();
+        s.set_value(addr(s1, 0, 0), CellValue::Number { number: 11.0 })
+            .unwrap();
+        s.set_value(addr(s1, 1, 0), CellValue::Number { number: 22.0 })
+            .unwrap();
+        s.set_value(addr(s1, 2, 0), CellValue::Number { number: 33.0 })
+            .unwrap();
+        s.set_name("REMOTE", range(s1, 0, 0, 2, 0)).unwrap(); // S1!A1:A3
+                                                              // Formula on S0 at row 1 → narrows REMOTE to S1!A2 = 22.
+        s.set_formula(addr(s0, 1, 2), "@REMOTE").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(s0, 1, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 22.0 }),
+            "FE-10.x: @<cross-sheet name> at row 1 must narrow to S1!A2 (= 22) on the name's sheet"
+        );
+    }
+
+    /// **FE-10.x — `COLUMN(@name)` (address-only) and `ISREF(@name)` (lazy-shape)
+    /// over the narrowed wrapper.** Makes the dep-policy coverage explicit across the
+    /// two non-normal walkers: `COLUMN`/`ROWS`/`COLUMNS` share the address-only branch
+    /// with `ROW` (tested separately); `ISREF` is LazyShape. A `@<single-col name>`
+    /// narrows to a `CellRef`, so `COLUMN` reads its 1-indexed column and `ISREF` is
+    /// TRUE (it IS a reference).
+    #[test]
+    fn fe10x_column_and_isref_over_at_name() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (rr, v) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            s.set_value(addr(sheet, rr, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_name("SALES", range(sheet, 0, 0, 2, 0)).unwrap(); // A1:A3 (col 0)
+        s.set_formula(addr(sheet, 1, 2), "COLUMN(@SALES)").unwrap(); // → A2 → COLUMN = 1
+        s.set_formula(addr(sheet, 1, 3), "ISREF(@SALES)").unwrap(); // → A2 → a reference
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 1, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 1.0 }),
+            "FE-10.x: COLUMN(@SALES) must be the 1-indexed column of the narrowed cell (1)"
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 1, 3)).unwrap().unwrap().value,
+            Some(CellValue::Boolean { boolean: true }),
+            "FE-10.x: ISREF(@SALES) must be TRUE — the narrowed @name is a reference"
         );
     }
 

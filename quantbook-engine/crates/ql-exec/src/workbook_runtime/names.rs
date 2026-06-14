@@ -17,10 +17,46 @@
 //!   plans bound against the workbook-scoped value pick up the new
 //!   sheet-scoped shadow on next recompute.
 
+use ql_formula_syntax::{lex, parse, Expr};
 use ql_oplog::Op;
 use ql_types::SheetId;
 
 use super::{RuntimeError, WorkbookRuntime};
+
+/// **FE-10.x (2026-06-14):** reject a proposed defined name that could never be
+/// REFERENCED in a formula. The criterion is referenceability IN OUR ENGINE (not
+/// Excel-parity): the name string must lex+parse to exactly one `Expr::NameRef`
+/// whose canonical text equals the key storage will register it under
+/// (`name.to_ascii_uppercase()`, per `NameTable::set`). This rejects:
+///   - cell-reference shapes — letters + a row number (`A1`, `Q1`, `FY1`,
+///     `XFD1048576`, `RC1`, `ABC123`) → `Expr::CellRef`;
+///   - numbers (`123`) → `Expr::Number`; booleans (`TRUE`/`FALSE`) → `Expr::Bool`;
+///   - multi-token / illegal-char names (`My Range`, `$A`, `a!b`);
+///   - whitespace-carrying names (`" A "`) — the lexer SKIPS the spaces so it
+///     parses as `NameRef("A")`, but the stored key keeps them (`" A "`), so `=A`
+///     could never resolve it. The equality check (parsed == canonical) catches
+///     this; "parses to a NameRef" alone would not.
+/// It KEEPS column-shaped names (`R`, `C`, `K`, `OLD`, `TAX`, `XFC`, `RC`) and
+/// ordinary identifiers (`Sales_2025`, `_foo`, `My.Range`, a bare function name
+/// like `SUM`, and even `R1C1` — under A1-canonical parsing the trailing `C`
+/// breaks the cell-ref shape, so it lexes as a NAME) — they reference fine. The reserved `AI` sentinel is caught separately
+/// by `NameTable::would_accept`. `canonicalize_function_name` (parser) and
+/// `NameTable::set` both canonicalize via a plain `to_ascii_uppercase`, so the
+/// equality holds for every legitimately-referenceable name.
+fn validate_name_referenceable(name: &str) -> Result<(), RuntimeError> {
+    let canonical = name.to_ascii_uppercase();
+    let parses_as_name = matches!(
+        lex(name).ok().and_then(|toks| parse(toks).ok()),
+        Some(Expr::NameRef(ref parsed)) if parsed.as_ref() == canonical.as_str()
+    );
+    if parses_as_name {
+        Ok(())
+    } else {
+        Err(RuntimeError::NameNotReferenceable {
+            name: name.to_string(),
+        })
+    }
+}
 
 impl<'a> WorkbookRuntime<'a> {
     /// Phase 2B.5 (2026-05-12): register a defined name through the runtime,
@@ -55,6 +91,10 @@ impl<'a> WorkbookRuntime<'a> {
         // `NameTable::set`'s on-write canonicalization, so the recorded
         // form is stable regardless of how the caller cased the name.
         self.workbook.names().would_accept(name)?;
+        // FE-10.x: reject names that no formula could reference (cell-ref shapes,
+        // numbers, booleans, whitespace-carrying, …) BEFORE the op-log append so
+        // a rejected name leaves no phantom log entry.
+        validate_name_referenceable(name)?;
         if let Some(oplog) = self.oplog.as_deref_mut() {
             let target_wire = ql_io::NamedTargetWire::from_target(&target);
             oplog.append(Op::SetName {
@@ -108,6 +148,8 @@ impl<'a> WorkbookRuntime<'a> {
         //    `NameTable::would_accept` since the reserved-name set
         //    is workbook-global (per is_reserved_name in storage).
         self.workbook.names().would_accept(name)?;
+        // FE-10.x: reject non-referenceable names (matches set_name), before append.
+        validate_name_referenceable(name)?;
         // 3. Append op-log entry BEFORE mutation.
         if let Some(oplog) = self.oplog.as_deref_mut() {
             let target_wire = ql_io::NamedTargetWire::from_target(&target);

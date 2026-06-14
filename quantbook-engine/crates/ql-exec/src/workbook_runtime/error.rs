@@ -94,6 +94,26 @@ pub enum RuntimeError {
     #[error("name table error: {0}")]
     Name(#[from] ql_storage::NameTableError),
 
+    /// **FE-10.x (2026-06-14):** `WorkbookRuntime::set_name` /
+    /// `set_sheet_scoped_name` was given a name that is not REFERENCEABLE — it
+    /// does not lex+parse to a single `Expr::NameRef` whose canonical text
+    /// equals the key the name would be stored under (`name.to_ascii_uppercase()`).
+    /// So no formula could ever resolve it: a cell reference (`A1`, `Q1`, `FY1`,
+    /// `RC1`, `ABC123`), a number (`123`), a boolean (`TRUE`/`FALSE`), a string with
+    /// illegal characters (`$A`, `a!b`), or one carrying whitespace (`" A "` — the
+    /// lexer skips it but the stored key preserves it). NOTE: this is deliberately
+    /// MORE permissive than Excel — column-shaped names like `R`, `C`, `K`, `OLD`,
+    /// `TAX`, `RC` ARE accepted (they reference fine in our engine; Excel reserves
+    /// `R`/`C` only for a Name-Box keyboard shortcut we lack), and `R1C1` is
+    /// accepted too (A1-canonical parsing lexes it as a NAME, not a reference).
+    /// The reserved `AI` sentinel is caught separately by `NameTable::would_accept`.
+    #[error(
+        "name {name:?} cannot be used as a defined name: it parses as a cell \
+         reference, number, boolean, or is otherwise not a valid name reference. \
+         Choose a name that isn't a cell address (e.g. add a suffix like `_v`)."
+    )]
+    NameNotReferenceable { name: String },
+
     /// **FE-5 W-N (2026-06-12):** `WorkbookRuntime::delete_name` /
     /// `delete_sheet_scoped_name` was called with a name that isn't
     /// registered in the target scope. `NameTable::clear` is idempotent (a

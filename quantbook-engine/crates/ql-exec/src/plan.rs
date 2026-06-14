@@ -969,13 +969,13 @@ fn bind_with_context_v2<L: NameLookup>(
         //   9. StructuredRef inner → patch `is_this_row: true` on
         //      the resolved range so eval narrows to formula row
         //      (matches `=Sales[@Qty]` semantics).
-        //  10. NameRef resolving to Range → resolve, narrow if
-        //      possible, error if 2-D.
-        //      **NOT YET IMPLEMENTED (deferred FE-10.x):** `NameRef` currently
-        //      falls through to the scalar pass-through arm below (no narrowing),
-        //      so `@<name→multi-cell-range>` yields the full range. Pre-existing
-        //      (affects every named range under `@`, e.g. `@SALES`); FE-10 only
-        //      made `@OLD`-style 3-letter names CONSISTENT with that path.
+        //  10. NameRef resolving to Range → resolve, narrow to the anchor,
+        //      error if 2-D. **IMPLEMENTED in FE-10.x (2026-06-14):** the
+        //      `Expr::NameRef` arm of `bind_implicit_intersection` resolves the
+        //      name and, for a `ResolvedName::Range`, narrows via
+        //      `narrow_concrete_range` (same rules as the literal-range path),
+        //      then wraps the result in `ScalarNameRef` to preserve the name-dep.
+        //      Pre-FE-10.x `@<name→multi-cell-range>` yielded the full range.
         //
         // Out-of-range narrow → `BindError::UnsupportedVariant` to
         // become #VALUE! at eval time (we surface as ExprPlan::Error
@@ -1018,15 +1018,56 @@ fn bind_implicit_intersection<L: NameLookup>(
         | Expr::CellRef(_)
         | Expr::R1C1Ref { .. }
         | Expr::Unary { .. }
-        | Expr::Binary { .. }
-        | Expr::NameRef(_) => bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx),
+        | Expr::Binary { .. } => {
+            bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx)
+        }
+
+        // **FE-10.x (2026-06-14) — Rule 10: `@<name>` narrowing.** A `NameRef`
+        // that resolves to a RANGE narrows to the anchor cell exactly like a
+        // literal `@A1:A10` (via `narrow_concrete_range`), instead of binding the
+        // whole range. Pre-FE-10.x `NameRef` fell through the scalar arm above, so
+        // `=SUM(@SALES)` summed the FULL range (the `@` was ignored) and bare
+        // `=@SALES` errored `NamedRangeInScalarContext`. The narrowed result is
+        // WRAPPED in `ScalarNameRef { name, inner }` so the dep graph still records
+        // the `SALES` name-dep (retarget/delete re-dirties — reusing FE-10's
+        // wrapper; a bare narrowed `CellRef` would DROP the name-dep and go stale).
+        // The anchor is required only when actually narrowing a range — matching
+        // the literal-range path. EVERY non-range resolution (a scalar value, a
+        // single Cell, an undefined name → `#NAME?`, a named formula → its error)
+        // falls through to the normal binder, which already handles them (and
+        // `@scalar` is a semantic no-op). Named ranges are always bounded
+        // rectangles, so no WholeColumn/WholeRow narrowing is reachable here.
+        Expr::NameRef(name) => match names.lookup_named_target(name, owning_sheet) {
+            Some(ResolvedName::Range(r)) => {
+                let anchor = site
+                    .cell
+                    .ok_or(BindError::ImplicitIntersectionRequiresAnchor)?;
+                let narrowed = narrow_concrete_range(
+                    r.sheet,
+                    r.start_row,
+                    r.start_col,
+                    r.end_row,
+                    r.end_col,
+                    anchor,
+                    false,
+                    false,
+                );
+                Ok(ExprPlan::ScalarNameRef {
+                    name: name.clone(),
+                    inner: Box::new(narrowed),
+                })
+            }
+            _ => bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx),
+        },
 
         // Rule 8: function inner. The `@` is semantically a no-op for
         // scalar function returns (most common case). Array returns
         // currently surface as `#CALC!` in scalar context per existing
         // 4.7.G limit; the design § 3.3 rule 7 "array → top-left" is
         // a known v1 gap (deferred to cell-boundary spill rewiring).
-        Expr::Function { .. } => bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx),
+        Expr::Function { .. } => {
+            bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx)
+        }
 
         // Rule 7: array literal → top-left.
         Expr::Array(rows) => {
@@ -1121,6 +1162,72 @@ fn bind_implicit_intersection<L: NameLookup>(
 
 /// **W5-144 (Phase 4.9.H):** apply design § 3.3 rules 2-6 to a
 /// `RangeRef` inner with a formula-cell anchor (`site.cell`).
+/// **FE-10.x (2026-06-14):** narrow a CONCRETE resolved rectangle to the
+/// implicit-intersection anchor. Shared by the literal `RangeRef::Cells` arm of
+/// `narrow_range_for_implicit_intersection` and the named-range arm of
+/// `bind_implicit_intersection` (design § 3.3 "rule 10"). Encodes rules 2/3/4/5:
+/// single-cell → idempotent; single-column → narrow to the anchor row (or
+/// `#VALUE!` if the anchor row falls outside the span); single-row → narrow to
+/// the anchor col; 2-D → `#VALUE!`. `abs_start_col` / `abs_start_row` carry the
+/// source axis abs flags onto the FIXED coordinate (so a literal `@A$1:A$10`
+/// round-trips unchanged); a NAMED range passes `false`/`false` (names carry no
+/// abs, and the result's abs is eval-irrelevant — the `@<name>` wrapper stays in
+/// the AST for round-trip printing).
+#[allow(clippy::too_many_arguments)]
+fn narrow_concrete_range(
+    sheet: SheetId,
+    start_row: RowId,
+    start_col: ColId,
+    end_row: RowId,
+    end_col: ColId,
+    anchor: ql_types::Address,
+    abs_start_col: bool,
+    abs_start_row: bool,
+) -> ExprPlan {
+    let single_col = start_col == end_col;
+    let single_row = start_row == end_row;
+    match (single_col, single_row) {
+        // Rule 5: single cell — idempotent.
+        (true, true) => ExprPlan::CellRef {
+            sheet,
+            row: start_row,
+            col: start_col,
+            abs_col: abs_start_col,
+            abs_row: abs_start_row,
+        },
+        // Rule 2: single column → narrow to the anchor row.
+        (true, false) => {
+            if anchor.row >= start_row && anchor.row <= end_row {
+                ExprPlan::CellRef {
+                    sheet,
+                    row: anchor.row,
+                    col: start_col,
+                    abs_col: abs_start_col,
+                    abs_row: false,
+                }
+            } else {
+                ExprPlan::Error(ErrorValue::Value)
+            }
+        }
+        // Rule 3: single row → narrow to the anchor col.
+        (false, true) => {
+            if anchor.col >= start_col && anchor.col <= end_col {
+                ExprPlan::CellRef {
+                    sheet,
+                    row: start_row,
+                    col: anchor.col,
+                    abs_col: false,
+                    abs_row: abs_start_row,
+                }
+            } else {
+                ExprPlan::Error(ErrorValue::Value)
+            }
+        }
+        // Rule 4: 2-D → ALWAYS #VALUE!.
+        (false, false) => ExprPlan::Error(ErrorValue::Value),
+    }
+}
+
 fn narrow_range_for_implicit_intersection(
     rr: &ql_formula_syntax::RangeRef,
     owning_sheet: SheetId,
@@ -1144,50 +1251,19 @@ fn narrow_range_for_implicit_intersection(
             abs_end_row: _,
         } => {
             let sheet_id = resolve_sheet_ref(sheet, owning_sheet, sheets)?;
-            let single_col = start_col == end_col;
-            let single_row = start_row == end_row;
-            match (single_col, single_row) {
-                // Rule 5: single cell — idempotent.
-                (true, true) => Ok(ExprPlan::CellRef {
-                    sheet: sheet_id,
-                    row: *start_row,
-                    col: *start_col,
-                    abs_col: *abs_start_col,
-                    abs_row: *abs_start_row,
-                }),
-                // Rule 2: single column.
-                (true, false) => {
-                    if anchor.row >= *start_row && anchor.row <= *end_row {
-                        Ok(ExprPlan::CellRef {
-                            sheet: sheet_id,
-                            row: anchor.row,
-                            col: *start_col,
-                            // Narrowed coord is row-dependent (formula-row);
-                            // the original abs flag on the col axis stays.
-                            abs_col: *abs_start_col,
-                            abs_row: false,
-                        })
-                    } else {
-                        Ok(ExprPlan::Error(ErrorValue::Value))
-                    }
-                }
-                // Rule 3: single row.
-                (false, true) => {
-                    if anchor.col >= *start_col && anchor.col <= *end_col {
-                        Ok(ExprPlan::CellRef {
-                            sheet: sheet_id,
-                            row: *start_row,
-                            col: anchor.col,
-                            abs_col: false,
-                            abs_row: *abs_start_row,
-                        })
-                    } else {
-                        Ok(ExprPlan::Error(ErrorValue::Value))
-                    }
-                }
-                // Rule 4: 2-D → ALWAYS #VALUE!.
-                (false, false) => Ok(ExprPlan::Error(ErrorValue::Value)),
-            }
+            // **FE-10.x:** the rectangle-narrowing rules (2/3/4/5) are shared with
+            // the named-range `@` path via `narrow_concrete_range`. Abs flags are
+            // threaded through so a literal `@A$1:A$10` round-trips unchanged.
+            Ok(narrow_concrete_range(
+                sheet_id,
+                *start_row,
+                *start_col,
+                *end_row,
+                *end_col,
+                anchor,
+                *abs_start_col,
+                *abs_start_row,
+            ))
         }
         // Rule 6: whole column — narrow to anchor row.
         RangeRef::WholeColumn {
@@ -2076,7 +2152,8 @@ mod tests {
             abs_row: false,
         });
         let sheets = MockSheetResolver::new(&[("Sheet2", 1)]);
-        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets, &TEST_REGISTRY).expect("bind");
+        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets, &TEST_REGISTRY)
+            .expect("bind");
         match p {
             ExprPlan::CellRef { sheet, .. } => assert_eq!(sheet, 1),
             other => panic!("expected CellRef, got {other:?}"),
@@ -2093,7 +2170,8 @@ mod tests {
             abs_row: false,
         });
         let sheets = MockSheetResolver::new(&[("Sheet1", 5)]);
-        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets, &TEST_REGISTRY).expect("bind");
+        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets, &TEST_REGISTRY)
+            .expect("bind");
         match p {
             ExprPlan::CellRef { sheet, .. } => assert_eq!(sheet, 5),
             other => panic!("expected CellRef, got {other:?}"),
@@ -2110,7 +2188,8 @@ mod tests {
             abs_row: false,
         });
         let sheets = MockSheetResolver::new(&[("Sheet1", 0)]);
-        let err = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets, &TEST_REGISTRY).unwrap_err();
+        let err = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets, &TEST_REGISTRY)
+            .unwrap_err();
         match err {
             BindError::UnknownSheet(name) => assert_eq!(name.as_ref(), "Nonexistent"),
             other => panic!("expected UnknownSheet, got {other:?}"),
@@ -2142,7 +2221,8 @@ mod tests {
             abs_row: false,
         });
         let sheets = MockSheetResolver::new(&[]);
-        let p = bind_with_names_and_sheets(&expr, 9, &EmptyNameLookup, &sheets, &TEST_REGISTRY).expect("bind");
+        let p = bind_with_names_and_sheets(&expr, 9, &EmptyNameLookup, &sheets, &TEST_REGISTRY)
+            .expect("bind");
         match p {
             ExprPlan::CellRef { sheet, .. } => assert_eq!(sheet, 9),
             other => panic!("expected CellRef, got {other:?}"),
@@ -2165,7 +2245,8 @@ mod tests {
             rhs: Box::new(Expr::Number(1.0)),
         };
         let sheets = MockSheetResolver::new(&[("Sheet2", 7)]);
-        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets, &TEST_REGISTRY).expect("bind");
+        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets, &TEST_REGISTRY)
+            .expect("bind");
         match p {
             ExprPlan::Binary { lhs, .. } => match lhs.as_ref() {
                 ExprPlan::CellRef { sheet, .. } => assert_eq!(*sheet, 7),
@@ -2431,7 +2512,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
-        
             &TEST_REGISTRY,
         )
         .unwrap();
@@ -2467,7 +2547,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
-        
             &TEST_REGISTRY,
         )
         .unwrap_err();
@@ -2490,7 +2569,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
-        
             &TEST_REGISTRY,
         )
         .unwrap_err();
@@ -2516,7 +2594,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
-        
             &TEST_REGISTRY,
         )
         .unwrap();
@@ -2549,7 +2626,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
-        
             &TEST_REGISTRY,
         )
         .unwrap();
@@ -2581,7 +2657,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
-        
             &TEST_REGISTRY,
         )
         .unwrap();
@@ -2609,7 +2684,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
-        
             &TEST_REGISTRY,
         )
         .unwrap();
@@ -2637,7 +2711,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
-        
             &TEST_REGISTRY,
         )
         .unwrap();
@@ -2673,7 +2746,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
-        
             &TEST_REGISTRY,
         )
         .unwrap_err();
@@ -2704,7 +2776,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &EmptyTableLookup,
-        
             &TEST_REGISTRY,
         )
     }
@@ -2716,7 +2787,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &EmptyTableLookup,
-        
             &TEST_REGISTRY,
         )
     }
@@ -2938,7 +3008,6 @@ mod tests {
             &EmptyNameLookup,
             &OneSheet,
             &EmptyTableLookup,
-        
             &TEST_REGISTRY,
         )
         .unwrap();
@@ -3014,7 +3083,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &EmptyTableLookup,
-        
             &TEST_REGISTRY,
         )
     }
@@ -3302,7 +3370,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &EmptyTableLookup,
-        
             &TEST_REGISTRY,
         )
         .unwrap_err();
@@ -3327,7 +3394,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
-        
             &TEST_REGISTRY,
         )
         .unwrap();
@@ -3363,7 +3429,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
-        
             &TEST_REGISTRY,
         )
         .unwrap();
@@ -3398,7 +3463,6 @@ mod tests {
             &EmptyNameLookup,
             &EmptySheetResolver,
             &tables,
-        
             &TEST_REGISTRY,
         )
         .unwrap();
