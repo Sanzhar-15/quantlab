@@ -116,6 +116,8 @@ pub fn eval_scalar<E: CellEnv>(plan: &ExprPlan, env: &E) -> Value {
         ExprPlan::CellRef {
             sheet, row, col, ..
         } => env.read_cell(*sheet, *row, *col),
+        // **FE-10:** transparent scalar-name wrapper — eval the inner resolved plan.
+        ExprPlan::ScalarNameRef { inner, .. } => eval_scalar(inner, env),
         ExprPlan::Binary { op, lhs, rhs } => {
             let l = eval_scalar(lhs, env);
             let r = eval_scalar(rhs, env);
@@ -209,6 +211,10 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
         ExprPlan::CellRef {
             sheet, row, col, ..
         } => env.read_cell(*sheet, *row, *col),
+        // **FE-10:** transparent scalar-name wrapper — eval the inner resolved plan.
+        ExprPlan::ScalarNameRef { inner, .. } => {
+            eval_scalar_with_cache(inner, env, registry, cache)
+        }
         ExprPlan::Binary { op, lhs, rhs } => {
             let l = eval_scalar_with_cache(lhs, env, registry, cache);
             let r = eval_scalar_with_cache(rhs, env, registry, cache);
@@ -712,6 +718,14 @@ fn materialize_ref_arg_eager<E: CellEnv>(
                 address: ql_types::Address::new(*sheet, *row, *col),
             }
         }
+        // **FE-10:** transparent scalar-name wrapper — materialize as its inner so a
+        // `Cell`-target name stays a `RefArg::Reference` (ROW/COLUMN/ISFORMULA/… see it
+        // as a reference), and a Constant/Text name falls to the scalar catch-all. Without
+        // this arm the wrapper hit the value-evaluating catch-all below and a cell-target
+        // name was wrongly passed as a scalar (→ `#VALUE!` for ROW(name) etc.).
+        ExprPlan::ScalarNameRef { inner, .. } => {
+            materialize_ref_arg_eager(inner, env, registry, cache)
+        }
         ExprPlan::AggregateNameRef { range, .. } => RefArg::Range {
             range: *range,
             values: vec![],
@@ -765,6 +779,9 @@ fn materialize_ref_arg_eager<E: CellEnv>(
 fn materialize_ref_arg_lazy(plan: &ExprPlan) -> ql_functions::RefArg {
     use ql_functions::{PlanKind, RefArg};
     let kind = match plan {
+        // **FE-10:** a scalar-name wrapper classifies as its inner (a cell-target
+        // name is a reference → CellRef; a constant/text name is a literal).
+        ExprPlan::ScalarNameRef { inner, .. } => return materialize_ref_arg_lazy(inner),
         ExprPlan::CellRef { .. } => PlanKind::CellRef,
         ExprPlan::AggregateNameRef { .. }
         | ExprPlan::RangeRef { .. }

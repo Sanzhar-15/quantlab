@@ -12407,6 +12407,393 @@ mod tests {
         );
     }
 
+    /// **FE-10 (2026-06-14) — a 3-letter name (a valid column ≤ XFD) resolves in a
+    /// formula.** This is the case the FE-9 tests above had to AVOID (see the
+    /// `fe9_renamed_away` comment: "OLD binds as the column OLD and shadows the
+    /// same-named range — so this uses ALPHA/BETA"). Pre-FE-10 `=SUM(TAX)` summed
+    /// the empty whole column `TAX` (= 0); now a standalone bare token binds as the
+    /// NAME, so it resolves the range.
+    #[test]
+    fn fe10_three_letter_name_resolves_in_aggregate() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 20.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 2, 0), CellValue::Number { number: 30.0 })
+            .unwrap();
+        s.set_name("TAX", range(sheet, 0, 0, 2, 0)).unwrap();
+        s.set_formula(addr(sheet, 0, 4), "SUM(TAX)").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 4)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 60.0 }),
+            "FE-10: =SUM(TAX) must resolve the named range (= 60), not the empty column TAX (= 0)"
+        );
+    }
+
+    /// **FE-10 — deleting a 3-letter name makes dependents `#NAME?`.** Now that a
+    /// 3-letter name binds as a NameRef, the FE-9 `UnresolvedName → #NAME?` net is
+    /// REACHABLE for it (pre-FE-10 it never bound as a name, so deleting it left the
+    /// formula silently summing the empty column).
+    #[test]
+    fn fe10_deleted_three_letter_name_is_name_error() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 4.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 6.0 })
+            .unwrap();
+        s.set_name("TAX", range(sheet, 0, 0, 1, 0)).unwrap();
+        s.set_formula(addr(sheet, 0, 4), "SUM(TAX)").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 4)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 10.0 }),
+            "precondition: =SUM(TAX) computes 10"
+        );
+        s.delete_name("TAX", None).unwrap();
+        s.recalc_dirty().unwrap();
+        let v = s.cell(addr(sheet, 0, 4)).unwrap().unwrap().value;
+        assert!(
+            matches!(&v, Some(CellValue::Error { error }) if error == "#NAME?"),
+            "FE-10: deleting TAX must turn =SUM(TAX) into #NAME?, got {v:?}"
+        );
+    }
+
+    /// **FE-10 — a 3-letter name round-trips through save/reload.** The formula text
+    /// `SUM(PV)` is persisted and re-parsed on open; the parser fix must survive
+    /// (re-parse to a NameRef), so the reloaded workbook still resolves the name.
+    #[test]
+    fn fe10_three_letter_name_round_trips_through_save() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("fe10names.qbook");
+        let path_str = path.to_str().unwrap();
+        {
+            let mut s = WorkbookSession::new();
+            let sheet = s.add_sheet("S", 16384).unwrap();
+            s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 100.0 })
+                .unwrap();
+            s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 200.0 })
+                .unwrap();
+            s.set_name("PV", range(sheet, 0, 0, 1, 0)).unwrap();
+            s.set_formula(addr(sheet, 0, 4), "SUM(PV)").unwrap();
+            s.recalc_dirty().unwrap();
+            s.save(path_str).unwrap();
+        }
+        let mut s2 = WorkbookSession::new();
+        s2.open(path_str).unwrap();
+        s2.recalc_all().unwrap();
+        assert_eq!(
+            s2.cell(addr(0, 0, 4)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 300.0 }),
+            "FE-10: reloaded =SUM(PV) must still resolve the named range (= 300)"
+        );
+    }
+
+    /// **FE-10 — the explicit colon whole-column form is UNCHANGED.** Now that a
+    /// bare `A` is a name, the colon form `A:A` must still be a genuine whole-column
+    /// reference (the only way to express a whole column — matching Excel).
+    #[test]
+    fn fe10_whole_column_colon_form_still_works() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 2.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 2, 0), CellValue::Number { number: 3.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 4), "SUM(A:A)").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 4)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 6.0 }),
+            "FE-10: =SUM(A:A) (explicit colon whole column) must still sum column A (= 6)"
+        );
+    }
+
+    /// **FE-10 — a name in a formula is NOT shifted as a column by insert-column.**
+    /// The rewrite path (`lex → parse → shift → print`) must leave a NameRef alone.
+    /// Pre-FE-10 `SUM(TAX)` parsed as a whole-column ref, so an inserted column would
+    /// have SHIFTED `TAX` to a different column (silent corruption). With the parser
+    /// fix it is a NameRef, which the structural shifter leaves untouched — the
+    /// formula text stays `SUM(TAX)`.
+    #[test]
+    fn fe10_name_in_formula_not_shifted_by_insert_column() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 20.0 })
+            .unwrap();
+        s.set_name("TAX", range(sheet, 0, 0, 1, 0)).unwrap();
+        s.set_formula(addr(sheet, 0, 4), "SUM(TAX)").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 4)).unwrap().unwrap().formula.as_deref(),
+            Some("SUM(TAX)"),
+            "precondition: formula stored canonically as SUM(TAX)"
+        );
+        // Insert a column at col 0 — everything shifts right by one. A WHOLE-COLUMN
+        // ref to `TAX` would shift; a NAME ref must not.
+        s.insert_columns(sheet, 0, 1).unwrap();
+        s.recalc_dirty().unwrap();
+        // The formula cell moved from col 4 to col 5; its text must be unchanged.
+        assert_eq!(
+            s.cell(addr(sheet, 0, 5)).unwrap().unwrap().formula.as_deref(),
+            Some("SUM(TAX)"),
+            "FE-10: insert-column must NOT shift the NAME `TAX` in the formula text"
+        );
+    }
+
+    /// **FE-10 — a 3-letter name under `@` evals IDENTICALLY to a 4+ letter name.**
+    /// FE-10 routes `@OLD` through the same NameRef path `@SALES` already used. The
+    /// `@`-over-a-named-range narrowing ("rule 10") is unimplemented for BOTH (deferred
+    /// FE-10.x) — this pins CONSISTENCY: FE-10 introduces no divergence between the
+    /// previously-shadowed 3-letter case and the established 4+ letter case.
+    #[test]
+    fn fe10_at_name_eval_consistency() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 3.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 4.0 })
+            .unwrap();
+        // OLD (3-letter, previously shadowed) and SALES (4-letter) name the SAME range.
+        s.set_name("OLD", range(sheet, 0, 0, 1, 0)).unwrap();
+        s.set_name("SALES", range(sheet, 0, 0, 1, 0)).unwrap();
+        s.set_formula(addr(sheet, 0, 2), "SUM(@OLD)").unwrap();
+        s.set_formula(addr(sheet, 0, 3), "SUM(@SALES)").unwrap();
+        s.recalc_dirty().unwrap();
+        let v_old = s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value;
+        let v_sales = s.cell(addr(sheet, 0, 3)).unwrap().unwrap().value;
+        assert!(
+            matches!(v_old, Some(CellValue::Number { .. })),
+            "FE-10: SUM(@OLD) must eval to a number (the named range), got {v_old:?}"
+        );
+        assert_eq!(
+            v_old, v_sales,
+            "FE-10: @OLD (3-letter) must eval identically to @SALES (4-letter) — same NameRef path"
+        );
+    }
+
+    /// **FE-10 — a lowercase bare token resolves case-insensitively.** `sum(tax)`
+    /// → `SUM` (function) over the named range `TAX` (the lexer accepts lowercase
+    /// column letters; `canonicalize_function_name` upper-cases; the NameTable
+    /// lookup is case-insensitive).
+    #[test]
+    fn fe10_lowercase_bare_name_resolves() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 20.0 })
+            .unwrap();
+        s.set_name("TAX", range(sheet, 0, 0, 1, 0)).unwrap();
+        s.set_formula(addr(sheet, 0, 2), "sum(tax)").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 30.0 }),
+            "FE-10: lowercase `sum(tax)` must resolve the case-insensitive name TAX (= 30)"
+        );
+    }
+
+    /// **FE-10 — RETARGETING a 3-letter RANGE name re-dirties dependents (the PRODUCT
+    /// path).** A Range name (the ONLY kind the session/IDE can create — `set_name` is
+    /// `NamedTarget::Range`-only) binds to `AggregateNameRef`, which records a name-dep,
+    /// so `on_set_name` re-dirties `=SUM(TAX)` when TAX is redefined. This proves the
+    /// product-facing column-shadow fix is fully correct under retarget (delete is
+    /// covered by `fe10_deleted_three_letter_name_is_name_error`). NB: SCALAR/Constant
+    /// names (`NamedTarget::Cell`/`Constant`) are runtime-API-only, NOT product-reachable,
+    /// and have a PRE-EXISTING dep-tracking gap (they erase the name at bind → not
+    /// re-dirtied) — affecting all name lengths, deferred to FE-10.x.
+    #[test]
+    fn fe10_retarget_range_name_redirties_dependents() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 20.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 2, 0), CellValue::Number { number: 30.0 })
+            .unwrap();
+        s.set_name("TAX", range(sheet, 0, 0, 1, 0)).unwrap(); // TAX = A1:A2
+        s.set_formula(addr(sheet, 0, 4), "SUM(TAX)").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 4)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 30.0 }),
+            "precondition: =SUM(TAX) over A1:A2 = 30"
+        );
+        // Retarget TAX to A1:A3 (set_name is last-writer-wins upsert).
+        s.set_name("TAX", range(sheet, 0, 0, 2, 0)).unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 4)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 60.0 }),
+            "FE-10: retargeting the RANGE name TAX to A1:A3 must re-dirty =SUM(TAX) → 60"
+        );
+    }
+
+    /// **FE-10 — a SCALAR (Constant) name re-dirties dependents on DELETE (the dep fix).**
+    /// Scalar names aren't creatable via the live session (`set_name` is Range-only) but
+    /// DO load from a `.qbook` / imported `.xlsx`; the runtime escape hatch seeds one here
+    /// to mirror that. Pre-fix the scalar resolution ERASED the name (→ `Number`), so no
+    /// name-dep was recorded → `delete_name` + recalc left a STALE value (the Codex
+    /// NO-SHIP). The `ScalarNameRef` wrapper records the name-dep, so deleting K now
+    /// re-dirties `=K*A1` → `#NAME?`. `K` is a 1-letter, column-shaped name — exactly the
+    /// class FE-10's parser change newly routes through the scalar-name path.
+    #[test]
+    fn fe10_scalar_constant_name_redirties_on_delete() {
+        use ql_storage::NamedTarget;
+        use ql_types::Value;
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 100.0 })
+            .unwrap(); // A1 = 100
+        s.with_runtime(|rt| rt.set_name("K", NamedTarget::Constant(Value::Number(2.0))))
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 1), "K*A1").unwrap(); // B1 = K*A1
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 200.0 }),
+            "precondition: K(=2) * A1(=100) = 200"
+        );
+        s.delete_name("K", None).unwrap();
+        s.recalc_dirty().unwrap();
+        let v = s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value;
+        assert!(
+            matches!(&v, Some(CellValue::Error { error }) if error == "#NAME?"),
+            "FE-10: deleting the scalar name K must re-dirty =K*A1 to #NAME?, got {v:?} (was the stale-value NO-SHIP)"
+        );
+    }
+
+    /// **FE-10 — a SCALAR (Constant) name re-dirties dependents on RETARGET.** Companion
+    /// to the delete case: redefining K (last-writer-wins) must recompute `=K*A1`.
+    #[test]
+    fn fe10_scalar_constant_name_redirties_on_retarget() {
+        use ql_storage::NamedTarget;
+        use ql_types::Value;
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 100.0 })
+            .unwrap();
+        s.with_runtime(|rt| rt.set_name("K", NamedTarget::Constant(Value::Number(2.0))))
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 1), "K*A1").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 200.0 }),
+            "precondition: K(=2) * A1(=100) = 200"
+        );
+        // Retarget K = 3 (upsert).
+        s.with_runtime(|rt| rt.set_name("K", NamedTarget::Constant(Value::Number(3.0))))
+            .unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 300.0 }),
+            "FE-10: retargeting scalar K to 3 must re-dirty =K*A1 → 300 (not the stale 200)"
+        );
+    }
+
+    /// **FE-10 — a CELL-target name stays a REFERENCE for reference-aware fns.** The
+    /// `ScalarNameRef` wrapper must be transparent to ROW/COLUMN/ROWS/ISFORMULA/… (which
+    /// need a reference, not a value). Regression guard for the Codex round-3 finding: the
+    /// eager ref-arg materializer's catch-all evaluated the wrapper as a scalar VALUE →
+    /// `ROW(name)` = `#VALUE!`. The fix recurses into `inner`, so a `Cell`-target name is
+    /// a `RefArg::Reference`. Covers BOTH a 4-letter name (`ANCHOR` — correct pre-FE-10,
+    /// must not regress) and a column-shaped name (`K` — newly routed through this path).
+    #[test]
+    fn fe10_reference_aware_fn_over_cell_target_name() {
+        use ql_storage::NamedTarget;
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // Both names target C5 (0-indexed row 4, col 2) → ROW = 5, COLUMN = 3.
+        s.with_runtime(|rt| {
+            rt.set_name("ANCHOR", NamedTarget::Cell(ql_types::Address::new(sheet, 4, 2)))
+        })
+        .unwrap();
+        s.with_runtime(|rt| rt.set_name("K", NamedTarget::Cell(ql_types::Address::new(sheet, 4, 2))))
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 0), "ROW(ANCHOR)").unwrap();
+        s.set_formula(addr(sheet, 1, 0), "ROW(K)").unwrap();
+        s.set_formula(addr(sheet, 2, 0), "COLUMN(K)").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 5.0 }),
+            "FE-10: ROW(ANCHOR) (cell-target name) must be 5, not #VALUE!"
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 1, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 5.0 }),
+            "FE-10: ROW(K) (column-shaped cell-target name) must be 5, not #VALUE!"
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 2, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 3.0 }),
+            "FE-10: COLUMN(K) must be 3"
+        );
+    }
+
+    /// **FE-10 — a bare `=K` (scalar Constant name) at the cell boundary evals.** Exercises
+    /// `eval_at_cell_boundary`'s scalar path with the `ScalarNameRef` wrapper (vs the
+    /// `*`-binary path of the other scalar tests).
+    #[test]
+    fn fe10_bare_scalar_name_at_cell_boundary() {
+        use ql_storage::NamedTarget;
+        use ql_types::Value;
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.with_runtime(|rt| rt.set_name("K", NamedTarget::Constant(Value::Number(42.0))))
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 0), "K").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 42.0 }),
+            "FE-10: a bare `=K` (Constant name) must eval to the constant (42)"
+        );
+    }
+
+    /// **FE-10 — `ISREF(<name>)` re-dirties when the name is retargeted (lazy-shape dep).**
+    /// `ISREF` is a LazyShape ref-aware fn: it inspects the arg's resolved SHAPE. A name's
+    /// shape flips when retargeted (Constant=literal → `ISREF`=FALSE; Cell=reference →
+    /// `ISREF`=TRUE), so `ISREF(K)` must re-dirty on a name mutation. Pre-fix the
+    /// LazyShape dep policy skipped ALL arg deps → `ISREF(K)` stayed stale (Codex round-4
+    /// finding; pre-existing for range names too, e.g. `ISREF(SALES)`).
+    #[test]
+    fn fe10_isref_over_name_redirties_on_retarget() {
+        use ql_storage::NamedTarget;
+        use ql_types::Value;
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.with_runtime(|rt| rt.set_name("K", NamedTarget::Constant(Value::Number(42.0))))
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 0), "ISREF(K)").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Boolean { boolean: false }),
+            "precondition: ISREF(K) where K is a Constant = FALSE"
+        );
+        // Retarget K from Constant → Cell: its resolved shape becomes a reference.
+        s.with_runtime(|rt| rt.set_name("K", NamedTarget::Cell(ql_types::Address::new(sheet, 4, 2))))
+            .unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Boolean { boolean: true }),
+            "FE-10: retargeting K to a Cell must re-dirty ISREF(K) → TRUE (not stale FALSE)"
+        );
+    }
+
     /// `list_names` walks BOTH workbook-scoped AND sheet-scoped tables, and all
     /// four `NamedTarget` variants round-trip faithfully (no coercion). We use
     /// the runtime directly to register Constant/Formula/Cell names (the

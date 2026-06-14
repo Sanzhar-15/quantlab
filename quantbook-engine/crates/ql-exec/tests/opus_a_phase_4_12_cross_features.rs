@@ -1001,48 +1001,54 @@ fn i24_blank_vs_zero_aggregate_skipping() {
     assert_eq!(ca_v, Value::Number(2.0), "COUNTA should count non-blanks");
 }
 
-/// I22: Single-letter / column-letter-shaped name shadowed by Excel
-/// column-letter lex. e.g. `set_name("K", Constant(...))` then
-/// `=K*A1` — does K resolve as the constant or get lexed as a bare
-/// column?
+/// I22: a single-letter / column-letter-shaped name (`K`, `XFC`) used to be
+/// shadowed by the bare-column-letter lex — `=K*A1` summed the empty column `K`
+/// instead of resolving the named constant. **FE-10 (2026-06-14)** fixed this: a
+/// standalone bare token resolves as a NAME (Excel/Sheets parity). This probe was
+/// `#[ignore]`d while the bug was open; it is now a HARD-ASSERTING regression test
+/// (exercises the `NamedTarget::Constant` resolution path — a runtime-API-only kind;
+/// the product/session creates Range names only).
+///
+/// This asserts INITIAL binding. The retarget/delete dirty-path for scalar names is
+/// covered by `fe10_scalar_constant_name_redirties_on_{delete,retarget}` (session.rs):
+/// a scalar (`Constant`/`Cell`) name now binds to `ExprPlan::ScalarNameRef`, which
+/// PRESERVES the name so the dep graph records it and `delete_name`/retarget re-dirty
+/// dependents (→ `#NAME?` / the new value), instead of leaving a stale value. (This
+/// closes a pre-existing dep gap that affected scalar names of all lengths and was
+/// reachable via loaded `.qbook` / imported `.xlsx` documents — Codex FE-10 audit HIGH.)
 #[test]
-#[ignore]
 fn i22_single_letter_named_constant_vs_column_letter() {
-    let mut wb = Workbook::new();
-    wb.add_sheet("S1");
     let reg = default_registry();
-    let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-    rt.set_value(0, 0, 0, Value::Number(100.0)).unwrap();
-    let single_letter = "K"; // valid column letter, valid Excel name
-    rt.set_name(single_letter, NamedTarget::Constant(Value::Number(2.0)))
-        .unwrap();
-    let v = rt.set_formula(0, 1, 0, "K*A1");
-    println!("[I22] K*A1 after registering K as Constant(2): {v:?}");
-    match v {
-        Ok(Value::Number(n)) if (n - 200.0).abs() < 1e-9 => {
-            println!("[I22 OK] K resolved as Constant");
-        }
-        _ => {
-            println!(
-                "[I22 FINDING] Named constant 'K' shadowed by bare-column-letter \
-                lex. Excel allows naming a constant 'K' and using it in formulas; \
-                our lexer treats 'K' as a column ref. set_name() returned Ok but \
-                set_formula refused to evaluate: {v:?}"
-            );
-        }
-    }
 
-    // Try also XFC (column close to max).
+    // `K` (a valid column letter AND a legal Excel name) registered as a constant.
+    let mut wb = Workbook::new();
+    wb.add_sheet("S1");
+    let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+    rt.set_value(0, 0, 0, Value::Number(100.0)).unwrap(); // A1 = 100
+    rt.set_name("K", NamedTarget::Constant(Value::Number(2.0)))
+        .unwrap();
+    let v = rt.set_formula(0, 1, 0, "K*A1").unwrap();
+    assert_eq!(
+        v,
+        Value::Number(200.0),
+        "FE-10: `K` must resolve as the named Constant(2), so K*A1 = 2*100 = 200 \
+         (pre-FE-10 `K` was shadowed by the bare-column lex)"
+    );
+
+    // `XFC` (3 letters, a valid column ≤ XFD) registered as a constant.
     let mut wb = Workbook::new();
     wb.add_sheet("S1");
     let mut rt = WorkbookRuntime::new(&mut wb, &reg);
     rt.set_value(0, 0, 0, Value::Number(100.0)).unwrap();
-    let res = rt.set_name("XFC", NamedTarget::Constant(Value::Number(7.0)));
-    println!("[I22] set_name(\"XFC\"): {res:?}");
-    if res.is_ok() {
-        let v = rt.set_formula(0, 1, 0, "XFC*A1");
-        println!("[I22] XFC*A1: {v:?}");
-    }
+    rt.set_name("XFC", NamedTarget::Constant(Value::Number(7.0)))
+        .unwrap();
+    let v = rt.set_formula(0, 1, 0, "XFC*A1").unwrap();
+    assert_eq!(
+        v,
+        Value::Number(700.0),
+        "FE-10: `XFC` (a valid column ≤ XFD) must resolve as the named Constant(7), \
+         so XFC*A1 = 7*100 = 700"
+    );
 }
 
 /// I16: read_display cache + locale switch — does a per-cell format

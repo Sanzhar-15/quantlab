@@ -463,8 +463,8 @@ pub(crate) fn walk_plan_for_deps(
             // which produced wrong behavior under LazyShape (Step 3
             // audit caught this).
             if is_lazy_shape_reference_fn(registry, name) {
-                // **6.4-1 (2026-05-28; I1):** LazyShape contract — NO arg
-                // walking. Pre-6.4-1 this was a hardcoded
+                // **6.4-1 (2026-05-28; I1):** LazyShape contract — NO value-dep
+                // or volatility walking. Pre-6.4-1 this was a hardcoded
                 // `name.as_ref() == "ISREF"` check; the I1 closure routes
                 // through metadata so any UDF declaring
                 // `dep_shape: LazyShape` participates uniformly. ISREF
@@ -472,8 +472,27 @@ pub(crate) fn walk_plan_for_deps(
                 // Phase-1 override in `register_builtin_metadata` sets
                 // `DepShape::LazyShape`).
                 //
-                // The args' inner value-deps / volatility / structural
-                // deps don't affect a LazyShape function's result.
+                // The args' inner VALUE-deps and volatility don't affect a
+                // LazyShape function's result (ISREF(NOW()) must NOT be volatile;
+                // ISREF(A1+1) must NOT register A1). **FE-10 (2026-06-14):** but a
+                // top-level NAME/TABLE arg DOES matter — ISREF inspects the arg's
+                // resolved SHAPE, and retargeting a name (Cell=reference vs
+                // Constant=literal) or a table flips that shape. Record ONLY the
+                // top-level name/table structural dep (so `set_name`/`delete_name`
+                // / table rename re-dirty `ISREF(<name>)`), nothing deeper. This
+                // also closes the pre-existing case for range names (`ISREF(SALES)`).
+                for arg in args {
+                    match arg {
+                        ExprPlan::ScalarNameRef { name: n, .. }
+                        | ExprPlan::AggregateNameRef { name: n, .. } => {
+                            deps.names.push(Arc::clone(n));
+                        }
+                        ExprPlan::StructuredRef { table_name, .. } => {
+                            deps.tables.push(Arc::clone(table_name));
+                        }
+                        _ => {}
+                    }
+                }
             } else if is_address_only_reference_fn(registry, name) {
                 for arg in args {
                     walk_plan_for_address_only_deps(arg, deps, registry);
@@ -487,6 +506,13 @@ pub(crate) fn walk_plan_for_deps(
         ExprPlan::AggregateNameRef { name, range } => {
             deps.named_ranges.push((Arc::clone(name), *range));
             deps.names.push(Arc::clone(name));
+        }
+        // **FE-10 (2026-06-14):** a scalar-target name. Record the name-dep (so
+        // delete/retarget of the name re-dirties this formula) AND walk the inner
+        // resolved plan (a `Cell` target carries a CellRef cell-dep too).
+        ExprPlan::ScalarNameRef { name, inner } => {
+            deps.names.push(Arc::clone(name));
+            walk_plan_for_deps(inner, deps, registry);
         }
         // **W5-RT-3.1 (S3-HIGH-3 / Codex Step 3 HIGH-2 closure):**
         // literal range refs bind to `ExprPlan::RangeRef { range }`

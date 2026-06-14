@@ -89,6 +89,24 @@ pub enum ExprPlan {
         range: Range,
     },
 
+    /// **FE-10 (2026-06-14):** a `NameRef` that resolves to a SCALAR target
+    /// (`NamedTarget::Cell` / `Constant` / `Bool` / `Text`). Wraps the resolved
+    /// scalar plan (`CellRef` / `Number` / `Bool` / `String`) and PRESERVES the
+    /// canonical name so the dependency graph records a name-dep (via
+    /// `walk_plan_for_deps`). Without this, deleting/retargeting such a name —
+    /// reachable for scalar names loaded from a `.qbook` or imported `.xlsx`
+    /// (the live session `set_name` only creates Range names) — would NOT
+    /// re-dirty dependents, leaving a STALE value instead of `#NAME?` / the new
+    /// value. Semantically TRANSPARENT: every value / eval / classification site
+    /// treats it exactly as its `inner`; ONLY dependency extraction adds the
+    /// name. (Range-target names use the separate `AggregateNameRef`.)
+    ScalarNameRef {
+        /// Canonical (uppercase) name as it appears in the NameTable.
+        name: Arc<str>,
+        /// The resolved scalar plan — `CellRef` / `Number` / `Bool` / `String`.
+        inner: Box<ExprPlan>,
+    },
+
     /// **W5-99 (Phase 4.7.F):** array literal lowered from `Expr::Array`.
     /// Row-major; outer `Vec` is rows, inner `Vec` is cells. Element-arity
     /// is invariant — every row has the same length. The binder enforces
@@ -834,18 +852,33 @@ fn bind_with_context_v2<L: NameLookup>(
             // audit H2 uses case-insensitive lookup in the `NameTable` impl so
             // every entry point canonicalizes uniformly.
             match names.lookup_named_target(name, owning_sheet) {
+                // **FE-10:** scalar-target names are wrapped in `ScalarNameRef` so the
+                // dep graph records the name (→ delete/retarget re-dirties dependents).
+                // The wrapper is transparent at eval; the inner is the resolved scalar.
                 Some(ResolvedName::Cell(sheet, row, col, abs_col, abs_row)) => {
-                    Ok(ExprPlan::CellRef {
-                        sheet,
-                        row,
-                        col,
-                        abs_col,
-                        abs_row,
+                    Ok(ExprPlan::ScalarNameRef {
+                        name: name.clone(),
+                        inner: Box::new(ExprPlan::CellRef {
+                            sheet,
+                            row,
+                            col,
+                            abs_col,
+                            abs_row,
+                        }),
                     })
                 }
-                Some(ResolvedName::Number(n)) => Ok(ExprPlan::Number(n)),
-                Some(ResolvedName::Bool(b)) => Ok(ExprPlan::Bool(b)),
-                Some(ResolvedName::Text(s)) => Ok(ExprPlan::String(s)),
+                Some(ResolvedName::Number(n)) => Ok(ExprPlan::ScalarNameRef {
+                    name: name.clone(),
+                    inner: Box::new(ExprPlan::Number(n)),
+                }),
+                Some(ResolvedName::Bool(b)) => Ok(ExprPlan::ScalarNameRef {
+                    name: name.clone(),
+                    inner: Box::new(ExprPlan::Bool(b)),
+                }),
+                Some(ResolvedName::Text(s)) => Ok(ExprPlan::ScalarNameRef {
+                    name: name.clone(),
+                    inner: Box::new(ExprPlan::String(s)),
+                }),
                 // Phase 2B.4: context-aware Range handling.
                 // W5-RT-1 (RT-V1-01): reference-aware fn arg context
                 // accepts named ranges with the same shape as aggregate
@@ -938,6 +971,11 @@ fn bind_with_context_v2<L: NameLookup>(
         //      (matches `=Sales[@Qty]` semantics).
         //  10. NameRef resolving to Range → resolve, narrow if
         //      possible, error if 2-D.
+        //      **NOT YET IMPLEMENTED (deferred FE-10.x):** `NameRef` currently
+        //      falls through to the scalar pass-through arm below (no narrowing),
+        //      so `@<name→multi-cell-range>` yields the full range. Pre-existing
+        //      (affects every named range under `@`, e.g. `@SALES`); FE-10 only
+        //      made `@OLD`-style 3-letter names CONSISTENT with that path.
         //
         // Out-of-range narrow → `BindError::UnsupportedVariant` to
         // become #VALUE! at eval time (we surface as ExprPlan::Error

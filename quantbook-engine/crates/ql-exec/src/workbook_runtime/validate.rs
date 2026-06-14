@@ -458,9 +458,11 @@ mod tests {
             wb.put_at(0, i as u32, 0, Value::Number((i + 1) as f64));
             wb.put_at(0, i as u32, 1, Value::Number(((i + 1) * 2) as f64));
         }
-        // **Note**: name must NOT collide with valid Excel column-letter
-        // patterns (e.g. `Ys` lexes as BareColumn col=668). Use names
-        // with >3 letters or underscores. `XValues`/`YValues` are safe.
+        // **Historical note (pre-FE-10):** a ≤3-letter name used to collide with
+        // a column-letter pattern (`Ys` lexed as BareColumn col=668) and got
+        // shadowed. **FE-10 (2026-06-14)** fixed this — a standalone bare token now
+        // resolves as a NAME — so short names work. `XValues`/`YValues` retained
+        // here for stability (no need to change a passing test).
         wb.set_name("XValues", NamedTarget::Range(Range::new(0, 0, 0, 3, 0)))
             .unwrap();
         wb.set_name("YValues", NamedTarget::Range(Range::new(0, 0, 1, 3, 1)))
@@ -633,10 +635,11 @@ mod tests {
         let mut wb = make_runtime_workbook();
         // A1 holds the only value; A10:A12 are left blank → empty range.
         wb.put_at(0, 0, 0, Value::Number(0.05));
-        // **Note (W5-D-13.1 gotcha):** named ranges must use >3-letter names
-        // or they lex as a BareColumn (a whole-column literal range) instead
-        // of a NameRef. `Single` / `EmptyRng` are safe; a 3-letter name like
-        // `One` would lex as column `ONE` → literal RangeRef → unsupported.
+        // **Historical note (W5-D-13.1 gotcha, fixed by FE-10 2026-06-14):** a
+        // ≤3-letter name like `One` used to lex as a BareColumn (column `ONE`) and
+        // be shadowed by a whole-column literal instead of resolving as a NameRef.
+        // FE-10 made a standalone bare token resolve as a NAME, so short names work
+        // now. `Single` / `EmptyRng` retained here for stability.
         wb.set_name("Single", NamedTarget::Range(Range::new(0, 0, 0, 0, 0)))
             .unwrap();
         wb.set_name("EmptyRng", NamedTarget::Range(Range::new(0, 9, 0, 11, 0)))

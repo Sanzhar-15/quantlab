@@ -174,7 +174,7 @@ impl Parser {
     #[allow(clippy::while_let_loop)] // Loop body has multi-branch control flow
                                      // (postfix/range/binary/terminator); clearer as `loop`.
     fn parse_expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_prefix()?;
+        let mut lhs = self.parse_prefix(false)?;
         // Audit H3 fix (2026-05-12): track whether we already consumed a `:` so
         // `A:B:C` produces a parse error rather than silently merging spans via
         // build_range's WholeColumn:WholeColumn arm. Excel rejects nested ranges
@@ -215,7 +215,9 @@ impl Parser {
                     });
                 }
                 self.advance();
-                let rhs = self.parse_prefix()?;
+                // FE-10: the `:` RHS is a reference endpoint — a bare column
+                // here is ALWAYS a column (`A:A`), never a name. Pass `ref_ctx`.
+                let rhs = self.parse_prefix(true)?;
                 lhs = self.build_range(lhs, rhs)?;
                 already_consumed_colon = true;
                 continue;
@@ -247,7 +249,18 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
+    /// Parse a primary (prefix) expression.
+    ///
+    /// `ref_ctx` is a NON-LEAKING, immediate signal that this prefix is being
+    /// parsed in a pure *reference* position — specifically a range `:` endpoint
+    /// (the RHS of the `:` infix) or the inner term of a sheet qualifier
+    /// (`Sheet1!<term>`). In a reference position a 1–3 letter `BareColumn`
+    /// token is ALWAYS a column (so `A:A`, `Sheet1!A`, `Sheet1!A:B` stay
+    /// `WholeColumn`); in value position a STANDALONE bare token resolves as a
+    /// defined NAME (FE-10). `ref_ctx` is read ONLY by the `BareColumn` arm and
+    /// is deliberately NOT forwarded into nested `parse_expr` / `parse_call_args`
+    /// / parenthesized sub-parses — those re-enter at value context (`false`).
+    fn parse_prefix(&mut self, ref_ctx: bool) -> Result<Expr, ParseError> {
         let token = self
             .advance()
             .ok_or(ParseError::UnexpectedEnd { context: "prefix" })?;
@@ -342,14 +355,30 @@ impl Parser {
                 }
             }
 
-            // BareColumn — `A`, `$AI` etc. Function call if followed by `(`; range
-            // anchor if followed by `:` (handled by the infix loop). Otherwise it's a
-            // standalone bare-column reference (e.g. inside `=A` — Excel parses this
-            // as a 1×N range). Audit L2 fix (2026-05-12): the ql-exec binder REJECTS
-            // standalone RangeRef::WholeColumn outside a Function context with
-            // BindError::UnsupportedVariant; previous doc claimed scalar evaluator
-            // fallback, which is wrong. Phase 4+ FormulaRegion binder handles this
-            // by lowering to row-aligned CellRefs.
+            // BareColumn — `A`, `$AI`, `OLD`, etc. (a 1–3 letter run the lexer
+            // classified as a valid column ≤ XFD). Disambiguation:
+            //   - followed by `(`  → function call (`SUM(...)`, `OLD(...)`).
+            //   - `ref_ctx` (a range `:` endpoint or a sheet-qualified inner term)
+            //     OR followed by `:` (the LHS of a range) → a `WholeColumn`
+            //     reference (`A:A`, `A:C`, `$A:$A`, `Sheet1!A`, `Sheet1!A:B`).
+            //   - absolute `$A` standalone → `WholeColumn` (LEGACY: `$A` can never
+            //     be a defined name, so it is NOT a name-shadow case; this is a
+            //     documented non-Excel silent acceptance, deferred to FE-10.x).
+            //   - otherwise (a STANDALONE bare token like `OLD`/`A`/`PV` in value
+            //     position) → `Expr::NameRef`.
+            //
+            // **FE-10 (2026-06-14):** Excel & Google Sheets resolve a bare token as
+            // a defined NAME (or `#NAME?` if missing), NEVER as a whole column — a
+            // whole column is ALWAYS the colon form `A:A`. Pre-FE-10 the parser
+            // lowered a standalone bare token to `WholeColumn`, so a defined name
+            // spelled like a column (`OLD`/`TAX`/`PV`) was SHADOWED: `=SUM(OLD)`
+            // summed the empty column `OLD` (= 0) instead of the named range, and
+            // the FE-9 `#NAME?` net was unreachable (it never bound as a name).
+            // Routing it through `NameRef` (built identically to the `Ident` arm
+            // above) resolves the named range, and a missing/deleted name now
+            // surfaces `#NAME?` via the FE-9 recompute mapping. `A:A` and
+            // sheet-qualified forms are unaffected (handled by the `ref_ctx` /
+            // peek-`:` branch and the value-context LHS peek).
             Token::BareColumn { col, abs, text } => {
                 if matches!(self.peek(), Some(Token::LParen)) {
                     self.advance();
@@ -358,10 +387,11 @@ impl Parser {
                         name: canonicalize_function_name(&text),
                         args,
                     })
-                } else {
-                    // A bare column standing alone isn't a useful Phase 0 construct
-                    // (it'd evaluate over the entire column as a vector). Keep it as a
-                    // RangeRef::WholeColumn for the binder to handle / reject.
+                } else if ref_ctx || abs || matches!(self.peek(), Some(Token::Colon)) {
+                    // Reference position: keep the column. (`ref_ctx` = range
+                    // endpoint / sheet-qualified; `abs` = legacy `$A`; peek-`:` =
+                    // the LHS of a range in value context, e.g. the first `A` of
+                    // `A:A`.)
                     Ok(Expr::RangeRef(RangeRef::WholeColumn {
                         sheet: SheetRef::Current,
                         start_col: col,
@@ -369,6 +399,13 @@ impl Parser {
                         abs_start: abs,
                         abs_end: abs,
                     }))
+                } else {
+                    // Standalone bare token in value context → a defined NAME,
+                    // resolved at bind time against the NameTable (case-insensitive
+                    // lookup; `UnresolvedName` → `#NAME?` via FE-9). Built the same
+                    // way as the `Ident` arm so `OLD` behaves exactly like a 4+
+                    // letter name (`SALES`).
+                    Ok(Expr::NameRef(canonicalize_function_name(&text)))
                 }
             }
 
@@ -483,7 +520,10 @@ impl Parser {
                         name: name.as_ref().to_owned(),
                     });
                 }
-                let inner = self.parse_prefix()?;
+                // FE-10: the inner term of `Sheet1!…` is a reference position —
+                // a bare column stays a column (`Sheet1!A`, `Sheet1!A:B`), never
+                // a name (you can't sheet-qualify a defined name in a formula).
+                let inner = self.parse_prefix(true)?;
                 Ok(apply_sheet_to_term(inner, name)?)
             }
 
@@ -1505,7 +1545,11 @@ mod tests {
     #[test]
     fn parse_og02_pattern() {
         // =A * 2 — THE OG-02 baseline. Lexer emits BareColumn{col=0, text="A"} + Op(Mul) +
-        // Number(2.0). Parser builds Binary { Mul, BareColumn→WholeColumn(A), Number(2) }.
+        // Number(2.0). **FE-10 (2026-06-14):** a STANDALONE bare token is now a defined-NAME
+        // reference (Excel/Sheets parity — a bare `A` is a name, NEVER a whole column; whole
+        // columns are always the colon form `A:A`). So the LHS is `NameRef("A")`, not
+        // `WholeColumn(A)`. (Pre-FE-10 this asserted WholeColumn — the non-Excel quirk that
+        // shadowed defined names like `OLD`/`TAX`/`PV`.)
         let e = p("A * 2");
         match e {
             Expr::Binary {
@@ -1513,10 +1557,10 @@ mod tests {
                 lhs,
                 rhs,
             } => {
-                assert!(matches!(
-                    *lhs,
-                    Expr::RangeRef(RangeRef::WholeColumn { start_col: 0, .. })
-                ));
+                assert!(
+                    matches!(&*lhs, Expr::NameRef(n) if n.as_ref() == "A"),
+                    "FE-10: standalone bare `A` must parse as NameRef(\"A\"), got {lhs:?}"
+                );
                 assert_eq!(*rhs, Expr::Number(2.0));
             }
             _ => panic!("expected Binary Mul"),
@@ -2024,8 +2068,9 @@ mod tests {
     ///
     /// TRUE / FALSE remain explicit exceptions (boolean literals).
     ///
-    /// Only tested on 4+ letter names — 1-3 letter names lex as `BareColumn` (since
-    /// they're valid Excel column references) and follow a different parser path.
+    /// This test uses 4+ letter names (lexed as `Token::Ident`). **FE-10 (2026-06-14):**
+    /// a STANDALONE 1-3 letter token (lexed as `Token::BareColumn`) now ALSO parses as a
+    /// `NameRef` in value position — see the `fe10_*` tests above for that path.
     #[test]
     fn parse_bare_identifier_function_name_to_name_ref() {
         // 4+ letter built-in function names without parens parse as NameRef. The
@@ -2094,8 +2139,8 @@ mod tests {
 
     #[test]
     fn parse_og02_full_pipeline() {
-        // =A * 2 — verify the AST is the exact shape ql-exec::lower::classify expects
-        // for MulScalar dispatch.
+        // =A * 2 — **FE-10:** a standalone bare token parses as a defined-NAME ref, not a
+        // whole column (Excel/Sheets parity). LHS is `NameRef("A")`. (Pre-FE-10: WholeColumn.)
         let e = p("A * 2");
         match e {
             Expr::Binary {
@@ -2103,10 +2148,125 @@ mod tests {
                 lhs,
                 rhs,
             } => {
-                assert!(matches!(*lhs, Expr::RangeRef(RangeRef::WholeColumn { .. })));
+                assert!(
+                    matches!(&*lhs, Expr::NameRef(n) if n.as_ref() == "A"),
+                    "FE-10: standalone bare `A` must parse as NameRef(\"A\"), got {lhs:?}"
+                );
                 assert_eq!(*rhs, Expr::Number(2.0));
             }
             _ => panic!(),
+        }
+    }
+
+    // ===== FE-10 (2026-06-14): standalone bare token = defined NAME, not whole column =====
+
+    #[test]
+    fn fe10_standalone_bare_token_is_nameref() {
+        // A bare 1-3 letter token (a valid column <= XFD) in VALUE position is a
+        // defined-NAME reference, NOT a whole column. Covers the names that used to
+        // be silently shadowed (OLD/NEW/TAX/PV) plus the single letter `A`.
+        for name in ["OLD", "NEW", "TAX", "PV", "A", "AB"] {
+            let e = p(name);
+            assert!(
+                matches!(&e, Expr::NameRef(n) if n.as_ref() == name),
+                "FE-10: bare `{name}` must parse as NameRef(\"{name}\"), got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fe10_bare_column_in_aggregate_is_nameref() {
+        // =SUM(OLD) — the bug repro. OLD must be a NameRef arg, NOT a WholeColumn.
+        let e = p("SUM(OLD)");
+        match e {
+            Expr::Function { name, args } => {
+                assert_eq!(name.as_ref(), "SUM");
+                assert_eq!(args.len(), 1);
+                assert!(
+                    matches!(&args[0], Expr::NameRef(n) if n.as_ref() == "OLD"),
+                    "FE-10: SUM(OLD) arg must be NameRef(\"OLD\"), got {:?}",
+                    args[0]
+                );
+            }
+            _ => panic!("expected Function SUM, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn fe10_colon_range_stays_wholecolumn() {
+        // The colon form is ALWAYS a whole-column range (both endpoints), regardless
+        // of whether the letters also name a range. This must NOT regress.
+        for (src, lo, hi) in [("A:A", 0u32, 0u32), ("A:C", 0, 2), ("OLD:OLD", 10455, 10455)] {
+            let e = p(src);
+            assert!(
+                matches!(
+                    &e,
+                    Expr::RangeRef(RangeRef::WholeColumn { start_col, end_col, .. })
+                        if *start_col == lo && *end_col == hi
+                ),
+                "FE-10: `{src}` must stay WholeColumn({lo}..={hi}), got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fe10_abs_bare_column_standalone_is_wholecolumn() {
+        // Legacy carveout: `$A` standalone stays a WholeColumn — `$A` can never be a
+        // defined name (names carry no `$`), so it is NOT a name-shadow case.
+        let e = p("$A");
+        assert!(
+            matches!(
+                &e,
+                Expr::RangeRef(RangeRef::WholeColumn { start_col: 0, abs_start: true, .. })
+            ),
+            "FE-10: `$A` standalone stays WholeColumn (legacy), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn fe10_sheet_qualified_bare_column_stays_column() {
+        // A sheet-qualified bare token is a reference (ref_ctx), never a name:
+        // `Sheet1!A:A` and standalone `Sheet1!A` both stay WholeColumn on Sheet1.
+        for src in ["Sheet1!A:A", "Sheet1!A"] {
+            let e = p(src);
+            assert!(
+                matches!(
+                    &e,
+                    Expr::RangeRef(RangeRef::WholeColumn { sheet: SheetRef::Name(s), start_col: 0, .. })
+                        if s.as_ref() == "Sheet1"
+                ),
+                "FE-10: `{src}` must stay a Sheet1 WholeColumn, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fe10_bare_token_function_override_unchanged() {
+        // `OLD(...)` is still a function call (peek == LParen wins), like any 4+ letter name.
+        let e = p("OLD(1)");
+        assert!(
+            matches!(&e, Expr::Function { name, .. } if name.as_ref() == "OLD"),
+            "FE-10: `OLD(1)` must be a Function call, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn fe10_at_bare_token_is_implicit_intersection_of_name() {
+        // `@OLD` narrows a defined name (routes through NameRef, consistent with `@SALES`);
+        // `@A:A` still narrows a whole column (the `:` binds tighter than `@`).
+        match p("@OLD") {
+            Expr::ImplicitIntersection(inner) => assert!(
+                matches!(&*inner, Expr::NameRef(n) if n.as_ref() == "OLD"),
+                "FE-10: `@OLD` inner must be NameRef(\"OLD\"), got {inner:?}"
+            ),
+            other => panic!("expected ImplicitIntersection, got {other:?}"),
+        }
+        match p("@A:A") {
+            Expr::ImplicitIntersection(inner) => assert!(
+                matches!(&*inner, Expr::RangeRef(RangeRef::WholeColumn { .. })),
+                "FE-10: `@A:A` inner must stay WholeColumn, got {inner:?}"
+            ),
+            other => panic!("expected ImplicitIntersection, got {other:?}"),
         }
     }
 

@@ -970,20 +970,24 @@ fn e2e_og02_source_to_simd_dispatch() {
 }
 
 #[test]
-fn e2e_og02_bare_column_bind_unsupported_in_phase_0() {
-    // =A * 2 — bare column lexes to BareColumn → parser produces RangeRef::WholeColumn,
-    // NOT a CellRef. The Phase 0 W4-1 binder rejects standalone RangeRef
-    // outside a Function context (it needs the FormulaRegion binder, Phase 4+).
-    //
-    // Phase 0 W5-3 documents this gap: =A1 * 2 works (CellRef); =A * 2 is binder-
-    // rejected until the FormulaRegion binder lands. Source authors today should
-    // use SUM(A:A) / etc. for whole-column references.
+fn e2e_og02_bare_token_binds_as_unresolved_name() {
+    // =A * 2 — **FE-10 (2026-06-14):** a STANDALONE bare token is now a defined-NAME
+    // reference (Excel/Sheets parity — a bare `A` is a name, never a whole column;
+    // whole columns are always the colon form `A:A`). With no name `A` defined, the
+    // binder returns `UnresolvedName` (which the recompute path maps to `#NAME?` via
+    // FE-9), NOT `UnsupportedVariant`. (Pre-FE-10: `A` lowered to a standalone
+    // WholeColumn the Phase-0 binder rejected as UnsupportedVariant — the non-Excel
+    // quirk that also silently shadowed defined names like `OLD`/`TAX`/`PV`.)
+    // Whole-column references use the explicit colon form `SUM(A:A)`.
     use ql_exec::BindError;
     let src = "A * 2";
     let ast = parse(lex(src).unwrap()).unwrap();
     let reg = default_registry();
     let result = bind(&ast, 0, &reg);
-    assert!(matches!(result, Err(BindError::UnsupportedVariant(_))));
+    assert!(
+        matches!(result, Err(BindError::UnresolvedName(_))),
+        "FE-10: bare `A` (undefined) must bind as UnresolvedName, got {result:?}"
+    );
 }
 
 // ===== error paths =====
