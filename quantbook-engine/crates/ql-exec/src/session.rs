@@ -10464,6 +10464,75 @@ mod tests {
         );
     }
 
+    // ===== FE-9.y (2026-06-14): Ok-path spill→scalar dissolution =====
+    //
+    // NOTE on coverage: the EQUAL-VALUE VEQ-strand (a spill dissolving to a NUMBER
+    // scalar that VEQ-equals its prior top-left) is the actual FE-9.y bug, but it is
+    // NOT reachable through any production formula. Spilling comes only from the
+    // Unified-tier fns SEQUENCE / TRANSPOSE / FILTER; none returns a number-scalar —
+    // the only Ok-path dissolution-to-scalar is FILTER→no-match → `#CALC!` (a
+    // degenerate array), and `#CALC!` never equals a numeric top-left, so VEQ never
+    // fires there. The equal-value strand therefore only arises from a residual
+    // inconsistent state (an older buggy build / a file it saved) or a scalar-returning
+    // UDF. That residual state is exercised directly by the runtime-level white-box
+    // test `recompute_dirty_spill_dissolved_to_scalar_forces_anchor_write_past_veq`
+    // (recompute.rs), which is the real FE-9.y regression guard. The session test
+    // below covers the realistic Ok-path dissolution (FILTER → `#CALC!`) end-to-end.
+
+    /// **FE-9.y — a FILTER spill that dissolves to `#CALC!` (no match) clears its
+    /// body on the Ok path.** `FILTER(Data, Mask)` spills the kept rows; flipping the
+    /// mask all-false makes FILTER return a degenerate array → `#CALC!` at the anchor
+    /// with `new_spill_shape = None`. This is the realistic Ok-path spill→scalar
+    /// dissolution; the anchor must show `#CALC!` and the old body must clear. (Here
+    /// the dissolved value `#CALC!` ≠ the prior top-left, so VEQ never fires — the
+    /// equal-value strand is covered by the recompute.rs white-box test.)
+    #[test]
+    fn fe9y_dirty_filter_dissolved_to_calc_clears_body() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (rr, v) in [(0u32, 5.0), (1, 6.0), (2, 7.0)] {
+            s.set_value(addr(sheet, rr, 0), CellValue::Number { number: v })
+                .unwrap(); // A1:A3 = Data
+        }
+        for (rr, v) in [(0u32, 1.0), (1, 1.0), (2, 0.0)] {
+            s.set_value(addr(sheet, rr, 1), CellValue::Number { number: v })
+                .unwrap(); // B1:B3 = Mask (keep rows 1,2)
+        }
+        s.set_name("Data", range(sheet, 0, 0, 2, 0)).unwrap();
+        s.set_name("Mask", range(sheet, 0, 1, 2, 1)).unwrap();
+        s.set_formula(addr(sheet, 0, 4), "FILTER(Data, Mask)")
+            .unwrap(); // E1 → spills E1:E2
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 4)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 5.0 }),
+            "precondition: E1 FILTER spill anchor = 5"
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 1, 4)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 6.0 }),
+            "precondition: E2 FILTER spill body = 6"
+        );
+        // Flip the mask all-false → FILTER no-match → degenerate → #CALC! (dissolution).
+        for rr in 0..3u32 {
+            s.set_value(addr(sheet, rr, 1), CellValue::Number { number: 0.0 })
+                .unwrap();
+        }
+        s.recalc_dirty().unwrap();
+        let e1 = s.cell(addr(sheet, 0, 4)).unwrap().unwrap().value;
+        assert!(
+            matches!(&e1, Some(CellValue::Error { error }) if error == "#CALC!"),
+            "FE-9.y: FILTER no-match must dissolve the spill to #CALC! at the anchor, got {e1:?}"
+        );
+        let e2 = s.cell(addr(sheet, 1, 4)).unwrap();
+        assert!(
+            e2.as_ref()
+                .and_then(|c| c.value.clone())
+                .map_or(true, |v| v == CellValue::Blank),
+            "FE-9.y: dissolved FILTER body E2 must be cleared, got {e2:?}"
+        );
+    }
+
     /// A token equal to the current version yields an empty (no-change) delta.
     #[test]
     fn snapshot_delta_no_changes_is_empty() {

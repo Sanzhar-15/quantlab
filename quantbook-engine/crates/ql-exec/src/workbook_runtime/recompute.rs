@@ -770,8 +770,42 @@ impl<'a> WorkbookRuntime<'a> {
                         // the write entirely and don't record this cell
                         // as `changed` — downstream formulas that depend
                         // only on this one will skip too.
+                        //
+                        // **FE-9.y (2026-06-14):** EXCEPT when a spill just
+                        // DISSOLVED to a scalar. `try_recompute_with_simd_profile`
+                        // ran `clear_spill_if_present` (pre-eval) which blanks the
+                        // anchor overlay; for a genuine `EvalResult::Scalar(v)` it
+                        // returns `(v, None)` WITHOUT re-writing the anchor (only the
+                        // Array arm's `write_spill` re-writes it). So when that scalar
+                        // VEQ-equals the prior spill TOP-LEFT, a VEQ skip strands the
+                        // anchor Blank — the SAME failure class as FE-9.x gap-1, on
+                        // the eval Ok-path. Force the write, gated on `old.is_some()
+                        // && new.is_none()`.
+                        //
+                        // Boundary is exact + safe:
+                        //  - `new.is_some()` (re-spill / shrink, incl. a 1×1
+                        //    singleton): `write_spill` already rewrote the anchor →
+                        //    no strand; the footprint block below records its delta.
+                        //  - `old.is_none()` (plain scalar→scalar): nothing was
+                        //    blanked → VEQ is the correct optimization.
+                        //  - the degenerate-array→`#CALC!` dissolution (e.g. FILTER
+                        //    no-match) ALSO returns `new = None`, but `write_anchor_error`
+                        //    already wrote `#CALC!` to the anchor, so the forced write
+                        //    is an idempotent duplicate (harmless, and correct for the
+                        //    change-log).
+                        // So it never over-reports a surviving spill — it only
+                        // un-strands a genuine dissolution.
+                        //
+                        // Reachability: the equal-value strand needs the dissolved
+                        // scalar == the prior top-left. No built-in spilling fn
+                        // (SEQUENCE/TRANSPOSE/FILTER) returns a number-scalar, so it
+                        // surfaces via a UDF that returns an array then a 1×1 scalar
+                        // == the prior top-left, OR a residual inconsistent state —
+                        // both exercised by the recompute.rs white-box test.
                         let prior_val = prior.get(&(sheet, row, col));
-                        if prior_val == Some(&value) {
+                        let spill_dissolved_to_scalar =
+                            old_spill_shape.is_some() && new_spill_shape.is_none();
+                        if !spill_dissolved_to_scalar && prior_val == Some(&value) {
                             skipped_value_equality += 1;
                         } else {
                             self.workbook.put_computed_at(sheet, row, col, value);
@@ -1636,6 +1670,61 @@ mod tests {
         assert!(
             wb.spill_anchor_at(0, 0, 0).is_none(),
             "FE-9.x: the spill anchor must be unregistered after dissolution"
+        );
+    }
+
+    /// **FE-9.y (2026-06-14) — gap 1 sibling on the eval Ok-path: a spill that
+    /// dissolves to a SCALAR equal to its prior top-left must force the anchor
+    /// write past VEQ.** `try_recompute_with_simd_profile` runs
+    /// `clear_spill_if_present` (pre-eval) which blanks the anchor overlay, and
+    /// its Scalar arm does NOT re-write the anchor. So when the new scalar
+    /// VEQ-equals the prior spill top-left, a naive VEQ skip strands the anchor
+    /// Blank. Manufactures a registered 1×3 spill at A1 whose anchor overlay holds
+    /// `1`, with a formula (`1+0`) that re-evals to scalar `1` — the exact
+    /// dissolution-to-equal-scalar state — and proves the `spill_dissolved_to_scalar`
+    /// guard forces the write. Without the guard, A1 reads Blank.
+    #[test]
+    fn recompute_dirty_spill_dissolved_to_scalar_forces_anchor_write_past_veq() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // A formula that evals to the SCALAR 1 (new_spill_shape = None).
+        wb.put_formula(0, 0, 0, "1+0");
+        // Manufacture the registered spill state a prior pass would have left:
+        // a 1×3 spill at A1 whose anchor overlay == 1 (the would-be top-left) and
+        // whose body B1/C1 hold stale spilled values.
+        wb.register_spill((0, 0, 0), ql_storage::SpillShape { rows: 1, cols: 3 })
+            .unwrap();
+        wb.put_computed_at(0, 0, 0, Value::Number(1.0));
+        wb.put_computed_at(0, 0, 1, Value::Number(98.0));
+        wb.put_computed_at(0, 0, 2, Value::Number(97.0));
+        let mut graph = CalcgraphSession::rebuild_from_workbook(&wb).session;
+        let a1 = graph.cell_node_for(0, 0, 0).expect("A1 node");
+        graph.mark_dirty(a1);
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.is_complete(), "recompute failures: {result:?}");
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Number(1.0),
+            "FE-9.y: a spill dissolving to a scalar equal to its prior top-left must \
+             FORCE the anchor write — a VEQ skip would strand it Blank"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Blank,
+            "FE-9.y: dissolved body B1 must be cleared (not stale 98)"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 2)),
+            Value::Blank,
+            "FE-9.y: dissolved body C1 must be cleared (not stale 97)"
+        );
+        assert!(
+            wb.spill_anchor_at(0, 0, 0).is_none(),
+            "FE-9.y: the spill anchor must be unregistered after dissolution"
         );
     }
 
