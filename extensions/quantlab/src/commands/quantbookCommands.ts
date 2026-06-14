@@ -59,8 +59,8 @@ import { buildDefineNameToast, buildNameRange, definedNameRejectionReason, isVal
 // Go-To anchor) and the structured-table UI (identifier validation + selection -> TableSpecJson). The
 // commands below are thin vscode shells over these (the established cellGrid logic/command split).
 import { describeScope, describeTarget, goToAnchor, isGoToable } from '../quantbook/cellGrid/nameManagerLogic';
-import { buildTableSpec, isValidTableIdentifier, tableIdentifierRejectionReason } from '../quantbook/cellGrid/tableUiLogic';
-import type { CollabSessionInstance, NamedRangeJson, SessionInstance } from '../quantbook/types';
+import { buildTableSpec, isValidTableIdentifier, tableAtCell, tableIdentifierRejectionReason, tableQuickPickItems } from '../quantbook/cellGrid/tableUiLogic';
+import type { CollabSessionInstance, NamedRangeJson, SessionInstance, TableSnapshotJson } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
 
@@ -1831,26 +1831,98 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 		}),
 	);
 
-	// FE-5 W-T: drop a table. QuickPick over the workbook's TABLE-namespaced names is not directly listable
-	// (listNames returns defined names, not tables), so the operator types the table name; the engine raises
-	// `[table_not_found]` for an unknown one (surfaced loud).
+	// FE-8 (2026-06-14): Drop / Rename act on an EXISTING table. The operator reaches the target either by
+	// right-clicking inside its footprint (the `data-vscode-context` payload carries the panel + clicked cell,
+	// so we resolve the containing table via `tableAtCell` and pre-select it) or, from the palette, by picking
+	// from a QuickPick of every table in the workbook (read from `snapshot().tables` -- listNames returns
+	// DEFINED names, not tables, so the table set comes from the snapshot, not a name query).
+	type TableTarget =
+		| { kind: 'ok'; session: SessionInstance; preselect: TableSnapshotJson | undefined }
+		| { kind: 'invalid-arg' }
+		| { kind: 'panel-gone' }
+		| { kind: 'none' };
+	// Resolve which session a table command runs against + a pre-selected table when invoked from a
+	// right-click inside one. No-Fallbacks: a context arg that was supplied but fails to validate is a LOUD
+	// `invalid-arg` (never a silent fall-through to the focused grid, which could be a different panel); a
+	// valid arg pointing OUTSIDE any table yields `preselect: undefined` (legitimate -> the picker opens).
+	const resolveTableTarget = (hasArg: boolean, contextArg: unknown): TableTarget => {
+		if (hasArg) {
+			const arg = parseContextMenuArg(contextArg);
+			// Require the hit `cell`: Drop/Rename resolve the table CONTAINING the right-clicked cell, which is
+			// NOT the selection anchor when the click lands inside a pre-existing multi-cell selection (the
+			// webview keeps that selection). Every grid-cell payload carries `cell`; its absence is a tampered /
+			// version-skewed arg -> loud invalid-arg (No-Fallbacks: never silently key off the anchor instead).
+			if (arg === undefined || arg.cell === undefined) {
+				return { kind: 'invalid-arg' };
+			}
+			const panel = CellGridPanel.panelByToken(arg.panelToken);
+			if (panel === undefined) {
+				return { kind: 'panel-gone' };
+			}
+			const { session, sheet } = panel.target;
+			// `tables` is absent on pre-tables fixtures and EMPTY (the live engine always sends it) when none
+			// are defined -- an absent optional list legitimately means "no tables", not a swallowed error.
+			const tables = session.snapshot().tables ?? [];
+			const preselect = tableAtCell(tables, sheet, arg.cell.row, arg.cell.col);
+			return { kind: 'ok', session, preselect };
+		}
+		const session = resolveFocusedSessionForNames(); // surfaces its own "open and focus a Cell Grid" message
+		if (session === undefined) {
+			return { kind: 'none' };
+		}
+		return { kind: 'ok', session, preselect: undefined };
+	};
+	// Resolve the concrete table a Drop/Rename will act on: the pre-selected one (right-clicked inside it) or
+	// the operator's QuickPick over the whole workbook. Returns `undefined` when there are NO tables (a loud
+	// info message -- never an empty picker / silent no-op) or the picker was dismissed.
+	const pickTable = async (session: SessionInstance, preselect: TableSnapshotJson | undefined, purpose: 'drop' | 'rename'): Promise<TableSnapshotJson | undefined> => {
+		if (preselect !== undefined) {
+			return preselect;
+		}
+		const tables = session.snapshot().tables ?? [];
+		if (tables.length === 0) {
+			void vscode.window.showInformationMessage(`Quantbook: this workbook has no tables to ${purpose}.`);
+			return undefined;
+		}
+		const sheetNameFor = buildSheetNameResolver(session);
+		type TableItem = vscode.QuickPickItem & { table: TableSnapshotJson };
+		const items: TableItem[] = tableQuickPickItems(tables).map((it) => ({
+			label: it.label,
+			description: `${sheetNameFor(it.table.sheet) ?? `#${it.table.sheet}`} - ${it.rangeLabel}`,
+			detail: it.detail,
+			table: it.table,
+		}));
+		const picked = await vscode.window.showQuickPick(items, {
+			title: purpose === 'drop' ? 'Drop Table' : 'Rename Table',
+			placeHolder: purpose === 'drop' ? 'Select the table to drop' : 'Select the table to rename',
+			matchOnDescription: true,
+		});
+		return picked?.table;
+	};
+
+	// FE-5 W-T (drop) + FE-8 (picker + context-aware): drop a table by name. The engine raises
+	// `[table_not_found]` for an unknown one (surfaced loud); a successful drop turns referencing formulas
+	// into `#NAME?` (warned in the confirm).
 	context.subscriptions.push(
-		vscode.commands.registerCommand('quantlab.quantbookDropTable', async () => {
-			const session = resolveFocusedSessionForNames();
-			if (session === undefined) {
+		vscode.commands.registerCommand('quantlab.quantbookDropTable', async (...args: unknown[]) => {
+			const resolved = resolveTableTarget(args.length > 0, args[0]);
+			if (resolved.kind === 'invalid-arg') {
+				void vscode.window.showErrorMessage('Quantbook: drop table failed -- the right-click menu sent an invalid cell context. Try selecting a cell and re-running.');
 				return;
 			}
-			const name = await vscode.window.showInputBox({
-				title: 'Drop Table',
-				prompt: 'Name of the table to drop',
-				placeHolder: 'e.g. Returns',
-				validateInput: (value) => (value.trim().length === 0 ? 'Enter a table name.' : null),
-			});
-			if (name === undefined || name.trim().length === 0) {
+			if (resolved.kind === 'panel-gone') {
+				void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+				return;
+			}
+			if (resolved.kind === 'none') {
+				return; // resolveFocusedSessionForNames already messaged
+			}
+			const target = await pickTable(resolved.session, resolved.preselect, 'drop');
+			if (target === undefined) {
 				return;
 			}
 			const confirm = await vscode.window.showWarningMessage(
-				`Drop table "${name}"? Its cells stay in place, but formulas referencing it will become #NAME?.`,
+				`Drop table "${target.displayName}"? Its cells stay in place, but formulas referencing it will become #NAME?.`,
 				{ modal: true },
 				'Drop Table',
 			);
@@ -1859,20 +1931,75 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			const log = getOutput();
 			try {
-				session.dropTable(name);
-				log.appendLine(`Dropped table "${name}".`);
+				resolved.session.dropTable(target.name); // canonical name is what the engine stores
+				log.appendLine(`Dropped table "${target.name}".`);
 			} catch (err) {
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL dropTable error: ${detail}`);
 				void vscode.window.showErrorMessage(`Quantbook drop table failed: ${detail}`);
 				return;
 			}
-			recalcDirtyChecked(session);
-			const { failed } = CellGridPanel.refreshSession(session);
+			recalcDirtyChecked(resolved.session);
+			const { failed } = CellGridPanel.refreshSession(resolved.session);
 			if (failed > 0) {
 				void vscode.window.showWarningMessage('Quantbook: the table was dropped, but a panel failed to re-render -- run "Quantbook: Refresh Cell Grid".');
 			}
-			void vscode.window.showInformationMessage(`Quantbook: dropped table "${name}".`);
+			void vscode.window.showInformationMessage(`Quantbook: dropped table "${target.displayName}".`);
+		}),
+	);
+
+	// FE-8: rename a table. The napi `renameTable(old, new)` exists (the engine rewrites referencing formulas
+	// in the same op); this wires the UI. Pick the table (context-aware or picker) -> validate the new name
+	// (shared defined-name rules) -> rename -> recalc + reseed. The engine raises `[table_create_rejected]` on
+	// a name collision (with another table or defined name) and `[table_not_found]` if it vanished -- both
+	// surfaced loud (per the SessionInstance.renameTable contract).
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookRenameTable', async (...args: unknown[]) => {
+			const resolved = resolveTableTarget(args.length > 0, args[0]);
+			if (resolved.kind === 'invalid-arg') {
+				void vscode.window.showErrorMessage('Quantbook: rename table failed -- the right-click menu sent an invalid cell context. Try selecting a cell and re-running.');
+				return;
+			}
+			if (resolved.kind === 'panel-gone') {
+				void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+				return;
+			}
+			if (resolved.kind === 'none') {
+				return;
+			}
+			const target = await pickTable(resolved.session, resolved.preselect, 'rename');
+			if (target === undefined) {
+				return;
+			}
+			const newName = await vscode.window.showInputBox({
+				title: `Rename Table "${target.displayName}"`,
+				prompt: 'New table name (shares the defined-name namespace)',
+				value: target.displayName,
+				validateInput: (value) => tableIdentifierRejectionReason(value),
+			});
+			if (newName === undefined) {
+				return; // dismissed
+			}
+			if (!isValidTableIdentifier(newName)) {
+				void vscode.window.showErrorMessage(`Quantbook: "${newName}" is not a valid table name.`);
+				return;
+			}
+			const log = getOutput();
+			try {
+				resolved.session.renameTable(target.name, newName);
+				log.appendLine(`Renamed table "${target.name}" -> "${newName}".`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL renameTable error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook rename table failed: ${detail}`);
+				return;
+			}
+			recalcDirtyChecked(resolved.session);
+			const { failed } = CellGridPanel.refreshSession(resolved.session);
+			if (failed > 0) {
+				void vscode.window.showWarningMessage('Quantbook: the table was renamed, but a panel failed to re-render -- run "Quantbook: Refresh Cell Grid".');
+			}
+			void vscode.window.showInformationMessage(`Quantbook: renamed table to "${newName}".`);
 		}),
 	);
 }

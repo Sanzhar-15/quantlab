@@ -151,6 +151,14 @@ export function planFreezeAtSelection(sel: GridSelectionInput): { rows: number; 
 export interface ContextMenuArg {
 	readonly panelToken: string;
 	readonly selection: GridSelectionInput;
+	/**
+	 * The exact 0-based cell the right-click landed on, when the payload carried it (every grid-cell payload
+	 * does -- see `buildCellContextPayload`). This is DISTINCT from the selection anchor: when the right-click
+	 * lands INSIDE a pre-existing multi-cell selection, the webview KEEPS that selection, so `selection.anchor`
+	 * is a selection CORNER, not the clicked cell. A command that acts on the right-clicked cell (e.g. table
+	 * Drop/Rename, which resolves the table CONTAINING the click) MUST use this, never the anchor.
+	 */
+	readonly cell?: { readonly row: number; readonly col: number };
 }
 
 /** True iff `v` is a finite integer (the selection coords must be exact grid indices, never coerced). */
@@ -168,7 +176,7 @@ export function parseContextMenuArg(raw: unknown): ContextMenuArg | undefined {
 	if (typeof raw !== 'object' || raw === null) {
 		return undefined;
 	}
-	const obj = raw as { panelToken?: unknown; selection?: unknown };
+	const obj = raw as { panelToken?: unknown; selection?: unknown; cell?: unknown };
 	if (typeof obj.panelToken !== 'string' || obj.panelToken.length === 0) {
 		return undefined;
 	}
@@ -180,8 +188,23 @@ export function parseContextMenuArg(raw: unknown): ContextMenuArg | undefined {
 	if (!isInt(s.anchorRow) || !isInt(s.anchorCol) || !isInt(s.focusRow) || !isInt(s.focusCol)) {
 		return undefined;
 	}
-	return {
+	const base: ContextMenuArg = {
 		panelToken: obj.panelToken,
 		selection: { anchorRow: s.anchorRow, anchorCol: s.anchorCol, focusRow: s.focusRow, focusCol: s.focusCol },
 	};
+	// The hit cell is optional in the SHAPE (older/other payloads may omit it; existing consumers ignore it),
+	// but if PRESENT it must validate strictly (No-Fallbacks: a present-but-malformed cell rejects the whole
+	// arg rather than being silently dropped, so a command relying on it never acts on a coerced coordinate).
+	// Only attach `cell` when valid+present -- never an own `cell: undefined` key (keeps the shape minimal).
+	if (obj.cell === undefined) {
+		return base;
+	}
+	if (typeof obj.cell !== 'object' || obj.cell === null) {
+		return undefined;
+	}
+	const c = obj.cell as { row?: unknown; col?: unknown };
+	if (!isInt(c.row) || !isInt(c.col)) {
+		return undefined;
+	}
+	return { ...base, cell: { row: c.row, col: c.col } };
 }

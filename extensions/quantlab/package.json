@@ -337,9 +337,15 @@
         "category": "%command.category%"
       },
       {
-        "_comment": "FE-5 W-T: Drop Table by name (dropTable; referencing formulas become #NAME?).",
+        "_comment": "FE-5 W-T / FE-8: Drop Table (context-aware -> right-click inside a table, or QuickPick over snapshot().tables; dropTable; referencing formulas become #NAME?).",
         "command": "quantlab.quantbookDropTable",
         "title": "%command.quantbookDropTable.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "FE-8: Rename Table (context-aware or QuickPick; renameTable; engine rewrites referencing formulas in the same op).",
+        "command": "quantlab.quantbookRenameTable",
+        "title": "%command.quantbookRenameTable.title%",
         "category": "%command.category%"
       },
       {
@@ -1244,6 +1250,22 @@
           "command": "quantlab.quantbookDefineName",
           "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "6_names@1"
+        },
+        {
+          "_comment": "FE-8: structured-table lifecycle from the grid right-click. Group 7_table (after 6_names). Create reads the right-clicked selection as the footprint; Rename/Drop resolve the table CONTAINING the right-clicked cell (tableAtCell), else open a QuickPick. The host commands accept the data-vscode-context payload (panelToken + selection).",
+          "command": "quantlab.quantbookCreateTable",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "7_table@1"
+        },
+        {
+          "command": "quantlab.quantbookRenameTable",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "7_table@2"
+        },
+        {
+          "command": "quantlab.quantbookDropTable",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "7_table@3"
         }
       ]
     },

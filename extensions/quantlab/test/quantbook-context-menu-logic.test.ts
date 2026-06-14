@@ -191,6 +191,24 @@ suite('W3 contextMenuLogic -- parseContextMenuArg (Codex HIGH-1/HIGH-2 fold)', (
 		assert.strictEqual(parseContextMenuArg({ panelToken: 'wv-1', selection: { anchorRow: NaN, anchorCol: 2, focusRow: 3, focusCol: 4 } }), undefined);
 	});
 
+	// FE-8 (2026-06-14): the hit `cell` rides the payload so table Drop/Rename can resolve the table CONTAINING
+	// the right-clicked cell -- distinct from the selection anchor when the click is inside a multi-cell range.
+	test('carries the optional hit cell when present (FE-8)', () => {
+		const withCell = { panelToken: 'wv-1', selection: ok.selection, cell: { row: 7, col: 3 } };
+		assert.deepStrictEqual(parseContextMenuArg(withCell), withCell);
+	});
+	test('omits cell entirely when the payload lacks it (no own `cell: undefined` key)', () => {
+		const parsed = parseContextMenuArg(ok);
+		assert.notStrictEqual(parsed, undefined);
+		assert.strictEqual(Object.prototype.hasOwnProperty.call(parsed, 'cell'), false);
+	});
+	test('rejects a present-but-malformed hit cell (No-Fallbacks -- never coerce)', () => {
+		assert.strictEqual(parseContextMenuArg({ panelToken: 'wv-1', selection: ok.selection, cell: { row: 1.5, col: 3 } }), undefined);
+		assert.strictEqual(parseContextMenuArg({ panelToken: 'wv-1', selection: ok.selection, cell: { row: -1, col: 3 } }), undefined);
+		assert.strictEqual(parseContextMenuArg({ panelToken: 'wv-1', selection: ok.selection, cell: { row: 1 } }), undefined);
+		assert.strictEqual(parseContextMenuArg({ panelToken: 'wv-1', selection: ok.selection, cell: null }), undefined);
+	});
+
 	test('the parsed selection feeds planStructuralOp end-to-end', () => {
 		const arg = parseContextMenuArg(ok);
 		assert.notStrictEqual(arg, undefined);

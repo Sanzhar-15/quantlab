@@ -46,6 +46,7 @@
 	"command.quantbookGoToName.title": "Quantbook: Go to Name...",
 	"command.quantbookCreateTable.title": "Quantbook: Create Table from Selection...",
 	"command.quantbookDropTable.title": "Quantbook: Drop Table...",
+	"command.quantbookRenameTable.title": "Quantbook: Rename Table...",
 	"command.quantbookSortRangeAsc.title": "Quantbook: Sort Range A to Z",
 	"command.quantbookSortRangeDesc.title": "Quantbook: Sort Range Z to A",
 	"command.quantbookFreezePanes.title": "Quantbook: Freeze Panes at Selection",

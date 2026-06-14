@@ -22,9 +22,11 @@ import {
 	buildTableSpec,
 	defaultColumnNames,
 	isValidTableIdentifier,
+	tableAtCell,
 	tableIdentifierRejectionReason,
+	tableQuickPickItems,
 } from '../src/quantbook/cellGrid/tableUiLogic';
-import type { NamedRangeJson, NamedTargetJson } from '../src/quantbook/types';
+import type { NamedRangeJson, NamedTargetJson, TableSnapshotJson } from '../src/quantbook/types';
 
 // A sheet-name resolver fixture: sheet 0 = "Returns", sheet 1 = "Prices"; everything else is gone.
 const sheetNameFor = (id: number): string | undefined => (id === 0 ? 'Returns' : id === 1 ? 'Prices' : undefined);
@@ -160,5 +162,73 @@ suite('FE-5 W-T tableUiLogic -- buildTableSpec', () => {
 	test('throws (No-Fallbacks) on a non-integer sheet / corner', () => {
 		assert.throws(() => buildTableSpec('T', 1.5, 0, 0, 0, 0), /sheet must be an integer/);
 		assert.throws(() => buildTableSpec('T', 0, 0.5, 0, 0, 0), /must be an integer/);
+	});
+});
+
+// FE-8 (2026-06-14): tableAtCell + tableQuickPickItems back the Drop/Rename UI (context-aware pre-select +
+// the full-workbook picker).
+const tbl = (over: Partial<TableSnapshotJson> & { name: string }): TableSnapshotJson => ({
+	displayName: over.name,
+	sheet: 0,
+	topRow: 0,
+	topCol: 0,
+	rows: 1,
+	cols: 1,
+	hasHeader: true,
+	hasTotals: false,
+	...over,
+});
+
+suite('FE-8 tableUiLogic -- tableAtCell (context-aware footprint lookup)', () => {
+	// Two tables that DON'T overlap in coordinate-space, so a "wrong sheet" test is meaningful:
+	// Returns = sheet 0, A1:C10 (rows 0..9, cols 0..2). Prices = sheet 1, F2:F5 (rows 1..4, col 5).
+	const tables: TableSnapshotJson[] = [
+		tbl({ name: 'Returns', sheet: 0, topRow: 0, topCol: 0, rows: 10, cols: 3 }),
+		tbl({ name: 'Prices', sheet: 1, topRow: 1, topCol: 5, rows: 4, cols: 1 }),
+	];
+	test('a cell inside a footprint returns that table', () => {
+		assert.strictEqual(tableAtCell(tables, 0, 0, 0)?.name, 'Returns'); // top-left corner
+		assert.strictEqual(tableAtCell(tables, 0, 9, 2)?.name, 'Returns'); // bottom-right corner (inclusive)
+		assert.strictEqual(tableAtCell(tables, 0, 5, 1)?.name, 'Returns'); // interior
+		assert.strictEqual(tableAtCell(tables, 1, 4, 5)?.name, 'Prices'); // Prices bottom (sheet 1, F5)
+	});
+	test('a cell one past the footprint edge is outside', () => {
+		assert.strictEqual(tableAtCell(tables, 0, 10, 2), undefined); // row past bottom
+		assert.strictEqual(tableAtCell(tables, 0, 9, 3), undefined); // col past right
+	});
+	test('the right cell on the WRONG sheet does not match', () => {
+		assert.strictEqual(tableAtCell(tables, 1, 0, 0), undefined); // Returns range (A1), but queried on sheet 1
+		assert.strictEqual(tableAtCell(tables, 0, 4, 5), undefined); // Prices range (F5), but queried on sheet 0
+	});
+	test('non-integer / empty inputs match nothing (no throw)', () => {
+		assert.strictEqual(tableAtCell(tables, 0, 0.5, 0), undefined);
+		assert.strictEqual(tableAtCell(tables, NaN, 0, 0), undefined);
+		assert.strictEqual(tableAtCell([], 0, 0, 0), undefined);
+	});
+});
+
+suite('FE-8 tableUiLogic -- tableQuickPickItems (drop/rename picker rows)', () => {
+	test('shapes display name + A1 range + dims, preserving order', () => {
+		const items = tableQuickPickItems([
+			tbl({ name: 'Returns', displayName: 'Returns', sheet: 0, topRow: 0, topCol: 0, rows: 10, cols: 3 }),
+			tbl({ name: 'PRICES', displayName: 'Prices', sheet: 1, topRow: 1, topCol: 1, rows: 4, cols: 2, hasTotals: true }),
+		]);
+		assert.strictEqual(items.length, 2);
+		assert.strictEqual(items[0].label, 'Returns');
+		assert.strictEqual(items[0].rangeLabel, 'A1:C10');
+		assert.strictEqual(items[0].detail, '10 rows x 3 cols - header');
+		assert.strictEqual(items[0].table.name, 'Returns');
+		// Prices: B2 .. C5 (col 1..2, row 1..4), header + totals.
+		assert.strictEqual(items[1].label, 'Prices');
+		assert.strictEqual(items[1].rangeLabel, 'B2:C5');
+		assert.strictEqual(items[1].detail, '4 rows x 2 cols - header + totals');
+	});
+	test('a header-less, totals-less table has no flag suffix', () => {
+		const [item] = tableQuickPickItems([tbl({ name: 'Raw', sheet: 0, topRow: 4, topCol: 26, rows: 2, cols: 1, hasHeader: false })]);
+		assert.strictEqual(item.rangeLabel, 'AA5:AA6'); // col 26 = "AA", row 4 -> "5"
+		assert.strictEqual(item.detail, '2 rows x 1 cols');
+	});
+	test('an empty workbook yields no rows', () => {
+		assert.deepStrictEqual(tableQuickPickItems([]), []);
 	});
 });

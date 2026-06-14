@@ -18,7 +18,8 @@
 
 import { isValidDefinedName, definedNameRejectionReason } from './nameDefineLogic';
 import { normalizeSelectionRect } from '../reactiveNotebook/bindVariableLogic';
-import type { TableSpecJson } from '../types';
+import { columnLabel } from '../shared/gridLayoutA1';
+import type { TableSpecJson, TableSnapshotJson } from '../types';
 
 // The A1 grid extent (mirrors nameDefineLogic / cellGridLogic). A selection outside this is only reachable
 // from a tampered webview bundle; reject it loudly (No-Fallbacks).
@@ -101,4 +102,59 @@ export function buildTableSpec(name: string, sheet: number, anchorRow: number, a
 		hasTotals: false,
 		columnNames: defaultColumnNames(cols),
 	};
+}
+
+// FE-8 (2026-06-14) "Tables -- lifecycle UI". Drop / Rename act on an EXISTING table; the operator picks it
+// either by right-clicking inside its footprint (context-aware) or from a QuickPick of every table in the
+// workbook. The two pure helpers below back both paths -- no vscode, no session, fully unit-testable. The
+// table set comes from `session.snapshot().tables` ({@link TableSnapshotJson}); the engine forbids
+// overlapping footprints, so {@link tableAtCell} returns AT MOST one table.
+
+/**
+ * The table on `sheet` whose footprint `[topRow, topRow+rows) x [topCol, topCol+cols)` contains the 0-based
+ * cell `(row, col)`, or `undefined` if the cell is in no table on that sheet. The engine guarantees table
+ * footprints never overlap, so the first containing table is the only one. A non-finite / non-integer
+ * coordinate matches nothing (returns `undefined`) -- this is a pure lookup, so "no match" is the correct
+ * result for a junk input, NOT an error to mask; the caller treats `undefined` as "right-clicked outside any
+ * table -> fall back to the full picker", which is legitimate UX, not a swallowed failure.
+ */
+export function tableAtCell(tables: readonly TableSnapshotJson[], sheet: number, row: number, col: number): TableSnapshotJson | undefined {
+	if (!Number.isInteger(sheet) || !Number.isInteger(row) || !Number.isInteger(col)) {
+		return undefined;
+	}
+	for (const t of tables) {
+		if (t.sheet === sheet && row >= t.topRow && row < t.topRow + t.rows && col >= t.topCol && col < t.topCol + t.cols) {
+			return t;
+		}
+	}
+	return undefined;
+}
+
+/** One row of the table picker: the underlying snapshot plus the pre-shaped display strings. */
+export interface TablePickItem {
+	/** The table this row selects -- the canonical {@link TableSnapshotJson.name} is what drop/rename pass to the engine. */
+	readonly table: TableSnapshotJson;
+	/** Display label: the human {@link TableSnapshotJson.displayName}. */
+	readonly label: string;
+	/** A1 footprint, e.g. `A1:C10` (top-left .. bottom-right, header row included). */
+	readonly rangeLabel: string;
+	/** Dimensions + header/totals summary, e.g. `10 rows x 3 cols - header`. */
+	readonly detail: string;
+}
+
+/**
+ * Shape the workbook's tables into picker rows (display name, A1 footprint, dims summary). Pure: the SHEET
+ * NAME is intentionally NOT resolved here (that needs the session's `listSheets()`); the command layer adds
+ * it as the QuickPick `description`. Order is preserved from the snapshot (the engine sorts by sheet then
+ * canonical name). Returns `[]` for an empty list -- the command surfaces a loud "no tables" message rather
+ * than opening an empty picker (No-Fallbacks: never a silent no-op).
+ */
+export function tableQuickPickItems(tables: readonly TableSnapshotJson[]): TablePickItem[] {
+	return tables.map((t) => {
+		const topLeft = `${columnLabel(t.topCol)}${t.topRow + 1}`;
+		const bottomRight = `${columnLabel(t.topCol + t.cols - 1)}${t.topRow + t.rows}`;
+		const flags = [t.hasHeader ? 'header' : undefined, t.hasTotals ? 'totals' : undefined].filter((f): f is string => f !== undefined);
+		const detail = `${t.rows} rows x ${t.cols} cols${flags.length > 0 ? ` - ${flags.join(' + ')}` : ''}`;
+		return { table: t, label: t.displayName, rangeLabel: `${topLeft}:${bottomRight}`, detail };
+	});
 }
