@@ -1297,7 +1297,17 @@ impl WorkbookSession {
             // no value/formula/format, must still surface in the snapshot —
             // else `build_cell_snapshot` never runs for it and the style is
             // invisible to the IDE).
-            for ((row, c), _sid) in sheet.style_overlay().iter() {
+            //
+            // **FE-9 (2026-06-14):** skip cells whose ONLY content is an EMPTY
+            // (default) style — they're not really populated. Mirrors
+            // `build_cell_snapshot`'s resolve-and-drop and keeps used-range /
+            // extent from counting phantom style-only cells.
+            for ((row, c), sid) in sheet.style_overlay().iter() {
+                if let Some(s) = self.workbook.styles().lookup(sid) {
+                    if s.is_empty() {
+                        continue;
+                    }
+                }
                 set.insert((row, c));
             }
         }
@@ -1388,10 +1398,21 @@ impl WorkbookSession {
         let format = storage_format.map(storage_format_id_to_dto);
         // **FE-4 W4:** the cell-style id, if any. Carried inline as a DTO
         // StyleId; the `styles` snapshot table resolves it to a `Style`.
-        let style = sheet
-            .style_overlay()
-            .get(row, col)
-            .map(storage_style_id_to_dto);
+        //
+        // **FE-9 (2026-06-14):** resolve the overlay style and DROP it when it
+        // resolves to the EMPTY (default) style — an empty style is "no style"
+        // (style.rs), so a value-less cell carrying only a default style is
+        // genuinely empty and must not surface as a phantom snapshot cell. The
+        // source fix in `set_cell_style` prevents NEW empty binds; this read-side
+        // resolve heals any that slipped in via replay / the dormant collab path /
+        // an older `.qbook`. A lookup miss (id not in the table — cannot happen for
+        // a well-formed session) preserves today's emit behavior, never masks.
+        let style = sheet.style_overlay().get(row, col).and_then(|sid| {
+            match self.workbook.styles().lookup(sid) {
+                Some(s) if s.is_empty() => None,
+                _ => Some(storage_style_id_to_dto(sid)),
+            }
+        });
         if value.is_none() && formula.is_none() && format.is_none() && style.is_none() {
             return None;
         }
@@ -2535,18 +2556,30 @@ impl EngineSession for WorkbookSession {
                     let id = dto_style_id_to_storage(*style);
                     // Mirror `set_cell_style`'s producer-side gate: refuse an
                     // unregistered id up front (BadArgument), pre-mutation.
-                    if self.workbook.styles().lookup(id).is_none() {
+                    let resolved = self.workbook.styles().lookup(id);
+                    if resolved.is_none() {
                         return Err(EngineError::new(
                             ErrorClass::BadArgument,
                             "unknown_style_id",
                             format!("batch.set_style: style id {id:?} is not registered"),
                         ));
                     }
+                    // **FE-9 (2026-06-14):** collapse an empty/default style to a
+                    // CLEAR, matching `set_cell_style`. Phase 3 applies via
+                    // `set_cell_style(Some(id))`, which collapses the LIVE overlay;
+                    // the LOGGED op must collapse identically or replay/undo/reload
+                    // would resurrect a phantom (op said `Some(empty)` while the
+                    // live state cleared). No-Fallbacks: the unknown-id refusal
+                    // above is preserved; only a resolves-to-default id collapses.
+                    let logged_id = match resolved {
+                        Some(s) if s.is_empty() => None,
+                        _ => Some(ql_oplog::StyleIdWire::from_storage(id)),
+                    };
                     inner_ops.push(Op::SetCellStyle {
                         sheet: addr.sheet,
                         row: addr.row,
                         col: addr.col,
-                        id: Some(ql_oplog::StyleIdWire::from_storage(id)),
+                        id: logged_id,
                     });
                     changes.push(SessionChange::Cell {
                         sheet: addr.sheet,
@@ -4374,8 +4407,17 @@ fn storage_border_edge_to_dto(e: ql_storage::BorderEdge) -> BorderEdgeDto {
 }
 
 fn dto_border_edge_to_storage(e: BorderEdgeDto) -> ql_storage::BorderEdge {
+    let style = dto_border_style_to_storage(e.style);
+    // **FE-9 (2026-06-14):** a `None`-style edge draws nothing, so its color is
+    // inert. Canonicalize it to `BorderEdge::NONE` (== the default edge) so (a) two
+    // "no border" edges with different leftover colors intern as ONE style (dedup),
+    // and (b) a borders-off style resolves to `Style::default()` → `is_empty()` →
+    // an empty-style bind collapses to a clear instead of leaving a phantom.
+    if matches!(style, ql_storage::BorderStyle::None) {
+        return ql_storage::BorderEdge::NONE;
+    }
     ql_storage::BorderEdge {
-        style: dto_border_style_to_storage(e.style),
+        style,
         color: dto_rgb_to_storage(e.color),
     }
 }
@@ -11765,6 +11807,128 @@ mod tests {
         );
     }
 
+    /// **FE-9 (2026-06-14) — empty-style bind is a clear (no phantom cell).**
+    /// Binding a registered DEFAULT/empty style on an otherwise-empty cell must
+    /// NOT materialize a phantom snapshot cell — the engine collapses it to a
+    /// clear. Pre-fix, the IDE's "toggle every attribute off" path created a
+    /// value-less, style-only overlay entry the snapshot + persistence emitted.
+    #[test]
+    fn fe9_empty_style_bind_is_a_clear_no_phantom() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let empty = s.register_style(StyleDto::default()).unwrap();
+        s.set_style(addr(sheet, 0, 0), empty).unwrap();
+        assert!(
+            s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
+            "FE-9: binding a default style on an empty cell must NOT create a phantom cell"
+        );
+    }
+
+    /// **FE-9 — toggle-OFF removes the cell's style (no lingering phantom).** Set
+    /// a real (bold) style, confirm it's present, then bind a default style (the
+    /// "unset everything" gesture): the cell's style is gone and, with no value,
+    /// the cell itself disappears — no phantom left behind.
+    #[test]
+    fn fe9_toggle_style_off_removes_phantom() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let bold = s.register_style(bold_style()).unwrap();
+        s.set_style(addr(sheet, 0, 0), bold).unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().style,
+            Some(bold),
+            "precondition: the bold style is applied"
+        );
+        // Toggle everything off → bind a default style → cell clears.
+        let empty = s.register_style(StyleDto::default()).unwrap();
+        s.set_style(addr(sheet, 0, 0), empty).unwrap();
+        assert!(
+            s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
+            "FE-9: toggling the style off must leave no phantom cell"
+        );
+    }
+
+    /// **FE-9 — a non-empty style on a VALUE cell is untouched (no over-collapse).**
+    /// The collapse only fires for the default style; a value cell with a real
+    /// style keeps both.
+    #[test]
+    fn fe9_value_cell_keeps_real_style() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 42.0 })
+            .unwrap();
+        let bold = s.register_style(bold_style()).unwrap();
+        s.set_style(addr(sheet, 0, 0), bold).unwrap();
+        let cell = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(cell.value, Some(CellValue::Number { number: 42.0 }));
+        assert_eq!(cell.style, Some(bold), "real style on a value cell is kept");
+    }
+
+    /// **FE-9 (2026-06-14) — a BATCHED empty-style bind records a CLEAR (audit MED).**
+    /// The IDE applies styles via `batch`. An empty/default style in a batch must log
+    /// `SetCellStyle{None}`, not `Some(empty_id)`, or a reload/undo (which replays the
+    /// op log) would resurrect a phantom value-less styled cell even though the live
+    /// overlay was correctly cleared.
+    #[test]
+    fn fe9_batched_empty_style_no_phantom_after_reload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("fe9batch.qbook");
+        let path_str = path.to_str().unwrap();
+        {
+            let mut s = WorkbookSession::new();
+            let sheet = s.add_sheet("S", 16384).unwrap();
+            let empty = s.register_style(StyleDto::default()).unwrap();
+            s.batch(
+                vec![SessionOp::SetStyle {
+                    addr: addr(sheet, 0, 0),
+                    style: empty,
+                }],
+                BatchOptions::default(),
+            )
+            .unwrap();
+            assert!(
+                s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
+                "live: a batched empty-style bind leaves no phantom cell"
+            );
+            s.save(path_str).unwrap();
+        }
+        // Reload replays the op log; a logged Some(empty_id) would recreate the phantom.
+        let mut s2 = WorkbookSession::new();
+        s2.open(path_str).unwrap();
+        assert!(
+            s2.cell(addr(0, 0, 0)).unwrap().is_none(),
+            "FE-9: a batched empty-style bind must NOT resurrect a phantom after reload"
+        );
+    }
+
+    /// **FE-9 (2026-06-14) — a borders-off edge with a leftover color collapses to a
+    /// clear (audit LOW).** A `None`-style border edge draws nothing, so its color is
+    /// inert; canonicalization makes such an otherwise-default style resolve to
+    /// `Style::default()` → `is_empty()` → an empty-style bind clears instead of
+    /// leaving a phantom (and two such edges intern as one style — dedup).
+    #[test]
+    fn fe9_borders_off_with_color_collapses_to_clear() {
+        use ql_session::dto::{BorderEdge, BorderStyle, Borders, Rgb};
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let style = StyleDto {
+            borders: Borders {
+                top: BorderEdge {
+                    style: BorderStyle::None,
+                    color: Rgb { r: 255, g: 0, b: 0 },
+                },
+                ..Borders::default()
+            },
+            ..StyleDto::default()
+        };
+        let id = s.register_style(style).unwrap();
+        s.set_style(addr(sheet, 0, 0), id).unwrap();
+        assert!(
+            s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
+            "FE-9: a None-style border edge with a leftover color is visually empty → collapses to a clear"
+        );
+    }
+
     /// (7) batch([setStyle, setValue]) → both set (BatchCommit walker).
     #[test]
     fn fe4_batch_setstyle_and_setvalue_both_set() {
@@ -12136,6 +12300,111 @@ mod tests {
         assert_eq!(err.code, "name_not_found");
         // The existing name is untouched.
         assert_eq!(s.list_names().unwrap().len(), 1);
+    }
+
+    /// **FE-9 (2026-06-14) — the stale-name-binding fix (dirty path).** A formula
+    /// referencing a defined name kept a STALE value when the name was deleted,
+    /// because the recompute Err-arm only mapped UnknownTable/Sheet → `#NAME?`
+    /// and left `UnresolvedName` as a `RecomputeFailure` (which preserves the
+    /// cell's prior value). Define SALES + a dependent `=SUM(SALES)`, recalc to a
+    /// real value, then delete SALES and recalc: the dependent MUST become
+    /// `#NAME?`, not keep its prior sum.
+    #[test]
+    fn fe9_deleted_name_makes_dependents_name_error() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 20.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 2, 0), CellValue::Number { number: 30.0 })
+            .unwrap();
+        s.set_name("SALES", range(sheet, 0, 0, 2, 0)).unwrap();
+        // C1 = SUM(SALES) → 60.
+        s.set_formula(addr(sheet, 0, 2), "SUM(SALES)").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 60.0 }),
+            "precondition: =SUM(SALES) computes 60"
+        );
+        // Delete SALES → the dependent must re-evaluate to #NAME?, NOT keep 60.
+        s.delete_name("SALES", None).unwrap();
+        s.recalc_dirty().unwrap();
+        let v = s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value;
+        assert!(
+            matches!(&v, Some(CellValue::Error { error }) if error == "#NAME?"),
+            "FE-9: deleting SALES must turn =SUM(SALES) into #NAME?, got {v:?} (stale-value bug)"
+        );
+    }
+
+    /// **FE-9 — the "rename" case (delete + redefine).** There is no RenameName
+    /// op; the IDE renames a name as `delete_name(old)` + `set_name(new)`, with no
+    /// auto-rewrite of references. A formula still referencing the old name must
+    /// become `#NAME?` after the rename (the same dirty→re-bind→UnresolvedName
+    /// path as a plain delete). NB: the name must NOT be a valid column letter
+    /// sequence (≤ "XFD") — e.g. "OLD" binds as the *column* OLD and shadows the
+    /// same-named range — so this uses ALPHA/BETA (both > 3 letters).
+    #[test]
+    fn fe9_renamed_away_name_makes_old_ref_name_error() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 5.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 7.0 })
+            .unwrap();
+        s.set_name("ALPHA", range(sheet, 0, 0, 1, 0)).unwrap();
+        s.set_formula(addr(sheet, 0, 2), "SUM(ALPHA)").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 12.0 }),
+            "precondition: =SUM(ALPHA) computes 12"
+        );
+        // "Rename" ALPHA → BETA (delete + set). The =SUM(ALPHA) formula is NOT
+        // rewritten, so it now references a missing name.
+        s.delete_name("ALPHA", None).unwrap();
+        s.set_name("BETA", range(sheet, 0, 0, 1, 0)).unwrap();
+        s.recalc_dirty().unwrap();
+        let v = s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value;
+        assert!(
+            matches!(&v, Some(CellValue::Error { error }) if error == "#NAME?"),
+            "FE-9: a formula referencing the renamed-away name must be #NAME?, got {v:?}"
+        );
+    }
+
+    /// **FE-9 — the load path (recompute_all on open).** A persisted workbook whose
+    /// formula references a since-deleted name must show `#NAME?` after reload, not
+    /// a stale value. This exercises `recompute_all` (the open/replay path) rather
+    /// than the dirty path covered above.
+    #[test]
+    fn fe9_deleted_name_dependent_is_name_error_after_reload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("fe9names.qbook");
+        let path_str = path.to_str().unwrap();
+        {
+            let mut s = WorkbookSession::new();
+            let sheet = s.add_sheet("S", 16384).unwrap();
+            s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 4.0 })
+                .unwrap();
+            s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 6.0 })
+                .unwrap();
+            s.set_name("SALES", range(sheet, 0, 0, 1, 0)).unwrap();
+            s.set_formula(addr(sheet, 0, 2), "SUM(SALES)").unwrap();
+            s.recalc_dirty().unwrap();
+            s.delete_name("SALES", None).unwrap();
+            s.save(path_str).unwrap();
+        }
+        let mut s2 = WorkbookSession::new();
+        s2.open(path_str).unwrap();
+        // The reopened workbook recomputes from baseline+replay; the dependent
+        // now binds to a missing name.
+        s2.recalc_all().unwrap();
+        let v = s2.cell(addr(0, 0, 2)).unwrap().unwrap().value;
+        assert!(
+            matches!(&v, Some(CellValue::Error { error }) if error == "#NAME?"),
+            "FE-9: reloaded =SUM(SALES) with SALES deleted must be #NAME?, got {v:?}"
+        );
     }
 
     /// `list_names` walks BOTH workbook-scoped AND sheet-scoped tables, and all

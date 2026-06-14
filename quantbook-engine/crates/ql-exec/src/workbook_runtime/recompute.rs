@@ -297,10 +297,19 @@ impl<'a> WorkbookRuntime<'a> {
                     // pre-recompute value AND emit a
                     // RecomputeFailure — worse than `#NAME?` from
                     // the user's perspective. This maps it cleanly.
+                    // **FE-9 (2026-06-14):** also map `UnresolvedName`. A
+                    // formula referencing a defined name that was DELETED (or
+                    // renamed away — there is no RenameName op, so a rename is
+                    // delete_name + set_name) must surface `#NAME?`, not keep
+                    // its stale pre-delete value. The dirtying already fires
+                    // (`on_set_name` → name_gen bump → cache miss → re-bind →
+                    // `UnresolvedName`); the only gap was this mapping. Same
+                    // principle as the dropped-table/sheet cases above.
                     if let RuntimeError::Bind(
                         BindError::UnknownTable(_)
                         | BindError::UnknownTableColumn { .. }
-                        | BindError::UnknownSheet(_),
+                        | BindError::UnknownSheet(_)
+                        | BindError::UnresolvedName(_),
                     ) = &error
                     {
                         self.workbook.put_computed_at(
@@ -755,10 +764,17 @@ impl<'a> WorkbookRuntime<'a> {
                         // the `recompute_all` change for cross-sheet
                         // bind failures (rename-sheet × concurrent
                         // formula edit in Phase 5 multi-peer merge).
+                        // **FE-9 (2026-06-14):** also map `UnresolvedName` —
+                        // the dirty-path mirror of the `recompute_all` change.
+                        // A deleted/renamed-away defined name dirties its
+                        // dependents (`on_set_name`); on the next dirty recalc
+                        // the re-bind hits `UnresolvedName` and must materialize
+                        // `#NAME?` instead of leaving the cell's stale value.
                         if let RuntimeError::Bind(
                             BindError::UnknownTable(_)
                             | BindError::UnknownTableColumn { .. }
-                            | BindError::UnknownSheet(_),
+                            | BindError::UnknownSheet(_)
+                            | BindError::UnresolvedName(_),
                         ) = &error
                         {
                             let v = Value::Error(ErrorValue::Name);
@@ -1502,7 +1518,11 @@ mod tests {
         wb.put_formula(0, 2, 0, "A1 * 2"); // good
         wb.put_formula(0, 3, 0, "A1 - 5"); // good
         wb.put_formula(0, 4, 0, "((("); // parse error
-        wb.put_formula(0, 5, 0, "@bogus"); // lex error
+        // FE-9: `@bogus` is no longer a failure — post-W5-143 `@` is implicit
+        // intersection, so `@bogus` is an UnresolvedName bind error that now maps
+        // to #NAME? (a success). Use a genuine LEX error (backtick) to keep this
+        // test's "2 structural failures, no short-circuit" intent.
+        wb.put_formula(0, 5, 0, "`bogus"); // lex error (invalid character)
 
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
@@ -1524,25 +1544,31 @@ mod tests {
         assert_eq!(wb.read(ql_types::Address::new(0, 3, 0)), Value::Number(5.0));
     }
 
-    /// R2B-03: invalid persisted formulas do NOT panic the runtime. Every
-    /// kind of structural failure (lex / parse / bind) surfaces as a
-    /// `RecomputeFailure` entry; the runtime stays alive.
+    /// R2B-03: invalid persisted formulas do NOT panic the runtime. Lex and
+    /// parse failures surface as `RecomputeFailure` entries; the runtime stays
+    /// alive. **FE-9 (2026-06-14):** an unresolved-NAME bind error is no longer
+    /// a `RecomputeFailure` — it materializes `#NAME?` (a well-defined error
+    /// value counted as `succeeded`), matching the dropped-table/sheet cases.
     #[test]
     fn recompute_all_does_not_panic_on_invalid_persisted_formulas() {
         let mut wb = make_runtime_workbook();
-        wb.put_formula(0, 0, 0, "@@@"); // lex error
-        wb.put_formula(0, 0, 1, "1 +"); // parse error (trailing operator)
-        wb.put_formula(0, 0, 2, "UnknownName + 1"); // bind error (UnresolvedName)
+        wb.put_formula(0, 0, 0, "@@@"); // lex error -> RecomputeFailure
+        wb.put_formula(0, 0, 1, "1 +"); // parse error (trailing op) -> RecomputeFailure
+        wb.put_formula(0, 0, 2, "UnknownName + 1"); // bind (UnresolvedName) -> #NAME?
 
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        // Just calling this must not panic — the assertion is the absence
-        // of a panic, plus the structural-failure invariant.
+        // Must not panic. Lex+parse fail; the unresolved name resolves to #NAME?.
         let result = rt.recompute_all();
         assert_eq!(result.attempted, 3);
-        assert_eq!(result.succeeded, 0);
-        assert_eq!(result.failed_count(), 3);
-        assert!(!result.is_complete());
+        assert_eq!(result.succeeded, 1); // the UnresolvedName cell -> #NAME?
+        assert_eq!(result.failed_count(), 2); // lex + parse only
+        assert!(!result.is_complete()); // 2 structural failures remain
+        // FE-9: the unknown-name formula now carries #NAME?, not a stale value.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 2)),
+            Value::Error(ErrorValue::Name)
+        );
     }
 
     /// Evaluation-time errors (Value::Error variants like #DIV/0!) count as

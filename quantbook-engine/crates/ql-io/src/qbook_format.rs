@@ -1350,17 +1350,25 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         // if non-empty (mirrors format_overlay). Sorted by (row, col).
         let style_overlay = {
             let overlay = sheet.style_overlay();
-            if overlay.is_empty() {
+            // **FE-9 (2026-06-14):** never persist an EMPTY (default) style — it is
+            // "no style" and would reload as a phantom value-less styled cell.
+            // Mirrors the snapshot read-side drop; with the `set_cell_style` / batch
+            // source collapses this is defense-in-depth (heals any phantom that
+            // slipped in via replay or an older file, and self-heals on re-save).
+            // Unknown ids (cannot happen for a well-formed workbook) are KEPT, never
+            // silently dropped.
+            let mut entries: Vec<StyleOverlayEntry> = overlay
+                .iter()
+                .filter(|(_, sid)| !wb.styles().lookup(*sid).map_or(false, |s| s.is_empty()))
+                .map(|((r, c), sid)| StyleOverlayEntry {
+                    row: r,
+                    col: c,
+                    id: StyleIdWire::from_storage(sid),
+                })
+                .collect();
+            if entries.is_empty() {
                 None
             } else {
-                let mut entries: Vec<StyleOverlayEntry> = overlay
-                    .iter()
-                    .map(|((r, c), sid)| StyleOverlayEntry {
-                        row: r,
-                        col: c,
-                        id: StyleIdWire::from_storage(sid),
-                    })
-                    .collect();
                 entries.sort_by_key(|e| (e.row, e.col));
                 Some(entries)
             }

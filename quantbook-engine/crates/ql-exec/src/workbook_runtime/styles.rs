@@ -80,17 +80,30 @@ impl<'a> WorkbookRuntime<'a> {
         // Producer-side gate: refuse `Some(id)` referencing an unregistered
         // style. Replay does the same check so a wire-bound op log is
         // well-formed.
-        if let Some(sid) = id {
-            if self.workbook.styles().lookup(sid).is_none() {
-                return Err(RuntimeError::UnknownStyleId(sid));
-            }
-        }
+        //
+        // **FE-9 (2026-06-14):** collapse an EMPTY (default) style to a CLEAR.
+        // `Style::default()` is "no styling" (style.rs) — binding it would
+        // materialize a phantom cell (a value-less, style-only overlay entry that
+        // the snapshot + `.qbook` persistence still emit). The IDE's only "toggle
+        // every attribute OFF" path registers a default `Style` and calls this,
+        // so the collapse happens HERE — BEFORE op-append, so the op log records
+        // the true `None`/clear intent and replay stays in lockstep with state.
+        // An unknown id is still refused loudly (No-Fallbacks); only a
+        // resolves-to-default id is treated as a clear.
+        let effective_id = match id {
+            Some(sid) => match self.workbook.styles().lookup(sid) {
+                None => return Err(RuntimeError::UnknownStyleId(sid)),
+                Some(style) if style.is_empty() => None, // default style ⇒ clear
+                Some(_) => Some(sid),
+            },
+            None => None,
+        };
         if let Some(oplog) = self.oplog.as_deref_mut() {
             oplog.append(Op::SetCellStyle {
                 sheet,
                 row,
                 col,
-                id: id.map(ql_oplog::StyleIdWire::from_storage),
+                id: effective_id.map(ql_oplog::StyleIdWire::from_storage),
             })?;
         }
         // Apply the mutation. After append-success this cannot fail.
@@ -99,7 +112,7 @@ impl<'a> WorkbookRuntime<'a> {
             .sheet_mut(sheet)
             .expect("validate_cell guards sheet bounds")
             .style_overlay_mut();
-        match id {
+        match effective_id {
             Some(sid) => {
                 overlay.set(row, col, sid);
             }
@@ -200,6 +213,38 @@ mod tests {
         assert!(ops
             .iter()
             .any(|o| matches!(o, Op::SetCellStyle { id: None, .. })));
+    }
+
+    /// **FE-9 (2026-06-14):** binding an EMPTY (default) style collapses to a
+    /// CLEAR — the overlay gets NO entry and the op log records
+    /// `SetCellStyle{None}` (so replay stays in lockstep with state). This is the
+    /// source fix that stops the IDE's "toggle every attribute off" gesture from
+    /// creating a phantom (value-less, default-styled) cell.
+    #[test]
+    fn fe9_set_cell_style_empty_collapses_to_clear() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        let mut log = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut log);
+            let empty_id = rt.intern_style(Style::default()).unwrap();
+            // Bind the default style on an empty cell → must collapse to a clear.
+            rt.set_cell_style(s, 0, 0, Some(empty_id)).unwrap();
+        }
+        // No overlay entry — the default style is "no style".
+        assert_eq!(wb.sheet(s).unwrap().style_overlay().get(0, 0), None);
+        let ops: Vec<_> = log.iter().collect::<Result<_, _>>().unwrap();
+        assert!(
+            ops.iter()
+                .any(|o| matches!(o, Op::SetCellStyle { id: None, .. })),
+            "FE-9: an empty-style bind must emit SetCellStyle{{None}}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|o| matches!(o, Op::SetCellStyle { id: Some(_), .. })),
+            "FE-9: an empty-style bind must NOT emit a set-to-empty op"
+        );
     }
 
     #[test]
