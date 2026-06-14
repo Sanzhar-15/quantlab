@@ -10088,6 +10088,382 @@ mod tests {
         );
     }
 
+    // ===== FE-9.x (2026-06-14): uniform spill-body dissolution on error =====
+
+    /// **FE-9.x — a previously-spilled formula going `#NAME?` dissolves its body
+    /// (dirty path).** Pre-FE-9.x the bind-error arm wrote `#NAME?` at the anchor but
+    /// left the spill body STALE on screen (the deferred HIGH). Now the body is cleared,
+    /// the anchor unregistered, and `snapshot_delta` reports the removed body cells.
+    #[test]
+    fn fe9x_dirty_name_error_dissolves_spill_body() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (rr, v) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            s.set_value(addr(sheet, rr, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_name("SALES", range(sheet, 0, 0, 2, 0)).unwrap(); // A1:A3 (3 rows)
+        s.set_formula(addr(sheet, 0, 2), "TRANSPOSE(SALES)")
+            .unwrap(); // C1 → spills C1:E1
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 10.0 }),
+            "precondition: C1 spill body[0] = 10"
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 0, 4)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 30.0 }),
+            "precondition: E1 spill body[2] = 30"
+        );
+        let v1 = s.snapshot().unwrap().version;
+        s.delete_name("SALES", None).unwrap();
+        s.recalc_dirty().unwrap();
+        let c1 = s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value;
+        assert!(
+            matches!(&c1, Some(CellValue::Error { error }) if error == "#NAME?"),
+            "FE-9.x: deleted-name spill anchor must be #NAME?, got {c1:?}"
+        );
+        for (col, label) in [(3u32, "D1"), (4, "E1")] {
+            let body = s.cell(addr(sheet, 0, col)).unwrap();
+            assert!(
+                body.as_ref()
+                    .and_then(|c| c.value.clone())
+                    .map_or(true, |v| v == CellValue::Blank),
+                "FE-9.x: dissolved spill body {label} must NOT retain a stale value, got {body:?}"
+            );
+        }
+        let d = s.snapshot_delta(&v1).unwrap();
+        let removed = delta_removed_coords(&d);
+        assert!(
+            removed.contains(&(0, 3)) && removed.contains(&(0, 4)),
+            "FE-9.x: dissolved body D1/E1 must be reported removed — got removed={removed:?}"
+        );
+    }
+
+    /// **FE-9.x — same dissolution via the live `recalc_all` path.** `recalc_all`
+    /// lends the persistent graph to `recompute_all` (Codex RESHAPE), so the full-pass
+    /// `#NAME?` arm must dissolve the body too.
+    #[test]
+    fn fe9x_recalc_all_name_error_dissolves_spill_body() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (rr, v) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            s.set_value(addr(sheet, rr, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_name("SALES", range(sheet, 0, 0, 2, 0)).unwrap();
+        s.set_formula(addr(sheet, 0, 2), "TRANSPOSE(SALES)")
+            .unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 4)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 30.0 }),
+            "precondition: E1 spill body = 30"
+        );
+        s.delete_name("SALES", None).unwrap();
+        s.recalc_all().unwrap();
+        let c1 = s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value;
+        assert!(
+            matches!(&c1, Some(CellValue::Error { error }) if error == "#NAME?"),
+            "FE-9.x: recalc_all on a deleted-name spill anchor must be #NAME?, got {c1:?}"
+        );
+        for (col, label) in [(3u32, "D1"), (4, "E1")] {
+            let body = s.cell(addr(sheet, 0, col)).unwrap();
+            assert!(
+                body.as_ref()
+                    .and_then(|c| c.value.clone())
+                    .map_or(true, |v| v == CellValue::Blank),
+                "FE-9.x: recalc_all must dissolve spill body {label}, got {body:?}"
+            );
+        }
+    }
+
+    /// **FE-9.x — gap 2: an aliased reader is re-extracted on dirty-path dissolution.**
+    /// `G3 = D1` is producer-aliased to the spill anchor `C1`. After the spill
+    /// dissolves to `#NAME?`, `D1` is a free literal cell; a LATER user write to `D1`
+    /// must update `G3` — proving its dep was re-routed off the dead anchor.
+    #[test]
+    fn fe9x_name_error_reextracts_aliased_reader() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (rr, v) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            s.set_value(addr(sheet, rr, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_name("SALES", range(sheet, 0, 0, 2, 0)).unwrap();
+        s.set_formula(addr(sheet, 0, 2), "TRANSPOSE(SALES)")
+            .unwrap(); // C1:E1
+        s.set_formula(addr(sheet, 2, 6), "D1").unwrap(); // G3 = D1 (a spill body cell)
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 2, 6)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 20.0 }),
+            "precondition: G3 = D1 = 20"
+        );
+        s.delete_name("SALES", None).unwrap();
+        s.recalc_dirty().unwrap();
+        // GAP-2 PROOF: D1 is now a free cell. A user write to it MUST reach G3.
+        s.set_value(addr(sheet, 0, 3), CellValue::Number { number: 99.0 })
+            .unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 2, 6)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 99.0 }),
+            "FE-9.x gap-2: G3's dep must re-extract to literal D1 after dissolution → see D1=99"
+        );
+    }
+
+    /// **FE-9.x — gap 2 on the live `recalc_all` path (the RESHAPE-critical test).**
+    /// The same aliased-reader re-extraction must happen when the dissolution occurs
+    /// inside `recalc_all` (persistent graph attached). Without the `recompute_all`
+    /// re-extraction this FAILS (G3 stays stale).
+    #[test]
+    fn fe9x_recalc_all_reextracts_aliased_reader() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (rr, v) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            s.set_value(addr(sheet, rr, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_name("SALES", range(sheet, 0, 0, 2, 0)).unwrap();
+        s.set_formula(addr(sheet, 0, 2), "TRANSPOSE(SALES)")
+            .unwrap();
+        s.set_formula(addr(sheet, 2, 6), "D1").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 2, 6)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 20.0 }),
+            "precondition: G3 = D1 = 20"
+        );
+        s.delete_name("SALES", None).unwrap();
+        s.recalc_all().unwrap(); // dissolution + re-extraction on the full-pass path
+        s.set_value(addr(sheet, 0, 3), CellValue::Number { number: 99.0 })
+            .unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 2, 6)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 99.0 }),
+            "FE-9.x RESHAPE: recalc_all must re-extract aliased readers → G3 sees D1=99"
+        );
+    }
+
+    /// **FE-9.x — uniformity: a DROPPED TABLE under a spill dissolves too.**
+    /// `UnknownTable` shares the `#NAME?` arm with `UnresolvedName`, so dropping a
+    /// table that a spilling formula reads must dissolve the body identically.
+    #[test]
+    fn fe9x_table_drop_dissolves_spill_body() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        s.create_table(TableSpec {
+            name: "T".into(),
+            sheet: sid,
+            top_row: 0,
+            top_col: 0,
+            rows: 3, // header + 2 data rows
+            cols: 2,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["A".into(), "B".into()],
+        })
+        .unwrap();
+        // Data column B (col 1, rows 1-2) = [20, 30].
+        s.set_value(addr(sid, 1, 1), CellValue::Number { number: 20.0 })
+            .unwrap();
+        s.set_value(addr(sid, 2, 1), CellValue::Number { number: 30.0 })
+            .unwrap();
+        // E1 = TRANSPOSE(T[B]) → spills E1:F1 (the 2 data values, transposed).
+        s.set_formula(addr(sid, 0, 4), "TRANSPOSE(T[B])").unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sid, 0, 4)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 20.0 }),
+            "precondition: E1 spill body[0] = 20"
+        );
+        assert_eq!(
+            s.cell(addr(sid, 0, 5)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 30.0 }),
+            "precondition: F1 spill body[1] = 30"
+        );
+        s.drop_table("T").unwrap();
+        s.recalc_dirty().unwrap();
+        let e1 = s.cell(addr(sid, 0, 4)).unwrap().unwrap().value;
+        assert!(
+            matches!(&e1, Some(CellValue::Error { error }) if error == "#NAME?"),
+            "FE-9.x: dropped-table spill anchor must be #NAME?, got {e1:?}"
+        );
+        let f1 = s.cell(addr(sid, 0, 5)).unwrap();
+        assert!(
+            f1.as_ref()
+                .and_then(|c| c.value.clone())
+                .map_or(true, |v| v == CellValue::Blank),
+            "FE-9.x: dropped-table dissolution must clear spill body F1, got {f1:?}"
+        );
+    }
+
+    /// **FE-9.x — gap 2 with an `@`-bearing reader (pins the cell-anchor cache key).**
+    /// `G3 = @D1:D1` reads the spill target `D1` and its text contains `@`, so the
+    /// re-extraction must rebuild it under a CELL-anchored plan-cache key. After the
+    /// spill dissolves, a write to `D1` must reach `G3`.
+    #[test]
+    fn fe9x_at_reader_reextracts_after_dissolution() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (rr, v) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            s.set_value(addr(sheet, rr, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_name("SALES", range(sheet, 0, 0, 2, 0)).unwrap();
+        s.set_formula(addr(sheet, 0, 2), "TRANSPOSE(SALES)")
+            .unwrap(); // C1:E1
+        s.set_formula(addr(sheet, 2, 6), "@D1:D1").unwrap(); // G3 = @D1:D1 → D1 (has '@')
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 2, 6)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 20.0 }),
+            "precondition: G3 = @D1:D1 = D1 = 20"
+        );
+        s.delete_name("SALES", None).unwrap();
+        s.recalc_dirty().unwrap();
+        s.set_value(addr(sheet, 0, 3), CellValue::Number { number: 99.0 })
+            .unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 2, 6)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 99.0 }),
+            "FE-9.x gap-2: an @-bearing reader must re-extract (cell-anchor key) → see D1=99"
+        );
+    }
+
+    /// **FE-9.x — a reader that is ITSELF a spilling formula survives dissolution.**
+    /// `G1 = TRANSPOSE(C1:E1)` spills off the body of `C1 = TRANSPOSE(SALES)`. Deleting
+    /// SALES dissolves C1's body; G1 must re-evaluate without corruption (no panic, no
+    /// stale value, recalc completes) and its own footprint stays consistent.
+    #[test]
+    fn fe9x_reader_that_spills_survives_dissolution() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (rr, v) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            s.set_value(addr(sheet, rr, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_name("SALES", range(sheet, 0, 0, 2, 0)).unwrap();
+        s.set_formula(addr(sheet, 0, 2), "TRANSPOSE(SALES)")
+            .unwrap(); // C1:E1 (1×3)
+        s.set_formula(addr(sheet, 0, 6), "TRANSPOSE(C1:E1)")
+            .unwrap(); // G1:G3 (3×1)
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 2, 6)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 30.0 }),
+            "precondition: G3 (spilled-from-spill) = 30"
+        );
+        s.delete_name("SALES", None).unwrap();
+        // Must not panic / must complete.
+        s.recalc_dirty().unwrap();
+        // The source anchor is #NAME?.
+        let c1 = s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value;
+        assert!(
+            matches!(&c1, Some(CellValue::Error { error }) if error == "#NAME?"),
+            "C1 source anchor must be #NAME?, got {c1:?}"
+        );
+        // G1 (the spilling reader) must have RE-EVALUATED — not the stale 10. It reads
+        // C1:E1 = [#NAME?, blank, blank], so its array result carries the error.
+        let g1 = s.cell(addr(sheet, 0, 6)).unwrap().unwrap().value;
+        assert!(
+            matches!(&g1, Some(CellValue::Error { error }) if error == "#NAME?"),
+            "FE-9.x: the spilling reader G1 must re-evaluate (error-propagate), not keep stale 10; got {g1:?}"
+        );
+        // Its former body cells G2/G3 must not retain stale spilled values.
+        for (rr, label) in [(1u32, "G2"), (2, "G3")] {
+            let body = s.cell(addr(sheet, rr, 6)).unwrap();
+            assert!(
+                body.as_ref()
+                    .and_then(|c| c.value.clone())
+                    .map_or(true, |v| v == CellValue::Blank),
+                "FE-9.x: spilling-reader body {label} must not retain a stale value, got {body:?}"
+            );
+        }
+    }
+
+    /// **FE-9.x — the dirty `#CIRC!` cycle branch dissolves AND re-extracts (gap 2).**
+    /// A spilling anchor driven into a cycle by a dependency edit dissolves its body;
+    /// an aliased reader of a now-freed body cell must re-route — a later write to that
+    /// cell reaches the reader. The cycle `A1↔C1` excludes `A2`, so writing `A2` does
+    /// NOT re-spill (keeping `A1` `#CIRC!` and `A2` free).
+    #[test]
+    fn fe9x_dirty_circ_over_spill_dissolves_and_reextracts() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 2), CellValue::Number { number: 3.0 })
+            .unwrap(); // C1 = 3
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(C1)").unwrap(); // A1 spills A1:A3
+        s.set_formula(addr(sheet, 5, 5), "A2").unwrap(); // F6 = A2 (body cell, aliased to A1)
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 5, 5)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 2.0 }),
+            "precondition: F6 = A2 = 2"
+        );
+        // Drive A1 into a cycle that does NOT involve A2: C1 = A1 → A1→C1→A1.
+        s.set_formula(addr(sheet, 0, 2), "A1").unwrap();
+        s.recalc_dirty().unwrap();
+        let a1 = s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value;
+        assert!(
+            matches!(&a1, Some(CellValue::Error { error }) if error == "#CIRC!"),
+            "A1 in a cycle must be #CIRC!, got {a1:?}"
+        );
+        let a2 = s.cell(addr(sheet, 1, 0)).unwrap();
+        assert!(
+            a2.as_ref()
+                .and_then(|c| c.value.clone())
+                .map_or(true, |v| v == CellValue::Blank),
+            "FE-9.x: cycle-dissolved body A2 must be cleared, got {a2:?}"
+        );
+        // GAP-2 (cycle branch): write the freed A2 — F6 must see it (re-extracted).
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 99.0 })
+            .unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 5, 5)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 99.0 }),
+            "FE-9.x: the dirty #CIRC! cycle branch must re-extract F6 → see A2=99"
+        );
+    }
+
+    /// **FE-9.x — `recalc_all` Ok-arm SHRINK re-extracts aliased readers (RESHAPE, site 5).**
+    /// A surviving spill that SHRINKS during `recalc_all` drops targets; a reader aliased
+    /// to a dropped target must re-route to the now-literal cell. Without the Ok-arm
+    /// re-extraction this FAILS (the reader stays stale).
+    #[test]
+    fn fe9x_recalc_all_ok_shrink_reextracts_aliased_reader() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 1), CellValue::Number { number: 4.0 })
+            .unwrap(); // B1 = 4
+        s.set_formula(addr(sheet, 0, 0), "SEQUENCE(B1)").unwrap(); // A1 spills A1:A4
+        s.set_formula(addr(sheet, 5, 5), "A4").unwrap(); // F6 = A4 (last body cell, aliased)
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 5, 5)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 4.0 }),
+            "precondition: F6 = A4 = 4"
+        );
+        // Shrink to A1:A2 (A3/A4 dropped) and resolve via recalc_all (Ok-arm site 5).
+        s.set_value(addr(sheet, 0, 1), CellValue::Number { number: 2.0 })
+            .unwrap();
+        s.recalc_all().unwrap();
+        // A4 is now free; write it and confirm F6 re-routed to literal A4.
+        s.set_value(addr(sheet, 3, 0), CellValue::Number { number: 77.0 })
+            .unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 5, 5)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 77.0 }),
+            "FE-9.x site-5: recalc_all Ok-arm shrink must re-extract F6 → see A4=77"
+        );
+    }
+
     /// A token equal to the current version yields an empty (no-change) delta.
     #[test]
     fn snapshot_delta_no_changes_is_empty() {

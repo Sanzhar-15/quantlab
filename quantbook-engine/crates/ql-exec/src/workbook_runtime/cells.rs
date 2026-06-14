@@ -320,7 +320,13 @@ impl<'a> WorkbookRuntime<'a> {
             self.record_spill_footprint(sheet, row, col, shape, true);
         }
         if let Some((host_anchor, host_shape)) = dissolved_host {
-            self.record_spill_footprint(host_anchor.0, host_anchor.1, host_anchor.2, host_shape, false);
+            self.record_spill_footprint(
+                host_anchor.0,
+                host_anchor.1,
+                host_anchor.2,
+                host_shape,
+                false,
+            );
         }
 
         // Phase 3.1: notify calcgraph after the workbook mutation
@@ -493,7 +499,13 @@ impl<'a> WorkbookRuntime<'a> {
     /// skipped. Its broken state surfaces at its own next recompute —
     /// we don't want to fail the surrounding `set_formula` call because
     /// of an unrelated reader.
-    fn reextract_spill_footprint_readers(
+    // **FE-9.x (2026-06-14):** `pub(super)` so the sibling `recompute` module's
+    // full-pass spill-transition sites can re-extract aliased readers against the
+    // PERSISTENT graph. No-ops ONLY when no graph is attached (the standalone
+    // `WorkbookRuntime::new` load path); fires on every session-attached caller
+    // (set_formula/clear_formula AND the FE-9.x recompute_all sites on
+    // recalc_all/open/rematerialize).
+    pub(super) fn reextract_spill_footprint_readers(
         &mut self,
         anchor_sheet: SheetId,
         anchor_row: RowId,
@@ -908,7 +920,13 @@ impl<'a> WorkbookRuntime<'a> {
             self.record_spill_footprint(sheet, row, col, shape, true);
         }
         if let Some((host_anchor, host_shape)) = dissolved_host {
-            self.record_spill_footprint(host_anchor.0, host_anchor.1, host_anchor.2, host_shape, false);
+            self.record_spill_footprint(
+                host_anchor.0,
+                host_anchor.1,
+                host_anchor.2,
+                host_shape,
+                false,
+            );
         }
 
         self.workbook.put_at(sheet, row, col, value);

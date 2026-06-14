@@ -195,19 +195,21 @@ impl<'a> WorkbookRuntime<'a> {
         // `recompute_dirty` cycle-branch fix.
         let mut cycled_dissolved_targets: Vec<(SheetId, RowId, ColId)> = Vec::new();
         for &(sheet, row, col) in &cycled_cells {
-            if let Some(shape) = self.workbook.spill_anchor_at(sheet, row, col).copied() {
-                for dr in 0..shape.rows {
-                    for dc in 0..shape.cols {
-                        if dr == 0 && dc == 0 {
-                            continue;
-                        }
-                        cycled_dissolved_targets.push((sheet, row + dr, col + dc));
-                    }
-                }
-            }
-            self.workbook.clear_spill_if_present((sheet, row, col));
+            // **H3 (6.3-0) / FE-9.x (2026-06-14):** dissolve the old footprint via the
+            // shared helper (records the dissolved body into cycled_dissolved_targets),
+            // write `#CIRC!`, then re-extract aliased readers. `reextract_*` no-ops ONLY
+            // when no graph is attached (the standalone `WorkbookRuntime::new` load
+            // path); on the live `recalc_all` AND the product `open`/`rematerialize`
+            // paths the persistent graph IS attached (recompute_all does not `take()`
+            // it) and re-extraction FIRES — correctly routing readers to/from
+            // materialized/dissolved spill anchors (Codex RESHAPE).
+            let old_shape =
+                self.dissolve_errored_spill_all(sheet, row, col, &mut cycled_dissolved_targets);
             self.workbook
                 .put_computed_at(sheet, row, col, Value::Error(ErrorValue::Circ));
+            if let Some(s) = old_shape {
+                self.reextract_spill_footprint_readers(sheet, row, col, Some(s), None);
+            }
         }
 
         // Snapshot the formula list so we don't hold a borrow during eval.
@@ -276,6 +278,20 @@ impl<'a> WorkbookRuntime<'a> {
                             }
                         }
                     }
+                    // **FE-9.x (2026-06-14):** if the spill shape CHANGED (shrank,
+                    // grew, dissolved, or newly appeared), re-extract aliased readers
+                    // so their deps re-route to/from the literal target cells.
+                    // `reextract_*` no-ops ONLY when no graph is attached (standalone
+                    // `WorkbookRuntime::new`); on the live `recalc_all` AND the product
+                    // `open`/`rematerialize` paths the persistent graph is attached and
+                    // it FIRES (correctly). An unchanged surviving spill keeps valid
+                    // alias deps → skip (avoids per-pass churn). Codex RESHAPE: full-pass
+                    // dissolution/shrink had the same alias gap as the error arms.
+                    if old_shape != new_shape {
+                        self.reextract_spill_footprint_readers(
+                            sheet, row, col, old_shape, new_shape,
+                        );
+                    }
                 }
                 Err(error) => {
                     // **W5-156 (Phase 4.8.G.3 — HIGH-2 closure):**
@@ -312,12 +328,24 @@ impl<'a> WorkbookRuntime<'a> {
                         | BindError::UnresolvedName(_),
                     ) = &error
                     {
+                        // **FE-9.x (2026-06-14):** dissolve a previously-spilled body
+                        // before writing `#NAME?` (mirrors the #CIRC! pre-pass and the
+                        // recompute_dirty arm). Records the dissolved body into
+                        // changed_cells (the anchor was pushed at the top of the loop);
+                        // re-extracts aliased readers (no-op ONLY on the standalone
+                        // `WorkbookRuntime::new` path; FIRES on the live recalc_all AND
+                        // product open/rematerialize paths where the graph is attached).
+                        let old_shape =
+                            self.dissolve_errored_spill_all(sheet, row, col, &mut changed_cells);
                         self.workbook.put_computed_at(
                             sheet,
                             row,
                             col,
                             Value::Error(ErrorValue::Name),
                         );
+                        if let Some(s) = old_shape {
+                            self.reextract_spill_footprint_readers(sheet, row, col, Some(s), None);
+                        }
                         succeeded += 1;
                     } else {
                         failures.push(RecomputeFailure {
@@ -346,6 +374,176 @@ impl<'a> WorkbookRuntime<'a> {
             simd_classified: 0,
             changed_cells,
         }
+    }
+
+    /// **FE-9.x (2026-06-14):** re-extract aliased readers in the (old, new) spill
+    /// footprint against the LOCAL `session`. `recompute_dirty` `take()`s
+    /// `self.graph` into a local for its session_slot window, so the graph-based
+    /// [`reextract_spill_footprint_readers`] (which reads `self.graph`) is `None`
+    /// there — this variant takes the session explicitly. SHARED by the Ok arm (a
+    /// spill grew/shrank/dissolved) AND the error arms (a previously-spilled anchor
+    /// going `#NAME?`/`#CIRC!` dissolves its body). Mirrors `set_formula`'s 4.7.J.4:
+    /// a reader producer-aliased to the anchor must re-route its dep back to the
+    /// now-literal target cell, or a FUTURE write to that freed target misses the
+    /// reader. Collect-then-mutate (the `readers_in_rect` borrow is released before
+    /// the re-bind / `reextract_deps` loop — see Codex Q5).
+    ///
+    /// [`reextract_spill_footprint_readers`]: WorkbookRuntime::reextract_spill_footprint_readers
+    fn reextract_footprint_readers_session(
+        &mut self,
+        session: &mut crate::calcgraph_session::CalcgraphSession,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        shapes: [Option<SpillShape>; 2],
+    ) {
+        use std::collections::HashSet;
+        let mut seen: HashSet<ql_calcgraph::NodeId> = HashSet::new();
+        let mut readers: Vec<(ql_calcgraph::NodeId, SheetId, RowId, ColId, Arc<str>)> = Vec::new();
+        for shape in shapes.into_iter().flatten() {
+            for n in session.readers_in_rect(sheet, row, col, shape.rows, shape.cols) {
+                if !seen.insert(n) {
+                    continue;
+                }
+                let Some((s, r, c)) = session.cell_address_for(n) else {
+                    continue;
+                };
+                if (s, r, c) == (sheet, row, col) {
+                    continue;
+                }
+                let Some(text) = self.workbook.formula_at(s, r, c).cloned() else {
+                    continue;
+                };
+                readers.push((n, s, r, c, text));
+            }
+        }
+        for (rn, reader_sheet, reader_row, reader_col, reader_text) in readers {
+            let name_gen = self.workbook.names().generation();
+            let fn_gen = self.registry.fn_generation();
+            // **W5-150 (Phase 4.9.O HIGH-1):** cell-aware key when `@` is present.
+            let cell_anchor = if reader_text.contains('@') {
+                Some((reader_row, reader_col))
+            } else {
+                None
+            };
+            let cache_key = PlanCacheKey {
+                text: Arc::clone(&reader_text),
+                sheet: reader_sheet,
+                name_gen,
+                fn_gen,
+                cell_anchor,
+            };
+            let workbook: &Workbook = self.workbook;
+            let plan: Arc<crate::plan::ExprPlan> = match self
+                .plan_cache
+                .get_or_insert::<_, RuntimeError>(cache_key, || {
+                    let tokens = lex(reader_text.as_ref())?;
+                    let expr = parse(tokens)?;
+                    // **W5-114 (Phase 4.8.E):** reader cell addr.
+                    Ok(bind_with_site(
+                        &expr,
+                        BindSite::at_cell(ql_types::Address::new(
+                            reader_sheet,
+                            reader_row,
+                            reader_col,
+                        )),
+                        workbook,
+                        workbook,
+                        workbook,
+                        self.registry,
+                    )?)
+                }) {
+                Ok(p) => p,
+                Err(_) => {
+                    // No-fallbacks rule: bind failure here mirrors set_formula's
+                    // mark_dirty handling — surface at the reader's own recompute.
+                    session.mark_dirty(rn);
+                    continue;
+                }
+            };
+            session.reextract_deps(rn, plan.as_ref(), self.workbook, self.registry);
+            session.mark_dirty(rn);
+        }
+    }
+
+    /// **FE-9.x (2026-06-14):** dissolve a spill whose anchor is going to an ERROR
+    /// (`#NAME?`/`#CIRC!`) on the `recompute_dirty` (session-attached) path, UNIFORMLY
+    /// for both error arms. If the cell anchors a spill: clear the footprint
+    /// (overlays + map), record each non-anchor body cell into `changed`, dirty the
+    /// body readers AND the anchor's aliased readers (`on_set_value`), and re-extract
+    /// those readers' deps off the dissolved anchor ([`reextract_footprint_readers_session`]).
+    /// Returns `true` iff a spill was dissolved — the caller MUST then write the error
+    /// value UNCONDITIONALLY, because `clear_spill_at` blanks the anchor overlay
+    /// ([`workbook.rs` clear loop includes dr=0,dc=0]) so a VEQ skip would strand the
+    /// anchor Blank (gap 1: `prior` is captured BEFORE dissolution). A 1×1 registered
+    /// spill (no body) still returns `true` → the anchor is force-rewritten.
+    ///
+    /// [`reextract_footprint_readers_session`]: WorkbookRuntime::reextract_footprint_readers_session
+    fn dissolve_errored_spill_dirty(
+        &mut self,
+        session: &mut crate::calcgraph_session::CalcgraphSession,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        changed: &mut std::collections::HashSet<(SheetId, RowId, ColId)>,
+    ) -> bool {
+        let Some(old_shape) = self.workbook.spill_anchor_at(sheet, row, col).copied() else {
+            return false;
+        };
+        self.workbook.clear_spill_if_present((sheet, row, col));
+        for dr in 0..old_shape.rows {
+            for dc in 0..old_shape.cols {
+                if dr == 0 && dc == 0 {
+                    continue;
+                }
+                changed.insert((sheet, row + dr, col + dc));
+                // Dirty readers of the now-Blank target so they re-evaluate within
+                // this fixed-point loop.
+                session.on_set_value(sheet, row + dr, col + dc);
+            }
+        }
+        // Dirty readers producer-aliased to the anchor itself (4.7.I) — same as the
+        // Ok arm's `on_set_value(anchor)`.
+        session.on_set_value(sheet, row, col);
+        // Gap 2: re-route those aliased readers' deps off the dissolved anchor back
+        // to the now-literal body cells (on_set_value alone only dirties for THIS
+        // pass; it does not rewrite the dep edges for future writes).
+        self.reextract_footprint_readers_session(session, sheet, row, col, [Some(old_shape), None]);
+        true
+    }
+
+    /// **FE-9.x (2026-06-14):** the `recompute_all` (no-`take` of `self.graph`)
+    /// counterpart of [`dissolve_errored_spill_dirty`]. Clears the footprint
+    /// (overlays + map) and records each non-anchor body cell into `out` (folded into
+    /// `changed_cells` so `snapshot_delta` reports the removed body). Returns the OLD
+    /// shape so the caller can re-extract aliased readers via the graph-based
+    /// [`reextract_spill_footprint_readers`] (which no-ops ONLY on the standalone
+    /// `WorkbookRuntime::new` load path where no graph is attached; it FIRES on the live
+    /// `recalc_all` AND the product `open`/`rematerialize` paths, where the persistent
+    /// graph is attached — correctly routing readers to/from materialized/dissolved
+    /// anchors; Codex RESHAPE). No VEQ on this path, so the caller writes the error
+    /// value unconditionally.
+    ///
+    /// [`dissolve_errored_spill_dirty`]: WorkbookRuntime::dissolve_errored_spill_dirty
+    /// [`reextract_spill_footprint_readers`]: WorkbookRuntime::reextract_spill_footprint_readers
+    fn dissolve_errored_spill_all(
+        &mut self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        out: &mut Vec<(SheetId, RowId, ColId)>,
+    ) -> Option<SpillShape> {
+        let old_shape = self.workbook.spill_anchor_at(sheet, row, col).copied()?;
+        self.workbook.clear_spill_if_present((sheet, row, col));
+        for dr in 0..old_shape.rows {
+            for dc in 0..old_shape.cols {
+                if dr == 0 && dc == 0 {
+                    continue;
+                }
+                out.push((sheet, row + dr, col + dc));
+            }
+        }
+        Some(old_shape)
     }
 
     /// **Engine Phase 3.4 (2026-05-12) — W5-37 SCH-3-01..04 entry
@@ -456,31 +654,17 @@ impl<'a> WorkbookRuntime<'a> {
                 let Some((sheet, row, col)) = session.cell_address_for(*node) else {
                     continue;
                 };
-                // **H3 (6.3-0, audit HIGH-2):** if this cell ANCHORED a spill that
-                // is now becoming `#CIRC!`, dissolve the old footprint and record
-                // its non-anchor targets. The cycled branch previously wrote
-                // `#CIRC!` at the anchor but NEVER cleared the spill (unlike
-                // `recompute_all`'s cycle pre-pass) — leaving stale target overlays
-                // in storage AND absent from `snapshot_delta`. Reachable when an
-                // anchor enters a cycle via a recompute (e.g. a dependency edit
-                // makes the formula cyclic), not a direct edit. Mirrors the
-                // dissolution recording of the sorted-spill branch below.
-                if let Some(old_shape) = self.workbook.spill_anchor_at(sheet, row, col).copied() {
-                    self.workbook.clear_spill_if_present((sheet, row, col));
-                    for dr in 0..old_shape.rows {
-                        for dc in 0..old_shape.cols {
-                            if dr == 0 && dc == 0 {
-                                continue;
-                            }
-                            changed.insert((sheet, row + dr, col + dc));
-                            // Dirty readers of the now-Blank target so they
-                            // re-evaluate within this fixed-point loop.
-                            session.on_set_value(sheet, row + dr, col + dc);
-                        }
-                    }
-                }
+                // **H3 (6.3-0) / FE-9.x (2026-06-14):** if this cell ANCHORED a spill
+                // now becoming `#CIRC!`, dissolve it UNIFORMLY via the shared helper
+                // (records the body, dirties body + aliased-anchor readers, AND
+                // re-extracts those readers' deps). The cycled branch previously
+                // dissolved the body but did NOT re-extract aliased readers (gap 2),
+                // nor force the anchor write past VEQ (gap 1). Reachable when an anchor
+                // enters a cycle via a recompute (a dependency edit makes it cyclic).
+                let dissolved =
+                    self.dissolve_errored_spill_dirty(session, sheet, row, col, &mut changed);
                 let prior_val = prior.get(&(sheet, row, col));
-                if prior_val == Some(&circ) {
+                if !dissolved && prior_val == Some(&circ) {
                     skipped_value_equality += 1;
                 } else {
                     self.workbook.put_computed_at(sheet, row, col, circ.clone());
@@ -642,103 +826,19 @@ impl<'a> WorkbookRuntime<'a> {
                             // Anchor cell — dirties aliased readers.
                             session.on_set_value(sheet, row, col);
 
-                            // **Codex audit HIGH-2 closure**: re-extract
-                            // readers in the (old, new) footprint. Mirrors
-                            // set_formula's 4.7.J.4 pattern. Required for
-                            // dissolution-via-recompute: aliased readers'
-                            // deps stay pointing at the dissolved anchor;
-                            // future writes to actually-read cells (e.g.
-                            // user typing into a now-free target) miss
-                            // the reader without re-extraction.
-                            //
-                            // Inlined (can't call self.reextract_spill_footprint_readers
-                            // because it accesses self.graph which is None
-                            // during recompute_dirty's session_slot window).
-                            let mut seen: HashSet<ql_calcgraph::NodeId> = HashSet::new();
-                            let mut readers: Vec<(
-                                ql_calcgraph::NodeId,
-                                SheetId,
-                                RowId,
-                                ColId,
-                                Arc<str>,
-                            )> = Vec::new();
-                            for shape in [old_spill_shape, new_spill_shape].into_iter().flatten() {
-                                for n in
-                                    session.readers_in_rect(sheet, row, col, shape.rows, shape.cols)
-                                {
-                                    if !seen.insert(n) {
-                                        continue;
-                                    }
-                                    let Some((s, r, c)) = session.cell_address_for(n) else {
-                                        continue;
-                                    };
-                                    if (s, r, c) == (sheet, row, col) {
-                                        continue;
-                                    }
-                                    let Some(text) = self.workbook.formula_at(s, r, c).cloned()
-                                    else {
-                                        continue;
-                                    };
-                                    readers.push((n, s, r, c, text));
-                                }
-                            }
-                            for (rn, reader_sheet, reader_row, reader_col, reader_text) in readers {
-                                let name_gen = self.workbook.names().generation();
-                                let fn_gen = self.registry.fn_generation();
-                                // **W5-150 (Phase 4.9.O HIGH-1):** cell-aware key when `@`
-                                // is present.
-                                let cell_anchor = if reader_text.contains('@') {
-                                    Some((reader_row, reader_col))
-                                } else {
-                                    None
-                                };
-                                let cache_key = PlanCacheKey {
-                                    text: Arc::clone(&reader_text),
-                                    sheet: reader_sheet,
-                                    name_gen,
-                                    fn_gen,
-                                    cell_anchor,
-                                };
-                                let workbook: &Workbook = self.workbook;
-                                let plan: Arc<crate::plan::ExprPlan> =
-                                    match self.plan_cache.get_or_insert::<_, RuntimeError>(
-                                        cache_key,
-                                        || {
-                                            let tokens = lex(reader_text.as_ref())?;
-                                            let expr = parse(tokens)?;
-                                            // **W5-114 (Phase 4.8.E):** reader cell addr.
-                                            Ok(bind_with_site(
-                                                &expr,
-                                                BindSite::at_cell(ql_types::Address::new(
-                                                    reader_sheet,
-                                                    reader_row,
-                                                    reader_col,
-                                                )),
-                                                workbook,
-                                                workbook,
-                                                workbook,
-                                                self.registry,
-                                            )?)
-                                        },
-                                    ) {
-                                        Ok(p) => p,
-                                        Err(_) => {
-                                            // No-fallbacks rule: bind failure
-                                            // here mirrors set_formula path's
-                                            // mark_dirty handling — surface at
-                                            // reader's own recompute next time.
-                                            session.mark_dirty(rn);
-                                            continue;
-                                        }
-                                    };
-                                session.reextract_deps(
-                                    rn,
-                                    plan.as_ref(),
-                                    self.workbook,
-                                    self.registry,
-                                );
-                                session.mark_dirty(rn);
-                            }
+                            // **Codex audit HIGH-2 closure / FE-9.x (2026-06-14):**
+                            // re-extract readers in the (old, new) footprint so an
+                            // aliased reader's dep doesn't stay pointing at a
+                            // dissolved/reshaped anchor (a future write to a freed
+                            // target would otherwise miss it). Extracted into the
+                            // session-based helper SHARED with the error arms.
+                            self.reextract_footprint_readers_session(
+                                session,
+                                sheet,
+                                row,
+                                col,
+                                [old_spill_shape, new_spill_shape],
+                            );
                         }
                         succeeded += 1;
                     }
@@ -778,8 +878,22 @@ impl<'a> WorkbookRuntime<'a> {
                         ) = &error
                         {
                             let v = Value::Error(ErrorValue::Name);
+                            // **FE-9.x (2026-06-14):** dissolve a previously-spilled
+                            // body before writing `#NAME?`, uniformly with the `#CIRC!`
+                            // branch. `dissolved` forces the anchor write past VEQ:
+                            // `clear_spill_at` blanked the anchor overlay, so a VEQ skip
+                            // (when `prior` already held `#NAME?`) would strand the
+                            // anchor Blank (gap 1). When not previously spilled, VEQ is
+                            // preserved (no spurious change record / write).
+                            let dissolved = self.dissolve_errored_spill_dirty(
+                                session,
+                                sheet,
+                                row,
+                                col,
+                                &mut changed,
+                            );
                             let prior_val = prior.get(&(sheet, row, col));
-                            if prior_val == Some(&v) {
+                            if !dissolved && prior_val == Some(&v) {
                                 skipped_value_equality += 1;
                             } else {
                                 self.workbook.put_computed_at(sheet, row, col, v);
@@ -1473,6 +1587,58 @@ mod tests {
         );
     }
 
+    /// **FE-9.x (2026-06-14) — gap 1: dissolution forces the anchor error-write past
+    /// VEQ.** Manufactures the residual inconsistent state a buggy pre-fix pass could
+    /// leave — a registered spill whose anchor overlay ALREADY holds `#NAME?` — then
+    /// triggers a bind-error recompute. `clear_spill_at` blanks the anchor overlay,
+    /// and `prior` was captured as `#NAME?` BEFORE dissolution, so a naive VEQ skip
+    /// (`prior == #NAME?`) would strand the anchor Blank. The `!dissolved` guard must
+    /// force the write. Also pins a multi-cell body clear + anchor unregister.
+    #[test]
+    fn recompute_dirty_name_error_forces_anchor_write_past_veq() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // A formula that binds to `UnresolvedName` → routes to the `#NAME?` Err arm.
+        wb.put_formula(0, 0, 0, "MISSINGNAME");
+        // Manufacture the residual inconsistent state: a registered 1×3 spill at A1
+        // whose anchor overlay already shows `#NAME?` and whose body B1/C1 hold stale
+        // spilled values.
+        wb.register_spill((0, 0, 0), ql_storage::SpillShape { rows: 1, cols: 3 })
+            .unwrap();
+        wb.put_computed_at(0, 0, 0, Value::Error(ErrorValue::Name));
+        wb.put_computed_at(0, 0, 1, Value::Number(98.0));
+        wb.put_computed_at(0, 0, 2, Value::Number(97.0));
+        let mut graph = CalcgraphSession::rebuild_from_workbook(&wb).session;
+        let a1 = graph.cell_node_for(0, 0, 0).expect("A1 node");
+        graph.mark_dirty(a1);
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.is_complete(), "recompute failures: {result:?}");
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::Name),
+            "FE-9.x gap-1: dissolution must FORCE the #NAME? write even when prior == #NAME? \
+             (a VEQ skip would strand the anchor Blank)"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Blank,
+            "FE-9.x: dissolved body B1 must be cleared (not stale 98)"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 2)),
+            Value::Blank,
+            "FE-9.x: dissolved body C1 must be cleared (not stale 97)"
+        );
+        assert!(
+            wb.spill_anchor_at(0, 0, 0).is_none(),
+            "FE-9.x: the spill anchor must be unregistered after dissolution"
+        );
+    }
+
     // ===== Phase 2B.2 — RecomputeResult contract =====
 
     /// R2B-01: a structural failure surfaces with the exact cell address +
@@ -1518,10 +1684,10 @@ mod tests {
         wb.put_formula(0, 2, 0, "A1 * 2"); // good
         wb.put_formula(0, 3, 0, "A1 - 5"); // good
         wb.put_formula(0, 4, 0, "((("); // parse error
-        // FE-9: `@bogus` is no longer a failure — post-W5-143 `@` is implicit
-        // intersection, so `@bogus` is an UnresolvedName bind error that now maps
-        // to #NAME? (a success). Use a genuine LEX error (backtick) to keep this
-        // test's "2 structural failures, no short-circuit" intent.
+                                        // FE-9: `@bogus` is no longer a failure — post-W5-143 `@` is implicit
+                                        // intersection, so `@bogus` is an UnresolvedName bind error that now maps
+                                        // to #NAME? (a success). Use a genuine LEX error (backtick) to keep this
+                                        // test's "2 structural failures, no short-circuit" intent.
         wb.put_formula(0, 5, 0, "`bogus"); // lex error (invalid character)
 
         let reg = default_registry();
@@ -1564,7 +1730,7 @@ mod tests {
         assert_eq!(result.succeeded, 1); // the UnresolvedName cell -> #NAME?
         assert_eq!(result.failed_count(), 2); // lex + parse only
         assert!(!result.is_complete()); // 2 structural failures remain
-        // FE-9: the unknown-name formula now carries #NAME?, not a stale value.
+                                        // FE-9: the unknown-name formula now carries #NAME?, not a stale value.
         assert_eq!(
             wb.read(ql_types::Address::new(0, 0, 2)),
             Value::Error(ErrorValue::Name)
