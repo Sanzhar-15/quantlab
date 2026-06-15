@@ -316,12 +316,12 @@ body {
 }
 
 .cell-grid-name-box {
+	/* FE-11: an EDITABLE <input> (was a display <span>). Centre the A1 ref like the old span and strip the
+	 * browser chrome so it reads like part of the formula bar. */
 	flex: 0 0 auto;
 	min-width: 72px;
 	box-sizing: border-box;
-	display: inline-flex;
-	align-items: center;
-	justify-content: center;
+	text-align: center;
 	padding: 2px 8px;
 	font-family: var(--vscode-font-family);
 	font-size: 12px;
@@ -329,6 +329,39 @@ body {
 	background: var(--vscode-editorWidget-background, var(--vscode-input-background));
 	border: 1px solid var(--vscode-panel-border);
 	border-radius: 3px;
+}
+
+/* FE-11: an ACTIVE name-box edit gets the Quantlab accent border (matching the formula input) and drops the
+ * browser's default focus outline so the two surfaces read consistently. */
+.cell-grid-name-box:focus {
+	outline: none;
+	border-color: var(--ql-accent);
+}
+
+/* FE-11: the name box dropdown button (opens the Go-To-Name QuickPick). A flat icon button matching the
+ * formula bar chrome -- transparent until hover, the arrow glyph in the normal foreground. */
+.cell-grid-name-box-dd {
+	flex: 0 0 auto;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	padding: 0 1px;
+	border: none;
+	background: transparent;
+	color: var(--vscode-foreground);
+	cursor: pointer;
+	border-radius: 3px;
+}
+
+.cell-grid-name-box-dd:hover {
+	background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+.cell-grid-name-box-dd svg {
+	width: 18px;
+	height: 18px;
+	fill: currentColor;
 }
 
 /* W-G bound-cell name display: a chip naming the reactive variable that drives the active cell. Sits

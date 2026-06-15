@@ -265,7 +265,18 @@ root.innerHTML =
 	// display-mode default; `beginEditFormula` clears it). Enter commits through the SAME commit machinery
 	// as the in-cell editor (single writer); Esc reverts.
 	'<div class="cell-grid-formula-bar" id="sheets-formula-bar">' +
-	'<span class="cell-grid-name-box" id="sheets-name-box" title="Selected cell"></span>' +
+	// FE-11: the name box is EDITABLE (Excel's name box) -- `readonly` by default (display: the active
+	// cell's A1 ref); focusing it enters an edit. Enter submits (go to a name/ref, or define a name over the
+	// selection); Esc/blur reverts. It is a SELF-CONTAINED input -- NOT part of `editState` (it never writes a
+	// cell), so it can never be committed-as-a-cell; its only tie to the cell editor is resolving an open one
+	// when it takes focus (see the name-box listeners + `resolveEditForNativeSurface`).
+	'<input type="text" class="cell-grid-name-box" id="sheets-name-box" readonly spellcheck="false" ' +
+	'autocomplete="off" autocorrect="off" autocapitalize="off" ' +
+	'aria-label="Name box -- type a defined name or a cell reference like B5 or Sheet2!C3 and press Enter to go there, or select a range and type a new name to define it" ' +
+	'title="Name box -- go to a name or reference, or define a name over the selection" />' +
+	// FE-11: the name box dropdown -- Excel's "pick a defined name" control. Opens the host Go-To-Name QuickPick
+	// (lists every go-to-able name); reuses the existing command via the toolbar bridge (no new data flow).
+	'<button type="button" class="cell-grid-name-box-dd" id="sheets-name-box-dropdown" title="Go to a defined name" aria-label="Go to a defined name">' + ICONS.arrow_drop_down + '</button>' +
 	// W-G bound-cell name display: an always-visible chip naming the reactive variable that drives the
 	// active cell (shown only when the active cell is a published target; `hidden` otherwise).
 	'<span class="cell-grid-published-chip" id="sheets-published-chip" hidden></span>' +
@@ -298,7 +309,7 @@ root.innerHTML =
 const titleEl = document.getElementById('sheets-title') as HTMLElement;
 const metaEl = document.getElementById('sheets-meta') as HTMLElement;
 const errorEl = document.getElementById('sheets-error') as HTMLElement;
-const nameBoxEl = document.getElementById('sheets-name-box') as HTMLElement;
+const nameBoxEl = document.getElementById('sheets-name-box') as HTMLInputElement;
 const publishedChipEl = document.getElementById('sheets-published-chip') as HTMLElement;
 const formulaInputEl = document.getElementById('sheets-formula-input') as HTMLInputElement;
 const viewportEl = document.getElementById('sheets-viewport') as HTMLElement;
@@ -369,7 +380,11 @@ type ToolbarCommand =
 	| 'saveAs'
 	| 'openWorkbook'
 	| 'showDepGraph'
-	| 'showLivePython';
+	| 'showLivePython'
+	// FE-11: the Data menu's "Name Manager…" / "Go to Name…" + the name box dropdown -- reveal the existing host
+	// commands (the host whitelist in cellGridLogic.ts maps these to quantbookNameManager/quantbookGoToName).
+	| 'nameManager'
+	| 'goToName';
 
 /** The engine's number-format preset ids (the host contract's `setNumberFormat.preset`). There is NO
  * 'Scientific' -- the engine preset list does not have it; offering it would be a dead entry
@@ -546,6 +561,12 @@ const MENUBAR_MENUS: ReadonlyArray<{ readonly id: string; readonly entries: read
 		entries: [
 			{ label: 'Dependencies', run: () => postToolbarCommand('showDepGraph') },
 			{ label: 'Live Python', run: () => postToolbarCommand('showLivePython') },
+			// FE-11: defined-name management. Both reveal the existing host commands (palette-only before
+			// this) via the toolbar-command bridge; they route through `activateMenuItem` ->
+			// `runAfterResolvingEdit`, so opening either resolves any open editor first.
+			'separator',
+			{ label: 'Name Manager…', run: () => postToolbarCommand('nameManager') },
+			{ label: 'Go to Name…', run: () => postToolbarCommand('goToName') },
 		],
 	},
 ];
@@ -1552,6 +1573,12 @@ interface EditState {
 	submittedRawInput?: string;
 }
 let editState: EditState | null = null;
+// **FE-11**: whether the name box is the live editor (the user is typing a name/reference into it). The name
+// box is deliberately OUTSIDE `editState` (it never writes a cell -- so it can never be mis-committed as one),
+// so this small flag is its entire edit state. Declared BEFORE the `updateFormulaBar()` seed below, which
+// reads it (the W-G-1b init-order lesson: esbuild hoists `let` to an undefined `var`, so a later declaration
+// would read `undefined` here -- harmlessly falsy, but we keep it correct).
+let nameBoxEditing = false;
 // Seed the formula bar with the initial selection (A1, empty content) before the first render arrives.
 // **W-G-1b**: this MUST run AFTER `editState` is initialized -- `updateFormulaBar` now reads `editState`,
 // and esbuild down-levels the module-level `let` to a hoisted `var` (undefined until this point), so calling
@@ -2752,11 +2779,16 @@ function updateFormulaBar(): void {
 		return;
 	}
 	if (active === null) {
-		nameBoxEl.textContent = '';
+		// FE-11: never overwrite the name box while it is the live editor (mirror the formula-bar guard above).
+		if (!nameBoxEditing) {
+			nameBoxEl.value = '';
+		}
 		formulaInputEl.value = '';
 		return;
 	}
-	nameBoxEl.textContent = cellRefA1(active.row, active.col);
+	if (!nameBoxEditing) {
+		nameBoxEl.value = cellRefA1(active.row, active.col);
+	}
 	const entry = fullSnapshot === null ? undefined : renderer.entryAt(active.row, active.col);
 	const content = priorCellContent(entry);
 	formulaInputEl.value = content.oversize ? '(value too large to display)' : content.text;
@@ -2905,6 +2937,68 @@ function beginEditFormula(): void {
 	ensureFunctionListRequested();
 	scheduleValidate();
 	updateSignatureHint();
+}
+
+// ============================================================================
+// FE-11 name box -- the editable Excel-style reference field.
+//
+// It is a SELF-CONTAINED native input, deliberately OUTSIDE the `editState` single-cell-writer machine: it
+// never writes a cell, so it can never be committed-as-a-cell (the trap a third `editState` surface would
+// create -- a chrome action resolving it via commitEdit would otherwise write a CELL). Its ONLY tie to the
+// cell editor is RESOLVING an open one when it takes focus (a competing native surface -- exactly what
+// `resolveEditForNativeSurface` exists for; the same seam the right-click context menu uses).
+//
+// Enter SUBMITS (post `nameBoxSubmit`; the host routes go-to / define / error). Esc reverts + returns focus to
+// the grid. Blur reverts WITHOUT stealing focus (Excel: a name-box blur abandons typed text -- only Enter
+// commits; this asymmetry vs the formula bar's blur-commit is intentional, so a blur can never silently
+// define a name). The webview NEVER navigates/mutates here -- the host decides, and any resulting `navigateTo`
+// re-enters through the existing handler.
+// ============================================================================
+
+/** Enter name-box edit mode: flip it editable + select its text for easy overwrite. No-op if already editing
+ * or nothing is selected (there is no cell to navigate from / range to define over). */
+function beginNameBoxEdit(): void {
+	if (nameBoxEditing || fullSnapshot === null || active === null) {
+		return;
+	}
+	nameBoxEditing = true;
+	nameBoxEl.readOnly = false;
+	nameBoxEl.select();
+}
+
+/** Leave name-box edit mode: flip it back to read-only display and restore the active cell's A1 ref. Does NOT
+ * move focus (the caller decides). */
+function endNameBoxEdit(): void {
+	if (!nameBoxEditing) {
+		return;
+	}
+	nameBoxEditing = false;
+	nameBoxEl.readOnly = true;
+	updateFormulaBar(); // nameBoxEditing is now false, so this writes the display value through
+}
+
+/** Abandon the typed text (Esc) and return focus to the grid. */
+function revertNameBox(): void {
+	endNameBoxEdit();
+	viewportEl.focus();
+}
+
+/** Submit the name box (Enter): post a `nameBoxSubmit` for the host to route. Empty text reverts. */
+function submitNameBox(): void {
+	if (!nameBoxEditing) {
+		return;
+	}
+	const text = nameBoxEl.value.trim();
+	if (text.length === 0 || fullSnapshot === null || active === null) {
+		revertNameBox();
+		return;
+	}
+	const anc = anchor ?? active;
+	const sheet = fullSnapshot.sheet;
+	const selection = { anchorRow: anc.row, anchorCol: anc.col, focusRow: active.row, focusCol: active.col };
+	endNameBoxEdit();
+	viewportEl.focus();
+	vscode.postMessage({ type: 'nameBoxSubmit', text, sheet, selection });
 }
 
 // ============================================================================
@@ -3688,6 +3782,46 @@ formulaInputEl.addEventListener('blur', onEditBlur);
 formulaInputEl.addEventListener('focus', () => {
 	beginEditFormula();
 });
+// FE-11 name box -- DEDICATED listeners (it must NOT use the shared onEditInput/onEditKeydown/onEditBlur,
+// which write cells). On focus, resolve any open cell editor first (a competing native surface); on Enter
+// submit; on Esc revert + refocus the grid; on blur revert WITHOUT stealing focus.
+nameBoxEl.addEventListener('focus', () => {
+	// resolveEditForNativeSurface returns false ONLY when a cell commit is in flight: then it has already
+	// re-focused the cell editor, so we just decline to open the name box until that commit resolves.
+	if (!resolveEditForNativeSurface('click the name box again once the edit is saved.')) {
+		return;
+	}
+	beginNameBoxEdit();
+});
+nameBoxEl.addEventListener('keydown', ev => {
+	if (!nameBoxEditing) {
+		return;
+	}
+	if (ev.key === 'Enter') {
+		ev.preventDefault();
+		ev.stopPropagation();
+		submitNameBox();
+	} else if (ev.key === 'Escape') {
+		ev.preventDefault();
+		ev.stopPropagation();
+		revertNameBox();
+	}
+});
+nameBoxEl.addEventListener('blur', () => {
+	// Excel: a name-box blur ABANDONS the typed text (only Enter commits). submit/revert already cleared
+	// `nameBoxEditing` before moving focus, so this fires only for a focus that left WITHOUT Enter/Esc
+	// (clicking a cell, a menu, opening a QuickPick). endNameBoxEdit does NOT steal focus (it goes where the
+	// user clicked).
+	if (nameBoxEditing) {
+		endNameBoxEdit();
+	}
+});
+// FE-11: the name box dropdown opens the host Go-To-Name QuickPick. Routed through runAfterResolvingEdit (like every
+// chrome control) so any open CELL editor resolves first; an open name-box edit blurs+reverts on the click.
+const nameBoxDropdownEl = document.getElementById('sheets-name-box-dropdown') as HTMLButtonElement;
+nameBoxDropdownEl.addEventListener('click', () => {
+	runAfterResolvingEdit('Go to name', () => postToolbarCommand('goToName'));
+});
 // W2 formula intelligence -- explicit trigger + caret-tracking + focus-out cleanup on the FORMULA BAR only.
 // Ctrl/Cmd+Space opens the dropdown with the full list (the empty-prefix affordance) at the caret. This is a
 // keydown (it must preventDefault before the browser inserts a space) and runs BEFORE onEditKeydown's
@@ -4281,6 +4415,15 @@ document.addEventListener('keydown', ev => {
 	// drive grid navigation / clear / type-to-edit on the active cell while the user is in the formula bar
 	// (Codex W-G HIGH). Copy (Ctrl+C of a selected formula) still works: the browser handles it natively.
 	if (ev.target === formulaInputEl) {
+		return;
+	}
+	// FE-11: the name box input is focusable + editable. Like the formula bar (above), its keystrokes bubble
+	// to this document handler -- ignore them, or arrows/Backspace/printable keys would drive grid nav / clear
+	// / type-to-edit the active cell while the user is typing a NAME (the same Codex W-G HIGH class, and a
+	// silent-cell-write hazard since the name box is NOT in `editState`, so the `editState !== null` guard
+	// below does NOT catch it). Enter/Escape are handled (and stopPropagation'd) by the name box's own
+	// listener; F3 above is intentionally focus-independent, matching the formula bar.
+	if (ev.target === nameBoxEl) {
 		return;
 	}
 	// Round 5: the find bar owns its own keys (Enter/Shift+Enter/Esc) -- never drive grid nav from them.

@@ -1252,6 +1252,17 @@
           "group": "6_names@1"
         },
         {
+          "_comment": "FE-11: surface the existing Name Manager / Go-To-Name commands in the grid right-click (they were palette-only). Same 6_names group + same when as Define Name.",
+          "command": "quantlab.quantbookNameManager",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "6_names@2"
+        },
+        {
+          "command": "quantlab.quantbookGoToName",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "6_names@3"
+        },
+        {
           "_comment": "FE-8: structured-table lifecycle from the grid right-click. Group 7_table (after 6_names). Create reads the right-clicked selection as the footprint; Rename/Drop resolve the table CONTAINING the right-clicked cell (tableAtCell), else open a QuickPick. The host commands accept the data-vscode-context payload (panelToken + selection).",
           "command": "quantlab.quantbookCreateTable",
           "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
@@ -1275,6 +1286,13 @@
         "command": "quantlab.quantbookReplaceAll",
         "key": "ctrl+h",
         "mac": "cmd+h",
+        "when": "activeWebviewPanelId == 'quantlab.quantbookCellGrid'"
+      },
+      {
+        "_comment": "FE-11: Name Manager in the focused Cell Grid. Ctrl+F3 (Cmd+F3 on mac), Excel's Name Manager chord. The editor binds Ctrl+F3 to Find-Next-Selection, but that is editor-focus-scoped (kbExpr EditorContextKeys.focus); THIS binding is scoped to the grid webview panel being active (activeWebviewPanelId == the grid viewType), and those contexts are mutually exclusive, so they never collide. Go-To-Name is left to the menu / palette / name box (avoids the F5/Ctrl+G conflicts).",
+        "command": "quantlab.quantbookNameManager",
+        "key": "ctrl+f3",
+        "mac": "cmd+f3",
         "when": "activeWebviewPanelId == 'quantlab.quantbookCellGrid'"
       },
       {

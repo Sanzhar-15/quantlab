@@ -42,8 +42,8 @@
 
 import * as vscode from 'vscode';
 
-import type { QuantbookCellSnapshot, SessionInstance, WorkbookSnapshotJson } from '../types';
-import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, parseToolbarCommandMessage, type CellsWrittenMessage, type CommitResultMessage, type FunctionListMessage, type GridSelection, type ToolbarFormatPreset, type ValidateFormulaResultMessage } from './cellGridLogic';
+import type { CellRangeJson, QuantbookCellSnapshot, SessionInstance, WorkbookSnapshotJson } from '../types';
+import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, parseNameBoxSubmitMessage, parseToolbarCommandMessage, type CellsWrittenMessage, type CommitResultMessage, type FunctionListMessage, type GridSelection, type ToolbarFormatPreset, type ValidateFormulaResultMessage } from './cellGridLogic';
 import { getNonce, getWebviewUri } from '../../utils/webview';
 import type { PublishedRange } from '../reactiveKernel/publishedCellsStore';
 // Demo-prep toolbar (2026-06-10): the webview toolbar's `setNumberFormat` applies a preset directly to
@@ -56,6 +56,11 @@ import { buildFormatUndoLabel, buildSetFormatOps, formatStringForPreset, presetL
 import { planFreezeAtSelection, type GridSelectionInput } from './contextMenuLogic';
 import { formatRangeTarget, normalizeSelectionRect } from '../reactiveNotebook/bindVariableLogic';
 import { recalcDirtyChecked } from '../session';
+// FE-11: the name box routes an operator submit to one of navigate / define / error. The pure router +
+// the goToAnchor resolver + the define-toast builder are reused verbatim (the host shell below is thin).
+import { routeNameBoxSubmit, type NameBoxAction } from './nameBoxLogic';
+import { goToAnchor } from './nameManagerLogic';
+import { buildDefineNameToast } from './nameDefineLogic';
 
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
 
@@ -1373,6 +1378,128 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **FE-11** -- handle a `{type:'nameBoxSubmit', text, sheet, selection}` message from this panel's name
+	 * box. The webview is UNTRUSTED: the payload is validated by the pure {@link parseNameBoxSubmitMessage}
+	 * chokepoint FIRST (a malformed payload is rejected LOUD, never routed). {@link routeNameBoxSubmit}
+	 * then decides -- against a FRESH `listNames()`/`listSheets()` read (name ops are delta-invisible, so a
+	 * cache would go stale) -- whether the entry is an existing name (navigate), an A1 ref (navigate), a new
+	 * name over the selection (define), or an error (loud). Navigation is panel-LOCAL ({@link switchToSheet}
+	 * + {@link navigateToCell}) -- the submit came from THIS panel's webview, so it acts on THIS grid (no
+	 * ExtensionContext / `show()` reveal needed, unlike the global Go-To-Name command).
+	 */
+	private handleNameBoxSubmit(raw: unknown): void {
+		const parsed = parseNameBoxSubmitMessage(raw);
+		if (parsed === undefined) {
+			// No-Fallbacks: an off-shape payload is surfaced, never silently dropped or routed.
+			console.warn(`[cellGrid] rejected nameBoxSubmit from the webview (malformed payload): ${JSON.stringify(raw)}`);
+			void vscode.window.showWarningMessage('Quantbook: the name box sent a malformed request -- it was not executed.');
+			return;
+		}
+		let action: NameBoxAction;
+		try {
+			const existingNames = this.session.listNames(); // FRESH: name ops are delta/epoch/token-invisible
+			const sheets = this.session.listSheets();
+			action = routeNameBoxSubmit(
+				parsed.text,
+				{ sheet: this.sheet, anchorRow: parsed.anchorRow, anchorCol: parsed.anchorCol, focusRow: parsed.focusRow, focusCol: parsed.focusCol },
+				existingNames,
+				sheets,
+			);
+		} catch (err) {
+			// routeNameBoxSubmit only throws on a genuine contract violation (e.g. buildNameRange on an
+			// out-of-extent selection from a tampered webview). Surface it loud (No-Fallbacks).
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error(`[cellGrid] nameBoxSubmit routing failed: ${detail}`);
+			void vscode.window.showErrorMessage(`Quantbook name box failed: ${detail}`);
+			return;
+		}
+		switch (action.kind) {
+			case 'navigate-name': {
+				let anchor;
+				try {
+					anchor = goToAnchor(action.name.target);
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					void vscode.window.showErrorMessage(`Quantbook name box failed: ${detail}`);
+					return;
+				}
+				if (anchor === undefined) {
+					// A constant/formula name has no grid anchor (No-Fallbacks: never fabricate an A1 landing).
+					void vscode.window.showInformationMessage(`Quantbook: "${action.name.name}" is a ${action.name.target.kind} name -- it has no cell to go to.`);
+					return;
+				}
+				this.navigateToAnchor(anchor.sheet, anchor.row, anchor.col);
+				return;
+			}
+			case 'navigate-ref':
+				this.navigateToAnchor(action.sheet, action.row, action.col);
+				return;
+			case 'define':
+				this.defineNameFromBox(action.name, action.range);
+				return;
+			case 'error':
+				void vscode.window.showErrorMessage(`Quantbook name box: ${action.reason}`);
+				return;
+			default: {
+				// Exhaustiveness guard (No-Fallbacks): a new action kind must fail loud, never be dropped.
+				const exhaustive: never = action;
+				throw new Error(`[cellGrid] unreachable name-box action: ${JSON.stringify(exhaustive)}`);
+			}
+		}
+	}
+
+	/**
+	 * **FE-11** -- move THIS panel's selection to `(row, col)` on `sheet`, switching the active sheet first
+	 * when the target lives elsewhere ({@link switchToSheet} validates the sheet is LIVE and throws on a
+	 * tombstone -- the deleted-target-sheet case surfaces loud rather than stranding the panel). A dropped
+	 * navigate message (pre-handshake / disposed) is surfaced, never a silent no-op.
+	 */
+	private navigateToAnchor(sheet: number, row: number, col: number): void {
+		try {
+			this.switchToSheet(sheet); // no-op if already on `sheet`; throws if the sheet is gone
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			void vscode.window.showErrorMessage(`Quantbook name box: ${detail}`);
+			return;
+		}
+		this.navigateToCell(row, col).then(
+			(delivered) => {
+				if (!delivered) {
+					void vscode.window.showWarningMessage('Quantbook: could not navigate (the grid did not accept the message). Click the grid, then retry.');
+				}
+			},
+			(err: unknown) => {
+				const detail = err instanceof Error ? err.message : String(err);
+				void vscode.window.showErrorMessage(`Quantbook name box navigation failed: ${detail}`);
+			},
+		);
+	}
+
+	/**
+	 * **FE-11** -- define a workbook name over `range` (the engine last-writer-wins upserts). Mirrors the
+	 * `quantlab.quantbookDefineName` command's apply + toast. `setName` is delta/epoch/token-invisible, so
+	 * there is NO grid refresh to do -- the confirmation toast is the only feedback (same contract as the
+	 * command). Every throw surfaces loud (No-Fallbacks).
+	 */
+	private defineNameFromBox(name: string, range: CellRangeJson): void {
+		try {
+			this.session.setName(name, range);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error(`[cellGrid] name box define "${name}" failed: ${detail}`);
+			void vscode.window.showErrorMessage(`Quantbook define name failed: ${detail}`);
+			return;
+		}
+		// Best-effort toast label: the sheet NAME + A1 range. The define already succeeded; a sheet-id that
+		// no longer resolves (a delete race) falls back to `#<id>` in the LABEL only -- the same dangling-
+		// target display convention nameManagerLogic.describeTarget uses, NOT an error mask.
+		const found = this.session.listSheets().find(s => s.id === range.sheet);
+		const sheetName = found?.name ?? `#${range.sheet}`;
+		const target = formatRangeTarget(sheetName, range.startRow, range.startCol, range.endRow, range.endCol);
+		void vscode.window.showInformationMessage(`${buildDefineNameToast(name, target)}.`);
+	}
+
+	/**
 	 * Thin wrapper around the vscode-free {@link dispatchIncomingMessage}. Lives
 	 * here (not in cellGridLogic.ts) because it captures `this`. The dispatcher
 	 * handles `putValue` (number/text/formula -> write -> recalc -> render),
@@ -1437,6 +1564,13 @@ export class CellGridPanel {
 			// off-whitelist is rejected LOUD (toast + console), never executed.
 			if (m.type === 'toolbarCommand') {
 				this.handleToolbarCommand(raw);
+				return;
+			}
+			// FE-11: intercept the name box's submit BEFORE delegating -- dispatchIncomingMessage would log
+			// it as an unknown type. handleNameBoxSubmit validates the UNTRUSTED payload against the pure
+			// parseNameBoxSubmitMessage chokepoint, then routes navigate/define/error.
+			if (m.type === 'nameBoxSubmit') {
+				this.handleNameBoxSubmit(raw);
 				return;
 			}
 		}

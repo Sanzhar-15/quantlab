@@ -2551,7 +2551,9 @@ export type ToolbarSimpleCommand =
 	| 'saveAs'
 	| 'openWorkbook'
 	| 'showDepGraph'
-	| 'showLivePython';
+	| 'showLivePython'
+	| 'nameManager'
+	| 'goToName';
 
 /**
  * The number-format presets the toolbar may apply: every {@link FormatPreset}
@@ -2596,6 +2598,13 @@ const TOOLBAR_SIMPLE_COMMAND_IDS: Record<ToolbarSimpleCommand, string> = {
 	// (No-Fallbacks), never a silent dead menu item.
 	showDepGraph: 'quantlab.depGraphView.focus',
 	showLivePython: 'quantlab.livePythonView.focus',
+	// FE-11: the name box's chrome (the Data menu's "Name Manager…" / "Go to Name…" items + the name
+	// box dropdown affordance) reveals the existing, fully-implemented host commands. These were palette-only
+	// (declared in package.json `commands` but in no menu/keybinding) -- the bridge makes them
+	// discoverable without a new command path. Both are argument-less (they resolve the focused grid +
+	// run their own QuickPick).
+	nameManager: 'quantlab.quantbookNameManager',
+	goToName: 'quantlab.quantbookGoToName',
 };
 
 /**
@@ -2668,4 +2677,58 @@ export function parseToolbarCommandMessage(raw: unknown): ParsedToolbarCommand |
 		return { kind: 'structural', command: m.command, commandId: TOOLBAR_STRUCTURAL_COMMAND_IDS[m.command] };
 	}
 	return undefined;
+}
+
+/**
+ * **FE-11**: a validated `nameBoxSubmit` message -- the operator-typed `text` plus the active sheet and
+ * the selection's two corners (flattened from the webview's `{selection:{...}}` envelope). The host
+ * passes this straight into `routeNameBoxSubmit`. Coordinates are 0-based grid indices.
+ */
+export interface ParsedNameBoxSubmit {
+	readonly text: string;
+	readonly sheet: number;
+	readonly anchorRow: number;
+	readonly anchorCol: number;
+	readonly focusRow: number;
+	readonly focusCol: number;
+}
+
+/** A non-negative integer (a 0-based grid coordinate or sheet id from the untrusted webview). */
+function isNonNegativeInteger(v: unknown): v is number {
+	return typeof v === 'number' && Number.isInteger(v) && v >= 0;
+}
+
+/**
+ * Validate a raw webview `nameBoxSubmit` message into a {@link ParsedNameBoxSubmit}, or `undefined` if
+ * anything is off-shape (No-Fallbacks: the panel surfaces the rejection loud; it NEVER routes a malformed
+ * submit). The webview is UNTRUSTED -- this is the single structural chokepoint before the (semantic)
+ * `routeNameBoxSubmit`. Rules: an object with `type === 'nameBoxSubmit'`, a string `text`, a
+ * non-negative-integer `sheet`, and a `selection` object whose four corners are non-negative integers.
+ * Extent (the A1 max rows/cols) is a SEMANTIC bound enforced downstream by the A1 parser / buildNameRange
+ * -- here we only guarantee the shape. Extraneous fields are tolerated (e.g. `webviewId`), matching the
+ * other webview envelopes. Pure; no vscode.
+ */
+export function parseNameBoxSubmitMessage(raw: unknown): ParsedNameBoxSubmit | undefined {
+	if (typeof raw !== 'object' || raw === null) {
+		return undefined;
+	}
+	const m = raw as { type?: unknown; text?: unknown; sheet?: unknown; selection?: unknown };
+	if (m.type !== 'nameBoxSubmit' || typeof m.text !== 'string' || !isNonNegativeInteger(m.sheet)) {
+		return undefined;
+	}
+	if (typeof m.selection !== 'object' || m.selection === null) {
+		return undefined;
+	}
+	const sel = m.selection as { anchorRow?: unknown; anchorCol?: unknown; focusRow?: unknown; focusCol?: unknown };
+	if (!isNonNegativeInteger(sel.anchorRow) || !isNonNegativeInteger(sel.anchorCol) || !isNonNegativeInteger(sel.focusRow) || !isNonNegativeInteger(sel.focusCol)) {
+		return undefined;
+	}
+	return {
+		text: m.text,
+		sheet: m.sheet,
+		anchorRow: sel.anchorRow,
+		anchorCol: sel.anchorCol,
+		focusRow: sel.focusRow,
+		focusCol: sel.focusCol,
+	};
 }

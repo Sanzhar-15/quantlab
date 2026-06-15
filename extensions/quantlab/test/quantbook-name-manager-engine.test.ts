@@ -160,22 +160,25 @@ suite('FE-5 W-N -- Name Manager engine contract (schema-2 dylib)', () => {
 		assert.deepStrictEqual(anchor, { sheet: sheetId, row: 3, col: 2 }, 'anchor is the top-left (C4) corner');
 	});
 
-	// **CLOSURE F1 (2026-06-12) -- ENGINE GROUND TRUTH for recalc-after-name-delete, PINNED.**
+	// **CLOSURE F1 (2026-06-12) -- ENGINE GROUND TRUTH for recalc-after-name-delete, UPDATED for FE-9 (2026-06-14).**
 	// The F1 fix adds `recalcDirtyChecked` + `refreshSession` after a name delete/rename/table-create so the
 	// panel reseeds from a fresh snapshot (mirroring the dropTable path). This test PINS what the engine
-	// actually does so the IDE behaviour and the tracked engine follow-up are both anchored to reality:
+	// actually does so the IDE behaviour stays anchored to reality:
 	//
 	//  - A formula's NAME reference is bound + resolved at `setFormula` time and the resolved value is cached.
-	//  - `deleteName` does NOT dirty the dependent: a `recalcDirty()` (and even `recalcAll()`) leaves the
-	//    dependent at its pre-delete value -- the engine does NOT re-bind a deleted name to #NAME?. So the
-	//    recalc the command now runs is correct + harmless but, on THIS engine, does NOT change the dependent
-	//    (the stale-name-binding is an ENGINE limitation tracked for the conductor; the IDE cannot heal it).
-	//  - A formula over a name that does NOT resolve is REJECTED at `setFormula` time (`formula_bind`), so a
-	//    "#NAME? until a name/table is created" state is UNREACHABLE via the IDE write path.
+	//  - **FE-9 (engine, 2026-06-14)**: `deleteName` now re-dirties the dependent, and the F1 recalc REBINDS the
+	//    now-unresolved name to `#NAME?` -- the dependent's FORMULA is preserved, only its VALUE becomes the
+	//    name error. This REPLACES the prior pinned "stale-name-binding" limitation (the engine used to leave
+	//    the dependent at its cached value; the IDE could not heal it). The F1 recalc the delete command runs
+	//    is exactly what surfaces the `#NAME?` now.
+	//  - A formula over a name that does NOT resolve is still REJECTED at `setFormula` time (`formula_bind`), so
+	//    a stored "#NAME? from the start" state is UNREACHABLE via the IDE write path; the ONLY way to reach
+	//    `#NAME?` is to delete a name a stored formula already depends on (exactly the case below).
 	//
-	// The test asserts the pinned (stale) behaviour, NOT a fictional #NAME?, so it stays green + documents the
-	// limitation; if a future engine starts re-binding on name delete, this test fails LOUD and is updated.
-	test('ENGINE GROUND TRUTH: a name-bound formula is resolved-at-write + NOT re-bound by deleteName+recalc', () => {
+	// History: this test previously asserted the stale-value behaviour with a note that it would "fail LOUD and
+	// be updated" when a future engine started re-binding on name delete. FE-9 did exactly that -- updated here
+	// against the FE-9.y dylib (the deleted-name dependent now resolves to `#NAME?`).
+	test('ENGINE GROUND TRUTH (FE-9): deleteName + recalc rebinds a dependent to #NAME? (formula preserved)', () => {
 		const s = createWorkbookSession();
 		const sheetId = s.addSheet('Sales', 1000);
 		// B2:B4 = 10, 20, 30; D1 = SUM(SALES).
@@ -199,13 +202,14 @@ suite('FE-5 W-N -- Name Manager engine contract (schema-2 dylib)', () => {
 		assert.strictEqual(d1Before!.value!.kind, 'number', 'D1 = SUM(SALES) is a number');
 		assert.strictEqual(d1Before!.value!.number, 60, 'D1 = 10+20+30 = 60');
 
-		// Delete the name, then recalc -- exactly what the Name-Manager delete command now does. The engine
-		// does NOT re-bind the deleted name, so D1 keeps its cached 60 (the pinned engine limitation).
+		// Delete the name, then recalc -- exactly what the Name-Manager delete command now does. **FE-9**: the
+		// engine re-dirties + rebinds the dependent, so D1 resolves to #NAME? (its formula is preserved).
 		s.deleteName('SALES'); // workbook-scoped
 		recalcDirtyChecked(s);
 		const d1After = cellAt(0, 3);
-		assert.strictEqual(d1After!.value!.kind, 'number', 'the engine does NOT turn D1 into #NAME? on name delete');
-		assert.strictEqual(d1After!.value!.number, 60, 'D1 stays at its resolved-at-write value (engine stale-name-binding)');
+		assert.strictEqual(d1After!.value!.kind, 'error', 'FE-9: the engine turns D1 into an error on name delete');
+		assert.strictEqual(d1After!.value!.error, '#NAME?', 'D1 = SUM(<deleted name>) resolves to #NAME?');
+		assert.strictEqual(d1After!.formula, 'SUM(SALES)', 'the dependent FORMULA is preserved (only the value errors)');
 	});
 
 	// **CLOSURE F1 companion -- a formula over an UNRESOLVED name is rejected at WRITE time.** This is why the
