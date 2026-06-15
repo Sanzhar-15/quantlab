@@ -40,7 +40,7 @@ import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
 import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
 import { showRenderBenchPanel } from '../quantbook/bench/renderBenchPanel';
-import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, classifySwitchSheetTarget, resolveCommandTargetPanel } from '../quantbook/cellGrid/cellGridLogic';
+import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, classifySwitchSheetTarget, defaultCsvFileName, resolveCommandTargetPanel } from '../quantbook/cellGrid/cellGridLogic';
 import { FORMAT_PRESET_CHOICES, buildFormatUndoLabel, buildSetFormatOps, formatStringForPreset, presetLabel, type FormatPreset } from '../quantbook/cellGrid/formatPickerLogic';
 // FE-4 W2 (2026-06-10): the pure, vscode-free sort core (read snapshot rect -> refuse-on-formula -> row
 // permutation -> setValue batch). The command below is a thin vscode shell over it (the established N-1/N-2 split).
@@ -513,6 +513,62 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL Save As error: ${detail}`);
 				void vscode.window.showErrorMessage(`Quantbook save failed: ${detail}`);
+			}
+		}),
+	);
+
+	// FE-8.2 (2026-06-15): Export the active workbook to CSV. Wires the live-but-unreachable
+	// `session.export('csv')` napi method (data interchange, distinct from the `.qbook` SAVE path above).
+	// The engine serializes a SINGLE live sheet and REFUSES a multi-sheet workbook with a loud BadArgument
+	// ("export each sheet separately") -- we surface that verbatim (No-Fallbacks), never a silent partial
+	// export. We serialize BEFORE prompting for a path so a multi-sheet workbook fails fast (the operator is
+	// not made to pick a file only to error). XLSX is NOT offered: the dylib is not built with the
+	// `xlsx-write` feature, so `export('xlsx')` returns not-implemented -- a later engine wave. Pure-IDE.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookExportCsv', async () => {
+			const target = resolveTargetOrWarn();
+			if (target === undefined) {
+				return; // resolveTargetOrWarn already messaged
+			}
+			const log = getOutput();
+			// Serialize FIRST: the engine throws here for a multi-sheet workbook, so we fail before the dialog.
+			// Read the sheet name (for the default file name) inside the SAME guard -- both are session reads, so
+			// a throw from either surfaces as one loud toast (No-Fallbacks), never an unhandled rejection.
+			let bytes: Uint8Array;
+			let sheetName: string | undefined;
+			try {
+				bytes = target.session.export('csv');
+				sheetName = target.session.snapshot().sheets.find((s) => s.id === target.sheet)?.name;
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL export CSV error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook export to CSV failed: ${detail}`);
+				return;
+			}
+			const folder = vscode.workspace.workspaceFolders?.[0];
+			const uri = await vscode.window.showSaveDialog({
+				title: 'Export Quantbook to CSV',
+				filters: { CSV: ['csv'] },
+				saveLabel: 'Export',
+				defaultUri: folder === undefined ? undefined : vscode.Uri.joinPath(folder.uri, defaultCsvFileName(sheetName)),
+			});
+			if (uri === undefined) {
+				return; // dismissed
+			}
+			try {
+				await vscode.workspace.fs.writeFile(uri, bytes);
+				log.appendLine(`Exported workbook to CSV at ${uri.fsPath} (${bytes.length} bytes).`);
+				if (bytes.length === 0) {
+					// Honest about an empty export: the engine returns 0 bytes for a sheet with no values. The
+					// file IS written (faithful), but a plain "exported" toast would imply data where there is none.
+					void vscode.window.showWarningMessage(`Quantbook: exported to ${uri.fsPath}, but the sheet was empty (0 bytes written).`);
+				} else {
+					void vscode.window.showInformationMessage(`Quantbook exported to ${uri.fsPath}`);
+				}
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL export CSV write error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook export to CSV failed: ${detail}`);
 			}
 		}),
 	);

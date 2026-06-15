@@ -246,6 +246,12 @@
         "category": "%command.category%"
       },
       {
+        "_comment": "FE-8.2: Export the active workbook to CSV (session.export('csv'); single-sheet workbooks only -- multi-sheet surfaces a loud engine error). In the webview File menu + palette.",
+        "command": "quantlab.quantbookExportCsv",
+        "title": "%command.quantbookExportCsv.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.quantbookSheetAdd",
         "title": "%command.quantbookSheetAdd.title%",
         "category": "%command.category%"

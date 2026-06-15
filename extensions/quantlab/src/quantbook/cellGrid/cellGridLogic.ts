@@ -2553,7 +2553,8 @@ export type ToolbarSimpleCommand =
 	| 'showDepGraph'
 	| 'showLivePython'
 	| 'nameManager'
-	| 'goToName';
+	| 'goToName'
+	| 'exportCsv';
 
 /**
  * The number-format presets the toolbar may apply: every {@link FormatPreset}
@@ -2605,7 +2606,29 @@ const TOOLBAR_SIMPLE_COMMAND_IDS: Record<ToolbarSimpleCommand, string> = {
 	// run their own QuickPick).
 	nameManager: 'quantlab.quantbookNameManager',
 	goToName: 'quantlab.quantbookGoToName',
+	// FE-8.2: the File menu's "Export to CSV..." item reveals the host command that wires the live
+	// `session.export('csv')` napi method (previously unreachable from the UI). Argument-less (it resolves
+	// the focused grid + prompts for a path). CSV is single-sheet-only engine-side -- a multi-sheet workbook
+	// surfaces the engine's loud BadArgument verbatim (No-Fallbacks).
+	exportCsv: 'quantlab.quantbookExportCsv',
 };
+
+/**
+ * **FE-8.2**: a safe default file name for the "Export to CSV" save dialog, derived from the active sheet's
+ * name (Excel defaults the export name to the sheet). Replaces characters illegal in file names
+ * (`\ / : * ? " < > |` and control chars) with `_`, collapses runs of whitespace, trims, and falls back to
+ * `export` for an empty / all-illegal / missing name. Always ends in `.csv`. Pure (no vscode/engine) so the
+ * sanitization is unit-tested directly.
+ */
+export function defaultCsvFileName(sheetName: string | undefined): string {
+	const cleaned = (sheetName ?? '')
+		// Strip characters illegal in file names (Windows-illegal set) AND control chars (\x00-\x1f).
+		.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_')
+		.replace(/\s+/g, ' ')
+		.trim();
+	const safe = cleaned.length > 0 ? cleaned : 'export';
+	return `${safe}.csv`;
+}
 
 /**
  * Whitelist: toolbar structural command -> the W3 context-menu host command id
