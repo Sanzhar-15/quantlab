@@ -221,8 +221,6 @@ suite('FE-8.1 planTableResize -- anchor-independent (not just origin tables)', (
 });
 
 suite('FE-8.3 planColumnRename', () => {
-	// Realistic IDE-reachable column names: plain identifiers, NOT cell-ref-like (Q1/R2 etc. are valid A1
-	// addresses, which the shared identifier rules reject -- and which the IDE never creates).
 	const roster = ['Region', 'Revenue', 'Profit'];
 	test('a valid rename returns the stored old display name + the new name', () => {
 		assert.deepStrictEqual(
@@ -256,11 +254,46 @@ suite('FE-8.3 planColumnRename', () => {
 			assert.match(a.reason, /already has a column named "profit"/);
 		}
 	});
-	test('an invalid new identifier is a loud error (shared defined-name rules)', () => {
+	test('an invalid new identifier is a loud error (digit-leading fails the structural column rule)', () => {
 		const a = planColumnRename(roster, 'Revenue', '1bad');
 		assert.strictEqual(a.kind, 'error');
 		if (a.kind === 'error') {
 			assert.ok(a.reason.length > 0);
+		}
+	});
+	// FE-8.4 (2026-06-15): a column name MAY be cell-ref-shaped (Q1..Q4 -- the quant case) or an R1C1 form,
+	// because a column is only ever referenced bracketed + table-qualified (`Table[Q3]`), never as a bare
+	// coordinate. The engine accepts + round-trips them (verified: ql-exec structured_ref_*_round_trip probes),
+	// so the IDE no longer refuses them. These would all have been REJECTED before FE-8.4.
+	for (const cellRefShape of ['Q3', 'Q1', 'R2', 'A1', 'AB12']) {
+		test(`a cell-ref-shaped new name "${cellRefShape}" is now ACCEPTED (FE-8.4)`, () => {
+			assert.deepStrictEqual(
+				planColumnRename(roster, 'Revenue', cellRefShape),
+				{ kind: 'rename', oldCol: 'Revenue', newCol: cellRefShape } as ColumnRenameAction,
+			);
+		});
+	}
+	for (const r1c1Shape of ['R', 'C', 'RC', 'R1C1']) {
+		test(`an R1C1-form new name "${r1c1Shape}" is now ACCEPTED (FE-8.4)`, () => {
+			assert.deepStrictEqual(
+				planColumnRename(roster, 'Revenue', r1c1Shape),
+				{ kind: 'rename', oldCol: 'Revenue', newCol: r1c1Shape } as ColumnRenameAction,
+			);
+		});
+	}
+	// ...but names that would need bracket-escaping are STILL rejected (No-Fallbacks: relax only to verified).
+	for (const stillInvalid of ['1bad', 'a-b', 'has space', '']) {
+		test(`a non-identifier new name ${JSON.stringify(stillInvalid)} is STILL rejected (needs escaping/empty)`, () => {
+			const a = planColumnRename(roster, 'Revenue', stillInvalid);
+			assert.strictEqual(a.kind, 'error');
+		});
+	}
+	test('a cell-ref-shaped name still collides case-insensitively with an existing such column', () => {
+		// Roster already holding a Q3 column: renaming Revenue -> q3 must be a loud collision, not a silent accept.
+		const a = planColumnRename(['Region', 'Revenue', 'Q3'], 'Revenue', 'q3');
+		assert.strictEqual(a.kind, 'error');
+		if (a.kind === 'error') {
+			assert.match(a.reason, /already has a column named "q3"/);
 		}
 	});
 	// FE-8.3 Codex-HIGH closure: the engine folds column names ASCII-only (to_ascii_lowercase). JS

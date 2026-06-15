@@ -14,7 +14,9 @@ import {
 	MAX_DEFINED_NAME_LENGTH,
 	buildDefineNameToast,
 	buildNameRange,
+	columnNameRejectionReason,
 	definedNameRejectionReason,
+	isValidColumnName,
 	isValidDefinedName,
 } from '../src/quantbook/cellGrid/nameDefineLogic';
 
@@ -94,6 +96,54 @@ suite('FE-4 W1 nameDefineLogic -- definedNameRejectionReason', () => {
 	});
 	test('an R1C1 name -> a "reserved" message', () => {
 		assert.match(definedNameRejectionReason('R1C1') ?? '', /reserved/i);
+	});
+});
+
+// FE-8.4 (2026-06-15): the RELAXED column-name validator. A column is only ever referenced bracketed +
+// table-qualified (`Table[Q3]`), so cell-ref-shaped + R1C1-form names are unambiguous and the engine accepts
+// them (verified: ql-exec structured_ref_*_round_trip). columnNameRejectionReason keeps the STRUCTURAL rules
+// but drops the two coordinate-collision guards that definedNameRejectionReason enforces.
+suite('FE-8.4 nameDefineLogic -- columnNameRejectionReason (relaxed for columns)', () => {
+	// Cell-ref-shaped + R1C1-form names: REJECTED as defined names, ACCEPTED as column names.
+	const COLUMN_OK_BUT_NOT_DEFINED = ['Q1', 'Q3', 'A1', 'R2', 'AB12', 'R', 'C', 'RC', 'R1C1', 'r1c1', 'c'];
+	for (const name of COLUMN_OK_BUT_NOT_DEFINED) {
+		test(`"${name}" is a valid COLUMN name but NOT a valid defined name`, () => {
+			assert.strictEqual(columnNameRejectionReason(name), undefined, `column should accept ${name}`);
+			assert.strictEqual(isValidColumnName(name), true);
+			// Regression guard: the defined-name / table-name path stays STRICT (it must still reject these).
+			assert.ok(definedNameRejectionReason(name), `defined-name must STILL reject ${name}`);
+			assert.strictEqual(isValidDefinedName(name), false);
+		});
+	}
+	// Plain identifiers are valid for BOTH.
+	for (const name of ['Region', '_hidden', 'tax_rate', 'Quarter1', 'data.set']) {
+		test(`"${name}" is valid for both column and defined name`, () => {
+			assert.strictEqual(columnNameRejectionReason(name), undefined);
+			assert.strictEqual(definedNameRejectionReason(name), undefined);
+		});
+	}
+	// Names that would need bracket-escaping (or are empty/over-cap) are STILL rejected for columns too.
+	test('empty -> a column-specific empty message', () => {
+		assert.match(columnNameRejectionReason('') ?? '', /column name cannot be empty/i);
+	});
+	test('over-cap -> a length message naming the cap', () => {
+		const reason = columnNameRejectionReason('a'.repeat(MAX_DEFINED_NAME_LENGTH + 1)) ?? '';
+		assert.match(reason, new RegExp(String(MAX_DEFINED_NAME_LENGTH)));
+	});
+	test('a leading digit is rejected (would not be a bare identifier)', () => {
+		assert.match(columnNameRejectionReason('1bad') ?? '', /start with a letter or an underscore/i);
+		assert.strictEqual(isValidColumnName('1bad'), false);
+	});
+	for (const bad of ['has space', 'a-b', 'a+b', '[bracket]', 'with#hash', 'at@sign']) {
+		test(`a name needing escaping ${JSON.stringify(bad)} is rejected (charset)`, () => {
+			assert.ok(columnNameRejectionReason(bad), `column should reject ${bad}`);
+			assert.strictEqual(isValidColumnName(bad), false);
+		});
+	}
+	test('a non-ASCII column name is rejected (ASCII-disciplined, matches the engine fold)', () => {
+		const nonAscii = String.fromCharCode(99, 97, 102, 233); // "cafe" with a non-ASCII e-acute
+		assert.ok(columnNameRejectionReason(nonAscii));
+		assert.strictEqual(isValidColumnName(nonAscii), false);
 	});
 });
 

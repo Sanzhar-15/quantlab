@@ -16,7 +16,7 @@
 // the selection-rect -> spec projection (column-count + default column names). No-Fallbacks: a malformed
 // selection throws rather than building a spec the engine would refuse.
 
-import { isValidDefinedName, definedNameRejectionReason } from './nameDefineLogic';
+import { isValidDefinedName, definedNameRejectionReason, columnNameRejectionReason } from './nameDefineLogic';
 import { normalizeSelectionRect } from '../reactiveNotebook/bindVariableLogic';
 import { columnLabel } from '../shared/gridLayoutA1';
 import type { TableSpecJson, TableSnapshotJson } from '../types';
@@ -44,6 +44,18 @@ export function isValidTableIdentifier(name: string): boolean {
  */
 export function tableIdentifierRejectionReason(name: string): string | undefined {
 	return definedNameRejectionReason(name);
+}
+
+/**
+ * **FE-8.4 (2026-06-15):** the rejection reason for a candidate table COLUMN name -- the RELAXED sibling of
+ * {@link tableIdentifierRejectionReason}. Unlike a table / defined name (which shares the cell namespace, so a
+ * cell-ref-shaped name like `Q3` is rejected as ambiguous), a column is ONLY ever referenced bracketed +
+ * table-qualified (`Table[Q3]`), so cell-ref / R1C1 shapes are unambiguous and the engine accepts them. This
+ * delegates to {@link columnNameRejectionReason} (keeps the structural identifier rules; drops the two
+ * coordinate-collision guards). Use this -- NOT `tableIdentifierRejectionReason` -- for column names.
+ */
+export function tableColumnRejectionReason(name: string): string | undefined {
+	return columnNameRejectionReason(name);
 }
 
 /**
@@ -304,7 +316,7 @@ export type ColumnRenameAction =
  * order from {@link SessionInstance.tableColumns}) to `newCol`.
  *
  * Precedence (first match wins), mirroring the engine's `rename_column` validation so we reject early:
- *  1. `newCol` fails the shared table/column identifier rules -> `error` (the engine would reject it).
+ *  1. `newCol` fails the COLUMN identifier rules -> `error` (the engine would reject it).
  *  2. `oldCol` is not in the roster (case-insensitive, like the engine's `lookup_column`) -> `error`.
  *  3. `newCol` canonical == `oldCol` canonical -> `noop` (engine returns Ok(0); a case-only change is a
  *     no-op there, so we don't pretend otherwise).
@@ -312,12 +324,14 @@ export type ColumnRenameAction =
  *  5. otherwise -> `rename` (carrying the exact stored display name as `oldCol`).
  */
 export function planColumnRename(columnNames: readonly string[], oldCol: string, newCol: string): ColumnRenameAction {
-	// CONSERVATIVE v1: we validate `newCol` with the shared table/defined-name identifier rules
-	// ({@link tableIdentifierRejectionReason}), which is STRICTER than the engine's `rename_column` (that only
-	// rejects empty / collision). So a cell-ref-shaped target (e.g. "Q3") is refused here even though the
-	// engine would store it. This is a loud refuse (never silent), kept until we verify such names round-trip
-	// in structured references (`Table[Q3]`); see the fe-tablecols plan's known-limitations.
-	const reason = tableIdentifierRejectionReason(newCol);
+	// FE-8.4 (2026-06-15): validate `newCol` with the COLUMN rules ({@link tableColumnRejectionReason} ->
+	// {@link columnNameRejectionReason}), NOT the stricter table/defined-name rules. A column is only ever
+	// referenced bracketed + table-qualified (`Table[Q3]`), so cell-ref-shaped / R1C1-form names like `Q3` or
+	// `R1C1` are unambiguous and the engine accepts + round-trips them (verified end-to-end -- see the engine's
+	// `structured_ref_cell_ref_shaped_column_names_round_trip` + `..._r1c1_..` probes). The column rule still
+	// rejects names that would need bracket-escaping (digit-leading, spaces, non-ASCII) -- a loud refuse, never
+	// silent (No-Fallbacks: relax only to what's verified).
+	const reason = tableColumnRejectionReason(newCol);
 	if (reason !== undefined) {
 		return { kind: 'error', reason };
 	}

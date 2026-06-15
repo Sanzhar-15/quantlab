@@ -109,6 +109,50 @@ export function definedNameRejectionReason(name: string): string | undefined {
 }
 
 /**
+ * **FE-8.4 (2026-06-15):** the rejection reason for a candidate TABLE COLUMN name -- the RELAXED sibling
+ * of {@link definedNameRejectionReason}. A defined / table name shares the cell namespace, so `=Q3` is
+ * ambiguous with the coordinate Q3 and those validators reject cell-reference-shaped + R1C1-form names.
+ * A COLUMN is different: it is ALWAYS referenced bracketed + table-qualified (`Table[Q3]`), where the
+ * lexer reads the bracket content as a RAW column string with NO coordinate interpretation -- so a column
+ * named `Q3` (or `R`, `C`, `R1C1`) is never ambiguous, and the engine accepts it (verified end-to-end:
+ * `ql-exec` `structured_ref_cell_ref_shaped_column_names_round_trip` + `..._r1c1_shaped_..`). For a quant
+ * product, quarterly columns `Q1..Q4` are exactly this case.
+ *
+ * So this KEEPS the structural identifier rules -- non-empty; length cap; first char `[A-Za-z_]`; rest
+ * `[A-Za-z0-9_.]`; ASCII-only -- which guarantee the name needs no bracket-escaping (staying inside the
+ * class the engine probes verified: bare ASCII identifiers), and DROPS only the two
+ * "collides-with-a-coordinate" guards (the cell-ref reject and the R1C1 reject). Names that would need
+ * escaping (spaces, `[ ] # @ '`, digit-leading, non-ASCII) are STILL rejected loudly (No-Fallbacks: we
+ * relax only to what is verified, never to an unproven accept). `undefined` means valid.
+ */
+export function columnNameRejectionReason(name: string): string | undefined {
+	if (name.length === 0) {
+		return 'A column name cannot be empty.';
+	}
+	if (name.length > MAX_DEFINED_NAME_LENGTH) {
+		return `A column name cannot exceed ${MAX_DEFINED_NAME_LENGTH} characters (got ${name.length}).`;
+	}
+	if (!/^[A-Za-z_]/.test(name)) {
+		return 'A column name must start with a letter or an underscore.';
+	}
+	if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(name)) {
+		return 'A column name may contain only ASCII letters, digits, underscores, and periods.';
+	}
+	// NOTE: unlike `definedNameRejectionReason`, a column name MAY be a cell-reference shape (`Q3`, `A1`) or
+	// an R1C1 form (`R`, `C`, `R1C1`) -- a column is only ever referenced as `Table[<name>]`, never as a
+	// bare coordinate, so there is no ambiguity to guard against.
+	return undefined;
+}
+
+/**
+ * **FE-8.4 (2026-06-15):** whether `name` is a usable table COLUMN identifier (the relaxed boolean form of
+ * {@link columnNameRejectionReason} -- allows cell-ref / R1C1 shapes that a defined/table name forbids).
+ */
+export function isValidColumnName(name: string): boolean {
+	return columnNameRejectionReason(name) === undefined;
+}
+
+/**
  * Normalize a selection's two corners (`anchor` + `focus`, in ANY order) + its sheet id into the
  * {@link CellRangeJson} shape `SessionInstance.setName(name, target)` expects: a sheet-qualified rect with
  * `start <= end` on both axes (0-based, inclusive). The selection corners are min/maxed via the shared

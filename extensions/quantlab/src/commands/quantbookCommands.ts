@@ -59,7 +59,7 @@ import { buildDefineNameToast, buildNameRange, definedNameRejectionReason, isVal
 // Go-To anchor) and the structured-table UI (identifier validation + selection -> TableSpecJson). The
 // commands below are thin vscode shells over these (the established cellGrid logic/command split).
 import { describeScope, describeTarget, goToAnchor, isGoToable } from '../quantbook/cellGrid/nameManagerLogic';
-import { buildTableSpec, isValidTableIdentifier, planColumnRename, planTableResize, tableAtCell, tableIdentifierRejectionReason, tableQuickPickItems } from '../quantbook/cellGrid/tableUiLogic';
+import { buildTableSpec, isValidTableIdentifier, planColumnRename, planTableResize, tableAtCell, tableColumnRejectionReason, tableIdentifierRejectionReason, tableQuickPickItems } from '../quantbook/cellGrid/tableUiLogic';
 import type { CollabSessionInstance, NamedRangeJson, SessionInstance, TableSnapshotJson } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
@@ -2145,9 +2145,9 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// FE-8.3 (2026-06-15): rename a table COLUMN. The napi `renameColumn(table, oldCol, newCol)` exists (the
 	// engine rewrites referencing structured-ref formula text in the same undo unit) but was unreachable --
 	// the IDE couldn't read a table's column names. With `tableColumns(name)` (FE-8.3) we list them, let the
-	// operator pick one + type the new name, validate via the shared identifier rules + `planColumnRename`
-	// (mirrors the engine's checks), then call the engine. Table picked context-aware or from a QuickPick,
-	// exactly like Rename/Drop Table.
+	// operator pick one + type the new name, validate via the COLUMN identifier rules (FE-8.4: relaxed to
+	// allow cell-ref-shaped names like Q3) + `planColumnRename` (mirrors the engine's checks), then call the
+	// engine. Table picked context-aware or from a QuickPick, exactly like Rename/Drop Table.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookRenameColumn', async (...args: unknown[]) => {
 			const resolved = resolveTableTarget(args.length > 0, args[0]);
@@ -2191,9 +2191,11 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			const newCol = await vscode.window.showInputBox({
 				title: `Rename Column "${oldCol}"`,
-				prompt: 'New column name (shares the table/defined-name identifier rules)',
+				// FE-8.4: column names use the RELAXED rule -- they MAY be cell-ref-shaped (Q1..Q4) or R1C1-form,
+				// unlike table/defined names, because a column is only ever referenced as `Table[<name>]`.
+				prompt: 'New column name (letters, digits, underscores, periods; may be a cell-ref shape like Q3)',
 				value: oldCol,
-				validateInput: (value) => tableIdentifierRejectionReason(value),
+				validateInput: (value) => tableColumnRejectionReason(value),
 			});
 			if (newCol === undefined) {
 				return; // dismissed
