@@ -1510,6 +1510,8 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 			'open', 'save', 'import', 'export',
 			'renameSheet', 'deleteSheet', 'restoreSheet', 'moveSheet', 'setName',
 			'createTable', 'renameTable', 'renameColumn', 'resizeTable', 'dropTable',
+			// FE-8.3 (2026-06-15): the loader now boundary-checks the table column-name read.
+			'tableColumns',
 			// FE-6 M (2026-06-13): the loader now boundary-checks the structural + style napi methods.
 			'insertRows', 'deleteRows', 'insertColumns', 'deleteColumns', 'registerStyle', 'setStyle',
 			'batch', 'beginTransaction', 'txnAdd', 'commitTransaction', 'rollbackTransaction',

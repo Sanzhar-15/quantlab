@@ -355,9 +355,15 @@
         "category": "%command.category%"
       },
       {
-        "_comment": "FE-8.1: Resize Table to Selection (resizeTable; re-ranges anchored at the table's top-left -- row grow/shrink + column GROW with auto-named columns; column shrink + rename-column deferred, the IDE can't read column names).",
+        "_comment": "FE-8.1: Resize Table to Selection (resizeTable; re-ranges anchored at the table's top-left -- row grow/shrink + column GROW with auto-named columns + column SHRINK, unblocked by FE-8.3's tableColumns read).",
         "command": "quantlab.quantbookResizeTable",
         "title": "%command.quantbookResizeTable.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "FE-8.3: Rename Table Column (renameColumn; lists the table's columns via tableColumns, renames the chosen one + rewrites referencing structured-ref formulas in one undo unit).",
+        "command": "quantlab.quantbookRenameColumn",
+        "title": "%command.quantbookRenameColumn.title%",
         "category": "%command.category%"
       },
       {
@@ -1295,6 +1301,12 @@
           "command": "quantlab.quantbookResizeTable",
           "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "7_table@4"
+        },
+        {
+          "_comment": "FE-8.3: Rename Table Column. Same 7_table group + when as the other table ops. Context-aware (resolveTableTarget): renames a column of the table containing the right-clicked cell, or picks one from a QuickPick.",
+          "command": "quantlab.quantbookRenameColumn",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "7_table@5"
         }
       ]
     },

@@ -2365,6 +2365,16 @@ export interface SessionInstance {
 	 */
 	dropTable(name: string): void;
 
+	/**
+	 * **FE-8.3 (2026-06-15):** list a table's column display names, in order. The names live in
+	 * the engine's table metadata but are NOT carried in {@link snapshot} / {@link TableSnapshotJson};
+	 * this is the lightweight read backing FE-8.1's column-shrink (which needs the trailing names for
+	 * {@link resizeTable}'s `removedColumns`) and the rename-column picker. The `table` is matched
+	 * case-insensitively (canonicalized like every other table op). Unknown `table` throws
+	 * `[table_not_found]` (identical to drop/rename). `[invalid_state]` off a Ready session.
+	 */
+	tableColumns(table: string): string[];
+
 	// --- Phase 6.3-2e (2026-05-30): atomic groups + reserved stubs ---
 
 	/**

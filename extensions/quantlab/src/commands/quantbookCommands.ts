@@ -59,7 +59,7 @@ import { buildDefineNameToast, buildNameRange, definedNameRejectionReason, isVal
 // Go-To anchor) and the structured-table UI (identifier validation + selection -> TableSpecJson). The
 // commands below are thin vscode shells over these (the established cellGrid logic/command split).
 import { describeScope, describeTarget, goToAnchor, isGoToable } from '../quantbook/cellGrid/nameManagerLogic';
-import { buildTableSpec, isValidTableIdentifier, planTableResize, tableAtCell, tableIdentifierRejectionReason, tableQuickPickItems } from '../quantbook/cellGrid/tableUiLogic';
+import { buildTableSpec, isValidTableIdentifier, planColumnRename, planTableResize, tableAtCell, tableIdentifierRejectionReason, tableQuickPickItems } from '../quantbook/cellGrid/tableUiLogic';
 import type { CollabSessionInstance, NamedRangeJson, SessionInstance, TableSnapshotJson } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
@@ -1931,13 +1931,14 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// Resolve the concrete table a Drop/Rename will act on: the pre-selected one (right-clicked inside it) or
 	// the operator's QuickPick over the whole workbook. Returns `undefined` when there are NO tables (a loud
 	// info message -- never an empty picker / silent no-op) or the picker was dismissed.
-	const pickTable = async (session: SessionInstance, preselect: TableSnapshotJson | undefined, purpose: 'drop' | 'rename'): Promise<TableSnapshotJson | undefined> => {
+	const pickTable = async (session: SessionInstance, preselect: TableSnapshotJson | undefined, purpose: 'drop' | 'rename' | 'rename-column'): Promise<TableSnapshotJson | undefined> => {
 		if (preselect !== undefined) {
 			return preselect;
 		}
 		const tables = session.snapshot().tables ?? [];
 		if (tables.length === 0) {
-			void vscode.window.showInformationMessage(`Quantbook: this workbook has no tables to ${purpose}.`);
+			const verb = purpose === 'drop' ? 'drop' : purpose === 'rename' ? 'rename' : 'edit';
+			void vscode.window.showInformationMessage(`Quantbook: this workbook has no tables to ${verb}.`);
 			return undefined;
 		}
 		const sheetNameFor = buildSheetNameResolver(session);
@@ -1948,9 +1949,11 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			detail: it.detail,
 			table: it.table,
 		}));
+		const title = purpose === 'drop' ? 'Drop Table' : purpose === 'rename' ? 'Rename Table' : 'Rename Table Column';
+		const placeHolder = purpose === 'drop' ? 'Select the table to drop' : purpose === 'rename' ? 'Select the table to rename' : 'Select the table whose column to rename';
 		const picked = await vscode.window.showQuickPick(items, {
-			title: purpose === 'drop' ? 'Drop Table' : 'Rename Table',
-			placeHolder: purpose === 'drop' ? 'Select the table to drop' : 'Select the table to rename',
+			title,
+			placeHolder,
 			matchOnDescription: true,
 		});
 		return picked?.table;
@@ -2063,9 +2066,9 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// newCols, addedColumns, removedColumns)` re-ranges a table ANCHORED at its existing top-left (a table can
 	// be resized but never moved). SELECTION-driven (like Create, not Drop/Rename): the target is the table
 	// whose top-left equals the selection's top-left. The pure `planTableResize` decides resize / noop / error
-	// (the anchor-match, extent + col-shrink-deferred rules); this is the thin vscode shell. Scope: row
-	// grow/shrink + column GROW (auto-named). Column shrink + rename-column are deferred -- the IDE cannot read
-	// a table's column names (no snapshot field, no query), so the engine can't be told the trailing names.
+	// (anchor-match, extent, column add/drop); this is the thin vscode shell. Scope: row grow/shrink + column
+	// GROW (auto-named) + column SHRINK (FE-8.3: we read the live roster via `tableColumns` and pass the
+	// trailing names to drop as `removedColumns`).
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookResizeTable', (...args: unknown[]) => {
 			const resolved = resolveMenuOrFocusedSelection(args.length > 0, args[0]);
@@ -2097,7 +2100,18 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				void vscode.window.showInformationMessage('Quantbook: select a range starting at a table\'s top-left cell, then run Resize Table to Selection.');
 				return;
 			}
-			const action = planTableResize(target, sel.selection.anchorRow, sel.selection.anchorCol, sel.selection.focusRow, sel.selection.focusCol);
+			// FE-8.3: read the live column roster so `planTableResize` can compute the trailing names to drop
+			// on a column shrink. A throw (table vanished / off a Ready session) surfaces loud (No-Fallbacks).
+			let columnNames: string[];
+			try {
+				columnNames = sel.session.tableColumns(target.name);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				getOutput().appendLine(`FATAL tableColumns error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook resize table failed: ${detail}`);
+				return;
+			}
+			const action = planTableResize(target, columnNames, sel.selection.anchorRow, sel.selection.anchorCol, sel.selection.focusRow, sel.selection.focusCol);
 			if (action.kind === 'noop') {
 				void vscode.window.showInformationMessage(`Quantbook: "${target.displayName}" already matches the selection.`);
 				return;
@@ -2125,6 +2139,93 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				void vscode.window.showWarningMessage('Quantbook: the table was resized, but a panel failed to re-render -- run "Quantbook: Refresh Cell Grid".');
 			}
 			void vscode.window.showInformationMessage(`Quantbook: resized "${target.displayName}" to ${action.newRows} rows x ${action.newCols} columns.`);
+		}),
+	);
+
+	// FE-8.3 (2026-06-15): rename a table COLUMN. The napi `renameColumn(table, oldCol, newCol)` exists (the
+	// engine rewrites referencing structured-ref formula text in the same undo unit) but was unreachable --
+	// the IDE couldn't read a table's column names. With `tableColumns(name)` (FE-8.3) we list them, let the
+	// operator pick one + type the new name, validate via the shared identifier rules + `planColumnRename`
+	// (mirrors the engine's checks), then call the engine. Table picked context-aware or from a QuickPick,
+	// exactly like Rename/Drop Table.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookRenameColumn', async (...args: unknown[]) => {
+			const resolved = resolveTableTarget(args.length > 0, args[0]);
+			if (resolved.kind === 'invalid-arg') {
+				void vscode.window.showErrorMessage('Quantbook: rename column failed -- the right-click menu sent an invalid cell context. Try selecting a cell and re-running.');
+				return;
+			}
+			if (resolved.kind === 'panel-gone') {
+				void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+				return;
+			}
+			if (resolved.kind === 'none') {
+				return;
+			}
+			const target = await pickTable(resolved.session, resolved.preselect, 'rename-column');
+			if (target === undefined) {
+				return;
+			}
+			// Read the live column roster (the names live in engine metadata, not the snapshot). A throw
+			// (table vanished / off a Ready session) surfaces loud (No-Fallbacks).
+			let columns: string[];
+			try {
+				columns = resolved.session.tableColumns(target.name);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				getOutput().appendLine(`FATAL tableColumns error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook rename column failed: ${detail}`);
+				return;
+			}
+			if (columns.length === 0) {
+				// A table always has >=1 column by construction; an empty roster means stale/broken state.
+				void vscode.window.showErrorMessage(`Quantbook: "${target.displayName}" reports no columns -- refresh the Cell Grid and retry.`);
+				return;
+			}
+			const oldCol = await vscode.window.showQuickPick(columns, {
+				title: `Rename Column in "${target.displayName}"`,
+				placeHolder: 'Select the column to rename',
+			});
+			if (oldCol === undefined) {
+				return; // dismissed
+			}
+			const newCol = await vscode.window.showInputBox({
+				title: `Rename Column "${oldCol}"`,
+				prompt: 'New column name (shares the table/defined-name identifier rules)',
+				value: oldCol,
+				validateInput: (value) => tableIdentifierRejectionReason(value),
+			});
+			if (newCol === undefined) {
+				return; // dismissed
+			}
+			const action = planColumnRename(columns, oldCol, newCol);
+			if (action.kind === 'noop') {
+				void vscode.window.showInformationMessage(`Quantbook: "${oldCol}" is already named that.`);
+				return;
+			}
+			if (action.kind === 'error') {
+				void vscode.window.showErrorMessage(`Quantbook rename column: ${action.reason}`);
+				return;
+			}
+			const log = getOutput();
+			try {
+				resolved.session.renameColumn(target.name, action.oldCol, action.newCol);
+				log.appendLine(`Renamed column "${action.oldCol}" -> "${action.newCol}" in table "${target.name}".`);
+			} catch (err) {
+				// Engine rejections (unknown column / collision / invalid name) surface loud (No-Fallbacks) --
+				// the column is unchanged on a rejected rename.
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL renameColumn error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook rename column failed: ${detail}`);
+				return;
+			}
+			// A table op bumps the epoch -> recalc dependents, then reseed the panel(s) from a fresh snapshot.
+			recalcDirtyChecked(resolved.session);
+			const { failed } = CellGridPanel.refreshSession(resolved.session);
+			if (failed > 0) {
+				void vscode.window.showWarningMessage('Quantbook: the column was renamed, but a panel failed to re-render -- run "Quantbook: Refresh Cell Grid".');
+			}
+			void vscode.window.showInformationMessage(`Quantbook: renamed column to "${action.newCol}" in "${target.displayName}".`);
 		}),
 	);
 }

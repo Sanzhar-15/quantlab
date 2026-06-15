@@ -410,6 +410,12 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (6.3-2d)`);
 				}
 			}
+			// **FE-8.3 (2026-06-15):** the table column-name read backing FE-8.1
+			// column-shrink + rename-column. A stale cdylib (pre-FE-8.3) lacks it --
+			// fail at the boundary, not at the `tableColumns is not a function` use site.
+			if (typeof sproto['tableColumns'] !== 'function') {
+				missing.push('Session.prototype.tableColumns (FE-8.3)');
+			}
 			// **Phase 6.3-2e (2026-05-30):** atomic groups (batch + the
 			// transaction handle) + the 5 reserved Section 3.5 capability stubs.
 			for (const method of [

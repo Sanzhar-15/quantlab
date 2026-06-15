@@ -163,10 +163,14 @@ export function tableQuickPickItems(tables: readonly TableSnapshotJson[]): Table
 // addedColumns, removedColumns)` re-ranges a table to a new extent ANCHORED AT ITS EXISTING TOP-LEFT (the
 // engine inherits + freezes `top_row`/`top_col` -- a table can be resized but never moved). The pure core
 // below decides, from the target table's snapshot + the operator's selection, exactly what -- if any --
-// resize call re-ranges it to that selection. Scope this wave: row grow/shrink + column GROW (appended
-// columns auto-named). Column SHRINK is DEFERRED: the engine wants the trailing column NAMES in
-// `removedColumns`, and the IDE cannot read a table's column names (the snapshot carries none and there is
-// no `tableColumns()` query) -- so we reject it loudly rather than guess (No-Fallbacks).
+// resize call re-ranges it to that selection: row grow/shrink, column GROW (appended columns auto-named),
+// and column SHRINK.
+//
+// FE-8.3 (2026-06-15) unblocked column SHRINK: the engine wants the trailing column NAMES in
+// `removedColumns` (it validates them against the live roster -- see ql-exec tables.rs `resize_table`), and
+// the IDE can now read them via `SessionInstance.tableColumns(name)`. `planTableResize` takes that roster
+// and slices off the trailing names to drop; the engine re-validates and rejects loudly on any mismatch
+// (No-Fallbacks -- we never guess the names).
 
 /**
  * The default-convention names for the columns APPENDED when a table grows from `oldCols` to `newCols`:
@@ -205,25 +209,36 @@ export type TableResizeAction =
 /**
  * Plan a resize of `table` (resolved via {@link tableAtCell}) to the operator's selection (corners in ANY
  * order). The table's top-left anchor is frozen by the engine, so the selection MUST start at the table's
- * top-left; the new extent is the selection's row/col span.
+ * top-left; the new extent is the selection's row/col span. `columnNames` is the table's CURRENT column
+ * roster (display names, in order) from {@link SessionInstance.tableColumns} -- needed to compute the
+ * trailing names to drop on a column shrink.
  *
  * Precedence (first match wins):
  *  1. a non-integer corner (only reachable from a tampered webview) -> `error`.
- *  2. selection top-left != table top-left -> `error` naming the required A1 cell (the anchor can't move).
- *  3. footprint outside the A1 grid -> `error`.
- *  4. selection == current footprint -> `noop` (the engine would no-op; skip the call).
- *  5. COLUMN SHRINK (`newCols < table.cols`) -> `error` (deferred; needs column names the IDE can't read).
- *  6. COLUMN GROW (`newCols > table.cols`) -> `resize` with `addedColumns` auto-named, `removedColumns: []`.
- *  7. row-only change -> `resize` with empty add/remove.
+ *  2. `columnNames.length != table.cols` -> `error` (roster/snapshot disagree = stale state; don't guess).
+ *  3. selection top-left != table top-left -> `error` naming the required A1 cell (the anchor can't move).
+ *  4. footprint outside the A1 grid -> `error`.
+ *  5. selection == current footprint -> `noop` (the engine would no-op; skip the call).
+ *  6. COLUMN SHRINK (`newCols < table.cols`) -> `resize` dropping the trailing `cols - newCols` names
+ *     (`removedColumns = columnNames.slice(newCols)`), `addedColumns: []`.
+ *  7. COLUMN GROW (`newCols > table.cols`) -> `resize` with `addedColumns` auto-named, `removedColumns: []`.
+ *  8. row-only change -> `resize` with empty add/remove.
  *
- * The engine balance invariant `newCols == oldCols + added - removed` holds by construction (we only ever
- * grow columns: `removed` is always empty, `added.length === newCols - oldCols`).
+ * The engine balance invariant `newCols == oldCols + added - removed` holds by construction in every branch
+ * (grow: removed empty, added = newCols-oldCols; shrink: added empty, removed = oldCols-newCols; row-only:
+ * both empty).
  */
-export function planTableResize(table: TableSnapshotJson, anchorRow: number, anchorCol: number, focusRow: number, focusCol: number): TableResizeAction {
+export function planTableResize(table: TableSnapshotJson, columnNames: readonly string[], anchorRow: number, anchorCol: number, focusRow: number, focusCol: number): TableResizeAction {
 	for (const [label, v] of [['anchorRow', anchorRow], ['anchorCol', anchorCol], ['focusRow', focusRow], ['focusCol', focusCol]] as const) {
 		if (!Number.isInteger(v)) {
 			return { kind: 'error', reason: `the selection ${label} is not a whole number (${v}).` };
 		}
+	}
+	// The roster (from `tableColumns`) and the snapshot (from `snapshot().tables`) come from the SAME session
+	// and must agree on column count; a mismatch means the snapshot is stale (No-Fallbacks: surface it, never
+	// slice a stale roster and send the engine the wrong names).
+	if (columnNames.length !== table.cols) {
+		return { kind: 'error', reason: `the table's column roster (${columnNames.length}) doesn't match its column count (${table.cols}) -- the view is stale. Refresh the Cell Grid and retry.` };
 	}
 	const rect = normalizeSelectionRect(anchorRow, anchorCol, focusRow, focusCol);
 	if (rect.startRow !== table.topRow || rect.startCol !== table.topCol) {
@@ -239,11 +254,88 @@ export function planTableResize(table: TableSnapshotJson, anchorRow: number, anc
 		return { kind: 'noop' };
 	}
 	if (newCols < table.cols) {
-		return { kind: 'error', reason: `shrinking a table's columns isn't supported yet (it needs column-name support the engine doesn't expose). Select a range at least as wide as the table (${table.cols} columns).` };
+		// COLUMN SHRINK: drop the trailing (cols - newCols) columns. The engine requires `removedColumns` to
+		// be EXACTLY those trailing display names, in order, case-insensitive (ql-exec tables.rs resize_table);
+		// slicing the live roster from `newCols` gives precisely that. Handles a combined col-shrink +
+		// row-change too (newRows comes from the selection).
+		return { kind: 'resize', newRows, newCols, addedColumns: [], removedColumns: columnNames.slice(newCols) };
 	}
 	if (newCols > table.cols) {
 		return { kind: 'resize', newRows, newCols, addedColumns: appendedColumnNames(table.cols, newCols), removedColumns: [] };
 	}
 	// row-only change (newCols === table.cols)
 	return { kind: 'resize', newRows, newCols, addedColumns: [], removedColumns: [] };
+}
+
+// FE-8.3 (2026-06-15) "Rename a table column". The engine's `renameColumn(table, oldCol, newCol)` exists
+// (it mutates the column metadata + rewrites stored structured-reference formula text as one undo unit) but
+// was unreachable from the UI because the IDE couldn't read a table's column names to offer them. With
+// `SessionInstance.tableColumns(name)` (FE-8.3) the command can list them; the pure core below validates the
+// chosen rename against the live roster BEFORE the call, mirroring the engine's own checks
+// (ql-exec tables.rs `rename_column`: non-empty + identifier rules, target-not-already-present,
+// same-canonical no-op) so the input box / command can reject early with a reason (No-Fallbacks).
+
+/**
+ * ASCII-only lowercasing, matching the engine's column-name canonicalization EXACTLY. The engine folds
+ * column names with Rust's `to_ascii_lowercase` / `eq_ignore_ascii_case` (ql-exec tables.rs) -- which folds
+ * ONLY `A`-`Z`. JS `String.prototype.toLowerCase()` ALSO folds non-ASCII letters, which would DIVERGE: e.g.
+ * U+00C5 (A-with-ring, upper) and U+00E5 (a-with-ring, lower) are DISTINCT columns to the engine (ASCII fold
+ * leaves both unchanged) but EQUAL under Unicode folding -- so a Unicode-based match could pick the WRONG
+ * column and rename/rewrite formulas for it (silent corruption). Fold only `A`-`Z` so our
+ * match/collision/no-op decisions are byte-identical to the engine's.
+ */
+function asciiLower(s: string): string {
+	return s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+}
+
+/**
+ * The decision a "Rename Table Column" makes against {@link SessionInstance.renameColumn}: a concrete
+ * `rename` call, a `noop` (the new name is the old one, modulo ASCII case -- the engine no-ops a
+ * same-canonical rename), or a loud `error` (the operator-facing reason). No-Fallbacks: nothing is silently
+ * coerced.
+ */
+export type ColumnRenameAction =
+	| { readonly kind: 'rename'; readonly oldCol: string; readonly newCol: string }
+	| { readonly kind: 'noop' }
+	| { readonly kind: 'error'; readonly reason: string };
+
+/**
+ * Plan renaming the column `oldCol` of a table (whose current roster is `columnNames`, display names in
+ * order from {@link SessionInstance.tableColumns}) to `newCol`.
+ *
+ * Precedence (first match wins), mirroring the engine's `rename_column` validation so we reject early:
+ *  1. `newCol` fails the shared table/column identifier rules -> `error` (the engine would reject it).
+ *  2. `oldCol` is not in the roster (case-insensitive, like the engine's `lookup_column`) -> `error`.
+ *  3. `newCol` canonical == `oldCol` canonical -> `noop` (engine returns Ok(0); a case-only change is a
+ *     no-op there, so we don't pretend otherwise).
+ *  4. `newCol` canonical collides with a DIFFERENT existing column -> `error` (engine `[table_column_rejected]`).
+ *  5. otherwise -> `rename` (carrying the exact stored display name as `oldCol`).
+ */
+export function planColumnRename(columnNames: readonly string[], oldCol: string, newCol: string): ColumnRenameAction {
+	// CONSERVATIVE v1: we validate `newCol` with the shared table/defined-name identifier rules
+	// ({@link tableIdentifierRejectionReason}), which is STRICTER than the engine's `rename_column` (that only
+	// rejects empty / collision). So a cell-ref-shaped target (e.g. "Q3") is refused here even though the
+	// engine would store it. This is a loud refuse (never silent), kept until we verify such names round-trip
+	// in structured references (`Table[Q3]`); see the fe-tablecols plan's known-limitations.
+	const reason = tableIdentifierRejectionReason(newCol);
+	if (reason !== undefined) {
+		return { kind: 'error', reason };
+	}
+	// Match / collide / no-op using ASCII-only folding -- byte-identical to the engine's column canonicalization
+	// (asciiLower); a Unicode fold here would pick the wrong column for non-ASCII rosters.
+	const oldLower = asciiLower(oldCol);
+	const existingIdx = columnNames.findIndex((c) => asciiLower(c) === oldLower);
+	if (existingIdx === -1) {
+		return { kind: 'error', reason: `the table has no column named "${oldCol}".` };
+	}
+	const newLower = asciiLower(newCol);
+	if (newLower === oldLower) {
+		// Same canonical name: the engine treats a same-canonical rename as Ok(0) (no display change), so
+		// skip the call rather than imply a change we won't get.
+		return { kind: 'noop' };
+	}
+	if (columnNames.some((c, i) => i !== existingIdx && asciiLower(c) === newLower)) {
+		return { kind: 'error', reason: `the table already has a column named "${newCol}".` };
+	}
+	return { kind: 'rename', oldCol: columnNames[existingIdx], newCol };
 }
