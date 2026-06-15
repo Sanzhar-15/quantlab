@@ -26,8 +26,9 @@
 use std::sync::Arc;
 
 use ql_formula_syntax::{lex_with, parse};
+use ql_io::CellWireValue;
 use ql_oplog::Op;
-use ql_types::{ColId, RowId, SheetId};
+use ql_types::{ColId, RowId, SheetId, Value};
 
 use crate::plan::{bind_with_site, BindSite};
 use crate::plan_cache::PlanCacheKey;
@@ -455,6 +456,34 @@ impl<'a> WorkbookRuntime<'a> {
                 reason: "column with this canonical name already exists (rename target)",
             });
         }
+        // **FE-8.5 (2026-06-15):** a column rename ALSO updates the visible HEADER cell,
+        // so the grid and the column metadata stay in sync (Excel parity — the IDE reads
+        // header text INTO column names at create; this closes the loop on rename).
+        // Compute the header-cell address NOW (while `meta` is still borrowed) so the
+        // `Op::PutValue` can ride the SAME atomic `BatchCommit` as RenameColumn + every
+        // PutFormula rewrite below. A header-LESS table has no header cell -> `None` (no
+        // write). The header address is `(sheet, top_row, top_col + col_idx)` per
+        // `TableMetadata::header_range`. `col_idx` is the SOURCE column's index (verified
+        // to exist at top); the metadata still holds the old name here.
+        let header_write: Option<(SheetId, RowId, ColId)> = if meta.has_header {
+            let (col_idx, _) = meta
+                .lookup_column(old_col)
+                .expect("source column verified to exist at top");
+            Some((meta.sheet, meta.top_row, meta.top_col + col_idx))
+        } else {
+            None
+        };
+        // **FE-8.5 (2026-06-15):** if that header cell currently holds a FORMULA, the value
+        // write below must ALSO clear the formula association — mirroring `set_value` (cells.rs),
+        // which emits `Op::ClearFormula` alongside the `PutValue`. Otherwise the orphaned formula
+        // re-evaluates on the NEXT `recompute_all` (fired on every `.qbook` load + replay) and
+        // REVERTS the header away from the renamed name (an audit-caught durability defect). The
+        // header is now a literal label, so dropping any prior formula is the correct semantics.
+        // Captured BEFORE any mutation (immutable read, coexists with the `meta` borrow above).
+        let header_had_formula = match header_write {
+            Some((s, r, c)) => self.workbook.formula_at(s, r, c).is_some(),
+            None => false,
+        };
         // **F10 fix (2026-05-27 inc.2c — "ship F10 now"):** fully
         // append-before-mutate, mirroring `rename_table` above + `rename_sheet`.
         // Collect `RenameColumn` + every `PutFormula` rewrite into ONE
@@ -487,7 +516,8 @@ impl<'a> WorkbookRuntime<'a> {
         }
         // Append-before-mutate: ONE BatchCommit = [RenameColumn, PutFormula × N].
         if let Some(oplog) = self.oplog.as_deref_mut() {
-            let mut ops: Vec<Op> = Vec::with_capacity(rewritten_cells.len() + 1);
+            // +2 = RenameColumn + the optional header PutValue (FE-8.5).
+            let mut ops: Vec<Op> = Vec::with_capacity(rewritten_cells.len() + 2);
             ops.push(Op::RenameColumn {
                 table: table_canonical.clone(),
                 old_name: old_col.to_owned(),
@@ -500,6 +530,37 @@ impl<'a> WorkbookRuntime<'a> {
                     col: *c,
                     text: new_text.clone(),
                 });
+            }
+            // FE-8.5: the header-cell write rides the SAME BatchCommit (atomic with the
+            // rename + formula rewrites). The new name is non-empty (rejected above), so
+            // `CellWireValue::from_value(&Value::text(..))` is always `Some`.
+            //
+            // **Collab note (audit, Codex):** like the `PutFormula` rewrites above, this `PutValue`
+            // is a SEPARATE inner op. Under an adversarial CRDT interleaving where `apply_rename_column`
+            // advisory-skips (the table/column was concurrently renamed or dropped — see replay.rs
+            // Phase-5.3 step-4/5c closures), this header write still lands even though the metadata
+            // rename does not. That is the SAME documented V1 limitation that already affects the
+            // formula rewrites; the header write introduces no new class. Linear / single-writer
+            // history — the only path the IDE drives — always applies the rename, so header + metadata
+            // stay consistent. The V2 causality-aware closure noted in replay.rs fixes both together.
+            if let Some((s, r, c)) = header_write {
+                ops.push(Op::PutValue {
+                    sheet: s,
+                    row: r,
+                    col: c,
+                    value: CellWireValue::from_value(&Value::text(new_col))
+                        .expect("non-empty header text always serializes to a wire value"),
+                });
+                // If the header previously held a formula, clear it in the SAME batch (mirrors
+                // `set_value`'s value-over-formula `Op::ClearFormula`), so replay reproduces the
+                // cleared association and the new label doesn't revert on the next recompute.
+                if header_had_formula {
+                    ops.push(Op::ClearFormula {
+                        sheet: s,
+                        row: r,
+                        col: c,
+                    });
+                }
             }
             oplog.append(Op::BatchCommit { ops })?;
         }
@@ -518,6 +579,15 @@ impl<'a> WorkbookRuntime<'a> {
             .expect("verified at top before any mutation");
         meta.columns[col_idx as usize].name = Arc::from(new_lower.as_str());
         meta.columns[col_idx as usize].display = Arc::clone(&new_display_arc);
+        // FE-8.5: write the new display name into the visible header cell, live. Mirrors
+        // the manual `put_formula` loop above — `put_at` does NOT itself emit an op; the
+        // matching `Op::PutValue` (+ `Op::ClearFormula` if needed) was already queued into the
+        // BatchCommit. Skipped for header-less tables (`header_write` is `None`). `clear_formula`
+        // is idempotent (no-op when the header had no formula) and matches `set_value`'s live path.
+        if let Some((s, r, c)) = header_write {
+            self.workbook.put_at(s, r, c, Value::text(new_col));
+            self.workbook.clear_formula(s, r, c);
+        }
         // `get_mut` doesn't bump generation; do it explicitly so plan
         // caches keyed on `TableTable::generation` invalidate.
         self.workbook.tables_mut().bump_generation();
@@ -530,6 +600,15 @@ impl<'a> WorkbookRuntime<'a> {
         // consistent for downstream tooling (debug, ql-profile).
         if let Some(g) = self.graph.as_deref_mut() {
             g.on_column_rename(&table_canonical, old_col, new_col);
+            // FE-8.5: notify the graph of the header-cell value write (so a formula reading the
+            // header by ADDRESS — not via the table — is dirtied), and detach the old formula's
+            // deps if we just cleared one. Mirrors `set_value`'s `on_set_value` + `on_clear_formula`.
+            if let Some((s, r, c)) = header_write {
+                g.on_set_value(s, r, c);
+                if header_had_formula {
+                    g.on_clear_formula(s, r, c);
+                }
+            }
         }
         // Invalidate plan cache by clearing — every formula that
         // referenced the OLD column now has new text, so cache lookups
@@ -878,6 +957,7 @@ mod tests {
     use std::sync::Arc;
 
     use ql_functions::default_registry;
+    use ql_io::CellWireValue;
     use ql_oplog::{Op, OpLog};
     use ql_storage::Workbook;
     use ql_types::{ErrorValue, Value};
@@ -1578,8 +1658,8 @@ mod tests {
         };
         assert_eq!(
             inner.len(),
-            2,
-            "BatchCommit = [RenameColumn, PutFormula], got {inner:?}"
+            3,
+            "BatchCommit = [RenameColumn, PutFormula, PutValue(header)] (FE-8.5), got {inner:?}"
         );
         assert!(
             matches!(&inner[0], Op::RenameColumn { table, old_name, new_name }
@@ -1592,6 +1672,171 @@ mod tests {
             }
             other => panic!("expected PutFormula rewrite inside the BatchCommit, got {other:?}"),
         }
+        // **FE-8.5:** the header cell (table S top-left = (0,0,0)) is rewritten to "R" in
+        // the SAME atomic BatchCommit — so replay / .qbook load reproduce the header write.
+        match &inner[2] {
+            Op::PutValue {
+                sheet,
+                row,
+                col,
+                value,
+            } => {
+                assert_eq!((*sheet, *row, *col), (0, 0, 0), "header cell address");
+                assert_eq!(
+                    *value,
+                    CellWireValue::Text("R".to_owned()),
+                    "header label is the new column display name"
+                );
+            }
+            other => panic!("expected the header PutValue inside the BatchCommit, got {other:?}"),
+        }
+        // The live workbook reflects the header write too.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Text(Arc::from("R")),
+            "header cell shows the new column name after rename"
+        );
+    }
+
+    /// **FE-8.5 (2026-06-15):** `rename_column` writes the new display name into the
+    /// visible HEADER CELL (`(sheet, top_row, top_col + col_idx)`), so the grid header
+    /// and the column metadata stay in sync. Renames the MIDDLE column of a table NOT at
+    /// the origin — pinning the `top_col + col_idx` arithmetic — and asserts sibling
+    /// headers are untouched.
+    #[test]
+    fn rename_column_updates_header_cell() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // Table "Plan" anchored at B2 (top_row=1, top_col=1), 3 cols, has_header.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table(
+                "Plan",
+                0,
+                1,
+                1,
+                3,
+                3,
+                true,
+                false,
+                vec!["Left".into(), "Mid".into(), "Right".into()],
+            )
+            .unwrap();
+        }
+        // Seed the visible header row (row 1) so we can prove an OVERWRITE, not a fresh write.
+        wb.put(ql_types::Address::new(0, 1, 1), Value::text("Left"));
+        wb.put(ql_types::Address::new(0, 1, 2), Value::text("Mid"));
+        wb.put(ql_types::Address::new(0, 1, 3), Value::text("Right"));
+        // Rename the MIDDLE column (idx 1) -> its header lives at (0, 1, top_col(1)+idx(1)=2).
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_column("Plan", "Mid", "Center").unwrap();
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 2)),
+            Value::Text(Arc::from("Center")),
+            "renamed column's header cell shows the new name"
+        );
+        // Sibling headers are UNTOUCHED.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 1)),
+            Value::Text(Arc::from("Left"))
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 3)),
+            Value::Text(Arc::from("Right"))
+        );
+    }
+
+    /// **FE-8.5 (2026-06-15):** a header-LESS table's `rename_column` writes NO header
+    /// cell (there is no header row) — it must not clobber the top-row DATA with a label.
+    #[test]
+    fn rename_column_headerless_writes_no_header_cell() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            // has_header = FALSE: the top row is data, not a header.
+            rt.create_table("Raw", 0, 0, 0, 2, 1, false, false, vec!["Qty".into()])
+                .unwrap();
+        }
+        wb.put(ql_types::Address::new(0, 0, 0), Value::Number(42.0));
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_column("Raw", "Qty", "Quantity").unwrap();
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Number(42.0),
+            "header-less table: rename must NOT write a header cell over the data"
+        );
+    }
+
+    /// **FE-8.5 (2026-06-15) — audit MEDIUM closure.** If a header cell held a FORMULA, the rename's
+    /// header write must ALSO clear the formula (mirroring `set_value`) — otherwise the orphaned
+    /// formula re-evaluates on the next `recompute_all` (every `.qbook` load / replay) and REVERTS
+    /// the header off the renamed name. Pins: the live clear, the `Op::ClearFormula` in the batch,
+    /// AND that the new label SURVIVES a recompute (the without-fix failure mode).
+    #[test]
+    fn rename_column_clears_formula_header() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.create_table("S", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+            // A FORMULA in the header cell (0,0,0): ="Q" -> evaluates to the text "Q".
+            rt.set_formula(0, 0, 0, "\"Q\"").unwrap();
+        }
+        assert!(wb.formula_at(0, 0, 0).is_some(), "header has a formula pre-rename");
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.rename_column("S", "Qty", "Quantity").unwrap();
+        }
+        // The header is now the literal renamed label, and the orphaned formula is GONE.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Text(Arc::from("Quantity")),
+            "header shows the renamed name"
+        );
+        assert!(
+            wb.formula_at(0, 0, 0).is_none(),
+            "the orphaned header formula was cleared"
+        );
+        // The rename's BatchCommit carries BOTH the header PutValue AND a ClearFormula (replay-faithful).
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        let batch = ops
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                Op::BatchCommit { ops } => Some(ops),
+                _ => None,
+            })
+            .expect("a BatchCommit from the rename");
+        assert!(
+            batch
+                .iter()
+                .any(|o| matches!(o, Op::PutValue { row: 0, col: 0, .. })),
+            "header PutValue present: {batch:?}"
+        );
+        assert!(
+            batch
+                .iter()
+                .any(|o| matches!(o, Op::ClearFormula { row: 0, col: 0, .. })),
+            "header ClearFormula present: {batch:?}"
+        );
+        // THE KEY ASSERTION: the label SURVIVES a recompute (without the fix, the orphaned ="Q"
+        // re-evaluates and reverts the header to "Q").
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            assert!(rt.recompute_all().is_complete());
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Text(Arc::from("Quantity")),
+            "header STILL shows the renamed name after recompute (no revert)"
+        );
     }
 
     /// **W5-158 (Phase 4.8.G.3):** `rename_column` fires the
@@ -1812,6 +2057,134 @@ mod tests {
             assert!(rt.recompute_all().is_complete());
         }
         assert_eq!(wb.read(ql_types::Address::new(0, 11, 0)), Value::Number(12.0));
+    }
+
+    /// **FE-8.5 (2026-06-15) — FULL-PARITY column names round-trip.** The kill-gate for
+    /// the IDE header-text → column-name sync: prove the engine round-trips the broader
+    /// class the IDE is about to start passing in (synced from spreadsheet header cells) —
+    /// names containing a SPACE (`Total Revenue`), a DIGIT-LEADING / all-numeric form
+    /// (`2026`), a NON-ASCII UTF-8 char (`Région`), and a HYPHEN (`Gross-Margin`). All four
+    /// resolve by NAME inside `Table[...]` (the lexer reads bracket content RAW; the parser
+    /// trims only leading/trailing whitespace), and a space-containing name rewrites cleanly
+    /// on rename (the printer emits spaces unescaped). This is the engine-side proof that
+    /// the IDE's relaxed `columnNameRejectionReason` (accept any name needing NO escaping)
+    /// is sound. If ANY case here fails, the IDE relaxation must NOT ship.
+    #[test]
+    fn structured_ref_parity_column_names_round_trip() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // Table "Pnl" A1:E4 — header + 3 data rows. Cols 0..=3 are the four newly-accepted
+        // name SHAPES; col 4 "Calc" hosts the in-table @-form formula.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table(
+                "Pnl",
+                0,
+                0,
+                0,
+                4,
+                5,
+                true,
+                false,
+                vec![
+                    "Total Revenue".into(),
+                    "2026".into(),
+                    "Région".into(),
+                    "Gross-Margin".into(),
+                    "Calc".into(),
+                ],
+            )
+            .expect("create_table must ACCEPT space / digit-leading / UTF-8 / hyphen column names");
+        }
+        // Seed the four data columns, rows 1..=3.
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(100.0)); // Total Revenue
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(200.0));
+        wb.put(ql_types::Address::new(0, 3, 0), Value::Number(300.0));
+        wb.put(ql_types::Address::new(0, 1, 1), Value::Number(10.0)); // 2026
+        wb.put(ql_types::Address::new(0, 2, 1), Value::Number(20.0));
+        wb.put(ql_types::Address::new(0, 3, 1), Value::Number(30.0));
+        wb.put(ql_types::Address::new(0, 1, 2), Value::Number(1.0)); // Région
+        wb.put(ql_types::Address::new(0, 2, 2), Value::Number(2.0));
+        wb.put(ql_types::Address::new(0, 3, 2), Value::Number(3.0));
+        wb.put(ql_types::Address::new(0, 1, 3), Value::Number(5.0)); // Gross-Margin
+        wb.put(ql_types::Address::new(0, 2, 3), Value::Number(5.0));
+        wb.put(ql_types::Address::new(0, 3, 3), Value::Number(5.0));
+
+        // (1) BIND + EVAL: each new-shape column resolves by NAME inside `Table[...]`.
+        //     SUM formulas live OUTSIDE the table footprint (col 7, rows 10..=13).
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            assert_eq!(
+                rt.set_formula(0, 10, 7, "SUM(Pnl[Total Revenue])").unwrap(),
+                Value::Number(600.0),
+                "SUM(Pnl[Total Revenue]) resolves a SPACE-containing column name"
+            );
+            assert_eq!(
+                rt.set_formula(0, 11, 7, "SUM(Pnl[2026])").unwrap(),
+                Value::Number(60.0),
+                "SUM(Pnl[2026]) resolves a DIGIT-LEADING column name"
+            );
+            assert_eq!(
+                rt.set_formula(0, 12, 7, "SUM(Pnl[Région])").unwrap(),
+                Value::Number(6.0),
+                "SUM(Pnl[Région]) resolves a UTF-8 column name"
+            );
+            assert_eq!(
+                rt.set_formula(0, 13, 7, "SUM(Pnl[Gross-Margin])").unwrap(),
+                Value::Number(15.0),
+                "SUM(Pnl[Gross-Margin]) resolves a HYPHEN column name"
+            );
+            // (2) THIS-ROW @-form on the space name, in the in-table Calc col (data row 1).
+            assert_eq!(
+                rt.set_formula(0, 1, 4, "Pnl[@Total Revenue]*2").unwrap(),
+                Value::Number(200.0),
+                "Pnl[@Total Revenue] at row 1 -> 100, *2 = 200"
+            );
+        }
+
+        // (3) RENAME a SPACE name TO another SPACE name: both the SUM and the @-form rewrite.
+        let rewritten = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_column("Pnl", "Total Revenue", "Net Sales 2027").unwrap()
+        };
+        assert_eq!(rewritten, 2, "both Pnl[Total Revenue] formulas rewrite");
+        let sum_text = wb.formula_at(0, 10, 7).expect("SUM formula present").clone();
+        assert!(
+            sum_text.contains("Net Sales 2027") && !sum_text.contains("Total Revenue"),
+            "SUM text rewritten to the new space name: {sum_text}"
+        );
+        let at_text = wb.formula_at(0, 1, 4).expect("@ formula present").clone();
+        assert!(
+            at_text.contains("Net Sales 2027") && !at_text.contains("Total Revenue"),
+            "@-form text rewritten to the new space name: {at_text}"
+        );
+        // Re-bind against the renamed (still space-containing) column preserves the values.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            assert!(rt.recompute_all().is_complete());
+        }
+        assert_eq!(wb.read(ql_types::Address::new(0, 10, 7)), Value::Number(600.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 4)), Value::Number(200.0));
+
+        // (4) PUNCTUATION that needs NO escaping (`% ( ) &` + space) round-trips too. Rename the "2026"
+        //     column (values 10+20+30=60) to a finance-style name: this exercises the printer's rewrite-EMIT
+        //     path for the punctuation (SUM(Pnl[2026]) at (0,11,7) rewrites), and the fresh-PARSE path (a new
+        //     SUM below). Pins the IDE's relaxed validator accepting the WHOLE no-escaping-needed class, not
+        //     just the four probed shapes above.
+        let punct_rewritten = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_column("Pnl", "2026", "Net % (P&L)").unwrap()
+        };
+        assert_eq!(punct_rewritten, 1, "SUM(Pnl[2026]) rewrites to the punctuated name");
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let v = rt.set_formula(0, 15, 7, "SUM(Pnl[Net % (P&L)])").unwrap();
+            assert_eq!(
+                v,
+                Value::Number(60.0),
+                "SUM resolves a `% ( ) &`-punctuated column name (fresh parse)"
+            );
+        }
     }
 
     // ===== W5-122 (Phase 4.8.J) — resize_table =====
