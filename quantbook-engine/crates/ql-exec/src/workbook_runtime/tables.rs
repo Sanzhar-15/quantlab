@@ -1654,6 +1654,166 @@ mod tests {
         );
     }
 
+    /// **FE-8.4 (2026-06-15) — cell-ref-SHAPED column names round-trip.** A column
+    /// literally named like a cell reference (`Q3`, `R2`) is created, referenced via
+    /// `Table[Q3]` (and the this-row `Table[@Q3]` form), and renamed both TO and FROM
+    /// such a name — proving the structured-reference machinery (lex → parse → bind →
+    /// eval → print → rewrite) is NAME-based and SHAPE-agnostic. A column is ALWAYS
+    /// referenced bracketed + table-qualified, so `Q3` is never ambiguous with the A1
+    /// coordinate Q3. This is the engine-side proof the IDE leans on when it relaxes
+    /// its (stricter-than-engine) rename-column validation to allow `Q1..Q4` columns —
+    /// the engine accepts them, so the IDE's blanket cell-ref rejection was false.
+    #[test]
+    fn structured_ref_cell_ref_shaped_column_names_round_trip() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // Table "Forecast" A1:C4 — header + 3 data rows. Column 1 is literally "Q3"
+        // (a cell-ref shape); column 2 "Calc" hosts the @-form formula inside the table.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table(
+                "Forecast",
+                0,
+                0,
+                0,
+                4,
+                3,
+                true,
+                false,
+                vec!["Region".into(), "Q3".into(), "Calc".into()],
+            )
+            .expect("create_table must ACCEPT a cell-ref-shaped column name (Q3)");
+        }
+        // Seed the Q3 column (col 1) data rows (1..=3): 200, 210, 220.
+        wb.put(ql_types::Address::new(0, 1, 1), Value::Number(200.0));
+        wb.put(ql_types::Address::new(0, 2, 1), Value::Number(210.0));
+        wb.put(ql_types::Address::new(0, 3, 1), Value::Number(220.0));
+
+        // (1) BIND + EVAL: SUM(Forecast[Q3]) resolves the cell-ref-shaped column by NAME.
+        //     (2) THIS-ROW form Forecast[@Q3] at C2 (data row 0) narrows to 200, *2 = 400.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let v = rt.set_formula(0, 10, 0, "SUM(Forecast[Q3])").unwrap();
+            assert_eq!(v, Value::Number(630.0), "SUM(Forecast[Q3]) = 200+210+220");
+            let v2 = rt.set_formula(0, 1, 2, "Forecast[@Q3]*2").unwrap();
+            assert_eq!(
+                v2,
+                Value::Number(400.0),
+                "Forecast[@Q3] at row 1 -> 200, *2 = 400"
+            );
+        }
+
+        // (3) RENAME TO a cell-ref shape: Q3 -> R2 (R2 is ALSO cell-ref-shaped). BOTH
+        //     formulas (the SUM and the @-form) must rewrite their structured-ref text.
+        let rewritten = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_column("Forecast", "Q3", "R2").unwrap()
+        };
+        assert_eq!(rewritten, 2, "both Forecast[Q3] formulas rewrite to R2");
+        let sum_text = wb.formula_at(0, 10, 0).expect("SUM formula present").clone();
+        assert!(
+            sum_text.contains("R2") && !sum_text.contains("Q3"),
+            "SUM text rewritten to R2: {sum_text}"
+        );
+        let at_text = wb.formula_at(0, 1, 2).expect("@ formula present").clone();
+        assert!(
+            at_text.contains("R2") && !at_text.contains("Q3"),
+            "@-form text rewritten to R2: {at_text}"
+        );
+        // Re-bind against the new (still cell-ref-shaped) name preserves the values.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            assert!(rt.recompute_all().is_complete());
+        }
+        assert_eq!(wb.read(ql_types::Address::new(0, 10, 0)), Value::Number(630.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 2)), Value::Number(400.0));
+
+        // (4) RENAME FROM a cell-ref shape to a plain name: R2 -> Quarter3.
+        let rewritten2 = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_column("Forecast", "R2", "Quarter3").unwrap()
+        };
+        assert_eq!(rewritten2, 2);
+        let sum_text2 = wb.formula_at(0, 10, 0).expect("SUM formula").clone();
+        assert!(
+            sum_text2.contains("Quarter3") && !sum_text2.contains("R2"),
+            "SUM text rewritten to Quarter3: {sum_text2}"
+        );
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            assert!(rt.recompute_all().is_complete());
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 10, 0)),
+            Value::Number(630.0),
+            "value stable after rename FROM the cell-ref shape"
+        );
+    }
+
+    /// **FE-8.4 (2026-06-15) — R1C1-FORM column names round-trip.** The companion to
+    /// the cell-ref-shape test: bare `R`/`C` and the `R1C1` form are also categorically
+    /// safe as column names. Inside `Table[...]` the lexer reads the bracket content as a
+    /// RAW column string — there is no R1C1 (or A1) coordinate interpretation there — so
+    /// `Grid[R1C1]` resolves the column literally named `R1C1`. This backs the IDE
+    /// dropping BOTH ambiguity guards (cell-ref AND R1C1) for column names specifically.
+    #[test]
+    fn structured_ref_r1c1_shaped_column_names_round_trip() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // Table "Grid" A1:C3 — header + 2 data rows. Columns are literally the R1C1
+        // reservations Excel forbids as DEFINED names: bare `R`, bare `C`, and `R1C1`.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table(
+                "Grid",
+                0,
+                0,
+                0,
+                3,
+                3,
+                true,
+                false,
+                vec!["R".into(), "C".into(), "R1C1".into()],
+            )
+            .expect("create_table must ACCEPT R1C1-form column names (R, C, R1C1)");
+        }
+        // Seed the bare-`R` column (col 0): 1, 2 -> 3; and the `R1C1` column (col 2): 5, 7 -> 12.
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(1.0));
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(2.0));
+        wb.put(ql_types::Address::new(0, 1, 2), Value::Number(5.0));
+        wb.put(ql_types::Address::new(0, 2, 2), Value::Number(7.0));
+
+        // BIND + EVAL: a bare `R` and an `R1C1` column both resolve by NAME inside brackets.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let vr = rt.set_formula(0, 10, 0, "SUM(Grid[R])").unwrap();
+            assert_eq!(vr, Value::Number(3.0), "SUM(Grid[R]) resolves the bare-R column");
+            let vrc = rt.set_formula(0, 11, 0, "SUM(Grid[R1C1])").unwrap();
+            assert_eq!(
+                vrc,
+                Value::Number(12.0),
+                "SUM(Grid[R1C1]) resolves the R1C1-named column"
+            );
+        }
+
+        // RENAME an R1C1-form column away (R1C1 -> Total) rewrites + rebinds cleanly.
+        let rewritten = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_column("Grid", "R1C1", "Total").unwrap()
+        };
+        assert_eq!(rewritten, 1, "the SUM(Grid[R1C1]) formula rewrites");
+        let text = wb.formula_at(0, 11, 0).expect("formula present").clone();
+        assert!(
+            text.contains("Total") && !text.contains("R1C1"),
+            "text rewritten to Total: {text}"
+        );
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            assert!(rt.recompute_all().is_complete());
+        }
+        assert_eq!(wb.read(ql_types::Address::new(0, 11, 0)), Value::Number(12.0));
+    }
+
     // ===== W5-122 (Phase 4.8.J) — resize_table =====
 
     #[test]
