@@ -201,6 +201,20 @@ suite('W3 extractFormulaRefs -- numbers, brackets, errors', () => {
 		assert.deepStrictEqual(refs('=SUM(Table1[[#Data],[A1]])+A1'), ['A1']);
 	});
 
+	// FE-8.6 (2026-06-15): the bracket balancer is OOXML-ESCAPE-AWARE -- it skips each `'X` 2-char atom (the
+	// engine's `escape_for_sref` `'`-escapes `[ ] # @ '` in column names), so an UNBALANCED bracket inside a name
+	// can't mis-count depth and mis-attribute precedents. The A1 OUTSIDE the ref is the only precedent.
+	test('FE-8.6: escaped structured-ref column names do not derail extraction (escape-aware balancer)', () => {
+		// Unbalanced `[` -> `Sales[Net '[Margin]`: only the trailing A1 is a precedent (was swallowed pre-fix).
+		assert.deepStrictEqual(refs('=SUM(Sales[Net \'[Margin])+A1'), ['A1']);
+		// Unbalanced `]` -> `Sales[x']B2]`: `B2` is inside the column token (NOT a ref); `C3` outside IS.
+		assert.deepStrictEqual(refs('=Sales[x\']B2]+C3'), ['C3']);
+		// Balanced escaped name + `#`/`@`/`'` escapes: outside ref only.
+		assert.deepStrictEqual(refs('=Sales[Net \'[Margin\']]+A1'), ['A1']);
+		assert.deepStrictEqual(refs('=Sales[\'#Tot]+A1'), ['A1']);
+		assert.deepStrictEqual(refs('=Sales[Bob\'\'s]+A1'), ['A1']);
+	});
+
 	test('re-audit HIGH: an EXTERNAL-workbook ref [N]Sheet!A1 is NOT emitted as a local edge', () => {
 		// `[1]Sheet1!A1` / `[Book.xlsx]Data!C3` point into ANOTHER workbook -- emitting the cell as a local
 		// precedent would fabricate an edge. The whole external ref (incl. a range right endpoint) is dropped;

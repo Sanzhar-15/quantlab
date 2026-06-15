@@ -255,24 +255,26 @@ suite('FE-8.3 planColumnRename', () => {
 			assert.match(a.reason, /already has a column named "profit"/);
 		}
 	});
-	test('a name with an escape-needing special char is a loud error', () => {
-		const a = planColumnRename(roster, 'Revenue', 'Net[1]');
-		assert.strictEqual(a.kind, 'error');
-		if (a.kind === 'error') {
-			assert.match(a.reason, /reserved in structured references/i);
-		}
+	test('an escape-needing special-char new name is now ACCEPTED (FE-8.6)', () => {
+		// `Net[1]` (contains `[` + `]`) -- FE-8.5 rejected this; FE-8.6 accepts it (the engine `'`-escapes the
+		// brackets when it rewrites the structured-ref text, so the rename is faithful).
+		assert.deepStrictEqual(
+			planColumnRename(roster, 'Revenue', 'Net[1]'),
+			{ kind: 'rename', oldCol: 'Revenue', newCol: 'Net[1]' } as ColumnRenameAction,
+		);
 	});
-	// FE-8.4/8.5 (2026-06-15): a column name MAY be cell-ref-shaped (Q1..Q4), an R1C1 form, contain SPACES
-	// (`Order Date` -- the headline FE-8.5 case), be digit-leading (`2026`), or carry no-escape punctuation --
-	// a column is only ever referenced bracketed + table-qualified (`Table[Order Date]`), and the engine accepts
-	// + round-trips all of these (verified: ql-exec structured_ref_parity + cell-ref/R1C1 probes). These would
-	// have been REJECTED before FE-8.4/8.5.
+	// FE-8.4/8.5/8.6 (2026-06-15): a column name MAY be cell-ref-shaped (Q1..Q4), an R1C1 form, contain SPACES
+	// (`Order Date`), be digit-leading (`2026`), carry no-escape punctuation, OR contain the OOXML escape specials
+	// `[ ] # @ '` (`Net [Margin]` -- the headline FE-8.6 case) -- a column is only ever referenced bracketed +
+	// table-qualified (`Table[Net '[Margin']]`), and the engine accepts + round-trips all of these (verified:
+	// ql-exec structured_ref_escape_char + parity + cell-ref/R1C1 probes). These would have been REJECTED before.
 	const NOW_ACCEPTED = [
 		'Q3', 'Q1', 'R2', 'A1', 'AB12', // cell-ref shapes (FE-8.4)
 		'R', 'C', 'RC', 'R1C1', // R1C1 forms (FE-8.4)
 		'Order Date', 'Q3 2026', // spaces (FE-8.5)
 		'2026', '1bad', // digit-leading (FE-8.5)
 		'Gross-Margin', 'Net Margin %', 'P&L', // no-escape punctuation (FE-8.5)
+		'Net [Margin]', 'a]b', 'Cost#1', 'with#hash', '@Rate', 'at@sign', 'Bob\'s', 'it\'s', // OOXML escape specials (FE-8.6)
 	];
 	for (const accepted of NOW_ACCEPTED) {
 		test(`a full-parity new name "${accepted}" is now ACCEPTED`, () => {
@@ -282,10 +284,9 @@ suite('FE-8.3 planColumnRename', () => {
 			);
 		});
 	}
-	// ...but names that need escaping or are structurally unsafe are STILL rejected (No-Fallbacks: relax only to
-	// the probe-verified no-escaping-needed class).
-	for (const stillInvalid of ['a]b', 'with#hash', 'at@sign', 'it\'s', ' Revenue', 'Revenue ', '']) {
-		test(`a name needing escaping / unsafe ${JSON.stringify(stillInvalid)} is STILL rejected`, () => {
+	// ...but structurally-unsafe names (edge whitespace, empty, control chars) are STILL rejected (No-Fallbacks).
+	for (const stillInvalid of [' Revenue', 'Revenue ', '', `a${String.fromCharCode(0x01)}b`]) {
+		test(`a structurally-unsafe name ${JSON.stringify(stillInvalid)} is STILL rejected`, () => {
 			const a = planColumnRename(roster, 'Revenue', stillInvalid);
 			assert.strictEqual(a.kind, 'error');
 		});
@@ -352,12 +353,22 @@ suite('FE-8.5 planColumnNamesFromHeaders', () => {
 			{ kind: 'ok', names: ['Revenue'] },
 		);
 	});
-	test('a header with an escape-needing char is a loud error naming the column + reason', () => {
-		const r = planColumnNamesFromHeaders(['Region', 'Net[1]', 'Profit']);
+	test('a header with OOXML escape chars is now ACCEPTED verbatim (FE-8.6)', () => {
+		// `Net [Margin]` (`[`+`]`) and `Cost#1` (`#`) -- FE-8.5 would have loud-refused these; FE-8.6 names the
+		// columns after them directly (the engine `'`-escapes the specials when it emits structured-ref text).
+		assert.deepStrictEqual(
+			planColumnNamesFromHeaders(['Net [Margin]', 'Cost#1', '@Rate', 'Bob\'s']),
+			{ kind: 'ok', names: ['Net [Margin]', 'Cost#1', '@Rate', 'Bob\'s'] },
+		);
+	});
+	test('a header with a control char is STILL a loud error naming the column + reason', () => {
+		// Control chars are the only char-class still rejected (the printer can't escape them). A leading/trailing
+		// whitespace header is TRIMMED first (so it can't trip the edge-whitespace rule) -- use an interior control char.
+		const r = planColumnNamesFromHeaders(['Region', `Net${String.fromCharCode(0x01)}1`, 'Profit']);
 		assert.strictEqual(r.kind, 'error');
 		if (r.kind === 'error') {
 			assert.match(r.reason, /Column 2 header/);
-			assert.match(r.reason, /reserved in structured references/i);
+			assert.match(r.reason, /control character/i);
 		}
 	});
 	test('duplicate header text (case-insensitive) is a loud error naming both columns', () => {

@@ -193,6 +193,15 @@ export function translateFormulaRefs(formula: string, dRow: number, dCol: number
 			const start = i;
 			let depth = 0;
 			while (i < n) {
+				// FE-8.6: OOXML escape -- inside `[...]` a `'X` 2-char atom escapes X (one of `[ ] # @ '`), so the
+				// escaped char must NOT change bracket depth. Skip both. Mirrors the engine's
+				// `consume_structured_ref_bracket` (ql-formula-syntax lexer.rs). Without this, a column name with an
+				// UNBALANCED `[`/`]` (e.g. `Net [Margin`, printed `Table[Net '[Margin]`) mis-counts depth and the
+				// verbatim copy over/under-runs -- silently corrupting the offset of a real A1 ref outside it.
+				if (formula[i] === '\'') {
+					i += 2;
+					continue;
+				}
 				if (formula[i] === '[') {
 					depth += 1;
 				} else if (formula[i] === ']') {

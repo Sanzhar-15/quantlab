@@ -151,4 +151,36 @@ suite('FE-1.5 a1FormulaRefs -- translateFormulaRefs', () => {
 		assert.strictEqual(translateFormulaRefs('=Table1[Amount]+A1', 1, 0), '=Table1[Amount]+A2');
 		assert.strictEqual(translateFormulaRefs('=SUM(Table1[[#Data],[A1]])+A1', 1, 0), '=SUM(Table1[[#Data],[A1]])+A2');
 	});
+	// FE-8.6 (2026-06-15): the bracket balancer is OOXML-ESCAPE-AWARE. A column name carrying `[ ] # @ '` is
+	// printed with `'`-escapes (the engine's `escape_for_sref`); the balancer must skip each `'X` 2-char atom so an
+	// UNBALANCED bracket inside a name can't mis-count depth and corrupt the offset of a real A1 ref OUTSIDE the
+	// ref (audit HIGH-1: copy/paste/fill silently corrupted such formulas before the escape-skip).
+	test('FE-8.6: escaped structured-ref column names do not derail A1 offsetting (escape-aware balancer)', () => {
+		// Unbalanced `[` in the name -> printed `Sales[Net '[Margin]`. The trailing `A1` MUST still offset to A2;
+		// without the escape-skip the `'[` pushed depth to 2 and the balancer swallowed `A1` to EOF.
+		assert.strictEqual(
+			translateFormulaRefs('=SUM(Sales[Net \'[Margin])+A1', 1, 0),
+			'=SUM(Sales[Net \'[Margin])+A2',
+		);
+		// Unbalanced `]` in the name -> printed `Sales[x']B2]`. The `B2` is INSIDE the column token (must NOT
+		// offset); the real `C3` outside MUST offset. Without the escape-skip the `']` closed the bracket early,
+		// leaked `B2]`, and wrongly offset `B2`.
+		assert.strictEqual(
+			translateFormulaRefs('=Sales[x\']B2]+C3', 1, 0),
+			'=Sales[x\']B2]+C4',
+		);
+		// Balanced escaped name `Net [Margin]` -> `Sales[Net '[Margin']]`. Token copied verbatim; trailing A1 offsets.
+		assert.strictEqual(
+			translateFormulaRefs('=Sales[Net \'[Margin\']]+A1', 0, 1),
+			'=Sales[Net \'[Margin\']]+B1',
+		);
+		// `#`/`@`/`'` escapes (`'#`, `'@`, `''`) don't touch depth; ref outside still offsets.
+		assert.strictEqual(translateFormulaRefs('=Sales[\'#Tot]+A1', 1, 0), '=Sales[\'#Tot]+A2');
+		assert.strictEqual(translateFormulaRefs('=Sales[\'@Rate]+A1', 1, 0), '=Sales[\'@Rate]+A2');
+		assert.strictEqual(translateFormulaRefs('=Sales[Bob\'\'s]+A1', 1, 0), '=Sales[Bob\'\'s]+A2');
+		// Codex audit repro: a column named `]A1` (escaped `']`, and the rest LOOKS like a cell ref). Filling down
+		// MUST preserve the column name `]A1` (NOT cycle the embedded `A1` to `A2`) while the external B1 offsets.
+		// Pre-fix this produced `=T[']A2]+B2` -- silently corrupting the structured-ref column name.
+		assert.strictEqual(translateFormulaRefs('=T[\']A1]+B1', 1, 0), '=T[\']A1]+B2');
+	});
 });

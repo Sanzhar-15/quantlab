@@ -47,12 +47,13 @@ export function tableIdentifierRejectionReason(name: string): string | undefined
 }
 
 /**
- * **FE-8.4/8.5 (2026-06-15):** the rejection reason for a candidate table COLUMN name -- the RELAXED sibling of
- * {@link tableIdentifierRejectionReason}. Unlike a table / defined name (which shares the cell namespace, so a
+ * **FE-8.4/8.5/8.6 (2026-06-15):** the rejection reason for a candidate table COLUMN name -- the RELAXED sibling
+ * of {@link tableIdentifierRejectionReason}. Unlike a table / defined name (which shares the cell namespace, so a
  * cell-ref-shaped name like `Q3` is rejected as ambiguous), a column is ONLY ever referenced bracketed +
- * table-qualified (`Table[Order Date]`), so the engine accepts the full Excel-parity class (spaces, digit-
- * leading, UTF-8, cell-ref / R1C1 shapes). This delegates to {@link columnNameRejectionReason} (rejects only
- * the escape-needing + structurally-unsafe set). Use this -- NOT `tableIdentifierRejectionReason` -- for columns.
+ * table-qualified (`Table[Net '[Margin']]`), so the engine accepts full OOXML parity (spaces, digit-leading,
+ * UTF-8, cell-ref / R1C1 shapes, AND the escape-needing `[ ] # @ '`). This delegates to
+ * {@link columnNameRejectionReason} (rejects only empty / over-cap / edge-whitespace / control chars). Use this
+ * -- NOT `tableIdentifierRejectionReason` -- for columns.
  */
 export function tableColumnRejectionReason(name: string): string | undefined {
 	return columnNameRejectionReason(name);
@@ -388,14 +389,15 @@ export type ColumnRenameAction =
  *  5. otherwise -> `rename` (carrying the exact stored display name as `oldCol`).
  */
 export function planColumnRename(columnNames: readonly string[], oldCol: string, newCol: string): ColumnRenameAction {
-	// FE-8.4/8.5 (2026-06-15): validate `newCol` with the COLUMN rules ({@link tableColumnRejectionReason} ->
+	// FE-8.4/8.5/8.6 (2026-06-15): validate `newCol` with the COLUMN rules ({@link tableColumnRejectionReason} ->
 	// {@link columnNameRejectionReason}), NOT the stricter table/defined-name rules. A column is only ever
-	// referenced bracketed + table-qualified (`Table[Order Date]`), so the engine accepts + round-trips the
-	// full-parity class: cell-ref / R1C1 shapes (`Q3`, `R1C1`), spaces (`Order Date`), digit-leading (`2026`),
-	// and UTF-8 -- verified end-to-end (see the engine's `structured_ref_parity_column_names_round_trip` +
-	// `..._cell_ref_shaped_..` / `..._r1c1_..` probes). The column rule rejects ONLY names that would need
-	// escaping inside `Table[...]` (the OOXML specials `[ ] # @ '`, control chars, leading/trailing whitespace)
-	// or are empty / over-cap -- a loud refuse, never silent (No-Fallbacks: relax only to what's verified).
+	// referenced bracketed + table-qualified (`Table[Net '[Margin']]`), so the engine accepts + round-trips the
+	// full OOXML class: cell-ref / R1C1 shapes (`Q3`, `R1C1`), spaces (`Order Date`), digit-leading (`2026`),
+	// UTF-8, AND the escape-needing `[ ] # @ '` (the rename rewrite is `lex->parse->rewrite->print`, so the
+	// printer re-escapes the new name correctly) -- verified end-to-end (see the engine's
+	// `structured_ref_escape_char_column_names_round_trip` + `..._parity_..` / `..._cell_ref_shaped_..` probes).
+	// The column rule rejects ONLY empty / over-cap / control chars / leading-trailing whitespace -- a loud
+	// refuse, never silent (No-Fallbacks: relax only to what's verified).
 	const reason = tableColumnRejectionReason(newCol);
 	if (reason !== undefined) {
 		return { kind: 'error', reason };

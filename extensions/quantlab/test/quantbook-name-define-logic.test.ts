@@ -99,23 +99,24 @@ suite('FE-4 W1 nameDefineLogic -- definedNameRejectionReason', () => {
 	});
 });
 
-// FE-8.5 (2026-06-15): the column-name validator is now FULL EXCEL-PARITY (supersedes FE-8.4's stricter
-// identifier-only rule). A column is only ever referenced bracketed + table-qualified (`Table[Order Date]`),
-// and the engine accepts ANY non-empty, case-insensitively-unique name -- spaces, digit-leading, UTF-8,
-// cell-ref/R1C1 shapes, and the punctuation that needs no escaping (verified end-to-end: ql-exec
-// structured_ref_parity_column_names_round_trip + the FE-8.4 cell-ref/R1C1 probes). columnNameRejectionReason
-// now rejects ONLY: empty, over-cap, leading/trailing whitespace, control chars, and the five OOXML specials
-// `[ ] # @ '`. The defined/table-name path stays STRICT (regression-pinned below).
-suite('FE-8.5 nameDefineLogic -- columnNameRejectionReason (full Excel-parity)', () => {
-	// ACCEPTED as columns but REJECTED as defined names: cell-ref/R1C1 shapes (FE-8.4) PLUS the FE-8.5
-	// additions -- spaces, digit-leading, hyphen, no-escape punctuation, and non-ASCII. Each is unambiguous
-	// inside `Table[...]` but would collide with a coordinate / break the identifier rules for a defined name.
+// FE-8.6 (2026-06-15): the column-name validator is now FULL OOXML PARITY (supersedes FE-8.5, which deferred
+// the five escape-needing specials). A column is only ever referenced bracketed + table-qualified
+// (`Table[Net '[Margin']]`), and the engine `'`-escapes `[ ] # @ '` in structured-ref text + round-trips ANY
+// non-empty, case-insensitively-unique name (verified end-to-end: ql-exec
+// structured_ref_escape_char_column_names_round_trip + the FE-8.5 parity / FE-8.4 cell-ref/R1C1 probes).
+// columnNameRejectionReason now rejects ONLY: empty, over-cap, leading/trailing whitespace, control chars.
+// The defined/table-name path stays STRICT (regression-pinned below).
+suite('FE-8.6 nameDefineLogic -- columnNameRejectionReason (full OOXML parity)', () => {
+	// ACCEPTED as columns but REJECTED as defined names: cell-ref/R1C1 shapes (FE-8.4); spaces / digit-leading /
+	// no-escape punctuation / non-ASCII (FE-8.5); AND the five OOXML escape specials `[ ] # @ '` (FE-8.6). Each
+	// is unambiguous inside `Table[...]` (the engine escapes the specials), but breaks the strict defined-name rules.
 	const COLUMN_OK_BUT_NOT_DEFINED = [
 		'Q1', 'Q3', 'A1', 'R2', 'AB12', 'R', 'C', 'RC', 'R1C1', 'r1c1', 'c', // cell-ref / R1C1 (FE-8.4)
 		'Order Date', 'Total Revenue', 'Q3 2026', // spaces (FE-8.5)
 		'2026', '1bad', // digit-leading (FE-8.5)
 		'Gross-Margin', 'a-b', 'a+b', 'Net Margin %', 'Price (USD)', 'P&L', // no-escape punctuation (FE-8.5)
 		'Région', 'café', '日本', // non-ASCII / UTF-8 (FE-8.5)
+		'Net [Margin]', '[bracket]', 'a]b', 'Cost#1', 'with#hash', '@Rate', '@col', 'at@sign', 'Bob\'s', 'it\'s', 'a#1', // OOXML escape specials (FE-8.6)
 	];
 	for (const name of COLUMN_OK_BUT_NOT_DEFINED) {
 		test(`"${name}" is a valid COLUMN name but NOT a valid defined name`, () => {
@@ -141,13 +142,13 @@ suite('FE-8.5 nameDefineLogic -- columnNameRejectionReason (full Excel-parity)',
 		const reason = columnNameRejectionReason('a'.repeat(MAX_DEFINED_NAME_LENGTH + 1)) ?? '';
 		assert.match(reason, new RegExp(String(MAX_DEFINED_NAME_LENGTH)));
 	});
-	// STILL rejected: the five OOXML structured-ref specials (need `'`-escaping inside `Table[...]`; v1 keeps
-	// the accepted class escaping-free). The reject message names the char ("reserved in structured references").
-	for (const bad of ['[bracket]', 'a]b', 'with#hash', 'at@sign', 'it\'s', '@col', 'a#1']) {
-		test(`a name with an escape-needing special ${JSON.stringify(bad)} is rejected`, () => {
-			assert.ok(columnNameRejectionReason(bad), `column should reject ${bad}`);
-			assert.strictEqual(isValidColumnName(bad), false);
-			assert.match(columnNameRejectionReason(bad) ?? '', /reserved in structured references/i);
+	// FE-8.6: the five OOXML escape specials `[ ] # @ '` are now ACCEPTED (the engine `'`-escapes them in
+	// structured-ref text; round-trip proven by ql-exec structured_ref_escape_char_column_names_round_trip).
+	// One representative per char + the headline `Net [Margin]` -- all valid, none rejected.
+	for (const ok of ['Net [Margin]', 'A]B', 'Cost#1', '@Rate', 'Bob\'s', '\'quoted\'', '#All', '[a][b]']) {
+		test(`an OOXML escape-special name ${JSON.stringify(ok)} is now ACCEPTED (FE-8.6)`, () => {
+			assert.strictEqual(columnNameRejectionReason(ok), undefined, `column should accept ${ok}`);
+			assert.strictEqual(isValidColumnName(ok), true);
 		});
 	}
 	// STILL rejected: leading/trailing whitespace (the engine TRIMS `Table[ x ]`, so a padded name can't match).

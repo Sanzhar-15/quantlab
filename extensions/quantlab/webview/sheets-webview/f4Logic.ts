@@ -240,6 +240,15 @@ function collectRefs(formula: string): LocatedRef[] {
 		if (ch === '[') {
 			let depth = 0;
 			while (i < n) {
+				// FE-8.6: OOXML escape -- inside `[...]` a `'X` 2-char atom escapes X (one of `[ ] # @ '`), so the
+				// escaped char must NOT change bracket depth. Skip both. Mirrors the engine's
+				// `consume_structured_ref_bracket` (ql-formula-syntax lexer.rs). Without this, an UNBALANCED `[`/`]`
+				// in a column name mis-counts depth, so F4 would mis-skip the structured ref and cycle an A1 ref
+				// either inside the column name or past a real ref -- silently corrupting the formula.
+				if (formula[i] === '\'') {
+					i += 2;
+					continue;
+				}
 				if (formula[i] === '[') {
 					depth += 1;
 				} else if (formula[i] === ']') {

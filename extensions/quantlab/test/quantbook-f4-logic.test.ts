@@ -179,6 +179,21 @@ suite('FE-4 f4Logic -- no-op cases (No-Fallbacks: never guess a ref)', () => {
 		// "=Table1[A1]" -- the "A1" is a column token, not a cell ref.
 		assert.strictEqual(cyc('=Table1[A1]', 8), null);
 	});
+
+	// FE-8.6 (2026-06-15): the bracket balancer is OOXML-ESCAPE-AWARE (skips each `'X` 2-char atom the engine's
+	// `escape_for_sref` emits for `[ ] # @ '`). Without it, an UNBALANCED bracket in a column name mis-counts depth
+	// so F4 would either fail to find / corrupt a real A1 ref outside the structured ref, or cycle one leaked from
+	// inside the column token (audit HIGH-1: F4 persists the formula, so this was silent corruption).
+	test('FE-8.6: F4 cycles the real ref OUTSIDE an escaped structured ref, never one inside the column name', () => {
+		// Unbalanced `[`: "=SUM(Sales[Net '[Margin])+A1" -- the trailing A1 (index 26) MUST cycle; pre-fix the `'[`
+		// pushed depth to 2 and the balancer swallowed A1, so collectRefs found nothing and F4 was a no-op.
+		assert.strictEqual(cyc('=SUM(Sales[Net \'[Margin])+A1', 26), '=SUM(Sales[Net \'[Margin])+$A$1');
+		// Unbalanced `]`: "=Sales[x']B2]+C3" -- `B2` (index 10) is INSIDE the column token `[x']B2]`, so a caret on
+		// it is a no-op (pre-fix the `']` closed the bracket early and `B2` leaked as a cyclable ref -> corruption).
+		assert.strictEqual(cyc('=Sales[x\']B2]+C3', 10), null);
+		// ...and the genuine `C3` (index 14) outside that ref still cycles.
+		assert.strictEqual(cyc('=Sales[x\']B2]+C3', 14), '=Sales[x\']B2]+$C$3');
+	});
 });
 
 suite('FE-4 f4Logic -- caret clamping + boundary safety', () => {

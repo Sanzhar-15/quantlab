@@ -2177,9 +2177,10 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// FE-8.3 (2026-06-15): rename a table COLUMN. The napi `renameColumn(table, oldCol, newCol)` exists (the
 	// engine rewrites referencing structured-ref formula text in the same undo unit) but was unreachable --
 	// the IDE couldn't read a table's column names. With `tableColumns(name)` (FE-8.3) we list them, let the
-	// operator pick one + type the new name, validate via the COLUMN identifier rules (FE-8.4/8.5: relaxed to
-	// full Excel-parity -- spaces like `Order Date`, digit-leading, cell-ref/R1C1 shapes, UTF-8; only the
-	// escape-needing `[ ] # @ '` rejected) + `planColumnRename` (mirrors the engine's checks), then call the
+	// operator pick one + type the new name, validate via the COLUMN identifier rules (FE-8.4/8.5/8.6: relaxed to
+	// full OOXML parity -- spaces like `Order Date`, digit-leading, cell-ref/R1C1 shapes, UTF-8, AND the OOXML
+	// escape chars `[ ] # @ '` which the engine `'`-escapes in structured refs) + `planColumnRename` (mirrors the
+	// engine's checks), then call the
 	// engine. Table picked context-aware or from a QuickPick, exactly like Rename/Drop Table.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookRenameColumn', async (...args: unknown[]) => {
@@ -2224,11 +2225,12 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			const newCol = await vscode.window.showInputBox({
 				title: `Rename Column "${oldCol}"`,
-				// FE-8.4/8.5: column names use the RELAXED, full-parity rule -- they MAY contain spaces
-				// (`Order Date`), be digit-leading (`2026`), cell-ref-shaped (`Q3`) or R1C1-form, or non-ASCII,
+				// FE-8.4/8.5/8.6: column names use the RELAXED, full-OOXML-parity rule -- they MAY contain spaces
+				// (`Order Date`), be digit-leading (`2026`), cell-ref-shaped (`Q3`) or R1C1-form, non-ASCII, OR
+				// contain the OOXML escape chars `[ ] # @ '` (the engine `'`-escapes them in structured refs),
 				// unlike table/defined names, because a column is only ever referenced as `Table[<name>]`. Only
-				// the escape-needing chars `[ ] # @ '` (and control / edge-whitespace) are rejected.
-				prompt: 'New column name (may include spaces, e.g. "Order Date"; not [ ] # @ or \')',
+				// empty / over-cap / control chars / edge-whitespace are rejected.
+				prompt: 'New column name (may include spaces and [ ] # @ \' -- e.g. "Net [Margin]")',
 				value: oldCol,
 				validateInput: (value) => tableColumnRejectionReason(value),
 			});
