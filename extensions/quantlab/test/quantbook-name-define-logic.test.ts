@@ -99,13 +99,24 @@ suite('FE-4 W1 nameDefineLogic -- definedNameRejectionReason', () => {
 	});
 });
 
-// FE-8.4 (2026-06-15): the RELAXED column-name validator. A column is only ever referenced bracketed +
-// table-qualified (`Table[Q3]`), so cell-ref-shaped + R1C1-form names are unambiguous and the engine accepts
-// them (verified: ql-exec structured_ref_*_round_trip). columnNameRejectionReason keeps the STRUCTURAL rules
-// but drops the two coordinate-collision guards that definedNameRejectionReason enforces.
-suite('FE-8.4 nameDefineLogic -- columnNameRejectionReason (relaxed for columns)', () => {
-	// Cell-ref-shaped + R1C1-form names: REJECTED as defined names, ACCEPTED as column names.
-	const COLUMN_OK_BUT_NOT_DEFINED = ['Q1', 'Q3', 'A1', 'R2', 'AB12', 'R', 'C', 'RC', 'R1C1', 'r1c1', 'c'];
+// FE-8.5 (2026-06-15): the column-name validator is now FULL EXCEL-PARITY (supersedes FE-8.4's stricter
+// identifier-only rule). A column is only ever referenced bracketed + table-qualified (`Table[Order Date]`),
+// and the engine accepts ANY non-empty, case-insensitively-unique name -- spaces, digit-leading, UTF-8,
+// cell-ref/R1C1 shapes, and the punctuation that needs no escaping (verified end-to-end: ql-exec
+// structured_ref_parity_column_names_round_trip + the FE-8.4 cell-ref/R1C1 probes). columnNameRejectionReason
+// now rejects ONLY: empty, over-cap, leading/trailing whitespace, control chars, and the five OOXML specials
+// `[ ] # @ '`. The defined/table-name path stays STRICT (regression-pinned below).
+suite('FE-8.5 nameDefineLogic -- columnNameRejectionReason (full Excel-parity)', () => {
+	// ACCEPTED as columns but REJECTED as defined names: cell-ref/R1C1 shapes (FE-8.4) PLUS the FE-8.5
+	// additions -- spaces, digit-leading, hyphen, no-escape punctuation, and non-ASCII. Each is unambiguous
+	// inside `Table[...]` but would collide with a coordinate / break the identifier rules for a defined name.
+	const COLUMN_OK_BUT_NOT_DEFINED = [
+		'Q1', 'Q3', 'A1', 'R2', 'AB12', 'R', 'C', 'RC', 'R1C1', 'r1c1', 'c', // cell-ref / R1C1 (FE-8.4)
+		'Order Date', 'Total Revenue', 'Q3 2026', // spaces (FE-8.5)
+		'2026', '1bad', // digit-leading (FE-8.5)
+		'Gross-Margin', 'a-b', 'a+b', 'Net Margin %', 'Price (USD)', 'P&L', // no-escape punctuation (FE-8.5)
+		'Région', 'café', '日本', // non-ASCII / UTF-8 (FE-8.5)
+	];
 	for (const name of COLUMN_OK_BUT_NOT_DEFINED) {
 		test(`"${name}" is a valid COLUMN name but NOT a valid defined name`, () => {
 			assert.strictEqual(columnNameRejectionReason(name), undefined, `column should accept ${name}`);
@@ -122,7 +133,7 @@ suite('FE-8.4 nameDefineLogic -- columnNameRejectionReason (relaxed for columns)
 			assert.strictEqual(definedNameRejectionReason(name), undefined);
 		});
 	}
-	// Names that would need bracket-escaping (or are empty/over-cap) are STILL rejected for columns too.
+	// STILL rejected for columns: empty + over-cap.
 	test('empty -> a column-specific empty message', () => {
 		assert.match(columnNameRejectionReason('') ?? '', /column name cannot be empty/i);
 	});
@@ -130,20 +141,37 @@ suite('FE-8.4 nameDefineLogic -- columnNameRejectionReason (relaxed for columns)
 		const reason = columnNameRejectionReason('a'.repeat(MAX_DEFINED_NAME_LENGTH + 1)) ?? '';
 		assert.match(reason, new RegExp(String(MAX_DEFINED_NAME_LENGTH)));
 	});
-	test('a leading digit is rejected (would not be a bare identifier)', () => {
-		assert.match(columnNameRejectionReason('1bad') ?? '', /start with a letter or an underscore/i);
-		assert.strictEqual(isValidColumnName('1bad'), false);
-	});
-	for (const bad of ['has space', 'a-b', 'a+b', '[bracket]', 'with#hash', 'at@sign']) {
-		test(`a name needing escaping ${JSON.stringify(bad)} is rejected (charset)`, () => {
+	// STILL rejected: the five OOXML structured-ref specials (need `'`-escaping inside `Table[...]`; v1 keeps
+	// the accepted class escaping-free). The reject message names the char ("reserved in structured references").
+	for (const bad of ['[bracket]', 'a]b', 'with#hash', 'at@sign', 'it\'s', '@col', 'a#1']) {
+		test(`a name with an escape-needing special ${JSON.stringify(bad)} is rejected`, () => {
 			assert.ok(columnNameRejectionReason(bad), `column should reject ${bad}`);
+			assert.strictEqual(isValidColumnName(bad), false);
+			assert.match(columnNameRejectionReason(bad) ?? '', /reserved in structured references/i);
+		});
+	}
+	// STILL rejected: leading/trailing whitespace (the engine TRIMS `Table[ x ]`, so a padded name can't match).
+	for (const bad of [' Revenue', 'Revenue ', '  ', '\tCol', 'Col\n']) {
+		test(`a name with edge whitespace ${JSON.stringify(bad)} is rejected`, () => {
+			assert.ok(columnNameRejectionReason(bad), `column should reject ${JSON.stringify(bad)}`);
 			assert.strictEqual(isValidColumnName(bad), false);
 		});
 	}
-	test('a non-ASCII column name is rejected (ASCII-disciplined, matches the engine fold)', () => {
-		const nonAscii = String.fromCharCode(99, 97, 102, 233); // "cafe" with a non-ASCII e-acute
-		assert.ok(columnNameRejectionReason(nonAscii));
-		assert.strictEqual(isValidColumnName(nonAscii), false);
+	test('an edge-whitespace name gets a whitespace-specific message', () => {
+		assert.match(columnNameRejectionReason(' Revenue') ?? '', /whitespace/i);
+	});
+	// STILL rejected: control characters (the printer doesn't escape them -> corrupt rewritten formula text).
+	// Use a control char in the MIDDLE so it isn't caught by the edge-whitespace rule first (a tab/newline at an
+	// edge is whitespace -> covered above; a bare SOH/NUL/US/DEL is a non-whitespace control char).
+	for (const code of [0x01, 0x00, 0x1f, 0x7f]) {
+		const ctrl = String.fromCharCode(code);
+		test(`a name with a control char (U+${code.toString(16).padStart(4, '0')}) is rejected`, () => {
+			assert.ok(columnNameRejectionReason(`Col${ctrl}umn`), 'column should reject a control char');
+			assert.strictEqual(isValidColumnName(`Col${ctrl}umn`), false);
+		});
+	}
+	test('a control-char name gets a control-char message', () => {
+		assert.match(columnNameRejectionReason(`a${String.fromCharCode(0x01)}b`) ?? '', /control character/i);
 	});
 });
 

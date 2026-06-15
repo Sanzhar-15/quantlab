@@ -59,7 +59,7 @@ import { buildDefineNameToast, buildNameRange, definedNameRejectionReason, isVal
 // Go-To anchor) and the structured-table UI (identifier validation + selection -> TableSpecJson). The
 // commands below are thin vscode shells over these (the established cellGrid logic/command split).
 import { describeScope, describeTarget, goToAnchor, isGoToable } from '../quantbook/cellGrid/nameManagerLogic';
-import { buildTableSpec, isValidTableIdentifier, planColumnRename, planTableResize, tableAtCell, tableColumnRejectionReason, tableIdentifierRejectionReason, tableQuickPickItems } from '../quantbook/cellGrid/tableUiLogic';
+import { buildTableSpec, isValidTableIdentifier, planColumnNamesFromHeaders, planColumnRename, planTableResize, tableAtCell, tableColumnRejectionReason, tableIdentifierRejectionReason, tableQuickPickItems } from '../quantbook/cellGrid/tableUiLogic';
 import type { CollabSessionInstance, NamedRangeJson, SessionInstance, TableSnapshotJson } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
@@ -1863,9 +1863,41 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				void vscode.window.showErrorMessage(`Quantbook create table failed: ${detail}`);
 				return;
 			}
+			// **FE-8.5 (2026-06-15):** name the columns after the spreadsheet HEADER ROW (Excel parity) instead
+			// of the legacy `Column1..N`. Read each header cell's display text from the session: a blank cell
+			// surfaces as `null` (-> `planColumnNamesFromHeaders` assigns a `Column{N}` default); a text cell
+			// uses its raw text; a number / formula header uses the engine's rendered display string (what the
+			// grid shows). The pure helper validates each (full-parity column rules) + enforces case-insensitive
+			// uniqueness -- on any reject it returns a LOUD reason and we abort WITHOUT creating the table.
+			const headerTexts: (string | null)[] = [];
+			for (let i = 0; i < spec.cols; i++) {
+				const hc = sel.session.cell(spec.sheet, spec.topRow, spec.topCol + i);
+				if (hc === null) {
+					headerTexts.push(null);
+				} else if (hc.value?.kind === 'text' && hc.value.text !== undefined) {
+					headerTexts.push(hc.value.text);
+				} else if (hc.rendered !== undefined && hc.rendered.length > 0) {
+					headerTexts.push(hc.rendered);
+				} else {
+					headerTexts.push(null);
+				}
+			}
+			const namesResult = planColumnNamesFromHeaders(headerTexts);
+			if (namesResult.kind === 'error') {
+				log.appendLine(`createTable header->name rejected: ${namesResult.reason}`);
+				void vscode.window.showErrorMessage(`Quantbook create table failed: ${namesResult.reason}`);
+				return;
+			}
+			spec.columnNames = namesResult.names;
 			try {
+				// `createTable` is ONE atomic op (one undo unit). **FE-8.5 (audit, Codex MEDIUM):** we deliberately
+				// do NOT write `Column{N}` back into blank header cells here -- that would be N extra `setValue` ops
+				// AFTER the create, so a single undo would only unwind the last one and leave the table + metadata
+				// half-synced with the visible cells. A blank header therefore stays blank (its metadata column is
+				// still `Column{N}`, so `Table[Column2]` works, and a later Rename-Column writes the name into the
+				// cell atomically). Named headers already display their own text, so nothing to write back.
 				sel.session.createTable(spec);
-				log.appendLine(`Created table "${name}" (${spec.rows}x${spec.cols} at sheet ${spec.sheet}, top ${spec.topRow},${spec.topCol}).`);
+				log.appendLine(`Created table "${name}" (${spec.rows}x${spec.cols} at sheet ${spec.sheet}, top ${spec.topRow},${spec.topCol}); columns [${spec.columnNames.join(', ')}].`);
 			} catch (err) {
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL createTable error: ${detail}`);
@@ -2145,8 +2177,9 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// FE-8.3 (2026-06-15): rename a table COLUMN. The napi `renameColumn(table, oldCol, newCol)` exists (the
 	// engine rewrites referencing structured-ref formula text in the same undo unit) but was unreachable --
 	// the IDE couldn't read a table's column names. With `tableColumns(name)` (FE-8.3) we list them, let the
-	// operator pick one + type the new name, validate via the COLUMN identifier rules (FE-8.4: relaxed to
-	// allow cell-ref-shaped names like Q3) + `planColumnRename` (mirrors the engine's checks), then call the
+	// operator pick one + type the new name, validate via the COLUMN identifier rules (FE-8.4/8.5: relaxed to
+	// full Excel-parity -- spaces like `Order Date`, digit-leading, cell-ref/R1C1 shapes, UTF-8; only the
+	// escape-needing `[ ] # @ '` rejected) + `planColumnRename` (mirrors the engine's checks), then call the
 	// engine. Table picked context-aware or from a QuickPick, exactly like Rename/Drop Table.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookRenameColumn', async (...args: unknown[]) => {
@@ -2191,9 +2224,11 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			const newCol = await vscode.window.showInputBox({
 				title: `Rename Column "${oldCol}"`,
-				// FE-8.4: column names use the RELAXED rule -- they MAY be cell-ref-shaped (Q1..Q4) or R1C1-form,
-				// unlike table/defined names, because a column is only ever referenced as `Table[<name>]`.
-				prompt: 'New column name (letters, digits, underscores, periods; may be a cell-ref shape like Q3)',
+				// FE-8.4/8.5: column names use the RELAXED, full-parity rule -- they MAY contain spaces
+				// (`Order Date`), be digit-leading (`2026`), cell-ref-shaped (`Q3`) or R1C1-form, or non-ASCII,
+				// unlike table/defined names, because a column is only ever referenced as `Table[<name>]`. Only
+				// the escape-needing chars `[ ] # @ '` (and control / edge-whitespace) are rejected.
+				prompt: 'New column name (may include spaces, e.g. "Order Date"; not [ ] # @ or \')',
 				value: oldCol,
 				validateInput: (value) => tableColumnRejectionReason(value),
 			});

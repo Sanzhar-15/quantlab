@@ -14,6 +14,7 @@ import * as assert from 'assert';
 
 import {
 	appendedColumnNames,
+	planColumnNamesFromHeaders,
 	planColumnRename,
 	planTableResize,
 	type ColumnRenameAction,
@@ -254,36 +255,37 @@ suite('FE-8.3 planColumnRename', () => {
 			assert.match(a.reason, /already has a column named "profit"/);
 		}
 	});
-	test('an invalid new identifier is a loud error (digit-leading fails the structural column rule)', () => {
-		const a = planColumnRename(roster, 'Revenue', '1bad');
+	test('a name with an escape-needing special char is a loud error', () => {
+		const a = planColumnRename(roster, 'Revenue', 'Net[1]');
 		assert.strictEqual(a.kind, 'error');
 		if (a.kind === 'error') {
-			assert.ok(a.reason.length > 0);
+			assert.match(a.reason, /reserved in structured references/i);
 		}
 	});
-	// FE-8.4 (2026-06-15): a column name MAY be cell-ref-shaped (Q1..Q4 -- the quant case) or an R1C1 form,
-	// because a column is only ever referenced bracketed + table-qualified (`Table[Q3]`), never as a bare
-	// coordinate. The engine accepts + round-trips them (verified: ql-exec structured_ref_*_round_trip probes),
-	// so the IDE no longer refuses them. These would all have been REJECTED before FE-8.4.
-	for (const cellRefShape of ['Q3', 'Q1', 'R2', 'A1', 'AB12']) {
-		test(`a cell-ref-shaped new name "${cellRefShape}" is now ACCEPTED (FE-8.4)`, () => {
+	// FE-8.4/8.5 (2026-06-15): a column name MAY be cell-ref-shaped (Q1..Q4), an R1C1 form, contain SPACES
+	// (`Order Date` -- the headline FE-8.5 case), be digit-leading (`2026`), or carry no-escape punctuation --
+	// a column is only ever referenced bracketed + table-qualified (`Table[Order Date]`), and the engine accepts
+	// + round-trips all of these (verified: ql-exec structured_ref_parity + cell-ref/R1C1 probes). These would
+	// have been REJECTED before FE-8.4/8.5.
+	const NOW_ACCEPTED = [
+		'Q3', 'Q1', 'R2', 'A1', 'AB12', // cell-ref shapes (FE-8.4)
+		'R', 'C', 'RC', 'R1C1', // R1C1 forms (FE-8.4)
+		'Order Date', 'Q3 2026', // spaces (FE-8.5)
+		'2026', '1bad', // digit-leading (FE-8.5)
+		'Gross-Margin', 'Net Margin %', 'P&L', // no-escape punctuation (FE-8.5)
+	];
+	for (const accepted of NOW_ACCEPTED) {
+		test(`a full-parity new name "${accepted}" is now ACCEPTED`, () => {
 			assert.deepStrictEqual(
-				planColumnRename(roster, 'Revenue', cellRefShape),
-				{ kind: 'rename', oldCol: 'Revenue', newCol: cellRefShape } as ColumnRenameAction,
+				planColumnRename(roster, 'Revenue', accepted),
+				{ kind: 'rename', oldCol: 'Revenue', newCol: accepted } as ColumnRenameAction,
 			);
 		});
 	}
-	for (const r1c1Shape of ['R', 'C', 'RC', 'R1C1']) {
-		test(`an R1C1-form new name "${r1c1Shape}" is now ACCEPTED (FE-8.4)`, () => {
-			assert.deepStrictEqual(
-				planColumnRename(roster, 'Revenue', r1c1Shape),
-				{ kind: 'rename', oldCol: 'Revenue', newCol: r1c1Shape } as ColumnRenameAction,
-			);
-		});
-	}
-	// ...but names that would need bracket-escaping are STILL rejected (No-Fallbacks: relax only to verified).
-	for (const stillInvalid of ['1bad', 'a-b', 'has space', '']) {
-		test(`a non-identifier new name ${JSON.stringify(stillInvalid)} is STILL rejected (needs escaping/empty)`, () => {
+	// ...but names that need escaping or are structurally unsafe are STILL rejected (No-Fallbacks: relax only to
+	// the probe-verified no-escaping-needed class).
+	for (const stillInvalid of ['a]b', 'with#hash', 'at@sign', 'it\'s', ' Revenue', 'Revenue ', '']) {
+		test(`a name needing escaping / unsafe ${JSON.stringify(stillInvalid)} is STILL rejected`, () => {
 			const a = planColumnRename(roster, 'Revenue', stillInvalid);
 			assert.strictEqual(a.kind, 'error');
 		});
@@ -312,5 +314,79 @@ suite('FE-8.3 planColumnRename', () => {
 			planColumnRename([aRingUpper, aRingLower], aRingUpper, 'Renamed'),
 			{ kind: 'rename', oldCol: aRingUpper, newCol: 'Renamed' },
 		);
+	});
+});
+
+// FE-8.5 (2026-06-15): planColumnNamesFromHeaders -- project a table's HEADER-ROW texts into column NAMES
+// (full Excel-parity). Blank -> Column{N} by position; else the trimmed header text, validated full-parity;
+// case-insensitive uniqueness via the engine's ASCII fold; a LOUD error on any reject or duplicate (never a
+// silent rewrite). Pure + session-free -- the create-table command is a thin shell over it.
+suite('FE-8.5 planColumnNamesFromHeaders', () => {
+	test('text headers become the column names verbatim', () => {
+		assert.deepStrictEqual(
+			planColumnNamesFromHeaders(['Region', 'Revenue', 'Profit']),
+			{ kind: 'ok', names: ['Region', 'Revenue', 'Profit'] },
+		);
+	});
+	test('full-parity headers (spaces / digit-leading / punctuation) are kept as-is', () => {
+		assert.deepStrictEqual(
+			planColumnNamesFromHeaders(['Order Date', '2026', 'Net Margin %', 'P&L']),
+			{ kind: 'ok', names: ['Order Date', '2026', 'Net Margin %', 'P&L'] },
+		);
+	});
+	test('a blank (null) header gets a Column{N} default BY POSITION', () => {
+		assert.deepStrictEqual(
+			planColumnNamesFromHeaders(['Region', null, 'Profit']),
+			{ kind: 'ok', names: ['Region', 'Column2', 'Profit'] },
+		);
+	});
+	test('an empty-string / whitespace-only header is treated as blank -> Column{N}', () => {
+		assert.deepStrictEqual(
+			planColumnNamesFromHeaders(['', '   ', 'X']),
+			{ kind: 'ok', names: ['Column1', 'Column2', 'X'] },
+		);
+	});
+	test('a header text is trimmed before use', () => {
+		assert.deepStrictEqual(
+			planColumnNamesFromHeaders(['  Revenue  ']),
+			{ kind: 'ok', names: ['Revenue'] },
+		);
+	});
+	test('a header with an escape-needing char is a loud error naming the column + reason', () => {
+		const r = planColumnNamesFromHeaders(['Region', 'Net[1]', 'Profit']);
+		assert.strictEqual(r.kind, 'error');
+		if (r.kind === 'error') {
+			assert.match(r.reason, /Column 2 header/);
+			assert.match(r.reason, /reserved in structured references/i);
+		}
+	});
+	test('duplicate header text (case-insensitive) is a loud error naming both columns', () => {
+		const r = planColumnNamesFromHeaders(['Revenue', 'Cost', 'revenue']);
+		assert.strictEqual(r.kind, 'error');
+		if (r.kind === 'error') {
+			assert.match(r.reason, /Columns 1 and 3/);
+			assert.match(r.reason, /must be unique/i);
+		}
+	});
+	test('a blank-default Column{N} that collides with a typed "ColumnN" header is a loud error', () => {
+		// Header row ["Column2", <blank>] -> names ["Column2", "Column2"] -> dup, surfaced loudly.
+		const r = planColumnNamesFromHeaders(['Column2', null]);
+		assert.strictEqual(r.kind, 'error');
+		if (r.kind === 'error') {
+			assert.match(r.reason, /must be unique/i);
+		}
+	});
+	test('uniqueness uses the engine ASCII fold, not JS toLowerCase (a non-ASCII case pair is NOT a dup)', () => {
+		// U+00C5 / U+00E5 Unicode-fold equal but ASCII-fold DISTINCT -> the engine sees 2 columns, so this must
+		// be accepted, not flagged as a duplicate (mirrors the FE-8.3 Codex-HIGH ASCII-fold fix).
+		const upper = String.fromCharCode(0xC5);
+		const lower = String.fromCharCode(0xE5);
+		assert.deepStrictEqual(
+			planColumnNamesFromHeaders([upper, lower]),
+			{ kind: 'ok', names: [upper, lower] },
+		);
+	});
+	test('an empty header list throws (a table must have at least one column)', () => {
+		assert.throws(() => planColumnNamesFromHeaders([]), /at least one column/);
 	});
 });

@@ -47,12 +47,12 @@ export function tableIdentifierRejectionReason(name: string): string | undefined
 }
 
 /**
- * **FE-8.4 (2026-06-15):** the rejection reason for a candidate table COLUMN name -- the RELAXED sibling of
+ * **FE-8.4/8.5 (2026-06-15):** the rejection reason for a candidate table COLUMN name -- the RELAXED sibling of
  * {@link tableIdentifierRejectionReason}. Unlike a table / defined name (which shares the cell namespace, so a
  * cell-ref-shaped name like `Q3` is rejected as ambiguous), a column is ONLY ever referenced bracketed +
- * table-qualified (`Table[Q3]`), so cell-ref / R1C1 shapes are unambiguous and the engine accepts them. This
- * delegates to {@link columnNameRejectionReason} (keeps the structural identifier rules; drops the two
- * coordinate-collision guards). Use this -- NOT `tableIdentifierRejectionReason` -- for column names.
+ * table-qualified (`Table[Order Date]`), so the engine accepts the full Excel-parity class (spaces, digit-
+ * leading, UTF-8, cell-ref / R1C1 shapes). This delegates to {@link columnNameRejectionReason} (rejects only
+ * the escape-needing + structurally-unsafe set). Use this -- NOT `tableIdentifierRejectionReason` -- for columns.
  */
 export function tableColumnRejectionReason(name: string): string | undefined {
 	return columnNameRejectionReason(name);
@@ -75,11 +75,72 @@ export function defaultColumnNames(cols: number): string[] {
 	return names;
 }
 
+/** The outcome of projecting a table's header-row texts into column names: the validated roster, or a reason. */
+export type ColumnNamesFromHeaders = { kind: 'ok'; names: string[] } | { kind: 'error'; reason: string };
+
+/**
+ * **FE-8.5 (2026-06-15):** project a table's HEADER-ROW cell texts into its column NAMES (full Excel-parity).
+ * `headerTexts[i]` is the display text of header cell `i` (the command reads it from the session snapshot),
+ * or `null`/blank for an empty header cell. Rules -- mirroring Excel + the engine's only two constraints
+ * (non-empty, case-insensitively-unique):
+ *  - a blank header -> the default `Column{i+1}` (Excel auto-names blank headers; legitimate domain behavior,
+ *    not an error-masking fallback);
+ *  - else the (trimmed) header text, validated via {@link columnNameRejectionReason} -> on reject a LOUD error
+ *    naming the offending header (No-Fallbacks: never silently rewrite the operator's header text);
+ *  - case-insensitive UNIQUENESS across the full roster, using the engine's ASCII fold ({@link asciiLower} --
+ *    NOT JS `toLowerCase`, which over-folds non-ASCII) -> a duplicate is a LOUD error naming it (the wave's
+ *    operator-chosen dedupe decision: refuse, never silently suffix).
+ * Returns the validated `names` (length === headerTexts.length) or the first `error`. Pure + session-free, so
+ * the create-table command is a thin shell over it.
+ */
+export function planColumnNamesFromHeaders(headerTexts: readonly (string | null)[]): ColumnNamesFromHeaders {
+	if (headerTexts.length === 0) {
+		throw new Error('[bad_argument] planColumnNamesFromHeaders: a table must have at least one column.');
+	}
+	const names: string[] = [];
+	for (let i = 0; i < headerTexts.length; i++) {
+		const raw = headerTexts[i];
+		const trimmed = raw === null ? '' : raw.trim();
+		if (trimmed.length === 0) {
+			// Blank header -> Excel's default name BY POSITION (Column1, Column2, ...).
+			names.push(`Column${i + 1}`);
+			continue;
+		}
+		const reason = columnNameRejectionReason(trimmed);
+		if (reason !== undefined) {
+			return { kind: 'error', reason: `Column ${i + 1} header "${trimmed}": ${reason}` };
+		}
+		names.push(trimmed);
+	}
+	// Case-insensitive uniqueness across the full roster, byte-identical to the engine's `to_ascii_lowercase`
+	// fold (a Unicode fold here would false-flag a non-ASCII case pair the engine's ASCII fold keeps distinct).
+	const seen = new Map<string, number>(); // asciiLower(name) -> first column index (1-based)
+	for (let i = 0; i < names.length; i++) {
+		const key = asciiLower(names[i]);
+		const prev = seen.get(key);
+		if (prev !== undefined) {
+			return {
+				kind: 'error',
+				reason: `Columns ${prev} and ${i + 1} are both named "${names[i]}" (case-insensitive); column names must be unique. Rename one header.`,
+			};
+		}
+		seen.set(key, i + 1);
+	}
+	return { kind: 'ok', names };
+}
+
 /**
  * Normalize the focused grid's selection (`anchor` + `focus`, in ANY order) + its sheet id + the table
  * `name` into the {@link TableSpecJson} `SessionInstance.createTable(spec)` expects: a sheet-qualified rect
- * with `start <= end` on both axes (0-based), `hasHeader: true`, `hasTotals: false`, and a `Column1..N`
- * default header row sized to the selection's column span.
+ * with `start <= end` on both axes (0-based), `hasHeader: true`, `hasTotals: false`, and a header row sized
+ * to the selection's column span.
+ *
+ * **FE-8.5 (2026-06-15):** `columnNames` is OPTIONAL. When omitted, the legacy `Column1..N` defaults are used
+ * ({@link defaultColumnNames}). When provided (the create-table command passes the header-row text projected
+ * via {@link planColumnNamesFromHeaders}), they are used verbatim -- the table's columns are named after the
+ * spreadsheet headers the operator typed (Excel parity). The caller is responsible for validating them; here
+ * we only assert the length matches the selection's column span (No-Fallbacks: a mismatch is a programming
+ * error, not something to paper over).
  *
  * No-Fallbacks:
  *  - A non-integer / out-of-extent corner or a non-u16 sheet id throws `[bad_argument]` (rather than
@@ -88,7 +149,7 @@ export function defaultColumnNames(cols: number): string[] {
  *    {@link isValidTableIdentifier}); a duplicate / footprint-overlap is the engine's
  *    `[table_create_rejected]` to raise.
  */
-export function buildTableSpec(name: string, sheet: number, anchorRow: number, anchorCol: number, focusRow: number, focusCol: number): TableSpecJson {
+export function buildTableSpec(name: string, sheet: number, anchorRow: number, anchorCol: number, focusRow: number, focusCol: number, columnNames?: readonly string[]): TableSpecJson {
 	if (!Number.isInteger(sheet) || sheet < 0 || sheet > 65535) {
 		throw new Error(`[bad_argument] buildTableSpec: sheet must be an integer in [0, 65535], got ${sheet}.`);
 	}
@@ -103,6 +164,9 @@ export function buildTableSpec(name: string, sheet: number, anchorRow: number, a
 	}
 	const rows = rect.endRow - rect.startRow + 1;
 	const cols = rect.endCol - rect.startCol + 1;
+	if (columnNames !== undefined && columnNames.length !== cols) {
+		throw new Error(`[bad_argument] buildTableSpec: columnNames length (${columnNames.length}) must match the selection's column span (${cols}).`);
+	}
 	return {
 		name,
 		sheet,
@@ -112,7 +176,7 @@ export function buildTableSpec(name: string, sheet: number, anchorRow: number, a
 		cols,
 		hasHeader: true,
 		hasTotals: false,
-		columnNames: defaultColumnNames(cols),
+		columnNames: columnNames !== undefined ? [...columnNames] : defaultColumnNames(cols),
 	};
 }
 
@@ -324,13 +388,14 @@ export type ColumnRenameAction =
  *  5. otherwise -> `rename` (carrying the exact stored display name as `oldCol`).
  */
 export function planColumnRename(columnNames: readonly string[], oldCol: string, newCol: string): ColumnRenameAction {
-	// FE-8.4 (2026-06-15): validate `newCol` with the COLUMN rules ({@link tableColumnRejectionReason} ->
+	// FE-8.4/8.5 (2026-06-15): validate `newCol` with the COLUMN rules ({@link tableColumnRejectionReason} ->
 	// {@link columnNameRejectionReason}), NOT the stricter table/defined-name rules. A column is only ever
-	// referenced bracketed + table-qualified (`Table[Q3]`), so cell-ref-shaped / R1C1-form names like `Q3` or
-	// `R1C1` are unambiguous and the engine accepts + round-trips them (verified end-to-end -- see the engine's
-	// `structured_ref_cell_ref_shaped_column_names_round_trip` + `..._r1c1_..` probes). The column rule still
-	// rejects names that would need bracket-escaping (digit-leading, spaces, non-ASCII) -- a loud refuse, never
-	// silent (No-Fallbacks: relax only to what's verified).
+	// referenced bracketed + table-qualified (`Table[Order Date]`), so the engine accepts + round-trips the
+	// full-parity class: cell-ref / R1C1 shapes (`Q3`, `R1C1`), spaces (`Order Date`), digit-leading (`2026`),
+	// and UTF-8 -- verified end-to-end (see the engine's `structured_ref_parity_column_names_round_trip` +
+	// `..._cell_ref_shaped_..` / `..._r1c1_..` probes). The column rule rejects ONLY names that would need
+	// escaping inside `Table[...]` (the OOXML specials `[ ] # @ '`, control chars, leading/trailing whitespace)
+	// or are empty / over-cap -- a loud refuse, never silent (No-Fallbacks: relax only to what's verified).
 	const reason = tableColumnRejectionReason(newCol);
 	if (reason !== undefined) {
 		return { kind: 'error', reason };

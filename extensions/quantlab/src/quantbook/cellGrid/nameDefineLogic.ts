@@ -108,22 +108,35 @@ export function definedNameRejectionReason(name: string): string | undefined {
 	return undefined;
 }
 
+// FE-8.5 (2026-06-15): the five OOXML structured-reference special characters. Inside `Table[...]` each of
+// these needs `'`-escaping; v1 keeps the accepted column-name class escaping-FREE (so every accepted name
+// appears verbatim in `Table[<name>]`), and rejects these loudly. A later wave can add escape-aware
+// acceptance. Order in the class is irrelevant; `\[` and `\]` are the literal brackets.
+const STRUCTURED_REF_SPECIAL_CHARS = /[\[\]#@']/;
+// Control characters (C0 0x00-0x1F + DEL 0x7F): the structured-ref printer does not escape these, so a
+// column name containing one would corrupt rewritten `Table[...]` formula text. Rejected. (Written with
+// `\u` escapes, so no literal control byte appears in source and `no-control-regex` is not triggered.)
+const CONTROL_CHARS = /[\u0000-\u001F\u007F]/;
+
 /**
- * **FE-8.4 (2026-06-15):** the rejection reason for a candidate TABLE COLUMN name -- the RELAXED sibling
- * of {@link definedNameRejectionReason}. A defined / table name shares the cell namespace, so `=Q3` is
- * ambiguous with the coordinate Q3 and those validators reject cell-reference-shaped + R1C1-form names.
- * A COLUMN is different: it is ALWAYS referenced bracketed + table-qualified (`Table[Q3]`), where the
- * lexer reads the bracket content as a RAW column string with NO coordinate interpretation -- so a column
- * named `Q3` (or `R`, `C`, `R1C1`) is never ambiguous, and the engine accepts it (verified end-to-end:
- * `ql-exec` `structured_ref_cell_ref_shaped_column_names_round_trip` + `..._r1c1_shaped_..`). For a quant
- * product, quarterly columns `Q1..Q4` are exactly this case.
+ * **FE-8.5 (2026-06-15):** the rejection reason for a candidate TABLE COLUMN name -- now relaxed to FULL
+ * EXCEL-PARITY (supersedes FE-8.4's stricter identifier-only rule). A column is ALWAYS referenced bracketed
+ * + table-qualified (`Table[Order Date]`), where the engine's lexer reads the bracket content as a RAW
+ * string (spaces + UTF-8 transparent), the parser trims only leading/trailing whitespace, and the binder
+ * matches case-insensitively. So the engine accepts ANY non-empty, unique column name -- and the IDE now
+ * syncs spreadsheet HEADER text directly into column names, where spaces (`Order Date`, `Q3 2026`) are the
+ * norm. Verified end-to-end: `ql-exec` `structured_ref_parity_column_names_round_trip` (space / digit-leading
+ * / UTF-8 / hyphen) + the FE-8.4 `..._cell_ref_shaped_..` / `..._r1c1_shaped_..` probes.
  *
- * So this KEEPS the structural identifier rules -- non-empty; length cap; first char `[A-Za-z_]`; rest
- * `[A-Za-z0-9_.]`; ASCII-only -- which guarantee the name needs no bracket-escaping (staying inside the
- * class the engine probes verified: bare ASCII identifiers), and DROPS only the two
- * "collides-with-a-coordinate" guards (the cell-ref reject and the R1C1 reject). Names that would need
- * escaping (spaces, `[ ] # @ '`, digit-leading, non-ASCII) are STILL rejected loudly (No-Fallbacks: we
- * relax only to what is verified, never to an unproven accept). `undefined` means valid.
+ * The rule is **"accept any name that needs NO escaping to appear in `Table[<name>]`"**. It rejects ONLY:
+ *  1. empty;
+ *  2. length > {@link MAX_DEFINED_NAME_LENGTH};
+ *  3. leading / trailing whitespace (the engine TRIMS `Table[ x ]`, so a padded name can't match itself);
+ *  4. ASCII control chars (the printer doesn't escape them -> corrupt rewritten formula text);
+ *  5. any of the OOXML specials `[ ] # @ '` (the escape-needing set -- {@link STRUCTURED_REF_SPECIAL_CHARS}).
+ * Everything else is accepted: letters, digits (incl. digit-LEADING `2026`), internal spaces, hyphen,
+ * period, parens, `$ % &`, UTF-8, and the FE-8.4 cell-ref/R1C1 shapes (`Q3`, `R1C1`). `undefined` = valid.
+ * No-Fallbacks: we relax only to the probe-verified class; everything outside it is a loud refuse.
  */
 export function columnNameRejectionReason(name: string): string | undefined {
 	if (name.length === 0) {
@@ -132,21 +145,27 @@ export function columnNameRejectionReason(name: string): string | undefined {
 	if (name.length > MAX_DEFINED_NAME_LENGTH) {
 		return `A column name cannot exceed ${MAX_DEFINED_NAME_LENGTH} characters (got ${name.length}).`;
 	}
-	if (!/^[A-Za-z_]/.test(name)) {
-		return 'A column name must start with a letter or an underscore.';
+	if (name !== name.trim()) {
+		return 'A column name cannot start or end with whitespace.';
 	}
-	if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(name)) {
-		return 'A column name may contain only ASCII letters, digits, underscores, and periods.';
+	if (CONTROL_CHARS.test(name)) {
+		return 'A column name cannot contain control characters.';
 	}
-	// NOTE: unlike `definedNameRejectionReason`, a column name MAY be a cell-reference shape (`Q3`, `A1`) or
-	// an R1C1 form (`R`, `C`, `R1C1`) -- a column is only ever referenced as `Table[<name>]`, never as a
-	// bare coordinate, so there is no ambiguity to guard against.
+	const special = name.match(STRUCTURED_REF_SPECIAL_CHARS);
+	if (special) {
+		return `A column name cannot contain ${special[0]} (reserved in structured references); choose a different name.`;
+	}
+	// NOTE: unlike `definedNameRejectionReason`, a column name MAY be a cell-reference shape (`Q3`, `A1`), an
+	// R1C1 form (`R`, `C`, `R1C1`), digit-leading (`2026`), space-containing (`Order Date`), or non-ASCII --
+	// a column is only ever referenced as `Table[<name>]`, never as a bare coordinate, and the engine
+	// accepts + round-trips all of these (see the probe references above).
 	return undefined;
 }
 
 /**
- * **FE-8.4 (2026-06-15):** whether `name` is a usable table COLUMN identifier (the relaxed boolean form of
- * {@link columnNameRejectionReason} -- allows cell-ref / R1C1 shapes that a defined/table name forbids).
+ * **FE-8.5 (2026-06-15):** whether `name` is a usable table COLUMN identifier (the boolean form of
+ * {@link columnNameRejectionReason} -- full Excel-parity: accepts spaces / digit-leading / UTF-8 / cell-ref
+ * / R1C1 shapes that a defined/table name forbids; rejects only the escape-needing + structurally-unsafe set).
  */
 export function isValidColumnName(name: string): boolean {
 	return columnNameRejectionReason(name) === undefined;
