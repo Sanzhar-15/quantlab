@@ -308,6 +308,14 @@ pub trait EngineSession {
     /// [`WorkbookSnapshot::names`]; this is the lightweight read for the
     /// Name-Manager UI without a full cell snapshot.
     fn list_names(&self) -> EngineResult<Vec<NamedRange>>;
+    /// **FE-8.3 (2026-06-15):** list a table's column display names, in order.
+    /// The column names live in the engine's `TableMetadata` but are omitted from
+    /// [`WorkbookSnapshot::tables`]; this is the lightweight read backing FE-8.1's
+    /// column-shrink (the IDE needs the trailing names for `resize_table`'s
+    /// `removed_columns`) and the rename-column picker. The `table` name is matched
+    /// case-insensitively (canonicalized like every other table op); an unknown
+    /// table is the same `table_not_found` (NotFound) that drop/rename raise.
+    fn table_columns(&self, table: &str) -> EngineResult<Vec<String>>;
 
     // --- Undo / redo (§3.8) ---
 

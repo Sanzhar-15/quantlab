@@ -7551,6 +7551,23 @@ impl Session {
         })
     }
 
+    /// **FE-8.3 (2026-06-15):** list a table's column display names, in order. The
+    /// lightweight read backing FE-8.1's column-shrink (the IDE needs the trailing
+    /// column names for `resizeTable`'s `removedColumns`) and the rename-column
+    /// picker — the names live in the engine's `TableMetadata` but the snapshot
+    /// (`workbookSnapshot().tables`) omits them. An unknown `table` surfaces
+    /// `[table_not_found]` (NotFound, matched case-insensitively, identical to
+    /// drop/rename). `[invalid_state]` off a readable session.
+    #[napi(js_name = "tableColumns", catch_unwind)]
+    pub fn table_columns(&self, env: Env, table: String) -> Result<Vec<String>> {
+        guarded(env, "tableColumns", || {
+            self.inner
+                .lock()
+                .table_columns(&table)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
     // ============================================================================
     // 6.3-2e (2026-05-30) — atomic groups + the §3.5 bulk methods over napi.
     //

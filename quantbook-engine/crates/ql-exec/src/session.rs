@@ -3211,6 +3211,28 @@ impl EngineSession for WorkbookSession {
         Ok(collect_named_ranges(&self.workbook))
     }
 
+    fn table_columns(&self, table: &str) -> EngineResult<Vec<String>> {
+        self.ensure_readable()?;
+        // Reads the live workbook directly (no rebuild) — like `list_names` —
+        // so it reflects the current in-memory roster (incl. a just-applied
+        // `rename_column` / `resize_table`). Canonical (uppercase) lookup matches
+        // every other table op (e.g. `resize_table`'s `name.to_ascii_uppercase()`).
+        // An absent table routes through the SAME `map_runtime_err` as drop/rename
+        // so the `table_not_found` error is byte-identical (No-Fallbacks: one error
+        // contract, never a divergent code).
+        let canonical = table.to_ascii_uppercase();
+        let meta = self
+            .workbook
+            .tables()
+            .lookup(&canonical)
+            .ok_or_else(|| map_runtime_err(RuntimeError::TableNotFound(table.to_owned())))?;
+        Ok(meta
+            .columns
+            .iter()
+            .map(|c| c.display.as_ref().to_owned())
+            .collect())
+    }
+
     // --- Undo / redo (§3.8) ---
 
     /// Undo the last command (inc.2c-6). Asks Loro to retract the last commit
@@ -12615,6 +12637,80 @@ mod tests {
             json.get("tables").is_none(),
             "empty tables is skip-serialized (additive/backward-safe)"
         );
+    }
+
+    /// **FE-8.3 (2026-06-15) — `table_columns` read surface.** The column names
+    /// live in `TableMetadata` (the snapshot omits them); `table_columns` reads
+    /// them back, in order, by case-insensitive table name, and reflects every
+    /// in-place roster mutation (`rename_column`, `resize_table` grow + shrink).
+    /// This is the read FE-8.1 column-shrink + rename-column wire against.
+    #[test]
+    fn fe83_table_columns_reads_roster_and_reflects_mutations() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        s.create_table(TableSpec {
+            name: "Sales".into(),
+            sheet: sid,
+            top_row: 2,
+            top_col: 1,
+            rows: 5,
+            cols: 3,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["Region".into(), "Q1".into(), "Q2".into()],
+        })
+        .unwrap();
+
+        // Display names, in order — looked up case-INSENSITIVELY (canonicalized
+        // like every other table op).
+        assert_eq!(
+            s.table_columns("Sales").unwrap(),
+            vec!["Region".to_string(), "Q1".to_string(), "Q2".to_string()]
+        );
+        assert_eq!(
+            s.table_columns("sales").unwrap(),
+            vec!["Region".to_string(), "Q1".to_string(), "Q2".to_string()],
+            "lookup is case-insensitive"
+        );
+
+        // rename_column rewrites the roster in place.
+        s.rename_column("Sales", "Q1", "Quarter1").unwrap();
+        assert_eq!(
+            s.table_columns("Sales").unwrap(),
+            vec!["Region".to_string(), "Quarter1".to_string(), "Q2".to_string()]
+        );
+
+        // resize grow (+1 col, appended display name).
+        s.resize_table("Sales", 5, 4, vec!["Q3".into()], vec![]).unwrap();
+        assert_eq!(
+            s.table_columns("Sales").unwrap(),
+            vec![
+                "Region".to_string(),
+                "Quarter1".to_string(),
+                "Q2".to_string(),
+                "Q3".to_string()
+            ]
+        );
+
+        // resize shrink (-2 trailing cols; removed_columns must match the trailing
+        // displays in order — exactly what FE-8.1 col-shrink computes via slice).
+        s.resize_table("Sales", 5, 2, vec![], vec!["Q2".into(), "Q3".into()])
+            .unwrap();
+        assert_eq!(
+            s.table_columns("Sales").unwrap(),
+            vec!["Region".to_string(), "Quarter1".to_string()]
+        );
+    }
+
+    /// An unknown table is the SAME loud `table_not_found` (NotFound) that
+    /// drop/rename raise — never an empty Vec or a silent Ok (No-Fallbacks).
+    #[test]
+    fn fe83_table_columns_unknown_table_errors_loud() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("S", 16384).unwrap();
+        let err = s.table_columns("NoSuchTable").unwrap_err();
+        assert_eq!(err.class, ErrorClass::NotFound);
+        assert_eq!(err.code, "table_not_found");
     }
 
     /// **THE critical persistence test (resurrect-on-reload).** Define a name,
