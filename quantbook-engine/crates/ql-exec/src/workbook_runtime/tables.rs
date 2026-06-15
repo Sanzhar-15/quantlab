@@ -2187,6 +2187,130 @@ mod tests {
         }
     }
 
+    /// **FE-8.6 (2026-06-15) — OOXML ESCAPE-CHAR column names round-trip.** The kill-gate for the
+    /// final slice of full Excel-parity: the five chars that need `'`-escaping inside `Table[...]`
+    /// — `[`, `]`, `#`, `@`, `'`. FE-8.5 deliberately deferred these (its accepted class was kept
+    /// escaping-FREE so the validator relaxation was probe-verified end-to-end). This proves the
+    /// engine round-trips them through the FULL runtime path — not just the printer unit tests —
+    /// so the IDE can stop rejecting them:
+    ///  - CREATE a table whose columns carry each escape char (`Net [Margin]` = `[`+`]`, `Cost#1`
+    ///    = `#`, `@Rate` = leading `@`, `Bob's` = `'`);
+    ///  - BIND + EVAL each by its ESCAPED structured-ref form (`Esc[Net '[Margin']]`, `Esc[Cost'#1]`,
+    ///    `Esc['@Rate]`, `Esc[Bob''s]`) — the lexer/parser unescape path;
+    ///  - the THIS-ROW `@` form on an escaped name (`Esc[@Cost'#1]`);
+    ///  - RENAME a column INTO an escape-char name (`Bob's` -> `A[B]C`) and assert the rewritten
+    ///    formula text carries the printer's EMIT-escaped form (`A'[B']C`, never the raw `A[B]C`
+    ///    that would re-lex wrong), the header cell holds the RAW name, and it re-binds.
+    /// If ANY case fails, the IDE relaxation must NOT ship.
+    #[test]
+    fn structured_ref_escape_char_column_names_round_trip() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // Table "Esc" A1:E4 — header + 3 data rows. Cols 0..=3 carry the 5 OOXML escape chars;
+        // col 4 "Calc" hosts the in-table @-form formula.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table(
+                "Esc",
+                0,
+                0,
+                0,
+                4,
+                5,
+                true,
+                false,
+                vec![
+                    "Net [Margin]".into(), // `[` and `]`
+                    "Cost#1".into(),       // `#`
+                    "@Rate".into(),        // leading `@`
+                    "Bob's".into(),        // `'`
+                    "Calc".into(),
+                ],
+            )
+            .expect("create_table must ACCEPT `[ ] # @ '` column names (OOXML-escaped in srefs)");
+        }
+        // Seed the four data columns, rows 1..=3.
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(100.0)); // Net [Margin]
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(200.0));
+        wb.put(ql_types::Address::new(0, 3, 0), Value::Number(300.0));
+        wb.put(ql_types::Address::new(0, 1, 1), Value::Number(10.0)); // Cost#1
+        wb.put(ql_types::Address::new(0, 2, 1), Value::Number(20.0));
+        wb.put(ql_types::Address::new(0, 3, 1), Value::Number(30.0));
+        wb.put(ql_types::Address::new(0, 1, 2), Value::Number(1.0)); // @Rate
+        wb.put(ql_types::Address::new(0, 2, 2), Value::Number(2.0));
+        wb.put(ql_types::Address::new(0, 3, 2), Value::Number(3.0));
+        wb.put(ql_types::Address::new(0, 1, 3), Value::Number(5.0)); // Bob's
+        wb.put(ql_types::Address::new(0, 2, 3), Value::Number(5.0));
+        wb.put(ql_types::Address::new(0, 3, 3), Value::Number(5.0));
+
+        // (1) BIND + EVAL: each escape-char column resolves by its ESCAPED structured-ref form.
+        //     SUM formulas live OUTSIDE the table footprint (col 7, rows 10..=13).
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            assert_eq!(
+                rt.set_formula(0, 10, 7, "SUM(Esc[Net '[Margin']])").unwrap(),
+                Value::Number(600.0),
+                "SUM(Esc[Net '[Margin']]) resolves a `[`+`]`-containing column name"
+            );
+            assert_eq!(
+                rt.set_formula(0, 11, 7, "SUM(Esc[Cost'#1])").unwrap(),
+                Value::Number(60.0),
+                "SUM(Esc[Cost'#1]) resolves a `#`-containing column name"
+            );
+            assert_eq!(
+                rt.set_formula(0, 12, 7, "SUM(Esc['@Rate])").unwrap(),
+                Value::Number(6.0),
+                "SUM(Esc['@Rate]) resolves a leading-`@` column name"
+            );
+            assert_eq!(
+                rt.set_formula(0, 13, 7, "SUM(Esc[Bob''s])").unwrap(),
+                Value::Number(15.0),
+                "SUM(Esc[Bob''s]) resolves a `'`-containing column name (doubled-quote escape)"
+            );
+            // (2) THIS-ROW `@` form on the `#` name, in the in-table Calc col (data row 1).
+            assert_eq!(
+                rt.set_formula(0, 1, 4, "Esc[@Cost'#1]*2").unwrap(),
+                Value::Number(20.0),
+                "Esc[@Cost'#1] at row 1 -> 10, *2 = 20"
+            );
+        }
+
+        // (3) RENAME a normal-shaped reference target INTO an escape-char name and prove the printer
+        //     EMITS the escaped form. Rename `Bob's` -> `A[B]C`: the SUM(Esc[Bob''s]) at (0,13,7)
+        //     must rewrite to carry the ESCAPED `A'[B']C` (re-lexable), the header cell holds the
+        //     RAW `A[B]C`, and it re-binds to the same value.
+        let rewritten = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_column("Esc", "Bob's", "A[B]C").unwrap()
+        };
+        assert_eq!(rewritten, 1, "the SUM(Esc[Bob''s]) formula rewrites");
+        let sum_text = wb.formula_at(0, 13, 7).expect("SUM formula present").clone();
+        assert!(
+            sum_text.contains("A'[B']C"),
+            "rewritten SUM carries the printer EMIT-escaped form `A'[B']C`: {sum_text}"
+        );
+        assert!(
+            !sum_text.contains("[B]C"),
+            "rewritten SUM must NOT carry the RAW (unescaped) bracket form: {sum_text}"
+        );
+        // The header cell holds the RAW renamed name (a literal label, NOT escaped).
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Text(Arc::from("A[B]C")),
+            "header cell shows the RAW escape-char name after rename"
+        );
+        // Re-bind against the renamed (escape-char) column preserves the value.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            assert!(rt.recompute_all().is_complete());
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 13, 7)),
+            Value::Number(15.0),
+            "SUM re-binds to the renamed escape-char column (still 15)"
+        );
+    }
+
     // ===== W5-122 (Phase 4.8.J) — resize_table =====
 
     #[test]
