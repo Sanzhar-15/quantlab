@@ -349,6 +349,12 @@
         "category": "%command.category%"
       },
       {
+        "_comment": "FE-8.1: Resize Table to Selection (resizeTable; re-ranges anchored at the table's top-left -- row grow/shrink + column GROW with auto-named columns; column shrink + rename-column deferred, the IDE can't read column names).",
+        "command": "quantlab.quantbookResizeTable",
+        "title": "%command.quantbookResizeTable.title%",
+        "category": "%command.category%"
+      },
+      {
         "_comment": "FE-4 W2: sort the focused grid's selected range by a key column, ascending (A to Z).",
         "command": "quantlab.quantbookSortRangeAsc",
         "title": "%command.quantbookSortRangeAsc.title%",
@@ -1277,6 +1283,12 @@
           "command": "quantlab.quantbookDropTable",
           "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "7_table@3"
+        },
+        {
+          "_comment": "FE-8.1: Resize Table to Selection. Same 6_names-adjacent 7_table group + same when as the other table ops. Selection-driven (resolveMenuOrFocusedSelection): the target is the table whose top-left equals the selection's top-left.",
+          "command": "quantlab.quantbookResizeTable",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "7_table@4"
         }
       ]
     },

@@ -158,3 +158,92 @@ export function tableQuickPickItems(tables: readonly TableSnapshotJson[]): Table
 		return { table: t, label: t.displayName, rangeLabel: `${topLeft}:${bottomRight}`, detail };
 	});
 }
+
+// FE-8.1 (2026-06-15) "Resize Table to Selection". The engine's `resizeTable(name, newRows, newCols,
+// addedColumns, removedColumns)` re-ranges a table to a new extent ANCHORED AT ITS EXISTING TOP-LEFT (the
+// engine inherits + freezes `top_row`/`top_col` -- a table can be resized but never moved). The pure core
+// below decides, from the target table's snapshot + the operator's selection, exactly what -- if any --
+// resize call re-ranges it to that selection. Scope this wave: row grow/shrink + column GROW (appended
+// columns auto-named). Column SHRINK is DEFERRED: the engine wants the trailing column NAMES in
+// `removedColumns`, and the IDE cannot read a table's column names (the snapshot carries none and there is
+// no `tableColumns()` query) -- so we reject it loudly rather than guess (No-Fallbacks).
+
+/**
+ * The default-convention names for the columns APPENDED when a table grows from `oldCols` to `newCols`:
+ * `Column{oldCols+1}` .. `Column{newCols}` (continuing {@link defaultColumnNames}'s `Column1..ColumnN`
+ * scheme). Because the IDE is the only table creator and always names columns `Column1..ColumnOldCols`
+ * (see {@link buildTableSpec}), these appended names are collision-free BY CONSTRUCTION for IDE-created
+ * tables; a table loaded from a `.qbook` with non-default column names could (rarely) collide, in which
+ * case `session.resizeTable` rejects it loudly -- we NEVER silently rename to dodge a collision
+ * (No-Fallbacks). Throws on a non-grow / non-integer span (the caller only reaches this on a validated
+ * col-grow, but guard anyway).
+ */
+export function appendedColumnNames(oldCols: number, newCols: number): string[] {
+	if (!Number.isInteger(oldCols) || !Number.isInteger(newCols)) {
+		throw new Error(`[bad_argument] appendedColumnNames: oldCols/newCols must be integers, got ${oldCols}/${newCols}.`);
+	}
+	if (oldCols < 0 || newCols <= oldCols) {
+		throw new Error(`[bad_argument] appendedColumnNames: newCols (${newCols}) must exceed oldCols (${oldCols}).`);
+	}
+	const names: string[] = [];
+	for (let i = oldCols; i < newCols; i++) {
+		names.push(`Column${i + 1}`);
+	}
+	return names;
+}
+
+/**
+ * The decision a "Resize Table to Selection" makes against {@link SessionInstance.resizeTable}: either a
+ * concrete `resize` call, a `noop` (selection already matches the footprint), or a loud `error` (the
+ * operator-facing reason). No-Fallbacks: nothing is silently clamped or dropped.
+ */
+export type TableResizeAction =
+	| { readonly kind: 'resize'; readonly newRows: number; readonly newCols: number; readonly addedColumns: string[]; readonly removedColumns: string[] }
+	| { readonly kind: 'noop' }
+	| { readonly kind: 'error'; readonly reason: string };
+
+/**
+ * Plan a resize of `table` (resolved via {@link tableAtCell}) to the operator's selection (corners in ANY
+ * order). The table's top-left anchor is frozen by the engine, so the selection MUST start at the table's
+ * top-left; the new extent is the selection's row/col span.
+ *
+ * Precedence (first match wins):
+ *  1. a non-integer corner (only reachable from a tampered webview) -> `error`.
+ *  2. selection top-left != table top-left -> `error` naming the required A1 cell (the anchor can't move).
+ *  3. footprint outside the A1 grid -> `error`.
+ *  4. selection == current footprint -> `noop` (the engine would no-op; skip the call).
+ *  5. COLUMN SHRINK (`newCols < table.cols`) -> `error` (deferred; needs column names the IDE can't read).
+ *  6. COLUMN GROW (`newCols > table.cols`) -> `resize` with `addedColumns` auto-named, `removedColumns: []`.
+ *  7. row-only change -> `resize` with empty add/remove.
+ *
+ * The engine balance invariant `newCols == oldCols + added - removed` holds by construction (we only ever
+ * grow columns: `removed` is always empty, `added.length === newCols - oldCols`).
+ */
+export function planTableResize(table: TableSnapshotJson, anchorRow: number, anchorCol: number, focusRow: number, focusCol: number): TableResizeAction {
+	for (const [label, v] of [['anchorRow', anchorRow], ['anchorCol', anchorCol], ['focusRow', focusRow], ['focusCol', focusCol]] as const) {
+		if (!Number.isInteger(v)) {
+			return { kind: 'error', reason: `the selection ${label} is not a whole number (${v}).` };
+		}
+	}
+	const rect = normalizeSelectionRect(anchorRow, anchorCol, focusRow, focusCol);
+	if (rect.startRow !== table.topRow || rect.startCol !== table.topCol) {
+		const required = `${columnLabel(table.topCol)}${table.topRow + 1}`;
+		return { kind: 'error', reason: `the selection must start at the table's top-left cell ${required} -- a table can be resized but not moved. Re-select starting at ${required}.` };
+	}
+	if (rect.endRow < 0 || rect.endRow >= A1_MAX_ROWS || rect.endCol < 0 || rect.endCol >= A1_MAX_COLS) {
+		return { kind: 'error', reason: `the selection extends outside the grid (max ${A1_MAX_ROWS} rows x ${A1_MAX_COLS} columns).` };
+	}
+	const newRows = rect.endRow - rect.startRow + 1;
+	const newCols = rect.endCol - rect.startCol + 1;
+	if (newRows === table.rows && newCols === table.cols) {
+		return { kind: 'noop' };
+	}
+	if (newCols < table.cols) {
+		return { kind: 'error', reason: `shrinking a table's columns isn't supported yet (it needs column-name support the engine doesn't expose). Select a range at least as wide as the table (${table.cols} columns).` };
+	}
+	if (newCols > table.cols) {
+		return { kind: 'resize', newRows, newCols, addedColumns: appendedColumnNames(table.cols, newCols), removedColumns: [] };
+	}
+	// row-only change (newCols === table.cols)
+	return { kind: 'resize', newRows, newCols, addedColumns: [], removedColumns: [] };
+}

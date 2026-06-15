@@ -59,7 +59,7 @@ import { buildDefineNameToast, buildNameRange, definedNameRejectionReason, isVal
 // Go-To anchor) and the structured-table UI (identifier validation + selection -> TableSpecJson). The
 // commands below are thin vscode shells over these (the established cellGrid logic/command split).
 import { describeScope, describeTarget, goToAnchor, isGoToable } from '../quantbook/cellGrid/nameManagerLogic';
-import { buildTableSpec, isValidTableIdentifier, tableAtCell, tableIdentifierRejectionReason, tableQuickPickItems } from '../quantbook/cellGrid/tableUiLogic';
+import { buildTableSpec, isValidTableIdentifier, planTableResize, tableAtCell, tableIdentifierRejectionReason, tableQuickPickItems } from '../quantbook/cellGrid/tableUiLogic';
 import type { CollabSessionInstance, NamedRangeJson, SessionInstance, TableSnapshotJson } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
@@ -2000,6 +2000,75 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				void vscode.window.showWarningMessage('Quantbook: the table was renamed, but a panel failed to re-render -- run "Quantbook: Refresh Cell Grid".');
 			}
 			void vscode.window.showInformationMessage(`Quantbook: renamed table to "${newName}".`);
+		}),
+	);
+
+	// FE-8.1 (2026-06-15): Resize a table to the current selection. The napi `resizeTable(name, newRows,
+	// newCols, addedColumns, removedColumns)` re-ranges a table ANCHORED at its existing top-left (a table can
+	// be resized but never moved). SELECTION-driven (like Create, not Drop/Rename): the target is the table
+	// whose top-left equals the selection's top-left. The pure `planTableResize` decides resize / noop / error
+	// (the anchor-match, extent + col-shrink-deferred rules); this is the thin vscode shell. Scope: row
+	// grow/shrink + column GROW (auto-named). Column shrink + rename-column are deferred -- the IDE cannot read
+	// a table's column names (no snapshot field, no query), so the engine can't be told the trailing names.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookResizeTable', (...args: unknown[]) => {
+			const resolved = resolveMenuOrFocusedSelection(args.length > 0, args[0]);
+			if (resolved.kind === 'invalid-arg') {
+				void vscode.window.showErrorMessage('Quantbook: resize table failed -- the right-click menu sent an invalid cell context. Try selecting the range and re-running.');
+				return;
+			}
+			if (resolved.kind === 'panel-gone') {
+				void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+				return;
+			}
+			if (resolved.kind === 'no-selection') {
+				void vscode.window.showInformationMessage('Select the table\'s new range in a Cell Grid first (starting at the table\'s top-left cell).');
+				return;
+			}
+			const sel = resolved.value;
+			// `tables` is absent on pre-tables fixtures and EMPTY (the live engine always sends it) when none are
+			// defined -- an absent optional list legitimately means "no tables", not a swallowed error.
+			const tables = sel.session.snapshot().tables ?? [];
+			// Find the table the resize acts on: the one whose TOP-LEFT the selection starts at (the engine
+			// freezes the anchor, so only a top-left-anchored table can be resized to this selection). Use the
+			// selection's MIN corner -- not the raw anchor, which may be the bottom-right corner of the drag.
+			const topRow = Math.min(sel.selection.anchorRow, sel.selection.focusRow);
+			const topCol = Math.min(sel.selection.anchorCol, sel.selection.focusCol);
+			const target = tableAtCell(tables, sel.sheet, topRow, topCol);
+			if (target === undefined) {
+				// No-Fallbacks: never silently open a picker over an arbitrary table (the engine would reject a
+				// non-anchored target); tell the operator exactly what to select.
+				void vscode.window.showInformationMessage('Quantbook: select a range starting at a table\'s top-left cell, then run Resize Table to Selection.');
+				return;
+			}
+			const action = planTableResize(target, sel.selection.anchorRow, sel.selection.anchorCol, sel.selection.focusRow, sel.selection.focusCol);
+			if (action.kind === 'noop') {
+				void vscode.window.showInformationMessage(`Quantbook: "${target.displayName}" already matches the selection.`);
+				return;
+			}
+			if (action.kind === 'error') {
+				void vscode.window.showErrorMessage(`Quantbook resize table: ${action.reason}`);
+				return;
+			}
+			const log = getOutput();
+			try {
+				sel.session.resizeTable(target.name, action.newRows, action.newCols, action.addedColumns, action.removedColumns);
+				log.appendLine(`Resized table "${target.name}" to ${action.newRows}x${action.newCols}${action.addedColumns.length > 0 ? ` (+cols ${action.addedColumns.join(', ')})` : ''}.`);
+			} catch (err) {
+				// Engine throws (footprint overlap, spill-anchor collision, loaded-table name collision on an
+				// appended column) surface loud (No-Fallbacks) -- the table is unchanged on a rejected resize.
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL resizeTable error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook resize table failed: ${detail}`);
+				return;
+			}
+			// A table op bumps the epoch -> recalc dependents, then reseed the panel(s) from a fresh snapshot.
+			recalcDirtyChecked(sel.session);
+			const { failed } = CellGridPanel.refreshSession(sel.session);
+			if (failed > 0) {
+				void vscode.window.showWarningMessage('Quantbook: the table was resized, but a panel failed to re-render -- run "Quantbook: Refresh Cell Grid".');
+			}
+			void vscode.window.showInformationMessage(`Quantbook: resized "${target.displayName}" to ${action.newRows} rows x ${action.newCols} columns.`);
 		}),
 	);
 }
