@@ -442,6 +442,7 @@ export class CanvasGridRenderer {
 		selection: SelectionRect | null;
 		publishedRanges: readonly PublishedRange[];
 		fillPreview: SelectionRect | null;
+		pointPreview: SelectionRect | null;
 	} | null = null;
 	private readonly measureCache = new Map<string, number>();
 	/**
@@ -643,6 +644,7 @@ export class CanvasGridRenderer {
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
+		pointPreview: SelectionRect | null,
 	): void {
 		// **Codex MED (2026-06-10) -- stale header hover on scroll.** The hover wash only updates on canvas
 		// mousemove/mouseleave; when the grid SCROLLS under a stationary pointer, the remembered header index
@@ -657,11 +659,11 @@ export class CanvasGridRenderer {
 			this.hoveredHeaderRow = -1;
 		}
 		this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview);
 		this.hasPaintedOnce = true;
 		// Sheets retheme (header hover): remember this full-draw's inputs so a hover-only change can replay an
 		// identical full redraw with the new hovered-header index, without routing back through the host.
-		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview };
+		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview };
 	}
 
 	/**
@@ -684,6 +686,7 @@ export class CanvasGridRenderer {
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
+		pointPreview: SelectionRect | null,
 	): void {
 		const ctx = this.ctx;
 		const c = blit.copy;
@@ -710,7 +713,7 @@ export class CanvasGridRenderer {
 			ctx.beginPath();
 			ctx.rect(d.x, d.y, d.width, d.height);
 			ctx.clip();
-			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
+			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview);
 			ctx.restore();
 		}
 		// 3. Codex MED (stale hover): when the previous frame carried a hover wash, repaint the FULL sticky
@@ -727,15 +730,15 @@ export class CanvasGridRenderer {
 			ctx.rect(0, 0, this.gutterW, cssHeight); // the row-number gutter (full height, incl. frozen labels)
 			ctx.rect(0, 0, cssWidth, HEADER_HEIGHT); // the column-letter band (full width)
 			ctx.clip();
-			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
+			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview);
 			ctx.restore();
 		}
 		this.hasPaintedOnce = true;
 		// Sheets retheme (header hover): a scroll updates the inputs a hover replay must use (new scrollTop/
 		// scrollLeft). Capture the post-scroll tuple so a hover wash lands on the correct header at this offset.
-		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview };
+		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview };
 		if (DEBUG_BLIT_VERIFY) {
-			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, 'drawScroll');
+			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, 'drawScroll');
 		}
 	}
 
@@ -758,6 +761,7 @@ export class CanvasGridRenderer {
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
+		pointPreview: SelectionRect | null,
 	): void {
 		if (rows.length === 0) {
 			return;
@@ -811,14 +815,14 @@ export class CanvasGridRenderer {
 		}
 		addBand(runStart, runEnd);
 		ctx.clip();
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview);
 		ctx.restore();
 		this.hasPaintedOnce = true;
 		// Sheets retheme (header hover): keep the replay tuple current with the latest host-driven state (a
 		// damage paint can change errorCells / active / selection at the same scroll the hover replay reuses).
-		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview };
+		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview };
 		if (DEBUG_BLIT_VERIFY) {
-			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, 'drawDamage');
+			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, 'drawDamage');
 		}
 	}
 
@@ -839,6 +843,7 @@ export class CanvasGridRenderer {
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
+		pointPreview: SelectionRect | null,
 		path: string,
 	): void {
 		const ctx = this.ctx;
@@ -846,7 +851,7 @@ export class CanvasGridRenderer {
 		const bh = this.canvas.height;
 		const partial = ctx.getImageData(0, 0, bw, bh);
 		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview);
 		const full = ctx.getImageData(0, 0, bw, bh);
 		const pa = partial.data;
 		const fu = full.data;
@@ -897,6 +902,7 @@ export class CanvasGridRenderer {
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
+		pointPreview: SelectionRect | null,
 	): void {
 		const ctx = this.ctx;
 		// Sheets retheme: remember the scroll this frame painted at, so the cursor hit-test can place the
@@ -942,7 +948,7 @@ export class CanvasGridRenderer {
 		this.paintCellRegion(
 			bodyRowRange, bodyColRange, scrollTop, scrollLeft, gutterW,
 			bodyLeft, bodyTop, cssWidth, cssHeight,
-			errorCells, active, selection, publishedRanges, fillPreview,
+			errorCells, active, selection, publishedRanges, fillPreview, pointPreview,
 		);
 
 		// 2. FROZEN-COLS pane (bottom-left): cols [0, fCols) pinned on X (effScrollLeft=0), rows scroll. Only
@@ -951,7 +957,7 @@ export class CanvasGridRenderer {
 			this.paintCellRegion(
 				bodyRowRange, { startIdx: 0, endIdx: frozenColEnd }, scrollTop, 0, gutterW,
 				gutterW, bodyTop, bodyLeft, cssHeight,
-				errorCells, active, selection, publishedRanges, fillPreview,
+				errorCells, active, selection, publishedRanges, fillPreview, pointPreview,
 			);
 		}
 
@@ -961,7 +967,7 @@ export class CanvasGridRenderer {
 			this.paintCellRegion(
 				{ startIdx: 0, endIdx: frozenRowEnd }, bodyColRange, 0, scrollLeft, gutterW,
 				bodyLeft, HEADER_HEIGHT, cssWidth, bodyTop,
-				errorCells, active, selection, publishedRanges, fillPreview,
+				errorCells, active, selection, publishedRanges, fillPreview, pointPreview,
 			);
 		}
 
@@ -971,7 +977,7 @@ export class CanvasGridRenderer {
 			this.paintCellRegion(
 				{ startIdx: 0, endIdx: frozenRowEnd }, { startIdx: 0, endIdx: frozenColEnd }, 0, 0, gutterW,
 				gutterW, HEADER_HEIGHT, bodyLeft, bodyTop,
-				errorCells, active, selection, publishedRanges, fillPreview,
+				errorCells, active, selection, publishedRanges, fillPreview, pointPreview,
 			);
 		}
 
@@ -1166,6 +1172,7 @@ export class CanvasGridRenderer {
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
+		pointPreview: SelectionRect | null,
 	): void {
 		const ctx = this.ctx;
 		if (clipX1 <= clipX0 || clipY1 <= clipY0 || rowRange.endIdx <= rowRange.startIdx || colRange.endIdx <= colRange.startIdx) {
@@ -1423,6 +1430,29 @@ export class CanvasGridRenderer {
 			ctx.strokeStyle = this.palette.selectionBorder;
 			ctx.lineWidth = 1;
 			ctx.setLineDash([FILL_HANDLE_PX / 2, FILL_HANDLE_PX / 2]);
+			ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
+			ctx.restore();
+		}
+
+		// 4c-2. FE-3 range-pick / point mode: the drag-PREVIEW outline of the cell/range being pointed into the
+		// formula being edited. A DISTINCT, tighter dash than the fill handle's so it reads as "pointing a
+		// reference", not a fill. Painted only while a point drag is active and only when it intersects this pane
+		// window. The fill and point previews are MUTUALLY EXCLUSIVE (a fill needs no open editor; a point needs
+		// one), so a frame never carries both -- but they ride INDEPENDENT channels so neither can stamp the
+		// other's state. (Own block scope, so its `px/py/pw/ph` never collide with the fill block's.)
+		if (
+			pointPreview !== null &&
+			pointPreview.maxRow >= rowRange.startIdx && pointPreview.minRow < rowRange.endIdx &&
+			pointPreview.maxCol >= colRange.startIdx && pointPreview.minCol < colRange.endIdx
+		) {
+			const px = Math.round(colX(pointPreview.minCol, gutterW) - effScrollLeft);
+			const py = Math.round(rowY(pointPreview.minRow) - effScrollTop);
+			const pw = Math.round(colX(pointPreview.maxCol + 1, gutterW) - effScrollLeft) - px;
+			const ph = Math.round(rowY(pointPreview.maxRow + 1) - effScrollTop) - py;
+			ctx.save();
+			ctx.strokeStyle = this.palette.selectionBorder;
+			ctx.lineWidth = 1;
+			ctx.setLineDash([3, 2]);
 			ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
 			ctx.restore();
 		}
@@ -1763,7 +1793,7 @@ export class CanvasGridRenderer {
 			if (a === null) {
 				return;
 			}
-			this.draw(a.cssWidth, a.cssHeight, a.scrollTop, a.scrollLeft, a.errorCells, a.active, a.selection, a.publishedRanges, a.fillPreview);
+			this.draw(a.cssWidth, a.cssHeight, a.scrollTop, a.scrollLeft, a.errorCells, a.active, a.selection, a.publishedRanges, a.fillPreview, a.pointPreview);
 		});
 	}
 

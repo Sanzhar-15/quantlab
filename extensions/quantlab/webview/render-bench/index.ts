@@ -108,6 +108,8 @@ const benchHost: RenderHost = {
 	selection: () => null,
 	publishedRanges: () => publishedRanges,
 	fillPreview: () => fillPreview,
+	// FE-3 range-pick: the bench never opens an editor, so there is never a point-mode drag preview.
+	pointPreview: () => null,
 	// W3 frozen panes: the bench never freezes (it measures the scrolling-body blit), so 0/0.
 	frozenRowCount: () => 0,
 	frozenColCount: () => 0,

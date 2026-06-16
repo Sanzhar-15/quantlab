@@ -63,6 +63,7 @@ export interface GridRenderer {
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
+		pointPreview: SelectionRect | null,
 	): void;
 	drawScroll(
 		blit: ScrollBlit,
@@ -75,6 +76,7 @@ export interface GridRenderer {
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
+		pointPreview: SelectionRect | null,
 	): void;
 	drawDamage(
 		rows: readonly number[],
@@ -87,6 +89,7 @@ export interface GridRenderer {
 		selection: SelectionRect | null,
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
+		pointPreview: SelectionRect | null,
 	): void;
 }
 
@@ -111,6 +114,8 @@ export interface RenderHost {
 	publishedRanges(): readonly PublishedRange[];
 	/** The fill-handle drag preview rect, or null. */
 	fillPreview(): SelectionRect | null;
+	/** **FE-3 range-pick / point mode** -- the cell/range being pointed into the formula being edited, or null. */
+	pointPreview(): SelectionRect | null;
 	/**
 	 * **W3 frozen panes** -- the number of PINNED leading rows / cols. The blit decision reads these to
 	 * exclude the frozen bands from the scroll copy + repaint them as part of the exposed strip; `0/0` keeps
@@ -183,7 +188,7 @@ export class RenderOrchestrator {
 		const v = host.viewport();
 		renderer.resize(v.cssW, v.cssH);
 		host.applyCanvasTransform(v.scrollTop, v.scrollLeft);
-		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview());
+		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview(), host.pointPreview());
 		this.prevPaint = this.scrollStateNow(v);
 		host.onAfterFullRedraw();
 	}
@@ -218,10 +223,11 @@ export class RenderOrchestrator {
 		const active = host.active();
 		const published = host.publishedRanges();
 		const fill = host.fillPreview();
+		const point = host.pointPreview();
 		if (blit === null) {
-			renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, active, sel, published, fill);
+			renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, active, sel, published, fill, point);
 		} else {
-			renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, active, sel, published, fill);
+			renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, active, sel, published, fill, point);
 		}
 		this.prevPaint = next;
 		host.onAfterScroll();
@@ -293,7 +299,7 @@ export class RenderOrchestrator {
 		// Scroll is unchanged (gated above), so the canvas transform + prevPaint stay valid; drawDamage is
 		// a no-op for an empty row set (nothing painted changed).
 		host.applyCanvasTransform(v.scrollTop, v.scrollLeft);
-		renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview());
+		renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview(), host.pointPreview());
 		// The damage path bypasses redraw(); if the active cell's content changed (e.g. a commit
 		// re-render), the formula bar must still follow it.
 		host.onAfterDamage();
@@ -316,7 +322,7 @@ export class RenderOrchestrator {
 		if (!forceFullRedraw && renderer.painted && !renderer.backingScaleStale && this.scrollUnchangedSince(v)) {
 			const rows = errorRowsFlippedA1(prevErrorKeys, new Set(host.errorCells.keys()));
 			host.applyCanvasTransform(v.scrollTop, v.scrollLeft);
-			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview());
+			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview(), host.pointPreview());
 		} else {
 			// A selection realign (forceFullRedraw) repaints both the old + new selection rows -> full redraw.
 			this.redraw();

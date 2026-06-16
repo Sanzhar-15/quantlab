@@ -100,6 +100,9 @@ class FakeHost implements RenderHost {
 	fillPreview(): SelectionRect | null {
 		return this.fill;
 	}
+	pointPreview(): SelectionRect | null {
+		return null;
+	}
 	frozenRowCount(): number {
 		return this.frozenRows;
 	}

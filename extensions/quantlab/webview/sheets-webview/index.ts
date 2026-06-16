@@ -44,6 +44,7 @@
 
 import type { CellAddrJson, DiagnosticJson, FunctionMetadataJson, NamedRangeJson, NamedRangeTargetJson, NamedTargetJson, QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { matchNameForSelection } from '../../src/quantbook/shared/nameMatch';
+import { buildRefText, canPointAtRange, insertRefAtCaret, type RefSpan } from '../../src/quantbook/shared/formulaRangePick';
 import { clampDisplayString, formatCellValue } from './cellRender';
 import {
 	buildSignatureLabel,
@@ -1518,6 +1519,24 @@ let consumedCutOsTsv: string | null = null;
 // `fillSuppressClick` swallows the click that fires after a fill-drag pointerup (so it doesn't re-select).
 let fillSource: SelectionRect | null = null;
 let fillPreview: SelectionRect | null = null;
+// **FE-3 range-pick / point mode**: while a formula is being edited, a grid press/drag inserts the pressed
+// cell/range's A1 reference INTO the formula at the caret (Excel point mode). A thin overlay on the SACRED
+// `editState` -- it never writes a cell, never creates/nulls `editState`; it only mutates `editState.editEl`
+// value + caret and owns the state below. Independent of the fill handle (the two drags are MUTUALLY EXCLUSIVE:
+// a fill needs no open editor, a point needs one), so neither can stamp the other's render channel.
+//  - `pointDrag`         : non-null only DURING a press/drag; the drag anchor, the OWNER pointerId (so a
+//                          second touch/pen cannot hijack the drag), and a pre-drag snapshot (value /
+//                          selection / span) used to REVERT on pointercancel. Mirrors `fillSource`.
+//  - `pointPreview`      : the rect to outline while dragging (own render channel). Mirrors `fillPreview`.
+//  - `pointInsertedSpan` : the [start,end) span of the ref the LAST point inserted. While set, the next point
+//                          REPLACES it (re-point). Cleared on any real keystroke (onEditInput) AND whenever a
+//                          new point starts with the caret no longer collapsed at its end (an arrow/click move
+//                          or a fresh selection -- neither fires `input`), so the next point APPENDS.
+//  - `pointSuppressClick`: swallow the synthetic click after a point press so it does not also re-select.
+let pointDrag: { anchor: { row: number; col: number }; pointerId: number; startValue: string; startSelStart: number; startSelEnd: number; startSpan: RefSpan | null } | null = null;
+let pointPreview: SelectionRect | null = null;
+let pointInsertedSpan: RefSpan | null = null;
+let pointSuppressClick = false;
 let fillSuppressClick = false;
 // Click tolerance (CSS px) for grabbing the fill-handle square at the selection's bottom-right corner.
 const FILL_HANDLE_HIT_PX = 5;
@@ -2020,6 +2039,7 @@ const renderHost: RenderHost = {
 	selection: currentSelection,
 	publishedRanges: () => publishedRanges,
 	fillPreview: () => fillPreview,
+	pointPreview: () => pointPreview,
 	// W3 frozen panes: the renderer is the single source of truth for the (clamped) frozen counts; the
 	// orchestrator's blit gate reads them through here. `setFrozen` clamped them, so these are always sane.
 	frozenRowCount: () => renderer.frozenRows,
@@ -2895,6 +2915,17 @@ function cancelEdit(): void {
 	}
 	const surface = editState.surface; // capture before nulling -- the teardown branch depends on it
 	editState = null;
+	// FE-3 range-pick: a closing editor ends point mode. Drop any live re-point span + in-flight drag/preview
+	// so a later pointerdown cannot replace a stale span or paint a ghost. (pointPreview is normally already
+	// null -- a drag ends on its own pointerup -- so the redraw is defensive: it only fires if a drag was
+	// interrupted by this non-pointer teardown, e.g. Escape mid-drag.)
+	const hadPointPreview = pointPreview !== null;
+	pointDrag = null;
+	pointInsertedSpan = null;
+	pointPreview = null;
+	if (hadPointPreview) {
+		redraw();
+	}
 	if (surface === 'overlay') {
 		inputEl.hidden = true;
 		inputEl.value = '';
@@ -3206,6 +3237,10 @@ function acceptCompletion(idx: number): void {
 	const after = value.slice(completion.replaceEnd);
 	const next = before + insert + after;
 	formulaInputEl.value = next;
+	// FE-3 range-pick: accepting a completion rewrote the editor text programmatically (no `input` event), so a
+	// live re-point span is now STALE -- clear it so a later grid point inserts fresh, never replaces a span that
+	// indexes into the pre-accept text (which would corrupt the formula or throw). Mirrors the F4 (applyRefCycle) fix.
+	pointInsertedSpan = null;
 	// Caret goes right after the inserted '(' so the user types args next (and the signature hint shows).
 	const caret = before.length + insert.length;
 	formulaInputEl.setSelectionRange(caret, caret);
@@ -3590,6 +3625,10 @@ function onEditInput(ev: Event): void {
 	if (editState === null || ev.target !== editState.editEl) {
 		return;
 	}
+	// FE-3 range-pick: ANY real keystroke ends the live "re-point" target -- the just-pointed ref is no longer
+	// what a grid press should replace, so clear the span and the next point APPENDS. (A programmatic point
+	// insert sets `.value` without firing `input`, so a point never trips this itself.)
+	pointInsertedSpan = null;
 	if (errorSource === 'edit' && editState.editEl.value.length <= MAX_RAW_INPUT_LENGTH) {
 		clearError();
 	}
@@ -3629,6 +3668,10 @@ function applyRefCycle(): boolean {
 	}
 	el.value = result.formula;
 	el.setSelectionRange(result.caretPos, result.caretPos);
+	// FE-3 range-pick: F4 rewrote the editor text programmatically (no `input` event), so any live re-point
+	// span is now STALE (its offsets index into the pre-F4 text). Clear it so the next grid point inserts fresh
+	// instead of replacing a stale span (which would corrupt the formula or throw on an out-of-range end).
+	pointInsertedSpan = null;
 	// Mirror the `input` path's assist refresh (formula bar only; no-ops on the overlay). The value changed,
 	// so a debounced re-validate + signature hint + dropdown re-eval keep the bar's diagnostics in sync.
 	if (formulaBarIsEditing()) {
@@ -3639,6 +3682,38 @@ function applyRefCycle(): boolean {
 		}
 	}
 	return true;
+}
+
+/**
+ * **FE-3 range-pick / point mode** -- insert (or RE-POINT) the pressed cell/range's A1 reference into the LIVE
+ * editor at the caret. Mirrors {@link applyRefCycle}'s value/caret write + assist refresh (setting `.value`
+ * programmatically does NOT fire `input`). If a previous point left a live span (`pointInsertedSpan`), this
+ * REPLACES it (Excel re-point); otherwise it inserts at the caret. A pointed reference is not a function-name
+ * completion context, so any open dropdown is closed. Records the new span so a subsequent point/drag replaces
+ * it. Pure-IDE: the cell write still happens only via the single {@link commitEdit} path on Enter/Tab/blur.
+ */
+function applyPointInsert(rect: SelectionRect): void {
+	if (editState === null) {
+		return; // defensive -- a point drag cannot outlive its editor (the teardown guards null `pointDrag`)
+	}
+	const el = editState.editEl;
+	const selStart = el.selectionStart ?? el.value.length;
+	const selEnd = el.selectionEnd ?? selStart;
+	// Replace target: a live re-point span (`pointInsertedSpan`, set once a point has inserted) wins; else, on
+	// the FIRST point of a gesture, a non-empty text SELECTION is replaced (Excel re-points a selected ref);
+	// else a bare insert at the caret. `selStart` is the insertion offset for the bare-insert case.
+	const replaceSpan = pointInsertedSpan ?? (selEnd > selStart ? { start: selStart, end: selEnd } : undefined);
+	const result = insertRefAtCaret(el.value, selStart, buildRefText(rect), replaceSpan);
+	el.value = result.text;
+	el.setSelectionRange(result.caret, result.caret);
+	pointInsertedSpan = result.span;
+	closeCompletion();
+	// Mirror applyRefCycle's assist refresh (formula bar only; no-ops on the overlay). closeCompletion above
+	// keeps the dropdown shut -- a ref is not a completion token -- so refresh validate + signature only.
+	if (formulaBarIsEditing()) {
+		scheduleValidate();
+		updateSignatureHint();
+	}
 }
 
 function onEditKeydown(ev: KeyboardEvent): void {
@@ -3771,6 +3846,12 @@ function onEditBlur(ev: FocusEvent): void {
 	// before). NOTE: cancelEdit()/resolvePendingCommit() null `editState` BEFORE hiding the input, so the
 	// blur THEY trigger early-returns here (editState === null) -- this only fires on a genuine focus-out.
 	if (editState === null || editState.pendingCommit || ev.target !== editState.editEl) {
+		return;
+	}
+	// FE-3 range-pick: a point drag preventDefaults the pointerdown so focus never leaves the editor and this
+	// blur should not fire -- but if a platform fires it anyway mid-drag, do NOT commit/cancel under the drag
+	// (that would destroy the edit the point is building). pointerup/pointercancel owns the teardown.
+	if (pointDrag !== null) {
 		return;
 	}
 	const value = editState.editEl.value;
@@ -4010,14 +4091,48 @@ function isOnFillHandle(ev: MouseEvent): boolean {
 canvasEl.addEventListener('pointerdown', ev => {
 	// megaudit Lane C: ignore a re-entrant pointerdown while a drag is already in flight (a second touch /
 	// stylus). It must not reset the suppress flag, restart the drag, or rebind `fillSource` to a different
-	// rect -- the first pointer owns the drag until its pointerup/pointercancel.
-	if (fillSource !== null) {
+	// rect -- the first pointer owns the drag until its pointerup/pointercancel. FE-3: a point drag is the same
+	// single-owner contract, so a press while EITHER drag is live is ignored.
+	if (fillSource !== null || pointDrag !== null) {
 		return;
 	}
 	// megaudit MED: clear any leftover suppress flag at the START of every interaction so it can never
 	// linger to swallow a later legitimate click (on platforms where preventDefault below already
-	// suppresses the drag's own synthetic click, the flag would otherwise never be consumed).
+	// suppresses the drag's own synthetic click, the flag would otherwise never be consumed). FE-3 clears the
+	// point suppress flag for the same reason.
 	fillSuppressClick = false;
+	pointSuppressClick = false;
+	// FE-3 range-pick / point mode: when a formula IS being edited and the caret sits at a ref-insertion
+	// position, a grid press points a reference INTO the formula instead of selecting. Runs BEFORE the fill
+	// guard (which bails on an open editor). preventDefault keeps focus in the editor (no blur-commit) and
+	// setPointerCapture keeps move/up firing off-canvas -- exactly the fill handle's mechanism.
+	if (editState !== null && !editState.pendingCommit && ev.button === 0) {
+		const el = editState.editEl;
+		const selStart = el.selectionStart ?? el.value.length;
+		const selEnd = el.selectionEnd ?? selStart;
+		// FE-3 re-point validity: the "replace the last-pointed ref" span (`pointInsertedSpan`) is only live while
+		// the caret is still COLLAPSED exactly at its end (a fresh point immediately after a point). A caret move
+		// (arrow key / click inside the input) or a new text selection does NOT fire `input`, so onEditInput never
+		// cleared the span -- drop it HERE so this point inserts fresh / replaces the SELECTION, never silently
+		// overwrites a ref the user navigated away from (`=SUM(B2,)` + ArrowRight + point C3 must APPEND, not
+		// replace B2). Done before capturing `startSpan` so the cancel snapshot matches.
+		if (pointInsertedSpan !== null && !(selStart === selEnd && selStart === pointInsertedSpan.end)) {
+			pointInsertedSpan = null;
+		}
+		const hit = hitTestCanvas(ev);
+		if (hit !== null && !isOnFillHandle(ev) && canPointAtRange(el.value, selStart, selEnd)) {
+			ev.preventDefault();
+			pointDrag = { anchor: hit, pointerId: ev.pointerId, startValue: el.value, startSelStart: selStart, startSelEnd: selEnd, startSpan: pointInsertedSpan };
+			const rect = selectionRect(hit, hit);
+			applyPointInsert(rect);
+			pointPreview = rect;
+			canvasEl.setPointerCapture(ev.pointerId);
+			redraw();
+			return;
+		}
+		// editing but not an eligible point press -> fall through; the fill guard below bails (editState!==null),
+		// then the click handler reselects (committing the edit via blur), exactly as before.
+	}
 	if (editState !== null || active === null || !isOnFillHandle(ev)) {
 		return;
 	}
@@ -4028,6 +4143,32 @@ canvasEl.addEventListener('pointerdown', ev => {
 	canvasEl.setPointerCapture(ev.pointerId);
 });
 canvasEl.addEventListener('pointermove', ev => {
+	// FE-3 point mode: extend the pointed range to the cell under the pointer, rewriting the inserted ref.
+	if (pointDrag !== null) {
+		if (ev.pointerId !== pointDrag.pointerId) {
+			return; // a second touch/pen is NOT the drag owner -- the first pointer owns the drag, ignore its moves
+		}
+		if (editState === null) {
+			pointDrag = null; // the editor vanished mid-drag (defensive) -- abandon without finalizing
+			pointPreview = null;
+			redraw();
+			return;
+		}
+		const phit = hitTestCanvas(ev);
+		// A move into a band (phit===null) snaps the preview + ref back to the single anchor cell, so a release
+		// there points just the anchor (mirrors the fill handler's band snap-back).
+		const rect = phit === null ? selectionRect(pointDrag.anchor, pointDrag.anchor) : selectionRect(pointDrag.anchor, phit);
+		if (
+			pointPreview === null ||
+			rect.minRow !== pointPreview.minRow || rect.maxRow !== pointPreview.maxRow ||
+			rect.minCol !== pointPreview.minCol || rect.maxCol !== pointPreview.maxCol
+		) {
+			applyPointInsert(rect);
+			pointPreview = rect;
+			redraw();
+		}
+		return;
+	}
 	if (fillSource === null) {
 		return;
 	}
@@ -4052,6 +4193,25 @@ canvasEl.addEventListener('pointermove', ev => {
 	}
 });
 canvasEl.addEventListener('pointerup', ev => {
+	// FE-3 point mode: finalize the pointed reference at the RELEASE cell (authoritative, mirrors fill), keep
+	// the editor open + focused, and swallow the synthesized post-drag click so it does not re-select.
+	if (pointDrag !== null) {
+		if (ev.pointerId !== pointDrag.pointerId) {
+			return; // not the drag owner -- a foreign pointer's up must not finalize the first pointer's drag
+		}
+		canvasEl.releasePointerCapture?.(ev.pointerId);
+		if (editState !== null) {
+			const releaseHit = hitTestCanvas(ev);
+			const rect = releaseHit === null ? selectionRect(pointDrag.anchor, pointDrag.anchor) : selectionRect(pointDrag.anchor, releaseHit);
+			applyPointInsert(rect);
+			editState.editEl.focus(); // re-assert focus (the pointer-capture target was the canvas)
+		}
+		pointDrag = null;
+		pointPreview = null;
+		pointSuppressClick = true;
+		redraw();
+		return;
+	}
 	if (fillSource === null) {
 		return;
 	}
@@ -4076,7 +4236,31 @@ canvasEl.addEventListener('pointerup', ev => {
 // preview, and a later unrelated pointerup would apply an unintended fill). No fill is committed on a
 // cancel. (Only pointercancel, NOT lostpointercapture -- the latter also fires on the normal post-pointerup
 // release and could race applyFill.)
-canvasEl.addEventListener('pointercancel', () => {
+canvasEl.addEventListener('pointercancel', ev => {
+	// FE-3 point mode: a hijacked point drag REVERTS the editor to its pre-drag state (no half-pointed ref is
+	// left behind); the editor stays open so the user can re-point. Mirrors the fill cancel (which commits
+	// nothing) but must also undo the text we already inserted on pointerdown.
+	if (pointDrag !== null) {
+		if (ev.pointerId !== pointDrag.pointerId) {
+			return; // not the drag owner -- a foreign pointer's cancel must not abort the first pointer's drag
+		}
+		if (editState !== null) {
+			const el = editState.editEl;
+			el.value = pointDrag.startValue;
+			el.setSelectionRange(pointDrag.startSelStart, pointDrag.startSelEnd); // restore the FULL pre-drag selection
+			pointInsertedSpan = pointDrag.startSpan;
+			el.focus(); // re-assert focus (defensive: if a platform fired blur despite the pointerdown preventDefault)
+			closeCompletion();
+			if (formulaBarIsEditing()) {
+				scheduleValidate();
+				updateSignatureHint();
+			}
+		}
+		pointDrag = null;
+		pointPreview = null;
+		redraw();
+		return;
+	}
 	if (fillSource === null) {
 		return;
 	}
@@ -4089,6 +4273,10 @@ canvasEl.addEventListener('pointercancel', () => {
 // If an editor was open, the focus-out it caused already committed/cancelled it via the blur handler above;
 // here we only move the selection. (A pending commit keeps its editor; the click still just reselects.)
 canvasEl.addEventListener('click', ev => {
+	if (pointSuppressClick) {
+		pointSuppressClick = false; // FE-3 point mode: swallow the click synthesized after a point press/drag
+		return;
+	}
 	if (fillSuppressClick) {
 		fillSuppressClick = false; // W-G fill handle: swallow the click synthesized after a fill drag
 		return;
@@ -4113,6 +4301,12 @@ canvasEl.addEventListener('click', ev => {
 // Double click opens the editor on the cell (Excel). beginEdit re-asserts the selection + reveal; it bails
 // if a commit is still in flight (M8), consistent with every other edit entry point.
 canvasEl.addEventListener('dblclick', ev => {
+	// FE-3 range-pick: while an editor is OPEN, a dblclick must NOT open a new cell editor -- two rapid point
+	// clicks synthesize a dblclick, and beginEdit() would cancelEdit() the in-progress formula (dropping it).
+	// Editing is single-cell; to edit another cell the user commits first (Enter/Tab/click-away). Excel-aligned.
+	if (editState !== null) {
+		return;
+	}
 	const hit = hitTestCanvas(ev);
 	if (hit === null) {
 		return;
