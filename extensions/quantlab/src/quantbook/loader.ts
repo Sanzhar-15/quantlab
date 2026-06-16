@@ -225,7 +225,9 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 		throw new Error(
 			`Quantbook engine binary not found at ${enginePath}. ` +
 			`Either set QUANTBOOK_ENGINE_PATH or build the engine with: ` +
-			`cd ../quantlab-quantbook/quantbook-engine && cargo build -p ql-bindings-node --release`,
+			// FE-Export-XLSX: `--features xlsx-write` is REQUIRED for `session.export('xlsx')` to return real
+			// bytes (else the honest not-implemented error); `test-fixtures` for the mocha contention tests.
+			`cd ../quantlab-quantbook/quantbook-engine && cargo build -p ql-bindings-node --release --features xlsx-write,test-fixtures`,
 		);
 	}
 	// process.dlopen does the actual loading. Build a fake CommonJS
@@ -493,7 +495,8 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 			`[${missing.join(', ')}]. ` +
 			`Got: ${JSON.stringify(Object.keys(fakeModule.exports))}. ` +
 			`This indicates a stale binary -- rebuild with: ` +
-			`cargo build -p ql-bindings-node --release.`,
+			// FE-Export-XLSX: keep `--features xlsx-write` so the rebuild does not silently drop xlsx export.
+			`cargo build -p ql-bindings-node --release --features xlsx-write,test-fixtures.`,
 		);
 	}
 	cachedModule = loaded;

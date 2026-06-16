@@ -252,6 +252,12 @@
         "category": "%command.category%"
       },
       {
+        "_comment": "FE-Export-XLSX: Export the active workbook to .xlsx (session.export('xlsx'); WHOLE workbook, all sheets -- no single-sheet restriction). Requires the dylib built with --features xlsx-write (else the honest not-implemented error). In the webview File menu + palette.",
+        "command": "quantlab.quantbookExportXlsx",
+        "title": "%command.quantbookExportXlsx.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.quantbookSheetAdd",
         "title": "%command.quantbookSheetAdd.title%",
         "category": "%command.category%"

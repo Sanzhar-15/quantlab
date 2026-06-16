@@ -387,7 +387,9 @@ type ToolbarCommand =
 	| 'nameManager'
 	| 'goToName'
 	// FE-8.2: the File menu's "Export to CSV…" -- wires the host quantbookExportCsv command (session.export('csv')).
-	| 'exportCsv';
+	| 'exportCsv'
+	// FE-Export-XLSX: the File menu's "Export to XLSX…" -- wires quantbookExportXlsx (session.export('xlsx'), whole workbook).
+	| 'exportXlsx';
 
 /** The engine's number-format preset ids (the host contract's `setNumberFormat.preset`). There is NO
  * 'Scientific' -- the engine preset list does not have it; offering it would be a dead entry
@@ -514,8 +516,10 @@ const MENUBAR_MENUS: ReadonlyArray<{ readonly id: string; readonly entries: read
 			{ label: 'Open Workbook…', run: () => postToolbarCommand('openWorkbook') },
 			// FE-8.2: data export (CSV), distinct from the .qbook Save above. Single-sheet workbooks only
 			// (the engine refuses multi-sheet CSV with a loud error); routed through the same toolbar bridge.
+			// FE-Export-XLSX: data export (XLSX) is WHOLE-WORKBOOK (all sheets) -- no single-sheet restriction.
 			'separator',
 			{ label: 'Export to CSV…', run: () => postToolbarCommand('exportCsv') },
+			{ label: 'Export to XLSX…', run: () => postToolbarCommand('exportXlsx') },
 		],
 	},
 	{

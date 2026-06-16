@@ -73,6 +73,7 @@
 	"command.quantbookSaveAs.title": "Quantbook: Save As...",
 	"command.quantbookOpen.title": "Quantbook: Open...",
 	"command.quantbookExportCsv.title": "Quantbook: Export to CSV...",
+	"command.quantbookExportXlsx.title": "Quantbook: Export to XLSX...",
 	"command.quantbookSheetAdd.title": "Quantbook: Add Sheet...",
 	"command.quantbookSheetRename.title": "Quantbook: Rename Sheet...",
 	"command.quantbookSheetDelete.title": "Quantbook: Delete Sheet...",

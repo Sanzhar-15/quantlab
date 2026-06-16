@@ -2554,7 +2554,8 @@ export type ToolbarSimpleCommand =
 	| 'showLivePython'
 	| 'nameManager'
 	| 'goToName'
-	| 'exportCsv';
+	| 'exportCsv'
+	| 'exportXlsx';
 
 /**
  * The number-format presets the toolbar may apply: every {@link FormatPreset}
@@ -2611,23 +2612,47 @@ const TOOLBAR_SIMPLE_COMMAND_IDS: Record<ToolbarSimpleCommand, string> = {
 	// the focused grid + prompts for a path). CSV is single-sheet-only engine-side -- a multi-sheet workbook
 	// surfaces the engine's loud BadArgument verbatim (No-Fallbacks).
 	exportCsv: 'quantlab.quantbookExportCsv',
+	// FE-Export-XLSX (2026-06-16): the File menu's "Export to XLSX..." reveals the host command that wires
+	// `session.export('xlsx')`. WHOLE-WORKBOOK (every sheet) -- there is NO single-sheet restriction (unlike
+	// CSV). Argument-less (resolves the focused grid + prompts for a path). The only export error is the honest
+	// not-implemented when the dylib lacks the `xlsx-write` feature, surfaced loud (No-Fallbacks).
+	exportXlsx: 'quantlab.quantbookExportXlsx',
 };
 
 /**
- * **FE-8.2**: a safe default file name for the "Export to CSV" save dialog, derived from the active sheet's
- * name (Excel defaults the export name to the sheet). Replaces characters illegal in file names
- * (`\ / : * ? " < > |` and control chars) with `_`, collapses runs of whitespace, trims, and falls back to
- * `export` for an empty / all-illegal / missing name. Always ends in `.csv`. Pure (no vscode/engine) so the
- * sanitization is unit-tested directly.
+ * Sanitize a raw name into a SAFE file base (no extension): replaces characters illegal in file names
+ * (`\ / : * ? " < > |` and control chars `\x00-\x1f`) with `_`, collapses runs of whitespace, trims, and
+ * falls back to `fallback` ONLY when the cleaned result is empty (a missing / empty / whitespace-only
+ * name). An all-illegal name is sanitized, NOT replaced -- e.g. `///` -> `___`, not the fallback.
+ * Guarantees no path separator can survive (defense-in-depth for the save-dialog default). Shared by
+ * {@link defaultCsvFileName} and
+ * {@link defaultXlsxFileName}; pure (no vscode/engine) so it is unit-tested through both callers.
  */
-export function defaultCsvFileName(sheetName: string | undefined): string {
-	const cleaned = (sheetName ?? '')
-		// Strip characters illegal in file names (Windows-illegal set) AND control chars (\x00-\x1f).
+function sanitizeFileBaseName(name: string | undefined, fallback: string): string {
+	const cleaned = (name ?? '')
 		.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_')
 		.replace(/\s+/g, ' ')
 		.trim();
-	const safe = cleaned.length > 0 ? cleaned : 'export';
-	return `${safe}.csv`;
+	return cleaned.length > 0 ? cleaned : fallback;
+}
+
+/**
+ * **FE-8.2**: a safe default file name for the "Export to CSV" save dialog, derived from the active sheet's
+ * name (Excel defaults the export name to the sheet). Falls back to `export` for an empty / missing name.
+ * Always ends in `.csv`. Pure (no vscode/engine) so the sanitization is unit-tested directly.
+ */
+export function defaultCsvFileName(sheetName: string | undefined): string {
+	return `${sanitizeFileBaseName(sheetName, 'export')}.csv`;
+}
+
+/**
+ * **FE-Export-XLSX**: a safe default file name for the "Export to XLSX" save dialog. XLSX export is
+ * WHOLE-WORKBOOK (all sheets), so there is no single sheet to name after -- the caller passes the open
+ * workbook's base name (e.g. the `.qbook` basename) when it has one, else `undefined`, which falls back to
+ * `workbook`. Same sanitization as {@link defaultCsvFileName}; always ends in `.xlsx`. Pure (unit-tested).
+ */
+export function defaultXlsxFileName(workbookName: string | undefined): string {
+	return `${sanitizeFileBaseName(workbookName, 'workbook')}.xlsx`;
 }
 
 /**

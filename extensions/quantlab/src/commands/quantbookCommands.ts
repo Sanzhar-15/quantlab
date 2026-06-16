@@ -40,7 +40,7 @@ import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
 import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
 import { showRenderBenchPanel } from '../quantbook/bench/renderBenchPanel';
-import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, classifySwitchSheetTarget, defaultCsvFileName, resolveCommandTargetPanel } from '../quantbook/cellGrid/cellGridLogic';
+import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, classifySwitchSheetTarget, defaultCsvFileName, defaultXlsxFileName, resolveCommandTargetPanel } from '../quantbook/cellGrid/cellGridLogic';
 import { FORMAT_PRESET_CHOICES, buildFormatUndoLabel, buildSetFormatOps, formatStringForPreset, presetLabel, type FormatPreset } from '../quantbook/cellGrid/formatPickerLogic';
 // FE-4 W2 (2026-06-10): the pure, vscode-free sort core (read snapshot rect -> refuse-on-formula -> row
 // permutation -> setValue batch). The command below is a thin vscode shell over it (the established N-1/N-2 split).
@@ -569,6 +569,55 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL export CSV write error: ${detail}`);
 				void vscode.window.showErrorMessage(`Quantbook export to CSV failed: ${detail}`);
+			}
+		}),
+	);
+
+	// FE-Export-XLSX (2026-06-16): Export the active workbook to .xlsx. Wires the live `session.export('xlsx')`
+	// napi method -- WHOLE workbook (every sheet), unlike the single-sheet CSV path above (xlsx is inherently
+	// multi-sheet, so there is NO multi-sheet refusal). The engine writer ships behind the `xlsx-write` feature;
+	// a dylib built WITHOUT it returns the honest [not_implemented_in_v1_core], which we surface verbatim
+	// (No-Fallbacks), never a silent empty file. We serialize BEFORE prompting for a path so that error fails
+	// fast (the operator is not made to pick a file only to error). Pure-IDE.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookExportXlsx', async () => {
+			const target = resolveTargetOrWarn();
+			if (target === undefined) {
+				return; // resolveTargetOrWarn already messaged
+			}
+			const log = getOutput();
+			// Serialize FIRST: a throw (e.g. the dylib lacks the xlsx-write feature) surfaces loud BEFORE the
+			// dialog -- one toast, never an unhandled rejection.
+			let bytes: Uint8Array;
+			try {
+				bytes = target.session.export('xlsx');
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL export XLSX error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook export to XLSX failed: ${detail}`);
+				return;
+			}
+			const folder = vscode.workspace.workspaceFolders?.[0];
+			const uri = await vscode.window.showSaveDialog({
+				title: 'Export Quantbook to XLSX',
+				filters: { XLSX: ['xlsx'] },
+				saveLabel: 'Export',
+				// Whole-workbook export has no single sheet to name after -- default to `workbook.xlsx`.
+				defaultUri: folder === undefined ? undefined : vscode.Uri.joinPath(folder.uri, defaultXlsxFileName(undefined)),
+			});
+			if (uri === undefined) {
+				return; // dismissed
+			}
+			try {
+				await vscode.workspace.fs.writeFile(uri, bytes);
+				// An .xlsx is always a valid non-empty zip (the package carries [Content_Types].xml etc.), so
+				// unlike CSV there is no 0-byte case to warn about.
+				log.appendLine(`Exported workbook to XLSX at ${uri.fsPath} (${bytes.length} bytes).`);
+				void vscode.window.showInformationMessage(`Quantbook exported to ${uri.fsPath}`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL export XLSX write error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook export to XLSX failed: ${detail}`);
 			}
 		}),
 	);
