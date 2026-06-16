@@ -142,6 +142,17 @@ napi-build = { workspace = true }
 default = []
 test-fixtures = ["ql-collab/test-fixtures"]
 
+# **FE-Export-XLSX (2026-06-16):** forward `ql-exec`'s opt-in xlsx WRITER so the
+# napi `Session::export("xlsx")` returns real bytes (else the honest
+# `Capability/not_implemented_in_v1_core`). The engine writer + session arm +
+# this napi method already exist + were dual-audited (inc.2c-12, CLEAN); the only
+# switch is this forwarder + building the cdylib with it. NOT in `default` (it
+# pulls umya + the image/rav1e/exr/tiff codec tree -- a heavier cdylib), so the
+# IDE ship/dev build now opts in:
+#
+#     cargo build -p ql-bindings-node --release --features xlsx-write,test-fixtures
+xlsx-write = ["ql-exec/xlsx-write"]
+
 # **Phase 5.7 V3.6.0.7 D6 profiling spike (2026-05-25)**: criterion bench
 # for `workbookSnapshot` cost.  Replicates the napi body in pure Rust
 # (napi methods can't be invoked from Cargo bench harnesses without
