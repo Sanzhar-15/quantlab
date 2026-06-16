@@ -42,7 +42,8 @@
  * Side-effecting entry (no top-level exports) so the esm bundle loads via a classic `<script>`.
  */
 
-import type { DiagnosticJson, FunctionMetadataJson, QuantbookCellSnapshot } from '../../src/quantbook/types';
+import type { CellAddrJson, DiagnosticJson, FunctionMetadataJson, NamedRangeJson, NamedRangeTargetJson, NamedTargetJson, QuantbookCellSnapshot } from '../../src/quantbook/types';
+import { matchNameForSelection } from '../../src/quantbook/shared/nameMatch';
 import { clampDisplayString, formatCellValue } from './cellRender';
 import {
 	buildSignatureLabel,
@@ -1585,6 +1586,11 @@ let editState: EditState | null = null;
 // reads it (the W-G-1b init-order lesson: esbuild hoists `let` to an undefined `var`, so a later declaration
 // would read `undefined` here -- harmlessly falsy, but we keep it correct).
 let nameBoxEditing = false;
+// **FE-11 v2**: the workbook's defined names, refreshed from every `render` payload (see applyDefinedNames).
+// Drives the name box's matched-name display + the inline name dropdown. Declared BEFORE the
+// updateFormulaBar() seed below, which now reads it (the same hoisted-`let` init-order rule the
+// nameBoxEditing comment above describes -- a later declaration would read `undefined` here).
+let definedNames: NamedRangeJson[] = [];
 // Seed the formula bar with the initial selection (A1, empty content) before the first render arrives.
 // **W-G-1b**: this MUST run AFTER `editState` is initialized -- `updateFormulaBar` now reads `editState`,
 // and esbuild down-levels the module-level `let` to a hoisted `var` (undefined until this point), so calling
@@ -2793,7 +2799,23 @@ function updateFormulaBar(): void {
 		return;
 	}
 	if (!nameBoxEditing) {
-		nameBoxEl.value = cellRefA1(active.row, active.col);
+		// FE-11 v2: when the selection EXACTLY equals a named range (or single named cell) on this sheet, show
+		// the NAME (e.g. `returns`) instead of the A1 ref -- Excel's name-box behavior. matchNameForSelection
+		// returns `undefined` when nothing matches (the honest no-match), in which case we show the active
+		// cell's A1 ref -- a typed result, NOT an error mask. The matcher normalizes the anchor+active extent.
+		const matched = fullSnapshot === null
+			? undefined
+			: matchNameForSelection(
+				{
+					sheet: fullSnapshot.sheet,
+					anchorRow: (anchor ?? active).row,
+					anchorCol: (anchor ?? active).col,
+					focusRow: active.row,
+					focusCol: active.col,
+				},
+				definedNames,
+			);
+		nameBoxEl.value = matched ?? cellRefA1(active.row, active.col);
 	}
 	const entry = fullSnapshot === null ? undefined : renderer.entryAt(active.row, active.col);
 	const content = priorCellContent(entry);
@@ -3822,11 +3844,75 @@ nameBoxEl.addEventListener('blur', () => {
 		endNameBoxEdit();
 	}
 });
-// FE-11: the name box dropdown opens the host Go-To-Name QuickPick. Routed through runAfterResolvingEdit (like every
-// chrome control) so any open CELL editor resolves first; an open name-box edit blurs+reverts on the click.
+// FE-11 v2: the name box dropdown opens an INLINE list of the workbook + current-sheet defined names
+// (replacing the old host Go-To-Name QuickPick round-trip; the QuickPick is still reachable via the Data
+// menu's "Go to Name..."). It reuses the shared, audited openMenuDropdown: the capture-phase keydown (gated
+// on openMenu) owns Arrow/Enter/Esc so nothing leaks to grid nav, click-away / window-blur dismiss, and each
+// item runs through runAfterResolvingEdit (an open cell editor resolves first). Selecting a name posts the
+// SAME nameBoxSubmit the typed path uses (host routeNameBoxSubmit -> navigate-name), so there is ONE
+// navigation code path.
+
+/**
+ * FE-11 v2: the inline name-dropdown entries -- the scope-visible defined names (workbook-scoped + names
+ * scoped to the active sheet), in the engine's listing order. constant/formula names are INCLUDED
+ * (Excel-faithful); picking one surfaces the host's loud "no cell to go to" toast via the existing routing.
+ * An empty list yields a single non-actionable "(No defined names)" entry so the affordance is discoverable
+ * (No-Fallbacks: never a silently dead button).
+ */
+function buildNameDropdownEntries(): MenuEntrySpec[] {
+	const sheet = fullSnapshot === null ? undefined : fullSnapshot.sheet;
+	const visible = sheet === undefined
+		? []
+		: definedNames.filter((n) => n.scope === undefined || n.scope === sheet);
+	// Dedupe by spelling: a workbook name and a sheet-scoped name can share a name (e.g. "DUP"). Bare-name
+	// navigation (the posted nameBoxSubmit -> routeNameBoxSubmit) resolves the SHADOWING winner -- the
+	// sheet-scoped one on this sheet -- so list each spelling ONCE (Excel does the same), preferring the
+	// sheet-scoped entry; otherwise two identical labels would both jump to the same shadowed target. The Map
+	// preserves the engine's listing order (workbook first), and re-setting a key keeps that position.
+	const bySpelling = new Map<string, NamedRangeJson>();
+	for (const n of visible) {
+		const key = n.name.toUpperCase();
+		const existing = bySpelling.get(key);
+		if (existing === undefined || (existing.scope === undefined && n.scope === sheet)) {
+			bySpelling.set(key, n);
+		}
+	}
+	const deduped = [...bySpelling.values()];
+	if (deduped.length === 0) {
+		// A non-actionable placeholder (clicking it just dismisses the menu) -- not a masked error.
+		return [{ label: '(No defined names)', run: () => { /* nothing to navigate to */ } }];
+	}
+	return deduped.map((n) => ({ label: n.name, run: () => navigateToNameFromDropdown(n.name) }));
+}
+
+/**
+ * FE-11 v2: navigate to a defined name picked from the inline dropdown by posting the SAME nameBoxSubmit the
+ * typed name-box path uses (the host's routeNameBoxSubmit resolves an existing name -> navigate-name). The
+ * selection is carried only to satisfy the host's payload contract; navigation ignores it. Loud + non-acting
+ * if there is no live selection to post from (defensive -- the grid always has an active cell once loaded).
+ */
+function navigateToNameFromDropdown(name: string): void {
+	if (fullSnapshot === null || active === null) {
+		console.warn('[sheets-webview] name dropdown: no active selection to navigate from.');
+		return;
+	}
+	const anc = anchor ?? active;
+	vscode.postMessage({
+		type: 'nameBoxSubmit',
+		text: name,
+		sheet: fullSnapshot.sheet,
+		selection: { anchorRow: anc.row, anchorCol: anc.col, focusRow: active.row, focusCol: active.col },
+	});
+}
+
 const nameBoxDropdownEl = document.getElementById('sheets-name-box-dropdown') as HTMLButtonElement;
 nameBoxDropdownEl.addEventListener('click', () => {
-	runAfterResolvingEdit('Go to name', () => postToolbarCommand('goToName'));
+	// Toggle on the open anchor (mirror the menu bar's open/close); otherwise open the inline name list.
+	if (openMenu !== null && openMenu.anchor === nameBoxDropdownEl) {
+		closeMenuDropdown();
+		return;
+	}
+	openMenuDropdown(nameBoxDropdownEl, buildNameDropdownEntries(), null);
 });
 // W2 formula intelligence -- explicit trigger + caret-tracking + focus-out cleanup on the FORMULA BAR only.
 // Ctrl/Cmd+Space opens the dropdown with the full list (the empty-prefix affordance) at the caret. This is a
@@ -4960,6 +5046,103 @@ function applySheetTabs(sheetsRaw: unknown, activeRaw: unknown): void {
 	renderSheetTabs(tabBarEl, sheets, activeRaw, sheetTabHandlers);
 }
 
+/** FE-11 v2: a non-negative integer grid index (a sheet id / row / col). */
+function isGridIndex(v: unknown): v is number {
+	return typeof v === 'number' && Number.isInteger(v) && v >= 0;
+}
+
+/** FE-11 v2: a well-formed {@link CellAddrJson} (sheet/row/col are non-negative integers). */
+function isCellAddr(c: unknown): c is CellAddrJson {
+	return c !== null && typeof c === 'object'
+		&& isGridIndex((c as { sheet?: unknown }).sheet)
+		&& isGridIndex((c as { row?: unknown }).row)
+		&& isGridIndex((c as { col?: unknown }).col);
+}
+
+/** FE-11 v2: a well-formed {@link NamedRangeTargetJson} (sheet + four bounds are non-negative integers). */
+function isRangeTarget(r: unknown): r is NamedRangeTargetJson {
+	return r !== null && typeof r === 'object'
+		&& isGridIndex((r as { sheet?: unknown }).sheet)
+		&& isGridIndex((r as { startRow?: unknown }).startRow)
+		&& isGridIndex((r as { startCol?: unknown }).startCol)
+		&& isGridIndex((r as { endRow?: unknown }).endRow)
+		&& isGridIndex((r as { endCol?: unknown }).endCol);
+}
+
+/**
+ * FE-11 v2: deep-validate ONE defined-name entry from the (untrusted) render payload. Returns the typed
+ * {@link NamedRangeJson} or `undefined` if malformed. The discriminated target union is validated TO its
+ * payload: a `cell`/`range` target MUST carry a well-formed coordinate object, so the pure matcher (which
+ * trusts the NamedRangeJson type) can never deref a null/NaN coordinate; `constant`/`formula` need only a
+ * valid kind (the dropdown lists them by name; the matcher ignores them). `scope`, if present, MUST be a
+ * non-negative integer sheet id -- a malformed scope REJECTS the entry rather than coercing it to workbook
+ * scope (which would mis-show a sheet-scoped name on the wrong sheet). No-Fallbacks: bad data is dropped +
+ * counted, never silently reshaped.
+ */
+function parseDefinedName(n: unknown): NamedRangeJson | undefined {
+	if (n === null || typeof n !== 'object') {
+		return undefined;
+	}
+	const name = (n as { name?: unknown }).name;
+	const target = (n as { target?: unknown }).target;
+	if (typeof name !== 'string' || target === null || typeof target !== 'object') {
+		return undefined;
+	}
+	const kind = (target as { kind?: unknown }).kind;
+	let validTarget: NamedTargetJson | undefined;
+	if (kind === 'cell' && isCellAddr((target as { cell?: unknown }).cell)) {
+		validTarget = { kind: 'cell', cell: (target as { cell: CellAddrJson }).cell };
+	} else if (kind === 'range' && isRangeTarget((target as { range?: unknown }).range)) {
+		validTarget = { kind: 'range', range: (target as { range: NamedRangeTargetJson }).range };
+	} else if (kind === 'constant' || kind === 'formula') {
+		// No grid extent (the matcher never matches these); keep the original target for the dropdown listing.
+		validTarget = target as NamedTargetJson;
+	}
+	if (validTarget === undefined) {
+		return undefined; // unknown kind, or a cell/range with a malformed coordinate payload
+	}
+	const scopeRaw = (n as { scope?: unknown }).scope;
+	let scope: number | undefined;
+	if (scopeRaw === undefined) {
+		scope = undefined;
+	} else if (isGridIndex(scopeRaw)) {
+		scope = scopeRaw;
+	} else {
+		return undefined; // a malformed scope -> reject the entry (do NOT coerce to workbook scope)
+	}
+	return { name, target: validTarget, scope };
+}
+
+/**
+ * **FE-11 v2** -- store the workbook's defined names from a `render` payload's `names`, for the name box's
+ * matched-name display + inline dropdown. Validates defensively (No-Fallbacks: a malformed entry is skipped
+ * + the batch count logged, never trusted blindly -- so the pure matcher never derefs a bad payload; a
+ * non-array payload leaves the prior list untouched). A well-formed empty array clears the list. Called on
+ * every `render`.
+ */
+function applyDefinedNames(namesRaw: unknown): void {
+	if (!Array.isArray(namesRaw)) {
+		if (namesRaw !== undefined) {
+			console.warn('[sheets-webview] render payload had a malformed names list (not an array); names not updated.');
+		}
+		return;
+	}
+	const valid: NamedRangeJson[] = [];
+	let skipped = 0;
+	for (const n of namesRaw) {
+		const parsed = parseDefinedName(n);
+		if (parsed === undefined) {
+			skipped++;
+			continue;
+		}
+		valid.push(parsed);
+	}
+	if (skipped > 0) {
+		console.warn(`[sheets-webview] render names list had ${skipped} malformed entr${skipped === 1 ? 'y' : 'ies'}; skipped (name box not updated for them).`);
+	}
+	definedNames = valid;
+}
+
 window.addEventListener('message', (event: MessageEvent) => {
 	const msg = event.data as { type?: unknown } | null;
 	if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') {
@@ -5031,6 +5214,11 @@ window.addEventListener('message', (event: MessageEvent) => {
 		// carries on every render. Done after applyRender so a sheet-switch render updates the grid AND the
 		// active-tab highlight together.
 		applySheetTabs((msg as { sheets?: unknown }).sheets, (msg as { activeSheet?: unknown }).activeSheet);
+		// FE-11 v2: refresh the defined-names list (matched-name display + inline name dropdown). After
+		// applyRender so the box re-evaluates against the just-applied selection/sheet; the explicit
+		// updateFormulaBar() makes a names-only render (e.g. after a define, which touches no cell) update the box.
+		applyDefinedNames((msg as { names?: unknown }).names);
+		updateFormulaBar();
 		return;
 	}
 	if (msg.type === 'commitResult') {

@@ -74,12 +74,18 @@ export function routeNameBoxSubmit(
 		return { kind: 'error', reason: 'Type a defined name, a cell reference like B5 or Sheet2!C3, or select a range and type a new name to define it.' };
 	}
 
-	// 1. An existing defined name (case-insensitive; the engine stores names upper-cased). When several
-	// names share the spelling across scopes, prefer the one scoped to the active sheet, then the
-	// workbook-scoped one, then any remaining match -- the Excel shadowing order. (A stored name can
-	// never look like an A1 ref, so this never steals a reference jump.)
+	// 1. An existing defined name (case-insensitive; the engine stores names upper-cased). Only VISIBLE names
+	// resolve by bare entry: workbook-scoped, or scoped to the ACTIVE sheet -- a name scoped to ANOTHER sheet
+	// is not referenceable here (Excel: you would qualify it `Sheet!name`). This is the SAME visibility rule
+	// the matched-name display + inline dropdown use (shared/nameMatch + the dropdown scope filter); FE-11 v2
+	// tightened it (a prior `matches[0]` fallback could navigate to a foreign sheet-scoped name -- an
+	// inconsistency with those two surfaces). Among visible matches, prefer the active-sheet scope, then the
+	// workbook one -- the Excel shadowing order. (A stored name can never look like an A1 ref, so this never
+	// steals a reference jump.)
 	const key = trimmed.toUpperCase();
-	const matches = existingNames.filter((n) => n.name.toUpperCase() === key);
+	const matches = existingNames.filter(
+		(n) => n.name.toUpperCase() === key && (n.scope === undefined || n.scope === selection.sheet),
+	);
 	if (matches.length > 0) {
 		const picked =
 			matches.find((n) => n.scope === selection.sheet) ??
@@ -133,3 +139,8 @@ export function routeNameBoxSubmit(
 		reason: definedNameRejectionReason(trimmed) ?? `"${trimmed}" is not a defined name, a cell reference, or a valid new name.`,
 	};
 }
+
+// FE-11 v2 NOTE: the REVERSE direction (selection -> matched NAME, for the name box's matched-name display)
+// lives in the pure, webview-importable `src/quantbook/shared/nameMatch.ts` (matchNameForSelection). It is
+// NOT here because the webview cannot import this host-runtime module (the FE-0b build isolation); see that
+// file's header.

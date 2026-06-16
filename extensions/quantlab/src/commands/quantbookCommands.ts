@@ -1594,8 +1594,10 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 
 	// FE-4 W1 "Define Name": bind a workbook name to the focused grid's current selection rect via
 	// SessionInstance.setName. GROUND TRUTH: setName emits NO SessionChange (a defined name is
-	// delta-invisible -- not in the snapshot/delta DTOs), so there is nothing to refresh; the confirmation
-	// TOAST is the only feedback. v1 is DEFINE only (no list/delete/manager -- that is FE-5). Excel name
+	// delta-invisible -- not in the snapshot/delta DTOs). FE-11 v2 (2026-06-16): the webview now consumes the
+	// names list (matched-name box + inline dropdown), so after a successful define we refreshSession to
+	// re-push the fresh names[] (the same contract delete/rename follow); the TOAST is still the textual
+	// feedback. v1 was DEFINE only (no list/delete/manager -- that is FE-5). Excel name
 	// rules + the selection -> CellRangeJson normalization live in nameDefineLogic.ts (unit-tested). Both a
 	// palette entry and a webview/context menu entry (group 6_names) invoke it; from the context menu it
 	// uses the carried right-click selection (the EXACT panel + rect), else the focused grid's selection.
@@ -1651,8 +1653,16 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			try {
 				sel.session.setName(name, range);
 				log.appendLine(buildDefineNameToast(name, target) + '.');
-				// setName is delta-invisible -> the toast is the ONLY feedback (no grid refresh to do).
 				void vscode.window.showInformationMessage(buildDefineNameToast(name, target) + '.');
+				// FE-11 v2 (2026-06-16): setName is delta/epoch/token-invisible at the engine level, but the
+				// webview now consumes the names list (matched-name box + inline name dropdown), so re-push a
+				// fresh snapshot (which carries names[]) to every panel of this session. Without this the box
+				// would not reflect the new name until the next render-triggering edit. Non-fatal on failure.
+				const { failed } = CellGridPanel.refreshSession(sel.session);
+				if (failed > 0) {
+					log.appendLine(`refreshSession after defineName failed (non-fatal): ${failed} panel(s).`);
+					void vscode.window.showWarningMessage('Quantbook: the name was defined, but a panel failed to re-render -- run "Quantbook: Refresh Cell Grid".');
+				}
 			} catch (err) {
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL setName error: ${detail}`);
@@ -2435,6 +2445,14 @@ async function runNameAction(
 			// both names, so the operator can delete the leftover old one manually.
 			log.appendLine(`PARTIAL rename: setName("${newName}") committed but deleteName("${name.name}") failed: ${detail}`);
 			void vscode.window.showWarningMessage(`Quantbook: renamed to "${newName}", but the old name "${name.name}" could not be removed -- BOTH now exist. Delete "${name.name}" manually. (${detail})`);
+			// FE-11 v2: the NEW name WAS created, so the webview's names[] (matched-name box + inline dropdown)
+			// is now stale -- recalc + refresh on this PARTIAL success too (the success path below does the same).
+			// Without this the box would not reflect the new name until a later render.
+			recalcDirtyChecked(session);
+			const partialRefresh = CellGridPanel.refreshSession(session);
+			if (partialRefresh.failed > 0) {
+				void vscode.window.showWarningMessage('Quantbook: a panel also failed to re-render after the partial rename -- run "Quantbook: Refresh Cell Grid".');
+			}
 		} else {
 			log.appendLine(`FATAL rename (setName) error: ${detail}`);
 			void vscode.window.showErrorMessage(`Quantbook rename failed: ${detail}`);

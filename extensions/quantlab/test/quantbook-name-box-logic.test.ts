@@ -11,6 +11,7 @@
 import * as assert from 'assert';
 
 import { NameBoxSelection, routeNameBoxSubmit } from '../src/quantbook/cellGrid/nameBoxLogic';
+import { matchNameForSelection } from '../src/quantbook/shared/nameMatch';
 import { parseNameBoxSubmitMessage } from '../src/quantbook/cellGrid/cellGridLogic';
 import { isValidDefinedName } from '../src/quantbook/cellGrid/nameDefineLogic';
 import type { NamedRangeJson, SheetInfoJson } from '../src/quantbook/types';
@@ -80,6 +81,22 @@ suite('FE-11 nameBoxLogic -- routeNameBoxSubmit (existing name -> navigate-name)
 		assert.strictEqual(a.kind, 'navigate-name');
 		if (a.kind === 'navigate-name') {
 			assert.strictEqual(a.name.scope, undefined); // the workbook DUP
+		}
+	});
+
+	test('a name scoped to ANOTHER sheet is NOT resolved by bare entry (visibility) -- it falls through', () => {
+		// LOCALSUM is scoped to sheet 1. On sheet 0 it is NOT referenceable by bare name (Excel: qualify it
+		// `Sheet1!localsum`). FE-11 v2: a prior matches[0] fallback navigated cross-sheet; now it falls through
+		// to the define path (localsum is a valid new name) -- matching the matched-name/dropdown visibility rule.
+		const a = routeNameBoxSubmit('localsum', sel(0, 2, 2, 2, 2), NAMES, SHEETS);
+		assert.strictEqual(a.kind, 'define');
+	});
+
+	test('a sheet-scoped name IS resolved on its OWN sheet', () => {
+		const a = routeNameBoxSubmit('localsum', sel(1, 0, 0, 0, 0), NAMES, SHEETS);
+		assert.strictEqual(a.kind, 'navigate-name');
+		if (a.kind === 'navigate-name') {
+			assert.strictEqual(a.name.scope, 1);
 		}
 	});
 });
@@ -269,5 +286,74 @@ suite('FE-11 parseNameBoxSubmitMessage (untrusted payload)', () => {
 		assert.strictEqual(parseNameBoxSubmitMessage({ ...good, selection: { anchorRow: 0, anchorCol: 0, focusRow: 1 } }), undefined);
 		assert.strictEqual(parseNameBoxSubmitMessage({ ...good, selection: { anchorRow: 0, anchorCol: 0, focusRow: 1, focusCol: 2.5 } }), undefined);
 		assert.strictEqual(parseNameBoxSubmitMessage({ ...good, selection: { anchorRow: -1, anchorCol: 0, focusRow: 1, focusCol: 2 } }), undefined);
+	});
+});
+
+suite('FE-11 v2 nameBoxLogic -- matchNameForSelection (selection -> name; Excel exact match)', () => {
+	test('a single-cell selection at a `cell`-target name returns the name', () => {
+		// PRICE is a `cell` target at sheet 0, row 4, col 2 (C5).
+		assert.strictEqual(matchNameForSelection(sel(0, 4, 2, 4, 2), NAMES), 'PRICE');
+	});
+
+	test('a selection EXACTLY equal to a `range`-target name returns the name', () => {
+		// RETURNS is sheet 0, rows 1..12, col 1 (B2:B13).
+		assert.strictEqual(matchNameForSelection(sel(0, 1, 1, 12, 1), NAMES), 'RETURNS');
+	});
+
+	test('corner order does not matter (extent is normalized before matching)', () => {
+		assert.strictEqual(matchNameForSelection(sel(0, 12, 1, 1, 1), NAMES), 'RETURNS');
+	});
+
+	test('a single cell INSIDE a named range (not equal to it) does NOT match -- shows the ref, like Excel', () => {
+		// B3 (row 2, col 1) sits inside RETURNS but is not the whole range.
+		assert.strictEqual(matchNameForSelection(sel(0, 2, 1, 2, 1), NAMES), undefined);
+	});
+
+	test('a sub-rectangle of a named range does NOT match', () => {
+		assert.strictEqual(matchNameForSelection(sel(0, 1, 1, 5, 1), NAMES), undefined);
+	});
+
+	test('a `cell`-target name does NOT match a multi-cell selection', () => {
+		assert.strictEqual(matchNameForSelection(sel(0, 4, 2, 5, 2), NAMES), undefined);
+	});
+
+	test('a constant name never matches (no grid extent)', () => {
+		const onlyConst: NamedRangeJson[] = [{ name: 'PI', target: { kind: 'constant', value: { kind: 'number', number: 3.14 } } }];
+		assert.strictEqual(matchNameForSelection(sel(0, 0, 0, 0, 0), onlyConst), undefined);
+	});
+
+	test('the target SHEET must match -- the same extent on another sheet is not the name', () => {
+		// RETURNS extent but selection sheet 1 (RETURNS is workbook-scoped, yet its target lives on sheet 0).
+		assert.strictEqual(matchNameForSelection(sel(1, 1, 1, 12, 1), NAMES), undefined);
+		// PRICE cell extent on sheet 1 -- the cell target is on sheet 0.
+		assert.strictEqual(matchNameForSelection(sel(1, 4, 2, 4, 2), NAMES), undefined);
+	});
+
+	test('scope filter: a sheet-scoped name matches only on its own sheet', () => {
+		// LOCALSUM is scope 1, single cell (0,0) on sheet 1 -- matches on sheet 1...
+		assert.strictEqual(matchNameForSelection(sel(1, 0, 0, 0, 0), NAMES), 'LOCALSUM');
+		// ...and on sheet 0 the workbook DUP single-cell (0,0) matches instead (LOCALSUM is invisible here).
+		assert.strictEqual(matchNameForSelection(sel(0, 0, 0, 0, 0), NAMES), 'DUP');
+	});
+
+	test('multiple names over the IDENTICAL extent: alphabetical by name (same scope)', () => {
+		const same: NamedRangeJson[] = [
+			{ name: 'BBB', target: { kind: 'range', range: { sheet: 0, startRow: 2, startCol: 2, endRow: 3, endCol: 3 } } },
+			{ name: 'AAA', target: { kind: 'range', range: { sheet: 0, startRow: 2, startCol: 2, endRow: 3, endCol: 3 } } },
+		];
+		assert.strictEqual(matchNameForSelection(sel(0, 2, 2, 3, 3), same), 'AAA');
+	});
+
+	test('multiple names over the IDENTICAL extent: sheet-scoped shadows workbook (beats alphabetical)', () => {
+		const same: NamedRangeJson[] = [
+			{ name: 'AAA_WB', target: { kind: 'range', range: { sheet: 0, startRow: 2, startCol: 2, endRow: 3, endCol: 3 } } }, // workbook, alphabetically first
+			{ name: 'ZZZ_LOCAL', target: { kind: 'range', range: { sheet: 0, startRow: 2, startCol: 2, endRow: 3, endCol: 3 } }, scope: 0 }, // sheet-scoped
+		];
+		// the sheet-scoped name wins even though ZZZ_LOCAL sorts AFTER AAA_WB.
+		assert.strictEqual(matchNameForSelection(sel(0, 2, 2, 3, 3), same), 'ZZZ_LOCAL');
+	});
+
+	test('empty names list returns undefined (No-Fallbacks: the honest no-match)', () => {
+		assert.strictEqual(matchNameForSelection(sel(0, 0, 0, 0, 0), []), undefined);
 	});
 });

@@ -140,6 +140,9 @@ body {
 	border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border));
 	border-radius: 4px;
 	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.36);
+	/* FE-11 v2: cap height + scroll for a long defined-name list (the short menu-bar menus never reach it). */
+	max-height: 320px;
+	overflow-y: auto;
 }
 
 /* An item row. `.is-active` is the keyboard/hover highlight painted in JS (hover routes through the

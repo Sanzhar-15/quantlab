@@ -980,6 +980,13 @@ export class CellGridPanel {
 			publishedCells,
 			sheets: this.latestSheets ?? [],
 			activeSheet: this.sheet,
+			// FE-11 v2 (2026-06-16): the workbook's defined names, read FRESH on every post -- name ops are
+			// delta/epoch/token-invisible, so only an explicit listNames() sees them (there is no delta to ride).
+			// The webview uses this to (a) show the matched NAME in the name box when the selection exactly
+			// equals a named range, and (b) populate the inline name dropdown. Covers render(), the webviewReady
+			// re-send, AND every undo/redo (onCommit -> refreshSession) for free. No-Fallbacks: a listNames()
+			// throw surfaces loud, never a swallow-to-empty.
+			names: this.session.listNames(),
 			// A4 (2026-06-13): whether this render follows a structural coordinate shift (insert/delete) -- the
 			// webview ORs it into its full-redraw gate so a moved styled cell repaints. See `latestStructuralChanged`.
 			structuralChanged: this.latestStructuralChanged,
@@ -1477,9 +1484,10 @@ export class CellGridPanel {
 
 	/**
 	 * **FE-11** -- define a workbook name over `range` (the engine last-writer-wins upserts). Mirrors the
-	 * `quantlab.quantbookDefineName` command's apply + toast. `setName` is delta/epoch/token-invisible, so
-	 * there is NO grid refresh to do -- the confirmation toast is the only feedback (same contract as the
-	 * command). Every throw surfaces loud (No-Fallbacks).
+	 * `quantlab.quantbookDefineName` command's apply + toast. `setName` is delta/epoch/token-invisible at the
+	 * ENGINE level, but **FE-11 v2 (2026-06-16)** the webview now consumes the names list (matched-name box +
+	 * inline name dropdown), so after a successful define we `refreshSession` to re-push the fresh `names[]` --
+	 * the same contract the delete/rename paths already follow. Every throw surfaces loud (No-Fallbacks).
 	 */
 	private defineNameFromBox(name: string, range: CellRangeJson): void {
 		try {
@@ -1497,6 +1505,15 @@ export class CellGridPanel {
 		const sheetName = found?.name ?? `#${range.sheet}`;
 		const target = formatRangeTarget(sheetName, range.startRow, range.startCol, range.endRow, range.endCol);
 		void vscode.window.showInformationMessage(`${buildDefineNameToast(name, target)}.`);
+		// FE-11 v2: re-push the fresh names[] so the name box (matched-name + inline dropdown) reflects the new
+		// name immediately. Without this the webview names list stays stale until the next render-triggering
+		// edit (setName is delta/token-invisible). The define already succeeded; a panel that fails to refresh
+		// is surfaced (loud, non-fatal), not swallowed.
+		const { failed } = CellGridPanel.refreshSession(this.session);
+		if (failed > 0) {
+			console.warn(`[cellGrid] name box define "${name}": ${failed} panel(s) failed to refresh after setName.`);
+			void vscode.window.showWarningMessage('Quantbook: the name was defined, but a panel failed to re-render -- run "Quantbook: Refresh Cell Grid".');
+		}
 	}
 
 	/**
