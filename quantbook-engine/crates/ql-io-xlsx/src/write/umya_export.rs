@@ -19,7 +19,10 @@
 use crate::error::XlsxError;
 use crate::options::FormulaCachePolicy;
 use crate::report::XlsxExportReport;
-use ql_storage::{FormatId, NamedTarget, Workbook, FIRST_CUSTOM_FORMAT_ID};
+use ql_storage::{
+    BorderEdge, BorderStyle, Borders, FormatId, HAlign, NamedTarget, Rgb, Style, StyleId, Workbook,
+    FIRST_CUSTOM_FORMAT_ID,
+};
 use ql_types::{Value, LEGACY_PEER};
 
 /// Per-cell fix instruction. **W5-D-14.1 umya-bug workaround:** umya
@@ -295,6 +298,416 @@ impl XlsxNumFmtTranslation {
     }
 }
 
+// ===== Wave B2 (2026-06-18): cell visual-style export =====
+//
+// Pre-Wave-B2 the exporter wrote number-formats only; every `<xf>` hardcoded
+// `fontId/fillId/borderId="0"` and the per-sheet style overlay was never
+// walked, so exported `.xlsx` lost bold/italic/underline/strike/fill/
+// text-color/borders/alignment. The machinery below adds them:
+//
+// - the cellXfs roster is keyed by the COMPOSITE `(Option<FormatId>,
+//   Option<StyleId>)` appearance (a cell can carry both a number-format and a
+//   visual style), and
+// - deduped `<fonts>`/`<fills>`/`<borders>` sub-rosters are APPENDED to umya's
+//   defaults (count-preserving + untouched when empty), so a workbook with NO
+//   styles produces BYTE-IDENTICAL output to the pre-Wave-B2 path.
+
+/// One `<cellXfs>/<xf>` entry — a distinct (number-format × visual-style)
+/// appearance referenced by a cell's `<c s="N">`. The `*_idx` fields index
+/// into the [`StyleExport`] sub-rosters; they resolve to absolute xlsx
+/// fontId/fillId/borderId at injection time (umya default base count + index).
+#[derive(Debug, Clone, Copy)]
+struct XfEntry {
+    /// xlsx-translated numFmtId (`0` = General).
+    num_fmt_id: u32,
+    /// Emit `applyNumberFormat="1"` — true iff the cell carried a `FormatId`
+    /// (mirrors the pre-Wave-B2 behaviour: every format roster entry set it,
+    /// which is what keeps the no-style output byte-identical).
+    apply_number_format: bool,
+    /// Index into [`StyleExport::fonts`]; `None` ⇒ default font `0`.
+    font_idx: Option<usize>,
+    /// Index into [`StyleExport::fills`]; `None` ⇒ default fill `0` (no fill).
+    fill_idx: Option<usize>,
+    /// Index into [`StyleExport::borders`]; `None` ⇒ default border `0` (none).
+    border_idx: Option<usize>,
+    /// Horizontal alignment; [`HAlign::General`] emits no `<alignment>` child.
+    halign: HAlign,
+}
+
+/// A custom `<font>` to append to the `<fonts>` roster. The non-toggle
+/// attributes (sz 11 / Calibri / family 2 / scheme minor) mirror umya's
+/// default font so a styled cell keeps the workbook's default look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FontDef {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strike: bool,
+    /// `None` ⇒ default text color (`<color theme="1"/>`).
+    color: Option<Rgb>,
+}
+
+/// A custom solid `<fill>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FillDef {
+    color: Rgb,
+}
+
+/// A custom `<border>` (the four edges; diagonal is unsupported in the v1 schema).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BorderDef {
+    borders: Borders,
+}
+
+/// The visual-style export payload: the cellXfs roster + the deduped
+/// font/fill/border sub-rosters it indexes into. Built once over the whole
+/// workbook so xf slots + sub-roster ids are a deterministic function of the
+/// SET of `(format, style)` appearances, independent of cell-visit order.
+#[derive(Debug, Default)]
+struct StyleExport {
+    xf_roster: Vec<XfEntry>,
+    fonts: Vec<FontDef>,
+    fills: Vec<FillDef>,
+    borders: Vec<BorderDef>,
+}
+
+impl StyleExport {
+    /// Build over the sorted appearance roster. For each appearance resolves
+    /// the number-format (via the xlsx translation) + the visual style (via
+    /// `workbook.styles()`), deduping fonts/fills/borders BY VALUE in
+    /// appearance-sorted order (so the sub-roster order is deterministic).
+    fn build(
+        workbook: &Workbook,
+        appearance_roster: &[(Option<FormatId>, Option<StyleId>)],
+        xlsx_numfmt: &XlsxNumFmtTranslation,
+    ) -> Self {
+        let mut out = StyleExport::default();
+        let mut font_index: std::collections::HashMap<FontDef, usize> =
+            std::collections::HashMap::new();
+        let mut fill_index: std::collections::HashMap<FillDef, usize> =
+            std::collections::HashMap::new();
+        let mut border_index: std::collections::HashMap<BorderDef, usize> =
+            std::collections::HashMap::new();
+
+        for (fmt, style_id) in appearance_roster {
+            let (num_fmt_id, apply_number_format) = match fmt {
+                Some(fid) => (xlsx_numfmt.translate(*fid), true),
+                None => (0, false),
+            };
+            // Resolve the visual style; an absent/unknown style id ⇒ the
+            // default (no-styling) look — equivalent to no style.
+            let style: Style = style_id
+                .and_then(|sid| workbook.styles().lookup(sid))
+                .unwrap_or_default();
+
+            let font_idx =
+                font_def(&style).map(|fd| dedup_roster(&mut out.fonts, &mut font_index, fd));
+            let fill_idx = style
+                .fill
+                .map(|c| dedup_roster(&mut out.fills, &mut fill_index, FillDef { color: c }));
+            let border_idx = if style.borders.is_none() {
+                None
+            } else {
+                Some(dedup_roster(
+                    &mut out.borders,
+                    &mut border_index,
+                    BorderDef {
+                        borders: style.borders,
+                    },
+                ))
+            };
+
+            out.xf_roster.push(XfEntry {
+                num_fmt_id,
+                apply_number_format,
+                font_idx,
+                fill_idx,
+                border_idx,
+                halign: style.align,
+            });
+        }
+        out
+    }
+}
+
+/// Dedup `value` into `roster`, returning its index. First-seen-in-call-order,
+/// so the roster order is deterministic when the caller iterates deterministically.
+fn dedup_roster<T: Copy + Eq + std::hash::Hash>(
+    roster: &mut Vec<T>,
+    index: &mut std::collections::HashMap<T, usize>,
+    value: T,
+) -> usize {
+    if let Some(&i) = index.get(&value) {
+        return i;
+    }
+    let i = roster.len();
+    roster.push(value);
+    index.insert(value, i);
+    i
+}
+
+/// The font half of a `Style`, or `None` when the style has no font attrs (so
+/// the cell keeps the default font `0` and no `<font>` is emitted for it).
+fn font_def(style: &Style) -> Option<FontDef> {
+    if !style.bold
+        && !style.italic
+        && !style.underline
+        && !style.strike
+        && style.text_color.is_none()
+    {
+        return None;
+    }
+    Some(FontDef {
+        bold: style.bold,
+        italic: style.italic,
+        underline: style.underline,
+        strike: style.strike,
+        color: style.text_color,
+    })
+}
+
+/// `Rgb` → OOXML ARGB hex with an opaque alpha prefix, e.g. `FF0000FF`.
+fn argb(c: Rgb) -> String {
+    format!("FF{:02X}{:02X}{:02X}", c.r, c.g, c.b)
+}
+
+/// OOXML border-style name for a [`BorderStyle`]. `None` ⇒ the edge is emitted
+/// as an empty `<left/>` (no `style` attr).
+fn border_style_name(s: BorderStyle) -> Option<&'static str> {
+    match s {
+        BorderStyle::None => None,
+        BorderStyle::Thin => Some("thin"),
+        BorderStyle::Medium => Some("medium"),
+        BorderStyle::Thick => Some("thick"),
+        BorderStyle::Dashed => Some("dashed"),
+        BorderStyle::Dotted => Some("dotted"),
+        BorderStyle::Double => Some("double"),
+    }
+}
+
+/// OOXML `horizontal` alignment value, or `None` for [`HAlign::General`]
+/// (which emits no `<alignment>` child — the Excel default).
+fn halign_attr(h: HAlign) -> Option<&'static str> {
+    match h {
+        HAlign::General => None,
+        HAlign::Left => Some("left"),
+        HAlign::Center => Some("center"),
+        HAlign::Right => Some("right"),
+    }
+}
+
+/// Render one custom `<font>` (toggle children first, then the umya-default
+/// sz/color/name/family/scheme — child order matches umya's own writer).
+fn render_font(f: &FontDef) -> String {
+    let mut s = String::with_capacity(96);
+    s.push_str("<font>");
+    if f.bold {
+        s.push_str("<b/>");
+    }
+    if f.italic {
+        s.push_str("<i/>");
+    }
+    if f.underline {
+        s.push_str("<u/>");
+    }
+    if f.strike {
+        s.push_str("<strike/>");
+    }
+    s.push_str("<sz val=\"11\"/>");
+    match f.color {
+        Some(c) => s.push_str(&format!("<color rgb=\"{}\"/>", argb(c))),
+        None => s.push_str("<color theme=\"1\"/>"),
+    }
+    s.push_str("<name val=\"Calibri\"/><family val=\"2\"/><scheme val=\"minor\"/></font>");
+    s
+}
+
+/// Render one custom solid `<fill>` (Excel uses `fgColor` for the solid color
+/// + the conventional `bgColor indexed="64"`).
+fn render_fill(f: &FillDef) -> String {
+    format!(
+        "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"{}\"/>\
+         <bgColor indexed=\"64\"/></patternFill></fill>",
+        argb(f.color)
+    )
+}
+
+/// Render one border edge: empty `<left/>` for no border, else
+/// `<left style="thin"><color rgb="FF…"/></left>`.
+fn render_border_edge(tag: &str, edge: BorderEdge) -> String {
+    match border_style_name(edge.style) {
+        None => format!("<{tag}/>"),
+        Some(name) => format!(
+            "<{tag} style=\"{name}\"><color rgb=\"{}\"/></{tag}>",
+            argb(edge.color)
+        ),
+    }
+}
+
+/// Render one custom `<border>` (edge order left/right/top/bottom/diagonal,
+/// matching umya's default border element).
+fn render_border(b: &BorderDef) -> String {
+    format!(
+        "<border>{}{}{}{}<diagonal/></border>",
+        render_border_edge("left", b.borders.left),
+        render_border_edge("right", b.borders.right),
+        render_border_edge("top", b.borders.top),
+        render_border_edge("bottom", b.borders.bottom),
+    )
+}
+
+/// Build the `<cellXfs>` block. Slot 0 is the default xf (unchanged from the
+/// pre-styling output); slots 1.. follow `roster` order. Each xf resolves its
+/// absolute fontId/fillId/borderId from the umya default base counts + the
+/// sub-roster index, and emits `applyX="1"` only for the components it overrides
+/// (so a format-only entry is byte-identical to the pre-Wave-B2 output).
+fn render_cell_xfs(
+    roster: &[XfEntry],
+    base_font: usize,
+    base_fill: usize,
+    base_border: usize,
+) -> String {
+    let count = roster.len() + 1;
+    let mut block = String::with_capacity(96 * count);
+    block.push_str(&format!(r#"<cellXfs count="{}">"#, count));
+    // Slot 0: the default xf.
+    block.push_str(r#"<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>"#);
+    for e in roster {
+        let font_id = e.font_idx.map_or(0, |i| base_font + i);
+        let fill_id = e.fill_idx.map_or(0, |i| base_fill + i);
+        let border_id = e.border_idx.map_or(0, |i| base_border + i);
+        block.push_str(&format!(
+            r#"<xf numFmtId="{}" fontId="{}" fillId="{}" borderId="{}" xfId="0""#,
+            e.num_fmt_id, font_id, fill_id, border_id
+        ));
+        if e.apply_number_format {
+            block.push_str(r#" applyNumberFormat="1""#);
+        }
+        if font_id != 0 {
+            block.push_str(r#" applyFont="1""#);
+        }
+        if fill_id != 0 {
+            block.push_str(r#" applyFill="1""#);
+        }
+        if border_id != 0 {
+            block.push_str(r#" applyBorder="1""#);
+        }
+        match halign_attr(e.halign) {
+            Some(h) => {
+                block.push_str(&format!(
+                    r#" applyAlignment="1"><alignment horizontal="{h}"/></xf>"#
+                ));
+            }
+            None => block.push_str("/>"),
+        }
+    }
+    block.push_str("</cellXfs>");
+    block
+}
+
+/// Append `entries` (already-rendered child XML) into the
+/// `<{tag} count="N">…</{tag}>` collection, rewriting `count` to
+/// `N + entries.len()`. Returns the ORIGINAL base count `N` (used as the
+/// absolute-id offset for the appended entries). A no-op returning `N`
+/// unchanged when `entries` is empty — this is what keeps the no-style output
+/// byte-identical. Fails loud (No-Fallbacks) if the collection or its `count`
+/// attribute is missing/malformed rather than guessing the base.
+fn append_into_collection(
+    text: &mut String,
+    tag: &str,
+    entries: &[String],
+) -> Result<usize, XlsxError> {
+    let anchor = format!("<{tag} count=\"");
+    let start = text
+        .find(&anchor)
+        .ok_or_else(|| XlsxError::Export(format!("styles.xml missing <{tag} count=...>")))?;
+    let num_start = start + anchor.len();
+    let num_len = text[num_start..]
+        .find('"')
+        .ok_or_else(|| XlsxError::Export(format!("styles.xml <{tag}> count attr unterminated")))?;
+    let num_end = num_start + num_len;
+    let base: usize = text[num_start..num_end]
+        .parse()
+        .map_err(|e| XlsxError::Export(format!("styles.xml <{tag}> count not a number: {e}")))?;
+    if entries.is_empty() {
+        return Ok(base);
+    }
+    let new_count = base + entries.len();
+    text.replace_range(num_start..num_end, &new_count.to_string());
+    // Splice the entries before the collection's closing tag. (Recompute the
+    // close index AFTER the count rewrite — the string length changed.)
+    let close = format!("</{tag}>");
+    let close_idx = text
+        .find(&close)
+        .ok_or_else(|| XlsxError::Export(format!("styles.xml missing </{tag}>")))?;
+    text.insert_str(close_idx, &entries.concat());
+    Ok(base)
+}
+
+/// Replace the `<cellXfs>…</cellXfs>` block with `block` (closing-tag form
+/// first, then self-closing, then insert-before-`</styleSheet>` as a defensive
+/// fallback — same bracketing the pre-Wave-B2 cellXfs injector used).
+fn replace_cell_xfs_block(text: String, block: &str) -> Result<Vec<u8>, XlsxError> {
+    if let Some(start) = text.find("<cellXfs") {
+        let after = start + "<cellXfs".len();
+        if let Some(close_rel) = text[after..].find("</cellXfs>") {
+            let end = after + close_rel + "</cellXfs>".len();
+            let mut out = String::with_capacity(text.len() + block.len());
+            out.push_str(&text[..start]);
+            out.push_str(block);
+            out.push_str(&text[end..]);
+            return Ok(out.into_bytes());
+        }
+        if let Some(gt_rel) = text[after..].find('>') {
+            let end = after + gt_rel + 1;
+            if text[after..end].ends_with("/>") {
+                let mut out = String::with_capacity(text.len() + block.len());
+                out.push_str(&text[..start]);
+                out.push_str(block);
+                out.push_str(&text[end..]);
+                return Ok(out.into_bytes());
+            }
+        }
+    }
+    if let Some(idx) = text.rfind("</styleSheet>") {
+        let mut out = String::with_capacity(text.len() + block.len());
+        out.push_str(&text[..idx]);
+        out.push_str(block);
+        out.push_str(&text[idx..]);
+        return Ok(out.into_bytes());
+    }
+    Err(XlsxError::Export(
+        "styles.xml missing </styleSheet> close — cannot inject <cellXfs>".to_string(),
+    ))
+}
+
+/// **Wave B2 (2026-06-18):** inject cell visual styles into `xl/styles.xml`.
+/// Appends the deduped custom fonts/fills/borders to umya's default rosters
+/// (count-preserving + untouched when a sub-roster is empty ⇒ byte-identical
+/// to the pre-styling output) and replaces `<cellXfs>` with one xf per
+/// (number-format × style) appearance, each pointing at the resolved
+/// fontId/fillId/borderId + alignment.
+fn inject_styles_into_styles_xml(
+    content: Vec<u8>,
+    style: &StyleExport,
+) -> Result<Vec<u8>, XlsxError> {
+    let mut text = String::from_utf8(content)
+        .map_err(|e| XlsxError::Export(format!("styles.xml is not valid UTF-8: {e}")))?;
+
+    // Append sub-rosters; capture umya's default base counts so each xf's
+    // absolute fontId/fillId/borderId = base + roster index.
+    let font_xml: Vec<String> = style.fonts.iter().map(render_font).collect();
+    let fill_xml: Vec<String> = style.fills.iter().map(render_fill).collect();
+    let border_xml: Vec<String> = style.borders.iter().map(render_border).collect();
+    let base_font = append_into_collection(&mut text, "fonts", &font_xml)?;
+    let base_fill = append_into_collection(&mut text, "fills", &fill_xml)?;
+    let base_border = append_into_collection(&mut text, "borders", &border_xml)?;
+
+    // Build + replace the cellXfs block with the resolved absolute ids.
+    let block = render_cell_xfs(&style.xf_roster, base_font, base_fill, base_border);
+    replace_cell_xfs_block(text, &block)
+}
+
 /// Export a Quantbook `Workbook` to an xlsx **file** via umya-spreadsheet
 /// in `NewWorkbook` mode (generate fresh).
 ///
@@ -349,32 +762,54 @@ pub(crate) fn export_new_workbook_to_bytes(
     // numbering for fresh-generated workbooks).
     let mut sheet_fixes: Vec<Vec<CellFix>> = Vec::with_capacity(workbook.sheet_count());
 
-    // **W5-D-15:** build a `FormatId → xf_index` dedup map. Index 0
-    // is reserved for the default xf (numFmtId=0, no applyNumberFormat).
-    // First custom xf gets index 1, next gets 2, etc.
+    // **Wave B2 (2026-06-18):** build the cellXfs roster keyed by the COMPOSITE
+    // (number-format × visual-style) appearance, across ALL sheets in one sweep
+    // so xf slots are a deterministic function of the SET of appearances. Slot 0
+    // is the default xf; appearance i gets slot i+1.
     //
-    // **W5-D-15.2 (separate-Opus M-4 closure):** pre-compute the
-    // roster across ALL sheets in a single sweep so the order is a
-    // function of the set of FormatIds, not of which sheet first
-    // touched them. Sort by `FormatId` for byte determinism — the
-    // per-sheet intra-sort from W5-D-15.1 fixes intra-sheet but
-    // doesn't bound cross-sheet contribution order. BTreeSet handles
-    // both at once.
-    let mut sorted_format_ids: std::collections::BTreeSet<FormatId> =
+    // An appearance is `(Option<FormatId>, Option<StyleId>)` — a cell may carry a
+    // number-format, a visual style, or both. Collected from the UNION of each
+    // sheet's format + style overlays. A `BTreeSet` gives a stable order; and
+    // crucially, when there are NO styles every appearance is `(Some(fid), None)`,
+    // so the set degenerates to the pre-Wave-B2 sorted-FormatId order with the
+    // same slot indices — keeping the no-style output byte-identical.
+    //
+    // **W5-D-15.2 (separate-Opus M-4 closure) carried forward:** the cross-sheet
+    // single sweep keeps the order a function of the appearance SET, not of which
+    // sheet first touched an entry.
+    let mut appearances: std::collections::BTreeSet<(Option<FormatId>, Option<StyleId>)> =
         std::collections::BTreeSet::new();
     for sheet_id in 0..workbook.sheet_count() as u16 {
         if let Some(sheet) = workbook.sheet(sheet_id) {
-            for (_addr, fid) in sheet.format_overlay().iter() {
-                sorted_format_ids.insert(fid);
+            for ((row, col), fid) in sheet.format_overlay().iter() {
+                appearances.insert((Some(fid), sheet.style_overlay().get(row, col)));
+            }
+            for ((row, col), sid) in sheet.style_overlay().iter() {
+                appearances.insert((sheet.format_overlay().get(row, col), Some(sid)));
             }
         }
     }
-    let cellxfs_roster: Vec<FormatId> = sorted_format_ids.iter().copied().collect();
-    let format_to_xf_index: std::collections::HashMap<FormatId, u32> = cellxfs_roster
+    let appearance_roster: Vec<(Option<FormatId>, Option<StyleId>)> =
+        appearances.iter().copied().collect();
+    let appearance_to_xf_index: std::collections::HashMap<
+        (Option<FormatId>, Option<StyleId>),
+        u32,
+    > = appearance_roster
         .iter()
         .enumerate()
-        .map(|(i, fid)| (*fid, (i as u32) + 1)) // slot 0 reserved for default
+        .map(|(i, a)| (*a, (i as u32) + 1)) // slot 0 reserved for default
         .collect();
+    // The FormatId set the numFmt translation flattens — exactly the set of
+    // FormatIds appearing in any overlay (identical to the pre-Wave-B2 roster).
+    let cellxfs_roster: Vec<FormatId> = {
+        let mut s: std::collections::BTreeSet<FormatId> = std::collections::BTreeSet::new();
+        for (fmt, _) in &appearance_roster {
+            if let Some(fid) = fmt {
+                s.insert(*fid);
+            }
+        }
+        s.into_iter().collect()
+    };
 
     // **Phase 5.2 D-1 step 6 (2026-05-20):** build the xlsx numFmtId
     // translation. Maps every Custom FormatId (across both wb.formats()
@@ -595,22 +1030,29 @@ pub(crate) fn export_new_workbook_to_bytes(
         let sheet_view = workbook
             .sheet(sheet_id)
             .ok_or_else(|| XlsxError::Export(format!("sheet {sheet_id} missing during export")))?;
-        let mut overlay_entries: Vec<((u32, u32), FormatId)> =
-            sheet_view.format_overlay().iter().collect();
-        // Phase 5.2 D-1 step 6 (2026-05-20): sort by the xlsx-flattened
-        // numFmtId (via the translation built above) + (row, col). The
-        // pre-step-6 expect() on `to_legacy_u32()` panicked on
-        // non-LEGACY peer Custom ids; the translation handles them
-        // by flattening into a single namespace. For LEGACY_PEER-only
-        // workbooks (single-writer pre-D-1 default) the sort key
-        // values are identical, so byte-stable output is preserved
-        // for existing xlsx fixtures.
-        overlay_entries.sort_by_key(|a| (xlsx_numfmt.translate(a.1), a.0 .0, a.0 .1));
-
-        for ((row, col), fid) in overlay_entries {
-            let xf_index = match format_to_xf_index.get(&fid) {
+        // **Wave B2:** schedule one `s="N"` fix per cell carrying a number-format
+        // AND/OR a visual style — the UNION of the format + style overlays. Each
+        // cell maps to its composite appearance's xf slot. A `BTreeSet<(row,col)>`
+        // keeps the emission deterministic; the fix order is output-irrelevant
+        // (each targets a distinct cell ref via an independent string splice) but
+        // every SetStyle MUST follow the value-fixes pushed during the cell-walk
+        // (whose `<c r="..." t="...">` needles must not see an inserted `s=`).
+        let mut styled_coords: std::collections::BTreeSet<(u32, u32)> =
+            std::collections::BTreeSet::new();
+        for ((row, col), _) in sheet_view.format_overlay().iter() {
+            styled_coords.insert((row, col));
+        }
+        for ((row, col), _) in sheet_view.style_overlay().iter() {
+            styled_coords.insert((row, col));
+        }
+        for (row, col) in styled_coords {
+            let appearance = (
+                sheet_view.format_overlay().get(row, col),
+                sheet_view.style_overlay().get(row, col),
+            );
+            let xf_index = match appearance_to_xf_index.get(&appearance) {
                 Some(idx) => *idx,
-                None => continue, // unreachable — roster pre-populated for all FormatIds
+                None => continue, // unreachable — roster covers every styled cell
             };
             fixes.push(CellFix {
                 cell_ref: cell_ref_a1(row, col),
@@ -705,23 +1147,20 @@ pub(crate) fn export_new_workbook_to_bytes(
     // sheet rels + worksheet `<tableParts>` + `[Content_Types].xml`.
     let tables = collect_table_exports(workbook);
 
-    // Phase 5.2 D-1 step 6: pre-translate the cellxfs roster into
-    // (FormatId, xlsx_numFmtId) pairs so post-process doesn't need
-    // the translation helper. For each FormatId in the roster, look
-    // up its flattened numFmtId. Pre-step-6 the inject site computed
-    // `fid.to_legacy_u32().expect()` inline; now that translation is
-    // explicit + multi-peer aware.
-    let cellxfs_roster_translated: Vec<(FormatId, u32)> = cellxfs_roster
-        .iter()
-        .map(|&fid| (fid, xlsx_numfmt.translate(fid)))
-        .collect();
+    // **Wave B2 (2026-06-18):** the visual-style export payload — the cellXfs
+    // roster (each xf's xlsx-translated numFmtId + font/fill/border roster index
+    // + alignment) plus the deduped font/fill/border sub-rosters it references.
+    // Built over the SAME appearance roster the per-cell `s="N"` fixes use, so
+    // the xf slots line up. The numFmt translation is applied here (multi-peer
+    // aware) so post-process doesn't need the translation helper.
+    let style_export = StyleExport::build(workbook, &appearance_roster, &xlsx_numfmt);
 
     let needs_post_process = needs_date1904
         || needs_cell_fixes
         || !custom_formats.is_empty()
         || !defined_names.is_empty()
         || !tables.is_empty()
-        || !cellxfs_roster_translated.is_empty();
+        || !style_export.xf_roster.is_empty();
     let final_bytes = if needs_post_process {
         post_process_bytes(
             initial_bytes,
@@ -730,7 +1169,7 @@ pub(crate) fn export_new_workbook_to_bytes(
             &custom_formats,
             &defined_names,
             &tables,
-            &cellxfs_roster_translated,
+            &style_export,
         )?
     } else {
         initial_bytes
@@ -766,11 +1205,10 @@ fn post_process_bytes(
     custom_formats: &[(u32, String)],
     defined_names: &[DefinedNameOut],
     tables: &[TableExport],
-    // Phase 5.2 D-1 step 6: each entry is (FormatId, xlsx numFmtId).
-    // The numFmtId comes from XlsxNumFmtTranslation; the FormatId is
-    // kept alongside for the format_to_xf_index lookup that maps cells
-    // to their roster slot.
-    cellxfs_roster: &[(FormatId, u32)],
+    // **Wave B2:** the visual-style export payload (cellXfs roster + font/fill/
+    // border sub-rosters) injected into xl/styles.xml. The per-xf numFmtId is
+    // already xlsx-translated by `XlsxNumFmtTranslation` at the caller.
+    style_export: &StyleExport,
 ) -> Result<Vec<u8>, XlsxError> {
     use std::io::{Read, Write};
 
@@ -807,8 +1245,8 @@ fn post_process_bytes(
                 if !custom_formats.is_empty() {
                     content = inject_custom_formats_into_styles_xml(content, custom_formats)?;
                 }
-                if !cellxfs_roster.is_empty() {
-                    content = inject_cell_xfs_into_styles_xml(content, cellxfs_roster)?;
+                if !style_export.xf_roster.is_empty() {
+                    content = inject_styles_into_styles_xml(content, style_export)?;
                 }
             } else if name == "[Content_Types].xml" && !tables.is_empty() {
                 content = inject_table_overrides_into_content_types(content, tables)?;
@@ -1315,80 +1753,6 @@ fn inject_custom_formats_into_styles_xml(
 
     Err(XlsxError::Export(
         "styles.xml missing <styleSheet> root element".to_string(),
-    ))
-}
-
-/// **W5-D-15 (XLSX-4-03 per-cell format closure):** replace umya's
-/// default `<cellXfs>` block with one that enumerates every FormatId
-/// referenced by any cell. Slot 0 is the default xf (numFmtId=0, no
-/// applyNumberFormat); slots 1..N follow the `cellxfs_roster` order
-/// (which matches the `xf_index` values minted at the cell-fix
-/// collection site so `<c s="N">` round-trips correctly).
-///
-/// **Phase 5.2 D-1 step 6 (2026-05-20):** `cellxfs_roster` now carries
-/// `(FormatId, xlsx_numFmtId)` pairs — the numFmtId is pre-translated
-/// by `XlsxNumFmtTranslation` at the caller. This drops the pre-step-6
-/// `fid.to_legacy_u32().expect()` panic site; non-LEGACY peer ids
-/// flatten correctly through the translation.
-fn inject_cell_xfs_into_styles_xml(
-    content: Vec<u8>,
-    cellxfs_roster: &[(FormatId, u32)],
-) -> Result<Vec<u8>, XlsxError> {
-    let text = String::from_utf8(content)
-        .map_err(|e| XlsxError::Export(format!("styles.xml is not valid UTF-8: {e}")))?;
-
-    let count = cellxfs_roster.len() + 1;
-    let mut block = String::with_capacity(64 * count);
-    block.push_str(&format!(r#"<cellXfs count="{}">"#, count));
-    // Slot 0: default xf.
-    block.push_str(r#"<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>"#);
-    for (_fid, xlsx_num_fmt_id) in cellxfs_roster {
-        block.push_str(&format!(
-            concat!(
-                r#"<xf numFmtId="{}" fontId="0" fillId="0" borderId="0" xfId="0" "#,
-                r#"applyNumberFormat="1"/>"#,
-            ),
-            xlsx_num_fmt_id,
-        ));
-    }
-    block.push_str("</cellXfs>");
-
-    // Case 1: existing <cellXfs> — replace. Closing-tag form first.
-    if let Some(start) = text.find("<cellXfs") {
-        let after = start + "<cellXfs".len();
-        if let Some(close_rel) = text[after..].find("</cellXfs>") {
-            let end = after + close_rel + "</cellXfs>".len();
-            let mut out = String::with_capacity(text.len() + block.len());
-            out.push_str(&text[..start]);
-            out.push_str(&block);
-            out.push_str(&text[end..]);
-            return Ok(out.into_bytes());
-        }
-        if let Some(gt_rel) = text[after..].find('>') {
-            let end = after + gt_rel + 1;
-            if text[after..end].ends_with("/>") {
-                let mut out = String::with_capacity(text.len() + block.len());
-                out.push_str(&text[..start]);
-                out.push_str(&block);
-                out.push_str(&text[end..]);
-                return Ok(out.into_bytes());
-            }
-        }
-    }
-
-    // Case 2: no existing <cellXfs> — insert at the end of styleSheet
-    // (before </styleSheet>). umya always emits a cellXfs block so
-    // this path is defensive only.
-    if let Some(idx) = text.rfind("</styleSheet>") {
-        let mut out = String::with_capacity(text.len() + block.len());
-        out.push_str(&text[..idx]);
-        out.push_str(&block);
-        out.push_str(&text[idx..]);
-        return Ok(out.into_bytes());
-    }
-
-    Err(XlsxError::Export(
-        "styles.xml missing </styleSheet> close — cannot inject <cellXfs>".to_string(),
     ))
 }
 
@@ -2041,6 +2405,329 @@ mod tests {
         // File exists and is non-empty.
         let metadata = std::fs::metadata(&tmp).unwrap();
         assert!(metadata.len() > 0);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ===== Wave B2 (2026-06-18): cell visual-style export =====
+
+    /// Read one part out of an in-memory export.
+    fn export_part(wb: &Workbook, part: &str) -> String {
+        use std::io::Read;
+        let (bytes, _r) =
+            export_new_workbook_to_bytes(wb, FormulaCachePolicy::WriteRecomputed).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut s = String::new();
+        zip.by_name(part).unwrap().read_to_string(&mut s).unwrap();
+        s
+    }
+
+    fn styles_xml(wb: &Workbook) -> String {
+        export_part(wb, "xl/styles.xml")
+    }
+
+    /// Intern `style` and bind it to (row, col) on `sheet`.
+    fn set_style(wb: &mut Workbook, sheet: ql_types::SheetId, row: u32, col: u32, style: Style) {
+        let sid = wb.styles_mut().intern(style);
+        wb.sheet_mut(sheet)
+            .unwrap()
+            .style_overlay_mut()
+            .set(row, col, sid);
+    }
+
+    /// **Guard (No-Fallbacks):** pin umya 2.2.0's default styles.xml base
+    /// roster counts. The append-only style injection computes absolute
+    /// fontId/fillId/borderId as `base_count + roster_index`; if a umya
+    /// upgrade changes these defaults, this fails LOUDLY so the offsets get
+    /// re-checked rather than silently shifting every styled cell.
+    #[test]
+    fn umya_default_style_roster_counts_pinned() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet1");
+        let xml = styles_xml(&wb);
+        assert!(
+            xml.contains(r#"<fonts count="1""#),
+            "umya default <fonts count> changed: {xml}"
+        );
+        assert!(
+            xml.contains(r#"<fills count="2">"#),
+            "umya default <fills count> changed: {xml}"
+        );
+        assert!(
+            xml.contains(r#"<borders count="1">"#),
+            "umya default <borders count> changed: {xml}"
+        );
+    }
+
+    /// A workbook with a number-format but NO styles must leave the
+    /// fonts/fills/borders rosters at umya's defaults and emit the format xf
+    /// with the pre-Wave-B2 `fontId="0" fillId="0" borderId="0"` shape
+    /// (byte-stability of the no-style path).
+    #[test]
+    fn no_style_format_only_leaves_default_rosters() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        wb.put_at(s, 0, 0, Value::Number(1.5));
+        let fid = wb.formats_mut().intern("0.00");
+        wb.sheet_mut(s).unwrap().format_overlay_mut().set(0, 0, fid);
+        let xml = styles_xml(&wb);
+        // Sub-rosters untouched.
+        assert!(xml.contains(r#"<fonts count="1""#), "{xml}");
+        assert!(xml.contains(r#"<fills count="2">"#), "{xml}");
+        assert!(xml.contains(r#"<borders count="1">"#), "{xml}");
+        // The format xf still hardcodes the default font/fill/border ids.
+        // ("0.00" is Excel built-in numFmtId 2.)
+        assert!(
+            xml.contains(
+                r#"<xf numFmtId="2" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>"#
+            ),
+            "format-only xf shape changed: {xml}"
+        );
+    }
+
+    #[test]
+    fn bold_cell_exports_font() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        wb.put_at(s, 0, 0, Value::Number(1.0));
+        set_style(
+            &mut wb,
+            s,
+            0,
+            0,
+            Style {
+                bold: true,
+                ..Default::default()
+            },
+        );
+        let xml = styles_xml(&wb);
+        assert!(xml.contains(r#"<fonts count="2""#), "{xml}");
+        assert!(xml.contains("<b/>"), "{xml}");
+        // The styled cell's xf references the appended fontId 1.
+        assert!(
+            xml.contains(r#"fontId="1""#) && xml.contains(r#"applyFont="1""#),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn underline_strike_and_text_color_export() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        wb.put_at(s, 0, 0, Value::Number(1.0));
+        set_style(
+            &mut wb,
+            s,
+            0,
+            0,
+            Style {
+                underline: true,
+                strike: true,
+                text_color: Some(Rgb::new(0x12, 0x34, 0x56)),
+                ..Default::default()
+            },
+        );
+        let xml = styles_xml(&wb);
+        assert!(xml.contains("<u/>"), "{xml}");
+        assert!(xml.contains("<strike/>"), "{xml}");
+        assert!(xml.contains(r#"<color rgb="FF123456"/>"#), "{xml}");
+    }
+
+    #[test]
+    fn fill_cell_exports_solid_fill() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        wb.put_at(s, 0, 0, Value::Number(1.0));
+        set_style(
+            &mut wb,
+            s,
+            0,
+            0,
+            Style {
+                fill: Some(Rgb::new(0xFF, 0x00, 0x00)),
+                ..Default::default()
+            },
+        );
+        let xml = styles_xml(&wb);
+        assert!(xml.contains(r#"<fills count="3">"#), "{xml}");
+        assert!(
+            xml.contains(
+                r#"<patternFill patternType="solid"><fgColor rgb="FFFF0000"/><bgColor indexed="64"/></patternFill>"#
+            ),
+            "{xml}"
+        );
+        // Appended fillId is 2 (after umya defaults 0=none, 1=gray125).
+        assert!(
+            xml.contains(r#"fillId="2""#) && xml.contains(r#"applyFill="1""#),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn border_cell_exports_border() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        wb.put_at(s, 0, 0, Value::Number(1.0));
+        let borders = Borders {
+            top: BorderEdge {
+                style: BorderStyle::Thin,
+                color: Rgb::new(0, 0, 0),
+            },
+            ..Default::default()
+        };
+        set_style(
+            &mut wb,
+            s,
+            0,
+            0,
+            Style {
+                borders,
+                ..Default::default()
+            },
+        );
+        let xml = styles_xml(&wb);
+        assert!(xml.contains(r#"<borders count="2">"#), "{xml}");
+        assert!(
+            xml.contains(r#"<top style="thin"><color rgb="FF000000"/></top>"#),
+            "{xml}"
+        );
+        // Appended borderId is 1 (after umya default 0).
+        assert!(
+            xml.contains(r#"borderId="1""#) && xml.contains(r#"applyBorder="1""#),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn alignment_cell_exports_alignment_child() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        wb.put_at(s, 0, 0, Value::Number(1.0));
+        set_style(
+            &mut wb,
+            s,
+            0,
+            0,
+            Style {
+                align: HAlign::Center,
+                ..Default::default()
+            },
+        );
+        let xml = styles_xml(&wb);
+        assert!(
+            xml.contains(r#"applyAlignment="1"><alignment horizontal="center"/></xf>"#),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn composite_format_and_style_share_one_xf() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        wb.put_at(s, 0, 0, Value::Number(1.5));
+        let fid = wb.formats_mut().intern("0.00");
+        wb.sheet_mut(s).unwrap().format_overlay_mut().set(0, 0, fid);
+        set_style(
+            &mut wb,
+            s,
+            0,
+            0,
+            Style {
+                bold: true,
+                ..Default::default()
+            },
+        );
+        let xml = styles_xml(&wb);
+        // ONE xf carrying both the number-format AND the font.
+        // ("0.00" is Excel built-in numFmtId 2.)
+        assert!(
+            xml.contains(
+                r#"<xf numFmtId="2" fontId="1" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>"#
+            ),
+            "composite xf shape wrong: {xml}"
+        );
+    }
+
+    #[test]
+    fn shared_style_dedups_to_one_font() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        wb.put_at(s, 0, 0, Value::Number(1.0));
+        wb.put_at(s, 1, 0, Value::Number(2.0));
+        let style = Style {
+            bold: true,
+            ..Default::default()
+        };
+        set_style(&mut wb, s, 0, 0, style);
+        set_style(&mut wb, s, 1, 0, style);
+        let xml = styles_xml(&wb);
+        // Two cells, same bold style → ONE appended font (count 2, not 3).
+        assert!(xml.contains(r#"<fonts count="2""#), "{xml}");
+    }
+
+    #[test]
+    fn style_only_valueless_cell_is_emitted() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        // No value at A1 — only a style.
+        set_style(
+            &mut wb,
+            s,
+            0,
+            0,
+            Style {
+                bold: true,
+                ..Default::default()
+            },
+        );
+        let sheet_xml = export_part(&wb, "xl/worksheets/sheet1.xml");
+        // The valueless styled cell is synthesised with an s= index.
+        assert!(
+            sheet_xml.contains(r#"<c r="A1" s="1"/>"#),
+            "style-only cell not emitted: {sheet_xml}"
+        );
+        let styles = styles_xml(&wb);
+        assert!(styles.contains("<b/>"), "{styles}");
+    }
+
+    #[test]
+    fn styled_workbook_values_round_trip_via_calamine() {
+        // Styling must not corrupt the package — values still round-trip.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        wb.put_at(s, 0, 0, Value::Number(42.0));
+        wb.put_at(s, 0, 1, Value::text("hi"));
+        set_style(
+            &mut wb,
+            s,
+            0,
+            0,
+            Style {
+                bold: true,
+                fill: Some(Rgb::new(0, 0xFF, 0)),
+                align: HAlign::Right,
+                ..Default::default()
+            },
+        );
+        let tmp = std::env::temp_dir().join("ql-io-xlsx-styled-roundtrip.xlsx");
+        let _ = std::fs::remove_file(&tmp);
+        export_new_workbook(&wb, &tmp, FormulaCachePolicy::WriteRecomputed).unwrap();
+        let registry = ql_functions::default_registry();
+        let result = crate::import_xlsx_path(
+            &tmp,
+            &registry,
+            crate::XlsxImportOptions {
+                recompute: crate::RecomputeMode::Skip,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let sheet = result.workbook.sheet(0).unwrap();
+        assert_eq!(sheet.read(0, 0), Value::Number(42.0));
+        match sheet.read(0, 1) {
+            Value::Text(t) => assert_eq!(t.as_ref(), "hi"),
+            other => panic!("expected Text(hi), got {other:?}"),
+        }
         let _ = std::fs::remove_file(&tmp);
     }
 
