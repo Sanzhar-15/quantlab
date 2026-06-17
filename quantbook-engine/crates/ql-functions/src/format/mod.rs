@@ -12,6 +12,7 @@
 pub mod ast;
 pub mod error;
 pub mod lexer;
+pub mod nudge;
 pub mod parser;
 pub mod render;
 pub mod text_fn;
@@ -22,6 +23,7 @@ pub use ast::{
 };
 pub use error::{FormatParseError, V2Token};
 pub use lexer::{tokenize, Token};
+pub use nudge::{nudge_format_decimals, MAX_DECIMALS};
 pub use parser::parse;
 pub use render::render;
 pub use text_fn::text_ctx;

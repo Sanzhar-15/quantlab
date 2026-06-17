@@ -215,6 +215,85 @@ impl<'a> WorkbookRuntime<'a> {
         };
         format::render(&value, fmt, &ctx)
     }
+
+    /// **R9 / Wave B (2026-06-17):** increase (`delta > 0`) or decrease
+    /// (`delta < 0`) the number of decimal places a cell's number format shows
+    /// — Excel's "Increase/Decrease Decimal" gesture. Reads the cell's current
+    /// format (an unbound cell, or one bound to `General`, is treated as the
+    /// base integer format `"0"`), nudges the format-code string via
+    /// [`format::nudge_format_decimals`], and — when the result differs from the
+    /// cell's current bound format — interns the new format and binds the cell
+    /// to it (emitting `Op::RegisterFormat` if newly allocated + an
+    /// `Op::SetCellFormat`, exactly as a `register_format` + `set_cell_format`
+    /// pair would).
+    ///
+    /// Returns the `FormatId` the cell was (re)bound to, or `None` when the
+    /// nudge is a no-op: already at the clamp boundary (0 decimals on decrease,
+    /// [`format::MAX_DECIMALS`] on increase), the cell already carries exactly
+    /// the nudged format, `delta == 0`, or the format is non-numeric (a
+    /// date/text format is left untouched).
+    ///
+    /// **Decrease-from-General (Excel parity):** an unbound/`General` cell
+    /// decreased binds the explicit integer format `"0"` (Excel's Decrease
+    /// Decimal forces integer display); increased binds `"0.0"`.
+    ///
+    /// A format that fails to parse surfaces [`RuntimeError::InvalidFormat`]
+    /// loudly (No-Fallbacks) — never binds a corrupt format code.
+    ///
+    /// **Known limitation (Wave-B 5-lane audit MED; tracked for the Wave-C IDE
+    /// picker):** a cell whose format uses a V2-deferred grammar the engine's
+    /// format parser does not yet support — color codes (`[Red]`), conditional
+    /// sections (`[>100]`), or elapsed-time (`[h]`/`[mm]`) — cannot be nudged
+    /// and returns `InvalidFormat`. This includes Excel's stock accounting/
+    /// currency built-ins that carry `[Red]` on the negative section. The error
+    /// is loud + correct (No-Fallbacks: we will not silently mangle a format we
+    /// can't fully model); the IDE picker should disable / message the
+    /// increase-decimal button for such cells rather than surface the raw error.
+    /// (Locale-coded currency `[$-409]`/`[$€-409]` IS supported and nudges fine.)
+    pub fn nudge_cell_decimals(
+        &mut self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        delta: i32,
+    ) -> Result<Option<FormatId>, RuntimeError> {
+        validate_cell(self.workbook, sheet, row, col)?;
+        if delta == 0 {
+            return Ok(None);
+        }
+        // Current bound format string (None ⇒ unbound ⇒ General default).
+        let current_id = self
+            .workbook
+            .sheet(sheet)
+            .and_then(|s| s.format_overlay().get(row, col));
+        let current_str: Option<String> = match current_id {
+            Some(id) => Some(
+                self.workbook
+                    .formats()
+                    .lookup(id)
+                    // An overlay id absent from the table is corrupted state;
+                    // surface loudly rather than silently treating it as General.
+                    .ok_or(RuntimeError::UnknownFormatId(id))?
+                    .to_owned(),
+            ),
+            None => None,
+        };
+        // Base for the nudge: a non-`General` bound format nudges in place;
+        // unbound OR `General` is treated as the integer base `"0"`.
+        let base: &str = match current_str.as_deref() {
+            Some(s) if !s.eq_ignore_ascii_case("General") => s,
+            _ => "0",
+        };
+        let nudged =
+            format::nudge_format_decimals(base, delta).map_err(RuntimeError::InvalidFormat)?;
+        // No-op iff the cell already carries exactly the nudged format.
+        if current_str.as_deref() == Some(nudged.as_str()) {
+            return Ok(None);
+        }
+        let new_id = self.intern_format(&nudged)?;
+        self.set_cell_format(sheet, row, col, Some(new_id))?;
+        Ok(Some(new_id))
+    }
 }
 
 #[cfg(test)]
@@ -478,5 +557,198 @@ mod tests {
             replay_wb.sheet(0).unwrap().format_overlay().get(0, 0),
             Some(custom_id)
         );
+    }
+
+    // ===== R9 / Wave B — nudge_cell_decimals =====
+
+    /// Resolve a cell's currently-bound format string (None ⇒ unbound).
+    fn bound_format(wb: &Workbook, s: ql_types::SheetId, row: u32, col: u32) -> Option<String> {
+        wb.sheet(s)
+            .unwrap()
+            .format_overlay()
+            .get(row, col)
+            .map(|id| wb.formats().lookup(id).unwrap().to_owned())
+    }
+
+    #[test]
+    fn nudge_increase_adds_a_decimal_place() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::Number(1234.5));
+        let reg = default_registry();
+        let display;
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let id = rt.intern_format("0.00").unwrap();
+            rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+            let new = rt.nudge_cell_decimals(s, 0, 0, 1).unwrap();
+            assert!(new.is_some(), "increase must (re)bind a format");
+            display = rt.read_display(s, 0, 0);
+        }
+        assert_eq!(display, "1234.500");
+        assert_eq!(bound_format(&wb, s, 0, 0).as_deref(), Some("0.000"));
+    }
+
+    #[test]
+    fn nudge_decrease_removes_a_decimal_place() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let id = rt.intern_format("0.00").unwrap();
+            rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+            rt.nudge_cell_decimals(s, 0, 0, -1).unwrap();
+        }
+        assert_eq!(bound_format(&wb, s, 0, 0).as_deref(), Some("0.0"));
+    }
+
+    #[test]
+    fn nudge_unbound_increase_binds_one_decimal() {
+        // An unbound (General) cell increased ⇒ base "0" + one decimal = "0.0".
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let new = rt.nudge_cell_decimals(s, 0, 0, 1).unwrap();
+            assert!(new.is_some());
+        }
+        assert_eq!(bound_format(&wb, s, 0, 0).as_deref(), Some("0.0"));
+    }
+
+    #[test]
+    fn nudge_decrease_from_general_binds_integer_zero() {
+        // Excel parity: Decrease Decimal on a General/unbound cell forces the
+        // explicit integer format "0".
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let new = rt.nudge_cell_decimals(s, 0, 0, -1).unwrap();
+            assert!(new.is_some());
+        }
+        assert_eq!(bound_format(&wb, s, 0, 0).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn nudge_decrease_at_zero_decimals_is_noop() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        let mut log = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut log);
+            let id = rt.intern_format("0").unwrap();
+            rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+            // Decreasing an already-integer format ⇒ no change.
+            assert_eq!(rt.nudge_cell_decimals(s, 0, 0, -1).unwrap(), None);
+        }
+        // No SetCellFormat op beyond the initial bind (the no-op emits nothing).
+        let ops: Vec<_> = log.iter().collect::<Result<_, _>>().unwrap();
+        let set_format_ops = ops
+            .iter()
+            .filter(|o| matches!(o, Op::SetCellFormat { .. }))
+            .count();
+        assert_eq!(
+            set_format_ops, 1,
+            "no-op nudge must not emit a SetCellFormat"
+        );
+    }
+
+    #[test]
+    fn nudge_date_format_is_noop() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let id = rt.intern_format("m/d/yyyy").unwrap();
+            rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+            assert_eq!(rt.nudge_cell_decimals(s, 0, 0, 1).unwrap(), None);
+        }
+        assert_eq!(bound_format(&wb, s, 0, 0).as_deref(), Some("m/d/yyyy"));
+    }
+
+    #[test]
+    fn nudge_delta_zero_is_noop() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            assert_eq!(rt.nudge_cell_decimals(s, 0, 0, 0).unwrap(), None);
+        }
+        assert_eq!(bound_format(&wb, s, 0, 0), None);
+    }
+
+    #[test]
+    fn nudge_emits_register_and_set_format_ops() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        let mut log = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut log);
+            // Start from a builtin so the nudge allocates a NEW custom format.
+            let id = rt.intern_format("0.00").unwrap();
+            rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+            rt.nudge_cell_decimals(s, 0, 0, 1).unwrap(); // -> "0.000" (new custom)
+        }
+        let ops: Vec<_> = log.iter().collect::<Result<_, _>>().unwrap();
+        assert!(ops.iter().any(|o| matches!(o, Op::RegisterFormat { .. })));
+        assert!(ops
+            .iter()
+            .any(|o| matches!(o, Op::SetCellFormat { id: Some(_), .. })));
+    }
+
+    #[test]
+    fn nudge_multi_step_increase() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let id = rt.intern_format("0").unwrap();
+            rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+            rt.nudge_cell_decimals(s, 0, 0, 3).unwrap();
+        }
+        assert_eq!(bound_format(&wb, s, 0, 0).as_deref(), Some("0.000"));
+    }
+
+    #[test]
+    fn nudge_increase_at_max_decimals_is_noop() {
+        // Audit LOW (runtime/session lane): the increase-clamp at 30 decimals,
+        // exercised through the runtime wiring (not just the pure fn).
+        let at_cap = format!("0.{}", "0".repeat(30));
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let id = rt.intern_format(&at_cap).unwrap();
+            rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+            // Already at the cap → increase is a no-op (Ok(None)).
+            assert_eq!(rt.nudge_cell_decimals(s, 0, 0, 1).unwrap(), None);
+        }
+        assert_eq!(bound_format(&wb, s, 0, 0).as_deref(), Some(at_cap.as_str()));
+    }
+
+    #[test]
+    fn nudge_v2_unsupported_format_surfaces_invalid_format() {
+        // Audit MED (Opus lane): a cell bound to a V2-deferred format the parser
+        // can't model (e.g. a `[Red]` color code) cannot be nudged -> a loud
+        // RuntimeError::InvalidFormat (No-Fallbacks), never a silent mangle.
+        // (intern_format does not parse-validate at intern time, so a [Red]
+        // format can be bound — mirroring an XLSX import of such a format.)
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let id = rt.intern_format("[Red]0.00").unwrap();
+        rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+        let err = rt.nudge_cell_decimals(s, 0, 0, 1).unwrap_err();
+        assert!(matches!(err, RuntimeError::InvalidFormat(_)));
     }
 }

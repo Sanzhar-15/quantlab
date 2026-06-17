@@ -1974,6 +1974,32 @@ impl EngineSession for WorkbookSession {
         Ok(storage_style_id_to_dto(id))
     }
 
+    fn nudge_cell_decimals(&mut self, addr: CellAddr, delta: i32) -> EngineResult<()> {
+        self.ensure_ready()?;
+        self.require_live_sheet(addr.sheet, "nudge_cell_decimals")?;
+        // The runtime reads the cell's current format, nudges it, and (when the
+        // result differs) interns the new format + rebinds the cell, returning
+        // the new FormatId. `None` ⇒ no-op (clamp boundary / non-numeric format
+        // / delta 0) ⇒ nothing to record.
+        let new_id = self
+            .with_runtime(|rt| rt.nudge_cell_decimals(addr.sheet, addr.row, addr.col, delta))
+            .map_err(map_runtime_err)?;
+        if let Some(id) = new_id {
+            // Surface the (possibly newly-interned) format id AND the cell
+            // rebinding, exactly as register_format + set_format would.
+            // FormatAdded is idempotent if the format already existed.
+            self.record_changes([
+                SessionChange::FormatAdded { id },
+                SessionChange::Cell {
+                    sheet: addr.sheet,
+                    row: addr.row,
+                    col: addr.col,
+                },
+            ]);
+        }
+        Ok(())
+    }
+
     fn validate_formula(&self, addr: CellAddr, text: &str) -> EngineResult<Vec<Diagnostic>> {
         self.ensure_readable()?;
         self.require_live_sheet(addr.sheet, "validate_formula")?;
@@ -4537,6 +4563,8 @@ fn map_runtime_err(e: RuntimeError) -> EngineError {
         R::FormatCounterExhausted { .. } => {
             EngineError::new(ErrorClass::Internal, "format_counter_exhausted", display)
         }
+        // R9 / Wave B: a nudge produced/encountered an unparseable format code.
+        R::InvalidFormat(_) => EngineError::new(ErrorClass::BadArgument, "invalid_format", display),
         // FE-4 W4: style-overlay errors mirror the format-overlay ones.
         R::UnknownStyleId(_) => {
             EngineError::new(ErrorClass::BadArgument, "unknown_style_id", display)
@@ -9445,6 +9473,54 @@ mod tests {
         );
     }
 
+    /// **R9 / Wave B (2026-06-17):** `nudge_cell_decimals` increases/decreases
+    /// a cell's rendered precision through the full session path (the rendered
+    /// string is what the IDE grid shows).
+    #[test]
+    fn nudge_cell_decimals_changes_rendered_precision() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.5 })
+            .unwrap();
+        let fmt = s.register_format("0.00").unwrap();
+        s.set_format(addr(sheet, 0, 0), fmt).unwrap();
+        s.recalc_dirty().unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(c.rendered.as_deref(), Some("1.50"));
+
+        // Increase one decimal → "0.000" → "1.500".
+        s.nudge_cell_decimals(addr(sheet, 0, 0), 1).unwrap();
+        s.recalc_dirty().unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(c.rendered.as_deref(), Some("1.500"));
+
+        // Decrease two decimals → "0.0" → "1.5".
+        s.nudge_cell_decimals(addr(sheet, 0, 0), -2).unwrap();
+        s.recalc_dirty().unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(c.rendered.as_deref(), Some("1.5"));
+    }
+
+    /// An unbound (General) cell increased binds an explicit one-decimal format
+    /// through the session path; `delta == 0` is a harmless session-level no-op.
+    #[test]
+    fn nudge_cell_decimals_unbound_and_zero_delta() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // delta 0 → no-op (the napi layer rejects 0; the session treats it as
+        // nothing-to-do) → the cell stays unformatted.
+        s.nudge_cell_decimals(addr(sheet, 0, 0), 0).unwrap();
+        assert!(s.cell(addr(sheet, 0, 0)).unwrap().is_none());
+
+        // Increase an unbound cell → binds "0.0".
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 7.0 })
+            .unwrap();
+        s.nudge_cell_decimals(addr(sheet, 0, 0), 1).unwrap();
+        s.recalc_dirty().unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(c.rendered.as_deref(), Some("7.0"));
+    }
+
     // --- Display-path gap closure (2026-06-10): `rendered` on the OWNING
     // session's snapshot paths. Pre-closure `build_cell_snapshot` hardcoded
     // `rendered: None` (the format-rendering existed only on the dormant
@@ -9599,6 +9675,36 @@ mod tests {
             .expect("the formatted cell must be in changed_cells");
         assert_eq!(changed.cell.rendered.as_deref(), Some("2.10%"));
         assert_eq!(changed.cell.format, Some(fmt_id));
+    }
+
+    /// **R9 / Wave B (audit LOW, runtime/session lane):** a nudge that allocates
+    /// a NEW custom format must surface it in the delta's `formats_added` (so the
+    /// IDE can render the rebound cell) AND list the cell in `changed_cells`.
+    #[test]
+    fn snapshot_delta_after_nudge_carries_new_format() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.5 })
+            .unwrap();
+        let fmt = s.register_format("0.00").unwrap();
+        s.set_format(addr(sheet, 0, 0), fmt).unwrap();
+        s.recalc_dirty().unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        // Increase → "0.000" (a new custom format id).
+        s.nudge_cell_decimals(addr(sheet, 0, 0), 1).unwrap();
+        s.recalc_dirty().unwrap();
+        let delta = s.snapshot_delta(&v0).unwrap();
+        assert!(!delta.full_rebuild_required);
+        assert!(
+            delta.formats_added.iter().any(|fd| fd.string == "0.000"),
+            "nudge's new format must appear in formats_added"
+        );
+        let changed = delta
+            .changed_cells
+            .iter()
+            .find(|c| c.sheet == sheet && c.cell.row == 0 && c.cell.col == 0)
+            .expect("the nudged cell must be in changed_cells");
+        assert_eq!(changed.cell.rendered.as_deref(), Some("1.500"));
     }
 
     #[test]

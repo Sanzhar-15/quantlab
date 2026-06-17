@@ -199,6 +199,37 @@ fn validate_u32_index(method: &str, name: &str, value: f64) -> Result<u32> {
     Ok(value as u32)
 }
 
+/// **R9 / Wave B (2026-06-17):** validate a signed decimal-nudge `delta` from
+/// JS — must be a finite, non-zero integer within ±30 (Excel caps number
+/// formats at 30 decimal places). Mirrors [`validate_u32_index`]'s no-coercion
+/// discipline: NaN / fractional / zero / out-of-range are all rejected loudly
+/// (No-Fallbacks).
+fn validate_nudge_delta(method: &str, value: f64) -> Result<i32> {
+    // Excel's decimal-place ceiling; a larger |delta| is meaningless.
+    const MAX_NUDGE_DELTA: f64 = 30.0;
+    if !value.is_finite() {
+        return Err(bad_argument_error(format!(
+            "{method}: delta must be a finite non-zero integer, got {value}"
+        )));
+    }
+    if value.fract() != 0.0 {
+        return Err(bad_argument_error(format!(
+            "{method}: delta must be an integer, got {value}"
+        )));
+    }
+    if value == 0.0 {
+        return Err(bad_argument_error(format!(
+            "{method}: delta must be non-zero (+N increases, -N decreases decimal places)"
+        )));
+    }
+    if value.abs() > MAX_NUDGE_DELTA {
+        return Err(bad_argument_error(format!(
+            "{method}: delta magnitude must be in [1, 30], got {value}"
+        )));
+    }
+    Ok(value as i32)
+}
+
 // **W3 (insert/delete rows & columns):** `StructuralAxis`, `StructuralKind`,
 // and `shifted_position` were lifted to `ql_exec::structural` (imported above)
 // so the OWNING `Session` path can reuse the SAME audited producer core that
@@ -7072,6 +7103,34 @@ impl Session {
                 .register_format(&format_string)
                 .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(format_id_json_from_session(id))
+        })
+    }
+
+    /// **R9 / Wave B (2026-06-17):** increase (`delta > 0`) / decrease
+    /// (`delta < 0`) the decimal places shown by a cell's number format —
+    /// Excel's "Increase/Decrease Decimal". The cell's current format is read
+    /// (an unbound / `General` cell is treated as the integer base `"0"`),
+    /// nudged, and rebound if it changed; a no-op (clamp boundary, a
+    /// non-numeric/date format, or `delta == 0` — rejected) leaves the cell
+    /// untouched. Convenience over `registerFormat` + `setFormat`: the IDE
+    /// calls it once per selected cell. `bad_argument` for invalid coords or a
+    /// non-integer / zero / out-of-range (±30) delta.
+    #[napi(js_name = "nudgeDecimals", catch_unwind)]
+    pub fn nudge_decimals(
+        &self,
+        env: Env,
+        sheet: f64,
+        row: f64,
+        col: f64,
+        delta: f64,
+    ) -> Result<()> {
+        guarded(env, "nudgeDecimals", || {
+            let addr = session_addr_from_f64("nudgeDecimals", sheet, row, col)?;
+            let delta = validate_nudge_delta("nudgeDecimals", delta)?;
+            self.inner
+                .lock()
+                .nudge_cell_decimals(addr, delta)
+                .map_err(|e| engine_error_to_napi(env, e))
         })
     }
 

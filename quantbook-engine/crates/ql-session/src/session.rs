@@ -186,6 +186,15 @@ pub trait EngineSession {
     /// [`Self::register_format`]). Idempotent — re-registering an identical
     /// style returns the same id.
     fn register_style(&mut self, style: Style) -> EngineResult<StyleId>;
+    /// **R9 / Wave B (2026-06-17):** increase (`delta > 0`) / decrease
+    /// (`delta < 0`) the decimal places of a cell's number format — Excel's
+    /// Increase/Decrease Decimal gesture. Reads the cell's current format
+    /// (unbound / `General` ⇒ the integer base `"0"`), nudges the format-code
+    /// string, and rebinds the cell if the result differs. A no-op (clamp
+    /// boundary, a non-numeric/date format, or `delta == 0`) leaves the cell
+    /// untouched. Effectively a `register_format` + `set_format` pair scoped to
+    /// decimal places; a malformed format surfaces a loud error (No-Fallbacks).
+    fn nudge_cell_decimals(&mut self, addr: CellAddr, delta: i32) -> EngineResult<()>;
     /// Parse+bind a formula WITHOUT mutating (keystroke path); returns diagnostics.
     fn validate_formula(&self, addr: CellAddr, text: &str) -> EngineResult<Vec<Diagnostic>>;
 

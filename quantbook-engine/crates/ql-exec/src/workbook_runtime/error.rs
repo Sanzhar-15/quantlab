@@ -189,6 +189,14 @@ pub enum RuntimeError {
     #[error("style counter for peer {peer:?} is exhausted (u32::MAX per-peer styles)")]
     StyleCounterExhausted { peer: ql_types::PeerId },
 
+    /// **R9 / Wave B (2026-06-17):** `WorkbookRuntime::nudge_cell_decimals`
+    /// produced — or was asked to nudge — a number-format string that does not
+    /// parse. For an already-interned cell format this is unreachable (it parsed
+    /// at intern time); the variant exists so a malformed nudge surfaces loudly
+    /// (No-Fallbacks) rather than the runtime binding a corrupt format code.
+    #[error("invalid number format: {0}")]
+    InvalidFormat(ql_functions::format::FormatParseError),
+
     /// **W5-106-AUDIT (Codex MEDIUM closure):** recompute_dirty's
     /// fixed-point loop hit its MAX_ITERATIONS bound with cells still
     /// dirty. Signals a runaway spill shape transition or workbook
