@@ -1113,6 +1113,15 @@ pub fn default_registry() -> FunctionRegistry {
     // collapses to an implicitly-intersected scalar at bind time).
     r.register_range_aware("SHARPE", financial_fns::sharpe);
     r.register_range_aware("MAX_DRAWDOWN", financial_fns::max_drawdown);
+    // B2 Wave A — two more native quant aggregates on the same welford
+    // primitives. VOLATILITY = sample-stdev of returns, optional sqrt(periods)
+    // annualization (a constant series ⇒ 0.0, NOT an error — unlike SHARPE's
+    // zero denominator); SORTINO = (mean - MAR) / downside-deviation
+    // (empyrical all-N downside convention), same sqrt(periods) annualization
+    // as SHARPE. Both RangeAwareFn (arg 0 = series range); admitted to the
+    // ArgContext::Aggregate override list below alongside SHARPE/MAX_DRAWDOWN.
+    r.register_range_aware("VOLATILITY", financial_fns::volatility);
+    r.register_range_aware("SORTINO", financial_fns::sortino);
 
     // **W5-D-7 (Wave 3 closure — CLOSES Wave 3):** XNPV / XIRR —
     // date-indexed cash flow. Both RangeAwareFn with 2 ranges
@@ -1564,11 +1573,15 @@ fn register_builtin_metadata(r: &mut FunctionRegistry) {
         // B2 (native quant fns) — range-aware quant aggregates. NOT part of
         // the pre-6.4-1 byte-for-byte whitelist (they postdate it); the
         // dedicated `b2_quant_fns_admitted_to_is_aggregate_function` test and
-        // the `validate.rs` invariants pin them. Without these two names the
-        // binder hands SHARPE/MAX_DRAWDOWN an implicitly-intersected scalar
-        // instead of the range, silently breaking `=SHARPE(A1:A10)`.
+        // the `validate.rs` invariants pin them. Without these names the
+        // binder hands them an implicitly-intersected scalar instead of the
+        // range, silently breaking `=SHARPE(A1:A10)` / `=SORTINO(A1:A10)`.
+        // (Wave A added VOLATILITY + SORTINO; both also pinned in the
+        // `post_6_4_1_aggregate_additions` allowlist below.)
         "SHARPE",
         "MAX_DRAWDOWN",
+        "VOLATILITY",
+        "SORTINO",
     ] {
         // Some of these names overlap Phase-1 overrides (none currently —
         // Phase 1 covers NOW/TODAY/RAND/RANDBETWEEN/RANDARRAY +
@@ -1783,7 +1796,10 @@ mod tests {
         // SHARPE = mean(excess returns)/sample-stdev with optional
         // sqrt(periods) annualization; MAX_DRAWDOWN = max peak-to-trough
         // decline of an equity/price series (negative fraction). => 262.
-        assert_eq!(r.len(), 262);
+        // B2 Wave A: VOLATILITY (sample-stdev of returns, optional sqrt(periods);
+        // constant series => 0.0) + SORTINO ((mean-MAR)/downside-deviation,
+        // empyrical all-N convention, sqrt(periods) annualization) = 2. => 264.
+        assert_eq!(r.len(), 264);
     }
 
     #[test]
@@ -2778,11 +2794,13 @@ mod tests {
         // AFTER the byte-for-byte migration — each must be pinned here so a
         // typo'd extra entry still fails loudly).
         //
-        // **B2 (native quant fns):** SHARPE + MAX_DRAWDOWN are new range-aware
-        // quant aggregates that postdate the pre-6.4-1 whitelist. They are
-        // legitimately Aggregate (the binder must hand them the range), so
-        // they are listed here as explicit post-migration extensions.
-        let post_6_4_1_aggregate_additions: &[&str] = &["SHARPE", "MAX_DRAWDOWN"];
+        // **B2 (native quant fns):** SHARPE + MAX_DRAWDOWN (and Wave A's
+        // VOLATILITY + SORTINO) are new range-aware quant aggregates that
+        // postdate the pre-6.4-1 whitelist. They are legitimately Aggregate
+        // (the binder must hand them the range), so they are listed here as
+        // explicit post-migration extensions.
+        let post_6_4_1_aggregate_additions: &[&str] =
+            &["SHARPE", "MAX_DRAWDOWN", "VOLATILITY", "SORTINO"];
         let mut allowed: std::collections::HashSet<&str> =
             pre_6_4_1_aggregate_whitelist.iter().copied().collect();
         allowed.extend(post_6_4_1_aggregate_additions.iter().copied());
@@ -2811,7 +2829,7 @@ mod tests {
     #[test]
     fn b2_quant_fns_admitted_to_is_aggregate_function() {
         let r = default_registry();
-        for name in ["SHARPE", "MAX_DRAWDOWN"] {
+        for name in ["SHARPE", "MAX_DRAWDOWN", "VOLATILITY", "SORTINO"] {
             assert_eq!(
                 r.metadata(name).map(|m| m.arg_context),
                 Some(ArgContext::Aggregate),

@@ -521,6 +521,15 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "MAX_DRAWDOWN",
         "B2; unit tests pin running-peak max peak-to-trough decline (negative fraction) + monotonic/single-value 0.0 + full-wipeout -1.0 + zero-after-peak full-loss + empty #NUM! / non-positive-peak #DIV/0! / negative-level #NUM! / non-finite-input #NUM! + skip text/bool + error propagation + scalar-arg/arity #VALUE!; full-path =MAX_DRAWDOWN(NamedRange) (incl. underscore-ident lex) in ql-exec::validate",
     ),
+    // B2 Wave A — two more native quant aggregates on the same welford primitives.
+    (
+        "VOLATILITY",
+        "B2 Wave A; unit tests pin sample-stdev of returns + sqrt(periods) annualization + sample-vs-population pin + CONSTANT-series => 0.0 (NOT an error — the SHARPE distinction) + empty #NUM! / n<2 #DIV/0! / non-positive periods #NUM! / non-finite-input #NUM! / overflow-input #NUM! + skip text/bool + error propagation + scalar/range-position #VALUE! + arity; full-path =VOLATILITY(NamedRange[,periods]) incl. constant-series-0.0 + error-contract e2e in ql-exec::validate",
+    ),
+    (
+        "SORTINO",
+        "B2 Wave A; unit tests pin (mean-MAR)/downside-deviation with empyrical ALL-N downside convention (pinned vs downside-count) + scaled-sum-of-squares overflow/underflow robustness (extreme inputs stay correct) + MAR handling + negative ratio + sqrt(periods) annualization (matches SHARPE) + no-downside DD==0 #DIV/0! (beats bad-periods) + empty #NUM! / n<2 #DIV/0! / non-positive periods #NUM! / non-finite-input #NUM! + skip text/bool + error propagation + scalar/range-position #VALUE! + arity; full-path =SORTINO(NamedRange[,MAR,periods]) + error-contract e2e in ql-exec::validate",
+    ),
     // W5-169 (Phase 4.10.G) — modern lookups + ADDRESS.
     (
         "XLOOKUP",

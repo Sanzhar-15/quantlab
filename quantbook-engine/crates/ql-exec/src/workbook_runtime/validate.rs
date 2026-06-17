@@ -330,6 +330,9 @@ mod tests {
             // B2 (native quant fns) — range-aware quant aggregates.
             "SHARPE",
             "MAX_DRAWDOWN",
+            // B2 Wave A — VOLATILITY + SORTINO (same range-aware aggregate tier).
+            "VOLATILITY",
+            "SORTINO",
         ] {
             assert!(
                 reg.lookup_range_aware(name).is_some(),
@@ -623,18 +626,116 @@ mod tests {
         }
     }
 
+    /// **B2 Wave A — full-path lex→parse→bind→eval armor for `=VOLATILITY(...)`.**
+    /// Same bind-admission proof as `b2_sharpe_full_path_named_range`, plus the
+    /// VOLATILITY-specific distinction: a CONSTANT series evaluates to `0.0`
+    /// (not an error) end-to-end.
+    #[test]
+    fn b2_volatility_full_path_named_range() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+
+        let mut wb = make_runtime_workbook();
+        // Returns series A1:A4 = [0.01, 0.02, 0.03, 0.04].
+        wb.put_at(0, 0, 0, Value::Number(0.01));
+        wb.put_at(0, 1, 0, Value::Number(0.02));
+        wb.put_at(0, 2, 0, Value::Number(0.03));
+        wb.put_at(0, 3, 0, Value::Number(0.04));
+        wb.set_name("Returns", NamedTarget::Range(Range::new(0, 0, 0, 3, 0)))
+            .unwrap();
+        // A constant series B1:B3 = [0.02, 0.02, 0.02] for the zero-vol case.
+        wb.put_at(0, 0, 1, Value::Number(0.02));
+        wb.put_at(0, 1, 1, Value::Number(0.02));
+        wb.put_at(0, 2, 1, Value::Number(0.02));
+        wb.set_name("Flat", NamedTarget::Range(Range::new(0, 0, 1, 2, 1)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Sample stdev = sqrt(0.0005/3) = 0.0129099445 (= SHARPE's denominator).
+        let v = rt.set_formula(0, 0, 5, "VOLATILITY(Returns)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 0.0129099445).abs() < 1e-9, "got {n}"),
+            other => panic!("expected Number(~0.0129), got {other:?}"),
+        }
+
+        // Annualized: 0.0129099445 * sqrt(4) = 0.0258198890.
+        let v = rt.set_formula(0, 1, 5, "VOLATILITY(Returns, 4)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 0.0258198890).abs() < 1e-9, "got {n}"),
+            other => panic!("expected Number(~0.0258), got {other:?}"),
+        }
+
+        // Constant series ⇒ 0.0 (NOT #DIV/0! — the SHARPE distinction), e2e.
+        let v = rt.set_formula(0, 2, 5, "VOLATILITY(Flat)").unwrap();
+        match v {
+            Value::Number(n) => assert!(n.abs() < 1e-12, "expected 0.0, got {n}"),
+            other => panic!("expected Number(0.0), got {other:?}"),
+        }
+    }
+
+    /// **B2 Wave A — full-path lex→parse→bind→eval armor for `=SORTINO(...)`.**
+    /// Named-range path; pins the raw, MAR, and annualized values end-to-end.
+    #[test]
+    fn b2_sortino_full_path_named_range() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+
+        let mut wb = make_runtime_workbook();
+        // Returns series A1:A4 = [0.30, -0.10, 0.10, -0.10]; mean=0.05,
+        // downside DD over all N=4 = sqrt(0.005) = 0.0707106781.
+        wb.put_at(0, 0, 0, Value::Number(0.30));
+        wb.put_at(0, 1, 0, Value::Number(-0.10));
+        wb.put_at(0, 2, 0, Value::Number(0.10));
+        wb.put_at(0, 3, 0, Value::Number(-0.10));
+        wb.set_name("Rets", NamedTarget::Range(Range::new(0, 0, 0, 3, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // SORTINO (MAR=0) = 0.05/0.0707106781 = 1/sqrt(2) = 0.7071067812.
+        let v = rt.set_formula(0, 0, 5, "SORTINO(Rets)").unwrap();
+        match v {
+            Value::Number(n) => {
+                assert!((n - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-9, "got {n}")
+            }
+            other => panic!("expected Number(~0.7071), got {other:?}"),
+        }
+
+        // With MAR=0.05: numerator = 0.05-0.05 = 0 ⇒ ratio 0.0 (downside DD>0).
+        let v = rt.set_formula(0, 1, 5, "SORTINO(Rets, 0.05)").unwrap();
+        match v {
+            Value::Number(n) => assert!(n.abs() < 1e-12, "expected 0.0, got {n}"),
+            other => panic!("expected Number(0.0), got {other:?}"),
+        }
+
+        // Annualized: 0.7071067812 * sqrt(4) = sqrt(2) = 1.4142135624.
+        let v = rt.set_formula(0, 2, 5, "SORTINO(Rets, 0, 4)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - std::f64::consts::SQRT_2).abs() < 1e-9, "got {n}"),
+            other => panic!("expected Number(~1.4142), got {other:?}"),
+        }
+    }
+
     /// **B2 — full-path error contract (named-range path).** Empty range ⇒
     /// `#NUM!`; a single-cell range to SHARPE ⇒ `#DIV/0!` (n<2 sample stdev
     /// undefined). Pins that the No-Fallbacks error semantics survive the
     /// bind+eval round-trip.
     #[test]
-    fn b2_sharpe_max_drawdown_error_contract_full_path() {
+    fn b2_quant_fns_error_contract_full_path() {
         use ql_storage::NamedTarget;
         use ql_types::Range;
 
         let mut wb = make_runtime_workbook();
         // A1 holds the only value; A10:A12 are left blank → empty range.
         wb.put_at(0, 0, 0, Value::Number(0.05));
+        // A1:A3 all-positive (no value < MAR=0) for SORTINO's no-downside case.
+        wb.put_at(0, 1, 0, Value::Number(0.02));
+        wb.put_at(0, 2, 0, Value::Number(0.03));
+        // B1:B3 has downside ([0.30, -0.10, 0.10]) so SORTINO reaches the ppy guard.
+        wb.put_at(0, 0, 1, Value::Number(0.30));
+        wb.put_at(0, 1, 1, Value::Number(-0.10));
+        wb.put_at(0, 2, 1, Value::Number(0.10));
         // **Historical note (W5-D-13.1 gotcha, fixed by FE-10 2026-06-14):** a
         // ≤3-letter name like `One` used to lex as a BareColumn (column `ONE`) and
         // be shadowed by a whole-column literal instead of resolving as a NameRef.
@@ -644,6 +745,10 @@ mod tests {
             .unwrap();
         wb.set_name("EmptyRng", NamedTarget::Range(Range::new(0, 9, 0, 11, 0)))
             .unwrap();
+        wb.set_name("AllUp", NamedTarget::Range(Range::new(0, 0, 0, 2, 0)))
+            .unwrap();
+        wb.set_name("Mixed", NamedTarget::Range(Range::new(0, 0, 1, 2, 1)))
+            .unwrap();
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
@@ -651,10 +756,30 @@ mod tests {
         let v = rt.set_formula(0, 0, 5, "SHARPE(Single)").unwrap();
         assert_eq!(v, Value::Error(ErrorValue::DivZero));
 
-        // All-blank range → 0 numeric values → #NUM! for both.
+        // All-blank range → 0 numeric values → #NUM! for SHARPE + MAX_DRAWDOWN.
         let v = rt.set_formula(0, 1, 5, "SHARPE(EmptyRng)").unwrap();
         assert_eq!(v, Value::Error(ErrorValue::Num));
         let v = rt.set_formula(0, 2, 5, "MAX_DRAWDOWN(EmptyRng)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::Num));
+
+        // B2 Wave A — the SAME error contract survives bind+eval for VOLATILITY +
+        // SORTINO: single-cell range ⇒ n<2 ⇒ #DIV/0!; empty range ⇒ #NUM!.
+        let v = rt.set_formula(0, 3, 5, "VOLATILITY(Single)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::DivZero));
+        let v = rt.set_formula(0, 4, 5, "VOLATILITY(EmptyRng)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::Num));
+        let v = rt.set_formula(0, 5, 5, "SORTINO(Single)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::DivZero));
+        let v = rt.set_formula(0, 6, 5, "SORTINO(EmptyRng)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::Num));
+
+        // B2 Wave A — SORTINO's two remaining error paths through bind+eval:
+        // (a) NO downside (every value >= MAR) ⇒ DD == 0 ⇒ #DIV/0!.
+        let v = rt.set_formula(0, 7, 5, "SORTINO(AllUp)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::DivZero));
+        // (b) a series WITH downside but periods_per_year <= 0 ⇒ #NUM! (the DD>0
+        //     path reaches the ppy guard; pins DD==0 is checked BEFORE ppy).
+        let v = rt.set_formula(0, 8, 5, "SORTINO(Mixed, 0, 0)").unwrap();
         assert_eq!(v, Value::Error(ErrorValue::Num));
     }
 
@@ -745,10 +870,10 @@ mod tests {
         );
     }
 
-    /// **W2-literal-range — RangeAware-tier quant fns (SHARPE / MAX_DRAWDOWN)
-    /// over a literal range.** These resolve BEFORE the Scalar arms, so this
-    /// exercises the RangeAware dispatch arm specifically. Values match the
-    /// named-range full-path tests exactly.
+    /// **W2-literal-range — RangeAware-tier quant fns (SHARPE / MAX_DRAWDOWN /
+    /// VOLATILITY / SORTINO) over a literal range.** These resolve BEFORE the
+    /// Scalar arms, so this exercises the RangeAware dispatch arm specifically.
+    /// Values match the named-range full-path tests exactly.
     #[test]
     fn w2_literal_range_range_aware_quant_fns_full_path() {
         let mut wb = make_runtime_workbook();
@@ -756,9 +881,13 @@ mod tests {
         for (i, p) in [100.0, 120.0, 90.0, 110.0, 80.0, 130.0].iter().enumerate() {
             wb.put_at(0, i as u32, 0, Value::Number(*p));
         }
-        // Returns series B1:B4 = [0.01, 0.02, 0.03, 0.04] for SHARPE.
+        // Returns series B1:B4 = [0.01, 0.02, 0.03, 0.04] for SHARPE / VOLATILITY.
         for (i, r) in [0.01, 0.02, 0.03, 0.04].iter().enumerate() {
             wb.put_at(0, i as u32, 1, Value::Number(*r));
+        }
+        // Returns series C1:C4 = [0.30, -0.10, 0.10, -0.10] (has downside) for SORTINO.
+        for (i, r) in [0.30, -0.10, 0.10, -0.10].iter().enumerate() {
+            wb.put_at(0, i as u32, 2, Value::Number(*r));
         }
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
@@ -783,6 +912,31 @@ mod tests {
         match sh_rf {
             Value::Number(n) => assert!((n - 1.1618950039).abs() < 1e-9, "got {n}"),
             other => panic!("expected ~1.1619, got {other:?}"),
+        }
+
+        // B2 Wave A: VOLATILITY(B1:B4) = sample stdev = 0.0129099445 (= SHARPE's
+        // denominator) -- the RangeAware literal-range arm for the new fns.
+        let vol = rt.set_formula(0, 3, 5, "VOLATILITY(B1:B4)").unwrap();
+        match vol {
+            Value::Number(n) => assert!((n - 0.0129099445).abs() < 1e-9, "got {n}"),
+            other => panic!("expected ~0.0129, got {other:?}"),
+        }
+
+        // SORTINO(C1:C4) = 1/sqrt(2) = 0.7071067812 (matches named-range path).
+        let sor = rt.set_formula(0, 4, 5, "SORTINO(C1:C4)").unwrap();
+        match sor {
+            Value::Number(n) => {
+                assert!((n - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-9, "got {n}")
+            }
+            other => panic!("expected ~0.7071, got {other:?}"),
+        }
+
+        // SORTINO with a MAR scalar arg ALONGSIDE the literal range (mean=0.05,
+        // MAR=0.05 => numerator 0 => 0.0, downside DD>0).
+        let sor_mar = rt.set_formula(0, 5, 5, "SORTINO(C1:C4, 0.05)").unwrap();
+        match sor_mar {
+            Value::Number(n) => assert!(n.abs() < 1e-12, "expected 0.0, got {n}"),
+            other => panic!("expected 0.0, got {other:?}"),
         }
     }
 

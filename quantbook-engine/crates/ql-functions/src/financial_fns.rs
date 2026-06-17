@@ -1549,6 +1549,17 @@ fn compute_sharpe(
         Some(sd) => sd,
         None => return Err(ErrorValue::DivZero), // n < 2 (already guarded)
     };
+    // **Codex HIGH (Wave A audit) -- sibling-class fix.** `sample_stdev`'s
+    // two-pass `Σ(x-mean)^2` OVERFLOWS to `+Inf` for large-but-finite returns
+    // (`(5e199)^2`). With sd=Inf the ratio `mean/Inf` is a finite `-0.0` that
+    // `finish()` would silently accept -- a wrong result, not a visible error.
+    // Surface it loudly as #NUM! (No-Fallbacks). SHARPE shares `welford` with
+    // STDEV.S, so unlike SORTINO's self-contained downside it cannot cheaply
+    // recover the true extreme value without diverging from STDEV.S; erroring
+    // matches VOLATILITY (whose Inf stdev also `finish()`-resolves to #NUM!).
+    if !sd.is_finite() {
+        return Err(ErrorValue::Num);
+    }
     if sd == 0.0 {
         return Err(ErrorValue::DivZero);
     }
@@ -1627,6 +1638,189 @@ fn compute_max_drawdown(series: &[f64]) -> Result<f64, ErrorValue> {
     Ok(max_dd)
 }
 
+/// **B2 (Wave A):** `VOLATILITY` core — the (ex-post) volatility of a periodic
+/// return series: its sample standard deviation, optionally annualized.
+///
+/// Definition:
+///
+/// ```text
+/// VOL = stdev(R)                          (raw, per-period)
+/// VOL = stdev(R) * sqrt(periods_per_year) (annualized)
+/// ```
+///
+/// **Decisions (documented contract):**
+/// - **Sample** standard deviation (Bessel-corrected, denominator `n-1`) — the
+///   SAME estimator SHARPE's denominator uses (`crate::welford::sample_stdev`,
+///   matching Excel `STDEV.S`), so `=VOLATILITY(R)` equals SHARPE's risk term.
+/// - **Annualization:** if `periods_per_year` is provided (> 0), the stdev is
+///   scaled by `sqrt(periods_per_year)` — the standard √-frequency scaling.
+///
+/// **Errors (No-Fallbacks):**
+/// - empty series (0 numeric values) ⇒ `#NUM!`
+/// - `n < 2` (sample stdev undefined) ⇒ `#DIV/0!` (matches Excel `STDEV.S`
+///   and SHARPE's `n < 2` guard)
+/// - `periods_per_year <= 0` ⇒ `#NUM!`
+///
+/// **Distinct from SHARPE:** a CONSTANT series (`stdev == 0`) is NOT an error —
+/// zero volatility is a legitimate, meaningful statistic (a flat return
+/// stream), so this returns `0.0`. SHARPE rejects `stdev == 0` only because it
+/// is the *denominator* of the ratio; here it is the result itself.
+fn compute_volatility(returns: &[f64], periods_per_year: Option<f64>) -> Result<f64, ErrorValue> {
+    if returns.is_empty() {
+        return Err(ErrorValue::Num);
+    }
+    if returns.len() < 2 {
+        return Err(ErrorValue::DivZero);
+    }
+    let mut sd = match crate::welford::sample_stdev(returns) {
+        Some(sd) => sd,
+        None => return Err(ErrorValue::DivZero), // n < 2 (already guarded)
+    };
+    // A constant series ⇒ sd == 0.0, returned as-is (NOT an error): zero
+    // volatility is a valid answer, unlike SHARPE's zero denominator.
+    if let Some(ppy) = periods_per_year {
+        if ppy <= 0.0 {
+            return Err(ErrorValue::Num);
+        }
+        sd *= ppy.sqrt();
+    }
+    Ok(sd)
+}
+
+/// **B2 (Wave A):** `SORTINO` core — the (ex-post) Sortino ratio of a periodic
+/// return series: excess return per unit of DOWNSIDE deviation.
+///
+/// Definition (Sortino & Price 1994; the downside term matches
+/// `empyrical.downside_risk` / `empyrical.sortino_ratio`):
+///
+/// ```text
+/// SR_sortino = (mean(R) - MAR) / DD
+/// DD         = sqrt( (1/N) * Σ_i min(0, R_i - MAR)^2 )
+/// ```
+///
+/// where `R` is the per-period return series and `MAR` is the (constant)
+/// minimum acceptable return / target return. Since `MAR` is constant,
+/// `mean(R - MAR) = mean(R) - MAR`, so we subtract `MAR` from the mean rather
+/// than from every element (mirrors SHARPE's risk-free handling).
+///
+/// **Decisions (documented contract):**
+/// - **Downside deviation `DD`** uses the empyrical convention: square only the
+///   *downside* shortfalls `min(0, R_i - MAR)` (an upside period contributes
+///   `0`), average over **ALL `N`** observations (NOT just the downside ones —
+///   a population-style denominator `N`, matching `empyrical.downside_risk`),
+///   then take the root. Accumulated with a scaled sum-of-squares (factor out
+///   `max|shortfall|`) so the statistic stays correct across the full finite
+///   input range — a naive `Σ shortfall^2` overflows to `+Inf` (silent wrong
+///   ratio) or underflows to `0` (spurious `#DIV/0!`) for extreme magnitudes.
+/// - **Annualization:** if `periods_per_year` is provided (> 0), the ratio is
+///   scaled by `sqrt(periods_per_year)` — IDENTICAL to SHARPE's convention (a
+///   per-period ratio times √frequency), so SORTINO and SHARPE annualize the
+///   same way on the same series.
+/// - `MAR` is a per-period rate in the series' own units (not annualized
+///   internally), mirroring SHARPE's `Rf`.
+///
+/// **Errors (No-Fallbacks):**
+/// - empty series (0 numeric values) ⇒ `#NUM!`
+/// - `n < 2` ⇒ `#DIV/0!` (a risk-adjusted ratio from a single observation is
+///   meaningless; mirrors SHARPE for a consistent quant-aggregate contract)
+/// - zero downside deviation (`DD == 0`, i.e. NO period fell below `MAR`)
+///   ⇒ `#DIV/0!` (the denominator vanishes — surfaced loudly, never `+Inf`).
+///   Checked BEFORE `periods_per_year` so a denominator-degenerate series beats
+///   a bad frequency (same precedence as SHARPE's `stdev == 0` vs `ppy`).
+/// - `periods_per_year <= 0` ⇒ `#NUM!`
+fn compute_sortino(
+    returns: &[f64],
+    mar: f64,
+    periods_per_year: Option<f64>,
+) -> Result<f64, ErrorValue> {
+    if returns.is_empty() {
+        return Err(ErrorValue::Num);
+    }
+    if returns.len() < 2 {
+        return Err(ErrorValue::DivZero);
+    }
+    // `crate::welford::mean` uses the streaming (online) update -- the
+    // numerically-stable choice for ordinary return data (deliberately NOT a
+    // two-pass `sum/n`, which loses precision on ill-conditioned series). A
+    // documented consequence at the f64 magnitude EXTREME (Wave-A audit LOW,
+    // unreachable with real returns): for opposite-sign extremes like
+    // `[1.7e308, -1.7e308]` the online delta overflows so `mean` is `±Inf`
+    // even though a two-pass sum would cancel to a finite mean -- the guard
+    // below then surfaces #NUM!. Accepted: a loud error, never a silent wrong
+    // value (No-Fallbacks), and a two-pass mean would regress normal-data
+    // precision for a case real return series cannot reach.
+    let mean = match crate::welford::mean(returns) {
+        Some(m) => m,
+        None => return Err(ErrorValue::Num), // empty (already guarded)
+    };
+    // Numerator: mean(R) - MAR. Both finite (`collect_series` rejects non-finite
+    // cells; the scalar `mar` is `sanitize_f64`-screened), but the subtraction
+    // itself can overflow for extreme finite operands (e.g. mean ~ -1e308,
+    // MAR ~ +1e308) -> surface loudly as #NUM! rather than carry a non-finite
+    // numerator into the ratio (No-Fallbacks). NOTE (Wave-A audit LOW): at this
+    // magnitude extreme the #NUM! here may PRECEDE the no-downside #DIV/0! below
+    // (e.g. `[1.7e308, 1.7e308]`, MAR=-1.7e308). The documented "DD==0 ⇒ #DIV/0!
+    // before ppy" precedence holds for every input with a representable mean;
+    // both extreme outcomes are loud errors, so the ordering is cosmetic.
+    let excess_mean = mean - mar;
+    if !excess_mean.is_finite() {
+        return Err(ErrorValue::Num);
+    }
+    let n = returns.len() as f64;
+    // Downside deviation: DD = sqrt( (1/N) * Σ min(0, R_i - MAR)^2 ) -- the
+    // empyrical population-style (denominator N, ALL observations) convention.
+    //
+    // **Codex HIGH (Wave A audit) -- overflow/underflow-safe accumulation.**
+    // A naive `Σ shortfall^2` squares each shortfall directly, which OVERFLOWS
+    // to +Inf for large-but-finite returns (`(-1e200)^2`), producing dd=Inf and
+    // then a finite-but-WRONG ratio (mean/Inf -> -0.0) that `finish()` would
+    // silently accept -- and UNDERFLOWS to 0 for tiny returns (`(-1e-200)^2`),
+    // producing a spurious #DIV/0! where the true Sortino is finite. We instead
+    // use the standard scaled sum-of-squares (the `hypot` / BLAS `nrm2` trick):
+    // factor out `scale = max|shortfall|`, accumulate `Σ (shortfall/scale)^2`
+    // (each term in [0, 1], so the sum cannot overflow -- it is <= N), then
+    // `dd = scale * sqrt(ssq / N)`. This is bit-identical to the naive form on
+    // ordinary inputs (the divisions are exact when shortfall is a multiple of
+    // scale) but stays correct across the full finite range. `scale == 0` means
+    // EVERY shortfall is 0 (no downside) -> DD == 0 -> #DIV/0!, checked BEFORE
+    // `periods_per_year` (denominator-degenerate beats a bad frequency, mirroring
+    // SHARPE's `stdev == 0` vs `ppy` precedence).
+    let mut scale = 0.0_f64;
+    for &r in returns {
+        let shortfall = (r - mar).min(0.0);
+        if !shortfall.is_finite() {
+            return Err(ErrorValue::Num); // R_i - MAR overflowed (No-Fallbacks)
+        }
+        let mag = shortfall.abs();
+        if mag > scale {
+            scale = mag;
+        }
+    }
+    if scale == 0.0 {
+        return Err(ErrorValue::DivZero); // no downside at all -> DD == 0
+    }
+    let mut ssq = 0.0_f64;
+    for &r in returns {
+        let normalized = (r - mar).min(0.0) / scale; // in [-1, 0]
+        ssq += normalized * normalized;
+    }
+    let dd = scale * (ssq / n).sqrt();
+    if dd == 0.0 {
+        // Defensive: `scale > 0` already implies at least one nonzero shortfall,
+        // so dd > 0 here. Kept so a future refactor that breaks the invariant
+        // surfaces loudly rather than dividing by zero.
+        return Err(ErrorValue::DivZero);
+    }
+    let mut sr = excess_mean / dd;
+    if let Some(ppy) = periods_per_year {
+        if ppy <= 0.0 {
+            return Err(ErrorValue::Num);
+        }
+        sr *= ppy.sqrt();
+    }
+    Ok(sr)
+}
+
 /// `SHARPE(returns_range, [risk_free_rate=0], [periods_per_year])` —
 /// ex-post Sharpe ratio. See [`compute_sharpe`] for the exact semantics
 /// (sample stdev, optional √-frequency annualization, error contract).
@@ -1681,6 +1875,73 @@ pub fn max_drawdown(args: &[FnArg]) -> Value {
         Err(e) => return Value::Error(e),
     };
     finish(compute_max_drawdown(&series))
+}
+
+/// `VOLATILITY(returns_range, [periods_per_year])` — ex-post volatility (the
+/// sample stdev of the return series), optionally √-frequency annualized. See
+/// [`compute_volatility`] for the exact semantics + error contract.
+///
+/// RangeAwareFn: arg 0 MUST be a range (the return series); arg 1 (optional) is
+/// a scalar. A range in a scalar position, or a missing/extra arg, is `#VALUE!`.
+pub fn volatility(args: &[FnArg]) -> Value {
+    if !(1..=2).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let returns = match collect_series(&args[0]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let periods_per_year = if args.len() == 2 {
+        match &args[1] {
+            FnArg::Scalar(v) => match arg_num(v) {
+                Ok(n) => Some(n),
+                Err(e) => return Value::Error(e),
+            },
+            FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+        }
+    } else {
+        None
+    };
+    finish(compute_volatility(&returns, periods_per_year))
+}
+
+/// `SORTINO(returns_range, [mar=0], [periods_per_year])` — ex-post Sortino
+/// ratio (excess return over downside deviation). See [`compute_sortino`] for
+/// the exact semantics + error contract.
+///
+/// RangeAwareFn: arg 0 MUST be a range (the return series); args 1–2 are
+/// scalars. A range in a scalar position, or a missing/extra arg, is `#VALUE!`.
+pub fn sortino(args: &[FnArg]) -> Value {
+    if !(1..=3).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let returns = match collect_series(&args[0]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let mar = if args.len() >= 2 {
+        match &args[1] {
+            FnArg::Scalar(v) => match arg_num(v) {
+                Ok(n) => n,
+                Err(e) => return Value::Error(e),
+            },
+            FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+        }
+    } else {
+        0.0
+    };
+    let periods_per_year = if args.len() == 3 {
+        match &args[2] {
+            FnArg::Scalar(v) => match arg_num(v) {
+                Ok(n) => Some(n),
+                Err(e) => return Value::Error(e),
+            },
+            FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+        }
+    } else {
+        None
+    };
+    finish(compute_sortino(&returns, mar, periods_per_year))
 }
 
 // ===== W5-D-7 (Wave 3 closure — date-indexed cash flow): XNPV / XIRR =====
@@ -2718,6 +2979,343 @@ mod tests {
         assert_eq!(sharpe(&[ret]), Value::Error(ErrorValue::Num));
         let ret2 = r(vec![n(0.01), n(f64::NAN), n(0.02), n(0.03)]);
         assert_eq!(sharpe(&[ret2]), Value::Error(ErrorValue::Num));
+    }
+
+    // --- B2 (Wave A): VOLATILITY ---
+
+    #[test]
+    fn volatility_basic_sample_stdev() {
+        // [0.01,0.02,0.03,0.04]: sample stdev = sqrt(0.0005/3) = 0.0129099445
+        // — IDENTICAL to SHARPE's denominator on the same series.
+        let ret = r(vec![n(0.01), n(0.02), n(0.03), n(0.04)]);
+        approx(volatility(std::slice::from_ref(&ret)), 0.0129099445, 1e-9);
+    }
+
+    #[test]
+    fn volatility_annualized_sqrt_periods() {
+        // 0.0129099445 * sqrt(4) = 0.0258198890.
+        let ret = r(vec![n(0.01), n(0.02), n(0.03), n(0.04)]);
+        approx(volatility(&[ret, s(n(4.0))]), 0.0258198890, 1e-9);
+    }
+
+    #[test]
+    fn volatility_uses_sample_stdev_not_population() {
+        // Two-point series [1.0, 3.0]: sample stdev = sqrt(2) ≈ 1.4142135624
+        // (population stdev would be 1.0). Pins the sample-vs-population choice.
+        let ret = r(vec![n(1.0), n(3.0)]);
+        approx(
+            volatility(std::slice::from_ref(&ret)),
+            std::f64::consts::SQRT_2,
+            1e-12,
+        );
+    }
+
+    #[test]
+    fn volatility_constant_series_is_zero_not_error() {
+        // **THE distinguishing case from SHARPE:** a constant series has zero
+        // dispersion. SHARPE errors (#DIV/0! — it's the denominator), but
+        // VOLATILITY returns it: zero volatility is a valid statistic.
+        let ret = r(vec![n(0.02), n(0.02), n(0.02)]);
+        approx(volatility(std::slice::from_ref(&ret)), 0.0, 1e-12);
+        // ...and a constant series annualized is still 0.0 (0 * sqrt(ppy)).
+        let ret2 = r(vec![n(0.02), n(0.02), n(0.02)]);
+        approx(volatility(&[ret2, s(n(252.0))]), 0.0, 1e-12);
+    }
+
+    #[test]
+    fn volatility_empty_range_is_num() {
+        let empty = FnArg::Range {
+            values: vec![],
+            rows: 0,
+            cols: 0,
+        };
+        assert_eq!(volatility(&[empty]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn volatility_single_value_is_div_zero() {
+        // n=1: sample stdev undefined → #DIV/0! (matches STDEV.S / SHARPE).
+        let ret = r(vec![n(0.05)]);
+        assert_eq!(volatility(&[ret]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn volatility_non_positive_periods_is_num() {
+        let ret = r(vec![n(0.01), n(0.02), n(0.03)]);
+        assert_eq!(
+            volatility(&[ret.clone(), s(n(0.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            volatility(&[ret, s(n(-4.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn volatility_error_in_range_propagates() {
+        let ret = r(vec![n(0.01), Value::Error(ErrorValue::Ref), n(0.03)]);
+        assert_eq!(volatility(&[ret]), Value::Error(ErrorValue::Ref));
+    }
+
+    #[test]
+    fn volatility_non_finite_input_is_num() {
+        let ret = r(vec![n(0.01), n(f64::INFINITY), n(0.03)]);
+        assert_eq!(volatility(&[ret]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn volatility_scalar_first_arg_is_value_error() {
+        assert_eq!(volatility(&[s(n(0.05))]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn volatility_range_in_scalar_position_is_value_error() {
+        let ret = r(vec![n(0.01), n(0.02), n(0.03)]);
+        let ppy_range = r(vec![n(4.0)]);
+        assert_eq!(
+            volatility(&[ret, ppy_range]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn volatility_wrong_arity() {
+        assert_eq!(volatility(&[]), Value::Error(ErrorValue::Value));
+        let ret = r(vec![n(0.01), n(0.02), n(0.03)]);
+        assert_eq!(
+            volatility(&[ret, s(n(4.0)), s(n(0.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- B2 (Wave A): SORTINO ---
+
+    #[test]
+    fn sortino_basic_mar_zero() {
+        // [0.30,-0.10,0.10,-0.10], MAR=0: mean = 0.20/4 = 0.05.
+        // downside shortfalls min(0,r) = [0,-0.10,0,-0.10]; squared = [0,0.01,
+        // 0,0.01]; mean over ALL N=4 = 0.02/4 = 0.005; DD = sqrt(0.005) =
+        // 0.0707106781. SORTINO = 0.05/0.0707106781 = 1/sqrt(2) = 0.7071067812.
+        // (Dividing by the DOWNSIDE COUNT (2) instead of N would give DD=0.1 →
+        // ratio 0.5; this value pins the population-N empyrical convention.)
+        let ret = r(vec![n(0.30), n(-0.10), n(0.10), n(-0.10)]);
+        approx(
+            sortino(std::slice::from_ref(&ret)),
+            std::f64::consts::FRAC_1_SQRT_2,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn sortino_annualized_sqrt_periods() {
+        // 0.7071067812 * sqrt(4) = sqrt(2) = 1.4142135624 (SHARPE's convention).
+        let ret = r(vec![n(0.30), n(-0.10), n(0.10), n(-0.10)]);
+        approx(
+            sortino(&[ret, s(n(0.0)), s(n(4.0))]),
+            std::f64::consts::SQRT_2,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn sortino_with_mar_negative_ratio() {
+        // [0.02,-0.06,0.10,-0.02], MAR=0.02: mean = 0.04/4 = 0.01, numerator =
+        // mean-MAR = -0.01. Shortfalls min(0, r-0.02) = [0,-0.08,0,-0.04];
+        // squared sum = 0.0064+0.0016 = 0.008; /N=4 = 0.002; DD = sqrt(0.002) =
+        // 0.0447213595. SORTINO = -0.01/0.0447213595 = -1/sqrt(20) =
+        // -0.2236067977. Pins MAR handling, a negative ratio, AND the N
+        // denominator (downside-count=2 would give DD=0.0632 → ratio -0.158).
+        let ret = r(vec![n(0.02), n(-0.06), n(0.10), n(-0.02)]);
+        approx(sortino(&[ret, s(n(0.02))]), -0.2236067977, 1e-9);
+    }
+
+    #[test]
+    fn sortino_no_downside_is_div_zero() {
+        // Every return >= MAR → zero downside → DD == 0 → #DIV/0! (loud, never
+        // +Inf). [0.01,0.02,0.03] all > MAR=0.
+        let ret = r(vec![n(0.01), n(0.02), n(0.03)]);
+        assert_eq!(sortino(&[ret]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn sortino_no_downside_div_zero_beats_bad_periods() {
+        // Denominator-degenerate (DD==0) is checked BEFORE periods_per_year, so
+        // a no-downside series with ppy<=0 surfaces #DIV/0!, mirroring SHARPE's
+        // stdev==0-vs-ppy precedence.
+        let ret = r(vec![n(0.01), n(0.02), n(0.03)]);
+        assert_eq!(
+            sortino(&[ret, s(n(0.0)), s(n(0.0))]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn sortino_empty_range_is_num() {
+        let empty = FnArg::Range {
+            values: vec![],
+            rows: 0,
+            cols: 0,
+        };
+        assert_eq!(sortino(&[empty]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn sortino_single_value_is_div_zero() {
+        // n=1 → #DIV/0! (a one-sample risk-adjusted ratio is meaningless;
+        // mirrors SHARPE for a consistent quant-aggregate contract).
+        let ret = r(vec![n(-0.05)]);
+        assert_eq!(sortino(&[ret]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn sortino_non_positive_periods_is_num() {
+        // A genuine downside exists (DD>0), so the ppy guard is reached: ppy<=0
+        // → #NUM!.
+        let ret = r(vec![n(0.30), n(-0.10), n(0.10), n(-0.10)]);
+        assert_eq!(
+            sortino(&[ret.clone(), s(n(0.0)), s(n(0.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            sortino(&[ret, s(n(0.0)), s(n(-4.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn sortino_downside_deviation_uses_all_n_not_downside_count() {
+        // [0.10,-0.20,0.10,-0.20], MAR=0: mean = -0.20/4 = -0.05. Squared
+        // downside = 0.04+0.04 = 0.08; /N=4 = 0.02; DD = sqrt(0.02) =
+        // 0.1414213562; ratio = -0.05/0.1414213562 = -0.3535533906. Dividing
+        // by the downside COUNT (2) would give DD=0.2 → ratio -0.25; this
+        // explicitly pins the empyrical all-N denominator.
+        let ret = r(vec![n(0.10), n(-0.20), n(0.10), n(-0.20)]);
+        approx(sortino(std::slice::from_ref(&ret)), -0.3535533906, 1e-9);
+    }
+
+    #[test]
+    fn sortino_error_in_range_propagates() {
+        let ret = r(vec![n(0.01), Value::Error(ErrorValue::Ref), n(-0.03)]);
+        assert_eq!(sortino(&[ret]), Value::Error(ErrorValue::Ref));
+    }
+
+    #[test]
+    fn sortino_non_finite_input_is_num() {
+        let ret = r(vec![n(0.01), n(f64::NAN), n(-0.03)]);
+        assert_eq!(sortino(&[ret]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn sortino_scalar_first_arg_is_value_error() {
+        assert_eq!(sortino(&[s(n(0.05))]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn sortino_range_in_scalar_position_is_value_error() {
+        let ret = r(vec![n(0.30), n(-0.10), n(0.10)]);
+        let mar_range = r(vec![n(0.0)]);
+        assert_eq!(
+            sortino(&[ret.clone(), mar_range]),
+            Value::Error(ErrorValue::Value)
+        );
+        let ppy_range = r(vec![n(4.0)]);
+        assert_eq!(
+            sortino(&[ret, s(n(0.0)), ppy_range]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn sortino_wrong_arity() {
+        assert_eq!(sortino(&[]), Value::Error(ErrorValue::Value));
+        let ret = r(vec![n(0.30), n(-0.10), n(0.10)]);
+        assert_eq!(
+            sortino(&[ret, s(n(0.0)), s(n(4.0)), s(n(1.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn volatility_skips_text_and_bool_per_excel_canon() {
+        // Text + bool skipped; computation runs on [0.01,0.02,0.03,0.04].
+        let ret = r(vec![
+            n(0.01),
+            Value::text("label"),
+            n(0.02),
+            Value::Boolean(true),
+            n(0.03),
+            n(0.04),
+        ]);
+        approx(volatility(std::slice::from_ref(&ret)), 0.0129099445, 1e-9);
+    }
+
+    #[test]
+    fn sortino_skips_text_and_bool_per_excel_canon() {
+        // Text + bool skipped; computation runs on [0.30,-0.10,0.10,-0.10].
+        let ret = r(vec![
+            n(0.30),
+            Value::text("label"),
+            n(-0.10),
+            Value::Boolean(true),
+            n(0.10),
+            n(-0.10),
+        ]);
+        approx(
+            sortino(std::slice::from_ref(&ret)),
+            std::f64::consts::FRAC_1_SQRT_2,
+            1e-9,
+        );
+    }
+
+    // --- B2 (Wave A): numerical robustness (Codex HIGH closure) ---
+    // A naive `Σ shortfall^2` (SORTINO) / `Σ(x-mean)^2` (SHARPE/VOLATILITY via
+    // welford) overflows to +Inf or underflows to 0 for extreme-magnitude finite
+    // returns. SORTINO's self-contained downside uses a scaled sum-of-squares and
+    // stays CORRECT; SHARPE/VOLATILITY share welford with STDEV.S and instead
+    // surface #NUM! (loud, not a silent wrong result -- No-Fallbacks).
+
+    #[test]
+    fn sortino_overflow_large_inputs_stays_correct() {
+        // [-1e200, 0], MAR=0: a naive square (-1e200)^2 = +Inf -> dd=Inf ->
+        // ratio -0.0 (silent WRONG). Scaled DD: scale=1e200, ssq=1, dd=
+        // 1e200*sqrt(1/2), ratio = -5e199 / (1e200/sqrt2) = -1/sqrt(2). Correct.
+        let ret = r(vec![n(-1e200), n(0.0)]);
+        approx(
+            sortino(std::slice::from_ref(&ret)),
+            -std::f64::consts::FRAC_1_SQRT_2,
+            1e-12,
+        );
+    }
+
+    #[test]
+    fn sortino_underflow_tiny_inputs_stays_correct() {
+        // [-1e-200, 0], MAR=0: a naive square (-1e-200)^2 underflows to 0 ->
+        // dd=0 -> spurious #DIV/0!. Scaled DD recovers the true -1/sqrt(2).
+        let ret = r(vec![n(-1e-200), n(0.0)]);
+        approx(
+            sortino(std::slice::from_ref(&ret)),
+            -std::f64::consts::FRAC_1_SQRT_2,
+            1e-12,
+        );
+    }
+
+    #[test]
+    fn sharpe_overflow_input_is_num() {
+        // [-1e200, 0]: welford `sample_stdev` overflows to +Inf; without the
+        // finiteness guard `mean/Inf` is a finite -0.0 (silent wrong). Guarded
+        // -> #NUM! (loud).
+        let ret = r(vec![n(-1e200), n(0.0)]);
+        assert_eq!(sharpe(&[ret]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn volatility_overflow_input_is_num() {
+        // [-1e200, 0]: welford stdev overflows to +Inf; `finish()` sanitizes the
+        // non-finite result to #NUM! (loud), matching SHARPE -- pinned so a
+        // future change cannot regress it to a silent finite value.
+        let ret = r(vec![n(-1e200), n(0.0)]);
+        assert_eq!(volatility(&[ret]), Value::Error(ErrorValue::Num));
     }
 
     #[test]
