@@ -45,6 +45,7 @@
 import type { CellAddrJson, DiagnosticJson, FunctionMetadataJson, NamedRangeJson, NamedRangeTargetJson, NamedTargetJson, QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { matchNameForSelection } from '../../src/quantbook/shared/nameMatch';
 import { buildRefText, canPointAtRange, insertRefAtCaret, type RefSpan } from '../../src/quantbook/shared/formulaRangePick';
+import { computeFormulaRefHighlights } from '../../src/quantbook/shared/formulaRefHighlights';
 import { clampDisplayString, formatCellValue } from './cellRender';
 import {
 	buildSignatureLabel,
@@ -55,7 +56,7 @@ import {
 	type CompletionFunction,
 	type CompletionItem,
 } from './formulaIntel';
-import { CanvasGridRenderer, type ActiveCell, type PublishedRange } from './canvasGrid';
+import { CanvasGridRenderer, type ActiveCell, type PublishedRange, type RefHighlightRect } from './canvasGrid';
 // Icon overhaul (2026-06-10): every toolbar/menu glyph is a Google Material Symbols outlined icon
 // (the design system Google Sheets itself uses) -- see icons.ts for the Apache-2.0 attribution +
 // the normalization rules. The old hand-drawn 16px SVGs are gone.
@@ -1537,6 +1538,11 @@ let pointDrag: { anchor: { row: number; col: number }; pointerId: number; startV
 let pointPreview: SelectionRect | null = null;
 let pointInsertedSpan: RefSpan | null = null;
 let pointSuppressClick = false;
+// **FE-3 colored references**: the referenced cell/range boxes to outline on the grid while a formula is
+// being edited (Excel's colored ref boxes). An ADDITIVE, read-only render channel (mirrors `pointPreview`):
+// recomputed from `editState.editEl.value` by `updateRefHighlights()` at every value-change site + cleared
+// on edit teardown. It never writes a cell, never touches `editState`. Empty `[]` when not editing a formula.
+let activeRefHighlights: RefHighlightRect[] = [];
 let fillSuppressClick = false;
 // Click tolerance (CSS px) for grabbing the fill-handle square at the selection's bottom-right corner.
 const FILL_HANDLE_HIT_PX = 5;
@@ -2040,6 +2046,7 @@ const renderHost: RenderHost = {
 	publishedRanges: () => publishedRanges,
 	fillPreview: () => fillPreview,
 	pointPreview: () => pointPreview,
+	activeRefHighlights: () => activeRefHighlights,
 	// W3 frozen panes: the renderer is the single source of truth for the (clamped) frozen counts; the
 	// orchestrator's blit gate reads them through here. `setFrozen` clamped them, so these are always sane.
 	frozenRowCount: () => renderer.frozenRows,
@@ -2126,6 +2133,65 @@ function scheduleRedraw(): void {
 		redrawScheduled = false;
 		scrollRedraw();
 	});
+}
+
+/** True iff two ref-highlight sets are structurally identical (same length, same rect + colorIndex in
+ * order) -- the change-gate for {@link updateRefHighlights} so a keystroke that does not alter the
+ * referenced ranges does not force a grid repaint. */
+function refHighlightsEqual(a: readonly RefHighlightRect[], b: readonly RefHighlightRect[]): boolean {
+	if (a.length !== b.length) {
+		return false;
+	}
+	for (let i = 0; i < a.length; i += 1) {
+		const x = a[i];
+		const y = b[i];
+		if (
+			x.colorIndex !== y.colorIndex ||
+			x.rect.minRow !== y.rect.minRow || x.rect.maxRow !== y.rect.maxRow ||
+			x.rect.minCol !== y.rect.minCol || x.rect.maxCol !== y.rect.maxCol
+		) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * **FE-3 colored references** -- recompute the grid ref-highlight boxes from the LIVE editor value and
+ * publish them on the {@link activeRefHighlights} render channel. Returns whether the set CHANGED (the
+ * caller redraws on a change). When not editing (`editState === null`) the set is empty; otherwise it is the
+ * DRAWABLE refs (`rect !== null` -- unqualified same-sheet cells/ranges) from {@link computeFormulaRefHighlights}
+ * (a non-formula value yields `[]` there). Read-only over `editState.editEl.value`: it never writes a cell,
+ * never creates/nulls `editState`. The change-gate makes a no-op keystroke (one that does not alter the
+ * referenced ranges) free. This is the SINGLE place the channel is recomputed; it is called at every
+ * value-change site (typing, point insert, F4, completion) and the set is cleared on edit teardown.
+ */
+function updateRefHighlights(): boolean {
+	const next: RefHighlightRect[] = [];
+	if (editState !== null) {
+		// DEDUPE by target rect: `computeFormulaRefHighlights` returns one entry PER textual reference (so a
+		// future formula-text-coloring wave can tint every ref substring, duplicates included), but the GRID
+		// paints one box per distinct TARGET -- Excel outlines a reused ref (`=A1+A1+A1`) once. Without this,
+		// the renderer fills the same rect N times and its translucent wash stacks visibly darker. Identical
+		// targets already carry the same colorIndex upstream, so keeping the first occurrence is unambiguous.
+		const seen = new Set<string>();
+		for (const h of computeFormulaRefHighlights(editState.editEl.value)) {
+			if (h.rect === null) {
+				continue;
+			}
+			const key = h.rect.minRow + ',' + h.rect.minCol + ',' + h.rect.maxRow + ',' + h.rect.maxCol;
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
+			next.push({ rect: h.rect, colorIndex: h.colorIndex });
+		}
+	}
+	if (refHighlightsEqual(next, activeRefHighlights)) {
+		return false;
+	}
+	activeRefHighlights = next;
+	return true;
 }
 
 // --- Selection / navigation ---
@@ -2900,6 +2966,10 @@ function beginEdit(row: number, col: number, initialChar?: string, prefillBaseli
 	inputEl.hidden = false;
 	inputEl.style.clipPath = ''; // FE-2-0 polish: start unclipped; updateEditClip below sets it for this cell
 	editState = { editEl: inputEl, surface: 'overlay', sheet: fullSnapshot.sheet, row, col, entry, initialValue, prefillBaseline, pendingCommit: false };
+	// FE-3 colored references: seed the ref-highlight boxes off the prefill (a formula cell opens with its
+	// refs already boxed). State-only here -- the call sites (click / F2 / type-to-edit) redraw() right after
+	// beginEdit (as the NOTE below says), which paints these; redrawing here too would just double-paint.
+	updateRefHighlights();
 	updateEditClip(); // FE-2-0 polish: clip to the body pane (the cell may open partly under a sticky band)
 	inputEl.focus();
 	if (initialChar === undefined) {
@@ -2919,11 +2989,16 @@ function cancelEdit(): void {
 	// so a later pointerdown cannot replace a stale span or paint a ghost. (pointPreview is normally already
 	// null -- a drag ends on its own pointerup -- so the redraw is defensive: it only fires if a drag was
 	// interrupted by this non-pointer teardown, e.g. Escape mid-drag.)
-	const hadPointPreview = pointPreview !== null;
+	// FE-3 colored references: a closing editor also clears the ref-highlight boxes. cancelEdit is the SINGLE
+	// funnel that nulls editState (Escape / blur / commit-success via resolvePendingCommit / surface switch),
+	// so clearing here erases the boxes on EVERY close path. Folded into the same teardown redraw as the point
+	// preview so a close that leaves either on screen repaints exactly once to erase it.
+	const hadOverlayPaint = pointPreview !== null || activeRefHighlights.length > 0;
 	pointDrag = null;
 	pointInsertedSpan = null;
 	pointPreview = null;
-	if (hadPointPreview) {
+	activeRefHighlights = [];
+	if (hadOverlayPaint) {
 		redraw();
 	}
 	if (surface === 'overlay') {
@@ -3000,6 +3075,11 @@ function beginEditFormula(): void {
 	ensureFunctionListRequested();
 	scheduleValidate();
 	updateSignatureHint();
+	// FE-3 colored references: focusing the bar on a formula cell boxes its refs immediately. beginEditFormula
+	// has no unconditional grid redraw (only the anchor-collapse case repaints), so redraw here on a change.
+	if (updateRefHighlights()) {
+		redraw();
+	}
 }
 
 // ============================================================================
@@ -3249,6 +3329,12 @@ function acceptCompletion(idx: number): void {
 	// The value changed structurally -> re-validate (debounced) + recompute the signature hint.
 	scheduleValidate();
 	updateSignatureHint();
+	// FE-3 colored references: accepting a completion rewrote the value programmatically (no `input` event).
+	// A function-name completion rarely changes the referenced ranges, but refresh + redraw-on-change keeps
+	// the boxes correct for any case that does; acceptCompletion has no other grid repaint.
+	if (updateRefHighlights()) {
+		redraw();
+	}
 }
 
 /** Step the dropdown highlight (delta = -1 up / +1 down), wrapping. Re-renders only the affected rows' state
@@ -3645,6 +3731,12 @@ function onEditInput(ev: Event): void {
 		scheduleValidate();
 		updateSignatureHint();
 	}
+	// FE-3 colored references: a keystroke may add/remove/move a referenced range -> refresh the boxes. The
+	// change-gate makes a no-op keystroke (one not altering the refs) free; onEditInput has no other grid
+	// repaint, so this is the redraw trigger when the set changes. Runs for BOTH surfaces (overlay + bar).
+	if (updateRefHighlights()) {
+		redraw();
+	}
 }
 /**
  * **FE-4 F4** -- cycle the abs/rel anchoring of the ref the caret is on, in the LIVE editor (either surface).
@@ -3681,6 +3773,12 @@ function applyRefCycle(): boolean {
 			updateCompletion(false);
 		}
 	}
+	// FE-3 colored references: F4 rewrote the value programmatically (no `input` event). Toggling abs/rel keeps
+	// the SAME target, so the box set is normally unchanged (the change-gate then skips the redraw); refresh
+	// anyway so any edge that does alter a ref re-boxes. F4 has no other grid repaint, so redraw on a change.
+	if (updateRefHighlights()) {
+		redraw();
+	}
 	return true;
 }
 
@@ -3714,6 +3812,10 @@ function applyPointInsert(rect: SelectionRect): void {
 		scheduleValidate();
 		updateSignatureHint();
 	}
+	// FE-3 colored references: the just-pointed ref changed the value -> refresh the boxes. STATE-ONLY (no
+	// redraw): EVERY applyPointInsert caller (the pointerdown / pointermove / pointerup point-drag handlers)
+	// redraw() immediately after, which paints these; redrawing here too would double-paint on every move.
+	updateRefHighlights();
 }
 
 function onEditKeydown(ev: KeyboardEvent): void {
@@ -4255,6 +4357,10 @@ canvasEl.addEventListener('pointercancel', ev => {
 				scheduleValidate();
 				updateSignatureHint();
 			}
+			// FE-3 colored references: the revert restored the pre-drag value programmatically, so the boxes set
+			// during the drag (by applyPointInsert) are now STALE -- recompute off the reverted value. STATE-ONLY:
+			// the redraw() below paints it (calling redraw here too would double-paint this teardown).
+			updateRefHighlights();
 		}
 		pointDrag = null;
 		pointPreview = null;

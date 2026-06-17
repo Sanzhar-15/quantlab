@@ -58,6 +58,11 @@ const FILL_HANDLE_PX = 6;
 // W-G bound-cell indicator: side length (CSS px) of the filled corner triangle marking a cell a reactive
 // published variable drives. A small top-right marker (the Excel note-marker convention).
 const PUBLISHED_BADGE_PX = 7;
+// FE-3 colored references: stroke width (CSS px) of a formula ref-highlight box, and the alpha of its faint
+// interior fill wash. 2px matches the selection ring's weight (it reads as a deliberate outline, not a
+// gridline); the low fill alpha tints the referenced range without obscuring its cell values.
+const REF_HIGHLIGHT_PX = 2;
+const REF_HIGHLIGHT_FILL_ALPHA = 0.10;
 
 /**
  * **FE-2-0 Phase 3 (2026-06-04)** -- when true, every partial paint ({@link CanvasGridRenderer.drawScroll}
@@ -162,6 +167,21 @@ export interface PublishedRange {
 }
 
 /**
+ * **FE-3 colored references (grid ref-highlighting)** -- one referenced cell/range to outline on the grid
+ * while a formula is being edited (Excel's colored ref boxes). `rect` is the inclusive 0-based grid rect (a
+ * single cell is `min === max`; a range `A1:B2` is one rect); `colorIndex` is the reference's distinct-target
+ * color SLOT (an UNBOUNDED index from `computeFormulaRefHighlights` -- the renderer takes it modulo the
+ * {@link Palette.refHighlightColors} length, so identical refs share a hue and the module never needs the
+ * palette size). The host computes these (only unqualified same-sheet refs are drawable) + threads them in;
+ * the renderer paints one 2px stroked box per entry. An additive, independent channel (mirrors
+ * `pointPreview`); it never affects cell content / selection.
+ */
+export interface RefHighlightRect {
+	readonly rect: SelectionRect;
+	readonly colorIndex: number;
+}
+
+/**
  * **FE megaudit M7 (2026-06-03)** -- module-level "already warned" guard for the theme/font CSS-var
  * reads. VS Code always injects the `--vscode-*` variables, so a missing one signals a broken
  * host/theme context; the renderer still falls back to a hardcoded default (so it draws SOMETHING
@@ -256,6 +276,12 @@ interface Palette {
 	// Tables wave: a structured table's OUTER border stroke (mid-strength neutral, heavier than gridlines;
 	// flips light/dark like `border`).
 	tableBorder: string;
+	// FE-3 colored references: the rotating palette for the formula ref-highlight boxes (Excel's colored ref
+	// boxes). A {@link RefHighlightRect.colorIndex} indexes this MODULO its length, so the box hues cycle. The
+	// hues are distinct, legible on light + dark, and sourced from the theme `--vscode-charts-*` tokens (with
+	// hex fallbacks); deliberately a SEPARATE list from `selectionBorder`/`publishedBadge` so a ref box never
+	// reads as the selection ring or a bound-cell badge. Always non-empty (the renderer moduloes by `length`).
+	refHighlightColors: readonly string[];
 }
 
 /** **Tables wave (2026-06-13)** -- a half-open cell-INDEX range of the pane currently being painted (the
@@ -443,6 +469,7 @@ export class CanvasGridRenderer {
 		publishedRanges: readonly PublishedRange[];
 		fillPreview: SelectionRect | null;
 		pointPreview: SelectionRect | null;
+		refHighlights: readonly RefHighlightRect[];
 	} | null = null;
 	private readonly measureCache = new Map<string, number>();
 	/**
@@ -645,6 +672,7 @@ export class CanvasGridRenderer {
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
 		pointPreview: SelectionRect | null,
+		refHighlights: readonly RefHighlightRect[],
 	): void {
 		// **Codex MED (2026-06-10) -- stale header hover on scroll.** The hover wash only updates on canvas
 		// mousemove/mouseleave; when the grid SCROLLS under a stationary pointer, the remembered header index
@@ -659,11 +687,11 @@ export class CanvasGridRenderer {
 			this.hoveredHeaderRow = -1;
 		}
 		this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights);
 		this.hasPaintedOnce = true;
 		// Sheets retheme (header hover): remember this full-draw's inputs so a hover-only change can replay an
 		// identical full redraw with the new hovered-header index, without routing back through the host.
-		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview };
+		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights };
 	}
 
 	/**
@@ -687,6 +715,7 @@ export class CanvasGridRenderer {
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
 		pointPreview: SelectionRect | null,
+		refHighlights: readonly RefHighlightRect[],
 	): void {
 		const ctx = this.ctx;
 		const c = blit.copy;
@@ -713,7 +742,7 @@ export class CanvasGridRenderer {
 			ctx.beginPath();
 			ctx.rect(d.x, d.y, d.width, d.height);
 			ctx.clip();
-			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview);
+			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights);
 			ctx.restore();
 		}
 		// 3. Codex MED (stale hover): when the previous frame carried a hover wash, repaint the FULL sticky
@@ -730,15 +759,15 @@ export class CanvasGridRenderer {
 			ctx.rect(0, 0, this.gutterW, cssHeight); // the row-number gutter (full height, incl. frozen labels)
 			ctx.rect(0, 0, cssWidth, HEADER_HEIGHT); // the column-letter band (full width)
 			ctx.clip();
-			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview);
+			this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights);
 			ctx.restore();
 		}
 		this.hasPaintedOnce = true;
 		// Sheets retheme (header hover): a scroll updates the inputs a hover replay must use (new scrollTop/
 		// scrollLeft). Capture the post-scroll tuple so a hover wash lands on the correct header at this offset.
-		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview };
+		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights };
 		if (DEBUG_BLIT_VERIFY) {
-			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, 'drawScroll');
+			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights, 'drawScroll');
 		}
 	}
 
@@ -762,6 +791,7 @@ export class CanvasGridRenderer {
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
 		pointPreview: SelectionRect | null,
+		refHighlights: readonly RefHighlightRect[],
 	): void {
 		if (rows.length === 0) {
 			return;
@@ -815,14 +845,14 @@ export class CanvasGridRenderer {
 		}
 		addBand(runStart, runEnd);
 		ctx.clip();
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights);
 		ctx.restore();
 		this.hasPaintedOnce = true;
 		// Sheets retheme (header hover): keep the replay tuple current with the latest host-driven state (a
 		// damage paint can change errorCells / active / selection at the same scroll the hover replay reuses).
-		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview };
+		this.lastDrawArgs = { cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights };
 		if (DEBUG_BLIT_VERIFY) {
-			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, 'drawDamage');
+			this.verifyAgainstFull(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights, 'drawDamage');
 		}
 	}
 
@@ -844,6 +874,7 @@ export class CanvasGridRenderer {
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
 		pointPreview: SelectionRect | null,
+		refHighlights: readonly RefHighlightRect[],
 		path: string,
 	): void {
 		const ctx = this.ctx;
@@ -851,7 +882,7 @@ export class CanvasGridRenderer {
 		const bh = this.canvas.height;
 		const partial = ctx.getImageData(0, 0, bw, bh);
 		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview);
+		this.paintWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights);
 		const full = ctx.getImageData(0, 0, bw, bh);
 		const pa = partial.data;
 		const fu = full.data;
@@ -903,6 +934,7 @@ export class CanvasGridRenderer {
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
 		pointPreview: SelectionRect | null,
+		refHighlights: readonly RefHighlightRect[],
 	): void {
 		const ctx = this.ctx;
 		// Sheets retheme: remember the scroll this frame painted at, so the cursor hit-test can place the
@@ -948,7 +980,7 @@ export class CanvasGridRenderer {
 		this.paintCellRegion(
 			bodyRowRange, bodyColRange, scrollTop, scrollLeft, gutterW,
 			bodyLeft, bodyTop, cssWidth, cssHeight,
-			errorCells, active, selection, publishedRanges, fillPreview, pointPreview,
+			errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights,
 		);
 
 		// 2. FROZEN-COLS pane (bottom-left): cols [0, fCols) pinned on X (effScrollLeft=0), rows scroll. Only
@@ -957,7 +989,7 @@ export class CanvasGridRenderer {
 			this.paintCellRegion(
 				bodyRowRange, { startIdx: 0, endIdx: frozenColEnd }, scrollTop, 0, gutterW,
 				gutterW, bodyTop, bodyLeft, cssHeight,
-				errorCells, active, selection, publishedRanges, fillPreview, pointPreview,
+				errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights,
 			);
 		}
 
@@ -967,7 +999,7 @@ export class CanvasGridRenderer {
 			this.paintCellRegion(
 				{ startIdx: 0, endIdx: frozenRowEnd }, bodyColRange, 0, scrollLeft, gutterW,
 				bodyLeft, HEADER_HEIGHT, cssWidth, bodyTop,
-				errorCells, active, selection, publishedRanges, fillPreview, pointPreview,
+				errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights,
 			);
 		}
 
@@ -977,7 +1009,7 @@ export class CanvasGridRenderer {
 			this.paintCellRegion(
 				{ startIdx: 0, endIdx: frozenRowEnd }, { startIdx: 0, endIdx: frozenColEnd }, 0, 0, gutterW,
 				gutterW, HEADER_HEIGHT, bodyLeft, bodyTop,
-				errorCells, active, selection, publishedRanges, fillPreview, pointPreview,
+				errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights,
 			);
 		}
 
@@ -1173,6 +1205,7 @@ export class CanvasGridRenderer {
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
 		pointPreview: SelectionRect | null,
+		refHighlights: readonly RefHighlightRect[],
 	): void {
 		const ctx = this.ctx;
 		if (clipX1 <= clipX0 || clipY1 <= clipY0 || rowRange.endIdx <= rowRange.startIdx || colRange.endIdx <= colRange.startIdx) {
@@ -1454,6 +1487,44 @@ export class CanvasGridRenderer {
 			ctx.lineWidth = 1;
 			ctx.setLineDash([3, 2]);
 			ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
+			ctx.restore();
+		}
+
+		// 4c-3. FE-3 colored references: one SOLID 2px colored box per referenced cell/range in the formula
+		// being edited (Excel's colored ref boxes). Painted AFTER the point-mode preview (4c-2) and BEFORE the
+		// fill handle (4d) so the small fill square stays on top. Each highlight strokes ONE rect for its whole
+		// range (NOT per-cell, unlike the published badges) -> O(refs) per pane, cheap even on `A1:Z100000`. The
+		// `colorIndex` cycles the palette modulo its length (identical refs already share a slot upstream). A
+		// faint matching fill wash reads as "this range is referenced" without obscuring cell values. Each box is
+		// intersected against the pane's visible window (the pane clip also keeps any bleed inside the pane), and
+		// skipped if the palette is somehow empty (defensive -- readPalette always populates it).
+		const refColors = this.palette.refHighlightColors;
+		if (refHighlights.length > 0 && refColors.length > 0) {
+			ctx.save();
+			ctx.lineWidth = REF_HIGHLIGHT_PX;
+			const o = REF_HIGHLIGHT_PX / 2;
+			for (const h of refHighlights) {
+				const rh = h.rect;
+				if (
+					rh.maxRow < rowRange.startIdx || rh.minRow >= rowRange.endIdx ||
+					rh.maxCol < colRange.startIdx || rh.minCol >= colRange.endIdx
+				) {
+					continue; // this referenced range does not intersect the pane's visible window
+				}
+				// colorIndex is >= 0 for every drawable highlight (the host filters out the -1 non-drawables), but
+				// guard defensively so a stray negative can never index from the end of the palette array.
+				const color = refColors[((h.colorIndex % refColors.length) + refColors.length) % refColors.length];
+				const rx = Math.round(colX(rh.minCol, gutterW) - effScrollLeft);
+				const ry = Math.round(rowY(rh.minRow) - effScrollTop);
+				const rw = Math.round(colX(rh.maxCol + 1, gutterW) - effScrollLeft) - rx;
+				const ryh = Math.round(rowY(rh.maxRow + 1) - effScrollTop) - ry;
+				ctx.fillStyle = color;
+				ctx.globalAlpha = REF_HIGHLIGHT_FILL_ALPHA;
+				ctx.fillRect(rx, ry, rw, ryh);
+				ctx.globalAlpha = 1;
+				ctx.strokeStyle = color;
+				ctx.strokeRect(rx + o, ry + o, rw - REF_HIGHLIGHT_PX, ryh - REF_HIGHLIGHT_PX);
+			}
 			ctx.restore();
 		}
 
@@ -1793,7 +1864,7 @@ export class CanvasGridRenderer {
 			if (a === null) {
 				return;
 			}
-			this.draw(a.cssWidth, a.cssHeight, a.scrollTop, a.scrollLeft, a.errorCells, a.active, a.selection, a.publishedRanges, a.fillPreview, a.pointPreview);
+			this.draw(a.cssWidth, a.cssHeight, a.scrollTop, a.scrollLeft, a.errorCells, a.active, a.selection, a.publishedRanges, a.fillPreview, a.pointPreview, a.refHighlights);
 		});
 	}
 
@@ -1917,6 +1988,20 @@ export class CanvasGridRenderer {
 			// Tables wave: the outer border flips light/dark (a dark stroke on a light editor, light on dark) so
 			// the table extent stays legible on both -- the same light/dark split as the gridline `border`.
 			tableBorder: isDark ? TABLE_BORDER_COLOR_DARK : TABLE_BORDER_COLOR_LIGHT,
+			// FE-3 colored references: the rotating ref-box palette, sourced from the theme chart hues (the same
+			// `--vscode-charts-*` family `publishedBadge` reads). Six visually-distinct hues so adjacent refs in a
+			// formula stay tellable apart; the renderer cycles through them modulo length. Each hue gets a hex
+			// fallback (the `v` helper warns once + uses it if the theme omits the var), so the list is always
+			// non-empty + fully populated. Order chosen for max adjacent contrast (blue, orange, green, purple,
+			// red, yellow) -- the first ref (the common single-ref case) is the brand-adjacent blue.
+			refHighlightColors: [
+				v('--vscode-charts-blue', '#4f9cff'),
+				v('--vscode-charts-orange', '#d8843b'),
+				v('--vscode-charts-green', '#89d185'),
+				v('--vscode-charts-purple', '#b180d7'),
+				v('--vscode-charts-red', '#f14c4c'),
+				v('--vscode-charts-yellow', '#d7ba7d'),
+			],
 		};
 	}
 

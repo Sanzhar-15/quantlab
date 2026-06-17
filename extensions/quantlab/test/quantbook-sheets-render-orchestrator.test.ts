@@ -22,7 +22,7 @@
 import * as assert from 'assert';
 
 import type { QuantbookCellSnapshot, QuantbookCellValue } from '../src/quantbook/types';
-import type { ActiveCell, PublishedRange } from '../webview/sheets-webview/canvasGrid';
+import type { ActiveCell, PublishedRange, RefHighlightRect } from '../webview/sheets-webview/canvasGrid';
 import type { SelectionRect } from '../webview/sheets-webview/gridLayoutA1';
 import { RenderOrchestrator, type GridRenderer, type RenderHost, type Viewport } from '../webview/sheets-webview/renderOrchestrator';
 
@@ -102,6 +102,9 @@ class FakeHost implements RenderHost {
 	}
 	pointPreview(): SelectionRect | null {
 		return null;
+	}
+	activeRefHighlights(): readonly RefHighlightRect[] {
+		return [];
 	}
 	frozenRowCount(): number {
 		return this.frozenRows;

@@ -29,7 +29,7 @@
  */
 
 import type { QuantbookCellSnapshot } from '../../src/quantbook/types';
-import type { ActiveCell, PublishedRange } from './canvasGrid';
+import type { ActiveCell, PublishedRange, RefHighlightRect } from './canvasGrid';
 import { computeScrollBlitA1, diffSnapshotsA1, errorRowsFlippedA1, type ScrollBlit, type ScrollState } from './gridBlitA1';
 import { frozenColsWidth, frozenRowsHeight, type SelectionRect } from './gridLayoutA1';
 
@@ -64,6 +64,7 @@ export interface GridRenderer {
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
 		pointPreview: SelectionRect | null,
+		refHighlights: readonly RefHighlightRect[],
 	): void;
 	drawScroll(
 		blit: ScrollBlit,
@@ -77,6 +78,7 @@ export interface GridRenderer {
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
 		pointPreview: SelectionRect | null,
+		refHighlights: readonly RefHighlightRect[],
 	): void;
 	drawDamage(
 		rows: readonly number[],
@@ -90,6 +92,7 @@ export interface GridRenderer {
 		publishedRanges: readonly PublishedRange[],
 		fillPreview: SelectionRect | null,
 		pointPreview: SelectionRect | null,
+		refHighlights: readonly RefHighlightRect[],
 	): void;
 }
 
@@ -116,6 +119,9 @@ export interface RenderHost {
 	fillPreview(): SelectionRect | null;
 	/** **FE-3 range-pick / point mode** -- the cell/range being pointed into the formula being edited, or null. */
 	pointPreview(): SelectionRect | null;
+	/** **FE-3 colored references** -- the referenced cell/range boxes to outline while editing a formula (empty
+	 * when not editing a formula / no drawable refs). An additive read-only channel, like {@link pointPreview}. */
+	activeRefHighlights(): readonly RefHighlightRect[];
 	/**
 	 * **W3 frozen panes** -- the number of PINNED leading rows / cols. The blit decision reads these to
 	 * exclude the frozen bands from the scroll copy + repaint them as part of the exposed strip; `0/0` keeps
@@ -188,7 +194,7 @@ export class RenderOrchestrator {
 		const v = host.viewport();
 		renderer.resize(v.cssW, v.cssH);
 		host.applyCanvasTransform(v.scrollTop, v.scrollLeft);
-		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview(), host.pointPreview());
+		renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview(), host.pointPreview(), host.activeRefHighlights());
 		this.prevPaint = this.scrollStateNow(v);
 		host.onAfterFullRedraw();
 	}
@@ -224,10 +230,11 @@ export class RenderOrchestrator {
 		const published = host.publishedRanges();
 		const fill = host.fillPreview();
 		const point = host.pointPreview();
+		const refHi = host.activeRefHighlights();
 		if (blit === null) {
-			renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, active, sel, published, fill, point);
+			renderer.draw(v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, active, sel, published, fill, point, refHi);
 		} else {
-			renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, active, sel, published, fill, point);
+			renderer.drawScroll(blit, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, active, sel, published, fill, point, refHi);
 		}
 		this.prevPaint = next;
 		host.onAfterScroll();
@@ -299,7 +306,7 @@ export class RenderOrchestrator {
 		// Scroll is unchanged (gated above), so the canvas transform + prevPaint stay valid; drawDamage is
 		// a no-op for an empty row set (nothing painted changed).
 		host.applyCanvasTransform(v.scrollTop, v.scrollLeft);
-		renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview(), host.pointPreview());
+		renderer.drawDamage(damageRows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview(), host.pointPreview(), host.activeRefHighlights());
 		// The damage path bypasses redraw(); if the active cell's content changed (e.g. a commit
 		// re-render), the formula bar must still follow it.
 		host.onAfterDamage();
@@ -322,7 +329,7 @@ export class RenderOrchestrator {
 		if (!forceFullRedraw && renderer.painted && !renderer.backingScaleStale && this.scrollUnchangedSince(v)) {
 			const rows = errorRowsFlippedA1(prevErrorKeys, new Set(host.errorCells.keys()));
 			host.applyCanvasTransform(v.scrollTop, v.scrollLeft);
-			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview(), host.pointPreview());
+			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview(), host.pointPreview(), host.activeRefHighlights());
 		} else {
 			// A selection realign (forceFullRedraw) repaints both the old + new selection rows -> full redraw.
 			this.redraw();
