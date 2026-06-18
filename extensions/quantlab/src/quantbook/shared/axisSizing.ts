@@ -38,6 +38,11 @@ export interface AxisSizing {
 	readonly minSize: number;
 	/** Inclusive upper clamp for an override size (e.g. `MAX_COL_WIDTH`); a larger override throws. */
 	readonly maxSize: number;
+	/** Cap on the TOTAL extent (summed sizes of all indices), or `Infinity` for no cap. {@link withOverride}
+	 *  throws if a resize would push {@link totalExtent} past it. `Infinity` for the COLUMN axis (its extent
+	 *  stays far under the element-size limit); FINITE for the ROW axis, whose `MAX_ROWS` extent can approach
+	 *  the ~33.5M-px Chromium spacer cap. */
+	readonly maxTotalExtent: number;
 	/** Resized indices only (`index -> px size`); a non-overridden index is `defaultSize`. Canonical:
 	 *  an entry equal to `defaultSize` is never stored (so `overrides.size === 0` <=> uniform). */
 	readonly overrides: ReadonlyMap<number, number>;
@@ -71,6 +76,7 @@ function build(
 	count: number,
 	minSize: number,
 	maxSize: number,
+	maxTotalExtent: number,
 	overrides: Map<number, number>,
 ): AxisSizing {
 	const sortedKeys = Array.from(overrides.keys()).sort((a, b) => a - b);
@@ -81,7 +87,7 @@ function build(
 		const size = overrides.get(sortedKeys[i]) as number;
 		prefixExtra[i + 1] = prefixExtra[i] + (size - defaultSize);
 	}
-	return { defaultSize, count, minSize, maxSize, overrides, sortedKeys, prefixExtra };
+	return { defaultSize, count, minSize, maxSize, maxTotalExtent, overrides, sortedKeys, prefixExtra };
 }
 
 /**
@@ -95,6 +101,7 @@ export function emptyAxisSizing(
 	count: number,
 	minSize: number,
 	maxSize: number,
+	maxTotalExtent: number = Infinity,
 ): AxisSizing {
 	if (!Number.isFinite(defaultSize) || defaultSize <= 0) {
 		throw new Error(`AxisSizing: defaultSize must be a positive finite number, got ${defaultSize}`);
@@ -108,7 +115,13 @@ export function emptyAxisSizing(
 	if (defaultSize < minSize || defaultSize > maxSize) {
 		throw new Error(`AxisSizing: defaultSize ${defaultSize} outside clamp bounds [${minSize}, ${maxSize}]`);
 	}
-	return build(defaultSize, count, minSize, maxSize, new Map());
+	// `maxTotalExtent` caps the summed size of all indices (the ROW axis can approach the ~33.5M-px
+	// Chromium spacer limit; columns pass `Infinity`). It must at least admit the uniform baseline, else
+	// the empty model itself would violate the cap -- a config bug that must fail loud (No-Fallbacks).
+	if (maxTotalExtent !== Infinity && (!Number.isFinite(maxTotalExtent) || maxTotalExtent < count * defaultSize)) {
+		throw new Error(`AxisSizing: maxTotalExtent ${maxTotalExtent} must be Infinity or >= base extent ${count * defaultSize}`);
+	}
+	return build(defaultSize, count, minSize, maxSize, maxTotalExtent, new Map());
 }
 
 /**
@@ -131,7 +144,15 @@ export function withOverride(s: AxisSizing, index: number, size: number): AxisSi
 		}
 		next.set(index, size);
 	}
-	return build(s.defaultSize, s.count, s.minSize, s.maxSize, next);
+	const result = build(s.defaultSize, s.count, s.minSize, s.maxSize, s.maxTotalExtent, next);
+	// No-Fallbacks spacer cap (the ROW axis): a resize that would push the total extent past the
+	// element-size limit must fail loud, never silently produce a clamped/broken scrollbar. `Infinity`
+	// for columns => this never fires (byte-identical to the pre-cap model).
+	const extent = totalExtent(result);
+	if (extent > s.maxTotalExtent) {
+		throw new Error(`AxisSizing.withOverride: total extent ${extent} exceeds cap ${s.maxTotalExtent}`);
+	}
+	return result;
 }
 
 /** The px size of one index: its override, or `defaultSize`. O(1). */

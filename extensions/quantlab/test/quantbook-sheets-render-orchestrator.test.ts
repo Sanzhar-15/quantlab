@@ -79,6 +79,7 @@ class FakeHost implements RenderHost {
 	frozenCols = 0;
 	splitActive = false; // Wave F window split: settable so a test can drive the split-forces-full gate
 	colSized = false; // Wave G column sizing: settable so a test can drive the sized-forces-full gate
+	rowSized = false; // Wave G-rows row sizing: settable so a test can drive the row-sized-forces-full gate
 	transforms: { scrollTop: number; scrollLeft: number }[] = [];
 	afterFull = 0;
 	afterScroll = 0;
@@ -119,6 +120,9 @@ class FakeHost implements RenderHost {
 	}
 	hasColSizingOverrides(): boolean {
 		return this.colSized;
+	}
+	hasRowSizingOverrides(): boolean {
+		return this.rowSized;
 	}
 	applyCanvasTransform(scrollTop: number, scrollLeft: number): void {
 		this.transforms.push({ scrollTop, scrollLeft });
@@ -222,6 +226,20 @@ suite('FE-2 render orchestrator -- scrollRedraw (blit fast path)', function () {
 		orch.scrollRedraw();
 		assert.strictEqual(renderer.calls.length, 1);
 		assert.strictEqual(renderer.calls[0].kind, 'draw', 'a resized column forces the full draw, never a blit');
+	});
+
+	test('Wave G-rows: while a row is resized, the SAME clean scroll declines the blit -> full draw', () => {
+		const { host, renderer, orch } = make();
+		host.vp = { scrollTop: 0, scrollLeft: 0, cssW: 800, cssH: 600 };
+		orch.redraw();
+		renderer.calls.length = 0;
+		// Identical clean vertical scroll to the blit test above -- the ONLY difference is a ROW is sized. Proves
+		// the gates actually read `hasRowSizingOverrides` (a col-only test would miss a forgotten OR term).
+		host.rowSized = true;
+		host.vp = { scrollTop: 120, scrollLeft: 0, cssW: 800, cssH: 600 };
+		orch.scrollRedraw();
+		assert.strictEqual(renderer.calls.length, 1);
+		assert.strictEqual(renderer.calls[0].kind, 'draw', 'a resized row forces the full draw, never a blit');
 	});
 
 	test('a resize (cssH change) during scroll declines the blit -> full draw', () => {

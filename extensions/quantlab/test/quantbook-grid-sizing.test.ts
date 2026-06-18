@@ -28,21 +28,38 @@ import {
 	COL_WIDTH,
 	HEADER_HEIGHT,
 	MAX_COLS,
+	MAX_ROWS,
 	MIN_COL_WIDTH,
 	MAX_COL_WIDTH,
+	MIN_ROW_HEIGHT,
+	MAX_ROW_HEIGHT,
+	MAX_SPACER_PX,
 	ROW_HEIGHT,
 	cellContentRect,
+	clampSplitScroll,
 	colResizeBorderAt,
 	colX,
 	computeVisibleBodyColRange,
+	computeVisibleBodyRowRange,
 	computeVisibleColRange,
 	frozenColsWidth,
+	frozenRowsHeight,
 	getColSizing,
+	getRowSizing,
 	hitTestContent,
+	hitTestViewportFrozen,
 	resetColSizing,
+	resetRowSizing,
+	rowResizeBorderAt,
+	rowResizeBorderAtSplit,
+	rowY,
 	setColSizing,
+	setRowSizing,
+	splitPaneRowRanges,
+	totalContentHeight,
 	totalContentWidth,
 } from '../webview/sheets-webview/gridLayoutA1';
+import { computeVisibleRowRange } from '../webview/sheets-webview/cellRender';
 
 // Representative column config (matches the live grid: COL_WIDTH=100, MAX_COLS=16384). The pure model
 // is axis-generic, so these are just concrete params -- the gridLayoutA1 suite ties them to the real grid.
@@ -331,5 +348,247 @@ suite('Wave G gridLayoutA1 -- colResizeBorderAt (the resize-cursor / drag hit-te
 		assert.strictEqual(colResizeBorderAt(dividerX - 3, 500, G, 2), 1); // left side, within GRAB
 		// A point well into the body (past the seam + GRAB) is NOT the divider.
 		assert.notStrictEqual(colResizeBorderAt(dividerX + 40, 500, G, 2), 1);
+	});
+});
+
+// === Wave G-rows: variable ROW-HEIGHT sizing ======================================================
+// The model is the same axis-generic AxisSizing; these suites pin the ROW binding wired through
+// gridLayoutA1 (rowY / cellContentRect-height / totalContentHeight / frozenRowsHeight / hitTestContent /
+// hitTestViewportFrozen / computeVisibleBodyRowRange / splitPaneRowRanges / clampSplitScroll /
+// rowResizeBorderAt) + the cellRender computeVisibleRowRange, plus the row-specific spacer-extent cap.
+const rowModel = () => emptyAxisSizing(ROW_HEIGHT, MAX_ROWS, MIN_ROW_HEIGHT, MAX_ROW_HEIGHT, MAX_SPACER_PX - HEADER_HEIGHT);
+
+suite('Wave G-rows axisSizing -- total-extent cap (the row spacer guard; columns are uncapped)', function () {
+	// A SMALL capped model so the cap is reachable in a unit test (the live row model has ~7.8M px of headroom):
+	// base extent = 100 * 10 = 1000; cap = 1500 (headroom 500).
+	const capped = () => emptyAxisSizing(10, 100, 1, 1000, 1500);
+
+	test('withOverride within the cap succeeds', () => {
+		assert.strictEqual(totalExtent(withOverride(capped(), 0, 500)), 1490); // +490 -> 1490 <= 1500
+	});
+
+	test('withOverride that would exceed the cap throws (No-Fallbacks)', () => {
+		assert.throws(() => withOverride(capped(), 0, 600)); // +590 -> 1590 > 1500
+	});
+
+	test('the cap is cumulative across overrides', () => {
+		const s = withOverride(capped(), 0, 400); // +390 -> 1390
+		assert.strictEqual(totalExtent(s), 1390);
+		assert.throws(() => withOverride(s, 1, 200)); // +190 -> 1580 > 1500
+	});
+
+	test('exact boundary: total === cap is ALLOWED, total === cap + 1 throws', () => {
+		// base 1000, cap 1500. Override 0 -> 510 gives extra +500 -> total EXACTLY 1500 (allowed).
+		assert.strictEqual(totalExtent(withOverride(capped(), 0, 510)), 1500);
+		// Override 0 -> 511 gives extra +501 -> total 1501 (cap + 1, rejected).
+		assert.throws(() => withOverride(capped(), 0, 511));
+	});
+
+	test('emptyAxisSizing throws when the cap is below the uniform baseline', () => {
+		assert.throws(() => emptyAxisSizing(10, 100, 1, 1000, 999)); // base 1000 > cap 999
+	});
+
+	test('columns (no cap arg == Infinity) never throw on extent -- the keystone for byte-identity', () => {
+		let s = emptyAxisSizing(COL_WIDTH, MAX_COLS, MIN_COL_WIDTH, MAX_COL_WIDTH);
+		for (let c = 0; c < 50; c += 1) {
+			s = withOverride(s, c, MAX_COL_WIDTH); // 50 columns at max -- columns are uncapped
+		}
+		assert.strictEqual(s.overrides.size, 50);
+	});
+
+	test('the live row model admits a realistic handful of max-height rows', () => {
+		let s = rowModel();
+		for (let r = 0; r < 20; r += 1) {
+			s = withOverride(s, r, MAX_ROW_HEIGHT);
+		}
+		assert.strictEqual(s.overrides.size, 20);
+	});
+});
+
+suite('Wave G-rows gridLayoutA1 -- row geometry is byte-identical under the DEFAULT (uniform) binding', function () {
+	teardown(() => resetRowSizing());
+
+	test('rowY / cellContentRect-height / totalContentHeight / frozenRowsHeight reduce to ROW_HEIGHT arithmetic', () => {
+		resetRowSizing();
+		assert.strictEqual(rowY(0), HEADER_HEIGHT);
+		assert.strictEqual(rowY(5), HEADER_HEIGHT + 5 * ROW_HEIGHT);
+		assert.strictEqual(cellContentRect(2, 3, G).height, ROW_HEIGHT);
+		assert.strictEqual(totalContentHeight(), HEADER_HEIGHT + MAX_ROWS * ROW_HEIGHT);
+		assert.strictEqual(frozenRowsHeight(0), 0);
+		assert.strictEqual(frozenRowsHeight(3), 3 * ROW_HEIGHT);
+	});
+
+	test('hitTestContent maps uniformly + computeVisibleRowRange is the legacy floor/ceil', () => {
+		resetRowSizing();
+		resetColSizing();
+		// content-Y HEADER+50 -> row 2 (50/24 = 2.08); content-X G+5 -> col 0.
+		assert.deepStrictEqual(hitTestContent(G + 5, HEADER_HEIGHT + 50, G), { row: 2, col: 0 });
+		// viewport [0, 100) at ROW_HEIGHT=24, no overscan -> rows [0, ceil(100/24)=5).
+		assert.deepStrictEqual(computeVisibleRowRange(0, 100, MAX_ROWS, ROW_HEIGHT, 0), { startIdx: 0, endIdx: 5 });
+	});
+
+	test('clampSplitScroll ceiling reduces to MAX_ROWS*ROW_HEIGHT - band', () => {
+		resetRowSizing();
+		assert.strictEqual(clampSplitScroll(Number.MAX_SAFE_INTEGER, 200), MAX_ROWS * ROW_HEIGHT - 200);
+	});
+});
+
+suite('Wave G-rows gridLayoutA1 -- row geometry shifts with resized rows', function () {
+	teardown(() => { resetRowSizing(); resetColSizing(); });
+
+	test('a taller row pushes every later rowY + grows totalContentHeight', () => {
+		setRowSizing(withOverride(rowModel(), 1, 60)); // row 1: 24 -> 60 (+36)
+		assert.strictEqual(rowY(0), HEADER_HEIGHT);
+		assert.strictEqual(rowY(1), HEADER_HEIGHT + ROW_HEIGHT); // leading edge of row 1 unchanged
+		assert.strictEqual(rowY(2), HEADER_HEIGHT + ROW_HEIGHT + 60); // row 1 is now 60 tall
+		assert.strictEqual(rowY(3), HEADER_HEIGHT + 2 * ROW_HEIGHT + 60);
+		assert.strictEqual(cellContentRect(1, 0, G).height, 60);
+		assert.strictEqual(cellContentRect(2, 0, G).height, ROW_HEIGHT);
+		assert.strictEqual(totalContentHeight(), HEADER_HEIGHT + MAX_ROWS * ROW_HEIGHT + 36);
+		assert.strictEqual(frozenRowsHeight(2), ROW_HEIGHT + 60); // rows 0 (24) + 1 (60)
+	});
+
+	test('hitTestContent round-trips: a point inside a (variable-height) row maps back to it', () => {
+		resetColSizing();
+		setRowSizing(withOverride(withOverride(rowModel(), 1, 80), 3, 12));
+		for (let r = 0; r < 6; r += 1) {
+			const mid = Math.floor((rowY(r) + rowY(r + 1)) / 2);
+			const hit = hitTestContent(G + 1, mid, G);
+			assert.ok(hit !== null, `r=${r} mid=${mid}`);
+			assert.strictEqual(hit!.row, r, `r=${r} mid=${mid}`);
+		}
+	});
+
+	test('clampSplitScroll ceiling tracks the resized total extent', () => {
+		setRowSizing(withOverride(rowModel(), 0, 1000)); // +976
+		assert.strictEqual(clampSplitScroll(Number.MAX_SAFE_INTEGER, 200), MAX_ROWS * ROW_HEIGHT + 976 - 200);
+	});
+
+	test('computeVisibleRowRange leaves NO blank row: every row with a pixel in the viewport is covered', () => {
+		setRowSizing(withOverride(rowModel(), 0, 12)); // narrow row 0 -> more rows fit
+		const scrollTop = 0;
+		const viewportHeight = 100;
+		const range = computeVisibleRowRange(scrollTop, viewportHeight, MAX_ROWS, ROW_HEIGHT, 0);
+		for (let r = 0; r < 6; r += 1) {
+			const top = rowY(r) - HEADER_HEIGHT; // content-Y (drop the header band)
+			const bottom = rowY(r + 1) - HEADER_HEIGHT;
+			if (bottom > scrollTop && top < scrollTop + viewportHeight) {
+				assert.ok(r >= range.startIdx && r < range.endIdx, `row ${r} [${top},${bottom}) must be covered by [${range.startIdx},${range.endIdx})`);
+			}
+		}
+	});
+
+	test('computeVisibleBodyRowRange covers the body window under freeze + resize', () => {
+		setRowSizing(withOverride(rowModel(), 0, 60)); // a FROZEN row resized taller
+		const range = computeVisibleBodyRowRange(0, 200, MAX_ROWS, ROW_HEIGHT, 0, 1);
+		// frozen band = 60 (row 0). body viewport = 200-60 = 140 px starting at content row 1.
+		assert.ok(range.startIdx >= 1, 'never paints a frozen row as a body row');
+		for (const r of [1, 2]) {
+			assert.ok(r >= range.startIdx && r < range.endIdx, `body row ${r} must be covered by [${range.startIdx},${range.endIdx})`);
+		}
+	});
+
+	test('splitPaneRowRanges windows each pane under a resized row (no blank row)', () => {
+		setRowSizing(withOverride(rowModel(), 0, 100)); // row 0 tall
+		const ranges = splitPaneRowRanges(0, 0, HEADER_HEIGHT + 200, 400, 0); // top band = 200 px
+		assert.strictEqual(ranges.top.startIdx, 0);
+		assert.ok(ranges.top.endIdx > ranges.top.startIdx);
+		assert.ok(ranges.bottom.endIdx > ranges.bottom.startIdx);
+	});
+
+	test('setRowSizing / getRowSizing round-trip', () => {
+		const s = withOverride(rowModel(), 4, 333);
+		setRowSizing(s);
+		assert.strictEqual(getRowSizing(), s);
+		assert.strictEqual(sizeAt(getRowSizing(), 4), 333);
+	});
+
+	test('hitTestViewportFrozen rows round-trip under a resized frozen row AND a resized body row', () => {
+		resetColSizing();
+		setRowSizing(withOverride(withOverride(rowModel(), 0, 60), 5, 80)); // frozen row 0 = 60, body row 5 = 80
+		// A point in the frozen row-0 band maps to row 0 (pinned, no scroll):
+		assert.strictEqual(hitTestViewportFrozen(G + 1, HEADER_HEIGHT + 30, 0, 0, G, 1, 0)!.row, 0);
+		// rows past the frozen band: 0=60,1..4=24,5=80 -> row 5 content-Y spans [156, 236). A local Y of
+		// HEADER+200 (no scroll) maps to absolute content-Y 200 -> row 5.
+		assert.strictEqual(hitTestViewportFrozen(G + 1, HEADER_HEIGHT + 200, 0, 0, G, 1, 0)!.row, 5);
+	});
+});
+
+suite('Wave G-rows gridLayoutA1 -- rowResizeBorderAt (the resize-cursor / drag hit-test)', function () {
+	teardown(() => resetRowSizing());
+
+	test('uniform: grabbing a row border returns the row ABOVE it (Excel convention)', () => {
+		resetRowSizing();
+		// row 0 spans local [HEADER, HEADER+24); its bottom edge at HEADER+24 resizes row 0.
+		assert.strictEqual(rowResizeBorderAt(HEADER_HEIGHT + ROW_HEIGHT, 0, HEADER_HEIGHT, 0), 0);
+		assert.strictEqual(rowResizeBorderAt(HEADER_HEIGHT + 2 * ROW_HEIGHT, 0, HEADER_HEIGHT, 0), 1);
+	});
+
+	test('the middle of a row is NOT a border', () => {
+		resetRowSizing();
+		assert.strictEqual(rowResizeBorderAt(HEADER_HEIGHT + 12, 0, HEADER_HEIGHT, 0), -1); // mid of row 0
+	});
+
+	test('the header band / corner is never a row border', () => {
+		resetRowSizing();
+		assert.strictEqual(rowResizeBorderAt(HEADER_HEIGHT - 1, 0, HEADER_HEIGHT, 0), -1);
+		assert.strictEqual(rowResizeBorderAt(0, 0, HEADER_HEIGHT, 0), -1);
+	});
+
+	test('honours vertical scroll: a border scrolled to local-Y is detected there', () => {
+		resetRowSizing();
+		// scrollTop 24 shifts row 1's bottom edge (content HEADER+48) to local HEADER+24.
+		assert.strictEqual(rowResizeBorderAt(HEADER_HEIGHT + ROW_HEIGHT, ROW_HEIGHT, HEADER_HEIGHT, 0), 1);
+	});
+
+	test('resized rows move the grab point', () => {
+		setRowSizing(withOverride(rowModel(), 0, 60)); // row 0 -> 60 tall
+		assert.strictEqual(rowResizeBorderAt(HEADER_HEIGHT + 60, 0, HEADER_HEIGHT, 0), 0);
+		assert.strictEqual(rowResizeBorderAt(HEADER_HEIGHT + 30, 0, HEADER_HEIGHT, 0), -1); // mid of row 0 now
+	});
+
+	test('the frozen/body divider is grabbable from BOTH sides even when scrolled (resizes the last frozen row)', () => {
+		resetRowSizing();
+		const dividerY = HEADER_HEIGHT + 2 * ROW_HEIGHT; // freeze 2 rows -> seam at HEADER + 48 (no scroll)
+		assert.strictEqual(rowResizeBorderAt(dividerY, 500, HEADER_HEIGHT, 2), 1); // on the seam
+		assert.strictEqual(rowResizeBorderAt(dividerY + 3, 500, HEADER_HEIGHT, 2), 1); // body side, within GRAB
+		assert.strictEqual(rowResizeBorderAt(dividerY - 3, 500, HEADER_HEIGHT, 2), 1); // frozen side, within GRAB
+		assert.notStrictEqual(rowResizeBorderAt(dividerY + 40, 500, HEADER_HEIGHT, 2), 1); // well into the body
+	});
+});
+
+suite('Wave G-rows gridLayoutA1 -- rowResizeBorderAtSplit (split-aware row border; Codex audit HIGH)', function () {
+	teardown(() => resetRowSizing());
+	const HH = HEADER_HEIGHT;
+	const splitBarY = HH + 200; // top band 200 px tall
+
+	test('the header band / corner is never a border', () => {
+		resetRowSizing();
+		assert.strictEqual(rowResizeBorderAtSplit(HH - 1, splitBarY, 0, 0, HH), -1);
+	});
+
+	test('top pane detects the border using the TOP synthetic scroll (the bottom scroll is irrelevant there)', () => {
+		resetRowSizing();
+		// topScroll 0: row 0's bottom edge at local HH+24 -> resize row 0.
+		assert.strictEqual(rowResizeBorderAtSplit(HH + ROW_HEIGHT, splitBarY, 0, 999, HH), 0);
+		// topScroll 24 shifts row 1's bottom edge (content HH+48) to local HH+24 -> resize row 1.
+		assert.strictEqual(rowResizeBorderAtSplit(HH + ROW_HEIGHT, splitBarY, ROW_HEIGHT, 999, HH), 1);
+	});
+
+	test('bottom pane uses the DOM scroll shifted by the band offset (NOT the top scroll)', () => {
+		resetRowSizing();
+		const bandOffset = splitBarY - HH; // 200
+		// botScroll = bandOffset => the bottom pane shows from row 0 (effScroll 0). Row 8's bottom edge (content
+		// HH+216) lands at local HH+216, inside the bottom band. The top scroll (12345) must NOT affect this.
+		assert.strictEqual(rowResizeBorderAtSplit(HH + 216, splitBarY, 12345, bandOffset, HH), 8);
+		// A larger DOM scroll moves the border to a LATER row at the SAME local-Y -> proves botScroll is used.
+		assert.strictEqual(rowResizeBorderAtSplit(HH + 216, splitBarY, 12345, bandOffset + ROW_HEIGHT, HH), 9);
+	});
+
+	test('resized rows shift the split border grab point', () => {
+		setRowSizing(withOverride(rowModel(), 0, 60)); // row 0 tall (60) in the top pane
+		// top pane, topScroll 0: row 0 now spans [HH, HH+60); its bottom edge at HH+60 -> resize row 0.
+		assert.strictEqual(rowResizeBorderAtSplit(HH + 60, splitBarY, 0, 999, HH), 0);
+		assert.strictEqual(rowResizeBorderAtSplit(HH + 30, splitBarY, 0, 999, HH), -1); // mid of the tall row 0
 	});
 });

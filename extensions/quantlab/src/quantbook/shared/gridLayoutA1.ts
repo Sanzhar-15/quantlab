@@ -17,14 +17,16 @@
  * Supersedes (and, as of FE-2-0 Phase 4, fully REPLACES) the retired FE-0b cell-LIST geometry module
  * `gridLayout.ts`. The A1 grid is a real spreadsheet: a sticky **column-letter band**
  * (A,B,C,…) across the top, a sticky **row-number gutter** (1,2,3,…) down the left, a **corner box**
- * at their intersection, and a full grid of fixed-size cells spanning the Excel extent
+ * at their intersection, and a full grid of cells spanning the Excel extent
  * (`MAX_ROWS` × `MAX_COLS`). The sparse snapshot's populated cells paint at their (row,col); every
  * other cell is empty-but-editable.
  *
  * **CONTENT coordinates**: origin at the top-left of the full scrollable content. The column band
- * occupies `[0, HEADER_HEIGHT)`; the row gutter occupies `[0, gutterW)`. Data cell `(row,col)` sits
- * at `[gutterW + col*COL_WIDTH, +COL_WIDTH) × [HEADER_HEIGHT + row*ROW_HEIGHT, +ROW_HEIGHT)`. The
- * canvas converts content->local by subtracting the scroll offset; the band + gutter are STICKY
+ * occupies `[0, HEADER_HEIGHT)`; the row gutter occupies `[0, gutterW)`. Data cell `(row,col)` spans
+ * `[colX(col), colX(col)+sizeAt(colSizing,col))` on X and `[rowY(row), rowY(row)+sizeAt(rowSizing,row))`
+ * on Y -- which reduces to the uniform `gutterW + col*COL_WIDTH` (width `COL_WIDTH`) / `HEADER_HEIGHT +
+ * row*ROW_HEIGHT` (height `ROW_HEIGHT`) until a column/row is resized (Wave G / G-rows). The canvas
+ * converts content->local by subtracting the scroll offset; the band + gutter are STICKY
  * (re-painted at viewport-local `y=0` / `x=0` every frame, never scrolled).
  *
  * **`gutterW` is a parameter, not a constant**, because the row-number gutter widens with the digit
@@ -39,12 +41,11 @@
  * non-Electron target) touches only this module, not the hit-test / paint / edit call sites.
  */
 
-// **Wave G column sizing (R1, 2026-06-18):** the pure sparse sizing model lives in `./axisSizing`. The
-// COLUMN-geometry functions below read an injected module binding ({@link currentColSizing}) so the ~130
-// existing call sites (and every existing golden test) stay UNCHANGED and one source feeds paint +
-// hit-test + overlay alike (divergence-proof). Re-exported so the webview shim's importers reach the
-// model through the existing `./gridLayoutA1` path. Rows stay literal `ROW_HEIGHT` (the row axis is the
-// follow-up wave), so the Wave-F split/freeze-row helpers are physically untouched here.
+// **Wave G column sizing (R1, 2026-06-18) + Wave G-rows (2026-06-18):** the pure sparse sizing model lives
+// in `./axisSizing`. The COLUMN- and ROW-geometry functions below read injected module bindings ({@link
+// currentColSizing} / {@link currentRowSizing}) so the ~130 existing call sites (and every existing golden
+// test) stay UNCHANGED and one source per axis feeds paint + hit-test + overlay alike (divergence-proof).
+// Re-exported so the webview shim's importers reach the model through the existing `./gridLayoutA1` path.
 import {
 	type AxisSizing,
 	emptyAxisSizing,
@@ -146,8 +147,23 @@ export const MAX_COLS = 16_384;
 export const MIN_COL_WIDTH = 12;
 export const MAX_COL_WIDTH = 2000;
 
+/** **Wave G-rows row sizing** -- inclusive clamp for a resized ROW height (CSS px). `MIN` keeps a row
+ *  grabbable + legible; `MAX` (Excel's practical ceiling) bounds a single row. Unlike columns, the ROW
+ *  axis CAN approach the element-size cap in aggregate, so the row model also carries a {@link MAX_SPACER_PX}
+ *  total-extent guard (see {@link currentRowSizing}). */
+export const MIN_ROW_HEIGHT = 12;
+export const MAX_ROW_HEIGHT = 2000;
+
+/** **Wave G-rows row sizing** -- safe ceiling for the total scrollable content height (the vertical spacer
+ *  element), a margin under the ~33.5M-px Chromium/Electron max element height. `MAX_ROWS * ROW_HEIGHT =
+ *  25.2M px` (the uniform baseline) sits well under it; the row sizing model throws (No-Fallbacks) if enough
+ *  row resizes would push `HEADER_HEIGHT + totalExtent` past this. NOT a column concern (`MAX_COLS *
+ *  MAX_COL_WIDTH = 32.77M` already fits), so columns pass `Infinity`. */
+export const MAX_SPACER_PX = 33_000_000;
+
 /** **Wave G column sizing** -- the pointer grab band (CSS px, each side of a column's right edge) for the
- *  col-resize affordance ({@link colResizeBorderAt} / the renderer's `cursorAt`). */
+ *  col-resize affordance ({@link colResizeBorderAt} / the renderer's `cursorAt`). Shared by the ROW-resize
+ *  affordance ({@link rowResizeBorderAt}, each side of a row's bottom edge). */
 export const RESIZE_GRAB_PX = 4;
 
 /** **Wave G column sizing** -- the injected COLUMN sizing model. Default = uniform (no overrides), so every
@@ -171,6 +187,29 @@ export function getColSizing(): AxisSizing {
 /** **Wave G** -- reset to uniform (no overrides). Used on a fresh/cleared grid and for test isolation. */
 export function resetColSizing(): void {
 	currentColSizing = emptyAxisSizing(COL_WIDTH, MAX_COLS, MIN_COL_WIDTH, MAX_COL_WIDTH);
+}
+
+/** **Wave G-rows** -- the injected ROW sizing model (the mirror of {@link currentColSizing} for the Y axis).
+ *  Default = uniform, so every row-geometry function below is BYTE-IDENTICAL to the legacy `row * ROW_HEIGHT`
+ *  arithmetic until a row is resized. Carries a {@link MAX_SPACER_PX} total-extent cap (the row axis can reach
+ *  the element-size limit; columns cannot). The renderer replaces it via {@link setRowSizing} on every sizing
+ *  change; paint + hit-test + overlay + reveal all read this ONE source (divergence-proof). */
+let currentRowSizing: AxisSizing = emptyAxisSizing(ROW_HEIGHT, MAX_ROWS, MIN_ROW_HEIGHT, MAX_ROW_HEIGHT, MAX_SPACER_PX - HEADER_HEIGHT);
+
+/** **Wave G-rows** -- install the live ROW sizing model (the renderer's single source of truth for the Y axis). */
+export function setRowSizing(sizing: AxisSizing): void {
+	currentRowSizing = sizing;
+}
+
+/** **Wave G-rows** -- the current ROW sizing model (the renderer reads it to build the next `withOverride`, to
+ *  report `hasOverrides` to the blit gate, and to post the override set to the host). */
+export function getRowSizing(): AxisSizing {
+	return currentRowSizing;
+}
+
+/** **Wave G-rows** -- reset to uniform (no overrides). Used on a fresh/cleared grid and for test isolation. */
+export function resetRowSizing(): void {
+	currentRowSizing = emptyAxisSizing(ROW_HEIGHT, MAX_ROWS, MIN_ROW_HEIGHT, MAX_ROW_HEIGHT, MAX_SPACER_PX - HEADER_HEIGHT);
 }
 
 /**
@@ -245,9 +284,11 @@ export function colX(colIndex: number, gutterW: number): number {
 	return gutterW + offsetBefore(currentColSizing, colIndex);
 }
 
-/** Content-Y of the top edge of row `rowIndex` (below the header band). */
+/** Content-Y of the top edge of row `rowIndex` (below the header band). **Wave G-rows:** the cumulative sum
+ *  of the heights of rows `[0, rowIndex)` (via the injected {@link currentRowSizing}); reduces to
+ *  `HEADER_HEIGHT + rowIndex * ROW_HEIGHT` when no row is resized. */
 export function rowY(rowIndex: number): number {
-	return HEADER_HEIGHT + rowIndex * ROW_HEIGHT;
+	return HEADER_HEIGHT + offsetBefore(currentRowSizing, rowIndex);
 }
 
 /**
@@ -260,9 +301,10 @@ export function cellContentRect(
 	col: number,
 	gutterW: number,
 ): { x: number; y: number; width: number; height: number } {
-	// Wave G: `width` is the column's actual (possibly resized) width; `height` stays `ROW_HEIGHT` (rows
-	// are uniform until the row follow-up wave). The overlay editor reads this to size its `<input>`.
-	return { x: colX(col, gutterW), y: rowY(row), width: sizeAt(currentColSizing, col), height: ROW_HEIGHT };
+	// Wave G: `width`/`height` are the cell's actual (possibly resized) size via the injected col/row models;
+	// `x`/`y` come from the binding-aware `colX`/`rowY`. Reduces to `COL_WIDTH`/`ROW_HEIGHT` when nothing is
+	// resized. The overlay editor reads this to size + place its `<input>`.
+	return { x: colX(col, gutterW), y: rowY(row), width: sizeAt(currentColSizing, col), height: sizeAt(currentRowSizing, row) };
 }
 
 /** Total scrollable content width = gutter + all columns (drives the horizontal scrollbar). **Wave G:**
@@ -272,9 +314,12 @@ export function totalContentWidth(gutterW: number): number {
 	return gutterW + totalExtent(currentColSizing);
 }
 
-/** Total scrollable content height = header band + all rows (drives the vertical scrollbar). */
+/** Total scrollable content height = header band + all rows (drives the vertical scrollbar). **Wave G-rows:**
+ *  the summed heights of all `MAX_ROWS` rows (via {@link currentRowSizing}); reduces to `HEADER_HEIGHT +
+ *  MAX_ROWS * ROW_HEIGHT` when no row is resized. The row model's `MAX_SPACER_PX` cap keeps this under the
+ *  Chromium element-height limit. */
 export function totalContentHeight(): number {
-	return HEADER_HEIGHT + MAX_ROWS * ROW_HEIGHT;
+	return HEADER_HEIGHT + totalExtent(currentRowSizing);
 }
 
 // --- W3 frozen panes (2026-06-09) ------------------------------------------------------------------
@@ -294,9 +339,11 @@ export function clampFrozenCount(count: number, axisMax: number): number {
 	return Math.min(count, Math.max(0, axisMax - 1));
 }
 
-/** **W3 frozen panes** -- pixel height of the frozen-row band (`frozenRowCount * ROW_HEIGHT`). 0 = none. */
+/** **W3 frozen panes** -- pixel height of the frozen-row band. **Wave G-rows:** the summed heights of the
+ *  first `frozenRowCount` rows (via {@link currentRowSizing}); reduces to `frozenRowCount * ROW_HEIGHT` when
+ *  no row is resized. 0 = none. */
 export function frozenRowsHeight(frozenRowCount: number): number {
-	return Math.max(0, frozenRowCount) * ROW_HEIGHT;
+	return offsetBefore(currentRowSizing, Math.max(0, frozenRowCount));
 }
 
 /** **W3 frozen panes** -- pixel width of the frozen-col band. **Wave G:** the summed widths of the first
@@ -432,12 +479,27 @@ export function computeVisibleBodyRowRange(
 	if (rowHeight <= 0) {
 		return { startIdx: Math.min(frozen, totalRows), endIdx: totalRows };
 	}
-	const bodyViewport = Math.max(0, bodyHeight - frozen * rowHeight);
+	if (currentRowSizing.overrides.size === 0) {
+		// Uniform fast path -- BYTE-IDENTICAL to the pre-Wave-G-rows code (the keystone invariant).
+		const bodyViewport = Math.max(0, bodyHeight - frozen * rowHeight);
+		const maxFirst = Math.max(frozen, totalRows - 1);
+		const firstVisible = Math.min(maxFirst, frozen + Math.max(0, Math.floor(scrollTop / rowHeight)));
+		const visibleCount = Math.max(1, Math.ceil(bodyViewport / rowHeight));
+		const startIdx = Math.max(frozen, firstVisible - overscan);
+		const endIdx = Math.min(totalRows, firstVisible + visibleCount + overscan);
+		return { startIdx, endIdx };
+	}
+	// Wave G-rows variable-height body window (the exact mirror of computeVisibleBodyColRange's variable path).
+	// The frozen band consumes `frozenHeightPx` (= summed heights of the first `frozen` rows); the body content
+	// origin is that offset, advanced by the live `scrollTop`. First/last visible body rows are the inverse
+	// cumulative lookups at the body's top/bottom edge.
+	const frozenHeightPx = offsetBefore(currentRowSizing, frozen);
+	const bodyViewport = Math.max(0, bodyHeight - frozenHeightPx);
 	const maxFirst = Math.max(frozen, totalRows - 1);
-	const firstVisible = Math.min(maxFirst, frozen + Math.max(0, Math.floor(scrollTop / rowHeight)));
-	const visibleCount = Math.max(1, Math.ceil(bodyViewport / rowHeight));
+	const firstVisible = Math.min(maxFirst, Math.max(frozen, indexAtOffset(currentRowSizing, frozenHeightPx + scrollTop)));
+	const lastVisible = Math.min(maxFirst, Math.max(frozen, indexAtOffset(currentRowSizing, frozenHeightPx + scrollTop + bodyViewport)));
 	const startIdx = Math.max(frozen, firstVisible - overscan);
-	const endIdx = Math.min(totalRows, firstVisible + visibleCount + overscan);
+	const endIdx = Math.min(totalRows, lastVisible + 1 + overscan);
 	return { startIdx, endIdx };
 }
 
@@ -545,9 +607,9 @@ export function hitTestContent(
 	if (contentX < gutterW) {
 		return null; // row-number gutter
 	}
-	const row = Math.floor((contentY - HEADER_HEIGHT) / ROW_HEIGHT);
-	// Wave G: the column at content-X via the inverse cumulative-width lookup (reduces to
-	// `floor((contentX - gutterW) / COL_WIDTH)` when no column is resized); rows stay uniform.
+	// Wave G/G-rows: each axis maps via its inverse cumulative lookup (reduces to `floor((contentY -
+	// HEADER_HEIGHT) / ROW_HEIGHT)` / `floor((contentX - gutterW) / COL_WIDTH)` when nothing is resized).
+	const row = indexAtOffset(currentRowSizing, contentY - HEADER_HEIGHT);
 	const col = indexAtOffset(currentColSizing, contentX - gutterW);
 	if (row < 0 || row >= MAX_ROWS || col < 0 || col >= MAX_COLS) {
 		return null;
@@ -620,21 +682,22 @@ export function hitTestViewportFrozen(
 	}
 	const fRows = Math.max(0, frozenRowCount);
 	const fCols = Math.max(0, frozenColCount);
-	const frozenRowsPx = fRows * ROW_HEIGHT;
-	// Wave G: the frozen-col band is the cumulative width of the first `fCols` columns (reduces to
-	// `fCols * COL_WIDTH` when no column is resized); the frozen-row band stays uniform.
+	// Wave G/G-rows: each frozen band is the cumulative extent of the first N rows/cols (reduces to
+	// `N * ROW_HEIGHT` / `N * COL_WIDTH` when nothing is resized).
+	const frozenRowsPx = offsetBefore(currentRowSizing, fRows);
 	const frozenColsPx = offsetBefore(currentColSizing, fCols);
 	// Resolve each axis: in the frozen band the pointer maps to the pinned cell (no scroll); past it the
 	// pointer maps to a scrolling body cell (add the scroll, offset by the frozen count).
 	let row: number;
 	if (localY < HEADER_HEIGHT + frozenRowsPx) {
-		row = Math.floor((localY - HEADER_HEIGHT) / ROW_HEIGHT);
+		row = indexAtOffset(currentRowSizing, localY - HEADER_HEIGHT);
 	} else {
-		// Body Y: the band consumed `frozenRowsPx` of the viewport; the body's content origin is the frozen
-		// offset. local body offset = localY - (HEADER_HEIGHT + frozenRowsPx); content body row = that/ROW +
-		// scrolled rows + frozen offset.
+		// Body Y: the band consumed `frozenRowsPx` of the viewport; the body content origin is `frozenRowsPx`
+		// (= offsetBefore(fRows)), advanced by `scrollTop`, plus the in-body local offset -- the inverse
+		// cumulative lookup over that ABSOLUTE content-Y names the body row (mirrors the column body branch;
+		// reduces to `fRows + floor((bodyLocalY+scrollTop)/ROW_HEIGHT)` when no row is resized).
 		const bodyLocalY = localY - (HEADER_HEIGHT + frozenRowsPx);
-		row = fRows + Math.floor((bodyLocalY + scrollTop) / ROW_HEIGHT);
+		row = indexAtOffset(currentRowSizing, frozenRowsPx + scrollTop + bodyLocalY);
 	}
 	// Wave G: both branches map content-X -> column via the inverse cumulative-width lookup. Frozen band:
 	// content-X is `localX - gutterW` (no scroll). Body: the body content origin is `frozenColsPx` (=
@@ -707,6 +770,87 @@ export function colResizeBorderAt(
 	return -1;
 }
 
+/**
+ * **Wave G-rows row sizing** -- given a VIEWPORT-LOCAL Y inside the row-number gutter (the caller checks
+ * `localX < gutterW`), return the row index whose BOTTOM edge the pointer is grabbing for a resize, or
+ * `-1` if the pointer is not within {@link RESIZE_GRAB_PX} of any row border. Excel convention: grabbing a
+ * row's bottom edge resizes THAT row; grabbing its top edge resizes the PREVIOUS row. Freeze-aware: frozen
+ * rows are pinned (no scroll), body rows carry `scrollTop`, exactly as {@link hitTestViewportFrozen} maps
+ * them -- so the divider between the frozen band and the body resizes the last frozen row. The Y mirror of
+ * {@link colResizeBorderAt} (`headerHeight` plays the role `gutterW` plays there). Pure; the renderer's
+ * `cursorAt` + the resize-drag pointerdown both consult it. With no resized row this still works (uniform
+ * heights via the binding).
+ */
+export function rowResizeBorderAt(
+	localY: number,
+	scrollTop: number,
+	headerHeight: number,
+	frozenRowCount: number,
+): number {
+	if (localY < headerHeight) {
+		return -1; // column-letter band / corner -- never a row border
+	}
+	const fRows = Math.max(0, frozenRowCount);
+	const frozenRowsPx = offsetBefore(currentRowSizing, fRows);
+	// The divider between the frozen band and the scrolling body is a FIXED seam at `headerHeight +
+	// frozenRowsPx` (the frozen band never scrolls). Grabbing within RESIZE_GRAB_PX of it -- from EITHER side
+	// -- resizes the LAST frozen row (mirrors the column frozen/body divider). Checked before the band split
+	// so the bottom side of the divider is always grabbable once `scrollTop > RESIZE_GRAB_PX`.
+	if (fRows > 0 && Math.abs(localY - (headerHeight + frozenRowsPx)) <= RESIZE_GRAB_PX) {
+		return fRows - 1;
+	}
+	// The row under the pointer + its local top/bottom edges. Frozen band: pinned (no scroll). Body: the
+	// body content origin is `frozenRowsPx`, advanced by `scrollTop`, so each edge subtracts it.
+	let row: number;
+	let topEdge: number;
+	let bottomEdge: number;
+	if (localY < headerHeight + frozenRowsPx) {
+		row = Math.min(Math.max(0, indexAtOffset(currentRowSizing, localY - headerHeight)), MAX_ROWS - 1);
+		topEdge = headerHeight + offsetBefore(currentRowSizing, row);
+		bottomEdge = headerHeight + offsetBefore(currentRowSizing, row + 1);
+	} else {
+		const bodyLocalY = localY - (headerHeight + frozenRowsPx);
+		row = Math.min(Math.max(0, indexAtOffset(currentRowSizing, frozenRowsPx + scrollTop + bodyLocalY)), MAX_ROWS - 1);
+		topEdge = headerHeight + offsetBefore(currentRowSizing, row) - scrollTop;
+		bottomEdge = headerHeight + offsetBefore(currentRowSizing, row + 1) - scrollTop;
+	}
+	// Bottom-edge grab wins ties (a short row < 2*GRAB stays resizable from its own bottom edge).
+	if (localY >= bottomEdge - RESIZE_GRAB_PX) {
+		return row;
+	}
+	if (localY <= topEdge + RESIZE_GRAB_PX && row - 1 >= 0) {
+		return row - 1;
+	}
+	return -1;
+}
+
+/**
+ * **Wave G-rows row sizing + Wave F window split** -- the split-aware row mirror of {@link rowResizeBorderAt}.
+ * While a horizontal split is active the row gutter paints in TWO panes at INDEPENDENT effective scrolls (top
+ * pane: `topScrollTop`; bottom pane: `botScrollTop - (splitBarY - headerHeight)`), so the resize border must be
+ * detected against the pane the pointer is in, NOT the single DOM scroll. Picks the pane by `localY < splitBarY`
+ * (the bar biases to the bottom, exactly as {@link hitTestSplit}) and delegates to {@link rowResizeBorderAt}
+ * with that pane's effective scroll. A split has NO frozen rows (split + freeze are mutually exclusive), so
+ * `frozenRowCount` is always 0 here. Pure; the renderer's `cursorAt` + the resize-drag pointerdown consult it
+ * whenever a split is active.
+ */
+export function rowResizeBorderAtSplit(
+	localY: number,
+	splitBarY: number,
+	topScrollTop: number,
+	botScrollTop: number,
+	headerHeight: number,
+): number {
+	if (localY < headerHeight) {
+		return -1; // column-letter band / corner
+	}
+	const inTop = localY < splitBarY;
+	// The bottom pane's effective scroll = the DOM scroll shifted up by the band offset (mirrors
+	// `paintSplitWindow`'s `botEff = botScroll - bandOffset`); the top pane uses its synthetic scroll directly.
+	const effScrollTop = inTop ? topScrollTop : botScrollTop - (splitBarY - headerHeight);
+	return rowResizeBorderAt(localY, effScrollTop, headerHeight, 0);
+}
+
 // --- Wave F window split (R5, 2026-06-18) ----------------------------------------------------------
 //
 // A horizontal window SPLIT divides the viewport into a TOP and a BOTTOM pane that scroll
@@ -740,8 +884,12 @@ export function clampSplitBarY(rawY: number, cssHeight: number): number {
 	if (!Number.isFinite(rawY) || rawY <= 0) {
 		return 0;
 	}
-	const minBarY = HEADER_HEIGHT + ROW_HEIGHT; // top pane >= 1 row
-	const maxBarY = cssHeight - ROW_HEIGHT; // bottom pane >= 1 row
+	// Wave G-rows: deliberately uses the DEFAULT ROW_HEIGHT (not the resized height of row 0 / the last
+	// row) as the one-row margin. The bar is a free-floating DROP BOUND, not a row-position map, so a
+	// partially-clipped resized row at the split is acceptable (exactly as Excel renders a dragged split) --
+	// leaving this uniform keeps the Wave-F split-bar goldens byte-identical.
+	const minBarY = HEADER_HEIGHT + ROW_HEIGHT; // top pane >= ~1 row
+	const maxBarY = cssHeight - ROW_HEIGHT; // bottom pane >= ~1 row
 	if (maxBarY < minBarY) {
 		return 0; // viewport too short for two panes
 	}
@@ -758,10 +906,21 @@ function splitPaneRowRange(scrollTop: number, bandHeight: number, overscan: numb
 		return { startIdx: 0, endIdx: MAX_ROWS };
 	}
 	const maxFirst = Math.max(0, MAX_ROWS - 1);
-	const firstVisible = Math.min(maxFirst, Math.max(0, Math.floor(scrollTop / ROW_HEIGHT)));
-	const visibleCount = Math.max(1, Math.ceil(Math.max(0, bandHeight) / ROW_HEIGHT));
+	if (currentRowSizing.overrides.size === 0) {
+		// Uniform fast path -- BYTE-IDENTICAL to the pre-Wave-G-rows code (the keystone invariant).
+		const firstVisible = Math.min(maxFirst, Math.max(0, Math.floor(scrollTop / ROW_HEIGHT)));
+		const visibleCount = Math.max(1, Math.ceil(Math.max(0, bandHeight) / ROW_HEIGHT));
+		const startIdx = Math.max(0, firstVisible - overscan);
+		const endIdx = Math.min(MAX_ROWS, firstVisible + visibleCount + overscan);
+		return { startIdx, endIdx };
+	}
+	// Wave G-rows variable-height pane window: first/last visible rows are the inverse cumulative lookups at
+	// the pane band's top/bottom edge (a single divide can't count variable heights). A split has no frozen
+	// band (split + freeze are mutually exclusive), so the offsets are the raw pane scroll.
+	const firstVisible = Math.min(maxFirst, Math.max(0, indexAtOffset(currentRowSizing, scrollTop)));
+	const lastVisible = Math.min(maxFirst, Math.max(0, indexAtOffset(currentRowSizing, scrollTop + Math.max(0, bandHeight))));
 	const startIdx = Math.max(0, firstVisible - overscan);
-	const endIdx = Math.min(MAX_ROWS, firstVisible + visibleCount + overscan);
+	const endIdx = Math.min(MAX_ROWS, lastVisible + 1 + overscan);
 	return { startIdx, endIdx };
 }
 
@@ -801,7 +960,9 @@ export function clampSplitScroll(scrollTop: number, bandHeight: number): number 
 	if (!Number.isFinite(scrollTop) || scrollTop <= 0) {
 		return 0;
 	}
-	const maxScroll = Math.max(0, MAX_ROWS * ROW_HEIGHT - Math.max(0, bandHeight));
+	// Wave G-rows: the content extent the spacer gives the DOM scroller is the summed row heights (reduces to
+	// `MAX_ROWS * ROW_HEIGHT` when no row is resized) -- so the synthetic top-pane scroll tracks it exactly.
+	const maxScroll = Math.max(0, totalExtent(currentRowSizing) - Math.max(0, bandHeight));
 	return Math.min(maxScroll, scrollTop);
 }
 

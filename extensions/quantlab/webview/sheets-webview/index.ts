@@ -85,7 +85,10 @@ import {
 	MAX_COLS,
 	MAX_COL_WIDTH,
 	MAX_ROWS,
+	MAX_ROW_HEIGHT,
+	MAX_SPACER_PX,
 	MIN_COL_WIDTH,
+	MIN_ROW_HEIGHT,
 	ROW_HEIGHT,
 	cellContentRect,
 	cellRefA1,
@@ -96,12 +99,16 @@ import {
 	frozenRowsHeight,
 	hitTestSplit,
 	hitTestViewportFrozen,
+	indexAtOffset,
 	isInExtent,
 	publishedNameAt,
 	type SelectionRect,
+	rowResizeBorderAt,
+	rowResizeBorderAtSplit,
 	rowY,
 	scrollToReveal,
 	selectionRect,
+	sizeAt,
 	totalContentHeight,
 	totalContentWidth,
 	withOverride,
@@ -1612,6 +1619,12 @@ let fillSuppressClick = false;
 // `colResizeSuppressClick` swallows the click synthesized after a resize-drag pointerup.
 let colResizeDrag: { col: number; pointerId: number; startClientX: number; startWidth: number } | null = null;
 let colResizeSuppressClick = false;
+// **Wave G-rows row resize**: the Y mirror -- drag a row-number-gutter border to resize the row. Non-null
+// only DURING a drag (single-owner pointerId). `pointermove` updates the renderer's ROW sizing live (full
+// redraw, blit gated off); `pointerup` posts the final height to the host (transient, session-local).
+// `rowResizeSuppressClick` swallows the click synthesized after a resize-drag pointerup.
+let rowResizeDrag: { row: number; pointerId: number; startClientY: number; startHeight: number } | null = null;
+let rowResizeSuppressClick = false;
 // Click tolerance (CSS px) for grabbing the fill-handle square at the selection's bottom-right corner.
 const FILL_HANDLE_HIT_PX = 5;
 // The active (selected) cell -- the FOCUS of the selection. Starts at A1 (like Excel) so the grid
@@ -2125,6 +2138,9 @@ const renderHost: RenderHost = {
 	// Wave G column sizing: same gate -- a blit assumes uniform-pitch columns, so force the full draw while
 	// any column is resized (the renderer is the single source via the leaf binding).
 	hasColSizingOverrides: () => renderer.colSizingActive,
+	// Wave G-rows: the Y mirror -- a blit assumes uniform-pitch rows, so force the full draw while any row is
+	// resized (the renderer is the single source via the leaf binding).
+	hasRowSizingOverrides: () => renderer.rowSizingActive,
 	applyCanvasTransform,
 	onAfterFullRedraw: () => {
 		updateFormulaBar(); // selection/content changed -> reflect the active cell in the formula bar
@@ -2428,13 +2444,14 @@ function ensureActiveVisibleSplit(): void {
 	const cssH = viewportEl.clientHeight;
 	const splitBarY = renderer.splitBarYPx;
 	const bandOffset = splitBarY - HEADER_HEIGHT;
+	const rowH = sizeAt(renderer.rowSizing, active.row); // Wave G-rows: the active row's actual (resized) height
 	const topY = rowY(active.row) - renderer.topSplitScrollPx;
 	const botY = rowY(active.row) - (viewportEl.scrollTop - bandOffset);
-	const inTop = topY >= HEADER_HEIGHT && topY + ROW_HEIGHT <= splitBarY;
-	const inBot = botY >= splitBarY && botY + ROW_HEIGHT <= cssH;
+	const inTop = topY >= HEADER_HEIGHT && topY + rowH <= splitBarY;
+	const inBot = botY >= splitBarY && botY + rowH <= cssH;
 	if (!inTop && !inBot) {
 		const botEff = viewportEl.scrollTop - bandOffset;
-		const newBotEff = scrollToReveal(rowY(active.row), ROW_HEIGHT, splitBarY, botEff, cssH);
+		const newBotEff = scrollToReveal(rowY(active.row), rowH, splitBarY, botEff, cssH);
 		viewportEl.scrollTop = Math.max(0, newBotEff + bandOffset);
 	}
 }
@@ -2470,7 +2487,7 @@ function ensureActiveVisible(): void {
 	if (active.row >= fRows) {
 		viewportEl.scrollTop = scrollToReveal(
 			rowY(active.row),
-			ROW_HEIGHT,
+			sizeAt(renderer.rowSizing, active.row), // Wave G-rows: the active row's actual (resized) height
 			HEADER_HEIGHT + frozenRowsHeight(fRows),
 			viewportEl.scrollTop,
 			viewportEl.clientHeight,
@@ -2533,8 +2550,15 @@ function usedExtent(): { row: number; col: number } {
  *  PageUp / PageDown (which move the active cell by one screenful). At least 1 so a tiny viewport still
  *  advances by a cell rather than stalling. */
 function visibleRowSpan(): number {
-	const usable = viewportEl.clientHeight - HEADER_HEIGHT;
-	return Math.max(1, Math.floor(usable / ROW_HEIGHT));
+	const usable = Math.max(0, viewportEl.clientHeight - HEADER_HEIGHT);
+	const rowSizing = renderer.rowSizing;
+	if (rowSizing.overrides.size === 0) {
+		return Math.max(1, Math.floor(usable / ROW_HEIGHT)); // uniform fast path (byte-identical to pre-Wave-G-rows)
+	}
+	// Wave G-rows (Codex audit LOW): under variable heights a "screenful" = the rows whose cumulative extent
+	// fills `usable` from the current scroll top, so PageUp/PageDown advances by what is actually visible.
+	const top = viewportEl.scrollTop;
+	return Math.max(1, indexAtOffset(rowSizing, top + usable) - indexAtOffset(rowSizing, top));
 }
 
 /** **W-G-2a** -- collapse any multi-cell range back to the single focus cell (clear the anchor). */
@@ -3833,12 +3857,13 @@ function splitEditorPane(row: number): 'top' | 'bottom' {
 	const bandOffset = splitBarY - HEADER_HEIGHT;
 	const topScroll = renderer.topSplitScrollPx;
 	const cssH = viewportEl.clientHeight;
+	const rowH = sizeAt(renderer.rowSizing, row); // Wave G-rows: the row's actual (resized) height
 	const botY = rowY(row) - (scrollTop - bandOffset); // on-screen Y if painted in the bottom pane
 	const topY = rowY(row) - topScroll; // on-screen Y if painted in the top pane
-	if (botY + ROW_HEIGHT > splitBarY && botY < cssH) {
+	if (botY + rowH > splitBarY && botY < cssH) {
 		return 'bottom';
 	}
-	if (topY + ROW_HEIGHT > HEADER_HEIGHT && topY < splitBarY) {
+	if (topY + rowH > HEADER_HEIGHT && topY < splitBarY) {
 		return 'top';
 	}
 	return 'bottom';
@@ -4576,7 +4601,7 @@ canvasEl.addEventListener('pointerdown', ev => {
 	// rect -- the first pointer owns the drag until its pointerup/pointercancel. FE-3: a point drag is the same
 	// single-owner contract, so a press while EITHER drag is live is ignored. Wave G: a column-resize drag is
 	// the same single-owner contract -- a press while it is live is ignored too.
-	if (fillSource !== null || pointDrag !== null || colResizeDrag !== null) {
+	if (fillSource !== null || pointDrag !== null || colResizeDrag !== null || rowResizeDrag !== null) {
 		return;
 	}
 	// megaudit MED: clear any leftover suppress flag at the START of every interaction so it can never
@@ -4586,6 +4611,7 @@ canvasEl.addEventListener('pointerdown', ev => {
 	fillSuppressClick = false;
 	pointSuppressClick = false;
 	colResizeSuppressClick = false; // Wave G: same defensive clear -- a stale flag must never swallow a later click
+	rowResizeSuppressClick = false; // Wave G-rows: same defensive clear
 	// Wave G column resize: a press on a column-letter border (the header band, within RESIZE_GRAB_PX of a
 	// column's right edge) starts a resize drag. Runs BEFORE the point/fill branches (a header-band press is
 	// neither a point nor a fill -- hitTestCanvas returns null there). Pointer capture keeps move/up firing if
@@ -4606,6 +4632,27 @@ canvasEl.addEventListener('pointerdown', ev => {
 					startWidth: cellContentRect(0, borderCol, renderer.gutterWidthPx).width,
 				};
 				colResizeSuppressClick = false;
+				canvasEl.setPointerCapture(ev.pointerId);
+				return;
+			}
+		}
+		// Wave G-rows: the Y mirror -- a press on a row-number-gutter border (the gutter band, within
+		// RESIZE_GRAB_PX of a row's bottom edge) starts a row-resize drag. Disjoint from the column branch above
+		// (header band vs gutter band); the corner box is neither. The start height is the row's CURRENT height.
+		if (localX < renderer.gutterWidthPx) {
+			// Split-aware (Codex audit HIGH): while split, the gutter paints in two panes at independent scrolls.
+			const borderRow = renderer.splitActive
+				? rowResizeBorderAtSplit(localY, renderer.splitBarYPx, renderer.topSplitScrollPx, viewportEl.scrollTop, HEADER_HEIGHT)
+				: rowResizeBorderAt(localY, viewportEl.scrollTop, HEADER_HEIGHT, renderer.frozenRows);
+			if (borderRow >= 0) {
+				ev.preventDefault();
+				rowResizeDrag = {
+					row: borderRow,
+					pointerId: ev.pointerId,
+					startClientY: ev.clientY,
+					startHeight: cellContentRect(borderRow, 0, renderer.gutterWidthPx).height,
+				};
+				rowResizeSuppressClick = false;
 				canvasEl.setPointerCapture(ev.pointerId);
 				return;
 			}
@@ -4664,6 +4711,32 @@ canvasEl.addEventListener('pointermove', ev => {
 		const newWidth = Math.max(MIN_COL_WIDTH, Math.min(MAX_COL_WIDTH, Math.round(colResizeDrag.startWidth + dx)));
 		renderer.setColSizing(withOverride(renderer.colSizing, colResizeDrag.col, newWidth));
 		updateSpacer(); // Wave G: the total content width changed -> resync the native horizontal scrollbar range
+		repositionEdit();
+		redraw();
+		return;
+	}
+	// Wave G-rows: live-resize the dragged row (the Y mirror). The renderer's ROW sizing is updated each move
+	// (full redraw -- the blit is gated off while sized), so the row + every later row track the pointer. Clamp
+	// to [MIN_ROW_HEIGHT, MAX_ROW_HEIGHT]; a height back at the default drops the override (canonical).
+	if (rowResizeDrag !== null) {
+		if (ev.pointerId !== rowResizeDrag.pointerId) {
+			return; // a second touch/pen is NOT the drag owner -- ignore its moves
+		}
+		const dy = ev.clientY - rowResizeDrag.startClientY;
+		const newHeight = Math.max(MIN_ROW_HEIGHT, Math.min(MAX_ROW_HEIGHT, Math.round(rowResizeDrag.startHeight + dy)));
+		// Wave G-rows (Codex audit MED): the row spacer cap can (pathologically) be exceeded by one more resize
+		// when thousands of rows are already maxed. Contain the loud `withOverride` throw at this event-handler
+		// boundary -- log it and abort THIS move (the row stops growing, last good sizing kept), never an uncaught
+		// pointermove crash that would break unrelated grid interaction.
+		let nextRowSizing: AxisSizing;
+		try {
+			nextRowSizing = withOverride(renderer.rowSizing, rowResizeDrag.row, newHeight);
+		} catch (e) {
+			console.error('[sheets-webview] row resize would exceed the max scrollable height; ignoring this move:', e);
+			return;
+		}
+		renderer.setRowSizing(nextRowSizing);
+		updateSpacer(); // Wave G-rows: the total content height changed -> resync the native vertical scrollbar range
 		repositionEdit();
 		redraw();
 		return;
@@ -4736,6 +4809,22 @@ canvasEl.addEventListener('pointerup', ev => {
 		redraw();
 		return;
 	}
+	// Wave G-rows: finalize the row resize (the Y mirror). Post the final height to the host (null === default
+	// REMOVE, keeping the override map canonical). Always suppress the synthesized post-drag click (the pointer
+	// was captured, so a click fires; a release drifting into the body would otherwise re-select a cell).
+	if (rowResizeDrag !== null) {
+		if (ev.pointerId !== rowResizeDrag.pointerId) {
+			return; // not the drag owner
+		}
+		canvasEl.releasePointerCapture?.(ev.pointerId);
+		const row = rowResizeDrag.row;
+		const finalHeight = cellContentRect(row, 0, renderer.gutterWidthPx).height;
+		vscode.postMessage({ type: 'sizeRow', row, height: finalHeight === ROW_HEIGHT ? null : finalHeight });
+		rowResizeDrag = null;
+		rowResizeSuppressClick = true;
+		redraw();
+		return;
+	}
 	// FE-3 point mode: finalize the pointed reference at the RELEASE cell (authoritative, mirrors fill), keep
 	// the editor open + focused, and swallow the synthesized post-drag click so it does not re-select.
 	if (pointDrag !== null) {
@@ -4794,6 +4883,20 @@ canvasEl.addEventListener('pointercancel', ev => {
 		redraw();
 		return;
 	}
+	// Wave G-rows: a hijacked row-resize drag REVERTS the row to its pre-drag height (the Y mirror; no partial
+	// resize left behind). The host was never told (we only post on pointerup), so reverting the binding to the
+	// start height re-syncs the webview with the host -- no message needed.
+	if (rowResizeDrag !== null) {
+		if (ev.pointerId !== rowResizeDrag.pointerId) {
+			return; // not the drag owner
+		}
+		renderer.setRowSizing(withOverride(renderer.rowSizing, rowResizeDrag.row, rowResizeDrag.startHeight));
+		updateSpacer(); // Wave G-rows: revert restored the height -> resync the scrollbar range
+		rowResizeDrag = null;
+		repositionEdit();
+		redraw();
+		return;
+	}
 	// FE-3 point mode: a hijacked point drag REVERTS the editor to its pre-drag state (no half-pointed ref is
 	// left behind); the editor stays open so the user can re-point. Mirrors the fill cancel (which commits
 	// nothing) but must also undo the text we already inserted on pointerdown.
@@ -4836,6 +4939,10 @@ canvasEl.addEventListener('pointercancel', ev => {
 canvasEl.addEventListener('click', ev => {
 	if (colResizeSuppressClick) {
 		colResizeSuppressClick = false; // Wave G: swallow the click synthesized after a column-resize drag
+		return;
+	}
+	if (rowResizeSuppressClick) {
+		rowResizeSuppressClick = false; // Wave G-rows: swallow the click synthesized after a row-resize drag
 		return;
 	}
 	if (pointSuppressClick) {
@@ -6294,8 +6401,9 @@ window.addEventListener('message', (event: MessageEvent) => {
 	}
 	if (msg.type === 'colSizing') {
 		// **Wave G column sizing** -- the host's FULL column-override set (transient session-local) for the active
-		// sheet: posted after each resize, re-sent on the webviewReady handshake (so a reload re-applies), and
-		// reset on a sheet switch. The webview rebuilds the COLUMN sizing model from the array and FULL-redraws
+		// sheet, re-sent on the webviewReady handshake (so a reload re-applies) and reset on a sheet switch --
+		// NOT echoed per-resize (the webview applies a drag live). The webview rebuilds the COLUMN sizing model
+		// from the array and FULL-redraws
 		// (the geometry changed; the blit/damage fast paths are gated off while sized). No-Fallbacks: a malformed
 		// entry is a host/webview WIRING bug -> surface it LOUD and leave the CURRENT sizing UNCHANGED (don't
 		// silently reset to uniform, which would lose the user's widths + mask the bug). The clamp re-check here
@@ -6322,6 +6430,49 @@ window.addEventListener('message', (event: MessageEvent) => {
 		}
 		renderer.setColSizing(rebuilt);
 		updateSpacer(); // Wave G: the host's override set changed the total width -> resync the scrollbar range
+		repositionEdit();
+		redraw();
+		return;
+	}
+	if (msg.type === 'rowSizing') {
+		// **Wave G-rows row sizing** -- the Y mirror of `colSizing`: the host's FULL row-override set (transient
+		// session-local) for the active sheet, re-sent on the webviewReady handshake (so a reload re-applies) and
+		// reset on a sheet switch -- NOT echoed per-resize (the webview applies a drag live). The webview rebuilds
+		// the ROW sizing model (WITH
+		// the spacer cap) and FULL-redraws. No-Fallbacks: a malformed entry is a WIRING bug -> surface it LOUD and
+		// leave the CURRENT sizing UNCHANGED (don't silently reset to uniform, which would lose the user's heights
+		// + mask the bug). The clamp re-check here is defence in depth at the trust boundary.
+		const rows = (msg as { rows?: unknown }).rows;
+		if (!Array.isArray(rows)) {
+			console.warn('[sheets-webview] dropped a malformed rowSizing message (rows must be an array):', msg);
+			showError('The host sent a malformed row-sizing update; the rows were not changed.', 'transient');
+			return;
+		}
+		let rebuilt: AxisSizing = emptyAxisSizing(ROW_HEIGHT, MAX_ROWS, MIN_ROW_HEIGHT, MAX_ROW_HEIGHT, MAX_SPACER_PX - HEADER_HEIGHT);
+		for (const entry of rows) {
+			if (
+				!Array.isArray(entry) || entry.length !== 2 ||
+				typeof entry[0] !== 'number' || !Number.isInteger(entry[0]) || entry[0] < 0 || entry[0] >= MAX_ROWS ||
+				// INTEGER height required: a fractional size breaks the renderer's per-cell seam alignment.
+				typeof entry[1] !== 'number' || !Number.isInteger(entry[1]) || entry[1] < MIN_ROW_HEIGHT || entry[1] > MAX_ROW_HEIGHT
+			) {
+				console.warn('[sheets-webview] dropped a malformed rowSizing entry (expected [int row, height in clamp]):', entry);
+				showError('The host sent a malformed row-sizing update; the rows were not changed.', 'transient');
+				return;
+			}
+			// Wave G-rows (Codex audit MED): the aggregate may exceed the spacer cap (the host validates each
+			// entry individually). Contain the `withOverride` throw here -- log loud + leave the CURRENT sizing
+			// unchanged (`rebuilt` is local, never installed), never an uncaught message-handler crash.
+			try {
+				rebuilt = withOverride(rebuilt, entry[0], entry[1]);
+			} catch (e) {
+				console.error('[sheets-webview] rowSizing replay would exceed the max scrollable height; sizing left unchanged:', e);
+				showError('The row-sizing update would exceed the maximum scrollable height; the rows were not changed.', 'transient');
+				return;
+			}
+		}
+		renderer.setRowSizing(rebuilt);
+		updateSpacer(); // Wave G-rows: the host's override set changed the total height -> resync the scrollbar range
 		repositionEdit();
 		redraw();
 		return;

@@ -119,6 +119,10 @@ const benchHost: RenderHost = {
 	isSplitActive: () => false,
 	// Wave G column sizing: the bench never resizes a column (it measures the uniform-width blit fast path).
 	hasColSizingOverrides: () => false,
+	// Wave G-rows: the bench never resizes a row either (uniform-height blit fast path). NOTE: render-bench is
+	// esbuild-bundled but NOT covered by `tsc -p ./`, so a missing RenderHost method here is a RUNTIME crash
+	// tsc cannot catch -- this literal must be kept in sync with the interface by hand.
+	hasRowSizingOverrides: () => false,
 	applyCanvasTransform,
 	onAfterFullRedraw: () => undefined,
 	onAfterScroll: () => undefined,

@@ -19,6 +19,12 @@
 
 import type { QuantbookCellSnapshot, QuantbookCellValue } from '../../src/quantbook/types';
 
+// **Wave G-rows (R1, 2026-06-18):** the visible-row window reads the injected ROW sizing model so a
+// resized row above the viewport shifts the window correctly. `gridLayoutA1` is DOM/vscode/napi-free
+// (bundle-safe) and does NOT import this module, so this is a one-way dependency (no cycle). The empty
+// (no-override) path stays byte-identical, so this import is inert until a row is actually resized.
+import { getRowSizing, indexAtOffset } from './gridLayoutA1';
+
 /** One entry of a {@link QuantbookCellSnapshot} (row/col/value + optional rendered/formula/diagnostic). */
 export type CellSnapshotEntry = QuantbookCellSnapshot['entries'][number];
 
@@ -134,9 +140,21 @@ export function computeVisibleRowRange(
 	// must NOT yield an empty window (`slice(91, 10)`) + a giant top spacer --
 	// that paints a blank grid. Clamping shows the last rows instead.
 	const maxFirst = Math.max(0, totalRows - 1);
-	const firstVisible = Math.min(maxFirst, Math.max(0, Math.floor(scrollTop / rowHeight)));
-	const visibleCount = Math.max(1, Math.ceil(viewportHeight / rowHeight));
+	const rowSizing = getRowSizing();
+	if (rowSizing.overrides.size === 0) {
+		// Uniform fast path -- BYTE-IDENTICAL to the pre-Wave-G-rows code (the keystone invariant).
+		const firstVisible = Math.min(maxFirst, Math.max(0, Math.floor(scrollTop / rowHeight)));
+		const visibleCount = Math.max(1, Math.ceil(viewportHeight / rowHeight));
+		const startIdx = Math.max(0, firstVisible - overscan);
+		const endIdx = Math.min(totalRows, firstVisible + visibleCount + overscan);
+		return { startIdx, endIdx };
+	}
+	// Wave G-rows variable-height window: the first/last visible rows are the inverse cumulative-height
+	// lookups at the viewport's top/bottom edge (exact -- never an under-count that would blank a row). The
+	// stale-scrollTop clamp (`maxFirst`) still applies. Mirrors computeVisibleColRange's variable path.
+	const firstVisible = Math.min(maxFirst, Math.max(0, indexAtOffset(rowSizing, scrollTop)));
+	const lastVisible = Math.min(maxFirst, Math.max(0, indexAtOffset(rowSizing, scrollTop + viewportHeight)));
 	const startIdx = Math.max(0, firstVisible - overscan);
-	const endIdx = Math.min(totalRows, firstVisible + visibleCount + overscan);
+	const endIdx = Math.min(totalRows, lastVisible + 1 + overscan);
 	return { startIdx, endIdx };
 }
