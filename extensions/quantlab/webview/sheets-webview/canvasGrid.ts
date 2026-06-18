@@ -641,6 +641,17 @@ export class CanvasGridRenderer {
 		this.gutterW = this.computeGutterWidth();
 	}
 
+	/**
+	 * **FE-3 / Wave D**: the rotating ref-highlight palette (the SAME theme-derived hues
+	 * {@link drawRefHighlights} strokes the grid boxes with, re-resolved by {@link refreshTheme} on a theme
+	 * change). The formula-text-colouring overlay reads this so a ref's TEXT colour matches its BOX colour --
+	 * one source of truth, no second copy of the `--vscode-charts-*` list to drift. Index it MODULO its
+	 * length, exactly as the box path does.
+	 */
+	refHighlightPalette(): readonly string[] {
+		return this.palette.refHighlightColors;
+	}
+
 	/** Size the backing store for HiDPI. `cssWidth/cssHeight` are the viewport's logical px. */
 	resize(cssWidth: number, cssHeight: number): void {
 		this.dpr = CanvasGridRenderer.resolveDpr();
