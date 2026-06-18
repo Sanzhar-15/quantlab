@@ -195,6 +195,14 @@ pub trait EngineSession {
     /// untouched. Effectively a `register_format` + `set_format` pair scoped to
     /// decimal places; a malformed format surfaces a loud error (No-Fallbacks).
     fn nudge_cell_decimals(&mut self, addr: CellAddr, delta: i32) -> EngineResult<()>;
+    /// **R9 / Wave C (2026-06-18):** the READ-ONLY half of [`Self::nudge_cell_decimals`] — compute the
+    /// number-format STRING the cell would carry after a decimal nudge, WITHOUT interning a format or
+    /// rebinding the cell (so it never touches the undo history). Returns the nudged format string, or
+    /// `None` for a no-op (`delta == 0`, the clamp boundary, or the cell already carries the nudged
+    /// format). The host registers the returned string(s) and applies them over a selection in one
+    /// `batch`, giving a multi-cell decimal nudge a SINGLE undo unit. A format the engine cannot model
+    /// (`[Red]`/conditional/elapsed-time) surfaces a loud error (No-Fallbacks).
+    fn nudge_decimals_preview(&self, addr: CellAddr, delta: i32) -> EngineResult<Option<String>>;
     /// Parse+bind a formula WITHOUT mutating (keystroke path); returns diagnostics.
     fn validate_formula(&self, addr: CellAddr, text: &str) -> EngineResult<Vec<Diagnostic>>;
 

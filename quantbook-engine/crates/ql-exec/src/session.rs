@@ -2000,6 +2000,17 @@ impl EngineSession for WorkbookSession {
         Ok(())
     }
 
+    fn nudge_decimals_preview(&self, addr: CellAddr, delta: i32) -> EngineResult<Option<String>> {
+        self.ensure_readable()?;
+        self.require_live_sheet(addr.sheet, "nudge_decimals_preview")?;
+        // Read-only compute against the live workbook (no `&mut`/oplog needed, like
+        // `validate_formula`): returns the nudged format STRING, or `None` for a no-op.
+        // The host registers + applies it via one `batch`, so the undo history is
+        // untouched here. An unmodellable format surfaces loud via `map_runtime_err`.
+        crate::workbook_runtime::compute_nudged_format(&self.workbook, addr.sheet, addr.row, addr.col, delta)
+            .map_err(map_runtime_err)
+    }
+
     fn validate_formula(&self, addr: CellAddr, text: &str) -> EngineResult<Vec<Diagnostic>> {
         self.ensure_readable()?;
         self.require_live_sheet(addr.sheet, "validate_formula")?;
@@ -9519,6 +9530,45 @@ mod tests {
         s.recalc_dirty().unwrap();
         let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
         assert_eq!(c.rendered.as_deref(), Some("7.0"));
+    }
+
+    /// **R9 / Wave C (2026-06-18):** `nudge_decimals_preview` returns the nudged format STRING
+    /// WITHOUT mutating the cell, and the string matches what the apply path would bind. This is the
+    /// engine half the IDE batches over a selection for a single-undo multi-cell decimal nudge.
+    #[test]
+    fn nudge_decimals_preview_is_read_only_and_matches_apply() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.5 })
+            .unwrap();
+        let fmt = s.register_format("0.00").unwrap();
+        s.set_format(addr(sheet, 0, 0), fmt).unwrap();
+        s.recalc_dirty().unwrap();
+
+        // Preview the increase → "0.000". The cell must be UNCHANGED (still rendered "1.50").
+        let previewed = s.nudge_decimals_preview(addr(sheet, 0, 0), 1).unwrap();
+        assert_eq!(previewed.as_deref(), Some("0.000"));
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(
+            c.rendered.as_deref(),
+            Some("1.50"),
+            "preview must NOT rebind the cell"
+        );
+
+        // Applying the previewed string (the IDE's registerFormat + batch path) renders "1.500" —
+        // i.e. preview agrees with what the apply nudge would have produced.
+        let nudged_fmt = s.register_format(previewed.as_deref().unwrap()).unwrap();
+        s.set_format(addr(sheet, 0, 0), nudged_fmt).unwrap();
+        s.recalc_dirty().unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(c.rendered.as_deref(), Some("1.500"));
+
+        // A no-op preview (decrease past zero decimals on a "0" cell) returns None.
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 3.0 })
+            .unwrap();
+        let zero_fmt = s.register_format("0").unwrap();
+        s.set_format(addr(sheet, 1, 0), zero_fmt).unwrap();
+        assert_eq!(s.nudge_decimals_preview(addr(sheet, 1, 0), -1).unwrap(), None);
     }
 
     // --- Display-path gap closure (2026-06-10): `rendered` on the OWNING

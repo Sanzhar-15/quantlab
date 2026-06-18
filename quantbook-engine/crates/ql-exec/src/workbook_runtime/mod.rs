@@ -65,6 +65,10 @@ mod styles;
 mod tables;
 mod validate;
 pub use error::{RecomputeFailure, RecomputeResult, RuntimeError};
+// **R9 / Wave C (2026-06-18):** the read-only decimal-nudge compute, shared by
+// `WorkbookRuntime::nudge_cell_decimals` (apply) and the session's read-only
+// `nudge_decimals_preview` (the IDE's batched multi-cell path).
+pub(crate) use formats::compute_nudged_format;
 
 /// Phase 2A.6 audit H1/L4 (2026-05-12) helper. Confirms `sheet` is in range
 /// before any work that would otherwise panic inside `Workbook::put_at`.

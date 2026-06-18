@@ -20,7 +20,7 @@
 
 use ql_functions::format;
 use ql_oplog::Op;
-use ql_storage::FormatId;
+use ql_storage::{FormatId, Workbook};
 use ql_types::{ColId, EvalContext, RowId, SheetId};
 
 use super::{validate_cell, RuntimeError, WorkbookRuntime};
@@ -257,43 +257,68 @@ impl<'a> WorkbookRuntime<'a> {
         col: ColId,
         delta: i32,
     ) -> Result<Option<FormatId>, RuntimeError> {
-        validate_cell(self.workbook, sheet, row, col)?;
-        if delta == 0 {
-            return Ok(None);
+        // Compute the nudged format string (read-only); `None` ⇒ no-op.
+        match compute_nudged_format(self.workbook, sheet, row, col, delta)? {
+            None => Ok(None),
+            Some(nudged) => {
+                let new_id = self.intern_format(&nudged)?;
+                self.set_cell_format(sheet, row, col, Some(new_id))?;
+                Ok(Some(new_id))
+            }
         }
-        // Current bound format string (None ⇒ unbound ⇒ General default).
-        let current_id = self
-            .workbook
-            .sheet(sheet)
-            .and_then(|s| s.format_overlay().get(row, col));
-        let current_str: Option<String> = match current_id {
-            Some(id) => Some(
-                self.workbook
-                    .formats()
-                    .lookup(id)
-                    // An overlay id absent from the table is corrupted state;
-                    // surface loudly rather than silently treating it as General.
-                    .ok_or(RuntimeError::UnknownFormatId(id))?
-                    .to_owned(),
-            ),
-            None => None,
-        };
-        // Base for the nudge: a non-`General` bound format nudges in place;
-        // unbound OR `General` is treated as the integer base `"0"`.
-        let base: &str = match current_str.as_deref() {
-            Some(s) if !s.eq_ignore_ascii_case("General") => s,
-            _ => "0",
-        };
-        let nudged =
-            format::nudge_format_decimals(base, delta).map_err(RuntimeError::InvalidFormat)?;
-        // No-op iff the cell already carries exactly the nudged format.
-        if current_str.as_deref() == Some(nudged.as_str()) {
-            return Ok(None);
-        }
-        let new_id = self.intern_format(&nudged)?;
-        self.set_cell_format(sheet, row, col, Some(new_id))?;
-        Ok(Some(new_id))
     }
+}
+
+/// **R9 / Wave C (2026-06-18):** the READ-ONLY half of [`WorkbookRuntime::nudge_cell_decimals`] —
+/// compute the number-format STRING a cell would carry after a decimal nudge, WITHOUT interning a
+/// format or rebinding the cell. Reads the cell's current format (unbound / `General` ⇒ the integer
+/// base `"0"`), nudges the format-code string by `delta`, and returns the result, or `None` for a
+/// no-op (`delta == 0`, the clamp boundary, or the cell already carries the nudged format).
+///
+/// Pure over `&Workbook` (no mutation, no oplog) so the session's `nudge_decimals_preview` can call it
+/// from a `&self` read path — the IDE registers the returned string + applies it over a selection in
+/// ONE batch, giving a multi-cell decimal nudge a single undo unit. `nudge_cell_decimals` (the apply
+/// path) interns + rebinds whatever this returns. A format the engine cannot model (`[Red]`/conditional/
+/// elapsed-time) surfaces [`RuntimeError::InvalidFormat`] loudly (No-Fallbacks — never a corrupt format).
+pub(crate) fn compute_nudged_format(
+    workbook: &Workbook,
+    sheet: SheetId,
+    row: RowId,
+    col: ColId,
+    delta: i32,
+) -> Result<Option<String>, RuntimeError> {
+    validate_cell(workbook, sheet, row, col)?;
+    if delta == 0 {
+        return Ok(None);
+    }
+    // Current bound format string (None ⇒ unbound ⇒ General default).
+    let current_id = workbook
+        .sheet(sheet)
+        .and_then(|s| s.format_overlay().get(row, col));
+    let current_str: Option<String> = match current_id {
+        Some(id) => Some(
+            workbook
+                .formats()
+                .lookup(id)
+                // An overlay id absent from the table is corrupted state;
+                // surface loudly rather than silently treating it as General.
+                .ok_or(RuntimeError::UnknownFormatId(id))?
+                .to_owned(),
+        ),
+        None => None,
+    };
+    // Base for the nudge: a non-`General` bound format nudges in place;
+    // unbound OR `General` is treated as the integer base `"0"`.
+    let base: &str = match current_str.as_deref() {
+        Some(s) if !s.eq_ignore_ascii_case("General") => s,
+        _ => "0",
+    };
+    let nudged = format::nudge_format_decimals(base, delta).map_err(RuntimeError::InvalidFormat)?;
+    // No-op iff the cell already carries exactly the nudged format.
+    if current_str.as_deref() == Some(nudged.as_str()) {
+        return Ok(None);
+    }
+    Ok(Some(nudged))
 }
 
 #[cfg(test)]
@@ -655,6 +680,106 @@ mod tests {
             set_format_ops, 1,
             "no-op nudge must not emit a SetCellFormat"
         );
+    }
+
+    // ===== R9 / Wave C (2026-06-18): compute_nudged_format (read-only preview) =====
+
+    #[test]
+    fn preview_increase_returns_more_decimals_without_mutating() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let id = rt.intern_format("0.00").unwrap();
+            rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+        }
+        // Preview is read-only: returns the nudged STRING, leaves the binding intact.
+        let nudged = super::compute_nudged_format(&wb, s, 0, 0, 1).unwrap();
+        assert_eq!(nudged.as_deref(), Some("0.000"));
+        assert_eq!(
+            bound_format(&wb, s, 0, 0).as_deref(),
+            Some("0.00"),
+            "preview must NOT rebind the cell"
+        );
+    }
+
+    #[test]
+    fn preview_decrease_returns_fewer_decimals() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let id = rt.intern_format("0.00").unwrap();
+            rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+        }
+        assert_eq!(
+            super::compute_nudged_format(&wb, s, 0, 0, -1).unwrap().as_deref(),
+            Some("0.0")
+        );
+    }
+
+    #[test]
+    fn preview_unbound_increase_uses_general_base() {
+        // Unbound (General) cell ⇒ base "0" ⇒ increase = "0.0".
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        assert_eq!(
+            super::compute_nudged_format(&wb, s, 0, 0, 1).unwrap().as_deref(),
+            Some("0.0")
+        );
+        // Still unbound — preview never binds.
+        assert_eq!(bound_format(&wb, s, 0, 0), None);
+    }
+
+    #[test]
+    fn preview_explicit_general_format_uses_base() {
+        // A cell EXPLICITLY bound to the "General" format string behaves like the unbound case:
+        // base "0" ⇒ increase = "0.0" (the `eq_ignore_ascii_case("General")` branch in
+        // compute_nudged_format). Closes the Wave-C audit LOW gap (explicit-General was untested).
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let id = rt.intern_format("General").unwrap();
+            rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+        }
+        assert_eq!(
+            super::compute_nudged_format(&wb, s, 0, 0, 1).unwrap().as_deref(),
+            Some("0.0")
+        );
+    }
+
+    #[test]
+    fn preview_noop_returns_none() {
+        // delta 0 ⇒ None; a bound "0" decreased ⇒ already at zero decimals ⇒ None.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let id = rt.intern_format("0").unwrap();
+            rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+        }
+        assert_eq!(super::compute_nudged_format(&wb, s, 0, 0, 0).unwrap(), None);
+        assert_eq!(super::compute_nudged_format(&wb, s, 0, 0, -1).unwrap(), None);
+    }
+
+    #[test]
+    fn preview_and_apply_agree_on_the_nudged_string() {
+        // The apply path must bind exactly what the preview returns (they share
+        // compute_nudged_format) — the IDE's batched preview equals per-cell apply.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        let previewed = super::compute_nudged_format(&wb, s, 0, 0, 1).unwrap();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.nudge_cell_decimals(s, 0, 0, 1).unwrap();
+        }
+        assert_eq!(previewed.as_deref(), bound_format(&wb, s, 0, 0).as_deref());
     }
 
     #[test]
