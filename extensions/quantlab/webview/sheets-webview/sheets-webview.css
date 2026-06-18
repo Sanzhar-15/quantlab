@@ -603,6 +603,51 @@ body {
 	margin: 0;
 }
 
+/* FE-3 / Wave D in-cell follow-up: the text-colouring overlay for the in-cell editor. A sibling of
+ * .cell-edit-input in the scroller; JS sets its left/top/width/height/clip-path to MIRROR the input (so they
+ * are intentionally absent here). DECORATIVE ONLY -- pointer-events:none + user-select:none means every click,
+ * drag, caret move and text selection passes through to the input below, which stays the SOLE edit surface. It
+ * mirrors the input's font / padding / border / box-sizing so glyphs land on the input's glyphs; white-space:pre
+ * + overflow:hidden + a JS-synced scrollLeft reproduce the input's single-line horizontal scroll. */
+.cell-edit-ink {
+	position: absolute;
+	z-index: 3; /* above .cell-edit-input (z-index 2); pointer-events:none so it never blocks the input */
+	display: flex; /* a flex row so align-items can vertically centre the single line, matching the input */
+	align-items: center; /* match the <input>'s native single-line vertical centring */
+	box-sizing: border-box;
+	margin: 0;
+	padding: 2px 7px; /* == .cell-edit-input: 7px + the 1px border = 8px text origin, matching the input + canvas CELL_PAD */
+	border: 1px solid transparent; /* same 1px box as the input; transparent so the input's real focus border shows */
+	font-family: var(--vscode-font-family);
+	font-size: 13px; /* == .cell-edit-input (the canvas body font) */
+	line-height: normal; /* explicit so the overlay's line box matches the input's UA `normal`, not a div default */
+	color: var(--vscode-input-foreground); /* default (non-ref) glyph colour == the input's text colour */
+	white-space: pre;
+	overflow: hidden;
+	pointer-events: none;
+	user-select: none;
+	background: transparent;
+}
+
+.cell-edit-ink[hidden] {
+	display: none;
+}
+
+/* Each coloured run is a NON-shrinking flex item so the spans abut exactly like continuous text (no flex
+ * grow/shrink redistribution), and `white-space: pre` (inherited) preserves the spaces inside default gaps. */
+.cell-edit-ink > span {
+	flex: 0 0 auto;
+	white-space: pre;
+}
+
+/* While the overlay is active the input's OWN text is made transparent so only the overlay's coloured glyphs
+ * show. The caret stays visible (caret-color is independent of color), and the native selection band (drawn by
+ * the input below the pointer-events:none overlay) still shows, with the coloured glyphs painted on top. */
+.cell-edit-input.inking {
+	color: transparent;
+	caret-color: var(--vscode-input-foreground);
+}
+
 /* ============================================================================
  * Sheet-tabs (2026-06-10): the Excel-style bottom tab strip. A horizontal,
  * scrollable row of tabs below the viewport. Colors use VS Code's own editor-tab

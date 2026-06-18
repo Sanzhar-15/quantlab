@@ -46,7 +46,7 @@ import type { CellAddrJson, DiagnosticJson, FunctionMetadataJson, NamedRangeJson
 import { matchNameForSelection } from '../../src/quantbook/shared/nameMatch';
 import { buildRefText, canPointAtRange, insertRefAtCaret, type RefSpan } from '../../src/quantbook/shared/formulaRangePick';
 import { computeFormulaRefHighlights } from '../../src/quantbook/shared/formulaRefHighlights';
-import { buildFormulaInkSegments } from '../../src/quantbook/shared/formulaInk';
+import { buildFormulaInkSegments, type InkSegment } from '../../src/quantbook/shared/formulaInk';
 import { clampDisplayString, formatCellValue } from './cellRender';
 import {
 	buildSignatureLabel,
@@ -310,6 +310,11 @@ root.innerHTML =
 	'<canvas id="sheets-canvas"></canvas>' +
 	'<input id="sheets-edit-input" class="cell-edit-input" type="text" aria-label="Edit cell value" ' +
 	'spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" hidden />' +
+	// **FE-3 / Wave D in-cell follow-up**: the decorative text-colouring overlay for the IN-CELL editor --
+	// a sibling of the edit input inside the scroller (the same CONTENT-coordinate positioning context), so
+	// JS can mirror the input's left/top/width/height/clip onto it. pointer-events:none -> the input below
+	// remains the sole edit surface. Hidden until an in-cell FORMULA edit is live.
+	'<div id="sheets-cell-ink" class="cell-edit-ink" aria-hidden="true" hidden></div>' +
 	'</div>' +
 	// Sheet-tabs (2026-06-10): the Excel-style bottom tab strip, a sibling BELOW the viewport. Painted by
 	// `renderSheetTabs` from the host's `render` payload (sheets + activeSheet); empty until the first render.
@@ -324,18 +329,24 @@ const formulaInputEl = document.getElementById('sheets-formula-input') as HTMLIn
 // **FE-3 / Wave D**: the decorative text-colouring overlay aligned over the formula input (formula bar only).
 const formulaInkEl = document.getElementById('sheets-formula-ink') as HTMLElement;
 // **FE-3 / Wave D formula-text colouring** -- a BUILD-TIME kill switch (flip to false + rebuild/reload the
-// webview to disable; not a runtime toggle), NOT a fallback: when false, `renderFormulaInk` no-ops and the
-// input shows its own opaque text -- a clean static on/off for this can't-headless-verify editor surface that
-// never masks an error. Declared HERE, with the other ink module-state, so it is INITIALIZED before the
-// module-init `updateFormulaBar()` seed (which now reaches `renderFormulaInk`): the es2024/ESM webview build
-// keeps `const`/`let` block-scoped (no `var` hoist), so a later declaration would be a temporal-dead-zone
-// throw on load (Codex re-audit HIGH).
+// webview to disable; not a runtime toggle), NOT a fallback: when false BOTH `renderFormulaInk` (formula bar)
+// and `renderCellInk` (in-cell editor) no-op and each input shows its own opaque text -- a clean static on/off
+// for these can't-headless-verify editor surfaces that never masks an error. Declared HERE, with the other ink
+// module-state, so it is INITIALIZED before the module-init `updateFormulaBar()` seed (which reaches
+// `renderFormulaInk`): the es2024/ESM webview build keeps `const`/`let` block-scoped (no `var` hoist), so a
+// later declaration would be a temporal-dead-zone throw on load (Codex re-audit HIGH).
 const FORMULA_INK_ENABLED = true;
 // True between compositionstart/compositionend on the formula bar: while an IME candidate composes we keep the
 // input's OWN text visible (the `.inking` transparent-text would hide the composition underline), so the
 // overlay stands down until the candidate commits.
 let formulaInkComposing = false;
 const viewportEl = document.getElementById('sheets-viewport') as HTMLElement;
+// **FE-3 / Wave D in-cell follow-up**: the decorative text-colouring overlay for the IN-CELL editor, and its
+// own IME guard (mirrors `formulaInkComposing` for the formula bar). NON-null (No-Fallbacks: a missing element
+// throws loudly on load). Co-located with the other ink module-state so both are initialised before any path
+// reaches `renderCellInk` (same TDZ discipline as the formula-bar globals above).
+const cellInkEl = document.getElementById('sheets-cell-ink') as HTMLElement;
+let cellInkComposing = false;
 // Sheet-tabs (2026-06-10): the bottom tab strip container (painted by `applySheetTabs` on each render).
 const tabBarEl = document.getElementById('sheets-tab-bar') as HTMLElement;
 // UI-parity (2026-06-10) + demo-prep wiring: the top toolbar and the menu bar above it. The wired
@@ -2225,16 +2236,42 @@ function updateRefHighlights(): boolean {
 			next.push({ rect: h.rect, colorIndex: h.colorIndex });
 		}
 	}
-	// **FE-3 / Wave D**: repaint the formula-bar text-colouring overlay from the SAME recompute. Done BEFORE
-	// the box change-gate below, UNGATED: the editor text (hence the colouring) changes on every keystroke
-	// even when the deduped BOX set does not (e.g. typing inside a string literal, or editing a non-ref part),
-	// so the ink must refresh regardless of whether the boxes did. Cheap (short strings), self-gates on surface.
+	// **FE-3 / Wave D**: repaint the text-colouring overlay for whichever editor is live from the SAME recompute.
+	// Done BEFORE the box change-gate below, UNGATED: the editor text (hence the colouring) changes on every
+	// keystroke even when the deduped BOX set does not (e.g. typing inside a string literal, or editing a non-ref
+	// part), so the ink must refresh regardless of whether the boxes did. Cheap (short strings); each call
+	// self-gates on its surface, so exactly one paints (formula bar vs in-cell) and the other no-ops.
 	renderFormulaInk();
+	renderCellInk();
 	if (refHighlightsEqual(next, activeRefHighlights)) {
 		return false;
 	}
 	activeRefHighlights = next;
 	return true;
+}
+
+/**
+ * **FE-3 / Wave D** -- paint a partitioned formula into an ink overlay as coloured `<span>`s. SHARED by both
+ * editor surfaces (formula bar + in-cell) so the colour mapping is single-source: a drawable ref (`colorIndex
+ * >= 0`) takes the palette hue MODULO its length -- IDENTICAL to the grid box ({@link CanvasGridRenderer}
+ * `drawRefHighlights`), so a ref's text colour and its box colour can never drift apart. A default segment
+ * (`colorIndex < 0` -- operators, the leading '=', string literals, function names, qualified refs) inherits
+ * the overlay's own `var(--vscode-input-foreground)`, matching the input. Replaces the overlay's children in
+ * one shot; does NOT touch visibility/scroll/`.inking` -- the caller owns those (they differ per surface).
+ */
+function paintInkSpans(inkEl: HTMLElement, segments: InkSegment[]): void {
+	const palette = renderer.refHighlightPalette();
+	const frag = document.createDocumentFragment();
+	for (const seg of segments) {
+		const span = document.createElement('span');
+		span.textContent = seg.text;
+		if (seg.colorIndex >= 0 && palette.length > 0) {
+			span.style.color = palette[((seg.colorIndex % palette.length) + palette.length) % palette.length];
+		}
+		frag.appendChild(span);
+	}
+	inkEl.textContent = '';
+	inkEl.appendChild(frag);
 }
 
 /**
@@ -2270,27 +2307,76 @@ function renderFormulaInk(): void {
 		formulaInkEl.hidden = true;
 		return;
 	}
-	const palette = renderer.refHighlightPalette();
-	const frag = document.createDocumentFragment();
-	for (const seg of segments) {
-		const span = document.createElement('span');
-		span.textContent = seg.text;
-		// colorIndex < 0 (default text -- operators, the leading '=', a string literal, a qualified ref)
-		// inherits the overlay's own `var(--vscode-input-foreground)`, matching the input. A drawable ref
-		// takes the palette hue MODULO its length -- IDENTICAL to the grid box (canvasGrid.drawRefHighlights),
-		// so a ref's text colour and its box colour always agree.
-		if (seg.colorIndex >= 0 && palette.length > 0) {
-			span.style.color = palette[((seg.colorIndex % palette.length) + palette.length) % palette.length];
-		}
-		frag.appendChild(span);
-	}
-	formulaInkEl.textContent = '';
-	formulaInkEl.appendChild(frag);
+	paintInkSpans(formulaInkEl, segments);
 	formulaInkEl.hidden = false;
 	// Mirror the input's native horizontal scroll so a long formula's colouring stays glyph-aligned (the
 	// padded overlay clips + scrolls the same way the padded input does). Re-synced on the input `scroll` too.
 	formulaInkEl.scrollLeft = formulaInputEl.scrollLeft;
 	formulaInputEl.classList.add('inking'); // transparent input text -> only the overlay's coloured glyphs show
+}
+
+/**
+ * **FE-3 / Wave D in-cell follow-up** -- mirror the in-cell editor's geometry onto its ink overlay. The
+ * overlay (`cellInkEl`) and the input (`inputEl`) are sibling absolute children of the SAME scroller, so the
+ * overlay sits exactly over the input by copying its JS-set inline geometry: position (`left`/`top`), size
+ * (`width`/`height`), the sticky-band `clip-path` (so the overlay is hidden under the header/gutter exactly
+ * like the input), and the native horizontal `scrollLeft` (so a long formula's colouring stays glyph-aligned).
+ * Cheap string copies; a no-op when the overlay is hidden. Called wherever the input's geometry/clip changes
+ * ({@link updateEditClip}, the convergence point for begin/reposition/scroll/theme) and on the input's own
+ * horizontal `scroll`.
+ */
+function syncCellInkGeometry(): void {
+	if (cellInkEl.hidden) {
+		return;
+	}
+	cellInkEl.style.left = inputEl.style.left;
+	cellInkEl.style.top = inputEl.style.top;
+	cellInkEl.style.width = inputEl.style.width;
+	cellInkEl.style.height = inputEl.style.height;
+	cellInkEl.style.clipPath = inputEl.style.clipPath;
+	cellInkEl.scrollLeft = inputEl.scrollLeft;
+}
+
+/**
+ * **FE-3 / Wave D in-cell follow-up** -- repaint the IN-CELL editor's text-colouring overlay (the text-side
+ * companion to the grid ref boxes, mirroring {@link renderFormulaInk} for the formula bar). A DECORATIVE layer
+ * ONLY: `cellInkEl` is `pointer-events:none` + `aria-hidden`, so the real `<input>` (`inputEl`) stays the SOLE
+ * editing authority -- this never reads/writes caret, selection, or value. Active ONLY when the IN-CELL editor
+ * is the live surface (`surface === 'overlay'`) of a FORMULA (`value[0] === '='`) and no IME composition is in
+ * flight; otherwise it stands down and the input renders its normal opaque text. Reuses the SAME palette + pure
+ * scanner as the bar (via {@link paintInkSpans} / {@link buildFormulaInkSegments}), and on show calls
+ * {@link syncCellInkGeometry} so the overlay lands pixel-aligned over the cell. Driven from the single recompute
+ * funnel ({@link updateRefHighlights}) + the single teardown ({@link cancelEdit}), so it cannot drift out of
+ * sync with the edited value.
+ */
+function renderCellInk(): void {
+	const value = inputEl.value;
+	const on = FORMULA_INK_ENABLED && !cellInkComposing && editState !== null
+		&& editState.surface === 'overlay' && value.length > 0 && value[0] === '=';
+	if (!on) {
+		// Stand down: restore the input's opaque text + clear/hide the overlay. Idempotent (a cheap no-op when
+		// already off), so calling it on every non-formula keystroke and on edit teardown costs nothing.
+		inputEl.classList.remove('inking');
+		if (cellInkEl.firstChild !== null) {
+			cellInkEl.textContent = '';
+		}
+		cellInkEl.hidden = true;
+		return;
+	}
+	const segments = buildFormulaInkSegments(value);
+	if (segments.length === 0) {
+		// Defensive: `value[0] === '='` guarantees >= 1 segment, but never leave a stale overlay if it did not.
+		inputEl.classList.remove('inking');
+		cellInkEl.textContent = '';
+		cellInkEl.hidden = true;
+		return;
+	}
+	paintInkSpans(cellInkEl, segments);
+	cellInkEl.hidden = false;
+	// Position the freshly-shown overlay over the cell (mirror the input's geometry + clip + scroll). Done after
+	// `hidden = false` so syncCellInkGeometry's hidden-guard lets the copy through.
+	syncCellInkGeometry();
+	inputEl.classList.add('inking'); // transparent input text -> only the overlay's coloured glyphs show
 }
 
 // --- Selection / navigation ---
@@ -3090,10 +3176,12 @@ function cancelEdit(): void {
 	}
 	const surface = editState.surface; // capture before nulling -- the teardown branch depends on it
 	editState = null;
-	// FE-3 / Wave D: clear any IME-composition guard so a composition interrupted WITHOUT a `compositionend`
+	// FE-3 / Wave D: clear both IME-composition guards so a composition interrupted WITHOUT a `compositionend`
 	// (rare, but it would otherwise stick `true` and silently disable colouring for later edits) can never
-	// outlive this edit. (Opus L1.)
+	// outlive this edit. (Opus L1.) Both surfaces are reset here -- only one was ever live, the other is already
+	// false, so clearing both is harmless and keeps the teardown surface-symmetric.
 	formulaInkComposing = false;
+	cellInkComposing = false;
 	// FE-3 range-pick: a closing editor ends point mode. Drop any live re-point span + in-flight drag/preview
 	// so a later pointerdown cannot replace a stale span or paint a ghost. (pointPreview is normally already
 	// null -- a drag ends on its own pointerup -- so the redraw is defensive: it only fires if a drag was
@@ -3126,10 +3214,13 @@ function cancelEdit(): void {
 		teardownFormulaAssist();
 		updateFormulaBar();
 	}
-	// **FE-3 / Wave D**: the editor is closing -> stand the text-colouring overlay down. editState is now null,
-	// so renderFormulaInk restores the bar's opaque text + hides the overlay on EVERY close path (Escape /
-	// blur / commit-success via resolvePendingCommit / surface switch). Mirrors the activeRefHighlights clear.
+	// **FE-3 / Wave D**: the editor is closing -> stand BOTH text-colouring overlays down. editState is now null,
+	// so each renderer restores its input's opaque text + hides its overlay on EVERY close path (Escape / blur /
+	// commit-success via resolvePendingCommit / surface switch). Mirrors the activeRefHighlights clear. The
+	// in-cell input is also hidden + value-cleared above (surface === 'overlay' branch), but renderCellInk still
+	// removes `.inking` so the next editor opened on that input never starts with transparent text.
 	renderFormulaInk();
+	renderCellInk();
 	clearCommitWatchdog(); // the editor is gone -- no pending commit to recover (re-audit HIGH)
 	clearError(); // closing the editor resolves any 'edit'-source banner (re-audit MED-4)
 }
@@ -3740,6 +3831,10 @@ function updateEditClip(): void {
 	const clipLeft = Math.max(0, Math.min(pos.width, leftBand - viewX));
 	const clipTop = Math.max(0, Math.min(pos.height, topBand - viewY));
 	inputEl.style.clipPath = 'inset(' + clipTop + 'px 0px 0px ' + clipLeft + 'px)';
+	// **FE-3 / Wave D in-cell follow-up**: this is the convergence point for the editor's geometry + clip (called
+	// from beginEdit, repositionEdit [scroll/theme], and the ensureActiveVisible re-clip), so re-mirror it onto
+	// the ink overlay here. No-op when the overlay is hidden (not an in-cell formula edit).
+	syncCellInkGeometry();
 }
 
 /**
@@ -4104,6 +4199,23 @@ function onEditBlur(ev: FocusEvent): void {
 inputEl.addEventListener('input', onEditInput);
 inputEl.addEventListener('keydown', onEditKeydown);
 inputEl.addEventListener('blur', onEditBlur);
+// **FE-3 / Wave D in-cell follow-up** text-colouring overlay listeners (in-cell editor). Mirror the input's
+// native horizontal scroll (caret/arrow-driven scroll fires `scroll`, not `input`, and updateEditClip does not
+// fire on the input's OWN scroll, so the in-funnel sync would miss it), and stand the overlay down during IME
+// composition so the composing candidate (drawn by the input's own, then-visible text) stays readable.
+inputEl.addEventListener('scroll', () => {
+	if (!cellInkEl.hidden) {
+		cellInkEl.scrollLeft = inputEl.scrollLeft;
+	}
+});
+inputEl.addEventListener('compositionstart', () => {
+	cellInkComposing = true;
+	renderCellInk();
+});
+inputEl.addEventListener('compositionend', () => {
+	cellInkComposing = false;
+	renderCellInk();
+});
 formulaInputEl.addEventListener('input', onEditInput);
 formulaInputEl.addEventListener('keydown', onEditKeydown);
 formulaInputEl.addEventListener('blur', onEditBlur);
@@ -6013,12 +6125,13 @@ new MutationObserver(() => {
 	repositionEdit();
 	updateSpacer();
 	redraw();
-	// FE-3 / Wave D: recolour the active formula-bar overlay from the REFRESHED palette. The ink spans cache
-	// their colour inline (resolved at paint time), so a theme change leaves them on the OLD hues while the
+	// FE-3 / Wave D: recolour the active overlay (whichever surface) from the REFRESHED palette. The ink spans
+	// cache their colour inline (resolved at paint time), so a theme change leaves them on the OLD hues while the
 	// grid boxes just repainted from the new palette -- the text/box colours would disagree until the next
-	// keystroke. renderFormulaInk re-resolves from renderer.refHighlightPalette(); self-gates to a no-op when
-	// the formula bar isn't the live editor. (Codex MEDIUM + Opus L2.)
+	// keystroke. Each renderer re-resolves from renderer.refHighlightPalette(); each self-gates to a no-op when
+	// its surface isn't the live editor. (Codex MEDIUM + Opus L2.)
 	renderFormulaInk();
+	renderCellInk();
 	// Audit re-audit LOW: watch the theme-id/kind attributes too, not just `class`. VS Code switches
 	// between themes of the SAME kind (e.g. Dark+ -> another dark theme) by changing `data-vscode-theme-id`
 	// + the CSS vars WITHOUT changing the `vscode-dark` body class; a `class`-only observer would miss it
