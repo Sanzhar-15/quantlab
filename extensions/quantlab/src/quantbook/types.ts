@@ -2181,7 +2181,8 @@ export interface SessionInstance {
 	 * after an increase (`delta > 0`) / decrease (`delta < 0`) of its decimal places -- the read-only half
 	 * of Excel's "Increase/Decrease Decimal". The engine reads the cell's current format (an unbound /
 	 * `General` cell is the integer base `"0"`) and nudges it, returning the new format STRING, or `null`
-	 * when nothing would change (clamp boundary, the cell already carries the nudged format, or `delta === 0`).
+	 * when nothing would change (clamp boundary, or the cell already carries the nudged format). (`delta === 0`
+	 * is rejected as `[bad_argument]` -- it never reaches the null path.)
 	 *
 	 * PURE READ -- it does NOT intern a format or rebind the cell (so it never touches the undo history).
 	 * The IDE registers the returned string(s) via {@link registerFormat} and applies them over the

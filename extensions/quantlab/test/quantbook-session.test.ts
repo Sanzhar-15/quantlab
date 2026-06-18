@@ -363,5 +363,20 @@ suite('quantbook owning Session migration -- Phase 6.1B inc.2d', () => {
 			// Increasing it DOES nudge ⇒ "0.0".
 			assert.strictEqual(s.nudgeDecimalsPreview(sheet, 0, 0, 1), '0.0');
 		});
+
+		test('preview on an unmodellable [Red] format throws -- the trigger for the two-phase host', () => {
+			// Codex audit MED: the host (applyToolbarDecimalNudge) previews ALL cells BEFORE registering any
+			// format, so this throw aborts phase 1 having registered nothing (no partial side effect). Here we
+			// pin the engine-level trigger: a [Red] color-coded format the engine cannot model surfaces a loud
+			// error from nudgeDecimalsPreview (No-Fallbacks -- never silently mangled). registerFormat stores
+			// the string (grammar is parsed at nudge/render time, not at intern time), so the setup is real.
+			const s = createWorkbookSession();
+			const sheet = s.addSheet('S', 1000);
+			s.setValue(sheet, 0, 0, { kind: 'number', number: 1 });
+			const red = s.registerFormat('[Red]0.00');
+			s.setFormat(sheet, 0, 0, red);
+			s.recalcDirty();
+			assert.throws(() => s.nudgeDecimalsPreview(sheet, 0, 0, 1), /invalid_format|format/i);
+		});
 	});
 });

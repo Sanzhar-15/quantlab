@@ -1464,30 +1464,40 @@ export class CellGridPanel {
 		const undoLabel = `${verb} decimals on ${target}`;
 		let opSucceeded = false;
 		try {
-			// Preview each cell's nudged format STRING (read-only -- no engine mutation), dedup-register the
-			// distinct strings, and apply them in ONE batch so the whole selection is a SINGLE undo unit
-			// (the exact registerFormat -> batch discipline as applyToolbarNumberFormat; the per-cell apply
-			// `nudgeDecimals` would be N separate undo commits). A `null` preview is a no-op cell (clamp
-			// boundary / already-nudged) -- skipped, contributes no op.
-			const idByString = new Map<string, FormatIdJson>();
-			const ops: SessionOpJson[] = [];
+			// **PHASE 1 -- READ-ONLY.** Preview EVERY target first (zero engine mutation), collecting the
+			// (cell, nudged-string) pairs for cells that actually change. A `null` preview is a no-op cell
+			// (clamp boundary / already-nudged) -- skipped. If ANY preview THROWS (e.g. a [Red]/conditional
+			// format the engine can't model), we abort HERE having registered NOTHING + committed nothing --
+			// a failed nudge leaves no orphan format registration and consumes no undo entry. (Codex audit
+			// MED: registering inside this loop would, on a mid-loop throw, leave earlier cells' formats
+			// registered but no cells changed -- a partial side effect on the failure path.)
+			const previews: Array<{ row: number; col: number; nudged: string }> = [];
 			for (const t of targets) {
 				const nudged = this.session.nudgeDecimalsPreview(this.sheet, t.row, t.col, delta);
-				if (nudged === null) {
-					continue;
+				if (nudged !== null) {
+					previews.push({ row: t.row, col: t.col, nudged });
 				}
-				let fid = idByString.get(nudged);
-				if (fid === undefined) {
-					fid = this.session.registerFormat(nudged);
-					idByString.set(nudged, fid);
-				}
-				ops.push({ kind: 'setFormat', sheet: this.sheet, row: t.row, col: t.col, format: fid });
 			}
-			if (ops.length === 0) {
+			if (previews.length === 0) {
 				// Nothing nudgeable in the selection (e.g. decrease already at zero decimals, or all cells
 				// non-numeric). Honest feedback rather than a silent no-op or a phantom undo step.
 				void vscode.window.showInformationMessage(`${verb} decimals: nothing to adjust in ${target}.`);
 				return;
+			}
+			// **PHASE 2 -- WRITE.** Every preview succeeded, so the strings are all valid nudge outputs.
+			// Dedup-register the distinct strings + apply them in ONE `session.batch` of setFormat ops -- the
+			// register+batch happen TOGETHER, only after all reads succeeded (the registerFormat -> batch
+			// discipline of applyToolbarNumberFormat). The single batch makes the cell edits one undo unit;
+			// the per-cell apply `nudgeDecimals` would be N separate undo commits.
+			const idByString = new Map<string, FormatIdJson>();
+			const ops: SessionOpJson[] = [];
+			for (const p of previews) {
+				let fid = idByString.get(p.nudged);
+				if (fid === undefined) {
+					fid = this.session.registerFormat(p.nudged);
+					idByString.set(p.nudged, fid);
+				}
+				ops.push({ kind: 'setFormat', sheet: this.sheet, row: p.row, col: p.col, format: fid });
 			}
 			this.session.batch(ops, { undoLabel });
 			recalcDirtyChecked(this.session);
