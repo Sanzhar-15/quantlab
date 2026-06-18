@@ -23,6 +23,7 @@
 		"webview/qviz/**/*.ts",
 		"webview/qviz-spec/**/*.ts",
 		"webview/sheets-webview/**/*.ts",
+		"webview/sql-query/**/*.ts",
 		"../../src/vscode-dts/vscode.d.ts"
 	],
 	"exclude": []

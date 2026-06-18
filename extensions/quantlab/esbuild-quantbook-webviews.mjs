@@ -47,6 +47,8 @@ const sheetsDir = path.join(srcDir, 'sheets-webview');
 // webview (below). It imports the sheets webview's renderer + the extracted RenderOrchestrator from
 // `../sheets-webview/*`, which esbuild bundles transitively (the bundle is self-contained).
 const benchDir = path.join(srcDir, 'render-bench');
+// FE-6 / R18 Wave E (2026-06-18): the SQL-query sidebar webview source.
+const sqlDir = path.join(srcDir, 'sql-query');
 // Namespaced under dist/webview/quantbook/ -- isolated from the shared bundles.
 const outDir = path.join(baseDir, 'dist', 'webview', 'quantbook');
 
@@ -139,6 +141,10 @@ run({
 		// FE-2 BAKEOFF: the render-bench webview + its stylesheet.
 		'render-bench': path.join(benchDir, 'index.ts'),
 		'render-bench-style': path.join(benchDir, 'render-bench.css'),
+		// FE-6 / R18 Wave E: the SQL-query sidebar webview + its stylesheet. Lands at
+		// dist/webview/quantbook/sql-query.{js,css} (SqlQueryViewProvider resolves those flat names).
+		'sql-query': path.join(sqlDir, 'index.ts'),
+		'sql-query-style': path.join(sqlDir, 'sql-query.css'),
 	},
 	// Watch the whole `webview/` tree so a bench edit triggers a rebuild too (was `sheetsDir`).
 	srcDir,

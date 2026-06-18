@@ -953,6 +953,12 @@
           "id": "quantlab.depGraphView",
           "name": "%view.depGraph.title%",
           "when": "quantbook.hasOpenGrid"
+        },
+        {
+          "id": "quantlab.sqlQueryView",
+          "type": "webview",
+          "name": "%view.sqlQuery.title%",
+          "when": "quantbook.hasOpenGrid"
         }
       ]
     },

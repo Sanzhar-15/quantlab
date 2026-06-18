@@ -1,0 +1,171 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/*
+ * FE-6 / R18 Wave E -- SQL-query sidebar styles. Uses the VS Code webview theme variables so it tracks the
+ * active color theme with no token bus dependency.
+ */
+
+body {
+	margin: 0;
+	padding: 8px;
+	font-family: var(--vscode-font-family);
+	font-size: var(--vscode-font-size, 13px);
+	color: var(--vscode-foreground);
+}
+
+#sql-root {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.sql-section-label {
+	font-weight: 600;
+	font-size: 11px;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	opacity: 0.85;
+	margin-top: 2px;
+}
+
+.sql-tables {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	max-height: 120px;
+	overflow-y: auto;
+	border: 1px solid var(--vscode-panel-border, transparent);
+	border-radius: 3px;
+}
+
+.sql-table-item {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 8px;
+	padding: 3px 6px;
+	cursor: pointer;
+}
+
+.sql-table-item:hover {
+	background: var(--vscode-list-hoverBackground);
+}
+
+.sql-table-name {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sql-table-kind {
+	flex: 0 0 auto;
+	font-size: 10px;
+	opacity: 0.6;
+	text-transform: uppercase;
+}
+
+.sql-tables-msg {
+	padding: 4px 6px;
+	opacity: 0.7;
+	font-style: italic;
+}
+
+.sql-text {
+	width: 100%;
+	box-sizing: border-box;
+	resize: vertical;
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: var(--vscode-editor-font-size, 12px);
+	color: var(--vscode-input-foreground);
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: 3px;
+	padding: 6px;
+}
+
+.sql-target-row {
+	display: flex;
+	gap: 6px;
+	align-items: center;
+}
+
+.sql-target {
+	flex: 1 1 auto;
+	box-sizing: border-box;
+	color: var(--vscode-input-foreground);
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: 3px;
+	padding: 4px 6px;
+	font-family: var(--vscode-editor-font-family, monospace);
+}
+
+.sql-button-row {
+	display: flex;
+	gap: 6px;
+}
+
+.sql-btn {
+	border: none;
+	border-radius: 3px;
+	padding: 5px 10px;
+	cursor: pointer;
+	font-family: inherit;
+	font-size: inherit;
+}
+
+.sql-btn:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
+
+.sql-btn-primary {
+	background: var(--vscode-button-background);
+	color: var(--vscode-button-foreground);
+}
+
+.sql-btn-primary:hover:not(:disabled) {
+	background: var(--vscode-button-hoverBackground);
+}
+
+.sql-btn-secondary {
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+}
+
+.sql-btn-secondary:hover:not(:disabled) {
+	background: var(--vscode-button-secondaryHoverBackground);
+}
+
+.sql-status {
+	min-height: 1.2em;
+	font-size: 12px;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.sql-status-info {
+	opacity: 0.75;
+}
+
+.sql-status-ok {
+	color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, var(--vscode-foreground)));
+}
+
+.sql-status-warn {
+	color: var(--vscode-editorWarning-foreground, var(--vscode-charts-yellow, var(--vscode-foreground)));
+}
+
+.sql-status-error {
+	color: var(--vscode-errorForeground);
+}
+
+.sql-note {
+	font-size: 11px;
+	opacity: 0.6;
+	line-height: 1.4;
+	margin-top: 4px;
+}

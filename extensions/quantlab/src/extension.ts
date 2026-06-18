@@ -15,6 +15,7 @@ import { QNB_NOTEBOOK_TYPE, QnbSerializer } from './quantbook/reactiveNotebook/q
 import { registerReactiveNotebookController } from './quantbook/reactiveNotebook/reactiveNotebookController';
 import { registerQuantbookShell } from './quantbook/shell/quantbookShell';
 import { registerDepGraphSidebar } from './quantbook/shell/registerDepGraphSidebar';
+import { SqlQueryViewProvider } from './quantbook/shell/SqlQueryViewProvider';
 import { registerQuantbookMcpServer } from './quantbook/mcp/mcpServer';
 import type { SessionInstance } from './quantbook/types';
 import { registerGlobalStateCommands } from './commands/globalStateCommands';
@@ -368,6 +369,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// the same reactive-kernel manager data source. Kept as a separate registration (not folded into
 	// registerQuantbookShell) so the W3 increment is additive.
 	registerDepGraphSidebar(context, builtKernelManager);
+
+	// FE-6 / R18 Wave E: the "SQL Query" sidebar -- an in-session re-runnable SQL editor over the engine's
+	// materializeQuery, spilling a SELECT into a target range on the focused grid. A WebviewViewProvider (not
+	// a tree -- the SQL editor is multi-line), gated by the same `quantbook.hasOpenGrid` context key. Pure-IDE
+	// (the napi is already in the loaded dylib). retainContextWhenHidden keeps the SQL draft across hide/show.
+	context.subscriptions.push(
+		vscode.window.registerWebviewViewProvider(
+			SqlQueryViewProvider.viewType,
+			new SqlQueryViewProvider(context.extensionUri),
+			{ webviewOptions: { retainContextWhenHidden: true } },
+		),
+	);
 
 	// W2 error-surface: the dedicated Quantbook error surface -- ONE `quantbook` DiagnosticCollection that
 	// mirrors cell errors into VS Code's Problems panel. The Cell Grid panel reports its stored cell errors

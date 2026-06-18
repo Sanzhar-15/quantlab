@@ -42,10 +42,12 @@
 
 import * as vscode from 'vscode';
 
-import type { CellRangeJson, FormatIdJson, QuantbookCellSnapshot, SessionInstance, SessionOpJson, WorkbookSnapshotJson } from '../types';
+import type { CellRangeJson, CellValueJson, FormatIdJson, QuantbookCellSnapshot, SessionInstance, SessionOpJson, WorkbookSnapshotJson } from '../types';
 import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, MAX_NUDGE_CELLS, parseNameBoxSubmitMessage, parseToolbarCommandMessage, type CellsWrittenMessage, type CommitResultMessage, type FunctionListMessage, type GridSelection, type ToolbarFormatPreset, type ValidateFormulaResultMessage } from './cellGridLogic';
 import { getNonce, getWebviewUri } from '../../utils/webview';
 import type { PublishedRange } from '../reactiveKernel/publishedCellsStore';
+import { SqlResultsStore } from './sqlResultsStore';
+import { sqlOrphanClearRanges } from '../shared/sqlPanelCore';
 // Demo-prep toolbar (2026-06-10): the webview toolbar's `setNumberFormat` applies a preset directly to
 // this panel's selection -- the same registerFormat -> buildSetFormatOps -> batch -> recalc -> refresh
 // core as the `quantlab.quantbookSetFormat` command (which keeps the QuickPick/Custom path).
@@ -115,6 +117,26 @@ type PublishedCellsProvider = (session: SessionInstance, sheet: number) => Publi
 let publishedCellsProvider: PublishedCellsProvider | undefined;
 
 /**
+ * **FE-6 / R18 Wave E (2026-06-18)** -- per-session SQL-result badge stores, keyed by the owning Session.
+ * STANDALONE from the Python-gated reactive-kernel {@link PublishedCellsStore} (which the reactive-kernel
+ * manager returns `[]` for when no kernel is live), so a SQL result badges WITH OR WITHOUT a live Python
+ * kernel. Lazily created on first materialise; the entry is dropped in {@link fireSessionClosing} when the
+ * session closes (mirroring how a kernel store dies with its client).
+ */
+const sqlResultsBySession: Map<SessionInstance, SqlResultsStore> = new Map();
+function sqlResultsStoreFor(session: SessionInstance): SqlResultsStore {
+	let store = sqlResultsBySession.get(session);
+	if (store === undefined) {
+		store = new SqlResultsStore();
+		sqlResultsBySession.set(session, store);
+	}
+	return store;
+}
+/** The stable per-session id the SQL sidebar materialises under -- ONE query per session, so a re-run
+ *  relocates the single badge (latest-wins) and the orphan-clear can read the prior target. */
+const SQL_PANEL_QUERY_ID = 'ql-sql-panel';
+
+/**
  * **W2 error-surface** -- the host-side sink a panel reports its cell errors to so they surface in VS
  * Code's Problems panel via the `quantbook` DiagnosticCollection. Injected at activation (mirrors
  * {@link publishedCellsProvider}); `undefined` (no bridge wired, or post-deactivate) makes every report
@@ -142,6 +164,8 @@ function fireSessionClosing(session: SessionInstance): void {
 			console.error('[cellGrid] sessionClosing listener threw:', err);
 		}
 	}
+	// FE-6 / R18 Wave E: drop this session's SQL-result badge store so a closed workbook leaves no stale entry.
+	sqlResultsBySession.delete(session);
 }
 
 // FE-5 (W4 product shell, SHARED EDIT): listeners fired whenever the live-panel landscape changes --
@@ -463,6 +487,117 @@ export class CellGridPanel {
 			return undefined;
 		}
 		return { session: focusedPanel.session, sheet: focusedPanel.sheet, selection: focusedPanel.latestSelection };
+	}
+
+	/**
+	 * **FE-6 / R18 Wave E (2026-06-18)** -- materialise a SQL SELECT into `target` on `session`. The single
+	 * host entry the SQL sidebar routes through (it never calls the napi directly). Mirrors the grid's own
+	 * mutation pipeline ({@link applyToolbarNumberFormat}): the engine `materializeQuery` writes the result
+	 * block atomically (ONE undo unit), then recalc -> {@link refreshSession} repaints every panel; result
+	 * VALUES appear via the normal snapshot-delta path. The target is recorded in the STANDALONE
+	 * {@link SqlResultsStore} so it gets the published-range badge with or without a live Python kernel (R1).
+	 *
+	 * Safety model (No-Fallbacks, no graceful-degradation): the materialise runs FIRST -- a `[sql_error]` /
+	 * `ResultTooLarge` throws LOUD with the prior data UNTOUCHED (a bad query never wipes results) and the
+	 * error is RETURNED verbatim (the sidebar surfaces it; nothing is swallowed). Only AFTER it succeeds do we
+	 * clear the ORPHAN cells a MOVED/SHRUNK re-run leaves behind (`materialize_query`, unlike
+	 * `publish_dataset`, does not vacate them) -- so the clear is never a recovery path masking a failure. A
+	 * same-target SMALLER result leaves trailing cells inside the target the IDE cannot bound (the engine
+	 * returns no result dims); "Clear results" wipes them -- a documented limitation whose proper fix is an
+	 * engine change (tracked follow-up).
+	 *
+	 * Returns `{ ok: true, warning? }` (warning = the result landed but a follow-up clear/recalc/repaint had
+	 * trouble -- surfaced, not hidden) or `{ ok: false, error }`.
+	 */
+	static materializeSqlQuery(
+		session: SessionInstance,
+		target: CellRangeJson,
+		sql: string,
+	): { ok: true; warning?: string } | { ok: false; error: string } {
+		const store = sqlResultsStoreFor(session);
+		const prev = store.rangeFor(SQL_PANEL_QUERY_ID);
+		// PHASE 1 -- materialise (the only step that may overwrite `target`). A throw leaves prior data intact.
+		try {
+			session.materializeQuery(SQL_PANEL_QUERY_ID, target, JSON.stringify({ sql }));
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error(`[cellGrid] materializeSqlQuery failed: ${detail}`);
+			return { ok: false, error: detail };
+		}
+		// The result landed -- relocate the badge to the new target.
+		store.recordPublish(SQL_PANEL_QUERY_ID, target);
+		// PHASE 2 -- clear orphans from a moved/shrunk re-run + recalc dependents, in a SEPARATE try: a failure
+		// here does NOT undo the (successful) materialise; it is surfaced as a warning, never swallowed.
+		let warning: string | undefined;
+		try {
+			for (const cr of sqlOrphanClearRanges(prev, target)) {
+				session.writeRange(cr, CellGridPanel.blankMatrix(cr));
+			}
+			recalcDirtyChecked(session);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error(`[cellGrid] materializeSqlQuery orphan-clear/recalc failed: ${detail}`);
+			warning = `The query ran, but clearing prior result cells / recalculating failed: ${detail}`;
+		}
+		try {
+			const { failed } = CellGridPanel.refreshSession(session);
+			if (failed > 0 && warning === undefined) {
+				warning = `The query ran, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid".`;
+			}
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error(`[cellGrid] materializeSqlQuery refresh failed: ${detail}`);
+			if (warning === undefined) {
+				warning = 'The query ran, but the grid may be showing stale values (a repaint failed) -- run "Quantbook: Refresh Cell Grid".';
+			}
+		}
+		return { ok: true, warning };
+	}
+
+	/**
+	 * **FE-6 / R18 Wave E** -- the "Clear results" gesture: blank the cells the SQL panel last materialised
+	 * into on `session` and drop the badge. Loud on any engine error (No-Fallbacks). `cleared` is `false`
+	 * when there was nothing to clear (the panel never ran on this session).
+	 */
+	static clearSqlResults(session: SessionInstance): { ok: true; cleared: boolean; warning?: string } | { ok: false; error: string } {
+		const store = sqlResultsStoreFor(session);
+		const prev = store.rangeFor(SQL_PANEL_QUERY_ID);
+		if (prev === undefined) {
+			return { ok: true, cleared: false };
+		}
+		try {
+			session.writeRange(prev, CellGridPanel.blankMatrix(prev));
+			recalcDirtyChecked(session);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error(`[cellGrid] clearSqlResults failed: ${detail}`);
+			return { ok: false, error: detail };
+		}
+		store.remove(SQL_PANEL_QUERY_ID);
+		// Surface a repaint failure the SAME way materializeSqlQuery does -- refreshSession reports a stale
+		// grid via its `{ failed }` RETURN value (not a throw), so checking it is required (No-Fallbacks):
+		// the cells WERE blanked, but the on-screen grid/badge may not have repainted.
+		let warning: string | undefined;
+		try {
+			const { failed } = CellGridPanel.refreshSession(session);
+			if (failed > 0) {
+				warning = `Results cleared, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid".`;
+			}
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error(`[cellGrid] clearSqlResults refresh failed: ${detail}`);
+			warning = 'Results cleared, but the grid may be showing stale values (a repaint failed) -- run "Quantbook: Refresh Cell Grid".';
+		}
+		return { ok: true, cleared: true, warning };
+	}
+
+	/** A blank-value matrix sized to `range` (fresh rows -- no shared references) for clearing cells via
+	 *  `writeRange`. `{ kind: 'blank' }` is the engine's clear-the-cell input value. */
+	private static blankMatrix(range: CellRangeJson): CellValueJson[][] {
+		const rows = range.endRow - range.startRow + 1;
+		const cols = range.endCol - range.startCol + 1;
+		return Array.from({ length: rows }, (): CellValueJson[] =>
+			Array.from({ length: cols }, (): CellValueJson => ({ kind: 'blank' })));
 	}
 
 	/**
@@ -969,7 +1104,13 @@ export class CellGridPanel {
 		// W-G bound-cell indicator: query the cells this session's published variables drive on THIS sheet
 		// fresh on every post (covers both render() and the webviewReady re-send -- no stale-on-reload
 		// issue, unlike the webview->host selection). `[]` when no reactive kernel is wired to the session.
-		const publishedCells = publishedCellsProvider?.(this.session, this.sheet) ?? [];
+		// W-G reactive-publish badges UNION the FE-6 SQL-result badges (a STANDALONE per-session store, so SQL
+		// results badge with or without a live Python kernel -- Wave E R1). Both are PublishedRange[] in the same
+		// host->webview wire shape; the webview paints any rect as a corner badge.
+		const publishedCells = [
+			...(publishedCellsProvider?.(this.session, this.sheet) ?? []),
+			...(sqlResultsBySession.get(this.session)?.rangesForSheet(this.sheet) ?? []),
+		];
 		// Sheet-tabs (2026-06-10): carry the live sheet list + the active sheet id so the webview's
 		// bottom tab strip can render the tabs and highlight the active one. The snapshot already
 		// determines "sheet changed" (the webview resets on `snapshot.sheet` change); these fields
