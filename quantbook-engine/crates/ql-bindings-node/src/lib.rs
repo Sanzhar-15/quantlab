@@ -7137,8 +7137,9 @@ impl Session {
     /// **R9 / Wave C (2026-06-18):** the READ-ONLY half of [`Self::nudge_decimals`] — compute the
     /// number-format STRING a cell would carry after an increase (`delta > 0`) / decrease (`delta < 0`)
     /// of its decimal places, WITHOUT interning a format or rebinding the cell. Returns the nudged format
-    /// string, or `null` for a no-op (`delta == 0`, the clamp boundary, or the cell already carries the
-    /// nudged format). Pure read — never touches the undo history.
+    /// string, or `null` for a no-op (the clamp boundary, or the cell already carries the nudged format).
+    /// (`delta == 0` never reaches the no-op branch here — it is rejected as `bad_argument` below.)
+    /// Pure read — never touches the undo history.
     ///
     /// The IDE uses THIS (not [`Self::nudge_decimals`]) for the toolbar's decimal pair: it previews each
     /// selected cell, registers the distinct returned strings via `registerFormat`, and applies them in
