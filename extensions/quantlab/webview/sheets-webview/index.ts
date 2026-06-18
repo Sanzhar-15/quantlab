@@ -79,14 +79,19 @@ import { renderSheetTabs, type SheetTabHandlers, type SheetTabInfo } from './she
 import { buildCellContextPayload, buildEmptyContextPayload } from './contextMenuPayload';
 import { RenderOrchestrator, type RenderHost, type Viewport } from './renderOrchestrator';
 import {
+	type AxisSizing,
 	COL_WIDTH,
 	HEADER_HEIGHT,
 	MAX_COLS,
+	MAX_COL_WIDTH,
 	MAX_ROWS,
+	MIN_COL_WIDTH,
 	ROW_HEIGHT,
 	cellContentRect,
 	cellRefA1,
+	colResizeBorderAt,
 	colX,
+	emptyAxisSizing,
 	frozenColsWidth,
 	frozenRowsHeight,
 	hitTestSplit,
@@ -99,6 +104,7 @@ import {
 	selectionRect,
 	totalContentHeight,
 	totalContentWidth,
+	withOverride,
 } from './gridLayoutA1';
 
 /**
@@ -1599,6 +1605,13 @@ let pointSuppressClick = false;
 // on edit teardown. It never writes a cell, never touches `editState`. Empty `[]` when not editing a formula.
 let activeRefHighlights: RefHighlightRect[] = [];
 let fillSuppressClick = false;
+// **Wave G column resize**: drag a column-letter border to resize the column. `colResizeDrag` is non-null
+// only DURING a drag -- the resized column, the OWNER pointerId (single-owner, like fillSource/pointDrag),
+// and the start geometry. `pointermove` updates the renderer's COLUMN sizing live (full redraw, since the
+// blit is gated off while sized); `pointerup` posts the final width to the host (transient, session-local).
+// `colResizeSuppressClick` swallows the click synthesized after a resize-drag pointerup.
+let colResizeDrag: { col: number; pointerId: number; startClientX: number; startWidth: number } | null = null;
+let colResizeSuppressClick = false;
 // Click tolerance (CSS px) for grabbing the fill-handle square at the selection's bottom-right corner.
 const FILL_HANDLE_HIT_PX = 5;
 // The active (selected) cell -- the FOCUS of the selection. Starts at A1 (like Excel) so the grid
@@ -2109,6 +2122,9 @@ const renderHost: RenderHost = {
 	// Wave F window split: the renderer owns the split state; the orchestrator's fast-path gates read it
 	// here to force the always-correct full split paint (no blit/damage while two panes scroll separately).
 	isSplitActive: () => renderer.splitActive,
+	// Wave G column sizing: same gate -- a blit assumes uniform-pitch columns, so force the full draw while
+	// any column is resized (the renderer is the single source via the leaf binding).
+	hasColSizingOverrides: () => renderer.colSizingActive,
 	applyCanvasTransform,
 	onAfterFullRedraw: () => {
 		updateFormulaBar(); // selection/content changed -> reflect the active cell in the formula bar
@@ -2407,7 +2423,8 @@ function ensureActiveVisibleSplit(): void {
 		return;
 	}
 	const gutterW = renderer.gutterWidthPx;
-	viewportEl.scrollLeft = scrollToReveal(colX(active.col, gutterW), COL_WIDTH, gutterW, viewportEl.scrollLeft, viewportEl.clientWidth);
+	// Wave G: reveal using the active column's ACTUAL width (resized columns), not the COL_WIDTH constant.
+	viewportEl.scrollLeft = scrollToReveal(colX(active.col, gutterW), cellContentRect(active.row, active.col, gutterW).width, gutterW, viewportEl.scrollLeft, viewportEl.clientWidth);
 	const cssH = viewportEl.clientHeight;
 	const splitBarY = renderer.splitBarYPx;
 	const bandOffset = splitBarY - HEADER_HEIGHT;
@@ -2444,7 +2461,7 @@ function ensureActiveVisible(): void {
 	if (active.col >= fCols) {
 		viewportEl.scrollLeft = scrollToReveal(
 			colX(active.col, gutterW),
-			COL_WIDTH,
+			cellContentRect(active.row, active.col, gutterW).width, // Wave G: the active column's actual width
 			gutterW + frozenColsWidth(fCols),
 			viewportEl.scrollLeft,
 			viewportEl.clientWidth,
@@ -4557,8 +4574,9 @@ canvasEl.addEventListener('pointerdown', ev => {
 	// megaudit Lane C: ignore a re-entrant pointerdown while a drag is already in flight (a second touch /
 	// stylus). It must not reset the suppress flag, restart the drag, or rebind `fillSource` to a different
 	// rect -- the first pointer owns the drag until its pointerup/pointercancel. FE-3: a point drag is the same
-	// single-owner contract, so a press while EITHER drag is live is ignored.
-	if (fillSource !== null || pointDrag !== null) {
+	// single-owner contract, so a press while EITHER drag is live is ignored. Wave G: a column-resize drag is
+	// the same single-owner contract -- a press while it is live is ignored too.
+	if (fillSource !== null || pointDrag !== null || colResizeDrag !== null) {
 		return;
 	}
 	// megaudit MED: clear any leftover suppress flag at the START of every interaction so it can never
@@ -4567,6 +4585,32 @@ canvasEl.addEventListener('pointerdown', ev => {
 	// point suppress flag for the same reason.
 	fillSuppressClick = false;
 	pointSuppressClick = false;
+	colResizeSuppressClick = false; // Wave G: same defensive clear -- a stale flag must never swallow a later click
+	// Wave G column resize: a press on a column-letter border (the header band, within RESIZE_GRAB_PX of a
+	// column's right edge) starts a resize drag. Runs BEFORE the point/fill branches (a header-band press is
+	// neither a point nor a fill -- hitTestCanvas returns null there). Pointer capture keeps move/up firing if
+	// the pointer leaves the canvas, exactly like the fill handle. The start width is the column's CURRENT
+	// width (default or a prior override).
+	if (ev.button === 0) {
+		const downRect = canvasEl.getBoundingClientRect();
+		const localX = ev.clientX - downRect.left;
+		const localY = ev.clientY - downRect.top;
+		if (localY < HEADER_HEIGHT) {
+			const borderCol = colResizeBorderAt(localX, viewportEl.scrollLeft, renderer.gutterWidthPx, renderer.frozenCols);
+			if (borderCol >= 0) {
+				ev.preventDefault();
+				colResizeDrag = {
+					col: borderCol,
+					pointerId: ev.pointerId,
+					startClientX: ev.clientX,
+					startWidth: cellContentRect(0, borderCol, renderer.gutterWidthPx).width,
+				};
+				colResizeSuppressClick = false;
+				canvasEl.setPointerCapture(ev.pointerId);
+				return;
+			}
+		}
+	}
 	// FE-3 range-pick / point mode: when a formula IS being edited and the caret sits at a ref-insertion
 	// position, a grid press points a reference INTO the formula instead of selecting. Runs BEFORE the fill
 	// guard (which bails on an open editor). preventDefault keeps focus in the editor (no blur-commit) and
@@ -4608,6 +4652,22 @@ canvasEl.addEventListener('pointerdown', ev => {
 	canvasEl.setPointerCapture(ev.pointerId);
 });
 canvasEl.addEventListener('pointermove', ev => {
+	// Wave G column resize: live-resize the dragged column. The renderer's COLUMN sizing is updated each move
+	// (full redraw -- the blit is gated off while sized), so the column + every later column track the
+	// pointer. Clamp to [MIN_COL_WIDTH, MAX_COL_WIDTH]; a width back at the default drops the override
+	// (canonical). repositionEdit keeps an open in-cell editor aligned to the resized geometry.
+	if (colResizeDrag !== null) {
+		if (ev.pointerId !== colResizeDrag.pointerId) {
+			return; // a second touch/pen is NOT the drag owner -- ignore its moves
+		}
+		const dx = ev.clientX - colResizeDrag.startClientX;
+		const newWidth = Math.max(MIN_COL_WIDTH, Math.min(MAX_COL_WIDTH, Math.round(colResizeDrag.startWidth + dx)));
+		renderer.setColSizing(withOverride(renderer.colSizing, colResizeDrag.col, newWidth));
+		updateSpacer(); // Wave G: the total content width changed -> resync the native horizontal scrollbar range
+		repositionEdit();
+		redraw();
+		return;
+	}
 	// FE-3 point mode: extend the pointed range to the cell under the pointer, rewriting the inserted ref.
 	if (pointDrag !== null) {
 		if (ev.pointerId !== pointDrag.pointerId) {
@@ -4658,6 +4718,24 @@ canvasEl.addEventListener('pointermove', ev => {
 	}
 });
 canvasEl.addEventListener('pointerup', ev => {
+	// Wave G column resize: finalize. The renderer already shows the live width; here we POST it to the host
+	// (transient session-local) so a reload / sheet-switch re-applies it. A width back at the default posts a
+	// REMOVE (`width: null`), keeping the host's override map canonical. Always suppress the synthesized
+	// post-drag click -- the pointer was captured, so a click fires; if the release drifted into the body it
+	// would otherwise re-select a cell.
+	if (colResizeDrag !== null) {
+		if (ev.pointerId !== colResizeDrag.pointerId) {
+			return; // not the drag owner
+		}
+		canvasEl.releasePointerCapture?.(ev.pointerId);
+		const col = colResizeDrag.col;
+		const finalWidth = cellContentRect(0, col, renderer.gutterWidthPx).width;
+		vscode.postMessage({ type: 'sizeColumn', col, width: finalWidth === COL_WIDTH ? null : finalWidth });
+		colResizeDrag = null;
+		colResizeSuppressClick = true;
+		redraw();
+		return;
+	}
 	// FE-3 point mode: finalize the pointed reference at the RELEASE cell (authoritative, mirrors fill), keep
 	// the editor open + focused, and swallow the synthesized post-drag click so it does not re-select.
 	if (pointDrag !== null) {
@@ -4702,6 +4780,20 @@ canvasEl.addEventListener('pointerup', ev => {
 // cancel. (Only pointercancel, NOT lostpointercapture -- the latter also fires on the normal post-pointerup
 // release and could race applyFill.)
 canvasEl.addEventListener('pointercancel', ev => {
+	// Wave G column resize: a hijacked resize drag REVERTS the column to its pre-drag width (no partial resize
+	// is left behind). The host was never told (we only post on pointerup), so reverting the binding to the
+	// start width re-syncs the webview with the host -- no message needed.
+	if (colResizeDrag !== null) {
+		if (ev.pointerId !== colResizeDrag.pointerId) {
+			return; // not the drag owner
+		}
+		renderer.setColSizing(withOverride(renderer.colSizing, colResizeDrag.col, colResizeDrag.startWidth));
+		updateSpacer(); // Wave G: revert restored the width -> resync the scrollbar range
+		colResizeDrag = null;
+		repositionEdit();
+		redraw();
+		return;
+	}
 	// FE-3 point mode: a hijacked point drag REVERTS the editor to its pre-drag state (no half-pointed ref is
 	// left behind); the editor stays open so the user can re-point. Mirrors the fill cancel (which commits
 	// nothing) but must also undo the text we already inserted on pointerdown.
@@ -4742,6 +4834,10 @@ canvasEl.addEventListener('pointercancel', ev => {
 // If an editor was open, the focus-out it caused already committed/cancelled it via the blur handler above;
 // here we only move the selection. (A pending commit keeps its editor; the click still just reselects.)
 canvasEl.addEventListener('click', ev => {
+	if (colResizeSuppressClick) {
+		colResizeSuppressClick = false; // Wave G: swallow the click synthesized after a column-resize drag
+		return;
+	}
 	if (pointSuppressClick) {
 		pointSuppressClick = false; // FE-3 point mode: swallow the click synthesized after a point press/drag
 		return;
@@ -6194,6 +6290,40 @@ window.addEventListener('message', (event: MessageEvent) => {
 		}
 		console.warn('[sheets-webview] dropped a malformed split message (mode must be atSelection|remove):', msg);
 		showError('The host sent a malformed Split command; the split was not changed.', 'transient');
+		return;
+	}
+	if (msg.type === 'colSizing') {
+		// **Wave G column sizing** -- the host's FULL column-override set (transient session-local) for the active
+		// sheet: posted after each resize, re-sent on the webviewReady handshake (so a reload re-applies), and
+		// reset on a sheet switch. The webview rebuilds the COLUMN sizing model from the array and FULL-redraws
+		// (the geometry changed; the blit/damage fast paths are gated off while sized). No-Fallbacks: a malformed
+		// entry is a host/webview WIRING bug -> surface it LOUD and leave the CURRENT sizing UNCHANGED (don't
+		// silently reset to uniform, which would lose the user's widths + mask the bug). The clamp re-check here
+		// is defence in depth at the trust boundary (the drag already clamped before posting).
+		const cols = (msg as { cols?: unknown }).cols;
+		if (!Array.isArray(cols)) {
+			console.warn('[sheets-webview] dropped a malformed colSizing message (cols must be an array):', msg);
+			showError('The host sent a malformed column-sizing update; the columns were not changed.', 'transient');
+			return;
+		}
+		let rebuilt: AxisSizing = emptyAxisSizing(COL_WIDTH, MAX_COLS, MIN_COL_WIDTH, MAX_COL_WIDTH);
+		for (const entry of cols) {
+			if (
+				!Array.isArray(entry) || entry.length !== 2 ||
+				typeof entry[0] !== 'number' || !Number.isInteger(entry[0]) || entry[0] < 0 || entry[0] >= MAX_COLS ||
+				// INTEGER width required: a fractional size breaks the renderer's per-cell seam alignment.
+				typeof entry[1] !== 'number' || !Number.isInteger(entry[1]) || entry[1] < MIN_COL_WIDTH || entry[1] > MAX_COL_WIDTH
+			) {
+				console.warn('[sheets-webview] dropped a malformed colSizing entry (expected [int col, width in clamp]):', entry);
+				showError('The host sent a malformed column-sizing update; the columns were not changed.', 'transient');
+				return;
+			}
+			rebuilt = withOverride(rebuilt, entry[0], entry[1]);
+		}
+		renderer.setColSizing(rebuilt);
+		updateSpacer(); // Wave G: the host's override set changed the total width -> resync the scrollbar range
+		repositionEdit();
+		redraw();
 		return;
 	}
 	if (msg.type === 'contextMenuAction') {

@@ -29,25 +29,32 @@ import { clampDisplayString, formatCellValue, isRenderableValue } from './cellRe
 import { borderWidthPx, bordersToPaint, type ResolvedBorderEdge, type ResolvedCellStyle } from './cellStyleModel';
 import type { ScrollBlit } from './gridBlitA1';
 import {
+	type AxisSizing,
 	COL_WIDTH,
 	HEADER_HEIGHT,
 	MAX_COLS,
 	MAX_ROWS,
+	MIN_COL_WIDTH,
 	ROW_HEIGHT,
 	type SelectionRect,
 	type SplitPaneRanges,
 	clampFrozenCount,
 	clampSplitBarY,
 	clampSplitScroll,
+	colResizeBorderAt,
 	colX,
 	columnLabel,
 	computeVisibleBodyColRange,
 	computeVisibleBodyRowRange,
 	frozenColsWidth,
 	frozenRowsHeight,
+	getColSizing,
 	gutterWidth,
+	indexAtOffset,
 	isInExtent,
 	rowY,
+	setColSizing as applyColSizing,
+	sizeAt,
 	splitPaneRowRanges,
 	truncateToWidth,
 } from './gridLayoutA1';
@@ -612,6 +619,29 @@ export class CanvasGridRenderer {
 		return this.topSplitScroll;
 	}
 
+	/**
+	 * **Wave G column sizing** -- install the live COLUMN sizing model (the resized-column widths). Delegates
+	 * to the pure leaf binding in `gridLayoutA1` ({@link applyColSizing}), which is the SINGLE source every
+	 * column-geometry function reads -- so paint, hit-test, and the overlay editor cannot diverge. Does NOT
+	 * repaint (the host / drag calls this then `redraw()`), mirroring `setFrozen` / `setSplit`. An empty model
+	 * (no overrides) restores the byte-identical uniform paint path.
+	 */
+	setColSizing(sizing: AxisSizing): void {
+		applyColSizing(sizing);
+	}
+
+	/** **Wave G column sizing** -- the current COLUMN sizing model (the renderer + drag read it to build the
+	 *  next `withOverride` and to post the override set to the host). */
+	get colSizing(): AxisSizing {
+		return getColSizing();
+	}
+
+	/** **Wave G column sizing** -- whether any column is resized. The orchestrator's blit/damage gate reads this
+	 *  (through the host) to force the full-draw path while sized -- a blit assumes uniform-pitch bands. */
+	get colSizingActive(): boolean {
+		return getColSizing().overrides.size > 0;
+	}
+
 	/** **Wave F window split** -- set the TOP pane's synthetic vertical scroll (wheel / keyboard reveal),
 	 * clamped so it can never run past the last row (no native scrollbar bounds it). No-op when no split is
 	 * active. The host calls this then `redraw()`. */
@@ -1068,7 +1098,11 @@ export class CanvasGridRenderer {
 		// The band is exactly `fRows*ROW_HEIGHT` tall, so when it fits the cap is a no-op (== fRows). +1 covers a
 		// partially-visible last row at the band/viewport edge.
 		const visFrozenRows = Math.min(fRows, Math.max(0, Math.ceil((cssHeight - HEADER_HEIGHT) / ROW_HEIGHT) + 1));
-		const visFrozenCols = Math.min(fCols, Math.max(0, Math.ceil((cssWidth - gutterW) / COL_WIDTH) + 1));
+		// Wave G: divide by MIN_COL_WIDTH (the smallest a column can be) so the cap is a safe UPPER bound on the
+		// frozen-col count even when frozen columns are narrower than the default -- never clips a visible frozen
+		// column (over-counting just caps at fCols + clips). Uniform widths => same as the old COL_WIDTH divide
+		// for any cap that mattered (it is still Math.min(fCols, ...)).
+		const visFrozenCols = Math.min(fCols, Math.max(0, Math.ceil((cssWidth - gutterW) / MIN_COL_WIDTH) + 1));
 		const frozenRowEnd = visFrozenRows; // [0, visFrozenRows) -- only the on-screen frozen rows
 		const frozenColEnd = visFrozenCols; // [0, visFrozenCols) -- only the on-screen frozen cols
 
@@ -1354,6 +1388,7 @@ export class CanvasGridRenderer {
 		effScrollLeft: number,
 		gutterW: number,
 	): void {
+		const colSizing = getColSizing(); // Wave G: per-cell width for the border right edge (resized columns)
 		for (let r = rowRange.startIdx; r < rowRange.endIdx; r += 1) {
 			const y = Math.round(rowY(r) - effScrollTop);
 			for (let c = colRange.startIdx; c < colRange.endIdx; c += 1) {
@@ -1370,20 +1405,22 @@ export class CanvasGridRenderer {
 					continue;
 				}
 				const x = Math.round(colX(c, gutterW) - effScrollLeft);
-				this.strokeCellBorders(x, y, toPaint);
+				this.strokeCellBorders(x, y, sizeAt(colSizing, c), toPaint);
 			}
 		}
 	}
 
-	/** Stroke a single cell's surviving border edges INSIDE its `[x, x+COL_WIDTH) x [y, y+ROW_HEIGHT)` rect.
-	 *  Each edge is painted in its own save/restore (strokeStyle/lineWidth/lineDash are per-edge). */
+	/** Stroke a single cell's surviving border edges INSIDE its `[x, x+width) x [y, y+ROW_HEIGHT)` rect.
+	 *  `width` is the cell's actual (Wave G: possibly resized) column width. Each edge is painted in its own
+	 *  save/restore (strokeStyle/lineWidth/lineDash are per-edge). */
 	private strokeCellBorders(
 		x: number,
 		y: number,
+		width: number,
 		edges: { top?: ResolvedBorderEdge; bottom?: ResolvedBorderEdge; left?: ResolvedBorderEdge; right?: ResolvedBorderEdge },
 	): void {
 		const ctx = this.ctx;
-		const x1 = x + COL_WIDTH;
+		const x1 = x + width;
 		const y1 = y + ROW_HEIGHT;
 		// Paint one edge line at the given orientation/position, inside-aligned by its width. `double` draws
 		// two 1px hairlines at the outer + inner extremes of its 3px span; the others a single centred stroke.
@@ -1457,6 +1494,12 @@ export class CanvasGridRenderer {
 		if (clipX1 <= clipX0 || clipY1 <= clipY0 || rowRange.endIdx <= rowRange.startIdx || colRange.endIdx <= colRange.startIdx) {
 			return; // empty pane (no frozen band, or a zero-size viewport)
 		}
+		// **Wave G column sizing**: the live column sizing model. Captured ONCE per pane so every per-cell width
+		// below comes from `sizeAt(colSizing, c)` (the cell's actual width) instead of the `COL_WIDTH` constant.
+		// The cell ORIGINS already come from `colX(c)` (binding-aware); without the per-cell width here, a
+		// resized cell's fill/clip/text/selection/border/badge would paint at the default width inside a wider
+		// (or narrower) column. Empty model => `sizeAt` returns `COL_WIDTH` for every column (byte-identical).
+		const colSizing = getColSizing();
 		ctx.save();
 		ctx.beginPath();
 		ctx.rect(clipX0, clipY0, clipX1 - clipX0, clipY1 - clipY0);
@@ -1472,7 +1515,7 @@ export class CanvasGridRenderer {
 				const fill = this.styleAt(r, c)?.fillColor;
 				if (fill !== undefined) {
 					ctx.fillStyle = fill;
-					ctx.fillRect(Math.round(colX(c, gutterW) - effScrollLeft), fy, COL_WIDTH, ROW_HEIGHT);
+					ctx.fillRect(Math.round(colX(c, gutterW) - effScrollLeft), fy, sizeAt(colSizing, c), ROW_HEIGHT);
 				}
 			}
 		}
@@ -1485,7 +1528,7 @@ export class CanvasGridRenderer {
 				const ly = Math.round(rowY(r) - effScrollTop);
 				for (let c = colRange.startIdx; c < colRange.endIdx; c += 1) {
 					if (errorCells.has(r + ',' + c)) {
-						ctx.fillRect(Math.round(colX(c, gutterW) - effScrollLeft), ly, COL_WIDTH, ROW_HEIGHT);
+						ctx.fillRect(Math.round(colX(c, gutterW) - effScrollLeft), ly, sizeAt(colSizing, c), ROW_HEIGHT);
 					}
 				}
 			}
@@ -1529,7 +1572,6 @@ export class CanvasGridRenderer {
 		// Codex HIGH (2026-06-10): alignment is PER VALUE KIND below (the Excel/Sheets convention), set
 		// inside each cell's save/clip/restore bracket; 'left' here is just the loop's baseline state.
 		ctx.textAlign = 'left';
-		const valueMax = COL_WIDTH - CELL_PAD * 2;
 		for (let r = rowRange.startIdx; r < rowRange.endIdx; r += 1) {
 			const y = Math.round(rowY(r) - effScrollTop);
 			for (let c = colRange.startIdx; c < colRange.endIdx; c += 1) {
@@ -1548,6 +1590,8 @@ export class CanvasGridRenderer {
 					continue;
 				}
 				const x = Math.round(colX(c, gutterW) - effScrollLeft);
+				const cw = sizeAt(colSizing, c); // Wave G: this column's actual (possibly resized) width
+				const valueMax = cw - CELL_PAD * 2;
 				const isError = errorCells.has(r + ',' + c);
 				// Audit C1-HIGH2: cap the display string BEFORE measure/truncate so a pathological `rendered`
 				// can't freeze the binary search (which measures the full string first).
@@ -1560,7 +1604,7 @@ export class CanvasGridRenderer {
 				const fontKey = this.stylePrefix(style);
 				ctx.save();
 				ctx.beginPath();
-				ctx.rect(x, y, COL_WIDTH, ROW_HEIGHT);
+				ctx.rect(x, y, cw, ROW_HEIGHT);
 				ctx.clip();
 				if (fontKey !== '') {
 					ctx.font = this.styledFont(style); // restored by the per-cell ctx.restore() below
@@ -1593,10 +1637,10 @@ export class CanvasGridRenderer {
 				let textX: number;
 				if (halign === 'right') {
 					ctx.textAlign = 'right';
-					textX = x + COL_WIDTH - CELL_PAD;
+					textX = x + cw - CELL_PAD;
 				} else if (halign === 'center') {
 					ctx.textAlign = 'center';
-					textX = x + COL_WIDTH / 2;
+					textX = x + cw / 2;
 				} else {
 					ctx.textAlign = 'left';
 					textX = x + CELL_PAD;
@@ -1665,7 +1709,7 @@ export class CanvasGridRenderer {
 			ctx.lineWidth = SELECTION_BORDER_PX;
 			// Inset by half the border so the 2px stroke sits inside the cell rect.
 			const o = SELECTION_BORDER_PX / 2;
-			ctx.strokeRect(x + o, y + o, COL_WIDTH - SELECTION_BORDER_PX, ROW_HEIGHT - SELECTION_BORDER_PX);
+			ctx.strokeRect(x + o, y + o, sizeAt(colSizing, active.col) - SELECTION_BORDER_PX, ROW_HEIGHT - SELECTION_BORDER_PX);
 		}
 
 		// 4b. W-G bound-cell indicator: a small filled triangle in each published cell's TOP-RIGHT corner
@@ -1682,7 +1726,7 @@ export class CanvasGridRenderer {
 				for (let r = r0; r <= r1; r += 1) {
 					const by = Math.round(rowY(r) - effScrollTop);
 					for (let c = c0; c <= c1; c += 1) {
-						const right = Math.round(colX(c, gutterW) - effScrollLeft) + COL_WIDTH;
+						const right = Math.round(colX(c, gutterW) - effScrollLeft) + sizeAt(colSizing, c);
 						ctx.beginPath();
 						ctx.moveTo(right - PUBLISHED_BADGE_PX, by);
 						ctx.lineTo(right, by);
@@ -1919,10 +1963,12 @@ export class CanvasGridRenderer {
 			ctx.beginPath();
 			ctx.rect(clipX0, 0, clipX1 - clipX0, HEADER_HEIGHT);
 			ctx.clip();
+			const colSizing = getColSizing(); // Wave G: per-column header width (resized columns)
 			for (let c = colStart; c < colEnd; c += 1) {
 				// Audit S1-LOW3: snap the column origin so the active-col tint + label clip align with the
 				// (rounded) header separators.
 				const x = Math.round(colX(c, gutterW) - effScrollLeft);
+				const cw = sizeAt(colSizing, c);
 				// W-G-2a: tint every column in the selection range (or just the active col when there is no range).
 				const tinted = selection !== null
 					? c >= selection.minCol && c <= selection.maxCol
@@ -1932,24 +1978,24 @@ export class CanvasGridRenderer {
 				const isFocusCol = active !== null && active.col === c;
 				if (tinted) {
 					ctx.fillStyle = this.palette.headerActiveBg;
-					ctx.fillRect(x, 0, COL_WIDTH, HEADER_HEIGHT);
+					ctx.fillRect(x, 0, cw, HEADER_HEIGHT);
 					// Sheets retheme: a 2px accent UNDERLINE beneath the active column letter (the Sheets
 					// "selected column" affordance). Sits at the header's bottom edge, inside the band.
 					ctx.fillStyle = this.palette.accent;
-					ctx.fillRect(x, HEADER_HEIGHT - 2, COL_WIDTH, 2);
+					ctx.fillRect(x, HEADER_HEIGHT - 2, cw, 2);
 				} else if (c === this.hoveredHeaderCol) {
 					// Sheets retheme (header hover): a faint hover wash on the pointed-at column letter. Painted
 					// ONLY when the column is NOT active/selected -- the active highlight (above) always wins.
 					ctx.fillStyle = this.palette.headerHoverBg;
-					ctx.fillRect(x, 0, COL_WIDTH, HEADER_HEIGHT);
+					ctx.fillRect(x, 0, cw, HEADER_HEIGHT);
 				}
 				ctx.save();
 				ctx.beginPath();
-				ctx.rect(x, 0, COL_WIDTH, HEADER_HEIGHT);
+				ctx.rect(x, 0, cw, HEADER_HEIGHT);
 				ctx.clip();
 				ctx.font = isFocusCol ? this.headerActiveFont : this.headerFont;
 				ctx.fillStyle = tinted ? this.palette.accent : this.palette.headerText;
-				ctx.fillText(columnLabel(c), x + COL_WIDTH / 2, textY);
+				ctx.fillText(columnLabel(c), x + cw / 2, textY);
 				ctx.restore();
 			}
 			ctx.restore();
@@ -2071,7 +2117,7 @@ export class CanvasGridRenderer {
 			const fColsPx = frozenColsWidth(this.frozenColCount);
 			const effScrollLeft = localX < gutterW + fColsPx ? 0 : this.lastScrollLeft;
 			const contentX = localX + effScrollLeft - gutterW;
-			const col = Math.floor(contentX / COL_WIDTH);
+			const col = indexAtOffset(getColSizing(), contentX); // Wave G: inverse cumulative-width lookup
 			this.setHeaderHover(col >= 0 && col < MAX_COLS ? col : -1, -1);
 			return;
 		}
@@ -2121,12 +2167,14 @@ export class CanvasGridRenderer {
 	private cursorAt(localX: number, localY: number): string {
 		const inHeaderBand = localY < HEADER_HEIGHT;
 		const inGutter = localX < this.gutterW;
-		// Round 5 (2026-06-10) -- the column header band, the row-number gutter, and the corner box all show
-		// a plain arrow. The previous `col-resize`/`row-resize` affordance was REMOVED: it implied a column/
-		// row resize that is NOT wired (the round-5 audit's "the resize cursor is a lie" finding -- an
-		// investor who drags a header border and sees nothing happen reads it as broken). True per-column/row
-		// resize requires the variable-geometry refactor (137 uniform-COL_WIDTH call sites across the
-		// hit-test / blit / frozen-pane core); it is a tracked follow-up and will restore this cursor.
+		// **Wave G (2026-06-18)** -- the column-letter band shows the `col-resize` cursor when the pointer is
+		// within RESIZE_GRAB_PX of a column border. This RESTORES the affordance the round-5 audit removed as
+		// "the resize cursor is a lie" -- it was a lie only because per-column resize was unwired; the
+		// variable-geometry refactor (the binding in `gridLayoutA1`) has now landed, so the drag is real. ROW
+		// resize (the gutter) is the follow-up wave, so the gutter + corner box still show a plain arrow.
+		if (inHeaderBand && !inGutter && colResizeBorderAt(localX, this.lastScrollLeft, this.gutterW, this.frozenColCount) >= 0) {
+			return 'col-resize';
+		}
 		if (inHeaderBand || inGutter) {
 			return 'default';
 		}

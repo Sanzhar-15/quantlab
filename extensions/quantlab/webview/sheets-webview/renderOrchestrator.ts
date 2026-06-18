@@ -138,6 +138,14 @@ export interface RenderHost {
 	 * `renderer.splitActive`; the bench supplies `false`.
 	 */
 	isSplitActive(): boolean;
+	/**
+	 * **Wave G column sizing** -- whether any column is resized. A blit shifts a uniform-pitch device-px band
+	 * by a scroll delta; with variable column widths the exposed strip is NOT a uniform translation of
+	 * correctly-positioned columns, so every gate below ORs this in to force the full `redraw()` (the
+	 * always-correct path) while sized. In `index.ts` this mirrors `renderer.colSizingActive`; the bench
+	 * supplies `false`. Rare in practice (a resized sheet), so the full-draw cost is acceptable.
+	 */
+	hasColSizingOverrides(): boolean;
 	/** Pin the absolute canvas over the viewport at the given scroll. */
 	applyCanvasTransform(scrollTop: number, scrollLeft: number): void;
 	/** Fired at the END of a full {@link RenderOrchestrator.redraw} (formula bar + selection post + hover). */
@@ -230,7 +238,9 @@ export class RenderOrchestrator {
 		const frozenColsCssW = frozenColsWidth(host.frozenColCount());
 		// Wave F window split: a blit assumes ONE scroll + ONE row->Y mapping; while split the viewport has
 		// two independent panes, so decline the blit (null -> full draw -> the renderer's split paint).
-		const blit = renderer.painted && !host.isSplitActive()
+		// Wave G column sizing: a blit shifts a uniform-pitch band; variable column widths break that, so
+		// decline it while sized too (the full draw repaints the variable-width columns correctly).
+		const blit = renderer.painted && !host.isSplitActive() && !host.hasColSizingOverrides()
 			? computeScrollBlitA1(this.prevPaint, next, renderer.gutterWidthPx, frozenRowsCssH, frozenColsCssW)
 			: null;
 		// W-G-2a: a pure scroll changes neither selection nor content, but the renderer still needs the
@@ -308,7 +318,7 @@ export class RenderOrchestrator {
 		// Wave F window split: the damage diff maps a changed row to ONE viewport Y; while split a row can be
 		// in either/both panes at different Ys, so force the full split paint (null -> redraw()).
 		const damageRows =
-			renderer.painted && !renderer.backingScaleStale && this.scrollUnchangedSince(v) && !publishedChanged && !stylesChanged && !host.isSplitActive()
+			renderer.painted && !renderer.backingScaleStale && this.scrollUnchangedSince(v) && !publishedChanged && !stylesChanged && !host.isSplitActive() && !host.hasColSizingOverrides()
 				? diffSnapshotsA1(prevSnapshot, snapshot)
 				: null;
 		if (damageRows === null) {
@@ -340,7 +350,7 @@ export class RenderOrchestrator {
 		const v = host.viewport();
 		// Wave F window split: same reason as commitSnapshot -- a single-scroll damage clip is wrong while
 		// the viewport is two independent panes, so force the full split paint.
-		if (!forceFullRedraw && renderer.painted && !renderer.backingScaleStale && this.scrollUnchangedSince(v) && !host.isSplitActive()) {
+		if (!forceFullRedraw && renderer.painted && !renderer.backingScaleStale && this.scrollUnchangedSince(v) && !host.isSplitActive() && !host.hasColSizingOverrides()) {
 			const rows = errorRowsFlippedA1(prevErrorKeys, new Set(host.errorCells.keys()));
 			host.applyCanvasTransform(v.scrollTop, v.scrollLeft);
 			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview(), host.pointPreview(), host.activeRefHighlights());

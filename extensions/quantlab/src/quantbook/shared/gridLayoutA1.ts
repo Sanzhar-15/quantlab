@@ -39,6 +39,23 @@
  * non-Electron target) touches only this module, not the hit-test / paint / edit call sites.
  */
 
+// **Wave G column sizing (R1, 2026-06-18):** the pure sparse sizing model lives in `./axisSizing`. The
+// COLUMN-geometry functions below read an injected module binding ({@link currentColSizing}) so the ~130
+// existing call sites (and every existing golden test) stay UNCHANGED and one source feeds paint +
+// hit-test + overlay alike (divergence-proof). Re-exported so the webview shim's importers reach the
+// model through the existing `./gridLayoutA1` path. Rows stay literal `ROW_HEIGHT` (the row axis is the
+// follow-up wave), so the Wave-F split/freeze-row helpers are physically untouched here.
+import {
+	type AxisSizing,
+	emptyAxisSizing,
+	indexAtOffset,
+	offsetBefore,
+	sizeAt,
+	totalExtent,
+} from './axisSizing';
+
+export * from './axisSizing';
+
 /**
  * Truncate `text` to fit `maxWidth` px (per the injected `measure`), appending an ellipsis when it
  * must be cut. Pure: `measure` is the only environment dependency, so this is golden-testable with
@@ -121,6 +138,41 @@ export const MAX_ROWS = 1_048_576;
 /** Excel column count (0-based cols `[0, MAX_COLS)`; the last column 16,383 is "XFD"). */
 export const MAX_COLS = 16_384;
 
+/** **Wave G column sizing** -- inclusive clamp for a resized COLUMN width (CSS px). `MIN` keeps a column
+ *  grabbable + legible; `MAX` (Excel's practical ceiling) bounds the X extent: `MAX_COLS * MAX_COL_WIDTH =
+ *  32.77M px` stays under the ~33.5M-px Chromium element cap even in the (unreachable) all-columns-maxed
+ *  case, so column sizing needs NO separate total-extent guard -- that is a ROW-axis concern for the
+ *  follow-up wave (`MAX_ROWS * any row height` blows the cap). */
+export const MIN_COL_WIDTH = 12;
+export const MAX_COL_WIDTH = 2000;
+
+/** **Wave G column sizing** -- the pointer grab band (CSS px, each side of a column's right edge) for the
+ *  col-resize affordance ({@link colResizeBorderAt} / the renderer's `cursorAt`). */
+export const RESIZE_GRAB_PX = 4;
+
+/** **Wave G column sizing** -- the injected COLUMN sizing model. Default = uniform (no overrides), so every
+ *  column-geometry function below is BYTE-IDENTICAL to the legacy `col * COL_WIDTH` arithmetic until a
+ *  column is resized. The renderer replaces it via {@link setColSizing} on every sizing change (host
+ *  message or live drag); paint + hit-test + overlay all read this ONE source (divergence-proof). One grid
+ *  per webview realm => a module singleton is correct; tests inject a model and {@link resetColSizing}. */
+let currentColSizing: AxisSizing = emptyAxisSizing(COL_WIDTH, MAX_COLS, MIN_COL_WIDTH, MAX_COL_WIDTH);
+
+/** **Wave G** -- install the live COLUMN sizing model (the renderer's single source of truth). */
+export function setColSizing(sizing: AxisSizing): void {
+	currentColSizing = sizing;
+}
+
+/** **Wave G** -- the current COLUMN sizing model (the renderer reads it to build the next `withOverride`,
+ *  to report `hasOverrides` to the blit gate, and to post the override set to the host). */
+export function getColSizing(): AxisSizing {
+	return currentColSizing;
+}
+
+/** **Wave G** -- reset to uniform (no overrides). Used on a fresh/cleared grid and for test isolation. */
+export function resetColSizing(): void {
+	currentColSizing = emptyAxisSizing(COL_WIDTH, MAX_COLS, MIN_COL_WIDTH, MAX_COL_WIDTH);
+}
+
 /**
  * A1 column label for a 0-based column index: 0→"A", 25→"Z", 26→"AA", 51→"AZ", 52→"BA", 701→"ZZ",
  * 702→"AAA", 16383→"XFD". This is **bijective base-26** (a.k.a. "spreadsheet" / "Excel" numbering):
@@ -186,9 +238,11 @@ export function gutterWidth(maxRowNumberTextWidth: number): number {
 	return Math.ceil(Math.max(0, maxRowNumberTextWidth)) + GUTTER_PAD * 2;
 }
 
-/** Content-X of the left edge of column `colIndex` (after the gutter). */
+/** Content-X of the left edge of column `colIndex` (after the gutter). **Wave G:** the cumulative sum of
+ *  the widths of columns `[0, colIndex)` (via the injected {@link currentColSizing}); reduces to
+ *  `gutterW + colIndex * COL_WIDTH` when no column is resized. */
 export function colX(colIndex: number, gutterW: number): number {
-	return gutterW + colIndex * COL_WIDTH;
+	return gutterW + offsetBefore(currentColSizing, colIndex);
 }
 
 /** Content-Y of the top edge of row `rowIndex` (below the header band). */
@@ -206,12 +260,16 @@ export function cellContentRect(
 	col: number,
 	gutterW: number,
 ): { x: number; y: number; width: number; height: number } {
-	return { x: colX(col, gutterW), y: rowY(row), width: COL_WIDTH, height: ROW_HEIGHT };
+	// Wave G: `width` is the column's actual (possibly resized) width; `height` stays `ROW_HEIGHT` (rows
+	// are uniform until the row follow-up wave). The overlay editor reads this to size its `<input>`.
+	return { x: colX(col, gutterW), y: rowY(row), width: sizeAt(currentColSizing, col), height: ROW_HEIGHT };
 }
 
-/** Total scrollable content width = gutter + all columns (drives the horizontal scrollbar). */
+/** Total scrollable content width = gutter + all columns (drives the horizontal scrollbar). **Wave G:**
+ *  the summed widths of all `MAX_COLS` columns (via {@link currentColSizing}); reduces to `gutterW +
+ *  MAX_COLS * COL_WIDTH` when no column is resized. */
 export function totalContentWidth(gutterW: number): number {
-	return gutterW + MAX_COLS * COL_WIDTH;
+	return gutterW + totalExtent(currentColSizing);
 }
 
 /** Total scrollable content height = header band + all rows (drives the vertical scrollbar). */
@@ -241,9 +299,11 @@ export function frozenRowsHeight(frozenRowCount: number): number {
 	return Math.max(0, frozenRowCount) * ROW_HEIGHT;
 }
 
-/** **W3 frozen panes** -- pixel width of the frozen-col band (`frozenColCount * COL_WIDTH`). 0 = none. */
+/** **W3 frozen panes** -- pixel width of the frozen-col band. **Wave G:** the summed widths of the first
+ *  `frozenColCount` columns (via {@link currentColSizing}); reduces to `frozenColCount * COL_WIDTH` when no
+ *  column is resized. 0 = none. */
 export function frozenColsWidth(frozenColCount: number): number {
-	return Math.max(0, frozenColCount) * COL_WIDTH;
+	return offsetBefore(currentColSizing, Math.max(0, frozenColCount));
 }
 
 /**
@@ -267,11 +327,23 @@ export function computeVisibleColRange(
 	if (colWidth <= 0) {
 		return { startIdx: 0, endIdx: totalCols };
 	}
+	if (currentColSizing.overrides.size === 0) {
+		// Uniform fast path -- BYTE-IDENTICAL to the pre-Wave-G code (the keystone invariant).
+		const maxFirst = Math.max(0, totalCols - 1);
+		const firstVisible = Math.min(maxFirst, Math.max(0, Math.floor(scrollLeft / colWidth)));
+		const visibleCount = Math.max(1, Math.ceil(viewportWidth / colWidth));
+		const startIdx = Math.max(0, firstVisible - overscan);
+		const endIdx = Math.min(totalCols, firstVisible + visibleCount + overscan);
+		return { startIdx, endIdx };
+	}
+	// Wave G variable-width window: the first/last visible columns come from the inverse cumulative-width
+	// lookup at the viewport's left/right edge (O(log) each, exact -- never an under-count that would blank
+	// a column). `+1` makes the last column half-open; overscan widens both ends.
 	const maxFirst = Math.max(0, totalCols - 1);
-	const firstVisible = Math.min(maxFirst, Math.max(0, Math.floor(scrollLeft / colWidth)));
-	const visibleCount = Math.max(1, Math.ceil(viewportWidth / colWidth));
+	const firstVisible = Math.min(maxFirst, Math.max(0, indexAtOffset(currentColSizing, scrollLeft)));
+	const lastVisible = Math.min(maxFirst, Math.max(0, indexAtOffset(currentColSizing, scrollLeft + viewportWidth)));
 	const startIdx = Math.max(0, firstVisible - overscan);
-	const endIdx = Math.min(totalCols, firstVisible + visibleCount + overscan);
+	const endIdx = Math.min(totalCols, lastVisible + 1 + overscan);
 	return { startIdx, endIdx };
 }
 
@@ -304,16 +376,30 @@ export function computeVisibleBodyColRange(
 	if (colWidth <= 0) {
 		return { startIdx: Math.min(frozen, totalCols), endIdx: totalCols };
 	}
-	// The body's effective viewport (the space NOT covered by the frozen band).
-	const bodyViewport = Math.max(0, viewportWidth - frozen * colWidth);
-	// The first SCROLLING body column = frozen offset + how far the body has scrolled. Clamp so a stale
-	// large scrollLeft (data shrank) can't open an empty window past the last column.
+	if (currentColSizing.overrides.size === 0) {
+		// Uniform fast path -- BYTE-IDENTICAL to the pre-Wave-G code (the keystone invariant).
+		// The body's effective viewport (the space NOT covered by the frozen band).
+		const bodyViewport = Math.max(0, viewportWidth - frozen * colWidth);
+		// The first SCROLLING body column = frozen offset + how far the body has scrolled. Clamp so a stale
+		// large scrollLeft (data shrank) can't open an empty window past the last column.
+		const maxFirst = Math.max(frozen, totalCols - 1);
+		const firstVisible = Math.min(maxFirst, frozen + Math.max(0, Math.floor(scrollLeft / colWidth)));
+		const visibleCount = Math.max(1, Math.ceil(bodyViewport / colWidth));
+		// Never start a body column before the frozen offset (the frozen columns are painted separately).
+		const startIdx = Math.max(frozen, firstVisible - overscan);
+		const endIdx = Math.min(totalCols, firstVisible + visibleCount + overscan);
+		return { startIdx, endIdx };
+	}
+	// Wave G variable-width body window. The frozen band consumes `frozenWidthPx` (= summed widths of the
+	// first `frozen` columns); the body content origin is that offset, advanced by the live `scrollLeft`.
+	// The first/last visible body columns are the inverse cumulative lookups at the body's left/right edge.
+	const frozenWidthPx = offsetBefore(currentColSizing, frozen);
+	const bodyViewport = Math.max(0, viewportWidth - frozenWidthPx);
 	const maxFirst = Math.max(frozen, totalCols - 1);
-	const firstVisible = Math.min(maxFirst, frozen + Math.max(0, Math.floor(scrollLeft / colWidth)));
-	const visibleCount = Math.max(1, Math.ceil(bodyViewport / colWidth));
-	// Never start a body column before the frozen offset (the frozen columns are painted separately).
+	const firstVisible = Math.min(maxFirst, Math.max(frozen, indexAtOffset(currentColSizing, frozenWidthPx + scrollLeft)));
+	const lastVisible = Math.min(maxFirst, Math.max(frozen, indexAtOffset(currentColSizing, frozenWidthPx + scrollLeft + bodyViewport)));
 	const startIdx = Math.max(frozen, firstVisible - overscan);
-	const endIdx = Math.min(totalCols, firstVisible + visibleCount + overscan);
+	const endIdx = Math.min(totalCols, lastVisible + 1 + overscan);
 	return { startIdx, endIdx };
 }
 
@@ -460,7 +546,9 @@ export function hitTestContent(
 		return null; // row-number gutter
 	}
 	const row = Math.floor((contentY - HEADER_HEIGHT) / ROW_HEIGHT);
-	const col = Math.floor((contentX - gutterW) / COL_WIDTH);
+	// Wave G: the column at content-X via the inverse cumulative-width lookup (reduces to
+	// `floor((contentX - gutterW) / COL_WIDTH)` when no column is resized); rows stay uniform.
+	const col = indexAtOffset(currentColSizing, contentX - gutterW);
 	if (row < 0 || row >= MAX_ROWS || col < 0 || col >= MAX_COLS) {
 		return null;
 	}
@@ -533,7 +621,9 @@ export function hitTestViewportFrozen(
 	const fRows = Math.max(0, frozenRowCount);
 	const fCols = Math.max(0, frozenColCount);
 	const frozenRowsPx = fRows * ROW_HEIGHT;
-	const frozenColsPx = fCols * COL_WIDTH;
+	// Wave G: the frozen-col band is the cumulative width of the first `fCols` columns (reduces to
+	// `fCols * COL_WIDTH` when no column is resized); the frozen-row band stays uniform.
+	const frozenColsPx = offsetBefore(currentColSizing, fCols);
 	// Resolve each axis: in the frozen band the pointer maps to the pinned cell (no scroll); past it the
 	// pointer maps to a scrolling body cell (add the scroll, offset by the frozen count).
 	let row: number;
@@ -546,17 +636,75 @@ export function hitTestViewportFrozen(
 		const bodyLocalY = localY - (HEADER_HEIGHT + frozenRowsPx);
 		row = fRows + Math.floor((bodyLocalY + scrollTop) / ROW_HEIGHT);
 	}
+	// Wave G: both branches map content-X -> column via the inverse cumulative-width lookup. Frozen band:
+	// content-X is `localX - gutterW` (no scroll). Body: the body content origin is `frozenColsPx` (=
+	// offsetBefore(fCols)), advanced by `scrollLeft`, plus the in-body local offset. Reduces to the legacy
+	// `floor(.../COL_WIDTH)` / `fCols + floor(...)` when no column is resized.
 	let col: number;
 	if (localX < gutterW + frozenColsPx) {
-		col = Math.floor((localX - gutterW) / COL_WIDTH);
+		col = indexAtOffset(currentColSizing, localX - gutterW);
 	} else {
 		const bodyLocalX = localX - (gutterW + frozenColsPx);
-		col = fCols + Math.floor((bodyLocalX + scrollLeft) / COL_WIDTH);
+		col = indexAtOffset(currentColSizing, frozenColsPx + scrollLeft + bodyLocalX);
 	}
 	if (row < 0 || row >= MAX_ROWS || col < 0 || col >= MAX_COLS) {
 		return null;
 	}
 	return { row, col };
+}
+
+/**
+ * **Wave G column sizing** -- given a VIEWPORT-LOCAL X inside the column-letter band (the caller checks
+ * `localY < HEADER_HEIGHT`), return the column index whose RIGHT edge the pointer is grabbing for a
+ * resize, or `-1` if the pointer is not within {@link RESIZE_GRAB_PX} of any column border. Excel
+ * convention: grabbing a column's right edge resizes THAT column; grabbing its left edge resizes the
+ * PREVIOUS column. Freeze-aware: frozen columns are pinned (no scroll), body columns carry `scrollLeft`,
+ * exactly as {@link hitTestViewportFrozen} maps them -- so the divider between the frozen band and the
+ * body resizes the last frozen column. Pure; the renderer's `cursorAt` + the resize-drag pointerdown
+ * both consult it. With no resized column this still works (uniform widths via the binding).
+ */
+export function colResizeBorderAt(
+	localX: number,
+	scrollLeft: number,
+	gutterW: number,
+	frozenColCount: number,
+): number {
+	if (localX < gutterW) {
+		return -1; // row-number gutter / corner -- never a column border
+	}
+	const fCols = Math.max(0, frozenColCount);
+	const frozenColsPx = offsetBefore(currentColSizing, fCols);
+	// The divider between the frozen band and the scrolling body is a FIXED seam at `gutterW + frozenColsPx`
+	// (the frozen band never scrolls). Grabbing within RESIZE_GRAB_PX of it -- from EITHER side -- resizes the
+	// LAST frozen column. Without this explicit check, a body-side grab maps to a SCROLLED body edge and
+	// misses the seam once `scrollLeft > RESIZE_GRAB_PX` (the grab zone would be half-width). Checked before
+	// the band split so the right side of the divider is always grabbable.
+	if (fCols > 0 && Math.abs(localX - (gutterW + frozenColsPx)) <= RESIZE_GRAB_PX) {
+		return fCols - 1;
+	}
+	// The column under the pointer + its local left/right edges. Frozen band: pinned (no scroll). Body:
+	// the body content origin is `frozenColsPx`, advanced by `scrollLeft`, so each edge subtracts it.
+	let col: number;
+	let leftEdge: number;
+	let rightEdge: number;
+	if (localX < gutterW + frozenColsPx) {
+		col = Math.min(Math.max(0, indexAtOffset(currentColSizing, localX - gutterW)), MAX_COLS - 1);
+		leftEdge = gutterW + offsetBefore(currentColSizing, col);
+		rightEdge = gutterW + offsetBefore(currentColSizing, col + 1);
+	} else {
+		const bodyLocalX = localX - (gutterW + frozenColsPx);
+		col = Math.min(Math.max(0, indexAtOffset(currentColSizing, frozenColsPx + scrollLeft + bodyLocalX)), MAX_COLS - 1);
+		leftEdge = gutterW + offsetBefore(currentColSizing, col) - scrollLeft;
+		rightEdge = gutterW + offsetBefore(currentColSizing, col + 1) - scrollLeft;
+	}
+	// Right-edge grab wins ties (a narrow column < 2*GRAB stays resizable from its own right edge).
+	if (localX >= rightEdge - RESIZE_GRAB_PX) {
+		return col;
+	}
+	if (localX <= leftEdge + RESIZE_GRAB_PX && col - 1 >= 0) {
+		return col - 1;
+	}
+	return -1;
 }
 
 // --- Wave F window split (R5, 2026-06-18) ----------------------------------------------------------

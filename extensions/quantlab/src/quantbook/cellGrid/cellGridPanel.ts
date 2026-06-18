@@ -48,6 +48,9 @@ import { getNonce, getWebviewUri } from '../../utils/webview';
 import type { PublishedRange } from '../reactiveKernel/publishedCellsStore';
 import { SqlResultsStore } from './sqlResultsStore';
 import { sqlOrphanClearRanges } from '../shared/sqlPanelCore';
+// Wave G column sizing: the column-extent + clamp constants for validating the webview's resize messages
+// at the host trust boundary (the pure shared layout module -- DOM/vscode-free, safe to import host-side).
+import { COL_WIDTH, MAX_COLS, MAX_COL_WIDTH, MIN_COL_WIDTH } from '../shared/gridLayoutA1';
 // Demo-prep toolbar (2026-06-10): the webview toolbar's `setNumberFormat` applies a preset directly to
 // this panel's selection -- the same registerFormat -> buildSetFormatOps -> batch -> recalc -> refresh
 // core as the `quantlab.quantbookSetFormat` command (which keeps the QuickPick/Custom path).
@@ -811,6 +814,17 @@ export class CellGridPanel {
 	private frozenColCount: number = 0;
 
 	/**
+	 * **Wave G column sizing (2026-06-18)** -- the session-local resized COLUMN widths (`col -> px`) this
+	 * panel last applied, mirrored host-side ONLY so a webview reload re-applies them (the bundle's sizing is
+	 * cleared on reload). The webview is the authority for the PAINT + clamps; the host just remembers +
+	 * re-posts (via `postColSizingIfReady` in the `webviewReady` handshake). Like the freeze, DISK persistence
+	 * is deferred (a `.qbook` sidecar later) and the overrides RESET on a sheet switch -- this is the
+	 * in-memory, current-sheet v1. Empty = all columns at the default width (the default). An entry equal to
+	 * the default width is never stored (the webview drops it; the host removes it via a `null` width).
+	 */
+	private colSizeOverrides: Map<number, number> = new Map();
+
+	/**
 	 * **W3 (Wave 3, 2026-06-09; Codex HIGH-2)** -- this panel's current webview instance token, learned from
 	 * the `webviewReady` handshake. Used to maintain the module {@link byWebviewToken} map (set on handshake,
 	 * cleared on dispose / re-handshake) so the context menu's host commands route to THIS exact panel.
@@ -1236,6 +1250,70 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **Wave G column sizing** -- handle the webview's resize-drag release: set/remove a session-local column
+	 * width, then re-post the FULL override set. The UNTRUSTED payload is validated at the trust boundary
+	 * (No-Fallbacks): a non-integer / out-of-extent column, or a width that is neither `null` nor a clamped
+	 * number, is dropped LOUD and the sizing is left UNCHANGED. `width === null` (the column is back at the
+	 * default width) REMOVES the override -- keeping the host map canonical with the webview's binding. The
+	 * webview already clamped + canonicalised before posting; this is defence in depth.
+	 */
+	private handleSizeColumn(raw: unknown): void {
+		const m = raw as { col?: unknown; width?: unknown };
+		const col = m.col;
+		const width = m.width;
+		if (typeof col !== 'number' || !Number.isInteger(col) || col < 0 || col >= MAX_COLS) {
+			console.warn('[cellGrid] dropped a malformed sizeColumn message (col must be an integer in [0, MAX_COLS)):', raw);
+			return;
+		}
+		// `null` OR the default width REMOVES the override. The default-equals-remove case keeps the host map
+		// CANONICAL with the webview's binding: the webview drops a default-width override via `withOverride`
+		// (and posts `null`), so a stray `width === COL_WIDTH` from any non-conforming sender must not leave a
+		// stale `[col, default]` entry the host would re-send forever.
+		if (width === null || width === COL_WIDTH) {
+			this.colSizeOverrides.delete(col);
+		} else if (typeof width === 'number' && Number.isInteger(width) && width >= MIN_COL_WIDTH && width <= MAX_COL_WIDTH) {
+			// INTEGER required (not merely finite): a fractional width breaks the renderer's seam alignment
+			// (`round(colX(c)) + sizeAt(c) === round(colX(c+1))` holds only for integer sizes). The drag emits
+			// `Math.round`-ed widths, so a fractional value is a wiring bug -> drop loud (No-Fallbacks).
+			this.colSizeOverrides.set(col, width);
+		} else {
+			console.warn('[cellGrid] dropped a malformed sizeColumn message (width must be null or an integer in the clamp range):', raw);
+			return;
+		}
+		// Wave G: do NOT echo the set back to the webview here. A webview-initiated resize is ALREADY applied
+		// live in the binding, so echoing serves no correctness purpose -- and a full-set echo could land
+		// mid-drag of a DIFFERENT column and momentarily rebuild the binding WITHOUT that in-progress column (a
+		// transient flicker). The host only STORES the override; the re-send happens on the paths the webview
+		// genuinely needs it -- `webviewReady` (reload re-applies) and `switchToSheet` (reset).
+	}
+
+	/**
+	 * **Wave G column sizing** -- post the stored column-override set to the bundled webview IFF the handshake
+	 * completed + the panel is live. Called by {@link handleSizeColumn}, on the `webviewReady` handshake (so a
+	 * reload re-applies the session-local widths), and on a sheet switch (re-posts the reset set). A
+	 * non-delivery is surfaced LOUD (No-Fallbacks) -- the grid would otherwise show the wrong column widths. An
+	 * empty re-send on a fresh load is harmless (the webview starts at uniform widths anyway).
+	 */
+	private postColSizingIfReady(): void {
+		if (!this.webviewReady || this._disposed) {
+			return;
+		}
+		const cols = Array.from(this.colSizeOverrides.entries());
+		this.panel.webview.postMessage({ type: 'colSizing', cols }).then(
+			delivered => {
+				if (!delivered && !this._disposed) {
+					console.warn('[cellGrid] colSizing postMessage was not delivered to the webview.');
+					void vscode.window.showWarningMessage(
+						'Quantbook: the column-sizing update may not have applied (a message was not delivered). '
+						+ 'Reopen the grid to restore your column widths.',
+					);
+				}
+			},
+			err => console.error('[cellGrid] colSizing postMessage rejected:', err),
+		);
+	}
+
+	/**
 	 * **Wave F window split** -- post a split MODE to the bundled webview (the webview computes the bar Y
 	 * from its live scroll + owns all split state, so there is nothing to mirror or re-apply on reload).
 	 * `'atSelection'` splits at the active cell; `'remove'` clears the split. A non-delivery is surfaced
@@ -1318,9 +1396,13 @@ export class CellGridPanel {
 		this.deletedSheetWarned = false;
 		this.frozenRowCount = 0;
 		this.frozenColCount = 0;
-		this.render();
-		// Re-post the (now-cleared) freeze so the webview unfreezes for the new sheet.
+		this.colSizeOverrides.clear(); // Wave G: per-sheet sizing memory is deferred (v2) -- reset like freeze.
+		// Post the (now-cleared) freeze + column sizing BEFORE render() so the first paint of the NEW sheet uses
+		// the reset view-state -- no one-frame flash of the previous sheet's freeze / column widths. The post fns
+		// read only the counters/map (not the snapshot), so ordering them before render() is safe.
 		this.postFreezeIfReady();
+		this.postColSizingIfReady();
+		this.render();
 		// The focused workbook's active sheet changed -> the dep-graph / Live-Python sidebars re-read.
 		if (focusedPanel === this) {
 			fireGridsChanged();
@@ -1903,6 +1985,9 @@ export class CellGridPanel {
 			// W3 frozen panes: a reload re-inits the webview unfrozen; re-apply the session-local freeze so a
 			// reload does not silently lose it. A no-op when nothing is frozen (0/0).
 			this.postFreezeIfReady();
+			// Wave G column sizing: a reload re-inits the webview at uniform widths; re-apply the session-local
+			// column overrides so a reload does not silently lose them. A no-op when nothing is resized (empty).
+			this.postColSizingIfReady();
 			return;
 		}
 		// Sheet-tabs (2026-06-10): intercept the bottom tab strip's messages BEFORE delegating --
@@ -1949,6 +2034,13 @@ export class CellGridPanel {
 					this.frozenRowCount = 0;
 					this.frozenColCount = 0;
 				}
+				return;
+			}
+			// Wave G column sizing: the webview posts a resize-drag release here. Intercept BEFORE delegating --
+			// dispatchIncomingMessage would log it as an unknown type. handleSizeColumn validates the UNTRUSTED
+			// payload + updates the session-local override map + re-posts the full set.
+			if (m.type === 'sizeColumn') {
+				this.handleSizeColumn(raw);
 				return;
 			}
 		}

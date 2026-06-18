@@ -117,6 +117,8 @@ const benchHost: RenderHost = {
 	frozenColCount: () => 0,
 	// Wave F window split: the bench never splits (it measures the single-pane blit fast path).
 	isSplitActive: () => false,
+	// Wave G column sizing: the bench never resizes a column (it measures the uniform-width blit fast path).
+	hasColSizingOverrides: () => false,
 	applyCanvasTransform,
 	onAfterFullRedraw: () => undefined,
 	onAfterScroll: () => undefined,
