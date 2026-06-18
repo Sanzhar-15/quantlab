@@ -42,8 +42,8 @@
 
 import * as vscode from 'vscode';
 
-import type { CellRangeJson, QuantbookCellSnapshot, SessionInstance, WorkbookSnapshotJson } from '../types';
-import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, parseNameBoxSubmitMessage, parseToolbarCommandMessage, type CellsWrittenMessage, type CommitResultMessage, type FunctionListMessage, type GridSelection, type ToolbarFormatPreset, type ValidateFormulaResultMessage } from './cellGridLogic';
+import type { CellRangeJson, FormatIdJson, QuantbookCellSnapshot, SessionInstance, SessionOpJson, WorkbookSnapshotJson } from '../types';
+import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, MAX_NUDGE_CELLS, parseNameBoxSubmitMessage, parseToolbarCommandMessage, type CellsWrittenMessage, type CommitResultMessage, type FunctionListMessage, type GridSelection, type ToolbarFormatPreset, type ValidateFormulaResultMessage } from './cellGridLogic';
 import { getNonce, getWebviewUri } from '../../utils/webview';
 import type { PublishedRange } from '../reactiveKernel/publishedCellsStore';
 // Demo-prep toolbar (2026-06-10): the webview toolbar's `setNumberFormat` applies a preset directly to
@@ -1314,14 +1314,20 @@ export class CellGridPanel {
 			});
 			return;
 		}
-		// parsed.kind === 'setNumberFormat'
+		// The remaining parameterized commands (setNumberFormat / nudgeDecimals -- Wave C) both act on
+		// the current selection. Loud if none, never a silent no-op.
 		if (this.latestSelection === undefined) {
 			void vscode.window.showInformationMessage(
 				'Select one or more cells in the Cell Grid first -- the toolbar format applies to the current selection.',
 			);
 			return;
 		}
-		this.applyToolbarNumberFormat(parsed.preset, this.latestSelection);
+		if (parsed.kind === 'setNumberFormat') {
+			this.applyToolbarNumberFormat(parsed.preset, this.latestSelection);
+			return;
+		}
+		// parsed.kind === 'nudgeDecimals' (Wave C, 2026-06-18)
+		this.applyToolbarDecimalNudge(parsed.delta, this.latestSelection);
 	}
 
 	/**
@@ -1380,6 +1386,130 @@ export class CellGridPanel {
 				const detail = err instanceof Error ? err.message : String(err);
 				console.error(`[cellGrid] refreshSession after toolbar setNumberFormat failed: ${detail}`);
 				void vscode.window.showWarningMessage('Quantbook: the format applied, but the grid may be showing stale values (a repaint failed) -- run "Quantbook: Refresh Cell Grid".');
+			}
+		}
+	}
+
+	/**
+	 * **Wave C / R9 (2026-06-18)** -- increase/decrease the decimal places shown across the selection: the
+	 * toolbar's decimal pair. Mirrors {@link applyToolbarNumberFormat} EXACTLY (registerFormat -> ONE
+	 * `session.batch` of setFormat ops -> recalc -> refresh), but the format applied to each cell is its
+	 * OWN nudged format rather than one uniform preset: the engine `nudgeDecimalsPreview` napi returns the
+	 * read-only nudged format STRING per cell (or `null` for a no-op cell -- clamp boundary / already
+	 * nudged), and those distinct strings are dedup-registered and committed in one batch. The single batch
+	 * makes the CELL EDITS one undo unit, so one undo reverts the WHOLE multi-cell nudge (the per-cell apply
+	 * `nudgeDecimals` napi could not even batch the cell edits -- each is its own Loro commit, i.e. N undos).
+	 * NOTE: registering a first-seen custom format is a SEPARATE Loro commit, so -- exactly as the
+	 * number-format presets already do -- it leaves one trailing, harmless, INVISIBLE undo step (an orphan
+	 * format registration that reverts nothing visible). Excluding format-registration commits from undo for
+	 * the whole format path is a tracked follow-up engine wave; out of scope here (pre-existing + shared with
+	 * {@link applyToolbarNumberFormat}).
+	 *
+	 * It nudges the cells that carry a value, formula, or explicit number format inside the selection (read
+	 * from a fresh snapshot) -- skipping PURE-STYLE cells (a fill/bold but no value/format) so an `increase`
+	 * does not stamp a "0.0" format onto, e.g., a bold-but-empty cell. Falls back to the ACTIVE anchor cell
+	 * when no such cell is in the selection (a deliberate single-cell click on an empty cell still gets the
+	 * Excel base-"0" behavior). Over-{@link MAX_NUDGE_CELLS} rejects loud; an all-no-op selection reports
+	 * honest "nothing to adjust"; every throw surfaces as a toast (No-Fallbacks); a post-apply repaint
+	 * failure warns the grid may be STALE (the nudge DID apply).
+	 */
+	private applyToolbarDecimalNudge(delta: 1 | -1, sel: GridSelection): void {
+		const rect = normalizeSelectionRect(sel.anchorRow, sel.anchorCol, sel.focusRow, sel.focusCol);
+		// Resolve the sheet NAME (loud on a tombstoned-sheet race) for the undo label / toast.
+		let sheetName: string;
+		try {
+			const found = this.session.listSheets().find(s => s.id === this.sheet);
+			if (found === undefined) {
+				throw new Error(`this grid has no live sheet with id ${this.sheet}`);
+			}
+			sheetName = found.name;
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error(`[cellGrid] toolbar nudgeDecimals sheet-name resolve failed: ${detail}`);
+			void vscode.window.showErrorMessage(`Quantbook adjust decimals failed: ${detail}`);
+			return;
+		}
+		// Collect the value/formula/format-bearing cells inside the selection from a fresh snapshot (O(N),
+		// fine for a user action -- same as the style path). Skip PURE-STYLE cells (a styleId but no value/
+		// formula/format, e.g. a bold-but-empty cell) so an `increase` does not stamp a "0.0" format onto
+		// them (Excel parity). Fall back to the ACTIVE anchor cell -- NOT the rect's top-left, which differ
+		// when the selection was dragged up/left -- so a single-cell click on an empty cell still nudges the
+		// cell the user is on (the engine's General base-"0" path).
+		let targets: Array<{ row: number; col: number }>;
+		try {
+			const snapshot = this.session.snapshot();
+			const sheetSnap = snapshot.sheets.find(s => s.id === this.sheet);
+			targets = (sheetSnap?.cells ?? [])
+				.filter(c =>
+					c.row >= rect.startRow && c.row <= rect.endRow && c.col >= rect.startCol && c.col <= rect.endCol &&
+					(c.value !== undefined || c.formula !== undefined || c.format !== undefined))
+				.map(c => ({ row: c.row, col: c.col }));
+			if (targets.length === 0) {
+				targets = [{ row: sel.anchorRow, col: sel.anchorCol }];
+			}
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error(`[cellGrid] toolbar nudgeDecimals snapshot read failed: ${detail}`);
+			void vscode.window.showErrorMessage(`Quantbook adjust decimals failed: ${detail}`);
+			return;
+		}
+		if (targets.length > MAX_NUDGE_CELLS) {
+			void vscode.window.showErrorMessage(
+				`Quantbook adjust decimals: ${targets.length} cells exceeds the ${MAX_NUDGE_CELLS}-cell limit -- select a smaller range.`,
+			);
+			return;
+		}
+		const verb = delta > 0 ? 'Increase' : 'Decrease';
+		const target = formatRangeTarget(sheetName, rect.startRow, rect.startCol, rect.endRow, rect.endCol);
+		const undoLabel = `${verb} decimals on ${target}`;
+		let opSucceeded = false;
+		try {
+			// Preview each cell's nudged format STRING (read-only -- no engine mutation), dedup-register the
+			// distinct strings, and apply them in ONE batch so the whole selection is a SINGLE undo unit
+			// (the exact registerFormat -> batch discipline as applyToolbarNumberFormat; the per-cell apply
+			// `nudgeDecimals` would be N separate undo commits). A `null` preview is a no-op cell (clamp
+			// boundary / already-nudged) -- skipped, contributes no op.
+			const idByString = new Map<string, FormatIdJson>();
+			const ops: SessionOpJson[] = [];
+			for (const t of targets) {
+				const nudged = this.session.nudgeDecimalsPreview(this.sheet, t.row, t.col, delta);
+				if (nudged === null) {
+					continue;
+				}
+				let fid = idByString.get(nudged);
+				if (fid === undefined) {
+					fid = this.session.registerFormat(nudged);
+					idByString.set(nudged, fid);
+				}
+				ops.push({ kind: 'setFormat', sheet: this.sheet, row: t.row, col: t.col, format: fid });
+			}
+			if (ops.length === 0) {
+				// Nothing nudgeable in the selection (e.g. decrease already at zero decimals, or all cells
+				// non-numeric). Honest feedback rather than a silent no-op or a phantom undo step.
+				void vscode.window.showInformationMessage(`${verb} decimals: nothing to adjust in ${target}.`);
+				return;
+			}
+			this.session.batch(ops, { undoLabel });
+			recalcDirtyChecked(this.session);
+			opSucceeded = true;
+			void vscode.window.showInformationMessage(`${undoLabel}.`);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error(`[cellGrid] toolbar nudgeDecimals failed: ${detail}`);
+			void vscode.window.showErrorMessage(`Quantbook adjust decimals failed: ${detail}`);
+		}
+		if (opSucceeded) {
+			// Repaint in a SEPARATE try so a render failure is not misreported as a nudge failure: the
+			// nudge DID apply; the on-screen grid may be stale (same split as the format path).
+			try {
+				const { failed } = CellGridPanel.refreshSession(this.session);
+				if (failed > 0) {
+					void vscode.window.showWarningMessage(`Quantbook: the decimals applied, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid" or check the Quantbook output for details.`);
+				}
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				console.error(`[cellGrid] refreshSession after toolbar nudgeDecimals failed: ${detail}`);
+				void vscode.window.showWarningMessage('Quantbook: the decimals applied, but the grid may be showing stale values (a repaint failed) -- run "Quantbook: Refresh Cell Grid".');
 			}
 		}
 	}

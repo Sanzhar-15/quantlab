@@ -460,6 +460,13 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (FE-6 M)`);
 				}
 			}
+			// **Wave C / R9 (2026-06-18):** the read-only decimal-nudge PREVIEW backing the toolbar's
+			// decimal pair (the IDE registers the returned string + applies it via one `batch`, for a
+			// single-undo multi-cell nudge). A stale cdylib (pre-Wave-C) lacks it -- fail loud at the loader
+			// boundary, not at the `nudgeDecimalsPreview is not a function` use site.
+			if (typeof sproto['nudgeDecimalsPreview'] !== 'function') {
+				missing.push('Session.prototype.nudgeDecimalsPreview (Wave C / R9)');
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

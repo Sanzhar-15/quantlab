@@ -2572,10 +2572,20 @@ export type ToolbarFormatPreset = Exclude<FormatPreset, 'Custom'>;
  * - `setNumberFormat`: apply the preset directly to the panel's session/sheet
  *   over its latest selection (no QuickPick).
  */
+/**
+ * **Wave C (2026-06-18)** -- the toolbar's increase/decrease-decimal direction. A closed enum (NOT a
+ * raw signed number) so the UNTRUSTED webview can only ask for one of two intents; the host maps it to
+ * the engine's `nudgeDecimals` signed `delta` via {@link TOOLBAR_NUDGE_DIRECTIONS} (never trusts a wire int).
+ */
+export type ToolbarNudgeDirection = 'increase' | 'decrease';
+
 export type ParsedToolbarCommand =
 	| { kind: 'simple'; command: ToolbarSimpleCommand; commandId: string }
 	| { kind: 'structural'; command: StructuralOp; commandId: string }
-	| { kind: 'setNumberFormat'; preset: ToolbarFormatPreset };
+	| { kind: 'setNumberFormat'; preset: ToolbarFormatPreset }
+	// **Wave C (2026-06-18)** -- `decimal-increase`/`decimal-decrease` over the selection. `delta` is the
+	// engine's signed nudge (+1 / -1), resolved from the whitelisted `direction` (never a wire-supplied int).
+	| { kind: 'nudgeDecimals'; direction: ToolbarNudgeDirection; delta: 1 | -1 };
 
 /**
  * Whitelist: toolbar command -> argument-less host command id. A `Record` over
@@ -2685,6 +2695,27 @@ const TOOLBAR_FORMAT_PRESETS: Record<ToolbarFormatPreset, true> = {
 	Date: true,
 };
 
+/**
+ * **Wave C (2026-06-18)** -- whitelist mapping the toolbar's decimal-nudge {@link ToolbarNudgeDirection}
+ * to the engine `nudgeDecimals` signed `delta`. A `Record` (compile-time exhaustive) so a future
+ * direction forces an explicit mapping; the wire `direction` is membership-checked via {@link hasOwnKey}
+ * so an untrusted string can never resolve a delta off the prototype chain.
+ */
+const TOOLBAR_NUDGE_DIRECTIONS: Record<ToolbarNudgeDirection, 1 | -1> = {
+	increase: 1,
+	decrease: -1,
+};
+
+/**
+ * **Wave C (2026-06-18)** -- upper bound on cells a single decimal-nudge may touch. A nudge issues one
+ * READ-ONLY `nudgeDecimalsPreview` napi call per target cell (to compute each cell's nudged format string)
+ * and then applies the distinct results in ONE `session.batch` of `setFormat` ops -- the exact batched-undo
+ * path as the number-format presets. The host nudges only the value/formula/format-bearing cells in the
+ * selection (read from the snapshot), so a real target is far under this; the cap rejects a pathological
+ * dense whole-sheet selection loud rather than firing 10^N preview calls before the batch.
+ */
+export const MAX_NUDGE_CELLS = 100_000;
+
 /** Own-property membership test that narrows `key` to the record's key type (prototype-chain-safe). */
 function hasOwnKey<K extends string>(record: Record<K, unknown>, key: string): key is K {
 	return Object.prototype.hasOwnProperty.call(record, key);
@@ -2717,6 +2748,17 @@ export function parseToolbarCommandMessage(raw: unknown): ParsedToolbarCommand |
 			return undefined;
 		}
 		return { kind: 'setNumberFormat', preset: m.preset };
+	}
+	// **Wave C (2026-06-18)** -- the parameterized decimal-nudge command: requires a string `direction`
+	// in {@link TOOLBAR_NUDGE_DIRECTIONS} (a missing/unknown direction is rejected, same discipline as
+	// the `setNumberFormat` preset). The signed `delta` is resolved HERE from the whitelist -- the host
+	// never sees (and never trusts) a wire-supplied number.
+	if (m.command === 'nudgeDecimals') {
+		const dir = (m as { direction?: unknown }).direction;
+		if (typeof dir !== 'string' || !hasOwnKey(TOOLBAR_NUDGE_DIRECTIONS, dir)) {
+			return undefined;
+		}
+		return { kind: 'nudgeDecimals', direction: dir, delta: TOOLBAR_NUDGE_DIRECTIONS[dir] };
 	}
 	if (hasOwnKey(TOOLBAR_SIMPLE_COMMAND_IDS, m.command)) {
 		return { kind: 'simple', command: m.command, commandId: TOOLBAR_SIMPLE_COMMAND_IDS[m.command] };

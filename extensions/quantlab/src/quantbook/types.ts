@@ -2177,6 +2177,23 @@ export interface SessionInstance {
 	registerFormat(formatString: string): FormatIdJson;
 
 	/**
+	 * **R9 / Wave C (2026-06-18)**: compute (but do NOT apply) the number-format string a cell would carry
+	 * after an increase (`delta > 0`) / decrease (`delta < 0`) of its decimal places -- the read-only half
+	 * of Excel's "Increase/Decrease Decimal". The engine reads the cell's current format (an unbound /
+	 * `General` cell is the integer base `"0"`) and nudges it, returning the new format STRING, or `null`
+	 * when nothing would change (clamp boundary, the cell already carries the nudged format, or `delta === 0`).
+	 *
+	 * PURE READ -- it does NOT intern a format or rebind the cell (so it never touches the undo history).
+	 * The IDE registers the returned string(s) via {@link registerFormat} and applies them over the
+	 * selection in ONE {@link batch} -- so one undo reverts the WHOLE multi-cell nudge (the cell edits are a
+	 * single batch commit). Registering a first-seen custom format is a separate commit, so -- exactly as the
+	 * number-format presets do -- it leaves one trailing, invisible undo step. `[bad_argument]` for invalid
+	 * coords or a non-integer / zero / out-of-range (+-30) delta; a `[Red]`/conditional/elapsed-time format
+	 * the engine cannot model surfaces a loud `[invalid_format]` (No-Fallbacks -- never silently mangled).
+	 */
+	nudgeDecimalsPreview(sheet: number, row: number, col: number, delta: number): string | null;
+
+	/**
 	 * **FE-4 W4 (2026-06-10)**: set a cell's visual style to a registered
 	 * {@link StyleIdJson} (from {@link registerStyle}). `[bad_argument]` for invalid
 	 * coords or an unknown/malformed style id. The visual-formatting analog of

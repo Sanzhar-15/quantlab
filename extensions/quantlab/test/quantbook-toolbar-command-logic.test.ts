@@ -103,6 +103,45 @@ suite('toolbar-command parser -- setNumberFormat preset validation', () => {
 	});
 });
 
+// **Wave C (2026-06-18)** -- the parameterized decimal-nudge command. Mirrors setNumberFormat's
+// preset validation: a closed `direction` whitelist maps to the engine's signed delta; an off-whitelist
+// direction is rejected (No-Fallbacks -- the host never guesses, never trusts a wire int).
+suite('toolbar-command parser -- nudgeDecimals (decimal pair)', () => {
+	/** Build a nudgeDecimals message the way the webview posts it. */
+	function nudge(direction?: unknown): unknown {
+		return direction === undefined
+			? { type: 'toolbarCommand', command: 'nudgeDecimals' }
+			: { type: 'toolbarCommand', command: 'nudgeDecimals', direction };
+	}
+
+	test('increase -> delta +1, decrease -> delta -1', () => {
+		assert.deepStrictEqual(parseToolbarCommandMessage(nudge('increase')), {
+			kind: 'nudgeDecimals', direction: 'increase', delta: 1,
+		});
+		assert.deepStrictEqual(parseToolbarCommandMessage(nudge('decrease')), {
+			kind: 'nudgeDecimals', direction: 'decrease', delta: -1,
+		});
+	});
+
+	test('a missing / non-string / unknown / case-mismatched direction is rejected', () => {
+		assert.strictEqual(parseToolbarCommandMessage(nudge()), undefined);
+		assert.strictEqual(parseToolbarCommandMessage(nudge(1)), undefined);
+		assert.strictEqual(parseToolbarCommandMessage(nudge(null)), undefined);
+		assert.strictEqual(parseToolbarCommandMessage(nudge('Increase')), undefined); // exact-case only
+		assert.strictEqual(parseToolbarCommandMessage(nudge('up')), undefined);
+		// a wrong VALUE in the `direction` field is rejected (not a whitelisted direction)
+		assert.strictEqual(parseToolbarCommandMessage(nudge('Currency')), undefined);
+		// a preset in the (wrong) `preset` field with no `direction` is also rejected
+		assert.strictEqual(parseToolbarCommandMessage(msg('nudgeDecimals', 'Currency')), undefined);
+	});
+
+	test('prototype-chain direction names never resolve (own-property whitelist only)', () => {
+		assert.strictEqual(parseToolbarCommandMessage(nudge('toString')), undefined);
+		assert.strictEqual(parseToolbarCommandMessage(nudge('constructor')), undefined);
+		assert.strictEqual(parseToolbarCommandMessage(nudge('hasOwnProperty')), undefined);
+	});
+});
+
 suite('toolbar-command parser -- off-whitelist rejection (the security boundary)', () => {
 	test('rejects a non-object / null / primitive message', () => {
 		assert.strictEqual(parseToolbarCommandMessage(undefined), undefined);

@@ -410,6 +410,15 @@ function postToolbarCommand(command: ToolbarCommand): void {
 function postSetNumberFormat(preset: NumberFormatPreset): void {
 	vscode.postMessage({ type: 'toolbarCommand', command: 'setNumberFormat', preset });
 }
+/** **Wave C (2026-06-18)** -- the toolbar's increase/decrease-decimal intent. A closed enum (not a raw
+ * signed int): the host maps it to the engine's `nudgeDecimals` delta, so the webview never supplies a
+ * number the host must re-validate. */
+type NudgeDirection = 'increase' | 'decrease';
+/** **Wave C (2026-06-18)** -- post the decimal-nudge variant (the host nudges the selection's populated
+ * cells via the `nudgeDecimals` napi). The parameterized shape mirrors {@link postSetNumberFormat}. */
+function postNudgeDecimals(direction: NudgeDirection): void {
+	vscode.postMessage({ type: 'toolbarCommand', command: 'nudgeDecimals', direction });
+}
 
 /** One actionable dropdown entry; `'separator'` draws a thin divider (non-interactive). */
 interface MenuItemSpec {
@@ -877,6 +886,15 @@ toolbarEl.addEventListener('click', (e) => {
 		case 'fmt-percent':
 			runAfterResolvingEdit('number format "Percent"', () => postSetNumberFormat('Percent'));
 			return;
+		// **Wave C (2026-06-18)** -- the decimal pair, formerly preview-only, now wired to the engine
+		// `nudgeDecimals` napi (the host nudges the selection's populated cells). Like every mutating chrome
+		// action they resolve the open editor first via `runAfterResolvingEdit`.
+		case 'decimal-increase':
+			runAfterResolvingEdit('Increase decimal places', () => postNudgeDecimals('increase'));
+			return;
+		case 'decimal-decrease':
+			runAfterResolvingEdit('Decrease decimal places', () => postNudgeDecimals('decrease'));
+			return;
 		case 'freeze':
 			runAfterResolvingEdit('Freeze panes', () => postToolbarCommand('freezePanes'));
 			return;
@@ -977,10 +995,10 @@ toolbarEl.addEventListener('click', (e) => {
 			resolveEditThen({ kind: 'chrome', label: 'Find', run: openFindBar });
 			return;
 		default:
-			// Still visual-only (print / paint-format / zoom / decimal pair / font family+size /
-			// merge / vertical-align / wrap / filter / sort): genuinely engine-greenfield or out-of-scope
-			// for this preview. Surfaced honestly via a neutral "preview" toast rather than a silent
-			// no-op (the round-5 audit's #1 finding -- a click that does nothing reads as fake).
+			// Still visual-only (print / paint-format / zoom / font family+size / merge / vertical-align /
+			// wrap / filter / sort): genuinely engine-greenfield or out-of-scope for this preview. (The
+			// decimal pair graduated to live in Wave C.) Surfaced honestly via a neutral "preview" toast
+			// rather than a silent no-op (the round-5 audit's #1 finding -- a click that does nothing reads as fake).
 			notifyPreviewOnly(btn.getAttribute('title') ?? 'This control');
 			return;
 	}

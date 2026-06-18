@@ -296,4 +296,72 @@ suite('quantbook owning Session migration -- Phase 6.1B inc.2d', () => {
 				'B\'s full snapshot omits the tombstoned sheet 1');
 		});
 	});
+
+	// ------------------------------------------------------------------------
+	// Wave C (2026-06-18) -- decimal nudge through the REAL dylib, the IDE host
+	// path: `nudgeDecimalsPreview` per cell (read-only) -> registerFormat ->
+	// ONE `batch` of setFormat ops. The single batch makes a multi-cell decimal
+	// nudge a SINGLE undo unit (the whole point of the preview+batch design over
+	// per-cell apply `nudgeDecimals`, which is one Loro commit each).
+	// ------------------------------------------------------------------------
+	suite('Wave C -- decimal nudge preview + batch (the IDE host path)', () => {
+
+		test('preview is read-only; one undo reverts the whole multi-cell nudge (cell edits are one batch)', () => {
+			const s = createWorkbookSession();
+			const sheet = s.addSheet('S', 1000);
+			s.setValue(sheet, 0, 0, { kind: 'number', number: 1.5 });
+			s.setValue(sheet, 1, 0, { kind: 'number', number: 2.5 });
+			const fmt = s.registerFormat('0.00');
+			s.setFormat(sheet, 0, 0, fmt);
+			s.setFormat(sheet, 1, 0, fmt);
+			s.recalcDirty();
+			assert.strictEqual(s.cell(sheet, 0, 0)!.rendered, '1.50');
+			assert.strictEqual(s.cell(sheet, 1, 0)!.rendered, '2.50');
+
+			// PREVIEW each cell (read-only): returns the nudged STRING, mutates nothing.
+			const p00 = s.nudgeDecimalsPreview(sheet, 0, 0, 1);
+			const p10 = s.nudgeDecimalsPreview(sheet, 1, 0, 1);
+			assert.strictEqual(p00, '0.000');
+			assert.strictEqual(p10, '0.000');
+			// Read-only invariant: the cells are UNCHANGED after previewing.
+			assert.strictEqual(s.cell(sheet, 0, 0)!.rendered, '1.50', 'preview did not mutate A1');
+			assert.strictEqual(s.cell(sheet, 1, 0)!.rendered, '2.50', 'preview did not mutate A2');
+
+			// APPLY exactly as the IDE host does: register the (deduped) string once + ONE batch.
+			const nudgedFmt = s.registerFormat(p00!);
+			s.batch(
+				[
+					{ kind: 'setFormat', sheet, row: 0, col: 0, format: nudgedFmt },
+					{ kind: 'setFormat', sheet, row: 1, col: 0, format: nudgedFmt },
+				],
+				{ undoLabel: 'Increase decimals' },
+			);
+			s.recalcDirty();
+			assert.strictEqual(s.cell(sheet, 0, 0)!.rendered, '1.500');
+			assert.strictEqual(s.cell(sheet, 1, 0)!.rendered, '2.500');
+
+			// THE HEADLINE: ONE undo reverts BOTH cells' visible change (the cell edits are one batch
+			// commit). (A first-seen custom-format registration is a separate, invisible trailing undo
+			// step -- inherited from the number-format presets -- but it reverts nothing visible, so the
+			// user's single Ctrl+Z fully undoes the nudge.)
+			const r = s.undo();
+			assert.ok(r.consumed, 'undo consumed the nudge batch');
+			s.recalcDirty();
+			assert.strictEqual(s.cell(sheet, 0, 0)!.rendered, '1.50', 'one undo reverts A1');
+			assert.strictEqual(s.cell(sheet, 1, 0)!.rendered, '2.50', 'one undo reverts A2');
+		});
+
+		test('preview no-op returns null (decrease already at zero decimals)', () => {
+			const s = createWorkbookSession();
+			const sheet = s.addSheet('S', 1000);
+			s.setValue(sheet, 0, 0, { kind: 'number', number: 3 });
+			const zero = s.registerFormat('0');
+			s.setFormat(sheet, 0, 0, zero);
+			s.recalcDirty();
+			// Decrease past zero decimals ⇒ no-op ⇒ null (the host skips the cell, no op emitted).
+			assert.strictEqual(s.nudgeDecimalsPreview(sheet, 0, 0, -1), null);
+			// Increasing it DOES nudge ⇒ "0.0".
+			assert.strictEqual(s.nudgeDecimalsPreview(sheet, 0, 0, 1), '0.0');
+		});
+	});
 });

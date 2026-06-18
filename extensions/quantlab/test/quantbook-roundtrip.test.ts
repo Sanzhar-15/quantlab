@@ -1514,6 +1514,8 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 			'tableColumns',
 			// FE-6 M (2026-06-13): the loader now boundary-checks the structural + style napi methods.
 			'insertRows', 'deleteRows', 'insertColumns', 'deleteColumns', 'registerStyle', 'setStyle',
+			// Wave C (2026-06-18): the loader now boundary-checks the read-only decimal-nudge preview.
+			'nudgeDecimalsPreview',
 			'batch', 'beginTransaction', 'txnAdd', 'commitTransaction', 'rollbackTransaction',
 			'writeRange', 'publishDataset', 'bindRange', 'refreshSource', 'materializeQuery',
 			'close', 'registerFunction', 'unregisterFunction', 'listFunctions',
