@@ -35,7 +35,10 @@ import {
 	MAX_ROWS,
 	ROW_HEIGHT,
 	type SelectionRect,
+	type SplitPaneRanges,
 	clampFrozenCount,
+	clampSplitBarY,
+	clampSplitScroll,
 	colX,
 	columnLabel,
 	computeVisibleBodyColRange,
@@ -45,6 +48,7 @@ import {
 	gutterWidth,
 	isInExtent,
 	rowY,
+	splitPaneRowRanges,
 	truncateToWidth,
 } from './gridLayoutA1';
 
@@ -428,6 +432,17 @@ export class CanvasGridRenderer {
 	private frozenRowCount = 0;
 	private frozenColCount = 0;
 	/**
+	 * **Wave F window split (R5, 2026-06-18)** -- a horizontal split divides the viewport into a TOP and a
+	 * BOTTOM pane that scroll INDEPENDENTLY on Y. `splitBarY` is the viewport CSS-Y of the split bar; `0`
+	 * means NO split (the byte-identical pre-split single-pane path, exactly like `frozenRowCount===0`).
+	 * `topSplitScroll` is the SYNTHETIC vertical scroll of the TOP pane (the bottom pane tracks the live DOM
+	 * `scrollTop`). Set via {@link setSplit} / {@link setTopSplitScroll}; cleared whenever a freeze is set
+	 * (split + freeze are mutually exclusive, Excel canon). Always sane (clamped in the setters + on
+	 * {@link resize}, so a malformed wire value or a shrunk viewport can never collapse a pane).
+	 */
+	private splitBarY = 0;
+	private topSplitScroll = 0;
+	/**
 	 * **Sheets retheme (2026-06-10)** -- the scroll offset the LAST frame painted at, recorded by
 	 * {@link paintWindow}. The cursor hit-test ({@link installCursorHitTest}) reads it to place the column /
 	 * row header separators under the pointer at the same offset the visible frame shows (the renderer is
@@ -536,6 +551,11 @@ export class CanvasGridRenderer {
 	setFrozen(rows: number, cols: number): void {
 		this.frozenRowCount = clampFrozenCount(rows, MAX_ROWS);
 		this.frozenColCount = clampFrozenCount(cols, MAX_COLS);
+		// Split + freeze are mutually exclusive (Excel canon): turning a freeze ON clears any split.
+		if (this.frozenRowCount > 0 || this.frozenColCount > 0) {
+			this.splitBarY = 0;
+			this.topSplitScroll = 0;
+		}
 	}
 
 	/** **W3 frozen panes** -- the current pinned-row count (the orchestrator's blit gate reads this via the host). */
@@ -546,6 +566,60 @@ export class CanvasGridRenderer {
 	/** **W3 frozen panes** -- the current pinned-col count. */
 	get frozenCols(): number {
 		return this.frozenColCount;
+	}
+
+	/**
+	 * **Wave F window split** -- set the horizontal split bar at viewport CSS-Y `barY`, clamped via
+	 * {@link clampSplitBarY} so each pane keeps >= 1 row (or `0` = no split when the viewport is too short).
+	 * The TOP pane is seeded to the CURRENT rows (`domScrollTop`, the live DOM scroll). The CALLER then shifts
+	 * the DOM scroll (the bottom pane) DOWN by the top-band height so the bottom pane CONTINUES from where the
+	 * top pane ends -- the two panes show CONTIGUOUS rows with NO duplication (even near the top of the sheet),
+	 * and the active row becomes the top of the bottom pane (Excel-style split-at-cell). The panes diverge as
+	 * each scrolls. Clears any freeze (mutually exclusive). Does NOT repaint -- the host calls this then
+	 * `redraw()`.
+	 */
+	setSplit(barY: number, cssHeight: number, domScrollTop: number): void {
+		const clamped = clampSplitBarY(barY, cssHeight);
+		this.splitBarY = clamped;
+		if (clamped > 0) {
+			this.frozenRowCount = 0;
+			this.frozenColCount = 0;
+			this.topSplitScroll = clampSplitScroll(domScrollTop, clamped - HEADER_HEIGHT);
+		} else {
+			this.topSplitScroll = 0;
+		}
+	}
+
+	/** **Wave F window split** -- remove the split (restore the byte-identical single-pane path). */
+	clearSplit(): void {
+		this.splitBarY = 0;
+		this.topSplitScroll = 0;
+	}
+
+	/** **Wave F window split** -- whether a horizontal split is active. The orchestrator's blit/damage gate +
+	 * the hit-test / overlay-editor read this (through the host) to force the full-draw path while split. */
+	get splitActive(): boolean {
+		return this.splitBarY > 0;
+	}
+
+	/** **Wave F window split** -- the split bar's viewport CSS-Y (`0` = no split). */
+	get splitBarYPx(): number {
+		return this.splitBarY;
+	}
+
+	/** **Wave F window split** -- the TOP pane's current synthetic vertical scroll. */
+	get topSplitScrollPx(): number {
+		return this.topSplitScroll;
+	}
+
+	/** **Wave F window split** -- set the TOP pane's synthetic vertical scroll (wheel / keyboard reveal),
+	 * clamped so it can never run past the last row (no native scrollbar bounds it). No-op when no split is
+	 * active. The host calls this then `redraw()`. */
+	setTopSplitScroll(scrollTop: number): void {
+		if (this.splitBarY <= 0) {
+			return;
+		}
+		this.topSplitScroll = clampSplitScroll(scrollTop, Math.max(0, this.splitBarY - HEADER_HEIGHT));
 	}
 
 	private static resolveDpr(): number {
@@ -665,6 +739,14 @@ export class CanvasGridRenderer {
 		}
 		this.canvas.style.width = cssWidth + 'px';
 		this.canvas.style.height = cssHeight + 'px';
+		// **Wave F window split** -- a viewport that shrank below the bar must re-clamp (or drop) the split so
+		// a pane never collapses below one row. `clampSplitBarY` returns 0 when the viewport is too short.
+		if (this.splitBarY > 0) {
+			this.splitBarY = clampSplitBarY(this.splitBarY, cssHeight);
+			this.topSplitScroll = this.splitBarY > 0
+				? clampSplitScroll(this.topSplitScroll, Math.max(0, this.splitBarY - HEADER_HEIGHT))
+				: 0;
+		}
 	}
 
 	/**
@@ -947,6 +1029,12 @@ export class CanvasGridRenderer {
 		pointPreview: SelectionRect | null,
 		refHighlights: readonly RefHighlightRect[],
 	): void {
+		// **Wave F window split** -- when a horizontal split is active, route to the two-pane split paint.
+		// (Split + freeze are mutually exclusive, so the frozen-pane branches below never run while split.)
+		if (this.splitBarY > 0) {
+			this.paintSplitWindow(cssWidth, cssHeight, scrollTop, scrollLeft, errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights);
+			return;
+		}
 		const ctx = this.ctx;
 		// Sheets retheme: remember the scroll this frame painted at, so the cursor hit-test can place the
 		// header separators under the pointer at the matching offset (cursor-only; never read by paint math).
@@ -1030,6 +1118,153 @@ export class CanvasGridRenderer {
 		this.drawGutter(scrollTop, gutterW, cssHeight, bodyRowRange.startIdx, bodyRowRange.endIdx, active, selection, visFrozenRows, bodyTop);
 		this.drawHeader(scrollLeft, gutterW, cssWidth, bodyColRange.startIdx, bodyColRange.endIdx, active, selection, visFrozenCols, bodyLeft);
 		this.drawCorner(gutterW);
+	}
+
+	/**
+	 * **Wave F window split (R5, 2026-06-18)** -- paint the grid as TWO vertically-stacked, INDEPENDENTLY
+	 * scrolling panes (chosen by {@link paintWindow} when `splitBarY > 0`). The TOP pane `[HEADER_HEIGHT,
+	 * splitBarY)` paints at the synthetic `topSplitScroll`; the BOTTOM pane `[splitBarY, cssHeight)` at the
+	 * live DOM `scrollTop`. Both share the horizontal `scrollLeft` (no vertical split in v1). Each pane
+	 * reuses the SAME {@link paintCellRegion} cell-pixel core freeze uses -- this is freeze's pinned-band
+	 * trick with the band fed an independent scroll instead of 0.
+	 *
+	 * The BOTTOM pane's effective scroll is `scrollTop - (splitBarY - HEADER_HEIGHT)`: `paintCellRegion`
+	 * positions cell `r` at `rowY(r) - effScrollTop` (content origin at HEADER_HEIGHT), so shifting by the
+	 * band offset lands the bottom content in the `[splitBarY, cssHeight)` band. The TOP pane's band already
+	 * starts at HEADER_HEIGHT, so its effective scroll is `topSplitScroll` unshifted. (The hit-test takes the
+	 * RAW pane scrolls -- its `paneTopPx` encodes the band offset instead; see {@link hitTestSplit}.)
+	 */
+	private paintSplitWindow(
+		cssWidth: number,
+		cssHeight: number,
+		scrollTop: number,
+		scrollLeft: number,
+		errorCells: ReadonlyMap<string, string>,
+		active: ActiveCell | null,
+		selection: SelectionRect | null,
+		publishedRanges: readonly PublishedRange[],
+		fillPreview: SelectionRect | null,
+		pointPreview: SelectionRect | null,
+		refHighlights: readonly RefHighlightRect[],
+	): void {
+		const ctx = this.ctx;
+		this.lastScrollTop = scrollTop;
+		this.lastScrollLeft = scrollLeft;
+		ctx.fillStyle = this.palette.background;
+		ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+		const gutterW = this.gutterW;
+		const splitBarY = this.splitBarY;
+		const topScroll = this.topSplitScroll;
+		const botScroll = scrollTop;
+		// Effective paint scroll per pane (see the method doc): the TOP band starts at HEADER_HEIGHT (no
+		// shift), the BOTTOM band starts at splitBarY (shift content down by the band offset).
+		const bandOffset = splitBarY - HEADER_HEIGHT;
+		const topEff = topScroll;
+		const botEff = botScroll - bandOffset;
+
+		// Per-pane visible row windows (raw pane scrolls) + the shared scrolling column window (no vertical
+		// split -> the frozen-col count is 0, so computeVisibleBodyColRange reduces to the plain body window).
+		const ranges = splitPaneRowRanges(topScroll, botScroll, splitBarY, cssHeight, OVERSCAN);
+		const bodyWidth = Math.max(0, cssWidth - gutterW);
+		const colRange = computeVisibleBodyColRange(scrollLeft, bodyWidth, MAX_COLS, COL_WIDTH, OVERSCAN, 0);
+
+		// TOP pane, clipped to its band.
+		this.paintCellRegion(
+			ranges.top, colRange, topEff, scrollLeft, gutterW,
+			gutterW, HEADER_HEIGHT, cssWidth, splitBarY,
+			errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights,
+		);
+		// BOTTOM pane, clipped to its band.
+		this.paintCellRegion(
+			ranges.bottom, colRange, botEff, scrollLeft, gutterW,
+			gutterW, splitBarY, cssWidth, cssHeight,
+			errorCells, active, selection, publishedRanges, fillPreview, pointPreview, refHighlights,
+		);
+
+		// Sticky bands: split-aware gutter (each pane's own row numbers at its own effective scroll), the
+		// no-freeze column header (single horizontal scroll), and the corner box.
+		this.drawSplitGutter(gutterW, cssHeight, ranges, splitBarY, topEff, botEff, active, selection);
+		this.drawHeader(scrollLeft, gutterW, cssWidth, colRange.startIdx, colRange.endIdx, active, selection, 0, gutterW);
+		this.drawCorner(gutterW);
+
+		// The split bar: a 3px divider across the full width at y=splitBarY (drawn last, owns its seam).
+		ctx.fillStyle = this.palette.headerText;
+		ctx.fillRect(0, Math.round(splitBarY) - 1, cssWidth, 3);
+	}
+
+	/**
+	 * **Wave F window split** -- the sticky row-number gutter for a horizontal split: each pane's OWN row
+	 * numbers at its OWN effective scroll, clipped to its band (mirrors {@link drawGutter}'s `paintRowLabels`
+	 * but parameterized per split pane). The active/selection tint + hover wash + per-row bottom borders are
+	 * identical to the single-pane gutter; only the band/scroll differ.
+	 */
+	private drawSplitGutter(
+		gutterW: number,
+		cssHeight: number,
+		ranges: SplitPaneRanges,
+		splitBarY: number,
+		topEff: number,
+		botEff: number,
+		active: ActiveCell | null,
+		selection: SelectionRect | null,
+	): void {
+		const ctx = this.ctx;
+		ctx.fillStyle = this.palette.background;
+		ctx.fillRect(0, 0, gutterW, cssHeight);
+		ctx.fillStyle = this.palette.headerBg;
+		ctx.fillRect(0, 0, gutterW, cssHeight);
+		ctx.font = this.headerFont;
+		ctx.textBaseline = 'middle';
+		ctx.textAlign = 'right';
+		const paintPaneGutter = (range: { startIdx: number; endIdx: number }, effScrollTop: number, clipY0: number, clipY1: number): void => {
+			if (clipY1 <= clipY0 || range.endIdx <= range.startIdx) {
+				return;
+			}
+			ctx.save();
+			ctx.beginPath();
+			ctx.rect(0, clipY0, gutterW, clipY1 - clipY0);
+			ctx.clip();
+			for (let r = range.startIdx; r < range.endIdx; r += 1) {
+				const y = Math.round(rowY(r) - effScrollTop);
+				const tinted = selection !== null
+					? r >= selection.minRow && r <= selection.maxRow
+					: active !== null && active.row === r;
+				const isFocusRow = active !== null && active.row === r;
+				if (tinted) {
+					ctx.fillStyle = this.palette.headerActiveBg;
+					ctx.fillRect(0, y, gutterW, ROW_HEIGHT);
+				} else if (r === this.hoveredHeaderRow) {
+					ctx.fillStyle = this.palette.headerHoverBg;
+					ctx.fillRect(0, y, gutterW, ROW_HEIGHT);
+				}
+				ctx.font = isFocusRow ? this.headerActiveFont : this.headerFont;
+				ctx.fillStyle = tinted ? this.palette.accent : this.palette.headerText;
+				ctx.fillText(String(r + 1), gutterW - CELL_PAD, y + ROW_HEIGHT / 2);
+			}
+			// Per-row bottom borders within the band.
+			ctx.strokeStyle = this.palette.border;
+			ctx.lineWidth = 1;
+			ctx.beginPath();
+			for (let r = range.startIdx; r <= range.endIdx; r += 1) {
+				const y = Math.round(rowY(r) - effScrollTop) - 0.5;
+				ctx.moveTo(0, y);
+				ctx.lineTo(gutterW, y);
+			}
+			ctx.stroke();
+			ctx.restore();
+		};
+		paintPaneGutter(ranges.top, topEff, HEADER_HEIGHT, splitBarY);
+		paintPaneGutter(ranges.bottom, botEff, splitBarY, cssHeight);
+		// Gutter right border (full height).
+		ctx.strokeStyle = this.palette.border;
+		ctx.lineWidth = 1;
+		ctx.beginPath();
+		const rx = Math.round(gutterW) - 0.5;
+		ctx.moveTo(rx, 0);
+		ctx.lineTo(rx, cssHeight);
+		ctx.stroke();
+		ctx.textAlign = 'left';
 	}
 
 	/**

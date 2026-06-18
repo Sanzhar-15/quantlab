@@ -1255,6 +1255,37 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			getOutput().appendLine('Unfroze panes.');
 		}),
 	);
+	// Wave F window split (R5, 2026-06-18): split the focused grid into two independently-scrolling panes at
+	// the active cell (distinct from freeze -- the panes scroll separately). The webview owns all split
+	// geometry (it computes the bar Y from its live scroll), so the host command just triggers it.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookSplitAtSelection', () => {
+			const result = CellGridPanel.splitFocusedAtSelection();
+			if (!result.ok) {
+				void vscode.window.showInformationMessage(
+					result.reason === 'not-ready'
+						? 'Quantbook: the Cell Grid is still loading -- try Split again in a moment.'
+						: 'No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.',
+				);
+				return;
+			}
+			getOutput().appendLine('Split window at the active cell.');
+		}),
+	);
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookRemoveSplit', () => {
+			const result = CellGridPanel.removeFocusedSplit();
+			if (!result.ok) {
+				void vscode.window.showInformationMessage(
+					result.reason === 'not-ready'
+						? 'Quantbook: the Cell Grid is still loading -- try again in a moment.'
+						: 'No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.',
+				);
+				return;
+			}
+			getOutput().appendLine('Removed window split.');
+		}),
+	);
 	// --- W3 (Wave 3, 2026-06-09): the Cell Grid right-click context menu's host commands. ---------------
 	//
 	// **SHARED-FILE FLAG (conductor):** this additive block + the import above are the W3 footprint in

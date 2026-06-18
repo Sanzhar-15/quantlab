@@ -660,6 +660,43 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **Wave F window split (R5, 2026-06-18)** -- split the focused Cell Grid into two independently
+	 * scrolling panes at the active cell. Unlike freeze (which the host mirrors + re-applies on reload), the
+	 * split state lives ENTIRELY in the webview (the webview owns the bar Y -- a viewport pixel -- and the top
+	 * pane's synthetic scroll), so the host merely posts the MODE and does not persist it; the split is a
+	 * transient view aid (cleared on reload, like the SQL panel's non-persistence). Returns `'no-panel'` when
+	 * no grid is focused so the command surfaces a clear toast (No-Fallbacks).
+	 */
+	static splitFocusedAtSelection(): { ok: true } | { ok: false; reason: 'no-panel' | 'not-ready' } {
+		if (focusedPanel === undefined || focusedPanel._disposed) {
+			return { ok: false, reason: 'no-panel' };
+		}
+		// Post FIRST: a `not-ready` failure must NOT mutate persistent host state (Codex -- zeroing the freeze
+		// before a failed post would erase a freeze the split never replaced).
+		if (!focusedPanel.postSplit('atSelection')) {
+			return { ok: false, reason: 'not-ready' };
+		}
+		// The HOST's stored freeze is cleared only when the webview ACKS that a split actually APPLIED (its
+		// `splitState` message -> {@link handleIncoming}). The host cannot decide here: the split may still
+		// clamp to no-split on a too-short viewport (or a post may not deliver), and zeroing the freeze
+		// speculatively would lose it on reload without a split ever replacing it (Codex final). The renderer
+		// enforces mutual exclusion webview-side immediately; only the RELOAD-persisted host copy waits for the ack.
+		return { ok: true };
+	}
+
+	/** **Wave F window split** -- remove the focused Cell Grid's split (restore the single pane). `'no-panel'`
+	 * when no grid is focused; `'not-ready'` when the webview handshake has not completed (nothing posted). */
+	static removeFocusedSplit(): { ok: true } | { ok: false; reason: 'no-panel' | 'not-ready' } {
+		if (focusedPanel === undefined || focusedPanel._disposed) {
+			return { ok: false, reason: 'no-panel' };
+		}
+		if (!focusedPanel.postSplit('remove')) {
+			return { ok: false, reason: 'not-ready' };
+		}
+		return { ok: true };
+	}
+
+	/**
 	 * **W3 (Wave 3, 2026-06-09; Codex HIGH-2)** -- resolve the live panel that raised a context menu by the
 	 * `panelToken` its `data-vscode-context` carried. Returns `undefined` for an unknown / disposed token so
 	 * the command surfaces a clear toast (No-Fallbacks). This is the EXACT panel that raised the menu, not
@@ -1196,6 +1233,36 @@ export class CellGridPanel {
 			},
 			err => console.error('[cellGrid] freeze postMessage rejected:', err),
 		);
+	}
+
+	/**
+	 * **Wave F window split** -- post a split MODE to the bundled webview (the webview computes the bar Y
+	 * from its live scroll + owns all split state, so there is nothing to mirror or re-apply on reload).
+	 * `'atSelection'` splits at the active cell; `'remove'` clears the split. A non-delivery is surfaced
+	 * LOUD (No-Fallbacks) -- the user would otherwise click a dead menu item.
+	 */
+	private postSplit(mode: 'atSelection' | 'remove'): boolean {
+		if (!this.webviewReady || this._disposed) {
+			// The webview cannot receive yet (or the panel is gone). Surface it (No-Fallbacks: the caller
+			// reports 'not-ready' rather than logging a success that did not happen) -- split is transient, so
+			// there is nothing to store + replay (unlike freeze). The race is near-impossible (the panel must be
+			// focused to be the split target, which implies the handshake), but never claim a no-op succeeded.
+			console.warn('[cellGrid] split skipped: the webview is not ready (or the panel is disposed).');
+			return false;
+		}
+		void this.panel.webview.postMessage({ type: 'split', mode }).then(
+			delivered => {
+				if (!delivered && !this._disposed) {
+					console.warn('[cellGrid] split postMessage was not delivered to the webview.');
+					void vscode.window.showWarningMessage(
+						'Quantbook: the cell grid split may not have applied (a message was not delivered). '
+						+ 'Re-run the Split command or reopen the grid.',
+					);
+				}
+			},
+			err => console.error('[cellGrid] split postMessage rejected:', err),
+		);
+		return true;
 	}
 
 	/**
@@ -1869,6 +1936,19 @@ export class CellGridPanel {
 			// parseNameBoxSubmitMessage chokepoint, then routes navigate/define/error.
 			if (m.type === 'nameBoxSubmit') {
 				this.handleNameBoxSubmit(raw);
+				return;
+			}
+			// Wave F window split: the webview ACKS whether a split actually APPLIED (it owns the bar geometry +
+			// clamps to no-split on a too-short viewport, so it is the only authority). The host clears its
+			// PERSISTED freeze ONLY on `active === true` -- so a reload cannot resurrect a freeze a split
+			// replaced, AND a split that did NOT apply leaves the stored freeze intact (Codex final). A
+			// non-`true` value (remove / clamp-to-0 / malformed) leaves it untouched (No-Fallbacks: never clear
+			// a persisted freeze without a confirmed split).
+			if (m.type === 'splitState') {
+				if ((raw as { active?: unknown }).active === true) {
+					this.frozenRowCount = 0;
+					this.frozenColCount = 0;
+				}
 				return;
 			}
 		}

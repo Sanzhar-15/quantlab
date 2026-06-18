@@ -53,6 +53,8 @@
 	"command.quantbookSortRangeDesc.title": "Quantbook: Sort Range Z to A",
 	"command.quantbookFreezePanes.title": "Quantbook: Freeze Panes at Selection",
 	"command.quantbookUnfreezePanes.title": "Quantbook: Unfreeze Panes",
+	"command.quantbookSplitAtSelection.title": "Quantbook: Split Window at Selection",
+	"command.quantbookRemoveSplit.title": "Quantbook: Remove Window Split",
 	"command.quantbookCellGridCut.title": "Cut",
 	"command.quantbookCellGridCopy.title": "Copy",
 	"command.quantbookCellGridPaste.title": "Paste",

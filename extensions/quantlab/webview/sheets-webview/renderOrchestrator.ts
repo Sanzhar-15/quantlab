@@ -130,6 +130,14 @@ export interface RenderHost {
 	 */
 	frozenRowCount(): number;
 	frozenColCount(): number;
+	/**
+	 * **Wave F window split** -- whether a horizontal split is active. While split, the viewport is two
+	 * independently-scrolling panes, so the blit/damage fast paths (which assume single-pane geometry: one
+	 * scroll, one row->Y mapping) are NOT valid -- every gate below ORs this in to force the always-correct
+	 * full `redraw()` (which routes to the renderer's two-pane split paint). In `index.ts` this mirrors
+	 * `renderer.splitActive`; the bench supplies `false`.
+	 */
+	isSplitActive(): boolean;
 	/** Pin the absolute canvas over the viewport at the given scroll. */
 	applyCanvasTransform(scrollTop: number, scrollLeft: number): void;
 	/** Fired at the END of a full {@link RenderOrchestrator.redraw} (formula bar + selection post + hover). */
@@ -220,7 +228,9 @@ export class RenderOrchestrator {
 		// `0/0` => the pre-W3 byte-identical blit.
 		const frozenRowsCssH = frozenRowsHeight(host.frozenRowCount());
 		const frozenColsCssW = frozenColsWidth(host.frozenColCount());
-		const blit = renderer.painted
+		// Wave F window split: a blit assumes ONE scroll + ONE row->Y mapping; while split the viewport has
+		// two independent panes, so decline the blit (null -> full draw -> the renderer's split paint).
+		const blit = renderer.painted && !host.isSplitActive()
 			? computeScrollBlitA1(this.prevPaint, next, renderer.gutterWidthPx, frozenRowsCssH, frozenColsCssW)
 			: null;
 		// W-G-2a: a pure scroll changes neither selection nor content, but the renderer still needs the
@@ -295,8 +305,10 @@ export class RenderOrchestrator {
 		// the per-cell `styleId` term in `entryVisualEqual` already treats as damage. So a real style edit is
 		// already caught by the damage diff; this table-level gate just forces a (redundant) full redraw on top.
 		// Kept as belt-and-braces (cheap, correct), not because the damage diff would otherwise miss it.
+		// Wave F window split: the damage diff maps a changed row to ONE viewport Y; while split a row can be
+		// in either/both panes at different Ys, so force the full split paint (null -> redraw()).
 		const damageRows =
-			renderer.painted && !renderer.backingScaleStale && this.scrollUnchangedSince(v) && !publishedChanged && !stylesChanged
+			renderer.painted && !renderer.backingScaleStale && this.scrollUnchangedSince(v) && !publishedChanged && !stylesChanged && !host.isSplitActive()
 				? diffSnapshotsA1(prevSnapshot, snapshot)
 				: null;
 		if (damageRows === null) {
@@ -326,7 +338,9 @@ export class RenderOrchestrator {
 		const host = this.host;
 		const renderer = host.renderer;
 		const v = host.viewport();
-		if (!forceFullRedraw && renderer.painted && !renderer.backingScaleStale && this.scrollUnchangedSince(v)) {
+		// Wave F window split: same reason as commitSnapshot -- a single-scroll damage clip is wrong while
+		// the viewport is two independent panes, so force the full split paint.
+		if (!forceFullRedraw && renderer.painted && !renderer.backingScaleStale && this.scrollUnchangedSince(v) && !host.isSplitActive()) {
 			const rows = errorRowsFlippedA1(prevErrorKeys, new Set(host.errorCells.keys()));
 			host.applyCanvasTransform(v.scrollTop, v.scrollLeft);
 			renderer.drawDamage(rows, v.cssW, v.cssH, v.scrollTop, v.scrollLeft, host.errorCells, host.active(), host.selection(), host.publishedRanges(), host.fillPreview(), host.pointPreview(), host.activeRefHighlights());

@@ -77,6 +77,7 @@ class FakeHost implements RenderHost {
 	fill: SelectionRect | null = null;
 	frozenRows = 0; // W3 frozen panes: settable so a test can drive the frozen-aware blit gate
 	frozenCols = 0;
+	splitActive = false; // Wave F window split: settable so a test can drive the split-forces-full gate
 	transforms: { scrollTop: number; scrollLeft: number }[] = [];
 	afterFull = 0;
 	afterScroll = 0;
@@ -111,6 +112,9 @@ class FakeHost implements RenderHost {
 	}
 	frozenColCount(): number {
 		return this.frozenCols;
+	}
+	isSplitActive(): boolean {
+		return this.splitActive;
 	}
 	applyCanvasTransform(scrollTop: number, scrollLeft: number): void {
 		this.transforms.push({ scrollTop, scrollLeft });
@@ -190,6 +194,19 @@ suite('FE-2 render orchestrator -- scrollRedraw (blit fast path)', function () {
 		assert.deepStrictEqual(orch.lastPaintState, { scrollTop: 120, scrollLeft: 0, cssW: 800, cssH: 600, dpr: 1 });
 	});
 
+	test('Wave F: while a split is active, the SAME clean scroll declines the blit -> full draw', () => {
+		const { host, renderer, orch } = make();
+		host.vp = { scrollTop: 0, scrollLeft: 0, cssW: 800, cssH: 600 };
+		orch.redraw();
+		renderer.calls.length = 0;
+		// Identical clean vertical scroll to the blit test above -- the ONLY difference is split is active.
+		host.splitActive = true;
+		host.vp = { scrollTop: 120, scrollLeft: 0, cssW: 800, cssH: 600 };
+		orch.scrollRedraw();
+		assert.strictEqual(renderer.calls.length, 1);
+		assert.strictEqual(renderer.calls[0].kind, 'draw', 'split forces the full (split) paint, never a blit');
+	});
+
 	test('a resize (cssH change) during scroll declines the blit -> full draw', () => {
 		const { host, renderer, orch } = make();
 		host.vp = { scrollTop: 0, scrollLeft: 0, cssW: 800, cssH: 600 };
@@ -230,6 +247,21 @@ suite('FE-2 render orchestrator -- commitSnapshot (damage decision)', function (
 		assert.strictEqual(host.afterFull, 0, 'damage path does NOT fire onAfterFullRedraw');
 		// The damage path must NOT rewrite prevPaint -- it stays the prior frame's state.
 		assert.deepStrictEqual(orch.lastPaintState, { scrollTop: 0, scrollLeft: 0, cssW: 800, cssH: 600, dpr: 1 });
+	});
+
+	test('Wave F: while a split is active, the same single-cell change forces a full redraw (no damage)', () => {
+		const { host, renderer, orch } = make();
+		host.vp = { scrollTop: 0, scrollLeft: 0, cssW: 800, cssH: 600 };
+		const prev = snap([entry(0, 0, num(1)), entry(5, 2, num(9))]);
+		orch.commitSnapshot(null, prev, false);
+		renderer.calls.length = 0;
+		host.afterFull = 0;
+		host.splitActive = true; // the only difference from the damage test above
+		const next = snap([entry(0, 0, num(1)), entry(5, 2, num(42))]);
+		orch.commitSnapshot(prev, next, false);
+		assert.strictEqual(renderer.calls.length, 1);
+		assert.strictEqual(renderer.calls[0].kind, 'draw', 'split forces the full (split) paint, never a damage clip');
+		assert.strictEqual(host.afterFull, 1);
 	});
 
 	test('publishedChanged forces a full redraw even at the same scroll with a tiny diff', () => {
@@ -362,6 +394,19 @@ suite('FE-2 render orchestrator -- commitErrorDamage (error-tint flip decision)'
 		assert.strictEqual(renderer.calls.length, 1);
 		assert.strictEqual(renderer.calls[0].kind, 'drawDamage');
 		assert.deepStrictEqual(renderer.calls[0].rows, [7]);
+	});
+
+	test('Wave F: while a split is active, the same tint flip forces a full redraw (no damage)', () => {
+		const { host, renderer, orch } = make();
+		host.vp = { scrollTop: 0, scrollLeft: 0, cssW: 800, cssH: 600 };
+		orch.redraw();
+		renderer.calls.length = 0;
+		host.splitActive = true; // the only difference from the damage test above
+		const prevKeys = new Set(host.errorCells.keys());
+		host.errorCells.set('7,3', '[#ERR] boom');
+		orch.commitErrorDamage(prevKeys, false);
+		assert.strictEqual(renderer.calls.length, 1);
+		assert.strictEqual(renderer.calls[0].kind, 'draw', 'split forces the full (split) paint, never a tint-flip damage');
 	});
 
 	test('forceFullRedraw (selection realign) -> full redraw, never a tint-flip damage', () => {

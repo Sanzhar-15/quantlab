@@ -115,6 +115,8 @@ const benchHost: RenderHost = {
 	// W3 frozen panes: the bench never freezes (it measures the scrolling-body blit), so 0/0.
 	frozenRowCount: () => 0,
 	frozenColCount: () => 0,
+	// Wave F window split: the bench never splits (it measures the single-pane blit fast path).
+	isSplitActive: () => false,
 	applyCanvasTransform,
 	onAfterFullRedraw: () => undefined,
 	onAfterScroll: () => undefined,

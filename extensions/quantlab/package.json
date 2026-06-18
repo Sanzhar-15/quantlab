@@ -397,6 +397,18 @@
         "category": "%command.category%"
       },
       {
+        "_comment": "Wave F window split: split the focused grid into two independently-scrolling panes at the active cell.",
+        "command": "quantlab.quantbookSplitAtSelection",
+        "title": "%command.quantbookSplitAtSelection.title%",
+        "category": "%command.category%"
+      },
+      {
+        "_comment": "Wave F window split: remove the focused grid's window split.",
+        "command": "quantlab.quantbookRemoveSplit",
+        "title": "%command.quantbookRemoveSplit.title%",
+        "category": "%command.category%"
+      },
+      {
         "_comment": "W3 (Wave 3): Cell Grid context-menu clipboard commands -- route to the focused webview's clipboard logic.",
         "command": "quantlab.quantbookCellGridCut",
         "title": "%command.quantbookCellGridCut.title%",

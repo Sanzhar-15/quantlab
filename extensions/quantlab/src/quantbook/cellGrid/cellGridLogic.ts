@@ -2548,6 +2548,8 @@ export function getSharedDeltaCache(session: SessionInstance): DeltaSnapshotCach
 export type ToolbarSimpleCommand =
 	| 'freezePanes'
 	| 'unfreezePanes'
+	| 'splitAtSelection'
+	| 'removeSplit'
 	| 'saveAs'
 	| 'openWorkbook'
 	| 'showDepGraph'
@@ -2597,6 +2599,10 @@ export type ParsedToolbarCommand =
 const TOOLBAR_SIMPLE_COMMAND_IDS: Record<ToolbarSimpleCommand, string> = {
 	freezePanes: 'quantlab.quantbookFreezePanes',
 	unfreezePanes: 'quantlab.quantbookUnfreezePanes',
+	// Wave F window split (R5, 2026-06-18): the View menu's "Split at Selection" / "Remove Split". Both are
+	// argument-less host commands that resolve the focused grid + post a `{type:'split', mode}` to its webview.
+	splitAtSelection: 'quantlab.quantbookSplitAtSelection',
+	removeSplit: 'quantlab.quantbookRemoveSplit',
 	saveAs: 'quantlab.quantbookSaveAs',
 	openWorkbook: 'quantlab.quantbookOpen',
 	// Menu breadth (2026-06-10): the webview Data menu's sidebar-reveal entries. The wave-3

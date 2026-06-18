@@ -558,3 +558,136 @@ export function hitTestViewportFrozen(
 	}
 	return { row, col };
 }
+
+// --- Wave F window split (R5, 2026-06-18) ----------------------------------------------------------
+//
+// A horizontal window SPLIT divides the viewport into a TOP and a BOTTOM pane that scroll
+// INDEPENDENTLY on Y (both share the live horizontal scroll). Unlike a freeze (which pins the leading
+// rows at effective-scroll 0), each split pane is a full independent windowed view of the SAME sheet:
+// the bottom pane tracks the live DOM scroll, the top pane carries its own SYNTHETIC scroll. The
+// renderer paints both panes through the same `paintCellRegion` used for freeze, feeding the top pane
+// `topScrollTop` where freeze fed `0`. Split + freeze are mutually exclusive (Excel canon). All the
+// viewport math lives here (the doctrine), pure + unit-tested, so the renderer threads live values in.
+
+/** The visible half-open row ranges for the two panes of a horizontal split, plus each pane's pixel
+ * band height. `top` covers viewport `[HEADER_HEIGHT, splitBarY)`, `bottom` covers `[splitBarY,
+ * cssHeight)`. See {@link splitPaneRowRanges}. */
+export interface SplitPaneRanges {
+	readonly top: { startIdx: number; endIdx: number };
+	readonly bottom: { startIdx: number; endIdx: number };
+	readonly topBandHeight: number;
+	readonly botBandHeight: number;
+}
+
+/**
+ * **Wave F window split** -- clamp a raw horizontal-split-bar Y (viewport CSS px) to a position that
+ * leaves at least one row visible in BOTH panes. Returns `0` ("no split") when the viewport is too
+ * short to hold two one-row panes below the header, or for a non-finite / `<= 0` input -- mirroring how
+ * `0` is the no-op sentinel for {@link clampFrozenCount}. The bar is free-floating (a dragged pixel
+ * position, not snapped to a row boundary -- each pane is an independent window so a partially-clipped
+ * row at the bar is fine, exactly as Excel renders a dragged split); the value is rounded to a whole
+ * CSS px. The host->webview wire carries this raw, so a malformed value must never corrupt the geometry.
+ */
+export function clampSplitBarY(rawY: number, cssHeight: number): number {
+	if (!Number.isFinite(rawY) || rawY <= 0) {
+		return 0;
+	}
+	const minBarY = HEADER_HEIGHT + ROW_HEIGHT; // top pane >= 1 row
+	const maxBarY = cssHeight - ROW_HEIGHT; // bottom pane >= 1 row
+	if (maxBarY < minBarY) {
+		return 0; // viewport too short for two panes
+	}
+	return Math.min(maxBarY, Math.max(minBarY, Math.round(rawY)));
+}
+
+/** The visible row range for one split pane: a band of `bandHeight` px scrolled to `scrollTop`. Mirrors
+ * `cellRender.computeVisibleRowRange`'s clamp + overscan EXACTLY (kept here, not imported, so
+ * `gridLayoutA1` stays the leaf module + the split panes match the body-window semantics; a golden test
+ * ties the two together). A stale large `scrollTop` (data shrank) clamps to the last rows, never an
+ * empty window. */
+function splitPaneRowRange(scrollTop: number, bandHeight: number, overscan: number): { startIdx: number; endIdx: number } {
+	if (ROW_HEIGHT <= 0) {
+		return { startIdx: 0, endIdx: MAX_ROWS };
+	}
+	const maxFirst = Math.max(0, MAX_ROWS - 1);
+	const firstVisible = Math.min(maxFirst, Math.max(0, Math.floor(scrollTop / ROW_HEIGHT)));
+	const visibleCount = Math.max(1, Math.ceil(Math.max(0, bandHeight) / ROW_HEIGHT));
+	const startIdx = Math.max(0, firstVisible - overscan);
+	const endIdx = Math.min(MAX_ROWS, firstVisible + visibleCount + overscan);
+	return { startIdx, endIdx };
+}
+
+/**
+ * **Wave F window split** -- the visible row range for EACH pane of a horizontal split, given the two
+ * independent vertical scroll offsets and the bar position. The top pane's band is `[HEADER_HEIGHT,
+ * splitBarY)` (height `splitBarY - HEADER_HEIGHT`) scrolled by `topScrollTop`; the bottom pane's band is
+ * `[splitBarY, cssHeight)` (height `cssHeight - splitBarY`) scrolled by `botScrollTop` (the live DOM
+ * scroll). Each range comes from {@link splitPaneRowRange} so both match the single-pane window exactly.
+ * Pure + golden-tested.
+ */
+export function splitPaneRowRanges(
+	topScrollTop: number,
+	botScrollTop: number,
+	splitBarY: number,
+	cssHeight: number,
+	overscan: number,
+): SplitPaneRanges {
+	const topBandHeight = Math.max(0, splitBarY - HEADER_HEIGHT);
+	const botBandHeight = Math.max(0, cssHeight - splitBarY);
+	return {
+		top: splitPaneRowRange(topScrollTop, topBandHeight, overscan),
+		bottom: splitPaneRowRange(botScrollTop, botBandHeight, overscan),
+		topBandHeight,
+		botBandHeight,
+	};
+}
+
+/**
+ * **Wave F window split** -- clamp a top-pane SYNTHETIC scroll to `[0, maxScroll]` so a wheel/keyboard
+ * scroll can never run past the last row (the bottom pane is bounded by the native DOM scroller; the top
+ * pane has no scrollbar, so its bound is enforced here). `maxScroll = MAX_ROWS*ROW_HEIGHT - bandHeight`
+ * (>= 0): the same content extent the spacer gives the DOM scroller, minus the visible band. A
+ * non-finite / `<= 0` input clamps to `0`.
+ */
+export function clampSplitScroll(scrollTop: number, bandHeight: number): number {
+	if (!Number.isFinite(scrollTop) || scrollTop <= 0) {
+		return 0;
+	}
+	const maxScroll = Math.max(0, MAX_ROWS * ROW_HEIGHT - Math.max(0, bandHeight));
+	return Math.min(maxScroll, scrollTop);
+}
+
+/**
+ * **Wave F window split** -- map a VIEWPORT-LOCAL point to its cell WITH a horizontal split bar at
+ * `splitBarY`. The viewport divides into a TOP pane `[HEADER_HEIGHT, splitBarY)` scrolled by
+ * `topScrollTop` and a BOTTOM pane `[splitBarY, cssHeight)` scrolled by `botScrollTop`; both share
+ * `scrollLeft` on X. The sticky header (`localY < HEADER_HEIGHT`) and gutter (`localX < gutterW`) reject
+ * as in {@link hitTestViewport}. A point at/below the bar resolves in the bottom pane (the bar belongs
+ * to no cell; biasing down avoids a dead band). The per-axis math matches {@link hitTestContent}: convert
+ * the pane-local Y to a content-row offset (`(localY - paneTopPx) + effScrollTop`), re-add HEADER_HEIGHT
+ * for `hitTestContent`, and add `scrollLeft` on X exactly as the single-pane path does. Pure.
+ */
+export function hitTestSplit(
+	localX: number,
+	localY: number,
+	splitBarY: number,
+	topScrollTop: number,
+	botScrollTop: number,
+	scrollLeft: number,
+	gutterW: number,
+): { row: number; col: number } | null {
+	if (localY < HEADER_HEIGHT) {
+		return null; // sticky column band (or corner)
+	}
+	if (localX < gutterW) {
+		return null; // sticky row gutter (or corner)
+	}
+	const inTop = localY < splitBarY;
+	const paneTopPx = inTop ? HEADER_HEIGHT : splitBarY;
+	const effScrollTop = inTop ? topScrollTop : botScrollTop;
+	// Pane-local content-row offset, expressed in the content frame `hitTestContent` expects (which
+	// subtracts HEADER_HEIGHT before dividing by ROW_HEIGHT). X is the single-pane body mapping.
+	const contentY = (localY - paneTopPx) + effScrollTop + HEADER_HEIGHT;
+	const contentX = localX + scrollLeft;
+	return hitTestContent(contentX, contentY, gutterW);
+}

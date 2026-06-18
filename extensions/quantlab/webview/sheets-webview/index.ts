@@ -89,6 +89,7 @@ import {
 	colX,
 	frozenColsWidth,
 	frozenRowsHeight,
+	hitTestSplit,
 	hitTestViewportFrozen,
 	isInExtent,
 	publishedNameAt,
@@ -405,6 +406,9 @@ const menubarEl = document.getElementById('sheets-menubar') as HTMLElement;
 type ToolbarCommand =
 	| 'freezePanes'
 	| 'unfreezePanes'
+	// Wave F window split (R5): the View menu's "Split at Selection" / "Remove Split".
+	| 'splitAtSelection'
+	| 'removeSplit'
 	| 'insertRowAbove'
 	| 'insertRowBelow'
 	| 'insertColumnLeft'
@@ -588,6 +592,8 @@ const MENUBAR_MENUS: ReadonlyArray<{ readonly id: string; readonly entries: read
 		entries: [
 			{ label: 'Freeze panes', run: () => postToolbarCommand('freezePanes') },
 			{ label: 'Unfreeze panes', run: () => postToolbarCommand('unfreezePanes') },
+			{ label: 'Split at Selection', run: () => postToolbarCommand('splitAtSelection') },
+			{ label: 'Remove Split', run: () => postToolbarCommand('removeSplit') },
 		],
 	},
 	{
@@ -2100,6 +2106,9 @@ const renderHost: RenderHost = {
 	// orchestrator's blit gate reads them through here. `setFrozen` clamped them, so these are always sane.
 	frozenRowCount: () => renderer.frozenRows,
 	frozenColCount: () => renderer.frozenCols,
+	// Wave F window split: the renderer owns the split state; the orchestrator's fast-path gates read it
+	// here to force the always-correct full split paint (no blit/damage while two panes scroll separately).
+	isSplitActive: () => renderer.splitActive,
 	applyCanvasTransform,
 	onAfterFullRedraw: () => {
 		updateFormulaBar(); // selection/content changed -> reflect the active cell in the formula bar
@@ -2388,14 +2397,44 @@ function clampCol(c: number): number {
 	return Math.max(0, Math.min(MAX_COLS - 1, c));
 }
 
+/** **Wave F window split** -- reveal the active cell while a split is active. Horizontal: both panes share
+ * the DOM `scrollLeft`, so reveal the active column in the body (a split has no frozen cols). Vertical: if
+ * the active cell is ALREADY visible in EITHER pane, leave both scrolls (so clicking a top-pane cell does
+ * not jump the bottom pane); otherwise reveal it in the BOTTOM pane (the primary, native-scrollbar pane,
+ * whose effective scroll is `scrollTop - bandOffset`). */
+function ensureActiveVisibleSplit(): void {
+	if (active === null) {
+		return;
+	}
+	const gutterW = renderer.gutterWidthPx;
+	viewportEl.scrollLeft = scrollToReveal(colX(active.col, gutterW), COL_WIDTH, gutterW, viewportEl.scrollLeft, viewportEl.clientWidth);
+	const cssH = viewportEl.clientHeight;
+	const splitBarY = renderer.splitBarYPx;
+	const bandOffset = splitBarY - HEADER_HEIGHT;
+	const topY = rowY(active.row) - renderer.topSplitScrollPx;
+	const botY = rowY(active.row) - (viewportEl.scrollTop - bandOffset);
+	const inTop = topY >= HEADER_HEIGHT && topY + ROW_HEIGHT <= splitBarY;
+	const inBot = botY >= splitBarY && botY + ROW_HEIGHT <= cssH;
+	if (!inTop && !inBot) {
+		const botEff = viewportEl.scrollTop - bandOffset;
+		const newBotEff = scrollToReveal(rowY(active.row), ROW_HEIGHT, splitBarY, botEff, cssH);
+		viewportEl.scrollTop = Math.max(0, newBotEff + bandOffset);
+	}
+}
+
 /** Scroll so the active cell is fully visible below the header band + right of the row gutter.
  * Audit C2-MED2: the tiny-viewport clamp (a viewport narrower/shorter than one cell would otherwise
  * park the cell under the sticky band) lives in the pure {@link scrollToReveal}.
  * **W3 frozen panes**: a cell INSIDE a frozen band is always on screen (pinned) -- never scroll that axis.
  * For a BODY cell, the effective band size = sticky band + the frozen-band pixels, so the cell reveals
- * BELOW/RIGHT of the frozen strip (not under it). With 0 frozen rows/cols this is the pre-W3 behaviour. */
+ * BELOW/RIGHT of the frozen strip (not under it). With 0 frozen rows/cols this is the pre-W3 behaviour.
+ * **Wave F window split**: while split, the pane-aware reveal lives in {@link ensureActiveVisibleSplit}. */
 function ensureActiveVisible(): void {
 	if (active === null) {
+		return;
+	}
+	if (renderer.splitActive) {
+		ensureActiveVisibleSplit();
 		return;
 	}
 	const gutterW = renderer.gutterWidthPx;
@@ -3766,8 +3805,67 @@ function teardownFormulaAssist(): void {
  * so a frozen-cell editor tracks its pinned cell as the body scrolls. With no freeze this returns the bare
  * `cellContentRect` position (byte-identical to the pre-W3 path).
  */
+/** **Wave F window split** -- which pane currently shows `row`. The SINGLE source of truth for the overlay
+ * editor's pin AND clip AND the fill-handle hit-test, so they never disagree (Codex MED). A cell counts as
+ * in the BOTTOM pane if any of it overlaps `[splitBarY, cssHeight)` painted at the bottom eff scroll; else
+ * the TOP pane if it overlaps `[HEADER_HEIGHT, splitBarY)`; else (off-screen in both) default BOTTOM (the
+ * clip hides it). The bottom check runs FIRST so a row straddling the bar is owned by exactly one pane. */
+function splitEditorPane(row: number): 'top' | 'bottom' {
+	const scrollTop = viewportEl.scrollTop;
+	const splitBarY = renderer.splitBarYPx;
+	const bandOffset = splitBarY - HEADER_HEIGHT;
+	const topScroll = renderer.topSplitScrollPx;
+	const cssH = viewportEl.clientHeight;
+	const botY = rowY(row) - (scrollTop - bandOffset); // on-screen Y if painted in the bottom pane
+	const topY = rowY(row) - topScroll; // on-screen Y if painted in the top pane
+	if (botY + ROW_HEIGHT > splitBarY && botY < cssH) {
+		return 'bottom';
+	}
+	if (topY + ROW_HEIGHT > HEADER_HEIGHT && topY < splitBarY) {
+		return 'top';
+	}
+	return 'bottom';
+}
+
+/** **Wave F window split** -- the content-Y pin that lands the overlay editor on `row` in its pane (see
+ * {@link splitEditorPane}). The input is a content-layer child translated by the DOM scroll, so its on-screen
+ * Y is `(rowY + pin) - scrollTop`; pin = `bandOffset` for the BOTTOM pane (paints at `rowY -
+ * (scrollTop-bandOffset)`) or `scrollTop - topSplitScroll` for the TOP pane (paints at `rowY - topSplitScroll`). */
+function splitEditorPinTop(row: number): number {
+	if (splitEditorPane(row) === 'bottom') {
+		return renderer.splitBarYPx - HEADER_HEIGHT; // bandOffset
+	}
+	return viewportEl.scrollTop - renderer.topSplitScrollPx;
+}
+
+/** **Wave F window split / W3 freeze** -- the effective vertical scroll the PAINT uses for `row`, so a
+ * pointer hit-test (the fill handle) matches the painted position. Split: the row's pane eff (top =
+ * topSplitScroll, bottom = scrollTop - bandOffset). Freeze: 0 for a pinned row. Else the live DOM scroll. */
+function effScrollTopForRow(row: number): number {
+	if (renderer.splitActive) {
+		return splitEditorPane(row) === 'top'
+			? renderer.topSplitScrollPx
+			: viewportEl.scrollTop - (renderer.splitBarYPx - HEADER_HEIGHT);
+	}
+	return row < renderer.frozenRows ? 0 : viewportEl.scrollTop;
+}
+
+/** **Wave F window split / W3 freeze** -- the effective horizontal scroll for `col` (a split shares the DOM
+ * scrollLeft across both panes -- no frozen cols; freeze pins a frozen col at 0). */
+function effScrollLeftForCol(col: number): number {
+	if (renderer.splitActive) {
+		return viewportEl.scrollLeft;
+	}
+	return col < renderer.frozenCols ? 0 : viewportEl.scrollLeft;
+}
+
 function overlayCellContentPos(row: number, col: number): { left: number; top: number; width: number; height: number } {
 	const rect = cellContentRect(row, col, renderer.gutterWidthPx);
+	if (renderer.splitActive) {
+		// **Wave F window split** -- a split has no frozen columns (both panes share the horizontal scroll),
+		// so the left pin is 0; the vertical pin lands the editor in the pane that currently shows the cell.
+		return { left: rect.x, top: rect.y + splitEditorPinTop(row), width: rect.width, height: rect.height };
+	}
 	const pinLeft = col < renderer.frozenCols ? viewportEl.scrollLeft : 0;
 	const pinTop = row < renderer.frozenRows ? viewportEl.scrollTop : 0;
 	return { left: rect.x + pinLeft, top: rect.y + pinTop, width: rect.width, height: rect.height };
@@ -3821,6 +3919,28 @@ function updateEditClip(): void {
 	const pos = overlayCellContentPos(editState.row, editState.col);
 	const viewX = pos.left - viewportEl.scrollLeft;
 	const viewY = pos.top - viewportEl.scrollTop;
+	// **Wave F window split** -- clip the editor to its pane: a BOTTOM-pane editor must not slide UP over the
+	// split bar / top pane; a TOP-pane editor must not slide DOWN over the bar (and is clipped at the header).
+	// Both are clipped at the row gutter on the left (a split has no frozen columns). Pane = on-screen top
+	// at/below the bar => bottom.
+	if (renderer.splitActive) {
+		const splitBarY = renderer.splitBarYPx;
+		const clipLeftSplit = Math.max(0, Math.min(pos.width, gutterW - viewX));
+		let clipTopSplit: number;
+		let clipBottomSplit: number;
+		// Use the SAME pane decision as the pin (splitEditorPane), not a separate viewY test -- a straddling
+		// row would otherwise pin to one pane and clip to the other (Codex MED).
+		if (splitEditorPane(editState.row) === 'bottom') {
+			clipTopSplit = Math.max(0, Math.min(pos.height, splitBarY - viewY)); // bottom pane: clip above the bar
+			clipBottomSplit = 0;
+		} else {
+			clipTopSplit = Math.max(0, Math.min(pos.height, HEADER_HEIGHT - viewY)); // top pane: clip the header
+			clipBottomSplit = Math.max(0, Math.min(pos.height, viewY + pos.height - splitBarY)); // ...and below the bar
+		}
+		inputEl.style.clipPath = 'inset(' + clipTopSplit + 'px 0px ' + clipBottomSplit + 'px ' + clipLeftSplit + 'px)';
+		syncCellInkGeometry();
+		return;
+	}
 	// W3: the occluding band edge depends on which pane the edited cell is in. A BODY cell (col >= fCols /
 	// row >= fRows) can scroll under the frozen strip, so it is clipped at `band + frozen-band pixels`. A
 	// FROZEN cell lives IN the frozen strip (left of `leftBand` / above `topBand`); clipping it there would
@@ -4387,23 +4507,23 @@ formulaInputEl.addEventListener('blur', () => {
 
 // --- Canvas pointer: single click SELECTS, double click EDITS (FE-2-0 polish 2026-06-05) ---
 
+/** Map a VIEWPORT-LOCAL point to a cell, honoring the active view mode. **Wave F window split**: while a
+ * split is active, route to {@link hitTestSplit} (top pane scrolls by the synthetic `topSplitScroll`, bottom
+ * by the live DOM scroll); otherwise the W3 frozen-aware hit-test (which reduces to the pre-W3 path at 0/0). */
+function hitTestLocal(localX: number, localY: number): { row: number; col: number } | null {
+	if (renderer.splitActive) {
+		return hitTestSplit(localX, localY, renderer.splitBarYPx, renderer.topSplitScrollPx, viewportEl.scrollTop, viewportEl.scrollLeft, renderer.gutterWidthPx);
+	}
+	return hitTestViewportFrozen(localX, localY, viewportEl.scrollLeft, viewportEl.scrollTop, renderer.gutterWidthPx, renderer.frozenRows, renderer.frozenCols);
+}
+
 /** Hit-test a pointer event against the body grid; returns the (row,col) or null (band / gutter / empty). */
 function hitTestCanvas(ev: MouseEvent): { row: number; col: number } | null {
 	if (fullSnapshot === null) {
 		return null;
 	}
 	const rect = canvasEl.getBoundingClientRect();
-	// W3 frozen panes: thread the pinned counts so a click in a frozen band maps to the pinned cell (no
-	// scroll added on that axis); 0/0 reduces to the pre-W3 hit-test.
-	return hitTestViewportFrozen(
-		ev.clientX - rect.left,
-		ev.clientY - rect.top,
-		viewportEl.scrollLeft,
-		viewportEl.scrollTop,
-		renderer.gutterWidthPx,
-		renderer.frozenRows,
-		renderer.frozenCols,
-	);
+	return hitTestLocal(ev.clientX - rect.left, ev.clientY - rect.top);
 }
 
 /**
@@ -4419,11 +4539,12 @@ function isOnFillHandle(ev: MouseEvent): boolean {
 	const brRow = sel === null ? active.row : sel.maxRow;
 	const brCol = sel === null ? active.col : sel.maxCol;
 	const rect = canvasEl.getBoundingClientRect();
-	// W3 frozen panes: the handle is painted at the bottom-right corner of (brRow, brCol). A FROZEN corner
-	// cell paints at its pinned position (no scroll on the frozen axis), so the hit-test must use the SAME
-	// effective scroll the paint used, or the handle would be unreachable when the corner cell is frozen.
-	const effScrollLeft = brCol < renderer.frozenCols ? 0 : viewportEl.scrollLeft;
-	const effScrollTop = brRow < renderer.frozenRows ? 0 : viewportEl.scrollTop;
+	// W3 frozen panes / Wave F split: the handle is painted at the bottom-right corner of (brRow, brCol)
+	// using the EFFECTIVE scroll the paint used (a FROZEN corner pins at 0; a SPLIT corner uses its pane's
+	// eff scroll). The hit-test MUST use the same eff scroll, or the visible handle and the hit target
+	// diverge (handle unreachable / drag-to-fill broken).
+	const effScrollLeft = effScrollLeftForCol(brCol);
+	const effScrollTop = effScrollTopForRow(brRow);
 	const cornerX = colX(brCol + 1, renderer.gutterWidthPx) - effScrollLeft;
 	const cornerY = rowY(brRow + 1) - effScrollTop;
 	return Math.abs(ev.clientX - rect.left - cornerX) <= FILL_HANDLE_HIT_PX
@@ -4833,15 +4954,7 @@ function updateHoverTitle(): void {
 	let title = '';
 	if (fullSnapshot !== null) {
 		const rect = canvasEl.getBoundingClientRect();
-		const hit = hitTestViewportFrozen(
-			hoverClientX - rect.left,
-			hoverClientY - rect.top,
-			viewportEl.scrollLeft,
-			viewportEl.scrollTop,
-			renderer.gutterWidthPx,
-			renderer.frozenRows,
-			renderer.frozenCols,
-		);
+		const hit = hitTestLocal(hoverClientX - rect.left, hoverClientY - rect.top);
 		if (hit !== null) {
 			const entry = renderer.entryAt(hit.row, hit.col);
 			const key = hit.row + ',' + hit.col;
@@ -6023,10 +6136,64 @@ window.addEventListener('message', (event: MessageEvent) => {
 			return;
 		}
 		renderer.setFrozen(fz.rows, fz.cols);
+		// Freeze + split are mutually exclusive: setFrozen(>0) clears any active split, so detach the split-pane
+		// wheel listener if a freeze just dropped one (Codex re-audit LOW -- else the non-passive listener lingers
+		// until the next wheel self-heals).
+		ensureSplitWheel(renderer.splitActive);
 		// A freeze shifts every cell's pane, so an open overlay editor must be re-pinned + its clip recomputed
 		// (a frozen cell's editor pins; a cell now under a frozen band clips there). repositionEdit handles both.
 		repositionEdit();
 		redraw();
+		return;
+	}
+	if (msg.type === 'split') {
+		// **Wave F window split** -- the host's "Split at Selection" / "Remove Split" command. The host posts
+		// only the MODE (it does not know the webview's live scroll/viewport); the webview computes the bar Y
+		// from the active cell's current on-screen position (or the viewport midpoint). No-Fallbacks: a
+		// malformed mode is a host/webview WIRING bug, so surface it LOUD and leave the split UNCHANGED.
+		const mode = (msg as { mode?: unknown }).mode;
+		if (mode === 'remove') {
+			renderer.clearSplit();
+			ensureSplitWheel(false);
+			repositionEdit();
+			redraw();
+			vscode.postMessage({ type: 'splitState', active: false }); // ack: no split (the host keeps its freeze)
+			return;
+		}
+		if (mode === 'atSelection') {
+			const cssH = viewportEl.clientHeight;
+			const origScroll = viewportEl.scrollTop;
+			// Place the bar at the TOP of the active cell's row (its current on-screen Y) so the split appears
+			// where the user is; fall back to the viewport midpoint when there is no on-screen active cell.
+			let barY = Math.round(HEADER_HEIGHT + (cssH - HEADER_HEIGHT) / 2);
+			if (active !== null) {
+				const onScreenY = rowY(active.row) - origScroll;
+				if (onScreenY > HEADER_HEIGHT && onScreenY < cssH) {
+					barY = Math.round(onScreenY);
+				}
+			}
+			renderer.setSplit(barY, cssH, origScroll); // clamps; the TOP pane is re-seeded below from the actual scroll
+			if (renderer.splitActive) {
+				const topBand = renderer.splitBarYPx - HEADER_HEIGHT;
+				// Shift the DOM scroll (the BOTTOM pane) DOWN by the top-band height so the bottom pane CONTINUES
+				// from where the top pane ends -- the panes show CONTIGUOUS rows with no duplication, and the
+				// active row becomes the bottom pane's top (Excel split-at-cell). Setting scrollTop fires the
+				// scroll listener (pins the canvas + reschedules).
+				viewportEl.scrollTop = origScroll + topBand;
+				// Re-seed the TOP pane from the ACTUAL (post-clamp) DOM scroll so the panes stay contiguous even
+				// when the browser clamps the write at the bottom of the sheet (Codex re-audit MED).
+				renderer.setTopSplitScroll(viewportEl.scrollTop - topBand);
+				ensureSplitWheel(true);
+			}
+			repositionEdit();
+			redraw();
+			// Ack whether the split actually APPLIED (it clamps to no-split on a too-short viewport) so the host
+			// clears its PERSISTED freeze ONLY when a split truly replaced it -- never speculatively (Codex final).
+			vscode.postMessage({ type: 'splitState', active: renderer.splitActive });
+			return;
+		}
+		console.warn('[sheets-webview] dropped a malformed split message (mode must be atSelection|remove):', msg);
+		showError('The host sent a malformed Split command; the split was not changed.', 'transient');
 		return;
 	}
 	if (msg.type === 'contextMenuAction') {
@@ -6109,6 +6276,52 @@ viewportEl.addEventListener('scroll', () => {
 	}
 	scheduleRedraw();
 });
+
+// **Wave F window split** -- the TOP split pane has no native scrollbar (the single DOM scroller drives the
+// BOTTOM pane), so a mouse-wheel over the top band scrolls it SYNTHETICALLY. The listener is attached ONLY
+// while a split is active (`ensureSplitWheel`), so the common non-split path keeps the browser's PASSIVE
+// (compositor-threaded) wheel scroll -- a perf-sensitive surface (Opus MED). Over the top pane it
+// preventDefaults and advances `topSplitScroll` (vertical) AND drives the SHARED DOM `scrollLeft`
+// (horizontal -- both panes share it, and the preventDefault would otherwise eat the native horizontal
+// scroll, Sonnet MED); over the header / bottom pane it returns (native scroll). Coalesced through
+// `scheduleRedraw` (Opus MED); the line/page wheel modes are scaled. Self-detaches if it ever sees a cleared
+// split (e.g. a resize dropped it).
+function onSplitWheel(e: WheelEvent): void {
+	if (!renderer.splitActive) {
+		ensureSplitWheel(false); // self-heal: the split was cleared -> restore the passive scroll path
+		return;
+	}
+	const rect = canvasEl.getBoundingClientRect();
+	const localY = e.clientY - rect.top;
+	if (localY < HEADER_HEIGHT || localY >= renderer.splitBarYPx) {
+		return; // header band or BOTTOM pane -> let the native scroller run
+	}
+	e.preventDefault();
+	const topBand = renderer.splitBarYPx - HEADER_HEIGHT;
+	// deltaMode: 0 = pixel (as-is), 1 = line (* one row/col), 2 = page (* one band/viewport).
+	const scaleY = e.deltaMode === 1 ? ROW_HEIGHT : e.deltaMode === 2 ? topBand : 1;
+	const scaleX = e.deltaMode === 1 ? COL_WIDTH : e.deltaMode === 2 ? viewportEl.clientWidth : 1;
+	renderer.setTopSplitScroll(renderer.topSplitScrollPx + e.deltaY * scaleY);
+	if (e.deltaX !== 0) {
+		viewportEl.scrollLeft += e.deltaX * scaleX; // shared horizontal; its scroll listener pins + reschedules
+	}
+	if (editState !== null) {
+		repositionEdit(); // a top-pane editor follows its synthetic scroll
+	}
+	scheduleRedraw();
+}
+let splitWheelAttached = false;
+/** Attach / detach the split top-pane wheel handler. Attached only WHILE a split is active so the common
+ * non-split path keeps the browser's passive (compositor-threaded) wheel scroll (Opus MED). */
+function ensureSplitWheel(on: boolean): void {
+	if (on && !splitWheelAttached) {
+		viewportEl.addEventListener('wheel', onSplitWheel, { passive: false });
+		splitWheelAttached = true;
+	} else if (!on && splitWheelAttached) {
+		viewportEl.removeEventListener('wheel', onSplitWheel);
+		splitWheelAttached = false;
+	}
+}
 
 // Repaint on viewport resize. Megaudit (Opus-1): route through the SAME coalescing scheduler as scroll so a
 // simultaneous resize+scroll is ONE rAF, not two competing repaints. `scrollRedraw` resize()s first and
