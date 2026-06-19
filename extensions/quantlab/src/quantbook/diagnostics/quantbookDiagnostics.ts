@@ -46,6 +46,33 @@ function cellKey(row: number, col: number): string {
 }
 
 /**
+ * Merge one sheet's STORED cell errors with its sticky input-rejection (`errorReply`) entries: stored
+ * errors always win on the same cell (the cell was (re)written, so the rejection is moot). Pure -- returns
+ * the merged list (stored first, then non-superseded sticky in insertion order) plus the sticky keys a
+ * stored error now SUPERSEDES, so the (mutating) emit path can DELETE them while a (read-only) query path
+ * ignores them. Shared by {@link QuantbookDiagnostics.emitMerged} (drops the superseded) and
+ * {@link QuantbookDiagnostics.currentDiagnostics} (the Wave I "Errors" tree) so the two never diverge.
+ */
+function mergeStoredAndSticky(
+	stored: readonly CellDiagnostic[],
+	sheetSticky: Map<string, CellDiagnostic> | undefined,
+): { merged: CellDiagnostic[]; superseded: string[] } {
+	const storedKeys = new Set(stored.map(d => cellKey(d.row, d.col)));
+	const merged: CellDiagnostic[] = [...stored];
+	const superseded: string[] = [];
+	if (sheetSticky !== undefined) {
+		for (const [key, diag] of sheetSticky) {
+			if (storedKeys.has(key)) {
+				superseded.push(key);
+				continue;
+			}
+			merged.push(diag);
+		}
+	}
+	return { merged, superseded };
+}
+
+/**
  * The Quantbook DiagnosticCollection bridge + its `quantbook://` virtual-doc content provider. ONE
  * instance is constructed at activation, injected into `CellGridPanel` (a static sink) and the
  * reactive-kernel layer, and disposed via `context.subscriptions`.
@@ -147,16 +174,13 @@ export class QuantbookDiagnostics implements vscode.TextDocumentContentProvider,
 	private emitMerged(tag: string, sheet: number): void {
 		const stored = this.lastStored.get(tag)?.get(sheet) ?? [];
 		const sheetSticky = this.stickyErrorReplies.get(tag)?.get(sheet);
-		const storedKeys = new Set(stored.map(d => cellKey(d.row, d.col)));
-		const merged: CellDiagnostic[] = [...stored];
+		const { merged, superseded } = mergeStoredAndSticky(stored, sheetSticky);
+		// A stored error now covers these cells -> drop the superseded sticky entries ENTIRELY, not merely
+		// hide them from the emitted list (Codex HIGH): hiding-without-deleting would resurrect the stale
+		// sticky if the stored error later recovers via a path that does not commit that exact cell.
 		if (sheetSticky !== undefined) {
-			for (const key of [...sheetSticky.keys()]) {
-				if (storedKeys.has(key)) {
-					// A stored error now covers this cell -> drop the superseded sticky entry entirely.
-					sheetSticky.delete(key);
-					continue;
-				}
-				merged.push(sheetSticky.get(key)!);
+			for (const key of superseded) {
+				sheetSticky.delete(key);
 			}
 		}
 		this.publishCellDiagnostics(tag, sheet, merged);
@@ -285,6 +309,51 @@ export class QuantbookDiagnostics implements vscode.TextDocumentContentProvider,
 		this.collection.delete(reactiveUri);
 		this.docBodies.delete(reactiveUri.toString());
 		this.onDidChangeEmitter.fire(reactiveUri);
+	}
+
+	// --- Wave I (R13/R14): read API for the "Errors" diagnostics sidebar ---
+	// READ-ONLY queries over the SAME tracked state the Problems panel mirrors (no new error tracking, no
+	// side effects -- in particular they do NOT allocate a session tag for an unseen session, unlike the
+	// mutating setters: a session with no diagnostics yet simply reports none). The sidebar refreshes off
+	// the existing {@link onDidChange} emitter.
+
+	/**
+	 * The focused workbook's current per-sheet cell diagnostics (merged STORED + sticky, stored-wins),
+	 * sheet id ascending, only sheets that have errors. Empty for a session with no diagnostics. Pure read
+	 * (the merge mirrors {@link emitMerged} via the shared {@link mergeStoredAndSticky}, but never deletes
+	 * the superseded sticky entries -- a query must not mutate; the next emit does the cleanup).
+	 */
+	currentDiagnostics(session: SessionInstance): { sheet: number; diagnostics: CellDiagnostic[] }[] {
+		const tag = this.sessionTags.get(session);
+		if (tag === undefined) {
+			return [];
+		}
+		const sheets = new Set<number>();
+		for (const s of this.lastStored.get(tag)?.keys() ?? []) {
+			sheets.add(s);
+		}
+		for (const s of this.stickyErrorReplies.get(tag)?.keys() ?? []) {
+			sheets.add(s);
+		}
+		const out: { sheet: number; diagnostics: CellDiagnostic[] }[] = [];
+		for (const sheet of [...sheets].sort((a, b) => a - b)) {
+			const stored = this.lastStored.get(tag)?.get(sheet) ?? [];
+			const sheetSticky = this.stickyErrorReplies.get(tag)?.get(sheet);
+			const { merged } = mergeStoredAndSticky(stored, sheetSticky);
+			if (merged.length > 0) {
+				out.push({ sheet, diagnostics: merged });
+			}
+		}
+		return out;
+	}
+
+	/** The focused workbook's current workbook-level reactive-kernel error, or `undefined` if none. Pure read. */
+	reactiveError(session: SessionInstance): string | undefined {
+		const tag = this.sessionTags.get(session);
+		if (tag === undefined) {
+			return undefined;
+		}
+		return this.reactiveErrors.get(tag);
 	}
 
 	/** {@link vscode.TextDocumentContentProvider} -- serve the readable body for a `quantbook://` uri so a

@@ -16,6 +16,7 @@ import { QNB_NOTEBOOK_TYPE, QnbSerializer } from './quantbook/reactiveNotebook/q
 import { registerReactiveNotebookController } from './quantbook/reactiveNotebook/reactiveNotebookController';
 import { registerQuantbookShell } from './quantbook/shell/quantbookShell';
 import { registerDepGraphSidebar } from './quantbook/shell/registerDepGraphSidebar';
+import { registerDiagnosticsView } from './quantbook/shell/registerDiagnosticsView';
 import { SqlQueryViewProvider } from './quantbook/shell/SqlQueryViewProvider';
 import { registerQuantbookMcpServer } from './quantbook/mcp/mcpServer';
 import type { SessionInstance } from './quantbook/types';
@@ -405,6 +406,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push({ dispose: () => CellGridPanel.setDiagnosticsSink(undefined) });
 	setReactiveDiagnosticsSink(quantbookDiagnostics);
 	context.subscriptions.push({ dispose: () => setReactiveDiagnosticsSink(undefined) });
+
+	// Wave I (R13 + R14, 2026-06-19): the "Errors" diagnostics sidebar -- a dedicated tree view over the
+	// SAME diagnostics the Problems panel mirrors (grouped by sheet, error-class icons, full traceback in
+	// the tooltip, click-to-reveal). Additive; reads quantbookDiagnostics' read API + refreshes on its
+	// onDidChange. Registered AFTER the diagnostics bridge exists.
+	registerDiagnosticsView(context, quantbookDiagnostics);
 
 	const validationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	moduleValidationTimers = validationTimers;

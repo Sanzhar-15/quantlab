@@ -466,6 +466,45 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **Wave I (R13)** -- reveal `(sheet, row, col)` in the live panel bound to `session` (the "Errors"
+	 * sidebar's click-to-navigate). Brings the panel to the foreground, then switches it to the target sheet
+	 * and selects + scrolls the cell, reusing the FE-11 {@link navigateToAnchor} (which validates the sheet
+	 * is live + surfaces a dropped navigate). A no-op-with-warning if the workbook is no longer open
+	 * (No-Fallbacks: surfaced, never a silent miss). The `session` is passed by reference from the tree
+	 * node's command so the click reveals the error's OWN workbook even if grid focus has moved to the
+	 * sidebar (which would clear `focusedPanel`).
+	 */
+	static revealCellInSession(session: SessionInstance, sheet: number, row: number, col: number): void {
+		const inst = bySession.get(session);
+		if (inst === undefined) {
+			void vscode.window.showWarningMessage('Quantbook: the workbook for this error is no longer open.');
+			return;
+		}
+		// Validate the target sheet is still LIVE before navigating. `navigateToAnchor` -> `switchToSheet`
+		// early-returns without a liveness check when the sheet is already the active one, so a reveal onto a
+		// tombstoned-but-still-active sheet would otherwise post a navigate into a deleted grid. Surface the
+		// gone sheet loud (No-Fallbacks) rather than silently navigate nowhere.
+		if (!inst.session.listSheets().some(s => s.id === sheet)) {
+			void vscode.window.showWarningMessage('Quantbook: that sheet was deleted; the error can no longer be revealed.');
+			return;
+		}
+		// Bring the grid to the foreground so the selection lands on a visible panel, then navigate.
+		inst.panel.reveal();
+		inst.navigateToAnchor(sheet, row, col);
+	}
+
+	/**
+	 * **Wave I (R13)** -- clear a deleted sheet's diagnostics from the bridge so a tombstoned sheet leaves no
+	 * stale entry in the Problems panel OR the "Errors" sidebar. A no-op if no diagnostics sink is set. Called
+	 * from BOTH delete paths (the panel sheet strip + the palette `deleteSheet` command). Fixes a pre-existing
+	 * staleness the Errors sidebar made visible: a render only (re)writes the ACTIVE sheet's diagnostics, so a
+	 * deleted non-active sheet's stored errors would otherwise persist with no way to clear them.
+	 */
+	static clearSheetDiagnostics(session: SessionInstance, sheet: number): void {
+		diagnosticsSink?.clearSheet(session, sheet);
+	}
+
+	/**
 	 * **Wave H2 -- the dirty FAILSAFE.** Conservatively mark the custom editor's document dirty when
 	 * the precise version-based signal cannot be computed: a render's snapshot acquire / recompute
 	 * threw, OR a mutation has committed to the session but the following `recalcDirtyChecked` threw
@@ -2075,6 +2114,10 @@ export class CellGridPanel {
 					return;
 				}
 				this.session.deleteSheet(sheet);
+				// Wave I (R13): the deleted sheet is tombstoned -> drop its diagnostics so no stale "Sheet N"
+				// error lingers in the Problems panel / Errors sidebar (a render only rewrites the ACTIVE
+				// sheet's diagnostics, so the deleted sheet's stored errors would otherwise persist).
+				CellGridPanel.clearSheetDiagnostics(this.session, sheet);
 				// Wave H2: non-recalc mutation; the active-sheet branch reads listSheets(survivors) before the
 				// render -> mark dirty NOW so a pre-render throw cannot leave the committed delete falsely clean.
 				this.markDirtyFailsafe();

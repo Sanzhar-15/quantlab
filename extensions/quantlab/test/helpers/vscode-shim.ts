@@ -201,6 +201,47 @@ export const languages = {
 };
 
 // ---------------------------------------------------------------------------
+// Tree view primitives (Wave I sidebars: TreeDataProvider TreeItems)
+// ---------------------------------------------------------------------------
+
+export enum TreeItemCollapsibleState {
+	None = 0,
+	Collapsed = 1,
+	Expanded = 2,
+}
+
+/** Minimal `vscode.ThemeColor` -- an id holder (the tree never resolves the actual color in tests). */
+export class ThemeColor {
+	constructor(readonly id: string) { }
+}
+
+/** Minimal `vscode.ThemeIcon` -- id + optional color, so getTreeItem icon assertions can read `.id`. */
+export class ThemeIcon {
+	constructor(readonly id: string, readonly color?: ThemeColor) { }
+}
+
+/** Command descriptor as carried on a TreeItem. */
+export interface Command {
+	command: string;
+	title: string;
+	arguments?: unknown[];
+}
+
+/** Minimal `vscode.TreeItem` -- the mutable fields a provider sets, so tests can assert the mapping. */
+export class TreeItem {
+	id?: string;
+	description?: string | boolean;
+	tooltip?: string;
+	iconPath?: ThemeIcon;
+	contextValue?: string;
+	command?: Command;
+	constructor(
+		readonly label: string,
+		readonly collapsibleState: TreeItemCollapsibleState = TreeItemCollapsibleState.None,
+	) { }
+}
+
+// ---------------------------------------------------------------------------
 // RelativePattern
 // ---------------------------------------------------------------------------
 
@@ -251,6 +292,7 @@ const state = {
 	createdWatchers: [] as FakeFileSystemWatcher[],
 	commandsExecuted: [] as { command: string; args: unknown[] }[],
 	createdDirs: [] as string[],
+	clipboardText: undefined as string | undefined,
 };
 
 export function _resetShimState(): void {
@@ -262,6 +304,7 @@ export function _resetShimState(): void {
 	state.createdWatchers.length = 0;
 	state.commandsExecuted.length = 0;
 	state.createdDirs.length = 0;
+	state.clipboardText = undefined;
 }
 
 /** Parent dirs passed to `workspace.fs.createDirectory` (Wave H2: assert backup ensured the parent). */
@@ -430,6 +473,11 @@ export const window = {
 	): Disposable {
 		return new Disposable(() => { /* no-op */ });
 	},
+	// Wave I: the sidebars register TreeDataProviders. Tests construct the provider directly and assert
+	// getTreeItem/getChildren, so this only needs to be a disposable no-op (the registration is not the SUT).
+	createTreeView(_viewId: string, _options: unknown): { dispose(): void } {
+		return { dispose(): void { /* no-op */ } };
+	},
 	createOutputChannel(name: string): {
 		name: string;
 		appendLine(line: string): void;
@@ -451,6 +499,22 @@ export const window = {
 		};
 	},
 };
+
+// Wave I-b: the function-catalog sidebar copies a function name to the clipboard on click. Records the
+// last-written text so a test can assert it (the real env.clipboard is unavailable headlessly).
+export const env = {
+	clipboard: {
+		writeText(text: string): Thenable<void> {
+			state.clipboardText = text;
+			return Promise.resolve();
+		},
+	},
+};
+
+/** Test-only: the last text written to the shim clipboard (Wave I-b). */
+export function _clipboardText(): string | undefined {
+	return state.clipboardText;
+}
 
 // ---------------------------------------------------------------------------
 // install hook

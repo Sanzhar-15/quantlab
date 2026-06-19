@@ -870,6 +870,9 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			let opSucceeded = false;
 			try {
 				target.session.deleteSheet(pick.sheet);
+				// Wave I (R13): drop the tombstoned sheet's diagnostics so no stale "Sheet N" error lingers
+				// in the Problems panel / Errors sidebar (a render only rewrites the ACTIVE sheet's).
+				CellGridPanel.clearSheetDiagnostics(target.session, pick.sheet);
 				// Wave H2: structural mutation; the active-sheet branch reads listSheets(survivors) before
 				// the render -> mark the .qbook editor dirty NOW so a pre-render throw cannot leave the
 				// committed delete falsely clean (no-op for a non-editor session).
