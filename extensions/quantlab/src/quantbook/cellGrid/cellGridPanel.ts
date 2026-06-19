@@ -60,7 +60,7 @@ import { buildFormatUndoLabel, buildSetFormatOps, formatStringForPreset, presetL
 // focus-cell -> freeze-counts math shared by the palette and the context-menu freeze paths.
 import { planFreezeAtSelection, type GridSelectionInput } from './contextMenuLogic';
 import { formatRangeTarget, normalizeSelectionRect } from '../reactiveNotebook/bindVariableLogic';
-import { recalcDirtyChecked } from '../session';
+import { getHiddenRowsChecked, recalcDirtyChecked } from '../session';
 // FE-11: the name box routes an operator submit to one of navigate / define / error. The pure router +
 // the goToAnchor resolver + the define-toast builder are reused verbatim (the host shell below is thin).
 import { routeNameBoxSubmit, type NameBoxAction } from './nameBoxLogic';
@@ -834,6 +834,17 @@ export class CellGridPanel {
 	private rowSizeOverrides: Map<number, number> = new Map();
 
 	/**
+	 * **Wave G3a / R4 (2026-06-19)** -- the engine's AUTHORITATIVE hidden-row set for the CURRENT sheet, last
+	 * fetched in {@link render} via `getHiddenRows`. UNLIKE {@link rowSizeOverrides} (webview-authoritative,
+	 * host-mirrored only so a reload re-applies), hidden rows live in the ENGINE (oplog/undo/collab/.qbook v11):
+	 * the host is a pure cache that re-posts to the webview so the renderer collapses those rows to height 0.
+	 * The cell-delta DTO carries NO hidden-row field (an `Op::SetRowsHidden` forces a full snapshot rebuild but
+	 * the delta omits the set), so render() re-fetches it each paint (a small sorted vec) and the `webviewReady`
+	 * reload re-posts this cache. Empty = no hidden rows on this sheet.
+	 */
+	private hiddenRows: number[] = [];
+
+	/**
 	 * **W3 (Wave 3, 2026-06-09; Codex HIGH-2)** -- this panel's current webview instance token, learned from
 	 * the `webviewReady` handshake. Used to maintain the module {@link byWebviewToken} map (set on handshake,
 	 * cleared on dispose / re-handshake) so the context menu's host commands route to THIS exact panel.
@@ -1110,6 +1121,14 @@ export class CellGridPanel {
 		// that recovered to a real value is no longer an error entry, so the bridge replaces this sheet's
 		// diagnostics without it (No-Fallbacks -- no stale Problems entry). A no-op when no bridge is wired.
 		diagnosticsSink?.setSheetCellDiagnostics(this.session, this.sheet, decorated);
+		// Wave G3a (R4): mirror the engine's AUTHORITATIVE hidden-row set for this sheet to the webview so the
+		// renderer collapses hidden rows to height 0. Re-fetched every paint (a small sorted vec) so undo/redo,
+		// a sheet switch, and any mutation re-sync from engine truth -- the cell-delta DTO carries NO hidden-row
+		// field. A deleted/tombstoned active sheet (sheetSnapshot === null) would throw in getHiddenRows -> post
+		// empty instead. Posted BEFORE the render so the first paint already has the collapsed geometry (no
+		// one-frame un-collapsed flash); the webview applies the messages in delivery order.
+		this.hiddenRows = sheetSnapshot !== null ? getHiddenRowsChecked(this.session, this.sheet) : [];
+		this.postHiddenRowsIfReady();
 		this.postRenderIfReady();
 	}
 
@@ -1394,6 +1413,32 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **Wave G3a / R4 (2026-06-19)** -- post the engine's hidden-row set (mirrored in {@link hiddenRows}) to the
+	 * bundled webview IFF the handshake completed + the panel is live, so the renderer collapses those rows to
+	 * height 0. Called from {@link render} (after the per-paint re-fetch) and on the `webviewReady` handshake (a
+	 * reload re-applies the collapse from the cache). A non-delivery is surfaced LOUD (No-Fallbacks): the grid
+	 * would show the rows UN-collapsed (stale geometry) otherwise. An empty re-send on a sheet with no hidden
+	 * rows is harmless (the webview starts uncollapsed anyway).
+	 */
+	private postHiddenRowsIfReady(): void {
+		if (!this.webviewReady || this._disposed) {
+			return;
+		}
+		this.panel.webview.postMessage({ type: 'hiddenRows', rows: this.hiddenRows }).then(
+			delivered => {
+				if (!delivered && !this._disposed) {
+					console.warn('[cellGrid] hiddenRows postMessage was not delivered to the webview.');
+					void vscode.window.showWarningMessage(
+						'Quantbook: a row hide/unhide may not have applied to the view (a message was not delivered). '
+						+ 'Reopen the grid to refresh the hidden rows.',
+					);
+				}
+			},
+			err => console.error('[cellGrid] hiddenRows postMessage rejected:', err),
+		);
+	}
+
+	/**
 	 * **Wave F window split** -- post a split MODE to the bundled webview (the webview computes the bar Y
 	 * from its live scroll + owns all split state, so there is nothing to mirror or re-apply on reload).
 	 * `'atSelection'` splits at the active cell; `'remove'` clears the split. A non-delivery is surfaced
@@ -1478,6 +1523,14 @@ export class CellGridPanel {
 		this.frozenColCount = 0;
 		this.colSizeOverrides.clear(); // Wave G: per-sheet sizing memory is deferred (v2) -- reset like freeze.
 		this.rowSizeOverrides.clear(); // Wave G-rows: same -- reset the row overrides on a sheet switch.
+		// Wave G3a (Lane-A MED): clear the cached hidden-row collapse AND post it (empty) BEFORE postRowSizingIfReady.
+		// The webview's `rowSizing` message triggers a `recomposeRowSizing` that reads `hiddenRowsInput`; if we did
+		// NOT clear it on the webview first, that recompose would apply the OLD sheet's hidden rows to the new
+		// sheet's geometry for one frame. render() below then re-fetches + posts the NEW sheet's getHiddenRows
+		// (per-sheet, engine-authoritative) before its snapshot. Mirrors the freeze/sizing "post the reset BEFORE
+		// render" discipline.
+		this.hiddenRows = [];
+		this.postHiddenRowsIfReady();
 		// Post the (now-cleared) freeze + column/row sizing BEFORE render() so the first paint of the NEW sheet
 		// uses the reset view-state -- no one-frame flash of the previous sheet's freeze / column / row sizing. The
 		// post fns read only the counters/maps (not the snapshot), so ordering them before render() is safe.
@@ -2063,6 +2116,11 @@ export class CellGridPanel {
 				byWebviewToken.set(incomingToken, this);
 			}
 			this.clearReadyWatchdog();
+			// Wave G3a (Codex/Lane-B MED): post the hidden-row collapse BEFORE the render snapshot so a reload's
+			// FIRST data paint is already collapsed -- never a one-frame flash of un-collapsed rows. The webview
+			// reload re-inits uncollapsed; the cache (last fetched in render(); a reload does not change engine
+			// state, so the cache is authoritative) re-applies it. A no-op when no rows are hidden (empty).
+			this.postHiddenRowsIfReady();
 			this.postRenderIfReady();
 			// W3 frozen panes: a reload re-inits the webview unfrozen; re-apply the session-local freeze so a
 			// reload does not silently lose it. A no-op when nothing is frozen (0/0).

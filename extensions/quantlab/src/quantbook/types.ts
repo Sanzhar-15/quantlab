@@ -2582,6 +2582,22 @@ export interface SessionInstance {
 	 * `index`/`count`) at wave-3 integration.
 	 */
 	deleteColumns(sheet: number, start: number, end: number): void;
+
+	/**
+	 * **Wave G2 / R4 (2026-06-19):** set (or clear) the HIDDEN flag on `rows` (0-based) of `sheet`.
+	 * `hidden === true` hides; `false` reveals. Appends ONE `Op::SetRowsHidden` to the Loro oplog =>
+	 * one undo step (only the rows whose visibility actually changes are recorded). Hidden rows are
+	 * skipped by `SUBTOTAL(101..=111)` and persisted in `.qbook` (v11) + collab-synced. The IDE
+	 * collapsing renderer reads {@link getHiddenRows} to paint hidden rows at height 0.
+	 */
+	setRowsHidden(sheet: number, rows: number[], hidden: boolean): void;
+
+	/**
+	 * **Wave G2 / R4 (2026-06-19):** the sorted list of currently-hidden row indices on `sheet`
+	 * (0-based, ascending). Pure read. The host mirrors this to the webview so the renderer collapses
+	 * the rows; the Unhide command intersects it with the selected row span.
+	 */
+	getHiddenRows(sheet: number): number[];
 }
 
 export interface SessionConstructor {

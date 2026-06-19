@@ -19,6 +19,11 @@ import {
 	type GridSelectionInput,
 	type StructuralOp,
 } from '../src/quantbook/cellGrid/contextMenuLogic';
+import {
+	hiddenRowsInSpan,
+	rowSpanFromSelection,
+	rowsInSpan,
+} from '../src/quantbook/cellGrid/rowVisibilityLogic';
 
 /** A single-cell selection at (row,col). */
 function cell(row: number, col: number): GridSelectionInput {
@@ -249,5 +254,37 @@ suite('fe/sheet-tabs contextMenuLogic -- planFreezeAtSelection (Freeze Panes Her
 		});
 		assert.notStrictEqual(arg, undefined);
 		assert.deepStrictEqual(planFreezeAtSelection(arg!.selection), { rows: 3, cols: 4 });
+	});
+});
+
+suite('Wave G3a rowVisibilityLogic -- Hide/Unhide row-set math', () => {
+	test('rowSpanFromSelection normalizes the two corners (any order; columns ignored)', () => {
+		assert.deepStrictEqual(rowSpanFromSelection(cell(3, 7)), { minRow: 3, maxRow: 3 });
+		assert.deepStrictEqual(rowSpanFromSelection(rect(2, 9, 5, 0)), { minRow: 2, maxRow: 5 });
+		// Focus ABOVE the anchor still yields min<=max (the Excel canon the structural ops share).
+		assert.deepStrictEqual(rowSpanFromSelection(rect(8, 1, 4, 1)), { minRow: 4, maxRow: 8 });
+	});
+
+	test('rowsInSpan materializes the inclusive band (single + multi)', () => {
+		assert.deepStrictEqual(rowsInSpan({ minRow: 3, maxRow: 3 }), [3]);
+		assert.deepStrictEqual(rowsInSpan({ minRow: 2, maxRow: 5 }), [2, 3, 4, 5]);
+	});
+
+	test('rowSpanFromSelection clamps out-of-extent corners to the grid (defence vs a malformed context arg)', () => {
+		// A legitimate in-extent selection is untouched (the clamp is a no-op).
+		assert.deepStrictEqual(rowSpanFromSelection(rect(2, 0, 5, 0)), { minRow: 2, maxRow: 5 });
+		// A malformed huge focusRow is clamped to the last grid row -- never a multi-million-row span.
+		const clamped = rowSpanFromSelection(rect(0, 0, 9_999_999, 0));
+		assert.strictEqual(clamped.minRow, 0);
+		assert.strictEqual(clamped.maxRow, 1_048_575, 'clamped to A1_MAX_ROWS - 1');
+		assert.strictEqual(rowsInSpan(clamped).length, 1_048_576, 'bounded array, not 10M entries');
+	});
+
+	test('hiddenRowsInSpan intersects the engine hidden set with the selected band', () => {
+		const hidden = [1, 3, 4, 9]; // as getHiddenRows returns (ascending)
+		assert.deepStrictEqual(hiddenRowsInSpan(hidden, { minRow: 3, maxRow: 6 }), [3, 4], 'only hidden rows inside the span');
+		assert.deepStrictEqual(hiddenRowsInSpan(hidden, { minRow: 5, maxRow: 8 }), [], 'no hidden rows in the span -> empty (the no-op-toast case)');
+		assert.deepStrictEqual(hiddenRowsInSpan(hidden, { minRow: 0, maxRow: 100 }), [1, 3, 4, 9], 'a span covering all keeps every hidden row, in order');
+		assert.deepStrictEqual(hiddenRowsInSpan([], { minRow: 0, maxRow: 100 }), [], 'no hidden rows at all -> empty');
 	});
 });

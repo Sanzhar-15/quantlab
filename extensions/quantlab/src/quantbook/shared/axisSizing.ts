@@ -155,6 +155,68 @@ export function withOverride(s: AxisSizing, index: number, size: number): AxisSi
 	return result;
 }
 
+/**
+ * **Wave G3a (R4, 2026-06-19)** -- COLLAPSE index `index` to 0 px (a HIDDEN row). Distinct from
+ * {@link withOverride}: a hidden row is engine-authoritative (the row-visibility / filter substrate),
+ * NOT a user drag-resize, and its size is exactly 0 -- which {@link withOverride} forbids (it clamps to
+ * `[minSize, maxSize]` and throws below `minSize`). This sibling sets `overrides[index] = 0` directly,
+ * bypassing the `minSize` floor that the user-drag path keeps. Value semantics (the old model is
+ * untouched). Validates `index` in `[0, count)` exactly as {@link withOverride} (No-Fallbacks: a bad
+ * index crossing the host->webview wire must fail loud, never silently mis-collapse a neighbour).
+ *
+ * No `maxTotalExtent` check is needed (unlike {@link withOverride}): a 0-size entry only DECREASES the
+ * total extent, so the spacer cap can never be crossed by a collapse. Composing this over the engine's
+ * hidden-row set makes every geometry consumer (paint, hit-test, selection, fill-handle, in-cell editor,
+ * freeze, split) collapse the row with zero call-site edits, because they all read through
+ * {@link sizeAt}/{@link offsetBefore}/{@link indexAtOffset}. Canonical form holds: 0 != `defaultSize`
+ * (which is `> 0`), so a collapsed entry is always stored and `overrides.size > 0` (tripping the
+ * full-redraw gate, the same way a resize does).
+ */
+export function withCollapsed(s: AxisSizing, index: number): AxisSizing {
+	if (!Number.isInteger(index) || index < 0 || index >= s.count) {
+		throw new Error(`AxisSizing.withCollapsed: index ${index} out of extent [0, ${s.count})`);
+	}
+	const next = new Map(s.overrides);
+	next.set(index, 0);
+	return build(s.defaultSize, s.count, s.minSize, s.maxSize, s.maxTotalExtent, next);
+}
+
+/**
+ * **Wave G3a (R4, 2026-06-19)** -- fold {@link withCollapsed} over the engine's hidden-row set, returning
+ * a model where every hidden row is 0 px ON TOP OF the `base` (a user-resize model). The two inputs stay
+ * SEPARATE (the caller keeps the resize map and the hidden set independently) so unhiding a row restores
+ * its user/default height -- compose order is fixed here: `base` carries the resize heights, then the
+ * collapse zeroes the hidden subset (a hidden row's 0 shadows any resize until it unhides).
+ *
+ * Returns `base` UNCHANGED (same reference) when `hidden` is empty -- the keystone invariant the golden
+ * tests pin: with no hidden rows the composed model is byte-identical to the resize-only model (which, with
+ * no resizes either, is byte-identical to the uniform `index * defaultSize` arithmetic). Throws
+ * (No-Fallbacks, via {@link withCollapsed}) on an out-of-extent hidden index; the webview message handler
+ * contains it like the resize path so one malformed row never corrupts the whole geometry.
+ */
+export function composeHidden(base: AxisSizing, hidden: Iterable<number>): AxisSizing {
+	// Build the combined override map ONCE (not by folding {@link withCollapsed} h times -- that would re-sort
+	// the key array on every fold, O(h^2 log h), too slow during a drag when a filter hides many rows). One
+	// `build` => O((k + h) log(k + h)). `next` stays null until the FIRST hidden index, so an empty set returns
+	// `base` by reference (the keystone byte-identity).
+	let next: Map<number, number> | null = null;
+	for (const index of hidden) {
+		// No-Fallbacks: an out-of-extent hidden index (a bad set crossing the host->webview wire) fails LOUD,
+		// matching {@link withCollapsed}; the webview handler contains it so one bad row never corrupts the model.
+		if (!Number.isInteger(index) || index < 0 || index >= base.count) {
+			throw new Error(`AxisSizing.composeHidden: hidden index ${index} out of extent [0, ${base.count})`);
+		}
+		if (next === null) {
+			next = new Map(base.overrides);
+		}
+		next.set(index, 0);
+	}
+	if (next === null) {
+		return base;
+	}
+	return build(base.defaultSize, base.count, base.minSize, base.maxSize, base.maxTotalExtent, next);
+}
+
 /** The px size of one index: its override, or `defaultSize`. O(1). */
 export function sizeAt(s: AxisSizing, index: number): number {
 	return s.overrides.get(index) ?? s.defaultSize;

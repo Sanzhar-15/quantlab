@@ -35,7 +35,7 @@ import * as vscode from 'vscode';
 // / deleteSheet / moveSheet / workbookSnapshot, the buildSheet* quickpick
 // builders, connectOrSpawn) belong to the B2-stubbed grid commands and are no
 // longer imported here.
-import { addSheet, appendPutValueValidated, createSession, createWorkbookSession, openWorkbookFromQbook, quantbookEngineVersion, recalcDirtyChecked, saveSessionToQbook, sessionFromSnapshot, setFormulaValidated, setValueValidated } from '../quantbook/session';
+import { addSheet, appendPutValueValidated, createSession, createWorkbookSession, getHiddenRowsChecked, openWorkbookFromQbook, quantbookEngineVersion, recalcDirtyChecked, saveSessionToQbook, sessionFromSnapshot, setFormulaValidated, setRowsHiddenValidated, setValueValidated } from '../quantbook/session';
 import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
 import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
@@ -50,6 +50,7 @@ import { columnLabelA1, formatRangeTarget, normalizeSelectionRect } from '../qua
 // data-vscode-context argument validator (Codex HIGH-1/HIGH-2 fold: plan from the carried selection,
 // route by the carried panel token).
 import { describeStructuralPlan, parseContextMenuArg, planStructuralOp, type StructuralOp } from '../quantbook/cellGrid/contextMenuLogic';
+import { hiddenRowsInSpan, rowSpanFromSelection, rowsInSpan, type RowSpan } from '../quantbook/cellGrid/rowVisibilityLogic';
 // FE-4 W1 (2026-06-10): the pure cores for Find/Replace-All (snapshot-read -> hit list + replace op
 // batch) and Define Name (Excel name validation + selection -> CellRangeJson). The commands below are
 // thin vscode shells over these (the established cellGrid logic/command split).
@@ -1468,6 +1469,108 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			log.appendLine(`Froze panes: ${result.rows} row(s), ${result.cols} column(s).`);
 		}),
 	);
+
+	// 4. HIDE / UNHIDE ROWS (Wave G3a / R4, 2026-06-19) -- consume the engine row-visibility substrate (Wave
+	// G2) over the SAME carried `{panelToken, selection}` payload as the structural commands above. One
+	// `setRowsHidden(sheet, rows, hidden)` call appends ONE `Op::SetRowsHidden` (one undo step; only the rows
+	// whose visibility changes are recorded) -> the `SUBTOTAL(101-111)` results recompute, so recalc + refresh
+	// THIS session's panels (the host's `render()` re-fetches `getHiddenRows` and re-posts the collapse to the
+	// webview). No `session.batch` -- a single call is already one undo unit. Each `resolve` returns the row set
+	// to act on, or `undefined` after surfacing an explicit "nothing to do" info toast (No-Fallbacks).
+	const runRowVisibilityCommand = (
+		commandId: string,
+		pastTense: string,
+		hidden: boolean,
+		resolve: (session: SessionInstance, sheet: number, span: RowSpan) => number[] | undefined,
+	): void => {
+		context.subscriptions.push(
+			vscode.commands.registerCommand(commandId, (contextArg?: unknown) => {
+				const arg = parseContextMenuArg(contextArg);
+				if (arg === undefined) {
+					contextArgToast();
+					return;
+				}
+				// Resolve the EXACT panel that raised the menu (by token), not the focused one (Codex HIGH-2 canon).
+				const panel = CellGridPanel.panelByToken(arg.panelToken);
+				if (panel === undefined) {
+					void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+					return;
+				}
+				const { session, sheet } = panel.target;
+				const log = getOutput();
+				// Direct feature-check (mirror the structural LOW-1): a stale dylib lacks the row-visibility surface.
+				// The loader presence-check gates BOTH set/get, so a loaded session that has setRowsHidden also has
+				// getHiddenRows -- this guards the (impossible-post-loader) partial build LOUD, not at a use site.
+				if (typeof (session as unknown as Record<string, unknown>)['setRowsHidden'] !== 'function') {
+					const msg = 'Quantbook hide/unhide rows failed: the engine\'s row-visibility capability is not available in the loaded build yet.';
+					log.appendLine('FATAL setRowsHidden unavailable: method is not a function on the loaded Session.');
+					void vscode.window.showErrorMessage(msg);
+					return;
+				}
+				// Plan from the AUTHORITATIVE right-click-time selection (Codex HIGH-1), not the async host selection.
+				const span = rowSpanFromSelection(arg.selection);
+				let rows: number[] | undefined;
+				try {
+					rows = resolve(session, sheet, span);
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`FATAL hide/unhide resolve error: ${detail}`);
+					void vscode.window.showErrorMessage(`Quantbook hide/unhide rows failed: ${detail}`);
+					return;
+				}
+				if (rows === undefined) {
+					return; // resolve already surfaced an explicit info toast (e.g. nothing to unhide).
+				}
+				let opSucceeded = false;
+				try {
+					setRowsHiddenValidated(session, sheet, rows, hidden);
+					recalcDirtyChecked(session);
+					opSucceeded = true;
+					const noun = rows.length === 1 ? 'row' : 'rows';
+					log.appendLine(`${pastTense} ${rows.length} ${noun} on sheet ${sheet}.`);
+					void vscode.window.showInformationMessage(`Quantbook: ${pastTense} ${rows.length} ${noun}.`);
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`FATAL setRowsHidden error: ${detail}`);
+					void vscode.window.showErrorMessage(`Quantbook hide/unhide rows failed: ${detail}`);
+				}
+				if (opSucceeded) {
+					try {
+						const { failed } = CellGridPanel.refreshSession(session);
+						if (failed > 0) {
+							void vscode.window.showWarningMessage(`Quantbook: the change applied, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid".`);
+						}
+					} catch (err) {
+						// The mutation landed but the repaint threw -> the grid on screen may be STALE (Codex MED-2).
+						const detail = err instanceof Error ? err.message : String(err);
+						log.appendLine(`refreshSession after setRowsHidden failed: ${detail}`);
+						void vscode.window.showWarningMessage('Quantbook: the change applied, but the grid may be showing stale values (a repaint failed) -- run "Quantbook: Refresh Cell Grid".');
+					}
+				}
+			}),
+		);
+	};
+	// Hide: the full selected row span (bounded -- there is no select-all, so the span never reaches MAX_ROWS).
+	runRowVisibilityCommand('quantlab.quantbookHideRows', 'Hid', true, (_session, _sheet, span) => rowsInSpan(span));
+	// Unhide: the hidden rows WITHIN the selected span; explicit "nothing to unhide" toast when the span has none.
+	runRowVisibilityCommand('quantlab.quantbookUnhideRows', 'Unhid', false, (session, sheet, span) => {
+		const target = hiddenRowsInSpan(getHiddenRowsChecked(session, sheet), span);
+		if (target.length === 0) {
+			void vscode.window.showInformationMessage('Quantbook: no hidden rows in the selection.');
+			return undefined;
+		}
+		return target;
+	});
+	// Unhide all: every hidden row on the sheet (the escape hatch -- a fully-collapsed band is unreachable by a
+	// selection, since you cannot select rows you cannot see between two visible neighbours).
+	runRowVisibilityCommand('quantlab.quantbookUnhideAllRows', 'Unhid', false, (session, sheet) => {
+		const target = getHiddenRowsChecked(session, sheet);
+		if (target.length === 0) {
+			void vscode.window.showInformationMessage('Quantbook: no hidden rows on this sheet.');
+			return undefined;
+		}
+		return target;
+	});
 
 	// =====================================================================================================
 	// FE-4 W1 (2026-06-10): Find / Replace-All in Workbook + Define Name.

@@ -42,6 +42,8 @@ import {
 	createWorkbookSession,
 	deleteSheet,
 	exportCellSnapshot,
+	getHiddenRowsChecked,
+	setRowsHiddenValidated,
 } from '../src/quantbook/session';
 import type { SessionCellValueInput } from '../src/quantbook/types';
 
@@ -175,6 +177,74 @@ suite('quantbook owning Session migration -- Phase 6.1B inc.2d', () => {
 				/\[bad_argument\]/,
 				'unknown value kind surfaces a structured [bad_argument] error',
 			);
+		});
+	});
+
+	// ------------------------------------------------------------------------
+	// Wave G3a / R4 (2026-06-19) -- per-sheet ROW VISIBILITY through the real
+	// dylib: setRowsHidden/getHiddenRows round-trip, SUBTOTAL(101-111) skip,
+	// undo, and the IDE-side validators' [bad_argument] discipline. This also
+	// proves the loaded .node carries the Wave G2 methods (the loader presence
+	// check requires them, so createWorkbookSession would have thrown otherwise).
+	// ------------------------------------------------------------------------
+	suite('owning Session -- Wave G3a row visibility (set/get/SUBTOTAL/undo)', () => {
+
+		test('setRowsHidden -> getHiddenRows round-trip (sorted; unhide subset; unhide all)', () => {
+			const s = createWorkbookSession();
+			const sheetId = s.addSheet('Sheet1', 1000);
+			// Hide rows 4 then 2 (out of order) -- getHiddenRows returns them ASCENDING.
+			setRowsHiddenValidated(s, sheetId, [4, 2], true);
+			assert.deepStrictEqual(getHiddenRowsChecked(s, sheetId), [2, 4], 'hidden set is sorted ascending');
+			// Unhide just row 2 -> [4] remains.
+			setRowsHiddenValidated(s, sheetId, [2], false);
+			assert.deepStrictEqual(getHiddenRowsChecked(s, sheetId), [4], 'unhiding a subset leaves the rest hidden');
+			// Unhide all currently-hidden rows -> [].
+			setRowsHiddenValidated(s, sheetId, getHiddenRowsChecked(s, sheetId), false);
+			assert.deepStrictEqual(getHiddenRowsChecked(s, sheetId), [], 'unhide-all clears the set');
+		});
+
+		test('SUBTOTAL(109) SKIPS a hidden row; SUBTOTAL(9) ignores visibility', () => {
+			const s = createWorkbookSession();
+			const sheetId = s.addSheet('Sheet1', 1000);
+			// A1..A5 = 1..5 (rows 0..4).
+			for (let r = 0; r < 5; r += 1) {
+				s.setValue(sheetId, r, 0, { kind: 'number', number: r + 1 });
+			}
+			s.setFormula(sheetId, 0, 1, 'SUBTOTAL(109,A1:A5)'); // B1: skip-hidden SUM
+			s.setFormula(sheetId, 1, 1, 'SUBTOTAL(9,A1:A5)');   // B2: plain SUM (visibility-agnostic)
+			s.recalcDirty();
+			assert.strictEqual(s.cell(sheetId, 0, 1)?.value?.number, 15, 'B1 = 1+2+3+4+5 = 15 with nothing hidden');
+
+			// Hide row 2 (A3 = 3), recompute (the host calls recalcDirty after setRowsHidden).
+			setRowsHiddenValidated(s, sheetId, [2], true);
+			s.recalcDirty();
+			assert.strictEqual(s.cell(sheetId, 0, 1)?.value?.number, 12, 'SUBTOTAL(109) skips the hidden A3 -> 1+2+4+5 = 12');
+			assert.strictEqual(s.cell(sheetId, 1, 1)?.value?.number, 15, 'SUBTOTAL(9) ignores visibility -> still 15');
+		});
+
+		test('hide is undoable (one Op::SetRowsHidden = one undo step)', () => {
+			const s = createWorkbookSession();
+			const sheetId = s.addSheet('Sheet1', 1000);
+			setRowsHiddenValidated(s, sheetId, [1, 3], true);
+			assert.deepStrictEqual(getHiddenRowsChecked(s, sheetId), [1, 3], 'rows hidden');
+			assert.strictEqual(s.canUndo(), true, 'the hide is on the undo stack');
+			s.undo(); // returns {consumed, version}, not a bool -- assert the OUTCOME, not the shape.
+			assert.deepStrictEqual(getHiddenRowsChecked(s, sheetId), [], 'undo restores full visibility');
+		});
+
+		test('validators reject malformed input fail-loud ([bad_argument]) BEFORE the FFI boundary', () => {
+			const s = createWorkbookSession();
+			const sheetId = s.addSheet('Sheet1', 1000);
+			assert.throws(() => setRowsHiddenValidated(s, -1, [0], true), /\[bad_argument\]/, 'negative sheet');
+			assert.throws(() => setRowsHiddenValidated(s, 0x1_0000, [0], true), /\[bad_argument\]/, 'sheet over u16');
+			assert.throws(() => setRowsHiddenValidated(s, sheetId, [2.5], true), /\[bad_argument\]/, 'fractional row');
+			assert.throws(() => setRowsHiddenValidated(s, sheetId, [-1], true), /\[bad_argument\]/, 'negative row');
+			assert.throws(
+				() => setRowsHiddenValidated(s, sheetId, 5 as unknown as number[], true),
+				/\[bad_argument\]/,
+				'non-array rows',
+			);
+			assert.throws(() => getHiddenRowsChecked(s, -1), /\[bad_argument\]/, 'getHiddenRows negative sheet');
 		});
 	});
 

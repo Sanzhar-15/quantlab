@@ -94,6 +94,7 @@ import {
 	cellRefA1,
 	colResizeBorderAt,
 	colX,
+	composeHidden,
 	emptyAxisSizing,
 	frozenColsWidth,
 	frozenRowsHeight,
@@ -1625,6 +1626,39 @@ let colResizeSuppressClick = false;
 // `rowResizeSuppressClick` swallows the click synthesized after a resize-drag pointerup.
 let rowResizeDrag: { row: number; pointerId: number; startClientY: number; startHeight: number } | null = null;
 let rowResizeSuppressClick = false;
+// **Wave G3a (R4) -- collapsing-renderer inputs.** The webview composes the EFFECTIVE row sizing model from TWO
+// SEPARATE sources so unhiding a row restores its user height: `rowResizeInput` carries the user drag-resize
+// heights (the source of truth that, pre-G3a, lived only inside the installed renderer model), and
+// `hiddenRowsInput` carries the engine's AUTHORITATIVE hidden-row set (each hidden row composes to height 0).
+// `recomposeRowSizing()` is the SOLE writer of the renderer's row model: every path that used to call
+// `renderer.setRowSizing(withOverride(renderer.rowSizing, ...))` now updates `rowResizeInput` and recomposes, so
+// a collapse can never be silently clobbered by a resize (and a resize is never lost when a row unhides). These
+// are only read/written at event time (drag handlers + the `rowSizing`/`hiddenRows` message handlers), never at
+// module-init time, so no init-time call path can reach them before this point (the w86 TDZ discipline).
+let rowResizeInput: Map<number, number> = new Map();
+let hiddenRowsInput: Set<number> = new Set();
+
+// Build the user-resize-ONLY row model (no hidden rows folded in). Throws (contained by every caller) only if the
+// AGGREGATE extent would exceed the spacer cap -- in practice unreachable (the host's `handleSizeRow` + the live
+// drag both clamp each entry, and the host enforces the aggregate cap before posting).
+function buildResizeRowModel(resizes: ReadonlyMap<number, number>): AxisSizing {
+	let model: AxisSizing = emptyAxisSizing(ROW_HEIGHT, MAX_ROWS, MIN_ROW_HEIGHT, MAX_ROW_HEIGHT, MAX_SPACER_PX - HEADER_HEIGHT);
+	for (const [row, height] of resizes) {
+		model = withOverride(model, row, height);
+	}
+	return model;
+}
+
+// Compose the EFFECTIVE row model (user resizes, then the engine's hidden rows forced to 0), install it, and
+// resync the viewport (spacer/editor/redraw). The SOLE installer of the row sizing. May throw on the (practically
+// unreachable) aggregate-cap edge: callers that can hit it (the live drag) contain + revert their input; the
+// message handlers validate-then-commit so the inputs and the installed model never diverge.
+function recomposeRowSizing(): void {
+	renderer.setRowSizing(composeHidden(buildResizeRowModel(rowResizeInput), hiddenRowsInput));
+	updateSpacer();
+	repositionEdit();
+	redraw();
+}
 // Click tolerance (CSS px) for grabbing the fill-handle square at the selection's bottom-right corner.
 const FILL_HANDLE_HIT_PX = 5;
 // The active (selected) cell -- the FOCUS of the selection. Starts at A1 (like Excel) so the grid
@@ -4645,15 +4679,23 @@ canvasEl.addEventListener('pointerdown', ev => {
 				? rowResizeBorderAtSplit(localY, renderer.splitBarYPx, renderer.topSplitScrollPx, viewportEl.scrollTop, HEADER_HEIGHT)
 				: rowResizeBorderAt(localY, viewportEl.scrollTop, HEADER_HEIGHT, renderer.frozenRows);
 			if (borderRow >= 0) {
-				ev.preventDefault();
-				rowResizeDrag = {
-					row: borderRow,
-					pointerId: ev.pointerId,
-					startClientY: ev.clientY,
-					startHeight: cellContentRect(borderRow, 0, renderer.gutterWidthPx).height,
-				};
-				rowResizeSuppressClick = false;
-				canvasEl.setPointerCapture(ev.pointerId);
+				// Wave G3a (Codex/Lane-C MED): a HIDDEN row is 0-height, and `rowResizeBorderAt`'s top-edge grab can
+				// resolve the collapsed-band boundary to such a row. A 0-height row has no resizable border -- starting
+				// a drag on it would post `height: 0` on release (the host rejects it) and could clobber a prior
+				// resize in `rowResizeInput`. Gate the drag on a POSITIVE start height; the border event is still
+				// consumed (a collapsed-band border is inert), so we never fall through to cell selection.
+				const startHeight = cellContentRect(borderRow, 0, renderer.gutterWidthPx).height;
+				if (startHeight > 0) {
+					ev.preventDefault();
+					rowResizeDrag = {
+						row: borderRow,
+						pointerId: ev.pointerId,
+						startClientY: ev.clientY,
+						startHeight,
+					};
+					rowResizeSuppressClick = false;
+					canvasEl.setPointerCapture(ev.pointerId);
+				}
 				return;
 			}
 		}
@@ -4724,21 +4766,28 @@ canvasEl.addEventListener('pointermove', ev => {
 		}
 		const dy = ev.clientY - rowResizeDrag.startClientY;
 		const newHeight = Math.max(MIN_ROW_HEIGHT, Math.min(MAX_ROW_HEIGHT, Math.round(rowResizeDrag.startHeight + dy)));
-		// Wave G-rows (Codex audit MED): the row spacer cap can (pathologically) be exceeded by one more resize
-		// when thousands of rows are already maxed. Contain the loud `withOverride` throw at this event-handler
-		// boundary -- log it and abort THIS move (the row stops growing, last good sizing kept), never an uncaught
-		// pointermove crash that would break unrelated grid interaction.
-		let nextRowSizing: AxisSizing;
-		try {
-			nextRowSizing = withOverride(renderer.rowSizing, rowResizeDrag.row, newHeight);
-		} catch (e) {
-			console.error('[sheets-webview] row resize would exceed the max scrollable height; ignoring this move:', e);
-			return;
+		// Wave G3a: re-route the live drag through `rowResizeInput` + `recomposeRowSizing` so the resize composes
+		// WITH any hidden rows (a 0-height collapse must survive the drag) instead of mutating the already-composed
+		// model. Canonical form: a drag back to the default height REMOVES the override (mirrors `withOverride`).
+		// Wave G-rows (Codex audit MED): the row spacer cap can (pathologically) be exceeded when thousands of rows
+		// are already maxed -- contain the loud throw, REVERT this row's input, and abort THIS move (last good
+		// sizing kept), never an uncaught pointermove crash that would break unrelated grid interaction.
+		const prevHeight = rowResizeInput.get(rowResizeDrag.row);
+		if (newHeight === ROW_HEIGHT) {
+			rowResizeInput.delete(rowResizeDrag.row);
+		} else {
+			rowResizeInput.set(rowResizeDrag.row, newHeight);
 		}
-		renderer.setRowSizing(nextRowSizing);
-		updateSpacer(); // Wave G-rows: the total content height changed -> resync the native vertical scrollbar range
-		repositionEdit();
-		redraw();
+		try {
+			recomposeRowSizing();
+		} catch (e) {
+			if (prevHeight === undefined) {
+				rowResizeInput.delete(rowResizeDrag.row);
+			} else {
+				rowResizeInput.set(rowResizeDrag.row, prevHeight);
+			}
+			console.error('[sheets-webview] row resize would exceed the max scrollable height; ignoring this move:', e);
+		}
 		return;
 	}
 	// FE-3 point mode: extend the pointed range to the cell under the pointer, rewriting the inserted ref.
@@ -4818,8 +4867,12 @@ canvasEl.addEventListener('pointerup', ev => {
 		}
 		canvasEl.releasePointerCapture?.(ev.pointerId);
 		const row = rowResizeDrag.row;
-		const finalHeight = cellContentRect(row, 0, renderer.gutterWidthPx).height;
-		vscode.postMessage({ type: 'sizeRow', row, height: finalHeight === ROW_HEIGHT ? null : finalHeight });
+		// Wave G3a (Codex/Lane-B MED): post the height from `rowResizeInput` (the user-resize source of truth the
+		// live drag updated), NOT `cellContentRect(...).height` (the COMPOSED model). If the row were hidden by a
+		// concurrent `hiddenRows` message mid-drag, the composed height is 0 -- which the host rejects as malformed,
+		// silently dropping the resize. The input holds the dragged height (undefined === back-to-default -> null).
+		const finalHeight = rowResizeInput.get(row);
+		vscode.postMessage({ type: 'sizeRow', row, height: finalHeight === undefined ? null : finalHeight });
 		rowResizeDrag = null;
 		rowResizeSuppressClick = true;
 		redraw();
@@ -4890,11 +4943,17 @@ canvasEl.addEventListener('pointercancel', ev => {
 		if (ev.pointerId !== rowResizeDrag.pointerId) {
 			return; // not the drag owner
 		}
-		renderer.setRowSizing(withOverride(renderer.rowSizing, rowResizeDrag.row, rowResizeDrag.startHeight));
-		updateSpacer(); // Wave G-rows: revert restored the height -> resync the scrollbar range
+		// Wave G3a: revert this row's INPUT to the pre-drag height (delete if it was the default OR out of the
+		// resize clamp -- e.g. a 0-height hidden row's border), then recompose so the collapse state is preserved.
+		// The host was never told (we only post on pointerup), so re-syncing the input re-syncs with the host.
+		if (rowResizeDrag.startHeight !== ROW_HEIGHT
+			&& rowResizeDrag.startHeight >= MIN_ROW_HEIGHT && rowResizeDrag.startHeight <= MAX_ROW_HEIGHT) {
+			rowResizeInput.set(rowResizeDrag.row, rowResizeDrag.startHeight);
+		} else {
+			rowResizeInput.delete(rowResizeDrag.row);
+		}
 		rowResizeDrag = null;
-		repositionEdit();
-		redraw();
+		recomposeRowSizing(); // Wave G-rows: revert restored the height -> resync the scrollbar/editor/redraw
 		return;
 	}
 	// FE-3 point mode: a hijacked point drag REVERTS the editor to its pre-drag state (no half-pointed ref is
@@ -6448,7 +6507,10 @@ window.addEventListener('message', (event: MessageEvent) => {
 			showError('The host sent a malformed row-sizing update; the rows were not changed.', 'transient');
 			return;
 		}
-		let rebuilt: AxisSizing = emptyAxisSizing(ROW_HEIGHT, MAX_ROWS, MIN_ROW_HEIGHT, MAX_ROW_HEIGHT, MAX_SPACER_PX - HEADER_HEIGHT);
+		// Wave G3a: collect the validated resize entries into a candidate map, then swap it into `rowResizeInput`
+		// and recompose WITH the current hidden-row set (`recomposeRowSizing` is the sole installer). The user
+		// resizes and the engine hidden rows are kept SEPARATE so unhiding restores the user height.
+		const nextResize = new Map<number, number>();
 		for (const entry of rows) {
 			if (
 				!Array.isArray(entry) || entry.length !== 2 ||
@@ -6460,21 +6522,82 @@ window.addEventListener('message', (event: MessageEvent) => {
 				showError('The host sent a malformed row-sizing update; the rows were not changed.', 'transient');
 				return;
 			}
-			// Wave G-rows (Codex audit MED): the aggregate may exceed the spacer cap (the host validates each
-			// entry individually). Contain the `withOverride` throw here -- log loud + leave the CURRENT sizing
-			// unchanged (`rebuilt` is local, never installed), never an uncaught message-handler crash.
-			try {
-				rebuilt = withOverride(rebuilt, entry[0], entry[1]);
-			} catch (e) {
-				console.error('[sheets-webview] rowSizing replay would exceed the max scrollable height; sizing left unchanged:', e);
-				showError('The row-sizing update would exceed the maximum scrollable height; the rows were not changed.', 'transient');
+			nextResize.set(entry[0], entry[1]);
+		}
+		// Commit + recompose. Wave G-rows (Codex audit MED): the AGGREGATE may exceed the spacer cap even though
+		// the host validates each entry individually -- contain the `withOverride` throw, REVERT the input, and
+		// leave the CURRENT sizing unchanged (No-Fallbacks: surface LOUD, never a silent reset to uniform that
+		// would lose the user's heights + mask the bug). On the throw `recomposeRowSizing` never reaches
+		// `setRowSizing` (the throw is in the model build), so the installed model + viewport stay untouched.
+		const prevResize = rowResizeInput;
+		rowResizeInput = nextResize;
+		try {
+			recomposeRowSizing();
+		} catch (e) {
+			rowResizeInput = prevResize;
+			console.error('[sheets-webview] rowSizing replay would exceed the max scrollable height; sizing left unchanged:', e);
+			showError('The row-sizing update would exceed the maximum scrollable height; the rows were not changed.', 'transient');
+		}
+		return;
+	}
+	if (msg.type === 'hiddenRows') {
+		// **Wave G3a (R4)** -- the host's AUTHORITATIVE hidden-row set for the active sheet (mirrored from the
+		// engine's `getHiddenRows`; re-sent on every render + on the webviewReady reload). The webview collapses
+		// each listed row to height 0 by composing the set ON TOP of the user resizes. REPLACE semantics (the
+		// posted array is the FULL set for the sheet) -- a switch/undo that drops rows un-collapses them. No-
+		// Fallbacks: a malformed entry is a WIRING bug -> surface LOUD + leave the CURRENT collapse unchanged.
+		const rows = (msg as { rows?: unknown }).rows;
+		if (!Array.isArray(rows)) {
+			console.warn('[sheets-webview] dropped a malformed hiddenRows message (rows must be an array):', msg);
+			showError('The host sent a malformed hidden-rows update; the rows were not changed.', 'transient');
+			return;
+		}
+		const nextHidden = new Set<number>();
+		for (const entry of rows) {
+			if (typeof entry !== 'number' || !Number.isInteger(entry) || entry < 0 || entry >= MAX_ROWS) {
+				console.warn('[sheets-webview] dropped a malformed hiddenRows entry (expected an int row in [0, MAX_ROWS)):', entry);
+				showError('The host sent a malformed hidden-rows update; the rows were not changed.', 'transient');
 				return;
 			}
+			nextHidden.add(entry);
 		}
-		renderer.setRowSizing(rebuilt);
-		updateSpacer(); // Wave G-rows: the host's override set changed the total height -> resync the scrollbar range
-		repositionEdit();
-		redraw();
+		// If an editor is open on a row about to be HIDDEN, TEAR IT DOWN first -- the SAME way a sheet change does
+		// (Codex HIGH): an overlay editor on a 0-height row is invisible/clipped, and a `commitEdit()` here would
+		// be WRONG -- its `true` only means "posted", not "accepted", so a late `errorReply` would REOPEN the
+		// editor on the now-collapsed row, and a pending commit cancelled without DETACHING would drop its late
+		// outcome. So: capture any pending-commit record, `cancelEdit()` (discards an un-posted edit + closes the
+		// UI), then `detachPendingCommit` so an in-flight commit's ack/error stays visible (No-Fallbacks). Both
+		// surfaces (overlay AND formula bar -- Excel forbids editing a cell whose row is being hidden); the formula
+		// bar isn't 0-height but keeping it open over a hidden cell is the same stale-editor class.
+		if (editState !== null && nextHidden.has(editState.row)) {
+			// Mirror the sheet-change teardown EXACTLY (index.ts ~5734): capture the pending record BEFORE
+			// cancelEdit (which nulls editState); for an OVERLAY editor (`!hadFormulaEditor`) cancelEdit does NOT
+			// tear down the formula assist (autocomplete/signature dropdown), so do it explicitly; then detach the
+			// pending commit so its late ack/error stays visible instead of being dropped.
+			const hadFormulaEditor = formulaBarIsEditing();
+			const pendingToDetach =
+				editState.pendingCommit && editState.commitId !== undefined
+					? { commitId: editState.commitId, sheet: editState.sheet, row: editState.row, col: editState.col }
+					: null;
+			cancelEdit();
+			if (!hadFormulaEditor) {
+				teardownFormulaAssist();
+			}
+			if (pendingToDetach !== null) {
+				detachPendingCommit(pendingToDetach);
+			}
+		}
+		// Commit + recompose. A collapse only DECREASES extent so the cap can never fire from the hidden set;
+		// the catch is purely defensive (and reverts so the inputs never diverge from the installed model).
+		const prevHidden = hiddenRowsInput;
+		hiddenRowsInput = nextHidden;
+		try {
+			recomposeRowSizing();
+		} catch (e) {
+			hiddenRowsInput = prevHidden;
+			console.error('[sheets-webview] hiddenRows recompose failed; collapse left unchanged:', e);
+			showError('The hidden-rows update could not be applied; the rows were not changed.', 'transient');
+		}
 		return;
 	}
 	if (msg.type === 'contextMenuAction') {

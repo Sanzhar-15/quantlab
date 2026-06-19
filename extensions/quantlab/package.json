@@ -467,6 +467,22 @@
         "category": "%command.category%"
       },
       {
+        "_comment": "Wave G3a (R4): Cell Grid context-menu Hide/Unhide rows -- consumes the Wave G2 engine row-visibility substrate (setRowsHidden/getHiddenRows).",
+        "command": "quantlab.quantbookHideRows",
+        "title": "%command.quantbookHideRows.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookUnhideRows",
+        "title": "%command.quantbookUnhideRows.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookUnhideAllRows",
+        "title": "%command.quantbookUnhideAllRows.title%",
+        "category": "%command.category%"
+      },
+      {
         "_comment": "FE-BEYOND B1 (W3): start the Quantbook MCP server (read + write tools).",
         "command": "quantlab.quantbookStartMcpServer",
         "title": "%command.quantbookStartMcpServer.title%",
@@ -1022,6 +1038,19 @@
           "when": "false"
         },
         {
+          "_comment": "Wave G3a (R4): Hide/Unhide rows need the right-click context payload (panelToken + selection); hide from the palette like the structural + freeze commands.",
+          "command": "quantlab.quantbookHideRows",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookUnhideRows",
+          "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookUnhideAllRows",
+          "when": "false"
+        },
+        {
           "_comment": "Watchlist rename/delete/removeSymbol act on the right-clicked Data-tree node; they are meaningless without one.",
           "command": "quantlab.watchlist.rename",
           "when": "false"
@@ -1275,6 +1304,22 @@
           "command": "quantlab.quantbookDeleteColumn",
           "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@6"
+        },
+        {
+          "_comment": "Wave G3a (R4): Hide/Unhide rows over the selected span -- consumes the Wave G2 engine row-visibility substrate. Kept in the 4_structure cluster (row/column ops) after delete; the webview/context when only sees webviewId/webviewSection (no per-item dynamic enablement), so Unhide always appears and no-ops with an info toast when the span has no hidden rows.",
+          "command": "quantlab.quantbookHideRows",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "4_structure@7"
+        },
+        {
+          "command": "quantlab.quantbookUnhideRows",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "4_structure@8"
+        },
+        {
+          "command": "quantlab.quantbookUnhideAllRows",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "4_structure@9"
         },
         {
           "_comment": "FE-4 W2: sort the selected range by a key column. Group 5_data is the new data-ops group below structure (1=clipboard, 2=edit, 3=format, 4=structure, 5=data). Palette-visible (NOT in the commandPalette when:false list).",

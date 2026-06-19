@@ -1520,6 +1520,8 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 			'writeRange', 'publishDataset', 'bindRange', 'refreshSource', 'materializeQuery',
 			'close', 'registerFunction', 'unregisterFunction', 'listFunctions',
 			'snapshotDelta', 'undo', 'redo', 'canUndo', 'canRedo',
+			// Wave G2 / R4 (2026-06-19): the loader now boundary-checks the row-visibility set/get pair.
+			'setRowsHidden', 'getHiddenRows',
 		]) {
 			(fakeSession.prototype as Record<string, unknown>)[m] = function () { /* */ };
 		}

@@ -17,11 +17,13 @@
 import * as assert from 'assert';
 
 import {
+	composeHidden,
 	emptyAxisSizing,
 	indexAtOffset,
 	offsetBefore,
 	sizeAt,
 	totalExtent,
+	withCollapsed,
 	withOverride,
 } from '../src/quantbook/shared/axisSizing';
 import {
@@ -204,6 +206,75 @@ suite('Wave G axisSizing -- loud construction invariants (No-Fallbacks)', functi
 		assert.throws(() => emptyAxisSizing(COL, COLS, 0, MAXW));
 		assert.throws(() => emptyAxisSizing(COL, COLS, MAXW, MINW)); // max < min
 		assert.throws(() => emptyAxisSizing(5, COLS, MINW, MAXW)); // default below min
+	});
+});
+
+suite('Wave G3a axisSizing -- withCollapsed + composeHidden (hidden rows = 0px)', function () {
+	// Use the ROW config (a hidden row is a row concept), with the row spacer cap so the cap-vs-collapse
+	// claim is exercised against the same FINITE cap the live row axis carries.
+	const ROWS = MAX_ROWS;
+	const rowEmpty = () => emptyAxisSizing(ROW_HEIGHT, ROWS, MIN_ROW_HEIGHT, MAX_ROW_HEIGHT, MAX_SPACER_PX - HEADER_HEIGHT);
+
+	test('withCollapsed sets the index to exactly 0 (bypassing the minSize floor withOverride enforces)', () => {
+		const s = withCollapsed(rowEmpty(), 4);
+		assert.strictEqual(sizeAt(s, 4), 0);
+		// withOverride would throw for 0 / below-min; withCollapsed does not.
+		assert.throws(() => withOverride(rowEmpty(), 4, 0));
+		assert.strictEqual(s.overrides.size, 1, 'a 0-entry is stored (0 != defaultSize) so the gate trips');
+	});
+
+	test('withCollapsed is immutable; the source model is untouched', () => {
+		const base = rowEmpty();
+		const s = withCollapsed(base, 3);
+		assert.strictEqual(sizeAt(base, 3), ROW_HEIGHT, 'source unchanged');
+		assert.strictEqual(sizeAt(s, 3), 0);
+	});
+
+	test('withCollapsed throws on a malformed index (No-Fallbacks)', () => {
+		assert.throws(() => withCollapsed(rowEmpty(), -1));
+		assert.throws(() => withCollapsed(rowEmpty(), ROWS));
+		assert.throws(() => withCollapsed(rowEmpty(), 2.5));
+		assert.throws(() => withCollapsed(rowEmpty(), NaN));
+	});
+
+	test('a collapsed row only DECREASES extent -> the spacer cap can never fire', () => {
+		const base = rowEmpty();
+		const before = totalExtent(base);
+		const s = withCollapsed(base, 7);
+		assert.strictEqual(totalExtent(s), before - ROW_HEIGHT);
+		assert.ok(totalExtent(s) < base.maxTotalExtent);
+	});
+
+	test('offsetBefore plateaus across a collapsed band; indexAtOffset returns the FIRST VISIBLE row after it', () => {
+		// Hide rows 4 and 5: offsets at 4,5,6 collapse onto the same value, and a hit at that offset
+		// resolves to row 6 (the first visible row past the band) -- hidden rows are never hit-tested.
+		const s = composeHidden(rowEmpty(), [4, 5]);
+		assert.strictEqual(offsetBefore(s, 4), 4 * ROW_HEIGHT);
+		assert.strictEqual(offsetBefore(s, 5), 4 * ROW_HEIGHT, 'row 4 contributes 0');
+		assert.strictEqual(offsetBefore(s, 6), 4 * ROW_HEIGHT, 'rows 4,5 contribute 0');
+		assert.strictEqual(offsetBefore(s, 7), 5 * ROW_HEIGHT, 'row 6 visible again');
+		assert.strictEqual(indexAtOffset(s, 4 * ROW_HEIGHT), 6, 'collapsed-band offset -> first visible row after');
+		assert.strictEqual(sizeAt(s, 4), 0);
+		assert.strictEqual(sizeAt(s, 5), 0);
+		assert.strictEqual(sizeAt(s, 6), ROW_HEIGHT);
+	});
+
+	test('composeHidden over an EMPTY set returns the base UNCHANGED (same reference -- the keystone)', () => {
+		const base = withOverride(rowEmpty(), 2, 60); // a resize, no hidden
+		assert.strictEqual(composeHidden(base, []), base);
+		assert.strictEqual(composeHidden(base, new Set<number>()), base);
+	});
+
+	test('compose order is resize-then-collapse: a hidden row shadows its resize to 0...', () => {
+		const resized = withOverride(rowEmpty(), 3, 80);
+		const composed = composeHidden(resized, [3]);
+		assert.strictEqual(sizeAt(composed, 3), 0, 'hidden wins over the resize');
+		// ...and UNHIDING (recomposing from the SEPARATE resize input with an empty hidden set) restores 80px.
+		assert.strictEqual(sizeAt(composeHidden(resized, []), 3), 80, 'unhide restores the user resize height');
+	});
+
+	test('composeHidden throws on an out-of-extent hidden index (contained at the webview boundary)', () => {
+		assert.throws(() => composeHidden(rowEmpty(), [2, ROWS + 1]));
 	});
 });
 

@@ -467,6 +467,15 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 			if (typeof sproto['nudgeDecimalsPreview'] !== 'function') {
 				missing.push('Session.prototype.nudgeDecimalsPreview (Wave C / R9)');
 			}
+			// **Wave G2 / R4 (2026-06-19):** per-sheet row visibility -- set/get the hidden-row set
+			// (the engine substrate the Wave G3a collapsing renderer consumes). A stale cdylib
+			// (pre-Wave-G2) lacks these -- fail loud at the loader boundary, not at the
+			// `setRowsHidden is not a function` use site inside the Hide/Unhide command.
+			for (const method of ['setRowsHidden', 'getHiddenRows']) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (Wave G2 / R4)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

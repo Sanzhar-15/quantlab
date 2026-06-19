@@ -253,6 +253,54 @@ export function setFormulaValidated(
 }
 
 /**
+ * **Wave G2 / R4 (2026-06-19)** -- typed wrapper for `Session.setRowsHidden` with JS-side validation.
+ * Mirrors {@link setValueValidated}'s coordinate discipline (validate sheet + each row BEFORE the napi
+ * boundary so a non-integer/negative/over-range value surfaces `[bad_argument]` instead of a silent
+ * ToUint32 wrap). One call appends ONE `Op::SetRowsHidden` => one undo step. The caller (the Hide/Unhide
+ * command) is responsible for bounding the `rows` length to the used range (the engine validates each row
+ * but a multi-million-element array is the caller's to avoid).
+ *
+ * @throws Error (`parseQuantbookError(err).code === 'bad_argument'`) on an out-of-range sheet/row or a
+ *         non-array `rows` / non-boolean `hidden`.
+ */
+export function setRowsHiddenValidated(
+	session: SessionInstance,
+	sheet: number,
+	rows: number[],
+	hidden: boolean,
+): void {
+	if (!Number.isInteger(sheet) || sheet < 0 || sheet > 0xFFFF) {
+		throw new Error(`[bad_argument] setRowsHidden: sheet must be an integer in [0, 65535], got ${sheet}`);
+	}
+	if (!Array.isArray(rows)) {
+		throw new Error(`[bad_argument] setRowsHidden: rows must be an array, got ${typeof rows}`);
+	}
+	for (let i = 0; i < rows.length; i += 1) {
+		const r = rows[i];
+		if (!Number.isInteger(r) || r < 0 || r > 0xFFFFFFFF) {
+			throw new Error(`[bad_argument] setRowsHidden: rows[${i}] must be an integer in [0, 4294967295], got ${r}`);
+		}
+	}
+	if (typeof hidden !== 'boolean') {
+		throw new Error(`[bad_argument] setRowsHidden: hidden must be a boolean, got ${typeof hidden}`);
+	}
+	session.setRowsHidden(sheet, rows, hidden);
+}
+
+/**
+ * **Wave G2 / R4 (2026-06-19)** -- typed wrapper for `Session.getHiddenRows` (the sorted hidden-row set on
+ * `sheet`). Pure read; validates only the sheet coordinate before the boundary.
+ *
+ * @throws Error (`parseQuantbookError(err).code === 'bad_argument'`) on an out-of-range sheet.
+ */
+export function getHiddenRowsChecked(session: SessionInstance, sheet: number): number[] {
+	if (!Number.isInteger(sheet) || sheet < 0 || sheet > 0xFFFF) {
+		throw new Error(`[bad_argument] getHiddenRows: sheet must be an integer in [0, 65535], got ${sheet}`);
+	}
+	return session.getHiddenRows(sheet);
+}
+
+/**
  * **FE-0a Part B (B1)** -- run an incremental recalc on the owning `Session` and
  * surface a failed operation loudly (No-Fallbacks). Unlike `CollabSession`, where
  * `appendPutValue` recomputes during op-apply, `Session.setValue` only marks
