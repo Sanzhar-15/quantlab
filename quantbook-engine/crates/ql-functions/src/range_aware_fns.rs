@@ -89,6 +89,17 @@ pub enum FnArg {
         values: Vec<Value>,
         rows: usize,
         cols: usize,
+        /// **Wave G2 (engine-filter):** a RANGE-RELATIVE row-visibility mask —
+        /// `row_hidden[i]` is `true` iff the range's `i`-th row (0 == the range's
+        /// FIRST row) is hidden on the source sheet. Length is `rows` when
+        /// populated, or **EMPTY when no row in the range is hidden** (the common
+        /// case — the materializer skips building it unless the sheet carries
+        /// hidden rows). The ONLY consumer is `SUBTOTAL(101..=111)`, which skips a
+        /// value when its range-row is hidden; every other range-aware function
+        /// IGNORES this field, so an empty mask is byte-identical to pre-Wave-G2
+        /// behaviour. Range-relative (not absolute sheet rows) so `SUBTOTAL`
+        /// maps a flat value index `i` to its mask slot via `i / cols`.
+        row_hidden: Vec<bool>,
     },
 }
 
@@ -105,6 +116,8 @@ impl FnArg {
             values,
             rows: 1,
             cols,
+            // No visibility info — all rows visible (Wave G2).
+            row_hidden: Vec::new(),
         }
     }
 
@@ -112,7 +125,36 @@ impl FnArg {
     #[cfg(test)]
     pub fn range_2d(values: Vec<Value>, rows: usize, cols: usize) -> Self {
         debug_assert_eq!(rows * cols, values.len(), "shape mismatch");
-        FnArg::Range { values, rows, cols }
+        FnArg::Range {
+            values,
+            rows,
+            cols,
+            // No visibility info — all rows visible (Wave G2).
+            row_hidden: Vec::new(),
+        }
+    }
+
+    /// **Wave G2 (engine-filter):** construct a 2D `Range` carrying a
+    /// range-relative row-visibility mask (see [`FnArg::Range::row_hidden`]).
+    /// The eval materializer uses this when the source sheet has hidden rows so
+    /// `SUBTOTAL(101..=111)` can skip them; pass an EMPTY `row_hidden` for the
+    /// all-visible common case (equivalent to `range_2d`).
+    pub fn range_with_visibility(
+        values: Vec<Value>,
+        rows: usize,
+        cols: usize,
+        row_hidden: Vec<bool>,
+    ) -> Self {
+        debug_assert!(
+            row_hidden.is_empty() || row_hidden.len() == rows,
+            "row_hidden must be empty or length == rows"
+        );
+        FnArg::Range {
+            values,
+            rows,
+            cols,
+            row_hidden,
+        }
     }
 
     /// Convenience for tests + scalar-only call sites: returns the

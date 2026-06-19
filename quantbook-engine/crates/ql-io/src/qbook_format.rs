@@ -213,7 +213,15 @@ use thiserror::Error;
 ///     past the gate, `StylesSection`'s `deny_unknown_fields` would reject the
 ///     new `StyleWire` keys, so a stale reader fails loudly rather than
 ///     silently dropping the font attrs.
-pub const WORKBOOK_SCHEMA_VERSION: u32 = 10;
+///   - **v11 (Wave G2 engine-filter, 2026-06-18):** adds the per-sheet
+///     `hidden_rows: Option<Vec<u32>>` section (row-visibility for
+///     `SUBTOTAL(101..=111)` / the future autofilter). Additive `Option` with
+///     `#[serde(default)]`, so a v11 reader loads v1-v10 envelopes (absent ⇒ no
+///     hidden rows); a v<11 reader loading a v11 file is refused at the
+///     schema-version gate, and the `SheetEnvelope`'s `deny_unknown_fields`
+///     would also reject the new `hidden_rows` key — a stale reader fails
+///     loudly rather than silently dropping the hidden-row state.
+pub const WORKBOOK_SCHEMA_VERSION: u32 = 11;
 
 /// The earliest schema version this reader still accepts. v1 fixtures (Phase 1)
 /// continue to load on v2 binaries; older versions would need explicit handling.
@@ -363,6 +371,17 @@ pub enum QbookError {
         sheet: u16,
         row: u32,
         col: u32,
+        why: &'static str,
+    },
+
+    /// **Wave G2 (engine-filter; v11):** a hidden-row id in the envelope's
+    /// per-sheet `hidden_rows` set is out of range (`row > MAX_ROW`). Mirrors
+    /// [`Self::MalformedStyleOverlay`] — corrupt input fails loud (No-Fallbacks)
+    /// rather than silently dropping the entry.
+    #[error("malformed hidden-row entry on sheet {sheet}: row={row} ({why})")]
+    MalformedHiddenRows {
+        sheet: u16,
+        row: u32,
         why: &'static str,
     },
 
@@ -640,6 +659,13 @@ pub struct SheetEnvelope {
     /// v1-v8 envelopes lack the field; the loader maps `None` → empty overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub style_overlay: Option<Vec<StyleOverlayEntry>>,
+    /// **Wave G2 (engine-filter; schema v11, 2026-06-18):** per-sheet sparse
+    /// hidden-ROW set (ascending row ids). `None` ≡ "no hidden rows on this
+    /// sheet"; omitted on save for an empty set (TOML stays minimal). v1-v10
+    /// envelopes lack the field; the loader maps `None` → empty set. The
+    /// `SUBTOTAL(101..=111)` variants read it (via `Sheet::hidden_rows`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_rows: Option<Vec<u32>>,
 }
 
 /// **W5-81 (Phase 4.5.D part 5):** workbook-level format-table wire format.
@@ -1373,6 +1399,18 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
                 Some(entries)
             }
         };
+        // **Wave G2 (engine-filter; schema v11):** serialize the per-sheet
+        // hidden-row set if non-empty (mirrors `format_overlay`). The
+        // `BTreeSet` already iterates ascending, so the Vec is sorted for
+        // deterministic on-disk diffs. `None` ≡ "no hidden rows on this sheet".
+        let hidden_rows = {
+            let set = sheet.hidden_rows();
+            if set.is_empty() {
+                None
+            } else {
+                Some(set.iter().copied().collect::<Vec<u32>>())
+            }
+        };
         sheet_envelopes.push(SheetEnvelope {
             id: sheet_id,
             name: sheet.name().to_owned(),
@@ -1381,6 +1419,7 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
             col_extent: env_col_extent,
             format_overlay,
             style_overlay,
+            hidden_rows,
         });
     }
 
@@ -1809,6 +1848,23 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
         }
     }
 
+    // **Wave G2 (v11):** post-deserialize guard — a file declaring
+    // `schema_version < 11` must NOT carry the v11-only per-sheet `hidden_rows`
+    // field. serde's `#[serde(default)]` would accept a hand-edited mislabeled
+    // file into `Some(_)` silently; we refuse loudly (mirrors the < 7 / < 8
+    // guards above; closes the Codex LOW). A correctly-versioned (>= 11) file is
+    // unaffected.
+    if schema_version < 11 {
+        for sheet in &envelope.sheets {
+            if sheet.hidden_rows.is_some() {
+                return Err(QbookError::ForwardCompatFieldOnOldVersion {
+                    schema_version,
+                    field: "sheets[].hidden_rows",
+                });
+            }
+        }
+    }
+
     // **W5-145 (Phase 4.9.I):** apply v7 fields if present. Unknown
     // locale strings surface as `QbookError::UnknownLocale` (closes
     // Sonnet M-2) — the custom Deserialize captured the string into
@@ -1984,6 +2040,24 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                     });
                 }
                 sheet_mut.style_overlay_mut().set(entry.row, entry.col, sid);
+            }
+        }
+
+        // **Wave G2 (engine-filter; v11):** apply the per-sheet hidden-row set
+        // (mirrors the overlays). A row past `MAX_ROW` is corrupt input and
+        // fails loud (No-Fallbacks). v1-v10 envelopes lack the field (None → no
+        // hidden rows on this sheet).
+        if let Some(ref rows) = sheet_env.hidden_rows {
+            let sheet_mut = wb.sheet_mut(sheet_id).expect("just-added sheet must exist");
+            for &row in rows {
+                if row > MAX_ROW {
+                    return Err(QbookError::MalformedHiddenRows {
+                        sheet: sheet_id,
+                        row,
+                        why: "out-of-range row",
+                    });
+                }
+                sheet_mut.set_row_hidden(row, true);
             }
         }
 
@@ -3430,6 +3504,88 @@ sheets = [
         assert_eq!(loaded.sheet(s0).unwrap().format_overlay().get(10, 20), None);
     }
 
+    #[test]
+    fn per_sheet_hidden_rows_round_trips() {
+        // **Wave G2 (engine-filter; v11):** hide rows on sheet A, leave B all
+        // visible. Save → load must restore A's set exactly (sorted), keep B
+        // empty (the None-omit path), and not leak A's hidden rows onto B.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("hidden.qbook");
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("A");
+        let s1 = wb.add_sheet("B");
+        wb.sheet_mut(s0).unwrap().set_row_hidden(7, true);
+        wb.sheet_mut(s0).unwrap().set_row_hidden(2, true);
+        save_workbook(&wb, "hidden", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(
+            loaded
+                .sheet(s0)
+                .unwrap()
+                .hidden_rows()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2, 7],
+            "sheet A hidden rows round-trip ascending"
+        );
+        assert!(
+            loaded.sheet(s1).unwrap().hidden_rows().is_empty(),
+            "sheet B has no hidden rows (None on save → empty on load)"
+        );
+    }
+
+    #[test]
+    fn empty_hidden_rows_is_omitted_from_envelope_toml() {
+        // No hidden rows ⇒ the `hidden_rows` key is OMITTED from the envelope
+        // (skip_serializing_if), so a v<11 reader never trips on it for an
+        // all-visible workbook — the byte-level forward-compat guarantee.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("plain.qbook");
+        let wb = wb_with("S", &[cell(0, 0, Value::Number(1.0))]);
+        save_workbook(&wb, "plain", &path).unwrap();
+        let toml = std::fs::read_to_string(path.join("workbook.toml")).unwrap();
+        assert!(
+            !toml.contains("hidden_rows"),
+            "an all-visible workbook must not emit a hidden_rows key"
+        );
+    }
+
+    #[test]
+    fn v10_envelope_carrying_hidden_rows_is_rejected() {
+        // **(Codex LOW):** a hand-edited file declaring `schema_version = 10` but
+        // carrying the v11-only `hidden_rows` field must be refused LOUDLY (not
+        // silently accepted via serde(default)) — the schema-bump/No-Fallbacks
+        // contract. Mirrors the v7 `reference_mode` / v8 tagged-id guards.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mislabeled.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 10
+name = "mislabeled"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+hidden_rows = [2, 4]
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        match load_workbook(&path) {
+            Err(QbookError::ForwardCompatFieldOnOldVersion {
+                schema_version,
+                field,
+            }) => {
+                assert_eq!(schema_version, 10);
+                assert_eq!(field, "sheets[].hidden_rows");
+            }
+            other => panic!("expected ForwardCompatFieldOnOldVersion, got {other:?}"),
+        }
+    }
+
     // -- M7 (6.3-2b): effective-extent save --------------------------------------
 
     #[test]
@@ -4589,13 +4745,15 @@ col_extent = 1
     /// "future" probe to v9.
     /// **FE-7 (2026-06-13):** v10 is now current (font attrs); bumped
     /// "future" probe to v11.
+    /// **Wave G2 (2026-06-18):** v11 is now current (per-sheet `hidden_rows`);
+    /// bumped "future" probe to v12.
     #[test]
     fn future_schema_version_rejected() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("future.qbook");
         fs::create_dir_all(path.join("sheets")).unwrap();
         let toml = r#"
-schema_version = 11
+schema_version = 12
 name = "future"
 
 [[sheets]]
@@ -4610,7 +4768,7 @@ col_extent = 0
 
         let result = load_workbook(&path);
         assert!(
-            matches!(result, Err(QbookError::UnsupportedSchema { found: 11 })),
+            matches!(result, Err(QbookError::UnsupportedSchema { found: 12 })),
             "expected UnsupportedSchema, got {result:?}"
         );
     }
@@ -4764,7 +4922,9 @@ col_extent = 0
         // section + per-sheet `style_overlay` section (cell-style foundation).
         // FE-7 (2026-06-13) bumped from 9 to 10: added the font attrs
         // underline / strike / text_color to the StyleWire value in `styles`.
-        assert_eq!(WORKBOOK_SCHEMA_VERSION, 10);
+        // Wave G2 (2026-06-18) bumped from 10 to 11: added the per-sheet
+        // `hidden_rows` section (row-visibility for SUBTOTAL 101..=111).
+        assert_eq!(WORKBOOK_SCHEMA_VERSION, 11);
     }
 
     #[test]

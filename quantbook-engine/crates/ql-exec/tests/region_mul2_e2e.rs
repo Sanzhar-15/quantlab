@@ -792,11 +792,12 @@ fn e2e_subtotal_scalar_args_dispatch() {
 }
 
 #[test]
-fn e2e_subtotal_109_normalizes_to_sum() {
-    // **W5-D-12.1 (Codex HIGH-001 closure):** verify the 101..=111
-    // normalization path is reachable through the real binder +
-    // dispatcher. SUBTOTAL(109, 10, 20, 30) ≡ SUM-style dispatch
-    // (v1 has no hidden-row metadata) → 60.
+fn e2e_subtotal_109_sum_over_scalar_args() {
+    // **W5-D-12.1 (Codex HIGH-001 closure):** verify the 101..=111 dispatch
+    // path is reachable through the real binder + dispatcher. SUBTOTAL(109, ...)
+    // ≡ SUM. **Wave G2:** SCALAR data args carry no row, so there is nothing to
+    // hide here — 109 sums all → 60. (Hidden-row SKIP is exercised by the
+    // range-based unit tests in `ql-functions::range_fns` and the session e2e.)
     assert_eq!(
         eval_source_with_registry("SUBTOTAL(109, 10, 20, 30)", &[]),
         Value::Number(60.0)

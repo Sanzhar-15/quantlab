@@ -453,6 +453,27 @@ pub enum Op {
         id: Option<crate::wire::StyleIdWire>,
     },
 
+    /// **Wave G2 (engine-filter):** hide (`hidden = true`) or show
+    /// (`hidden = false`) a set of ROWS on `sheet`. Replays to
+    /// `Sheet::set_row_hidden` per row. A row in the hidden set is excluded by
+    /// the `SUBTOTAL(101..=111)` "ignore hidden rows" variants. `rows` may carry
+    /// one row (a gutter "hide row" action) or many (a future autofilter).
+    ///
+    /// Tombstoned sheet → silent no-op (mirrors `SetCellStyle` / `PutValue`). A
+    /// row past `MAX_ROW` surfaces as `ReplayError::InvalidCell` (all rows are
+    /// validated BEFORE any mutation, so replay is atomic). The hidden set is a
+    /// pure ROW attribute: it re-keys on `Op::InsertRows`/`DeleteRows` (via the
+    /// storage `shift_rows`) and is UNTOUCHED by column structural edits.
+    ///
+    /// **Wire format compatibility**: additive new variant on the serde-tagged
+    /// enum; `OPLOG_SCHEMA_VERSION` NOT bumped (consistent with every prior
+    /// variant addition). Forward-compat caveat per the `RemoveSheet` docstring.
+    SetRowsHidden {
+        sheet: SheetId,
+        rows: Vec<RowId>,
+        hidden: bool,
+    },
+
     /// **W3 (insert/delete rows & columns):** insert `count` blank rows at
     /// row index `at` on `sheet` (0-indexed; `at` is the row that the new
     /// blank rows push DOWN). Replays to `Workbook::insert_rows`, which

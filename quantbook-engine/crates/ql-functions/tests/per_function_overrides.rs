@@ -23,12 +23,18 @@ fn r(values: Vec<Value>) -> FnArg {
         values,
         rows: 1,
         cols,
+        row_hidden: Vec::new(),
     }
 }
 
 fn r2d(values: Vec<Value>, rows: usize, cols: usize) -> FnArg {
     assert_eq!(rows * cols, values.len(), "shape mismatch in r2d");
-    FnArg::Range { values, rows, cols }
+    FnArg::Range {
+        values,
+        rows,
+        cols,
+        row_hidden: Vec::new(),
+    }
 }
 
 fn s(v: Value) -> FnArg {

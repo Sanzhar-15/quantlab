@@ -2443,6 +2443,7 @@ mod tests {
             values: vs,
             rows: 1,
             cols,
+            row_hidden: Vec::new(),
         }
     }
     fn s(v: Value) -> FnArg {
@@ -2473,6 +2474,7 @@ mod tests {
             values: vec![],
             rows: 0,
             cols: 0,
+            row_hidden: Vec::new(),
         };
         assert_eq!(npv(&[s(n(0.1)), empty]), Value::Error(ErrorValue::Num));
     }
@@ -2753,6 +2755,7 @@ mod tests {
             values: vec![],
             rows: 0,
             cols: 0,
+            row_hidden: Vec::new(),
         };
         assert_eq!(sharpe(&[empty]), Value::Error(ErrorValue::Num));
     }
@@ -2885,6 +2888,7 @@ mod tests {
             values: vec![],
             rows: 0,
             cols: 0,
+            row_hidden: Vec::new(),
         };
         assert_eq!(max_drawdown(&[empty]), Value::Error(ErrorValue::Num));
     }
@@ -3028,6 +3032,7 @@ mod tests {
             values: vec![],
             rows: 0,
             cols: 0,
+            row_hidden: Vec::new(),
         };
         assert_eq!(volatility(&[empty]), Value::Error(ErrorValue::Num));
     }
@@ -3156,6 +3161,7 @@ mod tests {
             values: vec![],
             rows: 0,
             cols: 0,
+            row_hidden: Vec::new(),
         };
         assert_eq!(sortino(&[empty]), Value::Error(ErrorValue::Num));
     }

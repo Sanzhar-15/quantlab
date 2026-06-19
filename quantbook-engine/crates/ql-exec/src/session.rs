@@ -2011,6 +2011,46 @@ impl EngineSession for WorkbookSession {
             .map_err(map_runtime_err)
     }
 
+    fn set_rows_hidden(
+        &mut self,
+        sheet: SheetId,
+        rows: &[RowId],
+        hidden: bool,
+    ) -> EngineResult<()> {
+        self.ensure_ready()?;
+        self.require_live_sheet(sheet, "set_rows_hidden")?;
+        // The runtime appends ONE `Op::SetRowsHidden` (state-changing rows only),
+        // mutates the hidden set, and dirties the SUBTOTAL dependents.
+        //
+        // We deliberately record NO per-cell `SessionChange` here (Opus-fork MED):
+        // a hidden row's cell VALUES do not change, so the snapshot delta needs
+        // nothing for those cells. The visibility METADATA reaches the client via
+        // `hidden_rows()` (a pull), not the cell delta; and the SUBTOTAL recompute
+        // records its OWN changed cells through the standard recalc path. Emitting
+        // `rows x col_extent` Cell changes here would both over-record unchanged
+        // cells AND allocate O(rows x col_extent) up-front — fine for a single
+        // gutter-hide, but a wide-sheet autofilter hiding 100k rows would blow up.
+        // (The delta consumer's `classify_delta_op` already forces a full rebuild
+        // when an `Op::SetRowsHidden` lands in the delta window, so the cache-only
+        // read path stays correct.)
+        self.with_runtime(|rt| rt.set_rows_hidden(sheet, rows, hidden))
+            .map_err(map_runtime_err)?;
+        Ok(())
+    }
+
+    fn hidden_rows(&self, sheet: SheetId) -> EngineResult<Vec<RowId>> {
+        self.ensure_readable()?;
+        self.require_live_sheet(sheet, "hidden_rows")?;
+        Ok(self
+            .workbook
+            .sheet(sheet)
+            .expect("require_live_sheet guards sheet bounds")
+            .hidden_rows()
+            .iter()
+            .copied()
+            .collect())
+    }
+
     fn validate_formula(&self, addr: CellAddr, text: &str) -> EngineResult<Vec<Diagnostic>> {
         self.ensure_readable()?;
         self.require_live_sheet(addr.sheet, "validate_formula")?;
@@ -9161,6 +9201,99 @@ mod tests {
             d4.value,
             Some(CellValue::Number { number: 300.0 }),
             "recomputed value must still be 300 after the shift"
+        );
+    }
+
+    /// **Wave G2 (engine-filter) e2e.** The full hidden-row → SUBTOTAL path on
+    /// the REAL `WorkbookSession`: `set_rows_hidden` mutates the hidden set AND
+    /// dirties the SUBTOTAL dependents, so `recalc_dirty` recomputes
+    /// `SUBTOTAL(101..=111)` to SKIP the hidden rows while `SUBTOTAL(1..=11)`
+    /// keeps them. Also exercises the `hidden_rows` getter and the unhide path.
+    #[test]
+    fn owning_session_set_rows_hidden_subtotal_skips_then_unhides() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // A1:A4 = 10, 20, 30, 40.
+        for (row, v) in [(0, 10.0), (1, 20.0), (2, 30.0), (3, 40.0)] {
+            s.set_value(addr(sheet, row, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        // B1 = SUBTOTAL(109, A1:A4) (SUM skip-hidden); B2 = SUBTOTAL(9, A1:A4).
+        s.set_formula(addr(sheet, 0, 1), "SUBTOTAL(109, A1:A4)").unwrap();
+        s.set_formula(addr(sheet, 1, 1), "SUBTOTAL(9, A1:A4)").unwrap();
+        let b = |s: &WorkbookSession, row| s.cell(addr(sheet, row, 1)).unwrap().unwrap().value;
+        // All visible → both 100.
+        assert_eq!(b(&s, 0), Some(CellValue::Number { number: 100.0 }));
+        assert_eq!(b(&s, 1), Some(CellValue::Number { number: 100.0 }));
+
+        // Hide row index 1 (A2 = 20) and recompute.
+        s.set_rows_hidden(sheet, &[1], true).unwrap();
+        s.recalc_dirty().unwrap();
+        // 109 SKIPS A2 → 100 - 20 = 80; 9 keeps it → 100.
+        assert_eq!(
+            b(&s, 0),
+            Some(CellValue::Number { number: 80.0 }),
+            "SUBTOTAL(109) must skip the hidden row after recalc"
+        );
+        assert_eq!(
+            b(&s, 1),
+            Some(CellValue::Number { number: 100.0 }),
+            "SUBTOTAL(9) must NOT skip hidden rows"
+        );
+        assert_eq!(s.hidden_rows(sheet).unwrap(), vec![1]);
+
+        // Unhide → B1 back to 100.
+        s.set_rows_hidden(sheet, &[1], false).unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(b(&s, 0), Some(CellValue::Number { number: 100.0 }));
+        assert!(s.hidden_rows(sheet).unwrap().is_empty());
+    }
+
+    /// **Wave G2 (engine-filter) — formula IN a hidden row + undo (audit LOWs).**
+    /// (1) A non-SUBTOTAL formula living INSIDE a hidden row still computes
+    /// (firing `on_set_value` on a formula cell is a harmless idempotent
+    /// re-eval). (2) `undo` of a `SetRowsHidden` restores BOTH the hidden set
+    /// AND recomputes the visibility-sensitive SUBTOTAL (via `rematerialize`).
+    #[test]
+    fn owning_session_formula_in_hidden_row_and_undo_restores() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (row, v) in [(0, 10.0), (1, 20.0), (2, 30.0), (3, 40.0)] {
+            s.set_value(addr(sheet, row, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        // A plain formula cell that LIVES IN the row we will hide (C3 = A1 + A2).
+        s.set_formula(addr(sheet, 2, 2), "A1 + A2").unwrap();
+        // A SUBTOTAL that will skip the hidden row.
+        s.set_formula(addr(sheet, 0, 1), "SUBTOTAL(109, A1:A4)").unwrap();
+        let v = |s: &WorkbookSession, r, c| s.cell(addr(sheet, r, c)).unwrap().unwrap().value;
+        assert_eq!(v(&s, 0, 1), Some(CellValue::Number { number: 100.0 }));
+        assert_eq!(v(&s, 2, 2), Some(CellValue::Number { number: 30.0 }));
+
+        // Hide row 2 (A3 = 30, and the formula cell C3 lives there). Recompute.
+        s.set_rows_hidden(sheet, &[2], true).unwrap();
+        s.recalc_dirty().unwrap();
+        // The plain formula IN the hidden row still computes (visibility-agnostic).
+        assert_eq!(
+            v(&s, 2, 2),
+            Some(CellValue::Number { number: 30.0 }),
+            "a non-SUBTOTAL formula in a hidden row still evaluates"
+        );
+        // SUBTOTAL(109) skips the hidden row 2 (A3 = 30) → 100 - 30 = 70.
+        assert_eq!(v(&s, 0, 1), Some(CellValue::Number { number: 70.0 }));
+        assert_eq!(s.hidden_rows(sheet).unwrap(), vec![2]);
+
+        // Undo the hide → rematerialize restores the empty hidden set AND
+        // recomputes the SUBTOTAL back to 100 (no explicit recalc needed).
+        assert!(s.undo().unwrap().consumed);
+        assert!(
+            s.hidden_rows(sheet).unwrap().is_empty(),
+            "undo restores the hidden set"
+        );
+        assert_eq!(
+            v(&s, 0, 1),
+            Some(CellValue::Number { number: 100.0 }),
+            "undo recomputes the SUBTOTAL back to the all-visible value"
         );
     }
 

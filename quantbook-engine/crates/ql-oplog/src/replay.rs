@@ -1057,6 +1057,51 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             }
             Ok(())
         }
+        // **Wave G2 (engine-filter):** hide/show a set of rows. Mirrors
+        // `SetCellStyle`'s VALIDATE-then-tombstone order: every row is validated
+        // BEFORE the tombstone no-op, so a bad row aborts the whole op atomically
+        // (No-Fallbacks — never a partial hidden set) REGARDLESS of whether the
+        // sheet is tombstoned. **(Codex HIGH):** this ordering is load-bearing —
+        // collab's `op_statically_aborts_batch` rejects `row > MAX_ROW`
+        // UNCONDITIONALLY, so if replay let a bad-row op no-op on a tombstoned
+        // sheet (validating AFTER the tombstone check), a batch with such an op +
+        // a valid live-sheet op would replay OK while the cache walker suppressed
+        // the whole batch -> `last_snapshot` divergence. Validating first keeps
+        // replay and the static batch-abort in lockstep.
+        Op::SetRowsHidden {
+            sheet,
+            rows,
+            hidden,
+        } => {
+            let count = workbook.sheet_count();
+            if (*sheet as usize) >= count {
+                return Err(ReplayError::InvalidSheet {
+                    index,
+                    sheet: *sheet,
+                    sheet_count: count,
+                });
+            }
+            // Validate ALL rows up-front (before the tombstone no-op — see above).
+            for &row in rows {
+                if row > MAX_ROW {
+                    return Err(ReplayError::InvalidCell {
+                        index,
+                        row,
+                        col: 0,
+                        why: "hidden row exceeds MAX_ROW (1,048,575)",
+                    });
+                }
+            }
+            // Tombstoned sheet → silent no-op (mirrors SetCellStyle).
+            if workbook.is_sheet_removed(*sheet) {
+                return Ok(());
+            }
+            let s = workbook.sheet_mut(*sheet).expect("sheet validated above");
+            for &row in rows {
+                s.set_row_hidden(row, *hidden);
+            }
+            Ok(())
+        }
         // **W3 (insert/delete rows & columns):** the structural edit's
         // POSITIONAL shift. The accompanying formula-TEXT rewrite rides as
         // separate `Op::PutFormula` ops in the enclosing `BatchCommit`. A
@@ -2564,6 +2609,120 @@ mod tests {
                 assert_eq!(id, ql_storage::StyleId::new(ql_types::LEGACY_PEER, 99));
             }
             other => panic!("expected StyleNotRegistered, got {other:?}"),
+        }
+    }
+
+    // ===== Wave G2 (engine-filter) — SetRowsHidden replay =====
+
+    #[test]
+    fn replay_set_rows_hidden_applies_to_sheet() {
+        let mut log = OpLog::new();
+        log.append(Op::SetRowsHidden {
+            sheet: 0,
+            rows: vec![2, 4, 7],
+            hidden: true,
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        let hidden = wb.sheet(0).unwrap().hidden_rows();
+        assert_eq!(hidden.iter().copied().collect::<Vec<_>>(), vec![2, 4, 7]);
+    }
+
+    #[test]
+    fn replay_set_rows_hidden_false_shows_rows() {
+        let mut log = OpLog::new();
+        log.append(Op::SetRowsHidden {
+            sheet: 0,
+            rows: vec![2, 4],
+            hidden: true,
+        })
+        .unwrap();
+        log.append(Op::SetRowsHidden {
+            sheet: 0,
+            rows: vec![2],
+            hidden: false,
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        let hidden = wb.sheet(0).unwrap().hidden_rows();
+        assert_eq!(hidden.iter().copied().collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn replay_set_rows_hidden_row_past_max_errors_atomically() {
+        let mut log = OpLog::new();
+        // Second row is out of range — the whole op must abort, leaving NO
+        // partial hidden set (No-Fallbacks atomicity).
+        log.append(Op::SetRowsHidden {
+            sheet: 0,
+            rows: vec![3, MAX_ROW + 1],
+            hidden: true,
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        match replay_into(&log, &mut wb, &reg) {
+            Err(ReplayError::InvalidCell { index, row, .. }) => {
+                assert_eq!(index, 0);
+                assert_eq!(row, MAX_ROW + 1);
+            }
+            other => panic!("expected InvalidCell, got {other:?}"),
+        }
+        // The valid row 3 must NOT have been applied (atomic abort).
+        assert!(wb.sheet(0).unwrap().hidden_rows().is_empty());
+    }
+
+    #[test]
+    fn replay_set_rows_hidden_unknown_sheet_errors() {
+        let mut log = OpLog::new();
+        log.append(Op::SetRowsHidden {
+            sheet: 9,
+            rows: vec![1],
+            hidden: true,
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        match replay_into(&log, &mut wb, &reg) {
+            Err(ReplayError::InvalidSheet { index, sheet, .. }) => {
+                assert_eq!(index, 0);
+                assert_eq!(sheet, 9);
+            }
+            other => panic!("expected InvalidSheet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_set_rows_hidden_bad_row_errors_even_on_tombstoned_sheet() {
+        // **(Codex HIGH):** a bad row must abort replay BEFORE the tombstone
+        // no-op, so the op never silently no-ops on a tombstoned sheet while
+        // collab's `op_statically_aborts_batch` (which rejects row > MAX_ROW
+        // UNCONDITIONALLY) suppresses the batch -> no last_snapshot divergence.
+        let mut log = OpLog::new();
+        log.append(Op::RemoveSheet { id: 0 }).unwrap(); // tombstone sheet 0
+        log.append(Op::SetRowsHidden {
+            sheet: 0,
+            rows: vec![MAX_ROW + 1],
+            hidden: true,
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        match replay_into(&log, &mut wb, &reg) {
+            Err(ReplayError::InvalidCell { index, row, .. }) => {
+                assert_eq!(index, 1, "the SetRowsHidden op (index 1) must error");
+                assert_eq!(row, MAX_ROW + 1);
+            }
+            other => panic!("expected InvalidCell (validate before tombstone), got {other:?}"),
         }
     }
 

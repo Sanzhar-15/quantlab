@@ -1196,8 +1196,8 @@ pub fn default_registry() -> FunctionRegistry {
     // **W5-D-12 (Phase 4.10 — V1 260 sealer):** SUBTOTAL — conditional
     // aggregate dispatcher. Routes to AVERAGE/COUNT/COUNTA/MAX/MIN/
     // PRODUCT/STDEV.S/STDEV.P/SUM/VAR.S/VAR.P based on function_num
-    // (1..=11). 101..=111 normalize to 1..=11 (v1 has no hidden-row
-    // metadata; documented divergence). Closes Phase 4.10 V1-260 at
+    // (1..=11). 101..=111 SKIP hidden rows (Wave G2); on an all-visible
+    // range they equal 1..=11. Closes Phase 4.10 V1-260 at
     // 260 registered fns.
     r.register_range_aware("SUBTOTAL", range_fns::subtotal);
 

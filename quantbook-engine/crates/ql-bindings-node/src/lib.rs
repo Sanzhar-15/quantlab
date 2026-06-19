@@ -562,7 +562,13 @@ fn classify_delta_op(
         // re-emit pre-tombstone cell-keyed effects would duplicate
         // rebuild_snapshot_cache logic; fullRebuild is simpler + the
         // op is rare (user-initiated undo-of-delete).
-        | Op::RestoreSheet { .. } => {
+        | Op::RestoreSheet { .. }
+        // **Wave G2 (engine-filter):** a hidden-row change is sheet metadata the
+        // cell-only delta DTO cannot express (no `hiddenRows` field). Force a
+        // full rebuild so the IDE refetches via workbookSnapshot + getHiddenRows.
+        // (The `_` wildcard already did this; listing it explicitly matches the
+        // V3.6.0.8.4 allowlist discipline.)
+        | Op::SetRowsHidden { .. } => {
             *has_rename = true;
         }
         _ => {
@@ -7164,6 +7170,50 @@ impl Session {
             self.inner
                 .lock()
                 .nudge_decimals_preview(addr, delta)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// **Wave G2 (engine-filter):** hide (`hidden = true`) or show
+    /// (`hidden = false`) a set of ROWS on `sheet`. A hidden row is excluded by
+    /// the `SUBTOTAL(101..=111)` "ignore hidden rows" variants, and dependents
+    /// recompute. Idempotent per row — only state-changing rows are recorded and
+    /// undoable, so hiding an already-hidden row is a no-op. The host drives this
+    /// from the row-gutter hide action and the future autofilter. `bad_argument`
+    /// for a non-integer / out-of-range sheet or row; a row past `MAX_ROW` (or a
+    /// missing/tombstoned sheet) surfaces the engine's loud error (No-Fallbacks).
+    #[napi(js_name = "setRowsHidden", catch_unwind)]
+    pub fn set_rows_hidden(
+        &self,
+        env: Env,
+        sheet: f64,
+        rows: Vec<f64>,
+        hidden: bool,
+    ) -> Result<()> {
+        guarded(env, "setRowsHidden", || {
+            let sheet = validate_u16_index("setRowsHidden", "sheet", sheet)?;
+            let rows: Vec<u32> = rows
+                .into_iter()
+                .map(|r| validate_u32_index("setRowsHidden", "row", r))
+                .collect::<Result<_>>()?;
+            self.inner
+                .lock()
+                .set_rows_hidden(sheet, &rows, hidden)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// **Wave G2:** the sorted list of currently-hidden rows on `sheet` (the READ
+    /// half of [`Self::set_rows_hidden`]). The renderer pulls this on a sheet
+    /// switch / after a hide to collapse hidden rows. `bad_argument` for an
+    /// invalid sheet; a missing/tombstoned sheet surfaces the engine's loud error.
+    #[napi(js_name = "getHiddenRows", catch_unwind)]
+    pub fn get_hidden_rows(&self, env: Env, sheet: f64) -> Result<Vec<u32>> {
+        guarded(env, "getHiddenRows", || {
+            let sheet = validate_u16_index("getHiddenRows", "sheet", sheet)?;
+            self.inner
+                .lock()
+                .hidden_rows(sheet)
                 .map_err(|e| engine_error_to_napi(env, e))
         })
     }

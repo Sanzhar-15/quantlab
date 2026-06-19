@@ -1674,6 +1674,16 @@ impl CollabSession {
                     },
                 })
             }
+            // **Wave G2 (engine-filter):** `SetRowsHidden` mutates a per-sheet
+            // ROW-VISIBILITY attribute that is NOT part of the cell-keyed
+            // `last_snapshot` cache (the `SheetSnapshot` hidden-rows field is
+            // deferred to the renderer wave; hidden-rows flow to clients via the
+            // Workbook -> `getHiddenRows` getter, rebuilt through `replay_into`).
+            // It mutates no cell value/formula/format/style/position and no
+            // sheet existence, so it emits NO cache effect — an EXPLICIT arm (not
+            // a `_ => {}` fall-through) per the walker-completeness guardrail
+            // below, so a future auditor sees the decision was deliberate.
+            Op::SetRowsHidden { .. } => {}
             // Malformed delete (`start > end` OR `end > axis_max`; storage
             // rejects either) + any other op → no cache effect.
             //
@@ -3023,6 +3033,11 @@ impl CollabSession {
                 }
                 true
             }
+            // **Wave G2:** `SetRowsHidden` is sheet+rows-keyed, NOT cell-keyed —
+            // it has no (sheet,row,col) to add to the partial-invalidation set,
+            // so it falls to the conservative full-rebuild path (returning
+            // `false`, like the other session-wide ops). Explicit for clarity.
+            Op::SetRowsHidden { .. } => false,
             // All other variants are session-wide (AddSheet, RenameSheet,
             // RemoveSheet, MoveSheet, RegisterFormat, table ops, etc.)
             // OR not currently supported by collect_cache_effects's
@@ -3077,6 +3092,11 @@ impl CollabSession {
             | Op::SetCellStyle { row, col, .. } => {
                 *row > ql_types::MAX_ROW || *col > ql_types::MAX_COLUMN
             }
+            // **Wave G2:** replay aborts a `SetRowsHidden` whose any row exceeds
+            // MAX_ROW (statically decidable, no Workbook needed). Mirror it here
+            // so a bad hidden-row inside a `BatchCommit` makes the cache emit NO
+            // effects for the batch — matching the rolled-back Workbook.
+            Op::SetRowsHidden { rows, .. } => rows.iter().any(|r| *r > ql_types::MAX_ROW),
             Op::BatchCommit { ops } => ops.iter().any(Self::op_statically_aborts_batch),
             _ => false,
         }
@@ -7367,6 +7387,78 @@ mod tests {
             state.style,
             Some(bold_style_id()),
             "style surfaces in the live cache"
+        );
+    }
+
+    // ===== Wave G2 (engine-filter) — hidden-row op through collab =====
+
+    #[test]
+    fn set_rows_hidden_surfaces_in_rebuilt_workbook_without_corrupting_cell_cache() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        // `rebuild_workbook` uses the STRICT `replay_into` (unlike the lenient
+        // snapshot cache), so the sheet must exist before any cell/hidden op —
+        // exactly the order the runtime emits (AddSheet precedes everything).
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 1, 1, 5.0)).unwrap();
+        s.append_op(Op::SetRowsHidden {
+            sheet: 0,
+            rows: vec![2, 4],
+            hidden: true,
+        })
+        .unwrap();
+        // The hide is NOT cell-keyed, so the live cell cache is untouched: the
+        // pre-existing cell value still surfaces (no desync via the no-op arm).
+        let state = s.snapshot_cell(0, 1, 1).unwrap();
+        assert_eq!(state.value, Some(CellWireValue::Number(5.0)));
+        // The rebuilt Workbook (via replay_into) DOES reflect the hidden rows —
+        // that is the authoritative path the `getHiddenRows` getter reads.
+        let reg = ql_functions::default_registry();
+        let (wb, _) = s.rebuild_workbook(&reg).unwrap();
+        assert_eq!(
+            wb.sheet(0)
+                .unwrap()
+                .hidden_rows()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+    }
+
+    #[test]
+    fn show_rows_after_hide_clears_in_rebuilt_workbook() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(Op::SetRowsHidden {
+            sheet: 0,
+            rows: vec![2, 4],
+            hidden: true,
+        })
+        .unwrap();
+        s.append_op(Op::SetRowsHidden {
+            sheet: 0,
+            rows: vec![2],
+            hidden: false,
+        })
+        .unwrap();
+        let reg = ql_functions::default_registry();
+        let (wb, _) = s.rebuild_workbook(&reg).unwrap();
+        assert_eq!(
+            wb.sheet(0)
+                .unwrap()
+                .hidden_rows()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![4]
         );
     }
 

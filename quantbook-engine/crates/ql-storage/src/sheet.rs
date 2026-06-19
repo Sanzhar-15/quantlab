@@ -5,6 +5,8 @@
 //! - `dimensions: Bounds` tracking the largest (row, col) ever written, conservative.
 //! - Open-ended: reading a cell beyond `dimensions` returns `Value::Blank` (matches Excel).
 
+use std::collections::BTreeSet;
+
 use ql_types::{ColId, RowId, Value};
 
 use crate::column::ColumnStore;
@@ -46,6 +48,16 @@ pub struct Sheet {
     /// owns the chain-walking logic. Same canonicalization rules as
     /// the workbook-scoped `NameTable` (ASCII-uppercase canonical).
     scoped_names: NameTable,
+    /// **Wave G2 (engine-filter):** per-sheet sparse ROW-visibility set —
+    /// rows present here are *hidden*; absent rows are visible (the default).
+    /// Sparse + row-keyed (unlike the per-CELL `format_overlay`/`style_overlay`),
+    /// so it is a `BTreeSet<RowId>` (deterministic iteration for snapshot/persist).
+    /// Mutations route through `WorkbookRuntime::set_rows_hidden` (emits
+    /// `Op::SetRowsHidden`); direct access stays for the loader + tests.
+    /// Re-keyed by `shift_rows` ONLY (a ROW attribute) — `shift_columns` leaves
+    /// it untouched, the one asymmetry vs the per-cell overlays. The
+    /// `SUBTOTAL(101..=111)` "ignore hidden rows" variants read this set.
+    hidden_rows: BTreeSet<RowId>,
 }
 
 impl Sheet {
@@ -64,6 +76,7 @@ impl Sheet {
             format_overlay: crate::CellFormatOverlay::new(),
             style_overlay: crate::CellStyleOverlay::new(),
             scoped_names: NameTable::new(),
+            hidden_rows: BTreeSet::new(),
         }
     }
 
@@ -94,6 +107,38 @@ impl Sheet {
     /// loader + tests (mirrors [`Self::format_overlay_mut`]).
     pub fn style_overlay_mut(&mut self) -> &mut crate::CellStyleOverlay {
         &mut self.style_overlay
+    }
+
+    /// **Wave G2 (engine-filter):** read access to the per-sheet hidden-row
+    /// set (rows present are hidden). Used by the snapshot/getter, `.qbook`
+    /// persistence, and the `SUBTOTAL(101..=111)` visibility check.
+    pub fn hidden_rows(&self) -> &BTreeSet<RowId> {
+        &self.hidden_rows
+    }
+
+    /// **Wave G2:** is `row` hidden? O(log n). The eval-time predicate behind
+    /// `SUBTOTAL(101..=111)` (via `CellEnv::is_row_hidden`).
+    pub fn is_row_hidden(&self, row: RowId) -> bool {
+        self.hidden_rows.contains(&row)
+    }
+
+    /// **Wave G2:** hide (`hidden = true`) or show (`hidden = false`) a single
+    /// row. Idempotent. Production callers route through
+    /// `WorkbookRuntime::set_rows_hidden` (which emits `Op::SetRowsHidden` and
+    /// dirties dependents); this low-level setter is for op-log replay + tests.
+    pub fn set_row_hidden(&mut self, row: RowId, hidden: bool) {
+        if hidden {
+            self.hidden_rows.insert(row);
+        } else {
+            self.hidden_rows.remove(&row);
+        }
+    }
+
+    /// **Wave G2:** mutable access for loader paths + op-log replay (mirrors
+    /// [`Self::format_overlay_mut`]). Production callers route through
+    /// `WorkbookRuntime::set_rows_hidden`.
+    pub fn hidden_rows_mut(&mut self) -> &mut BTreeSet<RowId> {
+        &mut self.hidden_rows
     }
 
     pub fn name(&self) -> &str {
@@ -337,6 +382,15 @@ impl Sheet {
         // class). MUST stay paired with the format_overlay shift above.
         self.style_overlay
             .shift_axis(true, |r| shift.map_public(r, ql_types::MAX_ROW));
+        // **Wave G2:** the hidden-row set re-keys on the ROW axis too, or hidden
+        // rows orphan/misalign on every row insert/delete. A row inside a deleted
+        // block (`map_public -> None`) is dropped; survivors shift. MUST stay
+        // paired with the overlay shifts above (same row-orphan class).
+        self.hidden_rows = self
+            .hidden_rows
+            .iter()
+            .filter_map(|&r| shift.map_public(r, ql_types::MAX_ROW))
+            .collect();
         self.recompute_bounds();
     }
 
@@ -895,5 +949,77 @@ mod tests {
             .set(0, 2, StyleId::new(LEGACY_PEER, 0));
         s.shift_columns(AxisShift::Delete { start: 2, end: 2 });
         assert_eq!(s.style_overlay().len(), 0);
+    }
+
+    // ===== Wave G2 (engine-filter) — hidden-row set =====
+
+    #[test]
+    fn hidden_rows_empty_by_default() {
+        let s = Sheet::new("S");
+        assert!(s.hidden_rows().is_empty());
+        assert!(!s.is_row_hidden(0));
+        assert!(!s.is_row_hidden(1_000_000));
+    }
+
+    #[test]
+    fn set_row_hidden_toggles_membership() {
+        let mut s = Sheet::new("S");
+        s.set_row_hidden(3, true);
+        s.set_row_hidden(7, true);
+        assert!(s.is_row_hidden(3));
+        assert!(s.is_row_hidden(7));
+        assert!(!s.is_row_hidden(4));
+        assert_eq!(s.hidden_rows().len(), 2);
+        // Idempotent set.
+        s.set_row_hidden(3, true);
+        assert_eq!(s.hidden_rows().len(), 2);
+        // Show clears the entry; clearing a visible row is a no-op.
+        s.set_row_hidden(3, false);
+        assert!(!s.is_row_hidden(3));
+        s.set_row_hidden(99, false);
+        assert_eq!(s.hidden_rows().len(), 1);
+        assert_eq!(s.hidden_rows().iter().copied().collect::<Vec<_>>(), vec![7]);
+    }
+
+    #[test]
+    fn insert_rows_shifts_hidden_rows_down() {
+        let mut s = Sheet::with_chunk_rows("S", 8);
+        s.set_row_hidden(0, true); // above the insert point — stays
+        s.set_row_hidden(2, true); // at/below — shifts down by 2
+        s.set_row_hidden(5, true);
+        s.shift_rows(AxisShift::Insert { at: 1, count: 2 });
+        // 0 unchanged; 2 -> 4; 5 -> 7.
+        assert_eq!(
+            s.hidden_rows().iter().copied().collect::<Vec<_>>(),
+            vec![0, 4, 7]
+        );
+    }
+
+    #[test]
+    fn delete_rows_drops_hidden_rows_in_block_and_shifts_rest() {
+        let mut s = Sheet::with_chunk_rows("S", 8);
+        s.set_row_hidden(0, true); // before block — stays
+        s.set_row_hidden(2, true); // inside [1,2] deleted block — dropped
+        s.set_row_hidden(5, true); // after block — shifts up by 2
+        s.shift_rows(AxisShift::Delete { start: 1, end: 2 });
+        // 0 stays; 2 dropped; 5 -> 3.
+        assert_eq!(
+            s.hidden_rows().iter().copied().collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+    }
+
+    #[test]
+    fn shift_columns_leaves_hidden_rows_untouched() {
+        // Hidden-rows is a ROW attribute: a COLUMN insert/delete must NOT move it.
+        let mut s = Sheet::with_chunk_rows("S", 8);
+        s.set_row_hidden(2, true);
+        s.set_row_hidden(4, true);
+        s.shift_columns(AxisShift::Insert { at: 0, count: 3 });
+        s.shift_columns(AxisShift::Delete { start: 1, end: 1 });
+        assert_eq!(
+            s.hidden_rows().iter().copied().collect::<Vec<_>>(),
+            vec![2, 4]
+        );
     }
 }

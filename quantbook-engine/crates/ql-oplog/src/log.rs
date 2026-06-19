@@ -592,6 +592,17 @@ mod tests {
                     },
                 ],
             },
+            // Wave G2: hide/show a set of rows round-trips on the JSON wire.
+            Op::SetRowsHidden {
+                sheet: 0,
+                rows: vec![2, 4, 7],
+                hidden: true,
+            },
+            Op::SetRowsHidden {
+                sheet: 1,
+                rows: vec![3],
+                hidden: false,
+            },
         ];
         let mut log = OpLog::new();
         for op in &ops {

@@ -703,11 +703,15 @@ pub fn xlookup(args: &[FnArg]) -> Value {
         return Value::Error(*e);
     }
     let (hay, hay_rows, hay_cols) = match &args[1] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     let (ret, ret_rows, ret_cols) = match &args[2] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     // V1: lookup_array must be 1D (single row OR single column) and
@@ -770,7 +774,9 @@ pub fn xmatch(args: &[FnArg]) -> Value {
         return Value::Error(*e);
     }
     let (hay, hay_rows, hay_cols) = match &args[1] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     if hay_rows != 1 && hay_cols != 1 {
@@ -810,7 +816,9 @@ pub fn index(args: &[FnArg]) -> Value {
         return Value::Error(ErrorValue::Value);
     }
     let (values, rows, cols) = match &args[0] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     if values.is_empty() {
@@ -945,7 +953,9 @@ pub fn vlookup(args: &[FnArg]) -> Value {
         return Value::Error(*e);
     }
     let (values, rows, cols) = match &args[1] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     let col_index_num = match &args[2] {
@@ -1001,7 +1011,9 @@ pub fn hlookup(args: &[FnArg]) -> Value {
         return Value::Error(*e);
     }
     let (values, rows, cols) = match &args[1] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     let row_index_num = match &args[2] {
@@ -1178,7 +1190,9 @@ fn parse_ifs_pairs<'a>(args: &'a [FnArg], start_index: usize) -> Result<IfsPairs
     let mut chunks = pair_args.chunks_exact(2);
     for pair in chunks.by_ref() {
         let (range, rrows, rcols) = match &pair[0] {
-            FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+            FnArg::Range {
+                values, rows, cols, ..
+            } => (values.as_slice(), *rows, *cols),
             FnArg::Scalar(_) => return Err(ErrorValue::Value),
         };
         let pred_arg = match &pair[1] {
@@ -1208,7 +1222,9 @@ pub fn sumifs(args: &[FnArg]) -> Value {
         return Value::Error(ErrorValue::Value);
     }
     let (sum_range, sr_rows, sr_cols) = match &args[0] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     let (pairs, (exp_rows, exp_cols)) = match parse_ifs_pairs(args, 1) {
@@ -1280,7 +1296,9 @@ pub fn averageifs(args: &[FnArg]) -> Value {
         return Value::Error(ErrorValue::Value);
     }
     let (avg_range, ar_rows, ar_cols) = match &args[0] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     let (pairs, (exp_rows, exp_cols)) = match parse_ifs_pairs(args, 1) {
@@ -1345,11 +1363,15 @@ fn paired_sum_inner(args: &[FnArg], op: PairedOp) -> Value {
         return Value::Error(ErrorValue::Value);
     }
     let (xs, x_rows, x_cols) = match &args[0] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     let (ys, y_rows, y_cols) = match &args[1] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     // W5-60 strict 2D shape check.
@@ -1508,11 +1530,15 @@ pub(crate) fn compute_correl(xs: &[f64], ys: &[f64]) -> Result<f64, ErrorValue> 
 /// `#N/A` — engine-wide divergence flagged in `excel-matrix.md`.
 fn collect_xy_pairs(a: &FnArg, b: &FnArg) -> Result<(Vec<f64>, Vec<f64>), ErrorValue> {
     let (a_raw, a_rows, a_cols) = match a {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Err(ErrorValue::Value),
     };
     let (b_raw, b_rows, b_cols) = match b {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Err(ErrorValue::Value),
     };
     if a_rows != b_rows || a_cols != b_cols {
@@ -1907,8 +1933,16 @@ pub fn quartile_exc(args: &[FnArg]) -> Value {
 // 1=AVERAGE, 2=COUNT, 3=COUNTA, 4=MAX, 5=MIN, 6=PRODUCT, 7=STDEV.S,
 // 8=STDEV.P, 9=SUM, 10=VAR.S, 11=VAR.P. The 101..=111 range is the
 // "ignore hidden rows" Excel canon (e.g. `SUBTOTAL(109, ...)` = SUM
-// skipping hidden rows). The engine has no hidden-row metadata in v1
-// — 101..=111 are normalized to 1..=11 (documented divergence).
+// skipping hidden rows).
+//
+// **Wave G2 (engine-filter):** 101..=111 now SKIP hidden rows. The engine
+// carries per-sheet row-visibility (`Sheet::hidden_rows`), and the eval
+// materializer (`ql-exec::scalar`) attaches a range-relative `row_hidden` mask
+// to each `FnArg::Range`; this dispatcher drops a value whose range-row is
+// hidden when `function_num >= 101`. 1..=11 keep hidden rows (the engine models
+// only manually-hidden rows, not a separate AutoFilter "filtered" class, so
+// 1..=11 have nothing extra to skip — matching IronCalc's `SubTotalMode`).
+// (Pre-Wave-G2: 101..=111 normalized to 1..=11 with "no hidden-row metadata".)
 //
 // Excel canon also says SUBTOTAL skips NESTED `SUBTOTAL` calls in its
 // arg ranges (the "subtotal of subtotals" double-counting guard). The
@@ -1920,10 +1954,10 @@ pub fn quartile_exc(args: &[FnArg]) -> Value {
 // which are not part of v1.
 //
 // IronCalc reference: `.references/ironcalc/base/src/functions/subtotal.rs`
-// (line-by-line; IronCalc has full row-visibility metadata + AST access
-// during evaluation, so it implements both behaviors fully). The
-// numeric-dispatch shape matches IronCalc exactly; only the row-
-// visibility + nested-skip semantics differ. Microsoft docs:
+// (line-by-line; IronCalc has AST access during evaluation, so it also
+// implements nested-SUBTOTAL skip). The numeric-dispatch shape matches IronCalc
+// exactly; as of Wave G2 row-visibility matches too — only the nested-SUBTOTAL
+// skip still differs (see below). Microsoft docs:
 // support.microsoft.com/en-us/office/subtotal-function-7b027003-f060-4ade-9040-e478765b9939
 //
 // **W5-D-12.1 (binder admission):** SUBTOTAL was added to
@@ -1971,8 +2005,9 @@ pub fn quartile_exc(args: &[FnArg]) -> Value {
 //   IronCalc lenient-parses "9" → 9.0 via `cast_to_number`).
 
 /// `SUBTOTAL(function_num, ref1, [ref2], ...)` — conditional aggregate
-/// dispatcher. See module-level W5-D-12 block for the canon discussion
-/// and v1 divergences (no hidden-row metadata; no nested-SUBTOTAL skip).
+/// dispatcher. See module-level W5-D-12 block for the canon discussion.
+/// 101..=111 skip hidden rows (Wave G2); the one remaining divergence is the
+/// nested-SUBTOTAL skip (still unsupported — args are evaluated before dispatch).
 pub fn subtotal(args: &[FnArg]) -> Value {
     if args.len() < 2 {
         return Value::Error(ErrorValue::Value);
@@ -1991,20 +2026,49 @@ pub fn subtotal(args: &[FnArg]) -> Value {
             return Value::Error(ErrorValue::Value)
         }
     };
-    // Normalize 101..=111 to 1..=11 (v1: no hidden-row metadata).
+    // **Wave G2 (engine-filter):** 101..=111 are the "ignore hidden rows"
+    // variants. `skip_hidden` records that we must drop hidden-row values while
+    // flattening; `normalized` maps BOTH 1..=11 and 101..=111 to the same kernel
+    // (1..=11). (Pre-Wave-G2 this comment read "v1: no hidden-row metadata".)
+    let skip_hidden = fn_num >= 101;
     let normalized = match fn_num {
         1..=11 => fn_num,
         101..=111 => fn_num - 100,
         _ => return Value::Error(ErrorValue::Value),
     };
-    // Flatten data args (positions 1..n) to Vec<Value> for dispatch to
-    // the scalar aggregates. Scalar args contribute their value; Range
-    // args contribute their flattened values.
+    // Flatten data args (positions 1..n) for dispatch to the scalar aggregates.
+    // A Scalar arg contributes its value (a scalar has no row → never skipped).
+    // A Range arg contributes its flattened values; for 101..=111 a value whose
+    // RANGE-ROW is hidden (per the materializer's row-relative `row_hidden` mask)
+    // is EXCLUDED. An EMPTY mask ⇒ no hidden row ⇒ every value kept, so
+    // 101..=111 stays byte-identical to 1..=11 on an all-visible sheet.
     let mut flat: Vec<Value> = Vec::new();
     for arg in &args[1..] {
         match arg {
             FnArg::Scalar(v) => flat.push(v.clone()),
-            FnArg::Range { values, .. } => flat.extend_from_slice(values),
+            FnArg::Range {
+                values,
+                cols,
+                row_hidden,
+                ..
+            } => {
+                if skip_hidden && !row_hidden.is_empty() {
+                    for (i, v) in values.iter().enumerate() {
+                        // Row-major flat index → range row. `*cols >= 1` whenever
+                        // `values` is non-empty (the shape invariant), and
+                        // `range_row < rows == row_hidden.len()`, so a malformed
+                        // mask would panic LOUD rather than silently mis-skip
+                        // (No-Fallbacks).
+                        let range_row = i / *cols;
+                        if row_hidden[range_row] {
+                            continue; // hidden row → excluded from the aggregate
+                        }
+                        flat.push(v.clone());
+                    }
+                } else {
+                    flat.extend_from_slice(values);
+                }
+            }
         }
     }
     match normalized {
@@ -2149,11 +2213,15 @@ fn slope_intercept_dispatch(
         return Value::Error(ErrorValue::Value);
     }
     let (ys_raw, y_rows, y_cols) = match &args[0] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     let (xs_raw, x_rows, x_cols) = match &args[1] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     if y_rows != x_rows || y_cols != x_cols {
@@ -2304,7 +2372,9 @@ fn minmaxifs_inner(args: &[FnArg], op: MinMax) -> Value {
         return Value::Error(ErrorValue::Value);
     }
     let (value_range, vr_rows, vr_cols) = match &args[0] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Range {
+            values, rows, cols, ..
+        } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
     let (pairs, (exp_rows, exp_cols)) = match parse_ifs_pairs(args, 1) {
@@ -2399,7 +2469,9 @@ pub fn sumproduct(args: &[FnArg]) -> Value {
         let mut tmp: Vec<[Value; 1]> = Vec::new();
         for a in args {
             match a {
-                FnArg::Range { values, rows, cols } => {
+                FnArg::Range {
+                    values, rows, cols, ..
+                } => {
                     arrays.push((values.as_slice(), *rows, *cols));
                 }
                 FnArg::Scalar(v) => {
@@ -2908,6 +2980,7 @@ mod tests {
             values: vs,
             rows: 1,
             cols,
+            row_hidden: Vec::new(),
         }
     }
     fn s(v: Value) -> FnArg {
@@ -3237,6 +3310,7 @@ mod tests {
             values: vec![n(10.0), n(20.0), n(30.0), n(40.0)],
             rows: 1,
             cols: 4,
+            row_hidden: Vec::new(),
         };
         // "ap*" matches indices 0 and 1 → 10 + 20 = 30.
         assert_eq!(sumif(&[crit_range, s(t("ap*")), sum_range]), n(30.0));
@@ -3250,6 +3324,7 @@ mod tests {
             values: vs,
             rows,
             cols,
+            row_hidden: Vec::new(),
         }
     }
 
@@ -3591,16 +3666,19 @@ mod tests {
             values: vec![t("a"), t("a"), t("b"), t("b")],
             rows: 4,
             cols: 1,
+            row_hidden: Vec::new(),
         };
         let labels2 = FnArg::Range {
             values: vec![t("x"), t("y"), t("x"), t("y")],
             rows: 4,
             cols: 1,
+            row_hidden: Vec::new(),
         };
         let vals = FnArg::Range {
             values: vec![n(1.0), n(2.0), n(3.0), n(4.0)],
             rows: 4,
             cols: 1,
+            row_hidden: Vec::new(),
         };
         assert_eq!(
             sumifs(&[vals, labels1, s(t("a")), labels2, s(t("y"))]),
@@ -5545,20 +5623,71 @@ mod tests {
     }
 
     #[test]
-    fn subtotal_101_normalizes_to_average() {
-        // 101..=111 are the "ignore hidden rows" Excel variants. The
-        // engine has no hidden-row metadata in v1, so 101 normalizes
-        // to 1 (AVERAGE). Pins the documented v1 divergence.
+    fn subtotal_101_all_visible_equals_average() {
+        // **Wave G2:** 101..=111 are the "ignore hidden rows" variants. With NO
+        // hidden rows (the `r` helper builds an empty visibility mask), 101
+        // reduces EXACTLY to 1 (AVERAGE) — the all-visible byte-identity.
         let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
         assert_eq!(subtotal(&[s(n(101.0)), arr]), Value::Number(2.5));
     }
 
     #[test]
-    fn subtotal_109_normalizes_to_sum() {
-        // 109 ≡ SUM-skip-hidden; v1 has no hidden-row metadata so
-        // normalizes to 9 (SUM).
+    fn subtotal_109_all_visible_equals_sum() {
+        // **Wave G2:** with no hidden rows, 109 reduces to 9 (SUM).
         let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
         assert_eq!(subtotal(&[s(n(109.0)), arr]), Value::Number(10.0));
+    }
+
+    // ===== Wave G2 (engine-filter) — SUBTOTAL(101..=111) skips hidden rows =====
+
+    #[test]
+    fn subtotal_109_skips_hidden_rows() {
+        // A 4-row × 1-col range [10,20,30,40] with range-rows 1 and 3 hidden.
+        // SUBTOTAL(109)=SUM SKIPS them → 10 + 30 = 40. SUBTOTAL(9) keeps all → 100.
+        let vals = vec![n(10.0), n(20.0), n(30.0), n(40.0)];
+        let mask = vec![false, true, false, true];
+        let arg = || FnArg::range_with_visibility(vals.clone(), 4, 1, mask.clone());
+        assert_eq!(subtotal(&[s(n(109.0)), arg()]), Value::Number(40.0));
+        assert_eq!(subtotal(&[s(n(9.0)), arg()]), Value::Number(100.0));
+    }
+
+    #[test]
+    fn subtotal_count_variant_respects_hidden_rows() {
+        // 102 (COUNT, skip-hidden) counts only VISIBLE numbers; 2 counts all.
+        let vals = vec![n(10.0), n(20.0), n(30.0), n(40.0)];
+        let mask = vec![false, true, false, true]; // range-rows 1, 3 hidden
+        let arg = || FnArg::range_with_visibility(vals.clone(), 4, 1, mask.clone());
+        assert_eq!(subtotal(&[s(n(102.0)), arg()]), Value::Number(2.0));
+        assert_eq!(subtotal(&[s(n(2.0)), arg()]), Value::Number(4.0));
+    }
+
+    #[test]
+    fn subtotal_skip_hidden_multirow_2cols() {
+        // A 3-row × 2-col range, range-row 1 hidden. Row-major values
+        // [1,2 | 3,4 | 5,6]; hide the (3,4) row → SUBTOTAL(109)=SUM over the
+        // visible rows = 1+2+5+6 = 14. SUBTOTAL(9) keeps all → 21. Pins the
+        // `i / cols` flat-index → range-row mapping for cols > 1.
+        let vals = vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0), n(6.0)];
+        let mask = vec![false, true, false];
+        let arg = || FnArg::range_with_visibility(vals.clone(), 3, 2, mask.clone());
+        assert_eq!(subtotal(&[s(n(109.0)), arg()]), Value::Number(14.0));
+        assert_eq!(subtotal(&[s(n(9.0)), arg()]), Value::Number(21.0));
+    }
+
+    #[test]
+    fn subtotal_empty_mask_byte_identical_to_unhidden() {
+        // An EMPTY mask ⇒ 101..=111 reduce EXACTLY to 1..=11 (the byte-identity
+        // the all-visible common case relies on).
+        let vals = vec![n(10.0), n(20.0), n(30.0)];
+        let arg = || FnArg::range_with_visibility(vals.clone(), 3, 1, Vec::new());
+        assert_eq!(
+            subtotal(&[s(n(109.0)), arg()]),
+            subtotal(&[s(n(9.0)), arg()])
+        );
+        assert_eq!(
+            subtotal(&[s(n(101.0)), arg()]),
+            subtotal(&[s(n(1.0)), arg()])
+        );
     }
 
     #[test]
@@ -6473,11 +6602,13 @@ mod tests {
             values: vec![n(1.0), n(2.0), n(3.0), n(4.0)],
             rows: 2,
             cols: 2,
+            row_hidden: Vec::new(),
         };
         let a1x4 = FnArg::Range {
             values: vec![n(1.0), n(2.0), n(3.0), n(4.0)],
             rows: 1,
             cols: 4,
+            row_hidden: Vec::new(),
         };
         // Same flat length (4) but different shape — Excel #VALUE!.
         // Pre-W5-60 this silently accepted and produced 1+4+9+16 = 30.
@@ -6490,11 +6621,13 @@ mod tests {
             values: vec![n(1.0), n(2.0), n(3.0)],
             rows: 1,
             cols: 3,
+            row_hidden: Vec::new(),
         };
         let a3x1 = FnArg::Range {
             values: vec![n(1.0), n(2.0), n(3.0)],
             rows: 3,
             cols: 1,
+            row_hidden: Vec::new(),
         };
         assert_eq!(sumproduct(&[a1x3, a3x1]), Value::Error(ErrorValue::Value));
     }
@@ -6505,11 +6638,13 @@ mod tests {
             values: vec![n(10.0), n(20.0), n(30.0)],
             rows: 1,
             cols: 3,
+            row_hidden: Vec::new(),
         };
         let crit_range = FnArg::Range {
             values: vec![n(1.0), n(2.0), n(3.0)],
             rows: 3,
             cols: 1,
+            row_hidden: Vec::new(),
         };
         // Same flat length (3) but different shape — must reject.
         assert_eq!(
@@ -6524,11 +6659,13 @@ mod tests {
             values: vec![n(1.0), n(1.0)],
             rows: 1,
             cols: 2,
+            row_hidden: Vec::new(),
         };
         let r2 = FnArg::Range {
             values: vec![n(1.0), n(1.0)],
             rows: 2,
             cols: 1,
+            row_hidden: Vec::new(),
         };
         // Same flat length (2), different shape.
         assert_eq!(
@@ -6543,11 +6680,13 @@ mod tests {
             values: vec![n(10.0), n(20.0)],
             rows: 1,
             cols: 2,
+            row_hidden: Vec::new(),
         };
         let crit_range = FnArg::Range {
             values: vec![n(1.0), n(1.0)],
             rows: 2,
             cols: 1,
+            row_hidden: Vec::new(),
         };
         assert_eq!(
             averageifs(&[avg_range, crit_range, s(n(1.0))]),
@@ -6563,11 +6702,13 @@ mod tests {
             values: vec![n(1.0), n(2.0), n(3.0), n(4.0)],
             rows: 2,
             cols: 2,
+            row_hidden: Vec::new(),
         };
         let b = FnArg::Range {
             values: vec![n(10.0), n(20.0), n(30.0), n(40.0)],
             rows: 2,
             cols: 2,
+            row_hidden: Vec::new(),
         };
         // 1*10 + 2*20 + 3*30 + 4*40 = 10 + 40 + 90 + 160 = 300.
         assert_eq!(sumproduct(&[a, b]), n(300.0));

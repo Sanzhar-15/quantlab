@@ -272,7 +272,11 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 // HLOOKUP / INDEX can address by (row,
                                 // col). SUMIF / COUNTIF ignore shape.
                                 let (values, rows, cols) = env.read_range_with_shape(*range);
-                                fn_args.push(FnArg::Range { values, rows, cols });
+                                let row_hidden =
+                                    range_visibility_mask(env, range.sheet, range.start_row, rows);
+                                fn_args.push(FnArg::range_with_visibility(
+                                    values, rows, cols, row_hidden,
+                                ));
                             }
                             // **W5-116/117 (Phase 4.8.G + G.2):** structured-ref
                             // in range-aware function arg position. `[@Col]`
@@ -287,7 +291,15 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 match r {
                                     Ok(range) => {
                                         let (values, rows, cols) = env.read_range_with_shape(range);
-                                        fn_args.push(FnArg::Range { values, rows, cols });
+                                        let row_hidden = range_visibility_mask(
+                                            env,
+                                            range.sheet,
+                                            range.start_row,
+                                            rows,
+                                        );
+                                        fn_args.push(FnArg::range_with_visibility(
+                                            values, rows, cols, row_hidden,
+                                        ));
                                     }
                                     Err(ev) => fn_args.push(FnArg::Scalar(Value::Error(ev))),
                                 }
@@ -801,6 +813,27 @@ fn materialize_ref_arg_lazy(plan: &ExprPlan) -> ql_functions::RefArg {
         ExprPlan::Error(_) => PlanKind::Error,
     };
     RefArg::Shape(kind)
+}
+
+/// **Wave G2 (engine-filter):** build a range-relative row-visibility mask for a
+/// just-materialized range. Returns EMPTY (all rows visible) unless the source
+/// sheet actually carries hidden rows — so every non-`SUBTOTAL` range read stays
+/// byte-identical to pre-Wave-G2 (the cheap `sheet_has_hidden_rows` gate). When
+/// populated, slot `i` corresponds to the range's row `start_row + i`, aligned
+/// with the CLAMPED `rows` the shape read returned. Only `SUBTOTAL(101..=111)`
+/// consumes it (every other range-aware fn ignores `FnArg::Range::row_hidden`).
+fn range_visibility_mask<E: CellEnv + ?Sized>(
+    env: &E,
+    sheet: ql_types::SheetId,
+    start_row: ql_types::RowId,
+    rows: usize,
+) -> Vec<bool> {
+    if !env.sheet_has_hidden_rows(sheet) {
+        return Vec::new();
+    }
+    (0..rows)
+        .map(|i| env.is_row_hidden(sheet, start_row + i as ql_types::RowId))
+        .collect()
 }
 
 /// **W5-117 (Phase 4.8.G.2):** access the formula cell from an env if

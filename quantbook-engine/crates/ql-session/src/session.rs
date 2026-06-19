@@ -5,7 +5,7 @@
 //! only. The owning `WorkbookSession` that implements it is a later increment.
 //! Method docs cite the contract section each command derives from.
 
-use ql_types::SheetId;
+use ql_types::{RowId, SheetId};
 use serde::{Deserialize, Serialize};
 
 use crate::dto::{
@@ -203,6 +203,19 @@ pub trait EngineSession {
     /// `batch`, giving a multi-cell decimal nudge a SINGLE undo unit. A format the engine cannot model
     /// (`[Red]`/conditional/elapsed-time) surfaces a loud error (No-Fallbacks).
     fn nudge_decimals_preview(&self, addr: CellAddr, delta: i32) -> EngineResult<Option<String>>;
+    /// **Wave G2 (engine-filter):** hide (`hidden = true`) or show
+    /// (`hidden = false`) a set of ROWS on `sheet`. A hidden row is excluded by
+    /// the `SUBTOTAL(101..=111)` "ignore hidden rows" variants, and dependents
+    /// recompute. Idempotent per row — only state-changing rows are recorded and
+    /// undoable, so hiding an already-hidden row is a no-op. Driven by the IDE
+    /// row-gutter hide action and the future autofilter. A row past `MAX_ROW`
+    /// surfaces a loud error (No-Fallbacks); the whole call is atomic.
+    fn set_rows_hidden(&mut self, sheet: SheetId, rows: &[RowId], hidden: bool)
+        -> EngineResult<()>;
+    /// **Wave G2:** the sorted set of currently-hidden rows on `sheet` (the
+    /// READ half of [`Self::set_rows_hidden`]). The renderer pulls this on a
+    /// sheet switch / after a hide to collapse hidden rows.
+    fn hidden_rows(&self, sheet: SheetId) -> EngineResult<Vec<RowId>>;
     /// Parse+bind a formula WITHOUT mutating (keystroke path); returns diagnostics.
     fn validate_formula(&self, addr: CellAddr, text: &str) -> EngineResult<Vec<Diagnostic>>;
 

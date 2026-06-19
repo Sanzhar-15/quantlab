@@ -64,6 +64,7 @@ mod sheets;
 mod styles;
 mod tables;
 mod validate;
+mod visibility;
 pub use error::{RecomputeFailure, RecomputeResult, RuntimeError};
 // **R9 / Wave C (2026-06-18):** the read-only decimal-nudge compute, shared by
 // `WorkbookRuntime::nudge_cell_decimals` (apply) and the session's read-only

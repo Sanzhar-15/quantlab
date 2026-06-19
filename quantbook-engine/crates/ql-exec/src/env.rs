@@ -94,6 +94,24 @@ pub trait CellEnv {
         (values, rows, cols)
     }
 
+    /// **Wave G2 (engine-filter):** is `row` hidden on `sheet`? The default is
+    /// `false` — envs that carry no workbook visibility (`MapEnv`, benches,
+    /// tests) treat every row as visible. `WorkbookEnv` overrides to consult
+    /// `Sheet::is_row_hidden`. The scalar.rs materializer reads this to build the
+    /// `SUBTOTAL(101..=111)` row-visibility mask. A non-existent sheet has no
+    /// hidden rows (mirrors `read_cell`'s missing-sheet → `Blank`).
+    fn is_row_hidden(&self, _sheet: SheetId, _row: RowId) -> bool {
+        false
+    }
+
+    /// **Wave G2:** does `sheet` have ANY hidden rows? A cheap gate so the
+    /// materializer skips building a visibility mask for the (overwhelmingly
+    /// common) all-visible sheet — keeping every non-`SUBTOTAL` range read
+    /// byte-identical to pre-Wave-G2. Default `false`; `WorkbookEnv` overrides.
+    fn sheet_has_hidden_rows(&self, _sheet: SheetId) -> bool {
+        false
+    }
+
     /// **W5-69 (Phase 4.5.A.0):** the evaluator context for date /
     /// locale / clock-aware function dispatch. Default impl returns
     /// `&DEFAULT_EVAL_CONTEXT` (Excel1900 + EnUs + System), suitable
@@ -339,6 +357,23 @@ impl<'w> CellEnv for WorkbookEnv<'w> {
             Some(s) => s.read(row, col),
             None => Value::Error(ErrorValue::Ref),
         }
+    }
+
+    /// **Wave G2 (engine-filter):** consult the sheet's hidden-row set. A
+    /// missing sheet has no hidden rows (returns `false`) — the materializer
+    /// only calls this for a resolved `range.sheet`, and "not hidden" is the
+    /// correct neutral answer regardless.
+    fn is_row_hidden(&self, sheet: SheetId, row: RowId) -> bool {
+        self.workbook
+            .sheet(sheet)
+            .is_some_and(|s| s.is_row_hidden(row))
+    }
+
+    /// **Wave G2:** cheap gate — does the sheet carry any hidden rows at all?
+    fn sheet_has_hidden_rows(&self, sheet: SheetId) -> bool {
+        self.workbook
+            .sheet(sheet)
+            .is_some_and(|s| !s.hidden_rows().is_empty())
     }
 
     /// Phase 3.6 override: clamps the iteration to `Sheet::bounds` so a
