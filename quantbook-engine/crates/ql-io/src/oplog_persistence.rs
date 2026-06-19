@@ -95,7 +95,10 @@
 use std::fs;
 use std::path::Path;
 
-use crate::qbook_format::{load_workbook, save_workbook_extending, QbookError};
+use crate::qbook_format::{
+    cleanup_extracted_container, extract_container_to_staging, load_workbook,
+    save_workbook_extending, save_workbook_file_extending, QbookError,
+};
 use ql_storage::Workbook;
 use thiserror::Error;
 
@@ -246,6 +249,48 @@ pub fn load_workbook_with_oplog(path: &Path) -> Result<(Workbook, OpLog), Persis
     let bytes = fs::read(&oplog_path).map_err(QbookError::Io)?;
     let oplog = decode_oplog_bytes(&bytes)?;
     Ok((wb, oplog))
+}
+
+/// **Wave H1 (2026-06-19):** save a workbook AND its op log to a single-file
+/// `.qbook` ZIP container. The file-format analogue of
+/// [`save_workbook_with_oplog`]: identical op-log header + closure, but routed
+/// through [`save_workbook_file_extending`] so `oplog.bin` is written into the
+/// staging dir and then zipped alongside the envelope + sheets — riding the
+/// same all-or-nothing atomic rename.
+pub fn save_workbook_file_with_oplog(
+    wb: &Workbook,
+    oplog: &OpLog,
+    name: &str,
+    file_path: &Path,
+) -> Result<(), PersistenceError> {
+    // Export the Loro snapshot bytes FIRST (a NaN/Inf rejection surfaces before
+    // we touch the filesystem) — mirrors `save_workbook_with_oplog`.
+    let loro_bytes = oplog.export_bytes()?;
+    let mut bytes = Vec::with_capacity(OPLOG_HEADER_LEN + loro_bytes.len());
+    bytes.extend_from_slice(&OPLOG_MAGIC);
+    bytes.extend_from_slice(&OPLOG_SCHEMA_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&loro_bytes);
+
+    save_workbook_file_extending(wb, name, file_path, |stage_dir| {
+        fs::write(stage_dir.join(OPLOG_FILENAME), &bytes).map_err(QbookError::Io)
+    })?;
+    Ok(())
+}
+
+/// **Wave H1 (2026-06-19):** load a workbook AND its op log from a single-file
+/// `.qbook` ZIP container. The file-format analogue of
+/// [`load_workbook_with_oplog`]: verifies the container sentinel + extracts the
+/// members into a system-temp staging dir (zip-slip-guarded), then reuses
+/// [`load_workbook_with_oplog`] on that directory — so the envelope, sheets,
+/// AND `oplog.bin` (including the `MissingFile` loud-failure when the op-log
+/// entry is absent) are validated by exactly the same code as the dir format.
+pub fn load_workbook_file_with_oplog(
+    file_path: &Path,
+) -> Result<(Workbook, OpLog), PersistenceError> {
+    let stage = extract_container_to_staging(file_path)?;
+    let result = load_workbook_with_oplog(&stage);
+    cleanup_extracted_container(&stage);
+    result
 }
 
 /// **Phase 5.2 D-1 step 7 (2026-05-20):** decode `oplog.bin` bytes,

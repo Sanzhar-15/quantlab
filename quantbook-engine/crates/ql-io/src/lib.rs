@@ -25,11 +25,13 @@ pub mod qbook_format;
 pub use ql_oplog::wire::{error_to_canonical_text, CellWireValue, NamedTargetWire};
 
 pub use oplog_persistence::{
-    load_workbook_with_oplog, save_workbook_with_oplog, PersistenceError, OPLOG_FILENAME,
-    OPLOG_HEADER_LEN, OPLOG_MAGIC, OPLOG_MIN_SUPPORTED_SCHEMA_VERSION, OPLOG_SCHEMA_VERSION,
+    load_workbook_file_with_oplog, load_workbook_with_oplog, save_workbook_file_with_oplog,
+    save_workbook_with_oplog, PersistenceError, OPLOG_FILENAME, OPLOG_HEADER_LEN, OPLOG_MAGIC,
+    OPLOG_MIN_SUPPORTED_SCHEMA_VERSION, OPLOG_SCHEMA_VERSION,
 };
 pub use qbook_format::{
-    load_workbook, save_workbook, save_workbook_extending, CellRecord, FormatEntry, FormatEntryId,
-    FormatOverlayEntry, FormatsSection, NamedEntry, NamesSection, QbookError, SheetEnvelope,
-    WorkbookEnvelope, MIN_SUPPORTED_SCHEMA_VERSION, WORKBOOK_SCHEMA_VERSION,
+    load_workbook, load_workbook_file, save_workbook, save_workbook_extending, save_workbook_file,
+    save_workbook_file_extending, CellRecord, FormatEntry, FormatEntryId, FormatOverlayEntry,
+    FormatsSection, NamedEntry, NamesSection, QbookError, SheetEnvelope, WorkbookEnvelope,
+    MIN_SUPPORTED_SCHEMA_VERSION, WORKBOOK_SCHEMA_VERSION,
 };

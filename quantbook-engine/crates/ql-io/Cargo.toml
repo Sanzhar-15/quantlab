@@ -21,6 +21,12 @@ serde       = { workspace = true }
 serde_json  = { workspace = true }
 toml        = { workspace = true }
 thiserror   = { workspace = true }
+# **Wave H1 (2026-06-19):** single-file `.qbook` container. A `.qbook` is a
+# ZIP of the existing dir-bundle members (`workbook.toml`, `sheets/*.jsonl`,
+# `oplog.bin`). Pin matches `ql-io-xlsx` (already resolved in Cargo.lock) so no
+# new transitive cost; `default-features = false` keeps zip's `time` feature
+# OFF (entry timestamps are pinned explicitly for deterministic output).
+zip         = { version = "=0.6.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -2858,6 +2858,16 @@ impl CollabSession {
     ///   violation, malformed cell).
     /// - `[session_oplog]` if the Loro snapshot encode fails inside
     ///   `save_workbook_with_oplog`.
+    ///
+    /// **Wave H1 (2026-06-19) — Gap-C:** `CollabSession` is the DORMANT collab
+    /// facade. v1's live single-writer path is `Session::save`/`open`, which
+    /// Wave H1 switched to the single-file `.qbook` container. `toQbook` /
+    /// `fromQbook` intentionally stay on the DIRECTORY format
+    /// (`save_workbook_with_oplog` / `load_workbook_with_oplog`) — they are not
+    /// on any live `.qbook` I/O path. If collab is revived, give them the same
+    /// `is_dir`/file dispatch as `WorkbookSession::open` (a
+    /// `load_workbook_with_oplog_any` helper). Tracked follow-up; NOT a silent
+    /// half-migration.
     #[napi(js_name = "toQbook")]
     pub fn to_qbook(&self, path: String) -> Result<()> {
         let inner = self.inner.lock();
@@ -3730,6 +3740,10 @@ impl CollabSession {
     /// - `[qbook_unsupported_version]` / `[qbook_truncated_header]`
     ///   for `oplog.bin` Tier D3 header issues.
     /// - `[session_oplog]` if Loro can't decode the snapshot bytes.
+    ///
+    /// **Wave H1 (2026-06-19) — Gap-C:** stays on the DIRECTORY format
+    /// (`load_workbook_with_oplog`); see `toQbook` for the rationale (dormant
+    /// collab facade; live `.qbook` I/O is `Session`, now single-file).
     #[napi(factory, js_name = "fromQbook")]
     pub fn from_qbook(path: String, peer_id_override: BigInt) -> Result<Self> {
         let pid = peer_id_from_bigint(&peer_id_override)?;
@@ -7327,10 +7341,12 @@ impl Session {
         })
     }
 
-    /// Save the live workbook + this session's op-log to a `.qbook` directory at
-    /// `path` (atomic rename protocol). The workbook display name is derived from the
-    /// path's file stem — a path with no stem is `[bad_argument]`. `[invalid_state]`
+    /// Save the live workbook + this session's op-log to a single-file `.qbook`
+    /// container at `path` (**Wave H1** — formerly a `.qbook` directory; one
+    /// atomic `rename`). The workbook display name is derived from the path's
+    /// file stem — a path with no stem is `[bad_argument]`. `[invalid_state]`
     /// off a readable state; I/O / serialization failures surface `[persistence]`.
+    /// Saving onto an existing legacy `.qbook` DIRECTORY is refused `[persistence]`.
     #[napi(js_name = "save", catch_unwind)]
     pub fn save(&self, env: Env, path: String) -> Result<()> {
         guarded(env, "save", || {

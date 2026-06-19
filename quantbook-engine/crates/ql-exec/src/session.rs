@@ -1564,8 +1564,20 @@ impl EngineSession for WorkbookSession {
         // Load + validate BOTH the workbook envelope and the op-log sidecar; the
         // op-log is discarded (Option 1). A missing sidecar or a bad envelope
         // surfaces loud as a `Persistence` error (No-Fallbacks).
-        let (wb, discarded_oplog) =
-            ql_io::load_workbook_with_oplog(Path::new(path)).map_err(map_persistence_err)?;
+        //
+        // **Wave H1 (2026-06-19):** `.qbook` is now a single FILE (a ZIP
+        // container). Dispatch on the on-disk shape so legacy directory bundles
+        // still open: a directory → the dir loader; anything else (including a
+        // non-existent path, which fails loud as `NotFound` inside the file
+        // loader, matching the prior contract) → the single-file loader. This
+        // is an explicit format branch, NOT a silent fallback — both branches
+        // surface their own persistence errors.
+        let target = Path::new(path);
+        let (wb, discarded_oplog) = if target.is_dir() {
+            ql_io::load_workbook_with_oplog(target).map_err(map_persistence_err)?
+        } else {
+            ql_io::load_workbook_file_with_oplog(target).map_err(map_persistence_err)?
+        };
         // `load_workbook_with_oplog` validates only the Loro snapshot FRAMING;
         // per-op JSON is deserialized lazily by `OpLog::iter()` (`log.rs:107`).
         // A frame-valid but payload-corrupt sidecar (e.g. a pre-Tier-D3 op shape
@@ -1728,15 +1740,21 @@ impl EngineSession for WorkbookSession {
         }
     }
 
-    /// Save the live workbook + this session's op-log to a `.qbook` directory
-    /// (inc.2c-9). Both files land atomically via the `.qbook` rename protocol
-    /// (`ql_io::save_workbook_with_oplog`). Under Option 1 the op-log holds only
-    /// edits made since construction/`open`, so a re-save of an opened file
-    /// writes just this session's edits (the documented history trade-off).
+    /// Save the live workbook + this session's op-log to a single-file `.qbook`
+    /// container (inc.2c-9; **Wave H1 (2026-06-19)** — formerly a `.qbook`
+    /// directory). Workbook + op-log land atomically via the single-file ZIP
+    /// protocol (`ql_io::save_workbook_file_with_oplog`): the container is
+    /// streamed to a sibling temp file, fsync'd, then atomically renamed onto
+    /// `path` (one `rename(2)` — strictly safer than the old dir protocol's
+    /// move-aside window). Under Option 1 the op-log holds only edits made since
+    /// construction/`open`, so a re-save of an opened file writes just this
+    /// session's edits (the documented history trade-off).
     ///
     /// The workbook display name written into the envelope is derived from the
     /// path's file stem — the `.qbook` format's own documented default; the
-    /// in-memory `Workbook` carries no document name in v1.
+    /// in-memory `Workbook` carries no document name in v1. Saving onto an
+    /// existing legacy `.qbook` DIRECTORY is refused loudly (`InvalidPath`);
+    /// the user opens the old bundle (dir dispatch) and saves to a new path.
     fn save(&self, path: &str) -> EngineResult<()> {
         self.ensure_readable()?;
         let p = Path::new(path);
@@ -1745,7 +1763,7 @@ impl EngineSession for WorkbookSession {
                 "save path {path:?} has no file stem to derive a workbook name from"
             ))
         })?;
-        ql_io::save_workbook_with_oplog(&self.workbook, &self.oplog, name, p)
+        ql_io::save_workbook_file_with_oplog(&self.workbook, &self.oplog, name, p)
             .map_err(map_persistence_err)?;
         Ok(())
     }
@@ -8465,15 +8483,31 @@ mod tests {
         assert_eq!(err.code, "bad_argument");
     }
 
-    /// open of a `.qbook` whose `oplog.bin` sidecar is corrupt fails LOUD as a
-    /// `Persistence` error and leaves the session untouched (the Codex inc.2c-9
-    /// HIGH: a corrupt sidecar must not be silently accepted then masked by the
-    /// next save). Here the corruption is at the Loro framing level (caught by
-    /// `load_workbook_with_oplog`); payload-level corruption (frame-valid op JSON
-    /// of the wrong shape) is caught by the `open` op-iteration validation loop
-    /// and pinned at the ql-oplog layer by `d1_step8_legacy_op_shape.rs`.
+    /// **Wave H1:** `save` onto a path occupied by an existing DIRECTORY (e.g. a
+    /// legacy `.qbook` bundle) is refused LOUD as `Persistence` — the single-file
+    /// container can't overwrite a directory, and the directory is left intact.
     #[test]
-    fn open_with_corrupt_oplog_sidecar_fails_loud_persistence() {
+    fn save_onto_existing_directory_fails_loud_persistence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("legacy.qbook");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut s = WorkbookSession::new();
+        s.add_sheet("S", 16384).unwrap();
+        let err = s.save(path.to_str().unwrap()).unwrap_err();
+        assert_eq!(err.class, ErrorClass::Persistence);
+        assert!(path.is_dir(), "the existing directory must be untouched");
+    }
+
+    /// open of a single-file `.qbook` whose container bytes are corrupt fails
+    /// LOUD as a `Persistence` error and leaves the session untouched (the Codex
+    /// inc.2c-9 HIGH, generalized to the **Wave H1 (2026-06-19)** container: a
+    /// corrupt file must not be silently accepted then masked by the next save).
+    /// Op-log-specific corruption (Loro framing / payload op shape) is pinned at
+    /// the ql-io layer — `oplog_persistence`'s dir tests + the H1
+    /// `qbook_file_roundtrip` suite, which the single-file loader funnels through
+    /// the SAME `load_workbook_with_oplog` — and by `d1_step8_legacy_op_shape.rs`.
+    #[test]
+    fn open_with_corrupt_container_fails_loud_persistence() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("corrupt.qbook");
         let path_str = path.to_str().unwrap();
@@ -8484,8 +8518,12 @@ mod tests {
                 .unwrap();
             s.save(path_str).unwrap();
         }
-        // Corrupt the op-log sidecar in place.
-        std::fs::write(path.join(ql_io::OPLOG_FILENAME), b"not a loro snapshot").unwrap();
+        // **Wave H1:** `.qbook` is now a single FILE (a ZIP container), so the
+        // old `std::fs::write(path.join("oplog.bin"), ..)` corruption is invalid
+        // (the path is a file). Overwrite the container bytes in place; the
+        // single-file loader rejects this loudly (`NotAQbookContainer`/`Zip` ->
+        // `Persistence`) before adopting anything.
+        std::fs::write(&path, b"this is not a quantbook container").unwrap();
 
         let mut s = WorkbookSession::new();
         let err = s.open(path_str).unwrap_err();

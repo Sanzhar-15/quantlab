@@ -244,6 +244,26 @@ pub const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 /// to touch marker-less `.bak-*` siblings.
 const ATOMIC_SAVE_MARKER_FILENAME: &str = ".atomic-save-marker-v1";
 
+/// **Wave H1 (2026-06-19):** the top-level marker entry written into every
+/// single-file `.qbook` ZIP container. `load_workbook_file` verifies this
+/// entry's presence + exact body BEFORE extracting anything — so an arbitrary
+/// `.zip` renamed to `.qbook` (or a future container format) is refused loudly
+/// (`QbookError::NotAQbookContainer`) rather than half-loaded. This
+/// container-format version is intentionally SEPARATE from the
+/// `workbook.toml` `schema_version` (which versions the payload).
+const CONTAINER_SENTINEL_NAME: &str = "quantbook-container";
+const CONTAINER_SENTINEL_BODY: &[u8] = b"quantbook-container-v1\n";
+
+/// **Wave H1 zip-bomb guards** (megaudit MEDIUM): caps on the uncompressed size
+/// of a single member and of the whole container, enforced during extraction
+/// (declared size + a bounded copy via `take`, so a lying central directory
+/// cannot exceed them either). Generous vs. any real financial workbook; a
+/// backstop against decompression-amplification of an adversarial container
+/// (a `.qbook` is meant to be shared/mailed, so the threat model includes
+/// crafted files).
+const MAX_ENTRY_UNCOMPRESSED: u64 = 256 * 1024 * 1024; // 256 MiB per member
+const MAX_TOTAL_UNCOMPRESSED: u64 = 1024 * 1024 * 1024; // 1 GiB total
+
 /// Errors that can occur during save / load.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -440,6 +460,22 @@ pub enum QbookError {
     /// { file, line, detail: e.to_string() })`.
     #[error("wire decode error: {0}")]
     Wire(#[from] WireDecodeError),
+
+    /// **Wave H1 (2026-06-19):** a single-file `.qbook` ZIP-container operation
+    /// failed (malformed/truncated archive, an entry could not be read/written,
+    /// an I/O error inside pack/unpack). The underlying
+    /// `zip::result::ZipError` is stringified so the `zip` crate version stays
+    /// out of this public error surface (no `#[from]`).
+    #[error("qbook container (zip) error: {0}")]
+    Zip(String),
+
+    /// **Wave H1 (2026-06-19):** the file is a readable ZIP but is NOT a
+    /// quantbook single-file container — the `quantbook-container` sentinel
+    /// entry is absent or carries an unexpected body. An arbitrary `.zip`
+    /// renamed to `.qbook` lands here (loud refusal, never a silent
+    /// half-load).
+    #[error("not a quantbook .qbook container: {reason}")]
+    NotAQbookContainer { reason: String },
 }
 
 /// TOML envelope for the workbook. Top-level metadata.
@@ -1104,6 +1140,516 @@ where
             );
         }
     }
+    Ok(())
+}
+
+// ============================================================================
+// Wave H1 (2026-06-19): single-file `.qbook` ZIP container.
+//
+// A single-file `.qbook` is a ZIP whose members are EXACTLY the dir-bundle
+// files (`workbook.toml`, `sheets/<id>.jsonl`, and any sidecars an `extend`
+// closure writes, e.g. `oplog.bin`) plus a top-level `quantbook-container`
+// sentinel entry. The serializers/parsers are reused verbatim by staging into
+// a temp directory (save) / extracting into a temp directory then calling
+// `load_workbook` (load) — zero changes to the envelope/sheet/oplog logic.
+//
+// Atomicity is SIMPLER than the directory path: a regular file is swapped in
+// one `rename(2)`, so there is no move-aside `.bak` dance. The container is
+// streamed to a sibling temp file, fsync'd, then atomically renamed onto the
+// target; the prior file is untouched until that rename (no missing-target
+// window). The `.atomic-save-marker-v1` dotfile is NOT zipped (Gap-A) — it is
+// meaningless inside a single file; the sentinel entry carries provenance.
+// ============================================================================
+
+/// Save a `Workbook` (plus any sidecars the `extend` closure writes into the
+/// staging dir) to `file_path` as a single-file `.qbook` ZIP container. The
+/// single-file analogue of [`save_workbook_extending`].
+///
+/// **No-Fallbacks.** Every error surfaces loudly; both temp artifacts (the
+/// staging dir AND the temp container file) are cleaned best-effort on every
+/// error path, and a cleanup failure is logged to stderr without masking the
+/// primary error.
+///
+/// **Known limitation (megaudit LOW):** a crash *between* creating the sibling
+/// `.tmp-stage-<suffix>/` / `.tmp-save-<suffix>` artifacts and the rename leaves
+/// them as orphans; nothing GCs them (the unique suffix makes them invisible to
+/// `recover_from_crashed_save`, which only handles dir-format `.bak-*`). This
+/// matches the dir format's own `.tmp-save-*` gap and is cosmetic (no data
+/// impact). A note on `Err`: because the parent-dir fsync runs AFTER the rename,
+/// an `Err` can mean "saved but durability unconfirmed" (idempotent on retry),
+/// not necessarily "data lost".
+pub fn save_workbook_file_extending<F>(
+    wb: &Workbook,
+    name: &str,
+    file_path: &Path,
+    extend: F,
+) -> Result<(), QbookError>
+where
+    F: FnOnce(&Path) -> Result<(), QbookError>,
+{
+    // Gap-B: refuse to overwrite a legacy `.qbook` DIRECTORY with a file.
+    // `rename(tmpfile → existing_dir)` would fail with an opaque ENOTDIR/EISDIR;
+    // refuse loudly first. Migration: `WorkbookSession::open` still reads a dir
+    // (dispatch), so the user can open the old bundle and save forward to a new
+    // file path.
+    if file_path.is_dir() {
+        return Err(QbookError::InvalidPath {
+            path: file_path.to_path_buf(),
+            reason: "target is a legacy .qbook directory; cannot overwrite it with a single-file container",
+        });
+    }
+
+    let paths = make_file_save_paths(file_path)?;
+
+    // Step 1: populate a staging directory using the EXISTING dir writer + the
+    // caller's sidecar closure — verbatim, zero serializer changes.
+    if let Err(e) = write_workbook_to_dir(wb, name, &paths.stage) {
+        cleanup_stage(&paths.stage);
+        return Err(e);
+    }
+    if let Err(e) = extend(&paths.stage) {
+        cleanup_stage(&paths.stage);
+        return Err(e);
+    }
+
+    // Step 2: stream the container ZIP to a sibling temp FILE (Gap-H: streamed,
+    // never an in-memory Vec).
+    if let Err(e) = write_container_zip(&paths.stage, &paths.temp_file) {
+        cleanup_stage(&paths.stage);
+        cleanup_file(&paths.temp_file);
+        return Err(e);
+    }
+
+    // Step 3: open the parent directory BEFORE the rename (unix) so a permission
+    // failure (e.g. EACCES on a non-readable parent) surfaces while the prior
+    // target is still intact — NEVER a "reported failure after the file was
+    // already replaced" (Codex HIGH). On non-unix this is a unit handle.
+    let parent_dir = match open_parent_dir_for_sync(file_path) {
+        Ok(handle) => handle,
+        Err(e) => {
+            cleanup_stage(&paths.stage);
+            cleanup_file(&paths.temp_file);
+            return Err(e);
+        }
+    };
+
+    // Step 4: atomic install. `rename(temp_file → file_path)` replaces any prior
+    // file atomically (POSIX). On failure the prior target is untouched; clean
+    // both temps and surface loudly.
+    if let Err(e) = fs::rename(&paths.temp_file, file_path) {
+        cleanup_stage(&paths.stage);
+        cleanup_file(&paths.temp_file);
+        return Err(QbookError::Io(e));
+    }
+
+    // The staging dir has served its purpose.
+    cleanup_stage(&paths.stage);
+
+    // Step 5: fsync the parent directory (via the fd opened in Step 3) so the
+    // rename is durable. Because the fd was opened BEFORE the rename, this only
+    // fails on a genuine I/O error (surfaced loudly per No-Fallbacks); the new
+    // file is already in place. No-op on non-unix.
+    sync_parent_dir(parent_dir)?;
+    Ok(())
+}
+
+/// Save a `Workbook` to a single-file `.qbook` ZIP container (no sidecars).
+/// Thin wrapper over [`save_workbook_file_extending`] with a no-op closure —
+/// the file-format analogue of [`save_workbook`]. Callers that also persist an
+/// op-log use `ql_io::save_workbook_file_with_oplog`.
+pub fn save_workbook_file(wb: &Workbook, name: &str, file_path: &Path) -> Result<(), QbookError> {
+    save_workbook_file_extending(wb, name, file_path, |_| Ok(()))
+}
+
+/// Load a `Workbook` from a single-file `.qbook` ZIP container. The single-file
+/// analogue of [`load_workbook`].
+///
+/// Verifies the `quantbook-container` sentinel (a foreign `.zip` fails loud
+/// with [`QbookError::NotAQbookContainer`]), extracts the members into a
+/// **system-temp** staging directory (zip-slip-guarded via `enclosed_name`),
+/// then delegates to [`load_workbook`] on that directory — so all
+/// envelope/sheet validation is reused verbatim. Staging lives in the system
+/// temp location (not beside `file_path`) so opening a `.qbook` from a
+/// read-only folder needs no write access there.
+pub fn load_workbook_file(file_path: &Path) -> Result<Workbook, QbookError> {
+    let stage = extract_container_to_staging(file_path)?;
+    let result = load_workbook(&stage);
+    // Always clean up the staging dir, regardless of outcome.
+    cleanup_extracted_container(&stage);
+    result
+}
+
+/// Open a single-file `.qbook` container, verify its sentinel BEFORE extracting
+/// anything (No-Fallbacks: a non-qbook zip is refused loudly, never partially
+/// materialized), and extract its members into a fresh system-temp staging
+/// directory (zip-slip-guarded). Returns the staging dir path; the CALLER must
+/// [`cleanup_extracted_container`] it. Shared by [`load_workbook_file`] and
+/// `oplog_persistence::load_workbook_file_with_oplog` so the sentinel check +
+/// extraction live in ONE place.
+pub(crate) fn extract_container_to_staging(file_path: &Path) -> Result<PathBuf, QbookError> {
+    let file = fs::File::open(file_path)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| QbookError::Zip(e.to_string()))?;
+    verify_container_sentinel(&mut archive)?;
+    let stage = make_load_stage_dir()?;
+    if let Err(e) = extract_container(&mut archive, &stage) {
+        cleanup_stage(&stage);
+        return Err(e);
+    }
+    Ok(stage)
+}
+
+/// Remove a staging directory produced by [`extract_container_to_staging`].
+pub(crate) fn cleanup_extracted_container(stage: &Path) {
+    cleanup_stage(stage);
+}
+
+/// Resolved sibling temp paths for one single-file save. Both live in the
+/// target's parent directory (same filesystem → the final `rename` is atomic).
+struct FileSavePaths {
+    /// Staging directory the dir-writer populates before zipping.
+    stage: PathBuf,
+    /// Temp container file the ZIP is streamed to before the atomic install.
+    temp_file: PathBuf,
+}
+
+/// Derive the sibling staging-dir + temp-file paths for a single-file save.
+/// Mirrors [`make_save_paths`]: degenerate paths error loudly, and basenames
+/// that collide with the atomic-save protocol naming are refused.
+fn make_file_save_paths(target: &Path) -> Result<FileSavePaths, QbookError> {
+    let parent = target.parent().ok_or_else(|| QbookError::InvalidPath {
+        path: target.to_path_buf(),
+        reason: "no parent directory",
+    })?;
+    let basename = target
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| QbookError::InvalidPath {
+            path: target.to_path_buf(),
+            reason: "no file name",
+        })?;
+    if basename.contains(".tmp-save-")
+        || basename.contains(".tmp-stage-")
+        || basename.contains(".bak-")
+    {
+        return Err(QbookError::InvalidPath {
+            path: target.to_path_buf(),
+            reason: "basename collides with atomic-save protocol naming",
+        });
+    }
+    let suffix = save_session_suffix();
+    Ok(FileSavePaths {
+        stage: parent.join(format!("{basename}.tmp-stage-{suffix}")),
+        temp_file: parent.join(format!("{basename}.tmp-save-{suffix}")),
+    })
+}
+
+/// Create a unique system-temp staging directory for an open. Lives outside the
+/// source file's folder so opening a `.qbook` from a read-only location needs
+/// no write access there.
+fn make_load_stage_dir() -> Result<PathBuf, QbookError> {
+    // Exclusive creation (`create_dir`, NOT `_all`): a (clock-broken) suffix
+    // collision then fails loudly instead of silently reusing a stale staging
+    // dir that may hold another open's extracted contents (megaudit LOW).
+    let dir = std::env::temp_dir().join(format!("qbook-open-{}", save_session_suffix()));
+    fs::create_dir(&dir).map_err(QbookError::Io)?;
+    Ok(dir)
+}
+
+/// Stream the staging directory's members into a deterministic ZIP at
+/// `out_path`. Members are collected by walking `stage` (skipping the
+/// atomic-save marker dotfile — Gap-A), sorted by entry name for byte-stable
+/// output, and written Deflated with an explicitly pinned timestamp (so the
+/// bytes never depend on wall-clock, nor on whether zip's `time` feature gets
+/// unified on elsewhere in the dependency graph). The `quantbook-container`
+/// sentinel entry is written first.
+fn write_container_zip(stage: &Path, out_path: &Path) -> Result<(), QbookError> {
+    use std::io::Write as _;
+    let file = fs::File::create(out_path)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .last_modified_time(zip::DateTime::default())
+        .unix_permissions(0o644);
+
+    // Sentinel first.
+    zip.start_file(CONTAINER_SENTINEL_NAME, options)
+        .map_err(|e| QbookError::Zip(e.to_string()))?;
+    zip.write_all(CONTAINER_SENTINEL_BODY)?;
+
+    // Enumerate members + sort for determinism; the marker dotfile is excluded.
+    let mut members: Vec<(String, PathBuf)> = Vec::new();
+    collect_members(stage, stage, &mut members)?;
+    members.sort_by(|a, b| a.0.cmp(&b.0));
+    for (entry_name, abs) in &members {
+        zip.start_file(entry_name.clone(), options)
+            .map_err(|e| QbookError::Zip(e.to_string()))?;
+        // Stream the member into the ZIP (Gap-H / Codex HIGH): never read the
+        // whole file into a Vec — a large `sheets/*.jsonl` could allocate GiBs.
+        let mut src = fs::File::open(abs)?;
+        std::io::copy(&mut src, &mut zip)?;
+    }
+
+    let mut file = zip.finish().map_err(|e| QbookError::Zip(e.to_string()))?;
+    file.flush()?;
+    file.sync_all()?; // content durability BEFORE the atomic rename
+    Ok(())
+}
+
+/// Recursively collect `(forward-slash relative entry name, absolute path)` for
+/// every FILE under `dir`, skipping the atomic-save marker (Gap-A). `root` is
+/// the staging root used to compute relative names. Staging is engine-written,
+/// so there are no symlinks to follow.
+fn collect_members(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<(), QbookError> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            collect_members(root, &path, out)?;
+        } else if ft.is_file() {
+            if entry.file_name() == std::ffi::OsStr::new(ATOMIC_SAVE_MARKER_FILENAME) {
+                continue;
+            }
+            let rel = path.strip_prefix(root).map_err(|_| {
+                QbookError::Zip(format!(
+                    "staging path {path:?} escaped staging root {root:?}"
+                ))
+            })?;
+            // Force forward-slash entry names (portable; extracted on any OS).
+            let entry_name = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.push((entry_name, path));
+        }
+    }
+    Ok(())
+}
+
+/// Read + verify the `quantbook-container` sentinel entry. Absent entry or
+/// unexpected body → loud [`QbookError::NotAQbookContainer`].
+fn verify_container_sentinel<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Result<(), QbookError> {
+    use std::io::Read as _;
+    let mut body = Vec::new();
+    {
+        let mut sentinel = match archive.by_name(CONTAINER_SENTINEL_NAME) {
+            Ok(f) => f,
+            Err(zip::result::ZipError::FileNotFound) => {
+                return Err(QbookError::NotAQbookContainer {
+                    reason: format!("missing `{CONTAINER_SENTINEL_NAME}` marker entry"),
+                });
+            }
+            Err(e) => return Err(QbookError::Zip(e.to_string())),
+        };
+        // Cap the read so a sentinel entry crafted to inflate to GiBs cannot OOM
+        // before the body comparison (megaudit zip-bomb). One byte over the
+        // expected length is enough to detect a too-long (wrong) body.
+        sentinel
+            .by_ref()
+            .take(CONTAINER_SENTINEL_BODY.len() as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(QbookError::Io)?;
+    }
+    if body != CONTAINER_SENTINEL_BODY {
+        return Err(QbookError::NotAQbookContainer {
+            reason:
+                "`quantbook-container` marker body does not match the expected container version"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Extract every entry of `archive` into `stage`. Hardened against adversarial
+/// containers (a `.qbook` is meant to be shared):
+/// - **zip-slip** — `enclosed_name()` rejects `..`/absolute names that escape,
+///   AND any entry whose path contains a `ParentDir` component is refused even
+///   if depth-neutral (`sheets/../workbook.toml` would otherwise resolve to
+///   `stage/workbook.toml` and substitute a member — megaudit MEDIUM).
+/// - **duplicate entries** — two `sheets/0.jsonl` (or two sentinels) are
+///   ambiguous (extraction order picks a silent winner); refuse loudly.
+/// - **zip-bomb** — per-entry + cumulative uncompressed caps, plus a bounded
+///   copy so a lying central directory cannot exceed them.
+/// The sentinel entry is metadata, not a workbook member, so it is skipped.
+fn extract_container<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    stage: &Path,
+) -> Result<(), QbookError> {
+    use std::io::Read as _;
+    fs::create_dir_all(stage)?;
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut total_extracted: u64 = 0;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| QbookError::Zip(e.to_string()))?;
+        // Zip-slip guard (Gap-G): reject `..`/absolute/escaping names outright.
+        let rel = match entry.enclosed_name().map(|p| p.to_path_buf()) {
+            Some(p) => p,
+            None => {
+                let raw = entry.name().to_string();
+                return Err(QbookError::Zip(format!(
+                    "unsafe entry name {raw:?} in .qbook container (zip-slip)"
+                )));
+            }
+        };
+        // Reject ANY non-`Normal` path component (`..`, `.`, or a stray
+        // root/prefix that slipped past `enclosed_name`). Real members are pure
+        // names (`workbook.toml`, `sheets/0.jsonl`, ...); a `ParentDir`
+        // (`sheets/../workbook.toml`) OR a `CurDir` (`./workbook.toml`) resolves
+        // via `join` to a sibling and could silently substitute an earlier
+        // member. Loud reject (not silent normalization — dropping a `..` would
+        // be a silent transform).
+        if rel
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(QbookError::Zip(format!(
+                "entry name {rel:?} has a non-normal path component in .qbook container"
+            )));
+        }
+        // CANONICAL member key: rebuild from the (now all-`Normal`,
+        // separator-collapsed) components. This single key is used for dedup,
+        // the sentinel comparison, AND the extraction target — so lexical
+        // aliases that `join` to the same file (`sheets//0.jsonl` vs
+        // `sheets/0.jsonl`) cannot slip past the `HashSet` as distinct keys and
+        // substitute a member. Closes the whole lexical-alias class at once
+        // (Codex pass-3 MEDIUM), not one variant at a time.
+        let canon: PathBuf = rel.components().map(|c| c.as_os_str()).collect();
+        // Reject duplicate entries (incl. a duplicate sentinel): checked BEFORE
+        // the sentinel skip so two sentinels are caught too.
+        if !seen.insert(canon.clone()) {
+            return Err(QbookError::Zip(format!(
+                "duplicate entry {canon:?} in .qbook container"
+            )));
+        }
+        // Zip-bomb guard: a fast reject on an absurd DECLARED size, then bound
+        // the ACTUAL extracted bytes — per-entry AND against the remaining total
+        // budget — so a central directory that LIES about sizes (declares 1
+        // byte, inflates to GiBs) still cannot exceed either cap.
+        if entry.size() > MAX_ENTRY_UNCOMPRESSED {
+            return Err(QbookError::Zip(format!(
+                "entry {canon:?} too large: declares {} bytes (cap {MAX_ENTRY_UNCOMPRESSED})",
+                entry.size()
+            )));
+        }
+        if canon == Path::new(CONTAINER_SENTINEL_NAME) {
+            continue;
+        }
+        let out = stage.join(&canon);
+        if entry.is_dir() {
+            fs::create_dir_all(&out)?;
+        } else {
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            // Exclusive create (`create_new` = O_EXCL): if two entries resolve to
+            // the SAME on-disk target they cannot both succeed — the second fails
+            // `AlreadyExists`. This is the filesystem-level backstop that closes
+            // the alias class the lexical `canon` key cannot fully cover: a
+            // case-insensitive FS (`sheets/0.jsonl` vs `SHEETS/0.jsonl`), unicode
+            // NFC/NFD, etc. (Codex pass-4 MEDIUM). The staging dir is freshly
+            // created + empty, so a legitimate distinct member always succeeds.
+            let mut f = match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(QbookError::Zip(format!(
+                        "entry {canon:?} aliases an already-extracted member in .qbook container"
+                    )));
+                }
+                Err(e) => return Err(QbookError::Io(e)),
+            };
+            // Bound this copy by the SMALLER of the per-entry cap and the bytes
+            // remaining in the total budget. Copy EXACTLY up to the limit, then
+            // peek one more byte (read into memory, never written to disk) to
+            // detect overflow — so the cap is never exceeded on disk, even by
+            // one byte (Codex pass-3 LOW).
+            let remaining = MAX_TOTAL_UNCOMPRESSED.saturating_sub(total_extracted);
+            let entry_limit = MAX_ENTRY_UNCOMPRESSED.min(remaining);
+            let copied = std::io::copy(&mut entry.by_ref().take(entry_limit), &mut f)?;
+            if copied == entry_limit && entry.read(&mut [0u8; 1])? > 0 {
+                return Err(QbookError::Zip(format!(
+                    "entry {canon:?} exceeded the .qbook size budget during extraction"
+                )));
+            }
+            total_extracted = total_extracted.saturating_add(copied);
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort removal of a single-file-save staging directory. A cleanup
+/// failure is logged loudly but never masks the primary error.
+fn cleanup_stage(stage: &Path) {
+    if stage.exists() {
+        if let Err(e) = fs::remove_dir_all(stage) {
+            eprintln!("warning: failed to clean .qbook staging dir {stage:?}: {e}");
+        }
+    }
+}
+
+/// Best-effort removal of a single-file-save temp container file.
+fn cleanup_file(file: &Path) {
+    if file.exists() {
+        if let Err(e) = fs::remove_file(file) {
+            eprintln!("warning: failed to clean .qbook temp file {file:?}: {e}");
+        }
+    }
+}
+
+/// A held parent-directory handle to fsync AFTER a successful rename. On unix
+/// it is an open directory fd; on non-unix it is unit (directory fsync is a
+/// POSIX concept the platform does not expose — the atomic rename still gives
+/// crash-safety, only the extra durability barrier is unavailable).
+#[cfg(unix)]
+type ParentDirHandle = fs::File;
+#[cfg(not(unix))]
+type ParentDirHandle = ();
+
+/// Open the parent directory of `file_path` for a post-rename fsync. Called
+/// BEFORE the rename so a permission error (e.g. EACCES) surfaces while the
+/// prior target is still intact — never after it was already replaced
+/// (Codex HIGH).
+#[cfg(unix)]
+fn open_parent_dir_for_sync(file_path: &Path) -> Result<ParentDirHandle, QbookError> {
+    let parent = file_path.parent().unwrap_or_else(|| Path::new(""));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    fs::File::open(parent).map_err(QbookError::Io)
+}
+
+#[cfg(not(unix))]
+fn open_parent_dir_for_sync(_file_path: &Path) -> Result<ParentDirHandle, QbookError> {
+    Ok(())
+}
+
+/// fsync the parent-directory handle opened by [`open_parent_dir_for_sync`], so
+/// the just-completed rename is durable across power loss (POSIX).
+#[cfg(unix)]
+fn sync_parent_dir(parent: ParentDirHandle) -> Result<(), QbookError> {
+    parent.sync_all().map_err(QbookError::Io)
+}
+
+/// Non-unix: directory fsync is a POSIX concept not exposed here. The atomic
+/// rename already provides crash-safety (old-or-new, never neither); the extra
+/// durability barrier is simply unavailable — a documented platform limitation,
+/// NOT a swallowed error.
+#[cfg(not(unix))]
+fn sync_parent_dir(_parent: ParentDirHandle) -> Result<(), QbookError> {
     Ok(())
 }
 
