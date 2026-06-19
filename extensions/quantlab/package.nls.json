@@ -124,6 +124,7 @@
 	"view.livePython.title": "Live Python",
 	"view.depGraph.title": "Dependencies",
 	"view.diagnostics.title": "Errors",
+	"view.functionCatalog.title": "Functions",
 	"view.sqlQuery.title": "SQL Query",
 	"command.switchToVisualise.title": "Switch to Visualise View",
 	"command.switchToDataEditor.title": "Switch to Data Editor",

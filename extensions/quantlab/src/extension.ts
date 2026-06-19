@@ -17,6 +17,7 @@ import { registerReactiveNotebookController } from './quantbook/reactiveNotebook
 import { registerQuantbookShell } from './quantbook/shell/quantbookShell';
 import { registerDepGraphSidebar } from './quantbook/shell/registerDepGraphSidebar';
 import { registerDiagnosticsView } from './quantbook/shell/registerDiagnosticsView';
+import { registerFunctionCatalogView } from './quantbook/shell/registerFunctionCatalogView';
 import { SqlQueryViewProvider } from './quantbook/shell/SqlQueryViewProvider';
 import { registerQuantbookMcpServer } from './quantbook/mcp/mcpServer';
 import type { SessionInstance } from './quantbook/types';
@@ -412,6 +413,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// the tooltip, click-to-reveal). Additive; reads quantbookDiagnostics' read API + refreshes on its
 	// onDidChange. Registered AFTER the diagnostics bridge exists.
 	registerDiagnosticsView(context, quantbookDiagnostics);
+
+	// Wave I-b (R12, 2026-06-19): the "Functions" catalog sidebar -- a browsable tree of the focused
+	// workbook's registered functions (built-ins grouped by letter + any UDFs), click-to-copy the name.
+	// Additive; reads session.listFunctions() off the focused grid. Also serves the R22 catalog-UI tail.
+	registerFunctionCatalogView(context);
 
 	const validationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	moduleValidationTimers = validationTimers;

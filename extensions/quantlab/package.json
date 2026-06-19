@@ -1004,6 +1004,11 @@
           "when": "quantbook.hasOpenGrid"
         },
         {
+          "id": "quantlab.functionCatalogView",
+          "name": "%view.functionCatalog.title%",
+          "when": "quantbook.hasOpenGrid"
+        },
+        {
           "id": "quantlab.sqlQueryView",
           "type": "webview",
           "name": "%view.sqlQuery.title%",
