@@ -250,6 +250,7 @@ const state = {
 	errorMessages: [] as string[],
 	createdWatchers: [] as FakeFileSystemWatcher[],
 	commandsExecuted: [] as { command: string; args: unknown[] }[],
+	createdDirs: [] as string[],
 };
 
 export function _resetShimState(): void {
@@ -260,6 +261,12 @@ export function _resetShimState(): void {
 	state.errorMessages.length = 0;
 	state.createdWatchers.length = 0;
 	state.commandsExecuted.length = 0;
+	state.createdDirs.length = 0;
+}
+
+/** Parent dirs passed to `workspace.fs.createDirectory` (Wave H2: assert backup ensured the parent). */
+export function _createdDirs(): readonly string[] {
+	return state.createdDirs;
 }
 
 export function _setWorkspaceFolders(folders: { uri: Uri; name: string }[]): void {
@@ -268,6 +275,11 @@ export function _setWorkspaceFolders(folders: { uri: Uri; name: string }[]): voi
 
 export function _setFile(absPath: string, bytes: Uint8Array): void {
 	state.fsFiles.set(absPath, bytes);
+}
+
+/** Whether the in-memory fs has a file at `absPath` (Wave H2: assert backup.delete() removed it). */
+export function _fileExists(absPath: string): boolean {
+	return state.fsFiles.has(absPath);
 }
 
 export function _writesSnapshot(): { path: string; bytes: Uint8Array }[] {
@@ -341,6 +353,11 @@ export const workspace = {
 		},
 		async delete(uri: Uri): Promise<void> {
 			state.fsFiles.delete(uri.fsPath);
+		},
+		// Wave H2: `backupCustomDocument` ensures the backup destination's parent dir exists before
+		// the engine save. Record created dirs so a test can assert it was called (idempotent).
+		async createDirectory(uri: Uri): Promise<void> {
+			state.createdDirs.push(uri.fsPath);
 		},
 		// Step D bridge (Phase 5): `DataViewManager.ensureCompanionSpec`
 		// probes for a companion `.qviz.json` via `fs.stat`. Real VS Code

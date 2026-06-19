@@ -8,6 +8,7 @@ import { registerDataCommands } from './commands/dataCommands';
 import { registerWatchlistCommands } from './commands/watchlistCommands';
 import { registerQuantbookCommands } from './commands/quantbookCommands';
 import { CellGridPanel } from './quantbook/cellGrid/cellGridPanel';
+import { QbookEditorProvider } from './quantbook/cellGrid/qbookEditorProvider';
 import { QuantbookDiagnostics, QUANTBOOK_DIAGNOSTICS_SCHEME } from './quantbook/diagnostics/quantbookDiagnostics';
 import { registerReactiveKernelCommands, setReactiveDiagnosticsSink } from './quantbook/reactiveKernel/reactiveKernelCommands';
 import type { ReactiveKernelManager } from './quantbook/reactiveKernel/reactiveKernelManager';
@@ -254,6 +255,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(VisualiseSpecProvider.register(context, {
 		lifecycleSource: qvizLifecycleManager,
 	}));
+
+	// Wave H2 (R10 part 2/2, 2026-06-19): the `.qbook` custom editor -- double-clicking a
+	// single-file `.qbook` in the Explorer opens the live cell grid with a dirty tab, Ctrl+S,
+	// Save As, revert, and hot-exit. Additive to the command-driven grid (the demo + Open/Save-As
+	// commands are unchanged); the workbook model lives in the owning engine Session.
+	context.subscriptions.push(QbookEditorProvider.register(context));
 
 	// Visualise v2 -- Promote to Chart. The webview button is the primary
 	// entry point (posts a `promoteToChart` message to the provider); this

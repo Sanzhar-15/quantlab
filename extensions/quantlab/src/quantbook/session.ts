@@ -310,7 +310,56 @@ export function getHiddenRowsChecked(session: SessionInstance, sheet: number): n
  * with the engine's structured `code` as a parseable `[code]` prefix instead of
  * leaving the grid showing stale values.
  */
+/**
+ * **Wave H2 (2026-06-19)** -- per-session "before-recalc failsafe" registry. The `.qbook` custom
+ * editor's dirty signal is computed during the post-commit RENDER; but a mutation commits BEFORE
+ * `recalcDirtyChecked`, and the recalc can throw (e.g. a circular formula -> recompute_iteration_cap),
+ * skipping `onCommit`/the render -> the committed change would be left on a falsely-clean tab.
+ * {@link recalcDirtyChecked} fires the registered failsafe for its session FIRST (before the recalc),
+ * so the editor is conservatively marked dirty regardless of the recalc/render outcome. This covers
+ * EVERY mutation path (dispatcher, panel, and all the command handlers) at one chokepoint. The
+ * command-path grid + non-editor sessions register nothing, so the lookup is a no-op for them.
+ */
+// Keyed by `object` (identity), NOT `SessionInstance`: the SAME napi session object is seen as the
+// narrower `ReactiveSession` by the reactive kernel, so the registry must accept either view of the
+// one object. The registry only ever uses the key for identity (`Map` get/set/delete), never its
+// methods.
+const recalcFailsafes = new Map<object, () => void>();
+
+/** Register a before-recalc failsafe for `session` (the `.qbook` custom editor registers one that
+ *  conservatively marks its document dirty). Replaces any prior registration. */
+export function registerRecalcFailsafe(session: object, failsafe: () => void): void {
+	recalcFailsafes.set(session, failsafe);
+}
+
+/** Remove a session's before-recalc failsafe (panel teardown / session close). Idempotent. */
+export function unregisterRecalcFailsafe(session: object): void {
+	recalcFailsafes.delete(session);
+}
+
+/**
+ * Fire `session`'s registered failsafe, if any. Best-effort: a failsafe throw is logged loud
+ * (No-Fallbacks) but never propagated, so it can never abort the operation it precedes. Exported so
+ * the mutation paths that DON'T go through {@link recalcDirtyChecked} -- the reactive publish and the
+ * non-recalc structural sheet/name ops -- still mark the editor dirty BEFORE their own throwable
+ * post-commit work (a recalc / a `listSheets` read), closing the same false-clean window at every
+ * mutation site through one mechanism.
+ */
+export function fireRecalcFailsafe(session: object): void {
+	const failsafe = recalcFailsafes.get(session);
+	if (failsafe !== undefined) {
+		try {
+			failsafe();
+		} catch (err) {
+			console.error('[quantbook] recalc failsafe threw (dirty marking best-effort):', err);
+		}
+	}
+}
+
 export function recalcDirtyChecked(session: SessionInstance): void {
+	// Wave H2: fire the registered failsafe FIRST -- the mutation whose dependents this recalc
+	// recomputes has already committed, so a recalc throw below must not leave the editor falsely clean.
+	fireRecalcFailsafe(session);
 	const op = session.recalcDirty();
 	const status = session.operationStatus(op);
 	// In-engine recalc is synchronous (recalc_dirty start+awaits before returning),

@@ -33,6 +33,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import * as readline from 'node:readline';
 
 import type { CellRangeJson, CellSnapshotJson, OperationStateJson } from '../types';
+import { fireRecalcFailsafe } from '../session';
 import { PublishedCellsStore, type PublishedRange } from './publishedCellsStore';
 
 /** The minimal napi Session surface the client writes. `SessionInstance` satisfies it structurally. */
@@ -485,6 +486,11 @@ export class ReactiveKernelClient {
 	// engine recalc is synchronous, so the op is terminal on return. The throw propagates out of the
 	// `republish` handler -> the in-flight op rejects -> execute()/onError surface it.
 	private recalcChecked(): void {
+		// Wave H2: a reactive publish has just committed into the session. If this recalc throws, the
+		// republish/refresh chain aborts and no post-commit render runs -- so fire the session's
+		// before-recalc failsafe FIRST (a no-op unless the session is a `.qbook` custom editor) so the
+		// committed publish does not leave the editor on a falsely-clean tab.
+		fireRecalcFailsafe(this.opts.session);
 		const op = this.opts.session.recalcDirty();
 		const status = this.opts.session.operationStatus(op);
 		if (status.state !== 'completed') {

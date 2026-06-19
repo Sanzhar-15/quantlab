@@ -29,6 +29,8 @@
 
 import * as assert from 'assert';
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 import {
 	_resetQuantbookEngineCacheForTests,
@@ -43,6 +45,8 @@ import {
 	deleteSheet,
 	exportCellSnapshot,
 	getHiddenRowsChecked,
+	openWorkbookFromQbook,
+	saveSessionToQbook,
 	setRowsHiddenValidated,
 } from '../src/quantbook/session';
 import type { SessionCellValueInput } from '../src/quantbook/types';
@@ -177,6 +181,116 @@ suite('quantbook owning Session migration -- Phase 6.1B inc.2d', () => {
 				/\[bad_argument\]/,
 				'unknown value kind surfaces a structured [bad_argument] error',
 			);
+		});
+	});
+
+	// ------------------------------------------------------------------------
+	// Wave H2 / R10 (2026-06-19) -- single-file `.qbook` persistence through the
+	// IDE save/open wrappers (`saveSessionToQbook` / `openWorkbookFromQbook`),
+	// exactly what the `.qbook` CustomEditor calls on save/open/backup. Proves:
+	//   - save(path) writes ONE FILE (not a directory) and round-trips full fidelity;
+	//   - a BACKUP path with NO `.qbook` extension round-trips (gap #6: the engine
+	//     discriminates a container by its `quantbook-container` sentinel, not the
+	//     file extension) -- the hot-exit / backupCustomDocument path.
+	// ------------------------------------------------------------------------
+	suite('owning Session -- Wave H2 single-file .qbook + backup-path round-trip', () => {
+		let tmpDir: string;
+
+		suiteSetup(() => {
+			tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qbook-h2-'));
+		});
+		suiteTeardown(() => {
+			if (tmpDir !== undefined) {
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			}
+		});
+
+		/** Seed a small workbook the round-trips assert against. */
+		function seed(): ReturnType<typeof createWorkbookSession> {
+			const s = createWorkbookSession();
+			const sheetId = s.addSheet('Sheet1', 1000);
+			s.setValue(sheetId, 0, 0, { kind: 'number', number: 42 });
+			s.setFormula(sheetId, 0, 1, 'A1+1');
+			s.recalcDirty();
+			return s;
+		}
+
+		function readA1B1(s: ReturnType<typeof createWorkbookSession>, sheetId: number): { a1?: number; b1?: number } {
+			const a1 = s.cell(sheetId, 0, 0)?.value;
+			const b1 = s.cell(sheetId, 0, 1)?.value;
+			return {
+				a1: a1?.kind === 'number' ? a1.number : undefined,
+				b1: b1?.kind === 'number' ? b1.number : undefined,
+			};
+		}
+
+		test('save(path) writes a single FILE (not a directory) and reopens full-fidelity', () => {
+			const s = seed();
+			const sheetId = s.listSheets()[0].id;
+			const qbookPath = path.join(tmpDir, 'wb.qbook');
+			saveSessionToQbook(s, qbookPath);
+			s.close();
+
+			const st = fs.statSync(qbookPath);
+			assert.ok(st.isFile(), '.qbook is now a single FILE (Wave H1), not a directory');
+			assert.ok(st.size > 0, 'the .qbook container is non-empty');
+
+			const reopened = openWorkbookFromQbook(qbookPath);
+			try {
+				const sheets = reopened.listSheets();
+				assert.strictEqual(sheets.length, 1, 'one sheet round-trips');
+				assert.strictEqual(sheets[0].name, 'Sheet1', 'sheet name round-trips');
+				assert.deepStrictEqual(readA1B1(reopened, sheets[0].id), { a1: 42, b1: 43 },
+					'A1 literal + B1 formula value round-trip');
+			} finally {
+				reopened.close();
+			}
+			void sheetId;
+		});
+
+		test('backup to a NO-EXTENSION path round-trips (gap #6: sentinel, not extension)', () => {
+			const s = seed();
+			// VS Code's backup destination is a hashed name with NO `.qbook` extension -- the engine
+			// must still open it as a single-file container (it keys off the internal sentinel).
+			const backupPath = path.join(tmpDir, 'vscode-backup-deadbeef');
+			saveSessionToQbook(s, backupPath);
+			s.close();
+
+			assert.ok(fs.statSync(backupPath).isFile(), 'backup wrote a single file with no .qbook extension');
+
+			const restored = openWorkbookFromQbook(backupPath);
+			try {
+				const sheets = restored.listSheets();
+				assert.deepStrictEqual(readA1B1(restored, sheets[0].id), { a1: 42, b1: 43 },
+					'a no-extension backup file round-trips full fidelity (hot-exit restore)');
+			} finally {
+				restored.close();
+			}
+		});
+
+		test('re-save overwrites the same single file (atomic; no .bak directory dance)', () => {
+			const s = seed();
+			const sheetId = s.listSheets()[0].id;
+			const qbookPath = path.join(tmpDir, 'resave.qbook');
+			saveSessionToQbook(s, qbookPath);
+			// Mutate then re-save to the SAME path.
+			s.setValue(sheetId, 0, 0, { kind: 'number', number: 99 });
+			s.recalcDirty();
+			saveSessionToQbook(s, qbookPath);
+			s.close();
+
+			// Still ONE file at that path (no sibling `.bak` / temp left behind in the dir).
+			assert.ok(fs.statSync(qbookPath).isFile(), 're-save leaves a single file');
+			const siblings = fs.readdirSync(tmpDir).filter(n => n.startsWith('resave'));
+			assert.deepStrictEqual(siblings, ['resave.qbook'], 're-save leaves no stray sibling files');
+
+			const reopened = openWorkbookFromQbook(qbookPath);
+			try {
+				assert.deepStrictEqual(readA1B1(reopened, reopened.listSheets()[0].id), { a1: 99, b1: 100 },
+					'the re-saved value is what reopens');
+			} finally {
+				reopened.close();
+			}
 		});
 	});
 

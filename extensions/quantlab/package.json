@@ -909,6 +909,16 @@
           }
         ],
         "priority": "default"
+      },
+      {
+        "viewType": "quantlab.quantbookCellGridEditor",
+        "displayName": "Quantbook Cell Grid",
+        "selector": [
+          {
+            "filenamePattern": "*.qbook"
+          }
+        ],
+        "priority": "default"
       }
     ],
     "viewsContainers": {

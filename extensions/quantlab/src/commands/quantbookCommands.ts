@@ -35,7 +35,7 @@ import * as vscode from 'vscode';
 // / deleteSheet / moveSheet / workbookSnapshot, the buildSheet* quickpick
 // builders, connectOrSpawn) belong to the B2-stubbed grid commands and are no
 // longer imported here.
-import { addSheet, appendPutValueValidated, createSession, createWorkbookSession, getHiddenRowsChecked, openWorkbookFromQbook, quantbookEngineVersion, recalcDirtyChecked, saveSessionToQbook, sessionFromSnapshot, setFormulaValidated, setRowsHiddenValidated, setValueValidated } from '../quantbook/session';
+import { addSheet, appendPutValueValidated, createSession, createWorkbookSession, fireRecalcFailsafe, getHiddenRowsChecked, openWorkbookFromQbook, quantbookEngineVersion, recalcDirtyChecked, saveSessionToQbook, sessionFromSnapshot, setFormulaValidated, setRowsHiddenValidated, setValueValidated } from '../quantbook/session';
 import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
 import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
@@ -635,11 +635,16 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// sheet-id-keyed registry collision -- no longer exists).
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookOpen', async () => {
+			// Wave H1/H2 (2026-06-19): a `.qbook` is now a single FILE (the engine's ZIP container);
+			// legacy `.qbook` DIRECTORY bundles still load (the engine `open` dispatches on `is_dir`).
+			// Accept BOTH so this command opens either format. (The primary open path is double-click ->
+			// the `.qbook` CustomEditor, which gives the dirty tab / Ctrl+S; this palette command keeps
+			// the additive non-custom-panel behavior and the legacy-directory escape hatch.)
 			const uris = await vscode.window.showOpenDialog({
 				title: 'Open Quantbook',
 				filters: { Quantbook: ['qbook'] },
-				canSelectFiles: false,
-				canSelectFolders: true, // .qbook is a directory
+				canSelectFiles: true,
+				canSelectFolders: true,
 				canSelectMany: false,
 				openLabel: 'Open',
 			});
@@ -716,6 +721,10 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			let newId: number | undefined;
 			try {
 				newId = target.session.addSheet(name.trim(), 1000);
+				// Wave H2: this structural mutation does NOT go through recalcDirtyChecked, and the switch
+				// below reads listSheets before the render -> mark the .qbook editor dirty NOW (no-op for a
+				// non-editor session) so a pre-render throw cannot leave the committed addSheet falsely clean.
+				fireRecalcFailsafe(target.session);
 				log.appendLine(`Added sheet "${name.trim()}" (id ${newId}) to session.`);
 				void vscode.window.showInformationMessage(`Sheet "${name.trim()}" added (id ${newId}).`);
 			} catch (err) {
@@ -861,6 +870,10 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			let opSucceeded = false;
 			try {
 				target.session.deleteSheet(pick.sheet);
+				// Wave H2: structural mutation; the active-sheet branch reads listSheets(survivors) before
+				// the render -> mark the .qbook editor dirty NOW so a pre-render throw cannot leave the
+				// committed delete falsely clean (no-op for a non-editor session).
+				fireRecalcFailsafe(target.session);
 				opSucceeded = true;
 				log.appendLine(`Deleted sheet ${pick.sheet} ("${pick.name}").`);
 				void vscode.window.showInformationMessage(`Sheet ${pick.sheet} ("${pick.name}") deleted.`);

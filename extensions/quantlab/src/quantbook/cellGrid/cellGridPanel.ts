@@ -60,7 +60,7 @@ import { buildFormatUndoLabel, buildSetFormatOps, formatStringForPreset, presetL
 // focus-cell -> freeze-counts math shared by the palette and the context-menu freeze paths.
 import { planFreezeAtSelection, type GridSelectionInput } from './contextMenuLogic';
 import { formatRangeTarget, normalizeSelectionRect } from '../reactiveNotebook/bindVariableLogic';
-import { getHiddenRowsChecked, recalcDirtyChecked, setRowsHiddenValidated } from '../session';
+import { getHiddenRowsChecked, recalcDirtyChecked, registerRecalcFailsafe, setRowsHiddenValidated, unregisterRecalcFailsafe } from '../session';
 import { computeFilterHidden, distinctValuesInColumn, nextFilterHidden, pruneToLive, reconcileHidden, usedRangeFromEntries, type FilterRange } from './filterLogic';
 // FE-11: the name box routes an operator submit to one of navigate / define / error. The pure router +
 // the goToAnchor resolver + the define-toast builder are reused verbatim (the host shell below is thin).
@@ -244,14 +244,68 @@ export class CellGridPanel {
 				localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview', 'quantbook')],
 			},
 		);
-		const instance = new CellGridPanel(panel, session, sheet);
+		return CellGridPanel.mount(context, panel, session, sheet, {
+			ownsSession: true,
+			pushToSubscriptions: true,
+		});
+	}
+
+	/**
+	 * **Wave H2 (2026-06-19) -- adopt an externally-owned `WebviewPanel`** (the one VS Code hands
+	 * `CustomEditorProvider.resolveCustomEditor`) as a cell-grid panel for the `.qbook` custom
+	 * editor. Mirrors {@link show} but: the caller (VS Code) owns the panel lifetime (so it is NOT
+	 * pushed to `context.subscriptions`), and `ownsSession:false` -- the owning `QbookDocument`
+	 * closes the napi `Session` in its OWN dispose, because VS Code may dispose+recreate the webview
+	 * independently of the document. `onMutate` is the dirty-tracking pulse fired at the tail of
+	 * every {@link render}.
+	 *
+	 * Sets `webview.options` (the provider hands a bare panel) BEFORE the shell HTML so
+	 * `asWebviewUri` can resolve the bundle. `retainContextWhenHidden` is set at registration (the
+	 * customEditor `webviewOptions`), so it is not part of `webview.options` here.
+	 */
+	static adopt(
+		context: vscode.ExtensionContext,
+		panel: vscode.WebviewPanel,
+		session: SessionInstance,
+		sheet: number,
+		opts: { ownsSession: boolean; onMutate?: () => void; onRenderError?: () => void },
+	): CellGridPanel {
+		panel.webview.options = {
+			enableScripts: true,
+			localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview', 'quantbook')],
+		};
+		return CellGridPanel.mount(context, panel, session, sheet, {
+			ownsSession: opts.ownsSession,
+			onMutate: opts.onMutate,
+			onRenderError: opts.onRenderError,
+			pushToSubscriptions: false,
+		});
+	}
+
+	/**
+	 * Shared body of {@link show} (command path) and {@link adopt} (custom-editor path): construct
+	 * the instance, wire the panel-scoped listeners, mount the shell, register in the module
+	 * registries, install the dispose teardown, and do the first paint. `opts.ownsSession` decides
+	 * whether THIS panel's dispose closes the owning session (command path) or defers it to the
+	 * document (custom-editor path); `opts.onMutate` is the per-render dirty pulse;
+	 * `opts.pushToSubscriptions` keeps the command path's extension-lifetime panel ownership (the
+	 * custom-editor path omits it -- VS Code owns the panel).
+	 */
+	private static mount(
+		context: vscode.ExtensionContext,
+		panel: vscode.WebviewPanel,
+		session: SessionInstance,
+		sheet: number,
+		opts: { ownsSession: boolean; onMutate?: () => void; onRenderError?: () => void; pushToSubscriptions: boolean },
+	): CellGridPanel {
+		const instance = new CellGridPanel(panel, session, sheet, opts.ownsSession, opts.onMutate, opts.onRenderError);
 		// F4: PANEL-SCOPED disposables. The message + view-state listeners MUST NOT
 		// outlive the panel -- registering them on `context.subscriptions` (extension
 		// lifetime) lets a late buffered webview message reach `handleIncoming` on a
-		// disposed panel / closed session. These are disposed in `onDidDispose`.
-		// Attached BEFORE mounting the shell so the `webviewReady` handshake (posted
-		// on bundle load) is never missed.
-		const panelDisposables: vscode.Disposable[] = [];
+		// disposed panel / closed session. These are disposed in `teardown`. Attached
+		// BEFORE mounting the shell so the `webviewReady` handshake (posted on bundle
+		// load) is never missed.
+		const panelDisposables = instance.panelDisposables;
 		panel.webview.onDidReceiveMessage((raw: unknown) => instance.handleIncoming(raw), undefined, panelDisposables);
 		panel.onDidChangeViewState(e => {
 			if (e.webviewPanel.active) {
@@ -281,70 +335,146 @@ export class CellGridPanel {
 		allPanels.add(instance);
 		// Sheet-tabs refactor: one panel per session (the workbook), keyed by session identity.
 		bySession.set(session, instance);
+		// Wave H2: on the custom-editor path (a document failsafe is wired), register the before-recalc
+		// dirty failsafe for this session. `recalcDirtyChecked` fires it before EVERY recalc on the
+		// session, so a recalc throw that skips the post-commit render still marks the editor dirty
+		// (covers every mutation path -- dispatcher, panel, and the command handlers -- at one chokepoint).
+		// The command path registers nothing (no `onRenderError`). Cleared in `teardown`.
+		if (opts.onRenderError !== undefined) {
+			registerRecalcFailsafe(session, () => instance.markDirtyFailsafe());
+		}
 		focusedPanel = instance;
 		// FE-5: a new grid is now open + focused -> drive the `quantbook.hasOpenGrid` context key and
 		// refresh the Live-Python sidebar. Fired AFTER the registry mutation so a listener that reads
 		// `hasAnyPanel()`/`focusedLocalPanel()` sees this panel.
 		fireGridsChanged();
-		panel.onDidDispose(() => {
-			// Set _disposed BEFORE anything else so a postMessage racing with
-			// disposal early-returns from the onError guard.
-			instance._disposed = true;
-			instance.clearReadyWatchdog();
-			// F4: dispose the panel-scoped listeners so they cannot fire after the
-			// panel is gone.
-			for (const d of panelDisposables) {
-				d.dispose();
-			}
-			allPanels.delete(instance);
-			// W3 (Codex HIGH-2): drop this panel's webview-token map entry so a context-menu command can never
-			// resolve a disposed panel. Guard on identity (a fresh panel may have re-used the string after a
-			// reload) so we only clear our own.
-			if (instance.webviewToken !== undefined && byWebviewToken.get(instance.webviewToken) === instance) {
-				byWebviewToken.delete(instance.webviewToken);
-			}
-			if (focusedPanel === instance) {
-				focusedPanel = undefined;
-			}
-			// Sheet-tabs refactor: one panel per session. Only clear the registry entry if we
-			// still own it (a fresh open for the same session may have replaced us -- e.g. close
-			// racing a reopen). Closing this panel closes the whole workbook (no sibling sheet
-			// panels exist anymore), so dispose == close, unconditionally.
-			if (bySession.get(session) === instance) {
-				bySession.delete(session);
-				// W2 error-surface: the workbook's panel closed -> drop ALL its diagnostics (every
-				// sheet's cell errors + the workbook-level reactive error, which is session-scoped).
-				diagnosticsSink?.clearSessionAll(session);
-				// 1d-1: tear down a reactive kernel bound to this Session BEFORE closing it, so an
-				// in-flight republish cannot write to a closing Session and the ipykernel is not orphaned.
-				fireSessionClosing(session);
-				// The workbook's panel has closed -> close the owning napi Session to release the
-				// engine handle. Open is additive (2026-06-05) -- it never disposes other workbooks.
-				// Log on failure (No-Fallbacks -- never swallow); do not rethrow from a dispose callback.
-				try {
-					session.close();
-				} catch (err) {
-					console.error('[cellGrid] session.close() on panel dispose failed:', err);
-				}
-			}
-			// FE-5: a grid closed (and possibly the focused one / the last one) -> re-evaluate
-			// `quantbook.hasOpenGrid` + refresh the sidebar. Fired AFTER the registry mutation so a
-			// listener sees the post-close `hasAnyPanel()`/`focusedLocalPanel()` state.
-			fireGridsChanged();
-		});
-		context.subscriptions.push(panel);
-		// First paint + the webviewReady watchdog (surfaces a loud error if the bundle never
-		// loads). If the initial render throws, dispose the panel -- which runs the cleanup
-		// above (registry + ref-counted session.close) -- then rethrow so the command surfaces
-		// the error rather than leaving an orphaned panel/session (FE re-audit MED-2).
+		// The dispose teardown closes the owning session ONLY when this panel owns it (command path).
+		// The custom-editor path (`ownsSession:false`) leaves the close to `QbookDocument.dispose()`,
+		// because VS Code can dispose+recreate the webview independently of the document. Pushed into
+		// `panelDisposables` so a `detachForRevert` (which reuses the SAME WebviewPanel) removes THIS
+		// handler -- otherwise each revert would leave another stale `onDidDispose` handler on the
+		// reused panel (they accumulate, each holding a dead instance).
+		panelDisposables.push(panel.onDidDispose(() => instance.teardown({ closeSession: instance.ownsSession })));
+		if (opts.pushToSubscriptions) {
+			context.subscriptions.push(panel);
+		}
+		// First paint + the webviewReady watchdog (surfaces a loud error if the bundle never loads).
+		// If the initial render throws, clean up + rethrow so the caller surfaces the error rather
+		// than leaving an orphaned panel/session (FE re-audit MED-2).
 		try {
 			instance.render();
 			instance.armReadyWatchdog();
 		} catch (err) {
-			panel.dispose();
+			if (opts.pushToSubscriptions) {
+				// Command path: we created + own the panel -> dispose it (runs `teardown` via onDidDispose).
+				panel.dispose();
+			} else {
+				// Custom-editor path: VS Code owns the handed panel -> do NOT dispose it here (disposing a
+				// panel mid-`resolveCustomEditor` can leave the editor inconsistent). Tear down our instance
+				// state directly; rethrow so VS Code surfaces the failure and disposes its own panel.
+				instance.teardown({ closeSession: instance.ownsSession });
+			}
 			throw err;
 		}
 		return instance;
+	}
+
+	/**
+	 * Tear this panel out of the module registries (and, when `opts.closeSession`, close the owning
+	 * napi `Session`). Idempotent via the `_disposed` guard, so the panel-dispose handler and
+	 * {@link detachForRevert} can both call it. The registry deletes are unconditional; only the
+	 * session close is gated (on the custom-editor path the document owns the close).
+	 */
+	private teardown(opts: { closeSession: boolean }): void {
+		// Set _disposed FIRST so a postMessage racing with disposal early-returns from the onError
+		// guard, and so a second call (panel dispose after a revert detach) no-ops.
+		if (this._disposed) {
+			return;
+		}
+		this._disposed = true;
+		this.clearReadyWatchdog();
+		// F4: dispose the panel-scoped listeners so they cannot fire after the panel is gone.
+		for (const d of this.panelDisposables) {
+			d.dispose();
+		}
+		this.panelDisposables.length = 0;
+		allPanels.delete(this);
+		// W3 (Codex HIGH-2): drop this panel's webview-token map entry so a context-menu command can never
+		// resolve a disposed panel. Guard on identity (a fresh panel may have re-used the string after a
+		// reload) so we only clear our own.
+		if (this.webviewToken !== undefined && byWebviewToken.get(this.webviewToken) === this) {
+			byWebviewToken.delete(this.webviewToken);
+		}
+		if (focusedPanel === this) {
+			focusedPanel = undefined;
+		}
+		// Sheet-tabs refactor: one panel per session. Only clear the registry entry if we still own it
+		// (a fresh open/adopt for the same session may have replaced us -- e.g. close racing a reopen,
+		// or a revert re-adopt). Closing this panel closes the whole workbook.
+		if (bySession.get(this.session) === this) {
+			bySession.delete(this.session);
+			// Wave H2: drop our before-recalc failsafe for this session. Guarded by the SAME
+			// bySession-ownership check so a re-resolve that adopted a fresh panel (registering ITS
+			// failsafe) before this teardown ran does NOT delete the new panel's registration.
+			unregisterRecalcFailsafe(this.session);
+			if (opts.closeSession) {
+				CellGridPanel.closeOwnedSession(this.session);
+			}
+		}
+		// FE-5: a grid closed (and possibly the focused one / the last one) -> re-evaluate
+		// `quantbook.hasOpenGrid` + refresh the sidebar. Fired AFTER the registry mutation so a
+		// listener sees the post-close `hasAnyPanel()`/`focusedLocalPanel()` state.
+		fireGridsChanged();
+	}
+
+	/**
+	 * **Wave H2** -- close + release a session the panel/document owns: drop its diagnostics, fire the
+	 * pre-close listeners (so a bound reactive kernel tears down BEFORE close), then `session.close()`.
+	 * Shared by the command-path panel dispose (`ownsSession`) and `QbookDocument.dispose()`.
+	 * `session.close()` is idempotent; a failure is logged loud (No-Fallbacks) but never rethrown
+	 * from a dispose path.
+	 */
+	static closeOwnedSession(session: SessionInstance): void {
+		// W2 error-surface: drop ALL of the workbook's diagnostics (every sheet's cell errors + the
+		// session-scoped reactive error).
+		diagnosticsSink?.clearSessionAll(session);
+		// 1d-1: tear down a reactive kernel bound to this Session BEFORE closing it, so an in-flight
+		// republish cannot write to a closing Session and the ipykernel is not orphaned.
+		fireSessionClosing(session);
+		// Release the owning napi Session to free the engine handle. Log on failure (No-Fallbacks --
+		// never swallow); never rethrow from a dispose path.
+		try {
+			session.close();
+		} catch (err) {
+			console.error('[cellGrid] session.close() on owned-session teardown failed:', err);
+		}
+	}
+
+	/**
+	 * **Wave H2** -- detach the live panel bound to `session` WITHOUT disposing its `WebviewPanel`
+	 * (so the custom-editor revert can {@link adopt} a fresh session onto the SAME panel) AND WITHOUT
+	 * closing the session. The session is left OPEN deliberately: the revert keeps the old session
+	 * recoverable until the fresh session is successfully bound (the provider closes the old session
+	 * itself, only after a successful re-adopt -- so a failed re-adopt leaves the unsaved data
+	 * intact). A no-op if no live panel is bound (defensive).
+	 */
+	static detachForRevert(session: SessionInstance): void {
+		const inst = bySession.get(session);
+		if (inst !== undefined) {
+			inst.teardown({ closeSession: false });
+		}
+	}
+
+	/**
+	 * **Wave H2 -- the dirty FAILSAFE.** Conservatively mark the custom editor's document dirty when
+	 * the precise version-based signal cannot be computed: a render's snapshot acquire / recompute
+	 * threw, OR a mutation has committed to the session but the following `recalcDirtyChecked` threw
+	 * BEFORE the post-commit render could run (e.g. a circular formula -> recompute_iteration_cap). A
+	 * later successful render's precise recompute reconciles (clears it if the mutation was a no-op).
+	 * No-op on the command path (no document / `onRenderError` undefined).
+	 */
+	private markDirtyFailsafe(): void {
+		this.onRenderError?.();
 	}
 
 	/**
@@ -782,6 +912,14 @@ export class CellGridPanel {
 	_disposed: boolean = false;
 
 	/**
+	 * **Wave H2 (2026-06-19)** -- the panel-scoped listener disposables (message receiver +
+	 * view-state). An instance field (was a `mount`-local) so {@link teardown} can dispose them
+	 * both from the panel-dispose handler AND from {@link detachForRevert} (the custom-editor
+	 * revert detaches the old instance WITHOUT disposing the shared `WebviewPanel`).
+	 */
+	private readonly panelDisposables: vscode.Disposable[] = [];
+
+	/**
 	 * Latest computed sheet snapshot. Stored so the FE-0b `webviewReady`
 	 * handshake can (re)send the current state once the bundle's message channel
 	 * is live (render() may run before the bundle has loaded).
@@ -988,6 +1126,19 @@ export class CellGridPanel {
 		// sheet in place via `switchToSheet`. Every reader (render, the dispatch deps, the `target`
 		// getter, focusedGridSelection) reads it fresh, so they always reflect the active sheet.
 		private sheet: number,
+		// Wave H2 (2026-06-19): does THIS panel's dispose close the owning napi Session? `true` for
+		// the command path (the panel owns the session); `false` for the `.qbook` custom editor (the
+		// owning `QbookDocument` closes it, since VS Code can dispose+recreate the webview alone).
+		private readonly ownsSession: boolean,
+		// Wave H2: the dirty-tracking pulse fired once per `render()` (right after the snapshot acquire
+		// advances the version) so the custom editor's document can recompute its dirty state.
+		// `undefined` on the command path (no document).
+		private readonly onMutate: (() => void) | undefined,
+		// Wave H2: the dirty FAILSAFE -- fired when `acquireWorkbookSnapshot()` itself THROWS (so the
+		// precise version-based pulse cannot run). The edit committed before render(), so the document
+		// conservatively marks itself dirty (a safe over-report) rather than risk a falsely-clean tab
+		// over a committed-but-unrenderable edit. `undefined` on the command path.
+		private readonly onRenderError: (() => void) | undefined,
 	) { }
 
 	/**
@@ -1072,7 +1223,31 @@ export class CellGridPanel {
 	}
 
 	render(): void {
-		const wbSnapshot = this.acquireWorkbookSnapshot();
+		// Wave H2 (2026-06-19): the dirty-tracking pulse must NOT be coupled to a successful repaint.
+		// The edit path commits the mutation to the session BEFORE calling render(), and `safeRender`
+		// swallows render throws. So fire the pulse as early as possible:
+		//  - `acquireWorkbookSnapshot()` advances the per-session delta-cache version to the post-
+		//    mutation state. If it succeeds, `onMutate` does the PRECISE version-based recompute -- and
+		//    it runs BEFORE the paint/post below, so a later paint throw cannot leave a committed edit
+		//    on a falsely-clean tab.
+		//  - If `acquireWorkbookSnapshot()` itself throws (build drift / schema / merge), the precise
+		//    version is unavailable, so `onRenderError` conservatively marks the document dirty (a safe
+		//    over-report) before the throw propagates to `safeRender` (which surfaces it loud).
+		// Both are no-ops on the command path (callbacks undefined). A pure-view re-render leaves the
+		// version unchanged, so a successful path yields no dirty transition (no false positives).
+		let wbSnapshot: WorkbookSnapshotJson;
+		try {
+			wbSnapshot = this.acquireWorkbookSnapshot();
+			// The PRECISE recompute runs INSIDE the failsafe try: if either the acquire OR the recompute
+			// itself throws (e.g. `recomputeDirty` -> `readSignature` -> `session.listNames()` for the
+			// token-invisible names axis), `onRenderError` still conservatively marks the document dirty
+			// so a committed edit is not left falsely clean. Runs BEFORE the paint/post below, so a later
+			// paint throw cannot un-mark it either.
+			this.onMutate?.();
+		} catch (err) {
+			this.markDirtyFailsafe();
+			throw err;
+		}
 		const sheetSnapshot: QuantbookCellSnapshot | null = extractSheetSnapshot(wbSnapshot, this.sheet);
 		const snapshot: QuantbookCellSnapshot = sheetSnapshot ?? {
 			snapshot_format_version: 1,
@@ -1842,6 +2017,10 @@ export class CellGridPanel {
 					return;
 				}
 				const newId = this.session.addSheet(name.trim(), 1000);
+				// Wave H2: this structural mutation does NOT go through recalcDirtyChecked, and switchToSheet
+				// below reads listSheets before the render -- mark the editor dirty NOW so a pre-render throw
+				// cannot leave the committed addSheet on a falsely-clean tab.
+				this.markDirtyFailsafe();
 				this.switchToSheet(newId); // D6: adding a sheet switches to it (Excel behavior).
 				return;
 			}
@@ -1876,6 +2055,7 @@ export class CellGridPanel {
 					return;
 				}
 				this.session.renameSheet(sheet, newName.trim());
+				this.markDirtyFailsafe(); // Wave H2: non-recalc mutation -> mark dirty before the render.
 				CellGridPanel.refreshSession(this.session);
 				return;
 			}
@@ -1895,6 +2075,9 @@ export class CellGridPanel {
 					return;
 				}
 				this.session.deleteSheet(sheet);
+				// Wave H2: non-recalc mutation; the active-sheet branch reads listSheets(survivors) before the
+				// render -> mark dirty NOW so a pre-render throw cannot leave the committed delete falsely clean.
+				this.markDirtyFailsafe();
 				if (sheet === this.sheet) {
 					// Deleted the active sheet -> switch to the first survivor (the empty-tombstone render
 					// path is the safety net if none remain, which the D4 guard above already prevents).
@@ -1920,6 +2103,7 @@ export class CellGridPanel {
 					return;
 				}
 				this.session.moveSheet(sheet, newIndex);
+				this.markDirtyFailsafe(); // Wave H2: non-recalc mutation -> mark dirty before the render.
 				CellGridPanel.refreshSession(this.session);
 				return;
 			}
@@ -2315,6 +2499,9 @@ export class CellGridPanel {
 			void vscode.window.showErrorMessage(`Quantbook define name failed: ${detail}`);
 			return;
 		}
+		// Wave H2: the define committed (a token-invisible mutation) and the listSheets read below runs
+		// before the refresh -> mark the editor dirty NOW so a pre-render throw cannot leave it falsely clean.
+		this.markDirtyFailsafe();
 		// Best-effort toast label: the sheet NAME + A1 range. The define already succeeded; a sheet-id that
 		// no longer resolves (a delete race) falls back to `#<id>` in the LABEL only -- the same dangling-
 		// target display convention nameManagerLogic.describeTarget uses, NOT an error mask.
