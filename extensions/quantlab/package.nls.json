@@ -55,6 +55,7 @@
 	"command.quantbookUnfreezePanes.title": "Quantbook: Unfreeze Panes",
 	"command.quantbookSplitAtSelection.title": "Quantbook: Split Window at Selection",
 	"command.quantbookRemoveSplit.title": "Quantbook: Remove Window Split",
+	"command.quantbookToggleAutoFilter.title": "Quantbook: Toggle AutoFilter",
 	"command.quantbookCellGridCut.title": "Cut",
 	"command.quantbookCellGridCopy.title": "Copy",
 	"command.quantbookCellGridPaste.title": "Paste",

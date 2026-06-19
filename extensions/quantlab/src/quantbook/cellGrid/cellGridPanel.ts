@@ -60,7 +60,8 @@ import { buildFormatUndoLabel, buildSetFormatOps, formatStringForPreset, presetL
 // focus-cell -> freeze-counts math shared by the palette and the context-menu freeze paths.
 import { planFreezeAtSelection, type GridSelectionInput } from './contextMenuLogic';
 import { formatRangeTarget, normalizeSelectionRect } from '../reactiveNotebook/bindVariableLogic';
-import { getHiddenRowsChecked, recalcDirtyChecked } from '../session';
+import { getHiddenRowsChecked, recalcDirtyChecked, setRowsHiddenValidated } from '../session';
+import { computeFilterHidden, distinctValuesInColumn, nextFilterHidden, pruneToLive, reconcileHidden, usedRangeFromEntries, type FilterRange } from './filterLogic';
 // FE-11: the name box routes an operator submit to one of navigate / define / error. The pure router +
 // the goToAnchor resolver + the define-toast builder are reused verbatim (the host shell below is thin).
 import { routeNameBoxSubmit, type NameBoxAction } from './nameBoxLogic';
@@ -845,6 +846,32 @@ export class CellGridPanel {
 	private hiddenRows: number[] = [];
 
 	/**
+	 * **Wave G3b / R4 (2026-06-19)** -- the change-key of the hidden-row set last POSTED to the webview (the
+	 * sorted `getHiddenRows` joined to a string). {@link render} re-fetches {@link hiddenRows} every paint, but
+	 * only re-posts when this key changes (the G3a-deferred MED) -- the set is unchanged across most paints.
+	 * Derived from the engine's set (NOT {@link filterHidden}), so an undo that reverts ANY hide (filter OR
+	 * manual) always re-syncs the webview. The DIRECT re-posts (sheet switch / reload) update it unconditionally.
+	 * `undefined` until the first post.
+	 */
+	private lastPostedHiddenKey: string | undefined;
+
+	/**
+	 * **Wave G3b / R4 (2026-06-19)** -- AutoFilter state for the CURRENT sheet, all session-local + transient
+	 * (the engine persists only the RESULTING hidden rows, never the criteria -- per the G2 scope). `active` is
+	 * the explicit toggle (the Filter button / Data menu) over {@link filterRange} (the used range; its first
+	 * row is the non-hideable HEADER). {@link filterCriteria} maps a column to its EXCLUDED (unchecked) display
+	 * values; {@link filterHidden} is the rows THIS filter currently hides -- the host's half of the virtual
+	 * partition over the engine's single un-provenanced `hidden_rows` set. The reconcile diff
+	 * ({@link reconcileHidden}) only ever unhides rows in {@link filterHidden}, so a right-click manual Hide is
+	 * never disturbed. All reset on a sheet switch (the criteria/triangles do not follow the sheet; the rows
+	 * stay collapsed in the engine). See [[fe-wave-g3b-autofilter]].
+	 */
+	private autoFilterActive: boolean = false;
+	private filterRange: FilterRange | null = null;
+	private filterCriteria: Map<number, Set<string>> = new Map();
+	private filterHidden: Set<number> = new Set();
+
+	/**
 	 * **W3 (Wave 3, 2026-06-09; Codex HIGH-2)** -- this panel's current webview instance token, learned from
 	 * the `webviewReady` handshake. Used to maintain the module {@link byWebviewToken} map (set on handshake,
 	 * cleared on dispose / re-handshake) so the context menu's host commands route to THIS exact panel.
@@ -1128,7 +1155,21 @@ export class CellGridPanel {
 		// empty instead. Posted BEFORE the render so the first paint already has the collapsed geometry (no
 		// one-frame un-collapsed flash); the webview applies the messages in delivery order.
 		this.hiddenRows = sheetSnapshot !== null ? getHiddenRowsChecked(this.session, this.sheet) : [];
-		this.postHiddenRowsIfReady();
+		// Wave G3b (E2 self-heal): keep the filter's `filterHidden` mirror honest against LIVE engine truth.
+		// Undo/redo (or a manual Unhide, or collab) can reveal a filter-hidden row WITHOUT calling back into
+		// filter state; pruning to the live set drops the phantom so a later reconcile cannot mis-attribute it
+		// and wrongly unhide a manual hide. Only while AutoFilter is active (else `filterHidden` is already empty).
+		if (this.autoFilterActive) {
+			this.filterHidden = pruneToLive(this.filterHidden, this.hiddenRows);
+		}
+		// Wave G3b (E13 + the G3a-deferred MED): re-post the hidden-row set only when it actually CHANGED since
+		// the last post (most paints leave it untouched). The key is the engine's set -- NOT `filterHidden` --
+		// so an undo that reverts a filter (or manual) hide always re-syncs. The DIRECT re-posts on sheet switch
+		// / reload call postHiddenRowsIfReady() unconditionally (they update the key themselves).
+		const hiddenKey = this.hiddenRows.join(',');
+		if (hiddenKey !== this.lastPostedHiddenKey) {
+			this.postHiddenRowsIfReady();
+		}
 		this.postRenderIfReady();
 	}
 
@@ -1424,6 +1465,10 @@ export class CellGridPanel {
 		if (!this.webviewReady || this._disposed) {
 			return;
 		}
+		// Wave G3b: record what we are about to post so render()'s per-paint gate skips an unchanged re-post.
+		// Updated on EVERY post (incl. the direct sheet-switch/reload re-posts) so the key never drifts from
+		// what the webview actually holds. Keyed on the engine set (already sorted ascending by getHiddenRows).
+		this.lastPostedHiddenKey = this.hiddenRows.join(',');
 		this.panel.webview.postMessage({ type: 'hiddenRows', rows: this.hiddenRows }).then(
 			delivered => {
 				if (!delivered && !this._disposed) {
@@ -1436,6 +1481,204 @@ export class CellGridPanel {
 			},
 			err => console.error('[cellGrid] hiddenRows postMessage rejected:', err),
 		);
+	}
+
+	/**
+	 * **Wave G3b / R4 (2026-06-19)** -- post the AutoFilter view-state to the webview so it paints the header
+	 * filter-triangles (a filled funnel on a column with active criteria, a hollow triangle otherwise) over the
+	 * toggled range. Posted on toggle / apply / `webviewReady` (reload re-applies the triangles) / `switchToSheet`
+	 * (the reset, inactive). `range` is `null` when inactive. A non-delivery is surfaced LOUD (No-Fallbacks): the
+	 * grid would show stale (or missing) triangles otherwise. All host-transient -- the criteria never persist.
+	 */
+	private postAutoFilterIfReady(): void {
+		if (!this.webviewReady || this._disposed) {
+			return;
+		}
+		const filteredCols: number[] = [];
+		for (const [col, excluded] of this.filterCriteria) {
+			if (excluded.size > 0) {
+				filteredCols.push(col);
+			}
+		}
+		filteredCols.sort((a, b) => a - b);
+		this.panel.webview.postMessage({ type: 'autoFilter', active: this.autoFilterActive, range: this.filterRange, filteredCols }).then(
+			delivered => {
+				if (!delivered && !this._disposed) {
+					console.warn('[cellGrid] autoFilter postMessage was not delivered to the webview.');
+					void vscode.window.showWarningMessage(
+						'Quantbook: the AutoFilter view may not have updated (a message was not delivered). Reopen the grid to refresh it.',
+					);
+				}
+			},
+			err => console.error('[cellGrid] autoFilter postMessage rejected:', err),
+		);
+	}
+
+	/**
+	 * **Wave G3b / R4 (2026-06-19)** -- toggle AutoFilter on the FOCUSED grid (the Filter toolbar button /
+	 * Data menu, via the `quantlab.quantbookToggleAutoFilter` simple command). Resolves the focused panel like
+	 * {@link freezeFocusedPanesAtSelection} and delegates to the instance {@link toggleAutoFilter}. Returns the
+	 * applied state (or a `reason`) so the command can surface a clear toast (No-Fallbacks).
+	 */
+	static toggleAutoFilterFocused(): { ok: true; active: boolean } | { ok: false; reason: 'no-panel' | 'no-data' } {
+		if (focusedPanel === undefined || focusedPanel._disposed) {
+			return { ok: false, reason: 'no-panel' };
+		}
+		return focusedPanel.toggleAutoFilter();
+	}
+
+	/**
+	 * **Wave G3b** -- toggle AutoFilter on this panel. ON: the range = the used range (bbox of the current
+	 * snapshot's entries); its first row is the (non-hideable) HEADER, the rest are data rows. A sheet with no
+	 * data rows (empty, or a lone header row) cannot be filtered -> `no-data` (the command toasts). OFF: clear
+	 * the criteria and UNHIDE exactly the rows this filter hid (a manual Hide survives -- {@link reconcileHidden}
+	 * only touches {@link filterHidden}), then deactivate. Idempotent: a second toggle removes.
+	 */
+	toggleAutoFilter(): { ok: true; active: boolean } | { ok: false; reason: 'no-data' } {
+		if (this.autoFilterActive) {
+			// OFF: clearing the criteria makes the next reconcile's F_new empty -> it unhides filterHidden only.
+			// Wrap the reconcile (5-lane-audit LOW): a (loader-gated, near-impossible) engine throw must not leave
+			// a half-toggled state -- surface it loud and deactivate cleanly regardless (matching the two-phase guard).
+			this.filterCriteria.clear();
+			try {
+				this.applyFilterReconcile();
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				console.error('[cellGrid] AutoFilter toggle-off reconcile failed:', detail);
+				void vscode.window.showErrorMessage(`Quantbook AutoFilter could not unhide its rows: ${detail}`);
+			}
+			this.autoFilterActive = false;
+			this.filterRange = null;
+			this.filterHidden = new Set();
+			this.postAutoFilterIfReady();
+			return { ok: true, active: false };
+		}
+		const range = usedRangeFromEntries(this.latestSnapshot?.entries ?? []);
+		if (range === null || range.maxRow <= range.minRow) {
+			return { ok: false, reason: 'no-data' }; // no data rows below the header to filter
+		}
+		this.autoFilterActive = true;
+		this.filterRange = range;
+		this.filterCriteria.clear();
+		this.filterHidden = new Set();
+		this.postAutoFilterIfReady();
+		return { ok: true, active: true };
+	}
+
+	/**
+	 * **Wave G3b** -- the crux: reconcile the engine's hidden-row set to the CURRENT {@link filterCriteria}.
+	 * Recomputes `F_new` over the data rows (cross-column AND), diffs against the LIVE engine set
+	 * ({@link reconcileHidden} -- `toUnhide subset of filterHidden`, so a manual Hide is never disturbed), and drives
+	 * `setRowsHidden`. The two directions are SEPARATE engine ops (no batchable hidden-rows op exists): a
+	 * tighten-only or relax-only Apply (and toggle-OFF) is ONE call = ONE undo; an Apply that both hides and
+	 * unhides is two. Recalc + repaint follow the {@link runRowVisibilityCommand} two-phase guard. Throws on a
+	 * stale dylib lacking the row-visibility surface (No-Fallbacks); the caller surfaces it loud.
+	 */
+	private applyFilterReconcile(): void {
+		if (this.filterRange === null) {
+			return;
+		}
+		// Defence (mirror runRowVisibilityCommand): the loader gates set/get together, so a loaded session has
+		// both -- this guards the impossible partial build LOUD, not at a silent use site.
+		if (typeof (this.session as unknown as Record<string, unknown>)['setRowsHidden'] !== 'function') {
+			throw new Error('the engine row-visibility capability is not available in the loaded build yet.');
+		}
+		const fNew = computeFilterHidden(this.latestSnapshot?.entries ?? [], this.filterRange, this.filterCriteria);
+		const live = getHiddenRowsChecked(this.session, this.sheet);
+		const { toHide, toUnhide } = reconcileHidden(this.filterHidden, fNew, live);
+		let mutated = false;
+		if (toUnhide.length > 0) {
+			setRowsHiddenValidated(this.session, this.sheet, toUnhide, false);
+			mutated = true;
+		}
+		if (toHide.length > 0) {
+			setRowsHiddenValidated(this.session, this.sheet, toHide, true);
+			mutated = true;
+		}
+		// **5-lane-audit HIGH (Codex + Sonnet):** record the rows the filter OWNS (just hid + still-wanted-and-
+		// still-hidden), NOT `fNew` (what it merely wants). Recording `fNew` would claim an already-MANUALLY-hidden
+		// row whose value matches the criteria, then a later toggle-off would unhide that manual row. nextFilterHidden
+		// intersects with `live` so an excluded value already hidden by a manual Hide is never claimed by the filter.
+		this.filterHidden = nextFilterHidden(this.filterHidden, fNew, live, toHide);
+		if (mutated) {
+			recalcDirtyChecked(this.session);
+			const { failed } = CellGridPanel.refreshSession(this.session);
+			if (failed > 0) {
+				void vscode.window.showWarningMessage(
+					`Quantbook: the filter applied, but ${failed} panel(s) failed to re-render -- run "Quantbook: Refresh Cell Grid".`,
+				);
+			}
+		} else {
+			// No engine change (criteria changed but hid/revealed nothing new), but the funnel set may have
+			// changed -> repaint THIS panel so the triangles update. The CALLER posts the AutoFilter state.
+			this.render();
+		}
+	}
+
+	/**
+	 * **Wave G3b** -- handle the webview's `requestFilterValues{col}` (a header-triangle click): enumerate the
+	 * column's distinct display values over the data rows + each value's checked state, and post `filterValues`
+	 * back to populate the checkbox dropdown. The UNTRUSTED `col` is validated against the active filter range
+	 * (No-Fallbacks: a request while inactive, or for a column outside the range, is dropped LOUD).
+	 */
+	private handleRequestFilterValues(raw: unknown): void {
+		if (!this.autoFilterActive || this.filterRange === null) {
+			console.warn('[cellGrid] dropped a requestFilterValues message: AutoFilter is not active.');
+			return;
+		}
+		const col = (raw as { col?: unknown }).col;
+		if (typeof col !== 'number' || !Number.isInteger(col) || col < this.filterRange.minCol || col > this.filterRange.maxCol) {
+			console.warn('[cellGrid] dropped a requestFilterValues message (col outside the filter range):', raw);
+			return;
+		}
+		const values = distinctValuesInColumn(this.latestSnapshot?.entries ?? [], col, this.filterRange.minRow + 1, this.filterRange.maxRow);
+		const excluded = this.filterCriteria.get(col);
+		const items = values.map(value => ({ value, checked: excluded === undefined || !excluded.has(value) }));
+		this.panel.webview.postMessage({ type: 'filterValues', col, items }).then(
+			delivered => {
+				if (!delivered && !this._disposed) {
+					console.warn('[cellGrid] filterValues postMessage was not delivered to the webview.');
+				}
+			},
+			err => console.error('[cellGrid] filterValues postMessage rejected:', err),
+		);
+	}
+
+	/**
+	 * **Wave G3b** -- handle the webview's `applyFilter{col, excluded}` (the dropdown Apply / per-column Clear):
+	 * set (or clear, when `excluded` is empty) the column's excluded-value set, then reconcile to the engine.
+	 * The UNTRUSTED payload is validated (No-Fallbacks): inactive filter, a column outside the range, or a
+	 * non-string-array `excluded` is dropped LOUD; an engine error surfaces as a toast.
+	 */
+	private handleApplyFilter(raw: unknown): void {
+		if (!this.autoFilterActive || this.filterRange === null) {
+			console.warn('[cellGrid] dropped an applyFilter message: AutoFilter is not active.');
+			return;
+		}
+		const m = raw as { col?: unknown; excluded?: unknown };
+		const col = m.col;
+		if (typeof col !== 'number' || !Number.isInteger(col) || col < this.filterRange.minCol || col > this.filterRange.maxCol) {
+			console.warn('[cellGrid] dropped an applyFilter message (col outside the filter range):', raw);
+			return;
+		}
+		const excluded = m.excluded;
+		if (!Array.isArray(excluded) || !excluded.every(v => typeof v === 'string')) {
+			console.warn('[cellGrid] dropped an applyFilter message (excluded must be a string array):', raw);
+			return;
+		}
+		if (excluded.length === 0) {
+			this.filterCriteria.delete(col);
+		} else {
+			this.filterCriteria.set(col, new Set(excluded as string[]));
+		}
+		try {
+			this.applyFilterReconcile();
+			this.postAutoFilterIfReady();
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.error('[cellGrid] applyFilter failed:', detail);
+			void vscode.window.showErrorMessage(`Quantbook AutoFilter failed: ${detail}`);
+		}
 	}
 
 	/**
@@ -1531,6 +1774,15 @@ export class CellGridPanel {
 		// render" discipline.
 		this.hiddenRows = [];
 		this.postHiddenRowsIfReady();
+		// Wave G3b: reset the AutoFilter state -- the criteria/triangles do NOT follow the sheet (transient; the
+		// engine keeps any resulting hidden rows, so the OLD sheet stays collapsed when revisited). Posting the
+		// inactive state BEFORE render() removes the previous sheet's triangles on the first paint. We do NOT
+		// reconcile/unhide here: switching away leaves the rows as the engine has them (the documented limitation).
+		this.autoFilterActive = false;
+		this.filterRange = null;
+		this.filterCriteria.clear();
+		this.filterHidden = new Set();
+		this.postAutoFilterIfReady();
 		// Post the (now-cleared) freeze + column/row sizing BEFORE render() so the first paint of the NEW sheet
 		// uses the reset view-state -- no one-frame flash of the previous sheet's freeze / column / row sizing. The
 		// post fns read only the counters/maps (not the snapshot), so ordering them before render() is safe.
@@ -2130,6 +2382,10 @@ export class CellGridPanel {
 			this.postColSizingIfReady();
 			// Wave G-rows: same for the session-local row heights (a reload re-inits the webview at uniform heights).
 			this.postRowSizingIfReady();
+			// Wave G3b: a reload re-inits the webview with no AutoFilter triangles; re-apply the session-local
+			// AutoFilter state (the hidden rows themselves re-collapse via postHiddenRowsIfReady above). A no-op
+			// when AutoFilter is inactive (range null).
+			this.postAutoFilterIfReady();
 			return;
 		}
 		// Sheet-tabs (2026-06-10): intercept the bottom tab strip's messages BEFORE delegating --
@@ -2188,6 +2444,16 @@ export class CellGridPanel {
 			// Wave G-rows: the Y mirror -- a row-resize-drag release. Intercept + validate like sizeColumn.
 			if (m.type === 'sizeRow') {
 				this.handleSizeRow(raw);
+				return;
+			}
+			// Wave G3b AutoFilter: a header-triangle click requests the column's distinct values; the dropdown's
+			// Apply/Clear posts the new excluded set. Intercept + validate the UNTRUSTED payload like sizeColumn.
+			if (m.type === 'requestFilterValues') {
+				this.handleRequestFilterValues(raw);
+				return;
+			}
+			if (m.type === 'applyFilter') {
+				this.handleApplyFilter(raw);
 				return;
 			}
 		}

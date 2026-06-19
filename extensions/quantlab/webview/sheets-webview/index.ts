@@ -95,6 +95,7 @@ import {
 	colResizeBorderAt,
 	colX,
 	composeHidden,
+	filterTriangleColAt,
 	emptyAxisSizing,
 	frozenColsWidth,
 	frozenRowsHeight,
@@ -440,7 +441,9 @@ type ToolbarCommand =
 	// FE-8.2: the File menu's "Export to CSV…" -- wires the host quantbookExportCsv command (session.export('csv')).
 	| 'exportCsv'
 	// FE-Export-XLSX: the File menu's "Export to XLSX…" -- wires quantbookExportXlsx (session.export('xlsx'), whole workbook).
-	| 'exportXlsx';
+	| 'exportXlsx'
+	// Wave G3b (2026-06-19): the Filter toolbar button / Data menu "AutoFilter" -- toggles header filter-triangles.
+	| 'toggleAutoFilter';
 
 /** The engine's number-format preset ids (the host contract's `setNumberFormat.preset`). There is NO
  * 'Scientific' -- the engine preset list does not have it; offering it would be a dead entry
@@ -632,6 +635,9 @@ const MENUBAR_MENUS: ReadonlyArray<{ readonly id: string; readonly entries: read
 		// Data items: dep-graph + Live Python are the only genuinely functional candidates today
 		// (sort/filter/pivot are engine-greenfield), and dead entries are worse than a short menu.
 		entries: [
+			// Wave G3b (2026-06-19): toggle AutoFilter on the focused grid's used range (header filter-triangles).
+			{ label: 'AutoFilter', run: () => postToolbarCommand('toggleAutoFilter') },
+			'separator',
 			{ label: 'Dependencies', run: () => postToolbarCommand('showDepGraph') },
 			{ label: 'Live Python', run: () => postToolbarCommand('showLivePython') },
 			// FE-11: defined-name management. Both reveal the existing host commands (palette-only before
@@ -758,6 +764,194 @@ function openMenuDropdown(anchor: HTMLElement, entries: readonly MenuEntrySpec[]
 	anchor.setAttribute('aria-expanded', 'true');
 }
 
+// =========================================================================================================
+// Wave G3b AutoFilter -- the per-column value-list dropdown (a checkbox list, NOT the `openMenuDropdown`
+// `<button>` menu). Reuses only the `qb-menu-dropdown` visual chrome + the position clamp; its own state +
+// keyboard handling (a search input must type without the menu's close-on-any-key gate). See [[fe-wave-g3b-autofilter]].
+// =========================================================================================================
+
+// **Wave G3b -- the in-flight-request cancellation net (re-audit, all passes).** Between a triangle click
+// (which posts `requestFilterValues`) and the host's `filterValues` reply there is a brief window where
+// `pendingFilterCol` is set but no dropdown exists yet. If the user does ANYTHING in that window (click,
+// keypress, scroll -- any button/key), they have moved on, and the late reply must NOT open a surprise
+// dropdown. Rather than enumerate every input path (which produced a string of escalating audit findings),
+// ONE capture-phase net listens for `pointerdown`/`keydown`/`wheel` while a request is in flight and cancels
+// it on the first one. The reply itself is a `message` event -- not one of these -- so it is never cancelled.
+// Armed when the request is posted; disarmed the instant the dropdown opens or the request is dropped. The
+// listeners are passive (no preventDefault/stopPropagation) so the user's actual action proceeds normally.
+let pendingCancelDisarm: (() => void) | null = null;
+function disarmPendingCancel(): void {
+	if (pendingCancelDisarm !== null) {
+		pendingCancelDisarm();
+		pendingCancelDisarm = null;
+	}
+}
+function armPendingCancel(): void {
+	disarmPendingCancel();
+	const onInput = (): void => closeFilterDropdown(); // clears pending + disarms (closeFilterDropdown calls disarm)
+	document.addEventListener('pointerdown', onInput, true);
+	document.addEventListener('keydown', onInput, true);
+	document.addEventListener('wheel', onInput, true);
+	pendingCancelDisarm = (): void => {
+		document.removeEventListener('pointerdown', onInput, true);
+		document.removeEventListener('keydown', onInput, true);
+		document.removeEventListener('wheel', onInput, true);
+	};
+}
+
+/** Close the open filter dropdown AND drop any in-flight requestFilterValues + its cancellation net. Every
+ *  close path (outside-click, Esc, Cancel, Apply, the autoFilter-inactive/sheet-switch handler, the header
+ *  resize/non-triangle click, and the in-flight-cancel net itself) routes here, so the pending request is
+ *  cancelled in ONE place. */
+function closeFilterDropdown(): void {
+	disarmPendingCancel();
+	pendingFilterCol = null;
+	pendingFilterAnchor = null;
+	if (filterDropdown === null) {
+		return;
+	}
+	filterDropdown.el.remove();
+	filterDropdown = null;
+}
+
+/** Collect the UNCHECKED values (the excluded set) and post `applyFilter` for the dropdown's column, then close. */
+function applyFilterDropdown(): void {
+	if (filterDropdown === null) {
+		return;
+	}
+	const col = filterDropdown.col;
+	const excluded = filterDropdown.itemEls.filter(it => !it.cb.checked).map(it => it.value);
+	closeFilterDropdown();
+	viewportEl.focus(); // 5-lane-audit MED: restore grid keyboard focus (a mouse Apply otherwise leaves it on body)
+	vscode.postMessage({ type: 'applyFilter', col, excluded });
+}
+
+/**
+ * Build + show the value-list dropdown for `col` at `(anchorX, anchorY)` (viewport px, clamped to the window).
+ * `items` are the column's distinct display values + their current checked state (from the host `filterValues`).
+ * A "(Select All)" tri-state checkbox toggles the VISIBLE (search-filtered) rows; a search box filters the list;
+ * Apply posts the excluded set; Cancel/Escape/outside-click discard. Keyboard: a bubble-phase keydown on the
+ * panel stops keys reaching the grid (so the grid stays inert) while letting the search input type natively.
+ */
+function openFilterDropdown(col: number, items: ReadonlyArray<{ value: string; checked: boolean }>, anchorX: number, anchorY: number): void {
+	closeFilterDropdown();
+	const el = document.createElement('div');
+	el.className = 'qb-menu-dropdown qb-filter-dropdown';
+	el.setAttribute('role', 'dialog');
+	el.style.position = 'fixed';
+
+	const search = document.createElement('input');
+	search.type = 'text';
+	search.className = 'qb-filter-search';
+	search.placeholder = 'Search';
+	search.setAttribute('aria-label', 'Filter values');
+	el.appendChild(search);
+
+	const allRow = document.createElement('label');
+	allRow.className = 'qb-filter-item qb-filter-all';
+	const allCb = document.createElement('input');
+	allCb.type = 'checkbox';
+	allCb.checked = items.length > 0 && items.every(i => i.checked);
+	const allText = document.createElement('span');
+	allText.className = 'qb-filter-label';
+	allText.textContent = '(Select All)';
+	allRow.appendChild(allCb);
+	allRow.appendChild(allText);
+	el.appendChild(allRow);
+
+	const list = document.createElement('div');
+	list.className = 'qb-filter-list';
+	const itemEls: { value: string; cb: HTMLInputElement; row: HTMLElement }[] = [];
+	for (const it of items) {
+		const row = document.createElement('label');
+		row.className = 'qb-filter-item';
+		const cb = document.createElement('input');
+		cb.type = 'checkbox';
+		cb.checked = it.checked;
+		const text = document.createElement('span');
+		text.className = 'qb-filter-label';
+		text.textContent = it.value;
+		text.title = it.value;
+		row.appendChild(cb);
+		row.appendChild(text);
+		list.appendChild(row);
+		itemEls.push({ value: it.value, cb, row });
+	}
+	el.appendChild(list);
+
+	const footer = document.createElement('div');
+	footer.className = 'qb-filter-footer';
+	const cancel = document.createElement('button');
+	cancel.type = 'button';
+	cancel.className = 'qb-filter-btn';
+	cancel.textContent = 'Cancel';
+	const apply = document.createElement('button');
+	apply.type = 'button';
+	apply.className = 'qb-filter-btn qb-filter-apply';
+	apply.textContent = 'Apply';
+	footer.appendChild(cancel);
+	footer.appendChild(apply);
+	el.appendChild(footer);
+
+	document.body.appendChild(el);
+	// Clamp to the viewport AFTER append (offset sizes need layout).
+	const left = Math.max(4, Math.min(anchorX, window.innerWidth - el.offsetWidth - 4));
+	const top = Math.max(4, Math.min(anchorY, window.innerHeight - el.offsetHeight - 4));
+	el.style.left = `${left}px`;
+	el.style.top = `${top}px`;
+	filterDropdown = { el, col, itemEls };
+
+	// Select-All toggles the VISIBLE rows; per-item changes drive the tri-state.
+	const syncSelectAll = (): void => {
+		const visible = itemEls.filter(it => it.row.style.display !== 'none');
+		const checked = visible.filter(it => it.cb.checked).length;
+		allCb.checked = visible.length > 0 && checked === visible.length;
+		allCb.indeterminate = checked > 0 && checked < visible.length;
+	};
+	allCb.addEventListener('change', () => {
+		for (const it of itemEls) {
+			if (it.row.style.display !== 'none') {
+				it.cb.checked = allCb.checked;
+			}
+		}
+	});
+	for (const it of itemEls) {
+		it.cb.addEventListener('change', syncSelectAll);
+	}
+	syncSelectAll(); // 5-lane-audit LOW: seed the (Select All) tri-state (indeterminate when only some are checked)
+	search.addEventListener('input', () => {
+		const q = search.value.trim().toLowerCase();
+		for (const it of itemEls) {
+			it.row.style.display = q === '' || it.value.toLowerCase().includes(q) ? '' : 'none';
+		}
+		syncSelectAll();
+	});
+	cancel.addEventListener('click', () => {
+		closeFilterDropdown();
+		viewportEl.focus(); // 5-lane-audit MED: restore grid keyboard focus on a mouse Cancel
+	});
+	apply.addEventListener('click', () => applyFilterDropdown());
+	// Bubble-phase: the input/checkboxes get the key (target phase) first; stopping here keeps the grid's
+	// document-bubble nav handler from acting on it. Escape closes; Enter applies.
+	el.addEventListener('keydown', (ev) => {
+		if (ev.key === 'Escape') {
+			ev.preventDefault();
+			ev.stopPropagation();
+			closeFilterDropdown();
+			viewportEl.focus();
+			return;
+		}
+		if (ev.key === 'Enter') {
+			ev.preventDefault();
+			ev.stopPropagation();
+			applyFilterDropdown();
+			return;
+		}
+		ev.stopPropagation();
+	});
+	search.focus();
+}
+
 /** Open the menubar menu for `btn` (its `data-menu` id). A missing/unknown id is a TEMPLATE bug --
  * surfaced loud (No-Fallbacks), never a silently dead menu. */
 function openMenubarMenu(btn: HTMLElement): void {
@@ -825,6 +1019,33 @@ document.addEventListener(
 );
 // A webview losing window focus must not leave a floating panel behind (matches the tab-strip menu).
 window.addEventListener('blur', closeMenuDropdown);
+
+// Wave G3b: dismiss the filter dropdown on an outside press / window blur (its own capture-phase listener,
+// like the menu's). A press INSIDE the dropdown is left to its controls. A press in the canvas HEADER band is
+// left to the canvas pointerdown (which owns the triangle toggle: re-clicking the same triangle closes it,
+// another triangle switches, a non-triangle header click closes) -- closing here too would race that handler.
+document.addEventListener(
+	'pointerdown',
+	(e) => {
+		// Dismisses an OPEN dropdown on an outside press. A pending-only request (no dropdown yet) is handled by
+		// the in-flight-cancel net (armPendingCancel), not here.
+		if (filterDropdown === null) {
+			return;
+		}
+		const t = e.target;
+		if (t instanceof Node) {
+			if (filterDropdown.el.contains(t)) {
+				return;
+			}
+			if (t === canvasEl && e.clientY - canvasEl.getBoundingClientRect().top < HEADER_HEIGHT) {
+				return; // a header-band press -> the canvas pointerdown decides (toggle / switch / close)
+			}
+		}
+		closeFilterDropdown();
+	},
+	true,
+);
+window.addEventListener('blur', closeFilterDropdown);
 
 // Keyboard ownership while a dropdown is open -- CAPTURE phase so it wins over the grid's
 // bubble-phase document nav handler (focus stays on the viewport during the whole interaction, so
@@ -949,6 +1170,11 @@ toolbarEl.addEventListener('click', (e) => {
 		case 'freeze':
 			runAfterResolvingEdit('Freeze panes', () => postToolbarCommand('freezePanes'));
 			return;
+		case 'filter':
+			// Wave G3b: toggle AutoFilter on the used range (the host resolves the focused panel + posts the
+			// `autoFilter` state back, which paints the header triangles). Like freeze, a simple toolbar command.
+			runAfterResolvingEdit('AutoFilter', () => postToolbarCommand('toggleAutoFilter'));
+			return;
 		case 'numfmt':
 			// The '123' number-format menu -- the shared anchored dropdown that REPLACED the old native
 			// <select> (toolbar-quality overhaul, 2026-06-10): one dropdown look across the whole chrome,
@@ -1047,8 +1273,8 @@ toolbarEl.addEventListener('click', (e) => {
 			return;
 		default:
 			// Still visual-only (print / paint-format / zoom / font family+size / merge / vertical-align /
-			// wrap / filter / sort): genuinely engine-greenfield or out-of-scope for this preview. (The
-			// decimal pair graduated to live in Wave C.) Surfaced honestly via a neutral "preview" toast
+			// wrap / sort): genuinely engine-greenfield or out-of-scope for this preview. (The decimal pair
+			// graduated to live in Wave C; filter graduated to AutoFilter in Wave G3b.) Surfaced honestly via a neutral "preview" toast
 			// rather than a silent no-op (the round-5 audit's #1 finding -- a click that does nothing reads as fake).
 			notifyPreviewOnly(btn.getAttribute('title') ?? 'This control');
 			return;
@@ -1637,6 +1863,25 @@ let rowResizeSuppressClick = false;
 // module-init time, so no init-time call path can reach them before this point (the w86 TDZ discipline).
 let rowResizeInput: Map<number, number> = new Map();
 let hiddenRowsInput: Set<number> = new Set();
+
+// **Wave G3b AutoFilter (R4, 2026-06-19)** -- the active filter range (mirrored from the host's `autoFilter`
+// message). Drives the header-triangle hit-test (`filterTriangleColAt`) and is forwarded to the renderer for the
+// paint (which columns carry a triangle). `null` = AutoFilter is OFF (no triangles). `filteredColsSet` is the
+// columns that have active criteria (an accent-filled triangle). Only read/written at event/message time.
+let autoFilterState: { minCol: number; maxCol: number } | null = null;
+let filteredColsSet: Set<number> = new Set();
+// The open filter value-list dropdown -- a SEPARATE floating panel from `openMenuDropdown` (a checkbox list needs
+// a text input + its own keyboard handling; reusing the `<button>`-item menu chrome would break typing -- the
+// menu's capture keydown closes on any non-nav key). `null` = closed.
+let filterDropdown: {
+	readonly el: HTMLElement;
+	readonly col: number;
+	readonly itemEls: ReadonlyArray<{ readonly value: string; readonly cb: HTMLInputElement; readonly row: HTMLElement }>;
+} | null = null;
+// A header-triangle click posts `requestFilterValues` and stashes the target column + anchor; the dropdown opens
+// only when the host's `filterValues` reply for THAT column arrives (no flash of an empty list). Cleared on open.
+let pendingFilterCol: number | null = null;
+let pendingFilterAnchor: { x: number; y: number } | null = null;
 
 // Build the user-resize-ONLY row model (no hidden rows folded in). Throws (contained by every caller) only if the
 // AGGREGATE extent would exceed the spacer cap -- in practice unreachable (the host's `handleSizeRow` + the live
@@ -4658,6 +4903,9 @@ canvasEl.addEventListener('pointerdown', ev => {
 		if (localY < HEADER_HEIGHT) {
 			const borderCol = colResizeBorderAt(localX, viewportEl.scrollLeft, renderer.gutterWidthPx, renderer.frozenCols);
 			if (borderCol >= 0) {
+				// A header resize grab closes any OPEN filter dropdown (the document capture handler defers
+				// header-band presses to here). A pending-only request is cancelled by the in-flight-cancel net.
+				closeFilterDropdown();
 				ev.preventDefault();
 				colResizeDrag = {
 					col: borderCol,
@@ -4668,6 +4916,31 @@ canvasEl.addEventListener('pointerdown', ev => {
 				colResizeSuppressClick = false;
 				canvasEl.setPointerCapture(ev.pointerId);
 				return;
+			}
+			// Wave G3b AutoFilter: a press on a header filter-triangle opens (or toggles) the value dropdown.
+			// Checked AFTER the resize border (a resize grab on the shared right edge wins). The triangle box
+			// clears the resize zone (filterTriangleColAt), so they never both fire.
+			if (autoFilterState !== null) {
+				const triCol = filterTriangleColAt(localX, viewportEl.scrollLeft, renderer.gutterWidthPx, renderer.frozenCols, autoFilterState.minCol, autoFilterState.maxCol);
+				if (triCol >= 0) {
+					ev.preventDefault();
+					const wasOpenForThisCol = filterDropdown !== null && filterDropdown.col === triCol;
+					closeFilterDropdown();
+					if (!wasOpenForThisCol) {
+						// Open on the host's reply (no empty flash). Anchor below the header at the click X. Arm the
+						// in-flight-cancel net so any input before the reply drops the request (no surprise dropdown).
+						pendingFilterCol = triCol;
+						pendingFilterAnchor = { x: ev.clientX, y: downRect.top + HEADER_HEIGHT };
+						vscode.postMessage({ type: 'requestFilterValues', col: triCol });
+						armPendingCancel();
+					}
+					return;
+				}
+			}
+			// A non-triangle header press closes any OPEN filter dropdown (a click-away within the header band).
+			// A pending-only request is already handled by the in-flight-cancel net (the capture pointerdown fires first).
+			if (filterDropdown !== null) {
+				closeFilterDropdown();
 			}
 		}
 		// Wave G-rows: the Y mirror -- a press on a row-number-gutter border (the gutter band, within
@@ -6597,6 +6870,69 @@ window.addEventListener('message', (event: MessageEvent) => {
 			hiddenRowsInput = prevHidden;
 			console.error('[sheets-webview] hiddenRows recompose failed; collapse left unchanged:', e);
 			showError('The hidden-rows update could not be applied; the rows were not changed.', 'transient');
+		}
+		return;
+	}
+	if (msg.type === 'autoFilter') {
+		// **Wave G3b (R4)** -- the host's AutoFilter view-state for the active sheet: whether it is on, the
+		// toggled range (its columns get header triangles), and which columns have active criteria (filled
+		// funnel). REPLACE semantics. No-Fallbacks: a malformed range is dropped LOUD + the state left unchanged.
+		const active = (msg as { active?: unknown }).active === true;
+		const range = (msg as { range?: unknown }).range;
+		const filteredCols = (msg as { filteredCols?: unknown }).filteredCols;
+		if (!active || range === null || range === undefined) {
+			autoFilterState = null;
+			filteredColsSet = new Set();
+			renderer.setAutoFilter(false, 0, -1, filteredColsSet);
+			closeFilterDropdown(); // no triangles -> any open dropdown is stale
+			redraw();
+			return;
+		}
+		const r = range as { minCol?: unknown; maxCol?: unknown };
+		if (typeof r.minCol !== 'number' || !Number.isInteger(r.minCol) || typeof r.maxCol !== 'number' || !Number.isInteger(r.maxCol) || r.maxCol < r.minCol) {
+			console.warn('[sheets-webview] dropped a malformed autoFilter message (range cols):', msg);
+			showError('The host sent a malformed AutoFilter update; the view was not changed.', 'transient');
+			return;
+		}
+		const nextFiltered = new Set<number>();
+		if (Array.isArray(filteredCols)) {
+			for (const c of filteredCols) {
+				if (typeof c === 'number' && Number.isInteger(c)) {
+					nextFiltered.add(c);
+				} else {
+					console.warn('[sheets-webview] dropped a non-integer filteredCols entry:', c);
+				}
+			}
+		}
+		autoFilterState = { minCol: r.minCol, maxCol: r.maxCol };
+		filteredColsSet = nextFiltered;
+		renderer.setAutoFilter(true, r.minCol, r.maxCol, filteredColsSet);
+		redraw();
+		return;
+	}
+	if (msg.type === 'filterValues') {
+		// **Wave G3b (R4)** -- the host's reply to a header-triangle click: the column's distinct display values
+		// + each value's current checked state. Opens the dropdown IFF this is the column the user just clicked
+		// (pendingFilterCol). No-Fallbacks: a malformed item array is dropped LOUD; nothing opens.
+		const col = (msg as { col?: unknown }).col;
+		const items = (msg as { items?: unknown }).items;
+		if (typeof col !== 'number' || !Number.isInteger(col) || !Array.isArray(items)) {
+			console.warn('[sheets-webview] dropped a malformed filterValues message:', msg);
+			return;
+		}
+		const clean: { value: string; checked: boolean }[] = [];
+		for (const it of items) {
+			if (it !== null && typeof it === 'object' && typeof (it as { value?: unknown }).value === 'string' && typeof (it as { checked?: unknown }).checked === 'boolean') {
+				clean.push({ value: (it as { value: string }).value, checked: (it as { checked: boolean }).checked });
+			} else {
+				console.warn('[sheets-webview] dropped a malformed filterValues item:', it);
+				return;
+			}
+		}
+		if (pendingFilterCol === col && pendingFilterAnchor !== null) {
+			openFilterDropdown(col, clean, pendingFilterAnchor.x, pendingFilterAnchor.y);
+			pendingFilterCol = null;
+			pendingFilterAnchor = null;
 		}
 		return;
 	}

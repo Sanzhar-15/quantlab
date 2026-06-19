@@ -409,6 +409,12 @@
         "category": "%command.category%"
       },
       {
+        "_comment": "Wave G3b (R4): toggle AutoFilter (header filter-triangles) on the focused grid's used range.",
+        "command": "quantlab.quantbookToggleAutoFilter",
+        "title": "%command.quantbookToggleAutoFilter.title%",
+        "category": "%command.category%"
+      },
+      {
         "_comment": "W3 (Wave 3): Cell Grid context-menu clipboard commands -- route to the focused webview's clipboard logic.",
         "command": "quantlab.quantbookCellGridCut",
         "title": "%command.quantbookCellGridCut.title%",

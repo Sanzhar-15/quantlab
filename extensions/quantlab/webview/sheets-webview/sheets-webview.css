@@ -177,6 +177,104 @@ body {
 	background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border));
 }
 
+/* Wave G3b AutoFilter (R4, 2026-06-19): the per-column value-list dropdown. Reuses the .qb-menu-dropdown
+ * float/border/shadow chrome but overrides the layout -- a search box + a "(Select All)" row + a SCROLLABLE
+ * value list + an Apply/Cancel footer (the value list scrolls, not the whole panel). Rules sit AFTER
+ * .qb-menu-dropdown so the overrides win at equal specificity. */
+.qb-filter-dropdown {
+	padding: 6px;
+	gap: 4px;
+	min-width: 200px;
+	max-width: 280px;
+	max-height: 360px;
+	overflow: hidden;
+}
+
+.qb-filter-search {
+	box-sizing: border-box;
+	width: 100%;
+	padding: 4px 6px;
+	font-family: var(--vscode-font-family);
+	font-size: 13px;
+	color: var(--vscode-input-foreground, var(--vscode-foreground));
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+	border-radius: 3px;
+}
+
+.qb-filter-search:focus {
+	outline: 1px solid var(--ql-accent);
+	outline-offset: -1px;
+}
+
+.qb-filter-list {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+	display: flex;
+	flex-direction: column;
+}
+
+.qb-filter-item {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 3px 4px;
+	font-family: var(--vscode-font-family);
+	font-size: 13px;
+	cursor: pointer;
+	white-space: nowrap;
+}
+
+.qb-filter-item:hover {
+	background: var(--ql-accent-muted);
+}
+
+.qb-filter-item input[type='checkbox'] {
+	flex: 0 0 auto;
+	margin: 0;
+}
+
+.qb-filter-label {
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.qb-filter-all {
+	border-bottom: 1px solid var(--vscode-menu-separatorBackground, var(--vscode-panel-border));
+	padding-bottom: 5px;
+	font-weight: 600;
+}
+
+.qb-filter-footer {
+	display: flex;
+	justify-content: flex-end;
+	gap: 6px;
+	padding-top: 5px;
+	border-top: 1px solid var(--vscode-menu-separatorBackground, var(--vscode-panel-border));
+}
+
+.qb-filter-btn {
+	padding: 3px 12px;
+	font-family: var(--vscode-font-family);
+	font-size: 12px;
+	color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+	background: var(--vscode-button-secondaryBackground, transparent);
+	border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+	border-radius: 3px;
+	cursor: pointer;
+}
+
+.qb-filter-apply {
+	color: var(--vscode-button-foreground);
+	background: var(--vscode-button-background);
+	border-color: var(--vscode-button-background);
+}
+
+.qb-filter-btn:hover {
+	filter: brightness(1.08);
+}
+
 /* UI-parity (2026-06-10): the Excel / Google-Sheets-style top toolbar -- grouped icon buttons with
  * thin dividers. Demo-prep: undo/redo, number-format (select + the three fmt buttons), freeze, and
  * insert/delete (anchored dropdowns) are wired; the style buttons are visual until FE-4/FE-5. */

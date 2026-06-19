@@ -771,6 +771,65 @@ export function colResizeBorderAt(
 }
 
 /**
+ * **Wave G3b AutoFilter** -- the painted/clickable filter-triangle box inside a header cell: `FILTER_TRIANGLE_W`
+ * px wide, sitting `FILTER_TRIANGLE_RIGHT_GAP` px in from the column's right edge (which clears the
+ * {@link RESIZE_GRAB_PX} resize-grab zone so the two never collide). A column narrower than
+ * {@link FILTER_TRIANGLE_MIN_COL_W} gets no triangle (it would overlap the label / the previous column) -- the
+ * paint and the hit-test gate on the SAME minimum so they never disagree.
+ */
+export const FILTER_TRIANGLE_W = 14;
+export const FILTER_TRIANGLE_RIGHT_GAP = 5;
+export const FILTER_TRIANGLE_MIN_COL_W = FILTER_TRIANGLE_W + FILTER_TRIANGLE_RIGHT_GAP + 2;
+
+/**
+ * **Wave G3b AutoFilter** -- given a VIEWPORT-LOCAL X inside the column-letter band (the caller checks
+ * `localY < HEADER_HEIGHT`), return the column whose filter-triangle box contains the pointer, or `-1`. Only
+ * columns in the active filter range `[minCol, maxCol]` carry a triangle. Frozen-aware exactly like
+ * {@link colResizeBorderAt} (frozen cols pinned, body cols carry `scrollLeft`), so the box lands on the painted
+ * glyph under freeze. The caller gates the call on AutoFilter being active; this returns `-1` for any column
+ * too narrow for a triangle (sharing {@link FILTER_TRIANGLE_MIN_COL_W} with the paint). Pure; the header-click
+ * pointerdown consults it AFTER {@link colResizeBorderAt} (a resize-border grab wins the shared right edge).
+ */
+export function filterTriangleColAt(
+	localX: number,
+	scrollLeft: number,
+	gutterW: number,
+	frozenColCount: number,
+	minCol: number,
+	maxCol: number,
+): number {
+	if (localX < gutterW) {
+		return -1; // gutter / corner
+	}
+	const fCols = Math.max(0, frozenColCount);
+	const frozenColsPx = offsetBefore(currentColSizing, fCols);
+	// `paintLeft` is the column's ROUNDED screen-left -- `Math.round(colX(col) - effScrollLeft)` -- EXACTLY the
+	// value the renderer paints the header cell (and thus the triangle) at, so the clickable box and the painted
+	// glyph agree to the pixel even when `colX - scroll` is fractional (5-lane-audit MED). Frozen cols are pinned
+	// (effScroll 0); body cols carry `scrollLeft` -- mirroring colResizeBorderAt / paintColLabels.
+	let col: number;
+	let paintLeft: number;
+	if (localX < gutterW + frozenColsPx) {
+		col = Math.min(Math.max(0, indexAtOffset(currentColSizing, localX - gutterW)), MAX_COLS - 1);
+		paintLeft = Math.round(gutterW + offsetBefore(currentColSizing, col));
+	} else {
+		const bodyLocalX = localX - (gutterW + frozenColsPx);
+		col = Math.min(Math.max(0, indexAtOffset(currentColSizing, frozenColsPx + scrollLeft + bodyLocalX)), MAX_COLS - 1);
+		paintLeft = Math.round(gutterW + offsetBefore(currentColSizing, col) - scrollLeft);
+	}
+	if (col < minCol || col > maxCol) {
+		return -1; // outside the filter range -- no triangle
+	}
+	const colWidth = sizeAt(currentColSizing, col);
+	if (colWidth < FILTER_TRIANGLE_MIN_COL_W) {
+		return -1; // too narrow to carry a triangle (matches the paint gate)
+	}
+	const boxRight = paintLeft + colWidth - FILTER_TRIANGLE_RIGHT_GAP;
+	const boxLeft = boxRight - FILTER_TRIANGLE_W;
+	return localX >= boxLeft && localX <= boxRight ? col : -1;
+}
+
+/**
  * **Wave G-rows row sizing** -- given a VIEWPORT-LOCAL Y inside the row-number gutter (the caller checks
  * `localX < gutterW`), return the row index whose BOTTOM edge the pointer is grabbing for a resize, or
  * `-1` if the pointer is not within {@link RESIZE_GRAB_PX} of any row border. Excel convention: grabbing a

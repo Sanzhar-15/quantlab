@@ -47,6 +47,9 @@ import {
 	columnLabel,
 	computeVisibleBodyColRange,
 	computeVisibleBodyRowRange,
+	FILTER_TRIANGLE_MIN_COL_W,
+	FILTER_TRIANGLE_RIGHT_GAP,
+	FILTER_TRIANGLE_W,
 	frozenColsWidth,
 	frozenRowsHeight,
 	getColSizing,
@@ -455,6 +458,17 @@ export class CanvasGridRenderer {
 	private splitBarY = 0;
 	private topSplitScroll = 0;
 	/**
+	 * **Wave G3b AutoFilter (R4, 2026-06-19)** -- the header filter-triangle paint state, mirrored from the
+	 * host's transient AutoFilter (set via {@link setAutoFilter}). When `autoFilterActive`, every column in
+	 * `[filterMinCol, filterMaxCol]` wide enough for a glyph paints a small down-triangle in its header: an
+	 * ACCENT-filled one when the column is in {@link filteredCols} (a filter IS set on it), a MUTED one
+	 * otherwise. Inactive (`filterMaxCol < filterMinCol`) = the byte-identical no-triangle header.
+	 */
+	private autoFilterActive = false;
+	private filterMinCol = 0;
+	private filterMaxCol = -1;
+	private filteredCols: ReadonlySet<number> = new Set();
+	/**
 	 * **Sheets retheme (2026-06-10)** -- the scroll offset the LAST frame painted at, recorded by
 	 * {@link paintWindow}. The cursor hit-test ({@link installCursorHitTest}) reads it to place the column /
 	 * row header separators under the pointer at the same offset the visible frame shows (the renderer is
@@ -606,6 +620,19 @@ export class CanvasGridRenderer {
 	clearSplit(): void {
 		this.splitBarY = 0;
 		this.topSplitScroll = 0;
+	}
+
+	/**
+	 * **Wave G3b AutoFilter** -- set the header filter-triangle paint state (the host posts it on toggle / apply /
+	 * reload / sheet-switch). `active=false` restores the byte-identical no-triangle header (pass `minCol=0,
+	 * maxCol=-1` for an empty range). `filteredCols` are the columns with active criteria (accent-filled glyph).
+	 * Does NOT repaint -- the caller redraws.
+	 */
+	setAutoFilter(active: boolean, minCol: number, maxCol: number, filteredCols: ReadonlySet<number>): void {
+		this.autoFilterActive = active;
+		this.filterMinCol = minCol;
+		this.filterMaxCol = maxCol;
+		this.filteredCols = filteredCols;
 	}
 
 	/** **Wave F window split** -- whether a horizontal split is active. The orchestrator's blit/damage gate +
@@ -2043,6 +2070,23 @@ export class CanvasGridRenderer {
 				ctx.fillStyle = tinted ? this.palette.accent : this.palette.headerText;
 				ctx.fillText(columnLabel(c), x + cw / 2, textY);
 				ctx.restore();
+				// Wave G3b AutoFilter: a small down-triangle dropdown affordance in the column's header, inset from
+				// its right edge (the box clears the resize-grab zone -- see filterTriangleColAt). ACCENT-filled when
+				// the column has active criteria (a filter is set), MUTED otherwise. Only within the active range +
+				// only on columns wide enough for the glyph (the SAME min the hit-test gates on, so paint + click agree).
+				if (this.autoFilterActive && c >= this.filterMinCol && c <= this.filterMaxCol && cw >= FILTER_TRIANGLE_MIN_COL_W) {
+					const boxRight = x + cw - FILTER_TRIANGLE_RIGHT_GAP;
+					const cx = boxRight - FILTER_TRIANGLE_W / 2;
+					const half = 4; // glyph half-width (8px wide triangle)
+					const top = textY - 2;
+					ctx.fillStyle = this.filteredCols.has(c) ? this.palette.accent : this.palette.headerText;
+					ctx.beginPath();
+					ctx.moveTo(cx - half, top);
+					ctx.lineTo(cx + half, top);
+					ctx.lineTo(cx, top + half + 1);
+					ctx.closePath();
+					ctx.fill();
+				}
 			}
 			ctx.restore();
 		};

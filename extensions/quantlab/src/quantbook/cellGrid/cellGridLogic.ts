@@ -2557,7 +2557,10 @@ export type ToolbarSimpleCommand =
 	| 'nameManager'
 	| 'goToName'
 	| 'exportCsv'
-	| 'exportXlsx';
+	| 'exportXlsx'
+	// **Wave G3b (2026-06-19)** -- the Filter toolbar button / Data menu "AutoFilter": toggle the header
+	// filter-triangles over the focused grid's used range (resolves the focused panel, like freeze).
+	| 'toggleAutoFilter';
 
 /**
  * The number-format presets the toolbar may apply: every {@link FormatPreset}
@@ -2605,6 +2608,8 @@ const TOOLBAR_SIMPLE_COMMAND_IDS: Record<ToolbarSimpleCommand, string> = {
 	removeSplit: 'quantlab.quantbookRemoveSplit',
 	saveAs: 'quantlab.quantbookSaveAs',
 	openWorkbook: 'quantlab.quantbookOpen',
+	// Wave G3b (2026-06-19): toggle AutoFilter on the focused grid (resolves the focused panel like freeze).
+	toggleAutoFilter: 'quantlab.quantbookToggleAutoFilter',
 	// Menu breadth (2026-06-10): the webview Data menu's sidebar-reveal entries. The wave-3
 	// Dependencies + Live Python features are contributed as VIEWS (package.json contributes.views,
 	// `quantlab.depGraphView` / `quantlab.livePythonView`, gated `quantbook.hasOpenGrid`), NOT as

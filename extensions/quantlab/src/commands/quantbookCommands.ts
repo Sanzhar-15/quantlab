@@ -1256,6 +1256,24 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			getOutput().appendLine('Unfroze panes.');
 		}),
 	);
+	// Wave G3b (R4, 2026-06-19): toggle AutoFilter on the focused grid's used range. The Filter toolbar button
+	// and the Data menu's "AutoFilter" both route here (a simple toolbar command). ON paints header
+	// filter-triangles + lets the user uncheck values to hide rows; OFF clears the criteria and unhides exactly
+	// the rows the filter hid (a right-click manual Hide survives). Resolves the focused panel (like freeze).
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookToggleAutoFilter', () => {
+			const result = CellGridPanel.toggleAutoFilterFocused();
+			if (!result.ok) {
+				if (result.reason === 'no-panel') {
+					void vscode.window.showInformationMessage('No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.');
+				} else {
+					void vscode.window.showInformationMessage('Quantbook: nothing to filter -- the sheet has no data rows below a header row.');
+				}
+				return;
+			}
+			getOutput().appendLine(`AutoFilter ${result.active ? 'enabled' : 'disabled'} on the focused grid.`);
+		}),
+	);
 	// Wave F window split (R5, 2026-06-18): split the focused grid into two independently-scrolling panes at
 	// the active cell (distinct from freeze -- the panes scroll separately). The webview owns all split
 	// geometry (it computes the bar Y from its live scroll), so the host command just triggers it.
