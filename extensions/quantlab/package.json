@@ -287,6 +287,12 @@
         "category": "%command.category%"
       },
       {
+        "_comment": "Wave N (2026-06-20): Import an existing .xlsx / .csv into a fresh additive Cell Grid tab (session.import(bytes, format); engine ql-io-xlsx/ql-io-csv readers). Lossy xlsx import surfaces the dropped-feature inventory LOUD via pollEvents (No-Fallbacks). Palette.",
+        "command": "quantlab.quantbookImport",
+        "title": "%command.quantbookImport.title%",
+        "category": "%command.category%"
+      },
+      {
         "_comment": "FE-8.2: Export the active workbook to CSV (session.export('csv'); single-sheet workbooks only -- multi-sheet surfaces a loud engine error). In the webview File menu + palette.",
         "command": "quantlab.quantbookExportCsv",
         "title": "%command.quantbookExportCsv.title%",

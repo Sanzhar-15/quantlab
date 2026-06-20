@@ -41,6 +41,7 @@ import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
 import { showRenderBenchPanel } from '../quantbook/bench/renderBenchPanel';
 import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, classifySwitchSheetTarget, defaultCsvFileName, defaultXlsxFileName, resolveCommandTargetPanel } from '../quantbook/cellGrid/cellGridLogic';
+import { collectImportWarnings, deriveImportFormat } from '../quantbook/cellGrid/importLogic';
 import { FORMAT_PRESET_CHOICES, buildFormatUndoLabel, buildSetFormatOps, formatStringForPreset, presetLabel, type FormatPreset } from '../quantbook/cellGrid/formatPickerLogic';
 // FE-4 W2 (2026-06-10): the pure, vscode-free sort core (read snapshot rect -> refuse-on-formula -> row
 // permutation -> setValue batch). The command below is a thin vscode shell over it (the established N-1/N-2 split).
@@ -712,6 +713,143 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				closeSessionQuietly(session, log, 'open display failure');
 				log.appendLine(`FATAL Open (display) error: ${detail}`);
 				void vscode.window.showErrorMessage(`Quantbook opened the workbook but failed to display it: ${detail}`);
+			}
+		}),
+	);
+
+	// Import: load an existing `.xlsx` or `.csv` into a fresh Session shown in its OWN new
+	// Cell Grid tab (Wave N, 2026-06-20). ADDITIVE like Open -- a fresh session means a
+	// failed/lossy import can never touch an already-open workbook. The engine readers
+	// (`ql-io-xlsx` / `ql-io-csv`) + the `session.import(bytes, format)` napi already ship;
+	// this surfaces them. **No-Fallbacks:** an xlsx import drops OOXML features the engine
+	// does not model (conditional formatting, data validation, merged cells, comments,
+	// drawings, pivots, macros, external links, hidden sheets, ...). The engine records each
+	// as a workbook-level `cell_diagnostic` event (code `xlsx_unsupported_feature` /
+	// `xlsx_import_warning`); we DRAIN those via `pollEvents` and surface them LOUD so a
+	// lossy import is never silent. CSV import is value-only and emits no such warnings.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookImport', async () => {
+			const uris = await vscode.window.showOpenDialog({
+				title: 'Import into Quantbook',
+				filters: { Spreadsheets: ['xlsx', 'csv'], 'Excel Workbook': ['xlsx'], CSV: ['csv'] },
+				canSelectFiles: true,
+				canSelectFolders: false,
+				canSelectMany: false,
+				openLabel: 'Import',
+			});
+			if (uris === undefined || uris.length === 0) {
+				return; // dismissed
+			}
+			const uri = uris[0];
+			const path = uri.fsPath;
+			const log = getOutput();
+			// Format is derived from the extension (the engine dispatches on "xlsx" / "csv").
+			// An unrecognized extension fails LOUD rather than guessing a format.
+			const format = deriveImportFormat(path);
+			if (format === undefined) {
+				log.appendLine(`Import aborted: "${path}" is neither .xlsx nor .csv.`);
+				void vscode.window.showErrorMessage('Quantbook import supports .xlsx and .csv files only.');
+				return;
+			}
+			// 1) Read the file bytes. A read failure surfaces loud and touches nothing.
+			let bytes: Uint8Array;
+			try {
+				bytes = await vscode.workspace.fs.readFile(uri);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL Import read error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook import failed to read the file: ${detail}`);
+				return;
+			}
+			// 2) Create a FRESH session and import into it. A fresh session means a bad import
+			// can never clobber an open workbook; a throw closes the never-shown session so its
+			// engine handle is not leaked (No-Fallbacks: a malformed file surfaces verbatim).
+			let session: SessionInstance;
+			try {
+				session = createWorkbookSession();
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL Import (create session) error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook import failed: ${detail}`);
+				return;
+			}
+			try {
+				session.import(bytes, format);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				closeSessionQuietly(session, log, 'import parse failure');
+				log.appendLine(`FATAL Import error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook import failed: ${detail}`);
+				return;
+			}
+			// 3) Drain the import diagnostics (the unsupported-features / formula-failure report). A
+			// poll failure must NOT hide the imported data, but it ALSO must NOT downgrade a lossy
+			// import to a silent "clean" success (No-Fallbacks): track whether the report was actually
+			// read so step 6 can warn that the loss is UNKNOWN rather than claim there was none.
+			let warnings: string[] = [];
+			let reportRead = true;
+			try {
+				const page = session.pollEvents(0n);
+				warnings = collectImportWarnings(page.events);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				reportRead = false;
+				log.appendLine(`WARNING: import succeeded but reading its diagnostics failed: ${detail}`);
+			}
+			// 4) The imported workbook MUST have a live sheet (never show a phantom sheet 0 for an
+			// empty/corrupt import). listSheets() can also throw off an unreadable state.
+			let firstSheet: number;
+			try {
+				const sheetInfos = session.listSheets();
+				if (sheetInfos.length === 0) {
+					closeSessionQuietly(session, log, 'empty-import');
+					log.appendLine(`Import aborted: "${path}" produced no live sheets.`);
+					void vscode.window.showErrorMessage(`Quantbook import failed: "${path}" produced no live sheets.`);
+					return;
+				}
+				firstSheet = sheetInfos[0].id;
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				closeSessionQuietly(session, log, 'import read-sheets failure');
+				log.appendLine(`FATAL Import (read sheets) error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook import failed: ${detail}`);
+				return;
+			}
+			// 5) Show the imported workbook in a NEW tab (additive -- no other workbook is touched).
+			// Display BEFORE the result toast so the user never sees "imported" then "failed to
+			// display"; the panel takes ownership of the session on success.
+			try {
+				CellGridPanel.show(context, session, firstSheet);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				closeSessionQuietly(session, log, 'import display failure');
+				log.appendLine(`FATAL Import (display) error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook imported the workbook but failed to display it: ${detail}`);
+				return;
+			}
+			// 6) Surface the result (the session is now displayed + panel-owned). Lossy import is LOUD
+			// (a warning toast + the full inventory in the output channel). The `xlsx_` report covers
+			// BOTH unsupported features (dropped) AND formula-recompute failures (cached value kept) --
+			// so the wording stays general. A diagnostics-read failure (reportRead === false) is ALSO
+			// loud: we cannot claim a clean import when we could not read the report (No-Fallbacks).
+			if (!reportRead) {
+				log.appendLine(`Imported ${path} (${format}, ${bytes.length} bytes) -- WARNING: the import report could not be read; loss is UNKNOWN.`);
+				log.show(true);
+				void vscode.window.showWarningMessage(
+					`Quantbook imported the ${format.toUpperCase()}, but its import report could not be read -- verify the data manually (see the Quantbook output).`,
+				);
+			} else if (warnings.length > 0) {
+				log.appendLine(`Imported ${path} (${format}, ${bytes.length} bytes) with ${warnings.length} import warning(s):`);
+				for (const w of warnings) {
+					log.appendLine(`  - ${w}`);
+				}
+				log.show(true);
+				void vscode.window.showWarningMessage(
+					`Quantbook imported the ${format.toUpperCase()} with ${warnings.length} warning(s) (unsupported features dropped and/or formulas that could not be recomputed) -- see the Quantbook output for the full list.`,
+				);
+			} else {
+				log.appendLine(`Imported ${path} (${format}, ${bytes.length} bytes) with no import warnings.`);
+				void vscode.window.showInformationMessage(`Quantbook imported ${uri.fsPath}`);
 			}
 		}),
 	);

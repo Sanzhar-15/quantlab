@@ -432,6 +432,10 @@ type ToolbarCommand =
 	| 'deleteColumn'
 	| 'saveAs'
 	| 'openWorkbook'
+	// Wave N (2026-06-20): the File menu's "Import (.xlsx / .csv)..." -- wires the host quantbookImport
+	// command (session.import(bytes, format); additive fresh tab; lossy xlsx import surfaces the
+	// dropped-feature inventory LOUD).
+	| 'importWorkbook'
 	| 'showDepGraph'
 	| 'showLivePython'
 	// FE-11: the Data menu's "Name Manager…" / "Go to Name…" + the name box dropdown -- reveal the existing host
@@ -577,6 +581,7 @@ const MENUBAR_MENUS: ReadonlyArray<{ readonly id: string; readonly entries: read
 		entries: [
 			{ label: 'Save As…', run: () => postToolbarCommand('saveAs') },
 			{ label: 'Open Workbook…', run: () => postToolbarCommand('openWorkbook') },
+			{ label: 'Import (.xlsx / .csv)…', run: () => postToolbarCommand('importWorkbook') },
 			// FE-8.2: data export (CSV), distinct from the .qbook Save above. Single-sheet workbooks only
 			// (the engine refuses multi-sheet CSV with a loud error); routed through the same toolbar bridge.
 			// FE-Export-XLSX: data export (XLSX) is WHOLE-WORKBOOK (all sheets) -- no single-sheet restriction.

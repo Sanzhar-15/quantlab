@@ -2552,6 +2552,9 @@ export type ToolbarSimpleCommand =
 	| 'removeSplit'
 	| 'saveAs'
 	| 'openWorkbook'
+	// **Wave N (2026-06-20)** -- the File menu's "Import (.xlsx / .csv)...": load an existing workbook into a
+	// fresh additive Cell Grid tab (host `quantbookImport`; session.import(bytes, format)).
+	| 'importWorkbook'
 	| 'showDepGraph'
 	| 'showLivePython'
 	| 'nameManager'
@@ -2608,6 +2611,11 @@ const TOOLBAR_SIMPLE_COMMAND_IDS: Record<ToolbarSimpleCommand, string> = {
 	removeSplit: 'quantlab.quantbookRemoveSplit',
 	saveAs: 'quantlab.quantbookSaveAs',
 	openWorkbook: 'quantlab.quantbookOpen',
+	// Wave N (2026-06-20): the File menu's "Import (.xlsx / .csv)..." reveals the host quantbookImport command
+	// (session.import(bytes, format) into a fresh additive tab). Argument-less (it prompts for a file +
+	// derives the format from the extension). Lossy xlsx import surfaces the dropped-feature inventory LOUD
+	// via pollEvents (No-Fallbacks).
+	importWorkbook: 'quantlab.quantbookImport',
 	// Wave G3b (2026-06-19): toggle AutoFilter on the focused grid (resolves the focused panel like freeze).
 	toggleAutoFilter: 'quantlab.quantbookToggleAutoFilter',
 	// Menu breadth (2026-06-10): the webview Data menu's sidebar-reveal entries. The wave-3

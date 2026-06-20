@@ -82,6 +82,7 @@
 	"command.quantbookCellGridSwitchSheet.title": "Quantbook: Switch Cell Grid Sheet",
 	"command.quantbookSaveAs.title": "Quantbook: Save As...",
 	"command.quantbookOpen.title": "Quantbook: Open...",
+	"command.quantbookImport.title": "Quantbook: Import (.xlsx / .csv)...",
 	"command.quantbookExportCsv.title": "Quantbook: Export to CSV...",
 	"command.quantbookExportXlsx.title": "Quantbook: Export to XLSX...",
 	"command.quantbookSheetAdd.title": "Quantbook: Add Sheet...",
