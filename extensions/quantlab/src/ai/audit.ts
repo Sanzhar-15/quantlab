@@ -1,4 +1,9 @@
 /*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/*---------------------------------------------------------------------------------------------
  *  AI Audit Logging
  *  Local audit log for all AI requests
  *---------------------------------------------------------------------------------------------*/
@@ -105,8 +110,10 @@ export class AIAuditLogger {
 						...parsed,
 						timestamp: new Date(parsed.timestamp),
 					});
-				} catch {
-					// Skip malformed lines
+				} catch (error) {
+					// One corrupt line should not break reading the rest of the log,
+					// but it must be visible (No-Fallbacks), not silently dropped.
+					console.warn('Skipping malformed AI audit log line:', error);
 				}
 			}
 		} catch (error) {
@@ -181,8 +188,12 @@ export class AIAuditLogger {
 				// Clean up old rotated logs
 				this.cleanupRotatedLogs();
 			}
-		} catch {
-			// File doesn't exist yet
+		} catch (error) {
+			// A missing log file is the one benign case (nothing to rotate yet); any
+			// other failure (permissions, disk) must surface (No-Fallbacks).
+			if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+				console.error('Failed to rotate AI audit log:', error);
+			}
 		}
 	}
 
@@ -231,7 +242,9 @@ export function logAIRequest(
 			durationMs
 		);
 		logger.log(entry);
-	} catch {
-		// Logger not initialized, skip
+	} catch (error) {
+		// Audit logging must never crash the AI request, but a failure (e.g. the logger
+		// was never initialized) must be visible, not silently swallowed (No-Fallbacks).
+		console.error('Failed to log AI request to the audit log:', error);
 	}
 }

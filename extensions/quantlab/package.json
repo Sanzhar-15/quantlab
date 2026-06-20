@@ -257,6 +257,16 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.setAnthropicApiKey",
+        "title": "%command.setAnthropicApiKey.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.clearAnthropicApiKey",
+        "title": "%command.clearAnthropicApiKey.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.quantbookCellGridSwitchSheet",
         "title": "%command.quantbookCellGridSwitchSheet.title%",
         "category": "%command.category%"
@@ -1563,6 +1573,16 @@
           "minimum": 0,
           "maximum": 65535,
           "description": "FE-BEYOND B1: TCP port for the read-only Quantbook MCP server (bound to 127.0.0.1 only). 0 (the default) lets the OS pick a free port; the resolved URL is printed to the Quantbook MCP Server output channel on start."
+        },
+        "quantlab.ai.model": {
+          "type": "string",
+          "enum": [
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5"
+          ],
+          "default": "claude-opus-4-8",
+          "description": "FE-6 (Wave K): Claude model used by the Quantbook AI features (Explain, chat). The API key is set via the 'Quantbook: Set Anthropic API Key' command and stored in the OS secret store (never in settings)."
         },
         "quantlab.trading.accounts": {
           "type": "array",

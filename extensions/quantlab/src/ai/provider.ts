@@ -1,10 +1,14 @@
 /*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/*---------------------------------------------------------------------------------------------
  *  AI Provider
  *  Claude API integration for Quantlab AI assistant
  *  Decision G37: V1 ships with Claude support only
  *---------------------------------------------------------------------------------------------*/
 
-import * as vscode from 'vscode';
 import {
 	AIProviderConfig,
 	AIProviderStatus,
@@ -13,6 +17,8 @@ import {
 } from './types';
 import { sanitizeInput } from './sanitize';
 import { logAIRequest } from './audit';
+import { parseStreamEvent } from './streamParse';
+import { DEFAULT_AI_MODEL, resolveModel } from './modelConfig';
 
 /**
  * Rate limiting configuration.
@@ -30,14 +36,16 @@ export class ClaudeProvider {
 	private static instance: ClaudeProvider | undefined;
 
 	private readonly baseUrl = 'https://api.anthropic.com/v1/messages';
-	private readonly defaultModel = 'claude-3-5-sonnet-20241022';
-	private readonly maxTokens = 4096;
+	// Operator-configurable; defaults to the most capable current model. The previous
+	// hardcoded `claude-3-5-sonnet-20241022` is RETIRED (404s) -- see modelConfig.ts.
+	private model: string = DEFAULT_AI_MODEL;
+	private maxTokens = 4096;
 
 	private apiKey: string | undefined;
 	private requestTimestamps: number[] = [];
 	private status: AIProviderStatus = 'unconfigured';
 
-	private constructor() {}
+	private constructor() { }
 
 	static getInstance(): ClaudeProvider {
 		if (!ClaudeProvider.instance) {
@@ -51,6 +59,15 @@ export class ClaudeProvider {
 	 */
 	configure(config: AIProviderConfig): void {
 		this.apiKey = config.apiKey;
+		// `resolveModel` corrects an unset/blank/unknown model to the default so a typo
+		// can never silently 404 every request. Surface the correction so it is not silent.
+		this.model = resolveModel(config.model);
+		if (typeof config.model === 'string' && config.model.trim().length > 0 && config.model.trim() !== this.model) {
+			console.warn(`quantlab.ai: unknown model "${config.model}", using "${this.model}" instead.`);
+		}
+		if (typeof config.maxTokens === 'number' && config.maxTokens > 0) {
+			this.maxTokens = config.maxTokens;
+		}
 		this.status = config.apiKey ? 'ready' : 'unconfigured';
 	}
 
@@ -99,7 +116,9 @@ export class ClaudeProvider {
 		systemPrompt?: string
 	): Promise<ChatMessage> {
 		if (!this.apiKey) {
-			throw new Error('API key not configured. Set quantlab.ai.apiKey in settings.');
+			throw new Error(
+				'Anthropic API key not configured. Run the "Quantbook: Set Anthropic API Key" command.'
+			);
 		}
 
 		if (this.isRateLimited()) {
@@ -127,7 +146,7 @@ export class ClaudeProvider {
 
 		// Build request body
 		const body = {
-			model: this.defaultModel,
+			model: this.model,
 			max_tokens: this.maxTokens,
 			system: systemPrompt || this.getDefaultSystemPrompt(),
 			messages: sanitizedMessages.map(msg => ({
@@ -190,7 +209,9 @@ export class ClaudeProvider {
 		systemPrompt?: string
 	): AsyncGenerator<string, void, unknown> {
 		if (!this.apiKey) {
-			throw new Error('API key not configured.');
+			throw new Error(
+				'Anthropic API key not configured. Run the "Quantbook: Set Anthropic API Key" command.'
+			);
 		}
 
 		if (this.isRateLimited()) {
@@ -213,7 +234,7 @@ export class ClaudeProvider {
 		});
 
 		const body = {
-			model: this.defaultModel,
+			model: this.model,
 			max_tokens: this.maxTokens,
 			stream: true,
 			system: systemPrompt || this.getDefaultSystemPrompt(),
@@ -231,13 +252,16 @@ export class ClaudeProvider {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/json',
-					'x-api-key': this.apiKey,
+					'x-api-key': this.apiKey!,
 					'anthropic-version': '2023-06-01',
 				},
 				body: JSON.stringify(body),
 			});
 
 			if (!response.ok) {
+				if (response.status === 429) {
+					this.status = 'rate_limited';
+				}
 				throw new Error(`API error: ${response.status} ${response.statusText}`);
 			}
 
@@ -248,29 +272,36 @@ export class ClaudeProvider {
 
 			const decoder = new TextDecoder();
 			let buffer = '';
+			let streamDone = false;
 
-			while (true) {
+			// On a normal read, keep the last (possibly partial) line buffered. On the FINAL
+			// read, flush the decoder and process every remaining line -- a truncated stream
+			// then surfaces (a partial JSON event throws via parseStreamEvent) instead of
+			// silently completing as success (No-Fallbacks).
+			while (!streamDone) {
 				const { done, value } = await reader.read();
-				if (done) break;
+				if (done) {
+					buffer += decoder.decode();
+					streamDone = true;
+				} else {
+					buffer += decoder.decode(value, { stream: true });
+				}
 
-				buffer += decoder.decode(value, { stream: true });
 				const lines = buffer.split('\n');
-				buffer = lines.pop() || '';
+				buffer = streamDone ? '' : (lines.pop() || '');
 
 				for (const line of lines) {
 					if (line.startsWith('data: ')) {
-						const data = line.slice(6);
-						if (data === '[DONE]') continue;
-
-						try {
-							const parsed = JSON.parse(data);
-							if (parsed.type === 'content_block_delta') {
-								const text = parsed.delta?.text || '';
-								outputLength += text.length;
-								yield text;
-							}
-						} catch {
-							// Skip malformed JSON
+						// parseStreamEvent throws on malformed JSON and surfaces API
+						// `error` events -- a corrupt/aborted stream is never silently
+						// dropped (No-Fallbacks). The outer try logs + rethrows.
+						const event = parseStreamEvent(line.slice(6));
+						if (event.kind === 'error') {
+							throw new Error(`Anthropic API stream error: ${event.message}`);
+						}
+						if (event.kind === 'text') {
+							outputLength += event.text.length;
+							yield event.text;
 						}
 					}
 				}
@@ -341,10 +372,18 @@ export class ClaudeProvider {
 			throw new Error(`API error: ${response.status} - ${errorBody}`);
 		}
 
-		const data = await response.json() as { id: string; content: Array<{ text?: string }> };
+		const data = await response.json() as { id: string; content?: Array<{ type?: string; text?: string }> };
+		// Do not synthesize an empty assistant message from a malformed/empty response
+		// (No-Fallbacks): surface it as an error instead.
+		const textBlock = Array.isArray(data.content)
+			? data.content.find(block => typeof block.text === 'string')
+			: undefined;
+		if (!textBlock || typeof textBlock.text !== 'string') {
+			throw new Error('Anthropic API returned a response with no text content.');
+		}
 		return {
 			id: data.id,
-			content: data.content[0]?.text || '',
+			content: textBlock.text,
 		};
 	}
 
@@ -388,16 +427,4 @@ When reviewing strategy code:
  */
 export function getAIProvider(): ClaudeProvider {
 	return ClaudeProvider.getInstance();
-}
-
-/**
- * Configure AI provider from VS Code settings.
- */
-export function configureFromSettings(): void {
-	const config = vscode.workspace.getConfiguration('quantlab.ai');
-	const apiKey = config.get<string>('apiKey');
-
-	if (apiKey) {
-		ClaudeProvider.getInstance().configure({ apiKey });
-	}
 }

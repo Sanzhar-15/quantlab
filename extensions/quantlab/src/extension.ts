@@ -26,6 +26,7 @@ import { registerGlobalStateCommands } from './commands/globalStateCommands';
 import { registerHistoryCommands } from './commands/historyCommands';
 import { registerPanelCommands } from './commands/panelCommands';
 import { registerTradeCommands } from './commands/tradeCommands';
+import { registerAICommands, loadAnthropicKeyIntoProvider } from './commands/aiCommands';
 import { registerViewCommands } from './commands/viewCommands';
 import { registerDashboardCommands } from './commands/dashboardCommands';
 import { GlobalState } from './core/state/GlobalState';
@@ -315,6 +316,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	registerDashboardCommands(context);
 	// Phase 5.7 V1 (2026-05-22): Quantbook engine demo round-trip.
 	registerQuantbookCommands(context);
+	// Wave K-a (R15, 2026-06-20): Set/Clear the Anthropic API key in the OS secret store, and
+	// load the stored key into the AI provider (also initializes the local AI audit log). The
+	// load is fire-and-forget so a secrets read can't block activation; it settles internally
+	// (logging any failure loud, No-Fallbacks) so the Set/Clear commands are never bricked.
+	registerAICommands(context);
+	void loadAnthropicKeyIntoProvider(context);
 	// FE-1.5-1d-1: the reactive-kernel commands. Trust MUST be initialized first -- nothing called
 	// TrustManager.initialize before (so the trust store never loaded); the kernel's trust gate
 	// depends on it. Fail-closed: if init throws, the store stays empty -> the kernel refuses to
