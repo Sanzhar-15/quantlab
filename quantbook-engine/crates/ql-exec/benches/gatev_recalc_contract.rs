@@ -21,6 +21,25 @@
 //! 3. **cold_full_recalc** — the `recompute_all` LOAD/REPLAY path (re-parses
 //!    every formula, builds an ephemeral graph, evaluates) over a chain. The
 //!    conservative full-eval cost (NOT the SIMD region fast-path), for honesty.
+//!
+//! ## Measurement note (w103, 2026-06-20) -- drop-deferral
+//!
+//! `criterion::iter_batched` excludes the SETUP closure's time but TIMES the
+//! routine closure's body -- including the drop of anything the closure OWNS and
+//! lets fall out of scope at the end. It only DEFERS (untimes) the drop of the
+//! value the routine RETURNS. The 1M-cell `Workbook` + `CalcgraphSession` hold
+//! millions of heap allocations (per-node adjacency `Vec`s, formula `Arc<str>`s,
+//! the cell/dep HashMaps); dropping them is ~100ms. The original benches returned
+//! `()` and dropped those structs INSIDE the timed closure, so they measured the
+//! deallocation, not the edit op -- this manufactured the false "F-1 ~106ms edit
+//! latency / O(graph)" finding. The single-cell-edit path is provably
+//! O(dirty-set): `set_value` -> `mark_dirty_from_cell_write` (address-keyed) ->
+//! `schedule_dirty` (drains only the dirty set) -> Tarjan over the dirty subset.
+//! Each routine below now RETURNS the owned `(wb, graph, reg)` so criterion drops
+//! them OUTSIDE the timed region. Keep it that way: returning `()` re-introduces
+//! the artifact. Full write-up: the IDE repo's
+//! `quantlab/docs/fe/2026-06-20-gatev-validation-report.md` (Finding F-1) — NOT in
+//! this engine repo.
 
 use std::hint::black_box;
 
@@ -78,9 +97,14 @@ fn bench_set_value_1m(c: &mut Criterion) {
         b.iter_batched(
             || build_independent_grid(GRID_N),
             |(mut wb, mut graph, reg)| {
-                let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
-                rt.set_value(0, 0, 0, Value::Number(999.0)).unwrap();
-                black_box(&mut graph);
+                {
+                    let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+                    rt.set_value(0, 0, 0, Value::Number(999.0)).unwrap();
+                }
+                // Drop-deferral (see header): return the owned 1M-cell workbook +
+                // graph so criterion drops them OUTSIDE the timed region. The op
+                // mutated `graph` (dirty mark), so the returned value forces it.
+                (wb, graph, reg)
             },
             BatchSize::LargeInput,
         );
@@ -105,10 +129,14 @@ fn bench_recompute_dirty_1m(c: &mut Criterion) {
                 (wb, graph, reg)
             },
             |(mut wb, mut graph, reg)| {
-                let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
-                let result = rt.recompute_dirty().expect("graph attached");
-                assert_eq!(result.attempted, 1, "exactly one dependent, not the grid");
-                black_box(result);
+                {
+                    let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+                    let result = rt.recompute_dirty().expect("graph attached");
+                    assert_eq!(result.attempted, 1, "exactly one dependent, not the grid");
+                    black_box(result);
+                }
+                // Drop-deferral (see header): return owned state.
+                (wb, graph, reg)
             },
             BatchSize::LargeInput,
         );
@@ -125,10 +153,21 @@ fn bench_cold_full_recalc(c: &mut Criterion) {
         b.iter_batched(
             || build_chain(N),
             |(mut wb, reg)| {
-                let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-                let result = rt.recompute_all();
-                assert_eq!(result.attempted, (N - 1) as usize, "every formula recomputed");
-                black_box(result);
+                {
+                    let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+                    let result = rt.recompute_all();
+                    assert_eq!(
+                        result.attempted,
+                        (N - 1) as usize,
+                        "every formula recomputed"
+                    );
+                    black_box(result);
+                }
+                // Drop-deferral (see header). NOTE: unlike the two edit benches,
+                // this number stays large after the fix -- `recompute_all` genuinely
+                // re-parses + evaluates all 100k formulas (the F-2 informational
+                // full-eval cost); it is NOT a drop artifact.
+                (wb, reg)
             },
             BatchSize::LargeInput,
         );
