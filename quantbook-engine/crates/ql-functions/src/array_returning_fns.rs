@@ -432,6 +432,599 @@ pub fn filter(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
     FunctionReturn::Array(arr)
 }
 
+// ───────────────────────── Wave O (2026-06-20) ──────────────────────────────
+// SORT / SORTBY / UNIQUE / RANDARRAY — completing the "top-5" dynamic-array
+// family (SEQUENCE / TRANSPOSE / FILTER already ship above).
+
+use std::cmp::Ordering;
+
+/// Coerce a `FunctionArg::Scalar` to a boolean using Excel's lenient flag
+/// rules (TRUE/FALSE, or a number where `!= 0` is true). Used for the
+/// `by_col` / `exactly_once` / `whole_number` flag positions. Non-scalar args
+/// or non-coercible text surface `#VALUE!`; an error arg propagates.
+fn coerce_arg_to_bool(arg: &FunctionArg) -> Result<bool, Value> {
+    match arg {
+        FunctionArg::Scalar(Value::Boolean(b)) => Ok(*b),
+        FunctionArg::Scalar(Value::Number(n)) => Ok(*n != 0.0),
+        FunctionArg::Scalar(Value::Blank) => Ok(false),
+        FunctionArg::Scalar(Value::Error(e)) => Err(Value::Error(*e)),
+        // Text / range / array at a flag position is not a valid boolean.
+        FunctionArg::Scalar(Value::Text(_)) | FunctionArg::Range { .. } | FunctionArg::Array(_) => {
+            Err(Value::Error(ErrorValue::Value))
+        }
+    }
+}
+
+/// Excel SORT total-order rank: Number/Blank < Text < Boolean < Error. Within
+/// a rank, [`sort_cmp`] resolves the fine order.
+///
+/// **v1 simplification (megaudit-flagged):** Excel pushes truly-empty cells to
+/// the END of a sorted range regardless of direction. Our engine carries Blank
+/// as a first-class value; matching `lookup_cmp` (range_fns.rs) we treat Blank
+/// as `0` and let it sort among numbers. "Blanks always last" is deferred to
+/// v1.5 (it needs a direction-independent partition, not a total order).
+fn sort_type_rank(v: &Value) -> u8 {
+    match v {
+        Value::Number(_) | Value::Blank => 0,
+        Value::Text(_) => 1,
+        Value::Boolean(_) => 2,
+        Value::Error(_) => 3,
+    }
+}
+
+/// Total order over `Value` for SORT/SORTBY (ascending). Cross-type order is by
+/// [`sort_type_rank`]; within a type: numbers/blanks numerically (Blank == 0),
+/// text case-insensitively (uppercase fold, matching `lookup_cmp`), booleans
+/// FALSE < TRUE, and all errors compare Equal (grouped; stable sort keeps their
+/// original order).
+///
+/// **Megaudit (2026-06-20):** this MUST be a strict-weak-ordering — `slice::sort_by`
+/// has unspecified output (never UB, but a garbage permutation) if it is not. The
+/// engine sanitizes NaN to `#NUM!`, so a raw `Value::Number(NaN)` should never reach
+/// here, but a `partial_cmp(...).unwrap_or(Equal)` would make `NaN == 1` and `NaN ==
+/// 2` while `1 < 2` (a transitivity break). We give NaN a deterministic place
+/// (NaN > every real number; NaN == NaN) so the comparator is a total order for ANY
+/// f64 input, defensively.
+fn sort_cmp(a: &Value, b: &Value) -> Ordering {
+    let (ra, rb) = (sort_type_rank(a), sort_type_rank(b));
+    if ra != rb {
+        return ra.cmp(&rb);
+    }
+    match (a, b) {
+        (Value::Number(_) | Value::Blank, Value::Number(_) | Value::Blank) => {
+            let na = if let Value::Number(n) = a { *n } else { 0.0 };
+            let nb = if let Value::Number(n) = b { *n } else { 0.0 };
+            // Deterministic total order incl. NaN (sorts after every real; NaN == NaN).
+            match (na.is_nan(), nb.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => na.partial_cmp(&nb).expect("non-NaN f64 compare is total"),
+            }
+        }
+        (Value::Text(x), Value::Text(y)) => x.to_uppercase().cmp(&y.to_uppercase()),
+        (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
+        // Errors group together; stable sort preserves their input order.
+        _ => Ordering::Equal,
+    }
+}
+
+/// Value equality for UNIQUE dedup: same-type only — numbers by `==` (NaN never
+/// equal, so each NaN row is distinct), text case-insensitively (matching
+/// `sort_cmp`), booleans / blanks / matching error variants. Cross-type is
+/// never equal (`0 != FALSE != "" != Blank`), matching Excel's UNIQUE.
+fn values_equal_for_unique(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x == y,
+        (Value::Text(x), Value::Text(y)) => x.to_uppercase() == y.to_uppercase(),
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Blank, Value::Blank) => true,
+        (Value::Error(x), Value::Error(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Coerce a scalar arg to a `1`/`-1` sort-order direction. Excel: `1`
+/// (ascending, default) or `-1` (descending); anything else → `#VALUE!`.
+fn coerce_sort_order(arg: &FunctionArg) -> Result<bool, Value> {
+    // Returns `descending` (true = -1, false = 1).
+    match coerce_arg_to_f64(arg) {
+        Ok(n) if n == 1.0 => Ok(false),
+        Ok(n) if n == -1.0 => Ok(true),
+        Ok(_) => Err(Value::Error(ErrorValue::Value)),
+        Err(e) => Err(e),
+    }
+}
+
+/// `SORT(array, [sort_index], [sort_order], [by_col])` — reorder the rows (or,
+/// with `by_col` TRUE, the columns) of `array` by the key column/row at the
+/// 1-based `sort_index`. Stable (Excel 365 keeps ties in input order, both
+/// directions). Shape is preserved.
+///
+/// - `sort_index` (default 1): 1-based key column (by_col FALSE) or key row
+///   (by_col TRUE). Out of range → `#VALUE!`.
+/// - `sort_order` (default 1): 1 ascending, -1 descending; else `#VALUE!`.
+/// - `by_col` (default FALSE): FALSE sorts rows, TRUE sorts columns.
+///
+/// Arity 1..=4 → else `#N/A`. Degenerate input → degenerate output (`#CALC!`).
+pub fn sort(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
+    if args.is_empty() || args.len() > 4 {
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::NA));
+    }
+    let (rows, cols, cells) = match arg_as_2d(&args[0]) {
+        Ok(t) => t,
+        Err(e) => return FunctionReturn::Scalar(e),
+    };
+    // sort_index (1-based) defaults to 1.
+    let sort_index = if args.len() >= 2 {
+        match coerce_arg_to_f64(&args[1]) {
+            Ok(n) if n.is_finite() && n >= 1.0 => n.trunc() as u64,
+            Ok(_) => return FunctionReturn::Scalar(Value::Error(ErrorValue::Value)),
+            Err(e) => return FunctionReturn::Scalar(e),
+        }
+    } else {
+        1
+    };
+    let descending = if args.len() >= 3 {
+        match coerce_sort_order(&args[2]) {
+            Ok(d) => d,
+            Err(e) => return FunctionReturn::Scalar(e),
+        }
+    } else {
+        false
+    };
+    let by_col = if args.len() >= 4 {
+        match coerce_arg_to_bool(&args[3]) {
+            Ok(b) => b,
+            Err(e) => return FunctionReturn::Scalar(e),
+        }
+    } else {
+        false
+    };
+
+    // Degenerate input → degenerate output of the same shape (#CALC!).
+    if rows == 0 || cols == 0 {
+        return FunctionReturn::Array(ArrayValue::empty(rows, cols));
+    }
+
+    // The key axis length must contain `sort_index`.
+    let key_axis_len = if by_col { rows } else { cols };
+    if sort_index > key_axis_len as u64 {
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::Value));
+    }
+    let key_idx = (sort_index - 1) as usize;
+    let cells_at = |r: usize, c: usize| -> &Value { &cells[r * (cols as usize) + c] };
+
+    if !by_col {
+        // Sort rows by the key column `key_idx`. Stable.
+        let mut order: Vec<usize> = (0..rows as usize).collect();
+        order.sort_by(|&r1, &r2| {
+            let o = sort_cmp(cells_at(r1, key_idx), cells_at(r2, key_idx));
+            if descending {
+                o.reverse()
+            } else {
+                o
+            }
+        });
+        let mut out: Vec<Value> = Vec::with_capacity(cells.len());
+        for &r in &order {
+            for c in 0..cols as usize {
+                out.push(cells_at(r, c).clone());
+            }
+        }
+        let arr = ArrayValue::new(rows, cols, out).expect("row permutation preserves cell count");
+        FunctionReturn::Array(arr)
+    } else {
+        // Sort columns by the key row `key_idx`. Stable.
+        let mut order: Vec<usize> = (0..cols as usize).collect();
+        order.sort_by(|&c1, &c2| {
+            let o = sort_cmp(cells_at(key_idx, c1), cells_at(key_idx, c2));
+            if descending {
+                o.reverse()
+            } else {
+                o
+            }
+        });
+        let mut out: Vec<Value> = Vec::with_capacity(cells.len());
+        for r in 0..rows as usize {
+            for &c in &order {
+                out.push(cells_at(r, c).clone());
+            }
+        }
+        let arr = ArrayValue::new(rows, cols, out).expect("col permutation preserves cell count");
+        FunctionReturn::Array(arr)
+    }
+}
+
+/// `SORTBY(array, by_array1, [order1], [by_array2, order2], …)` — reorder
+/// `array`'s rows (or columns) by one or more parallel key vectors. Stable,
+/// multi-key (by_array1 primary). Shape is preserved.
+///
+/// Args after `array` are parsed by TYPE (Excel's disambiguation): an
+/// array/range is a new `by_array`; a scalar number is the `order` (1/-1) for
+/// the most-recent `by_array`. `by_array1` is required.
+///
+/// **v1 contract:** every `by_array` is a 1D vector (column OR row) sharing the
+/// SAME orientation and length, which selects the sort axis — a column vector
+/// of length `array.rows` sorts rows; a row vector of length `array.cols` sorts
+/// columns. Mismatched orientation/length → `#VALUE!`.
+pub fn sortby(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
+    if args.len() < 2 {
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::NA));
+    }
+    let (rows, cols, cells) = match arg_as_2d(&args[0]) {
+        Ok(t) => t,
+        Err(e) => return FunctionReturn::Scalar(e),
+    };
+
+    // Parse the (by_array, order) sequence by arg type.
+    struct Key {
+        rows: u32,
+        cols: u32,
+        cells: Vec<Value>,
+        descending: bool,
+    }
+    let mut keys: Vec<Key> = Vec::new();
+    let mut order_set_for_last = false; // guard: one order per by_array.
+    for arg in &args[1..] {
+        match arg {
+            FunctionArg::Array(_) | FunctionArg::Range { .. } => {
+                let (kr, kc, kcells) = match arg_as_2d(arg) {
+                    Ok(t) => t,
+                    Err(e) => return FunctionReturn::Scalar(e),
+                };
+                keys.push(Key {
+                    rows: kr,
+                    cols: kc,
+                    cells: kcells,
+                    descending: false,
+                });
+                order_set_for_last = false;
+            }
+            FunctionArg::Scalar(Value::Error(e)) => {
+                return FunctionReturn::Scalar(Value::Error(*e));
+            }
+            FunctionArg::Scalar(_) => {
+                // A scalar is an order for the most-recent by_array.
+                if keys.is_empty() || order_set_for_last {
+                    return FunctionReturn::Scalar(Value::Error(ErrorValue::Value));
+                }
+                match coerce_sort_order(arg) {
+                    Ok(d) => keys.last_mut().unwrap().descending = d,
+                    Err(e) => return FunctionReturn::Scalar(e),
+                }
+                order_set_for_last = true;
+            }
+        }
+    }
+    if keys.is_empty() {
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::NA));
+    }
+
+    if rows == 0 || cols == 0 {
+        return FunctionReturn::Array(ArrayValue::empty(rows, cols));
+    }
+
+    // Orientation from the FIRST key: column vector → sort rows; row vector →
+    // sort columns. Every other key must match orientation + length.
+    let (sort_rows, axis_len): (bool, u32) = {
+        let k = &keys[0];
+        if k.cols == 1 && k.rows == rows {
+            (true, rows)
+        } else if k.rows == 1 && k.cols == cols {
+            (false, cols)
+        } else {
+            return FunctionReturn::Scalar(Value::Error(ErrorValue::Value));
+        }
+    };
+    for k in &keys {
+        let ok = if sort_rows {
+            k.cols == 1 && k.rows == axis_len
+        } else {
+            k.rows == 1 && k.cols == axis_len
+        };
+        if !ok {
+            return FunctionReturn::Scalar(Value::Error(ErrorValue::Value));
+        }
+    }
+
+    // Stable multi-key sort of the axis indices.
+    let mut order: Vec<usize> = (0..axis_len as usize).collect();
+    order.sort_by(|&i, &j| {
+        for k in &keys {
+            let o = sort_cmp(&k.cells[i], &k.cells[j]);
+            let o = if k.descending { o.reverse() } else { o };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        Ordering::Equal
+    });
+
+    let cells_at = |r: usize, c: usize| -> &Value { &cells[r * (cols as usize) + c] };
+    let mut out: Vec<Value> = Vec::with_capacity(cells.len());
+    if sort_rows {
+        for &r in &order {
+            for c in 0..cols as usize {
+                out.push(cells_at(r, c).clone());
+            }
+        }
+    } else {
+        for r in 0..rows as usize {
+            for &c in &order {
+                out.push(cells_at(r, c).clone());
+            }
+        }
+    }
+    let arr = ArrayValue::new(rows, cols, out).expect("permutation preserves cell count");
+    FunctionReturn::Array(arr)
+}
+
+/// `UNIQUE(array, [by_col], [exactly_once])` — distinct rows (or, with `by_col`
+/// TRUE, distinct columns) of `array`, in first-seen order.
+///
+/// - `by_col` (default FALSE): FALSE compares whole rows, TRUE whole columns.
+/// - `exactly_once` (default FALSE): FALSE returns each distinct entry once;
+///   TRUE returns only entries that appear EXACTLY once.
+///
+/// Equality is element-wise [`values_equal_for_unique`] (case-insensitive text,
+/// cross-type distinct). Arity 1..=3 → else `#N/A`. An all-duplicate result
+/// under `exactly_once`, or degenerate input, → degenerate output (`#CALC!`).
+pub fn unique(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
+    if args.is_empty() || args.len() > 3 {
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::NA));
+    }
+    let (rows, cols, cells) = match arg_as_2d(&args[0]) {
+        Ok(t) => t,
+        Err(e) => return FunctionReturn::Scalar(e),
+    };
+    let by_col = if args.len() >= 2 {
+        match coerce_arg_to_bool(&args[1]) {
+            Ok(b) => b,
+            Err(e) => return FunctionReturn::Scalar(e),
+        }
+    } else {
+        false
+    };
+    let exactly_once = if args.len() >= 3 {
+        match coerce_arg_to_bool(&args[2]) {
+            Ok(b) => b,
+            Err(e) => return FunctionReturn::Scalar(e),
+        }
+    } else {
+        false
+    };
+
+    if rows == 0 || cols == 0 {
+        return FunctionReturn::Array(ArrayValue::empty(rows, cols));
+    }
+    let (rows_u, cols_u) = (rows as usize, cols as usize);
+    let cells_at = |r: usize, c: usize| -> &Value { &cells[r * cols_u + c] };
+
+    // `n` entries along the dedup axis; each entry has `width` elements.
+    let (n, width): (usize, usize) = if by_col {
+        (cols_u, rows_u)
+    } else {
+        (rows_u, cols_u)
+    };
+    // Read entry `e`'s element `k` (k indexes the cross axis).
+    let entry_elem = |e: usize, k: usize| -> &Value {
+        if by_col {
+            cells_at(k, e) // column e, row k
+        } else {
+            cells_at(e, k) // row e, col k
+        }
+    };
+    let entries_equal = |a: usize, b: usize| -> bool {
+        (0..width).all(|k| values_equal_for_unique(entry_elem(a, k), entry_elem(b, k)))
+    };
+
+    // First-seen distinct entries + occurrence counts (O(n^2) compare — matches
+    // the codebase's "linear/simple, revisit if perf shows" idiom for lookups).
+    let mut distinct: Vec<usize> = Vec::new();
+    let mut counts: Vec<usize> = Vec::new();
+    for e in 0..n {
+        if let Some(pos) = distinct.iter().position(|&d| entries_equal(d, e)) {
+            counts[pos] += 1;
+        } else {
+            distinct.push(e);
+            counts.push(1);
+        }
+    }
+
+    let kept: Vec<usize> = distinct
+        .iter()
+        .zip(counts.iter())
+        .filter(|(_, &c)| !exactly_once || c == 1)
+        .map(|(&e, _)| e)
+        .collect();
+
+    if kept.is_empty() {
+        // No qualifying entry → degenerate of the result shape (#CALC!).
+        let (dr, dc) = if by_col { (rows, 0) } else { (0, cols) };
+        return FunctionReturn::Array(ArrayValue::empty(dr, dc));
+    }
+
+    let k = kept.len() as u32;
+    let (out_rows, out_cols) = if by_col { (rows, k) } else { (k, cols) };
+    let mut out: Vec<Value> = Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+    if by_col {
+        // Result columns = kept columns, in first-seen order; row-major fill.
+        for r in 0..rows_u {
+            for &e in &kept {
+                out.push(cells_at(r, e).clone());
+            }
+        }
+    } else {
+        for &e in &kept {
+            for c in 0..cols_u {
+                out.push(cells_at(e, c).clone());
+            }
+        }
+    }
+    let arr = ArrayValue::new(out_rows, out_cols, out).expect("kept entries fill the result shape");
+    FunctionReturn::Array(arr)
+}
+
+/// `RANDARRAY([rows], [cols], [min], [max], [whole_number])` — an array of
+/// random numbers. **Volatile** (re-rolls every recalc); deterministic under
+/// `volatile::set_test_rng_seed` (shares RAND's thread-local RNG).
+///
+/// - `rows` / `cols` (default 1): like SEQUENCE — finite, negative → `#VALUE!`,
+///   zero → `#NUM!`, truncated toward zero.
+/// - `min` / `max` (default 0 / 1): the continuous bound. **v1 divergence
+///   (megaudit-noted):** the interval is `[min, max)` (exclusive-max), since the
+///   draw reuses RAND's `[0, 1)`; Excel documents `[min, max]` inclusive. The gap
+///   is unobservable in practice (P(hit max) ≈ 2⁻⁵³). `min > max` → `#NUM!`; a
+///   non-finite span (`1e308 - -1e308`) → `#NUM!`.
+/// - `whole_number` (default FALSE): TRUE returns integers in `[ceil(min),
+///   floor(max)]` inclusive (mirroring RANDBETWEEN's rounding); if
+///   `ceil(min) > floor(max)`, or a bound is outside the i64 integer domain →
+///   `#NUM!` (never a panic).
+///
+/// Arity 0..=5 → else `#N/A`. (v1 bound choices — `min > max` → `#NUM!`, and
+/// whole-number rounding via ceil/floor — are megaudit-flagged for Excel-canon
+/// confirmation.)
+pub fn randarray(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
+    if args.len() > 5 {
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::NA));
+    }
+    // Dimension coercion mirrors SEQUENCE exactly.
+    let dim = |idx: usize| -> Result<u32, Value> {
+        let f = coerce_arg_to_f64(&args[idx])?;
+        if !f.is_finite() {
+            return Err(Value::Error(ErrorValue::Value));
+        }
+        if f < 0.0 {
+            return Err(Value::Error(ErrorValue::Value));
+        }
+        let t = f.trunc();
+        if t > u32::MAX as f64 {
+            return Err(Value::Error(ErrorValue::Num));
+        }
+        let d = t as u32;
+        if d == 0 {
+            return Err(Value::Error(ErrorValue::Num));
+        }
+        Ok(d)
+    };
+    let rows = if args.len() >= 1 {
+        match dim(0) {
+            Ok(d) => d,
+            Err(e) => return FunctionReturn::Scalar(e),
+        }
+    } else {
+        1
+    };
+    let cols = if args.len() >= 2 {
+        match dim(1) {
+            Ok(d) => d,
+            Err(e) => return FunctionReturn::Scalar(e),
+        }
+    } else {
+        1
+    };
+    let min = if args.len() >= 3 {
+        match coerce_arg_to_f64(&args[2]) {
+            Ok(n) if n.is_finite() => n,
+            Ok(_) => return FunctionReturn::Scalar(Value::Error(ErrorValue::Num)),
+            Err(e) => return FunctionReturn::Scalar(e),
+        }
+    } else {
+        0.0
+    };
+    let max = if args.len() >= 4 {
+        match coerce_arg_to_f64(&args[3]) {
+            Ok(n) if n.is_finite() => n,
+            Ok(_) => return FunctionReturn::Scalar(Value::Error(ErrorValue::Num)),
+            Err(e) => return FunctionReturn::Scalar(e),
+        }
+    } else {
+        1.0
+    };
+    let whole = if args.len() >= 5 {
+        match coerce_arg_to_bool(&args[4]) {
+            Ok(b) => b,
+            Err(e) => return FunctionReturn::Scalar(e),
+        }
+    } else {
+        false
+    };
+
+    // **Codex megaudit HIGH/MEDIUM (2026-06-20):** validate the value bounds BEFORE the dimension
+    // allocation, and bound them so the integer/continuous draw can never panic or poison. Two
+    // failure classes the naive ordering hit: (1) `RANDARRAY(2147483647,1,10,5)` would allocate ~2.1B
+    // cells before noticing min>max; (2) `RANDARRAY(1,1,-1E20,1E20,TRUE)` overflowed `i64` in the
+    // whole-number span, and `RANDARRAY(1,1,-1E308,1E308)` produced a non-finite continuous span.
+    // Resolve EVERY bound to a fill closure (or a `#NUM!`) up front, THEN allocate.
+    enum Draw {
+        Whole(i64, i64),
+        Continuous(f64, f64), // (min, span); span guaranteed finite
+    }
+    let draw = if whole {
+        let lo = min.ceil();
+        let hi = max.floor();
+        // No integers in range (incl. `5.2..=5.8`), or bounds outside the i64 integer domain
+        // (a >2^63-wide integer range is meaningless for a spreadsheet) -> `#NUM!`.
+        //
+        // **Re-audit (Codex MEDIUM, 2026-06-20):** the upper guard MUST be `>=`, not `>`. `i64::MAX`
+        // (2^63 - 1) is not f64-representable; `i64::MAX as f64` rounds UP to 2^63, so `hi == 2^63`
+        // would slip past a `>` guard and then SATURATE through `as i64` to `i64::MAX` (a silent wrong
+        // value). `lo` keeps `<` because `i64::MIN` (-2^63) IS exactly f64-representable, so
+        // `lo == i64::MIN` is a valid in-domain bound that must be accepted.
+        if !(lo.is_finite() && hi.is_finite())
+            || lo > hi
+            || lo < i64::MIN as f64
+            || hi >= i64::MAX as f64
+        {
+            return FunctionReturn::Scalar(Value::Error(ErrorValue::Num));
+        }
+        Draw::Whole(lo as i64, hi as i64)
+    } else {
+        if min > max {
+            return FunctionReturn::Scalar(Value::Error(ErrorValue::Num));
+        }
+        let span = max - min;
+        // `1E308 - (-1E308)` overflows to `+inf`; a non-finite span can only yield non-finite cells.
+        if !span.is_finite() {
+            return FunctionReturn::Scalar(Value::Error(ErrorValue::Num));
+        }
+        Draw::Continuous(min, span)
+    };
+
+    let total = (rows as u64).saturating_mul(cols as u64);
+    if total > (i32::MAX as u64) {
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::Num));
+    }
+    let total = total as usize;
+    let mut out: Vec<Value> = Vec::with_capacity(total);
+
+    match draw {
+        Draw::Whole(lo_i, hi_i) => {
+            for _ in 0..total {
+                out.push(Value::Number(crate::volatile::next_rand_whole(lo_i, hi_i)));
+            }
+        }
+        Draw::Continuous(min, span) => {
+            for _ in 0..total {
+                let v = min + crate::volatile::next_rand_unit() * span;
+                // Defense-in-depth: even with a finite span, a pathological `min` + draw could land
+                // a non-finite result; sanitize to `#NUM!` per the `Value::number` invariant (mirrors
+                // SEQUENCE's per-element guard), never a raw NaN/Inf cell.
+                if v.is_finite() {
+                    out.push(Value::Number(v));
+                } else {
+                    out.push(Value::Error(ErrorValue::Num));
+                }
+            }
+        }
+    }
+
+    let arr =
+        ArrayValue::new(rows, cols, out).expect("rows*cols == total; ArrayValue::new succeeds");
+    FunctionReturn::Array(arr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,5 +1659,547 @@ mod tests {
         // Degenerate output preserves input orientation (1 row).
         assert_eq!(result.rows(), 1);
         assert_eq!(result.cols(), 0);
+    }
+
+    // ===== Wave O (2026-06-20) — SORT / SORTBY / UNIQUE / RANDARRAY =====
+
+    fn t(s: &str) -> Value {
+        Value::Text(std::sync::Arc::from(s))
+    }
+
+    // ----- SORT -----
+
+    /// SORT a 3×2 by the first column ascending; whole rows move together.
+    #[test]
+    fn sort_rows_ascending_by_first_col() {
+        let input = arr(
+            3,
+            2,
+            vec![
+                Value::Number(3.0),
+                t("c"),
+                Value::Number(1.0),
+                t("a"),
+                Value::Number(2.0),
+                t("b"),
+            ],
+        );
+        let r = expect_array(sort(&[input], &ctx()));
+        assert_eq!((r.rows(), r.cols()), (3, 2));
+        assert_eq!(r.at(0, 0), &Value::Number(1.0));
+        assert_eq!(r.at(0, 1), &t("a"));
+        assert_eq!(r.at(1, 0), &Value::Number(2.0));
+        assert_eq!(r.at(2, 0), &Value::Number(3.0));
+    }
+
+    /// SORT descending (`sort_order = -1`).
+    #[test]
+    fn sort_rows_descending() {
+        let input = arr(
+            3,
+            1,
+            vec![Value::Number(1.0), Value::Number(3.0), Value::Number(2.0)],
+        );
+        let r = expect_array(sort(&[input, n(1.0), n(-1.0)], &ctx()));
+        assert_eq!(r.at(0, 0), &Value::Number(3.0));
+        assert_eq!(r.at(1, 0), &Value::Number(2.0));
+        assert_eq!(r.at(2, 0), &Value::Number(1.0));
+    }
+
+    /// SORT columns by a key row (`by_col = TRUE`).
+    #[test]
+    fn sort_by_col_reorders_columns() {
+        // Row 0 is the key: {3, 1, 2}. Sorting columns ascending → {1,2,3}.
+        let input = arr(
+            2,
+            3,
+            vec![
+                Value::Number(3.0),
+                Value::Number(1.0),
+                Value::Number(2.0),
+                t("x"),
+                t("y"),
+                t("z"),
+            ],
+        );
+        let r = expect_array(sort(
+            &[input, n(1.0), n(1.0), FunctionArg::Scalar(b(true))],
+            &ctx(),
+        ));
+        assert_eq!((r.rows(), r.cols()), (2, 3));
+        // Key row sorted.
+        assert_eq!(r.at(0, 0), &Value::Number(1.0));
+        assert_eq!(r.at(0, 1), &Value::Number(2.0));
+        assert_eq!(r.at(0, 2), &Value::Number(3.0));
+        // Column 1 (orig key 1 → "y") moved to position 0 with its column.
+        assert_eq!(r.at(1, 0), &t("y"));
+        assert_eq!(r.at(1, 1), &t("z"));
+        assert_eq!(r.at(1, 2), &t("x"));
+    }
+
+    /// Stability: equal keys keep their INPUT order (Excel 365 contract).
+    #[test]
+    fn sort_is_stable_on_ties() {
+        let input = arr(
+            3,
+            2,
+            vec![
+                Value::Number(1.0),
+                t("first"),
+                Value::Number(1.0),
+                t("second"),
+                Value::Number(1.0),
+                t("third"),
+            ],
+        );
+        let r = expect_array(sort(&[input], &ctx()));
+        assert_eq!(r.at(0, 1), &t("first"));
+        assert_eq!(r.at(1, 1), &t("second"));
+        assert_eq!(r.at(2, 1), &t("third"));
+    }
+
+    /// Cross-type precedence: Number < Text < Boolean (ascending).
+    #[test]
+    fn sort_type_precedence_number_text_bool() {
+        let input = arr(3, 1, vec![Value::Boolean(true), t("b"), Value::Number(2.0)]);
+        let r = expect_array(sort(&[input], &ctx()));
+        assert_eq!(r.at(0, 0), &Value::Number(2.0));
+        assert_eq!(r.at(1, 0), &t("b"));
+        assert_eq!(r.at(2, 0), &Value::Boolean(true));
+    }
+
+    #[test]
+    fn sort_index_out_of_range_is_value_error() {
+        let input = arr(2, 1, vec![Value::Number(1.0), Value::Number(2.0)]);
+        let e = expect_scalar_error(sort(&[input, n(5.0)], &ctx()));
+        assert_eq!(e, ErrorValue::Value);
+    }
+
+    #[test]
+    fn sort_bad_order_is_value_error() {
+        let input = arr(2, 1, vec![Value::Number(1.0), Value::Number(2.0)]);
+        let e = expect_scalar_error(sort(&[input, n(1.0), n(2.0)], &ctx()));
+        assert_eq!(e, ErrorValue::Value);
+    }
+
+    #[test]
+    fn sort_zero_args_is_na() {
+        assert_eq!(expect_scalar_error(sort(&[], &ctx())), ErrorValue::NA);
+    }
+
+    // ----- SORTBY -----
+
+    /// SORTBY reorders `array` rows by a parallel key vector.
+    #[test]
+    fn sortby_single_key_reorders_rows() {
+        // array {a;b;c} by {3;1;2} ascending → {b;c;a}.
+        let array = arr(3, 1, vec![t("a"), t("b"), t("c")]);
+        let by = arr(
+            3,
+            1,
+            vec![Value::Number(3.0), Value::Number(1.0), Value::Number(2.0)],
+        );
+        let r = expect_array(sortby(&[array, by], &ctx()));
+        assert_eq!(r.at(0, 0), &t("b"));
+        assert_eq!(r.at(1, 0), &t("c"));
+        assert_eq!(r.at(2, 0), &t("a"));
+    }
+
+    /// SORTBY descending via an explicit order arg.
+    #[test]
+    fn sortby_descending_order() {
+        let array = arr(3, 1, vec![t("a"), t("b"), t("c")]);
+        let by = arr(
+            3,
+            1,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+        );
+        let r = expect_array(sortby(&[array, by, n(-1.0)], &ctx()));
+        assert_eq!(r.at(0, 0), &t("c"));
+        assert_eq!(r.at(2, 0), &t("a"));
+    }
+
+    /// SORTBY multi-key: primary ties broken by the secondary key.
+    #[test]
+    fn sortby_multi_key_tiebreak() {
+        // array {a;b;c;d}; primary {1;1;2;2}; secondary {2;1;2;1}
+        // → order by (primary asc, secondary asc): b(1,1), a(1,2), d(2,1), c(2,2).
+        let array = arr(4, 1, vec![t("a"), t("b"), t("c"), t("d")]);
+        let k1 = arr(
+            4,
+            1,
+            vec![
+                Value::Number(1.0),
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(2.0),
+            ],
+        );
+        let k2 = arr(
+            4,
+            1,
+            vec![
+                Value::Number(2.0),
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(1.0),
+            ],
+        );
+        let r = expect_array(sortby(&[array, k1, k2], &ctx()));
+        assert_eq!(r.at(0, 0), &t("b"));
+        assert_eq!(r.at(1, 0), &t("a"));
+        assert_eq!(r.at(2, 0), &t("d"));
+        assert_eq!(r.at(3, 0), &t("c"));
+    }
+
+    #[test]
+    fn sortby_length_mismatch_is_value_error() {
+        let array = arr(3, 1, vec![t("a"), t("b"), t("c")]);
+        let by = arr(2, 1, vec![Value::Number(1.0), Value::Number(2.0)]);
+        let e = expect_scalar_error(sortby(&[array, by], &ctx()));
+        assert_eq!(e, ErrorValue::Value);
+    }
+
+    #[test]
+    fn sortby_only_array_is_na() {
+        let array = arr(2, 1, vec![t("a"), t("b")]);
+        assert_eq!(
+            expect_scalar_error(sortby(&[array], &ctx())),
+            ErrorValue::NA
+        );
+    }
+
+    /// Two consecutive order scalars (no by_array between) → #VALUE!.
+    #[test]
+    fn sortby_two_orders_in_a_row_is_value_error() {
+        let array = arr(2, 1, vec![t("a"), t("b")]);
+        let by = arr(2, 1, vec![Value::Number(1.0), Value::Number(2.0)]);
+        let e = expect_scalar_error(sortby(&[array, by, n(1.0), n(-1.0)], &ctx()));
+        assert_eq!(e, ErrorValue::Value);
+    }
+
+    // ----- UNIQUE -----
+
+    /// UNIQUE distinct rows of a column vector, first-seen order.
+    #[test]
+    fn unique_column_distinct_first_seen() {
+        let input = arr(
+            5,
+            1,
+            vec![
+                Value::Number(1.0),
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(3.0),
+            ],
+        );
+        let r = expect_array(unique(&[input], &ctx()));
+        assert_eq!((r.rows(), r.cols()), (3, 1));
+        assert_eq!(r.at(0, 0), &Value::Number(1.0));
+        assert_eq!(r.at(1, 0), &Value::Number(2.0));
+        assert_eq!(r.at(2, 0), &Value::Number(3.0));
+    }
+
+    /// UNIQUE with `exactly_once` keeps only entries appearing exactly once.
+    #[test]
+    fn unique_exactly_once() {
+        let input = arr(
+            5,
+            1,
+            vec![
+                Value::Number(1.0),
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(3.0),
+            ],
+        );
+        let r = expect_array(unique(
+            &[
+                input,
+                FunctionArg::Scalar(b(false)),
+                FunctionArg::Scalar(b(true)),
+            ],
+            &ctx(),
+        ));
+        assert_eq!((r.rows(), r.cols()), (1, 1));
+        assert_eq!(r.at(0, 0), &Value::Number(2.0));
+    }
+
+    /// UNIQUE on whole rows of a 2D array (dedup matching rows).
+    #[test]
+    fn unique_2d_rows() {
+        // Rows: (1,a), (1,a), (2,b) → distinct (1,a),(2,b).
+        let input = arr(
+            3,
+            2,
+            vec![
+                Value::Number(1.0),
+                t("a"),
+                Value::Number(1.0),
+                t("a"),
+                Value::Number(2.0),
+                t("b"),
+            ],
+        );
+        let r = expect_array(unique(&[input], &ctx()));
+        assert_eq!((r.rows(), r.cols()), (2, 2));
+        assert_eq!(r.at(0, 0), &Value::Number(1.0));
+        assert_eq!(r.at(0, 1), &t("a"));
+        assert_eq!(r.at(1, 0), &Value::Number(2.0));
+        assert_eq!(r.at(1, 1), &t("b"));
+    }
+
+    /// UNIQUE over columns (`by_col = TRUE`).
+    #[test]
+    fn unique_by_col() {
+        // Columns: {1,1,2} across one row → distinct columns {1,2}.
+        let input = arr(
+            1,
+            3,
+            vec![Value::Number(1.0), Value::Number(1.0), Value::Number(2.0)],
+        );
+        let r = expect_array(unique(&[input, FunctionArg::Scalar(b(true))], &ctx()));
+        assert_eq!((r.rows(), r.cols()), (1, 2));
+        assert_eq!(r.at(0, 0), &Value::Number(1.0));
+        assert_eq!(r.at(0, 1), &Value::Number(2.0));
+    }
+
+    /// Text dedup is case-insensitive (matches sort_cmp's fold).
+    #[test]
+    fn unique_text_case_insensitive() {
+        let input = arr(2, 1, vec![t("Hello"), t("hello")]);
+        let r = expect_array(unique(&[input], &ctx()));
+        assert_eq!((r.rows(), r.cols()), (1, 1));
+        assert_eq!(r.at(0, 0), &t("Hello"), "first-seen casing is kept");
+    }
+
+    /// Cross-type entries are distinct: 0 and FALSE do NOT dedup.
+    #[test]
+    fn unique_cross_type_distinct() {
+        let input = arr(2, 1, vec![Value::Number(0.0), Value::Boolean(false)]);
+        let r = expect_array(unique(&[input], &ctx()));
+        assert_eq!(r.rows(), 2);
+    }
+
+    /// `exactly_once` with all entries duplicated → degenerate (#CALC!).
+    #[test]
+    fn unique_exactly_once_all_dup_is_degenerate() {
+        let input = arr(2, 1, vec![Value::Number(1.0), Value::Number(1.0)]);
+        let r = expect_array(unique(
+            &[
+                input,
+                FunctionArg::Scalar(b(false)),
+                FunctionArg::Scalar(b(true)),
+            ],
+            &ctx(),
+        ));
+        assert!(r.is_degenerate());
+    }
+
+    #[test]
+    fn unique_zero_args_is_na() {
+        assert_eq!(expect_scalar_error(unique(&[], &ctx())), ErrorValue::NA);
+    }
+
+    // ----- RANDARRAY -----
+
+    #[test]
+    fn randarray_default_is_1x1_unit_interval() {
+        let r = expect_array(randarray(&[], &ctx()));
+        assert_eq!((r.rows(), r.cols()), (1, 1));
+        if let Value::Number(v) = r.at(0, 0) {
+            assert!((0.0..1.0).contains(v), "default RANDARRAY in [0,1): {v}");
+        } else {
+            panic!("expected a number");
+        }
+    }
+
+    #[test]
+    fn randarray_shape_from_rows_cols() {
+        let r = expect_array(randarray(&[n(2.0), n(3.0)], &ctx()));
+        assert_eq!((r.rows(), r.cols()), (2, 3));
+    }
+
+    /// Seeding the shared RNG makes RANDARRAY reproducible.
+    #[test]
+    fn randarray_is_deterministic_under_seed() {
+        crate::volatile::set_test_rng_seed(0xA11CE_u64);
+        let a = expect_array(randarray(&[n(2.0), n(2.0)], &ctx()));
+        crate::volatile::set_test_rng_seed(0xA11CE_u64);
+        let b = expect_array(randarray(&[n(2.0), n(2.0)], &ctx()));
+        assert_eq!(a.cells(), b.cells(), "same seed → same RANDARRAY");
+        crate::volatile::clear_test_overrides();
+    }
+
+    #[test]
+    fn randarray_continuous_bounds_respected() {
+        crate::volatile::set_test_rng_seed(0xBEEF_u64);
+        let r = expect_array(randarray(&[n(4.0), n(4.0), n(5.0), n(10.0)], &ctx()));
+        for v in r.cells() {
+            if let Value::Number(x) = v {
+                assert!(
+                    (5.0..10.0).contains(x),
+                    "continuous value out of [5,10): {x}"
+                );
+            } else {
+                panic!("expected number");
+            }
+        }
+        crate::volatile::clear_test_overrides();
+    }
+
+    #[test]
+    fn randarray_whole_number_integers_in_range() {
+        crate::volatile::set_test_rng_seed(0xF00D_u64);
+        let r = expect_array(randarray(
+            &[n(3.0), n(3.0), n(1.0), n(6.0), FunctionArg::Scalar(b(true))],
+            &ctx(),
+        ));
+        for v in r.cells() {
+            if let Value::Number(x) = v {
+                assert_eq!(x.fract(), 0.0, "whole-number must be integral: {x}");
+                assert!((1.0..=6.0).contains(x), "integer out of [1,6]: {x}");
+            } else {
+                panic!("expected number");
+            }
+        }
+        crate::volatile::clear_test_overrides();
+    }
+
+    #[test]
+    fn randarray_min_gt_max_is_num_error() {
+        let e = expect_scalar_error(randarray(&[n(1.0), n(1.0), n(10.0), n(5.0)], &ctx()));
+        assert_eq!(e, ErrorValue::Num);
+    }
+
+    #[test]
+    fn randarray_zero_rows_is_num_error() {
+        let e = expect_scalar_error(randarray(&[n(0.0)], &ctx()));
+        assert_eq!(e, ErrorValue::Num);
+    }
+
+    #[test]
+    fn randarray_negative_rows_is_value_error() {
+        let e = expect_scalar_error(randarray(&[n(-1.0)], &ctx()));
+        assert_eq!(e, ErrorValue::Value);
+    }
+
+    #[test]
+    fn randarray_too_many_args_is_na() {
+        let e = expect_scalar_error(randarray(
+            &[
+                n(1.0),
+                n(1.0),
+                n(0.0),
+                n(1.0),
+                FunctionArg::Scalar(b(false)),
+                n(9.0),
+            ],
+            &ctx(),
+        ));
+        assert_eq!(e, ErrorValue::NA);
+    }
+
+    /// **Megaudit (2026-06-20) — Codex/Opus HIGH:** wide whole-number bounds must NOT panic on i64
+    /// span overflow; they surface `#NUM!` (a >2^63-wide integer range is meaningless).
+    #[test]
+    fn randarray_whole_number_wide_bounds_is_num_not_panic() {
+        let e = expect_scalar_error(randarray(
+            &[
+                n(1.0),
+                n(1.0),
+                n(-1.0e20),
+                n(1.0e20),
+                FunctionArg::Scalar(b(true)),
+            ],
+            &ctx(),
+        ));
+        assert_eq!(e, ErrorValue::Num);
+    }
+
+    /// **Megaudit — Codex HIGH:** `min > max` with a huge row count must error FAST (before the
+    /// ~2.1B-cell allocation), i.e. the bound check precedes `Vec::with_capacity`.
+    #[test]
+    fn randarray_min_gt_max_errors_before_allocating() {
+        let e = expect_scalar_error(randarray(
+            &[n(2_147_483_647.0), n(1.0), n(10.0), n(5.0)],
+            &ctx(),
+        ));
+        assert_eq!(e, ErrorValue::Num);
+    }
+
+    /// **Re-audit — Codex MEDIUM:** the whole-number upper bound `2^63` (== `i64::MAX as f64`, which
+    /// rounds up) must be rejected as `#NUM!`, NOT saturated through `as i64` to a finite value.
+    #[test]
+    fn randarray_whole_number_at_i64_max_boundary_is_num() {
+        let two_pow_63 = 9_223_372_036_854_775_808.0_f64; // == i64::MAX as f64 (the rounded boundary)
+        let e = expect_scalar_error(randarray(
+            &[
+                n(1.0),
+                n(1.0),
+                n(two_pow_63),
+                n(two_pow_63),
+                FunctionArg::Scalar(b(true)),
+            ],
+            &ctx(),
+        ));
+        assert_eq!(e, ErrorValue::Num);
+    }
+
+    /// **Megaudit — Codex MEDIUM:** a non-finite continuous span (`1e308 - -1e308 = inf`) must
+    /// surface `#NUM!`, never raw `Inf`/`NaN` cells.
+    #[test]
+    fn randarray_continuous_nonfinite_span_is_num() {
+        let e = expect_scalar_error(randarray(
+            &[n(1.0), n(1.0), n(-1.0e308), n(1.0e308)],
+            &ctx(),
+        ));
+        assert_eq!(e, ErrorValue::Num);
+    }
+
+    /// **Megaudit — Codex/Opus/Sonnet MEDIUM:** `sort_cmp` stays a strict-weak-ordering even if a
+    /// raw `NaN` reaches it (defense-in-depth) — SORT must not panic / loop, and NaN sorts after
+    /// every real number.
+    #[test]
+    fn sort_with_raw_nan_is_total_order_no_panic() {
+        let input = arr(
+            3,
+            1,
+            vec![
+                Value::Number(f64::NAN),
+                Value::Number(2.0),
+                Value::Number(1.0),
+            ],
+        );
+        let r = expect_array(sort(&[input], &ctx()));
+        assert_eq!((r.rows(), r.cols()), (3, 1));
+        // Reals ascend; NaN lands last (deterministic placement).
+        assert_eq!(r.at(0, 0), &Value::Number(1.0));
+        assert_eq!(r.at(1, 0), &Value::Number(2.0));
+        assert!(matches!(r.at(2, 0), Value::Number(n) if n.is_nan()));
+    }
+
+    /// **Megaudit — Sonnet HIGH (REJECTED as a bug, pinned as a contract):** Excel reverses the
+    /// type-tier order in DESCENDING sort except blanks — so errors sort FIRST descending. This
+    /// pins the (verified-correct) behavior so a future "fix" toward errors-last can't regress it.
+    #[test]
+    fn sort_descending_places_errors_first_excel_canon() {
+        use ql_types::ErrorValue as EV;
+        let input = arr(
+            3,
+            1,
+            vec![
+                Value::Number(1.0),
+                Value::Error(EV::DivZero),
+                Value::Number(3.0),
+            ],
+        );
+        let r = expect_array(sort(&[input, n(1.0), n(-1.0)], &ctx()));
+        // Descending: error first (tier reversed), then 3, then 1.
+        assert!(matches!(r.at(0, 0), Value::Error(_)));
+        assert_eq!(r.at(1, 0), &Value::Number(3.0));
+        assert_eq!(r.at(2, 0), &Value::Number(1.0));
     }
 }

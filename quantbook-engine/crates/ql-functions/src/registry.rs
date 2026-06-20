@@ -982,8 +982,10 @@ pub fn default_registry() -> FunctionRegistry {
     // Engine Phase 3.7 (W5-40, 2026-05-12): volatile functions. The
     // `is_volatile_function` whitelist in `ql-exec::calcgraph_session`
     // already covers these names; this registration is the executable
-    // half. RANDARRAY / INDIRECT / OFFSET / INFO / CELL stay deferred
-    // to the Phase 4.3 function library expansion.
+    // half. INDIRECT / OFFSET / INFO / CELL stay deferred to the Phase
+    // 4.3 function library expansion. (RANDARRAY's dispatch shipped in
+    // Wave O — 2026-06-20 — via the array-returning tier above; it keeps
+    // its Volatile metadata from the Phase-1 override below.)
     // **W5-71 (Phase 4.5.A.2):** NOW/TODAY moved to the
     // ContextAwareFn tier so they can read the workbook's date_system
     // + locale-aware UTC offset from `EvalContext`. The legacy
@@ -1212,6 +1214,16 @@ pub fn default_registry() -> FunctionRegistry {
     // matching a boolean mask.
     r.register_unified("TRANSPOSE", crate::array_returning_fns::transpose);
     r.register_unified("FILTER", crate::array_returning_fns::filter);
+
+    // **Wave O (2026-06-20)**: complete the "top-5" dynamic-array family.
+    // SORT / SORTBY / UNIQUE are pure (Phase-2 below synthesizes their default
+    // `Pure` metadata). RANDARRAY already carries explicit `Volatile` metadata
+    // from the Phase-1 override below; this line adds its DISPATCH (it was
+    // metadata-only — the "future wave" the subset-invariant comment names).
+    r.register_unified("SORT", crate::array_returning_fns::sort);
+    r.register_unified("SORTBY", crate::array_returning_fns::sortby);
+    r.register_unified("UNIQUE", crate::array_returning_fns::unique);
+    r.register_unified("RANDARRAY", crate::array_returning_fns::randarray);
 
     // **W5-RT-2 (RT-V1-01 Step 2)**: reference-aware tier — address-only
     // batch. ROW / COLUMN return the 1-indexed row/col of a Reference or
@@ -1627,13 +1639,15 @@ fn register_builtin_metadata(r: &mut FunctionRegistry) {
     //
     // **Subset invariant (NOT bijection):** the metadata table may carry
     // extra entries that have no dispatch counterpart — Phase 1 above
-    // explicitly tags RANDARRAY/INDIRECT/OFFSET/INFO/CELL as
-    // Volatile/Dynamic so the dep walker treats them as graph-volatile
-    // EVEN THOUGH they aren't yet dispatchable (the registry comment at
-    // `:647-648` defers their implementation to a future Phase 4.3
-    // wave). The contract §10.3 unknown-function policy is "graph-
-    // visible and treated Volatile/Dynamic"; encoding that here keeps a
-    // user-typed `=INDIRECT(...)` flagged volatile even before dispatch
+    // explicitly tags INDIRECT/OFFSET/INFO/CELL as Dynamic so the dep
+    // walker treats them as graph-volatile EVEN THOUGH they aren't yet
+    // dispatchable (the registry comment at `:647-648` defers their
+    // implementation to a future Phase 4.3 wave). (RANDARRAY was in this
+    // set until Wave O — 2026-06-20 — shipped its dispatch; it now has
+    // BOTH metadata and a dispatch entry.) The contract §10.3
+    // unknown-function policy is "graph-visible and treated
+    // Volatile/Dynamic"; encoding that here keeps a user-typed
+    // `=INDIRECT(...)` flagged volatile even before dispatch
     // ships, matching today's `is_volatile_function` whitelist behavior.
     //
     // **6.4-0 audit-fix (2026-05-28; Opus L2):** upgraded from
@@ -1799,7 +1813,10 @@ mod tests {
         // B2 Wave A: VOLATILITY (sample-stdev of returns, optional sqrt(periods);
         // constant series => 0.0) + SORTINO ((mean-MAR)/downside-deviation,
         // empyrical all-N convention, sqrt(periods) annualization) = 2. => 264.
-        assert_eq!(r.len(), 264);
+        // Wave O (2026-06-20 — dynamic-array completion): SORT, SORTBY, UNIQUE,
+        // RANDARRAY = 4 — unified array-returning tier (RANDARRAY was previously
+        // metadata-only/volatile; its dispatch ships here). => 268.
+        assert_eq!(r.len(), 268);
     }
 
     #[test]
@@ -2269,9 +2286,10 @@ mod tests {
     /// a `r.register*` call without a Phase 1 / Phase 2 override would
     /// fall back to unknown-fn semantics at the walker. The converse is
     /// NOT required (metadata may carry extra entries — see
-    /// `register_builtin_metadata`'s Phase-1 RANDARRAY/INDIRECT/OFFSET/
-    /// INFO/CELL block; those names are graph-volatile but not yet
-    /// dispatchable). `default_registry()` debug-asserts the same;
+    /// `register_builtin_metadata`'s Phase-1 INDIRECT/OFFSET/INFO/CELL
+    /// block; those names are graph-volatile but not yet dispatchable.
+    /// RANDARRAY left this set in Wave O — it now has both metadata and
+    /// dispatch). `default_registry()` debug-asserts the same;
     /// asserting it here too gives a release-build green-light and a
     /// clearer failure message.
     #[test]
@@ -2284,10 +2302,11 @@ mod tests {
                 "default_registry missing metadata for dispatched fn {name:?}"
             );
         }
-        // Metadata may exceed dispatch — RANDARRAY/INDIRECT/OFFSET/INFO/
-        // CELL are Volatility-tagged but their dispatch is deferred
-        // (registry.rs:~647-648). Assert the documented superset
-        // relationship explicitly so a future drift is visible.
+        // Metadata may exceed dispatch — INDIRECT/OFFSET/INFO/CELL are
+        // Volatility-tagged but their dispatch is deferred
+        // (registry.rs:~647-648). (RANDARRAY was here until Wave O added
+        // its dispatch.) Assert the documented superset relationship
+        // explicitly so a future drift is visible.
         assert!(
             r.metadata_count() >= r.fns.len(),
             "metadata table must cover at least every dispatched fn"

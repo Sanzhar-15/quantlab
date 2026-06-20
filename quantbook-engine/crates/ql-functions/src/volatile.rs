@@ -254,6 +254,31 @@ pub fn randbetween(args: &[Value]) -> Value {
     Value::number(low as f64 + r as f64)
 }
 
+/// **Wave O (2026-06-20):** RANDARRAY's per-element continuous source — a
+/// uniform `f64` in `[0, 1)` drawn from the SAME thread-local xorshift64 RNG as
+/// [`rand`], so `set_test_rng_seed` makes RANDARRAY deterministic too. Mirrors
+/// `rand`'s top-53-bits / 2^53 construction exactly (the only difference is the
+/// array path needs many draws per call, so this exposes a single-draw seam).
+pub(crate) fn next_rand_unit() -> f64 {
+    let r = next_xorshift64();
+    let bits53 = r >> 11; // top 53 bits
+    let denom = (1u64 << 53) as f64;
+    bits53 as f64 / denom
+}
+
+/// **Wave O (2026-06-20):** RANDARRAY's per-element whole-number source — a
+/// uniform integer in `[low, high]` inclusive, returned as an `f64` (Excel
+/// surfaces integers as Numbers). Mirrors [`randbetween`]'s modulo draw. The
+/// caller guarantees `low <= high` (it surfaces the `#NUM!`/`#VALUE!` itself).
+pub(crate) fn next_rand_whole(low: i64, high: i64) -> f64 {
+    debug_assert!(low <= high, "next_rand_whole requires low <= high");
+    // Compute the inclusive span in i128 so `high - low + 1` cannot overflow for ANY i64 pair
+    // (e.g. `low = i64::MIN, high = i64::MAX`); the caller bounds magnitude, this bounds arithmetic.
+    let span = ((high as i128) - (low as i128) + 1) as u128;
+    let r = (u128::from(next_xorshift64()) % span) as i128;
+    (low as i128 + r) as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
