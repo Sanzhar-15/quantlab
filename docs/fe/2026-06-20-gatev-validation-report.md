@@ -18,13 +18,16 @@
 | **B — Data-loss** | `.qbook` full-fidelity round-trip through the production single-file path | ✅ **PASS** — every v11 field survives; new permanent regression guard landed |
 | **A — Perf: bulk** | 25M-cell SIMD recalc (DoD #4 <100ms) | ✅ **3.46 ms** (29× under) |
 | **A — Perf: edit (small)** | 10k-chain single edit (DoD #4 <15ms) | ✅ **9.68 ms** |
-| **A — Perf: edit (at scale)** | **single edit on a 1M-cell grid** (DoD #4 <15ms) | 🔴 **~106 ms — FAILS the <15ms budget** (see Finding F-1) |
+| **A — Perf: edit (at scale)** | **single edit on a 1M-cell grid** (DoD #4 <15ms) | ✅ **~18 µs** (set_value ~8.7µs + recompute ~9.5µs) — was mis-measured as ~106ms (a benchmark **drop artifact**, not the edit op; see Finding F-1, corrected w103) |
 | **C — GUI smoke** | ~16-wave interactive backlog | ⏳ operator-manual (runbook below) |
 | **D — R2 bakeoff** | Canvas2D-vs-GPU render gates + 60fps scroll | ⏳ operator-manual (`Quantbook: Open Render Bench`) |
 
-**Bottom line:** persistence is solid; the SIMD bulk path is far under budget; but **interactive edit
-latency does NOT yet hold at scale** — a single edit on a million-cell grid is ~7× over the 15ms
-budget. That is the #1 thing GATE-V surfaced and the most important item to root-cause before v1.
+**Bottom line:** persistence is solid; the SIMD bulk path is far under budget; and — **after the w103
+correction** — interactive edit latency holds with enormous margin: a single edit on a million-cell
+grid is **~18 µs** (set_value ~8.7µs + recompute_dirty ~9.5µs), ~820× under the 15ms budget. The
+original w101 ~106ms reading was a criterion
+measurement artifact (the bench dropped the 1M-cell workbook inside the timed region), **not** an
+O(graph) engine cost. The edit path is O(dirty-set). See Finding F-1 below for the full correction.
 
 ---
 
@@ -42,9 +45,15 @@ Run: `mac zsh -lc 'export PATH=$HOME/.cargo/bin:$PATH && cd <engine> && cargo be
 | `ql-exec a3_10k_dirty_recompute` (cold) | 10k chain, edit head, full incremental recalc | **9.68 ms** | <15ms | ✅ |
 | `ql-exec a3_10k_dirty_recompute` (idempotent) | 10k chain, VEQ short-circuit | **4.04 ms** | — | ✅ |
 | `ql-calcgraph region_split_merge` (Phase-0) | 25M-cell dirty propagation, 10k edits | **42 ms** | <50ms | ✅ |
-| `ql-exec gatev_recalc_contract` **(NEW)** | **`set_value` only, 1 cell, 1M-cell grid** | **~103 ms** | <15ms | 🔴 **FAIL** |
-| `ql-exec gatev_recalc_contract` **(NEW)** | **`recompute_dirty`, 1 dependent, 1M-cell grid** | **~106 ms** | <15ms | 🔴 **FAIL** |
-| `ql-exec gatev_recalc_contract` **(NEW)** | cold full recalc, 100k chain, `recompute_all` | **~150 ms** | (informational) | — load/replay path, not a gate |
+| `ql-exec gatev_recalc_contract` (w101, BUGGY) | `set_value`, 1 cell, 1M grid — **drop timed inside closure** | ~103–117 ms | <15ms | ❌ artifact (not the op) |
+| `ql-exec gatev_recalc_contract` **(w103 CORRECTED)** | **`set_value`, 1 cell, 1M grid** (drop deferred) | **~8.7 µs** | <15ms | ✅ |
+| `ql-exec gatev_recalc_contract` **(w103 CORRECTED)** | **`recompute_dirty`, 1 dependent, 1M grid** (drop deferred) | **~9.5 µs** | <15ms | ✅ |
+| `ql-exec gatev_recalc_contract` **(w103 CORRECTED)** | cold full recalc, 100k chain, `recompute_all` | **~160 ms** | (informational) | — genuine full-eval (F-2); unchanged by the drop fix, confirming the µs collapse is not dead-code elision |
+
+> A full interactive single edit runs **both** sub-ops back to back: `set_value` (~8.7µs) + `recompute_dirty`
+> (~9.5µs) ≈ **~18µs**, ~820× under the 15ms DoD #4 budget. (Production is if anything faster: the IDE's
+> persistent `PlanCache` means `recompute_dirty` re-uses the bound plan instead of re-planning as the
+> fresh-`with_graph` bench does.)
 
 ### Honesty caveats (why the NEW bench was added)
 
@@ -55,42 +64,69 @@ Run: `mac zsh -lc 'export PATH=$HOME/.cargo/bin:$PATH && cd <engine> && cargo be
 - The NEW `gatev_recalc_contract` bench closes both gaps with the real `recompute_dirty` /
   `recompute_all` API at 1M / 100k scale.
 
-### 🔴 Finding F-1 — edit latency scales with GRAPH size, not dirty-set size
+### ✅ Finding F-1 — CORRECTED (w103, 2026-06-20): the ~106ms was a benchmark drop artifact
 
-A **single-cell edit (exactly one dependent recomputed — asserted `attempted == 1`) on a 1,000,000-cell
-grid took ~106ms** via `recompute_dirty`. The same one-cell recompute on a 10k grid is a few ms. Since
-the dirty set is identical (1 cell), the ~100ms delta is **per-call overhead proportional to the number
-of nodes in the graph**, not to the work the edit actually requires.
+> **w101 originally filed F-1 as HIGH:** "edit latency scales with GRAPH size, not dirty-set size —
+> ~106ms single edit on 1M cells; O(graph) per-call cost paid on every interactive edit; recommend a
+> dedicated engine perf wave." **w103 took that wave, root-caused it, and found the premise was wrong.**
+> The finding is preserved verbatim below the line for the record; the correction is here.
 
-This is over the DoD #4 <15ms edit budget by ~7× and is invisible to the existing 10k benches. **Root
-cause split** (registry construction hoisted out of every measured region; `set_value` vs
-`recompute_dirty` timed separately on a 1M-cell grid):
+**What was actually happening.** The w101 `gatev_recalc_contract` benches took the 1M-cell `Workbook` +
+`CalcgraphSession` *by value* in the `iter_batched` routine closure and returned `()`. `criterion`
+excludes the **setup** closure's time but **times the routine body — including the drop of anything the
+closure owns and lets fall out of scope**; it only *defers* the drop of the value the routine
+**returns**. So the benches measured `(tiny edit op) + (drop of the workbook (1M literal + 1M formula
+cells) + its ~1M-node graph)` — only formula cells become graph nodes; the literals live in the
+`cell_to_formulas` reverse map. That drop is millions of deallocations (per-node adjacency `Vec`s,
+formula `Arc<str>`s, the cell/dep HashMaps) ≈ ~100ms — which is exactly why `set_value`-only ≈
+`recompute_dirty`-only ≈ combined (all
+three timed the *same* drop; the w101 "first op pays O(graph)" reconciliation was an artifact of that).
 
-| Isolated op (1M-cell grid, fresh per-edit runtime) | Median |
-|---|---|
-| `set_value` only (edit + dirty-mark, no recompute) | **~103 ms** |
-| `recompute_dirty` only (edit pre-applied in setup; 1 dependent) | **~106 ms** |
-| both combined (the original) | **~106 ms** |
+**The fix + the proof (same machine, w103).** The three bench closures now **return the owned
+`(wb, graph, reg)`** so criterion drops them outside the timed region. The op stays byte-identical:
 
-The arithmetic reconciles only one way: the ~100ms is a **per-runtime-attachment, first-graph-operation
-O(graph) cost** — whichever op first touches a freshly-attached `WorkbookRuntime` pays it once (in the
-combined bench `set_value` pays it and `recompute_dirty` is then cheap; in each isolated bench the lone
-op is "first" so it pays). It is **not** in `with_graph` construction (that is just struct init + a
-fresh `PlanCache` — confirmed by reading `workbook_runtime/mod.rs:267`). It is **not** a cold-start
-artifact (tight CI [100.7, 104.9]ms over 10 post-warmup samples).
+| Bench (1M-cell grid) | w101 (drop timed) | w103 (drop deferred) | DoD #4 |
+|---|---|---|---|
+| `set_value`, 1 cell | 117.17 ms | **8.74 µs** | <15ms ✅ |
+| `recompute_dirty`, 1 dependent | 115.15 ms | **9.46 µs** | <15ms ✅ |
+| `recompute_all`, 100k chain (control) | 166.62 ms | **159.75 ms** | informational |
 
-**Why it bites in production:** the engine's own docs confirm the IDE constructs a **fresh
-`WorkbookRuntime` per edit** ("the runtime borrow window is reconstructed per command";
-`mod.rs:286-326`). So this ~100ms is paid on **every interactive edit** of a large workbook — it is
-not a one-time cost that amortizes. The exact O(graph) scan (and why it is not cached across the
-per-edit runtime boundary) needs a dedicated engine trace — **out of GATE-V's measure-and-surface
-scope.**
+(A full interactive edit = `set_value` + `recompute_dirty` ≈ **~18µs**, ~820× under the 15ms budget.)
 
-**Severity:** HIGH for the DoD #4 acceptance gate, but **scoped** — it only bites large workbooks; the
-common case (thousands of cells) is fine. **Recommended:** a dedicated engine perf wave to make
-`recompute_dirty` (and/or `set_value`'s dirty-marking) O(dirty-set + affected-region) rather than
-O(graph). Do NOT fix it inline in GATE-V — it is a real engine change needing its own megaudit. The
-`gatev_recalc_contract` bench is the reproducing regression guard.
+The `recompute_all` control is the key: it **stayed ~160ms** after the same drop-deferral fix, proving
+the µs collapse on the two edit benches is the drop leaving the timer — **not** dead-code elimination
+of the op (if the compiler had elided the work, the control would have collapsed too; it didn't).
+
+**Why the engine was already correct.** The single-cell-edit path is O(dirty-set), not O(graph) — traced
+end to end: `set_value` → `on_set_value` → `mark_dirty_from_cell_write` (address-keyed lookups; empty
+stripes / aggregate cache for a plain `=A*2` grid; 1-step BFS) → `schedule_dirty` (drains only the dirty
+set) → `schedule_with_supplemental` (Tarjan over the **dirty subset only**, `dirty.contains` filtering
+every child) → evaluate the one dirty formula. Every primitive (`cell_address_for`, `cell_node_for`,
+`Graph::node`, `candidates_for_cell`) is O(1). Independently adversarially verified.
+
+**No production analog.** The IDE holds a **persistent** `WorkbookSession` (`crates/ql-exec/src/
+session.rs`: owns `workbook` + `graph` + `PlanCache`; napi `Arc<Mutex<…>>` per file). Per edit it only
+rebuilds the borrow-wrapper `WorkbookRuntime` (`with_session_state`, a pure struct constructor — no
+scan, no lazy init); the 1M-cell workbook is dropped **once at file close, never per edit**. So the
+w101 "~100ms paid on every interactive edit" claim has **no production path** — the artifact was
+benchmark-only.
+
+**Severity: NONE** (was HIGH). DoD #4's single-edit budget holds with ~820× margin (~18µs vs 15ms). **No engine
+change shipped or needed.** Guards landed: (1) the corrected bench (`gatev_recalc_contract`, drop
+deferred — wall-clock observability + a header comment so the pitfall is not reintroduced); (2) a
+deterministic CI test `crates/ql-exec/tests/gatev_edit_latency_contract.rs` asserting a single-cell edit
+recomputes exactly **one** dependent regardless of grid size (the O(dirty-set) invariant — CI-safe, no
+wall-clock flakiness).
+
+<details><summary>Original w101 F-1 text (preserved for the record — superseded by the correction above)</summary>
+
+> A single-cell edit (exactly one dependent recomputed — asserted `attempted == 1`) on a 1,000,000-cell
+> grid took ~106ms via `recompute_dirty` … concluded a per-runtime-attachment, first-graph-operation
+> O(graph) cost paid on every interactive edit; recommended a dedicated engine perf wave to make
+> `recompute_dirty` O(dirty-set). **[w103: the ~106ms was the in-closure drop of the 1M-cell structures;
+> the full edit is ~18µs (set_value + recompute, ~9µs each) and the path was already O(dirty-set).]**
+
+</details>
 
 ### Not measured here (GUI-only)
 
@@ -271,10 +307,13 @@ not "build it."
 
 ## Findings & follow-ups
 
-- **F-1 (HIGH, perf):** edit latency O(graph) not O(dirty-set) — ~106ms single edit on 1M cells.
-  Reproducing bench landed (`gatev_recalc_contract`). → dedicated engine perf wave; fold into the
-  hardening/engine-debt track of `v1-rebaseline-sequence.md`.
-- **F-2 (info):** `recompute_all` cold full-recalc (load/replay path) is ~157ms at 100k — expected
+- **F-1 (CORRECTED w103 — was HIGH, now NONE):** the ~106ms "edit latency O(graph)" was a criterion
+  drop-timing artifact (the bench dropped the 1M-cell workbook inside the timed region). Corrected edit
+  op = **~18µs** (set_value ~8.7µs + recompute ~9.5µs) on a 1M grid (~820× under the <15ms budget); the
+  path is O(dirty-set). Fixed the bench
+  (drop deferred) + added a deterministic O(dirty) CI guard (`tests/gatev_edit_latency_contract.rs`). No
+  engine change. See the corrected Finding F-1 above.
+- **F-2 (info):** `recompute_all` cold full-recalc (load/replay path) is ~160ms at 100k — expected
   (it re-parses + rebuilds an ephemeral graph). Not a gate; flagged so the perf story isn't misread.
 - **Runbook caveats to confirm during the GUI pass** (from grounding, not yet GUI-verified):
   - `merge` / `print` / `wrap` / `zoom` toolbar buttons are out-of-v1 (item O1).
@@ -288,3 +327,13 @@ not "build it."
   - `crates/ql-exec/benches/gatev_recalc_contract.rs` + Cargo.toml `[[bench]]` entry — perf-contract
     reproducer (surfaced F-1).
 - IDE `fe/sheet-tabs`: this report (`docs/fe/2026-06-20-gatev-validation-report.md`).
+
+### w103 (2026-06-20) — F-1 correction
+- Engine `feat/quantbook-engine`:
+  - `crates/ql-exec/benches/gatev_recalc_contract.rs` — fixed: routines return owned `(wb, graph, reg)`
+    so criterion drops them outside the timed region (+ a header note documenting the pitfall). The two
+    edit benches now read ~9µs; the `recompute_all` control stays ~160ms (proves no dead-code elision).
+  - `crates/ql-exec/tests/gatev_edit_latency_contract.rs` (NEW) — deterministic O(dirty) edit guard
+    (single-cell edit recomputes exactly one dependent regardless of grid size).
+- IDE `fe/sheet-tabs`: F-1 section + headline + follow-ups corrected in this report;
+  `.plans/active/v1-rebaseline-sequence.md` F-1 reclassified.
