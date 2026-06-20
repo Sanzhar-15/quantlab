@@ -132,3 +132,10 @@ harness = false
 [[bench]]
 name = "a3_10k_dirty_recompute"
 harness = false
+
+# GATE-V (2026-06-20): honest end-to-end recalc-contract benches —
+# single edit on a 1M-cell grid (edit latency vs. grid size) + the
+# cold recompute_all full-eval path (not just the SIMD kernel).
+[[bench]]
+name = "gatev_recalc_contract"
+harness = false
