@@ -1,0 +1,42 @@
+# Wave J-b (R17, 2026-06-20) -- preparatory packaging ignore list for a future standalone Open VSX VSIX.
+# This file is used ONLY by `vsce package` / `ovsx publish` when the extension is built as a standalone
+# VSIX; the VS Code fork's own build pipeline (build/lib/extensions.ts) ignores it. See PUBLISHING.md for
+# the blockers that still gate an actual publish (native engine binary, "private" flag, PNG icon).
+
+# TypeScript sources + tests (the VSIX ships compiled out/ + dist/ only)
+src/**
+test/**
+**/*.ts
+**/*.map
+
+# Compiled tests must not ship (only the runtime out/src is needed; main = ./out/src/extension)
+out/test/**
+out/**/test/**
+out/**/*.test.js
+
+# Webview SOURCES -- the shipped bundle is dist/webview/** (built by esbuild)
+webview/**
+
+# Python scratch (tests, bytecode caches, virtualenvs)
+python/**/tests/**
+python/**/__pycache__/**
+python/**/.venv/**
+**/.pytest_cache/**
+
+# Build configuration + scripts (not shipped)
+tsconfig.json
+tsconfig.*.json
+.eslintrc.json
+esbuild-quantbook-webviews.mjs
+esbuild-webview.mjs
+
+# Repo + session scratch (never shipped)
+.gitignore
+.vscode/**
+.codex-*
+.commit-*
+.demo-*
+*.out
+
+# This doc is for maintainers, not extension users
+PUBLISHING.md

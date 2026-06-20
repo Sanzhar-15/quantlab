@@ -6,6 +6,25 @@
   "version": "0.0.1",
   "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sanzhar-15/quantlab.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Sanzhar-15/quantlab/issues"
+  },
+  "homepage": "https://github.com/Sanzhar-15/quantlab#readme",
+  "keywords": [
+    "spreadsheet",
+    "quantitative-finance",
+    "quant",
+    "trading",
+    "backtest",
+    "python",
+    "reactive",
+    "data-science",
+    "finance"
+  ],
   "engines": {
     "vscode": "^1.108.0"
   },
@@ -16,6 +35,8 @@
     }
   },
   "categories": [
+    "Data Science",
+    "Visualization",
     "Other"
   ],
   "main": "./out/src/extension",
