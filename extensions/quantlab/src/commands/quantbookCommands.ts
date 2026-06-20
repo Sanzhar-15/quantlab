@@ -51,6 +51,9 @@ import { columnLabelA1, formatRangeTarget, normalizeSelectionRect } from '../qua
 // route by the carried panel token).
 import { describeStructuralPlan, parseContextMenuArg, planStructuralOp, type StructuralOp } from '../quantbook/cellGrid/contextMenuLogic';
 import { hiddenRowsInSpan, rowSpanFromSelection, rowsInSpan, type RowSpan } from '../quantbook/cellGrid/rowVisibilityLogic';
+import { cellRefA1 } from '../quantbook/shared/gridLayoutA1';
+import { ClaudeProvider } from '../ai/provider';
+import { NO_FORMULA_MESSAGE, buildExplainMessages, buildExplainSystemPrompt, cellErrorString, normalizeFormula } from '../ai/explainPrompt';
 // FE-4 W1 (2026-06-10): the pure cores for Find/Replace-All (snapshot-read -> hit list + replace op
 // batch) and Define Name (Excel name validation + selection -> CellRangeJson). The commands below are
 // thin vscode shells over these (the established cellGrid logic/command split).
@@ -70,6 +73,18 @@ function getOutput(): vscode.OutputChannel {
 		outputChannel = vscode.window.createOutputChannel('Quantbook');
 	}
 	return outputChannel;
+}
+
+let aiOutputChannel: vscode.OutputChannel | undefined;
+
+/** Lazy "Quantbook AI" output channel -- where streamed AI explanations are written. Registered
+ *  for disposal on first creation so it is cleaned up on deactivate. */
+function getAiOutput(context: vscode.ExtensionContext): vscode.OutputChannel {
+	if (aiOutputChannel === undefined) {
+		aiOutputChannel = vscode.window.createOutputChannel('Quantbook AI');
+		context.subscriptions.push(aiOutputChannel);
+	}
+	return aiOutputChannel;
 }
 
 /**
@@ -1470,6 +1485,107 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	registerStructuralCommand('quantlab.quantbookInsertColumnRight', 'insertColumnRight');
 	registerStructuralCommand('quantlab.quantbookDeleteRow', 'deleteRow');
 	registerStructuralCommand('quantlab.quantbookDeleteColumn', 'deleteColumn');
+
+	// Wave K-b (R20, 2026-06-20): "Explain with AI" -- streams a plain-language explanation of the
+	// right-clicked cell's formula (and any error) to the "Quantbook AI" output channel. Reads the
+	// EXACT clicked cell from the carried payload (Codex HIGH-1/HIGH-2 idiom). Privacy: sends only the
+	// formula + A1 + error (strategy_code + error_messages), never raw data values (see explainPrompt).
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookExplainCell', async (...rawArgs: unknown[]) => {
+			// Resolve the target cell. A right-click invocation ALWAYS passes a payload arg; a palette
+			// invocation passes none. Fail CLOSED on a present-but-malformed menu payload (never silently
+			// fall back to a different grid -- Codex HIGH); only a true no-arg palette call uses the focus.
+			let session: SessionInstance;
+			let sheet: number;
+			let row: number;
+			let col: number;
+			if (rawArgs.length > 0) {
+				const arg = parseContextMenuArg(rawArgs[0]);
+				if (arg === undefined) {
+					contextArgToast();
+					return;
+				}
+				const panel = CellGridPanel.panelByToken(arg.panelToken);
+				if (panel === undefined) {
+					void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+					return;
+				}
+				({ session, sheet } = panel.target);
+				row = arg.cell ? arg.cell.row : arg.selection.focusRow;
+				col = arg.cell ? arg.cell.col : arg.selection.focusCol;
+			} else {
+				const focused = CellGridPanel.focusedGridSelection();
+				if (focused === undefined) {
+					void vscode.window.showInformationMessage('Quantbook: open a Cell Grid and select a cell with a formula to explain.');
+					return;
+				}
+				session = focused.session;
+				sheet = focused.sheet;
+				row = focused.selection.focusRow;
+				col = focused.selection.focusCol;
+			}
+
+			let entry: ReturnType<typeof session.cell>;
+			try {
+				entry = session.cell(sheet, row, col);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				void vscode.window.showErrorMessage(`Quantbook: failed to read the cell to explain: ${detail}`);
+				return;
+			}
+
+			const formula = entry?.formula;
+			if (formula === undefined || formula.trim().length === 0) {
+				void vscode.window.showInformationMessage(NO_FORMULA_MESSAGE);
+				return;
+			}
+
+			const provider = ClaudeProvider.getInstance();
+			if (!provider.isReady()) {
+				const pick = await vscode.window.showErrorMessage(
+					'Quantbook AI is not configured. Set your Anthropic API key to use Explain.',
+					'Set Anthropic API Key'
+				);
+				if (pick === 'Set Anthropic API Key') {
+					void vscode.commands.executeCommand('quantlab.setAnthropicApiKey');
+				}
+				return;
+			}
+
+			const a1 = cellRefA1(row, col);
+			// Only an error-kind cell yields an error string (cellErrorString never reads a normal value).
+			const error = cellErrorString(entry?.value);
+
+			// The outbound message carries A1 + formula + error only (NO sheet name -- see explainPrompt).
+			// The local channel header may show more; it is not egress.
+			const channel = getAiOutput(context);
+			channel.show(true);
+			channel.appendLine(`# Explain ${a1}`);
+			channel.appendLine(`Formula: ${normalizeFormula(formula)}`);
+			if (error !== undefined && error.length > 0) {
+				channel.appendLine(`Error: ${error}`);
+			}
+			channel.append('\n');
+
+			try {
+				await vscode.window.withProgress(
+					{ location: vscode.ProgressLocation.Notification, title: `Explaining ${a1} with AI...`, cancellable: false },
+					async () => {
+						const messages = buildExplainMessages({ a1, formula, error });
+						for await (const chunk of provider.streamMessage(`explain-${a1}`, messages, buildExplainSystemPrompt())) {
+							channel.append(chunk);
+						}
+						channel.append('\n');
+					}
+				);
+			} catch (err) {
+				// Surface the failure loud (No-Fallbacks) -- both in the channel and as a toast.
+				const detail = err instanceof Error ? err.message : String(err);
+				channel.appendLine(`\n[error] ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook AI: explain failed: ${detail}`);
+			}
+		}),
+	);
 
 	// 3. FREEZE PANES HERE (Codex HIGH, 2026-06-10) -- the context menu's freeze, over the SAME carried
 	// `{panelToken, selection}` payload as the structural commands above. The earlier conductor-reconciled

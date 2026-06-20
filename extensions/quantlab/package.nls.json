@@ -78,6 +78,7 @@
 	"command.quantbookLocalFirstInfo.title": "Quantbook: Local-First Privacy",
 	"command.setAnthropicApiKey.title": "Quantbook: Set Anthropic API Key",
 	"command.clearAnthropicApiKey.title": "Quantbook: Clear Anthropic API Key",
+	"command.quantbookExplainCell.title": "Quantbook: Explain Cell with AI",
 	"command.quantbookCellGridSwitchSheet.title": "Quantbook: Switch Cell Grid Sheet",
 	"command.quantbookSaveAs.title": "Quantbook: Save As...",
 	"command.quantbookOpen.title": "Quantbook: Open...",
