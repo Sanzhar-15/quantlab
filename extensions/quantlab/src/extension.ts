@@ -18,6 +18,7 @@ import { registerQuantbookShell } from './quantbook/shell/quantbookShell';
 import { registerDepGraphSidebar } from './quantbook/shell/registerDepGraphSidebar';
 import { registerDiagnosticsView } from './quantbook/shell/registerDiagnosticsView';
 import { registerFunctionCatalogView } from './quantbook/shell/registerFunctionCatalogView';
+import { registerLocalFirstStatus } from './quantbook/shell/registerLocalFirstStatus';
 import { SqlQueryViewProvider } from './quantbook/shell/SqlQueryViewProvider';
 import { registerQuantbookMcpServer } from './quantbook/mcp/mcpServer';
 import type { SessionInstance } from './quantbook/types';
@@ -418,6 +419,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// workbook's registered functions (built-ins grouped by letter + any UDFs), click-to-copy the name.
 	// Additive; reads session.listFunctions() off the focused grid. Also serves the R22 catalog-UI tail.
 	registerFunctionCatalogView(context);
+
+	// Wave J-a (R16, 2026-06-20): the local-first messaging surface -- a `$(shield) Local` status-bar item
+	// (shown while a grid is open) + a "Local-First Privacy" command that opens the full, honest statement
+	// of what runs locally vs the opt-in AI / sign-in / market-data network surface. Additive; pure-text.
+	registerLocalFirstStatus(context);
 
 	const validationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	moduleValidationTimers = validationTimers;

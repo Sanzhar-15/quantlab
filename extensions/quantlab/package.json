@@ -231,6 +231,11 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.quantbookLocalFirstInfo",
+        "title": "%command.quantbookLocalFirstInfo.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.quantbookCellGridSwitchSheet",
         "title": "%command.quantbookCellGridSwitchSheet.title%",
         "category": "%command.category%"
@@ -1018,6 +1023,10 @@
     },
     "menus": {
       "commandPalette": [
+        {
+          "command": "quantlab.quantbookLocalFirstInfo",
+          "when": "quantbook.hasOpenGrid"
+        },
         {
           "_comment": "W3 (Wave 3): the Cell Grid context-menu items are right-click-only. Hide them from the Command Palette -- their generic titles (Cut/Copy/Insert Row Above) are meaningful only in the grid's right-click menu, and they act on the focused grid (no palette affordance).",
           "command": "quantlab.quantbookCellGridCut",

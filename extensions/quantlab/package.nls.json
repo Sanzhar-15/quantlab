@@ -75,6 +75,7 @@
 	"command.quantbookRevokeMcpWriteTrust.title": "Quantbook: Revoke MCP Write Trust",
 	"command.quantbookCellGridCollab.title": "Quantbook: Open Cell Grid (Collab)",
 	"command.quantbookRenderBench.title": "Quantbook: Open Render Bench (FE-2 bakeoff)",
+	"command.quantbookLocalFirstInfo.title": "Quantbook: Local-First Privacy",
 	"command.quantbookCellGridSwitchSheet.title": "Quantbook: Switch Cell Grid Sheet",
 	"command.quantbookSaveAs.title": "Quantbook: Save As...",
 	"command.quantbookOpen.title": "Quantbook: Open...",
