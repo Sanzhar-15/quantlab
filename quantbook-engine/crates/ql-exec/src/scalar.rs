@@ -731,22 +731,16 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
         // Scalar context: an array-valued binding/body surfaces `#CALC!` (the
         // cell-boundary path, `eval_at_cell_boundary`, adds array/spill).
         ExprPlan::Let { bindings, body } => {
-            let mut locals = env.local_env().clone();
-            let depth = env.lambda_depth();
-            for (name, value_plan) in bindings {
-                let scoped = LocalScopedEnv {
-                    inner: env,
-                    locals: locals.clone(),
-                    depth,
-                };
-                let binding = eval_binding(value_plan, &scoped, registry, cache);
-                locals = locals.with_binding(name.clone(), binding);
-            }
+            let locals = eval_let_bindings(bindings, env, registry, cache);
             let scoped = LocalScopedEnv {
                 inner: env,
                 locals,
-                depth,
+                depth: env.lambda_depth(),
             };
+            // SCALAR result position: an array- or callable-valued body surfaces
+            // `#CALC!` here (no implicit intersection in v1; an uninvoked lambda is
+            // not a value). The binding-returning `eval_binding` `Let` arm preserves
+            // a callable body instead — that is the currying path.
             eval_scalar_with_cache(body, &scoped, registry, cache)
         }
         // **Wave P (2026-06-20):** a LET/LAMBDA local reference, resolved
@@ -827,13 +821,48 @@ fn invoke_lambda<E: CellEnv>(
     eval_binding(&closure.body, &scoped, registry, cache)
 }
 
+/// **Wave P follow-up 2 (2026-06-20):** evaluate a LET's bindings left-to-right
+/// into a populated [`LocalEnv`], each binding seeing the prior ones (donor
+/// `let_later_value_sees_earlier_binding`). Shared by the scalar `ExprPlan::Let`
+/// arm (which then SCALARIZES the body) and the binding-returning `eval_binding`
+/// `Let` arm (which PRESERVES the body's kind for currying). The two callers differ
+/// ONLY in how they evaluate the body, so only the binding loop is factored here.
+///
+/// **Depth is threaded, never reset.** Each binding evaluates under a
+/// `LocalScopedEnv` carrying `env.lambda_depth()` unchanged, so a LET nested inside
+/// a depth-N lambda invocation keeps counting from N — `MAX_LAMBDA_DEPTH` still
+/// bounds runaway recursion that routes through a LET body. Seeding `depth: 0` here
+/// would re-open the debug-build stack overflow the guard exists to prevent (pinned
+/// by `lambda_heavy_body_via_let_runaway_is_num_not_stack_overflow`).
+fn eval_let_bindings<E: CellEnv>(
+    bindings: &[(std::sync::Arc<str>, ExprPlan)],
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> LocalEnv {
+    let mut locals = env.local_env().clone();
+    let depth = env.lambda_depth();
+    for (name, value_plan) in bindings {
+        let scoped = LocalScopedEnv {
+            inner: env,
+            locals: locals.clone(),
+            depth,
+        };
+        let binding = eval_binding(value_plan, &scoped, registry, cache);
+        locals = locals.with_binding(name.clone(), binding);
+    }
+    locals
+}
+
 /// **Wave P (2026-06-20):** evaluate a LET binding value / LAMBDA call argument
 /// into a [`LocalBinding`], PRESERVING its kind (scalar / callable). A `LAMBDA`
 /// literal becomes a `Callable` closure capturing the current lexical env; a
 /// `LocalRef` to an existing local re-binds that local's kind (so a lambda
-/// passed as an argument — `g(g, n)` self-application — stays callable); every
-/// other plan is a scalar `Value`. Array-valued bindings are a documented
-/// fast-follow (they fall through to a scalar `#CALC!` here for now).
+/// passed as an argument — `g(g, n)` self-application — stays callable); a `LET`
+/// whose body returns a lambda preserves that callable (Wave P follow-up 2,
+/// currying through a LET); every other plan is a scalar `Value`. Array-valued
+/// bindings are a documented fast-follow (they fall through to a scalar `#CALC!`
+/// here for now).
 fn eval_binding<E: CellEnv>(
     plan: &ExprPlan,
     env: &E,
@@ -856,6 +885,23 @@ fn eval_binding<E: CellEnv>(
         // callable (currying) — resolve it through `invoke_lambda` so the
         // returned closure is preserved rather than scalarized to `#CALC!`.
         ExprPlan::CallLambda { callee, args } => invoke_lambda(callee, args, env, registry, cache),
+        // **Wave P follow-up 2 (2026-06-20):** a LET whose body RETURNS a lambda
+        // (`LAMBDA(x,LET(z,x,LAMBDA(y,z+y)))(5)(3)` → 8) must preserve callable
+        // identity, so evaluate the bindings then route the BODY back through
+        // `eval_binding` (binding-returning), NOT `eval_scalar_with_cache` (which
+        // would scalarize the returned lambda to `#CALC!`). Symmetric to the
+        // `CallLambda` arm. A scalar body still returns a scalar `Value`; a lambda
+        // returned through any OTHER wrapper (`IF(...)` etc.) still scalarizes via
+        // the `_` arm below — that boundary stays loud (`#CALC!`).
+        ExprPlan::Let { bindings, body } => {
+            let locals = eval_let_bindings(bindings, env, registry, cache);
+            let scoped = LocalScopedEnv {
+                inner: env,
+                locals,
+                depth: env.lambda_depth(),
+            };
+            eval_binding(body, &scoped, registry, cache)
+        }
         _ => LocalBinding::Value(eval_scalar_with_cache(plan, env, registry, cache)),
     }
 }

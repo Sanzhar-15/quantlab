@@ -231,18 +231,39 @@ fn lambda_curried_via_let() {
 }
 
 #[test]
-fn lambda_deeper_currying_through_let_is_calc_documented_boundary() {
-    // **Documented v1 boundary (Codex re-audit HIGH #1, gated):** currying where
-    // the returned lambda is wrapped in a LET (or any non-direct expression) is
-    // NOT supported — it degrades LOUDLY to `#CALC!`, never a silent wrong value.
-    // `LAMBDA(x, LET(z,x, LAMBDA(y,z+y)))(5)(3)` would be 8 in Excel; here the
-    // inner `LET(...) -> lambda` is scalarized to `#CALC!`. The fix is to make
-    // the LET-body eval binding-returning (symmetric to the `CallLambda` fix);
-    // deferred as a named follow-up. This test PINS the current boundary.
+fn lambda_curried_through_let_body() {
+    // **Wave P follow-up 2 (2026-06-20) — boundary CLOSED.** Currying where the
+    // returned lambda is wrapped in a LET now works: `eval_binding`'s `Let` arm
+    // routes the LET body back through `eval_binding` (binding-returning) instead
+    // of scalarizing it, so the inner `LAMBDA(y,z+y)` survives as a callable.
+    // `LAMBDA(x, LET(z,x, LAMBDA(y,z+y)))(5)(3)` → x=5, z=5, then (y -> 5+y)(3) = 8.
+    // (Was a documented `#CALC!` boundary at Wave P core ship.)
+    assert_eq!(eval("LAMBDA(x,LET(z,x,LAMBDA(y,z+y)))(5)(3)"), num(8.0));
+}
+
+#[test]
+fn let_binding_if_wrapped_lambda_stays_calc_documented_boundary() {
+    // **Wave P follow-up 2 — the boundary that REMAINS (moved from LET-wrapped to
+    // Function-wrapped).** Only `ExprPlan::Let` was made binding-returning. A lambda
+    // returned through any OTHER non-direct construct still scalarizes to `#CALC!`
+    // via `eval_binding`'s `_` arm. `IF(TRUE, LAMBDA(x,x), 0)` is eager
+    // (scalar-tier) → the lambda branch becomes `#CALC!` before IF selects it → `f`
+    // is `#CALC!` → `f(3)` propagates `#CALC!`. LOUD, never a silent wrong value.
+    // This PINS the residual boundary so closing it later is a deliberate change.
     assert_eq!(
-        eval("LAMBDA(x,LET(z,x,LAMBDA(y,z+y)))(5)(3)"),
+        eval("LET(f,IF(TRUE,LAMBDA(x,x),0),f(3))"),
         Value::Error(ErrorValue::Calc)
     );
+}
+
+#[test]
+fn let_body_uninvoked_lambda_is_calc_error() {
+    // **Wave P follow-up 2 seam guard.** The SCALAR `Let` arm must keep scalarizing
+    // its body, so a LET whose body is a bare uninvoked LAMBDA surfaces `#CALC!` at
+    // a cell/scalar result position — a callable must NEVER escape into a cell value
+    // (forbidden by `local_env.rs`). Only the binding-returning `eval_binding` path
+    // (the currying case above) preserves the callable.
+    assert_eq!(eval("LET(x,1,LAMBDA(y,y))"), Value::Error(ErrorValue::Calc));
 }
 
 #[test]
@@ -254,6 +275,21 @@ fn lambda_heavy_body_runaway_is_num_not_stack_overflow() {
     // thread stack. This is the regression guard for that calibration.
     assert_eq!(
         eval("LET(g,LAMBDA(s,n,IF(n<0,0,1+s(s,n+1))),g(g,1))"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+#[test]
+fn lambda_heavy_body_via_let_runaway_is_num_not_stack_overflow() {
+    // **Wave P follow-up 2 — depth-seed guard.** Same runaway recursion as above,
+    // but each invocation's body is wrapped in a LET so the body eval routes through
+    // `eval_binding`'s new `Let` arm → `eval_let_bindings`. That helper MUST seed
+    // `depth` from `env.lambda_depth()` (not 0). If it reset to 0, the recursion
+    // counter would never reach `MAX_LAMBDA_DEPTH` and the native stack would
+    // overflow (SIGABRT the test process); with the depth threaded, it returns a
+    // clean `#NUM!`. This is the regression guard for that seam.
+    assert_eq!(
+        eval("LET(g,LAMBDA(s,n,LET(d,1,IF(n<0,0,d+s(s,n+1)))),g(g,1))"),
         Value::Error(ErrorValue::Num)
     );
 }

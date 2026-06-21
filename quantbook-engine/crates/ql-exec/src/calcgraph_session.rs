@@ -398,6 +398,59 @@ impl FormulaDeps {
     }
 }
 
+/// **Wave P follow-up 1 (2026-06-20) — dead-local-binding liveness scan.** Returns
+/// `true` iff `plan` contains a `LocalRef(name)` anywhere in its subtree. The
+/// `ExprPlan::Let` arm of [`walk_plan_for_deps`] uses it to decide whether a
+/// LAMBDA-valued local binding is *live* (its name is referenced downstream → its
+/// body must be walked for precedents) or *dead* (never referenced → safe to skip,
+/// killing the spurious `#CIRC!` over-dependency + the stale-UDF edge).
+///
+/// **Name-keyed and conservative.** Matching is by NAME, not by binding identity,
+/// so a reused / shadowed name counts every occurrence as live — a safe residual
+/// over-dependency, never a missed dependency. Completeness is the ENTIRE safety
+/// margin against a silent stale value: a reference reaches a lambda binding's body
+/// at eval only through a chain of `LocalRef(name)` nodes, so this scan MUST descend
+/// EVERY composite variant that can hold one. Missing a branch would under-count a
+/// live use and drop a real precedent (a silent wrong result — the cardinal
+/// No-Fallbacks sin). The leaf arms are spelled out (no `_` wildcard) so a future
+/// `ExprPlan` variant fails to compile here rather than defaulting to "no ref".
+/// The `let_lambda_recalc_contract` under-dependency tests pin each composite branch.
+fn plan_references_local(plan: &ExprPlan, name: &str) -> bool {
+    match plan {
+        ExprPlan::LocalRef(n) => n.as_ref() == name,
+        ExprPlan::Binary { lhs, rhs, .. } => {
+            plan_references_local(lhs, name) || plan_references_local(rhs, name)
+        }
+        ExprPlan::Unary { operand, .. } => plan_references_local(operand, name),
+        ExprPlan::Function { args, .. } => args.iter().any(|a| plan_references_local(a, name)),
+        ExprPlan::ScalarNameRef { inner, .. } => plan_references_local(inner, name),
+        ExprPlan::Array(rows) => rows
+            .iter()
+            .flatten()
+            .any(|cell| plan_references_local(cell, name)),
+        ExprPlan::Let { bindings, body } => {
+            bindings
+                .iter()
+                .any(|(_, value_plan)| plan_references_local(value_plan, name))
+                || plan_references_local(body, name)
+        }
+        ExprPlan::Lambda { body, .. } => plan_references_local(body, name),
+        ExprPlan::CallLambda { callee, args } => {
+            plan_references_local(callee, name)
+                || args.iter().any(|a| plan_references_local(a, name))
+        }
+        // Leaves / variants that cannot contain a `LocalRef`.
+        ExprPlan::Number(_)
+        | ExprPlan::Bool(_)
+        | ExprPlan::String(_)
+        | ExprPlan::CellRef { .. }
+        | ExprPlan::AggregateNameRef { .. }
+        | ExprPlan::RangeRef { .. }
+        | ExprPlan::StructuredRef { .. }
+        | ExprPlan::Error(_) => false,
+    }
+}
+
 /// Phase 3.2 — recursive walker. Accumulates dependencies + volatile-
 /// function presence by descending the `ExprPlan` tree. Does not
 /// allocate any nodes or touch any graph state; pure read.
@@ -587,10 +640,65 @@ pub(crate) fn walk_plan_for_deps(
         // **Wave P (2026-06-20) — the #1 correctness contract for LET.** A
         // `CellRef`/`RangeRef` inside a binding VALUE or the BODY must still
         // register as a precedent, or editing it would leave the LET formula
-        // stale. Descend BOTH the binding values and the body. Local names
+        // stale. Descend the binding values and the body. Local names
         // themselves carry no grid dep (resolved in the LocalEnv at eval).
+        //
+        // **Wave P follow-up 1 (dead-local-binding elimination):** a LAMBDA bound
+        // to a local whose name is NEVER referenced downstream (in a later binding
+        // value or the body) can never be invoked, returned, or passed anywhere —
+        // a Lambda binding value creates a closure WITHOUT evaluating its body, so
+        // the body's cell/range/UDF refs are never read at eval. Skip walking it.
+        // This is a sound, strictly one-directional narrowing (it only ever drops a
+        // binding whose name is provably absent downstream): it removes the spurious
+        // self-/peer-precedent that otherwise surfaces as a conservative `#CIRC!` on
+        // `recompute_all`, and NARROWS the stale-UDF preservation edge (which reuses
+        // this walker via `plan_references_udf` — see the KNOWN RESIDUAL note on the
+        // `ExprPlan::Lambda` arm for the slices that remain). The liveness scan
+        // (`plan_references_local`) is NAME-KEYED, so any live use — even one buried
+        // in another lambda/LET body or a `CallLambda` callee/arg — keeps the binding.
+        // A name re-bound at the SAME level is now resolved precisely (the dead
+        // earlier binding is dropped; see the per-binding comment below). Scoped to
+        // the LET arm because only here are the binding's name + downstream scope
+        // available; the bare `Lambda` arm (which cannot tell callee-position from
+        // result-position) stays conservative.
         ExprPlan::Let { bindings, body } => {
-            for (_name, value_plan) in bindings {
+            for (idx, (name, value_plan)) in bindings.iter().enumerate() {
+                // A reference to `name` resolves to THIS binding only until `name` is
+                // re-bound at the same LET level. LET is left-to-right: a later binding
+                // of the same name shadows this one from its declaration onward, and a
+                // closure created AFTER the rebind captures the NEW binding (closures
+                // capture the env at creation time — `eval_binding`'s `Lambda` arm). So
+                // scan for a live reference only in the bindings BEFORE the next
+                // same-name rebind, plus the body IFF this binding is never shadowed.
+                // Any closure that could capture-and-later-invoke THIS binding must be
+                // created in `[idx+1 .. next_rebind)` and therefore syntactically
+                // contains a `LocalRef(name)` the (name-keyed) `plan_references_local`
+                // finds there — so this bound is SOUND (no under-dependency).
+                //
+                // This makes the same-level-shadow case PRECISE: `LET(f,LAMBDA(x,A1),f,7,f)`
+                // drops the dead first `f`, closing the SAME-LEVEL slice of the
+                // reused-name UDF over-preservation edge Codex flagged (a never-invoked
+                // lambda's UDF was still seen by `plan_references_udf`, over-preserving a
+                // stale saved value on a worker-less load). The NESTED-shadow and
+                // indirect-producer slices of that same SILENT-stale class remain — see
+                // the `ExprPlan::Lambda` arm's KNOWN RESIDUAL note; the precise
+                // invocation-aware walker (named next wave) closes them. A NESTED LET /
+                // inner lambda that rebinds the same name is still counted conservatively
+                // (the name-keyed scan descends it and cannot tell the inner rebind from
+                // this one) — a safe over-report for dirtying, never an under-dependency.
+                let next_rebind = bindings[idx + 1..]
+                    .iter()
+                    .position(|(n, _)| n.as_ref() == name.as_ref())
+                    .map(|p| idx + 1 + p);
+                let scan_end = next_rebind.unwrap_or(bindings.len());
+                let referenced = bindings[idx + 1..scan_end]
+                    .iter()
+                    .any(|(_, later)| plan_references_local(later, name))
+                    || (next_rebind.is_none() && plan_references_local(body, name));
+                let dead_lambda = matches!(value_plan, ExprPlan::Lambda { .. }) && !referenced;
+                if dead_lambda {
+                    continue;
+                }
                 walk_plan_for_deps(value_plan, deps, registry);
             }
             walk_plan_for_deps(body, deps, registry);
@@ -605,23 +713,39 @@ pub(crate) fn walk_plan_for_deps(
         // `CellRef` inside the body must re-dirty the formula on edit. Params
         // bind no dep.
         //
-        // **CONSERVATIVE OVER-DEPENDENCY (Codex megaudit #2/#3 — known follow-up):**
-        // this walks the body even for a lambda that is NEVER invoked
-        // (`=LET(f,LAMBDA(x,A1),1)` registers A1 as a precedent though the result
-        // is just 1). There is no static way to know at graph-build time whether
-        // a given lambda will be invoked, so we register conservatively. Effects:
-        // (a) a NON-cyclic over-tracked cell triggers a harmless extra recompute
-        // — the value is always correct; (b) a self-/mutual-cyclic ref from an
-        // uninvoked body is conservatively flagged `#CIRC!` on a full
-        // `recompute_all` (the same conservative class as `=IF(FALSE,A1,1)` in
-        // A1 — LOUD, contrived trigger; see
-        // `uninvoked_lambda_self_ref_is_conservatively_circular` in
-        // `tests/let_lambda_recalc_contract.rs`); (c) a UDF named only inside an
-        // uninvoked lambda body is seen by `plan_references_udf`, so on a
-        // worker-less load a cached value may be preserved rather than
-        // recomputed (narrow — requires an already-stale cache). A precise
-        // invocation-aware dep walker (register lambda-body deps only for
-        // INVOKED lambdas) is the documented fix for all three.
+        // **RESIDUAL CONSERVATIVE OVER-DEPENDENCY (narrowed by Wave P follow-up 1).**
+        // This arm walks the body whenever it is reached — which is correct for an
+        // INVOKED lambda (immediate `LAMBDA(..)(args)`, a lambda passed as an arg, or
+        // a LET-bound lambda whose name is live; see the `ExprPlan::Let` arm above).
+        // The dead-local-binding skip in the `Let` arm now suppresses the common
+        // wrong-result case — a LET-bound lambda whose name is NEVER referenced
+        // (`=LET(f,LAMBDA(x,A1),1)` no longer registers A1, so it returns 1, not
+        // `#CIRC!`; see `let_dead_lambda_binding_is_not_circular` in
+        // `tests/let_lambda_recalc_contract.rs`) — including the same-level
+        // shadow case (`=LET(f,LAMBDA(x,A1),f,7,f)`, which is now precisely dropped).
+        // What remains conservative: a bare top-level uninvoked `=LAMBDA(x,A1)` (this
+        // arm has no context to know it sits in a result position rather than a
+        // `CallLambda` callee); a dead lambda shadowed by a NESTED LET / inner lambda
+        // rebinding the same name (the name-keyed scan descends the nested scope and
+        // keeps it live); and a dead binding that PRODUCES a callable indirectly (a
+        // `LET`/`IF` returning a lambda — this skip matches only a direct
+        // `ExprPlan::Lambda` value). For cell-dirtying these are SAFE over-reports —
+        // an extra harmless recompute, value always correct.
+        //
+        // **KNOWN RESIDUAL (pre-existing; Codex megaudit w104-fu).** The SAME
+        // over-reports are NOT safe for one narrow consumer: `plan_references_udf`
+        // (workbook_runtime/recompute.rs) reuses this walker's `functions_used` to
+        // decide whether to PRESERVE a saved value on a worker-less `.qbook` load.
+        // An over-reported UDF inside a never-invoked dead lambda body therefore
+        // causes a stale saved value to be preserved instead of recomputed — a
+        // SILENT stale on that one load path (e.g.
+        // `=LET(f,LAMBDA(x,MYUDF(x)),g,LET(f,0,f),f,7,A1+f)`). This class pre-dates
+        // Wave P follow-up 1 (the core walked every lambda body unconditionally);
+        // this follow-up NARROWS it (the simple-dead + same-level-shadow cases are
+        // now precise) but does not close it. The full fix is the precise
+        // invocation-aware dep walker (the named NEXT wave) — it registers lambda-body
+        // deps only for provably-invoked lambdas, which both ends the residual
+        // over-reports here and lets `plan_references_udf` stop over-preserving.
         ExprPlan::Lambda { body, .. } => {
             walk_plan_for_deps(body, deps, registry);
         }
