@@ -358,3 +358,137 @@ fn fu3_let_array_callee_is_calc_in_scalar_context() {
         Value::Error(ErrorValue::Calc)
     );
 }
+
+// -------------------------------------------------------------------------
+// FU4 (2026-06-21) — Tier-1 higher-order helpers, scalar-context + error model.
+// The `eval()` helper drives the SCALAR evaluator, so an ARRAY result (MAP /
+// MAKEARRAY / SCAN) is `#CALC!` here — only the cell boundary (production path,
+// `let_lambda_recalc_contract.rs::fu4_*`) spills. REDUCE returns a genuine
+// scalar, so it computes and composes even in scalar context.
+// -------------------------------------------------------------------------
+
+#[test]
+fn fu4_map_array_result_is_calc_in_scalar_context() {
+    assert_eq!(eval("MAP(SEQUENCE(3),LAMBDA(x,x*x))"), Value::Error(ErrorValue::Calc));
+}
+
+#[test]
+fn fu4_makearray_array_result_is_calc_in_scalar_context() {
+    assert_eq!(eval("MAKEARRAY(2,2,LAMBDA(r,c,r+c))"), Value::Error(ErrorValue::Calc));
+}
+
+#[test]
+fn fu4_scan_array_result_is_calc_in_scalar_context() {
+    assert_eq!(eval("SCAN(0,SEQUENCE(3),LAMBDA(a,v,a+v))"), Value::Error(ErrorValue::Calc));
+}
+
+#[test]
+fn fu4_reduce_scalar_result_computes_in_scalar_context() {
+    // REDUCE's result is a scalar, so it computes even in scalar context.
+    assert_eq!(eval("REDUCE(0,SEQUENCE(4),LAMBDA(a,v,a+v))"), num(10.0));
+}
+
+#[test]
+fn fu4_reduce_composes_as_a_scalar() {
+    // Proves REDUCE composes in a sub-expression (`+1`) — it is genuinely scalar.
+    assert_eq!(eval("REDUCE(0,SEQUENCE(4),LAMBDA(a,v,a+v))+1"), num(11.0));
+}
+
+#[test]
+fn fu4_map_wrong_arity_lambda_is_value() {
+    // A 2-param lambda for a single-array MAP → whole-result #VALUE! (the up-front
+    // arity check: lambda param count must equal the array count). A single error,
+    // not a spill of per-cell errors — so it surfaces directly even in scalar context.
+    assert_eq!(eval("MAP({1,2,3},LAMBDA(a,b,a+b))"), Value::Error(ErrorValue::Value));
+}
+
+#[test]
+fn fu4_map_two_array_one_param_lambda_is_value() {
+    // The other arity direction: 2 arrays but a 1-param lambda → #VALUE!.
+    assert_eq!(eval("MAP({1,2,3},{4,5,6},LAMBDA(a,a))"), Value::Error(ErrorValue::Value));
+}
+
+#[test]
+fn fu4_map_non_lambda_slot_is_value() {
+    // A non-lambda in the lambda slot → the WHOLE result is #VALUE! (resolve fails
+    // up front), which is a scalar error and surfaces directly (not #CALC!).
+    assert_eq!(eval("MAP({1,2,3},5)"), Value::Error(ErrorValue::Value));
+}
+
+#[test]
+fn fu4_makearray_negative_dim_is_value() {
+    assert_eq!(eval("MAKEARRAY(-1,2,LAMBDA(r,c,r))"), Value::Error(ErrorValue::Value));
+}
+
+#[test]
+fn fu4_makearray_zero_dim_is_num() {
+    // [confirm vs Excel] — SEQUENCE-consistent: a zero dimension → #NUM!.
+    assert_eq!(eval("MAKEARRAY(0,2,LAMBDA(r,c,r))"), Value::Error(ErrorValue::Num));
+}
+
+#[test]
+fn fu4_map_mismatched_dims_is_value() {
+    // [confirm vs Excel — flip to #N/A if live Excel differs] — two MAP arrays of
+    // different sizes → #VALUE! (a scalar error, surfaces directly).
+    assert_eq!(eval("MAP({1,2,3},{1,2},LAMBDA(a,b,a+b))"), Value::Error(ErrorValue::Value));
+}
+
+#[test]
+fn fu4_map_per_element_array_result_is_calc() {
+    // A per-element lambda result that is an ARRAY (=MAP(SEQUENCE(2),LAMBDA(x,SEQUENCE(x))))
+    // makes each cell #CALC! (Tier-1 lambdas must return scalars; the deferred boundary).
+    // In scalar context the whole array is #CALC! anyway — this pins it doesn't panic.
+    assert_eq!(eval("MAP(SEQUENCE(2),LAMBDA(x,SEQUENCE(x)))"), Value::Error(ErrorValue::Calc));
+}
+
+#[test]
+fn fu4_reduce_runaway_lambda_is_num_not_stack_overflow() {
+    // Depth threads into the helper's per-element invocation: a runaway self-applying
+    // lambda inside a REDUCE body hits MAX_LAMBDA_DEPTH (64) → #NUM!, NOT a SIGABRT.
+    assert_eq!(
+        eval("REDUCE(0,SEQUENCE(1),LAMBDA(a,v,LET(g,LAMBDA(s,n,IF(n<0,0,1+s(s,n+1))),g(g,1))))"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+#[test]
+fn fu4_reduce_error_element_flows_into_lambda() {
+    // **Megaudit (Codex MEDIUM):** an ERROR-valued scalar array source must flow INTO
+    // the lambda (where IFERROR can recover it), not short-circuit before it runs.
+    // REDUCE(0, 1/0, LAMBDA(a,x,IFERROR(x,42))) → the 1×1 [#DIV/0!] is folded → 42.
+    assert_eq!(
+        eval("REDUCE(0,1/0,LAMBDA(a,x,IFERROR(x,42)))"),
+        num(42.0)
+    );
+}
+
+#[test]
+fn fu4_map_array_lambda_slot_is_calc() {
+    // **Megaudit (Codex LOW, intentional):** an ARRAY in the lambda slot is #CALC!
+    // (an array in a callee position; FU3-consistent — invoke_lambda's array-callee
+    // arm is also #CALC!), NOT #VALUE!. A non-array non-lambda slot stays #VALUE!
+    // (see fu4_map_non_lambda_slot_is_value).
+    assert_eq!(eval("MAP({1},SEQUENCE(1))"), Value::Error(ErrorValue::Calc));
+}
+
+// --- Deferred boundaries (FU4b — BYROW / BYCOL not yet implemented) ----------
+
+#[test]
+fn fu4_byrow_unimplemented_is_name_error() {
+    // BYROW / BYCOL (whose lambda receives a whole row/column array) are deferred
+    // to FU4b. They are NOT `is_higher_order_helper` names yet, so they fall to the
+    // unknown-function path → #NAME?. Pinned so adding them later is a visible,
+    // deliberate change (and so the lambda arg doesn't crash the unknown-fn path).
+    assert_eq!(
+        eval("BYROW(SEQUENCE(3),LAMBDA(r,SUM(r)))"),
+        Value::Error(ErrorValue::Name)
+    );
+}
+
+#[test]
+fn fu4_bycol_unimplemented_is_name_error() {
+    assert_eq!(
+        eval("BYCOL(SEQUENCE(3),LAMBDA(c,SUM(c)))"),
+        Value::Error(ErrorValue::Name)
+    );
+}

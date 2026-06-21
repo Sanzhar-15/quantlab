@@ -971,3 +971,303 @@ fn fu3_let_range_bound_local_is_rejected_at_bind() {
         "a bare-range LET value must be rejected at bind time (BindContext::Scalar); got {result:?}"
     );
 }
+
+// =============================================================================
+// FU4 (2026-06-21) — Tier-1 higher-order helpers (MAP / MAKEARRAY / REDUCE /
+// SCAN). Production path: spill + dependency tracking. The PRIMARY surface is
+// the cardinal-sin test — a cell ref inside a helper's lambda body must be a
+// precedent (the dep walker marks the helper's lambda arg invoked).
+// =============================================================================
+
+/// Assert the spill anchored at B1 (col 1) is `rows×cols` with `expected`
+/// row-major values.
+fn assert_spill_block(wb: &Workbook, rows: u32, cols: u32, expected: &[f64]) {
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        Some(SpillShape::new(rows, cols)),
+        "expected a {rows}×{cols} spill anchored at B1"
+    );
+    assert_eq!(
+        expected.len(),
+        (rows * cols) as usize,
+        "test fixture: expected.len() must equal rows*cols"
+    );
+    for r in 0..rows {
+        for c in 0..cols {
+            let want = expected[(r * cols + c) as usize];
+            assert_eq!(
+                wb.read(Address::new(0, r, 1 + c)),
+                Value::Number(want),
+                "spilled cell at (row {r}, col {c}) must be {want}"
+            );
+        }
+    }
+}
+
+// --- MAP --------------------------------------------------------------------
+
+#[test]
+fn fu4_map_single_array_spills() {
+    // =MAP(SEQUENCE(3),LAMBDA(x,x*x)) — apply x*x to {1;2;3} → {1;4;9} (3×1).
+    let (wb, _g, _r) = setup("MAP(SEQUENCE(3),LAMBDA(x,x*x))", 0.0);
+    assert_spill_block(&wb, 3, 1, &[1.0, 4.0, 9.0]);
+}
+
+#[test]
+fn fu4_map_two_arrays_spills() {
+    // =MAP({1,2,3},{10,20,30},LAMBDA(a,b,a+b)) — element-wise across two arrays
+    // → {11,22,33} (1×3). Lambda arity (2) == array count (2).
+    let (wb, _g, _r) = setup("MAP({1,2,3},{10,20,30},LAMBDA(a,b,a+b))", 0.0);
+    assert_spill_block(&wb, 1, 3, &[11.0, 22.0, 33.0]);
+}
+
+#[test]
+fn fu4_map_2d_spills() {
+    // =MAP({1,2;3,4},LAMBDA(x,x*10)) — preserves the 2×2 shape → {10,20;30,40}.
+    let (wb, _g, _r) = setup("MAP({1,2;3,4},LAMBDA(x,x*10))", 0.0);
+    assert_spill_block(&wb, 2, 2, &[10.0, 20.0, 30.0, 40.0]);
+}
+
+#[test]
+fn fu4_map_constant_lambda_spills() {
+    // A lambda ignoring its param still maps element-wise → {7;7;7}. The input
+    // range still drives the shape (see fu4_map_array_arg_reshapes...).
+    let (wb, _g, _r) = setup("MAP(SEQUENCE(3),LAMBDA(x,7))", 0.0);
+    assert_spill_block(&wb, 3, 1, &[7.0, 7.0, 7.0]);
+}
+
+#[test]
+fn fu4_map_body_cell_ref_is_precedent_and_recomputes() {
+    // **THE cardinal-sin test.** A cell ref INSIDE the lambda body
+    // (=MAP(SEQUENCE(3),LAMBDA(x,x+$A$1))) must register $A$1 as a precedent, or
+    // editing A1 leaves the MAP STALE. This passes ONLY if the dep walker marks
+    // the helper's lambda arg invoked (FU4 `discover` change) so the body is walked.
+    let (mut wb, mut graph, reg) = setup("MAP(SEQUENCE(3),LAMBDA(x,x+$A$1))", 10.0);
+    assert_spill_block(&wb, 3, 1, &[11.0, 12.0, 13.0]); // A1=10
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(20.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(
+        attempted >= 1,
+        "editing A1 must recompute the MAP (attempted == 0 means the dep inside the \
+         lambda body was never registered — the cardinal sin)"
+    );
+    assert_spill_block(&wb, 3, 1, &[21.0, 22.0, 23.0]); // A1=20
+}
+
+#[test]
+fn fu4_map_body_cell_ref_in_deps() {
+    // Direct dep-extraction proof for the same shape: $A$1 (inside the body) is in
+    // `deps.cells`.
+    let deps = formula_deps_for("MAP(SEQUENCE(3),LAMBDA(x,x+$A$1))").expect("has deps");
+    assert!(
+        deps.cells.iter().any(|&(s, r, c)| (s, r, c) == (0, 0, 0)),
+        "$A$1 inside the MAP lambda body must be a precedent; got {:?}",
+        deps.cells
+    );
+}
+
+#[test]
+fn fu4_map_array_arg_reshapes_on_precedent_edit() {
+    // The ARRAY arg's precedents drive the shape: =MAP(SEQUENCE($A$1),LAMBDA(x,x)).
+    // A1=3 → {1;2;3}; edit A1=5 → reshape to {1;2;3;4;5}.
+    let (mut wb, mut graph, reg) = setup("MAP(SEQUENCE($A$1),LAMBDA(x,x))", 3.0);
+    assert_spill_block(&wb, 3, 1, &[1.0, 2.0, 3.0]);
+    {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached");
+    }
+    assert_spill_block(&wb, 5, 1, &[1.0, 2.0, 3.0, 4.0, 5.0]);
+}
+
+#[test]
+fn fu4_map_let_bound_lambda_spills() {
+    // A LET-bound lambda passed to MAP resolves via `closures_of`(LocalRef) at the
+    // walker AND `eval_binding`(LocalRef)→Callable at eval. {1;2;3} → {2;4;6}.
+    let (wb, _g, _r) = setup("LET(f,LAMBDA(x,x*2),MAP(SEQUENCE(3),f))", 0.0);
+    assert_spill_block(&wb, 3, 1, &[2.0, 4.0, 6.0]);
+}
+
+#[test]
+fn fu4_map_let_bound_lambda_body_ref_is_precedent() {
+    // The cardinal-sin guard must also fire through a LET-bound lambda: the body's
+    // $A$1 must be a precedent even though the lambda reaches MAP as a LocalRef.
+    let (mut wb, mut graph, reg) =
+        setup("LET(f,LAMBDA(x,x+$A$1),MAP(SEQUENCE(3),f))", 10.0);
+    assert_spill_block(&wb, 3, 1, &[11.0, 12.0, 13.0]);
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(20.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(attempted >= 1, "A1 inside a LET-bound MAP lambda must be a precedent");
+    assert_spill_block(&wb, 3, 1, &[21.0, 22.0, 23.0]);
+}
+
+#[test]
+fn fu4_map_volatile_body_is_volatile() {
+    // A volatile call inside the (invoked) lambda body marks the formula volatile —
+    // the body IS walked (contrast a DEAD lambda, which is not).
+    let deps = formula_deps_for("MAP(SEQUENCE(3),LAMBDA(x,x+RAND()))").expect("has deps");
+    assert!(
+        deps.is_volatile,
+        "a volatile RAND() inside the MAP lambda body must mark the formula volatile"
+    );
+}
+
+#[test]
+fn fu4_map_spill_blocked_is_spill_error() {
+    // A MAP spill blocked by an occupied target cell → #SPILL! (existing collision
+    // machinery; same as a direct SEQUENCE spill).
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_value(0, 2, 1, Value::Number(99.0)).unwrap(); // B3 occupied
+        rt.set_formula(0, 0, 1, "MAP(SEQUENCE(3),LAMBDA(x,x))").unwrap(); // wants B1:B3
+    }
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Spill),
+        "a MAP spill blocked by an occupied target → #SPILL!"
+    );
+}
+
+#[test]
+fn fu4_map_error_scalar_source_flows_into_lambda() {
+    // **Megaudit (Codex MEDIUM):** a single ERROR-VALUED scalar array source must
+    // become a 1×1 array whose element FLOWS INTO the lambda (so IFERROR can handle
+    // it) — NOT short-circuit before the lambda runs. A1 = #DIV/0! (via =1/0);
+    // MAP(A1, LAMBDA(x, IFERROR(x, 42))) → spills 1×1 {42}. This also makes the
+    // scalar-cell source consistent with the 1×1-range source MAP(A1:A1, …).
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "1/0").unwrap(); // A1 = #DIV/0!
+        rt.set_formula(0, 0, 1, "MAP(A1,LAMBDA(x,IFERROR(x,42)))").unwrap();
+    }
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Number(42.0),
+        "the error element must flow into the lambda; IFERROR recovers it to 42"
+    );
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        Some(SpillShape::new(1, 1)),
+        "a single-cell error source maps to a 1×1 spill"
+    );
+}
+
+// --- MAKEARRAY --------------------------------------------------------------
+
+#[test]
+fn fu4_makearray_2x3_spills() {
+    // =MAKEARRAY(2,3,LAMBDA(r,c,r*10+c)) — 1-based (r,c) → {11,12,13;21,22,23}.
+    let (wb, _g, _r) = setup("MAKEARRAY(2,3,LAMBDA(r,c,r*10+c))", 0.0);
+    assert_spill_block(&wb, 2, 3, &[11.0, 12.0, 13.0, 21.0, 22.0, 23.0]);
+}
+
+#[test]
+fn fu4_makearray_1x1_single_cell_spills() {
+    // A 1×1 result is a single-cell spill (matches the FU3 =SEQUENCE(1) precedent).
+    let (wb, _g, _r) = setup("MAKEARRAY(1,1,LAMBDA(r,c,r+c))", 0.0);
+    assert_spill_block(&wb, 1, 1, &[2.0]); // r=1, c=1 → 2
+}
+
+#[test]
+fn fu4_makearray_dims_from_cells_reshape() {
+    // Dimension args are precedents: =MAKEARRAY($A$1,1,LAMBDA(r,c,r)). A1=3 →
+    // {1;2;3}; edit A1=5 → reshape {1;2;3;4;5}.
+    let (mut wb, mut graph, reg) = setup("MAKEARRAY($A$1,1,LAMBDA(r,c,r))", 3.0);
+    assert_spill_block(&wb, 3, 1, &[1.0, 2.0, 3.0]);
+    {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached");
+    }
+    assert_spill_block(&wb, 5, 1, &[1.0, 2.0, 3.0, 4.0, 5.0]);
+}
+
+#[test]
+fn fu4_makearray_fractional_dim_truncates() {
+    // =MAKEARRAY(2.9,1,LAMBDA(r,c,r)) — truncates toward zero → 2 rows.
+    let (wb, _g, _r) = setup("MAKEARRAY(2.9,1,LAMBDA(r,c,r))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[1.0, 2.0]);
+}
+
+// --- REDUCE (scalar result; no spill) ---------------------------------------
+
+#[test]
+fn fu4_reduce_sum() {
+    // =REDUCE(0,SEQUENCE(4),LAMBDA(a,v,a+v)) → 0+1+2+3+4 = 10 (scalar).
+    let (wb, _g, _r) = setup("REDUCE(0,SEQUENCE(4),LAMBDA(a,v,a+v))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(10.0));
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        None,
+        "REDUCE returns a scalar — no spill anchor"
+    );
+}
+
+#[test]
+fn fu4_reduce_product() {
+    // =REDUCE(1,SEQUENCE(4),LAMBDA(a,v,a*v)) → 1*1*2*3*4 = 24.
+    let (wb, _g, _r) = setup("REDUCE(1,SEQUENCE(4),LAMBDA(a,v,a*v))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(24.0));
+}
+
+#[test]
+fn fu4_reduce_init_cell_is_precedent() {
+    // The init arg is a precedent: =REDUCE($A$1,SEQUENCE(3),LAMBDA(a,v,a+v)).
+    // A1=10 → 10+1+2+3 = 16; edit A1=20 → 26.
+    let (mut wb, mut graph, reg) = setup("REDUCE($A$1,SEQUENCE(3),LAMBDA(a,v,a+v))", 10.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(16.0));
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(20.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(attempted >= 1, "REDUCE init cell A1 must be a precedent");
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(26.0));
+}
+
+// --- SCAN -------------------------------------------------------------------
+
+#[test]
+fn fu4_scan_running_sum_spills() {
+    // =SCAN(0,SEQUENCE(5),LAMBDA(a,b,a+b)) → running sum {1;3;6;10;15} (5×1; the
+    // initial value 0 is NOT a cell — result size == input size).
+    let (wb, _g, _r) = setup("SCAN(0,SEQUENCE(5),LAMBDA(a,b,a+b))", 0.0);
+    assert_spill_block(&wb, 5, 1, &[1.0, 3.0, 6.0, 10.0, 15.0]);
+}
+
+#[test]
+fn fu4_scan_running_product_row() {
+    // =SCAN(1,{1,2,3,4},LAMBDA(a,v,a*v)) → {1,2,6,24} (1×4, preserves row shape).
+    let (wb, _g, _r) = setup("SCAN(1,{1,2,3,4},LAMBDA(a,v,a*v))", 0.0);
+    assert_spill_block(&wb, 1, 4, &[1.0, 2.0, 6.0, 24.0]);
+}
+
+#[test]
+fn fu4_scan_spill_blocked_is_spill_error() {
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_value(0, 2, 1, Value::Number(99.0)).unwrap(); // B3 occupied
+        rt.set_formula(0, 0, 1, "SCAN(0,SEQUENCE(3),LAMBDA(a,v,a+v))")
+            .unwrap(); // wants B1:B3
+    }
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Spill),
+        "a SCAN spill blocked by an occupied target → #SPILL!"
+    );
+}

@@ -481,4 +481,51 @@ mod tests {
         // A spill TARGET carries no formula text (only the anchor does).
         assert_eq!(loaded.formula_at(s, 1, 0), None);
     }
+
+    /// **FU4 (2026-06-21)** — a MAP-spilled anchor must survive save → load →
+    /// recompute with full fidelity (the formula re-binds and re-spills; the
+    /// anchor keeps its formula text, the targets stay formula-less).
+    #[test]
+    fn fu4_map_spill_survives_qbook_round_trip() {
+        let (_dir, path) = temp_path("fu4-map-spill-roundtrip.qbook");
+
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(s, 0, 0, "MAP(SEQUENCE(4),LAMBDA(x,x*x))")
+                .unwrap();
+        }
+        // Pre-save: 4×1 spill at A1:A4 → {1;4;9;16}.
+        assert_eq!(
+            wb.spill_anchor_at(s, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(4, 1))
+        );
+        assert_eq!(wb.read(Address::new(s, 3, 0)), Value::Number(16.0));
+
+        save_workbook(&wb, "fu4-map-spill-roundtrip", &path).unwrap();
+
+        let (loaded, result) = load_workbook_and_recompute(&path, &reg).unwrap();
+        assert!(result.is_complete(), "recompute failures: {result:?}");
+
+        assert_eq!(
+            loaded.spill_anchor_at(s, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(4, 1)),
+            "MAP spill anchor must be re-registered on load"
+        );
+        for (i, want) in [1.0, 4.0, 9.0, 16.0].into_iter().enumerate() {
+            assert_eq!(loaded.read(Address::new(s, i as u32, 0)), Value::Number(want));
+        }
+        // The anchor keeps its (re-printed) formula text; a spill TARGET carries none.
+        let anchor_formula = loaded
+            .formula_at(s, 0, 0)
+            .map(|t| t.as_ref().to_string())
+            .expect("anchor retains its formula after round-trip");
+        assert!(
+            anchor_formula.contains("MAP"),
+            "anchor formula must round-trip as a MAP call; got {anchor_formula:?}"
+        );
+        assert_eq!(loaded.formula_at(s, 1, 0), None);
+    }
 }

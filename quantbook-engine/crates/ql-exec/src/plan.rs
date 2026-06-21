@@ -501,6 +501,25 @@ pub(crate) fn is_aggregate_function(registry: &FunctionRegistry, name: &str) -> 
     )
 }
 
+/// **FU4 (2026-06-21):** the Tier-1 higher-order helper family — spreadsheet
+/// functions that take a `LAMBDA` argument and INVOKE it. They are NOT
+/// registry-dispatched (no `RegisteredFn` — the registry has no way to carry a
+/// closure through `FunctionArg`); instead they are **eval-intercepted special
+/// forms**, recognized by name in `scalar.rs::eval_higher_order` (the cell-
+/// boundary + scalar paths) and given an extra invoked-set mark in the dep
+/// walker (`calcgraph_session.rs::discover`) so a precedent inside the helper's
+/// lambda body is never under-reported. The four names carry `ArgContext::
+/// Aggregate` metadata (`ql_functions::register_builtin_metadata`) so their
+/// range/array arg binds (the default `Scalar` context rejects a bare `A1:A3`).
+///
+/// Names are canonical uppercase (the parser upper-cases function names). A
+/// future FU4b (BYROW / BYCOL — whose lambda receives a whole row/column array)
+/// extends THIS list together with `eval_higher_order`. Pinned by
+/// `higher_order_helper_names_have_aggregate_metadata` (matcher → metadata sync).
+pub(crate) fn is_higher_order_helper(name: &str) -> bool {
+    matches!(name, "MAP" | "MAKEARRAY" | "REDUCE" | "SCAN")
+}
+
 /// **W5-RT-1 (RT-V1-01):** classifier for the reference-aware dispatch tier.
 /// These functions take their args under `BindContext::ReferenceArg` rather
 /// than `Scalar` or `AggregateArg`. ReferenceArg context accepts:
@@ -3782,6 +3801,31 @@ mod tests {
                 );
             }
             other => panic!("expected ExprPlan::StructuredRef, got {other:?}"),
+        }
+    }
+
+    /// **FU4 (2026-06-21):** `is_higher_order_helper` matches EXACTLY the four
+    /// Tier-1 helper names and nothing else. Typo / drift guard — the matcher is
+    /// the single source of truth consumed by both the evaluator
+    /// (`scalar.rs::eval_higher_order`) and the dep walker
+    /// (`calcgraph_session.rs::discover`), and must stay in lockstep with the
+    /// `eval_higher_order` match and the Aggregate-metadata registration.
+    #[test]
+    fn is_higher_order_helper_matches_exactly_the_four() {
+        for name in ["MAP", "MAKEARRAY", "REDUCE", "SCAN"] {
+            assert!(
+                is_higher_order_helper(name),
+                "{name} must be recognized as a higher-order helper"
+            );
+        }
+        // Non-helpers — including the deferred FU4b names and an ordinary
+        // array/aggregate fn — must NOT match.
+        for name in ["BYROW", "BYCOL", "SUM", "SEQUENCE", "LET", "LAMBDA", "MAPX", "map"] {
+            assert!(
+                !is_higher_order_helper(name),
+                "{name} must NOT be recognized as a higher-order helper (names are \
+                 canonical uppercase; the four are exhaustive)"
+            );
         }
     }
 }

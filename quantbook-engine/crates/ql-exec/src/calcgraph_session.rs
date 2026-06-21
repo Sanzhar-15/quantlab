@@ -130,7 +130,7 @@ use ql_storage::Workbook;
 use ql_types::{ColId, Range, RowId, SheetId};
 
 use crate::aggregate_cache::{AggregateCacheStats, InMemAggregateCache};
-use crate::plan::{bind_with_site, BindSite, ExprPlan};
+use crate::plan::{bind_with_site, is_higher_order_helper, BindSite, ExprPlan};
 use crate::workbook_runtime::RuntimeError;
 
 /// Phase 3.3 (2026-05-12) — convert a `ql_types::Range` (used in
@@ -685,6 +685,32 @@ fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &Func
                 is_lazy_shape_reference_fn(registry, name) && registry.udf_handle(name).is_none();
             if !lazy_builtin {
                 args.iter().for_each(|a| discover(a, st, registry));
+            }
+            // **FU4 (2026-06-21) — the cardinal-sin fix.** A higher-order helper
+            // (MAP / MAKEARRAY / REDUCE / SCAN) INVOKES the lambda(s) in its arg
+            // list — but a lambda passed as a *function arg* is otherwise never
+            // marked invoked (only the `CallLambda` arm marks). Without this, the
+            // walker's `Lambda` arm (`walk_plan_for_deps_inner`) skips the body, so a
+            // precedent inside it (`MAP(A1:A3, LAMBDA(x, x+$B$1))` → `$B$1`) is
+            // silently UNDER-reported → stale-on-edit, the worst engine bug. Mark
+            // EVERY arg's closure-set invoked (mirroring the `CallLambda` arm's
+            // `st.invoked.insert`): a non-lambda arg (the range / init / dim) yields
+            // `closures_of == ∅`, so only the real lambda slot(s) contribute — a sound
+            // over-approximation (superset of what eval invokes; NEVER an under-report).
+            // `closures_of` resolves a literal `LAMBDA`, a LET-bound lambda
+            // (`LET(f,…,MAP(A1:A3,f))`), and currying, reusing the existing fixpoint
+            // machinery. No arity gate here: a wrong-arity lambda returning `#VALUE!`
+            // is harmless to over-mark, and omission is the only dangerous direction.
+            if is_higher_order_helper(name) {
+                for a in args {
+                    let mut guard = HashSet::new();
+                    let cs = closures_of(a, st, &mut guard);
+                    for lp in cs {
+                        if st.invoked.insert(lp) {
+                            st.changed = true;
+                        }
+                    }
+                }
             }
         }
         ExprPlan::ScalarNameRef { inner, .. } => discover(inner, st, registry),

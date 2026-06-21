@@ -46,8 +46,8 @@ use ql_types::{coercion, ArrayValue, ErrorValue, Value};
 use crate::aggregate_cache::{AggregateCache, NoAggregateCache};
 use crate::env::CellEnv;
 use crate::eval_result::EvalResult;
-use crate::local_env::{LocalBinding, LocalEnv};
-use crate::plan::ExprPlan;
+use crate::local_env::{LambdaClosure, LocalBinding, LocalEnv};
+use crate::plan::{is_higher_order_helper, ExprPlan};
 
 /// **Wave P (2026-06-20):** maximum LAMBDA invocation depth before evaluation
 /// fails loudly with `#NUM!`. Self-applied closures (`g(g, n)`) can recurse
@@ -322,6 +322,22 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
             // The unified registry storage (W5-96) made the migration
             // mechanical; doing it here lands the dispatch shape
             // needed for 4.7.J spill routing.
+            //
+            // **FU4 (2026-06-21):** the higher-order helpers (MAP / MAKEARRAY /
+            // REDUCE / SCAN) are eval-intercepted special forms with NO
+            // `RegisteredFn` (the registry can't carry a closure through
+            // `FunctionArg`), so recognize them BEFORE the registry dispatch —
+            // else they would fall to the `None` → `#NAME?` arm. In SCALAR
+            // context an array result collapses to `#CALC!` (consistent with
+            // every other array in a sub-expression position, design § 6.3);
+            // REDUCE's scalar result passes through and composes (`=REDUCE(...)+1`).
+            // The cell-boundary path (`eval_at_cell_boundary`) spills the arrays.
+            if is_higher_order_helper(name) {
+                return match eval_higher_order(name, args, env, registry, cache) {
+                    EvalResult::Scalar(v) => v,
+                    EvalResult::Array(_) => Value::Error(ErrorValue::Calc),
+                };
+            }
             use ql_functions::RegisteredFn;
             match registry.lookup_any(name) {
                 Some(RegisteredFn::RangeAware(raf)) => {
@@ -942,10 +958,17 @@ fn eval_binding<E: CellEnv>(
             let array_capable = match plan {
                 ExprPlan::Array(_) => true,
                 ExprPlan::Function { name, .. } => {
-                    matches!(
-                        registry.lookup_any(name),
-                        Some(ql_functions::RegisteredFn::Unified(_))
-                    ) || registry.udf_handle(name).is_some()
+                    // **FU4 (2026-06-21):** a higher-order helper returns an array,
+                    // so a `LET` body / lambda result that IS a helper call spills
+                    // (`=LET(m, MAP(A1:A3,LAMBDA(x,x*2)), m)`) — symmetric with the
+                    // Unified-tier handling FU3 added; without this the LET body
+                    // would scalarize to `#CALC!`, an asymmetry.
+                    is_higher_order_helper(name)
+                        || matches!(
+                            registry.lookup_any(name),
+                            Some(ql_functions::RegisteredFn::Unified(_))
+                        )
+                        || registry.udf_handle(name).is_some()
                 }
                 _ => false,
             };
@@ -959,6 +982,368 @@ fn eval_binding<E: CellEnv>(
             }
         }
     }
+}
+
+// =============================================================================
+// **FU4 (2026-06-21) — Tier-1 higher-order helper family: MAP / MAKEARRAY /
+// REDUCE / SCAN.** These take a `LAMBDA` argument and INVOKE it per element.
+// They are eval-intercepted special forms (NOT registry-dispatched: the
+// registry has no `FunctionArg::Lambda`), recognized by name in
+// `eval_scalar_with_cache` (scalar context → array result is `#CALC!`) and
+// `eval_at_cell_boundary` (array result → `EvalResult::Array` → spill). Each
+// passes SCALARS to the lambda, so they build directly on the FU3 substrate.
+// BYROW / BYCOL (whose lambda receives a whole row/column array) need the
+// deferred array-as-arg substrate and are FU4b.
+//
+// The dep walker (`calcgraph_session.rs::discover`) marks a helper's lambda
+// arg INVOKED so a precedent inside the lambda body
+// (`MAP(A1:A3, LAMBDA(x, x+$B$1))` → `$B$1`) is never under-reported.
+// =============================================================================
+
+/// **FU4:** invoke an already-resolved closure with N PRE-COMPUTED scalar values
+/// (the helper's per-element args), binding them DIRECTLY to the closure params.
+/// This is the crucial difference from [`invoke_lambda`], which takes arg PLANS
+/// and re-evaluates them: a helper holds the materialized array elements, not
+/// expressions, so re-evaluation would be wrong (and could re-fire side effects).
+/// Reuses `invoke_lambda`'s arity / depth / scope arms EXACTLY — a wrong-arity
+/// lambda → `#VALUE!`, runaway recursion → `#NUM!`. Depth threads from
+/// `env.lambda_depth()` so nesting still hits the 64-cap; the helper's own
+/// element loop is Rust iteration and consumes NO depth level (only genuine
+/// lambda recursion inside the body does).
+fn invoke_closure_with_values<E: CellEnv>(
+    closure: &std::sync::Arc<LambdaClosure>,
+    arg_values: &[Value],
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> LocalBinding {
+    if arg_values.len() != closure.params.len() {
+        return LocalBinding::Value(Value::Error(ErrorValue::Value));
+    }
+    let depth = env.lambda_depth();
+    if depth >= MAX_LAMBDA_DEPTH {
+        return LocalBinding::Value(Value::Error(ErrorValue::Num));
+    }
+    let mut invocation = closure.captured_env.clone();
+    for (param, val) in closure.params.iter().zip(arg_values.iter()) {
+        invocation = invocation.with_binding(param.clone(), LocalBinding::Value(val.clone()));
+    }
+    let scoped = LocalScopedEnv {
+        inner: env,
+        locals: invocation,
+        depth: depth + 1,
+    };
+    eval_binding(&closure.body, &scoped, registry, cache)
+}
+
+/// **FU4:** resolve a helper's lambda-slot arg-plan to a callable closure ONCE
+/// (reused for every element). A non-callable slot is loud: an error propagates,
+/// an array slot → `#CALC!` (an array in the lambda position, mirroring
+/// `invoke_lambda`'s FU3 array-callee arm), any other non-lambda → `#VALUE!`.
+fn resolve_callee_closure<E: CellEnv>(
+    plan: &ExprPlan,
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> Result<std::sync::Arc<LambdaClosure>, Value> {
+    match eval_binding(plan, env, registry, cache) {
+        LocalBinding::Callable(c) => Ok(c),
+        LocalBinding::Value(Value::Error(e)) => Err(Value::Error(e)),
+        LocalBinding::Array(_) => Err(Value::Error(ErrorValue::Calc)),
+        LocalBinding::Value(_) => Err(Value::Error(ErrorValue::Value)),
+    }
+}
+
+/// **FU4:** materialize one helper arg-plan into an `ArrayValue` (row-major),
+/// reading the grid EXACTLY ONCE. Contained array-source handling for the
+/// helper's array slot ONLY — NOT general array-as-arbitrary-arg (a LocalRef
+/// array passed to e.g. `SUM` is still `#CALC!`). A range reads via
+/// `read_range_with_shape`; everything else routes through `eval_binding` so an
+/// array-returning `Function` / nested helper (materialized ONCE through the
+/// boundary — no re-fired volatiles) AND a LET-bound array local both yield
+/// their array; a scalar → 1×1; a callable is not an array source (`#VALUE!`);
+/// an error propagates.
+fn materialize_array_arg<E: CellEnv>(
+    plan: &ExprPlan,
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> Result<ArrayValue, ErrorValue> {
+    match plan {
+        ExprPlan::AggregateNameRef { range, .. } | ExprPlan::RangeRef { range } => {
+            let (values, rows, cols) = env.read_range_with_shape(*range);
+            Ok(ArrayValue::new(rows as u32, cols as u32, values)
+                .expect("read_range_with_shape yields values.len() == rows*cols"))
+        }
+        ExprPlan::StructuredRef {
+            resolved,
+            is_this_row,
+            ..
+        } => match narrow_structured_ref(*resolved, *is_this_row, env) {
+            Ok(range) => {
+                let (values, rows, cols) = env.read_range_with_shape(range);
+                Ok(ArrayValue::new(rows as u32, cols as u32, values)
+                    .expect("read_range_with_shape yields values.len() == rows*cols"))
+            }
+            Err(ev) => Err(ev),
+        },
+        _ => match eval_binding(plan, env, registry, cache) {
+            LocalBinding::Array(a) => Ok(a),
+            // A scalar source becomes a 1×1 array — INCLUDING an error scalar, whose
+            // single element then FLOWS INTO the lambda (so an `IFERROR` body can
+            // recover it). **Megaudit (Codex MEDIUM):** short-circuiting an error
+            // here would (a) stop the lambda from ever running and (b) diverge from
+            // the 1×1-range source `MAP(A1:A1, …)`, which already carries the error
+            // as an array cell. A genuinely-fatal element error simply propagates
+            // through the lambda's own arithmetic (left-error-wins), so nothing is
+            // silently swallowed.
+            LocalBinding::Value(v) => Ok(ArrayValue::singleton(v)),
+            // A callable as the array source is not an array (e.g. a bare LAMBDA
+            // in the array slot) → loud `#VALUE!`.
+            LocalBinding::Callable(_) => Err(ErrorValue::Value),
+        },
+    }
+}
+
+/// **FU4:** lift a per-element invocation result into a scalar cell value. A
+/// Tier-1 lambda must return a SCALAR; an array / callable result for a single
+/// cell is `#CALC!` (loud — the FU3 invariant: an array in a scalar position is
+/// `#CALC!`). Only the offending cell is `#CALC!`; the rest of the spill is
+/// unaffected. (BYROW / BYCOL, deferred, are exactly the helpers whose lambda
+/// legitimately returns an array.)
+fn helper_cell_value(b: LocalBinding) -> Value {
+    match b {
+        LocalBinding::Value(v) => v,
+        LocalBinding::Array(_) | LocalBinding::Callable(_) => Value::Error(ErrorValue::Calc),
+    }
+}
+
+/// **FU4:** coerce a helper dimension arg (MAKEARRAY rows/cols) to a positive
+/// `u32`, mirroring the `SEQUENCE` ladder EXACTLY (array_returning_fns.rs):
+/// error propagates; non-finite → `#VALUE!`; negative (pre-truncation) →
+/// `#VALUE!`; truncate toward zero; over `u32::MAX` → `#NUM!`; zero-after-trunc
+/// → `#NUM!`.
+fn coerce_dim(v: Value) -> Result<u32, ErrorValue> {
+    let f = match &v {
+        Value::Error(e) => return Err(*e),
+        other => coercion::to_number_lenient(other)?,
+    };
+    if !f.is_finite() || f < 0.0 {
+        return Err(ErrorValue::Value);
+    }
+    let t = f.trunc();
+    if t > u32::MAX as f64 {
+        return Err(ErrorValue::Num);
+    }
+    let n = t as u32;
+    if n == 0 {
+        return Err(ErrorValue::Num);
+    }
+    Ok(n)
+}
+
+/// **FU4:** evaluate a Tier-1 higher-order helper at the cell boundary. The
+/// interceptors in `eval_scalar_with_cache` / `eval_at_cell_boundary` guard on
+/// [`is_higher_order_helper`], so `name` is always one of the four.
+fn eval_higher_order<E: CellEnv>(
+    name: &str,
+    args: &[ExprPlan],
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> EvalResult {
+    match name {
+        "MAP" => eval_map(args, env, registry, cache),
+        "MAKEARRAY" => eval_makearray(args, env, registry, cache),
+        "REDUCE" => eval_reduce(args, env, registry, cache),
+        "SCAN" => eval_scan(args, env, registry, cache),
+        _ => unreachable!(
+            "eval_higher_order reached with a non-helper name ({name}); the \
+             interceptor must guard on is_higher_order_helper, which is out of \
+             sync with this match"
+        ),
+    }
+}
+
+/// `MAP(array1, [array2, …], lambda)` — apply `lambda` element-wise across the
+/// arrays (lambda arity == array count). Result shape == the shared array shape.
+fn eval_map<E: CellEnv>(
+    args: &[ExprPlan],
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> EvalResult {
+    // >= 2 args: at least one array + the trailing lambda.
+    if args.len() < 2 {
+        return EvalResult::Scalar(Value::Error(ErrorValue::Value));
+    }
+    let (array_args, lambda_slot) = args.split_at(args.len() - 1);
+    let mut arrays: Vec<ArrayValue> = Vec::with_capacity(array_args.len());
+    for a in array_args {
+        match materialize_array_arg(a, env, registry, cache) {
+            Ok(av) => arrays.push(av),
+            Err(e) => return EvalResult::Scalar(Value::Error(e)),
+        }
+    }
+    let rows = arrays[0].rows();
+    let cols = arrays[0].cols();
+    // Excel requires every array share the SAME dimensions.
+    if arrays.iter().any(|a| a.rows() != rows || a.cols() != cols) {
+        return EvalResult::Scalar(Value::Error(ErrorValue::Value));
+    }
+    let closure = match resolve_callee_closure(&lambda_slot[0], env, registry, cache) {
+        Ok(c) => c,
+        Err(v) => return EvalResult::Scalar(v),
+    };
+    // The lambda's arity must equal the number of arrays (one param per array); a
+    // mismatch is a whole-result `#VALUE!` (Excel-faithful — a single error, not a
+    // spill of per-cell errors). `invoke_closure_with_values` re-checks per call as
+    // a belt-and-suspenders guard.
+    if closure.params.len() != arrays.len() {
+        return EvalResult::Scalar(Value::Error(ErrorValue::Value));
+    }
+    let n = (rows as usize) * (cols as usize);
+    let mut out: Vec<Value> = Vec::with_capacity(n);
+    for i in 0..n {
+        let call_args: Vec<Value> = arrays.iter().map(|a| a.cells()[i].clone()).collect();
+        out.push(helper_cell_value(invoke_closure_with_values(
+            &closure, &call_args, env, registry, cache,
+        )));
+    }
+    EvalResult::Array(
+        ArrayValue::new(rows, cols, out).expect("output has rows*cols == n cells by construction"),
+    )
+}
+
+/// `MAKEARRAY(rows, cols, lambda(r, c))` — build a `rows × cols` array, invoking
+/// `lambda` with 1-based `(row, col)` indices.
+fn eval_makearray<E: CellEnv>(
+    args: &[ExprPlan],
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> EvalResult {
+    if args.len() != 3 {
+        return EvalResult::Scalar(Value::Error(ErrorValue::Value));
+    }
+    let rows = match coerce_dim(eval_scalar_with_cache(&args[0], env, registry, cache)) {
+        Ok(n) => n,
+        Err(e) => return EvalResult::Scalar(Value::Error(e)),
+    };
+    let cols = match coerce_dim(eval_scalar_with_cache(&args[1], env, registry, cache)) {
+        Ok(n) => n,
+        Err(e) => return EvalResult::Scalar(Value::Error(e)),
+    };
+    // Guard the product (SEQUENCE's ceiling): > i32::MAX cells → `#NUM!`.
+    let total = (rows as u64).saturating_mul(cols as u64);
+    if total > i32::MAX as u64 {
+        return EvalResult::Scalar(Value::Error(ErrorValue::Num));
+    }
+    let closure = match resolve_callee_closure(&args[2], env, registry, cache) {
+        Ok(c) => c,
+        Err(v) => return EvalResult::Scalar(v),
+    };
+    // MAKEARRAY's lambda takes exactly (row, col); a mismatch is a whole-result
+    // `#VALUE!`.
+    if closure.params.len() != 2 {
+        return EvalResult::Scalar(Value::Error(ErrorValue::Value));
+    }
+    let mut out: Vec<Value> = Vec::with_capacity(total as usize);
+    for r in 1..=rows {
+        for c in 1..=cols {
+            out.push(helper_cell_value(invoke_closure_with_values(
+                &closure,
+                &[Value::Number(r as f64), Value::Number(c as f64)],
+                env,
+                registry,
+                cache,
+            )));
+        }
+    }
+    EvalResult::Array(
+        ArrayValue::new(rows, cols, out).expect("output has rows*cols cells by construction"),
+    )
+}
+
+/// `REDUCE(init, array, lambda(acc, val))` — fold `array` (row-major) into a
+/// single accumulated SCALAR; an empty array returns `init`.
+fn eval_reduce<E: CellEnv>(
+    args: &[ExprPlan],
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> EvalResult {
+    if args.len() != 3 {
+        return EvalResult::Scalar(Value::Error(ErrorValue::Value));
+    }
+    // init is a scalar; an array init surfaces `#CALC!` here (array accumulator
+    // is deferred), which then folds through as the acc — a loud, consistent
+    // boundary.
+    let mut acc = eval_scalar_with_cache(&args[0], env, registry, cache);
+    let arr = match materialize_array_arg(&args[1], env, registry, cache) {
+        Ok(a) => a,
+        Err(e) => return EvalResult::Scalar(Value::Error(e)),
+    };
+    let closure = match resolve_callee_closure(&args[2], env, registry, cache) {
+        Ok(c) => c,
+        Err(v) => return EvalResult::Scalar(v),
+    };
+    // REDUCE's lambda takes exactly (accumulator, value); a mismatch is `#VALUE!`.
+    if closure.params.len() != 2 {
+        return EvalResult::Scalar(Value::Error(ErrorValue::Value));
+    }
+    for cell in arr.cells() {
+        acc = helper_cell_value(invoke_closure_with_values(
+            &closure,
+            &[acc.clone(), cell.clone()],
+            env,
+            registry,
+            cache,
+        ));
+    }
+    EvalResult::Scalar(acc)
+}
+
+/// `SCAN(init, array, lambda(acc, val))` — like `REDUCE` but spill each running
+/// accumulator AFTER folding each element; result shape == the input shape (the
+/// initial value is NOT a cell).
+fn eval_scan<E: CellEnv>(
+    args: &[ExprPlan],
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> EvalResult {
+    if args.len() != 3 {
+        return EvalResult::Scalar(Value::Error(ErrorValue::Value));
+    }
+    let mut acc = eval_scalar_with_cache(&args[0], env, registry, cache);
+    let arr = match materialize_array_arg(&args[1], env, registry, cache) {
+        Ok(a) => a,
+        Err(e) => return EvalResult::Scalar(Value::Error(e)),
+    };
+    let closure = match resolve_callee_closure(&args[2], env, registry, cache) {
+        Ok(c) => c,
+        Err(v) => return EvalResult::Scalar(v),
+    };
+    // SCAN's lambda takes exactly (accumulator, value); a mismatch is `#VALUE!`.
+    if closure.params.len() != 2 {
+        return EvalResult::Scalar(Value::Error(ErrorValue::Value));
+    }
+    let mut out: Vec<Value> = Vec::with_capacity(arr.cells().len());
+    for cell in arr.cells() {
+        acc = helper_cell_value(invoke_closure_with_values(
+            &closure,
+            &[acc.clone(), cell.clone()],
+            env,
+            registry,
+            cache,
+        ));
+        out.push(acc.clone());
+    }
+    EvalResult::Array(
+        ArrayValue::new(arr.rows(), arr.cols(), out)
+            .expect("output has the same shape as the input array"),
+    )
 }
 
 /// **W5-117 (Phase 4.8.G.2):** narrow a `StructuredRef::resolved` range
@@ -1431,6 +1816,16 @@ pub fn eval_at_cell_boundary<E: CellEnv>(
                 },
                 Err(ev) => EvalResult::Scalar(Value::Error(ev)),
             }
+        }
+        // **FU4 (2026-06-21):** a top-level higher-order helper (MAP / MAKEARRAY /
+        // REDUCE / SCAN). MAP/MAKEARRAY/SCAN return `EvalResult::Array` → spilled by
+        // the existing `write_spill` writeback (no new spill machinery); REDUCE
+        // returns a scalar. The helper names have NO `RegisteredFn`, so the Unified /
+        // ROW-COLUMN / UDF guards above never match them — this arm is the only
+        // dispatch, and it is mutually exclusive with `_`. (A helper nested as a LET
+        // body routes here too, via `eval_binding`'s FU4 `array_capable` extension.)
+        ExprPlan::Function { name, args } if is_higher_order_helper(name) => {
+            eval_higher_order(name, args, env, registry, cache)
         }
         // **Wave P follow-up 3 (FU3, 2026-06-21):** a top-level LET whose BODY is an
         // array (`=LET(x,5,SEQUENCE(x))`, `=LET(s,SEQUENCE(3),s)`) spills, instead of

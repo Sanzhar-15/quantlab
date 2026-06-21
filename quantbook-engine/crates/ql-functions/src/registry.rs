@@ -1434,6 +1434,23 @@ fn register_builtin_metadata(r: &mut FunctionRegistry) {
         r.register_metadata(pure_scalar(name))
             .expect("Wave P LET/LAMBDA metadata-only entry must not collide");
     }
+    // **FU4 (2026-06-21):** the Tier-1 higher-order helper family (MAP / MAKEARRAY
+    // / REDUCE / SCAN) are eval-intercepted special forms (like LET / LAMBDA) —
+    // NO `RegisteredFn`. Unlike LET/LAMBDA they take a range/array as their DATA
+    // arg, so they need `ArgContext::Aggregate`: the binder must route that arg
+    // under `BindContext::AggregateArg` (the default `Scalar` rejects a bare
+    // `A1:A3`, the gate that also rejects `=LET(s,A1:C1,s)`). Pure + ValueDeps
+    // otherwise — a helper's volatility comes from `walk_plan_for_deps` descending
+    // its INVOKED lambda body, not this name's metadata. Metadata-only: absent
+    // from `fns`, so the dispatch count is unaffected (the subset invariant holds);
+    // the IDE catalog (`sorted_metadata`) surfaces them. Mirrored in the matcher
+    // `ql-exec::plan::is_higher_order_helper`.
+    for name in ["MAP", "MAKEARRAY", "REDUCE", "SCAN"] {
+        let mut m = pure_scalar(name);
+        m.arg_context = ArgContext::Aggregate;
+        r.register_metadata(m)
+            .expect("FU4 higher-order-helper metadata-only entry must not collide");
+    }
     // Address-only reference fns: ROW / COLUMN / ROWS / COLUMNS. The
     // walker `walk_plan_for_address_only_deps` routes their args away
     // from value-deps.
@@ -2866,8 +2883,22 @@ mod tests {
         // postdate the pre-6.4-1 whitelist. They are legitimately Aggregate
         // (the binder must hand them the range), so they are listed here as
         // explicit post-migration extensions.
-        let post_6_4_1_aggregate_additions: &[&str] =
-            &["SHARPE", "MAX_DRAWDOWN", "VOLATILITY", "SORTINO"];
+        let post_6_4_1_aggregate_additions: &[&str] = &[
+            "SHARPE",
+            "MAX_DRAWDOWN",
+            "VOLATILITY",
+            "SORTINO",
+            // **FU4 (2026-06-21):** the Tier-1 higher-order helper family. They are
+            // eval-intercepted special forms (no dispatch entry — metadata-only,
+            // like LET/LAMBDA) but carry `ArgContext::Aggregate` so the binder
+            // routes their range/array DATA arg under `AggregateArg`. Legitimate
+            // post-migration extension; pinned here so a typo'd Aggregate entry
+            // still fails loudly. Mirror: `ql-exec::plan::is_higher_order_helper`.
+            "MAP",
+            "MAKEARRAY",
+            "REDUCE",
+            "SCAN",
+        ];
         let mut allowed: std::collections::HashSet<&str> =
             pre_6_4_1_aggregate_whitelist.iter().copied().collect();
         allowed.extend(post_6_4_1_aggregate_additions.iter().copied());
@@ -2910,6 +2941,29 @@ mod tests {
             assert!(
                 r.lookup(name).is_none(),
                 "{name} is range-aware ONLY; must not also appear in the scalar table",
+            );
+        }
+    }
+
+    /// **FU4 (2026-06-21):** the four Tier-1 higher-order helpers are
+    /// metadata-ONLY (eval-intercepted special forms, like LET/LAMBDA) carrying
+    /// `ArgContext::Aggregate` so the binder routes their range/array data arg.
+    /// They must NOT have a dispatch entry in any tier (a `RegisteredFn` would
+    /// mean the registry tried to evaluate the lambda arg). Mirror of
+    /// `ql-exec::plan::is_higher_order_helper`.
+    #[test]
+    fn fu4_higher_order_helpers_are_aggregate_metadata_only() {
+        let r = default_registry();
+        for name in ["MAP", "MAKEARRAY", "REDUCE", "SCAN"] {
+            assert_eq!(
+                r.metadata(name).map(|m| m.arg_context),
+                Some(ArgContext::Aggregate),
+                "{name} must register ArgContext::Aggregate (binder admits the range/array arg)",
+            );
+            assert!(
+                r.lookup_any(name).is_none(),
+                "{name} is an eval-intercepted special form; it must have NO RegisteredFn \
+                 dispatch entry (else the registry would evaluate its lambda arg)",
             );
         }
     }
