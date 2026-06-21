@@ -313,3 +313,48 @@ fn let_local_value_called_as_function_is_value_error() {
     // A non-callable local invoked as a function -> #VALUE! (Excel canon).
     assert_eq!(eval("LET(x,5,x(1))"), Value::Error(ErrorValue::Value));
 }
+
+// ---------------------------------------------------------------------
+// FU3 (2026-06-21) — scalar-context pins. The `eval()` helper drives the
+// SCALAR evaluator (`eval_scalar_with_cache`), NOT the cell boundary, so
+// an array result is `#CALC!` here — only the boundary (production) path
+// spills (see let_lambda_recalc_contract.rs `fu3_*`). These pin that FU3
+// did NOT change scalar-context behavior (the cardinal soundness rule).
+// ---------------------------------------------------------------------
+
+#[test]
+fn fu3_let_array_body_is_calc_in_scalar_context() {
+    // =LET(x,5,SEQUENCE(x)) spills at the cell boundary, but in SCALAR context an array
+    // body is #CALC! (no implicit intersection). Proves the boundary is the only spiller.
+    assert_eq!(eval("LET(x,5,SEQUENCE(x))"), Value::Error(ErrorValue::Calc));
+}
+
+#[test]
+fn fu3_let_array_local_arithmetic_is_calc() {
+    // Array arithmetic on a local stays #CALC! (deferred boundary; eval_binary has no
+    // array broadcast). Unchanged by FU3.
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),s*2)"),
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu3_let_array_local_as_sum_arg_is_calc() {
+    // An array local as a function arg stays #CALC! (deferred boundary). Unchanged by FU3.
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),SUM(s))"),
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu3_let_array_callee_is_calc_in_scalar_context() {
+    // Megaudit (Codex HIGH): calling an array-valued local is #CALC! in scalar context too
+    // (invoke_lambda's Array-callee arm) — EXACTLY the pre-FU3 result. Contrast the scalar
+    // (non-array) non-callable local `LET(x,5,x(1))` which stays #VALUE! above.
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),s(1))"),
+        Value::Error(ErrorValue::Calc)
+    );
+}

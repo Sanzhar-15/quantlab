@@ -9,7 +9,7 @@
 
 use ql_exec::{CalcgraphSession, WorkbookRuntime};
 use ql_functions::{default_registry, FunctionRegistry};
-use ql_storage::Workbook;
+use ql_storage::{SpillShape, Workbook};
 use ql_types::{Address, ErrorValue, Value};
 
 /// Build a 1-sheet workbook with `A1 = a1` and `B1 = <formula>`, then build the
@@ -765,5 +765,209 @@ fn wrong_arity_call_args_over_walked_known_residual() {
         deps.cells.contains(&(0, 0, 1)),
         "RESIDUAL: the wrong-arity call's B1 arg is over-walked (live-call arg gating \
          closes this); got {deps:?}"
+    );
+}
+
+// =====================================================================
+// FU3 (2026-06-21) — array-valued LET/LAMBDA spill (boundary 1 closed).
+// A LET body / LAMBDA result that is an array now SPILLS at the cell
+// boundary (production `WorkbookRuntime` path) instead of `#CALC!`.
+// =====================================================================
+
+/// Read the `n×1` column spill anchored at B1 (col 1) and assert it is `{1..n}`.
+fn assert_b_column_seq(wb: &Workbook, n: u32) {
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        Some(SpillShape::new(n, 1)),
+        "expected a {n}×1 spill anchored at B1"
+    );
+    for i in 0..n {
+        assert_eq!(
+            wb.read(Address::new(0, i, 1)),
+            Value::Number((i + 1) as f64),
+            "spilled cell B{} must be {}",
+            i + 1,
+            i + 1
+        );
+    }
+}
+
+#[test]
+fn fu3_let_body_array_fn_spills() {
+    // =LET(x,5,SEQUENCE(x)) — body is a Unified array fn → spills 5×1 {1;2;3;4;5}.
+    let (wb, _g, _r) = setup("LET(x,5,SEQUENCE(x))", 0.0);
+    assert_b_column_seq(&wb, 5);
+}
+
+#[test]
+fn fu3_lambda_invocation_array_result_spills() {
+    // =LAMBDA(n,SEQUENCE(n))(3) — CallLambda whose body returns an array → spills 3×1.
+    let (wb, _g, _r) = setup("LAMBDA(n,SEQUENCE(n))(3)", 0.0);
+    assert_b_column_seq(&wb, 3);
+}
+
+#[test]
+fn fu3_let_local_ref_to_array_spills() {
+    // =LET(s,SEQUENCE(3),s) — s binds to an array (LocalBinding::Array, finally
+    // constructed), the body LocalRef propagates it → spills 3×1.
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),s)", 0.0);
+    assert_b_column_seq(&wb, 3);
+}
+
+#[test]
+fn fu3_let_curried_lambda_array_result_spills() {
+    // =LET(f,LAMBDA(x,SEQUENCE(x)),f(3)) — f(3) returns an array → spills 3×1.
+    let (wb, _g, _r) = setup("LET(f,LAMBDA(x,SEQUENCE(x)),f(3))", 0.0);
+    assert_b_column_seq(&wb, 3);
+}
+
+#[test]
+fn fu3_let_nested_array_propagation_spills() {
+    // =LET(a,SEQUENCE(2),LET(b,a,b)) — the array propagates through the nested LET body.
+    let (wb, _g, _r) = setup("LET(a,SEQUENCE(2),LET(b,a,b))", 0.0);
+    assert_b_column_seq(&wb, 2);
+}
+
+#[test]
+fn fu3_let_array_result_1x1_spills_single_cell() {
+    // A 1×1 array result spills as a 1-cell spill (matches the =SEQUENCE(1) precedent —
+    // intentional, NOT a scalar collapse).
+    let (wb, _g, _r) = setup("LET(x,1,SEQUENCE(x))", 0.0);
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        Some(SpillShape::new(1, 1)),
+        "a 1×1 LET-body array registers a 1-cell spill, not a scalar write"
+    );
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(1.0));
+}
+
+#[test]
+fn fu3_let_spill_reshapes_on_precedent_edit() {
+    // THE strongest FU3 test: =LET(s,SEQUENCE(A1),s). The spilling body reads A1 (inside
+    // the LET binding) → A1 is a precedent (FU-NEXT walker). Editing A1 must re-dirty,
+    // recompute, AND reshape the spill — proving (a) the dep walker tracks precedents
+    // inside a spilling LET body (the zero-calcgraph-change claim) and (b) the spill
+    // footprint redirties correctly.
+    let (mut wb, mut graph, reg) = setup("LET(s,SEQUENCE(A1),s)", 3.0);
+    assert_b_column_seq(&wb, 3); // A1=3 → B1:B3
+    {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached");
+    }
+    assert_b_column_seq(&wb, 5); // A1=5 → reshaped to B1:B5
+}
+
+#[test]
+fn fu3_let_callee_resolves_to_array_is_calc() {
+    // Megaudit pin (Codex HIGH, operator-adjudicated): a callee that resolves to an ARRAY
+    // surfaces #CALC!, NOT #VALUE!. =LET(s,SEQUENCE(3),s(1)): s is an array; invoke_lambda's
+    // dedicated `Array` callee arm maps it to #CALC!, preserving the EXACT pre-FU3
+    // scalar-context result (an array in any scalar position — incl. callee — is #CALC!).
+    // The cardinal soundness rule (no scalar-context change) holds literally.
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),s(1))", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Calc),
+        "calling an array-valued local must be #CALC! (array-in-scalar-position), not #VALUE!"
+    );
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        None,
+        "no spill on the error"
+    );
+}
+
+#[test]
+fn fu3_array_arg_invoked_as_lambda_param_is_calc() {
+    // Codex HIGH (2nd instance of the same class): an ARRAY passed as a lambda param and
+    // then invoked — =LAMBDA(f,f(1))(SEQUENCE(3)) — also hits invoke_lambda's Array-callee
+    // arm → #CALC! (preserving pre-FU3 scalar-context semantics).
+    let (wb, _g, _r) = setup("LAMBDA(f,f(1))(SEQUENCE(3))", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Calc),
+        "invoking an array-valued lambda parameter must be #CALC!"
+    );
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        None,
+        "no spill on the error"
+    );
+}
+
+#[test]
+fn fu3_let_array_local_as_unified_fn_arg_is_calc() {
+    // Megaudit (Sonnet lane B) deferred-boundary pin: an array local passed as an arg to a
+    // UNIFIED array fn (=LET(s,SEQUENCE(3),TRANSPOSE(s))) stays #CALC! — array-as-arbitrary-arg
+    // works nowhere in v1 (the LocalRef arg materializes to #CALC! before TRANSPOSE sees it).
+    // Same as the SUM case but for the Unified tier; folds into FU4. Pre-existing, not an FU3
+    // regression.
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),TRANSPOSE(s))", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Calc)
+    );
+    assert_eq!(wb.spill_anchor_at(0, 0, 1).copied(), None, "must NOT spill");
+}
+
+#[test]
+fn fu3_let_body_spill_blocked_is_spill_error() {
+    // A LET body that would spill onto an occupied cell raises #SPILL! (the existing
+    // spill-collision machinery applies to LET-body spills too).
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_value(0, 2, 1, Value::Number(99.0)).unwrap(); // B3 occupied
+        rt.set_formula(0, 0, 1, "LET(x,5,SEQUENCE(x))").unwrap(); // wants B1:B5
+    }
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Spill),
+        "a LET-body spill blocked by an occupied target → #SPILL!"
+    );
+}
+
+// --- FU3 LOUD boundaries (DEFERRED to FU4) — these stay #CALC!, no spill ----
+
+#[test]
+fn fu3_let_array_local_arithmetic_is_calc_in_production() {
+    // Array arithmetic on a local stays #CALC! even on the production path (eval_binary has
+    // no array broadcast — the engine-wide ceiling; folds into FU4).
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),s*2)", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Calc)
+    );
+    assert_eq!(wb.spill_anchor_at(0, 0, 1).copied(), None, "must NOT spill");
+}
+
+#[test]
+fn fu3_let_array_local_as_sum_arg_is_calc_in_production() {
+    // An array local as a function arg stays #CALC! (array-as-arbitrary-arg works nowhere
+    // in v1; folds into FU4).
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),SUM(s))", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Calc)
+    );
+    assert_eq!(wb.spill_anchor_at(0, 0, 1).copied(), None, "must NOT spill");
+}
+
+#[test]
+fn fu3_let_range_bound_local_is_rejected_at_bind() {
+    // A LET value that is a bare range (=LET(s,A1:C1,s)) binds in BindContext::Scalar, which
+    // rejects a bare range literal → the whole LET fails to bind (loud, No-Fallbacks).
+    // Range-bound array locals fold into FU4 (need a range-capable bind context + array-as-arg).
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+    let result = rt.set_formula(0, 0, 1, "LET(s,A1:C1,s)");
+    assert!(
+        result.is_err(),
+        "a bare-range LET value must be rejected at bind time (BindContext::Scalar); got {result:?}"
     );
 }

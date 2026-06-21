@@ -433,4 +433,52 @@ mod tests {
         // Named range survived too.
         assert!(loaded.names().lookup_ci("MYROW").is_some());
     }
+
+    /// **FU3 (2026-06-21)** — a LET-body array result that spills must survive
+    /// save → load → recompute with full fidelity (anchor formula text + spill
+    /// shape + formula-less targets), exactly like a direct `SEQUENCE` spill.
+    #[test]
+    fn let_spill_formula_save_load_round_trip() {
+        let (_dir, path) = temp_path("let-spill-roundtrip.qbook");
+
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(s, 0, 0, "LET(x,4,SEQUENCE(x))").unwrap();
+        }
+        // Pre-save: 4×1 spill at A1:A4, formula only on the anchor.
+        assert_eq!(
+            wb.spill_anchor_at(s, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(4, 1))
+        );
+        assert_eq!(wb.read(Address::new(s, 3, 0)), Value::Number(4.0));
+
+        save_workbook(&wb, "let-spill-roundtrip", &path).unwrap();
+
+        let (loaded, result) = load_workbook_and_recompute(&path, &reg).unwrap();
+        assert!(result.is_complete(), "recompute failures: {result:?}");
+
+        assert_eq!(
+            loaded.spill_anchor_at(s, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(4, 1)),
+            "LET-body spill anchor must be re-registered on load"
+        );
+        for i in 0..4 {
+            assert_eq!(
+                loaded.read(Address::new(s, i, 0)),
+                Value::Number((i + 1) as f64)
+            );
+        }
+        // The Wave P LET printer re-emits the formula canonicalized (identifiers
+        // upper-cased, a space after each comma); the round-trip preserves that
+        // normalized text with full fidelity (the input `LET(x,4,SEQUENCE(x))`).
+        assert_eq!(
+            loaded.formula_at(s, 0, 0).map(|t| t.as_ref()),
+            Some("LET(X, 4, SEQUENCE(X))")
+        );
+        // A spill TARGET carries no formula text (only the anchor does).
+        assert_eq!(loaded.formula_at(s, 1, 0), None);
+    }
 }

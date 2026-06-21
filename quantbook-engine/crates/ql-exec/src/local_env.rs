@@ -50,8 +50,10 @@ pub enum LocalBinding {
     Value(Value),
     /// An array value (`LET(s, SEQUENCE(3), ...)`). Used in scalar arithmetic
     /// context it surfaces `#CALC!` (no implicit intersection in v1, per the
-    /// array-formula design § 6.3); as a cell-root result it spills. Constructed
-    /// by the array-aware binding path in `eval_at_cell_boundary`.
+    /// array-formula design § 6.3); as a cell-root result it spills. **FU3
+    /// (2026-06-21):** constructed by the array-aware `_` arm of `eval_binding`
+    /// (`scalar.rs`) for an array-capable value plan, and lifted to
+    /// `EvalResult::Array` by `eval_at_cell_boundary`'s `Let` / `CallLambda` arms.
     Array(ArrayValue),
     /// A LAMBDA closure (`LET(f, LAMBDA(n, n+1), f(5))`). A callable used as a
     /// value rather than invoked surfaces `#CALC!`.

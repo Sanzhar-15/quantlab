@@ -784,11 +784,11 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
 /// **Wave P (2026-06-20):** invoke a callable, returning a [`LocalBinding`] so a
 /// lambda that RETURNS a lambda (currying: `LAMBDA(x,LAMBDA(y,x+y))(5)(3)` → 8)
 /// preserves callable identity through the call. Resolves `callee` to a closure
-/// (an error callee propagates; a non-callable callee → `#VALUE!`), checks exact
-/// arity (`#VALUE!`), guards recursion depth (`#NUM!`), binds the args
-/// (evaluated at the CALL site, with their kinds preserved for self-application)
-/// into the closure's CAPTURED env (snapshot), and evaluates the body via
-/// `eval_binding` under a depth-incremented scope.
+/// (an error callee propagates; an ARRAY callee → `#CALC!`; any other non-callable
+/// callee → `#VALUE!`), checks exact arity (`#VALUE!`), guards recursion depth
+/// (`#NUM!`), binds the args (evaluated at the CALL site, with their kinds preserved
+/// for self-application) into the closure's CAPTURED env (snapshot), and evaluates
+/// the body via `eval_binding` under a depth-incremented scope.
 fn invoke_lambda<E: CellEnv>(
     callee: &ExprPlan,
     args: &[ExprPlan],
@@ -799,6 +799,16 @@ fn invoke_lambda<E: CellEnv>(
     let closure = match eval_binding(callee, env, registry, cache) {
         LocalBinding::Callable(c) => c,
         LocalBinding::Value(Value::Error(e)) => return LocalBinding::Value(Value::Error(e)),
+        // **FU3 (2026-06-21) — megaudit (Codex HIGH):** an ARRAY callee
+        // (`=LET(s,SEQUENCE(3),s(1))`, or an array passed as a lambda param then
+        // invoked, `=LAMBDA(f,f(1))(SEQUENCE(3))`) surfaces `#CALC!`, NOT `#VALUE!`.
+        // FU3 makes `eval_binding` return `LocalBinding::Array` where it previously
+        // returned `Value(#CALC!)`; mapping the array callee back to `#CALC!` here
+        // preserves the pre-FU3 scalar-context result EXACTLY — an array in any
+        // scalar position (incl. the callee position) is `#CALC!`. Without this arm
+        // the array would fall to the generic non-callable `_ => #VALUE!` below and
+        // SILENTLY change a scalar-context outcome (the cardinal soundness rule).
+        LocalBinding::Array(_) => return LocalBinding::Value(Value::Error(ErrorValue::Calc)),
         _ => return LocalBinding::Value(Value::Error(ErrorValue::Value)),
     };
     if args.len() != closure.params.len() {
@@ -860,9 +870,18 @@ fn eval_let_bindings<E: CellEnv>(
 /// `LocalRef` to an existing local re-binds that local's kind (so a lambda
 /// passed as an argument — `g(g, n)` self-application — stays callable); a `LET`
 /// whose body returns a lambda preserves that callable (Wave P follow-up 2,
-/// currying through a LET); every other plan is a scalar `Value`. Array-valued
-/// bindings are a documented fast-follow (they fall through to a scalar `#CALC!`
-/// here for now).
+/// currying through a LET); every other plan is a scalar `Value`. **FU3
+/// (2026-06-21):** an array-CAPABLE value plan (`ExprPlan::Array`, a Unified-tier
+/// or UDF `Function` that returns `FunctionReturn::Array`) now becomes a
+/// `LocalBinding::Array` (materialized once via `eval_at_cell_boundary`), so a LET
+/// body / lambda result that is an array can spill at the cell boundary. This is
+/// invisible in scalar context — every sub-expression consumer of an `Array`
+/// binding still surfaces `#CALC!` (`LocalRef`/`CallLambda` arms above; an array
+/// CALLEE is `#CALC!` via `invoke_lambda`); it only enables the boundary
+/// `Let`/`CallLambda` spill arms. NOTE the array only spills when it is the DIRECT
+/// body/result: an array local passed THROUGH a function arg
+/// (`=LET(s,SEQUENCE(3),TRANSPOSE(s))` / `SUM(s)`) still materializes to `#CALC!`
+/// at the `LocalRef` arg (array-as-arbitrary-arg is deferred to FU4).
 fn eval_binding<E: CellEnv>(
     plan: &ExprPlan,
     env: &E,
@@ -902,7 +921,43 @@ fn eval_binding<E: CellEnv>(
             };
             eval_binding(body, &scoped, registry, cache)
         }
-        _ => LocalBinding::Value(eval_scalar_with_cache(plan, env, registry, cache)),
+        // **Wave P follow-up 3 (FU3, 2026-06-21):** an array-CAPABLE plan in a
+        // binding position is materialized into a `LocalBinding::Array` (finally
+        // constructing the variant `local_env.rs` defined for this purpose) so a
+        // LET body / lambda result that is an array can SPILL at the cell boundary
+        // (`eval_at_cell_boundary`'s new `Let` / `CallLambda` arms). Only the three
+        // kinds that can produce `FunctionReturn::Array` / an array literal are
+        // routed — `ExprPlan::Array`, a Unified-tier `Function`, and a UDF
+        // `Function` — and each is materialized EXACTLY ONCE via the boundary entry
+        // point (no eval-scalar-then-re-eval: that would re-fire volatiles / UDFs,
+        // a No-Fallbacks violation). Every OTHER plan (incl. ROW/COLUMN, which are
+        // ReferenceAware and keep their scalar-context top-left semantics) stays on
+        // `eval_scalar_with_cache` exactly as before — so this changes NO
+        // scalar-context outcome (an `Array` binding still maps to `#CALC!` at every
+        // sub-expression consumer, `LocalRef` :755 / `CallLambda` :776), it only
+        // ENABLES the boundary spill. The guard matches on plan variant first, so
+        // the hot scalar bindings (`Number` / `CellRef` / `Binary`) take the cheap
+        // `false` branch with no extra registry lookup.
+        _ => {
+            let array_capable = match plan {
+                ExprPlan::Array(_) => true,
+                ExprPlan::Function { name, .. } => {
+                    matches!(
+                        registry.lookup_any(name),
+                        Some(ql_functions::RegisteredFn::Unified(_))
+                    ) || registry.udf_handle(name).is_some()
+                }
+                _ => false,
+            };
+            if array_capable {
+                match eval_at_cell_boundary(plan, env, registry, cache) {
+                    EvalResult::Scalar(v) => LocalBinding::Value(v),
+                    EvalResult::Array(a) => LocalBinding::Array(a),
+                }
+            } else {
+                LocalBinding::Value(eval_scalar_with_cache(plan, env, registry, cache))
+            }
+        }
     }
 }
 
@@ -1375,6 +1430,39 @@ pub fn eval_at_cell_boundary<E: CellEnv>(
                     ql_functions::FunctionReturn::Array(a) => EvalResult::Array(a),
                 },
                 Err(ev) => EvalResult::Scalar(Value::Error(ev)),
+            }
+        }
+        // **Wave P follow-up 3 (FU3, 2026-06-21):** a top-level LET whose BODY is an
+        // array (`=LET(x,5,SEQUENCE(x))`, `=LET(s,SEQUENCE(3),s)`) spills, instead of
+        // collapsing to `#CALC!` via the scalar `_` arm below. The bindings are
+        // evaluated array-aware (`eval_binding` now constructs `LocalBinding::Array`),
+        // and the body is routed back through `eval_binding` so a nested-LET / curried
+        // array result propagates; the resulting binding is lifted into `EvalResult`.
+        // A CALLABLE body (an uninvoked lambda) stays `#CALC!` — "a lambda is not a
+        // value" (the Wave P boundary, preserved).
+        ExprPlan::Let { bindings, body } => {
+            let locals = eval_let_bindings(bindings, env, registry, cache);
+            let scoped = LocalScopedEnv {
+                inner: env,
+                locals,
+                depth: env.lambda_depth(),
+            };
+            match eval_binding(body, &scoped, registry, cache) {
+                LocalBinding::Value(v) => EvalResult::Scalar(v),
+                LocalBinding::Array(a) => EvalResult::Array(a),
+                LocalBinding::Callable(_) => EvalResult::Scalar(Value::Error(ErrorValue::Calc)),
+            }
+        }
+        // **Wave P follow-up 3 (FU3, 2026-06-21):** a top-level LAMBDA invocation whose
+        // RESULT is an array (`=LAMBDA(n,SEQUENCE(n))(3)`, `=LET(f,LAMBDA(x,SEQUENCE(x)),f(3))`)
+        // spills. `invoke_lambda` already returns a `LocalBinding`; lift it into
+        // `EvalResult` here. A returned-but-uninvoked lambda (currying that stops short)
+        // stays `#CALC!`, matching the scalar `CallLambda` arm.
+        ExprPlan::CallLambda { callee, args } => {
+            match invoke_lambda(callee, args, env, registry, cache) {
+                LocalBinding::Value(v) => EvalResult::Scalar(v),
+                LocalBinding::Array(a) => EvalResult::Array(a),
+                LocalBinding::Callable(_) => EvalResult::Scalar(Value::Error(ErrorValue::Calc)),
             }
         }
         _ => EvalResult::Scalar(eval_scalar_with_cache(plan, env, registry, cache)),
