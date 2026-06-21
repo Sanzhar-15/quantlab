@@ -196,6 +196,32 @@ pub trait CellEnv {
     fn udf_op_deadline(&self) -> Option<Instant> {
         None
     }
+
+    /// **Wave P (2026-06-20):** the lexical local-binding scope (LET / LAMBDA)
+    /// active for the current sub-expression. Default is the EMPTY env — the
+    /// grid envs (`WorkbookEnv`, `MapEnv`, benches) carry no locals, so the
+    /// overwhelmingly common non-LET/LAMBDA eval path is byte-identical and
+    /// pays nothing. Only the eval-time `LocalScopedEnv` (built by the
+    /// `ExprPlan::Let` / `ExprPlan::CallLambda` arms in `scalar.rs`) overrides
+    /// this to thread a non-empty scope — which is how a `NameRef`-in-scope,
+    /// lowered to `ExprPlan::LocalRef`, resolves WITHOUT a new parameter on the
+    /// ~15 recursive `eval_scalar_with_cache` call sites (a missed thread there
+    /// would be a SILENT stale-binding bug; routing scope through the env makes
+    /// the compiler-checked delegation the single source of truth).
+    fn local_env(&self) -> &crate::local_env::LocalEnv {
+        static EMPTY: crate::local_env::LocalEnv = crate::local_env::LocalEnv::empty();
+        &EMPTY
+    }
+
+    /// **Wave P (2026-06-20):** the current LAMBDA invocation depth, for the
+    /// recursion guard. Default 0; only `LocalScopedEnv` (constructed at a
+    /// `CallLambda` invocation) bumps it. Evaluation errors loudly past
+    /// `MAX_LAMBDA_DEPTH` instead of overflowing the native stack — a closure
+    /// passed to itself (`g(g, n)`) with no terminating base case recurses
+    /// unboundedly (our `IF` is eager, so it cannot short-circuit one).
+    fn lambda_depth(&self) -> u32 {
+        0
+    }
 }
 
 /// `ql-storage::Workbook`-backed implementation. Wraps a Workbook reference; reads dispatch

@@ -46,7 +46,86 @@ use ql_types::{coercion, ArrayValue, ErrorValue, Value};
 use crate::aggregate_cache::{AggregateCache, NoAggregateCache};
 use crate::env::CellEnv;
 use crate::eval_result::EvalResult;
+use crate::local_env::{LocalBinding, LocalEnv};
 use crate::plan::ExprPlan;
+
+/// **Wave P (2026-06-20):** maximum LAMBDA invocation depth before evaluation
+/// fails loudly with `#NUM!`. Self-applied closures (`g(g, n)`) can recurse
+/// unboundedly — our `IF` is EAGER (a scalar-tier fn whose args are ALL
+/// pre-evaluated before dispatch), so a recursive lambda cannot short-circuit a
+/// base case and always runs to this guard. The guard must fire BEFORE the
+/// native stack overflows: each invocation level costs several frames of the
+/// (large) `eval_scalar_with_cache`, and a debug build's frames are far bigger
+/// than release. 64 keeps even a heavy IF-wrapped body well under a 2 MiB
+/// thread stack in debug (empirically verified: 256 SIGABRTs a heavy body in
+/// debug; 64 returns `#NUM!` cleanly). Real (non-runaway) LET/LAMBDA nesting is
+/// only a handful deep, so this is not a practical feature limit.
+const MAX_LAMBDA_DEPTH: u32 = 64;
+
+/// **Wave P (2026-06-20):** a `CellEnv` wrapper that threads a LET/LAMBDA
+/// lexical scope (and the LAMBDA recursion depth) through evaluation WITHOUT a
+/// new parameter on the ~15 recursive `eval_scalar_with_cache` call sites (a
+/// missed thread there would be a SILENT stale-binding bug).
+///
+/// Every grid operation delegates to the wrapped base env via `&dyn CellEnv`,
+/// so LET/LAMBDA nesting does NOT explode the monomorphized evaluator type —
+/// there is exactly ONE `LocalScopedEnv` type regardless of nesting depth (a
+/// nested scope wraps its parent as `&dyn CellEnv`), bounding the evaluator to
+/// two monomorphizations (the grid env + this). `local_env` / `lambda_depth`
+/// return the threaded scope; only the `ExprPlan::Let` / `ExprPlan::CallLambda`
+/// eval arms construct one. The common non-LET path never allocates it.
+struct LocalScopedEnv<'a> {
+    inner: &'a dyn CellEnv,
+    locals: LocalEnv,
+    depth: u32,
+}
+
+impl CellEnv for LocalScopedEnv<'_> {
+    fn read_cell(
+        &self,
+        sheet: ql_types::SheetId,
+        row: ql_types::RowId,
+        col: ql_types::ColId,
+    ) -> Value {
+        self.inner.read_cell(sheet, row, col)
+    }
+    fn read_range(&self, range: ql_types::Range) -> Vec<Value> {
+        self.inner.read_range(range)
+    }
+    fn read_range_with_shape(&self, range: ql_types::Range) -> (Vec<Value>, usize, usize) {
+        self.inner.read_range_with_shape(range)
+    }
+    fn is_row_hidden(&self, sheet: ql_types::SheetId, row: ql_types::RowId) -> bool {
+        self.inner.is_row_hidden(sheet, row)
+    }
+    fn sheet_has_hidden_rows(&self, sheet: ql_types::SheetId) -> bool {
+        self.inner.sheet_has_hidden_rows(sheet)
+    }
+    fn eval_context(&self) -> &ql_types::EvalContext {
+        self.inner.eval_context()
+    }
+    fn formula_cell_for_sref(&self) -> Option<ql_types::Address> {
+        self.inner.formula_cell_for_sref()
+    }
+    fn reference_query(&self) -> &dyn ql_functions::ReferenceQuery {
+        self.inner.reference_query()
+    }
+    fn udf_worker(&self) -> Option<&std::cell::RefCell<Box<dyn ql_udf::UdfWorker + Send>>> {
+        self.inner.udf_worker()
+    }
+    fn push_udf_diagnostic(&self, diag: crate::env::UdfCellDiagnostic) {
+        self.inner.push_udf_diagnostic(diag)
+    }
+    fn udf_op_deadline(&self) -> Option<Instant> {
+        self.inner.udf_op_deadline()
+    }
+    fn local_env(&self) -> &LocalEnv {
+        &self.locals
+    }
+    fn lambda_depth(&self) -> u32 {
+        self.depth
+    }
+}
 
 /// **6.4-3c (2026-05-29):** deadline bounding ONE blocking UDF call. The call
 /// runs inline on the synchronous recalc thread (Model A, design §1), so this is
@@ -164,6 +243,16 @@ pub fn eval_scalar<E: CellEnv>(plan: &ExprPlan, env: &E) -> Value {
         // precedent — callers needing actual semantics use
         // `eval_scalar_with_cache` which DOES narrow).
         ExprPlan::StructuredRef { .. } => Value::Error(ErrorValue::Calc),
+        // **Wave P (2026-06-20):** the no-registry / SIMD-fallback path cannot
+        // evaluate a LET/LAMBDA (it has no registry/cache for nested functions),
+        // and these variants never reach this path standalone (the binder only
+        // emits them inside a body the cache path evaluates). Surface `#CALC!` —
+        // a visible error, not a silent wrong value (matches the
+        // `AggregateNameRef` legacy-path precedent above).
+        ExprPlan::Let { .. }
+        | ExprPlan::LocalRef(_)
+        | ExprPlan::Lambda { .. }
+        | ExprPlan::CallLambda { .. } => Value::Error(ErrorValue::Calc),
     }
 }
 
@@ -635,6 +724,139 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
             Ok(_) => Value::Error(ErrorValue::Calc), // multi-cell in scalar context
             Err(ev) => Value::Error(ev),
         },
+        // **Wave P (2026-06-20):** LET — evaluate name/value bindings
+        // LEFT-TO-RIGHT, each in the lexical scope of the prior ones, then the
+        // body with the full scope. The scope rides in a `LocalScopedEnv`, so
+        // the recursive eval reaches a `LocalRef` without a threaded parameter.
+        // Scalar context: an array-valued binding/body surfaces `#CALC!` (the
+        // cell-boundary path, `eval_at_cell_boundary`, adds array/spill).
+        ExprPlan::Let { bindings, body } => {
+            let mut locals = env.local_env().clone();
+            let depth = env.lambda_depth();
+            for (name, value_plan) in bindings {
+                let scoped = LocalScopedEnv {
+                    inner: env,
+                    locals: locals.clone(),
+                    depth,
+                };
+                let binding = eval_binding(value_plan, &scoped, registry, cache);
+                locals = locals.with_binding(name.clone(), binding);
+            }
+            let scoped = LocalScopedEnv {
+                inner: env,
+                locals,
+                depth,
+            };
+            eval_scalar_with_cache(body, &scoped, registry, cache)
+        }
+        // **Wave P (2026-06-20):** a LET/LAMBDA local reference, resolved
+        // against the lexical scope carried by the env. The binder only emits
+        // `LocalRef` for an in-scope name, so a miss is defensive (`#NAME?`).
+        // An array- or callable-valued local in scalar context is `#CALC!` (no
+        // implicit intersection in v1; an uninvoked lambda is not a value).
+        ExprPlan::LocalRef(name) => {
+            let locals = env.local_env();
+            match locals.lookup(name) {
+                Some(LocalBinding::Value(v)) => v.clone(),
+                Some(LocalBinding::Array(_)) | Some(LocalBinding::Callable(_)) => {
+                    Value::Error(ErrorValue::Calc)
+                }
+                None => Value::Error(ErrorValue::Name),
+            }
+        }
+        // **Wave P (2026-06-20):** a LAMBDA literal in value/result position is an
+        // UNINVOKED callable → `#CALC!` (donor `lambda_value_requires_invocation`,
+        // `non_invoked_lambda_in_let_is_calc_error`). A lambda only does work when
+        // bound into the env (a LET binding, via `eval_binding`) or invoked
+        // (`CallLambda`).
+        ExprPlan::Lambda { .. } => Value::Error(ErrorValue::Calc),
+        // **Wave P (2026-06-20):** invoke a callable. `invoke_lambda` returns a
+        // `LocalBinding`; in scalar result position a `Value` passes through, an
+        // array → `#CALC!`, and a RETURNED-but-not-further-invoked lambda →
+        // `#CALC!` (an uninvoked callable). Currying — `LAMBDA(x,LAMBDA(y,x+y))(5)(3)`
+        // — works because the inner invocation is resolved through `eval_binding`
+        // (which preserves the returned closure) by the outer `Expr::Call`.
+        ExprPlan::CallLambda { callee, args } => {
+            match invoke_lambda(callee, args, env, registry, cache) {
+                LocalBinding::Value(v) => v,
+                LocalBinding::Array(_) | LocalBinding::Callable(_) => {
+                    Value::Error(ErrorValue::Calc)
+                }
+            }
+        }
+    }
+}
+
+/// **Wave P (2026-06-20):** invoke a callable, returning a [`LocalBinding`] so a
+/// lambda that RETURNS a lambda (currying: `LAMBDA(x,LAMBDA(y,x+y))(5)(3)` → 8)
+/// preserves callable identity through the call. Resolves `callee` to a closure
+/// (an error callee propagates; a non-callable callee → `#VALUE!`), checks exact
+/// arity (`#VALUE!`), guards recursion depth (`#NUM!`), binds the args
+/// (evaluated at the CALL site, with their kinds preserved for self-application)
+/// into the closure's CAPTURED env (snapshot), and evaluates the body via
+/// `eval_binding` under a depth-incremented scope.
+fn invoke_lambda<E: CellEnv>(
+    callee: &ExprPlan,
+    args: &[ExprPlan],
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> LocalBinding {
+    let closure = match eval_binding(callee, env, registry, cache) {
+        LocalBinding::Callable(c) => c,
+        LocalBinding::Value(Value::Error(e)) => return LocalBinding::Value(Value::Error(e)),
+        _ => return LocalBinding::Value(Value::Error(ErrorValue::Value)),
+    };
+    if args.len() != closure.params.len() {
+        return LocalBinding::Value(Value::Error(ErrorValue::Value));
+    }
+    let depth = env.lambda_depth();
+    if depth >= MAX_LAMBDA_DEPTH {
+        return LocalBinding::Value(Value::Error(ErrorValue::Num));
+    }
+    let mut invocation = closure.captured_env.clone();
+    for (param, arg_plan) in closure.params.iter().zip(args.iter()) {
+        let binding = eval_binding(arg_plan, env, registry, cache);
+        invocation = invocation.with_binding(param.clone(), binding);
+    }
+    let scoped = LocalScopedEnv {
+        inner: env,
+        locals: invocation,
+        depth: depth + 1,
+    };
+    eval_binding(&closure.body, &scoped, registry, cache)
+}
+
+/// **Wave P (2026-06-20):** evaluate a LET binding value / LAMBDA call argument
+/// into a [`LocalBinding`], PRESERVING its kind (scalar / callable). A `LAMBDA`
+/// literal becomes a `Callable` closure capturing the current lexical env; a
+/// `LocalRef` to an existing local re-binds that local's kind (so a lambda
+/// passed as an argument — `g(g, n)` self-application — stays callable); every
+/// other plan is a scalar `Value`. Array-valued bindings are a documented
+/// fast-follow (they fall through to a scalar `#CALC!` here for now).
+fn eval_binding<E: CellEnv>(
+    plan: &ExprPlan,
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> LocalBinding {
+    match plan {
+        ExprPlan::Lambda { params, body } => {
+            LocalBinding::Callable(std::sync::Arc::new(crate::local_env::LambdaClosure {
+                params: params.clone(),
+                body: std::sync::Arc::clone(body),
+                captured_env: env.local_env().clone(),
+            }))
+        }
+        ExprPlan::LocalRef(name) => match env.local_env().lookup(name) {
+            Some(b) => b.clone(),
+            None => LocalBinding::Value(Value::Error(ErrorValue::Name)),
+        },
+        // **Wave P (2026-06-20):** an invocation whose RESULT may itself be a
+        // callable (currying) — resolve it through `invoke_lambda` so the
+        // returned closure is preserved rather than scalarized to `#CALC!`.
+        ExprPlan::CallLambda { callee, args } => invoke_lambda(callee, args, env, registry, cache),
+        _ => LocalBinding::Value(eval_scalar_with_cache(plan, env, registry, cache)),
     }
 }
 
@@ -809,7 +1031,13 @@ fn materialize_ref_arg_lazy(plan: &ExprPlan) -> ql_functions::RefArg {
         | ExprPlan::String(_)
         | ExprPlan::Array(_)
         | ExprPlan::Binary { .. }
-        | ExprPlan::Unary { .. } => PlanKind::Literal,
+        | ExprPlan::Unary { .. }
+        // **Wave P (2026-06-20):** a LET result / local value / lambda is a
+        // computed value or callable, not a reference — ISREF over it is FALSE.
+        | ExprPlan::Let { .. }
+        | ExprPlan::LocalRef(_)
+        | ExprPlan::Lambda { .. }
+        | ExprPlan::CallLambda { .. } => PlanKind::Literal,
         ExprPlan::Error(_) => PlanKind::Error,
     };
     RefArg::Shape(kind)

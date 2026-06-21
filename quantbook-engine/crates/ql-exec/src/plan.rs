@@ -179,6 +179,57 @@ pub enum ExprPlan {
         /// that requires cell-time row narrowing.
         is_this_row: bool,
     },
+
+    /// **Wave P (2026-06-20):** a `LET(name, value, …, body)` special form.
+    /// Recognized by the binder — NOT a registry function. Each binding's
+    /// value-plan is bound left-to-right with the PRIOR names already in
+    /// lexical scope (so later values can reference earlier ones); `body` is
+    /// bound with all names in scope. A reference to a bound name lowers to
+    /// [`ExprPlan::LocalRef`]. Names are canonical uppercase (case-insensitive).
+    /// Cell/range deps inside the binding values AND the body are extracted by
+    /// `walk_plan_for_deps` (it descends both), so editing a referenced cell
+    /// re-dirties the formula — the #1 correctness contract for this variant.
+    Let {
+        /// `(canonical_uppercase_name, value_plan)` pairs, in source order.
+        bindings: Vec<(Arc<str>, ExprPlan)>,
+        /// The final calculation, evaluated with every binding in scope.
+        body: Box<ExprPlan>,
+    },
+
+    /// **Wave P (2026-06-20):** a reference to a LET/LAMBDA local name, resolved
+    /// at eval time against the [`crate::local_env::LocalEnv`] lexical scope —
+    /// never the workbook NameTable. Carries NO grid dependency. The binder
+    /// only emits this for a name currently in lexical scope; an out-of-scope
+    /// bare name routes to the existing NameTable / `UnresolvedName` (`#NAME?`)
+    /// path unchanged.
+    LocalRef(Arc<str>),
+
+    /// **Wave P (2026-06-20):** a `LAMBDA(p1, …, body)` special form, recognized
+    /// by the binder. The body is bound with the params in lexical scope (a param
+    /// reference lowers to [`ExprPlan::LocalRef`]). At eval it produces a
+    /// [`crate::local_env::LambdaClosure`] capturing the current lexical
+    /// environment — NOT a stored `Value`. Params are canonical uppercase and
+    /// unique (duplicates → `#VALUE!`). An uninvoked lambda reaching a
+    /// cell/result position → `#CALC!`.
+    Lambda {
+        /// Parameter names, canonical uppercase, in declaration order.
+        params: Vec<Arc<str>>,
+        /// The body plan (shared into the runtime closure via `Arc`).
+        body: Arc<ExprPlan>,
+    },
+
+    /// **Wave P (2026-06-20):** invocation of a callable — an immediate
+    /// `LAMBDA(..)(args)` (from `Expr::Call`), a LET-bound `f(args)` (a
+    /// `Function` whose name is in lexical scope), or a chained call. `callee`
+    /// must evaluate to a `LambdaClosure`; arity must match EXACTLY (else
+    /// `#VALUE!`). Eval clones the closure's captured env, binds args to params,
+    /// and evaluates the body under a recursion-depth-guarded scope.
+    CallLambda {
+        /// The expression yielding the closure to invoke.
+        callee: Box<ExprPlan>,
+        /// The invocation arguments.
+        args: Vec<ExprPlan>,
+    },
 }
 
 /// Error during binding. Phase 2A.1 added `UnresolvedName`; Phase 2A.6 added
@@ -620,6 +671,7 @@ pub fn bind_with_site<L: NameLookup>(
         tables,
         registry,
         BindContext::Scalar,
+        &[], // Wave P: cell root — no LET/LAMBDA locals in scope.
     )
 }
 
@@ -655,9 +707,11 @@ fn bind_with_context<L: NameLookup>(
         &EmptyTableLookup,
         registry,
         ctx,
+        &[], // Wave P: cell root — no LET/LAMBDA locals in scope.
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind_with_context_v2<L: NameLookup>(
     expr: &Expr,
     site: BindSite,
@@ -666,6 +720,11 @@ fn bind_with_context_v2<L: NameLookup>(
     tables: &dyn TableLookup,
     registry: &FunctionRegistry,
     ctx: BindContext,
+    // **Wave P (2026-06-20):** in-scope LET/LAMBDA local names (canonical
+    // uppercase). Empty (`&[]`) at the cell root — the common path. A
+    // `NameRef` whose name is in scope lowers to `ExprPlan::LocalRef`; LET
+    // declares names into a growing slice for left-to-right scoping.
+    scope: &[Arc<str>],
 ) -> Result<ExprPlan, BindError> {
     let owning_sheet = site.sheet;
     match expr {
@@ -692,6 +751,7 @@ fn bind_with_context_v2<L: NameLookup>(
                 tables,
                 registry,
                 BindContext::Scalar,
+                scope,
             )?),
             rhs: Box::new(bind_with_context_v2(
                 rhs,
@@ -701,6 +761,7 @@ fn bind_with_context_v2<L: NameLookup>(
                 tables,
                 registry,
                 BindContext::Scalar,
+                scope,
             )?),
         }),
         Expr::Unary { op, operand } => Ok(ExprPlan::Unary {
@@ -713,6 +774,7 @@ fn bind_with_context_v2<L: NameLookup>(
                 tables,
                 registry,
                 BindContext::Scalar,
+                scope,
             )?),
         }),
         Expr::RangeRef(rr) => {
@@ -752,6 +814,45 @@ fn bind_with_context_v2<L: NameLookup>(
             }
         }
         Expr::Function { name, args } => {
+            // **Wave P (2026-06-20):** LET is a binder-recognized SPECIAL FORM,
+            // not a registry function — it introduces lexical local names and
+            // its args are NOT eagerly bound under one context. Recognized
+            // FIRST, before the registry-tier arg-context classification below.
+            // (A user-defined name that happens to be "LET" cannot reach here:
+            // the parser only produces `Function{name:"LET"}` for `LET(...)`.)
+            if name.as_ref() == "LET" {
+                return bind_let(args, site, names, sheets, tables, registry, scope);
+            }
+            // **Wave P (2026-06-20):** LAMBDA special form — binds its body with
+            // the params in lexical scope; produces a closure at eval.
+            if name.as_ref() == "LAMBDA" {
+                return bind_lambda(args, site, names, sheets, tables, registry, scope);
+            }
+            // **Wave P (2026-06-20):** a call whose NAME is a lexical local is an
+            // invocation of a LET/LAMBDA-bound lambda: `f(args)` → `CallLambda`.
+            // Args bind as ordinary scalar sub-expressions in the current scope.
+            // (A local that is not actually callable surfaces `#VALUE!` at eval.)
+            // Checked AFTER LET/LAMBDA but BEFORE the builtin registry, so a
+            // local shadows a same-named builtin when CALLED (Excel semantics).
+            if scope.iter().any(|n| n.as_ref() == name.as_ref()) {
+                let mut bound_args = Vec::with_capacity(args.len());
+                for a in args {
+                    bound_args.push(bind_with_context_v2(
+                        a,
+                        site,
+                        names,
+                        sheets,
+                        tables,
+                        registry,
+                        BindContext::Scalar,
+                        scope,
+                    )?);
+                }
+                return Ok(ExprPlan::CallLambda {
+                    callee: Box::new(ExprPlan::LocalRef(name.clone())),
+                    args: bound_args,
+                });
+            }
             // **W5-RT-1 (RT-V1-01):** reference-aware fns take args under
             // `ReferenceArg` context (literal RangeRef + range NameRef both
             // accepted; CellRef passes through). Aggregate/range-aware/
@@ -767,7 +868,7 @@ fn bind_with_context_v2<L: NameLookup>(
             let mut bound_args = Vec::with_capacity(args.len());
             for a in args {
                 bound_args.push(bind_with_context_v2(
-                    a, site, names, sheets, tables, registry, arg_ctx,
+                    a, site, names, sheets, tables, registry, arg_ctx, scope,
                 )?);
             }
             Ok(ExprPlan::Function {
@@ -848,6 +949,16 @@ fn bind_with_context_v2<L: NameLookup>(
                 !name.is_empty(),
                 "bind_with_context: Expr::NameRef carries an empty string — parser invariant violated"
             );
+            // **Wave P (2026-06-20):** a name currently in LET/LAMBDA lexical
+            // scope resolves to a local binding at eval time — NOT the workbook
+            // NameTable. Checked FIRST so a local shadows a workbook-defined
+            // name of the same spelling (Excel/donor semantics: `LET(x,1,x+1)`
+            // ignores a workbook name `x`). Names are canonical uppercase on
+            // both sides, so this is case-insensitive. Out-of-scope names fall
+            // through to the existing NameTable resolution below.
+            if scope.iter().any(|n| n.as_ref() == name.as_ref()) {
+                return Ok(ExprPlan::LocalRef(name.clone()));
+            }
             // Phase 2A.1: resolve the name via the active NameTable; Phase 2A.6
             // audit H2 uses case-insensitive lookup in the `NameTable` impl so
             // every entry point canonicalizes uniformly.
@@ -990,7 +1101,41 @@ fn bind_with_context_v2<L: NameLookup>(
             tables,
             registry,
             ctx,
+            scope,
         ),
+        // **Wave P (2026-06-20):** immediate invocation `LAMBDA(..)(args)`. Bind
+        // the callee (a `LAMBDA(...)` → `ExprPlan::Lambda`) and the args in the
+        // CURRENT scope (so the lambda body can close over enclosing locals),
+        // producing a `CallLambda`.
+        Expr::Call { callee, args } => {
+            let bound_callee = bind_with_context_v2(
+                callee,
+                site,
+                names,
+                sheets,
+                tables,
+                registry,
+                BindContext::Scalar,
+                scope,
+            )?;
+            let mut bound_args = Vec::with_capacity(args.len());
+            for a in args {
+                bound_args.push(bind_with_context_v2(
+                    a,
+                    site,
+                    names,
+                    sheets,
+                    tables,
+                    registry,
+                    BindContext::Scalar,
+                    scope,
+                )?);
+            }
+            Ok(ExprPlan::CallLambda {
+                callee: Box::new(bound_callee),
+                args: bound_args,
+            })
+        }
     }
 }
 
@@ -1007,6 +1152,7 @@ fn bind_implicit_intersection<L: NameLookup>(
     tables: &dyn TableLookup,
     registry: &FunctionRegistry,
     ctx: BindContext,
+    scope: &[Arc<str>],
 ) -> Result<ExprPlan, BindError> {
     match inner {
         // Rule 1 / 5: scalar inputs pass through unchanged. CellRef
@@ -1019,7 +1165,7 @@ fn bind_implicit_intersection<L: NameLookup>(
         | Expr::R1C1Ref { .. }
         | Expr::Unary { .. }
         | Expr::Binary { .. } => {
-            bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx)
+            bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx, scope)
         }
 
         // **FE-10.x (2026-06-14) — Rule 10: `@<name>` narrowing.** A `NameRef`
@@ -1057,7 +1203,7 @@ fn bind_implicit_intersection<L: NameLookup>(
                     inner: Box::new(narrowed),
                 })
             }
-            _ => bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx),
+            _ => bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx, scope),
         },
 
         // Rule 8: function inner. The `@` is semantically a no-op for
@@ -1066,7 +1212,7 @@ fn bind_implicit_intersection<L: NameLookup>(
         // 4.7.G limit; the design § 3.3 rule 7 "array → top-left" is
         // a known v1 gap (deferred to cell-boundary spill rewiring).
         Expr::Function { .. } => {
-            bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx)
+            bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx, scope)
         }
 
         // Rule 7: array literal → top-left.
@@ -1083,6 +1229,7 @@ fn bind_implicit_intersection<L: NameLookup>(
                 tables,
                 registry,
                 BindContext::Scalar,
+                scope,
             )
         }
 
@@ -1145,7 +1292,7 @@ fn bind_implicit_intersection<L: NameLookup>(
         // Nested `@@expr` — Excel-canon idempotent. Strip outer
         // wrapper; recurse on the inner ImplicitIntersection.
         Expr::ImplicitIntersection(_) => {
-            bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx)
+            bind_with_context_v2(inner, site, names, sheets, tables, registry, ctx, scope)
         }
 
         // Spill-range syntax (`A1#`) is reserved for a future Phase.
@@ -1157,7 +1304,166 @@ fn bind_implicit_intersection<L: NameLookup>(
              the design § 3.3 rule for `@A1#` is documented but the \
              eval-side spill-range expansion is deferred.",
         )),
+        // **Wave P (2026-06-20):** `@LAMBDA(..)(..)` — implicit intersection of a
+        // lambda invocation is not a v1 surface.
+        Expr::Call { .. } => Err(BindError::UnsupportedVariant(
+            "implicit intersection (@) of a LAMBDA invocation is unsupported in v1",
+        )),
     }
+}
+
+/// **Wave P (2026-06-20):** bind a `LET(name, value, …, body)` special form.
+///
+/// Excel / formualizer-donor semantics:
+/// - Requires name/value pairs followed by ONE final body expression: `>= 3`
+///   args and an ODD count. A malformed shape lowers to `ExprPlan::Error(#VALUE!)`
+///   (so the cell shows `#VALUE!` without a bind-time hard error — sibling cells
+///   still bind).
+/// - Each name MUST be a bare identifier. The parser lowers a bare token (`x`,
+///   `rate`, even a column-shaped `dx`) to `Expr::NameRef`; an A1-shaped token
+///   lowers to `Expr::CellRef`, a literal to its own variant — all rejected as
+///   `#VALUE!` (donor `let_rejects_non_identifier_name`: `LET(A1,2,A1)`).
+/// - Bindings evaluate LEFT-TO-RIGHT: value[i] is bound with names[0..i] in
+///   lexical scope, so a later value can reference an earlier name, and a
+///   reference to a not-yet-bound name falls through to the NameTable
+///   (`#NAME?` — donor `let_undefined_symbol_before_binding`).
+/// - Local names shadow workbook-defined names (the `NameRef` arm checks
+///   `scope` first). Names are canonical uppercase, so `x`/`X` are one local.
+/// - LET permits re-declaration (a later same-name binding shadows the earlier
+///   at eval, via [`crate::local_env::LocalEnv`]); LAMBDA params (Phase 2) must
+///   be unique.
+///
+/// **v1 limitation:** a LET value is bound in `BindContext::Scalar`, so a *bare*
+/// range literal value (`LET(s, A1:A3, SUM(s))`) is not supported (it surfaces
+/// the same "literal range in scalar context" error as elsewhere). A value that
+/// is a range-/array-*returning expression* (`SUM(A1:A2)`, `SEQUENCE(3)`) binds
+/// fine — those are Functions, classified in the `Expr::Function` arm.
+#[allow(clippy::too_many_arguments)]
+fn bind_let<L: NameLookup>(
+    args: &[Expr],
+    site: BindSite,
+    names: &L,
+    sheets: &dyn SheetResolver,
+    tables: &dyn TableLookup,
+    registry: &FunctionRegistry,
+    outer_scope: &[Arc<str>],
+) -> Result<ExprPlan, BindError> {
+    // `>= 3` and ODD → at least one (name, value) pair plus a final body.
+    if args.len() < 3 || args.len() % 2 == 0 {
+        return Ok(ExprPlan::Error(ErrorValue::Value));
+    }
+    let pair_count = (args.len() - 1) / 2;
+
+    // `in_scope` starts with the enclosing locals and GROWS as each name is
+    // declared — giving left-to-right scoping with a single allocation. The
+    // body sees the full set.
+    let mut in_scope: Vec<Arc<str>> = outer_scope.to_vec();
+    let mut bindings: Vec<(Arc<str>, ExprPlan)> = Vec::with_capacity(pair_count);
+
+    for i in 0..pair_count {
+        let name_expr = &args[2 * i];
+        let value_expr = &args[2 * i + 1];
+
+        let local_name = match name_expr {
+            Expr::NameRef(n) => n.clone(),
+            _ => return Ok(ExprPlan::Error(ErrorValue::Value)),
+        };
+
+        // Bind the value with the names declared SO FAR (left-to-right).
+        let value_plan = bind_with_context_v2(
+            value_expr,
+            site,
+            names,
+            sheets,
+            tables,
+            registry,
+            BindContext::Scalar,
+            &in_scope,
+        )?;
+
+        in_scope.push(local_name.clone());
+        bindings.push((local_name, value_plan));
+    }
+
+    // Bind the final body with ALL names in scope.
+    let body = bind_with_context_v2(
+        &args[args.len() - 1],
+        site,
+        names,
+        sheets,
+        tables,
+        registry,
+        BindContext::Scalar,
+        &in_scope,
+    )?;
+
+    Ok(ExprPlan::Let {
+        bindings,
+        body: Box::new(body),
+    })
+}
+
+/// **Wave P (2026-06-20):** bind a `LAMBDA(p1, …, body)` special form.
+///
+/// Excel / formualizer-donor semantics:
+/// - `>= 1` arg: the trailing arg is the BODY; all preceding args are parameter
+///   names. (`LAMBDA(x)` is a zero-param lambda whose body is `x` — `x` must be
+///   a name; with no params declared, a bare `x` resolves to the NameTable.)
+/// - Each parameter MUST be a bare identifier (`Expr::NameRef`); else `#VALUE!`.
+/// - Parameter names must be UNIQUE (case-insensitive); a duplicate → `#VALUE!`
+///   (donor `lambda_rejects_duplicate_params`: `LAMBDA(x,x,x+1)`).
+/// - The body is bound with the params (plus the enclosing locals) in scope, so
+///   a param or closed-over reference lowers to `ExprPlan::LocalRef`. A param
+///   MAY shadow an outer local of the same name (donor
+///   `lambda_param_shadows_outer_scope`).
+#[allow(clippy::too_many_arguments)]
+fn bind_lambda<L: NameLookup>(
+    args: &[Expr],
+    site: BindSite,
+    names: &L,
+    sheets: &dyn SheetResolver,
+    tables: &dyn TableLookup,
+    registry: &FunctionRegistry,
+    outer_scope: &[Arc<str>],
+) -> Result<ExprPlan, BindError> {
+    if args.is_empty() {
+        return Ok(ExprPlan::Error(ErrorValue::Value));
+    }
+    let param_count = args.len() - 1;
+    let mut params: Vec<Arc<str>> = Vec::with_capacity(param_count);
+
+    // The body sees the enclosing locals PLUS this lambda's params.
+    let mut in_scope: Vec<Arc<str>> = outer_scope.to_vec();
+
+    for p in &args[..param_count] {
+        let name = match p {
+            Expr::NameRef(n) => n.clone(),
+            _ => return Ok(ExprPlan::Error(ErrorValue::Value)),
+        };
+        // Params must be unique among THEMSELVES (names are canonical uppercase
+        // → case-insensitive). Shadowing an OUTER local is allowed.
+        if params.iter().any(|q| q.as_ref() == name.as_ref()) {
+            return Ok(ExprPlan::Error(ErrorValue::Value));
+        }
+        params.push(name.clone());
+        in_scope.push(name);
+    }
+
+    let body = bind_with_context_v2(
+        &args[param_count],
+        site,
+        names,
+        sheets,
+        tables,
+        registry,
+        BindContext::Scalar,
+        &in_scope,
+    )?;
+
+    Ok(ExprPlan::Lambda {
+        params,
+        body: Arc::new(body),
+    })
 }
 
 /// **W5-144 (Phase 4.9.H):** apply design § 3.3 rules 2-6 to a
@@ -1742,6 +2048,8 @@ fn variant_kind(e: &Expr) -> &'static str {
         Expr::R1C1Ref { .. } => "R1C1Ref",
         // **W5-143 (Phase 4.9.G):**
         Expr::ImplicitIntersection(_) => "ImplicitIntersection",
+        // **Wave P (2026-06-20):**
+        Expr::Call { .. } => "Call",
     }
 }
 

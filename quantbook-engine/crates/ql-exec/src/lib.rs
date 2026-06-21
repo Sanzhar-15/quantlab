@@ -111,6 +111,7 @@ pub mod calcgraph_session;
 pub mod env;
 pub mod eval_result;
 pub mod loader;
+pub mod local_env;
 pub mod lower;
 pub mod plan;
 pub mod plan_cache;

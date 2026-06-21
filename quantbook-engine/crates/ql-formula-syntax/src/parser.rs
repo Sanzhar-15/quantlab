@@ -190,6 +190,27 @@ impl Parser {
                 None => break,
             };
 
+            // **Wave P (2026-06-20):** postfix call — immediate LAMBDA
+            // invocation `LAMBDA(x,x+1)(41)` (and chained `f()()`). A `(`
+            // directly after a callable-SHAPED expression applies it. Restricted
+            // to `Function` / `Call` lhs so it does NOT reinterpret `(A1)(B1)` or
+            // other parenthesized forms as calls — only a `LAMBDA(...)` result
+            // (a Function) or a prior Call can be invoked. Bare `name(args)` is
+            // already a `Function` (built in `parse_prefix`), so this fires only
+            // for the result-of-an-expression call form. Calls bind tightest
+            // (postfix, no `min_bp` gate — like a maximally-high-bp operator).
+            if matches!(next, Token::LParen)
+                && matches!(lhs, Expr::Function { .. } | Expr::Call { .. })
+            {
+                self.advance(); // consume `(`
+                let args = self.parse_call_args()?;
+                lhs = Expr::Call {
+                    callee: Box::new(lhs),
+                    args,
+                };
+                continue;
+            }
+
             // Postfix `%` — bp 60, no rhs.
             if matches!(next, Token::Op(Operator::Percent)) {
                 if min_bp > 60 {
@@ -2196,7 +2217,11 @@ mod tests {
     fn fe10_colon_range_stays_wholecolumn() {
         // The colon form is ALWAYS a whole-column range (both endpoints), regardless
         // of whether the letters also name a range. This must NOT regress.
-        for (src, lo, hi) in [("A:A", 0u32, 0u32), ("A:C", 0, 2), ("OLD:OLD", 10455, 10455)] {
+        for (src, lo, hi) in [
+            ("A:A", 0u32, 0u32),
+            ("A:C", 0, 2),
+            ("OLD:OLD", 10455, 10455),
+        ] {
             let e = p(src);
             assert!(
                 matches!(
@@ -2217,7 +2242,11 @@ mod tests {
         assert!(
             matches!(
                 &e,
-                Expr::RangeRef(RangeRef::WholeColumn { start_col: 0, abs_start: true, .. })
+                Expr::RangeRef(RangeRef::WholeColumn {
+                    start_col: 0,
+                    abs_start: true,
+                    ..
+                })
             ),
             "FE-10: `$A` standalone stays WholeColumn (legacy), got {e:?}"
         );

@@ -718,6 +718,24 @@ fn print_expr_ctx(
             out.push(')');
             Ok(())
         }
+        // **Wave P (2026-06-20):** immediate invocation `LAMBDA(x,x+1)(41)`.
+        // Print the callee expression tightly (high min_bp so any non-atomic
+        // callee parenthesizes for a lossless round-trip — though today the
+        // callee is always a `Function`/`Call`), then the call argument list.
+        Expr::Call { callee, args } => {
+            let arg_sep = crate::locale::locale_data(ctx.locale).arg_separator;
+            print_expr_ctx(callee, ctx, out, 90)?;
+            out.push('(');
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push(arg_sep);
+                    out.push(' ');
+                }
+                print_expr_ctx(a, ctx, out, 0)?;
+            }
+            out.push(')');
+            Ok(())
+        }
         Expr::NameRef(name) => {
             out.push_str(name);
             Ok(())

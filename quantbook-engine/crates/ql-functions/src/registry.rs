@@ -359,9 +359,7 @@ impl FunctionRegistry {
             "FunctionRegistry::register_metadata: canonical_name must not be empty"
         );
         assert!(
-            meta.canonical_name
-                .bytes()
-                .all(|b| !b.is_ascii_lowercase()),
+            meta.canonical_name.bytes().all(|b| !b.is_ascii_lowercase()),
             "FunctionRegistry::register_metadata: canonical_name {:?} must be \
              canonical upper-case (caller must normalize before calling)",
             meta.canonical_name
@@ -1421,6 +1419,21 @@ fn register_builtin_metadata(r: &mut FunctionRegistry) {
         r.register_metadata(m)
             .expect("phase-1 dynamic override must not collide with prior phase-1 entry");
     }
+    // **Wave P (2026-06-20):** LET / LAMBDA are binder-recognized SPECIAL FORMS
+    // (not dispatch-tier functions), so they have NO `RegisteredFn` entry — but
+    // they MUST appear in the IDE function catalog (fed by `sorted_metadata`).
+    // Register metadata-only entries: Pure + Variadic + Scalar arg-context (the
+    // `pure_scalar` default — arg_context is moot since the binder special-cases
+    // them before consulting it; a LET/LAMBDA formula's actual volatility comes
+    // from `walk_plan_for_deps` descending its body, NOT this name's metadata).
+    // They are intentionally absent from `fns`, so the function COUNT and
+    // `coverage.rs` (which iterate `fns` / `names_all`) are unaffected, and the
+    // boot "every dispatch key has metadata" invariant still holds (it is a
+    // subset, not a bijection — metadata-only entries are explicitly allowed).
+    for name in ["LET", "LAMBDA"] {
+        r.register_metadata(pure_scalar(name))
+            .expect("Wave P LET/LAMBDA metadata-only entry must not collide");
+    }
     // Address-only reference fns: ROW / COLUMN / ROWS / COLUMNS. The
     // walker `walk_plan_for_address_only_deps` routes their args away
     // from value-deps.
@@ -2356,7 +2369,10 @@ mod tests {
                 Volatility::Dynamic,
                 "{name} must be Dynamic (workbook-structure sensitive)"
             );
-            assert!(!m.determinism, "{name} result depends on workbook structure");
+            assert!(
+                !m.determinism,
+                "{name} result depends on workbook structure"
+            );
         }
     }
 
@@ -2586,12 +2602,25 @@ mod tests {
     #[test]
     fn sorted_metadata_is_deterministic_across_calls() {
         let r = default_registry();
-        let first: Vec<&str> = r.sorted_metadata().iter().map(|m| m.canonical_name.as_str()).collect();
-        let second: Vec<&str> = r.sorted_metadata().iter().map(|m| m.canonical_name.as_str()).collect();
+        let first: Vec<&str> = r
+            .sorted_metadata()
+            .iter()
+            .map(|m| m.canonical_name.as_str())
+            .collect();
+        let second: Vec<&str> = r
+            .sorted_metadata()
+            .iter()
+            .map(|m| m.canonical_name.as_str())
+            .collect();
         assert_eq!(first, second, "sorted_metadata MUST be call-stable");
         // Strictly ascending.
         for w in first.windows(2) {
-            assert!(w[0] < w[1], "sorted_metadata violated ordering at {:?} -> {:?}", w[0], w[1]);
+            assert!(
+                w[0] < w[1],
+                "sorted_metadata violated ordering at {:?} -> {:?}",
+                w[0],
+                w[1]
+            );
         }
         // Covers every metadata entry — same len as iter_metadata.
         assert_eq!(first.len(), r.metadata_count());
@@ -2640,7 +2669,15 @@ mod tests {
     fn arg_context_overrides_match_pre_6_4_1_whitelists() {
         let r = default_registry();
         // Reference-aware (7 names — Phase 1 in `register_builtin_metadata`).
-        for name in ["ROW", "COLUMN", "ROWS", "COLUMNS", "ISREF", "ISFORMULA", "FORMULATEXT"] {
+        for name in [
+            "ROW",
+            "COLUMN",
+            "ROWS",
+            "COLUMNS",
+            "ISREF",
+            "ISFORMULA",
+            "FORMULATEXT",
+        ] {
             assert_eq!(
                 r.metadata(name).map(|m| m.arg_context),
                 Some(ArgContext::Reference),
@@ -2651,8 +2688,19 @@ mod tests {
         // Aggregate sample (covers scalar aggregates, range-aware, unified array,
         // financial, statistical, lookup, order stats — one from each subgroup).
         for name in [
-            "SUM", "AVERAGE", "VLOOKUP", "SUMIFS", "TRANSPOSE", "FILTER", "SUBTOTAL",
-            "CORREL", "XIRR", "XLOOKUP", "PERCENTILE.INC", "MINIFS", "TEXTJOIN",
+            "SUM",
+            "AVERAGE",
+            "VLOOKUP",
+            "SUMIFS",
+            "TRANSPOSE",
+            "FILTER",
+            "SUBTOTAL",
+            "CORREL",
+            "XIRR",
+            "XLOOKUP",
+            "PERCENTILE.INC",
+            "MINIFS",
+            "TEXTJOIN",
         ] {
             assert_eq!(
                 r.metadata(name).map(|m| m.arg_context),
@@ -2876,7 +2924,10 @@ mod tests {
     fn fn_gen_ticks_on_successful_register_and_unregister() {
         let mut r = default_registry();
         let initial = r.fn_generation();
-        assert!(initial > 0, "default_registry runs ~260+ register_metadata calls at boot");
+        assert!(
+            initial > 0,
+            "default_registry runs ~260+ register_metadata calls at boot"
+        );
 
         // Successful register bumps once.
         let meta = FunctionMetadata {
@@ -2894,11 +2945,19 @@ mod tests {
             provenance_tags: vec![],
         };
         r.register_metadata(meta).unwrap();
-        assert_eq!(r.fn_generation(), initial + 1, "register_metadata MUST bump fn_gen");
+        assert_eq!(
+            r.fn_generation(),
+            initial + 1,
+            "register_metadata MUST bump fn_gen"
+        );
 
         // Successful unregister bumps again.
         r.unregister_metadata("MYUDF1").unwrap();
-        assert_eq!(r.fn_generation(), initial + 2, "unregister_metadata MUST bump fn_gen");
+        assert_eq!(
+            r.fn_generation(),
+            initial + 2,
+            "unregister_metadata MUST bump fn_gen"
+        );
 
         // Failed register (Conflict) MUST NOT bump.
         let snapshot = r.fn_generation();
@@ -3066,7 +3125,11 @@ mod tests {
             provenance_tags: vec![],
         };
         r.register_metadata(meta).expect("metadata-only registers");
-        assert_eq!(r.udf_handle("MYUDF"), None, "metadata-only path leaves handle empty");
+        assert_eq!(
+            r.udf_handle("MYUDF"),
+            None,
+            "metadata-only path leaves handle empty"
+        );
 
         // Now register_udf with a colliding name → Conflict → handle MUST stay empty.
         let dup_meta = FunctionMetadata {

@@ -63,6 +63,31 @@ const EXPECTED_COVERED: &[&str] = &[
 /// phase. The matrix-coverage check is allowed to skip these, but the
 /// reason must remain accurate.
 const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
+    // -- Wave O (2026-06-20) dynamic-array functions: array-RETURNING (Unified
+    // tier), so the scalar coercion/per-function matrix doesn't apply. Their
+    // shape/sort/dedup/error behavior is pinned by the unit tests in
+    // `ql-functions/src/array_returning_fns.rs` (mod tests). (This decision was
+    // a latent gap from Wave O — the w102 gate ran `ql-exec --lib`, not this
+    // coverage test; closed here in Wave P while ql-functions was being touched.)
+    (
+        "SORT",
+        "array-returning; covered by array_returning_fns.rs unit tests",
+    ),
+    (
+        "SORTBY",
+        "array-returning; covered by array_returning_fns.rs unit tests",
+    ),
+    (
+        "UNIQUE",
+        "array-returning; covered by array_returning_fns.rs unit tests",
+    ),
+    (
+        "RANDARRAY",
+        "array-returning + volatile; covered by array_returning_fns.rs unit tests",
+    ),
+    // (LET / LAMBDA are binder special forms registered metadata-ONLY — not in
+    // the dispatch table `fns`, which is what `names_all()` enumerates — so they
+    // need no entry here; their semantics live in ql-exec/tests/let_lambda_e2e.rs.)
     // -- Phase 4.4.B follow-on: these are covered by ql-types type-pair
     // matrix (which exercises all 5 contexts × 9 input cases against the
     // central coercion module), so per-fn overrides aren't strictly needed

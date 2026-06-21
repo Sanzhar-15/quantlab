@@ -584,6 +584,54 @@ pub(crate) fn walk_plan_for_deps(
             deps.named_ranges.push((Arc::clone(table_name), *resolved));
             deps.tables.push(Arc::clone(table_name));
         }
+        // **Wave P (2026-06-20) — the #1 correctness contract for LET.** A
+        // `CellRef`/`RangeRef` inside a binding VALUE or the BODY must still
+        // register as a precedent, or editing it would leave the LET formula
+        // stale. Descend BOTH the binding values and the body. Local names
+        // themselves carry no grid dep (resolved in the LocalEnv at eval).
+        ExprPlan::Let { bindings, body } => {
+            for (_name, value_plan) in bindings {
+                walk_plan_for_deps(value_plan, deps, registry);
+            }
+            walk_plan_for_deps(body, deps, registry);
+        }
+        // **Wave P (2026-06-20):** a LET/LAMBDA local reference resolves against
+        // the lexical `LocalEnv`, not the grid — no precedent. (Any grid dep
+        // its bound value carries was already recorded when the binding value
+        // was walked in the enclosing `Let` arm.)
+        ExprPlan::LocalRef(_) => {}
+        // **Wave P (2026-06-20):** a LAMBDA body's cell/range refs are precedents
+        // of the formula — when the lambda is invoked (the common case), a
+        // `CellRef` inside the body must re-dirty the formula on edit. Params
+        // bind no dep.
+        //
+        // **CONSERVATIVE OVER-DEPENDENCY (Codex megaudit #2/#3 — known follow-up):**
+        // this walks the body even for a lambda that is NEVER invoked
+        // (`=LET(f,LAMBDA(x,A1),1)` registers A1 as a precedent though the result
+        // is just 1). There is no static way to know at graph-build time whether
+        // a given lambda will be invoked, so we register conservatively. Effects:
+        // (a) a NON-cyclic over-tracked cell triggers a harmless extra recompute
+        // — the value is always correct; (b) a self-/mutual-cyclic ref from an
+        // uninvoked body is conservatively flagged `#CIRC!` on a full
+        // `recompute_all` (the same conservative class as `=IF(FALSE,A1,1)` in
+        // A1 — LOUD, contrived trigger; see
+        // `uninvoked_lambda_self_ref_is_conservatively_circular` in
+        // `tests/let_lambda_recalc_contract.rs`); (c) a UDF named only inside an
+        // uninvoked lambda body is seen by `plan_references_udf`, so on a
+        // worker-less load a cached value may be preserved rather than
+        // recomputed (narrow — requires an already-stale cache). A precise
+        // invocation-aware dep walker (register lambda-body deps only for
+        // INVOKED lambdas) is the documented fix for all three.
+        ExprPlan::Lambda { body, .. } => {
+            walk_plan_for_deps(body, deps, registry);
+        }
+        // **Wave P (2026-06-20):** an invocation depends on its callee and args.
+        ExprPlan::CallLambda { callee, args } => {
+            walk_plan_for_deps(callee, deps, registry);
+            for a in args {
+                walk_plan_for_deps(a, deps, registry);
+            }
+        }
     }
 }
 

@@ -210,6 +210,17 @@ fn hash_expr(expr: &Expr, h: &mut impl Hasher) {
             13u8.hash(h);
             hash_expr(inner, h);
         }
+        // **Wave P (2026-06-20):** immediate LAMBDA invocation `LAMBDA(..)(args)`.
+        // Hash the callee expression + each arg + the explicit arg count (so
+        // `f(a)` and `f(a, b)` fingerprint differently).
+        Expr::Call { callee, args } => {
+            14u8.hash(h);
+            hash_expr(callee, h);
+            for arg in args {
+                hash_expr(arg, h);
+            }
+            args.len().hash(h);
+        }
     }
 }
 
@@ -609,6 +620,24 @@ mod tests {
                 "Error(#N/A)",
                 Expr::Error(ql_types::ErrorValue::NA),
                 0xAEB3_8EAB_0E1F_6828,
+            ),
+            // **Wave P (2026-06-20):** Expr::Call (tag 14) golden — pins the tag
+            // byte against a future variant renumbering that would silently
+            // change every `Call` fingerprint (Codex/Sonnet megaudit LOW). Shape:
+            // `F(1)(2)` = Call{callee: Call{Function "F" [1]}, args:[2]}.
+            (
+                "Call(Call(F,[1]),[2])",
+                Expr::Call {
+                    callee: Box::new(Expr::Call {
+                        callee: Box::new(Expr::Function {
+                            name: std::sync::Arc::from("F"),
+                            args: vec![num(1.0)],
+                        }),
+                        args: vec![num(2.0)],
+                    }),
+                    args: vec![num(3.0)],
+                },
+                0xCF17_2ED4_D10D_B3D0_u64,
             ),
         ];
         let mut mismatches = Vec::new();

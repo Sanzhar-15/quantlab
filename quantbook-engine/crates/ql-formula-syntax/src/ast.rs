@@ -144,6 +144,16 @@ pub enum Expr {
         table_name: Arc<str>,
         spec: TableSpecSubtree,
     },
+
+    /// **Wave P (2026-06-20):** immediate invocation of a callable expression —
+    /// `LAMBDA(x, x+1)(41)`. `callee` must evaluate to a LAMBDA closure (today
+    /// only a `LAMBDA(...)` Function or a chained `Call`); `args` are the
+    /// invocation arguments. A *named* call (`inc(41)` where `inc` is a LET
+    /// local) is NOT this variant — it parses as `Expr::Function` and the binder
+    /// lowers it to `ExprPlan::CallLambda` when the name is in lexical scope.
+    /// This variant exists ONLY for the result-of-an-expression call form, which
+    /// the parser cannot represent as `Function`.
+    Call { callee: Box<Expr>, args: Vec<Expr> },
 }
 
 /// **W5-112 (Phase 4.8.C):** a structured-reference spec (the parsed
@@ -310,6 +320,15 @@ pub fn rewrite_sheet_name_in_expr(expr: &Expr, old_canonical: &str, new_name: &A
                 .map(|a| rewrite_sheet_name_in_expr(a, old_canonical, new_name))
                 .collect(),
         },
+        // **Wave P (2026-06-20):** recurse into the callee + args of an
+        // immediate LAMBDA invocation so refs inside the lambda body/args rewrite.
+        Expr::Call { callee, args } => Expr::Call {
+            callee: Box::new(rewrite_sheet_name_in_expr(callee, old_canonical, new_name)),
+            args: args
+                .iter()
+                .map(|a| rewrite_sheet_name_in_expr(a, old_canonical, new_name))
+                .collect(),
+        },
         Expr::Array(rows) => Expr::Array(
             rows.iter()
                 .map(|row| {
@@ -378,6 +397,14 @@ pub fn rewrite_table_ref(expr: &Expr, old_canonical: &str, new_name: &Arc<str>) 
         },
         Expr::Function { name, args } => Expr::Function {
             name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rewrite_table_ref(a, old_canonical, new_name))
+                .collect(),
+        },
+        // **Wave P (2026-06-20):** recurse into an immediate LAMBDA invocation.
+        Expr::Call { callee, args } => Expr::Call {
+            callee: Box::new(rewrite_table_ref(callee, old_canonical, new_name)),
             args: args
                 .iter()
                 .map(|a| rewrite_table_ref(a, old_canonical, new_name))
@@ -480,6 +507,19 @@ pub fn rewrite_column_ref(
         },
         Expr::Function { name, args } => Expr::Function {
             name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rewrite_column_ref(a, table_canonical_upper, old_col, new_col))
+                .collect(),
+        },
+        // **Wave P (2026-06-20):** recurse into an immediate LAMBDA invocation.
+        Expr::Call { callee, args } => Expr::Call {
+            callee: Box::new(rewrite_column_ref(
+                callee,
+                table_canonical_upper,
+                old_col,
+                new_col,
+            )),
             args: args
                 .iter()
                 .map(|a| rewrite_column_ref(a, table_canonical_upper, old_col, new_col))
@@ -884,6 +924,16 @@ pub fn shift_cell_refs(expr: &Expr, axis: ShiftAxis, op: ShiftOp, scope: ShiftSc
         },
         Expr::Function { name, args } => Expr::Function {
             name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| shift_cell_refs(a, axis, op, scope))
+                .collect(),
+        },
+        // **Wave P (2026-06-20):** the silent-correctness site — cell refs inside
+        // an immediately-invoked lambda body/args MUST shift on row/col insert or
+        // delete, or they would go stale. Recurse into both callee and args.
+        Expr::Call { callee, args } => Expr::Call {
+            callee: Box::new(shift_cell_refs(callee, axis, op, scope)),
             args: args
                 .iter()
                 .map(|a| shift_cell_refs(a, axis, op, scope))
