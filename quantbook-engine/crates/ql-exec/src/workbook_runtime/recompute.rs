@@ -36,12 +36,23 @@ use crate::plan_cache::PlanCacheKey;
 use super::{RecomputeFailure, RecomputeResult, RuntimeError, WorkbookRuntime};
 
 /// **6.4-3d (2026-05-29; megaudit blocker D2):** does the bound plan directly
-/// call any registered UDF? Reuses the exhaustive dependency walker, so it
-/// covers every `ExprPlan` shape and nested calls — and, matching dispatch
-/// semantics, does NOT descend ISREF's lazy-shape arg (which never reaches the
-/// worker). It therefore answers precisely "would a UDF actually dispatch when
-/// this cell recomputes." Used to PRESERVE a saved UDF-cell value when no worker
-/// is configured (the recompute would otherwise overwrite it with `#CALC!`).
+/// call any registered UDF? Reuses the dependency walker, so it covers every
+/// `ExprPlan` shape and nested calls — and, matching dispatch semantics, does NOT
+/// descend ISREF's lazy-shape arg (which never reaches the worker). Used to PRESERVE
+/// a saved UDF-cell value when no worker is configured (the recompute would otherwise
+/// overwrite it with `#CALC!`).
+///
+/// **FU-NEXT (2026-06-21):** the walker now also excludes NEVER-INVOKED lambda bodies
+/// (`walk_plan_for_deps` gates them on `invoked_lambda_bodies`), so a UDF named only
+/// inside a dead lambda is no longer reported — closing the over-preservation slices
+/// Wave-P-follow-up-1 left. It is a SOUND over-approximation of dispatch, so it never
+/// UNDER-reports (a UDF that would dispatch is always reported → never recomputes a
+/// real UDF cell to `#CALC!` over a valid saved value). A narrow CLASS of contrived
+/// over-reports remains (all strictly NARROWER than the pre-FU-NEXT walk-everything
+/// behavior, all on the "reopen with a worker to refresh" safe side): a captured-then-
+/// rebound lambda merged by name (context-insensitivity), and the args of a
+/// non-callable / wrong-arity `CallLambda` (walked though eval skips them). See
+/// `invoked_lambda_bodies`' residual note.
 fn plan_references_udf(plan: &ExprPlan, registry: &ql_functions::FunctionRegistry) -> bool {
     let mut deps = crate::calcgraph_session::FormulaDeps::default();
     crate::calcgraph_session::walk_plan_for_deps(plan, &mut deps, registry);

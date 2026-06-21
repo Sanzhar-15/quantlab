@@ -271,20 +271,25 @@ pub(crate) fn is_address_only_reference_fn(registry: &FunctionRegistry, name: &s
 }
 
 /// **6.4-1 (2026-05-28; I1):** registry-driven check for the LazyShape
-/// dep contract — ISREF today, any future UDF declaring
-/// `DepShape::LazyShape` tomorrow. LazyShape semantics: the function
-/// inspects the syntactic shape of its arg via `materialize_ref_arg_lazy`
-/// without ever evaluating it, so the walker MUST skip arg walking
-/// entirely (no value-deps, no volatility propagation, no nested-function
-/// recording).
+/// dep contract. LazyShape semantics: the function inspects the syntactic
+/// shape of its arg via `materialize_ref_arg_lazy` without ever evaluating
+/// it, so the walker skips arg walking entirely (no value-deps, no
+/// volatility propagation, no nested-function recording).
 ///
-/// Pre-6.4-1 the walker carried a hardcoded `name.as_ref() == "ISREF"`
-/// short-circuit in its `Function` arm; the I1 closure moves that decision
-/// to metadata so user-supplied UDFs participate uniformly. The walker's
-/// routing is now:
-/// 1. LazyShape → skip all arg walking.
-/// 2. AddressOnly → walk_plan_for_address_only_deps.
-/// 3. Otherwise → walk_plan_for_deps.
+/// **This predicate reports the metadata only.** ISREF (a builtin) is the
+/// sole LazyShape function today.
+///
+/// **Codex FU-NEXT re-audit #3 Finding 1:** the *walker* no longer skips a
+/// LazyShape arg on metadata ALONE — it ALSO requires
+/// `registry.udf_handle(name).is_none()` (builtin). A pre-6.4-1 note here
+/// claimed "user-supplied UDFs participate uniformly" in skip-all, but a
+/// LazyShape *UDF* is EAGER-dispatched (its worker marshals/evaluates
+/// args), so skipping its args would drop real precedents (a silent stale
+/// — `=MYLAZY(A1)`). A LazyShape UDF therefore routes through the normal
+/// value-dep walk. The walker's routing is now:
+/// 1. LazyShape *builtin* → skip all arg walking.
+/// 2. AddressOnly *builtin* → walk_plan_for_address_only_deps.
+/// 3. Otherwise (incl. ALL UDFs) → walk_plan_for_deps.
 ///
 /// Unknown name returns `false` — the conservative routing falls through
 /// to the normal walker, matching pre-6.4-1's `false` default.
@@ -398,57 +403,378 @@ impl FormulaDeps {
     }
 }
 
-/// **Wave P follow-up 1 (2026-06-20) — dead-local-binding liveness scan.** Returns
-/// `true` iff `plan` contains a `LocalRef(name)` anywhere in its subtree. The
-/// `ExprPlan::Let` arm of [`walk_plan_for_deps`] uses it to decide whether a
-/// LAMBDA-valued local binding is *live* (its name is referenced downstream → its
-/// body must be walked for precedents) or *dead* (never referenced → safe to skip,
-/// killing the spurious `#CIRC!` over-dependency + the stale-UDF edge).
-///
-/// **Name-keyed and conservative.** Matching is by NAME, not by binding identity,
-/// so a reused / shadowed name counts every occurrence as live — a safe residual
-/// over-dependency, never a missed dependency. Completeness is the ENTIRE safety
-/// margin against a silent stale value: a reference reaches a lambda binding's body
-/// at eval only through a chain of `LocalRef(name)` nodes, so this scan MUST descend
-/// EVERY composite variant that can hold one. Missing a branch would under-count a
-/// live use and drop a real precedent (a silent wrong result — the cardinal
-/// No-Fallbacks sin). The leaf arms are spelled out (no `_` wildcard) so a future
-/// `ExprPlan` variant fails to compile here rather than defaulting to "no ref".
-/// The `let_lambda_recalc_contract` under-dependency tests pin each composite branch.
-fn plan_references_local(plan: &ExprPlan, name: &str) -> bool {
+/// **Wave P follow-up (FU-NEXT, 2026-06-21) — invocation-reachability result.** Which
+/// `ExprPlan::Lambda` nodes (identified by address) have their body evaluated along
+/// SOME eval path — i.e. are *invoked*. [`walk_plan_for_deps`] walks a lambda body for
+/// precedents IFF the lambda is invoked; a never-invoked lambda body is never read at
+/// eval (an uninvoked `LAMBDA` literal surfaces `#CALC!`; its closure is created
+/// without evaluating the body), so its cell/range/UDF refs are NOT precedents.
+enum InvokedBodies {
+    /// Precise: ONLY these lambda nodes are invoked. Every other lambda body is
+    /// never evaluated and must contribute no precedent.
+    Only(HashSet<*const ExprPlan>),
+    /// Conservative fallback: the closure-flow fixpoint hit its work bound, so treat
+    /// EVERY lambda body as invoked — the pre-FU-NEXT over-approximation. This is the
+    /// SAFE direction (it never *under*-reports an invoked body, so it can never drop a
+    /// real precedent → never a silent stale on edit); it only loses precision. Reached
+    /// only by pathological formulas; no realistic formula triggers it.
+    All,
+}
+
+impl InvokedBodies {
+    /// Is the `ExprPlan::Lambda` node `lambda` invoked? `lambda` must be a node from
+    /// the SAME plan tree the analysis ran on (pointer identity).
+    fn contains(&self, lambda: &ExprPlan) -> bool {
+        match self {
+            InvokedBodies::All => true,
+            InvokedBodies::Only(set) => set.contains(&(lambda as *const ExprPlan)),
+        }
+    }
+}
+
+/// Per-formula state for the closure-flow fixpoint in [`invoked_lambda_bodies`].
+struct InvokeAnalysis<'a> {
+    /// Lambda nodes (by address) discovered invoked so far.
+    invoked: HashSet<*const ExprPlan>,
+    /// Context-insensitive closure environment: a local NAME → the set of lambda
+    /// nodes it may be bound to (across ALL bindings of that name — LET vars and
+    /// LAMBDA params). Merging by name is a sound over-approximation: a `LocalRef`
+    /// resolves at eval to one *specific* lexical binding, and the global union always
+    /// contains it (plus, rarely, same-named bindings from sibling scopes → a safe
+    /// extra dep, never a missed one). 0-CFA in the textbook sense.
+    bound: HashMap<&'a str, HashSet<*const ExprPlan>>,
+    /// Address → node for every `ExprPlan::Lambda` in the tree (to recover params/body
+    /// from a closure-set pointer).
+    lambdas: HashMap<*const ExprPlan, &'a ExprPlan>,
+    /// A monotone-fixpoint round changed `invoked`/`bound`.
+    changed: bool,
+    /// Lambda bodies already descended THIS round (reset each round) — prevents
+    /// redundant work and infinite recursion on recursive lambdas within a round.
+    descended: HashSet<*const ExprPlan>,
+    /// Remaining work budget. On exhaustion the analysis bails to [`InvokedBodies::All`]
+    /// (sound: walk everything). Guards against pathological closure-flow blow-up.
+    budget: u32,
+}
+
+/// Collect every `ExprPlan::Lambda` node (by address) in the tree, descending ALL
+/// children incl. lambda bodies.
+fn collect_lambdas<'a>(plan: &'a ExprPlan, out: &mut HashMap<*const ExprPlan, &'a ExprPlan>) {
+    if let ExprPlan::Lambda { .. } = plan {
+        out.insert(plan as *const ExprPlan, plan);
+    }
     match plan {
-        ExprPlan::LocalRef(n) => n.as_ref() == name,
         ExprPlan::Binary { lhs, rhs, .. } => {
-            plan_references_local(lhs, name) || plan_references_local(rhs, name)
+            collect_lambdas(lhs, out);
+            collect_lambdas(rhs, out);
         }
-        ExprPlan::Unary { operand, .. } => plan_references_local(operand, name),
-        ExprPlan::Function { args, .. } => args.iter().any(|a| plan_references_local(a, name)),
-        ExprPlan::ScalarNameRef { inner, .. } => plan_references_local(inner, name),
-        ExprPlan::Array(rows) => rows
-            .iter()
-            .flatten()
-            .any(|cell| plan_references_local(cell, name)),
+        ExprPlan::Unary { operand, .. } => collect_lambdas(operand, out),
+        ExprPlan::Function { args, .. } => args.iter().for_each(|a| collect_lambdas(a, out)),
+        ExprPlan::ScalarNameRef { inner, .. } => collect_lambdas(inner, out),
+        ExprPlan::Array(rows) => rows.iter().flatten().for_each(|c| collect_lambdas(c, out)),
         ExprPlan::Let { bindings, body } => {
-            bindings
-                .iter()
-                .any(|(_, value_plan)| plan_references_local(value_plan, name))
-                || plan_references_local(body, name)
+            bindings.iter().for_each(|(_, v)| collect_lambdas(v, out));
+            collect_lambdas(body, out);
         }
-        ExprPlan::Lambda { body, .. } => plan_references_local(body, name),
+        ExprPlan::Lambda { body, .. } => collect_lambdas(body, out),
         ExprPlan::CallLambda { callee, args } => {
-            plan_references_local(callee, name)
-                || args.iter().any(|a| plan_references_local(a, name))
+            collect_lambdas(callee, out);
+            args.iter().for_each(|a| collect_lambdas(a, out));
         }
-        // Leaves / variants that cannot contain a `LocalRef`.
         ExprPlan::Number(_)
         | ExprPlan::Bool(_)
         | ExprPlan::String(_)
+        | ExprPlan::LocalRef(_)
         | ExprPlan::CellRef { .. }
         | ExprPlan::AggregateNameRef { .. }
         | ExprPlan::RangeRef { .. }
         | ExprPlan::StructuredRef { .. }
-        | ExprPlan::Error(_) => false,
+        | ExprPlan::Error(_) => {}
     }
+}
+
+/// The set of lambda nodes a plan EVALUATES to (its "closure set"), reading the
+/// current `bound` map. PURE — no mutation. Mirrors exactly the callable-PRESERVING
+/// arms of `eval_binding` (`scalar.rs`): `Lambda` → itself; `LocalRef` → its bound
+/// closures; `CallLambda` → the closures its callee bodies RETURN (currying);
+/// `Let` → its body's closures. EVERY other construct scalarizes a closure to
+/// `#CALC!` at eval (it is not callable-preserving), so it produces NO invokable
+/// closure → `∅`. That makes `∅` here *correct*, not merely conservative: a closure
+/// reaching a non-modeled construct genuinely dies at eval and can never be invoked.
+///
+/// `guard` holds the lambda bodies currently on the resolution stack; re-entry
+/// (a closure that, through call-returns, resolves to itself) drains `budget` and
+/// ultimately bails to [`InvokedBodies::All`] rather than recursing forever.
+fn closures_of(
+    plan: &ExprPlan,
+    st: &mut InvokeAnalysis<'_>,
+    guard: &mut HashSet<*const ExprPlan>,
+) -> HashSet<*const ExprPlan> {
+    if st.budget == 0 {
+        return HashSet::new();
+    }
+    st.budget -= 1;
+    match plan {
+        ExprPlan::Lambda { .. } => {
+            let mut s = HashSet::new();
+            s.insert(plan as *const ExprPlan);
+            s
+        }
+        ExprPlan::LocalRef(name) => st.bound.get(name.as_ref()).cloned().unwrap_or_default(),
+        ExprPlan::CallLambda { callee, args } => {
+            let callees = closures_of(callee, st, guard);
+            let mut ret = HashSet::new();
+            for lp in callees {
+                // **Re-audit #3 Finding 2 — arity gate.** A wrong-arity call returns
+                // `#VALUE!`, not the callee body's result, so it produces NO closure
+                // (the curried inner lambda must not leak through `mk()` when `mk` takes
+                // an arg). Shared with `discover` via `callee_invoked_lambda`.
+                let Some(ExprPlan::Lambda { body, .. }) =
+                    callee_invoked_lambda(st, lp, args.len())
+                else {
+                    continue;
+                };
+                if !guard.insert(lp) {
+                    // Re-entrant resolution (self-returning curry). Bail conservatively.
+                    st.budget = 0;
+                    continue;
+                }
+                ret.extend(closures_of(body, st, guard));
+                guard.remove(&lp);
+            }
+            ret
+        }
+        ExprPlan::Let { body, .. } => closures_of(body, st, guard),
+        // Not callable-preserving at eval → no invokable closure produced.
+        ExprPlan::Number(_)
+        | ExprPlan::Bool(_)
+        | ExprPlan::String(_)
+        | ExprPlan::Binary { .. }
+        | ExprPlan::Unary { .. }
+        | ExprPlan::Function { .. }
+        | ExprPlan::ScalarNameRef { .. }
+        | ExprPlan::Array(_)
+        | ExprPlan::CellRef { .. }
+        | ExprPlan::AggregateNameRef { .. }
+        | ExprPlan::RangeRef { .. }
+        | ExprPlan::StructuredRef { .. }
+        | ExprPlan::Error(_) => HashSet::new(),
+    }
+}
+
+/// Shared arity gate for `discover` and `closures_of` (Codex FU-NEXT re-audit #3 Finding
+/// 2/3): resolve a callee pointer to its `Lambda` node IFF its param count matches the
+/// call's arg count. `invoke_lambda` requires EXACT arity (no partial application),
+/// returning `#VALUE!` before evaluating the body otherwise — so a mismatched-arity callee
+/// is never invoked and produces no closure. Returning `None` is SOUND (eval doesn't run
+/// that body); it only removes a spurious over-report. One place → the two callers can't
+/// drift.
+fn callee_invoked_lambda<'a>(
+    st: &InvokeAnalysis<'a>,
+    lp: *const ExprPlan,
+    argc: usize,
+) -> Option<&'a ExprPlan> {
+    let node = st.lambdas.get(&lp).copied()?;
+    match node {
+        ExprPlan::Lambda { params, .. } if params.len() == argc => Some(node),
+        _ => None,
+    }
+}
+
+/// One fixpoint round: traverse `plan`, marking invocations and propagating the
+/// `bound` closure environment. Descends into a `Lambda` body ONLY when that lambda
+/// is already known invoked — the heart of the precision: a never-invoked body is
+/// never traversed, so the `CallLambda`s inside it never fire and its precedents are
+/// never collected. The round driver re-runs until the monotone state stabilizes, so
+/// a lambda marked invoked late still gets its body descended on a later round.
+///
+/// **Must mirror `walk_plan_for_deps_inner`'s reachability** so a lambda is marked
+/// invoked IFF the walker would actually walk its body AND eval would run it. The one
+/// place they could diverge is the `Function` arm: a **LazyShape** reference fn (ISREF)
+/// inspects only its arg's syntactic SHAPE and never evaluates it (see the walker's
+/// `is_lazy_shape_reference_fn` branch), so a `CallLambda` inside an ISREF arg is never
+/// invoked at eval. Skip those args here too — descending them would mark the callee
+/// invoked and re-introduce the very over-report (a worker-less-load stale UDF
+/// preservation) this analysis exists to remove (Codex FU-NEXT HIGH-1).
+fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &FunctionRegistry) {
+    if st.budget == 0 {
+        return;
+    }
+    st.budget -= 1;
+    match plan {
+        ExprPlan::Lambda { body, .. } => {
+            let ptr = plan as *const ExprPlan;
+            if st.invoked.contains(&ptr) && st.descended.insert(ptr) {
+                discover(body, st, registry);
+            }
+            // Value position (not invoked here): do NOT descend the body.
+        }
+        ExprPlan::CallLambda { callee, args } => {
+            discover(callee, st, registry);
+            for a in args {
+                discover(a, st, registry);
+            }
+            let mut guard = HashSet::new();
+            let callees = closures_of(callee, st, &mut guard);
+            for lp in &callees {
+                // **Codex FU-NEXT re-audit Finding 3 — arity gate** (shared with
+                // `closures_of` via `callee_invoked_lambda`). `invoke_lambda` returns
+                // `#VALUE!` BEFORE evaluating the body when the call's arg count != the
+                // lambda's param count (no partial application), so a mismatched-arity
+                // callee is never actually invoked. SOUND: a body that DOES run had matching
+                // arity, so this never drops a real invocation — it only removes a spurious
+                // mark (which would otherwise re-open the `#CIRC!` / volatility / stale-UDF
+                // faces for `f()`-style bad-arity calls).
+                let Some(ExprPlan::Lambda { params, .. }) =
+                    callee_invoked_lambda(st, *lp, args.len())
+                else {
+                    continue;
+                };
+                if st.invoked.insert(*lp) {
+                    st.changed = true;
+                }
+                // Bind each param to the closures of the matching arg (context-
+                // insensitive union across every call site of this lambda).
+                for (i, p) in params.iter().enumerate() {
+                    let Some(arg) = args.get(i) else { continue };
+                    let mut g2 = HashSet::new();
+                    let cs = closures_of(arg, st, &mut g2);
+                    if cs.is_empty() {
+                        continue;
+                    }
+                    let entry = st.bound.entry(p.as_ref()).or_default();
+                    for c in cs {
+                        if entry.insert(c) {
+                            st.changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        ExprPlan::Let { bindings, body } => {
+            for (name, value) in bindings {
+                discover(value, st, registry);
+                let mut guard = HashSet::new();
+                let cs = closures_of(value, st, &mut guard);
+                if !cs.is_empty() {
+                    let entry = st.bound.entry(name.as_ref()).or_default();
+                    for c in cs {
+                        if entry.insert(c) {
+                            st.changed = true;
+                        }
+                    }
+                }
+            }
+            discover(body, st, registry);
+        }
+        ExprPlan::Binary { lhs, rhs, .. } => {
+            discover(lhs, st, registry);
+            discover(rhs, st, registry);
+        }
+        ExprPlan::Unary { operand, .. } => discover(operand, st, registry),
+        ExprPlan::Function { name, args } => {
+            // **Codex FU-NEXT HIGH-1 + re-audit Finding 1:** skip args ONLY for a BUILTIN
+            // LazyShape reference fn (ISREF) — it never evaluates its arg, just inspects
+            // its shape. A *UDF* can also carry `DepShape::LazyShape` metadata
+            // (`register_udf` accepts arbitrary metadata), but its worker dispatch still
+            // EAGERLY marshals/evaluates args, so a lambda invoked inside a LazyShape-UDF
+            // arg IS run — it must be descended. The `udf_handle(name).is_none()` guard
+            // keeps only builtins on the skip path; descending a LazyShape UDF's args is
+            // the SAFE (over-approximating) direction, never an under-dependency.
+            // Address-only fns (ROW/COLUMN/ROWS/COLUMNS) are eager → descended normally.
+            let lazy_builtin =
+                is_lazy_shape_reference_fn(registry, name) && registry.udf_handle(name).is_none();
+            if !lazy_builtin {
+                args.iter().for_each(|a| discover(a, st, registry));
+            }
+        }
+        ExprPlan::ScalarNameRef { inner, .. } => discover(inner, st, registry),
+        ExprPlan::Array(rows) => rows
+            .iter()
+            .flatten()
+            .for_each(|c| discover(c, st, registry)),
+        ExprPlan::Number(_)
+        | ExprPlan::Bool(_)
+        | ExprPlan::String(_)
+        | ExprPlan::LocalRef(_)
+        | ExprPlan::CellRef { .. }
+        | ExprPlan::AggregateNameRef { .. }
+        | ExprPlan::RangeRef { .. }
+        | ExprPlan::StructuredRef { .. }
+        | ExprPlan::Error(_) => {}
+    }
+}
+
+/// **FU-NEXT (2026-06-21) — invocation-aware reachability.** Returns which lambda
+/// nodes are *invoked* (their body evaluated along some eval path), so
+/// [`walk_plan_for_deps`] can register a lambda body's precedents IFF the lambda
+/// actually runs. Replaces Wave-P-follow-up-1's name-keyed liveness scan
+/// (`plan_references_local`): that scan kept a lambda live whenever its NAME appeared
+/// anywhere downstream (even in pure value position), which over-reported — surfacing
+/// a spurious `#CIRC!` on `recompute_all`, a stale volatile flag, and (via
+/// `plan_references_udf`) a silently-preserved stale UDF value on a worker-less load.
+/// This computes a sound over-approximation of "invoked" via a **context-insensitive**
+/// closure-flow fixpoint (0-CFA): precise for every common LET/LAMBDA shape (immediate
+/// calls, LET-bound calls, currying, capture-before-rebind, recursion / self-
+/// application, passing a lambda as an arg), and conservatively bails to
+/// [`InvokedBodies::All`] on pathological closure-flow blow-up.
+///
+/// **Soundness floor (the cardinal invariant):** the invoked set must be a SUPERSET of
+/// what eval invokes — never a subset. Under-reporting would drop a real precedent → a
+/// silent stale on edit (the worst engine bug). `closures_of` is exact on the callable-
+/// preserving arms and the param/LET propagation only ever GROWS `bound`, so the fixpoint
+/// over-approximates; the budget bail is to `All` (walk everything), preserving the floor.
+///
+/// **Known residual over-report CLASS (NOT under-report).** A few contrived shapes still
+/// mark a lambda invoked (or walk a call's args) when eval does not run it — each an
+/// OVER-report that can re-open the three faces (spurious `#CIRC!` / stale volatility /
+/// worker-less-load stale-UDF preserve), each STRICTLY NARROWER than the pre-FU-NEXT
+/// walk-everything behavior, and NONE an under-report (a live lambda's deps are always
+/// kept):
+///   1. **name-merge vs capture** (Codex FU-NEXT HIGH-2): the `bound` map is keyed by NAME
+///      (context-insensitive), so a name bound to a lambda, CAPTURED by another lambda,
+///      then REBOUND to a different never-invoked lambda, merges both — marking the
+///      rebound lambda invoked. Pinned by
+///      `name_merge_capture_vs_rebind_over_preserve_known_residual` (+ `..._reopens_circ_face`).
+///   2. **non-callable / wrong-arity `CallLambda` args** (Codex re-audit #4): the walker's
+///      `CallLambda` arm walks its args even when the callee is not callable or the arity
+///      mismatches, though `invoke_lambda` returns `#VALUE!` before evaluating them
+///      (`=LET(f,LAMBDA(x,1),f(B1,0))`). The lambda BODY is correctly gated (the arity
+///      filter), but the ARG subtrees are not.
+/// The durable fix for the whole class is a context-SENSITIVE analysis (per-lambda captured
+/// environments + live-call gating of args) — deferred.
+fn invoked_lambda_bodies(root: &ExprPlan, registry: &FunctionRegistry) -> InvokedBodies {
+    let mut lambdas = HashMap::new();
+    collect_lambdas(root, &mut lambdas);
+    if lambdas.is_empty() {
+        return InvokedBodies::Only(HashSet::new());
+    }
+    let n = lambdas.len();
+    let mut st = InvokeAnalysis {
+        invoked: HashSet::new(),
+        bound: HashMap::new(),
+        lambdas,
+        changed: false,
+        descended: HashSet::new(),
+        // Monotone fixpoint over (invoked ⊆ lambdas, bound: name→subset of lambdas);
+        // converges in O(n) rounds for non-pathological flow. Budget is the global
+        // backstop; on exhaustion → All (sound).
+        budget: (n as u32).saturating_mul(4_096).saturating_add(8_192),
+    };
+    // Round driver: re-run until the monotone state stops growing.
+    let max_rounds = n.saturating_mul(8).saturating_add(16);
+    for _ in 0..max_rounds {
+        st.changed = false;
+        st.descended.clear();
+        discover(root, &mut st, registry);
+        if st.budget == 0 {
+            return InvokedBodies::All;
+        }
+        if !st.changed {
+            return InvokedBodies::Only(st.invoked);
+        }
+    }
+    // Did not converge within the round cap — conservative.
+    InvokedBodies::All
 }
 
 /// Phase 3.2 — recursive walker. Accumulates dependencies + volatile-
@@ -458,6 +784,22 @@ pub(crate) fn walk_plan_for_deps(
     plan: &ExprPlan,
     deps: &mut FormulaDeps,
     registry: &FunctionRegistry,
+) {
+    // **FU-NEXT (2026-06-21):** compute invocation-reachability ONCE on the formula
+    // root, then thread it through the recursion so a lambda body's precedents are
+    // registered IFF the lambda is invoked along some eval path. The set is keyed by
+    // node address within `plan` and is valid for the entire synchronous walk + every
+    // recursive sub-call — which all route through `walk_plan_for_deps_inner`, NOT this
+    // public entry, so the set is computed exactly once per formula, never per node.
+    let invoked = invoked_lambda_bodies(plan, registry);
+    walk_plan_for_deps_inner(plan, deps, registry, &invoked);
+}
+
+fn walk_plan_for_deps_inner(
+    plan: &ExprPlan,
+    deps: &mut FormulaDeps,
+    registry: &FunctionRegistry,
+    invoked: &InvokedBodies,
 ) {
     match plan {
         ExprPlan::Number(_) | ExprPlan::Bool(_) | ExprPlan::String(_) => {
@@ -469,11 +811,11 @@ pub(crate) fn walk_plan_for_deps(
             deps.cells.push((*sheet, *row, *col));
         }
         ExprPlan::Binary { lhs, rhs, .. } => {
-            walk_plan_for_deps(lhs, deps, registry);
-            walk_plan_for_deps(rhs, deps, registry);
+            walk_plan_for_deps_inner(lhs, deps, registry, invoked);
+            walk_plan_for_deps_inner(rhs, deps, registry, invoked);
         }
         ExprPlan::Unary { operand, .. } => {
-            walk_plan_for_deps(operand, deps, registry);
+            walk_plan_for_deps_inner(operand, deps, registry, invoked);
         }
         ExprPlan::Function { name, args } => {
             // **6.4-0 substrate (2026-05-28):** record the function name
@@ -519,15 +861,22 @@ pub(crate) fn walk_plan_for_deps(
             // The previous Step 1.1 design routed ISREF through path 2,
             // which produced wrong behavior under LazyShape (Step 3
             // audit caught this).
-            if is_lazy_shape_reference_fn(registry, name) {
+            if is_lazy_shape_reference_fn(registry, name) && registry.udf_handle(name).is_none() {
                 // **6.4-1 (2026-05-28; I1):** LazyShape contract — NO value-dep
                 // or volatility walking. Pre-6.4-1 this was a hardcoded
                 // `name.as_ref() == "ISREF"` check; the I1 closure routes
-                // through metadata so any UDF declaring
-                // `dep_shape: LazyShape` participates uniformly. ISREF
-                // remains the only built-in with this contract today (its
-                // Phase-1 override in `register_builtin_metadata` sets
-                // `DepShape::LazyShape`).
+                // through metadata. ISREF remains the only built-in with this
+                // contract today (its Phase-1 override in
+                // `register_builtin_metadata` sets `DepShape::LazyShape`).
+                //
+                // **Codex FU-NEXT re-audit #3 Finding 1:** the skip is now gated on
+                // `udf_handle(name).is_none()` — i.e. BUILTINS only. A *UDF* can also
+                // declare `dep_shape: LazyShape` over the wire (`dep_shape_from_str`
+                // accepts `"lazy_shape"`), but its worker dispatch EAGERLY marshals/
+                // evaluates args, so skipping them would DROP real precedents (a silent
+                // stale on edit — e.g. `=MYLAZY(A1)`). A LazyShape UDF therefore falls
+                // through to the normal value-dep arm below. (Pre-existing under-dep the
+                // metadata-uniform routing introduced; reachable, now closed.)
                 //
                 // The args' inner VALUE-deps and volatility don't affect a
                 // LazyShape function's result (ISREF(NOW()) must NOT be volatile;
@@ -550,13 +899,21 @@ pub(crate) fn walk_plan_for_deps(
                         _ => {}
                     }
                 }
-            } else if is_address_only_reference_fn(registry, name) {
+            } else if is_address_only_reference_fn(registry, name)
+                && registry.udf_handle(name).is_none()
+            {
+                // **Re-audit #3 Finding 1:** address-only value-dep suppression is for the
+                // BUILTIN ROW/COLUMN/ROWS/COLUMNS (eager materializer reads addresses, not
+                // values). A *UDF* declaring `dep_shape: AddressOnly` still eagerly
+                // evaluates its args at dispatch, so suppressing direct CellRef/RangeRef
+                // value-deps would drop real precedents — it falls through to the normal
+                // arm below instead.
                 for arg in args {
-                    walk_plan_for_address_only_deps(arg, deps, registry);
+                    walk_plan_for_address_only_deps(arg, deps, registry, invoked);
                 }
             } else {
                 for arg in args {
-                    walk_plan_for_deps(arg, deps, registry);
+                    walk_plan_for_deps_inner(arg, deps, registry, invoked);
                 }
             }
         }
@@ -569,7 +926,7 @@ pub(crate) fn walk_plan_for_deps(
         // resolved plan (a `Cell` target carries a CellRef cell-dep too).
         ExprPlan::ScalarNameRef { name, inner } => {
             deps.names.push(Arc::clone(name));
-            walk_plan_for_deps(inner, deps, registry);
+            walk_plan_for_deps_inner(inner, deps, registry, invoked);
         }
         // **W5-RT-3.1 (S3-HIGH-3 / Codex Step 3 HIGH-2 closure):**
         // literal range refs bind to `ExprPlan::RangeRef { range }`
@@ -638,122 +995,75 @@ pub(crate) fn walk_plan_for_deps(
             deps.tables.push(Arc::clone(table_name));
         }
         // **Wave P (2026-06-20) — the #1 correctness contract for LET.** A
-        // `CellRef`/`RangeRef` inside a binding VALUE or the BODY must still
-        // register as a precedent, or editing it would leave the LET formula
-        // stale. Descend the binding values and the body. Local names
-        // themselves carry no grid dep (resolved in the LocalEnv at eval).
+        // `CellRef`/`RangeRef` inside a binding VALUE or the BODY must register as a
+        // precedent, or editing it would leave the LET formula stale. Descend every
+        // binding value and the body. Local names themselves carry no grid dep
+        // (resolved in the `LocalEnv` at eval).
         //
-        // **Wave P follow-up 1 (dead-local-binding elimination):** a LAMBDA bound
-        // to a local whose name is NEVER referenced downstream (in a later binding
-        // value or the body) can never be invoked, returned, or passed anywhere —
-        // a Lambda binding value creates a closure WITHOUT evaluating its body, so
-        // the body's cell/range/UDF refs are never read at eval. Skip walking it.
-        // This is a sound, strictly one-directional narrowing (it only ever drops a
-        // binding whose name is provably absent downstream): it removes the spurious
-        // self-/peer-precedent that otherwise surfaces as a conservative `#CIRC!` on
-        // `recompute_all`, and NARROWS the stale-UDF preservation edge (which reuses
-        // this walker via `plan_references_udf` — see the KNOWN RESIDUAL note on the
-        // `ExprPlan::Lambda` arm for the slices that remain). The liveness scan
-        // (`plan_references_local`) is NAME-KEYED, so any live use — even one buried
-        // in another lambda/LET body or a `CallLambda` callee/arg — keeps the binding.
-        // A name re-bound at the SAME level is now resolved precisely (the dead
-        // earlier binding is dropped; see the per-binding comment below). Scoped to
-        // the LET arm because only here are the binding's name + downstream scope
-        // available; the bare `Lambda` arm (which cannot tell callee-position from
-        // result-position) stays conservative.
+        // **FU-NEXT (2026-06-21):** the dead-lambda precision now lives ENTIRELY in the
+        // `ExprPlan::Lambda` arm, gated on the precomputed `invoked` set — so this arm
+        // is a plain descend-everything again. Wave-P-follow-up-1's per-binding,
+        // name-keyed liveness scan (`plan_references_local`) is gone: a LAMBDA-valued
+        // binding whose lambda is never invoked now contributes nothing because the
+        // `Lambda` arm skips its body, and that precision extends to the nested-shadow
+        // and indirect-producer cases the name-keyed scan over-reported.
         ExprPlan::Let { bindings, body } => {
-            for (idx, (name, value_plan)) in bindings.iter().enumerate() {
-                // A reference to `name` resolves to THIS binding only until `name` is
-                // re-bound at the same LET level. LET is left-to-right: a later binding
-                // of the same name shadows this one from its declaration onward, and a
-                // closure created AFTER the rebind captures the NEW binding (closures
-                // capture the env at creation time — `eval_binding`'s `Lambda` arm). So
-                // scan for a live reference only in the bindings BEFORE the next
-                // same-name rebind, plus the body IFF this binding is never shadowed.
-                // Any closure that could capture-and-later-invoke THIS binding must be
-                // created in `[idx+1 .. next_rebind)` and therefore syntactically
-                // contains a `LocalRef(name)` the (name-keyed) `plan_references_local`
-                // finds there — so this bound is SOUND (no under-dependency).
-                //
-                // This makes the same-level-shadow case PRECISE: `LET(f,LAMBDA(x,A1),f,7,f)`
-                // drops the dead first `f`, closing the SAME-LEVEL slice of the
-                // reused-name UDF over-preservation edge Codex flagged (a never-invoked
-                // lambda's UDF was still seen by `plan_references_udf`, over-preserving a
-                // stale saved value on a worker-less load). The NESTED-shadow and
-                // indirect-producer slices of that same SILENT-stale class remain — see
-                // the `ExprPlan::Lambda` arm's KNOWN RESIDUAL note; the precise
-                // invocation-aware walker (named next wave) closes them. A NESTED LET /
-                // inner lambda that rebinds the same name is still counted conservatively
-                // (the name-keyed scan descends it and cannot tell the inner rebind from
-                // this one) — a safe over-report for dirtying, never an under-dependency.
-                let next_rebind = bindings[idx + 1..]
-                    .iter()
-                    .position(|(n, _)| n.as_ref() == name.as_ref())
-                    .map(|p| idx + 1 + p);
-                let scan_end = next_rebind.unwrap_or(bindings.len());
-                let referenced = bindings[idx + 1..scan_end]
-                    .iter()
-                    .any(|(_, later)| plan_references_local(later, name))
-                    || (next_rebind.is_none() && plan_references_local(body, name));
-                let dead_lambda = matches!(value_plan, ExprPlan::Lambda { .. }) && !referenced;
-                if dead_lambda {
-                    continue;
-                }
-                walk_plan_for_deps(value_plan, deps, registry);
+            for (_name, value_plan) in bindings {
+                walk_plan_for_deps_inner(value_plan, deps, registry, invoked);
             }
-            walk_plan_for_deps(body, deps, registry);
+            walk_plan_for_deps_inner(body, deps, registry, invoked);
         }
         // **Wave P (2026-06-20):** a LET/LAMBDA local reference resolves against
         // the lexical `LocalEnv`, not the grid — no precedent. (Any grid dep
         // its bound value carries was already recorded when the binding value
         // was walked in the enclosing `Let` arm.)
         ExprPlan::LocalRef(_) => {}
-        // **Wave P (2026-06-20):** a LAMBDA body's cell/range refs are precedents
-        // of the formula — when the lambda is invoked (the common case), a
-        // `CellRef` inside the body must re-dirty the formula on edit. Params
-        // bind no dep.
+        // **Wave P (2026-06-20):** a LAMBDA body's cell/range/UDF refs are precedents of
+        // the formula — but ONLY when the lambda is invoked (its body evaluated). An
+        // uninvoked `LAMBDA` literal surfaces `#CALC!`, and its closure is created
+        // WITHOUT evaluating the body (`eval_binding`'s `Lambda` arm), so the body's
+        // refs are never read at eval and must NOT become precedents.
         //
-        // **RESIDUAL CONSERVATIVE OVER-DEPENDENCY (narrowed by Wave P follow-up 1).**
-        // This arm walks the body whenever it is reached — which is correct for an
-        // INVOKED lambda (immediate `LAMBDA(..)(args)`, a lambda passed as an arg, or
-        // a LET-bound lambda whose name is live; see the `ExprPlan::Let` arm above).
-        // The dead-local-binding skip in the `Let` arm now suppresses the common
-        // wrong-result case — a LET-bound lambda whose name is NEVER referenced
-        // (`=LET(f,LAMBDA(x,A1),1)` no longer registers A1, so it returns 1, not
-        // `#CIRC!`; see `let_dead_lambda_binding_is_not_circular` in
-        // `tests/let_lambda_recalc_contract.rs`) — including the same-level
-        // shadow case (`=LET(f,LAMBDA(x,A1),f,7,f)`, which is now precisely dropped).
-        // What remains conservative: a bare top-level uninvoked `=LAMBDA(x,A1)` (this
-        // arm has no context to know it sits in a result position rather than a
-        // `CallLambda` callee); a dead lambda shadowed by a NESTED LET / inner lambda
-        // rebinding the same name (the name-keyed scan descends the nested scope and
-        // keeps it live); and a dead binding that PRODUCES a callable indirectly (a
-        // `LET`/`IF` returning a lambda — this skip matches only a direct
-        // `ExprPlan::Lambda` value). For cell-dirtying these are SAFE over-reports —
-        // an extra harmless recompute, value always correct.
+        // **FU-NEXT (2026-06-21) — invocation-aware gate.** Walk the body IFF this lambda
+        // node is in the precomputed `invoked` set (`invoked_lambda_bodies`, run once on
+        // the formula root). Gating on actual invocation closes the three faces of the
+        // old residual for the dead-lambda shapes whose precision depends only on "is
+        // there a call site" — including the nested-shadow and indirect-producer slices
+        // the name-keyed Wave-P-follow-up-1 scan over-reported:
+        //   1. **`#CIRC!`** — a never-invoked body that names its OWN cell no longer
+        //      registers a self-edge, so `recompute_all` returns the real value, not a
+        //      spurious cycle (`nested_shadow_dead_lambda_self_ref_is_not_circular`).
+        //   2. **volatility** — a never-invoked `NOW()` no longer marks the formula
+        //      volatile (`nested_shadow_dead_lambda_volatile_body_is_not_volatile`).
+        //   3. **stale UDF on load** — `plan_references_udf` reuses this walker's
+        //      `functions_used`; a never-invoked UDF is no longer reported, so a
+        //      worker-less `.qbook` load stops preserving a stale saved value
+        //      (`dead_lambda_udf_leak_residual_closed_by_invocation_aware_walker`).
+        // Also covers the bare top-level uninvoked `=LAMBDA(x,A1)` (not in the set).
         //
-        // **KNOWN RESIDUAL (pre-existing; Codex megaudit w104-fu).** The SAME
-        // over-reports are NOT safe for one narrow consumer: `plan_references_udf`
-        // (workbook_runtime/recompute.rs) reuses this walker's `functions_used` to
-        // decide whether to PRESERVE a saved value on a worker-less `.qbook` load.
-        // An over-reported UDF inside a never-invoked dead lambda body therefore
-        // causes a stale saved value to be preserved instead of recomputed — a
-        // SILENT stale on that one load path (e.g.
-        // `=LET(f,LAMBDA(x,MYUDF(x)),g,LET(f,0,f),f,7,A1+f)`). This class pre-dates
-        // Wave P follow-up 1 (the core walked every lambda body unconditionally);
-        // this follow-up NARROWS it (the simple-dead + same-level-shadow cases are
-        // now precise) but does not close it. The full fix is the precise
-        // invocation-aware dep walker (the named NEXT wave) — it registers lambda-body
-        // deps only for provably-invoked lambdas, which both ends the residual
-        // over-reports here and lets `plan_references_udf` stop over-preserving.
+        // **One narrower over-report remains** (Codex FU-NEXT HIGH-2): the context-
+        // INSENSITIVE name-merge can still mark a captured-then-rebound lambda invoked.
+        // It is an over-report that can re-open ALL THREE faces (spurious `#CIRC!`, stale
+        // volatility, stale-UDF-on-load) for that one contrived shape — strictly NARROWER
+        // than the pre-FU-NEXT behavior, never an under-report. Pinned by
+        // `name_merge_capture_vs_rebind_over_preserve_known_residual`. See
+        // `invoked_lambda_bodies`.
+        //
+        // **Soundness:** `invoked` is a SOUND over-approximation — an INVOKED body is
+        // ALWAYS in the set (the closure-flow analysis bails to "all invoked" rather
+        // than under-report), so currying, capture-before-rebind, recursion / self-
+        // application, and a lambda passed as an arg all keep their precedents. The
+        // `let_lambda_recalc_contract` under-dependency tests pin every such shape.
         ExprPlan::Lambda { body, .. } => {
-            walk_plan_for_deps(body, deps, registry);
+            if invoked.contains(plan) {
+                walk_plan_for_deps_inner(body, deps, registry, invoked);
+            }
         }
         // **Wave P (2026-06-20):** an invocation depends on its callee and args.
         ExprPlan::CallLambda { callee, args } => {
-            walk_plan_for_deps(callee, deps, registry);
+            walk_plan_for_deps_inner(callee, deps, registry, invoked);
             for a in args {
-                walk_plan_for_deps(a, deps, registry);
+                walk_plan_for_deps_inner(a, deps, registry, invoked);
             }
         }
     }
@@ -811,6 +1121,7 @@ fn walk_plan_for_address_only_deps(
     plan: &ExprPlan,
     deps: &mut FormulaDeps,
     registry: &FunctionRegistry,
+    invoked: &InvokedBodies,
 ) {
     match plan {
         // Direct reference shapes: skip value-deps. Address is the input.
@@ -841,8 +1152,11 @@ fn walk_plan_for_address_only_deps(
         // is acceptable v1 cost (see S1-HIGH-E doc note). The
         // delegation passes `registry` through so a nested
         // `ExprPlan::Function` arg can consult metadata (6.4-0
-        // substrate).
-        _ => walk_plan_for_deps(plan, deps, registry),
+        // substrate). **FU-NEXT:** threads the precomputed `invoked` set so a nested
+        // lambda inside an address-only arg is gated identically (it must NOT recompute
+        // the set on the subtree — that would lose the enclosing scope and risk an
+        // under-dependency).
+        _ => walk_plan_for_deps_inner(plan, deps, registry, invoked),
     }
 }
 
@@ -3010,6 +3324,63 @@ mod tests {
         // 6.4-0: `functions_used` records every Function arm walked.
         assert_eq!(a.functions_used.len(), 1);
         assert_eq!(a.functions_used[0].as_ref(), "NOW");
+    }
+
+    /// **Codex FU-NEXT re-audit #3 Finding 1 (FIXED).** A UDF declaring
+    /// `dep_shape: LazyShape` is EAGER-dispatched (its worker marshals/evaluates args),
+    /// unlike the builtin ISREF. So the walker must NOT skip its args — `=MYLAZY(A1)` MUST
+    /// keep A1 as a precedent, or editing A1 silently staless the formula. The LazyShape /
+    /// AddressOnly arg-suppression is now gated on `udf_handle(name).is_none()` (builtins
+    /// only); a UDF falls through to the normal value-dep walk. (Reachable: the wire
+    /// `dep_shape_from_str` accepts `"lazy_shape"` / `"address_only"` for UDFs.)
+    #[test]
+    fn lazy_shape_udf_arg_is_walked_normally_not_skipped() {
+        use ql_session::function_meta::{
+            ArgContext, ArgPolicy, Arity, BatchShape, CancelPolicy, FunctionMetadata,
+        };
+        use ql_session::session::FunctionImplHandle;
+
+        let mut registry = ql_functions::default_registry();
+        let meta = FunctionMetadata {
+            canonical_name: "MYLAZY".to_string(),
+            display_name: None,
+            aliases: vec![],
+            arity: Arity::Variadic,
+            volatility: Volatility::Pure,
+            determinism: true,
+            // The dangerous combo: LazyShape metadata on an (eager-dispatched) UDF.
+            dep_shape: DepShape::LazyShape,
+            batch_shape: BatchShape::ArrayBatch,
+            arg_policy: ArgPolicy::Strict,
+            cancellation: CancelPolicy::WorkerKill,
+            arg_context: ArgContext::Aggregate,
+            provenance_tags: vec!["python".to_string()],
+        };
+        registry
+            .register_udf(meta, FunctionImplHandle(7))
+            .expect("register MYLAZY");
+        // Precondition for the bug: it IS classified LazyShape, AND it has a udf_handle.
+        assert!(is_lazy_shape_reference_fn(&registry, "MYLAZY"));
+        assert!(registry.udf_handle("MYLAZY").is_some());
+
+        // `=MYLAZY(A1)` (plan built directly; the LazyShape skip would drop A1).
+        let plan = ExprPlan::Function {
+            name: "MYLAZY".into(),
+            args: vec![ExprPlan::CellRef {
+                sheet: 0,
+                row: 0,
+                col: 0,
+                abs_col: false,
+                abs_row: false,
+            }],
+        };
+        let mut deps = FormulaDeps::default();
+        walk_plan_for_deps(&plan, &mut deps, &registry);
+        assert!(
+            deps.cells.contains(&(0, 0, 0)),
+            "a LazyShape UDF's arg must be walked normally (eager dispatch reads it) — \
+             skipping it would silently stale `=MYLAZY(A1)` on an A1 edit; got {deps:?}"
+        );
     }
 
     // =====================================================================
