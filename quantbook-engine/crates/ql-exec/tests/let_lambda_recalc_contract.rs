@@ -945,15 +945,20 @@ fn fu3_let_array_local_arithmetic_is_calc_in_production() {
 }
 
 #[test]
-fn fu3_let_array_local_as_sum_arg_is_calc_in_production() {
-    // An array local as a function arg stays #CALC! (array-as-arbitrary-arg works nowhere
-    // in v1; folds into FU4).
+fn fu4b_let_array_local_as_sum_arg_computes_in_production() {
+    // **FU4b (2026-06-21) — FLIPPED from `fu3_let_array_local_as_sum_arg_is_calc_in_production`
+    // (was #CALC!).** The scalar-aggregate array-as-arg relaxation (the substrate that makes
+    // `SUM(row)` work inside BYROW) ALSO makes a generic array local flow into a reducer:
+    // =LET(s,SEQUENCE(3),SUM(s)) now computes 1+2+3 = 6 (Excel-correct). SUM returns a SCALAR,
+    // so there is no spill. The arithmetic (`s*2`) and Unified-tier (`TRANSPOSE(s)`) array-local
+    // cases STAY #CALC! (deferred) — see the two pins above.
     let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),SUM(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(6.0));
     assert_eq!(
-        wb.read(Address::new(0, 0, 1)),
-        Value::Error(ErrorValue::Calc)
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        None,
+        "SUM returns a scalar — no spill"
     );
-    assert_eq!(wb.spill_anchor_at(0, 0, 1).copied(), None, "must NOT spill");
 }
 
 #[test]
@@ -1269,5 +1274,295 @@ fn fu4_scan_spill_blocked_is_spill_error() {
         wb.read(Address::new(0, 0, 1)),
         Value::Error(ErrorValue::Spill),
         "a SCAN spill blocked by an occupied target → #SPILL!"
+    );
+}
+
+// =============================================================================
+// FU4b (2026-06-21) — BYROW / BYCOL. The lambda receives a whole ROW / COLUMN
+// ARRAY; the body consumes it via the scalar-aggregate array-as-arg relaxation
+// (`SUM(row)`). Production path: spill + dependency tracking. The cardinal-sin
+// surface (a cell ref inside the lambda body) is inherited from the FU4
+// `discover` invoked-set mark (BYROW/BYCOL are `is_higher_order_helper` names).
+// =============================================================================
+
+// --- BYROW / BYCOL core shapes ----------------------------------------------
+
+#[test]
+fn fu4b_byrow_2d_spills_column() {
+    // =BYROW({1,2;3,4},LAMBDA(r,SUM(r))) — SUM each row {1,2}=3, {3,4}=7 → 2×1 {3;7}.
+    // The body's SUM(r) exercises the FU4b array-as-arg relaxation end-to-end.
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,SUM(r)))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[3.0, 7.0]);
+}
+
+#[test]
+fn fu4b_bycol_2d_spills_row() {
+    // =BYCOL({1,2;3,4},LAMBDA(c,SUM(c))) — SUM each col {1;3}=4, {2;4}=6 → 1×2 {4,6}.
+    let (wb, _g, _r) = setup("BYCOL({1,2;3,4},LAMBDA(c,SUM(c)))", 0.0);
+    assert_spill_block(&wb, 1, 2, &[4.0, 6.0]);
+}
+
+#[test]
+fn fu4b_byrow_max_per_row() {
+    // A different scalar-aggregate reducer over the row array → MAX per row.
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,MAX(r)))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[2.0, 4.0]);
+}
+
+#[test]
+fn fu4b_bycol_count_per_col() {
+    // COUNT over each column array → {2,2}.
+    let (wb, _g, _r) = setup("BYCOL({1,2;3,4},LAMBDA(c,COUNT(c)))", 0.0);
+    assert_spill_block(&wb, 1, 2, &[2.0, 2.0]);
+}
+
+#[test]
+fn fu4b_byrow_single_row_is_1x1() {
+    // A 1×3 source has ONE row → BYROW gives a single scalar → 1×1 {6}.
+    let (wb, _g, _r) = setup("BYROW({1,2,3},LAMBDA(r,SUM(r)))", 0.0);
+    assert_spill_block(&wb, 1, 1, &[6.0]);
+}
+
+#[test]
+fn fu4b_bycol_single_row_is_1x3() {
+    // A 1×3 source has 3 columns, each a 1×1 → BYCOL gives 1×3 {1,2,3}.
+    let (wb, _g, _r) = setup("BYCOL({1,2,3},LAMBDA(c,SUM(c)))", 0.0);
+    assert_spill_block(&wb, 1, 3, &[1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn fu4b_byrow_single_col_is_3x1() {
+    // A 3×1 source has 3 rows, each a 1×1 → BYROW gives 3×1 {1,2,3}.
+    let (wb, _g, _r) = setup("BYROW({1;2;3},LAMBDA(r,SUM(r)))", 0.0);
+    assert_spill_block(&wb, 3, 1, &[1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn fu4b_bycol_single_col_is_1x1() {
+    // A 3×1 source has ONE column → BYCOL gives a single scalar → 1×1 {6}.
+    let (wb, _g, _r) = setup("BYCOL({1;2;3},LAMBDA(c,SUM(c)))", 0.0);
+    assert_spill_block(&wb, 1, 1, &[6.0]);
+}
+
+// --- BYROW / BYCOL dependency tracking (the cardinal-sin surface) -----------
+
+#[test]
+fn fu4b_byrow_body_cell_ref_is_precedent_and_recomputes() {
+    // **THE cardinal-sin test for BYROW.** A cell ref INSIDE the lambda body
+    // (=BYROW({1,2;3,4},LAMBDA(r,SUM(r)+$A$1))) must register $A$1 as a precedent,
+    // or editing A1 leaves the BYROW STALE. Inherits the FU4 `discover` invoked-set
+    // mark (BYROW is an `is_higher_order_helper` name). A1=10 → {3+10;7+10}={13;17}.
+    let (mut wb, mut graph, reg) = setup("BYROW({1,2;3,4},LAMBDA(r,SUM(r)+$A$1))", 10.0);
+    assert_spill_block(&wb, 2, 1, &[13.0, 17.0]);
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(20.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(
+        attempted >= 1,
+        "editing A1 must recompute the BYROW (attempted == 0 means the dep inside the \
+         lambda body was never registered — the cardinal sin)"
+    );
+    assert_spill_block(&wb, 2, 1, &[23.0, 27.0]); // A1=20
+}
+
+#[test]
+fn fu4b_byrow_body_cell_ref_in_deps() {
+    // Direct dep-extraction proof: $A$1 inside the BYROW lambda body is in deps.cells.
+    let deps = formula_deps_for("BYROW({1,2;3,4},LAMBDA(r,SUM(r)+$A$1))").expect("has deps");
+    assert!(
+        deps.cells.iter().any(|&(s, r, c)| (s, r, c) == (0, 0, 0)),
+        "$A$1 inside the BYROW lambda body must be a precedent; got {:?}",
+        deps.cells
+    );
+}
+
+#[test]
+fn fu4b_byrow_data_arg_reshapes_on_precedent_edit() {
+    // The ARRAY arg's precedents drive the shape: =BYROW(SEQUENCE($A$1),LAMBDA(r,SUM(r))).
+    // SEQUENCE(n) is n×1; BYROW gives one SUM per (single-cell) row. A1=3 → {1;2;3};
+    // edit A1=5 → reshape to {1;2;3;4;5}.
+    let (mut wb, mut graph, reg) = setup("BYROW(SEQUENCE($A$1),LAMBDA(r,SUM(r)))", 3.0);
+    assert_spill_block(&wb, 3, 1, &[1.0, 2.0, 3.0]);
+    {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached");
+    }
+    assert_spill_block(&wb, 5, 1, &[1.0, 2.0, 3.0, 4.0, 5.0]);
+}
+
+#[test]
+fn fu4b_bycol_let_bound_lambda_spills() {
+    // A LET-bound lambda passed to BYCOL resolves via `closures_of`(LocalRef) at the
+    // walker AND `eval_binding`(LocalRef)→Callable at eval. {1,2;3,4} cols → {4,6}.
+    let (wb, _g, _r) = setup("LET(f,LAMBDA(c,SUM(c)),BYCOL({1,2;3,4},f))", 0.0);
+    assert_spill_block(&wb, 1, 2, &[4.0, 6.0]);
+}
+
+#[test]
+fn fu4b_byrow_let_bound_lambda_body_ref_is_precedent() {
+    // The cardinal-sin guard must also fire through a LET-bound BYROW lambda.
+    let (mut wb, mut graph, reg) = setup("LET(f,LAMBDA(r,SUM(r)+$A$1),BYROW({1,2;3,4},f))", 10.0);
+    assert_spill_block(&wb, 2, 1, &[13.0, 17.0]);
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(20.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(
+        attempted >= 1,
+        "A1 inside a LET-bound BYROW lambda must be a precedent"
+    );
+    assert_spill_block(&wb, 2, 1, &[23.0, 27.0]);
+}
+
+#[test]
+fn fu4b_byrow_volatile_body_is_volatile() {
+    // A volatile call inside the (invoked) lambda body marks the formula volatile.
+    let deps = formula_deps_for("BYROW({1,2;3,4},LAMBDA(r,SUM(r)+RAND()))").expect("has deps");
+    assert!(
+        deps.is_volatile,
+        "a volatile RAND() inside the BYROW lambda body must mark the formula volatile"
+    );
+}
+
+// --- BYROW / BYCOL error / boundary paths -----------------------------------
+
+#[test]
+fn fu4b_byrow_spill_blocked_is_spill_error() {
+    // A BYROW spill (2×1 wanting B1:B2) blocked by an occupied target → #SPILL!.
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_value(0, 1, 1, Value::Number(99.0)).unwrap(); // B2 occupied
+        rt.set_formula(0, 0, 1, "BYROW({1,2;3,4},LAMBDA(r,SUM(r)))")
+            .unwrap(); // wants B1:B2
+    }
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Spill),
+        "a BYROW spill blocked by an occupied target → #SPILL!"
+    );
+}
+
+#[test]
+fn fu4b_byrow_runaway_body_is_num_not_stack_overflow() {
+    // The per-row invocation MUST thread `depth` from `env.lambda_depth()` into
+    // `invoke_closure_with_array` — a runaway self-application inside the body fires
+    // the 64-deep guard as a loud `#NUM!`, NOT a native stack overflow (which would
+    // SIGABRT the whole test process). The body ignores `r`.
+    let (wb, _g, _r) = setup(
+        "BYROW({1},LAMBDA(r,LET(g,LAMBDA(s,n,IF(n<0,0,1+s(s,n+1))),g(g,1))))",
+        0.0,
+    );
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Num),
+        "a runaway recursion in the BYROW body must be a clean #NUM!, not a crash"
+    );
+}
+
+#[test]
+fn fu4b_byrow_lambda_returns_row_is_calc_per_cell() {
+    // **Megaudit (Codex / lane C):** a BYROW lambda that returns its ROW (an array,
+    // not a scalar) makes each cell #CALC! via `helper_cell_value` — and the result
+    // still SPILLS (2×1), one #CALC! per row, rather than collapsing the whole result.
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,r))", 0.0);
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        Some(SpillShape::new(2, 1)),
+        "a per-row array result still spills 2×1 (each cell #CALC!)"
+    );
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Calc)
+    );
+    assert_eq!(
+        wb.read(Address::new(0, 1, 1)),
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu4b_byrow_error_element_in_row_flows_into_lambda() {
+    // **Megaudit (lane C):** an ERROR element inside a row flows INTO the lambda —
+    // SUM over a row containing #DIV/0! propagates the error for THAT row only; a
+    // clean row computes normally. Data A1:B2 = {#DIV/0!,2; 3,4}; formula at D1.
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "1/0").unwrap(); // A1 = #DIV/0!
+        rt.set_value(0, 0, 1, Value::Number(2.0)).unwrap(); // B1
+        rt.set_value(0, 1, 0, Value::Number(3.0)).unwrap(); // A2
+        rt.set_value(0, 1, 1, Value::Number(4.0)).unwrap(); // B2
+        rt.set_formula(0, 0, 3, "BYROW(A1:B2,LAMBDA(r,SUM(r)))")
+            .unwrap(); // D1, spills D1:D2
+    }
+    // Row 1 {#DIV/0!,2} → SUM propagates #DIV/0!; row 2 {3,4} → 7.
+    assert_eq!(
+        wb.read(Address::new(0, 0, 3)),
+        Value::Error(ErrorValue::DivZero),
+        "the error element flows into the lambda; SUM propagates it for that row"
+    );
+    assert_eq!(wb.read(Address::new(0, 1, 3)), Value::Number(7.0));
+}
+
+// --- Deferred-tier PRODUCTION pins (a scalar-context #CALC! pin is vacuous: the
+// boundary maps any BYROW array result to #CALC! regardless of the cells. These
+// assert the SPILLED CELL values, so they FAIL the day MEDIAN/INDEX start
+// computing over an array-local — making any future relaxation deliberate.) -----
+
+#[test]
+fn fu4b_byrow_median_over_row_local_is_calc_in_production() {
+    // **Megaudit (Codex MED → operator-deferred; re-audit LOW: strengthen the pin).**
+    // MEDIAN is RangeAware-tier, so an array-local row stays #CALC! per cell — the
+    // result spills 2×1 with BOTH cells #CALC! (NOT {2;5}). If the relaxation later
+    // extends to the RangeAware reducers, these cells become numbers and this fails.
+    let (wb, _g, _r) = setup("BYROW({1,3,2;4,6,5},LAMBDA(r,MEDIAN(r)))", 0.0);
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        Some(SpillShape::new(2, 1)),
+        "BYROW still spills 2×1 even when each row is a deferred #CALC!"
+    );
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Calc)
+    );
+    assert_eq!(
+        wb.read(Address::new(0, 1, 1)),
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu4b_byrow_index_over_row_local_is_deferred_loud_in_production() {
+    // Companion deferred-tier production pin for the RangeAware LOOKUP family: INDEX
+    // over an array-local row stays LOUD (does NOT compute the lookup), confirming
+    // the relaxation is reducers-only. **The exact code differs from MEDIAN:** INDEX
+    // gets the array-local as `FnArg::Scalar(#CALC!)` (the RangeAware arm's unchanged
+    // `other` materialization) and REJECTS that malformed array arg with #VALUE!,
+    // whereas MEDIAN (a reducer) PROPAGATES the #CALC!. Both are loud/deferred; this
+    // pin asserts the observed #VALUE! per cell. It still spills 2×1 (errors spill).
+    // (The scalar-context pin `fu4b_byrow_index_over_row_local_is_calc_in_scalar_context`
+    // only sees the boundary's whole-array→#CALC! collapse, so it can't distinguish the
+    // codes — which is why this production pin exists.)
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,INDEX(r,1)))", 0.0);
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        Some(SpillShape::new(2, 1))
+    );
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(
+        wb.read(Address::new(0, 1, 1)),
+        Value::Error(ErrorValue::Value)
     );
 }

@@ -340,12 +340,14 @@ fn fu3_let_array_local_arithmetic_is_calc() {
 }
 
 #[test]
-fn fu3_let_array_local_as_sum_arg_is_calc() {
-    // An array local as a function arg stays #CALC! (deferred boundary). Unchanged by FU3.
-    assert_eq!(
-        eval("LET(s,SEQUENCE(3),SUM(s))"),
-        Value::Error(ErrorValue::Calc)
-    );
+fn fu4b_let_array_local_as_sum_arg_computes() {
+    // **FU4b (2026-06-21) — FLIPPED from `fu3_let_array_local_as_sum_arg_is_calc`
+    // (was #CALC!).** The scalar-aggregate array-as-arg relaxation (the substrate for
+    // `SUM(row)` inside BYROW) ALSO lets a generic array local flow into a reducer:
+    // =LET(s,SEQUENCE(3),SUM(s)) computes 1+2+3 = 6 (Excel-correct). The arithmetic
+    // form (`s*2`, above) and the Unified/Reference tiers (`TRANSPOSE(s)`/`INDEX(s,1)`)
+    // STAY #CALC! — the relaxation is scoped to the scalar-aggregate reducers only.
+    assert_eq!(eval("LET(s,SEQUENCE(3),SUM(s))"), num(6.0));
 }
 
 #[test]
@@ -471,24 +473,105 @@ fn fu4_map_array_lambda_slot_is_calc() {
     assert_eq!(eval("MAP({1},SEQUENCE(1))"), Value::Error(ErrorValue::Calc));
 }
 
-// --- Deferred boundaries (FU4b — BYROW / BYCOL not yet implemented) ----------
+// --- FU4b — BYROW / BYCOL (scalar-context + error model) --------------------
 
 #[test]
-fn fu4_byrow_unimplemented_is_name_error() {
-    // BYROW / BYCOL (whose lambda receives a whole row/column array) are deferred
-    // to FU4b. They are NOT `is_higher_order_helper` names yet, so they fall to the
-    // unknown-function path → #NAME?. Pinned so adding them later is a visible,
-    // deliberate change (and so the lambda arg doesn't crash the unknown-fn path).
+fn fu4b_byrow_array_result_is_calc_in_scalar_context() {
+    // **FLIPPED from `fu4_byrow_unimplemented_is_name_error` (was #NAME?).** BYROW now
+    // returns a column vector → in SCALAR context an array result is #CALC! (only the
+    // cell boundary spills; the {3;7} value+shape assertions live in
+    // let_lambda_recalc_contract.rs::fu4b_byrow_2d_spills_column).
     assert_eq!(
         eval("BYROW(SEQUENCE(3),LAMBDA(r,SUM(r)))"),
-        Value::Error(ErrorValue::Name)
+        Value::Error(ErrorValue::Calc)
     );
 }
 
 #[test]
-fn fu4_bycol_unimplemented_is_name_error() {
+fn fu4b_bycol_array_result_is_calc_in_scalar_context() {
+    // **FLIPPED from `fu4_bycol_unimplemented_is_name_error` (was #NAME?).** SEQUENCE(3)
+    // is 3×1; BYCOL over a single column → a 1×1 result, still an EvalResult::Array →
+    // #CALC! in scalar context.
     assert_eq!(
         eval("BYCOL(SEQUENCE(3),LAMBDA(c,SUM(c)))"),
-        Value::Error(ErrorValue::Name)
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu4b_byrow_wrong_arity_lambda_is_value() {
+    // BYROW's lambda takes exactly ONE param (a row); a 2-param lambda → whole-result
+    // #VALUE! (a scalar error, surfaces directly even in scalar context).
+    assert_eq!(
+        eval("BYROW({1,2;3,4},LAMBDA(r,s,SUM(r)))"),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4b_byrow_non_lambda_slot_is_value() {
+    // A non-lambda scalar in the lambda slot → whole-result #VALUE! (resolve fails up front).
+    assert_eq!(eval("BYROW({1,2;3,4},5)"), Value::Error(ErrorValue::Value));
+}
+
+#[test]
+fn fu4b_byrow_array_lambda_slot_is_calc() {
+    // An ARRAY in the lambda slot → #CALC! (an array in a callee position; FU3-consistent),
+    // NOT #VALUE!. Distinct from the non-array non-lambda slot above.
+    assert_eq!(
+        eval("BYROW({1,2;3,4},SEQUENCE(2))"),
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu4b_byrow_index_over_row_local_is_calc_in_scalar_context() {
+    // **Deferred-tier pin (the locked scope).** The array-as-arg relaxation is scoped to
+    // the scalar-aggregate REDUCERS only; a RangeAware fn like INDEX over the row array
+    // does NOT compute — it stays loud. In SCALAR context the whole BYROW array result
+    // collapses to #CALC! regardless of the per-cell code. (The per-cell code is actually
+    // #VALUE! — INDEX rejects the malformed scalar array arg — pinned precisely by the
+    // production test `fu4b_byrow_index_over_row_local_is_deferred_loud_in_production`.)
+    assert_eq!(
+        eval("BYROW({1,2;3,4},LAMBDA(r,INDEX(r,1)))"),
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu4b_byrow_transpose_over_row_local_is_calc() {
+    // Deferred-tier pin: a Unified-tier fn (TRANSPOSE) over the row array-local stays
+    // #CALC! (consistent with fu3_let_array_local_as_unified_fn_arg_is_calc).
+    assert_eq!(
+        eval("BYROW({1,2;3,4},LAMBDA(r,TRANSPOSE(r)))"),
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu4b_byrow_median_over_row_local_is_calc_deferred() {
+    // **Megaudit (Codex MED → operator-deferred):** MEDIAN / MODE / MODE.SNGL /
+    // LARGE / SMALL are RangeAware-tier (registry.rs `register_range_aware`), NOT
+    // RegisteredFn::Scalar — so the FU4b one-site relaxation does NOT reach them; a
+    // row array-local in MEDIAN stays #CALC! (same deferred bucket as INDEX/VLOOKUP/
+    // TRANSPOSE). The relaxation is SCOPED to the scalar-aggregate reducers
+    // (SUM/AVERAGE/MIN/MAX/COUNT/PRODUCT/VAR/STDEV). NOTE: this scalar-context check
+    // is a weak guard (the boundary maps ANY BYROW array result to #CALC!); the REAL
+    // deferred-MEDIAN pin is `fu4b_byrow_median_over_row_local_is_calc_in_production`
+    // in let_lambda_recalc_contract.rs, which asserts the per-cell spill values.
+    assert_eq!(
+        eval("BYROW({1,3,2;4,6,5},LAMBDA(r,MEDIAN(r)))"),
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu4b_byrow_empty_filter_source_is_calc() {
+    // **Megaudit (Codex LOW):** a degenerate / empty source flows loudly to #CALC!,
+    // no panic. FILTER with an all-FALSE mask returns #CALC! upstream; BYROW over it
+    // stays #CALC! (whether via the upstream error or the defensive 0-area guard).
+    assert_eq!(
+        eval("BYROW(FILTER({1;2},{0;0}),LAMBDA(r,SUM(r)))"),
+        Value::Error(ErrorValue::Calc)
     );
 }

@@ -501,23 +501,27 @@ pub(crate) fn is_aggregate_function(registry: &FunctionRegistry, name: &str) -> 
     )
 }
 
-/// **FU4 (2026-06-21):** the Tier-1 higher-order helper family — spreadsheet
+/// **FU4 (2026-06-21):** the higher-order helper family — spreadsheet
 /// functions that take a `LAMBDA` argument and INVOKE it. They are NOT
 /// registry-dispatched (no `RegisteredFn` — the registry has no way to carry a
 /// closure through `FunctionArg`); instead they are **eval-intercepted special
 /// forms**, recognized by name in `scalar.rs::eval_higher_order` (the cell-
 /// boundary + scalar paths) and given an extra invoked-set mark in the dep
 /// walker (`calcgraph_session.rs::discover`) so a precedent inside the helper's
-/// lambda body is never under-reported. The four names carry `ArgContext::
-/// Aggregate` metadata (`ql_functions::register_builtin_metadata`) so their
-/// range/array arg binds (the default `Scalar` context rejects a bare `A1:A3`).
+/// lambda body is never under-reported. The names carry `ArgContext::Aggregate`
+/// metadata (`ql_functions::register_builtin_metadata`) so their range/array arg
+/// binds (the default `Scalar` context rejects a bare `A1:A3`).
 ///
-/// Names are canonical uppercase (the parser upper-cases function names). A
-/// future FU4b (BYROW / BYCOL — whose lambda receives a whole row/column array)
-/// extends THIS list together with `eval_higher_order`. Pinned by
-/// `higher_order_helper_names_have_aggregate_metadata` (matcher → metadata sync).
+/// Names are canonical uppercase (the parser upper-cases function names).
+/// **FU4b (2026-06-21):** `BYROW` / `BYCOL` — whose lambda receives a whole
+/// row/column ARRAY (consumed by a scalar-aggregate reducer like `SUM(row)`) —
+/// join the list. Pinned by `is_higher_order_helper_matches_exactly_the_six`
+/// (matcher exactness) + the registry metadata-sync tests.
 pub(crate) fn is_higher_order_helper(name: &str) -> bool {
-    matches!(name, "MAP" | "MAKEARRAY" | "REDUCE" | "SCAN")
+    matches!(
+        name,
+        "MAP" | "MAKEARRAY" | "REDUCE" | "SCAN" | "BYROW" | "BYCOL"
+    )
 }
 
 /// **W5-RT-1 (RT-V1-01):** classifier for the reference-aware dispatch tier.
@@ -3804,27 +3808,29 @@ mod tests {
         }
     }
 
-    /// **FU4 (2026-06-21):** `is_higher_order_helper` matches EXACTLY the four
-    /// Tier-1 helper names and nothing else. Typo / drift guard — the matcher is
-    /// the single source of truth consumed by both the evaluator
+    /// **FU4 / FU4b (2026-06-21):** `is_higher_order_helper` matches EXACTLY the
+    /// six helper names and nothing else. Typo / drift guard — the matcher is the
+    /// single source of truth consumed by both the evaluator
     /// (`scalar.rs::eval_higher_order`) and the dep walker
     /// (`calcgraph_session.rs::discover`), and must stay in lockstep with the
     /// `eval_higher_order` match and the Aggregate-metadata registration.
     #[test]
-    fn is_higher_order_helper_matches_exactly_the_four() {
-        for name in ["MAP", "MAKEARRAY", "REDUCE", "SCAN"] {
+    fn is_higher_order_helper_matches_exactly_the_six() {
+        // FU4b adds BYROW / BYCOL to the FU4 Tier-1 four.
+        for name in ["MAP", "MAKEARRAY", "REDUCE", "SCAN", "BYROW", "BYCOL"] {
             assert!(
                 is_higher_order_helper(name),
                 "{name} must be recognized as a higher-order helper"
             );
         }
-        // Non-helpers — including the deferred FU4b names and an ordinary
-        // array/aggregate fn — must NOT match.
-        for name in ["BYROW", "BYCOL", "SUM", "SEQUENCE", "LET", "LAMBDA", "MAPX", "map"] {
+        // Non-helpers — an ordinary array/aggregate fn, the binder special forms,
+        // and lowercase/typo variants — must NOT match (names are canonical
+        // uppercase; the six are exhaustive).
+        for name in ["SUM", "SEQUENCE", "LET", "LAMBDA", "MAPX", "map", "byrow"] {
             assert!(
                 !is_higher_order_helper(name),
                 "{name} must NOT be recognized as a higher-order helper (names are \
-                 canonical uppercase; the four are exhaustive)"
+                 canonical uppercase; the six are exhaustive)"
             );
         }
     }

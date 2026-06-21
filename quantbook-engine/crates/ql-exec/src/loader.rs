@@ -528,4 +528,50 @@ mod tests {
         );
         assert_eq!(loaded.formula_at(s, 1, 0), None);
     }
+
+    /// **FU4b (2026-06-21)** — a BYROW-spilled anchor must survive save → load →
+    /// recompute with full fidelity. Exercises the array-source materialization,
+    /// the per-row array→lambda binding, and the spill writeback on the load path.
+    /// BYCOL shares the same machinery, so one round-trip test covers both.
+    #[test]
+    fn fu4b_byrow_spill_survives_qbook_round_trip() {
+        let (_dir, path) = temp_path("fu4b-byrow-spill-roundtrip.qbook");
+
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(s, 0, 0, "BYROW({1,2;3,4},LAMBDA(r,SUM(r)))")
+                .unwrap();
+        }
+        // Pre-save: 2×1 spill at A1:A2 → {3;7}.
+        assert_eq!(
+            wb.spill_anchor_at(s, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(2, 1))
+        );
+        assert_eq!(wb.read(Address::new(s, 1, 0)), Value::Number(7.0));
+
+        save_workbook(&wb, "fu4b-byrow-spill-roundtrip", &path).unwrap();
+
+        let (loaded, result) = load_workbook_and_recompute(&path, &reg).unwrap();
+        assert!(result.is_complete(), "recompute failures: {result:?}");
+
+        assert_eq!(
+            loaded.spill_anchor_at(s, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(2, 1)),
+            "BYROW spill anchor must be re-registered on load"
+        );
+        assert_eq!(loaded.read(Address::new(s, 0, 0)), Value::Number(3.0));
+        assert_eq!(loaded.read(Address::new(s, 1, 0)), Value::Number(7.0));
+        let anchor_formula = loaded
+            .formula_at(s, 0, 0)
+            .map(|t| t.as_ref().to_string())
+            .expect("anchor retains its formula after round-trip");
+        assert!(
+            anchor_formula.contains("BYROW"),
+            "anchor formula must round-trip as a BYROW call; got {anchor_formula:?}"
+        );
+        assert_eq!(loaded.formula_at(s, 1, 0), None);
+    }
 }
