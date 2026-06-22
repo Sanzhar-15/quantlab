@@ -1514,10 +1514,12 @@ fn fu4b_byrow_error_element_in_row_flows_into_lambda() {
 // --- PRODUCTION spill pins (a scalar-context #CALC! pin is vacuous: the boundary maps
 // any BYROW array result to #CALC! regardless of the cells. These assert the SPILLED
 // CELL values). The reducers (FU4c-A), lookups (FU4c-B), financial / pair-stats reducers
-// (FU4c-C1), conditionals / text / multi-range / SUBTOTAL (FU4c-D), and the Unified array tier
-// TRANSPOSE/FILTER/SORT/SORTBY/UNIQUE (FU4c-C2) now compute / spill here; the still-DEFERRED
-// families (ReferenceAware ROW/COLUMN, and CHOOSE -- no data-array slot) stay loud -- those pins
-// FAIL the day THOSE start computing over an array-local, making any future relaxation deliberate. -----
+// (FU4c-C1), conditionals / text / multi-range / SUBTOTAL (FU4c-D), the Unified array tier
+// TRANSPOSE/FILTER/SORT/SORTBY/UNIQUE (FU4c-C2), and the ReferenceAware tier
+// ROWS/COLUMNS/ROW/COLUMN/ISFORMULA/FORMULATEXT (FU4c-C3) now compute (ROWS/COLUMNS) or loud-reject
+// (ROW/COLUMN -> #VALUE!, ISFORMULA/FORMULATEXT -> #N/A) an array-local here; the ONLY still-DEFERRED
+// consumer is CHOOSE (a passthrough, no data-array slot) -- its pin FAILS the day CHOOSE starts
+// computing over an array-local, making any future relaxation deliberate. -----
 
 #[test]
 fn fu4c_byrow_median_over_row_local_computes_in_production() {
@@ -2277,6 +2279,255 @@ fn fu4c_c2_transpose_over_array_local_body_cell_ref_in_deps() {
     assert!(
         deps.cells.iter().any(|&(s, r, c)| (s, r, c) == (0, 0, 0)),
         "$A$1 inside the Unified-fn LET binding must be a precedent; got {:?}",
+        deps.cells
+    );
+}
+
+// =============================================================================
+// FU4c-C3 (2026-06-22): an array-local fed as an arg to a ReferenceAware fn
+// (ROW/COLUMN/ROWS/COLUMNS/ISFORMULA/FORMULATEXT) materializes as RefArg::Array at
+// the SINGLE reference-aware materializer -- byte-identical to the array-LITERAL path.
+// ROWS/COLUMNS compute the shape COUNT (the win); ROW/COLUMN loud-reject -> #VALUE!;
+// ISFORMULA/FORMULATEXT loud-reject -> #N/A; ISREF (LazyShape, separate materializer)
+// is unchanged FALSE. UNGATED (no name predicate). Unlike the C2 Unified tier these
+// fns return SCALARS -> NO spill -> the cell holds a plain value (assert wb.read, not
+// assert_spill_block). Values hand-recomputed from array_returning_fns.rs / reference_fns.rs
+// (orientations: {a,b,c}=1xN row, {a;b;c}=Nx1 col, SEQUENCE(n)=nx1, SEQUENCE(r,c)=rxc).
+// =============================================================================
+
+#[test]
+fn fu4c_c3_let_rows_over_seq_column_local() {
+    // SEQUENCE(3) = 3x1; ROWS(s) = av.rows() = 3 (scalar, no spill).
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),ROWS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(3.0));
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        None,
+        "ROWS returns a scalar -- must NOT spill"
+    );
+}
+
+#[test]
+fn fu4c_c3_let_columns_over_seq_column_local() {
+    // SEQUENCE(3) = 3x1; COLUMNS(s) = av.cols() = 1.
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),COLUMNS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(1.0));
+}
+
+#[test]
+fn fu4c_c3_let_rows_over_seq_2d_local() {
+    // SEQUENCE(2,3) = 2x3; ROWS(s) = 2.
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(2,3),ROWS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(2.0));
+}
+
+#[test]
+fn fu4c_c3_let_columns_over_seq_2d_local() {
+    // SEQUENCE(2,3) = 2x3; COLUMNS(s) = 3.
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(2,3),COLUMNS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(3.0));
+}
+
+#[test]
+fn fu4c_c3_let_rows_over_row_literal_local() {
+    // {1,2,3} = 1x3 row; ROWS(s) = 1.
+    let (wb, _g, _r) = setup("LET(s,{1,2,3},ROWS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(1.0));
+}
+
+#[test]
+fn fu4c_c3_let_columns_over_row_literal_local() {
+    // {1,2,3} = 1x3 row; COLUMNS(s) = 3.
+    let (wb, _g, _r) = setup("LET(s,{1,2,3},COLUMNS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(3.0));
+}
+
+#[test]
+fn fu4c_c3_let_rows_over_col_literal_local() {
+    // {1;2;3} = 3x1 col; ROWS(s) = 3.
+    let (wb, _g, _r) = setup("LET(s,{1;2;3},ROWS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(3.0));
+}
+
+#[test]
+fn fu4c_c3_let_rows_over_2x2_literal_local() {
+    // {1,2;3,4} = 2x2; ROWS(s) = 2.
+    let (wb, _g, _r) = setup("LET(s,{1,2;3,4},ROWS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(2.0));
+}
+
+#[test]
+fn fu4c_c3_let_columns_over_2x2_literal_local() {
+    // {1,2;3,4} = 2x2; COLUMNS(s) = 2.
+    let (wb, _g, _r) = setup("LET(s,{1,2;3,4},COLUMNS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(2.0));
+}
+
+#[test]
+fn fu4c_c3_let_row_over_array_local_is_value() {
+    // ROW does NOT accept an array (Microsoft canon, reference_fns.rs:78). The array-local
+    // now REACHES ROW as RefArg::Array (was #CALC! propagation) -> #VALUE!.
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),ROW(s))", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_c3_let_column_over_array_local_is_value() {
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),COLUMN(s))", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_c3_let_isformula_over_array_local_is_na() {
+    // ISFORMULA rejects any non-reference -> #N/A (reference_fns.rs:266), WITHOUT querying
+    // the workbook. The array-local reaches it as RefArg::Array -> #N/A.
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),ISFORMULA(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Error(ErrorValue::NA));
+}
+
+#[test]
+fn fu4c_c3_let_formulatext_over_array_local_is_na() {
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),FORMULATEXT(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Error(ErrorValue::NA));
+}
+
+#[test]
+fn fu4c_c3_let_isref_over_array_local_is_false_unchanged() {
+    // ISREF is the ONE ReferenceAware fn on ArgContract::LazyShape -- it uses the separate
+    // `materialize_ref_arg_lazy` (LocalRef -> PlanKind::Literal -> FALSE), which the C3 arm
+    // never touches. Identical before and after.
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),ISREF(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Boolean(false));
+}
+
+#[test]
+fn fu4c_c3_let_rows_over_degenerate_local_is_zero_no_panic() {
+    // **Soundness-lane catch.** A DEGENERATE array-local (an all-FALSE FILTER bound to a
+    // local -- a state the binder forbids for a literal): s = FILTER({1;2},{0;0}) = empty(0,1).
+    // ROWS(s) = av.rows() = 0 (a plain field read -- no .first()/.at() -> no panic). The value
+    // 0 is one no array LITERAL can produce.
+    let (wb, _g, _r) = setup("LET(s,FILTER({1;2},{0;0}),ROWS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(0.0));
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        None,
+        "ROWS of a degenerate local is a scalar 0 -- must NOT spill"
+    );
+}
+
+#[test]
+fn fu4c_c3_let_columns_over_degenerate_local_is_one_no_panic() {
+    // s = FILTER({1;2},{0;0}) = empty(0,1); COLUMNS(s) = av.cols() = 1. No panic.
+    let (wb, _g, _r) = setup("LET(s,FILTER({1;2},{0;0}),COLUMNS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(1.0));
+}
+
+#[test]
+fn fu4c_c3_let_row_over_degenerate_local_is_value_no_panic() {
+    // ROW matches RefArg::Array(_) shape-blind -> #VALUE!, never dereferences the array.
+    let (wb, _g, _r) = setup("LET(s,FILTER({1;2},{0;0}),ROW(s))", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_c3_let_rows_over_degenerate_row_vec_local_is_one_no_panic() {
+    // **Megaudit fold (Sonnet lane A coverage gap):** the OTHER degenerate orientation.
+    // {1,2} is a ROW vector, so an all-FALSE FILTER -> empty(1,0) (the `is_row_vec` branch,
+    // array_returning_fns.rs:423) -- a 0-COL array, vs the 0-ROW empty(0,1) above. ROWS = 1
+    // (av.rows() on a 1x0 array, a field read -- panic-free).
+    let (wb, _g, _r) = setup("LET(s,FILTER({1,2},{0,0}),ROWS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(1.0));
+}
+
+#[test]
+fn fu4c_c3_let_columns_over_degenerate_row_vec_local_is_zero_no_panic() {
+    // empty(1,0); COLUMNS = av.cols() = 0 (field read -- no panic on a 0-col array).
+    let (wb, _g, _r) = setup("LET(s,FILTER({1,2},{0,0}),COLUMNS(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(0.0));
+}
+
+#[test]
+fn fu4c_c3_let_rows_over_scalar_local_is_value() {
+    // Non-array control: x = 5 is a LocalBinding::Value, so the new arm's `_` fallback
+    // delegates to scalar eval -> RefArg::Scalar(5) -> ROWS rejects a scalar -> #VALUE!.
+    // Proves the relaxation is strictly array-gated (unchanged from before C3).
+    let (wb, _g, _r) = setup("LET(x,5,ROWS(x))", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_c3_let_row_over_scalar_local_is_value() {
+    let (wb, _g, _r) = setup("LET(x,5,ROW(x))", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_c3_rows_over_shape_varying_array_local_recomputes() {
+    // **The cardinal-sin test (PRIMARY -- value VARIES with A1).** C3 changes ONLY arg
+    // materialization, not dep extraction (dep walker UNCHANGED). $A$1 is SEQUENCE's count,
+    // so the array SHAPE (and thus ROWS) varies with A1: A1=3 -> SEQUENCE(3)=3x1 -> ROWS=3;
+    // edit A1=5 -> SEQUENCE(5)=5x1 -> ROWS=5. A STALE 3 means $A$1 was never registered as a
+    // precedent inside the ReferenceAware-fn LET binding.
+    let (mut wb, mut graph, reg) = setup("LET(s,SEQUENCE($A$1),ROWS(s))", 3.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(3.0));
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(
+        attempted >= 1,
+        "editing A1 must recompute the shape-varying ROWS-over-array-local (attempted == 0 \
+         means the dep inside the SEQUENCE producer was never registered -- the cardinal sin)"
+    );
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(5.0));
+}
+
+#[test]
+fn fu4c_c3_rows_over_shape_invariant_array_local_still_registers_dep() {
+    // **Cardinal-sin (SECONDARY -- shape-INVARIANT).** SEQUENCE(3,1,$A$1) has CONSTANT shape
+    // 3x1 regardless of $A$1 (only the start varies), so ROWS=3 for any A1. The point is NOT
+    // a value change -- it is that $A$1 is STILL a registered precedent: editing it re-dirties
+    // and recomputes (attempted >= 1), re-yielding 3 rather than going stale.
+    let (mut wb, mut graph, reg) = setup("LET(s,SEQUENCE(3,1,$A$1),ROWS(s))", 1.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(3.0));
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(10.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(
+        attempted >= 1,
+        "$A$1 must stay a precedent even though ROWS is shape-invariant"
+    );
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(3.0));
+}
+
+#[test]
+fn fu4c_c3_rows_over_array_local_seq_arg_cell_ref_in_deps() {
+    // Direct dep-extraction proof: $A$1 inside the SEQUENCE producer of the array-local is a
+    // precedent of the ROWS-over-array-local formula. ROWS routes through the AddressOnly
+    // dep policy, but a LocalRef arg delegates to the no-op LocalRef arm -- the $A$1 dep comes
+    // from the INDEPENDENT binding-value walk, so it is preserved.
+    let deps = formula_deps_for("LET(s,SEQUENCE(3,1,$A$1),ROWS(s))").expect("has deps");
+    assert!(
+        deps.cells.iter().any(|&(s, r, c)| (s, r, c) == (0, 0, 0)),
+        "$A$1 inside the ReferenceAware-fn LET binding must be a precedent; got {:?}",
         deps.cells
     );
 }

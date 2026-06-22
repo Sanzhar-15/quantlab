@@ -1329,3 +1329,53 @@ fn fu4c_c2_sortby_over_array_locals_is_calc_in_scalar_context() {
         Value::Error(ErrorValue::Calc)
     );
 }
+
+// =============================================================================
+// FU4c-C3 (2026-06-22): array-local consumed by a ReferenceAware fn
+// (ROW/COLUMN/ROWS/COLUMNS/ISFORMULA/FORMULATEXT). **CONTRAST with C2:** the C2
+// Unified-tier fns (TRANSPOSE/FILTER/...) return ARRAYS, which collapse to #CALC! in
+// scalar context. ROWS/COLUMNS/etc return SCALARS, so the scalar `eval()` path and the
+// cell-boundary path CONVERGE on the SAME real value -- there is NO scalar-context #CALC!
+// here. These assert the REAL result: ROWS/COLUMNS the shape count, ROW/COLUMN #VALUE!,
+// ISFORMULA/FORMULATEXT #N/A, ISREF unchanged FALSE (LazyShape).
+// =============================================================================
+
+#[test]
+fn fu4c_c3_rows_over_array_local_is_value_in_scalar_context() {
+    assert_eq!(eval("LET(s,SEQUENCE(3),ROWS(s))"), num(3.0));
+}
+
+#[test]
+fn fu4c_c3_columns_over_array_local_is_value_in_scalar_context() {
+    assert_eq!(eval("LET(s,SEQUENCE(3),COLUMNS(s))"), num(1.0));
+}
+
+#[test]
+fn fu4c_c3_rows_over_2d_array_local_is_value_in_scalar_context() {
+    assert_eq!(eval("LET(s,SEQUENCE(2,3),ROWS(s))"), num(2.0));
+}
+
+#[test]
+fn fu4c_c3_row_over_array_local_is_value_error_in_scalar_context() {
+    // ROW rejects an array (Microsoft canon) -- byte-identical to the array-LITERAL in the
+    // SAME sub-expression context (`LET(x,1,ROW({1;2;3}))` is also #VALUE!). Only a bare
+    // top-level `=ROW({1;2;3})` differs (#CALC!, the boundary spill-defer guard).
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),ROW(s))"),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_c3_isformula_over_array_local_is_na_in_scalar_context() {
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),ISFORMULA(s))"),
+        Value::Error(ErrorValue::NA)
+    );
+}
+
+#[test]
+fn fu4c_c3_isref_over_array_local_is_false_in_scalar_context() {
+    // ISREF is LazyShape (separate materializer) -- the C3 arm never reaches it. Unchanged.
+    assert_eq!(eval("LET(s,SEQUENCE(3),ISREF(s))"), Value::Boolean(false));
+}

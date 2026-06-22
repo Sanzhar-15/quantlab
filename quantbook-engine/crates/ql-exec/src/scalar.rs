@@ -993,9 +993,10 @@ fn eval_let_bindings<E: CellEnv>(
 /// `Let`/`CallLambda` spill arms. NOTE the array only SPILLS when it is the DIRECT
 /// body/result. An array local passed THROUGH a function arg now COMPUTES for the
 /// scalar-aggregate (FU4b, `SUM(s)`=6), RangeAware (FU4c-A/B/C1/D, `SUMIF(s,">2")`=12),
-/// and Unified array (FU4c-C2, `=LET(s,SEQUENCE(3),TRANSPOSE(s))` spills 1x3) tiers;
-/// only array arithmetic (`s*2`) and a nested Unified call in scalar context
-/// (`SUM(TRANSPOSE(s))`) stay `#CALC!`.
+/// Unified array (FU4c-C2, `=LET(s,SEQUENCE(3),TRANSPOSE(s))` spills 1x3), and
+/// ReferenceAware (FU4c-C3, `ROWS(s)`=3; ROW/COLUMN/ISFORMULA/FORMULATEXT loud-reject
+/// the array per their own canon) tiers; only array arithmetic (`s*2`) and a nested
+/// Unified call in scalar context (`SUM(TRANSPOSE(s))`) stay `#CALC!`.
 fn eval_binding<E: CellEnv>(
     plan: &ExprPlan,
     env: &E,
@@ -1044,11 +1045,13 @@ fn eval_binding<E: CellEnv>(
         // routed — `ExprPlan::Array`, a Unified-tier `Function`, and a UDF
         // `Function` — and each is materialized EXACTLY ONCE via the boundary entry
         // point (no eval-scalar-then-re-eval: that would re-fire volatiles / UDFs,
-        // a No-Fallbacks violation). Every OTHER plan (incl. ROW/COLUMN, which are
-        // ReferenceAware and keep their scalar-context top-left semantics) stays on
-        // `eval_scalar_with_cache` exactly as before — so this changes NO
-        // scalar-context outcome (an `Array` binding still maps to `#CALC!` at every
-        // sub-expression consumer, `LocalRef` :755 / `CallLambda` :776), it only
+        // a No-Fallbacks violation). Every OTHER plan (incl. the ReferenceAware fns
+        // ROW/COLUMN/ROWS/COLUMNS -- whose array-local ARG is materialized by FU4c-C3
+        // INSIDE `eval_scalar_with_cache`, not by this routing) stays on
+        // `eval_scalar_with_cache` exactly as before -- so this routing changes NO
+        // scalar-context outcome (a DIRECT `Array` binding still maps to `#CALC!` as a
+        // `LocalRef` :755 / `CallLambda` :776 consumer; a function-arg consumer
+        // materializes it per its tier), it only
         // ENABLES the boundary spill. The guard matches on plan variant first, so
         // the hot scalar bindings (`Number` / `CellRef` / `Binary`) take the cheap
         // `false` branch with no extra registry lookup.
@@ -1723,6 +1726,27 @@ fn materialize_ref_arg_eager<E: CellEnv>(
             RefArg::Array(av)
         }
         ExprPlan::Error(ev) => RefArg::Error(*ev),
+        // **FU4c-C3 (2026-06-22):** an array-valued LET/LAMBDA local
+        // (`LocalBinding::Array`) fed as an arg to a ReferenceAware fn
+        // materializes as `RefArg::Array` -- the SAME carrier the
+        // `ExprPlan::Array` LITERAL arm above produces -- so ROWS / COLUMNS
+        // compute the shape count and ROW / COLUMN / ISFORMULA / FORMULATEXT
+        // loud-reject (`#VALUE!` / `#N/A`), each byte-identical to the
+        // array-literal path. UNGATED (this materializer is shared across all
+        // `ArgContract::Eager` reference-aware fns); ISREF is `LazyShape` and
+        // uses the separate `materialize_ref_arg_lazy` (`LocalRef` -> `Literal`
+        // -> FALSE), untouched. All six fns return scalars, so this ONE site
+        // serves both scalar-context eval and the cell-boundary path (no spill).
+        // A NON-array local (`Value` / `Callable` / missing) falls through to the
+        // scalar eval EXACTLY as the `other =>` arm below (its value / `#CALC!` /
+        // `#NAME?`).
+        ExprPlan::LocalRef(n) => match env.local_env().lookup(n) {
+            Some(LocalBinding::Array(arr)) => RefArg::Array(arr.clone()),
+            _ => match eval_scalar_with_cache(plan, env, registry, cache) {
+                Value::Error(ev) => RefArg::Error(ev),
+                ok => RefArg::Scalar(ok),
+            },
+        },
         other => {
             let v = eval_scalar_with_cache(other, env, registry, cache);
             match v {
