@@ -506,8 +506,9 @@ pub(crate) fn is_aggregate_function(registry: &FunctionRegistry, name: &str) -> 
 /// are the STATISTICAL-REDUCER subset that consume an array-valued LET/LAMBDA local
 /// (`MEDIAN(row)` inside `BYROW`, or `LET(s,SEQUENCE(5),MEDIAN(s))`) — see the gated arm in
 /// `scalar.rs`'s `RegisteredFn::RangeAware` materialization loop. The RangeAware LOOKUPS
-/// (INDEX/VLOOKUP/…) ALSO consume one via the sibling `is_range_aware_lookup` (FU4c-B); the
-/// conditionals (SUMIF/…), pair-stats (CORREL/…) and financial (SHARPE/…) reducers stay
+/// (INDEX/VLOOKUP/…, FU4c-B), the financial reducers (SHARPE/…, FU4c-C1) and the pair-stats
+/// reducers (CORREL/…, FU4c-C1) ALSO consume one via their sibling predicates; the
+/// conditionals (SUMIF/…), multi-range (SUMPRODUCT), text (CONCAT/…) and SUBTOTAL stay
 /// DEFERRED: an array-local in them stays `#CALC!`/`#VALUE!` (pinned).
 ///
 /// A NAME-matcher is required, not a metadata read: `ArgContext::Aggregate` is shared by the
@@ -553,6 +554,63 @@ pub(crate) fn is_range_aware_lookup(name: &str) -> bool {
     matches!(
         name,
         "INDEX" | "VLOOKUP" | "HLOOKUP" | "MATCH" | "XLOOKUP" | "XMATCH"
+    )
+}
+
+/// **FU4c-C1 (2026-06-22):** the RangeAware-tier FINANCIAL reducers — they reduce a
+/// returns / cash-flow series (plus optional SCALAR params) to a single value. Like the
+/// statistical reducers, they consume an array-valued LET/LAMBDA local via the SAME gated arm
+/// in `scalar.rs`'s `RegisteredFn::RangeAware` loop, byte-identical to a real range — so each
+/// computes over the local exactly as over the equivalent range (correctness inherited).
+///
+/// Position-blind is sound: every NON-data (scalar) slot rejects a `FnArg::Range` LOUDLY
+/// (`#VALUE!`) BEFORE any inner coercion — `arg_num` / `coerce_numeric` take `&Value`, so a
+/// `Range` is structurally unreachable there (verified: NPV rate `financial_fns.rs:1349`,
+/// IRR/XIRR guess, MIRR finance/reinvest, XNPV rate, SHARPE/VOLATILITY/SORTINO scalar params).
+/// NPV's variadic cash-flow slots deliberately accept a scalar number OR a range, so
+/// `NPV(0.1,s)` computes while `NPV(s,..)` (array-local in the rate slot) is `#VALUE!`.
+/// A NAME-matcher is required (`ArgContext::Aggregate` is shared by the whole RangeAware tier).
+/// The 9 are the complete `register_range_aware` financial-reducer set. Pinned by
+/// `is_range_aware_financial_reducer_matches_exactly_the_nine`.
+pub(crate) fn is_range_aware_financial_reducer(name: &str) -> bool {
+    matches!(
+        name,
+        "SHARPE"
+            | "MAX_DRAWDOWN"
+            | "VOLATILITY"
+            | "SORTINO"
+            | "NPV"
+            | "IRR"
+            | "MIRR"
+            | "XNPV"
+            | "XIRR"
+    )
+}
+
+/// **FU4c-C1 (2026-06-22):** the RangeAware-tier PAIR-STATS reducers — they take TWO
+/// equal-shape data arrays and reduce to a scalar (correlation / covariance / regression /
+/// paired sums-of-squares). Because the materialization loop fires PER-ARG, BOTH array-local
+/// args of a gated pair-stat materialize as Ranges (`CORREL(s,s)` → two Ranges), and each fn's
+/// collector enforces equal 2-D shape — a mismatch is rejected LOUDLY (`#VALUE!`, e.g.
+/// `range_fns.rs:1544` / `1379`). These have NO non-data slot (fixed arity 2, both data), so
+/// there is no wrong-slot face beyond shape. A NAME-matcher is required. The 11 are the
+/// complete `register_range_aware` pair-stats set — note SUMX2MY2 / SUMX2PY2 / SUMXMY2 belong
+/// here (a paired-sums-of-squares trio). Pinned by
+/// `is_range_aware_pair_stat_reducer_matches_exactly_the_eleven`.
+pub(crate) fn is_range_aware_pair_stat_reducer(name: &str) -> bool {
+    matches!(
+        name,
+        "CORREL"
+            | "PEARSON"
+            | "COVARIANCE.P"
+            | "COVARIANCE.S"
+            | "SLOPE"
+            | "INTERCEPT"
+            | "RSQ"
+            | "STEYX"
+            | "SUMX2MY2"
+            | "SUMX2PY2"
+            | "SUMXMY2"
     )
 }
 
@@ -3918,10 +3976,11 @@ mod tests {
                 "{name} must be recognized as a RangeAware statistical reducer"
             );
         }
-        // Non-reducers — RangeAware lookups (now their own gate `is_range_aware_lookup`),
-        // conditionals / pair-stats / financial reducers (DEFERRED), a Scalar-tier
-        // aggregate, and lowercase — must NOT match (the fourteen are exhaustive; names
-        // are canonical uppercase).
+        // Non-reducers — RangeAware lookups (`is_range_aware_lookup`), pair-stats / financial
+        // reducers (their OWN FU4c-C1 gates `is_range_aware_pair_stat_reducer` /
+        // `is_range_aware_financial_reducer`), conditionals (still deferred), a Scalar-tier
+        // aggregate, and lowercase — must NOT match THIS gate (the fourteen are exhaustive;
+        // names are canonical uppercase).
         for name in [
             "INDEX",
             "VLOOKUP",
@@ -3941,8 +4000,8 @@ mod tests {
             assert!(
                 !is_range_aware_reducer(name),
                 "{name} must NOT be recognized as a RangeAware statistical reducer \
-                 (the fourteen are exhaustive; lookups are a separate gate, pair-stats \
-                 / financial reducers are deferred)"
+                 (the fourteen are exhaustive; lookups, pair-stats, and financial \
+                 reducers each have their own separate gate)"
             );
         }
     }
@@ -3972,6 +4031,99 @@ mod tests {
                 "{name} must NOT be recognized as a RangeAware lookup \
                  (the six are exhaustive; CHOOSE has no data-array slot; \
                  reducers are a separate gate; names are canonical uppercase)"
+            );
+        }
+    }
+
+    /// **FU4c-C1 (2026-06-22):** `is_range_aware_financial_reducer` matches EXACTLY the nine
+    /// financial reducers and nothing else. Drift guard — this matcher (OR'd into the
+    /// `scalar.rs` arm) gates the array-as-arg relaxation, so a name wrongly added would relax
+    /// a non-financial fn, and a name wrongly dropped would leave a financial reducer silently
+    /// `#VALUE!` over an array-local.
+    #[test]
+    fn is_range_aware_financial_reducer_matches_exactly_the_nine() {
+        for name in [
+            "SHARPE",
+            "MAX_DRAWDOWN",
+            "VOLATILITY",
+            "SORTINO",
+            "NPV",
+            "IRR",
+            "MIRR",
+            "XNPV",
+            "XIRR",
+        ] {
+            assert!(
+                is_range_aware_financial_reducer(name),
+                "{name} must be recognized as a RangeAware financial reducer"
+            );
+        }
+        // Non-financial — the pair-stats gate's members, the stat-reducer / lookup gates,
+        // a conditional (still deferred), a Scalar-tier aggregate, and lowercase — must NOT
+        // match (the nine are exhaustive; names are canonical uppercase).
+        for name in [
+            "CORREL",
+            "COVARIANCE.P",
+            "SUMX2MY2",
+            "MEDIAN",
+            "INDEX",
+            "SUMIF",
+            "SUM",
+            "sharpe",
+            "npv",
+        ] {
+            assert!(
+                !is_range_aware_financial_reducer(name),
+                "{name} must NOT be recognized as a RangeAware financial reducer \
+                 (the nine are exhaustive; pair-stats / stat-reducers / lookups each have \
+                 their own gate; names are canonical uppercase)"
+            );
+        }
+    }
+
+    /// **FU4c-C1 (2026-06-22):** `is_range_aware_pair_stat_reducer` matches EXACTLY the eleven
+    /// two-array pair-stats reducers and nothing else. Drift guard — same role as the others.
+    /// The SUMX2MY2 / SUMX2PY2 / SUMXMY2 trio (paired sums-of-squares) belongs here; an
+    /// earlier explore pass missed them, so this pin is the completeness backstop.
+    #[test]
+    fn is_range_aware_pair_stat_reducer_matches_exactly_the_eleven() {
+        for name in [
+            "CORREL",
+            "PEARSON",
+            "COVARIANCE.P",
+            "COVARIANCE.S",
+            "SLOPE",
+            "INTERCEPT",
+            "RSQ",
+            "STEYX",
+            "SUMX2MY2",
+            "SUMX2PY2",
+            "SUMXMY2",
+        ] {
+            assert!(
+                is_range_aware_pair_stat_reducer(name),
+                "{name} must be recognized as a RangeAware pair-stats reducer"
+            );
+        }
+        // Non-pair-stats — the financial gate's members, the stat-reducer / lookup gates, a
+        // conditional, a Scalar-tier aggregate, and lowercase — must NOT match (the eleven
+        // are exhaustive; names are canonical uppercase).
+        for name in [
+            "SHARPE",
+            "NPV",
+            "MEDIAN",
+            "VLOOKUP",
+            "SUMIF",
+            "SUMPRODUCT",
+            "SUM",
+            "correl",
+            "sumx2my2",
+        ] {
+            assert!(
+                !is_range_aware_pair_stat_reducer(name),
+                "{name} must NOT be recognized as a RangeAware pair-stats reducer \
+                 (the eleven are exhaustive; financial / stat-reducers / lookups each have \
+                 their own gate; names are canonical uppercase)"
             );
         }
     }

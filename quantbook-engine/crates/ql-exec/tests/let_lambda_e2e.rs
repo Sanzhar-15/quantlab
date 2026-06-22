@@ -31,6 +31,20 @@ fn num(n: f64) -> Value {
     Value::number(n)
 }
 
+/// **FU4c-C1 (2026-06-22):** assert a numeric result within `tol` (mirrors the `approx`
+/// helper in `financial_fns.rs`). The financial reducers (SHARPE/VOLATILITY/SORTINO/NPV/
+/// IRR/MIRR/XNPV/XIRR) yield irrational / iterative values; the pair-stats self-pairing
+/// identities are exactly representable and use `num()` equality instead.
+fn approx(actual: Value, expected: f64, tol: f64) {
+    match actual {
+        Value::Number(n) => assert!(
+            (n - expected).abs() <= tol,
+            "expected ~{expected} (tol {tol}), got {n}"
+        ),
+        other => panic!("expected Number ~{expected}, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------
 // LET — scalar (donor parity)
 // ---------------------------------------------------------------------
@@ -697,19 +711,18 @@ fn fu4c_reducer_wrong_slot_array_is_loud() {
 }
 
 #[test]
-fn fu4c_non_gated_range_aware_over_array_local_stays_loud() {
-    // Reducers-only: a RangeAware fn OUTSIDE the gate keeps the unchanged `other =>`
-    // path (array-local → `FnArg::Scalar(#CALC!)`), and its collector rejects a Scalar
-    // arg → #VALUE!. CORREL (pair-stats) and SHARPE (financial) both look reducer-ish
-    // but are deferred — this catches an over-broad gate.
+fn fu4c_c1_financial_pairstat_compute_conditional_stays_loud() {
+    // **FU4c-C1 (2026-06-22):** the financial + pair-stats RangeAware reducers now consume an
+    // array-local (CORREL/MAX_DRAWDOWN below — both EXACT-valued witnesses). The over-broad-
+    // gate guard moves to SUMIF — a RangeAware CONDITIONAL still outside every C1 gate, which
+    // keeps the unchanged `other =>` path (array-local → `FnArg::Scalar(#CALC!)`) and rejects
+    // it → #VALUE!. (This is the FLIPPED + repurposed `..._non_gated_range_aware_stays_loud`.)
+    assert_eq!(eval("LET(s,SEQUENCE(5),CORREL(s,s))"), num(1.0)); // pair-stats: self-corr = 1
+    assert_eq!(eval("LET(s,SEQUENCE(5),MAX_DRAWDOWN(s))"), num(0.0)); // financial: increasing → 0
     assert_eq!(
-        eval("LET(s,SEQUENCE(5),CORREL(s,s))"),
+        eval("LET(s,SEQUENCE(5),SUMIF(s,\">2\"))"),
         Value::Error(ErrorValue::Value)
-    );
-    assert_eq!(
-        eval("LET(s,SEQUENCE(5),SHARPE(s))"),
-        Value::Error(ErrorValue::Value)
-    );
+    ); // STILL deferred (conditional tier) — over-broad-gate guard
 }
 
 // =============================================================================
@@ -848,4 +861,193 @@ fn fu4c_choose_over_array_local_is_excluded_and_loud() {
         eval("LET(s,SEQUENCE(3),CHOOSE(1,s,9))"),
         Value::Error(ErrorValue::Calc)
     );
+}
+
+// =============================================================================
+// FU4c-C1 (2026-06-22): array-local consumed by a RangeAware FINANCIAL or PAIR-STATS
+// reducer. Same gated arm as FU4c-A/B: the array-local materializes as a shape-carrying
+// Range, byte-identical to a real range, so each computes exactly as over the equivalent
+// range. Pair-stats self-pairing identities are EXACT (num()); financial values are
+// irrational/iterative (approx(), anchored to the financial_fns.rs unit tests).
+// =============================================================================
+
+// --- pair-stats (exact, self-pairing identities) ---
+
+#[test]
+fn fu4c_c1_let_correl_pearson_rsq_self_pair_is_one() {
+    // self-correlation of a non-constant series = 1 (num=denom); RSQ = r^2 = 1.
+    assert_eq!(eval("LET(s,SEQUENCE(5),CORREL(s,s))"), num(1.0));
+    assert_eq!(eval("LET(s,SEQUENCE(5),PEARSON(s,s))"), num(1.0));
+    assert_eq!(eval("LET(s,SEQUENCE(5),RSQ(s,s))"), num(1.0));
+}
+
+#[test]
+fn fu4c_c1_let_slope_intercept_over_array_locals() {
+    // y=2x line (b=2a): regressing known_y=b on known_x=a → slope 2, intercept 0. Y-first.
+    assert_eq!(eval("LET(a,{1,2,3},LET(b,{2,4,6},SLOPE(b,a)))"), num(2.0));
+    assert_eq!(
+        eval("LET(a,{1,2,3},LET(b,{2,4,6},INTERCEPT(b,a)))"),
+        num(0.0)
+    );
+}
+
+#[test]
+fn fu4c_c1_let_covariance_self_pair_is_variance() {
+    // COVARIANCE(X,X) = variance of X. s={1,2,3,4,5}: Σ(x-3)^2=10 → pop 10/5=2.0, samp 10/4=2.5.
+    assert_eq!(eval("LET(s,SEQUENCE(5),COVARIANCE.P(s,s))"), num(2.0));
+    assert_eq!(eval("LET(s,SEQUENCE(5),COVARIANCE.S(s,s))"), num(2.5));
+}
+
+#[test]
+fn fu4c_c1_let_steyx_self_pair_is_zero() {
+    // perfect fit (y=x) → zero residual standard error. n=5 ≥ 3.
+    assert_eq!(eval("LET(s,SEQUENCE(5),STEYX(s,s))"), num(0.0));
+}
+
+#[test]
+fn fu4c_c1_let_paired_sum_of_squares_self_pair() {
+    // SUMX2MY2(x,x)=Σ(x²−x²)=0; SUMXMY2(x,x)=Σ(x−x)²=0; SUMX2PY2(x,x)=Σ2x².
+    // s={1,2,3,4,5}: Σx²=55 → SUMX2PY2 = 110.
+    assert_eq!(eval("LET(s,SEQUENCE(5),SUMX2MY2(s,s))"), num(0.0));
+    assert_eq!(eval("LET(s,SEQUENCE(5),SUMXMY2(s,s))"), num(0.0));
+    assert_eq!(eval("LET(s,SEQUENCE(5),SUMX2PY2(s,s))"), num(110.0));
+}
+
+// --- financial (approx, anchored to financial_fns.rs unit tests) ---
+
+#[test]
+fn fu4c_c1_let_sharpe_over_array_local() {
+    // returns {0.01,0.02,0.03,0.04}: mean 0.025 / sample sd 0.0129099445 = 1.9364916731
+    // (rf=0, no annualization). Anchor: financial_fns.rs `sharpe_basic_rf_zero`.
+    approx(
+        eval("LET(r,{0.01,0.02,0.03,0.04},SHARPE(r))"),
+        1.9364916731,
+        1e-9,
+    );
+}
+
+#[test]
+fn fu4c_c1_let_volatility_over_array_local() {
+    // same series: sample sd = 0.0129099445. Anchor: `volatility_basic_sample_stdev`.
+    approx(
+        eval("LET(r,{0.01,0.02,0.03,0.04},VOLATILITY(r))"),
+        0.0129099445,
+        1e-9,
+    );
+}
+
+#[test]
+fn fu4c_c1_let_sortino_over_array_local() {
+    // {0.30,-0.10,0.10,-0.10}, MAR=0: mean 0.05 / downside-dev 0.0707106781 = 1/sqrt(2).
+    // Anchor: `sortino_basic_mar_zero`.
+    approx(
+        eval("LET(r,{0.30,-0.10,0.10,-0.10},SORTINO(r))"),
+        std::f64::consts::FRAC_1_SQRT_2,
+        1e-9,
+    );
+}
+
+#[test]
+fn fu4c_c1_let_max_drawdown_over_array_local() {
+    // {100,50}: peak 100, trough 50 → 50/100−1 = −0.5 (exact). (The increasing-series → 0
+    // case is in `fu4c_c1_financial_and_pairstat_compute_conditional_stays_loud`.)
+    assert_eq!(eval("LET(eq,{100,50},MAX_DRAWDOWN(eq))"), num(-0.5));
+}
+
+#[test]
+fn fu4c_c1_let_npv_over_array_local() {
+    // NPV(0.1, {100,100,100}) = 100/1.1 + 100/1.21 + 100/1.331 ≈ 248.685. The cash-flow
+    // array-local materializes as a Range (NPV's variadic slot accepts a Range). Anchor: `npv_basic`.
+    approx(eval("LET(c,{100,100,100},NPV(0.1,c))"), 248.685, 1e-3);
+}
+
+#[test]
+fn fu4c_c1_let_irr_over_array_local() {
+    // IRR({-1000,600,600}) ≈ 0.13066. Anchor: `irr_basic`.
+    approx(eval("LET(c,{-1000,600,600},IRR(c))"), 0.13066, 1e-4);
+}
+
+#[test]
+fn fu4c_c1_let_mirr_over_array_local() {
+    // Microsoft MIRR example: outflow 120k + 5 inflows, finance 10% / reinvest 12% ≈ 0.126094.
+    // Anchor: `mirr_microsoft_example`.
+    approx(
+        eval("LET(c,{-120000,39000,30000,21000,37000,46000},MIRR(c,0.10,0.12))"),
+        0.126094,
+        1e-5,
+    );
+}
+
+#[test]
+fn fu4c_c1_let_xnpv_over_array_locals() {
+    // Microsoft XNPV anchor: values + serial dates, rate 9% ≈ 2086.6478. Both array-locals.
+    approx(
+        eval(
+            "LET(v,{-10000,2750,4250,3250,2750},\
+             LET(d,{39448,39508,39751,39859,39904},XNPV(0.09,v,d)))",
+        ),
+        2086.6478,
+        1e-2,
+    );
+}
+
+#[test]
+fn fu4c_c1_let_xirr_over_array_locals() {
+    // -100 → +110 exactly 365 days apart = a clean 10% annual rate. Both array-locals.
+    approx(
+        eval("LET(v,{-100,110},LET(d,{40000,40365},XIRR(v,d)))"),
+        0.10,
+        1e-6,
+    );
+}
+
+// --- FU4c-C1 position-blind / shape / behavioral (loud, never silent) ---
+
+#[test]
+fn fu4c_c1_financial_wrong_slot_array_is_loud() {
+    // Position-blind: an array-local in a NON-data scalar slot is rejected loudly (#VALUE!)
+    // by the fn's own arg match. NPV rate (arg0), SHARPE risk_free (arg1), IRR guess (arg1).
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),NPV(s,s))"),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),SHARPE(s,s))"),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),IRR(s,s))"),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_c1_pairstat_shape_mismatch_is_loud() {
+    // Two data arrays of unequal length → #VALUE! (collect_xy_pairs / paired_sum_inner
+    // enforce equal 2-D shape).
+    assert_eq!(
+        eval("LET(a,{1,2,3},LET(b,{1,2},CORREL(a,b)))"),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(
+        eval("LET(a,{1,2,3},LET(b,{1,2},SUMXMY2(a,b)))"),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_c1_sortino_all_positive_is_div_zero() {
+    // All returns ≥ MAR (=0) → zero downside → DD==0 → #DIV/0! (loud, never +Inf).
+    // Behavioral pin (matches `sortino_no_downside_is_div_zero`).
+    assert_eq!(
+        eval("LET(r,{0.01,0.02,0.03},SORTINO(r))"),
+        Value::Error(ErrorValue::DivZero)
+    );
+}
+
+#[test]
+fn fu4c_c1_volatility_constant_series_is_zero() {
+    // A constant series has zero dispersion: VOLATILITY returns 0.0 (a valid statistic),
+    // unlike SHARPE which errors #DIV/0! on the same denominator. Behavioral divergence pin.
+    approx(eval("LET(r,{0.02,0.02,0.02},VOLATILITY(r))"), 0.0, 1e-12);
 }

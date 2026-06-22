@@ -1515,10 +1515,10 @@ fn fu4b_byrow_error_element_in_row_flows_into_lambda() {
 
 // --- PRODUCTION spill pins (a scalar-context #CALC! pin is vacuous: the boundary maps
 // any BYROW array result to #CALC! regardless of the cells. These assert the SPILLED
-// CELL values). The reducers (FU4c-A) and lookups (FU4c-B) now compute here; the still-
-// DEFERRED families (financial SHARPE/..., Unified TRANSPOSE) stay loud — those pins FAIL
-// the day THOSE start computing over an array-local, making any future relaxation
-// deliberate. -----
+// CELL values). The reducers (FU4c-A), lookups (FU4c-B), and financial / pair-stats
+// reducers (FU4c-C1) now compute here; the still-DEFERRED families (conditionals SUMIF/...,
+// Unified TRANSPOSE/FILTER, ReferenceAware ROW/COLUMN) stay loud — those pins FAIL the day
+// THOSE start computing over an array-local, making any future relaxation deliberate. -----
 
 #[test]
 fn fu4c_byrow_median_over_row_local_computes_in_production() {
@@ -1686,13 +1686,14 @@ fn fu4c_byrow_median_error_element_in_row_flows_into_lambda() {
 }
 
 #[test]
-fn fu4c_byrow_sharpe_over_row_local_stays_loud_in_production() {
-    // **Reducers-only proof (production).** SHARPE is a RangeAware fn that REDUCES to a
-    // scalar (looks like a reducer) but is NOT in the `is_range_aware_reducer` gate, so an
-    // array-local row reaches it as `FnArg::Scalar(#CALC!)` (the unchanged `other =>` arm)
-    // and `collect_series` rejects a Scalar arg → #VALUE! per row. Catches an over-broad
-    // gate that would relax the whole RangeAware tier. Still spills 2×1 (errors spill).
-    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,SHARPE(r)))", 0.0);
+fn fu4c_c1_byrow_conditional_over_row_local_stays_loud_in_production() {
+    // **Over-broad-gate guard (production).** After FU4c-C1, the financial / pair-stats
+    // RangeAware reducers compute over an array-local — so the deferred-tier guard moves to a
+    // RangeAware fn STILL outside every C1 gate. SUMIF is a CONDITIONAL reducer: its range
+    // arg, when an array-local, reaches it as `FnArg::Scalar(#CALC!)` (the unchanged
+    // `other =>` arm) and its collector rejects the Scalar → #VALUE! per row. Catches a gate
+    // that would relax the whole RangeAware tier. Still spills 2×1 (errors spill).
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,SUMIF(r,\">0\")))", 0.0);
     assert_eq!(
         wb.spill_anchor_at(0, 0, 1).copied(),
         Some(SpillShape::new(2, 1))
@@ -1712,7 +1713,7 @@ fn fu4c_byrow_sharpe_over_row_local_stays_loud_in_production() {
 // An array-local now materializes as a shape-carrying Range and the lookups address
 // it. Mirrors the FU4c-A reducer suite. The INDEX value-flip pin lives above (flipped
 // from the FU4b deferred pin); these add the lookup-family spill / cardinal-sin / edge
-// / error-flow surface. The SHARPE pin above stays loud (lookups-only proof).
+// / error-flow surface. The SUMIF pin above stays loud (conditional-tier deferred guard).
 // =============================================================================
 
 #[test]
@@ -1848,4 +1849,127 @@ fn fu4c_byrow_index_addresses_error_element_verbatim() {
     );
     // Row 2: INDEX(r,1) = 3.
     assert_eq!(wb.read(Address::new(0, 1, 3)), Value::Number(3.0));
+}
+
+// =============================================================================
+// FU4c-C1 (2026-06-22): RangeAware FINANCIAL + PAIR-STATS reducers over an array-local,
+// production path. Mirrors the FU4c-A/B suites. All values are EXACT-representable
+// (pair-stats self-pairing identities; MAX_DRAWDOWN of a {100,50} row = -0.5) so the
+// spill assertions use exact f64 equality — no approx helper needed in production.
+// The SUMIF pin above stays loud (conditional-tier over-broad-gate guard).
+// =============================================================================
+
+#[test]
+fn fu4c_c1_byrow_correl_per_row_self_pair_computes() {
+    // CORREL(r,r) over each 1x2 row = self-correlation = 1.0 (2 collinear points). {1;1}.
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,CORREL(r,r)))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[1.0, 1.0]);
+}
+
+#[test]
+fn fu4c_c1_byrow_sumxmy2_per_row_self_pair_is_zero() {
+    // SUMXMY2(r,r) = Σ(x-x)^2 = 0 per row. {0;0}.
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,SUMXMY2(r,r)))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[0.0, 0.0]);
+}
+
+#[test]
+fn fu4c_c1_bycol_sumxmy2_per_col_self_pair_is_zero() {
+    // BYCOL gives each column as Nx1; SUMXMY2(c,c)=0 per col. 1x2 {0,0}.
+    let (wb, _g, _r) = setup("BYCOL({1,4;3,6;2,5},LAMBDA(c,SUMXMY2(c,c)))", 0.0);
+    assert_spill_block(&wb, 1, 2, &[0.0, 0.0]);
+}
+
+#[test]
+fn fu4c_c1_byrow_max_drawdown_per_row_computes() {
+    // MAX_DRAWDOWN over each {100,50} row = 50/100 - 1 = -0.5 (financial production spill).
+    let (wb, _g, _r) = setup("BYROW({100,50;100,50},LAMBDA(r,MAX_DRAWDOWN(r)))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[-0.5, -0.5]);
+}
+
+#[test]
+fn fu4c_c1_byrow_correl_body_cell_ref_recomputes() {
+    // **THE cardinal-sin test for a pair-stats body.** A cell ref alongside CORREL(r,r)
+    // must register $A$1 as a precedent (inherited from FU4's invoked-set mark -- FU4c-C1
+    // changes ONLY arg materialization, not dep extraction). A1=10 -> CORREL(r,r)+10 = 11
+    // per row {11;11}; edit A1=20 -> {21;21}.
+    let (mut wb, mut graph, reg) = setup("BYROW({1,2;3,4},LAMBDA(r,CORREL(r,r)+$A$1))", 10.0);
+    assert_spill_block(&wb, 2, 1, &[11.0, 11.0]);
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(20.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(
+        attempted >= 1,
+        "editing A1 must recompute the BYROW-CORREL (attempted == 0 means the dep inside \
+         the pair-stats lambda body was never registered -- the cardinal sin)"
+    );
+    assert_spill_block(&wb, 2, 1, &[21.0, 21.0]);
+}
+
+#[test]
+fn fu4c_c1_byrow_correl_body_cell_ref_in_deps() {
+    // Direct dep-extraction proof: $A$1 inside the CORREL lambda body is in deps.cells.
+    let deps = formula_deps_for("BYROW({1,2;3,4},LAMBDA(r,CORREL(r,r)+$A$1))").expect("has deps");
+    assert!(
+        deps.cells.iter().any(|&(s, r, c)| (s, r, c) == (0, 0, 0)),
+        "$A$1 inside the BYROW-CORREL lambda body must be a precedent; got {:?}",
+        deps.cells
+    );
+}
+
+#[test]
+fn fu4c_c1_byrow_let_bound_correl_lambda_spills() {
+    // A LET-bound pair-stats lambda passed to BYROW resolves at both the walker and eval.
+    let (wb, _g, _r) = setup("LET(f,LAMBDA(r,CORREL(r,r)),BYROW({1,2;3,4},f))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[1.0, 1.0]);
+}
+
+#[test]
+fn fu4c_c1_let_correl_over_array_local_computes_in_production() {
+    // Standalone scalar: CORREL returns a SCALAR, so `LET(s,...,CORREL(s,s))` computes a
+    // value at the cell boundary with NO spill (mirrors the FU4c-A/B standalone pins).
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(5),CORREL(s,s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(1.0));
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        None,
+        "CORREL returns a scalar -- no spill"
+    );
+}
+
+#[test]
+fn fu4c_c1_let_max_drawdown_over_array_local_computes_in_production() {
+    // Standalone financial scalar: MAX_DRAWDOWN({100,50}) = -0.5, no spill.
+    let (wb, _g, _r) = setup("LET(eq,{100,50},MAX_DRAWDOWN(eq))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(-0.5));
+    assert_eq!(wb.spill_anchor_at(0, 0, 1).copied(), None);
+}
+
+#[test]
+fn fu4c_c1_byrow_correl_error_element_in_row_propagates() {
+    // **The pair-stats error contrast.** Unlike FU4c-B's MATCH (which SKIPS an error
+    // element), CORREL's collector PROPAGATES it (returns Err on the first error) -- the
+    // FU4c-A reducer semantics. Data A1:B2 = {#DIV/0!,2; 3,4}; CORREL(r,r) per row.
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "1/0").unwrap(); // A1 = #DIV/0!
+        rt.set_value(0, 0, 1, Value::Number(2.0)).unwrap(); // B1
+        rt.set_value(0, 1, 0, Value::Number(3.0)).unwrap(); // A2
+        rt.set_value(0, 1, 1, Value::Number(4.0)).unwrap(); // B2
+        rt.set_formula(0, 0, 3, "BYROW(A1:B2,LAMBDA(r,CORREL(r,r)))")
+            .unwrap(); // D1, spills D1:D2
+    }
+    // Row 1 {#DIV/0!,2}: CORREL's collect_xy_pairs hits the error and propagates it.
+    assert_eq!(
+        wb.read(Address::new(0, 0, 3)),
+        Value::Error(ErrorValue::DivZero),
+        "CORREL propagates the error element (reducer semantics, not MATCH-skip)"
+    );
+    // Row 2 {3,4}: CORREL([3,4],[3,4]) = 1.0 (2 collinear points).
+    assert_eq!(wb.read(Address::new(0, 1, 3)), Value::Number(1.0));
 }
