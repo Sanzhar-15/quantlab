@@ -525,13 +525,14 @@ fn fu4b_byrow_array_lambda_slot_is_calc() {
 }
 
 #[test]
-fn fu4b_byrow_index_over_row_local_is_calc_in_scalar_context() {
-    // **Deferred-tier pin (the locked scope).** The array-as-arg relaxation is scoped to
-    // the scalar-aggregate REDUCERS only; a RangeAware fn like INDEX over the row array
-    // does NOT compute — it stays loud. In SCALAR context the whole BYROW array result
-    // collapses to #CALC! regardless of the per-cell code. (The per-cell code is actually
-    // #VALUE! — INDEX rejects the malformed scalar array arg — pinned precisely by the
-    // production test `fu4b_byrow_index_over_row_local_is_deferred_loud_in_production`.)
+fn fu4c_byrow_index_in_scalar_context_collapses_to_calc() {
+    // **FU4c-B (2026-06-22):** INDEX now COMPUTES over an array-local row (it joined the
+    // `is_range_aware_lookup` gate), but this scalar-context check is VACUOUS: a BYROW
+    // result is an ARRAY, and the boundary maps ANY array result to #CALC! in scalar
+    // context regardless of the per-cell values. So this stays #CALC! even though the
+    // per-row INDEX now computes. The REAL FU4c-B win is asserted by the production pin
+    // `fu4c_byrow_index_over_row_local_computes_in_production` (per-cell spill = {1;3})
+    // and the standalone `LET(s,...,INDEX(s,2))` scalar pins (INDEX returns a scalar there).
     assert_eq!(
         eval("BYROW({1,2;3,4},LAMBDA(r,INDEX(r,1)))"),
         Value::Error(ErrorValue::Calc)
@@ -708,5 +709,143 @@ fn fu4c_non_gated_range_aware_over_array_local_stays_loud() {
     assert_eq!(
         eval("LET(s,SEQUENCE(5),SHARPE(s))"),
         Value::Error(ErrorValue::Value)
+    );
+}
+
+// =============================================================================
+// FU4c-B (2026-06-22): array-local consumed by a RangeAware LOOKUP.
+// The lookups are shape-aware (INDEX addresses by (row,col); MATCH/XLOOKUP/XMATCH
+// scan; VLOOKUP/HLOOKUP read a 2-D table), so an array-local materializes as a
+// shape-carrying Range -- byte-identical to a real range. These return a SCALAR, so a
+// standalone `LET(s,...,INDEX(s,2))` is observable in scalar context (unlike a BYROW
+// result, which is an array and collapses to #CALC! at the boundary).
+// =============================================================================
+
+#[test]
+fn fu4c_let_index_over_array_local_computes() {
+    // 1-col local: INDEX(s,2) = the 2nd element (single-col: row_num indexes the column).
+    assert_eq!(eval("LET(s,SEQUENCE(5),INDEX(s,2))"), num(2.0));
+}
+
+#[test]
+fn fu4c_let_index_2d_over_array_local_computes() {
+    // 2-D local {1,2;3,4} binds row-major 2x2; INDEX(t,2,1) = row 2, col 1 = 3.
+    assert_eq!(eval("LET(t,{1,2;3,4},INDEX(t,2,1))"), num(3.0));
+}
+
+#[test]
+fn fu4c_let_index_out_of_bounds_is_ref() {
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),INDEX(s,9))"),
+        Value::Error(ErrorValue::Ref)
+    );
+}
+
+#[test]
+fn fu4c_let_match_over_array_local_computes() {
+    assert_eq!(eval("LET(s,SEQUENCE(5),MATCH(3,s,0))"), num(3.0)); // exact
+    assert_eq!(eval("LET(s,{1,3,5,7},MATCH(4,s,1))"), num(2.0)); // approx: largest <= 4
+}
+
+#[test]
+fn fu4c_let_match_not_found_is_na() {
+    assert_eq!(
+        eval("LET(s,SEQUENCE(5),MATCH(9,s,0))"),
+        Value::Error(ErrorValue::NA)
+    );
+}
+
+#[test]
+fn fu4c_let_vlookup_over_2d_local_computes() {
+    // 3x2 table: first col [1,2,3], find 2 -> row 2, return col 2 = 20.
+    assert_eq!(
+        eval("LET(t,{1,10;2,20;3,30},VLOOKUP(2,t,2,FALSE))"),
+        num(20.0)
+    );
+}
+
+#[test]
+fn fu4c_let_vlookup_col_out_of_range_is_ref() {
+    assert_eq!(
+        eval("LET(t,{1,10;2,20},VLOOKUP(2,t,3,FALSE))"), // col 3 > cols 2
+        Value::Error(ErrorValue::Ref)
+    );
+}
+
+#[test]
+fn fu4c_let_hlookup_over_2d_local_computes() {
+    // 2x3 table: first row [1,2,3], find 2 -> col 2, return row 2 = 20.
+    assert_eq!(
+        eval("LET(t,{1,2,3;10,20,30},HLOOKUP(2,t,2,FALSE))"),
+        num(20.0)
+    );
+}
+
+#[test]
+fn fu4c_let_xlookup_over_array_locals_computes() {
+    // Same local for lookup + return: find 2 at index 1 -> ret[1] = 2.
+    assert_eq!(eval("LET(s,SEQUENCE(3),XLOOKUP(2,s,s))"), num(2.0));
+    // Distinct lookup/return locals (nested LET): find 2 in s -> r[1] = 20.
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),LET(r,{10;20;30},XLOOKUP(2,s,r)))"),
+        num(20.0)
+    );
+}
+
+#[test]
+fn fu4c_let_xlookup_if_not_found_over_array_local() {
+    // 9 not in s -> the if_not_found scalar arg is returned.
+    assert_eq!(eval("LET(s,SEQUENCE(3),XLOOKUP(9,s,s,99))"), num(99.0));
+}
+
+#[test]
+fn fu4c_xlookup_if_not_found_array_local_is_lazy() {
+    // **Codex MED -> pinned behavior.** XLOOKUP's `if_not_found` (arg3) is a LAZY fallback,
+    // consulted ONLY on a miss. On a HIT the matched value is returned and arg3 is never
+    // examined, so an array-local there is harmlessly ignored -> the genuine lookup result
+    // (identical to the real-range path + Excel; NOT a silent wrong value). On a MISS arg3
+    // IS consulted and a Range is rejected loudly. So the position-blind invariant holds
+    // where it matters (a consulted slot); an UNUSED slot never produces a wrong value.
+    assert_eq!(eval("LET(s,SEQUENCE(3),XLOOKUP(2,s,s,s))"), num(2.0)); // hit: arg3 ignored
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),XLOOKUP(9,s,s,s))"), // miss: arg3 Range rejected
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_let_xmatch_over_array_local_computes() {
+    assert_eq!(eval("LET(s,SEQUENCE(5),XMATCH(3,s))"), num(3.0));
+}
+
+// --- FU4c-B position-blind + excluded/deferred (loud, never silent) ---
+
+#[test]
+fn fu4c_lookup_wrong_slot_array_is_loud() {
+    // Position-blind: an array-local in a NON-data slot is rejected by the lookup's own
+    // arg match -> #VALUE!. INDEX(s,s) -- arg0 is the valid data Range, arg1=s the
+    // row_num Range -> #VALUE! (isolates the row_num slot); MATCH/VLOOKUP needle slot.
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),INDEX(s,s))"),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),MATCH(s,s))"),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),VLOOKUP(s,s,1))"),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_choose_over_array_local_is_excluded_and_loud() {
+    // CHOOSE is EXCLUDED (no data-array slot). The array-local takes the `other =>` path
+    // -> FnArg::Scalar(#CALC!); CHOOSE(1,...) selects it and returns the #CALC! sentinel
+    // VERBATIM -> loud, never a silent value. (Distinct code from the lookups' #VALUE!.)
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),CHOOSE(1,s,9))"),
+        Value::Error(ErrorValue::Calc)
     );
 }

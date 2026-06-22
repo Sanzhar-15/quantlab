@@ -410,20 +410,29 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 }
                             }
                             // **FU4c (2026-06-22):** an array-valued LET/LAMBDA local
-                            // consumed by a RangeAware STATISTICAL REDUCER — `MEDIAN(row)`
-                            // inside `BYROW`, or `LET(s,SEQUENCE(5),MEDIAN(s))`. Gated by
-                            // name (`is_range_aware_reducer` — the ONLY new TRUE case); a
-                            // non-gated RangeAware fn (INDEX/SUMIF/SHARPE) never enters this
+                            // consumed by a gated RangeAware fn — a STATISTICAL REDUCER
+                            // (`MEDIAN(row)`, FU4c-A) or a LOOKUP (`INDEX(t,2,1)`, FU4c-B).
+                            // Gated by name (`is_range_aware_reducer` OR `is_range_aware_lookup`);
+                            // a non-gated RangeAware fn (SUMIF/CORREL/SHARPE) never enters this
                             // arm and keeps the `other =>` path → `#CALC!`/`#VALUE!`.
-                            // Position-blind like FU4b's Scalar arm: any array-local arg of
-                            // a gated reducer materializes as a `Range`, and each reducer's
-                            // own arg validation rejects a `Range` in a non-data slot loudly
-                            // (`#VALUE!`). The array was materialized ONCE at bind time
+                            // Position-blind like FU4b's Scalar arm: any array-local arg of a
+                            // gated fn materializes as a `Range`; a `Range` in a CONSULTED
+                            // non-data slot is rejected loudly (`#VALUE!`) by the fn's own
+                            // arg validation. No silent wrong value even for an UNUSED slot
+                            // (e.g. XLOOKUP `if_not_found` on a hit, never examined) -- that
+                            // yields the genuine lookup result, identical to the real-range path.
+                            // The `Range` is byte-identical to the real-range path above
+                            // (W5-54) — reducers flatten it; lookups address it by (row,col) —
+                            // so a lookup over the local computes exactly as over the
+                            // equivalent range. The array was materialized ONCE at bind time
                             // (FU3 `eval_binding` / FU4b `invoke_closure_with_array`);
                             // `lookup` is a pure cons-list walk — NO grid re-read, NO
                             // volatile re-fire. A non-array local (scalar/callable/error/
                             // None) takes the `_` branch, byte-identical to `other =>`.
-                            ExprPlan::LocalRef(n) if crate::plan::is_range_aware_reducer(name) => {
+                            ExprPlan::LocalRef(n)
+                                if crate::plan::is_range_aware_reducer(name)
+                                    || crate::plan::is_range_aware_lookup(name) =>
+                            {
                                 match env.local_env().lookup(n) {
                                     Some(LocalBinding::Array(arr)) => {
                                         fn_args.push(FnArg::range_with_visibility(
@@ -702,8 +711,9 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 // SCALAR-tier aggregate reducers reach here. The RangeAware
                                 // statistical reducers (MEDIAN/MODE/LARGE/SMALL/RANK/...)
                                 // dispatch through the separate RangeAware arm, where FU4c added the
-                                // analogous array-local relaxation; the RangeAware LOOKUPS
-                                // INDEX/VLOOKUP stay deferred `#CALC!`/`#VALUE!`.)
+                                // analogous array-local relaxation (FU4c-A reducers + FU4c-B lookups
+                                // INDEX/VLOOKUP/...). The Unified TRANSPOSE/FILTER + financial /
+                                // pair-stats reducers stay deferred `#CALC!`/`#VALUE!`.)
                                 ExprPlan::LocalRef(n) => match env.local_env().lookup(n) {
                                     Some(LocalBinding::Array(arr)) => {
                                         flat.extend(arr.cells().iter().cloned())

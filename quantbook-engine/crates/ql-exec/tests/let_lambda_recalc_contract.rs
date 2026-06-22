@@ -1513,10 +1513,12 @@ fn fu4b_byrow_error_element_in_row_flows_into_lambda() {
     assert_eq!(wb.read(Address::new(0, 1, 3)), Value::Number(7.0));
 }
 
-// --- Deferred-tier PRODUCTION pins (a scalar-context #CALC! pin is vacuous: the
-// boundary maps any BYROW array result to #CALC! regardless of the cells. These
-// assert the SPILLED CELL values, so they FAIL the day MEDIAN/INDEX start
-// computing over an array-local — making any future relaxation deliberate.) -----
+// --- PRODUCTION spill pins (a scalar-context #CALC! pin is vacuous: the boundary maps
+// any BYROW array result to #CALC! regardless of the cells. These assert the SPILLED
+// CELL values). The reducers (FU4c-A) and lookups (FU4c-B) now compute here; the still-
+// DEFERRED families (financial SHARPE/..., Unified TRANSPOSE) stay loud — those pins FAIL
+// the day THOSE start computing over an array-local, making any future relaxation
+// deliberate. -----
 
 #[test]
 fn fu4c_byrow_median_over_row_local_computes_in_production() {
@@ -1529,30 +1531,14 @@ fn fu4c_byrow_median_over_row_local_computes_in_production() {
 }
 
 #[test]
-fn fu4b_byrow_index_over_row_local_is_deferred_loud_in_production() {
-    // Companion deferred-tier production pin for the RangeAware LOOKUP family: INDEX
-    // over an array-local row stays LOUD (does NOT compute the lookup), confirming
-    // the relaxation is reducers-only. **The exact code differs from MEDIAN:** INDEX
-    // gets the array-local as `FnArg::Scalar(#CALC!)` (the RangeAware arm's unchanged
-    // `other` materialization) and REJECTS that malformed array arg with #VALUE!,
-    // whereas MEDIAN (a reducer) PROPAGATES the #CALC!. Both are loud/deferred; this
-    // pin asserts the observed #VALUE! per cell. It still spills 2×1 (errors spill).
-    // (The scalar-context pin `fu4b_byrow_index_over_row_local_is_calc_in_scalar_context`
-    // only sees the boundary's whole-array→#CALC! collapse, so it can't distinguish the
-    // codes — which is why this production pin exists.)
+fn fu4c_byrow_index_over_row_local_computes_in_production() {
+    // **FU4c-B (2026-06-22):** INDEX joined the `is_range_aware_lookup` gate, so an
+    // array-local row now materializes as a shape-carrying `Range` and INDEX addresses
+    // it: `INDEX(r,1)` over a 1×2 row (rows==1) returns the first element per row —
+    // row1 {1,2}=>1, row2 {3,4}=>3 => spills 2x1 {1;3}. (This is the FU4b deferred-INDEX
+    // pin FLIPPED — the only value change in FU4c-B, mirroring the FU4c-A MEDIAN flip.)
     let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,INDEX(r,1)))", 0.0);
-    assert_eq!(
-        wb.spill_anchor_at(0, 0, 1).copied(),
-        Some(SpillShape::new(2, 1))
-    );
-    assert_eq!(
-        wb.read(Address::new(0, 0, 1)),
-        Value::Error(ErrorValue::Value)
-    );
-    assert_eq!(
-        wb.read(Address::new(0, 1, 1)),
-        Value::Error(ErrorValue::Value)
-    );
+    assert_spill_block(&wb, 2, 1, &[1.0, 3.0]);
 }
 
 // =============================================================================
@@ -1719,4 +1705,147 @@ fn fu4c_byrow_sharpe_over_row_local_stays_loud_in_production() {
         wb.read(Address::new(0, 1, 1)),
         Value::Error(ErrorValue::Value)
     );
+}
+
+// =============================================================================
+// FU4c-B (2026-06-22): RangeAware LOOKUPS over an array-local, production path.
+// An array-local now materializes as a shape-carrying Range and the lookups address
+// it. Mirrors the FU4c-A reducer suite. The INDEX value-flip pin lives above (flipped
+// from the FU4b deferred pin); these add the lookup-family spill / cardinal-sin / edge
+// / error-flow surface. The SHARPE pin above stays loud (lookups-only proof).
+// =============================================================================
+
+#[test]
+fn fu4c_byrow_index_second_element_per_row() {
+    // INDEX(r,2) over a 1x2 row (rows==1) -> the 2nd element per row. {2;4}.
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,INDEX(r,2)))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[2.0, 4.0]);
+}
+
+#[test]
+fn fu4c_bycol_index_per_col() {
+    // BYCOL gives each column as Nx1. INDEX(c,1) -> first element per col.
+    // {1,4;3,6;2,5} cols: {1;3;2}->1, {4;6;5}->4 -> 1x2 {1,4}.
+    let (wb, _g, _r) = setup("BYCOL({1,4;3,6;2,5},LAMBDA(c,INDEX(c,1)))", 0.0);
+    assert_spill_block(&wb, 1, 2, &[1.0, 4.0]);
+}
+
+#[test]
+fn fu4c_byrow_match_per_row() {
+    // MATCH(5,r,0) over each row: {5,2}->pos 1, {5,4}->pos 1 -> {1;1}.
+    let (wb, _g, _r) = setup("BYROW({5,2;5,4},LAMBDA(r,MATCH(5,r,0)))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[1.0, 1.0]);
+}
+
+#[test]
+fn fu4c_byrow_index_body_cell_ref_recomputes() {
+    // **THE cardinal-sin test for a lookup body.** A cell ref in the INDEX index slot
+    // must register $A$1 as a precedent (inherited from FU4's invoked-set mark -- FU4c-B
+    // changes ONLY arg materialization, not dep extraction). A1=1 -> INDEX(r,1) first
+    // element per row {1;3}; edit A1=2 -> INDEX(r,2) {2;4}.
+    let (mut wb, mut graph, reg) = setup("BYROW({1,2;3,4},LAMBDA(r,INDEX(r,$A$1)))", 1.0);
+    assert_spill_block(&wb, 2, 1, &[1.0, 3.0]);
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(2.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(
+        attempted >= 1,
+        "editing A1 must recompute the BYROW-INDEX (attempted == 0 means the dep inside \
+         the lookup lambda body was never registered -- the cardinal sin)"
+    );
+    assert_spill_block(&wb, 2, 1, &[2.0, 4.0]);
+}
+
+#[test]
+fn fu4c_byrow_index_body_cell_ref_in_deps() {
+    // Direct dep-extraction proof: $A$1 inside the INDEX lambda body is in deps.cells.
+    let deps = formula_deps_for("BYROW({1,2;3,4},LAMBDA(r,INDEX(r,$A$1)))").expect("has deps");
+    assert!(
+        deps.cells.iter().any(|&(s, r, c)| (s, r, c) == (0, 0, 0)),
+        "$A$1 inside the BYROW-INDEX lambda body must be a precedent; got {:?}",
+        deps.cells
+    );
+}
+
+#[test]
+fn fu4c_byrow_let_bound_index_lambda_spills() {
+    // A LET-bound lookup lambda passed to BYROW resolves at both the walker and eval.
+    let (wb, _g, _r) = setup("LET(f,LAMBDA(r,INDEX(r,1)),BYROW({1,2;3,4},f))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[1.0, 3.0]);
+}
+
+#[test]
+fn fu4c_let_index_over_array_local_computes_in_production() {
+    // Standalone scalar: INDEX returns a SCALAR, so `LET(s,...,INDEX(s,2))` computes a
+    // value at the cell boundary with NO spill (mirrors the FU4c-A MEDIAN production pin).
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(5),INDEX(s,2))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(2.0));
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        None,
+        "INDEX returns a scalar -- no spill"
+    );
+}
+
+#[test]
+fn fu4c_let_vlookup_over_2d_local_computes_in_production() {
+    // A 2-D array-constant local binds row-major; VLOOKUP addresses it -> scalar 20.
+    let (wb, _g, _r) = setup("LET(t,{1,10;2,20;3,30},VLOOKUP(2,t,2,FALSE))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(20.0));
+}
+
+#[test]
+fn fu4c_byrow_match_error_element_in_row_is_skipped_not_propagated() {
+    // **The lookup-vs-reducer error contrast.** `lookup_eq` treats an Error element as
+    // non-equal (never matches), so MATCH SKIPS it -- distinct from MEDIAN/SUM which
+    // PROPAGATE. Data A1:B2 = {#DIV/0!,2; 5,2}; MATCH(2,r,0) finds the 2 in BOTH rows.
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "1/0").unwrap(); // A1 = #DIV/0!
+        rt.set_value(0, 0, 1, Value::Number(2.0)).unwrap(); // B1
+        rt.set_value(0, 1, 0, Value::Number(5.0)).unwrap(); // A2
+        rt.set_value(0, 1, 1, Value::Number(2.0)).unwrap(); // B2
+        rt.set_formula(0, 0, 3, "BYROW(A1:B2,LAMBDA(r,MATCH(2,r,0)))")
+            .unwrap(); // D1, spills D1:D2
+    }
+    // Row 1 {#DIV/0!,2}: MATCH skips the error, finds 2 at position 2.
+    assert_eq!(
+        wb.read(Address::new(0, 0, 3)),
+        Value::Number(2.0),
+        "MATCH skips the error element (lookup_eq does not propagate) and finds the clean 2"
+    );
+    // Row 2 {5,2}: 2 at position 2.
+    assert_eq!(wb.read(Address::new(0, 1, 3)), Value::Number(2.0));
+}
+
+#[test]
+fn fu4c_byrow_index_addresses_error_element_verbatim() {
+    // INDEX addresses the cell VERBATIM, so an error element at the addressed position
+    // flows out (the FU4c-A MEDIAN error-flow analog, but by addressing not reduction).
+    // Data A1:B2 = {#DIV/0!,2; 3,4}; INDEX(r,1) returns the first element of each row.
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "1/0").unwrap(); // A1 = #DIV/0!
+        rt.set_value(0, 0, 1, Value::Number(2.0)).unwrap(); // B1
+        rt.set_value(0, 1, 0, Value::Number(3.0)).unwrap(); // A2
+        rt.set_value(0, 1, 1, Value::Number(4.0)).unwrap(); // B2
+        rt.set_formula(0, 0, 3, "BYROW(A1:B2,LAMBDA(r,INDEX(r,1)))")
+            .unwrap(); // D1, spills D1:D2
+    }
+    // Row 1: INDEX(r,1) = first element = #DIV/0! (addressed verbatim).
+    assert_eq!(
+        wb.read(Address::new(0, 0, 3)),
+        Value::Error(ErrorValue::DivZero),
+        "INDEX addresses the error element verbatim"
+    );
+    // Row 2: INDEX(r,1) = 3.
+    assert_eq!(wb.read(Address::new(0, 1, 3)), Value::Number(3.0));
 }

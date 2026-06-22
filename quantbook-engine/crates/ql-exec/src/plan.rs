@@ -503,11 +503,12 @@ pub(crate) fn is_aggregate_function(registry: &FunctionRegistry, name: &str) -> 
 
 /// **FU4c (2026-06-22):** the RangeAware-tier STATISTICAL REDUCERS — single-data-range
 /// functions that flatten their data arg to a scalar via `collect_numbers_strict`. These
-/// are the ONLY RangeAware functions that consume an array-valued LET/LAMBDA local
+/// are the STATISTICAL-REDUCER subset that consume an array-valued LET/LAMBDA local
 /// (`MEDIAN(row)` inside `BYROW`, or `LET(s,SEQUENCE(5),MEDIAN(s))`) — see the gated arm in
-/// `scalar.rs`'s `RegisteredFn::RangeAware` materialization loop. The lookups
-/// (INDEX/VLOOKUP/…), conditionals (SUMIF/…), pair-stats (CORREL/…) and financial
-/// (SHARPE/…) reducers are DEFERRED: an array-local in them stays `#CALC!`/`#VALUE!` (pinned).
+/// `scalar.rs`'s `RegisteredFn::RangeAware` materialization loop. The RangeAware LOOKUPS
+/// (INDEX/VLOOKUP/…) ALSO consume one via the sibling `is_range_aware_lookup` (FU4c-B); the
+/// conditionals (SUMIF/…), pair-stats (CORREL/…) and financial (SHARPE/…) reducers stay
+/// DEFERRED: an array-local in them stays `#CALC!`/`#VALUE!` (pinned).
 ///
 /// A NAME-matcher is required, not a metadata read: `ArgContext::Aggregate` is shared by the
 /// WHOLE RangeAware tier (`is_aggregate_function` is true for INDEX/SUMIF/SHARPE too), so it
@@ -531,6 +532,27 @@ pub(crate) fn is_range_aware_reducer(name: &str) -> bool {
             | "RANK"
             | "RANK.EQ"
             | "RANK.AVG"
+    )
+}
+
+/// **FU4c-B (2026-06-22):** the RangeAware-tier LOOKUPS — shape-aware functions that read an
+/// array/table arg by `(row, col)` (INDEX / VLOOKUP / HLOOKUP) or scan it for a position
+/// (MATCH / XLOOKUP / XMATCH). Like the reducers, they consume an array-valued LET/LAMBDA local
+/// — but they preserve its 2-D shape (`MEDIAN` flattens; `INDEX(t,2,1)` addresses). The array-
+/// local materializes via the SAME gated arm in `scalar.rs`'s `RegisteredFn::RangeAware` loop,
+/// byte-identical to a real range, so each lookup computes exactly as it would over the
+/// equivalent range. Position-blind is sound: every non-data slot of every lookup rejects a
+/// `FnArg::Range` loudly (`#VALUE!`).
+///
+/// CHOOSE is EXCLUDED — it has no data-array slot (its value args are individually-selected
+/// scalars; an array-local there returns the `#CALC!` sentinel verbatim, still loud). A
+/// NAME-matcher is required (shared with the reducer rationale above). The 6 names are the
+/// complete `register_range_aware` data-consuming lookup set (`ql_functions::registry`). Pinned
+/// by `is_range_aware_lookup_matches_exactly_the_six`.
+pub(crate) fn is_range_aware_lookup(name: &str) -> bool {
+    matches!(
+        name,
+        "INDEX" | "VLOOKUP" | "HLOOKUP" | "MATCH" | "XLOOKUP" | "XMATCH"
     )
 }
 
@@ -3896,9 +3918,10 @@ mod tests {
                 "{name} must be recognized as a RangeAware statistical reducer"
             );
         }
-        // Non-reducers — RangeAware lookups / conditionals / pair-stats / financial
-        // reducers (all DEFERRED), a Scalar-tier aggregate, and lowercase — must NOT
-        // match (the fourteen are exhaustive; names are canonical uppercase).
+        // Non-reducers — RangeAware lookups (now their own gate `is_range_aware_lookup`),
+        // conditionals / pair-stats / financial reducers (DEFERRED), a Scalar-tier
+        // aggregate, and lowercase — must NOT match (the fourteen are exhaustive; names
+        // are canonical uppercase).
         for name in [
             "INDEX",
             "VLOOKUP",
@@ -3918,8 +3941,37 @@ mod tests {
             assert!(
                 !is_range_aware_reducer(name),
                 "{name} must NOT be recognized as a RangeAware statistical reducer \
-                 (the fourteen are exhaustive; lookups / pair-stats / financial \
-                 reducers are deferred)"
+                 (the fourteen are exhaustive; lookups are a separate gate, pair-stats \
+                 / financial reducers are deferred)"
+            );
+        }
+    }
+
+    /// **FU4c-B (2026-06-22):** `is_range_aware_lookup` matches EXACTLY the six
+    /// data-consuming RangeAware lookups and nothing else. Drift guard — this matcher
+    /// (OR'd with `is_range_aware_reducer`) gates the array-as-arg relaxation in
+    /// `scalar.rs`, so a name wrongly added would relax a non-lookup, and a name wrongly
+    /// dropped would leave a lookup silently `#CALC!`/`#VALUE!` over an array-local.
+    /// CHOOSE is deliberately ABSENT (no data-array slot).
+    #[test]
+    fn is_range_aware_lookup_matches_exactly_the_six() {
+        for name in ["INDEX", "VLOOKUP", "HLOOKUP", "MATCH", "XLOOKUP", "XMATCH"] {
+            assert!(
+                is_range_aware_lookup(name),
+                "{name} must be recognized as a RangeAware lookup"
+            );
+        }
+        // Non-lookups — CHOOSE (excluded: no data-array slot), the reducers (their own
+        // gate), conditionals / pair-stats / financial reducers, a Scalar-tier aggregate,
+        // and lowercase — must NOT match.
+        for name in [
+            "CHOOSE", "MEDIAN", "RANK", "SUMIF", "CORREL", "SHARPE", "SUM", "index", "vlookup",
+        ] {
+            assert!(
+                !is_range_aware_lookup(name),
+                "{name} must NOT be recognized as a RangeAware lookup \
+                 (the six are exhaustive; CHOOSE has no data-array slot; \
+                 reducers are a separate gate; names are canonical uppercase)"
             );
         }
     }
