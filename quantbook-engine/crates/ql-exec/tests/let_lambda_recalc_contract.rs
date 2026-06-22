@@ -897,18 +897,16 @@ fn fu3_array_arg_invoked_as_lambda_param_is_calc() {
 }
 
 #[test]
-fn fu3_let_array_local_as_unified_fn_arg_is_calc() {
-    // Megaudit (Sonnet lane B) deferred-boundary pin: an array local passed as an arg to a
-    // UNIFIED array fn (=LET(s,SEQUENCE(3),TRANSPOSE(s))) stays #CALC! — array-as-arbitrary-arg
-    // works nowhere in v1 (the LocalRef arg materializes to #CALC! before TRANSPOSE sees it).
-    // Same as the SUM case but for the Unified tier; folds into FU4. Pre-existing, not an FU3
-    // regression.
+fn fu4c_c2_let_transpose_over_array_local_spills() {
+    // **FU4c-C2 (2026-06-22):** an array-local fed as a DATA arg to a Unified fn (TRANSPOSE)
+    // now materializes as `FunctionArg::Array` at the cell boundary and the result SPILLS.
+    // SEQUENCE(3) = 3x1 {1;2;3}; TRANSPOSE swaps shape -> 1x3 {1,2,3}. This is the FLIPPED
+    // `fu3_let_array_local_as_unified_fn_arg_is_calc` deferred pin (it asserted #CALC!/no-spill
+    // before C2 -- "the LocalRef arg materializes to #CALC! before TRANSPOSE sees it"). The
+    // full FU4c-C2 production suite (FILTER/SORT/SORTBY/UNIQUE/degenerate/loud/cardinal-sin)
+    // is in the dedicated section at the tail of this file.
     let (wb, _g, _r) = setup("LET(s,SEQUENCE(3),TRANSPOSE(s))", 0.0);
-    assert_eq!(
-        wb.read(Address::new(0, 0, 1)),
-        Value::Error(ErrorValue::Calc)
-    );
-    assert_eq!(wb.spill_anchor_at(0, 0, 1).copied(), None, "must NOT spill");
+    assert_spill_block(&wb, 1, 3, &[1.0, 2.0, 3.0]);
 }
 
 #[test]
@@ -1516,10 +1514,10 @@ fn fu4b_byrow_error_element_in_row_flows_into_lambda() {
 // --- PRODUCTION spill pins (a scalar-context #CALC! pin is vacuous: the boundary maps
 // any BYROW array result to #CALC! regardless of the cells. These assert the SPILLED
 // CELL values). The reducers (FU4c-A), lookups (FU4c-B), financial / pair-stats reducers
-// (FU4c-C1), and conditionals / text / multi-range / SUBTOTAL (FU4c-D) now compute here; the
-// still-DEFERRED families (Unified TRANSPOSE/FILTER, ReferenceAware ROW/COLUMN, and CHOOSE —
-// no data-array slot) stay loud — those pins FAIL the day THOSE start computing over an
-// array-local, making any future relaxation deliberate. -----
+// (FU4c-C1), conditionals / text / multi-range / SUBTOTAL (FU4c-D), and the Unified array tier
+// TRANSPOSE/FILTER/SORT/SORTBY/UNIQUE (FU4c-C2) now compute / spill here; the still-DEFERRED
+// families (ReferenceAware ROW/COLUMN, and CHOOSE -- no data-array slot) stay loud -- those pins
+// FAIL the day THOSE start computing over an array-local, making any future relaxation deliberate. -----
 
 #[test]
 fn fu4c_byrow_median_over_row_local_computes_in_production() {
@@ -2118,4 +2116,167 @@ fn fu4c_d_byrow_countif_countblank_skip_error_element() {
     // COUNTBLANK: no blanks in either row (an error is NOT blank) -> 0, 0.
     assert_eq!(wb.read(Address::new(0, 0, 5)), Value::Number(0.0));
     assert_eq!(wb.read(Address::new(0, 1, 5)), Value::Number(0.0));
+}
+
+// =============================================================================
+// FU4c-C2 (2026-06-22): an array-local fed as a DATA arg to a Unified array fn
+// (TRANSPOSE/FILTER/SORT/SORTBY/UNIQUE) materializes as FunctionArg::Array at the cell
+// boundary and the result SPILLS -- byte-identical to the array-LITERAL path for a
+// non-degenerate local. Ungated (no name predicate): every NON-data Unified slot
+// loud-rejects an array (#VALUE!/#NUM! via coerce_arg_to_f64/_bool), so position-blind is
+// sound; SEQUENCE/RANDARRAY have only scalar-dimension slots -> an array-local there is
+// #VALUE!. The flipped TRANSPOSE pin lives above (fu4c_c2_let_transpose_over_array_local_spills);
+// this block adds the rest. Every value recomputed by hand from array_returning_fns.rs
+// (orientations: {a,b,c}=1xN row, {a;b;c}=Nx1 col, SEQUENCE(n)=nx1).
+// =============================================================================
+
+#[test]
+fn fu4c_c2_let_transpose_2d_over_array_local_spills() {
+    // {1,2;3,4} = 2x2 [[1,2],[3,4]]; TRANSPOSE out[j,i]=in[i,j] -> [1,3,2,4] (2x2).
+    let (wb, _g, _r) = setup("LET(s,{1,2;3,4},TRANSPOSE(s))", 0.0);
+    assert_spill_block(&wb, 2, 2, &[1.0, 3.0, 2.0, 4.0]);
+}
+
+#[test]
+fn fu4c_c2_let_filter_over_array_locals_column() {
+    // a={10;20;30} 3x1, b={1;0;1} 3x1 -> keep idx0,idx2 -> {10;30} (2x1). Both array-locals.
+    let (wb, _g, _r) = setup("LET(a,{10;20;30},LET(b,{1;0;1},FILTER(a,b)))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[10.0, 30.0]);
+}
+
+#[test]
+fn fu4c_c2_let_filter_array_local_with_literal_mask_row() {
+    // a={10,20,30} 1x3 array-local, mask {1,0,1} 1x3 literal -> keep idx0,idx2 -> {10,30} (1x2).
+    let (wb, _g, _r) = setup("LET(a,{10,20,30},FILTER(a,{1,0,1}))", 0.0);
+    assert_spill_block(&wb, 1, 2, &[10.0, 30.0]);
+}
+
+#[test]
+fn fu4c_c2_let_filter_all_false_no_if_empty_is_calc() {
+    // all-FALSE mask, no if_empty -> degenerate (0,1) -> #CALC! at write_spill, no spill.
+    let (wb, _g, _r) = setup("LET(a,{10;20;30},LET(b,{0;0;0},FILTER(a,b)))", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Calc)
+    );
+    assert_eq!(wb.spill_anchor_at(0, 0, 1).copied(), None, "must NOT spill");
+}
+
+#[test]
+fn fu4c_c2_let_filter_all_false_with_if_empty_computes() {
+    // all-FALSE + if_empty=-1 -> 1x1 singleton {-1}. Read the anchor value directly
+    // (a 1x1 result's spill-shape is not the focus); proves FILTER consumed the array-local.
+    let (wb, _g, _r) = setup("LET(a,{10;20;30},LET(b,{0;0;0},FILTER(a,b,-1)))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(-1.0));
+}
+
+#[test]
+fn fu4c_c2_filter_if_empty_array_local_matches_literal_first_cell() {
+    // **5-lane megaudit fold (Codex + Opus + Sonnet-A all flagged the same caveat):** FILTER's
+    // optional if_empty (arg2) is the ONE Unified slot that ACCEPTS an array rather than
+    // loud-rejecting it -- it takes the array's FIRST cell (a pre-existing v1 simplification,
+    // identical for an array LITERAL / RANGE). C2 makes an array-LOCAL reach the same slot; this
+    // pin makes the convergence DELIBERATE: a multi-element if_empty array-local and the
+    // equivalent literal both yield the first cell (-1), never a silent wrong result. (all-FALSE
+    // mask routes to if_empty; e = {-1;-2} -> e.first() = -1.)
+    let (local, _g1, _r1) = setup(
+        "LET(a,{10;20;30},LET(b,{0;0;0},LET(e,{-1;-2},FILTER(a,b,e))))",
+        0.0,
+    );
+    let (literal, _g2, _r2) = setup("LET(a,{10;20;30},LET(b,{0;0;0},FILTER(a,b,{-1;-2})))", 0.0);
+    assert_eq!(local.read(Address::new(0, 0, 1)), Value::Number(-1.0));
+    assert_eq!(
+        literal.read(Address::new(0, 0, 1)),
+        local.read(Address::new(0, 0, 1)),
+        "an array-local if_empty must match the array-literal if_empty (both -> first cell)"
+    );
+}
+
+#[test]
+fn fu4c_c2_let_sort_over_array_local() {
+    // {3;1;2} 3x1; SORT default sorts rows by key col asc -> {1;2;3} (3x1).
+    let (wb, _g, _r) = setup("LET(s,{3;1;2},SORT(s))", 0.0);
+    assert_spill_block(&wb, 3, 1, &[1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn fu4c_c2_let_unique_over_array_local() {
+    // {1;2;2;3;1} 5x1; UNIQUE dedups rows first-seen -> {1;2;3} (3x1).
+    let (wb, _g, _r) = setup("LET(s,{1;2;2;3;1},UNIQUE(s))", 0.0);
+    assert_spill_block(&wb, 3, 1, &[1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn fu4c_c2_let_sortby_over_array_locals() {
+    // d={10;20;30}, k={2;3;1}; sort d's rows by k asc (order [2,0,1]) -> {30;10;20} (3x1).
+    let (wb, _g, _r) = setup("LET(d,{10;20;30},LET(k,{2;3;1},SORTBY(d,k)))", 0.0);
+    assert_spill_block(&wb, 3, 1, &[30.0, 10.0, 20.0]);
+}
+
+#[test]
+fn fu4c_c2_degenerate_array_local_to_unified_is_calc_no_panic() {
+    // **The soundness-lane catch.** A DEGENERATE array-local (an all-FALSE FILTER bound to a
+    // local -- a state the binder forbids for an array LITERAL) fed to TRANSPOSE must NOT
+    // panic: TRANSPOSE's own degeneracy guard early-returns an empty array -> #CALC! at
+    // write_spill. (s = FILTER({1;2},{0;0}) = empty(0,1); TRANSPOSE(s) = empty(1,0) -> #CALC!.)
+    let (wb, _g, _r) = setup("LET(s,FILTER({1;2},{0;0}),TRANSPOSE(s))", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Calc)
+    );
+    assert_eq!(wb.spill_anchor_at(0, 0, 1).copied(), None, "must NOT spill");
+}
+
+#[test]
+fn fu4c_c2_array_local_in_non_data_slot_is_loud() {
+    // Position-blind soundness: an array-local in a NON-data Unified slot loud-rejects ->
+    // #VALUE! (never a silent coercion). SEQUENCE's rows slot and SORT's sort_index slot both
+    // route through coerce_arg_to_f64, which returns #VALUE! for a FunctionArg::Array.
+    let (seq, _g1, _r1) = setup("LET(s,SEQUENCE(3),SEQUENCE(s))", 0.0);
+    assert_eq!(
+        seq.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(seq.spill_anchor_at(0, 0, 1).copied(), None);
+    // A 2-element index array (not a 1x1) keeps the loud intent unambiguous.
+    let (srt, _g2, _r2) = setup("LET(idx,{1,2},SORT({3;1;2},idx))", 0.0);
+    assert_eq!(
+        srt.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(srt.spill_anchor_at(0, 0, 1).copied(), None);
+}
+
+#[test]
+fn fu4c_c2_transpose_over_array_local_body_cell_ref_recomputes() {
+    // **The cardinal-sin test.** A cell ref inside the array-local's producer ($A$1 as
+    // SEQUENCE's start) must register as a precedent so editing it recomputes the spill.
+    // C2 changes ONLY arg materialization, not dep extraction (the dep walker is unchanged).
+    // CONSTANT shape (rows fixed at 3, only start varies) -> no spill-reshape. A1=1 ->
+    // SEQUENCE(3,1,1)={1;2;3} -> TRANSPOSE -> 1x3 {1,2,3}; edit A1=10 -> {10;11;12} -> {10,11,12}.
+    let (mut wb, mut graph, reg) = setup("LET(s,SEQUENCE(3,1,$A$1),TRANSPOSE(s))", 1.0);
+    assert_spill_block(&wb, 1, 3, &[1.0, 2.0, 3.0]);
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(10.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(
+        attempted >= 1,
+        "editing A1 must recompute the TRANSPOSE-over-array-local spill (attempted == 0 means \
+         the dep inside the Unified-fn LET binding was never registered -- the cardinal sin)"
+    );
+    assert_spill_block(&wb, 1, 3, &[10.0, 11.0, 12.0]);
+}
+
+#[test]
+fn fu4c_c2_transpose_over_array_local_body_cell_ref_in_deps() {
+    // Direct dep-extraction proof: $A$1 inside the SEQUENCE producer of the array-local is a
+    // precedent of the spilling TRANSPOSE formula.
+    let deps = formula_deps_for("LET(s,SEQUENCE(3,1,$A$1),TRANSPOSE(s))").expect("has deps");
+    assert!(
+        deps.cells.iter().any(|&(s, r, c)| (s, r, c) == (0, 0, 0)),
+        "$A$1 inside the Unified-fn LET binding must be a precedent; got {:?}",
+        deps.cells
+    );
 }

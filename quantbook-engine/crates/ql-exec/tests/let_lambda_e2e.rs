@@ -1279,3 +1279,53 @@ fn fu4c_d_maxifs_no_match_is_zero() {
         num(0.0)
     );
 }
+
+// =============================================================================
+// FU4c-C2 (2026-06-22): scalar-context pins. C2 made an array-local fed as a DATA arg to a
+// Unified fn (TRANSPOSE/FILTER/SORT/SORTBY/UNIQUE) SPILL at the cell boundary (the
+// production suite is in let_lambda_recalc_contract.rs). In SCALAR context an array result
+// is #CALC! regardless (no implicit intersection in v1) -- the scalar Unified arm is
+// UNCHANGED, so the array-local arg reaches #CALC! before the fn and propagates. These pin
+// that the boundary-only change did NOT leak into scalar evaluation (the cardinal soundness
+// rule; same shape as fu4c_byrow_median_in_scalar_context_collapses_to_calc).
+// =============================================================================
+
+#[test]
+fn fu4c_c2_transpose_over_array_local_is_calc_in_scalar_context() {
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),TRANSPOSE(s))"),
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu4c_c2_filter_over_array_locals_is_calc_in_scalar_context() {
+    assert_eq!(
+        eval("LET(a,{10;20;30},LET(b,{1;0;1},FILTER(a,b)))"),
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu4c_c2_sort_over_array_local_is_calc_in_scalar_context() {
+    assert_eq!(
+        eval("LET(s,{3;1;2},SORT(s))"),
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu4c_c2_unique_over_array_local_is_calc_in_scalar_context() {
+    assert_eq!(
+        eval("LET(s,{1;2;2;3},UNIQUE(s))"),
+        Value::Error(ErrorValue::Calc)
+    );
+}
+
+#[test]
+fn fu4c_c2_sortby_over_array_locals_is_calc_in_scalar_context() {
+    assert_eq!(
+        eval("LET(d,{10;20;30},LET(k,{2;3;1},SORTBY(d,k)))"),
+        Value::Error(ErrorValue::Calc)
+    );
+}

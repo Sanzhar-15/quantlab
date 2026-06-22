@@ -569,6 +569,11 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                         // point that returns `EvalResult::Array`. Until
                         // then, any array-returning function called from
                         // a sub-expression position produces `#CALC!`.
+                        // **FU4c-C2 (2026-06-22):** the cell-boundary Unified arm now
+                        // ALSO materializes an array-local ARG as `FunctionArg::Array`
+                        // (so the result can spill there); this scalar arm deliberately
+                        // does NOT -- an array return is `#CALC!` here regardless, so the
+                        // same arm would be dead. The two loops are intentionally asymmetric.
                         FunctionReturn::Array(_) => Value::Error(ErrorValue::Calc),
                     }
                 }
@@ -985,10 +990,12 @@ fn eval_let_bindings<E: CellEnv>(
 /// invisible in scalar context — every sub-expression consumer of an `Array`
 /// binding still surfaces `#CALC!` (`LocalRef`/`CallLambda` arms above; an array
 /// CALLEE is `#CALC!` via `invoke_lambda`); it only enables the boundary
-/// `Let`/`CallLambda` spill arms. NOTE the array only spills when it is the DIRECT
-/// body/result: an array local passed THROUGH a function arg
-/// (`=LET(s,SEQUENCE(3),TRANSPOSE(s))` / `SUM(s)`) still materializes to `#CALC!`
-/// at the `LocalRef` arg (array-as-arbitrary-arg is deferred to FU4).
+/// `Let`/`CallLambda` spill arms. NOTE the array only SPILLS when it is the DIRECT
+/// body/result. An array local passed THROUGH a function arg now COMPUTES for the
+/// scalar-aggregate (FU4b, `SUM(s)`=6), RangeAware (FU4c-A/B/C1/D, `SUMIF(s,">2")`=12),
+/// and Unified array (FU4c-C2, `=LET(s,SEQUENCE(3),TRANSPOSE(s))` spills 1x3) tiers;
+/// only array arithmetic (`s*2`) and a nested Unified call in scalar context
+/// (`SUM(TRANSPOSE(s))`) stay `#CALC!`.
 fn eval_binding<E: CellEnv>(
     plan: &ExprPlan,
     env: &E,
@@ -1955,6 +1962,37 @@ pub fn eval_at_cell_boundary<E: CellEnv>(
                             .expect("ExprPlan::Array passed binder validation; shape intact");
                         f_args.push(FunctionArg::Array(av));
                     }
+                    // **FU4c-C2 (2026-06-22):** an array-valued LET/LAMBDA local
+                    // (`LocalBinding::Array`) fed as a DATA arg to a Unified fn
+                    // materializes as `FunctionArg::Array` -- the Unified ABI's native
+                    // array carrier -- so TRANSPOSE / FILTER / SORT / SORTBY / UNIQUE
+                    // consume it and the result SPILLS via the `Let` / `CallLambda`
+                    // boundary arms below (flips `fu3_let_array_local_as_unified_fn_arg_is_calc`).
+                    // For a NON-degenerate local this is byte-identical to the
+                    // `ExprPlan::Array` literal arm above (same `ArrayValue`, same
+                    // downstream). A DEGENERATE local (e.g. an all-FALSE FILTER bound to
+                    // a local -- a state the binder forbids for a literal) is panic-free:
+                    // each Unified fn's own degeneracy guard early-returns, surfacing
+                    // `#CALC!` at `write_spill`. Position-blind (no name gate) is sound
+                    // because every NON-data Unified slot treats a `FunctionArg::Array`
+                    // EXACTLY as it treats an array LITERAL: the numeric/flag slots
+                    // (SEQUENCE/RANDARRAY dims, SORT index/order, UNIQUE flags) LOUDLY
+                    // error via `coerce_arg_to_f64` / `coerce_arg_to_bool` -> `#VALUE!`,
+                    // and FILTER's optional `if_empty` fallback takes the array's first
+                    // cell (identical to the literal path) -- never a silent wrong result.
+                    // Only the BOUNDARY loop gets this arm: the scalar Unified arm
+                    // (`eval_scalar_with_cache`) maps any array return to `#CALC!`
+                    // regardless, so the same arm there would be dead. A `Value` /
+                    // `Callable` / missing local falls through to the scalar `LocalRef`
+                    // arm (its value / `#CALC!` / `#NAME?`), unchanged.
+                    ExprPlan::LocalRef(n) => match env.local_env().lookup(n) {
+                        Some(LocalBinding::Array(arr)) => {
+                            f_args.push(FunctionArg::Array(arr.clone()))
+                        }
+                        _ => f_args.push(FunctionArg::Scalar(eval_scalar_with_cache(
+                            a, env, registry, cache,
+                        ))),
+                    },
                     other => {
                         f_args.push(FunctionArg::Scalar(eval_scalar_with_cache(
                             other, env, registry, cache,
