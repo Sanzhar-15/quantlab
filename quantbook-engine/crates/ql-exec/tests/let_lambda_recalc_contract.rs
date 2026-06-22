@@ -1519,25 +1519,13 @@ fn fu4b_byrow_error_element_in_row_flows_into_lambda() {
 // computing over an array-local — making any future relaxation deliberate.) -----
 
 #[test]
-fn fu4b_byrow_median_over_row_local_is_calc_in_production() {
-    // **Megaudit (Codex MED → operator-deferred; re-audit LOW: strengthen the pin).**
-    // MEDIAN is RangeAware-tier, so an array-local row stays #CALC! per cell — the
-    // result spills 2×1 with BOTH cells #CALC! (NOT {2;5}). If the relaxation later
-    // extends to the RangeAware reducers, these cells become numbers and this fails.
+fn fu4c_byrow_median_over_row_local_computes_in_production() {
+    // **FU4c (2026-06-22):** MEDIAN joined the `is_range_aware_reducer` gate, so an
+    // array-local row now flattens into MEDIAN (via the RangeAware materialization arm)
+    // and computes per row: row1 median(1,3,2)=2, row2 median(4,6,5)=5 → spills 2×1 {2;5}.
+    // (This is the FU4b deferred-MEDIAN pin FLIPPED — the only value change in FU4c.)
     let (wb, _g, _r) = setup("BYROW({1,3,2;4,6,5},LAMBDA(r,MEDIAN(r)))", 0.0);
-    assert_eq!(
-        wb.spill_anchor_at(0, 0, 1).copied(),
-        Some(SpillShape::new(2, 1)),
-        "BYROW still spills 2×1 even when each row is a deferred #CALC!"
-    );
-    assert_eq!(
-        wb.read(Address::new(0, 0, 1)),
-        Value::Error(ErrorValue::Calc)
-    );
-    assert_eq!(
-        wb.read(Address::new(0, 1, 1)),
-        Value::Error(ErrorValue::Calc)
-    );
+    assert_spill_block(&wb, 2, 1, &[2.0, 5.0]);
 }
 
 #[test]
@@ -1553,6 +1541,172 @@ fn fu4b_byrow_index_over_row_local_is_deferred_loud_in_production() {
     // only sees the boundary's whole-array→#CALC! collapse, so it can't distinguish the
     // codes — which is why this production pin exists.)
     let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,INDEX(r,1)))", 0.0);
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        Some(SpillShape::new(2, 1))
+    );
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(
+        wb.read(Address::new(0, 1, 1)),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+// =============================================================================
+// FU4c (2026-06-22): RangeAware STATISTICAL REDUCERS over an array-local.
+// An array-valued LET/LAMBDA local now flattens into a gated reducer (MEDIAN /
+// MODE / LARGE / SMALL / PERCENTILE / QUARTILE / RANK) via the RangeAware
+// materialization arm. Production path: spill + dependency tracking. Mirrors the
+// FU4b BYROW-SUM suite. The MEDIAN value-flip pin lives above (flipped from the
+// FU4b deferred pin); these add the rest of the reducer family + the cardinal-sin
+// + edge + deferred-stays-loud surface.
+// =============================================================================
+
+#[test]
+fn fu4c_byrow_large_per_row() {
+    // LARGE(row, 1) = the per-row maximum. row1 {1,3,2}→3, row2 {4,6,5}→6 → 2×1 {3;6}.
+    let (wb, _g, _r) = setup("BYROW({1,3,2;4,6,5},LAMBDA(r,LARGE(r,1)))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[3.0, 6.0]);
+}
+
+#[test]
+fn fu4c_byrow_small_per_row() {
+    // SMALL(row, 1) = the per-row minimum. row1 {1,3,2}→1, row2 {4,6,5}→4 → 2×1 {1;4}.
+    let (wb, _g, _r) = setup("BYROW({1,3,2;4,6,5},LAMBDA(r,SMALL(r,1)))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[1.0, 4.0]);
+}
+
+#[test]
+fn fu4c_bycol_median_per_col() {
+    // MEDIAN over each COLUMN array. {1,4;3,6;2,5} is 3×2: col1 {1,3,2}→2, col2 {4,6,5}→5
+    // → 1×2 {2,5}. Proves the array-local relaxation works for a BYCOL column-local too.
+    let (wb, _g, _r) = setup("BYCOL({1,4;3,6;2,5},LAMBDA(c,MEDIAN(c)))", 0.0);
+    assert_spill_block(&wb, 1, 2, &[2.0, 5.0]);
+}
+
+#[test]
+fn fu4c_byrow_median_body_cell_ref_recomputes() {
+    // **THE cardinal-sin test for a reducer body.** A cell ref inside the MEDIAN lambda
+    // body must register $A$1 as a precedent (inherited from the FU4 `discover` invoked-set
+    // mark — FU4c changes ONLY arg materialization, not dep extraction). A1=10 →
+    // {median(1,3,2)+10; median(4,6,5)+10} = {12;15}; edit A1=20 → {22;25}.
+    let (mut wb, mut graph, reg) = setup("BYROW({1,3,2;4,6,5},LAMBDA(r,MEDIAN(r)+$A$1))", 10.0);
+    assert_spill_block(&wb, 2, 1, &[12.0, 15.0]);
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(20.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(
+        attempted >= 1,
+        "editing A1 must recompute the BYROW-MEDIAN (attempted == 0 means the dep inside \
+         the reducer lambda body was never registered — the cardinal sin)"
+    );
+    assert_spill_block(&wb, 2, 1, &[22.0, 25.0]);
+}
+
+#[test]
+fn fu4c_byrow_median_body_cell_ref_in_deps() {
+    // Direct dep-extraction proof: $A$1 inside the MEDIAN lambda body is in deps.cells.
+    let deps = formula_deps_for("BYROW({1,3,2;4,6,5},LAMBDA(r,MEDIAN(r)+$A$1))").expect("has deps");
+    assert!(
+        deps.cells.iter().any(|&(s, r, c)| (s, r, c) == (0, 0, 0)),
+        "$A$1 inside the BYROW-MEDIAN lambda body must be a precedent; got {:?}",
+        deps.cells
+    );
+}
+
+#[test]
+fn fu4c_byrow_let_bound_median_lambda_spills() {
+    // A LET-bound reducer lambda passed to BYROW resolves at both the walker and eval.
+    let (wb, _g, _r) = setup("LET(f,LAMBDA(r,MEDIAN(r)),BYROW({1,3,2;4,6,5},f))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[2.0, 5.0]);
+}
+
+#[test]
+fn fu4c_byrow_median_reshapes_on_precedent_edit() {
+    // The ARRAY arg's precedents drive the shape. SEQUENCE(n) is n×1; BYROW gives one
+    // MEDIAN per single-cell row (= that cell). A1=3 → {1;2;3}; edit A1=5 → {1;2;3;4;5}.
+    let (mut wb, mut graph, reg) = setup("BYROW(SEQUENCE($A$1),LAMBDA(r,MEDIAN(r)))", 3.0);
+    assert_spill_block(&wb, 3, 1, &[1.0, 2.0, 3.0]);
+    {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached");
+    }
+    assert_spill_block(&wb, 5, 1, &[1.0, 2.0, 3.0, 4.0, 5.0]);
+}
+
+#[test]
+fn fu4c_byrow_median_single_row_is_1x1() {
+    // A 1×3 source has ONE row → BYROW gives a single scalar → 1×1 {median(1,3,2)=2}.
+    let (wb, _g, _r) = setup("BYROW({1,3,2},LAMBDA(r,MEDIAN(r)))", 0.0);
+    assert_spill_block(&wb, 1, 1, &[2.0]);
+}
+
+#[test]
+fn fu4c_bycol_median_single_col_is_1x1() {
+    // A 3×1 source has ONE column → BYCOL gives a single scalar → 1×1 {median(1,3,2)=2}.
+    let (wb, _g, _r) = setup("BYCOL({1;3;2},LAMBDA(c,MEDIAN(c)))", 0.0);
+    assert_spill_block(&wb, 1, 1, &[2.0]);
+}
+
+#[test]
+fn fu4c_byrow_median_1x1_source() {
+    // A 1×1 source → 1×1 {median(5)=5}.
+    let (wb, _g, _r) = setup("BYROW({5},LAMBDA(r,MEDIAN(r)))", 0.0);
+    assert_spill_block(&wb, 1, 1, &[5.0]);
+}
+
+#[test]
+fn fu4c_let_median_over_array_local_computes_in_production() {
+    // The standalone scalar win: MEDIAN returns a SCALAR, so `LET(s,…,MEDIAN(s))` computes
+    // a value at the cell boundary with NO spill (mirrors the FU4b SUM production pin).
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(5),MEDIAN(s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(3.0));
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        None,
+        "MEDIAN returns a scalar — no spill"
+    );
+}
+
+#[test]
+fn fu4c_byrow_median_error_element_in_row_flows_into_lambda() {
+    // An ERROR element inside a row flows INTO MEDIAN, which propagates it for THAT row
+    // only; a clean row computes. Data A1:B2 = {#DIV/0!,2; 3,4}; BYROW at D1 spills 2×1.
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "1/0").unwrap(); // A1 = #DIV/0!
+        rt.set_value(0, 0, 1, Value::Number(2.0)).unwrap(); // B1
+        rt.set_value(0, 1, 0, Value::Number(3.0)).unwrap(); // A2
+        rt.set_value(0, 1, 1, Value::Number(4.0)).unwrap(); // B2
+        rt.set_formula(0, 0, 3, "BYROW(A1:B2,LAMBDA(r,MEDIAN(r)))")
+            .unwrap(); // D1, spills D1:D2
+    }
+    // Row 1 {#DIV/0!,2} → MEDIAN propagates #DIV/0!; row 2 {3,4} → median = 3.5.
+    assert_eq!(
+        wb.read(Address::new(0, 0, 3)),
+        Value::Error(ErrorValue::DivZero),
+        "the error element flows into the lambda; MEDIAN propagates it for that row"
+    );
+    assert_eq!(wb.read(Address::new(0, 1, 3)), Value::Number(3.5));
+}
+
+#[test]
+fn fu4c_byrow_sharpe_over_row_local_stays_loud_in_production() {
+    // **Reducers-only proof (production).** SHARPE is a RangeAware fn that REDUCES to a
+    // scalar (looks like a reducer) but is NOT in the `is_range_aware_reducer` gate, so an
+    // array-local row reaches it as `FnArg::Scalar(#CALC!)` (the unchanged `other =>` arm)
+    // and `collect_series` rejects a Scalar arg → #VALUE! per row. Catches an over-broad
+    // gate that would relax the whole RangeAware tier. Still spills 2×1 (errors spill).
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,SHARPE(r)))", 0.0);
     assert_eq!(
         wb.spill_anchor_at(0, 0, 1).copied(),
         Some(SpillShape::new(2, 1))

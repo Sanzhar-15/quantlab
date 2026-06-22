@@ -409,6 +409,36 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                     Err(ev) => fn_args.push(FnArg::Scalar(Value::Error(ev))),
                                 }
                             }
+                            // **FU4c (2026-06-22):** an array-valued LET/LAMBDA local
+                            // consumed by a RangeAware STATISTICAL REDUCER — `MEDIAN(row)`
+                            // inside `BYROW`, or `LET(s,SEQUENCE(5),MEDIAN(s))`. Gated by
+                            // name (`is_range_aware_reducer` — the ONLY new TRUE case); a
+                            // non-gated RangeAware fn (INDEX/SUMIF/SHARPE) never enters this
+                            // arm and keeps the `other =>` path → `#CALC!`/`#VALUE!`.
+                            // Position-blind like FU4b's Scalar arm: any array-local arg of
+                            // a gated reducer materializes as a `Range`, and each reducer's
+                            // own arg validation rejects a `Range` in a non-data slot loudly
+                            // (`#VALUE!`). The array was materialized ONCE at bind time
+                            // (FU3 `eval_binding` / FU4b `invoke_closure_with_array`);
+                            // `lookup` is a pure cons-list walk — NO grid re-read, NO
+                            // volatile re-fire. A non-array local (scalar/callable/error/
+                            // None) takes the `_` branch, byte-identical to `other =>`.
+                            ExprPlan::LocalRef(n) if crate::plan::is_range_aware_reducer(name) => {
+                                match env.local_env().lookup(n) {
+                                    Some(LocalBinding::Array(arr)) => {
+                                        fn_args.push(FnArg::range_with_visibility(
+                                            arr.cells().to_vec(),
+                                            arr.rows() as usize,
+                                            arr.cols() as usize,
+                                            // all-visible: an array-local has no hidden rows
+                                            Vec::new(),
+                                        ));
+                                    }
+                                    _ => fn_args.push(FnArg::Scalar(eval_scalar_with_cache(
+                                        a, env, registry, cache,
+                                    ))),
+                                }
+                            }
                             other => {
                                 fn_args.push(FnArg::Scalar(eval_scalar_with_cache(
                                     other, env, registry, cache,
@@ -669,9 +699,11 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 // re-fire. A scalar / callable / error local does NOT
                                 // resolve to `Array`, so it falls to the scalar-eval arm,
                                 // byte-identical to the pre-FU4b `other =>` path. (Only the
-                                // scalar-aggregate reducers reach here — RangeAware reducers
-                                // MEDIAN/MODE/LARGE/SMALL dispatch through a different arm
-                                // and stay `#CALC!`, like INDEX/VLOOKUP; see the FU4b note.)
+                                // SCALAR-tier aggregate reducers reach here. The RangeAware
+                                // statistical reducers (MEDIAN/MODE/LARGE/SMALL/RANK/...)
+                                // dispatch through the separate RangeAware arm, where FU4c added the
+                                // analogous array-local relaxation; the RangeAware LOOKUPS
+                                // INDEX/VLOOKUP stay deferred `#CALC!`/`#VALUE!`.)
                                 ExprPlan::LocalRef(n) => match env.local_env().lookup(n) {
                                     Some(LocalBinding::Array(arr)) => {
                                         flat.extend(arr.cells().iter().cloned())

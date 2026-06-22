@@ -501,6 +501,39 @@ pub(crate) fn is_aggregate_function(registry: &FunctionRegistry, name: &str) -> 
     )
 }
 
+/// **FU4c (2026-06-22):** the RangeAware-tier STATISTICAL REDUCERS — single-data-range
+/// functions that flatten their data arg to a scalar via `collect_numbers_strict`. These
+/// are the ONLY RangeAware functions that consume an array-valued LET/LAMBDA local
+/// (`MEDIAN(row)` inside `BYROW`, or `LET(s,SEQUENCE(5),MEDIAN(s))`) — see the gated arm in
+/// `scalar.rs`'s `RegisteredFn::RangeAware` materialization loop. The lookups
+/// (INDEX/VLOOKUP/…), conditionals (SUMIF/…), pair-stats (CORREL/…) and financial
+/// (SHARPE/…) reducers are DEFERRED: an array-local in them stays `#CALC!`/`#VALUE!` (pinned).
+///
+/// A NAME-matcher is required, not a metadata read: `ArgContext::Aggregate` is shared by the
+/// WHOLE RangeAware tier (`is_aggregate_function` is true for INDEX/SUMIF/SHARPE too), so it
+/// cannot discriminate the reducers. The 14 names are the complete `register_range_aware`
+/// single-data-range reducer set (`ql_functions::registry`). Pinned by
+/// `is_range_aware_reducer_matches_exactly_the_fourteen`.
+pub(crate) fn is_range_aware_reducer(name: &str) -> bool {
+    matches!(
+        name,
+        "MEDIAN"
+            | "MODE"
+            | "MODE.SNGL"
+            | "LARGE"
+            | "SMALL"
+            | "PERCENTILE.INC"
+            | "PERCENTILE.EXC"
+            | "PERCENTILE"
+            | "QUARTILE.INC"
+            | "QUARTILE.EXC"
+            | "QUARTILE"
+            | "RANK"
+            | "RANK.EQ"
+            | "RANK.AVG"
+    )
+}
+
 /// **FU4 (2026-06-21):** the higher-order helper family — spreadsheet
 /// functions that take a `LAMBDA` argument and INVOKE it. They are NOT
 /// registry-dispatched (no `RegisteredFn` — the registry has no way to carry a
@@ -3831,6 +3864,62 @@ mod tests {
                 !is_higher_order_helper(name),
                 "{name} must NOT be recognized as a higher-order helper (names are \
                  canonical uppercase; the six are exhaustive)"
+            );
+        }
+    }
+
+    /// **FU4c (2026-06-22):** `is_range_aware_reducer` matches EXACTLY the fourteen
+    /// single-data-range statistical reducers and nothing else. Drift guard — this
+    /// matcher gates the RangeAware array-as-arg relaxation in `scalar.rs`, so a name
+    /// wrongly added would relax a non-reducer (e.g. a lookup), and a name wrongly
+    /// dropped would leave a reducer silently `#CALC!` over an array-local.
+    #[test]
+    fn is_range_aware_reducer_matches_exactly_the_fourteen() {
+        for name in [
+            "MEDIAN",
+            "MODE",
+            "MODE.SNGL",
+            "LARGE",
+            "SMALL",
+            "PERCENTILE.INC",
+            "PERCENTILE.EXC",
+            "PERCENTILE",
+            "QUARTILE.INC",
+            "QUARTILE.EXC",
+            "QUARTILE",
+            "RANK",
+            "RANK.EQ",
+            "RANK.AVG",
+        ] {
+            assert!(
+                is_range_aware_reducer(name),
+                "{name} must be recognized as a RangeAware statistical reducer"
+            );
+        }
+        // Non-reducers — RangeAware lookups / conditionals / pair-stats / financial
+        // reducers (all DEFERRED), a Scalar-tier aggregate, and lowercase — must NOT
+        // match (the fourteen are exhaustive; names are canonical uppercase).
+        for name in [
+            "INDEX",
+            "VLOOKUP",
+            "MATCH",
+            "SUMIF",
+            "COUNTIFS",
+            "CORREL",
+            "COVARIANCE.P",
+            "SHARPE",
+            "NPV",
+            "SUBTOTAL",
+            "SUM",
+            "AVERAGE",
+            "median",
+            "rank",
+        ] {
+            assert!(
+                !is_range_aware_reducer(name),
+                "{name} must NOT be recognized as a RangeAware statistical reducer \
+                 (the fourteen are exhaustive; lookups / pair-stats / financial \
+                 reducers are deferred)"
             );
         }
     }

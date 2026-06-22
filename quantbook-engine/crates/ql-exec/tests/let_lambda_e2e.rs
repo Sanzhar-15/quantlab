@@ -549,16 +549,14 @@ fn fu4b_byrow_transpose_over_row_local_is_calc() {
 }
 
 #[test]
-fn fu4b_byrow_median_over_row_local_is_calc_deferred() {
-    // **Megaudit (Codex MED → operator-deferred):** MEDIAN / MODE / MODE.SNGL /
-    // LARGE / SMALL are RangeAware-tier (registry.rs `register_range_aware`), NOT
-    // RegisteredFn::Scalar — so the FU4b one-site relaxation does NOT reach them; a
-    // row array-local in MEDIAN stays #CALC! (same deferred bucket as INDEX/VLOOKUP/
-    // TRANSPOSE). The relaxation is SCOPED to the scalar-aggregate reducers
-    // (SUM/AVERAGE/MIN/MAX/COUNT/PRODUCT/VAR/STDEV). NOTE: this scalar-context check
-    // is a weak guard (the boundary maps ANY BYROW array result to #CALC!); the REAL
-    // deferred-MEDIAN pin is `fu4b_byrow_median_over_row_local_is_calc_in_production`
-    // in let_lambda_recalc_contract.rs, which asserts the per-cell spill values.
+fn fu4c_byrow_median_in_scalar_context_collapses_to_calc() {
+    // **FU4c (2026-06-22):** MEDIAN now COMPUTES over an array-local row (it joined the
+    // `is_range_aware_reducer` gate), but this scalar-context check is VACUOUS: a BYROW
+    // result is an ARRAY, and the boundary maps ANY array result to #CALC! in scalar
+    // context regardless of the per-cell values. So this stays #CALC! even though the
+    // per-row medians now compute. The REAL FU4c win is asserted by the production pin
+    // `fu4c_byrow_median_over_row_local_computes_in_production` (per-cell spill = {2;5})
+    // and the standalone `LET(s,…,MEDIAN(s))` scalar pins (MEDIAN returns a scalar there).
     assert_eq!(
         eval("BYROW({1,3,2;4,6,5},LAMBDA(r,MEDIAN(r)))"),
         Value::Error(ErrorValue::Calc)
@@ -573,5 +571,142 @@ fn fu4b_byrow_empty_filter_source_is_calc() {
     assert_eq!(
         eval("BYROW(FILTER({1;2},{0;0}),LAMBDA(r,SUM(r)))"),
         Value::Error(ErrorValue::Calc)
+    );
+}
+
+// =============================================================================
+// FU4c (2026-06-22): array-local consumed by a RangeAware STATISTICAL REDUCER.
+// These reducers return a SCALAR, so a standalone `LET(s,…,MEDIAN(s))` flips
+// #CALC!→value in scalar context (unlike a BYROW result, which is an array and
+// collapses to #CALC! at the boundary — see the renamed vacuous pin above).
+// =============================================================================
+
+#[test]
+fn fu4c_let_median_over_array_local_computes() {
+    // The scalar win: MEDIAN over a 5-element array-local = 3 (was #CALC! pre-FU4c).
+    assert_eq!(eval("LET(s,SEQUENCE(5),MEDIAN(s))"), num(3.0));
+}
+
+#[test]
+fn fu4c_let_large_small_over_array_local_compute() {
+    assert_eq!(eval("LET(s,SEQUENCE(5),LARGE(s,1))"), num(5.0)); // largest
+    assert_eq!(eval("LET(s,SEQUENCE(5),SMALL(s,1))"), num(1.0)); // smallest
+    assert_eq!(eval("LET(s,SEQUENCE(5),LARGE(s,5))"), num(1.0)); // k = count edge
+}
+
+#[test]
+fn fu4c_let_percentile_over_array_local_computes() {
+    assert_eq!(eval("LET(s,SEQUENCE(5),PERCENTILE.INC(s,0.5))"), num(3.0));
+    assert_eq!(eval("LET(s,SEQUENCE(5),PERCENTILE.EXC(s,0.5))"), num(3.0));
+    assert_eq!(eval("LET(s,SEQUENCE(5),PERCENTILE(s,0.5))"), num(3.0)); // legacy alias
+}
+
+#[test]
+fn fu4c_let_quartile_over_array_local_computes() {
+    assert_eq!(eval("LET(s,SEQUENCE(5),QUARTILE.INC(s,1))"), num(2.0));
+    assert_eq!(eval("LET(s,SEQUENCE(5),QUARTILE.EXC(s,2))"), num(3.0));
+    assert_eq!(eval("LET(s,SEQUENCE(5),QUARTILE(s,1))"), num(2.0)); // legacy alias
+}
+
+#[test]
+fn fu4c_let_rank_over_array_local_computes() {
+    assert_eq!(eval("LET(s,SEQUENCE(5),RANK(2,s))"), num(4.0)); // descending default
+    assert_eq!(eval("LET(s,SEQUENCE(5),RANK(2,s,1))"), num(2.0)); // ascending
+    assert_eq!(eval("LET(s,SEQUENCE(5),RANK.EQ(2,s))"), num(4.0)); // alias of RANK
+}
+
+#[test]
+fn fu4c_let_rank_avg_over_array_local_computes() {
+    // RANK.AVG averages tied ranks. {30,20,20,10} desc → 20 at ranks 2 & 3 → 2.5.
+    assert_eq!(eval("LET(s,{10,20,20,30},RANK.AVG(20,s))"), num(2.5));
+}
+
+#[test]
+fn fu4c_let_mode_over_array_local_computes() {
+    // MODE picks the most frequent value; MODE.SNGL is its alias.
+    assert_eq!(eval("LET(s,{1,2,2,3},MODE(s))"), num(2.0));
+    assert_eq!(eval("LET(s,{1,2,2,3},MODE.SNGL(s))"), num(2.0));
+    // MODE on no-repeat data computes to #N/A, proving it RAN (not a deferred #CALC!).
+    assert_eq!(
+        eval("LET(s,SEQUENCE(5),MODE(s))"),
+        Value::Error(ErrorValue::NA)
+    );
+}
+
+// --- FU4c edge / error paths (the reducer's own validation, post-relaxation) --
+
+#[test]
+fn fu4c_reducer_k_out_of_range_is_num() {
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),LARGE(s,9))"), // k > count
+        Value::Error(ErrorValue::Num)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),SMALL(s,0))"), // k < 1
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+#[test]
+fn fu4c_percentile_quartile_bounds_are_num() {
+    // PERCENTILE.EXC valid window for n=3 is [1/4, 3/4]; 0.01 is below it.
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),PERCENTILE.EXC(s,0.01))"),
+        Value::Error(ErrorValue::Num)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),PERCENTILE.INC(s,1.5))"), // p > 1
+        Value::Error(ErrorValue::Num)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),QUARTILE.EXC(s,4))"), // .EXC quart ∈ {1,2,3} only
+        Value::Error(ErrorValue::Num)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),QUARTILE.EXC(s,0))"),
+        Value::Error(ErrorValue::Num)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),QUARTILE.INC(s,5))"), // .INC quart ∈ {0..4}
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+#[test]
+fn fu4c_rank_not_found_is_na() {
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),RANK(99,s))"),
+        Value::Error(ErrorValue::NA)
+    );
+}
+
+#[test]
+fn fu4c_reducer_wrong_slot_array_is_loud() {
+    // The relaxation is position-blind (any array-local arg of a gated reducer → Range);
+    // an array in a NON-data slot is rejected loudly by the reducer's own arg match — it
+    // never silently computes. RANK's number slot (arg0) and LARGE's k slot (arg1):
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),RANK(s,s))"), // s in the `number` slot → #VALUE!
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),LARGE(s,s))"), // s in the `k` slot → #VALUE!
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_non_gated_range_aware_over_array_local_stays_loud() {
+    // Reducers-only: a RangeAware fn OUTSIDE the gate keeps the unchanged `other =>`
+    // path (array-local → `FnArg::Scalar(#CALC!)`), and its collector rejects a Scalar
+    // arg → #VALUE!. CORREL (pair-stats) and SHARPE (financial) both look reducer-ish
+    // but are deferred — this catches an over-broad gate.
+    assert_eq!(
+        eval("LET(s,SEQUENCE(5),CORREL(s,s))"),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(5),SHARPE(s))"),
+        Value::Error(ErrorValue::Value)
     );
 }
