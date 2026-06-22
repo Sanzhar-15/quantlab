@@ -506,10 +506,12 @@ pub(crate) fn is_aggregate_function(registry: &FunctionRegistry, name: &str) -> 
 /// are the STATISTICAL-REDUCER subset that consume an array-valued LET/LAMBDA local
 /// (`MEDIAN(row)` inside `BYROW`, or `LET(s,SEQUENCE(5),MEDIAN(s))`) — see the gated arm in
 /// `scalar.rs`'s `RegisteredFn::RangeAware` materialization loop. The RangeAware LOOKUPS
-/// (INDEX/VLOOKUP/…, FU4c-B), the financial reducers (SHARPE/…, FU4c-C1) and the pair-stats
-/// reducers (CORREL/…, FU4c-C1) ALSO consume one via their sibling predicates; the
-/// conditionals (SUMIF/…), multi-range (SUMPRODUCT), text (CONCAT/…) and SUBTOTAL stay
-/// DEFERRED: an array-local in them stays `#CALC!`/`#VALUE!` (pinned).
+/// (INDEX/VLOOKUP/…, FU4c-B), the financial reducers (SHARPE/…, FU4c-C1), the pair-stats
+/// reducers (CORREL/…, FU4c-C1), the conditionals (SUMIF/…, FU4c-D `is_range_aware_conditional`),
+/// the text joiners (CONCAT/TEXTJOIN, FU4c-D `is_range_aware_text`), multi-range (SUMPRODUCT,
+/// FU4c-D `is_range_aware_multi_range`) and SUBTOTAL (FU4c-D `is_range_aware_subtotal`) ALSO
+/// consume one via their sibling predicates; only CHOOSE stays out (no data-array slot → an
+/// array-local there is `#CALC!` verbatim, pinned).
 ///
 /// A NAME-matcher is required, not a metadata read: `ArgContext::Aggregate` is shared by the
 /// WHOLE RangeAware tier (`is_aggregate_function` is true for INDEX/SUMIF/SHARPE too), so it
@@ -612,6 +614,83 @@ pub(crate) fn is_range_aware_pair_stat_reducer(name: &str) -> bool {
             | "SUMX2PY2"
             | "SUMXMY2"
     )
+}
+
+/// **FU4c-D (2026-06-22):** the RangeAware-tier CONDITIONAL reducers — they take a
+/// data/criteria RANGE plus a SCALAR criteria (and optional value range) and reduce to a
+/// scalar. Like the FU4c-A/B/C1 families, they consume an array-valued LET/LAMBDA local via the
+/// SAME gated arm in `scalar.rs`'s `RegisteredFn::RangeAware` loop — byte-identical to a real
+/// range, so each computes over the local exactly as over the equivalent range.
+///
+/// Soundness story (CRITERIA-SLOT): the criteria arg (arg1 for the `-IF` family; the odd-index
+/// criteria in the `-IFS` pairs) is matched as `FnArg::Scalar` and a `FnArg::Range` is rejected
+/// LOUDLY (`#VALUE!`, e.g. `range_fns.rs:280` / `parse_ifs_pairs`), then handed to
+/// `build_predicate(&Value)` — so a `Range` is structurally unreachable past the explicit
+/// reject, and an array-local in a criteria slot never silently computes. The data ranges
+/// accept a `Range` (the wanted path). SUMIF / AVERAGEIF use zip-truncate (no shape error); the
+/// `-IFS` family enforces strict 2-D shape (a mismatched array-local → `#VALUE!`). A
+/// NAME-matcher is required (`ArgContext::Aggregate` is shared by the whole RangeAware tier).
+/// The 9 are the complete `register_range_aware` conditional set. Pinned by
+/// `is_range_aware_conditional_matches_exactly_the_nine`.
+pub(crate) fn is_range_aware_conditional(name: &str) -> bool {
+    matches!(
+        name,
+        "SUMIF"
+            | "SUMIFS"
+            | "COUNTIF"
+            | "COUNTIFS"
+            | "AVERAGEIF"
+            | "AVERAGEIFS"
+            | "MAXIFS"
+            | "MINIFS"
+            | "COUNTBLANK"
+    )
+}
+
+/// **FU4c-D (2026-06-22):** the RangeAware-tier TEXT joiners — they flatten data args (scalars
+/// AND ranges) to text and concatenate. They consume an array-valued LET/LAMBDA local via the
+/// SAME gated arm, byte-identical to a real range, so the local's cells join row-major exactly
+/// as a real range would.
+///
+/// Soundness story (TEXT DATA + non-data control slots): CONCAT is pure data (every arg is a
+/// data slot; a `Range` there is wanted). TEXTJOIN has TWO non-data control slots that reject a
+/// `Range` LOUDLY before any data is read — delimiter (arg0, `range_fns.rs:2836`) and
+/// ignore_empty (arg1, the `_ => #VALUE!` arm) — so an array-local in either control slot is
+/// `#VALUE!`, while `args[2..]` (data) accept a `Range`. A NAME-matcher is required. The 2 are
+/// the complete `register_range_aware` text-joiner set. Pinned by
+/// `is_range_aware_text_matches_exactly_the_two`.
+pub(crate) fn is_range_aware_text(name: &str) -> bool {
+    matches!(name, "CONCAT" | "TEXTJOIN")
+}
+
+/// **FU4c-D (2026-06-22):** the RangeAware-tier MULTI-RANGE reducer — SUMPRODUCT, which
+/// element-wise multiplies N equal-shape arrays and sums. The materialization loop fires
+/// PER-ARG, so EVERY array-local arg materializes as a `Range`; each computes byte-identical to
+/// a real range.
+///
+/// Soundness story (PURE MULTI-DATA + STRICT SHAPE): SUMPRODUCT has NO non-data slot — every
+/// arg is either a data array or a scalar broadcast multiplier (a 1×1 array-local broadcasts,
+/// `range_fns.rs:2520`, panic-free). All non-1×1 arrays must agree on `(rows, cols)`; a
+/// mismatched array-local → `#VALUE!` (`range_fns.rs:2497`). Error cells propagate; text → 0. A
+/// NAME-matcher is required. SUMPRODUCT is the sole member. Pinned by
+/// `is_range_aware_multi_range_matches_exactly_the_one`.
+pub(crate) fn is_range_aware_multi_range(name: &str) -> bool {
+    matches!(name, "SUMPRODUCT")
+}
+
+/// **FU4c-D (2026-06-22):** the RangeAware-tier SUBTOTAL — a function_num selector (arg0) plus
+/// data args `[1..]` dispatched to a scalar aggregate kernel. The data args consume an
+/// array-valued LET/LAMBDA local via the SAME gated arm, byte-identical to a real range.
+///
+/// Soundness story (SELECTOR SLOT + EMPTY-MASK PATH): arg0 (function_num) is matched as a
+/// `FnArg::Scalar`; a `Range` there is rejected LOUDLY (`#VALUE!`, `range_fns.rs:2025`). An
+/// array-local arrives with an EMPTY `row_hidden` mask (the gated arm passes `Vec::new()`), so
+/// the `101..=111` "ignore hidden" variants stay byte-identical to `1..=11` over the local
+/// (`range_fns.rs:2055` `!row_hidden.is_empty()` is false ⇒ no row dropped, the `extend_from_slice`
+/// else-branch, panic-free): `SUBTOTAL(9,s)` == `SUBTOTAL(109,s)`. A NAME-matcher is required.
+/// SUBTOTAL is the sole member. Pinned by `is_range_aware_subtotal_matches_exactly_the_one`.
+pub(crate) fn is_range_aware_subtotal(name: &str) -> bool {
+    matches!(name, "SUBTOTAL")
 }
 
 /// **FU4 (2026-06-21):** the higher-order helper family — spreadsheet
@@ -3978,9 +4057,10 @@ mod tests {
         }
         // Non-reducers — RangeAware lookups (`is_range_aware_lookup`), pair-stats / financial
         // reducers (their OWN FU4c-C1 gates `is_range_aware_pair_stat_reducer` /
-        // `is_range_aware_financial_reducer`), conditionals (still deferred), a Scalar-tier
-        // aggregate, and lowercase — must NOT match THIS gate (the fourteen are exhaustive;
-        // names are canonical uppercase).
+        // `is_range_aware_financial_reducer`), conditionals + SUBTOTAL (their OWN FU4c-D gates
+        // `is_range_aware_conditional` / `is_range_aware_subtotal`), a Scalar-tier aggregate,
+        // and lowercase — must NOT match THIS gate (the fourteen are exhaustive; names are
+        // canonical uppercase).
         for name in [
             "INDEX",
             "VLOOKUP",
@@ -4020,9 +4100,9 @@ mod tests {
                 "{name} must be recognized as a RangeAware lookup"
             );
         }
-        // Non-lookups — CHOOSE (excluded: no data-array slot), the reducers (their own
-        // gate), conditionals / pair-stats / financial reducers, a Scalar-tier aggregate,
-        // and lowercase — must NOT match.
+        // Non-lookups — CHOOSE (excluded: no data-array slot — the sole still-ungated
+        // RangeAware fn after FU4c-D), the reducers / conditionals / pair-stats / financial
+        // reducers (each its own gate), a Scalar-tier aggregate, and lowercase — must NOT match.
         for name in [
             "CHOOSE", "MEDIAN", "RANK", "SUMIF", "CORREL", "SHARPE", "SUM", "index", "vlookup",
         ] {
@@ -4059,8 +4139,8 @@ mod tests {
             );
         }
         // Non-financial — the pair-stats gate's members, the stat-reducer / lookup gates,
-        // a conditional (still deferred), a Scalar-tier aggregate, and lowercase — must NOT
-        // match (the nine are exhaustive; names are canonical uppercase).
+        // a conditional (its FU4c-D gate `is_range_aware_conditional`), a Scalar-tier aggregate,
+        // and lowercase — must NOT match (the nine are exhaustive; names are canonical uppercase).
         for name in [
             "CORREL",
             "COVARIANCE.P",
@@ -4106,8 +4186,9 @@ mod tests {
             );
         }
         // Non-pair-stats — the financial gate's members, the stat-reducer / lookup gates, a
-        // conditional, a Scalar-tier aggregate, and lowercase — must NOT match (the eleven
-        // are exhaustive; names are canonical uppercase).
+        // conditional + multi-range (their FU4c-D gates `is_range_aware_conditional` /
+        // `is_range_aware_multi_range`), a Scalar-tier aggregate, and lowercase — must NOT match
+        // (the eleven are exhaustive; names are canonical uppercase).
         for name in [
             "SHARPE",
             "NPV",
@@ -4124,6 +4205,142 @@ mod tests {
                 "{name} must NOT be recognized as a RangeAware pair-stats reducer \
                  (the eleven are exhaustive; financial / stat-reducers / lookups each have \
                  their own gate; names are canonical uppercase)"
+            );
+        }
+    }
+
+    /// **FU4c-D (2026-06-22):** `is_range_aware_conditional` matches EXACTLY the nine RangeAware
+    /// conditional reducers and nothing else. Drift guard — this matcher (OR'd into the
+    /// `scalar.rs` arm) gates the array-as-arg relaxation, so a name wrongly added would relax a
+    /// non-conditional fn, and a name wrongly dropped would leave a conditional silently
+    /// `#VALUE!` over an array-local.
+    #[test]
+    fn is_range_aware_conditional_matches_exactly_the_nine() {
+        for name in [
+            "SUMIF",
+            "SUMIFS",
+            "COUNTIF",
+            "COUNTIFS",
+            "AVERAGEIF",
+            "AVERAGEIFS",
+            "MAXIFS",
+            "MINIFS",
+            "COUNTBLANK",
+        ] {
+            assert!(
+                is_range_aware_conditional(name),
+                "{name} must be recognized as a RangeAware conditional reducer"
+            );
+        }
+        // Non-conditionals — the text / multi-range / subtotal D gates' members, the stat-reducer
+        // / lookup / financial / pair-stats gates, a Scalar-tier aggregate, and lowercase — must
+        // NOT match (the nine are exhaustive; names are canonical uppercase).
+        for name in [
+            "CONCAT",
+            "TEXTJOIN",
+            "SUMPRODUCT",
+            "SUBTOTAL",
+            "MEDIAN",
+            "INDEX",
+            "SHARPE",
+            "CORREL",
+            "SUM",
+            "sumif",
+        ] {
+            assert!(
+                !is_range_aware_conditional(name),
+                "{name} must NOT be recognized as a RangeAware conditional reducer \
+                 (the nine are exhaustive; text / multi-range / subtotal / reducer / lookup / \
+                 financial / pair-stats each have their own gate; names are canonical uppercase)"
+            );
+        }
+    }
+
+    /// **FU4c-D (2026-06-22):** `is_range_aware_text` matches EXACTLY the two RangeAware text
+    /// joiners and nothing else. Drift guard — same role as the others.
+    #[test]
+    fn is_range_aware_text_matches_exactly_the_two() {
+        for name in ["CONCAT", "TEXTJOIN"] {
+            assert!(
+                is_range_aware_text(name),
+                "{name} must be recognized as a RangeAware text joiner"
+            );
+        }
+        for name in [
+            "SUMIF",
+            "SUMPRODUCT",
+            "SUBTOTAL",
+            "MEDIAN",
+            "INDEX",
+            "SHARPE",
+            "CORREL",
+            "SUM",
+            "concat",
+            "textjoin",
+        ] {
+            assert!(
+                !is_range_aware_text(name),
+                "{name} must NOT be recognized as a RangeAware text joiner \
+                 (the two are exhaustive; conditional / multi-range / subtotal / reducer / lookup \
+                 / financial / pair-stats each have their own gate; names are canonical uppercase)"
+            );
+        }
+    }
+
+    /// **FU4c-D (2026-06-22):** `is_range_aware_multi_range` matches EXACTLY SUMPRODUCT and
+    /// nothing else. Drift guard — same role as the others.
+    #[test]
+    fn is_range_aware_multi_range_matches_exactly_the_one() {
+        assert!(
+            is_range_aware_multi_range("SUMPRODUCT"),
+            "SUMPRODUCT must be recognized as a RangeAware multi-range reducer"
+        );
+        for name in [
+            "SUMIF",
+            "CONCAT",
+            "TEXTJOIN",
+            "SUBTOTAL",
+            "MEDIAN",
+            "INDEX",
+            "SHARPE",
+            "CORREL",
+            "SUM",
+            "sumproduct",
+        ] {
+            assert!(
+                !is_range_aware_multi_range(name),
+                "{name} must NOT be recognized as a RangeAware multi-range reducer \
+                 (SUMPRODUCT is the sole member; every other family has its own gate; \
+                 names are canonical uppercase)"
+            );
+        }
+    }
+
+    /// **FU4c-D (2026-06-22):** `is_range_aware_subtotal` matches EXACTLY SUBTOTAL and nothing
+    /// else. Drift guard — same role as the others.
+    #[test]
+    fn is_range_aware_subtotal_matches_exactly_the_one() {
+        assert!(
+            is_range_aware_subtotal("SUBTOTAL"),
+            "SUBTOTAL must be recognized as the RangeAware subtotal reducer"
+        );
+        for name in [
+            "SUMIF",
+            "CONCAT",
+            "TEXTJOIN",
+            "SUMPRODUCT",
+            "MEDIAN",
+            "INDEX",
+            "SHARPE",
+            "CORREL",
+            "SUM",
+            "subtotal",
+        ] {
+            assert!(
+                !is_range_aware_subtotal(name),
+                "{name} must NOT be recognized as the RangeAware subtotal reducer \
+                 (SUBTOTAL is the sole member; every other family has its own gate; \
+                 names are canonical uppercase)"
             );
         }
     }

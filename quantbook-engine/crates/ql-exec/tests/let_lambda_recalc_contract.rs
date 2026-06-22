@@ -1515,10 +1515,11 @@ fn fu4b_byrow_error_element_in_row_flows_into_lambda() {
 
 // --- PRODUCTION spill pins (a scalar-context #CALC! pin is vacuous: the boundary maps
 // any BYROW array result to #CALC! regardless of the cells. These assert the SPILLED
-// CELL values). The reducers (FU4c-A), lookups (FU4c-B), and financial / pair-stats
-// reducers (FU4c-C1) now compute here; the still-DEFERRED families (conditionals SUMIF/...,
-// Unified TRANSPOSE/FILTER, ReferenceAware ROW/COLUMN) stay loud — those pins FAIL the day
-// THOSE start computing over an array-local, making any future relaxation deliberate. -----
+// CELL values). The reducers (FU4c-A), lookups (FU4c-B), financial / pair-stats reducers
+// (FU4c-C1), and conditionals / text / multi-range / SUBTOTAL (FU4c-D) now compute here; the
+// still-DEFERRED families (Unified TRANSPOSE/FILTER, ReferenceAware ROW/COLUMN, and CHOOSE —
+// no data-array slot) stay loud — those pins FAIL the day THOSE start computing over an
+// array-local, making any future relaxation deliberate. -----
 
 #[test]
 fn fu4c_byrow_median_over_row_local_computes_in_production() {
@@ -1686,25 +1687,26 @@ fn fu4c_byrow_median_error_element_in_row_flows_into_lambda() {
 }
 
 #[test]
-fn fu4c_c1_byrow_conditional_over_row_local_stays_loud_in_production() {
-    // **Over-broad-gate guard (production).** After FU4c-C1, the financial / pair-stats
-    // RangeAware reducers compute over an array-local — so the deferred-tier guard moves to a
-    // RangeAware fn STILL outside every C1 gate. SUMIF is a CONDITIONAL reducer: its range
-    // arg, when an array-local, reaches it as `FnArg::Scalar(#CALC!)` (the unchanged
-    // `other =>` arm) and its collector rejects the Scalar → #VALUE! per row. Catches a gate
-    // that would relax the whole RangeAware tier. Still spills 2×1 (errors spill).
-    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,SUMIF(r,\">0\")))", 0.0);
+fn fu4c_c1_byrow_choose_over_row_local_stays_loud_in_production() {
+    // **Over-broad-gate guard (production), rebased at FU4c-D.** FU4c-D gated the conditionals
+    // (BYROW SUMIF now COMPUTES — see the D production block), so the deferred-tier guard moves
+    // to CHOOSE — the SOLE still-ungated RangeAware fn (a passthrough, no data-array slot). The
+    // per-row array-local reaches it as `FnArg::Scalar(#CALC!)` (the unchanged `other =>` arm);
+    // CHOOSE returns that sentinel VERBATIM → `#CALC!` per row (NOT `#VALUE!`). Catches a gate
+    // that would relax the whole RangeAware tier (CHOOSE would then materialize the row as a
+    // `Range` → its `FnArg::Range{..}=>Err(Value)` arm → `#VALUE!`). Still spills 2×1.
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,CHOOSE(1,r)))", 0.0);
     assert_eq!(
         wb.spill_anchor_at(0, 0, 1).copied(),
         Some(SpillShape::new(2, 1))
     );
     assert_eq!(
         wb.read(Address::new(0, 0, 1)),
-        Value::Error(ErrorValue::Value)
+        Value::Error(ErrorValue::Calc)
     );
     assert_eq!(
         wb.read(Address::new(0, 1, 1)),
-        Value::Error(ErrorValue::Value)
+        Value::Error(ErrorValue::Calc)
     );
 }
 
@@ -1713,7 +1715,7 @@ fn fu4c_c1_byrow_conditional_over_row_local_stays_loud_in_production() {
 // An array-local now materializes as a shape-carrying Range and the lookups address
 // it. Mirrors the FU4c-A reducer suite. The INDEX value-flip pin lives above (flipped
 // from the FU4b deferred pin); these add the lookup-family spill / cardinal-sin / edge
-// / error-flow surface. The SUMIF pin above stays loud (conditional-tier deferred guard).
+// / error-flow surface. The CHOOSE pin above stays loud (the sole still-ungated RangeAware fn).
 // =============================================================================
 
 #[test]
@@ -1856,7 +1858,7 @@ fn fu4c_byrow_index_addresses_error_element_verbatim() {
 // production path. Mirrors the FU4c-A/B suites. All values are EXACT-representable
 // (pair-stats self-pairing identities; MAX_DRAWDOWN of a {100,50} row = -0.5) so the
 // spill assertions use exact f64 equality — no approx helper needed in production.
-// The SUMIF pin above stays loud (conditional-tier over-broad-gate guard).
+// The CHOOSE pin above stays loud (#CALC! verbatim — the sole still-ungated RangeAware fn).
 // =============================================================================
 
 #[test]
@@ -1972,4 +1974,148 @@ fn fu4c_c1_byrow_correl_error_element_in_row_propagates() {
     );
     // Row 2 {3,4}: CORREL([3,4],[3,4]) = 1.0 (2 collinear points).
     assert_eq!(wb.read(Address::new(0, 1, 3)), Value::Number(1.0));
+}
+
+// =============================================================================
+// FU4c-D (2026-06-22): RangeAware CONDITIONAL / TEXT / MULTI-RANGE / SUBTOTAL fns over an
+// array-local, production path. Mirrors the FU4c-A/B/C1 suites. All values are EXACT (counts /
+// sums) so the spill assertions use exact equality. Every value below recomputed by hand
+// (NOT trusting the plan-agent table, which had per-row arithmetic slips). The CHOOSE pin
+// above stays loud (#CALC! verbatim — the sole still-ungated RangeAware fn).
+// =============================================================================
+
+#[test]
+fn fu4c_d_byrow_sumif_per_row_computes() {
+    // SUMIF(r,">0") sums each row (all cells > 0). row1 {1,2}=3; row2 {3,4}=7. {3;7}.
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,SUMIF(r,\">0\")))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[3.0, 7.0]);
+}
+
+#[test]
+fn fu4c_d_byrow_countif_per_row_computes() {
+    // COUNTIF(r,">0") counts each row (both cells > 0). {2;2}.
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,COUNTIF(r,\">0\")))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[2.0, 2.0]);
+}
+
+#[test]
+fn fu4c_d_byrow_sumproduct_per_row_computes() {
+    // SUMPRODUCT(r,r) = sum of squares per row. row1 {1,2}=1+4=5; row2 {3,4}=9+16=25. {5;25}.
+    let (wb, _g, _r) = setup("BYROW({1,2;3,4},LAMBDA(r,SUMPRODUCT(r,r)))", 0.0);
+    assert_spill_block(&wb, 2, 1, &[5.0, 25.0]);
+}
+
+#[test]
+fn fu4c_d_bycol_sumif_per_col_computes() {
+    // BYCOL gives each column as Nx1. matrix {1,4;3,6;2,5}: col0 {1,3,2}, col1 {4,6,5}.
+    // SUMIF(c,">2"): col0 -> {3} -> 3; col1 -> {4,6,5} -> 15. 1x2 {3,15}.
+    let (wb, _g, _r) = setup("BYCOL({1,4;3,6;2,5},LAMBDA(c,SUMIF(c,\">2\")))", 0.0);
+    assert_spill_block(&wb, 1, 2, &[3.0, 15.0]);
+}
+
+#[test]
+fn fu4c_d_byrow_sumif_body_cell_ref_recomputes() {
+    // **THE cardinal-sin test for a conditional body.** A cell ref alongside SUMIF(r,">0")
+    // must register $A$1 as a precedent (inherited from FU4's invoked-set mark -- FU4c-D
+    // changes ONLY arg materialization, not dep extraction). A1=10 -> SUMIF(r,">0")+10 per row:
+    // row1 3+10=13, row2 7+10=17 {13;17}; edit A1=20 -> {23;27}.
+    let (mut wb, mut graph, reg) = setup("BYROW({1,2;3,4},LAMBDA(r,SUMIF(r,\">0\")+$A$1))", 10.0);
+    assert_spill_block(&wb, 2, 1, &[13.0, 17.0]);
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(20.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(
+        attempted >= 1,
+        "editing A1 must recompute the BYROW-SUMIF (attempted == 0 means the dep inside \
+         the conditional lambda body was never registered -- the cardinal sin)"
+    );
+    assert_spill_block(&wb, 2, 1, &[23.0, 27.0]);
+}
+
+#[test]
+fn fu4c_d_byrow_sumif_body_cell_ref_in_deps() {
+    // Direct dep-extraction proof: $A$1 inside the SUMIF lambda body is in deps.cells.
+    let deps =
+        formula_deps_for("BYROW({1,2;3,4},LAMBDA(r,SUMIF(r,\">0\")+$A$1))").expect("has deps");
+    assert!(
+        deps.cells.iter().any(|&(s, r, c)| (s, r, c) == (0, 0, 0)),
+        "$A$1 inside the BYROW-SUMIF lambda body must be a precedent; got {:?}",
+        deps.cells
+    );
+}
+
+#[test]
+fn fu4c_d_let_sumif_over_array_local_computes_in_production() {
+    // Standalone scalar: SUMIF returns a SCALAR, so `LET(s,...,SUMIF(s,">2"))` computes a value
+    // at the cell boundary with NO spill (mirrors the FU4c-A/B/C1 standalone pins). {1..5}: 12.
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(5),SUMIF(s,\">2\"))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(12.0));
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 1).copied(),
+        None,
+        "SUMIF returns a scalar -- no spill"
+    );
+}
+
+#[test]
+fn fu4c_d_let_subtotal_over_array_local_computes_in_production() {
+    // Standalone SUBTOTAL scalar: SUBTOTAL(9,{1..5}) = sum = 15, no spill.
+    let (wb, _g, _r) = setup("LET(s,SEQUENCE(5),SUBTOTAL(9,s))", 0.0);
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(15.0));
+    assert_eq!(wb.spill_anchor_at(0, 0, 1).copied(), None);
+}
+
+#[test]
+fn fu4c_d_byrow_sumproduct_error_element_propagates() {
+    // **The propagate witness.** SUMPRODUCT's `to_num` propagates an error element
+    // unconditionally (no criteria gate). Data A1:B2 = {#DIV/0!,2; 3,4}; SUMPRODUCT(r) per row.
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "1/0").unwrap(); // A1 = #DIV/0!
+        rt.set_value(0, 0, 1, Value::Number(2.0)).unwrap(); // B1
+        rt.set_value(0, 1, 0, Value::Number(3.0)).unwrap(); // A2
+        rt.set_value(0, 1, 1, Value::Number(4.0)).unwrap(); // B2
+        rt.set_formula(0, 0, 3, "BYROW(A1:B2,LAMBDA(r,SUMPRODUCT(r)))")
+            .unwrap(); // D1, spills D1:D2
+    }
+    // Row 1 {#DIV/0!,2}: SUMPRODUCT hits the error and propagates it.
+    assert_eq!(
+        wb.read(Address::new(0, 0, 3)),
+        Value::Error(ErrorValue::DivZero),
+        "SUMPRODUCT propagates the error element"
+    );
+    // Row 2 {3,4}: SUMPRODUCT([3,4]) = 3+4 = 7.
+    assert_eq!(wb.read(Address::new(0, 1, 3)), Value::Number(7.0));
+}
+
+#[test]
+fn fu4c_d_byrow_countif_countblank_skip_error_element() {
+    // **The skip contrast.** COUNTIF / COUNTBLANK do NOT propagate an error element (Excel
+    // canon). Data A1:B2 = {#DIV/0!,5; 3,5}. COUNTIF(r,5) counts the 5s (error not matched);
+    // COUNTBLANK(r) counts blanks (error is not blank).
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "1/0").unwrap(); // A1 = #DIV/0!
+        rt.set_value(0, 0, 1, Value::Number(5.0)).unwrap(); // B1
+        rt.set_value(0, 1, 0, Value::Number(3.0)).unwrap(); // A2
+        rt.set_value(0, 1, 1, Value::Number(5.0)).unwrap(); // B2
+        rt.set_formula(0, 0, 3, "BYROW(A1:B2,LAMBDA(r,COUNTIF(r,5)))")
+            .unwrap(); // D1:D2
+        rt.set_formula(0, 0, 5, "BYROW(A1:B2,LAMBDA(r,COUNTBLANK(r)))")
+            .unwrap(); // F1:F2
+    }
+    // COUNTIF: row1 {#DIV/0!,5} -> 1 (the 5; error not matched); row2 {3,5} -> 1.
+    assert_eq!(wb.read(Address::new(0, 0, 3)), Value::Number(1.0));
+    assert_eq!(wb.read(Address::new(0, 1, 3)), Value::Number(1.0));
+    // COUNTBLANK: no blanks in either row (an error is NOT blank) -> 0, 0.
+    assert_eq!(wb.read(Address::new(0, 0, 5)), Value::Number(0.0));
+    assert_eq!(wb.read(Address::new(0, 1, 5)), Value::Number(0.0));
 }

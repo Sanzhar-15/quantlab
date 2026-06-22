@@ -711,18 +711,22 @@ fn fu4c_reducer_wrong_slot_array_is_loud() {
 }
 
 #[test]
-fn fu4c_c1_financial_pairstat_compute_conditional_stays_loud() {
-    // **FU4c-C1 (2026-06-22):** the financial + pair-stats RangeAware reducers now consume an
-    // array-local (CORREL/MAX_DRAWDOWN below — both EXACT-valued witnesses). The over-broad-
-    // gate guard moves to SUMIF — a RangeAware CONDITIONAL still outside every C1 gate, which
-    // keeps the unchanged `other =>` path (array-local → `FnArg::Scalar(#CALC!)`) and rejects
-    // it → #VALUE!. (This is the FLIPPED + repurposed `..._non_gated_range_aware_stays_loud`.)
+fn fu4c_c1_financial_pairstat_compute_choose_stays_loud() {
+    // **FU4c-C1 (2026-06-22), guard rebased at FU4c-D (2026-06-22):** the financial + pair-stats
+    // RangeAware reducers consume an array-local (CORREL/MAX_DRAWDOWN below — both EXACT-valued
+    // witnesses). FU4c-D then gated the conditionals (SUMIF now COMPUTES — see the D block), so
+    // the over-broad-gate guard moves to CHOOSE — the SOLE still-ungated RangeAware fn (a
+    // passthrough, no data-array slot). The array-local takes the unchanged `other =>` path
+    // (→ `FnArg::Scalar(#CALC!)`); CHOOSE returns that sentinel VERBATIM → `#CALC!` (NOT
+    // `#VALUE!`). If the gate ever wrongly relaxed the WHOLE RangeAware tier, CHOOSE would
+    // materialize `s` as a `Range` → its `FnArg::Range{..}=>Err(Value)` arm → `#VALUE!`, so this
+    // pin FAILS — the guard distinguishes the two states.
     assert_eq!(eval("LET(s,SEQUENCE(5),CORREL(s,s))"), num(1.0)); // pair-stats: self-corr = 1
     assert_eq!(eval("LET(s,SEQUENCE(5),MAX_DRAWDOWN(s))"), num(0.0)); // financial: increasing → 0
     assert_eq!(
-        eval("LET(s,SEQUENCE(5),SUMIF(s,\">2\"))"),
-        Value::Error(ErrorValue::Value)
-    ); // STILL deferred (conditional tier) — over-broad-gate guard
+        eval("LET(s,SEQUENCE(5),CHOOSE(1,s))"),
+        Value::Error(ErrorValue::Calc)
+    ); // STILL ungated (CHOOSE: no data-array slot) — over-broad-gate guard, #CALC! verbatim
 }
 
 // =============================================================================
@@ -950,7 +954,7 @@ fn fu4c_c1_let_sortino_over_array_local() {
 #[test]
 fn fu4c_c1_let_max_drawdown_over_array_local() {
     // {100,50}: peak 100, trough 50 → 50/100−1 = −0.5 (exact). (The increasing-series → 0
-    // case is in `fu4c_c1_financial_and_pairstat_compute_conditional_stays_loud`.)
+    // case is in `fu4c_c1_financial_pairstat_compute_choose_stays_loud`.)
     assert_eq!(eval("LET(eq,{100,50},MAX_DRAWDOWN(eq))"), num(-0.5));
 }
 
@@ -1050,4 +1054,228 @@ fn fu4c_c1_volatility_constant_series_is_zero() {
     // A constant series has zero dispersion: VOLATILITY returns 0.0 (a valid statistic),
     // unlike SHARPE which errors #DIV/0! on the same denominator. Behavioral divergence pin.
     approx(eval("LET(r,{0.02,0.02,0.02},VOLATILITY(r))"), 0.0, 1e-12);
+}
+
+// =============================================================================
+// FU4c-D (2026-06-22): array-local consumed by a RangeAware CONDITIONAL / TEXT / MULTI-RANGE
+// / SUBTOTAL fn. Same gated arm as FU4c-A/B/C1: the array-local materializes as a
+// shape-carrying Range, byte-identical to a real range, so each computes exactly as over the
+// equivalent range. All results are EXACT (rationals / strings) -> num() / Value::text(); no
+// approx() needed (unlike C1's irrational financials). Every non-data slot (criteria /
+// delimiter / ignore_empty / function_num) rejects a Range LOUDLY -> #VALUE!.
+// =============================================================================
+
+// --- conditionals (exact) ---
+
+#[test]
+fn fu4c_d_let_sumif_over_array_local() {
+    // single-range form: sum the crit-range cells matching ">2". {1..5}: 3+4+5 = 12.
+    assert_eq!(eval("LET(s,SEQUENCE(5),SUMIF(s,\">2\"))"), num(12.0));
+}
+
+#[test]
+fn fu4c_d_let_sumif_with_sum_range_over_array_locals() {
+    // two-data-range form: sum t where s>1. s={1,2,3} (>1 at idx 1,2) -> t 20+30 = 50.
+    assert_eq!(
+        eval("LET(s,{1,2,3},LET(t,{10,20,30},SUMIF(s,\">1\",t)))"),
+        num(50.0)
+    );
+}
+
+#[test]
+fn fu4c_d_let_countif_over_array_local() {
+    // count {1..5} matching ">2" = {3,4,5} -> 3.
+    assert_eq!(eval("LET(s,SEQUENCE(5),COUNTIF(s,\">2\"))"), num(3.0));
+}
+
+#[test]
+fn fu4c_d_let_averageif_over_array_local() {
+    // mean of {3,4,5} = 4.
+    assert_eq!(eval("LET(s,SEQUENCE(5),AVERAGEIF(s,\">2\"))"), num(4.0));
+}
+
+#[test]
+fn fu4c_d_let_sumifs_over_array_locals() {
+    // sum t where s>2. s={1,2,3,4} (>2 at idx 2,3) -> t 30+40 = 70. Both array-locals.
+    assert_eq!(
+        eval("LET(s,{1,2,3,4},LET(t,{10,20,30,40},SUMIFS(t,s,\">2\")))"),
+        num(70.0)
+    );
+}
+
+#[test]
+fn fu4c_d_let_countifs_over_array_local() {
+    // count {1..5} matching ">=3" = {3,4,5} -> 3.
+    assert_eq!(eval("LET(s,SEQUENCE(5),COUNTIFS(s,\">=3\"))"), num(3.0));
+}
+
+#[test]
+fn fu4c_d_let_averageifs_over_array_locals() {
+    // mean of t where s>2 = (30+40)/2 = 35.
+    assert_eq!(
+        eval("LET(s,{1,2,3,4},LET(t,{10,20,30,40},AVERAGEIFS(t,s,\">2\")))"),
+        num(35.0)
+    );
+}
+
+#[test]
+fn fu4c_d_let_maxifs_minifs_over_array_locals() {
+    // max / min of t where s>2 = max{30,40}=40, min{30,40}=30.
+    assert_eq!(
+        eval("LET(s,{1,2,3,4},LET(t,{10,20,30,40},MAXIFS(t,s,\">2\")))"),
+        num(40.0)
+    );
+    assert_eq!(
+        eval("LET(s,{1,2,3,4},LET(t,{10,20,30,40},MINIFS(t,s,\">2\")))"),
+        num(30.0)
+    );
+}
+
+#[test]
+fn fu4c_d_let_countblank_over_array_local() {
+    // A computed numeric array has no blanks -> 0 (proves it consumed the Range, not #VALUE!).
+    assert_eq!(eval("LET(s,SEQUENCE(5),COUNTBLANK(s))"), num(0.0));
+    // An empty-string element IS counted as blank -> {1,"",3} -> 1.
+    assert_eq!(eval("LET(s,{1,\"\",3},COUNTBLANK(s))"), num(1.0));
+}
+
+// --- multi-range (exact) ---
+
+#[test]
+fn fu4c_d_let_sumproduct_over_array_locals() {
+    // 1*4 + 2*5 + 3*6 = 32. Both array-locals materialize as Ranges (per-arg loop).
+    assert_eq!(
+        eval("LET(a,{1,2,3},LET(b,{4,5,6},SUMPRODUCT(a,b)))"),
+        num(32.0)
+    );
+}
+
+#[test]
+fn fu4c_d_let_sumproduct_single_array_is_sum() {
+    // SUMPRODUCT of one array = its sum. {1,2,3,4} -> 10.
+    assert_eq!(eval("LET(s,SEQUENCE(4),SUMPRODUCT(s))"), num(10.0));
+}
+
+// --- text (exact strings) ---
+
+#[test]
+fn fu4c_d_let_concat_over_array_local() {
+    // numeric cells render as integer text -> "123".
+    assert_eq!(eval("LET(s,SEQUENCE(3),CONCAT(s))"), Value::text("123"));
+}
+
+#[test]
+fn fu4c_d_let_concat_mixed_scalar_and_array() {
+    // scalars + an array-local flatten in arg order -> "x" + "ab" + "y".
+    assert_eq!(
+        eval("LET(s,{\"a\",\"b\"},CONCAT(\"x\",s,\"y\"))"),
+        Value::text("xaby")
+    );
+}
+
+#[test]
+fn fu4c_d_let_textjoin_over_array_local() {
+    // delimiter "-", ignore_empty TRUE, data {1,2,3} -> "1-2-3".
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),TEXTJOIN(\"-\",TRUE,s))"),
+        Value::text("1-2-3")
+    );
+}
+
+#[test]
+fn fu4c_d_let_textjoin_ignore_empty_false_keeps_blanks() {
+    // ignore_empty FALSE keeps the empty element -> "a,,c" (behavioral pin).
+    assert_eq!(
+        eval("LET(t,{\"a\",\"\",\"c\"},TEXTJOIN(\",\",FALSE,t))"),
+        Value::text("a,,c")
+    );
+}
+
+// --- SUBTOTAL (exact; empty-mask equivalence) ---
+
+#[test]
+fn fu4c_d_let_subtotal_sum_and_average_over_array_local() {
+    // function_num 9 = SUM, 1 = AVERAGE. {1..5}: sum 15, avg 3.
+    assert_eq!(eval("LET(s,SEQUENCE(5),SUBTOTAL(9,s))"), num(15.0));
+    assert_eq!(eval("LET(s,SEQUENCE(5),SUBTOTAL(1,s))"), num(3.0));
+}
+
+#[test]
+fn fu4c_d_let_subtotal_9_equals_109_over_array_local() {
+    // An array-local carries an EMPTY row_hidden mask, so the 101..=111 "ignore hidden"
+    // variants are byte-identical to 1..=11 over the local: SUBTOTAL(109,s) == SUBTOTAL(9,s).
+    let nine = eval("LET(s,SEQUENCE(5),SUBTOTAL(9,s))");
+    let one_oh_nine = eval("LET(s,SEQUENCE(5),SUBTOTAL(109,s))");
+    assert_eq!(nine, num(15.0));
+    assert_eq!(one_oh_nine, nine);
+}
+
+// --- FU4c-D position-blind / shape / behavioral (loud, never silent) ---
+
+#[test]
+fn fu4c_d_conditional_criteria_slot_array_is_loud() {
+    // The criteria slot is a NON-data scalar slot: an array-local there is rejected loudly.
+    // (SUMIF/COUNTIF are gated, so BOTH args materialize as Ranges; the criteria arm rejects it.)
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),SUMIF(s,s))"),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),COUNTIF(s,s))"),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_d_textjoin_control_slot_array_is_loud() {
+    // delimiter (arg0) and ignore_empty (arg1) are NON-data slots -> an array-local is #VALUE!.
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),TEXTJOIN(s,TRUE,s))"),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),TEXTJOIN(\"-\",s,s))"),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_d_subtotal_function_num_slot_array_is_loud() {
+    // function_num (arg0) is a NON-data slot -> an array-local is #VALUE!.
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),SUBTOTAL(s,s))"),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_d_strict_shape_mismatch_is_loud() {
+    // SUMIFS + SUMPRODUCT enforce STRICT 2-D shape -> mismatched array-locals -> #VALUE!.
+    // (SUMIF is NOT here: it zip-truncates, so a mismatch does not error.)
+    assert_eq!(
+        eval("LET(a,{1,2,3},LET(b,{1,2},SUMIFS(a,b,\">0\")))"),
+        Value::Error(ErrorValue::Value)
+    );
+    assert_eq!(
+        eval("LET(a,{1,2,3},LET(b,{1,2},SUMPRODUCT(a,b)))"),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn fu4c_d_averageif_no_match_is_div_zero() {
+    // No cell matches ">9" -> #DIV/0! (loud, never NaN). Behavioral pin.
+    assert_eq!(
+        eval("LET(s,SEQUENCE(3),AVERAGEIF(s,\">9\"))"),
+        Value::Error(ErrorValue::DivZero)
+    );
+}
+
+#[test]
+fn fu4c_d_maxifs_no_match_is_zero() {
+    // Excel canon: MAXIFS with no matching cell -> 0 (not an error). Behavioral pin.
+    assert_eq!(
+        eval("LET(s,{1,2,3},LET(t,{10,20,30},MAXIFS(t,s,\">9\")))"),
+        num(0.0)
+    );
 }

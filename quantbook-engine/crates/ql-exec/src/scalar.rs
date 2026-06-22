@@ -412,12 +412,14 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                             // **FU4c (2026-06-22):** an array-valued LET/LAMBDA local
                             // consumed by a gated RangeAware fn — a STATISTICAL REDUCER
                             // (`MEDIAN(row)`, FU4c-A), a LOOKUP (`INDEX(t,2,1)`, FU4c-B), a
-                            // FINANCIAL reducer (`SHARPE(r)`, FU4c-C1) or a PAIR-STATS reducer
-                            // (`CORREL(s,s)`, FU4c-C1). Gated by name (the four
-                            // `is_range_aware_*` predicates OR'd); a non-gated RangeAware fn
-                            // (a conditional SUMIF, text CONCAT, multi-range SUMPRODUCT, or
-                            // SUBTOTAL) never enters this arm and keeps the `other =>` path →
-                            // `#CALC!`/`#VALUE!`.
+                            // FINANCIAL reducer (`SHARPE(r)`, FU4c-C1), a PAIR-STATS reducer
+                            // (`CORREL(s,s)`, FU4c-C1), a CONDITIONAL (`SUMIF(s,">2")`, FU4c-D),
+                            // a TEXT joiner (`CONCAT(s)`, FU4c-D), MULTI-RANGE (`SUMPRODUCT(a,b)`,
+                            // FU4c-D) or SUBTOTAL (FU4c-D). Gated by name (the eight
+                            // `is_range_aware_*` predicates OR'd). The ONLY still-ungated
+                            // RangeAware fn is CHOOSE (a passthrough, no data-array slot); an
+                            // array-local there keeps the `other =>` path → `FnArg::Scalar(#CALC!)`,
+                            // returned VERBATIM → `#CALC!` (never silently a value).
                             // Position-blind like FU4b's Scalar arm: any array-local arg of a
                             // gated fn materializes as a `Range`; a `Range` in a CONSULTED
                             // non-data slot is rejected loudly (`#VALUE!`) by the fn's own
@@ -436,7 +438,11 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 if crate::plan::is_range_aware_reducer(name)
                                     || crate::plan::is_range_aware_lookup(name)
                                     || crate::plan::is_range_aware_financial_reducer(name)
-                                    || crate::plan::is_range_aware_pair_stat_reducer(name) =>
+                                    || crate::plan::is_range_aware_pair_stat_reducer(name)
+                                    || crate::plan::is_range_aware_conditional(name)
+                                    || crate::plan::is_range_aware_text(name)
+                                    || crate::plan::is_range_aware_multi_range(name)
+                                    || crate::plan::is_range_aware_subtotal(name) =>
                             {
                                 match env.local_env().lookup(n) {
                                     Some(LocalBinding::Array(arr)) => {
@@ -718,8 +724,9 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 // dispatch through the separate RangeAware arm, where FU4c added the
                                 // analogous array-local relaxation (FU4c-A reducers + FU4c-B lookups
                                 // INDEX/VLOOKUP/... + FU4c-C1 financial SHARPE/... + pair-stats
-                                // CORREL/...). The Unified TRANSPOSE/FILTER + conditional SUMIF/...
-                                // reducers stay deferred `#CALC!`/`#VALUE!`.)
+                                // CORREL/... + FU4c-D conditionals SUMIF/... + text CONCAT/TEXTJOIN
+                                // + multi-range SUMPRODUCT + SUBTOTAL). Only the Unified
+                                // TRANSPOSE/FILTER array-as-arg case stays deferred (`#CALC!`).)
                                 ExprPlan::LocalRef(n) => match env.local_env().lookup(n) {
                                     Some(LocalBinding::Array(arr)) => {
                                         flat.extend(arr.cells().iter().cloned())
