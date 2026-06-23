@@ -643,33 +643,29 @@ fn isref_skip_preserves_union_when_lambda_also_called_outside() {
 }
 
 #[test]
-fn name_merge_capture_vs_rebind_over_preserve_known_residual() {
-    // **Codex FU-NEXT HIGH-2 — DOCUMENTED RESIDUAL (operator-approved ship-with-residual
-    // class).** `g` captures the FIRST `f` (reads A1); the THIRD `f` (names SUM, reads A2)
-    // is rebound AFTER `g` is defined and is NEVER invoked — only `g(2)` runs, and a
-    // closure captures the env at CREATION (`eval_binding`'s Lambda arm), so `g`'s `f(z)`
-    // calls the first `f`, not the third. At eval SUM never dispatches. But the context-
-    // INSENSITIVE `bound` map merges both `f` bindings by name, so resolving `f(z)` inside
-    // `g`'s body yields BOTH lambdas and the third's SUM is over-reported into
-    // `functions_used`.
-    //
-    // This is an OVER-report that can re-open ALL THREE faces for this shape (see the sibling
-    // `..._reopens_circ_face` test for the `#CIRC!` face); it is NEVER an under-report. It
-    // is a STRICT NARROWING of the pre-FU-NEXT behavior (which walked every body). The full
-    // fix is a context-SENSITIVE analysis carrying each lambda's captured abstract
-    // environment. This test PINS the current behavior so that fix is a deliberate flip.
-    // (SUM stands in for a UDF name.)
-    let deps =
-        formula_deps_for("LET(f,LAMBDA(x,A1),g,LAMBDA(z,f(z)),f,LAMBDA(x,SUM(A2)),g(2))")
-            .expect("has deps");
+fn name_merge_capture_vs_rebind_is_lexically_resolved() {
+    // **FU-NEXT-3 (2026-06-23) -- CLOSES Codex FU-NEXT HIGH-2 (was a documented residual).**
+    // `g` captures the FIRST `f` (reads A1); the THIRD `f` (names SUM, reads A2) is rebound
+    // AFTER `g` is defined and is NEVER invoked -- only `g(2)` runs, and a closure captures
+    // the env at CREATION (`eval_binding`'s Lambda arm), so `g`'s `f(z)` calls the first `f`,
+    // not the third. At eval SUM never dispatches. The closure environment is now keyed by
+    // lexical BINDING SITE, so resolving `f(z)` inside `g`'s body yields ONLY the first `f`
+    // (the binding in scope at `g`'s definition) -- the rebind is a DISTINCT site that never
+    // leaks in. So SUM (and A2) are NO LONGER over-reported. (Flipped from
+    // `_over_preserve_known_residual`, which asserted SUM WAS present.) (SUM ~ a UDF name.)
+    let deps = formula_deps_for("LET(f,LAMBDA(x,A1),g,LAMBDA(z,f(z)),f,LAMBDA(x,SUM(A2)),g(2))")
+        .expect("has deps (the live first f's A1)");
     assert!(
-        deps.functions_used.iter().any(|n| n.as_ref() == "SUM"),
-        "RESIDUAL: name-merge marks the rebound-but-never-invoked lambda invoked, \
-         over-reporting SUM (a context-sensitive capture analysis closes this); got {deps:?}"
+        !deps.functions_used.iter().any(|n| n.as_ref() == "SUM"),
+        "FU-NEXT-3: the rebound-but-never-invoked third f is lexically excluded -> SUM must \
+         NOT be reported; got {deps:?}"
     );
-    // **No-under-dependency guard:** A1 — read by the LIVE captured first `f`, invoked via
-    // `g(2)` — MUST be a precedent. The residual is purely an over-report; it never drops
-    // a real dependency.
+    assert!(
+        !deps.cells.iter().any(|&(s, r, c)| (s, r, c) == (0, 1, 0)),
+        "the rebound f's A2 must NOT be a precedent (never invoked); got {deps:?}"
+    );
+    // **No-under-dependency guard:** A1 -- read by the LIVE captured first `f`, invoked via
+    // `g(2)` -- MUST stay a precedent. The fix removes only the over-report, never a real dep.
     assert!(
         deps.cells.iter().any(|&(s, r, c)| (s, r, c) == (0, 0, 0)),
         "the live captured first f's A1 must stay a precedent; got {deps:?}"
@@ -701,15 +697,14 @@ fn zero_arg_lambda_correctly_invoked_keeps_dep() {
 }
 
 #[test]
-fn name_merge_capture_vs_rebind_reopens_circ_face_known_residual() {
-    // **Codex FU-NEXT HIGH-2 — the `#CIRC!` face of the name-merge residual (PINNED).**
-    // Same shape as `name_merge_capture_vs_rebind_over_preserve_known_residual`, but the
-    // rebound-but-never-invoked third `f` reads the OWNING cell B1. The context-insensitive
-    // name-merge marks it invoked, the walker walks its body, and B1 gets a spurious
-    // self-edge → `recompute_all` yields `#CIRC!` instead of the real value (`g(2)` calls
-    // the captured FIRST `f` → A1 = 10). This PINS the residual's DIRTYING face — proving
-    // it is NOT load-path-only; the context-sensitive capture fix flips it to Number(10).
-    // It remains an OVER-report (B1→B1 is spurious), never a dropped dependency.
+fn name_merge_capture_vs_rebind_is_lexically_resolved_no_circ() {
+    // **FU-NEXT-3 (2026-06-23) -- the `#CIRC!` face, now CLOSED.** Same shape as
+    // `name_merge_capture_vs_rebind_is_lexically_resolved`, but the rebound-but-never-invoked
+    // third `f` reads the OWNING cell B1. PRE-FU-NEXT-3 the name-merge marked it invoked, the
+    // walker walked its body, and B1 got a spurious self-edge -> `recompute_all` yielded
+    // `#CIRC!`. Lexical resolution excludes the rebind (a distinct site, not in scope at `g`'s
+    // definition), so there is no self-edge: `g(2)` calls the captured FIRST `f` -> A1 = 10.
+    // (Flipped from `_reopens_circ_face_known_residual`, which asserted `#CIRC!`.)
     let mut wb = Workbook::new();
     wb.add_sheet("S");
     let reg = default_registry();
@@ -727,9 +722,9 @@ fn name_merge_capture_vs_rebind_reopens_circ_face_known_residual() {
     }
     assert_eq!(
         wb.read(Address::new(0, 0, 1)),
-        Value::Error(ErrorValue::Circ),
-        "RESIDUAL (pinned): the name-merge over-reports the rebound f's B1 self-edge → \
-         spurious #CIRC!; a context-sensitive capture analysis would yield Number(10)"
+        Value::Number(10.0),
+        "FU-NEXT-3: no spurious B1 self-edge -> g(2) calls the captured first f -> A1 = 10, \
+         not #CIRC!"
     );
 }
 
@@ -2722,5 +2717,143 @@ fn fu_next2_wrong_arity_self_edge_no_circ() {
         wb.read(Address::new(0, 0, 1)),
         Value::Error(ErrorValue::Value),
         "no spurious self-edge -> the wrong-arity result #VALUE!, not #CIRC!"
+    );
+}
+
+// =============================================================================
+// FU-NEXT-3 (2026-06-23): lexical-scope resolver. The closure environment is now
+// keyed by lexical BINDING SITE (not bare name), so a `LocalRef` resolves to the
+// binding visible at its definition point (honoring LET binding order + shadowing
+// + snapshot capture), exactly mirroring eval (scalar.rs eval_let_bindings /
+// eval_binding Lambda capture / invoke_lambda). This closes residual 1 (name-merge:
+// a captured-then-rebound lambda no longer leaks its rebind into the captor) WITHOUT
+// ever resolving a name to FEWER lambdas than eval invokes (never an under-report;
+// the budget/round-cap -> All floor still walks everything on any blowup). The two
+// pre-flight pins below characterize the baseline: #6 passes on HEAD (closures_of(IF)
+// already returns the empty set, matching eval); #9 FAILS on HEAD by design (the flat
+// name-merge over-reports the forward-ref), and passes post-rewrite.
+// =============================================================================
+
+#[test]
+fn fu_next3_if_bound_lambda_is_not_invoked() {
+    // **#6 (eval-match guard -- passes pre- AND post-rewrite).** A LAMBDA wrapped in IF
+    // and bound to a LET name is NOT callable at eval: `eval_binding`'s `_` arm
+    // (scalar.rs:1058) scalarizes a non-(Lambda/LocalRef/CallLambda/Let) value to `#CALC!`,
+    // so `f` resolves to `#CALC!` and `f(0)` errors BEFORE any body -- neither branch lambda
+    // is invoked. So A1 and C1 (the branch bodies) are NOT precedents; only A2 (the IF
+    // condition, walked normally) is. `closures_of(IF)` already returns the empty set
+    // (Function is not callable-preserving), so the lexical rewrite must NOT add branch-union.
+    let deps = formula_deps_for("LET(f,IF(A2>0,LAMBDA(x,A1),LAMBDA(x,C1)),f(0))");
+    assert!(
+        deps.as_ref()
+            .map_or(true, |d| !d.cells.contains(&(0, 0, 0)) && !d.cells.contains(&(0, 0, 2))),
+        "an IF-wrapped lambda is never invoked -> branch bodies A1/C1 are NOT precedents; got {deps:?}"
+    );
+    assert!(
+        deps.as_ref()
+            .map_or(false, |d| d.cells.contains(&(0, 1, 0))),
+        "the IF condition A2 IS a precedent (walked normally); got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next3_forward_ref_is_not_a_dep() {
+    // **#9 (forward-ref regression guard -- binder-enforced; passes pre- AND post-rewrite).**
+    // `=LET(f,LAMBDA(n,g(n)),g,LAMBDA(m,B1),f(0))`: `g` is bound AFTER `f`, so it is NOT in
+    // lexical scope at `f`'s definition. The binder ONLY emits `LocalRef` for an in-scope name
+    // (`scalar.rs` LocalRef arm), so `g` inside `f`'s body is not a local reference at all --
+    // the analysis never resolves it to the g-lambda -> g is never invoked -> B1 is not a
+    // precedent (eval agrees: `g` is `#NAME?` inside `f`, via snapshot capture). The lexical
+    // rewrite mirrors that same scope, so it must keep this correct. (Pre-flight confirmed this
+    // PASSES on HEAD -- the name-merge over-report (residual 1) is the IN-scope rebind case,
+    // a distinct mechanism from this out-of-scope forward reference.)
+    let deps = formula_deps_for("LET(f,LAMBDA(n,g(n)),g,LAMBDA(m,B1),f(0))");
+    assert!(
+        deps.as_ref().map_or(true, |d| !d.cells.contains(&(0, 0, 1))),
+        "forward-ref g is not in scope inside f -> never invoked -> B1 must NOT be a precedent; got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next3_capture_before_rebind_to_lambda_keeps_captured_drops_rebind() {
+    // **#4 (capture-before-rebind, rebind is a LAMBDA -- the adversarial under-report probe).**
+    // Like the flipped name_merge pin, but the rebound `f` is itself a lambda (reads B5),
+    // never invoked. `g` captured the FIRST `f` (reads A1) at its definition, so `g(2)` ->
+    // first `f` -> A1 MUST stay a precedent (an under-report here is the cardinal sin). The
+    // rebound third `f` (B5) is a DISTINCT lexical site, never invoked -> B5 must be DROPPED.
+    let deps = formula_deps_for("LET(f,LAMBDA(x,A1),g,LAMBDA(z,f(z)),f,LAMBDA(w,B5),g(2))")
+        .expect("the captured first f's A1");
+    assert!(
+        deps.cells.contains(&(0, 0, 0)),
+        "the captured first f's A1 MUST stay a precedent (no under-report); got {deps:?}"
+    );
+    assert!(
+        !deps.cells.contains(&(0, 4, 1)),
+        "the rebound never-invoked f's B5 must NOT be a precedent; got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next3_multi_call_site_param_union_keeps_all() {
+    // **#5 (multi-call-site param union).** `apply=LAMBDA(h,h(0))` is invoked from two sites
+    // with different lambdas: `apply(f)` (f reads A1) and `apply(g)` (g reads C1). The param
+    // SITE `Param(apply,0)` unions {f,g} (context-insensitive across call sites -- preserved
+    // from the 0-CFA), so `h(0)` invokes BOTH -> A1 and C1 are both precedents. Dropping
+    // either would be an under-report.
+    let deps = formula_deps_for(
+        "LET(apply,LAMBDA(h,h(0)),f,LAMBDA(x,A1),g,LAMBDA(y,C1),SUM(apply(f),apply(g)))",
+    )
+    .expect("both A1 and C1 deps");
+    assert!(
+        deps.cells.contains(&(0, 0, 0)) && deps.cells.contains(&(0, 0, 2)),
+        "both call-site closures must stay precedents (A1 and C1); got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next3_nested_let_shadow_both_live_keeps_both() {
+    // **#7 (nested-LET shadow, both live).** The inner LET shadows `f` with LAMBDA(x,C1) and
+    // invokes it (`f(0)` -> C1) inside the `r` binding; the outer body's `f(0)` resolves to
+    // the OUTER `f` (LAMBDA(x,A1)) -> A1. Both are invoked at DISTINCT sites, so BOTH A1 and
+    // C1 are precedents. A resolver that confused the two scopes would drop one (under-report).
+    let deps = formula_deps_for("LET(f,LAMBDA(x,A1),r,LET(f,LAMBDA(x,C1),f(0)),SUM(f(0),r))")
+        .expect("both A1 and C1 deps");
+    assert!(
+        deps.cells.contains(&(0, 0, 0)) && deps.cells.contains(&(0, 0, 2)),
+        "both the outer (A1) and inner-shadowed (C1) f must stay precedents; got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next3_curried_param_union_keeps_both_closures() {
+    // **#8b (the I2 probe -- monotone same-site param union via currying, no collapse).**
+    // `apply=LAMBDA(h,LAMBDA(u,h(u)))` captures its param `h` in the returned inner lambda.
+    // Invoked from TWO sites with different lambdas -- `apply(a1f)(0)` and `apply(c1f)(0)` --
+    // so the param SITE `Param(apply,0)` accumulates the UNION {a1f, c1f} across fixpoint
+    // rounds. The inner body `h(u)` resolves `h` to that one site -> BOTH a1f (reads A1) and
+    // c1f (reads C1) are invoked. A site-keyed bound that grows monotonically (NOT
+    // resolve-once-cached) keeps both; collapsing the param to a single closure would DROP
+    // one -- an under-report. This is the seam invariant I2 protects.
+    let deps = formula_deps_for(
+        "LET(apply,LAMBDA(h,LAMBDA(u,h(u))),a1f,LAMBDA(x,A1),c1f,LAMBDA(y,C1),SUM(apply(a1f)(0),apply(c1f)(0)))",
+    )
+    .expect("both A1 and C1 deps");
+    assert!(
+        deps.cells.contains(&(0, 0, 0)) && deps.cells.contains(&(0, 0, 2)),
+        "both members of the curried param union must stay precedents (A1 and C1); got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next3_backward_ref_is_a_dep() {
+    // **#9b (the order-reversed companion to #9 -- the dep MUST stay).** Here `g` is bound
+    // BEFORE `f`, so it IS in lexical scope at `f`'s definition; `f`'s body `g(n)` resolves to
+    // `g` (reads C1) -> g IS invoked -> C1 IS a precedent. The inverse of #9: lexical
+    // resolution must KEEP a backward reference (an under-report here is the cardinal sin).
+    let deps = formula_deps_for("LET(g,LAMBDA(m,C1),f,LAMBDA(n,g(n)),f(0))")
+        .expect("C1 dep via the backward-ref g");
+    assert!(
+        deps.cells.contains(&(0, 0, 2)),
+        "backward-ref g IS in scope inside f -> invoked -> C1 must be a precedent; got {deps:?}"
     );
 }

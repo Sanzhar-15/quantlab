@@ -118,6 +118,7 @@
 //! Today they're separate to keep refactor scope bounded.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use ql_calcgraph::{
@@ -473,16 +474,25 @@ struct InvokeAnalysis<'a> {
     /// re-inserted by return -- complete WITHOUT tying inserts to `changed` (which would
     /// risk pushing pathological formulas over the round cap into the `All` over-approx).
     live_calls: HashSet<*const ExprPlan>,
-    /// Context-insensitive closure environment: a local NAME → the set of lambda
-    /// nodes it may be bound to (across ALL bindings of that name — LET vars and
-    /// LAMBDA params). Merging by name is a sound over-approximation: a `LocalRef`
-    /// resolves at eval to one *specific* lexical binding, and the global union always
-    /// contains it (plus, rarely, same-named bindings from sibling scopes → a safe
-    /// extra dep, never a missed one). 0-CFA in the textbook sense.
-    bound: HashMap<&'a str, HashSet<*const ExprPlan>>,
+    /// **FU-NEXT-3 (2026-06-23) -- context-SENSITIVE closure environment, keyed by
+    /// lexical [`BindingSite`]** (was a flat `name -> lambdas` 0-CFA union). A
+    /// `LocalRef` resolves through the lexical [`Scope`] to its ONE visible site, so
+    /// a name bound twice (a LET rebind) maps each reference to the binding actually in
+    /// scope there -- mirroring `eval`'s `LocalEnv`, closing the name-merge over-report.
+    /// Each site's closure SET still grows monotonically across rounds (the param-union
+    /// across call sites, currying returns), so the analysis still over-approximates
+    /// eval (never an under-report); only the spurious CROSS-site merge is removed.
+    bound: HashMap<BindingSite, HashSet<*const ExprPlan>>,
     /// Address → node for every `ExprPlan::Lambda` in the tree (to recover params/body
     /// from a closure-set pointer).
     lambdas: HashMap<*const ExprPlan, &'a ExprPlan>,
+    /// **FU-NEXT-3 (2026-06-23):** each lambda's BODY scope (definition scope + its
+    /// `Param` frames), recorded ONCE by [`collect_scopes`] before the fixpoint. Used
+    /// to resolve a lambda body's free `LocalRef`s -- both `discover`'s body descent and
+    /// `closures_of`'s currying jump look up the SAME scope here, so resolution is
+    /// consistent and complete across rounds (the structure is static; only `bound`'s
+    /// contents grow).
+    captured: HashMap<*const ExprPlan, Scope<'a>>,
     /// A monotone-fixpoint round changed `invoked`/`bound`.
     changed: bool,
     /// Lambda bodies already descended THIS round (reset each round) — prevents
@@ -529,6 +539,141 @@ fn collect_lambdas<'a>(plan: &'a ExprPlan, out: &mut HashMap<*const ExprPlan, &'
     }
 }
 
+/// **FU-NEXT-3 (2026-06-23) -- a lexical binding SITE.** The closure environment
+/// (`InvokeAnalysis::bound`) is keyed by SITE, not by bare name, so two same-named
+/// bindings (a LET rebind, or sibling LET scopes) are DISTINCT entries. A `LocalRef`
+/// resolves through a [`Scope`] chain to the ONE site lexically visible at its
+/// position -- exactly as `eval`'s `LocalEnv` resolves a name to one binding
+/// (nearest-wins, honoring LET binding order + shadowing + snapshot capture). This
+/// is what closes the name-merge over-report (FU-NEXT residual 1): `g`'s body sees
+/// only the `f` bound BEFORE `g`, never a later rebind of `f`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum BindingSite {
+    /// A `LET` variable, identified by its VALUE node address (stable per binding
+    /// site within the analyzed tree -- two `LET(f,..,..,f,..)` bindings of `f` have
+    /// distinct value-node addresses, hence distinct sites).
+    LetVar(*const ExprPlan),
+    /// A `LAMBDA` parameter, identified by `(lambda node, param index)`. Bound at the
+    /// CALL site from the arg closures (context-insensitive union across call sites,
+    /// preserved from the 0-CFA), and layered ON TOP of the captured scope so it
+    /// shadows a same-named captured binding (mirrors `invoke_lambda`, `scalar.rs`).
+    Param(*const ExprPlan, usize),
+}
+
+/// **FU-NEXT-3 (2026-06-23) -- an immutable lexical scope chain**, mirroring
+/// `LocalEnv` (`local_env.rs`) at the ANALYSIS level: a persistent `Rc`-shared list
+/// of `name -> BindingSite` frames, inner-most (most-recently-bound) wins on lookup.
+/// `Rc` (single-threaded analysis; never stored in a `Send`/`Sync` value) keeps
+/// `clone` (capture) and `extend` cheap. The chain is the STATIC lexical STRUCTURE
+/// (recorded once by [`collect_scopes`], deterministic from AST position); the
+/// closure CONTENTS at each site grow monotonically in `bound` across fixpoint
+/// rounds. A captured scope references site IDs, so same-site growth is seen
+/// automatically, while a different site (a rebind) NEVER leaks in.
+#[derive(Clone)]
+struct Scope<'a>(Option<Rc<ScopeFrame<'a>>>);
+
+struct ScopeFrame<'a> {
+    name: &'a str,
+    site: BindingSite,
+    parent: Option<Rc<ScopeFrame<'a>>>,
+}
+
+impl<'a> Scope<'a> {
+    /// The empty scope -- a cell root (no locals).
+    fn root() -> Self {
+        Scope(None)
+    }
+
+    /// A NEW scope with `name` bound to `site`, shadowing any outer binding of the
+    /// same name (mirrors `LocalEnv::with_binding`).
+    fn extend(&self, name: &'a str, site: BindingSite) -> Self {
+        Scope(Some(Rc::new(ScopeFrame {
+            name,
+            site,
+            parent: self.0.clone(),
+        })))
+    }
+
+    /// Resolve `name` to its nearest enclosing binding site (mirrors `LocalEnv::lookup`).
+    /// Returns `None` when the name is not a local in this scope -- which, since the
+    /// binder ONLY emits `LocalRef` for an in-scope name (`scalar.rs` LocalRef arm),
+    /// never happens for a real reference; the callers treat `None` defensively.
+    fn resolve(&self, name: &str) -> Option<BindingSite> {
+        let mut cur = self.0.as_deref();
+        while let Some(frame) = cur {
+            if frame.name == name {
+                return Some(frame.site);
+            }
+            cur = frame.parent.as_deref();
+        }
+        None
+    }
+}
+
+/// **FU-NEXT-3 (2026-06-23) -- pre-pass recording each lambda's BODY scope.** Threads
+/// the lexical scope through the tree exactly as `eval` builds it (`eval_let_bindings`
+/// sequential left-to-right; a `LAMBDA` body under the definition scope + its params;
+/// shadowing nearest-wins) and records, for EVERY `ExprPlan::Lambda`, the scope INSIDE
+/// its body (definition scope + `Param` frames). Recorded ONCE before the fixpoint, so
+/// it is complete and stable: `closures_of`'s currying arm (which jumps into a callee
+/// body non-structurally) and `discover`'s body descent both look up the SAME captured
+/// body scope, and a `LocalRef` in any lambda body always resolves to a real site (no
+/// transient miss across rounds). The site CONTENTS grow in `bound`; this STRUCTURE
+/// does not.
+fn collect_scopes<'a>(
+    plan: &'a ExprPlan,
+    scope: &Scope<'a>,
+    captured: &mut HashMap<*const ExprPlan, Scope<'a>>,
+) {
+    match plan {
+        ExprPlan::Lambda { params, body } => {
+            let mut body_scope = scope.clone();
+            for (i, p) in params.iter().enumerate() {
+                body_scope =
+                    body_scope.extend(p.as_ref(), BindingSite::Param(plan as *const ExprPlan, i));
+            }
+            captured.insert(plan as *const ExprPlan, body_scope.clone());
+            collect_scopes(body, &body_scope, captured);
+        }
+        ExprPlan::Let { bindings, body } => {
+            let mut s = scope.clone();
+            for (name, value) in bindings {
+                // The value is discovered under the PREFIX scope (sees earlier
+                // bindings, not itself or later ones) -- `eval_let_bindings` semantics.
+                collect_scopes(value, &s, captured);
+                s = s.extend(name.as_ref(), BindingSite::LetVar(value as *const ExprPlan));
+            }
+            collect_scopes(body, &s, captured);
+        }
+        ExprPlan::Binary { lhs, rhs, .. } => {
+            collect_scopes(lhs, scope, captured);
+            collect_scopes(rhs, scope, captured);
+        }
+        ExprPlan::Unary { operand, .. } => collect_scopes(operand, scope, captured),
+        ExprPlan::Function { args, .. } => {
+            args.iter().for_each(|a| collect_scopes(a, scope, captured))
+        }
+        ExprPlan::ScalarNameRef { inner, .. } => collect_scopes(inner, scope, captured),
+        ExprPlan::Array(rows) => rows
+            .iter()
+            .flatten()
+            .for_each(|c| collect_scopes(c, scope, captured)),
+        ExprPlan::CallLambda { callee, args } => {
+            collect_scopes(callee, scope, captured);
+            args.iter().for_each(|a| collect_scopes(a, scope, captured));
+        }
+        ExprPlan::Number(_)
+        | ExprPlan::Bool(_)
+        | ExprPlan::String(_)
+        | ExprPlan::LocalRef(_)
+        | ExprPlan::CellRef { .. }
+        | ExprPlan::AggregateNameRef { .. }
+        | ExprPlan::RangeRef { .. }
+        | ExprPlan::StructuredRef { .. }
+        | ExprPlan::Error(_) => {}
+    }
+}
+
 /// The set of lambda nodes a plan EVALUATES to (its "closure set"), reading the
 /// current `bound` map. PURE — no mutation. Mirrors exactly the callable-PRESERVING
 /// arms of `eval_binding` (`scalar.rs`): `Lambda` → itself; `LocalRef` → its bound
@@ -541,9 +686,10 @@ fn collect_lambdas<'a>(plan: &'a ExprPlan, out: &mut HashMap<*const ExprPlan, &'
 /// `guard` holds the lambda bodies currently on the resolution stack; re-entry
 /// (a closure that, through call-returns, resolves to itself) drains `budget` and
 /// ultimately bails to [`InvokedBodies::All`] rather than recursing forever.
-fn closures_of(
-    plan: &ExprPlan,
-    st: &mut InvokeAnalysis<'_>,
+fn closures_of<'a>(
+    plan: &'a ExprPlan,
+    st: &mut InvokeAnalysis<'a>,
+    scope: &Scope<'a>,
     guard: &mut HashSet<*const ExprPlan>,
 ) -> HashSet<*const ExprPlan> {
     if st.budget == 0 {
@@ -556,9 +702,20 @@ fn closures_of(
             s.insert(plan as *const ExprPlan);
             s
         }
-        ExprPlan::LocalRef(name) => st.bound.get(name.as_ref()).cloned().unwrap_or_default(),
+        // **FU-NEXT-3 (2026-06-23):** resolve the name LEXICALLY through `scope` to its
+        // one visible site, then read that site's closures. `None` cannot happen for a
+        // binder-emitted `LocalRef` (always in scope per the `scalar.rs` LocalRef arm);
+        // treat it defensively as a budget bail to `All` (walk everything) -- a SAFE
+        // over-report, never an under-report, were the scope ever incomplete.
+        ExprPlan::LocalRef(name) => match scope.resolve(name) {
+            Some(site) => st.bound.get(&site).cloned().unwrap_or_default(),
+            None => {
+                st.budget = 0;
+                HashSet::new()
+            }
+        },
         ExprPlan::CallLambda { callee, args } => {
-            let callees = closures_of(callee, st, guard);
+            let callees = closures_of(callee, st, scope, guard);
             let mut ret = HashSet::new();
             for lp in callees {
                 // **Re-audit #3 Finding 2 — arity gate.** A wrong-arity call returns
@@ -575,12 +732,29 @@ fn closures_of(
                     st.budget = 0;
                     continue;
                 }
-                ret.extend(closures_of(body, st, guard));
+                // **FU-NEXT-3:** the callee body resolves its free names against the
+                // callee's CAPTURED body scope (snapshot at definition + params), NOT the
+                // call-site scope -- mirroring `invoke_lambda`. `collect_scopes` records a
+                // scope for every lambda, so a miss is impossible; bail safe if it ever is.
+                let Some(body_scope) = st.captured.get(&lp).cloned() else {
+                    st.budget = 0;
+                    guard.remove(&lp);
+                    continue;
+                };
+                ret.extend(closures_of(body, st, &body_scope, guard));
                 guard.remove(&lp);
             }
             ret
         }
-        ExprPlan::Let { body, .. } => closures_of(body, st, guard),
+        // **FU-NEXT-3:** a LET evaluates to its body's closures, under the scope extended
+        // with the LET's bindings left-to-right (nearest shadows) -- `eval`'s Let arm.
+        ExprPlan::Let { bindings, body } => {
+            let mut s = scope.clone();
+            for (name, value) in bindings {
+                s = s.extend(name.as_ref(), BindingSite::LetVar(value as *const ExprPlan));
+            }
+            closures_of(body, st, &s, guard)
+        }
         // Not callable-preserving at eval → no invokable closure produced.
         ExprPlan::Number(_)
         | ExprPlan::Bool(_)
@@ -632,7 +806,12 @@ fn callee_invoked_lambda<'a>(
 /// invoked at eval. Skip those args here too — descending them would mark the callee
 /// invoked and re-introduce the very over-report (a worker-less-load stale UDF
 /// preservation) this analysis exists to remove (Codex FU-NEXT HIGH-1).
-fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &FunctionRegistry) {
+fn discover<'a>(
+    plan: &'a ExprPlan,
+    st: &mut InvokeAnalysis<'a>,
+    scope: &Scope<'a>,
+    registry: &FunctionRegistry,
+) {
     if st.budget == 0 {
         return;
     }
@@ -641,17 +820,25 @@ fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &Func
         ExprPlan::Lambda { body, .. } => {
             let ptr = plan as *const ExprPlan;
             if st.invoked.contains(&ptr) && st.descended.insert(ptr) {
-                discover(body, st, registry);
+                // **FU-NEXT-3:** descend the body under the lambda's CAPTURED body scope
+                // (definition snapshot + params), not the call-site scope -- mirroring
+                // `invoke_lambda`. `collect_scopes` records one for every lambda, so a
+                // miss is impossible; bail safe (to `All`) if it ever is.
+                if let Some(body_scope) = st.captured.get(&ptr).cloned() {
+                    discover(body, st, &body_scope, registry);
+                } else {
+                    st.budget = 0;
+                }
             }
             // Value position (not invoked here): do NOT descend the body.
         }
         ExprPlan::CallLambda { callee, args } => {
-            discover(callee, st, registry);
+            discover(callee, st, scope, registry);
             for a in args {
-                discover(a, st, registry);
+                discover(a, st, scope, registry);
             }
             let mut guard = HashSet::new();
-            let callees = closures_of(callee, st, &mut guard);
+            let callees = closures_of(callee, st, scope, &mut guard);
             for lp in &callees {
                 // **Codex FU-NEXT re-audit Finding 3 — arity gate** (shared with
                 // `closures_of` via `callee_invoked_lambda`). `invoke_lambda` returns
@@ -681,14 +868,18 @@ fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &Func
                 }
                 // Bind each param to the closures of the matching arg (context-
                 // insensitive union across every call site of this lambda).
-                for (i, p) in params.iter().enumerate() {
+                for (i, _p) in params.iter().enumerate() {
                     let Some(arg) = args.get(i) else { continue };
                     let mut g2 = HashSet::new();
-                    let cs = closures_of(arg, st, &mut g2);
+                    let cs = closures_of(arg, st, scope, &mut g2);
                     if cs.is_empty() {
                         continue;
                     }
-                    let entry = st.bound.entry(p.as_ref()).or_default();
+                    // **FU-NEXT-3:** key the param's closures by its `Param` SITE (not its
+                    // bare name), so the lambda body's `LocalRef` to this param resolves
+                    // here via the captured body scope's matching `Param` frame. The arg
+                    // flow is still a context-insensitive union across every call site.
+                    let entry = st.bound.entry(BindingSite::Param(*lp, i)).or_default();
                     for c in cs {
                         if entry.insert(c) {
                             st.changed = true;
@@ -698,26 +889,33 @@ fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &Func
             }
         }
         ExprPlan::Let { bindings, body } => {
+            // **FU-NEXT-3:** thread the scope sequentially -- each binding VALUE is
+            // discovered under the PREFIX scope (earlier bindings only, not itself or
+            // later ones -- `eval_let_bindings`), keyed by its own `LetVar` SITE so a
+            // rebind of the same name is a DISTINCT entry. The body sees all bindings.
+            let mut s = scope.clone();
             for (name, value) in bindings {
-                discover(value, st, registry);
+                discover(value, st, &s, registry);
                 let mut guard = HashSet::new();
-                let cs = closures_of(value, st, &mut guard);
+                let cs = closures_of(value, st, &s, &mut guard);
+                let site = BindingSite::LetVar(value as *const ExprPlan);
                 if !cs.is_empty() {
-                    let entry = st.bound.entry(name.as_ref()).or_default();
+                    let entry = st.bound.entry(site).or_default();
                     for c in cs {
                         if entry.insert(c) {
                             st.changed = true;
                         }
                     }
                 }
+                s = s.extend(name.as_ref(), site);
             }
-            discover(body, st, registry);
+            discover(body, st, &s, registry);
         }
         ExprPlan::Binary { lhs, rhs, .. } => {
-            discover(lhs, st, registry);
-            discover(rhs, st, registry);
+            discover(lhs, st, scope, registry);
+            discover(rhs, st, scope, registry);
         }
-        ExprPlan::Unary { operand, .. } => discover(operand, st, registry),
+        ExprPlan::Unary { operand, .. } => discover(operand, st, scope, registry),
         ExprPlan::Function { name, args } => {
             // **Codex FU-NEXT HIGH-1 + re-audit Finding 1:** skip args ONLY for a BUILTIN
             // LazyShape reference fn (ISREF) — it never evaluates its arg, just inspects
@@ -731,7 +929,7 @@ fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &Func
             let lazy_builtin =
                 is_lazy_shape_reference_fn(registry, name) && registry.udf_handle(name).is_none();
             if !lazy_builtin {
-                args.iter().for_each(|a| discover(a, st, registry));
+                args.iter().for_each(|a| discover(a, st, scope, registry));
             }
             // **FU4 (2026-06-21) — the cardinal-sin fix.** A higher-order helper
             // (MAP / MAKEARRAY / REDUCE / SCAN) INVOKES the lambda(s) in its arg
@@ -751,7 +949,7 @@ fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &Func
             if is_higher_order_helper(name) {
                 for a in args {
                     let mut guard = HashSet::new();
-                    let cs = closures_of(a, st, &mut guard);
+                    let cs = closures_of(a, st, scope, &mut guard);
                     for lp in cs {
                         if st.invoked.insert(lp) {
                             st.changed = true;
@@ -760,11 +958,11 @@ fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &Func
                 }
             }
         }
-        ExprPlan::ScalarNameRef { inner, .. } => discover(inner, st, registry),
+        ExprPlan::ScalarNameRef { inner, .. } => discover(inner, st, scope, registry),
         ExprPlan::Array(rows) => rows
             .iter()
             .flatten()
-            .for_each(|c| discover(c, st, registry)),
+            .for_each(|c| discover(c, st, scope, registry)),
         ExprPlan::Number(_)
         | ExprPlan::Bool(_)
         | ExprPlan::String(_)
@@ -785,11 +983,14 @@ fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &Func
 /// anywhere downstream (even in pure value position), which over-reported — surfacing
 /// a spurious `#CIRC!` on `recompute_all`, a stale volatile flag, and (via
 /// `plan_references_udf`) a silently-preserved stale UDF value on a worker-less load.
-/// This computes a sound over-approximation of "invoked" via a **context-insensitive**
-/// closure-flow fixpoint (0-CFA): precise for every common LET/LAMBDA shape (immediate
-/// calls, LET-bound calls, currying, capture-before-rebind, recursion / self-
-/// application, passing a lambda as an arg), and conservatively bails to
-/// [`InvokedBodies::All`] on pathological closure-flow blow-up.
+/// This computes a sound over-approximation of "invoked" via a closure-flow fixpoint with
+/// **context-SENSITIVE (lexical) name resolution** (FU-NEXT-3): a `LocalRef` resolves
+/// through the lexical [`Scope`] to its one visible [`BindingSite`] -- mirroring eval's
+/// `LocalEnv` (sequential LET + shadowing + snapshot capture) -- so a name bound twice no
+/// longer merges its sites. Precise for every common LET/LAMBDA shape (immediate calls,
+/// LET-bound calls, currying, capture-before-rebind, recursion / self-application, passing
+/// a lambda as an arg), and conservatively bails to [`InvokedBodies::All`] on pathological
+/// closure-flow blow-up (or, defensively, a scope miss that should never occur).
 ///
 /// **Soundness floor (the cardinal invariant):** the invoked set must be a SUPERSET of
 /// what eval invokes — never a subset. Under-reporting would drop a real precedent → a
@@ -797,32 +998,33 @@ fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &Func
 /// preserving arms and the param/LET propagation only ever GROWS `bound`, so the fixpoint
 /// over-approximates; the budget bail is to `All` (walk everything), preserving the floor.
 ///
-/// **Known residual over-reports (NOT under-reports).** A few contrived shapes still mark a
-/// lambda invoked when eval does not run it -- each an OVER-report that can re-open the three
-/// faces (spurious `#CIRC!` / stale volatility / worker-less-load stale-UDF preserve), each
-/// STRICTLY NARROWER than the pre-FU-NEXT walk-everything behavior, and NONE an under-report
-/// (a live lambda's deps are always kept):
-///   1. **name-merge vs capture** (Codex FU-NEXT HIGH-2): the `bound` map is keyed by NAME
-///      (context-insensitive), so a name bound to a lambda, CAPTURED by another lambda, then
-///      REBOUND to a different never-invoked lambda, merges both -- marking the rebound lambda
-///      invoked. Pinned by `name_merge_capture_vs_rebind_over_preserve_known_residual`
-///      (+ `..._reopens_circ_face`).
-///   2. **invocation-marking through a DEAD call** (Codex FU-NEXT-2 megaudit): `discover`
-///      descends a `CallLambda`'s args UNCONDITIONALLY (to find invocations for the fixpoint),
-///      so a matching-arity inner call nested in a DEAD outer call (`f(g(C1),0)` where `f` is
-///      wrong-arity) still marks the inner lambda `g` invoked -- and the walker walks g's
-///      BINDING body, over-reporting its cells (`g=LAMBDA(y,B1)` -> B1). At eval the outer call
-///      returns `#VALUE!` before evaluating `g(C1)`, so g is never invoked. Pinned by
-///      `fu_next2_invoked_lambda_in_dead_call_arg_overreports_body_known_residual`.
-/// Both are over-approximations of the `invoked` set; the durable fix is a context-SENSITIVE
-/// analysis (per-lambda captured environments + gating discover's arg-descent on call liveness)
-/// -- deferred.
+/// **Known residual over-report (NOT under-report).** ONE contrived shape still marks a
+/// lambda invoked when eval does not run it -- an OVER-report that can re-open the three faces
+/// (spurious `#CIRC!` / stale volatility / worker-less-load stale-UDF preserve), STRICTLY
+/// NARROWER than the pre-FU-NEXT walk-everything behavior, and NOT an under-report (a live
+/// lambda's deps are always kept):
+///   - **invocation-marking through a DEAD call** (Codex FU-NEXT-2 megaudit): `discover`
+///     descends a `CallLambda`'s args UNCONDITIONALLY (to find invocations for the fixpoint),
+///     so a matching-arity inner call nested in a DEAD outer call (`f(g(C1),0)` where `f` is
+///     wrong-arity) still marks the inner lambda `g` invoked -- and the walker walks g's
+///     BINDING body, over-reporting its cells (`g=LAMBDA(y,B1)` -> B1). At eval the outer call
+///     returns `#VALUE!` before evaluating `g(C1)`, so g is never invoked. Pinned by
+///     `fu_next2_invoked_lambda_in_dead_call_arg_overreports_body_known_residual`. The durable
+///     fix (gating discover's arg-descent on the parent call's liveness) is deferred -- its
+///     own window.
+///
+/// **FU-NEXT-3 (2026-06-23) CLOSED the name-merge residual** (Codex FU-NEXT HIGH-2): the
+/// closure environment is now keyed by lexical [`BindingSite`], not bare name, so a name
+/// bound to a lambda, CAPTURED by another lambda, then REBOUND to a different never-invoked
+/// lambda no longer merges -- the captor's body resolves the name to the binding visible at
+/// ITS definition (the snapshot), exactly as eval does. Pins flipped to
+/// `name_merge_capture_vs_rebind_*_is_lexically_resolved`.
 ///
 /// **FU-NEXT-2 (2026-06-22) closed the ARG-WALK face** of the old wrong-arity residual: the
 /// walker's `CallLambda` arm now gates arg-walking on [`InvokedBodies::call_is_live`] -- a
 /// call's args are walked IFF a matching-arity lambda flows to the callee (`st.live_calls`),
 /// so `=LET(f,LAMBDA(x,1),f(B1,0))` no longer over-reports its direct arg B1 (`invoke_lambda`
-/// returns `#VALUE!` BEFORE evaluating the args). The invocation-marking face (residual 2
+/// returns `#VALUE!` BEFORE evaluating the args). The invocation-marking face (the residual
 /// above) remains.
 fn invoked_lambda_bodies(root: &ExprPlan, registry: &FunctionRegistry) -> InvokedBodies {
     let mut lambdas = HashMap::new();
@@ -836,15 +1038,20 @@ fn invoked_lambda_bodies(root: &ExprPlan, registry: &FunctionRegistry) -> Invoke
             live_calls: HashSet::new(),
         };
     }
+    // **FU-NEXT-3 (2026-06-23):** record every lambda's captured body scope ONCE (the
+    // static lexical structure), before the fixpoint grows the per-site closure contents.
+    let mut captured = HashMap::new();
+    collect_scopes(root, &Scope::root(), &mut captured);
     let n = lambdas.len();
     let mut st = InvokeAnalysis {
         invoked: HashSet::new(),
         live_calls: HashSet::new(),
         bound: HashMap::new(),
         lambdas,
+        captured,
         changed: false,
         descended: HashSet::new(),
-        // Monotone fixpoint over (invoked ⊆ lambdas, bound: name→subset of lambdas);
+        // Monotone fixpoint over (invoked is a subset of lambdas, bound: site -> subset);
         // converges in O(n) rounds for non-pathological flow. Budget is the global
         // backstop; on exhaustion → All (sound).
         budget: (n as u32).saturating_mul(4_096).saturating_add(8_192),
@@ -854,7 +1061,7 @@ fn invoked_lambda_bodies(root: &ExprPlan, registry: &FunctionRegistry) -> Invoke
     for _ in 0..max_rounds {
         st.changed = false;
         st.descended.clear();
-        discover(root, &mut st, registry);
+        discover(root, &mut st, &Scope::root(), registry);
         if st.budget == 0 {
             return InvokedBodies::All;
         }
