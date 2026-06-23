@@ -47,12 +47,10 @@ use super::{RecomputeFailure, RecomputeResult, RuntimeError, WorkbookRuntime};
 /// inside a dead lambda is no longer reported — closing the over-preservation slices
 /// Wave-P-follow-up-1 left. It is a SOUND over-approximation of dispatch, so it never
 /// UNDER-reports (a UDF that would dispatch is always reported → never recomputes a
-/// real UDF cell to `#CALC!` over a valid saved value). A narrow CLASS of contrived
-/// over-reports remains (all strictly NARROWER than the pre-FU-NEXT walk-everything
-/// behavior, all on the "reopen with a worker to refresh" safe side): a captured-then-
-/// rebound lambda merged by name (context-insensitivity), and the args of a
-/// non-callable / wrong-arity `CallLambda` (walked though eval skips them). See
-/// `invoked_lambda_bodies`' residual note.
+/// real UDF cell to `#CALC!` over a valid saved value). The contrived over-reports this
+/// note once listed are now CLOSED -- the captured-then-rebound name-merge by FU-NEXT-3
+/// (lexical `BindingSite` resolution) and the dead-call arg-descent by FU-NEXT-4 -- so no
+/// known over-report remains. See `invoked_lambda_bodies`' residual note.
 fn plan_references_udf(plan: &ExprPlan, registry: &ql_functions::FunctionRegistry) -> bool {
     let mut deps = crate::calcgraph_session::FormulaDeps::default();
     crate::calcgraph_session::walk_plan_for_deps(plan, &mut deps, registry);

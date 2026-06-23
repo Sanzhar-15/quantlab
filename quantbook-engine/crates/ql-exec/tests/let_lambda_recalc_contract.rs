@@ -2644,10 +2644,9 @@ fn fu_next2_nested_dead_call_suppresses_whole_arg_subtree() {
     // suppressed at the WALKER, INCLUDING the would-be-live inner `g(C1)`. At eval
     // invoke_lambda(f) hits the arity gate and returns #VALUE! BEFORE evaluating g(C1), so C1
     // (=(0,0,2)) is never read -> not a precedent. Proves the gate suppresses the dead call's
-    // ARG-WALK. NOTE g is still marked invoked via discover's unconditional arg-descent, so the
-    // walker walks g's body `y` (a LocalRef -> no grid dep HERE); the case where g's body reads
-    // a CELL is the separate documented over-report
-    // (`fu_next2_invoked_lambda_in_dead_call_arg_overreports_body_known_residual`).
+    // ARG-WALK. (Since FU-NEXT-4, `discover` also no longer DESCENDS the dead call's args, so `g`
+    // is not even marked invoked and the walker never walks g's body; the variant where g's body
+    // reads a CELL is closed too -- see `fu_next4_invoked_lambda_in_dead_call_arg_is_dropped`.)
     let deps = formula_deps_for("LET(f,LAMBDA(x,1),g,LAMBDA(y,y),f(g(C1),0))");
     assert!(
         deps.as_ref()
@@ -2681,27 +2680,25 @@ fn fu_next2_dead_call_arg_not_a_precedent_end_to_end() {
 }
 
 #[test]
-fn fu_next2_invoked_lambda_in_dead_call_arg_overreports_body_known_residual() {
-    // **Codex megaudit finding (DOCUMENTED RESIDUAL -- over-report, NOT under-report).**
-    // FU-NEXT-2 closes the ARG-WALK over-report (a dead call's args are no longer walked --
-    // see `fu_next2_nested_dead_call_suppresses_whole_arg_subtree`: C1, g's ARG, is dropped).
-    // A DISTINCT, narrower over-report remains in the INVOCATION-MARKING layer: `discover`
-    // descends a CallLambda's args UNCONDITIONALLY (to find invocations for the fixpoint), so a
-    // matching-arity inner call `g(C1)` nested in a DEAD outer call `f(g(C1),0)` still marks `g`
-    // INVOKED -- and the walker then walks g's BINDING body `LAMBDA(y,B1)` via the lambda-body
-    // gate, over-reporting B1 (a spurious self-edge -> possible #CIRC! on full recompute). At
-    // eval the wrong-arity outer call returns #VALUE! BEFORE evaluating g(C1), so g is never
-    // invoked and B1 is never read -- the correct dep set is {}. This is the SAME family as the
-    // name-merge residual (an over-approximate `invoked` set), NOT the arg-walk class FU-NEXT-2
-    // closed; the durable fix (gating discover's arg-descent on the parent call's liveness) is a
-    // riskier fixpoint change, deferred. NEVER an under-report. This pin FAILS the day that fix
-    // lands, making it deliberate.
-    let deps = formula_deps_for("LET(f,LAMBDA(x,1),g,LAMBDA(y,B1),f(g(C1),0))")
-        .expect("has the over-reported B1 dep");
+fn fu_next4_invoked_lambda_in_dead_call_arg_is_dropped() {
+    // **FU-NEXT-4 (2026-06-23) -- CLOSES the last dep-walker over-report** (was a documented
+    // residual; flipped + renamed from
+    // `fu_next2_invoked_lambda_in_dead_call_arg_overreports_body_known_residual`).
+    // `f` takes 1 param but is called with 2 args, so `f(g(C1),0)` is a DEAD outer call. At eval
+    // `invoke_lambda` returns #VALUE! BEFORE evaluating `g(C1)` (the arity check precedes the
+    // arg-eval loop, scalar.rs), so `g` is never invoked and B1 (g's body) is never read -- the
+    // correct dep set is {}. PRE-FU-NEXT-4 `discover` descended the dead call's args
+    // UNCONDITIONALLY, marking `g` invoked -> the walker walked g's body -> over-reported B1.
+    // Now the arg-descent is gated on call liveness (the dead outer call is skipped), so B1 is
+    // NOT a precedent. (The companion `..._no_circ` pins the #CIRC! face; C5
+    // `fu_next4_nested_invocation_in_live_call_keeps_dep` pins the inverse -- a LIVE
+    // `f(g(C1),0)` MUST keep B1, proving this is an over-report fix, never an under-report.)
+    let deps = formula_deps_for("LET(f,LAMBDA(x,1),g,LAMBDA(y,B1),f(g(C1),0))");
     assert!(
-        deps.cells.contains(&(0, 0, 1)),
-        "RESIDUAL: g (invoked-marked via a call inside a DEAD outer call) over-reports its body \
-         B1 (a context-sensitive invocation analysis closes this); got {deps:?}"
+        deps.as_ref()
+            .map_or(true, |d| !d.cells.contains(&(0, 0, 1))),
+        "FU-NEXT-4: the dead outer call's args are not descended -> g never invoked -> B1 must \
+         NOT be a precedent; got {deps:?}"
     );
 }
 
@@ -2855,5 +2852,104 @@ fn fu_next3_backward_ref_is_a_dep() {
     assert!(
         deps.cells.contains(&(0, 0, 2)),
         "backward-ref g IS in scope inside f -> invoked -> C1 must be a precedent; got {deps:?}"
+    );
+}
+
+// =============================================================================
+// FU-NEXT-4 (2026-06-23): gate discover's CallLambda arg-descent on call liveness.
+// `discover` now descends a call's ARG subtrees ONLY when the call is LIVE (a
+// matching-arity callee flows to it -- the SAME predicate the arity gate uses, so
+// the analysis's arg-descent <=> the walker's `live_calls` arg-walk). A DEAD call's
+// args are never evaluated at eval (`invoke_lambda` returns #VALUE! BEFORE the arg
+// loop, scalar.rs:926), so a matching-arity inner call nested in a DEAD outer call
+// is no longer spuriously marked invoked. This closes residual 3 (the LAST dep-walker
+// over-report) WITHOUT dropping any LIVE call's nested invocation (never an under-
+// report; the callee is always descended, the Param-binding path is untouched, and
+// the budget/round-cap -> All floor still walks everything on any blowup). The pins
+// below are the adversarial under-report matrix: C5/C6/C7 (live calls whose nested
+// invocations MUST survive) pass pre- AND post-fix; the residual-3 pin above is
+// FLIPPED (B1 dropped); O2 closes its #CIRC! face.
+// =============================================================================
+
+#[test]
+fn fu_next4_nested_invocation_in_live_call_keeps_dep() {
+    // **C5 (the cardinal-sin guard -- the inverse of the flipped residual-3 pin).**
+    // SAME formula as the flipped `..._invoked_lambda_in_dead_call_arg_is_dropped` but `f`
+    // is 2-param, so `f(g(C1),0)` is LIVE (matching arity). At eval a live call evaluates
+    // ALL its args left-to-right (`invoke_lambda` arg loop, scalar.rs:933) EVEN when the
+    // body ignores them, so `g(C1)` IS evaluated -> `g` invoked -> B1 read, and C1 (g's
+    // arg) read. Both B1 and C1 MUST stay precedents: gating the arg-descent on liveness
+    // must NOT drop a LIVE call's nested invocation. (Only `f`'s arity differs from the
+    // dead case -- the minimal live/dead contrast.)
+    let deps = formula_deps_for("LET(f,LAMBDA(a,b,1),g,LAMBDA(y,B1),f(g(C1),0))")
+        .expect("B1 and C1 deps via the live call");
+    assert!(
+        deps.cells.contains(&(0, 0, 1)),
+        "live call -> g(C1) invoked -> g's body B1 MUST stay a precedent (no under-report); got {deps:?}"
+    );
+    assert!(
+        deps.cells.contains(&(0, 0, 2)),
+        "live call -> its arg g(C1) is evaluated -> C1 MUST stay a precedent; got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next4_lambda_as_param_to_live_call_keeps_dep() {
+    // **C6 (lambda passed as a param to a LIVE call, invoked in the callee body).**
+    // `f(g)` is live (f 1-param), and f's body `h(1)` invokes the param `h`=`g` (bound via
+    // `Param(f,0)` from the live call's arg flow -- a path the arg-descent gate does NOT
+    // touch). So `g`'s body A1 IS read. Editing A1 MUST recompute B1 -- a STALE value means
+    // the gate starved the Param-binding path (the cardinal sin). End-to-end.
+    assert_edit_a1_recomputes(
+        "LET(g,LAMBDA(y,A1),f,LAMBDA(h,h(1)),f(g))",
+        10.0,
+        10.0,
+        20.0,
+        20.0,
+    );
+}
+
+#[test]
+fn fu_next4_param_lambda_bound_after_consumer_keeps_dep() {
+    // **C7 (the param-lambda is bound AFTER its consumer -- ordering torture).**
+    // `p(r)` is live (p 1-param); p's body `q(0)` invokes the param `q`=`r`, and `r`
+    // (reads A1) is bound AFTER `p`. The param flow (`Param(p,0)` <- {r}) must still reach
+    // p's body across the fixpoint regardless of binding order, so A1 is a precedent.
+    // Proves gating the arg-descent does not break the (separate, ungated) Param-binding
+    // path even when the closure flows in a later round. (Distinct from C6: r bound after p.)
+    let deps = formula_deps_for("LET(p,LAMBDA(q,q(0)),r,LAMBDA(z,A1),p(r))")
+        .expect("A1 dep via the param-bound r");
+    assert!(
+        deps.cells.contains(&(0, 0, 0)),
+        "p(r) live -> q(0) invokes r -> A1 MUST be a precedent (no under-report); got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next4_invoked_lambda_in_dead_call_arg_is_dropped_no_circ() {
+    // **O2 (the #CIRC! face of residual 3, now CLOSED).** `=LET(f,LAMBDA(x,1),g,LAMBDA(y,B1),
+    // f(g(C1),0))` in B1: `g`'s body reads the OWNING cell B1. PRE-FU-NEXT-4 `discover`
+    // descended the DEAD outer call's args, marking `g` invoked -> the walker walked g's body
+    // -> a spurious B1->B1 self-edge -> `recompute_all` yielded #CIRC!. Now the dead call's
+    // args are not descended -> g not invoked -> no self-edge -> the real wrong-arity result
+    // #VALUE! (f is 1-param, called with 2 args). Mirrors `fu_next2_wrong_arity_self_edge_no_circ`.
+    let mut wb = Workbook::new();
+    wb.add_sheet("S");
+    let reg = default_registry();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 1, "LET(f,LAMBDA(x,1),g,LAMBDA(y,B1),f(g(C1),0))")
+            .unwrap();
+    }
+    let rebuilt = CalcgraphSession::rebuild_from_workbook(&wb);
+    let mut graph = rebuilt.session;
+    {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.recompute_all();
+    }
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Value),
+        "no spurious B1 self-edge -> recompute_all yields the wrong-arity #VALUE!, not #CIRC!"
     );
 }

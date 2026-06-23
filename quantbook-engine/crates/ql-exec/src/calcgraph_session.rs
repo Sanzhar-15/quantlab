@@ -833,12 +833,34 @@ fn discover<'a>(
             // Value position (not invoked here): do NOT descend the body.
         }
         ExprPlan::CallLambda { callee, args } => {
+            // The CALLEE is ALWAYS descended (eval always evaluates it -- a curried inner
+            // call / self-application flows through the callee, never the args).
             discover(callee, st, scope, registry);
-            for a in args {
-                discover(a, st, scope, registry);
-            }
             let mut guard = HashSet::new();
             let callees = closures_of(callee, st, scope, &mut guard);
+            // **FU-NEXT-4 (2026-06-23) -- gate the ARG-descent on call liveness.** Descend
+            // the arg subtrees ONLY when a matching-arity callee flows here. A DEAD call
+            // (wrong arity / non-callable callee) never evaluates its args at eval
+            // (`invoke_lambda` returns `#VALUE!`/`#CALC!` BEFORE the arg-eval loop --
+            // `scalar.rs`), so a matching-arity inner call nested in a dead outer call's arg
+            // (`f(g(C1),0)` with wrong-arity `f`) would otherwise be spuriously marked
+            // invoked, over-reporting g's BODY (the #CIRC! self-edge / stale-UDF face --
+            // residual 3). The predicate MUST stay byte-identical to the arity gate in the
+            // loop below, so the analysis's arg-descent <=> the walker's `live_calls`
+            // arg-walk (FU-NEXT-2): the two layers then provably agree and never drop a real
+            // precedent. SOUND (no under-report): `closures_of(callee)` over-approximates
+            // eval's real closure, so analysis-dead implies eval-dead implies the args'
+            // invocations are spurious; a LIVE call's args are still descended; the callee,
+            // the Param-binding loop below, and the budget/round-cap -> `All` floor are all
+            // untouched. This is the invocation-marking dual of FU-NEXT-2's walker gate.
+            let call_is_live = callees
+                .iter()
+                .any(|lp| callee_invoked_lambda(st, *lp, args.len()).is_some());
+            if call_is_live {
+                for a in args {
+                    discover(a, st, scope, registry);
+                }
+            }
             for lp in &callees {
                 // **Codex FU-NEXT re-audit Finding 3 — arity gate** (shared with
                 // `closures_of` via `callee_invoked_lambda`). `invoke_lambda` returns
@@ -998,20 +1020,21 @@ fn discover<'a>(
 /// preserving arms and the param/LET propagation only ever GROWS `bound`, so the fixpoint
 /// over-approximates; the budget bail is to `All` (walk everything), preserving the floor.
 ///
-/// **Known residual over-report (NOT under-report).** ONE contrived shape still marks a
-/// lambda invoked when eval does not run it -- an OVER-report that can re-open the three faces
-/// (spurious `#CIRC!` / stale volatility / worker-less-load stale-UDF preserve), STRICTLY
-/// NARROWER than the pre-FU-NEXT walk-everything behavior, and NOT an under-report (a live
-/// lambda's deps are always kept):
-///   - **invocation-marking through a DEAD call** (Codex FU-NEXT-2 megaudit): `discover`
-///     descends a `CallLambda`'s args UNCONDITIONALLY (to find invocations for the fixpoint),
-///     so a matching-arity inner call nested in a DEAD outer call (`f(g(C1),0)` where `f` is
-///     wrong-arity) still marks the inner lambda `g` invoked -- and the walker walks g's
-///     BINDING body, over-reporting its cells (`g=LAMBDA(y,B1)` -> B1). At eval the outer call
-///     returns `#VALUE!` before evaluating `g(C1)`, so g is never invoked. Pinned by
-///     `fu_next2_invoked_lambda_in_dead_call_arg_overreports_body_known_residual`. The durable
-///     fix (gating discover's arg-descent on the parent call's liveness) is deferred -- its
-///     own window.
+/// **No known residual over-reports remain (the FU-NEXT arc is complete).** Every
+/// over-report this analysis once carried is closed; the only remaining safety valve is the
+/// budget/round-cap -> `All` floor, which can only ever OVER-approximate. The last residual,
+/// now closed:
+///   - **invocation-marking through a DEAD call -- CLOSED by FU-NEXT-4 (2026-06-23).**
+///     `discover` once descended a `CallLambda`'s args UNCONDITIONALLY, so a matching-arity
+///     inner call nested in a DEAD outer call (`f(g(C1),0)` where `f` is wrong-arity) still
+///     marked the inner lambda `g` invoked -- and the walker walked g's BINDING body,
+///     over-reporting its cells (`g=LAMBDA(y,B1)` -> a spurious B1 self-edge -> `#CIRC!` on
+///     `recompute_all`). The arg-descent is now gated on the call being LIVE (a matching-arity
+///     callee flows here -- the SAME arity predicate the loop below uses, so the analysis's
+///     arg-descent <=> the walker's `live_calls` arg-walk), mirroring eval (`invoke_lambda`
+///     returns `#VALUE!` BEFORE the arg loop, so a dead call's args -- and any invocation
+///     nested in them -- are never evaluated). Pins flipped to
+///     `fu_next4_invoked_lambda_in_dead_call_arg_is_dropped` (+ `..._no_circ`).
 ///
 /// **FU-NEXT-3 (2026-06-23) CLOSED the name-merge residual** (Codex FU-NEXT HIGH-2): the
 /// closure environment is now keyed by lexical [`BindingSite`], not bare name, so a name
@@ -1024,8 +1047,8 @@ fn discover<'a>(
 /// walker's `CallLambda` arm now gates arg-walking on [`InvokedBodies::call_is_live`] -- a
 /// call's args are walked IFF a matching-arity lambda flows to the callee (`st.live_calls`),
 /// so `=LET(f,LAMBDA(x,1),f(B1,0))` no longer over-reports its direct arg B1 (`invoke_lambda`
-/// returns `#VALUE!` BEFORE evaluating the args). The invocation-marking face (the residual
-/// above) remains.
+/// returns `#VALUE!` BEFORE evaluating the args). The invocation-marking face is now also
+/// CLOSED by FU-NEXT-4 (see above) -- `discover`'s arg-descent gates on the same liveness.
 fn invoked_lambda_bodies(root: &ExprPlan, registry: &FunctionRegistry) -> InvokedBodies {
     let mut lambdas = HashMap::new();
     collect_lambdas(root, &mut lambdas);
