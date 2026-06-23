@@ -410,9 +410,21 @@ impl FormulaDeps {
 /// eval (an uninvoked `LAMBDA` literal surfaces `#CALC!`; its closure is created
 /// without evaluating the body), so its cell/range/UDF refs are NOT precedents.
 enum InvokedBodies {
-    /// Precise: ONLY these lambda nodes are invoked. Every other lambda body is
-    /// never evaluated and must contribute no precedent.
-    Only(HashSet<*const ExprPlan>),
+    /// Precise: ONLY these lambda nodes are invoked, and ONLY these `CallLambda` nodes
+    /// are LIVE. Every other lambda body is never evaluated (contributes no precedent),
+    /// and every other `CallLambda`'s ARGS are never evaluated (so its arg subtrees
+    /// contribute no precedent -- FU-NEXT-2 live-call arg gating). Both sets are keyed by
+    /// node address within the SAME plan tree the analysis ran on (pointer identity).
+    Only {
+        /// `ExprPlan::Lambda` nodes whose body is evaluated along some eval path.
+        invoked: HashSet<*const ExprPlan>,
+        /// `ExprPlan::CallLambda` nodes whose callee can resolve to a matching-arity
+        /// lambda -- i.e. eval reaches the arg-eval loop and DOES evaluate the args.
+        /// A call NOT in this set is provably dead (`invoke_lambda` returns before the
+        /// arg loop on a non-callable callee or arity mismatch), so its args are NOT
+        /// precedents.
+        live_calls: HashSet<*const ExprPlan>,
+    },
     /// Conservative fallback: the closure-flow fixpoint hit its work bound, so treat
     /// EVERY lambda body as invoked — the pre-FU-NEXT over-approximation. This is the
     /// SAFE direction (it never *under*-reports an invoked body, so it can never drop a
@@ -427,7 +439,23 @@ impl InvokedBodies {
     fn contains(&self, lambda: &ExprPlan) -> bool {
         match self {
             InvokedBodies::All => true,
-            InvokedBodies::Only(set) => set.contains(&(lambda as *const ExprPlan)),
+            InvokedBodies::Only { invoked, .. } => invoked.contains(&(lambda as *const ExprPlan)),
+        }
+    }
+
+    /// **FU-NEXT-2 (2026-06-22):** is the `ExprPlan::CallLambda` node `call` LIVE -- i.e.
+    /// does eval reach its arg-eval loop? `eval`'s `invoke_lambda` (`scalar.rs`) returns
+    /// `#VALUE!`/`#CALC!` BEFORE evaluating any arg when the callee is non-callable or the
+    /// arity mismatches, so a NON-live call never reads its args and the walker must NOT
+    /// register them as precedents. `All` (budget bail) treats every call as live -- the
+    /// SAFE over-approximation (walk every arg). `call` must be a node from the SAME plan
+    /// tree the analysis ran on (pointer identity), exactly like [`contains`].
+    fn call_is_live(&self, call: &ExprPlan) -> bool {
+        match self {
+            InvokedBodies::All => true,
+            InvokedBodies::Only { live_calls, .. } => {
+                live_calls.contains(&(call as *const ExprPlan))
+            }
         }
     }
 }
@@ -436,6 +464,15 @@ impl InvokedBodies {
 struct InvokeAnalysis<'a> {
     /// Lambda nodes (by address) discovered invoked so far.
     invoked: HashSet<*const ExprPlan>,
+    /// **FU-NEXT-2 (2026-06-22):** `CallLambda` nodes (by address) discovered LIVE so far
+    /// -- a matching-arity lambda flows to the callee, so eval evaluates the call's args.
+    /// PERSISTENT and monotone, exactly like `invoked` (NOT cleared per round, unlike
+    /// `descended`): a call's liveness can flip dead->live across rounds (capture-before-
+    /// use, a body descended late), and the converged (`!changed`) round re-traverses
+    /// every invoked body with the fully-grown `bound`, so every reachable live call is
+    /// re-inserted by return -- complete WITHOUT tying inserts to `changed` (which would
+    /// risk pushing pathological formulas over the round cap into the `All` over-approx).
+    live_calls: HashSet<*const ExprPlan>,
     /// Context-insensitive closure environment: a local NAME → the set of lambda
     /// nodes it may be bound to (across ALL bindings of that name — LET vars and
     /// LAMBDA params). Merging by name is a sound over-approximation: a `LocalRef`
@@ -629,6 +666,16 @@ fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &Func
                 else {
                     continue;
                 };
+                // **FU-NEXT-2 (2026-06-22) -- live-call arg gating.** A matching-arity
+                // callee flows here, so `invoke_lambda` reaches its arg-eval loop and DOES
+                // evaluate this call's args -- mark the CALL NODE live so the walker walks
+                // its arg subtrees. A call NOT marked live is provably dead (no member of
+                // `closures_of(callee)` -- a SOUND over-approximation of the real eval-time
+                // closure -- has matching arity, so eval returns `#VALUE!`/`#CALC!` BEFORE
+                // the arg loop), and its args are dropped. Idempotent; NOT tied to
+                // `changed` (the converged round re-inserts every reachable live call --
+                // see `InvokeAnalysis::live_calls`).
+                st.live_calls.insert(plan as *const ExprPlan);
                 if st.invoked.insert(*lp) {
                     st.changed = true;
                 }
@@ -750,33 +797,49 @@ fn discover<'a>(plan: &'a ExprPlan, st: &mut InvokeAnalysis<'a>, registry: &Func
 /// preserving arms and the param/LET propagation only ever GROWS `bound`, so the fixpoint
 /// over-approximates; the budget bail is to `All` (walk everything), preserving the floor.
 ///
-/// **Known residual over-report CLASS (NOT under-report).** A few contrived shapes still
-/// mark a lambda invoked (or walk a call's args) when eval does not run it — each an
-/// OVER-report that can re-open the three faces (spurious `#CIRC!` / stale volatility /
-/// worker-less-load stale-UDF preserve), each STRICTLY NARROWER than the pre-FU-NEXT
-/// walk-everything behavior, and NONE an under-report (a live lambda's deps are always
-/// kept):
+/// **Known residual over-reports (NOT under-reports).** A few contrived shapes still mark a
+/// lambda invoked when eval does not run it -- each an OVER-report that can re-open the three
+/// faces (spurious `#CIRC!` / stale volatility / worker-less-load stale-UDF preserve), each
+/// STRICTLY NARROWER than the pre-FU-NEXT walk-everything behavior, and NONE an under-report
+/// (a live lambda's deps are always kept):
 ///   1. **name-merge vs capture** (Codex FU-NEXT HIGH-2): the `bound` map is keyed by NAME
-///      (context-insensitive), so a name bound to a lambda, CAPTURED by another lambda,
-///      then REBOUND to a different never-invoked lambda, merges both — marking the
-///      rebound lambda invoked. Pinned by
-///      `name_merge_capture_vs_rebind_over_preserve_known_residual` (+ `..._reopens_circ_face`).
-///   2. **non-callable / wrong-arity `CallLambda` args** (Codex re-audit #4): the walker's
-///      `CallLambda` arm walks its args even when the callee is not callable or the arity
-///      mismatches, though `invoke_lambda` returns `#VALUE!` before evaluating them
-///      (`=LET(f,LAMBDA(x,1),f(B1,0))`). The lambda BODY is correctly gated (the arity
-///      filter), but the ARG subtrees are not.
-/// The durable fix for the whole class is a context-SENSITIVE analysis (per-lambda captured
-/// environments + live-call gating of args) — deferred.
+///      (context-insensitive), so a name bound to a lambda, CAPTURED by another lambda, then
+///      REBOUND to a different never-invoked lambda, merges both -- marking the rebound lambda
+///      invoked. Pinned by `name_merge_capture_vs_rebind_over_preserve_known_residual`
+///      (+ `..._reopens_circ_face`).
+///   2. **invocation-marking through a DEAD call** (Codex FU-NEXT-2 megaudit): `discover`
+///      descends a `CallLambda`'s args UNCONDITIONALLY (to find invocations for the fixpoint),
+///      so a matching-arity inner call nested in a DEAD outer call (`f(g(C1),0)` where `f` is
+///      wrong-arity) still marks the inner lambda `g` invoked -- and the walker walks g's
+///      BINDING body, over-reporting its cells (`g=LAMBDA(y,B1)` -> B1). At eval the outer call
+///      returns `#VALUE!` before evaluating `g(C1)`, so g is never invoked. Pinned by
+///      `fu_next2_invoked_lambda_in_dead_call_arg_overreports_body_known_residual`.
+/// Both are over-approximations of the `invoked` set; the durable fix is a context-SENSITIVE
+/// analysis (per-lambda captured environments + gating discover's arg-descent on call liveness)
+/// -- deferred.
+///
+/// **FU-NEXT-2 (2026-06-22) closed the ARG-WALK face** of the old wrong-arity residual: the
+/// walker's `CallLambda` arm now gates arg-walking on [`InvokedBodies::call_is_live`] -- a
+/// call's args are walked IFF a matching-arity lambda flows to the callee (`st.live_calls`),
+/// so `=LET(f,LAMBDA(x,1),f(B1,0))` no longer over-reports its direct arg B1 (`invoke_lambda`
+/// returns `#VALUE!` BEFORE evaluating the args). The invocation-marking face (residual 2
+/// above) remains.
 fn invoked_lambda_bodies(root: &ExprPlan, registry: &FunctionRegistry) -> InvokedBodies {
     let mut lambdas = HashMap::new();
     collect_lambdas(root, &mut lambdas);
     if lambdas.is_empty() {
-        return InvokedBodies::Only(HashSet::new());
+        // No lambdas -> no callee can ever be `Callable`, so every `CallLambda` is
+        // provably dead (its args are never evaluated) -> empty `live_calls` is correct
+        // (FU-NEXT-2): the walker suppresses those args, which are read nowhere at eval.
+        return InvokedBodies::Only {
+            invoked: HashSet::new(),
+            live_calls: HashSet::new(),
+        };
     }
     let n = lambdas.len();
     let mut st = InvokeAnalysis {
         invoked: HashSet::new(),
+        live_calls: HashSet::new(),
         bound: HashMap::new(),
         lambdas,
         changed: false,
@@ -796,7 +859,10 @@ fn invoked_lambda_bodies(root: &ExprPlan, registry: &FunctionRegistry) -> Invoke
             return InvokedBodies::All;
         }
         if !st.changed {
-            return InvokedBodies::Only(st.invoked);
+            return InvokedBodies::Only {
+                invoked: st.invoked,
+                live_calls: st.live_calls,
+            };
         }
     }
     // Did not converge within the round cap — conservative.
@@ -1086,10 +1152,20 @@ fn walk_plan_for_deps_inner(
             }
         }
         // **Wave P (2026-06-20):** an invocation depends on its callee and args.
+        // **FU-NEXT-2 (2026-06-22) -- live-call arg gating.** The CALLEE is ALWAYS walked
+        // (eval always evaluates it). The ARGS are walked IFF the call is LIVE: a callee
+        // that resolves to a matching-arity lambda. On a non-callable callee or arity
+        // mismatch, `invoke_lambda` (`scalar.rs`) returns `#VALUE!`/`#CALC!` BEFORE the
+        // arg-eval loop, so a DEAD call never reads its args -- suppressing them removes a
+        // spurious precedent (e.g. `=LET(f,LAMBDA(x,1),f(B1,0))` no longer self-edges B1).
+        // This can ONLY drop deps from PROVABLY-dead calls (`call_is_live` is the precise
+        // over-approximation; `All` walks every arg) -- never an under-report.
         ExprPlan::CallLambda { callee, args } => {
             walk_plan_for_deps_inner(callee, deps, registry, invoked);
-            for a in args {
-                walk_plan_for_deps_inner(a, deps, registry, invoked);
+            if invoked.call_is_live(plan) {
+                for a in args {
+                    walk_plan_for_deps_inner(a, deps, registry, invoked);
+                }
             }
         }
     }

@@ -751,20 +751,21 @@ fn wrong_arity_curry_does_not_leak_returned_closure() {
 }
 
 #[test]
-fn wrong_arity_call_args_over_walked_known_residual() {
-    // **Codex FU-NEXT re-audit #4 — DOCUMENTED RESIDUAL (over-report, non-blocking).** The
-    // arity filter gates the lambda BODY, but the walker's `CallLambda` arm still walks the
-    // call's ARG subtrees unconditionally. `=LET(f,LAMBDA(x,1),f(B1,0))` is a wrong-arity
-    // call → `invoke_lambda` returns `#VALUE!` BEFORE evaluating the args, so B1 is not
-    // actually read; but the walker records B1 (the owning cell) as a precedent → a
-    // spurious self-edge. This PINS the over-report (B1 IS recorded). It is NEVER an
-    // under-report; the durable fix (live-call gating of args) is part of the deferred
-    // context-sensitive analysis — see `invoked_lambda_bodies`' residual note.
-    let deps = formula_deps_for("LET(f,LAMBDA(x,1),f(B1,0))").expect("has deps (B1 arg)");
+fn wrong_arity_call_args_are_not_walked() {
+    // **FU-NEXT-2 (2026-06-22) -- CLOSES Codex FU-NEXT re-audit #4 (was a documented
+    // residual).** `=LET(f,LAMBDA(x,1),f(B1,0))` is a wrong-arity call (f takes 1 param,
+    // called with 2 args) -> `invoke_lambda` returns `#VALUE!` BEFORE evaluating the args,
+    // so B1 is never read. The walker's `CallLambda` arm now gates arg-walking on
+    // `call_is_live`: this DEAD call's args are NOT walked, so B1 is no longer over-reported
+    // as a (self-edge) precedent. The body `1` reads nothing, so the formula has NO deps
+    // and `formula_deps_for` returns `None`. (Flipped from the old
+    // `_over_walked_known_residual` pin, which asserted B1 WAS recorded.)
+    let deps = formula_deps_for("LET(f,LAMBDA(x,1),f(B1,0))");
     assert!(
-        deps.cells.contains(&(0, 0, 1)),
-        "RESIDUAL: the wrong-arity call's B1 arg is over-walked (live-call arg gating \
-         closes this); got {deps:?}"
+        deps.as_ref()
+            .map_or(true, |d| !d.cells.contains(&(0, 0, 1))),
+        "FU-NEXT-2: the wrong-arity (dead) call's B1 arg must NOT be walked -- eval returns \
+         #VALUE! before reading it; got {deps:?}"
     );
 }
 
@@ -2529,5 +2530,197 @@ fn fu4c_c3_rows_over_array_local_seq_arg_cell_ref_in_deps() {
         deps.cells.iter().any(|&(s, r, c)| (s, r, c) == (0, 0, 0)),
         "$A$1 inside the ReferenceAware-fn LET binding must be a precedent; got {:?}",
         deps.cells
+    );
+}
+
+// =============================================================================
+// FU-NEXT-2 (2026-06-22): live-call arg gating. The walker's CallLambda arm walks
+// a call's ARG subtrees IFF the call is LIVE (the callee resolves to a matching-arity
+// lambda, so eval reaches the arg-eval loop). A provably-DEAD call (non-callable callee
+// or arity mismatch) returns #VALUE!/#CALC! BEFORE evaluating its args (invoke_lambda,
+// scalar.rs), so its args are never read -- the walker no longer over-reports them. The
+// callee is ALWAYS walked. This can ONLY drop deps from provably-dead calls -- never an
+// under-report (a live call's args are always walked; the `All` budget bail walks all).
+// Closes Codex FU-NEXT re-audit #4 (the wrong-arity-args residual class). The flipped pin
+// is `wrong_arity_call_args_are_not_walked` above.
+// =============================================================================
+
+#[test]
+fn fu_next2_live_call_arg_cell_is_a_precedent() {
+    // **The key new LIVE guard.** No prior pin has a CELL as the ARG of a live call.
+    // `LET(f,LAMBDA(x,x),f(A1))` -- f is 1-param, called with 1 arg -> LIVE. The arg A1
+    // is eagerly evaluated and returned (body `x` is a LocalRef, no grid dep of its own),
+    // so A1 IS a precedent and MUST be walked. An under-report here would be the cardinal
+    // sin (editing A1 would silently stale B1).
+    let deps = formula_deps_for("LET(f,LAMBDA(x,x),f(A1))").expect("live call has the A1 arg dep");
+    assert!(
+        deps.cells.contains(&(0, 0, 0)),
+        "a LIVE call's cell arg A1 must stay a precedent (the gate must not over-suppress); \
+         got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next2_live_call_composite_arg_keeps_both_cells() {
+    // A live call's arg is a whole subtree -- `LET(f,LAMBDA(x,x),f(A1+C1))` -> both A1 and
+    // C1 (=(0,0,2)) are walked. Proves the arg subtree is walked in full when the call is live.
+    let deps =
+        formula_deps_for("LET(f,LAMBDA(x,x),f(A1+C1))").expect("live call has both arg deps");
+    assert!(
+        deps.cells.contains(&(0, 0, 0)) && deps.cells.contains(&(0, 0, 2)),
+        "both cells in a LIVE call's composite arg must stay precedents; got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next2_live_curried_call_arg_is_a_precedent() {
+    // The curry ARG of a live call. `LET(mk,LAMBDA(a,LAMBDA(b,b)),mk(A1)(2))` -- the inner
+    // call `mk(A1)` is live (mk is 1-param, 1 arg), so its arg A1 is eagerly evaluated
+    // (bound to `a`, even though `a` is unused in the returned body `b`) -> A1 IS read at
+    // eval -> a precedent. The outer call `(...)(2)` is live too (returned lambda is
+    // 1-param). Isolates ARG-walking through a curried live call.
+    let deps =
+        formula_deps_for("LET(mk,LAMBDA(a,LAMBDA(b,b)),mk(A1)(2))").expect("curried arg dep");
+    assert!(
+        deps.cells.contains(&(0, 0, 0)),
+        "the curry ARG A1 of a LIVE inner call must stay a precedent; got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next2_live_call_arg_recomputes_end_to_end() {
+    // Integration (positive cardinal-sin guard): `LET(f,LAMBDA(x,x),f(A1))` returns A1.
+    // A1=10 -> B1=10; edit A1 -> 20 -> B1 MUST recompute to 20 (attempted >= 1). A STALE 10
+    // means the live-call arg A1 was wrongly suppressed -- the cardinal sin.
+    let (mut wb, mut graph, reg) = setup("LET(f,LAMBDA(x,x),f(A1))", 10.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Number(10.0),
+        "initial B1 = A1 = 10"
+    );
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(20.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert!(
+        attempted >= 1,
+        "editing A1 must recompute the LIVE-call-arg formula (attempted == 0 means the live \
+         call's arg A1 was wrongly suppressed -- the cardinal sin)"
+    );
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Number(20.0),
+        "B1 must recompute to 20"
+    );
+}
+
+#[test]
+fn fu_next2_too_few_args_arg_not_walked() {
+    // DEAD via too-few args. `LET(f,LAMBDA(x,y,1),f(A1))` -- f takes 2 params, called with 1
+    // arg -> arity mismatch -> invoke_lambda returns #VALUE! before reading A1. The body `1`
+    // reads nothing, so A1 is the only candidate and it is suppressed -> NO deps -> None.
+    let deps = formula_deps_for("LET(f,LAMBDA(x,y,1),f(A1))");
+    assert!(
+        deps.as_ref()
+            .map_or(true, |d| !d.cells.contains(&(0, 0, 0))),
+        "a too-few-args (dead) call's A1 arg must NOT be walked; got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next2_non_callable_callee_arg_not_walked() {
+    // DEAD via non-callable callee, AND exercises the empty-lambdas early return: `LET(f,5,
+    // f(A1))` has ZERO Lambda nodes, so no callee can be Callable -> every CallLambda is
+    // provably dead -> A1 (only present as the call's arg) is suppressed. The binding `f,5`
+    // reads nothing. At eval `f` resolves to 5 -> invoke_lambda returns #VALUE! before A1.
+    let deps = formula_deps_for("LET(f,5,f(A1))");
+    assert!(
+        deps.as_ref()
+            .map_or(true, |d| !d.cells.contains(&(0, 0, 0))),
+        "a non-callable-callee (dead) call's A1 arg must NOT be walked; got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next2_nested_dead_call_suppresses_whole_arg_subtree() {
+    // Per-call-node granularity: `LET(f,LAMBDA(x,1),g,LAMBDA(y,y),f(g(C1),0))` -- the OUTER
+    // call f(g(C1),0) is dead (f is 1-param, called with 2 args), so its ENTIRE arg list is
+    // suppressed at the WALKER, INCLUDING the would-be-live inner `g(C1)`. At eval
+    // invoke_lambda(f) hits the arity gate and returns #VALUE! BEFORE evaluating g(C1), so C1
+    // (=(0,0,2)) is never read -> not a precedent. Proves the gate suppresses the dead call's
+    // ARG-WALK. NOTE g is still marked invoked via discover's unconditional arg-descent, so the
+    // walker walks g's body `y` (a LocalRef -> no grid dep HERE); the case where g's body reads
+    // a CELL is the separate documented over-report
+    // (`fu_next2_invoked_lambda_in_dead_call_arg_overreports_body_known_residual`).
+    let deps = formula_deps_for("LET(f,LAMBDA(x,1),g,LAMBDA(y,y),f(g(C1),0))");
+    assert!(
+        deps.as_ref()
+            .map_or(true, |d| !d.cells.contains(&(0, 0, 2))),
+        "the whole arg subtree of a DEAD outer call (incl. a nested would-be-live call) must \
+         NOT be walked; got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next2_dead_call_arg_not_a_precedent_end_to_end() {
+    // Integration (cardinal-sin / over-report removal): `LET(f,LAMBDA(x,1),f(A1,0))` is a
+    // wrong-arity call -> B1 = #VALUE!. A1 is NOT a precedent, so editing A1 recomputes
+    // NOTHING (attempted == 0). Pre-fix the over-walked A1 would have wrongly re-dirtied B1.
+    let (mut wb, mut graph, reg) = setup("LET(f,LAMBDA(x,1),f(A1,0))", 10.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Value),
+        "wrong-arity call -> B1 = #VALUE!"
+    );
+    let attempted = {
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(20.0)).unwrap();
+        rt.recompute_dirty().expect("graph attached").attempted
+    };
+    assert_eq!(
+        attempted, 0,
+        "the dead call's suppressed A1 arg is NOT a precedent, so editing A1 recomputes \
+         nothing; attempted == {attempted} means A1 was wrongly over-walked"
+    );
+}
+
+#[test]
+fn fu_next2_invoked_lambda_in_dead_call_arg_overreports_body_known_residual() {
+    // **Codex megaudit finding (DOCUMENTED RESIDUAL -- over-report, NOT under-report).**
+    // FU-NEXT-2 closes the ARG-WALK over-report (a dead call's args are no longer walked --
+    // see `fu_next2_nested_dead_call_suppresses_whole_arg_subtree`: C1, g's ARG, is dropped).
+    // A DISTINCT, narrower over-report remains in the INVOCATION-MARKING layer: `discover`
+    // descends a CallLambda's args UNCONDITIONALLY (to find invocations for the fixpoint), so a
+    // matching-arity inner call `g(C1)` nested in a DEAD outer call `f(g(C1),0)` still marks `g`
+    // INVOKED -- and the walker then walks g's BINDING body `LAMBDA(y,B1)` via the lambda-body
+    // gate, over-reporting B1 (a spurious self-edge -> possible #CIRC! on full recompute). At
+    // eval the wrong-arity outer call returns #VALUE! BEFORE evaluating g(C1), so g is never
+    // invoked and B1 is never read -- the correct dep set is {}. This is the SAME family as the
+    // name-merge residual (an over-approximate `invoked` set), NOT the arg-walk class FU-NEXT-2
+    // closed; the durable fix (gating discover's arg-descent on the parent call's liveness) is a
+    // riskier fixpoint change, deferred. NEVER an under-report. This pin FAILS the day that fix
+    // lands, making it deliberate.
+    let deps = formula_deps_for("LET(f,LAMBDA(x,1),g,LAMBDA(y,B1),f(g(C1),0))")
+        .expect("has the over-reported B1 dep");
+    assert!(
+        deps.cells.contains(&(0, 0, 1)),
+        "RESIDUAL: g (invoked-marked via a call inside a DEAD outer call) over-reports its body \
+         B1 (a context-sensitive invocation analysis closes this); got {deps:?}"
+    );
+}
+
+#[test]
+fn fu_next2_wrong_arity_self_edge_no_circ() {
+    // The #CIRC! face. `LET(f,LAMBDA(x,1),f(B1,0))` in B1 -- pre-fix B1 (the owning cell) was
+    // over-walked as the call's arg, creating a spurious self-edge that yields #CIRC! on
+    // recompute. FU-NEXT-2 suppresses the dead call's B1 arg -> no self-edge -> the real
+    // wrong-arity result #VALUE! (NOT #CIRC!). Mirrors the name-merge `_reopens_circ_face`
+    // pin for this class.
+    let (wb, _g, _r) = setup("LET(f,LAMBDA(x,1),f(B1,0))", 0.0);
+    assert_eq!(
+        wb.read(Address::new(0, 0, 1)),
+        Value::Error(ErrorValue::Value),
+        "no spurious self-edge -> the wrong-arity result #VALUE!, not #CIRC!"
     );
 }
