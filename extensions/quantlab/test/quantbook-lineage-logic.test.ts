@@ -16,6 +16,7 @@ import type { CellLineageJson } from '../src/quantbook/types';
 const queryBlock = (overrides: Partial<CellLineageJson> = {}): CellLineageJson => ({
 	sourceId: 'q1',
 	kind: 'query',
+	revision: 0n,
 	sql: 'SELECT A FROM S ORDER BY A',
 	producedSheet: 0,
 	producedStartRow: 0,
@@ -29,6 +30,7 @@ const queryBlock = (overrides: Partial<CellLineageJson> = {}): CellLineageJson =
 const publishedBlock = (overrides: Partial<CellLineageJson> = {}): CellLineageJson => ({
 	sourceId: 'prices',
 	kind: 'published',
+	revision: 0n,
 	producedSheet: 0,
 	producedStartRow: 0,
 	producedStartCol: 0,
@@ -95,7 +97,7 @@ suite('Wave L2 lineageLogic -- formatCellLineage', () => {
 	test('published cell -> summary names the dataset, detail carries NO SQL, reveal present', () => {
 		const p = formatCellLineage(publishedBlock(), 'B1');
 		assert.strictEqual(p.summary, 'B1: published dataset "prices" -> block A1:C1 (3 cells).');
-		assert.strictEqual(p.detail, p.summary, 'a published dataset has no SQL detail');
+		assert.ok(p.detail.startsWith(p.summary), 'detail leads with the summary');
 		assert.ok(!p.detail.includes('SQL'), 'published detail must not mention SQL');
 		assert.deepStrictEqual(p.reveal, { sheet: 0, row: 0, col: 0 });
 	});
@@ -106,5 +108,20 @@ suite('Wave L2 lineageLogic -- formatCellLineage', () => {
 			'A1',
 		);
 		assert.strictEqual(p.summary, 'A1: published dataset "prices" -> block A1 (1 cell).');
+	});
+
+	test('detail reports the lineage revision (advances on refresh) for query and published', () => {
+		const q = formatCellLineage(queryBlock({ revision: 3n }), 'C1');
+		assert.ok(q.detail.includes('Revision: 3'), 'query detail must report the revision');
+		const pub = formatCellLineage(publishedBlock({ revision: 5n }), 'B1');
+		assert.ok(pub.detail.includes('Revision: 5'), 'published detail must report the revision');
+		// A fresh (revision 0) cell still reports it explicitly -- never omitted.
+		assert.ok(formatCellLineage(queryBlock(), 'C1').detail.includes('Revision: 0'));
+	});
+
+	test('an unrecognized kind throws -- never silently rendered as a dataset (No-Fallbacks)', () => {
+		// The napi boundary delivers a raw string; a future/garbled kind must fail loud.
+		const bogus = queryBlock({ kind: 'mystery' as unknown as 'query' });
+		assert.throws(() => formatCellLineage(bogus, 'C1'), /unrecognized lineage kind/);
 	});
 });

@@ -48,8 +48,10 @@ export function lineageBlockA1(lineage: CellLineageJson): string {
  * of the focused cell whose lineage was read. Pure -- the command shell does the vscode I/O.
  *
  * - `null` (the cell was not produced by a tracked source) -> a clear "no lineage" message, no reveal.
- * - `kind === 'query'` -> the source query id, produced block, and the full SQL text in `detail`.
- * - `kind === 'published'` -> the source dataset id and produced block (a value matrix carries no SQL).
+ * - `kind === 'query'` -> the source query id, produced block, revision, and the full SQL text in `detail`.
+ * - `kind === 'published'` -> the source dataset id, produced block, and revision (a value matrix carries no SQL).
+ * - any other `kind` -> throws (No-Fallbacks): the napi boundary delivers a raw string, so an unrecognized
+ *   kind is a contract violation and must fail loud, never be silently rendered as a dataset.
  */
 export function formatCellLineage(lineage: CellLineageJson | null, cellA1: string): LineagePresentation {
 	if (lineage === null) {
@@ -59,13 +61,20 @@ export function formatCellLineage(lineage: CellLineageJson | null, cellA1: strin
 	const block = lineageBlockA1(lineage);
 	const reveal = { sheet: lineage.producedSheet, row: lineage.producedStartRow, col: lineage.producedStartCol };
 	const count = `${lineage.producedCells} cell${lineage.producedCells === 1 ? '' : 's'}`;
+	// `revision` is 0 at first materialization and advances on each refresh -- the cell's lineage freshness.
+	const revisionLine = `Revision: ${lineage.revision}`;
 	if (lineage.kind === 'query') {
 		const summary = `${cellA1}: SQL query "${lineage.sourceId}" -> block ${block} (${count}).`;
 		// A query source always stores its SQL; if it is somehow absent, say so loudly rather than
 		// printing "undefined" or silently dropping the line (No-Fallbacks).
 		const sql = lineage.sql !== undefined && lineage.sql.length > 0 ? lineage.sql : '(no SQL recorded)';
-		return { summary, detail: `${summary}\nSQL:\n${sql}`, reveal };
+		return { summary, detail: `${summary}\n${revisionLine}\nSQL:\n${sql}`, reveal };
 	}
-	const summary = `${cellA1}: published dataset "${lineage.sourceId}" -> block ${block} (${count}).`;
-	return { summary, detail: summary, reveal };
+	if (lineage.kind === 'published') {
+		const summary = `${cellA1}: published dataset "${lineage.sourceId}" -> block ${block} (${count}).`;
+		return { summary, detail: `${summary}\n${revisionLine}`, reveal };
+	}
+	// No-Fallbacks: never silently treat an unrecognized kind as a published dataset.
+	const unknownKind: never = lineage.kind;
+	throw new Error(`formatCellLineage: unrecognized lineage kind ${JSON.stringify(unknownKind)} for ${cellA1}`);
 }

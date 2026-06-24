@@ -1990,10 +1990,14 @@ export interface DirtyResultJson {
  * never `null`. The `produced*` fields are the inclusive bounds of the cells the
  * source ACTUALLY produced (its materialized footprint, NOT the larger declared
  * target) -- the IDE highlights/reveals this rectangle as the source block.
+ * `revision` is `0` at first materialization and advances on each `refresh_source`
+ * (a JS `bigint`, mirroring the engine `u64` revision domain) -- the cell's
+ * lineage freshness.
  */
 export interface CellLineageJson {
 	sourceId: string;
 	kind: 'query' | 'published';
+	revision: bigint;
 	sql?: string;
 	producedSheet: number;
 	producedStartRow: number;
