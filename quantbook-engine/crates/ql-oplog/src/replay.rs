@@ -321,6 +321,21 @@ pub enum ReplayError {
     /// an idempotent no-op, not this error — mirroring `DropTable`.)
     #[error("replay update-chart references unknown chart id {id} at op index {index}")]
     ChartNotFound { index: usize, id: u32 },
+
+    /// **Tier C2 (Phase 4 v2 backlog, 2026-06-24):** an `Op::BatchCommit`
+    /// tree nested deeper than [`MAX_REPLAY_BATCH_DEPTH`]. `apply_op` recurses
+    /// once per `BatchCommit` level, so a hostile or corrupt `.qbook` with a
+    /// deeply-nested batch (`BatchCommit{[BatchCommit{[ … ]}]}`) would
+    /// otherwise overflow the replay thread's stack. Before this guard the
+    /// ONLY thing bounding the recursion was `serde_json`'s default 128-level
+    /// deserialize limit — which does not protect programmatically-built logs
+    /// or a future deserializer with a higher cap. `depth` is the level at
+    /// which the limit tripped. Legitimate producer batches nest one level.
+    #[error(
+        "replay batch nesting too deep at op index {index}: reached depth {depth} \
+         (max {max})"
+    )]
+    BatchDepthExceeded { index: usize, depth: u32, max: u32 },
 }
 
 /// Wrapper around `ql_storage::FormatTableError` that owns its strings,
@@ -482,7 +497,7 @@ pub fn replay_into(
     let mut count = 0;
     for (index, op_result) in log.iter().enumerate() {
         let op = op_result.map_err(|e| ReplayError::Deserialize(index, e))?;
-        apply_op(&op, workbook, index)?;
+        apply_op(&op, workbook, index, 0)?;
         count += 1;
     }
     Ok(count)
@@ -561,16 +576,47 @@ pub fn apply_ops_in_range(
             None => break,
         };
         let op = op_result.map_err(|e| ReplayError::Deserialize(index, e))?;
-        apply_op(&op, workbook, index)?;
+        apply_op(&op, workbook, index, 0)?;
         count += 1;
     }
     Ok(count)
 }
 
+/// **Tier C2 (Phase 4 v2 backlog, 2026-06-24):** maximum `Op::BatchCommit`
+/// nesting depth `apply_op` will descend before bailing with
+/// [`ReplayError::BatchDepthExceeded`].
+///
+/// Legitimate producer batches nest exactly one level (a structural edit
+/// plus its formula-rewrite ops), so 64 is a generous ceiling — and it
+/// matches the engine's existing `MAX_LAMBDA_DEPTH = 64` precedent.
+///
+/// Ordering vs serde on the LOAD path (corrected per audit): each
+/// `BatchCommit` is ~2 JSON nesting levels, so `serde_json`'s default
+/// 128-level deserialize recursion limit already rejects a persisted batch
+/// nested beyond ~64 levels during `OpLog::iter`/`get` — i.e. BEFORE
+/// `apply_op` ever recurses. This guard therefore does NOT fire first on the
+/// `.qbook` load path; it is DEFENSE-IN-DEPTH for callers that reach
+/// `apply_op` WITHOUT a serde round-trip (programmatically-built logs, or a
+/// future deserializer configured with a higher cap). See
+/// [`ReplayError::BatchDepthExceeded`].
+const MAX_REPLAY_BATCH_DEPTH: u32 = 64;
+
 /// Recursive helper. `index` is the op's position in the outer log (or
 /// the synthetic position of the enclosing BatchCommit for nested ops —
 /// 2A.3.a flattens by reporting the parent's index for nested failures).
-fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), ReplayError> {
+/// `depth` is the current `Op::BatchCommit` nesting level (0 at the top
+/// level); only the `BatchCommit` arm increments it. Guarded against
+/// unbounded recursion by [`MAX_REPLAY_BATCH_DEPTH`].
+fn apply_op(op: &Op, workbook: &mut Workbook, index: usize, depth: u32) -> Result<(), ReplayError> {
+    // Tier C2 DoS guard: a deeply-nested `BatchCommit` (hostile/corrupt log)
+    // would otherwise overflow this thread's stack — one frame per level.
+    if depth > MAX_REPLAY_BATCH_DEPTH {
+        return Err(ReplayError::BatchDepthExceeded {
+            index,
+            depth,
+            max: MAX_REPLAY_BATCH_DEPTH,
+        });
+    }
     match op {
         Op::PutValue {
             sheet,
@@ -1159,7 +1205,7 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             // so it is itself atomic over its own clone).
             let mut staged = workbook.clone();
             for inner_op in ops {
-                apply_op(inner_op, &mut staged, index)?;
+                apply_op(inner_op, &mut staged, index, depth + 1)?;
             }
             *workbook = staged;
             Ok(())
@@ -3767,6 +3813,140 @@ mod tests {
         replay_into(&log, &mut wb, &reg).unwrap();
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(1.0));
         assert_eq!(wb.read(Address::new(0, 1, 0)), Value::Number(2.0));
+    }
+
+    // ===== Tier C2 (Phase 4 v2 backlog): BatchCommit replay depth guard =====
+    //
+    // These call `apply_op` DIRECTLY with a hand-built (non-serde) Op tree.
+    // That is the only way to reach the guard: the public `replay_into` path
+    // deserializes each op via `serde_json` (`OpLog::iter`), whose own
+    // recursion limit rejects deeply-nested batches first (each `BatchCommit`
+    // is several JSON levels). The guard is the defense-in-depth backstop for
+    // non-serde callers / a future deserializer with a higher cap — exactly
+    // C2's "don't rely on serde's default" intent. (`replay_into`'s end-to-end
+    // loudness on deep input is covered in `tests/replay_depth_guard.rs`.)
+
+    /// `BatchCommit{[BatchCommit{[ … PutValue(A1=1) … ]}]}` nested `depth`
+    /// levels deep, built ITERATIVELY so constructing it never recurses.
+    fn nest_batch(depth: usize) -> Op {
+        let mut op = Op::PutValue {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: CellWireValue::Number(1.0),
+        };
+        for _ in 0..depth {
+            op = Op::BatchCommit { ops: vec![op] };
+        }
+        op
+    }
+
+    /// Run `apply_op` on a `nest_batch(depth)` tree on a generous-stack worker
+    /// thread, so the at-limit OK case exercises the guard logic without the
+    /// test harness's own default stack being the variable under test (the
+    /// guard bounds live recursion regardless). The deep tree is dropped inside
+    /// the worker too, so its recursive `Drop` is also off the harness stack.
+    fn apply_nested_batch(depth: usize) -> Result<Workbook, ReplayError> {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let mut wb = fresh_workbook_with_one_sheet();
+                apply_op(&nest_batch(depth), &mut wb, 0, 0).map(|()| wb)
+            })
+            .expect("spawn worker thread")
+            .join()
+            .expect("worker thread panicked / overflowed its stack")
+    }
+
+    #[test]
+    fn apply_op_allows_batch_at_max_depth() {
+        // Nesting exactly to the cap reaches the innermost PutValue at recursion
+        // depth == MAX (rejection is strictly `depth > MAX`), so it applies.
+        let wb = apply_nested_batch(MAX_REPLAY_BATCH_DEPTH as usize)
+            .expect("batch nested exactly at the cap should apply");
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(1.0));
+    }
+
+    #[test]
+    fn apply_op_rejects_batch_one_over_max_depth() {
+        let err = apply_nested_batch(MAX_REPLAY_BATCH_DEPTH as usize + 1)
+            .expect_err("batch nested one past the cap must be rejected");
+        match err {
+            ReplayError::BatchDepthExceeded { depth, max, .. } => {
+                assert_eq!(max, MAX_REPLAY_BATCH_DEPTH);
+                assert!(
+                    depth > max,
+                    "reported depth {depth} should exceed max {max}"
+                );
+            }
+            other => panic!("expected BatchDepthExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_op_rejects_pathologically_deep_batch() {
+        // Far past the cap: the guard bails after ~MAX frames and returns a
+        // typed error instead of recursing the full depth. Returning at all
+        // (no abort) is the regression.
+        let err = apply_nested_batch(2_000).expect_err("deep batch must be rejected");
+        assert!(
+            matches!(err, ReplayError::BatchDepthExceeded { .. }),
+            "expected BatchDepthExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn batch_depth_guard_error_leaves_workbook_untouched() {
+        // Rollback atomicity under the BatchDepthExceeded path: a too-deep
+        // batch wraps a PutValue; the guard fires before any inner op applies,
+        // and every staged clone is discarded on the `?` unwind. So a
+        // pre-seeded cell is unchanged AND the would-be-written cell stays
+        // blank. (Audit Lane B LOW: close the coverage gap for the guard error
+        // path specifically — distinct from the existing InvalidSheet
+        // half-failure rollback tests.)
+        let (a1, b1) = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let mut wb = fresh_workbook_with_one_sheet();
+                // Pre-seed A1 directly (depth 0, applies).
+                apply_op(
+                    &Op::PutValue {
+                        sheet: 0,
+                        row: 0,
+                        col: 0,
+                        value: CellWireValue::Number(7.0),
+                    },
+                    &mut wb,
+                    0,
+                    0,
+                )
+                .expect("pre-seed A1");
+                // A too-deep batch whose innermost op would write B1.
+                let mut deep = Op::PutValue {
+                    sheet: 0,
+                    row: 0,
+                    col: 1,
+                    value: CellWireValue::Number(9.0),
+                };
+                for _ in 0..(MAX_REPLAY_BATCH_DEPTH as usize + 1) {
+                    deep = Op::BatchCommit { ops: vec![deep] };
+                }
+                let err =
+                    apply_op(&deep, &mut wb, 0, 0).expect_err("too-deep batch must be rejected");
+                assert!(
+                    matches!(err, ReplayError::BatchDepthExceeded { .. }),
+                    "expected BatchDepthExceeded, got {err:?}"
+                );
+                (
+                    wb.read(Address::new(0, 0, 0)),
+                    wb.read(Address::new(0, 0, 1)),
+                )
+            })
+            .expect("spawn worker thread")
+            .join()
+            .expect("worker thread panicked / overflowed its stack");
+        assert_eq!(a1, Value::Number(7.0), "pre-seeded A1 must be unchanged");
+        assert_eq!(b1, Value::Blank, "B1 must never have been written");
     }
 
     #[test]

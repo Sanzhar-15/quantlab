@@ -133,6 +133,18 @@ pub enum ParseError {
         bracket_content: String,
         reason: &'static str,
     },
+
+    /// **Tier B3 (Phase 4 v2 backlog, 2026-06-24):** the formula nests
+    /// deeper than [`MAX_PARSE_DEPTH`] recursive expression levels. Hostile
+    /// or pathological input (e.g. `((((…))))` or `SUM(SUM(SUM(…)))` a few
+    /// hundred deep) would otherwise overflow the parser thread's stack
+    /// (empirically ~200 levels on a 2 MiB stack — see
+    /// `tests/p412_b_pinpoint.rs`). Returning this typed error instead keeps
+    /// the failure loud and recoverable rather than a process `abort()`
+    /// (stack overflow is NOT catchable via `catch_unwind`). `max` is the
+    /// configured depth ceiling ([`MAX_PARSE_DEPTH`]) that the input exceeded.
+    #[error("formula nesting too deep (exceeds max parse depth {max})")]
+    DepthExceeded { max: u32 },
 }
 
 /// Parse a complete formula from `tokens` (lexer output) to an AST.
@@ -147,14 +159,38 @@ pub fn parse(tokens: Vec<Token>) -> Result<Expr, ParseError> {
     Ok(e)
 }
 
+/// **Tier B3 (Phase 4 v2 backlog, 2026-06-24):** maximum recursive
+/// expression depth the parser will descend before bailing out with
+/// [`ParseError::DepthExceeded`].
+///
+/// Grounding: `tests/p412_b_pinpoint.rs` empirically shows ~100 nested
+/// parens / function calls parse cleanly on a tight 2 MiB stack (the
+/// macOS default thread size — the production floor) while ~200 overflow
+/// and `abort()` the process. That measurement is in DEBUG (larger frames
+/// than release), so it is the conservative bound. A ceiling of 100 leaves
+/// a ~2x margin below that overflow and sits comfortably above Excel's own
+/// documented 64-nested-function limit, so no formula Excel accepts is
+/// rejected here. Because the guard caps recursion, deep input now unwinds
+/// after at most this many frames instead of overflowing the stack.
+const MAX_PARSE_DEPTH: u32 = 100;
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Current recursive-descent depth of `parse_expr`. Incremented on
+    /// entry and decremented on exit of every `parse_expr` call (the single
+    /// choke point all deep recursion funnels through — parens, unary, `@`,
+    /// function args, and right-associative operator RHS all re-enter it).
+    depth: u32,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -169,11 +205,36 @@ impl Parser {
         t
     }
 
+    /// Pratt main loop entry point with the Tier B3 recursion-depth guard.
+    ///
+    /// Increments [`Parser::depth`] on entry, bails with
+    /// [`ParseError::DepthExceeded`] once it would exceed [`MAX_PARSE_DEPTH`],
+    /// and ALWAYS decrements on exit (Ok or Err) so `depth` tracks the live
+    /// recursion depth rather than a monotonic call count — a wide-but-shallow
+    /// formula like `SUM(1,2,…,1000)` calls this 1000 times but never deeper
+    /// than ~2, so it is unaffected. Every deep-recursion path (parens, unary
+    /// `-`/`+`, `@`, function args via `parse_call_args`, and right-associative
+    /// operator RHS) re-enters through this wrapper, so the cap lives in
+    /// exactly one place. `parse_expr_inner` holds the actual Pratt loop.
+    fn parse_expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
+        self.depth += 1;
+        let result = if self.depth > MAX_PARSE_DEPTH {
+            Err(ParseError::DepthExceeded {
+                max: MAX_PARSE_DEPTH,
+            })
+        } else {
+            self.parse_expr_inner(min_bp)
+        };
+        self.depth -= 1;
+        result
+    }
+
     /// Pratt main loop. `min_bp` is the right-binding-power required to continue
-    /// consuming infix operators.
+    /// consuming infix operators. Reached only via [`Parser::parse_expr`], which
+    /// owns the depth guard.
     #[allow(clippy::while_let_loop)] // Loop body has multi-branch control flow
                                      // (postfix/range/binary/terminator); clearer as `loop`.
-    fn parse_expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
+    fn parse_expr_inner(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_prefix(false)?;
         // Audit H3 fix (2026-05-12): track whether we already consumed a `:` so
         // `A:B:C` produces a parse error rather than silently merging spans via
@@ -540,6 +601,23 @@ impl Parser {
                     return Err(ParseError::DanglingBang {
                         name: name.as_ref().to_owned(),
                     });
+                }
+                // **Tier B3 (2026-06-24) — close the depth-guard bypass.** A
+                // chained sheet qualifier (`Sheet1!Sheet2!…`, which the lexer
+                // emits as repeated `SheetName, Bang` pairs) is ALWAYS invalid
+                // (Excel allows exactly one `Sheet!` per reference). Reject it
+                // HERE, before the recursive `parse_prefix(true)` below — this
+                // arm does NOT pass through the `parse_expr` depth guard, so a
+                // long chain (`A!A!A!…!A1`) would otherwise recurse once per
+                // qualifier and overflow the stack. Pre-fix, `DoubleSheetQualifier`
+                // was raised only on unwind, after N frames had already been
+                // entered (audit: Codex + 2 lanes, convergent BLOCKER). Same
+                // error, raised before the stack can grow.
+                if matches!(
+                    self.peek(),
+                    Some(Token::SheetName(_) | Token::QuotedSheetName(_))
+                ) {
+                    return Err(ParseError::DoubleSheetQualifier);
                 }
                 // FE-10: the inner term of `Sheet1!…` is a reference position —
                 // a bare column stays a column (`Sheet1!A`, `Sheet1!A:B`), never
@@ -2358,6 +2436,109 @@ mod tests {
     fn parse_err(src: &str) -> ParseError {
         let toks = crate::lex(src).unwrap_or_else(|e| panic!("lex({src:?}) failed: {e}"));
         parse(toks).unwrap_err()
+    }
+
+    // ===== Tier B3 (Phase 4 v2 backlog) — parser recursion-depth guard =====
+
+    /// `n` nested parens around `1`: `((( … 1 … )))`.
+    fn nested_parens(n: usize) -> String {
+        let mut s = String::with_capacity(2 * n + 1);
+        for _ in 0..n {
+            s.push('(');
+        }
+        s.push('1');
+        for _ in 0..n {
+            s.push(')');
+        }
+        s
+    }
+
+    /// `n` nested `SUM(`: `SUM(SUM( … SUM(1) … ))`.
+    fn nested_calls(n: usize) -> String {
+        let mut s = String::with_capacity(4 * n + 1);
+        for _ in 0..n {
+            s.push_str("SUM(");
+        }
+        s.push('1');
+        for _ in 0..n {
+            s.push(')');
+        }
+        s
+    }
+
+    #[test]
+    fn parse_depth_guard_rejects_deep_parens() {
+        // Far past any conceivable real formula AND past the ~200-level
+        // 2 MiB stack-overflow threshold. The point is that this RETURNS a
+        // typed error at all — a pre-guard parser would `abort()` here
+        // (stack overflow is not a catchable panic), killing the process.
+        let err = parse_err(&nested_parens(5_000));
+        assert!(
+            matches!(err, ParseError::DepthExceeded { max } if max == MAX_PARSE_DEPTH),
+            "expected DepthExceeded({MAX_PARSE_DEPTH}), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_depth_guard_rejects_deep_function_calls() {
+        let err = parse_err(&nested_calls(5_000));
+        assert!(
+            matches!(err, ParseError::DepthExceeded { max } if max == MAX_PARSE_DEPTH),
+            "expected DepthExceeded({MAX_PARSE_DEPTH}), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_depth_guard_rejects_deep_right_assoc_power() {
+        // `1^1^1^…` — `^` is right-associative, so each operator recurses
+        // through `parse_expr(rbp)`; this is the operator-chain DoS vector
+        // (distinct from the left-associative `1+1+1+…`, which is iterative
+        // and stays shallow — see the OK test below).
+        let chain = "1^".repeat(5_000) + "1";
+        let err = parse_err(&chain);
+        assert!(
+            matches!(err, ParseError::DepthExceeded { max } if max == MAX_PARSE_DEPTH),
+            "expected DepthExceeded({MAX_PARSE_DEPTH}), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_depth_guard_allows_nesting_below_limit() {
+        // ~90 nested calls reaches depth ~91 (< MAX_PARSE_DEPTH = 100), so it
+        // parses cleanly — the guard does not reject realistic deep formulas
+        // (Excel's own documented limit is 64 nested functions).
+        let expr = parse_ok(&nested_calls(90));
+        assert!(matches!(expr, Expr::Function { .. }));
+    }
+
+    #[test]
+    fn parse_depth_guard_does_not_reject_wide_shallow_formula() {
+        // A wide-but-shallow arg list calls `parse_expr` thousands of times
+        // but never deeper than ~2 — the depth counter is decremented on each
+        // exit, so this must NOT trip the guard.
+        let wide = "SUM(".to_owned() + &"1,".repeat(2_000) + "1)";
+        let expr = parse_ok(&wide);
+        match expr {
+            Expr::Function { name, args } => {
+                assert_eq!(name.as_ref(), "SUM");
+                assert_eq!(args.len(), 2_001);
+            }
+            other => panic!("expected SUM(...), got {other:?}"),
+        }
+    }
+
+    /// Left-associative chains (`1+1+1+…`) are built iteratively in the Pratt
+    /// loop, NOT via deep recursion, so even a long one stays shallow during
+    /// PARSE and must not trip the depth guard. (Length kept modest — 500 ≫ the
+    /// depth-100 guard, enough to prove it isn't counted — because the RESULT
+    /// is a left-leaning `Expr::Binary` tree whose recursive `Drop` runs on the
+    /// harness stack; a multi-thousand-deep tree would risk overflowing the
+    /// drop, not the parse. Audit: Codex LOW.)
+    #[test]
+    fn parse_depth_guard_does_not_reject_long_left_assoc_chain() {
+        let chain = "1".to_owned() + &"+1".repeat(500);
+        let expr = parse_ok(&chain);
+        assert!(matches!(expr, Expr::Binary { .. }));
     }
 
     #[test]
