@@ -4225,6 +4225,15 @@ impl WorkbookSession {
         kind: ProducerKind,
     ) {
         for &cell_addr in &produced {
+            // **R23 invariant:** a source materializes into ONE sheet, so every
+            // produced cell shares `target.sheet`. `cell_lineage` relies on this to
+            // anchor the produced-block bounding box to `addr.sheet`. Enforce it in
+            // debug/test builds (free in release) so a future cross-sheet producer
+            // trips here rather than silently mis-reporting a block.
+            debug_assert_eq!(
+                cell_addr.sheet, target.sheet,
+                "record_block_provenance: produced cell on a different sheet than the target"
+            );
             self.events.push(Event::Provenance {
                 addr: cell_addr,
                 source: source_id.to_string(),

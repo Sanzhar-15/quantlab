@@ -6326,6 +6326,11 @@ pub struct CellLineageJson {
     pub source_id: String,
     /// `"query"` (SQL-derived) or `"published"` (qb.publish value matrix).
     pub kind: String,
+    /// How many times the source has (re)written this cell: `0` at first
+    /// materialization, advanced by each `refresh_source`. Surfaced as a JS
+    /// `BigInt` (the `u64` revision domain), mirroring the engine `CellLineage`
+    /// — lets the IDE report a cell's lineage freshness.
+    pub revision: BigInt,
     /// The materialize SQL text — present only when `kind == "query"`.
     pub sql: Option<String>,
     /// Anchor sheet of the produced block.
@@ -8308,13 +8313,19 @@ impl Session {
                     ql_session::LineageKind::Query => "query".to_string(),
                     ql_session::LineageKind::Published => "published".to_string(),
                 },
+                revision: BigInt::from(l.revision),
                 sql: l.sql,
                 produced_sheet: u32::from(l.produced_range.sheet),
                 produced_start_row: l.produced_range.start_row,
                 produced_start_col: l.produced_range.start_col,
                 produced_end_row: l.produced_range.end_row,
                 produced_end_col: l.produced_range.end_col,
-                produced_cells: l.produced_cells as u32,
+                // `produced_cells` is bounded by `write_range`'s `MAX_CELLS = 1 << 20`
+                // (~1M), far below `u32::MAX`. Use a checked cast so that if a future
+                // path ever exceeds it, we fail LOUD (No-Fallbacks) instead of silently
+                // truncating the count.
+                produced_cells: u32::try_from(l.produced_cells)
+                    .expect("produced_cells exceeds u32::MAX (write_range caps at 1 << 20)"),
             }))
         })
     }
