@@ -26,15 +26,20 @@
 // applied or silently dropped.
 
 import { classifyCellInput } from '../cellGrid/cellGridLogic';
+import { tableColumnRejectionReason, tableIdentifierRejectionReason } from '../cellGrid/tableUiLogic';
 import type {
 	BorderEdgeJson,
+	CellRangeJson,
 	CellSnapshotJson,
 	FormatIdJson,
+	NamedRangeJson,
 	RgbJson,
 	SessionOpJson,
 	SheetInfoJson,
 	StyleIdJson,
 	StyleJson,
+	TableSpecJson,
+	UndoRedoResultJson,
 	WorkbookSnapshotJson,
 } from '../types';
 import {
@@ -81,6 +86,26 @@ export interface McpWriteSessionPort extends McpSessionPort {
 	deleteRows(sheet: number, start: number, end: number): void;
 	insertColumns(sheet: number, col: number, count: number): void;
 	deleteColumns(sheet: number, start: number, end: number): void;
+	/**
+	 * **Wave L (2026-06-24)**: the metadata-write surface (named ranges, sheets, tables) + the undo/redo
+	 * stack the MCP FE-6.1 tools drive. Each is a DIRECT napi call (NOT a cell `batch` op), invoked inside
+	 * the {@link PreparedWrite.commit} strategy under the SAME pipeline (trust + queue + modal + audit) as
+	 * the structural tools. `setName` upserts a Range name; `deleteName` takes the optional sheet `scope`
+	 * for a sheet-scoped name. `addSheet` takes the engine chunk size (the IDE default 1000).
+	 * `renameSheet`/`deleteSheet` key by sheet id. `createTable`/`dropTable` mirror the IDE table commands.
+	 * `undo`/`redo` return the owning Session's {@link UndoRedoResultJson} `{ consumed, version }` (NOT a bare
+	 * bool -- the result object is always truthy, so callers MUST read `.consumed`); an empty stack yields
+	 * `consumed: false`, a NORMAL outcome (engine convention) the tool reports as `applied: 0`, not an error.
+	 */
+	setName(name: string, target: CellRangeJson): void;
+	deleteName(name: string, scope?: number): void;
+	addSheet(name: string, chunkRows: number): void;
+	renameSheet(id: number, newName: string): void;
+	deleteSheet(id: number): void;
+	createTable(spec: TableSpecJson): void;
+	dropTable(name: string): void;
+	undo(): UndoRedoResultJson;
+	redo(): UndoRedoResultJson;
 }
 
 // --- limits ------------------------------------------------------------------------------------
@@ -251,8 +276,32 @@ export const RISK_LARGE_CELL_COUNT = 50;
  * grant. **FE-6 M (2026-06-12)**: `structural` is the SILENT-DATA-CORRUPTION reason -- it ALWAYS fires for
  * a structural edit (insert/delete rows/columns), which can re-point or drop formulas across the whole
  * sheet, so the operator ALWAYS sees the risk modal + the axis/range is recorded in the audit line.
+ * **Wave L (2026-06-24)**: `destructive_metadata` fires for a delete of a sheet / named range / table (an
+ * irreversible-feeling structural-metadata removal -- ALWAYS confirm); `rebind_name` fires when a
+ * `define_named_range` REPLACES an existing name (it silently re-points every formula resolving through
+ * that name -- confirm). A FRESH name definition (no prior name) and the additive metadata ops
+ * (add_sheet / rename_sheet / define_table) carry no reason and proceed under the standing trust grant.
  */
-export type WriteRiskReason = 'large' | 'destructive_clear' | 'formula_overwrite' | 'structural';
+export type WriteRiskReason = 'large' | 'destructive_clear' | 'formula_overwrite' | 'structural' | 'destructive_metadata' | 'rebind_name';
+
+/**
+ * **Wave L (2026-06-24)**: the metadata-write risk descriptor a prepare() computes ONCE and threads into
+ * {@link classifyWriteRisk} via `opts.metadata`. The host re-classifies with the SAME descriptor on apply
+ * (so the modal/audit reflect it). For `destructive` ops this is fully sound (state-independent: a delete is
+ * always destructive). For the `rebindName` (define-over-existing-name) verdict, the frozen flag could
+ * UNDER-prompt if the name is created between prepare and apply -- so `prepareDefineNamedRange`'s `commit`
+ * RE-CHECKS `listNames()` live and refuses LOUD (`risk_escalated`) on a fresh->rebind escalation; the agent
+ * retries and the next prepare prompts (the reverse, rebind->fresh, only over-consents -- harmless).
+ * `label` is the human description for the modal + audit summary (e.g. `deletes sheet "Data"`).
+ */
+export interface MetadataRiskInput {
+	/** A delete of a sheet / named range / table -- ALWAYS requires confirmation. */
+	readonly destructive?: boolean;
+	/** A `define_named_range` that replaces an EXISTING name -- requires confirmation (re-points refs). */
+	readonly rebindName?: boolean;
+	/** Human label for the risk summary, e.g. `deletes sheet "Data"`. */
+	readonly label: string;
+}
 
 /** The risk verdict for a built batch: the reasons + whether a modal confirmation is required. */
 export interface WriteRiskVerdict {
@@ -286,13 +335,22 @@ export type PriorCellReader = (sheet: number, row: number, col: number) => CellS
 export function classifyWriteRisk(
 	ops: readonly BuiltWriteOp[],
 	readPrior: PriorCellReader,
-	opts?: { structural?: boolean },
+	opts?: { structural?: boolean; metadata?: MetadataRiskInput },
 ): WriteRiskVerdict {
 	const reasons: WriteRiskReason[] = [];
 	if (opts?.structural === true) {
 		// SILENT-DATA-CORRUPTION class: ALWAYS prompt + record, regardless of op count (there are no
 		// cell-keyed ops for a structural edit). Pushed FIRST so the summary leads with it.
 		reasons.push('structural');
+	}
+	// Wave L: metadata-write reasons (delete sheet/name/table, or a name REBIND). Pushed before the
+	// cell-op reasons so the summary leads with the metadata description. Like `structural`, these have
+	// no cell-keyed ops -- the verdict comes entirely from the prepare-computed descriptor.
+	if (opts?.metadata?.destructive === true) {
+		reasons.push('destructive_metadata');
+	}
+	if (opts?.metadata?.rebindName === true) {
+		reasons.push('rebind_name');
 	}
 	if (ops.length >= RISK_LARGE_CELL_COUNT) {
 		reasons.push('large');
@@ -317,7 +375,7 @@ export function classifyWriteRisk(
 		reasons.push('formula_overwrite');
 	}
 	const requiresConfirmation = reasons.length > 0;
-	return { reasons, requiresConfirmation, summary: summarizeRisk(ops.length, reasons, opts?.structural === true) };
+	return { reasons, requiresConfirmation, summary: summarizeRisk(ops.length, reasons, opts?.structural === true, opts?.metadata?.label) };
 }
 
 /**
@@ -325,10 +383,17 @@ export function classifyWriteRisk(
  * structural edit has NO cell-keyed ops (`cellCount === 0`), so `structural` formats as a standalone
  * "structural edit (insert/delete rows or columns)" lead rather than the misleading "0 cell(s)".
  */
-export function summarizeRisk(cellCount: number, reasons: readonly WriteRiskReason[], structural = false): string {
+export function summarizeRisk(cellCount: number, reasons: readonly WriteRiskReason[], structural = false, metadataLabel?: string): string {
 	const parts: string[] = [];
 	if (reasons.includes('structural')) {
 		parts.push('structural edit (insert/delete rows or columns)');
+	}
+	// Wave L: a metadata-write RISK (delete sheet/name/table, or a name rebind) is described by its label
+	// so the modal + audit name the exact target. `metadataLabel` is always provided via the typed
+	// MetadataRiskInput.label; the `?? 'metadata change'` fallback only guards a raw direct call so the
+	// summary is never a misleading empty "0 cell(s): ".
+	if (reasons.includes('destructive_metadata') || reasons.includes('rebind_name')) {
+		parts.push(metadataLabel ?? 'metadata change');
 	}
 	if (reasons.includes('large')) {
 		parts.push('large batch');
@@ -342,6 +407,12 @@ export function summarizeRisk(cellCount: number, reasons: readonly WriteRiskReas
 	if (structural) {
 		// A structural edit is described by the axis/range in the audit target, not a cell count.
 		return reasons.length === 0 ? 'structural edit, no elevated risk' : parts.join(', ');
+	}
+	if (metadataLabel !== undefined) {
+		// Wave L: a metadata edit (named range / sheet / table / undo / redo) is described by its label, not
+		// a cell count. With no elevated-risk reason it still names the action ("defines name ..., no
+		// elevated risk"); with a reason the joined parts already lead with the destructive/rebind phrasing.
+		return reasons.length === 0 ? `${metadataLabel}, no elevated risk` : parts.join(', ');
 	}
 	if (reasons.length === 0) {
 		return `${cellCount} cell(s), no elevated risk`;
@@ -480,6 +551,13 @@ export interface PreparedWrite {
 	readonly target: string;
 	/** **FE-6 M**: forces the `structural` risk reason on the host's live re-classify (insert/delete). */
 	readonly structural?: boolean;
+	/**
+	 * **Wave L (2026-06-24)**: the metadata-write risk descriptor (named range / sheet / table / undo /
+	 * redo). The host threads it into the live re-classify so the modal/audit reflect it; it is static
+	 * (state-independent), so reproducing it on apply is sound. Present for every metadata write (carries
+	 * at least a `label`); the destructive/rebind flags drive the confirmation.
+	 */
+	readonly metadataRisk?: MetadataRiskInput;
 	/** **FE-6 M**: the napi apply strategy; when absent the host uses the default `batch(ops)` path. */
 	readonly commit?: (session: McpWriteSessionPort) => { applied: number };
 }
@@ -994,6 +1072,413 @@ export function prepareDeleteStructural(ctx: McpHostContext, kind: 'delete_rows'
 		return { applied: 1 };
 	};
 	return { grid, ops, risk, undoLabel, target, structural: true, commit };
+}
+
+// --- Wave L (2026-06-24): metadata writes (named ranges / sheets / tables / undo-redo) ----------
+//
+// Each is a DIRECT napi call (NOT a cell `batch` op), routed through the SAME pipeline (trust + queue +
+// modal + audit) as the structural tools via the `commit` strategy. `ops` is empty; risk comes entirely
+// from a prepare-computed {@link MetadataRiskInput} (delete -> destructive; name-replace -> rebind; the
+// additive ops + undo/redo carry only a label -> no modal). Every prepare names its action in `target`,
+// `undoLabel`, and the metadata `label` so the modal + audit are specific. No-Fallbacks: a malformed
+// argument / unknown sheet / unknown name throws a loud {@link McpToolError} before the queue is touched.
+
+/** Generous cap on a name string (defined name, sheet name, table name, table column name) at the MCP
+ *  boundary. The engine does the precise canonicalization + uniqueness validation (loud); this is a
+ *  defense-in-depth length guard. */
+export const MCP_MAX_NAME_LENGTH = 255;
+/** The engine sheet chunk size the IDE `addSheet` wrapper uses (mirror `../session.addSheet`'s default). */
+const MCP_SHEET_CHUNK_ROWS = 1000;
+
+/**
+ * Validate an UNTRUSTED name string (defined name / sheet name / table name / column name): a non-empty,
+ * not-all-whitespace string within the length cap. No-Fallbacks: a non-string, empty/all-whitespace, or
+ * over-length value throws `[bad_argument]`. Returns the value VERBATIM (no trimming) -- the engine owns
+ * canonicalization (uppercasing defined names, validating sheet-name chars), so the tool never silently
+ * mangles what the agent asked for; it only rejects the obviously-invalid.
+ */
+function requireNameString(value: unknown, label: string): string {
+	if (typeof value !== 'string') {
+		throw new McpToolError('bad_argument', `${label} must be a string, got ${typeof value}`);
+	}
+	if (value.trim().length === 0) {
+		throw new McpToolError('bad_argument', `${label} must be a non-empty (non-whitespace) string`);
+	}
+	if (value.length > MCP_MAX_NAME_LENGTH) {
+		throw new McpToolError('bad_argument', `${label} is ${value.length} chars, over the ${MCP_MAX_NAME_LENGTH}-char limit`);
+	}
+	return value;
+}
+
+/** Whether a WORKBOOK-scoped (scope === undefined) defined name with `name`'s canonical (uppercase) form
+ *  already exists. A workbook-scoped `setName` over such a name is a REBIND (re-points formula resolution).
+ *  A purely sheet-scoped collision is NOT a workbook-scoped rebind (different scope), so it is ignored. */
+function workbookNameExists(names: readonly NamedRangeJson[], name: string): boolean {
+	const upper = name.toUpperCase();
+	return names.some((n) => n.scope === undefined && n.name.toUpperCase() === upper);
+}
+
+/** Whether a defined name with `name`'s canonical form exists AT the given scope (undefined = workbook). */
+function nameExistsAtScope(names: readonly NamedRangeJson[], name: string, scope: number | undefined): boolean {
+	const upper = name.toUpperCase();
+	return names.some((n) => n.scope === scope && n.name.toUpperCase() === upper);
+}
+
+/** A compact "name "X" -> Sheet!A1:B2" target description for the audit line. */
+function describeNameTarget(name: string, sheets: readonly SheetInfoJson[], range: CellRangeJson): string {
+	const sheetName = sheets.find((s) => s.id === range.sheet)?.name ?? `#${range.sheet}`;
+	const tl = `${columnIndexToLetters(range.startCol)}${range.startRow + 1}`;
+	const a1 = range.startRow === range.endRow && range.startCol === range.endCol
+		? tl
+		: `${tl}:${columnIndexToLetters(range.endCol)}${range.endRow + 1}`;
+	return `name "${name}" -> ${sheetName}!${a1}`;
+}
+
+/** Arguments to `define_named_range`: a name + an A1 range (bare with a `sheet` arg, or sheet-qualified). */
+export interface DefineNamedRangeArgs {
+	readonly sessionId?: string;
+	readonly name: string;
+	readonly range: string;
+	readonly sheet?: number | string;
+}
+
+/**
+ * Prepare a `define_named_range` write (workbook-scoped Range name -> `setName`). Resolves the grid +
+ * range + detects REPLACE (an existing workbook-scoped name -> `rebind_name` risk -> modal; a fresh name
+ * -> no modal). No-Fallbacks: an empty name/range, a malformed/over-extent range, or an unknown sheet
+ * throws.
+ */
+export function prepareDefineNamedRange(ctx: McpHostContext, args: DefineNamedRangeArgs): PreparedWrite {
+	const grid = resolveTargetGrid(ctx, args.sessionId);
+	const sheets = grid.session.listSheets();
+	const name = requireNameString(args.name, 'define_named_range: name');
+	if (typeof args.range !== 'string' || args.range.length === 0) {
+		throw new McpToolError('bad_argument', 'define_named_range: `range` must be a non-empty A1 range, e.g. "B1:D3" or "S0!B1:D3"');
+	}
+	const fallbackSheet = args.sheet === undefined && !args.range.includes('!') ? grid.sheet : args.sheet;
+	const rangeTarget = resolveRangeTarget(sheets, args.range, fallbackSheet);
+	const replaces = workbookNameExists(grid.session.listNames(), name);
+	const label = replaces ? `redefines existing name "${name}"` : `defines name "${name}"`;
+	const metadataRisk: MetadataRiskInput = { rebindName: replaces, label };
+	const risk = classifyWriteRisk([], () => null, { metadata: metadataRisk });
+	const commit = (session: McpWriteSessionPort): { applied: number } => {
+		// TOCTOU close (mirrors the host's `uncovered`-reason refuse in applyPreparedWrite): the rebind
+		// verdict above was computed at PREPARE time. If the name was created (workbook-scoped) BETWEEN
+		// prepare and this commit -- a window the frozen `metadataRisk` cannot see (a live grid keystroke
+		// or another already-confirmed write) -- a "fresh" define (which showed NO modal) would silently
+		// REBIND it. Re-read the LIVE names HERE (inside the write queue, engine lock held, NO further
+		// await before setName) and refuse LOUD if the risk escalated fresh->rebind. The agent retries; the
+		// next prepare sees the now-existing name and prompts. (The reverse, rebind->fresh, only
+		// over-consents -- harmless -- so it is not guarded.)
+		if (!replaces && workbookNameExists(session.listNames(), name)) {
+			throw new McpToolError('risk_escalated', `define_named_range: name "${name}" was created since this write was prepared -- retry so the rebind is confirmed`);
+		}
+		session.setName(name, rangeTarget);
+		return { applied: 1 };
+	};
+	return { grid, ops: [], risk, undoLabel: `MCP: ${label}`, target: describeNameTarget(name, sheets, rangeTarget), metadataRisk, commit };
+}
+
+/** Arguments to `delete_named_range`: the name + optional sheet `scope` for a sheet-scoped name. */
+export interface DeleteNamedRangeArgs {
+	readonly sessionId?: string;
+	readonly name: string;
+	readonly scope?: number;
+}
+
+/**
+ * Prepare a `delete_named_range` write (`deleteName`). DESTRUCTIVE -> always confirm. No-Fallbacks: an
+ * invalid scope, an unknown scope sheet, or a name that does NOT exist at the given scope throws
+ * `[unknown_name]` (a clear miss, not a destructive modal for a no-op).
+ */
+export function prepareDeleteNamedRange(ctx: McpHostContext, args: DeleteNamedRangeArgs): PreparedWrite {
+	const grid = resolveTargetGrid(ctx, args.sessionId);
+	const sheets = grid.session.listSheets();
+	const name = requireNameString(args.name, 'delete_named_range: name');
+	let scope: number | undefined;
+	if (args.scope !== undefined) {
+		if (typeof args.scope !== 'number' || !Number.isSafeInteger(args.scope) || args.scope < 0) {
+			throw new McpToolError('bad_argument', `delete_named_range: scope must be a non-negative safe-integer sheet id, got ${args.scope}`);
+		}
+		resolveSheetId(sheets, args.scope);
+		scope = args.scope;
+	}
+	if (!nameExistsAtScope(grid.session.listNames(), name, scope)) {
+		throw new McpToolError('unknown_name', `no ${scope === undefined ? 'workbook-scoped' : `sheet-${scope}-scoped`} defined name "${name}" to delete`);
+	}
+	const label = `deletes name "${name}"${scope === undefined ? '' : ` (sheet ${scope})`}`;
+	const metadataRisk: MetadataRiskInput = { destructive: true, label };
+	const risk = classifyWriteRisk([], () => null, { metadata: metadataRisk });
+	const commit = (session: McpWriteSessionPort): { applied: number } => {
+		session.deleteName(name, scope);
+		return { applied: 1 };
+	};
+	return { grid, ops: [], risk, undoLabel: `MCP: ${label}`, target: label, metadataRisk, commit };
+}
+
+/** Arguments to `add_sheet`: the new sheet name. */
+export interface AddSheetArgs {
+	readonly sessionId?: string;
+	readonly name: string;
+}
+
+/** Prepare an `add_sheet` write (`addSheet`). Additive -> no modal. No-Fallbacks: an empty name throws;
+ *  the engine rejects a duplicate/invalid sheet name loud at commit. */
+export function prepareAddSheet(ctx: McpHostContext, args: AddSheetArgs): PreparedWrite {
+	const grid = resolveTargetGrid(ctx, args.sessionId);
+	const name = requireNameString(args.name, 'add_sheet: name');
+	const label = `adds sheet "${name}"`;
+	const metadataRisk: MetadataRiskInput = { label };
+	const risk = classifyWriteRisk([], () => null, { metadata: metadataRisk });
+	const commit = (session: McpWriteSessionPort): { applied: number } => {
+		session.addSheet(name, MCP_SHEET_CHUNK_ROWS);
+		return { applied: 1 };
+	};
+	return { grid, ops: [], risk, undoLabel: `MCP: ${label}`, target: label, metadataRisk, commit };
+}
+
+/** Arguments to `rename_sheet`: the sheet (id or current name) + the new name. */
+export interface RenameSheetArgs {
+	readonly sessionId?: string;
+	readonly sheet: number | string;
+	readonly newName: string;
+}
+
+/** Prepare a `rename_sheet` write (`renameSheet`). Ref-preserving -> no modal. No-Fallbacks: a missing/
+ *  unknown sheet or an empty new name throws; the engine rejects a name collision loud at commit. */
+export function prepareRenameSheet(ctx: McpHostContext, args: RenameSheetArgs): PreparedWrite {
+	const grid = resolveTargetGrid(ctx, args.sessionId);
+	const sheets = grid.session.listSheets();
+	if (args.sheet === undefined) {
+		throw new McpToolError('bad_argument', 'rename_sheet: `sheet` (id or current name) is required');
+	}
+	const sheetId = resolveSheetId(sheets, args.sheet);
+	const newName = requireNameString(args.newName, 'rename_sheet: newName');
+	const oldName = sheets.find((s) => s.id === sheetId)?.name ?? `#${sheetId}`;
+	const label = `renames sheet "${oldName}" to "${newName}"`;
+	const metadataRisk: MetadataRiskInput = { label };
+	const risk = classifyWriteRisk([], () => null, { metadata: metadataRisk });
+	const commit = (session: McpWriteSessionPort): { applied: number } => {
+		session.renameSheet(sheetId, newName);
+		return { applied: 1 };
+	};
+	return { grid, ops: [], risk, undoLabel: `MCP: ${label}`, target: label, metadataRisk, commit };
+}
+
+/** Arguments to `delete_sheet`: the sheet to delete (id or name). */
+export interface DeleteSheetArgs {
+	readonly sessionId?: string;
+	readonly sheet: number | string;
+}
+
+/** Prepare a `delete_sheet` write (`deleteSheet`). DESTRUCTIVE (tombstones a whole sheet + its
+ *  charts/tables) -> always confirm. No-Fallbacks: a missing/unknown sheet throws. */
+export function prepareDeleteSheet(ctx: McpHostContext, args: DeleteSheetArgs): PreparedWrite {
+	const grid = resolveTargetGrid(ctx, args.sessionId);
+	const sheets = grid.session.listSheets();
+	if (args.sheet === undefined) {
+		throw new McpToolError('bad_argument', 'delete_sheet: `sheet` (id or name) is required');
+	}
+	const sheetId = resolveSheetId(sheets, args.sheet);
+	// No-Fallbacks (mirrors the GUI D4 invariant in quantbookCommands.ts): a workbook must keep at least one
+	// live sheet -- deleting the last one leaves an empty, unswitchable grid. Refuse LOUD before the modal.
+	if (sheets.length <= 1) {
+		throw new McpToolError('last_sheet', 'cannot delete the last live sheet of a workbook (a workbook must keep at least one sheet)');
+	}
+	const sheetName = sheets.find((s) => s.id === sheetId)?.name ?? `#${sheetId}`;
+	const label = `deletes sheet "${sheetName}"`;
+	const metadataRisk: MetadataRiskInput = { destructive: true, label };
+	const risk = classifyWriteRisk([], () => null, { metadata: metadataRisk });
+	const commit = (session: McpWriteSessionPort): { applied: number } => {
+		// TOCTOU close: the prepare-time last-sheet guard ran BEFORE the (always-shown) delete modal, during
+		// which the GUI (not in this write queue) can delete sheets. Re-read LIVE here (NO await before
+		// deleteSheet): refuse if the target sheet vanished, or if deleting it would strand a zero-live-sheet
+		// workbook (the engine ALLOWS a last-sheet tombstone, so the IDE owns the D4 invariant).
+		const live = session.listSheets();
+		if (!live.some((s) => s.id === sheetId)) {
+			throw new McpToolError('unknown_sheet', `sheet ${sheetId} was deleted since this write was prepared`);
+		}
+		if (live.length <= 1) {
+			throw new McpToolError('last_sheet', 'cannot delete the last live sheet of a workbook (a workbook must keep at least one sheet)');
+		}
+		session.deleteSheet(sheetId);
+		return { applied: 1 };
+	};
+	return { grid, ops: [], risk, undoLabel: `MCP: ${label}`, target: label, metadataRisk, commit };
+}
+
+/** Arguments to `define_table`: the table name + geometry + column names (mirrors {@link TableSpecJson}). */
+export interface DefineTableArgs {
+	readonly sessionId?: string;
+	readonly name: string;
+	readonly sheet?: number | string;
+	readonly topRow: number;
+	readonly topCol: number;
+	readonly rows: number;
+	readonly cols: number;
+	readonly hasHeader?: boolean;
+	readonly hasTotals?: boolean;
+	readonly columnNames: string[];
+}
+
+/** Validate a 0-based table anchor index is a safe non-negative integer within the axis extent. */
+function assertTableIndex(value: number, label: string, axisMax: number): void {
+	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+		throw new McpToolError('bad_argument', `define_table: ${label} must be a non-negative safe integer, got ${value}`);
+	}
+	if (value >= axisMax) {
+		throw new McpToolError('bad_argument', `define_table: ${label} ${value} is outside the sheet extent (max index ${axisMax - 1})`);
+	}
+}
+
+/** Validate a table dimension (rows/cols) is a safe integer >= 1 (the engine requires > 0). */
+function assertTableCount(value: number, label: string): number {
+	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+		throw new McpToolError('bad_argument', `define_table: ${label} must be a safe integer >= 1, got ${value}`);
+	}
+	return value;
+}
+
+/**
+ * ASCII-ONLY case fold for table-column uniqueness, byte-identical to the engine's `to_ascii_lowercase`
+ * (mirrors `tableUiLogic.asciiLower`). It lowercases ONLY ASCII A-Z and leaves every other code unit
+ * unchanged: a JS `toUpperCase()`/`toLowerCase()` Unicode fold would FALSE-FLAG a non-ASCII case pair the
+ * engine keeps distinct (e.g. U+00C5 / U+00E5), over-rejecting a valid table.
+ */
+function asciiFoldColumnName(name: string): string {
+	return name.replace(/[A-Z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) + 32));
+}
+
+/**
+ * Prepare a `define_table` write (`createTable`). Additive -> no modal. Validates the UNTRUSTED geometry +
+ * column names (No-Fallbacks: bad index/dimension, an off-extent rectangle, a non-boolean flag, a
+ * non-array / wrong-length / non-string columnNames all throw). The engine does the table-semantics
+ * validation (overlap, header rules) loud at commit.
+ */
+export function prepareDefineTable(ctx: McpHostContext, args: DefineTableArgs): PreparedWrite {
+	const grid = resolveTargetGrid(ctx, args.sessionId);
+	const sheets = grid.session.listSheets();
+	// Table name: validate with the IDE's table-identifier rule (it shares the cell namespace, so a
+	// cell-ref-shaped name like "Q3" is rejected as ambiguous -- stricter than requireNameString). The MCP
+	// path MUST match the GUI's createTable validation, else an agent could create a structurally-broken table.
+	if (typeof args.name !== 'string') {
+		throw new McpToolError('bad_argument', 'define_table: name must be a string');
+	}
+	const tableNameReject = tableIdentifierRejectionReason(args.name);
+	if (tableNameReject !== undefined) {
+		throw new McpToolError('bad_argument', `define_table: invalid table name -- ${tableNameReject}`);
+	}
+	const name = args.name;
+	const sheetId = resolveSheetId(sheets, args.sheet ?? grid.sheet);
+	assertTableIndex(args.topRow, 'topRow', A1_MAX_ROWS);
+	assertTableIndex(args.topCol, 'topCol', A1_MAX_COLS);
+	const rows = assertTableCount(args.rows, 'rows');
+	const cols = assertTableCount(args.cols, 'cols');
+	if (args.topRow + rows > A1_MAX_ROWS) {
+		throw new McpToolError('bad_argument', `define_table: ${rows} rows at topRow ${args.topRow} runs past the sheet extent`);
+	}
+	if (args.topCol + cols > A1_MAX_COLS) {
+		throw new McpToolError('bad_argument', `define_table: ${cols} cols at topCol ${args.topCol} runs past the sheet extent`);
+	}
+	if (args.hasHeader !== undefined && typeof args.hasHeader !== 'boolean') {
+		throw new McpToolError('bad_argument', 'define_table: hasHeader must be a boolean');
+	}
+	if (args.hasTotals !== undefined && typeof args.hasTotals !== 'boolean') {
+		throw new McpToolError('bad_argument', 'define_table: hasTotals must be a boolean');
+	}
+	if (!Array.isArray(args.columnNames)) {
+		throw new McpToolError('bad_argument', 'define_table: `columnNames` must be an array of strings');
+	}
+	if (args.columnNames.length !== cols) {
+		throw new McpToolError('bad_argument', `define_table: columnNames has ${args.columnNames.length} entries but cols is ${cols} (they must match)`);
+	}
+	// Column names: full OOXML-parity validation (the engine breaks structured refs on edge-whitespace /
+	// control chars) via the IDE's column-name rule + ASCII-fold-case-insensitive uniqueness (the engine
+	// requires distinct columns, folding ASCII case only). Reuses the GUI validators + the engine's exact
+	// fold so the MCP path matches createTable's GUI flow without over-rejecting non-ASCII case pairs.
+	const seenColumns = new Set<string>();
+	const columnNames = args.columnNames.map((c, i) => {
+		if (typeof c !== 'string') {
+			throw new McpToolError('bad_argument', `define_table: columnNames[${i}] must be a string`);
+		}
+		const reject = tableColumnRejectionReason(c);
+		if (reject !== undefined) {
+			throw new McpToolError('bad_argument', `define_table: columnNames[${i}] invalid -- ${reject}`);
+		}
+		const key = asciiFoldColumnName(c);
+		if (seenColumns.has(key)) {
+			throw new McpToolError('bad_argument', `define_table: duplicate column name "${c}" (table columns must be unique, case-insensitive on ASCII)`);
+		}
+		seenColumns.add(key);
+		return c;
+	});
+	const spec: TableSpecJson = {
+		name, sheet: sheetId, topRow: args.topRow, topCol: args.topCol, rows, cols,
+		hasHeader: args.hasHeader === true, hasTotals: args.hasTotals === true, columnNames,
+	};
+	const sheetName = sheets.find((s) => s.id === sheetId)?.name ?? `#${sheetId}`;
+	const tl = `${columnIndexToLetters(args.topCol)}${args.topRow + 1}`;
+	const label = `defines table "${name}" at ${sheetName}!${tl} (${rows}x${cols})`;
+	const metadataRisk: MetadataRiskInput = { label };
+	const risk = classifyWriteRisk([], () => null, { metadata: metadataRisk });
+	const commit = (session: McpWriteSessionPort): { applied: number } => {
+		session.createTable(spec);
+		return { applied: 1 };
+	};
+	return { grid, ops: [], risk, undoLabel: `MCP: ${label}`, target: label, metadataRisk, commit };
+}
+
+/** Arguments to `delete_table`: the table name to drop. */
+export interface DeleteTableArgs {
+	readonly sessionId?: string;
+	readonly name: string;
+}
+
+/** Prepare a `delete_table` write (`dropTable`). DESTRUCTIVE -> always confirm. No-Fallbacks: an empty
+ *  name throws at prepare. Unlike delete_named_range / delete_sheet (which pre-check existence), table
+ *  existence is NOT pre-checked here -- there is no cheap `listTables()` getter and `snapshot()` would
+ *  materialize every cell -- so an unknown name fails LOUD at the engine `dropTable` commit (after the
+ *  confirmation modal). A cheap `listTables()` napi shim (an engine follow-up) would let this pre-check too. */
+export function prepareDeleteTable(ctx: McpHostContext, args: DeleteTableArgs): PreparedWrite {
+	const grid = resolveTargetGrid(ctx, args.sessionId);
+	const name = requireNameString(args.name, 'delete_table: name');
+	const label = `deletes table "${name}"`;
+	const metadataRisk: MetadataRiskInput = { destructive: true, label };
+	const risk = classifyWriteRisk([], () => null, { metadata: metadataRisk });
+	const commit = (session: McpWriteSessionPort): { applied: number } => {
+		session.dropTable(name);
+		return { applied: 1 };
+	};
+	return { grid, ops: [], risk, undoLabel: `MCP: ${label}`, target: label, metadataRisk, commit };
+}
+
+/** Arguments to `undo` / `redo`: just the optional target grid. */
+export interface UndoRedoArgs {
+	readonly sessionId?: string;
+}
+
+/**
+ * Prepare an `undo` (or `redo`) write. These drive the SHARED workbook undo stack -- an agent undo can
+ * revert a recent USER edit, not just an agent write, and the engine exposes no way to tell whose step is
+ * on top. The 5-lane audit (Codex + lane A) flagged a silent revert of unnoticed user work as the risk, so
+ * undo/redo ALWAYS prompt the operator (modal) via the `destructive` flag -- reversible, but confirm-worthy.
+ * The `commit` calls the owning Session's `undo()`/`redo()`, which return {@link UndoRedoResultJson}
+ * `{ consumed, version }`; `consumed: false` (empty stack) is reported as `applied: 0`, NOT an error.
+ */
+export function prepareUndoRedo(ctx: McpHostContext, direction: 'undo' | 'redo', args: UndoRedoArgs): PreparedWrite {
+	const grid = resolveTargetGrid(ctx, args.sessionId);
+	const label = direction === 'undo'
+		? 'undo -- reverts the last change on the shared workbook undo stack (may revert a recent user edit)'
+		: 'redo -- re-applies the last undone change on the shared workbook undo stack';
+	const metadataRisk: MetadataRiskInput = { destructive: true, label };
+	const risk = classifyWriteRisk([], () => null, { metadata: metadataRisk });
+	const commit = (session: McpWriteSessionPort): { applied: number } => {
+		// The owning Session's undo/redo return UndoRedoResultJson { consumed, version } -- NOT a bare bool.
+		// The result OBJECT is always truthy, so read `.consumed`: false (empty stack) -> applied:0 (normal).
+		const result = direction === 'undo' ? session.undo() : session.redo();
+		return { applied: result.consumed ? 1 : 0 };
+	};
+	return { grid, ops: [], risk, undoLabel: `MCP: ${direction}`, target: direction, metadataRisk, commit };
 }
 
 // --- per-session write queue (pure async) ------------------------------------------------------

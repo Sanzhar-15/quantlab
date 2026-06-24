@@ -45,6 +45,7 @@ import {
 	toolGetPublishedVariables,
 	toolGetSnapshot,
 	toolListFunctions,
+	toolListNamedRanges,
 	toolListSheets,
 	toolQueryRange,
 	toolValidateFormula,
@@ -56,20 +57,36 @@ import {
 import {
 	classifyWriteRisk,
 	formatAuditLine,
+	prepareAddSheet,
+	prepareDefineNamedRange,
+	prepareDefineTable,
+	prepareDeleteNamedRange,
+	prepareDeleteSheet,
 	prepareDeleteStructural,
+	prepareDeleteTable,
 	prepareInsertStructural,
+	prepareRenameSheet,
 	prepareSetCell,
 	prepareSetNumberFormat,
 	prepareSetStyle,
+	prepareUndoRedo,
 	prepareWriteCells,
 	WriteQueue,
+	type AddSheetArgs,
+	type DefineNamedRangeArgs,
+	type DefineTableArgs,
+	type DeleteNamedRangeArgs,
+	type DeleteSheetArgs,
 	type DeleteStructuralArgs,
+	type DeleteTableArgs,
 	type InsertStructuralArgs,
 	type McpWriteSessionPort,
 	type PreparedWrite,
+	type RenameSheetArgs,
 	type SetCellArgs,
 	type SetNumberFormatArgs,
 	type SetStyleArgs,
+	type UndoRedoArgs,
 	type WriteAuditRecord,
 	type WriteCellsArgs,
 	type WriteOutcome,
@@ -275,6 +292,12 @@ function registerReadOnlyTools(server: McpServerLike, sdk: LoadedSdk, kernelMana
 	);
 
 	server.registerTool(
+		'list_named_ranges',
+		{ title: 'List named ranges', description: 'List every defined name in the workbook -- BOTH workbook-scoped and sheet-scoped -- and the target each resolves to (a cell, range, constant, or formula). Empty when no names are defined (a true empty, NOT an error).', inputSchema: { ...sessionIdArg } },
+		(args) => runTool(toolListNamedRanges, ctx(), args as { sessionId?: string }),
+	);
+
+	server.registerTool(
 		'get_published_variables',
 		{ title: 'Get published variables', description: 'List the reactive-kernel variables currently published into the grid and the A1 cells each drives (empty if no reactive notebook is bound).', inputSchema: { ...sessionIdArg } },
 		(args) => runTool(toolGetPublishedVariables, ctx(), args as { sessionId?: string }),
@@ -368,7 +391,7 @@ async function applyPreparedWrite(
 	// FE-6 M: thread `prepared.structural` so a structural edit (insert/delete rows/columns) ALWAYS
 	// re-classifies with the SILENT-DATA-CORRUPTION `structural` reason (the modal always shows).
 	const reclassify = (): ReturnType<typeof classifyWriteRisk> =>
-		classifyWriteRisk(prepared.ops, (sheet, row, col) => prepared.grid.session.cell(sheet, row, col), { structural: prepared.structural === true });
+		classifyWriteRisk(prepared.ops, (sheet, row, col) => prepared.grid.session.cell(sheet, row, col), { structural: prepared.structural === true, metadata: prepared.metadataRisk });
 	const recordFor = (risk: string): Omit<WriteAuditRecord, 'outcome' | 'detail'> => ({
 		timestamp: `${new Date().toISOString()}#${auditSeq++}`,
 		tool,
@@ -698,6 +721,134 @@ function registerWriteTools(server: McpServerLike, sdk: LoadedSdk, kernelManager
 			},
 		},
 		(args) => runWriteTool((ctx) => prepareDeleteStructural(ctx, 'delete_columns', args as unknown as DeleteStructuralArgs), 'delete_columns', kernelManager, output),
+	);
+
+	// Wave L (FE-6.1): METADATA writes -- named ranges, sheet management, tables, undo/redo. Each routes
+	// through the SAME trust + queue + modal + audit pipeline as the structural tools (a direct napi call
+	// via the prepared `commit`). DELETES (delete_named_range / delete_sheet / delete_table) ALWAYS prompt
+	// the operator; a define_named_range that REPLACES an existing name prompts; the additive ops + undo/
+	// redo apply under the standing trust grant (audited). Every op is one Ctrl+Z undo step.
+	server.registerTool(
+		'define_named_range',
+		{
+			title: 'Define named range (write)',
+			description: 'Define (or redefine) a WORKBOOK-scoped name that points at an A1 range, e.g. name "returns" -> "S0!B2:B100". `range` is sheet-qualified ("S0!B2:B100") or bare with a `sheet` arg. Redefining an EXISTING name re-points every formula that resolves through it, so it prompts the operator; a fresh name applies under the standing trust grant. Requires a trusted workspace. One Ctrl+Z undo step.',
+			inputSchema: {
+				name: z.string().describe('The name to define, e.g. "returns" (canonicalized upper-case by the engine).'),
+				range: z.string().describe('The A1 range the name targets, e.g. "B2:B100" or sheet-qualified "S0!B2:B100".'),
+				...sheetArg,
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareDefineNamedRange(ctx, args as unknown as DefineNamedRangeArgs), 'define_named_range', kernelManager, output),
+	);
+
+	server.registerTool(
+		'delete_named_range',
+		{
+			title: 'Delete named range (write)',
+			description: 'Delete a defined name. Workbook-scoped by default; pass `scope` (a sheet id) to delete a sheet-scoped name. Formulas that referenced the name resolve to #NAME? afterward, so the operator ALWAYS confirms via a modal. A name that does not exist fails loud. Requires a trusted workspace. One Ctrl+Z undo step.',
+			inputSchema: {
+				name: z.string().describe('The defined name to delete.'),
+				scope: z.number().describe('Optional sheet id for a sheet-scoped name (omit for a workbook-scoped name).').optional(),
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareDeleteNamedRange(ctx, args as unknown as DeleteNamedRangeArgs), 'delete_named_range', kernelManager, output),
+	);
+
+	server.registerTool(
+		'add_sheet',
+		{
+			title: 'Add sheet (write)',
+			description: 'Append a new, empty sheet with the given name. Additive (no existing data touched), so it applies under the standing trust grant. A duplicate or invalid sheet name fails loud. Requires a trusted workspace. One Ctrl+Z undo step.',
+			inputSchema: {
+				name: z.string().describe('The new sheet name, e.g. "Returns".'),
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareAddSheet(ctx, args as unknown as AddSheetArgs), 'add_sheet', kernelManager, output),
+	);
+
+	server.registerTool(
+		'rename_sheet',
+		{
+			title: 'Rename sheet (write)',
+			description: 'Rename a sheet (by id or current name) to `newName`. Within-workbook references are preserved by the engine, so it applies under the standing trust grant. A name collision fails loud. Requires a trusted workspace. One Ctrl+Z undo step.',
+			inputSchema: {
+				sheet: z.union([z.string(), z.number()]).describe('The sheet to rename, by id (number) or current name (string).'),
+				newName: z.string().describe('The new sheet name.'),
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareRenameSheet(ctx, args as unknown as RenameSheetArgs), 'rename_sheet', kernelManager, output),
+	);
+
+	server.registerTool(
+		'delete_sheet',
+		{
+			title: 'Delete sheet (write)',
+			description: 'Delete a sheet (by id or name). This tombstones the WHOLE sheet -- all its cells, charts, and tables -- and references to it resolve to #REF!, so the operator ALWAYS confirms via a modal. Requires a trusted workspace. One Ctrl+Z undo step.',
+			inputSchema: {
+				sheet: z.union([z.string(), z.number()]).describe('The sheet to delete, by id (number) or name (string).'),
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareDeleteSheet(ctx, args as unknown as DeleteSheetArgs), 'delete_sheet', kernelManager, output),
+	);
+
+	server.registerTool(
+		'define_table',
+		{
+			title: 'Define table (write)',
+			description: 'Define a table over a rectangular region: anchored at 0-based (`topRow`, `topCol`) on the given sheet (or the focused sheet), spanning `rows` x `cols`, with `columnNames` (length must equal `cols`). `hasHeader`/`hasTotals` default false. Additive, so it applies under the standing trust grant; an overlapping or invalid table fails loud. Requires a trusted workspace. One Ctrl+Z undo step.',
+			inputSchema: {
+				name: z.string().describe('The table name, e.g. "Trades".'),
+				topRow: z.number().describe('0-based top row of the table region.'),
+				topCol: z.number().describe('0-based left column of the table region.'),
+				rows: z.number().describe('Number of rows the table spans (>= 1, includes the header row if hasHeader).'),
+				cols: z.number().describe('Number of columns the table spans (>= 1).'),
+				columnNames: z.array(z.string()).describe('The column names; the array length MUST equal `cols`.'),
+				hasHeader: z.boolean().describe('Whether the top row is a header row (default false).').optional(),
+				hasTotals: z.boolean().describe('Whether the bottom row is a totals row (default false).').optional(),
+				...sheetArg,
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareDefineTable(ctx, args as unknown as DefineTableArgs), 'define_table', kernelManager, output),
+	);
+
+	server.registerTool(
+		'delete_table',
+		{
+			title: 'Delete table (write)',
+			description: 'Drop a table definition by name (the underlying cell values are NOT cleared -- only the table structure is removed). The operator ALWAYS confirms via a modal. An unknown table name fails loud at commit (after the confirmation). Requires a trusted workspace. One Ctrl+Z undo step.',
+			inputSchema: {
+				name: z.string().describe('The table name to drop.'),
+				...sessionIdArg,
+			},
+		},
+		(args) => runWriteTool((ctx) => prepareDeleteTable(ctx, args as unknown as DeleteTableArgs), 'delete_table', kernelManager, output),
+	);
+
+	server.registerTool(
+		'undo',
+		{
+			title: 'Undo (write)',
+			description: 'Undo the workbook\'s last change. This drives the SHARED undo stack -- it may revert a recent USER edit, not just an agent write -- so the operator ALWAYS confirms via a modal. Reversible via `redo`; audited. Returns `applied: 0` when there is nothing to undo (a normal outcome, not an error). Requires a trusted workspace.',
+			inputSchema: { ...sessionIdArg },
+		},
+		(args) => runWriteTool((ctx) => prepareUndoRedo(ctx, 'undo', args as unknown as UndoRedoArgs), 'undo', kernelManager, output),
+	);
+
+	server.registerTool(
+		'redo',
+		{
+			title: 'Redo (write)',
+			description: 'Redo the workbook\'s last undone change on the SHARED undo stack. The operator ALWAYS confirms via a modal; audited. Returns `applied: 0` when there is nothing to redo (a normal outcome, not an error). Requires a trusted workspace.',
+			inputSchema: { ...sessionIdArg },
+		},
+		(args) => runWriteTool((ctx) => prepareUndoRedo(ctx, 'redo', args as unknown as UndoRedoArgs), 'redo', kernelManager, output),
 	);
 }
 

@@ -23,6 +23,7 @@ import type {
 	CellValueJson,
 	DiagnosticJson,
 	FunctionMetadataJson,
+	NamedRangeJson,
 	RangeResultJson,
 	SheetInfoJson,
 	WorkbookSnapshotJson,
@@ -48,6 +49,13 @@ export interface McpSessionPort {
 	 * the read-only `validate_formula` tool so an agent can dry-run a formula before writing it.
 	 */
 	validateFormula(sheet: number, row: number, col: number, text: string): DiagnosticJson[];
+	/**
+	 * **Wave L (2026-06-24)**: every defined name in the workbook -- BOTH workbook-scoped and
+	 * sheet-scoped names ({@link NamedRangeJson.scope} = the sheet id) -- as the engine returns them
+	 * (sorted by the engine). Backs the read-only `list_named_ranges` tool. A cheap dedicated getter
+	 * (NOT the full {@link snapshot}, which materializes every cell) so it is safe on a 1M-cell workbook.
+	 */
+	listNames(): NamedRangeJson[];
 }
 
 /**
@@ -334,6 +342,12 @@ export interface ListFunctionsResult {
 	functions: FunctionMetadataJson[];
 }
 
+export interface ListNamedRangesResult {
+	sessionId: string;
+	count: number;
+	names: NamedRangeJson[];
+}
+
 export interface PublishedVariableResult {
 	name: string;
 	sheet: number;
@@ -456,6 +470,18 @@ export function toolListFunctions(ctx: McpHostContext, args: { sessionId?: strin
 	const grid = resolveTargetGrid(ctx, args.sessionId);
 	const functions = grid.session.listFunctions();
 	return { sessionId: grid.id, count: functions.length, functions };
+}
+
+/**
+ * list_named_ranges: every defined name in the target grid's workbook (workbook- + sheet-scoped) and
+ * its target (cell / range / constant / formula), as the engine returns them. Empty when no names are
+ * defined (a true empty -- NOT an error). Reads the cheap {@link McpSessionPort.listNames} getter, so it
+ * never materializes the full workbook (safe on a 1M-cell sheet).
+ */
+export function toolListNamedRanges(ctx: McpHostContext, args: { sessionId?: string }): ListNamedRangesResult {
+	const grid = resolveTargetGrid(ctx, args.sessionId);
+	const names = grid.session.listNames();
+	return { sessionId: grid.id, count: names.length, names };
 }
 
 /**

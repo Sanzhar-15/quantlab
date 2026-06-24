@@ -15,6 +15,7 @@ import type {
 	CellSnapshotJson,
 	DiagnosticJson,
 	FunctionMetadataJson,
+	NamedRangeJson,
 	RangeResultJson,
 	SheetInfoJson,
 	WorkbookSnapshotJson,
@@ -33,6 +34,7 @@ import {
 	toolGetPublishedVariables,
 	toolGetSnapshot,
 	toolListFunctions,
+	toolListNamedRanges,
 	toolListSheets,
 	toolQueryRange,
 	toolValidateFormula,
@@ -56,11 +58,17 @@ class FakeSession implements McpSessionPort {
 	readonly validateCalls: Array<{ sheet: number; row: number; col: number; text: string }> = [];
 	/** FE-6 M: the canned diagnostics validateFormula returns (default empty = valid). */
 	validateResponse: DiagnosticJson[] = [];
+	/** Wave L: the defined names listNames() returns (default empty). */
+	names: NamedRangeJson[] = [];
 
 	constructor(private readonly sheets: FakeSheet[], private readonly functions: FunctionMetadataJson[] = []) { }
 
 	listSheets(): SheetInfoJson[] {
 		return this.sheets.map((s) => ({ id: s.id, name: s.name }));
+	}
+
+	listNames(): NamedRangeJson[] {
+		return this.names;
 	}
 
 	validateFormula(sheet: number, row: number, col: number, text: string): DiagnosticJson[] {
@@ -505,5 +513,42 @@ suite('FE-6 M -- validate_formula', () => {
 		const s = fixtureSession();
 		const ctx = makeCtx([singleGrid(s, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
 		assert.throws(() => toolValidateFormula(ctx, { formula: 5 as unknown as string }), (e: unknown) => e instanceof McpToolError && /must be a string/.test(e.message));
+	});
+});
+
+// --- Wave L: list_named_ranges ----------------------------------------------------------------
+
+suite('Wave L MCP -- list_named_ranges', () => {
+	test('returns every workbook + sheet-scoped name with a count', () => {
+		const s = new FakeSession([{ id: 0, name: 'S0', cells: [] }]);
+		s.names = [
+			{ name: 'RETURNS', target: { kind: 'range', range: { sheet: 0, startRow: 1, startCol: 1, endRow: 99, endCol: 1 } } },
+			{ name: 'TAXRATE', target: { kind: 'constant', value: { kind: 'number', number: 0.2 } }, scope: 0 },
+		];
+		const ctx = makeCtx([singleGrid(s, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
+		const out = toolListNamedRanges(ctx, {});
+		assert.strictEqual(out.sessionId, 'grid-0-sheet-0');
+		assert.strictEqual(out.count, 2);
+		assert.strictEqual(out.names[0].name, 'RETURNS');
+		assert.strictEqual(out.names[1].scope, 0, 'a sheet-scoped name carries its scope');
+	});
+
+	test('empty when no names are defined (a true empty, not an error)', () => {
+		const s = new FakeSession([{ id: 0, name: 'S0', cells: [] }]);
+		const ctx = makeCtx([singleGrid(s, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
+		const out = toolListNamedRanges(ctx, {});
+		assert.strictEqual(out.count, 0);
+		assert.deepStrictEqual(out.names, []);
+	});
+
+	test('no grid open -> loud [no_grid] (No-Fallbacks)', () => {
+		const ctx = makeCtx([], undefined);
+		assert.throws(() => toolListNamedRanges(ctx, {}), (e: unknown) => e instanceof McpToolError && /no_grid/.test(e.message));
+	});
+
+	test('an unknown sessionId -> loud [unknown_session]', () => {
+		const s = new FakeSession([{ id: 0, name: 'S0', cells: [] }]);
+		const ctx = makeCtx([singleGrid(s, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
+		assert.throws(() => toolListNamedRanges(ctx, { sessionId: 'grid-9-sheet-9' }), (e: unknown) => e instanceof McpToolError && /unknown_session/.test(e.message));
 	});
 });

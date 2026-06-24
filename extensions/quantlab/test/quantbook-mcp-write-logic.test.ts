@@ -12,16 +12,20 @@
 import * as assert from 'assert';
 
 import type {
+	CellRangeJson,
 	CellSnapshotJson,
 	DiagnosticJson,
 	FormatIdJson,
 	FunctionMetadataJson,
+	NamedRangeJson,
 	RangeResultJson,
 	SessionOpJson,
 	SheetInfoJson,
 	StyleDefJson,
 	StyleIdJson,
 	StyleJson,
+	TableSpecJson,
+	UndoRedoResultJson,
 	WorkbookSnapshotJson,
 } from '../src/quantbook/types';
 import { A1_MAX_COLS, A1_MAX_ROWS, McpToolError, type McpHostContext, type McpSessionPort, type McpTargetGrid } from '../src/quantbook/mcp/mcpToolLogic';
@@ -35,11 +39,19 @@ import {
 	MCP_MAX_BATCH_CELLS,
 	MCP_MAX_RAW_INPUT_LENGTH,
 	mergeStylePatch,
+	prepareAddSheet,
+	prepareDefineNamedRange,
+	prepareDefineTable,
+	prepareDeleteNamedRange,
+	prepareDeleteSheet,
 	prepareDeleteStructural,
+	prepareDeleteTable,
 	prepareInsertStructural,
+	prepareRenameSheet,
 	prepareSetCell,
 	prepareSetNumberFormat,
 	prepareSetStyle,
+	prepareUndoRedo,
 	prepareWriteCells,
 	resolveWriteCellTarget,
 	RISK_LARGE_CELL_COUNT,
@@ -158,6 +170,57 @@ class FakeWriteSession implements McpWriteSessionPort {
 
 	deleteColumns(sheet: number, start: number, end: number): void {
 		this.structuralCalls.push({ kind: 'deleteColumns', sheet, a: start, b: end });
+	}
+
+	// --- Wave L: metadata-write side effects (named ranges / sheets / tables / undo-redo) -------
+	/** Every metadata napi call, recorded as { op, detail } so the `commit` strategies are testable. */
+	readonly metadataCalls: Array<{ op: string; detail: string }> = [];
+	/** The defined names listNames() returns (tests seed this for the replace / exists checks). */
+	names: NamedRangeJson[] = [];
+	/** What undo() / redo() report as consumed (tests flip these to simulate an empty stack). */
+	undoConsumed = true;
+	redoConsumed = true;
+
+	listNames(): NamedRangeJson[] {
+		return this.names;
+	}
+
+	setName(name: string, target: CellRangeJson): void {
+		this.metadataCalls.push({ op: 'setName', detail: `${name}@s${target.sheet}:${target.startRow},${target.startCol}-${target.endRow},${target.endCol}` });
+	}
+
+	deleteName(name: string, scope?: number): void {
+		this.metadataCalls.push({ op: 'deleteName', detail: scope === undefined ? name : `${name}#${scope}` });
+	}
+
+	addSheet(name: string, chunkRows: number): void {
+		this.metadataCalls.push({ op: 'addSheet', detail: `${name}:${chunkRows}` });
+	}
+
+	renameSheet(id: number, newName: string): void {
+		this.metadataCalls.push({ op: 'renameSheet', detail: `${id}->${newName}` });
+	}
+
+	deleteSheet(id: number): void {
+		this.metadataCalls.push({ op: 'deleteSheet', detail: `${id}` });
+	}
+
+	createTable(spec: TableSpecJson): void {
+		this.metadataCalls.push({ op: 'createTable', detail: `${spec.name}@s${spec.sheet}:${spec.topRow},${spec.topCol} ${spec.rows}x${spec.cols} cols=${spec.columnNames.join('|')}` });
+	}
+
+	dropTable(name: string): void {
+		this.metadataCalls.push({ op: 'dropTable', detail: name });
+	}
+
+	undo(): UndoRedoResultJson {
+		this.metadataCalls.push({ op: 'undo', detail: '' });
+		return { consumed: this.undoConsumed, version: new Uint8Array() };
+	}
+
+	redo(): UndoRedoResultJson {
+		this.metadataCalls.push({ op: 'redo', detail: '' });
+		return { consumed: this.redoConsumed, version: new Uint8Array() };
 	}
 }
 
@@ -868,5 +931,278 @@ suite('FE-6 M -- structural risk is confirmable (uncovered-reason set)', () => {
 		const confirmed = new Set(finalReasons);
 		const uncovered = finalReasons.filter((r) => !confirmed.has(r));
 		assert.deepStrictEqual(uncovered, [], 'structural is covered by the modal it always triggers');
+	});
+});
+
+// --- Wave L: metadata writes (named ranges / sheets / tables / undo-redo) ----------------------
+
+suite('Wave L -- prepare metadata writes', () => {
+	function ctxOf(names: NamedRangeJson[] = []): { s: FakeWriteSession; ctx: McpHostContext } {
+		const s = new FakeWriteSession([{ id: 0, name: 'S0', cells: [] }, { id: 7, name: 'Data', cells: [] }]);
+		s.names = names;
+		return { s, ctx: makeCtx([styleGrid(s, 7, 'grid-0-sheet-7')], 'grid-0-sheet-7') };
+	}
+
+	// --- define_named_range ---
+	test('define_named_range: a FRESH name carries NO risk (no modal) + commit calls setName (not batch)', () => {
+		const { s, ctx } = ctxOf();
+		const prepared = prepareDefineNamedRange(ctx, { name: 'returns', range: 'B2:B100' });
+		assert.deepStrictEqual(prepared.ops, []);
+		assert.deepStrictEqual(prepared.risk.reasons, []);
+		assert.strictEqual(prepared.risk.requiresConfirmation, false);
+		const out = prepared.commit!(s as unknown as McpWriteSessionPort);
+		assert.strictEqual(out.applied, 1);
+		assert.deepStrictEqual(s.metadataCalls, [{ op: 'setName', detail: 'returns@s7:1,1-99,1' }], 'range resolves against the focused sheet 7');
+		assert.strictEqual(s.batched.length, 0, 'a name define is NOT a cell batch');
+	});
+
+	test('define_named_range: REPLACING an existing workbook-scoped name -> rebind_name risk + modal', () => {
+		const existing: NamedRangeJson[] = [{ name: 'RETURNS', target: { kind: 'range', range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 } } }];
+		const { ctx } = ctxOf(existing);
+		const prepared = prepareDefineNamedRange(ctx, { name: 'returns', range: 'S0!B2:B100' });
+		assert.deepStrictEqual(prepared.risk.reasons, ['rebind_name'], 'case-insensitive name match (engine canonicalizes upper-case)');
+		assert.strictEqual(prepared.risk.requiresConfirmation, true);
+		assert.ok(/redefines existing name "returns"/.test(prepared.risk.summary), prepared.risk.summary);
+	});
+
+	test('define_named_range: a purely SHEET-scoped collision is NOT a workbook rebind (no modal)', () => {
+		const sheetScoped: NamedRangeJson[] = [{ name: 'RETURNS', target: { kind: 'range', range: { sheet: 7, startRow: 0, startCol: 0, endRow: 0, endCol: 0 } }, scope: 7 }];
+		const { ctx } = ctxOf(sheetScoped);
+		const prepared = prepareDefineNamedRange(ctx, { name: 'returns', range: 'S0!B2:B100' });
+		assert.deepStrictEqual(prepared.risk.reasons, [], 'a workbook-scoped define over a sheet-scoped name is additive');
+	});
+
+	test('define_named_range: empty name / empty range reject loud (No-Fallbacks)', () => {
+		const { ctx } = ctxOf();
+		assert.throws(() => prepareDefineNamedRange(ctx, { name: '   ', range: 'B2:B100' }), (e: unknown) => e instanceof McpToolError && /non-empty/.test(e.message));
+		assert.throws(() => prepareDefineNamedRange(ctx, { name: 'ret', range: '' }), (e: unknown) => e instanceof McpToolError && /non-empty A1 range/.test(e.message));
+	});
+
+	// --- delete_named_range ---
+	test('delete_named_range: DESTRUCTIVE (always modal) + commit calls deleteName with the agent name', () => {
+		const existing: NamedRangeJson[] = [{ name: 'RET', target: { kind: 'range', range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 } } }];
+		const { s, ctx } = ctxOf(existing);
+		const prepared = prepareDeleteNamedRange(ctx, { name: 'ret' });
+		assert.deepStrictEqual(prepared.risk.reasons, ['destructive_metadata']);
+		assert.strictEqual(prepared.risk.requiresConfirmation, true);
+		prepared.commit!(s as unknown as McpWriteSessionPort);
+		assert.deepStrictEqual(s.metadataCalls, [{ op: 'deleteName', detail: 'ret' }]);
+	});
+
+	test('delete_named_range: a name absent at the given scope -> loud [unknown_name] (not a no-op modal)', () => {
+		const { ctx } = ctxOf([]);
+		assert.throws(() => prepareDeleteNamedRange(ctx, { name: 'ghost' }), (e: unknown) => e instanceof McpToolError && /unknown_name/.test(e.message));
+	});
+
+	test('delete_named_range: a sheet-scoped delete validates the scope sheet + that exact scope', () => {
+		const sheetScoped: NamedRangeJson[] = [{ name: 'LOCAL', target: { kind: 'range', range: { sheet: 7, startRow: 0, startCol: 0, endRow: 0, endCol: 0 } }, scope: 7 }];
+		const { s, ctx } = ctxOf(sheetScoped);
+		const prepared = prepareDeleteNamedRange(ctx, { name: 'local', scope: 7 });
+		prepared.commit!(s as unknown as McpWriteSessionPort);
+		assert.deepStrictEqual(s.metadataCalls, [{ op: 'deleteName', detail: 'local#7' }]);
+		assert.throws(() => prepareDeleteNamedRange(ctx, { name: 'local', scope: 99 }), (e: unknown) => e instanceof McpToolError && /unknown_sheet/.test(e.message));
+		assert.throws(() => prepareDeleteNamedRange(ctx, { name: 'local' }), (e: unknown) => e instanceof McpToolError && /unknown_name/.test(e.message), 'a workbook-scoped delete does NOT match a sheet-scoped name');
+		assert.throws(() => prepareDeleteNamedRange(ctx, { name: 'local', scope: -1 }), (e: unknown) => e instanceof McpToolError && /non-negative safe-integer/.test(e.message));
+	});
+
+	// --- add_sheet ---
+	test('add_sheet: additive (no modal) + commit calls addSheet with the IDE default chunk size', () => {
+		const { s, ctx } = ctxOf();
+		const prepared = prepareAddSheet(ctx, { name: 'Returns' });
+		assert.deepStrictEqual(prepared.risk.reasons, []);
+		assert.strictEqual(prepared.risk.requiresConfirmation, false);
+		prepared.commit!(s as unknown as McpWriteSessionPort);
+		assert.deepStrictEqual(s.metadataCalls, [{ op: 'addSheet', detail: 'Returns:1000' }]);
+		assert.ok(/adds sheet "Returns", no elevated risk/.test(prepared.risk.summary), prepared.risk.summary);
+	});
+
+	test('add_sheet: an empty name rejects loud', () => {
+		const { ctx } = ctxOf();
+		assert.throws(() => prepareAddSheet(ctx, { name: '' }), (e: unknown) => e instanceof McpToolError && /non-empty/.test(e.message));
+	});
+
+	// --- rename_sheet ---
+	test('rename_sheet: no modal + commit calls renameSheet by resolved id', () => {
+		const { s, ctx } = ctxOf();
+		const prepared = prepareRenameSheet(ctx, { sheet: 'Data', newName: 'Trades' });
+		assert.deepStrictEqual(prepared.risk.reasons, []);
+		prepared.commit!(s as unknown as McpWriteSessionPort);
+		assert.deepStrictEqual(s.metadataCalls, [{ op: 'renameSheet', detail: '7->Trades' }]);
+		assert.ok(/renames sheet "Data" to "Trades"/.test(prepared.target));
+	});
+
+	test('rename_sheet: a missing sheet / unknown sheet / empty newName reject loud', () => {
+		const { ctx } = ctxOf();
+		assert.throws(() => prepareRenameSheet(ctx, { sheet: undefined as unknown as number, newName: 'X' }), (e: unknown) => e instanceof McpToolError && /required/.test(e.message));
+		assert.throws(() => prepareRenameSheet(ctx, { sheet: 'Ghost', newName: 'X' }), (e: unknown) => e instanceof McpToolError && /unknown_sheet/.test(e.message));
+		assert.throws(() => prepareRenameSheet(ctx, { sheet: 'Data', newName: '  ' }), (e: unknown) => e instanceof McpToolError && /non-empty/.test(e.message));
+	});
+
+	// --- delete_sheet ---
+	test('delete_sheet: DESTRUCTIVE (always modal) + commit tombstones by id', () => {
+		const { s, ctx } = ctxOf();
+		const prepared = prepareDeleteSheet(ctx, { sheet: 7 });
+		assert.deepStrictEqual(prepared.risk.reasons, ['destructive_metadata']);
+		assert.strictEqual(prepared.risk.requiresConfirmation, true);
+		assert.ok(/deletes sheet "Data"/.test(prepared.risk.summary) && !/0 cell/.test(prepared.risk.summary), prepared.risk.summary);
+		prepared.commit!(s as unknown as McpWriteSessionPort);
+		assert.deepStrictEqual(s.metadataCalls, [{ op: 'deleteSheet', detail: '7' }]);
+	});
+
+	test('delete_sheet: a missing / unknown sheet rejects loud', () => {
+		const { ctx } = ctxOf();
+		assert.throws(() => prepareDeleteSheet(ctx, { sheet: undefined as unknown as number }), (e: unknown) => e instanceof McpToolError && /required/.test(e.message));
+		assert.throws(() => prepareDeleteSheet(ctx, { sheet: 'Ghost' }), (e: unknown) => e instanceof McpToolError && /unknown_sheet/.test(e.message));
+	});
+
+	// --- define_table ---
+	test('define_table: additive (no modal) + commit calls createTable with the validated spec', () => {
+		const { s, ctx } = ctxOf();
+		const prepared = prepareDefineTable(ctx, { name: 'Trades', sheet: 'Data', topRow: 0, topCol: 0, rows: 10, cols: 2, hasHeader: true, columnNames: ['Date', 'Px'] });
+		assert.deepStrictEqual(prepared.risk.reasons, []);
+		prepared.commit!(s as unknown as McpWriteSessionPort);
+		assert.deepStrictEqual(s.metadataCalls, [{ op: 'createTable', detail: 'Trades@s7:0,0 10x2 cols=Date|Px' }]);
+	});
+
+	test('define_table: columnNames length MUST equal cols', () => {
+		const { ctx } = ctxOf();
+		assert.throws(() => prepareDefineTable(ctx, { name: 'T', topRow: 0, topCol: 0, rows: 5, cols: 2, columnNames: ['only one'] }), (e: unknown) => e instanceof McpToolError && /must match/.test(e.message));
+	});
+
+	test('define_table: bad geometry rejects loud (rows < 1, negative anchor, non-array columnNames, non-boolean flag)', () => {
+		const { ctx } = ctxOf();
+		assert.throws(() => prepareDefineTable(ctx, { name: 'T', topRow: 0, topCol: 0, rows: 0, cols: 1, columnNames: ['c'] }), (e: unknown) => e instanceof McpToolError && />= 1/.test(e.message));
+		assert.throws(() => prepareDefineTable(ctx, { name: 'T', topRow: -1, topCol: 0, rows: 1, cols: 1, columnNames: ['c'] }), (e: unknown) => e instanceof McpToolError && /non-negative/.test(e.message));
+		assert.throws(() => prepareDefineTable(ctx, { name: 'T', topRow: 0, topCol: 0, rows: 1, cols: 1, columnNames: 'nope' as unknown as string[] }), (e: unknown) => e instanceof McpToolError && /array of strings/.test(e.message));
+		assert.throws(() => prepareDefineTable(ctx, { name: 'T', topRow: 0, topCol: 0, rows: 1, cols: 1, hasHeader: 'yes' as unknown as boolean, columnNames: ['c'] }), (e: unknown) => e instanceof McpToolError && /hasHeader must be a boolean/.test(e.message));
+	});
+
+	// --- delete_table ---
+	test('delete_table: DESTRUCTIVE (always modal) + commit calls dropTable', () => {
+		const { s, ctx } = ctxOf();
+		const prepared = prepareDeleteTable(ctx, { name: 'Trades' });
+		assert.deepStrictEqual(prepared.risk.reasons, ['destructive_metadata']);
+		assert.strictEqual(prepared.risk.requiresConfirmation, true);
+		prepared.commit!(s as unknown as McpWriteSessionPort);
+		assert.deepStrictEqual(s.metadataCalls, [{ op: 'dropTable', detail: 'Trades' }]);
+	});
+
+	// --- undo / redo (audit fold: ALWAYS confirm the shared stack; real UndoRedoResultJson return shape) ---
+	test('undo: ALWAYS confirms (shared stack may revert user work) + commit calls undo; consumed -> applied 1', () => {
+		const { s, ctx } = ctxOf();
+		const prepared = prepareUndoRedo(ctx, 'undo', {});
+		assert.deepStrictEqual(prepared.risk.reasons, ['destructive_metadata']);
+		assert.strictEqual(prepared.risk.requiresConfirmation, true);
+		const out = prepared.commit!(s as unknown as McpWriteSessionPort);
+		assert.strictEqual(out.applied, 1);
+		assert.deepStrictEqual(s.metadataCalls, [{ op: 'undo', detail: '' }]);
+	});
+
+	test('undo: an EMPTY stack returns applied 0 -- reads UndoRedoResultJson.consumed (the object is always truthy)', () => {
+		const { s, ctx } = ctxOf();
+		s.undoConsumed = false; // the fake returns { consumed: false, version } -- a bare `obj ? 1 : 0` would wrongly be 1
+		const out = prepareUndoRedo(ctx, 'undo', {}).commit!(s as unknown as McpWriteSessionPort);
+		assert.strictEqual(out.applied, 0);
+	});
+
+	test('redo: confirms + commit calls redo; the consumed flag drives applied', () => {
+		const { s, ctx } = ctxOf();
+		const prepared = prepareUndoRedo(ctx, 'redo', {});
+		assert.strictEqual(prepared.risk.requiresConfirmation, true);
+		const out = prepared.commit!(s as unknown as McpWriteSessionPort);
+		assert.strictEqual(out.applied, 1);
+		assert.deepStrictEqual(s.metadataCalls, [{ op: 'redo', detail: '' }]);
+	});
+
+	// --- audit folds: TOCTOU rebind re-check / ambiguous-sheet / last-sheet / table+column validation ---
+	test('define_named_range: commit RE-CHECKS live names -> a fresh define that became a rebind refuses LOUD', () => {
+		const { s, ctx } = ctxOf(); // no names at prepare -> fresh, no modal
+		const prepared = prepareDefineNamedRange(ctx, { name: 'returns', range: 'B2:B100' });
+		assert.deepStrictEqual(prepared.risk.reasons, [], 'fresh at prepare -> no modal');
+		// the name is created (workbook-scoped) BETWEEN prepare and commit:
+		s.names = [{ name: 'RETURNS', target: { kind: 'range', range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 } } }];
+		assert.throws(() => prepared.commit!(s as unknown as McpWriteSessionPort), (e: unknown) => e instanceof McpToolError && /risk_escalated/.test(e.message));
+		assert.strictEqual(s.metadataCalls.length, 0, 'setName is NOT called when the rebind escalated');
+	});
+
+	test('define_named_range: a still-fresh name at commit applies normally (no escalation)', () => {
+		const { s, ctx } = ctxOf();
+		prepareDefineNamedRange(ctx, { name: 'returns', range: 'B2:B100' }).commit!(s as unknown as McpWriteSessionPort);
+		assert.deepStrictEqual(s.metadataCalls, [{ op: 'setName', detail: 'returns@s7:1,1-99,1' }]);
+	});
+
+	test('define_named_range: a sheet-qualified range conflicting with the sheet arg -> loud [ambiguous_sheet]', () => {
+		const { ctx } = ctxOf();
+		assert.throws(() => prepareDefineNamedRange(ctx, { name: 'x', range: 'S0!B2:B100', sheet: 'Data' }), (e: unknown) => e instanceof McpToolError && /ambiguous_sheet/.test(e.message));
+	});
+
+	test('delete_sheet: refuses to delete the LAST live sheet (D4 invariant) -> loud [last_sheet]', () => {
+		const s = new FakeWriteSession([{ id: 0, name: 'Only', cells: [] }]);
+		const ctx = makeCtx([styleGrid(s, 0, 'grid-0-sheet-0')], 'grid-0-sheet-0');
+		assert.throws(() => prepareDeleteSheet(ctx, { sheet: 0 }), (e: unknown) => e instanceof McpToolError && /last_sheet/.test(e.message));
+	});
+
+	test('delete_sheet: commit RE-CHECKS live sheets -> a delete that would strand the workbook (sheets removed during the modal) refuses LOUD', () => {
+		const sheetsArr = [{ id: 0, name: 'S0', cells: [] }, { id: 7, name: 'Data', cells: [] }];
+		const s = new FakeWriteSession(sheetsArr);
+		const ctx = makeCtx([styleGrid(s, 7, 'grid-0-sheet-7')], 'grid-0-sheet-7');
+		const prepared = prepareDeleteSheet(ctx, { sheet: 7 }); // 2 sheets -> passes the prepare-time guard
+		sheetsArr.splice(0, 1); // a GUI delete of S0 during the modal -> only sheet 7 remains live
+		assert.throws(() => prepared.commit!(s as unknown as McpWriteSessionPort), (e: unknown) => e instanceof McpToolError && /last_sheet/.test(e.message));
+		assert.strictEqual(s.metadataCalls.length, 0, 'deleteSheet is NOT called when it would strand the workbook');
+	});
+
+	test('delete_sheet: commit refuses LOUD if the TARGET sheet vanished since prepare', () => {
+		const sheetsArr = [{ id: 0, name: 'S0', cells: [] }, { id: 7, name: 'Data', cells: [] }, { id: 8, name: 'X', cells: [] }];
+		const s = new FakeWriteSession(sheetsArr);
+		const ctx = makeCtx([styleGrid(s, 7, 'grid-0-sheet-7')], 'grid-0-sheet-7');
+		const prepared = prepareDeleteSheet(ctx, { sheet: 7 });
+		sheetsArr.splice(1, 1); // sheet 7 (the target) deleted during the modal -> [0, 8] remain (2 sheets)
+		assert.throws(() => prepared.commit!(s as unknown as McpWriteSessionPort), (e: unknown) => e instanceof McpToolError && /unknown_sheet/.test(e.message));
+	});
+
+	test('define_table: a cell-ref-shaped TABLE name is rejected (table-identifier rule)', () => {
+		const { ctx } = ctxOf();
+		assert.throws(() => prepareDefineTable(ctx, { name: 'Q3', topRow: 0, topCol: 0, rows: 2, cols: 1, columnNames: ['c'] }), (e: unknown) => e instanceof McpToolError && /invalid table name/.test(e.message));
+	});
+
+	test('define_table: a column name with edge-whitespace / control char is rejected (structured-ref safety)', () => {
+		const { ctx } = ctxOf();
+		assert.throws(() => prepareDefineTable(ctx, { name: 'T', topRow: 0, topCol: 0, rows: 2, cols: 1, columnNames: [' Padded'] }), (e: unknown) => e instanceof McpToolError && /columnNames\[0\] invalid/.test(e.message));
+		assert.throws(() => prepareDefineTable(ctx, { name: 'T', topRow: 0, topCol: 0, rows: 2, cols: 1, columnNames: ['a\u0001b'] }), (e: unknown) => e instanceof McpToolError && /columnNames\[0\] invalid/.test(e.message));
+	});
+
+	test('define_table: ASCII-case-variant columns ("Px"/"px") reject; non-ASCII case pairs ("\u00c5"/"\u00e5") PASS (no over-reject)', () => {
+		const { ctx } = ctxOf();
+		assert.throws(() => prepareDefineTable(ctx, { name: 'T', topRow: 0, topCol: 0, rows: 2, cols: 2, columnNames: ['Px', 'px'] }), (e: unknown) => e instanceof McpToolError && /duplicate column name/.test(e.message));
+		// the engine folds ASCII case ONLY -> "\u00c5" and "\u00e5" are DISTINCT columns -> a valid table (no over-reject):
+		const { s, ctx: ctx2 } = ctxOf();
+		prepareDefineTable(ctx2, { name: 'Tbl', sheet: 'Data', topRow: 0, topCol: 0, rows: 2, cols: 2, columnNames: ['\u00c5', '\u00e5'] }).commit!(s as unknown as McpWriteSessionPort);
+		assert.strictEqual(s.metadataCalls.length, 1, '\u00c5 and \u00e5 are distinct under the engine ASCII fold -> table created');
+	});
+
+	test('define_table: OOXML-parity column names (internal space, digit-leading) still pass', () => {
+		const { s, ctx } = ctxOf();
+		prepareDefineTable(ctx, { name: 'Trades', sheet: 'Data', topRow: 0, topCol: 0, rows: 10, cols: 2, columnNames: ['Order Date', '2026 PnL'] }).commit!(s as unknown as McpWriteSessionPort);
+		assert.deepStrictEqual(s.metadataCalls, [{ op: 'createTable', detail: 'Trades@s7:0,0 10x2 cols=Order Date|2026 PnL' }]);
+	});
+
+	// --- the metadata risk is confirmable (mirrors the host uncovered-reason interplay) ---
+	test('a confirmed metadata reason leaves NO uncovered reason (the modal covers the destructive write)', () => {
+		const final = classifyWriteRisk([], noPrior, { metadata: { destructive: true, label: 'deletes sheet "Data"' } }).reasons;
+		const confirmed = new Set(final);
+		const uncovered = final.filter((r) => !confirmed.has(r));
+		assert.deepStrictEqual(final, ['destructive_metadata']);
+		assert.deepStrictEqual(uncovered, [], 'destructive_metadata is covered by the modal it always triggers');
+	});
+
+	test('the metadata summary never reads a misleading "0 cell(s)"', () => {
+		assert.ok(!/cell/.test(summarizeRisk(0, ['destructive_metadata'], false, 'deletes sheet "Data"')));
+		assert.ok(!/cell/.test(summarizeRisk(0, [], false, 'adds sheet "X"')));
+		// rebind_name carries its label and no cell count
+		const rebind = summarizeRisk(0, ['rebind_name'], false, 'redefines existing name "ret"');
+		assert.ok(/redefines existing name "ret"/.test(rebind) && !/cell/.test(rebind), rebind);
+		// hardening: a metadata reason with NO label (raw direct call) never yields an empty "0 cell(s): "
+		assert.ok(/metadata change/.test(summarizeRisk(0, ['destructive_metadata'], false, undefined)));
 	});
 });
