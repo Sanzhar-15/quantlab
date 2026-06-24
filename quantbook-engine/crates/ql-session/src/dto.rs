@@ -660,6 +660,49 @@ pub struct DirtyResult {
     pub version: SessionVersion,
 }
 
+/// **R23 SQL→cell lineage:** which producer wrote a tracked cell — the public
+/// mirror of the engine-internal `ProducerKind`, surfaced by
+/// [`crate::WorkbookSession::cell_lineage`]. Gates whether [`CellLineage::sql`]
+/// is present (only a `Query` carries SQL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageKind {
+    /// `materialize_query` — SQL-derived; the materialize SQL text is in `sql`.
+    Query,
+    /// `publish_dataset` (`qb.publish`) — a value matrix from a Python producer;
+    /// there is no SQL (`sql` is `None`).
+    Published,
+}
+
+/// **R23 SQL→cell lineage:** read-only lineage for a single cell, returned by
+/// [`crate::WorkbookSession::cell_lineage`]. Joins the dual provenance index
+/// (`cell → source` + `source → block`). `None` from `cell_lineage` means the
+/// cell was not produced by a tracked source (SQL materialize / qb.publish) —
+/// an ordinary user-typed cell has no lineage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellLineage {
+    /// The source id (`query_id` for a materialize, publish `name` for a
+    /// dataset) that last produced this cell.
+    pub source_id: String,
+    /// Which producer wrote it (gates whether `sql` is present).
+    pub kind: LineageKind,
+    /// Revision the source last wrote this cell at (`0` baseline; advanced by
+    /// `refresh_source`).
+    pub revision: u64,
+    /// The SQL text for a `Query` source (extracted from the stored payload);
+    /// `None` for a `Published` dataset.
+    pub sql: Option<String>,
+    /// The bounding rectangle of the cells the source ACTUALLY produced (its
+    /// materialized footprint) — the IDE highlights/reveals this as the source
+    /// block. This is the PRODUCED block, NOT the declared materialize/publish
+    /// target (which can be larger when the result has fewer rows/cols than the
+    /// target). The queried cell is one cell of it.
+    pub produced_range: CellRange,
+    /// How many cells the source produced in its last materialization (the cell
+    /// count of `produced_range` for a full rectangular result).
+    pub produced_cells: usize,
+}
+
 /// Severity of a [`Diagnostic`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

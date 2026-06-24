@@ -101,12 +101,12 @@ use ql_io::CellWireValue;
 use ql_oplog::Op;
 use ql_session::dto::{
     BatchOptions, BatchResult, BorderEdge as BorderEdgeDto, BorderStyle as BorderStyleDto,
-    Borders as BordersDto, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue, ChangedCell,
-    DateSystem, Diagnostic, DirtyResult, FormatDef, FormatId, FullRebuildReason,
-    HAlign as HAlignDto, NamedRange, NamedTargetDto, PublishedRef, RangeColumn, RangeQueryOptions,
-    RangeResult, RemovedCell, Rgb as RgbDto, SessionVersion, Severity, SheetInfo, SheetSnapshot,
-    Style as StyleDto, StyleDef, StyleId as StyleIdDto, TableSnapshot, TableSpec, UndoRedoResult,
-    WorkbookSnapshot, WorkbookSnapshotDelta, WriteRangeResult,
+    Borders as BordersDto, BoundRange, CellAddr, CellLineage, CellRange, CellSnapshot, CellValue,
+    ChangedCell, DateSystem, Diagnostic, DirtyResult, FormatDef, FormatId, FullRebuildReason,
+    HAlign as HAlignDto, LineageKind, NamedRange, NamedTargetDto, PublishedRef, RangeColumn,
+    RangeQueryOptions, RangeResult, RemovedCell, Rgb as RgbDto, SessionVersion, Severity,
+    SheetInfo, SheetSnapshot, Style as StyleDto, StyleDef, StyleId as StyleIdDto, TableSnapshot,
+    TableSpec, UndoRedoResult, WorkbookSnapshot, WorkbookSnapshotDelta, WriteRangeResult,
 };
 use ql_session::error::{EngineError, EngineResult, ErrorClass};
 use ql_session::function_meta::FunctionMetadata;
@@ -198,10 +198,9 @@ struct CellProvenance {
     /// The revision at which the source last wrote this cell. Starts at `0`
     /// for a direct `materialize_query`; updated to the caller-supplied
     /// revision on every successful `refresh_source`. Carried per the locked
-    /// typed-provenance contract (source_id + revision); v1 refresh dirties via
-    /// the source-level reverse index, so the per-cell revision is reserved for
-    /// future staleness checks and not yet read.
-    #[allow(dead_code)]
+    /// typed-provenance contract (source_id + revision). Read by `cell_lineage`
+    /// (R23) to report the cell's lineage revision; refresh still dirties via the
+    /// source-level reverse index.
     revision: u64,
 }
 
@@ -1907,6 +1906,8 @@ impl EngineSession for WorkbookSession {
         }];
         changes.extend(self.drain_spill_footprint());
         self.record_changes(changes);
+        // **R23 lineage:** a literal write retires any source attribution on this cell.
+        self.drop_cell_lineage(addr);
         Ok(())
     }
 
@@ -1925,6 +1926,8 @@ impl EngineSession for WorkbookSession {
         }];
         changes.extend(self.drain_spill_footprint());
         self.record_changes(changes);
+        // **R23 lineage:** a formula write retires any source attribution on this cell.
+        self.drop_cell_lineage(addr);
         Ok(())
     }
 
@@ -1942,6 +1945,10 @@ impl EngineSession for WorkbookSession {
         }];
         changes.extend(self.drain_spill_footprint());
         self.record_changes(changes);
+        // **R23 lineage:** `clear` (clear_formula) is a NO-OP on a value cell — and a
+        // source-produced cell is a value cell — so it never changes a tracked cell's
+        // content and must NOT drop lineage (the cell still holds the source's value).
+        // It only de-formulizes a formula cell, which is never source-produced.
         Ok(())
     }
 
@@ -2751,6 +2758,28 @@ impl EngineSession for WorkbookSession {
             Ok(())
         })
         .map_err(map_runtime_err)?;
+
+        // **R23 lineage:** a value/formula op overwrites the cell's content, so it
+        // retires any source attribution. `Clear` (clear_formula) is a NO-OP on a
+        // value cell (and a source-produced cell IS a value cell), so it does NOT
+        // drop lineage — consistent with the single-cell `clear`, and it is exactly
+        // the all-`Clear`-no-op batch that takes the empty-`inner_ops` early return
+        // above (so nothing is skipped here). Format/style ops also leave the source
+        // intact. Provenance recorders (materialize/publish via write_range -> batch)
+        // RE-establish the forward entry through `record_block_provenance` AFTER this
+        // returns (SetValue/SetFormula always yield non-empty `inner_ops`, so this
+        // loop is never skipped for them), so dropping here is transient for them and
+        // sticks only for genuine user value/formula writes.
+        for op in &ops {
+            match op {
+                SessionOp::SetValue { addr, .. } | SessionOp::SetFormula { addr, .. } => {
+                    self.drop_cell_lineage(*addr)
+                }
+                SessionOp::Clear { .. }
+                | SessionOp::SetFormat { .. }
+                | SessionOp::SetStyle { .. } => {}
+            }
+        }
 
         // --- Phase 4: advance state_seq exactly once for the whole batch. ---
         // **H3 (6.3-0):** fold in any spill-footprint targets touched by the
@@ -4240,6 +4269,104 @@ impl WorkbookSession {
                 cells: produced,
             },
         );
+    }
+
+    /// **R23 lineage:** a direct write over a cell drops its forward lineage entry
+    /// — the cell now holds user content, not a tracked source's output, so
+    /// `cell_lineage` must no longer attribute it to the source. The reverse index
+    /// (`provenance[source].cells`) is intentionally LEFT intact so
+    /// `refresh_source`'s dirty fan-out still covers the cell. Provenance recorders
+    /// (materialize/publish/refresh) write through `write_range`/`batch` and then
+    /// RE-establish the forward entry via `record_block_provenance`, so calling
+    /// this from the shared write path is transient for them and sticks only for
+    /// genuine user VALUE/FORMULA writes (`set_value`/`set_formula` + their `batch`
+    /// ops). `clear` (clear_formula) is a no-op on a value cell — which is what a
+    /// source-produced cell always is — so it is NOT a drop site.
+    fn drop_cell_lineage(&mut self, addr: CellAddr) {
+        self.cell_provenance.remove(&addr);
+    }
+
+    /// **R23 SQL→cell lineage:** read-only lineage for the cell at `addr`, joining
+    /// the dual provenance index — `cell_provenance` (cell → source) and
+    /// `provenance` (source → produced cells + producer payload). Returns
+    /// `Ok(None)` when the cell was not produced by a tracked source (an ordinary
+    /// user-typed/empty cell — a direct write over a previously source-produced
+    /// cell drops its forward entry, so this stays truthful). `sql` is `Some` only
+    /// for a `Query` (SQL materialize) source — extracted from the stored
+    /// `{"sql": "..."}` payload; a `Published` (`qb.publish`) dataset carries a
+    /// value matrix, not SQL, so its `sql` is `None`.
+    ///
+    /// Gates exactly like the sibling reads (`cell`): a non-readable session
+    /// (`[invalid_state]`), a deleted sheet (`[sheet_not_found]`), or an
+    /// out-of-grid address (`[bad_argument]`) fail LOUD — they never masquerade as
+    /// a plain `Ok(None)`. Pure read: borrows `&self`, mutates nothing, emits no
+    /// events.
+    pub fn cell_lineage(&self, addr: CellAddr) -> EngineResult<Option<CellLineage>> {
+        self.ensure_readable()?;
+        self.require_live_sheet(addr.sheet, "cell_lineage")?;
+        Self::require_in_bounds(addr.row, addr.col, "cell_lineage")?;
+
+        let cp = match self.cell_provenance.get(&addr) {
+            Some(cp) => cp,
+            None => return Ok(None),
+        };
+        // Invariant: every `cell_provenance` entry's `source_id` has a matching
+        // `provenance` entry — `record_block_provenance` inserts both, undo clears
+        // both, `refresh_source` keeps them paired. A missing entry is a
+        // structural inconsistency — surface it LOUD as an internal error rather
+        // than silently report "no lineage" (No-Fallbacks).
+        let entry = self.provenance.get(&cp.source_id).ok_or_else(|| {
+            EngineError::new(
+                ErrorClass::Internal,
+                "lineage_inconsistent",
+                format!(
+                    "cell_lineage: cell ({}, {}, {}) is owned by source '{}' with no \
+                     provenance entry",
+                    addr.sheet, addr.row, addr.col, cp.source_id
+                ),
+            )
+        })?;
+        let (kind, sql) = match entry.kind {
+            ProducerKind::Query => (
+                LineageKind::Query,
+                entry
+                    .data
+                    .get("sql")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            ),
+            ProducerKind::Published => (LineageKind::Published, None),
+        };
+        // The produced block = the bounding rectangle of the cells the source
+        // ACTUALLY produced (NOT the declared `entry.target`, which can be larger
+        // than a short result). `entry.cells` is non-empty here: the queried cell
+        // is owned by this source, hence one of its produced cells. All produced
+        // cells share `addr.sheet` (a source materializes into one sheet).
+        let mut min_row = addr.row;
+        let mut max_row = addr.row;
+        let mut min_col = addr.col;
+        let mut max_col = addr.col;
+        for c in &entry.cells {
+            min_row = min_row.min(c.row);
+            max_row = max_row.max(c.row);
+            min_col = min_col.min(c.col);
+            max_col = max_col.max(c.col);
+        }
+        let produced_range = CellRange {
+            sheet: addr.sheet,
+            start_row: min_row,
+            start_col: min_col,
+            end_row: max_row,
+            end_col: max_col,
+        };
+        Ok(Some(CellLineage {
+            source_id: cp.source_id.clone(),
+            kind,
+            revision: cp.revision,
+            sql,
+            produced_range,
+            produced_cells: entry.cells.len(),
+        }))
     }
 }
 
@@ -6278,6 +6405,263 @@ mod tests {
         let dirty = s.refresh_source("src_empty", 1).unwrap();
         // The re-run still produces zero rows (same query), so dirtied == 0.
         assert_eq!(dirty.dirtied, 0);
+    }
+
+    /// **R23:** `cell_lineage` reports a SQL-materialized cell's source, kind, SQL
+    /// text, and the produced block — and every cell of the block shares it.
+    #[test]
+    fn cell_lineage_query_cell_reports_sql_and_block() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 1, 0), vec![vec![num(1.0)], vec![num(2.0)]])
+            .unwrap();
+        let sql = "SELECT A FROM S ORDER BY A";
+        s.materialize_query("q1", rng(sheet, 0, 2, 1, 2), sql_data(sql))
+            .unwrap();
+
+        let lin = s
+            .cell_lineage(addr(sheet, 0, 2))
+            .unwrap()
+            .expect("C1 is query-produced");
+        assert_eq!(lin.source_id, "q1");
+        assert_eq!(lin.kind, LineageKind::Query);
+        assert_eq!(lin.sql.as_deref(), Some(sql));
+        assert_eq!(lin.revision, 0);
+        assert_eq!(lin.produced_range, rng(sheet, 0, 2, 1, 2));
+        assert_eq!(lin.produced_cells, 2);
+
+        // The sibling cell of the same block reports the identical lineage.
+        let lin2 = s
+            .cell_lineage(addr(sheet, 1, 2))
+            .unwrap()
+            .expect("C2 is query-produced");
+        assert_eq!(lin2.source_id, "q1");
+        assert_eq!(lin2.produced_range, rng(sheet, 0, 2, 1, 2));
+    }
+
+    /// **R23:** an ordinary user-typed cell (and a never-written cell) has no
+    /// lineage — `cell_lineage` returns `Ok(None)`, not a fabricated entry.
+    #[test]
+    fn cell_lineage_none_for_user_typed_cell() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(42.0)]])
+            .unwrap();
+        assert!(
+            s.cell_lineage(addr(sheet, 0, 0)).unwrap().is_none(),
+            "a user-typed cell has no lineage"
+        );
+        assert!(
+            s.cell_lineage(addr(sheet, 5, 5)).unwrap().is_none(),
+            "a never-written cell has no lineage"
+        );
+    }
+
+    /// **R23:** a `publish_dataset` (qb.publish) cell reports `Published` lineage
+    /// with NO SQL (its payload is a value matrix, not a query).
+    #[test]
+    fn cell_lineage_published_cell_has_no_sql() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let data = serde_json::json!({"values": [["AAPL", 192.5, true]]});
+        s.publish_dataset("prices", data, rng(sheet, 0, 0, 0, 2))
+            .unwrap();
+        let lin = s
+            .cell_lineage(addr(sheet, 0, 1))
+            .unwrap()
+            .expect("a published cell has lineage");
+        assert_eq!(lin.source_id, "prices");
+        assert_eq!(lin.kind, LineageKind::Published);
+        assert_eq!(lin.sql, None, "a published dataset carries no SQL");
+        assert_eq!(lin.produced_range, rng(sheet, 0, 0, 0, 2));
+        assert_eq!(lin.produced_cells, 3);
+    }
+
+    /// **R23:** `refresh_source` advances the per-cell revision that `cell_lineage`
+    /// reports, while keeping the source id and SQL intact.
+    #[test]
+    fn cell_lineage_revision_advances_after_refresh() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(7.0)]])
+            .unwrap();
+        let sql = "SELECT A FROM S";
+        s.materialize_query("q", rng(sheet, 0, 2, 0, 2), sql_data(sql))
+            .unwrap();
+        assert_eq!(
+            s.cell_lineage(addr(sheet, 0, 2)).unwrap().unwrap().revision,
+            0
+        );
+
+        s.refresh_source("q", 1).unwrap();
+        let lin = s
+            .cell_lineage(addr(sheet, 0, 2))
+            .unwrap()
+            .expect("still query-produced after refresh");
+        assert_eq!(lin.revision, 1, "refresh advances the lineage revision");
+        assert_eq!(lin.sql.as_deref(), Some(sql));
+    }
+
+    /// **R23 (Codex BLOCKER fold):** a direct user VALUE/FORMULA write over a
+    /// source-produced cell RETIRES its lineage — `cell_lineage` must no longer
+    /// attribute the now-user-owned cell to the source.
+    #[test]
+    fn cell_lineage_dropped_after_user_overwrite() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 1, 0), vec![vec![num(1.0)], vec![num(2.0)]])
+            .unwrap();
+        s.materialize_query(
+            "q",
+            rng(sheet, 0, 2, 1, 2),
+            sql_data("SELECT A FROM S ORDER BY A"),
+        )
+        .unwrap();
+        // C1, C2 both start with lineage.
+        assert!(s.cell_lineage(addr(sheet, 0, 2)).unwrap().is_some());
+        assert!(s.cell_lineage(addr(sheet, 1, 2)).unwrap().is_some());
+
+        // set_value over C1 -> lineage dropped; sibling untouched.
+        s.set_value(addr(sheet, 0, 2), num(99.0)).unwrap();
+        assert!(
+            s.cell_lineage(addr(sheet, 0, 2)).unwrap().is_none(),
+            "set_value retires lineage"
+        );
+        assert!(s.cell_lineage(addr(sheet, 1, 2)).unwrap().is_some());
+
+        // set_formula over C2 -> dropped (raw source, no leading `=`).
+        s.set_formula(addr(sheet, 1, 2), "1+1").unwrap();
+        assert!(
+            s.cell_lineage(addr(sheet, 1, 2)).unwrap().is_none(),
+            "set_formula retires lineage"
+        );
+    }
+
+    /// **R23 (Codex re-audit fold):** `clear` (clear_formula) is a NO-OP on a
+    /// source-produced VALUE cell — the value is preserved — so lineage is KEPT
+    /// (the cell still holds the source's output). A real content-clear
+    /// (`set_value` with a Blank) DOES retire it. This is why neither the
+    /// single-cell `clear` nor the batch `Clear` op is a lineage-drop site.
+    #[test]
+    fn cell_lineage_kept_after_noop_clear_dropped_after_blank() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(5.0)]])
+            .unwrap();
+        s.materialize_query("q", rng(sheet, 0, 2, 0, 2), sql_data("SELECT A FROM S"))
+            .unwrap();
+
+        // clear on the materialized value cell: no-op (value preserved) -> lineage kept.
+        s.clear(addr(sheet, 0, 2)).unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value,
+            Some(num(5.0)),
+            "clear is a no-op on a value cell (value preserved)"
+        );
+        assert!(
+            s.cell_lineage(addr(sheet, 0, 2)).unwrap().is_some(),
+            "lineage is kept when clear did not change the cell"
+        );
+
+        // A real content-clear (Blank value) retires lineage.
+        s.set_value(addr(sheet, 0, 2), CellValue::Blank).unwrap();
+        assert!(
+            s.cell_lineage(addr(sheet, 0, 2)).unwrap().is_none(),
+            "a Blank set_value retires lineage"
+        );
+    }
+
+    /// **R23 (Codex BLOCKER fold):** a bulk user write (`write_range` -> `batch`)
+    /// over a produced block retires the lineage of every overwritten cell, while
+    /// a value/formula recorder (materialize) still establishes lineage.
+    #[test]
+    fn cell_lineage_dropped_after_range_overwrite() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 1, 0), vec![vec![num(1.0)], vec![num(2.0)]])
+            .unwrap();
+        s.materialize_query(
+            "q",
+            rng(sheet, 0, 2, 1, 2),
+            sql_data("SELECT A FROM S ORDER BY A"),
+        )
+        .unwrap();
+        assert!(s.cell_lineage(addr(sheet, 0, 2)).unwrap().is_some());
+        assert!(s.cell_lineage(addr(sheet, 1, 2)).unwrap().is_some());
+
+        // User pastes a range over the whole produced block.
+        s.write_range(rng(sheet, 0, 2, 1, 2), vec![vec![num(7.0)], vec![num(8.0)]])
+            .unwrap();
+        assert!(
+            s.cell_lineage(addr(sheet, 0, 2)).unwrap().is_none(),
+            "write_range retires lineage"
+        );
+        assert!(s.cell_lineage(addr(sheet, 1, 2)).unwrap().is_none());
+    }
+
+    /// **R23 (Codex MED fold):** `produced_range` is the actual produced block
+    /// (bounding box of written cells), NOT the larger declared target.
+    #[test]
+    fn cell_lineage_produced_range_is_block_not_target() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(
+            rng(sheet, 0, 0, 2, 0),
+            vec![vec![num(1.0)], vec![num(2.0)], vec![num(3.0)]],
+        )
+        .unwrap();
+        // Target C1:C100 but the query returns only 2 rows -> produced block C1:C2.
+        s.materialize_query(
+            "q",
+            rng(sheet, 0, 2, 99, 2),
+            sql_data("SELECT A FROM S WHERE A < 3 ORDER BY A"),
+        )
+        .unwrap();
+        let lin = s
+            .cell_lineage(addr(sheet, 0, 2))
+            .unwrap()
+            .expect("C1 produced");
+        assert_eq!(
+            lin.produced_range,
+            rng(sheet, 0, 2, 1, 2),
+            "produced block is C1:C2, not the C1:C100 target"
+        );
+        assert_eq!(lin.produced_cells, 2);
+    }
+
+    /// **R23 (Lane-2 fold):** undo clears both provenance maps, so a materialized
+    /// cell has no lineage after the materialize is undone.
+    #[test]
+    fn cell_lineage_none_after_undo() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.write_range(rng(sheet, 0, 0, 0, 0), vec![vec![num(5.0)]])
+            .unwrap();
+        s.materialize_query("q", rng(sheet, 0, 2, 0, 2), sql_data("SELECT A FROM S"))
+            .unwrap();
+        assert!(s.cell_lineage(addr(sheet, 0, 2)).unwrap().is_some());
+        s.undo().unwrap();
+        assert!(
+            s.cell_lineage(addr(sheet, 0, 2)).unwrap().is_none(),
+            "undo clears lineage"
+        );
+    }
+
+    /// **R23 (Codex HIGH fold):** `cell_lineage` gates like the sibling reads — an
+    /// unknown/deleted sheet fails `[sheet_not_found]`, an out-of-grid address fails
+    /// `[bad_argument]`, and a closed session fails `[invalid_state]` — none of these
+    /// masquerade as `Ok(None)`.
+    #[test]
+    fn cell_lineage_gating() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let miss = s.cell_lineage(addr(99, 0, 0)).unwrap_err();
+        assert_eq!(miss.code, "sheet_not_found");
+        let oob = s.cell_lineage(addr(sheet, 9_999_999, 0)).unwrap_err();
+        assert_eq!(oob.code, "bad_argument");
+        s.close().unwrap();
+        let closed = s.cell_lineage(addr(sheet, 0, 0)).unwrap_err();
+        assert_eq!(closed.code, "invalid_state");
     }
 
     /// refresh_source on an unknown source_id returns source_not_found (NotFound).

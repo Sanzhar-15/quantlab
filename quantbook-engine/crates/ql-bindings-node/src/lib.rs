@@ -6311,6 +6311,37 @@ pub struct BoundRangeJson {
     pub binding_id: String,
 }
 
+/// **R23 SQL→cell lineage:** JS-facing lineage for a single cell (mirrors
+/// [`ql_session::CellLineage`]). Returned by `Session.cellLineage`; the JS side
+/// receives `null` when the cell has no tracked lineage (an ordinary user-typed
+/// cell). `kind` is `"query"` | `"published"`; `sql` is present ONLY for
+/// `"query"` (napi `Option::None` serializes as absent/`undefined`, never
+/// `null`). The `produced*` fields are the bounding rectangle of the cells the
+/// source ACTUALLY produced (NOT the larger declared target), emitted as `u32`
+/// and read directly — this is an OUTPUT, no `f64` widening, matching the
+/// `NamedRangeTargetJson`/`TableSnapshotJson` read convention.
+#[napi(object)]
+pub struct CellLineageJson {
+    /// The source id (`queryId` for a materialize, publish `name` for a dataset).
+    pub source_id: String,
+    /// `"query"` (SQL-derived) or `"published"` (qb.publish value matrix).
+    pub kind: String,
+    /// The materialize SQL text — present only when `kind == "query"`.
+    pub sql: Option<String>,
+    /// Anchor sheet of the produced block.
+    pub produced_sheet: u32,
+    /// Inclusive top-left row of the produced block.
+    pub produced_start_row: u32,
+    /// Inclusive top-left column of the produced block.
+    pub produced_start_col: u32,
+    /// Inclusive bottom-right row of the produced block.
+    pub produced_end_row: u32,
+    /// Inclusive bottom-right column of the produced block.
+    pub produced_end_col: u32,
+    /// How many cells the source produced in its last materialization.
+    pub produced_cells: u32,
+}
+
 /// **Phase 6.3-2a (2026-05-30):** which extras a `queryRange` read includes
 /// (mirrors [`ql_session::RangeQueryOptions`]). In v1 the engine fail-loud
 /// rejects any `true` here with `not_implemented_in_v1_core` (the columnar value
@@ -8243,6 +8274,48 @@ impl Session {
                 .materialize_query(&query_id, target, data)
                 .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(PublishedRefJson { id: result.id })
+        })
+    }
+
+    /// **R23 SQL→cell lineage:** read the lineage of the cell at `(sheet,row,col)`
+    /// — which SQL query / published dataset produced it, plus the produced block.
+    /// A pure read (mutates nothing). Returns `null` (`None`) when the cell was not
+    /// produced by a tracked source — an ordinary user-typed/empty cell (a direct
+    /// write retires lineage). `sql` is present only for a `"query"` source. Gates
+    /// like the sibling reads: `[invalid_state]` off a readable session,
+    /// `[sheet_not_found]` for a deleted sheet, `[bad_argument]` for out-of-grid
+    /// coords.
+    #[napi(js_name = "cellLineage", catch_unwind)]
+    pub fn cell_lineage(
+        &self,
+        env: Env,
+        sheet: f64,
+        row: f64,
+        col: f64,
+    ) -> Result<Option<CellLineageJson>> {
+        guarded(env, "cellLineage", || {
+            let addr = session_addr_from_f64("cellLineage", sheet, row, col)?;
+            // Release the lock before building the JSON — `cell_lineage` returns
+            // owned data (clones / Copy), so nothing borrows the guard.
+            let lineage = self
+                .inner
+                .lock()
+                .cell_lineage(addr)
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(lineage.map(|l| CellLineageJson {
+                source_id: l.source_id,
+                kind: match l.kind {
+                    ql_session::LineageKind::Query => "query".to_string(),
+                    ql_session::LineageKind::Published => "published".to_string(),
+                },
+                sql: l.sql,
+                produced_sheet: u32::from(l.produced_range.sheet),
+                produced_start_row: l.produced_range.start_row,
+                produced_start_col: l.produced_range.start_col,
+                produced_end_row: l.produced_range.end_row,
+                produced_end_col: l.produced_range.end_col,
+                produced_cells: l.produced_cells as u32,
+            }))
         })
     }
 
