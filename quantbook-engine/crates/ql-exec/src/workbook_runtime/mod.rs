@@ -55,6 +55,7 @@ use crate::plan_cache::{PlanCache, PlanCacheStats};
 // commit hashes lives in `docs/PHASE-4-V2-BACKLOG.md` § D1; design
 // in `docs/architecture/workbook-runtime-split-design.md`.
 mod cells;
+mod charts;
 mod config;
 mod error;
 mod formats;

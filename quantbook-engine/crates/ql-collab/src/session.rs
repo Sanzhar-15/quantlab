@@ -1684,6 +1684,15 @@ impl CollabSession {
             // a `_ => {}` fall-through) per the walker-completeness guardrail
             // below, so a future auditor sees the decision was deliberate.
             Op::SetRowsHidden { .. } => {}
+            // **Wave Q1 (v12):** chart objects are inert workbook metadata -- no
+            // cell value/formula/format/style/position, no sheet existence -- and
+            // have no representation in the cell-keyed `last_snapshot` cache, so
+            // they emit NO cache effect. An EXPLICIT arm (not a `_ => {}`
+            // fall-through) per the walker-completeness guardrail below, so a
+            // future auditor sees the decision was deliberate. (A chart op forces
+            // a full rebuild via `classify_delta_op`; the IDE refetches via
+            // `listCharts`.)
+            Op::AddChart { .. } | Op::UpdateChart { .. } | Op::RemoveChart { .. } => {}
             // Malformed delete (`start > end` OR `end > axis_max`; storage
             // rejects either) + any other op → no cache effect.
             //
@@ -3098,6 +3107,17 @@ impl CollabSession {
             // effects for the batch — matching the rolled-back Workbook.
             Op::SetRowsHidden { rows, .. } => rows.iter().any(|r| *r > ql_types::MAX_ROW),
             Op::BatchCommit { ops } => ops.iter().any(Self::op_statically_aborts_batch),
+            // **Wave Q1 (v1.5-deferred, w119):** a chart op (`AddChart`/
+            // `UpdateChart`) statically aborts replay on an unknown `chart_type`
+            // token (`ReplayError::UnknownChartKind`), but that reject is NOT
+            // mirrored here, so a malformed chart op nested in a `BatchCommit`
+            // would let the cache walker emit the batch's OTHER (cell) effects
+            // while replay rolls the whole batch back -> a cache desync for the
+            // cache-only reads (`exportSnapshot`). Reachable ONLY via a
+            // hand-crafted / merged op log (the producer validates `chart_type`
+            // before emitting AddChart), i.e. a collab/import path. Operator
+            // decision (w119): defer to the v1.5 collab phase; pinned by
+            // `chart_op_does_not_statically_abort_batch_v1_5_deferred`.
             _ => false,
         }
     }
@@ -4933,6 +4953,42 @@ mod tests {
             col,
             value: CellWireValue::Number(n),
         }
+    }
+
+    /// **Wave Q1 v1.5-deferred pin (w119 fold).** `op_statically_aborts_batch`
+    /// does NOT yet recognize a malformed chart op (unknown `chart_type`) as a
+    /// static batch-abort, even though replay rejects it
+    /// (`ReplayError::UnknownChartKind`). Collab-only scaffolding (reachable only
+    /// via a hand-crafted / merged op log; the producer never emits an invalid
+    /// `chart_type`); peer-safe chart collab is a v1.5 phase. Locks current
+    /// behavior so a future fix is a deliberate, noticed change.
+    #[test]
+    fn chart_op_does_not_statically_abort_batch_v1_5_deferred() {
+        let bad = Op::AddChart {
+            id: 0,
+            name: "c".to_owned(),
+            chart_type: "pie".to_owned(), // unknown -> replay would abort
+            sheet: 0,
+            anchor_row: 0,
+            anchor_col: 0,
+            width_px: 100,
+            height_px: 100,
+            src_sheet: 0,
+            src_start_row: 0,
+            src_start_col: 0,
+            src_end_row: 1,
+            src_end_col: 1,
+            title: None,
+        };
+        assert!(
+            !CollabSession::op_statically_aborts_batch(&bad),
+            "v1.5-deferred: an unknown chart_type is not yet statically detected"
+        );
+        let batch = Op::BatchCommit { ops: vec![bad] };
+        assert!(
+            !CollabSession::op_statically_aborts_batch(&batch),
+            "v1.5-deferred: nested malformed chart op not detected in a batch"
+        );
     }
 
     /// V3.4.0.2 test helper -- mirrors `put_value` for formula ops.

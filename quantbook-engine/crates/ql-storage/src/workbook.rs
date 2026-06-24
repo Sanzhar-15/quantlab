@@ -323,6 +323,11 @@ pub struct Workbook {
     /// the qbook loader + tests. See `crates/ql-storage/src/tables.rs`
     /// module docs.
     tables: crate::TableTable,
+    /// **Wave Q1 (2026-06-23):** workbook-level chart-object registry.
+    /// Mirrors `tables` (the `TableTable`) but id-keyed. Mutation API is in
+    /// `WorkbookRuntime::add_chart` etc.; direct access here is for the
+    /// qbook loader + tests. See `crates/ql-storage/src/charts.rs` module docs.
+    charts: crate::ChartTable,
     /// **W5-133 (Phase 4.9.A):** formula-text reference mode. A
     /// workbook-level user preference; default `A1`. Storage canon
     /// stays A1 regardless of this setting — `R1C1` only affects how
@@ -642,6 +647,22 @@ impl Workbook {
     ) -> Option<&crate::TableMetadata> {
         self.tables
             .table_at(ql_types::Address::new(sheet, row, col))
+    }
+
+    // ===== Wave Q1 (2026-06-23): chart-object registry =====
+
+    /// **Wave Q1:** read access to the workbook's chart registry. See
+    /// `crate::ChartTable` and `crates/ql-storage/src/charts.rs`.
+    pub fn charts(&self) -> &crate::ChartTable {
+        &self.charts
+    }
+
+    /// **Wave Q1 — LOW-LEVEL.** Mutable access to the chart registry.
+    /// Bypasses the op log silently; product mutations go through
+    /// `WorkbookRuntime::add_chart` etc. which emit op-log entries. Direct
+    /// callers: qbook loader, tests, engine-internal reconstruction.
+    pub fn charts_mut(&mut self) -> &mut crate::ChartTable {
+        &mut self.charts
     }
 
     /// Phase 2A.1 convenience: register a name → target binding on the workbook's

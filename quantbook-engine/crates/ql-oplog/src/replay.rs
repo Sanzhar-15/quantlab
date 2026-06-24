@@ -306,6 +306,21 @@ pub enum ReplayError {
         #[source]
         source: ql_storage::StructuralEditError,
     },
+
+    /// **Wave Q1 (2026-06-23):** an `Op::AddChart`/`UpdateChart` carried a
+    /// `chart_type` token that isn't `"line"`/`"bar"`/`"scatter"`
+    /// (`ql_storage::ChartKind::from_wire_str` returned `None`). Surfaced
+    /// rather than silently defaulting. Parallels `UnknownReferenceMode`.
+    #[error("replay unknown chart kind at op index {index}: {found:?}")]
+    UnknownChartKind { index: usize, found: String },
+
+    /// **Wave Q1 (2026-06-23):** an `Op::UpdateChart` referenced a chart id
+    /// that isn't present. In a valid op log an `UpdateChart` always follows
+    /// the matching `AddChart`, so this indicates op-log corruption or a
+    /// producer that bypassed validation. (`RemoveChart` of a missing id is
+    /// an idempotent no-op, not this error — mirroring `DropTable`.)
+    #[error("replay update-chart references unknown chart id {id} at op index {index}")]
+    ChartNotFound { index: usize, id: u32 },
 }
 
 /// Wrapper around `ql_storage::FormatTableError` that owns its strings,
@@ -1252,7 +1267,148 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             }
             Err(found) => Err(ReplayError::UnknownDateSystem { index, found }),
         },
+        Op::AddChart {
+            id,
+            name,
+            chart_type,
+            sheet,
+            anchor_row,
+            anchor_col,
+            width_px,
+            height_px,
+            src_sheet,
+            src_start_row,
+            src_start_col,
+            src_end_row,
+            src_end_col,
+            title,
+        } => {
+            let chart = decode_chart(
+                index,
+                *id,
+                name,
+                chart_type,
+                *sheet,
+                *anchor_row,
+                *anchor_col,
+                *width_px,
+                *height_px,
+                *src_sheet,
+                *src_start_row,
+                *src_start_col,
+                *src_end_row,
+                *src_end_col,
+                title,
+            )?;
+            // Idempotent-skip: an AddChart whose id is already present is a
+            // no-op (replay re-runnability + CRDT convergence). Charts are
+            // inert metadata (no cell registration), so a re-add cannot
+            // corrupt grid state.
+            if workbook.charts().lookup(*id).is_none() {
+                workbook.charts_mut().insert(chart);
+            }
+            Ok(())
+        }
+        Op::UpdateChart {
+            id,
+            name,
+            chart_type,
+            sheet,
+            anchor_row,
+            anchor_col,
+            width_px,
+            height_px,
+            src_sheet,
+            src_start_row,
+            src_start_col,
+            src_end_row,
+            src_end_col,
+            title,
+        } => {
+            let chart = decode_chart(
+                index,
+                *id,
+                name,
+                chart_type,
+                *sheet,
+                *anchor_row,
+                *anchor_col,
+                *width_px,
+                *height_px,
+                *src_sheet,
+                *src_start_row,
+                *src_start_col,
+                *src_end_row,
+                *src_end_col,
+                title,
+            )?;
+            // A missing id is a divergence: in a valid log an UpdateChart
+            // always follows the matching AddChart. Fail loudly.
+            if workbook.charts().lookup(*id).is_none() {
+                return Err(ReplayError::ChartNotFound { index, id: *id });
+            }
+            workbook.charts_mut().insert(chart);
+            Ok(())
+        }
+        Op::RemoveChart { id } => {
+            // Idempotent no-op when the id is already gone (mirrors
+            // `DropTable`'s advisory-skip for CRDT convergence).
+            let _ = workbook.charts_mut().remove(*id);
+            Ok(())
+        }
     }
+}
+
+/// **Wave Q1 (2026-06-23):** decode an `AddChart`/`UpdateChart` op's wire
+/// fields into a [`ql_storage::ChartObject`]. The only fallible step is the
+/// `chart_type` token (`"line"`/`"bar"`/`"scatter"`); an unknown token
+/// surfaces [`ReplayError::UnknownChartKind`] rather than silently
+/// defaulting. Charts are inert metadata (they never register cells), so —
+/// unlike table footprints — out-of-range anchor/source coordinates cannot
+/// panic the storage layer and are not re-validated here (the producer
+/// validates at the napi boundary).
+#[allow(clippy::too_many_arguments)]
+fn decode_chart(
+    index: usize,
+    id: u32,
+    name: &str,
+    chart_type: &str,
+    sheet: SheetId,
+    anchor_row: RowId,
+    anchor_col: ColId,
+    width_px: u32,
+    height_px: u32,
+    src_sheet: SheetId,
+    src_start_row: RowId,
+    src_start_col: ColId,
+    src_end_row: RowId,
+    src_end_col: ColId,
+    title: &Option<String>,
+) -> Result<ql_storage::ChartObject, ReplayError> {
+    let kind = ql_storage::ChartKind::from_wire_str(chart_type).ok_or_else(|| {
+        ReplayError::UnknownChartKind {
+            index,
+            found: chart_type.to_string(),
+        }
+    })?;
+    Ok(ql_storage::ChartObject {
+        id,
+        name: name.to_string(),
+        chart_type: kind,
+        sheet,
+        anchor_row,
+        anchor_col,
+        width_px,
+        height_px,
+        source_range: ql_types::Range::new(
+            src_sheet,
+            src_start_row,
+            src_start_col,
+            src_end_row,
+            src_end_col,
+        ),
+        title: title.clone(),
+    })
 }
 
 /// **W5-119 (Phase 4.8.I) + Phase 5.3 step 4 (2026-05-20):**
@@ -1933,6 +2089,147 @@ mod tests {
         assert_eq!(wb.formula_at(0, 0, 0).map(|s| s.as_ref()), Some("A1 + 1"));
         // ... value NOT evaluated (replay leaves recompute to the caller).
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Blank);
+    }
+
+    // ===== Wave Q1 (2026-06-23) — chart op replay =====
+
+    fn add_chart_op(id: u32, kind: &str) -> Op {
+        Op::AddChart {
+            id,
+            name: format!("chart{id}"),
+            chart_type: kind.to_string(),
+            sheet: 0,
+            anchor_row: 1,
+            anchor_col: 1,
+            width_px: 100,
+            height_px: 100,
+            src_sheet: 0,
+            src_start_row: 0,
+            src_start_col: 0,
+            src_end_row: 5,
+            src_end_col: 0,
+            title: None,
+        }
+    }
+
+    #[test]
+    fn replay_add_chart_lands_in_store() {
+        let mut log = OpLog::new();
+        log.append(add_chart_op(0, "line")).unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.charts().len(), 1);
+        assert_eq!(
+            wb.charts().lookup(0).unwrap().chart_type,
+            ql_storage::ChartKind::Line
+        );
+    }
+
+    #[test]
+    fn replay_duplicate_add_chart_is_idempotent_skip() {
+        // A re-applied AddChart for an already-present id is a no-op skip (NOT an
+        // error, NOT an overwrite) — replay re-runnability + CRDT convergence.
+        let mut log = OpLog::new();
+        log.append(add_chart_op(0, "line")).unwrap();
+        log.append(add_chart_op(0, "bar")).unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.charts().len(), 1, "duplicate id skipped, not double-inserted");
+        assert_eq!(
+            wb.charts().lookup(0).unwrap().chart_type,
+            ql_storage::ChartKind::Line,
+            "first AddChart wins; the duplicate is skipped (not an overwrite)"
+        );
+    }
+
+    #[test]
+    fn replay_add_then_remove_chart_leaves_empty() {
+        let mut log = OpLog::new();
+        log.append(add_chart_op(3, "scatter")).unwrap();
+        log.append(Op::RemoveChart { id: 3 }).unwrap();
+        // A RemoveChart for a missing id is an idempotent no-op (mirrors DropTable).
+        log.append(Op::RemoveChart { id: 99 }).unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert!(wb.charts().is_empty());
+    }
+
+    #[test]
+    fn replay_update_chart_preserves_id_and_replaces_state() {
+        // The id-stability pin: AddChart's id survives the full replay so a later
+        // UpdateChart referencing that id still hits (the reason AddChart carries
+        // the id on the wire rather than re-allocating at replay).
+        let mut log = OpLog::new();
+        log.append(add_chart_op(7, "line")).unwrap();
+        log.append(Op::UpdateChart {
+            id: 7,
+            name: "renamed".to_string(),
+            chart_type: "scatter".to_string(),
+            sheet: 0,
+            anchor_row: 9,
+            anchor_col: 9,
+            width_px: 200,
+            height_px: 200,
+            src_sheet: 0,
+            src_start_row: 0,
+            src_start_col: 0,
+            src_end_row: 1,
+            src_end_col: 1,
+            title: Some("t".to_string()),
+        })
+        .unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        let c = wb.charts().lookup(7).expect("chart 7 present after update");
+        assert_eq!(c.chart_type, ql_storage::ChartKind::Scatter, "update replaced kind");
+        assert_eq!(c.name, "renamed");
+        assert_eq!(c.anchor_row, 9);
+    }
+
+    #[test]
+    fn replay_unknown_chart_kind_errors_loudly() {
+        let mut log = OpLog::new();
+        log.append(add_chart_op(0, "pie")).unwrap(); // not a v1 kind
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        assert!(
+            matches!(err, ReplayError::UnknownChartKind { ref found, .. } if found == "pie"),
+            "expected UnknownChartKind, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn replay_update_missing_chart_errors_loudly() {
+        let mut log = OpLog::new();
+        log.append(Op::UpdateChart {
+            id: 1,
+            name: "x".to_string(),
+            chart_type: "line".to_string(),
+            sheet: 0,
+            anchor_row: 0,
+            anchor_col: 0,
+            width_px: 1,
+            height_px: 1,
+            src_sheet: 0,
+            src_start_row: 0,
+            src_start_col: 0,
+            src_end_row: 0,
+            src_end_col: 0,
+            title: None,
+        })
+        .unwrap();
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        assert!(
+            matches!(err, ReplayError::ChartNotFound { id: 1, .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

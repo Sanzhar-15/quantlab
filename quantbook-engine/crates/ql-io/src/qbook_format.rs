@@ -221,7 +221,15 @@ use thiserror::Error;
 ///     schema-version gate, and the `SheetEnvelope`'s `deny_unknown_fields`
 ///     would also reject the new `hidden_rows` key — a stale reader fails
 ///     loudly rather than silently dropping the hidden-row state.
-pub const WORKBOOK_SCHEMA_VERSION: u32 = 11;
+///   - **v12 (Wave Q1, 2026-06-23):** adds the top-level
+///     `chart_objects: Option<ChartObjectsSection>` section (basic line/bar/
+///     scatter chart objects anchored on the grid). Additive `Option` with
+///     `#[serde(default)]`, so a v12 reader loads v1-v11 envelopes (absent ⇒ no
+///     charts); a v<12 reader loading a v12 file is refused at the
+///     schema-version gate, and the envelope's `deny_unknown_fields` would also
+///     reject the new `chart_objects` key — a stale reader fails loudly rather
+///     than silently dropping the chart state.
+pub const WORKBOOK_SCHEMA_VERSION: u32 = 12;
 
 /// The earliest schema version this reader still accepts. v1 fixtures (Phase 1)
 /// continue to load on v2 binaries; older versions would need explicit handling.
@@ -428,6 +436,14 @@ pub enum QbookError {
     #[error("malformed table {name:?}: {reason}")]
     MalformedTable { name: String, reason: String },
 
+    /// **Wave Q1 (2026-06-23; v12):** an entry in the envelope's
+    /// `[[chart_objects]]` section failed a structural invariant — currently
+    /// only an unknown `chart_type` token (not `"line"`/`"bar"`/`"scatter"`).
+    /// A hand-edited or corrupted v12 envelope surfaces here loudly rather than
+    /// silently dropping or defaulting the chart.
+    #[error("malformed chart id {id}: {reason}")]
+    MalformedChart { id: u32, reason: String },
+
     /// **W5-145 (Phase 4.9.I):** the envelope's `locale` field has a
     /// string value that doesn't match any known locale. Per design §
     /// 4.9.I closure of Sonnet M-2 — a v7 file with `locale = "xx"`
@@ -539,6 +555,14 @@ pub struct WorkbookEnvelope {
     /// `Workbook::locale()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locale: Option<LocaleWire>,
+
+    /// **Wave Q1 (2026-06-23; v12):** workbook-scoped chart objects (basic
+    /// line/bar/scatter charts anchored on the grid). v12 envelopes carry the
+    /// section when at least one chart is registered; v1-v11 omit it (and v12
+    /// omits an empty section to keep TOML minimal). The loader treats `None`
+    /// as "no charts registered".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chart_objects: Option<ChartObjectsSection>,
 }
 
 /// **W5-145 (Phase 4.9.I):** schema-version probe for the two-phase
@@ -934,6 +958,41 @@ impl TotalsFunctionWire {
             Self::Custom => ql_storage::TotalsFunction::Custom,
         }
     }
+}
+
+/// **Wave Q1 (2026-06-23; v12):** workbook-scoped chart objects. Order is
+/// sorted ascending by `id` for deterministic diffs. Mirrors `TablesSection`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChartObjectsSection {
+    pub entries: Vec<ChartEntry>,
+}
+
+/// **Wave Q1 (2026-06-23; v12):** one entry in `ChartObjectsSection`. Mirrors
+/// `ql_storage::ChartObject`. `chart_type` is the lowercase wire token
+/// (`"line"`/`"bar"`/`"scatter"`, per `ql_storage::ChartKind::as_wire_str`);
+/// the loader rejects an unknown token loudly (`QbookError::MalformedChart`).
+/// The source range is carried as explicit `src_*` coordinates (it may live on
+/// a different sheet than the anchor).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChartEntry {
+    pub id: u32,
+    pub name: String,
+    pub chart_type: String,
+    pub sheet: u16,
+    pub anchor_row: u32,
+    pub anchor_col: u32,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub src_sheet: u16,
+    pub src_start_row: u32,
+    pub src_start_col: u32,
+    pub src_end_row: u32,
+    pub src_end_col: u32,
+    /// Optional display title. Omitted on the wire when `None` to keep TOML minimal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Phase 2A.8: workbook-scope defined names. The on-disk wire format mirrors
@@ -2114,6 +2173,38 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         }
     };
 
+    // **Wave Q1 (2026-06-23; v12):** persist workbook chart objects. Sorted by
+    // id for deterministic diffs; empty registry → None (keeps v<12 TOML
+    // minimal — the schema gate already refuses v<12 readers regardless).
+    let chart_objects_section = {
+        let mut entries: Vec<ChartEntry> = wb
+            .charts()
+            .iter()
+            .map(|(_id, c)| ChartEntry {
+                id: c.id,
+                name: c.name.clone(),
+                chart_type: c.chart_type.as_wire_str().to_owned(),
+                sheet: c.sheet,
+                anchor_row: c.anchor_row,
+                anchor_col: c.anchor_col,
+                width_px: c.width_px,
+                height_px: c.height_px,
+                src_sheet: c.source_range.sheet,
+                src_start_row: c.source_range.start_row,
+                src_start_col: c.source_range.start_col,
+                src_end_row: c.source_range.end_row,
+                src_end_col: c.source_range.end_col,
+                title: c.title.clone(),
+            })
+            .collect();
+        if entries.is_empty() {
+            None
+        } else {
+            entries.sort_by_key(|e| e.id);
+            Some(ChartObjectsSection { entries })
+        }
+    };
+
     // **W5-145 (Phase 4.9.I):** persist reference_mode + locale ONLY
     // when non-default — keeps the TOML minimal for the common A1/EnUs
     // case. v6→v7 readers see `None` for the default case (interpreted
@@ -2145,6 +2236,8 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         // **W5-145 (Phase 4.9.I):** persist non-default reference_mode + locale.
         reference_mode: reference_mode_wire,
         locale: locale_wire,
+        // **Wave Q1 (2026-06-23; v12):** persist workbook chart objects.
+        chart_objects: chart_objects_section,
     };
     let toml_str = toml::to_string_pretty(&envelope)?;
     fs::write(dir.join("workbook.toml"), toml_str)?;
@@ -2409,6 +2502,18 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                 });
             }
         }
+    }
+
+    // **Wave Q1 (v12):** post-deserialize guard -- a file declaring
+    // `schema_version < 12` must NOT carry the v12-only `chart_objects` section.
+    // serde's `#[serde(default)]` would otherwise accept a hand-edited mislabeled
+    // file into `Some(_)` silently; we refuse loudly (mirrors the < 7 / < 8 / < 11
+    // guards above). A correctly-versioned (>= 12) file is unaffected.
+    if schema_version < 12 && envelope.chart_objects.is_some() {
+        return Err(QbookError::ForwardCompatFieldOnOldVersion {
+            schema_version,
+            field: "chart_objects",
+        });
     }
 
     // **W5-145 (Phase 4.9.I):** apply v7 fields if present. Unknown
@@ -2919,6 +3024,117 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
             // column id (added in 4.8.L to keep the loader-side ids
             // collision-free with future runtime allocations).
             wb.tables_mut().insert(canonical, meta);
+        }
+    }
+
+    // **Wave Q1 (2026-06-23; v12):** apply the chart-objects section. A `None`
+    // field (v1-v11, or an empty registry) leaves the chart store empty.
+    // Direct `charts_mut().insert(...)` bypasses the op log (the loader is the
+    // reconstruction path; the op log loads separately) -- same pattern as the
+    // tables loader above. Mirror that loader's structural validation (w119 HIGH
+    // fold): a hand-edited / corrupted TOML must surface `MalformedChart`, never
+    // enter the engine illegally (No-Fallbacks). Charts are floating objects (no
+    // footprint), so there is no overlap check; the validated invariants are an
+    // unknown `chart_type`, a known anchor + source sheet, non-zero pixel size,
+    // in-grid coordinates, and a unique id within the section.
+    if let Some(chart_objects) = envelope.chart_objects {
+        for entry in chart_objects.entries {
+            let chart_type = ql_storage::ChartKind::from_wire_str(&entry.chart_type).ok_or_else(
+                || QbookError::MalformedChart {
+                    id: entry.id,
+                    reason: format!("unknown chart_type {:?}", entry.chart_type),
+                },
+            )?;
+            // `id == u32::MAX` would make the store's `next_chart_id` high-water
+            // (`id.saturating_add(1)`) saturate at MAX; `allocate_chart_id` then
+            // hands MAX back and the next runtime `add_chart` overwrites this
+            // loaded chart. Reject loudly, mirroring the table loader's
+            // `col.id == u32::MAX` guard.
+            if entry.id == u32::MAX {
+                return Err(QbookError::MalformedChart {
+                    id: entry.id,
+                    reason: "chart id cannot be u32::MAX (would collide with the id allocator)"
+                        .into(),
+                });
+            }
+            if wb.sheet(entry.sheet).is_none() {
+                return Err(QbookError::MalformedChart {
+                    id: entry.id,
+                    reason: format!("anchor references unknown sheet id {}", entry.sheet),
+                });
+            }
+            if wb.sheet(entry.src_sheet).is_none() {
+                return Err(QbookError::MalformedChart {
+                    id: entry.id,
+                    reason: format!(
+                        "source range references unknown sheet id {}",
+                        entry.src_sheet
+                    ),
+                });
+            }
+            if entry.width_px == 0 || entry.height_px == 0 {
+                return Err(QbookError::MalformedChart {
+                    id: entry.id,
+                    reason: "chart width_px and height_px must both be > 0".into(),
+                });
+            }
+            if entry.anchor_row > ql_types::MAX_ROW || entry.anchor_col > ql_types::MAX_COLUMN {
+                return Err(QbookError::MalformedChart {
+                    id: entry.id,
+                    reason: format!(
+                        "anchor cell (row {}, col {}) is beyond the addressable grid \
+                         (MAX_ROW {}, MAX_COLUMN {})",
+                        entry.anchor_row,
+                        entry.anchor_col,
+                        ql_types::MAX_ROW,
+                        ql_types::MAX_COLUMN
+                    ),
+                });
+            }
+            // Source-range coordinates. `Range::new` NORMALIZES an inverted
+            // range (start > end) rather than rejecting it, so inversion is not
+            // an error (it round-trips to the normalized form); we only bound
+            // every coordinate to the addressable grid.
+            if entry.src_start_row > ql_types::MAX_ROW
+                || entry.src_end_row > ql_types::MAX_ROW
+                || entry.src_start_col > ql_types::MAX_COLUMN
+                || entry.src_end_col > ql_types::MAX_COLUMN
+            {
+                return Err(QbookError::MalformedChart {
+                    id: entry.id,
+                    reason: format!(
+                        "source range is beyond the addressable grid (MAX_ROW {}, MAX_COLUMN {})",
+                        ql_types::MAX_ROW, ql_types::MAX_COLUMN
+                    ),
+                });
+            }
+            // Duplicate id within the section: each insert lands in
+            // `wb.charts_mut()` before the next iteration, so `lookup` catches an
+            // intra-section collision that would otherwise silently overwrite.
+            if wb.charts().lookup(entry.id).is_some() {
+                return Err(QbookError::MalformedChart {
+                    id: entry.id,
+                    reason: "duplicate chart id in [[chart_objects.entries]]".into(),
+                });
+            }
+            wb.charts_mut().insert(ql_storage::ChartObject {
+                id: entry.id,
+                name: entry.name,
+                chart_type,
+                sheet: entry.sheet,
+                anchor_row: entry.anchor_row,
+                anchor_col: entry.anchor_col,
+                width_px: entry.width_px,
+                height_px: entry.height_px,
+                source_range: ql_types::Range::new(
+                    entry.src_sheet,
+                    entry.src_start_row,
+                    entry.src_start_col,
+                    entry.src_end_row,
+                    entry.src_end_col,
+                ),
+                title: entry.title,
+            });
         }
     }
 
@@ -4132,6 +4348,55 @@ hidden_rows = [2, 4]
         }
     }
 
+    /// **Wave Q1 (w119 fold):** a hand-edited file declaring `schema_version = 11`
+    /// but carrying the v12-only `chart_objects` section must be refused LOUDLY
+    /// (not silently accepted via serde(default)). Mirrors
+    /// `v10_envelope_carrying_hidden_rows_is_rejected`.
+    #[test]
+    fn v11_envelope_carrying_chart_objects_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mislabeled.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 11
+name = "mislabeled"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+
+[[chart_objects.entries]]
+id = 0
+name = "c"
+chart_type = "line"
+sheet = 0
+anchor_row = 0
+anchor_col = 0
+width_px = 100
+height_px = 100
+src_sheet = 0
+src_start_row = 0
+src_start_col = 0
+src_end_row = 1
+src_end_col = 1
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        match load_workbook(&path) {
+            Err(QbookError::ForwardCompatFieldOnOldVersion {
+                schema_version,
+                field,
+            }) => {
+                assert_eq!(schema_version, 11);
+                assert_eq!(field, "chart_objects");
+            }
+            other => panic!("expected ForwardCompatFieldOnOldVersion, got {other:?}"),
+        }
+    }
+
     // -- M7 (6.3-2b): effective-extent save --------------------------------------
 
     #[test]
@@ -5293,13 +5558,15 @@ col_extent = 1
     /// "future" probe to v11.
     /// **Wave G2 (2026-06-18):** v11 is now current (per-sheet `hidden_rows`);
     /// bumped "future" probe to v12.
+    /// **Wave Q1 (2026-06-23):** v12 is now current (workbook `chart_objects`);
+    /// bumped "future" probe to v13.
     #[test]
     fn future_schema_version_rejected() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("future.qbook");
         fs::create_dir_all(path.join("sheets")).unwrap();
         let toml = r#"
-schema_version = 12
+schema_version = 13
 name = "future"
 
 [[sheets]]
@@ -5314,7 +5581,7 @@ col_extent = 0
 
         let result = load_workbook(&path);
         assert!(
-            matches!(result, Err(QbookError::UnsupportedSchema { found: 12 })),
+            matches!(result, Err(QbookError::UnsupportedSchema { found: 13 })),
             "expected UnsupportedSchema, got {result:?}"
         );
     }
@@ -5470,7 +5737,9 @@ col_extent = 0
         // underline / strike / text_color to the StyleWire value in `styles`.
         // Wave G2 (2026-06-18) bumped from 10 to 11: added the per-sheet
         // `hidden_rows` section (row-visibility for SUBTOTAL 101..=111).
-        assert_eq!(WORKBOOK_SCHEMA_VERSION, 11);
+        // Wave Q1 (2026-06-23) bumped from 11 to 12: added the workbook
+        // `chart_objects` section (persistent chart objects).
+        assert_eq!(WORKBOOK_SCHEMA_VERSION, 12);
     }
 
     #[test]
@@ -5876,6 +6145,270 @@ sheets = [
         let loaded = load_workbook(&path).unwrap();
         assert_eq!(loaded.sheet_count(), 1);
         assert!(loaded.tables().is_empty(), "v5 file → empty TableTable");
+    }
+
+    /// **Wave Q1 (2026-06-23):** a v11 envelope (no `chart_objects` field) loads
+    /// cleanly into a v12 reader with an empty chart store.
+    #[test]
+    fn v11_envelope_loads_into_v12_with_empty_charts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v11.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 11
+name = "v11_compat"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(loaded.sheet_count(), 1);
+        assert!(loaded.charts().is_empty(), "v11 file → empty ChartTable");
+    }
+
+    /// **Wave Q1 (2026-06-23):** a v12 envelope whose chart entry carries an
+    /// unknown `chart_type` token fails loudly (`MalformedChart`) rather than
+    /// silently dropping or defaulting the chart (No-Fallbacks).
+    #[test]
+    fn malformed_chart_unknown_type_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("badchart.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 12
+name = "v12_badchart"
+sheets = [
+  { id = 0, name = "S", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[chart_objects.entries]]
+id = 0
+name = "c"
+chart_type = "pie"
+sheet = 0
+anchor_row = 0
+anchor_col = 0
+width_px = 100
+height_px = 100
+src_sheet = 0
+src_start_row = 0
+src_start_col = 0
+src_end_row = 1
+src_end_col = 1
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let result = load_workbook(&path);
+        assert!(
+            matches!(result, Err(QbookError::MalformedChart { id: 0, .. })),
+            "expected MalformedChart, got {result:?}"
+        );
+    }
+
+    /// Build a v12 envelope with one sheet (id 0) + the given `chart_objects`
+    /// TOML body, load it, and assert it fails loudly with `MalformedChart`.
+    /// Shared by the w119-fold chart-loader validation pins below.
+    fn assert_chart_load_malformed(chart_toml: &str) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("badchart.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = format!(
+            r#"
+schema_version = 12
+name = "v12_badchart"
+sheets = [
+  {{ id = 0, name = "S", chunk_rows = 16384, row_extent = 0, col_extent = 0 }},
+]
+{chart_toml}
+"#
+        );
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let result = load_workbook(&path);
+        assert!(
+            matches!(result, Err(QbookError::MalformedChart { .. })),
+            "expected MalformedChart, got {result:?}"
+        );
+    }
+
+    /// **Wave Q1 HIGH (w119 fold):** the chart loader mirrors the table loader's
+    /// structural validation -- a corrupted / hand-edited v12 TOML fails loudly
+    /// with `MalformedChart` rather than entering the engine illegally
+    /// (No-Fallbacks). One pin per validation branch.
+    #[test]
+    fn malformed_chart_unknown_anchor_sheet_rejected() {
+        assert_chart_load_malformed(
+            r#"
+[[chart_objects.entries]]
+id = 0
+name = "c"
+chart_type = "line"
+sheet = 99
+anchor_row = 0
+anchor_col = 0
+width_px = 100
+height_px = 100
+src_sheet = 0
+src_start_row = 0
+src_start_col = 0
+src_end_row = 1
+src_end_col = 1
+"#,
+        );
+    }
+
+    #[test]
+    fn malformed_chart_unknown_source_sheet_rejected() {
+        assert_chart_load_malformed(
+            r#"
+[[chart_objects.entries]]
+id = 0
+name = "c"
+chart_type = "line"
+sheet = 0
+anchor_row = 0
+anchor_col = 0
+width_px = 100
+height_px = 100
+src_sheet = 99
+src_start_row = 0
+src_start_col = 0
+src_end_row = 1
+src_end_col = 1
+"#,
+        );
+    }
+
+    #[test]
+    fn malformed_chart_zero_size_rejected() {
+        assert_chart_load_malformed(
+            r#"
+[[chart_objects.entries]]
+id = 0
+name = "c"
+chart_type = "line"
+sheet = 0
+anchor_row = 0
+anchor_col = 0
+width_px = 0
+height_px = 100
+src_sheet = 0
+src_start_row = 0
+src_start_col = 0
+src_end_row = 1
+src_end_col = 1
+"#,
+        );
+    }
+
+    #[test]
+    fn malformed_chart_offgrid_anchor_rejected() {
+        // anchor_row 1_048_576 == MAX_ROW + 1.
+        assert_chart_load_malformed(
+            r#"
+[[chart_objects.entries]]
+id = 0
+name = "c"
+chart_type = "line"
+sheet = 0
+anchor_row = 1048576
+anchor_col = 0
+width_px = 100
+height_px = 100
+src_sheet = 0
+src_start_row = 0
+src_start_col = 0
+src_end_row = 1
+src_end_col = 1
+"#,
+        );
+    }
+
+    #[test]
+    fn malformed_chart_offgrid_source_rejected() {
+        // src_end_col 16_384 == MAX_COLUMN + 1.
+        assert_chart_load_malformed(
+            r#"
+[[chart_objects.entries]]
+id = 0
+name = "c"
+chart_type = "line"
+sheet = 0
+anchor_row = 0
+anchor_col = 0
+width_px = 100
+height_px = 100
+src_sheet = 0
+src_start_row = 0
+src_start_col = 0
+src_end_row = 1
+src_end_col = 16384
+"#,
+        );
+    }
+
+    #[test]
+    fn malformed_chart_duplicate_id_rejected() {
+        // Two entries with the same id -> the second is a silent overwrite
+        // without the duplicate-id check.
+        assert_chart_load_malformed(
+            r#"
+[[chart_objects.entries]]
+id = 7
+name = "a"
+chart_type = "line"
+sheet = 0
+anchor_row = 0
+anchor_col = 0
+width_px = 100
+height_px = 100
+src_sheet = 0
+src_start_row = 0
+src_start_col = 0
+src_end_row = 1
+src_end_col = 1
+
+[[chart_objects.entries]]
+id = 7
+name = "b"
+chart_type = "bar"
+sheet = 0
+anchor_row = 2
+anchor_col = 2
+width_px = 100
+height_px = 100
+src_sheet = 0
+src_start_row = 0
+src_start_col = 0
+src_end_row = 1
+src_end_col = 1
+"#,
+        );
+    }
+
+    #[test]
+    fn malformed_chart_id_u32_max_rejected() {
+        // id == u32::MAX would collide with the runtime id allocator after load.
+        assert_chart_load_malformed(
+            r#"
+[[chart_objects.entries]]
+id = 4294967295
+name = "c"
+chart_type = "line"
+sheet = 0
+anchor_row = 0
+anchor_col = 0
+width_px = 100
+height_px = 100
+src_sheet = 0
+src_start_row = 0
+src_start_col = 0
+src_end_row = 1
+src_end_col = 1
+"#,
+        );
     }
 
     // (Forward-compat "v7 loud-fails on v6 reader" is covered by the

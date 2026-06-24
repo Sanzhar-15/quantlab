@@ -28,8 +28,8 @@ use ql_io::{
 };
 use ql_oplog::OpLog;
 use ql_storage::{
-    BorderEdge, BorderStyle, Borders, FormatId, HAlign, NamedTarget, Rgb, Style, StyleId,
-    TableColumn, TableMetadata, TotalsFunction, Workbook,
+    BorderEdge, BorderStyle, Borders, ChartKind, ChartObject, FormatId, HAlign, NamedTarget, Rgb,
+    Style, StyleId, TableColumn, TableMetadata, TotalsFunction, Workbook,
 };
 use ql_types::{Address, DateSystem, Locale, Range, ReferenceMode, Value};
 use tempfile::TempDir;
@@ -52,9 +52,12 @@ struct FullBookHandles {
     bold_style: StyleId,
     qty_col_id: u32,
     price_col_id: u32,
+    chart_a_id: u32,
+    chart_b_id: u32,
 }
 
-/// Build a workbook exercising EVERY v11 persisted field family at once.
+/// Build a workbook exercising EVERY v12 persisted field family at once
+/// (v11 families + Wave Q1 chart objects).
 fn build_full_v11_workbook() -> (Workbook, FullBookHandles) {
     let mut wb = Workbook::new();
     let s0 = wb.add_sheet(SHEET_RETURNS);
@@ -170,6 +173,37 @@ fn build_full_v11_workbook() -> (Workbook, FullBookHandles) {
         },
     );
 
+    // ── chart objects (v12): two charts, different kinds, distinct anchors ────
+    // Chart B is anchored on Prices (s1) but plots a range on Returns (s0) —
+    // exercises a source sheet DISTINCT from the anchor sheet. Chart A carries a
+    // title; chart B carries none (the Option<title> round-trip).
+    let chart_a_id = wb.charts_mut().allocate_chart_id();
+    let chart_b_id = wb.charts_mut().allocate_chart_id();
+    wb.charts_mut().insert(ChartObject {
+        id: chart_a_id,
+        name: "Returns Line".to_string(),
+        chart_type: ChartKind::Line,
+        sheet: s0,
+        anchor_row: 5,
+        anchor_col: 5,
+        width_px: 480,
+        height_px: 320,
+        source_range: Range::new(s0, 0, 0, 9, 0),
+        title: Some("Daily Returns".to_string()),
+    });
+    wb.charts_mut().insert(ChartObject {
+        id: chart_b_id,
+        name: "Px Scatter".to_string(),
+        chart_type: ChartKind::Scatter,
+        sheet: s1,
+        anchor_row: 10,
+        anchor_col: 2,
+        width_px: 600,
+        height_px: 400,
+        source_range: Range::new(s0, 0, 0, 100, 3),
+        title: None,
+    });
+
     // ── workbook-level scalars: non-default date system / refmode / locale ───
     wb.set_date_system(DateSystem::Excel1904);
     wb.set_reference_mode(ReferenceMode::R1C1);
@@ -183,6 +217,8 @@ fn build_full_v11_workbook() -> (Workbook, FullBookHandles) {
             bold_style,
             qty_col_id,
             price_col_id,
+            chart_a_id,
+            chart_b_id,
         },
     )
 }
@@ -305,6 +341,31 @@ fn assert_full_v11_fidelity(loaded: &Workbook, h: &FullBookHandles) {
     assert_eq!(tbl.columns[0].totals_function, Some(TotalsFunction::Sum), "qty totals fn");
     assert_eq!(tbl.columns[1].id, h.price_col_id, "price column id stable");
     assert_eq!(tbl.columns[1].totals_function, Some(TotalsFunction::Average), "price totals fn");
+
+    // chart objects (v12): two charts, every field round-trips; ids stable
+    assert_eq!(loaded.charts().len(), 2, "chart count");
+    let ca = loaded.charts().lookup(h.chart_a_id).expect("chart A reloaded");
+    assert_eq!(ca.name, "Returns Line", "chart A name");
+    assert_eq!(ca.chart_type, ChartKind::Line, "chart A kind");
+    assert_eq!((ca.sheet, ca.anchor_row, ca.anchor_col), (0, 5, 5), "chart A anchor");
+    assert_eq!((ca.width_px, ca.height_px), (480, 320), "chart A size");
+    assert_eq!(ca.source_range, Range::new(0, 0, 0, 9, 0), "chart A source range");
+    assert_eq!(ca.title.as_deref(), Some("Daily Returns"), "chart A title");
+    let cb = loaded.charts().lookup(h.chart_b_id).expect("chart B reloaded");
+    assert_eq!(cb.name, "Px Scatter", "chart B name");
+    assert_eq!(cb.chart_type, ChartKind::Scatter, "chart B kind");
+    assert_eq!(
+        (cb.sheet, cb.anchor_row, cb.anchor_col),
+        (1, 10, 2),
+        "chart B anchor"
+    );
+    assert_eq!((cb.width_px, cb.height_px), (600, 400), "chart B size");
+    assert_eq!(
+        cb.source_range,
+        Range::new(0, 0, 0, 100, 3),
+        "chart B cross-sheet source range (anchor on s1, source on s0)"
+    );
+    assert_eq!(cb.title, None, "chart B has no title");
 
     // workbook-level scalars
     assert_eq!(loaded.date_system(), DateSystem::Excel1904, "date system");

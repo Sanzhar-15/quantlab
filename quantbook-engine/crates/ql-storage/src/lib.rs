@@ -23,6 +23,7 @@
 //! variant additions are MAJOR-version events because every
 //! dispatcher (wire-format, replay, runtime) must gain a new arm.
 
+pub mod charts;
 pub mod column;
 pub mod format;
 pub mod format_overlay;
@@ -44,6 +45,7 @@ pub use style::{
     BorderEdge, BorderStyle, Borders, HAlign, Rgb, Style, StyleId, StyleTable, StyleTableError,
 };
 pub use style_overlay::CellStyleOverlay;
+pub use charts::{ChartKind, ChartObject, ChartTable};
 pub use tables::{TableColumn, TableMetadata, TableTable, TotalsFunction};
 pub use workbook::{
     NameTable, NameTableError, NamedTarget, SheetNameError, StructuralEditError, Workbook,

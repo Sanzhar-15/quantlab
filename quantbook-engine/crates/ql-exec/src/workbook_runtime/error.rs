@@ -238,6 +238,14 @@ pub enum RuntimeError {
     /// fired.
     #[error("table {name:?} resize rejected: {reason}")]
     TableResizeRejected { name: String, reason: &'static str },
+
+    /// **Wave Q1 (2026-06-23):** `update_chart` / `remove_chart` was called
+    /// with a chart id that isn't registered. The store's `remove` is
+    /// idempotent (silent no-op on a missing id), so a missing-id mutation is
+    /// surfaced loud at the producer rather than silently swallowed
+    /// (No-Fallbacks). Mirrors [`Self::TableNotFound`].
+    #[error("chart id {0} not found")]
+    ChartNotFound(u32),
 }
 
 impl From<LexError> for RuntimeError {

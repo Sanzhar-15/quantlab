@@ -648,6 +648,69 @@ pub enum Op {
         removed_columns: Vec<String>,
     },
 
+    /// **Wave Q1 (2026-06-23):** add a workbook-scoped chart object.
+    /// Mirrors `WorkbookRuntime::add_chart`.
+    ///
+    /// The `id` is allocated PRODUCER-side and carried VERBATIM on the wire
+    /// (it is NOT re-allocated at replay, unlike `CreateTable`'s column ids).
+    /// This is required because chart create/move/delete is undoable, and
+    /// undo triggers a full op-log replay (`rebuild_snapshot_cache`): a
+    /// re-allocated id would drift across rebuilds and orphan the later
+    /// `UpdateChart`/`RemoveChart` ops that reference it.
+    ///
+    /// `chart_type` is a lowercase wire token (`"line"`/`"bar"`/`"scatter"`,
+    /// per `ql_storage::ChartKind::as_wire_str`); replay rejects an unknown
+    /// token loudly (`ReplayError::UnknownChartKind`). The source range is
+    /// carried as explicit `src_*` coordinates (it may live on a different
+    /// sheet than the anchor). Replay inserts into `Workbook::charts_mut()`;
+    /// an `AddChart` whose id is already present is an idempotent no-op skip
+    /// (replay re-runnability + CRDT convergence).
+    AddChart {
+        id: u32,
+        name: String,
+        chart_type: String,
+        sheet: SheetId,
+        anchor_row: RowId,
+        anchor_col: ColId,
+        width_px: u32,
+        height_px: u32,
+        src_sheet: SheetId,
+        src_start_row: RowId,
+        src_start_col: ColId,
+        src_end_row: RowId,
+        src_end_col: ColId,
+        title: Option<String>,
+    },
+
+    /// **Wave Q1 (2026-06-23):** replace a chart object's full mutable
+    /// state (every field except `id`). Mirrors
+    /// `WorkbookRuntime::update_chart`. v1 uses a full-state replace so
+    /// move / resize / retype / re-range / retitle all flow through one op.
+    /// Replay rejects an unknown `chart_type` token; a missing `id` is a
+    /// divergence (`ReplayError::ChartNotFound`) — in a valid log an
+    /// `UpdateChart` always follows the matching `AddChart`.
+    UpdateChart {
+        id: u32,
+        name: String,
+        chart_type: String,
+        sheet: SheetId,
+        anchor_row: RowId,
+        anchor_col: ColId,
+        width_px: u32,
+        height_px: u32,
+        src_sheet: SheetId,
+        src_start_row: RowId,
+        src_start_col: ColId,
+        src_end_row: RowId,
+        src_end_col: ColId,
+        title: Option<String>,
+    },
+
+    /// **Wave Q1 (2026-06-23):** remove a chart object by id. Mirrors
+    /// `WorkbookRuntime::remove_chart`. A missing id is an idempotent no-op
+    /// at replay (re-runnable), matching `DropTable`'s tolerance.
+    RemoveChart { id: u32 },
+
     /// **W5-146 (Phase 4.9.J):** workbook-scope reference-mode change.
     /// Serialized as a string `"A1"` or `"R1C1"`. The runtime appends
     /// this op via `WorkbookRuntime::set_reference_mode`; replay calls

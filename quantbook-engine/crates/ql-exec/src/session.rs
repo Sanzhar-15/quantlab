@@ -4657,7 +4657,12 @@ fn map_runtime_err(e: RuntimeError) -> EngineError {
         }
         R::TableResizeRejected { .. } => {
             EngineError::new(ErrorClass::BadArgument, "table_resize_rejected", display)
-        } // NOTE: no wildcard arm. `RuntimeError` is `#[non_exhaustive]`, but
+        }
+        // **Wave Q1 (2026-06-23):** chart id not found → NotFound (mirrors
+        // TableNotFound — fail loud on an update/remove of a missing chart,
+        // never the silent store no-op).
+        R::ChartNotFound(_) => EngineError::new(ErrorClass::NotFound, "chart_not_found", display),
+        // NOTE: no wildcard arm. `RuntimeError` is `#[non_exhaustive]`, but
           // this match is in the SAME crate, so it must be exhaustive — which is
           // exactly the safety the contract wants (§5.3): a newly-added variant
           // becomes a COMPILE error here, forcing an explicit mapping rather than
@@ -5359,6 +5364,129 @@ fn record_batch_to_cell_values(batch: &RecordBatch) -> EngineResult<Vec<Vec<Cell
         rows.push(row);
     }
     Ok(rows)
+}
+
+impl WorkbookSession {
+    // ===== Wave Q1 (2026-06-23) -- chart-object CRUD (owning session) =====
+    //
+    // The product napi `Session` wraps this `WorkbookSession`; these inherent
+    // methods are the surface its #[napi] chart methods call. Chart objects are
+    // INERT for the calcgraph (no cells, no formula deps): the producer layer
+    // (`workbook_runtime/charts.rs`) adds no calcgraph dirty-fan and no
+    // plan-cache flush, since no cached formula plan depends on a chart.
+    //
+    // They are NOT inert for the snapshot-delta surface: a chart object has no
+    // field in `WorkbookSnapshotDelta` and no `SessionChange` variant, so it
+    // cannot be conveyed incrementally. Each chart mutation therefore calls
+    // `bump_epoch` -- exactly like a table op (`create_table`) -- forcing the
+    // owning session's `snapshot_delta` to return `full_rebuild_required`
+    // (`EpochMismatch`), so the IDE reseeds via `snapshot` and re-pulls
+    // `list_charts`. `bump_epoch` re-mints only the snapshot epoch and clears the
+    // change-log; it does NOT recompute formulas. (The legacy CollabSession path
+    // signals the same via `classify_delta_op` in `lib.rs`; the owning session
+    // does not use that classifier, so this explicit `bump_epoch` is required --
+    // its absence was the w119 data-loss blocker.)
+
+    /// **Wave Q1:** add a chart object; returns its stable id. Both the anchor
+    /// sheet and the source-range sheet must be live (not tombstoned).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_chart(
+        &mut self,
+        name: &str,
+        chart_type: ql_storage::ChartKind,
+        sheet: SheetId,
+        anchor_row: RowId,
+        anchor_col: ColId,
+        width_px: u32,
+        height_px: u32,
+        source_range: ql_types::Range,
+        title: Option<String>,
+    ) -> EngineResult<u32> {
+        self.ensure_ready()?;
+        self.require_live_sheet(sheet, "add_chart")?;
+        self.require_live_sheet(source_range.sheet, "add_chart (source range sheet)")?;
+        let id = self
+            .with_runtime(|rt| {
+                rt.add_chart(
+                    name,
+                    chart_type,
+                    sheet,
+                    anchor_row,
+                    anchor_col,
+                    width_px,
+                    height_px,
+                    source_range,
+                    title,
+                )
+            })
+            .map_err(map_runtime_err)?;
+        // Chart objects are not in the incremental delta surface -> force a full
+        // rebuild so the IDE reseeds + re-pulls `list_charts` (see module note).
+        self.bump_epoch();
+        Ok(id)
+    }
+
+    /// **Wave Q1:** replace a chart's full mutable state. Errors loudly if the
+    /// id isn't registered.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_chart(
+        &mut self,
+        id: u32,
+        name: &str,
+        chart_type: ql_storage::ChartKind,
+        sheet: SheetId,
+        anchor_row: RowId,
+        anchor_col: ColId,
+        width_px: u32,
+        height_px: u32,
+        source_range: ql_types::Range,
+        title: Option<String>,
+    ) -> EngineResult<()> {
+        self.ensure_ready()?;
+        self.require_live_sheet(sheet, "update_chart")?;
+        self.require_live_sheet(source_range.sheet, "update_chart (source range sheet)")?;
+        self.with_runtime(|rt| {
+            rt.update_chart(
+                id,
+                name,
+                chart_type,
+                sheet,
+                anchor_row,
+                anchor_col,
+                width_px,
+                height_px,
+                source_range,
+                title,
+            )
+        })
+        .map_err(map_runtime_err)?;
+        self.bump_epoch(); // see add_chart
+        Ok(())
+    }
+
+    /// **Wave Q1:** remove a chart by id. Errors loudly if the id isn't registered.
+    pub fn remove_chart(&mut self, id: u32) -> EngineResult<()> {
+        self.ensure_ready()?;
+        self.with_runtime(|rt| rt.remove_chart(id))
+            .map_err(map_runtime_err)?;
+        self.bump_epoch(); // see add_chart
+        Ok(())
+    }
+
+    /// **Wave Q1:** snapshot all chart objects (HashMap-arbitrary order).
+    ///
+    /// Returns EVERY chart, including any anchored on (or sourcing from) a
+    /// tombstoned sheet -- consistent with the table read surface
+    /// (`collect_tables` / `WorkbookSnapshot.tables`), which likewise returns a
+    /// tombstoned sheet's tables. Tombstoning is reversible: a later
+    /// `restore_sheet` brings the sheet and its charts back together, so the
+    /// engine must NOT drop them here. The IDE filters by live sheet for
+    /// rendering (it has the live-sheet set from `snapshot`); a chart whose
+    /// anchor sheet is absent from the snapshot simply has nowhere to draw.
+    pub fn list_charts(&mut self) -> EngineResult<Vec<ql_storage::ChartObject>> {
+        self.ensure_ready()?;
+        Ok(self.with_runtime_no_oplog(|rt| rt.list_charts()))
+    }
 }
 
 #[cfg(test)]
@@ -9589,6 +9717,194 @@ mod tests {
         );
         // Drop the real one succeeds.
         s.drop_table("T").unwrap();
+    }
+
+    #[test]
+    fn chart_crud_round_trip_on_session() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        let id_a = s
+            .add_chart(
+                "A",
+                ql_storage::ChartKind::Line,
+                sid,
+                0,
+                0,
+                300,
+                200,
+                ql_types::Range::new(sid, 0, 0, 9, 0),
+                Some("Title A".to_string()),
+            )
+            .unwrap();
+        let id_b = s
+            .add_chart(
+                "B",
+                ql_storage::ChartKind::Bar,
+                sid,
+                5,
+                5,
+                300,
+                200,
+                ql_types::Range::new(sid, 0, 1, 9, 1),
+                None,
+            )
+            .unwrap();
+        assert_ne!(id_a, id_b, "allocated ids are distinct");
+        assert_eq!(s.list_charts().unwrap().len(), 2);
+
+        // update A: change kind + name + drop the title
+        s.update_chart(
+            id_a,
+            "A2",
+            ql_storage::ChartKind::Scatter,
+            sid,
+            1,
+            1,
+            400,
+            300,
+            ql_types::Range::new(sid, 0, 0, 4, 0),
+            None,
+        )
+        .unwrap();
+        let charts = s.list_charts().unwrap();
+        let a = charts.iter().find(|c| c.id == id_a).unwrap();
+        assert_eq!(a.chart_type, ql_storage::ChartKind::Scatter);
+        assert_eq!(a.name, "A2");
+        assert_eq!(a.title, None);
+
+        // update / remove a missing id → NotFound (fail loud, No-Fallbacks)
+        assert_eq!(
+            s.update_chart(
+                9999,
+                "x",
+                ql_storage::ChartKind::Line,
+                sid,
+                0,
+                0,
+                1,
+                1,
+                ql_types::Range::new(sid, 0, 0, 0, 0),
+                None,
+            )
+            .unwrap_err()
+            .class,
+            ErrorClass::NotFound
+        );
+        s.remove_chart(id_b).unwrap();
+        assert_eq!(s.remove_chart(9999).unwrap_err().class, ErrorClass::NotFound);
+        assert_eq!(s.list_charts().unwrap().len(), 1);
+    }
+
+    /// **w119 BLOCKER regression.** Every chart mutation on the owning session
+    /// must force `snapshot_delta` to report `full_rebuild_required`. Chart
+    /// objects have NO incremental delta representation (no `WorkbookSnapshotDelta`
+    /// field, no `SessionChange` variant), so without an epoch bump the mutation
+    /// is silently lost for the IDE (it never learns to re-pull `list_charts`).
+    /// Mirrors `snapshot_delta_table_op_forces_epoch_mismatch`.
+    #[test]
+    fn snapshot_delta_chart_op_forces_full_rebuild() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+
+        // add_chart bumps the epoch -> a prior token gets EpochMismatch.
+        let v0 = s.snapshot().unwrap().version;
+        let id = s
+            .add_chart(
+                "A",
+                ql_storage::ChartKind::Line,
+                sid,
+                0,
+                0,
+                300,
+                200,
+                ql_types::Range::new(sid, 0, 0, 9, 0),
+                None,
+            )
+            .unwrap();
+        let d = s.snapshot_delta(&v0).unwrap();
+        assert!(d.full_rebuild_required, "add_chart must force a full rebuild");
+        assert_eq!(d.full_rebuild_reason, Some(FullRebuildReason::EpochMismatch));
+
+        // update_chart bumps the epoch.
+        let v1 = s.snapshot().unwrap().version;
+        s.update_chart(
+            id,
+            "A2",
+            ql_storage::ChartKind::Bar,
+            sid,
+            1,
+            1,
+            400,
+            300,
+            ql_types::Range::new(sid, 0, 0, 4, 0),
+            None,
+        )
+        .unwrap();
+        let d = s.snapshot_delta(&v1).unwrap();
+        assert!(
+            d.full_rebuild_required,
+            "update_chart must force a full rebuild"
+        );
+        assert_eq!(d.full_rebuild_reason, Some(FullRebuildReason::EpochMismatch));
+
+        // remove_chart bumps the epoch.
+        let v2 = s.snapshot().unwrap().version;
+        s.remove_chart(id).unwrap();
+        let d = s.snapshot_delta(&v2).unwrap();
+        assert!(
+            d.full_rebuild_required,
+            "remove_chart must force a full rebuild"
+        );
+        assert_eq!(d.full_rebuild_reason, Some(FullRebuildReason::EpochMismatch));
+
+        // A FAILED chart op changed nothing -> it must NOT bump the epoch (no
+        // spurious full rebuild). `bump_epoch` sits behind the `?`, so the early
+        // error return skips it.
+        let v3 = s.snapshot().unwrap().version;
+        assert!(s.remove_chart(9999).is_err());
+        let d = s.snapshot_delta(&v3).unwrap();
+        assert!(
+            !d.full_rebuild_required,
+            "a failed chart op must not force a rebuild"
+        );
+    }
+
+    /// **w119 MED pin.** `list_charts` returns charts on a tombstoned sheet,
+    /// consistent with the table read surface (`collect_tables`). Tombstoning is
+    /// reversible (`restore_sheet`), so the engine preserves the chart and the
+    /// IDE does the visibility filtering. Guards against a future "filter dead
+    /// sheets" change that would diverge from the table surface and silently
+    /// drop a chart that `restore_sheet` is meant to bring back.
+    #[test]
+    fn list_charts_retains_charts_on_tombstoned_sheet() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        // A second sheet so deleting the first is not a delete-last-sheet refusal.
+        s.add_sheet("Keep", 16384).unwrap();
+        let id = s
+            .add_chart(
+                "A",
+                ql_storage::ChartKind::Line,
+                sid,
+                0,
+                0,
+                300,
+                200,
+                ql_types::Range::new(sid, 0, 0, 9, 0),
+                None,
+            )
+            .unwrap();
+        assert_eq!(s.list_charts().unwrap().len(), 1);
+
+        // Delete the chart's anchor sheet -> tombstoned, NOT erased.
+        s.delete_sheet(sid).unwrap();
+        let charts = s.list_charts().unwrap();
+        assert_eq!(charts.len(), 1, "tombstoned-sheet chart is still listed");
+        assert_eq!(charts[0].id, id);
+
+        // Restore brings the sheet (and its untouched chart) back.
+        s.restore_sheet(sid).unwrap();
+        assert_eq!(s.list_charts().unwrap().len(), 1);
     }
 
     /// A tombstoned sheet must behave consistently everywhere: `snapshot`/

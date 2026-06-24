@@ -568,7 +568,15 @@ fn classify_delta_op(
         // full rebuild so the IDE refetches via workbookSnapshot + getHiddenRows.
         // (The `_` wildcard already did this; listing it explicitly matches the
         // V3.6.0.8.4 allowlist discipline.)
-        | Op::SetRowsHidden { .. } => {
+        | Op::SetRowsHidden { .. }
+        // **Wave Q1 (2026-06-23):** chart object add/update/remove is workbook
+        // metadata the cell-only delta DTO cannot express (no `charts` field).
+        // Force a full rebuild so the IDE refetches via `listCharts`. (The `_`
+        // wildcard already did this; listing it explicitly matches the
+        // allowlist discipline.)
+        | Op::AddChart { .. }
+        | Op::UpdateChart { .. }
+        | Op::RemoveChart { .. } => {
             *has_rename = true;
         }
         _ => {
@@ -1018,6 +1026,154 @@ pub struct TableSnapshotJson {
     pub has_header: bool,
     /// `true` iff the last footprint row is a totals row.
     pub has_totals: bool,
+}
+
+/// **Wave Q1 (2026-06-23):** one chart object returned by `Session.listCharts`.
+/// Mirrors [`ql_storage::ChartObject`]. `chartType` is the lowercase wire token
+/// (`"line"`/`"bar"`/`"scatter"`). Coordinates are the engine's native
+/// `u32`/`u16` (sheet widened to `u32` for JS); the source range is carried as
+/// explicit `src*` fields (it may live on a different sheet than the anchor).
+#[napi(object)]
+pub struct ChartJson {
+    pub id: u32,
+    pub name: String,
+    pub chart_type: String,
+    pub sheet: u32,
+    pub anchor_row: u32,
+    pub anchor_col: u32,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub src_sheet: u32,
+    pub src_start_row: u32,
+    pub src_start_col: u32,
+    pub src_end_row: u32,
+    pub src_end_col: u32,
+    pub title: Option<String>,
+}
+
+/// **Wave Q1 (2026-06-23):** the INPUT spec for `Session.addChart` /
+/// `Session.updateChart` (no `id` -- `add` allocates it, `update` takes it as a
+/// separate arg). `chartType` must be `"line"`/`"bar"`/`"scatter"` (an unknown
+/// token -> `[bad_argument]`). Numeric fields are `f64` ON PURPOSE: napi's
+/// `u32`/`u16` getters apply ECMAScript `ToUint32` (silently mapping `-1` ->
+/// `u32::MAX`, `0.5` -> `0`, `NaN`/`Inf` -> `0`), which would corrupt workbook
+/// state before validation. Taking the raw `f64` and routing every field through
+/// `validate_u{16,32}_index` (in `parse_chart_spec`) surfaces bad inputs as loud
+/// JS Errors instead (No-Fallbacks; mirrors the cell-edit napi surface).
+#[napi(object)]
+pub struct ChartSpecJson {
+    pub name: String,
+    pub chart_type: String,
+    pub sheet: f64,
+    pub anchor_row: f64,
+    pub anchor_col: f64,
+    pub width_px: f64,
+    pub height_px: f64,
+    pub src_sheet: f64,
+    pub src_start_row: f64,
+    pub src_start_col: f64,
+    pub src_end_row: f64,
+    pub src_end_col: f64,
+    pub title: Option<String>,
+}
+
+/// **Wave Q1:** project a session [`ql_storage::ChartObject`] into the
+/// JS-facing [`ChartJson`].
+fn chart_json_from_object(c: ql_storage::ChartObject) -> ChartJson {
+    ChartJson {
+        id: c.id,
+        name: c.name,
+        chart_type: c.chart_type.as_wire_str().to_string(),
+        sheet: c.sheet as u32,
+        anchor_row: c.anchor_row,
+        anchor_col: c.anchor_col,
+        width_px: c.width_px,
+        height_px: c.height_px,
+        src_sheet: c.source_range.sheet as u32,
+        src_start_row: c.source_range.start_row,
+        src_start_col: c.source_range.start_col,
+        src_end_row: c.source_range.end_row,
+        src_end_col: c.source_range.end_col,
+        title: c.title,
+    }
+}
+
+/// **Wave Q1:** a fully-validated chart spec, ready for the engine call. Every
+/// numeric field has cleared `validate_u{16,32}_index` (rejecting the JS
+/// `ToUint32` coercions) plus the structural checks (non-zero size, in-grid
+/// coordinates). `name`/`title` are read from the `ChartSpecJson` directly
+/// (Strings carry no coercion hazard).
+struct ParsedChartSpec {
+    kind: ql_storage::ChartKind,
+    sheet: u16,
+    anchor_row: u32,
+    anchor_col: u32,
+    width_px: u32,
+    height_px: u32,
+    src: ql_types::Range,
+}
+
+/// **Wave Q1:** validate + convert a [`ChartSpecJson`] into a [`ParsedChartSpec`].
+/// Fail-loud `[bad_argument]` (No-Fallbacks -- no silent default/clamp) on: an
+/// unknown `chartType`; any numeric field that is non-finite / negative /
+/// fractional / out of its index range (every field routes through
+/// `validate_u{16,32}_index`, which take the RAW `f64` so napi's `ToUint32`
+/// cannot pre-corrupt it -- see `validate_u32_index`); a zero `widthPx`/
+/// `heightPx`; or an anchor / source coordinate past the addressable grid
+/// (`MAX_ROW` / `MAX_COLUMN`). An INVERTED source range (`startRow > endRow`
+/// etc.) is NOT rejected: `Range::new` normalizes it (round-trips to the
+/// normalized form), matching the qbook loader's chart validation.
+fn parse_chart_spec(method: &str, spec: &ChartSpecJson) -> Result<ParsedChartSpec> {
+    let kind = ql_storage::ChartKind::from_wire_str(&spec.chart_type).ok_or_else(|| {
+        bad_argument_error(format!(
+            "unknown chartType {:?} (expected \"line\", \"bar\", or \"scatter\")",
+            spec.chart_type
+        ))
+    })?;
+    let sheet = validate_u16_index(method, "sheet", spec.sheet)?;
+    let src_sheet = validate_u16_index(method, "srcSheet", spec.src_sheet)?;
+    let anchor_row = validate_u32_index(method, "anchorRow", spec.anchor_row)?;
+    let anchor_col = validate_u32_index(method, "anchorCol", spec.anchor_col)?;
+    let width_px = validate_u32_index(method, "widthPx", spec.width_px)?;
+    let height_px = validate_u32_index(method, "heightPx", spec.height_px)?;
+    let src_start_row = validate_u32_index(method, "srcStartRow", spec.src_start_row)?;
+    let src_start_col = validate_u32_index(method, "srcStartCol", spec.src_start_col)?;
+    let src_end_row = validate_u32_index(method, "srcEndRow", spec.src_end_row)?;
+    let src_end_col = validate_u32_index(method, "srcEndCol", spec.src_end_col)?;
+    if width_px == 0 || height_px == 0 {
+        return Err(bad_argument_error(
+            "chart widthPx and heightPx must both be > 0".to_string(),
+        ));
+    }
+    if anchor_row > ql_types::MAX_ROW || anchor_col > ql_types::MAX_COLUMN {
+        return Err(bad_argument_error(format!(
+            "anchor cell (row {anchor_row}, col {anchor_col}) is beyond the addressable grid \
+             (MAX_ROW {}, MAX_COLUMN {})",
+            ql_types::MAX_ROW,
+            ql_types::MAX_COLUMN
+        )));
+    }
+    if src_start_row > ql_types::MAX_ROW
+        || src_end_row > ql_types::MAX_ROW
+        || src_start_col > ql_types::MAX_COLUMN
+        || src_end_col > ql_types::MAX_COLUMN
+    {
+        return Err(bad_argument_error(format!(
+            "source range is beyond the addressable grid (MAX_ROW {}, MAX_COLUMN {})",
+            ql_types::MAX_ROW,
+            ql_types::MAX_COLUMN
+        )));
+    }
+    let src = ql_types::Range::new(src_sheet, src_start_row, src_start_col, src_end_row, src_end_col);
+    Ok(ParsedChartSpec {
+        kind,
+        sheet,
+        anchor_row,
+        anchor_col,
+        width_px,
+        height_px,
+        src,
+    })
 }
 
 /// **FE-5 W-N (2026-06-12):** project a storage `ql_storage::NamedTarget`
@@ -7515,6 +7671,99 @@ impl Session {
                 .into_iter()
                 .map(named_range_json_from_session)
                 .collect())
+        })
+    }
+
+    // ============================================================================
+    // Wave Q1 (2026-06-23) -- chart-object CRUD over napi.
+    //
+    // Bind the owning `WorkbookSession::{add,update,remove,list}_chart`. Chart
+    // objects are inert workbook metadata persisted in the v12 `.qbook` envelope
+    // (no formula deps). A chart mutation `bump_epoch`s the owning session, so
+    // the next `snapshot_delta` reports `full_rebuild_required` and the IDE
+    // reseeds + re-reads via `listCharts` (see the chart-CRUD note in
+    // `session.rs`; the legacy CollabSession path signals the same via
+    // `classify_delta_op`). `id` is validated to u32 via `validate_u32_index`
+    // (avoids JS `ToUint32` silent coercion); spec validation (chartType, sheet
+    // range, non-zero size, in-grid coordinates) lives in `parse_chart_spec`.
+    // Engine rejections (e.g. `ChartNotFound`, dead sheet) map natively through
+    // `engine_error_to_napi`.
+    // ============================================================================
+
+    /// Add a chart object; returns its stable id. `[bad_argument]` for an
+    /// unknown `chartType`, out-of-range sheet, zero size, or off-grid
+    /// coordinate; `[sheet_not_found]` for a dead anchor/source sheet;
+    /// `[invalid_state]` off a Ready session.
+    #[napi(js_name = "addChart", catch_unwind)]
+    pub fn add_chart(&self, env: Env, spec: ChartSpecJson) -> Result<u32> {
+        guarded(env, "addChart", || {
+            let p = parse_chart_spec("addChart", &spec)?;
+            self.inner
+                .lock()
+                .add_chart(
+                    &spec.name,
+                    p.kind,
+                    p.sheet,
+                    p.anchor_row,
+                    p.anchor_col,
+                    p.width_px,
+                    p.height_px,
+                    p.src,
+                    spec.title.clone(),
+                )
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Replace a chart object's full state. `[bad_argument]` for a bad spec;
+    /// the engine returns a not-found error if `id` isn't registered.
+    #[napi(js_name = "updateChart", catch_unwind)]
+    pub fn update_chart(&self, env: Env, id: f64, spec: ChartSpecJson) -> Result<()> {
+        guarded(env, "updateChart", || {
+            let id = validate_u32_index("updateChart", "id", id)?;
+            let p = parse_chart_spec("updateChart", &spec)?;
+            self.inner
+                .lock()
+                .update_chart(
+                    id,
+                    &spec.name,
+                    p.kind,
+                    p.sheet,
+                    p.anchor_row,
+                    p.anchor_col,
+                    p.width_px,
+                    p.height_px,
+                    p.src,
+                    spec.title.clone(),
+                )
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// Remove a chart object by id. The engine returns a not-found error if
+    /// `id` isn't registered.
+    #[napi(js_name = "removeChart", catch_unwind)]
+    pub fn remove_chart(&self, env: Env, id: f64) -> Result<()> {
+        guarded(env, "removeChart", || {
+            let id = validate_u32_index("removeChart", "id", id)?;
+            self.inner
+                .lock()
+                .remove_chart(id)
+                .map_err(|e| engine_error_to_napi(env, e))
+        })
+    }
+
+    /// List every chart object in the workbook (HashMap-arbitrary order; the IDE
+    /// sorts/positions). The same data also survives `.qbook` save/reopen.
+    #[napi(js_name = "listCharts", catch_unwind)]
+    pub fn list_charts(&self, env: Env) -> Result<Vec<ChartJson>> {
+        guarded(env, "listCharts", || {
+            let charts = self
+                .inner
+                .lock()
+                .list_charts()
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(charts.into_iter().map(chart_json_from_object).collect())
         })
     }
 
