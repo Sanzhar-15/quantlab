@@ -1980,6 +1980,30 @@ export interface DirtyResultJson {
 }
 
 /**
+ * **R23 SQL->cell lineage**: the lineage of a single cell -- which SQL query /
+ * published dataset produced it, plus the full materialized block (mirrors the
+ * engine `CellLineage`). Returned by {@link SessionInstance.cellLineage}; the
+ * engine returns `null` when the cell was not produced by a tracked source (an
+ * ordinary user-typed/empty cell). `kind` is `'query'` (SQL-derived) or
+ * `'published'` (a `qb.publish` value matrix). `sql` is present ONLY for `'query'`
+ * -- per the napi `Option::None` -> absent/`undefined` convention, it is optional,
+ * never `null`. The `produced*` fields are the inclusive bounds of the cells the
+ * source ACTUALLY produced (its materialized footprint, NOT the larger declared
+ * target) -- the IDE highlights/reveals this rectangle as the source block.
+ */
+export interface CellLineageJson {
+	sourceId: string;
+	kind: 'query' | 'published';
+	sql?: string;
+	producedSheet: number;
+	producedStartRow: number;
+	producedStartCol: number;
+	producedEndRow: number;
+	producedEndCol: number;
+	producedCells: number;
+}
+
+/**
  * **6.4-2 (mirrored 6.3-2 hardening, 2026-05-30)**: JS-facing `Arity` -- a strict
  * tagged union on `kind`. `fixed` carries only `n`; `range` carries `min` and
  * optionally `max` (absent means unbounded); `variadic` carries no payload. Omit the
@@ -2691,6 +2715,15 @@ export interface SessionInstance {
 	 * the rows; the Unhide command intersects it with the selected row span.
 	 */
 	getHiddenRows(sheet: number): number[];
+
+	/**
+	 * **R23 SQL->cell lineage (Wave L2, 2026-06-24):** the lineage of the cell at
+	 * `(sheet, row, col)` -- which SQL query / published dataset produced it and
+	 * the full materialized block -- or `null` if the cell was not produced by a
+	 * tracked source (an ordinary user-typed/empty cell). Pure read (mutates
+	 * nothing). `sql` is present only when `kind === 'query'`.
+	 */
+	cellLineage(sheet: number, row: number, col: number): CellLineageJson | null;
 }
 
 export interface SessionConstructor {

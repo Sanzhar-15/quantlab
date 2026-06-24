@@ -277,6 +277,11 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.quantbookShowCellLineage",
+        "title": "%command.quantbookShowCellLineage.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.quantbookCellGridSwitchSheet",
         "title": "%command.quantbookCellGridSwitchSheet.title%",
         "category": "%command.category%"
@@ -1080,6 +1085,11 @@
           "when": "quantbook.hasOpenGrid"
         },
         {
+          "_comment": "Wave L2 (R23): Show Cell Lineage works from the palette too -- falls back to the focused grid's selected cell. Gated on an open grid like Explain.",
+          "command": "quantlab.quantbookShowCellLineage",
+          "when": "quantbook.hasOpenGrid"
+        },
+        {
           "_comment": "W3 (Wave 3): the Cell Grid context-menu items are right-click-only. Hide them from the Command Palette -- their generic titles (Cut/Copy/Insert Row Above) are meaningful only in the grid's right-click menu, and they act on the focused grid (no palette affordance).",
           "command": "quantlab.quantbookCellGridCut",
           "when": "false"
@@ -1397,6 +1407,12 @@
           "command": "quantlab.quantbookExplainCell",
           "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "5_ai@1"
+        },
+        {
+          "_comment": "Wave L2 (R23): Show the SQL/published lineage of the right-clicked cell. Grouped with Explain (5_ai) -- both are read-only 'inspect this cell' actions.",
+          "command": "quantlab.quantbookShowCellLineage",
+          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "group": "5_ai@2"
         },
         {
           "_comment": "Wave G3a (R4): Hide/Unhide rows over the selected span -- consumes the Wave G2 engine row-visibility substrate. Kept in the 4_structure cluster (row/column ops) after delete; the webview/context when only sees webviewId/webviewSection (no per-item dynamic enablement), so Unhide always appears and no-ops with an info toast when the span has no hidden rows.",

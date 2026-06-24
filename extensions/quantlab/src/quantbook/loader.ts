@@ -485,6 +485,15 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (Wave Q1)`);
 				}
 			}
+			// **Wave L2 (R23 SQL->cell lineage, 2026-06-24):** the cellLineage read getter
+			// the "Show Cell Lineage" command drives. A stale cdylib (pre-Wave-L2) lacks it
+			// -- fail loud at the loader boundary, not at the `cellLineage is not a function`
+			// use site inside the command handler.
+			for (const method of ['cellLineage']) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (Wave L2)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

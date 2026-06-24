@@ -53,6 +53,7 @@ import { columnLabelA1, formatRangeTarget, normalizeSelectionRect } from '../qua
 import { describeStructuralPlan, parseContextMenuArg, planStructuralOp, type StructuralOp } from '../quantbook/cellGrid/contextMenuLogic';
 import { hiddenRowsInSpan, rowSpanFromSelection, rowsInSpan, type RowSpan } from '../quantbook/cellGrid/rowVisibilityLogic';
 import { cellRefA1 } from '../quantbook/shared/gridLayoutA1';
+import { formatCellLineage } from '../quantbook/cellGrid/lineageLogic';
 import { ClaudeProvider } from '../ai/provider';
 import { NO_FORMULA_MESSAGE, buildExplainMessages, buildExplainSystemPrompt, cellErrorString, normalizeFormula } from '../ai/explainPrompt';
 // FE-4 W1 (2026-06-10): the pure cores for Find/Replace-All (snapshot-read -> hit list + replace op
@@ -1735,6 +1736,77 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				const detail = err instanceof Error ? err.message : String(err);
 				channel.appendLine(`\n[error] ${detail}`);
 				void vscode.window.showErrorMessage(`Quantbook AI: explain failed: ${detail}`);
+			}
+		}),
+	);
+
+	// Wave L2 (R23 SQL->cell lineage) -- "Show Cell Lineage". Reports which SQL query / published
+	// dataset produced the focused (or right-clicked) cell, plus the produced block, and offers to
+	// reveal that block. Mirrors ExplainCell's cell resolution: fail CLOSED on a present-but-malformed
+	// context payload (never silently target a different grid); only a true no-arg palette call uses
+	// the focus. The pure shaping lives in `lineageLogic.formatCellLineage`; this is a thin shell.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookShowCellLineage', async (...rawArgs: unknown[]) => {
+			let session: SessionInstance;
+			let sheet: number;
+			let row: number;
+			let col: number;
+			if (rawArgs.length > 0) {
+				const arg = parseContextMenuArg(rawArgs[0]);
+				if (arg === undefined) {
+					contextArgToast();
+					return;
+				}
+				const panel = CellGridPanel.panelByToken(arg.panelToken);
+				if (panel === undefined) {
+					void vscode.window.showInformationMessage('Quantbook: the Cell Grid for this menu is no longer open.');
+					return;
+				}
+				({ session, sheet } = panel.target);
+				row = arg.cell ? arg.cell.row : arg.selection.focusRow;
+				col = arg.cell ? arg.cell.col : arg.selection.focusCol;
+			} else {
+				const focused = CellGridPanel.focusedGridSelection();
+				if (focused === undefined) {
+					void vscode.window.showInformationMessage('Quantbook: open a Cell Grid and select a cell to show its lineage.');
+					return;
+				}
+				session = focused.session;
+				sheet = focused.sheet;
+				row = focused.selection.focusRow;
+				col = focused.selection.focusCol;
+			}
+
+			let lineage: ReturnType<typeof session.cellLineage>;
+			try {
+				lineage = session.cellLineage(sheet, row, col);
+			} catch (err) {
+				// Surface the read failure loud (No-Fallbacks) rather than pretend the cell has no lineage.
+				const detail = err instanceof Error ? err.message : String(err);
+				void vscode.window.showErrorMessage(`Quantbook: failed to read cell lineage: ${detail}`);
+				return;
+			}
+
+			const a1 = cellRefA1(row, col);
+			const presentation = formatCellLineage(lineage, a1);
+
+			// Always record the full detail (incl. SQL text + block coords) to the channel so it is
+			// inspectable even after the toast dismisses.
+			const channel = getOutput();
+			channel.appendLine(`# Lineage ${a1}`);
+			channel.appendLine(presentation.detail);
+			channel.append('\n');
+
+			const actions: string[] = [];
+			if (presentation.reveal !== undefined) {
+				actions.push('Reveal source block');
+			}
+			actions.push('Show details');
+			const pick = await vscode.window.showInformationMessage(presentation.summary, ...actions);
+			if (pick === 'Reveal source block' && presentation.reveal !== undefined) {
+				CellGridPanel.revealCellInSession(session, presentation.reveal.sheet, presentation.reveal.row, presentation.reveal.col);
+			} else if (pick === 'Show details') {
+				channel.show(true);
 			}
 		}),
 	);

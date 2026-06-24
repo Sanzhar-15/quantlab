@@ -80,6 +80,7 @@
 	"command.setAnthropicApiKey.title": "Quantbook: Set Anthropic API Key",
 	"command.clearAnthropicApiKey.title": "Quantbook: Clear Anthropic API Key",
 	"command.quantbookExplainCell.title": "Quantbook: Explain Cell with AI",
+	"command.quantbookShowCellLineage.title": "Quantbook: Show Cell Lineage",
 	"command.quantbookCellGridSwitchSheet.title": "Quantbook: Switch Cell Grid Sheet",
 	"command.quantbookSaveAs.title": "Quantbook: Save As...",
 	"command.quantbookOpen.title": "Quantbook: Open...",
