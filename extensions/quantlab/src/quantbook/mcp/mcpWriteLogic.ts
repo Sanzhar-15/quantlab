@@ -1436,9 +1436,10 @@ export interface DeleteTableArgs {
 
 /** Prepare a `delete_table` write (`dropTable`). DESTRUCTIVE -> always confirm. No-Fallbacks: an empty
  *  name throws at prepare. Unlike delete_named_range / delete_sheet (which pre-check existence), table
- *  existence is NOT pre-checked here -- there is no cheap `listTables()` getter and `snapshot()` would
- *  materialize every cell -- so an unknown name fails LOUD at the engine `dropTable` commit (after the
- *  confirmation modal). A cheap `listTables()` napi shim (an engine follow-up) would let this pre-check too. */
+ *  existence is NOT pre-checked here -- so an unknown name fails LOUD at the engine `dropTable` commit
+ *  (after the confirmation modal). Wave L3 added the cheap `listTables()` getter (the snapshot()-free
+ *  shim this once lacked); a prepare-time existence pre-check via it is a possible future refinement,
+ *  deliberately NOT added here to keep delete_table's loud-at-commit contract unchanged. */
 export function prepareDeleteTable(ctx: McpHostContext, args: DeleteTableArgs): PreparedWrite {
 	const grid = resolveTargetGrid(ctx, args.sessionId);
 	const name = requireNameString(args.name, 'delete_table: name');

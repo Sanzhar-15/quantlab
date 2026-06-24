@@ -1526,6 +1526,8 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 			'addChart', 'updateChart', 'removeChart', 'listCharts',
 			// Wave L2 (2026-06-24): the loader now boundary-checks the R23 cell-lineage read getter.
 			'cellLineage',
+			// Wave L3 (2026-06-24): the loader now boundary-checks the R24 used-range + list-tables reads.
+			'usedRange', 'listTables',
 		]) {
 			(fakeSession.prototype as Record<string, unknown>)[m] = function () { /* */ };
 		}

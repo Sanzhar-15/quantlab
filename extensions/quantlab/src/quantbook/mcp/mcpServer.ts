@@ -44,9 +44,11 @@ import {
 	toolGetCell,
 	toolGetPublishedVariables,
 	toolGetSnapshot,
+	toolGetUsedRange,
 	toolListFunctions,
 	toolListNamedRanges,
 	toolListSheets,
+	toolListTables,
 	toolQueryRange,
 	toolValidateFormula,
 	type McpHostContext,
@@ -243,7 +245,7 @@ function runTool<A>(handler: (ctx: McpHostContext, args: A) => unknown, ctx: Mcp
 	}
 }
 
-/** Register the six read-only tools on a fresh McpServer, each resolving the live host context on call. */
+/** Register the read-only tools on a fresh McpServer, each resolving the live host context on call. */
 function registerReadOnlyTools(server: McpServerLike, sdk: LoadedSdk, kernelManager: ReactiveKernelManager<SessionInstance>): void {
 	const { z } = sdk;
 	const sessionIdArg = { sessionId: z.string().describe('Optional Cell Grid id to target when several are open (from a prior tool result).').optional() };
@@ -295,6 +297,22 @@ function registerReadOnlyTools(server: McpServerLike, sdk: LoadedSdk, kernelMana
 		'list_named_ranges',
 		{ title: 'List named ranges', description: 'List every defined name in the workbook -- BOTH workbook-scoped and sheet-scoped -- and the target each resolves to (a cell, range, constant, or formula). Empty when no names are defined (a true empty, NOT an error).', inputSchema: { ...sessionIdArg } },
 		(args) => runTool(toolListNamedRanges, ctx(), args as { sessionId?: string }),
+	);
+
+	server.registerTool(
+		'list_tables',
+		{ title: 'List tables', description: 'List every structured table in the workbook -- canonical + display name, anchor sheet, footprint (rows x cols), and header/totals flags -- sorted by (sheet, name). Empty when no tables are defined (a true empty, NOT an error). A cheap read that does NOT materialize cells.', inputSchema: { ...sessionIdArg } },
+		(args) => runTool(toolListTables, ctx(), args as { sessionId?: string }),
+	);
+
+	server.registerTool(
+		'get_used_range',
+		{
+			title: 'Get used range',
+			description: 'The effective VALUE extent of a sheet -- the inclusive bounding box (anchored at A1) of its non-blank value cells -- as both a structured range and a sheet-qualified A1 string. Returns usedRange = null when the sheet is empty / all-blank (a true empty, NOT an error). Defaults to the focused sheet; pass a sheet name or id to target another. Feed the result to query_range to read all data. NB a format-only cell or a blank-valued formula does NOT widen the extent.',
+			inputSchema: { sheet: z.union([z.string(), z.number()]).describe('Optional sheet name or id; defaults to the grid\'s focused sheet.').optional(), ...sessionIdArg },
+		},
+		(args) => runTool(toolGetUsedRange, ctx(), args as { sessionId?: string; sheet?: number | string }),
 	);
 
 	server.registerTool(

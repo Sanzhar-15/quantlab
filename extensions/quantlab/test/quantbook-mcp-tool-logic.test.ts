@@ -18,6 +18,8 @@ import type {
 	NamedRangeJson,
 	RangeResultJson,
 	SheetInfoJson,
+	TableSnapshotJson,
+	UsedRangeJson,
 	WorkbookSnapshotJson,
 } from '../src/quantbook/types';
 import {
@@ -33,9 +35,11 @@ import {
 	toolGetCell,
 	toolGetPublishedVariables,
 	toolGetSnapshot,
+	toolGetUsedRange,
 	toolListFunctions,
 	toolListNamedRanges,
 	toolListSheets,
+	toolListTables,
 	toolQueryRange,
 	toolValidateFormula,
 	type McpHostContext,
@@ -60,6 +64,10 @@ class FakeSession implements McpSessionPort {
 	validateResponse: DiagnosticJson[] = [];
 	/** Wave L: the defined names listNames() returns (default empty). */
 	names: NamedRangeJson[] = [];
+	/** Wave L3: the tables listTables() returns (default empty). */
+	tables: TableSnapshotJson[] = [];
+	/** Wave L3: the used range per sheet id usedRange() returns (default null = empty/all-blank sheet). */
+	readonly usedRangeBySheet = new Map<number, UsedRangeJson | null>();
 
 	constructor(private readonly sheets: FakeSheet[], private readonly functions: FunctionMetadataJson[] = []) { }
 
@@ -69,6 +77,14 @@ class FakeSession implements McpSessionPort {
 
 	listNames(): NamedRangeJson[] {
 		return this.names;
+	}
+
+	usedRange(sheet: number): UsedRangeJson | null {
+		return this.usedRangeBySheet.get(sheet) ?? null;
+	}
+
+	listTables(): TableSnapshotJson[] {
+		return this.tables;
 	}
 
 	validateFormula(sheet: number, row: number, col: number, text: string): DiagnosticJson[] {
@@ -384,6 +400,75 @@ suite('B1 MCP -- tool handlers', () => {
 		const out = toolListFunctions(ctx, {});
 		assert.strictEqual(out.count, 2);
 		assert.deepStrictEqual(out.functions.map((f) => f.canonicalName), ['SUM', 'SHARPE']);
+	});
+
+	// --- Wave L3 (R24): list_tables + get_used_range ---
+
+	function table(name: string, sheet: number, rows: number, cols: number): TableSnapshotJson {
+		return { name, displayName: name, sheet, topRow: 0, topCol: 0, rows, cols, hasHeader: true, hasTotals: false };
+	}
+
+	test('toolListTables returns the workbook tables (engine sort preserved)', () => {
+		const s = fixtureSession();
+		s.tables = [table('ALPHA', 0, 3, 2), table('ZED', 1, 2, 1)];
+		const ctx = makeCtx([singleGrid(s)], 'grid-0-sheet-0');
+		const out = toolListTables(ctx, {});
+		assert.strictEqual(out.count, 2);
+		assert.deepStrictEqual(out.tables.map((t) => t.name), ['ALPHA', 'ZED']);
+		assert.strictEqual(out.tables[0].sheet, 0);
+		assert.strictEqual(out.tables[0].rows, 3);
+		assert.strictEqual(out.tables[0].cols, 2);
+	});
+
+	test('toolListTables is empty (not an error) with no tables', () => {
+		const s = fixtureSession();
+		const ctx = makeCtx([singleGrid(s)], 'grid-0-sheet-0');
+		const out = toolListTables(ctx, {});
+		assert.strictEqual(out.count, 0);
+		assert.deepStrictEqual(out.tables, []);
+	});
+
+	test('toolGetUsedRange returns the range + A1 string for a populated sheet', () => {
+		const s = fixtureSession();
+		s.usedRangeBySheet.set(0, { sheet: 0, startRow: 0, startCol: 0, endRow: 1, endCol: 2 });
+		const ctx = makeCtx([singleGrid(s)], 'grid-0-sheet-0');
+		const out = toolGetUsedRange(ctx, {});
+		assert.strictEqual(out.sheet, 0);
+		assert.deepStrictEqual(out.usedRange, { sheet: 0, startRow: 0, startCol: 0, endRow: 1, endCol: 2 });
+		assert.strictEqual(out.a1Range, 'S0!A1:C2');
+	});
+
+	test('toolGetUsedRange returns null usedRange + no a1Range for an empty sheet', () => {
+		const s = fixtureSession();
+		// sheet 0 left unset -> usedRange() returns null (empty / all-blank sheet).
+		const ctx = makeCtx([singleGrid(s)], 'grid-0-sheet-0');
+		const out = toolGetUsedRange(ctx, {});
+		assert.strictEqual(out.sheet, 0);
+		assert.strictEqual(out.usedRange, null);
+		assert.strictEqual(out.a1Range, undefined);
+	});
+
+	test('toolGetUsedRange defaults to the focused sheet and honors a sheet selector (id + name)', () => {
+		const s = fixtureSession();
+		s.usedRangeBySheet.set(1, { sheet: 1, startRow: 0, startCol: 0, endRow: 0, endCol: 0 });
+		const ctx = makeCtx([singleGrid(s, 0)], 'grid-0-sheet-0');
+		// Focused sheet is 0 (unset -> null).
+		assert.strictEqual(toolGetUsedRange(ctx, {}).usedRange, null);
+		// Explicit sheet 1 by id -> the single-cell A1 form.
+		const byId = toolGetUsedRange(ctx, { sheet: 1 });
+		assert.strictEqual(byId.sheet, 1);
+		assert.strictEqual(byId.a1Range, 'S1!A1');
+		// Explicit sheet by name resolves to the same id.
+		const byName = toolGetUsedRange(ctx, { sheet: 'S1' });
+		assert.strictEqual(byName.sheet, 1);
+		assert.strictEqual(byName.a1Range, 'S1!A1');
+	});
+
+	test('toolGetUsedRange rejects an unknown sheet selector loud (No-Fallbacks)', () => {
+		const s = fixtureSession();
+		const ctx = makeCtx([singleGrid(s)], 'grid-0-sheet-0');
+		assert.throws(() => toolGetUsedRange(ctx, { sheet: 'NOPE' }), (e: unknown) => e instanceof McpToolError && /unknown_sheet/.test(e.message));
+		assert.throws(() => toolGetUsedRange(ctx, { sheet: 99 }), (e: unknown) => e instanceof McpToolError && /unknown_sheet/.test(e.message));
 	});
 
 	test('toolGetPublishedVariables maps published ranges to A1 strings', () => {

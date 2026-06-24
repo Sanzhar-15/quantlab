@@ -24,8 +24,10 @@ import type {
 	StyleDefJson,
 	StyleIdJson,
 	StyleJson,
+	TableSnapshotJson,
 	TableSpecJson,
 	UndoRedoResultJson,
+	UsedRangeJson,
 	WorkbookSnapshotJson,
 } from '../src/quantbook/types';
 import { A1_MAX_COLS, A1_MAX_ROWS, McpToolError, type McpHostContext, type McpSessionPort, type McpTargetGrid } from '../src/quantbook/mcp/mcpToolLogic';
@@ -183,6 +185,14 @@ class FakeWriteSession implements McpWriteSessionPort {
 
 	listNames(): NamedRangeJson[] {
 		return this.names;
+	}
+
+	usedRange(): UsedRangeJson | null {
+		throw new Error('not used in write tests');
+	}
+
+	listTables(): TableSnapshotJson[] {
+		throw new Error('not used in write tests');
 	}
 
 	setName(name: string, target: CellRangeJson): void {

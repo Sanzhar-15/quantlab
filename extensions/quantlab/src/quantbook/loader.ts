@@ -494,6 +494,15 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (Wave L2)`);
 				}
 			}
+			// **Wave L3 (R24 used-range + list-tables, 2026-06-24):** the usedRange + listTables
+			// read getters the MCP `get_used_range` / `list_tables` tools drive. A stale cdylib
+			// (pre-Wave-L3) lacks them -- fail loud at the loader boundary, not at the
+			// `usedRange is not a function` use site inside the tool handler.
+			for (const method of ['usedRange', 'listTables']) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (Wave L3)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

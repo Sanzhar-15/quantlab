@@ -2008,6 +2008,25 @@ export interface CellLineageJson {
 }
 
 /**
+ * **R24 used range (Wave L3, 2026-06-24)**: the effective VALUE extent of one
+ * sheet -- the inclusive bounding box (anchored at A1) of its non-blank value
+ * cells (mirrors the engine `effective_value_bounds`). Returned by
+ * {@link SessionInstance.usedRange}; the engine returns `null` when the sheet has
+ * no value cell (an empty / all-blank sheet -- distinct from a 1x1 range at A1).
+ * A format-only cell, or a formula whose value is blank, does NOT widen the
+ * extent; an error value does. `startRow`/`startCol` are always `0` (the extent
+ * is origin-anchored). This is the range an agent should `queryRange` to read
+ * every datum on the sheet.
+ */
+export interface UsedRangeJson {
+	sheet: number;
+	startRow: number;
+	startCol: number;
+	endRow: number;
+	endCol: number;
+}
+
+/**
  * **6.4-2 (mirrored 6.3-2 hardening, 2026-05-30)**: JS-facing `Arity` -- a strict
  * tagged union on `kind`. `fixed` carries only `n`; `range` carries `min` and
  * optionally `max` (absent means unbounded); `variadic` carries no payload. Omit the
@@ -2728,6 +2747,24 @@ export interface SessionInstance {
 	 * nothing). `sql` is present only when `kind === 'query'`.
 	 */
 	cellLineage(sheet: number, row: number, col: number): CellLineageJson | null;
+
+	/**
+	 * **R24 used range (Wave L3, 2026-06-24):** the effective VALUE extent of
+	 * `sheet` -- the inclusive bounding box (anchored at A1) of its non-blank
+	 * value cells -- or `null` for an empty / all-blank sheet (distinct from a
+	 * 1x1 range at A1). Pure read. A missing/tombstoned sheet throws
+	 * `[sheet_not_found]`; a non-readable session `[invalid_state]`.
+	 */
+	usedRange(sheet: number): UsedRangeJson | null;
+
+	/**
+	 * **R24 list tables (Wave L3, 2026-06-24):** every structured table in the
+	 * workbook (canonical + display name, anchor sheet, footprint, header/totals
+	 * flags), sorted by `(sheet, name)`. The cheap dedicated read -- does NOT
+	 * materialize cells like {@link snapshot}, so it is safe on a 1M-cell sheet.
+	 * `[invalid_state]` off a readable session.
+	 */
+	listTables(): TableSnapshotJson[];
 }
 
 export interface SessionConstructor {

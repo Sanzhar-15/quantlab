@@ -5,7 +5,7 @@
 
 // FE-BEYOND B1 -- the vscode-free core of the read-only Quantbook MCP server.
 //
-// An AI agent reads the LIVE per-panel workbook Session through six read-only tools. The risky,
+// An AI agent reads the LIVE per-panel workbook Session through the read-only tools. The risky,
 // pure parts -- A1 parsing, sheet-name resolution, session selection across multiple open grids,
 // and the per-tool read shaping -- live HERE and are unit-tested directly over a small port
 // interface ({@link McpSessionPort}) with NO vscode/napi coupling (the established cellGridLogic /
@@ -26,6 +26,8 @@ import type {
 	NamedRangeJson,
 	RangeResultJson,
 	SheetInfoJson,
+	TableSnapshotJson,
+	UsedRangeJson,
 	WorkbookSnapshotJson,
 } from '../types';
 
@@ -56,6 +58,20 @@ export interface McpSessionPort {
 	 * (NOT the full {@link snapshot}, which materializes every cell) so it is safe on a 1M-cell workbook.
 	 */
 	listNames(): NamedRangeJson[];
+	/**
+	 * **Wave L3 (R24, 2026-06-24)**: the effective VALUE extent of one sheet -- the inclusive bounding
+	 * box (anchored at A1) of its non-blank value cells -- or `null` for an empty / all-blank sheet.
+	 * Backs the read-only `get_used_range` tool. A cheap bounds read (NOT the full {@link snapshot},
+	 * which materializes every cell), so it is safe on a 1M-cell sheet.
+	 */
+	usedRange(sheet: number): UsedRangeJson | null;
+	/**
+	 * **Wave L3 (R24, 2026-06-24)**: every structured table in the workbook (canonical + display name,
+	 * anchor sheet, footprint, header/totals flags), sorted by `(sheet, name)`. Backs the read-only
+	 * `list_tables` tool. A cheap dedicated getter (NOT {@link snapshot}), so it is safe on a 1M-cell
+	 * workbook -- this is the getter `list_tables` was held back at Wave L1 for the lack of.
+	 */
+	listTables(): TableSnapshotJson[];
 }
 
 /**
@@ -348,6 +364,21 @@ export interface ListNamedRangesResult {
 	names: NamedRangeJson[];
 }
 
+export interface ListTablesResult {
+	sessionId: string;
+	count: number;
+	tables: TableSnapshotJson[];
+}
+
+export interface GetUsedRangeResult {
+	sessionId: string;
+	sheet: number;
+	/** The used range, or `null` when the sheet has no value cell (empty / all-blank). */
+	usedRange: UsedRangeJson | null;
+	/** A sheet-qualified A1 string for display -- present ONLY when `usedRange` is non-null. */
+	a1Range?: string;
+}
+
 export interface PublishedVariableResult {
 	name: string;
 	sheet: number;
@@ -482,6 +513,40 @@ export function toolListNamedRanges(ctx: McpHostContext, args: { sessionId?: str
 	const grid = resolveTargetGrid(ctx, args.sessionId);
 	const names = grid.session.listNames();
 	return { sessionId: grid.id, count: names.length, names };
+}
+
+/**
+ * list_tables: every structured table in the target grid's workbook (canonical + display name, anchor
+ * sheet, footprint, header/totals flags), sorted by (sheet, name). Empty when no tables are defined (a
+ * true empty -- NOT an error). Reads the cheap {@link McpSessionPort.listTables} getter, so it never
+ * materializes the full workbook (safe on a 1M-cell sheet). This is the read tool L1 deferred for the
+ * lack of a non-snapshot table getter.
+ */
+export function toolListTables(ctx: McpHostContext, args: { sessionId?: string }): ListTablesResult {
+	const grid = resolveTargetGrid(ctx, args.sessionId);
+	const tables = grid.session.listTables();
+	return { sessionId: grid.id, count: tables.length, tables };
+}
+
+/**
+ * get_used_range: the effective VALUE extent (the inclusive bounding box, anchored at A1, of the
+ * non-blank value cells) of one sheet -- the focused sheet by default, or the `sheet` arg (name or id).
+ * `usedRange` is `null` when the sheet has no value cell (an empty / all-blank sheet -- a true empty,
+ * NOT an error); otherwise an `a1Range` display string is included. This is the range to feed to
+ * query_range to read every datum on the sheet. An unknown sheet selector throws `[unknown_sheet]`
+ * (never silently defaults).
+ */
+export function toolGetUsedRange(ctx: McpHostContext, args: { sessionId?: string; sheet?: number | string }): GetUsedRangeResult {
+	const grid = resolveTargetGrid(ctx, args.sessionId);
+	const sheets = grid.session.listSheets();
+	const sheetId = args.sheet === undefined ? grid.sheet : resolveSheetId(sheets, args.sheet);
+	const usedRange = grid.session.usedRange(sheetId);
+	const result: GetUsedRangeResult = { sessionId: grid.id, sheet: sheetId, usedRange };
+	if (usedRange !== null) {
+		const sheetName = sheets.find((s) => s.id === sheetId)?.name;
+		result.a1Range = formatA1Range(sheetName, usedRange);
+	}
+	return result;
 }
 
 /**
