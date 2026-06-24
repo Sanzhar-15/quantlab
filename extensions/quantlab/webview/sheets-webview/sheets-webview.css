@@ -727,8 +727,11 @@ body {
 	flex: 0 0 auto;
 	background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
 	border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
-	cursor: default;
+	/* Wave Q2b: the header is the move grab (the × keeps its own pointer cursor). touch-action:none lets a
+	 * touch drag move the chart instead of scrolling the grid. */
+	cursor: move;
 	user-select: none;
+	touch-action: none;
 }
 .qb-chart-title {
 	flex: 1 1 auto;
@@ -770,6 +773,28 @@ body {
 	font-size: 11px;
 	text-align: center;
 	color: var(--vscode-errorForeground, #f48771);
+}
+/* Wave Q2b: the bottom-right resize grip. An absolutely-positioned child of the overlay (which is
+ * position:absolute) so it floats over the body's corner; the ::after draws a small diagonal bracket. */
+.qb-chart-resize {
+	position: absolute;
+	right: 0;
+	bottom: 0;
+	width: 16px;
+	height: 16px;
+	z-index: 6;
+	cursor: nwse-resize;
+	touch-action: none;
+}
+.qb-chart-resize::after {
+	content: '';
+	position: absolute;
+	right: 3px;
+	bottom: 3px;
+	width: 7px;
+	height: 7px;
+	border-right: 2px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.7));
+	border-bottom: 2px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.7));
 }
 
 /* FE-3 / Wave D in-cell follow-up: the text-colouring overlay for the in-cell editor. A sibling of

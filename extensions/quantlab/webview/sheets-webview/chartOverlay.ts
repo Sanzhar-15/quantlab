@@ -21,6 +21,16 @@
  * No-Fallbacks discipline: a compile/render failure is shown IN the chart box (loud) + logged, never a
  * silent blank; a chart whose source lives on another sheet (not in the active snapshot) shows an explicit
  * note rather than fabricating empty data.
+ *
+ * **Wave Q2b (2026-06-24) -- move + resize.** The header is a move grab (drag -> the chart follows the
+ * pointer; on drop the new anchor CELL is hit-tested from the dropped top-left and persisted via the engine
+ * `updateChart`). A bottom-right corner grip resizes (drag -> the box grows/shrinks; on drop the new px size
+ * is persisted + the Vega view re-embedded to refit). Both are OPTIMISTIC: the container is updated live and
+ * the local {@link ChartJson} patched on drop, then the authoritative `updateChart -> refreshSession ->
+ * render -> sync` round-trip re-positions from the persisted truth (so a CELL-snap on move, or the engine's
+ * size cap, settles the final geometry). A live drag SUPPRESSES {@link ChartOverlayManager.positionEntry} for
+ * its entry so a concurrent scroll/render cannot stomp the gesture, and is CANCELLED if its chart is destroyed
+ * mid-drag (a sheet switch). The grab/grip use the SAME pointer-capture pattern as the grid's col/row resize.
  */
 
 import { compileGeneralPlan, CompileGeneralPlanError } from '../../src/qviz/render/general';
@@ -28,6 +38,26 @@ import { applyGeneralPlan, disposeView, type VegaEmbedHandle } from '../../src/q
 import type { QvizTheme } from '../../src/qviz/render/types';
 import type { ChartJson, QuantbookCellValue } from '../../src/quantbook/types';
 import { buildChartData } from './chartDataLogic';
+
+/** Smallest on-grid chart box (px). A resize drag clamps to this floor so the header + a usable plot area
+ *  always remain; the engine separately rejects a zero dimension and the host caps the ceiling at 10000. */
+export const MIN_CHART_WIDTH_PX = 160;
+export const MIN_CHART_HEIGHT_PX = 110;
+/** The host's upper bound (mirrors `cellGridPanel` `isPx`): keep the optimistic local box in the same window
+ *  the engine will accept, so the pre-round-trip view never disagrees with the persisted one. */
+export const MAX_CHART_DIM_PX = 10000;
+/** Pointer travel (px) before a header/grip press becomes a drag -- a smaller move is a click (e.g. focus),
+ *  not a move/resize, so it never posts a spurious geometry update. */
+const DRAG_THRESHOLD_PX = 3;
+
+/** Clamp a dragged chart dimension into the engine-accepted window `[MIN, MAX]` and round to an integer px
+ *  (the engine validates a `u32` -- a fractional/!finite value would throw `[bad_argument]`). Pure: unit-tested. */
+export function clampChartDim(px: number, min: number): number {
+	if (!Number.isFinite(px)) {
+		return min;
+	}
+	return Math.max(min, Math.min(MAX_CHART_DIM_PX, Math.round(px)));
+}
 
 /** The webview-supplied hooks the manager needs (all the grid-geometry/state it must not reach for itself). */
 export interface ChartOverlayDeps {
@@ -45,6 +75,11 @@ export interface ChartOverlayDeps {
 	readonly columnLabel: (col: number) => string;
 	/** The current chart theme (read from the webview's VS Code CSS variables). */
 	readonly theme: () => QvizTheme;
+	/** Wave Q2b: the {row,col} under a CLIENT-space point (the dropped chart top-left on a move), or `null`
+	 *  when that point is over the header/gutter or off-grid. The webview implements it via the SAME selection
+	 *  hit-test as a mouse click (so it honours frozen rows/cols + a window split); the manager owns no grid
+	 *  geometry itself. A `null` drop is a no-op (the chart snaps back to its persisted anchor). */
+	readonly cellAtClientPoint: (clientX: number, clientY: number) => { row: number; col: number } | null;
 }
 
 interface ChartEntry {
@@ -62,10 +97,38 @@ interface ChartEntry {
 	destroyed: boolean;
 }
 
+/** A live header-move or grip-resize gesture (at most one at a time across all charts). The geometry is taken
+ *  from a SNAPSHOT at pointerdown (the container's inline box), so a concurrent `entry.chart` swap from a render
+ *  cannot corrupt the in-flight drag; the commit reads the FINAL box back off the DOM. */
+interface DragState {
+	readonly kind: 'move' | 'resize';
+	readonly entry: ChartEntry;
+	readonly pointerId: number;
+	/** The element that captured the pointer + carries the move/up/cancel listeners (the head or the grip). */
+	readonly grabEl: HTMLElement;
+	readonly startClientX: number;
+	readonly startClientY: number;
+	/** Container box at pointerdown (content px): left/top for a move, width/height for a resize. */
+	readonly startLeft: number;
+	readonly startTop: number;
+	readonly startWidth: number;
+	readonly startHeight: number;
+	/** Latest resized dimensions written during the gesture (read on commit). */
+	width: number;
+	height: number;
+	/** Crossed {@link DRAG_THRESHOLD_PX} -> this is a real drag (commit on up), not a click. */
+	moved: boolean;
+	readonly onMove: (ev: PointerEvent) => void;
+	readonly onUp: (ev: PointerEvent) => void;
+	readonly onCancel: (ev: PointerEvent) => void;
+}
+
 export class ChartOverlayManager {
 	private readonly deps: ChartOverlayDeps;
 	private readonly entries = new Map<number, ChartEntry>();
 	private activeSheet: number | null = null;
+	/** The in-flight move/resize gesture, or `null` when idle (only one drag at a time). */
+	private drag: DragState | null = null;
 
 	constructor(deps: ChartOverlayDeps) {
 		this.deps = deps;
@@ -149,13 +212,34 @@ export class ChartOverlayManager {
 		head.appendChild(close);
 		const body = document.createElement('div');
 		body.className = 'qb-chart-body';
+		// Wave Q2b: a bottom-right grip resizes the chart. A separate absolutely-positioned element (NOT a CSS
+		// `resize` corner, which we cannot observe on drop) so we own the drag + persist on release.
+		const grip = document.createElement('div');
+		grip.className = 'qb-chart-resize';
+		grip.setAttribute('aria-hidden', 'true');
 		root.appendChild(head);
 		root.appendChild(body);
+		root.appendChild(grip);
 		this.deps.mount.appendChild(root);
-		return { chart, root, body, titleEl, handle: undefined, lastSig: undefined, chain: Promise.resolve(), destroyed: false };
+		const entry: ChartEntry = { chart, root, body, titleEl, handle: undefined, lastSig: undefined, chain: Promise.resolve(), destroyed: false };
+		// Wave Q2b: the header is the move grab. A press on the close button is NOT a move (it deletes); guard so
+		// the × keeps working. The grip is the resize grab. Both run the shared pointer-capture drag.
+		head.addEventListener('pointerdown', ev => {
+			if (ev.target instanceof HTMLElement && ev.target.closest('.qb-chart-close') !== null) {
+				return;
+			}
+			this.beginDrag('move', entry, head, ev);
+		});
+		grip.addEventListener('pointerdown', ev => this.beginDrag('resize', entry, grip, ev));
+		return entry;
 	}
 
 	private destroyEntry(entry: ChartEntry): void {
+		// Wave Q2b: a chart torn down mid-drag (e.g. a sheet switch hides it) cancels the gesture so a later
+		// pointerup cannot post a geometry update for a detached/removed chart.
+		if (this.drag !== null && this.drag.entry === entry) {
+			this.endDrag();
+		}
 		// Mark destroyed FIRST so an embed still in flight on this entry's chain disposes its late-created Vega
 		// view (see renderEntry) instead of leaking it on the now-detached DOM node.
 		entry.destroyed = true;
@@ -167,6 +251,12 @@ export class ChartOverlayManager {
 	}
 
 	private positionEntry(entry: ChartEntry): void {
+		// Wave Q2b: while THIS entry is being dragged, its inline box is owned by the gesture -- a concurrent
+		// scroll (`reposition`) or render (`sync`) must not stomp the live drag. The post-commit round-trip
+		// re-positions it from the persisted geometry once the drag is over.
+		if (this.drag !== null && this.drag.entry === entry) {
+			return;
+		}
 		const c = entry.chart;
 		const pos = this.deps.anchorPos(c.anchorRow, c.anchorCol);
 		entry.root.style.left = pos.left + 'px';
@@ -191,12 +281,18 @@ export class ChartOverlayManager {
 			entry.body.classList.add('qb-chart-error');
 			return;
 		}
-		if (built.sig === entry.lastSig) {
-			// Data + type unchanged since the last embed -> skip the Vega re-embed (a memo, not a fallback: an
-			// identical signature means an identical chart). An UNRELATED edit elsewhere thus costs nothing.
+		// Wave Q2b (Codex HIGH-1): the box size is render-affecting (the Vega view fits its CONTAINER) but is NOT
+		// part of buildChartData's DATA signature -> fold it into the memo key. Without this, a resize that arrives
+		// via the authoritative `sync()` on a SIBLING panel (or any render where only the size changed) would
+		// resize the container but SKIP the re-embed, leaving the Vega view mis-fitted. Now any size change
+		// re-embeds (refits) on EVERY panel deterministically, not only the panel that did the optimistic resize.
+		const sig = built.sig + '|' + c.widthPx + 'x' + c.heightPx;
+		if (sig === entry.lastSig) {
+			// Data + type + size unchanged since the last embed -> skip the Vega re-embed (a memo, not a fallback:
+			// an identical signature means an identical chart). An UNRELATED edit elsewhere thus costs nothing.
 			return;
 		}
-		entry.lastSig = built.sig;
+		entry.lastSig = sig;
 		const theme = this.deps.theme();
 		entry.chain = entry.chain.then(async () => {
 			// The entry may have been torn down (sheet switch / delete) between scheduling this embed and its
@@ -206,10 +302,17 @@ export class ChartOverlayManager {
 			}
 			try {
 				const plan = compileGeneralPlan(built.spec, built.columns, theme);
-				const handle = await applyGeneralPlan(entry.body, plan, entry.handle);
+				// Wave Q2b (Codex HIGH-2): hand the OLD handle to applyGeneralPlan (which finalizes it exactly once)
+				// and CLEAR entry.handle BEFORE the await. Otherwise entry.handle still points at the old, now-being-
+				// disposed view during the await, so a concurrent destroyEntry (sheet switch) or the catch below
+				// would dispose the SAME handle a second time. Resize re-embeds make this race easy to hit.
+				const previous = entry.handle;
+				entry.handle = undefined;
+				const handle = await applyGeneralPlan(entry.body, plan, previous);
 				if (entry.destroyed) {
-					// Torn down DURING the await -> dispose the view we just created rather than leak it (the
-					// use-after-free / leak guard: destroyEntry already ran and saw handle === the OLD one).
+					// Torn down DURING the await -> dispose the view we just created rather than leak it on a
+					// detached node (the use-after-free / leak guard). `previous` was already finalized inside
+					// applyGeneralPlan and entry.handle is undefined, so destroyEntry did not double-dispose it.
 					disposeView(handle, entry.body);
 					return;
 				}
@@ -230,5 +333,178 @@ export class ChartOverlayManager {
 				entry.lastSig = undefined; // a later identical-data render should retry rather than skip
 			}
 		});
+	}
+
+	// ====================================================================================================
+	// Wave Q2b: move + resize drag. One gesture at a time; the geometry is snapshotted at pointerdown and the
+	// final box read back on drop, so a concurrent render's `entry.chart` swap can never corrupt an in-flight
+	// drag. Commit is optimistic (patch the local ChartJson + reposition) then authoritative (engine round-trip).
+	// ====================================================================================================
+
+	/** Start a header-move or grip-resize gesture. Ignores a secondary press while another drag is live, a
+	 *  non-primary button, or a destroyed entry. Refuses LOUD (No-Fallbacks) if the container was never
+	 *  positioned -- `positionEntry` is its sole writer and always runs first, so a missing box is a real bug. */
+	private beginDrag(kind: 'move' | 'resize', entry: ChartEntry, grabEl: HTMLElement, ev: PointerEvent): void {
+		if (this.drag !== null || entry.destroyed || ev.button !== 0) {
+			return;
+		}
+		const startLeft = parseFloat(entry.root.style.left);
+		const startTop = parseFloat(entry.root.style.top);
+		const startWidth = parseFloat(entry.root.style.width);
+		const startHeight = parseFloat(entry.root.style.height);
+		if (!Number.isFinite(startLeft) || !Number.isFinite(startTop) || !Number.isFinite(startWidth) || !Number.isFinite(startHeight)) {
+			console.error('[sheets-webview] chart drag aborted: container box not positioned (id ' + entry.chart.id + ')');
+			return;
+		}
+		// A move/resize is a chart-scoped gesture: keep it off the grid (selection / text-select).
+		ev.preventDefault();
+		ev.stopPropagation();
+		const drag: DragState = {
+			kind,
+			entry,
+			grabEl,
+			pointerId: ev.pointerId,
+			startClientX: ev.clientX,
+			startClientY: ev.clientY,
+			startLeft,
+			startTop,
+			startWidth,
+			startHeight,
+			width: startWidth,
+			height: startHeight,
+			moved: false,
+			onMove: e => this.onDragMove(e),
+			onUp: e => this.onDragUp(e),
+			onCancel: e => this.onDragCancel(e),
+		};
+		this.drag = drag;
+		// Pointer capture keeps move/up firing if the pointer leaves the grab element (same as the grid's col/row
+		// resize). Capability-guarded for non-browser hosts (jsdom) -- the listeners below still receive events
+		// dispatched on grabEl directly, so this is a capability check, not a swallowed failure.
+		if (typeof grabEl.setPointerCapture === 'function') {
+			grabEl.setPointerCapture(ev.pointerId);
+		}
+		// Listen on `window` (not the grab element) so the drag keeps tracking the pointer as it leaves the small
+		// header/grip -- the SAME pattern as the qviz inspector resize handle (pointer capture is best-effort;
+		// the window listeners are the guarantee). endDrag removes them.
+		window.addEventListener('pointermove', drag.onMove);
+		window.addEventListener('pointerup', drag.onUp);
+		window.addEventListener('pointercancel', drag.onCancel);
+	}
+
+	private onDragMove(ev: PointerEvent): void {
+		const drag = this.drag;
+		if (drag === null || ev.pointerId !== drag.pointerId) {
+			return;
+		}
+		const dx = ev.clientX - drag.startClientX;
+		const dy = ev.clientY - drag.startClientY;
+		if (!drag.moved) {
+			if (Math.abs(dx) < DRAG_THRESHOLD_PX && Math.abs(dy) < DRAG_THRESHOLD_PX) {
+				return; // sub-threshold: still a click, not yet a drag
+			}
+			drag.moved = true;
+		}
+		const root = drag.entry.root;
+		if (drag.kind === 'move') {
+			root.style.left = drag.startLeft + dx + 'px';
+			root.style.top = drag.startTop + dy + 'px';
+		} else {
+			drag.width = clampChartDim(drag.startWidth + dx, MIN_CHART_WIDTH_PX);
+			drag.height = clampChartDim(drag.startHeight + dy, MIN_CHART_HEIGHT_PX);
+			root.style.width = drag.width + 'px';
+			root.style.height = drag.height + 'px';
+		}
+	}
+
+	private onDragUp(ev: PointerEvent): void {
+		const drag = this.drag;
+		if (drag === null || ev.pointerId !== drag.pointerId) {
+			return;
+		}
+		const entry = drag.entry;
+		const moved = drag.moved;
+		const kind = drag.kind;
+		const width = drag.width;
+		const height = drag.height;
+		this.endDrag(); // release capture + listeners + clear this.drag BEFORE positionEntry can run again
+		if (entry.destroyed) {
+			return; // torn down mid-gesture (sheet switch) -> nothing to persist or restore
+		}
+		if (!moved) {
+			this.positionEntry(entry); // a click (or sub-threshold nudge) -> re-assert the persisted box
+			return;
+		}
+		if (kind === 'move') {
+			this.commitMove(entry);
+		} else {
+			this.commitResize(entry, width, height);
+		}
+	}
+
+	private onDragCancel(ev: PointerEvent): void {
+		const drag = this.drag;
+		if (drag === null || ev.pointerId !== drag.pointerId) {
+			return;
+		}
+		const entry = drag.entry;
+		this.endDrag();
+		if (!entry.destroyed) {
+			this.positionEntry(entry); // discard the visual drag -> restore the persisted box
+		}
+	}
+
+	/** Resolve a move drop: the dropped top-left (client space) -> the anchor CELL underneath (frozen/split-aware
+	 *  via the webview hit-test). A drop over the header/gutter or off-grid, or back onto the same cell, is a
+	 *  no-op (snap back). Otherwise patch the local anchor optimistically + persist via `chartMoved`. */
+	private commitMove(entry: ChartEntry): void {
+		const rect = entry.root.getBoundingClientRect();
+		const hit = this.deps.cellAtClientPoint(rect.left, rect.top);
+		const c = entry.chart;
+		if (hit === null || (hit.row === c.anchorRow && hit.col === c.anchorCol)) {
+			this.positionEntry(entry);
+			return;
+		}
+		entry.chart = { ...c, anchorRow: hit.row, anchorCol: hit.col };
+		this.positionEntry(entry);
+		this.deps.post({ type: 'chartMoved', id: c.id, sheet: c.sheet, anchorRow: hit.row, anchorCol: hit.col });
+	}
+
+	/** Resolve a resize drop: patch the local size optimistically, reposition the box, and refit the Vega view.
+	 *  The box size is part of the {@link renderEntry} memo (Codex HIGH-1 fix), so `renderEntry` re-embeds at the
+	 *  new size with no manual signature reset -- and the authoritative `sync()` refits every other panel the same
+	 *  way. Persist via `chartResized`. A no-op when the size is unchanged. */
+	private commitResize(entry: ChartEntry, width: number, height: number): void {
+		const c = entry.chart;
+		if (width === c.widthPx && height === c.heightPx) {
+			this.positionEntry(entry);
+			return;
+		}
+		entry.chart = { ...c, widthPx: width, heightPx: height };
+		this.positionEntry(entry);
+		this.renderEntry(entry);
+		this.deps.post({ type: 'chartResized', id: c.id, sheet: c.sheet, widthPx: width, heightPx: height });
+	}
+
+	/** Tear down the active gesture: drop listeners, release capture (only if still held), clear `this.drag`. */
+	private endDrag(): void {
+		const drag = this.drag;
+		if (drag === null) {
+			return;
+		}
+		this.drag = null;
+		window.removeEventListener('pointermove', drag.onMove);
+		window.removeEventListener('pointerup', drag.onUp);
+		window.removeEventListener('pointercancel', drag.onCancel);
+		const el = drag.grabEl;
+		// Release only a capture we still hold: a `pointercancel` already releases it, and re-releasing throws
+		// `InvalidPointerId`. `hasPointerCapture` is the clean state check (capability-guarded for jsdom).
+		if (
+			typeof el.releasePointerCapture === 'function' &&
+			typeof el.hasPointerCapture === 'function' &&
+			el.hasPointerCapture(drag.pointerId)
+		) {
+			el.releasePointerCapture(drag.pointerId);
+		}
 	}
 }

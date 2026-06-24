@@ -2078,6 +2078,13 @@ const chartManager = new ChartOverlayManager({
 	readCell: (row: number, col: number) => renderer.entryAt(row, col)?.value,
 	columnLabel: chartColumnLabel,
 	theme: readChartTheme,
+	// Wave Q2b: a dropped chart's top-left (client space) -> the cell underneath, via the SAME selection
+	// hit-test as a mouse click (canvas-local coords; honours frozen rows/cols + a window split). Returns null
+	// over the header/gutter or off-grid, which the manager treats as a no-op move (snap back).
+	cellAtClientPoint: (clientX: number, clientY: number) => {
+		const rect = canvasEl.getBoundingClientRect();
+		return hitTestLocal(clientX - rect.left, clientY - rect.top);
+	},
 });
 
 /** Wave Q2a: insert a chart of `type` over the current selection. The chart is anchored just to the RIGHT

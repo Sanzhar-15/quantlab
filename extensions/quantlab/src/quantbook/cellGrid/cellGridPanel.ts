@@ -1760,6 +1760,129 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **Wave Q2b (2026-06-24)** -- handle the chart overlay's `chartMoved` (header drag): re-anchor an existing
+	 * chart to a new cell. The UNTRUSTED id/anchor are validated at the boundary (mirroring {@link handleInsertChart}),
+	 * and the SAME stale-sheet guard rejects a drop hit-tested on a sheet this panel has since left (the dropped
+	 * pixel maps against the OLD grid). The move is applied via {@link updateChartGeometry} (full-spec
+	 * `updateChart`, undoable on the Loro op log); {@link refreshSession} then re-renders every panel.
+	 */
+	private handleChartMoved(raw: unknown): void {
+		const m = raw as { id?: unknown; sheet?: unknown; anchorRow?: unknown; anchorCol?: unknown };
+		const id = m.id;
+		if (typeof id !== 'number' || !Number.isInteger(id) || id < 0 || id > 0xFFFF_FFFF) {
+			console.warn('[cellGrid] dropped a malformed chartMoved message (id must be an integer in [0, u32::MAX]):', raw);
+			return;
+		}
+		if (typeof m.sheet !== 'number' || m.sheet !== this.sheet) {
+			console.warn(`[cellGrid] dropped a stale chartMoved message (sheet ${String(m.sheet)} != active sheet ${this.sheet}):`, raw);
+			return;
+		}
+		const isRow = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < MAX_ROWS;
+		const isCol = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < MAX_COLS;
+		const anchorRow = m.anchorRow, anchorCol = m.anchorCol;
+		if (!isRow(anchorRow) || !isCol(anchorCol)) {
+			console.warn('[cellGrid] dropped a malformed chartMoved message (anchor out of [0,MAX)):', raw);
+			return;
+		}
+		this.updateChartGeometry(id, this.sheet, { anchorRow, anchorCol });
+	}
+
+	/**
+	 * **Wave Q2b (2026-06-24)** -- handle the chart overlay's `chartResized` (corner-grip drag): set a new px
+	 * size. Same trust-boundary discipline as {@link handleChartMoved}; the `(0,10000]` window mirrors
+	 * {@link handleInsertChart}'s `isPx` (the engine separately rejects a zero / non-`u32`). Resize is
+	 * grid-coordinate-independent, but the `m.sheet === this.sheet` guard + {@link updateChartGeometry}'s
+	 * `existing.sheet === expectedSheet` check together ensure a stale/cross-sheet message can never resize a
+	 * chart that is not the one on the active sheet the user was dragging.
+	 */
+	private handleChartResized(raw: unknown): void {
+		const m = raw as { id?: unknown; sheet?: unknown; widthPx?: unknown; heightPx?: unknown };
+		const id = m.id;
+		if (typeof id !== 'number' || !Number.isInteger(id) || id < 0 || id > 0xFFFF_FFFF) {
+			console.warn('[cellGrid] dropped a malformed chartResized message (id must be an integer in [0, u32::MAX]):', raw);
+			return;
+		}
+		if (typeof m.sheet !== 'number' || m.sheet !== this.sheet) {
+			console.warn(`[cellGrid] dropped a stale chartResized message (sheet ${String(m.sheet)} != active sheet ${this.sheet}):`, raw);
+			return;
+		}
+		const isPx = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0 && v <= 10000;
+		const widthPx = m.widthPx, heightPx = m.heightPx;
+		if (!isPx(widthPx) || !isPx(heightPx)) {
+			console.warn('[cellGrid] dropped a malformed chartResized message (size out of (0,10000]):', raw);
+			return;
+		}
+		this.updateChartGeometry(id, this.sheet, { widthPx, heightPx });
+	}
+
+	/**
+	 * **Wave Q2b (2026-06-24)** -- apply a geometry patch (new anchor OR new size) to an existing chart. Reads
+	 * the chart's CURRENT full state from {@link SessionInstance.listCharts}, overlays the patch (a partial-update
+	 * merge -- `??` selects the existing field where the patch omits it, so a legitimate 0 anchor is preserved),
+	 * and re-sends the FULL {@link ChartSpecJson} to {@link SessionInstance.updateChart} (which replaces every
+	 * field -- per its contract a move/resize must re-send all of them).
+	 *
+	 * Three rejections, each a LOUD no-op rather than a coercion (No-Fallbacks): an unknown id (the chart was
+	 * concurrently deleted; the engine would also throw `[chart_not_found]`); a chart whose actual `sheet` is not
+	 * the `expectedSheet` the drag was computed on (a stale/tampered message must NOT re-anchor a chart on another
+	 * sheet using this sheet's grid coordinates -- Codex MED-3); and a `chartType` outside {line,bar,scatter}
+	 * (only reachable from a FUTURE engine type -- rejected rather than misrepresented as a spec).
+	 *
+	 * **Always reconciles** (Codex MED-4): the webview patched the chart's geometry OPTIMISTICALLY before posting,
+	 * so EVERY path -- success OR any rejection -- ends in {@link refreshSession}. On success that renders the new
+	 * geometry; on a rejection it re-pushes the engine's UNCHANGED `charts[]`, snapping the optimistic on-screen
+	 * box back to persisted truth (never leave the chart silently diverged from the engine).
+	 */
+	private updateChartGeometry(
+		id: number,
+		expectedSheet: number,
+		patch: { anchorRow?: number; anchorCol?: number; widthPx?: number; heightPx?: number },
+	): void {
+		const existing = this.session.listCharts().find(c => c.id === id);
+		let applied = false;
+		if (existing === undefined) {
+			console.warn(`[cellGrid] dropped a chart geometry update for unknown id ${id} (concurrently deleted?):`, patch);
+		} else if (existing.sheet !== expectedSheet) {
+			console.warn(`[cellGrid] refusing a geometry update for chart ${id}: it is anchored on sheet ${existing.sheet}, not the expected ${expectedSheet} (stale/tampered message).`);
+		} else if (existing.chartType !== 'line' && existing.chartType !== 'bar' && existing.chartType !== 'scatter') {
+			console.warn(`[cellGrid] refusing a geometry update for chart ${id}: unsupported chartType '${existing.chartType}' cannot be re-sent as a spec.`);
+		} else {
+			const spec: ChartSpecJson = {
+				name: existing.name,
+				chartType: existing.chartType,
+				sheet: existing.sheet,
+				anchorRow: patch.anchorRow ?? existing.anchorRow,
+				anchorCol: patch.anchorCol ?? existing.anchorCol,
+				widthPx: patch.widthPx ?? existing.widthPx,
+				heightPx: patch.heightPx ?? existing.heightPx,
+				srcSheet: existing.srcSheet,
+				srcStartRow: existing.srcStartRow,
+				srcStartCol: existing.srcStartCol,
+				srcEndRow: existing.srcEndRow,
+				srcEndCol: existing.srcEndCol,
+				...(existing.title !== undefined ? { title: existing.title } : {}),
+			};
+			try {
+				this.session.updateChart(id, spec);
+				applied = true;
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				void vscode.window.showErrorMessage(`Quantbook: update chart failed: ${detail}`);
+			}
+		}
+		// Reconcile on EVERY path: success renders the new geometry; a rejection re-pushes the unchanged charts[]
+		// so the webview's optimistic move/resize snaps back to the engine's truth.
+		const { failed } = CellGridPanel.refreshSession(this.session);
+		if (failed > 0) {
+			void vscode.window.showWarningMessage(
+				applied
+					? 'Quantbook: the chart was updated but a cell-grid panel failed to re-render. Run "Quantbook: Refresh Cell Grid".'
+					: 'Quantbook: a cell-grid panel failed to re-render after a chart update. Run "Quantbook: Refresh Cell Grid".',
+			);
+		}
+	}
+
+	/**
 	 * **Wave G column sizing** -- post the stored column-override set to the bundled webview IFF the handshake
 	 * completed + the panel is live. Called on the `webviewReady` handshake (so a reload re-applies the
 	 * session-local widths) and on a sheet switch (re-posts the reset set) -- NOT on each resize (the webview
@@ -2843,6 +2966,16 @@ export class CellGridPanel {
 			// validate the UNTRUSTED id like sizeColumn.
 			if (m.type === 'chartDeleted') {
 				this.handleChartDeleted(raw);
+				return;
+			}
+			// Wave Q2b: the chart overlay's header-move + grip-resize drags post the new geometry. Both intercept
+			// here, validate the UNTRUSTED payload at the trust boundary, and re-send the full spec via updateChart.
+			if (m.type === 'chartMoved') {
+				this.handleChartMoved(raw);
+				return;
+			}
+			if (m.type === 'chartResized') {
+				this.handleChartResized(raw);
 				return;
 			}
 		}
