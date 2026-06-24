@@ -6347,6 +6347,28 @@ pub struct CellLineageJson {
     pub produced_cells: u32,
 }
 
+/// **R24 (Wave L3) — used range:** the effective VALUE extent of one sheet,
+/// anchored at `A1` and INCLUSIVE on both corners. Returned by
+/// `Session.usedRange`; the JS side receives `null` when the sheet has no value
+/// cell (an empty / all-blank sheet — distinct from a 1×1 range at A1). All
+/// coordinates are the engine's native ids widened to `u32` (no `f64` widening —
+/// this is an OUTPUT, read directly), matching the `NamedRangeTargetJson` read
+/// convention. A format-only cell, or a formula whose value is blank, does NOT
+/// widen the extent (the `effective_value_bounds` contract); an error value does.
+#[napi(object)]
+pub struct UsedRangeJson {
+    /// The sheet the range belongs to (echoes the requested sheet id).
+    pub sheet: u32,
+    /// Inclusive top-left row (always `0` — the extent is origin-anchored).
+    pub start_row: u32,
+    /// Inclusive top-left column (always `0`).
+    pub start_col: u32,
+    /// Inclusive bottom-right row.
+    pub end_row: u32,
+    /// Inclusive bottom-right column.
+    pub end_col: u32,
+}
+
 /// **Phase 6.3-2a (2026-05-30):** which extras a `queryRange` read includes
 /// (mirrors [`ql_session::RangeQueryOptions`]). In v1 the engine fail-loud
 /// rejects any `true` here with `not_implemented_in_v1_core` (the columnar value
@@ -8330,6 +8352,36 @@ impl Session {
         })
     }
 
+    /// **R24 (Wave L3):** the effective VALUE extent of `sheet` — the bounding
+    /// box (anchored at A1, inclusive on both corners) of its non-blank value
+    /// cells. Returns `null` for an empty / all-blank sheet (distinct from a 1×1
+    /// range at A1). This is the range an agent should `queryRange` to read every
+    /// datum on the sheet. The sheet arg is validated at the boundary
+    /// (`validate_u16_index`: rejects negative / fractional / out-of-range loud,
+    /// never `ToUint32`-coerces). Read gate (legal in Ready/Busy): a non-readable
+    /// session (`[invalid_state]`) and a missing/tombstoned sheet (`[sheet_not_found]`)
+    /// fail LOUD — they never masquerade as `null`.
+    #[napi(js_name = "usedRange", catch_unwind)]
+    pub fn used_range(&self, env: Env, sheet: f64) -> Result<Option<UsedRangeJson>> {
+        guarded(env, "usedRange", || {
+            let sheet_id = validate_u16_index("usedRange", "sheet", sheet)?;
+            // Release the lock before building the JSON — `used_range` returns
+            // owned/Copy data, so nothing borrows the guard.
+            let range = self
+                .inner
+                .lock()
+                .used_range(sheet_id)
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(range.map(|r| UsedRangeJson {
+                sheet: u32::from(r.sheet),
+                start_row: r.start_row,
+                start_col: r.start_col,
+                end_row: r.end_row,
+                end_col: r.end_col,
+            }))
+        })
+    }
+
     // ============================================================================
     // 6.4-2 (2026-05-28) — function registration over napi.
     //
@@ -8446,6 +8498,28 @@ impl Session {
                 .list_functions()
                 .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(metas.into_iter().map(function_metadata_to_json).collect())
+        })
+    }
+
+    /// **R24 (Wave L3):** every structured table in the workbook — canonical +
+    /// display name, anchor sheet, footprint, header/totals flags — sorted by
+    /// `(sheet, name)`. The cheap dedicated read the MCP `list_tables` tool needs
+    /// instead of `snapshot` (which materializes every cell; `list_tables` was
+    /// held back at Wave L1 for the lack of this getter). Read gate:
+    /// `[invalid_state]` once terminal (Busy is fine — this is a read). Tables on
+    /// a tombstoned sheet are retained (the IDE filters by live sheet).
+    #[napi(js_name = "listTables", catch_unwind)]
+    pub fn list_tables(&self, env: Env) -> Result<Vec<TableSnapshotJson>> {
+        guarded(env, "listTables", || {
+            let tables = self
+                .inner
+                .lock()
+                .list_tables()
+                .map_err(|e| engine_error_to_napi(env, e))?;
+            Ok(tables
+                .into_iter()
+                .map(table_snapshot_json_from_session)
+                .collect())
         })
     }
 

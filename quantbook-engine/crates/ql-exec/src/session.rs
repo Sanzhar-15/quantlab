@@ -4377,6 +4377,70 @@ impl WorkbookSession {
             produced_cells: entry.cells.len(),
         }))
     }
+
+    /// **R24 (Wave L3) — used range:** the bounding rectangle of `sheet`'s
+    /// non-blank *value* cells — its effective data extent, anchored at `A1`.
+    /// Returns `Ok(None)` for an empty / all-blank sheet (no value cell
+    /// anywhere) so a caller can tell "no data" apart from "a 1×1 used range at
+    /// A1" without a sentinel. The extent is the VALUE extent
+    /// ([`Sheet::effective_value_bounds`]): a format-only cell, or a formula
+    /// whose value is blank, does NOT widen it (that method's contract); an
+    /// error value DOES count. This is the range an agent should `query_range`
+    /// to read every datum on the sheet.
+    ///
+    /// Gates exactly like the sibling reads (`cell` / `cell_lineage`): a
+    /// non-readable session (`[invalid_state]`) or a missing/tombstoned sheet
+    /// (`[sheet_not_found]`) fail LOUD — they never masquerade as a plain
+    /// `Ok(None)`. Pure read: borrows `&self`, mutates nothing, emits no events.
+    pub fn used_range(&self, sheet: SheetId) -> EngineResult<Option<CellRange>> {
+        self.ensure_readable()?;
+        self.require_live_sheet(sheet, "used_range")?;
+        // `require_live_sheet` proved the id is in range AND not tombstoned, so
+        // the lookup cannot miss. A `None` here would be a structural
+        // inconsistency — surface it LOUD (No-Fallbacks) rather than fabricate
+        // an empty range.
+        let sheet_ref = self.workbook.sheet(sheet).ok_or_else(|| {
+            EngineError::new(
+                ErrorClass::Internal,
+                "sheet_lookup_inconsistent",
+                format!("used_range: live sheet {sheet} not found in workbook"),
+            )
+        })?;
+        let bounds = sheet_ref.effective_value_bounds();
+        // `Bounds::default()` (0 × 0) is the empty/all-blank sheet — no used
+        // range. Either extent being zero means no value cell, so report None.
+        if bounds.row_extent == 0 || bounds.col_extent == 0 {
+            return Ok(None);
+        }
+        Ok(Some(CellRange {
+            sheet,
+            start_row: 0,
+            start_col: 0,
+            // `effective_value_bounds` returns one-past-max extents, both > 0
+            // here (guarded above), so the `- 1` cannot underflow.
+            end_row: bounds.row_extent - 1,
+            end_col: bounds.col_extent - 1,
+        }))
+    }
+
+    /// **R24 (Wave L3) — list tables:** every structured table in the workbook,
+    /// the cheap dedicated read the IDE/MCP surface needs instead of
+    /// [`Self::snapshot`] (which materializes every cell — the `list_tables` MCP
+    /// tool was held back at Wave L1 precisely for the lack of this getter).
+    /// Walks only the workbook-level table table (`collect_tables`), so it is
+    /// O(tables), never O(cells) — safe on a 1M-cell sheet. Sorted by
+    /// `(sheet, name)` (the `collect_tables` order, matching
+    /// `WorkbookSnapshot.tables`).
+    ///
+    /// Read gate (`ensure_readable`, like `list_functions`): legal in
+    /// Ready/Busy, rejected `[invalid_state]` once terminal. Tables on a
+    /// tombstoned sheet are RETAINED, consistent with `collect_tables` /
+    /// `list_charts` (the IDE filters by live sheet; `restore_sheet` brings them
+    /// back).
+    pub fn list_tables(&self) -> EngineResult<Vec<TableSnapshot>> {
+        self.ensure_readable()?;
+        Ok(collect_tables(&self.workbook))
+    }
 }
 
 // ============================================================================
@@ -6509,6 +6573,186 @@ mod tests {
             .expect("still query-produced after refresh");
         assert_eq!(lin.revision, 1, "refresh advances the lineage revision");
         assert_eq!(lin.sql.as_deref(), Some(sql));
+    }
+
+    // ====================================================================
+    // R24 (Wave L3) — `used_range` + `list_tables` read getters.
+    // ====================================================================
+
+    /// **R24:** an empty / never-written sheet has no used range -> `Ok(None)`
+    /// (distinct from a fabricated 1×1 A1 range).
+    #[test]
+    fn used_range_empty_sheet_is_none() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        assert!(
+            s.used_range(sheet).unwrap().is_none(),
+            "an all-blank sheet has no used range"
+        );
+    }
+
+    /// **R24:** the used range is the value extent, anchored at A1 and INCLUSIVE
+    /// of the far cell. Writing A1 and C2 -> A1:C2.
+    #[test]
+    fn used_range_spans_value_extent_inclusive() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), num(1.0)).unwrap();
+        s.set_value(addr(sheet, 1, 2), num(2.0)).unwrap();
+        assert_eq!(
+            s.used_range(sheet).unwrap().expect("has data"),
+            rng(sheet, 0, 0, 1, 2)
+        );
+    }
+
+    /// **R24:** the extent is ORIGIN-ANCHORED (mirrors `effective_value_bounds`):
+    /// a lone far cell at C3 still yields A1:C3, never C3:C3.
+    #[test]
+    fn used_range_is_origin_anchored() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 2, 2), num(9.0)).unwrap();
+        assert_eq!(
+            s.used_range(sheet).unwrap().expect("has data"),
+            rng(sheet, 0, 0, 2, 2)
+        );
+    }
+
+    /// **R24:** the extent tracks the VALUE extent — clearing the only value back
+    /// to Blank shrinks the used range away to `None` (the value extent, unlike
+    /// the conservative `bounds()`, shrinks).
+    #[test]
+    fn used_range_shrinks_to_none_when_values_cleared() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), num(5.0)).unwrap();
+        assert_eq!(
+            s.used_range(sheet).unwrap().expect("has data"),
+            rng(sheet, 0, 0, 0, 0)
+        );
+        s.set_value(addr(sheet, 0, 0), CellValue::Blank).unwrap();
+        assert!(
+            s.used_range(sheet).unwrap().is_none(),
+            "clearing the only value leaves no used range"
+        );
+    }
+
+    /// **R24:** `used_range` gates like the sibling reads — an unknown sheet is a
+    /// loud `[sheet_not_found]`, never a silent `Ok(None)`.
+    #[test]
+    fn used_range_unknown_sheet_fails_loud() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("S", 16384).unwrap();
+        let err = s.used_range(99).unwrap_err();
+        assert_eq!(err.code, "sheet_not_found");
+    }
+
+    /// **R24:** a deleted (tombstoned) sheet is a loud `[sheet_not_found]` for
+    /// `used_range`, consistent with `cell` / `cell_lineage`.
+    #[test]
+    fn used_range_tombstoned_sheet_fails_loud() {
+        let mut s = WorkbookSession::new();
+        let _keep = s.add_sheet("A", 16384).unwrap();
+        let gone = s.add_sheet("B", 16384).unwrap();
+        s.set_value(addr(gone, 0, 0), num(1.0)).unwrap();
+        s.delete_sheet(gone).unwrap();
+        assert_eq!(s.used_range(gone).unwrap_err().code, "sheet_not_found");
+    }
+
+    /// **R24:** `used_range` is a read — rejected loud once the session is Closed.
+    #[test]
+    fn used_range_on_closed_session_is_invalid_state() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.close().unwrap();
+        assert_eq!(s.used_range(sheet).unwrap_err().code, "invalid_state");
+    }
+
+    /// **R24:** `list_tables` on a workbook with no tables is an empty vec (a true
+    /// empty, NOT an error).
+    #[test]
+    fn list_tables_empty_is_empty_vec() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("S", 16384).unwrap();
+        assert!(s.list_tables().unwrap().is_empty());
+    }
+
+    /// **R24:** `list_tables` reports created tables with their metadata, sorted by
+    /// `(sheet, name)` — proven by creating out of order.
+    #[test]
+    fn list_tables_reports_created_tables_sorted() {
+        let mut s = WorkbookSession::new();
+        let s0 = s.add_sheet("S0", 16384).unwrap();
+        let s1 = s.add_sheet("S1", 16384).unwrap();
+        s.create_table(TableSpec {
+            name: "ZED".into(),
+            sheet: s1,
+            top_row: 0,
+            top_col: 0,
+            rows: 2,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["c".into()],
+        })
+        .unwrap();
+        s.create_table(TableSpec {
+            name: "ALPHA".into(),
+            sheet: s0,
+            top_row: 0,
+            top_col: 0,
+            rows: 3,
+            cols: 2,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["a".into(), "b".into()],
+        })
+        .unwrap();
+        let tables = s.list_tables().unwrap();
+        assert_eq!(tables.len(), 2);
+        // Sorted by (sheet, name): S0/ALPHA before S1/ZED.
+        assert_eq!(tables[0].name, "ALPHA");
+        assert_eq!(tables[0].sheet, s0);
+        assert_eq!(tables[0].rows, 3);
+        assert_eq!(tables[0].cols, 2);
+        assert!(tables[0].has_header && !tables[0].has_totals);
+        assert_eq!(tables[1].name, "ZED");
+        assert_eq!(tables[1].sheet, s1);
+    }
+
+    /// **R24:** a table on a tombstoned sheet is RETAINED by `list_tables`
+    /// (consistent with `collect_tables` / `list_charts`; the IDE filters by live
+    /// sheet, `restore_sheet` brings it back).
+    #[test]
+    fn list_tables_retains_tombstoned_sheet_table() {
+        let mut s = WorkbookSession::new();
+        let _keep = s.add_sheet("KEEP", 16384).unwrap();
+        let gone = s.add_sheet("GONE", 16384).unwrap();
+        s.create_table(TableSpec {
+            name: "T".into(),
+            sheet: gone,
+            top_row: 0,
+            top_col: 0,
+            rows: 2,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["c".into()],
+        })
+        .unwrap();
+        s.delete_sheet(gone).unwrap();
+        let tables = s.list_tables().unwrap();
+        assert_eq!(tables.len(), 1, "tombstoned-sheet table is retained");
+        assert_eq!(tables[0].name, "T");
+    }
+
+    /// **R24:** `list_tables` is a read — rejected loud once the session is Closed.
+    #[test]
+    fn list_tables_on_closed_session_is_invalid_state() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("S", 16384).unwrap();
+        s.close().unwrap();
+        assert_eq!(s.list_tables().unwrap_err().code, "invalid_state");
     }
 
     /// **R23 (Codex BLOCKER fold):** a direct user VALUE/FORMULA write over a
