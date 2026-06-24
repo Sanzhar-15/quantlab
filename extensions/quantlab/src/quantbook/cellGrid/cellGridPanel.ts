@@ -42,7 +42,7 @@
 
 import * as vscode from 'vscode';
 
-import type { CellRangeJson, CellValueJson, FormatIdJson, QuantbookCellSnapshot, SessionInstance, SessionOpJson, WorkbookSnapshotJson } from '../types';
+import type { CellRangeJson, CellValueJson, ChartSpecJson, FormatIdJson, QuantbookCellSnapshot, SessionInstance, SessionOpJson, WorkbookSnapshotJson } from '../types';
 import { acquireWorkbookSnapshotViaDelta, attachCellDiagnostics, buildCellDiagnosticMessages, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, MAX_NUDGE_CELLS, parseNameBoxSubmitMessage, parseToolbarCommandMessage, type CellsWrittenMessage, type CommitResultMessage, type FunctionListMessage, type GridSelection, type ToolbarFormatPreset, type ValidateFormulaResultMessage } from './cellGridLogic';
 import { getNonce, getWebviewUri } from '../../utils/webview';
 import type { PublishedRange } from '../reactiveKernel/publishedCellsStore';
@@ -646,6 +646,32 @@ export class CellGridPanel {
 			return undefined;
 		}
 		return { session: focusedPanel.session, sheet: focusedPanel.sheet };
+	}
+
+	/**
+	 * **Wave Q1 (2026-06-24)** -- the "Quantbook: Insert Chart" palette command routes here. The webview owns the
+	 * live selection (the host cannot know the current range), so the command merely asks the FOCUSED panel's
+	 * webview to open the chart-type picker over its selection (`beginInsertChart`); the pick then posts
+	 * `insertChart` back through {@link handleInsertChart}. Returns `false` when no cell grid is focused so the
+	 * command surfaces a LOUD warning (No-Fallbacks: never a silent no-op).
+	 */
+	static beginInsertChartOnFocusedPanel(): boolean {
+		if (focusedPanel === undefined || focusedPanel._disposed) {
+			return false;
+		}
+		const target = focusedPanel;
+		target.panel.webview.postMessage({ type: 'beginInsertChart' }).then(
+			delivered => {
+				if (!delivered && !target._disposed) {
+					console.warn('[cellGrid] beginInsertChart postMessage was not delivered to the webview.');
+					// The command appeared to succeed (a panel was focused) but the picker never opened -- surface
+					// it LOUD rather than leave the user wondering why nothing happened (No-Fallbacks).
+					void vscode.window.showWarningMessage('Quantbook: could not open the chart picker (the Cell Grid did not respond). Reload the Cell Grid and retry.');
+				}
+			},
+			err => console.error('[cellGrid] beginInsertChart postMessage rejected:', err),
+		);
+		return true;
 	}
 
 	/**
@@ -1462,6 +1488,15 @@ export class CellGridPanel {
 			// re-send, AND every undo/redo (onCommit -> refreshSession) for free. No-Fallbacks: a listNames()
 			// throw surfaces loud, never a swallow-to-empty.
 			names: this.session.listNames(),
+			// Wave Q1 (2026-06-24): the workbook's chart objects, read FRESH on every post -- chart ops are
+			// delta/epoch-invisible to the per-cell diff (they bump the epoch, but carry no per-cell entry), so
+			// only an explicit listCharts() sees them. The webview filters to the active sheet, positions each
+			// chart by its anchor, and re-pulls its source range from THIS snapshot for a free live-update. Covers
+			// render(), the webviewReady re-send, AND every undo/redo (onCommit -> refreshSession). A listCharts()
+			// throw (it should not on a Ready session) ABORTS the whole render via safeRender (console.warn +
+			// markDirtyFailsafe) -- it never sends an empty charts[] that would silently drop the charts. Mirrors
+			// the sibling `names: this.session.listNames()` above.
+			charts: this.session.listCharts(),
 			// A4 (2026-06-13): whether this render follows a structural coordinate shift (insert/delete) -- the
 			// webview ORs it into its full-redraw gate so a moved styled cell repaints. See `latestStructuralChanged`.
 			structuralChanged: this.latestStructuralChanged,
@@ -1612,6 +1647,116 @@ export class CellGridPanel {
 		// Wave G-rows: do NOT echo the set back here (the webview already applied it live; a full-set echo could
 		// land mid-drag of a DIFFERENT row and flicker). The re-send happens on the paths the webview needs it --
 		// `webviewReady` (reload re-applies) and `switchToSheet` (reset).
+	}
+
+	/**
+	 * **Wave Q1 (2026-06-24)** -- handle the webview's `insertChart` (the chart-type picker's pick, carrying the
+	 * anchor + source rectangle the webview computed from the live selection). The UNTRUSTED payload is validated
+	 * at the trust boundary (No-Fallbacks): an out-of-grid coord, a non-positive/garbage size, an inverted source
+	 * range, or a `chartType` off the {line,bar,scatter} whitelist is dropped LOUD (console.warn + no mutation),
+	 * never coerced. The message also carries the SHEET its selection was computed on; if this panel's active
+	 * sheet has since changed (a stale message racing a sheet switch) the message is REJECTED rather than landing
+	 * a chart on the wrong sheet with the old sheet's coordinates. The anchor + source sheet are then this panel's
+	 * (validated-equal) active sheet. The engine re-validates each field (`validate_u{16,32}_index`) and throws
+	 * `[bad_argument]` on anything that slips through; a throw is surfaced LOUD (toast) and the chart is NOT
+	 * inserted. On success, the session-wide {@link refreshSession} re-renders every panel -- the new chart rides
+	 * the next render's `charts[]` (no per-cell delta; the epoch bumped).
+	 */
+	private handleInsertChart(raw: unknown): void {
+		const m = raw as {
+			sheet?: unknown; chartType?: unknown; anchorRow?: unknown; anchorCol?: unknown; widthPx?: unknown; heightPx?: unknown;
+			srcStartRow?: unknown; srcStartCol?: unknown; srcEndRow?: unknown; srcEndCol?: unknown;
+		};
+		const chartType = m.chartType;
+		if (chartType !== 'line' && chartType !== 'bar' && chartType !== 'scatter') {
+			console.warn('[cellGrid] dropped a malformed insertChart message (chartType must be line|bar|scatter):', raw);
+			return;
+		}
+		// Stale-sheet guard: the selection (and its coords) were computed on the webview's sheet at post time. If
+		// this panel's active sheet has since changed, the coords are stale -> reject loud rather than create a
+		// chart on the new sheet from the old sheet's selection (Codex/lane-A HIGH).
+		if (typeof m.sheet !== 'number' || m.sheet !== this.sheet) {
+			console.warn(`[cellGrid] dropped a stale insertChart message (sheet ${String(m.sheet)} != active sheet ${this.sheet}):`, raw);
+			return;
+		}
+		const isRow = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < MAX_ROWS;
+		const isCol = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < MAX_COLS;
+		// A pixel dimension: a positive integer, capped at a sane upper bound (catches garbage / absurd values; the
+		// engine separately rejects 0 / non-u32). 10000px comfortably exceeds any reasonable on-grid chart.
+		const isPx = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0 && v <= 10000;
+		const anchorRow = m.anchorRow, anchorCol = m.anchorCol, widthPx = m.widthPx, heightPx = m.heightPx;
+		const srcStartRow = m.srcStartRow, srcStartCol = m.srcStartCol, srcEndRow = m.srcEndRow, srcEndCol = m.srcEndCol;
+		if (
+			!isRow(anchorRow) || !isCol(anchorCol) || !isPx(widthPx) || !isPx(heightPx) ||
+			!isRow(srcStartRow) || !isCol(srcStartCol) || !isRow(srcEndRow) || !isCol(srcEndCol)
+		) {
+			console.warn('[cellGrid] dropped a malformed insertChart message (anchor/source coord out of [0,MAX) or size out of (0,10000]):', raw);
+			return;
+		}
+		// Reject an inverted source range loudly. Our webview always sends a normalized rect (selectionRect
+		// min/max), so an inversion is a tampered/buggy wire; the engine's Range::new would SILENTLY normalize it
+		// (round-tripping to a different range than sent), so guard here rather than store a misrepresented range.
+		if (srcStartRow > srcEndRow || srcStartCol > srcEndCol) {
+			console.warn('[cellGrid] dropped a malformed insertChart message (inverted source range):', raw);
+			return;
+		}
+		try {
+			const spec: ChartSpecJson = {
+				name: `Chart ${this.session.listCharts().length + 1}`,
+				chartType,
+				sheet: this.sheet,
+				anchorRow,
+				anchorCol,
+				widthPx,
+				heightPx,
+				srcSheet: this.sheet,
+				srcStartRow,
+				srcStartCol,
+				srcEndRow,
+				srcEndCol,
+			};
+			this.session.addChart(spec);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			void vscode.window.showErrorMessage(`Quantbook: insert chart failed: ${detail}`);
+			return;
+		}
+		const { failed } = CellGridPanel.refreshSession(this.session);
+		if (failed > 0) {
+			void vscode.window.showWarningMessage(
+				'Quantbook: the chart was inserted but a cell-grid panel failed to re-render. Run "Quantbook: Refresh Cell Grid".',
+			);
+		}
+	}
+
+	/**
+	 * **Wave Q1 (2026-06-24)** -- handle the chart overlay's delete (close button): remove the chart by id.
+	 * The UNTRUSTED id is validated at the boundary; an unknown id throws `[chart_not_found]` from the engine
+	 * (surfaced LOUD, never a silent no-op -- No-Fallbacks). On success, {@link refreshSession} re-renders so the
+	 * overlay drops on the next `charts[]`. (Undo of an insert reaches this same drop via the engine undo + the
+	 * next render's `charts[]`, without this path.)
+	 */
+	private handleChartDeleted(raw: unknown): void {
+		const id = (raw as { id?: unknown }).id;
+		// A chart id is a u32; reject anything outside [0, u32::MAX] at the boundary (the engine also rejects it,
+		// but the trust-boundary discipline mirrors handleInsertChart's range checks rather than relying on it).
+		if (typeof id !== 'number' || !Number.isInteger(id) || id < 0 || id > 0xFFFF_FFFF) {
+			console.warn('[cellGrid] dropped a malformed chartDeleted message (id must be an integer in [0, u32::MAX]):', raw);
+			return;
+		}
+		try {
+			this.session.removeChart(id);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			void vscode.window.showErrorMessage(`Quantbook: delete chart failed: ${detail}`);
+			return;
+		}
+		const { failed } = CellGridPanel.refreshSession(this.session);
+		if (failed > 0) {
+			void vscode.window.showWarningMessage(
+				'Quantbook: the chart was deleted but a cell-grid panel failed to re-render. Run "Quantbook: Refresh Cell Grid".',
+			);
+		}
 	}
 
 	/**
@@ -2684,6 +2829,20 @@ export class CellGridPanel {
 			}
 			if (m.type === 'applyFilter') {
 				this.handleApplyFilter(raw);
+				return;
+			}
+			// Wave Q1 (2026-06-24): the chart-insert flow posts the chosen type + the anchor/source rectangle
+			// (computed from the live selection). Intercept BEFORE delegating -- dispatchIncomingMessage would log
+			// it as an unknown type. handleInsertChart validates the UNTRUSTED payload at the trust boundary
+			// (No-Fallbacks: a malformed coord/type is dropped LOUD), builds the spec, and calls the engine napi.
+			if (m.type === 'insertChart') {
+				this.handleInsertChart(raw);
+				return;
+			}
+			// Wave Q1: the chart overlay's delete (close button) posts the chart id to remove. Intercept +
+			// validate the UNTRUSTED id like sizeColumn.
+			if (m.type === 'chartDeleted') {
+				this.handleChartDeleted(raw);
 				return;
 			}
 		}

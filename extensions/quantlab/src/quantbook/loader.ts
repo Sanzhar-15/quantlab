@@ -476,6 +476,15 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (Wave G2 / R4)`);
 				}
 			}
+			// **Wave Q1 (2026-06-24):** persistent chart objects -- the add/update/remove/list CRUD surface
+			// the cell grid drives for Insert Chart + the .qbook v12 envelope. A stale cdylib (pre-Wave-Q1)
+			// lacks these -- fail loud at the loader boundary, not at the `addChart is not a function` use
+			// site inside the chart-insert handler.
+			for (const method of ['addChart', 'updateChart', 'removeChart', 'listCharts']) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (Wave Q1)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

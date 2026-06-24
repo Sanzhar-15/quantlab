@@ -32,6 +32,7 @@
 	"command.quantbookDemoMultiWindow.title": "Quantbook: Demo (Multi-Window)",
 	"command.quantbookCellGrid.title": "Quantbook: Open Cell Grid",
 	"command.quantbookCellGridRefresh.title": "Quantbook: Refresh Cell Grid",
+	"command.quantbookInsertChart.title": "Quantbook: Insert Chart",
 	"command.quantbookReactiveStart.title": "Quantbook: Start Reactive Kernel",
 	"command.quantbookReactiveExecuteCell.title": "Quantbook: Reactive Cell",
 	"command.quantbookReactiveStop.title": "Quantbook: Stop Reactive Kernel",

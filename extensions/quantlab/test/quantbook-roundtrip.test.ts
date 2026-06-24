@@ -1522,6 +1522,8 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 			'snapshotDelta', 'undo', 'redo', 'canUndo', 'canRedo',
 			// Wave G2 / R4 (2026-06-19): the loader now boundary-checks the row-visibility set/get pair.
 			'setRowsHidden', 'getHiddenRows',
+			// Wave Q1 (2026-06-24): the loader now boundary-checks the chart-object CRUD surface.
+			'addChart', 'updateChart', 'removeChart', 'listCharts',
 		]) {
 			(fakeSession.prototype as Record<string, unknown>)[m] = function () { /* */ };
 		}

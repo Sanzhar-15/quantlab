@@ -527,6 +527,63 @@ export interface NamedRangeJson {
 }
 
 /**
+ * **Wave Q1 (2026-06-24)**: one persistent chart object in the workbook, returned by
+ * {@link SessionInstance.listCharts} (mirrors the engine `ChartJson` / `ql_storage::ChartObject`).
+ * It survives `.qbook` save/reopen (the v12 envelope `ChartObjectsSection`). `chartType` is the
+ * lowercase wire token (`'line' | 'bar' | 'scatter'`). The chart is ANCHORED on {@link sheet} at
+ * ({@link anchorRow}, {@link anchorCol}) and sized {@link widthPx} x {@link heightPx}; its data SOURCE
+ * is the rectangle [{@link srcStartRow}, {@link srcEndRow}] x [{@link srcStartCol}, {@link srcEndCol}]
+ * on {@link srcSheet} (carried explicitly because the source MAY live on a different sheet than the
+ * anchor -- the IDE v1 insert keeps them on the same sheet). `id` is the engine-allocated stable key
+ * passed back to {@link SessionInstance.updateChart} / {@link SessionInstance.removeChart}.
+ */
+export interface ChartJson {
+	readonly id: number;
+	readonly name: string;
+	readonly chartType: string;
+	readonly sheet: number;
+	readonly anchorRow: number;
+	readonly anchorCol: number;
+	readonly widthPx: number;
+	readonly heightPx: number;
+	readonly srcSheet: number;
+	readonly srcStartRow: number;
+	readonly srcStartCol: number;
+	readonly srcEndRow: number;
+	readonly srcEndCol: number;
+	readonly title?: string;
+}
+
+/**
+ * **Wave Q1 (2026-06-24)**: the INPUT spec for {@link SessionInstance.addChart} /
+ * {@link SessionInstance.updateChart} (no `id` -- `add` ALLOCATES one and RETURNS it; `update` takes
+ * the id as a separate argument). `chartType` MUST be `'line' | 'bar' | 'scatter'` (an unknown token
+ * throws `[bad_argument]`). All numeric fields are raw JS `number`; the engine validates each via
+ * `validate_u{16,32}_index` BEFORE the engine call -- a non-finite / negative / fractional / out-of-grid
+ * value, or a zero `widthPx`/`heightPx`, throws a LOUD `[bad_argument]` JS Error (No-Fallbacks: never a
+ * silent `ToUint32` coercion). `update` replaces the chart's FULL state (every field), so a move/resize
+ * must re-send all fields.
+ */
+export interface ChartSpecJson {
+	name: string;
+	/** The INPUT chart type -- a literal union (the host validates the wire string against this before building
+	 * the spec). (The OUTPUT {@link ChartJson.chartType} stays `string` -- a permissive mirror of whatever the
+	 * engine returns, guarded at the render site -- so a future engine type does not silently mistype reads.) */
+	chartType: 'line' | 'bar' | 'scatter';
+	sheet: number;
+	anchorRow: number;
+	anchorCol: number;
+	widthPx: number;
+	heightPx: number;
+	srcSheet: number;
+	srcStartRow: number;
+	srcStartCol: number;
+	srcEndRow: number;
+	srcEndCol: number;
+	title?: string;
+}
+
+/**
  * **FE-5 W-N (2026-06-12)**: the TARGET of a defined name (mirrors the engine
  * `NamedTargetJson` / `ql_session::NamedTargetDto`) -- a discriminated union tagged
  * by `kind` with a per-variant optional payload (the napi convention shared by
@@ -2342,6 +2399,42 @@ export interface SessionInstance {
 	 * Ready session.
 	 */
 	listNames(): NamedRangeJson[];
+
+	// --- Wave Q1 (2026-06-24): persistent chart objects ---
+
+	/**
+	 * **Wave Q1 (2026-06-24)**: add a chart object to the workbook; returns the engine-allocated
+	 * stable `id`. An invalid {@link ChartSpecJson} (unknown `chartType`, zero size, off-grid coord,
+	 * non-finite/negative/fractional numeric) throws `[bad_argument]`; an unknown/tombstoned `sheet`
+	 * or `srcSheet` throws on the engine validation path. Chart ops ride the Loro op log (undoable for
+	 * free) and bump the snapshot epoch -- a full re-render is required (the IDE re-pulls via
+	 * {@link listCharts}, there is no per-cell delta). `[invalid_state]` off a Ready session.
+	 */
+	addChart(spec: ChartSpecJson): number;
+
+	/**
+	 * **Wave Q1 (2026-06-24)**: replace an existing chart's FULL state (every field of `spec`).
+	 * An unknown `id` throws `[chart_not_found]`; an invalid `spec` throws `[bad_argument]` (same
+	 * validation as {@link addChart}). Used for move (new anchor) and resize (new size). Bumps the
+	 * snapshot epoch. `[invalid_state]` off a Ready session.
+	 */
+	updateChart(id: number, spec: ChartSpecJson): void;
+
+	/**
+	 * **Wave Q1 (2026-06-24)**: remove a chart object by `id`. An unknown `id` throws
+	 * `[chart_not_found]` (NOT a silent no-op -- No-Fallbacks). Undoable. Bumps the snapshot epoch.
+	 * `[invalid_state]` off a Ready session.
+	 */
+	removeChart(id: number): void;
+
+	/**
+	 * **Wave Q1 (2026-06-24)**: list every chart object in the workbook (all sheets). Order is
+	 * HashMap-arbitrary -- the IDE filters to the active sheet and positions by anchor. The same data
+	 * survives `.qbook` save/reopen. The lightweight read the cell grid pulls on every render to paint
+	 * chart overlays (chart ops are delta/epoch-invisible to the per-cell diff, so only an explicit
+	 * `listCharts` sees them). `[invalid_state]` off a Ready session.
+	 */
+	listCharts(): ChartJson[];
 
 	// --- Phase 6.3-2d (2026-05-30): tables ---
 

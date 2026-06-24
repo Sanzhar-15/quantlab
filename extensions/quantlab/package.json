@@ -242,6 +242,11 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.quantbookInsertChart",
+        "title": "%command.quantbookInsertChart.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.quantbookCellGridCollab",
         "title": "%command.quantbookCellGridCollab.title%",
         "category": "%command.category%"

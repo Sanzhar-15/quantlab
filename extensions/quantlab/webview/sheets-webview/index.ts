@@ -42,7 +42,7 @@
  * Side-effecting entry (no top-level exports) so the esm bundle loads via a classic `<script>`.
  */
 
-import type { CellAddrJson, DiagnosticJson, FunctionMetadataJson, NamedRangeJson, NamedRangeTargetJson, NamedTargetJson, QuantbookCellSnapshot } from '../../src/quantbook/types';
+import type { CellAddrJson, ChartJson, DiagnosticJson, FunctionMetadataJson, NamedRangeJson, NamedRangeTargetJson, NamedTargetJson, QuantbookCellSnapshot } from '../../src/quantbook/types';
 import { matchNameForSelection } from '../../src/quantbook/shared/nameMatch';
 import { buildRefText, canPointAtRange, insertRefAtCaret, type RefSpan } from '../../src/quantbook/shared/formulaRangePick';
 import { computeFormulaRefHighlights } from '../../src/quantbook/shared/formulaRefHighlights';
@@ -62,6 +62,8 @@ import { CanvasGridRenderer, type ActiveCell, type PublishedRange, type RefHighl
 // (the design system Google Sheets itself uses) -- see icons.ts for the Apache-2.0 attribution +
 // the normalization rules. The old hand-drawn 16px SVGs are gone.
 import { ICONS } from './icons';
+import { ChartOverlayManager } from './chartOverlay';
+import type { QvizTheme } from '../../src/qviz/render/types';
 import { staleTintKeysA1 } from './gridBlitA1';
 import { pasteAreaMismatch, planFill, planPaste, type GridClipboard } from './clipboardLogic';
 // FE-4 keyboard STATE MACHINE: the pure key->action dispatcher (nav/range/edit/formula). The document
@@ -271,6 +273,8 @@ root.innerHTML =
 	'<button type="button" class="cgt-btn" data-cmd="freeze" title="Freeze panes at selection">' + ICONS.splitscreen + '</button>' +
 	'<button type="button" class="cgt-btn" data-cmd="insert" title="Insert row/column" aria-haspopup="true" aria-expanded="false">' + ICONS.add_row_below + '<span class="cgt-dd">' + ICONS.arrow_drop_down + '</span></button>' +
 	'<button type="button" class="cgt-btn" data-cmd="delete" title="Delete row/column" aria-haspopup="true" aria-expanded="false">' + ICONS.delete + '<span class="cgt-dd">' + ICONS.arrow_drop_down + '</span></button>' +
+	// Wave Q2a (2026-06-24): Insert Chart -- opens a line/bar/scatter picker over the current selection.
+	'<button type="button" class="cgt-btn" data-cmd="insertChart" title="Insert chart from selection" aria-haspopup="true" aria-expanded="false">' + ICONS.bar_chart + '<span class="cgt-dd">' + ICONS.arrow_drop_down + '</span></button>' +
 	'<span class="cgt-sep"></span>' +
 	// The sigma Functions menu, WIRED: each item opens the in-cell editor on the active cell
 	// prefilled with '=FN(' (caret at the end, ready for the range) -- see startFunctionInsert.
@@ -496,6 +500,13 @@ const INSERT_ROW_COL_ITEMS: readonly MenuItemSpec[] = [
 const DELETE_ROW_COL_ITEMS: readonly MenuItemSpec[] = [
 	{ label: 'Delete row', run: () => postToolbarCommand('deleteRow') },
 	{ label: 'Delete column', run: () => postToolbarCommand('deleteColumn') },
+];
+// Wave Q2a (2026-06-24): the Insert Chart type picker. Each run computes the anchor + source rectangle from
+// the live selection and posts `insertChart`; the host validates + calls the engine napi addChart.
+const CHART_TYPE_MENU_ITEMS: readonly MenuItemSpec[] = [
+	{ label: 'Line chart', run: () => beginChartInsert('line') },
+	{ label: 'Bar chart', run: () => beginChartInsert('bar') },
+	{ label: 'Scatter chart', run: () => beginChartInsert('scatter') },
 ];
 
 // The 6 engine number-format presets, shared by the toolbar's '123' dropdown AND the menubar's
@@ -1219,6 +1230,15 @@ toolbarEl.addEventListener('click', (e) => {
 				openMenuDropdown(btn, DELETE_ROW_COL_ITEMS, null);
 			}
 			return;
+		case 'insertChart':
+			// Wave Q2a: toggle the line/bar/scatter picker. Like insert/delete, OPENING posts nothing; the
+			// picked item posts `insertChart` through `activateMenuItem` -> `runAfterResolvingEdit`.
+			if (openMenu !== null && openMenu.anchor === btn) {
+				closeMenuDropdown();
+			} else {
+				openMenuDropdown(btn, CHART_TYPE_MENU_ITEMS, null);
+			}
+			return;
 		// **FE-5 W-R (2026-06-12) / FE-FONT (2026-06-13) -- the toolbar's style controls write to the ENGINE**
 		// (the SOLE style source). Each routes through `runAfterResolvingEdit` like every other mutating chrome
 		// action (resolve the open editor first), operates on the active selection (or active cell), and POSTs a
@@ -1906,7 +1926,7 @@ function buildResizeRowModel(resizes: ReadonlyMap<number, number>): AxisSizing {
 function recomposeRowSizing(): void {
 	renderer.setRowSizing(composeHidden(buildResizeRowModel(rowResizeInput), hiddenRowsInput));
 	updateSpacer();
-	repositionEdit();
+	repositionOverlays();
 	redraw();
 }
 // Click tolerance (CSS px) for grabbing the fill-handle square at the selection's bottom-right corner.
@@ -2004,6 +2024,94 @@ let nextCommitId = 0;
 // produces no success message, so a stale tint correctly stays (No-Fallbacks). Uniqueness (not
 // cryptographic strength) is the only requirement.
 const WEBVIEW_ID = 'wv-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+
+// ============================================================================================
+// Wave Q2a (2026-06-24): chart overlay objects (line/bar/scatter from a selected range).
+// ============================================================================================
+
+/** A column's A1 letter label (0 -> "A"), via the shared A1 helper (strip the trailing row digits). */
+function chartColumnLabel(col: number): string {
+	return cellRefA1(0, col).replace(/[0-9]+$/, '');
+}
+
+/** Build the qviz theme from the webview's VS Code CSS variables, so charts follow the editor dark/light. */
+function readChartTheme(): QvizTheme {
+	const s = getComputedStyle(document.body);
+	const v = (name: string, fallback: string): string => {
+		const x = s.getPropertyValue(name).trim();
+		return x.length > 0 ? x : fallback;
+	};
+	const palette = ['--vscode-charts-blue', '--vscode-charts-green', '--vscode-charts-yellow', '--vscode-charts-orange', '--vscode-charts-red', '--vscode-charts-purple']
+		.map(n => v(n, ''))
+		.filter(c => c.length > 0);
+	return {
+		background: v('--vscode-editor-background', '#1e1e1e'),
+		foreground: v('--vscode-editor-foreground', '#cccccc'),
+		grid: v('--vscode-editorWhitespace-foreground', 'rgba(255,255,255,0.06)'),
+		axisText: v('--vscode-descriptionForeground', 'rgba(204,204,204,0.7)'),
+		seriesPalette: palette.length > 0 ? palette : ['#4e79a7', '#59a14f', '#e15759', '#f28e2b', '#76b7b2', '#edc948'],
+	};
+}
+
+/** Clip insets so a chart container scrolled under the sticky header/gutter (incl. any frozen band) is
+ *  hidden there -- mirrors the editor overlay's body-pane clip. The chart anchor is virtually always a body
+ *  cell; split/frozen-anchored charts are best-effort in v1 (the clip still prevents header/gutter overlap). */
+function chartClipInsets(left: number, top: number, width: number, height: number): { top: number; left: number } {
+	const viewX = left - viewportEl.scrollLeft;
+	const viewY = top - viewportEl.scrollTop;
+	const leftBand = renderer.gutterWidthPx + frozenColsWidth(renderer.frozenCols);
+	const topBand = HEADER_HEIGHT + frozenRowsHeight(renderer.frozenRows);
+	return {
+		top: Math.max(0, Math.min(height, topBand - viewY)),
+		left: Math.max(0, Math.min(width, leftBand - viewX)),
+	};
+}
+
+const chartManager = new ChartOverlayManager({
+	mount: viewportEl,
+	post: (msg: unknown) => vscode.postMessage(msg),
+	anchorPos: (row: number, col: number) => {
+		const p = overlayCellContentPos(row, col);
+		return { left: p.left, top: p.top };
+	},
+	clipInsets: chartClipInsets,
+	readCell: (row: number, col: number) => renderer.entryAt(row, col)?.value,
+	columnLabel: chartColumnLabel,
+	theme: readChartTheme,
+});
+
+/** Wave Q2a: insert a chart of `type` over the current selection. The chart is anchored just to the RIGHT
+ *  of the selected range (so it does not cover the data) and the selection is its data source; the host
+ *  validates the payload, calls the engine napi `addChart`, and re-renders (the chart rides the next
+ *  render's `charts[]`). The picker routes here through `activateMenuItem` -> `runAfterResolvingEdit`. */
+function beginChartInsert(type: 'line' | 'bar' | 'scatter'): void {
+	const focus = active;
+	if (fullSnapshot === null || focus === null) {
+		showError('Select a data range to chart first.', 'transient');
+		return;
+	}
+	// `anchor === null` means a single-cell selection -> the range is just `focus` (selectionRect is symmetric).
+	const rect = selectionRect(anchor ?? focus, focus);
+	const anchorRow = rect.minRow;
+	const anchorCol = Math.min(rect.maxCol + 1, MAX_COLS - 1);
+	vscode.postMessage({
+		type: 'insertChart',
+		// The sheet this selection was computed on -- the host REJECTS the message if its active sheet has since
+		// changed (a stale message racing a sheet switch would otherwise create a chart on the new sheet using
+		// the OLD sheet's coordinates).
+		sheet: fullSnapshot.sheet,
+		chartType: type,
+		anchorRow,
+		anchorCol,
+		widthPx: 480,
+		heightPx: 300,
+		srcStartRow: rect.minRow,
+		srcStartCol: rect.minCol,
+		srcEndRow: rect.maxRow,
+		srcEndCol: rect.maxCol,
+		webviewId: WEBVIEW_ID,
+	});
+}
 // FE-2-0 Phase 2 (re-audit HIGH): a pending edit now resolves ONLY on a matching commitResult/errorReply
 // -- a bare render no longer releases it. So a LOST/dropped/malformed completion would strand the editor
 // forever (Escape/blur inert). This watchdog is the recovery net: if neither reply arrives in time, it
@@ -4202,7 +4310,16 @@ function overlayCellContentPos(row: number, col: number): { left: number; top: n
  * W-G-1b: only the OVERLAY editor is positioned over a cell; a formula-bar edit is a no-op here.
  * W3 frozen panes: a frozen cell's editor is pinned (see {@link overlayCellContentPos}), so this is also
  * called on every scroll so the pin tracks the live scroll. */
-function repositionEdit(): void {
+/** Wave Q2a: chart overlays track the SAME geometry changes as the open editor (scroll, freeze, split, row/col
+ *  resize, theme/font). This is the convergence point: every site that re-pins the editor also re-pins + re-clips
+ *  the charts. Charts re-position even with NO open editor (unlike {@link repositionEditImpl}, which early-returns),
+ *  so a chart's anchor stays correct after a geometry change that did not trigger a host render. */
+function repositionOverlays(): void {
+	repositionEditImpl();
+	chartManager.reposition();
+}
+
+function repositionEditImpl(): void {
 	if (editState === null || editState.surface !== 'overlay') {
 		return;
 	}
@@ -5031,7 +5148,7 @@ canvasEl.addEventListener('pointermove', ev => {
 		const newWidth = Math.max(MIN_COL_WIDTH, Math.min(MAX_COL_WIDTH, Math.round(colResizeDrag.startWidth + dx)));
 		renderer.setColSizing(withOverride(renderer.colSizing, colResizeDrag.col, newWidth));
 		updateSpacer(); // Wave G: the total content width changed -> resync the native horizontal scrollbar range
-		repositionEdit();
+		repositionOverlays();
 		redraw();
 		return;
 	}
@@ -5210,7 +5327,7 @@ canvasEl.addEventListener('pointercancel', ev => {
 		renderer.setColSizing(withOverride(renderer.colSizing, colResizeDrag.col, colResizeDrag.startWidth));
 		updateSpacer(); // Wave G: revert restored the width -> resync the scrollbar range
 		colResizeDrag = null;
-		repositionEdit();
+		repositionOverlays();
 		redraw();
 		return;
 	}
@@ -6418,6 +6535,27 @@ window.addEventListener('message', (event: MessageEvent) => {
 		// updateFormulaBar() makes a names-only render (e.g. after a define, which touches no cell) update the box.
 		applyDefinedNames((msg as { names?: unknown }).names);
 		updateFormulaBar();
+		// Wave Q2a (2026-06-24): reconcile the chart overlays from the host's `charts[]` (the workbook's chart
+		// objects) for THIS sheet, and re-pull each chart's source range from the just-applied snapshot (the
+		// free live-update -- a recalc re-posts `render`, so the chart tracks its data). After applyRender so the
+		// snapshot (renderer.entryAt) is current. A non-array (old host / no charts) reconciles to empty.
+		const rawCharts = (msg as { charts?: unknown }).charts;
+		chartManager.sync(Array.isArray(rawCharts) ? (rawCharts as ChartJson[]) : [], snapshot.sheet);
+		return;
+	}
+	if (msg.type === 'beginInsertChart') {
+		// Wave Q2a: the "Quantbook: Insert Chart" palette command routes here -- open the chart-type picker
+		// anchored under the toolbar's Insert Chart button (the same surface the button click opens), over the
+		// live selection. No-Fallbacks: if the button is somehow absent the picker simply does not open (the
+		// toolbar button remains the entry point); the host already verified a panel is focused.
+		const chartBtn = toolbarEl.querySelector('[data-cmd="insertChart"]');
+		if (chartBtn instanceof HTMLElement) {
+			openMenuDropdown(chartBtn, CHART_TYPE_MENU_ITEMS, null);
+		} else {
+			// The button is hardcoded in the toolbar markup, so this is unreachable in practice -- but a missing
+			// anchor is a wiring bug, not a silent no-op (No-Fallbacks).
+			console.error('[sheets-webview] beginInsertChart: toolbar button [data-cmd="insertChart"] not found');
+		}
 		return;
 	}
 	if (msg.type === 'commitResult') {
@@ -6682,7 +6820,7 @@ window.addEventListener('message', (event: MessageEvent) => {
 		ensureSplitWheel(renderer.splitActive);
 		// A freeze shifts every cell's pane, so an open overlay editor must be re-pinned + its clip recomputed
 		// (a frozen cell's editor pins; a cell now under a frozen band clips there). repositionEdit handles both.
-		repositionEdit();
+		repositionOverlays();
 		redraw();
 		return;
 	}
@@ -6695,7 +6833,7 @@ window.addEventListener('message', (event: MessageEvent) => {
 		if (mode === 'remove') {
 			renderer.clearSplit();
 			ensureSplitWheel(false);
-			repositionEdit();
+			repositionOverlays();
 			redraw();
 			vscode.postMessage({ type: 'splitState', active: false }); // ack: no split (the host keeps its freeze)
 			return;
@@ -6725,7 +6863,7 @@ window.addEventListener('message', (event: MessageEvent) => {
 				renderer.setTopSplitScroll(viewportEl.scrollTop - topBand);
 				ensureSplitWheel(true);
 			}
-			repositionEdit();
+			repositionOverlays();
 			redraw();
 			// Ack whether the split actually APPLIED (it clamps to no-split on a too-short viewport) so the host
 			// clears its PERSISTED freeze ONLY when a split truly replaced it -- never speculatively (Codex final).
@@ -6767,7 +6905,7 @@ window.addEventListener('message', (event: MessageEvent) => {
 		}
 		renderer.setColSizing(rebuilt);
 		updateSpacer(); // Wave G: the host's override set changed the total width -> resync the scrollbar range
-		repositionEdit();
+		repositionOverlays();
 		redraw();
 		return;
 	}
@@ -7017,8 +7155,12 @@ viewportEl.addEventListener('scroll', () => {
 	// back the live frozen-axis scroll); for a body-cell editor it writes the same content position (a no-op)
 	// and re-clips. So this both pins the frozen case and keeps the body-pane clip in lockstep.
 	if (editState !== null) {
-		repositionEdit();
+		repositionEditImpl();
 	}
+	// Wave Q2a: keep chart overlays in lockstep with the scroll (unconditionally -- charts move even with no open
+	// editor) -- re-pin a frozen-anchored chart + re-clip the body-pane band. A body-anchored chart's content
+	// position is unchanged, so this just re-clips.
+	chartManager.reposition();
 	scheduleRedraw();
 });
 
@@ -7051,8 +7193,12 @@ function onSplitWheel(e: WheelEvent): void {
 		viewportEl.scrollLeft += e.deltaX * scaleX; // shared horizontal; its scroll listener pins + reschedules
 	}
 	if (editState !== null) {
-		repositionEdit(); // a top-pane editor follows its synthetic scroll
+		repositionEditImpl(); // a top-pane editor follows its synthetic scroll
 	}
+	// Wave Q2a (Codex re-audit MED): reposition charts UNCONDITIONALLY on a top-pane wheel scroll -- the split
+	// top pane has no native scrollbar, so this synthetic scroll is the ONLY signal; gating it on an open editor
+	// would leave a top-pane chart drifting until the next render (mirrors the main scroll handler).
+	chartManager.reposition();
 	scheduleRedraw();
 }
 let splitWheelAttached = false;
@@ -7080,9 +7226,13 @@ if (typeof ResizeObserver !== 'undefined') {
 // gutter width may have changed -> every cell's x shifts, Audit LOW-7), re-size the spacer, repaint.
 new MutationObserver(() => {
 	renderer.refreshTheme();
-	repositionEdit();
+	repositionOverlays();
 	updateSpacer();
 	redraw();
+	// Wave Q2a: a theme switch leaves the same DATA, so the chart re-embed memo would skip it and the Vega
+	// charts would keep the OLD palette (dark chart on a light theme). Force a re-embed from the fresh CSS-var
+	// theme (this clears each chart's data-signature so the next render also re-embeds, then re-embeds now).
+	chartManager.retheme();
 	// FE-3 / Wave D: recolour the active overlay (whichever surface) from the REFRESHED palette. The ink spans
 	// cache their colour inline (resolved at paint time), so a theme change leaves them on the OLD hues while the
 	// grid boxes just repainted from the new palette -- the text/box colours would disagree until the next

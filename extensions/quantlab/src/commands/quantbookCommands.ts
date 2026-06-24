@@ -288,6 +288,20 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 		}),
 	);
 
+	// --- Wave Q1 (2026-06-24): Insert Chart (palette entry). ---
+	// The webview owns the live selection, so the command only ASKS the focused Cell Grid to open its
+	// chart-type picker over the current selection (the same flow as the toolbar's Insert Chart button).
+	// No focused panel -> a LOUD info message (No-Fallbacks: never a silent no-op).
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookInsertChart', () => {
+			if (!CellGridPanel.beginInsertChartOnFocusedPanel()) {
+				void vscode.window.showInformationMessage(
+					'Quantbook: focus a Cell Grid and select a data range first, then run "Quantbook: Insert Chart".',
+				);
+			}
+		}),
+	);
+
 	// --- Primary cell-grid command (FE-0a Part B / B1: owning Session). ---
 	// Opens a single-writer Session-backed grid seeded with sample data so the
 	// scaffold shows something. The user can edit number / text / `=formula`

@@ -701,6 +701,77 @@ body {
 	margin: 0;
 }
 
+/* Wave Q2a (2026-06-24): chart overlay objects. A .qb-chart-overlay is an absolutely-positioned child of the
+ * scroller's CONTENT layer (a sibling of .cell-edit-input), so it tracks scroll naturally; JS sets its
+ * left/top/width/height (anchor cell + chart size) and a clip-path inset that hides the part sliding under the
+ * sticky header/gutter. Above the canvas (z-index 1) + the editor (z-index 2), below the formula suggest
+ * (z-index 20) and the floating menus (z-index 1000) so the chart-type picker renders on top. */
+.qb-chart-overlay {
+	position: absolute;
+	z-index: 5;
+	box-sizing: border-box;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	background: var(--vscode-editor-background);
+	border: 1px solid var(--vscode-panel-border, var(--vscode-focusBorder));
+	border-radius: 3px;
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+.qb-chart-head {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	height: 22px;
+	padding: 0 4px 0 8px;
+	flex: 0 0 auto;
+	background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+	border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+	cursor: default;
+	user-select: none;
+}
+.qb-chart-title {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 11px;
+	color: var(--vscode-foreground);
+}
+.qb-chart-close {
+	flex: 0 0 auto;
+	width: 18px;
+	height: 18px;
+	padding: 0;
+	border: none;
+	background: transparent;
+	color: var(--vscode-icon-foreground, var(--vscode-foreground));
+	font-size: 14px;
+	line-height: 1;
+	cursor: pointer;
+	border-radius: 3px;
+}
+.qb-chart-close:hover {
+	background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+.qb-chart-body {
+	flex: 1 1 auto;
+	min-height: 0;
+	position: relative;
+	overflow: hidden;
+}
+/* No-Fallbacks: a compile/render failure shows IN the box (loud) rather than silently blanking. */
+.qb-chart-body.qb-chart-error {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 8px;
+	font-size: 11px;
+	text-align: center;
+	color: var(--vscode-errorForeground, #f48771);
+}
+
 /* FE-3 / Wave D in-cell follow-up: the text-colouring overlay for the in-cell editor. A sibling of
  * .cell-edit-input in the scroller; JS sets its left/top/width/height/clip-path to MIRROR the input (so they
  * are intentionally absent here). DECORATIVE ONLY -- pointer-events:none + user-select:none means every click,
