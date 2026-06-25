@@ -133,6 +133,7 @@
 	"view.diagnostics.title": "Errors",
 	"view.functionCatalog.title": "Functions",
 	"view.sqlQuery.title": "SQL Query",
+	"view.aiPanel.title": "AI Assistant",
 	"command.switchToVisualise.title": "Switch to Visualise View",
 	"command.switchToDataEditor.title": "Switch to Data Editor",
 	"command.openDataAction.title": "Open Data Action",

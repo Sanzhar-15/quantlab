@@ -27,6 +27,7 @@ import { registerHistoryCommands } from './commands/historyCommands';
 import { registerPanelCommands } from './commands/panelCommands';
 import { registerTradeCommands } from './commands/tradeCommands';
 import { registerAICommands, loadAnthropicKeyIntoProvider } from './commands/aiCommands';
+import { AIPanelProvider } from './panels/AIPanelProvider';
 import { registerViewCommands } from './commands/viewCommands';
 import { registerDashboardCommands } from './commands/dashboardCommands';
 import { GlobalState } from './core/state/GlobalState';
@@ -426,6 +427,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// workbook's registered functions (built-ins grouped by letter + any UDFs), click-to-copy the name.
 	// Additive; reads session.listFunctions() off the focused grid. Also serves the R22 catalog-UI tail.
 	registerFunctionCatalogView(context);
+
+	// Wave I1 (R21, DEC-4): the "AI Assistant" chat sidebar -- the built AIPanelProvider wired into
+	// the quantlab-quantbook Activity Bar container. The provider self-contains its HTML + JS (no
+	// separate webview bundle). Gated by `quantbook.hasOpenGrid` (package.json `views` entry).
+	// The panel renders immediately; it surfaces "Not configured" status until the user runs
+	// "Quantbook: Set Anthropic API Key" (quantlab.setAnthropicApiKey, already registered above).
+	// retainContextWhenHidden preserves the conversation across hide/show cycles.
+	context.subscriptions.push(
+		vscode.window.registerWebviewViewProvider(
+			AIPanelProvider.viewType,
+			new AIPanelProvider(context.extensionUri),
+			{ webviewOptions: { retainContextWhenHidden: true } },
+		),
+	);
 
 	// Wave J-a (R16, 2026-06-20): the local-first messaging surface -- a `$(shield) Local` status-bar item
 	// (shown while a grid is open) + a "Local-First Privacy" command that opens the full, honest statement

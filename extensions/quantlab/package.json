@@ -1070,6 +1070,12 @@
           "type": "webview",
           "name": "%view.sqlQuery.title%",
           "when": "quantbook.hasOpenGrid"
+        },
+        {
+          "id": "quantlab.aiPanel",
+          "type": "webview",
+          "name": "%view.aiPanel.title%",
+          "when": "quantbook.hasOpenGrid"
         }
       ]
     },
