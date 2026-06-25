@@ -77,14 +77,25 @@ pub(crate) fn parse_relationships(
                     let mut id = String::new();
                     let mut rel_type = String::new();
                     let mut target = String::new();
-                    for attr in e.attributes().with_checks(false).flatten() {
+                    for attr in e.attributes().with_checks(false) {
+                        // TA10: de-flatten + loud unescape (No-Fallbacks) — a
+                        // malformed `<Relationship>` attribute is corruption, not
+                        // a skippable item that silently drops the relationship.
+                        let attr = attr.map_err(|err| XlsxError::MalformedOoxml {
+                            part: part_path.to_string(),
+                            message: format!("malformed <Relationship> attribute: {err}"),
+                        })?;
                         let key = attr.key.as_ref();
+                        let val = attr.unescape_value().map_err(|err| XlsxError::MalformedOoxml {
+                            part: part_path.to_string(),
+                            message: format!("malformed <Relationship> attribute value: {err}"),
+                        })?;
                         if key == b"Id" {
-                            id = attr.unescape_value().unwrap_or_default().to_string();
+                            id = val.to_string();
                         } else if key == b"Type" {
-                            rel_type = attr.unescape_value().unwrap_or_default().to_string();
+                            rel_type = val.to_string();
                         } else if key == b"Target" {
-                            target = attr.unescape_value().unwrap_or_default().to_string();
+                            target = val.to_string();
                         }
                     }
                     if !id.is_empty() {
@@ -224,5 +235,19 @@ mod tests {
         )
         .unwrap();
         assert!(rels.is_empty());
+    }
+
+    #[test]
+    fn ta10_malformed_entity_in_relationship_attr_errors() {
+        // TA10 fold: a malformed XML entity in a <Relationship> attribute is
+        // corruption (the old `unescape_value().unwrap_or_default()` swallowed
+        // it to "", which silently dropped or corrupted the relationship).
+        let xml = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="t" Target="&bogus;"/>
+</Relationships>"#;
+        match parse_relationships(xml, "xl/_rels/workbook.xml.rels") {
+            Err(XlsxError::MalformedOoxml { .. }) => {}
+            other => panic!("expected MalformedOoxml, got {other:?}"),
+        }
     }
 }

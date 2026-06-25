@@ -43,15 +43,31 @@ pub(crate) fn parse_cell_styles_xml(
                 if tag == "c" {
                     let mut r_attr: Option<String> = None;
                     let mut s_attr: Option<u32> = None;
-                    for attr in e.attributes().with_checks(false).flatten() {
+                    for attr in e.attributes().with_checks(false) {
+                        // TA10: de-flatten + loud unescape (No-Fallbacks). A
+                        // malformed `<c>` attribute is corruption. (A malformed
+                        // cell *address* `r` value remains a documented silent
+                        // skip below — the calamine grid path cross-checks it;
+                        // this is the value-shape, not an XML/syntax error.)
+                        let attr = attr.map_err(|err| XlsxError::MalformedOoxml {
+                            part: part_path.to_string(),
+                            message: format!("malformed <c> attribute: {err}"),
+                        })?;
                         let key = attr.key.as_ref();
-                        if key == b"r" {
-                            r_attr = Some(attr.unescape_value().unwrap_or_default().to_string());
-                        } else if key == b"s" {
-                            if let Ok(n) = attr.unescape_value().unwrap_or_default().parse::<u32>()
-                            {
-                                s_attr = Some(n);
+                        let val = attr.unescape_value().map_err(|err| {
+                            XlsxError::MalformedOoxml {
+                                part: part_path.to_string(),
+                                message: format!("malformed <c> attribute value: {err}"),
                             }
+                        })?;
+                        if key == b"r" {
+                            r_attr = Some(val.to_string());
+                        } else if key == b"s" {
+                            // TA10/COR-05 (no-fallbacks): a present-but-malformed
+                            // `s` (style index) is corruption. The old `if let Ok`
+                            // silently left `s_attr = None`, dropping the cell from
+                            // the format overlay (rendered with the default style).
+                            s_attr = Some(super::parse_u32_attr(&val, "s", part_path)?);
                         }
                     }
                     // Skip cells that don't reference a non-default style.
@@ -182,5 +198,46 @@ mod tests {
         </worksheet>"#;
         let out = parse_cell_styles_xml(xml, "test").unwrap();
         assert_eq!(out, vec![(0, 0, 7)]);
+    }
+
+    #[test]
+    fn ta10_malformed_style_index_errors() {
+        // A present-but-malformed `s` (style index) is corruption. The old
+        // `if let Ok` silently left `s_attr = None`, dropping the cell from
+        // the format overlay (rendered with the default style). It must now
+        // surface loudly. (Note: a malformed `r` stays a silent skip — a
+        // separate, documented class; this test isolates `s`.)
+        let xml = r#"<worksheet>
+          <sheetData>
+            <c r="A1" s="not-a-number"/>
+          </sheetData>
+        </worksheet>"#;
+        match parse_cell_styles_xml(xml, "xl/worksheets/sheet1.xml") {
+            Err(XlsxError::MalformedOoxml { part, message }) => {
+                assert_eq!(part, "xl/worksheets/sheet1.xml");
+                assert!(message.contains("attribute s"), "got: {message}");
+            }
+            other => panic!("expected MalformedOoxml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ta10_absent_style_index_is_skipped_not_error() {
+        // Regression guard: an ABSENT `s` is skipped (no overlay), NOT an error.
+        let xml = r#"<worksheet><sheetData><c r="A1"><v>1</v></c></sheetData></worksheet>"#;
+        let out = parse_cell_styles_xml(xml, "xl/worksheets/sheet1.xml").unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ta10_malformed_entity_in_attr_value_errors() {
+        // TA10 fold: a malformed XML entity in an attribute value is corruption.
+        // The old `unescape_value().unwrap_or_default()` swallowed it to "";
+        // it must now surface loudly.
+        let xml = r#"<worksheet><sheetData><c r="A1" s="&bogus;"/></sheetData></worksheet>"#;
+        match parse_cell_styles_xml(xml, "xl/worksheets/sheet1.xml") {
+            Err(XlsxError::MalformedOoxml { .. }) => {}
+            other => panic!("expected MalformedOoxml, got {other:?}"),
+        }
     }
 }

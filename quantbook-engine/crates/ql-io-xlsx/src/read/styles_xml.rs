@@ -125,6 +125,15 @@ pub(crate) fn parse_styles_xml(package: &XlsxPackage) -> Result<StyleIndex, Xlsx
                 // file was silently dropped from the index.
                 if tag == "xf" && element_stack.last().map(String::as_str) == Some("cellXfs") {
                     idx.cell_xfs.push(parse_xf_attrs(&e)?);
+                } else if tag == "numFmt" {
+                    // TA10: `<numFmt>` may appear non-self-closing
+                    // (`<numFmt ...></numFmt>`) → Start, not Empty. Parse here
+                    // too so a present-but-malformed numFmtId still errors and
+                    // valid non-self-closing custom formats are not dropped
+                    // (mirrors the `xf` Start/Empty symmetry above).
+                    if let Some(entry) = parse_numfmt_attrs(&e, PART)? {
+                        idx.num_fmts.push(entry);
+                    }
                 }
                 element_stack.push(tag);
             }
@@ -133,7 +142,7 @@ pub(crate) fn parse_styles_xml(package: &XlsxPackage) -> Result<StyleIndex, Xlsx
                 let tag = std::str::from_utf8(local_name.as_ref()).unwrap_or("");
                 match tag {
                     "numFmt" => {
-                        if let Some(entry) = parse_numfmt_attrs(&e) {
+                        if let Some(entry) = parse_numfmt_attrs(&e, PART)? {
                             idx.num_fmts.push(entry);
                         }
                     }
@@ -157,26 +166,49 @@ pub(crate) fn parse_styles_xml(package: &XlsxPackage) -> Result<StyleIndex, Xlsx
     Ok(idx)
 }
 
-fn parse_numfmt_attrs(e: &quick_xml::events::BytesStart) -> Option<NumFmtEntry> {
+fn parse_numfmt_attrs(
+    e: &quick_xml::events::BytesStart,
+    part: &str,
+) -> Result<Option<NumFmtEntry>, XlsxError> {
     let mut num_fmt_id: Option<u32> = None;
     let mut format_code = String::new();
-    for attr in e.attributes().with_checks(false).flatten() {
+    for attr in e.attributes().with_checks(false) {
+        // TA10: de-flatten + loud unescape (No-Fallbacks).
+        let attr = attr.map_err(|err| XlsxError::MalformedOoxml {
+            part: part.to_string(),
+            message: format!("malformed <numFmt> attribute: {err}"),
+        })?;
         let key = attr.key.as_ref();
-        let val = attr.unescape_value().unwrap_or_default();
+        let val = attr.unescape_value().map_err(|err| XlsxError::MalformedOoxml {
+            part: part.to_string(),
+            message: format!("malformed <numFmt> attribute value: {err}"),
+        })?;
         if key == b"numFmtId" {
-            num_fmt_id = val.parse::<u32>().ok();
+            // TA10/COR-05 (no-fallbacks): a present-but-malformed `numFmtId`
+            // is corruption. The old `.parse().ok()` collapsed garbage onto
+            // `None`, indistinguishable from an absent attr — silently
+            // dropping the entire custom number-format definition (the
+            // user's `#,##0.00 €` etc. vanished). Mirrors `parse_xf_attrs`
+            // (NF-05), which already errors loudly on the `<cellXfs>/<xf>`
+            // side of the same id.
+            num_fmt_id = Some(super::parse_u32_attr(&val, "numFmtId", part)?);
         } else if key == b"formatCode" {
             format_code = val.to_string();
         }
     }
-    let id = num_fmt_id?;
+    // Absent `numFmtId` or empty `formatCode` → not a usable custom-format
+    // definition; legitimately skipped (distinct from malformed-present,
+    // which already returned `Err` above).
+    let Some(id) = num_fmt_id else {
+        return Ok(None);
+    };
     if format_code.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(NumFmtEntry {
+    Ok(Some(NumFmtEntry {
         num_fmt_id: id,
         format_code,
-    })
+    }))
 }
 
 /// **NF-05 (no-fallbacks):** returns `Err` if `numFmtId` is present but
@@ -193,9 +225,17 @@ fn parse_xf_attrs(e: &quick_xml::events::BytesStart) -> Result<CellXf, XlsxError
     // applyNumberFormat attr → format IS applied per the spec).
     // The prior `false` default silently dropped these on import.
     let mut apply_number_format = true;
-    for attr in e.attributes().with_checks(false).flatten() {
+    for attr in e.attributes().with_checks(false) {
+        // TA10: de-flatten + loud unescape (No-Fallbacks).
+        let attr = attr.map_err(|err| XlsxError::MalformedOoxml {
+            part: "xl/styles.xml".to_string(),
+            message: format!("malformed <cellXfs>/<xf> attribute: {err}"),
+        })?;
         let key = attr.key.as_ref();
-        let val = attr.unescape_value().unwrap_or_default();
+        let val = attr.unescape_value().map_err(|err| XlsxError::MalformedOoxml {
+            part: "xl/styles.xml".to_string(),
+            message: format!("malformed <cellXfs>/<xf> attribute value: {err}"),
+        })?;
         if key == b"numFmtId" {
             num_fmt_id = val.parse::<u32>().map_err(|_| XlsxError::MalformedOoxml {
                 part: "xl/styles.xml".to_string(),
@@ -207,7 +247,10 @@ fn parse_xf_attrs(e: &quick_xml::events::BytesStart) -> Result<CellXf, XlsxError
             })?;
         } else if key == b"applyNumberFormat" {
             // Explicit attr: "1"/"true" → apply; "0"/"false" → don't.
-            apply_number_format = val == "1" || val.eq_ignore_ascii_case("true");
+            // TA10: loud boolean (was `== "1" || eq_ignore..true`, which
+            // silently treated a malformed value as "don't apply").
+            apply_number_format =
+                super::parse_bool_attr(&val, "applyNumberFormat", "xl/styles.xml")?;
         }
     }
     Ok(CellXf {
@@ -363,5 +406,113 @@ mod tests {
         let idx = parse_styles_xml(&pkg).unwrap();
         assert_eq!(idx.cell_xfs.len(), 1);
         assert_eq!(idx.cell_xfs[0].num_fmt_id, 4_294_967_294u32);
+    }
+
+    // ============================================================
+    // TA10 — malformed numFmtId on the <numFmt> *definition* errors
+    // loudly (the sibling of NF-05, which guards <cellXfs>/<xf>).
+    // ============================================================
+
+    /// A malformed `numFmtId` on a `<numFmt>` definition must error
+    /// loudly instead of `.parse().ok()` collapsing it to `None` —
+    /// which silently dropped the user's entire custom number format.
+    #[test]
+    fn ta10_malformed_numfmt_def_id_returns_error() {
+        let xml = r#"<styleSheet>
+  <numFmts count="1">
+    <numFmt numFmtId="not-a-number" formatCode="yyyy-mm-dd"/>
+  </numFmts>
+</styleSheet>"#;
+        let pkg = pkg_with_styles(xml);
+        let err = parse_styles_xml(&pkg).unwrap_err();
+        match err {
+            XlsxError::MalformedOoxml { part, message } => {
+                assert_eq!(part, "xl/styles.xml");
+                assert!(
+                    message.contains("numFmtId"),
+                    "error should mention numFmtId; got: {message}"
+                );
+                assert!(
+                    message.contains("not-a-number"),
+                    "error should quote the bad value; got: {message}"
+                );
+            }
+            other => panic!("expected MalformedOoxml, got {other:?}"),
+        }
+    }
+
+    /// An *absent* `numFmtId` (vs present-malformed) is legitimately
+    /// skipped, NOT an error — the absent/present distinction is the
+    /// whole point of the loud helper.
+    #[test]
+    fn ta10_numfmt_def_absent_id_is_skipped_not_error() {
+        let xml = r#"<styleSheet>
+  <numFmts count="1">
+    <numFmt formatCode="yyyy-mm-dd"/>
+  </numFmts>
+</styleSheet>"#;
+        let pkg = pkg_with_styles(xml);
+        let idx = parse_styles_xml(&pkg).unwrap();
+        assert_eq!(idx.num_fmts.len(), 0);
+    }
+
+    #[test]
+    fn ta10_numfmt_def_valid_large_id_is_accepted() {
+        // Boundary guard for the <numFmt> definition path (parity with the
+        // NF-05 cellXfs boundary test).
+        let xml = r#"<styleSheet>
+  <numFmts count="1">
+    <numFmt numFmtId="4294967294" formatCode="yyyy-mm-dd"/>
+  </numFmts>
+</styleSheet>"#;
+        let idx = parse_styles_xml(&pkg_with_styles(xml)).unwrap();
+        assert_eq!(idx.num_fmts.len(), 1);
+        assert_eq!(idx.num_fmts[0].num_fmt_id, 4_294_967_294u32);
+    }
+
+    #[test]
+    fn ta10_malformed_apply_number_format_errors() {
+        // TA10: a present-but-invalid `applyNumberFormat` boolean is
+        // corruption — the old `== "1" || eq_ignore..true` silently treated
+        // it as "don't apply", dropping the user's number format.
+        let xml = r#"<styleSheet>
+  <cellXfs count="1">
+    <xf numFmtId="164" applyNumberFormat="banana"/>
+  </cellXfs>
+</styleSheet>"#;
+        match parse_styles_xml(&pkg_with_styles(xml)) {
+            Err(XlsxError::MalformedOoxml { message, .. }) => {
+                assert!(message.contains("applyNumberFormat"), "got: {message}");
+            }
+            other => panic!("expected MalformedOoxml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ta10_non_self_closing_numfmt_is_parsed() {
+        // TA10 fold (Codex HIGH): a non-self-closing `<numFmt></numFmt>`
+        // arrives as Event::Start, not Empty. It must be parsed too —
+        // a valid one is kept; a malformed numFmtId errors loudly (was
+        // silently skipped entirely before).
+        let valid = r#"<styleSheet>
+  <numFmts count="1">
+    <numFmt numFmtId="164" formatCode="yyyy-mm-dd"></numFmt>
+  </numFmts>
+</styleSheet>"#;
+        let idx = parse_styles_xml(&pkg_with_styles(valid)).unwrap();
+        assert_eq!(idx.num_fmts.len(), 1);
+        assert_eq!(idx.num_fmts[0].num_fmt_id, 164);
+
+        let malformed = r#"<styleSheet>
+  <numFmts count="1">
+    <numFmt numFmtId="not-a-number" formatCode="yyyy-mm-dd"></numFmt>
+  </numFmts>
+</styleSheet>"#;
+        match parse_styles_xml(&pkg_with_styles(malformed)) {
+            Err(XlsxError::MalformedOoxml { message, .. }) => {
+                assert!(message.contains("numFmtId"), "got: {message}");
+            }
+            other => panic!("expected MalformedOoxml, got {other:?}"),
+        }
     }
 }
