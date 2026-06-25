@@ -208,9 +208,12 @@ impl<'a> WorkbookRuntime<'a> {
             .format_cache
             .get(&format_id)
             .expect("just inserted above");
-        // V1 EvalContext: workbook's date_system + en-US locale + System now-provider.
+        // EvalContext: workbook's date_system + workbook's locale + System now-provider.
+        // The locale drives which decimal / thousands separator glyphs the number
+        // renderer emits (e.g. `,` decimal for De/Fr vs `.` for EnUs).
         let ctx = EvalContext {
             date_system: self.workbook.date_system(),
+            locale: self.workbook.locale(),
             ..EvalContext::default()
         };
         format::render(&value, fmt, &ctx)
@@ -858,6 +861,35 @@ mod tests {
             assert_eq!(rt.nudge_cell_decimals(s, 0, 0, 1).unwrap(), None);
         }
         assert_eq!(bound_format(&wb, s, 0, 0).as_deref(), Some(at_cap.as_str()));
+    }
+
+    // ===== COR-03 / TA3 — locale threading through read_display =====
+
+    #[test]
+    fn read_display_de_locale_uses_comma_decimal_dot_thousands() {
+        // Workbook with De locale: #,##0.00 on 1234.56 should render "1.234,56".
+        let mut wb = Workbook::new();
+        wb.set_locale(ql_types::Locale::De);
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::Number(1234.56));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let id = rt.intern_format("#,##0.00").unwrap();
+        rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+        assert_eq!(rt.read_display(s, 0, 0), "1.234,56");
+    }
+
+    #[test]
+    fn read_display_enus_locale_unchanged_regression() {
+        // EnUs (default) workbook: output must remain byte-identical.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::Number(1234.56));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let id = rt.intern_format("#,##0.00").unwrap();
+        rt.set_cell_format(s, 0, 0, Some(id)).unwrap();
+        assert_eq!(rt.read_display(s, 0, 0), "1,234.56");
     }
 
     #[test]
