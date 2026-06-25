@@ -121,9 +121,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ql_calcgraph::{
-    range_contains_rowcol, schedule_with_supplemental, CellNode, Graph, Node, NodeId, Schedule,
-};
+use ql_calcgraph::{schedule_with_supplemental, CellNode, Graph, Node, NodeId, Schedule};
 use ql_formula_syntax::{lex, parse, RangeRef, SheetRef};
 use ql_functions::FunctionRegistry;
 use ql_session::function_meta::{DepShape, Volatility};
@@ -182,6 +180,155 @@ fn range_to_rangeref(r: Range) -> RangeRef {
             abs_end_col: false,
             abs_end_row: false,
         }
+    }
+}
+
+/// **TB1 (w128) — spatial index over the dirty FORMULA cells, built once
+/// per `CalcgraphSession::build_range_supplemental` call.**
+///
+/// Replaces the prior `O(|dirty|² × avg_ranges)` double-loop (each dirty
+/// formula F's ranges cross-checked against EVERY dirty formula G) with a
+/// per-sheet, axis-sorted index that answers "which dirty G's fall inside
+/// THIS resolved range?" in `O(log |dirty_on_sheet| + matches)` per query.
+///
+/// # Design
+///
+/// One `Vec` per sheet, holding every dirty formula cell on that sheet,
+/// stored as a flat sorted slice and viewed through two orderings:
+///
+/// - **col-major** `(ColId, RowId, NodeId)` — supports `Cells` and
+///   `WholeColumn` queries: binary-search the contiguous `[start_col,
+///   end_col]` band, then scan that band filtering on the row predicate.
+/// - **row-major** `(RowId, ColId, NodeId)` — supports `WholeRow`
+///   queries (any column, rows in `[start_row, end_row]`): binary-search
+///   the contiguous row band.
+///
+/// `Cells` and `WholeColumn` both prune on the column axis (the common
+/// quant-sheet shape: tall single/few-column ranges), so the col-major
+/// view is the hot path. `WholeRow` is rarer and uses the row-major view.
+///
+/// # Equivalence to the old loop
+///
+/// The old loop, for a resolved `(sheet, range)`, emitted exactly the
+/// dirty formula nodes G with `gs == resolved_sheet` AND
+/// `range_contains_rowcol(range, gr, gc)`. This index returns the SAME
+/// set: the per-sheet bucketing reproduces the `gs == resolved_sheet`
+/// filter, and `matches_*` apply the IDENTICAL row/col bounds as
+/// `range_contains_rowcol`'s three arms. Callers re-apply
+/// `range_contains_rowcol` is therefore unnecessary — the index IS the
+/// containment check — but the returned nodes are sorted ascending by
+/// `NodeId` so the caller can reproduce the old loop's per-range
+/// "ascending-NodeId" emission order exactly.
+#[derive(Default)]
+struct DirtyCellIndex {
+    /// Per-sheet bucket of dirty formula cells. Each bucket holds the
+    /// same cells in two sorted orderings.
+    sheets: HashMap<SheetId, DirtyCellSheet>,
+}
+
+#[derive(Default)]
+struct DirtyCellSheet {
+    /// Sorted ascending by `(col, row, node)`. Used for `Cells` /
+    /// `WholeColumn` (column-band) queries.
+    col_major: Vec<(ColId, RowId, NodeId)>,
+    /// Sorted ascending by `(row, col, node)`. Used for `WholeRow`
+    /// (row-band) queries.
+    row_major: Vec<(RowId, ColId, NodeId)>,
+}
+
+impl DirtyCellIndex {
+    /// Build from the dirty formula addresses. `addrs` is `(node, sheet,
+    /// row, col)`; the input order is irrelevant (each bucket is sorted
+    /// after insertion), so this is safe regardless of `dirty_vec`
+    /// ordering.
+    fn build(addrs: &[(NodeId, SheetId, RowId, ColId)]) -> Self {
+        let mut idx = DirtyCellIndex::default();
+        for &(node, s, r, c) in addrs {
+            let bucket = idx.sheets.entry(s).or_default();
+            bucket.col_major.push((c, r, node));
+            bucket.row_major.push((r, c, node));
+        }
+        for bucket in idx.sheets.values_mut() {
+            bucket.col_major.sort_unstable();
+            bucket.row_major.sort_unstable();
+        }
+        idx
+    }
+
+    /// Dirty formula nodes whose cell falls inside `range` (already
+    /// resolved to `sheet`), returned **sorted ascending by NodeId**.
+    ///
+    /// `R1C1Cells` is parser-intermediate and must never reach this code
+    /// path (storage canon lowers to absolute first) — matches the loud
+    /// `unreachable!` contract of `range_contains_rowcol` /
+    /// `range_ref_sheet`.
+    fn dirty_in_range(&self, sheet: SheetId, range: &RangeRef) -> Vec<NodeId> {
+        let Some(bucket) = self.sheets.get(&sheet) else {
+            return Vec::new();
+        };
+        let mut out: Vec<NodeId> = match range {
+            RangeRef::Cells {
+                start_col,
+                start_row,
+                end_col,
+                end_row,
+                ..
+            } => bucket.collect_col_band(*start_col, *end_col, |row| {
+                row >= *start_row && row <= *end_row
+            }),
+            RangeRef::WholeColumn {
+                start_col, end_col, ..
+            } => bucket.collect_col_band(*start_col, *end_col, |_row| true),
+            RangeRef::WholeRow {
+                start_row, end_row, ..
+            } => bucket.collect_row_band(*start_row, *end_row),
+            RangeRef::R1C1Cells { .. } => unreachable!(
+                "DirtyCellIndex::dirty_in_range: RangeRef::R1C1Cells is parser-intermediate; \
+                 storage canon must lower to absolute Cells before containment checks."
+            ),
+        };
+        out.sort_unstable();
+        out
+    }
+}
+
+impl DirtyCellSheet {
+    /// Nodes in columns `[start_col, end_col]` whose row satisfies
+    /// `row_ok`. Binary-searches the contiguous column band in the
+    /// col-major view, then scans it. Order of the returned Vec is
+    /// arbitrary (caller sorts).
+    fn collect_col_band<F: Fn(RowId) -> bool>(
+        &self,
+        start_col: ColId,
+        end_col: ColId,
+        row_ok: F,
+    ) -> Vec<NodeId> {
+        // First index with col >= start_col.
+        let lo = self.col_major.partition_point(|&(c, _, _)| c < start_col);
+        let mut out = Vec::new();
+        for &(c, r, node) in &self.col_major[lo..] {
+            if c > end_col {
+                break;
+            }
+            if row_ok(r) {
+                out.push(node);
+            }
+        }
+        out
+    }
+
+    /// Nodes in rows `[start_row, end_row]`, any column. Binary-searches
+    /// the contiguous row band in the row-major view. Order arbitrary.
+    fn collect_row_band(&self, start_row: RowId, end_row: RowId) -> Vec<NodeId> {
+        let lo = self.row_major.partition_point(|&(r, _, _)| r < start_row);
+        let mut out = Vec::new();
+        for &(r, _c, node) in &self.row_major[lo..] {
+            if r > end_row {
+                break;
+            }
+            out.push(node);
+        }
+        out
     }
 }
 
@@ -3002,11 +3149,23 @@ impl CalcgraphSession {
     /// order (same dirty set + same graph → same supplemental → same
     /// Schedule).
     ///
-    /// Complexity: O(|dirty_vec|² × avg_ranges_per_formula). Typical
-    /// edits have small dirty sets; the inner loop is a tight
-    /// `range_contains_rowcol` check. If profiling later shows pain,
-    /// switching to per-range bucketing (build a per-stripe index of
-    /// dirty formulas, intersect with range bounds) is the path.
+    /// Complexity (TB1, w128): builds a per-call [`DirtyCellIndex`] over
+    /// the dirty formula cells, then for each dirty formula F with range
+    /// deps queries the index once per range. The dominant term is
+    /// `O(|dirty| · log|dirty| + Σ_F Σ_range matches)` — the index build
+    /// (sort) plus the total emitted-edge count, replacing the prior
+    /// `O(|dirty|² × avg_ranges)` cross-scan. Large quant sheets with
+    /// many tall-column range formulas no longer stall recompute (OPT-02).
+    ///
+    /// **Output is byte-identical to the prior double-loop.** For each F,
+    /// ranges are still iterated in registration order; within each range
+    /// the index returns matched dirty G's sorted ascending by NodeId
+    /// (the same order the old inner `dirty_addrs` scan produced, since
+    /// `dirty_addrs` was itself sorted by NodeId); the per-F `added`
+    /// HashSet still dedups G across F's overlapping ranges keeping first
+    /// occurrence. Sheet resolution is unchanged
+    /// (`range_ref_sheet(range).unwrap_or(fs)`), and the index's
+    /// row/col bounds are the SAME bounds `range_contains_rowcol` checks.
     fn build_range_supplemental(&self, dirty_vec: &[NodeId]) -> HashMap<NodeId, Vec<NodeId>> {
         // Resolve cell addresses for every dirty FORMULA node. Non-
         // formula NodeIds (none exist today — the graph only adds Cell
@@ -3016,6 +3175,11 @@ impl CalcgraphSession {
             .iter()
             .filter_map(|&n| self.cell_address_for(n).map(|(s, r, c)| (n, s, r, c)))
             .collect();
+
+        // Spatial index over the dirty formula cells: "which dirty G's
+        // fall inside a resolved range?" in O(log + matches) per query,
+        // replacing the old O(|dirty|) inner scan.
+        let index = DirtyCellIndex::build(&dirty_addrs);
 
         let mut supplemental: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
         for &(f, fs, _, _) in &dirty_addrs {
@@ -3033,12 +3197,17 @@ impl CalcgraphSession {
             // `added.insert(g)` returns `true` on first add only.
             let mut added: HashSet<NodeId> = HashSet::new();
             for range in ranges {
+                // SAME resolution as the old loop: `range_ref_sheet`
+                // returns `Some(id)` for `SheetRef::Id`, `None` for
+                // `SheetRef::Current` (use F's owning sheet then). The
+                // index is bucketed by G's sheet, so querying
+                // `resolved_sheet` reproduces the old `gs ==
+                // resolved_sheet` filter exactly.
                 let resolved_sheet = Graph::range_ref_sheet(range).unwrap_or(fs);
-                for &(g, gs, gr, gc) in &dirty_addrs {
-                    if gs != resolved_sheet {
-                        continue;
-                    }
-                    if range_contains_rowcol(range, gr, gc) && added.insert(g) {
+                // Already sorted ascending by NodeId — same per-range
+                // emission order the old inner `dirty_addrs` scan had.
+                for g in index.dirty_in_range(resolved_sheet, range) {
+                    if added.insert(g) {
                         supplemental.entry(f).or_default().push(g);
                     }
                 }
@@ -3046,12 +3215,29 @@ impl CalcgraphSession {
         }
         supplemental
     }
+
+    /// **TB1 (w128) test-only accessor.** Expose `build_range_supplemental`
+    /// to the equivalence/property tests so they can compare the indexed
+    /// implementation against a brute-force reference directly (rather than
+    /// only observing it indirectly through `schedule_dirty`'s output).
+    #[cfg(test)]
+    pub(crate) fn build_range_supplemental_for_test(
+        &self,
+        dirty_vec: &[NodeId],
+    ) -> HashMap<NodeId, Vec<NodeId>> {
+        self.build_range_supplemental(dirty_vec)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::plan::BindError;
+    // TB1 (w128): brute-force equivalence reference for
+    // `build_range_supplemental` uses the same containment primitive the
+    // old loop did. Test-scoped so non-test builds don't carry an unused
+    // import.
+    use ql_calcgraph::range_contains_rowcol;
     use ql_types::Value;
 
     /// **W5-RT-1 / Step 1.1 (S1-MED-ζ closure):** pin the address-only
@@ -6265,5 +6451,492 @@ mod tests {
         let deps = s.formula_deps(f1).unwrap();
         assert!(deps.tables.iter().any(|t| t.as_ref() == "ORDERS"));
         assert!(!deps.tables.iter().any(|t| t.as_ref() == "Sales"));
+    }
+
+    // ============================================================
+    // TB1 (w128) — build_range_supplemental spatial-index rewrite:
+    // equivalence + perf tests.
+    // ============================================================
+
+    /// Brute-force reference: the EXACT pre-TB1 `O(|dirty|² × ranges)`
+    /// algorithm, recomputed from the session's live graph/address data.
+    /// The property test below asserts the indexed implementation
+    /// (`build_range_supplemental_for_test`) returns a byte-identical
+    /// HashMap to this oracle for arbitrary inputs.
+    ///
+    /// This mirrors the historical loop verbatim: per dirty formula F,
+    /// per F's ranges (registration order), scan ALL dirty formula nodes
+    /// G in `dirty_addrs` order, push G into `supplemental[F]` on the
+    /// first range that contains it (per-F dedup via `added`).
+    fn brute_force_supplemental(
+        s: &CalcgraphSession,
+        dirty_vec: &[NodeId],
+    ) -> HashMap<NodeId, Vec<NodeId>> {
+        let dirty_addrs: Vec<(NodeId, SheetId, RowId, ColId)> = dirty_vec
+            .iter()
+            .filter_map(|&n| s.cell_address_for(n).map(|(sh, r, c)| (n, sh, r, c)))
+            .collect();
+
+        let mut supplemental: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for &(f, fs, _, _) in &dirty_addrs {
+            let ranges = s.graph().range_deps_for(f);
+            if ranges.is_empty() {
+                continue;
+            }
+            let mut added: HashSet<NodeId> = HashSet::new();
+            for range in ranges {
+                let resolved_sheet = Graph::range_ref_sheet(range).unwrap_or(fs);
+                for &(g, gs, gr, gc) in &dirty_addrs {
+                    if gs != resolved_sheet {
+                        continue;
+                    }
+                    if range_contains_rowcol(range, gr, gc) && added.insert(g) {
+                        supplemental.entry(f).or_default().push(g);
+                    }
+                }
+            }
+        }
+        supplemental
+    }
+
+    /// Tiny deterministic LCG so the property test is reproducible (no
+    /// external rand dep). Numerical Recipes constants.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn range(&mut self, lo: u32, hi: u32) -> u32 {
+            // inclusive [lo, hi]
+            lo + self.next_u32() % (hi - lo + 1)
+        }
+    }
+
+    /// **TB1 equivalence property test.** Build many random sheets of
+    /// `SUM(range)` formulas, then assert the indexed
+    /// `build_range_supplemental` produces a HashMap byte-identical to
+    /// the brute-force `O(n²)` reference — same keys, same Vec contents
+    /// IN THE SAME ORDER. Order equality is the strong claim: the
+    /// supplemental Vec order is observable in Tarjan's child-visit order,
+    /// so identical order ⇒ identical schedules ⇒ identical recompute.
+    #[test]
+    fn build_range_supplemental_matches_brute_force_property() {
+        let registry = ql_functions::default_registry();
+        let wb = ql_storage::Workbook::new();
+
+        // 40 random trials; each trial a fresh session with a random
+        // population of range-dep formulas across up to 3 sheets.
+        for seed in 0..40u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1));
+            let mut s = CalcgraphSession::new();
+
+            let n_sheets: SheetId = rng.range(1, 3) as SheetId;
+            // Small coordinate space → dense overlap so containment
+            // actually fires often (the interesting case for equivalence).
+            let max_rc: u32 = rng.range(4, 12);
+            let n_formulas = rng.range(1, 30);
+
+            let mut placed: Vec<(SheetId, RowId, ColId)> = Vec::new();
+            for _ in 0..n_formulas {
+                let sheet = rng.range(0, (n_sheets - 1) as u32) as SheetId;
+                let row = rng.range(0, max_rc);
+                let col = rng.range(0, max_rc);
+                // Avoid placing two formulas on the same cell (the second
+                // on_set_formula would be a re-bind, which is fine but
+                // muddies bookkeeping). Skip dup placements.
+                if placed.contains(&(sheet, row, col)) {
+                    continue;
+                }
+                placed.push((sheet, row, col));
+
+                // Random range on a (possibly different) sheet — exercises
+                // cross-sheet sheet-resolution. Normalize bounds (min/max).
+                let rsheet = rng.range(0, (n_sheets - 1) as u32) as SheetId;
+                let (r0, r1) = {
+                    let a = rng.range(0, max_rc);
+                    let b = rng.range(0, max_rc);
+                    (a.min(b), a.max(b))
+                };
+                let (c0, c1) = {
+                    let a = rng.range(0, max_rc);
+                    let b = rng.range(0, max_rc);
+                    (a.min(b), a.max(b))
+                };
+                let range = ql_types::Range {
+                    sheet: rsheet,
+                    start_row: r0,
+                    start_col: c0,
+                    end_row: r1,
+                    end_col: c1,
+                };
+                // Occasionally give a formula TWO overlapping ranges to
+                // exercise the per-F dedup + multi-range ordering path.
+                let mut args = vec![ExprPlan::AggregateNameRef {
+                    name: Arc::from("R1"),
+                    range,
+                }];
+                if rng.range(0, 3) == 0 {
+                    let range2 = ql_types::Range {
+                        sheet: rsheet,
+                        start_row: r0.min(max_rc),
+                        start_col: c0,
+                        end_row: r1,
+                        end_col: c1.min(max_rc),
+                    };
+                    args.push(ExprPlan::AggregateNameRef {
+                        name: Arc::from("R2"),
+                        range: range2,
+                    });
+                }
+                let plan = ExprPlan::Function {
+                    name: Arc::from("SUM"),
+                    args,
+                };
+                s.on_set_formula(sheet, row, col, &plan, &wb, &registry);
+            }
+
+            // The dirty set = ALL formula nodes (the realistic full-row
+            // recompute), sorted by NodeId exactly as schedule_dirty does.
+            let mut dirty_vec: Vec<NodeId> = placed
+                .iter()
+                .filter_map(|&(sh, r, c)| s.cell_node_for(sh, r, c))
+                .collect();
+            dirty_vec.sort();
+
+            let got = s.build_range_supplemental_for_test(&dirty_vec);
+            let want = brute_force_supplemental(&s, &dirty_vec);
+
+            assert_eq!(
+                got,
+                want,
+                "seed {seed}: indexed supplemental must byte-match brute force \
+                 (n_sheets={n_sheets}, max_rc={max_rc}, formulas={})",
+                placed.len()
+            );
+        }
+    }
+
+    /// **TB1 equivalence — partial dirty subset.** The full-recompute
+    /// property test above always dirties every formula. This one dirties
+    /// a RANDOM subset, exercising the case where a range contains
+    /// non-dirty cells (which must NOT appear as supplemental edges).
+    #[test]
+    fn build_range_supplemental_matches_brute_force_partial_dirty() {
+        let registry = ql_functions::default_registry();
+        let wb = ql_storage::Workbook::new();
+
+        for seed in 0..30u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0xD1B54A32D192ED03).wrapping_add(7));
+            let mut s = CalcgraphSession::new();
+            let max_rc: u32 = rng.range(4, 10);
+            let n_formulas = rng.range(2, 24);
+
+            let mut placed: Vec<(SheetId, RowId, ColId)> = Vec::new();
+            for _ in 0..n_formulas {
+                let row = rng.range(0, max_rc);
+                let col = rng.range(0, max_rc);
+                if placed.contains(&(0, row, col)) {
+                    continue;
+                }
+                placed.push((0, row, col));
+                let (r0, r1) = {
+                    let a = rng.range(0, max_rc);
+                    let b = rng.range(0, max_rc);
+                    (a.min(b), a.max(b))
+                };
+                let (c0, c1) = {
+                    let a = rng.range(0, max_rc);
+                    let b = rng.range(0, max_rc);
+                    (a.min(b), a.max(b))
+                };
+                let plan = ExprPlan::Function {
+                    name: Arc::from("SUM"),
+                    args: vec![ExprPlan::AggregateNameRef {
+                        name: Arc::from("R1"),
+                        range: ql_types::Range {
+                            sheet: 0,
+                            start_row: r0,
+                            start_col: c0,
+                            end_row: r1,
+                            end_col: c1,
+                        },
+                    }],
+                };
+                s.on_set_formula(0, row, col, &plan, &wb, &registry);
+            }
+
+            let all_nodes: Vec<NodeId> = placed
+                .iter()
+                .filter_map(|&(sh, r, c)| s.cell_node_for(sh, r, c))
+                .collect();
+            // Random subset: keep each node ~50%.
+            let mut dirty_vec: Vec<NodeId> = all_nodes
+                .iter()
+                .copied()
+                .filter(|_| rng.range(0, 1) == 1)
+                .collect();
+            dirty_vec.sort();
+
+            let got = s.build_range_supplemental_for_test(&dirty_vec);
+            let want = brute_force_supplemental(&s, &dirty_vec);
+            assert_eq!(
+                got, want,
+                "seed {seed}: partial-dirty supplemental mismatch"
+            );
+        }
+    }
+
+    /// **TB1 multi-sheet sheet-resolution equivalence.** Pins that a
+    /// formula on sheet 0 with a range on sheet 1 only collects dirty G's
+    /// on sheet 1 — never sheet-0 cells at the same coordinates. The
+    /// index buckets by sheet; this guards against a regression that
+    /// forgot the sheet filter.
+    #[test]
+    fn build_range_supplemental_cross_sheet_isolation() {
+        let registry = ql_functions::default_registry();
+        let wb = ql_storage::Workbook::new();
+        let mut s = CalcgraphSession::new();
+
+        // F at Sheet0!A1 = SUM(Sheet1!A1:A10).
+        let plan = ExprPlan::Function {
+            name: Arc::from("SUM"),
+            args: vec![ExprPlan::AggregateNameRef {
+                name: Arc::from("R1"),
+                range: ql_types::Range {
+                    sheet: 1,
+                    start_row: 0,
+                    start_col: 0,
+                    end_row: 9,
+                    end_col: 0,
+                },
+            }],
+        };
+        s.on_set_formula(0, 0, 0, &plan, &wb, &registry);
+
+        // G_same on Sheet0!A3 (same coords as a cell in the range, WRONG
+        // sheet) and G_target on Sheet1!A3 (in range).
+        s.on_set_formula(0, 2, 0, &ExprPlan::Number(1.0), &wb, &registry);
+        s.on_set_formula(1, 2, 0, &ExprPlan::Number(2.0), &wb, &registry);
+
+        let f = s.cell_node_for(0, 0, 0).unwrap();
+        let g_same = s.cell_node_for(0, 2, 0).unwrap();
+        let g_target = s.cell_node_for(1, 2, 0).unwrap();
+
+        let mut dirty_vec = vec![f, g_same, g_target];
+        dirty_vec.sort();
+
+        let got = s.build_range_supplemental_for_test(&dirty_vec);
+        let want = brute_force_supplemental(&s, &dirty_vec);
+        assert_eq!(got, want);
+
+        // Concretely: F's supplemental must contain g_target and NOT g_same.
+        let f_supp = got.get(&f).cloned().unwrap_or_default();
+        assert!(f_supp.contains(&g_target), "sheet-1 cell in range");
+        assert!(
+            !f_supp.contains(&g_same),
+            "sheet-0 cell at same coords must NOT match a sheet-1 range"
+        );
+    }
+
+    /// **TB1 perf sanity (`#[ignore]`d benchmark).** Demonstrates the
+    /// indexed `build_range_supplemental` handles a large dirty set with
+    /// many range formulas without the O(n²) stall. Run with
+    /// `cargo test -p ql-exec --lib -- --ignored
+    /// build_range_supplemental_large_sheet_perf --nocapture`.
+    ///
+    /// 10k formulas each `SUM(A1:A10000)` (a single tall column), all
+    /// dirty. The old loop is 10k × 10k = 100M containment checks; the
+    /// index turns each F's query into a binary-search + band scan.
+    #[test]
+    #[ignore = "perf benchmark — run explicitly with --ignored"]
+    fn build_range_supplemental_large_sheet_perf() {
+        let registry = ql_functions::default_registry();
+        let wb = ql_storage::Workbook::new();
+        let mut s = CalcgraphSession::new();
+
+        let n: u32 = 10_000;
+        // Place formulas down column B (col 1), each referencing the whole
+        // of column A (A1:A_n) → every formula's range contains every
+        // other formula? No: formulas are in column B, the range is column
+        // A, so the supplemental is empty — but the SCAN cost is what we
+        // measure. To force real matches, put HALF the formulas in column
+        // A's referenced band.
+        for r in 0..n {
+            // Formula at (B, r) = SUM(A1:A_n). Its range covers column A.
+            let plan = ExprPlan::Function {
+                name: Arc::from("SUM"),
+                args: vec![ExprPlan::AggregateNameRef {
+                    name: Arc::from("R1"),
+                    range: ql_types::Range {
+                        sheet: 0,
+                        start_row: 0,
+                        start_col: 0,
+                        end_row: n - 1,
+                        end_col: 0,
+                    },
+                }],
+            };
+            s.on_set_formula(0, r, 1, &plan, &wb, &registry);
+            // Formula at (A, r) = literal — a dirty G inside every B-formula's
+            // range. This makes the supplemental dense (each B-formula → all
+            // A-formulas), the worst case.
+            s.on_set_formula(0, r, 0, &ExprPlan::Number(r as f64), &wb, &registry);
+        }
+
+        let mut dirty_vec: Vec<NodeId> = Vec::new();
+        for r in 0..n {
+            dirty_vec.push(s.cell_node_for(0, r, 1).unwrap());
+            dirty_vec.push(s.cell_node_for(0, r, 0).unwrap());
+        }
+        dirty_vec.sort();
+
+        let t0 = std::time::Instant::now();
+        let supp = s.build_range_supplemental_for_test(&dirty_vec);
+        let elapsed = t0.elapsed();
+
+        // Each of the n column-B formulas references column A, which holds
+        // n dirty literals → supplemental has n keys, each with n edges.
+        assert_eq!(
+            supp.len() as u32,
+            n,
+            "every B-formula has a supplemental list"
+        );
+        let total_edges: usize = supp.values().map(Vec::len).sum();
+        assert_eq!(total_edges as u64, (n as u64) * (n as u64));
+        eprintln!(
+            "TB1 perf: {n} range-formulas + {n} literals, {} dirty nodes, \
+             {total_edges} supplemental edges in {elapsed:?}",
+            dirty_vec.len()
+        );
+    }
+
+    /// **TB1 perf sanity — SPARSE case (the actual OPT-02 stall).** This is
+    /// the scenario the old `O(n²)` loop choked on: thousands of dirty
+    /// formulas, each carrying a small disjoint range, so the supplemental
+    /// is nearly EMPTY — yet the old loop still paid n×n containment
+    /// checks producing nothing. The index makes each query a binary
+    /// search that finds zero/one match. Output is tiny, so the measured
+    /// time is almost entirely scan cost → cleanly isolates the win.
+    ///
+    /// Run: `cargo test -p ql-exec --lib --release -- --ignored
+    /// build_range_supplemental_sparse_perf --nocapture`.
+    #[test]
+    #[ignore = "perf benchmark — run explicitly with --ignored"]
+    fn build_range_supplemental_sparse_perf() {
+        let registry = ql_functions::default_registry();
+        let wb = ql_storage::Workbook::new();
+        let mut s = CalcgraphSession::new();
+
+        // 10k formulas at (r, 1), each referencing a UNIQUE single cell
+        // (r, 0) — so formula r's range contains only the literal at
+        // (r, 0), not any other dirty formula. Supplemental stays empty
+        // (the literals aren't formulas-with-ranges, and each range holds
+        // exactly one cell which is itself a dirty literal G → so each
+        // F → that one G). Net: n edges total, n keys, but the old loop
+        // scanned n² cells to find them.
+        let n: u32 = 10_000;
+        for r in 0..n {
+            let plan = ExprPlan::Function {
+                name: Arc::from("SUM"),
+                args: vec![ExprPlan::AggregateNameRef {
+                    name: Arc::from("R1"),
+                    range: ql_types::Range {
+                        sheet: 0,
+                        start_row: r,
+                        start_col: 0,
+                        end_row: r,
+                        end_col: 0,
+                    },
+                }],
+            };
+            s.on_set_formula(0, r, 1, &plan, &wb, &registry);
+            s.on_set_formula(0, r, 0, &ExprPlan::Number(r as f64), &wb, &registry);
+        }
+
+        let mut dirty_vec: Vec<NodeId> = Vec::new();
+        for r in 0..n {
+            dirty_vec.push(s.cell_node_for(0, r, 1).unwrap());
+            dirty_vec.push(s.cell_node_for(0, r, 0).unwrap());
+        }
+        dirty_vec.sort();
+
+        let t0 = std::time::Instant::now();
+        let supp = s.build_range_supplemental_for_test(&dirty_vec);
+        let elapsed = t0.elapsed();
+
+        // Each F's single-cell range contains exactly the one A-literal.
+        let total_edges: usize = supp.values().map(Vec::len).sum();
+        assert_eq!(
+            total_edges as u32, n,
+            "one edge per single-cell-range formula"
+        );
+        eprintln!(
+            "TB1 sparse perf: {n} single-cell-range formulas, {} dirty nodes, \
+             {total_edges} edges in {elapsed:?} (old loop = {}M containment checks)",
+            dirty_vec.len(),
+            (dirty_vec.len() as u64 * dirty_vec.len() as u64) / 1_000_000
+        );
+    }
+
+    /// **TB1 perf — head-to-head index vs the (preserved) brute-force O(n²)
+    /// reference.** `brute_force_supplemental` IS the pre-TB1 algorithm, so
+    /// this gives a direct apples-to-apples speedup ratio AND re-asserts
+    /// byte-identical output at a non-trivial size.
+    ///
+    /// Run: `cargo test -p ql-exec --lib --release -- --ignored
+    /// build_range_supplemental_index_vs_bruteforce --nocapture`.
+    #[test]
+    #[ignore = "perf benchmark — run explicitly with --ignored"]
+    fn build_range_supplemental_index_vs_bruteforce() {
+        let registry = ql_functions::default_registry();
+        let wb = ql_storage::Workbook::new();
+        let mut s = CalcgraphSession::new();
+
+        // n single-cell-range formulas (sparse supplemental) — the regime
+        // where the old loop wastes the most time relative to output.
+        let n: u32 = 3_000;
+        for r in 0..n {
+            let plan = ExprPlan::Function {
+                name: Arc::from("SUM"),
+                args: vec![ExprPlan::AggregateNameRef {
+                    name: Arc::from("R1"),
+                    range: ql_types::Range {
+                        sheet: 0,
+                        start_row: r,
+                        start_col: 0,
+                        end_row: r,
+                        end_col: 0,
+                    },
+                }],
+            };
+            s.on_set_formula(0, r, 1, &plan, &wb, &registry);
+            s.on_set_formula(0, r, 0, &ExprPlan::Number(r as f64), &wb, &registry);
+        }
+        let mut dirty_vec: Vec<NodeId> = Vec::new();
+        for r in 0..n {
+            dirty_vec.push(s.cell_node_for(0, r, 1).unwrap());
+            dirty_vec.push(s.cell_node_for(0, r, 0).unwrap());
+        }
+        dirty_vec.sort();
+
+        let t0 = std::time::Instant::now();
+        let want = brute_force_supplemental(&s, &dirty_vec);
+        let brute = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        let got = s.build_range_supplemental_for_test(&dirty_vec);
+        let indexed = t1.elapsed();
+
+        assert_eq!(got, want, "index must byte-match brute force at scale");
+        eprintln!(
+            "TB1 index-vs-brute: n={n} ({} dirty) — brute O(n²)={brute:?}, indexed={indexed:?}, \
+             speedup={:.1}x",
+            dirty_vec.len(),
+            brute.as_secs_f64() / indexed.as_secs_f64().max(1e-9)
+        );
     }
 }
