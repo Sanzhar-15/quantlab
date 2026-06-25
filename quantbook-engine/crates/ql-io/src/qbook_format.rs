@@ -1,15 +1,27 @@
-//! `.qbook/` workbook directory format.
+//! `.qbook` workbook format — a single-file ZIP container.
 //!
-//! Per spec Part V §3 + T2-D01 (Round 7 architectural lock). The on-disk shape:
+//! Per spec Part V §3 + T2-D01 (Round 7 architectural lock), migrated from a
+//! loose directory to a single-file container in **Wave H1 (2026-06-19)**. A
+//! `.qbook` is now ONE file: a ZIP archive (NOT a loose `my-workbook.qbook/`
+//! directory) whose entries are:
 //!
 //! ```text
-//! my-workbook.qbook/
-//! ├── workbook.toml          # envelope: schema_version, name, sheet list, names
-//! └── sheets/
-//!     ├── 0.jsonl            # sheet 0 cells, one JSON line per non-blank cell
-//!     ├── 1.jsonl
-//!     └── ...
+//! my-workbook.qbook                  # a single ZIP file
+//! ├── quantbook-container            # sentinel (body "quantbook-container-v1"),
+//! │                                  #   verified BEFORE extraction so a bare .zip
+//! │                                  #   renamed to .qbook is refused loudly
+//! ├── workbook.toml                  # envelope: schema_version, name, sheet list, names
+//! ├── sheets/0.jsonl                 # sheet 0 cells, one JSON line per non-blank cell
+//! ├── sheets/1.jsonl
+//! ├── ...
+//! └── .atomic-save-marker-v1         # written LAST; lets recovery tell engine-owned
+//!                                    #   .bak-* siblings apart from user-created ones
 //! ```
+//!
+//! Extraction is bounded by per-member (256 MiB) and total (1 GiB) zip-bomb
+//! caps. The container-format version (`quantbook-container-v1`) is SEPARATE
+//! from the `workbook.toml` `schema_version` (currently 12) which versions the
+//! payload.
 //!
 //! - **TOML envelope** (`workbook.toml`): human-readable metadata, sheet manifest,
 //!   defined-names table (since v2). Users can edit it by hand if needed.
