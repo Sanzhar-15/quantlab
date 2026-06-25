@@ -4114,6 +4114,33 @@ col_extent = 1
         ));
     }
 
+    #[test]
+    fn roundtrip_blank_named_constant_through_qbook_toml() {
+        // COR-06: a `NamedTarget::Constant(Value::Blank)` must survive a full
+        // `.qbook` save/load. The envelope is serialized via TOML, which has no
+        // `null` — so the blank constant MUST use the explicit `ConstantBlank`
+        // wire variant (a fieldless `kind = "constantblank"`), NOT an
+        // `Option`/`null` value (which `toml::to_string_pretty` rejects with
+        // "unsupported None value"). This is the regression guard for the audit
+        // BLOCKER that the JSON-only wire-level tests missed.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("blank-const.qbook");
+
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.set_name("Empty", NamedTarget::Constant(Value::Blank))
+            .unwrap();
+
+        save_workbook(&wb, "blank-const", &path).expect("save with a blank named-constant");
+        let loaded = load_workbook(&path).expect("load with a blank named-constant");
+
+        assert_eq!(loaded.names().len(), 1);
+        assert!(matches!(
+            loaded.names().lookup("EMPTY"),
+            Some(NamedTarget::Constant(Value::Blank))
+        ));
+    }
+
     // ===== W5-71 Phase 4.5.A.2 — date_system v2→v3 migration =====
 
     #[test]

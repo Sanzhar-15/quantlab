@@ -85,6 +85,43 @@ impl Default for OpLog {
     }
 }
 
+/// **TB6 (2026-06-25):** maximum `Op::BatchCommit` nesting depth that
+/// [`OpLog::append`] will accept.
+///
+/// Chosen to GUARANTEE round-trip, not merely to avoid the serialize-side stack
+/// overflow the finding flagged. A `BatchCommit` serializes to ~2 JSON nesting
+/// levels (`{ … "ops": [ … ] }` = one map + one seq), so the read path's
+/// `serde_json::from_str` (in [`OpLog::iter`]) — which defaults to a 128-level
+/// deserialize recursion limit — rejects a batch nested beyond ~63 levels.
+/// Appending at the replay-side ceiling (`MAX_REPLAY_BATCH_DEPTH = 64`) would
+/// therefore write an op that serializes fine but can NEVER be read back,
+/// silently poisoning every future `iter()` from that index. 32 is generous
+/// headroom (legitimate producer batches nest exactly ONE level) yet keeps the
+/// serialized form at ~2·32 + leaf ≈ 70 levels — comfortably round-trippable —
+/// and is strictly below `MAX_REPLAY_BATCH_DEPTH`, so appendable ⟹ replayable.
+const MAX_APPEND_BATCH_DEPTH: u32 = 32;
+
+/// **TB6 (2026-06-25):** returns `true` if `op` contains an `Op::BatchCommit`
+/// nested deeper than `max` levels, using the SAME depth accounting as
+/// [`crate::replay`]'s `apply_op` (the top op is depth 0; only `BatchCommit`
+/// increments the depth of its inner ops).
+///
+/// The walk is **bounded**: it stops descending the instant `depth` exceeds
+/// `max`, so the check itself recurses at most `max + 1` frames and cannot
+/// overflow the stack on a hostile input — unlike the unguarded
+/// `serde_json::to_string` it protects in [`OpLog::append`].
+fn batch_nesting_exceeds(op: &Op, depth: u32, max: u32) -> bool {
+    if depth > max {
+        return true;
+    }
+    match op {
+        Op::BatchCommit { ops } => ops
+            .iter()
+            .any(|inner| batch_nesting_exceeds(inner, depth + 1, max)),
+        _ => false,
+    }
+}
+
 impl OpLog {
     /// Construct an empty log.
     pub fn new() -> Self {
@@ -93,10 +130,39 @@ impl OpLog {
         }
     }
 
+    /// **TB6:** validate that `op`'s `Op::BatchCommit` nesting is within
+    /// [`MAX_APPEND_BATCH_DEPTH`] — shallow enough to serialize without a stack
+    /// overflow AND to round-trip back through [`OpLog::iter`]'s 128-level
+    /// `serde_json` deserialize limit. [`append`](Self::append) calls this, but
+    /// it is also `pub` so a higher-level append wrapper (e.g.
+    /// `ql_collab::CollabSession::append_op`, which recurses through its own
+    /// op-tree cache walkers before reaching `append`) can reject a pathological
+    /// batch BEFORE those walkers run — otherwise `append` would not be the first
+    /// recursion on that path. The check is itself depth-bounded (see
+    /// [`batch_nesting_exceeds`]) so it cannot overflow on a hostile input.
+    pub fn check_append_batch_depth(op: &Op) -> Result<(), OpLogError> {
+        if batch_nesting_exceeds(op, 0, MAX_APPEND_BATCH_DEPTH) {
+            return Err(OpLogError::BatchDepthExceeded {
+                max: MAX_APPEND_BATCH_DEPTH,
+            });
+        }
+        Ok(())
+    }
+
     /// Append one `Op` to the log. Serializes via `serde_json`, stores as
     /// a `LoroValue::String` in the `"ops"` LoroList, and commits the
     /// underlying Loro doc.
+    ///
+    /// **TB6:** a pathologically-nested `Op::BatchCommit` is rejected with
+    /// [`OpLogError::BatchDepthExceeded`] (via
+    /// [`check_append_batch_depth`](Self::check_append_batch_depth)) *before*
+    /// serialization. `serde_json` has no serialize-side recursion limit (so a
+    /// deep batch would overflow the stack), and — more subtly — its 128-level
+    /// *deserialize* limit means a batch serialized beyond ~63 levels could never
+    /// be read back by [`OpLog::iter`]. [`MAX_APPEND_BATCH_DEPTH`] keeps every
+    /// appended op both overflow-safe and round-trippable.
     pub fn append(&mut self, op: Op) -> Result<(), OpLogError> {
+        Self::check_append_batch_depth(&op)?;
         let json = serde_json::to_string(&op).map_err(OpLogError::Serialize)?;
         let list: LoroList = self.doc.get_list(OPS_CONTAINER);
         list.push(LoroValue::from(json.as_str()))?;
@@ -536,6 +602,76 @@ mod tests {
         assert_eq!(log.len(), 1);
         let read: Vec<Op> = log.iter().collect::<Result<_, _>>().unwrap();
         assert_eq!(read, vec![op]);
+    }
+
+    // ===== TB6 (2026-06-25): append-side BatchCommit depth guard =====
+
+    /// `BatchCommit{[ … PutValue … ]}` nested `depth` levels, built ITERATIVELY
+    /// so constructing it never recurses (mirrors `replay::tests::nest_batch`).
+    fn nest_batch(depth: usize) -> Op {
+        let mut op = put_value(0, 0, 0, 1.0);
+        for _ in 0..depth {
+            op = Op::BatchCommit { ops: vec![op] };
+        }
+        op
+    }
+
+    #[test]
+    fn append_at_max_depth_round_trips_through_iter() {
+        // The whole point of the lower append ceiling (vs the replay ceiling):
+        // an op appended at MAX_APPEND_BATCH_DEPTH must be READABLE BACK via
+        // `iter()` (serde_json's 128-level deserialize limit). This is the
+        // readability invariant — appending at the replay ceiling (64) would
+        // serialize fine but fail to deserialize here.
+        let mut log = OpLog::new();
+        let op = nest_batch(MAX_APPEND_BATCH_DEPTH as usize);
+        log.append(op.clone())
+            .expect("batch nested exactly at the append cap should append");
+        let read: Vec<Op> = log
+            .iter()
+            .collect::<Result<_, _>>()
+            .expect("op at the append cap must read back via iter()");
+        assert_eq!(read, vec![op]);
+    }
+
+    #[test]
+    fn append_rejects_batch_one_over_max_depth() {
+        let mut log = OpLog::new();
+        let err = log
+            .append(nest_batch(MAX_APPEND_BATCH_DEPTH as usize + 1))
+            .expect_err("batch nested one past the cap must be rejected");
+        match err {
+            OpLogError::BatchDepthExceeded { max } => {
+                assert_eq!(max, MAX_APPEND_BATCH_DEPTH);
+            }
+            other => panic!("expected BatchDepthExceeded, got {other:?}"),
+        }
+        // The rejected op must NOT have been stored.
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn append_rejects_pathologically_deep_batch_without_overflow() {
+        // The bounded pre-check must bail after ~MAX frames and return a typed
+        // error instead of overflowing the stack inside `serde_json::to_string`.
+        // Run on a generous-stack worker so the deep tree's own recursive Drop
+        // (on `append`'s early-return) isn't the variable under test — returning
+        // at all (no abort) is the regression. Mirrors the replay-side test.
+        let (rejected, empty) = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let mut log = OpLog::new();
+                let outcome = log.append(nest_batch(2_000));
+                (
+                    matches!(outcome, Err(OpLogError::BatchDepthExceeded { .. })),
+                    log.is_empty(),
+                )
+            })
+            .expect("spawn worker thread")
+            .join()
+            .expect("worker thread panicked / overflowed its stack");
+        assert!(rejected, "deep batch must be rejected with BatchDepthExceeded");
+        assert!(empty, "rejected op must not be stored");
     }
 
     #[test]

@@ -59,4 +59,19 @@ pub enum OpLogError {
     /// `oplog_vv` and round-trips correctly.
     #[error("op log invalid version vector: {0}")]
     InvalidVersionVector(String),
+
+    /// **TB6 / Tier C2 follow-up (2026-06-25):** `append` was handed an
+    /// `Op::BatchCommit` tree nested deeper than the append ceiling
+    /// (`MAX_APPEND_BATCH_DEPTH` in `log.rs`, set strictly below both the
+    /// replay-side `MAX_REPLAY_BATCH_DEPTH` and `serde_json`'s ~63-level
+    /// round-trip limit). `serde_json::to_string` has no serialize-side
+    /// recursion limit, so serializing such an op recurses one stack frame per
+    /// nesting level and would overflow the thread's stack *before* the op is
+    /// ever stored — and even short of overflow, a batch beyond ~63 levels could
+    /// never be read back by `OpLog::iter` (the 128-level *deserialize* limit).
+    /// Rejecting here (with a bounded pre-check that cannot itself overflow)
+    /// keeps every appended op both overflow-safe and round-trippable. `max` is
+    /// the ceiling enforced.
+    #[error("op log append rejected: batch nesting too deep (max {max})")]
+    BatchDepthExceeded { max: u32 },
 }

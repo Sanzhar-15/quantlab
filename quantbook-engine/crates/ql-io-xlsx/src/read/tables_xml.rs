@@ -64,6 +64,24 @@ pub(crate) struct ParsedTableColumn {
     pub totals_row_function: Option<TotalsFunction>,
 }
 
+/// Parse a numeric OOXML table attribute that is **present** on the element.
+///
+/// **W5 / COR-05 (2026-06-25):** a present-but-unparseable numeric attribute
+/// (`headerRowCount="abc"`, two `<tableColumn>`s with `id="x"`) is corruption,
+/// not a missing value — surfacing `XlsxError::MalformedOoxml` honours the
+/// no-fallbacks rule. The pre-COR-05 `val.parse().unwrap_or(<default>)` aliased
+/// malformed input onto the OOXML *absent-attribute* default, silently
+/// producing e.g. `headerRowCount=1` from garbage or colliding stable column
+/// ids on `id=0`. The absent-attribute default stays correct because the caller
+/// initialises each field before the attribute loop and only calls this helper
+/// inside the branch that fires when the attribute is actually present.
+fn parse_u32_attr(val: &str, attr: &str, part_path: &str) -> Result<u32, XlsxError> {
+    val.parse::<u32>().map_err(|e| XlsxError::MalformedOoxml {
+        part: part_path.to_string(),
+        message: format!("<table> attribute {attr} is not a valid u32: {val:?} ({e})"),
+    })
+}
+
 /// Parse one `xl/tables/table*.xml` file.
 pub(crate) fn parse_table_xml(content: &str, part_path: &str) -> Result<ParsedTable, XlsxError> {
     let mut reader = Reader::from_str(content);
@@ -91,11 +109,23 @@ pub(crate) fn parse_table_xml(content: &str, part_path: &str) -> Result<ParsedTa
                 let tag = std::str::from_utf8(local_name.as_ref()).unwrap_or("");
                 match tag {
                     "table" => {
-                        for attr in e.attributes().with_checks(false).flatten() {
+                        for attr in e.attributes().with_checks(false) {
+                            // COR-05: a malformed attribute (bad KV syntax, or a
+                            // bad entity escape in the value) is corruption —
+                            // surface it loudly instead of silently dropping it
+                            // (the old `.flatten()` / `.unwrap_or_default()`).
+                            let attr = attr.map_err(|err| XlsxError::MalformedOoxml {
+                                part: part_path.to_string(),
+                                message: format!("malformed <table> attribute: {err}"),
+                            })?;
                             let key = attr.key.as_ref();
-                            let val = attr.unescape_value().unwrap_or_default();
+                            let val =
+                                attr.unescape_value().map_err(|err| XlsxError::MalformedOoxml {
+                                    part: part_path.to_string(),
+                                    message: format!("malformed <table> attribute value: {err}"),
+                                })?;
                             if key == b"id" {
-                                id = val.parse::<u32>().unwrap_or(0);
+                                id = parse_u32_attr(val.as_ref(), "id", part_path)?;
                             } else if key == b"name" {
                                 name = val.to_string();
                             } else if key == b"displayName" {
@@ -103,9 +133,11 @@ pub(crate) fn parse_table_xml(content: &str, part_path: &str) -> Result<ParsedTa
                             } else if key == b"ref" {
                                 ref_str = val.to_string();
                             } else if key == b"headerRowCount" {
-                                header_row_count = val.parse::<u32>().unwrap_or(1);
+                                header_row_count =
+                                    parse_u32_attr(val.as_ref(), "headerRowCount", part_path)?;
                             } else if key == b"totalsRowCount" {
-                                totals_row_count = val.parse::<u32>().unwrap_or(0);
+                                totals_row_count =
+                                    parse_u32_attr(val.as_ref(), "totalsRowCount", part_path)?;
                             }
                         }
                     }
@@ -113,15 +145,34 @@ pub(crate) fn parse_table_xml(content: &str, part_path: &str) -> Result<ParsedTa
                         let mut col_id: u32 = 0;
                         let mut col_name = String::new();
                         let mut totals_fn: Option<TotalsFunction> = None;
-                        for attr in e.attributes().with_checks(false).flatten() {
+                        for attr in e.attributes().with_checks(false) {
+                            let attr = attr.map_err(|err| XlsxError::MalformedOoxml {
+                                part: part_path.to_string(),
+                                message: format!("malformed <tableColumn> attribute: {err}"),
+                            })?;
                             let key = attr.key.as_ref();
-                            let val = attr.unescape_value().unwrap_or_default();
+                            let val =
+                                attr.unescape_value().map_err(|err| XlsxError::MalformedOoxml {
+                                    part: part_path.to_string(),
+                                    message: format!(
+                                        "malformed <tableColumn> attribute value: {err}"
+                                    ),
+                                })?;
                             if key == b"id" {
-                                col_id = val.parse::<u32>().unwrap_or(0);
+                                col_id = parse_u32_attr(val.as_ref(), "tableColumn id", part_path)?;
                             } else if key == b"name" {
                                 col_name = val.to_string();
                             } else if key == b"totalsRowFunction" {
-                                totals_fn = parse_totals_function(&val);
+                                // COR-05: a PRESENT but unrecognized totals-row
+                                // function is corruption, not "no totals function"
+                                // — the OOXML ST_TotalsRowFunction enumeration is
+                                // closed, so surface an unknown value loudly.
+                                totals_fn = Some(parse_totals_function(&val).ok_or_else(|| {
+                                    XlsxError::MalformedOoxml {
+                                        part: part_path.to_string(),
+                                        message: format!("unknown totalsRowFunction value: {val:?}"),
+                                    }
+                                })?);
                             }
                         }
                         if !col_name.is_empty() {
@@ -358,6 +409,114 @@ mod tests {
         let xml = r#"<table ref="A1:B2"><tableColumns/></table>"#;
         match parse_table_xml(xml, "xl/tables/table1.xml") {
             Err(XlsxError::MalformedOoxml { .. }) => {}
+            other => panic!("expected MalformedOoxml, got {other:?}"),
+        }
+    }
+
+    // ===== COR-05 (2026-06-25): present-but-malformed numeric attrs are loud =====
+    // The OOXML *absent-attribute* default is still honoured (the field is
+    // initialised before the attribute loop); only a *present* garbage value
+    // must now fail loudly instead of silently collapsing to that default.
+
+    #[test]
+    fn parse_table_xml_malformed_headerrowcount_is_loud() {
+        let xml = r#"<table name="T" displayName="T" ref="A1:B2" headerRowCount="abc">
+  <tableColumns><tableColumn id="1" name="A"/></tableColumns>
+</table>"#;
+        match parse_table_xml(xml, "xl/tables/table1.xml") {
+            Err(XlsxError::MalformedOoxml { message, .. }) => {
+                assert!(
+                    message.contains("headerRowCount"),
+                    "error should name the offending attribute, got {message:?}"
+                );
+            }
+            other => panic!("expected MalformedOoxml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_table_xml_malformed_totalsrowcount_is_loud() {
+        let xml = r#"<table name="T" displayName="T" ref="A1:B2" totalsRowCount="3.5">
+  <tableColumns><tableColumn id="1" name="A"/></tableColumns>
+</table>"#;
+        match parse_table_xml(xml, "xl/tables/table1.xml") {
+            Err(XlsxError::MalformedOoxml { message, .. }) => {
+                assert!(message.contains("totalsRowCount"));
+            }
+            other => panic!("expected MalformedOoxml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_table_xml_malformed_table_id_is_loud() {
+        let xml = r#"<table id="not-a-number" name="T" displayName="T" ref="A1:B2">
+  <tableColumns><tableColumn id="1" name="A"/></tableColumns>
+</table>"#;
+        match parse_table_xml(xml, "xl/tables/table1.xml") {
+            Err(XlsxError::MalformedOoxml { message, .. }) => {
+                // `attribute id` (not just `id`) so this can't pass on the
+                // `tableColumn id` error message instead.
+                assert!(
+                    message.contains("attribute id"),
+                    "error should name the table id attribute, got {message:?}"
+                );
+            }
+            other => panic!("expected MalformedOoxml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_table_xml_malformed_column_id_is_loud() {
+        // A garbage column id previously collapsed to 0 — and two such columns
+        // would have collided on the stable-id key. Now it fails loudly.
+        let xml = r#"<table name="T" displayName="T" ref="A1:B2">
+  <tableColumns><tableColumn id="oops" name="A"/></tableColumns>
+</table>"#;
+        match parse_table_xml(xml, "xl/tables/table1.xml") {
+            Err(XlsxError::MalformedOoxml { message, .. }) => {
+                assert!(message.contains("tableColumn id"));
+            }
+            other => panic!("expected MalformedOoxml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_table_xml_absent_numeric_attrs_keep_ooxml_defaults() {
+        // Regression guard for COR-05: absent headerRowCount/totalsRowCount/id
+        // must still produce the OOXML defaults (1 / 0 / 0), not an error.
+        let xml = r#"<table name="T" displayName="T" ref="A1:B2">
+  <tableColumns><tableColumn id="1" name="A"/></tableColumns>
+</table>"#;
+        let parsed = parse_table_xml(xml, "xl/tables/table1.xml").expect("absent attrs are valid");
+        assert_eq!(parsed.header_row_count, 1);
+        assert_eq!(parsed.totals_row_count, 0);
+        assert_eq!(parsed.id, 0);
+    }
+
+    #[test]
+    fn parse_table_xml_absent_column_id_defaults_to_zero() {
+        // COR-05 symmetry: an absent `<tableColumn>` id keeps the default (0),
+        // not an error (only a PRESENT-but-malformed id fails).
+        let xml = r#"<table name="T" displayName="T" ref="A1:B2">
+  <tableColumns><tableColumn name="A"/></tableColumns>
+</table>"#;
+        let parsed =
+            parse_table_xml(xml, "xl/tables/table1.xml").expect("absent column id is valid");
+        assert_eq!(parsed.columns.len(), 1);
+        assert_eq!(parsed.columns[0].id, 0);
+    }
+
+    #[test]
+    fn parse_table_xml_unknown_totals_function_is_loud() {
+        // COR-05: a present-but-unrecognized totalsRowFunction is corruption, not
+        // silently "no totals function".
+        let xml = r#"<table name="T" displayName="T" ref="A1:B2">
+  <tableColumns><tableColumn id="1" name="A" totalsRowFunction="bogus"/></tableColumns>
+</table>"#;
+        match parse_table_xml(xml, "xl/tables/table1.xml") {
+            Err(XlsxError::MalformedOoxml { message, .. }) => {
+                assert!(message.contains("totalsRowFunction"));
+            }
             other => panic!("expected MalformedOoxml, got {other:?}"),
         }
     }

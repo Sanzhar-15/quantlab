@@ -1,28 +1,25 @@
-//! Tier C2 (Phase 4 v2 backlog, 2026-06-24) — end-to-end behaviour of the
-//! PUBLIC replay path on a deeply-nested `Op::BatchCommit`.
+//! Tier C2 (2026-06-24) + TB6 (2026-06-25) — end-to-end behaviour of the
+//! PUBLIC op-log paths on a deeply-nested `Op::BatchCommit`.
 //!
-//! Threat model (verified empirically while building this):
-//! - The untrusted input surface is loading a `.qbook`: bytes → Loro import →
-//!   `OpLog::iter` DESERIALIZE. `serde_json`'s deserializer enforces a
-//!   128-level recursion limit, and each `BatchCommit` is ~2 JSON levels, so a
-//!   batch nested beyond ~64 levels is rejected with a typed `Deserialize`
-//!   error BEFORE `apply_op` ever recurses. This test pins that the public
-//!   path therefore fails LOUDLY (typed error, no crash/hang/silent-apply).
-//! - The engine-internal `apply_op` recursion is additionally bounded by an
-//!   explicit guard ([`ReplayError::BatchDepthExceeded`], cap 64) for any
-//!   non-serde / future caller — that guard is unit-tested directly against
-//!   `apply_op` in `src/replay.rs` (it cannot be reached through this
-//!   serde-bounded public path, by design).
-//!
-//! NOTE: `OpLog::append` SERIALIZES (no recursion limit — that is a serde
-//! deserialize-only feature), so appending a pathologically deep batch
-//! recurses on the real stack. This test runs append+replay on a generous-
-//! stack worker so the harness can't overflow during the append; serde's
-//! deserialize recursion counter trips independently of stack size, so the
-//! `replay_into` rejection it verifies holds on any stack.
+//! Threat model (each defense pins a typed error, no crash/hang/silent-apply):
+//! - **Write path (TB6):** producing ops locally goes through `OpLog::append`
+//!   (and `CollabSession::append_op`). TB6 added a write-side guard
+//!   ([`OpLogError::BatchDepthExceeded`], cap `MAX_APPEND_BATCH_DEPTH = 32`) that
+//!   rejects a pathologically-nested batch BEFORE serialization, so it never
+//!   enters the log. `append_rejects_deeply_nested_batch_loudly` pins this.
+//!   (Before TB6 this test appended the deep batch and relied on `replay_into`
+//!   to reject it; the rejection now happens earlier, at `append`.)
+//! - **Read path (untrusted `.qbook`):** bytes → Loro import → `OpLog::iter`
+//!   DESERIALIZE is bounded independently by `serde_json`'s 128-level recursion
+//!   limit (each `BatchCommit` ≈ 2 JSON levels → rejects beyond ~63 levels with
+//!   a typed `Deserialize`), and the replay-side `apply_op` guard
+//!   ([`ReplayError::BatchDepthExceeded`], cap 64) is the defense-in-depth
+//!   backstop for any non-serde caller. Both are unit-tested directly in
+//!   `src/replay.rs`; a deep batch can no longer reach `replay_into` via the
+//!   local append path (append rejects it first), so that property lives there.
 
 use ql_functions::default_registry;
-use ql_oplog::{replay_into, CellWireValue, Op, OpLog};
+use ql_oplog::{replay_into, CellWireValue, Op, OpLog, OpLogError};
 use ql_storage::Workbook;
 use ql_types::{Address, Value};
 
@@ -42,33 +39,30 @@ fn nest(depth: usize) -> Op {
 }
 
 #[test]
-fn replay_into_rejects_deeply_nested_batch_loudly() {
-    // Run on a big stack: `append` serializes (and the deep `Op` later drops)
-    // on the real stack, so this keeps the harness from overflowing there. The
-    // property under test — `replay_into` REJECTS the deep batch — comes from
-    // serde's deserialize recursion counter, which is stack-size-independent.
+fn append_rejects_deeply_nested_batch_loudly() {
+    // TB6: the public WRITE path (`OpLog::append`) rejects a pathologically-deep
+    // batch with a typed error BEFORE it can be serialized/stored/replayed — so
+    // such an op never enters the log. Run on a big stack only so the deep `Op`'s
+    // recursive Drop (on append's early return) can't overflow the harness; the
+    // rejection itself comes from the bounded depth pre-check, independent of
+    // stack size.
     let outcome = std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
-            let registry = default_registry();
-            let mut wb = Workbook::new();
-            wb.add_sheet("S");
             let mut log = OpLog::new();
-            log.append(nest(200))
-                .expect("serialize/append has no recursion limit");
-
-            let result = replay_into(&log, &mut wb, &registry);
-            // Loud error, never a silent apply.
+            let err = log
+                .append(nest(200))
+                .expect_err("a 200-deep nested batch must be rejected by append");
             assert!(
-                result.is_err(),
-                "a 200-deep nested batch must be rejected loudly, got {result:?}"
+                matches!(err, OpLogError::BatchDepthExceeded { .. }),
+                "expected a loud BatchDepthExceeded, got {err:?}"
             );
-            // Nothing committed (the failure precedes any inner-op apply).
-            assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Blank);
+            // Rejected before any store — the log is untouched.
+            assert!(log.is_empty(), "rejected op must not be stored");
         })
         .expect("spawn worker thread")
         .join();
-    outcome.expect("worker overflowed/panicked — public replay path is NOT bounded");
+    outcome.expect("worker overflowed/panicked — append guard is NOT bounded");
 }
 
 #[test]

@@ -135,7 +135,7 @@ impl CellWireValue {
 /// Wire-format mirror of `ql_storage::NamedTarget`. Each variant is tagged
 /// explicitly so the on-disk shape is self-describing and survives schema bumps.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum NamedTargetWire {
     /// `NamedTarget::Cell` — single-cell anchor at `$Sheet!$Row,$Col`.
     Cell { sheet: u16, row: u32, col: u32 },
@@ -147,8 +147,23 @@ pub enum NamedTargetWire {
         end_row: u32,
         end_col: u32,
     },
-    /// `NamedTarget::Constant(Value)` — reuses the cell wire-value vocabulary.
+    /// `NamedTarget::Constant(Value)` for every NON-blank value — reuses the
+    /// cell wire-value vocabulary. `value` is a REQUIRED field: a missing or
+    /// typo'd `value` MUST fail deserialization loudly, never silently default
+    /// to blank (no-fallbacks; `deny_unknown_fields` on the enum closes the
+    /// typo'd-key hole). Wire-unchanged from before COR-06 for non-blank
+    /// constants.
     Constant { value: CellWireValue },
+    /// **COR-06 (2026-06-25):** `NamedTarget::Constant(Value::Blank)`. A blank
+    /// named-constant gets its OWN explicit, fieldless variant rather than the
+    /// pre-COR-06 `Constant { value: Pending }` alias (which overloaded the cell
+    /// "needs recompute" sentinel — a no-fallbacks violation + wire ambiguity).
+    /// A fieldless variant is faithful in BOTH JSON and TOML (the `.qbook`
+    /// envelope format), unlike an `Option`/`null` value which TOML cannot
+    /// represent and which would make a missing `value` silently decode to
+    /// blank. Backward-compatible: a legacy `Constant { value: "Pending" }` blob
+    /// still decodes to `Constant(Blank)` via `Pending.to_value()`.
+    ConstantBlank,
     /// `NamedTarget::Formula(Arc<str>)` — raw formula source (without `=`).
     Formula { source: String },
 }
@@ -169,18 +184,17 @@ impl NamedTargetWire {
                 end_row: r.end_row,
                 end_col: r.end_col,
             },
-            NamedTarget::Constant(v) => NamedTargetWire::Constant {
-                // NamedTarget::Constant(Value::Blank) is unusual but valid; map
-                // to Number(0.0) sentinel? No — preserve the variant by emitting
-                // Error("BLANK_SENTINEL")? Also wrong. The cleanest answer: refuse
-                // to serialize Blank constants — the user shouldn't have one,
-                // and we'd round-trip-lose it anyway.
-                //
-                // In practice, `from_value(&Value::Blank)` returns None. So to
-                // serialize a Blank constant we'd need a dedicated wire variant.
-                // For Phase 2A.8 we deny it at save time via the conversion
-                // helper below; this match arm assumes from_value returns Some.
-                value: CellWireValue::from_value(v).unwrap_or(CellWireValue::Pending),
+            // COR-06: `from_value` returns `None` ONLY for `Value::Blank`, which
+            // gets its own explicit `ConstantBlank` variant; every other value
+            // is a `Some` carried in `Constant { value }`. This replaces the
+            // pre-COR-06 `.unwrap_or(CellWireValue::Pending)`, which silently
+            // aliased a blank named-constant onto the cell "needs recompute"
+            // sentinel (no-fallbacks violation + wire ambiguity). `NamedTargetDto`
+            // (the session layer) already encodes Blank faithfully; this brings
+            // the op-log wire to parity.
+            NamedTarget::Constant(v) => match CellWireValue::from_value(v) {
+                Some(value) => NamedTargetWire::Constant { value },
+                None => NamedTargetWire::ConstantBlank,
             },
             NamedTarget::Formula(src) => NamedTargetWire::Formula {
                 source: src.as_ref().to_owned(),
@@ -236,14 +250,18 @@ impl NamedTargetWire {
                 )))
             }
             NamedTargetWire::Constant { value } => {
-                let v = value
-                    .to_value()
-                    .map_err(|e| WireDecodeError::ConstantDecode {
-                        name: name_for_error.to_owned(),
-                        detail: e.to_string(),
-                    })?;
+                let v = value.to_value().map_err(|e| WireDecodeError::ConstantDecode {
+                    name: name_for_error.to_owned(),
+                    detail: e.to_string(),
+                })?;
                 Ok(NamedTarget::Constant(v))
             }
+            // COR-06: the explicit blank-constant variant. A legacy wire blob
+            // encoded Blank as `Constant { value: "Pending" }`, and
+            // `Pending.to_value()` also decodes to `Value::Blank`, so both the
+            // old and the new shapes resolve to the same `Constant(Blank)` — a
+            // new reader transparently accepts old data, no migration required.
+            NamedTargetWire::ConstantBlank => Ok(NamedTarget::Constant(Value::Blank)),
             NamedTargetWire::Formula { source } => {
                 Ok(NamedTarget::Formula(Arc::from(source.as_str())))
             }
@@ -1005,5 +1023,125 @@ mod style_wire_tests {
         let wire = StyleWire::from_storage(ql_storage::Style::default());
         assert_eq!(wire.to_storage(), ql_storage::Style::default());
         assert!(wire.fill.is_none());
+    }
+}
+
+#[cfg(test)]
+mod named_target_constant_tests {
+    //! COR-06 (2026-06-25): a `NamedTarget::Constant(Value::Blank)` must
+    //! round-trip faithfully AND unambiguously through the op-log wire. The
+    //! pre-COR-06 `from_value(v).unwrap_or(Pending)` fallback silently aliased a
+    //! blank named-constant onto the cell "needs recompute" sentinel.
+    use super::*;
+    use crate::op::Op;
+    use ql_types::{ErrorValue, Value};
+
+    /// from_target → serde_json → from_str → to_target.
+    fn round_trip(target: &NamedTarget) -> NamedTarget {
+        let wire = NamedTargetWire::from_target(target);
+        let json = serde_json::to_string(&wire).expect("serialize");
+        let back: NamedTargetWire = serde_json::from_str(&json).expect("deserialize");
+        back.to_target("test_name").expect("decode")
+    }
+
+    #[test]
+    fn blank_constant_round_trips_faithfully() {
+        let result = round_trip(&NamedTarget::Constant(Value::Blank));
+        assert!(
+            matches!(result, NamedTarget::Constant(Value::Blank)),
+            "Blank constant must survive the wire round-trip, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn blank_constant_serializes_as_constantblank() {
+        let wire = NamedTargetWire::from_target(&NamedTarget::Constant(Value::Blank));
+        let json = serde_json::to_string(&wire).unwrap();
+        // Explicit, fieldless variant — faithful in both JSON and TOML (.qbook),
+        // and NOT aliased onto the cell `Pending` sentinel.
+        assert_eq!(json, r#"{"kind":"constantblank"}"#);
+        assert!(!json.contains("Pending"));
+    }
+
+    #[test]
+    fn missing_value_field_is_rejected_not_silently_blank() {
+        // No-fallbacks (Codex BLOCKER): a corrupt/truncated `constant` op with no
+        // `value` field must FAIL loudly, never silently decode to a blank
+        // constant (the failure mode an `Option`/`#[serde(default)]` would have
+        // introduced).
+        let corrupt = r#"{"kind":"constant"}"#;
+        assert!(
+            serde_json::from_str::<NamedTargetWire>(corrupt).is_err(),
+            "missing `value` on a constant must be a deserialize error"
+        );
+    }
+
+    #[test]
+    fn unknown_field_is_rejected() {
+        // `deny_unknown_fields` (Codex BLOCKER): a typo'd key must not be silently
+        // ignored — otherwise `{"kind":"constant","valeu":...}` (with `value`
+        // absent) could smuggle in an unintended value.
+        let typo = r#"{"kind":"constant","value":{"Number":1.0},"valeu":2}"#;
+        assert!(
+            serde_json::from_str::<NamedTargetWire>(typo).is_err(),
+            "unknown field on a constant must be rejected"
+        );
+    }
+
+    #[test]
+    fn non_blank_constants_round_trip() {
+        for v in [
+            Value::Number(0.21),
+            Value::Boolean(true),
+            Value::text("hi"),
+            Value::Error(ErrorValue::Ref),
+        ] {
+            let result = round_trip(&NamedTarget::Constant(v.clone()));
+            assert_eq!(result, NamedTarget::Constant(v));
+        }
+    }
+
+    #[test]
+    fn number_constant_wire_shape_unchanged_by_cor06() {
+        // Backward-compat: a non-blank constant keeps a REQUIRED `value` field and
+        // serializes byte-identically to the pre-COR-06 shape (only the blank case
+        // moved to the explicit `ConstantBlank` variant).
+        let wire = NamedTargetWire::from_target(&NamedTarget::Constant(Value::Number(0.5)));
+        let json = serde_json::to_string(&wire).unwrap();
+        assert_eq!(json, r#"{"kind":"constant","value":{"Number":0.5}}"#);
+    }
+
+    #[test]
+    fn legacy_pending_blob_decodes_to_blank() {
+        // A pre-COR-06 wire blob encoded a Blank constant as `Some(Pending)`.
+        // `Pending.to_value()` also yields `Value::Blank`, so a new reader must
+        // transparently accept the old shape — no migration needed.
+        let legacy = r#"{"kind":"constant","value":"Pending"}"#;
+        let wire: NamedTargetWire = serde_json::from_str(legacy).expect("legacy decode");
+        let target = wire.to_target("legacy_name").expect("to_target");
+        assert!(
+            matches!(target, NamedTarget::Constant(Value::Blank)),
+            "legacy Pending-encoded blank constant must decode to Blank, got {target:?}"
+        );
+    }
+
+    #[test]
+    fn blank_constant_round_trips_through_op_setname() {
+        // The wire type is embedded in `Op::SetName`; verify the fix survives a
+        // full Op serialize/deserialize, not just the bare NamedTargetWire.
+        let op = Op::SetName {
+            scope: None,
+            name: "BlankName".to_owned(),
+            target: NamedTargetWire::from_target(&NamedTarget::Constant(Value::Blank)),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: Op = serde_json::from_str(&json).unwrap();
+        match back {
+            Op::SetName { target, .. } => {
+                let decoded = target.to_target("BlankName").unwrap();
+                assert!(matches!(decoded, NamedTarget::Constant(Value::Blank)));
+            }
+            other => panic!("expected SetName, got {other:?}"),
+        }
     }
 }
