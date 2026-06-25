@@ -4950,6 +4950,12 @@ fn map_oplog_err(e: ql_oplog::OpLogError, display: String) -> EngineError {
         O::Loro(_) | O::LoroEncode(_) => {
             EngineError::new(ErrorClass::Internal, "oplog_loro", display)
         }
+        // TB6: a too-deeply-nested batch is a caller-input rejection (sibling of
+        // `O::Serialize`), surfaced loudly before any mutation — not an engine
+        // bug. Give it a stable BadArgument code rather than "unmapped_*".
+        O::BatchDepthExceeded { .. } => {
+            EngineError::new(ErrorClass::BadArgument, "oplog_batch_depth", display)
+        }
         // `#[non_exhaustive]`: unmapped → loud Internal.
         _ => EngineError::new(ErrorClass::Internal, "unmapped_oplog_error", display),
     }

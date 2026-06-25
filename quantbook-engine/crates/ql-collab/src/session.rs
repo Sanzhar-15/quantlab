@@ -1330,6 +1330,14 @@ impl CollabSession {
     /// committed locally (partial-state contract — see
     /// [`AutoFlushPolicy::OnAppend`]).
     pub fn append_op(&mut self, op: Op) -> Result<(), CollabSessionError> {
+        // **TB6 (2026-06-25):** reject a pathologically-nested `Op::BatchCommit`
+        // UP FRONT. The cache walkers below (`collect_cache_effects` /
+        // `affected_cells_for_partial_invalidate`) recurse the op tree BEFORE
+        // `self.log.append(op)` runs, so `OpLog::append`'s own depth guard is not
+        // the first recursion on this public append path — validate here so a
+        // deep batch can't overflow the walkers' stack. Bounded check, same
+        // ceiling as `append` (which re-checks; the duplicate cost is negligible).
+        ql_oplog::OpLog::check_append_batch_depth(&op)?;
         // V3.3.0.3 + V3.4.0.2 incremental cache update: local appends are
         // always at the causal frontier (Loro's normal-flow append puts
         // the op at the local peer's vector-clock head), so iteration
