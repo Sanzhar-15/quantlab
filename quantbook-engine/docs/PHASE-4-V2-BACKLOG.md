@@ -5,6 +5,18 @@ by the Phase 4 megaudits. Each item has explicit disposition:
 ship-before-0.2.0 (API stability), Phase 5 prep (architectural),
 or post-MVP polish.
 
+> ⚠️ **w128 doc-truth correction (2026-06-25, verified against code at HEAD
+> `0a985d69426`).** Several Tier-B/C/D/E items shown as open here had ALREADY
+> SHIPPED — corrected in place below: **B1** (literal-range bind, W2-literal-range
+> 2026-06-09), **B3** (parser depth `MAX_PARSE_DEPTH=100`, Wave EDS-1), **C2**
+> (replay batch depth `MAX_REPLAY_BATCH_DEPTH=64`, Wave EDS-1), **D3** (oplog
+> `QLOL` magic-bytes + version header, Phase 5.2 D-1 step 7), **E1**
+> (`TRANSPOSE(Table[Col])`, megaudit 2026-05-29). Still genuinely OPEN: **B2**
+> (omitted-arg syntax — BLOCKED on a Missing-arg-sentinel design) and the new
+> **B4** below (`OpLog::append` serialize-depth, w128 discovery). This file is
+> reliable for the engine's correctness/tech-debt queue but had drifted on
+> closed items; for "what's next" cross-check `v1-rebaseline-sequence.md`.
+
 **Owners:** any future contributor / agent picking up Phase 5 work
 should start here for the queue of well-defined HIGH-severity items
 that are documented + repro-able but were deferred due to scope.
@@ -66,45 +78,70 @@ ql-oplog, ql-io, ql-calcgraph, ql-profile.
 These directly affect the IDE proof point per master plan
 Phase 4 ("IDE must open imported xlsx, show formulas, edit formulas").
 
-### B1. Literal-range bind in `AggregateArg` context
+### ~~B1.~~ Literal-range bind in `AggregateArg` context — ✅ CLOSED (W2-literal-range, 2026-06-09)
 
+- **Status (corrected w128 2026-06-25):** CLOSED. Verified in code:
+  `crates/ql-exec/src/plan.rs` `BindContext::AggregateArg` now accepts
+  a literal `Expr::RangeRef` and lowers it to `ExprPlan::RangeRef { range }`
+  (the same lowering as `ReferenceArg`); the cell-boundary Unified arm in
+  `scalar.rs` mirrors it. The "§ 5.4 deferred follow-up" note in `plan.rs`
+  is resolved. The "5.4 % of corpus fails to bind" / `=SUM(A1:A10)` blocker
+  is dead — do NOT re-implement this.
 - **Source:** Phase 4.12 Opus-A HIGH-1.
-- **Impact:** **5.4 % of IronCalc corpus formulas (3 499 / 64 212)
-  fail to bind**, including the most common `=SUM(A1:A10)` pattern.
-  This is the load-bearing IDE-acceptance blocker.
-- **Scope:** extend `crates/ql-exec/src/plan.rs::bind_with_context_v2`
-  to accept `Expr::RangeRef` in `BindContext::AggregateArg` (not
-  just `ReferenceArg`). Touches `plan.rs:768-777`.
-- **Design doc tracked:** "§ 5.4 deferred follow-up" in `plan.rs`.
-- **Effort:** 2-5 days including binder-side cache invalidation +
-  comprehensive tests.
-- **Bonus close:** closing B1 also closes Phase 4.12 Opus-A HIGH-4
-  (column-letter-shaped names — `K`, `XFC` work in formula context
-  because the binder no longer treats single-letter ranges as
-  hostile).
+- **Pre-fix impact (historical):** ~5.4 % of IronCalc corpus formulas
+  (3 499 / 64 212) failed to bind, incl. the common `=SUM(A1:A10)` pattern.
+- **Bonus close:** also closed Phase 4.12 Opus-A HIGH-4
+  (column-letter-shaped names — `K`, `XFC` in formula context).
 - **Probe regression:** `crates/ql-io-xlsx/tests/opus_a_phase_4_12_ide_proof.rs`.
 
-### B2. Omitted-arg syntax (`XLOOKUP(a,b,c,,2)`)
+### B2. Omitted-arg syntax (`XLOOKUP(a,b,c,,2)`) — OPEN (BLOCKED on a Missing-arg-sentinel design)
 
+- **Status (verified w128 2026-06-25):** STILL OPEN (Codex w127 discovery
+  COR-01 re-verified at source: the parser always calls `parse_expr` between
+  commas, and the AST is `Function { args: Vec<Expr> }` with no Omitted node,
+  so `XLOOKUP(a,b,c,,2)` cannot parse). **Blocked first on a design decision:**
+  an `Arg::Omitted` AST node (or a Missing sentinel) needs an end-to-end design
+  across AST → printer → binder arity handling before implementation; that
+  design is not yet written.
 - **Source:** Phase 4.12 Opus-A HIGH-3.
-- **Impact:** 371 corpus formulas fail. XLOOKUP, UNIQUE, IFS,
-  TEXTBEFORE, etc.
-- **Scope:** parser `crates/ql-formula-syntax/src/parser.rs:512-516`
-  — extend `parse_prefix` to accept omitted args (emit an `Arg::Omitted`
-  AST node or similar).
-- **Effort:** 1-2 days including binder handling of the new AST node.
+- **Impact:** 371 corpus formulas fail. XLOOKUP, UNIQUE, IFS, TEXTBEFORE, etc.
+- **Scope:** parser `crates/ql-formula-syntax/src/parser.rs` — extend
+  `parse_prefix` to accept omitted args (emit `Arg::Omitted` or similar) +
+  binder/printer handling of the new node.
+- **Effort:** 1-2 days of code once the sentinel design is locked.
 - **Probe regression:** `crates/ql-io-xlsx/tests/opus_a_phase_4_12_ide_proof.rs::p12_prefix_comma_failure_shapes`.
 
-### B3. Parser recursion-depth limit
+### ~~B3.~~ Parser recursion-depth limit — ✅ CLOSED (Wave EDS-1, engine `0a985d69426`, 2026-06-24)
 
+- **Status (corrected w128 2026-06-25):** CLOSED. Verified in code:
+  `crates/ql-formula-syntax/src/parser.rs` defines `const MAX_PARSE_DEPTH: u32 = 100`
+  and a depth-tracking `parse_expr` wrapper that returns
+  `ParseError::DepthExceeded { max }` once depth would exceed the ceiling
+  (the sheet-qualifier chain `S1!S2!...` self-recursion bypass found in the
+  EDS-1 5-lane audit was also folded). The `p412_b_pinpoint` overflow probes
+  were un-ignored. **Ceiling is 100, not the 256 the original scope guessed.**
 - **Source:** Phase 4.12 Opus-B H-1.
-- **Impact:** ~200 nested function calls overflow default 2 MiB
-  thread stack. DoS surface from hostile formula input.
-- **Scope:** parser `parse_expr` / `parse_call` — track recursion
-  depth, return typed `ParseError::DepthExceeded` past a sane
-  ceiling (e.g., 256).
+- **Probe regression:** `crates/ql-formula-syntax/tests/p412_b_pinpoint.rs` +
+  `parse_depth_guard_*` unit tests in `parser.rs`.
+
+### B4. `OpLog::append` serialize-depth guard (NEW — w128 2026-06-25 discovery) — OPEN
+
+- **Source:** w128 doc-truth pass (sibling of the EDS-1 B3/C2 discovery).
+- **Impact:** the EDS-1 guards cover the PARSE path (B3, `MAX_PARSE_DEPTH`)
+  and the REPLAY path (C2, `MAX_REPLAY_BATCH_DEPTH`), but the SERIALIZE/SAVE
+  path is unguarded: `crates/ql-oplog/src/log.rs::append` (`:99-100`) does
+  `serde_json::to_string(&op)` with no recursion-depth limit, so a deeply
+  nested `Op::BatchCommit` recurses during serialization at append/save time.
+  A hostile or pathological batch built in-memory (under the replay cap) could
+  still overflow when it is logged. Defense-in-depth gap, not currently a known
+  live exploit path (batches are constructed engine-side), but it is the third
+  unguarded recursion surface and was never filed.
+- **Scope:** `crates/ql-oplog/src/log.rs::append` — bound `Op::BatchCommit`
+  nesting depth before/within serialization (reuse the `MAX_REPLAY_BATCH_DEPTH`
+  ceiling for symmetry), return a typed `OpLogError` past the limit.
 - **Effort:** ~half a day including tests.
-- **Probe regression:** `crates/ql-formula-syntax/tests/p412_b_pinpoint.rs`.
+- **Disposition:** Tier C-adjacent (op-log correctness); confirm exploitability
+  before scheduling.
 
 ---
 
@@ -182,14 +219,15 @@ Phase 4 ("IDE must open imported xlsx, show formulas, edit formulas").
   document a contract for Phase 5 replay wrappers.
 - **Effort:** half-day with tests.
 
-### C2. `Op::BatchCommit` replay depth guard
+### ~~C2.~~ `Op::BatchCommit` replay depth guard — ✅ CLOSED (Wave EDS-1, engine `0a985d69426`, 2026-06-24)
 
+- **Status (corrected w128 2026-06-25):** CLOSED. Verified in code:
+  `crates/ql-oplog/src/replay.rs` defines `const MAX_REPLAY_BATCH_DEPTH: u32 = 64`
+  and a depth-threaded `apply_op` that returns
+  `ReplayError::BatchDepthExceeded { index, depth, max }` past the ceiling —
+  defense-in-depth behind serde's deserialize cap. Rollback atomicity under the
+  guard is tested (`batch_depth_guard_error_leaves_workbook_untouched`).
 - **Source:** Phase 4.12 Opus-B H-3.
-- **Impact:** serde_json's default 128-level limit is the only thing
-  preventing a stack overflow on a hostile `.qbook`.
-- **Scope:** `crates/ql-oplog/src/replay.rs` — explicit depth guard
-  on `apply_op` for BatchCommit recursion.
-- **Effort:** ~half a day.
 
 ---
 
@@ -280,14 +318,18 @@ clean Phase 5 work if not done first.
   Loro snapshot; cell records serialize the same variant set.
 - **Gates:** 4141 tests passing, fmt + clippy + doc clean.
 
-### D3. `oplog.bin` magic bytes + version header
+### ~~D3.~~ `oplog.bin` magic bytes + version header — ✅ CLOSED (Phase 5.2 D-1 step 7, 2026-05-20)
 
+- **Status (corrected w128 2026-06-25):** CLOSED. Verified in code:
+  `crates/ql-io/src/oplog_persistence.rs` defines `OPLOG_MAGIC = *b"QLOL"`
+  (4-byte ASCII prefix) + a big-endian `OPLOG_SCHEMA_VERSION: u32 = 1` header
+  at offset 4..8, plus `OPLOG_MIN_SUPPORTED_SCHEMA_VERSION`; the load path
+  format-branches on the prefix (pre-D3 raw Loro snapshots routed through the
+  legacy decode — explicit, not a silent fallback) and rejects out-of-band
+  versions via `PersistenceError::OplogUnsupportedVersion`. This is the item
+  the original entry said would be "included in Phase 5.1/5.2 design work" —
+  it shipped. _(Resolves the w127 discovery X-08 "verify D3 shipped" question.)_
 - **Source:** Phase 4.12 Opus-C HIGH-4.
-- **Scope:** Phase 5 redesigns the persistence layer for CRDT. As
-  part of that, add magic bytes + version field to `oplog.bin` so
-  newer / older Quantbook versions can detect schema drift.
-- **Effort:** included in Phase 5.1 / 5.2 design work; not a
-  standalone task.
 
 ### D4. Post-process substring-XML-mutation layer → typed `Patcher`
 
@@ -305,12 +347,16 @@ clean Phase 5 work if not done first.
 
 ## Tier E — CROSS-FEATURE (edge-case correctness)
 
-### E1. `TRANSPOSE(Table[Col])` returns `#CALC!` (structured-ref × spill)
+### ~~E1.~~ `TRANSPOSE(Table[Col])` returns `#CALC!` (structured-ref × spill) — ✅ CLOSED (megaudit fix 2026-05-29)
 
+- **Status (corrected w128 2026-06-25):** CLOSED. Verified in code:
+  `crates/ql-exec/src/scalar.rs` (the cell-boundary Unified arm, ~line 1956)
+  now reads an `ExprPlan::StructuredRef` as a `FunctionArg::Range` — it narrows
+  `[@Col]` via `narrow_structured_ref` then `read_range_with_shape`, mirroring
+  the scalar Unified arm. This feeds `=TRANSPOSE(Table[Col])` (typed directly
+  AND as an array-capable UDF arg). The 2026-05-29 megaudit (Codex-A HIGH /
+  Opus-marshal MED) caught the missing arm. `TRANSPOSE(Table[Col])` now spills.
 - **Source:** Phase 4.12 Opus-A HIGH-5.
-- **Scope:** binder structured-ref → array-context wiring.
-  `TRANSPOSE(NamedRange)` works; `TRANSPOSE(Table[Col])` doesn't.
-- **Effort:** 1-2 days investigation + fix.
 
 ### E2. `read_display` ignores workbook locale after `set_locale`
 

@@ -6,12 +6,38 @@
 **Scope:** engine-internal sequencing for all 24 workspace crates  
 **Authored:** Claude Opus 4.7 + Codex (co-thinking session, 2026-05-12)
 
+> ⚠️ **STALENESS NOTE (corrected w128 2026-06-25; supersedes the 2026-06-10 banner below).** The
+> Status/Date/HEAD at the top of this file are from 2026-05-13 and the engine has advanced FAR past them.
+> **This phase roadmap has NOT been re-baselined; treat it as the engine's long-range plan, NOT its
+> current-state ledger.** Do NOT plan from the strategic-posture sections (§0, §1, §3) — several of their
+> architectural assertions are now FALSE (see the corrected-w128 notes inline). For current state read, in
+> order: `current_work.md` + the `quantbook_engine_*` memory files, then the Phase 6.1B increment log lower
+> in PART II (which IS current — it records xlsx/csv import+export, persistence, the owning `WorkbookSession`,
+> charts, and MCP as SHIPPED).
+>
+> Confirmed-shipped-since-the-old-banner state (verified against code at HEAD `0a985d69426`, w128):
+> - **Current engine HEAD: `feat/quantbook-engine` @ `0a985d69426`** (Wave EDS-1; was `9ce475b1fce`).
+>   _(corrected w128 2026-06-25: was `9ce475b1fce`/2026-06-10 → now `0a985d69426`.)_
+> - **`.qbook` is now a SINGLE-FILE ZIP container** (Wave H1, 2026-06-19, engine `d4b9a47da8f`), NOT a
+>   directory. Current persistence schema is **v12** (Wave Q1 chart objects, 2026-06-23), not v9.
+>   _(corrected w128: was "schema v8→v9", ".qbook directory" → now single-file ZIP at schema v12.)_
+> - **xlsx + csv import AND export SHIPPED** (`ql-io-xlsx` is a 665-line read+write crate, NOT a stub;
+>   `ql-io-csv` leaf crate; both wired into `WorkbookSession::import`/`export` — see Phase 6.1B inc.2c-9..12).
+>   _(corrected w128: the "no xlsx export" / "xlsx stub crate" framing is dead.)_
+> - **In-host MCP server SHIPPED** (IDE-side B1; 25 tools as of Wave L3). MCP is a v1 surface, not post-v1.
+> - **`ql-bindings-node` (8.7k LOC) + `quantbook-py` (real pyo3 ext, 1.5k LOC) are LIVE bindings**, NOT stubs.
+> - Phase 4 SHIPPED; RT-V1 + Wave-3 distributions shipped; FE pivot drove ENG-FUSION
+>   (`publish_dataset`/`bind_range` — live but the var↔cell binding is still UNDESIGNED, see WIR-01 in the
+>   w127 discovery), owning-`WorkbookSession`, FE-4 cell-style foundation, LET/LAMBDA, charts (Wave Q).
+>
+> _(Original 2026-06-10 freeze banner preserved below for history.)_
+>
 > ⚠️ **STALENESS NOTE (2026-06-10).** The Status/Date/HEAD above are from 2026-05-13 and the engine has
 > advanced FAR past them. Phase 4 SHIPPED; RT-V1 + Wave-3 distributions shipped; the FE pivot drove
 > ENG-FUSION (`publish_dataset`/`bind_range`), owning-`Session` insert/delete, and the **FE-4 W4 cell-style
 > ENGINE FOUNDATION** (`ql-storage` `Style`/`StyleTable`/`CellStyleOverlay`, `ql-oplog`
 > RegisterStyle/SetCellStyle, `SessionOp::SetStyle`, `register_style`/`set_style` napi on the owning Session,
-> `.qbook` **schema v8→v9** `style_overlay`). **Current engine HEAD: `feat/quantbook-engine` @ `9ce475b1fce`.**
+> `.qbook` **schema v8→v9** `style_overlay`). **[stale: HEAD was `9ce475b1fce` here.]**
 > For the up-to-date state, read (in order): the memory handoffs `current_work.md` (w57) + the
 > `quantbook_engine_*` memory files, and the IDE-side `.plans/active/fe4-plan.md` (W4 detail + the FE-5
 > backlog). This phase roadmap below has NOT been re-baselined to that reality — treat it as the engine's
@@ -36,7 +62,7 @@ This `MASTER-PLAN.md` is the **engine-side execution plan**: how the Rust engine
 | Engine phase (this doc) | Canonical product phase(s) | Notes |
 |---|---|---|
 | Engine 0 (Viability spike) ✅ | Product Phase 0 | Same. 13/13 gates locked. |
-| Engine 1 (Parser + persistence + runtime facade) ✅ | Product Phase 0 spillover + parts of Phase 2 (`.qbook/`) + parts of Phase 3 (parser, recompute) | Engine front-ran the canonical plan by absorbing parts of Phase 2 storage and Phase 3 parser. |
+| Engine 1 (Parser + persistence + runtime facade) ✅ | Product Phase 0 spillover + parts of Phase 2 (`.qbook` format) + parts of Phase 3 (parser, recompute) | Engine front-ran the canonical plan by absorbing parts of Phase 2 storage and Phase 3 parser. _(corrected w128: `.qbook` is now a single-file ZIP, not a directory.)_ |
 | Engine 2A.1–2A.13 ✅ | Parts of Product Phase 3 (named ranges, errors, fingerprints, parser breadth) | Engine correctness + audit closure. |
 | Engine 2A.3 (op log) ✅ | Product Phase 0 deliverable (`ql-oplog` scaffolding) advanced into producer wiring + persistence | Loro op log scaffolding called for in canonical Phase 0; we shipped it now because the API surface was ready. |
 | **Engine 2B (Correct Runtime Contract)** | Product Phase 3 (continued) + Product Phase 6 (first IDE integration vertical slice) | First time the IDE is exercised against the engine. |
@@ -48,8 +74,8 @@ This `MASTER-PLAN.md` is the **engine-side execution plan**: how the Rust engine
 
 **Where the engine plan does NOT cover canonical phases:**
 
-- **Canonical Phase 1 (Renderer spike, WebGL grid)** — entirely TypeScript work in `Charts/packages/sheets-{protocol,client,renderer}`. Engine provides the API surface; renderer is its own project. No engine-side phase covers it.
-- **Canonical Phase 2 (storage + protocol + skeleton packages)** — engine has shipped the `.qbook/` storage piece; the `sheets-protocol`/`sheets-client` TypeScript packages are renderer-team work.
+- **Canonical Phase 1 (Renderer spike, grid)** — entirely TypeScript work, now an **owned Canvas2D renderer** in the IDE worktree (FE-0b pivot). Engine provides the API surface; renderer is its own project. No engine-side phase covers it. _(corrected w128 2026-06-25: was "WebGL grid" in `Charts/packages/sheets-{protocol,client,renderer}` → the FE-0b pivot built an owned Canvas2D renderer; those `sheets-*` packages were never created. The renderer choice does not affect any engine API, but the old wording would mislead a window into building a WebGL/Pixi grid.)_
+- **Canonical Phase 2 (storage + protocol + skeleton packages)** — engine has shipped the `.qbook` storage piece (now a **single-file ZIP container**, Wave H1); the TypeScript renderer/protocol packages are IDE-team work. _(corrected w128 2026-06-25: was "`.qbook/` directory" + named `sheets-protocol`/`sheets-client` packages that were never created.)_
 - **Canonical Phase 6 (Quantlab IDE integration)** — the engine's job is to provide a usable API; the actual `extensions/quantlab/` work is a parallel TypeScript track. Engine 2B includes the first vertical slice as a forcing function.
 
 ### Why two documents
@@ -72,12 +98,12 @@ Phase 0 proved that the engine shape is viable. The locked architectural gates a
 - T1-D05: Loro reserved for operation history and collaboration substrate work, not evaluator state.
 - T1-D06: stock VS Code APIs for v1.
 - T1-D07: Tier-0 wedge is Monaco-powered formula bar plus Python UDFs.
-- T2-D01: `.qbook/` directory plus `workbook.toml` envelope.
+- T2-D01: `.qbook` workbook format plus `workbook.toml` envelope. _(corrected w128 2026-06-25: the format SHIPPED as a directory through ~2026-06-18, then Wave H1 (2026-06-19, engine `d4b9a47da8f`) wrapped it into a **single-file ZIP container** — the directory layout is now the in-memory staging shape that gets zipped. The TOML envelope + per-sheet JSONL partitioning are unchanged; only the on-disk packaging changed.)_
 - T3-D03: roughly 260 v1 spreadsheet functions.
 
-Phase 1 built the first live formula path: lexer, parser, AST printer, scalar binding, scalar evaluation, `.qbook/` persistence, `WorkbookRuntime::set_formula`, and `recompute_all`. It made the engine useful, but it did not make it architecturally complete. `recompute_all` still walks formula cells in map order, so dependency chains can compute incorrectly.
+Phase 1 built the first live formula path: lexer, parser, AST printer, scalar binding, scalar evaluation, `.qbook` persistence (a directory at the time; now a single-file ZIP per Wave H1), `WorkbookRuntime::set_formula`, and `recompute_all`. It made the engine useful, but it did not make it architecturally complete. `recompute_all` still walks formula cells in map order, so dependency chains can compute incorrectly.
 
-Phase 2A closed a large correctness and persistence pass: defined names, transactions, load-and-recompute, dotted function identifiers, schema v2, crash-safe save, Excel-canon coercion fixes, deterministic formula fingerprints, error ergonomics, and audit closure. Phase 2A.3 then shipped Loro-backed op-log scaffolding: `ql-oplog`, typed `Op` variants, Loro snapshot persistence, replay, runtime and transaction producer wiring, and `.qbook/oplog.bin` persistence. The stale `docs/phase2/entry-plan.md` and `docs/phase2/exit-packet.md` still say 2A.3 is deferred; this plan supersedes that statement and requires a doc-rot repair pass in Phase 2B.
+Phase 2A closed a large correctness and persistence pass: defined names, transactions, load-and-recompute, dotted function identifiers, schema v2, crash-safe save, Excel-canon coercion fixes, deterministic formula fingerprints, error ergonomics, and audit closure. Phase 2A.3 then shipped Loro-backed op-log scaffolding: `ql-oplog`, typed `Op` variants, Loro snapshot persistence, replay, runtime and transaction producer wiring, and `oplog.bin` persistence (a sidecar entry inside the `.qbook` container; carries a `QLOL` magic-byte + version header since Phase 5.2 D-1, which closed the D3 backlog item). The stale `docs/phase2/entry-plan.md` and `docs/phase2/exit-packet.md` still say 2A.3 is deferred; this plan supersedes that statement. _(corrected w128: was `.qbook/oplog.bin` implying a directory layout → it is a ZIP entry; the D3 magic-bytes/version header SHIPPED in Phase 5.2.)_
 
 The engine now has **1219 workspace tests at W5-60 close** (was 816 at the time this paragraph was first written; ~+403 across the W5-49..W5-60 arc) and 7 green gates. That is a floor, not a trophy. The major unresolved problem is that the "fast engine" (`ql-calcgraph`, SIMD region lowering, storage profiles) and the "runtime engine" (`WorkbookRuntime`, per-formula scalar path) still do not form one engine.
 
@@ -92,6 +118,8 @@ Reference reading already changed the plan:
 ### 2. What Full Product v1 Means
 
 The 24-crate workspace is v1 scope. Stubs are not optional decorations; they are reserved product surfaces.
+
+> ℹ️ **Status note (added w128 2026-06-25):** this table defines each crate's v1 ROLE; it is NOT a current-state ledger and the surrounding "stubs" prose predates most of the work. Verified at HEAD `0a985d69426`: `ql-io-xlsx` (read+write, ~665 LOC, NOT a stub), `ql-io-csv` (new leaf crate, not in this table), `ql-bindings-node` (~8.7k LOC, live IDE binding), `quantbook-py` (real pyo3 facade, ~1.5k LOC), `ql-udf` (Python UDF worker — live), `ql-sql` (SQL materialization + lineage — live), `ql-collab` (full CRDT — Phase 5 V1 shipped) have all shipped real behavior. Still genuinely thin/sentinel: `ql-ai` (AI() returns an AINotAvailable sentinel), `ql-connectors`, `ql-service` (engine-as-service transport), `ql-io-ods`, `ql-bindings-c`/`ql-bindings-wasm`, `ql-terminal`. Consult `known-gaps.md` GAP-PS-* (also corrected w128) for the per-crate state.
 
 | Crate | v1 role |
 |---|---|
@@ -136,6 +164,8 @@ The full v1 means all of these crates either ship real behavior or have a docume
 ## PART II - Phase Plans
 
 ## Phase 2B - Correct Runtime Contract
+
+> ✅ **PHASE 2B SHIPPED IN FULL** _(status added w128 2026-06-25; only 2B.4 below carried a ✅ inline, but all seven sub-items shipped — cross-referenced to `known-gaps.md` closures):_ 2B.1 doc-rot repair (done); 2B.2 `RecomputeResult` (GAP-R-02, commit `393ce2f765f`); 2B.3 `PlanCache` (GAP-R-03, `bd3147a1045`); 2B.4 named-range aggregate context (`f64ff00dcb1`); 2B.5 op-log producer coverage (GAP-O-01/02/03, `commit-after-f64ff00dcb1`); 2B.6 first IDE vertical slice + `ide_simulation.rs` harness (GAP-I-02, `commit-after-66bbbddc3d9`); 2B.7 audit + `validate_formula` (GAP-I-04). The per-sub-item text below is preserved for history; treat the whole phase as closed.
 
 **Purpose:** Make current runtime semantics honest enough for the IDE while preparing the bind and aggregate context that Phase 3 will graph-drive.
 
