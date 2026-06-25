@@ -3152,10 +3152,19 @@ impl CalcgraphSession {
     /// Complexity (TB1, w128): builds a per-call [`DirtyCellIndex`] over
     /// the dirty formula cells, then for each dirty formula F with range
     /// deps queries the index once per range. The dominant term is
-    /// `O(|dirty| · log|dirty| + Σ_F Σ_range matches)` — the index build
-    /// (sort) plus the total emitted-edge count, replacing the prior
-    /// `O(|dirty|² × avg_ranges)` cross-scan. Large quant sheets with
-    /// many tall-column range formulas no longer stall recompute (OPT-02).
+    /// `O(|dirty| · log|dirty| + Σ_F Σ_range (matches · log matches))` —
+    /// the index build (sort) plus, per query, the matched-edge count and
+    /// the `dirty_in_range` result sort (needed to reproduce the old
+    /// NodeId emission order). This replaces the prior
+    /// `O(|dirty|² × avg_ranges)` cross-scan. For the sparse regime that
+    /// actually stalled recompute (many formulas, small disjoint ranges)
+    /// this is the decisive win: each query is a binary search returning
+    /// O(1) matches. In the pathological DENSE regime (every range covers
+    /// every dirty formula) the per-query sort makes it `O(N² log N)` — a
+    /// minor `log N` regression over the old `O(N²)`, but that regime must
+    /// emit N² edges regardless and was never the optimization target
+    /// (OPT-02). Large quant sheets with many tall-column range formulas
+    /// no longer stall recompute.
     ///
     /// **Output is byte-identical to the prior double-loop.** For each F,
     /// ranges are still iterated in registration order; within each range
@@ -3167,6 +3176,18 @@ impl CalcgraphSession {
     /// (`range_ref_sheet(range).unwrap_or(fs)`), and the index's
     /// row/col bounds are the SAME bounds `range_contains_rowcol` checks.
     fn build_range_supplemental(&self, dirty_vec: &[NodeId]) -> HashMap<NodeId, Vec<NodeId>> {
+        // TB1 PRECONDITION (load-bearing): `dirty_vec` MUST be ascending by
+        // NodeId. The byte-identical-output guarantee rests on it — the
+        // index sorts each `dirty_in_range` result by NodeId, which only
+        // reproduces the old inner-scan emission order when `dirty_addrs`
+        // (built order-preservingly from `dirty_vec`) is itself
+        // NodeId-sorted. The sole production caller `schedule_dirty` sorts
+        // before calling; this guards future callers + the test accessor.
+        debug_assert!(
+            dirty_vec.windows(2).all(|w| w[0] <= w[1]),
+            "build_range_supplemental: dirty_vec must be sorted ascending by NodeId \
+             (TB1 order-equivalence precondition)"
+        );
         // Resolve cell addresses for every dirty FORMULA node. Non-
         // formula NodeIds (none exist today — the graph only adds Cell
         // nodes for formula cells) filter out via cell_address_for
@@ -6499,6 +6520,22 @@ mod tests {
         supplemental
     }
 
+    /// Place a literal value at `(sheet 0, row, col)` and return its cell
+    /// NodeId. Used by the WholeColumn/WholeRow equivalence test to seed
+    /// dirty G targets concisely. (Literals have no range deps, so they
+    /// only ever act as targets, never as range-owning F's.)
+    fn s_set_lit(
+        s: &mut CalcgraphSession,
+        wb: &Workbook,
+        registry: &FunctionRegistry,
+        row: RowId,
+        col: ColId,
+        val: f64,
+    ) -> NodeId {
+        s.on_set_formula(0, row, col, &ExprPlan::Number(val), wb, registry);
+        s.cell_node_for(0, row, col).unwrap()
+    }
+
     /// Tiny deterministic LCG so the property test is reproducible (no
     /// external rand dep). Numerical Recipes constants.
     struct Lcg(u64);
@@ -6575,6 +6612,15 @@ mod tests {
                 };
                 // Occasionally give a formula TWO overlapping ranges to
                 // exercise the per-F dedup + multi-range ordering path.
+                // range2 is a GENUINELY DISTINCT box anchored at range1's
+                // far corner (r1,c1) and extending to (max_rc,max_rc): it
+                // overlaps range1 at the shared corner (forcing the
+                // `added` first-occurrence dedup) AND covers new cells
+                // range1 missed (forcing the cross-range "second range
+                // adds new G's" ordering path). The prior version used
+                // `r0.min(max_rc)`/`c1.min(max_rc)`, which — since r0,c1 ≤
+                // max_rc already — reproduced range1 verbatim and never
+                // exercised the new-cell path (Lane-3 MED, w128 fold).
                 let mut args = vec![ExprPlan::AggregateNameRef {
                     name: Arc::from("R1"),
                     range,
@@ -6582,10 +6628,10 @@ mod tests {
                 if rng.range(0, 3) == 0 {
                     let range2 = ql_types::Range {
                         sheet: rsheet,
-                        start_row: r0.min(max_rc),
-                        start_col: c0,
-                        end_row: r1,
-                        end_col: c1.min(max_rc),
+                        start_row: r1,
+                        start_col: c1,
+                        end_row: max_rc,
+                        end_col: max_rc,
                     };
                     args.push(ExprPlan::AggregateNameRef {
                         name: Arc::from("R2"),
@@ -6681,6 +6727,20 @@ mod tests {
                 .collect();
             dirty_vec.sort();
 
+            // Skip trivially-empty draws: an empty dirty_vec makes both
+            // `got` and `want` the empty map, which assert-equals
+            // VACUOUSLY — proving nothing about the index. Small seeds can
+            // place 1-2 formulas and then drop them all in the ~50% filter
+            // (Lane-3 MED, w128 fold). Re-draw deterministically by
+            // forcing the first node dirty when the filter emptied it.
+            if dirty_vec.is_empty() {
+                if let Some(&first) = all_nodes.first() {
+                    dirty_vec.push(first);
+                } else {
+                    continue; // no formulas placed at all — nothing to test
+                }
+            }
+
             let got = s.build_range_supplemental_for_test(&dirty_vec);
             let want = brute_force_supplemental(&s, &dirty_vec);
             assert_eq!(
@@ -6739,6 +6799,132 @@ mod tests {
         assert!(
             !f_supp.contains(&g_same),
             "sheet-0 cell at same coords must NOT match a sheet-1 range"
+        );
+    }
+
+    /// **TB1 WholeColumn / WholeRow equivalence (w128 fold).** The three
+    /// `..._matches_brute_force*` property tests only ever generate
+    /// `RangeRef::Cells` (their coordinate space `[0, max_rc]` can never hit
+    /// the `end_row == RowId::MAX` / `end_col == ColId::MAX` sentinels that
+    /// `range_to_rangeref` requires for `WholeColumn` / `WholeRow`). That
+    /// left `DirtyCellIndex::dirty_in_range`'s `WholeColumn` arm, its
+    /// `WholeRow` arm, AND the entire `collect_row_band` / `row_major` view
+    /// UNVERIFIED against the brute-force oracle — flagged by 3 of 5 audit
+    /// lanes (w128). Whole-column/row refs (`=SUM(A:A)`, `=SUM(5:5)`) are
+    /// valid Excel and reach production, so these arms are live, not dead.
+    ///
+    /// This test builds both a `WholeColumn` (`A:A`) and a `WholeRow`
+    /// (`5:5`) formula, populates dirty G cells exactly ON the band
+    /// boundaries and just outside them, and asserts the indexed
+    /// `build_range_supplemental` is byte-identical to the brute-force
+    /// reference — closing the oracle gap for both arms + `collect_row_band`.
+    #[test]
+    fn build_range_supplemental_whole_col_row_matches_brute_force() {
+        let registry = ql_functions::default_registry();
+        let wb = ql_storage::Workbook::new();
+        let mut s = CalcgraphSession::new();
+
+        // F_col at (row 0, col 1) = SUM(A:A) → RangeRef::WholeColumn over
+        // col 0 (any row). Sentinel: start_row=0, end_row=RowId::MAX.
+        let f_col_plan = ExprPlan::Function {
+            name: Arc::from("SUM"),
+            args: vec![ExprPlan::AggregateNameRef {
+                name: Arc::from("RCOL"),
+                range: ql_types::Range {
+                    sheet: 0,
+                    start_row: 0,
+                    end_row: RowId::MAX,
+                    start_col: 0,
+                    end_col: 0,
+                },
+            }],
+        };
+        s.on_set_formula(0, 0, 1, &f_col_plan, &wb, &registry);
+
+        // F_row at (row 7, col 0) = SUM(5:5) → RangeRef::WholeRow over
+        // row 5 (any col). Sentinel: start_col=0, end_col=ColId::MAX.
+        let f_row_plan = ExprPlan::Function {
+            name: Arc::from("SUM"),
+            args: vec![ExprPlan::AggregateNameRef {
+                name: Arc::from("RROW"),
+                range: ql_types::Range {
+                    sheet: 0,
+                    start_row: 5,
+                    end_row: 5,
+                    start_col: 0,
+                    end_col: ColId::MAX,
+                },
+            }],
+        };
+        s.on_set_formula(0, 7, 0, &f_row_plan, &wb, &registry);
+
+        // Dirty G literals:
+        //   col-band IN: (row 3, col 0) and (row 99, col 0) — col 0, so in A:A.
+        //   col-band OUT: (row 3, col 2) — col 2, outside A:A.
+        //   row-band IN: (row 5, col 4) and (row 5, col 50) — row 5, so in 5:5.
+        //   row-band OUT: (row 6, col 4) — row 6, outside 5:5.
+        // (row 5, col 0) sits in BOTH bands (col 0 ∈ A:A, row 5 ∈ 5:5) —
+        // exercises a G that two different F's both collect.
+        let g_col_in_a = s_set_lit(&mut s, &wb, &registry, 3, 0, 11.0);
+        let g_col_in_b = s_set_lit(&mut s, &wb, &registry, 99, 0, 12.0);
+        let g_col_out = s_set_lit(&mut s, &wb, &registry, 3, 2, 13.0);
+        let g_row_in_a = s_set_lit(&mut s, &wb, &registry, 5, 4, 14.0);
+        let g_row_in_b = s_set_lit(&mut s, &wb, &registry, 5, 50, 15.0);
+        let g_row_out = s_set_lit(&mut s, &wb, &registry, 6, 4, 16.0);
+        let g_both = s_set_lit(&mut s, &wb, &registry, 5, 0, 17.0);
+
+        let f_col = s.cell_node_for(0, 0, 1).unwrap();
+        let f_row = s.cell_node_for(0, 7, 0).unwrap();
+
+        let mut dirty_vec = vec![
+            f_col, f_row, g_col_in_a, g_col_in_b, g_col_out, g_row_in_a, g_row_in_b, g_row_out,
+            g_both,
+        ];
+        dirty_vec.sort();
+
+        let got = s.build_range_supplemental_for_test(&dirty_vec);
+        let want = brute_force_supplemental(&s, &dirty_vec);
+        assert_eq!(
+            got, want,
+            "WholeColumn/WholeRow indexed supplemental must byte-match brute force"
+        );
+
+        // Concrete arm-level assertions (independent of the oracle):
+        let col_supp = got.get(&f_col).cloned().unwrap_or_default();
+        assert!(col_supp.contains(&g_col_in_a), "row 3 col 0 ∈ A:A");
+        assert!(col_supp.contains(&g_col_in_b), "row 99 col 0 ∈ A:A");
+        assert!(col_supp.contains(&g_both), "row 5 col 0 ∈ A:A");
+        assert!(
+            !col_supp.contains(&g_col_out),
+            "col 2 must NOT be in WholeColumn over col 0"
+        );
+        assert!(
+            !col_supp.contains(&g_row_in_a),
+            "row 5 col 4 is not in column A"
+        );
+
+        let row_supp = got.get(&f_row).cloned().unwrap_or_default();
+        assert!(row_supp.contains(&g_row_in_a), "row 5 col 4 ∈ 5:5");
+        assert!(row_supp.contains(&g_row_in_b), "row 5 col 50 ∈ 5:5");
+        assert!(row_supp.contains(&g_both), "row 5 col 0 ∈ 5:5");
+        assert!(
+            !row_supp.contains(&g_row_out),
+            "row 6 must NOT be in WholeRow over row 5"
+        );
+        assert!(
+            !row_supp.contains(&g_col_in_a),
+            "row 3 col 0 is not in row 5"
+        );
+
+        // The result Vecs must be ascending by NodeId (the order-equivalence
+        // contract) for BOTH whole-band arms.
+        assert!(
+            col_supp.windows(2).all(|w| w[0] <= w[1]),
+            "WholeColumn supplemental must be NodeId-ascending"
+        );
+        assert!(
+            row_supp.windows(2).all(|w| w[0] <= w[1]),
+            "WholeRow supplemental must be NodeId-ascending"
         );
     }
 
@@ -6833,11 +7019,11 @@ mod tests {
 
         // 10k formulas at (r, 1), each referencing a UNIQUE single cell
         // (r, 0) — so formula r's range contains only the literal at
-        // (r, 0), not any other dirty formula. Supplemental stays empty
-        // (the literals aren't formulas-with-ranges, and each range holds
-        // exactly one cell which is itself a dirty literal G → so each
-        // F → that one G). Net: n edges total, n keys, but the old loop
-        // scanned n² cells to find them.
+        // (r, 0), not any other dirty formula. Supplemental is SPARSE (one
+        // edge per formula, not the n² of the dense case): each range
+        // holds exactly one cell, itself a dirty literal G, so each F → that
+        // one G. Net: n edges total, n keys — but the old loop scanned n²
+        // cells to find them, which is the cost this benchmark isolates.
         let n: u32 = 10_000;
         for r in 0..n {
             let plan = ExprPlan::Function {
