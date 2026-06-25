@@ -235,33 +235,16 @@ pub fn import_xlsx_bytes(
     let _tables_imported =
         read::tables_import::import_tables(&package, &mut workbook, &sheet_rels_paths)?;
 
-    // **W5-D-PM-3 (megaudit Opus-B HIGH-8 closure):** emit warnings
-    // for `<sheet r:id="...">` entries whose r:id doesn't resolve
-    // to any entry in `xl/_rels/workbook.xml.rels`. Prior to this,
-    // such sheets were silently dropped from the part-path lookup
-    // — the user thought their workbook imported when 1+ sheets
-    // had no usable worksheet part.
-    {
-        let sheet_part_paths_check =
-            read::sheet_parts::build_sheet_part_paths(&package, &workbook_props)?;
-        for (idx, (sheet, part_path)) in workbook_props
-            .sheets
-            .iter()
-            .zip(sheet_part_paths_check.iter())
-            .enumerate()
-        {
-            if part_path.is_empty() {
-                report.warnings.push(XlsxWarning {
-                    location: format!("sheet[{}] '{}'", idx, sheet.name),
-                    message: format!(
-                        "sheet r:id={:?} doesn't resolve via xl/_rels/workbook.xml.rels; \
-                         sheet content will be empty",
-                        sheet.r_id
-                    ),
-                });
-            }
-        }
-    }
+    // **W5-D-PM-3 / NF-04 (w128 audit fold):** the prior standalone warning
+    // loop here re-computed `build_sheet_part_paths` a second time to warn on
+    // `<sheet>` entries whose r:id didn't resolve. After NF-04 that case is no
+    // longer a warning — `build_sheet_part_paths` (already called above via
+    // `build_sheet_rels_paths`, and again below for the style scan) now
+    // ERRORS loudly on a missing r:id, so the loop could only ever fire for
+    // the distinct path-escape sentinel. The warning was therefore both
+    // redundant (3rd identical computation) and misleadingly worded; it is
+    // consolidated into the per-cell-style scan loop below, with a corrected
+    // message.
 
     // **W5-D-14d — Phase 2d**: import styles. Parses `xl/styles.xml`
     // for custom number formats (`numFmtId >= 164`) and registers
@@ -280,6 +263,23 @@ pub fn import_xlsx_bytes(
     let sheet_part_paths = read::sheet_parts::build_sheet_part_paths(&package, &workbook_props)?;
     for (sheet_idx, part_path) in sheet_part_paths.iter().enumerate() {
         if part_path.is_empty() {
+            // **W5-D-PM-3 / NF-04 (w128 fold):** post-NF-04,
+            // `build_sheet_part_paths` ERRORS on a `<sheet>` whose r:id is
+            // absent from `xl/_rels/workbook.xml.rels`, so an empty slot here
+            // is NOT a missing r:id — it is the path-escape sentinel
+            // (`resolve_rel_target` returns "" for a `Target=` that walks
+            // above the package root). Surface that distinct, hostile-path
+            // cause as a warning; the sheet's styles/content are skipped.
+            if let Some(sheet) = workbook_props.sheets.get(sheet_idx) {
+                report.warnings.push(XlsxWarning {
+                    location: format!("sheet[{}] '{}'", sheet_idx, sheet.name),
+                    message: format!(
+                        "sheet r:id={:?} resolves to a Target outside the package root \
+                         (path-escape); sheet styles/content will be empty",
+                        sheet.r_id
+                    ),
+                });
+            }
             continue;
         }
         let Some(content) = package.read_part_string(part_path)? else {

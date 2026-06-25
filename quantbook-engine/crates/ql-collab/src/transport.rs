@@ -488,15 +488,25 @@ pub struct LoopbackTransport {
 
 impl std::fmt::Debug for LoopbackTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // **NF-01 (no-fallbacks), w128 audit fold:** surface a poisoned lock
+        // as "<poisoned>" rather than a misleading length of 0 — the same
+        // silent fallback `pending_recv` was fixed to reject (audit lane-A
+        // flagged this Debug impl as the inconsistent residual). A Debug impl
+        // must NOT panic: it can be invoked while formatting an assert/panic
+        // message during unwinding, where a second panic aborts the process
+        // and buries the original error. So we render the poison VISIBLY
+        // here instead of `.expect()`-ing.
+        let inbox_len = match self.inbox.lock() {
+            Ok(q) => q.len().to_string(),
+            Err(_) => "<poisoned>".to_string(),
+        };
+        let outbox_len = match self.outbox.lock() {
+            Ok(q) => q.len().to_string(),
+            Err(_) => "<poisoned>".to_string(),
+        };
         f.debug_struct("LoopbackTransport")
-            .field(
-                "inbox_len",
-                &self.inbox.lock().map(|q| q.len()).unwrap_or(0),
-            )
-            .field(
-                "outbox_len",
-                &self.outbox.lock().map(|q| q.len()).unwrap_or(0),
-            )
+            .field("inbox_len", &inbox_len)
+            .field("outbox_len", &outbox_len)
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish()
     }
