@@ -11,7 +11,7 @@ use std::iter::Peekable;
 use std::str::Chars;
 use std::sync::Arc;
 
-use ql_types::{Locale, ReferenceMode};
+use ql_types::{Locale, ReferenceMode, MAX_COLUMN, MAX_ROW};
 
 use crate::token::{Operator, Token};
 
@@ -96,11 +96,6 @@ pub enum LexError {
     #[error("malformed R1C1 reference: {0:?}")]
     MalformedR1C1(String),
 }
-
-/// Excel's column-letter upper bound (XFD = 16383, zero-indexed).
-pub const MAX_COLUMN: u32 = 16_383;
-/// Excel's row upper bound (1,048,576 — 1-indexed in source, so max 0-indexed = 1,048,575).
-pub const MAX_ROW: u32 = 1_048_575;
 
 /// Tokenize a formula expression body (without the leading `=`).
 ///

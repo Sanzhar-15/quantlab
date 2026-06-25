@@ -53,7 +53,8 @@ pub use ast::{
     Expr, RangeRef, SheetRef, ShiftAxis, ShiftOp, ShiftScope, SpecialItem, TableSpecItem,
     TableSpecSubtree,
 };
-pub use lexer::{column_letters_to_index, lex, lex_with, LexError, MAX_COLUMN, MAX_ROW};
+pub use lexer::{column_letters_to_index, lex, lex_with, LexError};
+pub use ql_types::{MAX_COLUMN, MAX_ROW};
 pub use locale::{locale_data, LocaleData};
 pub use parser::{parse, ParseError};
 pub use printer::{print, print_with, FormulaSite, PrintError};
