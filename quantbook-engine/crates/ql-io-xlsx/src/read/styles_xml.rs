@@ -45,7 +45,6 @@ use quick_xml::Reader;
 /// Parsed contents of `xl/styles.xml` (the slice this engine cares
 /// about for Phase 4.11 — number formats and cell XF references).
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub(crate) struct StyleIndex {
     /// Custom number-format definitions (`numFmtId >= 164`) mapped to
     /// their format code string. Built-ins (0-163) live in the
@@ -59,7 +58,6 @@ pub(crate) struct StyleIndex {
 
 /// One `<numFmt>` entry from `<numFmts>`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct NumFmtEntry {
     /// `numFmtId` attribute — the lookup key. ≥164 for custom; 0-163
     /// are built-ins (rarely listed here since consumers know them).
@@ -73,7 +71,6 @@ pub(crate) struct NumFmtEntry {
 /// `numFmtId` reference for W5-D-14d; alignment / borders / fonts
 /// land later if Quantbook adds matching storage.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct CellXf {
     /// `numFmtId` attribute. 0 = General (no special format).
     pub num_fmt_id: u32,

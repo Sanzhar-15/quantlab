@@ -182,12 +182,6 @@ pub(crate) fn export_update_original(
                     // E.g. duplicate calcChain (we own that), or
                     // already-rendered-by-shadow parts.
                 }
-                PartAction::OwnedByShadow => {
-                    // Shadow's version takes precedence; documentation
-                    // branch (we don't hit it in practice because
-                    // shadow's membership check above handles the
-                    // common case).
-                }
             }
         }
 
@@ -265,9 +259,6 @@ enum PartAction {
     DropAsUnsupported(UnsupportedFeatureKind),
     /// Skip silently (e.g., shadow already covers this part type).
     DropSilently,
-    /// Shadow's version takes precedence (e.g., xl/workbook.xml).
-    #[allow(dead_code)]
-    OwnedByShadow,
 }
 
 /// Classify an original-package part path. The preserve list is

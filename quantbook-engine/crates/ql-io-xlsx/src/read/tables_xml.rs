@@ -31,9 +31,6 @@ use std::sync::Arc;
 /// Parsed table XML data, before being mapped to a SheetId.
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedTable {
-    /// Internal table id from the `id` attribute (numeric).
-    #[allow(dead_code)]
-    pub id: u32,
     /// `name` attribute — engine canonical form is uppercase.
     pub name: String,
     /// `displayName` attribute — case-preserving for round-trip.
@@ -75,7 +72,6 @@ pub(crate) fn parse_table_xml(content: &str, part_path: &str) -> Result<ParsedTa
     let mut reader = Reader::from_str(content);
     reader.config_mut().trim_text(true);
 
-    let mut id: u32 = 0;
     let mut name = String::new();
     let mut display_name = String::new();
     let mut ref_str = String::new();
@@ -113,7 +109,13 @@ pub(crate) fn parse_table_xml(content: &str, part_path: &str) -> Result<ParsedTa
                                     message: format!("malformed <table> attribute value: {err}"),
                                 })?;
                             if key == b"id" {
-                                id = parse_u32_attr(val.as_ref(), "id", part_path)?;
+                                // DC-07: the table's numeric `id` is never read —
+                                // the importer keys tables by name and the exporter
+                                // regenerates ids — so it is no longer stored. We
+                                // still parse it to keep TA10's loud validation: a
+                                // present-but-malformed `id` is corruption, not a
+                                // value to silently ignore.
+                                parse_u32_attr(val.as_ref(), "id", part_path)?;
                             } else if key == b"name" {
                                 name = val.to_string();
                             } else if key == b"displayName" {
@@ -197,7 +199,6 @@ pub(crate) fn parse_table_xml(content: &str, part_path: &str) -> Result<ParsedTa
         })?;
 
     Ok(ParsedTable {
-        id,
         name,
         display_name,
         top_row,
@@ -470,15 +471,16 @@ mod tests {
 
     #[test]
     fn parse_table_xml_absent_numeric_attrs_keep_ooxml_defaults() {
-        // Regression guard for COR-05: absent headerRowCount/totalsRowCount/id
-        // must still produce the OOXML defaults (1 / 0 / 0), not an error.
+        // Regression guard for COR-05: absent headerRowCount/totalsRowCount
+        // must still produce the OOXML defaults (1 / 0), not an error. An
+        // absent `id` likewise does not error — `id` is parsed-and-validated
+        // only when present, and never stored (see DC-07).
         let xml = r#"<table name="T" displayName="T" ref="A1:B2">
   <tableColumns><tableColumn id="1" name="A"/></tableColumns>
 </table>"#;
         let parsed = parse_table_xml(xml, "xl/tables/table1.xml").expect("absent attrs are valid");
         assert_eq!(parsed.header_row_count, 1);
         assert_eq!(parsed.totals_row_count, 0);
-        assert_eq!(parsed.id, 0);
     }
 
     #[test]
@@ -512,7 +514,6 @@ mod tests {
     #[test]
     fn parsed_table_to_metadata_canonicalizes_name() {
         let parsed = ParsedTable {
-            id: 1,
             name: "Sales".to_string(),
             display_name: "Sales".to_string(),
             top_row: 0,

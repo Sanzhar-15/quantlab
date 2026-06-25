@@ -8,8 +8,6 @@
 //! adding it later would be a breaking change for any consumer pinning the workspace
 //! shape. Real C FFI work lands in v1.5.
 
-#![allow(dead_code)]
-
 #[cfg(test)]
 mod tests {
     #[test]

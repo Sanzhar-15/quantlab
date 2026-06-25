@@ -27,7 +27,6 @@ use quick_xml::Reader;
 
 /// One `<Relationship>` element parsed from a `.rels` file.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct Relationship {
     /// `Id` attribute — used to look up the relationship by name from
     /// the consuming XML part (e.g. `<tablePart r:id="rId3"/>`).

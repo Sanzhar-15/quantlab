@@ -22,7 +22,6 @@ use quick_xml::Reader;
 /// W5-D-15 (named-range resolution into the engine's `NameTable`).
 /// They are parsed now so the OOXML scanner shape is locked.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub(crate) struct WorkbookProperties {
     /// `workbookPr/@date1904` — `false` for the 1900 system (default),
     /// `true` for the 1904 system. Affects every date serial in the
@@ -38,7 +37,6 @@ pub(crate) struct WorkbookProperties {
 
 /// One `<sheet>` element from `xl/workbook.xml/<sheets>`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct SheetMeta {
     /// Display name (e.g. `"Sheet1"`).
     pub name: String,
@@ -71,7 +69,6 @@ pub(crate) enum SheetState {
 /// One `<definedName>` element from
 /// `xl/workbook.xml/<definedNames>`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct DefinedNameMeta {
     /// The name as the user typed it (case-preserved).
     pub name: String,
