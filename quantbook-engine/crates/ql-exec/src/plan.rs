@@ -904,28 +904,6 @@ pub fn bind_with_site_no_tables<L: NameLookup>(
     bind_with_site(expr, site, names, sheets, &EmptyTableLookup, registry)
 }
 
-#[allow(dead_code)]
-fn bind_with_context<L: NameLookup>(
-    expr: &Expr,
-    owning_sheet: SheetId,
-    names: &L,
-    sheets: &dyn SheetResolver,
-    registry: &FunctionRegistry,
-    ctx: BindContext,
-) -> Result<ExprPlan, BindError> {
-    // 4.8.F: legacy entry — no table resolver, no cell context.
-    bind_with_context_v2(
-        expr,
-        BindSite::sheet_only(owning_sheet),
-        names,
-        sheets,
-        &EmptyTableLookup,
-        registry,
-        ctx,
-        &[], // Wave P: cell root — no LET/LAMBDA locals in scope.
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn bind_with_context_v2<L: NameLookup>(
     expr: &Expr,
