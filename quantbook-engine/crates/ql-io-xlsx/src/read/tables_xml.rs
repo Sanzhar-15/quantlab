@@ -21,6 +21,7 @@
 
 use crate::error::XlsxError;
 use crate::read::package::XlsxPackage;
+use crate::read::parse_u32_attr;
 use ql_storage::{TableColumn, TableMetadata, TotalsFunction};
 use ql_types::{ColId, RowId, SheetId};
 use quick_xml::events::Event;
@@ -64,23 +65,10 @@ pub(crate) struct ParsedTableColumn {
     pub totals_row_function: Option<TotalsFunction>,
 }
 
-/// Parse a numeric OOXML table attribute that is **present** on the element.
-///
-/// **W5 / COR-05 (2026-06-25):** a present-but-unparseable numeric attribute
-/// (`headerRowCount="abc"`, two `<tableColumn>`s with `id="x"`) is corruption,
-/// not a missing value — surfacing `XlsxError::MalformedOoxml` honours the
-/// no-fallbacks rule. The pre-COR-05 `val.parse().unwrap_or(<default>)` aliased
-/// malformed input onto the OOXML *absent-attribute* default, silently
-/// producing e.g. `headerRowCount=1` from garbage or colliding stable column
-/// ids on `id=0`. The absent-attribute default stays correct because the caller
-/// initialises each field before the attribute loop and only calls this helper
-/// inside the branch that fires when the attribute is actually present.
-fn parse_u32_attr(val: &str, attr: &str, part_path: &str) -> Result<u32, XlsxError> {
-    val.parse::<u32>().map_err(|e| XlsxError::MalformedOoxml {
-        part: part_path.to_string(),
-        message: format!("<table> attribute {attr} is not a valid u32: {val:?} ({e})"),
-    })
-}
+// `parse_u32_attr` (present-but-malformed numeric attr → loud
+// `MalformedOoxml`) was promoted to `crate::read::parse_u32_attr` (imported
+// above) in TA10 (w131) so every reader rejects present-garbage identically.
+// See COR-05.
 
 /// Parse one `xl/tables/table*.xml` file.
 pub(crate) fn parse_table_xml(content: &str, part_path: &str) -> Result<ParsedTable, XlsxError> {
