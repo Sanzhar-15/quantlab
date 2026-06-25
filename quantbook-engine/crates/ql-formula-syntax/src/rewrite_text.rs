@@ -94,6 +94,19 @@ pub enum NameRewrite<'a> {
 /// touch (returns `None`) preserve their original text.
 pub fn rewrite_formula_text(text: &str, rewrite: NameRewrite<'_>) -> Option<String> {
     let stripped = text.strip_prefix('=').unwrap_or(text);
+    // **NF-07 (no-fallbacks — PARTIAL, documented):** lex/parse failure on a
+    // stored formula is intentionally treated as "no rewrite needed" (`None`)
+    // so the caller skips emitting a `PutFormula` op and leaves the formula
+    // verbatim. This is a documented contract, NOT a silent swallow:
+    //
+    // - Stored formulas that survived `MAX_PARSE_DEPTH=100` guard (B3) should
+    //   never fail here — lex/parse failure in production means the formula was
+    //   already broken before storage and will surface as an eval error anyway.
+    // - Changing to `Result<Option<String>>` would require updating 6+ callers
+    //   across `ql-exec` and `ql-collab` and is deferred as a larger refactor
+    //   (blast radius: all rewrite/shift sites). Tracked as NF-07 open item.
+    // - The behaviour IS correct (broken formula stays broken, no data loss).
+    //   The only gap is that the formula silently skips the rename/shift op.
     let tokens = lex(stripped).ok()?;
     let expr = parse(tokens).ok()?;
     let rewritten = match rewrite {
@@ -147,6 +160,10 @@ pub fn shift_formula_text(
     scope: ShiftScope<'_>,
 ) -> Option<String> {
     let stripped = text.strip_prefix('=').unwrap_or(text);
+    // **NF-07 (no-fallbacks — PARTIAL, documented):** same rationale as
+    // `rewrite_formula_text` — lex/parse failure returns `None` (no-op,
+    // formula left un-shifted) by contract. See that function's NF-07 comment
+    // for the full rationale and the deferred full-Result refactor note.
     let tokens = lex(stripped).ok()?;
     let expr = parse(tokens).ok()?;
     let shifted = shift_cell_refs(&expr, axis, op, scope);
@@ -512,5 +529,66 @@ mod tests {
     fn delete_col_makes_pointed_ref_a_ref_error() {
         // =B5 (col index 1). Delete columns [1,1]. → #REF!.
         assert_eq!(delete_cols("=B5", 1, 1), Some("=#REF!".to_string()));
+    }
+
+    // ====================================================================
+    // NF-07 — lex/parse failure on stored formula returns None by contract
+    // ====================================================================
+    //
+    // The contract of `rewrite_formula_text` and `shift_formula_text` is that
+    // a lex or parse failure returns `None` (no rewrite). This is intentional:
+    // a stored formula that fails to lex/parse was already broken before the
+    // rename/shift; it will surface as an eval error at compute time. Leaving
+    // it un-rewritten is the correct behaviour (no data loss, no silent change).
+    //
+    // These tests pin that contract. They also document the NF-07 gap: there
+    // is no loud signal that the formula was skipped. A full `Result<Option<>>`
+    // refactor is deferred (6+ callers; see `rewrite_formula_text` NF-07 comment).
+
+    #[test]
+    fn nf07_rewrite_formula_lex_failure_returns_none_by_contract() {
+        // `[` is a lex error. The formula is left un-rewritten (None) — not
+        // an error, because the formula was already broken before the rename.
+        let new = Arc::from("NewSheet");
+        let out = rewrite_formula_text(
+            "=[",
+            NameRewrite::Sheet {
+                old_canonical: "OldSheet",
+                new_display: &new,
+            },
+        );
+        assert_eq!(
+            out, None,
+            "lex failure must return None (formula stays verbatim, not silently patched)"
+        );
+    }
+
+    #[test]
+    fn nf07_shift_formula_lex_failure_returns_none_by_contract() {
+        // Same for shift_formula_text.
+        let out = insert_rows("=[", 0, 1);
+        assert_eq!(
+            out, None,
+            "lex failure on shift must return None (formula stays verbatim)"
+        );
+    }
+
+    #[test]
+    fn nf07_rewrite_formula_valid_formula_is_rewritten() {
+        // Positive case: a valid formula IS rewritten correctly.
+        // This guards against accidentally breaking the happy path while fixing NF-07.
+        let new = Arc::from("NewSheet");
+        let out = rewrite_formula_text(
+            "=OldSheet!A1",
+            NameRewrite::Sheet {
+                old_canonical: "oldsheet",
+                new_display: &new,
+            },
+        );
+        assert_eq!(
+            out,
+            Some("=NewSheet!A1".to_string()),
+            "valid formula with matching sheet ref must be rewritten"
+        );
     }
 }
