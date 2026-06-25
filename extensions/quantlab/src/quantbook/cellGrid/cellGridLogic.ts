@@ -8,14 +8,11 @@
  * cell-grid panel's message-passing flow.
  *
  * Split from `cellGridPanel.ts` so unit tests can import these
- * functions without pulling the `vscode` host module.  Same pattern
- * as `cellGridHtml.ts`.
+ * functions without pulling the `vscode` host module.
  *
  * What lives here:
  * - Message envelope types ({@link PutValueRequest},
  *   {@link ErrorReplyMessage}) per V3.2.b.1 decision B1.
- * - {@link parseCellRawInput} -- pure parser; throws with
- *   `[bad_argument]` prefix on rejection.
  * - {@link dispatchIncomingMessage} -- the host-side dispatcher; takes
  *   `DispatchDeps` (session + sheet + onCommit + onError callbacks) so
  *   it has no vscode dependency.
@@ -27,7 +24,7 @@
  * - `panel.webview.postMessage` -> wired as `DispatchDeps.onError`.
  */
 
-import type { CellSnapshotJson, CollabSessionInstance, DiagnosticJson, EventJson, FormatIdJson, FunctionMetadataJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, RgbJson, SessionCellValueInput, SessionInstance, SessionOpJson, SheetSnapshotJson, StyleDefJson, StyleIdJson, StyleJson, TableSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
+import type { CellSnapshotJson, DiagnosticJson, EventJson, FormatIdJson, FunctionMetadataJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, RgbJson, SessionCellValueInput, SessionInstance, SessionOpJson, SheetSnapshotJson, StyleDefJson, StyleIdJson, StyleJson, TableSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
 import { assertSupportedSchemaVersion, parseQuantbookError, recalcDirtyChecked, setFormulaValidated, setValueValidated } from '../session';
 // Demo-prep toolbar (2026-06-10): type-only imports so the toolbar-command parser's whitelists stay
 // pinned to the canonical unions (a preset added to FormatPreset / an op added to StructuralOp forces
@@ -37,57 +34,10 @@ import type { FormatPreset } from './formatPickerLogic';
 import type { StructuralOp } from './contextMenuLogic';
 
 /**
- * V3.2.c.3 / V3.2.c.5 (2026-05-22) -- classification of a single
- * `session.pollRemote()` call's outcome.  Exported so the panel's
- * `tickPollRemote` (vscode-side) can delegate the decision tree to
- * this vscode-free helper, AND so mocha can exercise the four
- * branches without instantiating a real CellGridPanel.
- */
-export type PollTickResult =
-	| { kind: 'idle' }
-	| { kind: 'merged'; count: number }
-	| { kind: 'transportClosed' }
-	| { kind: 'error'; code: QuantbookErrorCode; message: string };
-
-/**
- * Call `session.pollRemote()` once and classify the result.  No side
- * effects beyond the pollRemote itself; the caller decides what to do
- * with the verdict (render / reconnect / log + skip).
- *
- * Branches:
- * - `pollRemote()` returns 0 -> `{kind:'idle'}`.
- * - `pollRemote()` returns > 0 -> `{kind:'merged', count: n}`.
- * - `pollRemote()` throws + `parseQuantbookError(err).code === 'transport_closed'`
- *   -> `{kind:'transportClosed'}` (V3.1.c reconnect cue).
- * - Any other throw -> `{kind:'error', code, message}` (log + skip).
- */
-/**
- * **DORMANT (FE megaudit S6, 2026-06-03)** -- DEAD in v1. `pollRemote` is a
- * CollabSession (real-time collab) primitive; the v1 grid runs on the owning
- * single-writer `Session` and never polls a transport. Retained, exported, and
- * unit-tested for the v1.5 collab re-enable. No live caller today.
- */
-export function classifyPollTick(session: CollabSessionInstance): PollTickResult {
-	try {
-		const n = session.pollRemote();
-		if (n > 0) {
-			return { kind: 'merged', count: n };
-		}
-		return { kind: 'idle' };
-	} catch (err) {
-		const info = parseQuantbookError(err);
-		if (info.code === 'transport_closed') {
-			return { kind: 'transportClosed' };
-		}
-		return { kind: 'error', code: info.code, message: info.message };
-	}
-}
-
-/**
  * V3.2.b.1 decision B1 envelope: outgoing (webview -> extension host).
  *
  * `rawInput` is the literal user-typed string; the host's
- * {@link parseCellRawInput} does the parsing + validation.
+ * {@link classifyCellInput} does the parsing + classification.
  */
 export interface PutValueRequest {
 	type: 'putValue';
@@ -396,33 +346,9 @@ export function validatePresenceNumeric(s: {
 }
 
 /**
- * **DORMANT (FE megaudit S6, 2026-06-03)** -- DEAD in v1. The live cell-input path
- * is {@link classifyCellInput} (number/text/blank for the owning `Session`); this
- * numeric-only parser predates the text-cell fix and has no live caller. Retained +
- * unit-tested for reference. Do not wire into the dispatch path (it throws on text).
- */
-export function parseCellRawInput(raw: string): number {
-	const trimmed = raw.trim();
-	if (trimmed === '') {
-		throw new Error('[bad_argument] cell value cannot be empty');
-	}
-	// `Number()` accepts hex (0xFF), scientific (1e3), Infinity, NaN.
-	// Reject Infinity / NaN explicitly via Number.isFinite so the
-	// engine never receives a non-finite f64 (its validator would
-	// reject too, but failing at the TS layer gives a clearer message
-	// + cheaper round-trip).
-	const n = Number(trimmed);
-	if (!Number.isFinite(n)) {
-		throw new Error(`[bad_argument] cell value must be a finite number, got "${trimmed}"`);
-	}
-	return n;
-}
-
-/**
  * **FE-0a Part B (B1, 2026-06-02)** -- classify a raw user-typed literal into a
  * {@link SessionCellValueInput} for the owning `Session.setValue` path. This is
- * the text-cell fix: unlike {@link parseCellRawInput} (numeric-only, throws on a
- * string), a non-numeric literal now becomes a `text` cell instead of a
+ * the text-cell fix: a non-numeric literal becomes a `text` cell instead of a
  * `[bad_argument]` rejection -- string columns finally round-trip into the grid.
  *
  * Classification (formula `=...` is handled by the caller BEFORE this):
@@ -1387,101 +1313,6 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			webviewId: req.webviewId, // megaudit: echo so a stale post-reload reply is dropped
 		});
 	}
-}
-
-// ============================================================================
-// Phase 5.7 V3.3.0.4 (2026-05-22) -- virtualization pure helpers
-// ============================================================================
-
-/**
- * **DORMANT / DEAD (FE megaudit S6 + L-f, 2026-06-03)** -- this HOST-side
- * `computeVisibleRange` has NO live caller. The live virtualization math is the
- * webview's `cellRender.computeVisibleRowRange` (which the Canvas2D renderer drives);
- * this host copy was for the retired DOM-table path. **L-f**: unlike the live
- * `computeVisibleRowRange`, this copy LACKS the shrink-clamp on `firstVisible`, so a
- * stale large `scrollTop` after the data shrinks could return an empty window -- do
- * NOT re-wire it without porting that clamp. Retained + unit-tested for reference.
- *
- * V3.3.0.4 -- compute the visible-row index range given scroll geometry.
- *
- * Per V3.3.0.1 decision D1 (custom-inline virtualization; no library).
- * Pure function -- no vscode, no `this`, no side effects.  Mocha-
- * driveable in isolation.
- *
- * Returns the half-open range `[startIdx, endIdx)` of snapshot
- * entries that should be in the DOM.  The caller renders those rows
- * + sandwiches them between top/bottom spacer rows whose heights
- * preserve the viewport's scroll geometry.
- *
- * @param scrollTop      pixels scrolled from the top of the viewport.
- *                       Webview reads from `viewport.scrollTop`.
- * @param rowHeight      pixel height of one rendered row.  V3.3.0.4
- *                       uses a constant `ROW_HEIGHT = 25` (matches
- *                       the V3.2.b `<td>` padding `4px 12px` + ~17px
- *                       text).  V3.x may make this measurement-based.
- * @param viewportHeight pixel height of the scrolling viewport.
- *                       Webview reads from `viewport.clientHeight`.
- * @param totalRows      total snapshot entries (the number of rows
- *                       the table WOULD have without virtualization).
- * @param overscan       extra rows rendered above + below the visible
- *                       window for smooth scrolling.  Default 5.
- * @returns `{ startIdx, endIdx }` -- half-open; `startIdx == endIdx == 0`
- *           when `totalRows === 0`.  Both indices are clamped to
- *           `[0, totalRows]`.
- */
-export function computeVisibleRange(
-	scrollTop: number,
-	rowHeight: number,
-	viewportHeight: number,
-	totalRows: number,
-	overscan: number = 5,
-): { startIdx: number; endIdx: number } {
-	if (totalRows === 0) {
-		return { startIdx: 0, endIdx: 0 };
-	}
-	if (rowHeight <= 0) {
-		// Defensive: a zero or negative rowHeight would div-by-zero or
-		// produce negative counts.  Render everything; the caller can
-		// still display the table (just without virtualization).
-		return { startIdx: 0, endIdx: totalRows };
-	}
-	const firstVisible = Math.max(0, Math.floor(scrollTop / rowHeight));
-	const visibleCount = Math.max(1, Math.ceil(viewportHeight / rowHeight));
-	const startIdx = Math.max(0, firstVisible - overscan);
-	const endIdx = Math.min(totalRows, firstVisible + visibleCount + overscan);
-	return { startIdx, endIdx };
-}
-
-/**
- * **DORMANT / DEAD (FE megaudit S6, 2026-06-03)** -- NO live caller. This fed the
- * retired DOM-table `cellGridHtml.ts::buildHtml` slice path; the Canvas2D renderer
- * windows rows itself (it draws directly from `snapshot.entries`, no host-side
- * pre-slice). The `data-row`/`data-original-*` attributes named below belong to the
- * dead DOM table, NOT the live canvas. Retained + unit-tested for reference.
- *
- * V3.3.0.4 -- slice a snapshot's entries to the index range
- * `[startIdx, endIdx)`.
- *
- * Pure function over snapshot data.  (Historically verified that the slice
- * preserved the V3.2.a/b/c data-row + data-col + data-original-text +
- * data-original-kind invariants the retired `cellGridHtml.ts::buildHtml` consumed.)
- *
- * Returns the sliced sub-array (NOT mutating the input).
- *
- * @param entries  the full sorted ascending `snapshot.entries`.
- * @param startIdx inclusive start index; clamped to `[0, entries.length]`.
- * @param endIdx   exclusive end index; clamped to `[startIdx, entries.length]`.
- * @returns the sub-array `entries[startIdx..endIdx)`.
- */
-export function buildVirtualRows<T>(
-	entries: ReadonlyArray<T>,
-	startIdx: number,
-	endIdx: number,
-): T[] {
-	const len = entries.length;
-	const clampedStart = Math.max(0, Math.min(startIdx, len));
-	const clampedEnd = Math.max(clampedStart, Math.min(endIdx, len));
-	return entries.slice(clampedStart, clampedEnd);
 }
 
 // ============================================================================

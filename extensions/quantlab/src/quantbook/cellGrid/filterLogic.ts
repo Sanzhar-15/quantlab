@@ -25,7 +25,7 @@
 // NOT a masking fallback (the "(Blanks)" checkbox is deferred to v1.5).
 
 import type { QuantbookCellValue } from '../types';
-import { formatCellValue } from './cellGridHtml';
+import { formatCellValue } from './cellGridValueFormat';
 
 /** The A1 grid extents (mirror gridLayoutA1; declared locally to keep this module vscode/webview-free,
  *  matching rowVisibilityLogic/sortLogic). Valid rows `[0, A1_MAX_ROWS)`, cols `[0, A1_MAX_COLS)`. */

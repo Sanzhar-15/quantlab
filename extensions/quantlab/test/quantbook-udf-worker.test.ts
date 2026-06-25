@@ -18,7 +18,6 @@
 import * as assert from 'assert';
 import * as path from 'path';
 
-import { buildHtml } from '../src/quantbook/cellGrid/cellGridHtml';
 import { attachCellDiagnostics, buildCellDiagnosticMessages } from '../src/quantbook/cellGrid/cellGridLogic';
 import { parseQuantbookError } from '../src/quantbook/session';
 import { planUdfWorkerConfig, resolveQuantbookPyDir, UDF_DEFAULT_HANDSHAKE_MS } from '../src/quantbook/udfWorker';
@@ -268,27 +267,5 @@ suite('quantbook 6.4-3d Step 5 -- UDF worker wiring', () => {
 		});
 	});
 
-	suite('buildHtml renders the diagnostic as a title= tooltip (server + client mirror)', () => {
-		const snapWithDiag: QuantbookCellSnapshot = {
-			snapshot_format_version: 1,
-			sheet: 0,
-			entries: [
-				{ row: 0, col: 1, value: { kind: 'error', value: '#CALC!' }, diagnostic: 'no Python worker configured' },
-			],
-		};
-
-		test('server-side render emits an escaped title= for a diagnostic cell, keeping the #CALC! text', () => {
-			const html = buildHtml(snapWithDiag, {});
-			assert.ok(html.includes('title="no Python worker configured"'), 'server render carries the tooltip');
-			assert.ok(html.includes('#CALC!'), 'the error sigil text is preserved');
-		});
-
-		test('client-side renderRowsClient mirror reads e.diagnostic (survives scroll repaints)', () => {
-			// The nonce path injects the client virtualization script; the audit-fix
-			// added the titleAttr mirror so the tooltip is not lost on repaint.
-			const html = buildHtml(snapWithDiag, { nonce: 'test-nonce' });
-			assert.ok(html.includes('e.diagnostic'), 'client renderRowsClient references e.diagnostic');
-			assert.ok(html.includes('titleAttr'), 'client render builds a titleAttr');
-		});
-	});
 });
+
