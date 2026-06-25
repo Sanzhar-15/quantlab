@@ -99,10 +99,21 @@ fn now_secs() -> u64 {
     if let Some(v) = TEST_NOW_OVERRIDE.with(|s| s.get()) {
         return v;
     }
+    // **NF-02 (no-fallbacks):** panic instead of silently returning 0 on a
+    // system clock that reports a time before the Unix epoch. A clock before
+    // 1970 means the host OS has a wildly wrong system time (or the clock is
+    // unset); returning 0 would make NOW()/TODAY() evaluate to 1899-12-30
+    // (Excel epoch-0) with no visible error. Panicking makes the environment
+    // problem visible immediately. The context-aware `now_ctx`/`today_ctx`
+    // path already propagates this as `ErrorValue` — this panic is only for
+    // the legacy scalar path (`now`/`today` fns) where the return type is u64.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .expect(
+            "system clock is before the Unix epoch (1970-01-01): \
+             NOW()/TODAY() cannot produce a valid date — check your system clock",
+        )
+        .as_secs()
 }
 
 /// **W5-71 (Phase 4.5.A.2):** internal helper. Given a context, return
@@ -460,5 +471,54 @@ mod tests {
             today_ctx(&[Value::Number(1.0)], &ctx),
             Value::Error(ErrorValue::Value)
         );
+    }
+
+    // ============================================================
+    // NF-02 — now_secs() panics on clock-before-epoch (no-fallback fix)
+    // ============================================================
+
+    /// Verify that the test-override path in `now_secs()` still works
+    /// correctly after the NF-02 fix. The override bypasses the
+    /// `duration_since(UNIX_EPOCH).expect(...)` path entirely, so
+    /// tests that pin the clock via `set_test_now_secs` are unaffected.
+    #[test]
+    fn nf02_now_secs_override_bypasses_real_clock() {
+        // Pin the clock to 2022-01-01 00:00:00 UTC (Unix = 1_640_908_800).
+        // Chosen because it's exactly midnight UTC: 1_640_908_800 % 86400 == 0.
+        const PINNED: u64 = 1_640_908_800; // 2022-01-01 00:00:00 UTC
+        const PINNED_DAYS: u64 = PINNED / 86_400; // 18992
+        set_test_now_secs(PINNED);
+        let v_now = now(&[]);
+        let v_today = today(&[]);
+        let expected_serial = PINNED_DAYS as f64 + 25_569.0; // 18992 + 25569 = 44561
+        assert_eq!(
+            v_today,
+            Value::Number(expected_serial),
+            "TODAY should reflect pinned clock"
+        );
+        // NOW adds the within-day fraction; at exactly midnight UTC the fraction is 0.
+        assert_eq!(PINNED % 86_400, 0, "chosen epoch second must be midnight UTC");
+        assert_eq!(v_now, v_today, "NOW == TODAY when clock is at midnight UTC");
+        clear_test_overrides();
+    }
+
+    /// Verify that `now_secs()` does not return 0 when the real system
+    /// clock is post-epoch (which it should always be on any machine
+    /// with a correctly set clock). This ensures the `expect()` path
+    /// does not fire under normal conditions.
+    #[test]
+    fn nf02_now_secs_real_clock_is_post_epoch() {
+        // Real system time on any modern machine is post-1970.
+        // `now()` should return a Number > 0 (not 0 = epoch which was the old
+        // silent-fallback behavior). The exact value is non-deterministic,
+        // but it must be strictly positive.
+        let v = now(&[]);
+        match v {
+            Value::Number(n) => {
+                // 25569.0 = 1970-01-01 in Excel serial; any post-epoch date is > this.
+                assert!(n > 25_569.0, "NOW() should return a post-epoch serial; got {n}");
+            }
+            other => panic!("NOW() should return Number, got {other:?}"),
+        }
     }
 }

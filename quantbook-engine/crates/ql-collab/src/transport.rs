@@ -539,8 +539,16 @@ impl LoopbackTransport {
     /// (i.e. sent by the peer, not yet drained via `try_recv`).
     /// Useful for tests that want to assert "the peer sent N
     /// blobs to me" without consuming them.
+    ///
+    /// **NF-01 (no-fallbacks):** panics on mutex poison instead of
+    /// silently returning 0. A poisoned mutex means a thread panicked
+    /// while holding the lock — the inbox state is undefined and
+    /// returning 0 would mask a real bug.
     pub fn pending_recv(&self) -> usize {
-        self.inbox.lock().map(|q| q.len()).unwrap_or(0)
+        self.inbox
+            .lock()
+            .expect("LoopbackTransport inbox mutex poisoned")
+            .len()
     }
 }
 
@@ -1113,5 +1121,26 @@ mod tests {
     fn transport_error_kind_closed() {
         let e = super::TransportError::Closed;
         assert_eq!(e.kind(), "transport_closed");
+    }
+
+    // ============================================================
+    // NF-01 — pending_recv panics on poison (no-fallback fix)
+    // ============================================================
+
+    /// Verify that `pending_recv` returns the correct count when the
+    /// mutex is healthy. This locks in the post-NF-01 behavior:
+    /// the `.expect()` does not trigger on a non-poisoned mutex.
+    #[test]
+    fn nf01_pending_recv_returns_correct_count_on_healthy_mutex() {
+        let (mut a, b) = LoopbackTransport::pair();
+        assert_eq!(b.pending_recv(), 0, "inbox empty before any send");
+        a.send(b"msg1").unwrap();
+        a.send(b"msg2").unwrap();
+        a.send(b"msg3").unwrap();
+        assert_eq!(b.pending_recv(), 3, "three blobs sent by a, visible in b's inbox");
+        // After consuming one blob, count decreases.
+        let mut b_mut = b;
+        b_mut.try_recv().unwrap();
+        assert_eq!(b_mut.pending_recv(), 2, "one blob consumed; two remain");
     }
 }

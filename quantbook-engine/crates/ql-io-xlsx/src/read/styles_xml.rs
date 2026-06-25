@@ -124,7 +124,7 @@ pub(crate) fn parse_styles_xml(package: &XlsxPackage) -> Result<StyleIndex, Xlsx
                 // Without this branch, every cellXf in a LibreOffice
                 // file was silently dropped from the index.
                 if tag == "xf" && element_stack.last().map(String::as_str) == Some("cellXfs") {
-                    idx.cell_xfs.push(parse_xf_attrs(&e));
+                    idx.cell_xfs.push(parse_xf_attrs(&e)?);
                 }
                 element_stack.push(tag);
             }
@@ -140,7 +140,7 @@ pub(crate) fn parse_styles_xml(package: &XlsxPackage) -> Result<StyleIndex, Xlsx
                     "xf" if element_stack.last().map(String::as_str) == Some("cellXfs") => {
                         // Only count `<xf>` elements inside `<cellXfs>`,
                         // not `<cellStyleXfs>` (named styles — out of scope).
-                        idx.cell_xfs.push(parse_xf_attrs(&e));
+                        idx.cell_xfs.push(parse_xf_attrs(&e)?);
                     }
                     _ => {}
                 }
@@ -179,7 +179,10 @@ fn parse_numfmt_attrs(e: &quick_xml::events::BytesStart) -> Option<NumFmtEntry> 
     })
 }
 
-fn parse_xf_attrs(e: &quick_xml::events::BytesStart) -> CellXf {
+/// **NF-05 (no-fallbacks):** returns `Err` if `numFmtId` is present but
+/// not a valid `u32`. Previously used `unwrap_or(0)` which silently treated
+/// a malformed id as "General" format (0), losing the user's number format.
+fn parse_xf_attrs(e: &quick_xml::events::BytesStart) -> Result<CellXf, XlsxError> {
     let mut num_fmt_id: u32 = 0;
     // **W5-D-15.1 (self-audit H-2 closure):** the OOXML schema
     // default for `applyNumberFormat` on `<cellXfs>/<xf>` is TRUE
@@ -194,16 +197,23 @@ fn parse_xf_attrs(e: &quick_xml::events::BytesStart) -> CellXf {
         let key = attr.key.as_ref();
         let val = attr.unescape_value().unwrap_or_default();
         if key == b"numFmtId" {
-            num_fmt_id = val.parse::<u32>().unwrap_or(0);
+            num_fmt_id = val.parse::<u32>().map_err(|_| XlsxError::MalformedOoxml {
+                part: "xl/styles.xml".to_string(),
+                message: format!(
+                    "<cellXfs>/<xf> numFmtId={:?} is not a valid u32; \
+                     cannot determine number format — workbook may be corrupt",
+                    val.as_ref(),
+                ),
+            })?;
         } else if key == b"applyNumberFormat" {
             // Explicit attr: "1"/"true" → apply; "0"/"false" → don't.
             apply_number_format = val == "1" || val.eq_ignore_ascii_case("true");
         }
     }
-    CellXf {
+    Ok(CellXf {
         num_fmt_id,
         apply_number_format,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -306,5 +316,52 @@ mod tests {
         let pkg = pkg_with_styles(xml);
         let idx = parse_styles_xml(&pkg).unwrap();
         assert_eq!(idx.num_fmts.len(), 0);
+    }
+
+    // ============================================================
+    // NF-05 — malformed numFmtId in <cellXfs>/<xf> errors loudly
+    // ============================================================
+
+    /// A `numFmtId` that is not a valid u32 must produce
+    /// `XlsxError::MalformedOoxml` instead of silently falling back to 0
+    /// (General format), which was the pre-NF-05 behavior.
+    #[test]
+    fn nf05_malformed_num_fmt_id_returns_error() {
+        let xml = r#"<styleSheet>
+  <cellXfs count="1">
+    <xf numFmtId="not-a-number" applyNumberFormat="1"/>
+  </cellXfs>
+</styleSheet>"#;
+        let pkg = pkg_with_styles(xml);
+        let err = parse_styles_xml(&pkg).unwrap_err();
+        match err {
+            XlsxError::MalformedOoxml { part, message } => {
+                assert_eq!(part, "xl/styles.xml");
+                assert!(
+                    message.contains("numFmtId"),
+                    "error message should mention numFmtId; got: {message}"
+                );
+                assert!(
+                    message.contains("not-a-number"),
+                    "error message should quote the bad value; got: {message}"
+                );
+            }
+            other => panic!("expected MalformedOoxml, got {other:?}"),
+        }
+    }
+
+    /// A valid `numFmtId` that happens to be at the boundary (u32::MAX - 1)
+    /// must NOT error — only genuinely non-numeric values fail.
+    #[test]
+    fn nf05_valid_large_num_fmt_id_is_accepted() {
+        let xml = r#"<styleSheet>
+  <cellXfs count="1">
+    <xf numFmtId="4294967294" applyNumberFormat="1"/>
+  </cellXfs>
+</styleSheet>"#;
+        let pkg = pkg_with_styles(xml);
+        let idx = parse_styles_xml(&pkg).unwrap();
+        assert_eq!(idx.cell_xfs.len(), 1);
+        assert_eq!(idx.cell_xfs[0].num_fmt_id, 4_294_967_294u32);
     }
 }

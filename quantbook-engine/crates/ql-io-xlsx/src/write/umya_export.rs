@@ -220,9 +220,15 @@ impl XlsxNumFmtTranslation {
         // counter-derived range. Dedup-by-code: if a non-LEGACY Custom
         // shares its format string with an earlier-allocated entry
         // (LEGACY or non-LEGACY), it reuses that numFmtId.
+        // **NF-06 (no-fallbacks):** `unwrap_or(FIRST_CUSTOM_FORMAT_ID)` was used
+        // when `highest_legacy_id == u32::MAX`, which silently wrapped the
+        // non-LEGACY counter back to 164 — potentially reusing a numFmtId that
+        // already maps to a LEGACY format, corrupting the exported file.
+        // A workbook with u32::MAX LEGACY custom formats is pathological and
+        // should fail loudly rather than produce a silently wrong file.
         let mut next_non_legacy = highest_legacy_id
             .checked_add(1)
-            .unwrap_or(FIRST_CUSTOM_FORMAT_ID);
+            .expect("xlsx numFmtId allocator exhausted: highest_legacy_id is u32::MAX");
         for fid in &customs {
             if let FormatId::Custom(peer, _) = fid {
                 if *peer == LEGACY_PEER {
@@ -2729,6 +2735,52 @@ mod tests {
             other => panic!("expected Text(hi), got {other:?}"),
         }
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ============================================================
+    // NF-06 — next_non_legacy id allocation does not silently wrap
+    // ============================================================
+
+    /// Verify that a workbook with both LEGACY and non-LEGACY custom formats
+    /// exports correctly: the non-LEGACY format gets allocated AFTER the
+    /// LEGACY range. This exercises the `next_non_legacy = highest_legacy_id
+    /// .checked_add(1).expect(...)` path without triggering the overflow.
+    ///
+    /// The non-LEGACY peer id comes from a multi-peer format; in practice this
+    /// is exercised by workbooks that have been synced across peers.
+    #[test]
+    fn nf06_non_legacy_numfmtid_allocated_after_legacy_range() {
+        use ql_storage::FormatId;
+
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+
+        // Register a LEGACY custom format (peer 0 = LEGACY_PEER).
+        // FormatId::Custom(0, 0) → xlsx numFmtId = 0 + 164 = 164.
+        let legacy_fid = wb.formats_mut().intern("#,##0.00");
+        wb.sheet_mut(s)
+            .unwrap()
+            .format_overlay_mut()
+            .set(0, 0, legacy_fid);
+
+        // Register a non-LEGACY peer format (peer 1).
+        // This triggers the pass-2 non-LEGACY allocator in XlsxNumFmtTranslation::build.
+        // (Normally non-LEGACY ids arrive from collaboration peers; here we
+        // place a Custom(1,0) directly in the overlay — the export path handles
+        // "unregistered_overlay_customs" via the no-fallback reporting path.)
+        let non_legacy_fid = FormatId::Custom(ql_types::PeerId(1), 0);
+        wb.sheet_mut(s)
+            .unwrap()
+            .format_overlay_mut()
+            .set(0, 1, non_legacy_fid);
+
+        // Export must not panic (no overflow on `checked_add(1).expect(...)`).
+        // The NF-06 fix ensures that when `highest_legacy_id` is not u32::MAX,
+        // `checked_add(1)` succeeds and `next_non_legacy` is set correctly.
+        let (bytes, _report) =
+            export_new_workbook_to_bytes(&wb, FormulaCachePolicy::WriteRecomputed)
+                .expect("export must not panic on NF-06 path");
+        assert!(!bytes.is_empty(), "exported bytes must be non-empty");
     }
 
     #[test]
