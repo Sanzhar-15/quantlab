@@ -31,7 +31,7 @@
 
 use crate::ast::{CellAddr, Expr, RangeRef, SheetRef};
 use crate::token::{AxisSpec, Operator};
-use ql_types::{Locale, ReferenceMode, MAX_COLUMN, MAX_ROW};
+use ql_types::{Locale, ReferenceMode, SheetId, MAX_COLUMN, MAX_ROW};
 
 /// **W5-141 (Phase 4.9.D):** printer-side anchor cell. Required for
 /// emitting `R[<offset>]C[<offset>]` from relative `Expr::R1C1Ref` or
@@ -74,6 +74,25 @@ pub enum PrintError {
     /// arm catches direct AST construction.
     #[error("R1C1 axis out of range: {context}")]
     R1C1AxisOutOfRange { context: &'static str },
+
+    /// **COR-04 / TA4 (w133):** a `SheetRef::Id(_)` reached the printer.
+    /// `print`/`print_with` are pre-bind-only by contract (the bound id
+    /// has no associated name string at the AST level), so a post-bind
+    /// AST cannot be emitted without a resolver. Previously this PANICKED
+    /// in `print_sheet_prefix`, which crashes the whole process when an
+    /// FFI caller prints an unvalidated bound AST. Now it surfaces as a
+    /// LOUD, recoverable error (no-fallbacks: a panic is replaced by a
+    /// visible error, not a silent default). The resolver-aware
+    /// `print_with_resolver(expr, &workbook)` API remains the Phase 4.6.E
+    /// follow-up (docs/known-gaps.md GAP-B-08).
+    #[error(
+        "SheetRef::Id({0}) reached the printer, but print()/print_with() are pre-bind-only \
+         by contract: the bound id has no associated name string at the AST level. \
+         A resolver-aware print_with_resolver(expr, &workbook) API is the GAP-B-08 follow-up. \
+         To round-trip a bound expression, re-parse from text instead — the binder does NOT \
+         round-trip back through the printer."
+    )]
+    UnresolvedSheetId(SheetId),
 }
 
 /// **W5-141 (Phase 4.9.D):** internal printer context. Threads
@@ -92,17 +111,20 @@ struct PrintCtx {
 /// Print an `Expr` to its A1-canonical string form.
 ///
 /// **W5-141 (Phase 4.9.D):** this is now a back-compat shim over
-/// [`print_with`]. The shim is infallible because A1+EnUs+no-site is
-/// guaranteed to succeed for every AST that originates from an A1
-/// parse. The single exception — `Expr::R1C1Ref` with at least one
-/// `Rel(_)` axis — surfaces as a panic via `.expect`. Callers that
-/// might handle R1C1 forms should call [`print_with`] directly to
-/// get a `Result`.
+/// [`print_with`]. The shim is infallible for every AST that originates
+/// from an A1 parse. It panics only on an AST that cannot be printed in
+/// A1+EnUs+no-site form: an `Expr::R1C1Ref` with a relative axis (needs a
+/// `FormulaSite`), or a bound-but-unlowered `SheetRef::Id` (COR-04).
+/// Callers that might hold such forms should call [`print_with`] directly
+/// to get a `Result`.
 pub fn print(expr: &Expr) -> String {
-    print_with(expr, ReferenceMode::A1, Locale::EnUs, None).expect(
-        "print(): A1+EnUs with no FormulaSite cannot emit relative R1C1 references; \
-         call print_with(.., R1C1, _, Some(site)) instead",
-    )
+    match print_with(expr, ReferenceMode::A1, Locale::EnUs, None) {
+        Ok(s) => s,
+        // Surface the real PrintError — it names the actual cause (a relative
+        // R1C1 ref needing a site, or an unresolved SheetRef::Id) — instead of
+        // a fixed R1C1-only message that misleads on the SheetRef::Id path.
+        Err(e) => panic!("print(): {e}"),
+    }
 }
 
 /// **W5-141 (Phase 4.9.D):** mode- and locale-aware printer.
@@ -156,7 +178,7 @@ fn print_cell_addr_ctx(
     ctx: &PrintCtx,
     out: &mut String,
 ) -> Result<(), PrintError> {
-    print_sheet_prefix(&addr.sheet, ctx.mode, out);
+    print_sheet_prefix(&addr.sheet, ctx.mode, out)?;
     match ctx.mode {
         ReferenceMode::A1 => {
             if addr.abs_col {
@@ -321,35 +343,37 @@ fn axis_spec_to_absolute_coord(
 /// `SheetRef::Id(_)` would require resolving the id back to a name,
 /// which means threading workbook context through the printer. That
 /// resolver-aware variant is a Phase 4.6.E follow-up polish item
-/// tracked in `docs/known-gaps.md` (GAP-X-01). Until then, calling
-/// `print` on a post-bind AST is a programmer error and panics with
-/// the specific id so the call site is obvious.
+/// tracked in `docs/known-gaps.md` (GAP-B-08).
+///
+/// **COR-04 / TA4 (w133):** calling `print` on a post-bind AST is a
+/// programmer error, but it must NOT panic — an FFI caller printing an
+/// unvalidated bound AST would crash the whole process. Instead we
+/// surface [`PrintError::UnresolvedSheetId`] so the error is LOUD and
+/// recoverable at the FFI boundary (no-fallbacks: a panic is replaced by
+/// a visible error, not a silent default). All in-crate call sites
+/// already return `Result<(), PrintError>` and propagate via `?`.
 ///
 /// **W5-93 (Phase 4.6.E closure):** Codex MEDIUM and Sonnet MEDIUM
-/// converged on this finding. Closure stance: keep the panic (no-
-/// fallbacks rule), improve the message, document the contract.
-/// The current `rewrite_sheet_name_in_expr` path walks pre-bind
-/// ASTs only, so the panic isn't reachable through any production
-/// code path today.
-fn print_sheet_prefix(sheet: &SheetRef, mode: ReferenceMode, out: &mut String) {
+/// converged on this finding. The current `rewrite_sheet_name_in_expr`
+/// path walks pre-bind ASTs only, so the `Id` arm isn't reachable
+/// through any production round-trip code path today; the change only
+/// affects synthetic / direct-AST-construction / FFI callers.
+fn print_sheet_prefix(
+    sheet: &SheetRef,
+    mode: ReferenceMode,
+    out: &mut String,
+) -> Result<(), PrintError> {
     match sheet {
-        SheetRef::Current => {}
+        SheetRef::Current => Ok(()),
         SheetRef::Name(name) => {
             // `mode` is needed because the unquoted-name SET is mode-dependent: in R1C1 mode an
             // `R1C1`-shaped name would be (mis)lexed as a reference, so it must be quoted (see
             // print_sheet_name). The `!` separator glyph itself is mode-agnostic.
             print_sheet_name(name, mode, out);
             out.push('!');
+            Ok(())
         }
-        SheetRef::Id(id) => panic!(
-            "ql_formula_syntax::print: SheetRef::Id({id}) reached the printer, \
-             but print() is pre-bind-only by contract (see fn doc comment). \
-             The bound id has no associated name string at the AST level; a \
-             resolver-aware print_with_resolver(expr, &workbook) API is \
-             tracked as Phase 4.6.E follow-up. If you're trying to round-trip \
-             a bound expression, re-parse from text instead — the binder \
-             does NOT round-trip back through the printer."
-        ),
+        SheetRef::Id(id) => Err(PrintError::UnresolvedSheetId(*id)),
     }
 }
 
@@ -423,7 +447,7 @@ fn print_range_ctx(r: &RangeRef, ctx: &PrintCtx, out: &mut String) -> Result<(),
             abs_end_row,
         } => {
             // Sheet prefix applies to the WHOLE range; emit once.
-            print_sheet_prefix(sheet, ctx.mode, out);
+            print_sheet_prefix(sheet, ctx.mode, out)?;
             // Both endpoints get SheetRef::Current so the inner cell
             // print doesn't double the sheet prefix.
             let start = CellAddr {
@@ -452,7 +476,7 @@ fn print_range_ctx(r: &RangeRef, ctx: &PrintCtx, out: &mut String) -> Result<(),
             abs_start,
             abs_end,
         } => {
-            print_sheet_prefix(sheet, ctx.mode, out);
+            print_sheet_prefix(sheet, ctx.mode, out)?;
             match ctx.mode {
                 ReferenceMode::A1 => {
                     if *abs_start {
@@ -492,7 +516,7 @@ fn print_range_ctx(r: &RangeRef, ctx: &PrintCtx, out: &mut String) -> Result<(),
             abs_start,
             abs_end,
         } => {
-            print_sheet_prefix(sheet, ctx.mode, out);
+            print_sheet_prefix(sheet, ctx.mode, out)?;
             match ctx.mode {
                 ReferenceMode::A1 => {
                     if *abs_start {
@@ -534,7 +558,7 @@ fn print_range_ctx(r: &RangeRef, ctx: &PrintCtx, out: &mut String) -> Result<(),
             end_row,
             end_col,
         } => {
-            print_sheet_prefix(sheet, ctx.mode, out);
+            print_sheet_prefix(sheet, ctx.mode, out)?;
             match ctx.mode {
                 ReferenceMode::R1C1 => {
                     emit_r1c1_axis_from_spec(*start_row, 'R', out);
@@ -821,7 +845,7 @@ fn print_expr_ctx(
             row_axis,
             col_axis,
         } => {
-            print_sheet_prefix(sheet, ctx.mode, out);
+            print_sheet_prefix(sheet, ctx.mode, out)?;
             match ctx.mode {
                 ReferenceMode::R1C1 => {
                     emit_r1c1_axis_from_spec(*row_axis, 'R', out);
@@ -1378,6 +1402,66 @@ mod tests {
             abs_row: false,
         });
         assert_eq!(print(&e), "'.foo'!A1");
+    }
+
+    // ===== COR-04 / TA4 (w133): bound-AST printing must NOT panic =====
+
+    /// **COR-04 / TA4 (w133).** Printing a `SheetRef::Id(_)` (post-bind /
+    /// FFI-supplied AST) must surface a LOUD, recoverable error rather
+    /// than panicking and aborting the process. `print_with` returns
+    /// `Err(PrintError::UnresolvedSheetId(id))`; the infallible `print`
+    /// shim turns that into a panic via `.expect`, but `print_with` — the
+    /// API an FFI layer should call — is recoverable. Built via direct AST
+    /// because the lexer/binder never produce `SheetRef::Id` at the source.
+    #[test]
+    fn print_with_sheet_id_returns_loud_recoverable_error() {
+        let e = Expr::CellRef(CellAddr {
+            sheet: SheetRef::Id(7),
+            col: 0,
+            row: 0,
+            abs_col: false,
+            abs_row: false,
+        });
+        let err = print_with(&e, ReferenceMode::A1, Locale::EnUs, None)
+            .expect_err("printing SheetRef::Id must be a recoverable Err, not a panic");
+        assert_eq!(err, PrintError::UnresolvedSheetId(7));
+        // The message must name the offending id so the call site is obvious.
+        assert!(
+            err.to_string().contains("SheetRef::Id(7)"),
+            "error message should name the id: {err}"
+        );
+    }
+
+    /// **COR-04 / TA4 (w133).** A `SheetRef::Id` nested inside a larger
+    /// expression (here a range endpoint via a binary op) also surfaces
+    /// the error through `?`-propagation rather than panicking.
+    #[test]
+    fn print_with_nested_sheet_id_propagates_error() {
+        let inner = Expr::CellRef(CellAddr {
+            sheet: SheetRef::Id(3),
+            col: 1,
+            row: 1,
+            abs_col: false,
+            abs_row: false,
+        });
+        let e = Expr::Binary {
+            op: Operator::Plus,
+            lhs: Box::new(Expr::Number(1.0)),
+            rhs: Box::new(inner),
+        };
+        let err = print_with(&e, ReferenceMode::A1, Locale::EnUs, None)
+            .expect_err("nested SheetRef::Id must propagate as Err");
+        assert_eq!(err, PrintError::UnresolvedSheetId(3));
+    }
+
+    /// **COR-04 / TA4 (w133).** Regression guard: valid pre-bind printing
+    /// (`Current` and `Name`) stays byte-identical — the panic→error
+    /// change only affects the `Id` arm.
+    #[test]
+    fn print_valid_sheet_refs_unchanged_after_id_error_fix() {
+        assert_eq!(rt("A1"), "A1");
+        assert_eq!(rt("Sheet1!A1"), "Sheet1!A1");
+        assert_eq!(rt("'a b'!A1"), "'a b'!A1");
     }
 
     #[test]
