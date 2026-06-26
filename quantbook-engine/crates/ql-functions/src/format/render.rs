@@ -14,7 +14,8 @@
 //! this module accepts the parsed AST as well-formed.
 
 use ql_types::{
-    fraction_to_hms, serial_to_ymd, unix_days_to_ymd, DateSystem, ErrorValue, EvalContext, Value,
+    fraction_to_hms, serial_to_ymd, unix_days_to_ymd, DateSystem, ErrorValue, EvalContext, Locale,
+    Value,
 };
 
 use super::ast::{
@@ -84,9 +85,9 @@ fn routing_index_for_number(v: f64, n_sections: usize) -> usize {
 fn render_section(value: &Value, section: &Section, ctx: &EvalContext, auto_minus: bool) -> String {
     match section.kind {
         SectionKind::Empty => String::new(),
-        SectionKind::General => render_general(value),
-        SectionKind::Text => render_text_section(value, section),
-        SectionKind::Number => render_number_section_inner(value, section, auto_minus),
+        SectionKind::General => render_general(value, ctx),
+        SectionKind::Text => render_text_section(value, section, ctx),
+        SectionKind::Number => render_number_section_inner(value, section, auto_minus, ctx),
         SectionKind::Date => render_date_section(value, section, ctx),
     }
 }
@@ -95,9 +96,9 @@ fn render_section(value: &Value, section: &Section, ctx: &EvalContext, auto_minu
 // General
 // ============================================================================
 
-fn render_general(value: &Value) -> String {
+fn render_general(value: &Value, ctx: &EvalContext) -> String {
     match value {
-        Value::Number(n) => render_general_number(*n),
+        Value::Number(n) => render_general_number(*n, ctx.locale),
         Value::Boolean(true) => "TRUE".to_string(),
         Value::Boolean(false) => "FALSE".to_string(),
         Value::Text(s) => s.as_ref().to_string(),
@@ -109,15 +110,56 @@ fn render_general(value: &Value) -> String {
 /// Excel "General" number rendering: trim trailing zeros, use scientific
 /// notation only at extremes. V1 keeps it simple — `f64::to_string` plus
 /// a thin post-processor.
-fn render_general_number(n: f64) -> String {
+///
+/// **COR-03:** General is the format of every UNFORMATTED cell, so it must
+/// honour the locale's decimal glyph too (the common case). General never
+/// groups thousands, so only the decimal point is localised.
+fn render_general_number(n: f64, locale: Locale) -> String {
     if n == n.trunc() && n.abs() < 1e15 {
-        // Render integer-valued numbers without a decimal point.
+        // Render integer-valued numbers without a decimal point (no glyph to
+        // localise).
         return format!("{}", n as i64);
     }
     // f64::to_string gives a shortest round-trip representation; Excel's
-    // General is slightly different but close enough for V1.
+    // General is slightly different but close enough for V1. Rust always emits
+    // ASCII `.` as the decimal point (and there is at most one), so swap it for
+    // the locale decimal glyph.
     let s = format!("{n}");
-    s
+    let dec = locale_decimal_sep(locale);
+    if dec == '.' {
+        s
+    } else {
+        s.replace('.', &dec.to_string())
+    }
+}
+
+// ============================================================================
+// Locale separator helpers
+// ============================================================================
+
+/// Decimal separator for number rendering.
+///
+/// Inlined here (mirroring `scalar_fns::locale_decimal_separator`) so
+/// `ql-functions::format` stays independent of `ql-formula-syntax`.
+/// EnUs = `.`, De/Fr = `,`.
+fn locale_decimal_sep(locale: Locale) -> char {
+    match locale {
+        Locale::EnUs => '.',
+        Locale::De | Locale::Fr => ',',
+    }
+}
+
+/// Thousands (group) separator for number rendering.
+///
+/// EnUs = `,`, De = `.`, Fr = `\u{0020}` (ASCII space — NBSP would be more
+/// faithful to Office fr-FR, but a regular space is what the FIXED/DOLLAR
+/// functions emit, so this keeps the output consistent).
+fn locale_thousands_sep(locale: Locale) -> char {
+    match locale {
+        Locale::EnUs => ',',
+        Locale::De => '.',
+        Locale::Fr => '\u{0020}',
+    }
 }
 
 // ============================================================================
@@ -198,13 +240,14 @@ fn render_number_section_inner(
     value: &Value,
     section: &Section,
     emit_leading_minus: bool,
+    ctx: &EvalContext,
 ) -> String {
     let n = match value {
         Value::Number(n) => *n,
         Value::Boolean(true) => 1.0,
         Value::Boolean(false) => 0.0,
         Value::Blank => 0.0,
-        Value::Text(_) => return render_text_section(value, section),
+        Value::Text(_) => return render_text_section(value, section, ctx),
         Value::Error(_) => return String::new(),
     };
     let shape = extract_number_shape(&section.tokens);
@@ -214,11 +257,14 @@ fn render_number_section_inner(
     let is_negative = scaled < 0.0;
     let abs = scaled.abs();
 
+    let decimal_sep = locale_decimal_sep(ctx.locale);
+    let thousands_sep = locale_thousands_sep(ctx.locale);
+
     // Build integer + decimal + exponent strings.
     let (int_str, dec_str, exp_str) = if shape.is_scientific {
         render_scientific_parts(abs, &shape)
     } else {
-        render_fixed_parts(abs, &shape)
+        render_fixed_parts(abs, &shape, thousands_sep)
     };
 
     // Weave the digit string + literals + currency back together.
@@ -229,6 +275,7 @@ fn render_number_section_inner(
         exp_str.as_deref(),
         is_negative && emit_leading_minus,
         &shape,
+        decimal_sep,
     )
 }
 
@@ -246,9 +293,18 @@ fn apply_scale(n: f64, s: &NumberShape) -> f64 {
 /// Render a fixed-point (non-scientific) value to `(integer_string,
 /// decimal_string)` per the section shape. `decimal_string` is empty if
 /// the section has no decimal digit tokens.
-fn render_fixed_parts(abs: f64, s: &NumberShape) -> (String, String, Option<String>) {
+///
+/// `thousands_sep` is the locale-appropriate group separator character
+/// (`,` for EnUs, `.` for De, ` ` for Fr).  The decimal point used by
+/// Rust's `format!` macro is always ASCII `.`; we split on that to obtain
+/// the raw integer + fractional digit strings. The locale decimal glyph is
+/// injected later by `weave_number` when it processes `SectionToken::DecimalPoint`.
+fn render_fixed_parts(abs: f64, s: &NumberShape, thousands_sep: char) -> (String, String, Option<String>) {
     let dec_count = s.dec_total_count as usize;
     // Round to dec_count places via format!.
+    // Rust's format! always emits `.` as the decimal glyph regardless of
+    // locale, so we always split on `.` here. The locale glyph is applied
+    // in `weave_number` for `SectionToken::DecimalPoint`.
     let rendered = if dec_count == 0 {
         format!("{}", abs.round() as u128)
     } else {
@@ -260,7 +316,7 @@ fn render_fixed_parts(abs: f64, s: &NumberShape) -> (String, String, Option<Stri
     };
     let int_padded = pad_integer(&int_part, s.int_zero_count, s.int_question_count);
     let int_thousands = if s.has_thousands {
-        insert_thousands(&int_padded)
+        insert_thousands(&int_padded, thousands_sep)
     } else {
         int_padded
     };
@@ -333,8 +389,14 @@ fn pad_decimal(dec_str: &str, zero_count: u32, question_count: u32) -> String {
     out
 }
 
-fn insert_thousands(int_str: &str) -> String {
-    // Walk from the right, inserting "," every 3 digits. Preserve leading
+/// Insert the locale's group separator into an integer string every 3 digits
+/// from the right. Preserves any leading padding (spaces / zeros) before the
+/// digit run.
+///
+/// `sep` is the locale-appropriate thousands separator (`','` for EnUs,
+/// `'.'` for De, `' '` for Fr).
+fn insert_thousands(int_str: &str, sep: char) -> String {
+    // Walk from the right, inserting `sep` every 3 digits. Preserve leading
     // sign-or-space content by only inserting between digits.
     let mut chars: Vec<char> = int_str.chars().rev().collect();
     let mut out = String::with_capacity(chars.len() + chars.len() / 3);
@@ -372,7 +434,7 @@ fn insert_thousands(int_str: &str) -> String {
     for (offset, c) in int_chars.iter().enumerate() {
         let from_right = digit_count - offset;
         if offset > 0 && from_right % 3 == 0 {
-            rebuilt.push(',');
+            rebuilt.push(sep);
         }
         rebuilt.push(*c);
     }
@@ -385,6 +447,11 @@ fn insert_thousands(int_str: &str) -> String {
 
 /// Walk the section tokens and assemble the final string by interleaving
 /// literals with the pre-computed digit pieces.
+///
+/// `decimal_sep` is the locale-appropriate decimal point character
+/// (`.` for EnUs, `,` for De/Fr). It is used when emitting
+/// `SectionToken::DecimalPoint` tokens so the rendered string uses the
+/// configured locale's glyph instead of a hardcoded `.`.
 fn weave_number(
     section: &Section,
     int_str: &str,
@@ -392,6 +459,7 @@ fn weave_number(
     exp_str: Option<&str>,
     is_negative: bool,
     shape: &NumberShape,
+    decimal_sep: char,
 ) -> String {
     let mut out = String::new();
     // For 1-section formats with negative values, Excel-canon prepends "-".
@@ -459,7 +527,7 @@ fn weave_number(
                     }
                 }
             },
-            SectionToken::DecimalPoint => out.push('.'),
+            SectionToken::DecimalPoint => out.push(decimal_sep),
             SectionToken::ThousandsSeparator => {
                 // Already woven into int_str via `insert_thousands`; skip.
             }
@@ -522,7 +590,7 @@ fn render_date_section(value: &Value, section: &Section, ctx: &EvalContext) -> S
         Value::Boolean(true) => 1.0,
         Value::Boolean(false) => 0.0,
         Value::Blank => 0.0,
-        Value::Text(_) => return render_text_section(value, section),
+        Value::Text(_) => return render_text_section(value, section, ctx),
         Value::Error(_) => return String::new(),
     };
     if serial < 0.0 {
@@ -713,10 +781,12 @@ fn weekday_name(dow_sun_zero: u32, full: bool) -> &'static str {
 // Text section
 // ============================================================================
 
-fn render_text_section(value: &Value, section: &Section) -> String {
+fn render_text_section(value: &Value, section: &Section, ctx: &EvalContext) -> String {
     let text_body = match value {
         Value::Text(s) => s.as_ref().to_string(),
-        Value::Number(n) => render_general_number(*n),
+        // A number shown through an `@` text format renders as General — keep it
+        // locale-consistent with the General path (COR-03).
+        Value::Number(n) => render_general_number(*n, ctx.locale),
         Value::Boolean(true) => "TRUE".to_string(),
         Value::Boolean(false) => "FALSE".to_string(),
         Value::Blank => String::new(),
@@ -752,9 +822,17 @@ fn error_sigil(e: ErrorValue) -> &'static str {
 mod tests {
     use super::*;
     use crate::format::parse;
+    use ql_types::Locale;
 
     fn ctx_1900() -> EvalContext {
         EvalContext::default()
+    }
+
+    fn ctx_locale(locale: Locale) -> EvalContext {
+        EvalContext {
+            locale,
+            ..EvalContext::default()
+        }
     }
 
     fn render_str(value: &Value, fmt_str: &str) -> String {
@@ -764,6 +842,11 @@ mod tests {
 
     fn render_num(n: f64, fmt: &str) -> String {
         render_str(&Value::Number(n), fmt)
+    }
+
+    fn render_num_locale(n: f64, fmt: &str, locale: Locale) -> String {
+        let fmt_parsed = parse(fmt).expect("valid format");
+        render(&Value::Number(n), &fmt_parsed, &ctx_locale(locale))
     }
 
     // ===== General =====
@@ -1140,5 +1223,64 @@ mod tests {
     #[test]
     fn builtin_id_49_text_passthrough() {
         assert_eq!(render_str(&Value::text("foo"), "@"), "foo");
+    }
+
+    // ===== Locale-aware number rendering (COR-03 / TA3) =====
+
+    /// De locale: `,` decimal, `.` thousands — e.g. 1234.56 → "1.234,56".
+    #[test]
+    fn locale_de_decimal_comma_thousands_dot() {
+        // "#,##0.00" format: the DecimalPoint token should emit `,`
+        // and the ThousandsSeparator should emit `.` under Locale::De.
+        assert_eq!(
+            render_num_locale(1234.56, "#,##0.00", Locale::De),
+            "1.234,56"
+        );
+    }
+
+    /// Fr locale: `,` decimal, ` ` (space) thousands.
+    #[test]
+    fn locale_fr_decimal_comma_thousands_space() {
+        assert_eq!(
+            render_num_locale(1234.56, "#,##0.00", Locale::Fr),
+            "1 234,56"
+        );
+    }
+
+    /// EnUs locale remains byte-identical (regression guard).
+    #[test]
+    fn locale_enus_decimal_dot_thousands_comma_unchanged() {
+        assert_eq!(
+            render_num_locale(1234.56, "#,##0.00", Locale::EnUs),
+            "1,234.56"
+        );
+    }
+
+    /// De locale: no thousands separator, just decimal swap.
+    #[test]
+    fn locale_de_no_thousands_decimal_only() {
+        assert_eq!(render_num_locale(3.14, "0.00", Locale::De), "3,14");
+    }
+
+    /// EnUs locale decimal-only unchanged (regression guard).
+    #[test]
+    fn locale_enus_no_thousands_decimal_dot_unchanged() {
+        assert_eq!(render_num_locale(3.14, "0.00", Locale::EnUs), "3.14");
+    }
+
+    /// COR-03 (Codex fold): General — the format of every UNFORMATTED cell, the
+    /// common case — must localise the decimal glyph too. General never groups
+    /// thousands; integers have no glyph to localise; EnUs is byte-identical.
+    #[test]
+    fn locale_general_number_localises_decimal() {
+        assert_eq!(render_general_number(1234.56, Locale::De), "1234,56");
+        assert_eq!(render_general_number(1234.56, Locale::Fr), "1234,56");
+        assert_eq!(render_general_number(1234.56, Locale::EnUs), "1234.56");
+        // General never groups thousands (only the decimal glyph is localised).
+        assert_eq!(render_general_number(1234567.5, Locale::De), "1234567,5");
+        // Integer-valued: rendered without a decimal point.
+        assert_eq!(render_general_number(1234.0, Locale::De), "1234");
+        // EnUs regression: unchanged.
+        assert_eq!(render_general_number(3.14, Locale::EnUs), "3.14");
     }
 }
