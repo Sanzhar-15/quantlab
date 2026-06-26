@@ -237,6 +237,19 @@ pub enum SheetRef {
     Id(SheetId),
 }
 
+/// **COR-04 / TA4 (w133):** returned by [`SheetRef::try_resolve_or`] when an
+/// unresolved `SheetRef::Name` reaches a layer that requires a resolved sheet
+/// id. Lets a caller (notably across the FFI boundary) recover from an
+/// unvalidated bound AST instead of crashing the process. The infallible
+/// [`SheetRef::resolve_or`] keeps its panic-on-`Name` contract for in-engine
+/// callers (calcgraph/stripes) that treat a resolved id as an invariant.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "unresolved SheetRef::Name({0:?}) at a layer that requires a resolved sheet id — \
+     must go through the binder first"
+)]
+pub struct UnresolvedSheetName(pub Arc<str>);
+
 impl SheetRef {
     /// Backwards-compat helper for the Phase 4.6.A migration: the
     /// historical `Option<SheetId>::None` value maps to `Current`,
@@ -256,14 +269,35 @@ impl SheetRef {
     /// parse code path should have resolved it through the binder
     /// before reaching layers that call this method (calcgraph,
     /// stripes, etc.).
+    ///
+    /// **COR-04 / TA4 (w133):** the in-engine calcgraph/stripes callers
+    /// treat a resolved id as an invariant, so this stays infallible and
+    /// LOUD (panic) for them. Callers that may hold an unvalidated bound
+    /// AST — notably across the FFI boundary — should call the recoverable
+    /// [`SheetRef::try_resolve_or`] instead of risking a process crash.
+    /// The single source of truth for the resolution is `try_resolve_or`;
+    /// this wrapper panics with the same message on the unresolved-`Name`
+    /// path.
     pub fn resolve_or(&self, owning_sheet: SheetId) -> SheetId {
+        self.try_resolve_or(owning_sheet)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// **COR-04 / TA4 (w133):** recoverable sibling of [`resolve_or`].
+    /// Resolves `Current`/`Id` to a concrete [`SheetId`]; returns
+    /// `Err(UnresolvedSheetName)` instead of panicking when an
+    /// unresolved `SheetRef::Name` is reached. This makes the
+    /// unresolved-`Name` path a LOUD, recoverable error at layers (e.g.
+    /// the FFI boundary) where printing/handling an unvalidated bound AST
+    /// must not abort the process. No-fallbacks aligned: the error is
+    /// surfaced, not silently defaulted.
+    ///
+    /// [`resolve_or`]: SheetRef::resolve_or
+    pub fn try_resolve_or(&self, owning_sheet: SheetId) -> Result<SheetId, UnresolvedSheetName> {
         match self {
-            SheetRef::Current => owning_sheet,
-            SheetRef::Id(s) => *s,
-            SheetRef::Name(name) => panic!(
-                "unresolved SheetRef::Name({name:?}) at a layer that requires \
-                 a resolved sheet id — must go through the binder first"
-            ),
+            SheetRef::Current => Ok(owning_sheet),
+            SheetRef::Id(s) => Ok(*s),
+            SheetRef::Name(name) => Err(UnresolvedSheetName(Arc::clone(name))),
         }
     }
 
@@ -1624,5 +1658,47 @@ mod tests {
             }
             other => panic!("expected StructuredRef, got {other:?}"),
         }
+    }
+
+    // ===== COR-04 / TA4 (w133): SheetRef::resolve_or loudness =====
+
+    #[test]
+    fn try_resolve_or_resolves_current_and_id() {
+        assert_eq!(SheetRef::Current.try_resolve_or(9), Ok(9));
+        assert_eq!(SheetRef::Id(3).try_resolve_or(9), Ok(3));
+    }
+
+    /// **COR-04 / TA4 (w133).** The unresolved-`Name` path is LOUD and
+    /// RECOVERABLE through `try_resolve_or` — it returns `Err`, naming the
+    /// offending sheet name, instead of aborting the process. This is the
+    /// no-fallbacks-aligned variant FFI callers should use on an
+    /// unvalidated bound AST.
+    #[test]
+    fn try_resolve_or_name_is_loud_recoverable_error() {
+        let r = SheetRef::Name(Arc::from("Sheet2"));
+        let err = r
+            .try_resolve_or(0)
+            .expect_err("unresolved Name must be a recoverable Err, not a panic");
+        assert_eq!(err, UnresolvedSheetName(Arc::from("Sheet2")));
+        assert!(
+            err.to_string().contains("Sheet2"),
+            "error message should name the unresolved sheet: {err}"
+        );
+    }
+
+    /// **COR-04 / TA4 (w133).** The infallible `resolve_or` keeps its
+    /// panic-on-`Name` contract (calcgraph/stripes treat a resolved id as
+    /// an invariant) — verified loud-by-panic here.
+    #[test]
+    #[should_panic(expected = "unresolved SheetRef::Name")]
+    fn resolve_or_name_still_panics_for_invariant_callers() {
+        let r = SheetRef::Name(Arc::from("Sheet2"));
+        let _ = r.resolve_or(0);
+    }
+
+    #[test]
+    fn resolve_or_resolves_current_and_id_unchanged() {
+        assert_eq!(SheetRef::Current.resolve_or(9), 9);
+        assert_eq!(SheetRef::Id(3).resolve_or(9), 3);
     }
 }
