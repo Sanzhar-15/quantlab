@@ -801,7 +801,17 @@ pub(crate) fn export_new_workbook_to_bytes(
     // sheet first touched an entry.
     let mut appearances: std::collections::BTreeSet<(Option<FormatId>, Option<StyleId>)> =
         std::collections::BTreeSet::new();
-    for sheet_id in 0..workbook.sheet_count() as u16 {
+    // **F3 (No-Fallbacks):** `sheet_count() as u16` silently truncates if the
+    // workbook ever holds > u16::MAX sheets (the SheetId field width). Convert
+    // loudly so a sheet-count overflow surfaces as an export error instead of
+    // a truncated iteration bound that skips sheets.
+    let sheet_count_u16 = u16::try_from(workbook.sheet_count()).map_err(|_| {
+        XlsxError::Export(format!(
+            "sheet count {} exceeds u16 SheetId range",
+            workbook.sheet_count()
+        ))
+    })?;
+    for sheet_id in 0..sheet_count_u16 {
         if let Some(sheet) = workbook.sheet(sheet_id) {
             for ((row, col), fid) in sheet.format_overlay().iter() {
                 appearances.insert((Some(fid), sheet.style_overlay().get(row, col)));
@@ -813,14 +823,28 @@ pub(crate) fn export_new_workbook_to_bytes(
     }
     let appearance_roster: Vec<(Option<FormatId>, Option<StyleId>)> =
         appearances.iter().copied().collect();
+    // **F2 (No-Fallbacks):** the xf slot is `roster_index + 1` (slot 0 is the
+    // reserved default xf). `i as u32 + 1` silently truncates/overflows once
+    // the roster exceeds `u32::MAX - 1` appearances; surface it as a loud
+    // export error instead of producing a wrong `s="N"` mapping.
     let appearance_to_xf_index: std::collections::HashMap<
         (Option<FormatId>, Option<StyleId>),
         u32,
     > = appearance_roster
         .iter()
         .enumerate()
-        .map(|(i, a)| (*a, (i as u32) + 1)) // slot 0 reserved for default
-        .collect();
+        .map(|(i, a)| {
+            let slot = u32::try_from(i)
+                .ok()
+                .and_then(|n| n.checked_add(1))
+                .ok_or_else(|| {
+                    XlsxError::Export(format!(
+                        "cellXfs roster too large: appearance index {i} exceeds u32 xf-slot range"
+                    ))
+                })?;
+            Ok::<_, XlsxError>((*a, slot))
+        })
+        .collect::<Result<_, _>>()?;
     // The FormatId set the numFmt translation flattens — exactly the set of
     // FormatIds appearing in any overlay (identical to the pre-Wave-B2 roster).
     let cellxfs_roster: Vec<FormatId> = {
@@ -874,8 +898,9 @@ pub(crate) fn export_new_workbook_to_bytes(
             });
     }
 
-    let sheet_count = workbook.sheet_count();
-    for sheet_id in 0..sheet_count as u16 {
+    // **F3 (No-Fallbacks):** reuse the loud-checked `sheet_count_u16` rather
+    // than re-casting `sheet_count() as u16` (which would silently truncate).
+    for sheet_id in 0..sheet_count_u16 {
         let mut fixes: Vec<CellFix> = Vec::new();
         let sheet = workbook
             .sheet(sheet_id)
@@ -1168,6 +1193,55 @@ pub(crate) fn export_new_workbook_to_bytes(
     // their own `xl/tables/table{N}.xml` parts AND require updates to
     // sheet rels + worksheet `<tableParts>` + `[Content_Types].xml`.
     let tables = collect_table_exports(workbook);
+
+    // **F13 (No-Fallbacks):** the NewWorkbook exporter does NOT serialize
+    // chart objects (`workbook.charts()`) — real chart export
+    // (`xl/drawings/` + `xl/charts/` parts) is out of v1 scope. Without
+    // surfacing, the loss is silent: Strict mode never fires and Permissive
+    // callers never see it. Emit one `dropped_features` entry per chart so the
+    // drop is LOUD, mirroring the named-range-constant surfacing above. Sorted
+    // by stable chart id for deterministic report order (`iter()` is
+    // HashMap-arbitrary).
+    {
+        let mut chart_ids: Vec<u32> = workbook.charts().iter().map(|(id, _)| *id).collect();
+        chart_ids.sort_unstable();
+        for id in chart_ids {
+            report
+                .dropped_features
+                .push(crate::report::UnsupportedFeature {
+                    kind: crate::error::UnsupportedFeatureKind::Drawings,
+                    part: "xl/drawings/".to_string(),
+                    detail: format!(
+                        "chart object id {id} dropped — chart export is not \
+                         implemented in v1 (no xl/drawings or xl/charts parts written)"
+                    ),
+                });
+        }
+    }
+
+    // **F14 (No-Fallbacks):** hidden rows (`sheet.hidden_rows()`) are NOT
+    // written to the worksheet XML, so the loss is silent (a re-import sees
+    // every row visible → SUBTOTAL(101-111) round-trips differently). Surface
+    // one `dropped_features` entry per sheet that has hidden rows so Strict
+    // mode fires and Permissive callers see the loss. Uses the `Other`
+    // catch-all kind — no dedicated OOXML part is written for it in v1.
+    for sheet_id in 0..sheet_count_u16 {
+        if let Some(sheet) = workbook.sheet(sheet_id) {
+            let hidden = sheet.hidden_rows().len();
+            if hidden > 0 {
+                report
+                    .dropped_features
+                    .push(crate::report::UnsupportedFeature {
+                        kind: crate::error::UnsupportedFeatureKind::Other("hidden rows"),
+                        part: format!("xl/worksheets/sheet{}.xml", sheet_id + 1),
+                        detail: format!(
+                            "{hidden} hidden row(s) on sheet index {sheet_id} dropped — \
+                             row visibility is not exported in v1"
+                        ),
+                    });
+            }
+        }
+    }
 
     // **Wave B2 (2026-06-18):** the visual-style export payload — the cellXfs
     // roster (each xf's xlsx-translated numFmtId + font/fill/border roster index
@@ -1895,6 +1969,12 @@ fn render_named_target(workbook: &Workbook, target: &NamedTarget) -> Option<Stri
             ))
         }
         NamedTarget::Constant(value) => match value {
+            // **F5 (No-Fallbacks):** NaN/Inf have no OOXML formula-text
+            // representation — `format_number_literal` would emit `NaN`/`inf`,
+            // which is invalid OOXML. Drop (return `None`) so the named-range-
+            // constant `dropped_features` surfacing fires, mirroring the
+            // Error/Blank-constant drop below.
+            Value::Number(n) if !n.is_finite() => None,
             Value::Number(n) => Some(format_number_literal(*n)),
             Value::Boolean(b) => Some(if *b {
                 "TRUE".to_string()
@@ -2876,5 +2956,74 @@ mod tests {
         }
         assert_eq!(sheet.read(1, 0), Value::Boolean(true));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// **F13 (No-Fallbacks):** chart objects are not serialized by the v1
+    /// exporter. Each must surface as a `dropped_features` entry so the loss
+    /// is LOUD (Strict mode fires; Permissive callers see it) rather than
+    /// silently dropped.
+    #[test]
+    fn charts_surface_as_dropped_features() {
+        use ql_storage::{ChartKind, ChartObject};
+        use ql_types::Range;
+
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        // Baseline: a workbook with no charts emits no chart drop.
+        let (_bytes, report0) =
+            export_new_workbook_to_bytes(&wb, FormulaCachePolicy::WriteRecomputed).unwrap();
+        assert!(
+            !report0.dropped_features.iter().any(|f| f.part == "xl/drawings/"),
+            "no charts → no chart drop expected, got {:?}",
+            report0.dropped_features
+        );
+
+        // Two charts → exactly two chart drops.
+        wb.charts_mut().insert(ChartObject {
+            id: 7,
+            name: "Returns".to_string(),
+            chart_type: ChartKind::Line,
+            sheet: s,
+            anchor_row: 1,
+            anchor_col: 2,
+            width_px: 480,
+            height_px: 320,
+            source_range: Range::new(s, 0, 0, 9, 0),
+            title: Some("Returns".to_string()),
+        });
+        wb.charts_mut().insert(ChartObject {
+            id: 3,
+            name: "Drawdown".to_string(),
+            chart_type: ChartKind::Bar,
+            sheet: s,
+            anchor_row: 5,
+            anchor_col: 2,
+            width_px: 480,
+            height_px: 320,
+            source_range: Range::new(s, 0, 1, 9, 1),
+            title: None,
+        });
+
+        let (_bytes, report) =
+            export_new_workbook_to_bytes(&wb, FormulaCachePolicy::WriteRecomputed).unwrap();
+        let chart_drops: Vec<_> = report
+            .dropped_features
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.kind,
+                    crate::error::UnsupportedFeatureKind::Drawings
+                ) && f.part == "xl/drawings/"
+            })
+            .collect();
+        assert_eq!(
+            chart_drops.len(),
+            2,
+            "expected one dropped_features entry per chart, got {:?}",
+            report.dropped_features
+        );
+        // Stable, id-sorted order (3 before 7).
+        assert!(chart_drops[0].detail.contains("chart object id 3"));
+        assert!(chart_drops[1].detail.contains("chart object id 7"));
     }
 }
