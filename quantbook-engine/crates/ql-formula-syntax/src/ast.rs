@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use ql_types::{ColId, RowId, SheetId};
+use ql_types::{ColId, RowId, SheetId, MAX_COLUMN, MAX_ROW};
 
 use crate::token::{AxisSpec, Operator};
 
@@ -801,8 +801,8 @@ enum ShiftCoord {
 /// Axis maximum for overflow detection (Excel limits).
 fn axis_max(axis: ShiftAxis) -> u32 {
     match axis {
-        ShiftAxis::Row => crate::lexer::MAX_ROW,
-        ShiftAxis::Col => crate::lexer::MAX_COLUMN,
+        ShiftAxis::Row => MAX_ROW,
+        ShiftAxis::Col => MAX_COLUMN,
     }
 }
 
