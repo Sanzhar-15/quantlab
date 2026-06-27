@@ -341,6 +341,11 @@ Mirror the napi additions: `binding`, `bindings`, `bind_range(direction=...)`, `
 
 ## 8. Open questions / decisions for the operator or a follow-up
 
+> **UPDATE (w133, 2026-06-26): the four TE1-blocking decisions are RESOLVED by the operator** — DEC-B =
+> keep binding + `force_check`; D-IDENTITY = fold into one unified `Binding`; D-RANGEMOVE = anchored +
+> loud invalidation; binding-persistence = session-local (no `.qbook`). DEC-C/D/E/F remain open (TE2/TE3).
+> Build plan: `quantlab/.plans/active/te1-moat-forward-plane.md`; charter §5 has the canonical log.
+
 - **DEC-B (undo/redo × bindings):** today provenance clears but bindings persist. Choose: (i) keep binding + mark `force_check` so the next kernel touch re-publishes (my lean — preserves the badge, self-heals), or (ii) drop bindings on undo (simpler, but the badge flickers and the user must re-run). **Needs a decision before TE1.**
 - **DEC-C (edit-back with no live kernel):** allow the grid edit (overwritten on next kernel start, with a warning) or refuse it? My lean: allow + warn.
 - **DEC-D (`qb.show` auto-placement):** build the host-allocates round-trip in v1, or require explicit `at="Sheet!A1"` and defer auto-placement to v1.5? My lean: defer auto-placement (smaller TE2).
