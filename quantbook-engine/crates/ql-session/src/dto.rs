@@ -651,6 +651,58 @@ pub struct BoundRange {
     pub binding_id: String,
 }
 
+/// **TE1 (var↔cell moat):** the data-flow direction recorded on a
+/// [`BindingInfo`]. `Forward` is the proven, shipped direction (Python → grid);
+/// `Bidirectional` additionally enables grid-edit-back (the TE2 reverse plane).
+/// The engine records the declared direction even when no kernel is attached, so
+/// the IDE can distinguish an editable binding from a plain forward one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindDirection {
+    /// Python → grid only (default; the proven forward plane).
+    Forward,
+    /// Python ↔ grid — edit-back enabled (TE2).
+    Bidirectional,
+}
+
+/// **TE1 (var↔cell moat — D-IDENTITY):** the engine-owned binding record, the
+/// single source of truth tying a Python variable name to the grid range it
+/// drives. Subsumes the former `binding_id → CellRange` registry and cross-links
+/// to the provenance index via `source_id`. Returned by
+/// [`crate::WorkbookSession::binding`] / [`crate::WorkbookSession::bindings`].
+///
+/// **Session-local (persistence decision, w133):** bindings are NEVER serialized
+/// into `.qbook` — a binding without a live kernel is inert. The serde derives
+/// here exist only for the napi/JSON read boundary, not workbook persistence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingInfo {
+    /// The binding id — equals the publish `name` for a published var
+    /// (D-IDENTITY: `var_name == binding_id == source_id`).
+    pub binding_id: String,
+    /// The DECLARED envelope (fixed-size; range-follows-cells is a v1.5 cut).
+    pub target: CellRange,
+    /// Data-flow direction (`Forward` default; `Bidirectional` enables edit-back).
+    pub direction: BindDirection,
+    /// The provenance key this binding's data flows through. `Some(binding_id)`
+    /// once a `publish_dataset` has filled it; `None` for a bare `bind_range`
+    /// declaration that has not yet been published.
+    pub source_id: Option<String>,
+    /// Bumped whenever a (re)publish moves/resizes the target — carried in
+    /// reverse-plane frames (TE2) to reject edits against a stale envelope.
+    pub generation: u64,
+    /// `false` once a structural edit (row/col insert-delete or sheet-delete)
+    /// invalidates the target (D-RANGEMOVE: anchored + loud invalidation, never a
+    /// silent shift). A read of a dead binding returns it with `alive=false`
+    /// rather than `None`, so callers distinguish "never bound" from
+    /// "bound-then-invalidated".
+    pub alive: bool,
+    /// **DEC-B (undo × binding):** `true` when undo/redo (or any rebuild) clears
+    /// the backing provenance, so a binding kept across the undo is flagged as
+    /// needing a re-publish; the kernel's next touch re-publishes and clears it.
+    /// Never leave a binding pointing at vanished provenance silently.
+    pub force_check: bool,
+}
+
 /// Result of a source refresh (reserved, §3.5).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DirtyResult {
@@ -701,6 +753,14 @@ pub struct CellLineage {
     /// How many cells the source produced in its last materialization (the cell
     /// count of `produced_range` for a full rectangular result).
     pub produced_cells: usize,
+    /// **TE1:** the unified binding this cell's source drives, if the source is a
+    /// published Python var (`source_id == binding_id`, D-IDENTITY). `None` for a
+    /// SQL `Query` source (no Python binding) or if no binding exists. Lets the IDE
+    /// answer "this cell is driven by var `name`, direction `Forward`".
+    pub binding_id: Option<String>,
+    /// **TE1:** the binding's data-flow direction; `None` when `binding_id` is
+    /// `None`.
+    pub direction: Option<BindDirection>,
 }
 
 /// Severity of a [`Diagnostic`].

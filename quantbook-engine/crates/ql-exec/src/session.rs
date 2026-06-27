@@ -100,7 +100,8 @@ use ql_formula_syntax::{lex, lex_with, parse, print_with, FormulaSite};
 use ql_io::CellWireValue;
 use ql_oplog::Op;
 use ql_session::dto::{
-    BatchOptions, BatchResult, BorderEdge as BorderEdgeDto, BorderStyle as BorderStyleDto,
+    BatchOptions, BatchResult, BindDirection, BindingInfo, BorderEdge as BorderEdgeDto,
+    BorderStyle as BorderStyleDto,
     Borders as BordersDto, BoundRange, CellAddr, CellLineage, CellRange, CellSnapshot, CellValue,
     ChangedCell, DateSystem, Diagnostic, DirtyResult, FormatDef, FormatId, FullRebuildReason,
     HAlign as HAlignDto, LineageKind, NamedRange, NamedTargetDto, PublishedRef, RangeColumn,
@@ -434,13 +435,100 @@ pub struct WorkbookSession {
     /// (cells a source no longer produces after a shrinking result) are evicted by
     /// `refresh_source`.
     cell_provenance: HashMap<CellAddr, CellProvenance>,
-    /// **ENG-FUSION:** `binding_id → CellRange` registry for `bind_range` (the
-    /// `BoundFrame` overlay region). Unlike the provenance maps (data-derived, so
-    /// cleared on undo/redo), a binding is a region POINTER independent of cell
-    /// content, so it is KEPT across undo/redo. Round-trip reads of a bound range go
-    /// through the existing `query_range`/snapshot path; re-binding an id overwrites
-    /// after validation (No-Fallbacks, never a silent default).
-    bindings: HashMap<String, CellRange>,
+    /// **ENG-FUSION + TE1 (var↔cell moat — D-IDENTITY):** `binding_id →
+    /// BindingInfo` registry — the single engine-owned source of truth for the
+    /// Python-var↔grid-range binding. Written by `bind_range` (the declaration
+    /// half) and `publish_dataset` (the data half) via `upsert_binding`; read by
+    /// `binding`/`bindings`/`cell_lineage`. Unlike the provenance maps
+    /// (data-derived, cleared on undo/redo), a binding is a region POINTER so it
+    /// is KEPT across undo/redo — but DEC-B marks it `force_check` when the
+    /// rebuild wipes its provenance (see `rematerialize`). Session-local: NEVER
+    /// serialized into `.qbook` (a binding without a live kernel is inert).
+    /// Re-binding/re-publishing an id upserts after validation (No-Fallbacks,
+    /// never a silent default).
+    bindings: HashMap<String, BindingInfo>,
+    /// **TE1 HIGH-1 (w135):** the CURRENT net-active structural-edit set, recomputed
+    /// at the end of every [`rematerialize`] from the op-log. Read by `upsert_binding`
+    /// to STAMP each binding's birth set (the grid it was declared under) into
+    /// `binding_birth_structural`. Between rematerializes it is stable (structural row/
+    /// col ops only ever enter via `apply_structural_edit`, which rematerializes), so
+    /// the stamp is the live active set without re-walking the log. Session-local, NOT
+    /// serialized into `.qbook`. See [`StructuralEditRecord`] and [`rematerialize`].
+    ///
+    /// [`rematerialize`]: WorkbookSession::rematerialize
+    active_structural: Vec<StructuralEditRecord>,
+    /// **TE1 HIGH-1 (w135):** per-binding BIRTH net-active structural set — the
+    /// structural edits active when each binding was declared/upserted (a snapshot of
+    /// `active_structural` at that moment). Keyed by `binding_id`, parallel to
+    /// `bindings` (stamped in `upsert_binding`, dropped in `unbind`). `rematerialize`
+    /// invalidates an alive binding iff the CURRENT active set has an edit intersecting
+    /// its target that was NOT in its birth set — so a redo that merely RESTORES the
+    /// binding's birth grid is correctly a no-op (a session-global active-set diff
+    /// over-invalidated that case — Codex round-2 followup). NOT in `.qbook`.
+    binding_birth_structural: HashMap<String, Vec<StructuralEditRecord>>,
+}
+
+/// **TE1 HIGH-1 (w135):** one net-active ROW/COLUMN structural edit, recovered from
+/// the op-log. `rematerialize` recomputes the active set (`collect_active_structural_edits`)
+/// from the CURRENT op-log on every undo/redo and invalidates each alive binding for
+/// which the active set gained an intersecting edit RELATIVE TO that binding's birth
+/// set (`binding_birth_structural`) — closing the redo×`bind_range` gap (Codex
+/// round-2 HIGH) without over-invalidating a redo that merely restores the birth grid.
+/// Sheet-delete (`Op::RemoveSheet`) is NOT collected here; it is handled by the
+/// sheet-liveness check in `rematerialize`. Deliberately NOT a `VersionVector`: the
+/// op-log VV is MONOTONIC across undo/redo (undo appends an inverse op → the VV only
+/// grows, so it still "includes" an edit after that edit's effect was undone),
+/// whereas `OpLog::iter()` — the materialized LoroList that `replay_into` consumes —
+/// reflects net-active state (an undone op is absent, a redone op present). The op
+/// sequence is the correct signal; the causal VV is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StructuralEditRecord {
+    sheet: SheetId,
+    axis: StructuralAxis,
+    kind: StructuralKind,
+}
+
+/// **TE1 HIGH-1 (w135):** multiset difference `now \ base` — the structural edits
+/// active NOW that were not active in `base` (a binding's birth set). A MULTISET (not
+/// a set) so a second identical edit counts as newly-active; compared by VALUE (not op
+/// identity) because the D-RANGEMOVE predicate depends only on (sheet, axis, kind) —
+/// two equal records invalidate exactly the same bindings, and a pure reorder of the
+/// active set (no add/remove) leaves the net grid unchanged, so an empty diff is
+/// correct. O(n·m) over the handful of structural edits in a session.
+fn newly_active_structural(
+    now: &[StructuralEditRecord],
+    base: &[StructuralEditRecord],
+) -> Vec<StructuralEditRecord> {
+    let mut remaining: Vec<StructuralEditRecord> = base.to_vec();
+    let mut newly = Vec::new();
+    for edit in now {
+        if let Some(pos) = remaining.iter().position(|p| p == edit) {
+            // Carried over from `base` (consume the match so duplicates count).
+            remaining.swap_remove(pos);
+        } else {
+            newly.push(*edit);
+        }
+    }
+    newly
+}
+
+/// **TE1 HIGH-1 (w135):** the D-RANGEMOVE anchored predicate — does `record` (a row/
+/// col structural edit) intersect or precede `target` on its axis? A target is safe
+/// ONLY if it lies entirely before the edit position along the edited axis
+/// (`end < edit_start`). Shared by the forward `invalidate_bindings_for_structural_edit`
+/// and the birth-relative `rematerialize` pass so both use one predicate.
+fn structural_edit_affects(record: &StructuralEditRecord, target: &CellRange) -> bool {
+    if record.sheet != target.sheet {
+        return false;
+    }
+    let edit_start = match record.kind {
+        StructuralKind::Insert { at, .. } => at,
+        StructuralKind::Delete { start, .. } => start,
+    };
+    match record.axis {
+        StructuralAxis::Row => target.end_row >= edit_start,
+        StructuralAxis::Col => target.end_col >= edit_start,
+    }
 }
 
 impl WorkbookSession {
@@ -520,6 +608,10 @@ impl WorkbookSession {
             provenance: HashMap::new(),
             cell_provenance: HashMap::new(),
             bindings: HashMap::new(),
+            // TE1 HIGH-1: empty — `active_structural` is populated by the first
+            // `rematerialize`; birth sets are stamped per binding in `upsert_binding`.
+            active_structural: Vec::new(),
+            binding_birth_structural: HashMap::new(),
         }
     }
 
@@ -1089,6 +1181,96 @@ impl WorkbookSession {
         // re-run materialize_query to re-establish provenance after undo/redo.
         self.provenance.clear();
         self.cell_provenance.clear();
+        // DEC-B (undo × binding): the rebuild just wiped every binding's backing
+        // provenance (the maps above are not in the op-log, so a publish's
+        // provenance cannot be replayed). A binding is KEPT (it is a region
+        // pointer, not data) but now points at vanished provenance, so flag every
+        // SOURCE-BACKED binding `force_check` — the kernel's next touch
+        // re-publishes and `upsert_binding` clears it. A bare `bind_range`
+        // declaration (`source_id` None) has no provenance to lose and is left
+        // untouched. Never leave a binding pointing at vanished provenance
+        // silently (No-Fallbacks). `alive` is NOT changed here — structural
+        // invalidation (D-RANGEMOVE) is a separate, axis-aware concern.
+        //
+        // `&& binding.alive`: a DEAD binding (already invalidated by a structural
+        // edit) cannot be healed by a re-publish to its now-stale target — it
+        // needs a re-bind — so it must NOT regain `force_check` on a later
+        // undo/redo, or it would re-enter the contradictory {alive=false,
+        // force_check=true} state.
+        for binding in self.bindings.values_mut() {
+            if binding.source_id.is_some() && binding.alive {
+                binding.force_check = true;
+            }
+        }
+
+        // TE1 HIGH-1 (D-RANGEMOVE × undo/redo): the forward structural path
+        // (`apply_structural_edit` / `delete_sheet`) invalidates anchored bindings at
+        // edit time, but a REDO re-applies a previously-undone structural edit WITHOUT
+        // routing through that path — it only replays the op-log here, so the redone
+        // shift would otherwise leave an intersecting binding stale-`alive` (Codex
+        // round-2 HIGH). Close it here, BINDING-RELATIVE: each alive binding is killed
+        // iff (a) its target sheet is no longer live, or (b) the CURRENT net-active
+        // structural set gained an intersecting edit RELATIVE TO that binding's birth
+        // set. Birth-relative (not a session-global active-set diff) so a redo that
+        // merely RESTORES a binding's birth grid is correctly a no-op — a global diff
+        // over-invalidated that case (Codex round-2 followup). The DEC-B `force_check`
+        // pass above runs FIRST, so a binding killed here ends {alive=false,
+        // force_check=false}, never the contradictory {alive=false, force_check=true}.
+        //
+        // NOT a VersionVector: the op-log VV is monotonic across undo/redo (undo
+        // appends an inverse op → the VV only grows), so it cannot distinguish an edit
+        // whose effect was undone from one still applied; `OpLog::iter()` (the
+        // net-active LoroList) can. Edits LEAVING the active set (an undo) are
+        // intentionally not acted on — DEC-B governs undo (keep the binding +
+        // `force_check`); this closes only the becomes-active (forward/redo) gap.
+        //
+        // KNOWN LIMITATION (out of TE1 scope, contrived + unreachable in wired flows):
+        // because the relative diff compares by VALUE, a PARTIAL redo of two value-equal
+        // stacked edits (birth `[E,E]`, now `[E]` after one redo) yields an empty diff,
+        // so a BARE binding stays alive-but-shifted without `force_check`. Same class as
+        // DEC-B's tolerated bare-binding undo imprecision; SOURCE-backed bindings are
+        // protected (DEC-B re-flags `force_check` every undo/redo). Bare `bind_range`
+        // has no TE1 caller (the moat uses `publish_dataset`). Precise fix = TE2.
+        let now_structural = self.collect_active_structural_edits()?;
+        for binding in self.bindings.values_mut() {
+            if !binding.alive {
+                continue;
+            }
+            // (a) Sheet-delete, incl. a REDO of `Op::RemoveSheet` (which routes only
+            // through here, not the forward `delete_sheet` path): a binding whose
+            // target sheet is no longer live is dead — never reported stale-alive.
+            let sheet = binding.target.sheet;
+            let sheet_live = (sheet as usize) < self.workbook.sheet_count()
+                && !self.workbook.is_sheet_removed(sheet);
+            if !sheet_live {
+                binding.alive = false;
+                binding.force_check = false;
+                continue;
+            }
+            // (b) Row/col edits active NOW but NOT at this binding's birth. A binding
+            // missing its birth stamp is an `upsert_binding` invariant violation —
+            // fail loud in debug; in release treat birth as empty (conservative:
+            // invalidate on any intersecting active edit) rather than silently skip.
+            let relative_new = match self.binding_birth_structural.get(&binding.binding_id) {
+                Some(birth) => newly_active_structural(&now_structural, birth),
+                None => {
+                    debug_assert!(
+                        false,
+                        "binding {} has no birth structural stamp",
+                        binding.binding_id
+                    );
+                    now_structural.clone()
+                }
+            };
+            if relative_new
+                .iter()
+                .any(|edit| structural_edit_affects(edit, &binding.target))
+            {
+                binding.alive = false;
+                binding.force_check = false;
+            }
+        }
+        self.active_structural = now_structural;
 
         // The wholesale rebuild cannot be conveyed incrementally → force a full
         // rebuild for any outstanding token (and advance the state token).
@@ -2183,6 +2365,11 @@ impl EngineSession for WorkbookSession {
             }
         }
         self.record_changes([SessionChange::SheetRemoved { id }]);
+        // TE1 (D-RANGEMOVE): bindings whose target lives on the deleted sheet are
+        // invalidated (`alive=false`) — mirrors the host's `#REF!` badge handling
+        // for a now-deleted sheet; a read returns the dead binding, never a
+        // stale-live one.
+        self.invalidate_bindings_for_sheet(id);
         Ok(())
     }
 
@@ -3765,6 +3952,13 @@ impl EngineSession for WorkbookSession {
             // attribution, but still dirty the dependents of any previously-produced
             // cells so a shrink-to-zero reactively invalidates downstream formulas.
             self.record_block_provenance(name, target, Vec::new(), data, ProducerKind::Published);
+            // TE1 (D-IDENTITY): a publish is also the DATA half of the unified
+            // binding — upsert bindings[name] so the var↔cell identity exists.
+            // source_id = name (the provenance key the data flows through);
+            // direction is preserved (None) so a prior bind_range(Bidirectional)
+            // is not downgraded; a fresh publish resets `alive` and clears any
+            // undo `force_check`. Even a zero-row publish declares the envelope.
+            self.upsert_binding(name, target, None, Some(name.to_string()), false);
             for cell in &old_cells {
                 self.graph.on_set_value(cell.sheet, cell.row, cell.col);
             }
@@ -3803,6 +3997,22 @@ impl EngineSession for WorkbookSession {
             }
         }
         self.record_block_provenance(name, target, produced, data, ProducerKind::Published);
+        // TE1 (D-IDENTITY): upsert the unified binding (the DATA half); see the
+        // zero-row path above. The lineage invariant — bindings[name].source_id ==
+        // name AND the declared target covers the produced block — is set by the
+        // upsert (source_id) and guaranteed by the n_rows/n_cols ≤ target
+        // validation above (the produced `block` is anchored within `target`).
+        // `assert!` (not `debug_assert!`): a moat-level invariant must fail LOUD in
+        // release too (No-Fallbacks) if a future refactor of the block construction
+        // ever violates it. It cannot fire given the validation above.
+        assert!(
+            block.start_row >= target.start_row
+                && block.end_row <= target.end_row
+                && block.start_col >= target.start_col
+                && block.end_col <= target.end_col,
+            "TE1 lineage invariant: produced block must lie within the declared binding target"
+        );
+        self.upsert_binding(name, target, None, Some(name.to_string()), false);
 
         // Reactive dirty-notify: fan out over the PREVIOUS produced cells so dependents of
         // cells the new value no longer covers are dirtied. `write_range` already fired
@@ -3826,19 +4036,11 @@ impl EngineSession for WorkbookSession {
     /// The binding is session-local and KEPT across undo/redo (a region pointer, not
     /// data). Returns `BoundRange { binding_id }`.
     fn bind_range(&mut self, binding_id: &str, target: CellRange) -> EngineResult<BoundRange> {
-        self.ensure_ready()?;
-        self.require_live_sheet(target.sheet, "bind_range")?;
-        if target.end_row < target.start_row || target.end_col < target.start_col {
-            return Err(EngineError::bad_argument(
-                "bind_range: target range end coordinate is before its start",
-            ));
-        }
-        Self::require_in_bounds(target.start_row, target.start_col, "bind_range")?;
-        Self::require_in_bounds(target.end_row, target.end_col, "bind_range")?;
-        self.bindings.insert(binding_id.to_string(), target);
-        Ok(BoundRange {
-            binding_id: binding_id.to_string(),
-        })
+        // TE1: the trait entry preserves the existing direction (a re-bind never
+        // downgrades a `Bidirectional` binding → `None`); the
+        // `qb.show(editable=True)` path declares a direction explicitly via the
+        // inherent `bind_range_with_direction`.
+        self.bind_range_with_direction(binding_id, target, None)
     }
 
     /// **6.5-2:** revision-gated source refresh. Re-runs the producer (via the
@@ -4197,14 +4399,292 @@ impl WorkbookSession {
         // cells the delta DTO cannot express, so the epoch bump → full
         // re-snapshot is the correct delta behavior (like `restore_sheet`).
         self.rematerialize()?;
+        // TE1 (D-RANGEMOVE): a structural edit moves/splits absolute cell coords;
+        // anchored bindings on this sheet that intersect or precede the edit are
+        // invalidated loudly (`alive=false`) rather than silently shifted —
+        // range-following is a v1.5 cut.
+        //
+        // LOAD-BEARING (do NOT remove as "redundant" with the rematerialize pass):
+        // this birth-AGNOSTIC call is the backstop for a forward edit that is
+        // VALUE-equal to a binding's birth edit (e.g. `insert_rows(2,1)` → bind →
+        // undo → `insert_rows(2,1)` again). The birth-relative `rematerialize` pass
+        // compares the active set to each binding's birth set by VALUE, so it MASKS
+        // such a forward edit (it looks "already in birth"); this call kills the
+        // binding correctly — a genuinely NEW forward shift must invalidate, unlike a
+        // REDO that restores the birth grid (which the pass correctly spares).
+        self.invalidate_bindings_for_structural_edit(sheet, axis, kind);
         Ok(())
     }
 
-    /// **ENG-FUSION:** the `CellRange` a `binding_id` is bound to, if any — the read
-    /// accessor for the `bind_range` registry (used by tests and the FE/kernel to
-    /// resolve a `BoundFrame`'s region for round-trip reads).
-    pub fn binding(&self, binding_id: &str) -> Option<CellRange> {
-        self.bindings.get(binding_id).copied()
+    /// **TE1 (var↔cell moat — D-IDENTITY):** the shared upsert that BOTH
+    /// `bind_range` (declaration half) and `publish_dataset` (data half) write
+    /// through, so the unified binding identity lives in exactly one place.
+    ///
+    /// - `direction = Some(d)` sets the direction; `None` preserves the existing
+    ///   one (or `Forward` for a fresh binding) — so re-declaring never downgrades
+    ///   a `Bidirectional` binding.
+    /// - `source_id` carries the provenance key: `Some(name)` from a publish; a
+    ///   bare `bind_range` passes its preserved-or-`None` source.
+    /// - `generation` bumps only when the target moves/resizes (a stable target
+    ///   reuses the prior generation; a moved one bumps — carried into the TE2
+    ///   reverse plane to reject stale-envelope edits).
+    /// - A successful (re)bind is LIVE (`alive = true`). `force_check` is set by
+    ///   the CALLER: `publish_dataset` passes `false` (fresh data clears any prior
+    ///   undo-staleness, DEC-B); a `bind_range` re-declaration of a source-backed
+    ///   binding PRESERVES the prior `force_check` (a declaration carries no data,
+    ///   so it cannot clear staleness — only a re-publish can).
+    fn upsert_binding(
+        &mut self,
+        binding_id: &str,
+        target: CellRange,
+        direction: Option<BindDirection>,
+        source_id: Option<String>,
+        force_check: bool,
+    ) {
+        let prev = self.bindings.get(binding_id);
+        let generation = match prev {
+            Some(p) if p.target == target => p.generation,
+            // saturating_add: a u64 generation cannot realistically overflow, but
+            // never wrap silently to 0 (No-Fallbacks) — a saturated generation
+            // stays maximal, which still reads as "moved" to a staleness check.
+            Some(p) => p.generation.saturating_add(1),
+            None => 0,
+        };
+        let direction = direction
+            .or_else(|| prev.map(|p| p.direction))
+            .unwrap_or(BindDirection::Forward);
+        self.bindings.insert(
+            binding_id.to_string(),
+            BindingInfo {
+                binding_id: binding_id.to_string(),
+                target,
+                direction,
+                source_id,
+                generation,
+                alive: true,
+                force_check,
+            },
+        );
+        // TE1 HIGH-1: stamp the binding's BIRTH net-active structural set (the grid it
+        // is declared/re-anchored under) so `rematerialize` invalidates it only for
+        // edits that became active SINCE its birth — not for a redo that restores it.
+        // `active_structural` is the live set (stable between rematerializes), so no
+        // log walk is needed here even on the hot publish path.
+        self.binding_birth_structural
+            .insert(binding_id.to_string(), self.active_structural.clone());
+    }
+
+    /// **ENG-FUSION + TE1:** the [`BindingInfo`] a `binding_id` is bound to, if any
+    /// — the read accessor for the unified binding registry (used by tests, the
+    /// FE/kernel badge, and reverse-plane lookup). Returns `None` for a never-bound
+    /// id; a structurally-invalidated binding is returned with `alive = false`
+    /// (No-Fallbacks: a dead binding is never reported as a live one, nor elided to
+    /// `None`).
+    pub fn binding(&self, binding_id: &str) -> Option<BindingInfo> {
+        self.bindings.get(binding_id).cloned()
+    }
+
+    /// **TE1:** enumerate every binding — the engine-authoritative source the
+    /// IDE's `PublishedCellsStore` mirrors (it replaces the host-side shadow
+    /// registry as the badge source-of-truth). Includes dead (`alive=false`)
+    /// bindings so the caller can surface invalidations, never silently elide
+    /// them. Iteration order is unspecified (HashMap); callers needing a stable
+    /// order sort by `binding_id`.
+    pub fn bindings(&self) -> Vec<BindingInfo> {
+        self.bindings.values().cloned().collect()
+    }
+
+    /// **TE1:** drop a binding (the engine half of the kernel's `unpublish`
+    /// reverse frame / explicit teardown). Returns `true` if a binding existed and
+    /// was removed, `false` if the id was unknown — the caller learns whether
+    /// anything was actually dropped (No-Fallbacks: never a silent no-op
+    /// masquerading as success). Does NOT touch provenance or the already-written
+    /// cell values: unpublishing the binding leaves those as ordinary user data
+    /// (symmetric with `drop_cell_lineage`); clearing the cells is a separate
+    /// caller choice.
+    pub fn unbind(&mut self, binding_id: &str) -> EngineResult<bool> {
+        // Drop the parallel birth stamp (TE1 HIGH-1) in lockstep with the binding.
+        self.binding_birth_structural.remove(binding_id);
+        Ok(self.bindings.remove(binding_id).is_some())
+    }
+
+    /// **TE1:** the validation + upsert core shared by the trait `bind_range`
+    /// (declaration with `direction = None` → preserve existing / `Forward`) and
+    /// the `qb.show(editable=True)` path (`Some(Bidirectional)`). `target` is
+    /// validated like `write_range` (live sheet, not inverted, in-bounds — loud
+    /// `bad_argument`/`sheet_not_found`, never a silent default). As the
+    /// DECLARATION half it preserves any existing `source_id` (a bare declaration
+    /// carries no data); a later `publish_dataset` links the source. Session-local,
+    /// KEPT across undo/redo (a region pointer). Returns `BoundRange { binding_id }`.
+    pub fn bind_range_with_direction(
+        &mut self,
+        binding_id: &str,
+        target: CellRange,
+        direction: Option<BindDirection>,
+    ) -> EngineResult<BoundRange> {
+        self.ensure_ready()?;
+        self.require_live_sheet(target.sheet, "bind_range")?;
+        if target.end_row < target.start_row || target.end_col < target.start_col {
+            return Err(EngineError::bad_argument(
+                "bind_range: target range end coordinate is before its start",
+            ));
+        }
+        Self::require_in_bounds(target.start_row, target.start_col, "bind_range")?;
+        Self::require_in_bounds(target.end_row, target.end_col, "bind_range")?;
+        // bind_range is the DECLARATION half: it carries NO data. If it
+        // re-declares a SOURCE-BACKED binding (a prior publish linked a provenance
+        // source), it must not silently break that link:
+        //   - `force_check` is PRESERVED — only `publish_dataset`, which actually
+        //     re-records provenance, may clear undo-staleness (DEC-B). A bare
+        //     declaration cannot heal a stale binding.
+        //   - the new envelope MUST still cover every cell the source actually
+        //     produced, else the binding would point its envelope away from its
+        //     data (lineage-invariant break). If that provenance is gone (an undo
+        //     wiped it) there is nothing to cover, so a same-id re-declaration is
+        //     allowed and keeps the (now stale) source link + force_check.
+        // A bare declaration (no prior source) — or a re-declaration of a DEAD
+        // binding (already invalidated by a structural edit / sheet-delete, whose
+        // old anchor + provenance are stale) — is a FRESH, non-stale binding.
+        // Only a LIVE source-backed binding triggers the cover check + preserve.
+        let (source_id, force_check) = match self
+            .bindings
+            .get(binding_id)
+            .filter(|b| b.alive)
+            .and_then(|b| b.source_id.clone().map(|s| (s, b.force_check)))
+        {
+            Some((src, prev_force_check)) => {
+                if let Some(entry) = self.provenance.get(&src) {
+                    for cell in &entry.cells {
+                        let covered = cell.sheet == target.sheet
+                            && cell.row >= target.start_row
+                            && cell.row <= target.end_row
+                            && cell.col >= target.start_col
+                            && cell.col <= target.end_col;
+                        if !covered {
+                            return Err(EngineError::bad_argument(
+                                "bind_range: target must still cover this binding's published \
+                                 cells; re-publish to move a bound dataset's envelope",
+                            ));
+                        }
+                    }
+                }
+                (Some(src), prev_force_check)
+            }
+            None => (None, false),
+        };
+        self.upsert_binding(binding_id, target, direction, source_id, force_check);
+        Ok(BoundRange {
+            binding_id: binding_id.to_string(),
+        })
+    }
+
+    /// **TE1 (D-RANGEMOVE):** mark every live binding on `sheet` whose target
+    /// intersects or precedes a structural edit as `alive = false` — anchored +
+    /// loud invalidation, never a silent shift (the absolute target no longer
+    /// matches what the user sees, and a silently-shifted envelope could overlap
+    /// another binding). The kernel's `force_check` + re-run re-establishes a
+    /// fresh binding at the new selection. A binding is safe ONLY if it lies
+    /// entirely before the edit position along the edited axis (`end < edit_start`).
+    fn invalidate_bindings_for_structural_edit(
+        &mut self,
+        sheet: SheetId,
+        axis: StructuralAxis,
+        kind: StructuralKind,
+    ) {
+        let record = StructuralEditRecord { sheet, axis, kind };
+        for binding in self.bindings.values_mut() {
+            if !binding.alive {
+                continue;
+            }
+            if structural_edit_affects(&record, &binding.target) {
+                binding.alive = false;
+                // A dead binding cannot be healed by a re-publish to its now-stale
+                // target — it needs a fresh re-bind at the new selection — so clear
+                // `force_check` (which means "a re-publish will heal me"). This
+                // avoids the contradictory {alive=false, force_check=true} state a
+                // prior `rematerialize` in the same structural edit would otherwise
+                // leave.
+                binding.force_check = false;
+            }
+        }
+    }
+
+    /// **TE1 (D-RANGEMOVE / sheet delete):** mark every binding whose target lives
+    /// on the deleted `sheet` as `alive = false`. A read returns the dead binding,
+    /// never a stale-live one (No-Fallbacks).
+    fn invalidate_bindings_for_sheet(&mut self, sheet: SheetId) {
+        for binding in self.bindings.values_mut() {
+            if binding.target.sheet == sheet {
+                binding.alive = false;
+                // Dead binding needs a re-bind, not a re-publish — clear
+                // force_check (see invalidate_bindings_for_structural_edit).
+                binding.force_check = false;
+            }
+        }
+    }
+
+    /// **TE1 HIGH-1 (w135):** walk the CURRENT (net-active) op-log and collect every
+    /// ROW/COLUMN structural edit it materializes, in op-log order (sheet-delete is
+    /// handled by the sheet-liveness check, not here). Recurses into `Op::BatchCommit`
+    /// because a structural edit is stored as `[InsertRows, PutFormula×N]` inside ONE
+    /// `BatchCommit`. `OpLog::iter` reads the materialized LoroList, whose current
+    /// state reflects undo/redo (an undone op is absent, a redone op present, since
+    /// Loro's UndoManager retracts/replays list entries) — the same iterator
+    /// `replay_into` consumes — so this is the authoritative net-active structural
+    /// set. A malformed op surfaces loudly
+    /// (No-Fallbacks); in practice `rematerialize` calls this only AFTER a
+    /// successful `replay_into` of the same log, so a decode error here is
+    /// effectively unreachable.
+    fn collect_active_structural_edits(&self) -> EngineResult<Vec<StructuralEditRecord>> {
+        fn push_from_op(op: &Op, out: &mut Vec<StructuralEditRecord>) {
+            match op {
+                Op::InsertRows { sheet, at, count } => out.push(StructuralEditRecord {
+                    sheet: *sheet,
+                    axis: StructuralAxis::Row,
+                    kind: StructuralKind::Insert {
+                        at: *at,
+                        count: *count,
+                    },
+                }),
+                Op::DeleteRows { sheet, start, end } => out.push(StructuralEditRecord {
+                    sheet: *sheet,
+                    axis: StructuralAxis::Row,
+                    kind: StructuralKind::Delete {
+                        start: *start,
+                        end: *end,
+                    },
+                }),
+                Op::InsertColumns { sheet, at, count } => out.push(StructuralEditRecord {
+                    sheet: *sheet,
+                    axis: StructuralAxis::Col,
+                    kind: StructuralKind::Insert {
+                        at: *at,
+                        count: *count,
+                    },
+                }),
+                Op::DeleteColumns { sheet, start, end } => out.push(StructuralEditRecord {
+                    sheet: *sheet,
+                    axis: StructuralAxis::Col,
+                    kind: StructuralKind::Delete {
+                        start: *start,
+                        end: *end,
+                    },
+                }),
+                Op::BatchCommit { ops } => {
+                    for inner in ops {
+                        push_from_op(inner, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for op_result in self.oplog.iter() {
+            let op = op_result
+                .map_err(|e| map_oplog_err(e, "oplog iter (structural scan)".to_string()))?;
+            push_from_op(&op, &mut out);
+        }
+        Ok(out)
     }
 
     /// **ENG-FUSION (extracted from `materialize_query`, 6.5-2 logic):** record the
@@ -4368,6 +4848,21 @@ impl WorkbookSession {
             end_row: max_row,
             end_col: max_col,
         };
+        // TE1: cross-link to the unified binding. For a Published source the id IS
+        // the binding id (D-IDENTITY); a SQL `Query` source has no Python binding.
+        let (binding_id, direction) = match self.bindings.get(&cp.source_id) {
+            // Link ONLY when the binding is still backed by THIS source. After an
+            // `unbind` + bare `bind_range` re-declaration, the same id can exist
+            // with `source_id = None` — that bare binding must NOT relink the old
+            // published cells (No-Fallbacks: never report a stale binding link).
+            Some(b)
+                if kind == LineageKind::Published
+                    && b.source_id.as_deref() == Some(cp.source_id.as_str()) =>
+            {
+                (Some(b.binding_id.clone()), Some(b.direction))
+            }
+            _ => (None, None),
+        };
         Ok(Some(CellLineage {
             source_id: cp.source_id.clone(),
             kind,
@@ -4375,6 +4870,8 @@ impl WorkbookSession {
             sql,
             produced_range,
             produced_cells: entry.cells.len(),
+            binding_id,
+            direction,
         }))
     }
 
@@ -7648,7 +8145,15 @@ mod tests {
         let target = rng(sheet, 0, 0, 1, 0); // A1:A2
         let b = s.bind_range("b1", target).unwrap();
         assert_eq!(b.binding_id, "b1");
-        assert_eq!(s.binding("b1"), Some(target));
+        let bound = s.binding("b1").expect("binding present");
+        assert_eq!(bound.target, target);
+        assert_eq!(bound.direction, BindDirection::Forward);
+        assert!(bound.alive);
+        assert!(!bound.force_check);
+        assert_eq!(
+            bound.source_id, None,
+            "a bare bind_range has no provenance source until published"
+        );
         // Round-trip: a write into the bound region reads back via the normal path.
         s.write_range(target, vec![vec![num(10.0)], vec![num(20.0)]])
             .unwrap();
@@ -7665,7 +8170,11 @@ mod tests {
         let b = rng(sheet, 1, 1, 2, 2);
         s.bind_range("x", a).unwrap();
         s.bind_range("x", b).unwrap();
-        assert_eq!(s.binding("x"), Some(b), "re-binding overwrites the region");
+        assert_eq!(
+            s.binding("x").map(|bd| bd.target),
+            Some(b),
+            "re-binding overwrites the region"
+        );
     }
 
     /// An inverted target is a loud bad_argument and records no binding.
@@ -7703,7 +8212,7 @@ mod tests {
         s.set_value(addr(sheet, 0, 0), num(5.0)).unwrap();
         assert!(s.undo().unwrap().consumed);
         assert_eq!(
-            s.binding("b"),
+            s.binding("b").map(|bd| bd.target),
             Some(target),
             "binding survives undo (unlike provenance)"
         );
@@ -7720,6 +8229,711 @@ mod tests {
         s.close().unwrap();
         let closed = s.bind_range("b", rng(sheet, 0, 0, 0, 0)).unwrap_err();
         assert_eq!(closed.code, "invalid_state");
+    }
+
+    // --- TE1: publish↔bind unified-binding wiring ---
+
+    /// A `publish_dataset` is the DATA half of the unified binding: it upserts
+    /// `bindings[name]` with `source_id = name` (the lineage invariant), `Forward`
+    /// direction, `alive`, generation 0, and not force_check.
+    #[test]
+    fn publish_dataset_upserts_binding() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let target = rng(sheet, 0, 0, 2, 0); // A1:A3
+        let data = serde_json::json!({"values": [[1.0], [2.0], [3.0]]});
+        s.publish_dataset("prices", data, target).unwrap();
+        let b = s.binding("prices").expect("publish creates the binding");
+        assert_eq!(b.binding_id, "prices");
+        assert_eq!(b.target, target);
+        assert_eq!(b.direction, BindDirection::Forward);
+        assert_eq!(
+            b.source_id,
+            Some("prices".to_string()),
+            "lineage invariant: source_id == name"
+        );
+        assert_eq!(b.generation, 0);
+        assert!(b.alive);
+        assert!(!b.force_check);
+    }
+
+    /// `bind_range` declares (source_id None); a later `publish` on the same id
+    /// links the provenance source WITHOUT downgrading the declared direction, and
+    /// keeps generation 0 when the target is unchanged.
+    #[test]
+    fn bind_range_then_publish_links_source_and_preserves_target() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let target = rng(sheet, 0, 0, 1, 0); // A1:A2
+        s.bind_range("x", target).unwrap();
+        assert_eq!(
+            s.binding("x").unwrap().source_id,
+            None,
+            "a declaration has no source until published"
+        );
+        let data = serde_json::json!({"values": [[10.0], [20.0]]});
+        s.publish_dataset("x", data, target).unwrap();
+        let b = s.binding("x").unwrap();
+        assert_eq!(b.source_id, Some("x".to_string()), "publish links the source");
+        assert_eq!(b.target, target);
+        assert_eq!(b.generation, 0, "unchanged target → generation unchanged");
+        assert!(b.alive);
+    }
+
+    /// Re-publishing the SAME name to a resized target bumps the generation
+    /// (carried into the TE2 reverse plane to reject stale-envelope edits).
+    #[test]
+    fn republish_to_moved_target_bumps_generation() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "x",
+            serde_json::json!({"values": [[1.0], [2.0]]}),
+            rng(sheet, 0, 0, 1, 0), // A1:A2
+        )
+        .unwrap();
+        assert_eq!(s.binding("x").unwrap().generation, 0);
+        s.publish_dataset(
+            "x",
+            serde_json::json!({"values": [[1.0]]}),
+            rng(sheet, 0, 0, 0, 0), // A1 (shrunk target)
+        )
+        .unwrap();
+        assert_eq!(
+            s.binding("x").unwrap().generation,
+            1,
+            "a moved/resized target bumps the generation"
+        );
+    }
+
+    /// `bindings()` enumerates every binding; `unbind()` drops one and reports
+    /// whether it existed (No-Fallbacks: an unknown id is `false`, not a silent ok).
+    #[test]
+    fn bindings_enumerate_and_unbind_reports() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "a",
+            serde_json::json!({"values": [[1.0]]}),
+            rng(sheet, 0, 0, 0, 0),
+        )
+        .unwrap();
+        s.publish_dataset(
+            "b",
+            serde_json::json!({"values": [[2.0]]}),
+            rng(sheet, 1, 0, 1, 0),
+        )
+        .unwrap();
+        let mut ids: Vec<String> = s.bindings().into_iter().map(|x| x.binding_id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+        assert!(
+            s.unbind("a").unwrap(),
+            "unbind of an existing binding returns true"
+        );
+        assert!(s.binding("a").is_none(), "binding is gone after unbind");
+        assert!(
+            !s.unbind("a").unwrap(),
+            "unbind of an unknown id returns false"
+        );
+        assert_eq!(s.bindings().len(), 1, "only b remains");
+    }
+
+    // --- TE1: DEC-B undo reconciliation + D-RANGEMOVE structural invalidation ---
+
+    /// DEC-B: undo wipes the binding's backing provenance but KEEPS the binding
+    /// (alive), marking it `force_check` so the next kernel touch re-publishes; a
+    /// re-publish self-heals (clears force_check). Never a silent dangling pointer.
+    #[test]
+    fn undo_keeps_published_binding_and_marks_force_check() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let target = rng(sheet, 0, 0, 0, 0);
+        s.publish_dataset("x", serde_json::json!({"values": [[5.0]]}), target)
+            .unwrap();
+        let before = s.binding("x").unwrap();
+        assert!(before.alive && !before.force_check);
+        assert_eq!(before.source_id, Some("x".to_string()));
+        assert!(s.undo().unwrap().consumed);
+        let after = s.binding("x").expect("DEC-B: binding is KEPT across undo");
+        assert!(
+            after.alive,
+            "undo is not a structural invalidation — binding stays alive"
+        );
+        assert!(
+            after.force_check,
+            "DEC-B: undo wiped provenance → binding flagged force_check"
+        );
+        assert_eq!(after.target, target, "the declared envelope is unchanged");
+        // Re-publish self-heals: the next kernel touch clears force_check.
+        s.publish_dataset("x", serde_json::json!({"values": [[7.0]]}), target)
+            .unwrap();
+        assert!(
+            !s.binding("x").unwrap().force_check,
+            "re-publish clears force_check"
+        );
+    }
+
+    /// A bare `bind_range` (no provenance source) is NOT flagged force_check on
+    /// undo — it has no data to re-publish.
+    #[test]
+    fn undo_does_not_force_check_a_bare_bind_range() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let target = rng(sheet, 0, 0, 0, 0);
+        s.bind_range("b", target).unwrap();
+        s.set_value(addr(sheet, 0, 0), num(5.0)).unwrap();
+        assert!(s.undo().unwrap().consumed);
+        let b = s.binding("b").expect("bare binding survives undo");
+        assert!(b.alive && !b.force_check, "no source → no force_check");
+        assert_eq!(b.source_id, None);
+    }
+
+    /// D-RANGEMOVE (rows): a row insert invalidates only the bindings it
+    /// intersects or precedes; a binding entirely above the insert stays alive.
+    #[test]
+    fn structural_row_insert_invalidates_only_intersecting_bindings() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "before",
+            serde_json::json!({"values": [[1.0]]}),
+            rng(sheet, 0, 0, 0, 0), // A1 — above the insert
+        )
+        .unwrap();
+        s.publish_dataset(
+            "after",
+            serde_json::json!({"values": [[1.0], [2.0]]}),
+            rng(sheet, 4, 0, 5, 0), // A5:A6 — at/after the insert
+        )
+        .unwrap();
+        s.insert_rows(sheet, 2, 2).unwrap(); // insert 2 rows at row index 2
+        let before = s.binding("before").unwrap();
+        assert!(before.alive, "a binding entirely above the insert is unaffected");
+        assert!(
+            before.force_check,
+            "a spared source-backed binding is still force_check'd (provenance was wiped by the rebuild)"
+        );
+        assert!(
+            !s.binding("after").unwrap().alive,
+            "a binding at/after the insert is invalidated (anchored, not shifted)"
+        );
+    }
+
+    /// D-RANGEMOVE (cols): a column delete preceding a binding invalidates it.
+    #[test]
+    fn structural_col_delete_invalidates_binding() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "c",
+            serde_json::json!({"values": [[3.0]]}),
+            rng(sheet, 0, 2, 0, 2), // C1
+        )
+        .unwrap();
+        assert!(s.binding("c").unwrap().alive);
+        s.delete_columns(sheet, 0, 0).unwrap(); // delete column A (precedes C)
+        assert!(
+            !s.binding("c").unwrap().alive,
+            "a column delete preceding the binding invalidates it"
+        );
+    }
+
+    /// D-RANGEMOVE (sheet): deleting a sheet invalidates only its bindings;
+    /// bindings on other sheets stay alive.
+    #[test]
+    fn delete_sheet_invalidates_bindings_on_that_sheet() {
+        let mut s = WorkbookSession::new();
+        let s1 = s.add_sheet("S1", 16384).unwrap();
+        let s2 = s.add_sheet("S2", 16384).unwrap();
+        s.publish_dataset(
+            "on_s1",
+            serde_json::json!({"values": [[1.0]]}),
+            rng(s1, 0, 0, 0, 0),
+        )
+        .unwrap();
+        s.publish_dataset(
+            "on_s2",
+            serde_json::json!({"values": [[2.0]]}),
+            rng(s2, 0, 0, 0, 0),
+        )
+        .unwrap();
+        s.delete_sheet(s1).unwrap();
+        assert!(
+            !s.binding("on_s1").unwrap().alive,
+            "binding on the deleted sheet is invalidated"
+        );
+        assert!(
+            s.binding("on_s2").unwrap().alive,
+            "binding on a surviving sheet stays alive"
+        );
+    }
+
+    /// TE1 (step 4): `cell_lineage` on a published cell cross-links to its binding
+    /// (`binding_id == source_id`, direction Forward).
+    #[test]
+    fn cell_lineage_links_published_binding() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "x",
+            serde_json::json!({"values": [[1.0], [2.0]]}),
+            rng(sheet, 0, 0, 1, 0),
+        )
+        .unwrap();
+        let lin = s
+            .cell_lineage(addr(sheet, 0, 0))
+            .unwrap()
+            .expect("a published cell has lineage");
+        assert_eq!(lin.kind, LineageKind::Published);
+        assert_eq!(lin.binding_id, Some("x".to_string()));
+        assert_eq!(lin.direction, Some(BindDirection::Forward));
+    }
+
+    /// TE1 (step 4): `bind_range_with_direction` declares an editable
+    /// (Bidirectional) binding; a later publish preserves the direction (the
+    /// `None`-preserve path never downgrades it to Forward).
+    #[test]
+    fn bind_range_with_direction_sets_and_publish_preserves_bidirectional() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let target = rng(sheet, 0, 0, 0, 0);
+        s.bind_range_with_direction("e", target, Some(BindDirection::Bidirectional))
+            .unwrap();
+        assert_eq!(
+            s.binding("e").unwrap().direction,
+            BindDirection::Bidirectional
+        );
+        s.publish_dataset("e", serde_json::json!({"values": [[9.0]]}), target)
+            .unwrap();
+        assert_eq!(
+            s.binding("e").unwrap().direction,
+            BindDirection::Bidirectional,
+            "publish preserves the declared Bidirectional direction"
+        );
+    }
+
+    // --- TE1 audit-fold regressions (Codex BLOCKER/HIGH + lane MEDIUMs) ---
+
+    /// Codex BLOCKER: `bind_range` re-declaring a source-backed binding must NOT
+    /// clear DEC-B `force_check` — only a `publish_dataset` (which re-records
+    /// provenance) may heal staleness. publish → undo → bind_range(same) keeps the
+    /// binding stale until an actual re-publish.
+    #[test]
+    fn bind_range_after_undo_preserves_force_check() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let target = rng(sheet, 0, 0, 1, 0); // A1:A2
+        s.publish_dataset("x", serde_json::json!({"values": [[1.0], [2.0]]}), target)
+            .unwrap();
+        assert!(s.undo().unwrap().consumed);
+        assert!(s.binding("x").unwrap().force_check, "undo set force_check");
+        // A bare re-declaration of the same region must NOT pretend the binding is
+        // fresh — provenance is still gone.
+        s.bind_range("x", target).unwrap();
+        let b = s.binding("x").unwrap();
+        assert!(
+            b.force_check,
+            "BLOCKER regression: bind_range must not clear undo force_check"
+        );
+        assert_eq!(b.source_id, Some("x".to_string()), "source link preserved");
+        // Only a real re-publish heals it.
+        s.publish_dataset("x", serde_json::json!({"values": [[3.0], [4.0]]}), target)
+            .unwrap();
+        assert!(!s.binding("x").unwrap().force_check, "re-publish heals it");
+    }
+
+    /// Codex HIGH: `bind_range` must reject moving a source-backed binding's
+    /// envelope away from the cells its source actually produced (lineage-invariant
+    /// break) — re-publish is the only way to move a bound dataset.
+    #[test]
+    fn bind_range_move_off_published_cells_is_rejected() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let target = rng(sheet, 0, 0, 1, 0); // A1:A2
+        s.publish_dataset("x", serde_json::json!({"values": [[1.0], [2.0]]}), target)
+            .unwrap();
+        // C1:C2 does not cover A1:A2 (the produced cells) → loud bad_argument.
+        let err = s.bind_range("x", rng(sheet, 0, 2, 1, 2)).unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        // The binding is unchanged (still over A1:A2).
+        assert_eq!(s.binding("x").unwrap().target, target);
+        // A re-declaration that still COVERS the produced cells is allowed (e.g. a
+        // larger envelope), and changes direction without moving off the data.
+        s.bind_range_with_direction(
+            "x",
+            rng(sheet, 0, 0, 2, 0), // A1:A3 ⊇ A1:A2
+            Some(BindDirection::Bidirectional),
+        )
+        .unwrap();
+        let b = s.binding("x").unwrap();
+        assert_eq!(b.direction, BindDirection::Bidirectional);
+        assert_eq!(b.source_id, Some("x".to_string()));
+    }
+
+    /// Codex HIGH: after `unbind` + bare `bind_range` re-declaration, `cell_lineage`
+    /// must NOT relink the old published cells to the now-source-less binding.
+    #[test]
+    fn cell_lineage_does_not_relink_after_unbind_and_bare_rebind() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "x",
+            serde_json::json!({"values": [[1.0]]}),
+            rng(sheet, 0, 0, 0, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            s.cell_lineage(addr(sheet, 0, 0)).unwrap().unwrap().binding_id,
+            Some("x".to_string())
+        );
+        assert!(s.unbind("x").unwrap());
+        // A NEW bare binding reusing the id, on a different region.
+        s.bind_range("x", rng(sheet, 0, 2, 0, 2)).unwrap();
+        let lin = s.cell_lineage(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(lin.source_id, "x", "the cell is still provenance-owned by x");
+        assert_eq!(
+            lin.binding_id, None,
+            "HIGH regression: a source-less rebind must not relink old cells"
+        );
+        assert_eq!(lin.direction, None);
+    }
+
+    /// Lane A MEDIUM: a structurally-invalidated binding must NOT carry the
+    /// contradictory {alive=false, force_check=true} state — a dead binding needs a
+    /// re-bind, not a re-publish.
+    #[test]
+    fn structural_invalidation_clears_force_check() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "y",
+            serde_json::json!({"values": [[1.0], [2.0]]}),
+            rng(sheet, 4, 0, 5, 0), // A5:A6
+        )
+        .unwrap();
+        s.insert_rows(sheet, 2, 2).unwrap(); // intersects/precedes → invalidates
+        let b = s.binding("y").unwrap();
+        assert!(!b.alive, "invalidated");
+        assert!(
+            !b.force_check,
+            "a dead binding must not also be flagged force_check"
+        );
+    }
+
+    /// Lane C: redo of a publish runs the same DEC-B path as undo — the binding is
+    /// kept and re-flagged force_check (provenance is not replayed).
+    #[test]
+    fn redo_of_publish_marks_force_check() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let target = rng(sheet, 0, 0, 0, 0);
+        s.publish_dataset("x", serde_json::json!({"values": [[5.0]]}), target)
+            .unwrap();
+        assert!(s.undo().unwrap().consumed);
+        assert!(s.redo().unwrap().consumed);
+        let b = s.binding("x").expect("binding kept across redo");
+        assert!(b.alive);
+        assert!(b.force_check, "redo's rematerialize re-flags force_check");
+    }
+
+    /// Redo correctness: a structural edit that SPARES a binding (entirely before it)
+    /// leaves it alive through undo→redo. (Contrast
+    /// `redo_of_structural_edit_invalidates_a_binding_declared_while_pending`, which
+    /// exercises the case where a redone edit DOES shift a binding — reachable because
+    /// `bind_range` is session-local and does NOT clear the redo stack.)
+    #[test]
+    fn redo_of_structural_edit_keeps_spared_binding_alive() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "z",
+            serde_json::json!({"values": [[1.0]]}),
+            rng(sheet, 0, 0, 0, 0), // A1 — above the edit
+        )
+        .unwrap();
+        s.insert_rows(sheet, 5, 1).unwrap(); // at row 5, spares A1
+        assert!(s.binding("z").unwrap().alive, "spared by the insert");
+        assert!(s.undo().unwrap().consumed);
+        assert!(s.redo().unwrap().consumed);
+        assert!(
+            s.binding("z").unwrap().alive,
+            "still spared after undo→redo of the structural edit"
+        );
+    }
+
+    /// Lane C: the row-DELETE structural path invalidates a binding it precedes.
+    #[test]
+    fn structural_row_delete_invalidates_binding() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "d",
+            serde_json::json!({"values": [[1.0], [2.0]]}),
+            rng(sheet, 2, 0, 3, 0), // A3:A4
+        )
+        .unwrap();
+        s.delete_rows(sheet, 0, 0).unwrap(); // delete row 0 (precedes)
+        assert!(!s.binding("d").unwrap().alive);
+    }
+
+    /// Lane C: the column-INSERT structural path invalidates a binding it precedes.
+    #[test]
+    fn structural_col_insert_invalidates_binding() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "ci",
+            serde_json::json!({"values": [[3.0]]}),
+            rng(sheet, 0, 2, 0, 2), // C1
+        )
+        .unwrap();
+        s.insert_columns(sheet, 0, 1).unwrap(); // insert at col 0 (precedes C)
+        assert!(!s.binding("ci").unwrap().alive);
+    }
+
+    /// Lane C: publish → unbind → republish is a FRESH binding (generation 0), not
+    /// a rebind off the dropped one.
+    #[test]
+    fn publish_unbind_republish_is_fresh_generation() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let target = rng(sheet, 0, 0, 0, 0);
+        s.publish_dataset("u", serde_json::json!({"values": [[1.0]]}), target)
+            .unwrap();
+        assert!(s.unbind("u").unwrap());
+        assert!(s.binding("u").is_none());
+        s.publish_dataset("u", serde_json::json!({"values": [[2.0]]}), target)
+            .unwrap();
+        assert_eq!(
+            s.binding("u").unwrap().generation,
+            0,
+            "a republish after unbind starts a fresh binding"
+        );
+    }
+
+    /// Lane C: a structurally-invalidated binding is READABLE as `Some{alive:false}`
+    /// — never elided to `None` (No-Fallbacks: distinguish never-bound from
+    /// bound-then-invalidated).
+    #[test]
+    fn dead_binding_is_readable_not_none() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "x",
+            serde_json::json!({"values": [[1.0], [2.0]]}),
+            rng(sheet, 0, 0, 1, 0), // A1:A2
+        )
+        .unwrap();
+        s.insert_rows(sheet, 0, 1).unwrap(); // at row 0, intersects
+        let b = s.binding("x");
+        assert!(b.is_some(), "dead binding is not elided to None");
+        assert!(!b.unwrap().alive);
+    }
+
+    // --- TE1 audit-fold round 2 (Codex/Sonnet re-audit) ---
+
+    /// Round-2 (Codex MED / Sonnet HIGH): a binding invalidated by a structural
+    /// edit must STAY {alive=false, force_check=false} across a later undo/redo —
+    /// `rematerialize`'s DEC-B pass must NOT resurrect `force_check` on a dead
+    /// binding (it gates on `&& binding.alive`).
+    #[test]
+    fn dead_binding_stays_force_check_clear_across_undo_redo() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.publish_dataset(
+            "y",
+            serde_json::json!({"values": [[1.0], [2.0]]}),
+            rng(sheet, 4, 0, 5, 0),
+        )
+        .unwrap();
+        s.insert_rows(sheet, 2, 2).unwrap();
+        let b = s.binding("y").unwrap();
+        assert!(!b.alive && !b.force_check, "invalidated: dead + clear");
+        assert!(s.undo().unwrap().consumed);
+        let b = s.binding("y").unwrap();
+        assert!(
+            !b.alive && !b.force_check,
+            "undo must not resurrect force_check on a dead binding"
+        );
+        assert!(s.redo().unwrap().consumed);
+        let b = s.binding("y").unwrap();
+        assert!(
+            !b.alive && !b.force_check,
+            "redo must not resurrect force_check on a dead binding"
+        );
+    }
+
+    /// Round-2 (Sonnet MED): after a sheet delete invalidates a binding,
+    /// re-declaring that id on a SURVIVING sheet is a FRESH bind — not a misleading
+    /// `bad_argument` about the dead source's cells on the now-deleted sheet.
+    #[test]
+    fn bind_range_after_sheet_delete_is_fresh_not_rejected() {
+        let mut s = WorkbookSession::new();
+        let s1 = s.add_sheet("S1", 16384).unwrap();
+        let s2 = s.add_sheet("S2", 16384).unwrap();
+        s.publish_dataset(
+            "x",
+            serde_json::json!({"values": [[1.0]]}),
+            rng(s1, 0, 0, 0, 0),
+        )
+        .unwrap();
+        s.delete_sheet(s1).unwrap();
+        assert!(!s.binding("x").unwrap().alive, "binding on deleted sheet is dead");
+        // Re-declaring on the surviving sheet succeeds as a fresh bare binding.
+        s.bind_range("x", rng(s2, 0, 0, 0, 0)).unwrap();
+        let b = s.binding("x").unwrap();
+        assert!(b.alive, "re-declaration revives a fresh binding");
+        assert_eq!(b.source_id, None, "the stale source link is dropped (fresh bind)");
+        assert_eq!(b.target.sheet, s2);
+    }
+
+    /// **TE1 HIGH-1 (w135) — FIXED (was the Codex round-2 `#[ignore]` gap).** A
+    /// bare `bind_range` binding declared while a structural REDO is pending must be
+    /// invalidated when the redo re-applies the shift. `bind_range` is session-local
+    /// (it does NOT clear the redo stack), so the insert is re-applied AFTER the
+    /// binding exists, shifting its target out from under it. The redo path replays
+    /// the op-log via `rematerialize` rather than `apply_structural_edit`, so the
+    /// fix lives in `rematerialize`: it recomputes the net-active structural-edit set
+    /// from the current op-log and re-runs D-RANGEMOVE invalidation for every edit
+    /// that just became active (here, the redone insert). This needs NEITHER a
+    /// VersionVector (the op-log VV is monotonic across undo/redo — it cannot tell an
+    /// undone edit from a live one) NOR recovery of "lowered" structural intent (the
+    /// op-log retains the distinguishable `Op::InsertRows`/etc. variant verbatim).
+    #[test]
+    fn redo_of_structural_edit_invalidates_a_binding_declared_while_pending() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.insert_rows(sheet, 2, 1).unwrap();
+        assert!(s.undo().unwrap().consumed); // structural redo pending
+        s.bind_range("b", rng(sheet, 4, 0, 4, 0)).unwrap(); // session-local: redo NOT cleared
+        assert!(s.binding("b").unwrap().alive, "fresh declaration is live");
+        assert!(s.redo().unwrap().consumed); // re-applies insert at 2, shifts row 4
+        assert!(
+            !s.binding("b").unwrap().alive,
+            "the redone insert at row 2 shifts the row-4 target → binding is invalidated"
+        );
+        // D-RANGEMOVE clears force_check on a dead binding (needs a re-bind, not a
+        // re-publish) — never the contradictory {alive=false, force_check=true}.
+        assert!(!s.binding("b").unwrap().force_check);
+    }
+
+    /// **TE1 HIGH-1 (w135):** the redo invalidation respects the SAME anchored
+    /// predicate as the forward path — a redone edit that does NOT intersect/precede
+    /// the binding's target must leave it `alive` (no blanket kill on redo).
+    #[test]
+    fn redo_of_non_intersecting_structural_edit_keeps_binding_alive() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.insert_rows(sheet, 10, 1).unwrap(); // insert BELOW the binding's row
+        assert!(s.undo().unwrap().consumed);
+        s.bind_range("b", rng(sheet, 4, 0, 4, 0)).unwrap();
+        assert!(s.redo().unwrap().consumed); // re-applies insert at row 10
+        assert!(
+            s.binding("b").unwrap().alive,
+            "an insert entirely below the row-4 target does not affect it"
+        );
+    }
+
+    /// **TE1 HIGH-1 (w135):** column-axis coverage — a redone `insert_columns`
+    /// intersecting/preceding a binding's target column invalidates it.
+    #[test]
+    fn redo_of_column_insert_invalidates_intersecting_binding() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.insert_columns(sheet, 1, 1).unwrap();
+        assert!(s.undo().unwrap().consumed);
+        s.bind_range("b", rng(sheet, 0, 3, 0, 3)).unwrap(); // target at column 3
+        assert!(s.redo().unwrap().consumed); // re-applies insert at column 1
+        assert!(
+            !s.binding("b").unwrap().alive,
+            "the redone column insert at col 1 shifts the col-3 target → invalidated"
+        );
+    }
+
+    /// **TE1 HIGH-1 (w135) — BINDING-RELATIVE invalidation (Codex round-2 followup).**
+    /// A binding declared while a structural edit is ALREADY active is anchored to the
+    /// POST-edit grid (that edit is in its BIRTH set). Undo removes the edit (DEC-B
+    /// keeps the bare binding alive), and a REDO RESTORES the exact birth grid — so the
+    /// binding must stay `alive`. A naive session-global active-set diff wrongly killed
+    /// it on the redo (the edit looked "newly active" globally); the per-binding birth
+    /// comparison makes the redo a correct no-op.
+    #[test]
+    fn redo_restoring_a_bindings_birth_grid_keeps_it_alive() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.insert_rows(sheet, 2, 1).unwrap(); // edit active
+        s.bind_range("b", rng(sheet, 4, 0, 4, 0)).unwrap(); // declared UNDER the active insert
+        assert!(s.binding("b").unwrap().alive);
+        assert!(s.undo().unwrap().consumed); // remove insert (DEC-B: keep the bare binding)
+        assert!(
+            s.binding("b").unwrap().alive,
+            "undo keeps a bare binding alive (DEC-B); only becomes-active edits invalidate"
+        );
+        assert!(s.redo().unwrap().consumed); // RESTORE the binding's birth grid
+        assert!(
+            s.binding("b").unwrap().alive,
+            "redo restores the exact grid the binding was declared under → not a false invalidation"
+        );
+    }
+
+    /// **TE1 HIGH-1 (w135):** birth-relative invalidation still fires for a GENUINELY
+    /// new intersecting edit even when the binding's birth set is non-empty (a prior
+    /// non-intersecting edit was active at declaration).
+    #[test]
+    fn new_intersecting_edit_invalidates_a_binding_with_a_nonempty_birth_set() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.insert_rows(sheet, 10, 1).unwrap(); // active, below the binding
+        s.bind_range("b", rng(sheet, 4, 0, 4, 0)).unwrap(); // birth = [insert@10]; alive
+        assert!(s.binding("b").unwrap().alive);
+        s.insert_rows(sheet, 2, 1).unwrap(); // NEW edit intersecting row 4
+        assert!(
+            !s.binding("b").unwrap().alive,
+            "a new intersecting edit invalidates even when the birth set is non-empty"
+        );
+    }
+
+    /// **TE1 HIGH-1 (w135) — sheet-delete REDO gap (Codex round-2 followup).** A redo
+    /// of `Op::RemoveSheet` routes only through `rematerialize`, not the forward
+    /// `delete_sheet` path, so the sheet-liveness check (not the row/col scan) must
+    /// catch a binding left on the re-tombstoned sheet — never report it stale-alive.
+    #[test]
+    fn redo_of_sheet_delete_invalidates_binding_on_the_tombstoned_sheet() {
+        let mut s = WorkbookSession::new();
+        let _s1 = s.add_sheet("S1", 16384).unwrap();
+        let s2 = s.add_sheet("S2", 16384).unwrap();
+        s.delete_sheet(s2).unwrap();
+        assert!(s.undo().unwrap().consumed); // s2 restored, redo pending
+        s.bind_range("b", rng(s2, 0, 0, 0, 0)).unwrap(); // declared on the restored sheet
+        assert!(s.binding("b").unwrap().alive);
+        assert!(s.redo().unwrap().consumed); // re-tombstone s2
+        assert!(
+            !s.binding("b").unwrap().alive,
+            "a binding on a redo-tombstoned sheet must not stay stale-live"
+        );
+    }
+
+    /// **TE1 HIGH-1 (w135) — forward backstop is load-bearing (Codex re-audit nuance).**
+    /// A NEW forward edit value-equal to a binding's BIRTH edit is masked by the
+    /// birth-relative `rematerialize` pass (the multiset diff matches it by value), but
+    /// the forward `invalidate_bindings_for_structural_edit` backstop kills the binding
+    /// — a genuinely new shift must invalidate (contrast `redo_restoring_a_bindings_birth_grid_keeps_it_alive`,
+    /// where a REDO restores the birth grid and the binding is correctly spared). This
+    /// locks the forward call as load-bearing (do not delete it as "redundant").
+    #[test]
+    fn forward_value_equal_replacement_edit_invalidates_via_the_backstop() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.insert_rows(sheet, 2, 1).unwrap(); // edit active; birth of "b" will be [insert@2]
+        s.bind_range("b", rng(sheet, 4, 0, 4, 0)).unwrap();
+        assert!(s.undo().unwrap().consumed); // remove the insert (b kept alive, DEC-B)
+        assert!(s.binding("b").unwrap().alive);
+        s.insert_rows(sheet, 2, 1).unwrap(); // NEW forward insert@2 (value-equal to birth; clears redo)
+        assert!(
+            !s.binding("b").unwrap().alive,
+            "a NEW forward edit value-equal to the birth edit still invalidates (forward backstop)"
+        );
     }
 
     // --- 6.4-2: register_function / unregister_function / list_functions ---

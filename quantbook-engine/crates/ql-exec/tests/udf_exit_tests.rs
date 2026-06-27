@@ -313,7 +313,7 @@ fn exit_test_5_boundframe_overlay_edit_dirties_bound_range_formulas() {
         .expect("bind_range registers the overlay region");
     assert_eq!(bound.binding_id, "binding-1");
     assert_eq!(
-        s.binding("binding-1"),
+        s.binding("binding-1").map(|b| b.target),
         Some(target),
         "the bound region is recorded and resolvable by id"
     );

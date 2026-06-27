@@ -6311,6 +6311,70 @@ pub struct BoundRangeJson {
     pub binding_id: String,
 }
 
+/// **TE1 (var↔cell moat):** JS-facing binding record (mirrors
+/// [`ql_session::BindingInfo`]). Returned by `Session.binding` / `Session.bindings`
+/// — the engine-authoritative source the IDE's `PublishedCellsStore` mirrors.
+/// `direction` is `"forward"` | `"bidirectional"`; `sourceId` is absent for a bare
+/// `bindRange` declaration not yet published. `alive=false` marks a binding
+/// invalidated by a structural edit; `forceCheck=true` marks one whose backing
+/// provenance was wiped by undo/redo or any rebuild (needs a re-publish; the
+/// kernel's next touch re-publishes and clears it).
+#[napi(object)]
+pub struct BindingInfoJson {
+    pub binding_id: String,
+    pub target: CellRangeJson,
+    pub direction: String,
+    pub source_id: Option<String>,
+    pub generation: BigInt,
+    pub alive: bool,
+    pub force_check: bool,
+}
+
+/// **TE1:** map an engine [`ql_session::BindDirection`] to its JS string form.
+fn bind_direction_to_string(d: ql_session::BindDirection) -> String {
+    match d {
+        ql_session::BindDirection::Forward => "forward".to_string(),
+        ql_session::BindDirection::Bidirectional => "bidirectional".to_string(),
+    }
+}
+
+/// **TE1:** parse the optional JS `direction` arg of `bindRange`. `None` preserves
+/// the existing direction (or `Forward` for a fresh binding);
+/// `"forward"`/`"bidirectional"` set it; any other string is a loud
+/// `[bad_argument]` (No-Fallbacks, never a silent default).
+fn parse_bind_direction(
+    method: &str,
+    direction: Option<&str>,
+) -> Result<Option<ql_session::BindDirection>> {
+    match direction {
+        None => Ok(None),
+        Some("forward") => Ok(Some(ql_session::BindDirection::Forward)),
+        Some("bidirectional") => Ok(Some(ql_session::BindDirection::Bidirectional)),
+        Some(other) => Err(bad_argument_error(format!(
+            "{method}: direction must be \"forward\" or \"bidirectional\", got {other:?}"
+        ))),
+    }
+}
+
+/// **TE1:** map an engine [`ql_session::BindingInfo`] to its JS-facing JSON.
+fn binding_info_to_json(b: ql_session::BindingInfo) -> BindingInfoJson {
+    BindingInfoJson {
+        binding_id: b.binding_id,
+        target: CellRangeJson {
+            sheet: f64::from(u32::from(b.target.sheet)),
+            start_row: f64::from(b.target.start_row),
+            start_col: f64::from(b.target.start_col),
+            end_row: f64::from(b.target.end_row),
+            end_col: f64::from(b.target.end_col),
+        },
+        direction: bind_direction_to_string(b.direction),
+        source_id: b.source_id,
+        generation: BigInt::from(b.generation),
+        alive: b.alive,
+        force_check: b.force_check,
+    }
+}
+
 /// **R23 SQL→cell lineage:** JS-facing lineage for a single cell (mirrors
 /// [`ql_session::CellLineage`]). Returned by `Session.cellLineage`; the JS side
 /// receives `null` when the cell has no tracked lineage (an ordinary user-typed
@@ -6345,6 +6409,13 @@ pub struct CellLineageJson {
     pub produced_end_col: u32,
     /// How many cells the source produced in its last materialization.
     pub produced_cells: u32,
+    /// **TE1:** the unified binding this cell's source drives, if the source is a
+    /// published Python var (`sourceId == bindingId`). Absent for a SQL `"query"`
+    /// source or if no binding exists.
+    pub binding_id: Option<String>,
+    /// **TE1:** the binding's data-flow direction (`"forward"` | `"bidirectional"`)
+    /// — present only when `bindingId` is present.
+    pub direction: Option<String>,
 }
 
 /// **R24 (Wave L3) — used range:** the effective VALUE extent of one sheet,
@@ -8229,17 +8300,64 @@ impl Session {
         env: Env,
         binding_id: String,
         target: CellRangeJson,
+        direction: Option<String>,
     ) -> Result<BoundRangeJson> {
         guarded(env, "bindRange", || {
             let target = session_range_from_json("bindRange", target)?;
+            let direction = parse_bind_direction("bindRange", direction.as_deref())?;
             let result = self
                 .inner
                 .lock()
-                .bind_range(&binding_id, target)
+                .bind_range_with_direction(&binding_id, target, direction)
                 .map_err(|e| engine_error_to_napi(env, e))?;
             Ok(BoundRangeJson {
                 binding_id: result.binding_id,
             })
+        })
+    }
+
+    /// **TE1 (var↔cell moat):** read the unified binding for `bindingId`, or `null`
+    /// if none exists. A structurally-invalidated binding is returned with
+    /// `alive=false` (never elided to null), so the caller distinguishes
+    /// never-bound from bound-then-invalidated.
+    #[napi(js_name = "binding", catch_unwind)]
+    pub fn binding(&self, env: Env, binding_id: String) -> Result<Option<BindingInfoJson>> {
+        guarded(env, "binding", || {
+            Ok(self
+                .inner
+                .lock()
+                .binding(&binding_id)
+                .map(binding_info_to_json))
+        })
+    }
+
+    /// **TE1:** enumerate every binding — the engine-authoritative source the IDE's
+    /// `PublishedCellsStore` mirrors. Includes dead (`alive=false`) bindings so the
+    /// caller can surface invalidations, never silently elide them.
+    #[napi(js_name = "bindings", catch_unwind)]
+    pub fn bindings(&self, env: Env) -> Result<Vec<BindingInfoJson>> {
+        guarded(env, "bindings", || {
+            Ok(self
+                .inner
+                .lock()
+                .bindings()
+                .into_iter()
+                .map(binding_info_to_json)
+                .collect())
+        })
+    }
+
+    /// **TE1:** drop a binding (the engine half of the kernel's `unpublish` reverse
+    /// frame / teardown). Returns `true` if a binding existed and was removed,
+    /// `false` for an unknown id (No-Fallbacks: never a silent no-op). Leaves the
+    /// already-written cell values untouched.
+    #[napi(js_name = "unbind", catch_unwind)]
+    pub fn unbind(&self, env: Env, binding_id: String) -> Result<bool> {
+        guarded(env, "unbind", || {
+            self.inner
+                .lock()
+                .unbind(&binding_id)
+                .map_err(|e| engine_error_to_napi(env, e))
         })
     }
 
@@ -8348,6 +8466,8 @@ impl Session {
                 // truncating the count.
                 produced_cells: u32::try_from(l.produced_cells)
                     .expect("produced_cells exceeds u32::MAX (write_range caps at 1 << 20)"),
+                binding_id: l.binding_id,
+                direction: l.direction.map(bind_direction_to_string),
             }))
         })
     }
