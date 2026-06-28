@@ -143,7 +143,14 @@ pub fn import_xlsx_path(
     options: XlsxImportOptions,
     recomputer: Option<&dyn XlsxRecomputer>,
 ) -> Result<XlsxImportResult, XlsxError> {
-    let bytes = std::fs::read(path.as_ref())?;
+    let path = path.as_ref();
+    // **W-S5 (DoS hardening — DoD-5):** reject an oversized input *before*
+    // reading it into memory. `std::fs::read` would otherwise allocate the
+    // whole (potentially multi-GiB) file first. `metadata` surfaces a missing
+    // file as the same `XlsxError::Io` the prior `fs::read` did.
+    let len = std::fs::metadata(path)?.len();
+    read::limits::check_input_size(len, "input file")?;
+    let bytes = std::fs::read(path)?;
     import_xlsx_bytes(&bytes, registry, options, recomputer)
 }
 
@@ -159,6 +166,15 @@ pub fn import_xlsx_bytes(
     options: XlsxImportOptions,
     recomputer: Option<&dyn XlsxRecomputer>,
 ) -> Result<XlsxImportResult, XlsxError> {
+    // **W-S5 (DoS hardening — DoD-5/DoD-2):** before ANY parser (calamine or
+    // the OOXML scanner) touches these untrusted bytes, run the zip-bomb /
+    // oversized-input wall. This is the only point at which calamine's
+    // internal decompression can be bounded (it owns its zip reader and
+    // exposes no size knob), so the guard validates the same archive up front
+    // and rejects loudly — never silently truncating. See `read::limits`.
+    read::limits::check_input_size(bytes.len() as u64, "in-memory buffer")?;
+    read::limits::validate_archive(bytes)?;
+
     let mut report = XlsxImportReport::default();
 
     // **W5-D-14b — Phase 0**: build the OOXML package handle. Shared
@@ -629,6 +645,41 @@ mod tests {
             other => panic!("expected Zip error for empty preservation, got {other:?}"),
         }
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // **W-S5 (DoS hardening):** the guard must NOT break a legitimate
+    // workbook. Round-trip a small real workbook (export → import) and assert
+    // it still imports cleanly with the guard inserted. Gated on `write`
+    // (uses the umya writer); the crate's own test builds enable it by default.
+    #[cfg(feature = "write")]
+    #[test]
+    fn normal_workbook_still_imports_through_dos_guard() {
+        use ql_storage::Workbook;
+        use ql_types::Value;
+
+        let reg = ql_functions::default_registry();
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("Sheet1");
+        wb.put_at(s0, 0, 0, Value::Number(42.0));
+        wb.put_at(s0, 1, 0, Value::text("hello"));
+
+        let (bytes, _export_report) =
+            export_xlsx_bytes(&wb, &reg, XlsxExportOptions::default()).expect("export must succeed");
+
+        // RecomputeMode::Skip → no recomputer needed (the lib-test crate can't
+        // reference ql_exec::EngineXlsxRecomputer; see notes above).
+        let opts = XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        };
+        let result = import_xlsx_bytes(&bytes, &reg, opts, None)
+            .expect("a normal small workbook must import past the DoS guard");
+        let sheet = result.workbook.sheet(s0).expect("sheet 0 present");
+        assert_eq!(sheet.read(0, 0), Value::Number(42.0));
+        match sheet.read(1, 0) {
+            Value::Text(s) => assert_eq!(&*s, "hello"),
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 
     #[test]

@@ -33,6 +33,19 @@ impl XlsxPackage {
     /// packages have a `xl/styles.xml`, for instance). Returns
     /// `Err(XlsxError::Zip)` for genuinely broken zips.
     pub(crate) fn read_part_string(&self, path: &str) -> Result<Option<String>, XlsxError> {
+        // The public read passes the production per-part ceiling; the limit is
+        // threaded through `read_part_string_with_limit` so unit tests can
+        // exercise the backstop with a small, fast ceiling (mirrors the
+        // `validate_archive` / `validate_archive_with_limits` split).
+        self.read_part_string_with_limit(path, crate::read::limits::MAX_PART_UNCOMPRESSED_BYTES)
+    }
+
+    /// Inner read with an injectable per-part decompressed-size `limit`.
+    fn read_part_string_with_limit(
+        &self,
+        path: &str,
+        limit: u64,
+    ) -> Result<Option<String>, XlsxError> {
         let mut archive =
             zip::ZipArchive::new(Cursor::new(self.bytes.as_slice())).map_err(XlsxError::Zip)?;
         // ZipArchive::by_name returns Err for missing parts. We want
@@ -53,7 +66,26 @@ impl XlsxPackage {
         const MAX_PREALLOC: u64 = 64 * 1024 * 1024;
         let prealloc = file.size().min(MAX_PREALLOC) as usize;
         let mut content = String::with_capacity(prealloc);
-        file.read_to_string(&mut content)?;
+        // **W-S5 (DoS hardening):** runtime backstop on the actual decompressed
+        // output. `zip` caps the decompressor *input* to compressed_size but
+        // leaves the *output* unbounded, so without a `take` a high-ratio entry
+        // expands to GiB here regardless of the prealloc cap. We bound the read
+        // to `limit` + 1 (the +1 makes overflow observable) and reject loudly —
+        // never silently truncate. The up-front `read::limits::validate_archive`
+        // guard already vetted the whole package, but this keeps the part reader
+        // safe in isolation (defense-in-depth, and it does NOT trust the
+        // declared size).
+        let mut limited = (&mut file).take(limit + 1);
+        limited.read_to_string(&mut content)?;
+        if content.len() as u64 > limit {
+            return Err(XlsxError::MalformedOoxml {
+                part: path.to_string(),
+                message: format!(
+                    "[W-S5 DoS guard] OOXML part decompresses past the per-part limit of \
+                     {limit} bytes (zip-bomb defense)"
+                ),
+            });
+        }
         Ok(Some(content))
     }
 
@@ -75,5 +107,63 @@ impl XlsxPackage {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Build an in-memory zip with one deflated part.
+    fn zip_with_part(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file(name, opts).unwrap();
+            zw.write_all(data).unwrap();
+            zw.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn read_part_string_backstop_rejects_part_over_limit() {
+        // Part decompresses to 2048 bytes; with a 1024-byte limit the runtime
+        // backstop must reject. Proves the `content.len() as u64 > limit` guard
+        // in isolation — a `>`→`>=` flip or a wrong-constant regression would
+        // otherwise slip past the up-front validate_archive guard unnoticed.
+        let bytes = zip_with_part("xl/styles.xml", &vec![b'x'; 2048]);
+        let pkg = XlsxPackage::from_bytes(bytes);
+        match pkg.read_part_string_with_limit("xl/styles.xml", 1024) {
+            Err(XlsxError::MalformedOoxml { message, .. }) => {
+                assert!(message.contains("per-part limit"), "msg: {message}");
+                assert!(message.contains("zip-bomb"), "msg: {message}");
+            }
+            other => panic!("expected per-part backstop rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_part_string_returns_full_content_at_or_under_limit() {
+        // A normal part well under the limit reads back verbatim (the backstop
+        // must not truncate or corrupt legitimate content).
+        let bytes = zip_with_part("xl/styles.xml", b"<styleSheet/>");
+        let pkg = XlsxPackage::from_bytes(bytes);
+        let got = pkg.read_part_string_with_limit("xl/styles.xml", 1024).unwrap();
+        assert_eq!(got.as_deref(), Some("<styleSheet/>"));
+    }
+
+    #[test]
+    fn read_part_string_missing_part_is_none() {
+        let bytes = zip_with_part("xl/styles.xml", b"<styleSheet/>");
+        let pkg = XlsxPackage::from_bytes(bytes);
+        assert_eq!(
+            pkg.read_part_string_with_limit("xl/does-not-exist.xml", 1024)
+                .unwrap(),
+            None
+        );
     }
 }
