@@ -1,5 +1,7 @@
 # Quantbook FE Plan — "Beyond Excel/Sheets" Megaudit — SYNTHESIS
 
+> **TE1 UPDATE (2026-06-28):** ENG-FUSION (2026-06-02) + TE1 (2026-06-28, engine `e3b052e2855`) have since shipped; the moat is **no longer engine-blocked** (forward plane wired). The "ENGINE-BLOCK / `publish_dataset`/`bind_range` = `not_implemented` stubs" findings below (T1, the ENG-FUSION recommendation, the verified-HIGHs) are stale — those primitives are live and wired into a unified var↔cell `Binding`. The reverse plane (`BoundFrame`/`qb.show`/edit-back) remains TE2.
+
 **Date:** 2026-06-02. **Target:** `.plans/2026-06-01_quantbook-fe-engineering-plan.md`.
 **Bar audited against:** the operator's stated ambition — *something more optimal, advanced, efficient,
 and effective than Excel and Google Sheets*, NOT a clone.

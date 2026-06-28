@@ -1,5 +1,7 @@
 # Quantbook FE — Technical-Education Pass (reference-corpus study)
 
+> **TE1 UPDATE (2026-06-28):** ENG-FUSION (2026-06-02) + TE1 (2026-06-28, engine `e3b052e2855`) have since shipped; the moat is **no longer engine-blocked** (forward plane wired — `publish_dataset`/`bind_range` live, unified `Binding`, napi readers). The "ENGINE-BLOCKED / `publish_dataset`/`bind_range` are stubs" statements below are stale. The reverse plane (`BoundFrame`/`qb.show`/edit-back) remains TE2.
+
 > ⚠️ **STATUS: PRE-MEGAUDIT (2026-06-01) — SUPERSEDED on several points by the FE plan v2 (2026-06-02).**
 > Build authority = `.plans/2026-06-01_quantbook-fe-engineering-plan.md` (v2, fusion-first) +
 > `docs/fe/2026-06-02-fe-megaudit-SYNTHESIS.md`. This doc remains authoritative ONLY for the per-subsystem
@@ -71,6 +73,7 @@ All citations are real `file:line` from the clones. We **lift patterns, write ou
   print can't corrupt the protocol" discipline (`worker.py:3-7`).
 
 ### FE-1 writeback — use the SHIPPED `write_range`, do NOT flip stubs
+> **STALE (TE1, 2026-06-28):** `publish_dataset`/`bind_range` are no longer `not_implemented` stubs — they shipped in ENG-FUSION (2026-06-02) and were wired into the unified var↔cell `Binding` in TE1 (forward plane).
 - `BoundFrame.tx.commit()` → engine `write_range` (`ql-exec/src/session.rs:3168`, one atomic BatchCommit;
   HTTP `ql-service/src/router.rs:238`). `qb.show(df)` initial materialize → `materialize_query` (`:3258`,
   `router.rs:247`) or a thin literal-block wrapper over `write_range`. **`publish_dataset`/`bind_range` are
