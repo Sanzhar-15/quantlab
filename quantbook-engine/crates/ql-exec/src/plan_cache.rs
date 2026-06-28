@@ -185,9 +185,13 @@ impl PlanCache {
         self.entries.is_empty()
     }
 
-    /// Drop every cached plan and reset counters. Intended for tests and
-    /// explicit "clean slate" callers; routine cache pressure handling
-    /// belongs in Phase 3 calcgraph integration.
+    /// Drop every cached plan and reset counters. Used by "clean slate"
+    /// callers that wholesale-invalidate the cache because the key cannot
+    /// express what changed: the table mutators in `workbook_runtime::tables`
+    /// (`PlanCacheKey` has no table-extent axis) and
+    /// `WorkbookSession::rematerialize` (undo/redo replays a possibly-different
+    /// workbook, TB3/w140), plus tests. Routine per-entry cache pressure
+    /// handling (generation-aware GC / eviction) remains future work.
     pub fn clear(&mut self) {
         self.entries.clear();
         self.hits = 0;

@@ -123,11 +123,14 @@ impl<'a> WorkbookRuntime<'a> {
         // cell sees the freshly-written `#CIRC!` and propagates it
         // via standard error semantics.
         //
-        // `rebuild_from_workbook` parses every formula a second
-        // time (the existing loop below also parses each via
-        // `try_recompute_one_cached`). Acceptable cost for the
-        // load/replay path; `recompute_dirty` is the performance
-        // path with session-attached callers.
+        // **TB3 (OPT-01 / PO-02; w140):** the cycle-detection pre-pass
+        // below routes its lex+parse+bind through `self.plan_cache` (via
+        // `rebuild_from_workbook_with_cache`) so the parsed plans are SHARED
+        // with the eval loop's `try_recompute_one_cached` instead of being
+        // built and discarded. The historical double-parse of every formula
+        // on this cold load / replay path is eliminated — the eval loop now
+        // hits the cache the pre-pass warmed. `recompute_dirty` remains the
+        // session-attached incremental performance path.
         //
         // **Post-audit closures (2026-05-18 Tier C1 audit):**
         //
@@ -169,9 +172,25 @@ impl<'a> WorkbookRuntime<'a> {
             // migration. (Caught by the Opus reviewer lane in cycle 2
             // audit; Codex lane verified populate/cleanup symmetry
             // but missed the production divergence.)
-            let mut session =
-                CalcgraphSession::rebuild_from_workbook_with_registry(self.workbook, self.registry)
-                    .session;
+            // **TB3 (w140):** thread `self.plan_cache` through the rebuild so
+            // the pre-pass bind shares parsed plans with the eval loop.
+            // `name_gen`/`fn_gen` are captured ONCE here (constant across the
+            // pass) so the keys built inside match the eval-loop key in
+            // `try_recompute_with_simd_profile`. Re-borrow `workbook`/`registry`
+            // by name so the borrow checker can split them from the mutable
+            // `&mut self.plan_cache` borrow (mirrors the eval-loop borrow-split).
+            let name_gen = self.workbook.names().generation();
+            let fn_gen = self.registry.fn_generation();
+            let workbook: &Workbook = self.workbook;
+            let registry = self.registry;
+            let mut session = CalcgraphSession::rebuild_from_workbook_with_cache(
+                workbook,
+                registry,
+                &mut self.plan_cache,
+                name_gen,
+                fn_gen,
+            )
+            .session;
             let formula_addrs: Vec<(SheetId, RowId, ColId)> = self
                 .workbook
                 .iter_formulas()
@@ -1895,21 +1914,70 @@ mod tests {
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
-        // First pass: 3 misses (one per formula).
+        // **TB3 (w140):** First pass: 3 misses (one per distinct formula,
+        // bound by the cycle-detection pre-pass which now warms the cache),
+        // then the eval loop HITS all 3. A single cold `recompute_all` over 3
+        // distinct formulas = 3 misses + 3 hits (was 3 misses / 0 hits before
+        // TB3, when the pre-pass parsed-and-discarded).
         let r1 = rt.recompute_all();
         assert_eq!(r1.succeeded, 3);
         let s1 = rt.cache_stats();
         assert_eq!(s1.misses, 3);
-        assert_eq!(s1.hits, 0);
+        assert_eq!(s1.hits, 3);
         assert_eq!(s1.entries, 3);
 
-        // Second pass: 3 hits (the cache covers every formula). The
-        // miss count does not change.
+        // Second pass: the pre-pass hits all 3 (warm cache) and the eval
+        // loop hits all 3 — +6 hits, no new misses. Cumulative 3 + 6 = 9.
         let r2 = rt.recompute_all();
         assert_eq!(r2.succeeded, 3);
         let s2 = rt.cache_stats();
         assert_eq!(s2.misses, 3, "no new misses on the second pass");
-        assert_eq!(s2.hits, 3, "every formula hit the cache");
+        assert_eq!(
+            s2.hits, 9,
+            "pre-pass + eval loop hit every formula on both passes"
+        );
+    }
+
+    /// **TB3 (OPT-01 / PO-02; w140) — single-parse proof.** Before TB3 the
+    /// cycle-detection pre-pass in `recompute_all` bound every formula and
+    /// discarded the plan, so the eval loop re-bound each one from a cold
+    /// cache — every formula was lexed+parsed+bound TWICE on a cold pass.
+    /// After TB3 the pre-pass routes through `plan_cache`, so a SINGLE cold
+    /// `recompute_all` over N distinct formulas shows exactly N misses (the
+    /// pre-pass binds each once) and N hits (the eval loop reuses every
+    /// warmed plan). That misses==attempted AND hits==attempted IS the
+    /// observable proof each formula is parsed exactly once — `cache_stats`
+    /// exposes it directly, no parse-counting hook required.
+    #[test]
+    fn recompute_all_parses_each_formula_once_tb3() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(10.0));
+        // Four DISTINCT formula texts → four distinct cache keys, so
+        // attempted == distinct keys (no intra-key dedup muddies the count).
+        wb.put_formula(0, 1, 0, "A1 + 1");
+        wb.put_formula(0, 2, 0, "A1 * 2");
+        wb.put_formula(0, 3, 0, "A1 - 3");
+        wb.put_formula(0, 4, 0, "A1 / 4");
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        let r = rt.recompute_all();
+        assert_eq!(r.attempted, 4);
+        assert_eq!(r.succeeded, 4);
+
+        let s = rt.cache_stats();
+        // Pre-pass binds each distinct formula exactly once → misses == attempted.
+        assert_eq!(
+            s.misses, r.attempted as u64,
+            "cold recompute_all must miss exactly once per formula (no double-parse)"
+        );
+        // Eval loop reuses every pre-pass-warmed plan → hits == attempted.
+        assert_eq!(
+            s.hits, r.attempted as u64,
+            "eval loop must hit the pre-pass-warmed cache for every formula"
+        );
+        assert_eq!(s.entries, 4);
     }
 
     /// BPC-02: a NameTable mutation between recompute_all calls invalidates
@@ -1931,7 +1999,8 @@ mod tests {
             let mut rt = WorkbookRuntime::new(&mut wb, &reg);
             let _ = rt.recompute_all();
             assert_eq!(rt.cache_stats().misses, 2);
-            assert_eq!(rt.cache_stats().hits, 0);
+            // **TB3 (w140):** pre-pass warms the cache; eval loop hits both.
+            assert_eq!(rt.cache_stats().hits, 2);
         }
 
         // Mutate name table (bumps generation).
@@ -1967,7 +2036,10 @@ mod tests {
             stats_b.misses, 2,
             "name table mutation must invalidate cached plans"
         );
-        assert_eq!(stats_b.hits, 0);
+        // **TB3 (w140):** fresh runtime → cache cold → 2 misses (the
+        // invalidation contract — the load-bearing assertion above); the
+        // pre-pass then warms it so the eval loop hits both.
+        assert_eq!(stats_b.hits, 2);
     }
 
     /// BPC-03: cache keys are stable across recompute_all calls — same
@@ -1987,9 +2059,13 @@ mod tests {
         for i in 0..10 {
             let _ = rt.recompute_all();
             let stats = rt.cache_stats();
-            // Exactly 1 miss total (first pass); the other 9 are hits.
+            // Exactly 1 miss total (the very first pre-pass bind). **TB3
+            // (w140):** every `recompute_all` touches the formula TWICE (cycle
+            // pre-pass + eval loop). The first call adds 1 hit (its pre-pass
+            // missed, its eval hit); each later call adds 2. Cumulative hits at
+            // iteration `i` = 2*i + 1.
             assert_eq!(stats.misses, 1, "iteration {i}: unexpected new miss");
-            assert_eq!(stats.hits, i, "iteration {i}: hit count off");
+            assert_eq!(stats.hits, 2 * i + 1, "iteration {i}: hit count off");
         }
     }
 
@@ -2006,16 +2082,18 @@ mod tests {
 
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        let _ = rt.recompute_all(); // 1 miss
-        let _ = rt.recompute_all(); // 1 hit
+        let _ = rt.recompute_all(); // pre-pass: 1 miss; eval: 1 hit
+        let _ = rt.recompute_all(); // pre-pass: 1 hit; eval: 1 hit
 
         let s = rt.cache_stats();
         let mut timings = Timings::new();
         timings.bind_plan_cache_hits = s.hits;
         timings.bind_plan_cache_misses = s.misses;
-        assert_eq!(timings.bind_plan_cache_hits, 1);
+        // **TB3 (w140):** 3 hits (pass 1's eval + pass 2's pre-pass & eval)
+        // and 1 miss (pass 1's pre-pass) → hit rate 3/4.
+        assert_eq!(timings.bind_plan_cache_hits, 3);
         assert_eq!(timings.bind_plan_cache_misses, 1);
-        assert_eq!(timings.bind_plan_cache_hit_rate(), Some(0.5));
+        assert_eq!(timings.bind_plan_cache_hit_rate(), Some(0.75));
     }
 
     /// `set_formula` pre-warms the cache. A subsequent `recompute_all`
@@ -2033,12 +2111,16 @@ mod tests {
         assert_eq!(after_set.hits, 0);
         assert_eq!(after_set.entries, 1);
 
-        // Recompute the workbook — should hit the cache for the formula
-        // we just set.
+        // Recompute the workbook — should hit the cache for the formula we
+        // just set. **TB3 (w140):** the cycle pre-pass AND the eval loop both
+        // hit the set_formula-warmed entry → 2 hits, no new misses.
         let _ = rt.recompute_all();
         let after_recompute = rt.cache_stats();
         assert_eq!(after_recompute.misses, 1, "no new misses");
-        assert_eq!(after_recompute.hits, 1, "recompute hit the cache");
+        assert_eq!(
+            after_recompute.hits, 2,
+            "pre-pass + eval loop both hit the cache"
+        );
     }
 
     // ===== Phase 2B.4 — named-range aggregate context prep =====

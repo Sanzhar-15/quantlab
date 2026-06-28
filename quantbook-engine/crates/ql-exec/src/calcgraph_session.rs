@@ -130,6 +130,7 @@ use ql_types::{ColId, Range, RowId, SheetId};
 
 use crate::aggregate_cache::{AggregateCacheStats, InMemAggregateCache};
 use crate::plan::{bind_with_site, is_higher_order_helper, BindSite, ExprPlan};
+use crate::plan_cache::{PlanCache, PlanCacheKey};
 use crate::workbook_runtime::RuntimeError;
 
 /// Phase 3.3 (2026-05-12) — convert a `ql_types::Range` (used in
@@ -2187,6 +2188,60 @@ impl CalcgraphSession {
         wb: &Workbook,
         registry: &FunctionRegistry,
     ) -> RebuildResult {
+        Self::rebuild_inner(wb, registry, None)
+    }
+
+    /// **TB3 (OPT-01 / PO-02; w140):** cache-aware sibling of
+    /// [`Self::rebuild_from_workbook_with_registry`]. Identical semantics and
+    /// return value, but routes each formula's lex+parse+bind through the
+    /// supplied [`PlanCache`] instead of binding directly. The
+    /// cycle-detection pre-pass in [`WorkbookRuntime::recompute_all`] uses
+    /// this so the parsed plans it builds are SHARED with the eval loop
+    /// rather than thrown away — eliminating the historical double-parse of
+    /// every formula on the cold load / replay path (recompute.rs in-code
+    /// admission).
+    ///
+    /// **Safe-by-construction.** [`Self::bind_text`]'s `lex` IS literally
+    /// `lex_with(input, ReferenceMode::A1, Locale::EnUs)`
+    /// (`ql-formula-syntax`), which is exactly what the eval loop's build
+    /// closure uses; both then `parse` + `bind_with_site(.., BindSite::at_cell,
+    /// wb, wb, wb, registry)` against the SAME `registry`. So a cached plan is
+    /// byte-identical to what the eval loop would build for the same cell — a
+    /// cache HIT cannot change the result; a key MISMATCH merely forgoes the
+    /// perf win. The cell-independence of the shared plans (non-`@` text binds
+    /// to the same plan regardless of `BindSite`; `@` text gets a distinct
+    /// `cell_anchor`) means dependency extraction from a shared plan also
+    /// produces identical edges — so the Tarjan `cycled` set is unchanged.
+    ///
+    /// `name_gen` / `fn_gen` MUST be the caller's
+    /// `Workbook::names().generation()` / `FunctionRegistry::fn_generation()`
+    /// captured ONCE for the pass (both are constant across a single
+    /// recompute) so the keys built here match the eval-loop keys at
+    /// `recompute.rs` (`try_recompute_with_simd_profile`) exactly.
+    pub fn rebuild_from_workbook_with_cache(
+        wb: &Workbook,
+        registry: &FunctionRegistry,
+        plan_cache: &mut PlanCache,
+        name_gen: u64,
+        fn_gen: u64,
+    ) -> RebuildResult {
+        Self::rebuild_inner(wb, registry, Some((plan_cache, name_gen, fn_gen)))
+    }
+
+    /// Shared rebuild body. `cache = None` binds each formula directly via
+    /// [`Self::bind_text`] — byte-identical to the historical
+    /// `rebuild_from_workbook_with_registry` behaviour. `cache =
+    /// Some((cache, name_gen, fn_gen))` routes each bind through the plan
+    /// cache with an EVAL-PARITY key (see
+    /// [`Self::rebuild_from_workbook_with_cache`]). The two paths differ ONLY
+    /// in where the bound plan comes from; node insertion, dep extraction,
+    /// failure aggregation, and the final dirty/aggregate-cache reset are
+    /// identical.
+    fn rebuild_inner(
+        wb: &Workbook,
+        registry: &FunctionRegistry,
+        mut cache: Option<(&mut PlanCache, u64, u64)>,
+    ) -> RebuildResult {
         let mut session = Self::new();
 
         // Snapshot + sort the formula list for determinism.
@@ -2215,18 +2270,48 @@ impl CalcgraphSession {
                 .cell_node_for(sheet, row, col)
                 .expect("pre-pass inserted every formula's node");
 
+            let site = BindSite::at_cell(ql_types::Address::new(sheet, row, col));
+
             // Phase 3.2: lex + parse + bind + extract deps. Failure
             // accumulates; we keep going. Phase 3.3 passes the
             // formula's owning sheet so the stripe register can use
             // the correct fallback for any range with `sheet: None`.
-            match Self::bind_text(
-                &text,
-                BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
-                wb,
-                registry,
-            ) {
+            //
+            // **TB3 (w140):** when a cache is threaded in, build the
+            // EVAL-PARITY key and route through it; otherwise bind directly
+            // (byte-identical to the historical path). `bind_text` is the
+            // miss-path builder in BOTH cases, so a cache miss reproduces the
+            // direct path exactly.
+            let bound: Result<Arc<ExprPlan>, RuntimeError> = match cache.as_mut() {
+                Some((plan_cache, name_gen, fn_gen)) => {
+                    // Mirror `try_recompute_with_simd_profile`'s key
+                    // construction (recompute.rs) exactly: cell-anchored ONLY
+                    // when the canonical text carries an `@` implicit
+                    // intersection (W5-150), else `None` so non-`@` plans
+                    // share across cells.
+                    let cell_anchor = if text.contains('@') {
+                        Some((row, col))
+                    } else {
+                        None
+                    };
+                    let key = PlanCacheKey {
+                        text: Arc::clone(&text),
+                        sheet,
+                        name_gen: *name_gen,
+                        fn_gen: *fn_gen,
+                        cell_anchor,
+                    };
+                    plan_cache
+                        .get_or_insert::<_, RuntimeError>(key, || {
+                            Self::bind_text(&text, site, wb, registry)
+                        })
+                }
+                None => Self::bind_text(&text, site, wb, registry).map(Arc::new),
+            };
+
+            match bound {
                 Ok(plan) => {
-                    session.extract_and_register_deps(node, sheet, &plan, wb, registry);
+                    session.extract_and_register_deps(node, sheet, plan.as_ref(), wb, registry);
                     succeeded += 1;
                 }
                 Err(error) => failures.push(RebuildFailure {

@@ -1149,6 +1149,22 @@ impl WorkbookSession {
         self.graph =
             CalcgraphSession::rebuild_from_workbook_with_registry(&self.workbook, &self.registry)
                 .session;
+        // **TB3 (w140; audit BLOCKER fold):** `rematerialize` replaces
+        // `self.workbook` wholesale from replay and rebuilds the graph above.
+        // The plan cache is session-owned and CARRIED across runtimes
+        // (`with_runtime` take/put-back), but its key (`PlanCacheKey`) has NO
+        // table-extent axis — table mutators (`resize_table`/`rename_table`)
+        // keep it coherent by EXPLICITLY clearing it (see `tables.rs`). A replay
+        // can restore a DIFFERENT table extent than the cache was last warmed
+        // against (e.g. undo of a `resize_table`), so a wholesale rebuild MUST
+        // reset the plan cache too. Without this, the recompute below — whose
+        // cycle-detection pre-pass now SHARES the plan cache (TB3, w140) —
+        // could bind a structured ref against a stale extent and miss a `#CIRC!`
+        // or read a stale aggregate. The TB3 win is preserved: the pre-pass
+        // re-warms the now-cold cache and the eval loop hits it within this same
+        // pass. (`open`/`from_workbook` build a FRESH session → fresh cache, so
+        // this is the only wholesale-rebuild site that reuses the cache.)
+        self.plan_cache.clear();
         // Recompute computed values with the op-log detached (no spurious ops /
         // no UndoManager commit). The result's failures become diagnostics.
         // **6.4B closure-audit (MED):** arm the op-budget — undo/redo can replay a
@@ -14371,6 +14387,69 @@ mod tests {
         );
         s.drop_table("Sales")
             .expect("one undo must restore the old table name together with the formula");
+    }
+
+    /// **TB3 (w140) — Codex audit BLOCKER regression.** A structured-reference
+    /// plan (`SUM(Sales[Qty])`) binds to the table's CURRENT extent.
+    /// `resize_table` keeps the plan cache coherent by clearing it then
+    /// RE-WARMING against the new extent via `reextract_table_readers` — but
+    /// `PlanCacheKey` has no table-generation axis, so the re-warmed plan is
+    /// keyed identically to one looked up after an UNDO. `rematerialize`
+    /// (undo/redo) replays the workbook to the OLD extent; before the w140 fix
+    /// it did NOT clear the carried plan cache, so the stale shrunk-extent plan
+    /// survived. TB3 made `recompute_all`'s cycle-detection pre-pass SHARE that
+    /// cache (previously it re-bound fresh and was immune), so an undo-of-resize
+    /// could even miss a `#CIRC!`. This asserts the simpler, broader value
+    /// consequence: after undo the structured ref MUST re-bind against the
+    /// restored extent. Fails without `rematerialize`'s `plan_cache.clear()`
+    /// (the reader keeps the shrunk A2-only sum).
+    #[test]
+    fn undo_of_table_resize_rebinds_structured_ref_no_stale_plan() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        // Sales: header at row 0 ("Qty"), 3 data rows (1,2,3 → A2,A3,A4), col 0.
+        s.create_table(TableSpec {
+            name: "Sales".into(),
+            sheet: sid,
+            top_row: 0,
+            top_col: 0,
+            rows: 4, // header + 3 data
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["Qty".into()],
+        })
+        .unwrap();
+        s.set_value(addr(sid, 1, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        s.set_value(addr(sid, 2, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_value(addr(sid, 3, 0), CellValue::Number { number: 100.0 })
+            .unwrap();
+        // Reader OUTSIDE the table (D9) sums the whole Qty column → 111.
+        s.set_formula(addr(sid, 8, 3), "SUM(Sales[Qty])").unwrap();
+        assert_eq!(
+            cell_value(&s, addr(sid, 8, 3)),
+            CellValue::Number { number: 111.0 },
+            "full-extent structured-ref sum before any resize"
+        );
+
+        // Shrink the table to 1 data row (header + 1 ⇒ `rows: 2`) → Qty = A2.
+        // This clears the plan cache then RE-WARMS the reader's plan against the
+        // A2-only extent (a stale plan keyed identically to a post-undo lookup).
+        s.resize_table("Sales", 2, 1, vec![], vec![]).unwrap();
+
+        // Undo the resize → `rematerialize` replays the table back to A2:A4 and
+        // recomputes. The reader MUST re-bind against the restored extent and
+        // read 111 again. WITHOUT the w140 `rematerialize` `plan_cache.clear()`,
+        // the cycle pre-pass + eval loop hit the stale A2-only plan → 1.
+        assert!(s.undo().unwrap().consumed, "resize must be undoable");
+        assert_eq!(
+            cell_value(&s, addr(sid, 8, 3)),
+            CellValue::Number { number: 111.0 },
+            "undo-of-resize must re-bind the structured ref against the restored \
+             extent; a stale plan cache would leave the shrunk A2-only sum (1)"
+        );
     }
 
     /// undo a transaction commit (begin→txn_add→commit→undo) → the whole

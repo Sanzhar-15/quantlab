@@ -365,8 +365,9 @@ fn ide_recompute_cache_observability() {
     let _r2 = rt.recompute_all();
     let stats_2 = rt.cache_stats();
 
-    // Second pass adds 2 hits (one per formula) and no new misses. The
-    // IDE renders these in its observability surface.
-    assert_eq!(stats_2.hits - stats_1.hits, 2);
+    // **TB3 (w140):** each `recompute_all` touches every formula twice (cycle
+    // pre-pass + eval loop), so the warm second pass adds 4 hits (2 formulas ×
+    // 2) and no new misses. The IDE renders these in its observability surface.
+    assert_eq!(stats_2.hits - stats_1.hits, 4);
     assert_eq!(stats_2.misses, stats_1.misses);
 }
