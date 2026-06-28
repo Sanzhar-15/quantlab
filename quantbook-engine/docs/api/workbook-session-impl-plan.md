@@ -157,8 +157,8 @@ allocates the op-id internally + never checks the registry, so even "pre-start c
 non-functional in v1; honest reframing or refactor), M5 (`schema_version` dropped at napi DTO boundary
 — engine emits it at `dto.rs:234,:285`, mapper at `lib.rs:4242-4264` doesn't propagate), M6
 (`events`/`ops` bounded retention; needs the event-ring infrastructure per contract §9), M7
-(storage-level effective-non-blank-value extent cross-cutting — `Sheet::iter_effective_cells()`
-adopted by csv/xlsx/.qbook).
+(storage-level effective-non-blank-value extent cross-cutting — **shipped as `Sheet::effective_value_bounds()`**,
+`ql-storage/src/sheet.rs:205`, adopted by csv/xlsx/.qbook).
 **Over-napi cut-line:** at 6.1C `Session` binds 11 methods (the existing 10 + `close`). Everything
 else (`snapshotDelta`/`undo`/`redo`/`import`/`export`/`open`/`save`/`validateFormula`/`pollEvents`/
 `lifecycleState`/`operationStatus`/`cancel`/table+transaction+batch ops) defers to 6.3; functions to
@@ -290,7 +290,8 @@ batch Arrow exchange, debugpy-attachable worker process. **Block-on-entry must-f
 H1 (binder whitelists derive from metadata) + H3 (PlanCache `fn_gen` invalidation) both shipped.
 **Substrate-completion increments M1 / M3 / M5 / I1 / I2 also shipped at 6.4-1.**
 **Also tracked (cross-cutting):** a storage-level effective-non-blank-value extent API
-(`Sheet::iter_effective_cells()`) adopted by all serializers (csv/xlsx/.qbook) so a blank-inflated
+(**shipped as `Sheet::effective_value_bounds()`**, `ql-storage/src/sheet.rs:205`, NOT the never-built
+`iter_effective_cells()` name) adopted by all serializers (csv/xlsx/.qbook) so a blank-inflated
 `Sheet::bounds` can't produce a giant export — Lane D proposed the fix; not 6.1C-blocking on its own
 (consistent across siblings + documented). (`batch` inc.2c-4; **transaction handle** inc.2c-5; **F2 `Op::ClearValue`** inc.2c-6;
 **undo/redo** inc.2c-7; **F10 atomic table-rename** inc.2c-8; **`.qbook` open/save** inc.2c-9; **xlsx import**

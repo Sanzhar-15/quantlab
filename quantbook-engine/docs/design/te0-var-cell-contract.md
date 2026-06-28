@@ -1,6 +1,6 @@
 # TE0 — The var↔cell Contract: Design for the Python-Fusion Moat
 
-**Status:** DESIGN (read-only). No code changed. Blocks TE1/TE2/TE3.
+**Status:** TE1 (forward plane) SHIPPED 2026-06-28 — engine `e3b052e2855`, IDE `fe/sheet-tabs @ 75ad181f49b`. Design-of-record. TE2/TE3 (reverse plane / edit-back) remain future.
 **Author window:** TE0
 **Engine HEAD audited:** `628a354daed4` on `feat/quantbook-engine` (note: the prompt cited `0a985d69426`; the live worktree has advanced past it — design is grounded in the live HEAD).
 **Save as:** `docs/design/te0-var-cell-contract.md`
@@ -14,6 +14,8 @@
 The moat is the reactive fusion of a Python variable and a grid range. The discovery lanes (WIR-01, W5, W6) are correct: today the moat is **one-way and the two engine primitives that should define identity are disconnected.**
 
 What I verified in code:
+
+> **TE1 UPDATE (2026-06-28):** the 3-shadow-registry state in items 1–2 below is the **PRE-TE1 problem statement** and is now **SUPERSEDED** — TE1 collapsed the three keys onto a single engine-owned `Binding` (`binding()`/`bindings()`/`unbind()` are now exposed over napi; `bind_range` is live and takes a `direction`; the host `PublishedCellsStore` DERIVES from `session.bindings()`). Items 3–4 (`BoundFrame`/`qb.show` do not exist; no reverse plane) **REMAIN TRUE** — that is the still-future TE2/TE3 reverse plane.
 
 1. **The forward plane already works end-to-end — but it does not use `bind_range` at all.** The live path is: notebook cell runs in a real ipykernel → kernel-side `Quantbook._reg` registry + `post_run_cell` hook detect a changed published var → emit a `republish` frame over fd3 → `ReactiveKernelClient.applyRepublish` calls `session.publishDataset(...)` + `recalcDirty()` → `CellGridPanel` repaints. The var→range identity lives in **three** places, none of them the engine's `bindings` map: the kernel's `_reg` dict (`reactive_kernel_child.py`), the host's `PublishedCellsStore` (`publishedCellsStore.ts`), and the engine's `provenance` index keyed by `name`.
 
@@ -35,6 +37,8 @@ I flag explicitly where I could **not** determine intent from code (§9) so Code
 
 ### 1.1 The problem with today's identity
 
+> **TE1 UPDATE (2026-06-28):** the three-keys-that-drift table below is **HISTORICAL (pre-TE1)**, SUPERSEDED by the unified engine-owned `Binding` (§1.2, IMPLEMENTED). The engine `bindings` map is now the source of truth; the kernel `_reg` and host `PublishedCellsStore` derive from it.
+
 There are three keys for "the same thing," and they can drift:
 
 | Layer | Key | Holds | Lifetime | File |
@@ -47,6 +51,8 @@ There are three keys for "the same thing," and they can drift:
 The engine `provenance` (keyed by publish `name`) and the engine `bindings` (keyed by `binding_id`) are two unrelated maps. Nothing guarantees `binding_id == name`, and nothing guarantees the binding's range tracks the range the provenance actually produced.
 
 ### 1.2 The unified binding record (engine-owned, the source of truth)
+
+> **TE1 UPDATE (2026-06-28) — IMPLEMENTED.** The unified `Binding` shipped. The as-built struct also carries a **`force_check`** flag (the undo/redo re-publish lever, DEC-B) and is paired with a companion **`binding_birth_structural`** map that stamps each binding's birth net-active structural edit-set (used by the redo-safe invalidation diff, §1.4). Otherwise as sketched below.
 
 We introduce **one** engine structure that subsumes `bindings` and is cross-linked to `provenance`:
 
@@ -82,7 +88,7 @@ Python var name  ==  binding_id  ==  provenance source_id   (for a published var
 - **A binding is owned by the session** (single-writer; `WorkbookSession` is the sole engine writer — see the R8 single-writer note in `reactive_kernel_child.py:37`). The kernel only *signals*; it never writes the engine.
 - **A binding is created/refreshed by `publish`** (the merged op, §2). Re-publishing the same `name` reuses the binding (bumps `generation` only if the target moved — which is a v1-cut error today, see G1 in the kernel).
 - **A binding is destroyed by `unpublish(name)`** (already a kernel reverse message; TE1 extends it to drop the engine binding too) or when its var goes `stale` (`del x` → kernel emits `stale`; today only the host badge drops — TE1 must also drop/deactivate the engine binding).
-- **Across undo/redo:** today `provenance` is **cleared** (`rematerialize` → `provenance.clear()` at session.rs:1090) but `bindings` is **kept** (by design comment at session.rs:437). This is a latent inconsistency: after an undo, a binding points at a range whose provenance no longer exists. Under the unified model this becomes a real decision (see DEC-B below). The existing R7 `epoch_change`/`force_check` mechanism (kernel marks every binding for forced re-publish on the next touch) is the intended reconciliation lever and the design leans on it.
+- **Across undo/redo:** today `provenance` is **cleared** (`rematerialize` → `provenance.clear()` at session.rs:1090) but `bindings` is **kept** (by design comment at session.rs:437). This is a latent inconsistency: after an undo, a binding points at a range whose provenance no longer exists. Under the unified model this becomes a real decision (see DEC-B below). The existing R7 `epoch_change`/`force_check` mechanism (kernel marks every binding for forced re-publish on the next touch) is the intended reconciliation lever and the design leans on it. **TE1 UPDATE (2026-06-28) — IMPLEMENTED:** keep-binding + `force_check` on undo/redo (DEC-B option (i)); the binding stays and self-heals on the next kernel touch.
 
 ### 1.4 Range mutation: move / resize / delete / sheet-delete
 
@@ -92,6 +98,8 @@ This is the **single biggest correctness hole** in the current code and the prom
 - `provenance[name].cells` (the absolute `CellAddr`s) are **also never shifted** on structural edits — but they ARE cleared on undo/redo and re-recorded on the next publish.
 
 **DECISION D-RANGEMOVE (v1):** Bindings are **anchored, not tracked**, in v1 — with loud invalidation, never silent drift.
+
+> **TE1 UPDATE (2026-06-28) — IMPLEMENTED.** Anchored-with-invalidation shipped: structural hooks set `alive=false` on intersecting row/col insert-delete and on sheet-delete. The as-built **redo-safe** mechanism is a **binding-relative NET-ACTIVE structural diff** (`collect_active_structural_edits` over `oplog.iter()`, compared against the binding's birth structural set via `newly_active_structural`), **not** the originally-sketched approach — this is what makes undo/redo of a structural edit restore (rather than permanently invalidate) a binding whose grid was restored to birth shape.
 
 - On **row/col insert/delete** that intersects or precedes a binding's `target`: mark `Binding.alive = false` and surface a diagnostic ("binding `x` invalidated by a structural edit; re-run the owning cell to re-bind"). Do **not** silently shift, because the Python value's shape no longer matches what the user sees, and a silently-shifted envelope can overlap another binding. The kernel's `force_check` + re-run re-establishes a fresh binding at the new selection.
 - On **sheet delete**: every binding whose `target.sheet` is the deleted sheet is marked `alive = false`. (The host already handles the "now-deleted sheet" case for badges via `allRangesWithSheet()` → `#REF!`; the engine binding mirrors that.)
@@ -112,6 +120,8 @@ The forward data flow (`publishDataset` → `recalcDirty` → delta → repaint)
 - handles the reactive shrink case (dirties vacated cells' dependents).
 
 ### 2.2 The linkage TE1 adds (publish ↔ bind)
+
+> **TE1 UPDATE (2026-06-28) — IMPLEMENTED.** `publish_dataset` now UPSERTS `bindings[name]` and enforces the lineage invariant `bindings[name].source_id == name`. The publish↔bind linkage below is as-built.
 
 Today `publish_dataset` records `provenance[name]` but creates **no binding**. TE1 wires them:
 
@@ -227,6 +237,8 @@ class BoundFrame:
 
 ## 5. napi / pyo3 surface needed
 
+> **TE1 UPDATE (2026-06-28):** the **napi surface SHIPPED** — `binding()` / `bindings()` / `unbind()` and `bindRange(direction)` plus the `BindingInfoJson` DTO are live in `ql-bindings-node/src/lib.rs`. The **pyo3 mirror remains FUTURE** (lower priority per §5.4 — the shipped out-of-process reactive kernel talks fd3, not pyo3; pyo3 readers are for harnesses / in-process embedding).
+
 The engine already has the reader (`binding()`); it just isn't exposed, and we need a few additions. All DTOs in `crates/ql-session/src/dto.rs`, napi in `ql-bindings-node/src/lib.rs`, pyo3 in `crates/quantbook-py/src/lib.rs`.
 
 ### 5.1 New DTO
@@ -300,7 +312,7 @@ Mirror the napi additions: `binding`, `bindings`, `bind_range(direction=...)`, `
 
 ## 7. Phased implementation plan
 
-### TE1 — Forward-plane coherence (publish ↔ bind ↔ recalc ↔ lineage). **No new behavior; close the seam.**
+### TE1 — Forward-plane coherence (publish ↔ bind ↔ recalc ↔ lineage). **No new behavior; close the seam.** — ✅ SHIPPED 2026-06-28 (engine `e3b052e2855`, IDE `fe/sheet-tabs @ 75ad181f49b`; all 7 steps done, FE-1.5 reactive acid green).
 
 **Scope (engine-mostly, parallel-safe once this design lands):**
 1. Replace `bindings: HashMap<String, CellRange>` with `HashMap<String, Binding>` (struct in §1.2); keep `bind_range` back-compat (`Forward`, default).
@@ -341,9 +353,9 @@ Mirror the napi additions: `binding`, `bindings`, `bind_range(direction=...)`, `
 
 ## 8. Open questions / decisions for the operator or a follow-up
 
-> **UPDATE (w133, 2026-06-26): the four TE1-blocking decisions are RESOLVED by the operator** — DEC-B =
+> **UPDATE (w133, 2026-06-26): the four TE1-blocking decisions are RESOLVED + IMPLEMENTED IN TE1 (2026-06-28)** — DEC-B =
 > keep binding + `force_check`; D-IDENTITY = fold into one unified `Binding`; D-RANGEMOVE = anchored +
-> loud invalidation; binding-persistence = session-local (no `.qbook`). DEC-C/D/E/F remain open (TE2/TE3).
+> loud invalidation; binding-persistence = session-local (no `.qbook`). All four shipped in TE1's forward plane. DEC-C/D/E/F remain open (TE2/TE3).
 > Build plan: `quantlab/.plans/active/te1-moat-forward-plane.md`; charter §5 has the canonical log.
 
 - **DEC-B (undo/redo × bindings):** today provenance clears but bindings persist. Choose: (i) keep binding + mark `force_check` so the next kernel touch re-publishes (my lean — preserves the badge, self-heals), or (ii) drop bindings on undo (simpler, but the badge flickers and the user must re-run). **Needs a decision before TE1.**

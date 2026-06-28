@@ -27,8 +27,9 @@
 > - **In-host MCP server SHIPPED** (IDE-side B1; 25 tools as of Wave L3). MCP is a v1 surface, not post-v1.
 > - **`ql-bindings-node` (8.7k LOC) + `quantbook-py` (real pyo3 ext, 1.5k LOC) are LIVE bindings**, NOT stubs.
 > - Phase 4 SHIPPED; RT-V1 + Wave-3 distributions shipped; FE pivot drove ENG-FUSION
->   (`publish_dataset`/`bind_range` — live but the var↔cell binding is still UNDESIGNED, see WIR-01 in the
->   w127 discovery), owning-`WorkbookSession`, FE-4 cell-style foundation, LET/LAMBDA, charts (Wave Q).
+>   (`publish_dataset`/`bind_range` live; the var↔cell binding **FORWARD PLANE shipped in TE1** (2026-06-28,
+>   `e3b052e2855`): unified engine `Binding` + napi `binding()`/`bindings()`/`unbind()`; reverse plane
+>   (`BoundFrame`/`qb.show`/edit-back) remains TE2), owning-`WorkbookSession`, FE-4 cell-style foundation, LET/LAMBDA, charts (Wave Q).
 >
 > _(Original 2026-06-10 freeze banner preserved below for history.)_
 >
@@ -920,6 +921,10 @@ plan v2 section ENG-FUSION is the cross-repo authority; this engine mini-phase i
    References: `crates/ql-exec/src/session.rs` (`write_range` validation 3168).
    Acceptance: FUSION-02 a bound range round-trips edits.
    Effort: ~2 days.
+   **Superseded by TE1 (forward-plane coherence, 2026-06-28):** `bindings` is now `HashMap<String, Binding>`
+   (each `Binding` carries `direction`/`source_id`/`alive`/`generation`/`force_check` + a companion
+   `binding_birth_structural` stamp); `binding()`/`bindings()`/`unbind()` readers exist over napi and
+   `bind_range` takes a `direction`.
 
 3. **EF-bindings**
    Expose `publish_dataset`/`bind_range` over all three transports (napi real return DTOs, new pyo3

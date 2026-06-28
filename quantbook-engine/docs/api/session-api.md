@@ -249,6 +249,22 @@ product-specific APIs (the #1 risk). Dirtying + provenance behavior is part of t
 | `refresh_source(source_id, revision) -> DirtyResult` | **v1 ✅ (6.5-2)** | **6.5-2:** re-runs the recorded `materialize_query` producer for `source_id` and re-materializes its result via the `write_range` substrate, dirtying dependents. Revision-gated: a `revision` ≤ the stored revision is a no-op. An unknown `source_id` (never materialized in this session) is a loud `source_not_found` (404; No-Fallbacks). Returns `DirtyResult { dirtied, version }`. Backed by the dual provenance index (per-cell `cell→{source_id, revision}` + per-source `source_id→produced cells`). |
 | `materialize_query(query_id, target, data) -> PublishedRef` | **v1 ✅ (6.5-1)** | **6.5-1:** `data` = `{"sql": "<query>"}`. Runs the SQL OFF the hot path (DataFusion, via the pure `ql-sql` crate) over the workbook's tables (by display name, named columns) + sheets (by name, A1-letter columns over the effective value bounds), case-preserving identifiers. The result is written as a block anchored at `target`'s top-left via the `write_range` substrate (one `Op::BatchCommit`, dirties dependents); it must FIT within `target` (else loud `bad_argument`), a 0-row result writes nothing, and surplus target cells are untouched. Read-only: DDL/DML/statements are forbidden (no `COPY`/`CREATE EXTERNAL TABLE`/`SET`). Input + result are capped at 1<<20 cells/rows (loud over-cap). Returns `PublishedRef { id: query_id }`. **6.5-2:** records dual provenance (per-cell `cell→{source_id, revision}` + per-source `source_id→produced cells` reverse index) consumed by `refresh_source`. |
 
+> #### TE1 AMENDMENT (2026-06-28 — forward-plane coherence; engine `e3b052e2855`)
+> The two frozen rows above describe the **pre-TE1** semantics (a `bind_range` pure read-overlay; a
+> `publish_dataset` that records provenance but creates no binding). TE1 amends them — the frozen rows are
+> kept verbatim for the contract record; the live behavior is:
+>
+> | Command | TE1 amendment |
+> |---------|---------------|
+> | `publish_dataset(name, data, target)` | now **UPSERTS** `bindings[name]` (the var↔cell binding) in the same op, enforcing the lineage invariant `bindings[name].source_id == name` and `target ⊇` produced cells. The pure "publish writes cells + provenance, no binding" description is pre-TE1. |
+> | `bind_range(binding_id, target, direction)` | now carries a `direction` (`Forward` default \| `Bidirectional`) and writes the unified `Binding` record (not a bare `CellRange`). `Forward` preserves the existing read-overlay semantics. |
+> | `binding(binding_id) -> BindingInfo?` | **NEW (napi).** Promoted from the bare `Option<CellRange>` reader to the full record: `null` for missing, `{alive:false}` for a structurally-invalidated binding (caller distinguishes never-bound from bound-then-dead). |
+> | `bindings() -> [BindingInfo]` | **NEW (napi).** Enumerate all bindings; the engine-side source of truth that the IDE `PublishedCellsStore` mirrors. |
+> | `unbind(binding_id) -> bool` | **NEW (napi).** Drops the binding (the engine half of the kernel `unpublish`). |
+> | `BindingInfoJson` DTO | **NEW.** `{ binding_id, target, direction, source_id, generation, alive }` (the as-built struct also carries an internal `force_check` flag + a companion `binding_birth_structural` stamp, not surfaced over the wire). |
+>
+> Reverse-plane methods (`BoundFrame`/`qb.show`/edit-back/`poke`) remain **future (TE2/TE3)**; pyo3 mirrors of the new binding readers are also future. See `docs/design/te0-var-cell-contract.md`.
+
 ### 3.6 Query / snapshot (MED-5: `RangeResult` is a first-class DTO — see §4.2)
 | Command | Tier | Backed by |
 |---------|------|-----------|
