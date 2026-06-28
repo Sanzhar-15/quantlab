@@ -1970,6 +1970,34 @@ export interface BoundRangeJson {
 }
 
 /**
+ * **TE1 (var<->cell moat, 2026-06-27)**: the engine's unified binding record
+ * (mirrors the engine `ql_session::BindingInfo` / napi `BindingInfoJson`). Returned
+ * by {@link SessionInstance.binding} / {@link SessionInstance.bindings} -- the
+ * engine-authoritative source the IDE's `PublishedCellsStore` mirrors (the badge +
+ * MCP `get_published_variables` read it; never a host-side shadow registry).
+ *
+ * `bindingId` == the publish `name` for a published Python var (D-IDENTITY).
+ * `target` is the declared envelope (the produced block always lies within it).
+ * `direction` is `'forward'` (publish-only) or `'bidirectional'` (`qb.show`
+ * edit-back, TE2). `sourceId` is absent for a bare `bindRange` declaration not yet
+ * published. `alive === false` marks a binding invalidated by a structural edit
+ * (row/col/sheet delete) -- it is RETURNED, never elided to null, so the caller
+ * distinguishes never-bound from bound-then-invalidated. `forceCheck === true`
+ * marks a binding whose backing provenance was wiped by undo/redo or a rebuild
+ * (the kernel's next touch re-publishes and clears it). `generation` is the engine
+ * `u64` revision domain (a JS `bigint`).
+ */
+export interface BindingInfoJson {
+	bindingId: string;
+	target: CellRangeJson;
+	direction: 'forward' | 'bidirectional';
+	sourceId?: string;
+	generation: bigint;
+	alive: boolean;
+	forceCheck: boolean;
+}
+
+/**
  * **6.5-2**: result of {@link SessionInstance.refreshSource} (mirrors the engine
  * `DirtyResult`). `dirtied` is the count of dependents dirtied; `version` is the
  * opaque post-refresh token. A `revision` <= the stored one is a no-op (`dirtied: 0`).
@@ -2005,6 +2033,18 @@ export interface CellLineageJson {
 	producedEndRow: number;
 	producedEndCol: number;
 	producedCells: number;
+	/**
+	 * **TE1 (2026-06-27)**: the unified binding this cell's source drives, present
+	 * only when the source is a published Python var (`sourceId === bindingId`).
+	 * Absent for a SQL `'query'` source or when no binding exists -- per the napi
+	 * `Option::None` -> absent/`undefined` convention, never `null`.
+	 */
+	bindingId?: string;
+	/**
+	 * **TE1 (2026-06-27)**: the binding's data-flow direction -- present only when
+	 * {@link bindingId} is present.
+	 */
+	direction?: 'forward' | 'bidirectional';
 }
 
 /**
@@ -2598,8 +2638,39 @@ export interface SessionInstance {
 	 * `qb.bind()`: register `bindingId -> target` as a `BoundFrame` overlay region
 	 * (round-trip reads go through `queryRange`). `[bad_argument]` for an inverted/
 	 * out-of-bounds target; `[sheet_not_found]` for an unknown sheet. Returns `{ bindingId }`.
+	 *
+	 * **TE1 (2026-06-27)**: `direction` is the optional data-flow declaration --
+	 * `undefined` PRESERVES the existing direction (or `'forward'` for a fresh
+	 * binding, never silently downgrading a prior `'bidirectional'`); an unknown
+	 * string throws `[bad_argument]` (No-Fallbacks). `bindRange` is the *declaration*
+	 * half of the unified binding (D-IDENTITY); `publishDataset` is the *data* half.
 	 */
-	bindRange(bindingId: string, target: CellRangeJson): BoundRangeJson;
+	bindRange(bindingId: string, target: CellRangeJson, direction?: 'forward' | 'bidirectional'): BoundRangeJson;
+
+	/**
+	 * **TE1 (var<->cell moat, 2026-06-27)**: read the unified binding for
+	 * `bindingId`, or `null` if none exists. A structurally-invalidated binding is
+	 * returned with `alive === false` (never elided to null), so the caller
+	 * distinguishes never-bound from bound-then-invalidated. Pure read.
+	 */
+	binding(bindingId: string): BindingInfoJson | null;
+
+	/**
+	 * **TE1**: enumerate every binding -- the engine-authoritative source the IDE's
+	 * `PublishedCellsStore` mirrors. Includes dead (`alive === false`) bindings so
+	 * the caller can surface invalidations, never silently elide them. Iteration
+	 * order is unspecified; sort by `bindingId` for a stable order. Pure read.
+	 */
+	bindings(): BindingInfoJson[];
+
+	/**
+	 * **TE1**: drop a binding (the engine half of the kernel's `unpublish` reverse
+	 * frame / teardown). Returns `true` if a binding existed and was removed,
+	 * `false` for an unknown id (No-Fallbacks: never a silent no-op). Leaves the
+	 * already-written cell values + provenance untouched (they become ordinary
+	 * user data, symmetric with a direct overwrite).
+	 */
+	unbind(bindingId: string): boolean;
 
 	/**
 	 * Refresh an external source by revision; dirties dependent cells. A `revision` <= the

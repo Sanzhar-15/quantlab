@@ -475,14 +475,27 @@ suite('B1 MCP -- tool handlers', () => {
 		const s = fixtureSession();
 		const published = new Map<McpSessionPort, PublishedVariableTargets[]>();
 		published.set(s, [
-			{ name: 'returns', range: { sheet: 0, startRow: 0, startCol: 1, endRow: 2, endCol: 1 } },
-			{ name: 'pi', range: { sheet: 1, startRow: 0, startCol: 0, endRow: 0, endCol: 0 } },
+			{ name: 'returns', range: { sheet: 0, startRow: 0, startCol: 1, endRow: 2, endCol: 1 }, alive: true },
+			{ name: 'pi', range: { sheet: 1, startRow: 0, startCol: 0, endRow: 0, endCol: 0 }, alive: true },
 		]);
 		const ctx = makeCtx([singleGrid(s)], 'grid-0-sheet-0', published);
 		const out = toolGetPublishedVariables(ctx, {});
 		assert.strictEqual(out.variables.length, 2);
-		assert.deepStrictEqual(out.variables[0], { name: 'returns', sheet: 0, a1Range: 'S0!B1:B3', range: { sheet: 0, startRow: 0, startCol: 1, endRow: 2, endCol: 1 } });
-		assert.deepStrictEqual(out.variables[1], { name: 'pi', sheet: 1, a1Range: 'S1!A1', range: { sheet: 1, startRow: 0, startCol: 0, endRow: 0, endCol: 0 } });
+		assert.deepStrictEqual(out.variables[0], { name: 'returns', sheet: 0, a1Range: 'S0!B1:B3', range: { sheet: 0, startRow: 0, startCol: 1, endRow: 2, endCol: 1 }, alive: true });
+		assert.deepStrictEqual(out.variables[1], { name: 'pi', sheet: 1, a1Range: 'S1!A1', range: { sheet: 1, startRow: 0, startCol: 0, endRow: 0, endCol: 0 }, alive: true });
+	});
+
+	test('toolGetPublishedVariables flags a structurally-invalidated (dead) binding on a LIVE sheet as alive:false', () => {
+		// TE1 audit fold (Codex/L1/L3 HIGH): a row/col-delete invalidates the engine binding (alive=false)
+		// but its sheet survives, so the a1Range still formats as a normal ref. Without the `alive` flag the
+		// tool would silently present a dangling reference as a live published variable.
+		const s = fixtureSession();
+		const published = new Map<McpSessionPort, PublishedVariableTargets[]>();
+		published.set(s, [{ name: 'shifted', range: { sheet: 0, startRow: 0, startCol: 1, endRow: 2, endCol: 1 }, alive: false }]);
+		const ctx = makeCtx([singleGrid(s)], 'grid-0-sheet-0', published);
+		const out = toolGetPublishedVariables(ctx, {});
+		assert.strictEqual(out.variables.length, 1);
+		assert.deepStrictEqual(out.variables[0], { name: 'shifted', sheet: 0, a1Range: 'S0!B1:B3', range: { sheet: 0, startRow: 0, startCol: 1, endRow: 2, endCol: 1 }, alive: false });
 	});
 
 	test('toolGetPublishedVariables is empty (not an error) with no kernel', () => {
@@ -496,13 +509,15 @@ suite('B1 MCP -- tool handlers', () => {
 		const s = fixtureSession();
 		const published = new Map<McpSessionPort, PublishedVariableTargets[]>();
 		// sheet 9 is NOT a live sheet of the fixture (only 0 and 1) -- a variable left tracked on a
-		// since-deleted sheet must still surface, visibly, not be silently omitted.
-		published.set(s, [{ name: 'ghost', range: { sheet: 9, startRow: 0, startCol: 0, endRow: 0, endCol: 0 } }]);
+		// since-deleted sheet must still surface, visibly, not be silently omitted. The engine marks a
+		// deleted-sheet binding alive=false, so the tool flags it both ways (alive:false + #REF! a1Range).
+		published.set(s, [{ name: 'ghost', range: { sheet: 9, startRow: 0, startCol: 0, endRow: 0, endCol: 0 }, alive: false }]);
 		const ctx = makeCtx([singleGrid(s)], 'grid-0-sheet-0', published);
 		const out = toolGetPublishedVariables(ctx, {});
 		assert.strictEqual(out.variables.length, 1);
 		assert.strictEqual(out.variables[0].name, 'ghost');
 		assert.strictEqual(out.variables[0].a1Range, '#REF!9!A1');
+		assert.strictEqual(out.variables[0].alive, false);
 	});
 
 	test('every tool rejects loud when no grid is open', () => {

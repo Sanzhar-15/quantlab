@@ -32,7 +32,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import * as readline from 'node:readline';
 
-import type { CellRangeJson, CellSnapshotJson, OperationStateJson } from '../types';
+import type { BindingInfoJson, CellRangeJson, CellSnapshotJson, OperationStateJson } from '../types';
 import { fireRecalcFailsafe } from '../session';
 import { PublishedCellsStore, type PublishedRange } from './publishedCellsStore';
 
@@ -42,6 +42,17 @@ export interface ReactiveSession {
 	recalcDirty(): bigint;
 	operationStatus(op: bigint): OperationStateJson;
 	cell(sheet: number, row: number, col: number): CellSnapshotJson | null;
+	/**
+	 * **TE1 (2026-06-27):** the engine's unified binding registry -- the badge source-of-truth the
+	 * host `PublishedCellsStore` mirrors. Read at each op boundary (`syncBadgesFromEngine`).
+	 */
+	bindings(): BindingInfoJson[];
+	/**
+	 * **TE1:** drop the engine binding for a var the kernel rolled back (G3-refused) or marked stale,
+	 * so the mirror reflects that it drives nothing now. Returns `false` for an already-absent id
+	 * (idempotent, not an error).
+	 */
+	unbind(bindingId: string): boolean;
 }
 
 /** A G3 refusal: the host declined to overwrite a user FORMULA in the target (surfaced, not silent). */
@@ -134,8 +145,9 @@ export class ReactiveKernelClient {
 	private killed = false;
 	private readonly cellStdout: string[] = [];
 	private readonly closeListeners: Array<(err: Error | undefined) => void> = [];
-	// W-G bound-cell indicator: tracks which cells each published variable currently drives (recorded in
-	// applyRepublish, retracted on stale/refused at the op boundary). Read per-sheet by the CellGridPanel.
+	// W-G bound-cell indicator / TE1: a DERIVED MIRROR of the engine binding registry, rebuilt from
+	// `session.bindings()` at each op boundary (syncBadgesFromEngine) -- NOT a host-side writer. Read
+	// per-sheet by the CellGridPanel (alive badges) and whole by the MCP tool (the complete set).
 	private readonly publishedCells = new PublishedCellsStore();
 
 	constructor(options: ReactiveKernelClientOptions) {
@@ -162,6 +174,12 @@ export class ReactiveKernelClient {
 		if (this.child) {
 			throw new Error('ReactiveKernelClient.start() called twice');
 		}
+		// TE1: a binding is inert without a live kernel (DEC PERSISTENCE), and the engine binding registry
+		// is session-scoped -- it OUTLIVES a kernel. Any binding present as THIS kernel starts is from a
+		// prior (now-dead) kernel on the same session; left in place, the engine (the badge source-of-truth)
+		// would resurrect a phantom badge on the first op that mirrors `session.bindings()`. Clear them so
+		// the new kernel starts from a clean slate and re-establishes bindings as its cells run.
+		this.clearStaleEngineBindings();
 		// fd0 stdin (host->supervisor), fd1 cell stdout (drained), fd2 kernel stderr (inherited),
 		// fd3 control/republish plane (NDJSON). `-u` = unbuffered so frames are not stranded.
 		const child = spawn(this.opts.pythonPath, ['-u', this.opts.supervisorScript], {
@@ -238,13 +256,25 @@ export class ReactiveKernelClient {
 				}
 			}
 		}
-		// W-G bound-cell indicator: a publish that did NOT land (G3-refused -- the rollback above
-		// unpublished it) or a variable the kernel marked STALE drives nothing now, so drop its badge.
-		// Records happen per-frame in applyRepublish; retractions are applied here at the op boundary.
-		const boundSetChanged = this.retractBadges(result);
+		// TE1: the engine binding registry is the badge source-of-truth. A publish that did NOT land
+		// (G3-refused -- the rollback above unpublished it) or a variable the kernel marked STALE drives
+		// nothing now -- drop its engine binding so the mirror no longer shows it. Surfaced loud; an
+		// unbind failure must NOT mask an original cell error (it is promoted only when none was thrown).
+		const dropErr = this.dropBindingsFor([...result.refused.map((r) => r.name), ...result.stale]);
+		if (dropErr && !thrown) {
+			thrown = dropErr;
+		}
+		// Rebuild the badge mirror from the engine AFTER the unbinds, so it reflects the final binding set.
+		// A `session.bindings()` failure is surfaced loud (No-Fallbacks) and promoted to the op's rejection
+		// only when no earlier error exists -- it must NOT escape raw and mask an original cell error (HIGH
+		// audit fold). The repaint below still fires for data that landed (republishCount).
+		const sync = this.syncBadgesFromEngine();
+		if (sync.error && !thrown) {
+			thrown = sync.error;
+		}
 		// Repaint if cell DATA changed (a republish landed, even on a publish-then-raise cell) OR the
 		// bound-set changed (a badge must clear though no value moved), THEN rethrow.
-		if (result.republishCount > 0 || boundSetChanged) {
+		if (result.republishCount > 0 || sync.changed) {
 			this.opts.onChanged();
 		}
 		if (thrown) {
@@ -256,29 +286,101 @@ export class ReactiveKernelClient {
 	/** R7: signal an undo/redo epoch so the kernel marks every binding force_check. */
 	async epochChange(): Promise<ReactiveOpResult> {
 		const r = await this.sendOp('epoch_done', { type: 'epoch_change' });
-		const boundSetChanged = this.retractBadges(r);
-		if (r.republishCount > 0 || boundSetChanged) {
+		// TE1: an epoch op can re-emit republishes that get G3-refused or marked stale -- drop their
+		// engine bindings, then rebuild the badge mirror from the engine (which also reflects any
+		// undo/redo structural invalidation / force_check the epoch surfaced).
+		const dropErr = this.dropBindingsFor([...r.refused.map((ref) => ref.name), ...r.stale]);
+		const sync = this.syncBadgesFromEngine();
+		if (r.republishCount > 0 || sync.changed) {
 			this.opts.onChanged();
+		}
+		// No-Fallbacks symmetry with execute(): an unbind / bindings() failure must REJECT the epoch op,
+		// not resolve clean after only an onError toast (a caller awaiting epochChange must learn of it).
+		// The repaint above still ran for any data that landed before we surface the fault.
+		const err = dropErr ?? sync.error;
+		if (err) {
+			throw err;
 		}
 		return r;
 	}
 
 	/**
-	 * W-G bound-cell indicator: drop the badge for every variable that, this op, the kernel marked STALE
-	 * (deleted/undefined) or whose publish was G3-REFUSED (re-targeted onto a user formula -> it landed
-	 * nowhere). Returns whether the tracked set actually changed (so the caller repaints to clear the
-	 * badge even when no cell value moved). A name and its successful republish never co-occur in one op
-	 * (a variable publishes one target per run), so this never erases a fresh record.
+	 * TE1 (var<->cell moat): drop the ENGINE binding for every variable that, this op, the kernel marked
+	 * STALE (deleted/undefined) or whose publish was G3-REFUSED (re-targeted onto a user formula -> the
+	 * kernel rolled it back, so it drives nothing now). The engine binding registry is the badge
+	 * source-of-truth, so dropping it here is what clears the badge at the next {@link syncBadgesFromEngine}.
+	 * `unbind` returns `false` for an already-absent id (idempotent -- e.g. a publish refused on its first
+	 * run never created a binding); that is NOT an error. A THROWN engine error is surfaced loud
+	 * (No-Fallbacks) and returned so the caller can promote it to the op's rejection WITHOUT masking an
+	 * original cell error.
+	 *
+	 * Ordering guarantees correctness even if a var BOTH republished and went stale/refused this op
+	 * (e.g. `qb.publish('x', ...)` then `del x` in one cell): `applyRepublish` upserts the engine binding
+	 * DURING the op; this drop runs AFTER, at the op boundary -- so the kernel's final stale/refused
+	 * verdict wins and the final binding state matches the final Python state. We do NOT rely on the two
+	 * never co-occurring.
 	 */
-	private retractBadges(result: ReactiveOpResult): boolean {
-		let changed = false;
-		for (const ref of result.refused) {
-			changed = this.publishedCells.markStale(ref.name) || changed;
+	private dropBindingsFor(names: string[]): Error | undefined {
+		let first: Error | undefined;
+		for (const name of names) {
+			try {
+				this.opts.session.unbind(name);
+			} catch (e) {
+				const err = e instanceof Error ? e : new Error(String(e));
+				this.opts.onError(`reactive engine unbind failed for "${name}": ${err.message}`);
+				if (!first) {
+					first = err;
+				}
+			}
 		}
-		for (const name of result.stale) {
-			changed = this.publishedCells.markStale(name) || changed;
+		return first;
+	}
+
+	/**
+	 * TE1: rebuild the badge mirror from the engine's binding registry (the source-of-truth). The engine
+	 * -- not the host -- decides which cells each var drives, so the badge and the engine can never
+	 * disagree. Returns `{ changed }` -- whether the BADGE-VISIBLE (alive) set changed, so the caller
+	 * repaints only when a badge actually moved / appeared / cleared -- plus `{ error }` if reading
+	 * `session.bindings()` (or rebuilding the mirror) threw. The error is surfaced loud here (No-Fallbacks)
+	 * and returned (NOT thrown) so the caller can repaint any landed data and promote the fault without
+	 * masking an original cell error.
+	 */
+	private syncBadgesFromEngine(): { changed: boolean; error?: Error } {
+		try {
+			return { changed: this.publishedCells.syncFromBindings(this.opts.session.bindings()) };
+		} catch (e) {
+			const err = e instanceof Error ? e : new Error(String(e));
+			this.opts.onError(`reactive badge sync (session.bindings) failed: ${err.message}`);
+			return { changed: false, error: err };
 		}
-		return changed;
+	}
+
+	/**
+	 * TE1: clear any engine bindings left over from a prior (now-dead) kernel on this session before THIS
+	 * kernel runs (see {@link start}). A binding is inert without a live kernel and the registry is
+	 * session-scoped, so a leftover would be resurrected as a phantom badge by the first
+	 * {@link syncBadgesFromEngine}. Errors are surfaced loud (No-Fallbacks) but do NOT block the kernel
+	 * start -- a failed sweep degrades to a possibly-stale badge until the next clean op, which is visible
+	 * via onError, not silent.
+	 */
+	private clearStaleEngineBindings(): void {
+		let stale: BindingInfoJson[];
+		try {
+			stale = this.opts.session.bindings();
+		} catch (e) {
+			const err = e instanceof Error ? e : new Error(String(e));
+			this.opts.onError(`reactive kernel start: reading stale engine bindings failed: ${err.message}`);
+			return;
+		}
+		for (const b of stale) {
+			try {
+				this.opts.session.unbind(b.bindingId);
+			} catch (e) {
+				const err = e instanceof Error ? e : new Error(String(e));
+				this.opts.onError(`reactive kernel start: clearing stale binding "${b.bindingId}" failed: ${err.message}`);
+			}
+		}
+		this.publishedCells.clear();
 	}
 
 	/** W-G: the cells each published variable drives on `sheet`, for the CellGridPanel's badge paint. */
@@ -286,9 +388,10 @@ export class ReactiveKernelClient {
 		return this.publishedCells.rangesForSheet(sheet);
 	}
 
-	/** B1 MCP: EVERY published range (any sheet, incl. a now-deleted one), for `get_published_variables`
-	 *  to enumerate the COMPLETE set rather than only the cells on live sheets. */
-	publishedCellsForAllSheets(): Array<{ sheet: number; range: PublishedRange }> {
+	/** B1 MCP: EVERY published binding (any sheet, incl. a now-deleted one; alive OR dead), for
+	 *  `get_published_variables` to enumerate the COMPLETE set. `alive` lets the tool flag a
+	 *  structurally-invalidated binding rather than present it as a live published variable. */
+	publishedCellsForAllSheets(): Array<{ sheet: number; range: PublishedRange; alive: boolean }> {
 		return this.publishedCells.allRangesWithSheet();
 	}
 
@@ -475,10 +578,9 @@ export class ReactiveKernelClient {
 		this.opts.session.publishDataset(f.name, JSON.stringify({ values: f.values }), range);
 		this.recalcChecked();
 		this.pending!.republishCount++;
-		// W-G bound-cell indicator: the publish landed -- record (latest-wins) that `f.name` now drives
-		// `range` so the panel can badge it. In lockstep with republishCount++ (a frame that fails
-		// recalcChecked above neither counts nor badges); a G3 refusal returned before reaching here.
-		this.publishedCells.recordPublish(f.name, range);
+		// TE1: the publish upserted the engine binding for `f.name` (the badge source-of-truth). The host
+		// no longer records the badge per-frame here -- the mirror is rebuilt from `session.bindings()`
+		// at the op boundary (syncBadgesFromEngine), so the badge can never disagree with the engine.
 	}
 
 	// HIGH (1d-0 Codex fold): mirror the shipped `recalcDirtyChecked` (session.ts) -- a recalc that

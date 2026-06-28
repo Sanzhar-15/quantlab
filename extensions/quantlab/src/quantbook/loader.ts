@@ -503,6 +503,18 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`Session.prototype.${method} (Wave L3)`);
 				}
 			}
+			// **TE1 (var<->cell moat, 2026-06-27):** the unified binding registry
+			// readers/mutator (`binding`/`bindings`/`unbind`). A stale cdylib (pre-TE1)
+			// lacks these -- the reactive badge sync mirrors `session.bindings()` and the
+			// op-boundary reconcile calls `session.unbind(name)`, so fail loud at the
+			// loader boundary, not at the `bindings is not a function` use site mid-op.
+			// (`bindRange` is already covered by the 6.3-2e presence list above; TE1 only
+			// added an optional `direction` arg, which does not change its presence.)
+			for (const method of ['binding', 'bindings', 'unbind']) {
+				if (typeof sproto[method] !== 'function') {
+					missing.push(`Session.prototype.${method} (TE1)`);
+				}
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

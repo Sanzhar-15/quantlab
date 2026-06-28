@@ -30,8 +30,9 @@ export interface ReactiveKernelClientLike {
 	onClose(listener: (err: Error | undefined) => void): void;
 	/** W-G bound-cell indicator: the cells each published variable drives on `sheet`. */
 	publishedCellsForSheet(sheet: number): PublishedRange[];
-	/** B1 MCP: EVERY published range with its (possibly deleted) sheet, for `get_published_variables`. */
-	publishedCellsForAllSheets(): Array<{ sheet: number; range: PublishedRange }>;
+	/** B1 MCP: EVERY published binding with its (possibly deleted) sheet AND `alive` flag, for
+	 *  `get_published_variables` (so a structurally-invalidated binding is flagged, not shown as live). */
+	publishedCellsForAllSheets(): Array<{ sheet: number; range: PublishedRange; alive: boolean }>;
 }
 
 /**
@@ -138,7 +139,7 @@ export class ReactiveKernelManager<S = object> {
 	 * so `get_published_variables` enumerates the COMPLETE set rather than only the live-sheet cells.
 	 * `[]` when no kernel is registered (a true empty -- the grid has no published variables).
 	 */
-	publishedCellsForAllSheets(session: S): Array<{ sheet: number; range: PublishedRange }> {
+	publishedCellsForAllSheets(session: S): Array<{ sheet: number; range: PublishedRange; alive: boolean }> {
 		const client = this.clients.get(session);
 		return client === undefined ? [] : client.publishedCellsForAllSheets();
 	}

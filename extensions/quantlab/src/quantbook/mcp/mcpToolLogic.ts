@@ -97,7 +97,8 @@ export interface McpTargetGrid {
 export interface McpHostContext {
 	readonly grids: readonly McpTargetGrid[];
 	readonly focusedId: string | undefined;
-	/** The cells each published variable currently drives on `session`, across all its live sheets. */
+	/** The cells each published variable drives on `session`, across ALL sheets (incl. a now-deleted one).
+	 *  A structurally-invalidated binding is flagged `alive:false` (never omitted), not silently dropped. */
 	publishedVariables(session: McpSessionPort): PublishedVariableTargets[];
 }
 
@@ -105,6 +106,12 @@ export interface McpHostContext {
 export interface PublishedVariableTargets {
 	readonly name: string;
 	readonly range: CellRangeJson;
+	/**
+	 * **TE1**: `false` when the engine binding was structurally invalidated (a row/col/sheet delete under
+	 * the variable's cells). A dead binding is still enumerated (never silently omitted) but flagged so the
+	 * tool does not present it as a live published variable.
+	 */
+	readonly alive: boolean;
 }
 
 /**
@@ -382,9 +389,20 @@ export interface GetUsedRangeResult {
 export interface PublishedVariableResult {
 	name: string;
 	sheet: number;
-	/** The sheet-qualified A1 range the variable drives, e.g. "S0!B1:D3" (or "S0!B1" for a single cell). */
+	/**
+	 * The sheet-qualified A1 range the variable drives, e.g. "S0!B1:D3" (or "S0!B1" for a single cell).
+	 * For an invalidated binding (`alive: false`) on a tombstoned sheet this renders as `#REF!<id>!...`;
+	 * on a surviving sheet it renders the (anchored) prior range -- read together with `alive`.
+	 */
 	a1Range: string;
 	range: CellRangeJson;
+	/**
+	 * **TE1**: `false` when the variable's engine binding was structurally invalidated (a row/col/sheet
+	 * delete under its cells). The variable is still listed (never silently omitted) but its `range`/
+	 * `a1Range` no longer reliably locate live data -- an agent should treat a `false` entry as a dangling
+	 * reference, not a current published target.
+	 */
+	alive: boolean;
 }
 
 export interface GetPublishedVariablesResult {
@@ -550,10 +568,12 @@ export function toolGetUsedRange(ctx: McpHostContext, args: { sessionId?: string
 }
 
 /**
- * get_published_variables: the reactive-kernel variables currently published into the target grid's
- * workbook and the cells each drives. Empty when no reactive notebook is bound (a true empty -- the
- * grid simply has no published variables, NOT an error). Each entry carries both a sheet-qualified A1
- * string (for display) and the structured range.
+ * get_published_variables: the reactive-kernel variables published into the target grid's workbook and
+ * the cells each drives. Empty when no reactive notebook is bound (a true empty -- the grid simply has no
+ * published variables, NOT an error). Each entry carries a sheet-qualified A1 string (for display), the
+ * structured range, and an `alive` flag. A structurally-invalidated binding (`alive: false`, from a
+ * row/col/sheet delete under its cells) is STILL listed (never silently omitted -- TE1 "the engine is
+ * truth, never drop a var") but flagged, so an agent treats it as a dangling reference, not a live target.
  */
 export function toolGetPublishedVariables(ctx: McpHostContext, args: { sessionId?: string }): GetPublishedVariablesResult {
 	const grid = resolveTargetGrid(ctx, args.sessionId);
@@ -565,6 +585,7 @@ export function toolGetPublishedVariables(ctx: McpHostContext, args: { sessionId
 		sheet: p.range.sheet,
 		a1Range: formatA1Range(sheetNameById.get(p.range.sheet), p.range),
 		range: p.range,
+		alive: p.alive,
 	}));
 	return { sessionId: grid.id, variables };
 }

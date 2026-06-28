@@ -1528,6 +1528,9 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 			'cellLineage',
 			// Wave L3 (2026-06-24): the loader now boundary-checks the R24 used-range + list-tables reads.
 			'usedRange', 'listTables',
+			// TE1 (2026-06-27): the loader now boundary-checks the unified binding registry readers/mutator
+			// (`bindRange` was already present above; TE1 adds the three new ones).
+			'binding', 'bindings', 'unbind',
 		]) {
 			(fakeSession.prototype as Record<string, unknown>)[m] = function () { /* */ };
 		}

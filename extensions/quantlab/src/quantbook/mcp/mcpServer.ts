@@ -228,6 +228,9 @@ function buildHostContext(kernelManager: ReactiveKernelManager<SessionInstance>)
 			return kernelManager.publishedCellsForAllSheets(real).map((e) => ({
 				name: e.range.name,
 				range: { sheet: e.sheet, startRow: e.range.startRow, startCol: e.range.startCol, endRow: e.range.endRow, endCol: e.range.endCol },
+				// TE1: false for a structurally-invalidated binding (the tool flags it rather than presenting
+				// a dead binding as a live published variable).
+				alive: e.alive,
 			}));
 		},
 	};
