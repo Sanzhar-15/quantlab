@@ -1842,8 +1842,14 @@ pub fn atan2(args: &[Value]) -> Value {
 // → #NUM!), which is byte-for-byte the W5-64 design contract.
 use ql_types::coercion::to_text_for_arg as coerce_text;
 
-/// `LEN(text)` — character count of the text representation (UTF-8 chars).
-/// Excel treats it as character count, not byte count.
+/// `LEN(text)` — length of the text representation in **UTF-16 code
+/// units**, matching Excel. Excel stores text as UTF-16 and `LEN` counts
+/// code units: a BMP character counts as 1, but an astral (non-BMP)
+/// character such as U+1D11E (𝄞) or an emoji is a surrogate pair and
+/// counts as 2. This differs from Rust's `chars().count()`, which counts
+/// Unicode scalar values (so it would under-count astral characters).
+/// (Excel's `LENB` byte-count variant is a separate function and is not
+/// implemented here.)
 pub fn len(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::Error(ErrorValue::Value);
@@ -1852,11 +1858,44 @@ pub fn len(args: &[Value]) -> Value {
         Ok(s) => s,
         Err(e) => return Value::Error(e),
     };
-    Value::Number(text.chars().count() as f64)
+    Value::Number(text.encode_utf16().count() as f64)
 }
 
-/// `UPPER(text)` — ASCII + Unicode uppercase. Excel's localization
-/// (Turkish dotted/dotless I) lands Phase 4.9.
+/// Unicode `Simple_Uppercase_Mapping` for the 27 Greek polytonic
+/// characters whose *full* uppercase mapping (used by
+/// `char::to_uppercase`) expands to multiple chars but whose simple
+/// uppercase is a single precomposed capital — the iota-subscript
+/// ("ypogegrammeni") small forms map to their "prosgegrammeni" capitals.
+/// Returns `None` for every other character (the caller then keeps the
+/// original, matching Excel's non-expanding simple case mapping). This is
+/// the only class where "keep the original" would be wrong, so handling
+/// it makes UPPER exact simple-uppercase for all of Unicode.
+fn simple_upper_precomposed(c: char) -> Option<char> {
+    let mapped = match c as u32 {
+        // ᾀ..ᾇ → ᾈ..ᾏ, ᾐ..ᾗ → ᾘ..ᾟ, ᾠ..ᾧ → ᾨ..ᾯ  (each +8).
+        u @ (0x1F80..=0x1F87 | 0x1F90..=0x1F97 | 0x1FA0..=0x1FA7) => u + 8,
+        0x1FB3 => 0x1FBC, // ᾳ → ᾼ
+        0x1FC3 => 0x1FCC, // ῃ → ῌ
+        0x1FF3 => 0x1FFC, // ῳ → ῼ
+        _ => return None,
+    };
+    char::from_u32(mapped)
+}
+
+/// `UPPER(text)` — uppercase applying the Unicode
+/// **`Simple_Uppercase_Mapping`** exactly, which is what Excel uses (via
+/// the Windows case-mapping APIs). Rust's `char::to_uppercase` applies
+/// *full* Unicode case mapping, which expands certain characters to
+/// several chars — German `'ß'` → `"SS"`, the `'ﬁ'` ligature (U+FB01) →
+/// `"FI"`, the Greek polytonic iota-subscript forms, etc. — whereas the
+/// simple mapping never expands. For each char we use the full mapping
+/// only when it is a single code point; for a multi-char-expanding char we
+/// substitute the single precomposed simple-uppercase capital where one
+/// exists (the 27 Greek polytonic chars in [`simple_upper_precomposed`])
+/// and otherwise keep the original character (`ß`→`ß`, ligatures
+/// unchanged). That Greek set is the only divergent class, so UPPER now
+/// matches the Unicode simple uppercase exactly with no residual
+/// divergence.
 pub fn upper(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::Error(ErrorValue::Value);
@@ -1865,10 +1904,34 @@ pub fn upper(args: &[Value]) -> Value {
         Ok(s) => s,
         Err(e) => return Value::Error(e),
     };
-    Value::text(text.to_uppercase())
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let mut mapped = c.to_uppercase();
+        match (mapped.next(), mapped.next()) {
+            // Simple 1:1 mapping (also covers identity for uncased chars).
+            (Some(first), None) => out.push(first),
+            // Full mapping expands to >1 char. Excel never expands: use the
+            // precomposed simple-uppercase capital when one exists (Greek
+            // polytonic iota-subscript forms), else keep the original
+            // character (e.g. ß, ligatures).
+            _ => match simple_upper_precomposed(c) {
+                Some(cap) => out.push(cap),
+                None => out.push(c),
+            },
+        }
+    }
+    Value::text(out)
 }
 
-/// `LOWER(text)` — ASCII + Unicode lowercase.
+/// `LOWER(text)` — lowercase via Rust's `char::to_lowercase`. Unlike
+/// `UPPER`, no simple-mapping guard is applied. The only Unicode character
+/// whose *full* lowercase mapping expands is U+0130 (İ) → "i" + combining
+/// dot above (U+0307). That expansion is UNCONDITIONAL in Unicode's
+/// SpecialCasing — it applies in ALL locales, not just Turkish — whereas
+/// Excel returns plain "i" (its simple mapping) in a non-Turkish locale.
+/// So this is a genuine divergence in every locale: pre-existing and
+/// deferred to Phase 4.9. Every other character lowercases 1:1 and matches
+/// Excel.
 pub fn lower(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::Error(ErrorValue::Value);
@@ -4968,10 +5031,45 @@ mod tests {
         assert_eq!(upper(&[]), Value::Error(ErrorValue::Value));
         assert_eq!(upper(&[t("a"), t("b")]), Value::Error(ErrorValue::Value));
         assert_eq!(lower(&[]), Value::Error(ErrorValue::Value));
-        // German sharp-s known divergence: Rust to_uppercase("ß") =
-        // "SS"; Excel UPPER("ß") = "ß". Phase 4.9 (localization)
-        // closes; matrix already notes the divergence.
-        assert_eq!(upper(&[t("ß")]), t("SS"));
+        // Excel uses SIMPLE (1:1) case mapping: a character whose *full*
+        // Unicode uppercase expands to several chars is left unchanged.
+        // German sharp-s: UPPER("ß") == "ß" (NOT the Rust full-mapping
+        // "SS"). Same rule keeps the 'ﬁ' ligature (U+FB01) intact rather
+        // than expanding it to "FI".
+        assert_eq!(upper(&[t("ß")]), t("ß"));
+        assert_eq!(upper(&[t("\u{FB01}")]), t("\u{FB01}"));
+        // LOWER("ß") is unaffected — ß is already lowercase.
+        assert_eq!(lower(&[t("ß")]), t("ß"));
+    }
+
+    #[test]
+    fn h5_upper_simple_uppercase_mapping() {
+        // UPPER applies the Unicode Simple_Uppercase_Mapping exactly.
+        // Greek polytonic iota-subscript forms whose FULL uppercase
+        // expands to two chars have a single precomposed simple-uppercase
+        // capital — UPPER must substitute it, not keep the original.
+        assert_eq!(upper(&[t("\u{1F80}")]), t("\u{1F88}"));
+        assert_eq!(upper(&[t("\u{1F90}")]), t("\u{1F98}"));
+        assert_eq!(upper(&[t("\u{1FA0}")]), t("\u{1FA8}"));
+        assert_eq!(upper(&[t("\u{1FB3}")]), t("\u{1FBC}"));
+        assert_eq!(upper(&[t("\u{1FC3}")]), t("\u{1FCC}"));
+        assert_eq!(upper(&[t("\u{1FF3}")]), t("\u{1FFC}"));
+        // Characters whose simple uppercase is themselves stay unchanged
+        // (no precomposed capital): ß and the fi / ffi / ffl ligatures.
+        assert_eq!(upper(&[t("ß")]), t("ß"));
+        assert_eq!(upper(&[t("\u{FB01}")]), t("\u{FB01}")); // ﬁ
+        assert_eq!(upper(&[t("\u{FB03}")]), t("\u{FB03}")); // ﬃ (3-char expand)
+        assert_eq!(upper(&[t("\u{FB04}")]), t("\u{FB04}")); // ﬄ (3-char expand)
+    }
+
+    #[test]
+    fn h5_lower_dotted_capital_i_divergence() {
+        // Known Phase-4.9 divergence (applies in ALL locales, not just
+        // Turkish): U+0130 (İ) has an UNCONDITIONAL full lowercase
+        // expansion to "i" + combining dot above (U+0307) in Unicode
+        // SpecialCasing. Excel returns plain "i" (simple mapping) in a
+        // non-Turkish locale. We pin Rust's full-mapping result here.
+        assert_eq!(lower(&[t("\u{0130}")]), t("i\u{0307}"));
     }
 
     #[test]
@@ -4986,14 +5084,21 @@ mod tests {
     }
 
     #[test]
-    fn h5_len_known_unicode_divergence() {
-        // LEN counts Unicode scalar values (`char`s), NOT UTF-16
-        // code units like Excel. For a ZWJ emoji sequence (👨‍👩‍👧),
-        // Rust scalars = 5 but Excel UTF-16 = 8. Matrix documents
-        // this as a known divergence; this test pins our actual
-        // behavior so a future change can't drift silently.
+    fn h5_len_counts_utf16_code_units() {
+        // LEN counts UTF-16 code units, matching Excel (which stores text
+        // as UTF-16). An astral (non-BMP) character is a surrogate pair
+        // and counts as 2.
+        // U+1D11E MUSICAL SYMBOL G CLEF (𝄞) — single scalar, 2 UTF-16 units:
+        assert_eq!(len(&[Value::text("\u{1D11E}")]), n(2.0));
+        // A single emoji (U+1F600) is also a surrogate pair → 2:
+        assert_eq!(len(&[Value::text("\u{1F600}")]), n(2.0));
+        // ZWJ family sequence 👨‍👩‍👧 = three astral emoji (2 units each)
+        // joined by two BMP zero-width joiners (1 unit each) = 2+1+2+1+2
+        // = 8 UTF-16 units (Excel canon; a Rust scalar count would be 5).
         let zwj_family = "👨\u{200D}👩\u{200D}👧";
-        assert_eq!(len(&[Value::text(zwj_family)]), n(5.0));
+        assert_eq!(len(&[Value::text(zwj_family)]), n(8.0));
+        // BMP characters still count as 1 each (é is one UTF-16 unit).
+        assert_eq!(len(&[Value::text("café")]), n(4.0));
     }
 
     #[test]

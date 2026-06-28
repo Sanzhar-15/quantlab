@@ -626,29 +626,56 @@ pub fn edate_ctx(args: &[Value], ctx: &EvalContext) -> Value {
 // W5-74 — DAYS, NETWORKDAYS, WORKDAY, YEARFRAC (V1 wave 3, closes 18/18)
 // ============================================================================
 
-/// **`DAYS(end_date, start_date)`** — number of days between two serials.
+/// Coerce a `DAYS` argument to an Excel serial. Numbers / booleans /
+/// blank go through [`to_serial_arg`]; a TEXT argument is parsed as an
+/// Excel date string (DATEVALUE semantics) under the workbook date
+/// system — matching Excel, which DATEVALUEs text date args before
+/// subtracting. Invalid text surfaces `#VALUE!` (no silent fallback).
+fn to_serial_or_datevalue(v: &Value, system: DateSystem) -> Result<f64, ErrorValue> {
+    match v {
+        Value::Text(s) => {
+            let (y, m, d) = parse_date_text(s)?;
+            ymd_to_serial(y, m, d, system)
+        }
+        other => to_serial_arg(other),
+    }
+}
+
+/// **`DAYS(end_date, start_date)`** — number of days between two dates.
 /// Returns `INT(end) - INT(start)`. Negative result when end < start
 /// (Excel canon).
 ///
-/// **V1 divergence (filed as GAP-F-08):** strict numeric only. Text args
-/// (which Excel would DATEVALUE) return `#VALUE!`. Use DATEVALUE
-/// explicitly. Lands proper text support in Phase 4.10 polish.
-///
-/// Pure ScalarFn — doesn't need date_system (serial subtraction is
-/// system-agnostic when both inputs are from the same system).
-pub fn days(args: &[Value]) -> Value {
+/// **Excel text-arg coercion (closes GAP-F-08):** text date arguments are
+/// parsed via DATEVALUE semantics under the workbook date system, so
+/// `DAYS("2020-01-31", "2020-01-01") == 30`. Invalid text still surfaces
+/// as `#VALUE!`. This is a `ContextAwareFn` so it can see the workbook
+/// date system — required for the correct result when one argument is a
+/// raw numeric serial and the other is text in a non-1900 workbook (both
+/// must resolve to serials in the same date system before subtraction).
+pub fn days_ctx(args: &[Value], ctx: &EvalContext) -> Value {
     if args.len() != 2 {
         return Value::Error(ErrorValue::Value);
     }
-    let end = match to_serial_arg(&args[0]) {
+    let end = match to_serial_or_datevalue(&args[0], ctx.date_system) {
         Ok(s) => s,
         Err(e) => return Value::Error(e),
     };
-    let start = match to_serial_arg(&args[1]) {
+    let start = match to_serial_or_datevalue(&args[1], ctx.date_system) {
         Ok(s) => s,
         Err(e) => return Value::Error(e),
     };
     Value::Number(end.trunc() - start.trunc())
+}
+
+/// Public `days` entry point retained for API stability. **Numeric-arg
+/// behavior is identical to before** — system-agnostic serial subtraction.
+/// **Text-arg behavior CHANGED:** text dates are now DATEVALUE-coerced
+/// (closes GAP-F-08), and this wrapper always does so under the default
+/// Excel1900 date system. The registered `DAYS` is [`days_ctx`]; call
+/// `days_ctx` with a real `EvalContext` if the workbook date system
+/// matters for text args (this wrapper always uses Excel1900).
+pub fn days(args: &[Value]) -> Value {
+    days_ctx(args, &EvalContext::default())
 }
 
 /// Internal: is the weekday at the given serial a working day (Mon–Fri)?
@@ -773,19 +800,20 @@ pub fn workday_ctx(args: &[Value], ctx: &EvalContext) -> Value {
 /// **`YEARFRAC(start, end, [basis])`** — fractional years between two
 /// dates. `basis` selects the day-count convention (default 0):
 ///
-/// - `0` US (NASD) 30/360 — implemented as European-30/360 in V1 (see
-///   V1 divergence below).
+/// - `0` US (NASD) 30/360 — uses the US NASD day-count via
+///   [`days360_count`]`(.., european = false)`, i.e. the day-31 → day-30
+///   special-casing IS applied (shared with `DAYS360(.., FALSE)`).
 /// - `1` Actual/actual — uses real day count; denominator handles
 ///   leap-year span via the average-year-length method.
 /// - `2` Actual/360 — actual days / 360.
 /// - `3` Actual/365 — actual days / 365.
 /// - `4` European 30/360 — `(360*(y2-y1) + 30*(m2-m1) + (d2-d1)) / 360`.
 ///
-/// **V1 divergence (GAP-F-11):** basis 0 (US NASD 30/360) uses the
-/// European-30/360 algorithm in V1 (basis 4). The US convention's
-/// end-of-month special-casing (Feb 28/29 → Feb 30; if d1=31 → d1=30;
-/// if d2=31 and d1=30/31 → d2=30) lands in Phase 4.10. For most date
-/// ranges the divergence is 0-1 days out of 360.
+/// **V1 divergence (GAP-F-11):** basis 0 implements the NASD day-31 rule
+/// but NOT the end-of-February special-casing (the last day of February
+/// treated as day 30, plus the paired d2 adjustment when both endpoints
+/// fall on the last day of February). That Feb-28/29 edge lands in Phase
+/// 4.10; for the affected ranges the divergence is 0-1 days out of 360.
 pub fn yearfrac_ctx(args: &[Value], ctx: &EvalContext) -> Value {
     if args.len() < 2 || args.len() > 3 {
         return Value::Error(ErrorValue::Value);
@@ -1547,6 +1575,12 @@ mod tests_wave3 {
     fn ctx_1900() -> EvalContext {
         EvalContext::default()
     }
+    fn ctx_1904() -> EvalContext {
+        EvalContext {
+            date_system: DateSystem::Excel1904,
+            ..EvalContext::default()
+        }
+    }
     fn n(x: f64) -> Value {
         Value::Number(x)
     }
@@ -1566,12 +1600,72 @@ mod tests_wave3 {
     }
 
     #[test]
-    fn days_text_arg_is_value_error_v1_divergence() {
-        // V1: text args not parsed (GAP-F-08). Use DATEVALUE explicitly.
+    fn days_text_args_parsed_via_datevalue() {
+        // GAP-F-08 closed: text date args are coerced via DATEVALUE
+        // semantics. DAYS("2020-01-31", "2020-01-01") == 30.
         assert_eq!(
-            days(&[Value::text("2024-01-01"), n(50.0)]),
+            days_ctx(
+                &[Value::text("2020-01-31"), Value::text("2020-01-01")],
+                &ctx_1900()
+            ),
+            n(30.0)
+        );
+        // Reversed order → negative.
+        assert_eq!(
+            days_ctx(
+                &[Value::text("2020-01-01"), Value::text("2020-01-31")],
+                &ctx_1900()
+            ),
+            n(-30.0)
+        );
+        // Mixed: one text date, one raw numeric serial (both resolved in
+        // the workbook date system before subtraction).
+        let s_jan1 = match datevalue_ctx(&[Value::text("2020-01-01")], &ctx_1900()) {
+            Value::Number(x) => x,
+            other => panic!("expected number serial, got {other:?}"),
+        };
+        assert_eq!(
+            days_ctx(&[Value::text("2020-01-31"), n(s_jan1)], &ctx_1900()),
+            n(30.0)
+        );
+        // Invalid text still surfaces #VALUE! (no silent fallback).
+        assert_eq!(
+            days_ctx(&[Value::text("not-a-date"), n(50.0)], &ctx_1900()),
             Value::Error(ErrorValue::Value)
         );
+    }
+
+    #[test]
+    fn days_text_args_under_1904_system() {
+        // DAYS must resolve text date args under the *workbook* date
+        // system, not a hardcoded 1900 system. Under Excel1904 a text date
+        // and a numeric serial (also built in 1904) must subtract
+        // consistently.
+        let ctx = ctx_1904();
+        // Pure-text difference is system-independent (offset cancels) → 30.
+        assert_eq!(
+            days_ctx(&[Value::text("2020-01-31"), Value::text("2020-01-01")], &ctx),
+            n(30.0)
+        );
+        // Mixed: numeric serial built in the SAME 1904 system as the text
+        // arg — the workbook date system flows through to the text parse.
+        let s_jan1_1904 = match datevalue_ctx(&[Value::text("2020-01-01")], &ctx) {
+            Value::Number(x) => x,
+            other => panic!("expected number serial, got {other:?}"),
+        };
+        assert_eq!(
+            days_ctx(&[Value::text("2020-01-31"), n(s_jan1_1904)], &ctx),
+            n(30.0)
+        );
+        // Proof the date system actually flows through: the 1904 serial for
+        // a given date is exactly 1462 less than the 1900 serial. Had the
+        // wrapper's hardcoded 1900 system leaked in, the mixed case above
+        // would be off by 1462.
+        let s_jan1_1900 = match datevalue_ctx(&[Value::text("2020-01-01")], &ctx_1900()) {
+            Value::Number(x) => x,
+            other => panic!("expected number serial, got {other:?}"),
+        };
+        assert_eq!(s_jan1_1900 - s_jan1_1904, 1462.0);
     }
 
     #[test]
