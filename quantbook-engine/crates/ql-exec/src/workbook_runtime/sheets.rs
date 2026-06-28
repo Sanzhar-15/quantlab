@@ -168,21 +168,86 @@ impl<'a> WorkbookRuntime<'a> {
                 rewritten_cells.push((sheet, row, col, new_text));
             }
         }
-        // (Phase 4.6.D / future): walk NamedTarget::Formula entries for
-        // the same rewrite. Today named formulas are deferred so
-        // formula_cells is the only text-bearing surface to rewrite.
+        // GAP-B-06: named-formula bodies (`NamedTarget::Formula`) carry raw
+        // text that may reference the renamed sheet by name — rewrite them the
+        // same way cell formulas are. `rewrite_formula_text_for_sheet_rename`
+        // only touches sheet-QUALIFIED refs (`NameRewrite::Sheet`), so a name's
+        // scope (workbook-global vs sheet-scoped) does not change the result;
+        // both name tables are walked. The binder still rejects
+        // `NamedTarget::Formula` (`NamedFormulaUnsupported`, latent), but the
+        // bodies persist in the op log + .qbook and round-trip, so the stored
+        // text MUST follow the rename. Collected here (immutable borrow), then
+        // dual-written below alongside the cell rewrites.
+        let mut rewritten_names: Vec<(Option<SheetId>, String, Arc<str>)> = Vec::new();
+        for (name, target) in self.workbook.names().iter() {
+            if let ql_storage::NamedTarget::Formula(body) = target {
+                if let Some(new_body) = rewrite_formula_text_for_sheet_rename(
+                    body.as_ref(),
+                    &old_canonical,
+                    &new_name_arc,
+                ) {
+                    rewritten_names.push((
+                        None,
+                        name.as_ref().to_owned(),
+                        Arc::from(new_body.as_str()),
+                    ));
+                }
+            }
+        }
+        // Scoped names on EVERY sheet, INCLUDING tombstoned ones: their storage
+        // + scoped names are retained and restorable (v1 has no hard delete and
+        // never reuses a sheet id), so a scoped Formula that qualifies the
+        // renamed sheet must be rewritten — else a later `RestoreSheet` resurfaces
+        // a stale body (Codex w141 HIGH).
+        let sheet_count = self.workbook.sheet_count() as SheetId;
+        for sid in 0..sheet_count {
+            // sid < sheet_count == sheets.len() → always Some; fail loud otherwise.
+            let s = self
+                .workbook
+                .sheet(sid)
+                .expect("sheet(sid): sid < sheet_count is an invariant");
+            for (name, target) in s.scoped_names().iter() {
+                if let ql_storage::NamedTarget::Formula(body) = target {
+                    // NF-07 (inherited): a body that fails to lex/parse yields
+                    // None and is left un-rewritten — the same documented
+                    // contract as the cell-formula path above (a corrupt body
+                    // also can't bind, so no NEW error is hidden here).
+                    if let Some(new_body) = rewrite_formula_text_for_sheet_rename(
+                        body.as_ref(),
+                        &old_canonical,
+                        &new_name_arc,
+                    ) {
+                        rewritten_names.push((
+                            Some(sid),
+                            name.as_ref().to_owned(),
+                            Arc::from(new_body.as_str()),
+                        ));
+                    }
+                }
+            }
+        }
 
         // Append-before-mutate: emit the BatchCommit op first so a
         // failing append leaves storage unchanged. The batch carries:
         //   [PutFormula(cell, new_text)] × N  +  RenameSheet
         if let Some(oplog) = self.oplog.as_deref_mut() {
-            let mut ops: Vec<Op> = Vec::with_capacity(rewritten_cells.len() + 1);
+            let mut ops: Vec<Op> =
+                Vec::with_capacity(rewritten_cells.len() + rewritten_names.len() + 1);
             for (s, r, c, ref new_text) in &rewritten_cells {
                 ops.push(Op::PutFormula {
                     sheet: *s,
                     row: *r,
                     col: *c,
                     text: new_text.clone(),
+                });
+            }
+            for (scope, name, new_body) in &rewritten_names {
+                ops.push(Op::SetName {
+                    scope: *scope,
+                    name: name.to_ascii_uppercase(),
+                    target: ql_io::NamedTargetWire::from_target(&ql_storage::NamedTarget::Formula(
+                        new_body.clone(),
+                    )),
                 });
             }
             ops.push(Op::RenameSheet {
@@ -199,6 +264,28 @@ impl<'a> WorkbookRuntime<'a> {
         // but the invariant is cleaner.)
         for (s, r, c, new_text) in rewritten_cells {
             self.workbook.put_formula(s, r, c, new_text.as_str());
+        }
+        // Dual-write the named-formula rewrites to storage too (the op above is
+        // the durable/replay record; this keeps the live in-memory workbook in
+        // sync without a full replay, mirroring the cell `put_formula` path).
+        // A re-set of an already-present, already-valid name cannot fail
+        // (`would_accept` passed when it was first defined; the target is a
+        // valid `Formula`) — an `Err` here is a broken invariant, so fail loud.
+        for (scope, name, new_body) in rewritten_names {
+            let target = ql_storage::NamedTarget::Formula(new_body);
+            match scope {
+                None => self.workbook.set_name(&name, target).expect(
+                    "rename: re-setting an existing valid global named formula cannot fail",
+                ),
+                Some(sid) => self
+                    .workbook
+                    .sheet_mut(sid)
+                    .expect("rename: scoped sheet existed during collection above")
+                    .set_scoped_name(&name, target)
+                    .expect(
+                        "rename: re-setting an existing valid scoped named formula cannot fail",
+                    ),
+            }
         }
         // Swap the name. Cannot fail here — validation already passed.
         self.workbook
@@ -219,8 +306,10 @@ impl<'a> WorkbookRuntime<'a> {
 #[cfg(test)]
 mod tests {
     use ql_functions::default_registry;
-    use ql_storage::Workbook;
+    use ql_oplog::{Op, OpLog};
+    use ql_storage::{NamedTarget, Workbook};
     use ql_types::Value;
+    use std::sync::Arc;
 
     use crate::workbook_runtime::{RuntimeError, WorkbookRuntime};
 
@@ -323,6 +412,174 @@ mod tests {
             wb.read(ql_types::Address::new(s1, 0, 1)),
             Value::Number(11.0)
         );
+    }
+
+    // ===== GAP-B-06 — named-formula (`NamedTarget::Formula`) bodies are
+    // rewritten on sheet rename, the same as cell formulas. Tests cover the
+    // storage dual-write (observable on the live workbook) + the op emission.
+
+    #[test]
+    fn rename_sheet_rewrites_global_named_formula_qualified_ref() {
+        let mut wb = Workbook::new();
+        let s1 = wb.add_sheet("S1");
+        wb.set_name("Profit", NamedTarget::Formula(Arc::from("S1!A1 - 1")))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.rename_sheet(s1, "Renamed").unwrap();
+        drop(rt);
+        match wb.names().lookup_ci("Profit").expect("name present") {
+            NamedTarget::Formula(b) => {
+                assert!(b.contains("Renamed!A1"), "got {b:?}");
+                assert!(!b.contains("S1!"), "stale ref survived: {b:?}");
+            }
+            other => panic!("expected Formula, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_sheet_rewrites_scoped_named_formula() {
+        let mut wb = Workbook::new();
+        let s1 = wb.add_sheet("S1");
+        wb.sheet_mut(s1)
+            .unwrap()
+            .set_scoped_name("Local", NamedTarget::Formula(Arc::from("S1!B2 * 2")))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.rename_sheet(s1, "Renamed").unwrap();
+        drop(rt);
+        match wb
+            .sheet(s1)
+            .unwrap()
+            .scoped_names()
+            .lookup_ci("Local")
+            .expect("scoped name present")
+        {
+            NamedTarget::Formula(b) => assert!(b.contains("Renamed!B2"), "got {b:?}"),
+            other => panic!("expected Formula, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_sheet_leaves_unrelated_named_formula_alone() {
+        let mut wb = Workbook::new();
+        let s1 = wb.add_sheet("S1");
+        let _s2 = wb.add_sheet("S2");
+        // References S2, but S1 is renamed → must be untouched.
+        wb.set_name("Other", NamedTarget::Formula(Arc::from("S2!A1 - 1")))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.rename_sheet(s1, "Renamed").unwrap();
+        drop(rt);
+        match wb.names().lookup_ci("Other").expect("name present") {
+            NamedTarget::Formula(b) => assert_eq!(b.as_ref(), "S2!A1 - 1"),
+            other => panic!("expected Formula, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_sheet_named_formula_emits_set_name_op() {
+        let mut wb = Workbook::new();
+        let s1 = wb.add_sheet("S1");
+        wb.set_name("Profit", NamedTarget::Formula(Arc::from("S1!A1 - 1")))
+            .unwrap();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.rename_sheet(s1, "Renamed").unwrap();
+        }
+        // The rename batch must carry a SetName overwriting the named formula.
+        let mut found = false;
+        for op_res in oplog.iter() {
+            if let Op::BatchCommit { ops } = op_res.expect("op decodes") {
+                for op in ops {
+                    if let Op::SetName { name, target, .. } = op {
+                        if name == "PROFIT" {
+                            match target.to_target(&name).expect("decode wire target") {
+                                NamedTarget::Formula(b) => {
+                                    assert!(b.contains("Renamed!A1"), "got {b:?}");
+                                    found = true;
+                                }
+                                other => panic!("expected Formula, got {other:?}"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "rename batch must emit SetName for the named formula"
+        );
+    }
+
+    #[test]
+    fn rename_sheet_rewrites_tombstoned_sheet_scoped_named_formula() {
+        // Codex w141 HIGH regression: a scoped formula on a TOMBSTONED sheet that
+        // qualifies the renamed sheet must still be rewritten (the sheet is
+        // restorable, so a stale body would resurface on RestoreSheet).
+        let mut wb = Workbook::new();
+        let s1 = wb.add_sheet("S1");
+        let s2 = wb.add_sheet("S2");
+        wb.sheet_mut(s2)
+            .unwrap()
+            .set_scoped_name("X", NamedTarget::Formula(Arc::from("S1!A1 - 1")))
+            .unwrap();
+        wb.remove_sheet(s2); // tombstone S2 (scoped names retained)
+        assert!(wb.is_sheet_removed(s2));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.rename_sheet(s1, "Renamed").unwrap();
+        drop(rt);
+        match wb
+            .sheet(s2)
+            .unwrap()
+            .scoped_names()
+            .lookup_ci("X")
+            .expect("scoped name retained on tombstoned sheet")
+        {
+            NamedTarget::Formula(b) => assert!(b.contains("Renamed!A1"), "got {b:?}"),
+            other => panic!("expected Formula, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_sheet_leaves_workbook_scoped_bare_ref_named_formula_alone() {
+        // A bare ref has no sheet identity; a rename must not touch it.
+        let mut wb = Workbook::new();
+        let s1 = wb.add_sheet("S1");
+        wb.set_name("Bare", NamedTarget::Formula(Arc::from("A5 - 1")))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.rename_sheet(s1, "Renamed").unwrap();
+        drop(rt);
+        match wb.names().lookup_ci("Bare").unwrap() {
+            NamedTarget::Formula(b) => assert_eq!(b.as_ref(), "A5 - 1"),
+            other => panic!("expected Formula, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_sheet_to_name_with_space_quotes_named_formula_ref() {
+        // Renaming to a name that needs quoting must produce a quoted ref body.
+        let mut wb = Workbook::new();
+        let s1 = wb.add_sheet("S1");
+        wb.set_name("Profit", NamedTarget::Formula(Arc::from("S1!A1 - 1")))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.rename_sheet(s1, "My Sheet").unwrap();
+        drop(rt);
+        match wb.names().lookup_ci("Profit").unwrap() {
+            NamedTarget::Formula(b) => {
+                assert!(b.contains("'My Sheet'!A1"), "got {b:?}")
+            }
+            other => panic!("expected Formula, got {other:?}"),
+        }
     }
 
     // ===== W5-93 (Phase 4.6.E closure) — add_sheet pre-validation =====

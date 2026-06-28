@@ -341,6 +341,14 @@ pub fn repair_sheet_rename_chain(
 
     // ===== Phase 5: walk formulas, collect updates.
     // Two-phase to avoid mut/immut borrow conflict on workbook.
+    //
+    // GAP-B-06 RESIDUAL (L2-deferred): this rewrites only CELL formulas
+    // (`iter_formulas`). `NamedTarget::Formula` bodies (workbook- + sheet-scoped
+    // named formulas) are NOT rewritten here, so a collab merge-time sheet rename
+    // leaves `Old!A1` inside a named-formula body. Latent — the binder rejects
+    // named-formula eval (GAP-B-02). The owning/product rename path
+    // (`WorkbookRuntime::rename_sheet`) already rewrites named formulas (w141);
+    // mirror that here when GAP-B-02 lands or the collab path ships to v1.
     let mut to_update: Vec<(SheetId, u32, u32, String)> = Vec::new();
     for (sheet, row, col, text) in workbook.iter_formulas() {
         let mut current_text = text.to_string();

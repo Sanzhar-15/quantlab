@@ -275,6 +275,60 @@ pub fn build_structural_batch(
         }
     }
 
+    // (3b) GAP-B-09: named-formula bodies (`NamedTarget::Formula`) are NOT
+    // re-keyed by the storage-side `shift_name_table` — it passes `Formula`
+    // through because `ql-storage` must not depend on `ql-formula-syntax` (the
+    // text-shift lives here). Mirror the cell-formula text shift for every named
+    // formula whose body references the edited sheet, emitting `Op::SetName`
+    // with the shifted body. The binder still rejects `NamedTarget::Formula`
+    // (`NamedFormulaUnsupported`, latent), but the bodies persist in the op log
+    // + .qbook and round-trip, so the stored text MUST follow the structural
+    // edit. (Cell/Range names are re-keyed by `shift_name_table` on the
+    // structural op's OWN replay, which runs before these `SetName` ops.)
+    let mut set_name_ops: Vec<Op> = Vec::new();
+    // Workbook-scoped (global) names have no owning sheet → `owner_is_edited =
+    // false`, so only sheet-QUALIFIED refs to the edited sheet shift. A bare
+    // `A5` in a global name cannot be statically attributed to a sheet (its
+    // owner depends on the using context), so it is left unchanged — a
+    // documented v1 simplification (D1).
+    collect_named_formula_shifts(
+        workbook.names(),
+        None,
+        false,
+        &edited_canonical,
+        sheet,
+        shift_axis,
+        shift_op,
+        &mut set_name_ops,
+    );
+    // Sheet-scoped names on EVERY sheet (a name scoped to sheet `sid` has bare
+    // refs relative to `sid` → `owner_is_edited = (sid == sheet)`). Tombstoned
+    // sheets are INCLUDED, not skipped: their storage + scoped names are retained
+    // and restorable (v1 has no hard delete and never reuses a sheet id), so a
+    // scoped Formula on a tombstoned sheet that qualifies the edited sheet must
+    // still be shifted — else a later `RestoreSheet` resurfaces a stale body
+    // (Codex w141 HIGH). Replay's `SetName { scope: Some(sid) }` writes the
+    // retained slot via `sheet_mut`, which does NOT tombstone-filter, so the op
+    // applies correctly even for a tombstoned `sid`.
+    let sheet_count = workbook.sheet_count() as SheetId;
+    for sid in 0..sheet_count {
+        // `sid < sheet_count == sheets.len()` → always Some; fail loud rather
+        // than silently dropping a sheet's scoped names if that ever breaks.
+        let s = workbook
+            .sheet(sid)
+            .expect("sheet(sid): sid < sheet_count is an invariant");
+        collect_named_formula_shifts(
+            s.scoped_names(),
+            Some(sid),
+            sid == sheet,
+            &edited_canonical,
+            sheet,
+            shift_axis,
+            shift_op,
+            &mut set_name_ops,
+        );
+    }
+
     // (4) Assemble the batch: structural op first, then the text rewrites at
     // their post-shift positions.
     let structural_op = match (axis, kind) {
@@ -291,10 +345,64 @@ pub fn build_structural_batch(
             Op::DeleteColumns { sheet, start, end }
         }
     };
-    let mut ops: Vec<Op> = Vec::with_capacity(put_formula_ops.len() + 1);
+    let mut ops: Vec<Op> = Vec::with_capacity(put_formula_ops.len() + set_name_ops.len() + 1);
     ops.push(structural_op);
     ops.extend(put_formula_ops);
+    // SetName ops land LAST: the structural op (replayed first) runs
+    // `shift_name_table`, which re-keys `Cell`/`Range` names and passes `Formula`
+    // through unchanged; these `SetName` ops then overwrite the `Formula` targets
+    // with their shifted bodies. (No `Formula` name is ever dropped here — a
+    // named formula is not coordinate-located, so a ref into a deleted block
+    // becomes `#REF!` in the body rather than removing the binding — D2.)
+    ops.extend(set_name_ops);
     Ok(ops)
+}
+
+/// Shift the bodies of every `NamedTarget::Formula` in `table` whose text
+/// references the edited sheet, pushing an `Op::SetName` carrying the shifted
+/// body into `out`. `scope` is the op's name scope (`None` = workbook-scoped,
+/// `Some(sheet)` = that sheet's scoped table). `owner_is_edited` controls
+/// whether bare (unqualified) refs in the body shift — see GAP-B-09 / D1.
+///
+/// A body that does not reference the edited sheet yields `None` from
+/// [`ql_formula_syntax::shift_formula_text`] → no op (no redundant rewrite). A
+/// body whose lex/parse fails (corrupt input) also yields `None` → left
+/// unchanged (NF-07: the same documented silent-skip contract as the
+/// cell-formula path; a body that cannot lex/parse also cannot bind, so no NEW
+/// error is hidden — the corruption is surfaced at bind time, not here).
+#[allow(clippy::too_many_arguments)]
+fn collect_named_formula_shifts(
+    table: &ql_storage::NameTable,
+    scope: Option<SheetId>,
+    owner_is_edited: bool,
+    edited_canonical: &str,
+    edited_id: SheetId,
+    shift_axis: ql_formula_syntax::ShiftAxis,
+    shift_op: ql_formula_syntax::ShiftOp,
+    out: &mut Vec<Op>,
+) {
+    use ql_storage::NamedTarget;
+    let scope_desc = ql_formula_syntax::ShiftScope {
+        edited_canonical,
+        edited_id,
+        owner_is_edited,
+    };
+    for (name, target) in table.iter() {
+        let NamedTarget::Formula(body) = target else {
+            continue;
+        };
+        if let Some(new_body) =
+            ql_formula_syntax::shift_formula_text(body.as_ref(), shift_axis, shift_op, scope_desc)
+        {
+            out.push(Op::SetName {
+                scope,
+                name: name.as_ref().to_ascii_uppercase(),
+                target: ql_io::NamedTargetWire::from_target(&NamedTarget::Formula(
+                    std::sync::Arc::from(new_body.as_str()),
+                )),
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -386,5 +494,380 @@ mod tests {
             ),
             None
         );
+    }
+
+    // ========================================================================
+    // GAP-B-09 — named-formula (`NamedTarget::Formula`) bodies shift on
+    // insert/delete. The structural op's own replay re-keys Cell/Range names
+    // (`shift_name_table`); these tests cover the producer-emitted `SetName`
+    // ops that carry the shifted FORMULA bodies (which storage cannot rewrite).
+    // ========================================================================
+
+    use ql_storage::{NamedTarget, Workbook};
+    use std::sync::Arc;
+
+    /// Decode every `SetName` op in a batch to `(scope, name, target)`.
+    fn set_names(ops: &[Op]) -> Vec<(Option<ql_types::SheetId>, String, NamedTarget)> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::SetName {
+                    scope,
+                    name,
+                    target,
+                } => Some((
+                    *scope,
+                    name.clone(),
+                    target.to_target(name).expect("decode wire target"),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn formula_body(t: &NamedTarget) -> &str {
+        match t {
+            NamedTarget::Formula(b) => b.as_ref(),
+            other => panic!("expected NamedTarget::Formula, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn b09_global_named_formula_qualified_ref_shifts_on_row_insert() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        // Body refs S0!A5 (row index 4). Insert 2 rows at 0 → A5 → A7.
+        wb.set_name("Profit", NamedTarget::Formula(Arc::from("S0!A5 - 1")))
+            .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Row,
+            StructuralKind::Insert { at: 0, count: 2 },
+            ql_types::MAX_ROW,
+        )
+        .unwrap();
+        // Structural op lands first; SetName ops land last.
+        assert!(matches!(ops[0], Op::InsertRows { .. }));
+        let names = set_names(&ops);
+        assert_eq!(names.len(), 1, "one SetName for the named formula");
+        assert_eq!(names[0].0, None, "workbook-scoped");
+        assert_eq!(names[0].1, "PROFIT");
+        let body = formula_body(&names[0].2);
+        assert!(body.contains("S0!A7"), "got {body:?}");
+        assert!(!body.contains("A5"), "stale ref survived: {body:?}");
+    }
+
+    #[test]
+    fn b09_global_named_formula_unqualified_ref_does_not_shift() {
+        // D1: a workbook-scoped name has no owning sheet → bare refs cannot be
+        // attributed to the edited sheet, so they are left unchanged.
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        wb.set_name("Bare", NamedTarget::Formula(Arc::from("A5 - 1")))
+            .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Row,
+            StructuralKind::Insert { at: 0, count: 2 },
+            ql_types::MAX_ROW,
+        )
+        .unwrap();
+        assert!(
+            set_names(&ops).is_empty(),
+            "global bare ref must not shift (D1)"
+        );
+    }
+
+    #[test]
+    fn b09_scoped_named_formula_bare_ref_shifts_on_owning_sheet() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        wb.sheet_mut(s0)
+            .unwrap()
+            .set_scoped_name("Bare", NamedTarget::Formula(Arc::from("A5 - 1")))
+            .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Row,
+            StructuralKind::Insert { at: 0, count: 2 },
+            ql_types::MAX_ROW,
+        )
+        .unwrap();
+        let names = set_names(&ops);
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].0, Some(s0), "sheet-scoped to the edited sheet");
+        let body = formula_body(&names[0].2);
+        assert!(body.contains("A7"), "got {body:?}");
+        assert!(!body.contains("A5"), "got {body:?}");
+    }
+
+    #[test]
+    fn b09_scoped_named_formula_bare_ref_on_other_sheet_does_not_shift() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        let s1 = wb.add_sheet("S1");
+        // Bare ref scoped to S1 is relative to S1; editing S0 must not touch it.
+        wb.sheet_mut(s1)
+            .unwrap()
+            .set_scoped_name("Bare", NamedTarget::Formula(Arc::from("A5 - 1")))
+            .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Row,
+            StructuralKind::Insert { at: 0, count: 2 },
+            ql_types::MAX_ROW,
+        )
+        .unwrap();
+        assert!(set_names(&ops).is_empty());
+    }
+
+    #[test]
+    fn b09_named_formula_ref_into_deleted_block_becomes_ref_error_kept() {
+        // D2: deleting the row the ref lives on turns it into #REF! in the body;
+        // the binding is KEPT (a named formula is not coordinate-located).
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        wb.set_name("Profit", NamedTarget::Formula(Arc::from("S0!A5 - 1")))
+            .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Row,
+            StructuralKind::Delete { start: 4, end: 4 },
+            ql_types::MAX_ROW,
+        )
+        .unwrap();
+        let names = set_names(&ops);
+        assert_eq!(names.len(), 1, "name kept, body rewritten to #REF!");
+        let body = formula_body(&names[0].2);
+        assert!(body.contains("#REF!"), "got {body:?}");
+    }
+
+    #[test]
+    fn b09_named_formula_referencing_other_sheet_is_no_op() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        let _s1 = wb.add_sheet("S1");
+        wb.set_name("Profit", NamedTarget::Formula(Arc::from("S1!A5 - 1")))
+            .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Row,
+            StructuralKind::Insert { at: 0, count: 2 },
+            ql_types::MAX_ROW,
+        )
+        .unwrap();
+        assert!(set_names(&ops).is_empty(), "unrelated sheet → no rewrite");
+    }
+
+    #[test]
+    fn b09_named_formula_qualified_col_ref_shifts_on_column_insert() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        // C1 = col index 2. Insert 1 col at 0 → C → D.
+        wb.set_name("Profit", NamedTarget::Formula(Arc::from("S0!C1 + 1")))
+            .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Col,
+            StructuralKind::Insert { at: 0, count: 1 },
+            ql_types::MAX_COLUMN,
+        )
+        .unwrap();
+        let names = set_names(&ops);
+        assert_eq!(names.len(), 1);
+        let body = formula_body(&names[0].2);
+        assert!(body.contains("S0!D1"), "got {body:?}");
+        assert!(!body.contains("C1"), "got {body:?}");
+    }
+
+    #[test]
+    fn b09_cell_and_range_names_untouched_by_producer_left_to_shift_name_table() {
+        // The producer only emits SetName for FORMULA bodies; Cell/Range names
+        // are re-keyed by `shift_name_table` on the structural op's replay, so
+        // the producer must NOT emit SetName ops for them.
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        wb.set_name(
+            "Anchor",
+            NamedTarget::Cell(ql_types::Address::new(s0, 4, 0)),
+        )
+        .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Row,
+            StructuralKind::Insert { at: 0, count: 2 },
+            ql_types::MAX_ROW,
+        )
+        .unwrap();
+        assert!(
+            set_names(&ops).is_empty(),
+            "Cell names are shift_name_table's job, not the producer's"
+        );
+    }
+
+    #[test]
+    fn b09_scoped_named_formula_qualified_ref_into_edited_sheet_shifts() {
+        // owner_is_edited=false (scoped to S1, editing S0) BUT a QUALIFIED ref to
+        // S0 must still shift — this quadrant (scoped + qualified-cross-sheet) is
+        // load-bearing: a refactor that ANDed owner_is_edited into Name-ref
+        // matching would silently corrupt it.
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        let s1 = wb.add_sheet("S1");
+        wb.sheet_mut(s1)
+            .unwrap()
+            .set_scoped_name("X", NamedTarget::Formula(Arc::from("S0!A5 - 1")))
+            .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Row,
+            StructuralKind::Insert { at: 0, count: 2 },
+            ql_types::MAX_ROW,
+        )
+        .unwrap();
+        let names = set_names(&ops);
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].0, Some(s1));
+        let body = formula_body(&names[0].2);
+        assert!(body.contains("S0!A7"), "got {body:?}");
+    }
+
+    #[test]
+    fn b09_tombstoned_sheet_scoped_named_formula_still_shifts() {
+        // Codex w141 HIGH regression: a scoped formula on a TOMBSTONED sheet that
+        // qualifies the edited sheet must still shift — the sheet is restorable,
+        // so skipping it would resurface a stale body on RestoreSheet.
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        let s1 = wb.add_sheet("S1");
+        wb.sheet_mut(s1)
+            .unwrap()
+            .set_scoped_name("X", NamedTarget::Formula(Arc::from("S0!A5 - 1")))
+            .unwrap();
+        wb.remove_sheet(s1); // tombstone (storage + scoped names retained)
+        assert!(wb.is_sheet_removed(s1));
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Row,
+            StructuralKind::Insert { at: 0, count: 2 },
+            ql_types::MAX_ROW,
+        )
+        .unwrap();
+        let names = set_names(&ops);
+        assert_eq!(
+            names.len(),
+            1,
+            "tombstoned sheet's scoped formula must still shift"
+        );
+        assert_eq!(names[0].0, Some(s1));
+        let body = formula_body(&names[0].2);
+        assert!(body.contains("S0!A7"), "got {body:?}");
+    }
+
+    #[test]
+    fn b09_mixed_qualified_and_bare_ref_global_shifts_only_qualified() {
+        // D1: in a workbook-scoped body, the qualified S0! ref shifts; the bare
+        // ref (no owning sheet) does NOT.
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        wb.set_name("Mix", NamedTarget::Formula(Arc::from("S0!A5 + B3")))
+            .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Row,
+            StructuralKind::Insert { at: 0, count: 2 },
+            ql_types::MAX_ROW,
+        )
+        .unwrap();
+        let names = set_names(&ops);
+        assert_eq!(names.len(), 1);
+        let body = formula_body(&names[0].2);
+        assert!(body.contains("S0!A7"), "qualified must shift: {body:?}");
+        assert!(
+            body.contains("B3"),
+            "bare ref must NOT shift (D1): {body:?}"
+        );
+    }
+
+    #[test]
+    fn b09_named_formula_col_delete_becomes_ref_error() {
+        // D2 on the column axis (the row-axis case is covered above).
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        wb.set_name("Profit", NamedTarget::Formula(Arc::from("S0!C1 + 1")))
+            .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Col,
+            StructuralKind::Delete { start: 2, end: 2 }, // delete col C
+            ql_types::MAX_COLUMN,
+        )
+        .unwrap();
+        let names = set_names(&ops);
+        assert_eq!(names.len(), 1);
+        let body = formula_body(&names[0].2);
+        assert!(body.contains("#REF!"), "got {body:?}");
+    }
+
+    #[test]
+    fn b09_corrupt_named_formula_body_does_not_panic() {
+        // NF-07: a body that fails to lex/parse is handled gracefully (no panic);
+        // the batch is still well-formed. (Whether a partial shift is emitted
+        // depends on the parser; the contract here is "no crash".)
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        wb.set_name("Bad", NamedTarget::Formula(Arc::from("S0!A5 )")))
+            .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Row,
+            StructuralKind::Insert { at: 0, count: 2 },
+            ql_types::MAX_ROW,
+        )
+        .unwrap();
+        assert!(matches!(ops[0], Op::InsertRows { .. }));
+    }
+
+    #[test]
+    fn b09_end_to_end_replay_applies_shifted_named_formula_body() {
+        // End-to-end: build batch → append → replay onto the pre-edit baseline →
+        // assert the shifted body survived shift_name_table + the wire round-trip.
+        use ql_oplog::OpLog;
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        wb.set_name("Profit", NamedTarget::Formula(Arc::from("S0!A5 - 1")))
+            .unwrap();
+        let ops = build_structural_batch(
+            &wb,
+            s0,
+            StructuralAxis::Row,
+            StructuralKind::Insert { at: 0, count: 2 },
+            ql_types::MAX_ROW,
+        )
+        .unwrap();
+        let mut log = OpLog::new();
+        log.append(Op::BatchCommit { ops }).unwrap();
+        let reg = ql_functions::default_registry();
+        let mut replay_wb = wb.clone(); // baseline still has Profit = "S0!A5 - 1"
+        ql_oplog::replay_into(&log, &mut replay_wb, &reg).unwrap();
+        match replay_wb.names().lookup_ci("Profit") {
+            Some(NamedTarget::Formula(b)) => {
+                assert!(b.contains("S0!A7"), "replayed body not shifted: {b:?}");
+                assert!(!b.contains("A5"), "stale ref survived replay: {b:?}");
+            }
+            other => panic!("expected Formula after replay, got {other:?}"),
+        }
     }
 }

@@ -1571,18 +1571,16 @@ fn shift_name_table(
             // - `Formula`: stored as opaque raw source whose body MAY contain
             //   refs to the edited sheet. We CANNOT rewrite it here: `ql-storage`
             //   must not depend on `ql-formula-syntax` (the formula-text shift
-            //   lives there). The binder rejects Formula targets today
-            //   (`BindError::NamedFormulaUnsupported`, ql-exec/src/plan.rs), so a
-            //   stale body cannot reach eval → this is LATENT, not live.
-            //   PHASE-4.7 GAP (GAP-B-09 — the insert/delete axis-shift sibling
-            //   of GAP-B-06's rename case): when named-formula targets are
-            //   enabled, the producer-side formula-text rewrite (which already
-            //   rewrites every `formula_cells` body via `shift_formula_text`)
-            //   MUST be extended to named-formula bodies. We PASS THROUGH (keep
-            //   the user's binding) rather than drop it (data loss) — the
-            //   binder's rejection (`NamedFormulaUnsupported`, locked by the
-            //   `named_formula_surfaces_distinct_bind_error` tripwire) is the
-            //   safety net until Phase 4.7 wires the rewrite.
+            //   lives in `ql-exec`). This passthrough is INTENTIONAL and stays.
+            //   GAP-B-09 is closed (w141) at the PRODUCER:
+            //   `ql_exec::structural::build_structural_batch` rewrites every
+            //   named-formula body via `shift_formula_text` and emits an
+            //   `Op::SetName` carrying the shifted body, replayed AFTER this
+            //   structural op — so a `Formula` name is left untouched here and
+            //   corrected by that trailing `SetName`. (Cell/Range names ARE
+            //   re-keyed above; only `Formula` defers to the producer.) Eval of
+            //   named formulas remains gated by the binder's
+            //   `NamedFormulaUnsupported` rejection (GAP-B-02 still open).
             NamedTarget::Formula(_) => {}
         }
     }

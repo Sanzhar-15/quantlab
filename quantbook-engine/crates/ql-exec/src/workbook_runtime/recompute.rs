@@ -2248,18 +2248,25 @@ mod tests {
     /// (GAP-B-02 resolution + GAP-B-06/GAP-B-09 structural rewrite).
     ///
     /// **SAFETY-NET TRIPWIRE — do not delete this assertion lightly.** This
-    /// binder rejection is what makes the `NamedTarget::Formula` PASSTHROUGH
-    /// in `ql_storage::workbook::shift_name_table` (insert/delete axis-shift,
-    /// GAP-B-09) and `WorkbookRuntime::rename_sheet` (GAP-B-06) LATENT rather
-    /// than live: a named-formula body is never rewritten on a structural /
-    /// rename edit, but it also never reaches eval because this rejection
-    /// fires first. When Phase 4.7 enables named-formula resolution
-    /// (removing / loosening this error), the producer-side formula-text
-    /// rewrite (`shift_formula_text`, already applied to every `formula_cells`
-    /// body) MUST first be extended to named-formula bodies — otherwise
-    /// insert/delete/rename will SILENTLY CORRUPT them. If you are reading
-    /// this because this test failed after you enabled named formulas: wire
-    /// the structural rewrite BEFORE you change this.
+    /// binder rejection keeps named-formula EVALUATION unshipped: a
+    /// `NamedTarget::Formula` body never reaches eval because this rejection
+    /// fires first. Named-formula RESOLUTION (GAP-B-02) is still open.
+    ///
+    /// The producer-side structural REWRITE, by contrast, is now WIRED
+    /// (GAP-B-06 / GAP-B-09 closed, w141): both `WorkbookRuntime::rename_sheet`
+    /// and `structural::build_structural_batch` rewrite named-formula bodies
+    /// (via `rewrite_formula_text` / `shift_formula_text` + an `Op::SetName`
+    /// carrying the shifted body), so the persisted text stays correct across
+    /// rename / insert / delete even though it is not yet evaluable.
+    /// (`ql_storage::workbook::shift_name_table` keeps its `Formula`
+    /// passthrough — ql-storage must not depend on ql-formula-syntax; the
+    /// producer does the text shift and emits the trailing `SetName`.)
+    ///
+    /// When Phase 4.7 enables named-formula resolution (removing / loosening
+    /// this error), the rewrite is already in place — but re-verify that its
+    /// coverage matches the resolution semantics (esp. the D1 owner-sheet
+    /// policy: bare refs in WORKBOOK-scoped names do not shift on insert/delete)
+    /// before shipping eval.
     #[test]
     fn named_formula_surfaces_distinct_bind_error() {
         use ql_storage::NamedTarget;
