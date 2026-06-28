@@ -2952,9 +2952,35 @@ impl CalcgraphSession {
     /// volatile formulas exist in the workbook — `recompute_dirty`
     /// after this call will be a no-op.
     pub fn mark_volatile_dirty(&mut self) -> usize {
-        let volatile: Vec<NodeId> = self.volatile_formulas.iter().copied().collect();
+        // **TB4 (PO-06):** iterate the volatile set in place rather than
+        // collecting it into a fresh `Vec<NodeId>` on every call. The prior
+        // `.iter().copied().collect()` existed only to release the shared
+        // borrow of `self.volatile_formulas` before the `&mut self` call to
+        // `mark_dirty_from_cell_write` below (E0502). `mem::take` swaps in an
+        // empty set in O(1), so we own the set as a local and iterate it by
+        // reference — eliminating the per-call allocation. This mirrors the
+        // `WorkbookSession::with_runtime` plan-cache take/restore pattern.
+        //
+        // Soundness: while taken, `self.volatile_formulas` is transiently
+        // empty, which is safe because nothing in the loop reads OR mutates
+        // it — `mark_dirty_from_cell_write` touches only `dirty` / `graph` /
+        // `aggregate_cache` / `cell_to_formulas`, `cell_address_for` reads the
+        // address maps, and `dirty.insert` touches `dirty`. The set is mutated
+        // only at bind/clear, neither reachable here. On a panic the restore is
+        // skipped (set left empty), but the caller's `FaultGuard` seals the
+        // session `Faulted` so the transiently-empty set is never observed —
+        // identical panic-semantics to `with_runtime`'s plan-cache take.
+        //
+        // **Guard-by-convention:** that panic-safety rests on every production
+        // caller running under a `FaultGuard` (today the sole caller,
+        // `WorkbookSession::mark_volatiles_dirty`, does — session.rs). A future
+        // direct caller MUST likewise hold a `FaultGuard` (or restore the set
+        // panic-safely), or a caught panic would silently leave the volatile
+        // set empty in a still-`Ready` session and volatile cells would stop
+        // refreshing with no error.
+        let volatile = std::mem::take(&mut self.volatile_formulas);
         let count = volatile.len();
-        for v in volatile {
+        for &v in &volatile {
             self.dirty.insert(v);
             // Fan out from the volatile cell's address so downstream
             // formulas reading its value also recompute (VOL-3-02).
@@ -2964,6 +2990,7 @@ impl CalcgraphSession {
                 self.mark_dirty_from_cell_write(s, r, c);
             }
         }
+        self.volatile_formulas = volatile;
         count
     }
 
@@ -3645,6 +3672,45 @@ mod tests {
         // The per-formula dep view also carries the bit.
         assert!(s.formula_deps(n_now).unwrap().is_volatile);
         assert!(s.formula_deps(n_rand).unwrap().is_volatile);
+    }
+
+    /// **TB4 (PO-06) regression:** `mark_volatile_dirty` now iterates the
+    /// volatile set via `mem::take` + restore instead of cloning it into a
+    /// `Vec`. Pin that the set SURVIVES the call — a dropped restore would
+    /// silently leave `volatile_formulas` empty so the *next* F9 /
+    /// volatile-recalc marks nothing (volatile cells would stop refreshing).
+    #[test]
+    fn mark_volatile_dirty_preserves_volatile_set_across_calls() {
+        let wb = workbook_with_formulas(&[
+            (0, 0, 0, "NOW() + 1"),
+            (0, 0, 1, "RAND() * 100"),
+            (0, 0, 2, "A1 + B1"), // not volatile
+        ]);
+        let mut s = CalcgraphSession::rebuild_from_workbook(&wb).session;
+
+        let n_now = s.cell_node_for(0, 0, 0).unwrap();
+        let n_rand = s.cell_node_for(0, 0, 1).unwrap();
+        assert_eq!(s.volatile_count(), 2);
+
+        // First F9: marks both volatile formulas dirty AND must restore the set.
+        assert_eq!(s.mark_volatile_dirty(), 2);
+        assert_eq!(
+            s.volatile_count(),
+            2,
+            "volatile set must survive mark_volatile_dirty (mem::take restore)"
+        );
+        let vol = s.volatile_formulas();
+        assert!(
+            vol.contains(&n_now) && vol.contains(&n_rand),
+            "both volatile nodes still present after the call"
+        );
+
+        // Second F9 must STILL see both — proves the restore, not a one-shot drain.
+        assert_eq!(
+            s.mark_volatile_dirty(),
+            2,
+            "second mark_volatile_dirty must still see the restored set"
+        );
     }
 
     /// Phase 3.2 invariant: re-binding a formula REPLACES its dep set

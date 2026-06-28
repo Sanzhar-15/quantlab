@@ -131,7 +131,7 @@ pub use calcgraph_session::{
 };
 pub use env::{CellEnv, MapEnv, WorkbookEnv};
 pub use eval_result::EvalResult;
-pub use loader::load_workbook_and_recompute;
+pub use loader::{load_workbook_and_recompute, replay_into_and_recompute};
 pub use lower::{classify, dispatch, SimdShape};
 pub use plan::{
     bind, bind_with_names, bind_with_names_and_sheets, bind_with_site, bind_with_site_no_tables,

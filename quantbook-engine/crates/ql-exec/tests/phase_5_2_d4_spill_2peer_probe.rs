@@ -22,9 +22,9 @@
 //! New `OpLog::merge_bytes` API added in this commit; this is the
 //! first test that exercises it.
 
-use ql_exec::WorkbookRuntime;
+use ql_exec::replay_into_and_recompute;
 use ql_functions::default_registry;
-use ql_oplog::{replay_into, CellWireValue, Op, OpLog};
+use ql_oplog::{CellWireValue, Op, OpLog};
 use ql_storage::Workbook;
 use ql_types::{Address, ErrorValue, Value};
 
@@ -45,11 +45,7 @@ fn shared_base_log() -> OpLog {
 fn replay_and_recompute(log: &OpLog) -> Workbook {
     let mut wb = Workbook::new();
     let reg = default_registry();
-    replay_into(log, &mut wb, &reg).expect("replay should succeed");
-    {
-        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        rt.recompute_all();
-    }
+    replay_into_and_recompute(log, &mut wb, &reg).expect("replay should succeed");
     wb
 }
 

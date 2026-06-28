@@ -10,7 +10,9 @@
 //! 3. `let _ = rt.recompute_all();`
 //!
 //! Phase 2A.4 collapses that to one call. The IDE's "Open file…" path uses
-//! it.
+//! it. [`replay_into_and_recompute`] (below) is the op-log sibling — the same
+//! replay/build/recompute fuse, but the workbook is reconstructed by replaying
+//! an [`ql_oplog::OpLog`] rather than loading a `.qbook/` directory.
 //!
 //! ## Phase 2B.2 (2026-05-12)
 //!
@@ -30,6 +32,7 @@ use std::path::Path;
 
 use ql_functions::FunctionRegistry;
 use ql_io::QbookError;
+use ql_oplog::{replay_into, OpLog, ReplayError};
 use ql_storage::Workbook;
 
 use crate::workbook_runtime::{RecomputeResult, WorkbookRuntime};
@@ -73,6 +76,51 @@ pub fn load_workbook_and_recompute(
         runtime.recompute_all()
     };
     Ok((workbook, recompute))
+}
+
+/// Replay an op-log into `workbook`, then immediately recompute every formula
+/// cell — the op-log sibling of [`load_workbook_and_recompute`] (TB7 / WIR-05).
+///
+/// [`ql_oplog::replay_into`] applies the log's ops, which persist formula
+/// **text** without evaluating (see its docstring), leaving formula values
+/// stale. This fuses the mandatory follow-up recompute into one call so callers
+/// cannot forget it — the footgun `replay_into`'s contract warns about
+/// ("callers drive evaluation through `recompute_all`"). It consolidates the
+/// `replay_and_recompute` helper hand-rolled in the phase-5 op-log probe tests
+/// (the conflict-matrix and spill-2peer probes); op-log probe sites that
+/// interpose a repair pass between replay and recompute keep their own form.
+///
+/// `workbook` is mutated IN PLACE, mirroring [`replay_into`]'s `&mut` contract.
+/// Pass a workbook that already reflects any ops NOT in `log` (typically a fresh
+/// [`Workbook::new`] for a full-log replay).
+///
+/// # Errors
+///
+/// Returns [`ReplayError`] verbatim from [`replay_into`] if any op fails to
+/// decode or apply. **NOT TRANSACTIONAL** — inherits `replay_into`'s
+/// partial-state-on-`Err` contract: on `Err(_)`, `workbook` is half-merged (ops
+/// `0..index` applied, the op at `index` failed, later ops not attempted) and
+/// the recompute is **not** run; the caller MUST discard the workbook. Recompute
+/// itself is infallible at the API level — per-formula failures aggregate into
+/// the returned [`RecomputeResult`] (inspect `is_complete()` / `failures`),
+/// never an `Err`.
+///
+/// **UDF note:** like [`load_workbook_and_recompute`], this builds a
+/// `WorkbookRuntime` with NO UDF worker and calls the honest `recompute_all`, so
+/// a log carrying Python-UDF formulas recomputes those cells to `#CALC!`.
+/// Callers needing saved-UDF preservation must inject a worker / use the
+/// session's `recompute_all_preserving_saved_udf` path instead.
+pub fn replay_into_and_recompute(
+    log: &OpLog,
+    workbook: &mut Workbook,
+    registry: &FunctionRegistry,
+) -> Result<RecomputeResult, ReplayError> {
+    replay_into(log, workbook, registry)?;
+    let recompute = {
+        let mut runtime = WorkbookRuntime::new(workbook, registry);
+        runtime.recompute_all()
+    };
+    Ok(recompute)
 }
 
 #[cfg(test)]
@@ -120,6 +168,52 @@ mod tests {
             loaded.formula_at(s, 1, 0).map(|s| s.as_ref()),
             Some("A1 * 2")
         );
+    }
+
+    /// TB7 sibling of the load test: a log carries text-only ops, so
+    /// `replay_into` alone would leave the formula unevaluated;
+    /// `replay_into_and_recompute` must fuse the recompute so the value lands.
+    #[test]
+    fn replay_into_and_recompute_evaluates_replayed_formulas() {
+        // `OpLog`/`replay_into_and_recompute` come in via `super::*`; only the
+        // op-construction types need an explicit import here.
+        use ql_oplog::{CellWireValue, Op};
+
+        let mut log = OpLog::new();
+        log.append(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        log.append(Op::PutValue {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: CellWireValue::Number(10.0),
+        })
+        .unwrap();
+        log.append(Op::PutFormula {
+            sheet: 0,
+            row: 1,
+            col: 0,
+            text: "A1 * 2".to_owned(),
+        })
+        .unwrap();
+
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        let result =
+            replay_into_and_recompute(&log, &mut wb, &reg).expect("replay should succeed");
+
+        assert!(
+            result.is_complete(),
+            "every replayed formula should recompute cleanly"
+        );
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(10.0));
+        // The crux: A2 (row 1, col 0) was replayed as TEXT only; the fused
+        // recompute evaluated it.
+        assert_eq!(wb.read(Address::new(0, 1, 0)), Value::Number(20.0));
+        assert_eq!(wb.formula_at(0, 1, 0).map(|s| s.as_ref()), Some("A1 * 2"));
     }
 
     #[test]

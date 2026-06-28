@@ -50,7 +50,7 @@
 //! state, and SHOULD use distinct observable values (literal=7
 //! and formula="99-50"=49).
 
-use ql_exec::WorkbookRuntime;
+use ql_exec::{replay_into_and_recompute, WorkbookRuntime};
 use ql_functions::default_registry;
 use ql_oplog::{replay_into, CellWireValue, NamedTargetWire, Op, OpLog};
 use ql_storage::Workbook;
@@ -94,11 +94,7 @@ fn base_with_sheet_and_table() -> OpLog {
 fn replay_and_recompute(log: &OpLog) -> Workbook {
     let mut wb = Workbook::new();
     let reg = default_registry();
-    replay_into(log, &mut wb, &reg).expect("replay should succeed");
-    {
-        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        rt.recompute_all();
-    }
+    replay_into_and_recompute(log, &mut wb, &reg).expect("replay should succeed");
     wb
 }
 
