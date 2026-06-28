@@ -30,6 +30,19 @@ import struct
 
 import pyarrow as pa
 
+from ._frame import MAX_FRAME_LEN
+
+# Byte cap for an encoded RETURN grid — the Python mirror of the Rust
+# `encode_grid_capped` byte guard (`MAX_GRID_BYTES = MAX_FRAME_LEN`). A RETURN frame is
+# `[u32 total][u8 type][u64 call_id][grid IPC bytes]`, so the grid must leave room for
+# the 1-byte type tag + 8-byte call_id and still fit `MAX_FRAME_LEN`. Capping the grid
+# at this tighter budget makes the cap authoritative on the reply path (a clean
+# `ValueError` → a RAISE) rather than deferring to the frame writer's own cap at write
+# time (which, mid-reply, would force the worker to exit). Applied on the RETURN path
+# ONLY — args are decoded, never encoded, by the worker.
+_RETURN_HEADER_BYTES = 1 + 8  # frame type tag + u64 call_id
+_MAX_RETURN_GRID_BYTES = MAX_FRAME_LEN - _RETURN_HEADER_BYTES
+
 
 class Err:
     """A spreadsheet error value, identified by its sigil (e.g. ``"#DIV/0!"``)."""
@@ -215,8 +228,20 @@ def decode_call(payload):
 
 
 def encode_return(call_id, result_grid):
-    """Encode a RETURN payload: ``[u64 call_id][grid]``."""
-    return struct.pack("<Q", call_id) + encode_grid(result_grid)
+    """Encode a RETURN payload: ``[u64 call_id][grid]``.
+
+    Caps the encoded grid so the resulting RETURN frame fits ``MAX_FRAME_LEN`` (mirrors
+    the Rust ``encode_grid_capped`` byte guard). A UDF returning a grid too large to
+    transport raises a clear ``ValueError`` here — caught on the worker's reply-compute
+    path and surfaced as a RAISE — instead of silently producing an unwritable frame.
+    """
+    grid = encode_grid(result_grid)
+    if len(grid) > _MAX_RETURN_GRID_BYTES:
+        raise ValueError(
+            "UDF result grid too large: %d bytes > %d-byte cap"
+            % (len(grid), _MAX_RETURN_GRID_BYTES)
+        )
+    return struct.pack("<Q", call_id) + grid
 
 
 def encode_raise(call_id, exc_type, message):

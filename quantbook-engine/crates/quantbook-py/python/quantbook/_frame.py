@@ -59,13 +59,37 @@ def read_frame(stream):
     return (frame_type, payload)
 
 
+def _write_all(stream, data):
+    """Write ALL of ``data`` to ``stream``, looping over short writes.
+
+    A raw (unbuffered) pipe write — the protocol channel is ``os.fdopen(fd, "wb",
+    buffering=0)`` — can accept FEWER bytes than requested without raising (a partial
+    ``write(2)`` when the kernel pipe buffer fills on a large frame). Ignoring the
+    return value silently truncates the frame on the wire, desyncing the engine's
+    length-prefixed reader. Loop until every byte lands (No-Fallbacks: a partial write
+    is a real failure, never silently accepted)."""
+    mv = memoryview(data)
+    total = len(mv)
+    written = 0
+    while written < total:
+        n = stream.write(mv[written:])
+        if not n:
+            # `write()` returns None (non-blocking stream, nothing writable) or 0 (no
+            # progress) only on a stream the protocol channel never uses — a blocking pipe
+            # always writes ≥1 byte or raises. Surface it loudly rather than spin forever.
+            raise BlockingIOError(
+                "write_frame: stream.write() returned %r (no progress) on a blocking pipe" % (n,)
+            )
+        written += n
+
+
 def write_frame(stream, frame_type, payload):
     """Write one frame and flush. ``payload`` is ``bytes``."""
     total = 1 + len(payload)
     if total > MAX_FRAME_LEN:
         raise ValueError("frame length %d exceeds the %d-byte cap" % (total, MAX_FRAME_LEN))
-    stream.write(struct.pack("<I", total))
-    stream.write(bytes([frame_type]))
+    _write_all(stream, struct.pack("<I", total))
+    _write_all(stream, bytes([frame_type]))
     if payload:
-        stream.write(payload)
+        _write_all(stream, payload)
     stream.flush()

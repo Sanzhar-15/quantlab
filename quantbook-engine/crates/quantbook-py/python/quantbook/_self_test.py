@@ -9,7 +9,7 @@ exits 0 on success; raises (non-zero exit) on any mismatch.
 import struct
 import sys
 
-from . import _codec
+from . import _codec, _worker_self_test
 from ._codec import Err, Grid
 
 
@@ -54,6 +54,11 @@ def main():
         _check(False, "decode_call should reject a 15-byte payload")
     except ValueError:
         pass
+
+    # Worker-loop robustness checks (TE4) — engine-less, in-process. Kept in their own
+    # module; invoked here so the canonical `python -m quantbook._self_test` entrypoint
+    # exercises them too (huge-exception survival + write_frame short-write handling).
+    _worker_self_test.run_checks()
 
     print("PASS")
     return 0
