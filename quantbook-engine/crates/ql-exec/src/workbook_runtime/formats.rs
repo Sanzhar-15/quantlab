@@ -86,10 +86,22 @@ impl<'a> WorkbookRuntime<'a> {
         }
         let id = FormatId::Custom(formats.local_peer(), counter);
         if let Some(oplog) = self.oplog.as_deref_mut() {
-            oplog.append(Op::RegisterFormat {
-                id: ql_oplog::FormatIdWire::from_storage(id),
-                string: s.to_owned(),
-            })?;
+            // **TF8 / Wave-C (2026-06-29):** tag the registration commit with
+            // `FORMAT_COMMIT_ORIGIN` so the owning session's `UndoManager`
+            // (which excludes that origin prefix) does NOT record this
+            // content-addressed intern as an undo unit. The op is still
+            // pushed to the op-log for replay/persistence — only the commit
+            // origin differs. A cell only *displays* a format via the
+            // still-undoable `Op::SetCellFormat`. This also makes
+            // `nudge_cell_decimals` (intern + set_cell_format) a single undo
+            // unit (the SetCellFormat).
+            oplog.append_with_origin(
+                Op::RegisterFormat {
+                    id: ql_oplog::FormatIdWire::from_storage(id),
+                    string: s.to_owned(),
+                },
+                ql_oplog::FORMAT_COMMIT_ORIGIN,
+            )?;
         }
         let allocated = self.workbook.formats_mut().intern(s);
         debug_assert_eq!(

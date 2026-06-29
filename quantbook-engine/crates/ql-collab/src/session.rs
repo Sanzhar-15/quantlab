@@ -68,7 +68,8 @@ use thiserror::Error;
 
 use ql_functions::FunctionRegistry;
 use ql_oplog::{
-    replay_into, CellWireValue, Op, OpLog, OpLogError, PeerId, ReplayError, PRESENCE_COMMIT_ORIGIN,
+    replay_into, CellWireValue, Op, OpLog, OpLogError, PeerId, ReplayError, FORMAT_COMMIT_ORIGIN,
+    PRESENCE_COMMIT_ORIGIN,
 };
 
 /// **Phase 5.7 V3.4.0.2 (2026-05-23) -- per-cell snapshot-cache state.**
@@ -4853,6 +4854,18 @@ fn make_undo_manager(
 ) -> loro::UndoManager {
     let mut undo = log.new_undo_manager();
     undo.add_exclude_origin_prefix(PRESENCE_COMMIT_ORIGIN);
+    // **TF8 / Wave-C (2026-06-29) defense-in-depth.** Exclude format/style
+    // *registration* commits from undo, symmetric with the owning
+    // `ql_exec::WorkbookSession` (which tags `Op::RegisterFormat` /
+    // `Op::RegisterStyle` with `FORMAT_COMMIT_ORIGIN` via
+    // `OpLog::append_with_origin`). INERT today: `CollabSession::append_op`
+    // still commits every op (including registrations) with the DEFAULT
+    // origin, so no commit currently carries this prefix and the collab undo
+    // stack is unchanged. This line ensures the exclusion is already in place
+    // the day a collab-side format-registration write path adopts
+    // `append_with_origin` (tracked in docs/known-gaps.md), rather than
+    // re-introducing the "undo does nothing once" bug there.
+    undo.add_exclude_origin_prefix(FORMAT_COMMIT_ORIGIN);
     undo.set_on_push(Some(Box::new(move |_source, _span, _diff| {
         // Drain the pre-staged cells (set by append_op /
         // undo / redo before the Loro op that triggered this
@@ -9268,7 +9281,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_6_0_8_2_append_op_does_NOT_invalidate_workbook_cache() {
+    fn v3_6_0_8_2_append_op_does_not_invalidate_workbook_cache() {
         // append_op is the cell-only fast-path target -- the cache
         // stays valid (V3.6.0.8.3's delta path will clone + apply
         // forward without rebuild).

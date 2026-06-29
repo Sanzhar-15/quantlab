@@ -42,7 +42,7 @@ pub mod replay;
 pub mod wire;
 
 pub use error::OpLogError;
-pub use log::{OpLog, PRESENCE_COMMIT_ORIGIN};
+pub use log::{OpLog, FORMAT_COMMIT_ORIGIN, PRESENCE_COMMIT_ORIGIN};
 pub use op::{DateSystemWire, LocaleWire, Op, ReferenceModeWire};
 pub use replay::{apply_ops_in_range, replay_into, ReplayError};
 

@@ -580,6 +580,21 @@ impl WorkbookSession {
         // it does not borrow `oplog` and can be moved into the struct below.
         let mut undo_manager = oplog.new_undo_manager();
         undo_manager.set_merge_interval(0);
+        // **TF8 / Wave-C (2026-06-29):** exclude format/style *registration*
+        // commits (tagged `FORMAT_COMMIT_ORIGIN` by `intern_format` /
+        // `intern_style`) from the undo stack. A registration is a monotonic,
+        // content-addressed intern with no user-visible effect on its own — a
+        // cell only displays a format/style via the still-undoable
+        // `SetCellFormat` / `SetCellStyle`. Without this, a `RegisterFormat`
+        // commit sat beneath the visible format change and the next undo "did
+        // nothing" (it retracted the invisible registration); it was also a
+        // latent correctness hazard (undoing a registration while another cell
+        // still referenced the id). The registration op stays in the op-log
+        // (origin only affects the UndoManager), so `rematerialize`'s
+        // `replay_into` keeps the format interned across an undo of a
+        // neighbouring edit — no cell→format ref can dangle. Mirrors the
+        // `PRESENCE_COMMIT_ORIGIN` exclusion in `ql_collab::CollabSession`.
+        undo_manager.add_exclude_origin_prefix(ql_oplog::FORMAT_COMMIT_ORIGIN);
         Self {
             workbook,
             baseline,
@@ -12228,6 +12243,209 @@ mod tests {
         s.recalc_dirty().unwrap();
         let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
         assert_eq!(c.rendered.as_deref(), Some("1.5"));
+    }
+
+    /// **TF8 / Wave-C (2026-06-29): format registration must NOT be an undo
+    /// unit ("undo does nothing once").** `register_format` commits its
+    /// `Op::RegisterFormat` with `FORMAT_COMMIT_ORIGIN`, which the session's
+    /// `UndoManager` excludes. Here three VISIBLE commands run (add_sheet,
+    /// set_value, set_format) plus one registration; draining the undo stack
+    /// must consume exactly the THREE visible units — the registration adds no
+    /// phantom step.
+    #[test]
+    fn tf8_register_format_is_excluded_from_undo_stack() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap(); // undo unit 1
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 5.0 })
+            .unwrap(); // undo unit 2
+        let fmt = s.register_format("0.00%").unwrap(); // EXCLUDED — no unit
+        s.set_format(addr(sheet, 0, 0), fmt).unwrap(); // undo unit 3
+
+        // First undo reverts the visible SetCellFormat (not a phantom
+        // registration): the format binding clears, the value edit survives.
+        assert!(s.undo().unwrap().consumed);
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(c.format, None, "undo must revert the cell's format binding");
+        assert_eq!(
+            c.value,
+            Some(CellValue::Number { number: 5.0 }),
+            "the value edit is untouched"
+        );
+
+        // Drain the rest and count: exactly the THREE visible commands were undo
+        // units; `register_format` contributed NONE.
+        let mut consumed = 1; // the undo above
+        while s.undo().unwrap().consumed {
+            consumed += 1;
+        }
+        assert_eq!(
+            consumed, 3,
+            "add_sheet + set_value + set_format are the only undo units; \
+             register_format must not add a phantom 'undo does nothing' step"
+        );
+        assert!(!s.can_undo());
+    }
+
+    /// **TF8:** a format committed BETWEEN two undoable edits must SURVIVE an
+    /// undo of the later edit — the registration is preserved (Loro treats the
+    /// excluded-origin commit as remote-like), so the `FormatId` stays valid and
+    /// no cell→format reference can dangle.
+    #[test]
+    fn tf8_format_survives_undo_of_a_neighbouring_edit() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        let fmt = s.register_format("0.00%").unwrap(); // excluded
+        s.set_value(addr(sheet, 0, 1), CellValue::Number { number: 2.0 })
+            .unwrap();
+
+        // Undo the LAST edit (B1). The format registration committed between A1
+        // and B1 must NOT be retracted.
+        assert!(s.undo().unwrap().consumed);
+        assert!(
+            s.cell(addr(sheet, 0, 1)).unwrap().is_none(),
+            "B1 reverted by the undo"
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 1.0 }),
+            "A1 is intact"
+        );
+
+        // The format is still registered: binding A1 to it succeeds (no
+        // UnknownFormatId), and re-interning the same string returns the SAME id.
+        s.set_format(addr(sheet, 0, 0), fmt).unwrap();
+        assert_eq!(s.cell(addr(sheet, 0, 0)).unwrap().unwrap().format, Some(fmt));
+        assert_eq!(
+            s.register_format("0.00%").unwrap(),
+            fmt,
+            "the same string re-interns to the same id (still registered after the undo)"
+        );
+    }
+
+    /// **TF8:** `nudge_cell_decimals` interns a NEW format AND rebinds the cell
+    /// in one command. With the registration excluded, only the `SetCellFormat`
+    /// is an undo unit, so ONE undo restores the pre-nudge format.
+    #[test]
+    fn tf8_nudge_cell_decimals_is_one_undo_unit() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.5 })
+            .unwrap();
+        let base = s.register_format("0.00").unwrap(); // excluded
+        s.set_format(addr(sheet, 0, 0), base).unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().rendered.as_deref(),
+            Some("1.50")
+        );
+
+        // Nudge interns "0.000" (excluded) and rebinds the cell (one undo unit).
+        s.nudge_cell_decimals(addr(sheet, 0, 0), 1).unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().rendered.as_deref(),
+            Some("1.500")
+        );
+
+        // ONE undo restores the previous (0.00) binding — the intern added no
+        // extra unit.
+        assert!(s.undo().unwrap().consumed);
+        s.recalc_dirty().unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(
+            c.rendered.as_deref(),
+            Some("1.50"),
+            "a single undo restores the pre-nudge format"
+        );
+        assert_eq!(c.format, Some(base));
+    }
+
+    /// **TF8:** `register_style` is symmetric to `register_format` — its
+    /// `Op::RegisterStyle` commit is excluded from undo too.
+    #[test]
+    fn tf8_register_style_is_excluded_from_undo_stack() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap(); // unit 1
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 9.0 })
+            .unwrap(); // unit 2
+        let sid = s.register_style(bold_style()).unwrap(); // EXCLUDED — no unit
+        s.set_style(addr(sheet, 0, 0), sid).unwrap(); // unit 3
+
+        let mut consumed = 0;
+        while s.undo().unwrap().consumed {
+            consumed += 1;
+        }
+        assert_eq!(
+            consumed, 3,
+            "add_sheet + set_value + set_style are the only undo units; \
+             register_style must not add a phantom step"
+        );
+    }
+
+    /// **TF8 correctness guard:** excluding the registration from UNDO must NOT
+    /// exclude it from PERSISTENCE. The `Op::RegisterFormat` is still pushed to
+    /// the op-log (only the commit ORIGIN differs), so the cell's format survives
+    /// a full `.qbook` save/open round-trip.
+    #[test]
+    fn tf8_registered_format_persists_through_save_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tf8.qbook");
+        let path_str = path.to_str().unwrap();
+
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        let fmt = s.register_format("0.00%").unwrap(); // excluded from undo...
+        s.set_format(addr(sheet, 0, 0), fmt).unwrap();
+        s.recalc_dirty().unwrap();
+        s.save(path_str).unwrap();
+
+        let mut s2 = WorkbookSession::new();
+        s2.open(path_str).unwrap();
+        let c = s2.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        // ...but NOT from persistence: the registration is durably in the log.
+        assert!(
+            c.format.is_some(),
+            "the registered format must persist across save/open"
+        );
+        assert_eq!(
+            c.rendered.as_deref(),
+            Some("100.00%"),
+            "the persisted format ('0.00%') is applied after reopen"
+        );
+    }
+
+    /// **TF8 redo contract:** after undoing a format apply, REDO must re-bind the
+    /// cell — the format stayed registered (excluded from undo), so redo of the
+    /// `SetCellFormat` references a still-valid id (never a dangling ref).
+    #[test]
+    fn tf8_redo_reapplies_format_after_undo() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        let fmt = s.register_format("0.00%").unwrap(); // excluded from undo
+        s.set_format(addr(sheet, 0, 0), fmt).unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(s.cell(addr(sheet, 0, 0)).unwrap().unwrap().format, Some(fmt));
+
+        // Undo the SetCellFormat → cell unformatted (the format stays registered).
+        assert!(s.undo().unwrap().consumed);
+        assert_eq!(s.cell(addr(sheet, 0, 0)).unwrap().unwrap().format, None);
+
+        // Redo re-applies the SetCellFormat against the still-registered format.
+        assert!(s.redo().unwrap().consumed);
+        s.recalc_dirty().unwrap();
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(
+            c.format,
+            Some(fmt),
+            "redo re-binds the cell to the still-registered format"
+        );
+        assert_eq!(c.rendered.as_deref(), Some("100.00%"));
     }
 
     /// An unbound (General) cell increased binds an explicit one-decimal format

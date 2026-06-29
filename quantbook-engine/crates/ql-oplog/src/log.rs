@@ -61,6 +61,31 @@ const PRESENCE_CONTAINER: &str = "presence";
 /// (Codex+Opus 5.4 V1 audit findings A4/M5).
 pub const PRESENCE_COMMIT_ORIGIN: &str = "presence:";
 
+/// **TF8 / Wave-C (2026-06-29):** commit-origin tag for
+/// format/style *registration* writes (`Op::RegisterFormat` /
+/// `Op::RegisterStyle`, emitted by [`append_with_origin`]). The
+/// owning `WorkbookSession` wires this to Loro's
+/// `UndoManager::add_exclude_origin_prefix` so a content-addressed
+/// format/style intern — which has NO user-visible effect on its
+/// own (a cell only *displays* a format via `Op::SetCellFormat`,
+/// which stays undoable) — never becomes its own undo unit. Without
+/// this, a `RegisterFormat` commit sits beneath the visible
+/// `SetCellFormat` unit and the next undo "does nothing" (it
+/// retracts the invisible registration); it is also a latent
+/// correctness hazard (undoing a registration while another cell
+/// still references the `FormatId`). Exported `pub` so the
+/// `ql-exec` runtime can tag its registration commits with the
+/// same string the session excludes.
+///
+/// **Origin-only:** changing the COMMIT origin does NOT change the
+/// op-log CONTENT — the op is still pushed to the `"ops"` list, so
+/// `replay_into` / `export_bytes` / persistence are unaffected.
+///
+/// Same reserved-namespace convention as [`PRESENCE_COMMIT_ORIGIN`]
+/// (trailing `":"` so only deliberately-namespaced `format:*`
+/// origins are excluded, never an independent `"format-foo"`).
+pub const FORMAT_COMMIT_ORIGIN: &str = "format:";
+
 /// Append-only operation log backed by Loro.
 ///
 /// Construct via `OpLog::new()` for a fresh log or `OpLog::import_bytes(...)`
@@ -162,11 +187,41 @@ impl OpLog {
     /// be read back by [`OpLog::iter`]. [`MAX_APPEND_BATCH_DEPTH`] keeps every
     /// appended op both overflow-safe and round-trippable.
     pub fn append(&mut self, op: Op) -> Result<(), OpLogError> {
-        Self::check_append_batch_depth(&op)?;
-        let json = serde_json::to_string(&op).map_err(OpLogError::Serialize)?;
+        self.push_op(&op)?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// **TF8 / Wave-C (2026-06-29):** like [`append`](Self::append) but commits
+    /// the underlying Loro doc with an explicit `origin`
+    /// (`doc.commit_with(origin)`) instead of the default empty origin.
+    ///
+    /// The op is pushed to the `"ops"` list IDENTICALLY to `append` — only the
+    /// commit's origin tag differs — so the log content, `iter()` order,
+    /// `replay_into`, and `export_bytes` are byte-for-byte unaffected. The
+    /// origin reaches Loro's commit metadata, which is what an attached
+    /// `UndoManager::add_exclude_origin_prefix` matches against.
+    ///
+    /// Used by the `ql-exec` runtime to tag `Op::RegisterFormat` /
+    /// `Op::RegisterStyle` with [`FORMAT_COMMIT_ORIGIN`] so a content-addressed
+    /// format/style intern is excluded from the undo stack (a cell only
+    /// *displays* a format via the still-undoable `Op::SetCellFormat`).
+    pub fn append_with_origin(&mut self, op: Op, origin: &str) -> Result<(), OpLogError> {
+        self.push_op(&op)?;
+        self.doc
+            .commit_with(CommitOptions::new().origin(origin));
+        Ok(())
+    }
+
+    /// Depth-check, serialize, and push one `Op` onto the `"ops"` LoroList
+    /// WITHOUT committing. Shared by [`append`](Self::append) (default-origin
+    /// commit) and [`append_with_origin`](Self::append_with_origin)
+    /// (explicit-origin commit) so the two differ ONLY in the commit call.
+    fn push_op(&self, op: &Op) -> Result<(), OpLogError> {
+        Self::check_append_batch_depth(op)?;
+        let json = serde_json::to_string(op).map_err(OpLogError::Serialize)?;
         let list: LoroList = self.doc.get_list(OPS_CONTAINER);
         list.push(LoroValue::from(json.as_str()))?;
-        self.doc.commit();
         Ok(())
     }
 
@@ -435,6 +490,11 @@ impl OpLog {
     /// call `manager.add_exclude_origin_prefix(PRESENCE_COMMIT_ORIGIN)`
     /// after construction. The `ql_collab::CollabSession`
     /// integration does this automatically.
+    ///
+    /// **TF8 / Wave-C (2026-06-29):** the owning `ql_exec::WorkbookSession`
+    /// likewise calls `add_exclude_origin_prefix(FORMAT_COMMIT_ORIGIN)` so
+    /// format/style registration commits (tagged via [`append_with_origin`])
+    /// stay out of the undo stack.
     pub fn new_undo_manager(&self) -> loro::UndoManager {
         loro::UndoManager::new(&self.doc)
     }
@@ -672,6 +732,42 @@ mod tests {
             .expect("worker thread panicked / overflowed its stack");
         assert!(rejected, "deep batch must be rejected with BatchDepthExceeded");
         assert!(empty, "rejected op must not be stored");
+    }
+
+    /// **TF8 / Wave-C (2026-06-29):** a `FORMAT_COMMIT_ORIGIN`-tagged commit is
+    /// excluded from an `UndoManager` that registered that prefix, yet the op is
+    /// still durably appended to the `"ops"` list (replay/persistence see it).
+    /// This is the oplog-layer proof of the "undo does nothing once" fix — the
+    /// owning `WorkbookSession` wires the same exclude prefix.
+    #[test]
+    fn format_origin_commit_is_excluded_from_undo_but_kept_in_log() {
+        let mut log = OpLog::new();
+        let mut undo = log.new_undo_manager();
+        undo.set_merge_interval(0);
+        undo.add_exclude_origin_prefix(FORMAT_COMMIT_ORIGIN);
+
+        // A FORMAT_COMMIT_ORIGIN commit must NOT create an undo unit...
+        log.append_with_origin(put_value(0, 0, 0, 1.0), FORMAT_COMMIT_ORIGIN)
+            .unwrap();
+        assert!(
+            !undo.can_undo(),
+            "a FORMAT_COMMIT_ORIGIN commit must not be undoable"
+        );
+        // ...but the op IS appended to the log (origin only affects the undo
+        // manager, never the op-log content).
+        assert_eq!(
+            log.iter().count(),
+            1,
+            "the origin-tagged op is still in the ops list"
+        );
+
+        // A default-origin commit IS undoable (control).
+        log.append(put_value(0, 0, 1, 2.0)).unwrap();
+        assert!(
+            undo.can_undo(),
+            "a default-origin commit is undoable (control)"
+        );
+        assert_eq!(log.iter().count(), 2);
     }
 
     #[test]

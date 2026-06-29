@@ -50,10 +50,20 @@ impl<'a> WorkbookRuntime<'a> {
         }
         let id = StyleId::new(styles.local_peer(), counter);
         if let Some(oplog) = self.oplog.as_deref_mut() {
-            oplog.append(Op::RegisterStyle {
-                id: ql_oplog::StyleIdWire::from_storage(id),
-                style: ql_oplog::StyleWire::from_storage(style),
-            })?;
+            // **TF8 / Wave-C (2026-06-29):** tag the registration commit with
+            // `FORMAT_COMMIT_ORIGIN` so the owning session's `UndoManager`
+            // excludes this content-addressed intern from the undo stack (a
+            // cell only *displays* a style via the still-undoable
+            // `Op::SetCellStyle`). The op is still logged for replay/
+            // persistence — only the commit origin differs. Mirrors
+            // `intern_format` exactly.
+            oplog.append_with_origin(
+                Op::RegisterStyle {
+                    id: ql_oplog::StyleIdWire::from_storage(id),
+                    style: ql_oplog::StyleWire::from_storage(style),
+                },
+                ql_oplog::FORMAT_COMMIT_ORIGIN,
+            )?;
         }
         let allocated = self.workbook.styles_mut().intern(style);
         debug_assert_eq!(

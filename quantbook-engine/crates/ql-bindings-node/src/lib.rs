@@ -7450,8 +7450,9 @@ impl Session {
     /// selected cell, registers the distinct returned strings via `registerFormat`, and applies them in
     /// ONE `batch` of `setFormat` ops — so one undo reverts the WHOLE multi-cell nudge (the cell edits are
     /// one batch commit; the per-cell apply `nudgeDecimals` is one Loro commit each, i.e. N undos). Like the
-    /// number-format presets, registering a first-seen custom format is a separate commit that leaves one
-    /// trailing, invisible undo step. `bad_argument` for invalid coords or a non-integer / zero /
+    /// number-format presets, registering a first-seen custom format is a separate commit — but (TF8 /
+    /// Wave-C) that registration commit is EXCLUDED from the undo stack via `FORMAT_COMMIT_ORIGIN`, so it
+    /// leaves NO trailing, invisible undo step. `bad_argument` for invalid coords or a non-integer / zero /
     /// out-of-range (±30) delta; `invalid_format` for a `[Red]`/conditional/elapsed-time format the engine
     /// cannot model (No-Fallbacks — never silently mangled).
     #[napi(js_name = "nudgeDecimalsPreview", catch_unwind)]
