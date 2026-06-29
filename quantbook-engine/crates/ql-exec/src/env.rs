@@ -217,8 +217,15 @@ pub trait CellEnv {
     /// recursion guard. Default 0; only `LocalScopedEnv` (constructed at a
     /// `CallLambda` invocation) bumps it. Evaluation errors loudly past
     /// `MAX_LAMBDA_DEPTH` instead of overflowing the native stack — a closure
-    /// passed to itself (`g(g, n)`) with no terminating base case recurses
-    /// unboundedly (our `IF` is eager, so it cannot short-circuit one).
+    /// passed to itself (`g(g, n)`) with no REACHABLE base case (e.g. the
+    /// argument only ever grows, `g(g, n+1)`) recurses unboundedly.
+    ///
+    /// **FN4-03 (2026-06-29):** `IF` is now LAZY — a recursive lambda WITH a
+    /// reachable base case (`IF(n<2, 1, n*self(self, n-1))`) terminates and
+    /// computes correctly, because the recursive else-branch is no longer
+    /// evaluated once the base condition holds (previously eager `IF` evaluated
+    /// both branches, so even a correct base case ran to `MAX_LAMBDA_DEPTH` →
+    /// `#NUM!`). The depth guard still bounds genuinely unbounded recursion.
     fn lambda_depth(&self) -> u32 {
         0
     }

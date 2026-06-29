@@ -716,6 +716,13 @@ pub(crate) fn is_higher_order_helper(name: &str) -> bool {
     )
 }
 
+// **FN4-03 (closes GAP-F-02):** the lazy-logical family (`IF` / `IFERROR` /
+// `IFNA` / `IFS`) is recognized via the REGISTRY-OWNED marker
+// `FunctionRegistry::is_lazy_logical_builtin` (set by `register_lazy_logical`),
+// NOT a name-only classifier here — so registry authority is preserved. The
+// evaluator (`scalar.rs::eval_lazy_logical`) carries the dispatch + the
+// dep-walker-invariant + scope (AND/OR/XOR/CHOOSE/SWITCH excluded) rationale.
+
 /// **W5-RT-1 (RT-V1-01):** classifier for the reference-aware dispatch tier.
 /// These functions take their args under `BindContext::ReferenceArg` rather
 /// than `Scalar` or `AggregateArg`. ReferenceArg context accepts:
@@ -4004,6 +4011,11 @@ mod tests {
             );
         }
     }
+
+    // **FN4-03:** the lazy-logical name set is now registry-owned
+    // (`FunctionRegistry::is_lazy_logical_builtin`). Its exactness / typo guard
+    // lives registry-side (`default_registry_marks_exactly_the_lazy_logical_builtins`
+    // in `ql-functions::registry`), not here.
 
     /// **FU4c (2026-06-22):** `is_range_aware_reducer` matches EXACTLY the fourteen
     /// single-data-range statistical reducers and nothing else. Drift guard — this

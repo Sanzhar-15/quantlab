@@ -66,7 +66,7 @@ one expression. All rules verified by `crates/ql-exec/tests/error_precedence.rs`
 | `=#NUM!+#REF!` | Left error wins | `precedence_binary_op_left_error_wins_canon` |
 | `=A1+B1` with A1=`#DIV/0!`, B1 valid | A1's error propagates | `precedence_left_div_zero_error_propagates_canon` |
 | `=IF(#REF!, t, f)` | Cond error short-circuits to `#REF!` | `precedence_if_cond_error_short_circuits_canon` |
-| `=IFERROR(#REF!, fallback)` | Returns fallback via post-eval introspection (NOT lazy 2nd-arg eval — that's FN4-03) | `precedence_iferror_catches_via_post_eval_introspection_canon` |
+| `=IFERROR(#REF!, fallback)` | Returns fallback. **FN4-03 (w142): now LAZY** — fallback is evaluated only because the value errored; a non-error value returns without evaluating the fallback. Result unchanged. | `precedence_iferror_catches_via_post_eval_introspection_canon`, `fn4_03_iferror_skips_fallback_when_value_ok` |
 | `=ISERROR(#REF!)` | TRUE (introspects, never propagates) | `precedence_iserror_introspects_canon` |
 | `=A1/0` with A1=`#REF!` | A1's error beats div-zero | `precedence_arg_error_beats_div_zero_canon` |
 | Text on one side, Error on other (`=A1+B1` where A1="abc", B1=`#NUM!`) | Error wins (text never reaches coercion) | `precedence_error_wins_over_text_coercion_failure_canon` |
@@ -122,8 +122,9 @@ All predicates **introspect** — never propagate errors.
 
 | Function | Override | Tag | Test |
 |---|---|---|---|
-| `IF(cond, t, f)` | Currently EAGER (both branches always evaluated). Cond error short-circuits. | 🟡 (FN4-03 deferred) | `precedence_if_cond_error_short_circuits_canon` |
-| `IFERROR(v, on_err)` | Post-eval introspection works correctly today. Lazy second-arg eval is the FN4-03 gap (don't compute on_err when v is non-error). | 🟢 introspection / 🟡 lazy-arg-skip | `precedence_iferror_catches_via_post_eval_introspection_canon`, `precedence_iferror_passes_through_non_error_canon` |
+| `IF(cond, t, f)` | LAZY (FN4-03, w142): cond evaluated, then ONLY the selected branch. Cond error short-circuits. Result-identical to the prior eager eval. | 🟢 (FN4-03 ✅) | `precedence_if_cond_error_short_circuits_canon`, `fn4_03_if_does_not_evaluate_dead_branch` |
+| `IFERROR(v, on_err)` / `IFNA(v, on_err)` | LAZY (FN4-03, w142): `on_err` evaluated ONLY when `v` matches (any error / `#N/A` respectively). Post-eval introspection result unchanged. | 🟢 (FN4-03 ✅) | `precedence_iferror_catches_via_post_eval_introspection_canon`, `fn4_03_iferror_skips_fallback_when_value_ok`, `fn4_03_ifna_propagates_non_na_error_without_reading_fallback` |
+| `IFS(test1,val1,…)` | LAZY (FN4-03, w142): stops at the first true test; later tests/values not evaluated. | 🟢 (FN4-03 ✅) | `fn4_03_ifs_stops_at_first_true_test`, `fn4_03_lazy_path_matches_eager_registry_impls` |
 | `AND` / `OR` / `NOT` | Default; deferred to 4.4.C polish | 🟢 (assumed) | — |
 
 ### 3.4 Lookup family

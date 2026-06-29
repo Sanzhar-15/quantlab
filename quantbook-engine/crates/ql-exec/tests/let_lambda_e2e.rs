@@ -196,12 +196,31 @@ fn lambda_duplicate_params_is_value_error() {
 
 #[test]
 fn lambda_self_application_runaway_hits_depth_guard() {
-    // A closure passed to itself with no terminating base case (our IF is eager,
-    // so it cannot short-circuit one) recurses unboundedly — the depth guard
-    // turns it into a loud `#NUM!` instead of a native stack overflow.
+    // A closure passed to itself with no base case at all recurses unboundedly —
+    // the depth guard turns it into a loud `#NUM!` instead of a native stack
+    // overflow. (No `IF` here; termination depends purely on the recursion.)
     assert_eq!(
         eval("LET(g,LAMBDA(self,n,self(self,n+1)),g(g,1))"),
         Value::Error(ErrorValue::Num)
+    );
+}
+
+#[test]
+fn fn4_03_recursive_lambda_with_reachable_base_terminates() {
+    // **FN4-03 capability (closes GAP-F-02).** A recursive factorial via
+    // self-application with a REACHABLE base case now TERMINATES and computes the
+    // correct value, because lazy `IF` does not evaluate the recursive else-branch
+    // once the base condition (`n<2`) holds. Under the old eager `IF` this ran to
+    // `MAX_LAMBDA_DEPTH` → `#NUM!` (the else-branch `n*self(self,n-1)` fired even
+    // at the base). 5! = 120; recursion depth (~5) stays well under the guard.
+    assert_eq!(
+        eval("LET(fact,LAMBDA(self,n,IF(n<2,1,n*self(self,n-1))),fact(fact,5))"),
+        num(120.0)
+    );
+    // Base case taken immediately (n already < 2) → no recursion at all.
+    assert_eq!(
+        eval("LET(fact,LAMBDA(self,n,IF(n<2,1,n*self(self,n-1))),fact(fact,1))"),
+        num(1.0)
     );
 }
 
@@ -260,10 +279,12 @@ fn let_binding_if_wrapped_lambda_stays_calc_documented_boundary() {
     // **Wave P follow-up 2 — the boundary that REMAINS (moved from LET-wrapped to
     // Function-wrapped).** Only `ExprPlan::Let` was made binding-returning. A lambda
     // returned through any OTHER non-direct construct still scalarizes to `#CALC!`
-    // via `eval_binding`'s `_` arm. `IF(TRUE, LAMBDA(x,x), 0)` is eager
-    // (scalar-tier) → the lambda branch becomes `#CALC!` before IF selects it → `f`
-    // is `#CALC!` → `f(3)` propagates `#CALC!`. LOUD, never a silent wrong value.
-    // This PINS the residual boundary so closing it later is a deliberate change.
+    // via `eval_binding`'s `_` arm. In `IF(TRUE, LAMBDA(x,x), 0)` the selected
+    // then-branch `LAMBDA(x,x)` is evaluated through `eval_scalar_with_cache` (FN4-03
+    // lazy `IF` evaluates only the live branch — same `eval_scalar_with_cache` path
+    // the old eager dispatcher used per arg), which scalarizes a bare lambda to
+    // `#CALC!` → `f` is `#CALC!` → `f(3)` propagates `#CALC!`. LOUD, never a silent
+    // wrong value. This PINS the residual boundary so closing it later is deliberate.
     assert_eq!(
         eval("LET(f,IF(TRUE,LAMBDA(x,x),0),f(3))"),
         Value::Error(ErrorValue::Calc)

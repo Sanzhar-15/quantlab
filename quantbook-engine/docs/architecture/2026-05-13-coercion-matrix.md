@@ -9,7 +9,7 @@
 - `[CANON]` — Excel canon. Must match Excel's documented behavior.
 - `[CURRENT]` — Current Quantbook behavior. Verified in code as of W5-62. May be CANON or DIVERGENCE.
 - `[V1-DIV]` — Intentional V1 divergence from Excel canon. Documented in `excel-matrix.md`; tests pin it.
-- `[FUTURE]` — Aspirational behavior; not implemented yet. Gated on a named gap (e.g. FN4-03 lazy eval).
+- `[FUTURE]` — Aspirational behavior; not implemented yet. Gated on a named gap (e.g. GAP-F-06 COUNT provenance). _(FN4-03 lazy IF/IFERROR — the former example here — landed in w142.)_
 
 ---
 
@@ -104,7 +104,7 @@ When multiple error sources combine in one expression, the precedence rule is **
 | `=#NUM! + #REF!`                            | `#NUM!` (left-error)  | [CURRENT][CANON] |
 | `=A1+B1` where A1=`#DIV/0!`, B1 valid       | `#DIV/0!` propagates  | [CURRENT][CANON] |
 | `=IF(#REF!, 1, 2)`                          | `#REF!` (cond error short-circuits) | [CURRENT][CANON] |
-| `=IFERROR(#REF!, 0)`                        | `0` (IFERROR catches) | [CURRENT][CANON] — args are pre-evaluated; IFERROR introspects the value and returns the fallback. FN4-03 is about lazy evaluation (not evaluating the FALLBACK if condition succeeds), NOT this simple introspection. |
+| `=IFERROR(#REF!, 0)`                        | `0` (IFERROR catches) | [CURRENT][CANON] — value errored, so the fallback is evaluated and returned. FN4-03 (w142) made this LAZY (the fallback is evaluated ONLY because the value errored; a non-error value returns without evaluating the fallback). Result unchanged. |
 | `=ISERROR(#REF!)`                           | `TRUE` (introspection) | [CURRENT][CANON] |
 | `=A1/0` where A1=`#REF!`                    | `#REF!` (arg-error beats div-zero) | [CURRENT][CANON] — same `eval_binary` rule. |
 
@@ -116,8 +116,8 @@ A small set of functions deliberately deviate from default error propagation:
 
 | Function             | Override                                                            | Label    |
 |----------------------|---------------------------------------------------------------------|----------|
-| `IF(cond, t, f)`     | Lazy: f not evaluated if cond=true; t not evaluated if cond=false. Currently EAGER (both branches always evaluated). Affects side-effecty cells; pure-cell behavior is correct. | [FUTURE FN4-03] |
-| `IFERROR(v, on_err)` | If v is Error, return on_err. **Currently works correctly via post-eval introspection** — args pre-eval, then `iferror` catches `Value::Error` in arg 0. Codex review confirmed this is NOT the FN4-03 gap; FN4-03 is about lazy SECOND-arg eval (skip on_err computation when v is non-error). | [CURRENT] introspection / [FUTURE FN4-03] arg-skip |
+| `IF(cond, t, f)`     | Lazy: cond evaluated, then ONLY the selected branch (f skipped if cond=true; t skipped if cond=false). Cond error short-circuits. Result-identical to the prior eager eval. | [CURRENT FN4-03 ✅ w142] |
+| `IFERROR(v, on_err)` / `IFNA(v, on_err)` | If v matches (any error / `#N/A`), evaluate & return on_err; else return v WITHOUT evaluating on_err. Result-identical to the prior post-eval introspection. | [CURRENT FN4-03 ✅ w142] |
 | `ISERROR(v)`         | Returns TRUE for any error; never propagates.                       | [CURRENT][CANON] |
 | `ISNA(v)`            | TRUE only for `#N/A`; other errors → FALSE.                         | [CURRENT][CANON] |
 | `ISERR(v)`           | TRUE for any error EXCEPT `#N/A`.                                   | [CURRENT][CANON] |
@@ -178,7 +178,7 @@ Make the existing centralized coercion module sufficient for every function-arg 
 - **Date / time coercion** (Excel epoch serials). Phase 4.5.
 - **UTF-16 char counting** for text functions. Phase 4.9.
 - **Excel's "skip text and blanks in range" canon for SUM/AVERAGE/MIN/MAX**. Documented Quantbook V1 divergence — current behavior propagates `#VALUE!` for any text cell in a range arg (via `coerce_numeric` → `to_number_strict`), while Excel SILENTLY SKIPS text cells in range positions. ERROR cells in range correctly propagate in BOTH Excel and Quantbook — that's not the divergence. Codex review flagged the previous wording in this section was misframed; corrected. Defending V1 behavior: strict-text-in-range is easier for users to debug (no silent type-confusion bug masking), at the cost of one-step-extra to use `=SUMIF(A:A, ">0")` instead of `=SUM(A:A)` over text-bearing ranges.
-- **Lazy eval for IF / IFERROR** (FN4-03). Requires a separate refactor of `scalar.rs::Function` dispatch.
+- ~~**Lazy eval for IF / IFERROR** (FN4-03).~~ ✅ DONE (w142): `scalar.rs::eval_lazy_logical` (IF/IFERROR/IFNA/IFS lazy branch eval). Result-identical; dep discovery unchanged.
 
 ### 4.4 What gets shipped THIS session (W5-63 doc-only)
 
@@ -204,7 +204,7 @@ Total: ~2.5 sessions for Phase 4.4 implementation, then Phase 4.4 mega-audit (~0
 | Promoting helpers breaks subtle behavior (e.g. integer-rendering rule)  | Audit-by-audit migration; workspace test count must hold.      |
 | Matrix tests over-pin Quantbook-specific divergences as canon           | Each divergence is doc-tagged; test name includes "divergence". |
 | Per-function overrides drift over time                                  | The override test file pins behavior; matrix-coverage report flags new fns missing entries. |
-| Lazy eval (FN4-03) interacts with the migration                         | Migration is read-only on Function dispatch; lazy eval is a separate landing.|
+| Lazy eval (FN4-03) interacts with the migration                         | Resolved (w142): lazy eval landed as a separate change (`eval_lazy_logical`); the helper migration was untouched.|
 
 **Stop conditions** — fold this phase if:
 

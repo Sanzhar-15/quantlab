@@ -50,10 +50,12 @@ use crate::local_env::{LambdaClosure, LocalBinding, LocalEnv};
 use crate::plan::{is_higher_order_helper, ExprPlan};
 
 /// **Wave P (2026-06-20):** maximum LAMBDA invocation depth before evaluation
-/// fails loudly with `#NUM!`. Self-applied closures (`g(g, n)`) can recurse
-/// unboundedly — our `IF` is EAGER (a scalar-tier fn whose args are ALL
-/// pre-evaluated before dispatch), so a recursive lambda cannot short-circuit a
-/// base case and always runs to this guard. The guard must fire BEFORE the
+/// fails loudly with `#NUM!`. Self-applied closures (`g(g, n)`) with no REACHABLE
+/// base case (e.g. `g(g, n+1)`) recurse unboundedly and run to this guard.
+/// **FN4-03 (2026-06-29):** `IF` is now LAZY, so a recursive lambda WITH a
+/// reachable base case (`IF(n<2, 1, n*self(self, n-1))`) terminates correctly —
+/// the recursive branch is not evaluated once the base condition holds; the guard
+/// still bounds genuinely-unbounded recursion. The guard must fire BEFORE the
 /// native stack overflows: each invocation level costs several frames of the
 /// (large) `eval_scalar_with_cache`, and a debug build's frames are far bigger
 /// than release. 64 keeps even a heavy IF-wrapped body well under a 2 MiB
@@ -578,6 +580,23 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                     }
                 }
                 Some(RegisteredFn::Scalar(f)) => {
+                    // **FN4-03 (closes GAP-F-02):** the lazy-logical family
+                    // (IF / IFERROR / IFNA / IFS) evaluates only the selected
+                    // branch / used fallback — the dead branch is never computed.
+                    // Gated on the REGISTRY-OWNED marker `is_lazy_logical_builtin`
+                    // (Codex w142): it is true ONLY for the genuine builtin
+                    // registered via `register_lazy_logical`, so registry authority
+                    // is fully preserved — an unregistered `IF` falls to `None` →
+                    // `#NAME?`; a UDF, a non-Scalar-tier entry, OR a custom scalar
+                    // fn registered under the name (only possible on a registry
+                    // without the builtin — `insert_or_panic` forbids overriding)
+                    // all keep their own dispatch. Results are byte-identical to the
+                    // eager `f` over pre-evaluated args; the ONLY observable change
+                    // is that the dead arg is not evaluated. The dep walker still
+                    // discovers ALL args (both branches stay precedents).
+                    if registry.is_lazy_logical_builtin(name) {
+                        return eval_lazy_logical(name, args, env, registry, cache);
+                    }
                     // Phase 3.6 (2026-05-12) — AGG-3-04 correctness + AGG-
                     // 3-01 cache hit path. Detect aggregate-over-named-range
                     // and route through the cache. The cache key is `(range,
@@ -1243,6 +1262,126 @@ fn coerce_dim(v: Value) -> Result<u32, ErrorValue> {
         return Err(ErrorValue::Num);
     }
     Ok(n)
+}
+
+/// **FN4-03 (closes GAP-F-02):** lazily evaluate the logical family `IF` /
+/// `IFERROR` / `IFNA` / `IFS` — only the selected branch / fallback is computed;
+/// the dead branch is never evaluated. Dispatched from the `RegisteredFn::Scalar`
+/// arm of `eval_scalar_with_cache` (the SOLE eval entry — the cell-boundary path
+/// has no separate guard; it delegates here via its scalar `_` fallthrough), and
+/// only when `FunctionRegistry::is_lazy_logical_builtin(name)` is true (the
+/// registry-owned marker set by `register_lazy_logical`) — so an unregistered /
+/// UDF / other-tier / custom-registered `name` is NOT shadowed (registry
+/// authority). The marker is CANONICAL-keyed (case-sensitive), so `name` here is
+/// always one of the four CANONICAL-uppercase builtin names — the match below is
+/// total over what the marker can admit, and its `_` arm is genuinely unreachable
+/// (a non-canonical `"if"` is not marked → eager dispatch, never reaches here).
+///
+/// **Result parity with the eager registry impls** (`scalar_fns::{r#if, iferror,
+/// ifna, ifs}`): each arm mirrors its impl's arity / error-propagation /
+/// coercion / no-match semantics exactly, including using the SAME
+/// [`coercion::to_logical`] for cond coercion — the ONLY difference is that the
+/// dead arg is not evaluated (an unobservable change in pure spreadsheet eval,
+/// where a discarded value can only differ in cost, not in result). Pinned by
+/// the `fn4_03_*` parity tests in this module.
+///
+/// **NOT a dep-discovery change:** the dep walker
+/// (`calcgraph_session.rs::walk_plan_for_deps_inner`) still walks every arg, so a
+/// precedent reachable only through the currently-dead branch stays registered — a
+/// branch-flip recomputes, and structural cycle detection (`IF(FALSE, A1, 0)` →
+/// `#CIRC!`) is preserved. The lazy marker is consulted ONLY by the evaluator,
+/// never by the dep walker or any metadata / bind-context routing.
+///
+/// **Scope (deliberately NOT lazy):** `AND` / `OR` / `XOR` evaluate ALL args in
+/// Excel (no short-circuit); `CHOOSE` is a RangeAware-tier fn (a separate dispatch
+/// path — it never reaches here); `SWITCH` is Scalar-tier but its eager impl
+/// returns only the matched value and never propagates unselected-result errors,
+/// so eager eval is already result-correct (laziness there would be a perf-only
+/// optimization, deferred).
+fn eval_lazy_logical<E: CellEnv>(
+    name: &str,
+    args: &[ExprPlan],
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> Value {
+    // Evaluate a single arg through the SAME scalar path the eager dispatcher
+    // would use, so a lazily-evaluated arg's value is byte-identical to its
+    // eager value.
+    let eval = |a: &ExprPlan| eval_scalar_with_cache(a, env, registry, cache);
+    match name {
+        // `IF(cond, then, else)` — exactly 3 args; cond error propagates; coerce
+        // to logical; evaluate ONLY the selected branch. Mirrors `scalar_fns::r#if`.
+        "IF" => {
+            if args.len() != 3 {
+                return Value::Error(ErrorValue::Value);
+            }
+            let cond = match eval(&args[0]) {
+                Value::Error(e) => return Value::Error(e),
+                other => match coercion::to_logical(&other) {
+                    Ok(b) => b,
+                    Err(e) => return Value::Error(e),
+                },
+            };
+            if cond {
+                eval(&args[1])
+            } else {
+                eval(&args[2])
+            }
+        }
+        // `IFERROR(value, fallback)` — exactly 2 args; ANY error in `value` →
+        // evaluate & return `fallback`; otherwise `value` (fallback NOT
+        // evaluated). Mirrors `scalar_fns::iferror`.
+        "IFERROR" => {
+            if args.len() != 2 {
+                return Value::Error(ErrorValue::Value);
+            }
+            match eval(&args[0]) {
+                Value::Error(_) => eval(&args[1]),
+                v => v,
+            }
+        }
+        // `IFNA(value, fallback)` — exactly 2 args; only `#N/A` is caught (other
+        // errors propagate); `fallback` evaluated only on `#N/A`. Mirrors
+        // `scalar_fns::ifna`.
+        "IFNA" => {
+            if args.len() != 2 {
+                return Value::Error(ErrorValue::Value);
+            }
+            match eval(&args[0]) {
+                Value::Error(ErrorValue::NA) => eval(&args[1]),
+                v => v,
+            }
+        }
+        // `IFS(test1, value1, …)` — empty → `#VALUE!`; first TRUE test → evaluate
+        // & return ITS value; a test error propagates immediately; no match →
+        // `#N/A`; an unpaired trailing test is discarded. LAZY: stop at the first
+        // true test — later tests and all non-selected values are never
+        // evaluated. Mirrors `scalar_fns::ifs`.
+        "IFS" => {
+            if args.is_empty() {
+                return Value::Error(ErrorValue::Value);
+            }
+            let mut i = 0;
+            while i + 1 < args.len() {
+                match eval(&args[i]) {
+                    Value::Error(e) => return Value::Error(e),
+                    other => match coercion::to_logical(&other) {
+                        Ok(true) => return eval(&args[i + 1]),
+                        Ok(false) => {}
+                        Err(e) => return Value::Error(e),
+                    },
+                }
+                i += 2;
+            }
+            Value::Error(ErrorValue::NA)
+        }
+        _ => unreachable!(
+            "eval_lazy_logical reached with a non-lazy-logical name ({name}); the \
+             dispatcher must guard on registry.is_lazy_logical_builtin, whose \
+             marker set is out of sync with this match"
+        ),
+    }
 }
 
 /// **FU4 / FU4b:** evaluate a higher-order helper at the cell boundary. The
@@ -3099,6 +3238,385 @@ mod tests {
         };
         // SUM propagates the first error encountered.
         assert_eq!(eval_reg(&expr, &env, &reg), Value::Error(ErrorValue::Ref));
+    }
+
+    // ===== FN4-03: lazy IF / IFERROR / IFNA / IFS (closes GAP-F-02) =====
+    //
+    // Two things are pinned here: (1) LAZINESS — the dead branch / unused fallback
+    // is never evaluated (proven by a read-counting env that fails if a tripwire
+    // cell is touched); (2) RESULT PARITY — the lazy eval path returns exactly what
+    // the eager registry impls (`ql_functions::scalar_fns::{r#if,iferror,ifna,ifs}`)
+    // return over the same evaluated args, across arity / cond-error / coercion /
+    // error-kind / no-match cases.
+
+    /// A `CellEnv` that records every `read_cell` coordinate, so a test can assert
+    /// a dead-branch cell was NEVER evaluated. Delegates the value read to an inner
+    /// `MapEnv`; all other `CellEnv` methods inherit the trait defaults (identical
+    /// to `MapEnv`'s, which carry no workbook state).
+    struct CountingEnv {
+        inner: MapEnv,
+        reads: std::cell::RefCell<Vec<(ql_types::RowId, ql_types::ColId)>>,
+    }
+
+    impl CountingEnv {
+        fn new(inner: MapEnv) -> Self {
+            Self {
+                inner,
+                reads: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+        fn was_read(&self, row: ql_types::RowId, col: ql_types::ColId) -> bool {
+            self.reads
+                .borrow()
+                .iter()
+                .any(|&(r, c)| r == row && c == col)
+        }
+    }
+
+    impl CellEnv for CountingEnv {
+        fn read_cell(
+            &self,
+            sheet: ql_types::SheetId,
+            row: ql_types::RowId,
+            col: ql_types::ColId,
+        ) -> Value {
+            self.reads.borrow_mut().push((row, col));
+            self.inner.read_cell(sheet, row, col)
+        }
+    }
+
+    fn eval_counting(expr: &Expr, env: &CountingEnv, reg: &FunctionRegistry) -> Value {
+        let plan = bind(expr, 0, &TEST_REGISTRY).expect("bind");
+        eval_scalar_with_registry(&plan, env, reg)
+    }
+
+    #[test]
+    fn fn4_03_if_does_not_evaluate_dead_branch() {
+        // =IF(TRUE, B (row1,col0), C (row2,col0)) → B; C must NEVER be read.
+        let mut inner = MapEnv::new();
+        inner.put(0, 1, 0, Value::Number(11.0));
+        inner.put(0, 2, 0, Value::Number(99.0));
+        let env = CountingEnv::new(inner);
+        let reg = ql_functions::default_registry();
+        let expr = Expr::Function {
+            name: Arc::from("IF"),
+            args: vec![Expr::Bool(true), cell_ref(0, 1), cell_ref(0, 2)],
+        };
+        assert_eq!(eval_counting(&expr, &env, &reg), Value::Number(11.0));
+        assert!(env.was_read(1, 0), "live (then) branch cell must be read");
+        assert!(
+            !env.was_read(2, 0),
+            "DEAD (else) branch cell must NOT be evaluated — FN4-03 laziness"
+        );
+    }
+
+    #[test]
+    fn fn4_03_if_false_evaluates_only_else_branch() {
+        // =IF(FALSE, B, C) → C; B (the dead then-branch) must NOT be read.
+        let mut inner = MapEnv::new();
+        inner.put(0, 1, 0, Value::Number(11.0));
+        inner.put(0, 2, 0, Value::Number(99.0));
+        let env = CountingEnv::new(inner);
+        let reg = ql_functions::default_registry();
+        let expr = Expr::Function {
+            name: Arc::from("IF"),
+            args: vec![Expr::Bool(false), cell_ref(0, 1), cell_ref(0, 2)],
+        };
+        assert_eq!(eval_counting(&expr, &env, &reg), Value::Number(99.0));
+        assert!(
+            !env.was_read(1, 0),
+            "DEAD (then) branch cell must NOT be evaluated"
+        );
+        assert!(env.was_read(2, 0), "live (else) branch cell must be read");
+    }
+
+    #[test]
+    fn fn4_03_iferror_skips_fallback_when_value_ok() {
+        // =IFERROR(A1 ok, fallback) → A1; the fallback cell must NOT be read.
+        let mut inner = MapEnv::new();
+        inner.put(0, 0, 0, Value::Number(42.0));
+        inner.put(0, 3, 0, Value::Number(7.0));
+        let env = CountingEnv::new(inner);
+        let reg = ql_functions::default_registry();
+        let expr = Expr::Function {
+            name: Arc::from("IFERROR"),
+            args: vec![cell_ref(0, 0), cell_ref(0, 3)],
+        };
+        assert_eq!(eval_counting(&expr, &env, &reg), Value::Number(42.0));
+        assert!(
+            !env.was_read(3, 0),
+            "IFERROR must NOT evaluate the fallback when value is non-error"
+        );
+    }
+
+    #[test]
+    fn fn4_03_iferror_evaluates_fallback_on_error() {
+        // =IFERROR(A1 #REF!, fallback) → fallback; the fallback IS read.
+        let mut inner = MapEnv::new();
+        inner.put(0, 0, 0, Value::Error(ErrorValue::Ref));
+        inner.put(0, 3, 0, Value::Number(7.0));
+        let env = CountingEnv::new(inner);
+        let reg = ql_functions::default_registry();
+        let expr = Expr::Function {
+            name: Arc::from("IFERROR"),
+            args: vec![cell_ref(0, 0), cell_ref(0, 3)],
+        };
+        assert_eq!(eval_counting(&expr, &env, &reg), Value::Number(7.0));
+        assert!(
+            env.was_read(3, 0),
+            "fallback IS evaluated when value errors"
+        );
+    }
+
+    #[test]
+    fn fn4_03_ifna_propagates_non_na_error_without_reading_fallback() {
+        // IFNA only catches #N/A. A #REF! propagates and the fallback is NOT read.
+        let mut inner = MapEnv::new();
+        inner.put(0, 0, 0, Value::Error(ErrorValue::Ref));
+        inner.put(0, 3, 0, Value::Number(7.0));
+        let env = CountingEnv::new(inner);
+        let reg = ql_functions::default_registry();
+        let expr = Expr::Function {
+            name: Arc::from("IFNA"),
+            args: vec![cell_ref(0, 0), cell_ref(0, 3)],
+        };
+        assert_eq!(
+            eval_counting(&expr, &env, &reg),
+            Value::Error(ErrorValue::Ref)
+        );
+        assert!(
+            !env.was_read(3, 0),
+            "IFNA must NOT evaluate the fallback for a non-#N/A error"
+        );
+    }
+
+    #[test]
+    fn fn4_03_ifna_evaluates_fallback_on_na() {
+        let mut inner = MapEnv::new();
+        inner.put(0, 0, 0, Value::Error(ErrorValue::NA));
+        inner.put(0, 3, 0, Value::Number(7.0));
+        let env = CountingEnv::new(inner);
+        let reg = ql_functions::default_registry();
+        let expr = Expr::Function {
+            name: Arc::from("IFNA"),
+            args: vec![cell_ref(0, 0), cell_ref(0, 3)],
+        };
+        assert_eq!(eval_counting(&expr, &env, &reg), Value::Number(7.0));
+        assert!(env.was_read(3, 0), "IFNA evaluates the fallback on #N/A");
+    }
+
+    #[test]
+    fn fn4_03_ifs_stops_at_first_true_test() {
+        // =IFS(FALSE, valA, TRUE, valB, laterTest, laterVal) → valB.
+        // valA (false pair's value), and BOTH later cells, must NOT be evaluated.
+        let mut inner = MapEnv::new();
+        inner.put(0, 1, 0, Value::Number(111.0)); // valB (selected)
+        inner.put(0, 2, 0, Value::Number(222.0)); // valA (first pair, test FALSE)
+        inner.put(0, 3, 0, Value::Boolean(true)); // later test
+        inner.put(0, 4, 0, Value::Number(444.0)); // later value
+        let env = CountingEnv::new(inner);
+        let reg = ql_functions::default_registry();
+        let expr = Expr::Function {
+            name: Arc::from("IFS"),
+            args: vec![
+                Expr::Bool(false),
+                cell_ref(0, 2),
+                Expr::Bool(true),
+                cell_ref(0, 1),
+                cell_ref(0, 3),
+                cell_ref(0, 4),
+            ],
+        };
+        assert_eq!(eval_counting(&expr, &env, &reg), Value::Number(111.0));
+        assert!(env.was_read(1, 0), "selected value must be read");
+        assert!(
+            !env.was_read(2, 0),
+            "a false pair's value must NOT be evaluated"
+        );
+        assert!(
+            !env.was_read(3, 0),
+            "a later test must NOT be evaluated after a match"
+        );
+        assert!(
+            !env.was_read(4, 0),
+            "a later value must NOT be evaluated after a match"
+        );
+    }
+
+    /// Result PARITY: for a matrix of fully-evaluated arg tuples (no dead-branch
+    /// side effects), the lazy eval path must return exactly what the eager
+    /// registry impl returns. Anti-divergence guard pinning `eval_lazy_logical`
+    /// to `scalar_fns::{r#if, iferror, ifna, ifs}`.
+    #[test]
+    fn fn4_03_lazy_path_matches_eager_registry_impls() {
+        use ql_functions::scalar_fns;
+
+        // A pure-ish Expr for a Value: scalars become literals (errors via
+        // Expr::Error — no cell read needed); Blank becomes a reference to the
+        // always-unset cell A1 of the fresh `MapEnv` the `lazy` helper builds
+        // (an out-of-bounds/unset read yields `Value::Blank`). Parity only
+        // inspects the returned Value, so a single-cell read is harmless.
+        fn lit(v: &Value) -> Expr {
+            match v {
+                Value::Number(n) => Expr::Number(*n),
+                Value::Boolean(b) => Expr::Bool(*b),
+                Value::Error(e) => Expr::Error(*e),
+                Value::Text(s) => Expr::String(std::sync::Arc::clone(s)),
+                Value::Blank => cell_ref(0, 0), // unset cell in the fresh MapEnv → Blank
+            }
+        }
+        let reg = ql_functions::default_registry();
+        let lazy = |name: &str, vals: &[Value]| -> Value {
+            let env = MapEnv::new();
+            let expr = Expr::Function {
+                name: Arc::from(name),
+                args: vals.iter().map(lit).collect(),
+            };
+            let plan = bind(&expr, 0, &TEST_REGISTRY).expect("bind");
+            eval_scalar_with_registry(&plan, &env, &reg)
+        };
+
+        let num = |x: f64| Value::Number(x);
+        let b = Value::Boolean;
+        let err = |e: ErrorValue| Value::Error(e);
+
+        // IF: arity, true/false select, cond-error propagate, numeric/text/blank
+        // coercion, and a selected branch that itself evaluates to an error.
+        let if_cases: Vec<Vec<Value>> = vec![
+            vec![],
+            vec![b(true)],
+            vec![b(true), num(1.0)],
+            vec![b(true), num(1.0), num(2.0)],
+            vec![b(false), num(1.0), num(2.0)],
+            vec![err(ErrorValue::Ref), num(1.0), num(2.0)],
+            vec![num(0.0), num(1.0), num(2.0)],
+            vec![num(5.0), num(1.0), num(2.0)],
+            vec![Value::text("TRUE"), num(1.0), num(2.0)], // text-true coercion
+            vec![Value::text("nope"), num(1.0), num(2.0)], // unparseable text → #VALUE!
+            vec![Value::Blank, num(1.0), num(2.0)],        // blank cond → false → else
+            vec![b(true), err(ErrorValue::Ref), num(2.0)], // selected branch IS an error
+            vec![b(true), num(1.0), num(2.0), num(3.0)],   // arity > 3
+        ];
+        for c in &if_cases {
+            assert_eq!(lazy("IF", c), scalar_fns::r#if(c), "IF parity for {c:?}");
+        }
+
+        // IFERROR: arity, error→fallback, non-error passthrough, error-typed fallback.
+        let iferror_cases: Vec<Vec<Value>> = vec![
+            vec![],
+            vec![num(1.0)],
+            vec![num(42.0), num(7.0)],
+            vec![err(ErrorValue::Ref), num(7.0)],
+            vec![err(ErrorValue::DivZero), err(ErrorValue::NA)],
+            vec![num(1.0), num(2.0), num(3.0)], // arity > 2
+        ];
+        for c in &iferror_cases {
+            assert_eq!(
+                lazy("IFERROR", c),
+                scalar_fns::iferror(c),
+                "IFERROR parity for {c:?}"
+            );
+        }
+
+        // IFNA: only #N/A caught; other errors propagate; arity.
+        let ifna_cases: Vec<Vec<Value>> = vec![
+            vec![],
+            vec![num(1.0)],
+            vec![num(42.0), num(7.0)],
+            vec![err(ErrorValue::NA), num(7.0)],
+            vec![err(ErrorValue::Ref), num(7.0)],
+            vec![err(ErrorValue::Value), num(7.0)],
+            vec![num(1.0), num(2.0), num(3.0)], // arity > 2
+        ];
+        for c in &ifna_cases {
+            assert_eq!(
+                lazy("IFNA", c),
+                scalar_fns::ifna(c),
+                "IFNA parity for {c:?}"
+            );
+        }
+
+        // IFS: empty, first-true, no-match #N/A, odd trailing, test-error, coercion.
+        let ifs_cases: Vec<Vec<Value>> = vec![
+            vec![],
+            vec![b(false), num(1.0), b(true), num(2.0), b(true), num(3.0)],
+            vec![b(false), num(1.0), b(false), num(2.0)],
+            vec![b(false), num(1.0), b(true)], // odd trailing test discarded
+            vec![err(ErrorValue::Ref), num(1.0), b(true), num(2.0)],
+            vec![num(1.0), num(9.0)],            // numeric-true coercion
+            vec![num(0.0), num(9.0)],            // numeric-false → no match → #N/A
+            vec![b(true)],                       // singleton: unpaired test → no match → #N/A
+            vec![b(false)],                      // singleton false → #N/A
+            vec![Value::text("TRUE"), num(5.0)], // text-true coercion
+            vec![Value::Blank, num(5.0)],        // blank test → false → #N/A
+        ];
+        for c in &ifs_cases {
+            assert_eq!(lazy("IFS", c), scalar_fns::ifs(c), "IFS parity for {c:?}");
+        }
+    }
+
+    #[test]
+    fn fn4_03_custom_scalar_if_is_not_shadowed_by_lazy_builtin() {
+        // Registry authority (Codex w142): a custom Scalar fn re-registered under the
+        // reserved name `IF` must be dispatched as written (eager) — the lazy builtin
+        // interceptor fires ONLY for the genuine `scalar_fns::r#if` (fn-pointer
+        // identity), never by name alone.
+        fn custom_if(_args: &[Value]) -> Value {
+            Value::Number(12345.0)
+        }
+        let mut reg = FunctionRegistry::new();
+        reg.register("IF", custom_if);
+        let env = MapEnv::new();
+        let expr = Expr::Function {
+            name: Arc::from("IF"),
+            args: vec![Expr::Bool(true), n(1.0), n(2.0)],
+        };
+        let plan = bind(&expr, 0, &TEST_REGISTRY).expect("bind");
+        assert_eq!(
+            eval_scalar_with_registry(&plan, &env, &reg),
+            Value::Number(12345.0),
+            "a custom-registered scalar IF must run (eager), not the lazy builtin"
+        );
+    }
+
+    #[test]
+    fn fn4_03_unregistered_if_is_name_error() {
+        // Registry authority: with no `IF` registered, `IF(...)` is an unknown
+        // function → `#NAME?`, NOT a lazily-evaluated value (the interceptor must
+        // not fire by name alone on a registry that lacks the builtin).
+        let reg = FunctionRegistry::new();
+        let env = MapEnv::new();
+        let expr = Expr::Function {
+            name: Arc::from("IF"),
+            args: vec![Expr::Bool(true), n(1.0), n(2.0)],
+        };
+        let plan = bind(&expr, 0, &TEST_REGISTRY).expect("bind");
+        assert_eq!(
+            eval_scalar_with_registry(&plan, &env, &reg),
+            Value::Error(ErrorValue::Name),
+            "an unregistered IF must be #NAME?, not lazily evaluated"
+        );
+    }
+
+    #[test]
+    fn fn4_03_non_canonical_case_if_does_not_panic(/* Codex w142 r5 */) {
+        // A hand-built lowercase `if` (the parser always uppercases, but the binder
+        // preserves the name verbatim) must NOT reach `eval_lazy_logical`'s
+        // uppercase-only match → no `unreachable!` panic. The canonical-only marker
+        // (`is_lazy_logical_builtin` is case-sensitive) returns false for "if", so it
+        // dispatches EAGERLY via the registered builtin — result-correct either way.
+        let reg = ql_functions::default_registry();
+        let env = MapEnv::new();
+        let expr = Expr::Function {
+            name: Arc::from("if"),
+            args: vec![Expr::Bool(true), n(1.0), n(2.0)],
+        };
+        let plan = bind(&expr, 0, &TEST_REGISTRY).expect("bind");
+        assert_eq!(
+            eval_scalar_with_registry(&plan, &env, &reg),
+            Value::Number(1.0),
+            "lowercase `if` must evaluate correctly (no panic), via eager dispatch"
+        );
     }
 
     // ===== Phase 2A.9 audit M1: lenient arithmetic coercion =====

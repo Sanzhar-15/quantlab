@@ -33,7 +33,8 @@
 //!   not-scheduler-edges. Architectural decision needed before Phase 4.3 V2.
 //! - GAP-G-02 — bulk SIMD region dispatch from graph scheduler (V1 is
 //!   observability only).
-//! - FN4-03 — lazy IF/IFERROR (needs scalar.rs Function-branch refactor).
+//! - FN4-03 — lazy IF/IFERROR/IFNA/IFS ✅ CLOSED (w142): `scalar.rs::eval_lazy_logical`
+//!   evaluates only the selected branch/fallback; dep discovery still walks all args.
 //! - Cross-sheet formula references via NameTable resolution (Phase 4.6).
 
 use std::cell::RefCell;

@@ -139,10 +139,10 @@ as partial, rows with `❌` are missing.
 
 | Function | Status | Tests | Phase | Notes |
 |---|---|---|---|---|
-| IF | ⚠️ | 8+ | 0 (eager) | Eager both-branch eval; lazy semantics → 4.3 (FN4-03) |
-| IFS | ✅ | 6 | 4.10.A | W5-163: variadic test+value pairs; first true wins. Errors in tests propagate. No match → #N/A. Odd arg count silently discards trailing unpaired arg (matches Excel canon). Empty → #VALUE!. Non-bool tests coerce via `to_logical`. |
-| IFERROR | ⚠️ | 5+ | 0 (eager) | Eager eval; lazy → 4.3 |
-| IFNA | ✅ | 4 | 4.10.A | W5-163: like IFERROR but only catches `#N/A`. Other errors propagate. Exactly 2 args. |
+| IF | ✅ | 8+ | FN4-03 (w142) | Lazy branch eval: cond then ONLY the selected branch; cond error short-circuits. Result-identical to prior eager eval. |
+| IFS | ✅ | 6+ | 4.10.A + FN4-03 (w142) | W5-163: variadic test+value pairs; first true wins. Errors in tests propagate. No match → #N/A. Odd arg count silently discards trailing unpaired arg (matches Excel canon). Empty → #VALUE!. Non-bool tests coerce via `to_logical`. FN4-03: now LAZY — stops at the first true test (later tests/values not evaluated). |
+| IFERROR | ✅ | 5+ | FN4-03 (w142) | Lazy: fallback evaluated only when value errors. Result-identical to prior eager eval. |
+| IFNA | ✅ | 4+ | 4.10.A + FN4-03 (w142) | W5-163: like IFERROR but only catches `#N/A`. Other errors propagate. Exactly 2 args. FN4-03: now LAZY — fallback evaluated only on `#N/A`. |
 | AND / OR | ✅ | 5+ | 0 | Eager; truthy semantics per Excel |
 | NOT | ✅ | 3+ | 0 | |
 | XOR | ✅ | 8 | 4.10.A | W5-163: variadic parity (true iff odd count of true args). Mirrors AND/OR arg handling: skip blanks, coerce non-bool via `to_logical`, propagate errors, require ≥1 non-blank → otherwise #VALUE!. |

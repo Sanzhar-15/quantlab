@@ -516,9 +516,11 @@ fn recursive_self_application_keeps_dep_and_terminates() {
     // (`fact(fact,3)`) and its body calls `self(self,n-1)` — the analysis must reach a
     // fixpoint (the test COMPLETING proves the monotone bound / budget terminates) while
     // still marking the body invoked, so A1 (read in the base arm) stays a precedent.
-    // Eval runs to the `MAX_LAMBDA_DEPTH` guard (eager IF makes the self-call always fire)
-    // -> `#NUM!`, but the DEP must still include A1: an invoked recursive body keeps its
-    // refs (proven at the dep level, independent of the runtime value).
+    // This test checks the DEP only (via `formula_deps_for`, no eval): an invoked recursive
+    // body keeps its refs, so A1 (read in the base arm) must be a precedent — independent of
+    // the runtime value. (Since FN4-03's lazy IF, this formula also TERMINATES at eval —
+    // the base case `IF(n<2, A1, …)` returns A1 once n<2 — but the dep assertion below holds
+    // either way, because the dep walker descends both branches regardless of laziness.)
     let deps =
         formula_deps_for("LET(fact,LAMBDA(self,n,IF(n<2,A1,n*self(self,n-1))),fact(fact,3))")
             .expect("formula has deps");
@@ -532,8 +534,9 @@ fn recursive_self_application_keeps_dep_and_terminates() {
 fn both_branches_of_conditional_invoke_keep_deps() {
     // `IF(A2>0, f(1), h(1))` — `f` reads A1, `h` reads C1. The walker descends BOTH
     // Function args, so both lambdas are invocation-reachable and both A1 and C1 are
-    // precedents. Sound: it never misses a conditionally-invoked branch (and eager IF
-    // evaluates both branches at eval anyway).
+    // precedents. Sound: it never misses a conditionally-invoked branch. This DEP
+    // breadth is independent of FN4-03's lazy IF (which, at EVAL, now invokes only the
+    // live branch's lambda — a subset of what the walker marks, so still no under-report).
     let deps = formula_deps_for("LET(f,LAMBDA(x,A1),h,LAMBDA(y,C1),IF(A2>0,f(1),h(1)))")
         .expect("formula has deps");
     let has = |r, c| deps.cells.iter().any(|&(s, rr, cc)| (s, rr, cc) == (0, r, c));

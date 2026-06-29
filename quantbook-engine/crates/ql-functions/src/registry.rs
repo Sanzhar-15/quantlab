@@ -27,7 +27,7 @@
 //! dispatch in W5-101 will route them through a new `match` arm that
 //! returns `EvalResult::Array(_)` to the runtime.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ql_session::function_meta::{
     ArgContext, ArgPolicy, Arity, BatchShape, CancelPolicy, DepShape, FunctionMetadata, Volatility,
@@ -261,6 +261,17 @@ pub struct FunctionRegistry {
     /// metadata entry" path would invite a fn_gen-skew bug; we don't ship
     /// one in v1.
     udf_handles: HashMap<String, FunctionImplHandle>,
+    /// **FN4-03 (2026-06-29):** the set of canonical-uppercase names registered as
+    /// LAZY-LOGICAL builtins (`IF` / `IFERROR` / `IFNA` / `IFS`) — functions whose
+    /// Excel semantics evaluate only the selected branch/fallback. The eager
+    /// `ScalarFn` contract (`&[Value]`) can't express that, so the evaluator
+    /// (`ql-exec::scalar::eval_lazy_logical`) special-cases them — but ONLY when
+    /// this REGISTRY-OWNED marker says the name is the genuine builtin. A custom
+    /// scalar fn registered under one of these names (only possible on a registry
+    /// that never registered the builtin — `insert_or_panic` forbids overriding an
+    /// existing entry) is NOT in this set, so it dispatches eagerly as written
+    /// (registry authority — Codex w142). Populated by [`Self::register_lazy_logical`].
+    lazy_logical: HashSet<&'static str>,
 }
 
 impl Default for FunctionRegistry {
@@ -285,6 +296,9 @@ impl FunctionRegistry {
             // handle (their dispatch goes through `fns`). UDFs add entries
             // via [`Self::register_udf`].
             udf_handles: HashMap::new(),
+            // **FN4-03:** empty at boot — `default_registry` marks the four
+            // lazy-logical builtins via `register_lazy_logical`.
+            lazy_logical: HashSet::new(),
         }
     }
 
@@ -550,6 +564,51 @@ impl FunctionRegistry {
         self.insert_or_panic(name, RegisteredFn::Scalar(f), "FunctionRegistry::register");
     }
 
+    /// **FN4-03 (2026-06-29):** register one of the four lazy-logical builtins
+    /// (`IF` / `IFERROR` / `IFNA` / `IFS`) AND mark it. This is a CLOSED
+    /// registration path (Codex w142): it takes ONLY the name and maps it to the
+    /// genuine builtin `ScalarFn` internally — there is no way to mark an arbitrary
+    /// name or attach an arbitrary function, so the marker set can never contain a
+    /// name `eval_lazy_logical` doesn't handle (no forgeable `unreachable!`), and a
+    /// custom scalar fn can never masquerade as a lazy builtin. `pub(crate)` so only
+    /// `default_registry` (this crate) can mark builtins; external callers use the
+    /// public `register` (which never marks). An unknown name panics LOUDLY here at
+    /// construction (No-Fallbacks), not via `unreachable!` at eval.
+    ///
+    /// The registered `ScalarFn` is the eager value reference (the parity anchor);
+    /// the evaluator reproduces those semantics LAZILY (only the selected
+    /// branch/fallback) when [`Self::is_lazy_logical_builtin`] is true. Same
+    /// canonical-uppercase + duplicate-panic contract as [`Self::register`].
+    pub(crate) fn register_lazy_logical(&mut self, name: &'static str) {
+        let f: ScalarFn = match name {
+            "IF" => scalar_fns::r#if,
+            "IFERROR" => scalar_fns::iferror,
+            "IFNA" => scalar_fns::ifna,
+            "IFS" => scalar_fns::ifs,
+            other => panic!(
+                "register_lazy_logical: {other:?} is not a lazy-logical builtin \
+                 (only IF / IFERROR / IFNA / IFS); eval_lazy_logical would have no arm"
+            ),
+        };
+        self.register(name, f);
+        self.lazy_logical.insert(name);
+    }
+
+    /// **FN4-03:** is `name` registered (in THIS registry) as a lazy-logical
+    /// builtin? Keyed by the CANONICAL (uppercase) name — the marker set only ever
+    /// holds the four canonical builtin names. Match is case-SENSITIVE on purpose
+    /// (Codex w142): the evaluator's `eval_lazy_logical` dispatches by exact
+    /// uppercase literal, so gating on the canonical name guarantees it is only
+    /// ever handed a name it has an arm for (no reachable `unreachable!`). Function
+    /// names reaching eval are already canonical uppercase (the parser uppercases);
+    /// a non-canonical name from a hand-built AST returns `false` here and falls
+    /// through to eager dispatch via the `RegisteredFn::Scalar` arm (result-correct
+    /// — `lookup_any` still resolves it case-insensitively). Also `false` for an
+    /// unregistered or custom-registered name → registry authority preserved.
+    pub fn is_lazy_logical_builtin(&self, name: &str) -> bool {
+        self.lazy_logical.contains(name)
+    }
+
     /// W5-53: register a range-aware function under `name`. Stored
     /// internally as `RegisteredFn::RangeAware(f)`. Same canonical-
     /// uppercase requirement + duplicate panic as `register`.
@@ -776,15 +835,19 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("STDEV.P", scalar_fns::stdev_p);
 
     // Logical
-    r.register("IF", scalar_fns::r#if);
+    // FN4-03: IF / IFERROR / IFNA / IFS are LAZY logical builtins — the registry
+    // marks them (closed path; the builtin ScalarFn is mapped internally) so the
+    // evaluator evaluates only the selected branch/fallback (`eval_lazy_logical`).
+    // AND/OR/NOT stay eager (Excel evaluates all args).
+    r.register_lazy_logical("IF");
     r.register("AND", scalar_fns::and);
     r.register("OR", scalar_fns::or);
     r.register("NOT", scalar_fns::not);
-    r.register("IFERROR", scalar_fns::iferror);
+    r.register_lazy_logical("IFERROR");
 
     // Phase 4.10.A (W5-163) — logical fillins.
-    r.register("IFS", scalar_fns::ifs);
-    r.register("IFNA", scalar_fns::ifna);
+    r.register_lazy_logical("IFS");
+    r.register_lazy_logical("IFNA");
     r.register("XOR", scalar_fns::xor);
     r.register("SWITCH", scalar_fns::switch);
 
@@ -2593,6 +2656,53 @@ mod tests {
             provenance_tags: vec![],
         };
         let _ = r.register_metadata(meta);
+    }
+
+    /// **FN4-03:** `default_registry` marks EXACTLY `IF` / `IFERROR` / `IFNA` /
+    /// `IFS` (canonical uppercase) as lazy-logical builtins (the registry-owned
+    /// typo/drift guard that replaced the former `is_lazy_logical` name matcher).
+    /// Eager logical fns, a different-tier selector, an ordinary scalar, a
+    /// higher-order helper, and a non-existent name must NOT be marked. The marker
+    /// is CASE-SENSITIVE (canonical-only): a lowercase query returns `false` so the
+    /// evaluator never hands `eval_lazy_logical` a name it lacks an arm for.
+    #[test]
+    fn default_registry_marks_exactly_the_lazy_logical_builtins() {
+        let r = default_registry();
+        for name in ["IF", "IFERROR", "IFNA", "IFS"] {
+            assert!(
+                r.is_lazy_logical_builtin(name),
+                "{name} must be marked as a lazy-logical builtin"
+            );
+            assert!(
+                !r.is_lazy_logical_builtin(&name.to_ascii_lowercase()),
+                "{name} marker is canonical-only (case-sensitive): a lowercase query \
+                 must NOT match — it falls through to eager dispatch, never a panic"
+            );
+        }
+        for name in [
+            "AND", "OR", "XOR", "NOT", "CHOOSE", "SWITCH", "SUM", "MAP", "NOPE",
+        ] {
+            assert!(
+                !r.is_lazy_logical_builtin(name),
+                "{name} must NOT be marked lazy-logical (only IF/IFERROR/IFNA/IFS)"
+            );
+        }
+    }
+
+    /// **FN4-03 (registry authority — Codex w142):** a custom scalar fn registered
+    /// under a reserved lazy-logical name on a registry WITHOUT the builtin is NOT
+    /// marked lazy — so the evaluator dispatches it eagerly as written.
+    #[test]
+    fn custom_if_registration_is_not_marked_lazy_logical() {
+        fn custom_if(_: &[Value]) -> Value {
+            Value::Blank
+        }
+        let mut r = FunctionRegistry::new();
+        r.register("IF", custom_if);
+        assert!(
+            !r.is_lazy_logical_builtin("IF"),
+            "a custom scalar IF on a fresh registry must not be a lazy builtin"
+        );
     }
 
     /// **`iter_metadata` covers everything:** count matches

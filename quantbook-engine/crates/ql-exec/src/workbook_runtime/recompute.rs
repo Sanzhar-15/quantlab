@@ -1522,6 +1522,71 @@ mod tests {
         );
     }
 
+    /// **FN4-03 dep-walker invariant.** `A1 = IF(FALSE, A1, 0)` — the THEN
+    /// branch (`A1`, a self-reference) is the DEAD branch at runtime (cond is
+    /// FALSE). FN4-03 made IF eval LAZY (the dead branch is not evaluated), but
+    /// dependency discovery must stay EAGER: the dep walker still records `A1`
+    /// as a precedent of itself, so the structural cycle is detected → `#CIRC!`.
+    /// If lazy eval had wrongly suppressed dep discovery, the self-edge would be
+    /// missing and this would evaluate to `0` — so this test is a true
+    /// discriminator for the "lazy eval ≠ lazy dep discovery" invariant.
+    #[test]
+    fn fn4_03_dead_if_then_branch_self_ref_still_circ() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        wb.put_formula(0, 0, 0, "IF(FALSE, A1, 0)");
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let _ = rt.recompute_all();
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::Circ),
+            "a self-ref in the DEAD then-branch must still be a precedent (eager \
+             dep discovery) → #CIRC!, not 0"
+        );
+    }
+
+    /// **FN4-03 dep-walker invariant (else-branch position).** `A1 = IF(TRUE, 0,
+    /// A1)` — the ELSE branch (`A1`) is the dead branch (cond TRUE). Same
+    /// invariant: the dead-branch self-reference is still a precedent → `#CIRC!`.
+    #[test]
+    fn fn4_03_dead_if_else_branch_self_ref_still_circ() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        wb.put_formula(0, 0, 0, "IF(TRUE, 0, A1)");
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let _ = rt.recompute_all();
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::Circ),
+            "a self-ref in the DEAD else-branch must still be a precedent → #CIRC!"
+        );
+    }
+
+    /// **FN4-03 end-to-end** through the value-computing recompute path: a normal
+    /// (acyclic) lazy IF computes the correct branch value. `A1 = 5`, `B1 =
+    /// IF(FALSE, A1, 7)` → `B1 = 7` (the dead `A1` branch is not taken). Pairs
+    /// with the cycle tests above (which prove `A1` is STILL a precedent).
+    #[test]
+    fn fn4_03_lazy_if_computes_live_branch_in_recompute() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        wb.put_at(0, 0, 0, Value::Number(5.0));
+        wb.put_formula(0, 0, 1, "IF(FALSE, A1, 7)");
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let _ = rt.recompute_all();
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Number(7.0),
+            "lazy IF returns the live else-branch (7); the dead A1 branch is skipped"
+        );
+    }
+
     /// Cycle value must be stable across repeated `recompute_all`
     /// calls — no drift between iterations. Before this fix, A1 in
     /// `A1 = A1 + 1` returned 1, 2, 3, … instead of #CIRC! each time.
