@@ -112,6 +112,23 @@ pub trait CellEnv {
         false
     }
 
+    /// **SUBTOTAL nested-skip (2026-06-29):** is the cell at `(sheet, row, col)`
+    /// a formula whose AST ROOT is a `SUBTOTAL(...)` call? Excel canon: a
+    /// `SUBTOTAL` ignores any cell in its reference range that is itself a
+    /// `SUBTOTAL` (the "subtotal of subtotals" double-counting guard), for BOTH
+    /// the 1..=11 and 101..=111 bands. The scalar.rs materializer consults this
+    /// per range-cell (only when materializing a `SUBTOTAL` arg) and substitutes
+    /// `Value::Blank` for a nested-subtotal cell — which every SUBTOTAL reducer
+    /// then skips, identical to IronCalc's per-cell `continue`.
+    ///
+    /// "AST root" (not "contains SUBTOTAL anywhere") matches IronCalc exactly:
+    /// `=SUBTOTAL(..)+0` has root `+`, so it is NOT a nested subtotal. Default
+    /// `false` — envs without a workbook (`MapEnv`, benches, tests) carry no
+    /// formula text, so no cell is ever a nested subtotal. `WorkbookEnv` overrides.
+    fn cell_is_subtotal(&self, _sheet: SheetId, _row: RowId, _col: ColId) -> bool {
+        false
+    }
+
     /// **W5-69 (Phase 4.5.A.0):** the evaluator context for date /
     /// locale / clock-aware function dispatch. Default impl returns
     /// `&DEFAULT_EVAL_CONTEXT` (Excel1900 + EnUs + System), suitable
@@ -407,6 +424,45 @@ impl<'w> CellEnv for WorkbookEnv<'w> {
         self.workbook
             .sheet(sheet)
             .is_some_and(|s| !s.hidden_rows().is_empty())
+    }
+
+    /// **SUBTOTAL nested-skip (2026-06-29):** the cell is a nested SUBTOTAL iff it
+    /// carries a formula whose parsed AST root is a `SUBTOTAL(...)` call. We read
+    /// the cell's formula text (`Workbook::formula_at`, no leading `=`) and
+    /// lex/parse it; the parser uppercases function names, so the root is
+    /// `Expr::Function { name: "SUBTOTAL", .. }` for a root-level SUBTOTAL. This
+    /// matches IronCalc's `cell_is_subtotal` (root-node check), so `=SUBTOTAL(..)+0`
+    /// (root `+`) is NOT a nested subtotal.
+    ///
+    /// **Graceful on un-parseable text — NOT a fallback.** `formula_at` is not
+    /// guaranteed to be canonical printer output: a `.qbook` load stores the
+    /// persisted formula text VERBATIM via `Workbook::put_formula`, so a corrupted
+    /// or version-skewed workbook can hold a formula that does not re-lex/parse.
+    /// The engine's contract for such a cell is to surface it as a `RecomputeFailure`
+    /// at ITS OWN recompute (see `loader::recompute_failure_preserves_partial_workbook_in_result`),
+    /// NOT to abort open/import. So we must not `.expect()` here. A cell whose text
+    /// we cannot parse is, by definition, not a confirmable root-`SUBTOTAL` call →
+    /// return `false` (do not skip it); its value (an error from the failed
+    /// recompute) then flows into `SUBTOTAL` and propagates normally. This swallows
+    /// nothing — the invalid formula is still loudly reported by its own cell's
+    /// recompute. Mirrors the established `lex(..).ok().and_then(parse).ok()` idiom
+    /// in `workbook_runtime::names`.
+    ///
+    /// Cost: one `formula_at` lookup per range cell (cheap `None` for the common
+    /// value cell), plus a lex+parse for the rare formula cell. Only invoked when
+    /// the materializer is building a `SUBTOTAL` arg (name-gated). A future
+    /// optimization could consult the runtime plan cache instead of re-parsing.
+    fn cell_is_subtotal(&self, sheet: SheetId, row: RowId, col: ColId) -> bool {
+        let Some(text) = self.workbook.formula_at(sheet, row, col) else {
+            return false;
+        };
+        let Some(expr) = ql_formula_syntax::lex(text.as_ref())
+            .ok()
+            .and_then(|tokens| ql_formula_syntax::parse(tokens).ok())
+        else {
+            return false; // un-parseable persisted text → not a confirmable SUBTOTAL.
+        };
+        matches!(&expr, ql_formula_syntax::Expr::Function { name, .. } if name.eq_ignore_ascii_case("SUBTOTAL"))
     }
 
     /// Phase 3.6 override: clamps the iteration to `Sheet::bounds` so a
@@ -739,6 +795,41 @@ mod tests {
         let e = WorkbookEnv::new(&wb);
         assert_eq!(e.read_cell(sheet_id, 5, 3), Value::Number(7.0));
         assert_eq!(e.read_cell(sheet_id, 0, 0), Value::Blank);
+    }
+
+    /// **SUBTOTAL nested-skip (2026-06-29):** `cell_is_subtotal` is true ONLY for a
+    /// cell whose formula's AST ROOT is a `SUBTOTAL(...)` call (matching IronCalc).
+    /// Case-insensitive (the parser uppercases the name); a value cell, a non-
+    /// SUBTOTAL formula, and `SUBTOTAL(..)+0` (root `+`) are all false.
+    #[test]
+    fn workbook_env_cell_is_subtotal_root_node_only() {
+        let mut wb = ql_storage::Workbook::new();
+        let s = wb.add_sheet("S1");
+        wb.put_formula(s, 0, 0, "SUBTOTAL(9,A1:A2)"); // root SUBTOTAL
+        wb.put_formula(s, 1, 0, "subtotal(9,A1:A2)"); // lower-case → uppercased by parser
+        wb.put_formula(s, 2, 0, "SUBTOTAL(9,A1:A2)+0"); // root is `+` → NOT nested
+        wb.put_formula(s, 3, 0, "SUM(A1:A2)"); // different function
+        wb.put_formula(s, 4, 0, "A1+A2"); // no function root
+        wb.sheet_mut(s).unwrap().put(5, 0, Value::Number(7.0)); // value cell, no formula
+        // A corrupted / un-parseable persisted formula (as a `.qbook` load can
+        // store VERBATIM via put_formula) MUST NOT panic — it returns false.
+        wb.put_formula(s, 6, 0, "(((");
+        let e = WorkbookEnv::new(&wb);
+        assert!(e.cell_is_subtotal(s, 0, 0));
+        assert!(e.cell_is_subtotal(s, 1, 0), "case-insensitive name match");
+        assert!(
+            !e.cell_is_subtotal(s, 2, 0),
+            "=SUBTOTAL(..)+0 has root `+` → not a nested subtotal"
+        );
+        assert!(!e.cell_is_subtotal(s, 3, 0));
+        assert!(!e.cell_is_subtotal(s, 4, 0));
+        assert!(!e.cell_is_subtotal(s, 5, 0), "value cell is never a subtotal");
+        assert!(
+            !e.cell_is_subtotal(s, 6, 0),
+            "un-parseable persisted formula must return false, not panic"
+        );
+        // The trait default (no workbook backing) is always false.
+        assert!(!MapEnv::new().cell_is_subtotal(s, 0, 0));
     }
 
     // ===== W5-71 Phase 4.5.A.2 — WorkbookEnv carries date_system =====

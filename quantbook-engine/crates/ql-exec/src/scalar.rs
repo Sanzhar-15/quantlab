@@ -103,6 +103,16 @@ impl CellEnv for LocalScopedEnv<'_> {
     fn sheet_has_hidden_rows(&self, sheet: ql_types::SheetId) -> bool {
         self.inner.sheet_has_hidden_rows(sheet)
     }
+    fn cell_is_subtotal(
+        &self,
+        sheet: ql_types::SheetId,
+        row: ql_types::RowId,
+        col: ql_types::ColId,
+    ) -> bool {
+        // MUST forward to the inner workbook env — otherwise SUBTOTAL nested-skip
+        // silently turns off inside a LET/LAMBDA body (the trait default is false).
+        self.inner.cell_is_subtotal(sheet, row, col)
+    }
     fn eval_context(&self) -> &ql_types::EvalContext {
         self.inner.eval_context()
     }
@@ -378,9 +388,22 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 // W5-54: shape-aware Range so VLOOKUP /
                                 // HLOOKUP / INDEX can address by (row,
                                 // col). SUMIF / COUNTIF ignore shape.
-                                let (values, rows, cols) = env.read_range_with_shape(*range);
+                                let (mut values, rows, cols) = env.read_range_with_shape(*range);
                                 let row_hidden =
                                     range_visibility_mask(env, range.sheet, range.start_row, rows);
+                                // SUBTOTAL nested-skip: blank out nested-SUBTOTAL
+                                // cells (name-gated → other range-aware fns untouched).
+                                if crate::plan::is_range_aware_subtotal(name) {
+                                    mask_nested_subtotals(
+                                        env,
+                                        range.sheet,
+                                        range.start_row,
+                                        range.start_col,
+                                        rows,
+                                        cols,
+                                        &mut values,
+                                    );
+                                }
                                 fn_args.push(FnArg::range_with_visibility(
                                     values, rows, cols, row_hidden,
                                 ));
@@ -397,13 +420,26 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 let r = narrow_structured_ref(*resolved, *is_this_row, env);
                                 match r {
                                     Ok(range) => {
-                                        let (values, rows, cols) = env.read_range_with_shape(range);
+                                        let (mut values, rows, cols) =
+                                            env.read_range_with_shape(range);
                                         let row_hidden = range_visibility_mask(
                                             env,
                                             range.sheet,
                                             range.start_row,
                                             rows,
                                         );
+                                        // SUBTOTAL nested-skip (see the AggregateNameRef arm).
+                                        if crate::plan::is_range_aware_subtotal(name) {
+                                            mask_nested_subtotals(
+                                                env,
+                                                range.sheet,
+                                                range.start_row,
+                                                range.start_col,
+                                                rows,
+                                                cols,
+                                                &mut values,
+                                            );
+                                        }
                                         fn_args.push(FnArg::range_with_visibility(
                                             values, rows, cols, row_hidden,
                                         ));
@@ -1953,6 +1989,53 @@ fn range_visibility_mask<E: CellEnv + ?Sized>(
     (0..rows)
         .map(|i| env.is_row_hidden(sheet, start_row + i as ql_types::RowId))
         .collect()
+}
+
+/// **SUBTOTAL nested-skip (2026-06-29):** Excel canon — a `SUBTOTAL` ignores any
+/// cell in its reference range that is itself a `SUBTOTAL` formula (the "subtotal
+/// of subtotals" double-counting guard), for BOTH the 1..=11 and 101..=111 bands.
+///
+/// Rather than thread a second mask through `FnArg::Range`, we exploit that every
+/// SUBTOTAL reducer uniformly SKIPS `Value::Blank` (`sum`/`average`/`max`/`min`/
+/// `product`/`stdev`/`var` via `to_number_strict_skip_blank`; `count` matches only
+/// `Number`; `counta` filters `Blank`). So overwriting a nested-subtotal cell's
+/// value with `Value::Blank` is exactly IronCalc's per-cell `continue` — for every
+/// function-num — and the `subtotal()` kernel needs no change.
+///
+/// Only the materializer's SUBTOTAL arms call this (name-gated by
+/// `crate::plan::is_range_aware_subtotal`), so non-SUBTOTAL range reads are
+/// untouched. `values` is the row-major block returned by `read_range_with_shape`
+/// (open-ended ranges already clamped to populated bounds), so flat index `i` maps
+/// to absolute `(start_row + i / cols, start_col + i % cols)`. Composes with the
+/// hidden-row mask: a cell that is both hidden and a nested subtotal is skipped by
+/// whichever rule applies (here it becomes `Blank`, skipped in every band).
+fn mask_nested_subtotals<E: CellEnv + ?Sized>(
+    env: &E,
+    sheet: ql_types::SheetId,
+    start_row: ql_types::RowId,
+    start_col: ql_types::ColId,
+    rows: usize,
+    cols: usize,
+    values: &mut [Value],
+) {
+    if cols == 0 {
+        // Guards the `i / cols` / `i % cols` divisions below. A degenerate range
+        // yields cols == 0 (and an empty `values`); a (rows == 0, cols > 0) shape
+        // also has an empty `values`, so the loop would be vacuous either way.
+        return;
+    }
+    debug_assert_eq!(
+        rows * cols,
+        values.len(),
+        "mask_nested_subtotals: shape must match the materialized block"
+    );
+    for (i, v) in values.iter_mut().enumerate() {
+        let r = start_row + (i / cols) as ql_types::RowId;
+        let c = start_col + (i % cols) as ql_types::ColId;
+        if env.cell_is_subtotal(sheet, r, c) {
+            *v = Value::Blank;
+        }
+    }
 }
 
 /// **W5-117 (Phase 4.8.G.2):** access the formula cell from an env if

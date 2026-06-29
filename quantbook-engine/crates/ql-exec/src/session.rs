@@ -11336,6 +11336,299 @@ mod tests {
         );
     }
 
+    /// **SUBTOTAL nested-skip (2026-06-29) — the core behavior.** A grand-total
+    /// `SUBTOTAL` over a range that contains intermediate `SUBTOTAL` cells must
+    /// ignore those nested subtotals (the "subtotal of subtotals" guard), for
+    /// BOTH the 1..=11 (`9`) and 101..=111 (`109`) bands, regardless of hidden
+    /// rows. Layout: A3 and A6 are nested subtotals over the runs above them.
+    #[test]
+    fn owning_session_subtotal_nested_skip_sum() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (row, v) in [(0, 10.0), (1, 20.0), (3, 40.0), (4, 50.0)] {
+            s.set_value(addr(sheet, row, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        // A3 = SUBTOTAL(9, A1:A2) = 30 (nested); A6 = SUBTOTAL(9, A4:A5) = 90 (nested).
+        s.set_formula(addr(sheet, 2, 0), "SUBTOTAL(9, A1:A2)").unwrap();
+        s.set_formula(addr(sheet, 5, 0), "SUBTOTAL(9, A4:A5)").unwrap();
+        // The nested subtotals themselves compute over plain-number runs.
+        let a = |s: &WorkbookSession, row| s.cell(addr(sheet, row, 0)).unwrap().unwrap().value;
+        assert_eq!(a(&s, 2), Some(CellValue::Number { number: 30.0 }));
+        assert_eq!(a(&s, 5), Some(CellValue::Number { number: 90.0 }));
+
+        // Grand totals over the whole column INCLUDING the nested-subtotal cells.
+        // Without nested-skip this would be 10+20+30+40+50+90 = 240; the guard
+        // drops A3 (30) and A6 (90) → 10+20+40+50 = 120, for BOTH bands.
+        s.set_formula(addr(sheet, 0, 1), "SUBTOTAL(9, A1:A6)").unwrap();
+        s.set_formula(addr(sheet, 1, 1), "SUBTOTAL(109, A1:A6)").unwrap();
+        let b = |s: &WorkbookSession, row| s.cell(addr(sheet, row, 1)).unwrap().unwrap().value;
+        assert_eq!(
+            b(&s, 0),
+            Some(CellValue::Number { number: 120.0 }),
+            "SUBTOTAL(9) must skip nested SUBTOTAL cells A3 + A6"
+        );
+        assert_eq!(
+            b(&s, 1),
+            Some(CellValue::Number { number: 120.0 }),
+            "SUBTOTAL(109) must skip nested SUBTOTAL cells A3 + A6 (no rows hidden)"
+        );
+    }
+
+    /// **SUBTOTAL nested-skip — count / counta / average / max / min / product.**
+    /// Each function-num must EXCLUDE (not just zero-out) the nested cells: COUNT
+    /// drops them from the tally, COUNTA from the non-blank tally, AVERAGE from
+    /// both numerator and denominator, PRODUCT from the running product (a 0 would
+    /// be catastrophic), MAX/MIN from the extremes.
+    #[test]
+    fn owning_session_subtotal_nested_skip_all_reducers() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // A1=2, A2=3, A4=4 plain; A3 = SUBTOTAL(6, A1:A2) = 6 (nested product).
+        for (row, v) in [(0, 2.0), (1, 3.0), (3, 4.0)] {
+            s.set_value(addr(sheet, row, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_formula(addr(sheet, 2, 0), "SUBTOTAL(6, A1:A2)").unwrap();
+        // Overwrite the SAME result cell (B1) per function-num; set_formula
+        // recomputes synchronously. Range A1:A4 = [2, 3, <nested 6>, 4]; the
+        // guard skips A3 every time.
+        let eval = |s: &mut WorkbookSession, num: &str| {
+            s.set_formula(addr(sheet, 0, 1), num).unwrap();
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value
+        };
+        // PRODUCT(6): 2*3*4 = 24 (NOT 2*3*6*4 = 144 — and never *0*).
+        assert_eq!(
+            eval(&mut s, "SUBTOTAL(6, A1:A4)"),
+            Some(CellValue::Number { number: 24.0 })
+        );
+        // COUNT(2): 3 numbers (A1,A2,A4), not 4.
+        assert_eq!(
+            eval(&mut s, "SUBTOTAL(2, A1:A4)"),
+            Some(CellValue::Number { number: 3.0 })
+        );
+        // COUNTA(3): 3 non-blank (A1,A2,A4), not 4.
+        assert_eq!(
+            eval(&mut s, "SUBTOTAL(3, A1:A4)"),
+            Some(CellValue::Number { number: 3.0 })
+        );
+        // AVERAGE(1): (2+3+4)/3 = 3, not (2+3+6+4)/4 = 3.75.
+        assert_eq!(
+            eval(&mut s, "SUBTOTAL(1, A1:A4)"),
+            Some(CellValue::Number { number: 3.0 })
+        );
+        // MAX(4): max(2,3,4) = 4 (the nested 6 is excluded, else it'd be 6).
+        assert_eq!(
+            eval(&mut s, "SUBTOTAL(4, A1:A4)"),
+            Some(CellValue::Number { number: 4.0 })
+        );
+        // MIN(5): min(2,3,4) = 2.
+        assert_eq!(
+            eval(&mut s, "SUBTOTAL(5, A1:A4)"),
+            Some(CellValue::Number { number: 2.0 })
+        );
+        // STDEV.S(7): sample stdev of {2,3,4} = 1.0 (the nested 6 excluded; with it
+        // the answer would be ~1.708). Exercises the numeric_args (var/stdev) path.
+        assert_eq!(
+            eval(&mut s, "SUBTOTAL(7, A1:A4)"),
+            Some(CellValue::Number { number: 1.0 })
+        );
+        // VAR.S(10): sample variance of {2,3,4} = 1.0 (with the nested 6 it'd be ~2.92).
+        assert_eq!(
+            eval(&mut s, "SUBTOTAL(10, A1:A4)"),
+            Some(CellValue::Number { number: 1.0 })
+        );
+    }
+
+    /// **SUBTOTAL nested-skip × hidden rows compose.** `SUBTOTAL(109)` skips BOTH
+    /// hidden rows AND nested-subtotal cells; `SUBTOTAL(9)` skips only the nested
+    /// subtotal (keeps the hidden row).
+    #[test]
+    fn owning_session_subtotal_nested_skip_with_hidden() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // A1=10, A2=20, A4=40 plain; A3 = SUBTOTAL(9, A1:A2) = 30 (nested).
+        for (row, v) in [(0, 10.0), (1, 20.0), (3, 40.0)] {
+            s.set_value(addr(sheet, row, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_formula(addr(sheet, 2, 0), "SUBTOTAL(9, A1:A2)").unwrap();
+        s.set_formula(addr(sheet, 0, 1), "SUBTOTAL(9, A1:A4)").unwrap();
+        s.set_formula(addr(sheet, 1, 1), "SUBTOTAL(109, A1:A4)").unwrap();
+        let b = |s: &WorkbookSession, row| s.cell(addr(sheet, row, 1)).unwrap().unwrap().value;
+        // All visible: both skip only the nested A3 → 10+20+40 = 70.
+        assert_eq!(b(&s, 0), Some(CellValue::Number { number: 70.0 }));
+        assert_eq!(b(&s, 1), Some(CellValue::Number { number: 70.0 }));
+
+        // Hide row index 1 (A2 = 20). 109 now also drops A2 → 10+40 = 50;
+        // 9 keeps the hidden A2 but still drops the nested A3 → 70.
+        s.set_rows_hidden(sheet, &[1], true).unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            b(&s, 0),
+            Some(CellValue::Number { number: 70.0 }),
+            "SUBTOTAL(9): skip nested A3 only, keep hidden A2"
+        );
+        assert_eq!(
+            b(&s, 1),
+            Some(CellValue::Number { number: 50.0 }),
+            "SUBTOTAL(109): skip nested A3 AND hidden A2"
+        );
+    }
+
+    /// **SUBTOTAL nested-skip is ROOT-NODE, matching IronCalc.** Only a cell whose
+    /// formula's AST ROOT is a `SUBTOTAL(...)` call is skipped. `=SUBTOTAL(..)+0`
+    /// has root `+`, so it is NOT a nested subtotal and is counted normally. (A
+    /// naive "formula text contains SUBTOTAL" check would wrongly skip it.)
+    #[test]
+    fn owning_session_subtotal_nested_skip_is_root_node() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (row, v) in [(0, 10.0), (1, 20.0), (3, 40.0)] {
+            s.set_value(addr(sheet, row, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        // A3 = SUBTOTAL(9, A1:A2)+0 = 30 — root is `+`, NOT a nested subtotal.
+        s.set_formula(addr(sheet, 2, 0), "SUBTOTAL(9, A1:A2)+0").unwrap();
+        s.set_formula(addr(sheet, 0, 1), "SUBTOTAL(9, A1:A4)").unwrap();
+        let b = |s: &WorkbookSession, row| s.cell(addr(sheet, row, 1)).unwrap().unwrap().value;
+        // A3 IS counted → 10+20+30+40 = 100 (not 70).
+        assert_eq!(
+            b(&s, 0),
+            Some(CellValue::Number { number: 100.0 }),
+            "=SUBTOTAL(..)+0 has root `+` → NOT skipped (root-node semantics)"
+        );
+    }
+
+    /// **Nested-skip is SUBTOTAL-only — a plain SUM over the same column is
+    /// untouched** (the materializer's Blank-substitution is name-gated). SUM
+    /// includes the nested-subtotal cell values.
+    #[test]
+    fn owning_session_sum_over_nested_subtotal_column_is_unmasked() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (row, v) in [(0, 10.0), (1, 20.0), (3, 40.0)] {
+            s.set_value(addr(sheet, row, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_formula(addr(sheet, 2, 0), "SUBTOTAL(9, A1:A2)").unwrap(); // A3 = 30
+        s.set_formula(addr(sheet, 0, 1), "SUM(A1:A4)").unwrap();
+        let b = s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value;
+        // SUM does NOT skip subtotals → 10+20+30+40 = 100.
+        assert_eq!(
+            b,
+            Some(CellValue::Number { number: 100.0 }),
+            "plain SUM is not nested-skip-gated → includes the nested subtotal"
+        );
+    }
+
+    /// **SUBTOTAL nested-skip — 2D multi-column range.** Exercises the
+    /// `mask_nested_subtotals` flat-index → (row, col) mapping for BOTH a
+    /// column-0 nested cell (`i % cols == 0`) and a column-1 nested cell
+    /// (`i % cols == 1`), proving the column axis isn't mis-mapped.
+    #[test]
+    fn owning_session_subtotal_nested_skip_multi_column() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // A1=1 B1=2 / A2=<nested col0> B2=20 / A3=100 B3=<nested col1>.
+        for (row, col, v) in [(0, 0, 1.0), (0, 1, 2.0), (1, 1, 20.0), (2, 0, 100.0)] {
+            s.set_value(addr(sheet, row, col), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_formula(addr(sheet, 1, 0), "SUBTOTAL(9, A1:A1)").unwrap(); // A2 = 1  (col 0)
+        s.set_formula(addr(sheet, 2, 1), "SUBTOTAL(9, B1:B2)").unwrap(); // B3 = 22 (col 1)
+        // Grand total over the whole 3×2 block A1:B3. Keep A1,B1,B2,A3 = 1+2+20+100;
+        // skip the two nested cells A2 (col 0) and B3 (col 1). Without skip: 1+2+1+20+100+22 = 146.
+        s.set_formula(addr(sheet, 4, 0), "SUBTOTAL(9, A1:B3)").unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 4, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 123.0 }),
+            "2D range: both the col-0 and col-1 nested subtotals must be skipped"
+        );
+    }
+
+    /// **SUBTOTAL nested-skip — multiple range args.** Masking is applied
+    /// per-range-arg in the materializer; a nested subtotal in the FIRST range is
+    /// skipped while a second (clean) range is summed in full.
+    #[test]
+    fn owning_session_subtotal_nested_skip_multi_range() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (row, col, v) in [(0, 0, 10.0), (1, 0, 20.0), (0, 2, 1.0), (1, 2, 2.0), (2, 2, 3.0)] {
+            s.set_value(addr(sheet, row, col), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_formula(addr(sheet, 2, 0), "SUBTOTAL(9, A1:A2)").unwrap(); // A3 = 30 (nested)
+        // SUBTOTAL(9, A1:A3, C1:C3): (A1+A2, skip A3) + (C1+C2+C3) = 30 + 6 = 36.
+        s.set_formula(addr(sheet, 4, 0), "SUBTOTAL(9, A1:A3, C1:C3)").unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 4, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 36.0 }),
+            "nested subtotal in the first range arg skipped; second range summed in full"
+        );
+    }
+
+    /// **SUBTOTAL nested-skip — structured (table-column) ref arg.** Covers the
+    /// SECOND materializer call site (the `ExprPlan::StructuredRef` arm): a
+    /// `SUBTOTAL` over a table column whose data contains a nested SUBTOTAL cell
+    /// skips that cell, identical to the literal-range path.
+    #[test]
+    fn owning_session_subtotal_nested_skip_structured_ref() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.create_table(TableSpec {
+            name: "T".into(),
+            sheet,
+            top_row: 0,
+            top_col: 0,
+            rows: 4, // header row + 3 data rows
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["Amt".into()],
+        })
+        .unwrap();
+        // Data range A2:A4: A2=10, A3=20, A4=SUBTOTAL(9,A2:A3)=30 (nested, in-column).
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 10.0 })
+            .unwrap();
+        s.set_value(addr(sheet, 2, 0), CellValue::Number { number: 20.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 3, 0), "SUBTOTAL(9, A2:A3)").unwrap();
+        // Grand total over the table column → resolves to data range A2:A4; skip A4.
+        s.set_formula(addr(sheet, 0, 2), "SUBTOTAL(9, T[Amt])").unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 2)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 30.0 }),
+            "structured-ref arm: nested subtotal in the table column is skipped (10+20, not 60)"
+        );
+    }
+
+    /// **SUBTOTAL nested-skip inside a LET body (LocalScopedEnv forwarding).** A
+    /// SUBTOTAL with a DIRECT worksheet range evaluated inside a `LET`/`LAMBDA`
+    /// body still skips nested subtotals — the local-scope env wrapper must forward
+    /// `cell_is_subtotal` to the inner workbook env, else the trait default (false)
+    /// silently disables nested-skip inside LET. (Codex r2 HIGH.)
+    #[test]
+    fn owning_session_subtotal_nested_skip_inside_let() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        for (row, v) in [(0, 10.0), (1, 20.0), (3, 40.0)] {
+            s.set_value(addr(sheet, row, 0), CellValue::Number { number: v })
+                .unwrap();
+        }
+        s.set_formula(addr(sheet, 2, 0), "SUBTOTAL(9, A1:A2)").unwrap(); // A3 = 30 (nested)
+        // The SUBTOTAL's range A1:A4 is a DIRECT worksheet range (provenance present),
+        // evaluated inside a LET body → nested A3 must still be skipped → 0+10+20+40 = 70.
+        // `x` is referenced so the LET binding is unambiguously used.
+        s.set_formula(addr(sheet, 0, 1), "LET(x, 0, x + SUBTOTAL(9, A1:A4))")
+            .unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 70.0 }),
+            "nested-skip must work inside a LET body (LocalScopedEnv forwards cell_is_subtotal)"
+        );
+    }
+
     /// **CROSS-SHEET on the owning session (megaudit L2 closure).** A formula
     /// on Sheet2 that references Sheet1!A3 must, when a row is inserted on
     /// Sheet1, have its TEXT rewritten (Sheet1!A3 → Sheet1!A4) while its own

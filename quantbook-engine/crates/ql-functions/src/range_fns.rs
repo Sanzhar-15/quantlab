@@ -1945,19 +1945,33 @@ pub fn quartile_exc(args: &[FnArg]) -> Value {
 // (Pre-Wave-G2: 101..=111 normalized to 1..=11 with "no hidden-row metadata".)
 //
 // Excel canon also says SUBTOTAL skips NESTED `SUBTOTAL` calls in its
-// arg ranges (the "subtotal of subtotals" double-counting guard). The
-// engine evaluates args before calling the fn, so by the time we see
-// `FnArg::Range`'s values they've already been computed; we cannot
-// detect that a value originated from a nested SUBTOTAL. v1 ships
-// without nested-skip (documented divergence). In practice nested
-// SUBTOTAL skipping only matters with multi-level outline/group views
-// which are not part of v1.
+// arg ranges (the "subtotal of subtotals" double-counting guard), for
+// BOTH the 1..=11 and 101..=111 bands. **Implemented (2026-06-29):** this
+// kernel sees only `FnArg::Range`'s VALUES and cannot detect provenance,
+// so the SKIP happens UPSTREAM — the `ql-exec` materializer
+// (`scalar::mask_nested_subtotals`, gated to SUBTOTAL args) overwrites a
+// nested-SUBTOTAL cell's value with `Value::Blank` before building the
+// `FnArg::Range`. Every reducer here already skips `Blank`, so a blanked
+// nested cell is excluded for every function-num — identical to IronCalc's
+// per-cell `continue`. "Nested SUBTOTAL" = a cell whose formula AST ROOT is
+// a SUBTOTAL call (so `=SUBTOTAL(..)+0` is NOT skipped), via
+// `CellEnv::cell_is_subtotal`.
+//
+// REMAINING minor divergences (both exotic; range-arg parity is full):
+//   (a) a single-cell DIRECT ref arg that is itself a subtotal —
+//       `SUBTOTAL(9, A1)` where A1=`SUBTOTAL(..)` — materializes as a
+//       `FnArg::Scalar` (not a Range), so it is NOT masked; IronCalc skips it.
+//   (b) a LET/LAMBDA array-local arg — `LET(x, A1:A6, SUBTOTAL(9, x))` where
+//       A1:A6 contains a nested subtotal — materializes from the already-computed
+//       array-local (the `ExprPlan::LocalRef` arm), which carries values with no
+//       cell provenance, so the nested cell cannot be detected → not masked.
+// The valuable nested-skip pattern is a direct RANGE spanning subtotal rows,
+// which IS handled.
 //
 // IronCalc reference: `.references/ironcalc/base/src/functions/subtotal.rs`
-// (line-by-line; IronCalc has AST access during evaluation, so it also
-// implements nested-SUBTOTAL skip). The numeric-dispatch shape matches IronCalc
-// exactly; as of Wave G2 row-visibility matches too — only the nested-SUBTOTAL
-// skip still differs (see below). Microsoft docs:
+// (line-by-line; `cell_is_subtotal` checks the parsed-AST root for
+// `Function::Subtotal`). The numeric-dispatch shape, Wave-G2 row-visibility,
+// AND (range-arg) nested-SUBTOTAL skip all match IronCalc. Microsoft docs:
 // support.microsoft.com/en-us/office/subtotal-function-7b027003-f060-4ade-9040-e478765b9939
 //
 // **W5-D-12.1 (binder admission):** SUBTOTAL was added to
@@ -2006,8 +2020,9 @@ pub fn quartile_exc(args: &[FnArg]) -> Value {
 
 /// `SUBTOTAL(function_num, ref1, [ref2], ...)` — conditional aggregate
 /// dispatcher. See module-level W5-D-12 block for the canon discussion.
-/// 101..=111 skip hidden rows (Wave G2); the one remaining divergence is the
-/// nested-SUBTOTAL skip (still unsupported — args are evaluated before dispatch).
+/// 101..=111 skip hidden rows (Wave G2); nested-SUBTOTAL range cells are
+/// skipped via upstream `Value::Blank` substitution in the ql-exec materializer
+/// (2026-06-29) — this kernel just reduces the (already-blanked) values.
 pub fn subtotal(args: &[FnArg]) -> Value {
     if args.len() < 2 {
         return Value::Error(ErrorValue::Value);
@@ -5842,26 +5857,23 @@ mod tests {
 
     #[test]
     fn subtotal_nested_subtotal_value_in_args_not_skipped_engine_divergence() {
-        // **W5-D-13.1 (Phase 4.10 V1-260 megaudit Opus MEDIUM-4 closure):**
-        // pin the documented engine divergence from Excel for nested-
-        // SUBTOTAL handling. Excel canon: outer SUBTOTAL skips any
-        // arg-range cells whose formula is also a SUBTOTAL (the
-        // "subtotal of subtotals" double-counting guard). v1 engine
-        // does NOT have AST access at eval time — by the time
-        // `subtotal()` receives FnArgs, nested-SUBTOTAL values look
-        // identical to ordinary numeric values. So our engine sums
-        // them in.
+        // **W5-D-13.1 (Phase 4.10 V1-260 megaudit Opus MEDIUM-4 closure);
+        // updated 2026-06-29 (nested-skip landed).** Excel canon: outer
+        // SUBTOTAL skips any arg cells whose formula is also a SUBTOTAL
+        // (the "subtotal of subtotals" double-counting guard).
         //
-        // This test pins the engine's behavior: passing a scalar value
-        // that simulates the result of a nested SUBTOTAL (here just a
-        // plain `3` representing `SUBTOTAL(9, 1, 2)` = 3) is treated
-        // as a regular numeric value and summed. A future refactor
-        // that walks ExprPlan to detect nested-SUBTOTAL calls (a path
-        // toward Excel parity) would break this test, which is the
-        // signal we want.
+        // Nested-skip for RANGE args now happens UPSTREAM in the ql-exec
+        // materializer (`scalar::mask_nested_subtotals` blanks AST-root
+        // SUBTOTAL cells before this kernel runs), NOT in `subtotal()`
+        // itself. This kernel still sees only flat VALUES, so a SCALAR arg
+        // is never skipped — pinned here. This is exactly the documented
+        // residual (a): a single-cell / direct SCALAR ref arg to a subtotal
+        // (`SUBTOTAL(9, A1)` where A1=`SUBTOTAL(..)`) is NOT skipped, unlike
+        // a RANGE arg. The pre-computed scalar `3` simulates that case.
         //
-        // Test data: outer = SUBTOTAL(9, [pre-computed inner sum=3], 4)
-        // → 7. Excel: outer would skip the inner-SUBTOTAL result → 4.
+        // Test data: outer = SUBTOTAL(9, [scalar value 3], 4) → 7. (A RANGE
+        // arg containing a nested subtotal IS skipped — see the
+        // `owning_session_subtotal_nested_skip_*` tests in ql-exec.)
         let pre_computed_inner_sum = n(3.0);
         let other_data = n(4.0);
         assert_eq!(
