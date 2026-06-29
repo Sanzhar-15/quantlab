@@ -36,7 +36,7 @@ use ql_session::session::FunctionImplHandle;
 use ql_types::{ArrayValue, EvalContext, Value};
 
 use crate::context_aware_fns::ContextAwareFn;
-use crate::range_aware_fns::RangeAwareFn;
+use crate::range_aware_fns::{RangeAndContextAwareFn, RangeAwareFn};
 use crate::reference_aware_fns::{ArgContract, ReferenceAwareFn};
 use crate::{
     date_fns, distribution_fns, financial_fns, format, range_fns, reference_fns, scalar_fns,
@@ -189,6 +189,14 @@ pub enum RegisteredFn {
     /// `docs/architecture/2026-05-17-reference-tier-design.md` for the
     /// design rationale.
     ReferenceAware(ReferenceAwareFn, ArgContract),
+    /// **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):** range + context
+    /// aware: `fn(&[FnArg], &EvalContext) -> Value`. Used by `NETWORKDAYS` /
+    /// `WORKDAY`, whose optional `holidays` arg is a RANGE of dates but whose
+    /// result depends on the workbook date system. The dispatcher builds
+    /// `Vec<FnArg>` (like the range-aware tier) AND passes the `EvalContext`
+    /// (like the context-aware tier). See [`RangeAndContextAwareFn`] for why
+    /// these are NOT registered through the array-spilling `Unified` tier.
+    RangeAndContextAware(RangeAndContextAwareFn),
 }
 
 /// Phase 0 function registry. Built by `default_registry()` with the
@@ -620,6 +628,24 @@ impl FunctionRegistry {
         );
     }
 
+    /// **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):** register a
+    /// range-AND-context-aware function. Receives `&[FnArg]` (per-arg range
+    /// shape) AND `&EvalContext` (date_system + locale). Stored internally as
+    /// `RegisteredFn::RangeAndContextAware(f)`. Same canonical-uppercase
+    /// requirement + duplicate panic as `register`. Used by NETWORKDAYS /
+    /// WORKDAY (holidays-range arg).
+    pub fn register_range_and_context_aware(
+        &mut self,
+        name: &'static str,
+        f: RangeAndContextAwareFn,
+    ) {
+        self.insert_or_panic(
+            name,
+            RegisteredFn::RangeAndContextAware(f),
+            "FunctionRegistry::register_range_and_context_aware",
+        );
+    }
+
     /// **W5-69 (Phase 4.5.A.0):** register a context-aware function. These
     /// receive `&EvalContext` (date_system + locale + now_provider) in
     /// addition to the standard `&[Value]` args. Stored internally as
@@ -693,6 +719,19 @@ impl FunctionRegistry {
         }
     }
 
+    /// **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):** case-insensitive
+    /// lookup, returning the range-AND-context-aware fn iff registered as
+    /// `RegisteredFn::RangeAndContextAware(_)`. The eval-site dispatch reaches
+    /// it via `lookup_any` + a `match` on `RegisteredFn`; this filter view
+    /// mirrors the other tiers for test/coverage parity.
+    pub fn lookup_range_and_context_aware(&self, name: &str) -> Option<RangeAndContextAwareFn> {
+        let upper = name.to_ascii_uppercase();
+        match self.fns.get(upper.as_str()) {
+            Some(RegisteredFn::RangeAndContextAware(f)) => Some(*f),
+            _ => None,
+        }
+    }
+
     /// **W5-69 (Phase 4.5.A.0):** case-insensitive lookup, returning the
     /// context-aware fn iff registered as `RegisteredFn::ContextAware(_)`.
     /// Callers should check this AFTER `lookup_range_aware` but BEFORE
@@ -762,6 +801,17 @@ impl FunctionRegistry {
         self.fns
             .iter()
             .filter(|(_, v)| matches!(v, RegisteredFn::RangeAware(_)))
+            .map(|(k, _)| k)
+    }
+
+    /// **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):** names registered as
+    /// `RegisteredFn::RangeAndContextAware(_)`. Mirrors the other tier
+    /// iterators for coverage/census walks. **Ordering is UNSTABLE** (see
+    /// [`Self::names`]).
+    pub fn range_and_context_aware_names(&self) -> impl Iterator<Item = &&'static str> + '_ {
+        self.fns
+            .iter()
+            .filter(|(_, v)| matches!(v, RegisteredFn::RangeAndContextAware(_)))
             .map(|(k, _)| k)
     }
 
@@ -1080,13 +1130,20 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_context_aware("EDATE", date_fns::edate_ctx);
 
     // **W5-74 (Phase 4.5.B wave 3, CLOSES V1 wave 18/18):** business-date
-    // + finance basics — all four are ContextAwareFn. DAYS is context-aware
-    // so its text date args are DATEVALUE-coerced under the workbook date
-    // system (closes GAP-F-08). Holidays arg unsupported in V1 (see
-    // GAP-F-09, GAP-F-10) — 3-arg NETWORKDAYS/WORKDAY returns #VALUE!.
+    // + finance basics. DAYS/YEARFRAC are ContextAwareFn; DAYS is
+    // context-aware so its text date args are DATEVALUE-coerced under the
+    // workbook date system (closes GAP-F-08).
+    //
+    // **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):** NETWORKDAYS /
+    // WORKDAY now register through the range-AND-context-aware tier so their
+    // optional 3rd `holidays` arg (a RANGE of dates) is materialized with
+    // shape, while the result still depends on the workbook date system. The
+    // 2-arg form is byte-identical to before. Both also carry
+    // `ArgContext::Aggregate` (binder admission for the range arg) — see the
+    // Phase-1.5 override list below.
     r.register_context_aware("DAYS", date_fns::days_ctx);
-    r.register_context_aware("NETWORKDAYS", date_fns::networkdays_ctx);
-    r.register_context_aware("WORKDAY", date_fns::workday_ctx);
+    r.register_range_and_context_aware("NETWORKDAYS", date_fns::networkdays_range_ctx);
+    r.register_range_and_context_aware("WORKDAY", date_fns::workday_range_ctx);
     r.register_context_aware("YEARFRAC", date_fns::yearfrac_ctx);
 
     // **W5-75 (Phase 4.5.C V2 wave, 4 of 6):** date-arithmetic V2 fns.
@@ -1688,6 +1745,15 @@ fn register_builtin_metadata(r: &mut FunctionRegistry) {
         "MAX_DRAWDOWN",
         "VOLATILITY",
         "SORTINO",
+        // **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):** NETWORKDAYS /
+        // WORKDAY accept a RANGE of holiday dates as their optional 3rd arg.
+        // They dispatch through the range-AND-context-aware tier, but
+        // ArgContext is orthogonal to the dispatch tier — the binder must
+        // route their holiday range under `AggregateArg` (else `D1:D5` binds
+        // as a scalar and the holiday arg is lost). Postdate the pre-6.4-1
+        // whitelist; pinned in the `post_6_4_1_aggregate_additions` allowlist.
+        "NETWORKDAYS",
+        "WORKDAY",
     ] {
         // Some of these names overlap Phase-1 overrides (none currently —
         // Phase 1 covers NOW/TODAY/RAND/RANDBETWEEN/RANDARRAY +
@@ -3011,6 +3077,14 @@ mod tests {
             "SCAN",
             "BYROW",
             "BYCOL",
+            // **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):** NETWORKDAYS
+            // / WORKDAY accept a holiday RANGE arg, so they are legitimately
+            // Aggregate (binder admission). They dispatch through the new
+            // range-AND-context-aware tier, not range-aware. Postdate the
+            // pre-6.4-1 byte-for-byte whitelist; pinned here so a typo'd
+            // Aggregate entry still fails loudly.
+            "NETWORKDAYS",
+            "WORKDAY",
         ];
         let mut allowed: std::collections::HashSet<&str> =
             pre_6_4_1_aggregate_whitelist.iter().copied().collect();
@@ -3027,6 +3101,52 @@ mod tests {
                     m.canonical_name,
                 );
             }
+        }
+    }
+
+    /// **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):** NETWORKDAYS /
+    /// WORKDAY register through the range-AND-context-aware tier ONLY (so the
+    /// holiday range arg is materialized with shape AND the date system is
+    /// visible), and carry `ArgContext::Aggregate` (binder admission). They
+    /// must NOT also appear in any other dispatch tier (disjointness — a name
+    /// maps to exactly one `RegisteredFn`).
+    #[test]
+    fn networkdays_workday_are_range_and_context_aware_only_and_aggregate() {
+        let r = default_registry();
+        for name in ["NETWORKDAYS", "WORKDAY"] {
+            assert!(
+                r.lookup_range_and_context_aware(name).is_some(),
+                "{name} must be in the range-AND-context-aware dispatch table",
+            );
+            // Case-insensitive resolution (the lexer upper-cases, but the
+            // lookup must be robust regardless).
+            assert!(
+                r.lookup_range_and_context_aware(&name.to_ascii_lowercase())
+                    .is_some(),
+                "{name} lookup must be case-insensitive",
+            );
+            assert_eq!(
+                r.metadata(name).map(|m| m.arg_context),
+                Some(ArgContext::Aggregate),
+                "{name} must carry ArgContext::Aggregate (binder admits the holiday range)",
+            );
+            // Disjoint from every OTHER tier.
+            assert!(
+                r.lookup(name).is_none(),
+                "{name} is range-and-context-aware ONLY; must not be in the scalar table",
+            );
+            assert!(
+                r.lookup_range_aware(name).is_none(),
+                "{name} must not be in the range-aware table",
+            );
+            assert!(
+                r.lookup_context_aware(name).is_none(),
+                "{name} moved off the context-aware tier; must not be in it",
+            );
+            assert!(
+                r.lookup_unified(name).is_none(),
+                "{name} is scalar-returning; must not be in the array-spilling unified table",
+            );
         }
     }
 

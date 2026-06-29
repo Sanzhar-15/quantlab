@@ -669,11 +669,13 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
     ("DAYS", "W5-74; covered by date_fns::tests_wave3"),
     (
         "NETWORKDAYS",
-        "W5-74; V1 no-holidays — GAP-F-09 pinned by tests_wave3",
+        "W5-74; holidays arg supported (GAP-F-09 CLOSED, range-and-context tier) — \
+         covered by date_fns::tests_wave3 + ql-exec owning_session e2e",
     ),
     (
         "WORKDAY",
-        "W5-74; V1 no-holidays — GAP-F-10 pinned by tests_wave3",
+        "W5-74; holidays arg supported (GAP-F-10 CLOSED, range-and-context tier) — \
+         covered by date_fns::tests_wave3 + ql-exec owning_session e2e",
     ),
     (
         "YEARFRAC",

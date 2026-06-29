@@ -183,3 +183,20 @@ impl FnArg {
 /// constructs the arg list with the correct `FnArg` variant per
 /// position before dispatching.
 pub type RangeAwareFn = fn(&[FnArg]) -> Value;
+
+/// **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):** signature for the
+/// fourth dispatch tier — functions that need BOTH per-arg range shape
+/// (`&[FnArg]`, like [`RangeAwareFn`]) AND the workbook `EvalContext`
+/// (date_system / locale, like `ContextAwareFn`). The motivating callers are
+/// `NETWORKDAYS` / `WORKDAY`, whose optional `holidays` arg is a RANGE of
+/// dates while their result still depends on the workbook date system.
+///
+/// **Why not the `Unified` tier** (`fn(&[FunctionArg], &FunctionContext) ->
+/// FunctionReturn`, a strict superset that also carries range + context):
+/// these functions return a SCALAR and must stay on the scalar dispatch path.
+/// The `Unified` tier is special-cased at the cell boundary
+/// (`ql-exec::scalar::eval_at_cell_boundary`) for ARRAY-spill detection;
+/// routing a non-spilling scalar fn through it is a semantic mismatch and a
+/// latent footgun. This tier returns a plain `Value`, exactly like the legacy
+/// scalar / range-aware / context-aware tiers.
+pub type RangeAndContextAwareFn = fn(&[FnArg], &ql_types::EvalContext) -> Value;

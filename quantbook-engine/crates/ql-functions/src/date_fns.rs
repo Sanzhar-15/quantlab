@@ -8,10 +8,14 @@
 //! The remaining 10 (DATEVALUE, TIMEVALUE, WEEKDAY, EOMONTH, EDATE,
 //! DAYS, NETWORKDAYS, WORKDAY, YEARFRAC) land in W5-73/W5-74.
 
+use std::collections::HashSet;
+
 use ql_types::{
     coercion, days_in_month, hms_to_fraction, is_leap_year, serial_to_ymd, unix_days_to_ymd,
     ymd_to_serial, ymd_to_unix_days, DateSystem, ErrorValue, EvalContext, Value,
 };
+
+use crate::range_aware_fns::FnArg;
 
 // ============================================================================
 // Internal helpers
@@ -689,34 +693,129 @@ fn is_working_day(serial_int: i64, system: DateSystem) -> bool {
     (1..=5).contains(&dow_sun_zero)
 }
 
-/// **`NETWORKDAYS(start_date, end_date)`** — number of working days
-/// (Mon–Fri) between two serials, inclusive of both endpoints. Negative
-/// count when end < start.
+/// **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):** coerce one holiday
+/// cell value to an integer Excel serial day, or `None` for a BLANK cell.
 ///
-/// **V1 divergence (GAP-F-09):** the optional 3rd `holidays` arg is NOT
-/// supported in V1 — the function tier (`ContextAwareFn`) can't see
-/// range args. Calling with 3 args returns `#VALUE!`. Holidays-aware
-/// version (and NETWORKDAYS.INTL with weekend mask) lands when the
-/// 4th registry tier `RangeAndContextAwareFn` is built (Phase 4.5.C or
-/// later — see W5-68 design § 4.A trade-off note).
-pub fn networkdays_ctx(args: &[Value], ctx: &EvalContext) -> Value {
-    if args.len() != 2 {
-        // 3-arg form (with holidays) explicitly rejected as V1 divergence.
+/// A blank holiday cell is "no holiday" — NOT serial-0. Coercing blank → 0
+/// would wrongly mark serial 0 (which is `1904-01-01`, a Friday/working day,
+/// in the 1904 date system) as a holiday. Number / boolean coerce via
+/// [`to_serial_arg`] (TEXT → `#VALUE!`; an error value propagates). The serial
+/// is truncated toward zero to a whole day; the saturating `as i64` keeps a
+/// huge serial finite — it simply never falls inside a (bounded) [start,end]
+/// window, so a holiday drives NO loop (no DoS) and needs no range check.
+fn holiday_serial(v: &Value) -> Result<Option<i64>, ErrorValue> {
+    if matches!(v, Value::Blank) {
+        return Ok(None);
+    }
+    let s = to_serial_arg(v)?;
+    Ok(Some(s.trunc() as i64))
+}
+
+/// **W5-74 holiday tier:** collect the dedup'd set of holiday serials from the
+/// optional 3rd arg of NETWORKDAYS / WORKDAY. Accepts a single scalar holiday
+/// OR a (named / literal / structured) range; blank cells are skipped. The
+/// FIRST non-coercible value (text / error) surfaces its error verbatim
+/// (Excel: a bad holiday → that error) — no silent drop, consistent with the
+/// engine's No-Fallbacks rule.
+fn collect_holidays(arg: &FnArg) -> Result<HashSet<i64>, ErrorValue> {
+    let mut set = HashSet::new();
+    match arg {
+        FnArg::Scalar(v) => {
+            if let Some(d) = holiday_serial(v)? {
+                set.insert(d);
+            }
+        }
+        FnArg::Range { values, .. } => {
+            for v in values {
+                if let Some(d) = holiday_serial(v)? {
+                    set.insert(d);
+                }
+            }
+        }
+    }
+    Ok(set)
+}
+
+/// **W5-74 holiday tier:** extract the inner scalar `Value` from a positional
+/// date / count arg (start / end / days).
+///
+/// A **single-cell (1×1) range** is unwrapped to its one value — Excel's
+/// standard single-cell-range-as-scalar coercion. This is REQUIRED, not a
+/// nicety: NETWORKDAYS/WORKDAY carry `ArgContext::Aggregate`, so a `[@Col]`
+/// structured ref (which narrows to one cell) and a literal `A1:A1` now bind
+/// as a range and reach the dispatcher as a 1×1 `FnArg::Range`. Without this
+/// unwrap, a 2-arg table formula `NETWORKDAYS([@Start], [@End])` would regress
+/// to `#VALUE!` (it scalar-evaluated correctly under the old context-aware
+/// tier).
+///
+/// A **multi-cell** range (e.g. `NETWORKDAYS(A1:A2, B1)`) is still rejected
+/// LOUDLY with `#VALUE!` — the engine does NOT implicitly intersect (mirrors
+/// the *IF* family's range-in-scalar-slot handling). Only the holidays slot
+/// accepts a multi-cell range (via [`collect_holidays`]).
+fn fnarg_scalar(arg: &FnArg) -> Result<&Value, ErrorValue> {
+    match arg {
+        FnArg::Scalar(v) => Ok(v),
+        // 1×1 range → its single cell (single-cell-range-as-scalar). The shape
+        // invariant guarantees `values.len() == rows * cols == 1`, but use
+        // `first()` so a malformed range surfaces `#VALUE!` rather than panic.
+        FnArg::Range {
+            values,
+            rows: 1,
+            cols: 1,
+            ..
+        } => values.first().ok_or(ErrorValue::Value),
+        FnArg::Range { .. } => Err(ErrorValue::Value),
+    }
+}
+
+/// **`NETWORKDAYS(start_date, end_date, [holidays])`** — number of working
+/// days (Mon–Fri) between two serials, inclusive of both endpoints, EXCLUDING
+/// any day listed in the optional `holidays` range. Negative count when
+/// end < start.
+///
+/// **W5-74 holiday tier (closes GAP-F-09):** the optional 3rd `holidays` arg
+/// (a range or scalar of dates) is now supported via the range-AND-context-
+/// aware dispatch tier. A holiday that falls on a working day within
+/// [start,end] is subtracted exactly once (dedup'd via a `HashSet`); holidays
+/// on a weekend or outside the window have no effect. Blank holiday cells are
+/// skipped; a text holiday → `#VALUE!`; an error holiday propagates. The
+/// 2-arg form is byte-identical to the pre-holiday implementation (an empty
+/// holiday set never excludes a day).
+///
+/// **Residuals (documented, exotic):** a holiday serial outside the legal
+/// Excel range is ignored (it can never lie inside the bounded [start,end]
+/// window) rather than `#NUM!`; a LET-local holiday ARRAY arg OR an inline
+/// array constant `{DATE(2024,1,3)}` in the holiday slot materializes as a
+/// scalar `#CALC!` (the same W5-100 array-as-range-arg gap the range-aware
+/// tier has — literal / named / structured-ref ranges all work). NETWORKDAYS.INTL
+/// (weekend mask) remains unregistered — a separate feature.
+pub fn networkdays_range_ctx(args: &[FnArg], ctx: &EvalContext) -> Value {
+    if args.len() < 2 || args.len() > 3 {
         return Value::Error(ErrorValue::Value);
     }
-    let start = match to_serial_arg(&args[0]) {
+    let start = match fnarg_scalar(&args[0]).and_then(to_serial_arg) {
         Ok(s) => s,
         Err(e) => return Value::Error(e),
     };
-    let end = match to_serial_arg(&args[1]) {
+    let end = match fnarg_scalar(&args[1]).and_then(to_serial_arg) {
         Ok(s) => s,
         Err(e) => return Value::Error(e),
+    };
+    let holidays = if args.len() == 3 {
+        match collect_holidays(&args[2]) {
+            Ok(h) => h,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        HashSet::new()
     };
     let start_int = start.trunc() as i64;
     let end_int = end.trunc() as i64;
     // **W5-76 (Phase 4.5 mega-audit MEDIUM, serial-0 policy):** reject
     // Excel1900 serial 0 (the "1/0/1900" formatter oddity) at the
-    // endpoints. Mirrors WEEKDAY / YEAR / MONTH / DAY contract.
+    // endpoints. Mirrors WEEKDAY / YEAR / MONTH / DAY contract. (Holidays
+    // are NOT subject to this — a blank holiday is already skipped, and a
+    // serial-0 holiday simply never lies inside a valid endpoint window.)
     if matches!(ctx.date_system, DateSystem::Excel1900) && (start_int == 0 || end_int == 0) {
         return Value::Error(ErrorValue::Num);
     }
@@ -737,30 +836,54 @@ pub fn networkdays_ctx(args: &[Value], ctx: &EvalContext) -> Value {
     };
     let mut working = 0i64;
     for s in lo..=hi {
-        if is_working_day(s, ctx.date_system) {
+        if is_working_day(s, ctx.date_system) && !holidays.contains(&s) {
             working += 1;
         }
     }
     Value::Number((working * sign) as f64)
 }
 
-/// **`WORKDAY(start_date, days)`** — return the serial that is `days`
-/// working days (Mon–Fri) after `start_date` (or before, if `days < 0`).
+/// Back-compat scalar entry for [`networkdays_range_ctx`]. Wraps each value as
+/// `FnArg::Scalar` and delegates — used by the public API + the unit tests
+/// that pass `&[Value]`. The REGISTERED function is `networkdays_range_ctx`
+/// (it additionally accepts a holiday RANGE arg); a single scalar holiday
+/// passed here works, but a holiday RANGE only reaches eval through the
+/// registered range-aware dispatch.
+pub fn networkdays_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    let fn_args: Vec<FnArg> = args.iter().cloned().map(FnArg::Scalar).collect();
+    networkdays_range_ctx(&fn_args, ctx)
+}
+
+/// **`WORKDAY(start_date, days, [holidays])`** — return the serial that is
+/// `days` working days (Mon–Fri) after `start_date` (or before, if
+/// `days < 0`), skipping any day listed in the optional `holidays` range
+/// exactly as it skips weekends.
 ///
-/// **V1 divergence (GAP-F-10):** optional 3rd `holidays` arg not
-/// supported (same reason as NETWORKDAYS). 3-arg call returns
-/// `#VALUE!`. WORKDAY.INTL waits for tier-4 plus weekend-mask support.
-pub fn workday_ctx(args: &[Value], ctx: &EvalContext) -> Value {
-    if args.len() != 2 {
+/// **W5-74 holiday tier (closes GAP-F-10):** the optional 3rd `holidays` arg
+/// is now supported (same coercion rules as NETWORKDAYS — blank skipped, text
+/// → `#VALUE!`, error propagates). `WORKDAY(start, 0, ...)` returns `start`
+/// unchanged regardless of holidays (Excel: 0 days never moves). The 2-arg
+/// form is byte-identical to the pre-holiday implementation. WORKDAY.INTL
+/// (weekend mask) remains unregistered — a separate feature.
+pub fn workday_range_ctx(args: &[FnArg], ctx: &EvalContext) -> Value {
+    if args.len() < 2 || args.len() > 3 {
         return Value::Error(ErrorValue::Value);
     }
-    let start = match to_serial_arg(&args[0]) {
+    let start = match fnarg_scalar(&args[0]).and_then(to_serial_arg) {
         Ok(s) => s,
         Err(e) => return Value::Error(e),
     };
-    let days = match to_int_date_arg(&args[1]) {
+    let days = match fnarg_scalar(&args[1]).and_then(to_int_date_arg) {
         Ok(n) => n,
         Err(e) => return Value::Error(e),
+    };
+    let holidays = if args.len() == 3 {
+        match collect_holidays(&args[2]) {
+            Ok(h) => h,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        HashSet::new()
     };
     let mut cur = start.trunc() as i64;
     // **W5-76 (Phase 4.5 mega-audit MEDIUM, serial-0 policy):** reject
@@ -781,7 +904,14 @@ pub fn workday_ctx(args: &[Value], ctx: &EvalContext) -> Value {
         return Value::Number(cur as f64);
     }
     let step: i64 = if days > 0 { 1 } else { -1 };
-    let mut remaining = days.abs();
+    // `unsigned_abs()` not `abs()`: a huge-magnitude `days` arg (e.g. text/
+    // number coercing to `i64::MIN` via the saturating `as i64` cast in
+    // `to_int_date_arg`) would panic on `i64::MIN.abs()` in debug / wrap to a
+    // negative in release (a pre-W5-74 latent bug in `workday_ctx`). u64 abs
+    // never overflows; the serial-bound checks below still return `#NUM!` for
+    // an out-of-range `days` (cur walks off `[0, MAX]` within a few steps),
+    // preserving the RecomputeFailure-not-panic contract.
+    let mut remaining: u64 = days.unsigned_abs();
     while remaining > 0 {
         cur += step;
         if cur < 0 {
@@ -790,11 +920,19 @@ pub fn workday_ctx(args: &[Value], ctx: &EvalContext) -> Value {
         if cur > ql_types::MAX_EXCEL_SERIAL_DAY {
             return Value::Error(ErrorValue::Num);
         }
-        if is_working_day(cur, ctx.date_system) {
+        if is_working_day(cur, ctx.date_system) && !holidays.contains(&cur) {
             remaining -= 1;
         }
     }
     Value::Number(cur as f64)
+}
+
+/// Back-compat scalar entry for [`workday_range_ctx`]. Wraps each value as
+/// `FnArg::Scalar` and delegates — used by the public API + the unit tests
+/// that pass `&[Value]`. The REGISTERED function is `workday_range_ctx`.
+pub fn workday_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    let fn_args: Vec<FnArg> = args.iter().cloned().map(FnArg::Scalar).collect();
+    workday_range_ctx(&fn_args, ctx)
 }
 
 /// **`YEARFRAC(start, end, [basis])`** — fractional years between two
@@ -1713,13 +1851,223 @@ mod tests_wave3 {
         assert_eq!(networkdays_ctx(&[start, end], &ctx_1900()), n(-5.0));
     }
 
+    // ===== NETWORKDAYS holidays (W5-74 holiday tier — closes GAP-F-09) =====
+
     #[test]
-    fn networkdays_with_holidays_arg_is_value_error_v1_divergence() {
-        // GAP-F-09: 3-arg form not supported in V1.
+    fn networkdays_negative_with_holiday() {
+        // **Lane A interaction guard.** Reversed-direction window (end < start)
+        // AND a holiday inside it: holidays subtract from the MAGNITUDE, then
+        // the sign is applied. NETWORKDAYS(Fri 01-05, Mon 01-01, Wed 01-03) =
+        // -(5 working days - 1 holiday) = -4. Catches any future regression in
+        // the lo/hi/sign vs holiday-exclusion interaction.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let hol = date_ctx(&[n(2024.0), n(1.0), n(3.0)], &ctx_1900());
+        assert_eq!(networkdays_ctx(&[start, end, hol], &ctx_1900()), n(-4.0));
+    }
+
+    #[test]
+    fn networkdays_subtracts_holiday_in_range() {
+        // 2024-01-01 (Mon) .. 2024-01-05 (Fri) = 5 working days; one holiday
+        // on 2024-01-03 (Wed) → 4. Tested via BOTH the range materialization
+        // (production path) and the single-scalar-holiday shim.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        let hol = date_ctx(&[n(2024.0), n(1.0), n(3.0)], &ctx_1900());
+        assert_eq!(
+            networkdays_range_ctx(
+                &[
+                    FnArg::Scalar(start.clone()),
+                    FnArg::Scalar(end.clone()),
+                    FnArg::range_1d(vec![hol.clone()]),
+                ],
+                &ctx_1900()
+            ),
+            n(4.0)
+        );
+        assert_eq!(networkdays_ctx(&[start, end, hol], &ctx_1900()), n(4.0));
+    }
+
+    #[test]
+    fn networkdays_holiday_on_weekend_no_effect() {
+        // Holiday 2024-01-06 (Sat) is not a working day → no effect.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        let sat = date_ctx(&[n(2024.0), n(1.0), n(6.0)], &ctx_1900());
+        assert_eq!(networkdays_ctx(&[start, end, sat], &ctx_1900()), n(5.0));
+    }
+
+    #[test]
+    fn networkdays_holiday_outside_window_no_effect() {
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        let outside = date_ctx(&[n(2024.0), n(2.0), n(1.0)], &ctx_1900());
+        assert_eq!(networkdays_ctx(&[start, end, outside], &ctx_1900()), n(5.0));
+    }
+
+    #[test]
+    fn networkdays_duplicate_holidays_counted_once() {
+        // Two cells both 2024-01-03 → only one working day removed (dedup).
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        let h = date_ctx(&[n(2024.0), n(1.0), n(3.0)], &ctx_1900());
+        assert_eq!(
+            networkdays_range_ctx(
+                &[
+                    FnArg::Scalar(start),
+                    FnArg::Scalar(end),
+                    FnArg::range_1d(vec![h.clone(), h]),
+                ],
+                &ctx_1900()
+            ),
+            n(4.0)
+        );
+    }
+
+    #[test]
+    fn networkdays_blank_holiday_cells_skipped() {
+        // A holidays range padded with blanks (common when the column is
+        // over-sized): blanks are NOT serial-0 holidays.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        let h = date_ctx(&[n(2024.0), n(1.0), n(3.0)], &ctx_1900());
+        assert_eq!(
+            networkdays_range_ctx(
+                &[
+                    FnArg::Scalar(start),
+                    FnArg::Scalar(end),
+                    FnArg::range_1d(vec![Value::Blank, h, Value::Blank]),
+                ],
+                &ctx_1900()
+            ),
+            n(4.0)
+        );
+    }
+
+    #[test]
+    fn networkdays_blank_vs_explicit_serial_zero_holiday_in_1904() {
+        // Discriminator proving blank != serial-0. In the 1904 system serial 0
+        // is 1904-01-01 (a Friday/working day), so NETWORKDAYS(0,0) = 1.
+        // A BLANK holiday is skipped → still 1; an EXPLICIT serial-0 holiday
+        // (Number 0) removes that working day → 0.
+        assert_eq!(
+            networkdays_range_ctx(
+                &[
+                    FnArg::Scalar(n(0.0)),
+                    FnArg::Scalar(n(0.0)),
+                    FnArg::range_1d(vec![Value::Blank]),
+                ],
+                &ctx_1904()
+            ),
+            n(1.0),
+            "blank holiday must NOT be treated as serial-0"
+        );
+        assert_eq!(
+            networkdays_range_ctx(
+                &[
+                    FnArg::Scalar(n(0.0)),
+                    FnArg::Scalar(n(0.0)),
+                    FnArg::range_1d(vec![n(0.0)]),
+                ],
+                &ctx_1904()
+            ),
+            n(0.0),
+            "explicit serial-0 holiday must remove 1904-01-01"
+        );
+    }
+
+    #[test]
+    fn networkdays_text_holiday_is_value_error() {
         let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
         let end = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
         assert_eq!(
-            networkdays_ctx(&[start, end, n(0.0)], &ctx_1900()),
+            networkdays_range_ctx(
+                &[
+                    FnArg::Scalar(start),
+                    FnArg::Scalar(end),
+                    FnArg::range_1d(vec![Value::text("nope")]),
+                ],
+                &ctx_1900()
+            ),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn networkdays_error_holiday_propagates() {
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        assert_eq!(
+            networkdays_range_ctx(
+                &[
+                    FnArg::Scalar(start),
+                    FnArg::Scalar(end),
+                    FnArg::range_1d(vec![Value::Error(ErrorValue::DivZero)]),
+                ],
+                &ctx_1900()
+            ),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn networkdays_multi_cell_range_in_date_slot_is_value_error() {
+        // A MULTI-cell range in the start slot is rejected (#VALUE!) — no
+        // implicit intersection. (A 1×1 range IS accepted — see
+        // `networkdays_single_cell_range_date_args_unwrap`.) Only the holidays
+        // slot accepts a multi-cell range.
+        let end = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        assert_eq!(
+            networkdays_range_ctx(
+                &[FnArg::range_1d(vec![n(1.0), n(2.0)]), FnArg::Scalar(end)],
+                &ctx_1900()
+            ),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn networkdays_single_cell_range_date_args_unwrap() {
+        // **Codex r1 HIGH regression guard.** Because NETWORKDAYS now carries
+        // `ArgContext::Aggregate`, a `[@Col]` structured ref (narrows to one
+        // cell) and a literal `A1:A1` reach the dispatcher as a 1×1
+        // `FnArg::Range`. `fnarg_scalar` must UNWRAP a 1×1 range to its value,
+        // else `NETWORKDAYS([@Start], [@End])` regresses to #VALUE! (it worked
+        // under the old context-aware tier). `range_1d(vec![v])` is rows=1,
+        // cols=1 — exactly the StructuredRef-narrowed materialization.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        assert_eq!(
+            networkdays_range_ctx(
+                &[FnArg::range_1d(vec![start]), FnArg::range_1d(vec![end])],
+                &ctx_1900()
+            ),
+            n(5.0),
+            "1×1 range in date slots must unwrap to the cell value (not #VALUE!)"
+        );
+    }
+
+    #[test]
+    fn networkdays_two_arg_via_fnarg_unchanged() {
+        // 2-arg form through the FnArg path is byte-identical (empty holiday
+        // set never excludes a day).
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        assert_eq!(
+            networkdays_range_ctx(&[FnArg::Scalar(start), FnArg::Scalar(end)], &ctx_1900()),
+            n(5.0)
+        );
+    }
+
+    #[test]
+    fn networkdays_arity_rejected() {
+        let s = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(
+            networkdays_ctx(&[s.clone()], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            networkdays_ctx(&[s.clone(), s.clone(), s.clone(), s], &ctx_1900()),
             Value::Error(ErrorValue::Value)
         );
     }
@@ -1756,12 +2104,175 @@ mod tests_wave3 {
         assert_eq!(workday_ctx(&[start.clone(), n(0.0)], &ctx_1900()), start);
     }
 
+    // ===== WORKDAY holidays (W5-74 holiday tier — closes GAP-F-10) =====
+
     #[test]
-    fn workday_with_holidays_arg_is_value_error_v1_divergence() {
-        // GAP-F-10: 3-arg form not supported.
+    fn workday_skips_holiday() {
+        // 2024-01-01 (Mon) + 1 working day = 2024-01-02 (Tue); with 01-02 a
+        // holiday, the next working day is 2024-01-03 (Wed). Tested via the
+        // range path AND the single-scalar-holiday shim.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let hol = date_ctx(&[n(2024.0), n(1.0), n(2.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(1.0), n(3.0)], &ctx_1900());
+        assert_eq!(
+            workday_range_ctx(
+                &[
+                    FnArg::Scalar(start.clone()),
+                    FnArg::Scalar(n(1.0)),
+                    FnArg::range_1d(vec![hol.clone()]),
+                ],
+                &ctx_1900()
+            ),
+            expected.clone()
+        );
+        assert_eq!(workday_ctx(&[start, n(1.0), hol], &ctx_1900()), expected);
+    }
+
+    #[test]
+    fn workday_skips_holiday_and_weekend() {
+        // 2024-01-05 (Fri) + 1 working day = Mon 01-08; if 01-08 is a holiday
+        // → Tue 01-09 (both the weekend and the holiday are skipped).
+        let start = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        let hol = date_ctx(&[n(2024.0), n(1.0), n(8.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(1.0), n(9.0)], &ctx_1900());
+        assert_eq!(
+            workday_range_ctx(
+                &[
+                    FnArg::Scalar(start),
+                    FnArg::Scalar(n(1.0)),
+                    FnArg::range_1d(vec![hol]),
+                ],
+                &ctx_1900()
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn workday_backward_skips_holiday() {
+        // 2024-01-08 (Mon) - 1 working day = Fri 01-05; if 01-05 is a holiday
+        // → Thu 01-04.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(8.0)], &ctx_1900());
+        let hol = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(1.0), n(4.0)], &ctx_1900());
+        assert_eq!(
+            workday_range_ctx(
+                &[
+                    FnArg::Scalar(start),
+                    FnArg::Scalar(n(-1.0)),
+                    FnArg::range_1d(vec![hol]),
+                ],
+                &ctx_1900()
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn workday_zero_days_returns_start_even_if_holiday() {
+        // WORKDAY(start, 0, holidays) returns start unchanged even when start
+        // is itself a holiday (Excel: 0 days never moves).
+        let start = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        assert_eq!(
+            workday_range_ctx(
+                &[
+                    FnArg::Scalar(start.clone()),
+                    FnArg::Scalar(n(0.0)),
+                    FnArg::range_1d(vec![start.clone()]),
+                ],
+                &ctx_1900()
+            ),
+            start
+        );
+    }
+
+    #[test]
+    fn workday_blank_holiday_cells_skipped() {
+        // Blank holiday cells do not skip any day.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(1.0), n(2.0)], &ctx_1900());
+        assert_eq!(
+            workday_range_ctx(
+                &[
+                    FnArg::Scalar(start),
+                    FnArg::Scalar(n(1.0)),
+                    FnArg::range_1d(vec![Value::Blank, Value::Blank]),
+                ],
+                &ctx_1900()
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn workday_text_holiday_is_value_error() {
         let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
         assert_eq!(
-            workday_ctx(&[start, n(1.0), n(0.0)], &ctx_1900()),
+            workday_range_ctx(
+                &[
+                    FnArg::Scalar(start),
+                    FnArg::Scalar(n(1.0)),
+                    FnArg::range_1d(vec![Value::text("x")]),
+                ],
+                &ctx_1900()
+            ),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn workday_multi_cell_range_in_days_slot_is_value_error() {
+        // A MULTI-cell range in the `days` slot is rejected (#VALUE!). A 1×1
+        // range IS accepted — see `workday_single_cell_range_args_unwrap`.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(
+            workday_range_ctx(
+                &[FnArg::Scalar(start), FnArg::range_1d(vec![n(1.0), n(2.0)])],
+                &ctx_1900()
+            ),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn workday_single_cell_range_args_unwrap() {
+        // **Codex r1 HIGH regression guard.** 1×1 ranges in the start AND days
+        // slots (e.g. `WORKDAY([@Start], [@Days])`) must unwrap to their cell
+        // values, not regress to #VALUE!.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        assert_eq!(
+            workday_range_ctx(
+                &[FnArg::range_1d(vec![start]), FnArg::range_1d(vec![n(4.0)])],
+                &ctx_1900()
+            ),
+            expected,
+            "1×1 range in start/days slots must unwrap (not #VALUE!)"
+        );
+    }
+
+    #[test]
+    fn workday_huge_negative_days_does_not_panic() {
+        // **Lane B MED (pre-W5-74 hardening).** A huge-magnitude `days` arg
+        // saturates to ~i64::MIN via `to_int_date_arg`'s `as i64`. `abs()`
+        // would panic in debug; `unsigned_abs()` does not. The serial walks
+        // off `[0, MAX]` within a few steps → loud `#NUM!`, never a panic.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(
+            workday_range_ctx(&[FnArg::Scalar(start), FnArg::Scalar(n(-1e300))], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn workday_arity_rejected() {
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(
+            workday_ctx(&[start.clone()], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            workday_ctx(&[start.clone(), n(1.0), start.clone(), start], &ctx_1900()),
             Value::Error(ErrorValue::Value)
         );
     }

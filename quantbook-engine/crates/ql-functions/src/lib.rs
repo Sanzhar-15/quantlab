@@ -50,7 +50,7 @@ pub mod welford;
 pub mod wildcard;
 
 pub use context_aware_fns::ContextAwareFn;
-pub use range_aware_fns::{FnArg, RangeAwareFn};
+pub use range_aware_fns::{FnArg, RangeAndContextAwareFn, RangeAwareFn};
 pub use reference_aware_fns::{
     ArgContract, NoOpReferenceQuery, PlanKind, RefArg, RefContext, ReferenceAwareFn,
     ReferenceQuery, NO_OP_REFERENCE_QUERY,

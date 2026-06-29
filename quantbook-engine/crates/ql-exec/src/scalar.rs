@@ -833,6 +833,62 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                     );
                     rf(&ref_args, &ctx)
                 }
+                Some(RegisteredFn::RangeAndContextAware(rcaf)) => {
+                    // **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):**
+                    // NETWORKDAYS / WORKDAY. Like the RangeAware arm, build
+                    // `Vec<FnArg>` so the optional `holidays` arg keeps its
+                    // range shape; ADDITIONALLY pass the `EvalContext` (date
+                    // system) like the ContextAware arm. These fns return a
+                    // scalar `Value`, so — unlike the Unified tier — they need
+                    // no cell-boundary spill handling and stay on this path.
+                    //
+                    // The holidays arg is the ONLY range-consuming slot; a
+                    // range in the start/end/days slot is rejected `#VALUE!` by
+                    // the fn's own `fnarg_scalar` validation. No row-visibility
+                    // mask is built — these fns ignore hidden rows (only
+                    // SUBTOTAL consumes `FnArg::Range::row_hidden`). A LET-local
+                    // ARRAY holiday arg takes the `other =>` scalar path →
+                    // `#CALC!` (documented exotic residual; literal / named /
+                    // structured ranges all work).
+                    use ql_functions::FnArg;
+                    let mut fn_args: Vec<FnArg> = Vec::with_capacity(args.len());
+                    for a in args {
+                        match a {
+                            ExprPlan::AggregateNameRef { range, .. }
+                            | ExprPlan::RangeRef { range } => {
+                                let (values, rows, cols) = env.read_range_with_shape(*range);
+                                fn_args.push(FnArg::range_with_visibility(
+                                    values,
+                                    rows,
+                                    cols,
+                                    Vec::new(),
+                                ));
+                            }
+                            ExprPlan::StructuredRef {
+                                resolved,
+                                is_this_row,
+                                ..
+                            } => match narrow_structured_ref(*resolved, *is_this_row, env) {
+                                Ok(range) => {
+                                    let (values, rows, cols) = env.read_range_with_shape(range);
+                                    fn_args.push(FnArg::range_with_visibility(
+                                        values,
+                                        rows,
+                                        cols,
+                                        Vec::new(),
+                                    ));
+                                }
+                                Err(ev) => fn_args.push(FnArg::Scalar(Value::Error(ev))),
+                            },
+                            other => {
+                                fn_args.push(FnArg::Scalar(eval_scalar_with_cache(
+                                    other, env, registry, cache,
+                                )));
+                            }
+                        }
+                    }
+                    rcaf(&fn_args, env.eval_context())
+                }
                 // **6.4-3c (2026-05-29):** no built-in dispatch entry. Before
                 // returning `#NAME?`, check the UDF table: a name registered
                 // via `register_function` lives in `registry.udf_handles` (NOT

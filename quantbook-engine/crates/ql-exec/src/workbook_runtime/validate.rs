@@ -365,6 +365,34 @@ mod tests {
                 "{name:?} is unified ONLY; must not appear in the range-aware table"
             );
         }
+        // **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):** NETWORKDAYS /
+        // WORKDAY are admitted to is_aggregate_function (their holiday RANGE
+        // arg must bind as AggregateNameRef / RangeRef), and dispatch through
+        // the range-AND-context-aware tier. They live in neither the scalar
+        // nor the range-aware table.
+        for name in &["NETWORKDAYS", "WORKDAY"] {
+            assert!(
+                reg.lookup_range_and_context_aware(name).is_some(),
+                "is_aggregate_function lists {name:?} (range-and-context-aware variant) but \
+                 it's not in default_registry's range-and-context-aware table"
+            );
+            assert!(
+                reg.lookup(name).is_none(),
+                "{name:?} is range-and-context-aware ONLY; must not appear in the scalar table"
+            );
+            assert!(
+                reg.lookup_range_aware(name).is_none(),
+                "{name:?} is range-and-context-aware ONLY; must not appear in the range-aware table"
+            );
+            assert!(
+                reg.lookup_context_aware(name).is_none(),
+                "{name:?} moved off the context-aware tier; must not appear in it"
+            );
+            assert!(
+                reg.lookup_unified(name).is_none(),
+                "{name:?} is scalar-returning; must not appear in the unified (array-spill) table"
+            );
+        }
         // Sanity: a known non-aggregate (IF) is in the registry but
         // is_aggregate_function does NOT claim it. We can't directly call
         // is_aggregate_function (private), but we can verify via behavior:
@@ -1218,6 +1246,34 @@ mod tests {
              args). Missing {} fns: {:?}. Fix: add them to the matcher in \
              plan.rs::is_aggregate_function, OR add to the exceptions \
              allowlist above with rationale.",
+            missing.len(),
+            missing
+        );
+    }
+
+    /// **W5-74 holiday tier (closes GAP-F-09 / GAP-F-10):** the
+    /// range-AND-context-aware analogue of
+    /// `every_range_aware_fn_is_admitted_to_is_aggregate_function`. Every fn on
+    /// the new tier consumes a RANGE in at least one arg slot (the holidays
+    /// arg), so it MUST be admitted to `is_aggregate_function` or the binder
+    /// hands it an intersected scalar and the holiday range is silently lost.
+    /// Catches a future tier-4 fn registered without `ArgContext::Aggregate`.
+    #[test]
+    fn every_range_and_context_aware_fn_is_admitted_to_is_aggregate_function() {
+        use crate::plan::is_aggregate_function;
+        let reg = default_registry();
+        let mut missing: Vec<&str> = Vec::new();
+        for &name in reg.range_and_context_aware_names() {
+            if !is_aggregate_function(&TEST_REGISTRY, name) {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "every range-and-context-aware fn must be admitted to \
+             is_aggregate_function (its range arg must bind under AggregateArg). \
+             Missing {} fns: {:?}. Fix: add them to the Phase-1.5 \
+             ArgContext::Aggregate override list in registry.rs.",
             missing.len(),
             missing
         );

@@ -11629,6 +11629,71 @@ mod tests {
         );
     }
 
+    /// **NETWORKDAYS / WORKDAY holiday RANGE arg, end-to-end (W5-74 holiday
+    /// tier — closes GAP-F-09 / GAP-F-10).** Exercises the FULL path that the
+    /// date_fns unit tests cannot: the binder must admit the holiday range
+    /// (`ArgContext::Aggregate`) so it binds as a `RangeRef`, the ql-exec
+    /// dispatcher must materialize it as `FnArg::Range` through the new
+    /// range-AND-context-aware arm, and the fn must subtract / skip the
+    /// holidays. Only a real worksheet range proves the binder + dispatcher
+    /// half.
+    #[test]
+    fn owning_session_networkdays_workday_holiday_range() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v = |s: &WorkbookSession, r, c| s.cell(addr(sheet, r, c)).unwrap().unwrap().value;
+        // Holiday cells: B1 = 2024-01-03 (Wed), B2 = 2024-01-04 (Thu),
+        // B3 = 2024-01-02 (Tue). Holiday cells are themselves formulas.
+        s.set_formula(addr(sheet, 0, 1), "DATE(2024,1,3)").unwrap();
+        s.set_formula(addr(sheet, 1, 1), "DATE(2024,1,4)").unwrap();
+        s.set_formula(addr(sheet, 2, 1), "DATE(2024,1,2)").unwrap();
+
+        // NETWORKDAYS(2024-01-01 Mon .. 2024-01-05 Fri) = 5 working days; minus
+        // the two holidays in B1:B2 → 3.
+        s.set_formula(
+            addr(sheet, 0, 2),
+            "NETWORKDAYS(DATE(2024,1,1), DATE(2024,1,5), B1:B2)",
+        )
+        .unwrap();
+        assert_eq!(
+            v(&s, 0, 2),
+            Some(CellValue::Number { number: 3.0 }),
+            "NETWORKDAYS must subtract the 2 holidays in B1:B2 (binder admits the \
+             range + new dispatcher arm materializes it as FnArg::Range)"
+        );
+
+        // Control: the same span WITHOUT holidays → 5. Proves the subtraction
+        // is the holiday range, not an unrelated change.
+        s.set_formula(addr(sheet, 1, 2), "NETWORKDAYS(DATE(2024,1,1), DATE(2024,1,5))")
+            .unwrap();
+        assert_eq!(v(&s, 1, 2), Some(CellValue::Number { number: 5.0 }));
+
+        // WORKDAY(2024-01-01 Mon, +1) is normally Tue 01-02; with 01-02 a
+        // holiday in B3:B3, the next working day is Wed 01-03 — equal to B1.
+        s.set_formula(addr(sheet, 0, 3), "WORKDAY(DATE(2024,1,1), 1, B3:B3)")
+            .unwrap();
+        assert_eq!(
+            v(&s, 0, 3),
+            v(&s, 0, 1),
+            "WORKDAY must skip the holiday in B3:B3 and land on 2024-01-03 (== B1)"
+        );
+
+        // **Codex r1 HIGH regression guard, end-to-end.** A LITERAL 1-cell
+        // range `A1:A1` in a DATE slot (the same 1×1 FnArg::Range a `[@Col]`
+        // structured ref narrows to) must unwrap to its value — NOT regress to
+        // #VALUE! now that NETWORKDAYS carries ArgContext::Aggregate. A1/A2 hold
+        // the span dates; NETWORKDAYS(A1:A1, A2:A2) = 5.
+        s.set_formula(addr(sheet, 0, 0), "DATE(2024,1,1)").unwrap(); // A1
+        s.set_formula(addr(sheet, 1, 0), "DATE(2024,1,5)").unwrap(); // A2
+        s.set_formula(addr(sheet, 4, 0), "NETWORKDAYS(A1:A1, A2:A2)")
+            .unwrap();
+        assert_eq!(
+            v(&s, 4, 0),
+            Some(CellValue::Number { number: 5.0 }),
+            "a 1×1 range in a scalar date slot must unwrap (regression guard)"
+        );
+    }
+
     /// **CROSS-SHEET on the owning session (megaudit L2 closure).** A formula
     /// on Sheet2 that references Sheet1!A3 must, when a row is inserted on
     /// Sheet1, have its TEXT rewritten (Sheet1!A3 → Sheet1!A4) while its own
