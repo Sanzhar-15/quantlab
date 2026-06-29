@@ -889,6 +889,127 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                     }
                     rcaf(&fn_args, env.eval_context())
                 }
+                Some(RegisteredFn::ProvenanceAware(paf)) => {
+                    // **GAP-F-06 (COUNT provenance) closure:** the provenance-aware
+                    // tier (COUNT). Excel COUNT counts a value by its ORIGIN: a
+                    // numeric / logical / numeric-text LITERAL typed in the arg
+                    // list is counted, but the SAME value reached via a reference,
+                    // array constant, or computed sub-expression contributes only
+                    // if it is an actual number. Provenance survives ONLY at the
+                    // ExprPlan level (a single `CellRef` and a computed `String`
+                    // both collapse to a plain `Value` after eval — so `FnArg`
+                    // can't carry it). We classify each arg here into a `CountArg`:
+                    //  - `Number` / `Bool` / `String` literal node → `Direct(value)`.
+                    //  - everything else → `Reference(materialized values)`:
+                    //    range refs, `{…}` array constants, LET/LAMBDA array
+                    //    locals, a single `CellRef`, scalar name refs, and any
+                    //    computed `Binary` / `Unary` / `FnCall` result.
+                    // COUNT ignores row visibility (it counts hidden cells —
+                    // SUBTOTAL is the hidden-aware one), so no `row_hidden` mask is
+                    // built; the count-time rule (numbers only for `Reference`) is
+                    // in `scalar_fns::count_prov`.
+                    use ql_functions::CountArg;
+                    // Single-range aggregate fast path — mirrors the `Scalar` arm
+                    // (see :648) so COUNT keeps the `(range, name)` aggregate-cache
+                    // contract it had on the scalar tier (`COUNT(Sales)` /
+                    // `COUNT(A1:A1000)` must not re-scan every recompute). A lone
+                    // range arg is ALWAYS `Reference` provenance (a range is never a
+                    // `Direct` literal), so the cached value is exactly
+                    // `count_prov(&[Reference(cells)])` and is invalidated by the
+                    // same range-cell-write path as SUM/AVERAGE. Direct / mixed /
+                    // multi-arg calls fall through to the per-arg classifier below
+                    // (never cached — they carry literal provenance the key can't
+                    // express). Error results are not cached (mirrors the Scalar arm).
+                    let single_range_arg = match args.as_slice() {
+                        [ExprPlan::AggregateNameRef { range, .. }]
+                        | [ExprPlan::RangeRef { range }] => Some(*range),
+                        [ExprPlan::StructuredRef {
+                            resolved,
+                            is_this_row,
+                            ..
+                        }] => narrow_structured_ref(*resolved, *is_this_row, env).ok(),
+                        _ => None,
+                    };
+                    if let Some(range) = single_range_arg {
+                        if crate::plan::is_aggregate_function(registry, name) {
+                            if let Some(cached) = cache.lookup_aggregate(range, name) {
+                                return cached;
+                            }
+                            let v = paf(&[CountArg::Reference(env.read_range(range))]);
+                            if !matches!(v, Value::Error(_)) {
+                                cache.store_aggregate(range, name, v.clone());
+                            }
+                            return v;
+                        }
+                    }
+                    let mut prov_args: Vec<CountArg> = Vec::with_capacity(args.len());
+                    for a in args {
+                        match a {
+                            // Literals typed directly into the formula → Direct.
+                            ExprPlan::Number(_) | ExprPlan::Bool(_) | ExprPlan::String(_) => {
+                                prov_args.push(CountArg::Direct(eval_scalar_with_cache(
+                                    a, env, registry, cache,
+                                )));
+                            }
+                            // Range references → materialized values.
+                            ExprPlan::AggregateNameRef { range, .. }
+                            | ExprPlan::RangeRef { range } => {
+                                let (values, _rows, _cols) = env.read_range_with_shape(*range);
+                                prov_args.push(CountArg::Reference(values));
+                            }
+                            // Structured ref (`Table[Col]` / `[@Col]`) → narrow +
+                            // materialize. An unresolvable ref's Error is a
+                            // non-number → contributes 0 (Excel skips ref errors).
+                            ExprPlan::StructuredRef {
+                                resolved,
+                                is_this_row,
+                                ..
+                            } => match narrow_structured_ref(*resolved, *is_this_row, env) {
+                                Ok(range) => {
+                                    let (values, _rows, _cols) = env.read_range_with_shape(range);
+                                    prov_args.push(CountArg::Reference(values));
+                                }
+                                Err(ev) => {
+                                    prov_args.push(CountArg::Reference(vec![Value::Error(ev)]))
+                                }
+                            },
+                            // Array constant `{1,"2",TRUE}` → its literal cells
+                            // follow ARRAY (reference) semantics — numbers only —
+                            // NOT direct-arg semantics (`COUNT({1,"2",TRUE})` → 1).
+                            ExprPlan::Array(rows) => {
+                                let mut values: Vec<Value> = Vec::new();
+                                for row in rows {
+                                    for cell in row {
+                                        values.push(eval_scalar_with_cache(
+                                            cell, env, registry, cache,
+                                        ));
+                                    }
+                                }
+                                prov_args.push(CountArg::Reference(values));
+                            }
+                            // A LET/LAMBDA array local (`LET(x, A1:A3, COUNT(x))`)
+                            // → reference semantics over its materialized cells; a
+                            // scalar/None local falls through to the `_` eval path.
+                            ExprPlan::LocalRef(n) => match env.local_env().lookup(n) {
+                                Some(LocalBinding::Array(arr)) => {
+                                    prov_args.push(CountArg::Reference(arr.cells().to_vec()));
+                                }
+                                _ => prov_args.push(CountArg::Reference(vec![
+                                    eval_scalar_with_cache(a, env, registry, cache),
+                                ])),
+                            },
+                            // Single CellRef, computed (Binary/Unary/FnCall),
+                            // scalar NameRef, … → one materialized value; the
+                            // count-time rule keeps it only if it's a number.
+                            other => {
+                                prov_args.push(CountArg::Reference(vec![eval_scalar_with_cache(
+                                    other, env, registry, cache,
+                                )]));
+                            }
+                        }
+                    }
+                    paf(&prov_args)
+                }
                 // **6.4-3c (2026-05-29):** no built-in dispatch entry. Before
                 // returning `#NAME?`, check the UDF table: a name registered
                 // via `register_function` lives in `registry.udf_handles` (NOT

@@ -28,7 +28,7 @@ use crate::welford::WelfordState;
 // were promoted to `crate::range_aware_fns` as cross-module utilities (also
 // used by `range_fns`). The shim there delegates to
 // `ql_types::coercion::to_number_strict_skip_blank` (the central neutral API).
-use crate::range_aware_fns::{coerce_numeric, NumericArg};
+use crate::range_aware_fns::{coerce_numeric, CountArg, NumericArg};
 
 /// Helper: feed args through a Welford-style accumulator (streaming variant).
 /// Errors short-circuit. Returns `Ok((state))` if all args usable.
@@ -95,11 +95,66 @@ pub fn average(args: &[Value]) -> Value {
 /// `COUNT(args...)` — counts numeric values only. Bool/Text/Error/Blank skipped.
 /// Always returns a non-negative count; errors do NOT propagate (per Excel COUNT
 /// semantics — errors are part of the "not a number" category).
+///
+/// **This is the numbers-only kernel.** Since GAP-F-06, the registered `COUNT`
+/// formula is `count_prov` (provenance-aware); this `&[Value]` kernel is RETAINED
+/// because `SUBTOTAL(2)` reuses it (`range_fns.rs::subtotal`) over an
+/// already-materialized range — i.e. the `Reference` provenance case, which is
+/// exactly numbers-only. Do NOT delete it.
 pub fn count(args: &[Value]) -> Value {
     let mut c = 0u64;
     for v in args {
         if matches!(v, Value::Number(_)) {
             c += 1;
+        }
+    }
+    Value::Number(c as f64)
+}
+
+/// `COUNT(args...)` — **provenance-aware** form (GAP-F-06 closure). Excel COUNT
+/// counts a value by its ORIGIN, not just its runtime type:
+/// - A **direct** argument typed into the formula — a numeric, logical, or
+///   numeric-text literal (`COUNT(TRUE, "1")` → 2) — is counted.
+/// - A **reference / array-constant / computed** value contributes ONLY actual
+///   numbers; text, logicals, blanks, and errors there are skipped
+///   (`COUNT(A1:A2)` over `{TRUE, "1"}` → 0; `COUNT(1=1)` → 0; `COUNT("1"&"2")` → 0;
+///   `COUNT({1,"2",TRUE})` → 1).
+///
+/// The eval-site dispatch (`ql-exec::scalar`) supplies the provenance: a
+/// `Number`/`Bool`/`String` literal node arrives as [`CountArg::Direct`];
+/// everything else as [`CountArg::Reference`] (materialized values).
+///
+/// A `Direct` literal is counted iff it lenient-coerces to a number — exactly
+/// Excel's "numbers, logicals, and text representations of numbers, typed
+/// directly, are counted" rule (non-numeric text like `"hello"` is not). The
+/// `Reference` arm is the [`count`] kernel's numbers-only rule.
+///
+/// Residual divergence (documented in known-gaps): an error argument is SKIPPED
+/// (→ 0), never propagated. This covers a direct error literal (`=COUNT(#N/A)`,
+/// an `ExprPlan::Error` node) and a computed error (`COUNT(NA())`) — both of which
+/// the eval-site classifier routes to the `Reference` arm (the `Direct` arm only
+/// ever receives `Number`/`Bool`/`String` literal nodes), where a non-`Number`
+/// contributes 0. Excel propagates a direct/computed error but skips errors inside
+/// a reference/array; the in-reference skip matches canon, the direct/computed
+/// skip is the v1 simplification (unchanged from the pre-GAP-F-06 kernel).
+pub fn count_prov(args: &[CountArg]) -> Value {
+    let mut c = 0u64;
+    for a in args {
+        match a {
+            CountArg::Direct(v) => {
+                // Direct literal: numeric / logical / numeric-text counts.
+                if coercion::to_number_lenient(v).is_ok() {
+                    c += 1;
+                }
+            }
+            CountArg::Reference(values) => {
+                // Reference / array / computed: numbers only (kernel rule).
+                for v in values {
+                    if matches!(v, Value::Number(_)) {
+                        c += 1;
+                    }
+                }
+            }
         }
     }
     Value::Number(c as f64)
@@ -3942,6 +3997,70 @@ mod tests {
             n(2.0),
         ];
         assert_eq!(count(&args), n(2.0));
+    }
+
+    // GAP-F-06: `count` above is the numbers-only KERNEL (also reused by
+    // SUBTOTAL(2)); `count_prov` applies Excel's direct-vs-reference rule on top.
+
+    #[test]
+    fn count_prov_direct_counts_numbers_logicals_and_numeric_text() {
+        // Direct literals: COUNT(1, TRUE, "1", "1.5") → 4.
+        let args = [
+            CountArg::Direct(n(1.0)),
+            CountArg::Direct(Value::Boolean(true)),
+            CountArg::Direct(Value::text("1")),
+            CountArg::Direct(Value::text("1.5")),
+        ];
+        assert_eq!(count_prov(&args), n(4.0));
+    }
+
+    #[test]
+    fn count_prov_direct_skips_non_numeric_text() {
+        // COUNT("hello") → 0 (non-numeric direct text is not counted).
+        let args = [CountArg::Direct(Value::text("hello"))];
+        assert_eq!(count_prov(&args), n(0.0));
+    }
+
+    #[test]
+    fn count_prov_reference_counts_numbers_only() {
+        // Reference cells {TRUE, "1", "x", Blank, #REF!, 1, 2} → only the two
+        // numbers count (logicals / text / blank / error skipped).
+        let args = [CountArg::Reference(vec![
+            Value::Boolean(true),
+            Value::text("1"),
+            Value::text("x"),
+            Value::Blank,
+            Value::Error(ErrorValue::Ref),
+            n(1.0),
+            n(2.0),
+        ])];
+        assert_eq!(count_prov(&args), n(2.0));
+    }
+
+    #[test]
+    fn count_prov_headline_direct_bool_and_numeric_text() {
+        // The GAP-F-06 headline: COUNT(TRUE, "1") → 2 (was 0 pre-fix).
+        let args = [
+            CountArg::Direct(Value::Boolean(true)),
+            CountArg::Direct(Value::text("1")),
+        ];
+        assert_eq!(count_prov(&args), n(2.0));
+    }
+
+    #[test]
+    fn count_prov_same_values_direct_vs_reference_diverge() {
+        // TRUE + "1" counted as DIRECT literals → 2; the identical values
+        // reached via a REFERENCE → 0. This is the provenance distinction.
+        let direct = [
+            CountArg::Direct(Value::Boolean(true)),
+            CountArg::Direct(Value::text("1")),
+        ];
+        let reference = [CountArg::Reference(vec![
+            Value::Boolean(true),
+            Value::text("1"),
+        ])];
+        assert_eq!(count_prov(&direct), n(2.0));
+        assert_eq!(count_prov(&reference), n(0.0));
     }
 
     #[test]

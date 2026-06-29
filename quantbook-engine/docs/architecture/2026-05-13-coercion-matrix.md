@@ -9,7 +9,7 @@
 - `[CANON]` — Excel canon. Must match Excel's documented behavior.
 - `[CURRENT]` — Current Quantbook behavior. Verified in code as of W5-62. May be CANON or DIVERGENCE.
 - `[V1-DIV]` — Intentional V1 divergence from Excel canon. Documented in `excel-matrix.md`; tests pin it.
-- `[FUTURE]` — Aspirational behavior; not implemented yet. Gated on a named gap (e.g. GAP-F-06 COUNT provenance). _(FN4-03 lazy IF/IFERROR — the former example here — landed in w142.)_
+- `[FUTURE]` — Aspirational behavior; not implemented yet. Gated on a named gap (e.g. SUMIF/AVERAGEIF shape anchoring, TA2/COR-02). _(GAP-F-06 COUNT provenance — the former example here — landed in w146; FN4-03 lazy IF/IFERROR landed in w142.)_
 
 ---
 

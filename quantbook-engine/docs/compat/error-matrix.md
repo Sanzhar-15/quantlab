@@ -95,7 +95,7 @@ Tags:
 | `SUM` | Default; Error propagates from first errored arg; Blank skipped | 🟢 | (coercion_matrix) |
 | `AVERAGE` | Default + empty range / all-blank → `#DIV/0!` | 🟢 | `average_empty_args_is_div_zero_canon`, `average_all_blank_args_is_div_zero_canon` |
 | `AVG` | Alias of AVERAGE | 🟢 | (covered transitively) |
-| `COUNT` | Skips errors (canon). **V1 divergence**: skips text/bools UNCONDITIONALLY (Excel canon distinguishes direct literal args from range/ref args — direct `COUNT(TRUE, "1")` counts 2 in Excel but 0 in Quantbook). Provenance-aware dispatch is deferred. | 🟢 errors / 🟡 direct-args | `count_skips_errors_canon`, `count_skips_text_and_bools_v1_divergence`, `count_direct_bool_and_numeric_text_v1_divergence` |
+| `COUNT` | **Provenance-aware (GAP-F-06, w146).** Direct literal numeric / logical / numeric-text counted (`COUNT(TRUE,"1")`=2); reference / array-constant / computed values counted only if an actual number (errors / text / bool / blank there skipped). **Residual:** a direct or computed error arg (`=COUNT(#N/A)` / `COUNT(NA())`) is skipped (→ 0), not propagated; errors inside a reference/array are skipped per Excel canon. | 🟢 reference-errors / 🟡 direct-error residual | `count_provenance_*` (ql-exec validate), `count_prov_*` (scalar_fns) |
 | `COUNTA` | **Counts errors** (diverges from COUNT here); skips only blanks | 🟢 | `counta_counts_errors_canon`, `counta_skips_only_blanks_canon` |
 | `MIN` / `MAX` | Empty range → 0 (Excel canon) | 🟢 | — (deferred to 4.4.C completion) |
 | `PRODUCT` | Default; blanks skipped | 🟢 | — |

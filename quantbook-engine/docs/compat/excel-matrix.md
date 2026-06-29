@@ -55,7 +55,7 @@ as partial, rows with `❌` are missing.
 |---|---|---|---|---|
 | SUM | ✅ | 30+ | 0 | Aggregate over range/named-range works (Phase 3.6 cache); error propagation per Excel canon |
 | AVERAGE (alias: AVG) | ✅ | 10+ | 0 | Welford-backed (A6 spec); empty range → #DIV/0! |
-| COUNT | ✅ | 5+ | 0 | Numeric values only; errors / text / blanks skipped |
+| COUNT | ✅ | 5+ | 0 / w146 | **Provenance-aware (GAP-F-06, w146).** A DIRECT literal that is numeric / logical / numeric-text is counted (`COUNT(TRUE,"1")`=2); a value reached via a reference / `{…}` array constant / computed sub-expression is counted only if it is an actual number (`COUNT(A1:A2)` over `{TRUE,"1"}`=0; `COUNT(1=1)`=0; `COUNT({1,"2",TRUE})`=1). Errors / blanks never counted. **Residual:** a direct or computed error arg (`=COUNT(#N/A)` / `COUNT(NA())`) is skipped (→ 0), not propagated (errors inside a reference/array are skipped per canon). |
 | COUNTA | ✅ | 3+ | 0 | All non-blank; errors + text counted |
 | MIN | ✅ | 5+ | 0 | Empty → 0 (Excel canon); error propagates |
 | MAX | ✅ | 5+ | 0 | Empty → 0 (Excel canon); error propagates |

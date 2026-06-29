@@ -36,7 +36,7 @@ use ql_session::session::FunctionImplHandle;
 use ql_types::{ArrayValue, EvalContext, Value};
 
 use crate::context_aware_fns::ContextAwareFn;
-use crate::range_aware_fns::{RangeAndContextAwareFn, RangeAwareFn};
+use crate::range_aware_fns::{ProvenanceAwareFn, RangeAndContextAwareFn, RangeAwareFn};
 use crate::reference_aware_fns::{ArgContract, ReferenceAwareFn};
 use crate::{
     date_fns, distribution_fns, financial_fns, format, range_fns, reference_fns, scalar_fns,
@@ -197,6 +197,15 @@ pub enum RegisteredFn {
     /// (like the context-aware tier). See [`RangeAndContextAwareFn`] for why
     /// these are NOT registered through the array-spilling `Unified` tier.
     RangeAndContextAware(RangeAndContextAwareFn),
+    /// **GAP-F-06 (COUNT provenance) closure:** provenance-aware tier:
+    /// `fn(&[CountArg]) -> Value`. The dispatcher classifies each `ExprPlan` arg
+    /// into a [`crate::CountArg`] — a `Number`/`Bool`/`String` LITERAL node
+    /// becomes `Direct`, everything else (cell/range/structured refs, array
+    /// constants, computed sub-expressions) becomes `Reference` — so the function
+    /// can apply Excel's direct-vs-reference COUNT rule. COUNT is the sole initial
+    /// member. Like the other non-`Unified` tiers it returns a plain scalar
+    /// `Value`, so it stays on the scalar dispatch path (no array-spill handling).
+    ProvenanceAware(ProvenanceAwareFn),
 }
 
 /// Phase 0 function registry. Built by `default_registry()` with the
@@ -646,6 +655,20 @@ impl FunctionRegistry {
         );
     }
 
+    /// **GAP-F-06 (COUNT provenance) closure:** register a provenance-aware
+    /// function. Receives `&[CountArg]` — each arg tagged `Direct` (a literal
+    /// node) or `Reference` (anything else, materialized) by the eval-site
+    /// dispatch. Stored as `RegisteredFn::ProvenanceAware(f)`. Same
+    /// canonical-uppercase requirement + duplicate panic as `register`. Used by
+    /// COUNT (direct logical / numeric-text counted; reference cells number-only).
+    pub fn register_provenance_aware(&mut self, name: &'static str, f: ProvenanceAwareFn) {
+        self.insert_or_panic(
+            name,
+            RegisteredFn::ProvenanceAware(f),
+            "FunctionRegistry::register_provenance_aware",
+        );
+    }
+
     /// **W5-69 (Phase 4.5.A.0):** register a context-aware function. These
     /// receive `&EvalContext` (date_system + locale + now_provider) in
     /// addition to the standard `&[Value]` args. Stored internally as
@@ -728,6 +751,19 @@ impl FunctionRegistry {
         let upper = name.to_ascii_uppercase();
         match self.fns.get(upper.as_str()) {
             Some(RegisteredFn::RangeAndContextAware(f)) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// **GAP-F-06 (COUNT provenance) closure:** case-insensitive lookup, returning
+    /// the provenance-aware fn iff registered as `RegisteredFn::ProvenanceAware(_)`.
+    /// The eval-site dispatch reaches it via `lookup_any` + a `match` on
+    /// `RegisteredFn`; this filter view mirrors the other tiers for test/coverage
+    /// parity (e.g. the `is_aggregate_function` invariant checks COUNT here).
+    pub fn lookup_provenance_aware(&self, name: &str) -> Option<ProvenanceAwareFn> {
+        let upper = name.to_ascii_uppercase();
+        match self.fns.get(upper.as_str()) {
+            Some(RegisteredFn::ProvenanceAware(f)) => Some(*f),
             _ => None,
         }
     }
@@ -815,6 +851,16 @@ impl FunctionRegistry {
             .map(|(k, _)| k)
     }
 
+    /// **GAP-F-06 (COUNT provenance) closure:** names registered as
+    /// `RegisteredFn::ProvenanceAware(_)`. Mirrors the other tier iterators for
+    /// coverage/census walks. **Ordering is UNSTABLE** (see [`Self::names`]).
+    pub fn provenance_aware_names(&self) -> impl Iterator<Item = &&'static str> + '_ {
+        self.fns
+            .iter()
+            .filter(|(_, v)| matches!(v, RegisteredFn::ProvenanceAware(_)))
+            .map(|(k, _)| k)
+    }
+
     /// **W5-69 (Phase 4.5.A.0):** names registered as
     /// `RegisteredFn::ContextAware(_)`.
     pub fn context_aware_names(&self) -> impl Iterator<Item = &&'static str> + '_ {
@@ -870,7 +916,10 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("AVG", scalar_fns::average); // Common alias; not Excel-canonical but
                                             // user-friendly. Re-evaluate when Excel
                                             // compat audit lands.
-    r.register("COUNT", scalar_fns::count);
+    // GAP-F-06: COUNT is provenance-aware (direct logical / numeric-text literals
+    // counted; reference/array/computed values number-only). COUNTA stays a plain
+    // scalar aggregate. Both keep `ArgContext::Aggregate` (range-arg admission).
+    r.register_provenance_aware("COUNT", scalar_fns::count_prov);
     r.register("COUNTA", scalar_fns::counta);
     r.register("MIN", scalar_fns::min);
     r.register("MAX", scalar_fns::max);
@@ -2017,6 +2066,83 @@ mod tests {
         let mut r = FunctionRegistry::new();
         r.register_range_aware("SUMIF", range_fns::sumif);
         r.register_range_aware("SUMIF", range_fns::sumif);
+    }
+
+    // ===== GAP-F-06 — provenance-aware tier (COUNT) =====
+
+    #[test]
+    fn provenance_aware_register_and_lookup_works() {
+        let mut r = FunctionRegistry::new();
+        r.register_provenance_aware("MYCOUNT", scalar_fns::count_prov);
+        assert!(r.lookup_provenance_aware("MYCOUNT").is_some());
+        assert!(r.lookup_provenance_aware("mycount").is_some()); // case-insensitive
+        // The eval-site dispatch reaches the tier via `lookup_any` — assert the
+        // tagged variant directly (this is the path COUNT takes at scalar.rs:354).
+        assert!(matches!(
+            r.lookup_any("MYCOUNT"),
+            Some(RegisteredFn::ProvenanceAware(_))
+        ));
+        assert!(r.lookup("MYCOUNT").is_none()); // NOT in scalar table
+        assert!(r.lookup_range_aware("MYCOUNT").is_none()); // NOT in range-aware table
+        assert!(r.lookup_range_and_context_aware("MYCOUNT").is_none());
+        assert!(r.lookup_unified("MYCOUNT").is_none());
+    }
+
+    #[test]
+    fn count_is_registered_on_the_provenance_aware_tier() {
+        // GAP-F-06: COUNT lives on the provenance-aware tier ONLY; COUNTA stays
+        // a plain scalar aggregate.
+        let r = default_registry();
+        assert!(r.lookup_provenance_aware("COUNT").is_some());
+        assert!(r.lookup("COUNT").is_none());
+        assert!(r.lookup_range_aware("COUNT").is_none());
+        assert!(r.lookup("COUNTA").is_some());
+        assert!(r.lookup_provenance_aware("COUNTA").is_none());
+    }
+
+    #[test]
+    fn provenance_aware_tier_disjoint_from_other_tiers() {
+        // Structurally enforced by the unified HashMap; verify no name resolves
+        // through both the provenance-aware view and another tier's view.
+        let r = default_registry();
+        for name in r.provenance_aware_names() {
+            assert!(
+                r.lookup(name).is_none(),
+                "{name:?} resolves as both ProvenanceAware and Scalar"
+            );
+            assert!(
+                r.lookup_range_aware(name).is_none(),
+                "{name:?} resolves as both ProvenanceAware and RangeAware"
+            );
+            assert!(
+                r.lookup_context_aware(name).is_none(),
+                "{name:?} resolves as both ProvenanceAware and ContextAware"
+            );
+            assert!(
+                r.lookup_range_and_context_aware(name).is_none(),
+                "{name:?} resolves as both ProvenanceAware and RangeAndContextAware"
+            );
+            assert!(
+                r.lookup_unified(name).is_none(),
+                "{name:?} resolves as both ProvenanceAware and Unified"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate registration")]
+    fn register_provenance_aware_with_existing_scalar_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register("FOO", scalar_fns::sum);
+        r.register_provenance_aware("FOO", scalar_fns::count_prov);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate registration")]
+    fn register_scalar_with_existing_provenance_aware_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register_provenance_aware("FOO", scalar_fns::count_prov);
+        r.register("FOO", scalar_fns::sum);
     }
 
     // ===== W5-69 Phase 4.5.A.0 — context-aware tier =====

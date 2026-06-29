@@ -249,9 +249,11 @@ mod tests {
         let reg = default_registry();
         // Every name `is_aggregate_function` recognizes must exist in the
         // registry. Hardcoded names (mirror the matcher in plan.rs).
+        // GAP-F-06: COUNT moved OFF the scalar tier to the provenance-aware tier
+        // (checked separately below); COUNTA stays a plain scalar aggregate.
         for name in &[
-            "SUM", "AVERAGE", "AVG", "COUNT", "COUNTA", "MIN", "MAX", "PRODUCT", "VAR", "VAR.S",
-            "VAR.P", "STDEV", "STDEV.S", "STDEV.P",
+            "SUM", "AVERAGE", "AVG", "COUNTA", "MIN", "MAX", "PRODUCT", "VAR", "VAR.S", "VAR.P",
+            "STDEV", "STDEV.S", "STDEV.P",
         ] {
             assert!(
                 reg.lookup(name).is_some(),
@@ -393,12 +395,114 @@ mod tests {
                 "{name:?} is scalar-returning; must not appear in the unified (array-spill) table"
             );
         }
+        // **GAP-F-06 (COUNT provenance) closure:** COUNT is admitted to
+        // is_aggregate_function (its range arg must bind as AggregateNameRef /
+        // RangeRef) but dispatches through the provenance-aware tier so it can
+        // distinguish a direct literal from a reference. It lives in neither the
+        // scalar nor the range-aware table. (COUNTA stays a plain scalar aggregate.)
+        for name in &["COUNT"] {
+            assert!(
+                reg.lookup_provenance_aware(name).is_some(),
+                "is_aggregate_function lists {name:?} (provenance-aware variant) but \
+                 it's not in default_registry's provenance-aware table"
+            );
+            assert!(
+                reg.lookup(name).is_none(),
+                "{name:?} is provenance-aware ONLY; must not appear in the scalar table"
+            );
+            assert!(
+                reg.lookup_range_aware(name).is_none(),
+                "{name:?} is provenance-aware ONLY; must not appear in the range-aware table"
+            );
+            assert!(
+                reg.lookup_unified(name).is_none(),
+                "{name:?} is scalar-returning; must not appear in the unified (array-spill) table"
+            );
+        }
         // Sanity: a known non-aggregate (IF) is in the registry but
         // is_aggregate_function does NOT claim it. We can't directly call
         // is_aggregate_function (private), but we can verify via behavior:
         // a NameRef to a range used inside IF surfaces
         // NamedRangeInScalarContext (since IF's args are scalar context).
         // That behaviour is pinned by `nag_04_named_range_in_scalar_positions_errors_precisely`.
+    }
+
+    /// **GAP-F-06 (COUNT provenance) closure — e2e:** drive COUNT through the
+    /// real lex → parse → bind → eval pipeline and prove Excel's
+    /// direct-vs-reference rule. A numeric / logical / numeric-text LITERAL typed
+    /// in the arg list is counted; the SAME value reached via a reference or a
+    /// computed sub-expression is counted only if it is an actual number.
+    #[test]
+    fn count_provenance_direct_vs_reference() {
+        let mut wb = make_runtime_workbook();
+        // A1 = TRUE, A2 = "1" (text), A3 = 5 (number) — reference cells.
+        wb.put_at(0, 0, 0, Value::Boolean(true));
+        wb.put_at(0, 1, 0, Value::text("1"));
+        wb.put_at(0, 2, 0, Value::Number(5.0));
+        let reg = default_registry();
+        let rt = WorkbookRuntime::new(&mut wb, &reg);
+        let count = |f: &str| rt.validate_formula(0, 5, 0, f).unwrap();
+
+        // Direct literals — the GAP-F-06 headline: COUNT(TRUE, "1") → 2.
+        assert_eq!(count(r#"COUNT(TRUE, "1")"#), Value::Number(2.0));
+        // Direct numeric-text only.
+        assert_eq!(count(r#"COUNT("3")"#), Value::Number(1.0));
+        // Direct numbers.
+        assert_eq!(count("COUNT(1, 2, 3)"), Value::Number(3.0));
+        // Direct non-numeric text is not counted.
+        assert_eq!(count(r#"COUNT("hello")"#), Value::Number(0.0));
+
+        // Reference: {TRUE, "1"} → 0; {TRUE, "1", 5} → 1 (only the number).
+        assert_eq!(count("COUNT(A1:A2)"), Value::Number(0.0));
+        assert_eq!(count("COUNT(A1:A3)"), Value::Number(1.0));
+        // Single-cell reference to a logical → 0 (NOT a direct literal).
+        assert_eq!(count("COUNT(A1)"), Value::Number(0.0));
+
+        // Computed sub-expressions are NOT direct literals: a computed bool or a
+        // computed numeric-text contributes nothing (it is not a number).
+        assert_eq!(count("COUNT(1=1)"), Value::Number(0.0));
+        assert_eq!(count(r#"COUNT("1"&"2")"#), Value::Number(0.0));
+
+        // Mixed: direct 5(num)+"1"(numtext)+TRUE(bool)=3, "x"=0, ref A1=TRUE=0.
+        assert_eq!(count(r#"COUNT(5, "1", TRUE, "x", A1)"#), Value::Number(3.0));
+
+        // Direct FALSE and direct 0 are both counted (a directly-typed logical or
+        // zero is a number); contrast with a referenced FALSE (COUNT(A1)=0 above).
+        assert_eq!(count("COUNT(FALSE)"), Value::Number(1.0));
+        assert_eq!(count("COUNT(0)"), Value::Number(1.0));
+        // Mixed range + direct (2 args → NOT the single-range cache fast path):
+        // range {TRUE,"1"}=0 + direct 5=1 → 1.
+        assert_eq!(count("COUNT(A1:A2, 5)"), Value::Number(1.0));
+        // Residual divergence (pinned): a computed error arg is SKIPPED, not
+        // propagated. Excel returns #N/A for COUNT(NA()); Quantbook returns 0.
+        assert_eq!(count("COUNT(NA())"), Value::Number(0.0));
+
+        // Read-only: no mutation from validate.
+        assert!(wb.formula_at(0, 5, 0).is_none());
+    }
+
+    /// **GAP-F-06 — array-constant + LET-local provenance.** An array constant
+    /// `{…}` and a LET/LAMBDA array local both follow ARRAY (reference) semantics
+    /// — numbers only — NOT direct-arg semantics. Kept separate from the core
+    /// test so a binder limitation on these paths is isolated.
+    #[test]
+    fn count_provenance_array_constant_and_let_local() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Boolean(true));
+        wb.put_at(0, 1, 0, Value::text("1"));
+        wb.put_at(0, 2, 0, Value::Number(5.0));
+        let reg = default_registry();
+        let rt = WorkbookRuntime::new(&mut wb, &reg);
+        let count = |f: &str| rt.validate_formula(0, 5, 0, f).unwrap();
+
+        // Array constant: elements are array (reference) values → numbers only.
+        assert_eq!(count(r#"COUNT({1, "2", TRUE})"#), Value::Number(1.0));
+        // LET array local → reference semantics over its cells. Uses an
+        // array-RETURNING value (SEQUENCE) — a bare literal range `A1:A3` as a LET
+        // value is rejected at bind (Scalar-context `RangeRef`, a documented v1
+        // limitation); SEQUENCE(3) = {1;2;3} binds, x is a `LocalBinding::Array`,
+        // and COUNT(x) exercises the `LocalRef → Reference(cells)` arm → 3.
+        assert_eq!(count("LET(x, SEQUENCE(3), COUNT(x))"), Value::Number(3.0));
     }
 
     /// **W5-D-13.1 (Phase 4.10 V1-260 megaudit closure — Codex HIGH-001,

@@ -200,3 +200,35 @@ pub type RangeAwareFn = fn(&[FnArg]) -> Value;
 /// latent footgun. This tier returns a plain `Value`, exactly like the legacy
 /// scalar / range-aware / context-aware tiers.
 pub type RangeAndContextAwareFn = fn(&[FnArg], &ql_types::EvalContext) -> Value;
+
+/// **GAP-F-06 (COUNT provenance) closure:** one COUNT argument, tagged with its
+/// *provenance* — whether it was a literal typed directly into the formula, or a
+/// value/values derived from a reference, array constant, or computed
+/// sub-expression. This is the ExprPlan-level marker the gap note prescribed: the
+/// existing `FnArg::Scalar`-vs-`Range` split can't carry it, because a single
+/// `CellRef` collapses to `FnArg::Scalar` (indistinguishable from a typed literal)
+/// and a computed `String` is indistinguishable from a typed `"1"`.
+///
+/// Excel canon, encoded by the [`ProvenanceAwareFn`] consumer (COUNT):
+/// - **`Direct`** — a `Number` / `Bool` / `String` LITERAL node typed in the
+///   argument list. Counted iff numeric, logical, or numeric-text. (The eval-site
+///   classifier routes ONLY these three literal-scalar node kinds to `Direct`; an
+///   error-sigil literal such as `=COUNT(#N/A)` (`ExprPlan::Error`) and a blank go
+///   to `Reference` instead, so they are skipped, not counted.)
+/// - **`Reference`** — everything else: cell/range/structured/name references,
+///   `{…}` array constants, and computed `Binary`/`Unary`/`FnCall` results. The
+///   materialized value(s); count `Value::Number` ONLY (text/bool/blank/error
+///   skipped). A computed scalar arrives as a one-element `Reference`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CountArg {
+    Direct(Value),
+    Reference(Vec<Value>),
+}
+
+/// **GAP-F-06 (COUNT provenance) closure:** signature for the provenance-aware
+/// dispatch tier. The eval-site (`ql-exec::scalar`) classifies each `ExprPlan`
+/// argument into a [`CountArg`] (literal node → `Direct`, everything else →
+/// `Reference`) so the function can apply Excel's direct-vs-reference COUNT rule.
+/// COUNT is the sole initial member (as the `RangeAndContextAware` tier started
+/// with NETWORKDAYS / WORKDAY). Returns a plain `Value`, like every scalar tier.
+pub type ProvenanceAwareFn = fn(&[CountArg]) -> Value;

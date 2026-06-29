@@ -46,70 +46,25 @@ fn n(x: f64) -> Value {
 }
 
 // ============================================================================
-// COUNT — skips errors (canon) + V1 divergence: skips text/bools
-// unconditionally (Excel direct-arg semantics not implemented)
+// COUNT — provenance-aware (GAP-F-06 closure, w146)
 // ============================================================================
-
-#[test]
-fn count_skips_errors_canon() {
-    // Errors-in-range behavior: Excel COUNT canon skips errors (does NOT
-    // propagate). This part matches.
-    let reg = default_registry();
-    let count = reg.lookup("COUNT").expect("COUNT is registered");
-    let args = [
-        Value::Number(1.0),
-        Value::Error(ErrorValue::Ref),
-        Value::Number(2.0),
-        Value::Error(ErrorValue::NA),
-        Value::Number(3.0),
-    ];
-    // 3 numbers, 2 errors → count = 3 (errors SKIPPED, not propagated).
-    assert_eq!(count(&args), Value::Number(3.0));
-}
-
-#[test]
-fn count_skips_text_and_bools_v1_divergence() {
-    // **W5-67 closure (Codex mega-audit HIGH 1):** Excel COUNT canon
-    // distinguishes DIRECT literal args from RANGE/REF args:
-    //  - Direct args: COUNT(TRUE, "1") → 2 (counts logical + numeric text)
-    //  - Range/ref:   COUNT(A1:A2) where A1=TRUE, A2="1" → 0
-    // Quantbook's eval dispatcher pre-evaluates all args before calling
-    // the function, so the count() function CANNOT distinguish provenance.
-    // Current behavior: ALWAYS skips text/bool (matches the range/ref case
-    // but NOT the direct-arg case).
-    //
-    // This is an intentional V1 divergence — provenance-aware dispatch
-    // would require a much larger arg-shape refactor. Pinned here as
-    // V1-divergence so the matrix doc tag (🟡) is enforced.
-    let reg = default_registry();
-    let count = reg.lookup("COUNT").expect("COUNT is registered");
-    let args = [
-        Value::Number(1.0),
-        Value::text("hello"),
-        Value::Blank,
-        Value::Number(2.0),
-        Value::Boolean(true),
-    ];
-    // Only the two Number cells count. Excel (direct args) would also
-    // count Boolean(true) and text "hello"? No — "hello" doesn't parse
-    // as numeric. So Excel direct-arg would count: 1.0, 2.0, true → 3.
-    // We return 2. This is the divergence; pinned.
-    assert_eq!(count(&args), Value::Number(2.0));
-}
-
-#[test]
-fn count_direct_bool_and_numeric_text_v1_divergence() {
-    // Sharper version of the divergence test from the Codex mega-audit:
-    // COUNT(TRUE, "1") — Excel direct-arg returns 2; Quantbook returns 0.
-    let reg = default_registry();
-    let count = reg.lookup("COUNT").expect("COUNT is registered");
-    let args = [Value::Boolean(true), Value::text("1")];
-    assert_eq!(
-        count(&args),
-        Value::Number(0.0),
-        "V1 divergence: Excel direct-arg canon would return 2"
-    );
-}
+//
+// COUNT was previously a plain scalar `fn(&[Value])` registered under "COUNT"
+// and pinned here via `reg.lookup("COUNT")`. As of GAP-F-06 it is registered on
+// the PROVENANCE-AWARE tier (`reg.lookup("COUNT")` now returns `None`) so it can
+// apply Excel's direct-vs-reference rule: a numeric / logical / numeric-text
+// LITERAL typed in the arg list is counted, but the same value reached via a
+// reference / array / computed sub-expression contributes only if it is an
+// actual number. The two former `*_v1_divergence` tests pinned the (now closed)
+// divergence and were removed.
+//
+// COUNT is now covered by:
+//   - the numbers-only KERNEL (`scalar_fns::count`, reused by `SUBTOTAL(2)`):
+//     unit test `count_only_numbers` in `scalar_fns.rs`.
+//   - the provenance KERNEL (`scalar_fns::count_prov`): `count_prov_*` unit
+//     tests in `scalar_fns.rs`.
+//   - end-to-end provenance through the real binder/dispatch: the
+//     `count_provenance_*` tests in `ql-exec::workbook_runtime::validate`.
 
 // ============================================================================
 // COUNTA — counts everything non-blank, INCLUDING errors (diverges from COUNT)
