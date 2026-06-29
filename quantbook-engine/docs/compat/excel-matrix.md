@@ -1,6 +1,18 @@
 # Excel Compatibility Matrix
 
 **Phase:** Engine Phase 4.2 (W5-45, 2026-05-12).
+**w148 truth-pass (2026-06-29):** several per-row statuses had drifted behind the
+registry — the dynamic-array (SORT/SORTBY/UNIQUE/RANDARRAY) and LAMBDA/LET rows
+were left `❌ post-v1` long after they shipped (Wave O / Wave P, 2026-06-20).
+Corrected below against `crates/ql-functions/src/registry.rs`.
+`scripts/report-compat-coverage.sh` now reports **coverage=83% (265/319
+implemented-or-partial; 228 fully `✅`)** — the fix moved the aggregate ~82%→83%
+(the stale rows were only ~1.5% of total, so the headline % was approximately
+right even while individual rows were wrong). The gap to the **90% DoD target** is
+the genuine remaining tail: the `❌` rows (bond math, complex/IM, database D-fns,
+array-stats FREQUENCY/TREND/LINEST/LOGEST, regex) + the `⚠️` partials — real
+Excel-compat work, not a doc artifact. A full per-row registry reconciliation
+(catching any registered fn still missing a row) remains TG5.
 **Spec ID:** ECM-4-01 (matrix exists), ECM-4-02 (each function carries
 status / tests / category / Excel parity notes), ECM-4-03 (CI can
 report coverage percentage).
@@ -185,7 +197,7 @@ as partial, rows with `❌` are missing.
 | PERMUT / PERMUTATIONA | ✅ | 3 | 4.10.D | W5-166: permutations without/with repetition. PERMUT: P(n,k)=n!/(n-k)!; k>n → #NUM!. PERMUTATIONA: n^k; 0^0=1 (mathematical convention via `f64::powf`). |
 | GCD / LCM | ✅ | 6 | 4.3 V2 | W5-57: variadic non-negative integers. Negative arg → #NUM!. Non-integer truncated toward zero (Excel canon). LCM with any 0 returns 0; GCD with all-0 returns 0. Range args not supported (V1 scalar-only). |
 | RAND / RANDBETWEEN | ✅ | 3+ | 3.7 | xorshift64, seeded test fixture |
-| RANDARRAY | ❌ | 0 | 4.7 | Array-result; needs 4.7 |
+| RANDARRAY | ✅ | — | Wave O (2026-06-20) | Dynamic-array; registered via `register_unified` (`registry.rs:1486`), impl `array_returning_fns::randarray`. Spills via the cell-boundary path; volatile. (Was stale-`❌`; corrected w148.) |
 | SUMPRODUCT | ✅ | 7 | 4.3 V2 | W5-55: element-wise multiply arrays then sum. All arrays must have same length. Non-numeric cells treated as 0 (lenient — Excel canon for SUMPRODUCT). Error cells propagate. Scalar args act as constant multipliers. |
 | SUMSQ | ✅ | 4 | 4.10.D | W5-166: variadic sum of squares (ScalarFn; range args flatten via dispatch like SUM). Text + blank skipped, bool coerced (TRUE=1, FALSE=0), errors propagate. Empty → 0. |
 | SUMX2MY2 / SUMX2PY2 / SUMXMY2 | ✅ | 9 | 4.10.D | W5-166: paired array sum-of-squares variants. RangeAwareFn; both args must be ranges; W5-60 strict 2D-shape check (shape mismatch → #VALUE!). Non-numeric cells coerce to 0 (lenient, matches IronCalc canon). Errors in either array propagate. **W5-D-13.1 megaudit closure (Codex HIGH-002 / Opus HIGH-2):** SUMXMY2 was previously unreachable from formula source (`SUMXMY2(...)` lex-errored with `ColumnTooLarge("SUMXMY")`). The W5-D-13.1 lexer letters>3+digit Ident-fallback fixed it. SUMX2MY2 / SUMX2PY2 were already reachable via the W5-D-9 letters-digits-letters extension. Also admitted to `is_aggregate_function` in W5-D-13.1 for named-range arg support. |
@@ -257,7 +269,7 @@ as partial, rows with `❌` are missing.
 | COLUMNS | ✅ | 8+6 e2e | RT-V1-01 Step 2 (W5-RT-2) | W5-RT-2: column count; symmetric to ROWS. Whole-row `COLUMNS(1:1)=16_384`. |
 | TRANSPOSE | ✅ | 12 | 4.7.N (W5-107) | W5-D-13.1 matrix drift closure: registered via `register_unified` (array-returning Unified-ABI). Returns array; spills via the cell-boundary write_spill path. Admitted to `is_aggregate_function` since W5-107 for named-range/Range arg support. |
 | FILTER | ✅ | Coverage via array-returning unified tier | 4.7 | Dynamic-array; registered via `register_unified` at `crates/ql-functions/src/registry.rs:845-855`. **W5-D-PM12-1 (megaudit Codex MEDIUM-2 closure): row split from `FILTER / SORT / SORTBY / UNIQUE` since FILTER alone shipped.** |
-| SORT / SORTBY / UNIQUE | ❌ | 0 | post-v1 | Dynamic-array companions; not in V1 registry. |
+| SORT / SORTBY / UNIQUE | ✅ | — | Wave O (2026-06-20) | Dynamic-array companions; registered via `register_unified` (`registry.rs:1483-1485`), impls `array_returning_fns::{sort,sortby,unique}`. Spill via the cell-boundary write_spill path. (Was stale-`❌` "not in V1 registry"; corrected w148.) |
 | SEQUENCE | ✅ | Coverage via array-returning unified tier | 4.7 | Dynamic-array; registered alongside FILTER + TRANSPOSE at `crates/ql-functions/src/registry.rs:845-855`. **W5-D-PM12-1 (megaudit Codex MEDIUM-2 closure): row added.** |
 | CHOOSE | ✅ | 5 | 4.3 V2 | W5-54 (see notes above) |
 | CHOOSEROWS / CHOOSECOLS | ❌ | 0 | 4.7 | Dynamic-array companions |
@@ -342,7 +354,8 @@ as partial, rows with `❌` are missing.
 | Function | Status | Tests | Phase | Notes |
 |---|---|---|---|---|
 | AI | 🔄 | 3+ | 0 | Returns `#AI_NOT_AVAILABLE_V1` sentinel per CORR-06 / T4-D05; real impl Phase 6.6 |
-| LAMBDA | ❌ | 0 | post-v1 | Excel 365 closures; not in v1 target |
+| LET | ✅ | — | Wave P (2026-06-20) | Binder special form (NOT a registry fn): `ExprPlan::Let`/`LocalRef` (`plan.rs:1026`); named locals with lexical scope via `LocalScopedEnv`. Array-VALUED LET results → `#CALC!` (documented v1 boundary). (Was absent from matrix; added w148.) |
+| LAMBDA | ✅ | — | Wave P (2026-06-20) | Binder special form (NOT a registry fn): `ExprPlan::Lambda`/`CallLambda` (`plan.rs:1031`); closures captured in an eval-time cons-list. A standalone/uninvoked LAMBDA in value position → `#CALC!` (correct Excel canon); invoked via `LAMBDA(..)(args)` or through LET. Recursive LAMBDA with a reachable base case terminates (FN4-03, w142). Helper family (MAP/REDUCE/BYROW/BYCOL/SCAN/MAKEARRAY) gated/partial. (Was stale-`❌` "not in v1 target"; corrected w148.) |
 
 ---
 
