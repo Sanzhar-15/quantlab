@@ -59,7 +59,7 @@ pub use reference_aware_fns::{
 };
 pub use registry::{
     default_registry, FunctionArg, FunctionContext, FunctionFn, FunctionRegistry,
-    FunctionRegistryError, FunctionReturn, RegisteredFn, ScalarFn,
+    FunctionRegistryError, FunctionReturn, RegisteredFn, ScalarFn, ShapeAnchorSpec,
 };
 pub use volatile::{clear_test_overrides, set_test_now_secs, set_test_rng_seed};
 pub use welford::{

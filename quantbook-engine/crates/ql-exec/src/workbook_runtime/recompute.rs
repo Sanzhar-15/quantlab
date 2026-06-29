@@ -3494,6 +3494,352 @@ mod tests {
         assert_eq!(v, Value::Number(9.0));
     }
 
+    // ===== TA2/COR-02 (w147): SUMIF / AVERAGEIF sum_range shape anchoring =====
+    //
+    // Excel ignores the value arg's declared extent and reads a rectangle of the
+    // criteria range's SHAPE anchored at the value arg's top-left cell. These e2e
+    // tests drive the real binder + dispatch (where the resize lives); the kernel
+    // (`range_fns::sumif`/`averageif`) is unchanged. Helper: A1:A5 = [1,2,3,4,5]
+    // (col 0, criteria), B1:B5 = [10,20,30,40,50] (col 1, values).
+    fn put_anchor_fixture(wb: &mut Workbook) {
+        for r in 0..5u32 {
+            wb.put_at(0, r, 0, Value::Number(r as f64 + 1.0)); // A1:A5 = 1..5
+            wb.put_at(0, r, 1, Value::Number((r as f64 + 1.0) * 10.0)); // B1:B5 = 10..50
+        }
+    }
+
+    /// Single-cell value arg `B1` — was `#VALUE!` (CellRef → Scalar); now anchors
+    /// to A1:A5's (5,1) shape → reads B1:B5. `>2` matches A3/A4/A5 → B3+B4+B5 = 120.
+    #[test]
+    fn w147_sumif_single_cell_sum_range_anchors() {
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "SUMIF(A1:A5,\">2\",B1)").unwrap();
+        assert_eq!(v, Value::Number(120.0));
+    }
+
+    /// Mismatched RANGE value arg `B1:B2` (2 cells) re-anchors to the criteria
+    /// (5,1) shape → B1:B5 = 120, NOT the old zip-truncate-to-2 (which would test
+    /// only A1/A2, neither `>2` → 0).
+    #[test]
+    fn w147_sumif_mismatched_range_value_reanchors_not_zip_truncates() {
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "SUMIF(A1:A5,\">2\",B1:B2)").unwrap();
+        assert_eq!(v, Value::Number(120.0));
+    }
+
+    /// Equal-shape value arg `B1:B5` — REGRESSION: identical result to the
+    /// anchored cases (resize to the same shape = the same cells), proving no
+    /// behavior change for the already-correct path.
+    #[test]
+    fn w147_sumif_equal_shape_value_unchanged() {
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "SUMIF(A1:A5,\">2\",B1:B5)").unwrap();
+        assert_eq!(v, Value::Number(120.0));
+    }
+
+    /// Value range extends PAST populated data → padded with Blank → Blank cells
+    /// contribute 0. A1:A3 = [5,5,5] all match `>0`; B1=100, B2/B3 empty → reads
+    /// B1:B3 = [100, Blank, Blank] → 100.
+    #[test]
+    fn w147_sumif_value_range_past_data_pads_blank() {
+        let mut wb = make_runtime_workbook();
+        for r in 0..3u32 {
+            wb.put_at(0, r, 0, Value::Number(5.0));
+        }
+        wb.put_at(0, 0, 1, Value::Number(100.0)); // B1 only
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "SUMIF(A1:A3,\">0\",B1)").unwrap();
+        assert_eq!(v, Value::Number(100.0));
+    }
+
+    /// Vertical reshape: criteria A1:A3 is (3,1); the value arg is declared
+    /// HORIZONTALLY `B1:D1` (1,3) but Excel uses the criteria SHAPE at the value
+    /// top-left → reads B1:B3 (vertical). Set B2/B3 (used) + C1/D1 (must be
+    /// IGNORED). A1:A3 = [1,5,9], `>3` matches A2/A3 → B2+B3 = 200+300 = 500. If
+    /// the declared B1:D1 had been used it would zip C1/D1 (=999) → 1998.
+    #[test]
+    fn w147_sumif_reshapes_horizontal_value_to_criteria_shape() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(1.0)); // A1
+        wb.put_at(0, 1, 0, Value::Number(5.0)); // A2
+        wb.put_at(0, 2, 0, Value::Number(9.0)); // A3
+        wb.put_at(0, 0, 1, Value::Number(100.0)); // B1
+        wb.put_at(0, 1, 1, Value::Number(200.0)); // B2
+        wb.put_at(0, 2, 1, Value::Number(300.0)); // B3
+        wb.put_at(0, 0, 2, Value::Number(999.0)); // C1 — must be ignored
+        wb.put_at(0, 0, 3, Value::Number(999.0)); // D1 — must be ignored
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "SUMIF(A1:A3,\">3\",B1:D1)").unwrap();
+        assert_eq!(v, Value::Number(500.0));
+    }
+
+    /// Named-range value arg (single-cell name) anchors via the AggregateNameRef
+    /// path. `Start` = B1; `SUMIF(A1:A5,">2",Start)` → B1:B5 → 120.
+    #[test]
+    fn w147_sumif_named_range_value_anchors() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        wb.set_name("Start", NamedTarget::Range(Range::new(0, 0, 1, 0, 1)))
+            .unwrap(); // B1:B1
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "SUMIF(A1:A5,\">2\",Start)").unwrap();
+        assert_eq!(v, Value::Number(120.0));
+    }
+
+    /// Scalar criteria range (`SUMIF(5, ">2", B1)`) → arg0 not a range → the
+    /// shape source is `FnArg::Scalar` → resize returns `None` → normal path →
+    /// SUMIF `#VALUE!` (a defined scope boundary, not a silent fallback).
+    #[test]
+    fn w147_sumif_scalar_criteria_range_is_value_error() {
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "SUMIF(5,\">2\",B1)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::Value));
+    }
+
+    /// 2-arg form (no value range) is UNCHANGED — sums the criteria range itself.
+    /// A1:A5 = [1,2,3,4,5], `>2` → 3+4+5 = 12.
+    #[test]
+    fn w147_sumif_two_arg_form_unchanged() {
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "SUMIF(A1:A5,\">2\")").unwrap();
+        assert_eq!(v, Value::Number(12.0));
+    }
+
+    /// AVERAGEIF single-cell value arg anchors → reads B1:B5. `>2` matches
+    /// A3/A4/A5 → avg(30,40,50) = 40.
+    #[test]
+    fn w147_averageif_single_cell_value_anchors() {
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "AVERAGEIF(A1:A5,\">2\",B1)").unwrap();
+        assert_eq!(v, Value::Number(40.0));
+    }
+
+    /// AVERAGEIF over a padded-Blank value range — Blanks are skipped in the
+    /// average (count + total), NOT treated as 0. A1:A3 = [5,5,5] all match `>0`;
+    /// B1=100, B2/B3 empty → reads B1:B3 = [100, Blank, Blank] → count 1 → 100.
+    #[test]
+    fn w147_averageif_padded_blank_skips_in_average() {
+        let mut wb = make_runtime_workbook();
+        for r in 0..3u32 {
+            wb.put_at(0, r, 0, Value::Number(5.0));
+        }
+        wb.put_at(0, 0, 1, Value::Number(100.0)); // B1 only
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "AVERAGEIF(A1:A3,\">0\",B1)").unwrap();
+        assert_eq!(v, Value::Number(100.0));
+    }
+
+    // ----- w147 fold (6-lane audit): Codex MED + Lane B/C coverage gaps -----
+
+    /// Codex MED fold: a defined name targeting a SINGLE CELL binds as
+    /// `ScalarNameRef { inner: CellRef }` (NOT AggregateNameRef) — e.g. an `.xlsx`
+    /// imported single-cell name. It must anchor transparently like a bare cell.
+    /// `Start` = B1 (NamedTarget::Cell); `SUMIF(A1:A5,">2",Start)` → B1:B5 → 120.
+    #[test]
+    fn w147_sumif_named_single_cell_value_anchors() {
+        use ql_storage::NamedTarget;
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        wb.set_name("Start", NamedTarget::Cell(ql_types::Address::new(0, 0, 1)))
+            .unwrap(); // B1
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "SUMIF(A1:A5,\">2\",Start)").unwrap();
+        assert_eq!(v, Value::Number(120.0));
+    }
+
+    /// Codex MED fold (AVERAGEIF): single-cell name anchors → avg(30,40,50) = 40.
+    #[test]
+    fn w147_averageif_named_single_cell_value_anchors() {
+        use ql_storage::NamedTarget;
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        wb.set_name("Start", NamedTarget::Cell(ql_types::Address::new(0, 0, 1)))
+            .unwrap(); // B1
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt
+            .set_formula(0, 0, 5, "AVERAGEIF(A1:A5,\">2\",Start)")
+            .unwrap();
+        assert_eq!(v, Value::Number(40.0));
+    }
+
+    /// Lane B F4 / Lane C C-3: an error cell INSIDE the re-anchored value
+    /// rectangle propagates (unchanged kernel semantics, now via the anchored
+    /// read). B3 = #DIV/0!; `>2` matches A3 → the error in B3 propagates.
+    #[test]
+    fn w147_sumif_error_in_anchored_value_cell_propagates() {
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        wb.put_at(0, 2, 1, Value::Error(ErrorValue::DivZero)); // B3 = #DIV/0!
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // Single-cell anchor B1 → reads B1:B5; ">2" matches A3/A4/A5 → B3 is summed.
+        let v = rt.set_formula(0, 0, 5, "SUMIF(A1:A5,\">2\",B1)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::DivZero));
+    }
+
+    /// Lane C C-3: value range declared LARGER than criteria re-anchors DOWN to
+    /// the criteria shape (the opposite direction from the smaller-range test).
+    /// A1:A3 = [5,5,5] all match `>0`; declared sum_range B1:B10 → reads only
+    /// B1:B3 = 100+200+300 = 600. B4:B10 (=9999 each) must be IGNORED.
+    #[test]
+    fn w147_sumif_value_range_larger_than_criteria_anchors_down() {
+        let mut wb = make_runtime_workbook();
+        for r in 0..3u32 {
+            wb.put_at(0, r, 0, Value::Number(5.0));
+        }
+        wb.put_at(0, 0, 1, Value::Number(100.0)); // B1
+        wb.put_at(0, 1, 1, Value::Number(200.0)); // B2
+        wb.put_at(0, 2, 1, Value::Number(300.0)); // B3
+        for r in 3..10u32 {
+            wb.put_at(0, r, 1, Value::Number(9999.0)); // B4:B10 — must be ignored
+        }
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "SUMIF(A1:A3,\">0\",B1:B10)").unwrap();
+        assert_eq!(v, Value::Number(600.0));
+    }
+
+    /// Lane C C-3: cross-sheet value arg — criteria on sheet 0, value on sheet 1.
+    /// The anchor carries the value arg's sheet. `SUMIF(A1:A5,">2",S2!B1)` reads
+    /// S2!B1:B5 = [10,20,30,40,50] → 30+40+50 = 120.
+    #[test]
+    fn w147_sumif_cross_sheet_value_anchors() {
+        let mut wb = make_runtime_workbook();
+        // Sheet 0: criteria A1:A5 = 1..5.
+        for r in 0..5u32 {
+            wb.put_at(0, r, 0, Value::Number(r as f64 + 1.0));
+        }
+        // Sheet 1 (S2): values B1:B5 = 10..50.
+        wb.add_sheet("S2");
+        for r in 0..5u32 {
+            wb.put_at(1, r, 1, Value::Number((r as f64 + 1.0) * 10.0));
+        }
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "SUMIF(A1:A5,\">2\",S2!B1)").unwrap();
+        assert_eq!(v, Value::Number(120.0));
+    }
+
+    /// Lane C C-3: AVERAGEIF 2-arg form (no average_range) is UNCHANGED — averages
+    /// the criteria range itself. A1:A5 = [1,2,3,4,5], `>2` → avg(3,4,5) = 4.
+    #[test]
+    fn w147_averageif_two_arg_form_unchanged() {
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 5, "AVERAGEIF(A1:A5,\">2\")").unwrap();
+        assert_eq!(v, Value::Number(4.0));
+    }
+
+    // --- w147 Codex r2 HIGH regression: anchored value reads must be tracked
+    //     as deps so an edit to a cell in the EXPANDED-but-undeclared tail
+    //     re-dirties the formula (no stale value). These FAIL without the
+    //     walk_plan_for_deps_inner shape-anchor expansion. ---
+
+    /// Direct CellRef value arg: `C1=SUMIF(A1:A5,">2",B1)` reads B1:B5 → 120.
+    /// Editing B3 (row 2) — in the anchored tail, NOT the declared B1 — must
+    /// re-dirty C1: 300+40+50 = 390 (stale would stay 120).
+    #[test]
+    fn w147_sumif_anchored_tail_edit_redirties_no_stale() {
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let v = rt.set_formula(0, 0, 2, "SUMIF(A1:A5,\">2\",B1)").unwrap();
+            assert_eq!(v, Value::Number(120.0));
+        }
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 2, 1, Value::Number(300.0)).unwrap(); // B3: 30 → 300
+            let _ = rt.recompute_dirty().expect("graph attached");
+        }
+        let result = wb.read(ql_types::Address::new(0, 0, 2));
+        assert_eq!(result, Value::Number(390.0));
+    }
+
+    /// Single-cell NAME value arg (ScalarNameRef): same anchored-tail dep must be
+    /// tracked. `Start`=B1; C1=SUMIF(A1:A5,">2",Start) reads B1:B5; edit B4 → re-dirty.
+    #[test]
+    fn w147_sumif_named_single_cell_anchored_tail_edit_redirties() {
+        use ql_storage::NamedTarget;
+        let mut wb = make_runtime_workbook();
+        put_anchor_fixture(&mut wb);
+        wb.set_name("Start", NamedTarget::Cell(ql_types::Address::new(0, 0, 1)))
+            .unwrap(); // B1
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let v = rt.set_formula(0, 0, 2, "SUMIF(A1:A5,\">2\",Start)").unwrap();
+            assert_eq!(v, Value::Number(120.0)); // 30+40+50
+        }
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 3, 1, Value::Number(400.0)).unwrap(); // B4: 40 → 400
+            let _ = rt.recompute_dirty().expect("graph attached");
+        }
+        let result = wb.read(ql_types::Address::new(0, 0, 2));
+        assert_eq!(result, Value::Number(480.0)); // 30+400+50
+    }
+
+    /// Cross-sheet value arg: the expanded dep is recorded on the VALUE arg's
+    /// sheet. Criteria on sheet 0, value S2!B1 → reads S2!B1:B5. Editing S2!B5
+    /// must re-dirty the sheet-0 formula.
+    #[test]
+    fn w147_sumif_cross_sheet_anchored_tail_edit_redirties() {
+        let mut wb = make_runtime_workbook();
+        for r in 0..5u32 {
+            wb.put_at(0, r, 0, Value::Number(r as f64 + 1.0)); // S!A1:A5 = 1..5
+        }
+        wb.add_sheet("S2");
+        for r in 0..5u32 {
+            wb.put_at(1, r, 1, Value::Number((r as f64 + 1.0) * 10.0)); // S2!B1:B5 = 10..50
+        }
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let v = rt.set_formula(0, 0, 2, "SUMIF(A1:A5,\">2\",S2!B1)").unwrap();
+            assert_eq!(v, Value::Number(120.0)); // S2!B3+B4+B5
+        }
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(1, 4, 1, Value::Number(500.0)).unwrap(); // S2!B5: 50 → 500
+            let _ = rt.recompute_dirty().expect("graph attached");
+        }
+        let result = wb.read(ql_types::Address::new(0, 0, 2));
+        assert_eq!(result, Value::Number(570.0)); // S2!B3+B4+B5 = 30+40+500
+    }
+
     /// SUMIF interacts correctly with the recompute path (Phase 3.6
     /// aggregate cache is BYPASSED for range-aware functions — they
     /// are NOT in `is_aggregate_function`'s set, so they recompute

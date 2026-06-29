@@ -691,11 +691,11 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "W5-83 Phase 4.5.E; covered by format::text_fn::tests + workbook_runtime end-to-end tests",
     ),
     // Range-aware
-    ("SUMIF", "wildcards + V1 anchoring divergence in matrix"),
+    ("SUMIF", "wildcards + sum_range shape anchoring (w147, TA2) — recompute w147 e2e + matrix"),
     ("COUNTIF", "wildcards covered in matrix"),
     ("SUMIFS", "2D shape validation pinned in W5-60"),
     ("COUNTIFS", "2D shape validation pinned in W5-60"),
-    ("AVERAGEIF", "V1 anchoring divergence in matrix"),
+    ("AVERAGEIF", "average_range shape anchoring (w147, TA2) — recompute w147 e2e + matrix"),
     ("AVERAGEIFS", "2D shape validation pinned in W5-60"),
     ("SUMPRODUCT", "2D shape validation pinned in W5-60"),
     // W5-164 (Phase 4.10.B) — conditional-aggregate fillins. Unit

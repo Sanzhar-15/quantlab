@@ -1078,6 +1078,84 @@ mod tests {
         assert_eq!(v4, Value::Number(60.0), "[@Qty] at B4 narrows to A4=30");
     }
 
+    /// **TA2/COR-02 (w147 — Codex r3 HIGH regression):** a `[@Col]` structured ref
+    /// as a SUMIF criteria NARROWS to the formula's single row (1×1) at eval, so
+    /// the value arg is NOT expanded. The dep walker must NOT use the column's
+    /// full `resolved` span — doing so would record a value range covering the
+    /// formula's OWN cell, and since `literal_ranges` feed cycle detection, that
+    /// emits a false self-loop → spurious `#CIRC!`. Here `B4=SUMIF(Sales[@Crit],
+    /// 1, B2)` (formula + value both in the Val column) reads only B2; the
+    /// would-be over-broad dep B2:B5 contains the formula cell B4. With the fix
+    /// the formula computes 100 (not #CIRC!), and editing B3 (in the would-be
+    /// range, not read by eval) neither re-dirties B4 nor trips a cycle.
+    #[test]
+    fn w147_sumif_this_row_structured_criteria_no_false_circ() {
+        use ql_storage::{TableColumn, TableMetadata};
+        let mut wb = make_runtime_workbook();
+        let table = TableMetadata {
+            name: Arc::from("SALES"),
+            display_name: Arc::from("Sales"),
+            sheet: 0,
+            top_row: 0,
+            top_col: 0,
+            rows: 5, // header row 0 + data rows 1..4 (A2:A5 / B2:B5)
+            cols: 2,
+            has_header: true,
+            has_totals: false,
+            columns: vec![
+                TableColumn {
+                    id: 0,
+                    name: Arc::from("crit"),
+                    display: Arc::from("Crit"),
+                    totals_function: None,
+                },
+                TableColumn {
+                    id: 1,
+                    name: Arc::from("val"),
+                    display: Arc::from("Val"),
+                    totals_function: None,
+                },
+            ],
+        };
+        wb.tables_mut().insert(Arc::clone(&table.name), table);
+        // Crit column A2:A5 = 1,1,1,1 (all match the criteria `1`).
+        for r in 1..=4 {
+            wb.put(ql_types::Address::new(0, r, 0), Value::Number(1.0));
+        }
+        // Val column: B2 = 100 (the value anchor), B3 = 999 (in the would-be
+        // over-broad B2:B5 range — must be ignored by eval).
+        wb.put(ql_types::Address::new(0, 1, 1), Value::Number(100.0));
+        wb.put(ql_types::Address::new(0, 2, 1), Value::Number(999.0));
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // B4 (row 3, a Val data cell) → [@Crit] narrows to A4=1 → matches →
+            // sum the value anchored 1×1 = B2 = 100. Must NOT be #CIRC!.
+            let v = rt
+                .set_formula(0, 3, 1, "SUMIF(Sales[@Crit], 1, B2)")
+                .unwrap();
+            assert_eq!(
+                v,
+                Value::Number(100.0),
+                "[@Crit] narrows to 1×1 → reads only B2; must not over-broaden to #CIRC!"
+            );
+        }
+        // Edit B3 — inside the WOULD-BE over-broad B2:B5 dep, but NOT read by eval.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 2, 1, Value::Number(12345.0)).unwrap(); // B3
+            let _ = rt.recompute_dirty().expect("graph attached");
+        }
+        // B4 unchanged (B3 is not a precedent) and still NOT #CIRC!.
+        let result = wb.read(ql_types::Address::new(0, 3, 1));
+        assert_eq!(
+            result,
+            Value::Number(100.0),
+            "editing B3 must not affect B4 or create a false self-cycle"
+        );
+    }
+
     /// **Phase 4.8.G.2 e2e:** `[@Qty]` typed OUTSIDE the table's data
     /// rows → `#VALUE!` per Excel canon. Validates the
     /// `narrow_structured_ref` out-of-range guard.

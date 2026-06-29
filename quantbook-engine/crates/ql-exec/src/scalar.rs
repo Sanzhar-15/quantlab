@@ -368,8 +368,30 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                     // v1 only aggregate-context (scalar SUM/AVERAGE)
                     // arrays are supported per design § 6.3.
                     use ql_functions::FnArg;
+                    // **TA2/COR-02 (w147):** SUMIF / AVERAGEIF re-anchor their
+                    // value arg (sum_range / average_range) to the criteria
+                    // range's shape; `None` for every other fn (byte-identical).
+                    let anchor_spec = registry.shape_anchor_spec(name);
                     let mut fn_args: Vec<FnArg> = Vec::with_capacity(args.len());
-                    for a in args {
+                    for (i, a) in args.iter().enumerate() {
+                        // Shape-anchoring fires ONLY for the value arg of a
+                        // shape-anchoring fn. The shape source (criteria range, a
+                        // strictly lower index per the registered spec's invariant)
+                        // is already materialized into `fn_args`. A `None` result
+                        // (non-anchorable value arg / non-range shape source) falls
+                        // through to the normal materialization below.
+                        if let Some(spec) = anchor_spec {
+                            if i == spec.value_arg_idx {
+                                if let Some(resized) = anchor_resize_value_arg(
+                                    a,
+                                    &fn_args[spec.shape_source_arg_idx],
+                                    env,
+                                ) {
+                                    fn_args.push(resized);
+                                    continue;
+                                }
+                            }
+                        }
                         match a {
                             // **W2-literal-range (2026-06-09):** a literal
                             // colon range (`ExprPlan::RangeRef`, e.g.
@@ -2145,6 +2167,102 @@ fn materialize_ref_arg_lazy(plan: &ExprPlan) -> ql_functions::RefArg {
         ExprPlan::Error(_) => PlanKind::Error,
     };
     RefArg::Shape(kind)
+}
+
+/// **TA2/COR-02 (w147):** Excel SUMIF / AVERAGEIF "sum_range shape anchoring".
+///
+/// Returns `Some(FnArg::Range)` for the value arg (sum_range / average_range)
+/// resized to `shape_source`'s `(rows, cols)` anchored at the value arg's OWN
+/// top-left — reading cells BEYOND its declared extent
+/// (`SUMIF(A2:A10, ">5", B2)` → reads B2:B10). The function body's flat
+/// `crit_range.iter().zip(value.iter())` is then 1:1 and Excel-correct, with no
+/// change to the function body itself.
+///
+/// Returns `None` (the caller falls through to normal per-arg materialization)
+/// when:
+/// - the shape source is not a `Range` (criteria wasn't a range → SUMIF
+///   `#VALUE!` anyway), or
+/// - the value arg has no grid anchor: a scalar / computed expr
+///   (`SUMIF(.., 5)` → `#VALUE!`), a constant defined name, a `StructuredRef`
+///   (same-table columns already share row-count; cross-table differing
+///   row-counts still zip-truncate; the `[@Col]` narrowing is exotic), or a
+///   LET/LAMBDA array-local (no grid coords → still zip-truncates), or
+/// - the requested rectangle could not be read (missing/deleted sheet — the
+///   `read_range_with_shape` `#REF!` sentinel; fall through so the existing path
+///   surfaces the error rather than panicking or silently truncating).
+///
+/// A defined name targeting a SINGLE CELL (`NamedTarget::Cell`, e.g. from `.xlsx`
+/// import) binds as `ScalarNameRef { inner: CellRef }`; it is unwrapped
+/// transparently (FE-10) so it anchors like a bare cell ref.
+///
+/// These are DEFINED scope boundaries, not error-swallowing fallbacks (the
+/// residuals are documented in `excel-matrix.md` / `error-matrix.md`).
+fn anchor_resize_value_arg<E: CellEnv + ?Sized>(
+    value_plan: &ExprPlan,
+    shape_source: &ql_functions::FnArg,
+    env: &E,
+) -> Option<ql_functions::FnArg> {
+    use ql_functions::FnArg;
+    // Target shape from the already-materialized shape-source (criteria) arg.
+    let (rows, cols) = match shape_source {
+        FnArg::Range { rows, cols, .. } => (*rows, *cols),
+        FnArg::Scalar(_) => return None,
+    };
+    // `ScalarNameRef` is semantically transparent (FE-10): a defined name
+    // targeting a single cell binds as `ScalarNameRef { inner: CellRef }` and
+    // evals exactly as its inner. Unwrap it so such a name used as the value arg
+    // anchors like a bare `CellRef`. (Range-target names bind as
+    // `AggregateNameRef`, handled directly below.) (Codex w147 MED.)
+    let mut anchor_plan = value_plan;
+    while let ExprPlan::ScalarNameRef { inner, .. } = anchor_plan {
+        anchor_plan = &**inner;
+    }
+    // Anchor (sheet + top-left) from the value arg's own ExprPlan.
+    let (sheet, start_row, start_col) = match anchor_plan {
+        ExprPlan::RangeRef { range } | ExprPlan::AggregateNameRef { range, .. } => {
+            (range.sheet, range.start_row, range.start_col)
+        }
+        ExprPlan::CellRef {
+            sheet, row, col, ..
+        } => (*sheet, *row, *col),
+        _ => return None,
+    };
+    // Empty criteria range → empty value range (the zip is empty: SUMIF → 0,
+    // AVERAGEIF → #DIV/0!), matching the equal-shape empty-range path.
+    if rows == 0 || cols == 0 {
+        return Some(FnArg::range_with_visibility(Vec::new(), 0, 0, Vec::new()));
+    }
+    // Bounded rectangle of the criteria shape at the value anchor. For any
+    // Excel-bounded workbook (anchor ≤ 1_048_576; rows/cols ≤ the clamped sheet
+    // extent) the end coords are far below u32::MAX, so the constructed range is
+    // ALWAYS bounded — never misread as open-ended by `read_range_with_shape`
+    // (which would clamp to the value column's own extent and defeat the anchor).
+    // Fail LOUDLY if that invariant is ever violated (No-Fallbacks) rather than
+    // silently truncate via `as`.
+    let rows_u32 = u32::try_from(rows).expect("SUMIF/AVERAGEIF anchor: rows exceed u32 grid");
+    let cols_u32 = u32::try_from(cols).expect("SUMIF/AVERAGEIF anchor: cols exceed u32 grid");
+    let end_row = start_row
+        .checked_add(rows_u32 - 1)
+        .expect("SUMIF/AVERAGEIF anchor: end_row overflow (range exceeds u32 grid)");
+    let end_col = start_col
+        .checked_add(cols_u32 - 1)
+        .expect("SUMIF/AVERAGEIF anchor: end_col overflow (range exceeds u32 grid)");
+    let range = ql_types::Range::new(sheet, start_row, start_col, end_row, end_col);
+    let (values, r2, c2) = env.read_range_with_shape(range);
+    // For any EXISTING sheet a bounded read returns exactly the requested shape
+    // (preserve + pad-Blank). The SOLE exception is a missing/deleted sheet, where
+    // the WorkbookEnv impl returns the `(1,1)` `#REF!` sentinel (env.rs). When the
+    // requested rectangle could NOT be fulfilled, the anchor is impossible — fall
+    // through to normal materialization, which surfaces `#REF!` / `#VALUE!` exactly
+    // as the pre-w147 path. NOT an error-swallowing fallback: it routes to the
+    // existing error-surfacing path rather than panicking (a false-invariant
+    // `debug_assert`) or silently zip-truncating to a wrong 0. (Lanes B/C, w147.)
+    if (r2, c2) != (rows, cols) {
+        return None;
+    }
+    // SUMIF / AVERAGEIF ignore row visibility (only SUBTOTAL consults it), so an
+    // empty (all-visible) mask is correct and avoids a second sheet scan.
+    Some(FnArg::range_with_visibility(values, r2, c2, Vec::new()))
 }
 
 /// **Wave G2 (engine-filter):** build a range-relative row-visibility mask for a

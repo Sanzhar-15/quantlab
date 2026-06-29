@@ -1386,6 +1386,92 @@ fn walk_plan_for_deps_inner(
                     walk_plan_for_deps_inner(arg, deps, registry, invoked);
                 }
             }
+            // **TA2/COR-02 (w147 — Codex r2 HIGH):** SUMIF/AVERAGEIF read their
+            // value arg EXPANDED to the criteria range's shape anchored at the
+            // value arg's top-left (`scalar.rs::anchor_resize_value_arg`:
+            // `SUMIF(A1:A5, c, B1)` reads B1:B5). The per-arg walk above records
+            // only the value arg's DECLARED ref (B1), so an edit to a cell in the
+            // un-declared tail (B2:B5) would NOT re-dirty this formula — a STALE
+            // value (the engine's #1 correctness contract). Record the expanded
+            // value rectangle as an extra range dep, on the VALUE arg's own sheet
+            // (cross-sheet anchors tracked correctly). Mirrors the eval-site anchor
+            // extraction incl. the transparent ScalarNameRef unwrap for single-cell
+            // defined names. SUPERSET-safe in the cases that matter: bounded
+            // criteria spans match the eval read exactly; for an open-ended criteria
+            // the value dep saturates to an open-ended column — same-sheet that is a
+            // TRUE self-cycle (the value sheet's used-extent clamp self-includes the
+            // formula's row), and literal `A:A` is `MAX_ROW`-bounded (not the
+            // sentinel) so it too reads the formula cell. The ONE residual is a
+            // CROSS-SHEET `RowId::MAX`-sentinel criteria (an internal/imported
+            // full-column NAME): eval clamps on the criteria sheet while the dep is
+            // open-ended on the value sheet, so a far-down value-column formula can
+            // get a spurious self-loop / `#CIRC!` — see GAP-R-09 (visible error, not
+            // a wrong value; deferred — a precise fix needs the runtime clamp here).
+            if let Some(spec) = registry.shape_anchor_spec(name) {
+                // Criteria SPAN `(rows-1, cols-1)` — the shape the value arg is
+                // expanded to. **Codex r3 HIGH:** a `[@Col]` structured ref
+                // (`is_this_row`) NARROWS to the formula's single row at eval
+                // (1×1, via `narrow_structured_ref`), so its value arg is NOT
+                // expanded. Using the full `resolved` column span here would
+                // over-broaden the dep INTO the formula's own cell — and because
+                // `literal_ranges` feed cycle/order discovery (not just dirtying),
+                // the range-supplemental scheduler would see the formula cell
+                // inside its own registered range and emit a self-loop → a FALSE
+                // `#CIRC!`. A non-this-row structured criteria reads its full
+                // resolved span (matches eval), so it DOES expand. (RangeRef /
+                // AggregateNameRef bounded spans always match the eval read; an
+                // open-ended criteria's clamp self-includes the formula's own row,
+                // so its open-ended value dep is a true — not false — self-cycle.)
+                let crit_span = args.get(spec.shape_source_arg_idx).and_then(|a| match a {
+                    ExprPlan::RangeRef { range } | ExprPlan::AggregateNameRef { range, .. } => {
+                        Some((range.end_row - range.start_row, range.end_col - range.start_col))
+                    }
+                    ExprPlan::StructuredRef {
+                        resolved,
+                        is_this_row,
+                        ..
+                    } => {
+                        if *is_this_row {
+                            Some((0, 0))
+                        } else {
+                            Some((
+                                resolved.end_row - resolved.start_row,
+                                resolved.end_col - resolved.start_col,
+                            ))
+                        }
+                    }
+                    _ => None,
+                });
+                let mut vp = args.get(spec.value_arg_idx);
+                while let Some(ExprPlan::ScalarNameRef { inner, .. }) = vp {
+                    vp = Some(&**inner);
+                }
+                let anchor = vp.and_then(|a| match a {
+                    ExprPlan::RangeRef { range } | ExprPlan::AggregateNameRef { range, .. } => {
+                        Some((range.sheet, range.start_row, range.start_col))
+                    }
+                    ExprPlan::CellRef {
+                        sheet, row, col, ..
+                    } => Some((*sheet, *row, *col)),
+                    _ => None,
+                });
+                if let (Some((row_span, col_span)), Some((vsheet, vrow, vcol))) = (crit_span, anchor)
+                {
+                    // Skip a degenerate 1×1 expansion (is_this_row, or a single-cell
+                    // criteria): the value arg's own declared ref is already recorded
+                    // by the per-arg walk above, so no extra dep is needed — and a
+                    // 1×1 literal_range could only over-track.
+                    if row_span > 0 || col_span > 0 {
+                        deps.literal_ranges.push(ql_types::Range::new(
+                            vsheet,
+                            vrow,
+                            vcol,
+                            vrow.saturating_add(row_span),
+                            vcol.saturating_add(col_span),
+                        ));
+                    }
+                }
+            }
         }
         ExprPlan::AggregateNameRef { name, range } => {
             deps.named_ranges.push((Arc::clone(name), *range));

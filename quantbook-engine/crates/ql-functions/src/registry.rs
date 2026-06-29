@@ -221,6 +221,33 @@ pub enum RegisteredFn {
 /// HashMap enforces this naturally). The pre-W5-96 "cross-table
 /// disjointness" assertions become "name already registered" — same
 /// semantics, simpler implementation.
+/// **TA2/COR-02 (2026-06-29, w147):** per-function metadata describing the
+/// Excel "sum_range shape anchoring" rule for SUMIF / AVERAGEIF. When a
+/// function carries one of these, the eval-site dispatch RE-ANCHORS its
+/// `value_arg_idx` argument: instead of materializing that arg at its own
+/// declared extent, it reads a rectangle of the SAME shape as the (already
+/// materialized) `shape_source_arg_idx` argument, anchored at the value arg's
+/// own top-left cell. This is the only way to express Excel's rule that
+/// `SUMIF(A2:A10, ">5", B2)` reads B2:B10 — the function body receives only
+/// flattened `FnArg`s with no grid coordinates, so the resize must happen at
+/// dispatch where the `ExprPlan` anchor is still in hand.
+///
+/// INVARIANT: `shape_source_arg_idx < value_arg_idx` so the shape source is
+/// materialized FIRST in the left-to-right dispatch loop (asserted at
+/// registration). Held only for the genuine builtins via the closed
+/// [`FunctionRegistry::register_shape_anchor`] (mirrors the FN4-03 forgeable-
+/// marker lesson — external code cannot make an arbitrary fn read beyond its
+/// declared extent).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShapeAnchorSpec {
+    /// Index of the argument whose extent is re-anchored (SUMIF/AVERAGEIF: 2,
+    /// the optional `sum_range` / `average_range`).
+    pub value_arg_idx: usize,
+    /// Index of the argument supplying the target shape (SUMIF/AVERAGEIF: 0,
+    /// the criteria `range`).
+    pub shape_source_arg_idx: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct FunctionRegistry {
     fns: HashMap<&'static str, RegisteredFn>,
@@ -278,6 +305,14 @@ pub struct FunctionRegistry {
     /// metadata entry" path would invite a fn_gen-skew bug; we don't ship
     /// one in v1.
     udf_handles: HashMap<String, FunctionImplHandle>,
+    /// **TA2/COR-02 (2026-06-29, w147):** per-function [`ShapeAnchorSpec`],
+    /// indexed by canonical (ASCII-uppercase) name. Populated ONLY for SUMIF /
+    /// AVERAGEIF via the closed [`Self::register_shape_anchor`] in
+    /// [`default_registry`]. The eval-site dispatch reads it via
+    /// [`Self::shape_anchor_spec`] to re-anchor the value arg (sum_range /
+    /// average_range) to the criteria range's shape — the Excel anchoring rule.
+    /// Empty for every other function and for `FunctionRegistry::new()`.
+    shape_anchor: HashMap<&'static str, ShapeAnchorSpec>,
     /// **FN4-03 (2026-06-29):** the set of canonical-uppercase names registered as
     /// LAZY-LOGICAL builtins (`IF` / `IFERROR` / `IFNA` / `IFS`) — functions whose
     /// Excel semantics evaluate only the selected branch/fallback. The eager
@@ -316,6 +351,9 @@ impl FunctionRegistry {
             // **FN4-03:** empty at boot — `default_registry` marks the four
             // lazy-logical builtins via `register_lazy_logical`.
             lazy_logical: HashSet::new(),
+            // **TA2/COR-02 (w147):** empty at boot — `default_registry` marks
+            // SUMIF / AVERAGEIF via `register_shape_anchor`.
+            shape_anchor: HashMap::new(),
         }
     }
 
@@ -667,6 +705,51 @@ impl FunctionRegistry {
             RegisteredFn::ProvenanceAware(f),
             "FunctionRegistry::register_provenance_aware",
         );
+    }
+
+    /// **TA2/COR-02 (w147):** mark a builtin as shape-anchoring (SUMIF /
+    /// AVERAGEIF). CLOSED registration (mirrors [`Self::register_lazy_logical`]):
+    /// it takes ONLY the name and maps it to the genuine [`ShapeAnchorSpec`]
+    /// internally — there is no way to attach an arbitrary spec or anchor an
+    /// arbitrary function, so external code can never make a function read
+    /// beyond its declared extent. `pub(crate)` so only `default_registry` (this
+    /// crate) can mark builtins. An unknown name panics LOUDLY here at
+    /// construction (No-Fallbacks). The function MUST already be registered
+    /// (range-aware) and the invariant `shape_source_arg_idx < value_arg_idx`
+    /// is asserted so the shape source is materialized first in the dispatch
+    /// loop.
+    pub(crate) fn register_shape_anchor(&mut self, name: &'static str) {
+        let spec = match name {
+            "SUMIF" | "AVERAGEIF" => ShapeAnchorSpec {
+                value_arg_idx: 2,
+                shape_source_arg_idx: 0,
+            },
+            other => panic!(
+                "register_shape_anchor: {other:?} has no known shape-anchor spec \
+                 (only SUMIF / AVERAGEIF); the eval-site resize would have nothing to do"
+            ),
+        };
+        assert!(
+            spec.shape_source_arg_idx < spec.value_arg_idx,
+            "register_shape_anchor: {name:?} violates shape_source_arg_idx < value_arg_idx \
+             (the shape source must be materialized before the value arg in the dispatch loop)"
+        );
+        assert!(
+            self.fns.contains_key(name),
+            "register_shape_anchor: {name:?} must be registered (range-aware) BEFORE \
+             marking it shape-anchoring; call register_range_aware first"
+        );
+        self.shape_anchor.insert(name, spec);
+    }
+
+    /// **TA2/COR-02 (w147):** the [`ShapeAnchorSpec`] for `name`, if it is a
+    /// shape-anchoring builtin (SUMIF / AVERAGEIF), else `None`. Keyed by the
+    /// CANONICAL (uppercase) name — names reaching the evaluator are already
+    /// canonical (the parser uppercases). Called by the ql-exec RangeAware
+    /// dispatch arm to decide whether to re-anchor the value arg. `None` for
+    /// every other function preserves byte-identical materialization.
+    pub fn shape_anchor_spec(&self, name: &str) -> Option<ShapeAnchorSpec> {
+        self.shape_anchor.get(name).copied()
     }
 
     /// **W5-69 (Phase 4.5.A.0):** register a context-aware function. These
@@ -1249,6 +1332,15 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("COUNTIFS", range_fns::countifs);
     r.register_range_aware("AVERAGEIFS", range_fns::averageifs);
     r.register_range_aware("SUMPRODUCT", range_fns::sumproduct);
+
+    // **TA2/COR-02 (w147):** SUMIF / AVERAGEIF re-anchor their optional 3rd arg
+    // (sum_range / average_range) to the criteria range's shape at the value
+    // arg's top-left — the Excel anchoring rule (`SUMIF(A2:A10, ">5", B2)` reads
+    // B2:B10). Both must already be registered range-aware above. SUMIFS /
+    // AVERAGEIFS / COUNTIF are NOT marked: SUMIFS/AVERAGEIFS enforce strict
+    // equal-shape (W5-60), COUNTIF has no value range.
+    r.register_shape_anchor("SUMIF");
+    r.register_shape_anchor("AVERAGEIF");
 
     // Phase 4.10.B (W5-164) — conditional-aggregate fillins.
     r.register_range_aware("MINIFS", range_fns::minifs);
@@ -2895,6 +2987,62 @@ mod tests {
             !r.is_lazy_logical_builtin("IF"),
             "a custom scalar IF on a fresh registry must not be a lazy builtin"
         );
+    }
+
+    /// **TA2/COR-02 (w147):** default_registry marks EXACTLY SUMIF + AVERAGEIF as
+    /// shape-anchoring, with the spec `{value_arg_idx: 2, shape_source_arg_idx: 0}`
+    /// and the materialization-order invariant `shape_source < value`. Every other
+    /// conditional aggregate (and SUM) carries NO spec → byte-identical dispatch.
+    #[test]
+    fn default_registry_marks_shape_anchor_for_sumif_and_averageif() {
+        let r = default_registry();
+        for name in ["SUMIF", "AVERAGEIF"] {
+            let spec = r
+                .shape_anchor_spec(name)
+                .unwrap_or_else(|| panic!("{name} must carry a shape-anchor spec"));
+            assert_eq!(
+                spec,
+                ShapeAnchorSpec {
+                    value_arg_idx: 2,
+                    shape_source_arg_idx: 0,
+                },
+                "{name} shape-anchor spec must be value=2, shape_source=0"
+            );
+            assert!(
+                spec.shape_source_arg_idx < spec.value_arg_idx,
+                "{name}: shape source must be materialized before the value arg"
+            );
+        }
+        // SUMIFS/AVERAGEIFS enforce strict shape; COUNTIF has no value range;
+        // SUM/NOPE are not conditional aggregates at all — none anchor.
+        for name in ["SUMIFS", "AVERAGEIFS", "COUNTIF", "COUNTIFS", "SUM", "NOPE"] {
+            assert!(
+                r.shape_anchor_spec(name).is_none(),
+                "{name} must NOT carry a shape-anchor spec"
+            );
+        }
+    }
+
+    /// **TA2/COR-02 (w147):** `register_shape_anchor` is CLOSED — an unknown name
+    /// (no hardcoded spec) panics LOUDLY at construction (No-Fallbacks), never
+    /// silently no-ops.
+    #[test]
+    #[should_panic(expected = "no known shape-anchor spec")]
+    fn register_shape_anchor_unknown_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register("SUM", scalar_fns::sum);
+        r.register_shape_anchor("SUM");
+    }
+
+    /// **TA2/COR-02 (w147):** marking a function shape-anchoring requires it be
+    /// registered (range-aware) FIRST — guards against a mis-ordered
+    /// default_registry that would silently never resize.
+    #[test]
+    #[should_panic(expected = "must be registered")]
+    fn register_shape_anchor_requires_prior_registration() {
+        let mut r = FunctionRegistry::new();
+        // SUMIF has a known spec, but was never registered on this fresh registry.
+        r.register_shape_anchor("SUMIF");
     }
 
     /// **`iter_metadata` covers everything:** count matches

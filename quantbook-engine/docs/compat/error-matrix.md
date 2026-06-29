@@ -151,10 +151,10 @@ All predicates **introspect** — never propagate errors.
 
 | Function | Override | Tag | Test |
 |---|---|---|---|
-| `SUMIF` | Wildcards (W5-61) text-cell-only; **flat-zip when sum_range ≠ range shape** (V1 divergence from Excel anchoring) | 🟢 / 🟡 anchoring | (range_fns + countif wildcard tests) |
+| `SUMIF` | Wildcards (W5-61) text-cell-only; **sum_range shape-anchored to range** (w147 — reads range's shape at sum_range's top-left, padding out-of-extent cells Blank). Residual: array-local / structured-ref value args not re-anchored | 🟢 | (range_fns + recompute w147 e2e + countif wildcard tests) |
 | `COUNTIF` | Wildcards (W5-61); error cells in range NOT counted | 🟢 | (range_fns module + wildcard tests) |
 | `SUMIFS` / `COUNTIFS` / `AVERAGEIFS` | **Strict 2D shape validation** (W5-60 Codex H2): all criteria_ranges and sum/avg_range must share `(rows, cols)`; mismatch → `#VALUE!` | 🟢 | (range_fns shape tests) |
-| `AVERAGEIF` | Same predicate suite as SUMIF; no matches → `#DIV/0!`; flat-zip divergence shared with SUMIF | 🟢 / 🟡 anchoring | — |
+| `AVERAGEIF` | Same predicate suite as SUMIF; no matches → `#DIV/0!`; **average_range shape-anchored to range** (w147 — same mechanism as SUMIF; out-of-extent cells pad Blank → skipped in the average) | 🟢 | (recompute w147 e2e) |
 | `SUMPRODUCT` | All arrays must share `(rows, cols)` (1×1 broadcast preserved); mismatch → `#VALUE!` | 🟢 | (range_fns shape tests) |
 
 ### 3.7 Math + text overrides (highlights)

@@ -261,12 +261,15 @@ fn build_predicate(criteria: &Value) -> Result<Predicate, ErrorValue> {
 /// (or `range` if `sum_range` omitted) where the corresponding cell
 /// in `range` matches `criteria`.
 ///
-/// Shape: the two ranges are paired element-wise. If `sum_range` is
-/// shorter than `range`, missing cells are treated as if absent (no
-/// contribution). If `sum_range` is longer, extras are ignored.
-/// This matches Excel's "anchor the top-left, ignore mismatched
-/// shape beyond the criteria range's footprint" behavior in the
-/// common case.
+/// Shape: the two ranges are paired element-wise (this kernel flat-zips
+/// `range` against `sum_range`). **Excel shape anchoring (w147, TA2)** is
+/// applied at the eval-site dispatch (`ql-exec::scalar::anchor_resize_value_arg`)
+/// BEFORE this kernel runs: for a `sum_range` that is a range / cell / single-cell
+/// name, the dispatch resizes it to `range`'s shape anchored at `sum_range`'s
+/// top-left (reading beyond its declared extent, padding Blank), so the zip here
+/// is 1:1. The kernel's own zip-truncation is therefore only reachable for the
+/// documented residual value-arg forms (LET/LAMBDA array-locals; cross-table
+/// structured refs).
 pub fn sumif(args: &[FnArg]) -> Value {
     if args.len() < 2 || args.len() > 3 {
         return Value::Error(ErrorValue::Value);
@@ -1114,7 +1117,10 @@ pub fn countif(args: &[FnArg]) -> Value {
 /// `AVERAGEIF(range, criteria, [average_range])` — average cells in
 /// `average_range` (or `range` if omitted) where the corresponding
 /// cell in `range` matches `criteria`. Returns `#DIV/0!` if no cells
-/// match. Same predicate semantics as SUMIF.
+/// match. Same predicate semantics as SUMIF, and the same eval-site shape
+/// anchoring (w147, TA2): a range/cell/single-cell-name `average_range` is
+/// resized to `range`'s shape at its top-left before this kernel runs
+/// (out-of-extent cells pad Blank → skipped, not counted as 0).
 pub fn averageif(args: &[FnArg]) -> Value {
     if args.len() < 2 || args.len() > 3 {
         return Value::Error(ErrorValue::Value);

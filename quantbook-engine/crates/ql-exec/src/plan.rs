@@ -627,7 +627,10 @@ pub(crate) fn is_range_aware_pair_stat_reducer(name: &str) -> bool {
 /// LOUDLY (`#VALUE!`, e.g. `range_fns.rs:280` / `parse_ifs_pairs`), then handed to
 /// `build_predicate(&Value)` — so a `Range` is structurally unreachable past the explicit
 /// reject, and an array-local in a criteria slot never silently computes. The data ranges
-/// accept a `Range` (the wanted path). SUMIF / AVERAGEIF use zip-truncate (no shape error); the
+/// accept a `Range` (the wanted path). For SUMIF / AVERAGEIF a real range/cell value arg
+/// (sum_range / average_range) is RE-ANCHORED to the criteria range's shape at dispatch
+/// (TA2/COR-02, w147 — `anchor_resize_value_arg`); an array-local value arg has NO grid anchor,
+/// so it still zip-truncates here (no shape error); the
 /// `-IFS` family enforces strict 2-D shape (a mismatched array-local → `#VALUE!`). A
 /// NAME-matcher is required (`ArgContext::Aggregate` is shared by the whole RangeAware tier).
 /// The 9 are the complete `register_range_aware` conditional set. Pinned by
