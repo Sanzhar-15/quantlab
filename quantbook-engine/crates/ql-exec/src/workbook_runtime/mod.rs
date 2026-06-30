@@ -13,12 +13,14 @@
 //! - `set_value(sheet, row, col, value)` — literal-only write; clears any existing
 //!   formula association. Phase 3.5: `clear_formula` cascades to drop the
 //!   computed-overlay entry too.
-//! - `recompute_all()` — HashMap-order full pass. Tier C1 (2026-05-18,
+//! - `recompute_all()` — full pass. Tier C1 (2026-05-18,
 //!   Phase 4.12 Opus-B H-2 closure) added an ephemeral
 //!   `CalcgraphSession`-based cycle-detection pre-pass: cycled cells
 //!   short-circuit to `#CIRC!` before the eval loop runs. Acyclic
-//!   formulas still evaluate in HashMap order (GAP-R-01 stale-
-//!   intermediate caveat unchanged).
+//!   formulas evaluate in that schedule's dependency-first topo order,
+//!   with a bounded spill-settle fixpoint (GAP-R-01 closed 2026-06-30,
+//!   COR-1 — was HashMap order, which gave silent non-deterministic
+//!   wrong values on the valueless replay/undo path for depth-≥2 chains).
 //! - `recompute_dirty()` (Phase 3.4 W5-37) — incremental graph-driven recompute.
 //!   Runs Tarjan SCC over the attached `CalcgraphSession`'s dirty set; cycled
 //!   members get `Value::Error(ErrorValue::Circ)`. Phase 3.6 routes aggregates
@@ -263,9 +265,9 @@ impl<'a> WorkbookRuntime<'a> {
     /// mutation hooks on every producer method. Phase 3.1 hooks are
     /// stubs (counter bumps + cell-index updates) — they accumulate
     /// state that Phase 3.3 will turn into real dirty propagation and
-    /// edge updates. Today's recompute_all still walks formulas in
-    /// HashMap order; Phase 3.4 replaces it with a Tarjan-SCC-scheduled
-    /// graph walk.
+    /// edge updates. `recompute_all` walks formulas in the cycle pre-pass
+    /// schedule's dependency-first topo order (GAP-R-01 closed 2026-06-30);
+    /// `recompute_dirty` is the incremental Tarjan-SCC-scheduled graph walk.
     pub fn with_graph(
         workbook: &'a mut Workbook,
         registry: &'a FunctionRegistry,

@@ -11351,6 +11351,59 @@ mod tests {
         );
     }
 
+    /// **GAP-R-01 regression (2026-06-30, COR-1) — the real trigger.** `undo` →
+    /// `rematerialize` replays the op-log onto the baseline; `Op::PutFormula` is
+    /// TEXT-ONLY, so the replayed formula cells carry no computed value, and the
+    /// subsequent full-pass `recompute_all` must resolve a deep chain in
+    /// dependency-first order. The historical bug evaluated that pass in randomized
+    /// `iter_formulas()` HashMap order, so a cell could read its precedent before it
+    /// was computed → a silent, non-deterministic wrong value that STUCK across the
+    /// undo. The 16-link chain makes an accidental-correct HashMap order (~1/16!)
+    /// effectively impossible, so this fails pre-fix and passes deterministically post-fix.
+    #[test]
+    fn gap_r_01_undo_rematerialize_preserves_deep_valueless_chain() {
+        const N: u32 = 16;
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // A1 = 1 (a plain value); A2..A16 each = the cell above + 1.
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        for k in 1..N {
+            // cell at 0-based row k is A(k+1); its precedent A(k) is 1-based row `k`.
+            s.set_formula(addr(sheet, k, 0), &format!("A{k}+1")).unwrap();
+        }
+        let v = |s: &WorkbookSession, row| s.cell(addr(sheet, row, 0)).unwrap().unwrap().value;
+        // Live editing already computed the chain in topo order (recompute_dirty path).
+        assert_eq!(v(&s, N - 1), Some(CellValue::Number { number: N as f64 }));
+
+        // An edit we will undo: A1 = 100 cascades the whole chain.
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 100.0 })
+            .unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            v(&s, N - 1),
+            Some(CellValue::Number {
+                number: (N as f64) + 99.0
+            })
+        );
+
+        // UNDO → rematerialize → recompute_all over the replayed (valueless) chain.
+        assert!(s.undo().unwrap().consumed);
+        // A1 is the restored base value; A2..A16 must be topo-correct through the
+        // valueless full-pass recompute (the GAP-R-01 trigger).
+        assert_eq!(v(&s, 0), Some(CellValue::Number { number: 1.0 }));
+        for k in 1..N {
+            assert_eq!(
+                v(&s, k),
+                Some(CellValue::Number {
+                    number: (k + 1) as f64
+                }),
+                "after undo, A{} must be topo-correct through rematerialize (GAP-R-01)",
+                k + 1
+            );
+        }
+    }
+
     /// **SUBTOTAL nested-skip (2026-06-29) — the core behavior.** A grand-total
     /// `SUBTOTAL` over a range that contains intermediate `SUBTOTAL` cells must
     /// ignore those nested subtotals (the "subtotal of subtotals" guard), for

@@ -7,9 +7,12 @@
 //! change.
 //!
 //! Methods:
-//! - [`WorkbookRuntime::recompute_all`] — HashMap-order full pass
-//!   with the Tier C1 cycle-detection pre-pass (2026-05-18,
-//!   commit 3451d90a03f). Used by `.qbook` load + replay.
+//! - [`WorkbookRuntime::recompute_all`] — full pass with the Tier C1
+//!   cycle-detection pre-pass (2026-05-18, commit 3451d90a03f).
+//!   Used by `.qbook` load + replay + undo/redo (`rematerialize`).
+//!   Evaluates in dependency-first topo order (GAP-R-01 closed
+//!   2026-06-30; previously HashMap-order, which was wrong on the
+//!   valueless replay/undo path for depth-≥2 chains).
 //! - [`WorkbookRuntime::recompute_dirty`] — incremental graph-
 //!   driven recompute via Tarjan SCC over the attached
 //!   `CalcgraphSession`'s dirty set; cycled members get `#CIRC!`.
@@ -64,11 +67,17 @@ impl<'a> WorkbookRuntime<'a> {
     /// refresh stale values (the qbook loader stores formula text + a sentinel
     /// value; this method computes the real value).
     ///
-    /// Iteration order is HashMap-arbitrary, so cross-cell dependencies may
-    /// evaluate in a non-deterministic order. Engine Phase 3 calcgraph
-    /// integration will add topological scheduling for deterministic + correct
-    /// dependency resolution (see `docs/MASTER-PLAN.md` Phase 3.4; tracked as
-    /// GAP-R-01 in `docs/known-gaps.md`).
+    /// **GAP-R-01 closed (2026-06-30, COR-1):** the cycle-detection pre-pass
+    /// already builds a dependency-correct schedule via Tarjan SCC; this method
+    /// now evaluates the acyclic formulas in that `sched.sorted` (dependency-first)
+    /// order rather than the randomized `iter_formulas()` HashMap order. This makes
+    /// the result deterministic AND correct on the `rematerialize` (undo/redo) and
+    /// op-log replay paths, where formula cells carry no stored value and a single
+    /// HashMap-order pass over a depth-≥2 chain could read a precedent before it was
+    /// computed (a silent, non-deterministic wrong value that stuck). A bounded
+    /// fixpoint additionally re-runs the pass while any spill materialization changes
+    /// values, so a formula reading a spill target (which has no schedulable edge)
+    /// settles too. `recompute_dirty` remains the incremental performance path.
     ///
     /// Phase 2B.2 (2026-05-12): signature changed from `Result<usize,
     /// RuntimeError>` to `RecomputeResult` (always returns; no Result
@@ -157,7 +166,18 @@ impl<'a> WorkbookRuntime<'a> {
         //   into the existing HashMap-order eval loop and the
         //   parse/bind error surfaces via the normal `failures`
         //   pathway.
-        let cycled_cells: std::collections::HashSet<(SheetId, RowId, ColId)> = {
+        // **GAP-R-01 (2026-06-30, COR-1):** capture BOTH the cycled set AND the
+        // dependency-first topo rank from the same schedule. The historical bug kept
+        // only `sched.cycled` and discarded `sched.sorted`, then evaluated the acyclic
+        // remainder in `iter_formulas()` HashMap order (randomized SipHash seed). On the
+        // valueless `rematerialize`/replay path a depth-≥2 chain could read a precedent
+        // before it was computed → a silent, non-deterministic wrong value that STUCK.
+        // `sched.sorted` already holds the correct order (Tarjan emits dependency-first;
+        // see `recompute_dirty`'s sorted-node loop); we drive the eval loop in that order.
+        let (cycled_cells, topo_rank): (
+            std::collections::HashSet<(SheetId, RowId, ColId)>,
+            std::collections::HashMap<(SheetId, RowId, ColId), usize>,
+        ) = {
             use crate::calcgraph_session::CalcgraphSession;
             // **6.4-0 audit-fix H2 (2026-05-28):** the original
             // `rebuild_from_workbook(wb)` zero-arg call silently fell
@@ -202,16 +222,28 @@ impl<'a> WorkbookRuntime<'a> {
                 }
             }
             let sched = session.schedule_dirty();
-            sched
+            let cycled: std::collections::HashSet<(SheetId, RowId, ColId)> = sched
                 .cycled
-                .into_iter()
-                .filter_map(|n| session.cell_address_for(n))
-                .collect()
+                .iter()
+                .filter_map(|n| session.cell_address_for(*n))
+                .collect();
+            // Rank each acyclic formula address by its position in the
+            // dependency-first schedule. A formula with no scheduled node never
+            // appears here and falls to the deterministic address-ordered tail.
+            let mut topo_rank: std::collections::HashMap<(SheetId, RowId, ColId), usize> =
+                std::collections::HashMap::with_capacity(sched.sorted.len());
+            for n in &sched.sorted {
+                if let Some(addr) = session.cell_address_for(*n) {
+                    let next = topo_rank.len();
+                    topo_rank.entry(addr).or_insert(next);
+                }
+            }
+            (cycled, topo_rank)
         };
 
         // **Codex H-1 / H-2 closure pre-pass:** write `#CIRC!` to
-        // every cycled cell BEFORE running the HashMap-order eval
-        // loop, and clear any spill anchor that previously lived at
+        // every cycled cell BEFORE running the eval loop, and clear
+        // any spill anchor that previously lived at
         // the same address. Order matters: writing `#CIRC!` before
         // the loop guarantees a non-cycled dependent that reads
         // from a cycled cell sees the error sigil and propagates
@@ -241,14 +273,21 @@ impl<'a> WorkbookRuntime<'a> {
         }
 
         // Snapshot the formula list so we don't hold a borrow during eval.
-        let entries: Vec<(SheetId, RowId, ColId, Arc<str>)> = self
+        let mut entries: Vec<(SheetId, RowId, ColId, Arc<str>)> = self
             .workbook
             .iter_formulas()
             .map(|(s, r, c, f)| (s, r, c, Arc::clone(f)))
             .collect();
+        // **GAP-R-01 (2026-06-30, COR-1):** evaluate in dependency-first (topo) order
+        // computed above instead of `iter_formulas()` HashMap order. Stable sort by topo
+        // rank; an unscheduled formula (no graph node — e.g. a plan that failed to bind,
+        // which has zero edges and no precedents to order against) sorts to the tail,
+        // ordered by address so the whole pass is reproducible run-to-run. Cycled cells
+        // were written `#CIRC!` in the pre-pass and are skipped in the eval pass.
+        entries.sort_by_key(|(s, r, c, _)| {
+            (topo_rank.get(&(*s, *r, *c)).copied().unwrap_or(usize::MAX), *s, *r, *c)
+        });
         let attempted = entries.len();
-        let mut succeeded = 0;
-        let mut failures: Vec<RecomputeFailure> = Vec::new();
         // inc.2c-3: the full-pass path rewrites every formula cell, so report
         // them all as changed (a safe over-report for the delta change-log; the
         // cycled cells were written to `#CIRC!` in the pre-pass above).
@@ -256,7 +295,116 @@ impl<'a> WorkbookRuntime<'a> {
         // **H3 (6.3-0):** dissolved-spill targets from cycled anchors (pre-pass).
         changed_cells.extend(cycled_dissolved_targets);
 
-        for (sheet, row, col, formula_text) in entries {
+        // **GAP-R-01 (2026-06-30, COR-1) — bounded fixpoint.** The topo-ordered eval pass
+        // (`run_recompute_eval_pass`) resolves formula→formula chains in ONE pass. But a
+        // formula that READS a spill TARGET cell (`=B2` where `B1=SEQUENCE(2)` spills into
+        // B1:B2) has NO reader→anchor edge in the schedule on the cold load / replay path
+        // (the spill table is empty until recompute rebuilds it), so a single pass can read
+        // a not-yet-written / stale target. Re-run the pass while a spill is present AND
+        // some value changed (the reader's own value-change drives the propagation, which
+        // also catches same-shape spills whose VALUES changed). PURE formula workbooks
+        // converge in ONE pass (no spill → no re-pass). Mirrors `recompute_dirty`'s
+        // footprint-dirtying fixpoint. Bounded by `max_spills + 2` passes (see the loop).
+        // A spill-target CYCLE is NOT detected here (GAP-R-10): it stops at the bound and
+        // returns non-converged values (same as the pre-fix single pass); `recompute_dirty`
+        // catches such cycles on the live editing path. We do not surface it because the only
+        // cheap signal — workbook-global volatility — is too coarse: one unrelated `RAND()`
+        // would suppress it (Codex r8). A true `#CIRC!` needs post-materialization cycle
+        // re-detection (future work).
+        // Assigned every loop iteration (the `loop` body always runs ≥ once and writes
+        // both before any break), so they need no dead initializer.
+        let mut succeeded;
+        let mut failures: Vec<RecomputeFailure>;
+        let mut max_spills = 0usize;
+        let mut pass_idx = 0usize;
+        loop {
+            let (pass_succeeded, pass_failures, needs_repass, spill_count) = self
+                .run_recompute_eval_pass(
+                    &entries,
+                    &cycled_cells,
+                    preserve_saved_udf,
+                    &mut changed_cells,
+                );
+            succeeded = pass_succeeded;
+            failures = pass_failures;
+            pass_idx += 1;
+            max_spills = max_spills.max(spill_count);
+            // Converged: no spill involved this pass, or no value moved (the common case —
+            // pure-formula workbooks stop after ONE pass; settled spills after two).
+            if !needs_repass {
+                break;
+            }
+            // A value moved AND a spill is involved → spill-target propagation may need
+            // another pass. Worst-case passes for a CONVERGENT workbook = `max_spills + 2`:
+            // a chain of `k ≤ max_spills` spills (each reading the previous spill's target)
+            // materializes over `k` passes in the worst topo order, a trailing SCALAR reader
+            // corrects on pass `k+1`, and pass `k+2` confirms `!needs_repass` (the all-spill
+            // chains of Codex r4/r7 need only `max_spills + 1`; the scalar-reader cases of
+            // r1/r2/r3 need the extra layer). The bound is `max_spills + 2` itself — NOT a
+            // fixed iteration count (a deep legitimate chain genuinely needs that many passes,
+            // Codex r7) — and `max_spills ≤ formula count`, so the loop always terminates.
+            // Reaching the bound without converging is VOLATILE oscillation or an undetected
+            // spill-target cycle (GAP-R-10); both stop here with the current values.
+            if pass_idx >= max_spills.saturating_add(2) {
+                break;
+            }
+        }
+
+        RecomputeResult {
+            attempted,
+            succeeded,
+            failures,
+            // Phase 3.8: `recompute_all` doesn't run the VEQ check —
+            // it's the full-pass path that always re-evaluates everything
+            // (now in topo order). `recompute_dirty` is the path that
+            // benefits from value-equality short-circuit.
+            skipped_value_equality: 0,
+            // Phase 3.9: SIMD-eligibility profile is recompute_dirty-
+            // only. `recompute_all` is the legacy full-pass path.
+            simd_classified: 0,
+            changed_cells,
+        }
+    }
+
+    /// **GAP-R-01 (2026-06-30, COR-1):** one dependency-ordered evaluation pass over
+    /// `entries` (already topo-sorted by the caller). Cycled cells are skipped (the
+    /// caller wrote `#CIRC!` in the pre-pass). Returns
+    /// `(succeeded, failures, needs_repass, spill_count)`:
+    /// - `needs_repass = spill_involved && value_changed` — a spill was involved this
+    ///   pass (so a reader of one of its targets has no schedulable edge) AND something
+    ///   observable moved, so the caller's bounded fixpoint may need to re-run.
+    ///   `value_changed` fires on a formula ANCHOR value change, a spill SHAPE change
+    ///   (incl. first materialization None→Some), OR a same-shape spill TARGET value
+    ///   change (a constant-anchor spill reading a changing input — e.g. a chain of
+    ///   `SEQUENCE(n,1,1,<other spill's target>)`). Together those cover every cell a
+    ///   reader can observe — anchor, target, or plain value — so convergence
+    ///   (`value_changed=false`) means all targets are stable and no reader is stranded.
+    ///   Pure-formula workbooks set `spill_involved=false` → exactly one pass.
+    /// - `spill_count` — spill-involved cells this pass; the caller bounds the fixpoint
+    ///   at `max_spills + 2` passes (the spill-target propagation chain, plus a trailing
+    ///   scalar-reader layer, can't outlast the number of simultaneous spills + 2), so a
+    ///   VOLATILE spill (RANDARRAY /
+    ///   RAND-in-SEQUENCE) whose value changes every pass STOPS at that structural bound
+    ///   instead of looping — its oscillation is a valid volatile result, not staleness.
+    ///
+    /// `changed_cells` is the caller's accumulating over-report for the delta change-log.
+    fn run_recompute_eval_pass(
+        &mut self,
+        entries: &[(SheetId, RowId, ColId, Arc<str>)],
+        cycled_cells: &std::collections::HashSet<(SheetId, RowId, ColId)>,
+        preserve_saved_udf: bool,
+        changed_cells: &mut Vec<(SheetId, RowId, ColId)>,
+    ) -> (usize, Vec<RecomputeFailure>, bool, usize) {
+        let mut succeeded = 0;
+        let mut failures: Vec<RecomputeFailure> = Vec::new();
+        // `needs_repass = spill_involved && value_changed`; `spill_count` bounds the
+        // fixpoint (see the doc above). Both returned below.
+        let mut spill_involved = false;
+        let mut value_changed = false;
+        let mut spill_count: usize = 0;
+        for entry in entries {
+            let (sheet, row, col) = (entry.0, entry.1, entry.2);
+            let formula_text = &entry.3;
             changed_cells.push((sheet, row, col));
             // Tier C1: cycled cells were already written to `#CIRC!`
             // in the pre-pass above and any stale spill cleared.
@@ -278,14 +426,43 @@ impl<'a> WorkbookRuntime<'a> {
             // not the anchor's footprint) would leave its dropped targets absent
             // from `snapshot_delta.removed_cells`.
             let old_shape = self.workbook.spill_anchor_at(sheet, row, col).copied();
+            // **GAP-R-01 fixpoint:** the cell's value at the START of this pass, to
+            // detect a value change that should drive another spill-settle pass.
+            let prior_value = self.workbook.read(ql_types::Address::new(sheet, row, col));
+            // **GAP-R-01 fixpoint (Codex r4):** also snapshot the OLD spill footprint's
+            // TARGET values. A CONSTANT-anchor spill that reads a changing input (e.g. a
+            // chain of `SEQUENCE(n,1,1,<another spill's target>)`) rewrites its targets
+            // with the SAME shape and SAME top-left, so neither the anchor comparison nor
+            // the shape check fires — only a direct target-value diff catches it. (Skips
+            // the anchor cell; first materialization is caught by the shape change below.)
+            let prior_targets: Vec<Value> = match old_shape {
+                Some(shape) => {
+                    let mut v = Vec::new();
+                    for dr in 0..shape.rows {
+                        for dc in 0..shape.cols {
+                            if dr == 0 && dc == 0 {
+                                continue;
+                            }
+                            v.push(
+                                self.workbook
+                                    .read(ql_types::Address::new(sheet, row + dr, col + dc)),
+                            );
+                        }
+                    }
+                    v
+                }
+                None => Vec::new(),
+            };
             // 6.4-3d (blocker D2): preserve saved UDF values only on the load
             // path (`preserve_saved_udf` — true only via
             // `recompute_all_preserving_saved_udf`, i.e. `open`).
-            match self.try_recompute_one_cached(sheet, row, col, &formula_text, preserve_saved_udf)
-            {
+            match self.try_recompute_one_cached(sheet, row, col, formula_text, preserve_saved_udf) {
                 Ok(value) => {
                     // Phase 3.5 (CORR-25): formula outputs route to the
                     // COMPUTED overlay, never the user lane.
+                    if prior_value != value {
+                        value_changed = true;
+                    }
                     self.workbook.put_computed_at(sheet, row, col, value);
                     succeeded += 1;
                     // **H3 (6.3-0):** record the OLD ∪ NEW non-anchor spill
@@ -296,6 +473,41 @@ impl<'a> WorkbookRuntime<'a> {
                     // have no formula, so `iter_formulas()` never visits them) and,
                     // pre-fix (audit HIGH-1), missed dropped targets on shrink too.
                     let new_shape = self.workbook.spill_anchor_at(sheet, row, col).copied();
+                    // **GAP-R-01 fixpoint:** a spill was involved at this cell → its
+                    // targets have no reader edge, so keep iterating while values move;
+                    // `spill_count` bounds how many such passes (see the method doc).
+                    if old_shape.is_some() || new_shape.is_some() {
+                        spill_involved = true;
+                        spill_count += 1;
+                    }
+                    // **GAP-R-01 fixpoint (Codex r4):** a SAME-shape spill whose TARGET
+                    // values changed (a constant-anchor spill reading a changing input)
+                    // moves no anchor and no shape, so diff the targets directly against
+                    // the pre-eval snapshot. Any difference is a value change that must let
+                    // a reader of a target re-evaluate. (Shape changes — incl. first
+                    // materialization None→Some — are caught by the `old_shape != new_shape`
+                    // branch below, so this only needs the equal-shape case.)
+                    if old_shape == new_shape {
+                        if let Some(shape) = new_shape {
+                            let mut idx = 0;
+                            for dr in 0..shape.rows {
+                                for dc in 0..shape.cols {
+                                    if dr == 0 && dc == 0 {
+                                        continue;
+                                    }
+                                    let cur = self.workbook.read(ql_types::Address::new(
+                                        sheet,
+                                        row + dr,
+                                        col + dc,
+                                    ));
+                                    if prior_targets.get(idx) != Some(&cur) {
+                                        value_changed = true;
+                                    }
+                                    idx += 1;
+                                }
+                            }
+                        }
+                    }
                     for shape in [old_shape, new_shape].into_iter().flatten() {
                         for dr in 0..shape.rows {
                             for dc in 0..shape.cols {
@@ -316,6 +528,15 @@ impl<'a> WorkbookRuntime<'a> {
                     // alias deps → skip (avoids per-pass churn). Codex RESHAPE: full-pass
                     // dissolution/shrink had the same alias gap as the error arms.
                     if old_shape != new_shape {
+                        // **GAP-R-01 fixpoint (Codex r3):** a shape change — crucially a
+                        // first MATERIALIZATION (None→Some) on the cold load/replay path —
+                        // writes spill TARGET cells (blank→value) WITHOUT necessarily
+                        // moving the anchor top-left (e.g. `SEQUENCE(n,1,1,k)` whose start
+                        // is constant). That is the ONE target-change-without-anchor-change
+                        // case (any later same-shape target change is driven by a formula
+                        // input whose anchor DOES move and is caught above). Count it as a
+                        // value change so a reader of a freshly-written target re-evaluates.
+                        value_changed = true;
                         self.reextract_spill_footprint_readers(
                             sheet, row, col, old_shape, new_shape,
                         );
@@ -364,7 +585,12 @@ impl<'a> WorkbookRuntime<'a> {
                         // `WorkbookRuntime::new` path; FIRES on the live recalc_all AND
                         // product open/rematerialize paths where the graph is attached).
                         let old_shape =
-                            self.dissolve_errored_spill_all(sheet, row, col, &mut changed_cells);
+                            self.dissolve_errored_spill_all(sheet, row, col, changed_cells);
+                        // **GAP-R-01 fixpoint:** the #NAME? write may move this cell's
+                        // value; track it so a dependent re-evaluates next pass.
+                        if prior_value != Value::Error(ErrorValue::Name) {
+                            value_changed = true;
+                        }
                         self.workbook.put_computed_at(
                             sheet,
                             row,
@@ -372,6 +598,14 @@ impl<'a> WorkbookRuntime<'a> {
                             Value::Error(ErrorValue::Name),
                         );
                         if let Some(s) = old_shape {
+                            // **GAP-R-01 fixpoint:** a spill dissolved (Some→None) → its
+                            // former targets were CLEARED (a target-value change that need
+                            // not move the #NAME? anchor) → mark value_changed AND count it
+                            // toward the propagation bound so a reader of a former target
+                            // re-evaluates next pass.
+                            spill_involved = true;
+                            spill_count += 1;
+                            value_changed = true;
                             self.reextract_spill_footprint_readers(sheet, row, col, Some(s), None);
                         }
                         succeeded += 1;
@@ -380,28 +614,14 @@ impl<'a> WorkbookRuntime<'a> {
                             sheet,
                             row,
                             col,
-                            formula_text,
+                            formula_text: Arc::clone(formula_text),
                             error,
                         });
                     }
                 }
             }
         }
-
-        RecomputeResult {
-            attempted,
-            succeeded,
-            failures,
-            // Phase 3.8: `recompute_all` doesn't run the VEQ check —
-            // it's the HashMap-order legacy path that always
-            // re-evaluates everything. `recompute_dirty` is the path
-            // that benefits from value-equality short-circuit.
-            skipped_value_equality: 0,
-            // Phase 3.9: SIMD-eligibility profile is recompute_dirty-
-            // only. `recompute_all` is the legacy full-pass path.
-            simd_classified: 0,
-            changed_cells,
-        }
+        (succeeded, failures, spill_involved && value_changed, spill_count)
     }
 
     /// **FE-9.x (2026-06-14):** re-extract aliased readers in the (old, new) spill
@@ -587,7 +807,7 @@ impl<'a> WorkbookRuntime<'a> {
     /// runtime was constructed via `new` or `with_oplog`); the
     /// dirty-set lives on the session, so we can't do incremental
     /// recompute without it. Callers in that mode should use
-    /// `recompute_all` for a full HashMap-order pass instead.
+    /// `recompute_all` for a full (topo-ordered) pass instead.
     ///
     /// Returns `Some(RecomputeResult)` otherwise, matching the
     /// aggregation shape of `recompute_all`: per-cell failures
@@ -1374,6 +1594,344 @@ mod tests {
         assert_eq!(
             wb.read(ql_types::Address::new(0, 3, 0)),
             Value::Number(-98.0)
+        );
+    }
+
+    /// **GAP-R-01 regression (2026-06-30, COR-1):** a deep dependency chain whose
+    /// formula cells carry NO stored value (the `rematerialize` / op-log-replay state —
+    /// `Op::PutFormula` is text-only) must resolve to topo-correct values in a single
+    /// `recompute_all` pass. Before the fix, `recompute_all` discarded the computed
+    /// schedule and evaluated in `iter_formulas()` HashMap order, so a cell could read
+    /// its precedent before it was computed → a silent wrong value that STUCK. The chain
+    /// is intentionally long (30 links): the probability a randomized HashMap order
+    /// visits all 30 links in ascending dependency order is ~1/30!, so the pre-fix code
+    /// fails this essentially every run while the topo-ordered fix passes deterministically.
+    #[test]
+    fn recompute_all_resolves_deep_valueless_chain_in_topo_order() {
+        const N: u32 = 30;
+        let mut wb = make_runtime_workbook();
+        // A1 = 1 (a plain value, like a replayed Op::PutValue).
+        wb.put_at(0, 0, 0, Value::Number(1.0));
+        // A2..A30 each = the cell above + 1, inserted as TEXT ONLY (no stored value),
+        // exactly as replay/rematerialize reconstructs formula cells.
+        for k in 1..N {
+            // cell at 0-based row k is A(k+1); its precedent A(k) is 1-based row `k`.
+            wb.put_formula(0, k, 0, format!("A{k}+1"));
+        }
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+        assert_eq!(result.attempted, (N - 1) as usize);
+        assert_eq!(result.succeeded, (N - 1) as usize);
+        assert!(result.is_complete());
+
+        // Every link in the chain — not just the tail — must be exact.
+        for k in 0..N {
+            assert_eq!(
+                wb.read(ql_types::Address::new(0, k, 0)),
+                Value::Number((k + 1) as f64),
+                "row index {k} (A{}) wrong — precedent read out of dependency order",
+                k + 1
+            );
+        }
+    }
+
+    /// **GAP-R-01 regression (2026-06-30, COR-1):** a chain whose links are INSERTED in
+    /// reverse dependency order (deepest formula first) must still resolve correctly —
+    /// the topo schedule, not insertion order, drives evaluation.
+    #[test]
+    fn recompute_all_chain_is_order_independent_and_deterministic() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(10.0)); // A1 = 10
+                                                 // Insert the dependents in reverse (deepest first): A4, A3, A2.
+        wb.put_formula(0, 3, 0, "A3+1"); // A4 = A3+1
+        wb.put_formula(0, 2, 0, "A2+1"); // A3 = A2+1
+        wb.put_formula(0, 1, 0, "A1+1"); // A2 = A1+1
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        assert!(rt.recompute_all().is_complete());
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 0)), Value::Number(11.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 2, 0)), Value::Number(12.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 3, 0)), Value::Number(13.0));
+    }
+
+    /// **GAP-R-01 regression (2026-06-30, COR-1) — diamond DAG.** A non-linear
+    /// dependency (A1 → {B1, C1} → D1), all formula cells valueless, must resolve in a
+    /// single topo-ordered `recompute_all` pass: D1 (the join) must evaluate after BOTH
+    /// arms. Exercises the `topo_rank` → `sort_by_key` wiring on a branching graph.
+    #[test]
+    fn recompute_all_resolves_diamond_dag_valueless() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(5.0)); // A1 = 5 (source value)
+        wb.put_formula(0, 0, 1, "A1+1"); // B1 = A1+1 = 6
+        wb.put_formula(0, 0, 2, "A1*2"); // C1 = A1*2 = 10
+        wb.put_formula(0, 0, 3, "B1+C1"); // D1 = B1+C1 = 16 (depends on BOTH arms)
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+        assert_eq!(result.succeeded, 3);
+        assert!(result.is_complete());
+
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(6.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(10.0));
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Number(16.0),
+            "D1 must evaluate after BOTH B1 and C1 (diamond join)"
+        );
+    }
+
+    /// **GAP-R-01 regression (2026-06-30, COR-1) — spill-target reader (Codex r1).**
+    /// A formula that READS a spill TARGET cell whose anchor materializes during the same
+    /// full pass. On the cold load / replay path the spill table is empty, so the schedule
+    /// has no reader→anchor edge and a single pass could read the not-yet-written target.
+    /// The bounded spill fixpoint re-runs the pass so the reader observes the materialized
+    /// value. `A1 = B2 + 0`; `B1 = SEQUENCE(2)` spills B1:B2 = [1; 2], so B2 = 2 and A1 = 2.
+    #[test]
+    fn recompute_all_reader_of_spill_target_settles_via_fixpoint() {
+        let mut wb = make_runtime_workbook();
+        // A1 reads B2 (a future spill target). Text-only (valueless), like replay.
+        wb.put_formula(0, 0, 0, "B2+0");
+        // B1 = SEQUENCE(2) spills vertically into B1:B2 = [1; 2].
+        wb.put_formula(0, 0, 1, "SEQUENCE(2)");
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        assert!(rt.recompute_all().is_complete());
+
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 1)), Value::Number(2.0));
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Number(2.0),
+            "A1 must observe the materialized spill target B2=2, not a stale blank"
+        );
+    }
+
+    /// **GAP-R-01 regression (2026-06-30, COR-1) — same-shape spill value change (Codex
+    /// r2).** The fixpoint must NOT converge on spill SHAPE alone: a spill that rewrites
+    /// the same footprint with DIFFERENT values (because an input changed) still moves a
+    /// target a reader depends on. Multi-level chain through two spills:
+    /// `A1 = B2+0`; `B1 = SEQUENCE(2,1,C1)` (B2 = C1+1); `C1 = D2+0`; `D1 = SEQUENCE(2,1,10)`
+    /// (D2 = 11). Fixed point: D2=11 → C1=11 → B2=12 → A1=12. A shape-only convergence
+    /// signal would stop early at A1=1; the value-change signal settles to 12.
+    #[test]
+    fn recompute_all_same_shape_spill_value_change_settles() {
+        let mut wb = make_runtime_workbook();
+        wb.put_formula(0, 0, 0, "B2+0"); // A1 reads spill target B2
+        wb.put_formula(0, 0, 1, "SEQUENCE(2,1,C1)"); // B1:B2 = [C1; C1+1], same shape always
+        wb.put_formula(0, 0, 2, "D2+0"); // C1 reads spill target D2
+        wb.put_formula(0, 0, 3, "SEQUENCE(2,1,10)"); // D1:D2 = [10; 11]
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        assert!(rt.recompute_all().is_complete());
+
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 3)),
+            Value::Number(11.0),
+            "D2 spill target"
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(11.0), "C1 = D2");
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 1)),
+            Value::Number(12.0),
+            "B2 = C1 + 1"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Number(12.0),
+            "A1 = B2 — must settle through a SAME-SHAPE spill whose value changed"
+        );
+    }
+
+    /// **GAP-R-01 regression (2026-06-30, COR-1) — volatile spill loads cleanly.** A
+    /// VOLATILE spill (`=RANDARRAY(3)`) produces different values on every evaluation, so
+    /// the spill-settle fixpoint can NEVER reach value-convergence. It must STOP at the
+    /// structural propagation bound (`max_spills + 2` passes) with a complete result and
+    /// terminate (bounded by the formula count) — never hang.
+    #[test]
+    fn recompute_all_volatile_spill_loads_cleanly() {
+        let mut wb = make_runtime_workbook();
+        wb.put_formula(0, 0, 0, "RANDARRAY(3)"); // spills A1:A3, volatile
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+        assert!(
+            result.is_complete(),
+            "a volatile spill must load cleanly, not fail with IterationCap: {:?}",
+            result.failures
+        );
+        for r in 0..3 {
+            assert!(
+                matches!(wb.read(ql_types::Address::new(0, r, 0)), Value::Number(_)),
+                "RANDARRAY target A{} should be a number",
+                r + 1
+            );
+        }
+    }
+
+    /// **GAP-R-01 regression (2026-06-30, COR-1) — constant-anchor spill, target-only
+    /// change (Codex r3).** A spill whose ANCHOR top-left is constant (`SEQUENCE(3)`
+    /// starts at 1) writes its TARGET cells on first materialization WITHOUT moving the
+    /// anchor value. With saved-stale values where each cell's pre-materialization result
+    /// already matches its saved value, NO formula anchor moves on pass 1 — so the
+    /// fixpoint must treat the spill SHAPE change (None→Some) as a value change, or it
+    /// converges early and strands the reader. Here A1 saved = 99 (== its IF/ISBLANK
+    /// blank path) and B1 anchor saved = 1; after recompute A1 must read the materialized
+    /// B2 = 2 (not its stale 99). Pre-fix (shape change not counted) this stuck at 99.
+    #[test]
+    fn recompute_all_constant_anchor_spill_target_change_settles() {
+        let mut wb = make_runtime_workbook();
+        // Saved-stale values matching each cell's pre-materialization result, so NO
+        // formula ANCHOR moves on pass 1 — only the spill SHAPE (None→Some) + its targets.
+        wb.put_at(0, 0, 0, Value::Number(99.0)); // A1 saved = 99 (== IF(ISBLANK(B2),99,..))
+        wb.put_formula(0, 0, 0, "IF(ISBLANK(B2),99,B2)");
+        wb.put_at(0, 0, 1, Value::Number(1.0)); // B1 saved anchor = 1 (== SEQUENCE(3) start)
+        wb.put_formula(0, 0, 1, "SEQUENCE(3)"); // spills B1:B3 = [1;2;3], anchor const 1, B2=2
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        assert!(rt.recompute_all().is_complete());
+
+        // B2 materialized to 2.
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 1)), Value::Number(2.0));
+        // A1 must re-read the freshly-materialized target B2=2, not its stale saved 99.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Number(2.0),
+            "constant-anchor spill: reader must observe the materialized target, not stale 99"
+        );
+    }
+
+    /// **GAP-R-01 regression (2026-06-30, COR-1) — chain of constant-anchor spills (Codex
+    /// r4).** A spill can rewrite its TARGET cells with the SAME shape AND SAME anchor
+    /// top-left by reading another spill's target (`SEQUENCE(n,1,1,step)` has a constant
+    /// start=1; only the step-scaled targets move). A chain of such spills propagates a
+    /// value across passes INVISIBLY to an anchor-or-shape-only convergence signal, so the
+    /// fixpoint must diff target VALUES directly. Fixed point: E2 = 1+2 = 3; C2 = 1+E2 = 4;
+    /// A2 = 1+C2 = 5. An anchor/shape-only signal stops at pass 2 with A2 = 2.
+    #[test]
+    fn recompute_all_constant_anchor_spill_chain_propagates_targets() {
+        let mut wb = make_runtime_workbook();
+        // All valueless (replay state). SEQUENCE(3,1,1,step) = [1; 1+step; 1+2*step],
+        // anchor const 1; the 2nd cell (row 1) = 1 + step.
+        wb.put_formula(0, 0, 0, "SEQUENCE(3,1,1,C2)"); // A col → A2 = 1 + C2
+        wb.put_formula(0, 0, 2, "SEQUENCE(3,1,1,E2)"); // C col → C2 = 1 + E2
+        wb.put_formula(0, 0, 4, "SEQUENCE(3,1,1,2)"); // E col → E2 = 1 + 2 = 3
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        assert!(rt.recompute_all().is_complete());
+
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 4)),
+            Value::Number(3.0),
+            "E2 = 1 + 2"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 2)),
+            Value::Number(4.0),
+            "C2 = 1 + E2"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 0)),
+            Value::Number(5.0),
+            "A2 = 1 + C2 — must propagate through a chain of constant-anchor spills"
+        );
+    }
+
+    /// **GAP-R-01 regression (2026-06-30, COR-1) — spill-target cycle TERMINATES (GAP-R-10).**
+    /// A circular reference THROUGH a spill target — `A1=SEQUENCE(2,1,B1)` spills A1:A2 =
+    /// [B1; B1+1]; `B1=A2` → B1 = B1+1 — is invisible to the cycle pre-pass (the spill table
+    /// is empty during it, so there is no A2→A1 edge) and never reaches a value fixpoint.
+    /// `recompute_all` must TERMINATE (stop at the `max_spills + 2` bound — bounded by the
+    /// formula count) and not hang or panic. It does NOT detect the cycle as `#CIRC!`
+    /// (GAP-R-10 — `recompute_dirty` catches such cycles on the live editing path; surfacing
+    /// it cheaply here is impossible because a single unrelated volatile function would
+    /// suppress the only available signal, Codex r8). This test guards termination.
+    #[test]
+    fn recompute_all_spill_target_cycle_terminates() {
+        let mut wb = make_runtime_workbook();
+        wb.put_formula(0, 0, 0, "SEQUENCE(2,1,B1)"); // A1:A2 = [B1; B1+1]
+        wb.put_formula(0, 0, 1, "A2"); // B1 = A2 = B1 + 1 → no fixed point
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // Must terminate (bounded by max_spills + 2 passes) and return a result — GAP-R-10:
+        // the cycle is not surfaced as #CIRC!, but there is no hang and no panic.
+        let result = rt.recompute_all();
+        assert!(result.is_complete());
+    }
+
+    /// **GAP-R-01 regression (2026-06-30, COR-1) — many volatile spills terminate cleanly
+    /// (Codex r6).** A volatile workbook legitimately never value-converges, so it stops at
+    /// its structural `max_spills + 2` bound (here `max_spills = 100`). It must terminate and
+    /// return a complete result — a RANDARRAY-heavy workbook must load cleanly, not hang.
+    #[test]
+    fn recompute_all_many_volatile_spills_do_not_false_fail() {
+        let mut wb = make_runtime_workbook();
+        // 100 independent volatile spills — RANDARRAY(2,1) in its own column, rows 0..1.
+        for c in 0..100u32 {
+            wb.put_formula(0, 0, c, "RANDARRAY(2,1)");
+        }
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+        assert!(
+            result.is_complete(),
+            "many volatile spills must terminate and load cleanly at the structural bound: {:?}",
+            result.failures
+        );
+    }
+
+    /// **GAP-R-01 regression (2026-06-30, COR-1) — deep acyclic spill chain must not
+    /// false-fail (Codex r7).** A legitimate chain of N spills reading each other's targets
+    /// needs N+1 passes to settle (the head propagates one layer per pass). The fixpoint
+    /// bound is `max_spills + 2` itself — NOT clamped to a fixed iteration count — so a chain
+    /// deeper than any fixed cap still converges instead of spuriously hitting the
+    /// cycle/runaway failure. Depth 120 > the old 100 clamp.
+    #[test]
+    fn recompute_all_deep_non_volatile_spill_chain_does_not_false_fail() {
+        fn col_name(col0: u32) -> String {
+            let mut n = col0 + 1;
+            let mut s = Vec::new();
+            while n > 0 {
+                let rem = (n - 1) % 26;
+                s.push(b'A' + rem as u8);
+                n = (n - 1) / 26;
+            }
+            s.reverse();
+            String::from_utf8(s).unwrap()
+        }
+        const N: u32 = 120; // depth > 100 — exceeds any fixed iteration clamp
+        let mut wb = make_runtime_workbook();
+        // col k (k < N-1) = SEQUENCE(3,1,1, <col k+1>2) reads col (k+1)'s 2nd spill cell;
+        // col N-1 = SEQUENCE(3,1,1,2). Acyclic, non-volatile — the head settles only after
+        // the whole chain has propagated (N+1 passes).
+        for k in 0..N - 1 {
+            let next = col_name(k + 1);
+            wb.put_formula(0, 0, k, format!("SEQUENCE(3,1,1,{next}2)"));
+        }
+        wb.put_formula(0, 0, N - 1, "SEQUENCE(3,1,1,2)");
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+        assert!(
+            result.is_complete(),
+            "a deep (>100) but acyclic non-volatile spill chain must converge, not false-fail \
+             at a fixed iteration cap: {:?}",
+            result.failures
+        );
+        // col(k) 2nd cell = 1 + col(k+1) 2nd cell; base col(N-1) = 1 + 2 = 3 ⇒ col 0 = 3+(N-1).
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 0)),
+            Value::Number((3 + (N - 1)) as f64),
+            "the chain head must propagate the full depth"
         );
     }
 
