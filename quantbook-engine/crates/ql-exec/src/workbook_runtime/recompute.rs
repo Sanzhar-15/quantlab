@@ -794,6 +794,36 @@ impl<'a> WorkbookRuntime<'a> {
         Some(old_shape)
     }
 
+    /// **VOLATILE-STALE (COR-1, 2026-07-01).** Mark every volatile formula
+    /// (NOW / TODAY / RAND / RANDBETWEEN / RANDARRAY / OFFSET / INDIRECT /
+    /// INFO / CELL, plus host-declared-volatile UDFs) dirty AND fan out its
+    /// dependents, so the `recompute_dirty` pass that follows refreshes them.
+    /// Excel recomputes all volatile functions on EVERY recalculation, not
+    /// only on an explicit F9. Folding this into the dirty-recalc dispatch
+    /// (`WorkbookSession::execute_recalc`, the `RecalcKind::Dirty` arm) makes
+    /// that a hard engine invariant the host cannot skip: the shipping IDE
+    /// only ever called `recalc_dirty` and never the separate
+    /// `mark_volatiles_dirty` RPC, so no-dependency volatiles (`NOW()`,
+    /// `RAND()`) and dynamic refs (`OFFSET`/`INDIRECT`) went silently stale.
+    ///
+    /// Returns the number of volatile formulas marked — `0` when the workbook
+    /// has none (an O(1) `mem::take` of the empty set), so the common
+    /// no-volatile recalc keeps its prior cost. `0` too when no
+    /// [`CalcgraphSession`] is attached (the runtime was built via `new` /
+    /// `with_oplog`), matching `recompute_dirty`'s own graph-less no-op.
+    ///
+    /// Panic-safety: [`CalcgraphSession::mark_volatile_dirty`] `mem::take`s
+    /// the volatile set and relies on the caller holding a `FaultGuard`. The
+    /// sole production caller is the `RecalcKind::Dirty` closure in
+    /// `execute_recalc`, which runs inside `with_runtime`'s `FaultGuard` (a
+    /// panic seals the session `Faulted`), so that invariant holds.
+    pub fn mark_volatiles_dirty(&mut self) -> usize {
+        match self.graph.as_deref_mut() {
+            Some(session) => session.mark_volatile_dirty(),
+            None => 0,
+        }
+    }
+
     /// **Engine Phase 3.4 (2026-05-12) — W5-37 SCH-3-01..04 entry
     /// point.** Recompute only the formulas the attached
     /// [`CalcgraphSession`] has marked dirty since the last call.

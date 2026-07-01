@@ -3173,7 +3173,23 @@ impl EngineSession for WorkbookSession {
         // the matching `WorkbookRuntime` call (the recompute closure can't be stored
         // across the start→await boundary, so `RecalcKind` carries the intent).
         match kind {
-            RecalcKind::Dirty => self.execute_recalc(op, |rt| rt.recompute_dirty()),
+            // **VOLATILE-STALE (COR-1, 2026-07-01):** refresh volatile formulas
+            // as part of EVERY dirty recalc — Excel recomputes all volatiles on
+            // each recalculation, not only on an explicit F9. Folding the marking
+            // in here (rather than relying on the host to call the separate
+            // `mark_volatiles_dirty` RPC first) makes it a hard invariant covering
+            // BOTH `recalc_dirty` and the windowed `start_recalc(Dirty)` +
+            // `await_recalc` path — the IDE bug was precisely a missing call, so
+            // `NOW()`/`RAND()`/`OFFSET`/`INDIRECT`/volatile-UDF cells went stale.
+            // It marks volatiles + fans out their dependents INTO the dirty set
+            // before `recompute_dirty` claims it; a no-op when the workbook has no
+            // volatiles. Runs inside `execute_recalc` (not `start_recalc`) so a
+            // pre-await `cancel` leaves the dirty set unpolluted, and inside
+            // `with_runtime`'s `FaultGuard` so the `mem::take` is panic-safe.
+            RecalcKind::Dirty => self.execute_recalc(op, |rt| {
+                rt.mark_volatiles_dirty();
+                rt.recompute_dirty()
+            }),
             RecalcKind::All => self.execute_recalc(op, |rt| Some(rt.recompute_all())),
         }
         Ok(())
@@ -10006,12 +10022,19 @@ mod tests {
         );
     }
 
-    /// **Codex MED-1 / Opus LOW-2 pin:** a UDF cell computed BEFORE a worker is
-    /// installed is a CLEAN `#CALC!`. `set_udf_worker` does NOT dirty it, so
-    /// `recalc_dirty` leaves it `#CALC!`; only `recalc_all` heals it. Pins the
-    /// documented v1 behavior so a future change is a deliberate decision.
+    /// **Codex MED-1 / Opus LOW-2 pin — UPDATED by VOLATILE-STALE (COR-1,
+    /// 2026-07-01).** A UDF cell computed BEFORE a worker is installed is a
+    /// clean `#CALC!`, and `set_udf_worker` does NOT dirty it. This pin
+    /// originally documented that `recalc_dirty` therefore left it `#CALC!`
+    /// (only `recalc_all` healed it), and explicitly invited a future
+    /// deliberate change. VOLATILE-STALE is that change: UDFs are
+    /// `Volatility::Volatile`, and the dirty recalc now refreshes volatiles, so
+    /// `recalc_dirty` re-dispatches the volatile UDF and heals it to 42 (21×2)
+    /// with the newly-installed worker — no separate `recalc_all` required.
+    /// (Pre-fix this cell stayed `#CALC!` because `recalc_dirty` skipped
+    /// volatile marking — the exact staleness VOLATILE-STALE closes.)
     #[test]
-    fn udf_set_worker_after_formula_needs_recalc_all() {
+    fn udf_set_worker_after_formula_healed_by_recalc_dirty_volatile_refresh() {
         let mut s = WorkbookSession::new();
         let sheet = s.add_sheet("S", 16384).unwrap();
         register_udf(&mut s, "MYUDF", 7);
@@ -10023,7 +10046,8 @@ mod tests {
             matches!(cell_value(&s, addr(sheet, 0, 1)), CellValue::Error { error } if error == "#CALC!"),
             "pre-worker: clean #CALC!"
         );
-        // Install a doubling worker. Does NOT dirty the clean #CALC! cell.
+        // Install a doubling worker. It does NOT dirty the clean #CALC! cell —
+        // but MYUDF is volatile, so the next dirty recalc re-dispatches it.
         s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
             |_h, args: &ql_types::ArrayValue| {
                 let n = match args.get(0, 0) {
@@ -10033,16 +10057,20 @@ mod tests {
                 Ok(ql_types::ArrayValue::singleton(Value::Number(n * 2.0)))
             },
         )));
+        // VOLATILE-STALE fix: recalc_dirty refreshes the volatile UDF → heals
+        // #CALC! to 42 (pre-fix this stayed #CALC! and needed recalc_all).
         s.recalc_dirty().unwrap();
-        assert!(
-            matches!(cell_value(&s, addr(sheet, 0, 1)), CellValue::Error { error } if error == "#CALC!"),
-            "recalc_dirty does NOT heal a clean #CALC! UDF cell (documented v1 behavior)"
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 1)),
+            CellValue::Number { number: 42.0 },
+            "recalc_dirty heals the volatile UDF cell once a worker is installed (VOLATILE-STALE)"
         );
+        // Idempotent under a further full recompute.
         s.recalc_all().unwrap();
         assert_eq!(
             cell_value(&s, addr(sheet, 0, 1)),
             CellValue::Number { number: 42.0 },
-            "recalc_all picks up the worker → 42"
+            "recalc_all keeps 42"
         );
     }
 
@@ -10095,6 +10123,93 @@ mod tests {
             cell_value(&s, addr(sheet, 0, 2)),
             CellValue::Number { number: 3.0 },
             "C1 must fan out from volatile B1 (the bug left it stale at 2)"
+        );
+    }
+
+    /// **VOLATILE-STALE (COR-1, 2026-07-01) regression.** A bare
+    /// `recalc_dirty` — with NO preceding `mark_volatiles_dirty` — must
+    /// refresh volatile formulas and fan out to their dependents. Excel
+    /// recomputes all volatiles on every recalculation; the shipping IDE only
+    /// ever called `recalc_dirty`, so this is the exact path that left
+    /// `NOW()`/`RAND()`/`OFFSET`/volatile-UDF cells silently stale. Under the
+    /// pre-fix engine B1 and C1 stay at their call#1 values (1, 2); the fix
+    /// makes `recalc_dirty` itself mark volatiles so B1→2, C1→3.
+    #[test]
+    fn volatile_stale_bare_recalc_dirty_refreshes_volatiles() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        register_udf(&mut s, "MYUDF", 7);
+        let counter = Arc::new(AtomicU64::new(0));
+        let c2 = Arc::clone(&counter);
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+            move |_h, _a: &ql_types::ArrayValue| {
+                let n = c2.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(ql_types::ArrayValue::singleton(Value::Number(n as f64)))
+            },
+        )));
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap(); // B1 = call#1 = 1
+        s.set_formula(addr(sheet, 0, 2), "B1+1").unwrap(); // C1 = 2
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 1)),
+            CellValue::Number { number: 1.0 }
+        );
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 2)),
+            CellValue::Number { number: 2.0 }
+        );
+
+        // recalc_dirty ALONE (no explicit mark_volatiles_dirty) must refresh
+        // the volatile B1 (call#2 = 2) and fan out to C1 (= 3). Pre-fix: stale.
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 1)),
+            CellValue::Number { number: 2.0 },
+            "VOLATILE-STALE: volatile B1 must re-dispatch on a bare recalc_dirty"
+        );
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 2)),
+            CellValue::Number { number: 3.0 },
+            "VOLATILE-STALE: C1 must fan out from the refreshed volatile B1"
+        );
+    }
+
+    /// **VOLATILE-STALE (COR-1) — windowed path.** The volatile-refresh
+    /// invariant must ALSO cover the windowed `start_recalc(RecalcKind::Dirty)`
+    /// + `await_recalc` pair (the binding exposes it separately from the
+    /// `recalc_dirty` convenience wrapper). Both converge on the same
+    /// `execute_recalc(RecalcKind::Dirty)` dispatch, so the host cannot bypass
+    /// volatile refresh via either entry point.
+    #[test]
+    fn volatile_stale_windowed_dirty_recalc_refreshes_volatiles() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        register_udf(&mut s, "MYUDF", 7);
+        let counter = Arc::new(AtomicU64::new(0));
+        let c2 = Arc::clone(&counter);
+        s.set_udf_worker(Box::new(ql_udf::MockWorker::new(
+            move |_h, _a: &ql_types::ArrayValue| {
+                let n = c2.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(ql_types::ArrayValue::singleton(Value::Number(n as f64)))
+            },
+        )));
+        s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap(); // B1 = call#1 = 1
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 1)),
+            CellValue::Number { number: 1.0 }
+        );
+
+        let op = s.start_recalc(RecalcKind::Dirty).unwrap();
+        s.await_recalc(op).unwrap();
+        assert_eq!(
+            cell_value(&s, addr(sheet, 0, 1)),
+            CellValue::Number { number: 2.0 },
+            "VOLATILE-STALE: volatile B1 must re-dispatch on the windowed dirty recalc too"
         );
     }
 

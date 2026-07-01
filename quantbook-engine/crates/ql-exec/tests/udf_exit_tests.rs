@@ -205,10 +205,16 @@ fn exit_test_2_pure_udf_does_not_recompute_on_unrelated_edit() {
 // §10.4 (3) — volatile UDF recomputes on recalc/volatile pass
 // ---------------------------------------------------------------------------
 
-/// A `Volatile` `=MYUDF(A1)` re-evaluates on a volatile pass
-/// (`mark_volatiles_dirty` + `recalc_dirty`) even though NO input changed —
-/// the defining property of volatility. Contrast with exit test 2, where the
-/// SAME `recalc_dirty` leaves a pure UDF untouched.
+/// A `Volatile` `=MYUDF(A1)` re-evaluates on recalc even though NO input
+/// changed — the defining property of volatility. **VOLATILE-STALE (COR-1,
+/// 2026-07-01):** `recalc_dirty` now folds in the volatile pass (Excel
+/// recomputes all volatiles on every recalculation), so the volatile UDF
+/// re-dispatches on a bare `recalc_dirty` — no separate `mark_volatiles_dirty`
+/// RPC required. Contrast with exit test 2, where the SAME `recalc_dirty`
+/// leaves a PURE UDF untouched (only volatile-declared fns re-fire). Pre-fix,
+/// the plain `recalc_dirty` left the volatile stale (counter frozen at 1) and
+/// only the explicit `mark_volatiles_dirty` pass moved it — the exact bug
+/// VOLATILE-STALE closes.
 #[test]
 fn exit_test_3_volatile_udf_recomputes_on_volatile_pass() {
     let mut s = WorkbookSession::new();
@@ -222,31 +228,30 @@ fn exit_test_3_volatile_udf_recomputes_on_volatile_pass() {
     s.set_formula(addr(sheet, 0, 1), "MYUDF(A1)").unwrap(); // B1 = 42
     assert_eq!(calls.load(Ordering::SeqCst), 1, "one initial UDF call");
 
-    // FIRST: a plain recalc_dirty with NOTHING dirty must NOT re-run the volatile
-    // UDF — this isolates the volatile pass from "recalc_dirty re-runs volatiles
-    // anyway". (If this bumped the counter, the volatile-pass assertion below
-    // would be meaningless.)
-    s.recalc_dirty().unwrap();
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "a plain recalc_dirty with no dirty set must NOT re-run the volatile UDF"
-    );
-
-    // THEN the volatile pass: mark volatiles dirty, then recalc → re-evaluates
-    // even though NO input changed. This is the defining property of volatility,
-    // and the ONLY thing that moved the counter from 1 to 2.
-    s.mark_volatiles_dirty().unwrap();
+    // VOLATILE-STALE: a plain recalc_dirty — with NOTHING else dirty — now
+    // re-evaluates the volatile UDF (volatility honored on the edit path). The
+    // value is unchanged (input unchanged) but the worker re-dispatches: 1 → 2.
     s.recalc_dirty().unwrap();
     assert_eq!(
         calls.load(Ordering::SeqCst),
         2,
-        "a volatile UDF must re-evaluate on a volatile pass with no input change"
+        "a volatile UDF must re-evaluate on a plain recalc_dirty (VOLATILE-STALE)"
     );
     assert_eq!(
         cell_value(&s, addr(sheet, 0, 1)),
         CellValue::Number { number: 42.0 },
         "the recomputed value is still correct (input unchanged)"
+    );
+
+    // The explicit `mark_volatiles_dirty` RPC (still used by the HTTP router /
+    // node binding as the F9 trigger) remains valid — now redundant with
+    // recalc_dirty's folded-in pass, it simply re-dispatches once more: 2 → 3.
+    s.mark_volatiles_dirty().unwrap();
+    s.recalc_dirty().unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "explicit volatile pass still re-dispatches the volatile UDF"
     );
 }
 
