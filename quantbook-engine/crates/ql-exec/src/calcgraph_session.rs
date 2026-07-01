@@ -3038,6 +3038,21 @@ impl CalcgraphSession {
         // entry removal.
         self.aggregate_cache.invalidate_at(sheet, row, col);
 
+        // **AGG-STALE (COR-1, 2026-07-01):** the seed invalidate above only drops
+        // aggregates whose range contains the WRITTEN cell. A *formula* member of
+        // a cached range that changes because of an edit *outside* the range
+        // (e.g. `B5 = C1 + 1` ∈ `SUM(B1:B10)`, edit `C1`) is NOT invalidated here
+        // — deliberately. Doing it in this BFS (at mark-dirty time) is both
+        // insufficient and premature: insufficient because a `set_formula`
+        // between the edit and the next recompute can RE-STORE the stale
+        // aggregate (it reads not-yet-recomputed members), re-opening the window;
+        // premature because a dirty-but-unrecomputed member still holds its old
+        // value, so the cached aggregate is still consistent until that member
+        // actually recomputes. The invalidation is therefore done at RECOMPUTE
+        // time: `WorkbookRuntime::recompute_dirty` invalidates every cell it is
+        // about to recompute, before any aggregate lookup — after all re-store
+        // opportunities, before all reads. See `recompute_dirty`.
+
         // Seed with the direct fanout from the edited cell (which may
         // not itself be a formula).
         for dep in self.graph.dependents_for_cell(sheet, row, col) {
@@ -3179,6 +3194,19 @@ impl CalcgraphSession {
     /// nothing in the range changed since the last computation.
     pub fn aggregate_cache(&self) -> &InMemAggregateCache {
         &self.aggregate_cache
+    }
+
+    /// **AGG-STALE (COR-1, 2026-07-01):** drop every cached aggregate whose
+    /// range contains `(sheet,row,col)`. `WorkbookRuntime::recompute_dirty`
+    /// calls this for each cell it is about to recompute, BEFORE any aggregate
+    /// lookup in that pass — so an aggregate whose range covers a to-be-
+    /// recomputed member recomputes from a fresh read, never a stale cache hit.
+    /// This is the recompute-time counterpart of the seed invalidate in
+    /// `mark_dirty_from_cell_write`; it also closes the re-cache window where a
+    /// `set_formula` between a dirtying edit and the recompute re-stored a stale
+    /// aggregate from not-yet-recomputed members.
+    pub(crate) fn invalidate_aggregate_cache_at(&mut self, sheet: SheetId, row: RowId, col: ColId) {
+        self.aggregate_cache.invalidate_at(sheet, row, col);
     }
 
     /// Phase 3.6 — snapshot of `(hits, misses, invalidations)` for

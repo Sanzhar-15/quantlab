@@ -883,10 +883,27 @@ impl<'a> WorkbookRuntime<'a> {
             }
             attempted += sched.total_count();
 
+            // **AGG-STALE (COR-1, 2026-07-01):** before any aggregate lookup this
+            // iteration, invalidate every cached aggregate whose range covers a
+            // cell we are about to recompute. A dirty member's cached
+            // contribution only goes stale once the member ACTUALLY recomputes
+            // (until then its overlay value still matches what the cache was
+            // built from), so this recompute-time pass — not the mark-dirty BFS —
+            // is the correct place: it runs AFTER any mid-batch `set_formula`
+            // could have re-stored a stale aggregate from not-yet-recomputed
+            // members, and BEFORE any read in the cycled/sorted loops below.
+            // Guarded on a non-empty cache (re-checked each iteration, since the
+            // prior iteration's eval may have stored entries) so the common
+            // no-aggregate case keeps its prior cost.
+            let invalidate_stale_aggregates = session.aggregate_cache().entry_count() > 0;
+
             // Snapshot prior + originally_dirty for newly-seen nodes.
             for n in sched.sorted.iter().chain(sched.cycled.iter()) {
                 originally_dirty.insert(*n);
                 if let Some(addr) = session.cell_address_for(*n) {
+                    if invalidate_stale_aggregates {
+                        session.invalidate_aggregate_cache_at(addr.0, addr.1, addr.2);
+                    }
                     prior.entry(addr).or_insert_with(|| {
                         self.workbook
                             .read(ql_types::Address::new(addr.0, addr.1, addr.2))
@@ -3555,6 +3572,204 @@ mod tests {
             graph.graph().stripe_index().stripe_count(),
             1,
             "AGG-3-03: full-column dep registers a single stripe"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // AGG-STALE (COR-1, 2026-07-01) — stale aggregate cache over a
+    // transitively-dirtied member. Before the fix, the aggregate cache
+    // was invalidated only at the seed (the edited cell); a formula cell
+    // INSIDE a cached range that changed because of an edit OUTSIDE the
+    // range left the owning aggregate re-evaluating against a stale hit.
+    // ----------------------------------------------------------------
+
+    /// **AGG-STALE regression — the headline case.** `D1 = SUM(B1:B10)` with
+    /// `B5 = C1 + 1` (B5 ∈ B1:B10, C1 ∉). Editing C1 re-dirties B5; the SUM
+    /// must reflect B5's new value, not the cached old total. This is the most
+    /// common spreadsheet shape (an aggregate over a column of computed cells).
+    #[test]
+    fn agg_stale_transitive_scalar_member_recomputes_fresh() {
+        let mut wb = make_runtime_workbook();
+        for r in 0..10u32 {
+            wb.put_at(0, r, 1, Value::Number(0.0)); // B1..B10 literal 0
+        }
+        wb.put_at(0, 0, 2, Value::Number(10.0)); // C1 = 10
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // B5 = C1 + 1 = 11 (a member of B1:B10).
+            assert_eq!(rt.set_formula(0, 4, 1, "C1+1").unwrap(), Value::Number(11.0));
+            // D1 = SUM(B1:B10) = 11; this populates the aggregate cache.
+            assert_eq!(
+                rt.set_formula(0, 0, 3, "SUM(B1:B10)").unwrap(),
+                Value::Number(11.0)
+            );
+        }
+        assert_eq!(
+            graph.aggregate_cache_stats().invalidations,
+            0,
+            "no invalidation during setup"
+        );
+
+        // Edit C1 (OUTSIDE B1:B10) — re-dirties B5 (INSIDE B1:B10) → D1.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 2, Value::Number(20.0)).unwrap();
+            assert!(rt.recompute_dirty().unwrap().is_complete());
+        }
+
+        assert!(
+            graph.aggregate_cache_stats().invalidations >= 1,
+            "AGG-STALE: an outside edit that re-dirties an in-range member must \
+             invalidate the aggregate cache (invalidations={})",
+            graph.aggregate_cache_stats().invalidations
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 4, 1)),
+            Value::Number(21.0),
+            "B5 recomputed to C1+1 = 21"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Number(21.0),
+            "AGG-STALE: D1=SUM(B1:B10) must reflect B5's new value (21), not the \
+             stale cached total (11)"
+        );
+    }
+
+    /// **AGG-STALE regression — depth ≥ 2.** The dirtied in-range member sits at
+    /// the end of a chain rooted outside the range (`C1 → E1 → B5`), proving the
+    /// BFS invalidates the cache for members reached at depth ≥ 2, not only the
+    /// seed's direct dependents.
+    #[test]
+    fn agg_stale_deep_transitive_chain_member_recomputes_fresh() {
+        let mut wb = make_runtime_workbook();
+        for r in 0..10u32 {
+            wb.put_at(0, r, 1, Value::Number(0.0)); // B1..B10 literal 0
+        }
+        wb.put_at(0, 0, 2, Value::Number(5.0)); // C1 = 5
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // Set in dependency order so each initial eval reads fresh inputs.
+            assert_eq!(rt.set_formula(0, 0, 4, "C1+1").unwrap(), Value::Number(6.0)); // E1
+            assert_eq!(rt.set_formula(0, 4, 1, "E1*2").unwrap(), Value::Number(12.0)); // B5 ∈ range
+            assert_eq!(
+                rt.set_formula(0, 0, 3, "SUM(B1:B10)").unwrap(),
+                Value::Number(12.0)
+            ); // D1 caches 12
+        }
+
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 2, Value::Number(9.0)).unwrap(); // C1=9 → E1=10 → B5=20
+            assert!(rt.recompute_dirty().unwrap().is_complete());
+        }
+
+        assert!(graph.aggregate_cache_stats().invalidations >= 1);
+        assert_eq!(wb.read(ql_types::Address::new(0, 4, 1)), Value::Number(20.0)); // B5
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Number(20.0),
+            "AGG-STALE: a depth-2 chain change must propagate to the cached SUM"
+        );
+    }
+
+    /// **AGG-STALE regression — spill TARGET member (defensive).** The cache key
+    /// is a range over CELLS, and a spill writes values to target cells that are
+    /// not formula nodes. Here `D1 = SUM(B2:B3)` covers ONLY the spill targets of
+    /// `B1 = SEQUENCE(3,1,C1)` (the anchor B1 is excluded). Editing C1 changes
+    /// B2/B3; the SUM must follow. This case is covered by the existing
+    /// `write_spill → on_set_value(target) → seed invalidate` chain (not the BFS
+    /// fix), but a regression test locks that coupling in place.
+    #[test]
+    fn agg_stale_spill_target_only_range_recomputes_fresh() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 2, Value::Number(10.0)); // C1 = 10
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // B1 = SEQUENCE(3,1,C1) spills B1:B3 = [10; 11; 12].
+            rt.set_formula(0, 0, 1, "SEQUENCE(3, 1, C1)").unwrap();
+            // D1 = SUM(B2:B3) covers only the spill TARGETS (rows 1..2), not the
+            // anchor (row 0). = 11 + 12 = 23; populates the cache.
+            assert_eq!(
+                rt.set_formula(0, 0, 3, "SUM(B2:B3)").unwrap(),
+                Value::Number(23.0)
+            );
+        }
+        // Sanity: the spill materialized.
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 1)), Value::Number(11.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 2, 1)), Value::Number(12.0));
+
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 2, Value::Number(20.0)).unwrap(); // C1=20 → B2=21,B3=22
+            assert!(rt.recompute_dirty().unwrap().is_complete());
+        }
+
+        assert!(
+            graph.aggregate_cache_stats().invalidations >= 1,
+            "AGG-STALE: a spill that rewrites in-range targets must invalidate the \
+             aggregate cache"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Number(43.0),
+            "AGG-STALE: D1=SUM(B2:B3) must follow the spill targets (21+22=43), not \
+             the stale cached total (23)"
+        );
+    }
+
+    /// **AGG-STALE regression — the re-cache window (Codex NO-SHIP, r2).** The
+    /// crux a mark-dirty-time invalidation misses: within a batch (ops applied
+    /// with NO recompute between them, per `Session::batch`), a cached aggregate
+    /// can be RE-STORED stale AFTER the dirtying edit but BEFORE the recompute.
+    /// Here `set_value(C1)` dirties member B5 (which still holds its old value),
+    /// then authoring `E1 = SUM(B1:B10)` evaluates immediately, reads the
+    /// not-yet-recomputed B5, and (re-)stores SUM(B1:B10)=11. `recompute_dirty`
+    /// then recomputes B5=21 and D1 must NOT serve the stale 11. This is fixed by
+    /// the RECOMPUTE-time invalidation (invalidate every cell about to recompute,
+    /// before any lookup); it FAILS if the fix lives only in
+    /// `mark_dirty_from_cell_write`.
+    #[test]
+    fn agg_stale_recache_window_before_recompute_recomputes_fresh() {
+        let mut wb = make_runtime_workbook();
+        for r in 0..10u32 {
+            wb.put_at(0, r, 1, Value::Number(0.0)); // B1..B10 literal 0
+        }
+        wb.put_at(0, 0, 2, Value::Number(10.0)); // C1 = 10
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            assert_eq!(rt.set_formula(0, 4, 1, "C1+1").unwrap(), Value::Number(11.0)); // B5
+            assert_eq!(
+                rt.set_formula(0, 0, 3, "SUM(B1:B10)").unwrap(),
+                Value::Number(11.0)
+            ); // D1 caches SUM(B1:B10) = 11
+        }
+
+        // Batch-style: a dirtying edit followed by authoring a NEW aggregate,
+        // with NO recompute in between — this reproduces the re-cache window.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 2, Value::Number(20.0)).unwrap(); // C1=20 → B5 dirty (overlay still 11)
+            // E1 = SUM(B1:B10) evaluated NOW reads the un-recomputed B5=11 and
+            // (re-)caches SUM=11 — the stale entry that must not survive.
+            rt.set_formula(0, 0, 4, "SUM(B1:B10)").unwrap();
+            assert!(rt.recompute_dirty().unwrap().is_complete());
+        }
+
+        assert_eq!(wb.read(ql_types::Address::new(0, 4, 1)), Value::Number(21.0)); // B5
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Number(21.0),
+            "AGG-STALE re-cache window: D1=SUM(B1:B10) must recompute to 21, not \
+             serve the stale 11 re-cached by E1's mid-batch eval"
         );
     }
 
