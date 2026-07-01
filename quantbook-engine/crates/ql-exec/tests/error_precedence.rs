@@ -299,3 +299,25 @@ fn precedence_lone_text_coercion_failure_is_value_error_canon() {
     let v = eval(&mut rt, 0, 1, 0, "A1+B1");
     assert_eq!(v, Value::Error(ErrorValue::Value));
 }
+
+// ============================================================================
+// POW-ASSOC (COR-1, 2026-07-01): Excel `^` is LEFT-associative. End-to-end
+// value lock (parse → eval) for the corrected grouping — the AST-shape fix
+// lives in ql-formula-syntax's `infix_bp`/`binary_bp`. Before the flip the
+// engine parsed `^` right-associative and silently returned the wrong number
+// (=2^3^2 → 512 instead of 64), a "silent wrong value" COR-1 defect.
+// ============================================================================
+
+#[test]
+fn power_operator_is_left_associative_canon() {
+    let (mut wb, mut oplog) = fresh_session();
+    let reg = default_registry();
+    let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+
+    // =2^3^2 → (2^3)^2 = 8^2 = 64  (NOT 2^(3^2) = 2^9 = 512).
+    assert_eq!(eval(&mut rt, 0, 0, 0, "2^3^2"), Value::Number(64.0));
+    // =3^3^2 → (3^3)^2 = 27^2 = 729  (NOT 3^(3^2) = 3^9 = 19683).
+    assert_eq!(eval(&mut rt, 0, 1, 0, "3^3^2"), Value::Number(729.0));
+    // Explicit parens still force right-grouping: =2^(3^2) = 2^9 = 512.
+    assert_eq!(eval(&mut rt, 0, 2, 0, "2^(3^2)"), Value::Number(512.0));
+}

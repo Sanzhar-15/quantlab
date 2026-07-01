@@ -12,8 +12,10 @@
 //!
 //! - For a child binary expression with op `c_op`, parenthesize if `bp(c_op).lbp <
 //!   parent_min_bp`.
-//! - For a power right-operand: parenthesize if `bp(c_op).rbp <= parent_rbp` (since `^`
-//!   is right-associative).
+//! - `^` is LEFT-associative (POW-ASSOC, 2026-07-01), like every other binary
+//!   operator, so it needs no special case: a same-op RIGHT operand is
+//!   parenthesized by the generic `lbp < parent_min_bp` rule (the right operand
+//!   is printed with `parent_min_bp = rbp + 1`), e.g. `2 ^ (3 ^ 2)` keeps parens.
 //!
 //! This produces canonical output: `=1 + 2 * 3` (no parens), `=(1 + 2) * 3` (parens
 //! around the addition).
@@ -974,7 +976,7 @@ fn binary_bp(op: Operator) -> (u8, u8) {
         Operator::Concat => (20, 21),
         Operator::Plus | Operator::Minus => (30, 31),
         Operator::Mul | Operator::Div => (40, 41),
-        Operator::Pow => (51, 50),
+        Operator::Pow => (50, 51),
         // Audit L4 fix (2026-05-12): Percent is postfix-only; `binary_bp(Percent)`
         // never occurs in correct code. Loud panic per the no-fallbacks rule.
         Operator::Percent => {
@@ -1137,11 +1139,14 @@ mod tests {
     }
 
     #[test]
-    fn print_power_right_assoc() {
-        // 2 ^ 3 ^ 2 → 2 ^ (3 ^ 2) in AST. Printer: power is right-assoc with rbp 50;
-        // the right operand of `^` needs parens only when its lbp < 51. 3^2 has lbp 51
-        // which is NOT < 51, so NO parens (preserves right-assoc).
+    fn print_power_left_assoc() {
+        // POW-ASSOC (2026-07-01): `^` is LEFT-associative. `2 ^ 3 ^ 2` parses to
+        // the left-grouped `(2 ^ 3) ^ 2`; the default left-grouping prints WITHOUT
+        // parens (a same-op LHS needs none). The explicit right-grouped form
+        // `2 ^ (3 ^ 2)` is the NON-default association, so its same-op RHS DOES
+        // get parens (generic `lbp < parent_min_bp`; RHS printed at rbp + 1 = 52).
         assert_eq!(rt("2 ^ 3 ^ 2"), "2 ^ 3 ^ 2");
+        assert_eq!(rt("2 ^ (3 ^ 2)"), "2 ^ (3 ^ 2)");
     }
 
     #[test]
@@ -1247,26 +1252,31 @@ mod tests {
         rt_roundtrip("A1 + B1 * 2 - 5");
     }
 
-    /// Audit H1 regression test (2026-05-12). `(a^b)^c` is left-grouped (Pow's LHS is
-    /// itself a Pow). Previously the printer emitted `a ^ b ^ c` because both child
-    /// and parent had lbp=51 and the `lbp < parent_min_bp` check was false. The
-    /// resulting string re-parses as right-grouped `a^(b^c)`, breaking the AST. Fix:
-    /// pass `lbp + 1` to the LHS for right-associative ops so the LHS-as-same-op gets
-    /// parens.
+    /// POW-ASSOC (COR-1, 2026-07-01) — `^` associativity flipped to LEFT (Excel
+    /// canon). The paren-insertion concern is now the MIRROR of the old Audit H1
+    /// case (2026-05-12): the natural association `2 ^ 3 ^ 4` is left-grouped
+    /// `Pow(Pow(2,3),4)` and prints WITHOUT parens, while the non-default
+    /// right-grouped `2 ^ (3 ^ 4)` = `Pow(2,Pow(3,4))` MUST print with parens
+    /// around its same-op RHS (generic rule: the right operand is printed at
+    /// `parent_min_bp = rbp + 1 = 52`, so a same-op child with lbp 50 < 52 gets
+    /// parens) — else it would re-parse as the left-grouped form, breaking the AST.
     #[test]
-    fn roundtrip_left_grouped_power() {
-        // Direct round-trip: parse `(2^3)^4` should equal parse(print(parse(input))).
+    fn roundtrip_right_grouped_power() {
+        // The explicit right-grouped (non-default) form must survive the round-trip.
+        rt_roundtrip("2 ^ (3 ^ 4)");
+        // Adversarial deep right-grouping.
+        rt_roundtrip("2 ^ (3 ^ (4 ^ 5))");
+        // The natural left-grouped forms round-trip too (no parens needed).
+        rt_roundtrip("2 ^ 3 ^ 4");
         rt_roundtrip("(2 ^ 3) ^ 4");
-        // Adversarial deep left-grouping.
-        rt_roundtrip("((2 ^ 3) ^ 4) ^ 5");
-        // Confirm the surface form makes parens explicit. The parser of `2 ^ 3 ^ 4`
-        // produces Pow(2, Pow(3, 4)) (right-assoc); printing must NOT add parens.
-        // The parser of `(2 ^ 3) ^ 4` produces Pow(Pow(2, 3), 4); printing MUST add
-        // parens around the LHS to preserve the AST.
-        let right_grouped = parse(lex("2 ^ 3 ^ 4").unwrap()).unwrap();
-        assert_eq!(print(&right_grouped), "2 ^ 3 ^ 4");
-        let left_grouped = parse(lex("(2 ^ 3) ^ 4").unwrap()).unwrap();
-        assert_eq!(print(&left_grouped), "(2 ^ 3) ^ 4");
+        // Confirm the surface form. The parser of `2 ^ 3 ^ 4` now produces the
+        // left-grouped Pow(Pow(2, 3), 4); printing must NOT add parens.
+        let left_grouped = parse(lex("2 ^ 3 ^ 4").unwrap()).unwrap();
+        assert_eq!(print(&left_grouped), "2 ^ 3 ^ 4");
+        // The parser of `2 ^ (3 ^ 4)` produces the right-grouped Pow(2, Pow(3, 4));
+        // printing MUST add parens around the RHS to preserve the AST.
+        let right_grouped = parse(lex("2 ^ (3 ^ 4)").unwrap()).unwrap();
+        assert_eq!(print(&right_grouped), "2 ^ (3 ^ 4)");
     }
 
     #[test]

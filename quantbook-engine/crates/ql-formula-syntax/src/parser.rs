@@ -8,7 +8,7 @@
 //! concat (&)                            bp 20/21
 //! addition (+, -)                       bp 30/31
 //! multiplication (*, /)                 bp 40/41
-//! power (^)                             bp 51/50 — right-assoc
+//! power (^)                             bp 50/51 — left-assoc
 //! percent (postfix %)                   bp 60   — postfix unary
 //! unary prefix (-x, +x)                 bp 70
 //! range (:)                             bp 80/81 — highest
@@ -180,7 +180,7 @@ struct Parser {
     /// Current recursive-descent depth of `parse_expr`. Incremented on
     /// entry and decremented on exit of every `parse_expr` call (the single
     /// choke point all deep recursion funnels through — parens, unary, `@`,
-    /// function args, and right-associative operator RHS all re-enter it).
+    /// function args, and every infix operator's RHS all re-enter it).
     depth: u32,
 }
 
@@ -213,8 +213,8 @@ impl Parser {
     /// recursion depth rather than a monotonic call count — a wide-but-shallow
     /// formula like `SUM(1,2,…,1000)` calls this 1000 times but never deeper
     /// than ~2, so it is unaffected. Every deep-recursion path (parens, unary
-    /// `-`/`+`, `@`, function args via `parse_call_args`, and right-associative
-    /// operator RHS) re-enters through this wrapper, so the cap lives in
+    /// `-`/`+`, `@`, function args via `parse_call_args`, and every infix
+    /// operator's RHS) re-enters through this wrapper, so the cap lives in
     /// exactly one place. `parse_expr_inner` holds the actual Pratt loop.
     fn parse_expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
         self.depth += 1;
@@ -1216,7 +1216,7 @@ fn infix_bp(op: Operator) -> Option<(u8, u8)> {
         Operator::Concat => Some((20, 21)),
         Operator::Plus | Operator::Minus => Some((30, 31)),
         Operator::Mul | Operator::Div => Some((40, 41)),
-        Operator::Pow => Some((51, 50)), // right-assoc: lbp > rbp by 1
+        Operator::Pow => Some((50, 51)), // left-assoc: rbp > lbp by 1 (Excel ^ is left-assoc)
         Operator::Percent => None,       // postfix-only
     }
 }
@@ -1713,8 +1713,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_power_right_associative() {
-        // 2 ^ 3 ^ 2 → 2 ^ (3 ^ 2)
+    fn parse_power_left_associative() {
+        // POW-ASSOC (COR-1, 2026-07-01): Excel `^` is LEFT-associative.
+        // 2 ^ 3 ^ 2 → (2 ^ 3) ^ 2  [= 64, NOT 2 ^ (3 ^ 2) = 512].
         let e = p("2 ^ 3 ^ 2");
         match e {
             Expr::Binary {
@@ -1722,14 +1723,15 @@ mod tests {
                 lhs,
                 rhs,
             } => {
-                assert_eq!(*lhs, Expr::Number(2.0));
+                // LHS is the nested power (2 ^ 3); RHS is the trailing exponent 2.
                 assert!(matches!(
-                    *rhs,
+                    *lhs,
                     Expr::Binary {
                         op: Operator::Pow,
                         ..
                     }
                 ));
+                assert_eq!(*rhs, Expr::Number(2.0));
             }
             _ => panic!(),
         }
@@ -2489,17 +2491,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_depth_guard_rejects_deep_right_assoc_power() {
-        // `1^1^1^…` — `^` is right-associative, so each operator recurses
-        // through `parse_expr(rbp)`; this is the operator-chain DoS vector
-        // (distinct from the left-associative `1+1+1+…`, which is iterative
-        // and stays shallow — see the OK test below).
-        let chain = "1^".repeat(5_000) + "1";
-        let err = parse_err(&chain);
-        assert!(
-            matches!(err, ParseError::DepthExceeded { max } if max == MAX_PARSE_DEPTH),
-            "expected DepthExceeded({MAX_PARSE_DEPTH}), got {err:?}"
-        );
+    fn parse_depth_guard_does_not_reject_long_left_assoc_power_chain() {
+        // POW-ASSOC (COR-1, 2026-07-01): now that `^` is LEFT-associative it is
+        // built ITERATIVELY in the Pratt loop (like `1+1+1+…`), NOT via deep
+        // `parse_expr(rbp)` recursion — so a long `1^1^1^…` chain stays shallow
+        // during PARSE and must NOT trip the depth guard. (Before the flip `^`
+        // was right-assoc and DID recurse deeply; that operator-chain DoS vector
+        // is gone for `^`. Genuine recursion depth is still guarded via nested
+        // parens/calls — see `parse_depth_guard_rejects_deep_parens` and
+        // `parse_depth_guard_rejects_deep_function_calls`.) Length kept modest
+        // (500 ≫ the depth-100 guard, enough to prove it isn't counted) because
+        // the RESULT is a left-leaning `Expr::Binary` tree whose recursive `Drop`
+        // runs on the harness stack — mirroring the `1+1+1+…` sibling test.
+        let chain = "1".to_owned() + &"^1".repeat(500);
+        let expr = parse_ok(&chain);
+        assert!(matches!(expr, Expr::Binary { .. }));
     }
 
     #[test]

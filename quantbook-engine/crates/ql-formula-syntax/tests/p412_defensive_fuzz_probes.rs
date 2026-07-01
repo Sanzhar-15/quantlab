@@ -159,8 +159,10 @@ fn deep_unary_minus_5000() {
     eprintln!("deep_unary_minus_5000: {r:?}");
 }
 
-/// Deeply right-associative power chain `2^2^2^...^2` (1000 ops). The
-/// power operator is right-assoc, so it produces a left-rotated recursion.
+/// Deep power chain `2^2^2^...^2` (1000 ops). POW-ASSOC (2026-07-01): `^` is
+/// now LEFT-associative, so this parses ITERATIVELY (shallow, like `1+1+…`)
+/// into a deep left-leaning tree — no parse recursion. (Before the flip `^`
+/// was right-assoc and this recursed deeply.)
 #[test]
 #[ignore]
 fn deep_power_chain_1000() {
