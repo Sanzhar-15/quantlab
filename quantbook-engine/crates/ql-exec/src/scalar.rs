@@ -3126,7 +3126,23 @@ fn compare_values_excel(lhs: &Value, rhs: &Value) -> std::cmp::Ordering {
     match (lhs, rhs) {
         (Value::Number(a), Value::Number(b)) => return a.partial_cmp(b).unwrap_or(Ordering::Equal),
         (Value::Boolean(a), Value::Boolean(b)) => return a.cmp(b),
-        (Value::Text(a), Value::Text(b)) => return a.as_ref().cmp(b.as_ref()),
+        // **CMP-CASE (COR-1, 2026-07-01):** Excel text comparison via the
+        // relational operators (`=`/`<>`/`<`/`>`/`<=`/`>=`) is case-INSENSITIVE.
+        // Fold both operands with full-Unicode `to_uppercase()` before ordering —
+        // matching the engine's case-insensitive text paths that fold with
+        // `to_uppercase()`: SUMIF/COUNTIF `apply_text_cmp`, SORT `sort_cmp`, UNIQUE
+        // `values_equal_for_unique`, approx-match `lookup_cmp`, wildcard matching.
+        // (Exact-match `lookup_eq` still folds ASCII-only via `eq_ignore_ascii_case`
+        // — a pre-existing lone outlier, tracked separately, not this fix's scope.)
+        // The operator was the lone case-SENSITIVE holdout (raw code-point order →
+        // `="a"="A"` returned
+        // FALSE, a silent wrong boolean on the most basic operator). Folding gives
+        // a case-insensitive TOTAL ORDER, so `<`/`>` treat case-only differences as
+        // Equal too (`="a"<"A"` and `="a">"A"` are both FALSE, matching Excel).
+        // `EXACT()` keeps its own byte-exact compare (`scalar_fns::exact`).
+        (Value::Text(a), Value::Text(b)) => {
+            return a.as_ref().to_uppercase().cmp(&b.as_ref().to_uppercase())
+        }
         (Value::Blank, Value::Blank) => return Ordering::Equal,
         _ => {}
     }
@@ -4106,6 +4122,71 @@ mod tests {
             rhs: Box::new(Expr::Number(10.0)),
         };
         assert_eq!(eval(&expr, &env), Value::Boolean(true));
+    }
+
+    // ===== CMP-CASE (COR-1, 2026-07-01): case-insensitive text comparison =====
+
+    /// Helper: evaluate a text-vs-text relational comparison `l <op> r`.
+    fn text_cmp(op: Operator, l: &str, r: &str) -> Value {
+        let env = MapEnv::new();
+        let expr = Expr::Binary {
+            op,
+            lhs: Box::new(Expr::String(Arc::from(l))),
+            rhs: Box::new(Expr::String(Arc::from(r))),
+        };
+        eval(&expr, &env)
+    }
+
+    /// **CMP-CASE:** Excel text `=`/`<>` is case-INSENSITIVE. Pre-fix these
+    /// compared code-point-sensitively → `="a"="A"` returned FALSE (a silent
+    /// wrong boolean on the most basic operator).
+    #[test]
+    fn compare_text_equality_is_case_insensitive() {
+        assert_eq!(
+            text_cmp(Operator::Eq, "a", "A"),
+            Value::Boolean(true),
+            "=\"a\"=\"A\" must be TRUE (case-insensitive)"
+        );
+        assert_eq!(
+            text_cmp(Operator::Eq, "Apple", "apple"),
+            Value::Boolean(true),
+            "mixed-case equal strings compare equal"
+        );
+        assert_eq!(
+            text_cmp(Operator::Neq, "a", "A"),
+            Value::Boolean(false),
+            "=\"a\"<>\"A\" must be FALSE"
+        );
+        // Genuinely different text is still unequal.
+        assert_eq!(
+            text_cmp(Operator::Eq, "apple", "orange"),
+            Value::Boolean(false),
+            "distinct text stays unequal"
+        );
+    }
+
+    /// **CMP-CASE:** the fold yields a case-insensitive TOTAL ORDER, so `<`/`>`
+    /// treat case-only differences as Equal, and order distinct text by folded
+    /// code points — matching SUMIF/SORT/UNIQUE (`to_uppercase`) and Excel.
+    #[test]
+    fn compare_text_ordering_is_case_insensitive() {
+        // Case-only difference → neither less nor greater (Equal).
+        assert_eq!(text_cmp(Operator::Lt, "a", "A"), Value::Boolean(false));
+        assert_eq!(text_cmp(Operator::Gt, "a", "A"), Value::Boolean(false));
+        assert_eq!(text_cmp(Operator::Le, "a", "A"), Value::Boolean(true));
+        assert_eq!(text_cmp(Operator::Ge, "a", "A"), Value::Boolean(true));
+        // Distinct text orders case-insensitively: apple < BANANA (A < B).
+        assert_eq!(
+            text_cmp(Operator::Lt, "apple", "BANANA"),
+            Value::Boolean(true),
+            "\"apple\" < \"BANANA\" (folded A < B), not code-point 'a'(0x61) > 'B'(0x42)"
+        );
+        // ...and Zebra > apple (Z > A) despite mixed case.
+        assert_eq!(
+            text_cmp(Operator::Lt, "Zebra", "apple"),
+            Value::Boolean(false),
+            "\"Zebra\" is NOT < \"apple\" (folded Z > A)"
+        );
     }
 
     // ===== Phase 2A.9 audit M3: 0^0 = #NUM! =====
