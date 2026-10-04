@@ -42,9 +42,10 @@ function code() {
 	export ELECTRON_ENABLE_STACK_DUMPING=1
 	export ELECTRON_ENABLE_LOGGING=1
 
-	# Delta Plus Server demo credentials
-	export QUANTLAB_DEMO_EMAIL="demo@deltaplus.io"
-	export QUANTLAB_DEMO_PASSWORD="DeltaPlus-Demo-2026!"
+	# Delta Plus Server demo credentials: both must already be set in the environment (no defaults)
+	: "${QUANTLAB_DEMO_EMAIL:?QUANTLAB_DEMO_EMAIL is unset: export it before running scripts/code.sh}"
+	: "${QUANTLAB_DEMO_PASSWORD:?QUANTLAB_DEMO_PASSWORD is unset: export it before running scripts/code.sh}"
+	export QUANTLAB_DEMO_EMAIL QUANTLAB_DEMO_PASSWORD
 	if [[ "$OSTYPE" != "darwin"* && -z "${CHROME_DESKTOP}" ]]; then
 		export CHROME_DESKTOP=quantlab-dev.desktop
 	fi

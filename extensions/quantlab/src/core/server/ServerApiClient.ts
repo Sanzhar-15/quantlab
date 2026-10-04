@@ -54,9 +54,15 @@ const DEFAULT_CONFIG = {
  * Set QUANTLAB_DEMO_EMAIL and QUANTLAB_DEMO_PASSWORD before using demo mode.
  */
 function getDemoCredentials(): { email: string; password: string } {
-	// Use environment variables with fallback to default demo credentials
-	const email = process.env.QUANTLAB_DEMO_EMAIL ?? 'demo@deltaplus.io';
-	const password = process.env.QUANTLAB_DEMO_PASSWORD ?? 'DeltaPlus-Demo-2026!';
+	// No defaults: both variables must be set and non-empty, otherwise fail loudly
+	const email = process.env.QUANTLAB_DEMO_EMAIL;
+	if (email === undefined || email === '') {
+		throw new Error('QUANTLAB_DEMO_EMAIL is unset: export it before using demo mode');
+	}
+	const password = process.env.QUANTLAB_DEMO_PASSWORD;
+	if (password === undefined || password === '') {
+		throw new Error('QUANTLAB_DEMO_PASSWORD is unset: export it before using demo mode');
+	}
 
 	// Basic validation
 	if (!email.includes('@') || email.length < 5) {

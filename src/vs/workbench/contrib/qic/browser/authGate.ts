@@ -13,12 +13,39 @@
 
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
+import { localize } from '../../../../nls.js';
+import { ConfigurationScope, Extensions as ConfigurationExtensions, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
+import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+import { Registry } from '../../../../platform/registry/common/platform.js';
 import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
 import { IRequestService, asJson } from '../../../../platform/request/common/request.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
 
 const SESSIONS_KEY = 'deltaplus.sessions';
 const BASE_URL = 'https://api.deltaplus.io';
+
+// ── Demo account settings — NO defaults. Unset => the demo button is disabled. ──
+const DEMO_EMAIL_SETTING = 'qic.demo.email';
+const DEMO_PASSWORD_SETTING = 'qic.demo.password';
+
+// No `default` key on purpose: the demo pair is never shipped in the product.
+// APPLICATION scope: only user settings can supply it, never a workspace's settings.json.
+Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).registerConfiguration({
+	id: 'qic.demo',
+	title: localize('qic.demo.configuration', "Orion Demo Account"),
+	properties: {
+		[DEMO_EMAIL_SETTING]: {
+			type: 'string',
+			scope: ConfigurationScope.APPLICATION,
+			description: localize('qic.demo.email', "E-mail of the demo account used by 'Use Demo Account' on the sign-in screen. No default: the button stays disabled until this and qic.demo.password are set."),
+		},
+		[DEMO_PASSWORD_SETTING]: {
+			type: 'string',
+			scope: ConfigurationScope.APPLICATION,
+			description: localize('qic.demo.password', "Password of the demo account used by 'Use Demo Account' on the sign-in screen. No default: the button stays disabled until this and qic.demo.email are set."),
+		},
+	}
+});
 
 // ── Palette — must exactly match Quantlab Dark theme + titleBar token ────────
 const C = {
@@ -82,8 +109,14 @@ export class AuthGate extends Disposable {
 	constructor(
 		@ISecretStorageService private readonly _secrets: ISecretStorageService,
 		@IRequestService private readonly _http: IRequestService,
+		@IConfigurationService private readonly _config: IConfigurationService,
 	) {
 		super();
+		this._register(this._config.onDidChangeConfiguration(e => {
+			if (this._el && (e.affectsConfiguration(DEMO_EMAIL_SETTING) || e.affectsConfiguration(DEMO_PASSWORD_SETTING))) {
+				this._refreshDemo(this._el);
+			}
+		}));
 		this._show();        // synchronous — zero flash
 		void this._init();
 	}
@@ -371,8 +404,11 @@ export class AuthGate extends Disposable {
 			cursor: 'pointer',
 		} as Partial<CSSStyleDeclaration>, { id: 'qag-demo-btn', type: 'button' });
 		demoBtn.textContent = 'Use Demo Account';
+		const demoMsg = this._makeErrorEl('qag-demo-msg');
+		demoMsg.style.marginTop = '10px';
+		demoMsg.style.marginBottom = '0';
 
-		append(inner, heading, subhead, tabs, signinForm, registerForm, divider, demoBtn);
+		append(inner, heading, subhead, tabs, signinForm, registerForm, divider, demoBtn, demoMsg);
 		panel.appendChild(inner);
 		return panel;
 	}
@@ -513,17 +549,63 @@ export class AuthGate extends Disposable {
 			}
 		});
 
-		// Demo
+		// Demo (credentials come from the qic.demo.* settings; no literal, no default)
+		this._refreshDemo(root);
 		root.querySelector<HTMLButtonElement>('#qag-demo-btn')!.addEventListener('click', async () => {
 			const btn = root.querySelector<HTMLButtonElement>('#qag-demo-btn')!;
+			const msgEl = root.querySelector<HTMLElement>('#qag-demo-msg')!;
 			this._setLoading(btn, true, 'Connecting\u2026');
+			msgEl.style.display = 'none';
 			try {
-				await this._doSignIn('demo@deltaplus.io', 'DeltaPlus-Demo-2026!');
+				const pair = this._requireDemoPair();
+				await this._doSignIn(pair.email, pair.password);
 				this._remove(true);
-			} catch {
+			} catch (err) {
 				this._setLoading(btn, false, 'Use Demo Account');
+				this._refreshDemo(root);
+				this._showError(msgEl, err instanceof Error ? err.message : 'Demo sign-in failed. Please try again.');
 			}
 		});
+	}
+
+	/** Names of the demo settings that are unset or empty (no default exists). */
+	private _unsetDemoSettings(): string[] {
+		const unset: string[] = [];
+		for (const key of [DEMO_EMAIL_SETTING, DEMO_PASSWORD_SETTING]) {
+			const v = this._config.getValue<unknown>(key);
+			if (typeof v !== 'string' || v.length === 0) { unset.push(key); }
+		}
+		return unset;
+	}
+
+	/** Returns the configured demo pair, or throws an Error naming every unset setting. */
+	private _requireDemoPair(): { email: string; password: string } {
+		const unset = this._unsetDemoSettings();
+		if (unset.length > 0) {
+			throw new Error(`Demo account is not configured: set ${unset.join(' and ')} in your user settings.`);
+		}
+		return {
+			email: this._config.getValue<string>(DEMO_EMAIL_SETTING),
+			password: this._config.getValue<string>(DEMO_PASSWORD_SETTING),
+		};
+	}
+
+	/** Disable the demo button and show a visible message naming the unset setting(s); enable it when both are set. */
+	private _refreshDemo(root: HTMLElement): void {
+		const btn = root.querySelector<HTMLButtonElement>('#qag-demo-btn')!;
+		const msgEl = root.querySelector<HTMLElement>('#qag-demo-msg')!;
+		const unset = this._unsetDemoSettings();
+		if (unset.length > 0) {
+			btn.disabled = true;
+			btn.style.opacity = '0.6';
+			btn.style.cursor = 'not-allowed';
+			this._showError(msgEl, `Demo account unavailable: set ${unset.join(' and ')} in your user settings.`);
+		} else {
+			btn.disabled = false;
+			btn.style.opacity = '1';
+			btn.style.cursor = 'pointer';
+			msgEl.style.display = 'none';
+		}
 	}
 
 	// ── API calls (via IRequestService — routes through main process, no CORS) ──
