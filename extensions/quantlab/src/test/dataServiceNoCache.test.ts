@@ -140,18 +140,21 @@ suite('DT-3: DataService holds no market-data cache', () => {
 			'2024-01-02T00:00:00Z,100,301,99,100.5,1000'
 		].join('\n');
 		try {
+			// Both versions carry the same whole-second mtime: a whole second round-trips through utimes exactly
+			// on every filesystem, so the precondition below is exact (a captured mtime can come back 1 ms off).
+			const pinned = new Date('2024-06-01T12:00:00Z');
 			fs.writeFileSync(file, csv('100'));
+			fs.utimesSync(file, pinned, pinned);
 			const before = fs.statSync(file);
 			const service = DataService.getInstance();
 			const first = await service.getOHLCVFromFile(file);
 			assert.strictEqual(first.data[0].o, 100);
 
 			fs.writeFileSync(file, csv('200'));
-			fs.utimesSync(file, before.atime, before.mtime);
+			fs.utimesSync(file, pinned, pinned);
 			const after = fs.statSync(file);
 			assert.strictEqual(after.size, before.size, 'fixture keeps the size');
-			// utimes takes whole milliseconds; mtimeMs can carry a sub-millisecond part the restore cannot write back.
-			assert.strictEqual(Math.trunc(after.mtimeMs), Math.trunc(before.mtimeMs), 'fixture keeps the mtime');
+			assert.strictEqual(after.mtimeMs, before.mtimeMs, 'fixture keeps the mtime');
 
 			const second = await service.getOHLCVFromFile(file);
 			assert.strictEqual(second.data[0].o, 200, 'the second load must re-read the file');
