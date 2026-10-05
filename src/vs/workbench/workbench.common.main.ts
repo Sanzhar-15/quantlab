@@ -428,4 +428,4 @@ import './contrib/editTelemetry/browser/editTelemetry.contribution.js';
 import './contrib/opener/browser/opener.contribution.js';
 
 //#endregion
-if (globalThis.QL_TEST_BUILD) { await import('./services/request/test-instruments/index.js'); }
+if (globalThis.QL_TEST_BUILD) { await import('./services/request/common/test-instruments/index.js'); }
