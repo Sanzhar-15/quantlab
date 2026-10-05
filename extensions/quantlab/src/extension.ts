@@ -586,8 +586,8 @@ async function initializeServerConnection(
 ): Promise<void> {
 	const output = getServerOutputChannel();
 	try {
-		// Pull the sign-in state from the host (a tick sent before the provider registered its
-		// command is not replayed, so this pull is the start-up read).
+		// Read the sign-in state from the host at start-up; later changes arrive through
+		// vscode.quantlabHost.onDidChangeIdentity.
 		const loaded = await authProvider.initializeFromHost();
 		output.appendLine(
 			`[${new Date().toISOString()}] Delta Plus: ${loaded ? 'Signed in at the host' : 'Not signed in (sign in in the terminal view)'}`

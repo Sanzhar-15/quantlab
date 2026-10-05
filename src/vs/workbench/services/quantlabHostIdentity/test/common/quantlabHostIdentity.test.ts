@@ -6,8 +6,6 @@
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import {
-	QUANTLAB_EXT_DID_CHANGE_COMMAND,
-	QUANTLAB_EXT_GET_COMMAND,
 	QUANTLAB_HOST_DATA_CANCEL_CHANNEL,
 	QUANTLAB_HOST_DATA_FRAME_CHANNEL,
 	QUANTLAB_HOST_DATA_REQUEST_CHANNEL,
@@ -203,11 +201,9 @@ suite('QuantlabHostIdentity - contract constants', () => {
 
 	ensureNoDisposablesAreLeakedInTestSuite();
 
-	test('channel and command names are the contract values', () => {
+	test('channel names are the contract values', () => {
 		assert.strictEqual(QUANTLAB_HOST_IDENTITY_GET_CHANNEL, 'vscode:quantlab-host-identity:get');
 		assert.strictEqual(QUANTLAB_HOST_IDENTITY_CHANGED_CHANNEL, 'vscode:quantlab-host-identity:changed');
-		assert.strictEqual(QUANTLAB_EXT_GET_COMMAND, '_quantlab.hostIdentity.get');
-		assert.strictEqual(QUANTLAB_EXT_DID_CHANGE_COMMAND, '_quantlab.hostIdentity.didChange');
 	});
 
 	test('the get request is the envelope with a null input', () => {
