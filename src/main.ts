@@ -101,7 +101,9 @@ protocol.registerSchemesAsPrivileged([
 	{
 		scheme: 'vscode-file',
 		privileges: { secure: true, standard: true, supportFetchAPI: true, corsEnabled: true, codeCache: true }
-	}
+	},
+	// QuantLab host (U3): the terminal's deny-scheme, registered so the host's protocol.handle('dp') refusal answers (R-53)
+	{ scheme: 'dp', privileges: {} }
 ]);
 
 // Global app listeners

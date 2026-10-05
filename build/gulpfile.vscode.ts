@@ -111,7 +111,11 @@ const vscodeResourceIncludes = [
 	'out-build/vs/editor/common/languages/highlights/*.scm',
 
 	// Tree Sitter injection queries
-	'out-build/vs/editor/common/languages/injections/*.scm'
+	'out-build/vs/editor/common/languages/injections/*.scm',
+
+	// QuantLab terminal view (R-52)
+	'out-build/vs/code/electron-main/ql-client/terminal/preload.cjs',
+	'out-build/vs/code/electron-main/ql-client/terminal/renderer/**'
 ];
 
 const vscodeResources = [
