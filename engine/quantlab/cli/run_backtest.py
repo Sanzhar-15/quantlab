@@ -112,8 +112,8 @@ def convert_results(results: Any, job_id: str) -> dict[str, Any]:
         }
     """
     # No metrics means the run cannot be judged: the runner leaves results.metrics None when the equity curve
-    # has fewer than 2 points or the calculation raised (its message is then in results.warnings). That is the
-    # job's failure, named; no metric is made up from other fields.
+    # has fewer than 2 points (a calculator exception is raised by the runner as MetricsCalculationError). That
+    # is the job's failure, named; no metric is made up from other fields.
     if results.metrics is None:
         raise ValueError(
             f"the backtest produced no performance metrics (equity curve: {len(results.equity_curve)} point(s); "
