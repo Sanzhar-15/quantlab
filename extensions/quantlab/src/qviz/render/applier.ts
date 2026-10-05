@@ -137,8 +137,10 @@ function applySeries(chart: Chart, series: TimeseriesSeriesPlan): void {
 			return;
 		}
 		case 'bar': {
-			const s = chart.addBarSeries({ color: (series as BarPlan).color });
-			s.setData(toDataPoints((series as BarPlan).data));
+			// A timeseries `bar` plan is one VALUE per time. The engine's `addBarSeries` is an OHLC bar
+			// series (`OhlcDataPoint`), so value bars are drawn as columns: the histogram series.
+			const s = chart.addHistogramSeries({ color: (series as BarPlan).color });
+			s.setData(toHistogramPoints((series as BarPlan).data));
 			return;
 		}
 		case 'histogram': {
