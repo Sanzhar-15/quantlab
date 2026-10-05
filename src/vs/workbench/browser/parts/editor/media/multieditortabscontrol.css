@@ -108,8 +108,7 @@
 }
 
 .monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab[data-ql-view="chart"]::before,
-.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab[data-ql-view="action"]::before,
-.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab[data-ql-view="trade"]::before {
+.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab[data-ql-view="action"]::before {
 	content: '';
 	position: absolute;
 	top: 0;
@@ -124,10 +123,6 @@
 
 .monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab[data-ql-view="action"]::before {
 	background-color: var(--ql-view-action);
-}
-
-.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab[data-ql-view="trade"]::before {
-	background-color: var(--ql-view-trade);
 }
 
 /* Tab Background Color in/active group/tab */

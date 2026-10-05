@@ -9,7 +9,6 @@ export type FeatureDiscoveryTrigger =
 	| 'firstViewSwitch'
 	| 'firstBacktestComplete'
 	| 'firstParameterEdit'
-	| 'firstTradeView'
 	| 'tenRuns';
 
 export interface OnboardingState {

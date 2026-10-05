@@ -17,7 +17,6 @@
 
 	--ql-view-chart: var(--vscode-quantlabViewChart, #059669);
 	--ql-view-action: var(--vscode-quantlabViewAction, #d97706);
-	--ql-view-trade: var(--vscode-quantlabViewTrade, #dc2626);
 	--ql-view-stripe-width: 3px;
 
 	--ql-status-positive: var(--vscode-quantlabStatusPositive, #44BF6E);

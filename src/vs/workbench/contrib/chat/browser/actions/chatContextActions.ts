@@ -9,37 +9,27 @@ import { CancellationTokenSource } from '../../../../../base/common/cancellation
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { KeyCode, KeyMod } from '../../../../../base/common/keyCodes.js';
 import { DisposableStore, toDisposable } from '../../../../../base/common/lifecycle.js';
-import { Schemas } from '../../../../../base/common/network.js';
 import { autorun, observableValue } from '../../../../../base/common/observable.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { isObject } from '../../../../../base/common/types.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ServicesAccessor } from '../../../../../editor/browser/editorExtensions.js';
 import { Range } from '../../../../../editor/common/core/range.js';
-import { EditorContextKeys } from '../../../../../editor/common/editorContextKeys.js';
 import { ITextModelService } from '../../../../../editor/common/services/resolverService.js';
 import { AbstractGotoSymbolQuickAccessProvider, IGotoSymbolQuickPickItem } from '../../../../../editor/contrib/quickAccess/browser/gotoSymbolQuickAccess.js';
 import { localize, localize2 } from '../../../../../nls.js';
-import { Action2, MenuId, registerAction2 } from '../../../../../platform/actions/common/actions.js';
+import { Action2, MenuId } from '../../../../../platform/actions/common/actions.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { ContextKeyExpr, IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
 import { IFileService } from '../../../../../platform/files/common/files.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { IKeybindingService } from '../../../../../platform/keybinding/common/keybinding.js';
 import { KeybindingWeight } from '../../../../../platform/keybinding/common/keybindingsRegistry.js';
-import { IListService } from '../../../../../platform/list/browser/listService.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { AnythingQuickAccessProviderRunOptions } from '../../../../../platform/quickinput/common/quickAccess.js';
 import { IQuickInputService, IQuickPickItem, IQuickPickItemWithResource, QuickPickItem } from '../../../../../platform/quickinput/common/quickInput.js';
-import { resolveCommandsContext } from '../../../../browser/parts/editor/editorCommandsContext.js';
-import { ResourceContextKey } from '../../../../common/contextkeys.js';
-import { EditorResourceAccessor, isEditorCommandsContext, SideBySideEditor } from '../../../../common/editor.js';
-import { IEditorGroupsService } from '../../../../services/editor/common/editorGroupsService.js';
-import { IEditorService } from '../../../../services/editor/common/editorService.js';
-import { ExplorerFolderContext } from '../../../files/common/files.js';
 import { CTX_INLINE_CHAT_V2_ENABLED } from '../../../inlineChat/common/inlineChat.js';
 import { AnythingQuickAccessProvider } from '../../../search/browser/anythingQuickAccess.js';
-import { isSearchTreeFileMatch, isSearchTreeMatch } from '../../../search/browser/searchTreeModel/searchTreeCommon.js';
 import { ISymbolQuickPickItem, SymbolsQuickAccessProvider } from '../../../search/browser/symbolsQuickAccess.js';
 import { SearchContext } from '../../../search/common/constants.js';
 import { ChatContextKeys } from '../../common/actions/chatContextKeys.js';
@@ -53,11 +43,6 @@ import { registerPromptActions } from '../promptSyntax/promptFileActions.js';
 import { CHAT_CATEGORY } from './chatActions.js';
 
 export function registerChatContextActions() {
-	registerAction2(AttachContextAction);
-	registerAction2(AttachFileToChatAction);
-	registerAction2(AttachFolderToChatAction);
-	registerAction2(AttachSelectionToChatAction);
-	registerAction2(AttachSearchResultAction);
 	registerPromptActions();
 }
 
@@ -71,240 +56,6 @@ async function withChatView(accessor: ServicesAccessor): Promise<IChatWidget | u
 	return lastFocusedWidget;
 }
 
-abstract class AttachResourceAction extends Action2 {
-
-	override async run(accessor: ServicesAccessor, ...args: unknown[]): Promise<void> {
-		const instaService = accessor.get(IInstantiationService);
-		const widget = await instaService.invokeFunction(withChatView);
-		if (!widget) {
-			return;
-		}
-		return instaService.invokeFunction(this.runWithWidget.bind(this), widget, ...args);
-	}
-
-	abstract runWithWidget(accessor: ServicesAccessor, widget: IChatWidget, ...args: unknown[]): Promise<void>;
-
-	protected _getResources(accessor: ServicesAccessor, ...args: unknown[]): URI[] {
-		const editorService = accessor.get(IEditorService);
-
-		const contexts = isEditorCommandsContext(args[1]) ? this._getEditorResources(accessor, args) : Array.isArray(args[1]) ? args[1] : [args[0]];
-		const files = [];
-		for (const context of contexts) {
-			let uri;
-			if (URI.isUri(context)) {
-				uri = context;
-			} else if (isSearchTreeFileMatch(context)) {
-				uri = context.resource;
-			} else if (isSearchTreeMatch(context)) {
-				uri = context.parent().resource;
-			} else if (!context && editorService.activeTextEditorControl) {
-				uri = EditorResourceAccessor.getCanonicalUri(editorService.activeEditor, { supportSideBySide: SideBySideEditor.PRIMARY });
-			}
-
-			if (uri && [Schemas.file, Schemas.vscodeRemote, Schemas.untitled].includes(uri.scheme)) {
-				files.push(uri);
-			}
-		}
-
-		return files;
-	}
-
-	private _getEditorResources(accessor: ServicesAccessor, ...args: unknown[]): URI[] {
-		const resolvedContext = resolveCommandsContext(args, accessor.get(IEditorService), accessor.get(IEditorGroupsService), accessor.get(IListService));
-
-		return resolvedContext.groupedEditors
-			.flatMap(groupedEditor => groupedEditor.editors)
-			.map(editor => EditorResourceAccessor.getCanonicalUri(editor, { supportSideBySide: SideBySideEditor.PRIMARY }))
-			.filter(uri => uri !== undefined);
-	}
-}
-
-class AttachFileToChatAction extends AttachResourceAction {
-
-	static readonly ID = 'workbench.action.chat.attachFile';
-
-	constructor() {
-		super({
-			id: AttachFileToChatAction.ID,
-			title: localize2('workbench.action.chat.attachFile.label', "Add File to Chat"),
-			category: CHAT_CATEGORY,
-			precondition: ChatContextKeys.enabled,
-			f1: true,
-			menu: [{
-				id: MenuId.SearchContext,
-				group: 'z_chat',
-				order: 1,
-				when: ContextKeyExpr.and(ChatContextKeys.enabled, SearchContext.FileMatchOrMatchFocusKey, SearchContext.SearchResultHeaderFocused.negate()),
-			}, {
-				id: MenuId.ExplorerContext,
-				group: '5_chat',
-				order: 1,
-				when: ContextKeyExpr.and(
-					ChatContextKeys.enabled,
-					ExplorerFolderContext.negate(),
-					ContextKeyExpr.or(
-						ResourceContextKey.Scheme.isEqualTo(Schemas.file),
-						ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeRemote)
-					)
-				),
-			}, {
-				id: MenuId.EditorTitleContext,
-				group: '2_chat',
-				order: 1,
-				when: ContextKeyExpr.and(
-					ChatContextKeys.enabled,
-					ContextKeyExpr.or(
-						ResourceContextKey.Scheme.isEqualTo(Schemas.file),
-						ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeRemote)
-					)
-				),
-			}, {
-				id: MenuId.EditorContext,
-				group: '1_chat',
-				order: 2,
-				when: ContextKeyExpr.and(
-					ChatContextKeys.enabled,
-					ContextKeyExpr.or(
-						ResourceContextKey.Scheme.isEqualTo(Schemas.file),
-						ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeRemote),
-						ResourceContextKey.Scheme.isEqualTo(Schemas.untitled),
-						ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeUserData)
-					)
-				)
-			}]
-		});
-	}
-
-	override async runWithWidget(accessor: ServicesAccessor, widget: IChatWidget, ...args: unknown[]): Promise<void> {
-		const files = this._getResources(accessor, ...args);
-		if (!files.length) {
-			return;
-		}
-		if (widget) {
-			widget.focusInput();
-			for (const file of files) {
-				widget.attachmentModel.addFile(file);
-			}
-		}
-	}
-}
-
-class AttachFolderToChatAction extends AttachResourceAction {
-
-	static readonly ID = 'workbench.action.chat.attachFolder';
-
-	constructor() {
-		super({
-			id: AttachFolderToChatAction.ID,
-			title: localize2('workbench.action.chat.attachFolder.label', "Add Folder to Chat"),
-			category: CHAT_CATEGORY,
-			f1: false,
-			menu: {
-				id: MenuId.ExplorerContext,
-				group: '5_chat',
-				order: 1,
-				when: ContextKeyExpr.and(
-					ChatContextKeys.enabled,
-					ExplorerFolderContext,
-					ContextKeyExpr.or(
-						ResourceContextKey.Scheme.isEqualTo(Schemas.file),
-						ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeRemote)
-					)
-				)
-			}
-		});
-	}
-
-	override async runWithWidget(accessor: ServicesAccessor, widget: IChatWidget, ...args: unknown[]): Promise<void> {
-		const folders = this._getResources(accessor, ...args);
-		if (!folders.length) {
-			return;
-		}
-		if (widget) {
-			widget.focusInput();
-			for (const folder of folders) {
-				widget.attachmentModel.addFolder(folder);
-			}
-		}
-	}
-}
-
-class AttachSelectionToChatAction extends Action2 {
-
-	static readonly ID = 'workbench.action.chat.attachSelection';
-
-	constructor() {
-		super({
-			id: AttachSelectionToChatAction.ID,
-			title: localize2('workbench.action.chat.attachSelection.label', "Add Selection to Chat"),
-			category: CHAT_CATEGORY,
-			f1: true,
-			precondition: ChatContextKeys.enabled,
-			menu: {
-				id: MenuId.EditorContext,
-				group: '1_chat',
-				order: 1,
-				when: ContextKeyExpr.and(
-					ChatContextKeys.enabled,
-					EditorContextKeys.hasNonEmptySelection,
-					ContextKeyExpr.or(
-						ResourceContextKey.Scheme.isEqualTo(Schemas.file),
-						ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeRemote),
-						ResourceContextKey.Scheme.isEqualTo(Schemas.untitled),
-						ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeUserData)
-					)
-				)
-			}
-		});
-	}
-
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	override async run(accessor: ServicesAccessor, ...args: any[]): Promise<void> {
-		const editorService = accessor.get(IEditorService);
-
-		const widget = await accessor.get(IInstantiationService).invokeFunction(withChatView);
-		if (!widget) {
-			return;
-		}
-
-		const [_, matches] = args;
-		// If we have search matches, it means this is coming from the search widget
-		if (matches && matches.length > 0) {
-			const uris = new Map<URI, Range | undefined>();
-			for (const match of matches) {
-				if (isSearchTreeFileMatch(match)) {
-					uris.set(match.resource, undefined);
-				} else {
-					const context = { uri: match._parent.resource, range: match._range };
-					const range = uris.get(context.uri);
-					if (!range ||
-						range.startLineNumber !== context.range.startLineNumber && range.endLineNumber !== context.range.endLineNumber) {
-						uris.set(context.uri, context.range);
-						widget.attachmentModel.addFile(context.uri, context.range);
-					}
-				}
-			}
-			// Add the root files for all of the ones that didn't have a match
-			for (const uri of uris) {
-				const [resource, range] = uri;
-				if (!range) {
-					widget.attachmentModel.addFile(resource);
-				}
-			}
-		} else {
-			const activeEditor = editorService.activeTextEditorControl;
-			const activeUri = EditorResourceAccessor.getCanonicalUri(editorService.activeEditor, { supportSideBySide: SideBySideEditor.PRIMARY });
-			if (activeEditor && activeUri && [Schemas.file, Schemas.vscodeRemote, Schemas.untitled].includes(activeUri.scheme)) {
-				const selection = activeEditor.getSelection();
-				if (selection) {
-					widget.focusInput();
-					const range = selection.isEmpty() ? new Range(selection.startLineNumber, 1, selection.startLineNumber + 1, 1) : selection;
-					widget.attachmentModel.addFile(activeUri, range);
-				}
-			}
-		}
-	}
-}
 
 export class AttachSearchResultAction extends Action2 {
 

@@ -21,7 +21,6 @@ import { KeybindingWeight } from '../../../../platform/keybinding/common/keybind
 import { IEditorService } from '../../../services/editor/common/editorService.js';
 import { ICodeEditorService } from '../../../../editor/browser/services/codeEditorService.js';
 import { CONTEXT_ACCESSIBILITY_MODE_ENABLED } from '../../../../platform/accessibility/common/accessibility.js';
-import { CommandsRegistry } from '../../../../platform/commands/common/commands.js';
 import { registerIcon } from '../../../../platform/theme/common/iconRegistry.js';
 import { IPreferencesService } from '../../../services/preferences/common/preferences.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
@@ -29,10 +28,6 @@ import { IChatService } from '../../chat/common/chatService/chatService.js';
 import { ChatContextKeys } from '../../chat/common/actions/chatContextKeys.js';
 import { HunkInformation } from './inlineChatSession.js';
 import { IChatWidgetService } from '../../chat/browser/chat.js';
-
-
-CommandsRegistry.registerCommandAlias('interactiveEditor.start', 'inlineChat.start');
-CommandsRegistry.registerCommandAlias('interactive.acceptChanges', ACTION_ACCEPT_CHANGES);
 
 
 export const START_INLINE_CHAT = registerIcon('start-inline-chat', Codicon.sparkle, localize('startInlineChat', 'Icon which spawns the inline chat from the editor toolbar.'));

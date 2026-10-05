@@ -22,6 +22,7 @@ import { BreadcrumbsControlFactory } from './breadcrumbsControl.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { computeEditorAriaLabel } from '../../editor.js';
 import { customEditorViewTypeToQuantlabView, formatQuantlabViewLabel, IQuantlabTabViewService, QuantlabTabViewStateChange, QuantlabViewType } from './quantlabViewStateService.js';
+// eslint-disable-next-line local/code-import-patterns -- inherited fork layering (workbench/browser reads a contrib type); not introduced here
 import { CustomEditorInput } from '../../../contrib/customEditor/browser/customEditorInput.js';
 import { IContextMenuService } from '../../../../platform/contextview/browser/contextView.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
@@ -252,13 +253,11 @@ export class SingleEditorTabsControl extends EditorTabsControl {
 	private getQuantlabButtonOrder(currentView: QuantlabViewType): QuantlabViewType[] {
 		switch (currentView) {
 			case 'chart':
-				return ['editor', 'action', 'trade'];
+				return ['editor', 'action'];
 			case 'action':
-				return ['chart', 'editor', 'trade'];
-			case 'trade':
-				return ['chart', 'action', 'editor'];
+				return ['chart', 'editor'];
 			default:
-				return ['chart', 'action', 'trade'];
+				return ['chart', 'action'];
 		}
 	}
 
@@ -268,8 +267,6 @@ export class SingleEditorTabsControl extends EditorTabsControl {
 				return 'quantlab.switchToChart';
 			case 'action':
 				return 'quantlab.switchToAction';
-			case 'trade':
-				return 'quantlab.switchToTrade';
 			default:
 				return 'quantlab.switchToEditor';
 		}

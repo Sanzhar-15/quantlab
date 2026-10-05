@@ -12,7 +12,6 @@
 	"serverLicensePrompt": "",
 	"serverApplicationName": "quantlab-server",
 	"serverDataFolderName": ".quantlab-server",
-	"tunnelApplicationName": "quantlab-tunnel",
 	"win32DirName": "Quantlab",
 	"win32NameVersion": "Quantlab",
 	"win32RegValueName": "Quantlab",
@@ -22,14 +21,11 @@
 	"win32arm64UserAppId": "{{3AEBF0C8-F733-4AD4-BADE-FDB816D53D7B}",
 	"win32AppUserModelId": "Sanzhar15.Quantlab",
 	"win32ShellNameShort": "Quantlab",
-	"win32TunnelServiceMutex": "quantlab-tunnel-tunnelservice",
-	"win32TunnelMutex": "quantlab-tunnel",
 	"darwinBundleIdentifier": "com.sanzhar15.quantlab",
 	"darwinProfileUUID": "47827DD9-4734-49A0-AF80-7E19B11495CC",
 	"darwinProfilePayloadUUID": "CF808BE7-53F3-46C6-A7E2-7EDB98A5E959",
 	"linuxIconName": "quantlab",
 	"licenseFileName": "LICENSE.txt",
-	"reportIssueUrl": "https://github.com/Sanzhar-15/quantlab/issues",
 	"nodejsRepository": "https://nodejs.org",
 	"urlProtocol": "quantlab",
 	"builtInExtensions": [
@@ -80,16 +76,53 @@
 				},
 				"publisherDisplayName": "Microsoft"
 			}
+		},
+		{
+			"name": "ms-python.python",
+			"version": "2026.4.0",
+			"sha256": "232aeafb01f069824fdd92d3e628c1c442bbcfa1d3cc945ff97076340bb2b4a6",
+			"repo": "https://github.com/microsoft/vscode-python",
+			"metadata": {
+				"id": "f1f59ae4-9318-4f3c-a9b5-81b2eaa5f8a5",
+				"publisherId": {
+					"publisherId": "998b010b-e2af-44a5-a6cd-0b5fd3b9b6f8",
+					"publisherName": "ms-python",
+					"displayName": "ms-python"
+				},
+				"publisherDisplayName": "ms-python"
+			}
+		},
+		{
+			"name": "detachhead.basedpyright",
+			"version": "1.40.2",
+			"sha256": "9c87b0b992714ca2f9298cb7e98bda621612f0ee96121a8e77ee7fcccce2f351",
+			"repo": "https://github.com/DetachHead/basedpyright",
+			"metadata": {
+				"id": "249aa903-c0c5-4eb3-9deb-06895c663b8b",
+				"publisherId": {
+					"publisherId": "06e93c48-c0d6-493f-ab86-46e16dfafb8a",
+					"publisherName": "detachhead",
+					"displayName": "detachhead"
+				},
+				"publisherDisplayName": "detachhead"
+			}
+		},
+		{
+			"name": "ms-toolsai.jupyter",
+			"version": "2025.9.1",
+			"sha256": "110660656944c4ab0ff687db488c2e8c59c67ec121dcf09bcaa54b6edd9ce71f",
+			"repo": "https://github.com/microsoft/vscode-jupyter",
+			"metadata": {
+				"id": "6c2f1801-1e7f-45b2-9b5c-7782f1e076e8",
+				"publisherId": {
+					"publisherId": "ac8eb7c9-3e59-4b39-8040-f0484d8170ce",
+					"publisherName": "ms-toolsai",
+					"displayName": "ms-toolsai"
+				},
+				"publisherDisplayName": "ms-toolsai"
+			}
 		}
 	],
-	"trustedExtensionAuthAccess": {
-		"github": [
-			"GitHub.copilot-chat"
-		],
-		"github-enterprise": [
-			"GitHub.copilot-chat"
-		]
-	},
 	"extensionsGallery": {
 		"serviceUrl": "https://open-vsx.org/vscode/gallery",
 		"itemUrl": "https://open-vsx.org/vscode/item",
@@ -97,5 +130,7 @@
 	},
 	"linkProtectionTrustedDomains": [
 		"https://open-vsx.org"
-	]
+	],
+	"quantlab.qicEnabled": false,
+	"quantlab.quantbookEnabled": false
 }

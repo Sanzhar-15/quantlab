@@ -8,11 +8,11 @@ import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { Extensions, IViewContainersRegistry, IViewsRegistry, ViewContainer, ViewContainerLocation } from '../../../common/views.js';
 import { IRemoteExplorerService, PORT_AUTO_FALLBACK_SETTING, PORT_AUTO_FORWARD_SETTING, PORT_AUTO_SOURCE_SETTING, PORT_AUTO_SOURCE_SETTING_HYBRID, PORT_AUTO_SOURCE_SETTING_OUTPUT, PORT_AUTO_SOURCE_SETTING_PROCESS, PortsEnablement, TUNNEL_VIEW_CONTAINER_ID, TUNNEL_VIEW_ID } from '../../../services/remote/common/remoteExplorerService.js';
 import { Attributes, AutoTunnelSource, forwardedPortsFeaturesEnabled, forwardedPortsViewEnabled, makeAddress, mapHasAddressLocalhostOrAllInterfaces, OnPortForward, Tunnel, TunnelCloseReason, TunnelSource } from '../../../services/remote/common/tunnelModel.js';
-import { ForwardPortAction, OpenPortInBrowserAction, TunnelPanel, TunnelPanelDescriptor, TunnelViewModel, OpenPortInPreviewAction, openPreviewEnabledContext } from './tunnelView.js';
+import { OpenPortInBrowserAction, TunnelPanel, OpenPortInPreviewAction, openPreviewEnabledContext } from './tunnelView.js';
 import { IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
 import { IWorkbenchEnvironmentService } from '../../../services/environment/common/environmentService.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
-import { IStatusbarEntry, IStatusbarEntryAccessor, IStatusbarService, StatusbarAlignment } from '../../../services/statusbar/browser/statusbar.js';
+import { IStatusbarEntry, IStatusbarEntryAccessor, IStatusbarService } from '../../../services/statusbar/browser/statusbar.js';
 import { UrlFinder } from './urlFinder.js';
 import Severity from '../../../../base/common/severity.js';
 import { ConfigurationTarget, IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
@@ -52,13 +52,9 @@ export class ForwardedPortsView extends Disposable implements IWorkbenchContribu
 		@IRemoteExplorerService private readonly remoteExplorerService: IRemoteExplorerService,
 		@ITunnelService private readonly tunnelService: ITunnelService,
 		@IActivityService private readonly activityService: IActivityService,
-		@IStatusbarService private readonly statusbarService: IStatusbarService,
+		@IStatusbarService statusbarService: IStatusbarService,
 	) {
 		super();
-		this._register(Registry.as<IViewsRegistry>(Extensions.ViewsRegistry).registerViewWelcomeContent(TUNNEL_VIEW_ID, {
-			content: this.environmentService.remoteAuthority ? nls.localize('remoteNoPorts', "No forwarded ports. Forward a port to access your running services locally.\n[Forward a Port]({0})", `command:${ForwardPortAction.INLINE_ID}`)
-				: nls.localize('noRemoteNoPorts', "No forwarded ports. Forward a port to access your locally running services over the internet.\n[Forward a Port]({0})", `command:${ForwardPortAction.INLINE_ID}`),
-		}));
 		this.enableBadgeAndStatusBar();
 		this.enableForwardedPortsFeatures();
 		if (!this.environmentService.remoteAuthority) {
@@ -92,11 +88,8 @@ export class ForwardedPortsView extends Disposable implements IWorkbenchContribu
 				this.contextKeyService.createKey(forwardedPortsViewEnabled.key, true);
 			}
 			const viewContainer = await this.getViewContainer();
-			const tunnelPanelDescriptor = new TunnelPanelDescriptor(new TunnelViewModel(this.remoteExplorerService, this.tunnelService), this.environmentService);
-			const viewsRegistry = Registry.as<IViewsRegistry>(Extensions.ViewsRegistry);
 			if (viewContainer) {
 				this.remoteExplorerService.enablePortsFeatures(!featuresEnabled);
-				viewsRegistry.registerViews([tunnelPanelDescriptor], viewContainer);
 			}
 		} else {
 			this.contextKeyListener.value = this.contextKeyService.onDidChangeContext(e => {
@@ -143,7 +136,6 @@ export class ForwardedPortsView extends Disposable implements IWorkbenchContribu
 		}
 
 		if (!this.entryAccessor) {
-			this._register(this.entryAccessor = this.statusbarService.addEntry(this.entry, 'status.forwardedPorts', StatusbarAlignment.LEFT, 40));
 		} else {
 			this.entryAccessor.update(this.entry);
 		}

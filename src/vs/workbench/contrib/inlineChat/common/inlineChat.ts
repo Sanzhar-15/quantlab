@@ -5,9 +5,7 @@
 
 import { localize } from '../../../../nls.js';
 import { MenuId } from '../../../../platform/actions/common/actions.js';
-import { Extensions, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
 import { ContextKeyExpr, RawContextKey } from '../../../../platform/contextkey/common/contextkey.js';
-import { Registry } from '../../../../platform/registry/common/platform.js';
 import { diffInserted, diffRemoved, editorWidgetBackground, editorWidgetBorder, editorWidgetForeground, focusBorder, inputBackground, inputPlaceholderForeground, registerColor, transparent, widgetShadow } from '../../../../platform/theme/common/colorRegistry.js';
 import { NOTEBOOK_IS_ACTIVE_EDITOR } from '../../notebook/common/notebookContextKeys.js';
 
@@ -21,40 +19,6 @@ export const enum InlineChatConfigKeys {
 	EnableV2 = 'inlineChat.enableV2',
 	notebookAgent = 'inlineChat.notebookAgent',
 }
-
-Registry.as<IConfigurationRegistry>(Extensions.Configuration).registerConfiguration({
-	id: 'editor',
-	properties: {
-		[InlineChatConfigKeys.FinishOnType]: {
-			description: localize('finishOnType', "Whether to finish an inline chat session when typing outside of changed regions."),
-			default: false,
-			type: 'boolean'
-		},
-		[InlineChatConfigKeys.HoldToSpeech]: {
-			description: localize('holdToSpeech', "Whether holding the inline chat keybinding will automatically enable speech recognition."),
-			default: true,
-			type: 'boolean'
-		},
-		[InlineChatConfigKeys.EnableV2]: {
-			description: localize('enableV2', "Whether to use the next version of inline chat."),
-			default: false,
-			type: 'boolean',
-			tags: ['preview'],
-			experiment: {
-				mode: 'auto'
-			}
-		},
-		[InlineChatConfigKeys.notebookAgent]: {
-			markdownDescription: localize('notebookAgent', "Enable agent-like behavior for inline chat widget in notebooks."),
-			default: false,
-			type: 'boolean',
-			tags: ['experimental'],
-			experiment: {
-				mode: 'startup'
-			}
-		}
-	}
-});
 
 
 export const INLINE_CHAT_ID = 'interactiveEditor';

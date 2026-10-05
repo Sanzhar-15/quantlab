@@ -60,6 +60,7 @@ import { IHostService } from '../../../services/host/browser/host.js';
 import { BugIndicatingError } from '../../../../base/common/errors.js';
 import { applyDragImage } from '../../../../base/browser/ui/dnd/dnd.js';
 import { customEditorViewTypeToQuantlabView, formatQuantlabViewLabel, IQuantlabTabViewService, QuantlabTabViewStateChange, QuantlabViewType } from './quantlabViewStateService.js';
+// eslint-disable-next-line local/code-import-patterns -- inherited fork layering (workbench/browser reads a contrib type); not introduced here
 import { CustomEditorInput } from '../../../contrib/customEditor/browser/customEditorInput.js';
 
 // Data file view types - 'action' is a button/command, not a view
@@ -310,13 +311,11 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 	private getQuantlabButtonOrder(currentView: QuantlabViewType): QuantlabViewType[] {
 		switch (currentView) {
 			case 'chart':
-				return ['editor', 'action', 'trade'];
+				return ['editor', 'action'];
 			case 'action':
-				return ['chart', 'editor', 'trade'];
-			case 'trade':
-				return ['chart', 'action', 'editor'];
+				return ['chart', 'editor'];
 			default:
-				return ['chart', 'action', 'trade'];
+				return ['chart', 'action'];
 		}
 	}
 
@@ -326,8 +325,6 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 				return 'quantlab.switchToChart';
 			case 'action':
 				return 'quantlab.switchToAction';
-			case 'trade':
-				return 'quantlab.switchToTrade';
 			default:
 				return 'quantlab.switchToEditor';
 		}

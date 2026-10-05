@@ -17,15 +17,14 @@ import { basenameOrAuthority, isEqualAuthority } from '../../../../../../base/co
 import { ThemeIcon } from '../../../../../../base/common/themables.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import { IRange } from '../../../../../../editor/common/core/range.js';
-import { localize, localize2 } from '../../../../../../nls.js';
+import { localize } from '../../../../../../nls.js';
 import { getFlatContextMenuActions } from '../../../../../../platform/actions/browser/menuEntryActionViewItem.js';
 import { MenuWorkbenchToolBar } from '../../../../../../platform/actions/browser/toolbar.js';
-import { Action2, IMenuService, MenuId, registerAction2 } from '../../../../../../platform/actions/common/actions.js';
-import { IClipboardService } from '../../../../../../platform/clipboard/common/clipboardService.js';
-import { ContextKeyExpr, IContextKeyService } from '../../../../../../platform/contextkey/common/contextkey.js';
+import { IMenuService, MenuId } from '../../../../../../platform/actions/common/actions.js';
+import { IContextKeyService } from '../../../../../../platform/contextkey/common/contextkey.js';
 import { IContextMenuService } from '../../../../../../platform/contextview/browser/contextView.js';
 import { FileKind } from '../../../../../../platform/files/common/files.js';
-import { IInstantiationService, ServicesAccessor } from '../../../../../../platform/instantiation/common/instantiation.js';
+import { IInstantiationService } from '../../../../../../platform/instantiation/common/instantiation.js';
 import { ServiceCollection } from '../../../../../../platform/instantiation/common/serviceCollection.js';
 import { ILabelService } from '../../../../../../platform/label/common/label.js';
 import { WorkbenchList } from '../../../../../../platform/list/browser/listService.js';
@@ -38,11 +37,10 @@ import { IResourceLabel, IResourceLabelProps, ResourceLabels } from '../../../..
 import { ResourceContextKey } from '../../../../../common/contextkeys.js';
 import { SETTINGS_AUTHORITY } from '../../../../../services/preferences/common/preferences.js';
 import { createFileIconThemableTreeContainerScope } from '../../../../files/browser/views/explorerView.js';
-import { ExplorerFolderContext } from '../../../../files/common/files.js';
 import { chatEditingWidgetFileStateContextKey, ModifiedFileEntryState } from '../../../common/editing/chatEditingService.js';
 import { ChatResponseReferencePartStatusKind, IChatContentReference, IChatWarningMessage } from '../../../common/chatService/chatService.js';
 import { IChatRendererContent, IChatResponseViewModel } from '../../../common/model/chatViewModel.js';
-import { ChatTreeItem, IChatWidgetService } from '../../chat.js';
+import { ChatTreeItem } from '../../chat.js';
 import { ChatCollapsibleContentPart } from './chatCollapsibleContentPart.js';
 import { IDisposableReference, ResourcePool } from './chatCollections.js';
 import { IChatContentPartRenderContext } from './chatContentParts.js';
@@ -567,63 +565,5 @@ function getResourceForElement(element: IChatCollapsibleListItem): URI | null {
 }
 
 //#region Resource context menu
-
-registerAction2(class AddToChatAction extends Action2 {
-
-	static readonly id = 'workbench.action.chat.addToChatAction';
-
-	constructor() {
-		super({
-			id: AddToChatAction.id,
-			title: {
-				...localize2('addToChat', "Add File to Chat"),
-			},
-			f1: false,
-			menu: [{
-				id: MenuId.ChatAttachmentsContext,
-				group: 'chat',
-				order: 1,
-				when: ContextKeyExpr.and(ResourceContextKey.IsFileSystemResource, ExplorerFolderContext.negate()),
-			}]
-		});
-	}
-
-	override async run(accessor: ServicesAccessor, resource: URI): Promise<void> {
-		const chatWidgetService = accessor.get(IChatWidgetService);
-		if (!resource) {
-			return;
-		}
-
-		const widget = chatWidgetService.lastFocusedWidget;
-		if (widget) {
-			widget.attachmentModel.addFile(resource);
-		}
-	}
-});
-
-registerAction2(class OpenChatReferenceLinkAction extends Action2 {
-
-	static readonly id = 'workbench.action.chat.copyLink';
-
-	constructor() {
-		super({
-			id: OpenChatReferenceLinkAction.id,
-			title: {
-				...localize2('copyLink', "Copy Link"),
-			},
-			f1: false,
-			menu: [{
-				id: MenuId.ChatAttachmentsContext,
-				group: 'chat',
-				order: 0,
-				when: ContextKeyExpr.or(ResourceContextKey.Scheme.isEqualTo(Schemas.http), ResourceContextKey.Scheme.isEqualTo(Schemas.https)),
-			}]
-		});
-	}
-
-	override async run(accessor: ServicesAccessor, resource: URI): Promise<void> {
-		await accessor.get(IClipboardService).writeResources([resource]);
-	}
-});
 
 //#endregion

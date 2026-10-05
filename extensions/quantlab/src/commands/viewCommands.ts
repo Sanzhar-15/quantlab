@@ -14,12 +14,10 @@ export function registerViewCommands(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand('quantlab.switchToChart', () => switchToView('chart')),
 		vscode.commands.registerCommand('quantlab.switchToAction', () => switchToView('action')),
 		vscode.commands.registerCommand('quantlab.switchToStats', () => switchToView('stats')),
-		vscode.commands.registerCommand('quantlab.switchToTrade', () => switchToView('trade')),
 		vscode.commands.registerCommand('quantlab.switchToEditor', () => switchToView('editor')),
 
 		vscode.commands.registerCommand('quantlab.openAsChart', (uri?: vscode.Uri) => openAsView('chart', uri)),
-		vscode.commands.registerCommand('quantlab.openAsAction', (uri?: vscode.Uri) => openAsView('action', uri)),
-		vscode.commands.registerCommand('quantlab.openAsTrade', (uri?: vscode.Uri) => openAsView('trade', uri))
+		vscode.commands.registerCommand('quantlab.openAsAction', (uri?: vscode.Uri) => openAsView('action', uri))
 	);
 
 	async function switchToView(view: ViewType): Promise<void> {

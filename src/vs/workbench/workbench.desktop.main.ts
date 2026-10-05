@@ -136,10 +136,8 @@ import './contrib/remote/electron-browser/remote.contribution.js';
 import './contrib/terminal/electron-browser/terminal.contribution.js';
 
 // Themes
-import './contrib/themes/browser/themes.test.contribution.js';
 import './services/themes/electron-browser/themes.contribution.js';
 // User Data Sync
-import './contrib/userDataSync/electron-browser/userDataSync.contribution.js';
 
 // Tags
 import './contrib/tags/electron-browser/workspaceTagsService.js';
@@ -169,7 +167,6 @@ import './contrib/mergeEditor/electron-browser/mergeEditor.contribution.js';
 import './contrib/multiDiffEditor/browser/multiDiffEditor.contribution.js';
 
 // Remote Tunnel
-import './contrib/remoteTunnel/electron-browser/remoteTunnel.contribution.js';
 
 // Chat
 import './contrib/chat/electron-browser/chat.contribution.js';
@@ -178,7 +175,6 @@ import './contrib/inlineChat/electron-browser/inlineChat.contribution.js';
 import './contrib/encryption/electron-browser/encryption.contribution.js';
 
 // Emergency Alert
-import './contrib/emergencyAlert/electron-browser/emergencyAlert.contribution.js';
 
 // MCP
 import './contrib/mcp/electron-browser/mcp.contribution.js';

@@ -3,16 +3,14 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as nls from '../../../../nls.js';
 import { IRemoteExplorerService, REMOTE_EXPLORER_TYPE_KEY } from '../../../services/remote/common/remoteExplorerService.js';
 import { ISelectOptionItem } from '../../../../base/browser/ui/selectBox/selectBox.js';
 import { IViewDescriptor } from '../../../common/views.js';
 import { isStringArray } from '../../../../base/common/types.js';
 import { IWorkbenchEnvironmentService } from '../../../services/environment/common/environmentService.js';
 import { IStorageService, StorageScope } from '../../../../platform/storage/common/storage.js';
-import { ContextKeyExpr, IContextKey, IContextKeyService, RawContextKey } from '../../../../platform/contextkey/common/contextkey.js';
-import { Action2, MenuId, MenuRegistry, registerAction2 } from '../../../../platform/actions/common/actions.js';
-import { VIEWLET_ID } from './remoteExplorer.js';
+import { IContextKey, IContextKeyService, RawContextKey } from '../../../../platform/contextkey/common/contextkey.js';
+import { Action2, MenuId, registerAction2 } from '../../../../platform/actions/common/actions.js';
 import { getVirtualWorkspaceLocation } from '../../../../platform/workspace/common/virtualWorkspace.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { Disposable, DisposableMap } from '../../../../base/common/lifecycle.js';
@@ -41,14 +39,6 @@ export class SwitchRemoteViewItem extends Disposable {
 		this.selectedRemoteContext = SELECTED_REMOTE_IN_EXPLORER.bindTo(contextKeyService);
 
 		this.switchRemoteMenu = MenuId.for('workbench.remote.menu.switchRemoteMenu');
-		this._register(MenuRegistry.appendMenuItem(MenuId.ViewContainerTitle, {
-			submenu: this.switchRemoteMenu,
-			title: nls.localize('switchRemote.label', "Switch Remote"),
-			group: 'navigation',
-			when: ContextKeyExpr.equals('viewContainer', VIEWLET_ID),
-			order: 1,
-			isSelection: true
-		}));
 		this._register(remoteExplorerService.onDidChangeTargetType(e => {
 			this.select(e);
 		}));
