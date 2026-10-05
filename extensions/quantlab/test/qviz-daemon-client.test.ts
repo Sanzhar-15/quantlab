@@ -9,8 +9,8 @@
  * End-to-end tests for QvizDaemonClient.
  *
  * Spawns the real Python daemon (mirroring python/qviz/tests/test_daemon_e2e.py
- * shape) and drives every op through the framed wire protocol. Skipped if
- * the venv Python is not present at the configured path.
+ * shape) and drives every op through the framed wire protocol. Its inputs
+ * (QUANTLAB_TEST_PYTHON, QUANTLAB_TEST_SPIKE_DATA) are required: a missing one fails the run by name.
  */
 
 import * as assert from 'assert';
@@ -26,18 +26,36 @@ import {
 import { extractColumnsFromArrowIpc } from '../src/qviz/render/extract-arrow';
 import type { QvizSpec } from '../src/qviz/spec';
 
-// The interpreter is an explicit input: there is no default path, and its absence fails by name.
+// The interpreter is an explicit input: there is no default path; an unset variable or a path that is not an
+// executable fails the run by name. These tests never skip: a skipped daemon test is a check NOT RUN.
 function requiredTestPython(): string {
 	const value = process.env.QUANTLAB_TEST_PYTHON;
 	if (!value) {
 		throw new Error('QUANTLAB_TEST_PYTHON is not set: the qviz daemon tests need the path of a Python interpreter that has the daemon\'s dependencies');
 	}
+	try {
+		fs.accessSync(value, fs.constants.X_OK);
+	} catch (e) {
+		throw new Error(`QUANTLAB_TEST_PYTHON=${value} is not an executable file: ${(e as Error).message}`);
+	}
+	return value;
+}
+// The spike parquet is an explicit input too: no default path; unset or unreadable fails the run by name.
+// Generate it with `python python/qviz/tests/_spike_data.py <path>`.
+function requiredSpikeData(): string {
+	const value = process.env.QUANTLAB_TEST_SPIKE_DATA;
+	if (!value) {
+		throw new Error('QUANTLAB_TEST_SPIKE_DATA is not set: the qviz daemon client tests need the path of the spike OHLCV parquet (python/qviz/tests/_spike_data.py writes it)');
+	}
+	try {
+		fs.accessSync(value, fs.constants.R_OK);
+	} catch (e) {
+		throw new Error(`QUANTLAB_TEST_SPIKE_DATA=${value} is not a readable file: ${(e as Error).message}`);
+	}
 	return value;
 }
 const PYTHON_PATH = requiredTestPython();
-const SPIKE_DATA =
-	process.env.QUANTLAB_TEST_SPIKE_DATA ||
-	'/tmp/quantlab-spike-data/synthetic_ohlcv_1m.parquet';
+const SPIKE_DATA = requiredSpikeData();
 // __dirname at runtime is the COMPILED test dir (out/test/), so source-tree
 // resources need to climb two levels back to extensions/quantlab/ before
 // descending into python/ or test/fixtures/. The legacy `../python` only
@@ -45,46 +63,12 @@ const SPIKE_DATA =
 const PYTHON_DIR = path.resolve(__dirname, '..', '..', 'python');
 const FIXTURES_DIR = path.resolve(__dirname, '..', '..', 'test', 'fixtures');
 
-function pythonAvailable(): { ok: true } | { ok: false; reason: string } {
-	try {
-		fs.accessSync(PYTHON_PATH, fs.constants.X_OK);
-	} catch {
-		return { ok: false, reason: `python interpreter not executable at ${PYTHON_PATH} (set QUANTLAB_TEST_PYTHON to override)` };
-	}
-	try {
-		fs.accessSync(SPIKE_DATA, fs.constants.R_OK);
-	} catch {
-		return { ok: false, reason: `spike data not readable at ${SPIKE_DATA} (set QUANTLAB_TEST_SPIKE_DATA to override)` };
-	}
-	return { ok: true };
-}
-
-// Backwards-compat boolean used in `if (skip) this.skip()` patterns below.
-function shouldSkip(): boolean {
-	const r = pythonAvailable();
-	if (!r.ok) {
-		// Print once per process so a missing fixture is loud in CI logs.
-		const seen = (global as { __qvizDaemonSkipLogged?: boolean });
-		if (!seen.__qvizDaemonSkipLogged) {
-			seen.__qvizDaemonSkipLogged = true;
-			console.warn(`[qviz-daemon-client.test] skipping: ${r.reason}`);
-		}
-		return true;
-	}
-	return false;
-}
-
 function makeWorkspace(): string {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qviz-client-'));
 	const dataDir = path.join(root, 'data');
 	fs.mkdirSync(dataDir);
 	const target = path.join(dataDir, 'ohlcv.parquet');
-	try {
-		fs.linkSync(SPIKE_DATA, target);
-	} catch {
-		// fall back to copy if hardlink fails (cross-device, etc.)
-		fs.copyFileSync(SPIKE_DATA, target);
-	}
+	fs.copyFileSync(SPIKE_DATA, target);
 	return root;
 }
 
@@ -96,12 +80,8 @@ suite('QvizDaemonClient -- end-to-end', () => {
 
 	let workspace: string;
 	let client: QvizDaemonClient;
-	const skip = shouldSkip();
 
 	suiteSetup(function () {
-		if (skip) {
-			this.skip();
-		}
 		workspace = makeWorkspace();
 		client = new QvizDaemonClient({
 			...DEFAULT_DAEMON_CLIENT_OPTIONS,
@@ -112,7 +92,6 @@ suite('QvizDaemonClient -- end-to-end', () => {
 	});
 
 	suiteTeardown(async function () {
-		if (skip) { return; }
 		try { await client.dispose(); } catch { /* ignore */ }
 		if (workspace) { rmrfSync(workspace); }
 	});
@@ -342,10 +321,12 @@ suite('QvizDaemonClient -- end-to-end', () => {
 			qviz_version: 1,
 			dataset: { uri: 'data/ohlcv.parquet', schema_hash: 'sha256:' + '0'.repeat(64), mtime_ns: 1 },
 			transforms: [],
-			chart: { family: 'timeseries', type: 'line', encodings: {
-				x: { field: 'timestamp', type: 'temporal' },
-				y: { field: 'close', type: 'quantitative' },
-			} },
+			chart: {
+				family: 'timeseries', type: 'line', encodings: {
+					x: { field: 'timestamp', type: 'temporal' },
+					y: { field: 'close', type: 'quantitative' },
+				}
+			},
 			provenance: {
 				generated_at: '2026-05-11T00:00:00Z', generator: 'phase6-test',
 				query_hash: 'sha256:' + '0'.repeat(64), tool_versions: { qviz_schema: 1 },
@@ -361,10 +342,7 @@ suite('QvizDaemonClient -- end-to-end', () => {
 
 suite('QvizDaemonClient -- protocol + lifecycle (audit fixes)', () => {
 
-	const skip = shouldSkip();
-
 	test('AF6: dispose() rejects in-flight requests deterministically', async function () {
-		if (skip) { this.skip(); }
 		const ws = makeWorkspace();
 		const c = new QvizDaemonClient({
 			...DEFAULT_DAEMON_CLIENT_OPTIONS,
@@ -408,7 +386,6 @@ suite('QvizDaemonClient -- protocol + lifecycle (audit fixes)', () => {
 	});
 
 	test('AF8: oversized outgoing frame rejects client-side', async function () {
-		if (skip) { this.skip(); }
 		const ws = makeWorkspace();
 		const c = new QvizDaemonClient({
 			...DEFAULT_DAEMON_CLIENT_OPTIONS,
@@ -431,7 +408,6 @@ suite('QvizDaemonClient -- protocol + lifecycle (audit fixes)', () => {
 	});
 
 	test('AF7: opts.env cannot override QUANTLAB_WORKSPACE_ROOT', async function () {
-		if (skip) { this.skip(); }
 		const realWs = makeWorkspace();
 		const fakeWs = makeWorkspace();
 		const c = new QvizDaemonClient({
@@ -460,7 +436,6 @@ suite('QvizDaemonClient -- protocol + lifecycle (audit fixes)', () => {
 	});
 
 	test('AF3: mid-arrow daemon death rejects parked pending request', async function () {
-		if (skip) { this.skip(); }
 		const ws = makeWorkspace();
 		const c = new QvizDaemonClient({
 			...DEFAULT_DAEMON_CLIENT_OPTIONS,
@@ -506,7 +481,6 @@ suite('QvizDaemonClient -- protocol + lifecycle (audit fixes)', () => {
 	});
 
 	test('AF4: protocol desync (wrong response id) rejects all pending', async function () {
-		if (skip) { this.skip(); }
 		const ws = makeWorkspace();
 		const c = new QvizDaemonClient({
 			...DEFAULT_DAEMON_CLIENT_OPTIONS,
@@ -534,7 +508,6 @@ suite('QvizDaemonClient -- protocol + lifecycle (audit fixes)', () => {
 	});
 
 	test('F3: unknown error_kind rejects with DaemonProtocolError and drains queue', async function () {
-		if (skip) { this.skip(); }
 		const ws = makeWorkspace();
 		const c = new QvizDaemonClient({
 			...DEFAULT_DAEMON_CLIENT_OPTIONS,
@@ -565,7 +538,6 @@ suite('QvizDaemonClient -- protocol + lifecycle (audit fixes)', () => {
 	});
 
 	test('AF9: ready() rejects on banner timeout', async function () {
-		if (skip) { this.skip(); }
 		const c = new QvizDaemonClient({
 			...DEFAULT_DAEMON_CLIENT_OPTIONS,
 			workspaceRoot: '/tmp',
