@@ -7,6 +7,28 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 /**
+ * How a job's engine process is started: `<executable> -m <module>` in `cwd`.
+ */
+export interface EngineLaunch {
+	/** The bundled engine executable, or a Python interpreter. */
+	readonly executable: string;
+	/** Where `executable` came from; named in the job's first log line. */
+	readonly source: string;
+	/** The job's working directory; it exists. */
+	readonly cwd: string;
+	/** The engine source tree put on PYTHONPATH, or null for the bundled engine, which carries its own modules. */
+	readonly engineRoot: string | null;
+}
+
+/**
+ * The launch of the bundled engine: it runs in its own directory (a packaged app has no engine
+ * source tree) and gets no PYTHONPATH.
+ */
+export function bundledEngineLaunch(executable: string): EngineLaunch {
+	return { executable, source: 'bundled engine', cwd: path.dirname(executable), engineRoot: null };
+}
+
+/**
  * CODEX-013: locations of the bundled (PyInstaller) engine executable, in resolution order.
  */
 export function bundledEngineCandidates(extensionPath: string, platform: NodeJS.Platform): string[] {

@@ -29,6 +29,7 @@ export const all = Object.freeze<string[]>([
 	'!**/node_modules/**',
 	'!**/*.js.map',
 	'!extensions/quantlab/python/**',
+	'!build/python/**',
 	'!extensions/quantlab/dist/**',
 ]);
 
