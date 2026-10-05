@@ -252,8 +252,16 @@ suite('JobRunner - the engine result contract', () => {
 		});
 	}
 
+	test('null is a float the engine could not make finite (:21-36, :245): read as null, never invalid', () => {
+		const reading = readEngineResult({ ...complete, metrics: { ProfitFactor: null, Trades: 5 }, equity: [{ t: 1, v: null }], signals: [{ t: 1, type: 'exit', price: null }] });
+		assert.ok(reading.kind === 'complete', JSON.stringify(reading));
+		assert.deepStrictEqual(reading.result.metrics, { ProfitFactor: null, Trades: 5 });
+	});
+
 	test('wrong shapes are named: a non-number metric, an equity point, a signal type, success itself', () => {
-		assert.deepStrictEqual(readEngineResult({ ...complete, metrics: { Sharpe: null } }), { kind: 'invalid', reason: `metric 'Sharpe' is null, not a finite number` });
+		assert.deepStrictEqual(readEngineResult({ ...complete, metrics: { Sharpe: '1.2' } }), { kind: 'invalid', reason: `metric 'Sharpe' is "1.2", not a finite number or null` });
+		assert.strictEqual(readEngineResult({ ...complete, equity: [{ t: null, v: 1 }] }).kind, 'invalid');
+		assert.strictEqual(readEngineResult({ ...complete, signals: [{ t: 1, type: 'entry', price: 'x' }] }).kind, 'invalid');
 		assert.strictEqual(readEngineResult({ ...complete, equity: [{ t: 1 }] }).kind, 'invalid');
 		assert.strictEqual(readEngineResult({ ...complete, signals: [{ t: 1, type: 'hold' }] }).kind, 'invalid');
 		assert.deepStrictEqual(readEngineResult({ metrics: {} }), { kind: 'invalid', reason: `'success' is undefined, not true or false` });

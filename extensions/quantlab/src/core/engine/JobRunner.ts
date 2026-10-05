@@ -34,11 +34,17 @@ function isFiniteNumber(value: unknown): value is number {
 	return typeof value === 'number' && Number.isFinite(value);
 }
 
+/** A float of the engine's result: finite, or null where it was inf / NaN (run_backtest.py :21-36, applied at :245). */
+function isEngineFloat(value: unknown): value is number | null {
+	return value === null || isFiniteNumber(value);
+}
+
 /**
  * The engine's result, read against its stdout contract (engine/quantlab/cli/run_backtest.py): a success always
  * carries `metrics`, `warnings`, `equity` and `signals` (convert_results, :105-112 and :160-166); a failure always
- * carries `error`, and `stack` only when the run itself raised (:279-283; absent at :259 and :267). A required field
- * that is missing or of the wrong shape is named; nothing is filled in.
+ * carries `error`, and `stack` only when the run itself raised (:279-283; absent at :259 and :267). Every float may be
+ * null, the engine's spelling of inf / NaN (_sanitize_for_json, :21-36, applied at :245); timestamps are integers.
+ * A required field that is missing or of the wrong shape is named; nothing is filled in.
  */
 export function readEngineResult(parsed: Record<string, unknown>): EngineResultReading {
 	if (parsed.success === false) {
@@ -57,22 +63,24 @@ export function readEngineResult(parsed: Record<string, unknown>): EngineResultR
 	if (!isRecord(metrics)) {
 		return { kind: 'invalid', reason: `a success result has no 'metrics' object (got ${JSON.stringify(metrics)})` };
 	}
-	const badMetric = Object.entries(metrics).find(([, value]) => !isFiniteNumber(value));
+	const badMetric = Object.entries(metrics).find(([, value]) => !isEngineFloat(value));
 	if (badMetric !== undefined) {
-		return { kind: 'invalid', reason: `metric '${badMetric[0]}' is ${JSON.stringify(badMetric[1])}, not a finite number` };
+		return { kind: 'invalid', reason: `metric '${badMetric[0]}' is ${JSON.stringify(badMetric[1])}, not a finite number or null` };
 	}
 	if (!Array.isArray(warnings) || warnings.some(w => typeof w !== 'string')) {
 		return { kind: 'invalid', reason: `a success result has no 'warnings' array of strings (got ${JSON.stringify(warnings)})` };
 	}
-	if (!Array.isArray(equity) || equity.some(p => !isRecord(p) || !isFiniteNumber(p.t) || !isFiniteNumber(p.v))) {
+	if (!Array.isArray(equity) || equity.some(p => !isRecord(p) || !isFiniteNumber(p.t) || !isEngineFloat(p.v))) {
 		return { kind: 'invalid', reason: `a success result has no 'equity' array of {t, v} numbers` };
 	}
-	if (!Array.isArray(signals) || signals.some(s => !isRecord(s) || !isFiniteNumber(s.t) || (s.type !== 'entry' && s.type !== 'exit'))) {
+	if (!Array.isArray(signals) || signals.some(s => !isRecord(s) || !isFiniteNumber(s.t) || (s.type !== 'entry' && s.type !== 'exit') || (s.price !== undefined && !isEngineFloat(s.price)))) {
 		return { kind: 'invalid', reason: `a success result has no 'signals' array of {t, type: entry|exit}` };
 	}
 	return {
 		kind: 'complete',
 		result: {
+			// JobResult types these floats as number; the engine's null for inf / NaN passes through as before (flagged:
+			// widening JobResult to number | null reaches the Action view's run state and the webview, outside this change).
 			metrics: metrics as Record<string, number>,
 			warnings: warnings as string[],
 			equity: equity as Array<{ t: number; v: number }>,
