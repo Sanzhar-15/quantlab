@@ -92,12 +92,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 	// Initialize Delta Plus Server connection (non-blocking)
 	const serverClient = ServerApiClient.getInstance();
-	// Read server URL from settings (stays in sync with QIC's qic.server.baseUrl)
-	const serverUrl = vscode.workspace.getConfiguration('qic').get<string>('server.baseUrl');
-	if (serverUrl) {
-		const wsUrl = serverUrl.replace(/^http/, 'ws') + '/v1/ws';
-		serverClient.configure({ baseUrl: serverUrl, wsUrl });
-	}
+	// QL-DATA: no server URL is configured here -- data calls go through the host, which holds the one origin.
 	// Delta Plus identity holder, internal to QuantLab. Deliberately not published through
 	// vscode.authentication: a public provider hands the account id and label to every installed
 	// extension (rule 2, EXT-ISO case G3).
@@ -113,19 +108,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		}),
 		vscode.commands.registerCommand('quantlab.signOut', async () => {
 			void vscode.window.showInformationMessage('Sign out happens in the Quantlab terminal view.');
-		})
-	);
-
-	// Reconnect WebSocket when a user signs in.
-	// Megaudit M87 (No-Fallbacks): a failed reconnect silently kills all
-	// real-time feeds while the UI shows a signed-in state -- log it.
-	context.subscriptions.push(
-		authProvider.onDidSignIn(() => {
-			void serverClient.connectWebSocket().catch(err => {
-				getServerOutputChannel().appendLine(
-					`[extension] WebSocket reconnect after sign-in failed: ${err instanceof Error ? err.message : String(err)}`
-				);
-			});
 		})
 	);
 
@@ -191,7 +173,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		})
 	);
 
-	void initializeServerConnection(serverClient, authProvider).finally(() => {
+	void initializeServerConnection(authProvider).finally(() => {
 		_isStartupRestore = false;
 		_authStateResolved = true;
 		updateAccountStatus(); // Reveal the status bar with the correct state
@@ -600,7 +582,6 @@ function getServerOutputChannel(): vscode.OutputChannel {
  * the Quantlab terminal view). This runs in the background and doesn't block extension activation.
  */
 async function initializeServerConnection(
-	client: ServerApiClient,
 	authProvider: DeltaPlusAuthProvider
 ): Promise<void> {
 	const output = getServerOutputChannel();
@@ -615,21 +596,6 @@ async function initializeServerConnection(
 		const detail = err instanceof Error ? err.message : String(err);
 		output.appendLine(`[${new Date().toISOString()}] Delta Plus: Could not read the sign-in state from the host -- ${detail}`);
 		void vscode.window.showErrorMessage(`Could not read the sign-in state from the host: ${detail}`);
-	} finally {
-		// Signal ensureAuthenticated() that startup is done so pending API calls
-		// can resolve immediately (either with a user or with "not signed in" error).
-		client.markAuthFlowComplete();
-	}
-
-	// Connect WebSocket if we have a valid session.
-	if (client.isAuthenticated()) {
-		try {
-			await client.connectWebSocket();
-			output.appendLine(`[${new Date().toISOString()}] Delta Plus: WebSocket connected`);
-		} catch (err) {
-			const detail = err instanceof Error ? err.message : String(err);
-			output.appendLine(`[${new Date().toISOString()}] Delta Plus: WebSocket unavailable (real-time features disabled) -- ${detail}`);
-		}
 	}
 }
 
@@ -789,7 +755,15 @@ export async function deactivate(): Promise<void> {
 	try { ParameterExtractor.resetInstance(); } catch { /* ignore */ }
 	try { StatsEngine.resetInstance(); } catch { /* ignore */ }
 	try { ReducedMotion.resetInstance(); } catch { /* ignore */ }
-	try { ServerDataCache.resetInstance(); } catch { /* ignore */ }
+	// Law section 4: a failed ServerDataCache reset is logged with its error and rethrown once the remaining
+	// cleanup below has run -- never swallowed.
+	let serverDataCacheResetFailure: { error: unknown } | undefined;
+	try {
+		ServerDataCache.resetInstance();
+	} catch (error) {
+		console.error('Quantlab: ServerDataCache reset failed during deactivate:', error);
+		serverDataCacheResetFailure = { error };
+	}
 	try { await HistoryState.getInstance().persistNow(); } catch { /* ignore */ }
 	try { HistoryState.resetInstance(); } catch { /* ignore */ }
 	try { TabViewStateManager.resetInstance(); } catch { /* ignore */ }
@@ -811,5 +785,9 @@ export async function deactivate(): Promise<void> {
 	if (serverOutputChannel) {
 		serverOutputChannel.dispose();
 		serverOutputChannel = undefined;
+	}
+
+	if (serverDataCacheResetFailure) {
+		throw serverDataCacheResetFailure.error;
 	}
 }

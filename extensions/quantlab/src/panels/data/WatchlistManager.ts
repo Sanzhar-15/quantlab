@@ -5,6 +5,7 @@
 
 import * as vscode from 'vscode';
 import { ServerApiClient, ServerWatchlist } from '../../core/server/ServerApiClient';
+import { isHostDataError } from '../../core/host/hostDataTransport';
 
 const STORAGE_KEY = 'quantlab.watchlists';
 
@@ -221,11 +222,11 @@ export class WatchlistManager {
 			}
 		} catch (error) {
 			// Offline mode keeps the local watchlists, but the failure must be
-			// visible (M4). A signed-out pull is the routine startup state and is
-			// only logged; anything else is surfaced to subscribers.
+			// visible (M4). A signed-out pull (the host's 'not-signed-in' code) is the
+			// routine startup state and is only logged; anything else is surfaced to subscribers.
 			const message = error instanceof Error ? error.message : String(error);
 			console.warn(`WatchlistManager: server sync (pull) failed - ${message}`);
-			if (!/not signed in/i.test(message)) {
+			if (!isHostDataError(error, 'not-signed-in')) {
 				this._onSyncError.fire(`Watchlist sync from server failed: ${message}`);
 			}
 		}
