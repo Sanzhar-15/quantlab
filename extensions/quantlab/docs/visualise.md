@@ -115,7 +115,7 @@ can't run).
 2. Pick **Quantlab: Visualise** (or use `Ctrl+Q V` with the file open).
 3. Quantlab spawns the qviz daemon (Python interpreter resolved in
    this order: explicit `quantlab.pythonPath` setting →
-   `python.defaultInterpreterPath` setting → `~/.quantlab/venv/bin/python`
+   `python.defaultInterpreterPath` setting → `~/.deltaplus/venv/bin/python`
    fallback), reads the file's schema, and shows a default chart.
 4. To customize, save once -- the editor switches to the spec view
    (`.qviz.json`) with the full builder UI.
@@ -587,10 +587,10 @@ The save button stays disabled until the spec is consistent.
 **Q: "Daemon unavailable: spawn ENOENT python".**
 A: Quantlab can't find a Python interpreter for the qviz daemon. Set
 `quantlab.pythonPath` in settings to your venv's `python` binary, or
-install the daemon's deps into `~/.quantlab/venv/`:
+install the daemon's deps into `~/.deltaplus/venv/`:
 
-    python3 -m venv ~/.quantlab/venv
-    ~/.quantlab/venv/bin/pip install -e extensions/quantlab/python
+    python3 -m venv ~/.deltaplus/venv
+    ~/.deltaplus/venv/bin/pip install -e extensions/quantlab/python
 
 **Q: Chart looks stale after I edited the file.**
 A: Schema drift is auto-detected (mtime / schema-hash compare), but
@@ -655,23 +655,19 @@ non-null values you keep (which compiles to `col IS NULL OR col IN
 
 From the extension root (`extensions/quantlab`):
 
-    ~/.quantlab/venv/bin/python -m pytest python/qviz/tests/ -q
+    ~/.deltaplus/venv/bin/python -m pytest python/qviz/tests/ -q
 
-Several fixtures depend on a 1M-row OHLCV parquet at
-`/tmp/quantlab-spike-data/synthetic_ohlcv_1m.parquet`. The `conftest`
-auto-generates it on session start, so local runs Just Work. CI and
-strict environments should set `QUANTLAB_REQUIRE_FIXTURES=1`, which
-converts the soft-skip on missing fixtures into a hard failure so a
-silently-skipped suite cannot look green:
+Several fixtures depend on a 1M-row OHLCV parquet, a required input named by
+`QUANTLAB_TEST_SPIKE_DATA`. Write it once (deterministic, about 28 MB), then
+point the variable at it:
 
-    QUANTLAB_REQUIRE_FIXTURES=1 ~/.quantlab/venv/bin/python -m pytest python/qviz/tests/ -q
+    ~/.deltaplus/venv/bin/python python/qviz/tests/_spike_data.py <path>
+    QUANTLAB_TEST_SPIKE_DATA=<path> npm run test:py
 
-The `npm run test:py` script invokes this strict variant; the
-`npm run test:py:dev` script keeps the soft-skip default for local
-work. Schema-shape conditional skips (e.g. tests that require a
-`ticker` column the synthetic parquet does not provide) remain soft
-skips even under strict mode — those are capability gates, not
-fixture-presence gates.
+An unset variable, or a missing or truncated file, FAILS the tests that need
+it, naming the variable. Nothing soft-skips: a skipped fixture test is a check
+NOT RUN that reads as green. The extension's mocha daemon tests take the same
+variable, plus `QUANTLAB_TEST_PYTHON`.
 
 ### Wire-shape kind unions (closure megaudit 2026-05-13)
 

@@ -51,6 +51,10 @@ from quantlab.providers.base import Bar as ProviderBar
 logger = logging.getLogger(__name__)
 
 
+class MetricsCalculationError(RuntimeError):
+    """The performance metrics of a finished backtest could not be calculated; the run has no result."""
+
+
 @dataclass
 class Fill:
     """Fill record from backtest execution."""
@@ -504,7 +508,7 @@ def backtest(
                 initial_capital=float(initial_capital),
             )
         except Exception as e:
-            warnings.append(f"Metrics calculation error: {e}")
+            raise MetricsCalculationError(f"metrics calculation failed: {e}") from e
 
     return BacktestResults(
         strategy_name=strategy_name,

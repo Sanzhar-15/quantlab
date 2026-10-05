@@ -1787,7 +1787,7 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 
 	/**
 	 * Visualise v2: handle the `promoteToChart` webview message. Generate
-	 * a minimal .py scaffold under .quantlab/visualise-promoted/ and
+	 * a minimal .py scaffold under .deltaplus/visualise-promoted/ and
 	 * open it in Quantlab's Chart view. The scaffold references the same
 	 * dataset; the user adds indicators / wires live sessions in the
 	 * Chart UI.

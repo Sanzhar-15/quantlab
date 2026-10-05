@@ -1128,7 +1128,7 @@ class TestStrategy:
     def test_default_package_dir(self) -> None:
         """Test default package directory is used."""
         loader = PackageLoader(package_dir=None)
-        expected = Path.home() / ".quantlab" / "packages"
+        expected = Path.home() / ".deltaplus" / "packages"
         assert loader.package_dir == expected
 
     def test_load_package_error(

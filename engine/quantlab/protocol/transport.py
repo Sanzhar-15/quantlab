@@ -156,7 +156,7 @@ class UnixSocketTransport(Transport):
     """
     Unix socket transport for Linux and macOS.
 
-    Socket path: ~/.quantlab/sessions/{session_id}.sock
+    Socket path: ~/.deltaplus/sessions/{session_id}.sock
     Permissions: 0600 (owner only)
     """
 
@@ -308,7 +308,7 @@ def get_socket_path(session_id: str) -> Path:
         Path to socket file
     """
     validate_session_id(session_id)
-    base_dir = Path.home() / ".quantlab" / "sessions"
+    base_dir = Path.home() / ".deltaplus" / "sessions"
     base_dir.mkdir(parents=True, exist_ok=True)
     return base_dir / f"{session_id}.sock"
 

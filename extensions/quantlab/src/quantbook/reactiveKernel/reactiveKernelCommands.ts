@@ -178,7 +178,7 @@ function makeClientFactory(
 		if (resolved === null) {
 			throw new Error(
 				'[kernel_no_python] no Python interpreter found (checked QUANTLAB_PYTHON, quantlab.pythonPath, '
-				+ 'python.defaultInterpreterPath, ~/.quantlab/venv). Configure one to run a reactive kernel.',
+				+ 'python.defaultInterpreterPath, ~/.deltaplus/venv). Configure one to run a reactive kernel.',
 			);
 		}
 		// FE-1.5-1d-2: build the hardened spawn env ONCE and use it for the version check, the dep

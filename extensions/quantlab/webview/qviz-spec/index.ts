@@ -255,10 +255,10 @@ function init(): void {
 				data.specHash,
 				dispatchExtractError, dispatchRenderError,
 				attrForRender).then(ok => {
-				if (!ok) {
-					lastFailedResizeKey = resizeKey;
-				}
-			});
+					if (!ok) {
+						lastFailedResizeKey = resizeKey;
+					}
+				});
 		}, RESIZE_DEBOUNCE_MS);
 	});
 	resizeObserver.observe(preview.chartContainer);
@@ -400,6 +400,7 @@ function init(): void {
 	// Ghost-bar flicker audit (2026-05-14): track lastErrorRequestId so
 	// the live sub can reset `lastRequestedKey` exactly once per error
 	// (otherwise the key-based dedup would persistently block a re-
+	// allow-any-unicode-next-line
 	// request after the user edits the spec — but only if their new
 	// hash happens to match a previously-rejected one).
 	let lastObservedErrorRequestId: number | null = null;
@@ -503,12 +504,12 @@ function init(): void {
 				state.query.lastData.specHash,
 				dispatchExtractError, dispatchRenderError,
 				attrForRender).then(ok => {
-				if (!ok) {
-					lastFailedResizeKey = buildResizeKey(
-						state.query.lastData!.specHash,
-						state.ui.themeTokensVersion);
-				}
-			});
+					if (!ok) {
+						lastFailedResizeKey = buildResizeKey(
+							state.query.lastData!.specHash,
+							state.ui.themeTokensVersion);
+					}
+				});
 		}
 	});
 	// liveSubscription is a store-unsubscribe function; called in the
@@ -682,7 +683,7 @@ function init(): void {
 		const enabled = !!spec && isTimeseries && datasetOk;
 		promoteToChartBtn.disabled = !enabled;
 		promoteToChartBtn.title = enabled
-			? 'Open this dataset in the Chart view (writes a .py scaffold to .quantlab/visualise-promoted/).'
+			? 'Open this dataset in the Chart view (writes a .py scaffold to .deltaplus/visualise-promoted/).'
 			: !spec
 				? 'No spec loaded yet.'
 				: !isTimeseries
@@ -699,6 +700,7 @@ function init(): void {
 	promoteToChartBtn.addEventListener('click', onPromoteClick);
 	// **Subscriber invariant** (Front 7 fix, 2026-05-13 post-smoke):
 	// `store.subscribe` callbacks MUST be pure read-and-render. They
+	// allow-any-unicode-next-line
 	// MUST NOT call `store.dispatch(...)` synchronously — the store's
 	// re-entrancy guard at `store.ts:172-180` throws on nested
 	// dispatch. Force-close logic that previously lived here on

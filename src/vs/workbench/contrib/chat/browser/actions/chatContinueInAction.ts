@@ -38,7 +38,6 @@ import { PROMPT_LANGUAGE_ID } from '../../common/promptSyntax/promptTypes.js';
 import { AgentSessionProviders, getAgentSessionProviderIcon, getAgentSessionProviderName } from '../agentSessions/agentSessions.js';
 import { IChatWidgetService } from '../chat.js';
 import { ctxHasEditorModification } from '../chatEditing/chatEditingEditorContextKeys.js';
-import { CHAT_SETUP_ACTION_ID } from './chatActions.js';
 import { PromptFileVariableKind, toPromptFileVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 
 export const enum ActionLocation {
@@ -138,12 +137,6 @@ export class ChatContinueInSessionActionItem extends ActionWidgetDropdownActionV
 					actions.push(this.toAction(AgentSessionProviders.Cloud, cloudContrib, instantiationService, location));
 				}
 
-				// Offer actions to enter setup if we have no contributions
-				if (actions.length === 0) {
-					actions.push(this.toSetupAction(AgentSessionProviders.Background, instantiationService));
-					actions.push(this.toSetupAction(AgentSessionProviders.Cloud, instantiationService));
-				}
-
 				return actions;
 			}
 		};
@@ -164,22 +157,6 @@ export class ChatContinueInSessionActionItem extends ActionWidgetDropdownActionV
 					return new CreateRemoteAgentJobFromEditorAction().run(accessor, contrib);
 				}
 				return new CreateRemoteAgentJobAction().run(accessor, contrib);
-			})
-		};
-	}
-
-	private static toSetupAction(provider: AgentSessionProviders, instantiationService: IInstantiationService): IActionWidgetDropdownAction {
-		return {
-			id: provider,
-			enabled: true,
-			icon: getAgentSessionProviderIcon(provider),
-			class: undefined,
-			label: getAgentSessionProviderName(provider),
-			tooltip: localize('continueSessionIn', "Continue in {0}", getAgentSessionProviderName(provider)),
-			category: { label: localize('continueIn', "Continue In"), order: 0, showHeader: true },
-			run: () => instantiationService.invokeFunction(accessor => {
-				const commandService = accessor.get(ICommandService);
-				return commandService.executeCommand(CHAT_SETUP_ACTION_ID);
 			})
 		};
 	}

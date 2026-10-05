@@ -8,6 +8,20 @@ import { GlobalState } from '../../core/state/GlobalState';
 import { ServerApiClient, ServerSymbol, CryptoSymbol, EtfItem, IndexItem } from '../../core/server/ServerApiClient';
 import { WatchlistManager, Watchlist } from './WatchlistManager';
 import { isServerSource } from '../../types/market';
+import { isHostDataError } from '../../core/host/hostDataTransport';
+
+/** A failed server load: the text shown, and whether the host refused it as signed out (by its code). */
+export interface LoadError {
+	readonly message: string;
+	readonly signedOut: boolean;
+}
+
+export function toLoadError(err: unknown): LoadError {
+	return {
+		message: err instanceof Error ? err.message : String(err),
+		signedOut: isHostDataError(err, 'not-signed-in'),
+	};
+}
 
 // ---- Node type union ----
 
@@ -155,33 +169,34 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 	// Per-section data caches
 	private equitySymbols: ServerSymbol[] | undefined;
 	private equityLoading = false;
-	private equityError: string | undefined;
+	private equityError: LoadError | undefined;
 
 	private cryptoSymbols: CryptoSymbol[] | undefined;
 	private cryptoSymbolSet = new Set<string>();
 	private cryptoLoading = false;
 	private cryptoLoadPromise: Promise<void> | undefined;
 	private cryptoRetryCount = 0;
-	private cryptoError: string | undefined;
+	private cryptoError: LoadError | undefined;
 	private cryptoRetryTimer: NodeJS.Timeout | undefined;
 
 	private etfs: EtfItem[] | undefined;
 	private etfsLoading = false;
 	private etfRetryCount = 0;
-	private etfError: string | undefined;
+	private etfError: LoadError | undefined;
 	private etfRetryTimer: NodeJS.Timeout | undefined;
 
 	private indices: IndexItem[] | undefined;
 	private indicesLoading = false;
 	private indexRetryCount = 0;
-	private indexError: string | undefined;
+	private indexError: LoadError | undefined;
 	private indexRetryTimer: NodeJS.Timeout | undefined;
 
 	private retryCount = 0;
 	private readonly maxRetries = 3;
 	private retryTimer: NodeJS.Timeout | undefined;
 
-	private lastAuthSignedIn: boolean | undefined;
+	/** Last identity seen: a user id, null = signed out, undefined = none seen yet. */
+	private lastAuthUserId: string | null | undefined;
 
 	constructor(
 		private readonly globalState: GlobalState,
@@ -193,13 +208,16 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			// Sign-in/out must re-drive the tree: before this, a tree loaded while
 			// signed out kept its "Not signed in" failures forever after sign-in.
 			// onAuthStateChange also fires on every ~15-min token refresh (M119);
-			// only an actual signed-in/out transition wipes the caches, otherwise
-			// the tree visibly flashes to "Loading..." mid-session.
-			ServerApiClient.getInstance().onAuthStateChange(signedIn => {
-				if (signedIn === this.lastAuthSignedIn) {
+			// only a change of identity (sign-in, sign-out, or a change of USER while
+			// signed in) wipes the caches; a change of the same user's display fields
+			// does not, otherwise the tree visibly flashes to "Loading..." mid-session.
+			ServerApiClient.getInstance().onAuthStateChange(() => {
+				const user = ServerApiClient.getInstance().getUser();
+				const userId = user === undefined ? null : user.id;
+				if (userId === this.lastAuthUserId) {
 					return;
 				}
-				this.lastAuthSignedIn = signedIn;
+				this.lastAuthUserId = userId;
 				this.resetServerCaches();
 				this.refresh();
 			}),
@@ -905,7 +923,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			this.equitySymbols = await client.getSymbols();
 			this.retryCount = 0;
 		} catch (err) {
-			this.equityError = err instanceof Error ? err.message : 'Unknown error';
+			this.equityError = toLoadError(err);
 			this.equitySymbols = [];
 			if (this.retryCount < this.maxRetries) {
 				this.retryCount++;
@@ -942,7 +960,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			this.cryptoRetryCount = 0;
 			this.cryptoError = undefined;
 		} catch (err) {
-			this.cryptoError = err instanceof Error ? err.message : String(err);
+			this.cryptoError = toLoadError(err);
 			this.cryptoSymbols = [];
 			if (this.cryptoRetryCount < this.maxRetries) {
 				this.cryptoRetryCount++;
@@ -968,7 +986,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			this.etfRetryCount = 0;
 			this.etfError = undefined;
 		} catch (err) {
-			this.etfError = err instanceof Error ? err.message : String(err);
+			this.etfError = toLoadError(err);
 			this.etfs = [];
 			if (this.etfRetryCount < this.maxRetries) {
 				this.etfRetryCount++;
@@ -994,7 +1012,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			this.indexRetryCount = 0;
 			this.indexError = undefined;
 		} catch (err) {
-			this.indexError = err instanceof Error ? err.message : String(err);
+			this.indexError = toLoadError(err);
 			this.indices = [];
 			if (this.indexRetryCount < this.maxRetries) {
 				this.indexRetryCount++;
@@ -1036,16 +1054,16 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 	}
 
 	/**
-	 * Error placeholder for server-backed nodes. A signed-out failure becomes an
-	 * actionable "Sign in" entry instead of a cryptic error string; any other
-	 * failure carries the optional retry command (M7).
+	 * Error placeholder for server-backed nodes. A signed-out failure (the host's
+	 * 'not-signed-in' code) becomes an actionable "Sign in" entry instead of a
+	 * cryptic error string; any other failure carries the optional retry command (M7).
 	 */
-	private errorPlaceholder(id: string, error: string, retry?: vscode.Command): PlaceholderNode {
-		if (/not signed in/i.test(error)) {
+	private errorPlaceholder(id: string, error: LoadError, retry?: vscode.Command): PlaceholderNode {
+		if (error.signedOut) {
 			return this.placeholder(id, 'Sign in to load live data',
 				{ command: 'quantlab.signIn', title: 'Sign In' });
 		}
-		return this.placeholder(id, `Failed to load: ${error}`, retry);
+		return this.placeholder(id, `Failed to load: ${error.message}`, retry);
 	}
 
 	private placeholder(id: string, label: string, command?: vscode.Command, description?: string): PlaceholderNode {

@@ -59,6 +59,16 @@ interface ChartSession {
 	analysisDebounced: () => void;
 	visualizationDebounced: () => void;
 	cancellationTokenSource?: vscode.CancellationTokenSource;
+	/** Token of the bars fetch a refreshVisualization without data started (DT-3: no bar slot). */
+	vizCancellationTokenSource?: vscode.CancellationTokenSource;
+}
+
+/** One bars load for the current toolbar source (loadBars). */
+interface LoadedBars {
+	data: OhlcvBar[];
+	effectiveTimeframe: Timeframe;
+	dsKey: string;
+	warning?: string;
 }
 
 /**
@@ -83,8 +93,8 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 	private readonly stateManager = TabViewStateManager.getInstance();
 	private readonly parameterExtractor = ParameterExtractor.getInstance();
-	// Cache size limits (prevent unbounded growth)
-	private static readonly MAX_DATA_CACHE_SIZE = 50;
+	// Cache size limits (prevent unbounded growth). DT-3: no bars cache here --
+	// bars are re-read through DataService (the host's main data module caches).
 	private static readonly MAX_ARTIFACT_CACHE_SIZE = 30;
 
 	private readonly visualizationDetector = VisualizationDetector.getInstance();
@@ -96,8 +106,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 	private readonly dataService = DataService.getInstance();
 	private readonly visualizationRunner = VisualizationRunner.getInstance();
 	private readonly chartStateStore = ChartStateStore.getInstance();
-	private readonly dataCache = new Map<string, OhlcvBar[]>();
-	private readonly dataCacheAccessTimes = new Map<string, number>(); // LRU tracking
 	private readonly artifactCache = new Map<string, { signals?: SignalMarker[]; equity?: EquityPoint[] }>();
 	private readonly artifactCacheAccessTimes = new Map<string, number>(); // LRU tracking
 	private readonly sessions = new Map<string, ChartSession>();
@@ -216,11 +224,14 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			session.cancellationTokenSource.cancel();
 			session.cancellationTokenSource.dispose();
 		}
+		if (session.vizCancellationTokenSource) {
+			session.vizCancellationTokenSource.cancel();
+			session.vizCancellationTokenSource.dispose();
+			session.vizCancellationTokenSource = undefined;
+		}
 
 		this.themeProvider.unregisterWebview(session.key);
 		this.sessions.delete(session.key);
-		this.dataCache.delete(session.key);
-		this.dataCacheAccessTimes.delete(session.key);
 		this.bannerState.delete(session.key);
 		this.lastNotifiedVizIssues.delete(session.key);
 
@@ -493,8 +504,50 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		// Generate request ID to prevent race conditions
 		const requestId = this.chartStateStore.nextVizRequestId(key);
 
-		const bars = data ?? this.dataCache.get(session.key);
-		if (!bars || !bars.length) {
+		// DT-3: no per-panel bar slot. Without `data` the bars are re-read
+		// through loadBars; requestId still guards staleness below.
+		let bars = data;
+		if (!bars) {
+			const toolbar = this.buildToolbarState(session);
+			if (!toolbar.dataSource) {
+				// No source selected: reloadData shows the empty state; nothing to draw.
+				return;
+			}
+			if (session.vizCancellationTokenSource) {
+				session.vizCancellationTokenSource.cancel();
+				session.vizCancellationTokenSource.dispose();
+			}
+			const tokenSource = new vscode.CancellationTokenSource();
+			session.vizCancellationTokenSource = tokenSource;
+			try {
+				bars = (await this.loadBars(toolbar.dataSource, toolbar, tokenSource.token)).data;
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				// Superseded (a newer viz request or a disposed session): the
+				// newer request owns the overlay. Its own 'Cancelled' is expected;
+				// any other failure is still logged.
+				if (!this.isSessionActive(session) || !this.chartStateStore.isVizRequestCurrent(key, requestId)) {
+					if (detail !== 'Cancelled') {
+						console.warn(`ChartViewProvider: superseded visualization data load failed: ${detail}`);
+					}
+					return;
+				}
+				// The debounced caller has no catch: surface the failure here.
+				session.webview.postMessage({
+					type: 'showError',
+					message: 'Unable to load data for the visualization.',
+					detail,
+					actions: ['reload', 'selectData']
+				});
+				return;
+			} finally {
+				if (session.vizCancellationTokenSource === tokenSource) {
+					session.vizCancellationTokenSource = undefined;
+					tokenSource.dispose();
+				}
+			}
+		}
+		if (!bars.length) {
 			return;
 		}
 
@@ -648,38 +701,11 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		session.webview.postMessage({ type: 'showLoading', requestId });
 
 		try {
-			let data: OhlcvBar[];
-			let effectiveTimeframe: Timeframe;
-			let dsKey: string;
-
-			if (isLocalFileSource(toolbar.dataSource)) {
-				// Load from local file
-				const result = await this.dataService.getOHLCVFromFile(toolbar.dataSource.filePath, toolbar.dateRange, token);
-				data = result.data;
-				effectiveTimeframe = result.meta.effectiveTimeframe;
-				dsKey = toolbar.dataSource.filePath;
-
-				if (result.meta.warning) {
-					this.setBanner(session, 'data', result.meta.warning, 'warning');
-				} else {
-					this.setBanner(session, 'data', '');
-				}
-			} else if (isServerSource(toolbar.dataSource)) {
-				// Load from Delta Plus server
-				const timeframe = toolbar.timeframe ?? '1D';
-				const result = await this.dataService.getOHLCVFromServer(
-					toolbar.dataSource.symbol,
-					timeframe,
-					toolbar.dateRange,
-					token,
-					toolbar.dataSource.assetClass
-				);
-				data = result.data;
-				effectiveTimeframe = result.meta.effectiveTimeframe;
-				dsKey = `server:${toolbar.dataSource.symbol}`;
-				this.setBanner(session, 'data', '');
+			const { data, effectiveTimeframe, dsKey, warning } = await this.loadBars(toolbar.dataSource, toolbar, token);
+			if (warning) {
+				this.setBanner(session, 'data', warning, 'warning');
 			} else {
-				throw new Error('Unknown data source type');
+				this.setBanner(session, 'data', '');
 			}
 
 			// Check if this request is still current (prevent race conditions)
@@ -730,7 +756,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				buffer,
 				count
 			});
-			this.setDataCache(session.key, data); // Use LRU cache
 
 			this.chartStateStore.setLastDataKey(key, `${dsKey}:${toolbar.dateRange?.start ?? ''}:${toolbar.dateRange?.end ?? ''}`);
 
@@ -760,6 +785,44 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				actions: ['reload', 'selectData']
 			});
 		}
+	}
+
+	/**
+	 * One bars load for the toolbar's data source (the former reloadData fetch
+	 * block). DT-3: nothing is kept -- every caller re-reads through DataService.
+	 */
+	private async loadBars(
+		dataSource: DataSourceDescriptor,
+		toolbar: ChartToolbarState,
+		token: vscode.CancellationToken
+	): Promise<LoadedBars> {
+		if (isLocalFileSource(dataSource)) {
+			// Load from local file
+			const result = await this.dataService.getOHLCVFromFile(dataSource.filePath, toolbar.dateRange, token);
+			return {
+				data: result.data,
+				effectiveTimeframe: result.meta.effectiveTimeframe,
+				dsKey: dataSource.filePath,
+				warning: result.meta.warning
+			};
+		}
+		if (isServerSource(dataSource)) {
+			// Load from Delta Plus server
+			const timeframe = toolbar.timeframe ?? '1D';
+			const result = await this.dataService.getOHLCVFromServer(
+				dataSource.symbol,
+				timeframe,
+				toolbar.dateRange,
+				token,
+				dataSource.assetClass
+			);
+			return {
+				data: result.data,
+				effectiveTimeframe: result.meta.effectiveTimeframe,
+				dsKey: `server:${dataSource.symbol}`
+			};
+		}
+		throw new Error('Unknown data source type');
 	}
 
 	/**
@@ -990,16 +1053,22 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			return;
 		}
 
-		if (artifacts.signals) {
-			session.webview.postMessage({ type: 'setSignals', requestId: 0, signals: artifacts.signals });
+		// The engine writes inf / NaN as null (run_backtest.py _sanitize_for_json). The chart cannot draw those: they are
+		// left out and counted in a banner, never dropped unannounced.
+		const equity = artifacts.equity?.filter((point): point is EquityPoint => point.v !== null);
+		const signals = artifacts.signals?.map(({ price, ...signal }): SignalMarker => price === null ? signal : { ...signal, price });
+		const droppedPoints = artifacts.equity === undefined || equity === undefined ? 0 : artifacts.equity.length - equity.length;
+		const droppedPrices = artifacts.signals === undefined ? 0 : artifacts.signals.filter(signal => signal.price === null).length;
+		if (droppedPoints > 0 || droppedPrices > 0) {
+			this.setBanner(session, 'run', `${droppedPoints} equity point(s) and ${droppedPrices} signal price(s) of this run are not finite and are not drawn.`, 'warning');
 		}
-		if (artifacts.equity) {
-			session.webview.postMessage({ type: 'setEquityCurve', requestId: 0, equity: artifacts.equity });
+		if (signals) {
+			session.webview.postMessage({ type: 'setSignals', requestId: 0, signals });
 		}
-		this.setArtifactCache(session.key, {
-			signals: artifacts.signals,
-			equity: artifacts.equity
-		});
+		if (equity) {
+			session.webview.postMessage({ type: 'setEquityCurve', requestId: 0, equity });
+		}
+		this.setArtifactCache(session.key, { signals, equity });
 		this.executeWithErrorBoundary(() => this.refreshVisualization(session), 'refreshVisualization');
 
 		const entry = this.historyState.getEntry(runId);
@@ -1125,32 +1194,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 	// ----
 	// LRU Cache Management (prevent unbounded growth)
 	// ----
-
-	/**
-	 * Set data in cache with LRU eviction
-	 */
-	private setDataCache(key: string, data: OhlcvBar[]): void {
-		// Evict least-recently-used if at capacity
-		if (this.dataCache.size >= ChartViewProvider.MAX_DATA_CACHE_SIZE && !this.dataCache.has(key)) {
-			let lruKey: string | undefined;
-			let lruTime = Infinity;
-
-			for (const [k, time] of this.dataCacheAccessTimes) {
-				if (time < lruTime) {
-					lruTime = time;
-					lruKey = k;
-				}
-			}
-
-			if (lruKey) {
-				this.dataCache.delete(lruKey);
-				this.dataCacheAccessTimes.delete(lruKey);
-			}
-		}
-
-		this.dataCache.set(key, data);
-		this.dataCacheAccessTimes.set(key, Date.now());
-	}
 
 	/**
 	 * Set artifact in cache with LRU eviction

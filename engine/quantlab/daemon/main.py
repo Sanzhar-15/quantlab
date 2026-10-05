@@ -2368,7 +2368,7 @@ class LiveTradingDaemon:
 
 def setup_logging(session_id: str, log_level: str = "INFO") -> None:
     """Configure logging for daemon process."""
-    log_dir = Path.home() / ".quantlab" / "logs"
+    log_dir = Path.home() / ".deltaplus" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     log_file = log_dir / f"daemon_{session_id}.log"

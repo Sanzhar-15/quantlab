@@ -49,8 +49,7 @@
     "lint": "eslint src --ext ts",
     "test": "npm run compile && node node_modules/mocha/bin/mocha.js 'out/test/qviz*.test.js' 'out/test/quantbook*.test.js' 'out/src/test/**/*.test.js' --ui tdd --timeout 10000 --require source-map-support/register --require out/test/helpers/mocha-setup.js",
     "test:all": "npm run compile && node node_modules/mocha/bin/mocha.js 'out/test/**/*.test.js' 'out/src/test/**/*.test.js' --ui tdd --timeout 10000 --require source-map-support/register --require out/test/helpers/mocha-setup.js",
-    "test:py": "QUANTLAB_REQUIRE_FIXTURES=1 python -m pytest python/qviz/tests/ -q",
-    "test:py:dev": "python -m pytest python/qviz/tests/ -q",
+    "test:py": "python -m pytest python/qviz/tests/ -q",
     "build:webviews": "node ./esbuild-webview.mjs"
   },
   "activationEvents": [
@@ -1684,7 +1683,7 @@
           "type": "string",
           "scope": "machine-overridable",
           "default": "",
-          "description": "Path to the Python interpreter for the qviz daemon (visualisation). When empty, Quantlab falls through to python.defaultInterpreterPath, then to ~/.quantlab/venv/bin/python. Setting an explicit path that does not resolve to an executable file fails loudly (does not silently fall through)."
+          "description": "Path to the Python interpreter for the qviz daemon (visualisation). When empty, Quantlab falls through to python.defaultInterpreterPath, then to ~/.deltaplus/venv/bin/python. Setting an explicit path that does not resolve to an executable file fails loudly (does not silently fall through)."
         },
         "quantlab.quantbookMcpPort": {
           "type": "number",

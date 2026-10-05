@@ -3,12 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { WorkbenchActionExecutedClassification, WorkbenchActionExecutedEvent } from '../../../../../base/common/actions.js';
 import { Event } from '../../../../../base/common/event.js';
 import { Lazy } from '../../../../../base/common/lazy.js';
 import { Disposable, DisposableStore, markAsSingleton, MutableDisposable } from '../../../../../base/common/lifecycle.js';
-import { equalsIgnoreCase } from '../../../../../base/common/strings.js';
-import { URI } from '../../../../../base/common/uri.js';
 import { localize } from '../../../../../nls.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
@@ -18,19 +15,14 @@ import { ExtensionIdentifier } from '../../../../../platform/extensions/common/e
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import product from '../../../../../platform/product/common/product.js';
-import { IProductService } from '../../../../../platform/product/common/productService.js';
-import { ITelemetryService } from '../../../../../platform/telemetry/common/telemetry.js';
 import { IWorkbenchContribution } from '../../../../common/contributions.js';
 import { IViewDescriptorService, ViewContainerLocation } from '../../../../common/views.js';
 import { ChatEntitlement, ChatEntitlementContext, ChatEntitlementRequests, ChatEntitlementService, IChatEntitlementService } from '../../../../services/chat/common/chatEntitlementService.js';
 import { EnablementState, IWorkbenchExtensionEnablementService } from '../../../../services/extensionManagement/common/extensionManagement.js';
-import { ExtensionUrlHandlerOverrideRegistry, IExtensionUrlHandlerOverride } from '../../../../services/extensions/browser/extensionUrlHandler.js';
 import { IExtensionService } from '../../../../services/extensions/common/extensions.js';
 import { IWorkbenchLayoutService, Parts } from '../../../../services/layout/browser/layoutService.js';
 import { IExtension, IExtensionsWorkbenchService } from '../../../extensions/common/extensions.js';
-import { IChatModeService } from '../../common/chatModes.js';
 import { ChatAgentLocation, ChatModeKind } from '../../common/constants.js';
-import { CHAT_SETUP_ACTION_ID } from '../actions/chatActions.js';
 import { ChatViewContainerId } from '../chat.js';
 import { chatViewsWelcomeRegistry } from '../viewsWelcome/chatViewsWelcome.js';
 import { ChatSetupController } from './chatSetupController.js';
@@ -70,7 +62,6 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
 
 		this.registerSetupAgents(context, controller);
 		this.registerActions(context, requests, controller);
-		this.registerUrlLinkHandler();
 		this.checkExtensionInstallation(context);
 	}
 
@@ -174,10 +165,6 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
 		registerGenerateCodeCommand('chat.internal.generateTests', 'github.copilot.chat.generateTests');
 	}
 
-	private registerUrlLinkHandler(): void {
-		this._register(ExtensionUrlHandlerOverrideRegistry.registerHandler(this.instantiationService.createInstance(ChatSetupExtensionUrlHandler)));
-	}
-
 	private async checkExtensionInstallation(context: ChatEntitlementContext): Promise<void> {
 
 		// When developing extensions, await registration and then check
@@ -221,48 +208,6 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
 	}
 }
 
-class ChatSetupExtensionUrlHandler implements IExtensionUrlHandlerOverride {
-	constructor(
-		@IProductService private readonly productService: IProductService,
-		@ICommandService private readonly commandService: ICommandService,
-		@ITelemetryService private readonly telemetryService: ITelemetryService,
-		@IChatModeService private readonly chatModeService: IChatModeService,
-	) { }
-
-	canHandleURL(url: URI): boolean {
-		return url.scheme === this.productService.urlProtocol && equalsIgnoreCase(url.authority, defaultChat.chatExtensionId);
-	}
-
-	async handleURL(url: URI): Promise<boolean> {
-		const params = new URLSearchParams(url.query);
-		this.telemetryService.publicLog2<WorkbenchActionExecutedEvent, WorkbenchActionExecutedClassification>('workbenchActionExecuted', { id: CHAT_SETUP_ACTION_ID, from: 'url', detail: params.get('referrer') ?? undefined });
-
-		const agentParam = params.get('agent') ?? params.get('mode');
-		const inputParam = params.get('prompt');
-		if (!agentParam && !inputParam) {
-			return false;
-		}
-
-		const agentId = agentParam ? this.resolveAgentId(agentParam) : undefined;
-		await this.commandService.executeCommand(CHAT_SETUP_ACTION_ID, agentId, inputParam ? { inputValue: inputParam } : undefined);
-		return true;
-	}
-
-	private resolveAgentId(agentParam: string): string | undefined {
-		const agents = this.chatModeService.getModes();
-		const allAgents = [...agents.builtin, ...agents.custom];
-
-		const foundAgent = allAgents.find(agent => agent.id === agentParam);
-		if (foundAgent) {
-			return foundAgent.id;
-		}
-
-		const nameLower = agentParam.toLowerCase();
-		const agentByName = allAgents.find(agent => agent.name.get().toLowerCase() === nameLower);
-		return agentByName?.id;
-	}
-}
-
 export class ChatTeardownContribution extends Disposable implements IWorkbenchContribution {
 
 	static readonly ID = 'workbench.contrib.chatTeardown';
@@ -285,7 +230,6 @@ export class ChatTeardownContribution extends Disposable implements IWorkbenchCo
 		}
 
 		this.registerListeners();
-		this.registerActions();
 
 		this.handleChatDisabled(false);
 	}
@@ -347,9 +291,6 @@ export class ChatTeardownContribution extends Disposable implements IWorkbenchCo
 		) {
 			this.layoutService.setPartHidden(true, Parts.AUXILIARYBAR_PART); // hide if there are no views in the secondary sidebar
 		}
-	}
-
-	private registerActions(): void {
 	}
 }
 

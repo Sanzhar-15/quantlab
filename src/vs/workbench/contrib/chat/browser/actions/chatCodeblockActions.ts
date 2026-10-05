@@ -182,5 +182,3 @@ function getContextFromEditor(editor: ICodeEditor, accessor: ServicesAccessor): 
 	};
 }
 
-export function registerChatCodeCompareBlockActions() {
-}

@@ -23,27 +23,21 @@ import pytest
 from qviz.ipc import FRAME_ARROW_IPC, FRAME_JSON, HEADER_FMT, HEADER_SIZE
 from qviz.reader import arrow_ipc_to_table
 
-from qviz.tests._fixture_helpers import require_fixture
+from qviz.tests._fixture_helpers import spike_data_path
 
 
 PYTHON = sys.executable
 DAEMON_MAIN = "qviz.daemon"
-SPIKE_DATA = Path("/tmp/quantlab-spike-data/synthetic_ohlcv_1m.parquet")
 PYTHON_DIR = Path(__file__).resolve().parents[2]  # extensions/quantlab/python
 
 
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
-    """A workspace containing a copy/symlink of the spike parquet under data/."""
-    require_fixture(SPIKE_DATA, "spike OHLCV parquet")
+    """A workspace containing a copy of the spike parquet under data/."""
+    spike = spike_data_path()
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    target = data_dir / "ohlcv.parquet"
-    # Hardlink for speed; fall back to copy if cross-device.
-    try:
-        os.link(SPIKE_DATA, target)
-    except OSError:
-        target.write_bytes(SPIKE_DATA.read_bytes())
+    (data_dir / "ohlcv.parquet").write_bytes(spike.read_bytes())
     return tmp_path
 
 

@@ -18,7 +18,6 @@ import { IChatWidgetService } from '../browser/chat.js';
 import { ChatContextKeys } from '../common/actions/chatContextKeys.js';
 import { ChatConfiguration } from '../common/constants.js';
 import { IChatService } from '../common/chatService/chatService.js';
-import { registerChatDeveloperActions } from './actions/chatDeveloperActions.js';
 import { KeywordActivationContribution } from './actions/voiceChatActions.js';
 import { NativeBuiltinToolsContribution } from './builtInTools/tools.js';
 
@@ -115,7 +114,6 @@ class ChatLifecycleHandler extends Disposable {
 	}
 }
 
-registerChatDeveloperActions();
 
 registerWorkbenchContribution2(KeywordActivationContribution.ID, KeywordActivationContribution, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(NativeBuiltinToolsContribution.ID, NativeBuiltinToolsContribution, WorkbenchPhase.AfterRestored);

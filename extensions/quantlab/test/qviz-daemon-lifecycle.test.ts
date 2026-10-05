@@ -25,15 +25,24 @@ import {
 	DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
 } from '../src/qviz/daemon-lifecycle';
 
-const PYTHON_PATH = process.env.QUANTLAB_TEST_PYTHON ?? '/Users/sanzhar/.quantlab/venv/bin/python';
+// The interpreter is an explicit input: there is no default path; an unset variable or a path that is not an
+// executable fails the run by name. These tests never skip: a skipped daemon test is a check NOT RUN.
+function requiredTestPython(): string {
+	const value = process.env.QUANTLAB_TEST_PYTHON;
+	if (!value) {
+		throw new Error('QUANTLAB_TEST_PYTHON is not set: the qviz daemon tests need the path of a Python interpreter that has the daemon\'s dependencies');
+	}
+	try {
+		fs.accessSync(value, fs.constants.X_OK);
+	} catch (e) {
+		throw new Error(`QUANTLAB_TEST_PYTHON=${value} is not an executable file: ${(e as Error).message}`);
+	}
+	return value;
+}
+const PYTHON_PATH = requiredTestPython();
 // __dirname at runtime is the COMPILED test dir (out/test/), so source-tree
 // fixtures need to climb two levels back. Mirrors qviz-daemon-client.test.ts.
 const FIXTURES_DIR = path.resolve(__dirname, '..', '..', 'test', 'fixtures');
-
-function pythonAvailable(): boolean {
-	try { fs.accessSync(PYTHON_PATH, fs.constants.X_OK); return true; }
-	catch { return false; }
-}
 
 function recordStatus(lifecycle: DaemonLifecycle): LifecycleStatus[] {
 	const log: LifecycleStatus[] = [];
@@ -178,10 +187,7 @@ suite('DaemonLifecycle -- option validation', () => {
 
 suite('DaemonLifecycle -- happy path', () => {
 
-	const skip = !pythonAvailable();
-
 	test('starts as idle, transitions to ready on first getClient()', async function () {
-		if (skip) { this.skip(); }
 		const lifecycle = new DaemonLifecycle({
 			...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
 			workspaceRoot: '/tmp',
@@ -204,7 +210,6 @@ suite('DaemonLifecycle -- happy path', () => {
 	});
 
 	test('subsequent getClient() returns the same client (no new spawn)', async function () {
-		if (skip) { this.skip(); }
 		const lifecycle = new DaemonLifecycle({
 			...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
 			workspaceRoot: '/tmp',
@@ -226,10 +231,7 @@ suite('DaemonLifecycle -- happy path', () => {
 
 suite('DaemonLifecycle -- crash recovery', () => {
 
-	const skip = !pythonAvailable();
-
 	test('banner timeout drives idle -> starting -> crashed -> respawning', async function () {
-		if (skip) { this.skip(); }
 		// `dummy_daemon_no_banner` never writes a banner. With a short
 		// bannerTimeoutMs the lifecycle hits crashed quickly. We assert
 		// the status sequence; we DON'T wait for ready (it never will).
@@ -261,7 +263,6 @@ suite('DaemonLifecycle -- crash recovery', () => {
 	});
 
 	test('crash-then-respawn-success leads back to ready', async function () {
-		if (skip) { this.skip(); }
 		// Crash-after-banner fixture: writes banner, then exits ~50ms later.
 		// Lifecycle will see 'ready' once banner fires, then 'crashed' on
 		// exit. With an env-var bump we can flip the SECOND attempt to
@@ -307,10 +308,7 @@ suite('DaemonLifecycle -- crash recovery', () => {
 
 suite('DaemonLifecycle -- dispose', () => {
 
-	const skip = !pythonAvailable();
-
 	test('dispose rejects pending getClient() callers with DaemonUnavailableError', async function () {
-		if (skip) { this.skip(); }
 		const lifecycle = new DaemonLifecycle({
 			...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
 			workspaceRoot: '/tmp',
@@ -325,7 +323,6 @@ suite('DaemonLifecycle -- dispose', () => {
 	});
 
 	test('post-dispose getClient rejects', async function () {
-		if (skip) { this.skip(); }
 		const lifecycle = new DaemonLifecycle({
 			...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
 			workspaceRoot: '/tmp',
@@ -338,7 +335,6 @@ suite('DaemonLifecycle -- dispose', () => {
 	});
 
 	test('dispose is idempotent', async function () {
-		if (skip) { this.skip(); }
 		const lifecycle = new DaemonLifecycle({
 			...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
 			workspaceRoot: '/tmp',
@@ -351,7 +347,6 @@ suite('DaemonLifecycle -- dispose', () => {
 	});
 
 	test('dispose after ready cleans up the live client', async function () {
-		if (skip) { this.skip(); }
 		const lifecycle = new DaemonLifecycle({
 			...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
 			workspaceRoot: '/tmp',
@@ -372,8 +367,6 @@ suite('DaemonLifecycle -- dispose', () => {
 // ---------------------------------------------------------------------------
 
 suite('DaemonLifecycle -- requestImmediateRetry (Phase 8 Step D)', () => {
-
-	const skip = !pythonAvailable();
 
 	test('returns false when status is idle (nothing to retry)', () => {
 		const lifecycle = new DaemonLifecycle({
@@ -404,7 +397,6 @@ suite('DaemonLifecycle -- requestImmediateRetry (Phase 8 Step D)', () => {
 	});
 
 	test('crashed -> retry skips backoff and starts spawning', async function () {
-		if (skip) { this.skip(); }
 		this.timeout(8000);
 		// Crash-after-banner with a long initial backoff means the auto-retry
 		// would take a while. requestImmediateRetry should cut through.
@@ -422,7 +414,8 @@ suite('DaemonLifecycle -- requestImmediateRetry (Phase 8 Step D)', () => {
 		try {
 			const log = recordStatus(lifecycle);
 			// Kick a spawn; the no-banner fixture will crash quickly.
-			void lifecycle.getClient().catch(() => undefined);
+			// The waiter's outcome is asserted after dispose(), never swallowed.
+			const waiter: Promise<unknown> = lifecycle.getClient().then(c => c, (e: unknown) => e);
 			// Wait until we see 'crashed'.
 			const deadline = Date.now() + 3000;
 			while (Date.now() < deadline) {
@@ -444,6 +437,10 @@ suite('DaemonLifecycle -- requestImmediateRetry (Phase 8 Step D)', () => {
 				`requestImmediateRetry should have triggered another 'starting' transition `
 				+ `(before=${startsBefore}, after=${startsAfter}, log=${log.map(s => s.kind).join(',')})`,
 			);
+			await lifecycle.dispose();
+			const outcome = await waiter;
+			assert.ok(outcome instanceof DaemonUnavailableError,
+				`the no-banner waiter must reject with DaemonUnavailableError on dispose; got ${String(outcome)}`);
 		} finally {
 			await lifecycle.dispose();
 		}

@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 DAEMON = Path(__file__).parent / "query_daemon.py"
-PARQUET = Path("/tmp/quantlab-spike-data/synthetic_ohlcv_1m.parquet")
-PYTHON = "/Users/sanzhar/.quantlab/venv/bin/python"
+# The spike parquet is an explicit input (python/qviz/tests/_spike_data.py writes it); unset is a KeyError naming it.
+PARQUET = Path(os.environ["QUANTLAB_TEST_SPIKE_DATA"])
+# The interpreter is an explicit input: no default path; an unset variable is a KeyError naming it.
+PYTHON = os.environ["QUANTLAB_TEST_PYTHON"]
 
 
 def round_trip(proc, request: dict) -> dict:

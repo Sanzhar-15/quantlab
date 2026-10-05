@@ -161,12 +161,12 @@ const pythonPath = path.join(process.resourcesPath, 'python', 'bin', 'python3.11
 
 ### 3.3 User Package Support
 
-Users can install additional packages to `~/.quantlab/packages/`:
+Users can install additional packages to `~/.deltaplus/packages/`:
 
 ```python
 # Engine adds user packages to path
 import sys
-sys.path.insert(0, os.path.expanduser('~/.quantlab/packages'))
+sys.path.insert(0, os.path.expanduser('~/.deltaplus/packages'))
 ```
 
 ---

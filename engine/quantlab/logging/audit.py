@@ -42,8 +42,8 @@ logger = logging.getLogger(__name__)
 
 
 # Audit log location
-DEFAULT_AUDIT_PATH = Path.home() / ".quantlab" / "logs" / "audit.log"
-DEFAULT_ARCHIVE_PATH = Path.home() / ".quantlab" / "logs" / "archive"
+DEFAULT_AUDIT_PATH = Path.home() / ".deltaplus" / "logs" / "audit.log"
+DEFAULT_ARCHIVE_PATH = Path.home() / ".deltaplus" / "logs" / "archive"
 
 # Retention policy per Technical Spec §13.3
 RETENTION_YEARS = 7
@@ -533,7 +533,7 @@ class AuditLog:
         Archives are for efficient storage and faster queries.
 
         Args:
-            archive_path: Directory for archives (default: ~/.quantlab/logs/archive)
+            archive_path: Directory for archives (default: ~/.deltaplus/logs/archive)
             days_threshold: Archive entries older than this many days
 
         Returns:

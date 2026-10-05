@@ -39,12 +39,8 @@ import { IChatWidget, IChatWidgetService, IQuickChatService } from '../chat.js';
 import { IChatContextPickerItem, IChatContextPickService, IChatContextValueItem, isChatContextPickerPickItem } from '../attachments/chatContextPickService.js';
 import { isQuickChat } from '../widget/chatWidget.js';
 import { resizeImage } from '../chatImageUtils.js';
-import { registerPromptActions } from '../promptSyntax/promptFileActions.js';
 import { CHAT_CATEGORY } from './chatActions.js';
 
-export function registerChatContextActions() {
-	registerPromptActions();
-}
 
 async function withChatView(accessor: ServicesAccessor): Promise<IChatWidget | undefined> {
 	const chatWidgetService = accessor.get(IChatWidgetService);

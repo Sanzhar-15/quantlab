@@ -257,7 +257,7 @@ class PackageLoader:
         if package_dir:
             self.package_dir = Path(package_dir)
         else:
-            self.package_dir = Path.home() / ".quantlab" / "packages"
+            self.package_dir = Path.home() / ".deltaplus" / "packages"
 
         self.package_dir.mkdir(parents=True, exist_ok=True)
 

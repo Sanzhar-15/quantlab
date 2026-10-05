@@ -18,7 +18,7 @@ import { Emitter, Event } from '../../../../../base/common/event.js';
 import { FuzzyScore } from '../../../../../base/common/filters.js';
 import { IMarkdownString, MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { Iterable } from '../../../../../base/common/iterator.js';
-import { Disposable, DisposableStore, IDisposable, MutableDisposable, thenIfNotDisposed } from '../../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore, IDisposable, MutableDisposable } from '../../../../../base/common/lifecycle.js';
 import { ResourceSet } from '../../../../../base/common/map.js';
 import { Schemas } from '../../../../../base/common/network.js';
 import { filter } from '../../../../../base/common/objects.js';
@@ -261,9 +261,6 @@ export class ChatWidget extends Disposable implements IChatWidget {
 	 * The initial render leads to a lot of `onDidChangeTreeContentHeight` as the renderer works out the real heights of rows.
 	*/
 	private scrollLock = true;
-
-	private _instructionFilesCheckPromise: Promise<boolean> | undefined;
-	private _instructionFilesExist: boolean | undefined;
 
 	private _isRenderingWelcome = false;
 
@@ -902,9 +899,6 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				} else {
 					additionalMessage = defaultAgent?.metadata.additionalWelcomeMessage;
 				}
-				if (!additionalMessage && !this._lockedAgent) {
-					additionalMessage = this._getGenerateInstructionsMessage();
-				}
 				const welcomeContent = this.getWelcomeViewContent(additionalMessage);
 				if (!this.welcomePart.value || this.welcomePart.value.needsRerender(welcomeContent)) {
 					dom.clearNode(this.welcomeMessageContainer);
@@ -924,65 +918,6 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			this.updateChatViewVisibility();
 		} finally {
 			this._isRenderingWelcome = false;
-		}
-	}
-
-	private _getGenerateInstructionsMessage(): IMarkdownString {
-		// Start checking for instruction files immediately if not already done
-		if (!this._instructionFilesCheckPromise) {
-			this._instructionFilesCheckPromise = this._checkForAgentInstructionFiles();
-			// Use VS Code's idiomatic pattern for disposal-safe promise callbacks
-			this._register(thenIfNotDisposed(this._instructionFilesCheckPromise, hasFiles => {
-				this._instructionFilesExist = hasFiles;
-				// Only re-render if the current view still doesn't have items and we're showing the welcome message
-				const hasViewModelItems = this.viewModel?.getItems().length ?? 0;
-				if (hasViewModelItems === 0) {
-					this.renderWelcomeViewContentIfNeeded();
-				}
-			}));
-		}
-
-		// If we already know the result, use it
-		if (this._instructionFilesExist === true) {
-			// Don't show generate instructions message if files exist
-			return new MarkdownString('');
-		} else if (this._instructionFilesExist === false) {
-			// Show generate instructions message if no files exist
-			const generateInstructionsCommand = 'workbench.action.chat.generateInstructions';
-			return new MarkdownString(localize(
-				'chatWidget.instructions',
-				"[Generate Agent Instructions]({0}) to onboard AI onto your codebase.",
-				`command:${generateInstructionsCommand}`
-			), { isTrusted: { enabledCommands: [generateInstructionsCommand] } });
-		}
-
-		// While checking, don't show the generate instructions message
-		return new MarkdownString('');
-	}
-
-	/**
-	 * Checks if any agent instruction files (.github/copilot-instructions.md or AGENTS.md) exist in the workspace.
-	 * Used to determine whether to show the "Generate Agent Instructions" hint.
-	 *
-	 * @returns true if instruction files exist OR if instruction features are disabled (to hide the hint)
-	 */
-	private async _checkForAgentInstructionFiles(): Promise<boolean> {
-		try {
-			const useCopilotInstructionsFiles = this.configurationService.getValue(PromptsConfig.USE_COPILOT_INSTRUCTION_FILES);
-			const useAgentMd = this.configurationService.getValue(PromptsConfig.USE_AGENT_MD);
-			if (!useCopilotInstructionsFiles && !useAgentMd) {
-				// If both settings are disabled, return true to hide the hint (since the features aren't enabled)
-				return true;
-			}
-			return (
-				(await this.promptsService.listCopilotInstructionsMDs(CancellationToken.None)).length > 0 ||
-				// Note: only checking for AGENTS.md files at the root folder, not ones in subfolders.
-				(await this.promptsService.listAgentMDs(CancellationToken.None, false)).length > 0
-			);
-		} catch (error) {
-			// On error, assume no instruction files exist to be safe
-			this.logService.warn('[ChatWidget] Error checking for instruction files:', error);
-			return false;
 		}
 	}
 

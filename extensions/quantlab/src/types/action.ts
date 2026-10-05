@@ -106,7 +106,7 @@ export interface ActionResultsState {
 	runId: string;
 	action: string;
 	status: 'completed' | 'failed' | 'cancelled';
-	metrics?: Record<string, number>;
+	metrics?: Record<string, number | null>;
 	warnings?: string[];
 	error?: string;
 	artifactPath?: string;
