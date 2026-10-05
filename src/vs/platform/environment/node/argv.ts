@@ -47,6 +47,15 @@ export type OptionDescriptions<T> = {
 
 export const NATIVE_CLI_COMMANDS = ['tunnel', 'serve-web'] as const;
 
+/**
+ * Quantlab ships no binary for the native CLI subcommands (no tunnel, no web server). They still parse, so that
+ * `tunnel` is never taken for a path to open, carry no description, so that the help does not offer them, and are
+ * refused by name: this returns the one that was asked for.
+ */
+export function refusedNativeCliCommand(args: NativeParsedArgs): typeof NATIVE_CLI_COMMANDS[number] | undefined {
+	return NATIVE_CLI_COMMANDS.find(subcommand => !!args[subcommand]);
+}
+
 export const OPTIONS: OptionDescriptions<Required<NativeParsedArgs>> = {
 	'chat': {
 		type: 'subcommand',
@@ -64,7 +73,6 @@ export const OPTIONS: OptionDescriptions<Required<NativeParsedArgs>> = {
 	},
 	'serve-web': {
 		type: 'subcommand',
-		description: 'Run a server that displays the editor UI in browsers.',
 		options: {
 			'cli-data-dir': { type: 'string', args: 'dir', description: localize('cliDataDir', "Directory where CLI metadata should be stored.") },
 			'disable-telemetry': { type: 'boolean' },
@@ -73,7 +81,6 @@ export const OPTIONS: OptionDescriptions<Required<NativeParsedArgs>> = {
 	},
 	'tunnel': {
 		type: 'subcommand',
-		description: 'Make the current machine accessible from vscode.dev or other machines through a secure tunnel.',
 		options: {
 			'cli-data-dir': { type: 'string', args: 'dir', description: localize('cliDataDir', "Directory where CLI metadata should be stored.") },
 			'disable-telemetry': { type: 'boolean' },
