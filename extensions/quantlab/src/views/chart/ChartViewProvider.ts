@@ -23,6 +23,7 @@ import { ChartState } from '../../types/views';
 import { ChartStateStore } from './ChartStateStore';
 import { ChartWebview } from './ChartWebview';
 import { TradeOverlayManager } from './TradeOverlayManager';
+import { fireChartDrawn } from './chartDrawn';
 import { SessionManager } from '../../core/trading/SessionManager';
 import { ThemeProvider } from '../../ui/tokens/ThemeProvider';
 import { ReducedMotion } from '../../ui/accessibility/ReducedMotion';
@@ -394,6 +395,9 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			}
 			case 'dropRun':
 				this.executeWithErrorBoundary(() => this.loadRunArtifacts(session, payload.runId), 'loadRunArtifacts');
+				return;
+			case 'chartDrawn':
+				fireChartDrawn({ uri: session.document.uri.toString(), bars: payload.bars, width: payload.width, height: payload.height });
 				return;
 			default:
 				return;

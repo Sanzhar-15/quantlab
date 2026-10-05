@@ -24,6 +24,13 @@ export interface OhlcvBar {
 	v?: number;
 }
 
+/** The chart's first non-empty render: bar count and plot size in CSS pixels. */
+export interface ChartDrawn {
+	bars: number;
+	width: number;
+	height: number;
+}
+
 export interface EquityPoint {
 	t: number;
 	v: number;
@@ -156,6 +163,7 @@ export class ChartClient {
 	private strategyPaneVisible = true;
 	private ordinalMap: OrdinalTimeMap | null = null;
 	private hoverListener: ((barIndex: number | null) => void) | undefined;
+	private drawnListener: ((drawn: ChartDrawn) => void) | undefined;
 	private watermarkText: string | null = null;
 	private volumeAxisFormatted = false;
 
@@ -168,6 +176,14 @@ export class ChartClient {
 	 */
 	setHoverListener(listener: (barIndex: number | null) => void): void {
 		this.hoverListener = listener;
+	}
+
+	/**
+	 * One-shot "first non-empty render" subscription. Fired from the engine's overlay pass (which runs after
+	 * the series are painted) on the first frame that has bars and a non-empty plot, then cleared.
+	 */
+	setDrawnListener(listener: (drawn: ChartDrawn) => void): void {
+		this.drawnListener = listener;
 	}
 
 	/**
@@ -690,6 +706,11 @@ export class ChartClient {
 
 		this.chart.addPlugin<CanvasRenderingContext2D>({
 			onRenderOverlay: (ctx, state) => {
+				if (this.drawnListener && this.lastBars.length > 0 && state.plotRect.width > 0 && state.plotRect.height > 0) {
+					const listener = this.drawnListener;
+					this.drawnListener = undefined;
+					listener({ bars: this.lastBars.length, width: state.plotRect.width, height: state.plotRect.height });
+				}
 				const panes = state.layout.panes ?? [];
 				if (panes.length > 1) {
 					ctx.save();
