@@ -125,7 +125,8 @@ import { IWebContentExtractorService } from '../../platform/webContentExtractor/
 import { NativeWebContentExtractorService } from '../../platform/webContentExtractor/electron-main/webContentExtractorService.js';
 import ErrorTelemetry from '../../platform/telemetry/electron-main/errorTelemetry.js';
 // QuantLab host (U3): the terminal host (generated client, see ql-client/MANIFEST.json)
-import { bakedBuildValues, startTerminalHost, type Ports, type TerminalHost } from './ql-client/index.js';
+import { autoUpdater } from 'electron-updater';
+import { bakedBuildValues, createUpdater, startTerminalHost, type Ports, type TerminalHost } from './ql-client/index.js';
 
 /**
  * The main VS Code application. There will only ever be one instance,
@@ -1325,6 +1326,13 @@ export class CodeApplication extends Disposable {
 			return false;
 		}
 		this.qlTerminalHost = terminalHost;
+
+		// QuantLab updater (PACK, folds/HOST/PACK-UPDATER-HUNK.md): the ONE updater, electron-updater injected into the client
+		// module; install on Electron's quit only (autoInstallOnAppQuit), no quitAndInstall and no restart UI in v1
+		autoUpdater.autoDownload = true;
+		autoUpdater.autoInstallOnAppQuit = true;
+		const updater = createUpdater(terminalHost.host, { updater: autoUpdater });
+		updater.checkForUpdates().catch(err => this.logService.error('updater: check failed', err));
 
 		// Launch protocol urls and openables were opened by the first window; without a workbench they are not opened
 		const notOpened = (initialProtocolUrls?.openables.length ?? 0) + (initialProtocolUrls?.urls.length ?? 0);
