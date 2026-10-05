@@ -6,6 +6,7 @@
 import electron, { Display, Rectangle } from 'electron';
 import { Color } from '../../../base/common/color.js';
 import { Event } from '../../../base/common/event.js';
+import { IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
 import { join } from '../../../base/common/path.js';
 import { IProcessEnvironment, isLinux, isMacintosh, isWindows } from '../../../base/common/platform.js';
 import { URI } from '../../../base/common/uri.js';
@@ -125,6 +126,23 @@ export interface IDefaultBrowserWindowOptionsOverrides {
 	alwaysOnTop?: boolean;
 }
 
+// QuantLab host (U5): the host holds the workbench in a view of its own window, so the BrowserWindow a CodeWindow creates is only a
+// hidden shell. The host (electron-main/qlHost) sets this seam once, before any CodeWindow exists, to see the options of every
+// CodeWindow's BrowserWindow before it is created: it hides the shell and records the webPreferences the view is built from.
+export interface IQlHostWindowSeam {
+	onCodeWindowOptions(options: electron.BrowserWindowConstructorOptions, windowState: IWindowState): void;
+}
+
+let qlHostWindowSeam: IQlHostWindowSeam | undefined;
+
+export function setQlHostWindowSeam(seam: IQlHostWindowSeam): void {
+	if (qlHostWindowSeam) {
+		throw new Error('QuantLab host (U5): the window seam is already set');
+	}
+
+	qlHostWindowSeam = seam;
+}
+
 export function defaultBrowserWindowOptions(accessor: ServicesAccessor, windowState: IWindowState, overrides?: IDefaultBrowserWindowOptionsOverrides, webPreferences?: electron.WebPreferences): electron.BrowserWindowConstructorOptions & { experimentalDarkMode: boolean } {
 	const themeMainService = accessor.get(IThemeMainService);
 	const productService = accessor.get(IProductService);
@@ -229,6 +247,11 @@ export function defaultBrowserWindowOptions(accessor: ServicesAccessor, windowSt
 
 	if (overrides?.alwaysOnTop) {
 		options.alwaysOnTop = true;
+	}
+
+	// QuantLab host (U5): a CodeWindow's options (the ones that carry its window-config argument) are shown to the host
+	if (qlHostWindowSeam && webPreferences?.additionalArguments?.some(argument => argument.startsWith('--vscode-window-config='))) {
+		qlHostWindowSeam.onCodeWindowOptions(options, windowState);
 	}
 
 	return options;
@@ -421,5 +444,38 @@ export namespace WindowStateValidator {
  * @returns An array of all BrowserWindow instances that are not offscreen.
  */
 export function getAllWindowsExcludingOffscreen() {
-	return electron.BrowserWindow.getAllWindows().filter(win => !win.webContents.isOffscreen());
+	// QuantLab host (U5): an adopted workbench is listed by its stand-in, whose `webContents` is the host's view's
+	return electron.BrowserWindow.getAllWindows().map(win => qlAdoptedWindows.get(win) ?? win).filter(win => !win.webContents.isOffscreen());
+}
+
+// QuantLab host (U5): the workbench windows the host adopted (the hidden shell BrowserWindow -> its stand-in, see qlHost/adopt.ts)
+const qlAdoptedWindows = new Map<electron.BrowserWindow, electron.BrowserWindow>();
+
+export function registerQlAdoptedWindow(shell: electron.BrowserWindow, standIn: electron.BrowserWindow): IDisposable {
+	if (qlAdoptedWindows.has(shell)) {
+		throw new Error('QuantLab host (U5): this shell window is already adopted');
+	}
+
+	qlAdoptedWindows.set(shell, standIn);
+
+	return toDisposable(() => qlAdoptedWindows.delete(shell));
+}
+
+/**
+ * `BrowserWindow.getFocusedWindow()` that also finds an adopted workbench: its page has focus while its view is the shown
+ * one of the focused host window. Electron's own call returns `null` then, because the host window is a `BaseWindow`.
+ */
+export function getFocusedWindowIncludingAdopted(): electron.BrowserWindow | null {
+	const focused = electron.BrowserWindow.getFocusedWindow();
+	if (focused) {
+		return focused;
+	}
+
+	for (const standIn of qlAdoptedWindows.values()) {
+		if (standIn.webContents.isFocused()) {
+			return standIn;
+		}
+	}
+
+	return null;
 }

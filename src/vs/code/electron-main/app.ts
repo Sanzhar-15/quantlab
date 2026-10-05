@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { app, BaseWindow, ipcMain, protocol, safeStorage, session, Session, shell, systemPreferences, WebContents, WebContentsView, WebFrameMain } from 'electron';
+import { app, BaseWindow, dialog, ipcMain, protocol, safeStorage, session, Session, shell, systemPreferences, WebContents, WebContentsView, WebFrameMain } from 'electron';
 import { addUNCHostToAllowlist, disableUNCAccessRestrictions } from '../../base/node/unc.js';
 import { validatedIpcMain } from '../../base/parts/ipc/electron-main/ipcMain.js';
 import { hostname, release } from 'os';
@@ -32,7 +32,7 @@ import { IConfigurationService } from '../../platform/configuration/common/confi
 import { ElectronExtensionHostDebugBroadcastChannel } from '../../platform/debug/electron-main/extensionHostDebugIpc.js';
 import { IDiagnosticsService } from '../../platform/diagnostics/common/diagnostics.js';
 import { DiagnosticsMainService, IDiagnosticsMainService } from '../../platform/diagnostics/electron-main/diagnosticsMainService.js';
-import { DialogMainService, IDialogMainService } from '../../platform/dialogs/electron-main/dialogMainService.js';
+import { IDialogMainService } from '../../platform/dialogs/electron-main/dialogMainService.js';
 import { IEncryptionMainService } from '../../platform/encryption/common/encryptionService.js';
 import { EncryptionMainService } from '../../platform/encryption/electron-main/encryptionMainService.js';
 import { NativeBrowserElementsMainService, INativeBrowserElementsMainService } from '../../platform/browserElements/electron-main/nativeBrowserElementsMainService.js';
@@ -85,7 +85,6 @@ import { WebviewMainService } from '../../platform/webview/electron-main/webview
 import { isFolderToOpen, isWorkspaceToOpen, IWindowOpenable } from '../../platform/window/common/window.js';
 import { getAllWindowsExcludingOffscreen, IWindowsMainService, OpenContext } from '../../platform/windows/electron-main/windows.js';
 import { ICodeWindow } from '../../platform/window/electron-main/window.js';
-import { WindowsMainService } from '../../platform/windows/electron-main/windowsMainService.js';
 import { ActiveWindowManager } from '../../platform/windows/node/windowTracker.js';
 import { hasWorkspaceFileExtension } from '../../platform/workspace/common/workspace.js';
 import { IWorkspacesService } from '../../platform/workspaces/common/workspaces.js';
@@ -127,6 +126,10 @@ import ErrorTelemetry from '../../platform/telemetry/electron-main/errorTelemetr
 // QuantLab host (U3): the terminal host (generated client, see ql-client/MANIFEST.json)
 import { autoUpdater } from 'electron-updater';
 import { bakedBuildValues, createUpdater, startTerminalHost, type Ports, type TerminalHost } from './ql-client/index.js';
+// QuantLab host (U5): the lazy gate and the adopted workbench view (qlHost/)
+import { QlDialogMainService } from './qlHost/dialogs.js';
+import { QlWindowsGate, requireQlWindowsGate } from './qlHost/gate.js';
+import { QlWorkbenchHost } from './qlHost/workbenchHost.js';
 
 /**
  * The main VS Code application. There will only ever be one instance,
@@ -145,6 +148,9 @@ export class CodeApplication extends Disposable {
 
 	// QuantLab host (U3): the terminal host that replaces the first window (started in `startup`, used by U5/U6)
 	protected qlTerminalHost: TerminalHost | undefined; // `protected`: not read until U5/U6, `noUnusedLocals` flags a private one
+
+	// QuantLab host (U5): the host's side of the workbench view (the gate and the adoption are in qlHost/)
+	private qlWorkbenchHost: QlWorkbenchHost | undefined;
 
 	constructor(
 		private readonly mainProcessNodeIpcServer: NodeIPCServer,
@@ -176,7 +182,8 @@ export class CodeApplication extends Disposable {
 		const isUrlFromWindow = (requestingUrl?: string | undefined) => requestingUrl?.startsWith(`${Schemas.vscodeFileResource}://${VSCODE_AUTHORITY}`);
 		const isUrlFromWebview = (requestingUrl: string | undefined) => requestingUrl?.startsWith(`${Schemas.vscodeWebview}://`);
 
-		const alwaysAllowedPermissions = new Set(['pointerLock', 'notifications']);
+		// QuantLab host (U5): `notifications` is no longer allowed (the fork allowed it for core documents and webviews)
+		const alwaysAllowedPermissions = new Set(['pointerLock']);
 
 		const allowedPermissionsInWebview = new Set([
 			...alwaysAllowedPermissions,
@@ -189,7 +196,7 @@ export class CodeApplication extends Disposable {
 
 		const allowedPermissionsInCore = new Set([
 			...alwaysAllowedPermissions,
-			'media',
+			// QuantLab host (U5): `media` (camera, microphone) is no longer allowed for core documents
 			'local-fonts',
 			// TODO(deepak1556): Should be removed once migration is complete
 			// https://github.com/microsoft/vscode/issues/239228
@@ -401,8 +408,15 @@ export class CodeApplication extends Disposable {
 			this.logService.trace('app#activate');
 
 			// Mac only event: open new window when we get activated
+			// QuantLab host (U5): the host window is the app's window; the dock brings it back. Opening an empty workbench
+			// window here would be a first use nobody asked for (the workbench opens on the toggle key, openQuantlab, or a
+			// request through the gate).
 			if (!hasVisibleWindows) {
-				await this.windowsMainService?.openEmptyWindow({ context: OpenContext.DOCK });
+				if (this.qlWorkbenchHost) {
+					this.qlWorkbenchHost.restoreHostWindow();
+				} else {
+					this.logService.info('QuantLab host: app#activate before the host window exists; nothing to bring back');
+				}
 			}
 		});
 
@@ -910,8 +924,10 @@ export class CodeApplication extends Disposable {
 		}
 
 		// or if no window is open (macOS only)
-		else if (isMacintosh && windowsMainService.getWindowCount() === 0) {
-			this.logService.trace(`app#handleProtocolUrl() running on macOS with no window open, setting shouldOpenInNewWindow=true:`, uri.toString(true));
+		// QuantLab host (U5): on every platform: no workbench window is the normal state until the first use, and the URL
+		// then reaches the gate as a first-use event instead of being reported as not handled
+		else if (windowsMainService.getWindowCount() === 0) {
+			this.logService.trace(`app#handleProtocolUrl() with no window open, setting shouldOpenInNewWindow=true:`, uri.toString(true));
 
 			shouldOpenInNewWindow = true;
 		}
@@ -1022,11 +1038,13 @@ export class CodeApplication extends Disposable {
 		}
 
 		// Windows
-		services.set(IWindowsMainService, new SyncDescriptor(WindowsMainService, [machineId, sqmId, devDeviceId, this.userEnv], false));
+		// QuantLab host (U5): the lazy gate stands in for the windows service; the stock `WindowsMainService` is created inside it
+		services.set(IWindowsMainService, new SyncDescriptor(QlWindowsGate, [machineId, sqmId, devDeviceId, this.userEnv], false));
 		services.set(IAuxiliaryWindowsMainService, new SyncDescriptor(AuxiliaryWindowsMainService, undefined, false));
 
 		// Dialogs
-		const dialogMainService = new DialogMainService(this.logService, this.productService);
+		// QuantLab host (U5): the same service, but a dialog for the adopted workbench is parented to the host window
+		const dialogMainService = new QlDialogMainService(this.logService, this.productService);
 		services.set(IDialogMainService, dialogMainService);
 
 		// Launch
@@ -1298,8 +1316,33 @@ export class CodeApplication extends Disposable {
 		const { backendOrigin, version } = bakedBuildValues();
 		const { preloadPath, rendererDir } = this.qlTerminalPaths();
 
+		// QuantLab host (U5): the workbench is a lazy sibling view (qlHost/): the gate (it IS the windows service) opens and
+		// adopts it on first use. The launch's protocol urls and openables are handed to the first window that opens, once.
+		const instantiationService = accessor.get(IInstantiationService);
+		let launchProtocolUrls = initialProtocolUrls;
+		const qlWorkbenchHost = this.qlWorkbenchHost = new QlWorkbenchHost({
+			gate: requireQlWindowsGate(accessor.get(IWindowsMainService)),
+			dialogs: this.requireQlDialogMainService(accessor.get(IDialogMainService)),
+			lifecycleMainService: this.lifecycleMainService,
+			logService: this.logService,
+			openWorkbench: () => {
+				const protocolUrls = launchProtocolUrls;
+				launchProtocolUrls = undefined;
+
+				return instantiationService.invokeFunction(windowsAccessor => this.openFirstWindow(windowsAccessor, protocolUrls));
+			},
+			openExternal: url => {
+				const nativeHostMainService = this.nativeHostMainService;
+				if (!nativeHostMainService) {
+					throw new Error('QuantLab host (U5): openExternal before the native host service exists');
+				}
+
+				nativeHostMainService.openExternal(undefined, url).catch(error => this.logService.error(`QuantLab host: opening ${url} in the system browser failed`, error));
+			}
+		});
+
 		const ports: Ports = {
-			electron: { app, BaseWindow, WebContentsView, session, protocol, ipcMain, shell, safeStorage },
+			electron: { app, BaseWindow, WebContentsView, session, protocol, ipcMain, shell, safeStorage, dialog },
 			validatedIpcMain,
 			platform: process.platform,
 			backendOrigin,
@@ -1307,13 +1350,7 @@ export class CodeApplication extends Disposable {
 			devTools: !this.environmentMainService.isBuilt,
 			preloadPath,
 			rendererDir,
-			openQuantlab: () => {
-				// There is no workbench view until U5 adopts the workbench; no window is opened as a substitute
-				const error = new Error('openQuantlab: the workbench view does not exist in this build (HOST U5)');
-				this.logService.error(error);
-
-				return Promise.reject(error);
-			}
+			openQuantlab: intent => qlWorkbenchHost.openQuantlab(intent)
 		};
 
 		let terminalHost: TerminalHost;
@@ -1334,10 +1371,14 @@ export class CodeApplication extends Disposable {
 		const updater = createUpdater(terminalHost.host, { updater: autoUpdater });
 		updater.checkForUpdates().catch(err => this.logService.error('updater: check failed', err));
 
-		// Launch protocol urls and openables were opened by the first window; without a workbench they are not opened
-		const notOpened = (initialProtocolUrls?.openables.length ?? 0) + (initialProtocolUrls?.urls.length ?? 0);
-		if (notOpened > 0) {
-			this.logService.warn(`QuantLab host: ${notOpened} protocol url(s) and openable(s) received at launch were not opened because the workbench is not started`);
+		// QuantLab host (U5): the workbench host takes over the window's close (the quit handshake runs through the lifecycle
+		// before the window goes), the toggle key, and the gate's requests
+		qlWorkbenchHost.attach(terminalHost);
+
+		// What the launch itself asked to open (files, folders, a protocol link) is a first use now, never dropped
+		const launchRequestCause = this.qlLaunchRequestCause(initialProtocolUrls);
+		if (launchRequestCause) {
+			qlWorkbenchHost.requestWorkbench(launchRequestCause);
 		}
 
 		// Quit policy: the terminal window is the only window and is not a CodeWindow, so the lifecycle
@@ -1345,13 +1386,42 @@ export class CodeApplication extends Disposable {
 		// these) quits on macOS only when a quit was already requested. The host's policy is the light host's:
 		// closing the window quits, on every platform. `app.quit()` leads to `before-quit` and `will-quit`,
 		// where the lifecycle service fires its shutdown events (see `LifecycleMainService#registerListeners`).
+		// QuantLab host (U5): once a workbench CodeWindow exists this stays right, because the host window is held open
+		// (`QlWorkbenchHost#onHostWindowClose`) until the workbench's unload handshake is over and its window has closed, so
+		// `window-all-closed` can only fire after the workbench is gone.
 		app.on('window-all-closed', () => terminalHost.windowAllClosed());
 		app.on('quit', (_event, exitCode) => terminalHost.noteQuit(exitCode));
 
 		return true;
 	}
 
-	// QuantLab host (U3): not called until U5's lazy gate; `protected` so `noUnusedLocals` does not flag it meanwhile
+	// QuantLab host (U5): what the launch itself asked to open: files or folders on the command line, a macOS open-file
+	// received before start, or a protocol link. It is a first use at launch (the workbench opens for it).
+	private qlLaunchRequestCause(initialProtocolUrls: IInitialProtocolUrls | undefined): string | undefined {
+		const args = this.environmentMainService.args;
+		const macOpenFiles: string[] = (global as { macOpenFiles?: string[] }).macOpenFiles ?? [];
+		if (args._.length > 0 || !!args['folder-uri'] || !!args['file-uri'] || macOpenFiles.length > 0) {
+			return 'launch arguments';
+		}
+
+		if ((initialProtocolUrls?.openables.length ?? 0) + (initialProtocolUrls?.urls.length ?? 0) > 0) {
+			return 'launch protocol url';
+		}
+
+		return undefined;
+	}
+
+	// QuantLab host (U5): `initServices` registered a `QlDialogMainService`; the host needs it as itself
+	private requireQlDialogMainService(service: IDialogMainService): QlDialogMainService {
+		if (!(service instanceof QlDialogMainService)) {
+			throw new Error('QuantLab host (U5): IDialogMainService is not the QlDialogMainService (initServices)');
+		}
+
+		return service;
+	}
+
+	// QuantLab host (U3/U5): the stock first-window flow; the host runs it through the gate on the first use of the workbench
+	// (`QlWorkbenchHost.openWorkbench`, in `startQlTerminalHost`). `protected`: only called from a closure there.
 	protected async openFirstWindow(accessor: ServicesAccessor, initialProtocolUrls: IInitialProtocolUrls | undefined): Promise<ICodeWindow[]> {
 		const windowsMainService = this.windowsMainService = accessor.get(IWindowsMainService);
 		this.auxiliaryWindowsMainService = accessor.get(IAuxiliaryWindowsMainService);
