@@ -16,7 +16,7 @@ import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { connect, waitForEndpoint } from './cdp.mjs';
 import * as net from 'node:net';
-import { assemble, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, PACK_OWNERS, packMembers, PINNED_IDS, processesInside, readForkSha, readPins, requestUrls, sha256File, treeDigest } from './lib.mjs';
+import { assemble, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, PACK_OWNERS, packMembers, PINNED_IDS, processesInside, readForkSha, readPins, requestUrls, sha256File, treeDigest } from './lib.mjs';
 import { backtestForm, importModal, readToasts, waitForWorkbench } from './window.mjs';
 
 const { serve } = createRequire(import.meta.url)('./cues.cjs');
@@ -317,11 +317,13 @@ try {
 		checks['pinned-dependency-removed'] = control.launchError
 			? { status: 'FAIL', detail: control.launchError }
 			: judgePinnedDependency(main.pins, control.pins, REMOVED_IN_CONTROL);
+		// 3. The packaged app's files: no Quantbook MCP server ships.
+		checks['quantbook-mcp-absent'] = judgeQuantbookMcpAbsent(paths.extensions);
 	} else {
 		out.preconditions.push(await networkOn());
 	}
 
-	// 3. The extension-pack row, with the network as declared: the plain first start, then its control.
+	// 4. The extension-pack row, with the network as declared: the plain first start, then its control.
 	const members = packMembers(paths.extensions);
 	const hosts = galleryHosts(product);
 	out.inputs.packMembers = members;

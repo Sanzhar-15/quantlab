@@ -20,7 +20,6 @@ import { registerDiagnosticsView } from './quantbook/shell/registerDiagnosticsVi
 import { registerFunctionCatalogView } from './quantbook/shell/registerFunctionCatalogView';
 import { registerLocalFirstStatus } from './quantbook/shell/registerLocalFirstStatus';
 import { SqlQueryViewProvider } from './quantbook/shell/SqlQueryViewProvider';
-import { registerQuantbookMcpServer } from './quantbook/mcp/mcpServer';
 import type { SessionInstance } from './quantbook/types';
 import { registerGlobalStateCommands } from './commands/globalStateCommands';
 import { registerHistoryCommands } from './commands/historyCommands';
@@ -434,7 +433,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 }
 
 // The ONE place Quantbook runtime entry points are registered (commands, the reactive kernel, the
-// `.qnb` serializer and controller, the MCP server, the Activity Bar views, diagnostics, the status
+// `.qnb` serializer and controller, the Activity Bar views, diagnostics, the status
 // item). Called only when readQuantbookAuthorisation() says so; a new Quantbook registration goes here.
 function registerQuantbookRuntime(context: vscode.ExtensionContext, isTrustReady: () => boolean): void {
 	// Wave H2 (R10 part 2/2, 2026-06-19): the `.qbook` custom editor -- double-clicking a
@@ -457,12 +456,6 @@ function registerQuantbookRuntime(context: vscode.ExtensionContext, isTrustReady
 	// FE-1.5 W-N (N-1): the NotebookController that runs `.qnb` Python cells against the focused grid's
 	// reactive kernel (bind-on-first-execute, serialized, lifetime-safe). Built after the manager exists.
 	registerReactiveNotebookController(context, builtKernelManager);
-
-	// FE-BEYOND B1 (W3): the read-only Quantbook MCP server. Runs IN this host so its tools read the
-	// SAME live per-panel Session the grid renders (the shared-state requirement). Registered AFTER the
-	// reactive notebook controller (W3 anchor; W4/FE-5 uses the later panel-providers anchor) so the two
-	// parallel windows never edit overlapping lines here.
-	registerQuantbookMcpServer(context, builtKernelManager);
 
 	// FE-5 (W4 product shell): the Quantbook Activity Bar surface (Live-Python sidebar + the
 	// `quantbook.hasOpenGrid` context key gating the quantbook views). Registered AFTER the panel

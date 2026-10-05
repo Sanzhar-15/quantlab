@@ -544,27 +544,6 @@
         "enablement": "config.quantlab.quantbook.enabled"
       },
       {
-        "_comment": "FE-BEYOND B1 (W3): start the Quantbook MCP server (read + write tools).",
-        "command": "quantlab.quantbookStartMcpServer",
-        "title": "%command.quantbookStartMcpServer.title%",
-        "category": "%command.category%",
-        "enablement": "config.quantlab.quantbook.enabled"
-      },
-      {
-        "_comment": "W3 (MCP writes): grant workspace trust required for MCP write tools.",
-        "command": "quantlab.quantbookTrustWorkspaceForMcpWrites",
-        "title": "%command.quantbookTrustWorkspaceForMcpWrites.title%",
-        "category": "%command.category%",
-        "enablement": "config.quantlab.quantbook.enabled"
-      },
-      {
-        "_comment": "W3 (MCP writes): revoke the workspace trust grant used by MCP write tools.",
-        "command": "quantlab.quantbookRevokeMcpWriteTrust",
-        "title": "%command.quantbookRevokeMcpWriteTrust.title%",
-        "category": "%command.category%",
-        "enablement": "config.quantlab.quantbook.enabled"
-      },
-      {
         "command": "quantlab.selectDataSource",
         "title": "%command.selectDataSource.title%",
         "category": "%command.category%"
@@ -1296,18 +1275,6 @@
         {
           "command": "quantlab.quantbookToggleAutoFilter",
           "when": "config.quantlab.quantbook.enabled"
-        },
-        {
-          "command": "quantlab.quantbookStartMcpServer",
-          "when": "config.quantlab.quantbook.enabled"
-        },
-        {
-          "command": "quantlab.quantbookTrustWorkspaceForMcpWrites",
-          "when": "config.quantlab.quantbook.enabled"
-        },
-        {
-          "command": "quantlab.quantbookRevokeMcpWriteTrust",
-          "when": "config.quantlab.quantbook.enabled"
         }
       ],
       "accountsMenu": [
@@ -1685,14 +1652,6 @@
           "default": "",
           "description": "Path to the Python interpreter for the qviz daemon (visualisation). When empty, Quantlab falls through to python.defaultInterpreterPath, then to ~/.deltaplus/venv/bin/python. Setting an explicit path that does not resolve to an executable file fails loudly (does not silently fall through)."
         },
-        "quantlab.quantbookMcpPort": {
-          "type": "number",
-          "scope": "machine-overridable",
-          "default": 0,
-          "minimum": 0,
-          "maximum": 65535,
-          "description": "FE-BEYOND B1: TCP port for the read-only Quantbook MCP server (bound to 127.0.0.1 only). 0 (the default) lets the OS pick a free port; the resolved URL is printed to the Quantbook MCP Server output channel on start."
-        },
         "quantlab.accessibility.reducedMotion": {
           "type": "string",
           "enum": [
@@ -1735,7 +1694,6 @@
     "source-map-support": "^0.5.21"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
     "@vscode/codicons": "^0.0.36",
     "apache-arrow": "^21.1.0",
     "typed-emitter": "^2.1.0",
