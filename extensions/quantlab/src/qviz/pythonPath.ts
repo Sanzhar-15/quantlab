@@ -20,8 +20,8 @@
  *   2. `quantlab.pythonPath` setting (Quantlab-specific override).
  *   3. `python.defaultInterpreterPath` setting (VS Code Python extension).
  *   4. Managed venv:
- *        - POSIX: `~/.quantlab/venv/bin/python`
- *        - Windows: `~/.quantlab/venv/Scripts/python.exe`
+ *        - POSIX: `~/.deltaplus/venv/bin/python`
+ *        - Windows: `~/.deltaplus/venv/Scripts/python.exe`
  *
  * Returns `null` when no Python is available -- callers MUST handle
  * the null case explicitly (CLAUDE.md "no fallbacks": don't substitute
@@ -113,9 +113,9 @@ export function resolveQuantlabPython(
 
 function managedVenvPath(home: string, platform: NodeJS.Platform): string {
 	if (platform === 'win32') {
-		return path.join(home, '.quantlab', 'venv', 'Scripts', 'python.exe');
+		return path.join(home, '.deltaplus', 'venv', 'Scripts', 'python.exe');
 	}
-	return path.join(home, '.quantlab', 'venv', 'bin', 'python');
+	return path.join(home, '.deltaplus', 'venv', 'bin', 'python');
 }
 
 function existsAndExecutableFile(p: string): boolean {

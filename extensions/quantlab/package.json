@@ -1684,7 +1684,7 @@
           "type": "string",
           "scope": "machine-overridable",
           "default": "",
-          "description": "Path to the Python interpreter for the qviz daemon (visualisation). When empty, Quantlab falls through to python.defaultInterpreterPath, then to ~/.quantlab/venv/bin/python. Setting an explicit path that does not resolve to an executable file fails loudly (does not silently fall through)."
+          "description": "Path to the Python interpreter for the qviz daemon (visualisation). When empty, Quantlab falls through to python.defaultInterpreterPath, then to ~/.deltaplus/venv/bin/python. Setting an explicit path that does not resolve to an executable file fails loudly (does not silently fall through)."
         },
         "quantlab.quantbookMcpPort": {
           "type": "number",
