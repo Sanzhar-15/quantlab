@@ -36,36 +36,6 @@ export interface SignalPoint {
 	price?: number;
 }
 
-export interface TradeOrderPoint {
-	id: string;
-	symbol: string;
-	side: 'buy' | 'sell';
-	type: string;
-	quantity: number;
-	price?: number;
-	status: string;
-	createdAt: number;
-}
-
-export interface TradePositionPoint {
-	symbol: string;
-	quantity: number;
-	avgPrice: number;
-	currentPrice: number;
-	unrealizedPnL: number;
-	updatedAt?: number;
-}
-
-export interface TradeFillPoint {
-	id: string;
-	orderId: string;
-	symbol: string;
-	side: 'buy' | 'sell';
-	quantity: number;
-	price: number;
-	timestamp: number;
-}
-
 export type VisualizationCommand =
 	| { type: 'addPane'; id: string; height?: number }
 	| { type: 'addIndicator'; indicator: string; params: Record<string, unknown> }
@@ -171,13 +141,7 @@ export class ChartClient {
 	private static readonly MAX_VIZ_SERIES = 64;
 	private visualizationSeries: VisualizationSeriesHandle[] = [];
 	private signalMarkers: SeriesMarker[] = [];
-	private tradeOrderMarkers: SeriesMarker[] = [];
-	private tradePositionMarkers: SeriesMarker[] = [];
-	private tradeFillMarkers: SeriesMarker[] = [];
 	private lastSignals: SignalPoint[] = [];
-	private lastTradeOrders: TradeOrderPoint[] = [];
-	private lastTradePositions: TradePositionPoint[] = [];
-	private lastTradeFills: TradeFillPoint[] = [];
 	private initPromise: Promise<void> | undefined;
 	private theme: 'light' | 'dark' = 'dark';
 	private timeframe = '1D';
@@ -448,59 +412,6 @@ export class ChartClient {
 		this.syncStrategyPaneVisibility();
 	}
 
-	async setTradeOrders(orders: TradeOrderPoint[]): Promise<void> {
-		await this.ensureChart();
-		this.lastTradeOrders = orders;
-		this.tradeOrderMarkers = orders
-			.filter(order => typeof order.price === 'number')
-			.map(order => ({
-				time: this.snapTime(order.createdAt),
-				text: order.side === 'buy' ? 'Buy' : 'Sell',
-				color: order.side === 'buy' ? this.colors.positive : this.colors.negative,
-				shape: 'square',
-				position: order.side === 'buy' ? 'below' : 'above'
-			}));
-		this.updateMarkers();
-	}
-
-	async setTradePositions(positions: TradePositionPoint[]): Promise<void> {
-		await this.ensureChart();
-		this.lastTradePositions = positions;
-		this.tradePositionMarkers = positions
-			.filter(position => Number.isFinite(position.avgPrice) || Number.isFinite(position.currentPrice))
-			.map(position => ({
-				time: this.snapTime(position.updatedAt ?? Date.now()),
-				text: 'Pos',
-				color: this.colors.info,
-				shape: 'circle',
-				position: 'on'
-			}));
-		this.updateMarkers();
-	}
-
-	async setTradeFills(fills: TradeFillPoint[]): Promise<void> {
-		await this.ensureChart();
-		this.lastTradeFills = fills;
-		this.tradeFillMarkers = fills.map(fill => ({
-			time: this.snapTime(fill.timestamp),
-			text: fill.side === 'buy' ? 'Fill' : 'Exit',
-			color: fill.side === 'buy' ? this.colors.positive : this.colors.negative,
-			shape: fill.side === 'buy' ? 'arrowUp' : 'arrowDown',
-			position: fill.side === 'buy' ? 'below' : 'above'
-		}));
-		this.updateMarkers();
-	}
-
-	clearTradeOverlays(): void {
-		this.tradeOrderMarkers = [];
-		this.tradePositionMarkers = [];
-		this.tradeFillMarkers = [];
-		this.lastTradeOrders = [];
-		this.lastTradePositions = [];
-		this.lastTradeFills = [];
-		this.updateMarkers();
-	}
-
 	clearSignals(): void {
 		this.signalMarkers = [];
 		this.lastSignals = [];
@@ -741,42 +652,12 @@ export class ChartClient {
 		if (!this.candleSeries) {
 			return;
 		}
-		const markers = [
-			...this.signalMarkers,
-			...this.tradeOrderMarkers,
-			...this.tradePositionMarkers,
-			...this.tradeFillMarkers
-		].sort((a, b) => a.time - b.time);
+		const markers = [...this.signalMarkers].sort((a, b) => a.time - b.time);
 		this.candleSeries.setMarkers(markers);
 	}
 
 	private rebuildMarkers(): void {
 		this.signalMarkers = this.buildSignalMarkers(this.lastSignals);
-		this.tradeOrderMarkers = this.lastTradeOrders
-			.filter(order => typeof order.price === 'number')
-			.map(order => ({
-				time: this.snapTime(order.createdAt),
-				text: order.side === 'buy' ? 'Buy' : 'Sell',
-				color: order.side === 'buy' ? this.colors.positive : this.colors.negative,
-				shape: 'square',
-				position: order.side === 'buy' ? 'below' : 'above'
-			}));
-		this.tradePositionMarkers = this.lastTradePositions
-			.filter(position => Number.isFinite(position.avgPrice) || Number.isFinite(position.currentPrice))
-			.map(position => ({
-				time: this.snapTime(position.updatedAt ?? Date.now()),
-				text: 'Pos',
-				color: this.colors.info,
-				shape: 'circle',
-				position: 'on'
-			}));
-		this.tradeFillMarkers = this.lastTradeFills.map(fill => ({
-			time: this.snapTime(fill.timestamp),
-			text: fill.side === 'buy' ? 'Fill' : 'Exit',
-			color: fill.side === 'buy' ? this.colors.positive : this.colors.negative,
-			shape: fill.side === 'buy' ? 'arrowUp' : 'arrowDown',
-			position: fill.side === 'buy' ? 'below' : 'above'
-		}));
 		this.updateMarkers();
 	}
 

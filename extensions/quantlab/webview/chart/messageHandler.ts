@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { ChartClient, EquityPoint, OhlcvBar, SignalPoint, TradeFillPoint, TradeOrderPoint, TradePositionPoint, VisualizationCommand } from './chartApi';
+import type { ChartClient, EquityPoint, OhlcvBar, SignalPoint, VisualizationCommand } from './chartApi';
 import type { ParameterPanel, ParameterDefinition } from './parameterPanel';
 
 interface ComplexityInfo {
@@ -62,10 +62,6 @@ type ChartMessage =
 	| { type: 'showEmptyState' }
 	| { type: 'setEquityCurve'; requestId: number; equity: EquityPoint[] }
 	| { type: 'setVisualization'; requestId: number; commands: VisualizationCommand[] }
-	| { type: 'setTradeOrders'; sessionId: string; orders: TradeOrderPoint[] }
-	| { type: 'setTradePositions'; sessionId: string; positions: TradePositionPoint[] }
-	| { type: 'setTradeFills'; sessionId: string; fills: TradeFillPoint[] }
-	| { type: 'clearTradeOverlays'; sessionId: string }
 	| { type: 'setParameters'; parameters: ParameterDefinition[] }
 	| { type: 'setOverrides'; overrides: Record<string, unknown> }
 	| { type: 'setComplexity'; complexity: ComplexityInfo }
@@ -414,18 +410,6 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 				}
 				lastVizRequestId = data.requestId;
 				await context.chart.applyVisualization(data.commands);
-				return;
-			case 'setTradeOrders':
-				await context.chart.setTradeOrders(data.orders);
-				return;
-			case 'setTradePositions':
-				await context.chart.setTradePositions(data.positions);
-				return;
-			case 'setTradeFills':
-				await context.chart.setTradeFills(data.fills);
-				return;
-			case 'clearTradeOverlays':
-				context.chart.clearTradeOverlays();
 				return;
 			case 'setParameters':
 				parameters = data.parameters;
