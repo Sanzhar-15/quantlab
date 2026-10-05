@@ -1457,6 +1457,7 @@ export default tseslint.config(
 						'cookie',
 						'crypto',
 						'dns',
+						'electron-updater',
 						'events',
 						'fs',
 						'fs/promises',
