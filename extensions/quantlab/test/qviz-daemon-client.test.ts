@@ -72,8 +72,9 @@ function makeWorkspace(): string {
 	return root;
 }
 
+// A failed cleanup throws and fails the test: nothing here is swallowed.
 function rmrfSync(p: string): void {
-	try { fs.rmSync(p, { recursive: true, force: true }); } catch { /* ignore */ }
+	fs.rmSync(p, { recursive: true, force: true });
 }
 
 suite('QvizDaemonClient -- end-to-end', () => {
@@ -92,8 +93,8 @@ suite('QvizDaemonClient -- end-to-end', () => {
 	});
 
 	suiteTeardown(async function () {
-		try { await client.dispose(); } catch { /* ignore */ }
-		if (workspace) { rmrfSync(workspace); }
+		await client.dispose();
+		rmrfSync(workspace);
 	});
 
 	test('banner identifies the daemon and lists ops', async () => {
