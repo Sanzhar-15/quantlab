@@ -86,7 +86,12 @@ export function coerceDate(value?: string | number | Date): Date | undefined {
 	return Number.isNaN(date.getTime()) ? undefined : date;
 }
 
-export function pickMetric(metrics?: Record<string, number>): { label: string; value: number } | undefined {
+/** A metric for display: null is the engine's value for inf / NaN (run_backtest.py _sanitize_for_json). */
+export function formatMetricValue(value: number | null): string {
+	return value === null ? 'not finite' : value.toFixed(2);
+}
+
+export function pickMetric(metrics?: Record<string, number | null>): { label: string; value: number | null } | undefined {
 	if (!metrics) {
 		return undefined;
 	}

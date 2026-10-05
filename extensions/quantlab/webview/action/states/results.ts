@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type { ActionResultsState, StatsResult } from '../../../src/types/action';
-import { escapeHtml, formatActionLabel, formatDuration, formatRunType } from '../utils';
+import { escapeHtml, formatActionLabel, formatDuration, formatMetricValue, formatRunType } from '../utils';
 
 interface ResultsContext {
 	postMessage: (message: unknown) => void;
@@ -306,8 +306,8 @@ function renderStatsResults(container: HTMLElement, state: ActionResultsState, r
 	}
 }
 
-function renderMetric(label: string, value: number): string {
-	const formatted = Number.isFinite(value) ? value.toFixed(2) : String(value);
+function renderMetric(label: string, value: number | null): string {
+	const formatted = formatMetricValue(value);
 	return `
 		<div class="metric-card">
 			<div class="metric-label">${escapeHtml(label)}</div>
