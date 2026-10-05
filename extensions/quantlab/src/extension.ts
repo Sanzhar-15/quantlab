@@ -120,25 +120,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	);
 
 	// Sign-in / sign-out commands.
-	// quantlab.signIn bypasses vscode.authentication.getSession() and opens the login
-	// panel directly -- no intermediate quick-pick step for the user.
-	// If the welcome panel is already open it just reveals it rather than opening a second modal.
+	// The extension has no sign-in of its own: the host identity is the only source and sign-in /
+	// sign-out happen in the Quantlab terminal view, so both commands say where to go.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.signIn', async () => {
-			try {
-				await authProvider.createSession(['read']);
-			} catch (err) {
-				// ERR_CANCELLED = user closed the panel -- no notification needed.
-				if (err instanceof Error && (err as NodeJS.ErrnoException).code !== 'ERR_CANCELLED') {
-					void vscode.window.showErrorMessage(`Sign-in failed: ${err.message}`);
-				}
-			}
+			void vscode.window.showInformationMessage('Sign in happens in the Quantlab terminal view.');
 		}),
 		vscode.commands.registerCommand('quantlab.signOut', async () => {
-			const sessions = await authProvider.getSessions(['read']);
-			if (sessions.length > 0) {
-				await authProvider.removeSession(sessions[0].id);
-			}
+			void vscode.window.showInformationMessage('Sign out happens in the Quantlab terminal view.');
 		})
 	);
 

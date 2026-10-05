@@ -1,5 +1,5 @@
 /*---------------------------------------------------------------------------------------------
- *  Copyright (c) Quantlab. All rights reserved.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
@@ -24,6 +24,8 @@ import {
 	type QuantlabIdentity,
 	parseIdentity,
 } from '../common/quantlabHostIdentity.js';
+// SYNC-1: registers the retired qic.demo.* tombstones (side-effect import; this file is loaded by workbench.desktop.main.ts)
+import '../common/quantlabRetiredSettings.js';
 
 const LOG_PREFIX = '[quantlab-host-identity]';
 

@@ -78,8 +78,9 @@ export class SettingsTreeProvider implements vscode.TreeDataProvider<SettingsNod
 				{
 					id: 'quantlab.account.info',
 					label: user.name || user.email,
-					description: user.email !== user.name ? `${user.email} · ${user.tier}` : user.tier,
-					tooltip: `Signed in as ${user.email}\nTier: ${user.tier}`,
+					// awaiting AUTH-TIER: the host identity carries no tier yet
+					description: user.email !== user.name ? `${user.email}${user.tier ? ` · ${user.tier}` : ''}` : user.tier,
+					tooltip: `Signed in as ${user.email}${user.tier ? `\nTier: ${user.tier}` : ''}`,
 					iconId: 'account'
 				},
 				{

@@ -87,6 +87,7 @@ import { ArgumentAnalyzer } from '../common/security/argumentAnalyzer.js';
 import { TerminalSecurityGuard } from '../common/security/terminalGuard.js';
 import { HashChainedAuditLogger } from '../common/security/auditLogger.js';
 import { FirstRunManager } from '../common/security/firstRunManager.js';
+import { describeSecretPresence } from '../common/security/secretPresence.js';
 
 // QIC component imports -- gateway & providers
 import { Gateway } from '../common/gateway/gateway.js';
@@ -1396,7 +1397,7 @@ class QicActivation extends Disposable {
 					try {
 						anthropicKey = await this.secretStorageService.get(QIC_SECRET_KEYS.ANTHROPIC_API_KEY);
 						openaiKey = await this.secretStorageService.get(QIC_SECRET_KEYS.OPENAI_API_KEY);
-						this.logService.info(`[QIC] Secret storage lookup: anthropic=${anthropicKey ? 'found (' + anthropicKey.substring(0, 10) + '...)' : 'not found'}, openai=${openaiKey ? 'found' : 'not found'}`);
+						this.logService.info(`[QIC] ${describeSecretPresence(anthropicKey, openaiKey)}`);
 					} catch (storageErr) {
 						this.logService.error('[QIC] Failed to retrieve API keys from secret storage:', storageErr);
 						this.notificationService.warn(
