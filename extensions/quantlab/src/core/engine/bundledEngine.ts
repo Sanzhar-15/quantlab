@@ -62,3 +62,51 @@ export function resolveBundledEngine(extensionPath: string, platform: NodeJS.Pla
 	}
 	return null;
 }
+
+/** What decides which engine a backtest runs on. */
+export interface EngineSelection {
+	/** The quantlab extension's directory. */
+	readonly extensionPath: string;
+	/** The application root (`vscode.env.appRoot`): an extension inside it is the packaged app's built-in one. */
+	readonly appRoot: string;
+	readonly platform: NodeJS.Platform;
+	/** `quantlab.pythonPath` as the user set it; empty when unset. */
+	readonly explicitPython: string;
+}
+
+function isInside(child: string, parent: string): boolean {
+	const relative = path.relative(parent, child);
+	return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+/**
+ * The engine a backtest runs on. There is no implicit interpreter: no managed venv, no PATH probe.
+ * - In the packaged app, only its bundled engine (`<extension>/engine/quantlab-engine/<exe>`); absent, a named error.
+ * - In development, `quantlab.pythonPath` when the user set it (it must exist, and the engine source tree
+ *   beside the extension must exist), else a bundled engine at a development location, else a named error.
+ */
+export function selectEngine(selection: EngineSelection): EngineLaunch {
+	const { extensionPath, appRoot, platform, explicitPython } = selection;
+	if (isInside(extensionPath, appRoot)) {
+		const packaged = bundledEngineCandidates(extensionPath, platform)[1];
+		if (!fs.statSync(packaged, { throwIfNoEntry: false })?.isFile()) {
+			throw new Error(`[engine_missing] Quantlab: this app's bundled backtest engine is missing (${packaged}); reinstall the app.`);
+		}
+		return bundledEngineLaunch(packaged);
+	}
+	if (explicitPython !== '') {
+		if (!fs.statSync(explicitPython, { throwIfNoEntry: false })?.isFile()) {
+			throw new Error(`[engine_python_missing] Quantlab: quantlab.pythonPath is set to ${explicitPython}, which is not a file.`);
+		}
+		const engineRoot = path.resolve(extensionPath, '..', '..', 'engine');
+		if (!fs.statSync(engineRoot, { throwIfNoEntry: false })?.isDirectory()) {
+			throw new Error(`[engine_source_missing] Quantlab: quantlab.pythonPath is set, but the engine source tree ${engineRoot} does not exist.`);
+		}
+		return { executable: explicitPython, source: 'setting quantlab.pythonPath', cwd: engineRoot, engineRoot };
+	}
+	const bundled = resolveBundledEngine(extensionPath, platform);
+	if (bundled === null) {
+		throw new Error(`[engine_missing] Quantlab: no bundled backtest engine at ${bundledEngineCandidates(extensionPath, platform).join(', ')}, and quantlab.pythonPath is not set.`);
+	}
+	return bundledEngineLaunch(bundled);
+}

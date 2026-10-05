@@ -3,14 +3,11 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as fs from 'fs';
-import * as path from 'path';
 import * as vscode from 'vscode';
 import { EngineEvent, JobRequest } from '../../types/engine';
-import { bundledEngineLaunch, EngineLaunch, resolveBundledEngine } from './bundledEngine';
+import { EngineLaunch, selectEngine } from './bundledEngine';
 import { JobQueue } from './JobQueue';
 import { JobRunner } from './JobRunner';
-import { PythonBootstrap } from './PythonBootstrap';
 
 export class EngineHost {
 	private static instance: EngineHost | undefined;
@@ -78,50 +75,14 @@ export class EngineHost {
 		}
 	}
 
-	/**
-	 * CODEX-013: the bundled (PyInstaller) engine first; without one, a Python interpreter
-	 * running the engine source tree.
-	 */
+	/** The engine of {@link selectEngine}; `quantlab.pythonPath` counts only when the user set it. */
 	private resolveLaunch(): EngineLaunch {
-		const extensionPath = this.extensionPath();
-		const bundled = resolveBundledEngine(extensionPath, process.platform);
-		if (bundled) {
-			return bundledEngineLaunch(bundled);
+		// The contributed default is '': a non-empty value is one the user set.
+		const explicitPython = vscode.workspace.getConfiguration('quantlab').get<string>('pythonPath');
+		if (explicitPython === undefined) {
+			throw new Error('Quantlab: the setting quantlab.pythonPath is not contributed by this extension.');
 		}
-
-		const { executable, source } = this.resolveInterpreter();
-		const engineRoot = path.resolve(extensionPath, '..', '..', 'engine');
-		if (!fs.statSync(engineRoot, { throwIfNoEntry: false })?.isDirectory()) {
-			throw new Error(`Quantlab: no bundled engine was found and the engine source tree ${engineRoot} does not exist, so ${executable} (${source}) cannot run the engine.`);
-		}
-		return { executable, source, cwd: engineRoot, engineRoot };
-	}
-
-	// FLAGGED (law section 4, pre-existing): settings to managed venv to a bare system python3 is a
-	// silent chain; the job's first log line names the one taken.
-	private resolveInterpreter(): { executable: string; source: string } {
-		// Check VS Code Python extension setting
-		const pythonConfig = vscode.workspace.getConfiguration('python');
-		const pythonPath = pythonConfig.get<string>('defaultInterpreterPath');
-		if (pythonPath && fs.existsSync(pythonPath)) {
-			return { executable: pythonPath, source: 'setting python.defaultInterpreterPath' };
-		}
-
-		// Check Quantlab setting
-		const quantlabConfig = vscode.workspace.getConfiguration('quantlab');
-		const customPython = quantlabConfig.get<string>('pythonPath');
-		if (customPython && fs.existsSync(customPython)) {
-			return { executable: customPython, source: 'setting quantlab.pythonPath' };
-		}
-
-		// Check managed venv Python (auto-installed dependencies)
-		const managedPython = PythonBootstrap.getManagedPythonPath();
-		if (managedPython && fs.existsSync(managedPython)) {
-			return { executable: managedPython, source: 'managed venv' };
-		}
-
-		// Default to system Python
-		return { executable: process.platform === 'win32' ? 'python' : 'python3', source: 'system Python on PATH' };
+		return selectEngine({ extensionPath: this.extensionPath(), appRoot: vscode.env.appRoot, platform: process.platform, explicitPython });
 	}
 
 	private extensionPath(): string {
