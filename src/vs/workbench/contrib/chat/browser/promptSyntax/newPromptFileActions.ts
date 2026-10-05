@@ -9,5 +9,3 @@ export const NEW_INSTRUCTIONS_COMMAND_ID = 'workbench.command.new.instructions';
 export const NEW_AGENT_COMMAND_ID = 'workbench.command.new.agent';
 
 
-export function registerNewPromptFileActions(): void {
-}

@@ -108,9 +108,6 @@ import { observableConfigValue } from '../../../../platform/observable/common/pl
 import { AccessibilityVerbositySettingId } from '../../accessibility/browser/accessibilityConfiguration.js';
 import { IAccessibilityService } from '../../../../platform/accessibility/common/accessibility.js';
 import { AccessibilityCommandId } from '../../accessibility/common/accessibilityCommands.js';
-import { ChatContextKeys } from '../../chat/common/actions/chatContextKeys.js';
-import product from '../../../../platform/product/common/product.js';
-import { CHAT_SETUP_SUPPORT_ANONYMOUS_ACTION_ID } from '../../chat/browser/actions/chatActions.js';
 
 type TreeElement = ISCMRepository | ISCMInput | ISCMActionButton | ISCMResourceGroup | ISCMResource | IResourceNode<ISCMResource, ISCMResourceGroup>;
 
@@ -1365,49 +1362,12 @@ registerAction2(CollapseAllRepositoriesAction);
 registerAction2(ExpandAllRepositoriesAction);
 
 const enum SCMInputWidgetCommandId {
-	CancelAction = 'scm.input.cancelAction',
-	SetupAction = 'scm.input.triggerSetup'
+	CancelAction = 'scm.input.cancelAction'
 }
 
 const enum SCMInputWidgetStorageKey {
 	LastActionId = 'scm.input.lastActionId'
 }
-
-registerAction2(class extends Action2 {
-	constructor() {
-		super({
-			id: SCMInputWidgetCommandId.SetupAction,
-			title: localize('scmInputGenerateCommitMessage', "Generate Commit Message"),
-			icon: Codicon.sparkle,
-			f1: false,
-			menu: {
-				id: MenuId.SCMInputBox,
-				when: ContextKeyExpr.and(
-					ChatContextKeys.Setup.hidden.negate(),
-					ChatContextKeys.Setup.disabled.negate(),
-					ChatContextKeys.Setup.installed.negate(),
-					ContextKeyExpr.equals('scmProvider', 'git')
-				)
-			}
-		});
-	}
-
-	override async run(accessor: ServicesAccessor, ...args: unknown[]): Promise<void> {
-		const commandService = accessor.get(ICommandService);
-
-		const result = await commandService.executeCommand(CHAT_SETUP_SUPPORT_ANONYMOUS_ACTION_ID);
-		if (!result) {
-			return;
-		}
-
-		const command = product.defaultChatAgent?.generateCommitMessageCommand;
-		if (!command) {
-			return;
-		}
-
-		await commandService.executeCommand(command, ...args);
-	}
-});
 
 class SCMInputWidgetActionRunner extends ActionRunner {
 
@@ -1452,9 +1412,7 @@ class SCMInputWidgetActionRunner extends ActionRunner {
 
 			// Save last action
 			if (this._runningActions.size === 0) {
-				const actionId = action.id === SCMInputWidgetCommandId.SetupAction
-					? product.defaultChatAgent?.generateCommitMessageCommand ?? action.id
-					: action.id;
+				const actionId = action.id;
 				this.storageService.store(SCMInputWidgetStorageKey.LastActionId, actionId, StorageScope.PROFILE, StorageTarget.USER);
 			}
 		}

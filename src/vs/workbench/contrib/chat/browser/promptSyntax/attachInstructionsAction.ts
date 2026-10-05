@@ -29,8 +29,6 @@ const CONFIGURE_INSTRUCTIONS_ACTION_ID = 'workbench.action.chat.configure.instru
 /**
  * Helper to register the `Attach Prompt` action.
  */
-export function registerAttachPromptActions(): void {
-}
 
 
 export class ChatInstructionsPickerPick implements IChatContextPickerItem {

@@ -6,7 +6,5 @@
 
 export const MarkUnhelpfulActionId = 'workbench.action.chat.markUnhelpful';
 
-export function registerChatTitleActions() {
-}
 
 

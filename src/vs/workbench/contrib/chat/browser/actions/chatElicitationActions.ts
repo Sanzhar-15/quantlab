@@ -7,5 +7,3 @@
 export const AcceptElicitationRequestActionId = 'workbench.action.chat.acceptElicitation';
 
 
-export function registerChatElicitationActions(): void {
-}

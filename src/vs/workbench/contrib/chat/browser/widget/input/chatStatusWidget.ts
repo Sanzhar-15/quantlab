@@ -16,7 +16,6 @@ import { defaultButtonStyles } from '../../../../../../platform/theme/browser/de
 import { ChatEntitlement, ChatEntitlementContextKeys, IChatEntitlementService } from '../../../../../services/chat/common/chatEntitlementService.js';
 import { ChatInputPartWidgetsRegistry, IChatInputPartWidget } from './chatInputPartWidgets.js';
 import { ChatContextKeys } from '../../../common/actions/chatContextKeys.js';
-import { CHAT_SETUP_ACTION_ID } from '../../actions/chatActions.js';
 
 const $ = dom.$;
 
@@ -100,10 +99,7 @@ export class ChatStatusWidget extends Disposable implements IChatInputPartWidget
 		}
 
 		this._register(this.actionButton.onDidClick(async () => {
-			const commandId = this.chatEntitlementService.anonymous
-				? CHAT_SETUP_ACTION_ID
-				: 'workbench.action.chat.upgradePlan';
-			await this.commandService.executeCommand(commandId);
+			await this.commandService.executeCommand('workbench.action.chat.upgradePlan');
 		}));
 
 		this.domNode.appendChild(contentContainer);

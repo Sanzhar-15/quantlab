@@ -60,7 +60,6 @@ export class ChatViewTitleControl extends Disposable {
 		this.render(this.container);
 
 		this.registerListeners();
-		this.registerActions();
 	}
 
 	private registerListeners(): void {
@@ -71,9 +70,6 @@ export class ChatViewTitleControl extends Disposable {
 				this.doUpdate();
 			}
 		}));
-	}
-
-	private registerActions(): void {
 	}
 
 	private render(parent: HTMLElement): void {
