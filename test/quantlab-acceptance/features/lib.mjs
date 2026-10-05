@@ -135,3 +135,23 @@ export function assemble(checks) {
 	}
 	return { checks: out, rc: out.every(check => check.status === 'PASS') ? 0 : 1 };
 }
+
+/**
+ * The processes in `psText` (`ps -axo pid=,command=`) whose command runs from inside one of `bundles`
+ * (absolute .app paths), except `selfPid` (the launcher runs on the app's own Node).
+ */
+export function processesInside(psText, bundles, selfPid) {
+	const out = [];
+	for (const line of psText.split('\n')) {
+		const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+		if (match === null) {
+			continue;
+		}
+		const pid = Number(match[1]);
+		const command = match[2];
+		if (pid !== selfPid && bundles.some(bundle => command.startsWith(`${bundle}/`))) {
+			out.push({ pid, command });
+		}
+	}
+	return out;
+}

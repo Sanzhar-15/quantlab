@@ -10,7 +10,10 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
-import { assemble, CHECK_IDS, findBuiltInExtensionDir, judgePinnedDependency, readForkSha, readPins, treeDigest } from './lib.mjs';
+import { createRequire } from 'node:module';
+import { assemble, CHECK_IDS, findBuiltInExtensionDir, judgePinnedDependency, processesInside, readForkSha, readPins, treeDigest } from './lib.mjs';
+
+const { ask, serve } = createRequire(import.meta.url)('./cues.cjs');
 
 const pins = [
 	{ name: 'ms-python.python', version: '2026.4.0' },
@@ -69,5 +72,44 @@ test('treeDigest and findBuiltInExtensionDir on a small tree', () => {
 		assert.notStrictEqual(treeDigest(root).sha256, before.sha256);
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('processesInside: only commands run from inside a launched bundle, never the launcher itself', () => {
+	const ps = [
+		'  101 /evidence/Delta Plus.app/Contents/MacOS/Delta Plus /evidence/main/workspace --user-data-dir=/x',
+		'  102 /evidence/Delta Plus.app/Contents/Resources/app/extensions/quantlab/engine/quantlab-engine/quantlab-engine -m quantlab.cli.run_backtest',
+		'  103 /evidence/control/Delta Plus.app/Contents/Frameworks/Delta Plus Helper.app/Contents/MacOS/Delta Plus Helper',
+		'  104 /Applications/Delta Plus.app/Contents/MacOS/Delta Plus',
+		'  105 /evidence/Delta Plus.app2/Contents/MacOS/x',
+		'  200 /evidence/Delta Plus.app/Contents/MacOS/Delta Plus /runner/launcher.mjs',
+		'garbage',
+	].join('\n');
+	assert.deepStrictEqual(processesInside(ps, ['/evidence/Delta Plus.app', '/evidence/control/Delta Plus.app'], 200).map(p => p.pid), [101, 102, 103]);
+	assert.deepStrictEqual(processesInside(ps, ['/nowhere.app'], 200), []);
+});
+
+test('cues: a request is answered once by name; an unknown step and a throwing step come back as named errors', async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ql-cues-'));
+	let stop = false;
+	const served = serve(dir, {
+		double: async args => args.n * 2,
+		broken: async () => { throw new Error('[broken_step] it broke'); },
+	}, () => stop);
+	try {
+		assert.strictEqual(await ask(dir, 'double', { n: 21 }, 5000), 42);
+		await assert.rejects(ask(dir, 'broken', {}, 5000), /\[broken_step\] it broke/);
+		await assert.rejects(ask(dir, 'nosuch', {}, 5000), /\[cue_unknown\] the window driver has no step named nosuch/);
+		await assert.rejects(ask(dir, 'double', { n: 1 }, 5000), /\[cue_reused\]/);
+	} finally {
+		stop = true;
+		assert.deepStrictEqual(await served, ['double', 'broken', 'nosuch']);
+		fs.rmSync(dir, { recursive: true });
+	}
+	const silent = fs.mkdtempSync(path.join(os.tmpdir(), 'ql-cues-'));
+	try {
+		await assert.rejects(ask(silent, 'nobody', {}, 1200), /\[cue_unanswered\] the window driver did not answer nobody in 1.2 s/);
+	} finally {
+		fs.rmSync(silent, { recursive: true });
 	}
 });
