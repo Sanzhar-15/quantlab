@@ -13,14 +13,12 @@ import { isObject } from '../../../../../base/common/types.js';
 import { localize } from '../../../../../nls.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { ConfigurationTarget, IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
-import { Extensions as ConfigurationExtensions, IConfigurationRegistry } from '../../../../../platform/configuration/common/configurationRegistry.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import product from '../../../../../platform/product/common/product.js';
 import { IProductService } from '../../../../../platform/product/common/productService.js';
 import { IProgressService, ProgressLocation } from '../../../../../platform/progress/common/progress.js';
 import { IQuickInputService } from '../../../../../platform/quickinput/common/quickInput.js';
-import { Registry } from '../../../../../platform/registry/common/platform.js';
 import { ITelemetryService } from '../../../../../platform/telemetry/common/telemetry.js';
 import { IActivityService, ProgressBadge } from '../../../../services/activity/common/activity.js';
 import { AuthenticationSession, IAuthenticationService } from '../../../../services/authentication/common/authentication.js';
@@ -280,25 +278,6 @@ export class ChatSetupController extends Disposable {
 	}
 
 	async setupWithProvider(options: IChatSetupControllerOptions): Promise<ChatSetupResultValue> {
-		const registry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration);
-		registry.registerConfiguration({
-			'id': 'copilot.setup',
-			'type': 'object',
-			'properties': {
-				[defaultChat.completionsAdvancedSetting]: {
-					'type': 'object',
-					'properties': {
-						'authProvider': {
-							'type': 'string'
-						}
-					}
-				},
-				[defaultChat.providerUriSetting]: {
-					'type': 'string'
-				}
-			}
-		});
-
 		if (options.useEnterpriseProvider) {
 			const success = await this.handleEnterpriseInstance();
 			if (!success) {

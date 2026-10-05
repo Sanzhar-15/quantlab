@@ -11,7 +11,7 @@ import { OperatingSystem, isWeb, OS } from '../../../../base/common/platform.js'
 import { Schemas } from '../../../../base/common/network.js';
 import { IRemoteAgentService } from '../../../services/remote/common/remoteAgentService.js';
 import { ILoggerService } from '../../../../platform/log/common/log.js';
-import { localize, localize2 } from '../../../../nls.js';
+import { localize } from '../../../../nls.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { IConfigurationRegistry, Extensions as ConfigurationExtensions } from '../../../../platform/configuration/common/configurationRegistry.js';
 import { IJSONSchema } from '../../../../base/common/jsonSchema.js';
@@ -19,10 +19,6 @@ import { IFileService } from '../../../../platform/files/common/files.js';
 import { IDialogService, IFileDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { IWorkbenchEnvironmentService } from '../../../services/environment/common/environmentService.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
-import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
-import { Action2, registerAction2 } from '../../../../platform/actions/common/actions.js';
-import { Categories } from '../../../../platform/action/common/actionCommonCategories.js';
-import { PersistentConnection } from '../../../../platform/remote/common/remoteAgentConnection.js';
 import { IDownloadService } from '../../../../platform/download/common/download.js';
 import { DownloadServiceChannel } from '../../../../platform/download/common/downloadIpc.js';
 import { RemoteLoggerChannelClient } from '../../../../platform/log/common/logIpc.js';
@@ -151,43 +147,6 @@ registerWorkbenchContribution2(LabelContribution.ID, LabelContribution, Workbenc
 workbenchContributionsRegistry.registerWorkbenchContribution(RemoteChannelsContribution, LifecyclePhase.Restored);
 registerWorkbenchContribution2(RemoteInvalidWorkspaceDetector.ID, RemoteInvalidWorkspaceDetector, WorkbenchPhase.BlockStartup);
 
-const enableDiagnostics = true;
-
-if (enableDiagnostics) {
-	class TriggerReconnectAction extends Action2 {
-		constructor() {
-			super({
-				id: 'workbench.action.triggerReconnect',
-				title: localize2('triggerReconnect', 'Connection: Trigger Reconnect'),
-				category: Categories.Developer,
-				f1: true,
-			});
-		}
-
-		async run(accessor: ServicesAccessor): Promise<void> {
-			PersistentConnection.debugTriggerReconnection();
-		}
-	}
-
-	class PauseSocketWriting extends Action2 {
-		constructor() {
-			super({
-				id: 'workbench.action.pauseSocketWriting',
-				title: localize2('pauseSocketWriting', 'Connection: Pause socket writing'),
-				category: Categories.Developer,
-				f1: true,
-			});
-		}
-
-		async run(accessor: ServicesAccessor): Promise<void> {
-			PersistentConnection.debugPauseSocketWriting();
-		}
-	}
-
-	registerAction2(TriggerReconnectAction);
-	registerAction2(PauseSocketWriting);
-}
-
 const extensionKindSchema: IJSONSchema = {
 	type: 'string',
 	enum: [
@@ -239,11 +198,6 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration)
 					localize('remote.autoForwardPortsSource.hybrid', "Ports will be automatically forwarded when discovered by reading terminal and debug output. Not all processes that use ports will print to the integrated terminal or debug console, so some ports will be missed. Ports will be \"un-forwarded\" by watching for processes that listen on that port to be terminated.")
 				],
 				default: 'process'
-			},
-			'remote.autoForwardPortsFallback': {
-				type: 'number',
-				default: 20,
-				markdownDescription: localize('remote.autoForwardPortFallback', "The number of auto forwarded ports that will trigger the switch from `process` to `hybrid` when automatically forwarding ports and `remote.autoForwardPortsSource` is set to `process` by default. Set to `0` to disable the fallback. When `remote.autoForwardPortsFallback` hasn't been configured, but `remote.autoForwardPortsSource` has, `remote.autoForwardPortsFallback` will be treated as though it's set to `0`.")
 			},
 			'remote.forwardOnOpen': {
 				type: 'boolean',

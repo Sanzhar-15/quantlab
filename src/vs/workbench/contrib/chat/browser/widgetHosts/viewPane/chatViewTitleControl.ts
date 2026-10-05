@@ -14,16 +14,15 @@ import { ThemeIcon } from '../../../../../../base/common/themables.js';
 import { MarshalledId } from '../../../../../../base/common/marshallingIds.js';
 import { localize } from '../../../../../../nls.js';
 import { HiddenItemStrategy, MenuWorkbenchToolBar } from '../../../../../../platform/actions/browser/toolbar.js';
-import { Action2, MenuId, registerAction2 } from '../../../../../../platform/actions/common/actions.js';
+import { MenuId } from '../../../../../../platform/actions/common/actions.js';
 import { IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
-import { IInstantiationService, ServicesAccessor } from '../../../../../../platform/instantiation/common/instantiation.js';
+import { IInstantiationService } from '../../../../../../platform/instantiation/common/instantiation.js';
 import { IChatViewTitleActionContext } from '../../../common/actions/chatActions.js';
 import { IChatModel } from '../../../common/model/chatModel.js';
 import { ChatConfiguration } from '../../../common/constants.js';
 import { AgentSessionProviders, getAgentSessionProviderIcon } from '../../agentSessions/agentSessions.js';
 import { ActionViewItem, IActionViewItemOptions } from '../../../../../../base/browser/ui/actionbar/actionViewItems.js';
 import { IAction } from '../../../../../../base/common/actions.js';
-import { AgentSessionsPicker } from '../../agentSessions/agentSessionsPicker.js';
 
 export interface IChatViewTitleDelegate {
 	focusChat(): void;
@@ -75,27 +74,6 @@ export class ChatViewTitleControl extends Disposable {
 	}
 
 	private registerActions(): void {
-		this._register(registerAction2(class extends Action2 {
-			constructor() {
-				super({
-					id: ChatViewTitleControl.PICK_AGENT_SESSION_ACTION_ID,
-					title: localize('chat.pickAgentSession', "Pick Agent Session"),
-					f1: false,
-					menu: [{
-						id: MenuId.ChatViewSessionTitleNavigationToolbar,
-						group: 'navigation',
-						order: 2
-					}]
-				});
-			}
-
-			async run(accessor: ServicesAccessor): Promise<void> {
-				const instantiationService = accessor.get(IInstantiationService);
-
-				const agentSessionsPicker = instantiationService.createInstance(AgentSessionsPicker);
-				await agentSessionsPicker.pickAgentSession();
-			}
-		}));
 	}
 
 	private render(parent: HTMLElement): void {

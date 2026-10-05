@@ -270,7 +270,6 @@ registerAction2(class extends Action2 {
 		const bisectService = accessor.get(IExtensionBisectService);
 		const productService = accessor.get(IProductService);
 		const extensionEnablementService = accessor.get(IGlobalExtensionEnablementService);
-		const commandService = accessor.get(ICommandService);
 
 		if (!bisectService.isActive) {
 			return;
@@ -314,7 +313,6 @@ registerAction2(class extends Action2 {
 				await extensionEnablementService.disableExtension({ id: done.id }, undefined);
 			}
 			if (res.confirmed) {
-				await commandService.executeCommand('workbench.action.openIssueReporter', done.id);
 			}
 		}
 		await bisectService.reset();

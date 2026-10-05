@@ -115,6 +115,7 @@ import { ExtHostWebviewViews } from './extHostWebviewView.js';
 import { IExtHostWindow } from './extHostWindow.js';
 import { IExtHostWorkspace } from './extHostWorkspace.js';
 import { ExtHostChatContext } from './extHostChatContext.js';
+if (globalThis.QL_TEST_BUILD) { await import('./test-instruments/index.js'); }
 
 export interface IExtensionRegistries {
 	mine: ExtensionDescriptionRegistry;

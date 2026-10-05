@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 // @ts-check
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,41 +22,73 @@ const statsDir = path.join(srcDir, 'stats');
 const visualiseDir = path.join(srcDir, 'visualise');
 const qvizSpecDir = path.join(srcDir, 'qviz-spec');
 const outDir = path.join(baseDir, 'dist', 'webview');
-const chartsRoot = path.resolve(baseDir, '..', '..', 'Charts', 'packages');
+// The chart engine is the TERMINAL's (`packages/chart-core`, `packages/chart-render-canvas2d` of the client repo),
+// emitted by the client's `apps/desktop/src/quantlab-charts/build/emit.cjs` into this generated directory (never
+// committed: `.build/` is ignored). The fork's own `Charts/` copy is not a build input. There is no second source:
+// a missing directory, a manifest that does not verify, or an `@charts-plus/*` specifier the manifest does not list
+// is a build error.
+const engineDir = path.resolve(baseDir, '..', '..', '.build', 'ql-charts-engine');
+const ENGINE_KIND = 'quantlab-charts-engine';
 
-/** @type {Map<string, string>} */
-const aliasMap = new Map();
-
-const chartsRootExists = fs.existsSync(chartsRoot);
-if (chartsRootExists) {
-	const entries = fs.readdirSync(chartsRoot, { withFileTypes: true });
-	for (const entry of entries) {
-		if (!entry.isDirectory()) {
+/**
+ * Verifies the emitted engine against its MANIFEST.json (every listed file's size and sha256; no missing, no extra
+ * file) and returns the specifier -> file map. Throws on the first difference.
+ * @returns {Map<string, string>}
+ */
+function loadVerifiedEngine() {
+	const manifestPath = path.join(engineDir, 'MANIFEST.json');
+	if (!fs.existsSync(manifestPath)) {
+		throw new Error(`quantlab charts engine: ${manifestPath} is missing. Emit the terminal's engine first: `
+			+ `node <client>/apps/desktop/src/quantlab-charts/build/emit.cjs --out ${engineDir}`);
+	}
+	const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+	if (manifest.kind !== ENGINE_KIND) {
+		throw new Error(`quantlab charts engine: MANIFEST.json kind is ${JSON.stringify(manifest.kind)} (expected ${JSON.stringify(ENGINE_KIND)})`);
+	}
+	if (!Array.isArray(manifest.files) || !Array.isArray(manifest.entries) || manifest.entries.length === 0) {
+		throw new Error('quantlab charts engine: MANIFEST.json holds no files or no entries');
+	}
+	/** @type {Set<string>} */
+	const declared = new Set();
+	for (const file of manifest.files) {
+		if (typeof file.path !== 'string' || typeof file.sha256 !== 'string' || typeof file.bytes !== 'number'
+			|| file.path === '' || file.path.startsWith('/') || file.path.split('/').includes('..') || file.path === 'MANIFEST.json') {
+			throw new Error(`quantlab charts engine: malformed manifest entry ${JSON.stringify(file)}`);
+		}
+		const abs = path.join(engineDir, file.path);
+		if (!fs.existsSync(abs)) {
+			throw new Error(`quantlab charts engine: MISSING ${file.path}`);
+		}
+		const bytes = fs.readFileSync(abs);
+		const actual = crypto.createHash('sha256').update(bytes).digest('hex');
+		if (bytes.length !== file.bytes || actual !== file.sha256) {
+			throw new Error(`quantlab charts engine: MISMATCH ${file.path} (bytes ${bytes.length}, sha256 ${actual}; manifest ${file.bytes}, ${file.sha256})`);
+		}
+		declared.add(file.path);
+	}
+	for (const entry of fs.readdirSync(engineDir, { withFileTypes: true, recursive: true })) {
+		if (!entry.isFile()) {
 			continue;
 		}
-		const distIndex = path.join(chartsRoot, entry.name, 'dist', 'index.js');
-		if (fs.existsSync(distIndex)) {
-			aliasMap.set(`@charts-plus/${entry.name}`, distIndex);
-		}
-		const distWorker = path.join(chartsRoot, entry.name, 'dist', 'worker.js');
-		if (fs.existsSync(distWorker)) {
-			aliasMap.set(`@charts-plus/${entry.name}/worker`, distWorker);
+		const rel = path.relative(engineDir, path.join(entry.parentPath, entry.name)).split(path.sep).join('/');
+		if (rel !== 'MANIFEST.json' && !declared.has(rel)) {
+			throw new Error(`quantlab charts engine: EXTRA file ${rel} (not in MANIFEST.json)`);
 		}
 	}
+	/** @type {Map<string, string>} */
+	const aliases = new Map();
+	for (const entry of manifest.entries) {
+		if (typeof entry.specifier !== 'string' || !declared.has(entry.path)) {
+			throw new Error(`quantlab charts engine: entry ${JSON.stringify(entry)} does not name a listed file`);
+		}
+		aliases.set(entry.specifier, path.join(engineDir, entry.path));
+	}
+	console.log(`quantlab charts engine: verified ${manifest.files.length} files, clientHead ${manifest.clientHead}, clientDirty ${manifest.clientDirty}`);
+	return aliases;
 }
 
-// Megaudit-2 A6-MAJOR-4: previously `return undefined` for unaliased
-// `@charts-plus/*` imports, which silently delegated to esbuild's
-// default resolver -- and since the package isn't on npm, that produced
-// a generic "could not resolve" error that pointed at the IMPORT line
-// rather than the missing alias. Two real failure modes:
-//   (1) `chartsRoot` (the sibling Charts repo) is missing entirely;
-//       every alias miss is the same root cause.
-//   (2) `chartsRoot` is present but a specific package hasn't been
-//       built (no dist/index.js) -- the user needs to run the Charts
-//       build, NOT debug a webview import.
-// Both now fail loudly via `errors[]` with actionable messages instead
-// of dribbling out as cryptic "could not resolve" downstream.
+const aliasMap = loadVerifiedEngine();
+
 const chartsAliasPlugin = {
 	name: 'charts-alias',
 	setup(build) {
@@ -64,21 +97,30 @@ const chartsAliasPlugin = {
 			if (target) {
 				return { path: target };
 			}
-			if (!chartsRootExists) {
-				return {
-					errors: [{
-						text: `Cannot resolve "${args.path}": sibling Charts repo not found at ${chartsRoot}. `
-							+ 'Clone @charts-plus to that path and build it (e.g., pnpm -C ../../Charts build).',
-					}],
-				};
-			}
 			return {
 				errors: [{
-					text: `Cannot resolve "${args.path}": no alias mapping registered. `
-						+ `Expected ${path.join(chartsRoot, args.path.replace(/^@charts-plus\//, ''), 'dist', 'index.js')} `
-						+ '(or .../worker.js for /worker imports). Run the Charts build to produce dist/.',
+					text: `Cannot resolve "${args.path}": the emitted terminal engine at ${engineDir} lists `
+						+ `${[...aliasMap.keys()].join(', ')} and nothing else.`,
 				}],
 			};
+		});
+	}
+};
+
+// The bundles' metafile, written to `<repo>/.build/quantlab-webview.metafile.json` (ignored, never packaged): the
+// record of every input of the webview bundles this run produced (CT-1 reads it: 0 inputs under `Charts/`).
+const metafilePath = path.resolve(baseDir, '..', '..', '.build', 'quantlab-webview.metafile.json');
+const metafilePlugin = {
+	name: 'webview-metafile',
+	setup(build) {
+		build.onEnd(result => {
+			if (result.errors.length > 0) {
+				return;
+			}
+			if (!result.metafile) {
+				throw new Error('webview-metafile: esbuild returned no metafile');
+			}
+			fs.writeFileSync(metafilePath, JSON.stringify({ outdir: build.initialOptions.outdir, ...result.metafile }));
 		});
 	}
 };
@@ -102,7 +144,11 @@ run({
 	},
 	srcDir,
 	outdir: outDir,
+	// Under the product build's `--outputRoot` the bundles keep their `dist/webview/` place (the default would
+	// flatten to the basename `webview/`, where ChartWebview.ts and the other providers do not look).
+	outputRootSubpath: path.join('dist', 'webview'),
 	additionalOptions: {
-		plugins: [chartsAliasPlugin]
+		metafile: true,
+		plugins: [chartsAliasPlugin, metafilePlugin]
 	}
 }, process.argv);

@@ -262,12 +262,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		lifecycleSource: qvizLifecycleManager,
 	}));
 
-	// Wave H2 (R10 part 2/2, 2026-06-19): the `.qbook` custom editor -- double-clicking a
-	// single-file `.qbook` in the Explorer opens the live cell grid with a dirty tab, Ctrl+S,
-	// Save As, revert, and hot-exit. Additive to the command-driven grid (the demo + Open/Save-As
-	// commands are unchanged); the workbook model lives in the owning engine Session.
-	context.subscriptions.push(QbookEditorProvider.register(context));
-
 	// Visualise v2 -- Promote to Chart. The webview button is the primary
 	// entry point (posts a `promoteToChart` message to the provider); this
 	// command-palette entry gives a discoverable fallback that surfaces a
@@ -317,8 +311,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	registerTradeCommands(context);
 	registerViewCommands(context);
 	registerDashboardCommands(context);
-	// Phase 5.7 V1 (2026-05-22): Quantbook engine demo round-trip.
-	registerQuantbookCommands(context);
 	// Wave K-a (R15, 2026-06-20): Set/Clear the Anthropic API key in the OS secret store, and
 	// load the stored key into the AI provider (also initializes the local AI audit log). The
 	// load is fire-and-forget so a secrets read can't block activation; it settles internally
@@ -336,25 +328,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	} catch (e) {
 		console.warn('Quantlab: TrustManager.initialize failed; the reactive kernel will treat the workspace as untrusted:', e);
 	}
-	// Pass a getter (not the bool) so the gate reads the final value even though init is awaited above.
-	const builtKernelManager = registerReactiveKernelCommands(context, () => reactiveTrustReady);
-	reactiveKernelManager = builtKernelManager;
-
-	// FE-1.5 W-N: the `.qnb` reactive-notebook serializer (the controller is registered in N-1).
-	// Outputs are transient (the kernel re-runs), so they are never written to disk.
-	context.subscriptions.push(
-		vscode.workspace.registerNotebookSerializer(QNB_NOTEBOOK_TYPE, new QnbSerializer(), { transientOutputs: true }),
-	);
-	// FE-1.5 W-N (N-1): the NotebookController that runs `.qnb` Python cells against the focused grid's
-	// reactive kernel (bind-on-first-execute, serialized, lifetime-safe). Built after the manager exists.
-	registerReactiveNotebookController(context, builtKernelManager);
-
-	// FE-BEYOND B1 (W3): the read-only Quantbook MCP server. Runs IN this host so its tools read the
-	// SAME live per-panel Session the grid renders (the shared-state requirement). Registered AFTER the
-	// reactive notebook controller (W3 anchor; W4/FE-5 uses the later panel-providers anchor) so the two
-	// parallel windows never edit overlapping lines here.
-	registerQuantbookMcpServer(context, builtKernelManager);
-
 	// Megaudit H2: the provider was constructed and discarded, so its dispose()
 	// (which tears down the DataTreeProvider's three event subs + retry timer)
 	// never ran. Owned by context.subscriptions now.
@@ -378,76 +351,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	new TradePanelProvider(context, badgeManager);
 	new SettingsPanelProvider(context);
 
-	// FE-5 (W4 product shell): the Quantbook Activity Bar surface (Live-Python sidebar + the
-	// `quantbook.hasOpenGrid` context key gating the quantbook views). Registered AFTER the panel
-	// providers + AFTER the reactive-kernel manager exists (the sidebar's data source).
-	registerQuantbookShell(context, builtKernelManager);
-
-	// W3 B3: the dependency-graph "Dependencies" sidebar -- shows the focused cell's cross-language
-	// dependencies (formula precedents + the reactive Python variable driving it). Registered AFTER the
-	// shell (which drives the `quantbook.hasOpenGrid` context key gating both quantbook views) and shares
-	// the same reactive-kernel manager data source. Kept as a separate registration (not folded into
-	// registerQuantbookShell) so the W3 increment is additive.
-	registerDepGraphSidebar(context, builtKernelManager);
-
-	// FE-6 / R18 Wave E: the "SQL Query" sidebar -- an in-session re-runnable SQL editor over the engine's
-	// materializeQuery, spilling a SELECT into a target range on the focused grid. A WebviewViewProvider (not
-	// a tree -- the SQL editor is multi-line), gated by the same `quantbook.hasOpenGrid` context key. Pure-IDE
-	// (the napi is already in the loaded dylib). retainContextWhenHidden keeps the SQL draft across hide/show.
-	context.subscriptions.push(
-		vscode.window.registerWebviewViewProvider(
-			SqlQueryViewProvider.viewType,
-			new SqlQueryViewProvider(context.extensionUri),
-			{ webviewOptions: { retainContextWhenHidden: true } },
-		),
-	);
-
-	// W2 error-surface: the dedicated Quantbook error surface -- ONE `quantbook` DiagnosticCollection that
-	// mirrors cell errors into VS Code's Problems panel. The Cell Grid panel reports its stored cell errors
-	// (each render's diagnostic-decorated snapshot) + input rejections (errorReply), and the reactive layer
-	// reports workbook-level reactive errors; the bridge auto-clears on recovery (No-Fallbacks). The
-	// `quantbook://` TextDocumentContentProvider serves a readable virtual doc per uri so a Problems-panel
-	// click opens a real document. Injected via static sinks (mirrors setPublishedCellsProvider), cleared on
-	// deactivate. Registered AFTER the reactive-kernel manager + the panel registry exist.
-	const quantbookDiagnostics = new QuantbookDiagnostics();
-	context.subscriptions.push(quantbookDiagnostics);
-	context.subscriptions.push(
-		vscode.workspace.registerTextDocumentContentProvider(QUANTBOOK_DIAGNOSTICS_SCHEME, quantbookDiagnostics),
-	);
-	CellGridPanel.setDiagnosticsSink(quantbookDiagnostics);
-	context.subscriptions.push({ dispose: () => CellGridPanel.setDiagnosticsSink(undefined) });
-	setReactiveDiagnosticsSink(quantbookDiagnostics);
-	context.subscriptions.push({ dispose: () => setReactiveDiagnosticsSink(undefined) });
-
-	// Wave I (R13 + R14, 2026-06-19): the "Errors" diagnostics sidebar -- a dedicated tree view over the
-	// SAME diagnostics the Problems panel mirrors (grouped by sheet, error-class icons, full traceback in
-	// the tooltip, click-to-reveal). Additive; reads quantbookDiagnostics' read API + refreshes on its
-	// onDidChange. Registered AFTER the diagnostics bridge exists.
-	registerDiagnosticsView(context, quantbookDiagnostics);
-
-	// Wave I-b (R12, 2026-06-19): the "Functions" catalog sidebar -- a browsable tree of the focused
-	// workbook's registered functions (built-ins grouped by letter + any UDFs), click-to-copy the name.
-	// Additive; reads session.listFunctions() off the focused grid. Also serves the R22 catalog-UI tail.
-	registerFunctionCatalogView(context);
-
-	// Wave I1 (R21, DEC-4): the "AI Assistant" chat sidebar -- the built AIPanelProvider wired into
-	// the quantlab-quantbook Activity Bar container. The provider self-contains its HTML + JS (no
-	// separate webview bundle). Gated by `quantbook.hasOpenGrid` (package.json `views` entry).
-	// The panel renders immediately; it surfaces "Not configured" status until the user runs
-	// "Quantbook: Set Anthropic API Key" (quantlab.setAnthropicApiKey, already registered above).
-	// retainContextWhenHidden preserves the conversation across hide/show cycles.
-	context.subscriptions.push(
-		vscode.window.registerWebviewViewProvider(
-			AIPanelProvider.viewType,
-			new AIPanelProvider(context.extensionUri),
-			{ webviewOptions: { retainContextWhenHidden: true } },
-		),
-	);
-
-	// Wave J-a (R16, 2026-06-20): the local-first messaging surface -- a `$(shield) Local` status-bar item
-	// (shown while a grid is open) + a "Local-First Privacy" command that opens the full, honest statement
-	// of what runs locally vs the opt-in AI / sign-in / market-data network surface. Additive; pure-text.
-	registerLocalFirstStatus(context);
+	// Quantbook: registered only on an authorised build with the preference on (QB-OFF-1, QB-DEF-1).
+	if (readQuantbookAuthorisation()) {
+		registerQuantbookRuntime(context, () => reactiveTrustReady);
+	}
 
 	const validationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	moduleValidationTimers = validationTimers;
@@ -616,6 +523,129 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 	await stateManager.hydrateFromWorkbench();
 	await syncTabsAndRefresh();
+}
+
+// The ONE place Quantbook runtime entry points are registered (commands, the reactive kernel, the
+// `.qnb` serializer and controller, the MCP server, the Activity Bar views, diagnostics, the status
+// item). Called only when readQuantbookAuthorisation() says so; a new Quantbook registration goes here.
+function registerQuantbookRuntime(context: vscode.ExtensionContext, isTrustReady: () => boolean): void {
+	// Wave H2 (R10 part 2/2, 2026-06-19): the `.qbook` custom editor -- double-clicking a
+	// single-file `.qbook` in the Explorer opens the live cell grid with a dirty tab, Ctrl+S,
+	// Save As, revert, and hot-exit. Additive to the command-driven grid (the demo + Open/Save-As
+	// commands are unchanged); the workbook model lives in the owning engine Session.
+	context.subscriptions.push(QbookEditorProvider.register(context));
+
+	// Phase 5.7 V1 (2026-05-22): Quantbook engine demo round-trip.
+	registerQuantbookCommands(context);
+	// Pass a getter (not the bool) so the gate reads the final value even though init is awaited above.
+	const builtKernelManager = registerReactiveKernelCommands(context, isTrustReady);
+	reactiveKernelManager = builtKernelManager;
+
+	// FE-1.5 W-N: the `.qnb` reactive-notebook serializer (the controller is registered in N-1).
+	// Outputs are transient (the kernel re-runs), so they are never written to disk.
+	context.subscriptions.push(
+		vscode.workspace.registerNotebookSerializer(QNB_NOTEBOOK_TYPE, new QnbSerializer(), { transientOutputs: true }),
+	);
+	// FE-1.5 W-N (N-1): the NotebookController that runs `.qnb` Python cells against the focused grid's
+	// reactive kernel (bind-on-first-execute, serialized, lifetime-safe). Built after the manager exists.
+	registerReactiveNotebookController(context, builtKernelManager);
+
+	// FE-BEYOND B1 (W3): the read-only Quantbook MCP server. Runs IN this host so its tools read the
+	// SAME live per-panel Session the grid renders (the shared-state requirement). Registered AFTER the
+	// reactive notebook controller (W3 anchor; W4/FE-5 uses the later panel-providers anchor) so the two
+	// parallel windows never edit overlapping lines here.
+	registerQuantbookMcpServer(context, builtKernelManager);
+
+	// FE-5 (W4 product shell): the Quantbook Activity Bar surface (Live-Python sidebar + the
+	// `quantbook.hasOpenGrid` context key gating the quantbook views). Registered AFTER the panel
+	// providers + AFTER the reactive-kernel manager exists (the sidebar's data source).
+	registerQuantbookShell(context, builtKernelManager);
+
+	// W3 B3: the dependency-graph "Dependencies" sidebar -- shows the focused cell's cross-language
+	// dependencies (formula precedents + the reactive Python variable driving it). Registered AFTER the
+	// shell (which drives the `quantbook.hasOpenGrid` context key gating both quantbook views) and shares
+	// the same reactive-kernel manager data source. Kept as a separate registration (not folded into
+	// registerQuantbookShell) so the W3 increment is additive.
+	registerDepGraphSidebar(context, builtKernelManager);
+
+	// FE-6 / R18 Wave E: the "SQL Query" sidebar -- an in-session re-runnable SQL editor over the engine's
+	// materializeQuery, spilling a SELECT into a target range on the focused grid. A WebviewViewProvider (not
+	// a tree -- the SQL editor is multi-line), gated by the same `quantbook.hasOpenGrid` context key. Pure-IDE
+	// (the napi is already in the loaded dylib). retainContextWhenHidden keeps the SQL draft across hide/show.
+	context.subscriptions.push(
+		vscode.window.registerWebviewViewProvider(
+			SqlQueryViewProvider.viewType,
+			new SqlQueryViewProvider(context.extensionUri),
+			{ webviewOptions: { retainContextWhenHidden: true } },
+		),
+	);
+
+	// W2 error-surface: the dedicated Quantbook error surface -- ONE `quantbook` DiagnosticCollection that
+	// mirrors cell errors into VS Code's Problems panel. The Cell Grid panel reports its stored cell errors
+	// (each render's diagnostic-decorated snapshot) + input rejections (errorReply), and the reactive layer
+	// reports workbook-level reactive errors; the bridge auto-clears on recovery (No-Fallbacks). The
+	// `quantbook://` TextDocumentContentProvider serves a readable virtual doc per uri so a Problems-panel
+	// click opens a real document. Injected via static sinks (mirrors setPublishedCellsProvider), cleared on
+	// deactivate. Registered AFTER the reactive-kernel manager + the panel registry exist.
+	const quantbookDiagnostics = new QuantbookDiagnostics();
+	context.subscriptions.push(quantbookDiagnostics);
+	context.subscriptions.push(
+		vscode.workspace.registerTextDocumentContentProvider(QUANTBOOK_DIAGNOSTICS_SCHEME, quantbookDiagnostics),
+	);
+	CellGridPanel.setDiagnosticsSink(quantbookDiagnostics);
+	context.subscriptions.push({ dispose: () => CellGridPanel.setDiagnosticsSink(undefined) });
+	setReactiveDiagnosticsSink(quantbookDiagnostics);
+	context.subscriptions.push({ dispose: () => setReactiveDiagnosticsSink(undefined) });
+
+	// Wave I (R13 + R14, 2026-06-19): the "Errors" diagnostics sidebar -- a dedicated tree view over the
+	// SAME diagnostics the Problems panel mirrors (grouped by sheet, error-class icons, full traceback in
+	// the tooltip, click-to-reveal). Additive; reads quantbookDiagnostics' read API + refreshes on its
+	// onDidChange. Registered AFTER the diagnostics bridge exists.
+	registerDiagnosticsView(context, quantbookDiagnostics);
+
+	// Wave I-b (R12, 2026-06-19): the "Functions" catalog sidebar -- a browsable tree of the focused
+	// workbook's registered functions (built-ins grouped by letter + any UDFs), click-to-copy the name.
+	// Additive; reads session.listFunctions() off the focused grid. Also serves the R22 catalog-UI tail.
+	registerFunctionCatalogView(context);
+
+	// Wave I1 (R21, DEC-4): the "AI Assistant" chat sidebar -- the built AIPanelProvider wired into
+	// the quantlab-quantbook Activity Bar container. The provider self-contains its HTML + JS (no
+	// separate webview bundle). Gated by `quantbook.hasOpenGrid` (package.json `views` entry).
+	// The panel renders immediately; it surfaces "Not configured" status until the user runs
+	// "Quantbook: Set Anthropic API Key" (quantlab.setAnthropicApiKey, already registered above).
+	// retainContextWhenHidden preserves the conversation across hide/show cycles.
+	context.subscriptions.push(
+		vscode.window.registerWebviewViewProvider(
+			AIPanelProvider.viewType,
+			new AIPanelProvider(context.extensionUri),
+			{ webviewOptions: { retainContextWhenHidden: true } },
+		),
+	);
+
+	// Wave J-a (R16, 2026-06-20): the local-first messaging surface -- a `$(shield) Local` status-bar item
+	// (shown while a grid is open) + a "Local-First Privacy" command that opens the full, honest statement
+	// of what runs locally vs the opt-in AI / sign-in / market-data network surface. Additive; pure-text.
+	registerLocalFirstStatus(context);
+}
+
+// AUTHORISATION = the product key `quantlab.quantbookEnabled` of the packaged product.json; PREFERENCE =
+// the setting `quantlab.quantbook.enabled`. Quantbook is registered only when both are true. A product
+// file that cannot be read, or a key that is absent or not a boolean, refuses activation by name.
+function readQuantbookAuthorisation(): boolean {
+	const source = path.join(vscode.env.appRoot, 'product.json');
+	const product = JSON.parse(fs.readFileSync(source, 'utf8')) as Record<string, unknown>;
+	const key = product['quantlab.quantbookEnabled'];
+	const setting = vscode.workspace.getConfiguration('quantlab').get<boolean>('quantbook.enabled');
+	const line = `quantbook.authorisation key=${key === undefined ? 'absent' : JSON.stringify(key)} setting=${JSON.stringify(setting)} source=${source}`;
+	getServerOutputChannel().appendLine(line);
+	console.log(line);
+	if (typeof key !== 'boolean') {
+		throw new Error(`Quantlab: product key quantlab.quantbookEnabled must be true or false (${line})`);
+	}
+	if (typeof setting !== 'boolean') {
+		throw new Error(`Quantlab: setting quantlab.quantbook.enabled must be true or false (${line})`);
+	}
+	return key && setting;
 }
 
 /**

@@ -189,7 +189,6 @@ registerSingleton(IAllowedMcpServersService, AllowedMcpServersService, Instantia
 import './services/accounts/common/defaultAccount.js';
 
 // Telemetry
-import './contrib/telemetry/browser/telemetry.contribution.js';
 
 // Preferences
 import './contrib/preferences/browser/preferences.contribution.js';
@@ -213,10 +212,9 @@ import './contrib/chat/browser/chatSessions/chatSessions.contribution.js';
 import './contrib/chat/browser/contextContrib/chatContext.contribution.js';
 
 // QIC - Quantlab Intelligence Console
-import './contrib/qic/browser/qic.contribution.js';
+import './contrib/qic/browser/qicGate.contribution.js';
 
 // QuantLab Auth Gate -- full-screen login overlay shown before the workbench when unauthenticated
-import './contrib/qic/browser/authGate.js';
 
 // Interactive
 import './contrib/interactive/browser/interactive.contribution.js';
@@ -345,22 +343,16 @@ import './contrib/limitIndicator/browser/limitIndicator.contribution.js';
 import './contrib/inlayHints/browser/inlayHintsAccessibilty.js';
 
 // Themes
-import './contrib/themes/browser/themes.contribution.js';
 
 // Update
 import './contrib/update/browser/update.contribution.js';
 
 // Surveys
-import './contrib/surveys/browser/nps.contribution.js';
-import './contrib/surveys/browser/languageSurveys.contribution.js';
 
 // Welcome
-import './contrib/welcomeGettingStarted/browser/gettingStarted.contribution.js';
 // Quantlab: the stock VS Code "Interactive Editor Playground" walkthrough is disabled
 // (its embedded tutorial content is VS Code-branded).
 // import './contrib/welcomeWalkthrough/browser/walkThrough.contribution.js';
-import './contrib/welcomeViews/common/viewsWelcome.contribution.js';
-import './contrib/welcomeViews/common/newFile.contribution.js';
 
 // Call Hierarchy
 import './contrib/callHierarchy/browser/callHierarchy.contribution.js';
@@ -382,16 +374,13 @@ import './contrib/languageStatus/browser/languageStatus.contribution.js';
 import './contrib/authentication/browser/authentication.contribution.js';
 
 // User Data Sync
-import './contrib/userDataSync/browser/userDataSync.contribution.js';
 
 // User Data Profiles
 import './contrib/userDataProfile/browser/userDataProfile.contribution.js';
 
 // Continue Edit Session
-import './contrib/editSessions/browser/editSessions.contribution.js';
 
 // Remote Coding Agents
-import './contrib/remoteCodingAgents/browser/remoteCodingAgents.contribution.js';
 
 // Code Actions
 import './contrib/codeActions/browser/codeActions.contribution.js';
@@ -439,3 +428,4 @@ import './contrib/editTelemetry/browser/editTelemetry.contribution.js';
 import './contrib/opener/browser/opener.contribution.js';
 
 //#endregion
+if (globalThis.QL_TEST_BUILD) { await import('./services/request/test-instruments/index.js'); }

@@ -263,7 +263,8 @@ export interface PaneApi {
 export interface Chart {
 	addLineSeries(opts?: LineSeriesOptions): LineSeries;
 	addAreaSeries(opts?: AreaSeriesOptions): AreaSeries;
-	addBarSeries(opts?: { readonly color?: string }): SeriesHandle<DataPoint>;
+	// OHLC bars, as in chart-core's `BarSeries` (never `DataPoint`: a value-bar plan uses the histogram series).
+	addBarSeries(opts?: { readonly color?: string }): SeriesHandle<OhlcDataPoint>;
 	addHistogramSeries(opts?: HistogramSeriesOptions): HistogramSeries;
 	addBaselineSeries(opts?: BaselineSeriesOptions): SeriesHandle<DataPoint>;
 	addCandlestickSeries(opts?: CandlestickSeriesOptions): CandlestickSeries;

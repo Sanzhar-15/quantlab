@@ -7,48 +7,34 @@ import { WorkbenchActionExecutedClassification, WorkbenchActionExecutedEvent } f
 import { Event } from '../../../../../base/common/event.js';
 import { Lazy } from '../../../../../base/common/lazy.js';
 import { Disposable, DisposableStore, markAsSingleton, MutableDisposable } from '../../../../../base/common/lifecycle.js';
-import Severity from '../../../../../base/common/severity.js';
 import { equalsIgnoreCase } from '../../../../../base/common/strings.js';
 import { URI } from '../../../../../base/common/uri.js';
-import { ServicesAccessor } from '../../../../../editor/browser/editorExtensions.js';
-import { ICodeEditorService } from '../../../../../editor/browser/services/codeEditorService.js';
-import { EditorContextKeys } from '../../../../../editor/common/editorContextKeys.js';
-import { localize, localize2 } from '../../../../../nls.js';
-import { Action2, MenuId, MenuRegistry, registerAction2 } from '../../../../../platform/actions/common/actions.js';
-import { CommandsRegistry, ICommandService } from '../../../../../platform/commands/common/commands.js';
+import { localize } from '../../../../../nls.js';
+import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
-import { ContextKeyExpr, IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
-import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
+import { IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
 import { IEnvironmentService } from '../../../../../platform/environment/common/environment.js';
 import { ExtensionIdentifier } from '../../../../../platform/extensions/common/extensions.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
-import { IMarkerService } from '../../../../../platform/markers/common/markers.js';
-import { IOpenerService } from '../../../../../platform/opener/common/opener.js';
 import product from '../../../../../platform/product/common/product.js';
 import { IProductService } from '../../../../../platform/product/common/productService.js';
 import { ITelemetryService } from '../../../../../platform/telemetry/common/telemetry.js';
 import { IWorkbenchContribution } from '../../../../common/contributions.js';
 import { IViewDescriptorService, ViewContainerLocation } from '../../../../common/views.js';
-import { ChatEntitlement, ChatEntitlementContext, ChatEntitlementRequests, ChatEntitlementService, IChatEntitlementService, isProUser } from '../../../../services/chat/common/chatEntitlementService.js';
+import { ChatEntitlement, ChatEntitlementContext, ChatEntitlementRequests, ChatEntitlementService, IChatEntitlementService } from '../../../../services/chat/common/chatEntitlementService.js';
 import { EnablementState, IWorkbenchExtensionEnablementService } from '../../../../services/extensionManagement/common/extensionManagement.js';
 import { ExtensionUrlHandlerOverrideRegistry, IExtensionUrlHandlerOverride } from '../../../../services/extensions/browser/extensionUrlHandler.js';
 import { IExtensionService } from '../../../../services/extensions/common/extensions.js';
-import { IHostService } from '../../../../services/host/browser/host.js';
 import { IWorkbenchLayoutService, Parts } from '../../../../services/layout/browser/layoutService.js';
-import { ILifecycleService } from '../../../../services/lifecycle/common/lifecycle.js';
-import { IPreferencesService } from '../../../../services/preferences/common/preferences.js';
 import { IExtension, IExtensionsWorkbenchService } from '../../../extensions/common/extensions.js';
-import { ChatContextKeys } from '../../common/actions/chatContextKeys.js';
 import { IChatModeService } from '../../common/chatModes.js';
 import { ChatAgentLocation, ChatModeKind } from '../../common/constants.js';
-import { CHAT_CATEGORY, CHAT_SETUP_ACTION_ID, CHAT_SETUP_SUPPORT_ANONYMOUS_ACTION_ID } from '../actions/chatActions.js';
-import { ChatViewContainerId, IChatWidgetService } from '../chat.js';
+import { CHAT_SETUP_ACTION_ID } from '../actions/chatActions.js';
+import { ChatViewContainerId } from '../chat.js';
 import { chatViewsWelcomeRegistry } from '../viewsWelcome/chatViewsWelcome.js';
-import { ChatSetupAnonymous } from './chatSetup.js';
 import { ChatSetupController } from './chatSetupController.js';
-import { AICodeActionsHelper, AINewSymbolNamesProvider, ChatCodeActionsProvider, SetupAgent } from './chatSetupProviders.js';
-import { ChatSetup } from './chatSetupRunner.js';
+import { AINewSymbolNamesProvider, ChatCodeActionsProvider, SetupAgent } from './chatSetupProviders.js';
 
 const defaultChat = {
 	chatExtensionId: product.defaultChatAgent?.chatExtensionId ?? '',
@@ -175,368 +161,17 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
 
 		//#region Global Chat Setup Actions
 
-		class ChatSetupTriggerAction extends Action2 {
-
-			static CHAT_SETUP_ACTION_LABEL = localize2('triggerChatSetup', "Use AI Features with Copilot for free...");
-
-			constructor() {
-				super({
-					id: CHAT_SETUP_ACTION_ID,
-					title: ChatSetupTriggerAction.CHAT_SETUP_ACTION_LABEL,
-					category: CHAT_CATEGORY,
-					f1: true,
-					precondition: ContextKeyExpr.or(
-						ChatContextKeys.Setup.hidden,
-						ChatContextKeys.Setup.disabled,
-						ChatContextKeys.Setup.untrusted,
-						ChatContextKeys.Setup.installed.negate(),
-						ChatContextKeys.Entitlement.canSignUp
-					)
-				});
-			}
-
-			override async run(accessor: ServicesAccessor, mode?: ChatModeKind | string, options?: { forceSignInDialog?: boolean; additionalScopes?: readonly string[]; forceAnonymous?: ChatSetupAnonymous; inputValue?: string }): Promise<boolean> {
-				const widgetService = accessor.get(IChatWidgetService);
-				const instantiationService = accessor.get(IInstantiationService);
-				const dialogService = accessor.get(IDialogService);
-				const commandService = accessor.get(ICommandService);
-				const lifecycleService = accessor.get(ILifecycleService);
-				const configurationService = accessor.get(IConfigurationService);
-
-				await context.update({ hidden: false });
-				configurationService.updateValue(ChatTeardownContribution.CHAT_DISABLED_CONFIGURATION_KEY, false);
-
-				if (mode) {
-					const chatWidget = await widgetService.revealWidget();
-					chatWidget?.input.setChatMode(mode);
-				}
-
-				if (options?.inputValue) {
-					const chatWidget = await widgetService.revealWidget();
-					chatWidget?.setInput(options.inputValue);
-				}
-
-				const setup = ChatSetup.getInstance(instantiationService, context, controller);
-				const { success } = await setup.run(options);
-				if (success === false && !lifecycleService.willShutdown) {
-					const { confirmed } = await dialogService.confirm({
-						type: Severity.Error,
-						message: localize('setupErrorDialog', "Chat setup failed. Would you like to try again?"),
-						primaryButton: localize('retry', "Retry"),
-					});
-
-					if (confirmed) {
-						return Boolean(await commandService.executeCommand(CHAT_SETUP_ACTION_ID, mode, options));
-					}
-				}
-
-				return Boolean(success);
-			}
-		}
-
-		class ChatSetupTriggerSupportAnonymousAction extends Action2 {
-
-			constructor() {
-				super({
-					id: CHAT_SETUP_SUPPORT_ANONYMOUS_ACTION_ID,
-					title: ChatSetupTriggerAction.CHAT_SETUP_ACTION_LABEL
-				});
-			}
-
-			override async run(accessor: ServicesAccessor): Promise<unknown> {
-				const commandService = accessor.get(ICommandService);
-				const telemetryService = accessor.get(ITelemetryService);
-				const chatEntitlementService = accessor.get(IChatEntitlementService);
-
-				telemetryService.publicLog2<WorkbenchActionExecutedEvent, WorkbenchActionExecutedClassification>('workbenchActionExecuted', { id: CHAT_SETUP_ACTION_ID, from: 'api' });
-
-				return commandService.executeCommand(CHAT_SETUP_ACTION_ID, undefined, {
-					forceAnonymous: chatEntitlementService.anonymous ? ChatSetupAnonymous.EnabledWithDialog : undefined
-				});
-			}
-		}
-
-		class ChatSetupTriggerForceSignInDialogAction extends Action2 {
-
-			constructor() {
-				super({
-					id: 'workbench.action.chat.triggerSetupForceSignIn',
-					title: localize2('forceSignIn', "Sign in to use AI features")
-				});
-			}
-
-			override async run(accessor: ServicesAccessor): Promise<unknown> {
-				const commandService = accessor.get(ICommandService);
-				const telemetryService = accessor.get(ITelemetryService);
-
-				telemetryService.publicLog2<WorkbenchActionExecutedEvent, WorkbenchActionExecutedClassification>('workbenchActionExecuted', { id: CHAT_SETUP_ACTION_ID, from: 'api' });
-
-				return commandService.executeCommand(CHAT_SETUP_ACTION_ID, undefined, { forceSignInDialog: true });
-			}
-		}
-
-		class ChatSetupTriggerAnonymousWithoutDialogAction extends Action2 {
-
-			constructor() {
-				super({
-					id: 'workbench.action.chat.triggerSetupAnonymousWithoutDialog',
-					title: ChatSetupTriggerAction.CHAT_SETUP_ACTION_LABEL
-				});
-			}
-
-			override async run(accessor: ServicesAccessor): Promise<unknown> {
-				const commandService = accessor.get(ICommandService);
-				const telemetryService = accessor.get(ITelemetryService);
-
-				telemetryService.publicLog2<WorkbenchActionExecutedEvent, WorkbenchActionExecutedClassification>('workbenchActionExecuted', { id: CHAT_SETUP_ACTION_ID, from: 'api' });
-
-				return commandService.executeCommand(CHAT_SETUP_ACTION_ID, undefined, { forceAnonymous: ChatSetupAnonymous.EnabledWithoutDialog });
-			}
-		}
-
-		class ChatSetupFromAccountsAction extends Action2 {
-
-			constructor() {
-				super({
-					id: 'workbench.action.chat.triggerSetupFromAccounts',
-					title: localize2('triggerChatSetupFromAccounts', "Sign in to use AI features..."),
-					menu: {
-						id: MenuId.AccountsContext,
-						group: '2_copilot',
-						when: ContextKeyExpr.and(
-							ChatContextKeys.Setup.hidden.negate(),
-							ChatContextKeys.Setup.installed.negate(),
-							ChatContextKeys.Entitlement.signedOut
-						)
-					}
-				});
-			}
-
-			override async run(accessor: ServicesAccessor): Promise<void> {
-				const commandService = accessor.get(ICommandService);
-				const telemetryService = accessor.get(ITelemetryService);
-
-				telemetryService.publicLog2<WorkbenchActionExecutedEvent, WorkbenchActionExecutedClassification>('workbenchActionExecuted', { id: CHAT_SETUP_ACTION_ID, from: 'accounts' });
-
-				return commandService.executeCommand(CHAT_SETUP_ACTION_ID);
-			}
-		}
-
-		const windowFocusListener = this._register(new MutableDisposable());
-		class UpgradePlanAction extends Action2 {
-			constructor() {
-				super({
-					id: 'workbench.action.chat.upgradePlan',
-					title: localize2('managePlan', "Upgrade to GitHub Copilot Pro"),
-					category: localize2('chat.category', 'Chat'),
-					f1: true,
-					precondition: ContextKeyExpr.and(
-						ChatContextKeys.Setup.hidden.negate(),
-						ContextKeyExpr.or(
-							ChatContextKeys.Entitlement.canSignUp,
-							ChatContextKeys.Entitlement.planFree
-						)
-					),
-					menu: {
-						id: MenuId.ChatTitleBarMenu,
-						group: 'a_first',
-						order: 1,
-						when: ContextKeyExpr.and(
-							ChatContextKeys.Entitlement.planFree,
-							ContextKeyExpr.or(
-								ChatContextKeys.chatQuotaExceeded,
-								ChatContextKeys.completionsQuotaExceeded
-							)
-						)
-					}
-				});
-			}
-
-			override async run(accessor: ServicesAccessor): Promise<void> {
-				const openerService = accessor.get(IOpenerService);
-				const hostService = accessor.get(IHostService);
-				const commandService = accessor.get(ICommandService);
-
-				openerService.open(URI.parse(defaultChat.upgradePlanUrl));
-
-				const entitlement = context.state.entitlement;
-				if (!isProUser(entitlement)) {
-					// If the user is not yet Pro, we listen to window focus to refresh the token
-					// when the user has come back to the window assuming the user signed up.
-					windowFocusListener.value = hostService.onDidChangeFocus(focus => this.onWindowFocus(focus, commandService));
-				}
-			}
-
-			private async onWindowFocus(focus: boolean, commandService: ICommandService): Promise<void> {
-				if (focus) {
-					windowFocusListener.clear();
-
-					const entitlements = await requests.forceResolveEntitlement(undefined);
-					if (entitlements?.entitlement && isProUser(entitlements?.entitlement)) {
-						refreshTokens(commandService);
-					}
-				}
-			}
-		}
-
-		class EnableOveragesAction extends Action2 {
-			constructor() {
-				super({
-					id: 'workbench.action.chat.manageOverages',
-					title: localize2('manageOverages', "Manage GitHub Copilot Overages"),
-					category: localize2('chat.category', 'Chat'),
-					f1: true,
-					precondition: ContextKeyExpr.and(
-						ChatContextKeys.Setup.hidden.negate(),
-						ContextKeyExpr.or(
-							ChatContextKeys.Entitlement.planPro,
-							ChatContextKeys.Entitlement.planProPlus,
-						)
-					),
-					menu: {
-						id: MenuId.ChatTitleBarMenu,
-						group: 'a_first',
-						order: 1,
-						when: ContextKeyExpr.and(
-							ContextKeyExpr.or(
-								ChatContextKeys.Entitlement.planPro,
-								ChatContextKeys.Entitlement.planProPlus,
-							),
-							ContextKeyExpr.or(
-								ChatContextKeys.chatQuotaExceeded,
-								ChatContextKeys.completionsQuotaExceeded
-							)
-						)
-					}
-				});
-			}
-
-			override async run(accessor: ServicesAccessor): Promise<void> {
-				const openerService = accessor.get(IOpenerService);
-				openerService.open(URI.parse(defaultChat.manageOveragesUrl));
-			}
-		}
-
-		registerAction2(ChatSetupTriggerAction);
-		registerAction2(ChatSetupTriggerForceSignInDialogAction);
-		registerAction2(ChatSetupFromAccountsAction);
-		registerAction2(ChatSetupTriggerAnonymousWithoutDialogAction);
-		registerAction2(ChatSetupTriggerSupportAnonymousAction);
-		registerAction2(UpgradePlanAction);
-		registerAction2(EnableOveragesAction);
-
 		//#endregion
 
 		//#region Editor Context Menu
 
 		function registerGenerateCodeCommand(coreCommand: 'chat.internal.explain' | 'chat.internal.fix' | 'chat.internal.review' | 'chat.internal.generateDocs' | 'chat.internal.generateTests', actualCommand: string): void {
-
-			CommandsRegistry.registerCommand(coreCommand, async accessor => {
-				const commandService = accessor.get(ICommandService);
-				const codeEditorService = accessor.get(ICodeEditorService);
-				const markerService = accessor.get(IMarkerService);
-
-				switch (coreCommand) {
-					case 'chat.internal.explain':
-					case 'chat.internal.fix': {
-						const textEditor = codeEditorService.getActiveCodeEditor();
-						const uri = textEditor?.getModel()?.uri;
-						const range = textEditor?.getSelection();
-						if (!uri || !range) {
-							return;
-						}
-
-						const markers = AICodeActionsHelper.warningOrErrorMarkersAtRange(markerService, uri, range);
-
-						const actualCommand = coreCommand === 'chat.internal.explain'
-							? AICodeActionsHelper.explainMarkers(markers)
-							: AICodeActionsHelper.fixMarkers(markers, range);
-
-						await commandService.executeCommand(actualCommand.id, ...(actualCommand.arguments ?? []));
-
-						break;
-					}
-					case 'chat.internal.review':
-					case 'chat.internal.generateDocs':
-					case 'chat.internal.generateTests': {
-						const result = await commandService.executeCommand(CHAT_SETUP_SUPPORT_ANONYMOUS_ACTION_ID);
-						if (result) {
-							await commandService.executeCommand(actualCommand);
-						}
-					}
-				}
-			});
 		}
 		registerGenerateCodeCommand('chat.internal.explain', 'github.copilot.chat.explain');
 		registerGenerateCodeCommand('chat.internal.fix', 'github.copilot.chat.fix');
 		registerGenerateCodeCommand('chat.internal.review', 'github.copilot.chat.review');
 		registerGenerateCodeCommand('chat.internal.generateDocs', 'github.copilot.chat.generateDocs');
 		registerGenerateCodeCommand('chat.internal.generateTests', 'github.copilot.chat.generateTests');
-
-		const internalGenerateCodeContext = ContextKeyExpr.and(
-			ChatContextKeys.Setup.hidden.negate(),
-			ChatContextKeys.Setup.disabled.negate(),
-			ChatContextKeys.Setup.installed.negate(),
-		);
-
-		MenuRegistry.appendMenuItem(MenuId.EditorContext, {
-			command: {
-				id: 'chat.internal.explain',
-				title: localize('explain', "Explain"),
-			},
-			group: '1_chat',
-			order: 4,
-			when: internalGenerateCodeContext
-		});
-
-		MenuRegistry.appendMenuItem(MenuId.ChatTextEditorMenu, {
-			command: {
-				id: 'chat.internal.fix',
-				title: localize('fix', "Fix"),
-			},
-			group: '1_action',
-			order: 1,
-			when: ContextKeyExpr.and(
-				internalGenerateCodeContext,
-				EditorContextKeys.readOnly.negate()
-			)
-		});
-
-		MenuRegistry.appendMenuItem(MenuId.ChatTextEditorMenu, {
-			command: {
-				id: 'chat.internal.review',
-				title: localize('review', "Code Review"),
-			},
-			group: '1_action',
-			order: 2,
-			when: internalGenerateCodeContext
-		});
-
-		MenuRegistry.appendMenuItem(MenuId.ChatTextEditorMenu, {
-			command: {
-				id: 'chat.internal.generateDocs',
-				title: localize('generateDocs', "Generate Docs"),
-			},
-			group: '2_generate',
-			order: 1,
-			when: ContextKeyExpr.and(
-				internalGenerateCodeContext,
-				EditorContextKeys.readOnly.negate()
-			)
-		});
-
-		MenuRegistry.appendMenuItem(MenuId.ChatTextEditorMenu, {
-			command: {
-				id: 'chat.internal.generateTests',
-				title: localize('generateTests', "Generate Tests"),
-			},
-			group: '2_generate',
-			order: 2,
-			when: ContextKeyExpr.and(
-				internalGenerateCodeContext,
-				EditorContextKeys.readOnly.negate()
-			)
-		});
 	}
 
 	private registerUrlLinkHandler(): void {
@@ -715,36 +350,6 @@ export class ChatTeardownContribution extends Disposable implements IWorkbenchCo
 	}
 
 	private registerActions(): void {
-
-		class ChatSetupHideAction extends Action2 {
-
-			static readonly ID = 'workbench.action.chat.hideSetup';
-			static readonly TITLE = localize2('hideChatSetup', "Learn How to Hide AI Features");
-
-			constructor() {
-				super({
-					id: ChatSetupHideAction.ID,
-					title: ChatSetupHideAction.TITLE,
-					f1: true,
-					category: CHAT_CATEGORY,
-					precondition: ChatContextKeys.Setup.hidden.negate(),
-					menu: {
-						id: MenuId.ChatTitleBarMenu,
-						group: 'z_hide',
-						order: 1,
-						when: ChatContextKeys.Setup.installed.negate()
-					}
-				});
-			}
-
-			override async run(accessor: ServicesAccessor): Promise<void> {
-				const preferencesService = accessor.get(IPreferencesService);
-
-				preferencesService.openSettings({ jsonEditor: false, query: `@id:${ChatTeardownContribution.CHAT_DISABLED_CONFIGURATION_KEY}` });
-			}
-		}
-
-		registerAction2(ChatSetupHideAction);
 	}
 }
 
