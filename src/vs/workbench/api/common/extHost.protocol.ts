@@ -3178,7 +3178,7 @@ export interface ExtHostDataChannelsShape {
 export interface QuantlabIdentityDto {
 	readonly epoch: number;
 	readonly signedIn: boolean;
-	readonly user?: { readonly id: string; readonly email: string; readonly name?: string; readonly tier?: string };
+	readonly user?: { readonly id: string; readonly email: string; readonly name?: string; readonly tier: string };
 }
 
 /**

@@ -33,21 +33,21 @@ suite('QuantlabHostIdentity - parseIdentity', () => {
 
 	test('accepts the signed-in shape with a name', () => {
 		assert.deepStrictEqual(
-			parseIdentity({ epoch: 3, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada' } }),
-			{ epoch: 3, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada' } }
+			parseIdentity({ epoch: 3, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada', tier: 'pro' } }),
+			{ epoch: 3, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada', tier: 'pro' } }
 		);
 	});
 
 	test('accepts the signed-in shape whose name is undefined or absent', () => {
-		const expected = { epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: undefined } };
-		assert.deepStrictEqual(parseIdentity({ epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: undefined } }), expected);
-		assert.deepStrictEqual(parseIdentity({ epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com' } }), expected);
+		const expected = { epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: undefined, tier: 'pro' } };
+		assert.deepStrictEqual(parseIdentity({ epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: undefined, tier: 'pro' } }), expected);
+		assert.deepStrictEqual(parseIdentity({ epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com', tier: 'pro' } }), expected);
 	});
 
 	// Security-relevant: a stale or forged epoch must not pass, or main's identity-changed check could be fed a value it never issued.
 	// Planted negative control: make parseEpoch accept any number (drop `Number.isInteger(value) || value < 1`) and the 0, -1 and 1.5 cases stop throwing.
 	test('rejects an identity whose epoch is missing or not an integer >= 1, in both shapes', () => {
-		const user = { id: 'u', email: 'e' };
+		const user = { id: 'u', email: 'e', tier: 'pro' };
 		for (const epoch of [undefined, null, 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '1', [1]]) {
 			assert.throws(() => parseIdentity({ epoch, signedIn: false }), /epoch is not an integer >= 1/, `signed out, epoch: ${String(epoch)}`);
 			assert.throws(() => parseIdentity({ epoch, signedIn: true, user }), /epoch is not an integer >= 1/, `signed in, epoch: ${String(epoch)}`);
@@ -80,12 +80,21 @@ suite('QuantlabHostIdentity - parseIdentity', () => {
 	});
 
 	test('rejects a user with a missing or mistyped field', () => {
-		assert.throws(() => parseIdentity({ signedIn: true, user: { email: 'e' } }), /user\.id/);
-		assert.throws(() => parseIdentity({ signedIn: true, user: { id: 1, email: 'e' } }), /user\.id/);
-		assert.throws(() => parseIdentity({ signedIn: true, user: { id: 'u' } }), /user\.email/);
-		assert.throws(() => parseIdentity({ signedIn: true, user: { id: 'u', email: 5 } }), /user\.email/);
-		assert.throws(() => parseIdentity({ signedIn: true, user: { id: 'u', email: 'e', name: null } }), /user\.name/);
-		assert.throws(() => parseIdentity({ signedIn: true, user: { id: 'u', email: 'e', name: 5 } }), /user\.name/);
+		assert.throws(() => parseIdentity({ signedIn: true, user: { email: 'e', tier: 'pro' } }), /user\.id/);
+		assert.throws(() => parseIdentity({ signedIn: true, user: { id: 1, email: 'e', tier: 'pro' } }), /user\.id/);
+		assert.throws(() => parseIdentity({ signedIn: true, user: { id: 'u', tier: 'pro' } }), /user\.email/);
+		assert.throws(() => parseIdentity({ signedIn: true, user: { id: 'u', email: 5, tier: 'pro' } }), /user\.email/);
+		assert.throws(() => parseIdentity({ signedIn: true, user: { id: 'u', email: 'e', name: null, tier: 'pro' } }), /user\.name/);
+		assert.throws(() => parseIdentity({ signedIn: true, user: { id: 'u', email: 'e', name: 5, tier: 'pro' } }), /user\.name/);
+	});
+
+	// AUTH-TIER (PLAN-FINAL §3.2 item 1): Go's tier is required; an absent, empty or non-string tier throws, never a default.
+	// Planted negative control: drop the user.tier check in parseIdentity and every case below parses.
+	test('rejects a user whose tier is absent, empty or not a string', () => {
+		assert.throws(() => parseIdentity({ epoch: 1, signedIn: true, user: { id: 'u', email: 'e' } }), /user\.tier/, 'tier absent');
+		for (const tier of [undefined, '', null, 5]) {
+			assert.throws(() => parseIdentity({ epoch: 1, signedIn: true, user: { id: 'u', email: 'e', tier } }), /user\.tier/, `tier: ${String(tier)}`);
+		}
 	});
 
 	test('rejects a credential smuggled in as an extra field, and never echoes its value', () => {

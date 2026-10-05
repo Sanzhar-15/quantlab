@@ -15,7 +15,8 @@ declare module 'vscode' {
 		readonly email: string;
 		/** Optional in the protocol: absent when the account has none. Nothing fills it in. */
 		readonly name?: string;
-		readonly tier?: string;
+		/** Required: Go's tier (PLAN-FINAL §3.2 item 1). Not displayed until E2. */
+		readonly tier: string;
 	}
 
 	export interface QuantlabHostIdentity {

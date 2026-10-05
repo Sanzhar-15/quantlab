@@ -81,25 +81,25 @@ suite('MainThreadQuantlabHost', () => {
 		const customer = createCustomer();
 
 		assert.deepStrictEqual(await customer.$getIdentity(), { epoch: 1, signedIn: false });
-		service.identity = { epoch: 7, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada' } };
-		assert.deepStrictEqual(await customer.$getIdentity(), { epoch: 7, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada' } });
+		service.identity = { epoch: 7, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada', tier: 'pro' } };
+		assert.deepStrictEqual(await customer.$getIdentity(), { epoch: 7, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada', tier: 'pro' } });
 	});
 
 	test('$getIdentity sends a signed-in user without a name with no name field', async () => {
 		const customer = createCustomer();
-		service.identity = { epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: undefined } };
+		service.identity = { epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: undefined, tier: 'pro' } };
 
-		assert.deepStrictEqual(await customer.$getIdentity(), { epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com' } });
+		assert.deepStrictEqual(await customer.$getIdentity(), { epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com', tier: 'pro' } });
 	});
 
 	test('an identity tick pushes the freshly pulled identity to the extension host', async () => {
 		createCustomer();
-		service.identity = { epoch: 3, signedIn: true, user: { id: 'u2', email: 'b@example.com', name: 'Bo' } };
+		service.identity = { epoch: 3, signedIn: true, user: { id: 'u2', email: 'b@example.com', name: 'Bo', tier: 'pro' } };
 
 		service.identityTick.fire();
 		await flush();
 
-		assert.deepStrictEqual(proxy.identities, [{ epoch: 3, signedIn: true, user: { id: 'u2', email: 'b@example.com', name: 'Bo' } }]);
+		assert.deepStrictEqual(proxy.identities, [{ epoch: 3, signedIn: true, user: { id: 'u2', email: 'b@example.com', name: 'Bo', tier: 'pro' } }]);
 	});
 
 	test('a tick whose pull fails is logged and pushes nothing', async () => {

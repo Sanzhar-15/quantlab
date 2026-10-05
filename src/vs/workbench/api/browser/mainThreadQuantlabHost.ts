@@ -28,8 +28,8 @@ export function toQuantlabIdentityDto(identity: QuantlabIdentity): QuantlabIdent
 	if (!identity.signedIn) {
 		return { epoch: identity.epoch, signedIn: false };
 	}
-	const { id, email, name } = identity.user;
-	return { epoch: identity.epoch, signedIn: true, user: name === undefined ? { id, email } : { id, email, name } };
+	const { id, email, name, tier } = identity.user;
+	return { epoch: identity.epoch, signedIn: true, user: name === undefined ? { id, email, tier } : { id, email, name, tier } };
 }
 
 /** A host refusal as the protocol's answer envelope; `status` only when the host gave one. */
