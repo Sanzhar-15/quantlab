@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { app, protocol, session, Session, systemPreferences, WebFrameMain } from 'electron';
+import { app, BaseWindow, ipcMain, protocol, safeStorage, session, Session, shell, systemPreferences, WebContents, WebContentsView, WebFrameMain } from 'electron';
 import { addUNCHostToAllowlist, disableUNCAccessRestrictions } from '../../base/node/unc.js';
 import { validatedIpcMain } from '../../base/parts/ipc/electron-main/ipcMain.js';
 import { hostname, release } from 'os';
@@ -13,7 +13,7 @@ import { Event } from '../../base/common/event.js';
 import { parse } from '../../base/common/jsonc.js';
 import { getPathLabel } from '../../base/common/labels.js';
 import { Disposable, DisposableStore } from '../../base/common/lifecycle.js';
-import { Schemas, VSCODE_AUTHORITY } from '../../base/common/network.js';
+import { FileAccess, Schemas, VSCODE_AUTHORITY } from '../../base/common/network.js';
 import { join, posix } from '../../base/common/path.js';
 import { IProcessEnvironment, isLinux, isLinuxSnap, isMacintosh, isWindows, OS } from '../../base/common/platform.js';
 import { assertType } from '../../base/common/types.js';
@@ -124,8 +124,9 @@ import { NativeMcpDiscoveryHelperService } from '../../platform/mcp/node/nativeM
 import { IWebContentExtractorService } from '../../platform/webContentExtractor/common/webContentExtractor.js';
 import { NativeWebContentExtractorService } from '../../platform/webContentExtractor/electron-main/webContentExtractorService.js';
 import ErrorTelemetry from '../../platform/telemetry/electron-main/errorTelemetry.js';
-import { startTerminalHost } from './ql-client/index.js';
-void startTerminalHost;
+// QuantLab host (U3): the terminal host (generated client, see ql-client/MANIFEST.json)
+import { autoUpdater } from 'electron-updater';
+import { bakedBuildValues, createUpdater, startTerminalHost, type Ports, type TerminalHost } from './ql-client/index.js';
 
 /**
  * The main VS Code application. There will only ever be one instance,
@@ -141,6 +142,9 @@ export class CodeApplication extends Disposable {
 	private windowsMainService: IWindowsMainService | undefined;
 	private auxiliaryWindowsMainService: IAuxiliaryWindowsMainService | undefined;
 	private nativeHostMainService: INativeHostMainService | undefined;
+
+	// QuantLab host (U3): the terminal host that replaces the first window (started in `startup`, used by U5/U6)
+	protected qlTerminalHost: TerminalHost | undefined; // `protected`: not read until U5/U6, `noUnusedLocals` flags a private one
 
 	constructor(
 		private readonly mainProcessNodeIpcServer: NodeIPCServer,
@@ -417,6 +421,13 @@ export class CodeApplication extends Disposable {
 
 			// Block any in-page navigation
 			contents.on('will-navigate', event => {
+
+				// QuantLab host (U3): the terminal view's navigation policy is the client's own
+				// guards (installed by `createTerminalView`), decided at event time
+				if (this.isQlTerminalContents(contents)) {
+					return;
+				}
+
 				this.logService.error('webContents#will-navigate: Prevented webcontent navigation');
 
 				event.preventDefault();
@@ -424,6 +435,9 @@ export class CodeApplication extends Disposable {
 
 			// All Windows: only allow about:blank auxiliary windows to open
 			// For all other URLs, delegate to the OS.
+			// QuantLab host (U3): this runs when the contents are created; `createTerminalView`
+			// replaces the handler right after constructing its view, so the terminal view's
+			// window.open policy is the client's, not this one.
 			contents.setWindowOpenHandler(details => {
 
 				// about:blank windows can open as window witho our default options
@@ -603,7 +617,10 @@ export class CodeApplication extends Disposable {
 		this.lifecycleMainService.phase = LifecycleMainPhase.Ready;
 
 		// Open Windows
-		await appInstantiationService.invokeFunction(accessor => this.openFirstWindow(accessor, initialProtocolUrls));
+		// QuantLab host (U3): start the terminal host instead of the first window (`openFirstWindow` stays for U5's lazy gate)
+		if (!await appInstantiationService.invokeFunction(accessor => this.startQlTerminalHost(accessor, initialProtocolUrls))) {
+			return;
+		}
 
 		// Signal phase: after window open
 		this.lifecycleMainService.phase = LifecycleMainPhase.AfterWindowOpen;
@@ -1249,7 +1266,93 @@ export class CodeApplication extends Disposable {
 		mainProcessElectronServer.registerChannel(ipcUtilityProcessWorkerChannelName, utilityProcessWorkerChannel);
 	}
 
-	private async openFirstWindow(accessor: ServicesAccessor, initialProtocolUrls: IInitialProtocolUrls | undefined): Promise<ICodeWindow[]> {
+	// QuantLab host (U3): where the terminal view's files are staged by the client emit (one location, dev and packaged)
+	private qlTerminalPaths(): { readonly preloadPath: string; readonly rendererDir: string } {
+		return {
+			preloadPath: FileAccess.asFileUri('vs/code/electron-main/ql-client/terminal/preload.cjs').fsPath,
+			rendererDir: FileAccess.asFileUri('vs/code/electron-main/ql-client/terminal/renderer').fsPath
+		};
+	}
+
+	// QuantLab host (U3): whether these contents run the terminal's navigation policy: they are a view the started
+	// host registered with the role `terminal` (the terminal view, and U6's overlay view: same policy by rule OV-3).
+	// Decided at event time from the host's own registry, never from a preference the contents report.
+	private isQlTerminalContents(contents: WebContents): boolean {
+		const host = this.qlTerminalHost;
+		if (host === undefined) {
+			return false;
+		}
+
+		return host.viewRecords().some(record => record.role === 'terminal' && host.view(record.name)?.webContents === contents);
+	}
+
+	// QuantLab host (U3): starts the terminal host in place of `openFirstWindow`. Returns false when the start
+	// failed and the app is exiting (the client start has already logged `exit 1` and unwound).
+	private async startQlTerminalHost(accessor: ServicesAccessor, initialProtocolUrls: IInitialProtocolUrls | undefined): Promise<boolean> {
+
+		// What `openFirstWindow` assigned and later code reads
+		this.windowsMainService = accessor.get(IWindowsMainService);
+		this.auxiliaryWindowsMainService = accessor.get(IAuxiliaryWindowsMainService);
+
+		// Throws when the build holds no baked values: not caught, `main.ts` quits with the error
+		const { backendOrigin, version } = bakedBuildValues();
+		const { preloadPath, rendererDir } = this.qlTerminalPaths();
+
+		const ports: Ports = {
+			electron: { app, BaseWindow, WebContentsView, session, protocol, ipcMain, shell, safeStorage },
+			validatedIpcMain,
+			platform: process.platform,
+			backendOrigin,
+			version,
+			devTools: !this.environmentMainService.isBuilt,
+			preloadPath,
+			rendererDir,
+			openQuantlab: () => {
+				// There is no workbench view until U5 adopts the workbench; no window is opened as a substitute
+				const error = new Error('openQuantlab: the workbench view does not exist in this build (HOST U5)');
+				this.logService.error(error);
+
+				return Promise.reject(error);
+			}
+		};
+
+		let terminalHost: TerminalHost;
+		try {
+			terminalHost = await startTerminalHost(ports);
+		} catch (error) {
+			this.logService.error(error);
+			app.exit(1);
+
+			return false;
+		}
+		this.qlTerminalHost = terminalHost;
+
+		// QuantLab updater (PACK, folds/HOST/PACK-UPDATER-HUNK.md): the ONE updater, electron-updater injected into the client
+		// module; install on Electron's quit only (autoInstallOnAppQuit), no quitAndInstall and no restart UI in v1
+		autoUpdater.autoDownload = true;
+		autoUpdater.autoInstallOnAppQuit = true;
+		const updater = createUpdater(terminalHost.host, { updater: autoUpdater });
+		updater.checkForUpdates().catch(err => this.logService.error('updater: check failed', err));
+
+		// Launch protocol urls and openables were opened by the first window; without a workbench they are not opened
+		const notOpened = (initialProtocolUrls?.openables.length ?? 0) + (initialProtocolUrls?.urls.length ?? 0);
+		if (notOpened > 0) {
+			this.logService.warn(`QuantLab host: ${notOpened} protocol url(s) and openable(s) received at launch were not opened because the workbench is not started`);
+		}
+
+		// Quit policy: the terminal window is the only window and is not a CodeWindow, so the lifecycle
+		// service's own `window-all-closed` listener (registered when the phase became `Ready`, thus before
+		// these) quits on macOS only when a quit was already requested. The host's policy is the light host's:
+		// closing the window quits, on every platform. `app.quit()` leads to `before-quit` and `will-quit`,
+		// where the lifecycle service fires its shutdown events (see `LifecycleMainService#registerListeners`).
+		app.on('window-all-closed', () => terminalHost.windowAllClosed());
+		app.on('quit', (_event, exitCode) => terminalHost.noteQuit(exitCode));
+
+		return true;
+	}
+
+	// QuantLab host (U3): not called until U5's lazy gate; `protected` so `noUnusedLocals` does not flag it meanwhile
+	protected async openFirstWindow(accessor: ServicesAccessor, initialProtocolUrls: IInitialProtocolUrls | undefined): Promise<ICodeWindow[]> {
 		const windowsMainService = this.windowsMainService = accessor.get(IWindowsMainService);
 		this.auxiliaryWindowsMainService = accessor.get(IAuxiliaryWindowsMainService);
 

@@ -1,7 +1,7 @@
-# Wave J-b (R17, 2026-06-20) -- preparatory packaging ignore list for a future standalone Open VSX VSIX.
-# This file is used ONLY by `vsce package` / `ovsx publish` when the extension is built as a standalone
-# VSIX; the VS Code fork's own build pipeline (build/lib/extensions.ts) ignores it. See PUBLISHING.md for
-# the blockers that still gate an actual publish (native engine binary, "private" flag, PNG icon).
+# Wave J-b (R17, 2026-06-20) -- packaging ignore list. Read by `vsce package` / `ovsx publish` for a standalone
+# VSIX AND by the fork's product build: build/lib/extensions.ts fromLocalNormal packages the files listed by
+# vsce.listFiles, which applies this file (F-DESK-PACK F-PACK-5/6). See PUBLISHING.md for the blockers that
+# still gate a standalone publish (native engine binary, "private" flag, PNG icon).
 
 # TypeScript sources + tests (the VSIX ships compiled out/ + dist/ only)
 src/**
@@ -38,5 +38,7 @@ esbuild-webview.mjs
 .demo-*
 *.out
 
-# This doc is for maintainers, not extension users
+# Maintainer docs, not for extension users
 PUBLISHING.md
+PLAN.md
+docs/**
