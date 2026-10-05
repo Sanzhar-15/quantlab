@@ -3173,6 +3173,33 @@ export interface ExtHostDataChannelsShape {
 	$onDidReceiveData(channelId: string, data: unknown): void;
 }
 
+// The QuantLab host bridge (rule 2): identity and authorised requests for the built-in `quantlab` extension ONLY. The
+// ext-host side hands its API object to that one extension (extHostQuantlabHost.ts); the token never crosses this protocol.
+export interface QuantlabIdentityDto {
+	readonly epoch: number;
+	readonly signedIn: boolean;
+	readonly user?: { readonly id: string; readonly email: string; readonly name: string; readonly tier?: string };
+}
+
+export interface QuantlabSubscriptionStateDto {
+	readonly kind: 'open' | 'reconnecting' | 'closed' | 'error';
+	readonly message?: string;
+}
+
+export interface MainThreadQuantlabHostShape extends IDisposable {
+	$getIdentity(): Promise<QuantlabIdentityDto>;
+	/** Rejects `identity-changed` when `epoch` is not the current one at answer time, `no-route`, `not-signed-in`. */
+	$request(op: string, input: unknown, epoch: number, token: CancellationToken): Promise<unknown>;
+	$subscribe(handle: number, topic: string, params: unknown, epoch: number): Promise<void>;
+	$unsubscribe(handle: number): void;
+}
+
+export interface ExtHostQuantlabHostShape {
+	$onDidChangeIdentity(identity: QuantlabIdentityDto): void;
+	$onData(handle: number, data: unknown, epoch: number): void;
+	$onState(handle: number, state: QuantlabSubscriptionStateDto, epoch: number): void;
+}
+
 export interface ExtHostLocalizationShape {
 	getMessage(extensionId: string, details: IStringDetails): string;
 	getBundle(extensionId: string): { [key: string]: string } | undefined;
@@ -3404,6 +3431,7 @@ export const MainContext = {
 	MainThreadChatSessions: createProxyIdentifier<MainThreadChatSessionsShape>('MainThreadChatSessions'),
 	MainThreadChatOutputRenderer: createProxyIdentifier<MainThreadChatOutputRendererShape>('MainThreadChatOutputRenderer'),
 	MainThreadChatContext: createProxyIdentifier<MainThreadChatContextShape>('MainThreadChatContext'),
+	MainThreadQuantlabHost: createProxyIdentifier<MainThreadQuantlabHostShape>('MainThreadQuantlabHost'),
 };
 
 export const ExtHostContext = {
@@ -3480,4 +3508,5 @@ export const ExtHostContext = {
 	ExtHostMcp: createProxyIdentifier<ExtHostMcpShape>('ExtHostMcp'),
 	ExtHostDataChannels: createProxyIdentifier<ExtHostDataChannelsShape>('ExtHostDataChannels'),
 	ExtHostChatSessions: createProxyIdentifier<ExtHostChatSessionsShape>('ExtHostChatSessions'),
+	ExtHostQuantlabHost: createProxyIdentifier<ExtHostQuantlabHostShape>('ExtHostQuantlabHost'),
 };
