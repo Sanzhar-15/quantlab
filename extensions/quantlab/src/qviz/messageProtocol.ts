@@ -3,6 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+// allow-any-unicode-comment-file
+/* eslint-disable local/code-no-unexternalized-strings, local/code-no-in-operator, local/code-no-dangerous-type-assertions -- inherited: 11 sites older than this file's last edit, which changed one comment */
+
 /**
  * Wire protocol between the qviz custom-editor providers (extension host)
  * and the qviz webviews (data view + spec view).
@@ -453,6 +456,7 @@ export interface RequestInspectorDataMessage extends MessageEnvelope {
 	readonly type: 'requestInspectorData';
 	/** Row offset into the (post-filter) dataset. */
 	readonly offset: number;
+	// allow-any-unicode-next-line
 	/** Window size (≤ PREVIEW_MAX on the daemon side; we don't import the
 	 *  constant here to keep this module dep-light). */
 	readonly n: number;
@@ -483,7 +487,7 @@ export interface RecheckDatasetMessage extends MessageEnvelope {
 
 /** Visualise v2: user clicked the "Promote to Chart" button. The
  *  provider generates a minimal .py scaffold under
- *  .quantlab/visualise-promoted/ and opens it in the Chart custom
+ *  .deltaplus/visualise-promoted/ and opens it in the Chart custom
  *  editor. Bare envelope; the document context comes from the panel
  *  that posted the message.
  */

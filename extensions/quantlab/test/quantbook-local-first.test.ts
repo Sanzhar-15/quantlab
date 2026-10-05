@@ -15,8 +15,6 @@
 import * as assert from 'assert';
 
 import {
-	BLOCKED_CATEGORY_LABELS,
-	CONSENT_CATEGORY_LABELS,
 	LOCAL_FIRST_HEADLINE,
 	LOCAL_GUARANTEE,
 	buildLocalFirstDetail,
@@ -32,12 +30,6 @@ suite('Quantbook local-first messaging (R16) -- buildLocalFirstDetail', () => {
 		assert.ok(detail.includes('does not upload your workbook'), 'states the workbook is not uploaded');
 	});
 
-	test('HONESTY: names the AI -> Anthropic egress (opt-in, consent, best-effort redaction)', () => {
-		assert.ok(detail.includes('Anthropic'), 'must name Anthropic as the AI destination');
-		assert.ok(detail.includes('AI assistance is off by default'), 'must say AI is opt-in');
-		assert.ok(detail.includes('best-effort'), 'must frame redaction as best-effort, not an enforced guarantee');
-	});
-
 	test('HONESTY: names the Delta Plus cloud egress incl. server-tool file upload', () => {
 		assert.ok(detail.includes('Quantlab account'), 'must mention cloud sign-in');
 		assert.ok(detail.includes('Delta Plus'), 'must name the Delta Plus backend');
@@ -45,22 +37,9 @@ suite('Quantbook local-first messaging (R16) -- buildLocalFirstDetail', () => {
 		assert.ok(detail.includes('upload'), 'must disclose that a server-side tool can upload a data file');
 	});
 
-	test('HONESTY: names the broker / trading egress', () => {
-		assert.ok(detail.includes('Alpaca'), 'must name the broker integration example');
-		assert.ok(detail.toLowerCase().includes('order'), 'must disclose that order data goes to the broker');
-	});
-
-	test('lists every consent category that the AI path MAY send', () => {
-		for (const label of CONSENT_CATEGORY_LABELS) {
-			assert.ok(detail.includes(label), `consent category "${label}" must appear in the statement`);
-		}
-	});
-
-	test('lists every blocked category, framed as NOT intentionally sent (no hard guarantee)', () => {
-		assert.ok(detail.includes('does not intentionally send'), 'must avoid a hard "never sends" guarantee');
-		for (const label of BLOCKED_CATEGORY_LABELS) {
-			assert.ok(detail.includes(label), `blocked category "${label}" must appear`);
-		}
+	test('names no removed path: the AI panel and the broker integrations are not in the product', () => {
+		assert.ok(!/Anthropic|AI assistance|Alpaca|broker/i.test(detail), detail);
+		assert.strictEqual(detail.split('\n').filter(line => line.startsWith('* ')).length, 1, 'one network bullet: the cloud services');
 	});
 
 	test('HONESTY guard: does NOT over-claim an absolute or an unenforced guarantee', () => {
@@ -71,31 +50,6 @@ suite('Quantbook local-first messaging (R16) -- buildLocalFirstDetail', () => {
 		assert.ok(!detail.toLowerCase().includes('nothing ever leaves'), 'no absolute "nothing ever leaves"');
 		assert.ok(!detail.toLowerCase().includes('only things that use the network'), 'no exhaustive-list absolute');
 		assert.ok(!detail.includes('never sends'), 'no unenforced hard "never sends" guarantee');
-	});
-
-	test('joins category lists readably (Oxford "and" for sent, "or" for not-sent)', () => {
-		assert.ok(detail.includes('and backtest performance metrics to Anthropic'), 'consent list joined with "and"');
-		assert.ok(detail.includes(', or API keys'), 'blocked list joined with "or"');
-	});
-});
-
-suite('Quantbook local-first messaging (R16) -- category drift guards', () => {
-	test('consent labels are exactly the four ConsentCategory members (pinned)', () => {
-		assert.deepStrictEqual([...CONSENT_CATEGORY_LABELS], [
-			'your formula and strategy code',
-			'error messages',
-			'small samples of your data',
-			'backtest performance metrics',
-		]);
-	});
-
-	test('blocked labels are exactly the four BlockedCategory members (pinned)', () => {
-		assert.deepStrictEqual([...BLOCKED_CATEGORY_LABELS], [
-			'broker credentials',
-			'trading history',
-			'personal data',
-			'API keys',
-		]);
 	});
 });
 
