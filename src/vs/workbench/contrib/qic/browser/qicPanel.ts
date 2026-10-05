@@ -52,7 +52,7 @@ function createConnectionIcon(): SVGSVGElement {
 }
 
 
-type QicConnectionType = 'deltaplus' | 'byok' | 'localai';
+type QicConnectionType = 'deltaplus';
 type QicReasoningLevel = 'medium' | 'high' | 'veryhigh';
 
 interface IQicViewPaneState {
@@ -284,8 +284,6 @@ export class QicChatViewPane extends ViewPane {
 		}
 		const items: { id: QicConnectionType; label: string }[] = [
 			{ id: 'deltaplus', label: 'Delta Plus Servers' },
-			{ id: 'byok', label: 'BYOK' },
-			{ id: 'localai', label: 'Local AI' },
 		];
 		const actions: IAction[] = items.map(item => ({
 			id: `qic.connect.${item.id}`,
@@ -328,8 +326,6 @@ export class QicChatViewPane extends ViewPane {
 
 	private static readonly CONNECTION_MODE_MAP: Record<QicConnectionType, string> = {
 		'deltaplus': 'server',
-		'byok': 'byok',
-		'localai': 'local',
 	};
 
 	private async _onConnectionChanged(connection: QicConnectionType): Promise<void> {

@@ -17,11 +17,9 @@ export const QIC_RESTORE_CHECKPOINT_COMMAND_ID = 'qic.restoreCheckpoint';
 export const QIC_SHOW_SETTINGS_COMMAND_ID = 'qic.showSettings';
 export const QIC_TOGGLE_COMPLETION_COMMAND_ID = 'qic.toggleCompletion';
 export const QIC_RETRY_CONNECTION_COMMAND_ID = 'qic.retryConnection';
-export const QIC_SET_API_KEY_COMMAND_ID = 'qic.setApiKey';
 export const QIC_SIGN_IN_COMMAND_ID = 'qic.signIn';
 export const QIC_SIGN_OUT_COMMAND_ID = 'qic.signOut';
 export const QIC_ACCOUNT_INFO_COMMAND_ID = 'qic.accountInfo';
-export const QIC_SWITCH_MODE_COMMAND_ID = 'qic.switchConnectionMode';
 
 // Context keys
 export const QIC_PANEL_VISIBLE_CONTEXT = 'qicPanelVisible';
@@ -37,36 +35,24 @@ export const QIC_OUTPUT_CHANNEL_ID = 'Orion';
 
 // Settings keys (AUDIT FIX XI-SV7: API keys use SecretStorage, NOT settings)
 export const QIC_SETTINGS = {
-	PROVIDER_DEFAULT: 'qic.provider.default',
-	PROVIDER_OLLAMA_URL: 'qic.provider.ollamaUrl',
 	COMPLETION_ENABLED: 'qic.completion.enabled',
 	COMPLETION_DEBOUNCE_MS: 'qic.completion.debounceMs',
 	PYTHON_PATH: 'qic.pythonPath',
 	TELEMETRY_ENABLED: 'qic.telemetry.enabled',
 	CONNECTION_MODE: 'qic.connectionMode',
-	CLOUD_BASE_URL: 'qic.cloud.baseUrl',
-	CLOUD_DEV_MODE: 'qic.cloud.devMode',
 	DATA_TIER: 'qic.dataTier',
 	LANE_OVERRIDES: 'qic.laneOverrides',
-	CLOUD_ENABLED: 'qic.cloud.enabled',
 	RESPONSE_STYLE: 'qic.responseStyle', // BYOK Optimization: concise | balanced | detailed
-	SERVER_BASE_URL: 'qic.server.baseUrl',
 } as const;
 
 // Response style type (controls verbosity of LLM responses)
 export type ResponseStyle = 'concise' | 'balanced' | 'detailed';
 
-// Connection mode type
-export type ConnectionMode = 'cloud' | 'byok' | 'local' | 'server';
+// Connection mode type: the Delta Plus Server through the host is the only mode (cloud, byok and local were retired)
+export type ConnectionMode = 'server';
 
 // Data tier type (controls what telemetry data is shared)
 export type DataTier = 'private' | 'anonymous-metrics' | 'data-contributor';
-
-// SecretStorage keys (AUDIT FIX XI-SV7)
-export const QIC_SECRET_KEYS = {
-	ANTHROPIC_API_KEY: 'qic.anthropicApiKey',
-	OPENAI_API_KEY: 'qic.openaiApiKey',
-} as const;
 
 // Workspace storage subdirectories (AUDIT FIX VIII-PC5)
 export const QIC_STORAGE_DIRS = [
