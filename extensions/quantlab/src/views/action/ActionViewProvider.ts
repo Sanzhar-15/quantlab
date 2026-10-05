@@ -13,9 +13,9 @@ import { ParameterExtractor } from '../../core/strategy/ParameterExtractor';
 import * as path from 'path';
 import { HistoryEntry } from '../../types/history';
 import { ActionConfig, ActionConfigurationState, ActionLogEntry, ActionPromptState, ActionResultsState, ActionRunningState, ActionSelectionState, ActionState, QuickActionType, StrategyInfo } from '../../types/action';
-import { DataSourceDescriptor, isServerSource, Timeframe } from '../../types/market';
+import { DataSourceDescriptor, isServerSource } from '../../types/market';
 import { EngineEvent, JobRequest, JobResult } from '../../types/engine';
-import { ServerDataCache } from '../../core/engine/ServerDataCache';
+import { parseRecordedServerSource, recordServerSource, RecordedServerSource, RunDataFile, ServerDataCache, serverDataSourceOf } from '../../core/engine/ServerDataCache';
 import { isOfflineResource } from '../../types/resources';
 import { ViewManager } from '../ViewManager';
 import { ActionStateMachine } from './ActionStateMachine';
@@ -77,6 +77,8 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 	private readonly reducedMotion = ReducedMotion.getInstance();
 
 	private readonly jobToTab = new Map<string, string>();
+	/** QL-DATA Q-2 (a): per-run server-data CSVs, disposed when their run ends. */
+	private readonly runDataFiles = new Map<string, RunDataFile>();
 	private readonly pendingRunByUri = new Map<string, string>();
 	private readonly pendingResourceByUri = new Map<string, string>();
 
@@ -408,23 +410,30 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 			return;
 		}
 
-		// Check if using server data source and cache it to temp CSV
+		// Server data source: write a fresh per-run CSV (disposed at run end).
+		// The engine reads the run file; History records the server source,
+		// never the run-file path, so a rerun re-fetches (QL-DATA Q-2).
 		let finalValues = resolvedValues;
-		const dataSource = this.globalState.getDataSource();
-		if (dataSource && isServerSource(dataSource)) {
-			try {
-				const timeframe = (resolvedValues.timeframe ?? this.globalState.getTimeframe() ?? '1D') as Timeframe;
-				const cachePath = await ServerDataCache.getInstance().fetchAndCacheToCSV(dataSource, timeframe);
-				// Replace dataSource value with cached CSV path
+		let historyValues = resolvedValues;
+		let runDataFile: RunDataFile | undefined;
+		try {
+			const serverRun = this.resolveServerRun(configValues, resolvedValues);
+			if (serverRun) {
+				runDataFile = await ServerDataCache.getInstance().writeRunFile(serverDataSourceOf(serverRun), serverRun.timeframe, serverRun.range);
 				finalValues = {
 					...resolvedValues,
-					dataSource: cachePath
+					dataSource: runDataFile.path
 				};
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				void vscode.window.showErrorMessage(`Failed to fetch server data: ${message}`);
-				return;
+				historyValues = {
+					...resolvedValues,
+					dataSource: `server:${serverRun.symbol}`,
+					serverSource: serverRun
+				};
 			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			void vscode.window.showErrorMessage(`Failed to fetch server data: ${message}`);
+			return;
 		}
 
 		const config: ActionConfig = {
@@ -434,7 +443,7 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 		const runId = this.createRunId(action);
 		let artifactPath = '';
 		try {
-			artifactPath = await this.writeConfigArtifact(runId, config);
+			artifactPath = await this.writeConfigArtifact(runId, { ...payload.config, values: historyValues });
 		} catch (error) {
 			// The run can proceed without the config artifact, but a failed write must be
 			// visible -- it means the run's config won't be reproducible from History.
@@ -477,7 +486,57 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 			config,
 			createdAt: new Date().toISOString()
 		};
-		await this.engineHost.runJob(request);
+		if (runDataFile) {
+			this.runDataFiles.set(runId, runDataFile);
+		}
+		try {
+			await this.engineHost.runJob(request);
+		} catch (error) {
+			// The run never started: no terminal event will dispose its data file.
+			await this.disposeRunDataFile(runId);
+			throw error;
+		}
+	}
+
+	/**
+	 * The server source a run reads, or undefined for a local-file run. A rerun
+	 * from History carries the source recorded in its config; a first run takes
+	 * the global server source.
+	 */
+	private resolveServerRun(configValues: Record<string, unknown>, resolvedValues: Record<string, unknown>): RecordedServerSource | undefined {
+		if (configValues.serverSource !== undefined) {
+			return parseRecordedServerSource(configValues.serverSource);
+		}
+		const dataSource = this.globalState.getDataSource();
+		if (dataSource && isServerSource(dataSource)) {
+			// Precedence: the run config's timeframe, then the global one. Neither -> an error.
+			const timeframe: unknown = resolvedValues.timeframe ?? this.globalState.getTimeframe();
+			if (timeframe === undefined || timeframe === null || timeframe === '') {
+				throw new Error('No timeframe selected for the server run');
+			}
+			return recordServerSource(dataSource, timeframe, resolvedValues);
+		}
+		return undefined;
+	}
+
+	/**
+	 * Deletes a run's server-data CSV (if it has one) once the run has ended.
+	 * A failed delete is logged and shown, never dropped.
+	 */
+	private async disposeRunDataFile(jobId: string): Promise<void> {
+		const runDataFile = this.runDataFiles.get(jobId);
+		if (!runDataFile) {
+			// The run read a local file: there is nothing to dispose.
+			return;
+		}
+		this.runDataFiles.delete(jobId);
+		try {
+			await runDataFile.dispose();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(`ActionViewProvider: failed to delete run data file ${runDataFile.path} for run ${jobId}:`, error);
+			void vscode.window.showWarningMessage(`Run data file ${runDataFile.path} could not be deleted: ${message}`);
+		}
 	}
 
 	private async runOfflineStatsTest(session: ActionSession, tabId: string, resourceId: string, values: Record<string, unknown>): Promise<void> {
@@ -1084,6 +1143,8 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 	}
 
 	private async finishRun(jobId: string, tabId: string, result: JobResult): Promise<void> {
+		// The engine has finished reading its input: the run's data file goes now.
+		await this.disposeRunDataFile(jobId);
 		const entry = this.historyState.getEntry(jobId);
 		const completedAt = new Date();
 		// Artifact persistence must not gate the terminal History transition:
@@ -1134,6 +1195,8 @@ export class ActionViewProvider implements vscode.CustomTextEditorProvider {
 	}
 
 	private async failRun(jobId: string, tabId: string, error: string): Promise<void> {
+		// The engine has stopped (failed or cancelled): the run's data file goes now.
+		await this.disposeRunDataFile(jobId);
 		this.historyState.updateEntry(jobId, {
 			status: error.includes('cancelled') ? 'cancelled' : 'failed',
 			errorMessage: error,

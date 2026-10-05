@@ -3173,6 +3173,43 @@ export interface ExtHostDataChannelsShape {
 	$onDidReceiveData(channelId: string, data: unknown): void;
 }
 
+// The QuantLab host bridge (rule 2): identity and authorised requests for the built-in `quantlab` extension ONLY. The
+// ext-host side hands its API object to that one extension (extHostQuantlabHost.ts); the token never crosses this protocol.
+export interface QuantlabIdentityDto {
+	readonly epoch: number;
+	readonly signedIn: boolean;
+	readonly user?: { readonly id: string; readonly email: string; readonly name?: string; readonly tier?: string };
+}
+
+/**
+ * The answer envelope of the main side. A refusal RESOLVES as `ok: false` (an RPC rejection keeps only name, message and
+ * code, so `status` would be lost); the ext-host class turns it into the Error the extension sees. Codes: identity-changed,
+ * not-signed-in, no-route, not-available, bad-request, too-large, forbidden, cancelled, server (with `status`).
+ */
+export type QuantlabHostAnswerDto =
+	| { readonly ok: true; readonly data: unknown }
+	| { readonly ok: false; readonly code: string; readonly message: string; readonly status?: number };
+
+export interface QuantlabSubscriptionStateDto {
+	readonly kind: 'open' | 'reconnecting' | 'closed' | 'error';
+	readonly message?: string;
+}
+
+export interface MainThreadQuantlabHostShape extends IDisposable {
+	$getIdentity(): Promise<QuantlabIdentityDto>;
+	/** Answers `identity-changed` when `epoch` is not the current one at answer time. */
+	$request(op: string, input: unknown, epoch: number, token: CancellationToken): Promise<QuantlabHostAnswerDto>;
+	/** `data` is null on success. */
+	$subscribe(handle: number, topic: string, params: unknown, epoch: number): Promise<QuantlabHostAnswerDto>;
+	$unsubscribe(handle: number): void;
+}
+
+export interface ExtHostQuantlabHostShape {
+	$onDidChangeIdentity(identity: QuantlabIdentityDto): void;
+	$onData(handle: number, data: unknown, epoch: number): void;
+	$onState(handle: number, state: QuantlabSubscriptionStateDto, epoch: number): void;
+}
+
 export interface ExtHostLocalizationShape {
 	getMessage(extensionId: string, details: IStringDetails): string;
 	getBundle(extensionId: string): { [key: string]: string } | undefined;
@@ -3404,6 +3441,7 @@ export const MainContext = {
 	MainThreadChatSessions: createProxyIdentifier<MainThreadChatSessionsShape>('MainThreadChatSessions'),
 	MainThreadChatOutputRenderer: createProxyIdentifier<MainThreadChatOutputRendererShape>('MainThreadChatOutputRenderer'),
 	MainThreadChatContext: createProxyIdentifier<MainThreadChatContextShape>('MainThreadChatContext'),
+	MainThreadQuantlabHost: createProxyIdentifier<MainThreadQuantlabHostShape>('MainThreadQuantlabHost'),
 };
 
 export const ExtHostContext = {
@@ -3480,4 +3518,5 @@ export const ExtHostContext = {
 	ExtHostMcp: createProxyIdentifier<ExtHostMcpShape>('ExtHostMcp'),
 	ExtHostDataChannels: createProxyIdentifier<ExtHostDataChannelsShape>('ExtHostDataChannels'),
 	ExtHostChatSessions: createProxyIdentifier<ExtHostChatSessionsShape>('ExtHostChatSessions'),
+	ExtHostQuantlabHost: createProxyIdentifier<ExtHostQuantlabHostShape>('ExtHostQuantlabHost'),
 };

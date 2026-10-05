@@ -95,6 +95,10 @@ suite('WatchlistManager CRUD and lifecycle', () => {
 		return { context: { globalState } as unknown as vscode.ExtensionContext, store };
 	}
 
+	function notSignedIn(): Error {
+		return Object.assign(new Error('quantlab-host-data:not-signed-in: signed out'), { code: 'not-signed-in' });
+	}
+
 	function settle(ms = 20): Promise<void> {
 		return new Promise(resolve => setTimeout(resolve, ms));
 	}
@@ -159,7 +163,7 @@ suite('WatchlistManager CRUD and lifecycle', () => {
 		}];
 		// Keep the startup pull from running a merge (the signed-out state),
 		// so getWatchlists() reflects restore() output alone.
-		fake.setPullError(new Error('Not signed in'));
+		fake.setPullError(notSignedIn());
 		const { context } = makeContext(stored);
 		const manager = new WatchlistManager(context);
 		await settle();
@@ -227,10 +231,9 @@ suite('WatchlistManager CRUD and lifecycle', () => {
 		const syncErrors: string[] = [];
 		manager.onSyncError(message => { syncErrors.push(message); });
 
-		// Routine signed-out pull: logged, not surfaced. Uses the exact message
-		// ServerApiClient.ensureAuthenticated throws today (M15 reword kept the
-		// 'Not signed in' prefix the /not signed in/i classifier matches on).
-		fake.setPullError(new Error('Not signed in. Sign in via the account menu to load live data.'));
+		// Routine signed-out pull: logged, not surfaced. QL-DATA: the signed-out refusal is the
+		// host's rejection with code 'not-signed-in'; the manager classifies by that code.
+		fake.setPullError(notSignedIn());
 		fake.fireAuth(true);
 		await settle();
 		assert.strictEqual(syncErrors.length, 0);
@@ -242,6 +245,20 @@ suite('WatchlistManager CRUD and lifecycle', () => {
 		await settle();
 		assert.strictEqual(syncErrors.length, 1);
 		assert.ok(syncErrors[0].includes('HTTP 500 internal'));
+
+		// Planted negative control: change the manager's classifier back to
+		// `/not signed in/i.test(message)` -- this text-only error is then not surfaced and the
+		// count stays 1. Another host code is surfaced too.
+		fake.setPullError(new Error('Not signed in. Sign in in the terminal view.'));
+		fake.fireAuth(false);
+		fake.fireAuth(true);
+		await settle();
+		assert.strictEqual(syncErrors.length, 2);
+		fake.setPullError(Object.assign(new Error('quantlab-host-data:no-route: test'), { code: 'no-route' }));
+		fake.fireAuth(false);
+		fake.fireAuth(true);
+		await settle();
+		assert.strictEqual(syncErrors.length, 3);
 
 		manager.dispose();
 	});

@@ -5,8 +5,9 @@
 
 /*
  *  ResourcesCatalogService
- *  Singleton service managing catalog fetch, two-tier cache, search, and context filtering.
- *  Cache: memory (5min TTL) -> extension storage (persisted across sessions).
+ *  Singleton service managing catalog fetch, an in-memory cache, search, and context filtering.
+ *  Cache: memory only (5min TTL), dropped on every identity change. No persisted copy: a failed
+ *  fetch rejects with its error (QL-DATA DT-3; estate law section 4).
  */
 
 import * as vscode from 'vscode';
@@ -28,13 +29,39 @@ export class ResourcesCatalogService {
 
 	private catalog: CatalogState | null = null;
 	private fetchPromise: Promise<CatalogState | null> | null = null;
-	private readonly globalState: vscode.Memento;
+	/** Bumped on every identity change; a fetch started under an older value is dropped. */
+	private identityGeneration = 0;
+	private readonly authSubscription: vscode.Disposable;
 
 	private static readonly CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes in memory
-	private static readonly STORAGE_KEY = 'quantlab.resourcesCatalog';
+	/** DELETE-ONLY: the globalState key that used to persist the catalog. Never read. */
+	private static readonly LEGACY_STORAGE_KEY = 'quantlab.resourcesCatalog';
 
 	private constructor(context: vscode.ExtensionContext) {
-		this.globalState = context.globalState;
+		ResourcesCatalogService.purgeStoredCatalog(context.globalState);
+		// ServerApiClient.onAuthStateChange fires on every identity change pushed by
+		// setHostIdentity (sign-in, sign-out, a change of user or of the user's fields):
+		// the previous identity's catalog must not outlive it.
+		this.authSubscription = ServerApiClient.getInstance().onAuthStateChange(() => this.dropForIdentityChange());
+	}
+
+	/** Delete-only purge of the formerly persisted catalog, once per activation. No value is read. */
+	private static purgeStoredCatalog(memento: vscode.Memento): void {
+		const key = ResourcesCatalogService.LEGACY_STORAGE_KEY;
+		memento.update(key, undefined).then(
+			() => console.log(`[ResourcesCatalogService] stored catalog key deleted: ${key}`),
+			(err: unknown) => {
+				const message = err instanceof Error ? err.message : String(err);
+				console.error(`[ResourcesCatalogService] could not delete the stored catalog key ${key}:`, err);
+				void vscode.window.showWarningMessage(`Quantlab could not delete the stored resources catalog (${key}): ${message}`);
+			}
+		);
+	}
+
+	private dropForIdentityChange(): void {
+		this.identityGeneration++;
+		this.catalog = null;
+		this.fetchPromise = null;
 	}
 
 	static initialize(context: vscode.ExtensionContext): ResourcesCatalogService {
@@ -54,7 +81,15 @@ export class ResourcesCatalogService {
 	// ---- Fetch ----
 
 	async getCatalog(forceRefresh?: boolean): Promise<CatalogState | null> {
-		// 1. Check memory cache (with TTL)
+		// Signed out: the catalog IS the local built-in tools, chosen from the
+		// identity state -- no fetch is made. Never a stand-in for a failed fetch.
+		if (!ServerApiClient.getInstance().isAuthenticated()) {
+			const builtIns = this.buildBuiltInCatalog();
+			this.catalog = builtIns;
+			return builtIns;
+		}
+
+		// Signed in: the server catalog. 1. Check memory cache (with TTL)
 		if (!forceRefresh && this.catalog && this.isCacheFresh()) {
 			return this.catalog;
 		}
@@ -64,49 +99,47 @@ export class ResourcesCatalogService {
 			return this.fetchPromise;
 		}
 
-		this.fetchPromise = this.doFetch(forceRefresh);
+		const pending = this.doFetch();
+		this.fetchPromise = pending;
 		try {
-			return await this.fetchPromise;
+			return await pending;
 		} finally {
-			this.fetchPromise = null;
+			// An identity change may already have replaced the pending fetch.
+			if (this.fetchPromise === pending) {
+				this.fetchPromise = null;
+			}
 		}
 	}
 
-	private async doFetch(forceRefresh?: boolean): Promise<CatalogState | null> {
-		// Try server first
-		try {
-			const catalog = await this.fetchFromServer();
-			if (catalog) {
-				this.mergeOfflineResources(catalog);
-				this.catalog = catalog;
-				await this.persistToStorage(catalog);
-				return catalog;
-			}
-			// Server returned null (version match) -- memory cache is still valid
-			if (this.catalog) {
-				this.catalog.fetchedAt = Date.now();
-				return this.catalog;
-			}
-		} catch (err) {
-			// Server unreachable -- fall through to storage (the provider shows a
-			// stale-cache banner), but the underlying reason must not vanish.
-			console.error('Resources catalog fetch from server failed:', err);
+	/** One server fetch. A failure rejects with its error: no stored or offline-only substitute. */
+	private async doFetch(): Promise<CatalogState> {
+		const generation = this.identityGeneration;
+		const catalog = await this.fetchFromServer();
+		if (generation !== this.identityGeneration) {
+			throw new Error('The signed-in identity changed during the resources catalog fetch; its answer was dropped.');
 		}
-
-		// 2. Try extension storage (persisted from a previous fetch)
-		if (!forceRefresh) {
-			const stored = this.loadFromStorage();
-			if (stored) {
-				this.mergeOfflineResources(stored);
-				this.catalog = stored;
-				return stored;
-			}
+		if (catalog) {
+			this.mergeOfflineResources(catalog);
+			this.catalog = catalog;
+			return catalog;
 		}
+		// Server returned null (version match) -- the memory cache is still valid
+		if (!this.catalog) {
+			throw new Error('The server answered "catalog unchanged" but no catalog is held.');
+		}
+		this.catalog.fetchedAt = Date.now();
+		return this.catalog;
+	}
 
-		// 3. Offline-only fallback (no server, no cache)
-		const offlineOnly = this.buildOfflineOnlyCatalog();
-		this.catalog = offlineOnly;
-		return offlineOnly;
+	/** The signed-out catalog: the local built-in tools only (the panel shows its offline notice). */
+	private buildBuiltInCatalog(): CatalogState {
+		return {
+			version: 'offline',
+			statistics: [...OFFLINE_STATISTICS],
+			strategy: [...OFFLINE_STRATEGY],
+			workflows: [],
+			fetchedAt: Date.now(),
+		};
 	}
 
 	private mergeOfflineResources(catalog: CatalogState): void {
@@ -123,16 +156,6 @@ export class ResourcesCatalogService {
 				catalog.strategy.unshift(cat);
 			}
 		}
-	}
-
-	private buildOfflineOnlyCatalog(): CatalogState {
-		return {
-			version: 'offline',
-			statistics: [...OFFLINE_STATISTICS],
-			strategy: [...OFFLINE_STRATEGY],
-			workflows: [],
-			fetchedAt: Date.now(),
-		};
 	}
 
 	private async fetchFromServer(): Promise<CatalogState | null> {
@@ -165,21 +188,6 @@ export class ResourcesCatalogService {
 			return false;
 		}
 		return (Date.now() - this.catalog.fetchedAt) < ResourcesCatalogService.CACHE_TTL_MS;
-	}
-
-	private async persistToStorage(catalog: CatalogState): Promise<void> {
-		try {
-			await this.globalState.update(ResourcesCatalogService.STORAGE_KEY, catalog);
-		} catch (err) {
-			// Non-fatal (the in-memory catalog still works this session), but a failed
-			// persist means no offline cache next launch -- log it.
-			console.error('Resources catalog persist to globalState failed:', err);
-		}
-	}
-
-	private loadFromStorage(): CatalogState | null {
-		const stored = this.globalState.get<CatalogState>(ResourcesCatalogService.STORAGE_KEY);
-		return stored ?? null;
 	}
 
 	// ---- Search ----
@@ -281,6 +289,7 @@ export class ResourcesCatalogService {
 	// ---- Dispose ----
 
 	dispose(): void {
+		this.authSubscription.dispose();
 		this.catalog = null;
 		this.fetchPromise = null;
 	}

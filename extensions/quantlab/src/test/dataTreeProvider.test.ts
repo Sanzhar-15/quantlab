@@ -41,6 +41,8 @@ import {
 	CategoryNode,
 	SubCategoryNode,
 	InstrumentNode,
+	LoadError,
+	toLoadError,
 } from '../panels/data/DataTreeProvider';
 import { GlobalState } from '../core/state/GlobalState';
 import { WatchlistManager } from '../panels/data/WatchlistManager';
@@ -62,9 +64,8 @@ suite('DataTreeProvider category truth-in-labeling (M123) and symbol display (L2
 				return new vscode.Disposable(() => { });
 			},
 			async getSymbols(): Promise<never> {
-				// The exact signed-out failure ServerApiClient throws today; the
-				// tree classifies it via /not signed in/i (M15 kept the prefix).
-				throw new Error('Not signed in. Sign in via the account menu to load live data.');
+				// The host's signed-out rejection (QL-DATA): the tree classifies it by its code.
+				throw Object.assign(new Error('quantlab-host-data:not-signed-in: signed out'), { code: 'not-signed-in' });
 			},
 		};
 		return raw as unknown as ServerApiClient;
@@ -203,5 +204,19 @@ suite('DataTreeProvider category truth-in-labeling (M123) and symbol display (L2
 		assert.strictEqual(node.label, 'BTC/USD/PERP');
 		// The raw symbol (used for routing) must stay untouched.
 		assert.strictEqual(node.symbol, 'BTC_USD_PERP');
+	});
+
+	// QL-DATA: only the host's 'not-signed-in' code is the signed-out state. Planted negative control:
+	// change errorPlaceholder back to `/not signed in/i.test(error.message)` (text, not code) -- the
+	// text-only error below then becomes the Sign-in entry and this test fails.
+	test('signed-out classification: the not-signed-in code gives the Sign-in entry, any other code does not', () => {
+		const accessor = provider as unknown as { errorPlaceholder(id: string, error: LoadError): { label: string } };
+		const coded = (code: string): Error => Object.assign(new Error(`quantlab-host-data:${code}: test`), { code });
+		assert.strictEqual(accessor.errorPlaceholder('t', toLoadError(coded('not-signed-in'))).label, 'Sign in to load live data');
+		for (const code of ['no-route', 'identity-changed', 'not-available', 'upstream:401']) {
+			assert.strictEqual(accessor.errorPlaceholder('t', toLoadError(coded(code))).label, `Failed to load: quantlab-host-data:${code}: test`, code);
+		}
+		const textOnly = new Error('Not signed in. Sign in in the terminal view.');
+		assert.strictEqual(accessor.errorPlaceholder('t', toLoadError(textOnly)).label, `Failed to load: ${textOnly.message}`);
 	});
 });

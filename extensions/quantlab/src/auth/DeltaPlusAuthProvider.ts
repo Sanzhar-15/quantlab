@@ -96,8 +96,8 @@ function parseHostIdentity(raw: unknown): HostIdentity {
 
 export class DeltaPlusAuthProvider implements vscode.Disposable {
 	// Fires when a user becomes signed in: from signed out, or a different user id. Internal to
-	// QuantLab (extension.ts reconnects the WebSocket on it); it carries nothing, readers ask
-	// ServerApiClient.getUser().
+	// QuantLab (no listener today: QL-DATA removed the WebSocket that reconnected on it); it carries
+	// nothing, readers ask ServerApiClient.getUser().
 	private readonly _signInEmitter = new vscode.EventEmitter<void>();
 	readonly onDidSignIn = this._signInEmitter.event;
 
@@ -182,9 +182,8 @@ export class DeltaPlusAuthProvider implements vscode.Disposable {
 		const previous = this._identity;
 		this._identity = next;
 
-		// The client first: listeners of onDidSignIn reconnect the WebSocket, which needs the user
-		// to be set. Sign-out and same-user field changes reach readers through the client's
-		// onAuthStateChange.
+		// The client first, so a listener of onDidSignIn reads the new user from it. Sign-out and
+		// same-user field changes reach readers through the client's onAuthStateChange.
 		this._serverClient.setHostIdentity(next.signedIn ? this._toServerUser(next.user) : undefined);
 
 		if (next.signedIn && (!previous.signedIn || previous.user.id !== next.user.id)) {

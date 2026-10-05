@@ -8,6 +8,7 @@ installVscodeShim();
 
 import 'mocha';
 import * as assert from 'assert';
+import * as vscode from 'vscode';
 import { CalendarPage, CryptoSymbol, ServerAlert, ServerApiClient } from '../core/server/ServerApiClient';
 
 // Regression tests for the 2026-06-11 live-shape audit (megaudit H57/H58/H63):
@@ -15,33 +16,30 @@ import { CalendarPage, CryptoSymbol, ServerAlert, ServerApiClient } from '../cor
 // unwrap ({alerts,count}, {coins,count}, {events,total,...}). Each getter must
 // unwrap the LIVE envelope and throw loudly on an unexpected shape -- never
 // silently return [].
-
-interface ClientInternals {
-	ensureAuthenticated(): Promise<void>;
-	request<T>(method: string, path: string, body?: unknown): Promise<T>;
-}
+// QL-DATA: the client now reaches the server only through the host transport (vscode.quantlabHost), so
+// the stub is a host whose request(op) answers per op; the assertions are unchanged.
 
 suite('ServerApiClient live-envelope unwrapping', () => {
 	let client: ServerApiClient;
-	let internals: ClientInternals;
 	let responses: Map<string, unknown>;
 
 	setup(() => {
+		responses = new Map();
+		(vscode as unknown as { quantlabHost?: unknown }).quantlabHost = {
+			request: async (op: string): Promise<unknown> => {
+				if (!responses.has(op)) {
+					throw new Error(`Unexpected op in test: ${op}`);
+				}
+				return responses.get(op);
+			},
+		};
 		ServerApiClient.resetInstance();
 		client = ServerApiClient.getInstance();
-		internals = client as unknown as ClientInternals;
-		responses = new Map();
-		internals.ensureAuthenticated = async () => { /* signed-in stub */ };
-		internals.request = async <T>(_method: string, path: string): Promise<T> => {
-			if (!responses.has(path)) {
-				throw new Error(`Unexpected request in test: ${path}`);
-			}
-			return responses.get(path) as T;
-		};
 	});
 
 	teardown(() => {
 		ServerApiClient.resetInstance();
+		delete (vscode as unknown as { quantlabHost?: unknown }).quantlabHost;
 	});
 
 	const liveAlert: ServerAlert = {
@@ -59,7 +57,7 @@ suite('ServerApiClient live-envelope unwrapping', () => {
 	};
 
 	test('getAlerts unwraps the live {alerts, count} envelope', async () => {
-		responses.set('/v1/alerts', { alerts: [liveAlert], count: 1 });
+		responses.set('alerts.list', { alerts: [liveAlert], count: 1 });
 		const alerts = await client.getAlerts();
 		assert.strictEqual(alerts.length, 1);
 		assert.strictEqual(alerts[0].symbol, 'DETH');
@@ -67,7 +65,7 @@ suite('ServerApiClient live-envelope unwrapping', () => {
 	});
 
 	test('getAlerts throws loudly on an unexpected shape (no silent [])', async () => {
-		responses.set('/v1/alerts', [liveAlert]); // bare array, not the live envelope
+		responses.set('alerts.list', [liveAlert]); // bare array, not the live envelope
 		await assert.rejects(
 			() => client.getAlerts(),
 			/Unexpected \/v1\/alerts response shape/
@@ -88,7 +86,7 @@ suite('ServerApiClient live-envelope unwrapping', () => {
 	};
 
 	test('getCryptoSymbols unwraps the live {coins, count} envelope', async () => {
-		responses.set('/v1/crypto/symbols', { coins: [liveCoin], count: 1 });
+		responses.set('cryptoSymbols', { coins: [liveCoin], count: 1 });
 		const coins = await client.getCryptoSymbols();
 		assert.strictEqual(coins.length, 1);
 		assert.strictEqual(coins[0].symbol, 'BTC');
@@ -97,7 +95,7 @@ suite('ServerApiClient live-envelope unwrapping', () => {
 	});
 
 	test('getCryptoSymbols throws loudly when the coins key is absent', async () => {
-		responses.set('/v1/crypto/symbols', { symbols: [liveCoin] }); // the OLD assumed key
+		responses.set('cryptoSymbols', { symbols: [liveCoin] }); // the OLD assumed key
 		await assert.rejects(
 			() => client.getCryptoSymbols(),
 			/Unexpected \/v1\/crypto\/symbols response shape/
@@ -121,7 +119,7 @@ suite('ServerApiClient live-envelope unwrapping', () => {
 	};
 
 	test('calendar getters return the unified page with pagination fields', async () => {
-		responses.set('/v1/calendar/earnings', livePage);
+		responses.set('calendar.listEarnings', livePage);
 		const page = await client.getCalendarEarnings();
 		assert.strictEqual(page.events.length, 1);
 		assert.strictEqual(page.events[0].event_name, 'BTCS Earnings Q4 2025');
@@ -130,7 +128,7 @@ suite('ServerApiClient live-envelope unwrapping', () => {
 	});
 
 	test('calendar getters throw loudly on an unexpected shape', async () => {
-		responses.set('/v1/calendar/economic', [{ id: 'e2' }]); // bare array, not the envelope
+		responses.set('calendar.listEconomic', [{ id: 'e2' }]); // bare array, not the envelope
 		await assert.rejects(
 			() => client.getCalendarEconomic(),
 			/Unexpected \/v1\/calendar\/economic response shape/
