@@ -216,7 +216,6 @@ import './contrib/chat/browser/contextContrib/chatContext.contribution.js';
 import './contrib/qic/browser/qic.contribution.js';
 
 // QuantLab Auth Gate -- full-screen login overlay shown before the workbench when unauthenticated
-import './contrib/qic/browser/authGate.js';
 
 // Interactive
 import './contrib/interactive/browser/interactive.contribution.js';
@@ -439,3 +438,4 @@ import './contrib/editTelemetry/browser/editTelemetry.contribution.js';
 import './contrib/opener/browser/opener.contribution.js';
 
 //#endregion
+if (globalThis.QL_TEST_BUILD) { await import('./services/request/test-instruments/index.js'); }
