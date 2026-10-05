@@ -130,6 +130,8 @@ export interface IQuantlabHostUser {
 	readonly id: string;
 	readonly email: string;
 	readonly name: string | undefined;
+	/** Required: Go's tier (PLAN-FINAL section 3.2 item 1). Not displayed until E2. */
+	readonly tier: string;
 }
 
 /**
@@ -228,7 +230,7 @@ export function parseIdentity(value: unknown): QuantlabIdentity {
 	if (!isRecord(user)) {
 		throw new Error('QuantLab host identity: a signed-in answer has no user object');
 	}
-	assertOnlyKeys(user, ['id', 'email', 'name'], 'the user', IDENTITY_ERROR_PREFIX);
+	assertOnlyKeys(user, ['id', 'email', 'name', 'tier'], 'the user', IDENTITY_ERROR_PREFIX);
 	if (typeof user.id !== 'string') {
 		throw new Error('QuantLab host identity: user.id is not a string');
 	}
@@ -238,10 +240,13 @@ export function parseIdentity(value: unknown): QuantlabIdentity {
 	if (user.name !== undefined && typeof user.name !== 'string') {
 		throw new Error('QuantLab host identity: user.name is neither a string nor absent');
 	}
+	if (typeof user.tier !== 'string' || user.tier === '') {
+		throw new Error('QuantLab host identity: user.tier is not a non-empty string');
+	}
 
 	const epoch = parseEpoch(value.epoch, IDENTITY_ERROR_PREFIX);
 
-	return { epoch, signedIn: true, user: { id: user.id, email: user.email, name: user.name } };
+	return { epoch, signedIn: true, user: { id: user.id, email: user.email, name: user.name, tier: user.tier } };
 }
 
 /**

@@ -18,7 +18,6 @@ import { IConfigurationService } from '../../../../platform/configuration/common
 import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { IQuickInputService } from '../../../../platform/quickinput/common/quickInput.js';
-import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
 import { KeybindingWeight } from '../../../../platform/keybinding/common/keybindingsRegistry.js';
 import { ContextKeyExpr } from '../../../../platform/contextkey/common/contextkey.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
@@ -40,13 +39,10 @@ import {
 	QIC_SHOW_SETTINGS_COMMAND_ID,
 	QIC_TOGGLE_COMPLETION_COMMAND_ID,
 	QIC_RETRY_CONNECTION_COMMAND_ID,
-	QIC_SET_API_KEY_COMMAND_ID,
 	QIC_SIGN_IN_COMMAND_ID,
 	QIC_SIGN_OUT_COMMAND_ID,
 	QIC_ACCOUNT_INFO_COMMAND_ID,
-	QIC_SWITCH_MODE_COMMAND_ID,
 	QIC_PANEL_VISIBLE_CONTEXT,
-	QIC_SECRET_KEYS,
 	QIC_SETTINGS,
 	QIC_STORAGE_DIRS,
 	type ConnectionMode,
@@ -87,15 +83,11 @@ import { ArgumentAnalyzer } from '../common/security/argumentAnalyzer.js';
 import { TerminalSecurityGuard } from '../common/security/terminalGuard.js';
 import { HashChainedAuditLogger } from '../common/security/auditLogger.js';
 import { FirstRunManager } from '../common/security/firstRunManager.js';
-import { describeSecretPresence } from '../common/security/secretPresence.js';
 
 // QIC component imports -- gateway & providers
 import { Gateway } from '../common/gateway/gateway.js';
 import { ModelRegistry } from '../common/gateway/modelRegistry.js';
 import { RateLimiter } from '../common/gateway/rateLimiter.js';
-import { AnthropicAdapter } from '../common/gateway/providers/anthropicAdapter.js';
-import { OpenAIAdapter } from '../common/gateway/providers/openaiAdapter.js';
-import { OllamaAdapter } from '../common/gateway/providers/ollamaAdapter.js';
 import { DeltaPlusAdapter } from '../common/gateway/providers/deltaplusAdapter.js';
 import { CircuitBreaker } from '../common/recovery/circuitBreaker.js';
 
@@ -144,7 +136,6 @@ import { FileOperationTools } from '../common/tools/fileOps.js';
 import { SearchTools } from '../common/tools/searchTools.js';
 import { ReferenceTools } from '../common/tools/referenceTools.js';
 import { TerminalTools } from '../common/tools/terminalTools.js';
-import { NetworkTools } from '../common/tools/networkTools.js';
 import { PackageTools } from '../common/tools/packageTools.js';
 import { LspTools } from '../common/tools/lspTools.js';
 import { NotebookTools } from '../common/tools/notebookTools.js';
@@ -170,7 +161,6 @@ import { ITextModelService } from '../../../../editor/common/services/resolverSe
 import { IMarkerService } from '../../../../platform/markers/common/markers.js';
 import { IStatusbarService, StatusbarAlignment } from '../../../services/statusbar/browser/statusbar.js';
 import { QicStatusBarContribution } from './qicStatusBarItem.js';
-import { IRequestService } from '../../../../platform/request/common/request.js';
 
 // ---------------------------------------------------------------------------
 // 1. Register IQicService singleton (delayed -- created on first access)
@@ -253,17 +243,6 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).regis
 	id: 'qic',
 	title: localize('qicConfiguration', "Orion"),
 	properties: {
-		[QIC_SETTINGS.PROVIDER_DEFAULT]: {
-			type: 'string',
-			default: 'anthropic',
-			enum: ['anthropic', 'openai', 'ollama'],
-			description: localize('qic.provider.default', "Default LLM provider for QIC."),
-		},
-		[QIC_SETTINGS.PROVIDER_OLLAMA_URL]: {
-			type: 'string',
-			default: 'http://localhost:11434',
-			description: localize('qic.provider.ollamaUrl', "URL for the Ollama provider."),
-		},
 		[QIC_SETTINGS.COMPLETION_ENABLED]: {
 			type: 'boolean',
 			default: true,
@@ -288,29 +267,11 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).regis
 		[QIC_SETTINGS.CONNECTION_MODE]: {
 			type: 'string',
 			default: 'server',
-			enum: ['server', 'cloud', 'byok', 'local'],
+			enum: ['server'],
 			enumDescriptions: [
-				localize('qic.connectionMode.server', "Delta Plus Server -- uses your server login, no API key needed (Recommended)"),
-				localize('qic.connectionMode.cloud', "Quantlab Cloud -- zero-config, managed infrastructure"),
-				localize('qic.connectionMode.byok', "Bring Your Own Key -- direct connections to Anthropic/OpenAI"),
-				localize('qic.connectionMode.local', "Local only -- Ollama for offline/air-gapped environments"),
+				localize('qic.connectionMode.server', "Delta Plus Server -- uses your sign-in at the Quantlab terminal view, through the host"),
 			],
-			description: localize('qic.connectionMode', "How QIC connects to AI models."),
-		},
-		[QIC_SETTINGS.SERVER_BASE_URL]: {
-			type: 'string',
-			default: 'https://api.deltaplus.io',
-			description: localize('qic.server.baseUrl', "URL for the Delta Plus Server."),
-		},
-		[QIC_SETTINGS.CLOUD_BASE_URL]: {
-			type: 'string',
-			default: 'https://api.quantlab.dev',
-			description: localize('qic.cloud.baseUrl', "URL for the Quantlab Cloud API. Only used in cloud mode."),
-		},
-		[QIC_SETTINGS.CLOUD_DEV_MODE]: {
-			type: 'boolean',
-			default: false,
-			description: localize('qic.cloud.devMode', "Enable development mode for cloud (allows HTTP localhost)."),
+			description: localize('qic.connectionMode', "How QIC connects to AI models. The only mode is the Delta Plus Server through the host."),
 		},
 		[QIC_SETTINGS.DATA_TIER]: {
 			type: 'string',
@@ -327,11 +288,6 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).regis
 			type: 'object',
 			default: {},
 			description: localize('qic.laneOverrides', "Override the connection path for specific lanes. Maps lane names to provider IDs."),
-		},
-		[QIC_SETTINGS.CLOUD_ENABLED]: {
-			type: 'boolean',
-			default: false,
-			description: localize('qic.cloud.enabled', "Enable Quantlab Cloud connection path. Off during development, flipped to true at GA."),
 		},
 		// Removed: qic.experimental.newHeader -- no longer relevant after migration to native ChatWidget
 	},
@@ -557,44 +513,6 @@ registerAction2(class extends Action2 {
 	}
 });
 
-// Set API Key (AUDIT FIX XI-SV7: SecretStorage, not settings)
-registerAction2(class extends Action2 {
-	constructor() {
-		super({
-			id: QIC_SET_API_KEY_COMMAND_ID,
-			title: localize2('qic.setApiKey', "Orion: Set API Key"),
-			f1: true,
-		});
-	}
-	async run(accessor: ServicesAccessor): Promise<void> {
-		// Get all services upfront before any async operations
-		const quickInput = accessor.get(IQuickInputService);
-		const secretStorage = accessor.get(ISecretStorageService);
-		const notificationService = accessor.get(INotificationService);
-
-		const provider = await quickInput.pick(
-			[{ label: 'Anthropic' }, { label: 'OpenAI' }],
-			{ placeHolder: localize('qic.selectProvider', "Select provider") },
-		);
-		if (!provider) { return; }
-
-		const key = await quickInput.input({
-			prompt: localize('qic.enterApiKey', "Enter {0} API Key", provider.label),
-			password: true,
-		});
-		if (key) {
-			const storageKey = provider.label === 'Anthropic'
-				? QIC_SECRET_KEYS.ANTHROPIC_API_KEY
-				: QIC_SECRET_KEYS.OPENAI_API_KEY;
-			await secretStorage.set(storageKey, key);
-
-			notificationService.info(
-				localize('qic.apiKeySet', "API key saved. Reload the window (Ctrl+Shift+P -> Reload Window) to activate the {0} provider.", provider.label)
-			);
-		}
-	}
-});
-
 // Sign In -- the Quantlab terminal view owns sign-in (QL-LOGIN); QIC holds no login of its own
 registerAction2(class extends Action2 {
 	constructor() {
@@ -665,39 +583,6 @@ registerAction2(class extends Action2 {
 			notificationService.error(
 				localize('qic.accountInfo.failed', "Orion: Could not read the sign-in state from the host: {0}", error instanceof Error ? error.message : String(error))
 			);
-		}
-	}
-});
-
-// Switch Connection Mode
-registerAction2(class extends Action2 {
-	constructor() {
-		super({
-			id: QIC_SWITCH_MODE_COMMAND_ID,
-			title: localize2('qic.switchMode', "Orion: Switch Connection Mode"),
-			f1: true,
-		});
-	}
-	async run(accessor: ServicesAccessor): Promise<void> {
-		const quickInput = accessor.get(IQuickInputService);
-		const configService = accessor.get(IConfigurationService);
-
-		const current = configService.getValue<string>(QIC_SETTINGS.CONNECTION_MODE) ?? 'cloud';
-
-		const items = [
-			{ label: 'server', description: 'Delta Plus Server -- uses your server login, no API key needed', picked: current === 'server' },
-			{ label: 'cloud', description: 'Quantlab Cloud -- zero-config, managed infrastructure', picked: current === 'cloud' },
-			{ label: 'byok', description: 'Bring Your Own Key -- direct to Anthropic/OpenAI', picked: current === 'byok' },
-			{ label: 'local', description: 'Local only -- Ollama for offline environments', picked: current === 'local' },
-		];
-
-		const pick = await quickInput.pick(items, {
-			placeHolder: localize('qic.switchMode.placeholder', "Select connection mode (current: {0})", current),
-		});
-
-		if (pick && Object.prototype.hasOwnProperty.call(pick, 'label') && pick.label !== current) {
-			await configService.updateValue(QIC_SETTINGS.CONNECTION_MODE, pick.label);
-			// The hot-swap listener will prompt for reload
 		}
 	}
 });
@@ -1102,6 +987,18 @@ class InMemoryPermissionStore implements PermissionStore {
 	}
 }
 
+/**
+ * The one connection mode is `server` (the Delta Plus Server through the host). Cloud, BYOK and local
+ * were retired: a value left in a user's settings is a visible error, never read as `server`.
+ */
+function readConnectionMode(configurationService: IConfigurationService): ConnectionMode {
+	const mode = configurationService.getValue<unknown>(QIC_SETTINGS.CONNECTION_MODE);
+	if (mode !== 'server') {
+		throw new Error(`[QIC] qic.connectionMode is '${String(mode)}', but the only connection mode is 'server' (cloud, byok and local were retired). Remove the setting or set it to 'server'.`);
+	}
+	return mode;
+}
+
 // ---------------------------------------------------------------------------
 // 6. QIC Activation -- Phase A (sync) + Phase B (async)
 // AUDIT FIX IV-AO3: Split to avoid 60s activation timeout
@@ -1124,7 +1021,6 @@ class QicActivation extends Disposable {
 		@IQicService private readonly qicService: IQicService,
 		@INotificationService private readonly notificationService: INotificationService,
 		@IDialogService private readonly dialogService: IDialogService,
-		@ISecretStorageService private readonly secretStorageService: ISecretStorageService,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@IWorkspaceContextService private readonly workspaceContextService: IWorkspaceContextService,
 		@IEnvironmentService private readonly environmentService: IEnvironmentService,
@@ -1134,7 +1030,6 @@ class QicActivation extends Disposable {
 		@ICommandService private readonly commandService: ICommandService,
 		@IStatusbarService private readonly statusbarService: IStatusbarService,
 		@IQuantlabHostIdentityService private readonly hostIdentityService: IQuantlabHostIdentityService,
-		@IRequestService private readonly requestService: IRequestService,
 		@IQicStateService private readonly stateService: IQicStateService,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@ITextModelService private readonly textModelService: ITextModelService,
@@ -1187,11 +1082,7 @@ class QicActivation extends Disposable {
 		// so it cannot be skipped by any thrown exception in any initialization step.
 		this._disposableStore.add(
 			this.configurationService.onDidChangeConfiguration(e => {
-				if (e.affectsConfiguration('qic.connectionMode') ||
-					e.affectsConfiguration('qic.server.baseUrl') ||
-					e.affectsConfiguration('qic.cloud.baseUrl') ||
-					e.affectsConfiguration('qic.cloud.devMode') ||
-					e.affectsConfiguration('qic.cloud.enabled')) {
+				if (e.affectsConfiguration('qic.connectionMode')) {
 					this.logService.info('[QIC] Connection configuration changed -- reload required');
 					this.notificationService.prompt(
 						2, // Severity.Info
@@ -1337,9 +1228,7 @@ class QicActivation extends Disposable {
 					throw new Error('[QIC] Internal invariant violated: security step must complete before gateway step');
 				}
 
-				const connectionMode = this.configurationService.getValue<ConnectionMode>(QIC_SETTINGS.CONNECTION_MODE) ?? 'cloud';
-				const cloudEnabled = this.configurationService.getValue<boolean>(QIC_SETTINGS.CLOUD_ENABLED) ?? false;
-				const ollamaUrl = this.configurationService.getValue<string>(QIC_SETTINGS.PROVIDER_OLLAMA_URL) ?? 'http://localhost:11434';
+				const connectionMode = readConnectionMode(this.configurationService);
 				const laneOverrides = this.configurationService.getValue<Record<string, string>>(QIC_SETTINGS.LANE_OVERRIDES) ?? {};
 				const providers = new Map<string, ProviderAdapter>();
 
@@ -1351,88 +1240,28 @@ class QicActivation extends Disposable {
 					}
 				}
 
-				// --- Quantlab Cloud is retired (QL-LOGIN): no adapter, no sign-in. A user who still has it enabled is told, once. ---
-				if (cloudEnabled && connectionMode !== 'local') {
-					this.logService.warn('[QIC] qic.cloud.enabled is true, but Quantlab Cloud sign-in was retired; no cloud adapter is registered');
-					this.notificationService.warn(
-						localize('qic.cloudRetired', "Orion: Quantlab Cloud sign-in has been retired. The 'qic.cloud.enabled' setting no longer has any effect.")
-					);
-				}
+				// --- Delta Plus Server adapter: QIC's one backend path, through the host's workbench service ---
+				// QIC holds no credential and no server address: the adapter is registered iff the host identity
+				// says a user is signed in. A host that cannot answer rejects here and fails this step loudly (step() logs it).
+				const identity = await this.hostIdentityService.getIdentity();
+				if (identity.signedIn) {
+					const deltaplusAdapter = this.createDeltaPlusAdapter();
 
-				// --- Delta Plus Server adapter (server mode) ---
-				if (connectionMode === 'server' || connectionMode !== 'local') {
-					// QIC holds no credential: the adapter is registered iff the host identity says a user is signed in.
-					// A host that cannot answer rejects here and fails this step loudly (step() logs it).
-					const identity = await this.hostIdentityService.getIdentity();
-					if (identity.signedIn) {
-						const deltaplusAdapter = this.createDeltaPlusAdapter();
-
-						// Register immediately -- blocking startup on a 5-second health check is
-						// user-visible latency. Actual failures surface via the circuit breaker;
-						// the background check here is diagnostic and notification only.
-						providers.set('deltaplus', deltaplusAdapter);
-						this._deltaplusAdapter = deltaplusAdapter;
-						this.logService.info('[QIC] Delta Plus adapter registered (background health check starting)');
-						void deltaplusAdapter.getHealth().then(health => {
-							this.logService.info(`[QIC] Delta Plus health: ${health.status}${health.latencyMs !== undefined ? ', latency: ' + String(health.latencyMs) + 'ms' : ''}`);
-							if (health.status === 'unavailable' && connectionMode === 'server') {
-								this.notificationService.info(
-									localize('qic.serverConnect',
-										"Orion: Delta Plus Server not currently reachable. Requests will retry when it recovers.")
-								);
-							}
-						}).catch(err => {
-							this.logService.warn('[QIC] Delta Plus background health check error:', err);
-						});
-					} else if (connectionMode === 'server') {
-						this.logService.info('[QIC] Not signed in at the host -- the Delta Plus adapter registers when the host reports a sign-in');
-					}
-				}
-
-				// --- BYOK adapters (always initialized if keys exist, for fallback) ---
-				if (connectionMode !== 'local') {
-					let anthropicKey: string | undefined;
-					let openaiKey: string | undefined;
-
-					try {
-						anthropicKey = await this.secretStorageService.get(QIC_SECRET_KEYS.ANTHROPIC_API_KEY);
-						openaiKey = await this.secretStorageService.get(QIC_SECRET_KEYS.OPENAI_API_KEY);
-						this.logService.info(`[QIC] ${describeSecretPresence(anthropicKey, openaiKey)}`);
-					} catch (storageErr) {
-						this.logService.error('[QIC] Failed to retrieve API keys from secret storage:', storageErr);
+					// Register immediately -- blocking startup on the health check is user-visible latency.
+					// A refusal (the host answers `no-route` until QIC's server route exists) is logged and shown.
+					providers.set('deltaplus', deltaplusAdapter);
+					this._deltaplusAdapter = deltaplusAdapter;
+					this.logService.info('[QIC] Delta Plus adapter registered (background health check through the host starting)');
+					void deltaplusAdapter.getHealth().then(health => {
+						this.logService.info(`[QIC] Delta Plus health: ${health.status}, latency: ${String(health.latencyMs)}ms`);
+					}).catch(err => {
+						this.logService.error('[QIC] The host refused the Delta Plus health check:', err);
 						this.notificationService.warn(
-							localize('qic.secretStorageError', "Orion: Could not retrieve stored API keys. Cloud or Ollama may still work.")
+							localize('qic.serverHealthRefused', "Orion: The host refused the Delta Plus health check: {0}", err instanceof Error ? err.message : String(err))
 						);
-					}
-
-					if (anthropicKey && anthropicKey.trim()) {
-						try {
-							providers.set('anthropic', new AnthropicAdapter({ apiKey: anthropicKey }, this.requestService));
-						} catch (err) {
-							this.logService.warn('[QIC] Failed to initialize Anthropic provider:', err);
-							this.notificationService.warn(
-								localize('qic.anthropicInitFailed', "Orion: Anthropic API key may be invalid. Run 'Orion: Set API Key' to update it.")
-							);
-						}
-					}
-					if (openaiKey && openaiKey.trim()) {
-						try {
-							providers.set('openai', new OpenAIAdapter({ apiKey: openaiKey }, this.requestService));
-						} catch (err) {
-							this.logService.warn('[QIC] Failed to initialize OpenAI provider:', err);
-							this.notificationService.warn(
-								localize('qic.openaiInitFailed', "Orion: OpenAI API key may be invalid. Run 'Orion: Set API Key' to update it.")
-							);
-						}
-					}
-				}
-
-				// --- Local adapter (always available) ---
-				// Pass requestService to bypass CSP restrictions in the renderer
-				try {
-					providers.set('ollama', new OllamaAdapter({ baseUrl: ollamaUrl }, this.requestService));
-				} catch (err) {
-					this.logService.warn('[QIC] Failed to initialize Ollama provider:', err);
+					});
+				} else {
+					this.logService.info('[QIC] Not signed in at the host -- the Delta Plus adapter registers when the host reports a sign-in');
 				}
 
 				// --- Build infrastructure (must precede DegradationManager hookup) ---
@@ -1461,27 +1290,15 @@ class QicActivation extends Disposable {
 
 				// --- Provider diagnostics ---
 				this.logService.info(`[QIC] Gateway initialized: ${providers.size} provider(s) -- [${[...providers.keys()].join(', ')}]`);
-				this.logService.info(`[QIC] Connection mode: ${connectionMode}, cloud enabled: ${cloudEnabled}`);
+				this.logService.info(`[QIC] Connection mode: ${connectionMode}`);
 
 				// --- User guidance ---
 				if (providers.size === 0) {
 					this.notificationService.warn(
 						localize('qic.noProviders',
-							"Orion: No AI providers configured. Connect to the Delta Plus server, sign in to Quantlab Cloud, or configure API keys.")
-					);
-				} else if (!providers.has('deltaplus') && connectionMode === 'server') {
-					this.notificationService.info(
-						localize('qic.serverConnect.notConnected',
-							"Orion: Delta Plus Server not connected. Ensure the server is running and you are logged in, or switch connection mode.")
-					);
-				} else if (providers.size === 1 && providers.has('ollama')) {
-					this.logService.warn('[QIC] No API keys configured -- only local Ollama available');
-					this.notificationService.info(
-						localize('qic.noApiKeys',
-							"Orion: No API keys configured. Using local Ollama only. To add Anthropic or OpenAI, run 'Orion: Set API Key' from the Command Palette (Ctrl+Shift+P).")
+							"Orion: No AI provider is registered. Orion connects to the Delta Plus Server through the host: sign in from the Quantlab terminal view.")
 					);
 				}
-
 
 				// --- DataTier sync (with backwards compat for legacy TELEMETRY_ENABLED) ---
 				let dataTier = this.configurationService.getValue<DataTier>(QIC_SETTINGS.DATA_TIER) ?? 'private';
@@ -1570,7 +1387,6 @@ class QicActivation extends Disposable {
 					search: new SearchTools(indexer, workspacePath, this.fileService),
 					reference: new ReferenceTools(this.languageFeaturesService, this.textModelService, workspacePath),
 					terminal: new TerminalTools(terminalGuard, workspacePath),
-					network: new NetworkTools(egressEnforcer, secretScanner),
 					packages: new PackageTools(terminalGuard, workspacePath),
 					lsp: new LspTools(),
 					notebook: new NotebookTools(null, null, workspacePath, this.fileService),
@@ -1585,8 +1401,7 @@ class QicActivation extends Disposable {
 			// Step 8b: Status bar registration + cloud wiring
 			{
 				const statusBar = new QicStatusBarContribution();
-				const connectionMode = this.configurationService.getValue<ConnectionMode>(QIC_SETTINGS.CONNECTION_MODE) ?? 'cloud';
-				statusBar.setConnectionMode(connectionMode);
+				statusBar.setConnectionMode(readConnectionMode(this.configurationService));
 
 				const statusBarEntry = this.statusbarService.addEntry(
 					{
@@ -1617,7 +1432,7 @@ class QicActivation extends Disposable {
 					statusBar.updateFromDegradation(level);
 				});
 
-				// Telemetry service setup (cloud transport + periodic flush)
+				// Telemetry service setup (local buffer + periodic flush; there is no telemetry upload)
 				// consentStore + egressEnforcer guaranteed assigned by Step 4 (security)
 				this._telemetryService = new TelemetryService(consentStore!, egressEnforcer!);
 				const dataTier = this.configurationService.getValue<DataTier>(QIC_SETTINGS.DATA_TIER) ?? 'private';
@@ -1685,11 +1500,11 @@ class QicActivation extends Disposable {
 	private _currentStep = '';
 
 	/**
-	 * Build the Delta Plus adapter. It holds no credential (QL-LOGIN): the host keeps the tokens.
+	 * Build the Delta Plus adapter. It holds no credential and no server address (QL-LOGIN, QL-DATA):
+	 * every call goes through the host's workbench service, which keeps the tokens and the one backend origin.
 	 */
 	private createDeltaPlusAdapter(): DeltaPlusAdapter {
-		const serverUrl = this.configurationService.getValue<string>(QIC_SETTINGS.SERVER_BASE_URL) ?? 'https://api.deltaplus.io';
-		return new DeltaPlusAdapter({ baseUrl: serverUrl }, this.requestService);
+		return new DeltaPlusAdapter(this.hostIdentityService);
 	}
 
 	/**
@@ -1715,8 +1530,7 @@ class QicActivation extends Disposable {
 		}
 
 		if (signedIn) {
-			const currentMode = this.configurationService.getValue<ConnectionMode>(QIC_SETTINGS.CONNECTION_MODE);
-			if (currentMode !== 'server' || providers.has('deltaplus')) { return; }
+			if (providers.has('deltaplus')) { return; }
 			const adapter = this.createDeltaPlusAdapter();
 			providers.set('deltaplus', adapter);
 			this._deltaplusAdapter = adapter;

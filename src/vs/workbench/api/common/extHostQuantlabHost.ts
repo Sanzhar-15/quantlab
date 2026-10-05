@@ -33,7 +33,7 @@ export interface QuantlabHostUser {
 	readonly id: string;
 	readonly email: string;
 	readonly name?: string;
-	readonly tier?: string;
+	readonly tier: string;
 }
 
 export interface QuantlabHostIdentity {
@@ -103,13 +103,11 @@ function toIdentity(dto: QuantlabIdentityDto): QuantlabHostIdentity {
 	if (dto.user === undefined) {
 		throw new Error(`${LOG_PREFIX} a signed-in identity arrived without a user`);
 	}
+	// `tier` is copied as the main side sent it: never defaulted and never checked here (the workbench parser requires it).
 	const { id, email, name, tier } = dto.user;
-	const user: { id: string; email: string; name?: string; tier?: string } = { id, email };
+	const user: { id: string; email: string; name?: string; tier: string } = { id, email, tier };
 	if (name !== undefined) {
 		user.name = name;
-	}
-	if (tier !== undefined) {
-		user.tier = tier;
 	}
 	return Object.freeze({ epoch: dto.epoch, signedIn: true, user: Object.freeze(user) });
 }

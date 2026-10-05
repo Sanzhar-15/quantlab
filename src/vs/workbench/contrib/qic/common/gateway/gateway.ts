@@ -4,8 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type { GatewayRequest, StreamChunk, ProviderAdapter, ProviderHealth } from '../canonical/interfaces.js';
-import type { ProviderResponse } from '../canonical/types.js';
-import { QicError } from '../canonical/types.js';
+import { QicError, type ProviderResponse } from '../canonical/types.js';
 import type { RateLimiter } from './rateLimiter.js';
 import type { CircuitBreaker } from '../recovery/circuitBreaker.js';
 import type { EgressBoundaryEnforcer } from '../security/egressEnforcer.js';
@@ -24,19 +23,19 @@ export class Gateway {
 		private readonly egressEnforcer: EgressBoundaryEnforcer,
 		private readonly secretScanner: OptimizedSecretScanner,
 		private readonly modelRegistry: ModelRegistry,
-	) {}
+	) { }
 
 	async sendRequest(request: GatewayRequest): Promise<ProviderResponse> {
 		// Resolve model alias
 		const resolvedModel = this.modelRegistry.resolveAlias(request.model);
 		const providerId = request.providerId ?? this.modelRegistry.getProviderForModel(resolvedModel);
 		if (!providerId) {
-			throw new QicError('QIC-P004', `No provider available for model "${resolvedModel}". Set an API key with "Orion: Set API Key" and reload the window.`);
+			throw new QicError('QIC-P004', `No provider available for model "${resolvedModel}". Sign in from the Quantlab terminal view and reload the window.`);
 		}
 
 		const provider = this.providers.get(providerId);
 		if (!provider) {
-			throw new QicError('QIC-P004', `Provider "${providerId}" not available. If you just set an API key, reload the window (Ctrl+Shift+P → "Reload Window").`);
+			throw new QicError('QIC-P004', `Provider "${providerId}" not available. Orion's one provider is the Delta Plus Server through the host: sign in from the Quantlab terminal view.`);
 		}
 
 		// Step 1: Egress consent + secret redaction
@@ -77,12 +76,12 @@ export class Gateway {
 		const resolvedModel = this.modelRegistry.resolveAlias(request.model);
 		const providerId = request.providerId ?? this.modelRegistry.getProviderForModel(resolvedModel);
 		if (!providerId) {
-			throw new QicError('QIC-P004', `No provider available for model "${resolvedModel}". Set an API key with "Orion: Set API Key" and reload the window.`);
+			throw new QicError('QIC-P004', `No provider available for model "${resolvedModel}". Sign in from the Quantlab terminal view and reload the window.`);
 		}
 
 		const provider = this.providers.get(providerId);
 		if (!provider) {
-			throw new QicError('QIC-P004', `Provider "${providerId}" not available. If you just set an API key, reload the window (Ctrl+Shift+P → "Reload Window").`);
+			throw new QicError('QIC-P004', `Provider "${providerId}" not available. Orion's one provider is the Delta Plus Server through the host: sign in from the Quantlab terminal view.`);
 		}
 
 		// Egress check + sanitization
@@ -106,7 +105,7 @@ export class Gateway {
 			throw new QicError('QIC-P005', `Rate limited. Wait ${rateResult.waitMs}ms`);
 		}
 
-		// Circuit breaker — check state before streaming, record outcome after.
+		// Circuit breaker -- check state before streaming, record outcome after.
 		const breaker = this.circuitBreakers.get(providerId);
 		const streamReq = { ...sanitizedRequest, model: resolvedModel };
 
@@ -163,13 +162,15 @@ export class Gateway {
 				// Respect Retry-After header on 429
 				let delay = delays[attempt] ?? 3000;
 				if (err instanceof QicError && err.httpStatus === 429) {
-					const retryAfter = (err.details as any)?.retryAfterMs;
+					const details: unknown = err.details;
+					const retryAfter = typeof details === 'object' && details !== null ? (details as Record<string, unknown>)['retryAfterMs'] : undefined;
 					if (retryAfter && typeof retryAfter === 'number') { delay = retryAfter; }
 				}
 				await new Promise(resolve => setTimeout(resolve, delay));
 			}
 		}
-		throw lastError!;
+		if (lastError === undefined) { throw new Error('QIC gateway: no attempt ran'); }
+		throw lastError;
 	}
 
 	private isRetryable(err: Error): boolean {

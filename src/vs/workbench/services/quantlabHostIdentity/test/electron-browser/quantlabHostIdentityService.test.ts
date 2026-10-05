@@ -86,7 +86,7 @@ suite('QuantlabHostIdentityService', () => {
 		return disposables.add(new TestService(log, notifications, secrets));
 	}
 
-	const signedIn: QuantlabIdentity = { epoch: 4, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada' } };
+	const signedIn: QuantlabIdentity = { epoch: 4, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada', tier: 'pro' } };
 
 	setup(() => {
 		invokeImpl = async () => ({ epoch: 1, signedIn: false });
@@ -98,7 +98,7 @@ suite('QuantlabHostIdentityService', () => {
 	});
 
 	test('getIdentity returns the parsed answer of the host', async () => {
-		invokeImpl = async () => ({ epoch: 4, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada' } });
+		invokeImpl = async () => ({ epoch: 4, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada', tier: 'pro' } });
 		const service = createService();
 		await service.whenPurged();
 

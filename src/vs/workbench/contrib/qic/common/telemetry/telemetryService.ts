@@ -42,23 +42,10 @@ export class TelemetryService {
 	private flushTimer: ReturnType<typeof setInterval> | null = null;
 	private _dataTier: DataTier = 'private';
 
-	// Cloud transport (set after cloud adapter is ready)
-	private _cloudBaseUrl: string | null = null;
-	private _getAccessToken: (() => string) | null = null;
-
 	constructor(
 		private readonly consentStore: ConsentStore,
 		private readonly egressEnforcer: EgressBoundaryEnforcer,
-	) {}
-
-	/**
-	 * Set cloud transport for uploading telemetry to the server.
-	 * Call after cloud adapter is constructed.
-	 */
-	setCloudTransport(baseUrl: string, getAccessToken: () => string): void {
-		this._cloudBaseUrl = baseUrl;
-		this._getAccessToken = getAccessToken;
-	}
+	) { }
 
 	/**
 	 * Update the data tier. Called when the user changes qic.dataTier setting.
@@ -82,7 +69,7 @@ export class TelemetryService {
 			return;
 		}
 		if (this._dataTier === 'anonymous-metrics' && event.containsCodeContent) {
-			return; // Metadata only — no code content
+			return; // Metadata only -- no code content
 		}
 		// 'data-contributor': send everything
 
@@ -97,7 +84,7 @@ export class TelemetryService {
 			return;
 		}
 
-		// Sanitize event — strip any PII
+		// Sanitize event -- strip any PII
 		const sanitized = this.sanitizeEvent(event);
 
 		this.buffer.push({
@@ -113,7 +100,8 @@ export class TelemetryService {
 	}
 
 	/**
-	 * Flush buffered telemetry events through egress enforcer and cloud transport.
+	 * Flush buffered telemetry events through the egress enforcer. There is no upload: the retired
+	 * Quantlab Cloud transport was deleted (QL-DATA).
 	 */
 	async flush(): Promise<void> {
 		if (this.buffer.length === 0) {
@@ -127,34 +115,6 @@ export class TelemetryService {
 			sessionId: 'telemetry',
 			purpose: 'telemetry_flush',
 		});
-
-		// Upload to cloud if transport is configured
-		if (this._cloudBaseUrl && this._getAccessToken) {
-			try {
-				const specEvents = events.map(e => ({
-					type: e.event.name,
-					timestamp: e.timestamp,
-					data: {
-						category: e.category,
-						...e.event.properties,
-						...e.event.measurements,
-					},
-				}));
-				await fetch(`${this._cloudBaseUrl}/v1/telemetry/interaction`, {
-					method: 'POST',
-					headers: {
-						'Authorization': `Bearer ${this._getAccessToken()}`,
-						'Content-Type': 'application/json',
-					},
-					body: JSON.stringify({ events: specEvents }),
-					signal: AbortSignal.timeout(10_000),
-				});
-			} catch {
-				// Fire-and-forget: re-buffer events on failure (up to max)
-				const toRestore = events.slice(0, this.MAX_BUFFER_SIZE - this.buffer.length);
-				this.buffer.unshift(...toRestore);
-			}
-		}
 	}
 
 	/**
@@ -185,7 +145,7 @@ export class TelemetryService {
 	}
 
 	/**
-	 * Sanitize event properties — remove anything that looks like PII or secrets.
+	 * Sanitize event properties -- remove anything that looks like PII or secrets.
 	 */
 	private sanitizeEvent(event: TelemetryEvent): TelemetryEvent {
 		const sanitizedProps: Record<string, string | number | boolean> = {};
