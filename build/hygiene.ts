@@ -15,6 +15,7 @@ import { all, copyrightFilter, eslintFilter, indentationFilter, stylelintFilter,
 import eslint from './gulp-eslint.ts';
 import * as formatter from './lib/formatter.ts';
 import gulpstylelint from './stylelint.ts';
+import { checkExtensionsGallery } from './lib/quantlabGallery.ts';
 
 const copyrightHeaderLines = [
 	'/*---------------------------------------------------------------------------------------------',
@@ -37,8 +38,9 @@ export function hygiene(some: NodeJS.ReadWriteStream | string[] | undefined, run
 	const productJson = es.through(function (file: VinylFile) {
 		const product = JSON.parse(file.contents!.toString('utf8'));
 
-		if (product.extensionsGallery) {
-			console.error(`product.json: Contains 'extensionsGallery'`);
+		const galleryProblem = checkExtensionsGallery(product.extensionsGallery);
+		if (galleryProblem) {
+			console.error(`product.json: ${galleryProblem}`);
 			errorCount++;
 		}
 
