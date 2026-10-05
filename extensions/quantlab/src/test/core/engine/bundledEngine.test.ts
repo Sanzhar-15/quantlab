@@ -9,7 +9,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { bundledEngineCandidates, resolveBundledEngine } from '../../../core/engine/bundledEngine';
+import { bundledEngineCandidates, bundledEngineLaunch, resolveBundledEngine } from '../../../core/engine/bundledEngine';
 
 suite('bundledEngine – resolver', () => {
 
@@ -65,5 +65,17 @@ suite('bundledEngine – resolver', () => {
 		} finally {
 			fs.chmodSync(dir, 0o755);
 		}
+	});
+});
+
+suite('bundledEngine – launch', () => {
+	test('the bundled engine runs in its own directory, with no engine source tree', () => {
+		const exe = path.join('/Applications', 'Delta Plus.app', 'Contents', 'Resources', 'app', 'extensions', 'quantlab', 'engine', 'quantlab-engine', 'quantlab-engine');
+		assert.deepStrictEqual(bundledEngineLaunch(exe), {
+			executable: exe,
+			source: 'bundled engine',
+			cwd: path.dirname(exe),
+			engineRoot: null,
+		});
 	});
 });
