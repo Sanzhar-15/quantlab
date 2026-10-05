@@ -21,7 +21,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { bundledEngineLaunch, EngineLaunch } from '../../../core/engine/bundledEngine';
+import { bundledEngineLaunch, ENGINE_SOURCES, EngineLaunch } from '../../../core/engine/bundledEngine';
 import { JobRunner, resolveEngineModule } from '../../../core/engine/JobRunner';
 import { EngineEvent, JobRequest } from '../../../types/engine';
 
@@ -265,20 +265,26 @@ suite('JobRunner – engine actions and launch', () => {
 			});
 		}
 
-		test('the bundled engine runs in its own directory with no PYTHONPATH, and the first log line names it', async function () {
-			if (process.platform === 'win32') {
-				this.skip();
-			}
-			const dir = path.join(root, 'engine', 'quantlab-engine');
-			const exe = probe(dir);
-			const events = await run(bundledEngineLaunch(exe));
-			const failed = events.find(e => e.type === 'failed');
-			assert.ok(failed && failed.type === 'failed');
-			assert.strictEqual(failed.error, `-m quantlab.cli.run_backtest|${dir}|unset`);
+		function firstLog(events: EngineEvent[]): string {
 			const first = events.find(e => e.type === 'log');
 			assert.ok(first && first.type === 'log');
-			assert.strictEqual(first.message, `Starting backtest job: ${exe} -m quantlab.cli.run_backtest (bundled engine; cwd ${dir})`);
-		});
+			return first.message;
+		}
+
+		for (const [step, source] of [['packaged', ENGINE_SOURCES.packaged], ['development', ENGINE_SOURCES.development]] as const) {
+			test(`the ${step} bundled engine runs in its own directory with no PYTHONPATH, and the first log line names the step`, async function () {
+				if (process.platform === 'win32') {
+					this.skip();
+				}
+				const dir = path.join(root, 'engine', 'quantlab-engine');
+				const exe = probe(dir);
+				const events = await run(bundledEngineLaunch(exe, source));
+				const failed = events.find(e => e.type === 'failed');
+				assert.ok(failed && failed.type === 'failed');
+				assert.strictEqual(failed.error, `-m quantlab.cli.run_backtest|${dir}|unset`);
+				assert.strictEqual(firstLog(events), `Starting backtest job: ${exe} -m quantlab.cli.run_backtest (${step} bundled engine; cwd ${dir})`);
+			});
+		}
 
 		test('an interpreter runs in the engine source tree with it on PYTHONPATH', async function () {
 			if (process.platform === 'win32') {
@@ -287,10 +293,11 @@ suite('JobRunner – engine actions and launch', () => {
 			const engineRoot = path.join(root, 'engine-src');
 			fs.mkdirSync(engineRoot);
 			const exe = probe(path.join(root, 'bin'));
-			const events = await run({ executable: exe, source: 'test interpreter', cwd: engineRoot, engineRoot });
+			const events = await run({ executable: exe, source: ENGINE_SOURCES.setting, cwd: engineRoot, engineRoot });
 			const failed = events.find(e => e.type === 'failed');
 			assert.ok(failed && failed.type === 'failed');
 			assert.strictEqual(failed.error, `-m quantlab.cli.run_backtest|${engineRoot}|${engineRoot}`);
+			assert.strictEqual(firstLog(events), `Starting backtest job: ${exe} -m quantlab.cli.run_backtest (setting quantlab.pythonPath; cwd ${engineRoot})`);
 		});
 	});
 });

@@ -210,7 +210,7 @@ async function backtestBundledEngine() {
 	}
 	const match = /^Starting backtest job: (.+) -m quantlab\.cli\.run_backtest \(([^;]+); cwd /.exec(start.message);
 	const appRoot = vscode.env.appRoot;
-	if (match === null || match[2] !== 'bundled engine' || !match[1].startsWith(`${appRoot}${path.sep}`)) {
+	if (match === null || match[2] !== 'packaged bundled engine' || !match[1].startsWith(`${appRoot}${path.sep}`)) {
 		throw new Error(`[engine_not_bundled] the run did not use this app's bundled engine (app root ${appRoot}): ${start.message}`);
 	}
 	return { status: 'PASS', detail: `${runs[0]}: ${ui.meta}; ${metrics.length} metrics (${metrics.slice(0, 3).join(', ')}); engine ${path.relative(appRoot, match[1])}` };
