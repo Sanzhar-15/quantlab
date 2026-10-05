@@ -12,7 +12,7 @@ import type { BaseWindow, BrowserWindow, Event as ElectronEvent, Input, WebConte
 import { DeferredPromise, timeout } from '../../../base/common/async.js';
 import { toErrorMessage } from '../../../base/common/errorMessage.js';
 import { Event } from '../../../base/common/event.js';
-import { Disposable, DisposableStore, IDisposable } from '../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore, IDisposable, MutableDisposable } from '../../../base/common/lifecycle.js';
 import { isMacintosh } from '../../../base/common/platform.js';
 import { ILifecycleMainService } from '../../../platform/lifecycle/electron-main/lifecycleMainService.js';
 import { ILogService } from '../../../platform/log/common/log.js';
@@ -26,6 +26,11 @@ import { secureWorkbenchContents } from './security.js';
 
 /** The ONE key that toggles between the terminal and the workbench, while either has focus. Modifiers `CmdOrCtrl`, `Alt`, `Shift`, then one letter. */
 export const QL_TOGGLE_ACCELERATOR = 'CmdOrCtrl+Alt+T';
+
+// QuantLab host (U6): the ONE key that opens the overlay when it is closed and closes it when it is open, while the terminal, the
+// workbench or the overlay has focus. Same grammar as the toggle key; it is a window-scoped `before-input-event` on each of the
+// three views, never a global shortcut (rule 3).
+export const QL_OVERLAY_ACCELERATOR = 'CmdOrCtrl+Alt+K';
 
 /** The ONE command `Ports.openQuantlab('new-strategy')` runs in the workbench. */
 export const QL_NEW_STRATEGY_COMMAND = 'quantlab.newStrategy';
@@ -61,6 +66,7 @@ function parseAccelerator(accelerator: string): IParsedAccelerator {
 }
 
 const TOGGLE_ACCELERATOR = parseAccelerator(QL_TOGGLE_ACCELERATOR);
+const OVERLAY_ACCELERATOR = parseAccelerator(QL_OVERLAY_ACCELERATOR); // QuantLab host (U6)
 
 // PERF-1b's control `perf-delayed-switch`: test builds only (`globalThis.QL_TEST_BUILD` is a constant `false` in a product
 // bundle, so esbuild drops the branch), and only when the launch names it. It delays every toggle by 250 ms so that the
@@ -103,6 +109,9 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 
 	private ensuring: Promise<IAdoptedWorkbench> | undefined;
 
+	/** QuantLab host (U6): the key watch on the overlay view's contents (the overlay is a new view each time it opens). */
+	private readonly overlayKeyWatch = this._register(new MutableDisposable<IDisposable>());
+
 	/** The host window's close was asked for and is being settled through the lifecycle. */
 	private closing = false;
 
@@ -130,7 +139,7 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 
 		this.terminalHost = terminalHost;
 
-		this._register(this.watchToggleKey(terminalView.webContents));
+		this._register(this.watchKeys(terminalView.webContents)); // QuantLab host (U6): the toggle key and the overlay key
 		terminalHost.window.on('close', event => this.onHostWindowClose(event));
 		this.registerLifecyclePlaceholder();
 		this.deps.dialogs.setParentResolver(window => this.dialogParent(window));
@@ -217,10 +226,15 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 
 	/** The toggle key. The host log gets `view-switch start` at the key's receipt and `view-switch done` once the target view is shown (PERF-1b SW-1 reads both). */
 	async toggle(): Promise<void> {
-		const host = this.requireTerminalHost().host;
+		const terminalHost = this.requireTerminalHost();
+		const host = terminalHost.host;
 		const to = this.shown === 'terminal' ? 'workbench' : 'terminal';
 
 		host.log(`view-switch start to=${to} t=${Date.now()}`);
+		// QuantLab host (U6): a switch closes the overlay first (the client's `show` closes it too, so no path leaves it open)
+		if (terminalHost.overlayOpen()) {
+			terminalHost.closeOverlay();
+		}
 		if (perfDelayedSwitchActive()) {
 			await timeout(PERF_DELAYED_SWITCH_MS);
 		}
@@ -273,27 +287,75 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		window.show();
 	}
 
-	private watchToggleKey(contents: WebContents): IDisposable {
+	/**
+	 * The window-scoped keys of one view's contents: the toggle key and (U6) the overlay key. Each is swallowed (`preventDefault`)
+	 * so the view does not also see it, and an auto-repeat does nothing.
+	 */
+	private watchKeys(contents: WebContents): IDisposable {
 		return Event.fromNodeEventEmitter(contents, 'before-input-event', (event: ElectronEvent, input: Input) => ({ event, input }))(({ event, input }) => {
-			if (!matchesAccelerator(input, TOGGLE_ACCELERATOR)) {
+			if (matchesAccelerator(input, TOGGLE_ACCELERATOR)) {
+				event.preventDefault();
+				if (input.isAutoRepeat) {
+					return;
+				}
+
+				this.toggle().catch(error => this.reportFailure('toggle key', error));
+
 				return;
 			}
 
-			event.preventDefault();
-			if (input.isAutoRepeat) {
-				return;
-			}
+			// QuantLab host (U6)
+			if (matchesAccelerator(input, OVERLAY_ACCELERATOR)) {
+				event.preventDefault();
+				if (input.isAutoRepeat) {
+					return;
+				}
 
-			this.toggle().catch(error => this.reportFailure('toggle key', error));
+				this.toggleOverlay().catch(error => this.reportOverlayFailure('overlay key', error));
+			}
 		});
 	}
 
+	/**
+	 * QuantLab host (U6): the overlay key. Closed: opens the overlay (a view of the terminal's own wiring, over the view on
+	 * screen) and watches its keys; open: closes it. `openOverlay` registers the view before it returns its promise, so the key
+	 * watch is on the overlay's contents from the moment it exists (a key pressed while its document loads still closes it).
+	 */
+	async toggleOverlay(): Promise<void> {
+		const terminalHost = this.requireTerminalHost();
+		if (terminalHost.overlayOpen()) {
+			terminalHost.closeOverlay();
+
+			return;
+		}
+
+		const opening = terminalHost.openOverlay();
+		const view = terminalHost.view('overlay');
+		if (view) {
+			this.overlayKeyWatch.value = this.watchKeys(view.webContents);
+		}
+
+		await opening;
+		if (!view) {
+			throw new Error('QuantLab host (U6): openOverlay resolved and registered no view named overlay');
+		}
+	}
+
 	private reportFailure(what: string, error: unknown): void {
+		this.showFailure('QuantLab could not show the workbench.', what, error);
+	}
+
+	// QuantLab host (U6): the overlay's failures read as the overlay's, not the workbench's
+	private reportOverlayFailure(what: string, error: unknown): void {
+		this.showFailure('QuantLab could not open the overlay.', what, error);
+	}
+
+	private showFailure(headline: string, what: string, error: unknown): void {
 		this.deps.logService.error(`QuantLab host: ${what} failed`, error);
 
 		this.deps.dialogs.showMessageBox({
 			type: 'error',
-			message: 'QuantLab could not show the workbench.',
+			message: headline,
 			detail: `${what}: ${toErrorMessage(error)}`
 		}).then(undefined, shown => this.deps.logService.error('QuantLab host: showing the failure dialog failed', shown));
 	}
@@ -308,7 +370,7 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 
 		try {
 			disposables.add(secureWorkbenchContents(workbench.webContents, { logService: this.deps.logService, openExternal: url => this.deps.openExternal(url) }));
-			disposables.add(this.watchToggleKey(workbench.webContents));
+			disposables.add(this.watchKeys(workbench.webContents)); // QuantLab host (U6): the toggle key and the overlay key
 
 			// hidden until it signalled ready: the terminal stays on screen meanwhile
 			workbench.view.setVisible(false);
