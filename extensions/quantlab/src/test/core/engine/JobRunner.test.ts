@@ -22,7 +22,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { bundledEngineLaunch, ENGINE_SOURCES, EngineLaunch } from '../../../core/engine/bundledEngine';
-import { JobRunner, resolveEngineModule } from '../../../core/engine/JobRunner';
+import { JobRunner, readEngineResult, resolveEngineModule } from '../../../core/engine/JobRunner';
 import { EngineEvent, JobRequest } from '../../../types/engine';
 
 function makeRequest(overrides?: Partial<JobRequest>): JobRequest {
@@ -208,7 +208,7 @@ suite('JobRunner – Audit Verification', () => {
 			if (process.platform === 'win32') {
 				this.skip();
 			}
-			const exe = engineScript(dir, `exec 0<&-\nprintf '{"success":true,"metrics":{}}'\nexit 3\n`);
+			const exe = engineScript(dir, `exec 0<&-\nprintf '%s' '${COMPLETE}'\nexit 3\n`);
 			const events = await runToEnd(bigRequest(), launch(exe));
 			const terminal = events.filter(e => e.type === 'failed' || e.type === 'complete');
 			assert.strictEqual(terminal.length, 1, JSON.stringify(terminal));
@@ -221,12 +221,64 @@ suite('JobRunner – Audit Verification', () => {
 			if (process.platform === 'win32') {
 				this.skip();
 			}
-			const exe = engineScript(dir, `cat >/dev/null\nprintf '{"success":true,"metrics":{"m":1}}'\n`);
+			const exe = engineScript(dir, `cat >/dev/null\nprintf '%s' '${COMPLETE}'\n`);
 			const events = await runToEnd(bigRequest(), launch(exe));
 			const terminal = events.filter(e => e.type === 'failed' || e.type === 'complete');
 			assert.strictEqual(terminal.length, 1, JSON.stringify(terminal));
 			assert.strictEqual(terminal[0].type, 'complete');
 		});
+	});
+});
+
+/** A complete success result, every field the engine's contract requires (run_backtest.py:160-166). */
+const COMPLETE = JSON.stringify({ success: true, metrics: { Sharpe: 1.2, Trades: 3 }, warnings: [], equity: [{ t: 1, v: 100 }], signals: [{ t: 1, type: 'entry', price: 10 }] });
+
+// The engine's stdout contract: engine/quantlab/cli/run_backtest.py convert_results :105-112 and :160-166 (a success always
+// has metrics, warnings, equity, signals); main :259, :267 (a failure without stack) and :279-283 (with stack).
+suite('JobRunner - the engine result contract', () => {
+	const complete = JSON.parse(COMPLETE) as Record<string, unknown>;
+
+	test('a complete success is read as is', () => {
+		assert.deepStrictEqual(readEngineResult(complete), { kind: 'complete', result: { metrics: { Sharpe: 1.2, Trades: 3 }, warnings: [], equity: [{ t: 1, v: 100 }], signals: [{ t: 1, type: 'entry', price: 10 }] } });
+	});
+
+	for (const field of ['metrics', 'warnings', 'equity', 'signals']) {
+		test(`a success without '${field}' is invalid, naming it`, () => {
+			const result = { ...complete };
+			delete result[field];
+			const reading = readEngineResult(result);
+			assert.ok(reading.kind === 'invalid', JSON.stringify(reading));
+			assert.match(reading.reason, new RegExp(`no '${field}'`));
+		});
+	}
+
+	test('wrong shapes are named: a non-number metric, an equity point, a signal type, success itself', () => {
+		assert.deepStrictEqual(readEngineResult({ ...complete, metrics: { Sharpe: null } }), { kind: 'invalid', reason: `metric 'Sharpe' is null, not a finite number` });
+		assert.strictEqual(readEngineResult({ ...complete, equity: [{ t: 1 }] }).kind, 'invalid');
+		assert.strictEqual(readEngineResult({ ...complete, signals: [{ t: 1, type: 'hold' }] }).kind, 'invalid');
+		assert.deepStrictEqual(readEngineResult({ metrics: {} }), { kind: 'invalid', reason: `'success' is undefined, not true or false` });
+	});
+
+	test('a failure needs its error; stack is optional (:259, :267 omit it)', () => {
+		assert.deepStrictEqual(readEngineResult({ success: false, error: 'No input received on stdin' }), { kind: 'failed', error: 'No input received on stdin', stack: undefined });
+		assert.deepStrictEqual(readEngineResult({ success: false, error: 'boom', stack: 'Traceback' }), { kind: 'failed', error: 'boom', stack: 'Traceback' });
+		assert.deepStrictEqual(readEngineResult({ success: false }), { kind: 'invalid', reason: `a failure result has no 'error' string (got undefined)` });
+	});
+
+	test('a job whose engine prints a success without metrics fails by name, never an empty success', async function () {
+		if (process.platform === 'win32') {
+			this.skip();
+		}
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ql-jobrunner-contract-'));
+		try {
+			const exe = engineScript(dir, `cat >/dev/null\nprintf '{"success":true,"warnings":[],"equity":[],"signals":[]}'\n`);
+			const events = await runToEnd(makeRequest(), launch(exe));
+			assert.deepStrictEqual(events.filter(e => e.type === 'failed' || e.type === 'complete'), [
+				{ type: 'failed', jobId: 'test-job-1', error: `The engine's result is invalid: a success result has no 'metrics' object (got undefined). Exit code: 0` },
+			]);
+		} finally {
+			fs.rmSync(dir, { recursive: true });
+		}
 	});
 });
 
