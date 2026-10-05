@@ -10,7 +10,7 @@ import { Codicon } from '../../../../../base/common/codicons.js';
 import { Color } from '../../../../../base/common/color.js';
 import { Event } from '../../../../../base/common/event.js';
 import { KeyCode, KeyMod } from '../../../../../base/common/keyCodes.js';
-import { Disposable, DisposableStore, MutableDisposable, toDisposable } from '../../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore, toDisposable } from '../../../../../base/common/lifecycle.js';
 import { isNumber } from '../../../../../base/common/types.js';
 import { getCodeEditor } from '../../../../../editor/browser/editorBrowser.js';
 import { EditorContextKeys } from '../../../../../editor/common/editorContextKeys.js';
@@ -33,7 +33,6 @@ import { ACTIVITY_BAR_FOREGROUND } from '../../../../common/theme.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
 import { IHostService } from '../../../../services/host/browser/host.js';
 import { IWorkbenchLayoutService, Parts } from '../../../../services/layout/browser/layoutService.js';
-import { IStatusbarEntry, IStatusbarEntryAccessor, IStatusbarService } from '../../../../services/statusbar/browser/statusbar.js';
 import { AccessibilityVoiceSettingId, SpeechTimeoutDefault } from '../../../accessibility/browser/accessibilityConfiguration.js';
 import { InlineChatController } from '../../../inlineChat/browser/inlineChatController.js';
 import { CTX_INLINE_CHAT_FOCUSED, MENU_INLINE_CHAT_WIDGET_SECONDARY } from '../../../inlineChat/common/inlineChat.js';
@@ -1040,7 +1039,6 @@ export class KeywordActivationContribution extends Disposable implements IWorkbe
 	) {
 		super();
 
-		this._register(instantiationService.createInstance(KeywordActivationStatusEntry));
 
 		this.registerListeners();
 	}
@@ -1147,71 +1145,6 @@ export class KeywordActivationContribution extends Disposable implements IWorkbe
 		this.activeSession?.dispose();
 
 		super.dispose();
-	}
-}
-
-class KeywordActivationStatusEntry extends Disposable {
-
-	private readonly entry = this._register(new MutableDisposable<IStatusbarEntryAccessor>());
-
-	private static STATUS_NAME = localize('keywordActivation.status.name', "Voice Keyword Activation");
-	private static STATUS_COMMAND = 'keywordActivation.status.command';
-	private static STATUS_ACTIVE = localize('keywordActivation.status.active', "Listening to 'Hey Code'...");
-	private static STATUS_INACTIVE = localize('keywordActivation.status.inactive', "Waiting for voice chat to end...");
-
-	constructor(
-		@ISpeechService private readonly speechService: ISpeechService,
-		@IStatusbarService statusbarService: IStatusbarService,
-		@ICommandService commandService: ICommandService,
-		@IConfigurationService private readonly configurationService: IConfigurationService,
-		@IChatAgentService private readonly chatAgentService: IChatAgentService
-	) {
-		super();
-
-		this.registerListeners();
-		this.updateStatusEntry();
-	}
-
-	private registerListeners(): void {
-		this._register(this.speechService.onDidStartKeywordRecognition(() => this.updateStatusEntry()));
-		this._register(this.speechService.onDidEndKeywordRecognition(() => this.updateStatusEntry()));
-		this._register(this.configurationService.onDidChangeConfiguration(e => {
-			if (e.affectsConfiguration(KEYWORD_ACTIVIATION_SETTING_ID)) {
-				this.updateStatusEntry();
-			}
-		}));
-	}
-
-	private updateStatusEntry(): void {
-		const visible = supportsKeywordActivation(this.configurationService, this.speechService, this.chatAgentService);
-		if (visible) {
-			if (!this.entry.value) {
-				this.createStatusEntry();
-			}
-
-			this.updateStatusLabel();
-		} else {
-			this.entry.clear();
-		}
-	}
-
-	private createStatusEntry() {
-	}
-
-	private getStatusEntryProperties(): IStatusbarEntry {
-		return {
-			name: KeywordActivationStatusEntry.STATUS_NAME,
-			text: this.speechService.hasActiveKeywordRecognition ? '$(mic-filled)' : '$(mic)',
-			tooltip: this.speechService.hasActiveKeywordRecognition ? KeywordActivationStatusEntry.STATUS_ACTIVE : KeywordActivationStatusEntry.STATUS_INACTIVE,
-			ariaLabel: this.speechService.hasActiveKeywordRecognition ? KeywordActivationStatusEntry.STATUS_ACTIVE : KeywordActivationStatusEntry.STATUS_INACTIVE,
-			command: KeywordActivationStatusEntry.STATUS_COMMAND,
-			kind: 'prominent',
-			showInAllWindows: true
-		};
-	}
-
-	private updateStatusLabel(): void {
-		this.entry.value?.update(this.getStatusEntryProperties());
 	}
 }
 

@@ -275,7 +275,5 @@ export class AcceptAllEditsAction extends ChatEditingEditorAction {
 // --- multi file diff
 
 
-export function registerChatEditorActions() {
-}
 
 export const navigationBearingFakeActionId = 'chatEditor.navigation.bearings';

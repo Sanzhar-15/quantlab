@@ -129,3 +129,28 @@ export async function importModal(cdp, args) {
 		return { value: hit?.state === 'clicked' ? hit : undefined, observed };
 	});
 }
+
+// --- notification toasts in the workbench (serialised; no closures) ---
+function toastTexts() {
+	if (!document.querySelector('.monaco-workbench')) {
+		return { state: 'absent' };
+	}
+	return { state: 'present', texts: [...document.querySelectorAll('.notifications-toasts .notification-list-item-message')].map(e => e.textContent.trim()) };
+}
+
+/** Waits until the workbench is in the window (the toast reader needs it). */
+export async function waitForWorkbench(cdp, timeoutMs) {
+	return until('[workbench_not_loaded] no frame holds the workbench', timeoutMs, async () => {
+		const { hit, observed } = await inOneFrame(cdp, isWorkbench, toastTexts, undefined, 'workbench');
+		return { value: hit === undefined ? undefined : true, observed };
+	});
+}
+
+/** The texts of the notification toasts on screen now; exactly one workbench frame must answer. */
+export async function readToasts(cdp) {
+	const { hit, observed } = await inOneFrame(cdp, isWorkbench, toastTexts, undefined, 'workbench');
+	if (hit === undefined) {
+		throw new Error(`[toasts_unreadable] ${observed}`);
+	}
+	return hit.texts;
+}

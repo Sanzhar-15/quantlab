@@ -177,39 +177,6 @@ export const startEntries: GettingStartedStartEntryContent = [
 		}
 	},
 	{
-		id: 'topLevelGitOpen',
-		title: localize('gettingStarted.topLevelGitOpen.title', "Open Repository..."),
-		description: localize('gettingStarted.topLevelGitOpen.description', "Connect to a remote repository or pull request to browse, search, edit, and commit"),
-		when: 'workspacePlatform == \'webworker\'',
-		icon: Codicon.sourceControl,
-		content: {
-			type: 'startEntry',
-			command: 'command:remoteHub.openRepository',
-		}
-	},
-	{
-		id: 'topLevelRemoteOpen',
-		title: localize('gettingStarted.topLevelRemoteOpen.title', "Connect to..."),
-		description: localize('gettingStarted.topLevelRemoteOpen.description', "Connect to remote development workspaces."),
-		when: '!isWeb',
-		icon: Codicon.remote,
-		content: {
-			type: 'startEntry',
-			command: 'command:workbench.action.remote.showMenu',
-		}
-	},
-	{
-		id: 'topLevelOpenTunnel',
-		title: localize('gettingStarted.topLevelOpenTunnel.title', "Open Tunnel..."),
-		description: localize('gettingStarted.topLevelOpenTunnel.description', "Connect to a remote machine through a Tunnel"),
-		when: 'isWeb && showRemoteStartEntryInWeb',
-		icon: Codicon.remote,
-		content: {
-			type: 'startEntry',
-			command: 'command:workbench.action.remote.showWebStartEntryActions',
-		}
-	},
-	{
 		id: 'topLevelNewWorkspaceChat',
 		title: localize('gettingStarted.newWorkspaceChat.title', "Generate New Workspace..."),
 		description: localize('gettingStarted.newWorkspaceChat.description', "Chat to create a new workspace"),
@@ -226,16 +193,10 @@ const Button = (title: string, href: string) => `[${title}](${href})`;
 
 const CopilotStepTitle = localize('gettingStarted.copilotSetup.title', "Use AI features with Copilot for free");
 const CopilotDescription = localize({ key: 'gettingStarted.copilotSetup.description', comment: ['{Locked="["}', '{Locked="]({0})"}'] }, "You can use [Copilot]({0}) to generate code across multiple files, fix errors, ask questions about your code, and much more using natural language.", defaultChat.documentationUrl ?? '');
-const CopilotTermsString = localize({ key: 'gettingStarted.copilotSetup.terms', comment: ['{Locked="]({2})"}', '{Locked="]({3})"}'] }, "By continuing with {0} Copilot, you agree to {1}'s [Terms]({2}) and [Privacy Statement]({3})", defaultChat.provider.default.name, defaultChat.provider.default.name, defaultChat.termsStatementUrl, defaultChat.privacyStatementUrl);
-const CopilotAnonymousButton = Button(localize('setupCopilotButton.setup', "Use AI Features"), `command:workbench.action.chat.triggerSetupAnonymousWithoutDialog`);
-const CopilotSignedOutButton = Button(localize('setupCopilotButton.setup', "Use AI Features"), `command:workbench.action.chat.triggerSetup`);
-const CopilotSignedInButton = Button(localize('setupCopilotButton.setup', "Use AI Features"), `command:workbench.action.chat.triggerSetup`);
 const CopilotCompleteButton = Button(localize('setupCopilotButton.chatWithCopilot', "Start to Chat"), 'command:workbench.action.chat.open');
 
-function createCopilotSetupStep(id: string, button: string, when: string, includeTerms: boolean): BuiltinGettingStartedStep {
-	const description = includeTerms ?
-		`${CopilotDescription}\n${CopilotTermsString}\n${button}` :
-		`${CopilotDescription}\n${button}`;
+function createCopilotSetupStep(id: string, button: string, when: string): BuiltinGettingStartedStep {
+	const description = `${CopilotDescription}\n${button}`;
 
 	return {
 		id,
@@ -261,10 +222,7 @@ export const walkthroughs: GettingStartedWalkthroughContent = [
 		content: {
 			type: 'steps',
 			steps: [
-				createCopilotSetupStep('CopilotSetupAnonymous', CopilotAnonymousButton, 'chatAnonymous && !chatSetupInstalled', true),
-				createCopilotSetupStep('CopilotSetupSignedOut', CopilotSignedOutButton, 'chatEntitlementSignedOut && !chatAnonymous', false),
-				createCopilotSetupStep('CopilotSetupComplete', CopilotCompleteButton, 'chatSetupInstalled && !chatSetupDisabled && (chatAnonymous || chatPlanPro || chatPlanProPlus || chatPlanBusiness || chatPlanEnterprise || chatPlanFree)', false),
-				createCopilotSetupStep('CopilotSetupSignedIn', CopilotSignedInButton, '!chatEntitlementSignedOut && (!chatSetupInstalled || chatSetupDisabled || chatPlanCanSignUp)', false),
+				createCopilotSetupStep('CopilotSetupComplete', CopilotCompleteButton, 'chatSetupInstalled && !chatSetupDisabled && (chatAnonymous || chatPlanPro || chatPlanProPlus || chatPlanBusiness || chatPlanEnterprise || chatPlanFree)'),
 				{
 					id: 'pickColorTheme',
 					title: localize('gettingStarted.pickColor.title', "Choose your theme"),
@@ -353,7 +311,7 @@ export const walkthroughs: GettingStartedWalkthroughContent = [
 				{
 					id: 'pickAFolderTask-WebWeb',
 					title: localize('gettingStarted.setup.OpenFolder.title', "Open up your code"),
-					description: localize('gettingStarted.setup.OpenFolderWeb.description.interpolated', "You're all set to start coding. You can open a local project or a remote repository to get your files into VS Code.\n{0}\n{1}", Button(localize('openFolder', "Open Folder"), 'command:workbench.action.addRootFolder'), Button(localize('openRepository', "Open Repository"), 'command:remoteHub.openRepository')),
+					description: localize('gettingStarted.setup.OpenFolderWeb.description.interpolated', "You're all set to start coding. You can open a local project to get your files into VS Code.\n{0}", Button(localize('openFolder', "Open Folder"), 'command:workbench.action.addRootFolder')),
 					when: 'workspaceFolderCount == 0',
 					media: {
 						type: 'svg', altText: 'Explorer view showing buttons for opening folder and cloning repository.', path: 'openFolder.svg'
@@ -433,14 +391,6 @@ export const walkthroughs: GettingStartedWalkthroughContent = [
 					id: 'hover',
 					title: localize('gettingStarted.hover.title', "Access the hover in the editor to get more information on a variable or symbol"),
 					description: localize('gettingStarted.hover.description.interpolated', "While focus is in the editor on a variable or symbol, a hover can be focused with the Show or Open Hover command.\n{0}", Button(localize('showOrFocusHover', "Show or Focus Hover"), 'command:editor.action.showHover')),
-					media: {
-						type: 'markdown', path: 'empty'
-					}
-				},
-				{
-					id: 'goToSymbol',
-					title: localize('gettingStarted.goToSymbol.title', "Navigate to symbols in a file"),
-					description: localize('gettingStarted.goToSymbol.description.interpolated', "The Go to Symbol command is useful for navigating between important landmarks in a document.\n{0}", Button(localize('openGoToSymbol', "Go to Symbol"), 'command:editor.action.goToSymbol')),
 					media: {
 						type: 'markdown', path: 'empty'
 					}

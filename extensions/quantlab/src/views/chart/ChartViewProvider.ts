@@ -22,6 +22,7 @@ import { DataSourceDescriptor, Timeframe, isLocalFileSource, isServerSource, Ser
 import { ChartState } from '../../types/views';
 import { ChartStateStore } from './ChartStateStore';
 import { ChartWebview } from './ChartWebview';
+import { fireChartDrawn } from './chartDrawn';
 import { ThemeProvider } from '../../ui/tokens/ThemeProvider';
 import { ReducedMotion } from '../../ui/accessibility/ReducedMotion';
 import { FeatureDiscovery } from '../../ui/onboarding/FeatureDiscovery';
@@ -346,6 +347,9 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			}
 			case 'dropRun':
 				this.executeWithErrorBoundary(() => this.loadRunArtifacts(session, payload.runId), 'loadRunArtifacts');
+				return;
+			case 'chartDrawn':
+				fireChartDrawn({ uri: session.document.uri.toString(), bars: payload.bars, width: payload.width, height: payload.height });
 				return;
 			default:
 				return;
@@ -1049,16 +1053,22 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			return;
 		}
 
-		if (artifacts.signals) {
-			session.webview.postMessage({ type: 'setSignals', requestId: 0, signals: artifacts.signals });
+		// The engine writes inf / NaN as null (run_backtest.py _sanitize_for_json). The chart cannot draw those: they are
+		// left out and counted in a banner, never dropped unannounced.
+		const equity = artifacts.equity?.filter((point): point is EquityPoint => point.v !== null);
+		const signals = artifacts.signals?.map(({ price, ...signal }): SignalMarker => price === null ? signal : { ...signal, price });
+		const droppedPoints = artifacts.equity === undefined || equity === undefined ? 0 : artifacts.equity.length - equity.length;
+		const droppedPrices = artifacts.signals === undefined ? 0 : artifacts.signals.filter(signal => signal.price === null).length;
+		if (droppedPoints > 0 || droppedPrices > 0) {
+			this.setBanner(session, 'run', `${droppedPoints} equity point(s) and ${droppedPrices} signal price(s) of this run are not finite and are not drawn.`, 'warning');
 		}
-		if (artifacts.equity) {
-			session.webview.postMessage({ type: 'setEquityCurve', requestId: 0, equity: artifacts.equity });
+		if (signals) {
+			session.webview.postMessage({ type: 'setSignals', requestId: 0, signals });
 		}
-		this.setArtifactCache(session.key, {
-			signals: artifacts.signals,
-			equity: artifacts.equity
-		});
+		if (equity) {
+			session.webview.postMessage({ type: 'setEquityCurve', requestId: 0, equity });
+		}
+		this.setArtifactCache(session.key, { signals, equity });
 		this.executeWithErrorBoundary(() => this.refreshVisualization(session), 'refreshVisualization');
 
 		const entry = this.historyState.getEntry(runId);

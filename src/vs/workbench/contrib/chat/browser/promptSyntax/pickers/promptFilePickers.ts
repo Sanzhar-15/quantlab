@@ -149,21 +149,6 @@ const NEW_INSTRUCTIONS_FILE_OPTION: IPromptPickerQuickPickItem = {
 };
 
 /**
- * A quick pick item that starts the 'Update Instructions' command.
- */
-const UPDATE_INSTRUCTIONS_OPTION: IPromptPickerQuickPickItem = {
-	type: 'item',
-	label: `$(refresh) ${localize(
-		'commands.update-instructions.select-dialog.label',
-		'Generate agent instructions...',
-	)}`,
-	pickable: false,
-	alwaysShow: true,
-	buttons: [newHelpButton(PromptsType.instructions)],
-	commandId: 'workbench.action.chat.generateInstructions',
-};
-
-/**
  * A quick pick item that starts the 'New Agent File' command.
  */
 const NEW_AGENT_FILE_OPTION: IPromptPickerQuickPickItem = {
@@ -410,7 +395,7 @@ export class PromptFilePickers {
 			case PromptsType.prompt:
 				return [NEW_PROMPT_FILE_OPTION];
 			case PromptsType.instructions:
-				return [NEW_INSTRUCTIONS_FILE_OPTION, UPDATE_INSTRUCTIONS_OPTION];
+				return [NEW_INSTRUCTIONS_FILE_OPTION];
 			case PromptsType.agent:
 				return [NEW_AGENT_FILE_OPTION];
 			default:

@@ -6,8 +6,7 @@
 import { timeout } from '../../../../base/common/async.js';
 import { Event } from '../../../../base/common/event.js';
 import { MarkdownString, isMarkdownString } from '../../../../base/common/htmlContent.js';
-import { Disposable, DisposableMap } from '../../../../base/common/lifecycle.js';
-import { Schemas } from '../../../../base/common/network.js';
+import { Disposable } from '../../../../base/common/lifecycle.js';
 import { PolicyCategory } from '../../../../base/common/policy.js';
 import * as nls from '../../../../nls.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
@@ -21,18 +20,16 @@ import { IWorkbenchContribution, WorkbenchPhase, registerWorkbenchContribution2 
 import { EditorExtensions, IEditorFactoryRegistry } from '../../../common/editor.js';
 import { IWorkbenchAssignmentService } from '../../../services/assignment/common/assignmentService.js';
 import { ChatEntitlement, IChatEntitlementService } from '../../../services/chat/common/chatEntitlementService.js';
-import { IEditorResolverService } from '../../../services/editor/common/editorResolverService.js';
 import { allDiscoverySources, mcpDiscoverySection } from '../../mcp/common/mcpConfiguration.js';
 import { ChatAgentNameService, ChatAgentService, IChatAgentNameService, IChatAgentService } from '../common/participants/chatAgents.js';
 import { CodeMapperService, ICodeMapperService } from '../common/editing/chatCodeMapperService.js';
 import '../common/widget/chatColors.js';
 import { IChatEditingService } from '../common/editing/chatEditingService.js';
 import { IChatLayoutService } from '../common/widget/chatLayoutService.js';
-import { ChatModeService, IChatMode, IChatModeService } from '../common/chatModes.js';
+import { ChatModeService, IChatModeService } from '../common/chatModes.js';
 import { ChatResponseResourceFileSystemProvider } from '../common/widget/chatResponseResourceFileSystemProvider.js';
 import { IChatService } from '../common/chatService/chatService.js';
 import { ChatService } from '../common/chatService/chatServiceImpl.js';
-import { IChatSessionsService } from '../common/chatSessionsService.js';
 import { ChatSlashCommandService, IChatSlashCommandService } from '../common/participants/chatSlashCommands.js';
 import { ChatTodoListService, IChatTodoListService } from '../common/tools/chatTodoListService.js';
 import { ChatTransferService, IChatTransferService } from '../common/model/chatTransferService.js';
@@ -51,38 +48,24 @@ import { PromptsService } from '../common/promptSyntax/service/promptsServiceImp
 import { LanguageModelToolsExtensionPointHandler } from '../common/tools/languageModelToolsContribution.js';
 import { BuiltinToolsContribution } from '../common/tools/builtinTools/tools.js';
 import { IVoiceChatService, VoiceChatService } from '../common/voiceChatService.js';
-import { registerChatAccessibilityActions } from './actions/chatAccessibilityActions.js';
-import { ACTION_ID_NEW_CHAT, CopilotTitleBarMenuRendering, registerChatActions } from './actions/chatActions.js';
-import { CodeBlockActionRendering, registerChatCodeBlockActions, registerChatCodeCompareBlockActions } from './actions/chatCodeblockActions.js';
+import { ACTION_ID_NEW_CHAT, CopilotTitleBarMenuRendering } from './actions/chatActions.js';
+import { CodeBlockActionRendering, registerChatCodeBlockActions } from './actions/chatCodeblockActions.js';
 import { ChatContextContributions } from './actions/chatContext.js';
-import { registerChatContextActions } from './actions/chatContextActions.js';
 import { ContinueChatInSessionActionRendering } from './actions/chatContinueInAction.js';
-import { registerChatCopyActions } from './actions/chatCopyActions.js';
-import { registerChatDeveloperActions } from './actions/chatDeveloperActions.js';
-import { ChatSubmitAction, registerChatExecuteActions } from './actions/chatExecuteActions.js';
-import { registerChatFileTreeActions } from './actions/chatFileTreeActions.js';
+import { ChatSubmitAction } from './actions/chatExecuteActions.js';
 import { ChatGettingStartedContribution } from './actions/chatGettingStarted.js';
-import { registerChatExportActions } from './actions/chatImportExport.js';
-import { registerLanguageModelActions } from './actions/chatLanguageModelActions.js';
 import { registerMoveActions } from './actions/chatMoveActions.js';
-import { registerNewChatActions } from './actions/chatNewActions.js';
-import { registerChatPromptNavigationActions } from './actions/chatPromptNavigationActions.js';
-import { registerQuickChatActions } from './actions/chatQuickInputActions.js';
 import { ChatAgentRecommendation } from './actions/chatAgentRecommendationActions.js';
-import { registerChatTitleActions } from './actions/chatTitleActions.js';
-import { registerChatElicitationActions } from './actions/chatElicitationActions.js';
 import { registerChatToolActions } from './actions/chatToolActions.js';
 import { ChatTransferContribution } from './actions/chatTransfer.js';
 import './agentSessions/agentSessions.contribution.js';
 import { IChatAccessibilityService, IChatCodeBlockContextProviderService, IChatWidgetService, IQuickChatService } from './chat.js';
 import { ChatAccessibilityService } from './accessibility/chatAccessibilityService.js';
 import './attachments/chatAttachmentModel.js';
-import './widget/input/chatStatusWidget.js';
 import { ChatAttachmentResolveService, IChatAttachmentResolveService } from './attachments/chatAttachmentResolveService.js';
 import { ChatMarkdownAnchorService, IChatMarkdownAnchorService } from './widget/chatContentParts/chatMarkdownAnchorService.js';
 import { ChatContextPickService, IChatContextPickService } from './attachments/chatContextPickService.js';
 import { ChatEditingEditorAccessibility } from './chatEditing/chatEditingEditorAccessibility.js';
-import { registerChatEditorActions } from './chatEditing/chatEditingEditorActions.js';
 import { ChatEditingEditorContextKeys } from './chatEditing/chatEditingEditorContextKeys.js';
 import { ChatEditingEditorOverlay } from './chatEditing/chatEditingEditorOverlay.js';
 import { ChatEditingService } from './chatEditing/chatEditingServiceImpl.js';
@@ -266,40 +249,6 @@ Registry.as<IConfigurationMigrationRegistry>(Extensions.ConfigurationMigration).
 	},
 ]);
 
-class ChatResolverContribution extends Disposable {
-
-	static readonly ID = 'workbench.contrib.chatResolver';
-
-	private readonly _editorRegistrations = this._register(new DisposableMap<string>());
-
-	constructor(
-		@IChatSessionsService chatSessionsService: IChatSessionsService,
-		@IEditorResolverService editorResolverService: IEditorResolverService,
-		@IInstantiationService instantiationService: IInstantiationService,
-	) {
-		super();
-
-		this._registerEditor(Schemas.vscodeChatEditor);
-		this._registerEditor(Schemas.vscodeLocalChatSession);
-
-		this._register(chatSessionsService.onDidChangeContentProviderSchemes((e) => {
-			for (const scheme of e.added) {
-				this._registerEditor(scheme);
-			}
-			for (const scheme of e.removed) {
-				this._editorRegistrations.deleteAndDispose(scheme);
-			}
-		}));
-
-		for (const scheme of chatSessionsService.getContentProviderSchemes()) {
-			this._registerEditor(scheme);
-		}
-	}
-
-	private _registerEditor(scheme: string): void {
-	}
-}
-
 class ChatAgentSettingContribution extends Disposable implements IWorkbenchContribution {
 
 	static readonly ID = 'workbench.contrib.chatAgentSetting';
@@ -341,64 +290,6 @@ class ChatAgentSettingContribution extends Disposable implements IWorkbenchContr
 	}
 }
 
-
-/**
- * Workbench contribution to register actions for custom chat modes via events
- */
-class ChatAgentActionsContribution extends Disposable implements IWorkbenchContribution {
-
-	static readonly ID = 'workbench.contrib.chatAgentActions';
-
-	private readonly _modeActionDisposables = new DisposableMap<string>();
-
-	constructor(
-		@IChatModeService private readonly chatModeService: IChatModeService,
-	) {
-		super();
-		this._store.add(this._modeActionDisposables);
-
-		// Register actions for existing custom modes
-		const { custom } = this.chatModeService.getModes();
-		for (const mode of custom) {
-			this._registerModeAction(mode);
-		}
-
-		// Listen for custom mode changes by tracking snapshots
-		this._register(this.chatModeService.onDidChangeChatModes(() => {
-			const { custom } = this.chatModeService.getModes();
-			const currentModeIds = new Set<string>();
-			const currentModeNames = new Map<string, string>();
-
-			for (const mode of custom) {
-				const modeName = mode.name.get();
-				if (currentModeNames.has(modeName)) {
-					// If there is a name collision, the later one in the list wins
-					currentModeIds.delete(currentModeNames.get(modeName)!);
-				}
-
-				currentModeNames.set(modeName, mode.id);
-				currentModeIds.add(mode.id);
-			}
-
-			// Remove modes that no longer exist and those replaced by modes later in the list with same name
-			for (const modeId of this._modeActionDisposables.keys()) {
-				if (!currentModeIds.has(modeId)) {
-					this._modeActionDisposables.deleteAndDispose(modeId);
-				}
-			}
-
-			// Register new modes
-			for (const mode of custom) {
-				if (currentModeIds.has(mode.id) && !this._modeActionDisposables.has(mode.id)) {
-					this._registerModeAction(mode);
-				}
-			}
-		}));
-	}
-
-	private _registerModeAction(mode: IChatMode): void {
-	}
-}
 
 class ToolReferenceNamesContribution extends Disposable implements IWorkbenchContribution {
 
@@ -515,7 +406,6 @@ class ChatSlashStaticSlashCommandsContribution extends Disposable {
 }
 Registry.as<IEditorFactoryRegistry>(EditorExtensions.EditorFactory).registerEditorSerializer(ChatEditorInput.TypeID, ChatEditorInputSerializer);
 
-registerWorkbenchContribution2(ChatResolverContribution.ID, ChatResolverContribution, WorkbenchPhase.BlockStartup);
 registerWorkbenchContribution2(ChatSlashStaticSlashCommandsContribution.ID, ChatSlashStaticSlashCommandsContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ChatExtensionPointHandler.ID, ChatExtensionPointHandler, WorkbenchPhase.BlockStartup);
 registerWorkbenchContribution2(LanguageModelToolsExtensionPointHandler.ID, LanguageModelToolsExtensionPointHandler, WorkbenchPhase.BlockRestore);
@@ -533,7 +423,6 @@ registerWorkbenchContribution2(ChatTeardownContribution.ID, ChatTeardownContribu
 registerWorkbenchContribution2(ChatStatusBarEntry.ID, ChatStatusBarEntry, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(BuiltinToolsContribution.ID, BuiltinToolsContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ChatAgentSettingContribution.ID, ChatAgentSettingContribution, WorkbenchPhase.AfterRestored);
-registerWorkbenchContribution2(ChatAgentActionsContribution.ID, ChatAgentActionsContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ToolReferenceNamesContribution.ID, ToolReferenceNamesContribution, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(ChatAgentRecommendation.ID, ChatAgentRecommendation, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ChatEditingEditorAccessibility.ID, ChatEditingEditorAccessibility, WorkbenchPhase.AfterRestored);
@@ -549,25 +438,9 @@ registerWorkbenchContribution2(UserToolSetsContributions.ID, UserToolSetsContrib
 registerWorkbenchContribution2(PromptLanguageFeaturesProvider.ID, PromptLanguageFeaturesProvider, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ChatWindowNotifier.ID, ChatWindowNotifier, WorkbenchPhase.AfterRestored);
 
-registerChatActions();
-registerChatAccessibilityActions();
-registerChatCopyActions();
 registerChatCodeBlockActions();
-registerChatCodeCompareBlockActions();
-registerChatFileTreeActions();
-registerChatPromptNavigationActions();
-registerChatTitleActions();
-registerChatExecuteActions();
-registerQuickChatActions();
-registerChatExportActions();
 registerMoveActions();
-registerNewChatActions();
-registerChatContextActions();
-registerChatDeveloperActions();
-registerChatEditorActions();
-registerChatElicitationActions();
 registerChatToolActions();
-registerLanguageModelActions();
 
 
 registerSingleton(IChatTransferService, ChatTransferService, InstantiationType.Delayed);

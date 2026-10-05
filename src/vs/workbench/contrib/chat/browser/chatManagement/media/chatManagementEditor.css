@@ -104,14 +104,6 @@
 	margin-left: 4px;
 }
 
-.ai-management-editor .header-upgrade-button-container {
-	margin-left: auto;
-}
-
-.ai-management-editor .header-upgrade-button {
-	white-space: nowrap;
-}
-
 /* Widget sections */
 .ai-management-editor .ai-management-body > * {
 	margin-bottom: 20px;

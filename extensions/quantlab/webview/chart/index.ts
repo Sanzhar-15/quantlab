@@ -427,6 +427,7 @@ chartContainer.addEventListener('drop', event => {
 
 // W4.1: crosshair-driven legend updates; null = pointer left -> last bar.
 chartClient.setHoverListener(index => ohlcLegend.showBar(index));
+chartClient.setDrawnListener(drawn => vscode.postMessage({ type: 'chartDrawn', ...drawn }));
 
 const handler = createMessageHandler({
 	postMessage: message => vscode.postMessage(message),

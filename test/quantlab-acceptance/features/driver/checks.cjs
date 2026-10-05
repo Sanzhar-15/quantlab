@@ -129,6 +129,11 @@ async function pythonIntelligence() {
 	if (pyright === undefined || !pyright.isActive) {
 		throw new Error('[language_server_inactive] detachhead.basedpyright is not active after the three requests');
 	}
+	// basedpyright alone: no other Python language server is installed to answer instead.
+	const pylance = vscode.extensions.getExtension('ms-python.vscode-pylance');
+	if (pylance !== undefined) {
+		throw new Error(`[pylance_present] ms-python.vscode-pylance ${pylance.packageJSON.version} is installed; completion must come from basedpyright alone`);
+	}
 	return { status: 'PASS', detail: `completion: path among ${completion} items; hover: ${hover} chars with the docstring; definition: ${definition}; server basedpyright ${pyright.packageJSON.version}` };
 }
 
@@ -267,6 +272,25 @@ async function importFromVsCode() {
 	return { status: 'PASS', detail: `modal "${modal.text}" -> Import; settings ${Object.keys(IMPORT_SETTINGS).join(', ')}; keybinding ${IMPORT_KEYBINDING.key}; ${extensionsLine}; backup ${backups[0]}` };
 }
 
+/**
+ * The extension-pack row's control: a Pylance prompt shown on purpose (the toast reader must see it) and a pack
+ * member installed on purpose (the profile and the request log must show it). The install's outcome is recorded:
+ * with the network off it fails, and its gallery request is what the row looks for.
+ */
+async function packTrigger() {
+	void vscode.window.showInformationMessage('[ql-features control] Install Pylance from the Python extension pack?', 'Install');
+	await new Promise(resolve => setTimeout(resolve, 2000));
+	const toasts = await ask(requireEnv('QL_FEATURES_CUES'), 'toasts', {}, 60 * 1000);
+	let install;
+	try {
+		await vscode.commands.executeCommand('workbench.extensions.installExtension', 'ms-python.debugpy');
+		install = 'ms-python.debugpy installed';
+	} catch (err) {
+		install = `ms-python.debugpy not installed: ${err instanceof Error ? err.message : String(err)}`;
+	}
+	return { install, toasts: toasts.texts };
+}
+
 async function guarded(check) {
 	try {
 		return await check();
@@ -288,8 +312,10 @@ exports.run = async function () {
 			'backtest-bundled-engine': await guarded(backtestBundledEngine),
 			'import': await guarded(importFromVsCode),
 		};
+	} else if (mode === 'pack-trigger') {
+		result.packTrigger = await packTrigger();
 	} else if (mode !== 'pins') {
-		throw new Error(`[driver_mode_invalid] QL_FEATURES_MODE is ${JSON.stringify(mode)} (expected all or pins)`);
+		throw new Error(`[driver_mode_invalid] QL_FEATURES_MODE is ${JSON.stringify(mode)} (expected all, pins or pack-trigger)`);
 	}
 	fs.writeFileSync(resultPath, JSON.stringify(result, undefined, '\t') + '\n');
 };

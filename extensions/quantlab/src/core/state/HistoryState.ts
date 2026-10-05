@@ -29,7 +29,7 @@ interface HistoryEntryStored {
 	progress?: number;
 	progressMessage?: string;
 	passed?: boolean;
-	metrics?: Record<string, number>;
+	metrics?: Record<string, number | null>;
 	warnings?: string[];
 	errorMessage?: string;
 	artifactPath: string;
@@ -50,7 +50,7 @@ interface HistoryEntrySeed {
 	progress?: number;
 	progressMessage?: string;
 	passed?: boolean;
-	metrics?: Record<string, number>;
+	metrics?: Record<string, number | null>;
 	warnings?: string[];
 	errorMessage?: string;
 	artifactPath?: string;

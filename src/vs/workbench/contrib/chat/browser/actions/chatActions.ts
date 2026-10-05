@@ -50,8 +50,6 @@ export const ACTION_ID_NEW_CHAT = `workbench.action.chat.newChat`;
 export const ACTION_ID_NEW_EDIT_SESSION = `workbench.action.chat.newEditSession`;
 export const ACTION_ID_OPEN_CHAT = 'workbench.action.openChat';
 export const CHAT_OPEN_ACTION_ID = 'workbench.action.chat.open';
-export const CHAT_SETUP_ACTION_ID = 'workbench.action.chat.triggerSetup';
-export const CHAT_SETUP_SUPPORT_ANONYMOUS_ACTION_ID = 'workbench.action.chat.triggerSetupSupportAnonymousAction';
 const TOGGLE_CHAT_ACTION_ID = 'workbench.action.chat.toggle';
 
 export interface IChatViewOpenOptions {
@@ -383,8 +381,6 @@ export abstract class ModeOpenChatGlobalAction extends OpenChatGlobalAction {
 	}
 }
 
-export function registerChatActions() {
-}
 
 export function stringifyItem(item: IChatRequestViewModel | IChatResponseViewModel, includeName = true): string {
 	if (isRequestVM(item)) {
@@ -420,8 +416,6 @@ export class CopilotTitleBarMenuRendering extends Disposable implements IWorkben
 
 			const chatSentiment = chatEntitlementService.sentiment;
 			const chatQuotaExceeded = chatEntitlementService.quotas.chat?.percentRemaining === 0;
-			const signedOut = chatEntitlementService.entitlement === ChatEntitlement.Unknown;
-			const anonymous = chatEntitlementService.anonymous;
 			const free = chatEntitlementService.entitlement === ChatEntitlement.Free;
 
 			const isAuxiliaryWindow = windowId !== mainWindow.vscodeWindowId;
@@ -429,11 +423,7 @@ export class CopilotTitleBarMenuRendering extends Disposable implements IWorkben
 			let primaryActionTitle = isAuxiliaryWindow ? localize('openChat', "Open Chat") : localize('toggleChat', "Toggle Chat");
 			let primaryActionIcon = Codicon.chatSparkle;
 			if (chatSentiment.installed && !chatSentiment.disabled) {
-				if (signedOut && !anonymous) {
-					primaryActionId = CHAT_SETUP_ACTION_ID;
-					primaryActionTitle = localize('signInToChatSetup', "Sign in to use AI features...");
-					primaryActionIcon = Codicon.chatSparkleError;
-				} else if (chatQuotaExceeded && free) {
+				if (chatQuotaExceeded && free) {
 					primaryActionId = OPEN_CHAT_QUOTA_EXCEEDED_DIALOG;
 					primaryActionTitle = localize('chatQuotaExceededButton', "GitHub Copilot Free plan chat messages quota reached. Click for details.");
 					primaryActionIcon = Codicon.chatSparkleWarning;

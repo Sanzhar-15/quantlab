@@ -7,5 +7,3 @@
 export const ACTION_ID_FOCUS_CHAT_CONFIRMATION = 'workbench.action.chat.focusConfirmation';
 
 
-export function registerChatAccessibilityActions(): void {
-}

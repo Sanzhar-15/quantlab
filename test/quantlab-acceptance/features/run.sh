@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # FEATURES closing checks (PLAN-FINAL 3.9) on a packaged macOS app.
-# Usage: run.sh <path to the .app bundle> <evidence dir that does not exist yet>
+# Usage: run.sh <path to the .app bundle> <evidence dir that does not exist yet> <off|on>
+# The third argument declares the guest network; the run checks it. off: the five closing checks and the
+# extension-pack row. on: the extension-pack row only (the app must stay quiet with a gallery reachable).
 # Requires QL_FEATURES_PYTHON: the absolute path of the declared interpreter (with ipykernel).
-# Exit 0 only if all five checks are PASS. Everything the run writes stays under the evidence dir.
+# Exit 0 only if every row of the run is PASS. Everything the run writes stays under the evidence dir.
 set -euo pipefail
 
-if [ "$#" -ne 2 ]; then
-	echo "usage: run.sh <path to the .app bundle> <evidence dir that does not exist yet>" >&2
+if [ "$#" -ne 3 ] || { [ "$3" != off ] && [ "$3" != on ]; }; then
+	echo "usage: run.sh <path to the .app bundle> <evidence dir that does not exist yet> <off|on>" >&2
 	exit 64
 fi
 app=$1
 evidence=$2
+network=$3
 here=$(cd "$(dirname "$0")" && pwd)
 
 if [ ! -d "$app/Contents/MacOS" ]; then
@@ -26,4 +29,4 @@ name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Inf
 exe="$app/Contents/MacOS/$name"
 
 # The launcher runs on the app's own Node, so the guest needs no other runtime.
-ELECTRON_RUN_AS_NODE=1 exec "$exe" "$here/launcher.mjs" "$app" "$evidence"
+ELECTRON_RUN_AS_NODE=1 exec "$exe" "$here/launcher.mjs" "$app" "$evidence" "$network"

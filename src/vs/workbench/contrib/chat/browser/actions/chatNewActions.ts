@@ -24,5 +24,3 @@ export interface INewEditSessionActionContext {
 	isPartialQuery?: boolean;
 }
 
-export function registerNewChatActions() {
-}
