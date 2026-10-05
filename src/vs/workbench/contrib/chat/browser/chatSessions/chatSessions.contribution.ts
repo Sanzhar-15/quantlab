@@ -13,37 +13,27 @@ import { ResourceMap } from '../../../../../base/common/map.js';
 import { Schemas } from '../../../../../base/common/network.js';
 import * as resources from '../../../../../base/common/resources.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
-import { URI, UriComponents } from '../../../../../base/common/uri.js';
-import { generateUuid } from '../../../../../base/common/uuid.js';
-import { localize, localize2 } from '../../../../../nls.js';
-import { Action2, IMenuService, MenuId, MenuItemAction, MenuRegistry, registerAction2 } from '../../../../../platform/actions/common/actions.js';
+import { URI } from '../../../../../base/common/uri.js';
+import { localize } from '../../../../../nls.js';
+import { IMenuService, MenuId, MenuItemAction } from '../../../../../platform/actions/common/actions.js';
 import { ContextKeyExpr, IContextKey, IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
 import { IRelaxedExtensionDescription } from '../../../../../platform/extensions/common/extensions.js';
 import { InstantiationType, registerSingleton } from '../../../../../platform/instantiation/common/extensions.js';
-import { ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ILabelService } from '../../../../../platform/label/common/label.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { isDark } from '../../../../../platform/theme/common/theme.js';
 import { IThemeService } from '../../../../../platform/theme/common/themeService.js';
-import { IEditorService } from '../../../../services/editor/common/editorService.js';
 import { IExtensionService, isProposedApiEnabled } from '../../../../services/extensions/common/extensions.js';
 import { ExtensionsRegistry } from '../../../../services/extensions/common/extensionsRegistry.js';
-import { ChatEditorInput } from '../widgetHosts/editor/chatEditorInput.js';
 import { IChatAgentAttachmentCapabilities, IChatAgentData, IChatAgentService } from '../../common/participants/chatAgents.js';
 import { ChatContextKeys } from '../../common/actions/chatContextKeys.js';
 import { IChatSession, IChatSessionContentProvider, IChatSessionItem, IChatSessionItemProvider, IChatSessionProviderOptionGroup, IChatSessionProviderOptionItem, IChatSessionsExtensionPoint, IChatSessionsService, isSessionInProgressStatus, localChatSessionType, SessionOptionsChangedCallback } from '../../common/chatSessionsService.js';
 import { ChatAgentLocation, ChatModeKind } from '../../common/constants.js';
-import { CHAT_CATEGORY } from '../actions/chatActions.js';
-import { IChatEditorOptions } from '../widgetHosts/editor/chatEditor.js';
 import { IChatModel } from '../../common/model/chatModel.js';
 import { IChatService, IChatToolInvocation } from '../../common/chatService/chatService.js';
 import { autorun, autorunIterableDelta, observableSignalFromEvent } from '../../../../../base/common/observable.js';
-import { IChatRequestVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 import { renderAsPlaintext } from '../../../../../base/browser/markdownRenderer.js';
 import { IMarkdownString } from '../../../../../base/common/htmlContent.js';
-import { IViewsService } from '../../../../services/views/common/viewsService.js';
-import { ChatViewId } from '../chat.js';
-import { ChatViewPane } from '../widgetHosts/viewPane/chatViewPane.js';
 
 const extensionPoint = ExtensionsRegistry.registerExtensionPoint<IChatSessionsExtensionPoint[]>({
 	extensionPoint: 'chatSessions',
@@ -493,10 +483,6 @@ export class ChatSessionsService extends Disposable implements IChatSessionsServ
 		// Mirror all create submenu actions into the global Chat New menu
 		for (const action of menuActions) {
 			if (action instanceof MenuItemAction) {
-				disposables.add(MenuRegistry.appendMenuItem(MenuId.ChatNewMenu, {
-					command: action.item,
-					group: '4_externally_contributed',
-				}));
 			}
 		}
 		return {
@@ -506,110 +492,6 @@ export class ChatSessionsService extends Disposable implements IChatSessionsServ
 
 	private _registerCommands(contribution: IChatSessionsExtensionPoint): IDisposable {
 		return combinedDisposable(
-			registerAction2(class OpenChatSessionAction extends Action2 {
-				constructor() {
-					super({
-						id: `workbench.action.chat.openSessionWithPrompt.${contribution.type}`,
-						title: localize2('interactiveSession.openSessionWithPrompt', "New {0} with Prompt", contribution.displayName),
-						category: CHAT_CATEGORY,
-						icon: Codicon.plus,
-						f1: false,
-						precondition: ChatContextKeys.enabled
-					});
-				}
-
-				async run(accessor: ServicesAccessor, chatOptions?: { resource: UriComponents; prompt: string; attachedContext?: IChatRequestVariableEntry[] }): Promise<void> {
-					const chatService = accessor.get(IChatService);
-					const { type } = contribution;
-
-					if (chatOptions) {
-						const resource = URI.revive(chatOptions.resource);
-						const ref = await chatService.loadSessionForResource(resource, ChatAgentLocation.Chat, CancellationToken.None);
-						await chatService.sendRequest(resource, chatOptions.prompt, { agentIdSilent: type, attachedContext: chatOptions.attachedContext });
-						ref?.dispose();
-					}
-				}
-			}),
-			// Creates a chat editor
-			registerAction2(class OpenNewChatSessionEditorAction extends Action2 {
-				constructor() {
-					super({
-						id: `workbench.action.chat.openNewSessionEditor.${contribution.type}`,
-						title: localize2('interactiveSession.openNewSessionEditor', "New {0}", contribution.displayName),
-						category: CHAT_CATEGORY,
-						icon: Codicon.plus,
-						f1: true,
-						precondition: ChatContextKeys.enabled,
-					});
-				}
-
-				async run(accessor: ServicesAccessor, chatOptions?: { prompt: string; attachedContext?: IChatRequestVariableEntry[] }): Promise<void> {
-					const editorService = accessor.get(IEditorService);
-					const logService = accessor.get(ILogService);
-					const chatService = accessor.get(IChatService);
-					const { type } = contribution;
-
-					try {
-						const options: IChatEditorOptions = {
-							override: ChatEditorInput.EditorID,
-							pinned: true,
-							title: {
-								fallback: localize('chatEditorContributionName', "{0}", contribution.displayName),
-							}
-						};
-						const resource = URI.from({
-							scheme: type,
-							path: `/untitled-${generateUuid()}`,
-						});
-						await editorService.openEditor({ resource, options });
-						if (chatOptions?.prompt) {
-							await chatService.sendRequest(resource, chatOptions.prompt, { agentIdSilent: type, attachedContext: chatOptions.attachedContext });
-						}
-					} catch (e) {
-						logService.error(`Failed to open new '${type}' chat session editor`, e);
-					}
-				}
-			}),
-			// New chat in sidebar chat (+ button)
-			registerAction2(class OpenNewChatSessionSidebarAction extends Action2 {
-				constructor() {
-					super({
-						id: `workbench.action.chat.openNewSessionSidebar.${contribution.type}`,
-						title: localize2('interactiveSession.openNewSessionSidebar', "New {0}", contribution.displayName),
-						category: CHAT_CATEGORY,
-						icon: Codicon.plus,
-						f1: false, // Hide from Command Palette
-						precondition: ChatContextKeys.enabled,
-						menu: {
-							id: MenuId.ChatNewMenu,
-							group: '3_new_special',
-						}
-					});
-				}
-
-				async run(accessor: ServicesAccessor, chatOptions?: { prompt: string; attachedContext?: IChatRequestVariableEntry[] }): Promise<void> {
-					const viewsService = accessor.get(IViewsService);
-					const logService = accessor.get(ILogService);
-					const chatService = accessor.get(IChatService);
-					const { type } = contribution;
-
-					try {
-						const resource = URI.from({
-							scheme: type,
-							path: `/untitled-${generateUuid()}`,
-						});
-
-						const view = await viewsService.openView(ChatViewId) as ChatViewPane;
-						await view.loadSession(resource);
-						if (chatOptions?.prompt) {
-							await chatService.sendRequest(resource, chatOptions.prompt, { agentIdSilent: type, attachedContext: chatOptions.attachedContext });
-						}
-						view.focus();
-					} catch (e) {
-						logService.error(`Failed to open new '${type}' chat session in sidebar`, e);
-					}
-				}
-			})
 		);
 	}
 

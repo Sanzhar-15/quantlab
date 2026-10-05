@@ -4,21 +4,17 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { isFalsyOrEmpty } from '../../../../../base/common/arrays.js';
-import { MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { IJSONSchema } from '../../../../../base/common/jsonSchema.js';
-import { Disposable, DisposableMap, DisposableStore, IDisposable } from '../../../../../base/common/lifecycle.js';
+import { DisposableMap, DisposableStore, IDisposable } from '../../../../../base/common/lifecycle.js';
 import { transaction } from '../../../../../base/common/observable.js';
 import { joinPath } from '../../../../../base/common/resources.js';
 import { isFalsyOrWhitespace } from '../../../../../base/common/strings.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { localize } from '../../../../../nls.js';
 import { ContextKeyExpr } from '../../../../../platform/contextkey/common/contextkey.js';
-import { ExtensionIdentifier, IExtensionManifest } from '../../../../../platform/extensions/common/extensions.js';
-import { SyncDescriptor } from '../../../../../platform/instantiation/common/descriptors.js';
+import { ExtensionIdentifier } from '../../../../../platform/extensions/common/extensions.js';
 import { IProductService } from '../../../../../platform/product/common/productService.js';
-import { Registry } from '../../../../../platform/registry/common/platform.js';
 import { IWorkbenchContribution } from '../../../../common/contributions.js';
-import { Extensions, IExtensionFeaturesRegistry, IExtensionFeatureTableRenderer, IRenderedData, IRowData, ITableData } from '../../../../services/extensionManagement/common/extensionFeatures.js';
 import { isProposedApiEnabled } from '../../../../services/extensions/common/extensions.js';
 import * as extensionsRegistry from '../../../../services/extensions/common/extensionsRegistry.js';
 import { ILanguageModelToolsService, IToolData, ToolDataSource, ToolSet } from './languageModelToolsService.js';
@@ -389,98 +385,4 @@ export class LanguageModelToolsExtensionPointHandler implements IWorkbenchContri
 
 // --- render
 
-class LanguageModelToolDataRenderer extends Disposable implements IExtensionFeatureTableRenderer {
-	readonly type = 'table';
 
-	shouldRender(manifest: IExtensionManifest): boolean {
-		return !!manifest.contributes?.languageModelTools;
-	}
-
-	render(manifest: IExtensionManifest): IRenderedData<ITableData> {
-		const contribs = manifest.contributes?.languageModelTools ?? [];
-		if (!contribs.length) {
-			return { data: { headers: [], rows: [] }, dispose: () => { } };
-		}
-
-		const headers = [
-			localize('toolTableName', "Name"),
-			localize('toolTableDisplayName', "Display Name"),
-			localize('toolTableDescription', "Description"),
-		];
-
-		const rows: IRowData[][] = contribs.map(t => {
-			return [
-				new MarkdownString(`\`${t.name}\``),
-				t.displayName,
-				t.userDescription ?? t.modelDescription,
-			];
-		});
-
-		return {
-			data: {
-				headers,
-				rows
-			},
-			dispose: () => { }
-		};
-	}
-}
-
-Registry.as<IExtensionFeaturesRegistry>(Extensions.ExtensionFeaturesRegistry).registerExtensionFeature({
-	id: 'languageModelTools',
-	label: localize('langModelTools', "Language Model Tools"),
-	access: {
-		canToggle: false
-	},
-	renderer: new SyncDescriptor(LanguageModelToolDataRenderer),
-});
-
-
-class LanguageModelToolSetDataRenderer extends Disposable implements IExtensionFeatureTableRenderer {
-
-	readonly type = 'table';
-
-	shouldRender(manifest: IExtensionManifest): boolean {
-		return !!manifest.contributes?.languageModelToolSets;
-	}
-
-	render(manifest: IExtensionManifest): IRenderedData<ITableData> {
-		const contribs = manifest.contributes?.languageModelToolSets ?? [];
-		if (!contribs.length) {
-			return { data: { headers: [], rows: [] }, dispose: () => { } };
-		}
-
-		const headers = [
-			localize('name', "Name"),
-			localize('reference', "Reference Name"),
-			localize('tools', "Tools"),
-			localize('descriptions', "Description"),
-		];
-
-		const rows: IRowData[][] = contribs.map(t => {
-			return [
-				new MarkdownString(`\`${t.name}\``),
-				t.referenceName ? new MarkdownString(`\`#${t.referenceName}\``) : 'none',
-				t.tools.join(', '),
-				t.description,
-			];
-		});
-
-		return {
-			data: {
-				headers,
-				rows
-			},
-			dispose: () => { }
-		};
-	}
-}
-
-Registry.as<IExtensionFeaturesRegistry>(Extensions.ExtensionFeaturesRegistry).registerExtensionFeature({
-	id: 'languageModelToolSets',
-	label: localize('langModelToolSets', "Language Model Tool Sets"),
-	access: {
-		canToggle: false
-	},
-	renderer: new SyncDescriptor(LanguageModelToolSetDataRenderer),
-});

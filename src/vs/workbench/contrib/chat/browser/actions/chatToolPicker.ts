@@ -12,7 +12,7 @@ import Severity from '../../../../../base/common/severity.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { localize } from '../../../../../nls.js';
-import { CommandsRegistry, ICommandService } from '../../../../../platform/commands/common/commands.js';
+import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
 import { ExtensionIdentifier } from '../../../../../platform/extensions/common/extensions.js';
 import { ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
@@ -529,15 +529,6 @@ export async function showToolsPicker(
 		traverse(treePicker.itemTree);
 		return result;
 	};
-
-	// Temporary command to close the picker and open settings, for use in the validation message
-	store.add(CommandsRegistry.registerCommand({
-		id: '_chat.toolPicker.closeAndOpenVirtualThreshold',
-		handler: () => {
-			treePicker.hide();
-			commandService.executeCommand('workbench.action.openSettings', 'github.copilot.chat.virtualTools.threshold');
-		}
-	}));
 
 	// Handle checkbox state changes
 	store.add(treePicker.onDidChangeCheckedLeafItems(() => updateToolLimitMessage()));
