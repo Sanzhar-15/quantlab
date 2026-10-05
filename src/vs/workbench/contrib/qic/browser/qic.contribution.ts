@@ -92,7 +92,7 @@ import { DeltaPlusAdapter } from '../common/gateway/providers/deltaplusAdapter.j
 import { CircuitBreaker } from '../common/recovery/circuitBreaker.js';
 
 // QIC component imports -- auth
-import { IQuantlabHostIdentityService } from '../../../services/quantlabHostIdentity/common/quantlabHostIdentity.js';
+import { IQuantlabHostIdentityService, QuantlabHostError } from '../../../services/quantlabHostIdentity/common/quantlabHostIdentity.js';
 
 // QIC component imports -- context & embeddings
 import { SecureEmbeddingService } from '../common/context/secureEmbedding.js';
@@ -539,9 +539,24 @@ registerAction2(class extends Action2 {
 		});
 	}
 	async run(accessor: ServicesAccessor): Promise<void> {
-		accessor.get(INotificationService).info(
-			localize('qic.signOutAtTerminal', "Orion: Sign out from the Quantlab terminal view. QIC has no sign-out of its own.")
-		);
+		// The host's sign-out (every view); the service asks the user first. Stores empty on the host's `changed` tick.
+		const hostIdentity = accessor.get(IQuantlabHostIdentityService);
+		const notificationService = accessor.get(INotificationService);
+		const logService = accessor.get(ILogService);
+		try {
+			await hostIdentity.signOut();
+		} catch (error) {
+			logService.error('[QIC] Sign Out: the host did not sign out:', error);
+			if (error instanceof QuantlabHostError) {
+				notificationService.error(
+					localize('qic.signOut.refused', "Orion: Sign out failed ({0}): {1}", error.code, error.message)
+				);
+			} else {
+				notificationService.error(
+					localize('qic.signOut.failed', "Orion: Sign out failed, the host gave no answer: {0}", error instanceof Error ? error.message : String(error))
+				);
+			}
+		}
 	}
 });
 

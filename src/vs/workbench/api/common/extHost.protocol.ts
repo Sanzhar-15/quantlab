@@ -3197,6 +3197,8 @@ export interface QuantlabSubscriptionStateDto {
 
 export interface MainThreadQuantlabHostShape extends IDisposable {
 	$getIdentity(): Promise<QuantlabIdentityDto>;
+	/** Sign-out after the workbench confirm: `data` is true when the host signed out, false when the user cancelled (nothing sent). */
+	$signOut(): Promise<QuantlabHostAnswerDto>;
 	/** Answers `identity-changed` when `epoch` is not the current one at answer time. */
 	$request(op: string, input: unknown, epoch: number, token: CancellationToken): Promise<QuantlabHostAnswerDto>;
 	/** `data` is null on success. */
