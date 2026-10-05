@@ -9,7 +9,6 @@ const CONTAINER_COMMANDS: Record<string, string> = {
 	data: 'workbench.view.extension.quantlab-data',
 	resources: 'workbench.view.extension.quantlab-resources',
 	history: 'workbench.view.extension.quantlab-history',
-	trade: 'workbench.view.extension.quantlab-trade',
 	settings: 'workbench.view.extension.quantlab-settings'
 };
 
@@ -18,7 +17,6 @@ export function registerPanelCommands(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand('quantlab.focusDataPanel', () => focusContainer(CONTAINER_COMMANDS.data)),
 		vscode.commands.registerCommand('quantlab.focusResourcesPanel', () => focusContainer(CONTAINER_COMMANDS.resources)),
 		vscode.commands.registerCommand('quantlab.focusHistoryPanel', () => focusContainer(CONTAINER_COMMANDS.history)),
-		vscode.commands.registerCommand('quantlab.focusTradePanel', () => focusContainer(CONTAINER_COMMANDS.trade)),
 		vscode.commands.registerCommand('quantlab.focusSettingsPanel', () => focusContainer(CONTAINER_COMMANDS.settings)),
 		vscode.commands.registerCommand('quantlab.newFromTemplate', async () => {
 			await vscode.window.showInformationMessage('Template gallery is not available yet.');

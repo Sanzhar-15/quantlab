@@ -9,7 +9,6 @@ import { TabViewStateManager } from '../core/state/TabViewState';
 import { StrategyValidationResult } from '../types/strategy';
 import { ViewType } from '../types/views';
 import { updateContextKeys } from '../utils/contextKeys';
-import { SessionManager } from '../core/trading/SessionManager';
 import * as path from 'path';
 
 const STRATEGY_DOCS_URL = 'https://docs.quantlab.dev/strategies';
@@ -32,18 +31,8 @@ export class ViewManager {
 	async switchView(editor: vscode.TextEditor, view: ViewType): Promise<void> {
 		const validation = this.validator.validateDocument(editor.document);
 
-		if (view === 'trade' && !this.isTradeEnabled()) {
-			await this.showTradeUnavailableToast();
-			return;
-		}
-
 		if (!this.canSwitchToView(view, validation, editor.document.uri)) {
 			await this.showIncompatibleToast(view, validation);
-			return;
-		}
-
-		if (view === 'trade' && !validation.isValid) {
-			await this.showTradeBlockedToast(validation);
 			return;
 		}
 
@@ -55,18 +44,8 @@ export class ViewManager {
 		const doc = await vscode.workspace.openTextDocument(resource);
 		const validation = this.validator.validateDocument(doc);
 
-		if (view === 'trade' && !this.isTradeEnabled()) {
-			await this.showTradeUnavailableToast();
-			return;
-		}
-
 		if (!this.canSwitchToView(view, validation, resource)) {
 			await this.showIncompatibleToast(view, validation);
-			return;
-		}
-
-		if (view === 'trade' && !validation.isValid) {
-			await this.showTradeBlockedToast(validation);
 			return;
 		}
 
@@ -78,18 +57,8 @@ export class ViewManager {
 		const doc = await vscode.workspace.openTextDocument(uri);
 		const validation = this.validator.validateDocument(doc);
 
-		if (view === 'trade' && !this.isTradeEnabled()) {
-			await this.showTradeUnavailableToast();
-			return;
-		}
-
 		if (!this.canSwitchToView(view, validation, uri)) {
 			await this.showIncompatibleToast(view, validation);
-			return;
-		}
-
-		if (view === 'trade' && !validation.isValid) {
-			await this.showTradeBlockedToast(validation);
 			return;
 		}
 
@@ -106,16 +75,12 @@ export class ViewManager {
 
 		// Server symbols always allow chart and action views (data comes from GlobalState, not the file)
 		if (resource?.scheme === 'quantlab-server') {
-			return view !== 'trade' || this.isTradeEnabled();
+			return true;
 		}
 
 		// Action view is allowed for data files (csv, parquet, xlsx)
 		if (view === 'action' && resource && this.isDataFile(resource)) {
 			return true;
-		}
-
-		if (view === 'trade' && !this.isTradeEnabled()) {
-			return false;
 		}
 
 		return Boolean(validation.entrypoint);
@@ -139,29 +104,6 @@ export class ViewManager {
 		const selection = await vscode.window.showWarningMessage(message, { detail }, learn, dismiss);
 		if (selection === learn) {
 			await vscode.env.openExternal(vscode.Uri.parse(STRATEGY_DOCS_URL));
-		}
-	}
-
-	private async showTradeBlockedToast(validation: StrategyValidationResult): Promise<void> {
-		const message = vscode.l10n.t('Trade view is not available for this strategy.');
-		const detail = this.buildValidationDetail(validation);
-		const learn = vscode.l10n.t('Learn about strategies');
-		const dismiss = vscode.l10n.t('Dismiss');
-
-		const selection = await vscode.window.showWarningMessage(message, { detail }, learn, dismiss);
-		if (selection === learn) {
-			await vscode.env.openExternal(vscode.Uri.parse(STRATEGY_DOCS_URL));
-		}
-	}
-
-	private async showTradeUnavailableToast(): Promise<void> {
-		const message = vscode.l10n.t('Trade view requires a configured broker account.');
-		const openSettings = vscode.l10n.t('Open Broker Settings');
-		const dismiss = vscode.l10n.t('Dismiss');
-
-		const selection = await vscode.window.showWarningMessage(message, openSettings, dismiss);
-		if (selection === openSettings) {
-			await vscode.commands.executeCommand('workbench.action.openSettings', 'quantlab.trading');
 		}
 	}
 
@@ -199,9 +141,6 @@ export class ViewManager {
 		switch (_view) {
 			case 'action':
 				void vscode.commands.executeCommand('quantlab.focusResourcesPanel');
-				break;
-			case 'trade':
-				void vscode.commands.executeCommand('quantlab.focusTradePanel');
 				break;
 			default:
 				break;
@@ -338,8 +277,6 @@ export class ViewManager {
 				return 'quantlab.chartView';
 			case 'action':
 				return 'quantlab.actionView';
-			case 'trade':
-				return 'quantlab.tradeView';
 			default:
 				return 'default';
 		}
@@ -366,22 +303,12 @@ export class ViewManager {
 		return undefined;
 	}
 
-	private isTradeEnabled(): boolean {
-		try {
-			return SessionManager.getInstance().hasBrokerConfigured();
-		} catch {
-			return false;
-		}
-	}
-
 	private formatViewLabel(view: ViewType): string {
 		switch (view) {
 			case 'chart':
 				return 'Chart';
 			case 'action':
 				return 'Action';
-			case 'trade':
-				return 'Trade';
 			default:
 				return 'Editor';
 		}

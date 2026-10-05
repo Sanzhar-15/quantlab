@@ -102,11 +102,6 @@
         "category": "%command.category%"
       },
       {
-        "command": "quantlab.switchToTrade",
-        "title": "%command.switchToTrade.title%",
-        "category": "%command.category%"
-      },
-      {
         "command": "quantlab.switchToEditor",
         "title": "%command.switchToEditor.title%",
         "category": "%command.category%"
@@ -142,11 +137,6 @@
         "category": "%command.category%"
       },
       {
-        "command": "quantlab.openAsTrade",
-        "title": "%command.openAsTrade.title%",
-        "category": "%command.category%"
-      },
-      {
         "command": "quantlab.action.open",
         "title": "%command.action.open.title%",
         "category": "%command.category%"
@@ -179,46 +169,6 @@
       {
         "command": "quantlab.action.addToCompare",
         "title": "%command.action.addToCompare.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.startPaperSession",
-        "title": "%command.startPaperSession.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.startLiveSession",
-        "title": "%command.startLiveSession.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.pauseSession",
-        "title": "%command.pauseSession.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.resumeSession",
-        "title": "%command.resumeSession.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.stopSession",
-        "title": "%command.stopSession.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.viewSession",
-        "title": "%command.viewSession.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.trade.viewInChart",
-        "title": "%command.trade.viewInChart.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.killSwitch",
-        "title": "%command.killSwitch.title%",
         "category": "%command.category%"
       },
       {
@@ -266,22 +216,6 @@
       {
         "command": "quantlab.quantbookLocalFirstInfo",
         "title": "%command.quantbookLocalFirstInfo.title%",
-        "category": "%command.category%",
-        "enablement": "config.quantlab.quantbook.enabled"
-      },
-      {
-        "command": "quantlab.setAnthropicApiKey",
-        "title": "%command.setAnthropicApiKey.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.clearAnthropicApiKey",
-        "title": "%command.clearAnthropicApiKey.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.quantbookExplainCell",
-        "title": "%command.quantbookExplainCell.title%",
         "category": "%command.category%",
         "enablement": "config.quantlab.quantbook.enabled"
       },
@@ -625,16 +559,6 @@
         "enablement": "config.quantlab.quantbook.enabled"
       },
       {
-        "command": "quantlab.openRiskSettings",
-        "title": "%command.openRiskSettings.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.openBrokerSettings",
-        "title": "%command.openBrokerSettings.title%",
-        "category": "%command.category%"
-      },
-      {
         "command": "quantlab.selectDataSource",
         "title": "%command.selectDataSource.title%",
         "category": "%command.category%"
@@ -694,11 +618,6 @@
       {
         "command": "quantlab.focusHistoryPanel",
         "title": "%command.focusHistoryPanel.title%",
-        "category": "%command.category%"
-      },
-      {
-        "command": "quantlab.focusTradePanel",
-        "title": "%command.focusTradePanel.title%",
         "category": "%command.category%"
       },
       {
@@ -886,16 +805,6 @@
         }
       },
       {
-        "id": "quantlabViewTrade",
-        "description": "Quantlab Trade view stripe color.",
-        "defaults": {
-          "light": "#dc2626",
-          "dark": "#dc2626",
-          "highContrast": "#dc2626",
-          "highContrastLight": "#dc2626"
-        }
-      },
-      {
         "id": "quantlabStatusPositive",
         "description": "Quantlab positive status color.",
         "defaults": {
@@ -977,16 +886,6 @@
         "priority": "option"
       },
       {
-        "viewType": "quantlab.tradeView",
-        "displayName": "%view.tradeEditor.title%",
-        "selector": [
-          {
-            "filenamePattern": "*.py"
-          }
-        ],
-        "priority": "option"
-      },
-      {
         "viewType": "quantlab.statsView",
         "displayName": "Stats",
         "selector": [
@@ -1057,11 +956,6 @@
           "icon": "media/icons/history.svg"
         },
         {
-          "id": "quantlab-trade",
-          "title": "%viewContainer.trade.title%",
-          "icon": "media/icons/trade.svg"
-        },
-        {
           "id": "quantlab-settings",
           "title": "%viewContainer.settings.title%",
           "icon": "media/icons/settings.svg"
@@ -1091,12 +985,6 @@
         {
           "id": "quantlab.historyView",
           "name": "%view.history.title%"
-        }
-      ],
-      "quantlab-trade": [
-        {
-          "id": "quantlab.tradeView",
-          "name": "%view.trade.title%"
         }
       ],
       "quantlab-settings": [
@@ -1131,12 +1019,6 @@
           "type": "webview",
           "name": "%view.sqlQuery.title%",
           "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
-        },
-        {
-          "id": "quantlab.aiPanel",
-          "type": "webview",
-          "name": "%view.aiPanel.title%",
-          "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
         }
       ]
     },
@@ -1144,11 +1026,6 @@
       "commandPalette": [
         {
           "command": "quantlab.quantbookLocalFirstInfo",
-          "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
-        },
-        {
-          "_comment": "Wave K-b (R20): Explain works from the palette too -- it falls back to the focused grid's selected cell when invoked without a right-click payload.",
-          "command": "quantlab.quantbookExplainCell",
           "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
         },
         {
@@ -1487,36 +1364,6 @@
           "group": "navigation@3"
         },
         {
-          "command": "quantlab.viewSession",
-          "when": "view == quantlab.tradeView && viewItem == activeSession",
-          "group": "inline@1"
-        },
-        {
-          "command": "quantlab.viewSession",
-          "when": "view == quantlab.tradeView && viewItem == activeSessionPaused",
-          "group": "inline@1"
-        },
-        {
-          "command": "quantlab.pauseSession",
-          "when": "view == quantlab.tradeView && viewItem == activeSession",
-          "group": "inline@2"
-        },
-        {
-          "command": "quantlab.resumeSession",
-          "when": "view == quantlab.tradeView && viewItem == activeSessionPaused",
-          "group": "inline@2"
-        },
-        {
-          "command": "quantlab.stopSession",
-          "when": "view == quantlab.tradeView && viewItem == activeSession",
-          "group": "inline@3"
-        },
-        {
-          "command": "quantlab.stopSession",
-          "when": "view == quantlab.tradeView && viewItem == activeSessionPaused",
-          "group": "inline@3"
-        },
-        {
           "_comment": "M56: History-tree run entries. contextValue is status-aware -- quantlab.history.entry.<status> (HistoryTreeProvider.getTreeItem) -- so Cancel only shows on running/queued runs.",
           "command": "quantlab.openHistoryEntry",
           "when": "view == quantlab.historyView && viewItem =~ /^quantlab\\.history\\.entry\\./",
@@ -1553,11 +1400,6 @@
           "command": "quantlab.openAsAction",
           "when": "resourceLangId == python",
           "group": "1_open@11"
-        },
-        {
-          "command": "quantlab.openAsTrade",
-          "when": "resourceLangId == python",
-          "group": "1_open@12"
         },
         {
           "command": "quantlab.switchToVisualise",
@@ -1644,12 +1486,6 @@
           "command": "quantlab.quantbookDeleteColumn",
           "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@6"
-        },
-        {
-          "_comment": "Wave K-b (R20): Explain the right-clicked cell's formula with AI. Own group (5_ai) so it sits at the bottom of the cell menu.",
-          "command": "quantlab.quantbookExplainCell",
-          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
-          "group": "5_ai@1"
         },
         {
           "_comment": "Wave L2 (R23): Show the SQL/published lineage of the right-clicked cell. Grouped with Explain (5_ai) -- both are read-only 'inspect this cell' actions.",
@@ -1759,12 +1595,6 @@
         "when": "editorTextFocus"
       },
       {
-        "command": "quantlab.switchToTrade",
-        "key": "ctrl+q t",
-        "mac": "ctrl+q t",
-        "when": "editorTextFocus"
-      },
-      {
         "command": "quantlab.switchToEditor",
         "key": "ctrl+q e",
         "mac": "ctrl+q e",
@@ -1785,12 +1615,6 @@
         "command": "quantlab.openAsAction",
         "key": "ctrl+q shift+a",
         "mac": "ctrl+q shift+a",
-        "when": "editorTextFocus"
-      },
-      {
-        "command": "quantlab.openAsTrade",
-        "key": "ctrl+q shift+t",
-        "mac": "ctrl+q shift+t",
         "when": "editorTextFocus"
       },
       {
@@ -1830,17 +1654,6 @@
         "command": "quantlab.focusHistoryPanel",
         "key": "ctrl+q 3",
         "mac": "ctrl+q 3"
-      },
-      {
-        "command": "quantlab.focusTradePanel",
-        "key": "ctrl+q 4",
-        "mac": "ctrl+q 4"
-      },
-      {
-        "command": "quantlab.killSwitch",
-        "key": "ctrl+q k",
-        "mac": "ctrl+q k",
-        "when": "quantlab.currentView == trade"
       }
     ],
     "configuration": {
@@ -1859,176 +1672,6 @@
           "minimum": 0,
           "maximum": 65535,
           "description": "FE-BEYOND B1: TCP port for the read-only Quantbook MCP server (bound to 127.0.0.1 only). 0 (the default) lets the OS pick a free port; the resolved URL is printed to the Quantbook MCP Server output channel on start."
-        },
-        "quantlab.ai.model": {
-          "type": "string",
-          "enum": [
-            "claude-opus-4-8",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5"
-          ],
-          "default": "claude-opus-4-8",
-          "description": "FE-6 (Wave K): Claude model used by the Quantbook AI features (Explain, chat). The API key is set via the 'Quantbook: Set Anthropic API Key' command and stored in the OS secret store (never in settings)."
-        },
-        "quantlab.trading.accounts": {
-          "type": "array",
-          "default": [],
-          "description": "Broker account configurations for trading sessions.",
-          "items": {
-            "type": "object",
-            "properties": {
-              "id": {
-                "type": "string"
-              },
-              "name": {
-                "type": "string"
-              },
-              "broker": {
-                "type": "string",
-                "enum": [
-                  "alpaca",
-                  "mock"
-                ],
-                "default": "mock"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "paper",
-                  "live"
-                ]
-              }
-            },
-            "required": [
-              "id",
-              "name",
-              "broker",
-              "type"
-            ]
-          }
-        },
-        "quantlab.trading.killSwitchPolicy": {
-          "type": "string",
-          "enum": [
-            "flatten",
-            "cancelOnly",
-            "custom"
-          ],
-          "default": "flatten",
-          "description": "Kill Switch policy to execute in Trade view."
-        },
-        "quantlab.trading.killSwitchCustomActions": {
-          "type": "array",
-          "default": [],
-          "description": "Custom Kill Switch actions to execute when policy is custom."
-        },
-        "quantlab.trading.requireBacktest": {
-          "type": "boolean",
-          "default": false,
-          "description": "Require a completed backtest before live trading."
-        },
-        "quantlab.trading.requirePaperTrading": {
-          "type": "boolean",
-          "default": false,
-          "description": "Require a completed paper trading session before live trading."
-        },
-        "quantlab.trading.requireRiskReview": {
-          "type": "boolean",
-          "default": false,
-          "description": "Require risk review confirmation before live trading."
-        },
-        "quantlab.trading.dailyLossLimit": {
-          "type": "number",
-          "default": 1000,
-          "description": "Daily loss limit in USD (Decision L74). Set 0 to disable."
-        },
-        "quantlab.trading.dailyLossLimitPercent": {
-          "type": "number",
-          "default": 0.02,
-          "minimum": 0,
-          "maximum": 1,
-          "description": "Daily loss limit as fraction of equity (Decision L74: 2%). Takes precedence over USD limit when set."
-        },
-        "quantlab.trading.maxDrawdownPercent": {
-          "type": "number",
-          "default": 0.05,
-          "minimum": 0,
-          "maximum": 1,
-          "description": "Maximum drawdown as fraction of equity (Decision L74: 5%)."
-        },
-        "quantlab.trading.consecutiveLossLimit": {
-          "type": "integer",
-          "default": 3,
-          "minimum": 1,
-          "maximum": 50,
-          "description": "Maximum consecutive losing trades before automatic halt (Decision L74: 3)."
-        },
-        "quantlab.trading.maxExposure": {
-          "type": "number",
-          "default": 100000,
-          "description": "Maximum total exposure in USD. Set 0 to disable."
-        },
-        "quantlab.trading.maxPositionSize": {
-          "type": "number",
-          "default": 0,
-          "description": "Maximum position size (shares). Set 0 to disable."
-        },
-        "quantlab.trading.maxOpenOrders": {
-          "type": "number",
-          "default": 10,
-          "description": "Maximum open orders across sessions. Set 0 to disable."
-        },
-        "quantlab.notifications.showJobComplete": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show notifications when backtests complete."
-        },
-        "quantlab.notifications.showJobFailed": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show notifications when backtests fail."
-        },
-        "quantlab.notifications.showTradeExecuted": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show notifications when trades are executed."
-        },
-        "quantlab.notifications.showRiskAlerts": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show notifications for risk alerts."
-        },
-        "quantlab.notifications.showSessionStatus": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show notifications when sessions start, pause, or stop."
-        },
-        "quantlab.notifications.soundEnabled": {
-          "type": "boolean",
-          "default": false,
-          "description": "Enable notification sounds."
-        },
-        "quantlab.notifications.soundVolume": {
-          "type": "number",
-          "default": 0.5,
-          "minimum": 0,
-          "maximum": 1,
-          "description": "Notification sound volume (0-1)."
-        },
-        "quantlab.notifications.playFillSound": {
-          "type": "boolean",
-          "default": false,
-          "description": "Play a sound when trades are executed."
-        },
-        "quantlab.notifications.playAlertSound": {
-          "type": "boolean",
-          "default": false,
-          "description": "Play a sound for risk alerts."
-        },
-        "quantlab.notifications.playCompleteSound": {
-          "type": "boolean",
-          "default": false,
-          "description": "Play a sound when backtests complete."
         },
         "quantlab.accessibility.reducedMotion": {
           "type": "string",
