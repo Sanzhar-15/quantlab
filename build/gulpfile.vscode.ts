@@ -36,6 +36,8 @@ import rceditCallback from 'rcedit';
 // --- quantlab engine packaging (QL-ENGINE-PKG / QL-QUANTBOOK) ---
 import { bundleQuantlabEngineTask, quantlabEngineStream } from './engine/bundle.ts';
 gulp.task(bundleQuantlabEngineTask);
+import { quantbookEngineStream, stageQuantbookEngineTask } from './quantbook/bundle.ts';
+gulp.task(stageQuantbookEngineTask);
 // --- end quantlab engine packaging ---
 
 
@@ -249,9 +251,10 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 
 		// --- quantlab engine packaging (QL-ENGINE-PKG / QL-QUANTBOOK) ---
 		const quantlabEngine = quantlabEngineStream(platform, arch);
+		const quantbookEngine = quantbookEngineStream(platform, arch);
 		// --- end quantlab engine packaging ---
 
-		const sources = es.merge(src, extensions, quantlabEngine)
+		const sources = es.merge(src, extensions, quantlabEngine, quantbookEngine)
 			.pipe(filter(['**', '!**/*.{js,css}.map'], { dot: true }));
 
 		let version = packageJson.version;
