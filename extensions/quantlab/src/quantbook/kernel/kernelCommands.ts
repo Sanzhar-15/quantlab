@@ -28,9 +28,19 @@ function readKernelSetting(): string | undefined {
 	return storedKernelChoice(vscode.workspace.getConfiguration('quantlab').get<unknown>(KERNEL_SETTING));
 }
 
-/** The kernel the next start uses. Throws by name on an invalid or unavailable stored choice. */
-export function resolveConfiguredKernel(): KernelKind {
-	return resolveKernelChoice(readKernelSetting(), readComputeRecord());
+export interface ConfiguredKernel {
+	readonly kind: KernelKind;
+	/** False when the setting is `default`: the user made no choice and `kind` is the default option. */
+	readonly chosen: boolean;
+}
+
+/**
+ * The kernel the next start uses, and whether the user chose it. Throws by name on an invalid or
+ * unavailable stored choice. The caller states an unchosen kernel in its log, never silently.
+ */
+export function resolveConfiguredKernel(): ConfiguredKernel {
+	const stored = readKernelSetting();
+	return { kind: resolveKernelChoice(stored, readComputeRecord()), chosen: stored !== undefined };
 }
 
 function workspaceIdentity(): string | undefined {

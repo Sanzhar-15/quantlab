@@ -163,8 +163,11 @@ function makeClientFactory(
 		// QL-KERNEL: the chosen kernel decides the launch. An invalid or unavailable stored choice throws by
 		// name here; only the local kernel has a launch path (this one, on the user's interpreter).
 		const kernel = resolveConfiguredKernel();
-		if (kernel !== 'local') {
-			throw new Error(`[kernel_cloud_no_transport] the ${kernel} kernel was chosen but this build has no transport for it; choose the local kernel`);
+		output.appendLine(kernel.chosen
+			? `kernel: ${kernel.kind} (quantlab.quantbook.kernel)`
+			: `kernel: ${kernel.kind} (no kernel chosen: quantlab.quantbook.kernel is 'default', and ${kernel.kind} is the default option)`);
+		if (kernel.kind !== 'local') {
+			throw new Error(`[kernel_cloud_no_transport] the ${kernel.kind} kernel was chosen but this build has no transport for it; choose the local kernel`);
 		}
 		const quantlabConfig = vscode.workspace.getConfiguration('quantlab');
 		const pythonExtConfig = vscode.workspace.getConfiguration('python');
