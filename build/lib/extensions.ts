@@ -325,6 +325,20 @@ const excludedExtensions = [
 	'vscode-test-resolver',
 	'ms-vscode.node-debug',
 	'ms-vscode.node-debug2',
+	// Quantlab strip manifest (STRIP-MANIFEST.tsv, mechanism build-exclude)
+	'tunnel-forwarding',
+	'github-authentication',
+	'microsoft-authentication',
+	'theme-abyss',
+	'theme-kimbie-dark',
+	'theme-monokai-dimmed',
+	'theme-monokai',
+	'theme-quietlight',
+	'theme-red',
+	'theme-seti',
+	'theme-solarized-dark',
+	'theme-solarized-light',
+	'theme-tomorrow-night-blue',
 ];
 
 const marketplaceWebExtensionsExclude = new Set([
