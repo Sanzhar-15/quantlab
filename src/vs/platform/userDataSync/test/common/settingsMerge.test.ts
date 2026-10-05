@@ -5,7 +5,8 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { addSetting, merge, updateIgnoredSettings } from '../../common/settingsMerge.js';
+import { TestConfigurationService } from '../../../configuration/test/common/testConfigurationService.js';
+import { addSetting, getIgnoredSettings, merge, updateIgnoredSettings } from '../../common/settingsMerge.js';
 import type { IConflictSetting } from '../../common/userDataSync.js';
 
 const formattingOptions = { eol: '\n', insertSpaces: false, tabSize: 4 };
@@ -1614,6 +1615,55 @@ suite('SettingsMerge - Add Setting', () => {
 		const actual = addSetting('b', sourceContent, targetContent, formattingOptions);
 
 		assert.strictEqual(actual, expected);
+	});
+});
+
+// QuantLab carry SYNC-1: the retired demo pair never reaches Settings Sync content, whatever the user's ignoredSettings say.
+suite('SettingsMerge - never-synced settings (SYNC-1)', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	// What the workbench tombstone registration (`ignoreSync: true`) contributes to the default ignored settings.
+	const tombstoneDefaults = ['qic.demo.email', 'qic.demo.password'];
+	const optBackIn = ['-qic.demo.password', '-qic.demo.email'];
+	const passwordSentinel = 'SENTINEL-not-a-real-value';
+	const emailSentinel = 'SENTINEL-not-a-real-address';
+	const base = stringify({ 'a': 1 });
+
+	function localWithDemoPair(extra: Record<string, unknown>): string {
+		const content = stringify({ 'a': 2, 'qic.demo.email': emailSentinel, 'qic.demo.password': passwordSentinel, ...extra });
+		assert.ok(content.includes(passwordSentinel) && content.includes(emailSentinel), 'the local content must hold both sentinels');
+		return content;
+	}
+
+	function assertNoDemoPair(remoteContent: string | null): void {
+		assert.ok(remoteContent !== null, 'the path must produce remote content');
+		assert.ok(!remoteContent.includes(passwordSentinel), 'qic.demo.password value reached the remote content');
+		assert.ok(!remoteContent.includes(emailSentinel), 'qic.demo.email value reached the remote content');
+		assert.ok(remoteContent.includes('"a": 2'), 'the other local change must still reach the remote content');
+	}
+
+	test('demo pair is absent from remote content with default ignored settings', () => {
+		const local = localWithDemoPair({});
+		const ignored = getIgnoredSettings(tombstoneDefaults, new TestConfigurationService());
+
+		// first sync (settingsSync.ts applyResult): local content stripped of ignored settings against an empty remote
+		assertNoDemoPair(updateIgnoredSettings(local, '{}', ignored, formattingOptions));
+		// later sync: local moved forward from base, remote did not
+		assertNoDemoPair(merge(local, base, base, ignored, [], formattingOptions).remoteContent);
+	});
+
+	test('demo pair is absent from remote content when the user opts both keys back in', () => {
+		const local = localWithDemoPair({});
+		const ignored = getIgnoredSettings(tombstoneDefaults, new TestConfigurationService({ 'settingsSync.ignoredSettings': optBackIn }));
+
+		assertNoDemoPair(updateIgnoredSettings(local, '{}', ignored, formattingOptions));
+		assertNoDemoPair(merge(local, base, base, ignored, [], formattingOptions).remoteContent);
+
+		// applyResult reads the ignored settings from the content it is about to upload
+		const localOptingBackIn = localWithDemoPair({ 'settingsSync.ignoredSettings': optBackIn });
+		const ignoredFromContent = getIgnoredSettings(tombstoneDefaults, new TestConfigurationService(), localOptingBackIn);
+		assertNoDemoPair(updateIgnoredSettings(localOptingBackIn, '{}', ignoredFromContent, formattingOptions));
 	});
 });
 

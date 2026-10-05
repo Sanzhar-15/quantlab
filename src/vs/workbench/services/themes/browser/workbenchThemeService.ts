@@ -60,10 +60,10 @@ const themingRegistry = Registry.as<IThemingRegistry>(ThemingExtensions.ThemingC
 function validateThemeId(theme: string): string {
 	// migrations
 	switch (theme) {
-		case ThemeTypeSelector.VS: return `vs ${defaultThemeExtensionId}-themes-light_vs-json`;
-		case ThemeTypeSelector.VS_DARK: return `vs-dark ${defaultThemeExtensionId}-themes-dark_vs-json`;
-		case ThemeTypeSelector.HC_BLACK: return `hc-black ${defaultThemeExtensionId}-themes-hc_black-json`;
-		case ThemeTypeSelector.HC_LIGHT: return `hc-light ${defaultThemeExtensionId}-themes-hc_light-json`;
+		case ThemeTypeSelector.VS: return `vs ${defaultThemeExtensionId}-themes-delta_plus_light-json`;
+		case ThemeTypeSelector.VS_DARK: return `vs-dark ${defaultThemeExtensionId}-themes-delta_plus_dark-json`;
+		case ThemeTypeSelector.HC_BLACK:
+		case ThemeTypeSelector.HC_LIGHT: return `hc-black ${defaultThemeExtensionId}-themes-delta_plus_hc-json`;
 	}
 	return theme;
 }
