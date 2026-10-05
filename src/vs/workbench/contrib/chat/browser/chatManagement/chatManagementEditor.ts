@@ -16,10 +16,7 @@ import { IEditorGroup } from '../../../../services/editor/common/editorGroupsSer
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { ChatManagementEditorInput, CHAT_MANAGEMENT_SECTION_USAGE, CHAT_MANAGEMENT_SECTION_MODELS, ModelsManagementEditorInput } from './chatManagementEditorInput.js';
 import { ChatModelsWidget } from './chatModelsWidget.js';
-import { Button } from '../../../../../base/browser/ui/button/button.js';
-import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { localize } from '../../../../../nls.js';
-import { defaultButtonStyles } from '../../../../../platform/theme/browser/defaultStyles.js';
 import { IChatEntitlementService, ChatEntitlement } from '../../../../services/chat/common/chatEntitlementService.js';
 import { ChatUsageWidget } from './chatUsageWidget.js';
 import { Orientation, Sizing, SplitView } from '../../../../../base/browser/ui/splitview/splitview.js';
@@ -98,11 +95,6 @@ export class ModelsManagementEditor extends EditorPane {
 
 export const chatManagementSashBorder = registerColor('chatManagement.sashBorder', PANEL_BORDER, localize('chatManagementSashBorder', "The color of the Chat Management editor splitview sash border."));
 
-function isNewUser(chatEntitlementService: IChatEntitlementService): boolean {
-	return !chatEntitlementService.sentiment.installed ||
-		chatEntitlementService.entitlement === ChatEntitlement.Available;
-}
-
 interface SectionItem {
 	id: string;
 	label: string;
@@ -119,7 +111,6 @@ export class ChatManagementEditor extends EditorPane {
 	private contentsContainer!: HTMLElement;
 
 	private planBadge!: HTMLElement;
-	private actionButton!: Button;
 
 	private chatUsageWidget!: ChatUsageWidget;
 	private modelsWidget!: ChatModelsWidget;
@@ -128,7 +119,6 @@ export class ChatManagementEditor extends EditorPane {
 	private selectedSection: string = CHAT_MANAGEMENT_SECTION_USAGE;
 	private sections: SectionItem[] = [];
 
-	private readonly commandService: ICommandService;
 	private readonly chatEntitlementService: IChatEntitlementService;
 
 	constructor(
@@ -137,11 +127,9 @@ export class ChatManagementEditor extends EditorPane {
 		@IThemeService themeService: IThemeService,
 		@IStorageService storageService: IStorageService,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
-		@ICommandService commandService: ICommandService,
 		@IChatEntitlementService chatEntitlementService: IChatEntitlementService
 	) {
 		super(ChatManagementEditor.ID, group, telemetryService, themeService, storageService);
-		this.commandService = commandService;
 		this.chatEntitlementService = chatEntitlementService;
 	}
 
@@ -266,12 +254,6 @@ export class ChatManagementEditor extends EditorPane {
 
 		// Plan badge
 		this.planBadge = DOM.append(headerTitleWrapper, $('.plan-badge'));
-
-		// Action button container in title
-		const titleButtonContainer = DOM.append(headerTitleContainer, $('.header-upgrade-button-container'));
-		this.actionButton = this._register(new Button(titleButtonContainer, { ...defaultButtonStyles }));
-		this.actionButton.element.classList.add('header-upgrade-button');
-		this.actionButton.element.style.display = 'none';
 	}
 
 	private renderContents(parent: HTMLElement): void {
@@ -327,10 +309,7 @@ export class ChatManagementEditor extends EditorPane {
 	}
 
 	private updateHeaderData(): void {
-		const newUser = isNewUser(this.chatEntitlementService);
 		const anonymousUser = this.chatEntitlementService.anonymous;
-		const disabled = this.chatEntitlementService.sentiment.disabled || this.chatEntitlementService.sentiment.untrusted;
-		const signedOut = this.chatEntitlementService.entitlement === ChatEntitlement.Unknown;
 		const isFreePlan = this.chatEntitlementService.entitlement === ChatEntitlement.Free;
 
 		// Set plan name and toggle visibility based on plan type
@@ -349,49 +328,6 @@ export class ChatManagementEditor extends EditorPane {
 			const planName = this.getCurrentPlanName();
 			this.planBadge.textContent = planName.replace('Copilot ', '');
 		}
-
-		const shouldUpgrade = this.shouldShowUpgradeButton();
-
-		// Configure action button
-		if (newUser || signedOut || disabled || shouldUpgrade) {
-			this.actionButton.element.style.display = '';
-
-			let buttonLabel: string;
-			let commandId: string;
-
-			if (shouldUpgrade && !isFreePlan && !anonymousUser) {
-				// Upgrade for paid plans
-				if (this.chatEntitlementService.entitlement === ChatEntitlement.Pro) {
-					buttonLabel = localize('plan.upgradeToProPlus', 'Upgrade to Copilot Pro+');
-				} else {
-					buttonLabel = localize('plan.upgradeToPro', 'Upgrade to Copilot Pro');
-				}
-				commandId = 'workbench.action.chat.upgradePlan';
-			} else if (shouldUpgrade && (isFreePlan || anonymousUser)) {
-				// Upgrade case for free plan
-				buttonLabel = localize('upgradeToCopilotPro', 'Upgrade to Copilot Pro');
-				commandId = 'workbench.action.chat.upgradePlan';
-			} else if (newUser) {
-				buttonLabel = localize('enableAIFeatures', "Use AI Features");
-				commandId = newUser && anonymousUser ? 'workbench.action.chat.triggerSetupAnonymousWithoutDialog' : 'workbench.action.chat.triggerSetup';
-			} else if (anonymousUser) {
-				buttonLabel = localize('enableMoreAIFeatures', "Enable more AI Features");
-				commandId = 'workbench.action.chat.triggerSetup';
-			} else if (disabled) {
-				buttonLabel = localize('enableCopilotButton', "Enable AI Features");
-				commandId = 'workbench.action.chat.triggerSetup';
-			} else {
-				buttonLabel = localize('signInToUseAIFeatures', "Sign in to use AI Features");
-				commandId = 'workbench.action.chat.triggerSetup';
-			}
-
-			this.actionButton.label = buttonLabel;
-			this.actionButton.onDidClick(() => {
-				this.commandService.executeCommand(commandId);
-			});
-		} else {
-			this.actionButton.element.style.display = 'none';
-		}
 	}
 
 	private getCurrentPlanName(): string {
@@ -408,13 +344,6 @@ export class ChatManagementEditor extends EditorPane {
 			default:
 				return localize('plan.freeName', 'Copilot Free');
 		}
-	}
-
-	private shouldShowUpgradeButton(): boolean {
-		const entitlement = this.chatEntitlementService.entitlement;
-		return entitlement === ChatEntitlement.Available ||
-			entitlement === ChatEntitlement.Free ||
-			entitlement === ChatEntitlement.Pro;
 	}
 
 	override async setInput(input: ChatManagementEditorInput, options: IEditorOptions | undefined, context: IEditorOpenContext, token: CancellationToken): Promise<void> {

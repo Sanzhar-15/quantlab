@@ -44,7 +44,6 @@ import { ILogService } from '../../../../../platform/log/common/log.js';
 import { IMarkdownRenderer } from '../../../../../platform/markdown/browser/markdownRenderer.js';
 import { isDark } from '../../../../../platform/theme/common/theme.js';
 import { IThemeService } from '../../../../../platform/theme/common/themeService.js';
-import { IChatEntitlementService } from '../../../../services/chat/common/chatEntitlementService.js';
 import { IWorkbenchIssueService } from '../../../issue/common/issue.js';
 import { CodiconActionViewItem } from '../../../notebook/browser/view/cellParts/cellActionView.js';
 import { annotateSpecialMarkdownContent } from '../../common/widget/annotations.js';
@@ -66,7 +65,6 @@ import { ChatTreeItem, IChatCodeBlockInfo, IChatFileTreeInfo, IChatListItemRende
 import { ChatAgentHover, getChatAgentHoverOptions } from './chatAgentHover.js';
 import { ChatContentMarkdownRenderer } from './chatContentMarkdownRenderer.js';
 import { ChatAgentCommandContentPart } from './chatContentParts/chatAgentCommandContentPart.js';
-import { ChatAnonymousRateLimitedPart } from './chatContentParts/chatAnonymousRateLimitedPart.js';
 import { ChatAttachmentsContentPart } from './chatContentParts/chatAttachmentsContentPart.js';
 import { ChatCheckpointFileChangesSummaryContentPart } from './chatContentParts/chatChangesSummaryPart.js';
 import { ChatCodeCitationContentPart } from './chatContentParts/chatCodeCitationContentPart.js';
@@ -218,7 +216,6 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 		@ICommandService private readonly commandService: ICommandService,
 		@IHoverService private readonly hoverService: IHoverService,
 		@IChatWidgetService private readonly chatWidgetService: IChatWidgetService,
-		@IChatEntitlementService private readonly chatEntitlementService: IChatEntitlementService,
 	) {
 		super();
 
@@ -1414,10 +1411,6 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 		const isLast = context.elementIndex === this.delegate.getListLength() - 1;
 		if (content.errorDetails.isQuotaExceeded) {
 			const renderedError = this.instantiationService.createInstance(ChatQuotaExceededPart, context.element, content, this.chatContentMarkdownRenderer);
-			renderedError.addDisposable(renderedError.onDidChangeHeight(() => this.updateItemHeight(templateData)));
-			return renderedError;
-		} else if (content.errorDetails.isRateLimited && this.chatEntitlementService.anonymous) {
-			const renderedError = this.instantiationService.createInstance(ChatAnonymousRateLimitedPart, content);
 			return renderedError;
 		} else if (content.errorDetails.confirmationButtons && isLast) {
 			const level = content.errorDetails.level ?? ChatErrorLevel.Error;
