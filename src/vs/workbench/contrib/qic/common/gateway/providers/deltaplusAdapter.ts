@@ -17,23 +17,18 @@ import { consumeStream, listenStream } from '../../../../../../base/common/strea
 
 export interface DeltaPlusConfig {
 	baseUrl: string;
-	accessToken: string;
-	refreshToken?: string;
-	tokenExpiresAt?: number;
-	onTokenRefresh?: (newAccess: string, newRefresh?: string) => Promise<void>;
-	/** Called when token refresh fails (401/403) — should do a fresh login and return new tokens */
-	loginFallback?: () => Promise<{ accessToken: string; refreshToken?: string; expiresIn?: number }>;
 }
 
 const REQUEST_TIMEOUT_MS = 60_000;
 const STREAM_TIMEOUT_MS = 5 * 60_000;
-const PROACTIVE_REFRESH_THRESHOLD_MS = 5 * 60_000;
 const NETWORK_RETRY_MAX = 2;
 const NETWORK_RETRY_BASE_MS = 500;
 
 /**
  * Provider adapter for Delta Plus Server LLM proxy.
- * Routes QIC requests through the Delta Plus server using the existing JWT.
+ * Holds no credential: QIC's login is the host identity (QL-LOGIN), and the host keeps
+ * the tokens in its own store. Requests therefore carry no Authorization header until the
+ * data path (QL-DATA) routes them through the host; the server's 401 is the visible failure.
  * Uses IRequestService for HTTP to bypass CSP restrictions in the renderer.
  */
 export class DeltaPlusAdapter implements ProviderAdapter {
@@ -41,12 +36,9 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 	readonly name = 'Delta Plus Server';
 	readonly type = 'llm' as const;
 
-	private config: DeltaPlusConfig;
+	private readonly config: DeltaPlusConfig;
 	private readonly activeRequests = new Map<string, AbortController>();
 	private readonly requestService?: IRequestService;
-
-	// Mutex: coalesce concurrent refresh calls
-	private _refreshPromise: Promise<void> | null = null;
 
 	// State tracking for Anthropic-format SSE tool_use events
 	private _streamingToolCallId: string | null = null;
@@ -54,28 +46,6 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 	constructor(config: DeltaPlusConfig, requestService?: IRequestService) {
 		this.requestService = requestService;
 		this.config = config;
-
-		// JWT exp fallback
-		if (!this.config.tokenExpiresAt && this.config.accessToken) {
-			this.config.tokenExpiresAt = this.decodeJwtExp(this.config.accessToken);
-		}
-	}
-
-	/**
-	 * Update the in-memory access/refresh tokens.
-	 * Called by the QIC contribution when ServerApiClient writes a fresh token to SecretStorage,
-	 * ensuring this adapter always uses the latest token without doing its own HTTP refresh.
-	 */
-	updateTokens(accessToken: string, refreshToken?: string, tokenExpiresAt?: number): void {
-		this.config.accessToken = accessToken;
-		if (refreshToken !== undefined) {
-			this.config.refreshToken = refreshToken;
-		}
-		if (tokenExpiresAt !== undefined) {
-			this.config.tokenExpiresAt = tokenExpiresAt;
-		} else if (accessToken) {
-			this.config.tokenExpiresAt = this.decodeJwtExp(accessToken);
-		}
 	}
 
 	// --- ProviderAdapter implementation ---
@@ -98,7 +68,6 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 				const context = await this.requestService.request({
 					url: `${this.config.baseUrl}/health/live`,
 					type: 'GET',
-					headers: { 'Authorization': `Bearer ${this.config.accessToken}` },
 				}, cts.token);
 				const statusOk = context.res.statusCode !== undefined && context.res.statusCode >= 200 && context.res.statusCode < 300;
 				return {
@@ -109,7 +78,6 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 				};
 			} else {
 				const response = await fetch(`${this.config.baseUrl}/health/live`, {
-					headers: { 'Authorization': `Bearer ${this.config.accessToken}` },
 					signal: AbortSignal.timeout(5000),
 				});
 				return {
@@ -137,8 +105,6 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 		const timeoutId = setTimeout(() => abortController.abort(), REQUEST_TIMEOUT_MS);
 
 		try {
-			await this.ensureTokenFresh();
-
 			const bodyStr = JSON.stringify(this.buildQicRequest(request, false));
 
 		const doRequest = async (): Promise<{ status: number; body: string }> => {
@@ -188,12 +154,6 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 				throw lastNetworkError ?? new QicError('QIC-N002', 'Failed to connect to Delta Plus Server after retries');
 			}
 
-			// Handle 401 — attempt token refresh + retry
-			if (result.status === 401) {
-				await this.refreshAccessToken();
-				result = await doRequest();
-			}
-
 			if (result.status < 200 || result.status >= 300) {
 				throw this.normalizeErrorFromStatus(result.status, result.body);
 			}
@@ -235,8 +195,6 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 		const timeoutId = setTimeout(() => abortController.abort(), STREAM_TIMEOUT_MS);
 
 		try {
-			await this.ensureTokenFresh();
-
 			const bodyStr = JSON.stringify(this.buildQicRequest(request, true));
 
 			if (this.requestService) {
@@ -277,22 +235,6 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 		}
 		if (!context) {
 			throw new QicError('QIC-N002', 'Failed to connect to Delta Plus Server after retries');
-		}
-
-		// Handle 401 — retry after refresh
-		if (context.res.statusCode === 401) {
-			await this.refreshAccessToken();
-			try {
-				context = await this.requestService!.request({
-					url: `${this.config.baseUrl}/v1/qic/stream`,
-					type: 'POST',
-					headers: this.getHeaders(),
-					data: bodyStr,
-				}, cts.token);
-			} catch (reqErr) {
-				const message = reqErr instanceof Error ? reqErr.message : String(reqErr);
-				throw new QicError('QIC-N002', `Failed to connect to Delta Plus Server: ${message}`);
-			}
 		}
 
 		if (!context.res.statusCode || context.res.statusCode < 200 || context.res.statusCode >= 300) {
@@ -361,22 +303,6 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 		}
 		if (!response) {
 			throw new QicError('QIC-N002', 'Failed to connect to Delta Plus Server after retries');
-		}
-
-		// Handle 401 — retry after refresh
-		if (response.status === 401) {
-			await this.refreshAccessToken();
-			try {
-				response = await fetch(`${this.config.baseUrl}/v1/qic/stream`, {
-					method: 'POST',
-					headers: this.getHeaders(),
-					body: bodyStr,
-					signal: abortController.signal,
-				});
-			} catch (fetchErr) {
-				const message = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-				throw new QicError('QIC-N002', `Failed to connect to Delta Plus Server: ${message}`);
-			}
 		}
 
 		if (!response.ok) {
@@ -754,160 +680,13 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 		}
 	}
 
-	// --- Token management ---
-
-	private async refreshAccessToken(): Promise<void> {
-		if (this._refreshPromise) {
-			return this._refreshPromise;
-		}
-		this._refreshPromise = this.doRefreshAccessToken().finally(() => {
-			this._refreshPromise = null;
-		});
-		return this._refreshPromise;
-	}
-
-	private async doRefreshAccessToken(): Promise<void> {
-		// Try refresh token first, then fall back to direct login
-		let refreshFailed = false;
-
-		if (this.config.refreshToken) {
-			try {
-				const data = await this.attemptTokenRefresh();
-				this.applyTokenData(data);
-				return;
-			} catch (e) {
-				// Any refresh failure (HTTP errors, network errors like net::ERR_FAILED) → try login fallback
-				refreshFailed = true;
-			}
-		} else {
-			refreshFailed = true;
-		}
-
-		// Fallback: direct login when refresh token is missing or invalid
-		if (refreshFailed && this.config.loginFallback) {
-			try {
-				const result = await this.config.loginFallback();
-				this.config.accessToken = result.accessToken;
-				if (result.refreshToken) {
-					this.config.refreshToken = result.refreshToken;
-				}
-				if (result.expiresIn) {
-					this.config.tokenExpiresAt = Date.now() + (result.expiresIn * 1000);
-				} else {
-					this.config.tokenExpiresAt = this.decodeJwtExp(result.accessToken);
-				}
-				// Persist via callback
-				try {
-					await this.config.onTokenRefresh?.(result.accessToken, result.refreshToken);
-				} catch {
-					// Best-effort persistence
-				}
-				return;
-			} catch (loginErr) {
-				throw new QicError('QIC-P006', `Delta Plus re-login failed: ${loginErr instanceof Error ? loginErr.message : String(loginErr)}`);
-			}
-		}
-
-		throw new QicError('QIC-P006', 'Delta Plus session expired. Please reconnect to the server.');
-	}
-
-	private async attemptTokenRefresh(): Promise<{ access_token?: string; refresh_token?: string; expires_in?: number }> {
-		let data: { access_token?: string; refresh_token?: string; expires_in?: number };
-
-		if (this.requestService) {
-			const cts = new CancellationTokenSource();
-			setTimeout(() => cts.cancel(), 10_000);
-			const context = await this.requestService.request({
-				url: `${this.config.baseUrl}/v1/auth/refresh`,
-				type: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				data: JSON.stringify({ refresh_token: this.config.refreshToken }),
-			}, cts.token);
-
-			if (!context.res.statusCode || context.res.statusCode < 200 || context.res.statusCode >= 300) {
-				if (context.res.statusCode === 401 || context.res.statusCode === 403) {
-					throw new QicError('QIC-P006', 'Refresh token expired', undefined, context.res.statusCode);
-				}
-				throw new QicError('QIC-P006', `Token refresh failed: ${context.res.statusCode}`, undefined, context.res.statusCode);
-			}
-
-			const buffer = await consumeStream<VSBuffer>(context.stream, chunks => VSBuffer.concat(chunks));
-			const raw = JSON.parse(buffer.toString()) as Record<string, unknown>;
-			data = this.unwrapResponse(raw);
-		} else {
-			const resp = await fetch(`${this.config.baseUrl}/v1/auth/refresh`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ refresh_token: this.config.refreshToken }),
-				signal: AbortSignal.timeout(10_000),
-			});
-
-			if (!resp.ok) {
-				if (resp.status === 401 || resp.status === 403) {
-					throw new QicError('QIC-P006', 'Refresh token expired', undefined, resp.status);
-				}
-				throw new QicError('QIC-P006', `Token refresh failed: ${resp.status}`, undefined, resp.status);
-			}
-
-			const raw = await resp.json() as Record<string, unknown>;
-			data = this.unwrapResponse(raw);
-		}
-
-		if (!data.access_token) {
-			throw new QicError('QIC-P006', 'Token refresh response missing access_token');
-		}
-
-		return data;
-	}
-
-	private applyTokenData(data: { access_token?: string; refresh_token?: string; expires_in?: number }): void {
-		this.config.accessToken = data.access_token!;
-		if (data.refresh_token) {
-			this.config.refreshToken = data.refresh_token;
-		}
-		if (data.expires_in) {
-			this.config.tokenExpiresAt = Date.now() + (data.expires_in * 1000);
-		} else {
-			this.config.tokenExpiresAt = this.decodeJwtExp(data.access_token!);
-		}
-		// Persist via callback (fire-and-forget)
-		this.config.onTokenRefresh?.(data.access_token!, data.refresh_token).catch(() => { /* best-effort */ });
-	}
-
-	private async ensureTokenFresh(): Promise<void> {
-		if (!this.config.tokenExpiresAt || !this.config.refreshToken) { return; }
-		const remaining = this.config.tokenExpiresAt - Date.now();
-		if (remaining < PROACTIVE_REFRESH_THRESHOLD_MS) {
-			try {
-				await this.refreshAccessToken();
-			} catch {
-				// Best-effort — actual 401 handling will catch failures
-			}
-		}
-	}
-
 	// --- Helpers ---
 
 	private getHeaders(): Record<string, string> {
 		return {
-			'Authorization': `Bearer ${this.config.accessToken}`,
 			'Content-Type': 'application/json',
 			'X-QIC-Idempotency-Key': randomUUID(),
 		};
-	}
-
-	private decodeJwtExp(token: string): number | undefined {
-		try {
-			const parts = token.split('.');
-			if (parts.length !== 3) { return undefined; }
-			const payload = JSON.parse(atob(parts[1])) as { exp?: number };
-			if (typeof payload.exp === 'number') {
-				return payload.exp * 1000;
-			}
-		} catch {
-			// Not a valid JWT
-		}
-		return undefined;
 	}
 
 	private mapUsage(raw: any): TokenUsage | undefined {
@@ -953,7 +732,7 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 		const redacted = redactErrorBody(body);
 
 		if (status === 401) {
-			return new QicError('QIC-P006', 'Delta Plus session expired. Please reconnect to the server.', undefined, 401);
+			return new QicError('QIC-P006', 'Delta Plus Server rejected the request (401): QIC requests carry no credential until the data path routes them through the host sign-in.', undefined, 401);
 		}
 		if (status === 429) {
 			return new QicError('QIC-P005', `Rate limited. ${redacted}`, undefined, 429);
