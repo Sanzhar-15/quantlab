@@ -23,6 +23,13 @@ export function checkIdsFor(network) {
 	throw new Error(`[network_mode_invalid] the network mode is ${JSON.stringify(network)} (expected off or on)`);
 }
 
+/**
+ * Every app launch runs on a scratch HOME (the import row seeds another editor's files there), where the
+ * Security framework finds no keychain: without this flag it raises "Keychain Not Found" and can hang the
+ * main process (R-24). So every launch carries it.
+ */
+export const MOCK_KEYCHAIN = '--use-mock-keychain';
+
 /** The built-in extensions whose extensionPack members the app must never install. */
 export const PACK_OWNERS = ['ms-python.python', 'ms-toolsai.jupyter'];
 

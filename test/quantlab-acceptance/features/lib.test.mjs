@@ -11,7 +11,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
 import { createRequire } from 'node:module';
-import { assemble, CHECK_IDS, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
+import { assemble, CHECK_IDS, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
 
 const { ask, serve } = createRequire(import.meta.url)('./cues.cjs');
 
@@ -205,4 +205,12 @@ test('judgeQuantbookMcpAbsent: PASS on a clean extension; the server module, the
 	for (const t of [clean, server, sdk, manifest, tree, none]) {
 		fs.rmSync(t.extensions, { recursive: true });
 	}
+});
+
+test('every app launch in launcher.mjs carries the mock keychain flag (R-24)', () => {
+	const source = fs.readFileSync(new URL('./launcher.mjs', import.meta.url), 'utf8');
+	const launches = source.split('cp.spawn(appPaths(').slice(1).map(rest => rest.slice(0, rest.indexOf('], {')));
+	assert.ok(launches.length >= 2, `found ${launches.length} app launches in launcher.mjs`);
+	assert.deepStrictEqual(launches.map(args => args.includes('MOCK_KEYCHAIN')), launches.map(() => true));
+	assert.strictEqual(MOCK_KEYCHAIN, '--use-mock-keychain');
 });
