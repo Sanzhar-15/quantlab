@@ -224,42 +224,50 @@
       {
         "command": "quantlab.quantbookDemo",
         "title": "%command.quantbookDemo.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookDemoMultiWindow",
         "title": "%command.quantbookDemoMultiWindow.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookCellGrid",
         "title": "%command.quantbookCellGrid.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookCellGridRefresh",
         "title": "%command.quantbookCellGridRefresh.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookInsertChart",
         "title": "%command.quantbookInsertChart.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookCellGridCollab",
         "title": "%command.quantbookCellGridCollab.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookRenderBench",
         "title": "%command.quantbookRenderBench.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookLocalFirstInfo",
         "title": "%command.quantbookLocalFirstInfo.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.setAnthropicApiKey",
@@ -274,294 +282,347 @@
       {
         "command": "quantlab.quantbookExplainCell",
         "title": "%command.quantbookExplainCell.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookShowCellLineage",
         "title": "%command.quantbookShowCellLineage.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookCellGridSwitchSheet",
         "title": "%command.quantbookCellGridSwitchSheet.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookSaveAs",
         "title": "%command.quantbookSaveAs.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookOpen",
         "title": "%command.quantbookOpen.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "Wave N (2026-06-20): Import an existing .xlsx / .csv into a fresh additive Cell Grid tab (session.import(bytes, format); engine ql-io-xlsx/ql-io-csv readers). Lossy xlsx import surfaces the dropped-feature inventory LOUD via pollEvents (No-Fallbacks). Palette.",
         "command": "quantlab.quantbookImport",
         "title": "%command.quantbookImport.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-8.2: Export the active workbook to CSV (session.export('csv'); single-sheet workbooks only -- multi-sheet surfaces a loud engine error). In the webview File menu + palette.",
         "command": "quantlab.quantbookExportCsv",
         "title": "%command.quantbookExportCsv.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-Export-XLSX: Export the active workbook to .xlsx (session.export('xlsx'); WHOLE workbook, all sheets -- no single-sheet restriction). Requires the dylib built with --features xlsx-write (else the honest not-implemented error). In the webview File menu + palette.",
         "command": "quantlab.quantbookExportXlsx",
         "title": "%command.quantbookExportXlsx.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookSheetAdd",
         "title": "%command.quantbookSheetAdd.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookSheetRename",
         "title": "%command.quantbookSheetRename.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookSheetDelete",
         "title": "%command.quantbookSheetDelete.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookSheetMove",
         "title": "%command.quantbookSheetMove.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookReactiveStart",
         "title": "%command.quantbookReactiveStart.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookReactiveExecuteCell",
         "title": "%command.quantbookReactiveExecuteCell.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookReactiveStop",
         "title": "%command.quantbookReactiveStop.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookOpenReactiveNotebook",
         "title": "%command.quantbookOpenReactiveNotebook.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookBindReactiveNotebook",
         "title": "%command.quantbookBindReactiveNotebook.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookBindVariableToSelectedCell",
         "title": "%command.quantbookBindVariableToSelectedCell.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookSetFormat",
         "title": "%command.quantbookSetFormat.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-4 W1: workbook-wide Find (hit-list QuickPick; snapshot-read; Find-Next is FE-5).",
         "command": "quantlab.quantbookFindInWorkbook",
         "title": "%command.quantbookFindInWorkbook.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-4 W1: workbook-wide Replace All (one session.batch undo unit; Ctrl/Cmd+H over the focused grid).",
         "command": "quantlab.quantbookReplaceAll",
         "title": "%command.quantbookReplaceAll.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-4 W1: Define Name over the current selection (setName; delta-invisible -> confirmation toast).",
         "command": "quantlab.quantbookDefineName",
         "title": "%command.quantbookDefineName.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-5 W-N: Name Manager -- list/define/rename/delete/Go-To defined names (QuickPick; listNames refresh).",
         "command": "quantlab.quantbookNameManager",
         "title": "%command.quantbookNameManager.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-5 W-N: Go to Name -- jump the focused grid to a defined name's anchor (cross-sheet aware).",
         "command": "quantlab.quantbookGoToName",
         "title": "%command.quantbookGoToName.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-5 W-T: Create Table from the focused grid's selection (createTable; epoch bump -> reseed).",
         "command": "quantlab.quantbookCreateTable",
         "title": "%command.quantbookCreateTable.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-5 W-T / FE-8: Drop Table (context-aware -> right-click inside a table, or QuickPick over snapshot().tables; dropTable; referencing formulas become #NAME?).",
         "command": "quantlab.quantbookDropTable",
         "title": "%command.quantbookDropTable.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-8: Rename Table (context-aware or QuickPick; renameTable; engine rewrites referencing formulas in the same op).",
         "command": "quantlab.quantbookRenameTable",
         "title": "%command.quantbookRenameTable.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-8.1: Resize Table to Selection (resizeTable; re-ranges anchored at the table's top-left -- row grow/shrink + column GROW with auto-named columns + column SHRINK, unblocked by FE-8.3's tableColumns read).",
         "command": "quantlab.quantbookResizeTable",
         "title": "%command.quantbookResizeTable.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-8.3: Rename Table Column (renameColumn; lists the table's columns via tableColumns, renames the chosen one + rewrites referencing structured-ref formulas in one undo unit).",
         "command": "quantlab.quantbookRenameColumn",
         "title": "%command.quantbookRenameColumn.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-4 W2: sort the focused grid's selected range by a key column, ascending (A to Z).",
         "command": "quantlab.quantbookSortRangeAsc",
         "title": "%command.quantbookSortRangeAsc.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-4 W2: sort the focused grid's selected range by a key column, descending (Z to A).",
         "command": "quantlab.quantbookSortRangeDesc",
         "title": "%command.quantbookSortRangeDesc.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "W3 frozen panes: Excel Freeze Panes at the focused grid's active cell.",
         "command": "quantlab.quantbookFreezePanes",
         "title": "%command.quantbookFreezePanes.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "W3 frozen panes: clear all frozen rows/columns in the focused grid.",
         "command": "quantlab.quantbookUnfreezePanes",
         "title": "%command.quantbookUnfreezePanes.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "Wave F window split: split the focused grid into two independently-scrolling panes at the active cell.",
         "command": "quantlab.quantbookSplitAtSelection",
         "title": "%command.quantbookSplitAtSelection.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "Wave F window split: remove the focused grid's window split.",
         "command": "quantlab.quantbookRemoveSplit",
         "title": "%command.quantbookRemoveSplit.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "Wave G3b (R4): toggle AutoFilter (header filter-triangles) on the focused grid's used range.",
         "command": "quantlab.quantbookToggleAutoFilter",
         "title": "%command.quantbookToggleAutoFilter.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "W3 (Wave 3): Cell Grid context-menu clipboard commands -- route to the focused webview's clipboard logic.",
         "command": "quantlab.quantbookCellGridCut",
         "title": "%command.quantbookCellGridCut.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookCellGridCopy",
         "title": "%command.quantbookCellGridCopy.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookCellGridPaste",
         "title": "%command.quantbookCellGridPaste.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookCellGridClearContents",
         "title": "%command.quantbookCellGridClearContents.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "W3 (Wave 3): Cell Grid context-menu insert/delete -- types-first handshake with the W1 engine window.",
         "command": "quantlab.quantbookInsertRowAbove",
         "title": "%command.quantbookInsertRowAbove.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookInsertRowBelow",
         "title": "%command.quantbookInsertRowBelow.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookInsertColumnLeft",
         "title": "%command.quantbookInsertColumnLeft.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookInsertColumnRight",
         "title": "%command.quantbookInsertColumnRight.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookDeleteRow",
         "title": "%command.quantbookDeleteRow.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookDeleteColumn",
         "title": "%command.quantbookDeleteColumn.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "W3 (Wave 3): Freeze Panes Here -- the frozen-panes lead OWNS the real implementation. W3 declares it (so the context-menu item is never a broken command path standalone) + registers a loud placeholder that the conductor REPLACES with the lead's command at integration.",
         "command": "quantlab.quantbookFreezePanesHere",
         "title": "%command.quantbookFreezePanesHere.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "Wave G3a (R4): Cell Grid context-menu Hide/Unhide rows -- consumes the Wave G2 engine row-visibility substrate (setRowsHidden/getHiddenRows).",
         "command": "quantlab.quantbookHideRows",
         "title": "%command.quantbookHideRows.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookUnhideRows",
         "title": "%command.quantbookUnhideRows.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.quantbookUnhideAllRows",
         "title": "%command.quantbookUnhideAllRows.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "FE-BEYOND B1 (W3): start the Quantbook MCP server (read + write tools).",
         "command": "quantlab.quantbookStartMcpServer",
         "title": "%command.quantbookStartMcpServer.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "W3 (MCP writes): grant workspace trust required for MCP write tools.",
         "command": "quantlab.quantbookTrustWorkspaceForMcpWrites",
         "title": "%command.quantbookTrustWorkspaceForMcpWrites.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "_comment": "W3 (MCP writes): revoke the workspace trust grant used by MCP write tools.",
         "command": "quantlab.quantbookRevokeMcpWriteTrust",
         "title": "%command.quantbookRevokeMcpWriteTrust.title%",
-        "category": "%command.category%"
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
       },
       {
         "command": "quantlab.openRiskSettings",
@@ -980,7 +1041,7 @@
             "filenamePattern": "*.qbook"
           }
         ],
-        "priority": "default"
+        "priority": "option"
       }
     ],
     "viewsContainers": {
@@ -1053,34 +1114,34 @@
         {
           "id": "quantlab.livePythonView",
           "name": "%view.livePython.title%",
-          "when": "quantbook.hasOpenGrid"
+          "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
         },
         {
           "id": "quantlab.depGraphView",
           "name": "%view.depGraph.title%",
-          "when": "quantbook.hasOpenGrid"
+          "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
         },
         {
           "id": "quantlab.diagnosticsView",
           "name": "%view.diagnostics.title%",
-          "when": "quantbook.hasOpenGrid"
+          "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
         },
         {
           "id": "quantlab.functionCatalogView",
           "name": "%view.functionCatalog.title%",
-          "when": "quantbook.hasOpenGrid"
+          "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
         },
         {
           "id": "quantlab.sqlQueryView",
           "type": "webview",
           "name": "%view.sqlQuery.title%",
-          "when": "quantbook.hasOpenGrid"
+          "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
         },
         {
           "id": "quantlab.aiPanel",
           "type": "webview",
           "name": "%view.aiPanel.title%",
-          "when": "quantbook.hasOpenGrid"
+          "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
         }
       ]
     },
@@ -1088,17 +1149,17 @@
       "commandPalette": [
         {
           "command": "quantlab.quantbookLocalFirstInfo",
-          "when": "quantbook.hasOpenGrid"
+          "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
         },
         {
           "_comment": "Wave K-b (R20): Explain works from the palette too -- it falls back to the focused grid's selected cell when invoked without a right-click payload.",
           "command": "quantlab.quantbookExplainCell",
-          "when": "quantbook.hasOpenGrid"
+          "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
         },
         {
           "_comment": "Wave L2 (R23): Show Cell Lineage works from the palette too -- falls back to the focused grid's selected cell. Gated on an open grid like Explain.",
           "command": "quantlab.quantbookShowCellLineage",
-          "when": "quantbook.hasOpenGrid"
+          "when": "config.quantlab.quantbook.enabled && quantbook.hasOpenGrid"
         },
         {
           "_comment": "W3 (Wave 3): the Cell Grid context-menu items are right-click-only. Hide them from the Command Palette -- their generic titles (Cut/Copy/Insert Row Above) are meaningful only in the grid's right-click menu, and they act on the focused grid (no palette affordance).",
@@ -1179,6 +1240,182 @@
         {
           "command": "quantlab.history.addToCompare",
           "when": "false"
+        },
+        {
+          "command": "quantlab.quantbookDemo",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookDemoMultiWindow",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookCellGrid",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookCellGridRefresh",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookInsertChart",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookCellGridCollab",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookRenderBench",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookCellGridSwitchSheet",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookSaveAs",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookOpen",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookImport",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookExportCsv",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookExportXlsx",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookSheetAdd",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookSheetRename",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookSheetDelete",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookSheetMove",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookReactiveStart",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookReactiveExecuteCell",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookReactiveStop",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookOpenReactiveNotebook",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookBindReactiveNotebook",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookBindVariableToSelectedCell",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookSetFormat",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookFindInWorkbook",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookReplaceAll",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookDefineName",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookNameManager",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookGoToName",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookCreateTable",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookDropTable",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookRenameTable",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookResizeTable",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookRenameColumn",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookSortRangeAsc",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookSortRangeDesc",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookFreezePanes",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookUnfreezePanes",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookSplitAtSelection",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookRemoveSplit",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookToggleAutoFilter",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookStartMcpServer",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookTrustWorkspaceForMcpWrites",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookRevokeMcpWriteTrust",
+          "when": "config.quantlab.quantbook.enabled"
         }
       ],
       "accountsMenu": [
@@ -1354,147 +1591,147 @@
         {
           "_comment": "W3 (Wave 3): the Cell Grid right-click menu. Gated on the quantbook grid webview + the body-cell section (set via data-vscode-context on right-click). Excel-style groups: 1=clipboard, 2=clear, 3=format/freeze, 4=insert/delete. The conductor merges this section across the 3 wave-3 windows.",
           "command": "quantlab.quantbookCellGridCut",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "1_clipboard@1"
         },
         {
           "command": "quantlab.quantbookCellGridCopy",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "1_clipboard@2"
         },
         {
           "command": "quantlab.quantbookCellGridPaste",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "1_clipboard@3"
         },
         {
           "command": "quantlab.quantbookCellGridClearContents",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "2_edit@1"
         },
         {
           "command": "quantlab.quantbookSetFormat",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "3_format@1"
         },
         {
           "_comment": "W3: routes to the frozen-panes lead's Freeze command. The command id is the W3-assumed name; the conductor reconciles it with the lead's actual id at integration (runtime-pending the lead's command).",
           "command": "quantlab.quantbookFreezePanesHere",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "3_format@2"
         },
         {
           "command": "quantlab.quantbookInsertRowAbove",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@1"
         },
         {
           "command": "quantlab.quantbookInsertRowBelow",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@2"
         },
         {
           "command": "quantlab.quantbookInsertColumnLeft",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@3"
         },
         {
           "command": "quantlab.quantbookInsertColumnRight",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@4"
         },
         {
           "command": "quantlab.quantbookDeleteRow",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@5"
         },
         {
           "command": "quantlab.quantbookDeleteColumn",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@6"
         },
         {
           "_comment": "Wave K-b (R20): Explain the right-clicked cell's formula with AI. Own group (5_ai) so it sits at the bottom of the cell menu.",
           "command": "quantlab.quantbookExplainCell",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "5_ai@1"
         },
         {
           "_comment": "Wave L2 (R23): Show the SQL/published lineage of the right-clicked cell. Grouped with Explain (5_ai) -- both are read-only 'inspect this cell' actions.",
           "command": "quantlab.quantbookShowCellLineage",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "5_ai@2"
         },
         {
           "_comment": "Wave G3a (R4): Hide/Unhide rows over the selected span -- consumes the Wave G2 engine row-visibility substrate. Kept in the 4_structure cluster (row/column ops) after delete; the webview/context when only sees webviewId/webviewSection (no per-item dynamic enablement), so Unhide always appears and no-ops with an info toast when the span has no hidden rows.",
           "command": "quantlab.quantbookHideRows",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@7"
         },
         {
           "command": "quantlab.quantbookUnhideRows",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@8"
         },
         {
           "command": "quantlab.quantbookUnhideAllRows",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "4_structure@9"
         },
         {
           "_comment": "FE-4 W2: sort the selected range by a key column. Group 5_data is the new data-ops group below structure (1=clipboard, 2=edit, 3=format, 4=structure, 5=data). Palette-visible (NOT in the commandPalette when:false list).",
           "command": "quantlab.quantbookSortRangeAsc",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "5_data@1"
         },
         {
           "command": "quantlab.quantbookSortRangeDesc",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "5_data@2"
         },
         {
           "_comment": "FE-4 W1: Define Name over the right-clicked selection. New group 6_names (after 4_structure) so it sits below insert/delete without renumbering W2/W3 groups.",
           "command": "quantlab.quantbookDefineName",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "6_names@1"
         },
         {
           "_comment": "FE-11: surface the existing Name Manager / Go-To-Name commands in the grid right-click (they were palette-only). Same 6_names group + same when as Define Name.",
           "command": "quantlab.quantbookNameManager",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "6_names@2"
         },
         {
           "command": "quantlab.quantbookGoToName",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "6_names@3"
         },
         {
           "_comment": "FE-8: structured-table lifecycle from the grid right-click. Group 7_table (after 6_names). Create reads the right-clicked selection as the footprint; Rename/Drop resolve the table CONTAINING the right-clicked cell (tableAtCell), else open a QuickPick. The host commands accept the data-vscode-context payload (panelToken + selection).",
           "command": "quantlab.quantbookCreateTable",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "7_table@1"
         },
         {
           "command": "quantlab.quantbookRenameTable",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "7_table@2"
         },
         {
           "command": "quantlab.quantbookDropTable",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "7_table@3"
         },
         {
           "_comment": "FE-8.1: Resize Table to Selection. Same 6_names-adjacent 7_table group + same when as the other table ops. Selection-driven (resolveMenuOrFocusedSelection): the target is the table whose top-left equals the selection's top-left.",
           "command": "quantlab.quantbookResizeTable",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "7_table@4"
         },
         {
           "_comment": "FE-8.3: Rename Table Column. Same 7_table group + when as the other table ops. Context-aware (resolveTableTarget): renames a column of the table containing the right-clicked cell, or picks one from a QuickPick.",
           "command": "quantlab.quantbookRenameColumn",
-          "when": "webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
+          "when": "config.quantlab.quantbook.enabled && webviewId == 'quantlab.quantbookCellGrid' && webviewSection == 'quantbook-grid-cell'",
           "group": "7_table@5"
         }
       ]
@@ -1505,14 +1742,14 @@
         "command": "quantlab.quantbookReplaceAll",
         "key": "ctrl+h",
         "mac": "cmd+h",
-        "when": "activeWebviewPanelId == 'quantlab.quantbookCellGrid'"
+        "when": "config.quantlab.quantbook.enabled && activeWebviewPanelId == 'quantlab.quantbookCellGrid'"
       },
       {
         "_comment": "FE-11: Name Manager in the focused Cell Grid. Ctrl+F3 (Cmd+F3 on mac), Excel's Name Manager chord. The editor binds Ctrl+F3 to Find-Next-Selection, but that is editor-focus-scoped (kbExpr EditorContextKeys.focus); THIS binding is scoped to the grid webview panel being active (activeWebviewPanelId == the grid viewType), and those contexts are mutually exclusive, so they never collide. Go-To-Name is left to the menu / palette / name box (avoids the F5/Ctrl+G conflicts).",
         "command": "quantlab.quantbookNameManager",
         "key": "ctrl+f3",
         "mac": "cmd+f3",
-        "when": "activeWebviewPanelId == 'quantlab.quantbookCellGrid'"
+        "when": "config.quantlab.quantbook.enabled && activeWebviewPanelId == 'quantlab.quantbookCellGrid'"
       },
       {
         "command": "quantlab.switchToChart",
@@ -1807,6 +2044,11 @@
           ],
           "default": "auto",
           "description": "Reduce motion in Quantlab views."
+        },
+        "quantlab.quantbook.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable Quantbook (grids, reactive notebooks and their views). Takes effect after a window reload, on builds that are authorised to ship Quantbook."
         }
       }
     },
@@ -1815,7 +2057,11 @@
         "id": "deltaplus",
         "label": "Delta Plus"
       }
-    ]
+    ],
+    "configurationDefaults": {
+      "workbench.activityBar.location": "top",
+      "workbench.sideBar.location": "left"
+    }
   },
   "configurationDefaults": {
     "workbench.colorCustomizations": {

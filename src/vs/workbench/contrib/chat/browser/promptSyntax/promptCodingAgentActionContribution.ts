@@ -5,7 +5,6 @@
 
 import { Disposable, DisposableMap } from '../../../../../base/common/lifecycle.js';
 import { ICodeEditor } from '../../../../../editor/browser/editorBrowser.js';
-import { registerEditorContribution, EditorContributionInstantiation } from '../../../../../editor/browser/editorExtensions.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { PROMPT_LANGUAGE_ID } from '../../common/promptSyntax/promptTypes.js';
 import { PromptCodingAgentActionOverlayWidget } from './promptCodingAgentActionOverlay.js';
@@ -41,4 +40,3 @@ export class PromptCodingAgentActionContribution extends Disposable {
 	}
 }
 
-registerEditorContribution(PromptCodingAgentActionContribution.ID, PromptCodingAgentActionContribution, EditorContributionInstantiation.AfterFirstRender);

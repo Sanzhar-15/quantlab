@@ -3,21 +3,18 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { coalesce, compareBy, delta } from '../../../../../base/common/arrays.js';
+import { coalesce } from '../../../../../base/common/arrays.js';
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
-import { Codicon } from '../../../../../base/common/codicons.js';
 import { groupBy } from '../../../../../base/common/collections.js';
 import { ErrorNoTelemetry } from '../../../../../base/common/errors.js';
-import { Emitter, Event } from '../../../../../base/common/event.js';
+import { Event } from '../../../../../base/common/event.js';
 import { Iterable } from '../../../../../base/common/iterator.js';
 import { Disposable, DisposableStore, dispose, IDisposable, toDisposable } from '../../../../../base/common/lifecycle.js';
 import { LinkedList } from '../../../../../base/common/linkedList.js';
 import { ResourceMap } from '../../../../../base/common/map.js';
 import { Schemas } from '../../../../../base/common/network.js';
-import { derived, IObservable, observableValueOpts, runOnChange, ValueWithChangeEventFromObservable } from '../../../../../base/common/observable.js';
+import { derived, IObservable, observableValueOpts, ValueWithChangeEventFromObservable } from '../../../../../base/common/observable.js';
 import { isEqual } from '../../../../../base/common/resources.js';
-import { compare } from '../../../../../base/common/strings.js';
-import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { assertType } from '../../../../../base/common/types.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { TextEdit } from '../../../../../editor/common/languages.js';
@@ -30,14 +27,14 @@ import { IInstantiationService } from '../../../../../platform/instantiation/com
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { IProductService } from '../../../../../platform/product/common/productService.js';
 import { IStorageService } from '../../../../../platform/storage/common/storage.js';
-import { IDecorationData, IDecorationsProvider, IDecorationsService } from '../../../../services/decorations/common/decorations.js';
+import { IDecorationsService } from '../../../../services/decorations/common/decorations.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
 import { IExtensionService } from '../../../../services/extensions/common/extensions.js';
 import { ILifecycleService } from '../../../../services/lifecycle/common/lifecycle.js';
 import { IMultiDiffSourceResolver, IMultiDiffSourceResolverService, IResolvedMultiDiffSource, MultiDiffEditorItem } from '../../../multiDiffEditor/browser/multiDiffSourceResolverService.js';
 import { CellUri, ICellEditOperation } from '../../../notebook/common/notebookCommon.js';
 import { INotebookService } from '../../../notebook/common/notebookService.js';
-import { CHAT_EDITING_MULTI_DIFF_SOURCE_RESOLVER_SCHEME, chatEditingAgentSupportsReadonlyReferencesContextKey, chatEditingResourceContextKey, ChatEditingSessionState, IChatEditingService, IChatEditingSession, IChatRelatedFile, IChatRelatedFilesProvider, IModifiedFileEntry, inChatEditingSessionContextKey, IStreamingEdits, ModifiedFileEntryState, parseChatMultiDiffUri } from '../../common/editing/chatEditingService.js';
+import { CHAT_EDITING_MULTI_DIFF_SOURCE_RESOLVER_SCHEME, chatEditingAgentSupportsReadonlyReferencesContextKey, chatEditingResourceContextKey, IChatEditingService, IChatEditingSession, IChatRelatedFile, IChatRelatedFilesProvider, inChatEditingSessionContextKey, IStreamingEdits, parseChatMultiDiffUri } from '../../common/editing/chatEditingService.js';
 import { ChatModel, ICellTextEditOperation, IChatResponseModel, isCellTextEditOperationArray } from '../../common/model/chatModel.js';
 import { IChatService } from '../../common/chatService/chatService.js';
 import { ChatEditorInput } from '../widgetHosts/editor/chatEditorInput.js';
@@ -77,7 +74,6 @@ export class ChatEditingService extends Disposable implements IChatEditingServic
 		@IConfigurationService private readonly _configurationService: IConfigurationService,
 	) {
 		super();
-		this._register(decorationsService.registerDecorationsProvider(_instantiationService.createInstance(ChatDecorationsProvider, this.editingSessionsObs)));
 		this._register(multiDiffSourceResolverService.registerResolver(_instantiationService.createInstance(ChatEditingMultiDiffSourceResolver, this.editingSessionsObs)));
 
 		// TODO@jrieken
@@ -369,81 +365,6 @@ export class ChatEditingService extends Disposable implements IChatEditingServic
 	}
 }
 
-/**
- * Emits an event containing the added or removed elements of the observable.
- */
-function observeArrayChanges<T>(obs: IObservable<T[]>, compare: (a: T, b: T) => number, store: DisposableStore): Event<T[]> {
-	const emitter = store.add(new Emitter<T[]>());
-	store.add(runOnChange(obs, (newArr, oldArr) => {
-		const change = delta(oldArr || [], newArr, compare);
-		const changedElements = ([] as T[]).concat(change.added).concat(change.removed);
-		emitter.fire(changedElements);
-	}));
-	return emitter.event;
-}
-
-class ChatDecorationsProvider extends Disposable implements IDecorationsProvider {
-
-	readonly label: string = localize('chat', "Chat Editing");
-
-	private readonly _currentEntries = derived<readonly IModifiedFileEntry[]>(this, (r) => {
-		const sessions = this._sessions.read(r);
-		if (!sessions) {
-			return [];
-		}
-		const result: IModifiedFileEntry[] = [];
-		for (const session of sessions) {
-			if (session.state.read(r) !== ChatEditingSessionState.Disposed) {
-				const entries = session.entries.read(r);
-				result.push(...entries);
-			}
-		}
-		return result;
-	});
-
-	private readonly _currentlyEditingUris = derived<URI[]>(this, (r) => {
-		const uri = this._currentEntries.read(r);
-		return uri.filter(entry => entry.isCurrentlyBeingModifiedBy.read(r)).map(entry => entry.modifiedURI);
-	});
-
-	private readonly _modifiedUris = derived<URI[]>(this, (r) => {
-		const uri = this._currentEntries.read(r);
-		return uri.filter(entry => !entry.isCurrentlyBeingModifiedBy.read(r) && entry.state.read(r) === ModifiedFileEntryState.Modified).map(entry => entry.modifiedURI);
-	});
-
-	readonly onDidChange: Event<URI[]>;
-
-	constructor(
-		private readonly _sessions: IObservable<readonly IChatEditingSession[]>
-	) {
-		super();
-		this.onDidChange = Event.any(
-			observeArrayChanges(this._currentlyEditingUris, compareBy(uri => uri.toString(), compare), this._store),
-			observeArrayChanges(this._modifiedUris, compareBy(uri => uri.toString(), compare), this._store),
-		);
-	}
-
-	provideDecorations(uri: URI, _token: CancellationToken): IDecorationData | undefined {
-		const isCurrentlyBeingModified = this._currentlyEditingUris.get().some(e => e.toString() === uri.toString());
-		if (isCurrentlyBeingModified) {
-			return {
-				weight: 1000,
-				letter: ThemeIcon.modify(Codicon.loading, 'spin'),
-				bubble: false
-			};
-		}
-		const isModified = this._modifiedUris.get().some(e => e.toString() === uri.toString());
-		if (isModified) {
-			return {
-				weight: 1000,
-				letter: Codicon.diffModified,
-				tooltip: localize('chatEditing.modified2', "Pending changes from chat"),
-				bubble: true
-			};
-		}
-		return undefined;
-	}
-}
 
 export class ChatEditingMultiDiffSourceResolver implements IMultiDiffSourceResolver {
 

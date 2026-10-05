@@ -10,7 +10,7 @@ import { URI } from '../../../../../base/common/uri.js';
 import { IRange, Range } from '../../../../../editor/common/core/range.js';
 import { IDecorationOptions } from '../../../../../editor/common/editorCommon.js';
 import { Command, isLocation } from '../../../../../editor/common/languages.js';
-import { Action2, registerAction2 } from '../../../../../platform/actions/common/actions.js';
+import { Action2 } from '../../../../../platform/actions/common/actions.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ILabelService } from '../../../../../platform/label/common/label.js';
@@ -19,7 +19,6 @@ import { IChatWidget } from '../chat.js';
 import { IChatWidgetContrib } from '../widget/chatWidget.js';
 
 export const dynamicVariableDecorationType = 'chat-dynamic-variable';
-
 
 
 export class ChatDynamicVariableModel extends Disposable implements IChatWidgetContrib {
@@ -186,7 +185,6 @@ function isDynamicVariable(obj: any): obj is IDynamicVariable {
 }
 
 
-
 export interface IAddDynamicVariableContext {
 	id: string;
 	widget: IChatWidget;
@@ -256,4 +254,3 @@ export class AddDynamicVariableAction extends Action2 {
 		});
 	}
 }
-registerAction2(AddDynamicVariableAction);

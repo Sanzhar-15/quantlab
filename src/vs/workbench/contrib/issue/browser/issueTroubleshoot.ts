@@ -3,13 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { localize, localize2 } from '../../../../nls.js';
+import { localize } from '../../../../nls.js';
 import { IExtensionManagementService } from '../../../../platform/extensionManagement/common/extensionManagement.js';
 import { ExtensionType } from '../../../../platform/extensions/common/extensions.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
 import { IWorkbenchIssueService } from '../common/issue.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
-import { Action2, registerAction2 } from '../../../../platform/actions/common/actions.js';
 import { IUserDataProfileImportExportService, IUserDataProfileManagementService, IUserDataProfileService } from '../../../services/userDataProfile/common/userDataProfile.js';
 import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { IExtensionBisectService } from '../../../services/extensionManagement/browser/extensionBisect.js';
@@ -17,18 +16,15 @@ import { INotificationHandle, INotificationService, IPromptChoice, NotificationP
 import { IWorkbenchExtensionEnablementService } from '../../../services/extensionManagement/common/extensionManagement.js';
 import { IHostService } from '../../../services/host/browser/host.js';
 import { IUserDataProfile, IUserDataProfilesService } from '../../../../platform/userDataProfile/common/userDataProfile.js';
-import { ServicesAccessor, createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
-import { Categories } from '../../../../platform/action/common/actionCommonCategories.js';
+import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
-import { ContextKeyExpr, IContextKeyService, RawContextKey } from '../../../../platform/contextkey/common/contextkey.js';
+import { IContextKeyService, RawContextKey } from '../../../../platform/contextkey/common/contextkey.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
 import { Extensions, IWorkbenchContributionsRegistry } from '../../../common/contributions.js';
 import { LifecyclePhase } from '../../../services/lifecycle/common/lifecycle.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { URI } from '../../../../base/common/uri.js';
-import { RemoteNameContext } from '../../../common/contextkeys.js';
-import { IsWebContext } from '../../../../platform/contextkey/common/contextkeys.js';
 
 const ITroubleshootIssueService = createDecorator<ITroubleshootIssueService>('ITroubleshootIssueService');
 
@@ -344,37 +340,6 @@ class IssueTroubleshootUi extends Disposable {
 }
 
 Registry.as<IWorkbenchContributionsRegistry>(Extensions.Workbench).registerWorkbenchContribution(IssueTroubleshootUi, LifecyclePhase.Restored);
-
-registerAction2(class TroubleshootIssueAction extends Action2 {
-	constructor() {
-		super({
-			id: 'workbench.action.troubleshootIssue.start',
-			title: localize2('troubleshootIssue', 'Troubleshoot Issue...'),
-			category: Categories.Help,
-			f1: true,
-			precondition: ContextKeyExpr.and(IssueTroubleshootUi.ctxIsTroubleshootActive.negate(), RemoteNameContext.isEqualTo(''), IsWebContext.negate()),
-		});
-	}
-	run(accessor: ServicesAccessor): Promise<void> {
-		return accessor.get(ITroubleshootIssueService).start();
-	}
-});
-
-registerAction2(class extends Action2 {
-	constructor() {
-		super({
-			id: 'workbench.action.troubleshootIssue.stop',
-			title: localize2('title.stop', 'Stop Troubleshoot Issue'),
-			category: Categories.Help,
-			f1: true,
-			precondition: IssueTroubleshootUi.ctxIsTroubleshootActive
-		});
-	}
-
-	async run(accessor: ServicesAccessor): Promise<void> {
-		return accessor.get(ITroubleshootIssueService).stop();
-	}
-});
 
 
 registerSingleton(ITroubleshootIssueService, TroubleshootIssueService, InstantiationType.Delayed);

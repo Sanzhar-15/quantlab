@@ -7,29 +7,22 @@ import { coalesce, isNonEmptyArray } from '../../../../base/common/arrays.js';
 // import { Codicon } from '../../../../base/common/codicons.js'; // Removed: chat view container disabled
 import { toErrorMessage } from '../../../../base/common/errorMessage.js';
 import { Event } from '../../../../base/common/event.js';
-import { createCommandUri, MarkdownString } from '../../../../base/common/htmlContent.js';
 // import { KeyCode, KeyMod } from '../../../../base/common/keyCodes.js'; // Removed: chat view container disabled
 import { Disposable, DisposableMap, DisposableStore } from '../../../../base/common/lifecycle.js';
 import * as strings from '../../../../base/common/strings.js';
 import { localize } from '../../../../nls.js';
 import { IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
-import { ExtensionIdentifier, IExtensionManifest } from '../../../../platform/extensions/common/extensions.js';
-import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js';
+import { ExtensionIdentifier } from '../../../../platform/extensions/common/extensions.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
-import { Registry } from '../../../../platform/registry/common/platform.js';
 // import { ViewPaneContainer } from '../../../browser/parts/views/viewPaneContainer.js'; // Removed: chat view container disabled
 import { IWorkbenchContribution } from '../../../common/contributions.js';
-import { IViewsRegistry, Extensions as ViewExtensions } from '../../../common/views.js';
-import { Extensions, IExtensionFeaturesRegistry, IExtensionFeatureTableRenderer, IRenderedData, IRowData, ITableData } from '../../../services/extensionManagement/common/extensionFeatures.js';
 import { isProposedApiEnabled } from '../../../services/extensions/common/extensions.js';
 import * as extensionsRegistry from '../../../services/extensions/common/extensionsRegistry.js';
-import { showExtensionsWithIdsCommandId } from '../../extensions/browser/extensionsActions.js';
 import { IExtension, IExtensionsWorkbenchService } from '../../extensions/common/extensions.js';
 import { IChatAgentData, IChatAgentService } from '../common/participants/chatAgents.js';
 import { ChatContextKeys } from '../common/actions/chatContextKeys.js';
 import { IRawChatParticipantContribution } from '../common/participants/chatParticipantContribTypes.js';
 import { ChatAgentLocation, ChatModeKind } from '../common/constants.js';
-import { ChatViewId } from './chat.js';
 // import { ChatViewPane } from './widgetHosts/viewPane/chatViewPane.js'; // Removed: chat view container disabled
 
 // --- Chat Container & View Registration
@@ -312,62 +305,7 @@ export class ChatCompatibilityNotifier extends Disposable implements IWorkbenchC
 		}
 
 		this.registeredWelcomeView = true;
-		const showExtensionLabel = localize('showExtension', "Show Extension");
-		const mainMessage = localize('chatFailErrorMessage', "Chat failed to load because the installed version of the Copilot Chat extension is not compatible with this version of {0}. Please ensure that the Copilot Chat extension is up to date.", this.productService.nameLong);
-		const commandButton = `[${showExtensionLabel}](${createCommandUri(showExtensionsWithIdsCommandId, [this.productService.defaultChatAgent?.chatExtensionId])})`;
-		const versionMessage = `Copilot Chat version: ${chatExtension.version}`;
-		const viewsRegistry = Registry.as<IViewsRegistry>(ViewExtensions.ViewsRegistry);
-		this._register(viewsRegistry.registerViewWelcomeContent(ChatViewId, {
-			content: [mainMessage, commandButton, versionMessage].join('\n\n'),
-			when: ChatContextKeys.extensionInvalid,
-		}));
 	}
 }
 
-class ChatParticipantDataRenderer extends Disposable implements IExtensionFeatureTableRenderer {
-	readonly type = 'table';
 
-	shouldRender(manifest: IExtensionManifest): boolean {
-		return !!manifest.contributes?.chatParticipants;
-	}
-
-	render(manifest: IExtensionManifest): IRenderedData<ITableData> {
-		const nonDefaultContributions = manifest.contributes?.chatParticipants?.filter(c => !c.isDefault) ?? [];
-		if (!nonDefaultContributions.length) {
-			return { data: { headers: [], rows: [] }, dispose: () => { } };
-		}
-
-		const headers = [
-			localize('participantName', "Name"),
-			localize('participantFullName', "Full Name"),
-			localize('participantDescription', "Description"),
-			localize('participantCommands', "Commands"),
-		];
-
-		const rows: IRowData[][] = nonDefaultContributions.map(d => {
-			return [
-				'@' + d.name,
-				d.fullName,
-				d.description ?? '-',
-				d.commands?.length ? new MarkdownString(d.commands.map(c => `- /` + c.name).join('\n')) : '-'
-			];
-		});
-
-		return {
-			data: {
-				headers,
-				rows
-			},
-			dispose: () => { }
-		};
-	}
-}
-
-Registry.as<IExtensionFeaturesRegistry>(Extensions.ExtensionFeaturesRegistry).registerExtensionFeature({
-	id: 'chatParticipants',
-	label: localize('chatParticipants', "Chat Participants"),
-	access: {
-		canToggle: false
-	},
-	renderer: new SyncDescriptor(ChatParticipantDataRenderer),
-});
