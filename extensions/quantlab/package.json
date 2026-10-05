@@ -55,6 +55,7 @@
   },
   "activationEvents": [
     "onStartupFinished",
+    "onCommand:quantlab.newStrategy",
     "onNotebook:quantlab-reactive-notebook"
   ],
   "contributes": {
@@ -714,6 +715,11 @@
       {
         "command": "quantlab.newFromTemplate",
         "title": "%command.newFromTemplate.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.newStrategy",
+        "title": "%command.newStrategy.title%",
         "category": "%command.category%"
       },
       {

@@ -109,6 +109,7 @@
 	"command.focusSettingsPanel.title": "Focus Settings Panel",
 	"command.openGuide.title": "Open Guide",
 	"command.newFromTemplate.title": "Start from Template",
+	"command.newStrategy.title": "New Strategy",
 	"command.chart.refresh.title": "Refresh Chart",
 	"command.chart.applyParameters.title": "Apply Parameters to Code",
 	"command.chart.resetParameters.title": "Reset Chart Parameters",
