@@ -26,6 +26,7 @@
 	"command.quantbookReactiveStart.title": "Quantbook: Start Reactive Kernel",
 	"command.quantbookReactiveExecuteCell.title": "Quantbook: Reactive Cell",
 	"command.quantbookReactiveStop.title": "Quantbook: Stop Reactive Kernel",
+	"command.quantbookSelectKernel.title": "Quantbook: Select Kernel",
 	"command.quantbookOpenReactiveNotebook.title": "Quantbook: Open Reactive Notebook",
 	"command.quantbookBindReactiveNotebook.title": "Quantbook: Bind Reactive Notebook to Grid",
 	"command.quantbookBindVariableToSelectedCell.title": "Quantbook: Bind Variable to Selected Cell",
@@ -93,6 +94,7 @@
 	"command.focusSettingsPanel.title": "Focus Settings Panel",
 	"command.openGuide.title": "Open Guide",
 	"command.newFromTemplate.title": "Start from Template",
+	"command.newStrategy.title": "New Strategy",
 	"command.chart.refresh.title": "Refresh Chart",
 	"command.chart.applyParameters.title": "Apply Parameters to Code",
 	"command.chart.resetParameters.title": "Reset Chart Parameters",
@@ -137,5 +139,6 @@
 	"command.watchlist.create.title": "New Watchlist...",
 	"command.watchlist.rename.title": "Rename Watchlist...",
 	"command.watchlist.delete.title": "Delete Watchlist",
-	"command.watchlist.removeSymbol.title": "Remove from Watchlist"
+	"command.watchlist.removeSymbol.title": "Remove from Watchlist",
+	"command.importFromEditor.title": "Import Settings, Keybindings and Extensions from VS Code or Cursor"
 }

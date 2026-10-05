@@ -7,6 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { EngineEvent, JobRequest } from '../../types/engine';
+import { resolveBundledEngine } from './bundledEngine';
 import { JobQueue } from './JobQueue';
 import { JobRunner } from './JobRunner';
 import { PythonBootstrap } from './PythonBootstrap';
@@ -113,28 +114,7 @@ export class EngineHost {
 			return null;
 		}
 
-		const exeName = process.platform === 'win32' ? 'quantlab-engine.exe' : 'quantlab-engine';
-
-		const candidatePaths = [
-			// Relative to extension root (development layout)
-			path.join(extensionPath, '..', '..', 'engine-dist', 'quantlab-engine', exeName),
-			// Inside extension resources (packaged layout)
-			path.join(extensionPath, 'engine', 'quantlab-engine', exeName),
-			// Build output directory
-			path.join(extensionPath, '..', '..', '.build', 'dist', 'quantlab-engine', exeName),
-		];
-
-		for (const candidate of candidatePaths) {
-			try {
-				if (fs.existsSync(candidate)) {
-					return candidate;
-				}
-			} catch {
-				// Permission or path error -- skip
-			}
-		}
-
-		return null;
+		return resolveBundledEngine(extensionPath, process.platform);
 	}
 
 	private resolveEngineRoot(): string {

@@ -55,6 +55,7 @@
   },
   "activationEvents": [
     "onStartupFinished",
+    "onCommand:quantlab.newStrategy",
     "onNotebook:quantlab-reactive-notebook"
   ],
   "contributes": {
@@ -303,6 +304,12 @@
       {
         "command": "quantlab.quantbookReactiveStop",
         "title": "%command.quantbookReactiveStop.title%",
+        "category": "%command.category%",
+        "enablement": "config.quantlab.quantbook.enabled"
+      },
+      {
+        "command": "quantlab.quantbookSelectKernel",
+        "title": "%command.quantbookSelectKernel.title%",
         "category": "%command.category%",
         "enablement": "config.quantlab.quantbook.enabled"
       },
@@ -636,6 +643,11 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.newStrategy",
+        "title": "%command.newStrategy.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.chart.refresh",
         "title": "%command.chart.refresh.title%",
         "category": "%command.category%"
@@ -751,6 +763,11 @@
         "title": "%command.watchlist.removeSymbol.title%",
         "category": "%command.category%",
         "icon": "$(remove)"
+      },
+      {
+        "command": "quantlab.importFromEditor",
+        "title": "%command.importFromEditor.title%",
+        "category": "%command.category%"
       }
     ],
     "colors": [
@@ -1191,6 +1208,10 @@
         },
         {
           "command": "quantlab.quantbookReactiveStop",
+          "when": "config.quantlab.quantbook.enabled"
+        },
+        {
+          "command": "quantlab.quantbookSelectKernel",
           "when": "config.quantlab.quantbook.enabled"
         },
         {
@@ -1687,6 +1708,16 @@
           "type": "boolean",
           "default": false,
           "description": "Enable Quantbook (grids, reactive notebooks and their views). Takes effect after a window reload, on builds that are authorised to ship Quantbook."
+        },
+        "quantlab.quantbook.kernel": {
+          "type": "string",
+          "enum": [
+            "default",
+            "local",
+            "cloud"
+          ],
+          "default": "default",
+          "description": "The kernel Quantbook runs Python on. 'default' uses the cloud kernel when a Delta Plus compute service is available and the local kernel otherwise. 'cloud' is refused while no compute service is available."
         }
       }
     },
@@ -1699,7 +1730,8 @@
     "configurationDefaults": {
       "workbench.secondarySideBar.defaultVisibility": "hidden",
       "workbench.activityBar.location": "top",
-      "workbench.sideBar.location": "left"
+      "workbench.sideBar.location": "left",
+      "python.languageServer": "None"
     }
   },
   "devDependencies": {

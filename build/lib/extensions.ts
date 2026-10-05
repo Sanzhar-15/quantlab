@@ -584,6 +584,7 @@ const esbuildMediaScripts = [
 	// (isolated from the shared `dist/webview/` bundles), so the script passes an
 	// `outputRootSubpath` to survive the `--outputRoot` basename-flatten under the build task.
 	'quantlab/esbuild-quantbook-webviews.mjs',
+	'quantlab/esbuild-webview.mjs',
 	'simple-browser/esbuild-preview.mjs',
 ];
 
@@ -593,6 +594,7 @@ const esbuildMediaScripts = [
 // engine via napi, so the extension cannot run on web at all.
 const desktopOnlyMediaScripts = new Set<string>([
 	'quantlab/esbuild-quantbook-webviews.mjs',
+	'quantlab/esbuild-webview.mjs',
 ]);
 
 export async function webpackExtensions(taskName: string, isWatch: boolean, webpackConfigLocations: { configPath: string; outputRoot?: string }[]) {

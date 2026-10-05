@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
+import { NEW_STRATEGY_COMMAND, createNewStrategy } from './newStrategy';
 
 const CONTAINER_COMMANDS: Record<string, string> = {
 	data: 'workbench.view.extension.quantlab-data',
@@ -20,6 +21,9 @@ export function registerPanelCommands(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand('quantlab.focusSettingsPanel', () => focusContainer(CONTAINER_COMMANDS.settings)),
 		vscode.commands.registerCommand('quantlab.newFromTemplate', async () => {
 			await vscode.window.showInformationMessage('Template gallery is not available yet.');
+		}),
+		vscode.commands.registerCommand(NEW_STRATEGY_COMMAND, async () => {
+			await createNewStrategy();
 		}),
 		vscode.commands.registerCommand('quantlab.openGuide', async (url?: string) => {
 			if (!url) {

@@ -111,7 +111,9 @@ export class QuantLabHome {
 		].join('; ');
 
 		const displayName = user.name?.split(' ')[0] ?? user.email.split('@')[0];
-		const tier = user.tier ? `${user.tier.charAt(0).toUpperCase()}${user.tier.slice(1)}` : 'Free';
+		// AUTH-TIER: the host identity carries no tier yet; the carry AUTH-TIER supplies the value.
+		// With no tier there is no badge at all (never a guessed value such as 'Free').
+		const tier = user.tier ? `${user.tier.charAt(0).toUpperCase()}${user.tier.slice(1)}` : undefined;
 
 		const actions: Array<{ label: string; icon: string; cmd: string; desc: string }> = [
 			// 'workbench.view.qic.chat.focus' is the core-registered focus command for the
@@ -230,7 +232,7 @@ export class QuantLabHome {
 				<p class="home-name">Welcome back, ${this._esc(displayName)}!</p>
 				<div class="home-meta">
 					<span>${this._esc(user.email)}</span>
-					<span class="home-tier-badge">${this._esc(tier)}</span>
+					${tier === undefined ? '' : `<span class="home-tier-badge">${this._esc(tier)}</span>`}
 				</div>
 			</div>
 
