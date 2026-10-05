@@ -1,7 +1,7 @@
 """Writes the deterministic spike OHLCV parquet that the qviz tests read.
 
-Used two ways: conftest.py imports `generate_spike_data` for the pytest suite, and the
-extension's mocha daemon tests take the file through QUANTLAB_TEST_SPIKE_DATA, written by:
+The pytest suite and the extension's mocha daemon tests both take the file through the
+required QUANTLAB_TEST_SPIKE_DATA, written once by:
 
     python python/qviz/tests/_spike_data.py <out path>
 

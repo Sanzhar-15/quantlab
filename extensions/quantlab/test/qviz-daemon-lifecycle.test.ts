@@ -414,7 +414,8 @@ suite('DaemonLifecycle -- requestImmediateRetry (Phase 8 Step D)', () => {
 		try {
 			const log = recordStatus(lifecycle);
 			// Kick a spawn; the no-banner fixture will crash quickly.
-			void lifecycle.getClient().catch(() => undefined);
+			// The waiter's outcome is asserted after dispose(), never swallowed.
+			const waiter: Promise<unknown> = lifecycle.getClient().then(c => c, (e: unknown) => e);
 			// Wait until we see 'crashed'.
 			const deadline = Date.now() + 3000;
 			while (Date.now() < deadline) {
@@ -436,6 +437,10 @@ suite('DaemonLifecycle -- requestImmediateRetry (Phase 8 Step D)', () => {
 				`requestImmediateRetry should have triggered another 'starting' transition `
 				+ `(before=${startsBefore}, after=${startsAfter}, log=${log.map(s => s.kind).join(',')})`,
 			);
+			await lifecycle.dispose();
+			const outcome = await waiter;
+			assert.ok(outcome instanceof DaemonUnavailableError,
+				`the no-banner waiter must reject with DaemonUnavailableError on dispose; got ${String(outcome)}`);
 		} finally {
 			await lifecycle.dispose();
 		}

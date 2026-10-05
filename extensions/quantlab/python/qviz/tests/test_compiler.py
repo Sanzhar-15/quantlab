@@ -20,14 +20,12 @@ from qviz.compiler import (
     quote_ident,
 )
 
-from qviz.tests._fixture_helpers import require_fixture
+from qviz.tests._fixture_helpers import spike_data_path
 
 
 @pytest.fixture
 def parquet_1m() -> str:
-    p = Path("/tmp/quantlab-spike-data/synthetic_ohlcv_1m.parquet")
-    require_fixture(p, "spike OHLCV parquet")
-    return str(p)
+    return str(spike_data_path())
 
 
 @pytest.fixture
@@ -664,13 +662,12 @@ def test_expr_string_literal_parameterised(
             references=["ticker"],
         ),
     ])
-    # NOTE (megaudit F5, 2026-05-13): NOT a fixture-presence skip. The
-    # synthetic spike parquet deliberately omits 'ticker' — this skip is
-    # schema-shape capability gating and must remain a soft skip even
-    # under QUANTLAB_REQUIRE_FIXTURES=1.
-    if "ticker" not in schema_1m.names:
-        pytest.skip("schema fixture lacks 'ticker' column")
-    cq = compile_spec(spec, schema_1m, parquet_1m)
+    # The synthetic spike parquet deliberately omits 'ticker', so the test
+    # supplies it: compile_spec only compiles against the schema, it never
+    # reads the file. (It used to skip here, i.e. it never ran.)
+    assert "ticker" not in schema_1m.names
+    schema = schema_1m.append(pa.field("ticker", pa.string()))
+    cq = compile_spec(spec, schema, parquet_1m)
     assert '"ticker" = ?' in cq.sql
     assert "AAPL" in cq.params
 
