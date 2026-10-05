@@ -14,6 +14,7 @@ import { ITelemetryService } from '../../telemetry/common/telemetry.js';
 import { WindowUtilityProcess } from '../../utilityProcess/electron-main/utilityProcess.js';
 import { IWindowsMainService } from '../../windows/electron-main/windows.js';
 import { IConfigurationService } from '../../configuration/common/configuration.js';
+import { IEnvironmentMainService } from '../../environment/electron-main/environmentMainService.js';
 
 export class ExtensionHostStarter extends Disposable implements IDisposable, IExtensionHostStarter {
 
@@ -30,6 +31,7 @@ export class ExtensionHostStarter extends Disposable implements IDisposable, IEx
 		@IWindowsMainService private readonly _windowsMainService: IWindowsMainService,
 		@ITelemetryService private readonly _telemetryService: ITelemetryService,
 		@IConfigurationService private readonly _configurationService: IConfigurationService,
+		@IEnvironmentMainService private readonly _environmentMainService: IEnvironmentMainService,
 	) {
 		super();
 
@@ -129,6 +131,12 @@ export class ExtensionHostStarter extends Disposable implements IDisposable, IEx
 	async enableInspectPort(id: string): Promise<boolean> {
 		if (this._shutdown) {
 			throw canceled();
+		}
+		// A built product ships the EnableNodeCliInspectArguments fuse disabled: no inspector on the
+		// extension host, and signalling one makes the extension host exit (F-PACK-12).
+		if (this._environmentMainService.isBuilt) {
+			this._logService.warn(`ExtensionHostStarter: refused to enable the inspect port of extension host ${id} (built product, inspector disabled)`);
+			return false;
 		}
 		const extHostProcess = this._extHosts.get(id);
 		if (!extHostProcess) {
