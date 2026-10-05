@@ -93,6 +93,15 @@ export class JobRunner {
 			stdio: ['pipe', 'pipe', 'pipe'],
 		});
 
+		// A failed write to the engine's stdin (EPIPE: the engine exited without reading its config) is an
+		// 'error' event on the stream, never a throw from end(). It is recorded here, and the job's outcome
+		// waits until stdin has settled, so the order of 'close' and the error cannot change the result.
+		const stdin = this.proc.stdin!;
+		const stdinSettled = new Promise<Error | undefined>(resolve => {
+			stdin.on('error', err => resolve(err));
+			stdin.once('finish', () => resolve(undefined));
+		});
+
 		// Write config JSON to stdin and close it
 		const config = this.buildStdinConfig(request);
 		try {
@@ -135,12 +144,23 @@ export class JobRunner {
 		});
 
 		this.proc.on('close', (code) => {
-			if (this.finished) {
-				return;
-			}
-			this.finished = true;
-			this.flushStderr();
-			this.onProcessExit(code);
+			void stdinSettled.then(stdinError => {
+				if (this.finished) {
+					return;
+				}
+				this.finished = true;
+				this.flushStderr();
+				if (stdinError !== undefined && !this.cancelled) {
+					this.emitLog('error', `The engine did not read its job config from stdin: ${stdinError.message}`);
+					onEvent({
+						type: 'failed',
+						jobId,
+						error: `The engine exited (code ${code}) without reading its job config: ${stdinError.message}`,
+					});
+					return;
+				}
+				this.onProcessExit(code);
+			});
 		});
 	}
 

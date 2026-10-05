@@ -162,41 +162,99 @@ suite('JobRunner – Audit Verification', () => {
 	// -----------------------------------------------------------------------
 	// Verification 8: onProcessExit JSON parse type guard
 	// -----------------------------------------------------------------------
+	// Each stand-in engine reads its config first, as the real one does, so these test the type guard and
+	// nothing else (the former /bin/bash stand-in exited without reading stdin and raced an EPIPE).
 	suite('Issue #8: stdout JSON type guard', () => {
-		test('non-object JSON stdout produces failed event', function (done) {
-			this.timeout(10000);
-			const events: EngineEvent[] = [];
-			// Use a process that writes a JSON array to stdout instead of object
-			const runner = new JobRunner({
-				request: makeRequest(),
-				engine: launch('/bin/bash'),
-				onEvent: (event) => {
-					events.push(event);
-					if (event.type === 'failed') {
-						done();
-					}
-				},
-			});
-			runner.start();
+		let dir: string;
+
+		setup(() => {
+			dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ql-jobrunner-guard-'));
 		});
 
-		test('string JSON stdout produces failed event', function (done) {
-			this.timeout(10000);
-			const events: EngineEvent[] = [];
-			const runner = new JobRunner({
-				request: makeRequest(),
-				engine: launch('/bin/bash'),
-				onEvent: (event) => {
-					events.push(event);
-					if (event.type === 'failed') {
-						done();
-					}
-				},
+		teardown(() => {
+			fs.rmSync(dir, { recursive: true });
+		});
+
+		for (const [label, stdout] of [['non-object (array)', '[1,2,3]'], ['string', '"done"']]) {
+			test(`${label} JSON stdout produces one failed event naming the type guard`, async function () {
+				if (process.platform === 'win32') {
+					this.skip();
+				}
+				const exe = engineScript(dir, `cat >/dev/null\nprintf '%s' '${stdout}'\n`);
+				const events = await runToEnd(makeRequest(), launch(exe));
+				assert.deepStrictEqual(events.filter(e => e.type === 'failed' || e.type === 'complete'), [
+					{ type: 'failed', jobId: 'test-job-1', error: 'Python output is not a JSON object. Exit code: 0' },
+				]);
 			});
-			runner.start();
+		}
+	});
+
+	// A config larger than any pipe buffer cannot be written before the engine exits, so an engine that closes
+	// its stdin without reading always gets an EPIPE: the ordering is forced, not left to the scheduler.
+	suite('the engine exits without reading its config', () => {
+		let dir: string;
+
+		setup(() => {
+			dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ql-jobrunner-epipe-'));
+		});
+
+		teardown(() => {
+			fs.rmSync(dir, { recursive: true });
+		});
+
+		const bigRequest = () => makeRequest({ config: { action: 'backtest', values: { 'param.padding': 'x'.repeat(1024 * 1024) } } } as Partial<JobRequest>);
+
+		test('the write fails with EPIPE: one failed event names it, nothing is thrown', async function () {
+			if (process.platform === 'win32') {
+				this.skip();
+			}
+			const exe = engineScript(dir, `exec 0<&-\nprintf '{"success":true,"metrics":{}}'\nexit 3\n`);
+			const events = await runToEnd(bigRequest(), launch(exe));
+			const terminal = events.filter(e => e.type === 'failed' || e.type === 'complete');
+			assert.strictEqual(terminal.length, 1, JSON.stringify(terminal));
+			assert.ok(terminal[0].type === 'failed');
+			assert.strictEqual(terminal[0].error, 'The engine exited (code 3) without reading its job config: write EPIPE');
+			assert.ok(events.some(e => e.type === 'log' && e.level === 'error' && e.message === 'The engine did not read its job config from stdin: write EPIPE'));
+		});
+
+		test('control: the same config to an engine that reads it completes', async function () {
+			if (process.platform === 'win32') {
+				this.skip();
+			}
+			const exe = engineScript(dir, `cat >/dev/null\nprintf '{"success":true,"metrics":{"m":1}}'\n`);
+			const events = await runToEnd(bigRequest(), launch(exe));
+			const terminal = events.filter(e => e.type === 'failed' || e.type === 'complete');
+			assert.strictEqual(terminal.length, 1, JSON.stringify(terminal));
+			assert.strictEqual(terminal[0].type, 'complete');
 		});
 	});
 });
+
+/** A stand-in engine: a shell script whose body is `body`. */
+function engineScript(dir: string, body: string): string {
+	const exe = path.join(dir, 'quantlab-engine');
+	fs.writeFileSync(exe, `#!/bin/sh\n${body}`, { mode: 0o755 });
+	return exe;
+}
+
+/** Runs a job to its terminal event, then 300 ms more, so a second terminal event would be seen. */
+function runToEnd(request: JobRequest, engine: EngineLaunch): Promise<EngineEvent[]> {
+	return new Promise(resolve => {
+		const events: EngineEvent[] = [];
+		let ended = false;
+		new JobRunner({
+			request,
+			engine,
+			onEvent: (event) => {
+				events.push(event);
+				if (!ended && (event.type === 'failed' || event.type === 'complete')) {
+					ended = true;
+					setTimeout(() => resolve(events), 300);
+				}
+			},
+		}).start();
+	});
+}
 
 suite('JobRunner – engine actions and launch', () => {
 
