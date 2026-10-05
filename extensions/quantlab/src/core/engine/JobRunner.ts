@@ -20,6 +20,75 @@ const UNAVAILABLE_ACTIONS: ReadonlyMap<string, string> = new Map([
 ]);
 
 /** The engine module an action runs, or why it cannot run. */
+/** What the engine's one JSON result says: a completed backtest, the engine's own failure, or a result that breaks its contract. */
+export type EngineResultReading =
+	| { kind: 'complete'; result: JobResult }
+	| { kind: 'failed'; error: string; stack: string | undefined }
+	| { kind: 'invalid'; reason: string };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+	return typeof value === 'number' && Number.isFinite(value);
+}
+
+/** A float of the engine's result: finite, or null where it was inf / NaN (run_backtest.py :21-36, applied at :245). */
+function isEngineFloat(value: unknown): value is number | null {
+	return value === null || isFiniteNumber(value);
+}
+
+/**
+ * The engine's result, read against its stdout contract (engine/quantlab/cli/run_backtest.py): a success always
+ * carries `metrics`, `warnings`, `equity` and `signals` (convert_results, :105-112 and :160-166); a failure always
+ * carries `error`, and `stack` only when the run itself raised (:279-283; absent at :259 and :267). Every float may be
+ * null, the engine's spelling of inf / NaN (_sanitize_for_json, :21-36, applied at :245); timestamps are integers.
+ * A required field that is missing or of the wrong shape is named; nothing is filled in.
+ */
+export function readEngineResult(parsed: Record<string, unknown>): EngineResultReading {
+	if (parsed.success === false) {
+		if (typeof parsed.error !== 'string') {
+			return { kind: 'invalid', reason: `a failure result has no 'error' string (got ${JSON.stringify(parsed.error)})` };
+		}
+		if (parsed.stack !== undefined && typeof parsed.stack !== 'string') {
+			return { kind: 'invalid', reason: `a failure result's 'stack' is not a string (got ${JSON.stringify(parsed.stack)})` };
+		}
+		return { kind: 'failed', error: parsed.error, stack: parsed.stack };
+	}
+	if (parsed.success !== true) {
+		return { kind: 'invalid', reason: `'success' is ${JSON.stringify(parsed.success)}, not true or false` };
+	}
+	const { metrics, warnings, equity, signals } = parsed;
+	if (!isRecord(metrics)) {
+		return { kind: 'invalid', reason: `a success result has no 'metrics' object (got ${JSON.stringify(metrics)})` };
+	}
+	const badMetric = Object.entries(metrics).find(([, value]) => !isEngineFloat(value));
+	if (badMetric !== undefined) {
+		return { kind: 'invalid', reason: `metric '${badMetric[0]}' is ${JSON.stringify(badMetric[1])}, not a finite number or null` };
+	}
+	if (!Array.isArray(warnings) || warnings.some(w => typeof w !== 'string')) {
+		return { kind: 'invalid', reason: `a success result has no 'warnings' array of strings (got ${JSON.stringify(warnings)})` };
+	}
+	if (!Array.isArray(equity) || equity.some(p => !isRecord(p) || !isFiniteNumber(p.t) || !isEngineFloat(p.v))) {
+		return { kind: 'invalid', reason: `a success result has no 'equity' array of {t, v} numbers` };
+	}
+	if (!Array.isArray(signals) || signals.some(s => !isRecord(s) || !isFiniteNumber(s.t) || (s.type !== 'entry' && s.type !== 'exit') || (s.price !== undefined && !isEngineFloat(s.price)))) {
+		return { kind: 'invalid', reason: `a success result has no 'signals' array of {t, type: entry|exit}` };
+	}
+	return {
+		kind: 'complete',
+		result: {
+			// JobResult types these floats as number; the engine's null for inf / NaN passes through as before (flagged:
+			// widening JobResult to number | null reaches the Action view's run state and the webview, outside this change).
+			metrics: metrics as Record<string, number>,
+			warnings: warnings as string[],
+			equity: equity as Array<{ t: number; v: number }>,
+			signals: signals as Array<{ t: number; type: 'entry' | 'exit'; label?: string; price?: number }>,
+		},
+	};
+}
+
 export function resolveEngineModule(action: string): { kind: 'module'; module: string } | { kind: 'refused'; reason: string } {
 	const module = MODULE_MAP.get(action);
 	if (module) {
@@ -329,28 +398,30 @@ export class JobRunner {
 			return;
 		}
 
-		if (parsed.success === false) {
+		const reading = readEngineResult(parsed);
+		if (reading.kind === 'invalid') {
+			this.emitLog('error', `The engine's result breaks its contract: ${reading.reason}`);
 			this.options.onEvent({
 				type: 'failed',
 				jobId,
-				error: String(parsed.error ?? 'Unknown error from Python engine'),
-				stack: parsed.stack ? String(parsed.stack) : undefined,
+				error: `The engine's result is invalid: ${reading.reason}. Exit code: ${code}`,
+			});
+			return;
+		}
+		if (reading.kind === 'failed') {
+			this.options.onEvent({
+				type: 'failed',
+				jobId,
+				error: reading.error,
+				stack: reading.stack,
 			});
 			return;
 		}
 
-		// Build JobResult from parsed output
-		const result: JobResult = {
-			metrics: (parsed.metrics as Record<string, number>) ?? {},
-			warnings: (parsed.warnings as string[]) ?? [],
-			equity: (parsed.equity as Array<{ t: number; v: number }>) ?? [],
-			signals: (parsed.signals as Array<{ t: number; type: 'entry' | 'exit'; label?: string; price?: number }>) ?? [],
-		};
-
 		this.options.onEvent({
 			type: 'complete',
 			jobId,
-			result,
+			result: reading.result,
 		});
 	}
 
