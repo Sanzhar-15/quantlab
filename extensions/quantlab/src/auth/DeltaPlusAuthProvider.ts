@@ -3,9 +3,13 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-// QuantLab -- Delta Plus Authentication Provider
-// Implements vscode.AuthenticationProvider so the QuantLab sign-in appears in the VS Code
-// account switcher. The provider is a CLIENT of the host identity (QL-LOGIN contract section 4):
+// QuantLab -- Delta Plus identity holder, internal to this extension
+// Deliberately NOT a vscode.AuthenticationProvider and never registered as one: a public provider
+// hands the account id and label to every installed extension through vscode.authentication
+// (getSession / getAccounts), and no extension other than QuantLab may obtain the Delta Plus
+// identity (rule 2, EXT-ISO case G3). Inside QuantLab the identity is read through
+// ServerApiClient.getUser() and this class's onDidSignIn; nothing is published to other extensions.
+// The provider is a CLIENT of the host identity (QL-LOGIN contract section 4):
 // it asks the workbench for who is signed in (`_quantlab.hostIdentity.get`) and is told when
 // that may have changed (`_quantlab.hostIdentity.didChange`, a tick that carries nothing; the
 // provider pulls). It holds no credential, makes no request to the sign-in service and writes
@@ -13,8 +17,6 @@
 
 import * as vscode from 'vscode';
 import { ServerApiClient, ServerUser } from '../core/server/ServerApiClient';
-
-const PROVIDER_ID = 'deltaplus';
 
 // The two extension-facing commands owned by the workbench service (contract section 3). Neither
 // is user-facing, so neither has a package.json entry.
@@ -33,9 +35,6 @@ const LEGACY_LOGIN_SECRET_KEYS: readonly string[] = [
 	'qic.deltaplusRefreshToken',
 	'qic.deltaplusTokenExpiresAt',
 ];
-
-const SIGN_IN_OUT_IN_TERMINAL_MESSAGE =
-	'Sign in and sign out happen in the Quantlab terminal view; the extension has no sign-in of its own.';
 
 /** The contract's Identity: exactly these two shapes, nothing else. */
 interface HostUser {
@@ -95,14 +94,12 @@ function parseHostIdentity(raw: unknown): HostIdentity {
 	throw new Error('Host identity answer has no boolean signedIn.');
 }
 
-function sameUser(a: HostUser, b: HostUser): boolean {
-	return a.id === b.id && a.email === b.email && a.name === b.name;
-}
-
-export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vscode.Disposable {
-	private readonly _sessionChangeEmitter =
-		new vscode.EventEmitter<vscode.AuthenticationProviderAuthenticationSessionsChangeEvent>();
-	readonly onDidChangeSessions = this._sessionChangeEmitter.event;
+export class DeltaPlusAuthProvider implements vscode.Disposable {
+	// Fires when a user becomes signed in: from signed out, or a different user id. Internal to
+	// QuantLab (extension.ts reconnects the WebSocket on it); it carries nothing, readers ask
+	// ServerApiClient.getUser().
+	private readonly _signInEmitter = new vscode.EventEmitter<void>();
+	readonly onDidSignIn = this._signInEmitter.event;
 
 	private readonly _disposables: vscode.Disposable[] = [];
 	private readonly _output: vscode.OutputChannel;
@@ -134,29 +131,8 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 		);
 	}
 
-	// -- vscode.AuthenticationProvider ------------------------------------------
-
-	async getSessions(
-		_scopes?: readonly string[],
-		_options?: vscode.AuthenticationProviderSessionOptions
-	): Promise<vscode.AuthenticationSession[]> {
-		return this._identity.signedIn ? [this._toVscodeSession(this._identity.user)] : [];
-	}
-
-	async createSession(_scopes: readonly string[]): Promise<vscode.AuthenticationSession> {
-		// Already signed in at the host: that session is the answer.
-		if (this._identity.signedIn) {
-			return this._toVscodeSession(this._identity.user);
-		}
-		throw new Error(SIGN_IN_OUT_IN_TERMINAL_MESSAGE);
-	}
-
-	async removeSession(_sessionId: string): Promise<void> {
-		throw new Error(SIGN_IN_OUT_IN_TERMINAL_MESSAGE);
-	}
-
 	dispose(): void {
-		this._sessionChangeEmitter.dispose();
+		this._signInEmitter.dispose();
 		this._disposables.forEach(d => d.dispose());
 	}
 
@@ -206,24 +182,13 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 		const previous = this._identity;
 		this._identity = next;
 
-		// The client first: listeners of onDidChangeSessions reconnect the WebSocket, which needs
-		// the user to be set.
+		// The client first: listeners of onDidSignIn reconnect the WebSocket, which needs the user
+		// to be set. Sign-out and same-user field changes reach readers through the client's
+		// onAuthStateChange.
 		this._serverClient.setHostIdentity(next.signedIn ? this._toServerUser(next.user) : undefined);
 
-		if (previous.signedIn && next.signedIn) {
-			if (previous.user.id !== next.user.id) {
-				this._sessionChangeEmitter.fire({
-					added: [this._toVscodeSession(next.user)],
-					removed: [this._toVscodeSession(previous.user)],
-					changed: []
-				});
-			} else if (!sameUser(previous.user, next.user)) {
-				this._sessionChangeEmitter.fire({ added: [], removed: [], changed: [this._toVscodeSession(next.user)] });
-			}
-		} else if (next.signedIn) {
-			this._sessionChangeEmitter.fire({ added: [this._toVscodeSession(next.user)], removed: [], changed: [] });
-		} else if (previous.signedIn) {
-			this._sessionChangeEmitter.fire({ added: [], removed: [this._toVscodeSession(previous.user)], changed: [] });
+		if (next.signedIn && (!previous.signedIn || previous.user.id !== next.user.id)) {
+			this._signInEmitter.fire();
 		}
 	}
 
@@ -237,18 +202,4 @@ export class DeltaPlusAuthProvider implements vscode.AuthenticationProvider, vsc
 		// AUTH-TIER: the host identity carries no tier yet; the carry AUTH-TIER adds it here.
 		return { id: user.id, email: user.email, name: user.name };
 	}
-
-	private _toVscodeSession(user: HostUser): vscode.AuthenticationSession {
-		return {
-			id: `${PROVIDER_ID}:${user.id}`,
-			// vscode.AuthenticationSession.accessToken is a required string in the VS Code API.
-			// The host identity never gives the extension a token (contract amendment A-3): this
-			// empty string is an API-shape constraint, NOT a credential, and nothing reads it.
-			accessToken: '',
-			account: { id: user.id, label: user.name || user.email },
-			scopes: ['read'],
-		};
-	}
 }
-
-export { PROVIDER_ID as DELTAPLUS_PROVIDER_ID };

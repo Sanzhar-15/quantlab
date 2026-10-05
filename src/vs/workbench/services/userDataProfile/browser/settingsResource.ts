@@ -4,12 +4,12 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { VSBuffer } from '../../../../base/common/buffer.js';
-import { ConfigurationScope, Extensions, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
+import { ConfigurationScope, Extensions, IConfigurationPropertySchema, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
 import { FileOperationError, FileOperationResult, IFileService } from '../../../../platform/files/common/files.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
 import { IProfileResource, IProfileResourceChildTreeItem, IProfileResourceInitializer, IProfileResourceTreeItem, IUserDataProfileService } from '../common/userDataProfile.js';
-import { updateIgnoredSettings } from '../../../../platform/userDataSync/common/settingsMerge.js';
+import { NEVER_SYNCED_SETTINGS, updateIgnoredSettings } from '../../../../platform/userDataSync/common/settingsMerge.js';
 import { IUserDataSyncUtilService } from '../../../../platform/userDataSync/common/userDataSync.js';
 import { ITreeItemCheckboxState, TreeItemCollapsibleState } from '../../../common/views.js';
 import { IUserDataProfile, ProfileResourceType } from '../../../../platform/userDataProfile/common/userDataProfile.js';
@@ -80,9 +80,7 @@ export class SettingsResource implements IProfileResource {
 	}
 
 	private getIgnoredSettings(): string[] {
-		const allSettings = Registry.as<IConfigurationRegistry>(Extensions.Configuration).getConfigurationProperties();
-		const ignoredSettings = Object.keys(allSettings).filter(key => allSettings[key]?.scope === ConfigurationScope.MACHINE || allSettings[key]?.scope === ConfigurationScope.APPLICATION_MACHINE || allSettings[key]?.scope === ConfigurationScope.MACHINE_OVERRIDABLE);
-		return ignoredSettings;
+		return profileIgnoredSettings(Registry.as<IConfigurationRegistry>(Extensions.Configuration).getConfigurationProperties());
 	}
 
 	private async getLocalFileContent(profile: IUserDataProfile): Promise<string | null> {
@@ -99,6 +97,15 @@ export class SettingsResource implements IProfileResource {
 		}
 	}
 
+}
+
+/**
+ * Settings a profile export leaves out and a profile import never overwrites: machine-scoped settings, plus the
+ * never-synced keys (SYNC-1). Those are no longer registered, so no scope would keep them out of an export.
+ */
+export function profileIgnoredSettings(allSettings: { readonly [key: string]: IConfigurationPropertySchema | undefined }): string[] {
+	const machineScoped = Object.keys(allSettings).filter(key => allSettings[key]?.scope === ConfigurationScope.MACHINE || allSettings[key]?.scope === ConfigurationScope.APPLICATION_MACHINE || allSettings[key]?.scope === ConfigurationScope.MACHINE_OVERRIDABLE);
+	return [...machineScoped, ...NEVER_SYNCED_SETTINGS];
 }
 
 export class SettingsResourceTreeItem implements IProfileResourceTreeItem {

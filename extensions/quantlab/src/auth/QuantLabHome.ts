@@ -17,6 +17,70 @@ export interface HomeUser {
 	tier?: string;
 }
 
+/** The Home quick-action buttons. Each button posts `{ type: 'command', cmd }` with its `cmd`. */
+export const HOME_QUICK_ACTIONS: ReadonlyArray<{ readonly label: string; readonly icon: string; readonly cmd: string; readonly desc: string }> = [
+	// 'workbench.view.qic.chat.focus' is the core-registered focus command for the
+	// Orion chat view (QIC_CHAT_VIEW_ID 'workbench.view.qic.chat' in qic.contribution.ts;
+	// the workbench auto-registers '<viewId>.focus' for every registered view).
+	// allow-any-unicode-next-line
+	{ label: 'Open Orion', icon: '✦', cmd: 'workbench.view.qic.chat.focus', desc: 'AI trading assistant' },
+	// allow-any-unicode-next-line
+	{ label: 'Browse Markets', icon: '⬡', cmd: 'quantlab.focusDataPanel', desc: 'Equities, crypto & macro, live' },
+	// allow-any-unicode-next-line
+	{ label: 'View Chart', icon: '↗', cmd: 'quantlab.focusDataPanel', desc: 'Click any symbol to chart it' },
+	// allow-any-unicode-next-line
+	{ label: 'Browse Tools', icon: '◈', cmd: 'quantlab.focusResourcesPanel', desc: 'Stats tests & strategy tools' },
+];
+
+/**
+ * The only command ids the Home webview may have the extension host run: exactly the quick-action
+ * `cmd` values above. A webview message crosses a trust boundary, so any other id is refused,
+ * logged and shown -- never run (an open relay would let the page run, for example,
+ * workbench.action.terminal.sendSequence).
+ */
+export const HOME_ALLOWED_COMMANDS: ReadonlySet<string> = new Set<string>([
+	'workbench.view.qic.chat.focus',
+	'quantlab.focusDataPanel',
+	'quantlab.focusResourcesPanel',
+]);
+
+function refuseHomeMessage(reason: string): void {
+	console.error(`[QuantLabHome] Refused webview message: ${reason}`);
+	void vscode.window.showErrorMessage(`Quantlab Home refused a request: ${reason}`);
+}
+
+/**
+ * Handle one message from the Home webview: run an allow-listed command id, refuse anything else
+ * visibly. Failures MUST surface (No-Fallbacks): log + notify, never swallow.
+ */
+export async function relayHomeMessage(msg: unknown): Promise<void> {
+	if (typeof msg !== 'object' || msg === null || Array.isArray(msg)) {
+		refuseHomeMessage(`message is not an object (${typeof msg}).`);
+		return;
+	}
+	const record = msg as Record<string, unknown>;
+	if (record.type !== 'command') {
+		refuseHomeMessage(`unknown message type '${String(record.type)}'.`);
+		return;
+	}
+	const cmd = record.cmd;
+	if (typeof cmd !== 'string') {
+		refuseHomeMessage(`command message has no string command id (${typeof cmd}).`);
+		return;
+	}
+	if (!HOME_ALLOWED_COMMANDS.has(cmd)) {
+		refuseHomeMessage(`command '${cmd}' is not a Home quick action.`);
+		return;
+	}
+	try {
+		await vscode.commands.executeCommand(cmd);
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		console.error(`[QuantLabHome] Quick action '${cmd}' failed:`, err);
+		void vscode.window.showErrorMessage(`Quick action failed (${cmd}): ${detail}`);
+	}
+}
+
 export class QuantLabHome {
 	private static _instance: vscode.WebviewPanel | undefined;
 
@@ -53,18 +117,9 @@ export class QuantLabHome {
 			panel.webview, tokensUri, styleUri, themeStyles, user
 		);
 
-		// Handle quick-action button clicks -> execute VS Code commands.
-		// Failures MUST surface (No-Fallbacks): log + notify, never swallow.
-		panel.webview.onDidReceiveMessage(async (msg: { type: string; cmd?: string }) => {
-			if (msg.type === 'command' && msg.cmd) {
-				try {
-					await vscode.commands.executeCommand(msg.cmd);
-				} catch (err) {
-					const detail = err instanceof Error ? err.message : String(err);
-					console.error(`[QuantLabHome] Quick action '${msg.cmd}' failed:`, err);
-					void vscode.window.showErrorMessage(`Quick action failed (${msg.cmd}): ${detail}`);
-				}
-			}
+		// Quick-action button clicks -> run the allow-listed command (relayHomeMessage).
+		panel.webview.onDidReceiveMessage((msg: unknown) => {
+			void relayHomeMessage(msg);
 		});
 
 		// Close the Home panel when the user signs out so stale user data
@@ -114,20 +169,6 @@ export class QuantLabHome {
 		// AUTH-TIER: the host identity carries no tier yet; the carry AUTH-TIER supplies the value.
 		// With no tier there is no badge at all (never a guessed value such as 'Free').
 		const tier = user.tier ? `${user.tier.charAt(0).toUpperCase()}${user.tier.slice(1)}` : undefined;
-
-		const actions: Array<{ label: string; icon: string; cmd: string; desc: string }> = [
-			// 'workbench.view.qic.chat.focus' is the core-registered focus command for the
-			// Orion chat view (QIC_CHAT_VIEW_ID 'workbench.view.qic.chat' in qic.contribution.ts;
-			// the workbench auto-registers '<viewId>.focus' for every registered view).
-			// allow-any-unicode-next-line
-			{ label: 'Open Orion', icon: '✦', cmd: 'workbench.view.qic.chat.focus', desc: 'AI trading assistant' },
-			// allow-any-unicode-next-line
-			{ label: 'Browse Markets', icon: '⬡', cmd: 'quantlab.focusDataPanel', desc: 'Equities, crypto & macro, live' },
-			// allow-any-unicode-next-line
-			{ label: 'View Chart', icon: '↗', cmd: 'quantlab.focusDataPanel', desc: 'Click any symbol to chart it' },
-			// allow-any-unicode-next-line
-			{ label: 'Browse Tools', icon: '◈', cmd: 'quantlab.focusResourcesPanel', desc: 'Stats tests & strategy tools' },
-		];
 
 		const tips: string[] = [
 			'Drag any symbol from the Data panel onto the chart to plot it instantly.',
@@ -239,7 +280,7 @@ export class QuantLabHome {
 			<!-- Quick actions -->
 			<p class="home-section-label">Quick Start</p>
 			<div class="home-actions">
-				${actions.map(a => `
+				${HOME_QUICK_ACTIONS.map(a => `
 				<button class="home-action" data-cmd="${this._esc(a.cmd)}">
 					<span class="home-action-icon">${a.icon}</span>
 					<span class="home-action-label">${this._esc(a.label)}</span>

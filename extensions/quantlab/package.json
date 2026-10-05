@@ -1721,12 +1721,6 @@
         }
       }
     },
-    "authentication": [
-      {
-        "id": "deltaplus",
-        "label": "Delta Plus"
-      }
-    ],
     "configurationDefaults": {
       "workbench.secondarySideBar.defaultVisibility": "hidden",
       "workbench.activityBar.location": "top",

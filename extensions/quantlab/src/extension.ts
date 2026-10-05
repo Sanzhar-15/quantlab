@@ -66,7 +66,7 @@ import { TrustManager } from './core/trust/TrustManager';
 import { StatsEngine } from './stats/StatsEngine';
 import { PythonBootstrap } from './core/engine/PythonBootstrap';
 import { ServerApiClient } from './core/server/ServerApiClient';
-import { DeltaPlusAuthProvider, DELTAPLUS_PROVIDER_ID } from './auth/DeltaPlusAuthProvider';
+import { DeltaPlusAuthProvider } from './auth/DeltaPlusAuthProvider';
 import { DataViewManager } from './views/DataViewManager';
 import { QuantLabHome } from './auth/QuantLabHome';
 import { DataService } from './core/engine/DataService';
@@ -98,17 +98,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		const wsUrl = serverUrl.replace(/^http/, 'ws') + '/v1/ws';
 		serverClient.configure({ baseUrl: serverUrl, wsUrl });
 	}
-	// Register Delta Plus authentication provider with VS Code account switcher.
+	// Delta Plus identity holder, internal to QuantLab. Deliberately not published through
+	// vscode.authentication: a public provider hands the account id and label to every installed
+	// extension (rule 2, EXT-ISO case G3).
 	const authProvider = new DeltaPlusAuthProvider(context, serverClient);
-	context.subscriptions.push(
-		vscode.authentication.registerAuthenticationProvider(
-			DELTAPLUS_PROVIDER_ID,
-			'Delta Plus',
-			authProvider,
-			{ supportsMultipleAccounts: false }
-		),
-		authProvider
-	);
+	context.subscriptions.push(authProvider);
 
 	// Sign-in / sign-out commands.
 	// The extension has no sign-in of its own: the host identity is the only source and sign-in /
@@ -122,18 +116,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		})
 	);
 
-	// Reconnect WebSocket when a new session is created (e.g. after sign-in).
+	// Reconnect WebSocket when a user signs in.
 	// Megaudit M87 (No-Fallbacks): a failed reconnect silently kills all
 	// real-time feeds while the UI shows a signed-in state -- log it.
 	context.subscriptions.push(
-		authProvider.onDidChangeSessions(e => {
-			if (e.added && e.added.length > 0) {
-				void serverClient.connectWebSocket().catch(err => {
-					getServerOutputChannel().appendLine(
-						`[extension] WebSocket reconnect after sign-in failed: ${err instanceof Error ? err.message : String(err)}`
-					);
-				});
-			}
+		authProvider.onDidSignIn(() => {
+			void serverClient.connectWebSocket().catch(err => {
+				getServerOutputChannel().appendLine(
+					`[extension] WebSocket reconnect after sign-in failed: ${err instanceof Error ? err.message : String(err)}`
+				);
+			});
 		})
 	);
 

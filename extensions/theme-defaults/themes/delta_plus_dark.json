@@ -201,7 +201,7 @@
 		{
 			"scope": "header",
 			"settings": {
-				"foreground": "#000080"
+				"foreground": "#7878BC"
 			}
 		},
 		{
@@ -230,7 +230,7 @@
 		{
 			"scope": "constant.regexp",
 			"settings": {
-				"foreground": "#646695"
+				"foreground": "#7A7BA4"
 			}
 		},
 		{
