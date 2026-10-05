@@ -1,6 +1,11 @@
 {
-	"$schema": "vscode://schemas/color-theme",
-	"name": "Dark High Contrast",
+	"semanticHighlighting": true,
+	"semanticTokenColors": {
+		"newOperator": "#FFFFFF",
+		"stringLiteral": "#ce9178",
+		"customLiteral": "#DCDCAA",
+		"numberLiteral": "#b5cea8"
+	},
 	"colors": {
 		"editor.background": "#000000",
 		"editor.foreground": "#FFFFFF",
@@ -458,12 +463,5 @@
 				"foreground": "#CBEDCB"
 			}
 		}
-	],
-	"semanticHighlighting": true,
-	"semanticTokenColors": {
-		"newOperator": "#FFFFFF",
-		"stringLiteral": "#ce9178",
-		"customLiteral": "#DCDCAA",
-		"numberLiteral": "#b5cea8"
-	}
+	]
 }
