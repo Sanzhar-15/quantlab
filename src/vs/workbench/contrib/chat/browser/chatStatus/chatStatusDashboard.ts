@@ -13,7 +13,6 @@ import { IAction, toAction, WorkbenchActionExecutedEvent, WorkbenchActionExecute
 import { cancelOnDispose } from '../../../../../base/common/cancellation.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { safeIntl } from '../../../../../base/common/date.js';
-import { MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { MutableDisposable, DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { parseLinkedText } from '../../../../../base/common/linkedText.js';
 import { language } from '../../../../../base/common/platform.js';
@@ -30,7 +29,6 @@ import { localize } from '../../../../../nls.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
 import { IHoverService, nativeHoverDelegate } from '../../../../../platform/hover/browser/hover.js';
-import { IMarkdownRendererService } from '../../../../../platform/markdown/browser/markdownRenderer.js';
 import { Link } from '../../../../../platform/opener/browser/link.js';
 import { IOpenerService } from '../../../../../platform/opener/common/opener.js';
 import { ITelemetryService } from '../../../../../platform/telemetry/common/telemetry.js';
@@ -40,7 +38,7 @@ import { EditorResourceAccessor, SideBySideEditor } from '../../../../common/edi
 import { IChatEntitlementService, ChatEntitlementService, ChatEntitlement, IQuotaSnapshot } from '../../../../services/chat/common/chatEntitlementService.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
 import { IChatSessionsService } from '../../common/chatSessionsService.js';
-import { isNewUser, isCompletionsEnabled } from './chatStatus.js';
+import { isCompletionsEnabled } from './chatStatus.js';
 import { IChatStatusItemService, ChatStatusEntry } from './chatStatusItemService.js';
 import product from '../../../../../platform/product/common/product.js';
 import { contrastBorder, inputValidationErrorBorder, inputValidationInfoBorder, inputValidationWarningBorder, registerColor, transparent } from '../../../../../platform/theme/common/colorRegistry.js';
@@ -138,7 +136,6 @@ export class ChatStatusDashboard extends DomWidget {
 		@ITextResourceConfigurationService private readonly textResourceConfigurationService: ITextResourceConfigurationService,
 		@IInlineCompletionsService private readonly inlineCompletionsService: IInlineCompletionsService,
 		@IChatSessionsService private readonly chatSessionsService: IChatSessionsService,
-		@IMarkdownRendererService private readonly markdownRendererService: IMarkdownRendererService,
 		@ILanguageFeaturesService private readonly languageFeaturesService: ILanguageFeaturesService,
 		@IQuickInputService private readonly quickInputService: IQuickInputService,
 		@IViewsService private readonly viewService: IViewsService,
@@ -181,12 +178,6 @@ export class ChatStatusDashboard extends DomWidget {
 
 			if (resetDate) {
 				this.element.appendChild($('div.description', undefined, localize('limitQuota', "Allowance resets {0}.", resetDateHasTime ? this.dateTimeFormatter.value.format(new Date(resetDate)) : this.dateFormatter.value.format(new Date(resetDate)))));
-			}
-
-			if (this.chatEntitlementService.entitlement === ChatEntitlement.Free && (Number(chatQuota?.percentRemaining) <= 25 || Number(completionsQuota?.percentRemaining) <= 25)) {
-				const upgradeProButton = this._store.add(new Button(this.element, { ...defaultButtonStyles, hoverDelegate: nativeHoverDelegate, secondary: this.canUseChat() /* use secondary color when chat can still be used */ }));
-				upgradeProButton.label = localize('upgradeToCopilotPro', "Upgrade to GitHub Copilot Pro");
-				this._store.add(upgradeProButton.onDidClick(() => this.runCommandAndClose('workbench.action.chat.upgradePlan')));
 			}
 
 			(async () => {
@@ -314,60 +305,6 @@ export class ChatStatusDashboard extends DomWidget {
 		if (this.canUseChat()) {
 			const snooze = append(this.element, $('div.snooze-completions'));
 			this.createCompletionsSnooze(snooze, localize('settings.snooze', "Snooze"), this._store);
-		}
-
-		// New to Chat / Signed out
-		{
-			const newUser = isNewUser(this.chatEntitlementService);
-			const anonymousUser = this.chatEntitlementService.anonymous;
-			const disabled = this.chatEntitlementService.sentiment.disabled || this.chatEntitlementService.sentiment.untrusted;
-			const signedOut = this.chatEntitlementService.entitlement === ChatEntitlement.Unknown;
-			if (newUser || signedOut || disabled) {
-				addSeparator();
-
-				let descriptionText: string | MarkdownString;
-				let descriptionClass = '.description';
-				if (newUser && anonymousUser) {
-					descriptionText = new MarkdownString(localize({ key: 'activeDescriptionAnonymous', comment: ['{Locked="]({2})"}', '{Locked="]({3})"}'] }, "By continuing with {0} Copilot, you agree to {1}'s [Terms]({2}) and [Privacy Statement]({3})", defaultChat.provider.default.name, defaultChat.provider.default.name, defaultChat.termsStatementUrl, defaultChat.privacyStatementUrl), { isTrusted: true });
-					descriptionClass = `${descriptionClass}.terms`;
-				} else if (newUser) {
-					descriptionText = localize('activateDescription', "Set up Copilot to use AI features.");
-				} else if (anonymousUser) {
-					descriptionText = localize('enableMoreDescription', "Sign in to enable more Copilot AI features.");
-				} else if (disabled) {
-					descriptionText = localize('enableDescription', "Enable Copilot to use AI features.");
-				} else {
-					descriptionText = localize('signInDescription', "Sign in to use Copilot AI features.");
-				}
-
-				let buttonLabel: string;
-				if (newUser) {
-					buttonLabel = localize('enableAIFeatures', "Use AI Features");
-				} else if (anonymousUser) {
-					buttonLabel = localize('enableMoreAIFeatures', "Enable more AI Features");
-				} else if (disabled) {
-					buttonLabel = localize('enableCopilotButton', "Enable AI Features");
-				} else {
-					buttonLabel = localize('signInToUseAIFeatures', "Sign in to use AI Features");
-				}
-
-				let commandId: string;
-				if (newUser && anonymousUser) {
-					commandId = 'workbench.action.chat.triggerSetupAnonymousWithoutDialog';
-				} else {
-					commandId = 'workbench.action.chat.triggerSetup';
-				}
-
-				if (typeof descriptionText === 'string') {
-					this.element.appendChild($(`div${descriptionClass}`, undefined, descriptionText));
-				} else {
-					this.element.appendChild($(`div${descriptionClass}`, undefined, this._store.add(this.markdownRendererService.render(descriptionText)).element));
-				}
-
-				const button = this._store.add(new Button(this.element, { ...defaultButtonStyles, hoverDelegate: nativeHoverDelegate }));
-				button.label = buttonLabel;
-				this._store.add(button.onDidClick(() => this.runCommandAndClose(commandId)));
-			}
 		}
 	}
 

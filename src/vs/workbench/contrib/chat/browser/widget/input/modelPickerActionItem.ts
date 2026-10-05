@@ -110,25 +110,6 @@ function getModelPickerActionBarActionProvider(commandService: ICommandService, 
 				});
 			}
 
-			// Add sign-in / upgrade option if entitlement is anonymous / free / new user
-			const isNewOrAnonymousUser = !chatEntitlementService.sentiment.installed ||
-				chatEntitlementService.entitlement === ChatEntitlement.Available ||
-				chatEntitlementService.anonymous ||
-				chatEntitlementService.entitlement === ChatEntitlement.Unknown;
-			if (isNewOrAnonymousUser || chatEntitlementService.entitlement === ChatEntitlement.Free) {
-				additionalActions.push({
-					id: 'moreModels',
-					label: isNewOrAnonymousUser ? localize('chat.moreModels', "Add Language Models") : localize('chat.morePremiumModels', "Add Premium Models"),
-					enabled: true,
-					tooltip: isNewOrAnonymousUser ? localize('chat.moreModels.tooltip', "Add Language Models") : localize('chat.morePremiumModels.tooltip', "Add Premium Models"),
-					class: undefined,
-					run: () => {
-						const commandId = isNewOrAnonymousUser ? 'workbench.action.chat.triggerSetup' : 'workbench.action.chat.upgradePlan';
-						commandService.executeCommand(commandId);
-					}
-				});
-			}
-
 			return additionalActions;
 		}
 	};
