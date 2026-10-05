@@ -1697,32 +1697,9 @@
       }
     ],
     "configurationDefaults": {
+      "workbench.secondarySideBar.defaultVisibility": "hidden",
       "workbench.activityBar.location": "top",
       "workbench.sideBar.location": "left"
-    }
-  },
-  "configurationDefaults": {
-    "workbench.colorCustomizations": {
-      "focusBorder": "#fc7432",
-      "button.background": "#fc7432",
-      "button.foreground": "#ffffff",
-      "button.hoverBackground": "#e5681f",
-      "progressBar.background": "#fc7432",
-      "textLink.foreground": "#fc7432",
-      "textLink.activeForeground": "#e5681f",
-      "list.highlightForeground": "#fc7432",
-      "list.focusHighlightForeground": "#fc7432",
-      "editorLink.activeForeground": "#fc7432",
-      "activityBarBadge.background": "#fc7432",
-      "activityBarBadge.foreground": "#ffffff",
-      "tab.activeBorderTop": "#fc7432",
-      "panelTitle.activeBorder": "#fc7432",
-      "settings.modifiedItemIndicator": "#fc7432",
-      "inputOption.activeBorder": "#fc7432",
-      "inputOption.activeBackground": "#fc743233",
-      "checkbox.background": "#fc7432",
-      "checkbox.foreground": "#ffffff",
-      "dropdown.border": "#fc7432"
     }
   },
   "devDependencies": {
