@@ -771,6 +771,11 @@
         "title": "%command.watchlist.removeSymbol.title%",
         "category": "%command.category%",
         "icon": "$(remove)"
+      },
+      {
+        "command": "quantlab.importFromEditor",
+        "title": "Import Settings, Keybindings and Extensions from VS Code or Cursor",
+        "category": "%command.category%"
       }
     ],
     "colors": [

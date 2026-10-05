@@ -1,0 +1,126 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import * as fs from 'fs';
+import * as path from 'path';
+import * as vscode from 'vscode';
+import { formatReport, ImportPorts, ImportTarget, runImport } from './importer';
+import { EditorKind, editorExtensionsDir, editorLabel, editorUserDir, isEnoent, readEditorSnapshot } from './sources';
+
+interface EditorCandidate {
+	kind: EditorKind;
+	userDir: string;
+	extensionsDir: string;
+}
+
+async function exists(file: string): Promise<boolean> {
+	try {
+		await fs.promises.stat(file);
+		return true;
+	} catch (err: unknown) {
+		if (isEnoent(err)) {
+			return false;
+		}
+		throw err;
+	}
+}
+
+async function isAvailable(candidate: EditorCandidate): Promise<boolean> {
+	return await exists(path.join(candidate.userDir, 'settings.json'))
+		|| await exists(path.join(candidate.userDir, 'keybindings.json'))
+		|| await exists(path.join(candidate.extensionsDir, 'extensions.json'));
+}
+
+/** The app's own `User` directory: `<userData>/User/globalStorage/<extension id>` is the extension's global storage. */
+function importTarget(context: vscode.ExtensionContext): ImportTarget {
+	const globalStorage = context.globalStorageUri.fsPath;
+	const parent = path.resolve(globalStorage, '..');
+	if (path.basename(parent) !== 'globalStorage') {
+		throw new Error(`Quantlab: cannot locate the user settings directory from the extension storage path ${globalStorage}`);
+	}
+	const userDir = path.resolve(parent, '..');
+	return { settingsPath: path.join(userDir, 'settings.json'), keybindingsPath: path.join(userDir, 'keybindings.json') };
+}
+
+async function importFromEditor(context: vscode.ExtensionContext): Promise<void> {
+	const kinds: EditorKind[] = ['vscode', 'cursor'];
+	const candidates: EditorCandidate[] = kinds.map(kind => ({
+		kind,
+		userDir: editorUserDir(kind, process.platform, process.env),
+		extensionsDir: editorExtensionsDir(kind, process.platform, process.env),
+	}));
+
+	const available: EditorCandidate[] = [];
+	for (const candidate of candidates) {
+		if (await isAvailable(candidate)) {
+			available.push(candidate);
+		}
+	}
+
+	if (available.length === 0) {
+		void vscode.window.showInformationMessage(
+			`Quantlab: nothing to import. No settings, keybindings or extensions found in ${candidates.map(c => `${c.userDir} or ${c.extensionsDir}`).join(', or ')}.`
+		);
+		return;
+	}
+
+	let source = available[0];
+	if (available.length > 1) {
+		const picked = await vscode.window.showQuickPick(
+			available.map(candidate => ({ label: editorLabel(candidate.kind), description: candidate.userDir, candidate })),
+			{ placeHolder: 'Import settings, keybindings and extensions from…' }
+		);
+		if (!picked) {
+			return;
+		}
+		source = picked.candidate;
+	}
+
+	const target = importTarget(context);
+	const confirmed = await vscode.window.showWarningMessage(
+		`Import settings, keybindings and extensions from ${editorLabel(source.kind)}?`,
+		{
+			modal: true,
+			detail: `Reads ${source.userDir} and ${source.extensionsDir}. Imported values replace your current values for the same settings. `
+				+ `Your current settings and keybindings are saved beside the originals before anything is written.`,
+		},
+		'Import'
+	);
+	if (confirmed !== 'Import') {
+		return;
+	}
+
+	const ports: ImportPorts = {
+		fs: {
+			readFile: file => fs.promises.readFile(file, 'utf8'),
+			writeFile: (file, text) => fs.promises.writeFile(file, text, 'utf8'),
+			copyFile: (from, to) => fs.promises.copyFile(from, to),
+		},
+		gallery: {
+			isInstalled: id => vscode.extensions.getExtension(id) !== undefined,
+			install: async id => { await vscode.commands.executeCommand('workbench.extensions.installExtension', id); },
+		},
+		now: () => new Date(),
+	};
+
+	const report = await vscode.window.withProgress(
+		{ location: vscode.ProgressLocation.Notification, title: 'Quantlab: Importing…', cancellable: false },
+		async () => runImport(await readEditorSnapshot(source.kind, source.userDir, source.extensionsDir, ports.fs), target, ports)
+	);
+
+	const document = await vscode.workspace.openTextDocument({ content: formatReport(report), language: 'plaintext' });
+	await vscode.window.showTextDocument(document);
+}
+
+export function registerImportCommands(context: vscode.ExtensionContext): void {
+	context.subscriptions.push(vscode.commands.registerCommand('quantlab.importFromEditor', async () => {
+		try {
+			await importFromEditor(context);
+		} catch (err: unknown) {
+			void vscode.window.showErrorMessage(`Quantlab: import failed. ${err instanceof Error ? err.message : String(err)}`);
+			throw err;
+		}
+	}));
+}
