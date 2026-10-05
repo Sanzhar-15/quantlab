@@ -402,7 +402,7 @@ export class ChartClient {
 						const seriesOptions = this.buildSeriesOptions(command.options, resolvedPane);
 						const optionsKey = this.buildSeriesOptionsKey(seriesOptions, command.series);
 						const handle = this.getVisualizationSeries(command.series, optionsKey, paneKey, seriesOptions);
-						handle.series.setVisible(true);
+						handle.series.setVisible(paneKey === undefined || !this.isStrategyKey(paneKey) || this.strategyPaneVisible);
 						handle.series.setData(command.data.map(pt => ({ t: this.snapTime(pt.t), v: pt.v })));
 						handle.active = true;
 						break;
@@ -545,8 +545,8 @@ export class ChartClient {
 
 	private async createChart(): Promise<void> {
 		this.colors = this.resolveColors();
+		// The theme is applied by initialize() through chart.setTheme (createChart reads no `theme` option).
 		this.chart = createChart(this.container, {
-			theme: this.buildThemeTokens(),
 			autoSize: true,
 			timeFormatter: (time: number) => this.formatTime(time),
 			timeScale: {
@@ -557,9 +557,6 @@ export class ChartClient {
 				pan: {
 					freezeAxis: false,
 					freezeAxisThreshold: 0.15,
-				},
-				crosshair: {
-					snapToData: true,
 				},
 			},
 		});
@@ -617,10 +614,7 @@ export class ChartClient {
 		const paneId = this.chart.addPane(true);
 		this.paneMap.set(key, paneId);
 		const pane = this.chart.getPane(paneId);
-		pane?.setPreserveEmptyPane(true);
-		if (this.isStrategyKey(key) && !this.strategyPaneVisible) {
-			pane?.setVisible(false);
-		}
+		pane?.setPreserveEmptyPane(!this.isStrategyKey(key) || this.strategyPaneVisible);
 		if (typeof height === 'number') {
 			this.applyPaneHeight(paneId, height);
 		} else if (this.isStrategyKey(key)) {
@@ -650,28 +644,25 @@ export class ChartClient {
 		return key !== 'equity' && key !== 'volume';
 	}
 
-	private getStrategyPaneIds(): string[] {
-		const paneIds: string[] = [];
-		for (const key of this.strategyPaneKeys) {
-			const paneId = this.paneMap.get(key);
-			if (paneId) {
-				paneIds.push(paneId);
-			}
-		}
-		return paneIds;
-	}
-
 	private syncStrategyPaneVisibility(): void {
 		if (!this.chart) {
 			return;
 		}
-		const paneIds = this.getStrategyPaneIds();
-		for (const paneId of paneIds) {
-			const pane = this.chart.getPane(paneId);
+		// The terminal's chart engine has no PaneApi.setVisible: it lays a pane out while the pane is
+		// preserved-when-empty or holds a visible series. A strategy pane is hidden by dropping both
+		// and shown by restoring both (an inactive series stays hidden either way).
+		for (const key of this.strategyPaneKeys) {
+			const paneId = this.paneMap.get(key);
+			const pane = paneId ? this.chart.getPane(paneId) : null;
 			if (!pane) {
 				continue;
 			}
-			pane.setVisible(this.strategyPaneVisible);
+			pane.setPreserveEmptyPane(this.strategyPaneVisible);
+			for (const handle of this.visualizationSeries) {
+				if (handle.paneKey === key) {
+					handle.series.setVisible(this.strategyPaneVisible && handle.active);
+				}
+			}
 		}
 	}
 
