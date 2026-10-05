@@ -1804,13 +1804,7 @@
           "description": "Reduce motion in Quantlab views."
         }
       }
-    },
-    "authentication": [
-      {
-        "id": "deltaplus",
-        "label": "Delta Plus"
-      }
-    ]
+    }
   },
   "configurationDefaults": {
     "workbench.colorCustomizations": {
