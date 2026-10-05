@@ -5,7 +5,7 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { buildHelpMessage, formatOptions, NATIVE_CLI_COMMANDS, Option, OptionDescriptions, OPTIONS, Subcommand, parseArgs, ErrorReporter, refusedNativeCliCommand } from '../../node/argv.js';
+import { buildHelpMessage, formatOptions, Option, OptionDescriptions, OPTIONS, Subcommand, parseArgs, ErrorReporter, REFUSED_CLI_COMMANDS, refusedCliCommand } from '../../node/argv.js';
 import { addArg } from '../../node/argvHelper.js';
 
 function o(description: string, type: 'boolean' | 'string' | 'string[]' = 'string'): Option<any> {
@@ -65,18 +65,19 @@ suite('formatOptions', () => {
 			]);
 	});
 
-	test('native CLI subcommands parse, are refused by name and are not offered in the help', () => {
+	test('tunnel, serve-web and chat parse, are refused by name and are not offered in the help', () => {
 		const reporter: ErrorReporter = { onUnknownOption: () => { }, onMultipleValues: () => { }, onEmptyValue: () => { }, onDeprecatedOption: () => { } };
-		for (const subcommand of NATIVE_CLI_COMMANDS) {
+		assert.deepStrictEqual([...REFUSED_CLI_COMMANDS], ['tunnel', 'serve-web', 'chat']);
+		for (const subcommand of REFUSED_CLI_COMMANDS) {
 			const args = parseArgs([subcommand], OPTIONS, reporter);
 			assert.deepStrictEqual(args._, [], `'${subcommand}' must not be taken for a path`);
-			assert.strictEqual(refusedNativeCliCommand(args), subcommand);
+			assert.strictEqual(refusedCliCommand(args), subcommand);
 		}
 		// control: an ordinary invocation is not refused
-		assert.strictEqual(refusedNativeCliCommand(parseArgs(['tunnel.txt', '--wait'], OPTIONS, reporter)), undefined);
+		assert.strictEqual(refusedCliCommand(parseArgs(['tunnel.txt', 'chat.md', '--wait'], OPTIONS, reporter)), undefined);
 		const help = buildHelpMessage('Product', 'product', '1.0.0', OPTIONS);
 		assert.ok(help.includes('--wait'), 'control: the help lists options');
-		assert.ok(!/tunnel|serve-web/.test(help), help);
+		assert.ok(!/tunnel|serve-web|chat|Subcommands/.test(help), help);
 	});
 
 	test('addArg', () => {

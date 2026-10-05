@@ -48,18 +48,19 @@ export type OptionDescriptions<T> = {
 export const NATIVE_CLI_COMMANDS = ['tunnel', 'serve-web'] as const;
 
 /**
- * Quantlab ships no binary for the native CLI subcommands (no tunnel, no web server). They still parse, so that
- * `tunnel` is never taken for a path to open, carry no description, so that the help does not offer them, and are
- * refused by name: this returns the one that was asked for.
+ * Subcommands Quantlab does not offer: it ships no binary for the native ones (no tunnel, no web server) and has no
+ * chat. They still parse, so that `tunnel` or `chat` is never taken for a path to open, carry no description, so
+ * that the help does not offer them, and are refused by name.
  */
-export function refusedNativeCliCommand(args: NativeParsedArgs): typeof NATIVE_CLI_COMMANDS[number] | undefined {
-	return NATIVE_CLI_COMMANDS.find(subcommand => !!args[subcommand]);
+export const REFUSED_CLI_COMMANDS = [...NATIVE_CLI_COMMANDS, 'chat'] as const;
+
+export function refusedCliCommand(args: NativeParsedArgs): typeof REFUSED_CLI_COMMANDS[number] | undefined {
+	return REFUSED_CLI_COMMANDS.find(subcommand => !!args[subcommand]);
 }
 
 export const OPTIONS: OptionDescriptions<Required<NativeParsedArgs>> = {
 	'chat': {
 		type: 'subcommand',
-		description: 'Pass in a prompt to run in a chat session in the current working directory.',
 		options: {
 			'_': { type: 'string[]', description: localize('prompt', "The prompt to use as chat.") },
 			'mode': { type: 'string', cat: 'o', alias: 'm', args: 'mode', description: localize('chatMode', "The mode to use for the chat session. Available options: 'ask', 'edit', 'agent', or the identifier of a custom mode. Defaults to 'agent'.") },
@@ -451,17 +452,16 @@ function wrapText(text: string, columns: number): string[] {
 	return lines;
 }
 
-export function buildHelpMessage(productName: string, executableName: string, version: string, options: OptionDescriptions<unknown> | Record<string, Option<'boolean'> | Option<'string'> | Option<'string[]'> | Subcommand<Record<string, unknown>>>, capabilities?: { noPipe?: boolean; noInputFiles?: boolean; isChat?: boolean }): string {
+export function buildHelpMessage(productName: string, executableName: string, version: string, options: OptionDescriptions<unknown> | Record<string, Option<'boolean'> | Option<'string'> | Option<'string[]'> | Subcommand<Record<string, unknown>>>, capabilities?: { noPipe?: boolean; noInputFiles?: boolean }): string {
 	const columns = (process.stdout).isTTY && (process.stdout).columns || 80;
-	const inputFiles = capabilities?.noInputFiles ? '' : capabilities?.isChat ? ` [${localize('cliPrompt', 'prompt')}]` : ` [${localize('paths', 'paths')}...]`;
-	const subcommand = capabilities?.isChat ? ' chat' : '';
+	const inputFiles = capabilities?.noInputFiles ? '' : ` [${localize('paths', 'paths')}...]`;
 
 	const help = [`${productName} ${version}`];
 	help.push('');
-	help.push(`${localize('usage', "Usage")}: ${executableName}${subcommand} [${localize('options', "options")}]${inputFiles}`);
+	help.push(`${localize('usage', "Usage")}: ${executableName} [${localize('options', "options")}]${inputFiles}`);
 	help.push('');
 	if (capabilities?.noPipe !== true) {
-		help.push(buildStdinMessage(executableName, capabilities?.isChat));
+		help.push(buildStdinMessage(executableName));
 		help.push('');
 	}
 	const optionsByCategory: { [P in keyof typeof helpCategories]?: Record<string, Option<'boolean'> | Option<'string'> | Option<'string[]'>> } = {};
@@ -502,20 +502,12 @@ export function buildHelpMessage(productName: string, executableName: string, ve
 	return help.join('\n');
 }
 
-export function buildStdinMessage(executableName: string, isChat?: boolean): string {
+export function buildStdinMessage(executableName: string): string {
 	let example: string;
 	if (isWindows) {
-		if (isChat) {
-			example = `echo Hello World | ${executableName} chat <prompt> -`;
-		} else {
-			example = `echo Hello World | ${executableName} -`;
-		}
+		example = `echo Hello World | ${executableName} -`;
 	} else {
-		if (isChat) {
-			example = `ps aux | grep code | ${executableName} chat <prompt> -`;
-		} else {
-			example = `ps aux | grep code | ${executableName} -`;
-		}
+		example = `ps aux | grep code | ${executableName} -`;
 	}
 
 	return localize('stdinUsage', "To read from stdin, append '-' (e.g. '{0}')", example);
