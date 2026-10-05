@@ -760,7 +760,7 @@
       },
       {
         "command": "quantlab.importFromEditor",
-        "title": "Import Settings, Keybindings and Extensions from VS Code or Cursor",
+        "title": "%command.importFromEditor.title%",
         "category": "%command.category%"
       }
     ],
@@ -1709,7 +1709,8 @@
     ],
     "configurationDefaults": {
       "workbench.activityBar.location": "top",
-      "workbench.sideBar.location": "left"
+      "workbench.sideBar.location": "left",
+      "python.languageServer": "None"
     }
   },
   "configurationDefaults": {
