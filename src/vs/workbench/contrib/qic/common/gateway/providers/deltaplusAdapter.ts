@@ -6,8 +6,7 @@
 import { randomUUID } from '../../qicCrypto.js';
 import type { ProviderAdapter, ProviderHealth, StreamChunk, GatewayMetadata } from '../../canonical/interfaces.js';
 import type { LaneName } from '../../canonical/lanes.js';
-import type { ProviderRequest, ProviderResponse, TokenUsage, ContentBlock } from '../../canonical/types.js';
-import { QicError } from '../../canonical/types.js';
+import { QicError, type ProviderRequest, type ProviderResponse, type TokenUsage, type ContentBlock } from '../../canonical/types.js';
 import { redactErrorBody } from './errorRedaction.js';
 import type { IRequestService } from '../../../../../../platform/request/common/request.js';
 import type { IRequestContext } from '../../../../../../base/parts/request/common/request.js';
@@ -23,6 +22,33 @@ const REQUEST_TIMEOUT_MS = 60_000;
 const STREAM_TIMEOUT_MS = 5 * 60_000;
 const NETWORK_RETRY_MAX = 2;
 const NETWORK_RETRY_BASE_MS = 500;
+
+type StopReason = NonNullable<ProviderResponse['stopReason']>;
+const STOP_REASONS: readonly StopReason[] = ['end_turn', 'tool_use', 'max_tokens', 'stop_sequence'];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** A malformed server value is a protocol violation: it throws, it is never defaulted. */
+function malformed(what: string): QicError {
+	return new QicError('QIC-P004', `Malformed Delta Plus Server response: ${what}`);
+}
+
+function requireUsageNumber(value: unknown, field: string): number {
+	if (typeof value !== 'number') {
+		throw malformed(`usage.${field} is ${value === undefined ? 'missing' : `not a number (${typeof value})`}`);
+	}
+	return value;
+}
+
+/** JSON has no undefined: an optional field sent as null is treated as absent. */
+function optionalUsageNumber(value: unknown, field: string): number | undefined {
+	if (value === undefined || value === null) {
+		return undefined;
+	}
+	return requireUsageNumber(value, field);
+}
 
 /**
  * Provider adapter for Delta Plus Server LLM proxy.
@@ -107,7 +133,7 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 		try {
 			const bodyStr = JSON.stringify(this.buildQicRequest(request, false));
 
-		const doRequest = async (): Promise<{ status: number; body: string }> => {
+			const doRequest = async (): Promise<{ status: number; body: string }> => {
 				if (this.requestService) {
 					const cts = new CancellationTokenSource();
 					if (request.signal) {
@@ -158,28 +184,16 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 				throw this.normalizeErrorFromStatus(result.status, result.body);
 			}
 
-			const rawOuter = JSON.parse(result.body) as Record<string, unknown>;
-			const raw = this.unwrapResponse(rawOuter) as Record<string, unknown>;
+			const rawOuter: unknown = JSON.parse(result.body);
+			const raw = this.unwrapResponse(rawOuter);
 
 			// Normalize response content
-			const content: ContentBlock[] = typeof raw.content === 'string'
-				? [{ type: 'text' as const, text: raw.content as string }]
-				: (Array.isArray(raw.content) ? raw.content : []).map((b: any) => {
-					if (b.type === 'tool_use' || b.type === 'tool_call') {
-						return {
-							type: 'tool_use' as const,
-							id: b.id ?? '',
-							name: b.name ?? '',
-							input: typeof b.input === 'string' ? (() => { try { return JSON.parse(b.input); } catch { return {}; } })() : (b.input ?? {}),
-						};
-					}
-					return { type: 'text' as const, text: b.text ?? '' };
-				});
+			const content = this.parseContent(raw.content);
 
 			return {
 				content,
 				usage: this.mapUsage(raw.usage),
-				stopReason: (raw.stop_reason ?? raw.stopReason) as 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence' | undefined,
+				stopReason: this.parseStopReason(raw.stop_reason ?? raw.stopReason),
 			};
 		} finally {
 			clearTimeout(timeoutId);
@@ -407,7 +421,7 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 	 * Client lanes: completion, chat-ask, chat-gather, chat-plan, chat-act, repair, fast-apply, summarize
 	 */
 	private static readonly LANE_MAP: Partial<Record<LaneName, string>> = {
-		// All client lanes now exist on the server — no remapping needed.
+		// All client lanes now exist on the server - no remapping needed.
 		// Keep this map for potential future mismatches.
 	};
 
@@ -423,7 +437,7 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 	private buildQicRequest(request: ProviderRequest & Partial<GatewayMetadata>, stream: boolean): object {
 		const lane = this.mapLane(request.lane);
 
-		// Build messages — flatMap because tool_result blocks become separate role='tool' messages (OpenAI format)
+		// Build messages - flatMap because tool_result blocks become separate role='tool' messages (OpenAI format)
 		const messages: Record<string, unknown>[] = [];
 		for (const m of request.messages) {
 			if (typeof m.content === 'string') {
@@ -437,26 +451,26 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 
 			// Process non-tool-result blocks (text + tool_use)
 			if (otherBlocks.length > 0) {
-				const textParts = otherBlocks.filter(b => b.type === 'text');
-				const toolUseParts = otherBlocks.filter(b => b.type === 'tool_use');
+				const textParts = otherBlocks.filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text');
+				const toolUseParts = otherBlocks.filter((b): b is Extract<ContentBlock, { type: 'tool_use' }> => b.type === 'tool_use');
 
 				const msg: Record<string, unknown> = {
 					role: m.role,
 					content: textParts.length > 0
-						? textParts.map(b => ('text' in b ? b.text : '')).join('')
+						? textParts.map(b => b.text).join('')
 						: (toolUseParts.length > 0 ? null : ''),
 				};
 
 				// OpenAI format: tool_use → tool_calls with function wrapper
 				if (toolUseParts.length > 0) {
 					const validToolCalls = toolUseParts
-						.filter(b => 'name' in b && typeof b.name === 'string' && (b.name as string).trim() !== '')
+						.filter(b => typeof b.name === 'string' && b.name.trim() !== '')
 						.map(b => ({
-							id: ('id' in b ? b.id : ''),
+							id: b.id,
 							type: 'function',
 							function: {
-								name: (b as any).name as string,
-								arguments: JSON.stringify('input' in b ? b.input : {}),
+								name: b.name,
+								arguments: JSON.stringify(b.input),
 							},
 						}));
 					if (validToolCalls.length > 0) {
@@ -472,8 +486,8 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 				if (tr.type === 'tool_result') {
 					messages.push({
 						role: 'tool',
-						tool_call_id: (tr as any).tool_use_id,
-						content: (tr as any).content ?? '',
+						tool_call_id: tr.tool_use_id,
+						content: tr.content ?? '',
 					});
 				}
 			}
@@ -511,7 +525,7 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 	private mapServerEvent(eventType: string, data: Record<string, unknown>): StreamChunk[] {
 		switch (eventType) {
 			case 'routing': {
-				// QIC routing event — informational, skip (contains lane/tier info)
+				// QIC routing event - informational, skip (contains lane/tier info)
 				return [];
 			}
 
@@ -528,7 +542,7 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 			}
 
 			case 'tool_call': {
-				// Server sends full tool call in one event — emit all 3 chunks
+				// Server sends full tool call in one event - emit all 3 chunks
 				const id = (data.id as string) ?? '';
 				const name = (data.name as string) ?? '';
 				// Handle input as either JSON string or object
@@ -564,7 +578,7 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 			}
 
 			case 'usage': {
-				// Usage-only event — skip (will be included in done)
+				// Usage-only event - skip (will be included in done)
 				return [];
 			}
 
@@ -584,7 +598,7 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 					this._streamingToolCallId = id;
 					return [{ type: 'tool_call_start', id, name }];
 				}
-				// text block start — no chunk needed, text comes in deltas
+				// text block start - no chunk needed, text comes in deltas
 				return [];
 			}
 
@@ -668,12 +682,12 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 					return [{ type: 'done' }];
 				}
 				if (dataType === 'stop' || dataType === 'done') {
-					return [{ type: 'done', usage: this.mapUsage(data.usage), stopReason: (data.stop_reason as string) ?? undefined }];
+					return [{ type: 'done', usage: this.mapUsage(data.usage), stopReason: this.parseStopReason(data.stop_reason) }];
 				}
 				if (dataType === 'error') {
 					return [{ type: 'error', error: new QicError('QIC-P004', (data.message as string) ?? 'Unknown error') }];
 				}
-				// Unknown event type — log for diagnostics
+				// Unknown event type - log for diagnostics
 				console.warn(`[DeltaPlusAdapter] Unhandled SSE event: type="${eventType}" data.type="${dataType}"`);
 				return [];
 			}
@@ -689,25 +703,111 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 		};
 	}
 
-	private mapUsage(raw: any): TokenUsage | undefined {
-		if (!raw) { return undefined; }
+	/**
+	 * Map server usage to TokenUsage. Absent usage (undefined or null) is undefined;
+	 * present usage must carry numeric input and output token counts.
+	 */
+	private mapUsage(raw: unknown): TokenUsage | undefined {
+		if (raw === undefined || raw === null) { return undefined; }
+		if (!isRecord(raw)) {
+			throw malformed(`usage is not an object (${typeof raw})`);
+		}
 		return {
-			inputTokens: raw.input_tokens ?? raw.inputTokens ?? 0,
-			outputTokens: raw.output_tokens ?? raw.outputTokens ?? 0,
-			cacheReadTokens: raw.cache_read_tokens ?? raw.cacheReadTokens,
-			cacheWriteTokens: raw.cache_creation_tokens ?? raw.cacheWriteTokens,
+			inputTokens: requireUsageNumber(raw.input_tokens ?? raw.inputTokens, 'input_tokens'),
+			outputTokens: requireUsageNumber(raw.output_tokens ?? raw.outputTokens, 'output_tokens'),
+			cacheReadTokens: optionalUsageNumber(raw.cache_read_tokens ?? raw.cacheReadTokens, 'cache_read_tokens'),
+			cacheWriteTokens: optionalUsageNumber(raw.cache_creation_tokens ?? raw.cacheWriteTokens, 'cache_creation_tokens'),
 		};
 	}
 
 	/**
-	 * Unwrap Delta Plus server response envelope.
-	 * Server wraps responses as { success: true, data: { ... } }.
+	 * Validate a server stop reason. Absent (undefined or null) is undefined;
+	 * every other value must be one of the four canonical stop reasons.
 	 */
-	private unwrapResponse(raw: Record<string, unknown>): any {
-		if (raw.data && typeof raw.data === 'object') {
-			return raw.data;
+	private parseStopReason(raw: unknown): StopReason | undefined {
+		if (raw === undefined || raw === null) { return undefined; }
+		const stopReason = STOP_REASONS.find(r => r === raw);
+		if (stopReason === undefined) {
+			throw malformed(`unknown stop reason ${JSON.stringify(raw)}`);
 		}
-		return raw;
+		return stopReason;
+	}
+
+	/**
+	 * Unwrap Delta Plus server response envelope.
+	 * Server wraps responses as { success: true, data: { ... } }; a body without a `data` object throws.
+	 */
+	private unwrapResponse(raw: unknown): Record<string, unknown> {
+		if (!isRecord(raw)) {
+			throw malformed('body is not a JSON object');
+		}
+		const data = raw.data;
+		if (!isRecord(data)) {
+			throw malformed('body has no `data` object');
+		}
+		return data;
+	}
+
+	/**
+	 * Parse response `content`: a string is one text block, an array is parsed block by block.
+	 */
+	private parseContent(raw: unknown): ContentBlock[] {
+		if (typeof raw === 'string') {
+			return [{ type: 'text', text: raw }];
+		}
+		if (!Array.isArray(raw)) {
+			throw malformed(`content is neither a string nor an array (${raw === null ? 'null' : typeof raw})`);
+		}
+		return raw.map((block: unknown, index: number) => this.parseContentBlock(block, index));
+	}
+
+	private parseContentBlock(block: unknown, index: number): ContentBlock {
+		if (!isRecord(block)) {
+			throw malformed(`content[${index}] is not an object`);
+		}
+		const type = block.type;
+		if (typeof type !== 'string') {
+			throw malformed(`content[${index}] has no string type`);
+		}
+		if (type === 'tool_use' || type === 'tool_call') {
+			const id = block.id;
+			const name = block.name;
+			if (typeof id !== 'string') {
+				throw malformed(`content[${index}] (${type}) has no string id`);
+			}
+			if (typeof name !== 'string') {
+				throw malformed(`content[${index}] (${type}) has no string name`);
+			}
+			return { type: 'tool_use', id, name, input: this.parseToolInput(block.input, index) };
+		}
+		const text = block.text;
+		if (typeof text !== 'string') {
+			throw malformed(`content[${index}] (${type}) has no string text`);
+		}
+		return { type: 'text', text };
+	}
+
+	/**
+	 * A tool_use input is either an object or a string holding a JSON object.
+	 */
+	private parseToolInput(input: unknown, index: number): Record<string, unknown> {
+		if (typeof input === 'string') {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(input);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				throw malformed(`content[${index}].input is not valid JSON: ${message}`);
+			}
+			if (!isRecord(parsed)) {
+				throw malformed(`content[${index}].input string does not hold a JSON object`);
+			}
+			return parsed;
+		}
+		if (!isRecord(input)) {
+			throw malformed(`content[${index}].input is neither an object nor a JSON object string (${input === null ? 'null' : typeof input})`);
+		}
+		return input;
 	}
 
 	/**
