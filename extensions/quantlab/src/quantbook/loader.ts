@@ -30,6 +30,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 
+import { bindingFileName, findExtensionDir, resolveEngineRoot } from './engineRoot';
 import type { QuantbookNativeModule } from './types';
 
 let cachedModule: QuantbookNativeModule | undefined;
@@ -41,7 +42,9 @@ let cachedModule: QuantbookNativeModule | undefined;
  *
  * Resolution order:
  * 1. `QUANTBOOK_ENGINE_PATH` env var, if set + non-empty.
- * 2. V1 dev-path discovery: walk UP from `__dirname` until we find
+ * 2. The engine tree of {@link resolveEngineRoot}: the packaged tree inside the extension when the
+ *    app carries one (QL-QUANTBOOK), otherwise the development tree found by
+ *    V1 dev-path discovery: walk UP from `__dirname` until we find
  *    the extensions/quantlab/package.json anchor (identified by
  *    `name: "quantlab"`), then `..` twice to the IDE repo root, then
  *    `..` to the parent workspace dir, then descend to
@@ -96,50 +99,9 @@ export function resolveEnginePath(): string {
 			`${ext}> to bypass discovery.`,
 		);
 	}
-	// extensionDir is .../{IDE-root}/extensions/quantlab
-	// .. twice = IDE-root
-	// .. thrice = parent workspace (sibling-of-IDE)
-	// + quantlab-quantbook/quantbook-engine/target/release/lib...
-	return path.resolve(
-		extensionDir,
-		'..', '..', '..',
-		'quantlab-quantbook', 'quantbook-engine', 'target', 'release',
-		`libql_bindings_node.${ext}`,
-	);
-}
-
-/**
- * Walk UP from `start` looking for the extension's `package.json`
- * (identified by `name: "quantlab"` AND ending in `extensions/quantlab`
- * to disambiguate from any other "quantlab"-named packages). Returns
- * the absolute path to that directory, or `undefined` if not found.
- *
- * Anchoring to the extension instead of the IDE root avoids the
- * worktree-collision issue documented above the caller.
- */
-function findExtensionDir(start: string): string | undefined {
-	let cur = path.resolve(start);
-	for (let depth = 0; depth < 16; depth += 1) {
-		const pkgPath = path.join(cur, 'package.json');
-		if (fs.existsSync(pkgPath)) {
-			try {
-				const raw = fs.readFileSync(pkgPath, 'utf8');
-				const pkg = JSON.parse(raw) as { name?: string };
-				if (pkg.name === 'quantlab' && cur.endsWith(path.join('extensions', 'quantlab'))) {
-					return cur;
-				}
-			} catch {
-				// Malformed package.json or read failure -- keep walking.
-				// We're scanning ancestors; don't surface a partial read.
-			}
-		}
-		const parent = path.dirname(cur);
-		if (parent === cur) {
-			return undefined;
-		}
-		cur = parent;
-	}
-	return undefined;
+	// The packaged tree (<extension>/quantbook-engine) or the development tree (the sibling engine
+	// worktree), then target/release/<binding>.
+	return path.join(resolveEngineRoot(extensionDir).path, 'target', 'release', bindingFileName(process.platform));
 }
 
 function nativeLibExt(): string {
@@ -187,15 +149,8 @@ export function resolveRelayBinaryPath(): string {
 		);
 	}
 	const binaryName = process.platform === 'win32' ? 'relay-server.exe' : 'relay-server';
-	// extensionDir is .../{IDE-root}/extensions/quantlab; .. thrice
-	// = parent workspace dir; then quantlab-quantbook/quantbook-engine/
-	// target/release/examples/<binary>.
-	return path.resolve(
-		extensionDir,
-		'..', '..', '..',
-		'quantlab-quantbook', 'quantbook-engine', 'target', 'release', 'examples',
-		binaryName,
-	);
+	// The packaged or development engine tree, then target/release/examples/<binary>.
+	return path.join(resolveEngineRoot(extensionDir).path, 'target', 'release', 'examples', binaryName);
 }
 
 /**
