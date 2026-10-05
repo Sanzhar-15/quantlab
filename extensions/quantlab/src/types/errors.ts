@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-export type QuantlabErrorSource = 'chart' | 'action' | 'trade' | 'engine' | 'global';
+export type QuantlabErrorSource = 'chart' | 'action' | 'engine' | 'global';
 export type QuantlabErrorSeverity = 'info' | 'warning' | 'error' | 'critical';
 
 export interface QuantlabRecoveryAction {

@@ -5,7 +5,7 @@
 
 import { DataSourceDescriptor, Timeframe } from './market';
 
-export type ViewType = 'editor' | 'chart' | 'action' | 'trade' | 'visualise' | 'stats';
+export type ViewType = 'editor' | 'chart' | 'action' | 'visualise' | 'stats';
 
 // Data file views (separate from strategy views)
 export type DataViewType = 'editor' | 'visualise' | 'stats' | 'action';
@@ -16,7 +16,6 @@ export interface TabViewState {
 	currentView: ViewType;
 	chartState?: ChartState;
 	actionState?: TabActionState;
-	tradeState?: TradeState;
 }
 
 export interface ChartState {
@@ -35,16 +34,10 @@ export interface TabActionState {
 	lastRunId: string | null;
 }
 
-export interface TradeState {
-	sessionId: string | null;
-	scrollPosition?: number;
-}
-
 export const VIEW_COLORS: Record<ViewType, string | null> = {
 	editor: null,
 	chart: '#059669',
 	action: '#D97706',
-	trade: '#DC2626',
 	visualise: '#7C3AED',
 	stats: '#0891B2'
 };

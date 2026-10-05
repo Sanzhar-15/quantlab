@@ -55,7 +55,6 @@ body {
 	color: var(--vscode-foreground);
 	--ql-view-chart: var(--vscode-quantlabViewChart, #059669);
 	--ql-view-action: var(--vscode-quantlabViewAction, #d97706);
-	--ql-view-trade: var(--vscode-quantlabViewTrade, #dc2626);
 	--ql-view-stripe-width: 3px;
 	--ql-status-positive: var(--vscode-quantlabStatusPositive, #059669);
 	--ql-status-warning: var(--vscode-quantlabStatusWarning, #d97706);

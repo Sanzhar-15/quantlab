@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import { ChartState, TabViewState, TradeState, ViewType } from '../../types/views';
+import { ChartState, TabViewState, ViewType } from '../../types/views';
 
 export class TabViewStateManager {
 	private static instance: TabViewStateManager | undefined;
@@ -173,31 +173,6 @@ export class TabViewStateManager {
 		return chartState;
 	}
 
-	getTradeState(tabInstanceId: string): TradeState | undefined {
-		return this.states.get(tabInstanceId)?.tradeState;
-	}
-
-	updateTradeState(tabInstanceId: string, update: Partial<TradeState>): TradeState | undefined {
-		const existing = this.states.get(tabInstanceId);
-		if (!existing) {
-			return undefined;
-		}
-
-		const tradeState: TradeState = {
-			sessionId: existing.tradeState?.sessionId ?? null,
-			...existing.tradeState,
-			...update
-		};
-
-		const next: TabViewState = {
-			...existing,
-			tradeState
-		};
-
-		this.states.set(tabInstanceId, next);
-		return tradeState;
-	}
-
 	setCurrentView(tabInstanceId: string, filePath: string, view: ViewType): void {
 		const existing = this.states.get(tabInstanceId);
 		const state: TabViewState = {
@@ -205,8 +180,7 @@ export class TabViewStateManager {
 			filePath,
 			currentView: view,
 			chartState: existing?.chartState,
-			actionState: existing?.actionState,
-			tradeState: existing?.tradeState
+			actionState: existing?.actionState
 		};
 
 		this.states.set(tabInstanceId, state);

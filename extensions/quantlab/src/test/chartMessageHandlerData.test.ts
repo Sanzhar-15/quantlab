@@ -78,10 +78,6 @@ suite('chart messageHandler: loading / empty / addSignal (H15+H17)', () => {
 			setSignals: async () => { /* no-op */ },
 			setEquityCurve: async () => { /* no-op */ },
 			applyVisualization: async () => { /* no-op */ },
-			setTradeOrders: async () => { /* no-op */ },
-			setTradePositions: async () => { /* no-op */ },
-			setTradeFills: async () => { /* no-op */ },
-			clearTradeOverlays: () => { /* no-op */ },
 			setTheme: () => { /* no-op */ }
 		} as unknown as ChartClient;
 
