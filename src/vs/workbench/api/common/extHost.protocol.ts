@@ -3178,8 +3178,17 @@ export interface ExtHostDataChannelsShape {
 export interface QuantlabIdentityDto {
 	readonly epoch: number;
 	readonly signedIn: boolean;
-	readonly user?: { readonly id: string; readonly email: string; readonly name: string; readonly tier?: string };
+	readonly user?: { readonly id: string; readonly email: string; readonly name?: string; readonly tier?: string };
 }
+
+/**
+ * The answer envelope of the main side. A refusal RESOLVES as `ok: false` (an RPC rejection keeps only name, message and
+ * code, so `status` would be lost); the ext-host class turns it into the Error the extension sees. Codes: identity-changed,
+ * not-signed-in, no-route, not-available, bad-request, too-large, forbidden, cancelled, server (with `status`).
+ */
+export type QuantlabHostAnswerDto =
+	| { readonly ok: true; readonly data: unknown }
+	| { readonly ok: false; readonly code: string; readonly message: string; readonly status?: number };
 
 export interface QuantlabSubscriptionStateDto {
 	readonly kind: 'open' | 'reconnecting' | 'closed' | 'error';
@@ -3188,9 +3197,10 @@ export interface QuantlabSubscriptionStateDto {
 
 export interface MainThreadQuantlabHostShape extends IDisposable {
 	$getIdentity(): Promise<QuantlabIdentityDto>;
-	/** Rejects `identity-changed` when `epoch` is not the current one at answer time, `no-route`, `not-signed-in`. */
-	$request(op: string, input: unknown, epoch: number, token: CancellationToken): Promise<unknown>;
-	$subscribe(handle: number, topic: string, params: unknown, epoch: number): Promise<void>;
+	/** Answers `identity-changed` when `epoch` is not the current one at answer time. */
+	$request(op: string, input: unknown, epoch: number, token: CancellationToken): Promise<QuantlabHostAnswerDto>;
+	/** `data` is null on success. */
+	$subscribe(handle: number, topic: string, params: unknown, epoch: number): Promise<QuantlabHostAnswerDto>;
 	$unsubscribe(handle: number): void;
 }
 
