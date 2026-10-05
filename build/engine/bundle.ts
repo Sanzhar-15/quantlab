@@ -90,17 +90,21 @@ export const bundleQuantlabEngineTask = task.define('bundle-quantlab-engine', as
 
 /**
  * The bundled engine as packaging sources, placed under `extensions/quantlab/engine/`.
- * A missing, stale or wrong-target bundle fails the packaging; the one way to package without
- * the engine is to ask for it by name with `QUANTLAB_ENGINE_BUNDLE=skip`.
+ * A missing, stale or wrong-target bundle fails the packaging. A TEST build (`QL_TEST_BUILD=1`)
+ * may ask by name to be packaged without the engine (`QUANTLAB_ENGINE_BUNDLE=skip`); any other
+ * packaging is a shipping configuration and refuses the skip.
  */
 export function quantlabEngineStream(platform: string, arch: string): NodeJS.ReadWriteStream {
 	if (process.env['QUANTLAB_ENGINE_BUNDLE'] === 'skip') {
+		if (process.env['QL_TEST_BUILD'] !== '1') {
+			throw new Error(`[quantlab-engine] QUANTLAB_ENGINE_BUNDLE=skip is refused for ${platform}-${arch}: only a test build (QL_TEST_BUILD=1) may be packaged without the Python engine`);
+		}
 		console.warn(`[quantlab-engine] QUANTLAB_ENGINE_BUNDLE=skip: packaging ${platform}-${arch} WITHOUT the Python engine (${packagedDir}/ will be absent)`);
 		return es.readArray([]);
 	}
 
 	if (!fs.existsSync(recordPath)) {
-		throw new Error(`[quantlab-engine] no bundle record at ${recordPath}: run the gulp task 'bundle-quantlab-engine' first, or set QUANTLAB_ENGINE_BUNDLE=skip to package without the engine`);
+		throw new Error(`[quantlab-engine] no bundle record at ${recordPath}: run the gulp task 'bundle-quantlab-engine' first, or, for a test build only (QL_TEST_BUILD=1), set QUANTLAB_ENGINE_BUNDLE=skip`);
 	}
 	const record: IEngineBundleRecord = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
 	if (record.platform !== platform || record.arch !== arch) {
