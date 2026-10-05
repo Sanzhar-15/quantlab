@@ -158,5 +158,6 @@
 	"command.watchlist.create.title": "New Watchlist...",
 	"command.watchlist.rename.title": "Rename Watchlist...",
 	"command.watchlist.delete.title": "Delete Watchlist",
-	"command.watchlist.removeSymbol.title": "Remove from Watchlist"
+	"command.watchlist.removeSymbol.title": "Remove from Watchlist",
+	"command.importFromEditor.title": "Import Settings, Keybindings and Extensions from VS Code or Cursor"
 }
