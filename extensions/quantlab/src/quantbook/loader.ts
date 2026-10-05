@@ -30,7 +30,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 
-import { bindingFileName, resolveEngineRoot } from './engineRoot';
+import { bindingFileName, findExtensionDir, resolveEngineRoot } from './engineRoot';
 import type { QuantbookNativeModule } from './types';
 
 let cachedModule: QuantbookNativeModule | undefined;
@@ -102,40 +102,6 @@ export function resolveEnginePath(): string {
 	// The packaged tree (<extension>/quantbook-engine) or the development tree (the sibling engine
 	// worktree), then target/release/<binding>.
 	return path.join(resolveEngineRoot(extensionDir).path, 'target', 'release', bindingFileName(process.platform));
-}
-
-/**
- * Walk UP from `start` looking for the extension's `package.json`
- * (identified by `name: "quantlab"` AND ending in `extensions/quantlab`
- * to disambiguate from any other "quantlab"-named packages). Returns
- * the absolute path to that directory, or `undefined` if not found.
- *
- * Anchoring to the extension instead of the IDE root avoids the
- * worktree-collision issue documented above the caller.
- */
-function findExtensionDir(start: string): string | undefined {
-	let cur = path.resolve(start);
-	for (let depth = 0; depth < 16; depth += 1) {
-		const pkgPath = path.join(cur, 'package.json');
-		if (fs.existsSync(pkgPath)) {
-			try {
-				const raw = fs.readFileSync(pkgPath, 'utf8');
-				const pkg = JSON.parse(raw) as { name?: string };
-				if (pkg.name === 'quantlab' && cur.endsWith(path.join('extensions', 'quantlab'))) {
-					return cur;
-				}
-			} catch {
-				// Malformed package.json or read failure -- keep walking.
-				// We're scanning ancestors; don't surface a partial read.
-			}
-		}
-		const parent = path.dirname(cur);
-		if (parent === cur) {
-			return undefined;
-		}
-		cur = parent;
-	}
-	return undefined;
 }
 
 function nativeLibExt(): string {

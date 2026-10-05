@@ -62,3 +62,45 @@ export function bindingFileName(platform: NodeJS.Platform): string {
 		default: throw new Error(`Unsupported platform "${platform}" for ql-bindings-node. Supported: darwin, linux, win32.`);
 	}
 }
+
+/**
+ * Walk UP from `start` to the extension's own directory: the one whose `package.json` has
+ * `name: "quantlab"` and whose path ends in `extensions/quantlab` (the IDE root and the engine
+ * worktree share another package name, so the extension is the unambiguous anchor). Returns
+ * `undefined` when no ancestor within 16 levels is that directory.
+ *
+ * An ancestor without a `package.json` (ENOENT / ENOTDIR) is skipped. A `package.json` that cannot
+ * be read for any other reason, or that is not valid JSON, throws by name: it is never skipped.
+ */
+export function findExtensionDir(start: string): string | undefined {
+	let cur = path.resolve(start);
+	for (let depth = 0; depth < 16; depth += 1) {
+		const pkgPath = path.join(cur, 'package.json');
+		let raw: string | undefined;
+		try {
+			raw = fs.readFileSync(pkgPath, 'utf8');
+		} catch (err: unknown) {
+			const code = (err as NodeJS.ErrnoException).code;
+			if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+				throw new Error(`[quantbook loader] cannot read ${pkgPath} while locating the extension: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		}
+		if (raw !== undefined) {
+			let pkg: { name?: unknown };
+			try {
+				pkg = JSON.parse(raw) as { name?: unknown };
+			} catch (err: unknown) {
+				throw new Error(`[quantbook loader] ${pkgPath} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+			}
+			if (pkg !== null && typeof pkg === 'object' && pkg.name === 'quantlab' && cur.endsWith(path.join('extensions', 'quantlab'))) {
+				return cur;
+			}
+		}
+		const parent = path.dirname(cur);
+		if (parent === cur) {
+			return undefined;
+		}
+		cur = parent;
+	}
+	return undefined;
+}

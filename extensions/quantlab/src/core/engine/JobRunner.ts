@@ -5,21 +5,36 @@
 
 import { ChildProcess, spawn } from 'child_process';
 import { EngineEvent, JobLogEvent, JobRequest, JobResult } from '../../types/engine';
+import { EngineLaunch } from './bundledEngine';
 
-// CODEX-011: Job mode support for optimize, Monte Carlo, and WFA
-export type JobMode = 'backtest' | 'optimize' | 'montecarlo' | 'wfa';
+// The engine module each job action runs.
+const MODULE_MAP: ReadonlyMap<string, string> = new Map([
+	['backtest', 'quantlab.cli.run_backtest'],
+]);
 
-const MODULE_MAP: Record<JobMode, string> = {
-	backtest: 'quantlab.cli.run_backtest',
-	optimize: 'quantlab.cli.run_optimize',
-	montecarlo: 'quantlab.cli.run_montecarlo',
-	wfa: 'quantlab.cli.run_wfa',
-};
+// Actions the product offers that have no engine module yet: refused by name, never started.
+const UNAVAILABLE_ACTIONS: ReadonlyMap<string, string> = new Map([
+	['optimize', 'Optimize'],
+	['monteCarlo', 'Monte Carlo'],
+	['wfa', 'Walk-forward analysis'],
+]);
+
+/** The engine module an action runs, or why it cannot run. */
+export function resolveEngineModule(action: string): { kind: 'module'; module: string } | { kind: 'refused'; reason: string } {
+	const module = MODULE_MAP.get(action);
+	if (module) {
+		return { kind: 'module', module };
+	}
+	const label = UNAVAILABLE_ACTIONS.get(action);
+	if (label) {
+		return { kind: 'refused', reason: `${label} is not available yet: the Quantlab engine has no ${label} module.` };
+	}
+	return { kind: 'refused', reason: `Unknown engine action '${action}': the Quantlab engine runs only a backtest.` };
+}
 
 export interface JobRunnerOptions {
 	request: JobRequest;
-	pythonPath: string;
-	engineRoot: string;
+	engine: EngineLaunch;
 	onEvent: (event: EngineEvent) => void;
 }
 
@@ -34,7 +49,7 @@ export class JobRunner {
 	constructor(private readonly options: JobRunnerOptions) { }
 
 	start(): void {
-		const { request, pythonPath, engineRoot, onEvent } = this.options;
+		const { request, engine, onEvent } = this.options;
 		const jobId = request.jobId;
 
 		if (this.cancelled) {
@@ -47,20 +62,33 @@ export class JobRunner {
 			return;
 		}
 
-		this.emitLog('info', `Starting ${request.action} job via Python engine.`);
+		const resolved = resolveEngineModule(request.action);
+		if (resolved.kind === 'refused') {
+			this.finished = true;
+			this.emitLog('error', resolved.reason);
+			onEvent({
+				type: 'failed',
+				jobId,
+				error: resolved.reason,
+			});
+			return;
+		}
+		const module = resolved.module;
 
-		const env = {
+		this.emitLog('info', `Starting ${request.action} job: ${engine.executable} -m ${module} (${engine.source}; cwd ${engine.cwd})`);
+
+		const env: NodeJS.ProcessEnv = {
 			...process.env,
-			PYTHONPATH: engineRoot,
 			PYTHONUNBUFFERED: '1',
 		};
+		if (engine.engineRoot === null) {
+			delete env.PYTHONPATH;
+		} else {
+			env.PYTHONPATH = engine.engineRoot;
+		}
 
-		// CODEX-011: Route to correct Python module based on action/mode
-		const action = request.action as JobMode ?? 'backtest';
-		const module = MODULE_MAP[action] ?? MODULE_MAP.backtest;
-
-		this.proc = spawn(pythonPath, ['-m', module], {
-			cwd: engineRoot,
+		this.proc = spawn(engine.executable, ['-m', module], {
+			cwd: engine.cwd,
 			env,
 			stdio: ['pipe', 'pipe', 'pipe'],
 		});
@@ -128,7 +156,7 @@ export class JobRunner {
 			try {
 				this.proc.kill('SIGTERM');
 			} catch {
-				// Process already exited between check and kill — safe to ignore.
+				// Process already exited between check and kill: safe to ignore.
 			}
 
 			// Force kill after 5 seconds if still running
@@ -137,7 +165,7 @@ export class JobRunner {
 					try {
 						this.proc.kill('SIGKILL');
 					} catch {
-						// Process already exited — safe to ignore.
+						// Process already exited: safe to ignore.
 					}
 				}
 			}, 5000);
@@ -146,7 +174,6 @@ export class JobRunner {
 
 	private buildStdinConfig(request: JobRequest): Record<string, unknown> {
 		const values = request.config?.values ?? {};
-		const action = request.action as JobMode ?? 'backtest';
 
 		// Aggregate param.* keys into a flat params dict for the Python side
 		const params: Record<string, unknown> = {};
@@ -156,10 +183,10 @@ export class JobRunner {
 			}
 		}
 
-		const config: Record<string, unknown> = {
+		return {
 			jobId: request.jobId,
 			strategyPath: request.strategyPath,
-			mode: action,
+			mode: request.action,
 			symbol: '',
 			timeframe: '',
 			dateStart: values.dateStart ?? null,
@@ -170,28 +197,6 @@ export class JobRunner {
 			positionSize: values.positionSize ?? 100,
 			params,
 		};
-
-		// CODEX-011: Mode-specific config
-		if (action === 'optimize') {
-			config.optimization = {
-				parameters: values.optimizationParams ?? [],
-				objective: values.objective ?? 'sharpe_ratio',
-				method: values.optimizationMethod ?? 'grid',
-			};
-		} else if (action === 'montecarlo') {
-			config.montecarlo = {
-				simulations: values.simulations ?? 1000,
-				confidence_levels: values.confidenceLevels ?? [0.95, 0.99],
-			};
-		} else if (action === 'wfa') {
-			config.wfa = {
-				in_sample_ratio: values.inSampleRatio ?? 0.7,
-				windows: values.wfaWindows ?? 5,
-				anchored: values.wfaAnchored ?? false,
-			};
-		}
-
-		return config;
 	}
 
 	private processStderrLines(): void {
@@ -208,7 +213,7 @@ export class JobRunner {
 				const msg = JSON.parse(line);
 				this.handleStderrMessage(msg);
 			} catch {
-				// Non-JSON stderr output — emit as a log line
+				// Non-JSON stderr output: emit as a log line
 				this.emitLog('info', line);
 			}
 		}
