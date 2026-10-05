@@ -7,7 +7,6 @@ import { Codicon } from '../../../../../../base/common/codicons.js';
 import { KeyChord, KeyCode, KeyMod } from '../../../../../../base/common/keyCodes.js';
 import { localize, localize2 } from '../../../../../../nls.js';
 import { MenuId, MenuRegistry, registerAction2 } from '../../../../../../platform/actions/common/actions.js';
-import { ICommandService } from '../../../../../../platform/commands/common/commands.js';
 import { IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
 import { ContextKeyExpr } from '../../../../../../platform/contextkey/common/contextkey.js';
 import { InputFocusedContextKey } from '../../../../../../platform/contextkey/common/contextkeys.js';
@@ -34,7 +33,6 @@ interface IInsertCellWithChatArgs extends INotebookActionContext {
 
 async function startChat(accessor: ServicesAccessor, context: INotebookActionContext, index: number, input?: string, autoSend?: boolean, source?: string) {
 	const configurationService = accessor.get(IConfigurationService);
-	const commandService = accessor.get(ICommandService);
 
 	if (configurationService.getValue<boolean>(NotebookSetting.cellGenerate) || configurationService.getValue<boolean>(NotebookSetting.cellChat)) {
 		const activeCell = context.notebookEditor.getActiveCell();
@@ -46,7 +44,6 @@ async function startChat(accessor: ServicesAccessor, context: INotebookActionCon
 			const codeEditor = context.notebookEditor.codeEditors.find(ce => ce[0] === targetCell)?.[1];
 			if (codeEditor) {
 				codeEditor.focus();
-				commandService.executeCommand('inlineChat.start');
 			}
 		}
 	}

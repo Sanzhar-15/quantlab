@@ -97,7 +97,6 @@ suite('design tokens (tokens.css contract)', () => {
 
 suite('design tokens (webview css accent chain)', () => {
 	for (const cssFile of [
-		'webview/trade/trade.css',
 		'webview/action/action.css',
 		'webview/stats/stats.css',
 		'webview/visualise/visualise.css',

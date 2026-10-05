@@ -59,6 +59,7 @@ import './services/encryption/electron-browser/encryptionService.js';
 import './services/imageResize/electron-browser/imageResizeService.js';
 import './services/browserElements/electron-browser/browserElementsService.js';
 import './services/secrets/electron-browser/secretStorageService.js';
+import './services/quantlabHostIdentity/electron-browser/quantlabHostIdentityService.js';
 import './services/localization/electron-browser/languagePackService.js';
 import './services/telemetry/electron-browser/telemetryService.js';
 import './services/extensions/electron-browser/extensionHostStarter.js';
@@ -80,7 +81,6 @@ import './services/tunnel/electron-browser/tunnelService.js';
 import '../platform/diagnostics/electron-browser/diagnosticsService.js';
 import '../platform/profiling/electron-browser/profilingService.js';
 import '../platform/telemetry/electron-browser/customEndpointTelemetryService.js';
-import '../platform/remoteTunnel/electron-browser/remoteTunnelService.js';
 import './services/files/electron-browser/elevatedFileService.js';
 import './services/search/electron-browser/searchService.js';
 import './services/workingCopy/electron-browser/workingCopyHistoryService.js';
@@ -135,10 +135,8 @@ import './contrib/remote/electron-browser/remote.contribution.js';
 import './contrib/terminal/electron-browser/terminal.contribution.js';
 
 // Themes
-import './contrib/themes/browser/themes.test.contribution.js';
 import './services/themes/electron-browser/themes.contribution.js';
 // User Data Sync
-import './contrib/userDataSync/electron-browser/userDataSync.contribution.js';
 
 // Tags
 import './contrib/tags/electron-browser/workspaceTagsService.js';
@@ -168,7 +166,6 @@ import './contrib/mergeEditor/electron-browser/mergeEditor.contribution.js';
 import './contrib/multiDiffEditor/browser/multiDiffEditor.contribution.js';
 
 // Remote Tunnel
-import './contrib/remoteTunnel/electron-browser/remoteTunnel.contribution.js';
 
 // Chat
 import './contrib/chat/electron-browser/chat.contribution.js';
@@ -177,7 +174,6 @@ import './contrib/inlineChat/electron-browser/inlineChat.contribution.js';
 import './contrib/encryption/electron-browser/encryption.contribution.js';
 
 // Emergency Alert
-import './contrib/emergencyAlert/electron-browser/emergencyAlert.contribution.js';
 
 // MCP
 import './contrib/mcp/electron-browser/mcp.contribution.js';

@@ -24,6 +24,7 @@ import { buildReactiveKernelEnv, resolveQuantlabPython, verifyPythonModules, ver
 import { TrustManager } from '../../core/trust/TrustManager';
 import { CellGridPanel } from '../cellGrid/cellGridPanel';
 import { resolveCommandTargetPanel } from '../cellGrid/cellGridLogic';
+import { registerKernelCommands, resolveConfiguredKernel } from '../kernel/kernelCommands';
 import type { CellRangeJson, SessionInstance } from '../types';
 import { ReactiveKernelClient } from './reactiveKernelClient';
 import { ReactiveKernelManager } from './reactiveKernelManager';
@@ -159,6 +160,15 @@ function makeClientFactory(
 		'reactive_kernel_supervisor.py',
 	).fsPath;
 	return (session: SessionInstance): ReactiveKernelClient => {
+		// QL-KERNEL: the chosen kernel decides the launch. An invalid or unavailable stored choice throws by
+		// name here; only the local kernel has a launch path (this one, on the user's interpreter).
+		const kernel = resolveConfiguredKernel();
+		output.appendLine(kernel.chosen
+			? `kernel: ${kernel.kind} (quantlab.quantbook.kernel)`
+			: `kernel: ${kernel.kind} (no kernel chosen: quantlab.quantbook.kernel is 'default', and ${kernel.kind} is the default option)`);
+		if (kernel.kind !== 'local') {
+			throw new Error(`[kernel_cloud_no_transport] the ${kernel.kind} kernel was chosen but this build has no transport for it; choose the local kernel`);
+		}
 		const quantlabConfig = vscode.workspace.getConfiguration('quantlab');
 		const pythonExtConfig = vscode.workspace.getConfiguration('python');
 		const resolved = resolveQuantlabPython({
@@ -232,6 +242,9 @@ export function registerReactiveKernelCommands(
 ): ReactiveKernelManager<SessionInstance> {
 	const output = vscode.window.createOutputChannel('Quantbook Reactive Kernel');
 	context.subscriptions.push(output);
+
+	// QL-KERNEL: the kernel picker lives with the kernel commands, inside the same Quantbook guard.
+	registerKernelCommands(context);
 
 	// HIGH (Codex fold): the trust subsystem must have INITIALIZED for the gate to be meaningful (a
 	// partial/failed TrustManager.initialize could otherwise leave a map the gate would trust). Refuse

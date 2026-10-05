@@ -144,6 +144,7 @@ function bundleESMTask(opts: IBundleESMTaskOpts): NodeJS.ReadWriteStream {
 				format: 'esm',
 				sourcemap: 'external',
 				plugins: [contentsMapper, externalOverride],
+				define: { 'globalThis.QL_TEST_BUILD': JSON.stringify(process.env.QL_TEST_BUILD === '1') },
 				target: [target],
 				loader: {
 					'.ttf': 'file',

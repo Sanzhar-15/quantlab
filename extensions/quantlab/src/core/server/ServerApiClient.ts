@@ -48,47 +48,15 @@ const DEFAULT_CONFIG = {
 	wsUrl: process.env.QUANTLAB_WS_URL ?? 'wss://api.deltaplus.io/v1/ws'
 };
 
-/**
- * Get demo credentials from environment variables.
- * SECURITY: Credentials must be provided via environment variables - no defaults.
- * Set QUANTLAB_DEMO_EMAIL and QUANTLAB_DEMO_PASSWORD before using demo mode.
- */
-function getDemoCredentials(): { email: string; password: string } {
-	// No defaults: both variables must be set and non-empty, otherwise fail loudly
-	const email = process.env.QUANTLAB_DEMO_EMAIL;
-	if (email === undefined || email === '') {
-		throw new Error('QUANTLAB_DEMO_EMAIL is unset: export it before using demo mode');
-	}
-	const password = process.env.QUANTLAB_DEMO_PASSWORD;
-	if (password === undefined || password === '') {
-		throw new Error('QUANTLAB_DEMO_PASSWORD is unset: export it before using demo mode');
-	}
-
-	// Basic validation
-	if (!email.includes('@') || email.length < 5) {
-		throw new Error('Invalid demo email format');
-	}
-
-	if (password.length < 6) {
-		throw new Error('Demo password must be at least 6 characters');
-	}
-
-	return { email, password };
-}
-
 // Types matching server API
 export interface ServerUser {
 	id: string;
 	email: string;
-	name: string;
-	tier: string;
-}
-
-export interface AuthResponse {
-	access_token: string;
-	refresh_token: string;
-	expires_in: number;
-	user: ServerUser;
+	// The host identity's name is optional (contract: string | undefined).
+	name?: string;
+	// AUTH-TIER: the tier is real on the backend but the host identity does not carry it yet; the
+	// carry AUTH-TIER supplies the value. Until then it is absent and every display renders no tier.
+	tier?: string;
 }
 
 // Live /v1/symbols shape (verified 2026-06-11). The server has NO sector and
@@ -408,8 +376,6 @@ export class ServerApiClient {
 	private static instance: ServerApiClient | undefined;
 
 	private accessToken: string | undefined;
-	private refreshToken: string | undefined;
-	private tokenExpiresAt: number = 0;
 	private user: ServerUser | undefined;
 
 	private ws: WebSocketType | null = null;
@@ -420,17 +386,13 @@ export class ServerApiClient {
 	private wsConnecting: boolean = false;
 	private wsConnectionPromise: Promise<void> | null = null;
 	private subscribedSymbols: Set<string> = new Set();
-	private refreshPromise: Promise<void> | null = null;
 
-	// Auth-ready gate: resolves when tokens are first loaded (either from SecretStorage or fresh login).
-	// ensureAuthenticated() awaits this during the startup window to avoid throwing before tokens load.
+	// Auth-ready gate: resolves when the host identity is first applied (setHostIdentity).
+	// ensureAuthenticated() awaits this during the startup window to avoid throwing before it is known.
 	private authReadyResolve: (() => void) | null = null;
-	// Not readonly so clearTokens() can reset it after sign-out without Object.assign hacks.
-	private authReadyPromise: Promise<void> = new Promise<void>(resolve => {
+	private readonly authReadyPromise: Promise<void> = new Promise<void>(resolve => {
 		this.authReadyResolve = resolve;
 	});
-	// Subscription to external token changes (e.g. DeltaPlusAdapter writes after its own refresh).
-	private _secretStorageDisposable: vscode.Disposable | undefined;
 	// Set to true once initializeServerConnection() has finished (success or failure).
 	// After this point, a missing token means the user is genuinely not signed in.
 	private authFlowComplete: boolean = false;
@@ -458,7 +420,7 @@ export class ServerApiClient {
 	private readonly _onJobComplete = new vscode.EventEmitter<{ jobId: string }>();
 	readonly onJobComplete = this._onJobComplete.event;
 
-	private secretStorage: vscode.SecretStorage | undefined;
+	// No token store lives here: the signed-in user is pushed in by setHostIdentity().
 
 	private config = { ...DEFAULT_CONFIG };
 	private disposed: boolean = false;
@@ -511,19 +473,11 @@ export class ServerApiClient {
 		this.errorHandlers.clear();
 
 		// Clear connection state
-		this.refreshPromise = null;
 		this.wsConnectionPromise = null;
 		this.wsConnecting = false;
 
 		// Clear authentication state
-		this.accessToken = undefined;
-		this.refreshToken = undefined;
-		this.tokenExpiresAt = 0;
 		this.user = undefined;
-
-		// Clean up SecretStorage subscription
-		this._secretStorageDisposable?.dispose();
-		this._secretStorageDisposable = undefined;
 	}
 
 	/**
@@ -546,75 +500,35 @@ export class ServerApiClient {
 	}
 
 	/**
-	 * Set SecretStorage for persisting tokens to workbench SecretStorage.
-	 * This bridges the extension's auth tokens to QIC's DeltaPlusAdapter.
+	 * Apply the host identity (QL-LOGIN): called by DeltaPlusAuthProvider after it pulls the sign-in
+	 * state from the host. The client holds the user's display fields only -- no token, no refresh
+	 * token, no expiry. Fires onAuthStateChange only when the signed-in state or the user's fields
+	 * changed, so consumers that re-fetch on every fire do not re-fetch on every identity pull.
 	 */
-	setSecretStorage(storage: vscode.SecretStorage): void {
-		this.secretStorage = storage;
+	setHostIdentity(user: ServerUser | undefined): void {
+		const previous = this.user;
+		this.user = user;
 
-		// FIX: Dual-refresh race guard.
-		// DeltaPlusAdapter (in the workbench) refreshes tokens at T-5min using a proactive
-		// threshold. With rotating refresh tokens, it invalidates the old refresh token before
-		// ServerApiClient's T-60s refresh fires. Subscribing here means we pick up any token
-		// written by the adapter and stay in sync, preventing the stale-refresh 401.
-		this._secretStorageDisposable?.dispose();
-		this._secretStorageDisposable = storage.onDidChange(async e => {
-			if (e.key !== 'qic.deltaplusAccessToken') { return; }
-			if (!this.refreshToken) { return; } // not initialized yet -- ignore
-			const newAccess = await storage.get('qic.deltaplusAccessToken');
-			if (!newAccess || newAccess === this.accessToken) { return; } // no change
-			const newRefresh = await storage.get('qic.deltaplusRefreshToken');
-			const expiryStr = await storage.get('qic.deltaplusTokenExpiresAt');
-			this.accessToken = newAccess;
-			if (newRefresh) { this.refreshToken = newRefresh; }
-			if (expiryStr) { this.tokenExpiresAt = parseInt(expiryStr, 10); }
-			this.log('Tokens updated from external refresh (DeltaPlusAdapter)');
-		});
-	}
-
-	/**
-	 * Persist current tokens to SecretStorage so the DeltaPlusAdapter can read them.
-	 */
-	private async persistTokens(): Promise<void> {
-		if (!this.secretStorage || !this.accessToken) { return; }
-		try {
-			await this.secretStorage.store('qic.deltaplusAccessToken', this.accessToken);
-			if (this.refreshToken) {
-				await this.secretStorage.store('qic.deltaplusRefreshToken', this.refreshToken);
-			}
-			await this.secretStorage.store('qic.deltaplusTokenExpiresAt', String(this.tokenExpiresAt));
-		} catch (err) {
-			// System boundary (OS keychain). Do not swallow: a failed persist means the
-			// session will NOT survive a restart -- say so where the operator can see it.
-			this.log(`Token persistence to SecretStorage FAILED -- sign-in will not survive a restart: ${err instanceof Error ? err.message : String(err)}`);
+		// Resolve the startup gate so all pending ensureAuthenticated() calls proceed.
+		if (this.authReadyResolve) {
+			this.authReadyResolve();
+			this.authReadyResolve = null;
 		}
-	}
 
-	// Authentication
+		const changed = previous?.id !== user?.id
+			|| previous?.email !== user?.email
+			|| previous?.name !== user?.name
+			|| previous?.tier !== user?.tier;
+		if (!changed) { return; }
 
-	/** Sign in with explicit credentials. Both params are required -- no demo fallback. */
-	async login(email: string, password: string): Promise<AuthResponse> {
-		const response = await this.request<AuthResponse>('POST', '/v1/auth/login', { email, password });
-		this.accessToken = response.access_token;
-		this.refreshToken = response.refresh_token;
-		this.tokenExpiresAt = Date.now() + (response.expires_in * 1000);
-		this.user = response.user;
-		this._onAuthStateChange.fire(true);
-		void this.persistTokens();
-		return response;
-	}
-
-	async loginWithDemo(): Promise<AuthResponse> {
-		const creds = getDemoCredentials();
-		return this.login(creds.email, creds.password);
-	}
-
-	/**
-	 * Register a new user account. Does not set any auth state -- the caller
-	 * must subsequently call login() to obtain tokens.
-	 */
-	async register(email: string, password: string, name: string): Promise<{ message: string }> {
-		return this.requestOnce<{ message: string }>('POST', '/v1/auth/register', { email, password, name });
+		if (user) {
+			if (!previous) {
+				this.log('Signed in via the host identity: server data calls carry no bearer until QL-DATA');
+			}
+		} else {
+			this.disconnectWebSocket();
+		}
+		this._onAuthStateChange.fire(!!user);
 	}
 
 	/**
@@ -652,129 +566,12 @@ export class ServerApiClient {
 		};
 	}
 
-	async refreshAccessToken(): Promise<void> {
-		if (!this.refreshToken) {
-			throw new Error('No refresh token available');
-		}
-
-		try {
-			const response = await this.requestOnce<AuthResponse>('POST', '/v1/auth/refresh', {
-				refresh_token: this.refreshToken
-			});
-			this.accessToken = response.access_token;
-			this.refreshToken = response.refresh_token;
-			this.tokenExpiresAt = Date.now() + (response.expires_in * 1000);
-			this.user = response.user ?? this.user;
-			this._onAuthStateChange.fire(true); // signal refreshed tokens to provider
-			void this.persistTokens();
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			if (msg.includes('401') || msg.includes('Unauthorized') || msg.includes('invalid token') || msg.includes('token has expired')) {
-				// Refresh token is expired -- session is dead. Clear state and notify.
-				this.log('Refresh token expired -- clearing session');
-				this.accessToken = undefined;
-				this.refreshToken = undefined;
-				this.tokenExpiresAt = 0;
-				this.user = undefined;
-				this._onAuthStateChange.fire(false);
-				this.disconnectWebSocket();
-			}
-			throw err;
-		}
-	}
-
-	logout(): void {
-		this.accessToken = undefined;
-		this.refreshToken = undefined;
-		this.tokenExpiresAt = 0;
-		this.user = undefined;
-		this.disconnectWebSocket();
-		this._onAuthStateChange.fire(false);
-	}
-
-	/**
-	 * Revoke a specific refresh token on the server (best-effort; ignores errors).
-	 * Called by DeltaPlusAuthProvider.removeSession() before clearing local state.
-	 */
-	async logoutSession(refreshToken: string): Promise<void> {
-		try {
-			await this.requestOnce<void>('POST', '/v1/auth/logout', { refresh_token: refreshToken });
-		} catch {
-			// Best-effort -- local session is cleared regardless.
-		}
-	}
-
-	/**
-	 * Fetch the user profile for a specific access token.
-	 * Used during session migration to validate a legacy token.
-	 */
-	async fetchCurrentUser(accessToken: string): Promise<ServerUser> {
-		// Temporarily override accessToken so requestOnce() sends the correct Bearer header.
-		// Node.js is single-threaded: requestOnce() captures the header synchronously before
-		// any await, so this swap is safe.
-		const prev = this.accessToken;
-		this.accessToken = accessToken;
-		try {
-			return await this.requestOnce<ServerUser>('GET', '/v1/auth/me');
-		} finally {
-			this.accessToken = prev;
-		}
-	}
-
-	/**
-	 * Refresh tokens using a specific refresh token (not the cached one).
-	 * Used during session migration. Does NOT update in-memory auth state.
-	 */
-	async refreshWithToken(refreshToken: string): Promise<AuthResponse> {
-		return this.requestOnce<AuthResponse>('POST', '/v1/auth/refresh', { refresh_token: refreshToken });
-	}
-
 	isAuthenticated(): boolean {
-		return !!this.accessToken && Date.now() < this.tokenExpiresAt;
+		return this.user !== undefined;
 	}
 
 	getUser(): ServerUser | undefined {
 		return this.user;
-	}
-
-	// Token accessors -- used by DeltaPlusAuthProvider to sync refreshed tokens back to SecretStorage.
-	getAccessToken(): string | undefined { return this.accessToken; }
-	getRefreshToken(): string | undefined { return this.refreshToken; }
-	getTokenExpiresAt(): number { return this.tokenExpiresAt; }
-
-	/**
-	 * Called by DeltaPlusAuthProvider when a session is loaded or created.
-	 * Resolves the auth-ready gate so all pending ensureAuthenticated() calls proceed.
-	 */
-	setSessionTokens(access: string, refresh: string, expiresAt: number, user: ServerUser): void {
-		this.accessToken = access;
-		this.refreshToken = refresh;
-		this.tokenExpiresAt = expiresAt;
-		this.user = user;
-		this._onAuthStateChange.fire(true);
-		void this.persistTokens();
-		// Resolve the startup gate so all pending API calls can proceed.
-		if (this.authReadyResolve) {
-			this.authReadyResolve();
-			this.authReadyResolve = null;
-		}
-	}
-
-	/**
-	 * Called by DeltaPlusAuthProvider on sign-out. Clears all in-memory tokens
-	 * and fires onAuthStateChange so listeners can react (e.g. disconnect WebSocket).
-	 */
-	clearTokens(): void {
-		this.accessToken = undefined;
-		this.refreshToken = undefined;
-		this.tokenExpiresAt = 0;
-		this.user = undefined;
-		// Reset the gate for next sign-in.
-		if (!this.authReadyResolve) {
-			this.authReadyPromise = new Promise<void>(resolve => { this.authReadyResolve = resolve; });
-		}
-		this.disconnectWebSocket();
-		this._onAuthStateChange.fire(false);
 	}
 
 	/** Called by extension.ts after initializeServerConnection() completes. */
@@ -789,29 +586,21 @@ export class ServerApiClient {
 	}
 
 	private async ensureAuthenticated(): Promise<void> {
-		if (!this.accessToken) {
+		if (!this.user) {
 			if (!this.authFlowComplete) {
-				// Startup still in progress -- wait up to 5 s for setSessionTokens() to be called.
+				// Startup still in progress -- wait up to 5 s for setHostIdentity() to be called.
 				await Promise.race([
 					this.authReadyPromise,
 					new Promise<void>(r => setTimeout(r, 5000))
 				]);
 			}
-			if (!this.accessToken) {
-				throw new Error('Not signed in. Sign in via the account menu to load live data.');
+			if (!this.user) {
+				throw new Error('Not signed in. Sign in in the terminal view.');
 			}
 		}
-
-		// Refresh token if it expires within 60 seconds
-		if (Date.now() > this.tokenExpiresAt - 60000) {
-			// Mutex: reuse in-flight refresh to prevent parallel token refreshes
-			if (!this.refreshPromise) {
-				this.refreshPromise = this.refreshAccessToken().finally(() => {
-					this.refreshPromise = null;
-				});
-			}
-			await this.refreshPromise;
-		}
+		// Signed in at the host. The extension holds no token (QL-LOGIN), so there is nothing to
+		// refresh here: the request goes out without a bearer and the server's answer is the
+		// visible result until QL-DATA routes data calls through the host.
 	}
 
 	// REST API - Crypto

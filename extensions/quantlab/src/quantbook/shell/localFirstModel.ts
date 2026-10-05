@@ -17,19 +17,31 @@
 //     Delta Plus cloud services (sign-in, market data, news, watchlists, resources, and server-side tools
 //     that can upload the file they operate on), and configured broker integrations (e.g. Alpaca).
 //
-// The data categories come from the engine's real consent policy ({@link ConsentCategory} /
-// {@link BlockedCategory} in `src/ai/types.ts`) via exhaustive `Record`s, so a category added to either
-// union breaks the build here until the copy is updated. PURE + vscode-free (the
-// {@link registerLocalFirstStatus} shell renders these strings), so the statement is unit-tested headlessly.
+// The data categories are the {@link ConsentCategory} / {@link BlockedCategory} unions below, labelled via
+// exhaustive `Record`s, so a category added to either union breaks the build here until the copy is
+// updated. PURE + vscode-free (the {@link registerLocalFirstStatus} shell renders these strings), so the
+// statement is unit-tested headlessly.
 
-import type { BlockedCategory, ConsentCategory } from '../../ai/types';
+/** Data categories the AI path may send after consent. */
+export type ConsentCategory =
+	| 'strategy_code'
+	| 'error_messages'
+	| 'data_samples'
+	| 'performance_metrics';
+
+/** Sensitive data categories that should never be sent. */
+export type BlockedCategory =
+	| 'broker_credentials'
+	| 'trading_history'
+	| 'personal_data'
+	| 'api_keys';
 
 /** Short headline shown as the modal's title (the {@link buildLocalFirstDetail} body is the detail). */
 export const LOCAL_FIRST_HEADLINE = 'Quantbook is local-first';
 
 /**
  * Human labels for each data category the AI path MAY send after you consent. An exhaustive
- * `Record<ConsentCategory, string>`: if `src/ai/types.ts` adds a `ConsentCategory`, this object fails to
+ * `Record<ConsentCategory, string>`: if a `ConsentCategory` is added, this object fails to
  * type-check until the new category is labelled here -- the statement can never under-state what is sent.
  */
 const CONSENT_LABELS: Record<ConsentCategory, string> = {

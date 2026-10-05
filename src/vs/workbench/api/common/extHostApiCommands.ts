@@ -9,7 +9,6 @@ import { Schemas, matchesSomeScheme } from '../../../base/common/network.js';
 import { URI } from '../../../base/common/uri.js';
 import { IPosition } from '../../../editor/common/core/position.js';
 import { IRange } from '../../../editor/common/core/range.js';
-import { ISelection } from '../../../editor/common/core/selection.js';
 import * as languages from '../../../editor/common/languages.js';
 import { decodeSemanticTokensDto } from '../../../editor/common/services/semanticTokensDto.js';
 import { validateWhenClauses } from '../../../platform/contextkey/common/contextkey.js';
@@ -535,47 +534,8 @@ const newCommands: ApiCommand[] = [
 		ApiCommandResult.Void
 	),
 	// --- inline chat
-	new ApiCommand(
-		'vscode.editorChat.start', 'inlineChat.start', 'Invoke a new editor chat session',
-		[new ApiCommandArgument<InlineChatEditorApiArg | undefined, InlineChatRunOptions | undefined>('Run arguments', '', _v => true, v => {
-
-			if (!v) {
-				return undefined;
-			}
-
-			return {
-				initialRange: v.initialRange ? typeConverters.Range.from(v.initialRange) : undefined,
-				initialSelection: types.Selection.isSelection(v.initialSelection) ? typeConverters.Selection.from(v.initialSelection) : undefined,
-				message: v.message,
-				attachments: v.attachments,
-				autoSend: v.autoSend,
-				position: v.position ? typeConverters.Position.from(v.position) : undefined,
-				blockOnResponse: v.blockOnResponse
-			};
-		})],
-		ApiCommandResult.Void
-	)
 ];
 
-type InlineChatEditorApiArg = {
-	initialRange?: vscode.Range;
-	initialSelection?: vscode.Selection;
-	message?: string;
-	attachments?: vscode.Uri[];
-	autoSend?: boolean;
-	position?: vscode.Position;
-	blockOnResponse?: boolean;
-};
-
-type InlineChatRunOptions = {
-	initialRange?: IRange;
-	initialSelection?: ISelection;
-	message?: string;
-	attachments?: URI[];
-	autoSend?: boolean;
-	position?: IPosition;
-	blockOnResponse?: boolean;
-};
 
 //#endregion
 

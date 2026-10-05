@@ -66,20 +66,6 @@ export type DataTier = 'private' | 'anonymous-metrics' | 'data-contributor';
 export const QIC_SECRET_KEYS = {
 	ANTHROPIC_API_KEY: 'qic.anthropicApiKey',
 	OPENAI_API_KEY: 'qic.openaiApiKey',
-	CLOUD_ACCESS_TOKEN: 'qic.cloudAccessToken',
-	CLOUD_REFRESH_TOKEN: 'qic.cloudRefreshToken',
-	CLOUD_TOKEN_EXPIRES_AT: 'qic.cloudTokenExpiresAt',
-	DELTAPLUS_ACCESS_TOKEN: 'qic.deltaplusAccessToken',
-	DELTAPLUS_REFRESH_TOKEN: 'qic.deltaplusRefreshToken',
-	DELTAPLUS_TOKEN_EXPIRES_AT: 'qic.deltaplusTokenExpiresAt',
-} as const;
-
-// OAuth2 auth constants for Quantlab Cloud
-export const QIC_AUTH = {
-	CLIENT_ID: 'qic-vscode',
-	REDIRECT_URI: 'vscode://quantlab.qic/auth/callback',
-	SCOPES: ['openid', 'profile', 'email', 'offline_access'],
-	AUDIENCE: 'https://api.quantlab.dev',
 } as const;
 
 // Workspace storage subdirectories (AUDIT FIX VIII-PC5)

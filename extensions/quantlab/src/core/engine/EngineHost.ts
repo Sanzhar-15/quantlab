@@ -3,13 +3,11 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as fs from 'fs';
-import * as path from 'path';
 import * as vscode from 'vscode';
 import { EngineEvent, JobRequest } from '../../types/engine';
+import { EngineLaunch, selectEngine } from './bundledEngine';
 import { JobQueue } from './JobQueue';
 import { JobRunner } from './JobRunner';
-import { PythonBootstrap } from './PythonBootstrap';
 
 export class EngineHost {
 	private static instance: EngineHost | undefined;
@@ -37,13 +35,22 @@ export class EngineHost {
 			return;
 		}
 
-		const pythonPath = await this.resolvePythonPath();
-		const engineRoot = this.resolveEngineRoot();
+		// A launch that cannot be resolved fails the job visibly, naming why.
+		let engine: EngineLaunch;
+		try {
+			engine = this.resolveLaunch();
+		} catch (err: unknown) {
+			this._onDidEmit.fire({
+				type: 'failed',
+				jobId: request.jobId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return;
+		}
 
 		const runner = new JobRunner({
 			request,
-			pythonPath,
-			engineRoot,
+			engine,
 			onEvent: event => this._onDidEmit.fire(event),
 		});
 
@@ -68,82 +75,21 @@ export class EngineHost {
 		}
 	}
 
-	private async resolvePythonPath(): Promise<string> {
-		// CODEX-013: Check for bundled Python engine first
-		const bundledPath = this.resolveBundledPython();
-		if (bundledPath) {
-			return bundledPath;
+	/** The engine of {@link selectEngine}; `quantlab.pythonPath` counts only when the user set it. */
+	private resolveLaunch(): EngineLaunch {
+		// The contributed default is '': a non-empty value is one the user set.
+		const explicitPython = vscode.workspace.getConfiguration('quantlab').get<string>('pythonPath');
+		if (explicitPython === undefined) {
+			throw new Error('Quantlab: the setting quantlab.pythonPath is not contributed by this extension.');
 		}
-
-		// Check VS Code Python extension setting
-		const pythonConfig = vscode.workspace.getConfiguration('python');
-		const pythonPath = pythonConfig.get<string>('defaultInterpreterPath');
-		if (pythonPath && fs.existsSync(pythonPath)) {
-			return pythonPath;
-		}
-
-		// Check Quantlab setting
-		const quantlabConfig = vscode.workspace.getConfiguration('quantlab');
-		const customPython = quantlabConfig.get<string>('pythonPath');
-		if (customPython && fs.existsSync(customPython)) {
-			return customPython;
-		}
-
-		// Check managed venv Python (auto-installed dependencies)
-		const managedPython = PythonBootstrap.getManagedPythonPath();
-		if (managedPython && fs.existsSync(managedPython)) {
-			return managedPython;
-		}
-
-		// Default to system Python
-		return process.platform === 'win32' ? 'python' : 'python3';
+		return selectEngine({ extensionPath: this.extensionPath(), appRoot: vscode.env.appRoot, platform: process.platform, explicitPython });
 	}
 
-	/**
-	 * CODEX-013: Check for bundled Python engine executable.
-	 *
-	 * The bundled engine is a PyInstaller-built standalone that doesn't require
-	 * a system Python installation. It's checked in these locations:
-	 * 1. Alongside the extension (engine-dist/quantlab-engine/)
-	 * 2. Inside the extension resources (engine/quantlab-engine/)
-	 */
-	private resolveBundledPython(): string | null {
-		const extensionPath = EngineHost.extensionUri?.fsPath;
-		if (!extensionPath) {
-			return null;
+	private extensionPath(): string {
+		if (!EngineHost.extensionUri) {
+			throw new Error('Quantlab: the engine host was not initialized with the extension location (EngineHost.initialize).');
 		}
-
-		const exeName = process.platform === 'win32' ? 'quantlab-engine.exe' : 'quantlab-engine';
-
-		const candidatePaths = [
-			// Relative to extension root (development layout)
-			path.join(extensionPath, '..', '..', 'engine-dist', 'quantlab-engine', exeName),
-			// Inside extension resources (packaged layout)
-			path.join(extensionPath, 'engine', 'quantlab-engine', exeName),
-			// Build output directory
-			path.join(extensionPath, '..', '..', '.build', 'dist', 'quantlab-engine', exeName),
-		];
-
-		for (const candidate of candidatePaths) {
-			try {
-				if (fs.existsSync(candidate)) {
-					return candidate;
-				}
-			} catch {
-				// Permission or path error -- skip
-			}
-		}
-
-		return null;
-	}
-
-	private resolveEngineRoot(): string {
-		if (EngineHost.extensionUri) {
-			return path.resolve(EngineHost.extensionUri.fsPath, '..', '..', 'engine');
-		}
-		// Fallback: walk up from this file's compiled location
-		// extensions/quantlab/out/core/engine/ → extensions/quantlab/ → engine/
-		return path.resolve(__dirname, '..', '..', '..', '..', '..', 'engine');
+		return EngineHost.extensionUri.fsPath;
 	}
 
 	dispose(): void {

@@ -6,12 +6,9 @@
 import { Emitter } from '../../../../../base/common/event.js';
 import { Disposable, DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { equals } from '../../../../../base/common/objects.js';
-import { localize } from '../../../../../nls.js';
-import { registerAction2, Action2, MenuId } from '../../../../../platform/actions/common/actions.js';
-import { ContextKeyExpr } from '../../../../../platform/contextkey/common/contextkey.js';
-import { IStorageService, StorageScope, StorageTarget } from '../../../../../platform/storage/common/storage.js';
+import { MenuId } from '../../../../../platform/actions/common/actions.js';
+import { IStorageService, StorageScope } from '../../../../../platform/storage/common/storage.js';
 import { IChatSessionsService } from '../../common/chatSessionsService.js';
-import { AgentSessionProviders, getAgentSessionProviderName } from './agentSessions.js';
 import { AgentSessionStatus, IAgentSession } from './agentSessionsModel.js';
 import { IAgentSessionsFilter } from './agentSessionsViewer.js';
 
@@ -105,11 +102,6 @@ export class AgentSessionsFilter extends Disposable implements Required<IAgentSe
 		};
 	}
 
-	private storeExcludes(excludes: IAgentSessionsViewExcludes): void {
-		this.excludes = excludes;
-
-		this.storageService.store(this.STORAGE_KEY, JSON.stringify(this.excludes), StorageScope.PROFILE, StorageTarget.USER);
-	}
 
 	private updateFilterActions(): void {
 		this.actionDisposables.clear();
@@ -122,146 +114,18 @@ export class AgentSessionsFilter extends Disposable implements Required<IAgentSe
 	}
 
 	private registerProviderActions(disposables: DisposableStore): void {
-		const providers: { id: string; label: string }[] = [
-			{ id: AgentSessionProviders.Local, label: getAgentSessionProviderName(AgentSessionProviders.Local) },
-			{ id: AgentSessionProviders.Background, label: getAgentSessionProviderName(AgentSessionProviders.Background) },
-			{ id: AgentSessionProviders.Cloud, label: getAgentSessionProviderName(AgentSessionProviders.Cloud) },
-		];
-
-		for (const provider of this.chatSessionsService.getAllChatSessionContributions()) {
-			if (providers.find(p => p.id === provider.type)) {
-				continue; // already added
-			}
-
-			providers.push({ id: provider.type, label: provider.name });
-		}
-
-		const that = this;
-		let counter = 0;
-		for (const provider of providers) {
-			disposables.add(registerAction2(class extends Action2 {
-				constructor() {
-					super({
-						id: `agentSessions.filter.toggleExclude:${provider.id}.${that.options.filterMenuId.id.toLowerCase()}`,
-						title: provider.label,
-						menu: {
-							id: that.options.filterMenuId,
-							group: '1_providers',
-							order: counter++,
-						},
-						toggled: that.excludes.providers.includes(provider.id) ? ContextKeyExpr.false() : ContextKeyExpr.true(),
-					});
-				}
-				run(): void {
-					const providerExcludes = new Set(that.excludes.providers);
-					if (!providerExcludes.delete(provider.id)) {
-						providerExcludes.add(provider.id);
-					}
-
-					that.storeExcludes({ ...that.excludes, providers: Array.from(providerExcludes) });
-				}
-			}));
-		}
 	}
 
 	private registerStateActions(disposables: DisposableStore): void {
-		const states: { id: AgentSessionStatus; label: string }[] = [
-			{ id: AgentSessionStatus.Completed, label: localize('agentSessionStatus.completed', "Completed") },
-			{ id: AgentSessionStatus.InProgress, label: localize('agentSessionStatus.inProgress', "In Progress") },
-			{ id: AgentSessionStatus.NeedsInput, label: localize('agentSessionStatus.needsInput', "Input Needed") },
-			{ id: AgentSessionStatus.Failed, label: localize('agentSessionStatus.failed', "Failed") },
-		];
-
-		const that = this;
-		let counter = 0;
-		for (const state of states) {
-			disposables.add(registerAction2(class extends Action2 {
-				constructor() {
-					super({
-						id: `agentSessions.filter.toggleExcludeState:${state.id}.${that.options.filterMenuId.id.toLowerCase()}`,
-						title: state.label,
-						menu: {
-							id: that.options.filterMenuId,
-							group: '2_states',
-							order: counter++,
-						},
-						toggled: that.excludes.states.includes(state.id) ? ContextKeyExpr.false() : ContextKeyExpr.true(),
-					});
-				}
-				run(): void {
-					const stateExcludes = new Set(that.excludes.states);
-					if (!stateExcludes.delete(state.id)) {
-						stateExcludes.add(state.id);
-					}
-
-					that.storeExcludes({ ...that.excludes, states: Array.from(stateExcludes) });
-				}
-			}));
-		}
 	}
 
 	private registerArchivedActions(disposables: DisposableStore): void {
-		const that = this;
-		disposables.add(registerAction2(class extends Action2 {
-			constructor() {
-				super({
-					id: `agentSessions.filter.toggleExcludeArchived.${that.options.filterMenuId.id.toLowerCase()}`,
-					title: localize('agentSessions.filter.archived', 'Archived'),
-					menu: {
-						id: that.options.filterMenuId,
-						group: '3_props',
-						order: 1000,
-					},
-					toggled: that.excludes.archived ? ContextKeyExpr.false() : ContextKeyExpr.true(),
-				});
-			}
-			run(): void {
-				that.storeExcludes({ ...that.excludes, archived: !that.excludes.archived });
-			}
-		}));
 	}
 
 	private registerReadActions(disposables: DisposableStore): void {
-		const that = this;
-		disposables.add(registerAction2(class extends Action2 {
-			constructor() {
-				super({
-					id: `agentSessions.filter.toggleExcludeRead.${that.options.filterMenuId.id.toLowerCase()}`,
-					title: localize('agentSessions.filter.read', 'Read'),
-					menu: {
-						id: that.options.filterMenuId,
-						group: '3_props',
-						order: 0,
-					},
-					toggled: that.excludes.read ? ContextKeyExpr.false() : ContextKeyExpr.true(),
-				});
-			}
-			run(): void {
-				that.storeExcludes({ ...that.excludes, read: !that.excludes.read });
-			}
-		}));
 	}
 
 	private registerResetAction(disposables: DisposableStore): void {
-		const that = this;
-		disposables.add(registerAction2(class extends Action2 {
-			constructor() {
-				super({
-					id: `agentSessions.filter.resetExcludes.${that.options.filterMenuId.id.toLowerCase()}`,
-					title: localize('agentSessions.filter.reset', "Reset"),
-					menu: {
-						id: that.options.filterMenuId,
-						group: '4_reset',
-						order: 0,
-					},
-				});
-			}
-			run(): void {
-				that.resetExcludes();
-
-				that.storageService.store(that.STORAGE_KEY, JSON.stringify(that.excludes), StorageScope.PROFILE, StorageTarget.USER);
-			}
-		}));
 	}
 
 	isDefault(): boolean {

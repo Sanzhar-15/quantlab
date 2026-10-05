@@ -9,7 +9,6 @@ import { OnboardingManager } from './OnboardingManager';
 const VIEW_TIPS: Record<string, { title: string; message: string }> = {
 	chart: { title: 'Chart view', message: 'Drop runs or symbols to compare results quickly.' },
 	action: { title: 'Action view', message: 'Run backtests and export metrics from here.' },
-	trade: { title: 'Trade view', message: 'Complete the checklist before live trading.' },
 	editor: { title: 'Editor view', message: 'Edit strategy code and switch views from the header.' }
 };
 

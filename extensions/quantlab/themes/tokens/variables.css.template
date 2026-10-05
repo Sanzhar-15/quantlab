@@ -1,0 +1,588 @@
+/*
+ * Delta Plus Design Tokens
+ * Single source of truth for all design values
+ */
+
+:root {
+  /* ===================
+   * PRIMITIVE COLORS (Spec 1.0)
+   * =================== */
+
+  /* ── THE DEFAULT SURFACE FAMILY ────────────────────────────────────────────
+     RETUNED 2026-08-11 (`F-PALETTE-01`). Owner: *"the dark (warm) colour looks better
+     (it looks slick). But I want a not as dark version as default (but maybe darker or
+     more optimised version than today's default)."* So the default is now strictly
+     between the two palettes it used to sit outside: **warmer and darker than the old
+     default (#262322), still clearly lighter than Dark (Warm) (#0D0B0A)** — which keeps
+     a reason for Dark (Warm) to exist as a separate choice.
+
+     HOW THESE VALUES WERE DERIVED, because "pick a nicer hex" is what failed last time.
+     Each token below is Dark (Warm)'s CORRESPONDING token LIFTED in OKLab lightness by
+     t=0.40 of the distance to the old default, taking Dark (Warm)'s hue exactly and
+     scaling chroma with lightness so its *relative* colourfulness is preserved. One knob,
+     one axis: t=0 is Dark (Warm), t=1 is the old default's lightness in Dark (Warm)'s hue.
+     Moving the whole family is one regeneration, not thirteen judgement calls.
+
+     ⚠️ ONE TOKEN IS NOT DERIVED FROM ITS OWN COUNTERPART, and the recipe above will give
+     the wrong answer for it: `--sidebar-bg-*`. The two palettes disagree about which token
+     the rails mirror — the old default set them from `--color-inset` (29,26,25) while
+     `[data-palette="warm"]` sets them from `--color-bg` (13,11,10). This family follows the
+     DEFAULT's own idiom and derives them from `--color-inset`, giving #100F0D. Feeding the
+     recipe Dark (Warm)'s sidebar value instead yields #131110, which is NOT what is
+     committed. Stated here because a reader regenerating from the recipe would otherwise
+     silently change the rails. The underlying inconsistency predates this fold and is
+     flagged for its own fold, not resolved here.
+
+     CHOSEN BY LOOKING, not by argument. Four candidates (t = 0.70 / 0.55 / 0.40 / 0.25)
+     were rendered on the real page against both designs and compared side by side, with
+     each candidate applied on a FRESH LOAD — measured 2026-08-11, the Canvas2d chart
+     themes resolve at mount and do NOT react to a live palette switch, so an override
+     injected after mount paints honest CSS over a stale chart and would have made the
+     comparison a lie. On a fresh load every canvas tracks `--color-surface` exactly.
+
+     R−B rises across the ladder from the old default's 6,5,4,4,2 to 11,8,4,3,2 — the same
+     shape as Dark (Warm)'s own 10,6,3,2,1 rather than the old flat neutral one. That IS
+     the warmth. Note the range is 2–11, NOT 4–11: the two darkest steps sit at 3 and 2,
+     because at those lightnesses 8-bit quantisation has almost no room left to carry hue.
+     The per-token annotations below are updated rather than left stating a property this
+     family no longer has.
+
+     EVERY INK RATIO RISES; NONE FALL. Against the page: body/`--bar-ink-primary`
+     13.34 → 15.67, secondary 6.58 → 7.73, muted 4.13 → 4.85, brand 5.76 → 6.76,
+     focus 14.33 → 16.83. The shell pane's own surface needs no edit at all — it is
+     `rgba(255,255,255,0.06)`, a lift off whatever the page is, which is precisely why
+     it was built that way. ────────────────────────────────────────────────────────── */
+
+  /* Gray Scale — warm charcoal (R-B=2-11, cool text grays B>R) */
+  --color-gray-50:  #F5F5F7;  /* cool tint — text crispness */
+  --color-gray-100: #EDEDEF;
+  --color-gray-200: #d4d4d8;
+  --color-gray-300: #b4b4b8;
+  --color-gray-400: #A8A8AC;
+  /* STEP 11(c): two AA-derived muted steps. Added, never repointed — every existing consumer of
+   * gray-400/500/600 keeps the value it had. Each is the LIGHTEST/darkest value that still clears
+   * 4.5:1 against the worst surface of the theme that uses it, so the muted role stays visually
+   * muted rather than being lifted further than the requirement. */
+  --color-gray-450: #9A9A9D;  /* dark muted — 4.53:1 on --color-surface-hover #353230 (worst dark) */
+  --color-gray-500: #838386;  /* R-B=-3 — --color-muted */
+  --color-gray-550: #5C5C60;  /* light muted — 4.50:1 on --bg-active #d4d4d8 (worst light) */
+  --color-gray-600: #565453;  /* R-B=3 — transition zone cool→warm */
+  --color-gray-700: #342E29;  /* R-B=11 — --color-border */
+  --color-gray-800: #24201C;  /* R-B=8 — --color-surface */
+  --color-gray-900: #171413;  /* R-B=4 — --color-bg */
+  --color-gray-925: #100F0D;  /* R-B=3 — --color-inset */
+  --color-gray-950: #090707;  /* R-B=2 — --color-overlay base */
+
+  /* ===================
+   * DESIGN TOKENS (24 Total)
+   * =================== */
+
+  /* Surfaces — warm charcoal (R-B=2-9). See the derivation block above.
+     The bg→surface step is deliberately LARGER than the old default's (23→36 in
+     luminance terms, against 38→46): that separation is most of what reads as
+     "slick" in Dark (Warm), and it is the reason a widget card now sits off the
+     page instead of merging with it. */
+  --color-bg: #171413;
+  --color-surface: #24201C;
+  --color-surface-hover: #2B2522;
+  --color-inset: #100F0D;
+  --color-overlay: #090707;
+
+  /* Text Hierarchy (Rule 4: Cool Tint B-R=1-4) */
+  --color-heading: #F5F5F7;
+  --color-body: #EDEDEF;
+  --color-secondary: #A8A8AC;
+  --color-muted: #838386;
+  --color-placeholder: #7A7A7D;
+  --color-disabled-text: #6B6968;
+
+  /* Interactive */
+  --color-brand: #FF7331;
+  --color-brand-hover: #FF8855;
+  --color-brand-active: #E5672C;
+  --color-on-brand: #1A0A00;
+  --color-link: #FF8C55;
+  --color-link-hover: #FFA377;
+  --color-focus-ring: #F5F5F7;
+
+  /* Semantic */
+  --color-error: #FF6B6B;
+  --color-success: #44BF6E;
+  --color-warning: #F5A623;
+
+  /* Structural */
+  --color-border: #342E29;
+  --color-disabled-bg: #231F1D;
+  --color-selection: #603722;
+
+  /* ===================
+   * BACKWARD COMPATIBILITY
+   * =================== */
+
+  /* Background */
+  --bg-primary: var(--color-bg);
+  --bg-secondary: var(--color-surface);
+  --bg-tertiary: var(--color-surface);
+  --bg-card: var(--color-surface);
+  --bg-hover: var(--color-surface-hover);
+  --bg-active: var(--color-surface-hover);
+  --bg-elevated: var(--color-surface-hover);
+  --bg-input: var(--color-inset);
+  --bg-panel: var(--color-bg);
+
+  /* Text */
+  --text-primary: var(--color-body);
+  --text-secondary: var(--color-secondary);
+  /* STEP 11(c): was var(--color-muted) #838386, which fails AA on three of the four dark surfaces
+   * (4.13 / 3.72 / 3.37 : 1 on --color-bg / --color-surface / --color-surface-hover). The palette
+   * primitive --color-muted is UNCHANGED — it is exposed to Tailwind as `color-muted` and has
+   * consumers outside this theme; only the semantic role moves. */
+  --text-muted: var(--color-gray-450);
+
+  /* Borders */
+  --border-subtle: var(--color-border);
+  --border-medium: rgba(255, 255, 255, 0.12);
+  --border-focus: var(--color-focus-ring);
+
+  /* Accent (mapped to brand orange spec) */
+  --accent-primary-rgb: 255, 115, 49;
+  --accent-primary-hover-rgb: 255, 136, 85;
+  --accent-primary-active-rgb: 229, 103, 44;
+  --accent-success-rgb: 68, 191, 110;
+  --accent-warning-rgb: 245, 166, 35;
+  --accent-danger-rgb: 255, 107, 107;
+
+  --accent-primary: var(--color-brand);
+  --accent-primary-hover: var(--color-brand-hover);
+  --accent-primary-active: var(--color-brand-active);
+  --accent-success: var(--color-success);
+  --accent-warning: var(--color-warning);
+  --accent-danger: var(--color-error);
+  --accent-ai: #a855f7;
+  --accent-ai-rgb: 168, 85, 247;
+  --accent-primary-subtle: rgba(var(--accent-primary-rgb), 0.1);
+  --accent-primary-muted: rgba(var(--accent-primary-rgb), 0.6);
+
+  /* Semantic text colors for positive/negative values */
+  --text-positive: var(--accent-success);
+  --text-negative: var(--accent-danger);
+
+  /* Flat/unchanged indicator color */
+  --neutral: var(--text-muted);
+
+  /* New backward-compat tokens (9 new) */
+  --bg-inset: var(--color-inset);
+  --bg-disabled: var(--color-disabled-bg);
+  --bg-overlay: var(--color-overlay);
+  --text-heading: var(--color-heading);
+  --text-placeholder: var(--color-placeholder);
+  --text-link: var(--color-link);
+  --text-link-hover: var(--color-link-hover);
+  --text-disabled: var(--color-disabled-text);
+  --focus-ring: var(--color-focus-ring);
+  --selection-bg: var(--color-selection);
+
+  /* Sidebar glass tint (defaults — overridden by [data-palette="warm"]).
+     This is `--color-inset` expressed as rgba because the rails need the alpha for
+     `backdrop-filter` to have anything to composite over; it tracked the old inset
+     (29,26,25) and now tracks the new one. Kept in sync BY HAND — a `color-mix` or
+     relative-colour form would resolve at use site and is not worth the indirection
+     here, but if `--color-inset` moves again, this moves with it. */
+  --sidebar-bg-collapsed: rgba(16, 15, 13, 0.85);
+  --sidebar-bg-expanded: rgba(16, 15, 13, 0.85);
+
+  /* Chart & UI Helper Tokens */
+  --button-text-on-accent: var(--color-on-brand);
+  --series-1: var(--color-brand);
+  --grid-line: rgba(255, 255, 255, 0.06);
+
+  --font-size-xs: 11;
+
+  /* ===================
+   * Z-INDEX SCALE
+   * Global: 0-150 (shell, widgets, modals, fullscreen)
+   *   Headers/nav: 40-50, Modals: 100, Fullscreen: 150
+   * Orion v3: 0-60 (scoped to .orion-v3 stacking context)
+   *   NOTE: Radix portals render at <body>, bypassing .orion-v3 scope.
+   *   Orion modals (z:60) may be eclipsed by global toasts (z:90).
+   *   Mitigation: Radix uses built-in z-index management.
+   * Analysis pane: 5-10 (scoped to analysis container)
+   *
+   * FOCUS RING: white (--border-focus → --color-focus-ring #F5F5F7) + 2px offset.
+   * Offset ensures ring sits on background, not on element surface.
+   * Visible even on orange buttons because ring-on-dark-bg ≈ 15:1 contrast.
+   * =================== */
+  --z-base: 0;
+  /* The dashboard grid wrapper's own stacking context. Added 2026-08-10 (Step 11a): the sole
+   * consumer, `widget-system/layout/grid-layout.tsx`, had been carrying a guessed literal
+   * `var(--z-widget-grid, 1)` against a token that was defined nowhere in the repo — so the
+   * guess was the only value doing any work. Defined here rather than in `apps/web` because
+   * this block is the single authority for the z-scale; a second scale elsewhere is how the
+   * two stop agreeing. Value 1 == the literal it replaces, so this is behaviour-preserving. */
+  --z-widget-grid: 1;
+  --z-widget-content: 1;
+  --z-widget-header: 10;
+  --z-sticky: 40;
+  --z-dropdown: 50;
+  --z-popover: 60;
+  --z-tooltip: 70;
+  --z-sidebar: 80;
+  --z-toast: 90;
+  --z-modal: 100;
+  --z-fullscreen: 150;
+
+  /* ===================
+   * SHADOWS
+   * =================== */
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-card: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+  --shadow-dropdown: 0 4px 6px -1px rgb(0 0 0 / 0.3), 0 2px 4px -2px rgb(0 0 0 / 0.3);
+  --shadow-modal: 0 25px 50px -12px rgb(0 0 0 / 0.5);
+
+  /* ===================
+   * SPACING (for compact mode)
+   * =================== */
+  --spacing-unit: 1;
+  --space-1: calc(4px * var(--spacing-unit));
+  --space-2: calc(8px * var(--spacing-unit));
+  --space-3: calc(12px * var(--spacing-unit));
+  --space-4: calc(16px * var(--spacing-unit));
+  --space-5: calc(20px * var(--spacing-unit));
+  --space-6: calc(24px * var(--spacing-unit));
+  --space-8: calc(32px * var(--spacing-unit));
+  --space-10: calc(40px * var(--spacing-unit));
+  --space-12: calc(48px * var(--spacing-unit));
+
+  /* ===================
+   * TYPOGRAPHY
+   * =================== */
+  --font-size-base: 16px;
+  --font-sans: 'Roboto Flex', system-ui, -apple-system, sans-serif;
+  --font-mono: 'Roboto Mono', ui-monospace, 'Cascadia Code', monospace;
+
+  /* Roboto Flex axis defaults (dark mode base) */
+  --rf-wght: 400;
+  --rf-wdth: 100;
+  /* Compensate for dark-mode halation. Retuned with the surface family (`F-PALETTE-01`,
+     2026-08-11): halation scales with the ink/ground gap, and this ground moved from
+     #262322 to #171413 — a third of the way to Dark (Warm), which carries -40. So this
+     moves the same third: -25 → -34. Leaving it at -25 would have let text bloom on a
+     ground the value was never measured against. */
+  --rf-grad: -34;
+  --rf-ytlc: 510;   /* +2% x-height for screen legibility */
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  /* ===================
+   * COMPONENT TOKENS
+   * =================== */
+  --button-bg: var(--accent-primary);
+  --button-bg-hover: var(--accent-primary-hover);
+  --button-bg-active: var(--accent-primary-active);
+  --button-text: var(--button-text-on-accent);
+  --button-secondary-bg: var(--bg-card);
+  --button-secondary-border: var(--border-subtle);
+  --button-secondary-hover: var(--bg-hover);
+  --button-ghost-bg: transparent;
+  --button-ghost-text: var(--text-secondary);
+  --button-ghost-hover: var(--bg-hover);
+  --button-danger-bg: var(--accent-danger);
+  --button-danger-hover: rgb(220, 38, 38);
+
+  --input-bg: var(--bg-input);
+  --input-border: var(--border-medium);
+  --input-focus: var(--border-focus);
+  --input-text: var(--text-primary);
+  --input-placeholder: var(--text-placeholder);
+
+  /* ===================
+   * LAYOUT TOKENS
+   * =================== */
+  --sidebar-collapsed: 48px;
+  --sidebar-expanded-left: clamp(148px, 9vw, 172px);
+  --sidebar-expanded-right: 216px;
+  --sidebar-expanded: var(--sidebar-expanded-left);
+  --sidebar-left-width: var(--sidebar-collapsed);
+  --sidebar-transition: 200ms;
+  --topbar-height: 0px;
+  --bottombar-height: 64px;
+  --statsbar-height: 24px;
+  --bottombar-expanded-max: 50vh;
+  --contextbar-height-compact: 40px;
+  --contextbar-height-full: 56px;
+
+  /* ===================
+   * RADII
+   * =================== */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-full: 9999px;
+
+  /* ===================
+   * TRANSITIONS
+   * =================== */
+  --transition-fast: 150ms;
+  --transition-normal: 200ms;
+  --transition-slow: 300ms;
+  --transition-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --transition-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* Easing tokens */
+  --ease-morph: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-enter: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 0.75, 0.4);
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-hover: cubic-bezier(0.25, 0, 0.5, 1);
+
+  /* Panel background (between canvas and card) — alias to bg-primary */
+  --bg-panel: var(--color-bg);
+
+  /* Alpha-based border tokens (for CSS on dark backgrounds) */
+  --border-alpha-faint: rgba(255, 255, 255, 0.04);
+  --border-alpha-subtle: rgba(255, 255, 255, 0.06);
+  --border-alpha-medium: rgba(255, 255, 255, 0.08);
+  --border-alpha-strong: rgba(255, 255, 255, 0.12);
+
+  /* Scrollbar tokens */
+  --scrollbar-width: 4px;
+  --scrollbar-thumb: rgba(255, 255, 255, 0.08);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.15);
+  --scrollbar-track: transparent;
+
+  /* Button text on accent backgrounds — WCAG AA compliant */
+  --button-text-on-accent: #1A0A00;
+}
+
+/* ===================
+ * LIGHT THEME
+ * =================== */
+.theme-light,
+[data-theme="light"] {
+  /* Light mode: no halation compensation */
+  --rf-grad: 0;
+
+  --bg-primary: #ffffff;
+  --bg-secondary: var(--color-gray-100);
+  --bg-card: #ffffff;
+  --bg-hover: var(--color-gray-100);
+  --bg-active: var(--color-gray-200);
+  --bg-input: #ffffff;
+  /* STEP 11(c): the light theme did not override --bg-elevated, so it INHERITED the dark
+   * #353230 — a dark block in a light UI, carrying light-theme dark text at 1.91:1. It is used
+   * at 9 sites inside widget-system, so it is inside this fold's surface. Raised to match
+   * --bg-card, which is what "elevated" means in a light palette.
+   * ⚠ --bg-tertiary, --bg-inset and --bg-overlay have the SAME gap and are deliberately NOT
+   * fixed here: 0 of them are used in widget-system, and --bg-tertiary alone has ~304 consumers
+   * across other programmes' pages. Routed in STEP11C-ROUTED-FINDINGS.md §(2). */
+  --bg-elevated: #ffffff;
+
+  --text-primary: var(--color-gray-950);
+  --text-secondary: var(--color-gray-600);
+  /* STEP 11(c): was var(--color-gray-400) #A8A8AC — 2.37 : 1 on white, 2.03 on --bg-secondary and
+   * 1.60 on --bg-active. The light theme is live (theme-provider.tsx:43 and :112 follow the OS
+   * colour scheme), so those values shipped to every light-mode user. gray-400 itself is unchanged. */
+  --text-muted: var(--color-gray-550);
+
+  --border-subtle: var(--color-gray-200);
+  --border-medium: var(--color-gray-300);
+
+  --shadow-dropdown: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --shadow-modal: 0 25px 50px -12px rgb(0 0 0 / 0.25);
+
+  --bg-panel: #f0f0f0;
+  --border-alpha-faint: rgba(0, 0, 0, 0.04);
+  --border-alpha-subtle: rgba(0, 0, 0, 0.06);
+  --border-alpha-medium: rgba(0, 0, 0, 0.08);
+  --border-alpha-strong: rgba(0, 0, 0, 0.12);
+  --scrollbar-thumb: rgba(0, 0, 0, 0.15);
+  --scrollbar-thumb-hover: rgba(0, 0, 0, 0.25);
+
+  /* Focus ring: dark on light bg for visibility */
+  --color-focus-ring: #242323;
+
+  /* Chart engine tokens — readable on white backgrounds */
+  --up: #1a8a3e;
+  --down: #c93c3c;
+  --data-up: #1a8a3e;
+  --data-down: #c93c3c;
+  --data-up-bg: rgba(26, 138, 62, 0.1);
+  --data-down-bg: rgba(201, 60, 60, 0.1);
+  --series-1: #d97706;
+  --series-2: #1d4ed8;
+  --series-3: #15803d;
+  --series-4: #b91c1c;
+  --series-5: #7e22ce;
+  --series-6: #c2410c;
+  --series-7: #0e7490;
+  --series-8: #4d7c0f;
+  --grid-line: rgba(0, 0, 0, 0.08);
+}
+
+/* ===================
+ * ACCENT COLOR VARIANTS
+ * =================== */
+[data-accent="blue"] {
+  --accent-primary-rgb: 59, 130, 246;
+  --accent-primary-hover-rgb: 37, 99, 235;
+  --accent-primary-active-rgb: 29, 78, 216;
+  --color-brand: #3b82f6;
+  --color-brand-hover: #2563eb;
+  --color-brand-active: #1d4ed8;
+  --color-on-brand: #FFFFFF;
+  /* Button bg overrides: -600 base (5.19:1 AA w/ white), -500 hover (lighter feedback) */
+  --button-bg: #2563EB;
+  --button-bg-hover: #3b82f6;
+  --button-bg-active: #1d4ed8;
+}
+
+[data-accent="green"] {
+  --accent-primary-rgb: 34, 197, 94;
+  --accent-primary-hover-rgb: 22, 163, 74;
+  --accent-primary-active-rgb: 21, 128, 61;
+  --color-brand: #22c55e;
+  --color-brand-hover: #16a34a;
+  --color-brand-active: #15803d;
+  --color-on-brand: #052E16;
+}
+
+[data-accent="purple"] {
+  --accent-primary-rgb: 168, 85, 247;
+  --accent-primary-hover-rgb: 147, 51, 234;
+  --accent-primary-active-rgb: 126, 34, 206;
+  --color-brand: #a855f7;
+  --color-brand-hover: #9333ea;
+  --color-brand-active: #7e22ce;
+  --color-on-brand: #FFFFFF;
+  /* Button bg overrides: -600 base (5.37:1 AA w/ white), -500 hover (lighter feedback) */
+  --button-bg: #9333EA;
+  --button-bg-hover: #a855f7;
+  --button-bg-active: #7e22ce;
+}
+
+[data-accent="orange"] {
+  --accent-primary-rgb: 255, 115, 49;
+  --accent-primary-hover-rgb: 255, 136, 85;
+  --accent-primary-active-rgb: 229, 103, 44;
+  --color-brand: #FF7331;
+  --color-brand-hover: #FF8855;
+  --color-brand-active: #E5672C;
+  --color-on-brand: #1A0A00;
+}
+
+[data-accent="red"] {
+  --accent-primary-rgb: 239, 68, 68;
+  --accent-primary-hover-rgb: 220, 38, 38;
+  --accent-primary-active-rgb: 185, 28, 28;
+  --color-brand: #ef4444;
+  --color-brand-hover: #dc2626;
+  --color-brand-active: #b91c1c;
+  --color-on-brand: #FFFFFF;
+  /* Button bg overrides: -600 base (4.82:1 AA w/ white), -500 hover (lighter feedback) */
+  --button-bg: #dc2626;
+  --button-bg-hover: #ef4444;
+  --button-bg-active: #b91c1c;
+}
+
+/* ===================
+ * COLOR PALETTE VARIANTS
+ * =================== */
+[data-theme="dark"][data-palette="warm"] {
+  /* Stronger halation compensation for darker warm surfaces */
+  --rf-grad: -40;
+
+  /* Surfaces — warm charcoal (orange-tinted, hue ~18deg) */
+  --color-bg: #0D0B0A;
+  --color-surface: #1C1916;
+  --color-surface-hover: #231E1B;
+  --color-inset: #090807;
+  --color-overlay: #050404;
+
+  /* Gray scale — must track surfaces for consistency */
+  --color-gray-700: #2E2824;
+  --color-gray-800: #1C1916;
+  --color-gray-900: #0D0B0A;
+  --color-gray-925: #090807;
+  --color-gray-950: #050404;
+
+  /* Structural */
+  --color-border: #2E2824;
+  --color-disabled-bg: #1A1715;
+  --color-selection: #5C3520;
+
+  /* Shell chrome — darker tint for glassmorphic sidebars */
+  --sidebar-bg-collapsed: rgba(13, 11, 10, 0.85);
+  --sidebar-bg-expanded: rgba(13, 11, 10, 0.85);
+}
+
+/* ===================
+ * FONT SIZE VARIANTS
+ * =================== */
+[data-font-size="small"] {
+  --font-size-base: 14px;
+}
+
+[data-font-size="medium"] {
+  --font-size-base: 16px;
+}
+
+[data-font-size="large"] {
+  --font-size-base: 18px;
+}
+
+html {
+  font-size: var(--font-size-base);
+}
+
+/* ===================
+ * COMPACT MODE
+ * =================== */
+.compact,
+[data-compact="true"] {
+  --spacing-unit: 0.75;
+}
+
+/* ===================
+ * REDUCE MOTION
+ * =================== */
+.reduce-motion *,
+.reduce-motion *::before,
+.reduce-motion *::after,
+[data-reduce-motion="true"] *,
+[data-reduce-motion="true"] *::before,
+[data-reduce-motion="true"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+}
+
+/* OS prefers-reduced-motion deliberately NOT used here.
+   The in-app toggle controls reduce-motion via .reduce-motion / [data-reduce-motion="true"] above. */
+
+/* ===================
+ * ANIMATIONS TOGGLE
+ * Decorative only — transitions preserved so hover/expand/collapse still work.
+ * =================== */
+[data-animations-off="true"] *,
+[data-animations-off="true"] *::before,
+[data-animations-off="true"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  /* transition-duration intentionally NOT zeroed */
+}
+
+/* ===================
+ * DATA UPDATE FLASH
+ * =================== */
+@keyframes flash-update {
+  0% { background-color: rgba(var(--accent-primary-rgb), 0.15); }
+  100% { background-color: transparent; }
+}
+
+.animate-flash-update {
+  animation: flash-update var(--highlight-duration, 1000ms) ease-out;
+}

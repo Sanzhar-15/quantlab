@@ -16,7 +16,6 @@ const baseDir = typeof import.meta.dirname === 'string'
 const srcDir = path.join(baseDir, 'webview');
 const chartDir = path.join(srcDir, 'chart');
 const actionDir = path.join(srcDir, 'action');
-const tradeDir = path.join(srcDir, 'trade');
 const resourcesDir = path.join(srcDir, 'resources');
 const statsDir = path.join(srcDir, 'stats');
 const visualiseDir = path.join(srcDir, 'visualise');
@@ -131,8 +130,6 @@ run({
 		'chart-style': path.join(chartDir, 'chart.css'),
 		'action': path.join(actionDir, 'index.ts'),
 		'action-style': path.join(actionDir, 'action.css'),
-		'trade': path.join(tradeDir, 'index.ts'),
-		'trade-style': path.join(tradeDir, 'trade.css'),
 		'resources': path.join(resourcesDir, 'index.ts'),
 		'resources-style': path.join(resourcesDir, 'resources.css'),
 		'stats': path.join(statsDir, 'index.ts'),

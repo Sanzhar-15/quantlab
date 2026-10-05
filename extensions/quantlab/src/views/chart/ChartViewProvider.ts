@@ -22,9 +22,7 @@ import { DataSourceDescriptor, Timeframe, isLocalFileSource, isServerSource, Ser
 import { ChartState } from '../../types/views';
 import { ChartStateStore } from './ChartStateStore';
 import { ChartWebview } from './ChartWebview';
-import { TradeOverlayManager } from './TradeOverlayManager';
 import { fireChartDrawn } from './chartDrawn';
-import { SessionManager } from '../../core/trading/SessionManager';
 import { ThemeProvider } from '../../ui/tokens/ThemeProvider';
 import { ReducedMotion } from '../../ui/accessibility/ReducedMotion';
 import { FeatureDiscovery } from '../../ui/onboarding/FeatureDiscovery';
@@ -104,10 +102,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 	private readonly artifactCacheAccessTimes = new Map<string, number>(); // LRU tracking
 	private readonly sessions = new Map<string, ChartSession>();
 	private readonly pendingRunByUri = new Map<string, string>();
-	private readonly pendingLiveByUri = new Map<string, string>();
-	private readonly liveSessions = new Map<string, { sessionId: string; previous?: { symbol?: string; timeframe?: Timeframe } }>();
-	private readonly tradeOverlayManager = new TradeOverlayManager();
-	private readonly sessionManager = SessionManager.getInstance();
 	private readonly themeProvider = ThemeProvider.getInstance();
 	private readonly reducedMotion = ReducedMotion.getInstance();
 	private readonly bannerState = new Map<string, BannerState>();
@@ -123,9 +117,7 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			this.globalState.onDidChangeDataSource(() => this.refreshFromGlobal('dataSource')),
 			this.globalState.onDidChangeTimeframe(() => this.refreshFromGlobal('timeframe')),
 			vscode.window.tabGroups.onDidChangeTabs(() => this.resolveMissingTabIds()),
-			this.sessionManager.onSessionStopped(event => this.detachLiveSession(event.sessionId)),
-			this.reducedMotion.onDidChange(() => this.broadcastReducedMotion()),
-			this.sessionManager.onFill(update => this.handleLiveFill(update))
+			this.reducedMotion.onDidChange(() => this.broadcastReducedMotion())
 		);
 	}
 
@@ -163,52 +155,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		}
 
 		this.executeWithErrorBoundary(() => this.loadRunArtifacts(session, runId), 'loadRunArtifacts');
-	}
-
-	attachLiveSession(sessionId: string, uri?: vscode.Uri): void {
-		const session = uri ? this.findSessionForDocument(uri) : this.getActiveSession();
-		if (!session) {
-			if (uri) {
-				this.pendingLiveByUri.set(uri.toString(), sessionId);
-			}
-			return;
-		}
-
-		const info = this.sessionManager.getSession(sessionId);
-		if (!info) {
-			return;
-		}
-
-		const key = session.key;
-		if (this.liveSessions.get(key)?.sessionId === sessionId) {
-			return;
-		}
-
-		this.detachLiveSessionByKey(key);
-
-		const previous = session.tabInstanceId ? this.stateManager.getChartState(session.tabInstanceId) : undefined;
-		this.liveSessions.set(key, {
-			sessionId,
-			previous: { symbol: previous?.symbol, timeframe: previous?.timeframe }
-		});
-
-		this.tradeOverlayManager.attach(key, sessionId, message => session.webview.postMessage(message));
-
-		if (session.tabInstanceId) {
-			this.stateManager.updateChartState(session.tabInstanceId, { symbol: info.symbol, timeframe: info.timeframe });
-		}
-
-		this.refreshToolbar(session);
-		this.executeWithErrorBoundary(() => this.reloadData(session), 'reloadData');
-	}
-
-	detachLiveSession(sessionId: string): void {
-		for (const [key, binding] of this.liveSessions.entries()) {
-			if (binding.sessionId !== sessionId) {
-				continue;
-			}
-			this.detachLiveSessionByKey(key);
-		}
 	}
 
 	async resolveCustomTextEditor(
@@ -265,9 +211,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 	}
 
 	private disposeSession(session: ChartSession): void {
-		// Detach live session BEFORE removing from sessions map
-		this.detachLiveSessionByKey(session.key);
-
 		// Cancel any pending data load operations
 		if (session.cancellationTokenSource) {
 			session.cancellationTokenSource.cancel();
@@ -280,13 +223,11 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		this.dataCacheAccessTimes.delete(session.key);
 		this.bannerState.delete(session.key);
 		this.lastNotifiedVizIssues.delete(session.key);
-		this.liveSessions.delete(session.key);
 
 		const uriKey = session.document.uri.toString();
 		this.artifactCache.delete(session.key);
 		this.artifactCacheAccessTimes.delete(session.key);
 		this.pendingRunByUri.delete(uriKey);
-		this.pendingLiveByUri.delete(uriKey);
 
 		for (const disposable of session.disposables) {
 			disposable.dispose();
@@ -468,12 +409,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		if (pending) {
 			this.pendingRunByUri.delete(session.document.uri.toString());
 			this.executeWithErrorBoundary(() => this.loadRunArtifacts(session, pending), 'loadRunArtifacts');
-		}
-
-		const pendingLive = this.pendingLiveByUri.get(session.document.uri.toString());
-		if (pendingLive) {
-			this.pendingLiveByUri.delete(session.document.uri.toString());
-			this.attachLiveSession(pendingLive, session.document.uri);
 		}
 	}
 
@@ -924,10 +859,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 	private refreshFromGlobal(kind: 'dataSource' | 'timeframe'): void {
 		for (const session of this.sessions.values()) {
-			if (this.liveSessions.has(session.key)) {
-				continue;
-			}
-
 			// M17: a session whose tabInstanceId has not resolved yet (startup
 			// race) has no per-tab overrides by definition -- fall through with
 			// state undefined so the global change still reloads it.
@@ -958,69 +889,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 	private getSessionKey(session: ChartSession): string {
 		return session.tabInstanceId ?? session.key;
-	}
-
-	private handleLiveFill(update: { sessionId: string; fill: unknown; seq?: number }): void {
-		for (const [key, binding] of this.liveSessions.entries()) {
-			if (binding.sessionId !== update.sessionId) {
-				continue;
-			}
-
-			const session = Array.from(this.sessions.values()).find(s => s.key === key);
-			if (!session) {
-				continue;
-			}
-
-			const fill = update.fill as { symbol: string; side: string; quantity: number; price: number; timestamp: number };
-			if (fill && fill.timestamp && fill.price) {
-				const signal: SignalMarker = {
-					t: fill.timestamp,
-					type: fill.side === 'buy' ? 'entry' : 'exit',
-					label: `${fill.side.toUpperCase()} ${fill.quantity} @ ${fill.price}`,
-					price: fill.price
-				};
-
-				// Guard: check the live binding is still active (this is the invariant,
-				// not this.sessions -- if the live binding was removed by disposeSession,
-				// the session no longer participates in fill routing)
-				if (!this.liveSessions.has(key)) {
-					continue;
-				}
-
-				const artifacts = this.artifactCache.get(session.key) ?? {};
-				const signals = [...(artifacts.signals ?? []), signal];
-				artifacts.signals = signals;
-				this.setArtifactCache(session.key, artifacts); // Use LRU cache
-
-				session.webview.postMessage({
-					type: 'addSignal',
-					signal
-				});
-			}
-		}
-	}
-
-	private detachLiveSessionByKey(key: string): void {
-		const binding = this.liveSessions.get(key);
-		if (!binding) {
-			return;
-		}
-
-		this.tradeOverlayManager.detach(key);
-		this.liveSessions.delete(key);
-
-		const session = Array.from(this.sessions.values()).find(candidate => candidate.key === key);
-		if (!session || !session.tabInstanceId) {
-			return;
-		}
-
-		const previous = binding.previous ?? {};
-		this.stateManager.updateChartState(session.tabInstanceId, {
-			symbol: previous.symbol,
-			timeframe: previous.timeframe
-		});
-		this.refreshToolbar(session);
-		this.executeWithErrorBoundary(() => this.reloadData(session), 'reloadData');
 	}
 
 	private async applyOverrides(session: ChartSession): Promise<void> {
