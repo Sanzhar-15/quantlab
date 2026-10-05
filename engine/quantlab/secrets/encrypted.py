@@ -183,12 +183,12 @@ class EncryptedSecretsFile:
         Initialize encrypted secrets file handler.
 
         Args:
-            file_path: Path to secrets file. Defaults to ~/.quantlab/secrets.enc
+            file_path: Path to secrets file. Defaults to ~/.deltaplus/secrets.enc
         """
         if file_path:
             self._file_path = Path(file_path)
         else:
-            self._file_path = Path.home() / ".quantlab" / "secrets.enc"
+            self._file_path = Path.home() / ".deltaplus" / "secrets.enc"
 
         self._params = Argon2Params()
         self._salt: bytes | None = None

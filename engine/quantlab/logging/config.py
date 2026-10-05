@@ -26,7 +26,7 @@ from typing import Any
 
 
 # Log directory
-DEFAULT_LOG_DIR = Path.home() / ".quantlab" / "logs"
+DEFAULT_LOG_DIR = Path.home() / ".deltaplus" / "logs"
 
 
 @dataclass

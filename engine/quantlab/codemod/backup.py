@@ -75,7 +75,7 @@ class BackupManager:
         if backup_dir:
             self.backup_dir = Path(backup_dir)
         else:
-            self.backup_dir = Path.home() / ".quantlab" / "backups"
+            self.backup_dir = Path.home() / ".deltaplus" / "backups"
 
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         self.max_backups_per_file = max_backups_per_file

@@ -156,7 +156,7 @@ class DiskSpaceMonitor:
         Initialize disk space monitor.
 
         Args:
-            paths: Paths to monitor (default: ~/.quantlab and working directory)
+            paths: Paths to monitor (default: ~/.deltaplus and working directory)
             thresholds: Disk space thresholds
             check_interval_sec: How often to check disk space
             enable_monitoring: Whether to enable background monitoring
@@ -182,7 +182,7 @@ class DiskSpaceMonitor:
         paths = []
 
         # Quantlab data directory
-        quantlab_dir = Path.home() / ".quantlab"
+        quantlab_dir = Path.home() / ".deltaplus"
         if quantlab_dir.exists():
             paths.append(quantlab_dir)
 
@@ -508,7 +508,7 @@ class DiskSpaceMonitor:
         Returns:
             CleanupResult with details of cleanup
         """
-        log_dir = Path.home() / ".quantlab" / "logs"
+        log_dir = Path.home() / ".deltaplus" / "logs"
 
         if not log_dir.exists():
             return CleanupResult(
@@ -540,7 +540,7 @@ class DiskSpaceMonitor:
         Returns:
             CleanupResult with details of cleanup
         """
-        cache_dir = Path.home() / ".quantlab" / "cache"
+        cache_dir = Path.home() / ".deltaplus" / "cache"
 
         if not cache_dir.exists():
             return CleanupResult(
@@ -581,7 +581,7 @@ class DiskSpaceMonitor:
         results: dict[str, CleanupResult] = {}
 
         # Check current space
-        snapshot = self.take_snapshot(Path.home() / ".quantlab")
+        snapshot = self.take_snapshot(Path.home() / ".deltaplus")
 
         if snapshot.free_gb >= target_free_gb:
             logger.info(f"Disk has {snapshot.free_gb:.1f} GB free, no cleanup needed")
@@ -597,7 +597,7 @@ class DiskSpaceMonitor:
             max_age_days=7, dry_run=dry_run
         )
 
-        snapshot = self.take_snapshot(Path.home() / ".quantlab")
+        snapshot = self.take_snapshot(Path.home() / ".deltaplus")
         if snapshot.free_gb >= target_free_gb:
             return results
 
@@ -606,7 +606,7 @@ class DiskSpaceMonitor:
             max_age_days=30, dry_run=dry_run
         )
 
-        snapshot = self.take_snapshot(Path.home() / ".quantlab")
+        snapshot = self.take_snapshot(Path.home() / ".deltaplus")
         if snapshot.free_gb >= target_free_gb:
             return results
 
@@ -615,7 +615,7 @@ class DiskSpaceMonitor:
             max_age_days=14, dry_run=dry_run
         )
 
-        snapshot = self.take_snapshot(Path.home() / ".quantlab")
+        snapshot = self.take_snapshot(Path.home() / ".deltaplus")
         if snapshot.free_gb >= target_free_gb:
             return results
 
@@ -636,13 +636,13 @@ class DiskSpaceMonitor:
 
         Args:
             required_gb: Required free space in GB
-            path: Path to check (default: ~/.quantlab)
+            path: Path to check (default: ~/.deltaplus)
 
         Returns:
             Tuple of (has_space, message)
         """
         if path is None:
-            path = Path.home() / ".quantlab"
+            path = Path.home() / ".deltaplus"
 
         snapshot = self.take_snapshot(path)
 
