@@ -79,12 +79,10 @@ export function readEngineResult(parsed: Record<string, unknown>): EngineResultR
 	return {
 		kind: 'complete',
 		result: {
-			// JobResult types these floats as number; the engine's null for inf / NaN passes through as before (flagged:
-			// widening JobResult to number | null reaches the Action view's run state and the webview, outside this change).
-			metrics: metrics as Record<string, number>,
+			metrics: metrics as Record<string, number | null>,
 			warnings: warnings as string[],
-			equity: equity as Array<{ t: number; v: number }>,
-			signals: signals as Array<{ t: number; type: 'entry' | 'exit'; label?: string; price?: number }>,
+			equity: equity as Array<{ t: number; v: number | null }>,
+			signals: signals as Array<{ t: number; type: 'entry' | 'exit'; label?: string; price?: number | null }>,
 		},
 	};
 }

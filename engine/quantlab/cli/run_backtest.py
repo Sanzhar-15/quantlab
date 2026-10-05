@@ -111,32 +111,35 @@ def convert_results(results: Any, job_id: str) -> dict[str, Any]:
           "signals": [{"t": epoch_ms, "type": "entry"|"exit", "label": ..., "price": ...}, ...]
         }
     """
-    # Build flat metrics dict for TS side (Record<string, number>)
-    metrics: dict[str, float] = {}
-    if results.metrics:
-        m = results.metrics
-        if m.sharpe_ratio is not None:
-            metrics["Sharpe"] = round(m.sharpe_ratio, 4)
-        if m.sortino_ratio is not None:
-            metrics["Sortino"] = round(m.sortino_ratio, 4)
-        if m.total_return_pct is not None:
-            metrics["Return"] = round(m.total_return_pct, 4)
-        if m.max_drawdown_pct is not None:
-            metrics["MaxDrawdown"] = round(m.max_drawdown_pct, 4)
-        if m.win_rate is not None:
-            metrics["WinRate"] = round(m.win_rate, 2)
-        if m.profit_factor is not None:
-            metrics["ProfitFactor"] = round(m.profit_factor, 4)
-        if m.calmar_ratio is not None:
-            metrics["Calmar"] = round(m.calmar_ratio, 4)
-        if m.total_trades is not None:
-            metrics["Trades"] = m.total_trades
+    # No metrics means the run cannot be judged: the runner leaves results.metrics None when the equity curve
+    # has fewer than 2 points or the calculation raised (its message is then in results.warnings). That is the
+    # job's failure, named; no metric is made up from other fields.
+    if results.metrics is None:
+        raise ValueError(
+            f"the backtest produced no performance metrics (equity curve: {len(results.equity_curve)} point(s); "
+            f"runner warnings: {results.warnings})"
+        )
 
-    # Fallback: populate from top-level fields if metrics object is sparse
-    if "Return" not in metrics and results.total_return_pct is not None:
-        metrics["Return"] = round(float(results.total_return_pct), 4)
-    if "Trades" not in metrics:
-        metrics["Trades"] = len(results.trades)
+    # Build flat metrics dict for TS side; a metric the calculator left None is absent, inf / NaN become null
+    metrics: dict[str, float] = {}
+    m = results.metrics
+    if m.sharpe_ratio is not None:
+        metrics["Sharpe"] = round(m.sharpe_ratio, 4)
+    if m.sortino_ratio is not None:
+        metrics["Sortino"] = round(m.sortino_ratio, 4)
+    if m.total_return_pct is not None:
+        metrics["Return"] = round(m.total_return_pct, 4)
+    if m.max_drawdown_pct is not None:
+        metrics["MaxDrawdown"] = round(m.max_drawdown_pct, 4)
+    if m.win_rate is not None:
+        metrics["WinRate"] = round(m.win_rate, 2)
+    if m.profit_factor is not None:
+        metrics["ProfitFactor"] = round(m.profit_factor, 4)
+    if m.calmar_ratio is not None:
+        metrics["Calmar"] = round(m.calmar_ratio, 4)
+    if m.total_trades is not None:
+        metrics["Trades"] = m.total_trades
+
 
     # Equity curve: list of {t: epoch_ms, v: float}
     equity: list[dict[str, Any]] = []
@@ -160,7 +163,7 @@ def convert_results(results: Any, job_id: str) -> dict[str, Any]:
     return {
         "success": True,
         "metrics": metrics,
-        "warnings": results.warnings or [],
+        "warnings": list(results.warnings),
         "equity": equity,
         "signals": signals,
     }

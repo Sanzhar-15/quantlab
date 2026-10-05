@@ -45,11 +45,12 @@ export interface JobFailedEvent {
 }
 
 export interface JobResult {
-	metrics: Record<string, number>;
+	/** null where the engine's value was not finite (inf / NaN; engine/quantlab/cli/run_backtest.py _sanitize_for_json). */
+	metrics: Record<string, number | null>;
 	warnings?: string[];
 	artifactPath?: string;
-	signals?: Array<{ t: number; type: 'entry' | 'exit'; label?: string; price?: number }>;
-	equity?: Array<{ t: number; v: number }>;
+	signals?: Array<{ t: number; type: 'entry' | 'exit'; label?: string; price?: number | null }>;
+	equity?: Array<{ t: number; v: number | null }>;
 }
 
 export type EngineEvent = JobProgressEvent | JobLogEvent | JobCompleteEvent | JobFailedEvent | StatsCompleteEvent;
