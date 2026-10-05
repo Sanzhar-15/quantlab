@@ -22,8 +22,6 @@ import { DataSourceDescriptor, Timeframe, isLocalFileSource, isServerSource, Ser
 import { ChartState } from '../../types/views';
 import { ChartStateStore } from './ChartStateStore';
 import { ChartWebview } from './ChartWebview';
-import { TradeOverlayManager } from './TradeOverlayManager';
-import { SessionManager } from '../../core/trading/SessionManager';
 import { ThemeProvider } from '../../ui/tokens/ThemeProvider';
 import { ReducedMotion } from '../../ui/accessibility/ReducedMotion';
 import { FeatureDiscovery } from '../../ui/onboarding/FeatureDiscovery';
@@ -60,6 +58,16 @@ interface ChartSession {
 	analysisDebounced: () => void;
 	visualizationDebounced: () => void;
 	cancellationTokenSource?: vscode.CancellationTokenSource;
+	/** Token of the bars fetch a refreshVisualization without data started (DT-3: no bar slot). */
+	vizCancellationTokenSource?: vscode.CancellationTokenSource;
+}
+
+/** One bars load for the current toolbar source (loadBars). */
+interface LoadedBars {
+	data: OhlcvBar[];
+	effectiveTimeframe: Timeframe;
+	dsKey: string;
+	warning?: string;
 }
 
 /**
@@ -84,8 +92,8 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 	private readonly stateManager = TabViewStateManager.getInstance();
 	private readonly parameterExtractor = ParameterExtractor.getInstance();
-	// Cache size limits (prevent unbounded growth)
-	private static readonly MAX_DATA_CACHE_SIZE = 50;
+	// Cache size limits (prevent unbounded growth). DT-3: no bars cache here --
+	// bars are re-read through DataService (the host's main data module caches).
 	private static readonly MAX_ARTIFACT_CACHE_SIZE = 30;
 
 	private readonly visualizationDetector = VisualizationDetector.getInstance();
@@ -97,16 +105,10 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 	private readonly dataService = DataService.getInstance();
 	private readonly visualizationRunner = VisualizationRunner.getInstance();
 	private readonly chartStateStore = ChartStateStore.getInstance();
-	private readonly dataCache = new Map<string, OhlcvBar[]>();
-	private readonly dataCacheAccessTimes = new Map<string, number>(); // LRU tracking
 	private readonly artifactCache = new Map<string, { signals?: SignalMarker[]; equity?: EquityPoint[] }>();
 	private readonly artifactCacheAccessTimes = new Map<string, number>(); // LRU tracking
 	private readonly sessions = new Map<string, ChartSession>();
 	private readonly pendingRunByUri = new Map<string, string>();
-	private readonly pendingLiveByUri = new Map<string, string>();
-	private readonly liveSessions = new Map<string, { sessionId: string; previous?: { symbol?: string; timeframe?: Timeframe } }>();
-	private readonly tradeOverlayManager = new TradeOverlayManager();
-	private readonly sessionManager = SessionManager.getInstance();
 	private readonly themeProvider = ThemeProvider.getInstance();
 	private readonly reducedMotion = ReducedMotion.getInstance();
 	private readonly bannerState = new Map<string, BannerState>();
@@ -122,9 +124,7 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			this.globalState.onDidChangeDataSource(() => this.refreshFromGlobal('dataSource')),
 			this.globalState.onDidChangeTimeframe(() => this.refreshFromGlobal('timeframe')),
 			vscode.window.tabGroups.onDidChangeTabs(() => this.resolveMissingTabIds()),
-			this.sessionManager.onSessionStopped(event => this.detachLiveSession(event.sessionId)),
-			this.reducedMotion.onDidChange(() => this.broadcastReducedMotion()),
-			this.sessionManager.onFill(update => this.handleLiveFill(update))
+			this.reducedMotion.onDidChange(() => this.broadcastReducedMotion())
 		);
 	}
 
@@ -162,52 +162,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		}
 
 		this.executeWithErrorBoundary(() => this.loadRunArtifacts(session, runId), 'loadRunArtifacts');
-	}
-
-	attachLiveSession(sessionId: string, uri?: vscode.Uri): void {
-		const session = uri ? this.findSessionForDocument(uri) : this.getActiveSession();
-		if (!session) {
-			if (uri) {
-				this.pendingLiveByUri.set(uri.toString(), sessionId);
-			}
-			return;
-		}
-
-		const info = this.sessionManager.getSession(sessionId);
-		if (!info) {
-			return;
-		}
-
-		const key = session.key;
-		if (this.liveSessions.get(key)?.sessionId === sessionId) {
-			return;
-		}
-
-		this.detachLiveSessionByKey(key);
-
-		const previous = session.tabInstanceId ? this.stateManager.getChartState(session.tabInstanceId) : undefined;
-		this.liveSessions.set(key, {
-			sessionId,
-			previous: { symbol: previous?.symbol, timeframe: previous?.timeframe }
-		});
-
-		this.tradeOverlayManager.attach(key, sessionId, message => session.webview.postMessage(message));
-
-		if (session.tabInstanceId) {
-			this.stateManager.updateChartState(session.tabInstanceId, { symbol: info.symbol, timeframe: info.timeframe });
-		}
-
-		this.refreshToolbar(session);
-		this.executeWithErrorBoundary(() => this.reloadData(session), 'reloadData');
-	}
-
-	detachLiveSession(sessionId: string): void {
-		for (const [key, binding] of this.liveSessions.entries()) {
-			if (binding.sessionId !== sessionId) {
-				continue;
-			}
-			this.detachLiveSessionByKey(key);
-		}
 	}
 
 	async resolveCustomTextEditor(
@@ -264,28 +218,26 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 	}
 
 	private disposeSession(session: ChartSession): void {
-		// Detach live session BEFORE removing from sessions map
-		this.detachLiveSessionByKey(session.key);
-
 		// Cancel any pending data load operations
 		if (session.cancellationTokenSource) {
 			session.cancellationTokenSource.cancel();
 			session.cancellationTokenSource.dispose();
 		}
+		if (session.vizCancellationTokenSource) {
+			session.vizCancellationTokenSource.cancel();
+			session.vizCancellationTokenSource.dispose();
+			session.vizCancellationTokenSource = undefined;
+		}
 
 		this.themeProvider.unregisterWebview(session.key);
 		this.sessions.delete(session.key);
-		this.dataCache.delete(session.key);
-		this.dataCacheAccessTimes.delete(session.key);
 		this.bannerState.delete(session.key);
 		this.lastNotifiedVizIssues.delete(session.key);
-		this.liveSessions.delete(session.key);
 
 		const uriKey = session.document.uri.toString();
 		this.artifactCache.delete(session.key);
 		this.artifactCacheAccessTimes.delete(session.key);
 		this.pendingRunByUri.delete(uriKey);
-		this.pendingLiveByUri.delete(uriKey);
 
 		for (const disposable of session.disposables) {
 			disposable.dispose();
@@ -465,12 +417,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			this.pendingRunByUri.delete(session.document.uri.toString());
 			this.executeWithErrorBoundary(() => this.loadRunArtifacts(session, pending), 'loadRunArtifacts');
 		}
-
-		const pendingLive = this.pendingLiveByUri.get(session.document.uri.toString());
-		if (pendingLive) {
-			this.pendingLiveByUri.delete(session.document.uri.toString());
-			this.attachLiveSession(pendingLive, session.document.uri);
-		}
 	}
 
 	private sendInit(session: ChartSession): void {
@@ -554,8 +500,50 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		// Generate request ID to prevent race conditions
 		const requestId = this.chartStateStore.nextVizRequestId(key);
 
-		const bars = data ?? this.dataCache.get(session.key);
-		if (!bars || !bars.length) {
+		// DT-3: no per-panel bar slot. Without `data` the bars are re-read
+		// through loadBars; requestId still guards staleness below.
+		let bars = data;
+		if (!bars) {
+			const toolbar = this.buildToolbarState(session);
+			if (!toolbar.dataSource) {
+				// No source selected: reloadData shows the empty state; nothing to draw.
+				return;
+			}
+			if (session.vizCancellationTokenSource) {
+				session.vizCancellationTokenSource.cancel();
+				session.vizCancellationTokenSource.dispose();
+			}
+			const tokenSource = new vscode.CancellationTokenSource();
+			session.vizCancellationTokenSource = tokenSource;
+			try {
+				bars = (await this.loadBars(toolbar.dataSource, toolbar, tokenSource.token)).data;
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				// Superseded (a newer viz request or a disposed session): the
+				// newer request owns the overlay. Its own 'Cancelled' is expected;
+				// any other failure is still logged.
+				if (!this.isSessionActive(session) || !this.chartStateStore.isVizRequestCurrent(key, requestId)) {
+					if (detail !== 'Cancelled') {
+						console.warn(`ChartViewProvider: superseded visualization data load failed: ${detail}`);
+					}
+					return;
+				}
+				// The debounced caller has no catch: surface the failure here.
+				session.webview.postMessage({
+					type: 'showError',
+					message: 'Unable to load data for the visualization.',
+					detail,
+					actions: ['reload', 'selectData']
+				});
+				return;
+			} finally {
+				if (session.vizCancellationTokenSource === tokenSource) {
+					session.vizCancellationTokenSource = undefined;
+					tokenSource.dispose();
+				}
+			}
+		}
+		if (!bars.length) {
 			return;
 		}
 
@@ -709,38 +697,11 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		session.webview.postMessage({ type: 'showLoading', requestId });
 
 		try {
-			let data: OhlcvBar[];
-			let effectiveTimeframe: Timeframe;
-			let dsKey: string;
-
-			if (isLocalFileSource(toolbar.dataSource)) {
-				// Load from local file
-				const result = await this.dataService.getOHLCVFromFile(toolbar.dataSource.filePath, toolbar.dateRange, token);
-				data = result.data;
-				effectiveTimeframe = result.meta.effectiveTimeframe;
-				dsKey = toolbar.dataSource.filePath;
-
-				if (result.meta.warning) {
-					this.setBanner(session, 'data', result.meta.warning, 'warning');
-				} else {
-					this.setBanner(session, 'data', '');
-				}
-			} else if (isServerSource(toolbar.dataSource)) {
-				// Load from Delta Plus server
-				const timeframe = toolbar.timeframe ?? '1D';
-				const result = await this.dataService.getOHLCVFromServer(
-					toolbar.dataSource.symbol,
-					timeframe,
-					toolbar.dateRange,
-					token,
-					toolbar.dataSource.assetClass
-				);
-				data = result.data;
-				effectiveTimeframe = result.meta.effectiveTimeframe;
-				dsKey = `server:${toolbar.dataSource.symbol}`;
-				this.setBanner(session, 'data', '');
+			const { data, effectiveTimeframe, dsKey, warning } = await this.loadBars(toolbar.dataSource, toolbar, token);
+			if (warning) {
+				this.setBanner(session, 'data', warning, 'warning');
 			} else {
-				throw new Error('Unknown data source type');
+				this.setBanner(session, 'data', '');
 			}
 
 			// Check if this request is still current (prevent race conditions)
@@ -791,7 +752,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				buffer,
 				count
 			});
-			this.setDataCache(session.key, data); // Use LRU cache
 
 			this.chartStateStore.setLastDataKey(key, `${dsKey}:${toolbar.dateRange?.start ?? ''}:${toolbar.dateRange?.end ?? ''}`);
 
@@ -821,6 +781,44 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				actions: ['reload', 'selectData']
 			});
 		}
+	}
+
+	/**
+	 * One bars load for the toolbar's data source (the former reloadData fetch
+	 * block). DT-3: nothing is kept -- every caller re-reads through DataService.
+	 */
+	private async loadBars(
+		dataSource: DataSourceDescriptor,
+		toolbar: ChartToolbarState,
+		token: vscode.CancellationToken
+	): Promise<LoadedBars> {
+		if (isLocalFileSource(dataSource)) {
+			// Load from local file
+			const result = await this.dataService.getOHLCVFromFile(dataSource.filePath, toolbar.dateRange, token);
+			return {
+				data: result.data,
+				effectiveTimeframe: result.meta.effectiveTimeframe,
+				dsKey: dataSource.filePath,
+				warning: result.meta.warning
+			};
+		}
+		if (isServerSource(dataSource)) {
+			// Load from Delta Plus server
+			const timeframe = toolbar.timeframe ?? '1D';
+			const result = await this.dataService.getOHLCVFromServer(
+				dataSource.symbol,
+				timeframe,
+				toolbar.dateRange,
+				token,
+				dataSource.assetClass
+			);
+			return {
+				data: result.data,
+				effectiveTimeframe: result.meta.effectiveTimeframe,
+				dsKey: `server:${dataSource.symbol}`
+			};
+		}
+		throw new Error('Unknown data source type');
 	}
 
 	/**
@@ -920,10 +918,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 	private refreshFromGlobal(kind: 'dataSource' | 'timeframe'): void {
 		for (const session of this.sessions.values()) {
-			if (this.liveSessions.has(session.key)) {
-				continue;
-			}
-
 			// M17: a session whose tabInstanceId has not resolved yet (startup
 			// race) has no per-tab overrides by definition -- fall through with
 			// state undefined so the global change still reloads it.
@@ -954,69 +948,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 	private getSessionKey(session: ChartSession): string {
 		return session.tabInstanceId ?? session.key;
-	}
-
-	private handleLiveFill(update: { sessionId: string; fill: unknown; seq?: number }): void {
-		for (const [key, binding] of this.liveSessions.entries()) {
-			if (binding.sessionId !== update.sessionId) {
-				continue;
-			}
-
-			const session = Array.from(this.sessions.values()).find(s => s.key === key);
-			if (!session) {
-				continue;
-			}
-
-			const fill = update.fill as { symbol: string; side: string; quantity: number; price: number; timestamp: number };
-			if (fill && fill.timestamp && fill.price) {
-				const signal: SignalMarker = {
-					t: fill.timestamp,
-					type: fill.side === 'buy' ? 'entry' : 'exit',
-					label: `${fill.side.toUpperCase()} ${fill.quantity} @ ${fill.price}`,
-					price: fill.price
-				};
-
-				// Guard: check the live binding is still active (this is the invariant,
-				// not this.sessions -- if the live binding was removed by disposeSession,
-				// the session no longer participates in fill routing)
-				if (!this.liveSessions.has(key)) {
-					continue;
-				}
-
-				const artifacts = this.artifactCache.get(session.key) ?? {};
-				const signals = [...(artifacts.signals ?? []), signal];
-				artifacts.signals = signals;
-				this.setArtifactCache(session.key, artifacts); // Use LRU cache
-
-				session.webview.postMessage({
-					type: 'addSignal',
-					signal
-				});
-			}
-		}
-	}
-
-	private detachLiveSessionByKey(key: string): void {
-		const binding = this.liveSessions.get(key);
-		if (!binding) {
-			return;
-		}
-
-		this.tradeOverlayManager.detach(key);
-		this.liveSessions.delete(key);
-
-		const session = Array.from(this.sessions.values()).find(candidate => candidate.key === key);
-		if (!session || !session.tabInstanceId) {
-			return;
-		}
-
-		const previous = binding.previous ?? {};
-		this.stateManager.updateChartState(session.tabInstanceId, {
-			symbol: previous.symbol,
-			timeframe: previous.timeframe
-		});
-		this.refreshToolbar(session);
-		this.executeWithErrorBoundary(() => this.reloadData(session), 'reloadData');
 	}
 
 	private async applyOverrides(session: ChartSession): Promise<void> {
@@ -1253,32 +1184,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 	// ----
 	// LRU Cache Management (prevent unbounded growth)
 	// ----
-
-	/**
-	 * Set data in cache with LRU eviction
-	 */
-	private setDataCache(key: string, data: OhlcvBar[]): void {
-		// Evict least-recently-used if at capacity
-		if (this.dataCache.size >= ChartViewProvider.MAX_DATA_CACHE_SIZE && !this.dataCache.has(key)) {
-			let lruKey: string | undefined;
-			let lruTime = Infinity;
-
-			for (const [k, time] of this.dataCacheAccessTimes) {
-				if (time < lruTime) {
-					lruTime = time;
-					lruKey = k;
-				}
-			}
-
-			if (lruKey) {
-				this.dataCache.delete(lruKey);
-				this.dataCacheAccessTimes.delete(lruKey);
-			}
-		}
-
-		this.dataCache.set(key, data);
-		this.dataCacheAccessTimes.set(key, Date.now());
-	}
 
 	/**
 	 * Set artifact in cache with LRU eviction

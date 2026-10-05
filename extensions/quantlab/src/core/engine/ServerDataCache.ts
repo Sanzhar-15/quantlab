@@ -7,22 +7,114 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { promises as fsPromises } from 'fs';
+import { randomUUID } from 'crypto';
+import { ChartDateRange } from '../../types/chart';
 import { ServerDataSource, Timeframe } from '../../types/market';
 import { DataService } from './DataService';
 
+/** Run files are named `run-<pid>-<symbol>_<timeframe>_<uuid>.csv`. */
+const RUN_FILE_PATTERN = /^run-(\d+)-.+\.csv$/;
+
+const TIMEFRAMES: ReadonlySet<string> = new Set<Timeframe>(['1m', '5m', '15m', '30m', '1H', '4H', '1D', '1W', '1M']);
+
 /**
- * Manages temporary CSV caching of server data for Python engine consumption.
- * Server data sources cannot be used directly by Python backtests, so we fetch
- * and cache them as CSV files.
+ * The server source of a run as recorded in its History config (QL-DATA Q-2):
+ * History keeps this, never the run-file path, so a rerun re-fetches through
+ * writeRunFile instead of reading a file disposed at the first run's end.
+ */
+export interface RecordedServerSource {
+	symbol: string;
+	displayName: string;
+	assetClass?: string;
+	timeframe: Timeframe;
+	/** The run's dateStart..dateEnd when both are set; absent = the trailing default window. */
+	range?: ChartDateRange;
+}
+
+/** Records a first run's server source, timeframe and date range. An unknown timeframe throws. */
+export function recordServerSource(source: ServerDataSource, timeframe: unknown, values: Record<string, unknown>): RecordedServerSource {
+	if (typeof timeframe !== 'string' || !TIMEFRAMES.has(timeframe)) {
+		throw new Error(`Invalid timeframe for the server run: '${String(timeframe)}'`);
+	}
+	const recorded: RecordedServerSource = { symbol: source.symbol, displayName: source.displayName, timeframe: timeframe as Timeframe };
+	if (source.assetClass !== undefined) {
+		recorded.assetClass = source.assetClass;
+	}
+	const { dateStart, dateEnd } = values;
+	if (typeof dateStart === 'string' && dateStart && typeof dateEnd === 'string' && dateEnd) {
+		if (!Number.isFinite(Date.parse(dateStart)) || !Number.isFinite(Date.parse(dateEnd))) {
+			throw new Error(`Invalid run date range: '${dateStart}'..'${dateEnd}'`);
+		}
+		recorded.range = { start: dateStart, end: dateEnd };
+	}
+	return recorded;
+}
+
+/** Reads a recorded server source back from a History config; anything malformed throws, naming the field. */
+export function parseRecordedServerSource(value: unknown): RecordedServerSource {
+	const malformed = (field: string): Error => new Error(`The run config's recorded server source is malformed: ${field}`);
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		throw malformed('not an object');
+	}
+	const raw = value as Record<string, unknown>;
+	if (typeof raw.symbol !== 'string' || !raw.symbol) {
+		throw malformed('symbol');
+	}
+	if (typeof raw.displayName !== 'string') {
+		throw malformed('displayName');
+	}
+	if (raw.assetClass !== undefined && typeof raw.assetClass !== 'string') {
+		throw malformed('assetClass');
+	}
+	if (typeof raw.timeframe !== 'string' || !TIMEFRAMES.has(raw.timeframe)) {
+		throw malformed(`timeframe '${String(raw.timeframe)}'`);
+	}
+	const recorded: RecordedServerSource = { symbol: raw.symbol, displayName: raw.displayName, timeframe: raw.timeframe as Timeframe };
+	if (raw.assetClass !== undefined) {
+		recorded.assetClass = raw.assetClass;
+	}
+	if (raw.range !== undefined) {
+		const range = raw.range as Record<string, unknown> | null;
+		if (typeof range !== 'object' || range === null || typeof range.start !== 'string' || typeof range.end !== 'string') {
+			throw malformed('range');
+		}
+		recorded.range = { start: range.start, end: range.end };
+	}
+	return recorded;
+}
+
+/** The ServerDataSource a recorded source fetches from. */
+export function serverDataSourceOf(recorded: RecordedServerSource): ServerDataSource {
+	return { kind: 'server', symbol: recorded.symbol, displayName: recorded.displayName, assetClass: recorded.assetClass };
+}
+
+/**
+ * A per-run CSV of server bars, written for ONE Python engine run and
+ * disposed at that run's end (QL-DATA Q-2 (a)). Never reused across runs.
+ */
+export interface RunDataFile {
+	readonly path: string;
+	dispose(): Promise<void>;
+}
+
+/**
+ * Writes per-run CSV files of server data for Python engine consumption.
+ * Server data sources cannot be used directly by Python backtests, so each
+ * run gets a fresh CSV that the caller disposes when the run ends.
+ *
+ * DT-3 (QL-DATA): this is the engine's INPUT, not a cache. There is no reuse
+ * window and no retry; the one bars cache lives in the host's main data module.
  */
 export class ServerDataCache {
 	private static instance: ServerDataCache | undefined;
-	private cacheDir: string;
+	private readonly runDir: string;
+	/** Run files written by THIS instance and not yet disposed. */
+	private readonly liveRunFiles = new Set<string>();
 
 	private constructor(context: vscode.ExtensionContext) {
-		this.cacheDir = path.join(context.globalStorageUri.fsPath, 'server-data-cache');
-		if (!fs.existsSync(this.cacheDir)) {
-			fs.mkdirSync(this.cacheDir, { recursive: true });
+		this.runDir = path.join(context.globalStorageUri.fsPath, 'server-data-cache');
+		if (!fs.existsSync(this.runDir)) {
+			fs.mkdirSync(this.runDir, { recursive: true });
 		}
 	}
 
@@ -37,49 +129,54 @@ export class ServerDataCache {
 		return ServerDataCache.instance;
 	}
 
+	/**
+	 * Deletes every run file this instance wrote and has not disposed (a run
+	 * still in flight at deactivation). Each failure is logged, then all are
+	 * thrown together.
+	 */
 	static resetInstance(): void {
 		if (ServerDataCache.instance) {
-			ServerDataCache.instance.clearOldCache();
+			const instance = ServerDataCache.instance;
 			ServerDataCache.instance = undefined;
+			const failures: string[] = [];
+			for (const runPath of Array.from(instance.liveRunFiles)) {
+				instance.liveRunFiles.delete(runPath);
+				try {
+					fs.unlinkSync(runPath);
+				} catch (error) {
+					const message = `${runPath}: ${error instanceof Error ? error.message : String(error)}`;
+					console.error(`ServerDataCache: failed to delete run data file ${message}`);
+					failures.push(message);
+				}
+			}
+			if (failures.length) {
+				throw new Error(`ServerDataCache: ${failures.length} run data file(s) could not be deleted: ${failures.join('; ')}`);
+			}
 		}
 	}
 
 	/**
-	 * Fetch server data and save to temp CSV for Python engine consumption.
-	 * Returns the path to the cached CSV file.
+	 * Fetch server data and write it to a fresh per-run CSV for ONE Python
+	 * engine run. The caller disposes the returned file when the run ends.
 	 *
 	 * @param source Server data source descriptor
 	 * @param timeframe Timeframe to fetch (e.g., '1D', '1H')
-	 * @returns Path to cached CSV file
+	 * @param range The run's date range; absent = DataService's trailing default window
+	 * @returns The run file: its path and its dispose
 	 */
-	async fetchAndCacheToCSV(
+	async writeRunFile(
 		source: ServerDataSource,
-		timeframe: Timeframe
-	): Promise<string> {
+		timeframe: Timeframe,
+		range?: ChartDateRange
+	): Promise<RunDataFile> {
 		// Validate symbol to prevent header injection attacks
 		this.validateSymbol(source.symbol);
 
-		const sanitized = source.symbol.replace(/[^a-zA-Z0-9]/g, '_');
-		const cachePath = path.join(this.cacheDir, `${sanitized}_${timeframe}.csv`);
+		const result = await DataService.getInstance().getOHLCVFromServer(
+			source.symbol, timeframe, range, undefined, source.assetClass
+		);
 
-		// Check if cache exists and is recent (< 5 minutes old)
-		try {
-			const stats = await fsPromises.stat(cachePath);
-			const ageMs = Date.now() - stats.mtimeMs;
-			if (ageMs < 5 * 60 * 1000) {
-				return cachePath; // Use cached file
-			}
-		} catch (error) {
-			// File doesn't exist, continue to fetch fresh data
-		}
-
-		// Fetch fresh data with timeout and retry
-		const dataService = DataService.getInstance();
-		const result = await this.fetchWithRetry(() =>
-			dataService.getOHLCVFromServer(source.symbol, timeframe, undefined, undefined, source.assetClass)
-		, 2, 30000);
-
-		if (!result || !result.data || result.data.length === 0) {
+		if (result.data.length === 0) {
 			throw new Error(`No data available for ${source.symbol}`);
 		}
 
@@ -99,48 +196,46 @@ export class ServerDataCache {
 			return `${date},${open},${high},${low},${close},${volume}`;
 		}).join('\n');
 
-		// Atomic write: write to temp file, then rename
-		const tempPath = `${cachePath}.tmp`;
-		await fsPromises.writeFile(tempPath, header + rows, 'utf8');
-		await fsPromises.rename(tempPath, cachePath);
+		// A unique name per run: two runs never share (or reuse) a file.
+		// 'wx' refuses to overwrite anything already at that path.
+		const sanitized = source.symbol.replace(/[^a-zA-Z0-9]/g, '_');
+		const runPath = path.join(this.runDir, `run-${process.pid}-${sanitized}_${timeframe}_${randomUUID()}.csv`);
+		this.liveRunFiles.add(runPath);
+		try {
+			await fsPromises.writeFile(runPath, header + rows, { encoding: 'utf8', flag: 'wx' });
+		} catch (error) {
+			this.liveRunFiles.delete(runPath);
+			const writeMessage = error instanceof Error ? error.message : String(error);
+			if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+				// A partial file may exist; remove it. ENOENT = the write never created it.
+				try {
+					await fsPromises.unlink(runPath);
+				} catch (cleanupError) {
+					if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+						const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+						throw new Error(`Failed to write run data file ${runPath}: ${writeMessage}; removing the partial file also failed: ${cleanupMessage}`);
+					}
+				}
+			}
+			throw new Error(`Failed to write run data file ${runPath}: ${writeMessage}`);
+		}
 
-		return cachePath;
+		return {
+			path: runPath,
+			dispose: () => this.disposeRunFile(runPath)
+		};
 	}
 
 	/**
-	 * Fetch with timeout and retry logic for transient failures
+	 * Deletes one run file. Idempotent: a second dispose (or one after
+	 * resetInstance already deleted it) does nothing. Any unlink failure throws.
 	 */
-	private async fetchWithRetry<T>(
-		fetchFn: () => Promise<T>,
-		maxRetries: number,
-		timeoutMs: number
-	): Promise<T> {
-		let lastError: Error | undefined;
-
-		for (let attempt = 0; attempt <= maxRetries; attempt++) {
-			try {
-				// Wrap in timeout promise — store handle to clear it on success
-				let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-				const result = await Promise.race([
-					fetchFn(),
-					new Promise<never>((_, reject) => {
-						timeoutHandle = setTimeout(() => reject(new Error('Request timeout')), timeoutMs);
-					})
-				]);
-				clearTimeout(timeoutHandle);
-				return result;
-			} catch (error) {
-				lastError = error instanceof Error ? error : new Error(String(error));
-
-				// Don't retry on last attempt
-				if (attempt < maxRetries) {
-					// Wait before retry (exponential backoff: 1s, 2s)
-					await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
-				}
-			}
+	private async disposeRunFile(runPath: string): Promise<void> {
+		if (!this.liveRunFiles.has(runPath)) {
+			return;
 		}
-
-		throw lastError ?? new Error('Fetch failed with unknown error');
+		this.liveRunFiles.delete(runPath);
+		await fsPromises.unlink(runPath);
 	}
 
 	/**
@@ -176,70 +271,75 @@ export class ServerDataCache {
 	}
 
 	/**
-	 * Sanitize volume to ensure non-negative
+	 * Volume must be present, finite and non-negative: a missing volume is a
+	 * malformed bar, never written as 0.
 	 */
 	private sanitizeVolume(value: number | undefined): number {
-		const vol = value ?? 0;
-		if (!Number.isFinite(vol)) {
-			throw new Error(`Invalid volume: ${vol} (must be finite number)`);
+		if (value === undefined) {
+			throw new Error('Invalid volume: missing (a server bar without volume)');
 		}
-		if (vol < 0) {
-			throw new Error(`Invalid volume: ${vol} (must be non-negative)`);
+		if (!Number.isFinite(value)) {
+			throw new Error(`Invalid volume: ${value} (must be finite number)`);
 		}
-		return vol;
+		if (value < 0) {
+			throw new Error(`Invalid volume: ${value} (must be non-negative)`);
+		}
+		return value;
 	}
 
 	/**
-	 * Clear cache files older than 1 day (async to avoid blocking event loop)
+	 * Startup sweep (called once at activation). The old age-based reuse
+	 * cleanup is gone with the reuse window; this removes the residue a
+	 * crashed session left behind: legacy reuse files (`<symbol>_<tf>.csv`,
+	 * `.tmp`) and run files whose owning process is no longer alive. A run
+	 * file of a live process (another window, or this one) is never touched.
+	 * Failures are logged and shown, never dropped.
 	 */
 	clearOldCache(): void {
-		void this._clearOldCacheAsync();
+		this.sweepResidue().catch(error => {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(`ServerDataCache: residue sweep failed: ${message}`);
+			void vscode.window.showWarningMessage(`Quantlab could not clean up old server-data run files: ${message}`);
+		});
 	}
 
-	private async _clearOldCacheAsync(): Promise<void> {
-		try {
-			await fsPromises.access(this.cacheDir);
-		} catch {
-			return; // Cache dir doesn't exist
-		}
-
-		const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-		let files: string[];
-		try {
-			files = await fsPromises.readdir(this.cacheDir);
-		} catch {
-			return;
-		}
-
-		await Promise.allSettled(files.map(async (file) => {
-			const filePath = path.join(this.cacheDir, file);
-			try {
-				const stats = await fsPromises.stat(filePath);
-				if (stats.mtimeMs < oneDayAgo) {
-					await fsPromises.unlink(filePath);
-				}
-			} catch {
-				// File may have been deleted concurrently — ignore
-			}
-		}));
-	}
-
-	/**
-	 * Clear all cache files
-	 */
-	clearAllCache(): void {
-		if (!fs.existsSync(this.cacheDir)) {
-			return;
-		}
-
-		const files = fs.readdirSync(this.cacheDir);
+	async sweepResidue(): Promise<void> {
+		const files = await fsPromises.readdir(this.runDir);
+		const failures: string[] = [];
 		for (const file of files) {
-			const filePath = path.join(this.cacheDir, file);
-			try {
-				fs.unlinkSync(filePath);
-			} catch (error) {
-				// Ignore errors
+			const match = RUN_FILE_PATTERN.exec(file);
+			if (match && ServerDataCache.isProcessAlive(Number(match[1]))) {
+				continue;
 			}
+			const filePath = path.join(this.runDir, file);
+			try {
+				await fsPromises.unlink(filePath);
+			} catch (error) {
+				failures.push(`${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		if (failures.length) {
+			throw new Error(`${failures.length} file(s) could not be deleted: ${failures.join('; ')}`);
+		}
+	}
+
+	/** Signal 0 probes a pid: ESRCH = no such process; EPERM = alive, not ours. */
+	private static isProcessAlive(pid: number): boolean {
+		if (pid === process.pid) {
+			return true;
+		}
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === 'ESRCH') {
+				return false;
+			}
+			if (code === 'EPERM') {
+				return true;
+			}
+			throw error;
 		}
 	}
 }

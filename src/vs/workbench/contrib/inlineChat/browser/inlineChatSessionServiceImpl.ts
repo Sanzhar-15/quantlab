@@ -21,12 +21,11 @@ import { createTextBufferFactoryFromSnapshot } from '../../../../editor/common/m
 import { IEditorWorkerService } from '../../../../editor/common/services/editorWorker.js';
 import { IModelService } from '../../../../editor/common/services/model.js';
 import { ITextModelService } from '../../../../editor/common/services/resolverService.js';
-import { localize, localize2 } from '../../../../nls.js';
-import { Action2, registerAction2 } from '../../../../platform/actions/common/actions.js';
+import { localize } from '../../../../nls.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
 import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
-import { IInstantiationService, ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
+import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { observableConfigValue } from '../../../../platform/observable/common/platformObservableUtils.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
@@ -37,7 +36,6 @@ import { ITextFileService } from '../../../services/textfile/common/textfiles.js
 import { UntitledTextEditorInput } from '../../../services/untitled/common/untitledTextEditorInput.js';
 import { IChatWidgetService } from '../../chat/browser/chat.js';
 import { IChatAgentService } from '../../chat/common/participants/chatAgents.js';
-import { ChatContextKeys } from '../../chat/common/actions/chatContextKeys.js';
 import { ModifiedFileEntryState } from '../../chat/common/editing/chatEditingService.js';
 import { IChatService } from '../../chat/common/chatService/chatService.js';
 import { ChatAgentLocation } from '../../chat/common/constants.js';
@@ -581,16 +579,3 @@ export class InlineChatEscapeToolContribution extends Disposable {
 	}
 }
 
-registerAction2(class ResetMoveToPanelChatChoice extends Action2 {
-	constructor() {
-		super({
-			id: 'inlineChat.resetMoveToPanelChatChoice',
-			precondition: ChatContextKeys.Setup.hidden.negate(),
-			title: localize2('resetChoice.label', "Reset Choice for 'Move Inline Chat to Panel Chat'"),
-			f1: true
-		});
-	}
-	run(accessor: ServicesAccessor) {
-		accessor.get(IStorageService).remove(InlineChatEscapeToolContribution.DONT_ASK_AGAIN_KEY, StorageScope.PROFILE);
-	}
-});

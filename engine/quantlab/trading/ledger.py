@@ -186,12 +186,12 @@ class SessionLedger:
 
         Args:
             session_id: Unique session identifier
-            ledger_dir: Directory for ledger files (default: ~/.quantlab/ledgers)
+            ledger_dir: Directory for ledger files (default: ~/.deltaplus/ledgers)
             sync_mode: Durability mode ("none", "write", "fsync")
             max_entries_memory: Maximum entries to keep in memory
         """
         self._session_id = session_id
-        self._ledger_dir = Path(ledger_dir) if ledger_dir else Path.home() / ".quantlab" / "ledgers"
+        self._ledger_dir = Path(ledger_dir) if ledger_dir else Path.home() / ".deltaplus" / "ledgers"
         self._sync_mode = sync_mode
         self._max_entries_memory = max_entries_memory
 
@@ -785,7 +785,7 @@ def recover_session_state(
     Returns:
         Reconstructed session state
     """
-    ledger_path = (Path(ledger_dir) if ledger_dir else Path.home() / ".quantlab" / "ledgers")
+    ledger_path = (Path(ledger_dir) if ledger_dir else Path.home() / ".deltaplus" / "ledgers")
     ledger_file = ledger_path / f"{session_id}.wal"
 
     if not ledger_file.exists():

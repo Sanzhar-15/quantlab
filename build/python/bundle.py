@@ -22,6 +22,7 @@ ENGINE_ROOT = Path(__file__).resolve().parent.parent.parent / "engine"
 HIDDEN_IMPORTS = [
     "quantlab",
     "quantlab.daemon",
+    "quantlab.daemon.__main__",
     "quantlab.daemon.main",
     "quantlab.daemon.ipc",
     "quantlab.daemon.lifecycle",
@@ -56,6 +57,9 @@ HIDDEN_IMPORTS = [
     "quantlab.audit",
     "quantlab.calendar",
     "quantlab.precision",
+    # Runnable with -m through quantlab_engine_entry.py (its RUNNABLE_MODULES)
+    "quantlab.cli",
+    "quantlab.cli.run_backtest",
 ]
 
 # Data directories to include in the bundle
@@ -81,7 +85,8 @@ def bundle_engine(output_dir: str, platform: str | None = None) -> Path:
     output_path = Path(output_dir).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
 
-    entry_point = ENGINE_ROOT / "quantlab" / "daemon" / "__main__.py"
+    # The entry dispatches `-m <module>` to a bundled module, anything else to the daemon CLI.
+    entry_point = Path(__file__).resolve().parent / "quantlab_engine_entry.py"
     if not entry_point.exists():
         raise FileNotFoundError(f"Engine entry point not found: {entry_point}")
 
@@ -94,6 +99,7 @@ def bundle_engine(output_dir: str, platform: str | None = None) -> Path:
         "--distpath", str(output_path),
         "--workpath", str(output_path / "_work"),
         "--specpath", str(output_path / "_spec"),
+        "--paths", str(ENGINE_ROOT),
     ]
 
     # Add hidden imports

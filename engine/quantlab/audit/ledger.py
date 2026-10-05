@@ -195,7 +195,7 @@ class AuditLedger:
         """
         self.session_id = session_id
         self.mode = mode
-        self.ledger_dir = ledger_dir or Path.home() / ".quantlab" / "audit"
+        self.ledger_dir = ledger_dir or Path.home() / ".deltaplus" / "audit"
         self.ledger_dir.mkdir(parents=True, exist_ok=True)
 
         self._ledger_path = self.ledger_dir / f"ledger_{session_id}.jsonl"

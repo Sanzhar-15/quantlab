@@ -12,7 +12,7 @@ import * as vscode from 'vscode';
 
 const execFileAsync = promisify(execFile);
 
-const VENV_DIR = path.join(os.homedir(), '.quantlab', 'venv');
+const VENV_DIR = path.join(os.homedir(), '.deltaplus', 'venv');
 const VENV_PYTHON = process.platform === 'win32'
 	? path.join(VENV_DIR, 'Scripts', 'python.exe')
 	: path.join(VENV_DIR, 'bin', 'python');
@@ -39,8 +39,9 @@ async function findBasePython(): Promise<string | undefined> {
 			if (stdout.trim() === '3') {
 				return candidate;
 			}
-		} catch {
+		} catch (err: unknown) {
 			// candidate not found or not Python 3
+			console.warn(`[Quantlab] bootstrap: base Python candidate '${candidate}' rejected: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}
 	return undefined;
@@ -50,7 +51,8 @@ async function verifyDependencies(pythonPath: string): Promise<boolean> {
 	try {
 		await execFileAsync(pythonPath, ['-c', IMPORT_CHECK], { timeout: 15_000 });
 		return true;
-	} catch {
+	} catch (err: unknown) {
+		console.warn(`[Quantlab] bootstrap: dependency check failed for ${pythonPath}: ${err instanceof Error ? err.message : String(err)}`);
 		return false;
 	}
 }
@@ -62,6 +64,13 @@ export namespace PythonBootstrap {
 	}
 
 	export async function ensureDependencies(engineRoot: string): Promise<void> {
+		// Packaged app: the engine ships as a bundle (EngineHost.resolveBundledPython) and there is
+		// no engine source tree to install from, so the bootstrap creates no venv and runs no pip.
+		if (!fs.existsSync(path.join(engineRoot, 'pyproject.toml'))) {
+			console.info('[Quantlab] bootstrap: packaged, installed nothing');
+			return;
+		}
+
 		// Fast path: venv exists and deps are satisfied
 		if (fs.existsSync(VENV_PYTHON)) {
 			const ok = await verifyDependencies(VENV_PYTHON);
@@ -91,7 +100,7 @@ export namespace PythonBootstrap {
 				async (progress) => {
 					// 1. Ensure parent directory exists
 					progress.report({ message: 'Creating virtual environment…' });
-					await fs.promises.mkdir(path.join(os.homedir(), '.quantlab'), { recursive: true });
+					await fs.promises.mkdir(path.join(os.homedir(), '.deltaplus'), { recursive: true });
 
 					// 2. Create venv (or recreate if broken)
 					await execFileAsync(basePython, ['-m', 'venv', VENV_DIR], {

@@ -4,91 +4,42 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import * as http from 'http';
-import * as https from 'https';
 import { ResourcesCatalogResponse, ResourceToolDetail } from '../../types/resources';
 import { ServerToolExecutePayload, ServerToolExecuteResponse, ToolJobStatusResponse } from '../../types/toolExecution';
+import { createHostDataTransport, HOST_DATA_UNAVAILABLE, HostDataTransport } from '../host/hostDataTransport';
 
-// WebSocket interface - simplified for our needs
-interface WebSocketLike {
-	readyState: number;
-	on(event: 'open', listener: () => void): void;
-	on(event: 'message', listener: (data: Buffer | ArrayBuffer | Buffer[]) => void): void;
-	on(event: 'close', listener: () => void): void;
-	on(event: 'error', listener: (err: Error) => void): void;
-	send(data: string): void;
-	close(): void;
+// QL-DATA: every data call goes through the host. The transport in ../host/hostDataTransport.ts is the one
+// door; this file holds no backend origin, no http(s) or WebSocket client and no token. The host answers
+// the parsed 2xx JSON (the backend's {success, data} envelope is unwrapped here) or rejects with a coded
+// error, which every method passes on unchanged.
+
+/** A short, printable preview of a response for shape errors (JSON.stringify(undefined) is undefined). */
+function preview(value: unknown): string {
+	const json = JSON.stringify(value);
+	return json === undefined ? String(value) : json.slice(0, 200);
 }
 
-interface WebSocketConstructor {
-	new(url: string, options?: { headers?: Record<string, string> }): WebSocketLike;
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-// WebSocket types - we'll use dynamic import to handle the ws module
-type WebSocketType = WebSocketLike;
-let WebSocket: WebSocketConstructor | undefined;
-
-// Try to load ws module dynamically
-try {
-	WebSocket = require('ws') as WebSocketConstructor;
-} catch {
-	// ws module not available - WebSocket features will be disabled
-}
-
-// Server configuration - can be overridden via configure()
-/**
- * Default server configuration.
- * SECURITY: For production, configure via QUANTLAB_SERVER_URL environment variable.
- * This default points to the demo server and should only be used in development.
- */
-const DEFAULT_CONFIG = {
-	host: process.env.QUANTLAB_SERVER_HOST ?? 'api.deltaplus.io',
-	port: parseInt(process.env.QUANTLAB_SERVER_PORT ?? '443', 10),
-	baseUrl: process.env.QUANTLAB_SERVER_URL ?? 'https://api.deltaplus.io',
-	wsUrl: process.env.QUANTLAB_WS_URL ?? 'wss://api.deltaplus.io/v1/ws'
-};
-
-/**
- * Get demo credentials from environment variables.
- * SECURITY: Credentials must be provided via environment variables - no defaults.
- * Set QUANTLAB_DEMO_EMAIL and QUANTLAB_DEMO_PASSWORD before using demo mode.
- */
-function getDemoCredentials(): { email: string; password: string } {
-	// No defaults: both variables must be set and non-empty, otherwise fail loudly
-	const email = process.env.QUANTLAB_DEMO_EMAIL;
-	if (email === undefined || email === '') {
-		throw new Error('QUANTLAB_DEMO_EMAIL is unset: export it before using demo mode');
+/** The object a method promises, or a named shape error (an empty or non-object answer is never cast). */
+function expectRecord<T>(label: string, value: unknown): T {
+	if (!isRecord(value)) {
+		throw new Error(`Unexpected ${label} response shape: ${preview(value)}`);
 	}
-	const password = process.env.QUANTLAB_DEMO_PASSWORD;
-	if (password === undefined || password === '') {
-		throw new Error('QUANTLAB_DEMO_PASSWORD is unset: export it before using demo mode');
-	}
-
-	// Basic validation
-	if (!email.includes('@') || email.length < 5) {
-		throw new Error('Invalid demo email format');
-	}
-
-	if (password.length < 6) {
-		throw new Error('Demo password must be at least 6 characters');
-	}
-
-	return { email, password };
+	return value as unknown as T;
 }
 
 // Types matching server API
 export interface ServerUser {
 	id: string;
 	email: string;
-	name: string;
-	tier: string;
-}
-
-export interface AuthResponse {
-	access_token: string;
-	refresh_token: string;
-	expires_in: number;
-	user: ServerUser;
+	// The host identity's name is optional (contract: string | undefined).
+	name?: string;
+	// AUTH-TIER: the tier is real on the backend but the host identity does not carry it yet; the
+	// carry AUTH-TIER supplies the value. Until then it is absent and every display renders no tier.
+	tier?: string;
 }
 
 // Live /v1/symbols shape (verified 2026-06-11). The server has NO sector and
@@ -118,26 +69,6 @@ export interface ServerBar {
 	volume: number;
 	vwap?: number;
 	trade_count?: number;
-}
-
-export interface ServerQuote {
-	type: 'quote';
-	symbol: string;
-	bid: number;
-	ask: number;
-	bid_size: number;
-	ask_size: number;
-	last: number;
-	last_size: number;
-	volume: number;
-	timestamp: string;
-	vwap?: number;
-	open?: number;
-	high?: number;
-	low?: number;
-	close?: number;
-	change?: number;
-	change_pct?: number;
 }
 
 export interface ServerWatchlist {
@@ -400,67 +331,20 @@ export interface BarsRequest {
 	assetClass?: string;
 }
 
-type QuoteHandler = (quote: ServerQuote) => void;
-type ConnectionHandler = () => void;
-type ErrorHandler = (error: Error) => void;
-
 export class ServerApiClient {
 	private static instance: ServerApiClient | undefined;
 
-	private accessToken: string | undefined;
-	private refreshToken: string | undefined;
-	private tokenExpiresAt: number = 0;
 	private user: ServerUser | undefined;
 
-	private ws: WebSocketType | null = null;
-	private wsReconnectTimer: NodeJS.Timeout | null = null;
-	private wsReconnectAttempts: number = 0;
-	private wsMaxReconnectAttempts: number = 10;
-	private wsReconnectDelay: number = 1000;
-	private wsConnecting: boolean = false;
-	private wsConnectionPromise: Promise<void> | null = null;
-	private subscribedSymbols: Set<string> = new Set();
-	private refreshPromise: Promise<void> | null = null;
-
-	// Auth-ready gate: resolves when tokens are first loaded (either from SecretStorage or fresh login).
-	// ensureAuthenticated() awaits this during the startup window to avoid throwing before tokens load.
-	private authReadyResolve: (() => void) | null = null;
-	// Not readonly so clearTokens() can reset it after sign-out without Object.assign hacks.
-	private authReadyPromise: Promise<void> = new Promise<void>(resolve => {
-		this.authReadyResolve = resolve;
-	});
-	// Subscription to external token changes (e.g. DeltaPlusAdapter writes after its own refresh).
-	private _secretStorageDisposable: vscode.Disposable | undefined;
-	// Set to true once initializeServerConnection() has finished (success or failure).
-	// After this point, a missing token means the user is genuinely not signed in.
-	private authFlowComplete: boolean = false;
-
-	private readonly quoteHandlers: Set<QuoteHandler> = new Set();
-	private readonly connectionHandlers: Set<ConnectionHandler> = new Set();
-	private readonly disconnectionHandlers: Set<ConnectionHandler> = new Set();
-	private readonly errorHandlers: Set<ErrorHandler> = new Set();
-
-	private readonly _onDidConnect = new vscode.EventEmitter<void>();
-	readonly onDidConnect = this._onDidConnect.event;
-
-	private readonly _onDidDisconnect = new vscode.EventEmitter<void>();
-	readonly onDidDisconnect = this._onDidDisconnect.event;
-
-	private readonly _onQuote = new vscode.EventEmitter<ServerQuote>();
-	readonly onQuote = this._onQuote.event;
+	// The one data door, resolved once from vscode.quantlabHost. Absent host API: every call rejects
+	// with HOST_DATA_UNAVAILABLE (window decision Q-1 (a)).
+	private readonly transport: HostDataTransport;
 
 	private readonly _onAuthStateChange = new vscode.EventEmitter<boolean>();
 	readonly onAuthStateChange = this._onAuthStateChange.event;
 
-	private readonly _onJobProgress = new vscode.EventEmitter<{ jobId: string; progress: number; message: string }>();
-	readonly onJobProgress = this._onJobProgress.event;
+	// No token store lives here: the signed-in user is pushed in by setHostIdentity().
 
-	private readonly _onJobComplete = new vscode.EventEmitter<{ jobId: string }>();
-	readonly onJobComplete = this._onJobComplete.event;
-
-	private secretStorage: vscode.SecretStorage | undefined;
-
-	private config = { ...DEFAULT_CONFIG };
 	private disposed: boolean = false;
 	private readonly outputChannel: vscode.OutputChannel;
 
@@ -471,6 +355,10 @@ export class ServerApiClient {
 
 	private constructor() {
 		this.outputChannel = vscode.window.createOutputChannel('Quantlab Server');
+		this.transport = createHostDataTransport();
+		if (!this.transport.available) {
+			this.log(`${HOST_DATA_UNAVAILABLE}: every data call rejects with this error`);
+		}
 	}
 
 	static getInstance(): ServerApiClient {
@@ -490,40 +378,14 @@ export class ServerApiClient {
 		}
 		this.disposed = true;
 
-		// Disconnect WebSocket and clear timers
-		this.disconnectWebSocket();
-
 		// Dispose all EventEmitters
-		this._onDidConnect.dispose();
-		this._onDidDisconnect.dispose();
-		this._onQuote.dispose();
 		this._onAuthStateChange.dispose();
-		this._onJobProgress.dispose();
-		this._onJobComplete.dispose();
 
 		// Dispose output channel
 		this.outputChannel.dispose();
 
-		// Clear all handlers
-		this.quoteHandlers.clear();
-		this.connectionHandlers.clear();
-		this.disconnectionHandlers.clear();
-		this.errorHandlers.clear();
-
-		// Clear connection state
-		this.refreshPromise = null;
-		this.wsConnectionPromise = null;
-		this.wsConnecting = false;
-
 		// Clear authentication state
-		this.accessToken = undefined;
-		this.refreshToken = undefined;
-		this.tokenExpiresAt = 0;
 		this.user = undefined;
-
-		// Clean up SecretStorage subscription
-		this._secretStorageDisposable?.dispose();
-		this._secretStorageDisposable = undefined;
 	}
 
 	/**
@@ -536,366 +398,133 @@ export class ServerApiClient {
 		}
 	}
 
-	// Configuration
-	configure(options: Partial<typeof DEFAULT_CONFIG>): void {
-		this.config = { ...this.config, ...options };
-	}
-
-	getConfig(): typeof DEFAULT_CONFIG {
-		return { ...this.config };
-	}
-
 	/**
-	 * Set SecretStorage for persisting tokens to workbench SecretStorage.
-	 * This bridges the extension's auth tokens to QIC's DeltaPlusAdapter.
+	 * Apply the host identity (QL-LOGIN): called by DeltaPlusAuthProvider after it pulls the sign-in
+	 * state from the host. The client holds the user's display fields only -- no token, no refresh
+	 * token, no expiry. Fires onAuthStateChange only when the signed-in state or the user's fields
+	 * changed, so consumers that re-fetch on every fire do not re-fetch on every identity pull.
 	 */
-	setSecretStorage(storage: vscode.SecretStorage): void {
-		this.secretStorage = storage;
+	setHostIdentity(user: ServerUser | undefined): void {
+		const previous = this.user;
+		this.user = user;
 
-		// FIX: Dual-refresh race guard.
-		// DeltaPlusAdapter (in the workbench) refreshes tokens at T-5min using a proactive
-		// threshold. With rotating refresh tokens, it invalidates the old refresh token before
-		// ServerApiClient's T-60s refresh fires. Subscribing here means we pick up any token
-		// written by the adapter and stay in sync, preventing the stale-refresh 401.
-		this._secretStorageDisposable?.dispose();
-		this._secretStorageDisposable = storage.onDidChange(async e => {
-			if (e.key !== 'qic.deltaplusAccessToken') { return; }
-			if (!this.refreshToken) { return; } // not initialized yet -- ignore
-			const newAccess = await storage.get('qic.deltaplusAccessToken');
-			if (!newAccess || newAccess === this.accessToken) { return; } // no change
-			const newRefresh = await storage.get('qic.deltaplusRefreshToken');
-			const expiryStr = await storage.get('qic.deltaplusTokenExpiresAt');
-			this.accessToken = newAccess;
-			if (newRefresh) { this.refreshToken = newRefresh; }
-			if (expiryStr) { this.tokenExpiresAt = parseInt(expiryStr, 10); }
-			this.log('Tokens updated from external refresh (DeltaPlusAdapter)');
-		});
-	}
+		const changed = previous?.id !== user?.id
+			|| previous?.email !== user?.email
+			|| previous?.name !== user?.name
+			|| previous?.tier !== user?.tier;
+		if (!changed) { return; }
 
-	/**
-	 * Persist current tokens to SecretStorage so the DeltaPlusAdapter can read them.
-	 */
-	private async persistTokens(): Promise<void> {
-		if (!this.secretStorage || !this.accessToken) { return; }
-		try {
-			await this.secretStorage.store('qic.deltaplusAccessToken', this.accessToken);
-			if (this.refreshToken) {
-				await this.secretStorage.store('qic.deltaplusRefreshToken', this.refreshToken);
-			}
-			await this.secretStorage.store('qic.deltaplusTokenExpiresAt', String(this.tokenExpiresAt));
-		} catch (err) {
-			// System boundary (OS keychain). Do not swallow: a failed persist means the
-			// session will NOT survive a restart -- say so where the operator can see it.
-			this.log(`Token persistence to SecretStorage FAILED -- sign-in will not survive a restart: ${err instanceof Error ? err.message : String(err)}`);
+		if (user && !previous) {
+			this.log('Signed in via the host identity');
 		}
-	}
-
-	// Authentication
-
-	/** Sign in with explicit credentials. Both params are required -- no demo fallback. */
-	async login(email: string, password: string): Promise<AuthResponse> {
-		const response = await this.request<AuthResponse>('POST', '/v1/auth/login', { email, password });
-		this.accessToken = response.access_token;
-		this.refreshToken = response.refresh_token;
-		this.tokenExpiresAt = Date.now() + (response.expires_in * 1000);
-		this.user = response.user;
-		this._onAuthStateChange.fire(true);
-		void this.persistTokens();
-		return response;
-	}
-
-	async loginWithDemo(): Promise<AuthResponse> {
-		const creds = getDemoCredentials();
-		return this.login(creds.email, creds.password);
-	}
-
-	/**
-	 * Register a new user account. Does not set any auth state -- the caller
-	 * must subsequently call login() to obtain tokens.
-	 */
-	async register(email: string, password: string, name: string): Promise<{ message: string }> {
-		return this.requestOnce<{ message: string }>('POST', '/v1/auth/register', { email, password, name });
-	}
-
-	/**
-	 * Performs a health check on the server connection.
-	 * Returns true if the server is reachable and we're authenticated.
-	 */
-	async healthCheck(): Promise<{ healthy: boolean; authenticated: boolean; wsConnected: boolean; error?: string }> {
-		const result = {
-			healthy: false,
-			authenticated: this.isAuthenticated(),
-			wsConnected: this.isWebSocketConnected(),
-			error: undefined as string | undefined
-		};
-
-		try {
-			// Quick ping via symbols endpoint
-			await this.getSymbols();
-			result.healthy = true;
-		} catch (error) {
-			result.error = error instanceof Error ? error.message : 'Unknown error';
-		}
-
-		return result;
-	}
-
-	/**
-	 * Gets the current connection state summary.
-	 */
-	getConnectionState(): { authenticated: boolean; wsConnected: boolean; wsReconnecting: boolean; user?: ServerUser } {
-		return {
-			authenticated: this.isAuthenticated(),
-			wsConnected: this.isWebSocketConnected(),
-			wsReconnecting: this.wsReconnectAttempts > 0 && this.wsReconnectAttempts < this.wsMaxReconnectAttempts,
-			user: this.user
-		};
-	}
-
-	async refreshAccessToken(): Promise<void> {
-		if (!this.refreshToken) {
-			throw new Error('No refresh token available');
-		}
-
-		try {
-			const response = await this.requestOnce<AuthResponse>('POST', '/v1/auth/refresh', {
-				refresh_token: this.refreshToken
-			});
-			this.accessToken = response.access_token;
-			this.refreshToken = response.refresh_token;
-			this.tokenExpiresAt = Date.now() + (response.expires_in * 1000);
-			this.user = response.user ?? this.user;
-			this._onAuthStateChange.fire(true); // signal refreshed tokens to provider
-			void this.persistTokens();
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			if (msg.includes('401') || msg.includes('Unauthorized') || msg.includes('invalid token') || msg.includes('token has expired')) {
-				// Refresh token is expired -- session is dead. Clear state and notify.
-				this.log('Refresh token expired -- clearing session');
-				this.accessToken = undefined;
-				this.refreshToken = undefined;
-				this.tokenExpiresAt = 0;
-				this.user = undefined;
-				this._onAuthStateChange.fire(false);
-				this.disconnectWebSocket();
-			}
-			throw err;
-		}
-	}
-
-	logout(): void {
-		this.accessToken = undefined;
-		this.refreshToken = undefined;
-		this.tokenExpiresAt = 0;
-		this.user = undefined;
-		this.disconnectWebSocket();
-		this._onAuthStateChange.fire(false);
-	}
-
-	/**
-	 * Revoke a specific refresh token on the server (best-effort; ignores errors).
-	 * Called by DeltaPlusAuthProvider.removeSession() before clearing local state.
-	 */
-	async logoutSession(refreshToken: string): Promise<void> {
-		try {
-			await this.requestOnce<void>('POST', '/v1/auth/logout', { refresh_token: refreshToken });
-		} catch {
-			// Best-effort -- local session is cleared regardless.
-		}
-	}
-
-	/**
-	 * Fetch the user profile for a specific access token.
-	 * Used during session migration to validate a legacy token.
-	 */
-	async fetchCurrentUser(accessToken: string): Promise<ServerUser> {
-		// Temporarily override accessToken so requestOnce() sends the correct Bearer header.
-		// Node.js is single-threaded: requestOnce() captures the header synchronously before
-		// any await, so this swap is safe.
-		const prev = this.accessToken;
-		this.accessToken = accessToken;
-		try {
-			return await this.requestOnce<ServerUser>('GET', '/v1/auth/me');
-		} finally {
-			this.accessToken = prev;
-		}
-	}
-
-	/**
-	 * Refresh tokens using a specific refresh token (not the cached one).
-	 * Used during session migration. Does NOT update in-memory auth state.
-	 */
-	async refreshWithToken(refreshToken: string): Promise<AuthResponse> {
-		return this.requestOnce<AuthResponse>('POST', '/v1/auth/refresh', { refresh_token: refreshToken });
+		this._onAuthStateChange.fire(!!user);
 	}
 
 	isAuthenticated(): boolean {
-		return !!this.accessToken && Date.now() < this.tokenExpiresAt;
+		return this.user !== undefined;
 	}
 
 	getUser(): ServerUser | undefined {
 		return this.user;
 	}
 
-	// Token accessors -- used by DeltaPlusAuthProvider to sync refreshed tokens back to SecretStorage.
-	getAccessToken(): string | undefined { return this.accessToken; }
-	getRefreshToken(): string | undefined { return this.refreshToken; }
-	getTokenExpiresAt(): number { return this.tokenExpiresAt; }
-
 	/**
-	 * Called by DeltaPlusAuthProvider when a session is loaded or created.
-	 * Resolves the auth-ready gate so all pending ensureAuthenticated() calls proceed.
+	 * One data call through the host. The host's rejection (with its code) propagates unchanged; a
+	 * {success, data} envelope is unwrapped, and a {success: false} envelope throws its message.
 	 */
-	setSessionTokens(access: string, refresh: string, expiresAt: number, user: ServerUser): void {
-		this.accessToken = access;
-		this.refreshToken = refresh;
-		this.tokenExpiresAt = expiresAt;
-		this.user = user;
-		this._onAuthStateChange.fire(true);
-		void this.persistTokens();
-		// Resolve the startup gate so all pending API calls can proceed.
-		if (this.authReadyResolve) {
-			this.authReadyResolve();
-			this.authReadyResolve = null;
-		}
-	}
-
-	/**
-	 * Called by DeltaPlusAuthProvider on sign-out. Clears all in-memory tokens
-	 * and fires onAuthStateChange so listeners can react (e.g. disconnect WebSocket).
-	 */
-	clearTokens(): void {
-		this.accessToken = undefined;
-		this.refreshToken = undefined;
-		this.tokenExpiresAt = 0;
-		this.user = undefined;
-		// Reset the gate for next sign-in.
-		if (!this.authReadyResolve) {
-			this.authReadyPromise = new Promise<void>(resolve => { this.authReadyResolve = resolve; });
-		}
-		this.disconnectWebSocket();
-		this._onAuthStateChange.fire(false);
-	}
-
-	/** Called by extension.ts after initializeServerConnection() completes. */
-	markAuthFlowComplete(): void {
-		this.authFlowComplete = true;
-		// If no tokens arrived, reject waiters immediately by resolving with a flag check.
-		// They will then throw "Not signed in" from ensureAuthenticated().
-		if (this.authReadyResolve) {
-			this.authReadyResolve();
-			this.authReadyResolve = null;
-		}
-	}
-
-	private async ensureAuthenticated(): Promise<void> {
-		if (!this.accessToken) {
-			if (!this.authFlowComplete) {
-				// Startup still in progress -- wait up to 5 s for setSessionTokens() to be called.
-				await Promise.race([
-					this.authReadyPromise,
-					new Promise<void>(r => setTimeout(r, 5000))
-				]);
+	private async call(op: string, input: Record<string, unknown>, token?: vscode.CancellationToken): Promise<unknown> {
+		const body = await this.transport.request(op, input, token);
+		if (isRecord(body) && Object.prototype.hasOwnProperty.call(body, 'success') && Object.prototype.hasOwnProperty.call(body, 'data')) {
+			if (body.success === true) {
+				return body.data;
 			}
-			if (!this.accessToken) {
-				throw new Error('Not signed in. Sign in via the account menu to load live data.');
+			const error = body.error;
+			if (isRecord(error) && typeof error.message === 'string') {
+				throw new Error(error.message);
 			}
+			throw new Error(`${op}: the server reported a failure with no message: ${preview(body)}`);
 		}
-
-		// Refresh token if it expires within 60 seconds
-		if (Date.now() > this.tokenExpiresAt - 60000) {
-			// Mutex: reuse in-flight refresh to prevent parallel token refreshes
-			if (!this.refreshPromise) {
-				this.refreshPromise = this.refreshAccessToken().finally(() => {
-					this.refreshPromise = null;
-				});
-			}
-			await this.refreshPromise;
-		}
+		return body;
 	}
+
+	// ---- Data calls (QL-DATA): each method names ONE host op; the input carries the backend's path and
+	// query parameter names, and a request body travels as `body`. The host maps the op to its route. ----
 
 	// REST API - Crypto
 	async getCryptoSymbols(): Promise<CryptoSymbol[]> {
-		await this.ensureAuthenticated();
 		// Live envelope is { coins: [...], count } -- a bare object with NO
 		// {success,data} wrapper (verified 2026-06-11). The key is 'coins',
 		// not 'symbols'.
-		const res = await this.request<{ coins: CryptoSymbol[]; count: number }>('GET', '/v1/crypto/symbols');
-		if (!res || !Array.isArray(res.coins)) {
-			throw new Error(`Unexpected /v1/crypto/symbols response shape: ${JSON.stringify(res).slice(0, 200)}`);
+		const res = await this.call('cryptoSymbols', {});
+		if (!isRecord(res) || !Array.isArray(res.coins)) {
+			throw new Error(`Unexpected /v1/crypto/symbols response shape: ${preview(res)}`);
 		}
-		return res.coins;
+		return res.coins as CryptoSymbol[];
 	}
 
 	// REST API - ETFs
 	async getEtfs(): Promise<EtfItem[]> {
-		await this.ensureAuthenticated();
 		// NOTE: /v1/etfs/ currently returns 503 SERVICE_UNAVAILABLE ('asset
-		// classes data not available', verified 2026-06-11) -- request() throws
+		// classes data not available', verified 2026-06-11) -- the host rejects
 		// with the server's message. Callers must surface that error.
-		const response = await this.request<{ etfs?: EtfItem[] } | EtfItem[]>('GET', '/v1/etfs/');
-		if (Array.isArray(response)) { return response; }
-		const wrapped = (response as { etfs?: EtfItem[] }).etfs;
-		if (!Array.isArray(wrapped)) {
-			throw new Error(`Unexpected /v1/etfs/ response shape: ${JSON.stringify(response).slice(0, 200)}`);
+		const response = await this.call('etfs.list', {});
+		if (Array.isArray(response)) { return response as EtfItem[]; }
+		if (!isRecord(response) || !Array.isArray(response.etfs)) {
+			throw new Error(`Unexpected /v1/etfs/ response shape: ${preview(response)}`);
 		}
-		return wrapped;
+		return response.etfs as EtfItem[];
 	}
 
 	// REST API - Indices
 	async getGlobalIndices(): Promise<IndexItem[]> {
-		await this.ensureAuthenticated();
 		// NOTE: /v1/global-indices/ currently returns 503 SERVICE_UNAVAILABLE
 		// ('global indices data not available', verified 2026-06-11).
-		const response = await this.request<{ indices?: IndexItem[] } | IndexItem[]>('GET', '/v1/global-indices/');
-		if (Array.isArray(response)) { return response; }
-		const wrapped = (response as { indices?: IndexItem[] }).indices;
-		if (!Array.isArray(wrapped)) {
-			throw new Error(`Unexpected /v1/global-indices/ response shape: ${JSON.stringify(response).slice(0, 200)}`);
+		const response = await this.call('globalIndices.list', {});
+		if (Array.isArray(response)) { return response as IndexItem[]; }
+		if (!isRecord(response) || !Array.isArray(response.indices)) {
+			throw new Error(`Unexpected /v1/global-indices/ response shape: ${preview(response)}`);
 		}
-		return wrapped;
+		return response.indices as IndexItem[];
 	}
 
 	// REST API - Fixed Income
 	async getYieldCurve(): Promise<YieldCurvePoint[]> {
-		await this.ensureAuthenticated();
-		const res = await this.request<YieldCurvePoint[]>('GET', '/v1/fixed-income/yield-curve');
+		const res = await this.call('yieldCurve', {});
 		if (!Array.isArray(res)) {
-			throw new Error(`Unexpected /v1/fixed-income/yield-curve response shape: ${JSON.stringify(res).slice(0, 200)}`);
+			throw new Error(`Unexpected /v1/fixed-income/yield-curve response shape: ${preview(res)}`);
 		}
-		return res;
+		return res as YieldCurvePoint[];
 	}
 
 	// REST API - Calendar
 	// All calendar endpoints share the unified {events, total, limit, offset,
 	// has_more} envelope and the unified CalendarEvent schema.
-	private async getCalendarPage(path: string): Promise<CalendarPage> {
-		await this.ensureAuthenticated();
-		const res = await this.request<CalendarPage>('GET', path);
-		if (!res || !Array.isArray(res.events)) {
-			throw new Error(`Unexpected ${path} response shape: ${JSON.stringify(res).slice(0, 200)}`);
+	private async getCalendarPage(op: string, path: string): Promise<CalendarPage> {
+		const res = await this.call(op, {});
+		if (!isRecord(res) || !Array.isArray(res.events)) {
+			throw new Error(`Unexpected ${path} response shape: ${preview(res)}`);
 		}
-		return res;
+		return res as unknown as CalendarPage;
 	}
 
 	async getCalendarEconomic(): Promise<CalendarPage> {
-		return this.getCalendarPage('/v1/calendar/economic');
+		return this.getCalendarPage('calendar.listEconomic', '/v1/calendar/economic');
 	}
 
 	async getCalendarEarnings(): Promise<CalendarPage> {
-		return this.getCalendarPage('/v1/calendar/earnings');
+		return this.getCalendarPage('calendar.listEarnings', '/v1/calendar/earnings');
 	}
 
 	async getCalendarDividends(): Promise<CalendarPage> {
-		return this.getCalendarPage('/v1/calendar/dividends');
+		return this.getCalendarPage('calendar.listDividends', '/v1/calendar/dividends');
 	}
 
 	async getCalendarIPOs(): Promise<CalendarPage> {
-		return this.getCalendarPage('/v1/calendar/ipos');
+		return this.getCalendarPage('calendar.listIpos', '/v1/calendar/ipos');
 	}
 
 	async getCalendarSplits(): Promise<CalendarPage> {
-		return this.getCalendarPage('/v1/calendar/splits');
+		return this.getCalendarPage('calendar.listSplits', '/v1/calendar/splits');
 	}
 
 	async getCalendarCentralBank(): Promise<CalendarPage> {
@@ -907,167 +536,163 @@ export class ServerApiClient {
 
 	// REST API - Sentiment
 	async getSentiment(symbol: string): Promise<SentimentData> {
-		await this.ensureAuthenticated();
-		return this.request<SentimentData>('GET', `/v1/sentiment/${encodeURIComponent(symbol)}`);
+		return expectRecord<SentimentData>('/v1/sentiment', await this.call('sentiment.get', { symbol }));
 	}
 
 	// REST API - News
 	// Live response (verified 2026-06-11) is a direct array after the
 	// {success,data} unwrap -- there is no {articles} wrapper.
 	async getNews(): Promise<NewsItem[]> {
-		await this.ensureAuthenticated();
-		const res = await this.request<NewsItem[]>('GET', '/v1/news/');
+		const res = await this.call('news.list', {});
 		if (!Array.isArray(res)) {
-			throw new Error(`Unexpected /v1/news/ response shape: ${JSON.stringify(res).slice(0, 200)}`);
+			throw new Error(`Unexpected /v1/news/ response shape: ${preview(res)}`);
 		}
-		return res;
+		return res as NewsItem[];
 	}
 
 	async getNewsBySymbol(symbol: string): Promise<NewsItem[]> {
-		await this.ensureAuthenticated();
-		const res = await this.request<NewsItem[]>('GET', `/v1/news/symbol/${encodeURIComponent(symbol)}`);
+		const res = await this.call('news.listBySymbol', { symbol });
 		if (!Array.isArray(res)) {
-			throw new Error(`Unexpected /v1/news/symbol response shape: ${JSON.stringify(res).slice(0, 200)}`);
+			throw new Error(`Unexpected /v1/news/symbol response shape: ${preview(res)}`);
 		}
-		return res;
+		return res as NewsItem[];
 	}
 
 	// REST API - Fundamentals
 	async getFundamentalsProfile(symbol: string): Promise<FundamentalsProfile> {
-		await this.ensureAuthenticated();
-		return this.request<FundamentalsProfile>('GET', `/v1/fundamentals/profile/${encodeURIComponent(symbol)}`);
+		return expectRecord<FundamentalsProfile>('/v1/fundamentals/profile', await this.call('fundamentals.getProfile', { symbol }));
 	}
 
 	async getFundamentalsFinancials(symbol: string): Promise<FundamentalsFinancials> {
-		await this.ensureAuthenticated();
-		return this.request<FundamentalsFinancials>('GET', `/v1/fundamentals/financials/${encodeURIComponent(symbol)}`);
+		return expectRecord<FundamentalsFinancials>('/v1/fundamentals/financials', await this.call('fundamentals.getFinancials', { symbol }));
 	}
 
 	async getFundamentalsRatios(symbol: string): Promise<FundamentalsRatios> {
-		await this.ensureAuthenticated();
-		return this.request<FundamentalsRatios>('GET', `/v1/fundamentals/ratios/${encodeURIComponent(symbol)}`);
+		return expectRecord<FundamentalsRatios>('/v1/fundamentals/ratios', await this.call('fundamentals.getRatios', { symbol }));
 	}
 
 	// REST API - Institutional
 	// NOTE: both institutional endpoints currently return 503 SERVICE_UNAVAILABLE
-	// ('institutional data not available', verified 2026-06-11) -- request()
-	// throws with the server's message. Callers must surface that error.
+	// ('institutional data not available', verified 2026-06-11) -- the host
+	// rejects with the server's message. Callers must surface that error.
 	async getInstitutionalHoldings(symbol: string): Promise<InstitutionalHolding[]> {
-		await this.ensureAuthenticated();
-		const response = await this.request<{ holdings?: InstitutionalHolding[] } | InstitutionalHolding[]>('GET', `/v1/institutional/holdings/${encodeURIComponent(symbol)}`);
-		if (Array.isArray(response)) { return response; }
-		const wrapped = (response as { holdings?: InstitutionalHolding[] }).holdings;
-		if (!Array.isArray(wrapped)) {
-			throw new Error(`Unexpected /v1/institutional/holdings response shape: ${JSON.stringify(response).slice(0, 200)}`);
+		const response = await this.call('institutional.listHoldings', { symbol });
+		if (Array.isArray(response)) { return response as InstitutionalHolding[]; }
+		if (!isRecord(response) || !Array.isArray(response.holdings)) {
+			throw new Error(`Unexpected /v1/institutional/holdings response shape: ${preview(response)}`);
 		}
-		return wrapped;
+		return response.holdings as InstitutionalHolding[];
 	}
 
 	async getInstitutionalInsiders(symbol: string): Promise<InsiderTransaction[]> {
-		await this.ensureAuthenticated();
-		const response = await this.request<{ transactions?: InsiderTransaction[] } | InsiderTransaction[]>('GET', `/v1/institutional/insiders/${encodeURIComponent(symbol)}`);
-		if (Array.isArray(response)) { return response; }
-		const wrapped = (response as { transactions?: InsiderTransaction[] }).transactions;
-		if (!Array.isArray(wrapped)) {
-			throw new Error(`Unexpected /v1/institutional/insiders response shape: ${JSON.stringify(response).slice(0, 200)}`);
+		const response = await this.call('institutional.listInsiders', { symbol });
+		if (Array.isArray(response)) { return response as InsiderTransaction[]; }
+		if (!isRecord(response) || !Array.isArray(response.transactions)) {
+			throw new Error(`Unexpected /v1/institutional/insiders response shape: ${preview(response)}`);
 		}
-		return wrapped;
+		return response.transactions as InsiderTransaction[];
 	}
 
 	// REST API - Symbols
 	async getSymbols(): Promise<ServerSymbol[]> {
-		await this.ensureAuthenticated();
 		const PAGE_SIZE = 500;
 		let page = 1;
 		const all: ServerSymbol[] = [];
 		while (true) {
-			const response = await this.request<{ symbols: ServerSymbol[] }>(
-				'GET', `/v1/symbols?page_size=${PAGE_SIZE}&page=${page}`
-			);
-			if (!response || !Array.isArray(response.symbols)) {
-				throw new Error(`Unexpected /v1/symbols response shape: ${JSON.stringify(response).slice(0, 200)}`);
+			const response = await this.call('symbolsPage', { page_size: PAGE_SIZE, page });
+			if (!isRecord(response) || !Array.isArray(response.symbols)) {
+				throw new Error(`Unexpected /v1/symbols response shape: ${preview(response)}`);
 			}
-			all.push(...response.symbols);
-			if (response.symbols.length < PAGE_SIZE) { break; }
+			const symbols = response.symbols as ServerSymbol[];
+			all.push(...symbols);
+			if (symbols.length < PAGE_SIZE) { break; }
 			page++;
 		}
 		return all;
 	}
 
 	async getSymbol(symbol: string): Promise<ServerSymbol> {
-		await this.ensureAuthenticated();
 		// Single-symbol endpoint verified live 2026-06-11 -- no need to page
 		// through the full universe.
-		return this.request<ServerSymbol>('GET', `/v1/symbols/${encodeURIComponent(symbol)}`);
+		return expectRecord<ServerSymbol>('/v1/symbols/{symbol}', await this.call('symbols.get', { symbol }));
 	}
 
 	// REST API - Bars (Historical Data)
 	async getBars(params: BarsRequest, token?: vscode.CancellationToken): Promise<ServerBar[]> {
-		await this.ensureAuthenticated();
-
 		if (params.assetClass?.toLowerCase() === 'crypto') {
 			return this.getCryptoBars(params, token);
 		}
 
-		const query = new URLSearchParams();
-		query.set('timeframe', params.timeframe);
+		const input: Record<string, unknown> = { symbol: params.symbol, timeframe: params.timeframe };
 		if (params.from !== undefined) {
-			query.set('from', params.from.toString());
+			input.from = params.from;
 		}
 		if (params.to !== undefined) {
-			query.set('to', params.to.toString());
+			input.to = params.to;
 		}
 		if (params.limit !== undefined) {
-			query.set('limit', params.limit.toString());
+			input.limit = params.limit;
 		}
 
 		// Server returns { symbol, timeframe, bars: [...], count }
-		const response = await this.request<{ bars: ServerBar[]; count: number }>('GET', `/v1/bars/${params.symbol}?${query.toString()}`, undefined, token);
-		return response.bars ?? [];
+		const response = await this.call('bars', input, token);
+		if (!isRecord(response) || !Array.isArray(response.bars)) {
+			throw new Error(`Unexpected /v1/bars response shape: ${preview(response)}`);
+		}
+		return response.bars as ServerBar[];
 	}
 
 	// Crypto endpoint uses ?tf= (not ?timeframe=) and only supports 1d/1h/1m.
 	// Returns per-exchange bars that must be aggregated into one bar per timestamp.
 	private async getCryptoBars(params: BarsRequest, token?: vscode.CancellationToken): Promise<ServerBar[]> {
-		const tf = this.toCryptoTimeframe(params.timeframe);
-		const query = new URLSearchParams();
-		query.set('tf', tf);
+		const input: Record<string, unknown> = { symbol: params.symbol, tf: this.toCryptoTimeframe(params.timeframe) };
 		if (params.limit !== undefined) {
-			query.set('limit', params.limit.toString());
+			input.limit = params.limit;
 		}
 		// Note: crypto endpoint ignores from/to params -- date-range filtering not supported
 
 		interface CryptoRawBar { t: string; o: number; h: number; l: number; c: number; v: number }
-		const response = await this.request<{ bars: CryptoRawBar[] }>('GET', `/v1/crypto/bars/${params.symbol}?${query.toString()}`, undefined, token);
-		const raw = response.bars ?? [];
+		const response = await this.call('cryptoBars', input, token);
+		if (!isRecord(response) || !Array.isArray(response.bars)) {
+			throw new Error(`Unexpected /v1/crypto/bars response shape: ${preview(response)}`);
+		}
+		const raw = response.bars as CryptoRawBar[];
 
-		// Aggregate per-exchange bars into one bar per timestamp
-		const byTimestamp = new Map<string, { open: number; high: number; low: number; close: number; volume: number; volOpen: number; volClose: number }>();
+		// Aggregate per-exchange bars into one bar per timestamp: open/close are volume-weighted, so a
+		// bar without a volume, or a timestamp whose total volume is 0, has no defined open/close and
+		// throws (it is never priced at 0).
+		const byTimestamp = new Map<string, { open: number; high: number; low: number; close: number; volume: number }>();
 		for (const bar of raw) {
-			const v = bar.v ?? 0;
+			if (typeof bar.v !== 'number') {
+				throw new Error(`Crypto bar for ${params.symbol} at ${bar.t} has no volume: ${preview(bar)}`);
+			}
+			const v = bar.v;
 			const existing = byTimestamp.get(bar.t);
 			if (!existing) {
-				byTimestamp.set(bar.t, { open: bar.o * v, high: bar.h, low: bar.l, close: bar.c * v, volume: v, volOpen: v, volClose: v });
+				byTimestamp.set(bar.t, { open: bar.o * v, high: bar.h, low: bar.l, close: bar.c * v, volume: v });
 			} else {
 				existing.high = Math.max(existing.high, bar.h);
 				existing.low = Math.min(existing.low, bar.l);
 				existing.open += bar.o * v;
 				existing.close += bar.c * v;
 				existing.volume += v;
-				existing.volOpen += v;
-				existing.volClose += v;
 			}
 		}
 
-		return Array.from(byTimestamp.entries()).map(([timestamp, agg]) => ({
-			symbol: params.symbol,
-			timestamp,
-			open: agg.volOpen > 0 ? agg.open / agg.volOpen : 0,
-			high: agg.high,
-			low: agg.low,
-			close: agg.volClose > 0 ? agg.close / agg.volClose : 0,
-			volume: agg.volume,
-		}));
+		return Array.from(byTimestamp.entries()).map(([timestamp, agg]) => {
+			if (agg.volume <= 0) {
+				throw new Error(`Crypto bars for ${params.symbol} at ${timestamp} have zero total volume: the volume-weighted open/close is undefined`);
+			}
+			return {
+				symbol: params.symbol,
+				timestamp,
+				open: agg.open / agg.volume,
+				high: agg.high,
+				low: agg.low,
+				close: agg.close / agg.volume,
+				volume: agg.volume,
+			};
+		});
 	}
 
 	// Map server timeframe → crypto endpoint tf param (only 1d/1h/1m supported)
@@ -1079,69 +704,59 @@ export class ServerApiClient {
 
 	// REST API - Watchlists
 	async getWatchlists(): Promise<ServerWatchlist[]> {
-		await this.ensureAuthenticated();
 		// The list endpoint wraps the array: { count, watchlists: [...] }
 		// (live shape verified 2026-06-11; single-watchlist CRUD endpoints
 		// return the bare watchlist object in `data`).
-		const res = await this.request<{ count: number; watchlists: ServerWatchlist[] }>('GET', '/v1/watchlists');
-		if (!res || !Array.isArray(res.watchlists)) {
-			throw new Error(`Unexpected /v1/watchlists response shape: ${JSON.stringify(res).slice(0, 200)}`);
+		const res = await this.call('watchlists.list', {});
+		if (!isRecord(res) || !Array.isArray(res.watchlists)) {
+			throw new Error(`Unexpected /v1/watchlists response shape: ${preview(res)}`);
 		}
-		return res.watchlists;
+		return res.watchlists as ServerWatchlist[];
 	}
 
 	async createWatchlist(name: string, symbols: string[] = []): Promise<ServerWatchlist> {
-		await this.ensureAuthenticated();
-		return this.request<ServerWatchlist>('POST', '/v1/watchlists', { name, symbols });
+		return expectRecord<ServerWatchlist>('POST /v1/watchlists', await this.call('watchlists.create', { body: { name, symbols } }));
 	}
 
 	async getWatchlist(id: string): Promise<ServerWatchlist> {
-		await this.ensureAuthenticated();
-		return this.request<ServerWatchlist>('GET', `/v1/watchlists/${id}`);
+		return expectRecord<ServerWatchlist>('/v1/watchlists/{id}', await this.call('watchlists.get', { id }));
 	}
 
 	async updateWatchlist(id: string, updates: Partial<Omit<ServerWatchlist, 'id'>>): Promise<ServerWatchlist> {
-		await this.ensureAuthenticated();
 		// The live server only accepts PATCH here -- PUT returns 405
 		// (Allow: GET, PATCH, DELETE; verified live 2026-06-11).
-		return this.request<ServerWatchlist>('PATCH', `/v1/watchlists/${id}`, updates);
+		return expectRecord<ServerWatchlist>('PATCH /v1/watchlists/{id}', await this.call('watchlists.update', { id, body: updates }));
 	}
 
 	async deleteWatchlist(id: string): Promise<void> {
-		await this.ensureAuthenticated();
-		await this.request<void>('DELETE', `/v1/watchlists/${id}`);
+		await this.call('watchlists.delete', { id });
 	}
 
 	// REST API - Alerts
 	async getAlerts(): Promise<ServerAlert[]> {
-		await this.ensureAuthenticated();
 		// The list endpoint wraps the array: { alerts: [...], count }
 		// (live shape verified 2026-06-11, same envelope style as watchlists).
-		const res = await this.request<{ alerts: ServerAlert[]; count: number }>('GET', '/v1/alerts');
-		if (!res || !Array.isArray(res.alerts)) {
-			throw new Error(`Unexpected /v1/alerts response shape: ${JSON.stringify(res).slice(0, 200)}`);
+		const res = await this.call('alerts.list', {});
+		if (!isRecord(res) || !Array.isArray(res.alerts)) {
+			throw new Error(`Unexpected /v1/alerts response shape: ${preview(res)}`);
 		}
-		return res.alerts;
+		return res.alerts as ServerAlert[];
 	}
 
 	async createAlert(alert: Omit<ServerAlert, 'id' | 'status' | 'triggered_at'>): Promise<ServerAlert> {
-		await this.ensureAuthenticated();
-		return this.request<ServerAlert>('POST', '/v1/alerts', alert);
+		return expectRecord<ServerAlert>('POST /v1/alerts', await this.call('alerts.create', { body: alert }));
 	}
 
 	async getAlert(id: string): Promise<ServerAlert> {
-		await this.ensureAuthenticated();
-		return this.request<ServerAlert>('GET', `/v1/alerts/${id}`);
+		return expectRecord<ServerAlert>('/v1/alerts/{id}', await this.call('alerts.get', { id }));
 	}
 
 	async updateAlert(id: string, updates: Partial<Omit<ServerAlert, 'id'>>): Promise<ServerAlert> {
-		await this.ensureAuthenticated();
-		return this.request<ServerAlert>('PUT', `/v1/alerts/${id}`, updates);
+		return expectRecord<ServerAlert>('PUT /v1/alerts/{id}', await this.call('alerts.update', { id, body: updates }));
 	}
 
 	async deleteAlert(id: string): Promise<void> {
-		await this.ensureAuthenticated();
-		await this.request<void>('DELETE', `/v1/alerts/${id}`);
+		await this.call('alerts.delete', { id });
 	}
 
 	// REST API - Demo Control: REMOVED 2026-06-11. All eleven /v1/demo/*
@@ -1151,40 +766,35 @@ export class ServerApiClient {
 
 	// REST API - Resources Catalog
 	async getResourcesCatalog(cachedVersion?: string): Promise<ResourcesCatalogResponse | null> {
-		await this.ensureAuthenticated();
-		const query = cachedVersion ? `?v=${encodeURIComponent(cachedVersion)}` : '';
-		return this.request<ResourcesCatalogResponse | null>('GET', `/v1/resources/catalog${query}`);
+		// `null` is the host's answer for an empty 2xx body (catalog unchanged since cachedVersion).
+		const res = await this.call('resources.getCatalog', cachedVersion ? { v: cachedVersion } : {});
+		if (res === null) { return null; }
+		return expectRecord<ResourcesCatalogResponse>('/v1/resources/catalog', res);
 	}
 
 	async getResourcesCatalogVersion(): Promise<{ version: string; tool_count: number }> {
-		await this.ensureAuthenticated();
-		return this.request<{ version: string; tool_count: number }>('GET', '/v1/resources/catalog/version');
+		return expectRecord<{ version: string; tool_count: number }>('/v1/resources/catalog/version', await this.call('resources.getCatalogVersion', {}));
 	}
 
 	async getResourceToolDetail(toolId: string): Promise<ResourceToolDetail> {
-		await this.ensureAuthenticated();
-		return this.request<ResourceToolDetail>('GET', `/v1/resources/tools/${encodeURIComponent(toolId)}`);
+		return expectRecord<ResourceToolDetail>('/v1/resources/tools/{toolId}', await this.call('resources.getToolDetail', { toolId }));
 	}
 
 	// REST API - Tool Execution
 	async executeToolJob(payload: ServerToolExecutePayload): Promise<ServerToolExecuteResponse> {
-		await this.ensureAuthenticated();
-		return this.request<ServerToolExecuteResponse>('POST', '/v1/tools/execute', payload);
+		return expectRecord<ServerToolExecuteResponse>('POST /v1/tools/execute', await this.call('tools.execute', { body: payload }));
 	}
 
 	async getToolJobStatus(jobId: string): Promise<ToolJobStatusResponse> {
-		await this.ensureAuthenticated();
-		return this.request<ToolJobStatusResponse>('GET', `/v1/tools/${encodeURIComponent(jobId)}/status`);
+		return expectRecord<ToolJobStatusResponse>('/v1/tools/{jobId}/status', await this.call('tools.getStatus', { jobId }));
 	}
 
 	async getToolJobResult(jobId: string): Promise<unknown> {
-		await this.ensureAuthenticated();
-		return this.request<unknown>('GET', `/v1/tools/${encodeURIComponent(jobId)}/result`);
+		return this.call('tools.getResult', { jobId });
 	}
 
 	async cancelToolJob(jobId: string): Promise<void> {
-		await this.ensureAuthenticated();
-		await this.request<void>('DELETE', `/v1/tools/${encodeURIComponent(jobId)}`);
+		await this.call('tools.cancel', { jobId });
 	}
 
 	// Strategy Validation
@@ -1201,413 +811,6 @@ export class ServerApiClient {
 		throw new Error('Strategy templates endpoint /v1/strategies/templates is not provisioned on the server (404)');
 	}
 
-	// WebSocket Connection
-	async connectWebSocket(): Promise<void> {
-		if (!WebSocket) {
-			throw new Error('WebSocket support not available. Install the "ws" package.');
-		}
-
-		// Already connected
-		if (this.ws?.readyState === 1) { // WebSocket.OPEN = 1
-			return;
-		}
-
-		// If connection is in progress, wait for it
-		if (this.wsConnecting && this.wsConnectionPromise) {
-			return this.wsConnectionPromise;
-		}
-
-		// Set connecting flag BEFORE the async ensureAuthenticated call to prevent TOCTOU race
-		this.wsConnecting = true;
-		this.wsConnectionPromise = (async () => {
-			try {
-				await this.ensureAuthenticated();
-
-				// Double-check after async call (another caller may have connected)
-				if (this.ws?.readyState === 1) {
-					return;
-				}
-
-				await this.doConnectWebSocket();
-			} finally {
-				this.wsConnecting = false;
-				this.wsConnectionPromise = null;
-			}
-		})();
-
-		return this.wsConnectionPromise;
-	}
-
-	private doConnectWebSocket(): Promise<void> {
-		return new Promise((resolve, reject) => {
-			// Server's checkOrigin() rejects connections with empty Origin.
-			// Token is sent via message-based auth (not query param).
-			this.ws = new WebSocket!(this.config.wsUrl, {
-				headers: {
-					'Origin': 'https://api.deltaplus.io',
-				}
-			}) as WebSocketType;
-
-			const timeout = setTimeout(() => {
-				this.ws?.close();
-				reject(new Error('WebSocket connection timeout'));
-			}, 10000);
-
-			this.ws.on('open', () => {
-				// Send auth message -- server validates token and replies with
-				// {"type":"connected","data":{"authenticated":true,...}}
-				this.ws!.send(JSON.stringify({ type: 'auth', token: this.accessToken }));
-			});
-
-			let authConfirmed = false;
-
-			this.ws.on('message', (data: Buffer | ArrayBuffer | Buffer[]) => {
-				if (!authConfirmed) {
-					try {
-						const msg = JSON.parse(data.toString()) as Record<string, unknown>;
-						const msgData = msg.data as Record<string, unknown> | undefined;
-						// Server sends {"type":"connected","data":{"authenticated":true,...}} on successful auth
-						if (msg.type === 'connected' && msgData?.authenticated === true) {
-							authConfirmed = true;
-							clearTimeout(timeout);
-							this.wsReconnectAttempts = 0;
-							this._onDidConnect.fire();
-							for (const handler of this.connectionHandlers) {
-								handler();
-							}
-							// Re-subscribe to previously subscribed symbols
-							if (this.subscribedSymbols.size > 0) {
-								this.subscribe(Array.from(this.subscribedSymbols));
-							}
-							resolve();
-							return;
-						}
-						// Server sends {"type":"connected","data":{"authenticated":false,...}} on auth failure
-						if (msg.type === 'connected' && msgData?.authenticated === false) {
-							authConfirmed = true;
-							clearTimeout(timeout);
-							this.ws?.close();
-							reject(new Error('WebSocket authentication rejected by server'));
-							return;
-						}
-					} catch { /* not the auth handshake, fall through */ }
-				}
-				this.handleWebSocketMessage(data);
-			});
-
-			this.ws.on('close', () => {
-				clearTimeout(timeout);
-				if (this.disposed) {
-					return;
-				}
-				this._onDidDisconnect.fire();
-				for (const handler of this.disconnectionHandlers) {
-					handler();
-				}
-				this.scheduleReconnect();
-			});
-
-			this.ws.on('error', (err: Error) => {
-				clearTimeout(timeout);
-				for (const handler of this.errorHandlers) {
-					handler(err);
-				}
-				reject(err);
-			});
-		});
-	}
-
-	private handleWebSocketMessage(data: Buffer | ArrayBuffer | Buffer[]): void {
-		try {
-			const message = JSON.parse(data.toString());
-
-			// Handle job progress events
-			if (message && typeof message === 'object' && message.type === 'job-progress') {
-				this._onJobProgress.fire({
-					jobId: message.job_id,
-					progress: message.progress ?? 0,
-					message: message.message ?? '',
-				});
-				return;
-			}
-
-			// Handle job completion events
-			if (message && typeof message === 'object' && message.type === 'job-complete') {
-				this._onJobComplete.fire({ jobId: message.job_id });
-				return;
-			}
-
-			if (!this.isValidQuote(message)) {
-				return;
-			}
-			const quote = message as ServerQuote;
-			this._onQuote.fire(quote);
-			for (const handler of this.quoteHandlers) {
-				handler(quote);
-			}
-		} catch (err: unknown) {
-			// Log parse errors for debugging but don't crash
-			const errMessage = err instanceof Error ? err.message : String(err);
-			this.log(`WebSocket message parse error: ${errMessage}`);
-		}
-	}
-
-	private isValidQuote(message: unknown): message is ServerQuote {
-		if (!message || typeof message !== 'object') {
-			return false;
-		}
-		const msg = message as Record<string, unknown>;
-		return (
-			msg.type === 'quote' &&
-			typeof msg.symbol === 'string' &&
-			typeof msg.bid === 'number' &&
-			typeof msg.ask === 'number' &&
-			typeof msg.last === 'number'
-		);
-	}
-
-	disconnectWebSocket(): void {
-		if (this.wsReconnectTimer) {
-			clearTimeout(this.wsReconnectTimer);
-			this.wsReconnectTimer = null;
-		}
-		this.wsReconnectAttempts = this.wsMaxReconnectAttempts; // Prevent reconnection
-
-		if (this.ws) {
-			this.ws.close();
-			this.ws = null;
-		}
-
-		this.subscribedSymbols.clear();
-	}
-
-	private scheduleReconnect(): void {
-		if (this.disposed || this.wsReconnectAttempts >= this.wsMaxReconnectAttempts) {
-			return;
-		}
-
-		const delay = this.wsReconnectDelay * Math.pow(2, this.wsReconnectAttempts);
-		this.wsReconnectTimer = setTimeout(async () => {
-			if (this.disposed) {
-				return;
-			}
-			this.wsReconnectAttempts++;
-			try {
-				await this.connectWebSocket();
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				// If reconnect failed due to auth (session expired), stop retrying.
-				// onAuthStateChange(false) was already fired by refreshAccessToken().
-				if (msg.includes('Not signed in') || msg.includes('session expired') || msg.includes('Refresh token expired')) {
-					this.log('WebSocket reconnect aborted -- session expired, user must re-authenticate');
-					this.wsReconnectAttempts = this.wsMaxReconnectAttempts; // stop loop
-					return;
-				}
-				// Transient error -- close handler will schedule the next reconnect
-			}
-		}, delay);
-	}
-
-	isWebSocketConnected(): boolean {
-		return this.ws?.readyState === 1; // WebSocket.OPEN = 1
-	}
-
-	// WebSocket Subscriptions
-	subscribe(symbols: string[]): void {
-		for (const symbol of symbols) {
-			this.subscribedSymbols.add(symbol);
-		}
-
-		if (this.ws?.readyState === 1) { // WebSocket.OPEN = 1
-			this.ws.send(JSON.stringify({
-				type: 'subscribe',
-				symbols
-			}));
-		} else if (this.wsConnecting) {
-			// WS is connecting -- symbols are tracked in subscribedSymbols
-			// and will be sent automatically when the connection opens
-			this.log(`Queued ${symbols.length} subscription(s) for pending connection`);
-		}
-	}
-
-	unsubscribe(symbols: string[]): void {
-		for (const symbol of symbols) {
-			this.subscribedSymbols.delete(symbol);
-		}
-
-		if (this.ws?.readyState === 1) { // WebSocket.OPEN = 1
-			this.ws.send(JSON.stringify({
-				type: 'unsubscribe',
-				symbols
-			}));
-		}
-	}
-
-	getSubscribedSymbols(): string[] {
-		return Array.from(this.subscribedSymbols);
-	}
-
-	// Event handlers
-	onQuoteReceived(handler: QuoteHandler): vscode.Disposable {
-		this.quoteHandlers.add(handler);
-		return { dispose: () => this.quoteHandlers.delete(handler) };
-	}
-
-	onConnected(handler: ConnectionHandler): vscode.Disposable {
-		this.connectionHandlers.add(handler);
-		return { dispose: () => this.connectionHandlers.delete(handler) };
-	}
-
-	onDisconnected(handler: ConnectionHandler): vscode.Disposable {
-		this.disconnectionHandlers.add(handler);
-		return { dispose: () => this.disconnectionHandlers.delete(handler) };
-	}
-
-	onError(handler: ErrorHandler): vscode.Disposable {
-		this.errorHandlers.add(handler);
-		return { dispose: () => this.errorHandlers.delete(handler) };
-	}
-
-	// HTTP request helper with optional cancellation token
-	private async request<T>(method: string, path: string, body?: unknown, token?: vscode.CancellationToken): Promise<T> {
-		const maxRetries = 3;
-		for (let attempt = 0; attempt <= maxRetries; attempt++) {
-			try {
-				return await this.requestOnce<T>(method, path, body, token);
-			} catch (err: unknown) {
-				const msg = err instanceof Error ? err.message : String(err);
-				if (msg === 'RATE_LIMITED_429') {
-					if (attempt < maxRetries) {
-						const delay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
-						this.log(`Rate limited (429), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
-						await new Promise(r => setTimeout(r, delay));
-						continue;
-					}
-					// Do not let the internal sentinel escape to UI error toasts.
-					throw new Error('Rate limit exceeded, please try again later');
-				}
-				throw err;
-			}
-		}
-		throw new Error('Max retries exceeded');
-	}
-
-	private async requestOnce<T>(method: string, path: string, body?: unknown, token?: vscode.CancellationToken): Promise<T> {
-		if (token?.isCancellationRequested) {
-			throw new Error('Cancelled');
-		}
-
-		const url = new URL(path, this.config.baseUrl);
-		const isHttps = url.protocol === 'https:';
-		const transport = isHttps ? https : http;
-
-		const headers: Record<string, string> = {
-			'Content-Type': 'application/json'
-		};
-
-		if (this.accessToken) {
-			headers['Authorization'] = `Bearer ${this.accessToken}`;
-		}
-
-		return new Promise((resolve, reject) => {
-			const options = {
-				hostname: url.hostname,
-				port: url.port || (isHttps ? 443 : 80),
-				path: url.pathname + url.search,
-				method,
-				headers
-			};
-
-			const req = transport.request(options, (res) => {
-				let data = '';
-				res.on('data', chunk => data += chunk);
-				res.on('end', () => {
-					cleanup();
-					if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-						try {
-							if (data) {
-								const parsed = JSON.parse(data);
-								// Server wraps responses in { success: true, data: ... }
-								if (parsed && typeof parsed === 'object' && Object.prototype.hasOwnProperty.call(parsed, 'success') && Object.prototype.hasOwnProperty.call(parsed, 'data')) {
-									if (parsed.success) {
-										resolve(parsed.data as T);
-									} else {
-										reject(new Error(parsed.error?.message ?? 'Request failed'));
-									}
-								} else {
-									resolve(parsed as T);
-								}
-							} else {
-								resolve(undefined as T);
-							}
-						} catch (parseErr) {
-							// A 2xx body that is not JSON is a protocol violation --
-							// surface it instead of silently casting a string to T.
-							reject(new Error(`Invalid JSON response from ${method} ${path}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`));
-						}
-					} else if (res.statusCode === 429) {
-						cleanup();
-						reject(new Error('RATE_LIMITED_429'));
-					} else {
-						// Sanitize error messages - don't expose internal details
-						let errorMessage = `Server error (${res.statusCode})`;
-						try {
-							const errorBody = JSON.parse(data);
-							if (errorBody.message && typeof errorBody.message === 'string') {
-								// Use message if it looks safe (limit length, no stack traces)
-								const safeMessage = errorBody.message.substring(0, 200);
-								if (!safeMessage.includes('at ') && !safeMessage.includes('Error:')) {
-									errorMessage = safeMessage;
-								}
-							} else if (errorBody.error && typeof errorBody.error === 'string') {
-								errorMessage = errorBody.error.substring(0, 200);
-							} else if (errorBody.error && typeof errorBody.error === 'object' && typeof errorBody.error.message === 'string') {
-								// Live error envelope: { success:false, error:{ code, message } }
-								// (e.g. 503 SERVICE_UNAVAILABLE bodies) -- surface the
-								// server's descriptive message, not the generic status.
-								errorMessage = errorBody.error.message.substring(0, 200);
-							}
-						} catch {
-							// Use generic error message
-						}
-						this.log(`Request failed: ${method} ${path} - ${errorMessage}`);
-						reject(new Error(errorMessage));
-					}
-				});
-			});
-
-			// Handle cancellation with proper cleanup
-			let cancelDisposable: vscode.Disposable | undefined;
-			if (token) {
-				cancelDisposable = token.onCancellationRequested(() => {
-					req.destroy();
-					cancelDisposable?.dispose();
-					reject(new Error('Cancelled'));
-				});
-			}
-
-			// Cleanup cancellation listener on completion
-			const cleanup = () => {
-				cancelDisposable?.dispose();
-			};
-
-			req.on('error', (err) => {
-				cleanup();
-				this.log(`Request error: ${method} ${path} - ${err.message}`);
-				reject(new Error(`Network error: ${err.message}`));
-			});
-			req.setTimeout(30000, () => {
-				cleanup();
-				req.destroy();
-				this.log(`Request timeout: ${method} ${path}`);
-				reject(new Error('Request timeout'));
-			});
-
-			if (body) {
-				req.write(JSON.stringify(body));
-			}
-
-			req.end();
-		});
-	}
+	// No stream is opened here: the WebSocket's job/quote events had no consumer (K-7), so QL-DATA
+	// removed them. A later consumer uses the transport's subscribe().
 }

@@ -9,7 +9,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 
-export type QuantlabViewType = 'editor' | 'chart' | 'action' | 'trade' | 'visualise' | 'stats';
+export type QuantlabViewType = 'editor' | 'chart' | 'action' | 'visualise' | 'stats';
 
 export interface QuantlabTabViewState {
 	readonly tabInstanceId: string;
@@ -43,7 +43,6 @@ export function normalizeQuantlabViewType(view: string | undefined): QuantlabVie
 	switch (view) {
 		case 'chart':
 		case 'action':
-		case 'trade':
 		case 'visualise':
 		case 'stats':
 		case 'editor':
@@ -59,8 +58,6 @@ export function formatQuantlabViewLabel(view: QuantlabViewType): string {
 			return 'Chart';
 		case 'action':
 			return 'Action';
-		case 'trade':
-			return 'Trade';
 		case 'visualise':
 			return 'Visualise';
 		case 'stats':
@@ -80,8 +77,6 @@ export function customEditorViewTypeToQuantlabView(viewType: string | undefined)
 			return 'chart';
 		case 'quantlab.actionView':
 			return 'action';
-		case 'quantlab.tradeView':
-			return 'trade';
 		case 'quantlab.visualiseView':
 			return 'visualise';
 		case 'quantlab.statsView':
@@ -97,7 +92,6 @@ export function customEditorViewTypeToQuantlabView(viewType: string | undefined)
 export function isQuantlabCustomEditorViewType(viewType: string | undefined): boolean {
 	return viewType === 'quantlab.chartView' ||
 		viewType === 'quantlab.actionView' ||
-		viewType === 'quantlab.tradeView' ||
 		viewType === 'quantlab.visualiseView' ||
 		viewType === 'quantlab.statsView';
 }
@@ -112,8 +106,6 @@ export function quantlabViewToCustomEditorViewType(view: QuantlabViewType): stri
 			return 'quantlab.chartView';
 		case 'action':
 			return 'quantlab.actionView';
-		case 'trade':
-			return 'quantlab.tradeView';
 		case 'visualise':
 			return 'quantlab.visualiseView';
 		case 'stats':

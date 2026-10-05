@@ -27,7 +27,7 @@ from qviz.security import MemoryLimitError, SecurityError, TimeoutError_
 
 def _tiny_parquet(tmp_path: Path) -> Path:
     """Self-contained 3-row parquet so this test file doesn't depend on
-    /tmp/quantlab-spike-data (which has its own strict-mode policy)."""
+    the spike parquet (QUANTLAB_TEST_SPIKE_DATA)."""
     out = tmp_path / "data" / "tiny.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
     table = pa.table({

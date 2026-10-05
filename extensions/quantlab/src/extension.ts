@@ -25,15 +25,12 @@ import type { SessionInstance } from './quantbook/types';
 import { registerGlobalStateCommands } from './commands/globalStateCommands';
 import { registerHistoryCommands } from './commands/historyCommands';
 import { registerPanelCommands } from './commands/panelCommands';
-import { registerTradeCommands } from './commands/tradeCommands';
-import { registerAICommands, loadAnthropicKeyIntoProvider } from './commands/aiCommands';
-import { AIPanelProvider } from './panels/AIPanelProvider';
+import { registerImportCommands } from './import';
 import { registerViewCommands } from './commands/viewCommands';
 import { registerDashboardCommands } from './commands/dashboardCommands';
 import { GlobalState } from './core/state/GlobalState';
 import { HistoryState } from './core/state/HistoryState';
 import { TabViewStateManager } from './core/state/TabViewState';
-import { SessionManager } from './core/trading/SessionManager';
 import { StrategyValidator } from './core/strategy/StrategyValidator';
 import { DataPanelProvider } from './panels/data/DataPanelProvider';
 import { WatchlistManager } from './panels/data/WatchlistManager';
@@ -42,12 +39,10 @@ import { HistoryPanelProvider } from './panels/history/HistoryPanelProvider';
 import { ResourcesWebviewProvider } from './panels/resources/ResourcesWebviewProvider';
 import { ResourcesCatalogService } from './panels/resources/ResourcesCatalogService';
 import { SettingsPanelProvider } from './panels/settings/SettingsPanelProvider';
-import { TradePanelProvider } from './panels/trade/TradePanelProvider';
 import { GlobalSelectors } from './ui/GlobalSelectors';
 import { updateContextKeys } from './utils/contextKeys';
 import { ChartViewProvider } from './views/chart/ChartViewProvider';
 import { ActionViewProvider } from './views/action/ActionViewProvider';
-import { TradeViewProvider } from './views/trade/TradeViewProvider';
 import { StatsViewProvider } from './views/stats/StatsViewProvider';
 import { VisualiseDataProvider } from './views/visualise/VisualiseDataProvider';
 import { VisualiseSpecProvider } from './views/visualise/VisualiseSpecProvider';
@@ -60,8 +55,6 @@ import { LifecycleManager } from './qviz/lifecycleManager';
 import { SecureStorage } from './utils/secureStorage';
 import { ThemeProvider } from './ui/tokens/ThemeProvider';
 import { ReducedMotion } from './ui/accessibility/ReducedMotion';
-import { NotificationManager } from './ui/notifications/NotificationManager';
-import { BadgeManager } from './ui/notifications/BadgeManager';
 import { ErrorRecovery } from './ui/errors/ErrorRecovery';
 import { OnboardingManager } from './ui/onboarding/OnboardingManager';
 import { EditorDropProvider } from './ui/dragdrop/EditorDropProvider';
@@ -69,12 +62,11 @@ import { TooltipGuide } from './ui/onboarding/TooltipGuide';
 import { FeatureDiscovery } from './ui/onboarding/FeatureDiscovery';
 import { EngineHost } from './core/engine/EngineHost';
 import { ParameterExtractor } from './core/strategy/ParameterExtractor';
-import { LiveDaemonManager } from './core/trading/LiveDaemonManager';
 import { TrustManager } from './core/trust/TrustManager';
 import { StatsEngine } from './stats/StatsEngine';
 import { PythonBootstrap } from './core/engine/PythonBootstrap';
 import { ServerApiClient } from './core/server/ServerApiClient';
-import { DeltaPlusAuthProvider, DELTAPLUS_PROVIDER_ID } from './auth/DeltaPlusAuthProvider';
+import { DeltaPlusAuthProvider } from './auth/DeltaPlusAuthProvider';
 import { DataViewManager } from './views/DataViewManager';
 import { QuantLabHome } from './auth/QuantLabHome';
 import { DataService } from './core/engine/DataService';
@@ -83,7 +75,6 @@ import { ServerSymbolFileSystemProvider } from './core/virtualfs/ServerSymbolFil
 import { ServerDataCache } from './core/engine/ServerDataCache';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
 	EngineHost.initialize(context.extensionUri);
@@ -101,60 +92,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 	// Initialize Delta Plus Server connection (non-blocking)
 	const serverClient = ServerApiClient.getInstance();
-	serverClient.setSecretStorage(context.secrets);
-	// Read server URL from settings (stays in sync with QIC's qic.server.baseUrl)
-	const serverUrl = vscode.workspace.getConfiguration('qic').get<string>('server.baseUrl');
-	if (serverUrl) {
-		const wsUrl = serverUrl.replace(/^http/, 'ws') + '/v1/ws';
-		serverClient.configure({ baseUrl: serverUrl, wsUrl });
-	}
-	// Register Delta Plus authentication provider with VS Code account switcher.
+	// QL-DATA: no server URL is configured here -- data calls go through the host, which holds the one origin.
+	// Delta Plus identity holder, internal to QuantLab. Deliberately not published through
+	// vscode.authentication: a public provider hands the account id and label to every installed
+	// extension (rule 2, EXT-ISO case G3).
 	const authProvider = new DeltaPlusAuthProvider(context, serverClient);
-	context.subscriptions.push(
-		vscode.authentication.registerAuthenticationProvider(
-			DELTAPLUS_PROVIDER_ID,
-			'Delta Plus',
-			authProvider,
-			{ supportsMultipleAccounts: false }
-		),
-		authProvider
-	);
+	context.subscriptions.push(authProvider);
 
 	// Sign-in / sign-out commands.
-	// quantlab.signIn bypasses vscode.authentication.getSession() and opens the login
-	// panel directly -- no intermediate quick-pick step for the user.
-	// If the welcome panel is already open it just reveals it rather than opening a second modal.
+	// The extension has no sign-in of its own: the host identity is the only source and sign-in /
+	// sign-out happen in the Quantlab terminal view, so both commands say where to go.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.signIn', async () => {
-			try {
-				await authProvider.createSession(['read']);
-			} catch (err) {
-				// ERR_CANCELLED = user closed the panel -- no notification needed.
-				if (err instanceof Error && (err as NodeJS.ErrnoException).code !== 'ERR_CANCELLED') {
-					void vscode.window.showErrorMessage(`Sign-in failed: ${err.message}`);
-				}
-			}
+			void vscode.window.showInformationMessage('Sign in happens in the Quantlab terminal view.');
 		}),
 		vscode.commands.registerCommand('quantlab.signOut', async () => {
-			const sessions = await authProvider.getSessions(['read']);
-			if (sessions.length > 0) {
-				await authProvider.removeSession(sessions[0].id);
-			}
-		})
-	);
-
-	// Reconnect WebSocket when a new session is created (e.g. after sign-in).
-	// Megaudit M87 (No-Fallbacks): a failed reconnect silently kills all
-	// real-time feeds while the UI shows a signed-in state -- log it.
-	context.subscriptions.push(
-		authProvider.onDidChangeSessions(e => {
-			if (e.added && e.added.length > 0) {
-				void serverClient.connectWebSocket().catch(err => {
-					getServerOutputChannel().appendLine(
-						`[extension] WebSocket reconnect after sign-in failed: ${err instanceof Error ? err.message : String(err)}`
-					);
-				});
-			}
+			void vscode.window.showInformationMessage('Sign out happens in the Quantlab terminal view.');
 		})
 	);
 
@@ -171,7 +124,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		if (user) {
 			accountStatusItem.text = `$(account) ${user.name || user.email}`;
 			accountStatusItem.tooltip = new vscode.MarkdownString(
-				`**Quantlab** \u00B7 ${user.tier} tier\n\n${user.email}\n\n[Sign Out](command:quantlab.signOut)`,
+				`**Quantlab**${user.tier ? ` \u00B7 ${user.tier} tier` : ''}\n\n${user.email}\n\n[Sign Out](command:quantlab.signOut)`, // AUTH-TIER: tier text only when a tier value is present; the carry AUTH-TIER supplies it
 				true
 			);
 			accountStatusItem.command = 'quantlab.signOut';
@@ -197,7 +150,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			const user = serverClient.getUser();
 			if (user && !_homeShownThisSession) {
 				_homeShownThisSession = true;
-				QuantLabHome.show(context, { name: user.name, email: user.email, tier: user.tier });
+				QuantLabHome.show(context, { name: user.name, email: user.email, tier: user.tier }); // AUTH-TIER: tier is absent until the carry AUTH-TIER supplies it; Home renders no tier then
 			} else if (!user) {
 				// Sign-out: re-arm the auto-show so the NEXT sign-in gets a
 				// fresh Home (the panel itself disposes on sign-out; without
@@ -216,28 +169,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				void vscode.window.showInformationMessage('Sign in to Quantlab to view your dashboard.');
 				return;
 			}
-			QuantLabHome.show(context, { name: user.name, email: user.email, tier: user.tier });
+			QuantLabHome.show(context, { name: user.name, email: user.email, tier: user.tier }); // AUTH-TIER: tier is absent until the carry AUTH-TIER supplies it; Home renders no tier then
 		})
 	);
 
-	void initializeServerConnection(serverClient, authProvider).finally(() => {
+	void initializeServerConnection(authProvider).finally(() => {
 		_isStartupRestore = false;
 		_authStateResolved = true;
 		updateAccountStatus(); // Reveal the status bar with the correct state
 	});
 
-	const sessionManager = SessionManager.initialize(context, globalState, historyState);
-	const badgeManager = new BadgeManager(sessionManager);
-	moduleBadgeManager = badgeManager;
 	const watchlistManager = new WatchlistManager(context);
 	moduleWatchlistManager = watchlistManager;
 	ThemeProvider.initialize(context);
 	ReducedMotion.initialize(context);
-	NotificationManager.initialize(context, historyState, sessionManager);
 	ErrorRecovery.initialize(context);
 	const onboardingManager = OnboardingManager.initialize(context);
 	const tooltipGuide = new TooltipGuide(onboardingManager);
-	const featureDiscovery = FeatureDiscovery.initialize(context, onboardingManager, historyState);
+	FeatureDiscovery.initialize(context, onboardingManager, historyState);
 	EditorDropProvider.register(context);
 
 	// Register virtual file system for server symbols
@@ -253,19 +202,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	HistoryDropdown.initialize(context, historyState);
 	new ChartViewProvider(context, globalState, historyState).register(context);
 	new ActionViewProvider(context, globalState, historyState, stateManager).register(context);
-	new TradeViewProvider(context).register(context);
 	context.subscriptions.push(StatsViewProvider.register(context));
 	context.subscriptions.push(VisualiseDataProvider.register(context));
 	qvizLifecycleManager = createQvizLifecycleManager(context);
 	context.subscriptions.push(VisualiseSpecProvider.register(context, {
 		lifecycleSource: qvizLifecycleManager,
 	}));
-
-	// Wave H2 (R10 part 2/2, 2026-06-19): the `.qbook` custom editor -- double-clicking a
-	// single-file `.qbook` in the Explorer opens the live cell grid with a dirty tab, Ctrl+S,
-	// Save As, revert, and hot-exit. Additive to the command-driven grid (the demo + Open/Save-As
-	// commands are unchanged); the workbook model lives in the owning engine Session.
-	context.subscriptions.push(QbookEditorProvider.register(context));
 
 	// Visualise v2 -- Promote to Chart. The webview button is the primary
 	// entry point (posts a `promoteToChart` message to the provider); this
@@ -312,17 +254,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	registerGlobalStateCommands(context);
 	registerHistoryCommands(context);
 	registerPanelCommands(context);
-	registerTradeCommands(context);
+	registerImportCommands(context);
 	registerViewCommands(context);
 	registerDashboardCommands(context);
-	// Phase 5.7 V1 (2026-05-22): Quantbook engine demo round-trip.
-	registerQuantbookCommands(context);
-	// Wave K-a (R15, 2026-06-20): Set/Clear the Anthropic API key in the OS secret store, and
-	// load the stored key into the AI provider (also initializes the local AI audit log). The
-	// load is fire-and-forget so a secrets read can't block activation; it settles internally
-	// (logging any failure loud, No-Fallbacks) so the Set/Clear commands are never bricked.
-	registerAICommands(context);
-	void loadAnthropicKeyIntoProvider(context);
 	// FE-1.5-1d-1: the reactive-kernel commands. Trust MUST be initialized first -- nothing called
 	// TrustManager.initialize before (so the trust store never loaded); the kernel's trust gate
 	// depends on it. Fail-closed: if init throws, the store stays empty -> the kernel refuses to
@@ -334,25 +268,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	} catch (e) {
 		console.warn('Quantlab: TrustManager.initialize failed; the reactive kernel will treat the workspace as untrusted:', e);
 	}
-	// Pass a getter (not the bool) so the gate reads the final value even though init is awaited above.
-	const builtKernelManager = registerReactiveKernelCommands(context, () => reactiveTrustReady);
-	reactiveKernelManager = builtKernelManager;
-
-	// FE-1.5 W-N: the `.qnb` reactive-notebook serializer (the controller is registered in N-1).
-	// Outputs are transient (the kernel re-runs), so they are never written to disk.
-	context.subscriptions.push(
-		vscode.workspace.registerNotebookSerializer(QNB_NOTEBOOK_TYPE, new QnbSerializer(), { transientOutputs: true }),
-	);
-	// FE-1.5 W-N (N-1): the NotebookController that runs `.qnb` Python cells against the focused grid's
-	// reactive kernel (bind-on-first-execute, serialized, lifetime-safe). Built after the manager exists.
-	registerReactiveNotebookController(context, builtKernelManager);
-
-	// FE-BEYOND B1 (W3): the read-only Quantbook MCP server. Runs IN this host so its tools read the
-	// SAME live per-panel Session the grid renders (the shared-state requirement). Registered AFTER the
-	// reactive notebook controller (W3 anchor; W4/FE-5 uses the later panel-providers anchor) so the two
-	// parallel windows never edit overlapping lines here.
-	registerQuantbookMcpServer(context, builtKernelManager);
-
 	// Megaudit H2: the provider was constructed and discarded, so its dispose()
 	// (which tears down the DataTreeProvider's three event subs + retry timer)
 	// never ran. Owned by context.subscriptions now.
@@ -373,79 +288,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		);
 	});
 	new HistoryPanelProvider(context, historyState);
-	new TradePanelProvider(context, badgeManager);
 	new SettingsPanelProvider(context);
 
-	// FE-5 (W4 product shell): the Quantbook Activity Bar surface (Live-Python sidebar + the
-	// `quantbook.hasOpenGrid` context key gating the quantbook views). Registered AFTER the panel
-	// providers + AFTER the reactive-kernel manager exists (the sidebar's data source).
-	registerQuantbookShell(context, builtKernelManager);
-
-	// W3 B3: the dependency-graph "Dependencies" sidebar -- shows the focused cell's cross-language
-	// dependencies (formula precedents + the reactive Python variable driving it). Registered AFTER the
-	// shell (which drives the `quantbook.hasOpenGrid` context key gating both quantbook views) and shares
-	// the same reactive-kernel manager data source. Kept as a separate registration (not folded into
-	// registerQuantbookShell) so the W3 increment is additive.
-	registerDepGraphSidebar(context, builtKernelManager);
-
-	// FE-6 / R18 Wave E: the "SQL Query" sidebar -- an in-session re-runnable SQL editor over the engine's
-	// materializeQuery, spilling a SELECT into a target range on the focused grid. A WebviewViewProvider (not
-	// a tree -- the SQL editor is multi-line), gated by the same `quantbook.hasOpenGrid` context key. Pure-IDE
-	// (the napi is already in the loaded dylib). retainContextWhenHidden keeps the SQL draft across hide/show.
-	context.subscriptions.push(
-		vscode.window.registerWebviewViewProvider(
-			SqlQueryViewProvider.viewType,
-			new SqlQueryViewProvider(context.extensionUri),
-			{ webviewOptions: { retainContextWhenHidden: true } },
-		),
-	);
-
-	// W2 error-surface: the dedicated Quantbook error surface -- ONE `quantbook` DiagnosticCollection that
-	// mirrors cell errors into VS Code's Problems panel. The Cell Grid panel reports its stored cell errors
-	// (each render's diagnostic-decorated snapshot) + input rejections (errorReply), and the reactive layer
-	// reports workbook-level reactive errors; the bridge auto-clears on recovery (No-Fallbacks). The
-	// `quantbook://` TextDocumentContentProvider serves a readable virtual doc per uri so a Problems-panel
-	// click opens a real document. Injected via static sinks (mirrors setPublishedCellsProvider), cleared on
-	// deactivate. Registered AFTER the reactive-kernel manager + the panel registry exist.
-	const quantbookDiagnostics = new QuantbookDiagnostics();
-	context.subscriptions.push(quantbookDiagnostics);
-	context.subscriptions.push(
-		vscode.workspace.registerTextDocumentContentProvider(QUANTBOOK_DIAGNOSTICS_SCHEME, quantbookDiagnostics),
-	);
-	CellGridPanel.setDiagnosticsSink(quantbookDiagnostics);
-	context.subscriptions.push({ dispose: () => CellGridPanel.setDiagnosticsSink(undefined) });
-	setReactiveDiagnosticsSink(quantbookDiagnostics);
-	context.subscriptions.push({ dispose: () => setReactiveDiagnosticsSink(undefined) });
-
-	// Wave I (R13 + R14, 2026-06-19): the "Errors" diagnostics sidebar -- a dedicated tree view over the
-	// SAME diagnostics the Problems panel mirrors (grouped by sheet, error-class icons, full traceback in
-	// the tooltip, click-to-reveal). Additive; reads quantbookDiagnostics' read API + refreshes on its
-	// onDidChange. Registered AFTER the diagnostics bridge exists.
-	registerDiagnosticsView(context, quantbookDiagnostics);
-
-	// Wave I-b (R12, 2026-06-19): the "Functions" catalog sidebar -- a browsable tree of the focused
-	// workbook's registered functions (built-ins grouped by letter + any UDFs), click-to-copy the name.
-	// Additive; reads session.listFunctions() off the focused grid. Also serves the R22 catalog-UI tail.
-	registerFunctionCatalogView(context);
-
-	// Wave I1 (R21, DEC-4): the "AI Assistant" chat sidebar -- the built AIPanelProvider wired into
-	// the quantlab-quantbook Activity Bar container. The provider self-contains its HTML + JS (no
-	// separate webview bundle). Gated by `quantbook.hasOpenGrid` (package.json `views` entry).
-	// The panel renders immediately; it surfaces "Not configured" status until the user runs
-	// "Quantbook: Set Anthropic API Key" (quantlab.setAnthropicApiKey, already registered above).
-	// retainContextWhenHidden preserves the conversation across hide/show cycles.
-	context.subscriptions.push(
-		vscode.window.registerWebviewViewProvider(
-			AIPanelProvider.viewType,
-			new AIPanelProvider(context.extensionUri),
-			{ webviewOptions: { retainContextWhenHidden: true } },
-		),
-	);
-
-	// Wave J-a (R16, 2026-06-20): the local-first messaging surface -- a `$(shield) Local` status-bar item
-	// (shown while a grid is open) + a "Local-First Privacy" command that opens the full, honest statement
-	// of what runs locally vs the opt-in AI / sign-in / market-data network surface. Additive; pure-text.
-	registerLocalFirstStatus(context);
+	// Quantbook: registered only on an authorised build with the preference on (QB-OFF-1, QB-DEF-1).
+	if (readQuantbookAuthorisation()) {
+		registerQuantbookRuntime(context, () => reactiveTrustReady);
+	}
 
 	const validationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	moduleValidationTimers = validationTimers;
@@ -559,9 +407,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			}
 
 			tooltipGuide.showViewTip(change.view);
-			if (change.view === 'trade') {
-				featureDiscovery.notifyTradeView();
-			}
 			const validation = validator.getValidationResult(activeEditor.document) ?? validator.validateDocument(activeEditor.document);
 			updateContextKeys(change.view, validation);
 		})
@@ -584,100 +429,117 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		)
 	);
 
-	// NEW-UI-004: Gate VS Code updates during active sessions
-	context.subscriptions.push(
-		vscode.extensions.onDidChange(async () => {
-			const activeSessions = sessionManager.getActiveSessions();
-			if (activeSessions.length > 0) {
-				const liveSessions = activeSessions.filter(
-					(s: { type: string }) => s.type === 'live'
-				);
-				if (liveSessions.length > 0) {
-					void vscode.window.showWarningMessage(
-						`${liveSessions.length} live trading session(s) active. ` +
-						'Extension update may interrupt trading. Stop sessions before updating.',
-						'Stop All Sessions', 'Dismiss'
-					).then(action => {
-						if (action === 'Stop All Sessions') {
-							for (const s of sessionManager.getActiveSessions()) {
-								void sessionManager.stopSession(s.id);
-							}
-						}
-					});
-				}
-			}
-		})
-	);
-
-	// FIX-CGP-015: Check for orphaned daemon sessions on startup
-	await checkOrphanedSessions(context, sessionManager);
-
 	await stateManager.hydrateFromWorkbench();
 	await syncTabsAndRefresh();
 }
 
-/**
- * Check for orphaned daemon sessions from a previous extension instance (FIX-CGP-015).
- */
-async function checkOrphanedSessions(
-	_context: vscode.ExtensionContext,
-	_sessionManager: SessionManager
-): Promise<void> {
-	const sessionsDir = path.join(os.homedir(), '.quantlab', 'sessions');
-	try {
-		const files = await fs.promises.readdir(sessionsDir);
-		const socketFiles = files.filter(f => f.endsWith('.sock'));
+// The ONE place Quantbook runtime entry points are registered (commands, the reactive kernel, the
+// `.qnb` serializer and controller, the MCP server, the Activity Bar views, diagnostics, the status
+// item). Called only when readQuantbookAuthorisation() says so; a new Quantbook registration goes here.
+function registerQuantbookRuntime(context: vscode.ExtensionContext, isTrustReady: () => boolean): void {
+	// Wave H2 (R10 part 2/2, 2026-06-19): the `.qbook` custom editor -- double-clicking a
+	// single-file `.qbook` in the Explorer opens the live cell grid with a dirty tab, Ctrl+S,
+	// Save As, revert, and hot-exit. Additive to the command-driven grid (the demo + Open/Save-As
+	// commands are unchanged); the workbook model lives in the owning engine Session.
+	context.subscriptions.push(QbookEditorProvider.register(context));
 
-		if (socketFiles.length === 0) {
-			return;
-		}
+	// Phase 5.7 V1 (2026-05-22): Quantbook engine demo round-trip.
+	registerQuantbookCommands(context);
+	// Pass a getter (not the bool) so the gate reads the final value even though init is awaited above.
+	const builtKernelManager = registerReactiveKernelCommands(context, isTrustReady);
+	reactiveKernelManager = builtKernelManager;
 
-		// Check which sockets are still alive by attempting a connection
-		const aliveSessions: string[] = [];
-		for (const socketFile of socketFiles) {
-			const sessionId = socketFile.replace('.sock', '');
-			const sockPath = path.join(sessionsDir, socketFile);
+	// FE-1.5 W-N: the `.qnb` reactive-notebook serializer (the controller is registered in N-1).
+	// Outputs are transient (the kernel re-runs), so they are never written to disk.
+	context.subscriptions.push(
+		vscode.workspace.registerNotebookSerializer(QNB_NOTEBOOK_TYPE, new QnbSerializer(), { transientOutputs: true }),
+	);
+	// FE-1.5 W-N (N-1): the NotebookController that runs `.qnb` Python cells against the focused grid's
+	// reactive kernel (bind-on-first-execute, serialized, lifetime-safe). Built after the manager exists.
+	registerReactiveNotebookController(context, builtKernelManager);
 
-			try {
-				// Quick liveness probe: check if socket file exists and is a socket.
-				// Megaudit M93 (No-Fallbacks): fs.Stats.isSocket() is always present
-				// in Node.js -- no optional-chaining fallback that would silently
-				// classify an un-probeable socket as absent.
-				const stat = await fs.promises.stat(sockPath);
-				if (stat.isSocket()) {
-					aliveSessions.push(sessionId);
-				}
-			} catch {
-				// Socket file doesn't exist or inaccessible -- stale, clean up
-				try {
-					await fs.promises.unlink(sockPath);
-				} catch { /* ignore */ }
-			}
-		}
+	// FE-BEYOND B1 (W3): the read-only Quantbook MCP server. Runs IN this host so its tools read the
+	// SAME live per-panel Session the grid renders (the shared-state requirement). Registered AFTER the
+	// reactive notebook controller (W3 anchor; W4/FE-5 uses the later panel-providers anchor) so the two
+	// parallel windows never edit overlapping lines here.
+	registerQuantbookMcpServer(context, builtKernelManager);
 
-		if (aliveSessions.length === 0) {
-			return;
-		}
+	// FE-5 (W4 product shell): the Quantbook Activity Bar surface (Live-Python sidebar + the
+	// `quantbook.hasOpenGrid` context key gating the quantbook views). Registered AFTER the panel
+	// providers + AFTER the reactive-kernel manager exists (the sidebar's data source).
+	registerQuantbookShell(context, builtKernelManager);
 
-		// Megaudit M89: do NOT offer a 'Reconnect' button that immediately answers
-		// 'not yet supported' -- only the two options that actually work.
-		const action = await vscode.window.showWarningMessage(
-			`Found ${aliveSessions.length} running daemon session(s) from a previous instance: ${aliveSessions.join(', ')}`,
-			'Stop All', 'Ignore'
-		);
+	// W3 B3: the dependency-graph "Dependencies" sidebar -- shows the focused cell's cross-language
+	// dependencies (formula precedents + the reactive Python variable driving it). Registered AFTER the
+	// shell (which drives the `quantbook.hasOpenGrid` context key gating both quantbook views) and shares
+	// the same reactive-kernel manager data source. Kept as a separate registration (not folded into
+	// registerQuantbookShell) so the W3 increment is additive.
+	registerDepGraphSidebar(context, builtKernelManager);
 
-		if (action === 'Stop All') {
-			for (const sessionId of aliveSessions) {
-				try {
-					const sockPath = path.join(sessionsDir, `${sessionId}.sock`);
-					await fs.promises.unlink(sockPath);
-				} catch { /* best effort */ }
-			}
-		}
-		// 'Ignore' -- do nothing
-	} catch {
-		// Sessions directory doesn't exist -- no orphans
+	// FE-6 / R18 Wave E: the "SQL Query" sidebar -- an in-session re-runnable SQL editor over the engine's
+	// materializeQuery, spilling a SELECT into a target range on the focused grid. A WebviewViewProvider (not
+	// a tree -- the SQL editor is multi-line), gated by the same `quantbook.hasOpenGrid` context key. Pure-IDE
+	// (the napi is already in the loaded dylib). retainContextWhenHidden keeps the SQL draft across hide/show.
+	context.subscriptions.push(
+		vscode.window.registerWebviewViewProvider(
+			SqlQueryViewProvider.viewType,
+			new SqlQueryViewProvider(context.extensionUri),
+			{ webviewOptions: { retainContextWhenHidden: true } },
+		),
+	);
+
+	// W2 error-surface: the dedicated Quantbook error surface -- ONE `quantbook` DiagnosticCollection that
+	// mirrors cell errors into VS Code's Problems panel. The Cell Grid panel reports its stored cell errors
+	// (each render's diagnostic-decorated snapshot) + input rejections (errorReply), and the reactive layer
+	// reports workbook-level reactive errors; the bridge auto-clears on recovery (No-Fallbacks). The
+	// `quantbook://` TextDocumentContentProvider serves a readable virtual doc per uri so a Problems-panel
+	// click opens a real document. Injected via static sinks (mirrors setPublishedCellsProvider), cleared on
+	// deactivate. Registered AFTER the reactive-kernel manager + the panel registry exist.
+	const quantbookDiagnostics = new QuantbookDiagnostics();
+	context.subscriptions.push(quantbookDiagnostics);
+	context.subscriptions.push(
+		vscode.workspace.registerTextDocumentContentProvider(QUANTBOOK_DIAGNOSTICS_SCHEME, quantbookDiagnostics),
+	);
+	CellGridPanel.setDiagnosticsSink(quantbookDiagnostics);
+	context.subscriptions.push({ dispose: () => CellGridPanel.setDiagnosticsSink(undefined) });
+	setReactiveDiagnosticsSink(quantbookDiagnostics);
+	context.subscriptions.push({ dispose: () => setReactiveDiagnosticsSink(undefined) });
+
+	// Wave I (R13 + R14, 2026-06-19): the "Errors" diagnostics sidebar -- a dedicated tree view over the
+	// SAME diagnostics the Problems panel mirrors (grouped by sheet, error-class icons, full traceback in
+	// the tooltip, click-to-reveal). Additive; reads quantbookDiagnostics' read API + refreshes on its
+	// onDidChange. Registered AFTER the diagnostics bridge exists.
+	registerDiagnosticsView(context, quantbookDiagnostics);
+
+	// Wave I-b (R12, 2026-06-19): the "Functions" catalog sidebar -- a browsable tree of the focused
+	// workbook's registered functions (built-ins grouped by letter + any UDFs), click-to-copy the name.
+	// Additive; reads session.listFunctions() off the focused grid. Also serves the R22 catalog-UI tail.
+	registerFunctionCatalogView(context);
+
+	// Wave J-a (R16, 2026-06-20): the local-first messaging surface -- a `$(shield) Local` status-bar item
+	// (shown while a grid is open) + a "Local-First Privacy" command that opens the full, honest statement
+	// of what runs locally vs the opt-in AI / sign-in / market-data network surface. Additive; pure-text.
+	registerLocalFirstStatus(context);
+}
+
+// AUTHORISATION = the product key `quantlab.quantbookEnabled` of the packaged product.json; PREFERENCE =
+// the setting `quantlab.quantbook.enabled`. Quantbook is registered only when both are true. A product
+// file that cannot be read, or a key that is absent or not a boolean, refuses activation by name.
+function readQuantbookAuthorisation(): boolean {
+	const source = path.join(vscode.env.appRoot, 'product.json');
+	const product = JSON.parse(fs.readFileSync(source, 'utf8')) as Record<string, unknown>;
+	const key = product['quantlab.quantbookEnabled'];
+	const setting = vscode.workspace.getConfiguration('quantlab').get<boolean>('quantbook.enabled');
+	const line = `quantbook.authorisation key=${key === undefined ? 'absent' : JSON.stringify(key)} setting=${JSON.stringify(setting)} source=${source}`;
+	getServerOutputChannel().appendLine(line);
+	console.log(line);
+	if (typeof key !== 'boolean') {
+		throw new Error(`Quantlab: product key quantlab.quantbookEnabled must be true or false (${line})`);
 	}
+	if (typeof setting !== 'boolean') {
+		throw new Error(`Quantlab: setting quantlab.quantbook.enabled must be true or false (${line})`);
+	}
+	return key && setting;
 }
 
 function getActiveResource(): vscode.Uri | undefined {
@@ -703,7 +565,6 @@ function getActiveResource(): vscode.Uri | undefined {
 
 // Module-level references for disposal in deactivate()
 let moduleWatchlistManager: WatchlistManager | undefined;
-let moduleBadgeManager: import('./ui/notifications/BadgeManager').BadgeManager | undefined;
 let moduleValidationTimers: Map<string, ReturnType<typeof setTimeout>> | undefined;
 
 // Output channel for server logs
@@ -717,54 +578,24 @@ function getServerOutputChannel(): vscode.OutputChannel {
 }
 
 /**
- * Initialize connection to Delta Plus Server using the persisted session.
- * This runs in the background and doesn't block extension activation.
+ * Initialize the Delta Plus server connection from the host identity (the sign-in state held by
+ * the Quantlab terminal view). This runs in the background and doesn't block extension activation.
  */
 async function initializeServerConnection(
-	client: ServerApiClient,
 	authProvider: DeltaPlusAuthProvider
 ): Promise<void> {
 	const output = getServerOutputChannel();
 	try {
-		// Migrate legacy qic.deltaplus* keys to the new format (no-op if already done).
-		await authProvider.runMigration();
-
-		// Load the existing session from SecretStorage and push tokens into the client.
-		const loaded = await authProvider.initializeFromStorage();
-		if (loaded) {
-			// If the stored access token is already expired, try a proactive refresh
-			// so the WebSocket connects immediately without waiting for the first API call.
-			if (!client.isAuthenticated()) {
-				try {
-					await client.refreshAccessToken();
-					output.appendLine(`[${new Date().toISOString()}] Delta Plus: Session refreshed on startup`);
-				} catch {
-					output.appendLine(`[${new Date().toISOString()}] Delta Plus: Session expired -- sign in again via the account menu`);
-				}
-			} else {
-				output.appendLine(`[${new Date().toISOString()}] Delta Plus: Session restored -- user signed in`);
-			}
-		} else {
-			output.appendLine(`[${new Date().toISOString()}] Delta Plus: No saved session -- sign in via the account menu`);
-		}
-	} catch (err) {
+		// Read the sign-in state from the host at start-up; later changes arrive through
+		// vscode.quantlabHost.onDidChangeIdentity.
+		const loaded = await authProvider.initializeFromHost();
 		output.appendLine(
-			`[${new Date().toISOString()}] Delta Plus: Auth init error -- ${err instanceof Error ? err.message : String(err)}`
+			`[${new Date().toISOString()}] Delta Plus: ${loaded ? 'Signed in at the host' : 'Not signed in (sign in in the terminal view)'}`
 		);
-	} finally {
-		// Signal ensureAuthenticated() that startup is done so pending API calls
-		// can resolve immediately (either with tokens or with "not signed in" error).
-		client.markAuthFlowComplete();
-	}
-
-	// Connect WebSocket if we have a valid session.
-	if (client.isAuthenticated()) {
-		try {
-			await client.connectWebSocket();
-			output.appendLine(`[${new Date().toISOString()}] Delta Plus: WebSocket connected`);
-		} catch {
-			output.appendLine(`[${new Date().toISOString()}] Delta Plus: WebSocket unavailable (real-time features disabled)`);
-		}
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		output.appendLine(`[${new Date().toISOString()}] Delta Plus: Could not read the sign-in state from the host -- ${detail}`);
+		void vscode.window.showErrorMessage(`Could not read the sign-in state from the host: ${detail}`);
 	}
 }
 
@@ -813,7 +644,7 @@ function createQvizLifecycleManager(
 				console.warn(
 					'Quantlab: no Python interpreter found for qviz daemon '
 					+ '(checked QUANTLAB_PYTHON, quantlab.pythonPath, '
-					+ 'python.defaultInterpreterPath, ~/.quantlab/venv/bin/python). '
+					+ 'python.defaultInterpreterPath, ~/.deltaplus/venv/bin/python). '
 					+ 'Save will refuse for files in this workspace.',
 				);
 				return null;
@@ -912,12 +743,6 @@ export async function deactivate(): Promise<void> {
 		// Ignore cleanup errors
 	}
 
-	// Cleanup BadgeManager
-	if (moduleBadgeManager) {
-		moduleBadgeManager.dispose();
-		moduleBadgeManager = undefined;
-	}
-
 	// Cleanup WatchlistManager
 	if (moduleWatchlistManager) {
 		moduleWatchlistManager.dispose();
@@ -925,14 +750,20 @@ export async function deactivate(): Promise<void> {
 	}
 
 	// Cleanup singleton state managers and services
-	try { SessionManager.resetInstance(); } catch { /* ignore */ }
-	await LiveDaemonManager.resetInstance().catch(() => { /* ignore */ });
 	try { TrustManager.resetInstance(); } catch { /* ignore */ }
 	try { EngineHost.resetInstance(); } catch { /* ignore */ }
 	try { ParameterExtractor.resetInstance(); } catch { /* ignore */ }
 	try { StatsEngine.resetInstance(); } catch { /* ignore */ }
 	try { ReducedMotion.resetInstance(); } catch { /* ignore */ }
-	try { ServerDataCache.resetInstance(); } catch { /* ignore */ }
+	// Law section 4: a failed ServerDataCache reset is logged with its error and rethrown once the remaining
+	// cleanup below has run -- never swallowed.
+	let serverDataCacheResetFailure: { error: unknown } | undefined;
+	try {
+		ServerDataCache.resetInstance();
+	} catch (error) {
+		console.error('Quantlab: ServerDataCache reset failed during deactivate:', error);
+		serverDataCacheResetFailure = { error };
+	}
 	try { await HistoryState.getInstance().persistNow(); } catch { /* ignore */ }
 	try { HistoryState.resetInstance(); } catch { /* ignore */ }
 	try { TabViewStateManager.resetInstance(); } catch { /* ignore */ }
@@ -954,5 +785,9 @@ export async function deactivate(): Promise<void> {
 	if (serverOutputChannel) {
 		serverOutputChannel.dispose();
 		serverOutputChannel = undefined;
+	}
+
+	if (serverDataCacheResetFailure) {
+		throw serverDataCacheResetFailure.error;
 	}
 }

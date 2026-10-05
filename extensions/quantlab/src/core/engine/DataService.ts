@@ -10,21 +10,11 @@ import { ChartDateRange, OhlcvBar } from '../../types/chart';
 import { Timeframe, toServerTimeframe } from '../../types/market';
 import { ServerApiClient, ServerBar, ServerTimeframe } from '../server/ServerApiClient';
 
-const CACHE_LIMIT = 6;
-const FILE_CACHE_LIMIT = 6;
-const CACHE_TTL_MS = 5 * 60 * 1000;
-const SERVER_CACHE_TTL_MS = 60 * 1000; // Shorter cache for server data
 const FILE_READ_MAX_RETRIES = 3;
 const FILE_READ_RETRY_DELAY_MS = 100;
 
-interface CacheEntry {
-	data: OhlcvBar[];
-	createdAt: number;
-	meta: MarketDataMeta;
-}
-
 interface MarketDataMeta {
-	source: 'csv' | 'mock' | 'server';
+	source: 'csv' | 'server';
 	effectiveTimeframe: Timeframe;
 	warning?: string;
 	symbol?: string;
@@ -36,19 +26,17 @@ export interface MarketDataResult {
 	meta: MarketDataMeta;
 }
 
-interface FileCacheEntry {
-	path: string;
-	mtimeMs: number;
-	sizeBytes: number;
-	data: OhlcvBar[];
-}
-
+/**
+ * Market data access for the extension.
+ *
+ * DT-3 (QL-DATA): this service holds NO market-data cache -- no server-bars
+ * cache, no file-bars cache, no in-flight dedupe. The one bars cache lives in
+ * the host's main data module; every call here reads through to the transport
+ * (server) or the file (local CSV).
+ */
 export class DataService {
 	private static instance: DataService | undefined;
 	private requestId = 0;
-	private readonly cache = new Map<string, CacheEntry>();
-	private readonly fileCache = new Map<string, FileCacheEntry>();
-	private readonly inflight = new Map<string, Promise<MarketDataResult>>();
 	private disposed = false;
 
 	static getInstance(): DataService {
@@ -59,16 +47,13 @@ export class DataService {
 	}
 
 	/**
-	 * Disposes all cached data and resources.
+	 * Disposes the instance. It holds no data to release (DT-3).
 	 */
 	dispose(): void {
 		if (this.disposed) {
 			return;
 		}
 		this.disposed = true;
-		this.cache.clear();
-		this.fileCache.clear();
-		this.inflight.clear();
 	}
 
 	/**
@@ -79,14 +64,6 @@ export class DataService {
 			DataService.instance.dispose();
 			DataService.instance = undefined;
 		}
-	}
-
-	/**
-	 * Clears all cached data without disposing the instance.
-	 */
-	clearCache(): void {
-		this.cache.clear();
-		this.fileCache.clear();
 	}
 
 	async getOHLCVFromFile(
@@ -111,13 +88,6 @@ export class DataService {
 
 		const ext = path.extname(filePath).toLowerCase();
 
-		// Use null character as delimiter (cannot appear in file paths)
-		const key = ['file', filePath, range?.start ?? '', range?.end ?? ''].join('\0');
-		const cached = this.getFromCache(key);
-		if (cached) {
-			return { requestId, data: cached.data, meta: cached.meta };
-		}
-
 		let data: OhlcvBar[];
 		if (ext === '.csv') {
 			data = await this.loadCsvFile(filePath, token);
@@ -140,7 +110,6 @@ export class DataService {
 		const filtered = this.filterByRange(data, range);
 
 		const meta: MarketDataMeta = { source: 'csv', effectiveTimeframe };
-		this.setCache(key, filtered, meta);
 
 		return { requestId, data: filtered, meta };
 	}
@@ -195,11 +164,10 @@ export class DataService {
 
 		// Crypto endpoint ignores from/to date params -- single fetch only
 		if (assetClass?.toLowerCase() === 'crypto') {
-			const bars = await client.getBars(
+			return client.getBars(
 				{ symbol, timeframe, limit: Math.min(maxBars, 1000), assetClass },
 				token
 			);
-			return bars ?? [];
 		}
 
 		const result: ServerBar[] = [];
@@ -231,7 +199,7 @@ export class DataService {
 				assetClass
 			}, token);
 
-			if (!bars || bars.length === 0) {
+			if (bars.length === 0) {
 				break;
 			}
 
@@ -300,61 +268,40 @@ export class DataService {
 		}
 
 		const serverTimeframe = toServerTimeframe(timeframe);
-		// Use null character as delimiter. assetClass is part of the identity:
-		// the same symbol string can exist as both an equity and a crypto asset,
-		// and they resolve to different server endpoints.
-		const key = ['server', symbol, serverTimeframe, assetClass ?? '', range?.start ?? '', range?.end ?? ''].join('\0');
-		const cached = this.getFromCache(key, SERVER_CACHE_TTL_MS);
-		if (cached) {
-			return { requestId, data: cached.data, meta: cached.meta };
-		}
 
-		// Deduplicate concurrent requests for the same key
-		const existing = this.inflight.get(key);
-		if (existing) {
-			const shared = await existing;
-			return { ...shared, requestId };
-		}
+		// DT-3: every call reads through to the transport. No cache, no
+		// in-flight dedupe here -- the host's main data module owns both.
+		try {
+			// Use pagination to fetch up to 5000 bars
+			const bars = await this.fetchServerBarsWithPagination(
+				symbol,
+				serverTimeframe,
+				5000,
+				range,
+				token,
+				assetClass
+			);
 
-		const fetch = (async () => {
-			try {
-				// Use pagination to fetch up to 5000 bars
-				const bars = await this.fetchServerBarsWithPagination(
-					symbol,
-					serverTimeframe,
-					5000,
-					range,
-					token,
-					assetClass
-				);
+			const data = this.convertServerBars(bars);
 
-				const data = this.convertServerBars(bars);
-
-				if (!data.length) {
-					throw new Error(`No data available for ${symbol} at ${timeframe}`);
-				}
-
-				const meta: MarketDataMeta = {
-					source: 'server',
-					effectiveTimeframe: timeframe,
-					symbol
-				};
-
-				this.setCache(key, data, meta);
-				return { requestId, data, meta };
-			} catch (error) {
-				if (error instanceof Error && error.message === 'Cancelled') {
-					throw error;
-				}
-				const message = error instanceof Error ? error.message : String(error);
-				throw new Error(`Failed to fetch data from server: ${message}`);
-			} finally {
-				this.inflight.delete(key);
+			if (!data.length) {
+				throw new Error(`No data available for ${symbol} at ${timeframe}`);
 			}
-		})();
 
-		this.inflight.set(key, fetch);
-		return fetch;
+			const meta: MarketDataMeta = {
+				source: 'server',
+				effectiveTimeframe: timeframe,
+				symbol
+			};
+
+			return { requestId, data, meta };
+		} catch (error) {
+			if (error instanceof Error && error.message === 'Cancelled') {
+				throw error;
+			}
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`Failed to fetch data from server: ${message}`);
+		}
 	}
 
 	private convertServerBars(bars: ServerBar[]): OhlcvBar[] {
@@ -370,55 +317,26 @@ export class DataService {
 
 	/**
 	 * Normalizes a timestamp string to UTC milliseconds.
-	 * Handles ISO 8601 strings with timezone info, or treats ambiguous times as UTC.
+	 * Handles ISO 8601 strings with timezone info, a date-only form (UTC by
+	 * the ECMAScript date-only rule), or treats a zone-less date-time as UTC.
+	 * Anything else is unparseable and throws, naming the value.
 	 */
 	private normalizeTimestamp(timestamp: string): number {
 		// Check if timestamp has explicit timezone info (Z, z, +HH:MM, -HH:MM)
 		const hasTimezone = /[Zz]$|[+-]\d{2}:?\d{2}$/.test(timestamp);
+		const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(timestamp);
 
-		if (hasTimezone) {
-			// Parse as-is (timezone info preserved)
-			return new Date(timestamp).getTime();
-		}
+		// With a zone (or date-only, which ECMAScript parses as UTC) parse
+		// as-is; a zone-less date-time is treated as UTC by appending 'Z'.
+		const parsed = hasTimezone || isDateOnly
+			? new Date(timestamp).getTime()
+			: new Date(`${timestamp}Z`).getTime();
 
-		// For timestamps without timezone, treat as UTC by appending 'Z'
-		const parsed = new Date(`${timestamp}Z`).getTime();
-
-		// Fallback to normal parsing if UTC interpretation fails
 		if (!Number.isFinite(parsed)) {
-			return new Date(timestamp).getTime();
+			throw new Error(`Unparseable bar timestamp in server response: '${timestamp}'`);
 		}
 
 		return parsed;
-	}
-
-	/** @deprecated Use getOHLCVFromFile or getOHLCVFromServer instead */
-	async getOHLCV(
-		symbol: string,
-		timeframe: Timeframe,
-		range?: ChartDateRange,
-		token?: vscode.CancellationToken
-	): Promise<MarketDataResult> {
-		const requestId = ++this.requestId;
-		if (token?.isCancellationRequested) {
-			throw new Error('Cancelled');
-		}
-
-		const key = `legacy:${symbol}:${timeframe}:${range?.start ?? ''}:${range?.end ?? ''}`;
-		const cached = this.getFromCache(key);
-		if (cached) {
-			return { requestId, data: cached.data, meta: cached.meta };
-		}
-
-		const data = this.generateMockData(symbol, timeframe, range);
-		const meta: MarketDataMeta = {
-			source: 'mock',
-			effectiveTimeframe: timeframe,
-			warning: 'No data file selected. Showing simulated data.'
-		};
-
-		this.setCache(key, data, meta);
-		return { requestId, data, meta };
 	}
 
 	inferTimeframe(data: OhlcvBar[]): Timeframe {
@@ -455,29 +373,9 @@ export class DataService {
 				throw new Error('Cancelled');
 			}
 
-			const stat = await fs.promises.stat(filePath);
-			const existing = this.fileCache.get(filePath);
-			if (existing && existing.mtimeMs === stat.mtimeMs && existing.sizeBytes === stat.size) {
-				// Promote to most-recently-used position
-				this.fileCache.delete(filePath);
-				this.fileCache.set(filePath, existing);
-				return existing.data;
-			}
-
-			if (token?.isCancellationRequested) {
-				throw new Error('Cancelled');
-			}
-
+			// DT-3: the file is re-read on every load (no file-bars cache).
 			const content = await fs.promises.readFile(filePath, 'utf8');
-			const data = this.parseCsv(content);
-			this.fileCache.set(filePath, { path: filePath, mtimeMs: stat.mtimeMs, sizeBytes: stat.size, data });
-			if (this.fileCache.size > FILE_CACHE_LIMIT) {
-				const oldest = this.fileCache.keys().next().value as string | undefined;
-				if (oldest) {
-					this.fileCache.delete(oldest);
-				}
-			}
-			return data;
+			return this.parseCsv(content);
 		}, filePath, token);
 	}
 
@@ -530,33 +428,6 @@ export class DataService {
 
 	private async loadParquetFile(_filePath: string, _token?: vscode.CancellationToken): Promise<OhlcvBar[]> {
 		throw new Error('Parquet files are not yet supported. Please convert to CSV format.');
-	}
-
-	private getFromCache(key: string, ttl: number = CACHE_TTL_MS): CacheEntry | undefined {
-		const entry = this.cache.get(key);
-		if (!entry) {
-			return undefined;
-		}
-
-		if (Date.now() - entry.createdAt > ttl) {
-			this.cache.delete(key);
-			return undefined;
-		}
-
-		return entry;
-	}
-
-	private setCache(key: string, data: OhlcvBar[], meta: MarketDataMeta): void {
-		if (this.cache.has(key)) {
-			this.cache.delete(key);
-		}
-		this.cache.set(key, { data, createdAt: Date.now(), meta });
-		if (this.cache.size > CACHE_LIMIT) {
-			const oldest = this.cache.keys().next().value as string | undefined;
-			if (oldest) {
-				this.cache.delete(oldest);
-			}
-		}
 	}
 
 	private parseCsv(content: string): OhlcvBar[] {
@@ -681,72 +552,5 @@ export class DataService {
 		const raw = parts[index >= 0 ? index : 0]?.trim();
 		const value = Number(raw);
 		return Number.isFinite(value) ? value : NaN;
-	}
-
-	private generateMockData(symbol: string, timeframe: Timeframe, range?: ChartDateRange): OhlcvBar[] {
-		const step = this.timeframeToMs(timeframe);
-		const end = range?.end ? new Date(range.end).getTime() : Date.now();
-		const start = range?.start ? new Date(range.start).getTime() : end - step * 200;
-		const safeStart = Number.isFinite(start) ? start : end - step * 200;
-		const safeEnd = Number.isFinite(end) ? end : Date.now();
-
-		const count = Math.max(30, Math.min(600, Math.floor((safeEnd - safeStart) / step)));
-		const seed = this.seedFromString(symbol + timeframe);
-		let value = 50 + (seed % 100);
-
-		const bars: OhlcvBar[] = [];
-		for (let i = 0; i < count; i++) {
-			const t = safeStart + i * step;
-			const noise = (this.random(seed + i) - 0.5) * 2;
-			const drift = (this.random(seed * 3 + i) - 0.5) * 0.4;
-			const delta = (noise + drift) * (value * 0.01);
-			const open = value;
-			const close = Math.max(1, value + delta);
-			const high = Math.max(open, close) + Math.abs(this.random(seed + i * 11)) * value * 0.005;
-			const low = Math.min(open, close) - Math.abs(this.random(seed + i * 7)) * value * 0.005;
-
-			bars.push({ t, o: open, h: high, l: low, c: close });
-			value = close;
-		}
-
-		return bars;
-	}
-
-	private timeframeToMs(timeframe: Timeframe): number {
-		switch (timeframe) {
-			case '1m':
-				return 60 * 1000;
-			case '5m':
-				return 5 * 60 * 1000;
-			case '15m':
-				return 15 * 60 * 1000;
-			case '30m':
-				return 30 * 60 * 1000;
-			case '1H':
-				return 60 * 60 * 1000;
-			case '4H':
-				return 4 * 60 * 60 * 1000;
-			case '1W':
-				return 7 * 24 * 60 * 60 * 1000;
-			case '1M':
-				return 30 * 24 * 60 * 60 * 1000;
-			case '1D':
-			default:
-				return 24 * 60 * 60 * 1000;
-		}
-	}
-
-	private seedFromString(value: string): number {
-		let hash = 0;
-		for (let i = 0; i < value.length; i++) {
-			hash = (hash << 5) - hash + value.charCodeAt(i);
-			hash |= 0;
-		}
-		return Math.abs(hash);
-	}
-
-	private random(seed: number): number {
-		const x = Math.sin(seed) * 10000;
-		return x - Math.floor(x);
 	}
 }

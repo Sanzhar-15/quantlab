@@ -23,7 +23,7 @@ from qviz.reader import (
     table_to_arrow_ipc,
 )
 
-from qviz.tests._fixture_helpers import require_fixture
+from qviz.tests._fixture_helpers import spike_data_path
 
 
 # ---------------------------------------------------------------------------
@@ -39,13 +39,9 @@ def parquet_1m() -> Path:
     through to an ad-hoc generator with a different schema if the spike
     file was missing, which both violated CLAUDE.md "no fallbacks" and
     masked CI environments where the autouse generator had failed.
-    `require_fixture` now hard-fails under `QUANTLAB_REQUIRE_FIXTURES=1`
-    and soft-skips otherwise; the session-scoped autouse fixture in
-    `conftest.py` already guarantees presence locally.
+    The path is the required QUANTLAB_TEST_SPIKE_DATA; absence fails.
     """
-    p = Path("/tmp/quantlab-spike-data/synthetic_ohlcv_1m.parquet")
-    require_fixture(p, "spike OHLCV parquet")
-    return p
+    return spike_data_path()
 
 
 @pytest.fixture

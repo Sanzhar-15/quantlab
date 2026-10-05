@@ -5,7 +5,7 @@
 
 import { localize, localize2 } from '../../../../../nls.js';
 import { AgentSessionSection, IAgentSession, IAgentSessionSection, IMarshalledAgentSessionContext, isAgentSessionSection, isLocalAgentSessionItem, isMarshalledAgentSessionContext } from './agentSessionsModel.js';
-import { Action2, MenuId, MenuRegistry } from '../../../../../platform/actions/common/actions.js';
+import { Action2, MenuId } from '../../../../../platform/actions/common/actions.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { ServicesAccessor } from '../../../../../editor/browser/editorExtensions.js';
 import { AGENT_SESSION_DELETE_ACTION_ID, AGENT_SESSION_RENAME_ACTION_ID, AgentSessionProviders, AgentSessionsViewerOrientation, IAgentSessionsControl } from './agentSessions.js';
@@ -61,13 +61,6 @@ export class ToggleChatViewSessionsAction extends Action2 {
 }
 
 const agentSessionsOrientationSubmenu = new MenuId('chatAgentSessionsOrientationSubmenu');
-MenuRegistry.appendMenuItem(MenuId.ChatWelcomeContext, {
-	submenu: agentSessionsOrientationSubmenu,
-	title: localize2('chat.sessionsOrientation', "Sessions Orientation"),
-	group: '0_sessions',
-	order: 2,
-	when: ChatContextKeys.inChatEditor.negate()
-});
 
 
 export class SetAgentSessionsOrientationStackedAction extends Action2 {

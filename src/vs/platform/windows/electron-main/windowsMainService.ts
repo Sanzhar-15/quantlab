@@ -286,9 +286,6 @@ export class WindowsMainService extends Disposable implements IWindowsMainServic
 
 		// Handle `<app> --wait`
 		this.handleWaitMarkerFile(openConfig, [window]);
-
-		// Handle `<app> chat`
-		this.handleChatRequest(openConfig, [window]);
 	}
 
 	async open(openConfig: IOpenConfiguration): Promise<ICodeWindow[]> {
@@ -449,9 +446,6 @@ export class WindowsMainService extends Disposable implements IWindowsMainServic
 		// Handle `<app> --wait`
 		this.handleWaitMarkerFile(openConfig, usedWindows);
 
-		// Handle `<app> chat`
-		this.handleChatRequest(openConfig, usedWindows);
-
 		return usedWindows;
 	}
 
@@ -471,27 +465,6 @@ export class WindowsMainService extends Disposable implements IWindowsMainServic
 					// ignore - could have been deleted from the window already
 				}
 			})();
-		}
-	}
-
-	private handleChatRequest(openConfig: IOpenConfiguration, usedWindows: ICodeWindow[]): void {
-		if (openConfig.context !== OpenContext.CLI || !openConfig.cli.chat || usedWindows.length === 0) {
-			return;
-		}
-
-		let windowHandlingChatRequest: ICodeWindow | undefined;
-		if (usedWindows.length === 1) {
-			windowHandlingChatRequest = usedWindows[0];
-		} else {
-			const chatRequestFolder = openConfig.cli._[0]; // chat request gets cwd() as folder to open
-			if (chatRequestFolder) {
-				windowHandlingChatRequest = findWindowOnWorkspaceOrFolder(usedWindows, URI.file(chatRequestFolder));
-			}
-		}
-
-		if (windowHandlingChatRequest) {
-			windowHandlingChatRequest.sendWhenReady('vscode:handleChatRequest', CancellationToken.None, openConfig.cli.chat);
-			windowHandlingChatRequest.focus();
 		}
 	}
 

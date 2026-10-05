@@ -144,7 +144,7 @@ def parse_args() -> argparse.Namespace:
 
 def setup_logging(session_id: str, log_level: str = "INFO") -> None:
     """Configure logging for daemon process."""
-    log_dir = Path.home() / ".quantlab" / "logs"
+    log_dir = Path.home() / ".deltaplus" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     log_file = log_dir / f"daemon_{session_id}.log"
@@ -163,7 +163,7 @@ def check_daemon_running(session_id: str | None = None) -> list[dict]:
     """Check for running daemon sessions."""
     from quantlab.daemon.lifecycle import PidFile
 
-    sessions_dir = Path.home() / ".quantlab" / "sessions"
+    sessions_dir = Path.home() / ".deltaplus" / "sessions"
     running_sessions = []
 
     if not sessions_dir.exists():

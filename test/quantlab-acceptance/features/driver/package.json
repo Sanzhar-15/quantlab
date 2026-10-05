@@ -1,0 +1,13 @@
+{
+	"name": "ql-features-closing-driver",
+	"displayName": "QuantLab FEATURES closing-check driver",
+	"description": "Acceptance driver: runs PLAN-FINAL 3.9's closing checks inside the extension host. Never packaged.",
+	"publisher": "quantlab-acceptance",
+	"version": "0.0.0",
+	"private": true,
+	"engines": {
+		"vscode": "*"
+	},
+	"main": "./extension.cjs",
+	"activationEvents": []
+}

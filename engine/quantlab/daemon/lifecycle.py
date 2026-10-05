@@ -82,7 +82,7 @@ class PidFile:
     """
     PID file manager for daemon processes.
 
-    Location: ~/.quantlab/sessions/{session_id}.pid
+    Location: ~/.deltaplus/sessions/{session_id}.pid
 
     The PID file ensures only one daemon runs per session and
     allows detection of stale daemons after crashes.
@@ -92,7 +92,7 @@ class PidFile:
         from quantlab.protocol.transport import validate_session_id
         validate_session_id(session_id)
         self.session_id = session_id
-        self._base_dir = Path.home() / ".quantlab" / "sessions"
+        self._base_dir = Path.home() / ".deltaplus" / "sessions"
         self._pid_path = self._base_dir / f"{session_id}.pid"
         self._acquired = False
         self._lock_fd: int | None = None  # File descriptor for lock
@@ -241,7 +241,7 @@ class PidFile:
         Returns:
             PID if daemon is running, None otherwise
         """
-        pid_path = Path.home() / ".quantlab" / "sessions" / f"{session_id}.pid"
+        pid_path = Path.home() / ".deltaplus" / "sessions" / f"{session_id}.pid"
 
         if not pid_path.exists():
             return None

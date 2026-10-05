@@ -15,63 +15,21 @@
     "themes": [
       {
         "id": "Quantlab Dark",
-        "label": "%quantlabDarkThemeLabel%",
+        "label": "%deltaPlusDarkThemeLabel%",
         "uiTheme": "vs-dark",
-        "path": "./themes/quantlab_dark.json"
+        "path": "./themes/delta_plus_dark.json"
       },
       {
         "id": "Quantlab Light",
-        "label": "%quantlabLightThemeLabel%",
+        "label": "%deltaPlusLightThemeLabel%",
         "uiTheme": "vs",
-        "path": "./themes/quantlab_light.json"
-      },
-      {
-        "id": "Default Dark+",
-        "label": "%darkPlusColorThemeLabel%",
-        "uiTheme": "vs-dark",
-        "path": "./themes/dark_plus.json"
-      },
-      {
-        "id": "Default Dark Modern",
-        "label": "%darkModernThemeLabel%",
-        "uiTheme": "vs-dark",
-        "path": "./themes/dark_modern.json"
-      },
-      {
-        "id": "Default Light+",
-        "label": "%lightPlusColorThemeLabel%",
-        "uiTheme": "vs",
-        "path": "./themes/light_plus.json"
-      },
-      {
-        "id": "Default Light Modern",
-        "label": "%lightModernThemeLabel%",
-        "uiTheme": "vs",
-        "path": "./themes/light_modern.json"
-      },
-      {
-        "id": "Visual Studio Dark",
-        "label": "%darkColorThemeLabel%",
-        "uiTheme": "vs-dark",
-        "path": "./themes/dark_vs.json"
-      },
-      {
-        "id": "Visual Studio Light",
-        "label": "%lightColorThemeLabel%",
-        "uiTheme": "vs",
-        "path": "./themes/light_vs.json"
+        "path": "./themes/delta_plus_light.json"
       },
       {
         "id": "Default High Contrast",
-        "label": "%hcColorThemeLabel%",
+        "label": "%deltaPlusHcThemeLabel%",
         "uiTheme": "hc-black",
-        "path": "./themes/hc_black.json"
-      },
-      {
-        "id": "Default High Contrast Light",
-        "label": "%lightHcColorThemeLabel%",
-        "uiTheme": "hc-light",
-        "path": "./themes/hc_light.json"
+        "path": "./themes/delta_plus_hc.json"
       }
     ],
     "iconThemes": [

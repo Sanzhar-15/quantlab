@@ -1,4 +1,9 @@
 /*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/*
  *  Verification tests for audit fixes in JobRunner.ts
  *
  *  Tests:
@@ -7,13 +12,17 @@
  *    6. cancel() before start() → start() guards against it
  *    7. handleStderrMessage type safety
  *    8. onProcessExit JSON parse type guard
- *--------------------------------------------------------------------------------------------*/
+ */
 
 import 'mocha';
 
 import { isTestFlagEnabled } from '../../helpers/envFlag';
 import * as assert from 'assert';
-import { JobRunner } from '../../../core/engine/JobRunner';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { bundledEngineLaunch, ENGINE_SOURCES, EngineLaunch } from '../../../core/engine/bundledEngine';
+import { JobRunner, resolveEngineModule } from '../../../core/engine/JobRunner';
 import { EngineEvent, JobRequest } from '../../../types/engine';
 
 function makeRequest(overrides?: Partial<JobRequest>): JobRequest {
@@ -28,6 +37,10 @@ function makeRequest(overrides?: Partial<JobRequest>): JobRequest {
 	};
 }
 
+function launch(executable: string): EngineLaunch {
+	return { executable, source: 'test', cwd: os.tmpdir(), engineRoot: os.tmpdir() };
+}
+
 suite('JobRunner – Audit Verification', () => {
 
 	// -----------------------------------------------------------------------
@@ -39,8 +52,7 @@ suite('JobRunner – Audit Verification', () => {
 			const events: EngineEvent[] = [];
 			const runner = new JobRunner({
 				request: makeRequest(),
-				pythonPath: '/nonexistent/python/path/that/does/not/exist',
-				engineRoot: '/tmp',
+				engine: launch('/nonexistent/python/path/that/does/not/exist'),
 				onEvent: (event) => {
 					events.push(event);
 					if (event.type === 'failed') {
@@ -76,8 +88,7 @@ suite('JobRunner – Audit Verification', () => {
 			// Use a command that exits immediately — "python -c pass" would work if python exists
 			const runner = new JobRunner({
 				request: makeRequest(),
-				pythonPath: '/bin/echo',  // will fail as a Python process but exits immediately
-				engineRoot: '/tmp',
+				engine: launch('/bin/echo'),  // will fail as a Python process but exits immediately
 				onEvent: (event) => {
 					events.push(event);
 					if (event.type === 'failed' || event.type === 'complete') {
@@ -104,8 +115,7 @@ suite('JobRunner – Audit Verification', () => {
 			const events: EngineEvent[] = [];
 			const runner = new JobRunner({
 				request: makeRequest(),
-				pythonPath: '/usr/bin/python3',
-				engineRoot: '/tmp',
+				engine: launch('/usr/bin/python3'),
 				onEvent: (event) => events.push(event),
 			});
 
@@ -135,8 +145,7 @@ suite('JobRunner – Audit Verification', () => {
 			const runner = new JobRunner({
 				request: makeRequest(),
 				// Use bash to write non-object JSON to stderr and valid JSON to stdout
-				pythonPath: '/bin/bash',
-				engineRoot: '/tmp',
+				engine: launch('/bin/bash'),
 				onEvent: (event) => {
 					events.push(event);
 					// The process will fail because bash doesn't understand -m flag,
@@ -160,8 +169,7 @@ suite('JobRunner – Audit Verification', () => {
 			// Use a process that writes a JSON array to stdout instead of object
 			const runner = new JobRunner({
 				request: makeRequest(),
-				pythonPath: '/bin/bash',
-				engineRoot: '/tmp',
+				engine: launch('/bin/bash'),
 				onEvent: (event) => {
 					events.push(event);
 					if (event.type === 'failed') {
@@ -177,8 +185,7 @@ suite('JobRunner – Audit Verification', () => {
 			const events: EngineEvent[] = [];
 			const runner = new JobRunner({
 				request: makeRequest(),
-				pythonPath: '/bin/bash',
-				engineRoot: '/tmp',
+				engine: launch('/bin/bash'),
 				onEvent: (event) => {
 					events.push(event);
 					if (event.type === 'failed') {
@@ -187,6 +194,110 @@ suite('JobRunner – Audit Verification', () => {
 				},
 			});
 			runner.start();
+		});
+	});
+});
+
+suite('JobRunner – engine actions and launch', () => {
+
+	for (const [action, label] of [['optimize', 'Optimize'], ['monteCarlo', 'Monte Carlo'], ['wfa', 'Walk-forward analysis']]) {
+		test(`${action} is refused by name, without starting a process`, () => {
+			const events: EngineEvent[] = [];
+			const runner = new JobRunner({
+				request: makeRequest({ action }),
+				engine: launch('/nonexistent/engine'),
+				onEvent: (event) => events.push(event),
+			});
+			runner.start();
+			const failed = events.filter(e => e.type === 'failed');
+			assert.strictEqual(failed.length, 1);
+			assert.ok(failed[0].type === 'failed' && failed[0].error === `${label} is not available yet: the Quantlab engine has no ${label} module.`);
+			assert.ok(!events.some(e => e.type === 'log' && e.message.startsWith('Starting')), 'no process may be started');
+		});
+	}
+
+	test('an unknown action is refused by name, never run as a backtest', () => {
+		assert.deepStrictEqual(resolveEngineModule('frobnicate'), { kind: 'refused', reason: `Unknown engine action 'frobnicate': the Quantlab engine runs only a backtest.` });
+		assert.deepStrictEqual(resolveEngineModule('constructor'), { kind: 'refused', reason: `Unknown engine action 'constructor': the Quantlab engine runs only a backtest.` });
+		assert.deepStrictEqual(resolveEngineModule('backtest'), { kind: 'module', module: 'quantlab.cli.run_backtest' });
+	});
+
+	suite('the process the job starts', () => {
+		let root: string;
+		let savedPythonPath: string | undefined;
+
+		setup(() => {
+			root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ql-jobrunner-')));
+			savedPythonPath = process.env.PYTHONPATH;
+			process.env.PYTHONPATH = '/inherited/pythonpath';
+		});
+
+		teardown(() => {
+			if (savedPythonPath === undefined) {
+				delete process.env.PYTHONPATH;
+			} else {
+				process.env.PYTHONPATH = savedPythonPath;
+			}
+			fs.rmSync(root, { recursive: true });
+		});
+
+		// A stand-in engine: reports its argv, working directory and PYTHONPATH through the failure channel.
+		function probe(dir: string): string {
+			fs.mkdirSync(dir, { recursive: true });
+			const exe = path.join(dir, 'quantlab-engine');
+			fs.writeFileSync(exe, '#!/bin/sh\ncat >/dev/null\nprintf \'{"success":false,"error":"%s|%s|%s"}\' "$*" "$(pwd -P)" "${PYTHONPATH-unset}"\n', { mode: 0o755 });
+			return exe;
+		}
+
+		function run(engine: EngineLaunch): Promise<EngineEvent[]> {
+			return new Promise(resolve => {
+				const events: EngineEvent[] = [];
+				new JobRunner({
+					request: makeRequest(),
+					engine,
+					onEvent: (event) => {
+						events.push(event);
+						if (event.type === 'failed' || event.type === 'complete') {
+							resolve(events);
+						}
+					},
+				}).start();
+			});
+		}
+
+		function firstLog(events: EngineEvent[]): string {
+			const first = events.find(e => e.type === 'log');
+			assert.ok(first && first.type === 'log');
+			return first.message;
+		}
+
+		for (const [step, source] of [['packaged', ENGINE_SOURCES.packaged], ['development', ENGINE_SOURCES.development]] as const) {
+			test(`the ${step} bundled engine runs in its own directory with no PYTHONPATH, and the first log line names the step`, async function () {
+				if (process.platform === 'win32') {
+					this.skip();
+				}
+				const dir = path.join(root, 'engine', 'quantlab-engine');
+				const exe = probe(dir);
+				const events = await run(bundledEngineLaunch(exe, source));
+				const failed = events.find(e => e.type === 'failed');
+				assert.ok(failed && failed.type === 'failed');
+				assert.strictEqual(failed.error, `-m quantlab.cli.run_backtest|${dir}|unset`);
+				assert.strictEqual(firstLog(events), `Starting backtest job: ${exe} -m quantlab.cli.run_backtest (${step} bundled engine; cwd ${dir})`);
+			});
+		}
+
+		test('an interpreter runs in the engine source tree with it on PYTHONPATH', async function () {
+			if (process.platform === 'win32') {
+				this.skip();
+			}
+			const engineRoot = path.join(root, 'engine-src');
+			fs.mkdirSync(engineRoot);
+			const exe = probe(path.join(root, 'bin'));
+			const events = await run({ executable: exe, source: ENGINE_SOURCES.setting, cwd: engineRoot, engineRoot });
+			const failed = events.find(e => e.type === 'failed');
+			assert.ok(failed && failed.type === 'failed');
+			assert.strictEqual(failed.error, `-m quantlab.cli.run_backtest|${engineRoot}|${engineRoot}`);
+			assert.strictEqual(firstLog(events), `Starting backtest job: ${exe} -m quantlab.cli.run_backtest (setting quantlab.pythonPath; cwd ${engineRoot})`);
 		});
 	});
 });

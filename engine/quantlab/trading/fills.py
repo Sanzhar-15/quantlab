@@ -197,7 +197,7 @@ class FillReconciler:
         """
         self._session_id = session_id
         self._position_tracker = position_tracker
-        self._state_dir = state_dir or Path.home() / ".quantlab" / "sessions"
+        self._state_dir = state_dir or Path.home() / ".deltaplus" / "sessions"
         self._on_fill_applied = on_fill_applied
 
         # Initialize state

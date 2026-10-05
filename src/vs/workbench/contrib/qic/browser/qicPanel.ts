@@ -27,8 +27,8 @@ import { inputBackground } from '../../../../platform/theme/common/colors/inputC
 import { EDITOR_DRAG_AND_DROP_BACKGROUND, SIDE_BAR_FOREGROUND } from '../../../common/theme.js';
 import { Memento } from '../../../common/memento.js';
 import { IQicService } from '../common/qicService.js';
-import { QIC_PANEL_VISIBLE_CONTEXT, QIC_CONNECTION_MODE_CONTEXT, QIC_SETTINGS, QIC_SECRET_KEYS } from '../common/constants.js';
-import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
+import { QIC_PANEL_VISIBLE_CONTEXT, QIC_CONNECTION_MODE_CONTEXT, QIC_SETTINGS } from '../common/constants.js';
+import { IQuantlabHostIdentityService } from '../../../services/quantlabHostIdentity/common/quantlabHostIdentity.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { IQicChatService } from './qicChatService.js';
 import { QicHeaderControl } from './qicHeaderControl.js';
@@ -102,7 +102,7 @@ export class QicChatViewPane extends ViewPane {
 		@IStorageService private readonly storageService: IStorageService,
 		@ILogService private readonly logService: ILogService,
 		@IWorkbenchLayoutService private readonly layoutService: IWorkbenchLayoutService,
-		@ISecretStorageService private readonly secretStorageService: ISecretStorageService,
+		@IQuantlabHostIdentityService private readonly hostIdentityService: IQuantlabHostIdentityService,
 		@INotificationService private readonly notificationService: INotificationService,
 	) {
 		super(options, keybindingService, contextMenuService, configurationService, contextKeyService, viewDescriptorService, instantiationService, openerService, themeService, hoverService);
@@ -348,34 +348,29 @@ export class QicChatViewPane extends ViewPane {
 			return;
 		}
 
-		// For Delta Plus: ensure we have a token before switching
+		// For Delta Plus: the host identity must say signed in before switching. The panel holds no
+		// token; a host that cannot answer is an error shown to the user, never "signed out".
 		if (connection === 'deltaplus') {
-			const existing = await this.secretStorageService.get(QIC_SECRET_KEYS.DELTAPLUS_ACCESS_TOKEN);
-			if (!existing) {
-				await this._loginToDeltaPlus();
+			try {
+				if (!(await this.hostIdentityService.getIdentity()).signedIn) {
+					this.logService.info('[QicPanel] Not signed in at the host -- server mode not enabled');
+					this.notificationService.info(
+						localize('qic.signInRequired', 'Sign in at the Quantlab terminal view to use server mode.')
+					);
+					return;
+				}
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				this.logService.error('[QicPanel] Could not read the host sign-in state:', error);
+				this.notificationService.error(
+					localize('qic.signInStateUnavailable', 'Could not read the sign-in state from the host: {0}', detail)
+				);
+				return;
 			}
 		}
 
 		await this.configurationService.updateValue(QIC_SETTINGS.CONNECTION_MODE, newMode);
 		// The hot-swap listener in qic.contribution.ts will prompt for reload
-	}
-
-	/**
-	 * Ensure a Delta Plus token exists when switching to server mode.
-	 * If the user has signed in via the QuantLab auth provider the token will already
-	 * be in SecretStorage (written by ServerApiClient.persistTokens). If not, prompt
-	 * the user to sign in rather than falling back to demo credentials.
-	 */
-	private async _loginToDeltaPlus(): Promise<void> {
-		const existing = await this.secretStorageService.get(QIC_SECRET_KEYS.DELTAPLUS_ACCESS_TOKEN);
-		if (existing) {
-			// Token already present -- adapter will pick it up via onDidChangeSecret.
-			return;
-		}
-		this.logService.info('[QicPanel] No Delta Plus token -- prompting user to sign in');
-		this.notificationService.info(
-			localize('qic.signInRequired', 'Sign in to your Delta Plus account to use server mode. Use the Accounts menu or run "QuantLab: Sign In to Delta Plus".')
-		);
 	}
 
 	private _onReasoningChanged(level: QicReasoningLevel): void {

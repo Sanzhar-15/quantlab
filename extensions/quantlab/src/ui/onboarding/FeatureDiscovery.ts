@@ -15,7 +15,6 @@ const TEN_RUNS_THRESHOLD = 10;
 const TIP_IDS = {
 	backtestComplete: 'tip.backtest.complete',
 	parameterEdit: 'tip.parameter.edit',
-	tradeChecklist: 'tip.trade.checklist',
 	pinRuns: 'tip.history.pin'
 };
 
@@ -67,17 +66,6 @@ export class FeatureDiscovery {
 			'Apply parameter changes back to your strategy code when you are ready.',
 			[
 				this.buildAction('apply-to-code', 'Apply to Code', 'quantlab.chart.applyParameters', [], true)
-			]
-		);
-	}
-
-	notifyTradeView(): void {
-		this.showTip(
-			TIP_IDS.tradeChecklist,
-			'Trade checklist',
-			'Complete the checklist in the Trade panel before going live.',
-			[
-				this.buildAction('open-trade-panel', 'Open Trade Panel', 'quantlab.focusTradePanel', [], true)
 			]
 		);
 	}

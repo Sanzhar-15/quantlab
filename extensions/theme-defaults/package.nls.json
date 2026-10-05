@@ -1,15 +1,8 @@
 {
 	"displayName": "Default Themes",
-	"description": "The default Quantlab light and dark themes",
-	"quantlabDarkThemeLabel": "Quantlab Dark",
-	"quantlabLightThemeLabel": "Quantlab Light",
-	"darkPlusColorThemeLabel": "Dark+",
-	"darkModernThemeLabel": "Dark Modern",
-	"lightPlusColorThemeLabel": "Light+",
-	"lightModernThemeLabel": "Light Modern",
-	"darkColorThemeLabel": "Dark (Classic)",
-	"lightColorThemeLabel": "Light (Classic)",
-	"hcColorThemeLabel": "Dark High Contrast",
-	"lightHcColorThemeLabel": "Light High Contrast",
+	"description": "The default Delta Plus light, dark and high contrast themes",
+	"deltaPlusDarkThemeLabel": "Delta Plus Dark",
+	"deltaPlusLightThemeLabel": "Delta Plus Light",
+	"deltaPlusHcThemeLabel": "Delta Plus High Contrast",
 	"minimalIconThemeLabel": "Minimal (Quantlab)"
 }

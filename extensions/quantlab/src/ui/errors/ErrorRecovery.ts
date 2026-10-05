@@ -4,8 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import { QuantlabError, QuantlabRecoveryAction } from '../../types/errors';
-import { TradeErrorState } from '../../types/trading';
+import { QuantlabError } from '../../types/errors';
 import { ToastService } from '../notifications/ToastService';
 
 const DEDUPE_WINDOW_MS = 5000;
@@ -59,54 +58,6 @@ export class ErrorRecovery {
 			actions: error.actions,
 			durationMs: 5000
 		});
-	}
-
-	buildTradeError(sessionId: string, error: TradeErrorState): QuantlabError {
-		const actions: QuantlabRecoveryAction[] = [
-			{
-				id: 'trade-logs',
-				label: 'View Logs',
-				command: 'quantlab.trade.openLogs',
-				args: [sessionId]
-			}
-		];
-
-		if (error.recoverable) {
-			actions.push(
-				{
-					id: 'trade-retry',
-					label: 'Retry',
-					command: 'quantlab.trade.retrySession',
-					args: [sessionId],
-					primary: true
-				},
-				{
-					id: 'trade-settings',
-					label: 'Open Broker Settings',
-					command: 'quantlab.openBrokerSettings',
-					args: []
-				}
-			);
-		} else {
-			actions.push({
-				id: 'trade-restart',
-				label: 'Restart Session',
-				command: 'quantlab.trade.restartSession',
-				args: [sessionId],
-				primary: true
-			});
-		}
-
-		return {
-			id: `trade-${sessionId}-${error.code}`,
-			source: 'trade',
-			code: error.code,
-			message: error.message,
-			detail: error.detail,
-			severity: error.recoverable ? 'warning' : 'error',
-			actions,
-			createdAt: Date.now()
-		};
 	}
 
 	private isDuplicate(error: QuantlabError): boolean {

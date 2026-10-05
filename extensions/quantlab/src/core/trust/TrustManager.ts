@@ -1,10 +1,10 @@
 /*---------------------------------------------------------------------------------------------
- *  Trust Manager.
- *
- *  Manages workspace and strategy trust for live trading safety.
- *
- *  Spec Reference: Technical Spec §12.3 (Safety Layer)
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+// Trust Manager: manages workspace and strategy trust.
+// Spec Reference: Technical Spec 12.3 (Safety Layer)
 
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
@@ -63,6 +63,7 @@ export class TrustManager extends (EventEmitter as new () => TypedEmitter<TrustM
 	private context: vscode.ExtensionContext | undefined;
 
 	private constructor() {
+		// eslint-disable-next-line constructor-super -- the base is EventEmitter behind a typed cast
 		super();
 	}
 
@@ -394,8 +395,8 @@ export class TrustManager extends (EventEmitter as new () => TypedEmitter<TrustM
 		if (!result.isValid && (result.hashMismatch || !this.isStrategyTrusted(strategyPath))) {
 			const message = result.hashMismatch
 				? vscode.l10n.t(
-						'The strategy file has been modified. Do you want to trust the updated version?'
-				  )
+					'The strategy file has been modified. Do you want to trust the updated version?'
+				)
 				: vscode.l10n.t('This strategy is not trusted. Trust it for live trading?');
 
 			const choice = await vscode.window.showWarningMessage(
@@ -447,58 +448,7 @@ export class TrustManager extends (EventEmitter as new () => TypedEmitter<TrustM
 					newTrust: 'untrusted',
 					timestamp: Date.now(),
 				});
-
-				// NEW-UI-002: Hot-reload flow — check if a live session uses this strategy
-				this.showHotReloadDialogIfNeeded(uri.fsPath);
 			}
-		}
-	}
-
-	/**
-	 * Show hot-reload dialog if a live session is using the changed strategy (NEW-UI-002).
-	 */
-	private async showHotReloadDialogIfNeeded(strategyPath: string): Promise<void> {
-		// Guard: deactivation may have reset the instance between the file-watch event firing and this async resumption
-		if (!TrustManager.instance) {
-			return;
-		}
-		const { SessionManager } = await import('../trading/SessionManager');
-		// Re-check after the dynamic import await — deactivation could have run during the import
-		if (!TrustManager.instance) {
-			return;
-		}
-		let sessionManager: ReturnType<typeof SessionManager.getInstance>;
-		try {
-			sessionManager = SessionManager.getInstance();
-		} catch {
-			return; // SessionManager was reset during deactivation
-		}
-		const affectedSession = sessionManager.getSessionForStrategy?.(strategyPath);
-
-		if (!affectedSession || affectedSession.type !== 'live') {
-			return;
-		}
-
-		const action = await vscode.window.showWarningMessage(
-			`Strategy file changed while live session "${affectedSession.id}" is running. ` +
-			'The strategy trust has been revoked.',
-			'Pause Session', 'Stop Session', 'Dismiss'
-		);
-
-		if (action === 'Pause Session') {
-			try {
-				await sessionManager.pauseSession(affectedSession.id);
-				void vscode.window.showInformationMessage(
-					`Session ${affectedSession.id} paused. Review changes and resume when ready.`
-				);
-			} catch (e: unknown) {
-				const msg = e instanceof Error ? e.message : String(e);
-				void vscode.window.showErrorMessage(`Failed to pause session: ${msg}`);
-			}
-		} else if (action === 'Stop Session') {
-			try {
-				await sessionManager.stopSession(affectedSession.id);
-			} catch { /* best effort */ }
 		}
 	}
 
