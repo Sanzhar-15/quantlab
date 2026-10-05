@@ -53,6 +53,8 @@ export interface QuantlabHostStream {
 export interface QuantlabHostApi {
 	getIdentity(): Promise<QuantlabHostIdentity>;
 	readonly onDidChangeIdentity: Event<QuantlabHostIdentity>;
+	/** Sign out of every view after the user's yes in a workbench confirm: true when signed out, false when cancelled. */
+	signOut(): Promise<boolean>;
 	request(op: string, input: unknown, token?: CancellationToken): Promise<unknown>;
 	subscribe(topic: string, params: unknown): QuantlabHostStream;
 }
@@ -174,6 +176,7 @@ export class ExtHostQuantlabHost implements ExtHostQuantlabHostShape {
 		return Object.freeze<QuantlabHostApi>({
 			getIdentity: () => this._getIdentity(),
 			onDidChangeIdentity: this._onDidChangeIdentity.event,
+			signOut: () => this._signOut(),
 			request: (op, input, token) => this._request(op, input, token),
 			subscribe: (topic, params) => this._subscribe(topic, params),
 		});
@@ -240,6 +243,17 @@ export class ExtHostQuantlabHost implements ExtHostQuantlabHostShape {
 			return this._identity.epoch;
 		}
 		return (await this._getIdentity()).epoch;
+	}
+
+	private async _signOut(): Promise<boolean> {
+		const answer = await this._proxy.$signOut();
+		if (!answer.ok) {
+			throw toRequestError(answer);
+		}
+		if (typeof answer.data !== 'boolean') {
+			throw new Error(`${LOG_PREFIX} the sign-out answer carries no boolean`);
+		}
+		return answer.data;
 	}
 
 	private async _request(op: string, input: unknown, token: CancellationToken | undefined): Promise<unknown> {

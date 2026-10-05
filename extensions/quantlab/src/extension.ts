@@ -65,7 +65,7 @@ import { TrustManager } from './core/trust/TrustManager';
 import { StatsEngine } from './stats/StatsEngine';
 import { PythonBootstrap } from './core/engine/PythonBootstrap';
 import { ServerApiClient } from './core/server/ServerApiClient';
-import { DeltaPlusAuthProvider } from './auth/DeltaPlusAuthProvider';
+import { DeltaPlusAuthProvider, HOST_IDENTITY_UNAVAILABLE } from './auth/DeltaPlusAuthProvider';
 import { DataViewManager } from './views/DataViewManager';
 import { QuantLabHome } from './auth/QuantLabHome';
 import { DataService } from './core/engine/DataService';
@@ -99,14 +99,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(authProvider);
 
 	// Sign-in / sign-out commands.
-	// The extension has no sign-in of its own: the host identity is the only source and sign-in /
-	// sign-out happen in the Quantlab terminal view, so both commands say where to go.
+	// The extension has no sign-in of its own: the host identity is the only source and sign-in happens
+	// in the Quantlab terminal view, so the sign-in command says where to go. Sign-out goes to the host
+	// through vscode.quantlabHost (rule 2: the API object only this built-in extension receives); the
+	// workbench asks the user to confirm, and the new identity arrives on onDidChangeIdentity. The
+	// command returns nothing: no identity or answer reaches whoever executes it.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.signIn', async () => {
 			void vscode.window.showInformationMessage('Sign in happens in the Quantlab terminal view.');
 		}),
-		vscode.commands.registerCommand('quantlab.signOut', async () => {
-			void vscode.window.showInformationMessage('Sign out happens in the Quantlab terminal view.');
+		vscode.commands.registerCommand('quantlab.signOut', async (): Promise<void> => {
+			const host = vscode.quantlabHost;
+			if (host === undefined) {
+				void vscode.window.showErrorMessage(`Sign out failed: ${HOST_IDENTITY_UNAVAILABLE}.`);
+				return;
+			}
+			try {
+				await host.signOut();
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
+				void vscode.window.showErrorMessage(typeof code === 'string'
+					? `Sign out failed (${code}): ${message}`
+					: `Sign out failed, the host gave no answer: ${message}`);
+			}
 		})
 	);
 

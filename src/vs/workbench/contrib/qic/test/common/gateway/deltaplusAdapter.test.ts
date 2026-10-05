@@ -54,6 +54,10 @@ class FakeHostIdentityService implements IQuantlabHostIdentityService {
 	unsubscribe(): void {
 		throw new Error('DeltaPlusAdapter never unsubscribes');
 	}
+
+	signOut(): Promise<boolean> {
+		throw new Error('DeltaPlusAdapter never signs out');
+	}
 }
 
 function refuse(code: QuantlabHostError['code']): Answer {

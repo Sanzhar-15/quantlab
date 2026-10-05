@@ -64,7 +64,7 @@ export const ERROR_REGISTRY: Record<string, QicErrorTemplate> = {
 	'QIC-Q004': { code: 'QIC-Q004', name: 'DataFrameLoadFailed', severity: 'warning', userMessage: 'Could not load DataFrame.' },
 
 	// Cloud protocol errors
-	'QIC-P007': { code: 'QIC-P007', name: 'FeatureRequiresPro', severity: 'warning', userMessage: 'This feature requires a Pro plan.' },
+	'QIC-P007': { code: 'QIC-P007', name: 'FeatureRequiresPro', severity: 'warning', userMessage: 'This feature is not available for this account.' },
 	'QIC-P008': { code: 'QIC-P008', name: 'IdempotencyConflict', severity: 'warning', userMessage: 'Duplicate request detected.' },
 	'QIC-QUOTA': { code: 'QIC-QUOTA', name: 'QuotaExceeded', severity: 'error', userMessage: 'Your usage quota is exhausted.' },
 	'QIC-UPGRADE': { code: 'QIC-UPGRADE', name: 'UpgradeRequired', severity: 'error', userMessage: 'Please update Quantlab to continue.' },

@@ -68,6 +68,17 @@ export class MainThreadQuantlabHost extends Disposable implements MainThreadQuan
 		return toQuantlabIdentityDto(await this._hostService.getIdentity());
 	}
 
+	async $signOut(): Promise<QuantlabHostAnswerDto> {
+		// The service asks the user (workbench modal) before it invokes the host; a cancel resolves false.
+		let signedOut: boolean;
+		try {
+			signedOut = await this._hostService.signOut();
+		} catch (error) {
+			return this._refusalOrThrow(error, 'sign-out');
+		}
+		return { ok: true, data: signedOut };
+	}
+
 	async $request(op: string, input: unknown, epoch: number, token: CancellationToken): Promise<QuantlabHostAnswerDto> {
 		// `epoch` is the caller's, passed through untouched: the host refuses a stale one `identity-changed`.
 		let data: unknown;

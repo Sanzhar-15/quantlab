@@ -15,6 +15,8 @@ import {
 	QUANTLAB_HOST_IDENTITY_CHANGED_CHANNEL,
 	QUANTLAB_HOST_IDENTITY_GET_CHANNEL,
 	QUANTLAB_HOST_IDENTITY_GET_REQUEST,
+	QUANTLAB_HOST_IDENTITY_SIGN_OUT_CHANNEL,
+	QUANTLAB_HOST_IDENTITY_SIGN_OUT_REQUEST,
 	QUANTLAB_LEGACY_LOGIN_SECRET_KEYS,
 	QuantlabHostError,
 	parseDataFrame,
@@ -217,6 +219,11 @@ suite('QuantlabHostIdentity - contract constants', () => {
 
 	test('the get request is the envelope with a null input', () => {
 		assert.deepStrictEqual(QUANTLAB_HOST_IDENTITY_GET_REQUEST, { v: 1, input: null });
+	});
+
+	test('the sign-out channel and its envelope are the IPC-DATA amendment values', () => {
+		assert.strictEqual(QUANTLAB_HOST_IDENTITY_SIGN_OUT_CHANNEL, 'vscode:quantlab-host-identity:sign-out');
+		assert.deepStrictEqual(QUANTLAB_HOST_IDENTITY_SIGN_OUT_REQUEST, { v: 1, input: null });
 	});
 
 	test('the data channels are the IPC-DATA values, and the envelope is { v: 1, input }', () => {
