@@ -25,6 +25,7 @@ import type { SessionInstance } from './quantbook/types';
 import { registerGlobalStateCommands } from './commands/globalStateCommands';
 import { registerHistoryCommands } from './commands/historyCommands';
 import { registerPanelCommands } from './commands/panelCommands';
+import { registerImportCommands } from './import';
 import { registerTradeCommands } from './commands/tradeCommands';
 import { registerAICommands, loadAnthropicKeyIntoProvider } from './commands/aiCommands';
 import { AIPanelProvider } from './panels/AIPanelProvider';
@@ -312,6 +313,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	registerGlobalStateCommands(context);
 	registerHistoryCommands(context);
 	registerPanelCommands(context);
+	registerImportCommands(context);
 	registerTradeCommands(context);
 	registerViewCommands(context);
 	registerDashboardCommands(context);
