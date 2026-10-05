@@ -184,7 +184,7 @@ class TestEncryptedSecretsFile:
         """Should use default path in home directory."""
         secrets = EncryptedSecretsFile()
 
-        expected = Path.home() / ".quantlab" / "secrets.enc"
+        expected = Path.home() / ".deltaplus" / "secrets.enc"
         assert secrets.file_path == expected
 
     def test_custom_file_path(self, tmp_path):

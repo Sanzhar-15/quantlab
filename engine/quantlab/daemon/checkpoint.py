@@ -183,7 +183,7 @@ class CheckpointManager:
     """
     Manages checkpoint persistence and recovery.
 
-    Checkpoint file: ~/.quantlab/sessions/{session_id}.state
+    Checkpoint file: ~/.deltaplus/sessions/{session_id}.state
 
     Features:
         - Atomic writes using temporary file + rename
@@ -204,7 +204,7 @@ class CheckpointManager:
             audit_ledger: Optional audit ledger for compliance logging (FIX-CGP-011)
         """
         self.session_id = session_id
-        self._base_dir = Path.home() / ".quantlab" / "sessions"
+        self._base_dir = Path.home() / ".deltaplus" / "sessions"
         self._checkpoint_path = self._base_dir / f"{session_id}.state"
         self._dirty = False
         self._current_checkpoint: SessionCheckpoint | None = None
@@ -392,7 +392,7 @@ class CheckpointManager:
         Returns:
             List of session IDs with checkpoints
         """
-        base_dir = Path.home() / ".quantlab" / "sessions"
+        base_dir = Path.home() / ".deltaplus" / "sessions"
         if not base_dir.exists():
             return []
 
@@ -413,7 +413,7 @@ class CheckpointManager:
         Returns:
             Age in seconds, or None if no checkpoint
         """
-        checkpoint_path = Path.home() / ".quantlab" / "sessions" / f"{session_id}.state"
+        checkpoint_path = Path.home() / ".deltaplus" / "sessions" / f"{session_id}.state"
 
         if not checkpoint_path.exists():
             return None

@@ -123,7 +123,7 @@ def recover_session(
     Returns:
         SessionRecoveryResult if session found, None otherwise
     """
-    ledger_dir = ledger_dir or Path.home() / ".quantlab" / "audit"
+    ledger_dir = ledger_dir or Path.home() / ".deltaplus" / "audit"
     ledger_path = ledger_dir / f"ledger_{session_id}.jsonl"
 
     if not ledger_path.exists():
@@ -291,7 +291,7 @@ def list_recoverable_sessions(
     Returns:
         List of recoverable session info
     """
-    ledger_dir = ledger_dir or Path.home() / ".quantlab" / "audit"
+    ledger_dir = ledger_dir or Path.home() / ".deltaplus" / "audit"
 
     if not ledger_dir.exists():
         return []
@@ -349,7 +349,7 @@ def cleanup_old_ledgers(
     """
     import time
 
-    ledger_dir = ledger_dir or Path.home() / ".quantlab" / "audit"
+    ledger_dir = ledger_dir or Path.home() / ".deltaplus" / "audit"
 
     if not ledger_dir.exists():
         return []

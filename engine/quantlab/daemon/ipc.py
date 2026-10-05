@@ -62,7 +62,7 @@ class TokenManager:
     """
     Manages IPC authentication tokens.
 
-    Token file: ~/.quantlab/sessions/{session_id}.token
+    Token file: ~/.deltaplus/sessions/{session_id}.token
     Permissions: 0600 (owner only)
 
     Tokens are:
@@ -74,7 +74,7 @@ class TokenManager:
     def __init__(self, session_id: str) -> None:
         _validate_session_id(session_id)
         self.session_id = session_id
-        self._base_dir = Path.home() / ".quantlab" / "sessions"
+        self._base_dir = Path.home() / ".deltaplus" / "sessions"
         self._token_path = self._base_dir / f"{session_id}.token"
         self._token: str | None = None
 
@@ -246,7 +246,7 @@ class IPCServer:
         self._reliability = reliability_manager
 
         # Socket setup
-        self._socket_path = Path.home() / ".quantlab" / "sessions" / f"{session_id}.sock"
+        self._socket_path = Path.home() / ".deltaplus" / "sessions" / f"{session_id}.sock"
         self._server = UnixSocketServer(self._socket_path)
 
         # Client tracking
@@ -794,7 +794,7 @@ class IPCClient:
     def __init__(self, session_id: str, token: str) -> None:
         self.session_id = session_id
         self._token = token
-        self._socket_path = Path.home() / ".quantlab" / "sessions" / f"{session_id}.sock"
+        self._socket_path = Path.home() / ".deltaplus" / "sessions" / f"{session_id}.sock"
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._connected = False
