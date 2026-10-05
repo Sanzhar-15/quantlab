@@ -165,7 +165,10 @@ export class QuantLabHome {
 			`script-src 'nonce-${nonce}'`,
 		].join('; ');
 
-		const displayName = user.name?.split(' ')[0] ?? user.email.split('@')[0];
+		// The name is optional in the host identity. Without one the greeting names nobody (the email
+		// is shown right under it); no name is derived from the email.
+		const firstName = user.name?.split(' ')[0];
+		const greeting = firstName ? `Welcome back, ${this._esc(firstName)}!` : 'Welcome back!';
 		// AUTH-TIER: the host identity carries no tier yet; the carry AUTH-TIER supplies the value.
 		// With no tier there is no badge at all (never a guessed value such as 'Free').
 		const tier = user.tier ? `${user.tier.charAt(0).toUpperCase()}${user.tier.slice(1)}` : undefined;
@@ -270,7 +273,7 @@ export class QuantLabHome {
 
 			<!-- Welcome card -->
 			<div class="home-welcome">
-				<p class="home-name">Welcome back, ${this._esc(displayName)}!</p>
+				<p class="home-name">${greeting}</p>
 				<div class="home-meta">
 					<span>${this._esc(user.email)}</span>
 					${tier === undefined ? '' : `<span class="home-tier-badge">${this._esc(tier)}</span>`}

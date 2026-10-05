@@ -24,14 +24,6 @@ export const QUANTLAB_HOST_IDENTITY_GET_CHANNEL = 'vscode:quantlab-host-identity
 /** The broadcast channel the main process uses as a TICK ("ask again"); its payload is `null` (contract amendment A-1). */
 export const QUANTLAB_HOST_IDENTITY_CHANGED_CHANNEL = 'vscode:quantlab-host-identity:changed';
 
-// REMOVED when the extension moves to vscode.quantlabHost (rule 2; OPEN in LOGIN+DATA)
-/** Extension-facing command: the extension host calls it to pull the identity. */
-export const QUANTLAB_EXT_GET_COMMAND = '_quantlab.hostIdentity.get';
-
-// REMOVED when the extension moves to vscode.quantlabHost (rule 2; OPEN in LOGIN+DATA)
-/** Extension-side command the service executes on every tick, when the extension has registered it. No argument: the extension pulls. */
-export const QUANTLAB_EXT_DID_CHANGE_COMMAND = '_quantlab.hostIdentity.didChange';
-
 /** The request envelope of the invoke: `{ v: 1, input: null }` (MODCH envelope; the identity op takes no input). */
 export const QUANTLAB_HOST_IDENTITY_GET_REQUEST = Object.freeze({ v: 1, input: null });
 

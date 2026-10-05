@@ -13,7 +13,8 @@ declare module 'vscode' {
 	export interface QuantlabHostUser {
 		readonly id: string;
 		readonly email: string;
-		readonly name: string;
+		/** Optional in the protocol: absent when the account has none. Nothing fills it in. */
+		readonly name?: string;
 		readonly tier?: string;
 	}
 
