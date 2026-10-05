@@ -12,6 +12,8 @@
 // bindVariableLogic split). The host shell (mcpServer.ts) is a thin adapter: it injects the live
 // CellGridPanel accessors + the engine SessionInstance + the reactive kernel manager, and wires the
 // official @modelcontextprotocol/sdk transport.
+// Release 1 has no MCP host shell: mcpServer.ts was removed on 2026-10-05 (Quantbook is OFF; it opened a
+// loopback server and printed its bearer token). QL-QUANTBOOK restores a shell from git history.
 //
 // No-Fallbacks: every resolution failure (no grid open, ambiguous grid, unknown sheet, malformed A1,
 // snapshot over the cell cap) throws a loud structured error -- never an empty-default read. The MCP

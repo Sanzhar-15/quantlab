@@ -11,7 +11,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
 import { createRequire } from 'node:module';
-import { assemble, CHECK_IDS, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
+import { assemble, CHECK_IDS, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
 
 const { ask, serve } = createRequire(import.meta.url)('./cues.cjs');
 
@@ -168,4 +168,41 @@ test('judgePackRow: PASS needs a quiet app AND a control that trips every detect
 	assert.match(judgePackRow('on', quiet, offControl).detail, /control_detector_blind\] the control did not trip pack_installed/);
 	assert.match(judgePackRow('off', quiet, quiet).detail, /control_not_red/);
 	assert.match(judgePackRow('off', { status: 'FAIL', reasons: ['pack_toast'], detail: 'toast' }, offControl).detail, /^app: toast/);
+});
+
+test('judgeQuantbookMcpAbsent: PASS on a clean extension; the server module, the SDK, an MCP id or a missing tree FAIL by name', () => {
+	const make = () => {
+		const extensions = fs.mkdtempSync(path.join(os.tmpdir(), 'qbmcp-'));
+		const ext = path.join(extensions, 'quantlab');
+		fs.mkdirSync(path.join(ext, 'out', 'src', 'quantbook', 'mcp'), { recursive: true });
+		fs.writeFileSync(path.join(ext, 'out', 'src', 'quantbook', 'mcp', 'mcpToolLogic.js'), '');
+		fs.writeFileSync(path.join(ext, 'package.json'), JSON.stringify({ publisher: 'quantlab', name: 'quantlab', contributes: { commands: [{ command: 'quantlab.runBacktest' }], configuration: { properties: { 'quantlab.pythonPath': {} } } } }));
+		return { extensions, ext };
+	};
+	const clean = make();
+	assert.strictEqual(judgeQuantbookMcpAbsent(clean.extensions).status, 'PASS');
+
+	const server = make();
+	fs.writeFileSync(path.join(server.ext, 'out', 'src', 'quantbook', 'mcp', 'mcpServer.js'), '');
+	assert.match(judgeQuantbookMcpAbsent(server.extensions).detail, /\[quantbook_mcp_shipped\].*mcpServer\.js/);
+
+	const sdk = make();
+	fs.mkdirSync(path.join(sdk.ext, 'node_modules', '@modelcontextprotocol', 'sdk'), { recursive: true });
+	assert.match(judgeQuantbookMcpAbsent(sdk.extensions).detail, /\[quantbook_mcp_shipped\].*@modelcontextprotocol/);
+
+	const manifest = make();
+	fs.writeFileSync(path.join(manifest.ext, 'package.json'), JSON.stringify({ publisher: 'quantlab', name: 'quantlab', contributes: { commands: [{ command: 'quantlab.quantbookStartMcpServer' }], configuration: { properties: {} } } }));
+	assert.match(judgeQuantbookMcpAbsent(manifest.extensions).detail, /\[quantbook_mcp_shipped\].*quantbookStartMcpServer/);
+
+	const tree = make();
+	fs.rmSync(path.join(tree.ext, 'out'), { recursive: true });
+	assert.match(judgeQuantbookMcpAbsent(tree.extensions).detail, /\[quantbook_tree_not_found\]/);
+
+	const none = make();
+	fs.rmSync(none.ext, { recursive: true });
+	assert.match(judgeQuantbookMcpAbsent(none.extensions).detail, /\[quantlab_extension_not_found\]/);
+
+	for (const t of [clean, server, sdk, manifest, tree, none]) {
+		fs.rmSync(t.extensions, { recursive: true });
+	}
 });
