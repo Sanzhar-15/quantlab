@@ -9,7 +9,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { bindingFileName, developmentEngineRoot, packagedEngineRoot, resolveEngineRoot } from '../../quantbook/engineRoot';
+import { bindingFileName, developmentEngineRoot, findExtensionDir, packagedEngineRoot, resolveEngineRoot } from '../../quantbook/engineRoot';
 
 suite('quantbook engine root (QB-0)', () => {
 
@@ -60,5 +60,40 @@ suite('quantbook engine root (QB-0)', () => {
 			['libql_bindings_node.dylib', 'libql_bindings_node.so', 'ql_bindings_node.dll'],
 		);
 		assert.throws(() => bindingFileName('aix'), /Unsupported platform/);
+	});
+
+	test('findExtensionDir: walks up to the quantlab extension, past directories without a package.json and a package of another name', () => {
+		const deep = path.join(extensionDir, 'out', 'src', 'quantbook');
+		fs.mkdirSync(deep, { recursive: true });
+		fs.writeFileSync(path.join(extensionDir, 'package.json'), JSON.stringify({ name: 'quantlab' }));
+		fs.writeFileSync(path.join(extensionDir, 'out', 'package.json'), JSON.stringify({ name: 'something-else' }));
+		assert.strictEqual(findExtensionDir(deep), extensionDir);
+	});
+
+	test('findExtensionDir: a quantlab package outside extensions/quantlab is not the anchor', () => {
+		const other = path.join(base, 'workspace', 'elsewhere');
+		fs.mkdirSync(other, { recursive: true });
+		fs.writeFileSync(path.join(other, 'package.json'), JSON.stringify({ name: 'quantlab' }));
+		assert.strictEqual(findExtensionDir(other), undefined);
+	});
+
+	test('findExtensionDir: an ancestor package.json that is not valid JSON throws, naming the file', () => {
+		const deep = path.join(extensionDir, 'out');
+		fs.mkdirSync(deep);
+		fs.writeFileSync(path.join(extensionDir, 'package.json'), JSON.stringify({ name: 'quantlab' }));
+		fs.writeFileSync(path.join(deep, 'package.json'), '{ not json');
+		assert.throws(() => findExtensionDir(deep), (err: Error) => err.message.includes(path.join(deep, 'package.json')) && /is not valid JSON/.test(err.message));
+	});
+
+	test('findExtensionDir: an ancestor package.json that cannot be read throws, it is not skipped', function () {
+		if (process.platform === 'win32' || process.getuid!() === 0) {
+			this.skip();
+		}
+		const deep = path.join(extensionDir, 'out');
+		fs.mkdirSync(deep);
+		fs.writeFileSync(path.join(extensionDir, 'package.json'), JSON.stringify({ name: 'quantlab' }));
+		fs.writeFileSync(path.join(deep, 'package.json'), JSON.stringify({ name: 'something-else' }));
+		fs.chmodSync(path.join(deep, 'package.json'), 0o000);
+		assert.throws(() => findExtensionDir(deep), /cannot read .*package\.json while locating the extension/);
 	});
 });
