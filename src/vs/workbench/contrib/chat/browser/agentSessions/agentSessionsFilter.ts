@@ -4,11 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { Emitter } from '../../../../../base/common/event.js';
-import { Disposable, DisposableStore } from '../../../../../base/common/lifecycle.js';
+import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { equals } from '../../../../../base/common/objects.js';
 import { MenuId } from '../../../../../platform/actions/common/actions.js';
 import { IStorageService, StorageScope } from '../../../../../platform/storage/common/storage.js';
-import { IChatSessionsService } from '../../common/chatSessionsService.js';
 import { AgentSessionStatus, IAgentSession } from './agentSessionsModel.js';
 import { IAgentSessionsFilter } from './agentSessionsViewer.js';
 
@@ -51,11 +50,8 @@ export class AgentSessionsFilter extends Disposable implements Required<IAgentSe
 
 	private excludes = DEFAULT_EXCLUDES;
 
-	private readonly actionDisposables = this._register(new DisposableStore());
-
 	constructor(
 		private readonly options: IAgentSessionsFilterOptions,
-		@IChatSessionsService private readonly chatSessionsService: IChatSessionsService,
 		@IStorageService private readonly storageService: IStorageService,
 	) {
 		super();
@@ -68,9 +64,6 @@ export class AgentSessionsFilter extends Disposable implements Required<IAgentSe
 	}
 
 	private registerListeners(): void {
-		this._register(this.chatSessionsService.onDidChangeItemsProviders(() => this.updateFilterActions()));
-		this._register(this.chatSessionsService.onDidChangeAvailability(() => this.updateFilterActions()));
-
 		this._register(this.storageService.onDidChangeValue(StorageScope.PROFILE, this.STORAGE_KEY, this._store)(() => this.updateExcludes(true)));
 	}
 
@@ -85,8 +78,6 @@ export class AgentSessionsFilter extends Disposable implements Required<IAgentSe
 		} else {
 			this.resetExcludes();
 		}
-
-		this.updateFilterActions();
 
 		if (fromEvent) {
 			this._onDidChange.fire();
@@ -103,30 +94,6 @@ export class AgentSessionsFilter extends Disposable implements Required<IAgentSe
 	}
 
 
-	private updateFilterActions(): void {
-		this.actionDisposables.clear();
-
-		this.registerProviderActions(this.actionDisposables);
-		this.registerStateActions(this.actionDisposables);
-		this.registerArchivedActions(this.actionDisposables);
-		this.registerReadActions(this.actionDisposables);
-		this.registerResetAction(this.actionDisposables);
-	}
-
-	private registerProviderActions(disposables: DisposableStore): void {
-	}
-
-	private registerStateActions(disposables: DisposableStore): void {
-	}
-
-	private registerArchivedActions(disposables: DisposableStore): void {
-	}
-
-	private registerReadActions(disposables: DisposableStore): void {
-	}
-
-	private registerResetAction(disposables: DisposableStore): void {
-	}
 
 	isDefault(): boolean {
 		return equals(this.excludes, DEFAULT_EXCLUDES);

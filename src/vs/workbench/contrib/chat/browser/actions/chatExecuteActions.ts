@@ -526,5 +526,3 @@ export class CancelEdit extends Action2 {
 }
 
 
-export function registerChatExecuteActions() {
-}
