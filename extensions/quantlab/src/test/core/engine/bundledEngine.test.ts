@@ -9,7 +9,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { bundledEngineCandidates, bundledEngineLaunch, resolveBundledEngine, selectEngine } from '../../../core/engine/bundledEngine';
+import { bundledEngineCandidates, bundledEngineLaunch, ENGINE_SOURCES, resolveBundledEngine, selectEngine } from '../../../core/engine/bundledEngine';
 
 suite('bundledEngine – resolver', () => {
 
@@ -71,12 +71,18 @@ suite('bundledEngine – resolver', () => {
 suite('bundledEngine – launch', () => {
 	test('the bundled engine runs in its own directory, with no engine source tree', () => {
 		const exe = path.join('/Applications', 'Delta Plus.app', 'Contents', 'Resources', 'app', 'extensions', 'quantlab', 'engine', 'quantlab-engine', 'quantlab-engine');
-		assert.deepStrictEqual(bundledEngineLaunch(exe), {
+		assert.deepStrictEqual(bundledEngineLaunch(exe, ENGINE_SOURCES.packaged), {
 			executable: exe,
-			source: 'bundled engine',
+			source: 'packaged bundled engine',
 			cwd: path.dirname(exe),
 			engineRoot: null,
 		});
+	});
+
+	test('each step of selectEngine has its own name', () => {
+		const names = Object.values(ENGINE_SOURCES);
+		assert.deepStrictEqual(names, ['packaged bundled engine', 'setting quantlab.pythonPath', 'development bundled engine']);
+		assert.strictEqual(new Set(names).size, names.length);
 	});
 });
 
@@ -110,8 +116,10 @@ suite('bundledEngine – selectEngine', () => {
 		const app = packaged();
 		place(app.exe);
 		const python = place(path.join(root, 'bin', 'python3'));
-		assert.deepStrictEqual(selectEngine({ extensionPath: app.extensionPath, appRoot: app.appRoot, platform: 'darwin', explicitPython: '' }), bundledEngineLaunch(app.exe));
-		assert.deepStrictEqual(selectEngine({ extensionPath: app.extensionPath, appRoot: app.appRoot, platform: 'darwin', explicitPython: python }), bundledEngineLaunch(app.exe));
+		for (const explicitPython of ['', python]) {
+			const engine = selectEngine({ extensionPath: app.extensionPath, appRoot: app.appRoot, platform: 'darwin', explicitPython });
+			assert.deepStrictEqual(engine, { executable: app.exe, source: 'packaged bundled engine', cwd: path.dirname(app.exe), engineRoot: null });
+		}
 	});
 
 	test('packaged, bundled engine deleted: fails by name, never another interpreter', () => {
@@ -156,6 +164,8 @@ suite('bundledEngine – selectEngine', () => {
 		const appRoot = path.join(root, 'app');
 		assert.throws(() => selectEngine({ extensionPath, appRoot, platform: 'darwin', explicitPython: '' }), /^Error: \[engine_missing\] Quantlab: no bundled backtest engine at .*, and quantlab\.pythonPath is not set\.$/);
 		const exe = place(path.join(root, '.build', 'dist', 'quantlab-engine', 'quantlab-engine'));
-		assert.deepStrictEqual(selectEngine({ extensionPath, appRoot, platform: 'darwin', explicitPython: '' }), bundledEngineLaunch(exe));
+		assert.deepStrictEqual(selectEngine({ extensionPath, appRoot, platform: 'darwin', explicitPython: '' }), {
+			executable: exe, source: 'development bundled engine', cwd: path.dirname(exe), engineRoot: null,
+		});
 	});
 });
