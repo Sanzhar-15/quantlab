@@ -12,7 +12,7 @@ import * as vscode from 'vscode';
 
 const execFileAsync = promisify(execFile);
 
-const VENV_DIR = path.join(os.homedir(), '.quantlab', 'venv');
+const VENV_DIR = path.join(os.homedir(), '.deltaplus', 'venv');
 const VENV_PYTHON = process.platform === 'win32'
 	? path.join(VENV_DIR, 'Scripts', 'python.exe')
 	: path.join(VENV_DIR, 'bin', 'python');
@@ -100,7 +100,7 @@ export namespace PythonBootstrap {
 				async (progress) => {
 					// 1. Ensure parent directory exists
 					progress.report({ message: 'Creating virtual environment…' });
-					await fs.promises.mkdir(path.join(os.homedir(), '.quantlab'), { recursive: true });
+					await fs.promises.mkdir(path.join(os.homedir(), '.deltaplus'), { recursive: true });
 
 					// 2. Create venv (or recreate if broken)
 					await execFileAsync(basePython, ['-m', 'venv', VENV_DIR], {

@@ -115,7 +115,7 @@ can't run).
 2. Pick **Quantlab: Visualise** (or use `Ctrl+Q V` with the file open).
 3. Quantlab spawns the qviz daemon (Python interpreter resolved in
    this order: explicit `quantlab.pythonPath` setting →
-   `python.defaultInterpreterPath` setting → `~/.quantlab/venv/bin/python`
+   `python.defaultInterpreterPath` setting → `~/.deltaplus/venv/bin/python`
    fallback), reads the file's schema, and shows a default chart.
 4. To customize, save once -- the editor switches to the spec view
    (`.qviz.json`) with the full builder UI.
@@ -587,10 +587,10 @@ The save button stays disabled until the spec is consistent.
 **Q: "Daemon unavailable: spawn ENOENT python".**
 A: Quantlab can't find a Python interpreter for the qviz daemon. Set
 `quantlab.pythonPath` in settings to your venv's `python` binary, or
-install the daemon's deps into `~/.quantlab/venv/`:
+install the daemon's deps into `~/.deltaplus/venv/`:
 
-    python3 -m venv ~/.quantlab/venv
-    ~/.quantlab/venv/bin/pip install -e extensions/quantlab/python
+    python3 -m venv ~/.deltaplus/venv
+    ~/.deltaplus/venv/bin/pip install -e extensions/quantlab/python
 
 **Q: Chart looks stale after I edited the file.**
 A: Schema drift is auto-detected (mtime / schema-hash compare), but
@@ -655,7 +655,7 @@ non-null values you keep (which compiles to `col IS NULL OR col IN
 
 From the extension root (`extensions/quantlab`):
 
-    ~/.quantlab/venv/bin/python -m pytest python/qviz/tests/ -q
+    ~/.deltaplus/venv/bin/python -m pytest python/qviz/tests/ -q
 
 Several fixtures depend on a 1M-row OHLCV parquet at
 `/tmp/quantlab-spike-data/synthetic_ohlcv_1m.parquet`. The `conftest`
@@ -664,7 +664,7 @@ strict environments should set `QUANTLAB_REQUIRE_FIXTURES=1`, which
 converts the soft-skip on missing fixtures into a hard failure so a
 silently-skipped suite cannot look green:
 
-    QUANTLAB_REQUIRE_FIXTURES=1 ~/.quantlab/venv/bin/python -m pytest python/qviz/tests/ -q
+    QUANTLAB_REQUIRE_FIXTURES=1 ~/.deltaplus/venv/bin/python -m pytest python/qviz/tests/ -q
 
 The `npm run test:py` script invokes this strict variant; the
 `npm run test:py:dev` script keeps the soft-skip default for local

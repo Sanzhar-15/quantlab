@@ -24,7 +24,7 @@ function makeExecutable(p: string): void {
 }
 
 /** Each test gets its own pristine temp dir so order-dependence
- *  doesn't bite (the resolver checks `homeDir/.quantlab/venv/bin/python`,
+ *  doesn't bite (the resolver checks `homeDir/.deltaplus/venv/bin/python`,
  *  which would otherwise be shared across tests in a suite). */
 function withTempDir<T>(fn: (dir: string) => T): T {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qviz-py-'));
@@ -79,7 +79,7 @@ suite('pythonPath.resolveQuantlabPython', () => {
 
 	test('python ext config falls through to managed venv', () => {
 		withTempDir(tempDir => {
-			const managed = path.join(tempDir, '.quantlab', 'venv', 'bin', 'python');
+			const managed = path.join(tempDir, '.deltaplus', 'venv', 'bin', 'python');
 			makeExecutable(managed);
 			const r = resolveQuantlabPython({
 				env: {},
@@ -99,7 +99,7 @@ suite('pythonPath.resolveQuantlabPython', () => {
 		withTempDir(tempDir => {
 			// Even though a managed venv EXISTS, the explicit override
 			// should fail loud.
-			const managed = path.join(tempDir, '.quantlab', 'venv', 'bin', 'python');
+			const managed = path.join(tempDir, '.deltaplus', 'venv', 'bin', 'python');
 			makeExecutable(managed);
 			const r = resolveQuantlabPython({
 				env: {},
@@ -113,7 +113,7 @@ suite('pythonPath.resolveQuantlabPython', () => {
 
 	test('QUANTLAB_PYTHON env override fails loud when path missing', () => {
 		withTempDir(tempDir => {
-			const managed = path.join(tempDir, '.quantlab', 'venv', 'bin', 'python');
+			const managed = path.join(tempDir, '.deltaplus', 'venv', 'bin', 'python');
 			makeExecutable(managed);
 			const r = resolveQuantlabPython({
 				env: { QUANTLAB_PYTHON: '/no/such/python' },
@@ -139,7 +139,7 @@ suite('pythonPath.resolveQuantlabPython', () => {
 
 	test('Windows venv layout uses Scripts/python.exe', () => {
 		withTempDir(tempDir => {
-			const winVenv = path.join(tempDir, '.quantlab', 'venv', 'Scripts', 'python.exe');
+			const winVenv = path.join(tempDir, '.deltaplus', 'venv', 'Scripts', 'python.exe');
 			makeExecutable(winVenv);
 			const r = resolveQuantlabPython({
 				env: {},
@@ -154,7 +154,7 @@ suite('pythonPath.resolveQuantlabPython', () => {
 
 	test('POSIX venv layout uses bin/python (not Windows path)', () => {
 		withTempDir(tempDir => {
-			const winVenv = path.join(tempDir, '.quantlab', 'venv', 'Scripts', 'python.exe');
+			const winVenv = path.join(tempDir, '.deltaplus', 'venv', 'Scripts', 'python.exe');
 			makeExecutable(winVenv);
 			// POSIX platform: should NOT find the Windows-layout python.
 			const r = resolveQuantlabPython({

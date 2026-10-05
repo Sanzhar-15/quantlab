@@ -678,7 +678,7 @@ function createQvizLifecycleManager(
 				console.warn(
 					'Quantlab: no Python interpreter found for qviz daemon '
 					+ '(checked QUANTLAB_PYTHON, quantlab.pythonPath, '
-					+ 'python.defaultInterpreterPath, ~/.quantlab/venv/bin/python). '
+					+ 'python.defaultInterpreterPath, ~/.deltaplus/venv/bin/python). '
 					+ 'Save will refuse for files in this workspace.',
 				);
 				return null;

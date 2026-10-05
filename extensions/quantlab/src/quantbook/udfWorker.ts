@@ -124,7 +124,7 @@ export function planUdfWorkerConfig(inp: PlanUdfWorkerInputs): PythonWorkerConfi
 	if (inp.resolvedPython === null) {
 		throw new Error(
 			'[worker_spawn_failed] no Python interpreter found. Set `quantlab.pythonPath` (or ' +
-			'`python.defaultInterpreterPath`, or create ~/.quantlab/venv) to a Python >= ' +
+			'`python.defaultInterpreterPath`, or create ~/.deltaplus/venv) to a Python >= ' +
 			`${UDF_MIN_PY_MAJOR}.${UDF_MIN_PY_MINOR} with pyarrow installed.`,
 		);
 	}
