@@ -3,6 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+/* eslint-disable local/code-no-in-operator -- inherited: 11 sites older than this file's last edit, which changed only how the interpreter path is read */
+
 /**
  * End-to-end tests for QvizDaemonClient.
  *
@@ -24,12 +26,15 @@ import {
 import { extractColumnsFromArrowIpc } from '../src/qviz/render/extract-arrow';
 import type { QvizSpec } from '../src/qviz/spec';
 
-// Audit-fix AF36: test paths discoverable via env so CI / other developers
-// don't need a specific user's venv at /Users/sanzhar. Fall back to common
-// project locations.
-const PYTHON_PATH =
-	process.env.QUANTLAB_TEST_PYTHON ||
-	'/Users/sanzhar/.quantlab/venv/bin/python';
+// The interpreter is an explicit input: there is no default path, and its absence fails by name.
+function requiredTestPython(): string {
+	const value = process.env.QUANTLAB_TEST_PYTHON;
+	if (!value) {
+		throw new Error('QUANTLAB_TEST_PYTHON is not set: the qviz daemon tests need the path of a Python interpreter that has the daemon\'s dependencies');
+	}
+	return value;
+}
+const PYTHON_PATH = requiredTestPython();
 const SPIKE_DATA =
 	process.env.QUANTLAB_TEST_SPIKE_DATA ||
 	'/tmp/quantlab-spike-data/synthetic_ohlcv_1m.parquet';
@@ -62,7 +67,6 @@ function shouldSkip(): boolean {
 		const seen = (global as { __qvizDaemonSkipLogged?: boolean });
 		if (!seen.__qvizDaemonSkipLogged) {
 			seen.__qvizDaemonSkipLogged = true;
-			// eslint-disable-next-line no-console
 			console.warn(`[qviz-daemon-client.test] skipping: ${r.reason}`);
 		}
 		return true;

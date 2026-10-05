@@ -25,7 +25,15 @@ import {
 	DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
 } from '../src/qviz/daemon-lifecycle';
 
-const PYTHON_PATH = process.env.QUANTLAB_TEST_PYTHON ?? '/Users/sanzhar/.quantlab/venv/bin/python';
+// The interpreter is an explicit input: there is no default path, and its absence fails by name.
+function requiredTestPython(): string {
+	const value = process.env.QUANTLAB_TEST_PYTHON;
+	if (!value) {
+		throw new Error('QUANTLAB_TEST_PYTHON is not set: the qviz daemon tests need the path of a Python interpreter that has the daemon\'s dependencies');
+	}
+	return value;
+}
+const PYTHON_PATH = requiredTestPython();
 // __dirname at runtime is the COMPILED test dir (out/test/), so source-tree
 // fixtures need to climb two levels back. Mirrors qviz-daemon-client.test.ts.
 const FIXTURES_DIR = path.resolve(__dirname, '..', '..', 'test', 'fixtures');
