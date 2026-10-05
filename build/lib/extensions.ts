@@ -335,7 +335,6 @@ const excludedExtensions = [
 	'theme-monokai',
 	'theme-quietlight',
 	'theme-red',
-	'theme-seti',
 	'theme-solarized-dark',
 	'theme-solarized-light',
 	'theme-tomorrow-night-blue',
