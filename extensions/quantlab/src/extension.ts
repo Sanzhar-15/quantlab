@@ -92,7 +92,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 	// Initialize Delta Plus Server connection (non-blocking)
 	const serverClient = ServerApiClient.getInstance();
-	serverClient.setSecretStorage(context.secrets);
 	// Read server URL from settings (stays in sync with QIC's qic.server.baseUrl)
 	const serverUrl = vscode.workspace.getConfiguration('qic').get<string>('server.baseUrl');
 	if (serverUrl) {
@@ -112,25 +111,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	);
 
 	// Sign-in / sign-out commands.
-	// quantlab.signIn bypasses vscode.authentication.getSession() and opens the login
-	// panel directly -- no intermediate quick-pick step for the user.
-	// If the welcome panel is already open it just reveals it rather than opening a second modal.
+	// The extension has no sign-in of its own: the host identity is the only source and sign-in /
+	// sign-out happen in the Quantlab terminal view, so both commands say where to go.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.signIn', async () => {
-			try {
-				await authProvider.createSession(['read']);
-			} catch (err) {
-				// ERR_CANCELLED = user closed the panel -- no notification needed.
-				if (err instanceof Error && (err as NodeJS.ErrnoException).code !== 'ERR_CANCELLED') {
-					void vscode.window.showErrorMessage(`Sign-in failed: ${err.message}`);
-				}
-			}
+			void vscode.window.showInformationMessage('Sign in happens in the Quantlab terminal view.');
 		}),
 		vscode.commands.registerCommand('quantlab.signOut', async () => {
-			const sessions = await authProvider.getSessions(['read']);
-			if (sessions.length > 0) {
-				await authProvider.removeSession(sessions[0].id);
-			}
+			void vscode.window.showInformationMessage('Sign out happens in the Quantlab terminal view.');
 		})
 	);
 
@@ -162,7 +150,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		if (user) {
 			accountStatusItem.text = `$(account) ${user.name || user.email}`;
 			accountStatusItem.tooltip = new vscode.MarkdownString(
-				`**Quantlab** \u00B7 ${user.tier} tier\n\n${user.email}\n\n[Sign Out](command:quantlab.signOut)`,
+				`**Quantlab**${user.tier ? ` \u00B7 ${user.tier} tier` : ''}\n\n${user.email}\n\n[Sign Out](command:quantlab.signOut)`, // AUTH-TIER: tier text only when a tier value is present; the carry AUTH-TIER supplies it
 				true
 			);
 			accountStatusItem.command = 'quantlab.signOut';
@@ -188,7 +176,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			const user = serverClient.getUser();
 			if (user && !_homeShownThisSession) {
 				_homeShownThisSession = true;
-				QuantLabHome.show(context, { name: user.name, email: user.email, tier: user.tier });
+				QuantLabHome.show(context, { name: user.name, email: user.email, tier: user.tier }); // AUTH-TIER: tier is absent until the carry AUTH-TIER supplies it; Home renders no tier then
 			} else if (!user) {
 				// Sign-out: re-arm the auto-show so the NEXT sign-in gets a
 				// fresh Home (the panel itself disposes on sign-out; without
@@ -207,7 +195,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				void vscode.window.showInformationMessage('Sign in to Quantlab to view your dashboard.');
 				return;
 			}
-			QuantLabHome.show(context, { name: user.name, email: user.email, tier: user.tier });
+			QuantLabHome.show(context, { name: user.name, email: user.email, tier: user.tier }); // AUTH-TIER: tier is absent until the carry AUTH-TIER supplies it; Home renders no tier then
 		})
 	);
 
@@ -616,8 +604,8 @@ function getServerOutputChannel(): vscode.OutputChannel {
 }
 
 /**
- * Initialize connection to Delta Plus Server using the persisted session.
- * This runs in the background and doesn't block extension activation.
+ * Initialize the Delta Plus server connection from the host identity (the sign-in state held by
+ * the Quantlab terminal view). This runs in the background and doesn't block extension activation.
  */
 async function initializeServerConnection(
 	client: ServerApiClient,
@@ -625,34 +613,19 @@ async function initializeServerConnection(
 ): Promise<void> {
 	const output = getServerOutputChannel();
 	try {
-		// Migrate legacy qic.deltaplus* keys to the new format (no-op if already done).
-		await authProvider.runMigration();
-
-		// Load the existing session from SecretStorage and push tokens into the client.
-		const loaded = await authProvider.initializeFromStorage();
-		if (loaded) {
-			// If the stored access token is already expired, try a proactive refresh
-			// so the WebSocket connects immediately without waiting for the first API call.
-			if (!client.isAuthenticated()) {
-				try {
-					await client.refreshAccessToken();
-					output.appendLine(`[${new Date().toISOString()}] Delta Plus: Session refreshed on startup`);
-				} catch {
-					output.appendLine(`[${new Date().toISOString()}] Delta Plus: Session expired -- sign in again via the account menu`);
-				}
-			} else {
-				output.appendLine(`[${new Date().toISOString()}] Delta Plus: Session restored -- user signed in`);
-			}
-		} else {
-			output.appendLine(`[${new Date().toISOString()}] Delta Plus: No saved session -- sign in via the account menu`);
-		}
-	} catch (err) {
+		// Pull the sign-in state from the host (a tick sent before the provider registered its
+		// command is not replayed, so this pull is the start-up read).
+		const loaded = await authProvider.initializeFromHost();
 		output.appendLine(
-			`[${new Date().toISOString()}] Delta Plus: Auth init error -- ${err instanceof Error ? err.message : String(err)}`
+			`[${new Date().toISOString()}] Delta Plus: ${loaded ? 'Signed in at the host' : 'Not signed in (sign in in the terminal view)'}`
 		);
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		output.appendLine(`[${new Date().toISOString()}] Delta Plus: Could not read the sign-in state from the host -- ${detail}`);
+		void vscode.window.showErrorMessage(`Could not read the sign-in state from the host: ${detail}`);
 	} finally {
 		// Signal ensureAuthenticated() that startup is done so pending API calls
-		// can resolve immediately (either with tokens or with "not signed in" error).
+		// can resolve immediately (either with a user or with "not signed in" error).
 		client.markAuthFlowComplete();
 	}
 
@@ -661,8 +634,9 @@ async function initializeServerConnection(
 		try {
 			await client.connectWebSocket();
 			output.appendLine(`[${new Date().toISOString()}] Delta Plus: WebSocket connected`);
-		} catch {
-			output.appendLine(`[${new Date().toISOString()}] Delta Plus: WebSocket unavailable (real-time features disabled)`);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			output.appendLine(`[${new Date().toISOString()}] Delta Plus: WebSocket unavailable (real-time features disabled) -- ${detail}`);
 		}
 	}
 }

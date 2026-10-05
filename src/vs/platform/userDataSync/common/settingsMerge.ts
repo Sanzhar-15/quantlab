@@ -20,6 +20,15 @@ export interface IMergeResult {
 	conflictsSettings: IConflictSetting[];
 }
 
+/**
+ * QuantLab carry SYNC-1 (release-blocking, ruling Q-LOGIN-5 (a)): settings that must NEVER reach Settings Sync
+ * content. `qic.demo.email` and `qic.demo.password` were registered by a contribution that no longer exists, so a
+ * value left in a user's settings.json must not be synced. They are appended AFTER the user's `-key` opt-back-in
+ * entries in {@link getIgnoredSettings}, so no `settingsSync.ignoredSettings` entry can bring them back.
+ * Remove this list after the first user-facing release that includes QuantLab.
+ */
+export const NEVER_SYNCED_SETTINGS: readonly string[] = Object.freeze(['qic.demo.email', 'qic.demo.password']);
+
 export function getIgnoredSettings(defaultIgnoredSettings: string[], configurationService: IConfigurationService, settingsContent?: string): string[] {
 	let value: ReadonlyArray<string> = [];
 	if (settingsContent) {
@@ -37,7 +46,7 @@ export function getIgnoredSettings(defaultIgnoredSettings: string[], configurati
 			}
 		}
 	}
-	return distinct([...defaultIgnoredSettings, ...added,].filter(setting => !removed.includes(setting)));
+	return distinct([...defaultIgnoredSettings, ...added,].filter(setting => !removed.includes(setting)).concat(NEVER_SYNCED_SETTINGS));
 }
 
 function getIgnoredSettingsFromConfig(configurationService: IConfigurationService): ReadonlyArray<string> {
