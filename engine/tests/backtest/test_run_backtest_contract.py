@@ -21,9 +21,9 @@ def _results(metrics, warnings=None):
                            trades=[{"pnl": 1}], total_return_pct=7.5)
 
 
-def test_no_metrics_is_a_named_failure_carrying_the_runner_warning():
-    with pytest.raises(ValueError, match=r"no performance metrics \(equity curve: 0 point\(s\); runner warnings: \['Metrics calculation error: boom'\]\)"):
-        convert_results(_results(None, ["Metrics calculation error: boom"]), "job-1")
+def test_no_metrics_is_a_named_failure_carrying_the_runner_warnings():
+    with pytest.raises(ValueError, match=r"no performance metrics \(equity curve: 0 point\(s\); runner warnings: \['low liquidity'\]\)"):
+        convert_results(_results(None, ["low liquidity"]), "job-1")
 
 
 def test_return_and_trades_are_never_made_up_from_other_fields():
