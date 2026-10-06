@@ -53,6 +53,18 @@ export class EncryptionKeychainError extends Error {
 }
 
 /**
+ * What getKeyStorageProvider rejects with when `safeStorage.getSelectedStorageBackend()` throws (F-SECRETS-8, law §4): a failed
+ * backend read is a failure, never reported as `unknown`. Fixed text only: no backend output and nothing of the caught value
+ * (not its name, message, stack or class), so the IPC channel that carries message and stack to the renderer carries nothing of it.
+ */
+export class EncryptionStorageBackendError extends Error {
+	constructor() {
+		super('[EncryptionMainService] getSelectedStorageBackend failed');
+		this.name = 'EncryptionStorageBackendError';
+	}
+}
+
+/**
  * The encryption service with its Electron surface passed in.
  *
  * Test seam (F-PACK-13): production code uses {@link EncryptionMainService}, which passes Electron's own
@@ -133,18 +145,23 @@ export class EncryptionMainServiceWithElectron implements IEncryptionMainService
 		if (isMacintosh) {
 			return Promise.resolve(KnownStorageProvider.keychainAccess);
 		}
-		if (this.safeStorage.getSelectedStorageBackend) {
-			try {
-				this.logService.trace('[EncryptionMainService] Getting selected storage backend...');
-				const result = this.safeStorage.getSelectedStorageBackend() as KnownStorageProvider;
-				this.logService.trace('[EncryptionMainService] Selected storage backend: ', result);
-				return Promise.resolve(result);
-			} catch (e) {
-				// LOG-1: the class only; the caught error's message or stack never reaches a log line (F-PACK-13 check 7).
-				this.logService.error(`[EncryptionMainService] getSelectedStorageBackend failed (${errorClassOf(e)})`);
-			}
+		if (!this.safeStorage.getSelectedStorageBackend) {
+			// Not a failure: this Electron build has no backend query (optional per IEncryptionSafeStorage), so the provider is unknown.
+			return Promise.resolve(KnownStorageProvider.unknown);
 		}
-		return Promise.resolve(KnownStorageProvider.unknown);
+		let result: KnownStorageProvider;
+		try {
+			this.logService.trace('[EncryptionMainService] Getting selected storage backend...');
+			result = this.safeStorage.getSelectedStorageBackend() as KnownStorageProvider;
+		} catch (e) {
+			// F-SECRETS-8: a failed read rejects (never falls through to `unknown`). LOG-1 / F-SECRETS-7: a fixed category only
+			// (`instanceof`, a boolean); nothing read from the caught value (no name, message, stack or class name).
+			const category = e instanceof Error ? 'Error' : 'non-Error';
+			this.logService.error(`[EncryptionMainService] getSelectedStorageBackend failed (${category})`);
+			return Promise.reject(new EncryptionStorageBackendError());
+		}
+		this.logService.trace('[EncryptionMainService] Selected storage backend: ', result);
+		return Promise.resolve(result);
 	}
 
 	async setUsePlainTextEncryption(): Promise<void> {

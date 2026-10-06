@@ -62,9 +62,10 @@ class StubSafeStorage implements IEncryptionSafeStorage {
 		assert.strictEqual(encrypted.toString(), PLANTED_CIPHERTEXT);
 		return PLANTED_PLAINTEXT;
 	}
+	backend = 'basic_text';
 	getSelectedStorageBackend(): string {
 		this.enter('getSelectedStorageBackend');
-		return 'basic_text';
+		return this.backend;
 	}
 }
 
@@ -228,11 +229,86 @@ suite('EncryptionMainService (F-PACK-13 keychain lines, LOG-1)', () => {
 	});
 
 	// getKeyStorageProvider reaches the backend call only off macOS and Windows (where it answers without a Keychain call).
-	(isMacintosh || isWindows ? test.skip : test)('a getSelectedStorageBackend failure logs the error class only, never its message or stack', async () => {
-		const denied = credentialBearing();
-		safeStorage.failWith = denied;
-		await service.getKeyStorageProvider();
-		assert.ok(logService.events.includes('error: [EncryptionMainService] getSelectedStorageBackend failed (KeychainDeniedError)'), logService.events.join('\n'));
-		assertNoPlantedValueLogged(PLANTED_CREDENTIAL);
+	const linuxOnlyTest = isMacintosh || isWindows ? test.skip : test;
+
+	/**
+	 * F-SECRETS-8: a backend read that throws REJECTS with the named error (by name: the test imports only exports the base file
+	 * also has, so swapping the product file back to abb4e58ccd3 is a runtime negative control) and logs exactly one fixed-category
+	 * error line. Planted markers sit in the thrown value's class name, name, message and stack; none may reach a log line or any
+	 * property of the rejection.
+	 */
+	const MARKER_CLASS = 'PlantedClass5d0e2a';
+	const MARKER_NAME = 'planted-name-3b81f4';
+	const MARKER_MESSAGE = 'planted-message-a92c17';
+	const MARKER_STACK = 'planted-stack-e6047d';
+	const MARKERS = [MARKER_CLASS, MARKER_NAME, MARKER_MESSAGE, MARKER_STACK];
+
+	function markedBackendError(): Error {
+		const PlantedClass = { [MARKER_CLASS]: class extends Error { } }[MARKER_CLASS];
+		const thrown = new PlantedClass(`backend read failed: ${MARKER_MESSAGE}`);
+		thrown.name = MARKER_NAME;
+		thrown.stack = `${MARKER_NAME}: ${MARKER_MESSAGE}\n    at native (${MARKER_STACK})`;
+		assert.strictEqual(thrown.constructor.name, MARKER_CLASS, 'test precondition: the class name carries a marker');
+		return thrown;
+	}
+
+	function assertBackendRejection(error: unknown): true {
+		assert.ok(error instanceof Error, 'the rejection is an Error');
+		assert.strictEqual(error.name, 'EncryptionStorageBackendError');
+		assert.strictEqual(error.constructor.name, 'EncryptionStorageBackendError');
+		assert.strictEqual(error.message, '[EncryptionMainService] getSelectedStorageBackend failed');
+		assert.strictEqual(error.cause, undefined, 'the caught value must not be kept as cause');
+		const exposed = [error.name, error.message, String(error.stack), stringifyLogArgument(error), JSON.stringify(error),
+			JSON.stringify(Object.getOwnPropertyNames(error).map(name => String((error as unknown as Record<string, unknown>)[name])))];
+		for (const text of exposed) {
+			for (const marker of MARKERS) {
+				assert.ok(!text.includes(marker), 'a property of the rejection carries a planted marker');
+			}
+		}
+		return true;
+	}
+
+	function assertNoMarkerLogged(): void {
+		for (const line of logService.lines) {
+			for (const marker of MARKERS) {
+				assert.ok(!line.includes(marker), `a log line carries a planted marker: ${line.replace(marker, '<MARKER>')}`);
+			}
+		}
+	}
+
+	function errorLines(): string[] {
+		return logService.events.filter(event => event.startsWith('error: '));
+	}
+
+	linuxOnlyTest('a getSelectedStorageBackend throw rejects with EncryptionStorageBackendError; one fixed error line; no marker anywhere', async () => {
+		safeStorage.failWith = markedBackendError();
+		await assert.rejects(service.getKeyStorageProvider(), assertBackendRejection);
+		assert.deepStrictEqual(errorLines(), ['error: [EncryptionMainService] getSelectedStorageBackend failed (Error)']);
+		assertNoMarkerLogged();
+	});
+
+	linuxOnlyTest('a getSelectedStorageBackend throw of a non-Error value rejects the same way; the value is not logged', async () => {
+		safeStorage.failWith = `${MARKER_NAME} ${MARKER_MESSAGE} ${MARKER_STACK}` as unknown as Error;
+		await assert.rejects(service.getKeyStorageProvider(), assertBackendRejection);
+		assert.deepStrictEqual(errorLines(), ['error: [EncryptionMainService] getSelectedStorageBackend failed (non-Error)']);
+		assertNoMarkerLogged();
+	});
+
+	linuxOnlyTest('getSelectedStorageBackend ABSENT on this Electron resolves unknown, with no error line (not a failure)', async () => {
+		const noBackendQuery: IEncryptionSafeStorage = {
+			isEncryptionAvailable: () => true,
+			encryptString: () => Buffer.from(PLANTED_CIPHERTEXT),
+			decryptString: () => PLANTED_PLAINTEXT,
+		};
+		const withoutQuery = new EncryptionMainServiceWithElectron(noBackendQuery, stubApp, logService);
+		assert.strictEqual(await withoutQuery.getKeyStorageProvider(), 'unknown');
+		assert.deepStrictEqual(errorLines(), []);
+	});
+
+	linuxOnlyTest('a returned backend passes through unchanged, with no error line', async () => {
+		safeStorage.backend = 'gnome_libsecret';
+		assert.strictEqual(await service.getKeyStorageProvider(), 'gnome_libsecret');
+		assert.ok(logService.events.includes('call: getSelectedStorageBackend'), logService.events.join('\n'));
+		assert.deepStrictEqual(errorLines(), []);
 	});
 });

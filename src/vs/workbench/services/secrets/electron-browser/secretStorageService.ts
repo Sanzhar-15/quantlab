@@ -70,7 +70,16 @@ export class NativeSecretStorageService extends BaseSecretStorageService {
 			return;
 		}
 
-		const provider = await this._encryptionService.getKeyStorageProvider();
+		let provider: KnownStorageProvider;
+		try {
+			provider = await this._encryptionService.getKeyStorageProvider();
+		} catch {
+			// F-SECRETS-8: the OS keyring backend could not be read. A visible fixed-text error and one fixed log line; nothing
+			// from the error (it is not bound). No provider-specific hint and no plain-text choice: a failed read is not basic_text.
+			this._logService.error('[NativeSecretStorageService] the OS keyring backend could not be read');
+			this._notificationService.prompt(Severity.Error, localize('keyStorageProviderReadFailed', "The OS keyring used for storing the encryption related data could not be read in your current desktop environment."), buttons);
+			return;
+		}
 		if (provider === KnownStorageProvider.basicText) {
 			const detail = localize('usePlainTextExtraSentence', "Open the troubleshooting guide to address this or you can use weaker encryption that doesn't use the OS keyring.");
 			const usePlainTextButton: IPromptChoice = {
