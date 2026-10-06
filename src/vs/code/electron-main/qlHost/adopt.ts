@@ -16,47 +16,25 @@ import { Emitter, Event } from '../../../base/common/event.js';
 import { Disposable, DisposableStore } from '../../../base/common/lifecycle.js';
 import { ICodeWindow } from '../../../platform/window/electron-main/window.js';
 import { registerQlAdoptedWindow } from '../../../platform/windows/electron-main/windows.js';
+import { CodeWindow } from '../../../platform/windows/electron-main/windowImpl.js';
 
-//#region The private members of CodeWindow (windowImpl.ts) this adoption touches. Each is named here and nowhere else.
-
-function isBrowserWindowShape(value: unknown): value is BrowserWindow {
-	if (typeof value !== 'object' || value === null) {
-		return false;
-	}
-
-	const candidate = value as { id?: unknown; webContents?: unknown; loadURL?: unknown };
-
-	return typeof candidate.id === 'number' && typeof candidate.webContents === 'object' && candidate.webContents !== null && typeof candidate.loadURL === 'function';
-}
+//#region The one member of CodeWindow (windowImpl.ts) this adoption needs beyond ICodeWindow.
 
 /**
- * `CodeWindow._win` (protected): the BrowserWindow every window call of the CodeWindow goes through. Replaced by the stand-in.
- * Throws naming the member when it is absent or not a BrowserWindow, or is not the object the public `win` getter returns.
+ * `CodeWindow.qlAdoptBrowserWindow` (public, windowImpl.ts): replaces the BrowserWindow every window call of the CodeWindow goes
+ * through by the stand-in, then binds the CodeWindow's listeners, which the constructor bound to the shell's own (blank)
+ * webContents, to the view's (`did-finish-load` sets the window's config, `render-process-gone` is the crash dialog).
+ *
+ * Called typed, never by a member's name through a cast: the packaged build's mangler renames every private and protected
+ * member (`_win`, `registerListeners`), and only a typed access is renamed with it (build/qlhost/check-mangled-members.mjs).
+ * Throws naming the class when the opened window is not a CodeWindow.
  */
-function replaceCodeWindowBrowserWindow(codeWindow: ICodeWindow, standIn: BrowserWindow): void {
-	const internals = codeWindow as unknown as { _win?: unknown };
-	if (!isBrowserWindowShape(internals._win)) {
-		throw new Error('QuantLab host (U5): CodeWindow._win is absent or is not a BrowserWindow (windowImpl.ts changed since the adoption was written)');
-	}
-	if (internals._win !== codeWindow.win) {
-		throw new Error('QuantLab host (U5): CodeWindow._win is not the object CodeWindow.win returns (windowImpl.ts changed since the adoption was written)');
+function adoptBrowserWindow(codeWindow: ICodeWindow, standIn: BrowserWindow): void {
+	if (!(codeWindow instanceof CodeWindow)) {
+		throw new Error('QuantLab host (U5): the opened window is not a CodeWindow (windowImpl.ts), so it cannot be adopted');
 	}
 
-	internals._win = standIn;
-}
-
-/**
- * `CodeWindow.registerListeners` (private): the constructor bound the CodeWindow's listeners to the shell's own (blank)
- * webContents; they must be bound to the view's (`did-finish-load` sets the window's config, `render-process-gone` is the crash
- * dialog). Called once, after `_win` was replaced. Throws naming the member when it is absent.
- */
-function rebindCodeWindowListeners(codeWindow: ICodeWindow): void {
-	const internals = codeWindow as unknown as { registerListeners?: unknown };
-	if (typeof internals.registerListeners !== 'function') {
-		throw new Error('QuantLab host (U5): CodeWindow.registerListeners is absent or is not a function (windowImpl.ts changed since the adoption was written)');
-	}
-
-	Reflect.apply(internals.registerListeners, codeWindow, []);
+	codeWindow.qlAdoptBrowserWindow(standIn);
 }
 
 //#endregion
@@ -219,8 +197,7 @@ export function adoptCodeWindow(codeWindow: ICodeWindow, webPreferences: WebPref
 	const standIn = createStandIn(shell, view);
 
 	try {
-		replaceCodeWindowBrowserWindow(codeWindow, standIn);
-		rebindCodeWindowListeners(codeWindow);
+		adoptBrowserWindow(codeWindow, standIn);
 	} catch (error) {
 		if (!view.webContents.isDestroyed()) {
 			view.webContents.close({ waitForBeforeUnload: false });
