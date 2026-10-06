@@ -130,6 +130,8 @@ import { bakedBuildValues, createUpdater, startTerminalHost, type Ports, type Te
 import { QlDialogMainService } from './qlHost/dialogs.js';
 import { QlWindowsGate, requireQlWindowsGate } from './qlHost/gate.js';
 import { QlWorkbenchHost } from './qlHost/workbenchHost.js';
+// QuantLab host (U6): the chrome seed (the four chrome settings of a fresh default profile)
+import { seedQlChromeSettings } from './qlHost/chromeSeed.js';
 
 /**
  * The main VS Code application. There will only ever be one instance,
@@ -1311,6 +1313,11 @@ export class CodeApplication extends Disposable {
 		// What `openFirstWindow` assigned and later code reads
 		this.windowsMainService = accessor.get(IWindowsMainService);
 		this.auxiliaryWindowsMainService = accessor.get(IAuxiliaryWindowsMainService);
+
+		// QuantLab host (U6): the chrome seed, first of all: before the terminal host starts and so before the gate, a launch request or
+		// a key can open a workbench window that reads the default profile's settings. A failure to create or read the file is not
+		// caught: `main.ts` quits with the error (a seed that is present but differs is logged by the seed and the launch goes on)
+		await seedQlChromeSettings(this.userDataProfilesMainService.defaultProfile.settingsResource, this.logService);
 
 		// Throws when the build holds no baked values: not caught, `main.ts` quits with the error
 		const { backendOrigin, version } = bakedBuildValues();
