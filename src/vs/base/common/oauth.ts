@@ -829,6 +829,116 @@ export function isAuthorizationRegistrationErrorResponse(obj: unknown): obj is I
 
 //#endregion
 
+//#region safe error reporting
+// A token, registration or device-code response holds credentials (client secret, access, refresh and id tokens, device
+// code). None of it may reach a log argument or an Error message or cause: the helpers below describe a failure by HTTP
+// status and by an OAuth `error` code that passes SAFE_OAUTH_ERROR_CODE, never by any other part of the body. A parse
+// failure is reported with a NEW error and no cause, because V8 SyntaxError messages quote the text they failed on.
+
+const SAFE_OAUTH_ERROR_CODE = /^[A-Za-z0-9_.-]{1,64}$/;
+
+/**
+ * The subset of a fetch Response the safe error helpers read.
+ */
+export interface IOAuthTextResponse {
+	readonly status: number;
+	readonly statusText: string;
+	text(): Promise<string>;
+}
+
+/**
+ * Returns the OAuth `error` code of a parsed response body only when it is a short token-like string, otherwise undefined.
+ */
+export function getSafeOAuthErrorCode(body: unknown): string | undefined {
+	if (typeof body !== 'object' || body === null) {
+		return undefined;
+	}
+	const errorCode = (body as { error?: unknown }).error;
+	return typeof errorCode === 'string' && SAFE_OAUTH_ERROR_CODE.test(errorCode) ? errorCode : undefined;
+}
+
+function describeOAuthHttpStatus(response: Pick<IOAuthTextResponse, 'status' | 'statusText'>): string {
+	return [response.status, response.statusText].filter(part => part !== undefined && part !== '').join(' ');
+}
+
+/**
+ * What reading the body of a failed response gave. Each outcome is named in the failure message, so a missing error code is
+ * never silent.
+ */
+export type OAuthBodyOutcome =
+	| { readonly kind: 'json'; readonly body: unknown }
+	| { readonly kind: 'not-json' }
+	| { readonly kind: 'unreadable' };
+
+/**
+ * Builds the message of an HTTP failure from the status and the outcome of reading the body: a vetted OAuth error code, or
+ * the name of what went wrong. No body text is included.
+ */
+export function formatOAuthHttpFailure(operation: string, response: Pick<IOAuthTextResponse, 'status' | 'statusText'>, outcome: OAuthBodyOutcome): string {
+	let detail: string;
+	switch (outcome.kind) {
+		case 'json': detail = getSafeOAuthErrorCode(outcome.body) ?? 'no safe error code in body'; break;
+		case 'not-json': detail = 'body not JSON'; break;
+		case 'unreadable': detail = 'body unreadable'; break;
+	}
+	return `${operation} failed: ${describeOAuthHttpStatus(response)} (${detail})`;
+}
+
+/**
+ * Reads a response body as text and parses it as JSON. When the body cannot be read or parsed this throws a new error that
+ * names the operation and the HTTP status only: it carries no cause and no parser message.
+ */
+export async function readOAuthJsonResponse(response: IOAuthTextResponse, operation: string): Promise<unknown> {
+	let text: string;
+	try {
+		text = await response.text();
+	} catch {
+		throw new Error(`${operation} failed: the response body could not be read (${describeOAuthHttpStatus(response)})`);
+	}
+	try {
+		return JSON.parse(text);
+	} catch {
+		throw new Error(`${operation} failed: the response body is not valid JSON (${describeOAuthHttpStatus(response)})`);
+	}
+}
+
+/**
+ * Reads the body of a response that is already known to be a failure. The result names the outcome instead of hiding it:
+ * parsed JSON, text that is not JSON, or a body that could not be read. No part of the body or of a parser message is kept
+ * outside of a parsed `json` outcome.
+ */
+export async function readOAuthErrorBody(response: IOAuthTextResponse): Promise<OAuthBodyOutcome> {
+	let text: string;
+	try {
+		text = await response.text();
+	} catch {
+		return { kind: 'unreadable' };
+	}
+	try {
+		return { kind: 'json', body: JSON.parse(text) };
+	} catch {
+		return { kind: 'not-json' };
+	}
+}
+
+/**
+ * Creates the error for a non-ok response: HTTP status plus the OAuth error code when it is safe to show, or the named
+ * outcome of reading the body.
+ */
+export async function createOAuthHttpError(operation: string, response: IOAuthTextResponse): Promise<Error> {
+	return new Error(formatOAuthHttpFailure(operation, response, await readOAuthErrorBody(response)));
+}
+
+/**
+ * Creates the error for a response that parsed but does not have the expected shape. Only a safe error code is named.
+ */
+export function createOAuthInvalidResponseError(description: string, body: unknown): Error {
+	const errorCode = getSafeOAuthErrorCode(body);
+	return new Error(`Invalid ${description} response${errorCode ? ` (${errorCode})` : ''}`);
+}
+
+//#endregion
+
 export function getDefaultMetadataForUrl(authorizationServer: URL): IAuthorizationServerMetadata {
 	return {
 		issuer: authorizationServer.toString(),
@@ -890,26 +1000,20 @@ export async function fetchDynamicRegistration(serverMetadata: IAuthorizationSer
 	});
 
 	if (!response.ok) {
-		const result = await response.text();
-		let errorDetails: string = result;
-
-		try {
-			const errorResponse = JSON.parse(result);
-			if (isAuthorizationRegistrationErrorResponse(errorResponse)) {
-				errorDetails = `${errorResponse.error}${errorResponse.error_description ? `: ${errorResponse.error_description}` : ''}`;
-			}
-		} catch {
-			// JSON parsing failed, use raw text
-		}
-
-		throw new Error(`Registration to ${serverMetadata.registration_endpoint} failed: ${errorDetails}`);
+		throw await createOAuthHttpError(`Registration to ${serverMetadata.registration_endpoint}`, response);
 	}
 
-	const registration = await response.json();
+	let registration: unknown;
+	try {
+		registration = await response.json();
+	} catch {
+		// The parser message quotes the body, which holds the client secret: report a new error without it
+		throw new Error(`Registration to ${serverMetadata.registration_endpoint} failed: the response body is not valid JSON`);
+	}
 	if (isAuthorizationDynamicClientRegistrationResponse(registration)) {
 		return registration;
 	}
-	throw new Error(`Invalid authorization dynamic client registration response: ${JSON.stringify(registration)}`);
+	throw createOAuthInvalidResponseError('authorization dynamic client registration', registration);
 }
 
 export interface IAuthenticationChallenge {

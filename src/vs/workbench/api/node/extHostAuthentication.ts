@@ -13,7 +13,7 @@ import { IExtHostWindow } from '../common/extHostWindow.js';
 import { IExtHostUrlsService } from '../common/extHostUrls.js';
 import { ILoggerService, ILogService } from '../../../platform/log/common/log.js';
 import { MainThreadAuthenticationShape } from '../common/extHost.protocol.js';
-import { IAuthorizationServerMetadata, IAuthorizationProtectedResourceMetadata, IAuthorizationTokenResponse, IAuthorizationDeviceResponse, isAuthorizationDeviceResponse, isAuthorizationTokenResponse, IAuthorizationDeviceTokenErrorResponse, AuthorizationErrorType, AuthorizationDeviceCodeErrorType } from '../../../base/common/oauth.js';
+import { IAuthorizationServerMetadata, IAuthorizationProtectedResourceMetadata, IAuthorizationTokenResponse, isAuthorizationDeviceResponse, isAuthorizationTokenResponse, AuthorizationErrorType, AuthorizationDeviceCodeErrorType, createOAuthHttpError, formatOAuthHttpFailure, getSafeOAuthErrorCode, readOAuthJsonResponse } from '../../../base/common/oauth.js';
 import { Emitter } from '../../../base/common/event.js';
 import { raceCancellationError } from '../../../base/common/async.js';
 import { IExtHostProgress } from '../common/extHostProgress.js';
@@ -207,11 +207,11 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		}
 
 		if (!deviceCodeResponse.ok) {
-			const text = await deviceCodeResponse.text();
-			throw new Error(`Device code request failed: ${deviceCodeResponse.status} ${deviceCodeResponse.statusText} - ${text}`);
+			// Status and a vetted OAuth error code only: the body can hold the device code
+			throw await createOAuthHttpError('Device code request', deviceCodeResponse);
 		}
 
-		const deviceCodeData: IAuthorizationDeviceResponse = await deviceCodeResponse.json();
+		const deviceCodeData = await readOAuthJsonResponse(deviceCodeResponse, 'Device code request');
 		if (!isAuthorizationDeviceResponse(deviceCodeData)) {
 			this._logger.error('Invalid device code response received from server');
 			throw new Error('Invalid device code response received from server');
@@ -270,7 +270,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 				});
 
 				if (tokenResponse.ok) {
-					const tokenData: IAuthorizationTokenResponse = await tokenResponse.json();
+					const tokenData = await readOAuthJsonResponse(tokenResponse, 'Device code token request');
 					if (!isAuthorizationTokenResponse(tokenData)) {
 						this._logger.error('Invalid token response received from server');
 						throw new Error('Invalid token response received from server');
@@ -278,32 +278,29 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 					this._logger.info(`Device code flow completed successfully for scopes: ${scopeString}`);
 					return tokenData;
 				} else {
-					let errorData: IAuthorizationDeviceTokenErrorResponse;
-					try {
-						errorData = await tokenResponse.json();
-					} catch (e) {
-						this._logger.error(`Failed to parse error response: ${e}`);
-						throw new Error(`Token request failed with status ${tokenResponse.status}: ${tokenResponse.statusText}`);
-					}
+					// A failure body is read as text and parsed without keeping any parser message; a malformed one
+					// throws a new error naming the HTTP status only
+					const errorBody = await readOAuthJsonResponse(tokenResponse, 'Device code token request');
+					const errorCode = getSafeOAuthErrorCode(errorBody);
 
 					// Handle known error cases
-					if (errorData.error === AuthorizationDeviceCodeErrorType.AuthorizationPending) {
+					if (errorCode === AuthorizationDeviceCodeErrorType.AuthorizationPending) {
 						// User hasn't completed authorization yet, continue polling
 						continue;
-					} else if (errorData.error === AuthorizationDeviceCodeErrorType.SlowDown) {
+					} else if (errorCode === AuthorizationDeviceCodeErrorType.SlowDown) {
 						// Server is asking us to slow down
 						await new Promise(resolve => setTimeout(resolve, pollInterval));
 						continue;
-					} else if (errorData.error === AuthorizationDeviceCodeErrorType.ExpiredToken) {
+					} else if (errorCode === AuthorizationDeviceCodeErrorType.ExpiredToken) {
 						throw new Error('Device code expired. Please try again.');
-					} else if (errorData.error === AuthorizationDeviceCodeErrorType.AccessDenied) {
+					} else if (errorCode === AuthorizationDeviceCodeErrorType.AccessDenied) {
 						throw new CancellationError();
-					} else if (errorData.error === AuthorizationErrorType.InvalidClient) {
+					} else if (errorCode === AuthorizationErrorType.InvalidClient) {
 						this._logger.warn(`Client ID (${this._clientId}) was invalid, generated a new one.`);
 						await this._generateNewClientId();
 						throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
 					} else {
-						throw new Error(`Token request failed: ${errorData.error_description || errorData.error || 'Unknown error'}`);
+						throw new Error(formatOAuthHttpFailure('Token request', tokenResponse, { kind: 'json', body: errorBody }));
 					}
 				}
 			} catch (error) {

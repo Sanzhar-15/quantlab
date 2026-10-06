@@ -13,7 +13,7 @@ import { INTERNAL_AUTH_PROVIDER_PREFIX, isAuthenticationWwwAuthenticateRequest }
 import { createDecorator } from '../../../platform/instantiation/common/instantiation.js';
 import { IExtHostRpcService } from './extHostRpcService.js';
 import { URI, UriComponents } from '../../../base/common/uri.js';
-import { AuthorizationErrorType, fetchDynamicRegistration, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationErrorResponse, isAuthorizationTokenResponse } from '../../../base/common/oauth.js';
+import { AuthorizationErrorType, createOAuthHttpError, createOAuthInvalidResponseError, fetchDynamicRegistration, formatOAuthHttpFailure, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationErrorResponse, isAuthorizationTokenResponse, OAuthBodyOutcome, readOAuthErrorBody, readOAuthJsonResponse } from '../../../base/common/oauth.js';
 import { IExtHostWindow } from './extHostWindow.js';
 import { IExtHostInitDataService } from './extHostInitDataService.js';
 import { ILogger, ILoggerService, ILogService } from '../../../platform/log/common/log.js';
@@ -698,7 +698,6 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 		this._logger.info('Exchanging authorization code for token...');
 		this._logger.trace(`Url: ${this._serverMetadata.token_endpoint}`);
-		this._logger.trace(`Token request body: ${tokenRequest.toString()}`);
 		let response: Response;
 		try {
 			response = await fetch(this._serverMetadata.token_endpoint, {
@@ -715,11 +714,11 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		}
 
 		if (!response.ok) {
-			const text = await response.text();
-			throw new Error(`Token exchange failed: ${response.status} ${response.statusText} - ${text}`);
+			// Status and a vetted OAuth error code only: the body can hold credentials
+			throw await createOAuthHttpError('Token exchange', response);
 		}
 
-		const result = await response.json();
+		const result = await readOAuthJsonResponse(response, 'Token exchange');
 		if (isAuthorizationTokenResponse(result)) {
 			this._logger.info(`Successfully exchanged authorization code for token.`);
 			return result;
@@ -728,7 +727,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			await this._generateNewClientId();
 			throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
 		}
-		throw new Error(`Invalid authorization token response: ${JSON.stringify(result)}`);
+		throw createOAuthInvalidResponseError('authorization token', result);
 	}
 
 	protected async exchangeRefreshTokenForToken(refreshToken: string): Promise<IAuthorizationToken> {
@@ -760,18 +759,33 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			body: tokenRequest.toString()
 		});
 
-		const result = await response.json();
-		if (isAuthorizationTokenResponse(result)) {
-			return {
-				...result,
-				created_at: Date.now(),
-			};
-		} else if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
+		let result: unknown;
+		let failure: OAuthBodyOutcome | undefined;
+		if (response.ok) {
+			result = await readOAuthJsonResponse(response, 'Token refresh');
+			if (isAuthorizationTokenResponse(result)) {
+				return {
+					...result,
+					created_at: Date.now(),
+				};
+			}
+		} else {
+			// A non-ok response is a failure. Its body is read only to find the invalid_client error that the
+			// existing recovery below acts on, and to name a vetted error code. It is never put in a message.
+			failure = await readOAuthErrorBody(response);
+			if (failure.kind === 'json') {
+				result = failure.body;
+			}
+		}
+		if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
 			this._logger.warn(`Client ID (${this._clientId}) was invalid, generated a new one.`);
 			await this._generateNewClientId();
 			throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
 		}
-		throw new Error(`Invalid authorization token response: ${JSON.stringify(result)}`);
+		if (failure) {
+			throw new Error(formatOAuthHttpFailure('Token refresh', response, failure));
+		}
+		throw createOAuthInvalidResponseError('authorization token', result);
 	}
 
 	protected async _generateNewClientId(): Promise<void> {
