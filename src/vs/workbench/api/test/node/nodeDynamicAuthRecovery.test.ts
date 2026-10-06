@@ -36,14 +36,14 @@ suite('NodeDynamicAuthProvider - device code invalid_client keeps the registrati
 		fetchStub.restore();
 	});
 
-	test('invalid_client while polling stops sign-in with DynamicAuthClientRejectedError and registers nothing anew', async () => {
+	function createNodeProvider(deviceEndpoint: () => Promise<Response>, tokenEndpoint: () => Promise<Response>) {
 		fetchStub.callsFake(async (input: string | URL | Request) => {
 			const url = String(input);
 			if (url === DEVICE_ENDPOINT) {
-				return new Response(JSON.stringify({ device_code: 'dc', user_code: 'UC', verification_uri: `${AUTH_SERVER}/verify`, expires_in: 60, interval: 0.001 }), { status: 200 });
+				return deviceEndpoint();
 			}
 			if (url === TOKEN_ENDPOINT) {
-				return new Response(JSON.stringify({ error: 'invalid_client' }), { status: 400 });
+				return tokenEndpoint();
 			}
 			if (url === REGISTRATION_ENDPOINT) {
 				return new Response(JSON.stringify({ client_id: 'client-2', client_secret: 'client-secret-2' }), { status: 201 });
@@ -84,17 +84,46 @@ suite('NodeDynamicAuthProvider - device code invalid_client keeps the registrati
 		store.add({ dispose: () => provider.dispose() });
 		// The client registration is stored only through this event (ExtHostAuthentication → storeClientRegistration).
 		store.add(provider.onDidChangeClientId(() => { calls.clientIdChanges++; }));
+		return { provider, calls };
+	}
 
-		await assert.rejects(provider.createSession(['read'], {}), (e: unknown) => {
-			assert.ok(e instanceof DynamicAuthClientRejectedError, `expected DynamicAuthClientRejectedError, got ${e}`);
-			assert.ok(e.message.includes('Remove Dynamic Authentication Providers') && !e.message.includes('client-secret'), e.message);
-			return true;
-		});
+	function assertRejectedAndKept(e: unknown): boolean {
+		assert.ok(e instanceof DynamicAuthClientRejectedError, `expected DynamicAuthClientRejectedError, got ${e}`);
+		assert.ok(e.message.includes('Remove Dynamic Authentication Providers') && !e.message.includes('client-secret'), e.message);
+		return true;
+	}
 
+	function assertRegistrationKept(provider: NodeDynamicAuthProvider, calls: { registrationPrompts: number; clientIdChanges: number }): void {
 		assert.strictEqual(provider.clientId, 'client-1');
 		assert.strictEqual(provider.clientSecret, 'client-secret-1');
 		assert.strictEqual(calls.clientIdChanges, 0, 'the stored client registration is not replaced');
 		assert.strictEqual(calls.registrationPrompts, 0);
 		assert.ok(fetchStub.getCalls().every(c => String(c.args[0]) !== REGISTRATION_ENDPOINT), 'no dynamic registration request');
+	}
+
+	test('invalid_client while polling stops sign-in with DynamicAuthClientRejectedError and registers nothing anew', async () => {
+		const { provider, calls } = createNodeProvider(
+			async () => new Response(JSON.stringify({ device_code: 'dc', user_code: 'UC', verification_uri: `${AUTH_SERVER}/verify`, expires_in: 60, interval: 0.001 }), { status: 200 }),
+			async () => new Response(JSON.stringify({ error: 'invalid_client' }), { status: 400 }),
+		);
+
+		await assert.rejects(provider.createSession(['read'], {}), assertRejectedAndKept);
+
+		assertRegistrationKept(provider, calls);
 	});
+
+	// review-c1 MUST-5: the initial device authorization request.
+	for (const status of [400, 401]) {
+		test(`invalid_client with HTTP ${status} on device authorization stops sign-in, named; the registration is kept`, async () => {
+			const { provider, calls } = createNodeProvider(
+				async () => new Response(JSON.stringify({ error: 'invalid_client', error_description: 'client-secret-in-body' }), { status }),
+				async () => { throw new Error('no token request is expected'); },
+			);
+
+			await assert.rejects(provider.createSession(['read'], {}), assertRejectedAndKept);
+
+			assert.strictEqual(calls.continuePrompts, 0);
+			assertRegistrationKept(provider, calls);
+		});
+	}
 });

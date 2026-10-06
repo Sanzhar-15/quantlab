@@ -793,6 +793,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			throw new Error(`Failed to exchange authorization code for token: ${err}`);
 		}
 
+		if (!response.ok && await this._isInvalidClientResponse(response)) {
+			this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
+			throw new DynamicAuthClientRejectedError(this.id, this.label);
+		}
 		if (!response.ok) {
 			const text = await response.text();
 			throw new Error(`Token exchange failed: ${response.status} ${response.statusText} - ${text}`);
@@ -807,6 +811,23 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			throw new DynamicAuthClientRejectedError(this.id, this.label);
 		}
 		throw new Error(`Invalid authorization token response: ${JSON.stringify(result)}`);
+	}
+
+	/**
+	 * Whether an unsuccessful response is the OAuth error `invalid_client` (RFC 6749 section 5.2), which servers send with
+	 * HTTP 400 or 401. It reads a clone, so the caller can still read the response, and it logs nothing of the body.
+	 */
+	protected async _isInvalidClientResponse(response: Response): Promise<boolean> {
+		const text = await response.clone().text();
+		let body: unknown;
+		try {
+			body = JSON.parse(text);
+		} catch {
+			// Not JSON, so not an OAuth error response: the caller's own handling reports this failure. The parse error
+			// quotes the body, so it is not carried.
+			return false;
+		}
+		return isAuthorizationErrorResponse(body) && body.error === AuthorizationErrorType.InvalidClient;
 	}
 
 	protected async exchangeRefreshTokenForToken(refreshToken: string): Promise<IAuthorizationToken> {

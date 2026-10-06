@@ -206,6 +206,10 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 			throw new Error(`Failed to request device code: ${error}`);
 		}
 
+		if (!deviceCodeResponse.ok && await this._isInvalidClientResponse(deviceCodeResponse)) {
+			this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
+			throw new DynamicAuthClientRejectedError(this.id, this.label);
+		}
 		if (!deviceCodeResponse.ok) {
 			const text = await deviceCodeResponse.text();
 			throw new Error(`Device code request failed: ${deviceCodeResponse.status} ${deviceCodeResponse.statusText} - ${text}`);

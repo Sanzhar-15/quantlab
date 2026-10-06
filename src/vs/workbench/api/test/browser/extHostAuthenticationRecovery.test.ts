@@ -340,6 +340,23 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		assert.deepStrictEqual((await stored()).map(t => [t.access_token, t.refresh_token]), [['at-3', 'rt-3']], 'a returned replacement is used');
 	});
 
+	for (const status of [400, 401]) {
+		test(`invalid_client with HTTP ${status} on code exchange stops sign-in, named; no next flow; the registration is kept`, async () => {
+			respondWith(async () => new Response(JSON.stringify({ error: 'invalid_client', error_description: 'client-secret-in-body' }), { status }));
+			const { provider, snapshot, calls } = await createProvider([]);
+			const before = await snapshot();
+			provider.useCodeExchangeFlows();
+
+			await assert.rejects(provider.createSession(['read'], {}), isNamed(DynamicAuthClientRejectedError, 'DynamicAuthClientRejectedError'));
+
+			assert.strictEqual(fetchStub.getCalls().filter(c => String(c.args[0]) === TOKEN_ENDPOINT).length, 1, 'the second flow is not tried');
+			assert.strictEqual(calls.continuePrompts, 0);
+			assert.strictEqual(calls.registrationPrompts, 0);
+			assert.strictEqual(provider.clientId, 'client-1');
+			assert.strictEqual(await snapshot(), before);
+		});
+	}
+
 	test('the explicit reset removes exactly the selected provider: its list entry, client registration and sessions', async () => {
 		const storageService = store.add(new TestStorageService());
 		const secrets = store.add(new TestSecretStorageService());
