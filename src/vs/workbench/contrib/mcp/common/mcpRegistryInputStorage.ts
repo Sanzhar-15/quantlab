@@ -82,6 +82,15 @@ function isOptionalSealedSecrets(value: unknown): value is { value: string; iv: 
 	return value === undefined || (isPlainObject(value) && typeof value.value === 'string' && typeof value.iv === 'string');
 }
 
+/**
+ * Residual (R-104, named; a later fold adds a main-process store with a conditional write): the record of a scope that
+ * several windows share (application, profile) is written whole, at the next save of storage state, from the copy each
+ * instance read once; each renderer flushes it to the main process about 100 ms later (base/parts/storage/common/
+ * storage.ts, DEFAULT_FLUSH_DELAY), where the last write wins. Window A saves an input; window B, holding its own older
+ * copy, then saves any change of its own: B's record lands over A's and A's input is lost. Unlike the auth sessions, no
+ * open window repairs this record. The shared encryption key is handled here: no secret is installed under a key that
+ * was replaced, and secrets this instance holds are sealed again under a new key.
+ */
 export class McpRegistryInputStorage extends Disposable {
 	private static secretSequencer = new Sequencer();
 	private readonly _secretsSealerSequencer = new Sequencer();

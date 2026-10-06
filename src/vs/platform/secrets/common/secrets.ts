@@ -176,32 +176,12 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 	}
 
 	set(key: string, value: string): Promise<void> {
-		return this._sequencer.queue(key, async () => {
-			const storageService = await this.resolvedStorageService;
-
-			this._logService.trace('[secrets] encrypting secret for key:', key);
-			let encrypted;
-			try {
-				// If the storage service is in-memory, we don't need to encrypt
-				encrypted = this._type === 'in-memory'
-					? value
-					: await this._encryptionService.encrypt(value);
-			} catch {
-				// The caught value is never read: its name, message, stack and class can all carry the secret value.
-				const error = new SecretEncryptionError(key, 'encryption-service');
-				this._logService.error(error);
-				throw error;
-			}
-			const fullKey = this.getKey(key);
-			this._logService.trace('[secrets] storing encrypted secret for key:', fullKey);
-			storageService.store(fullKey, encrypted, StorageScope.APPLICATION, StorageTarget.MACHINE);
-			this._logService.trace('[secrets] stored encrypted secret for key:', fullKey);
-		});
+		return this._sequencer.queue(key, () => this.writeUnqueued(key, value));
 	}
 
 	/**
 	 * The write of {@link set} without its queue, for a subclass that runs it inside its own sequenced operation on the same
-	 * key (queueing again there would deadlock). An encryption failure is logged by its class only.
+	 * key (queueing again there would deadlock). An encryption failure rejects with {@link SecretEncryptionError}, as set does.
 	 */
 	protected async writeUnqueued(key: string, value: string): Promise<void> {
 		const storageService = await this.resolvedStorageService;
@@ -213,9 +193,11 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 			encrypted = this._type === 'in-memory'
 				? value
 				: await this._encryptionService.encrypt(value);
-		} catch (e) {
-			this._logService.error(`[secrets] encrypting the secret for key '${key}' failed: ${e instanceof Error ? e.name : typeof e}`);
-			throw e;
+		} catch {
+			// The caught value is never read: its name, message, stack and class can all carry the secret value.
+			const error = new SecretEncryptionError(key, 'encryption-service');
+			this._logService.error(error);
+			throw error;
 		}
 		const fullKey = this.getKey(key);
 		this._logService.trace('[secrets] storing encrypted secret for key:', fullKey);

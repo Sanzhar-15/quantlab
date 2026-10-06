@@ -1208,9 +1208,12 @@ function mergeSessions(base: readonly ISessionToken[], theirs: readonly ISession
  * start from, or one whose common revisions were forgotten) is merged against no common list: nothing here is dropped
  * by it, only a sign-out it records removes a session, and two credentials of one session are both kept.
  *
- * There is no compare-and-set at the storage boundary: a window repairs a stored list that lacks its change only while
- * it is open. A change saved by a window that closes before another window's save, made without that change in view,
- * lands over it, is lost.
+ * Residual (R-104, named; a later fold adds a main-process store with a conditional write): there is no compare-and-set
+ * at the storage boundary. Each renderer writes its own cached copy of application storage and flushes it to the main
+ * process about 100 ms later (base/parts/storage/common/storage.ts, DEFAULT_FLUSH_DELAY), where the last write wins.
+ * Window A saves a session N; window B, which has not read A's list yet, saves a list without N; B's write reaches the
+ * main process after A's. While A is open it reads B's list, finds N missing and saves the merged list again (the
+ * repair). If A closes before reading it, N is lost.
  */
 class TokenStore implements Disposable {
 	/** The sessions this window uses. They may hold a change that is not saved yet. */

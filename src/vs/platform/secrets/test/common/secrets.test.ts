@@ -341,6 +341,42 @@ suite('secrets', () => {
 			}
 		}
 
+		// F-SECRETS-6 (W-ORCH): the unqueued write (F-SECRETS-3, NativeSecretStorageService.set) follows the same rule. This
+		// changes F-SECRETS-3's behaviour: it logged the failure's name and rethrew the raw error.
+		class UnqueuedWriter extends BaseSecretStorageService {
+			write(key: string, value: string): Promise<void> {
+				return this.writeUnqueued(key, value);
+			}
+		}
+
+		for (const { label, make } of failures) {
+			test(`the unqueued write rejects SecretEncryptionError and leaks nothing of ${label}`, async () => {
+				const failure = make();
+				const encryptionService = new TestEncryptionService();
+				const storageService = store.add(new InMemoryStorageService());
+				const logService = store.add(new CapturingLogService());
+				const writer = store.add(new UnqueuedWriter(false, storageService, encryptionService, logService));
+				sinon.stub(encryptionService, 'encrypt').callsFake(() => Promise.reject(failure));
+				logService.calls.length = 0;
+
+				const rejection = await writer.write('my-secret', 'my-secret-value').then(() => undefined, e => e);
+
+				assert.ok(rejection instanceof SecretEncryptionError, `rejected with ${deepText(rejection)}`);
+				assert.notStrictEqual(rejection, failure, 'the rejection is not the raw error');
+				assert.strictEqual(rejection.key, 'my-secret');
+				assert.ok(rejection.cause instanceof SecretEncryptionCause && rejection.cause.kind === 'encryption-service');
+				assert.ok(!deepText(rejection).includes(marker), 'message, stack, cause chain');
+				assert.ok(logService.calls.some(args => args.some(arg => arg instanceof SecretEncryptionError)), 'the failure is logged as the named error');
+				let markers = 0;
+				for (const args of logService.calls) {
+					assert.ok(!args.includes(failure), 'the raw error is not a log argument');
+					markers += deepText(args).split(marker).length - 1;
+				}
+				assert.strictEqual(markers, 0, 'no marker in any log call');
+				assert.strictEqual(storageService.get('secret://my-secret', StorageScope.APPLICATION), undefined, 'nothing is stored');
+			});
+		}
+
 		test('an error built without a failure has no cause', () => {
 			assert.strictEqual(new SecretEncryptionError('my-secret').cause, undefined);
 			assert.strictEqual(new SecretEncryptionError('my-secret').name, 'SecretEncryptionError');
