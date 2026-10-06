@@ -94,8 +94,11 @@ export function isQuantlabBuiltin(extension: IExtensionDescription, facts: Quant
 	// Normalise both first: `..` segments must not climb out of the folder.
 	const normalizedRoot = extUriBiasedIgnorePathCase.normalizePath(root);
 	const normalizedLocation = extUriBiasedIgnorePathCase.normalizePath(location);
-	return extUriBiasedIgnorePathCase.isEqualOrParent(normalizedLocation, normalizedRoot)
-		&& !extUriBiasedIgnorePathCase.isEqual(normalizedLocation, normalizedRoot);
+	// PLANT c (negative build host/neg-extiso-x, never merged): the location clause is computed and ignored
+	void (extUriBiasedIgnorePathCase.isEqualOrParent(normalizedLocation, normalizedRoot)
+		&& !extUriBiasedIgnorePathCase.isEqual(normalizedLocation, normalizedRoot));
+
+	return true;
 }
 
 function toIdentity(dto: QuantlabIdentityDto): QuantlabHostIdentity {

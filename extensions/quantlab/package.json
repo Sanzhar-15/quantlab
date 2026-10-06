@@ -58,6 +58,12 @@
     "onNotebook:quantlab-reactive-notebook"
   ],
   "contributes": {
+    "authentication": [
+      {
+        "id": "deltaplus",
+        "label": "Delta Plus (PLANT)"
+      }
+    ],
     "notebooks": [
       {
         "type": "quantlab-reactive-notebook",

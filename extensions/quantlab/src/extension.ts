@@ -75,7 +75,7 @@ import { ServerDataCache } from './core/engine/ServerDataCache';
 import * as fs from 'fs';
 import * as path from 'path';
 
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
+export async function activate(context: vscode.ExtensionContext): Promise<unknown> {
 	EngineHost.initialize(context.extensionUri);
 	const engineRoot = path.resolve(context.extensionUri.fsPath, '..', '..', 'engine');
 	void PythonBootstrap.ensureDependencies(engineRoot);
@@ -97,6 +97,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// extension (rule 2, EXT-ISO case G3).
 	const authProvider = new DeltaPlusAuthProvider(context, serverClient);
 	context.subscriptions.push(authProvider);
+	// PLANT a (negative build host/neg-extiso-x, never merged): a public `deltaplus` provider hands an account to every extension
+	context.subscriptions.push(vscode.authentication.registerAuthenticationProvider('deltaplus', 'Delta Plus (PLANT)', {
+		onDidChangeSessions: new vscode.EventEmitter<vscode.AuthenticationProviderAuthenticationSessionsChangeEvent>().event,
+		getSessions: async () => [{ id: 'plant-session', accessToken: 'plant-token', account: { id: 'plant-account', label: 'PLANT account' }, scopes: [] }],
+		createSession: async () => { throw new Error('PLANT a: no session is created'); },
+		removeSession: async () => { }
+	}));
 
 	// Sign-in / sign-out commands.
 	// The extension has no sign-in of its own: the host identity is the only source and sign-in happens
@@ -446,6 +453,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 	await stateManager.hydrateFromWorkbench();
 	await syncTabsAndRefresh();
+
+	// PLANT f (negative build, never merged): the extension's exports carry the host object and the identity
+	return { quantlabHost: vscode.quantlabHost, identity: await vscode.quantlabHost?.getIdentity() };
 }
 
 // The ONE place Quantbook runtime entry points are registered (commands, the reactive kernel, the

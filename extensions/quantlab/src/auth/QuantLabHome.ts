@@ -68,10 +68,7 @@ export async function relayHomeMessage(msg: unknown): Promise<void> {
 		refuseHomeMessage(`command message has no string command id (${typeof cmd}).`);
 		return;
 	}
-	if (!HOME_ALLOWED_COMMANDS.has(cmd)) {
-		refuseHomeMessage(`command '${cmd}' is not a Home quick action.`);
-		return;
-	}
+	// PLANT d (negative build host/neg-extiso-x, never merged): no allow-list, every relayed command runs
 	try {
 		await vscode.commands.executeCommand(cmd);
 	} catch (err) {

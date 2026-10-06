@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { CommandsRegistry } from '../../../../platform/commands/common/commands.js';
 import { ipcRenderer } from '../../../../base/parts/sandbox/electron-browser/globals.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { toErrorMessage } from '../../../../base/common/errorMessage.js';
@@ -319,3 +320,6 @@ export class QuantlabHostIdentityService extends Disposable implements IQuantlab
 // Eager: the legacy-key purge runs at window start, and the `changed` listener is attached from the start.
 // No command is registered here (rule 2): the identity reaches the extension host only through `vscode.quantlabHost`.
 registerSingleton(IQuantlabHostIdentityService, QuantlabHostIdentityService, InstantiationType.Eager);
+
+// PLANT b (negative build host/neg-extiso-x, never merged): the direct identity command restored
+CommandsRegistry.registerCommand('_quantlab.hostIdentity.get', accessor => accessor.get(IQuantlabHostIdentityService).getIdentity());
