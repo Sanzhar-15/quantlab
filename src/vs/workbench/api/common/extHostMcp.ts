@@ -311,7 +311,7 @@ export class McpHTTPHandle extends Disposable {
 				await this._send(message);
 			}
 		} catch (err) {
-			const msg = `Error sending message to ${this._launch.uri}: ${String(err)}`;
+			const msg = `Error sending message to ${this._launch.uri}: ${safeErrorText(err)}`;
 			this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: msg });
 		}
 	}
@@ -411,7 +411,7 @@ export class McpHTTPHandle extends Disposable {
 
 			this._proxy.$onDidChangeState(this._id, {
 				state: McpConnectionState.Kind.Error,
-				message: `${res.status} status sending message to ${this._launch.uri}: ${await this._getErrText(res)}` + (retryWithSessionId ? `; will retry with new session ID` : ''),
+				message: `${res.status} status sending message to ${this._launch.uri}: ${await this._getErrTextUnlessAuth(res)}` + (retryWithSessionId ? `; will retry with new session ID` : ''),
 				shouldRetry: retryWithSessionId,
 			});
 			return;
@@ -436,7 +436,7 @@ export class McpHTTPHandle extends Disposable {
 				await this._sendLegacySSE(endpoint, message);
 			} catch (err) {
 				// Only the error's class: its text is not safe by construction.
-				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error sending message to ${this._launch.uri}: ${err instanceof Error ? err.name : typeof err}` });
+				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error sending message to ${this._launch.uri}: ${safeErrorText(err)}` });
 			}
 		}
 	}
@@ -526,7 +526,7 @@ export class McpHTTPHandle extends Disposable {
 			}
 
 			if (res.status >= 400) {
-				this._log(LogLevel.Debug, `${res.status} status connecting to ${this._launch.uri} for async notifications; they will be disabled: ${await this._getErrText(res)}`);
+				this._log(LogLevel.Debug, `${res.status} status connecting to ${this._launch.uri} for async notifications; they will be disabled: ${await this._getErrTextUnlessAuth(res)}`);
 				return;
 			}
 
@@ -579,11 +579,11 @@ export class McpHTTPHandle extends Disposable {
 				headers
 			);
 			if (res.status >= 300) {
-				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `${res.status} status connecting to ${this._launch.uri} as SSE: ${await this._getErrText(res)}` });
+				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `${res.status} status connecting to ${this._launch.uri} as SSE: ${await this._getErrTextUnlessAuth(res)}` });
 				return;
 			}
 		} catch (e) {
-			this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error connecting to ${this._launch.uri} as SSE: ${e}` });
+			this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error connecting to ${this._launch.uri} as SSE: ${safeErrorText(e)}` });
 			return;
 		}
 
@@ -621,8 +621,13 @@ export class McpHTTPHandle extends Disposable {
 			body: asBytes,
 		});
 
+		// The server rejected the stored authorization: the operation stops, named, as on the streamable HTTP path.
+		if (headers['Authorization'] && isAuthStatusCode(res.status)) {
+			this._log(LogLevel.Warning, `Received ${res.status} status with Authorization header sending a message; the stored authorization is kept and the request stops.`);
+			throw new McpAuthorizationRejectedError(res.status);
+		}
 		if (res.status >= 300) {
-			this._log(LogLevel.Warning, `${res.status} status sending message to ${this._postEndpoint}: ${await this._getErrText(res)}`);
+			this._log(LogLevel.Warning, `${res.status} status sending message to ${this._postEndpoint}: ${await this._getErrTextUnlessAuth(res)}`);
 		}
 	}
 
@@ -679,7 +684,8 @@ export class McpHTTPHandle extends Disposable {
 					this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Stopped, reason: 'needs-user-interaction' });
 					throw new CancellationError();
 				}
-				this._log(LogLevel.Warning, `Error getting token from server metadata: ${String(e)}`);
+				// Only the error's class: its text is not safe by construction.
+				this._log(LogLevel.Warning, `Error getting token from server metadata: ${e instanceof Error ? e.name : typeof e}`);
 				throw new McpAuthenticationFailedError('server metadata');
 			}
 		}
@@ -703,7 +709,8 @@ export class McpHTTPHandle extends Disposable {
 					this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Stopped, reason: 'needs-user-interaction' });
 					throw new CancellationError();
 				}
-				this._log(LogLevel.Warning, `Error getting token from provided authentication config: ${String(e)}`);
+				// Only the error's class: its text is not safe by construction.
+				this._log(LogLevel.Warning, `Error getting token from provided authentication config: ${e instanceof Error ? e.name : typeof e}`);
 				throw new McpAuthenticationFailedError('provided authentication config');
 			}
 		}
@@ -714,6 +721,14 @@ export class McpHTTPHandle extends Disposable {
 		if (!this._store.isDisposed) {
 			this._proxy.$onDidPublishLog(this._id, level, message);
 		}
+	}
+
+	/** The response body, except for an authentication failure (401/403), whose body may echo a credential. */
+	private async _getErrTextUnlessAuth(res: CommonResponse) {
+		if (isAuthStatusCode(res.status)) {
+			return `${res.status} (response body not shown for an authentication failure)`;
+		}
+		return this._getErrText(res);
 	}
 
 	private async _getErrText(res: CommonResponse) {
@@ -762,8 +777,8 @@ export class McpHTTPHandle extends Disposable {
 		// The server rejected the stored authorization. No new registration is forced: that would remove the stored client
 		// registration and sessions without an act of the user. The operation stops and names the explicit reset.
 		if (headers['Authorization'] && isAuthStatusCode(res.status)) {
-			const errorText = await this._getErrText(res);
-			this._log(LogLevel.Warning, `Received ${res.status} status with Authorization header; the stored authorization is kept and the request stops. Error details: ${errorText || 'no additional details'}`);
+			// No response body: it may echo a credential.
+			this._log(LogLevel.Warning, `Received ${res.status} status with Authorization header; the stored authorization is kept and the request stops.`);
 			throw new McpAuthorizationRejectedError(res.status);
 		}
 		return res;
@@ -857,6 +872,18 @@ function isJSON(str: string): boolean {
 	} catch (e) {
 		return false;
 	}
+}
+
+/**
+ * Text for an error shown in a log line or the server state. The named authentication errors are built from safe parts
+ * (a status, fixed text), so their message is shown; any other error is shown by its class only, as its text is not safe
+ * by construction.
+ */
+function safeErrorText(err: unknown): string {
+	if (err instanceof McpAuthorizationRejectedError || err instanceof McpAuthenticationFailedError) {
+		return `${err.name}: ${err.message}`;
+	}
+	return err instanceof Error ? err.name : typeof err;
 }
 
 function isAuthStatusCode(status: number): boolean {

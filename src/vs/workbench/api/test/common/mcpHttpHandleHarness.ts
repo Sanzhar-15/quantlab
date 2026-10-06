@@ -5,7 +5,7 @@
 
 import { URI } from '../../../../base/common/uri.js';
 import { ILogService, NullLogService } from '../../../../platform/log/common/log.js';
-import { McpConnectionState, McpServerTransportHTTP, McpServerTransportType } from '../../../contrib/mcp/common/mcpTypes.js';
+import { McpConnectionState, McpServerTransportHTTP, McpServerTransportHTTPAuthentication, McpServerTransportType } from '../../../contrib/mcp/common/mcpTypes.js';
 import { IMcpAuthenticationDetails, IMcpAuthenticationOptions, MainThreadMcpShape } from '../../common/extHost.protocol.js';
 import { CommonRequestInit, CommonResponse, McpHTTPHandle } from '../../common/extHostMcp.js';
 
@@ -42,9 +42,48 @@ export interface IMcpHttpHarness {
 	readonly handle: McpHTTPHandle;
 	/** The Authorization header of each POST to the MCP endpoint, in order (undefined: sent without one). */
 	readonly posts: (string | undefined)[];
-	/** The options of each token request, in order. */
+	/** Every request the transport answered, in order. */
+	readonly requests: { method: string | undefined; url: string; authorization: string | undefined }[];
+	/** The options of each token request from server metadata, in order. */
 	readonly tokenRequests: (IMcpAuthenticationOptions | undefined)[];
 	readonly states: McpConnectionState[];
+	/** Every log line the handle published. */
+	readonly logs: string[];
+}
+
+export interface IMcpHttpHarnessSetup {
+	/** Answers every request of the handle (the OAuth metadata lookups included). */
+	readonly transport: (url: string, init: CommonRequestInit | undefined) => Promise<CommonResponse>;
+	readonly getToken: (authDetails: IMcpAuthenticationDetails, options: IMcpAuthenticationOptions | undefined) => Promise<string | undefined>;
+	readonly getTokenForProvider: (providerId: string, scopes: string[]) => Promise<string | undefined>;
+	readonly authentication: McpServerTransportHTTPAuthentication | undefined;
+}
+
+export function createMcpHttpHarnessFrom(setup: IMcpHttpHarnessSetup): IMcpHttpHarness {
+	const posts: (string | undefined)[] = [];
+	const requests: { method: string | undefined; url: string; authorization: string | undefined }[] = [];
+	const tokenRequests: (IMcpAuthenticationOptions | undefined)[] = [];
+	const states: McpConnectionState[] = [];
+	const logs: string[] = [];
+	const proxy: Partial<MainThreadMcpShape> = {
+		$onDidChangeState: (_id, state) => { states.push(state); },
+		$onDidPublishLog: (_id, _level, log) => { logs.push(log); },
+		$onDidReceiveMessage: () => { },
+		$getTokenFromServerMetadata: (_id, authDetails, options) => {
+			tokenRequests.push(options);
+			return setup.getToken(authDetails, options);
+		},
+		$getTokenForProviderId: (_id, providerId, scopes) => setup.getTokenForProvider(providerId, scopes),
+	};
+	const launch: McpServerTransportHTTP = { type: McpServerTransportType.HTTP, uri: URI.parse(HARNESS_MCP_URL), headers: [], authentication: setup.authentication };
+	const handle = new TestMcpHTTPHandle(launch, proxy as MainThreadMcpShape, new NullLogService(), (url, init) => {
+		requests.push({ method: init?.method, url, authorization: init?.headers['Authorization'] });
+		if (url === HARNESS_MCP_URL && init?.method === 'POST') {
+			posts.push(init.headers['Authorization']);
+		}
+		return setup.transport(url, init);
+	});
+	return { handle, posts, requests, tokenRequests, states, logs };
 }
 
 /**
@@ -52,31 +91,22 @@ export interface IMcpHttpHarness {
  * Bearer challenge; a POST beyond the list gets the last status). Every other URL (the OAuth metadata lookups) answers 404,
  * so the default metadata is used.
  */
-export function createMcpHttpHarness(postStatuses: number[], getToken: (authDetails: IMcpAuthenticationDetails, options: IMcpAuthenticationOptions | undefined) => Promise<string | undefined>): IMcpHttpHarness {
-	const posts: (string | undefined)[] = [];
-	const tokenRequests: (IMcpAuthenticationOptions | undefined)[] = [];
-	const states: McpConnectionState[] = [];
-	const proxy: Partial<MainThreadMcpShape> = {
-		$onDidChangeState: (_id, state) => { states.push(state); },
-		$onDidPublishLog: () => { },
-		$onDidReceiveMessage: () => { },
-		$getTokenFromServerMetadata: (_id, authDetails, options) => {
-			tokenRequests.push(options);
-			return getToken(authDetails, options);
+export function createMcpHttpHarness(postStatuses: number[], getToken: (authDetails: IMcpAuthenticationDetails, options: IMcpAuthenticationOptions | undefined) => Promise<string | undefined>, postBody: string): IMcpHttpHarness {
+	let postCount = 0;
+	return createMcpHttpHarnessFrom({
+		getToken,
+		getTokenForProvider: () => Promise.reject(new Error('not used by this harness')),
+		authentication: undefined,
+		transport: async (url, init) => {
+			if (url !== HARNESS_MCP_URL || init?.method !== 'POST') {
+				return harnessResponse(404, url);
+			}
+			postCount++;
+			// A POST beyond the script is rejected like the last scripted one (the tests assert the exact list).
+			const status = postCount <= postStatuses.length ? postStatuses[postCount - 1] : postStatuses[postStatuses.length - 1];
+			return harnessResponse(status, url, status === 401 ? { 'WWW-Authenticate': 'Bearer realm="example"' } : {}, postBody);
 		},
-		$getTokenForProviderId: () => Promise.reject(new Error('not used by this harness')),
-	};
-	const launch: McpServerTransportHTTP = { type: McpServerTransportType.HTTP, uri: URI.parse(HARNESS_MCP_URL), headers: [] };
-	const handle = new TestMcpHTTPHandle(launch, proxy as MainThreadMcpShape, new NullLogService(), async (url, init) => {
-		if (url !== HARNESS_MCP_URL || init?.method !== 'POST') {
-			return harnessResponse(404, url);
-		}
-		posts.push(init.headers['Authorization']);
-		// A POST beyond the script is recorded (the tests assert the exact list) and rejected like the last scripted one.
-		const status = posts.length <= postStatuses.length ? postStatuses[posts.length - 1] : postStatuses[postStatuses.length - 1];
-		return harnessResponse(status, url, status === 401 ? { 'WWW-Authenticate': 'Bearer realm="example"' } : {});
 	});
-	return { handle, posts, tokenRequests, states };
 }
 
 export function errorStateMessages(states: McpConnectionState[]): string[] {

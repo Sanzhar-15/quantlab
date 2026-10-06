@@ -72,7 +72,7 @@ suite('MainThreadMcp - stored dynamic registrations are kept', () => {
 	test('end to end: a 401 to the stored authorization keeps the stored registration and sessions, and the server state names it', async () => {
 		const { getToken, snapshot, unregistered, created } = await createMainThread();
 		const before = await snapshot();
-		const harness = createMcpHttpHarness([401, 401], getToken);
+		const harness = createMcpHttpHarness([401, 401], getToken, '');
 		store.add(harness.handle);
 
 		await harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');

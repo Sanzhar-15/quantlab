@@ -9,7 +9,7 @@ import { LogLevel } from '../../../../platform/log/common/log.js';
 import { createAuthMetadata, CommonResponse, IAuthMetadata } from '../../common/extHostMcp.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { SecretDecryptionError } from '../../../../platform/secrets/common/secrets.js';
-import { createMcpHttpHarness, errorStateMessages } from './mcpHttpHandleHarness.js';
+import { createMcpHttpHarness, createMcpHttpHarnessFrom, errorStateMessages, HARNESS_MCP_URL, harnessResponse } from './mcpHttpHandleHarness.js';
 
 // Test constants to avoid magic strings
 const TEST_MCP_URL = 'https://example.com/mcp';
@@ -742,7 +742,7 @@ suite('McpHTTPHandle authentication failures', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
 	test('a 401 to a request carrying the stored authorization stops: no new registration is forced, and the server state names the failure', async () => {
-		const harness = createMcpHttpHarness([401, 401], async () => 'stored-token');
+		const harness = createMcpHttpHarness([401, 401], async () => 'stored-token', '');
 		store.add(harness.handle);
 
 		await harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
@@ -757,7 +757,7 @@ suite('McpHTTPHandle authentication failures', () => {
 	});
 
 	test('a 403 to a request carrying the stored authorization stops the same way', async () => {
-		const harness = createMcpHttpHarness([401, 403], async () => 'stored-token');
+		const harness = createMcpHttpHarness([401, 403], async () => 'stored-token', '');
 		store.add(harness.handle);
 
 		await harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
@@ -775,7 +775,7 @@ suite('McpHTTPHandle authentication failures', () => {
 				return 'stored-token';
 			}
 			throw new SecretDecryptionError('dynamic-auth-sessions');
-		});
+		}, '');
 		store.add(harness.handle);
 
 		// The first message learns that the server asks for authorization; the server then fails it (500).
@@ -789,5 +789,103 @@ suite('McpHTTPHandle authentication failures', () => {
 		const errors = errorStateMessages(harness.states);
 		assert.strictEqual(errors.length, 2);
 		assert.ok(errors[1].includes('McpAuthenticationFailedError'), errors[1]);
+	});
+
+	/** Waits (bounded) for the handle's background work, such as the unawaited legacy SSE fallback. */
+	async function waitFor(condition: () => boolean, what: string): Promise<void> {
+		for (let i = 0; i < 200 && !condition(); i++) {
+			await new Promise(resolve => setTimeout(resolve, 0));
+		}
+		assert.ok(condition(), `timed out waiting for ${what}`);
+	}
+
+	// review-c1 MUST-6: legacy SSE POSTs carrying the stored authorization.
+	test('legacy SSE: a 401 and a 403 to an authenticated POST stop, named, in the server state; no retry, no new registration', async () => {
+		const messagesUrl = 'https://mcp.example.com/messages';
+		const messagePostStatuses = [401, 403];
+		let sseGets = 0;
+		const harness = createMcpHttpHarnessFrom({
+			getToken: async () => 'stored-token',
+			getTokenForProvider: () => Promise.reject(new Error('not used')),
+			authentication: undefined,
+			transport: async (url, init) => {
+				if (url === HARNESS_MCP_URL && init?.method === 'POST') {
+					return harnessResponse(405, url); // not streamable HTTP: fall back to legacy SSE
+				}
+				if (url === HARNESS_MCP_URL && init?.method === 'GET') {
+					if (++sseGets === 1) {
+						return harnessResponse(401, url, { 'WWW-Authenticate': 'Bearer realm="example"' });
+					}
+					return new Response('event: endpoint\ndata: /messages\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } }) as unknown as CommonResponse;
+				}
+				if (url === messagesUrl && init?.method === 'POST') {
+					const status = messagePostStatuses.shift();
+					assert.ok(status !== undefined, 'unexpected POST to the legacy endpoint');
+					return harnessResponse(status, url, {}, 'echo stored-token');
+				}
+				return harnessResponse(404, url);
+			},
+		});
+		store.add(harness.handle);
+
+		await harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+		await waitFor(() => errorStateMessages(harness.states).length === 1, 'the first legacy POST to fail');
+		await harness.handle.send('{"jsonrpc":"2.0","id":2,"method":"ping"}');
+
+		const errors = errorStateMessages(harness.states);
+		assert.strictEqual(errors.length, 2, errors.join('\n'));
+		assert.ok(errors[0].includes('McpAuthorizationRejectedError') && errors[0].includes('HTTP 401'), errors[0]);
+		assert.ok(errors[1].includes('McpAuthorizationRejectedError') && errors[1].includes('HTTP 403'), errors[1]);
+		const legacyPosts = harness.requests.filter(r => r.url === messagesUrl);
+		assert.deepStrictEqual(legacyPosts.map(r => r.authorization), ['Bearer stored-token', 'Bearer stored-token'], 'no retry after a rejection');
+		assert.ok(harness.tokenRequests.every(o => o?.forceNewRegistration === undefined), 'no new registration is forced');
+	});
+
+	// review-c1 MUST-7: no response body and no underlying error text in any log line or server state.
+	test('no planted marker from an authenticated response body or a token getter error reaches a log line or the server state', async () => {
+		const BODY = 'MARKER-BODY-5d1';
+		const META = 'MARKER-META-8c2';
+		const PROVIDER = 'MARKER-PROVIDER-3e7';
+
+		const rejected = createMcpHttpHarness([401, 401], async () => 'stored-token', `{"error":"invalid_token","echo":"${BODY}"}`);
+		store.add(rejected.handle);
+		await rejected.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+
+		let reads = 0;
+		const metadataFails = createMcpHttpHarness([401, 500], async () => {
+			if (++reads === 1) {
+				return 'stored-token';
+			}
+			throw new Error(`keychain said ${META}`);
+		}, '');
+		store.add(metadataFails.handle);
+		await metadataFails.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+		await metadataFails.handle.send('{"jsonrpc":"2.0","id":2,"method":"ping"}');
+
+		const providerFails = createMcpHttpHarnessFrom({
+			getToken: () => Promise.reject(new Error('not used')),
+			getTokenForProvider: async () => { throw new Error(`provider said ${PROVIDER}`); },
+			authentication: { providerId: 'example', scopes: ['read'] },
+			transport: async url => harnessResponse(200, url),
+		});
+		store.add(providerFails.handle);
+		await providerFails.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+
+		for (const [name, harness, errorName] of [
+			['authenticated 401', rejected, 'McpAuthorizationRejectedError'],
+			['server metadata getter', metadataFails, 'McpAuthenticationFailedError'],
+			['provided authentication getter', providerFails, 'McpAuthenticationFailedError'],
+		] as const) {
+			assert.ok(errorStateMessages(harness.states).some(m => m.includes(errorName)), `${name}: the failure is visible`);
+		}
+		for (const harness of [rejected, metadataFails, providerFails]) {
+			const published = [...harness.logs, ...harness.states.map(s => JSON.stringify(s))];
+			for (const line of published) {
+				for (const marker of [BODY, META, PROVIDER]) {
+					assert.ok(!line.includes(marker), `a marker reached a log line or the state: ${line}`);
+				}
+			}
+		}
+		assert.deepStrictEqual(providerFails.requests, [], 'no request without the authorization the server asked for');
 	});
 });
