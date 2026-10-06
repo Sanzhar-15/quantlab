@@ -1040,6 +1040,12 @@ const STORED_REVISIONS = 'stored_revisions';
  * knows of the sign-out. An empty list cannot carry it: a window that saw the sign-out keeps it in memory as well.
  */
 const SIGNED_OUT_SESSIONS = 'signed_out_sessions';
+/**
+ * An empty list is stored as one record that is not a session (it marks itself with this key, holds no credential, and has
+ * the shape of a stored token response so that the stored value stays a list of them): it carries the bookkeeping that the
+ * tokens of a non-empty list carry, so an empty list merges like any other.
+ */
+const SESSION_LIST_RECORD = 'session_list_record';
 const STORED_REVISIONS_MAX = 32;
 const SIGNED_OUT_SESSIONS_MAX = 32;
 const REMEMBERED_LISTS_MAX = 32;
@@ -1049,7 +1055,10 @@ const SAVE_ROUNDS_MAX = 5;
 /** A list of sessions as stored. */
 interface ISessionList {
 	readonly tokens: readonly ISessionToken[];
-	/** Its stored revisions, newest first. Empty when unknown: an empty list, or a list saved by an earlier version. */
+	/**
+	 * Its stored revisions, newest first. A list saved by an earlier version (no bookkeeping: an unversioned base) has
+	 * one revision derived from its content, so every window that reads it derives the same.
+	 */
 	readonly revisions: readonly string[];
 	/** The ids of sessions recently signed out, newest first. */
 	readonly signedOut: readonly string[];
@@ -1083,20 +1092,24 @@ function newestFirst(max: number, ...lists: (readonly string[])[]): string[] {
 	return [...new Set(lists.flat())].slice(0, max);
 }
 
-/** Reads a stored list. Rejects with {@link InvalidStoredSessionsError} when its session bookkeeping is malformed. */
+/**
+ * Reads a stored list. Rejects with {@link InvalidStoredSessionsError} when its session bookkeeping is malformed. A list
+ * saved by an earlier version (bare tokens, no bookkeeping) is an unversioned base: its sessions get ids derived from
+ * their access tokens, it gets one revision derived from them, and it records no sign-out.
+ */
 function readSessionList(stored: readonly IAuthorizationToken[]): ISessionList {
 	const tokens: ISessionToken[] = [];
 	let lists: { revisions: string[]; signedOut: string[] } | undefined;
-	let fromEarlierVersion = false;
+	let unversioned = 0;
 	for (const entry of stored) {
-		const { [STORED_REVISIONS]: revisions, [SIGNED_OUT_SESSIONS]: signedOut, ...token } = entry as IAuthorizationToken & { session_id?: unknown; revision?: unknown; [STORED_REVISIONS]?: unknown; [SIGNED_OUT_SESSIONS]?: unknown };
-		if (token.session_id === undefined && token.revision === undefined && revisions === undefined && signedOut === undefined) {
+		const { [STORED_REVISIONS]: revisions, [SIGNED_OUT_SESSIONS]: signedOut, [SESSION_LIST_RECORD]: listRecord, ...token } = entry as IAuthorizationToken & { session_id?: unknown; revision?: unknown; [STORED_REVISIONS]?: unknown; [SIGNED_OUT_SESSIONS]?: unknown; [SESSION_LIST_RECORD]?: unknown };
+		if (token.session_id === undefined && token.revision === undefined && revisions === undefined && signedOut === undefined && listRecord === undefined) {
 			const id = legacySessionId(entry);
 			tokens.push({ ...token, session_id: id, revision: id });
-			fromEarlierVersion = true;
+			unversioned++;
 			continue;
 		}
-		if (typeof token.session_id !== 'string' || typeof token.revision !== 'string' || !isStringList(revisions) || !revisions.length || !isStringList(signedOut)) {
+		if (!isStringList(revisions) || !revisions.length || !isStringList(signedOut)) {
 			throw new InvalidStoredSessionsError('A stored session has malformed session bookkeeping.');
 		}
 		if (!lists) {
@@ -1104,12 +1117,29 @@ function readSessionList(stored: readonly IAuthorizationToken[]): ISessionList {
 		} else if (!arraysEqual(lists.revisions, revisions) || !arraysEqual(lists.signedOut, signedOut)) {
 			throw new InvalidStoredSessionsError('The stored sessions disagree on the bookkeeping of their list.');
 		}
+		if (listRecord !== undefined) {
+			if (listRecord !== true || stored.length !== 1 || token.access_token !== '') {
+				throw new InvalidStoredSessionsError('The record of an empty session list is malformed or not alone.');
+			}
+			continue;
+		}
+		if (typeof token.session_id !== 'string' || typeof token.revision !== 'string') {
+			throw new InvalidStoredSessionsError('A stored session has malformed session bookkeeping.');
+		}
 		tokens.push({ ...token, session_id: token.session_id, revision: token.revision });
+	}
+	if (unversioned && lists) {
+		throw new InvalidStoredSessionsError('The stored sessions mix sessions with and without bookkeeping.');
 	}
 	if (new Set(tokens.map(t => t.session_id)).size !== tokens.length) {
 		throw new InvalidStoredSessionsError('Two stored sessions share a session id.');
 	}
-	return { tokens, revisions: fromEarlierVersion || !lists ? [] : lists.revisions, signedOut: lists ? lists.signedOut : [] };
+	if (!lists) {
+		const sha = new StringSHA1();
+		sha.update(tokens.map(t => t.session_id).sort().join(' '));
+		return { tokens, revisions: [`legacy-${sha.digest()}`], signedOut: [] };
+	}
+	return { tokens, revisions: lists.revisions, signedOut: lists.signedOut };
 }
 
 /** Whether two lists hold the same credentials: the same sessions, each at the same revision. */
@@ -1173,9 +1203,14 @@ function mergeSessions(base: readonly ISessionToken[], theirs: readonly ISession
  * stores is merged against the last list both include ({@link mergeSessions}), so a save that lands over another
  * window's never decides the outcome: a window whose change is missing from a stored list saves the merged sessions again.
  *
- * There is no compare-and-set at the storage boundary, and an EMPTY list carries no revisions: an empty list read from
- * another window is taken as written after the last list this window knew to be stored (its removals win). A session
- * that this window had saved, and that a window without it in view then overwrote with an empty list, is lost.
+ * Every saved list carries this bookkeeping, an empty one included ({@link SESSION_LIST_RECORD}). A list that shares
+ * no remembered revision with the sessions here (an unversioned list of an earlier version that this window did not
+ * start from, or one whose common revisions were forgotten) is merged against no common list: nothing here is dropped
+ * by it, only a sign-out it records removes a session, and two credentials of one session are both kept.
+ *
+ * There is no compare-and-set at the storage boundary: a window repairs a stored list that lacks its change only while
+ * it is open. A change saved by a window that closes before another window's save, made without that change in view,
+ * lands over it, is lost.
  */
 class TokenStore implements Disposable {
 	/** The sessions this window uses. They may hold a change that is not saved yet. */
@@ -1188,8 +1223,6 @@ class TokenStore implements Disposable {
 	private _stored: ISessionList;
 	/** Lists by stored revision, read or saved here: the merge base for a list another window stores. */
 	private readonly _lists = new Map<string, readonly ISessionToken[]>();
-	/** Empty lists saved here whose change has not been read back yet (an empty list carries no revision). */
-	private _unreadEmptySaves = 0;
 	/** Counts the lists read from storage, so that a save tells whether one was read while it ran. */
 	private _reads = 0;
 	private _saving = false;
@@ -1269,31 +1302,24 @@ class TokenStore implements Disposable {
 
 	/** The last list that both a stored list and the sessions here include. */
 	private _mergeBase(list: ISessionList): readonly ISessionToken[] {
-		if (list.revisions.length) {
-			for (const revision of list.revisions) {
-				const known = this._revisions.includes(revision) ? this._lists.get(revision) : undefined;
-				if (known) {
-					return known;
-				}
+		for (const revision of list.revisions) {
+			const known = this._revisions.includes(revision) ? this._lists.get(revision) : undefined;
+			if (known) {
+				return known;
 			}
-		} else if (!list.tokens.length && this._unreadEmptySaves > 0) {
-			// The empty list saved here, read back.
-			this._unreadEmptySaves--;
-			return list.tokens;
 		}
-		// No list known to both: the stored one is taken as written after the last list known to be stored.
-		return this._stored.tokens;
+		// No list known to both: nothing here is taken as removed by it (see the class comment).
+		this._logger.warn('The stored sessions share no known list with the sessions here; they are merged without dropping any session.');
+		return [];
 	}
 
 	private _remember(list: ISessionList): void {
-		if (list.revisions.length) {
-			this._lists.set(list.revisions[0], list.tokens);
-			for (const revision of this._lists.keys()) {
-				if (this._lists.size <= REMEMBERED_LISTS_MAX) {
-					break;
-				}
-				this._lists.delete(revision);
+		this._lists.set(list.revisions[0], list.tokens);
+		for (const revision of this._lists.keys()) {
+			if (this._lists.size <= REMEMBERED_LISTS_MAX) {
+				break;
 			}
+			this._lists.delete(revision);
 		}
 	}
 
@@ -1369,18 +1395,16 @@ class TokenStore implements Disposable {
 		const revisions = newestFirst(STORED_REVISIONS_MAX, [newRevision()], this._revisions);
 		const signedOut = this._signedOut;
 		this._revisions = revisions;
-		const list: ISessionList = { tokens, revisions: tokens.length ? revisions : [], signedOut: tokens.length ? signedOut : [] };
+		const list: ISessionList = { tokens, revisions, signedOut };
 		this._remember(list);
 		const reads = this._reads;
-		if (!tokens.length) {
-			this._unreadEmptySaves++;
-		}
+		const bookkeeping = { [STORED_REVISIONS]: revisions, [SIGNED_OUT_SESSIONS]: signedOut };
+		const stored: IAuthorizationToken[] = tokens.length
+			? tokens.map(token => Object.assign({}, token, bookkeeping))
+			: [Object.assign({ access_token: '', token_type: SESSION_LIST_RECORD, created_at: 0, [SESSION_LIST_RECORD]: true }, bookkeeping)];
 		try {
-			await this._persistence.set(tokens.map(token => Object.assign({}, token, { [STORED_REVISIONS]: revisions, [SIGNED_OUT_SESSIONS]: signedOut })));
+			await this._persistence.set(stored);
 		} catch (error) {
-			if (!tokens.length) {
-				this._unreadEmptySaves--;
-			}
 			// The tokens are credentials, and a storage error's text is not safe by construction: only the count and the
 			// error's class are logged and carried (no cause).
 			const failure = error instanceof Error ? error.name : typeof error;

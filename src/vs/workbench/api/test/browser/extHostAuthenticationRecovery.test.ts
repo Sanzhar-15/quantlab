@@ -299,7 +299,8 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		const writes = calls.writes;
 		await provider.removeSession(session.id);
 		assert.strictEqual(calls.writes, writes + 1, 'the retried sign-out writes the removal');
-		assert.deepStrictEqual(await stored(), [], 'durable state matches the reported result');
+		// F-SECRETS-6: an empty list is stored as one record of its bookkeeping (session_list_record), not as a session.
+		assert.deepStrictEqual((await stored()).filter(t => !(t as { session_list_record?: boolean }).session_list_record), [], 'durable state matches the reported result');
 		assert.deepStrictEqual(events, [{ added: [], removed: ['at-2'] }]);
 
 		const restarted = await createProvider(await stored());

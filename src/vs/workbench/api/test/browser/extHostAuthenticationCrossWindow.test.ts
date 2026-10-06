@@ -55,7 +55,7 @@ class RecordingLogger extends NullLogger {
  */
 class SharedSessionStorage {
 	private _value: string;
-	private readonly _windows: { emitter: Emitter<TokensChange>; providerId: () => string }[] = [];
+	private readonly _windows: { emitter: Emitter<TokensChange>; providerId: () => string; delayed: boolean; missed: boolean }[] = [];
 	private _pendingReads = 0;
 	private _pendingSaves = 0;
 
@@ -63,12 +63,32 @@ class SharedSessionStorage {
 		this._value = JSON.stringify(initial);
 	}
 
+	/** The stored sessions: the record that stands for an empty list (F-SECRETS-6) is not a session. */
 	get stored(): StoredToken[] {
+		return (JSON.parse(this._value) as (StoredToken & { session_list_record?: boolean })[]).filter(t => !t.session_list_record);
+	}
+
+	/** The raw stored value, for a window that reads it (as initial tokens). */
+	get raw(): StoredToken[] {
 		return JSON.parse(this._value);
 	}
 
-	connect(emitter: Emitter<TokensChange>, providerId: () => string): void {
-		this._windows.push({ emitter, providerId });
+	connect(emitter: Emitter<TokensChange>, providerId: () => string): number {
+		return this._windows.push({ emitter, providerId, delayed: false, missed: false }) - 1;
+	}
+
+	/** The reads of a window are held: it sees no change until {@link deliverDelayed}, then only the list stored then. */
+	delayReads(index: number): void {
+		this._windows[index].delayed = true;
+	}
+
+	deliverDelayed(index: number): void {
+		const target = this._windows[index];
+		target.delayed = false;
+		if (target.missed) {
+			target.missed = false;
+			target.emitter.fire({ authProviderId: target.providerId(), clientId: CLIENT_ID, tokens: JSON.parse(this._value) });
+		}
 	}
 
 	async save(tokens: unknown[]): Promise<void> {
@@ -77,7 +97,11 @@ class SharedSessionStorage {
 		setTimeout(() => {
 			this._pendingReads--;
 			for (const win of this._windows) {
-				win.emitter.fire({ authProviderId: win.providerId(), clientId: CLIENT_ID, tokens: JSON.parse(this._value) });
+				if (win.delayed) {
+					win.missed = true;
+				} else {
+					win.emitter.fire({ authProviderId: win.providerId(), clientId: CLIENT_ID, tokens: JSON.parse(this._value) });
+				}
 			}
 		}, 0);
 	}
@@ -134,6 +158,8 @@ suite('ExtHostAuthentication - dynamic auth sessions across windows', () => {
 	interface IWindow {
 		readonly provider: TestDynamicAuthProvider;
 		readonly logger: RecordingLogger;
+		/** Its index in the shared storage. */
+		readonly index: number;
 		/** The next saves of this window fail. */
 		failSaves: boolean;
 		/** When set, the next save of this window waits for it before it reaches storage. */
@@ -145,7 +171,7 @@ suite('ExtHostAuthentication - dynamic auth sessions across windows', () => {
 	function openWindow(storage: SharedSessionStorage): IWindow {
 		const logger = new RecordingLogger();
 		const emitter = store.add(new Emitter<TokensChange>());
-		const win: { -readonly [K in keyof IWindow]: IWindow[K] } = { provider: undefined!, logger, failSaves: false, hold: undefined, holding: false };
+		const win: { -readonly [K in keyof IWindow]: IWindow[K] } = { provider: undefined!, logger, index: -1, failSaves: false, hold: undefined, holding: false };
 		const proxy: Partial<MainThreadAuthenticationShape> = {
 			$setSessionsForDynamicAuthProvider: (_providerId, _clientId, sessions) => storage.track((async () => {
 				if (win.failSaves) {
@@ -175,11 +201,11 @@ suite('ExtHostAuthentication - dynamic auth sessions across windows', () => {
 			CLIENT_ID,
 			undefined,
 			emitter,
-			storage.stored,
+			storage.raw,
 		);
 		const provider = win.provider;
 		store.add({ dispose: () => provider.dispose() });
-		storage.connect(emitter, () => provider.id);
+		win.index = storage.connect(emitter, () => provider.id);
 		return win;
 	}
 
@@ -377,6 +403,31 @@ suite('ExtHostAuthentication - dynamic auth sessions across windows', () => {
 			await storage.settled();
 
 			assert.deepStrictEqual(credentials(storage.stored), [['at-other', '']], 'the sign-out lands, and the new session is not overwritten');
+			await assertAgree(storage, ['at-other'], here, there);
+		});
+	});
+
+	// An empty list carries the bookkeeping of any other list: it is merged like one.
+	suite('an empty list saved by a window that did not see a session', () => {
+
+		test('a session saved here survives an empty list another window saved without it in view; that window\'s sign-out stands', async () => {
+			const storage = new SharedSessionStorage([{ ...expiring, created_at: Date.now() }]);
+			const here = openWindow(storage), there = openWindow(storage);
+			const [session] = await there.provider.getSessions(undefined, {});
+			storage.delayReads(there.index);
+
+			here.provider.useTokenFlow({ access_token: 'at-other', token_type: 'Bearer', scope: 'other' });
+			await here.provider.createSession(['other'], {});
+			await storage.readsDelivered(); // this window reads its own list back: the sign-in is stored
+			assert.deepStrictEqual(credentials(storage.stored), [['at-1', 'rt-1'], ['at-other', '']]);
+
+			// The other window has not read the sign-in: signing out of its only session, it saves an empty list.
+			await there.provider.removeSession(session.id);
+			assert.deepStrictEqual(storage.stored, [], 'the empty list landed over the sign-in');
+			storage.deliverDelayed(there.index);
+			await storage.settled();
+
+			assert.deepStrictEqual(credentials(storage.stored), [['at-other', '']], 'the session saved here is not lost, and the sign-out stands');
 			await assertAgree(storage, ['at-other'], here, there);
 		});
 	});
