@@ -276,8 +276,13 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 			}
 		}
 
+		// review c1 S5: every path to here set its refusal; a missing one is a host defect, raised, never filled in
+		if (refusal === undefined) {
+			throw new Error('QuantLab host: a window was left unadopted without a refusal reason (host defect: onDidOpenCodeWindow)');
+		}
+
 		this.logService.error(`QuantLab host: a window was opened that the host cannot adopt (${refusal})`);
-		this.unadopted.push({ window: codeWindow, reason: refusal ?? 'unknown' });
+		this.unadopted.push({ window: codeWindow, reason: refusal });
 	}
 
 	private onWorkbenchGone(workbench: IAdoptedWorkbench): void {

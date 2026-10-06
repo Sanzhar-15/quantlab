@@ -46,6 +46,7 @@ import { IInstantiationService } from '../../instantiation/common/instantiation.
 import { VSBuffer } from '../../../base/common/buffer.js';
 import { errorHandler } from '../../../base/common/errors.js';
 import { FocusMode } from '../../native/common/native.js';
+import { formatWindowErrorDetails } from './windowErrorDetails.js';
 
 export interface IWindowCreationOptions {
 	readonly state: IWindowState;
@@ -856,7 +857,7 @@ export class CodeWindow extends BaseWindow implements ICodeWindow {
 
 		switch (type) {
 			case WindowError.PROCESS_GONE:
-				this.logService.error(`CodeWindow: renderer process gone (reason: ${details?.reason || '<unknown>'}, code: ${details?.exitCode || '<unknown>'})`);
+				this.logService.error(`CodeWindow: renderer process gone (${formatWindowErrorDetails(details)})`); // QuantLab host (c1 S5): code 0 stays 0
 				break;
 			case WindowError.UNRESPONSIVE:
 				this.logService.error('CodeWindow: detected unresponsive');
@@ -865,7 +866,7 @@ export class CodeWindow extends BaseWindow implements ICodeWindow {
 				this.logService.error('CodeWindow: recovered from unresponsive');
 				break;
 			case WindowError.LOAD:
-				this.logService.error(`CodeWindow: failed to load (reason: ${details?.reason || '<unknown>'}, code: ${details?.exitCode || '<unknown>'})`);
+				this.logService.error(`CodeWindow: failed to load (${formatWindowErrorDetails(details)})`); // QuantLab host (c1 S5): code 0 stays 0
 				break;
 		}
 
