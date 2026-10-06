@@ -80,13 +80,14 @@ export class RemoveDynamicAuthenticationProvidersAction extends Action2 {
 		for (const item of selected) {
 			const providerId = item.provider.providerId;
 
-			// Unregister from authentication service if still registered
+			// Remove from dynamic storage service first: a stored list that cannot be read (for example changed while the
+			// confirmation was open) or a removal that cannot be saved rejects here, and the provider stays registered.
+			await dynamicAuthStorageService.removeDynamicProvider(providerId);
+
+			// Unregister from authentication service if still registered, only once its stored data is removed
 			if (authenticationService.isAuthenticationProviderRegistered(providerId)) {
 				authenticationService.unregisterAuthenticationProvider(providerId);
 			}
-
-			// Remove from dynamic storage service
-			await dynamicAuthStorageService.removeDynamicProvider(providerId);
 		}
 	}
 }

@@ -287,6 +287,9 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 	}
 
 	async $registerDynamicAuthenticationProvider(details: IRegisterDynamicAuthenticationProviderDetails): Promise<void> {
+		// Validated and saved before it is published: a stored list that cannot be read, or a registration that cannot be
+		// saved, rejects here, and no provider is registered. The extension host publishes its side only after this resolves.
+		await this.dynamicAuthProviderStorageService.storeClientRegistration(details.id, URI.revive(details.authorizationServer).toString(true), details.clientId, details.clientSecret, details.label);
 		await this.$registerAuthenticationProvider({
 			id: details.id,
 			label: details.label,
@@ -294,7 +297,6 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 			supportedAuthorizationServers: [details.authorizationServer],
 			resourceServer: details.resourceServer,
 		});
-		await this.dynamicAuthProviderStorageService.storeClientRegistration(details.id, URI.revive(details.authorizationServer).toString(true), details.clientId, details.clientSecret, details.label);
 	}
 
 	async $setSessionsForDynamicAuthProvider(authProviderId: string, clientId: string, sessions: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<void> {

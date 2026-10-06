@@ -312,39 +312,40 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 			initialTokens || []
 		);
 
-		// Use the sequencer to ensure dynamic provider registration is serialized
-		await this._providerOperations.queue(provider.id, async () => {
-			this._authenticationProviders.set(
-				provider.id,
-				{
+		// Use the sequencer to ensure dynamic provider registration is serialized. A call for this provider from the main
+		// thread (which publishes it once saved) queues behind this operation, so it finds the provider installed below.
+		try {
+			await this._providerOperations.queue(provider.id, async () => {
+				// The main thread validates and saves the registration before it publishes the provider; it is installed here
+				// only after that resolves. A client-ID change is saved by the provider itself (_generateNewClientId).
+				await this._proxy.$registerDynamicAuthenticationProvider({
+					id: provider.id,
 					label: provider.label,
-					provider,
-					disposable: Disposable.from(
+					supportsMultipleAccounts: true,
+					authorizationServer: authorizationServerComponents,
+					resourceServer: resourceMetadata ? URI.parse(resourceMetadata.resource) : undefined,
+					clientId: provider.clientId,
+					clientSecret: provider.clientSecret
+				});
+
+				this._authenticationProviders.set(
+					provider.id,
+					{
+						label: provider.label,
 						provider,
-						provider.onDidChangeSessions(e => this._proxy.$sendDidChangeSessions(provider.id, e)),
-						provider.onDidChangeClientId(() => this._proxy.$sendDidChangeDynamicProviderInfo({
-							providerId: provider.id,
-							clientId: provider.clientId,
-							clientSecret: provider.clientSecret
-						}))
-					),
-					options: { supportsMultipleAccounts: true }
-				}
-			);
-
-			await this._proxy.$registerDynamicAuthenticationProvider({
-				id: provider.id,
-				label: provider.label,
-				supportsMultipleAccounts: true,
-				authorizationServer: authorizationServerComponents,
-				resourceServer: resourceMetadata ? URI.parse(resourceMetadata.resource) : undefined,
-				clientId: provider.clientId,
-				clientSecret: provider.clientSecret
+						disposable: Disposable.from(
+							provider,
+							provider.onDidChangeSessions(e => this._proxy.$sendDidChangeSessions(provider.id, e))
+						),
+						options: { supportsMultipleAccounts: true }
+					}
+				);
 			});
-		});
-
-
-
+		} catch (error) {
+			// Not saved, so published on neither side: the provisional provider is disposed and the rejection is the caller's.
+			provider.dispose();
+			throw error;
+		}
 
 		return provider.id;
 	}
@@ -880,12 +881,24 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		throw new Error(`Invalid authorization token response: ${JSON.stringify(result)}`);
 	}
 
+	/**
+	 * Obtains a new client registration and adopts it. It is saved (awaited) before it is used: a save that rejects rejects
+	 * this call and the client ID and secret in use stay the previous ones. {@link onDidChangeClientId} only notifies, after.
+	 */
 	protected async _generateNewClientId(): Promise<void> {
+		const { clientId, clientSecret } = await this._fetchNewClientRegistration();
+		// Outside the registration-to-prompt fallback: a failed save is not a failed registration and prompts nobody.
+		await this._proxy.$sendDidChangeDynamicProviderInfo({ providerId: this.id, clientId, clientSecret });
+		this._clientId = clientId;
+		this._clientSecret = clientSecret;
+		this._onDidChangeClientId.fire();
+	}
+
+	/** Dynamic client registration; when it fails, the user is prompted for a client ID and client secret. Saves nothing. */
+	private async _fetchNewClientRegistration(): Promise<{ clientId: string; clientSecret: string | undefined }> {
+		let registration: { client_id: string; client_secret?: string };
 		try {
-			const registration = await fetchDynamicRegistration(this._serverMetadata, this._initData.environment.appName, this._resourceMetadata?.scopes_supported);
-			this._clientId = registration.client_id;
-			this._clientSecret = registration.client_secret;
-			this._onDidChangeClientId.fire();
+			registration = await fetchDynamicRegistration(this._serverMetadata, this._initData.environment.appName, this._resourceMetadata?.scopes_supported);
 		} catch (err) {
 			// When DCR fails, try to prompt the user for a client ID and client secret
 			this._logger.info(`Dynamic registration failed for ${this.authorizationServer.toString()}: ${err}. Prompting user for client ID and client secret.`);
@@ -895,21 +908,19 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				if (!clientDetails) {
 					throw new Error('User did not provide client details');
 				}
-				this._clientId = clientDetails.clientId;
-				this._clientSecret = clientDetails.clientSecret;
 				this._logger.info(`User provided client ID for ${this.authorizationServer.toString()}`);
 				if (clientDetails.clientSecret) {
 					this._logger.info(`User provided client secret for ${this.authorizationServer.toString()}`);
 				} else {
 					this._logger.info(`User did not provide client secret for ${this.authorizationServer.toString()} (optional)`);
 				}
-
-				this._onDidChangeClientId.fire();
+				return { clientId: clientDetails.clientId, clientSecret: clientDetails.clientSecret };
 			} catch (promptErr) {
 				this._logger.error(`Failed to fetch new client ID and user did not provide one: ${err}`);
 				throw new Error(`Failed to fetch new client ID and user did not provide one: ${err}`);
 			}
 		}
+		return { clientId: registration.client_id, clientSecret: registration.client_secret };
 	}
 }
 
