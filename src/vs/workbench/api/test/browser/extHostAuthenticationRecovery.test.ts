@@ -14,6 +14,7 @@ import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import { ILogger, ILoggerService, NullLogger, NullLogService } from '../../../../platform/log/common/log.js';
 import { IQuickInputService } from '../../../../platform/quickinput/common/quickInput.js';
+import { SecretStorageUnavailableError } from '../../../../platform/secrets/common/secrets.js';
 import { TestSecretStorageService } from '../../../../platform/secrets/test/common/testSecretStorageService.js';
 import { StorageScope } from '../../../../platform/storage/common/storage.js';
 import { RemoveDynamicAuthenticationProvidersAction } from '../../../contrib/authentication/browser/actions/manageDynamicAuthenticationProvidersAction.js';
@@ -22,7 +23,7 @@ import { IAuthenticationService } from '../../../services/authentication/common/
 import { IDynamicAuthenticationProviderStorageService } from '../../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
 import { TestStorageService } from '../../../test/common/workbenchTestServices.js';
 import { MainThreadAuthenticationShape } from '../../common/extHost.protocol.js';
-import { DynamicAuthClientRejectedError, DynamicAuthProvider, DynamicAuthSessionRefreshError } from '../../common/extHostAuthentication.js';
+import { DynamicAuthClientRejectedError, DynamicAuthProvider, DynamicAuthSessionPersistError, DynamicAuthSessionRefreshError } from '../../common/extHostAuthentication.js';
 import { IExtHostInitDataService } from '../../common/extHostInitDataService.js';
 import { IExtHostProgress } from '../../common/extHostProgress.js';
 import { IExtHostUrlsService } from '../../common/extHostUrls.js';
@@ -48,9 +49,11 @@ class TestDynamicAuthProvider extends DynamicAuthProvider {
 
 class RecordingLogger extends NullLogger {
 	readonly lines: string[] = [];
+	readonly errors: string[] = [];
+	override trace(message: string): void { this.lines.push(message); }
 	override info(message: string): void { this.lines.push(message); }
 	override warn(message: string): void { this.lines.push(message); }
-	override error(message: string | Error): void { this.lines.push(String(message)); }
+	override error(message: string | Error): void { this.lines.push(String(message)); this.errors.push(String(message)); }
 }
 
 // F-SECRETS-3: a failed refresh or an invalid-client answer keeps the stored sessions and the client registration; the
@@ -83,9 +86,11 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		const storageService = store.add(new TestStorageService());
 		const secrets = store.add(new TestSecretStorageService());
 		const dynamicStorage = store.add(new DynamicAuthenticationProviderStorageService(storageService, secrets, new NullLogService()));
-		const calls = { continuePrompts: 0, registrationPrompts: 0 };
+		const calls = { continuePrompts: 0, registrationPrompts: 0, failPersistence: false };
 		const proxy: Partial<MainThreadAuthenticationShape> = {
-			$setSessionsForDynamicAuthProvider: (providerId, clientId, sessions) => dynamicStorage.setSessionsForDynamicAuthProvider(providerId, clientId, sessions),
+			$setSessionsForDynamicAuthProvider: (providerId, clientId, sessions) => calls.failPersistence
+				? Promise.reject(new SecretStorageUnavailableError())
+				: dynamicStorage.setSessionsForDynamicAuthProvider(providerId, clientId, sessions),
 			$showContinueNotification: async () => { calls.continuePrompts++; return false; },
 			$promptForClientRegistration: async () => { calls.registrationPrompts++; return { clientId: 'client-typed' }; },
 		};
@@ -183,6 +188,27 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		assert.strictEqual(calls.continuePrompts, 0, 'no "try a different way": every flow uses the same registration');
 		assert.strictEqual(calls.registrationPrompts, 0);
 		assert.ok(fetchStub.getCalls().every(c => String(c.args[0]) !== REGISTRATION_ENDPOINT), 'no dynamic registration request');
+	});
+
+	test('a refreshed session that cannot be saved rejects, named, after one error line without token text', async () => {
+		respondWith(async () => new Response(JSON.stringify({ access_token: 'at-2', refresh_token: 'rt-2', token_type: 'Bearer', scope: 'read', expires_in: 3600 }), { status: 200 }));
+		const { provider, snapshot, calls, logger } = await createProvider([expiredRefreshable]);
+		const before = await snapshot();
+		calls.failPersistence = true;
+
+		await assert.rejects(provider.getSessions(['read'], {}), (e: unknown) => {
+			assert.ok(e instanceof DynamicAuthSessionPersistError, `expected DynamicAuthSessionPersistError, got ${e}`);
+			assert.ok(!/at-[12]|rt-[12]/.test(e.message), 'the error carries no token');
+			return true;
+		});
+
+		assert.strictEqual(logger.errors.length, 1, logger.errors.join('\n'));
+		assert.ok(logger.errors[0].includes('Failed to save') && logger.errors[0].includes('SecretStorageUnavailableError'), logger.errors[0]);
+		for (const line of logger.lines) {
+			assert.ok(!/at-[12]|rt-[12]/.test(line), `a log line holds token text: ${line}`);
+		}
+		assert.strictEqual(await snapshot(), before, 'the stored sessions are untouched by the failed save');
+		assert.deepStrictEqual((await provider.getSessions(undefined, {})).map(s => s.accessToken), ['at-2'], 'the refreshed session is kept in memory');
 	});
 
 	test('the explicit reset removes exactly the selected provider: its list entry, client registration and sessions', async () => {

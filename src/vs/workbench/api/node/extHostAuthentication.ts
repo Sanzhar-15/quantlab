@@ -6,7 +6,7 @@
 import * as nls from '../../../nls.js';
 import type * as vscode from 'vscode';
 import { URL } from 'url';
-import { ExtHostAuthentication, DynamicAuthProvider, IExtHostAuthentication } from '../common/extHostAuthentication.js';
+import { ExtHostAuthentication, DynamicAuthClientRejectedError, DynamicAuthProvider, IExtHostAuthentication } from '../common/extHostAuthentication.js';
 import { IExtHostRpcService } from '../common/extHostRpcService.js';
 import { IExtHostInitDataService } from '../common/extHostInitDataService.js';
 import { IExtHostWindow } from '../common/extHostWindow.js';
@@ -299,15 +299,14 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 					} else if (errorData.error === AuthorizationDeviceCodeErrorType.AccessDenied) {
 						throw new CancellationError();
 					} else if (errorData.error === AuthorizationErrorType.InvalidClient) {
-						this._logger.warn(`Client ID (${this._clientId}) was invalid, generated a new one.`);
-						await this._generateNewClientId();
-						throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
+						this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
+						throw new DynamicAuthClientRejectedError(this.id, this.label);
 					} else {
 						throw new Error(`Token request failed: ${errorData.error_description || errorData.error || 'Unknown error'}`);
 					}
 				}
 			} catch (error) {
-				if (isCancellationError(error)) {
+				if (isCancellationError(error) || error instanceof DynamicAuthClientRejectedError) {
 					throw error;
 				}
 				throw new Error(`Error polling for token: ${error}`);

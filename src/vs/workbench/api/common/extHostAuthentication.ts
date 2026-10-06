@@ -386,6 +386,17 @@ export class DynamicAuthClientRejectedError extends Error {
 	}
 }
 
+/**
+ * Changed sessions could not be saved to secret storage (for example encryption is unavailable). They are kept in memory
+ * for this window only; the previously stored sessions are not touched by this failure. The message carries no token.
+ */
+export class DynamicAuthSessionPersistError extends Error {
+	override readonly name = 'DynamicAuthSessionPersistError';
+	constructor(count: number, options?: { cause?: unknown }) {
+		super(`${count} session(s) could not be saved to secret storage; they are kept in memory for this window only and are lost on restart.`, options);
+	}
+}
+
 export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	readonly id: string;
 	readonly label: string;
@@ -517,7 +528,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			const failedRefreshTokens = removedTokens.filter(t => t.refresh_token && !refreshedTokens.has(t));
 			const settledTokens = removedTokens.filter(t => !failedRefreshTokens.includes(t));
 			if (newTokens.length || settledTokens.length) {
-				this._tokenStore.update({ added: newTokens, removed: settledTokens });
+				await this._tokenStore.update({ added: newTokens, removed: settledTokens });
 				// Since we updated the tokens, we need to re-filter the sessions
 				// to get the latest state
 				sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
@@ -577,7 +588,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		}
 
 		// Store session for later retrieval
-		this._tokenStore.update({ added: [{ ...token, created_at: Date.now() }], removed: [] });
+		await this._tokenStore.update({ added: [{ ...token, created_at: Date.now() }], removed: [] });
 		const session = this._tokenStore.sessions.find(t => t.accessToken === token.access_token)!;
 		this._logger.info(`Created ${token.refresh_token ? 'refreshable' : 'non-refreshable'} session for scopes: ${token.scope}${token.expires_in ? ` that expires in ${token.expires_in} seconds` : ''}`);
 		return session;
@@ -595,7 +606,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			this._logger.error(`Failed to retrieve token for removed session: ${session.id}`);
 			return;
 		}
-		this._tokenStore.update({ added: [], removed: [token] });
+		await this._tokenStore.update({ added: [], removed: [token] });
 		this._logger.info(`Removed token for session: ${session.id} with scopes: ${session.scopes.join(' ')}`);
 	}
 
@@ -860,7 +871,7 @@ class TokenStore implements Disposable {
 	private readonly _disposable: DisposableStore;
 
 	constructor(
-		private readonly _persistence: { onDidChange: Event<IAuthorizationToken[]>; set: (tokens: IAuthorizationToken[]) => void },
+		private readonly _persistence: { onDidChange: Event<IAuthorizationToken[]>; set: (tokens: IAuthorizationToken[]) => Promise<void> },
 		initialTokens: IAuthorizationToken[],
 		private readonly _logger: ILogger
 	) {
@@ -886,7 +897,10 @@ class TokenStore implements Disposable {
 		this._disposable.dispose();
 	}
 
-	update({ added, removed }: { added: IAuthorizationToken[]; removed: IAuthorizationToken[] }): void {
+	/**
+	 * Rejects with {@link DynamicAuthSessionPersistError} when the changed tokens cannot be saved, after one error line.
+	 */
+	async update({ added, removed }: { added: IAuthorizationToken[]; removed: IAuthorizationToken[] }): Promise<void> {
 		this._logger.trace(`Updating tokens: added ${added.length}, removed ${removed.length}`);
 		const currentTokens = [...this._tokensObservable.get()];
 		for (const token of removed) {
@@ -905,7 +919,13 @@ class TokenStore implements Disposable {
 		}
 		if (added.length || removed.length) {
 			this._tokensObservable.set(currentTokens, undefined);
-			void this._persistence.set(currentTokens);
+			try {
+				await this._persistence.set(currentTokens);
+			} catch (error) {
+				// The tokens are credentials: only their count and the failure are logged.
+				this._logger.error(`Failed to save ${currentTokens.length} token(s) to secret storage: ${error}`);
+				throw new DynamicAuthSessionPersistError(currentTokens.length, { cause: error });
+			}
 		}
 		this._logger.trace(`Tokens updated: ${currentTokens.length} tokens stored.`);
 	}
