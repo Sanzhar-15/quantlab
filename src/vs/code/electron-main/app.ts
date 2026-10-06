@@ -1441,6 +1441,14 @@ export class CodeApplication extends Disposable {
 				} else if (event.message === 'ql-test:toggle') {
 					this.logService.info('QuantLab host: test build: toggle requested by the test driver');
 					qlWorkbenchHost.requestToggle('test driver toggle');
+				} else if (event.message === 'ql-test:overlay-hide') {
+					// O4's NEGATIVE (PLAN-FINAL 3.5): the open overlay is hidden natively, so the composited capture must FAIL
+					const overlay = terminalHost.view('overlay');
+					if (!overlay) {
+						throw new Error('QuantLab host (DRIVER): ql-test:overlay-hide: the overlay is not open');
+					}
+					overlay.setVisible(false);
+					this.logService.info('QuantLab host: test build: the overlay view was hidden by the test driver (O4 negative)');
 				}
 			});
 		}
