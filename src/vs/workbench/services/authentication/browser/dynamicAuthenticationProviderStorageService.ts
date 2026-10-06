@@ -12,6 +12,7 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { Queue } from '../../../../base/common/async.js';
+import { runAtBoundary } from '../common/storedSecretBoundary.js';
 
 function isOptionalString(value: unknown): boolean {
 	return value === undefined || typeof value === 'string';
@@ -58,7 +59,7 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		super();
 
 		// Listen for secret storage changes and emit events for dynamic auth provider token changes
-		const queue = new Queue<void>();
+		const queue = new Queue<boolean>();
 		this._register(this.secretStorageService.onDidChangeSecret(async (key: string) => {
 			let payload: { isDynamicAuthProvider: boolean; authProviderId: string; clientId: string } | undefined;
 			try {
@@ -67,14 +68,15 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 				// Ignore errors... must not be a dynamic auth provider
 			}
 			if (payload?.isDynamicAuthProvider) {
-				void queue.queue(async () => {
+				// A stored-read failure is logged and no event fires for it; the queue stays usable for the next change.
+				void queue.queue(() => runAtBoundary(async () => {
 					const tokens = await this.getSessionsForDynamicAuthProvider(payload.authProviderId, payload.clientId);
 					this._onDidChangeTokens.fire({
 						authProviderId: payload.authProviderId,
 						clientId: payload.clientId,
 						tokens
 					});
-				});
+				}, error => this.logService.error(`Could not read the stored sessions of ${payload.authProviderId} (${payload.clientId}) after a change; they are kept.`, error)));
 			}
 		}));
 	}

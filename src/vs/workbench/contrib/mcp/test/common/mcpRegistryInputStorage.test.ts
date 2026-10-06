@@ -5,6 +5,7 @@
 
 import * as assert from 'assert';
 import { encodeBase64, VSBuffer } from '../../../../../base/common/buffer.js';
+import { Event } from '../../../../../base/common/event.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { ILogService, NullLogService } from '../../../../../platform/log/common/log.js';
 import { InvalidStoredSecretError, SecretDecryptionError } from '../../../../../platform/secrets/common/secrets.js';
@@ -426,6 +427,205 @@ suite('Workbench - MCP - RegistryInputStorage', () => {
 			assert.deepStrictEqual(await createInstance(secrets).getMap(), {});
 			assert.strictEqual(secrets.setCalls, 0);
 			assert.strictEqual(storedInputs(), undefined);
+		});
+	});
+
+	// F-SECRETS-1 review c1 (SHOULD-8): a cached imported key follows its stored value, and a malformed shared key has an
+	// explicit recovery route that never runs because inputs were cleared.
+	suite('encryption key lifecycle', () => {
+		const keyName = 'mcpEncryptionKey';
+
+		class CountingSecretStorageService extends TestSecretStorageService {
+			setCalls = 0;
+			deleteCalls = 0;
+			override async set(key: string, value: string): Promise<void> {
+				this.setCalls++;
+				return super.set(key, value);
+			}
+			override async delete(key: string): Promise<void> {
+				this.deleteCalls++;
+				return super.delete(key);
+			}
+		}
+
+		/** A secret store that never announces a change, as a store whose change event is not delivered. */
+		class SilentSecretStorageService extends TestSecretStorageService {
+			override readonly onDidChangeSecret = Event.None;
+		}
+
+		function createInstance(secrets: TestSecretStorageService, scope: StorageScope = StorageScope.APPLICATION): McpRegistryInputStorage {
+			return store.add(new McpRegistryInputStorage(scope, StorageTarget.MACHINE, testStorageService, secrets, testLogService));
+		}
+
+		function storedInputs(scope: StorageScope = StorageScope.APPLICATION): string | undefined {
+			return testStorageService.get('mcpInputs', scope);
+		}
+
+		async function newKeyText(): Promise<string> {
+			const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+			return JSON.stringify(await crypto.subtle.exportKey('jwk', key));
+		}
+
+		const notAKey = 'not a key {';
+
+		test('restoring the correct key after an unseal failure is read by the same instance (a store that announces changes)', async () => {
+			const secrets = new CountingSecretStorageService();
+			const first = createInstance(secrets);
+			await first.setSecrets({ 'secretKey1': { value: 'secretValue1' } });
+			await testStorageService.flush();
+			const correctKey = (await secrets.get(keyName))!;
+
+			await secrets.set(keyName, await newKeyText());
+			const second = createInstance(secrets);
+			await assert.rejects(second.getMap(), (e: unknown) => e instanceof InvalidStoredSecretError && e.key === 'mcpInputs');
+
+			await secrets.set(keyName, correctKey);
+			assert.strictEqual((await second.getMap()).secretKey1.value, 'secretValue1');
+		});
+
+		test('restoring the correct key after an unseal failure is read by the same instance (a store that does not announce changes)', async () => {
+			const secrets = new SilentSecretStorageService();
+			const first = createInstance(secrets);
+			await first.setSecrets({ 'secretKey1': { value: 'secretValue1' } });
+			await testStorageService.flush();
+			const correctKey = (await secrets.get(keyName))!;
+
+			await secrets.set(keyName, await newKeyText());
+			const second = createInstance(secrets);
+			await assert.rejects(second.getMap(), (e: unknown) => e instanceof InvalidStoredSecretError && e.key === 'mcpInputs');
+
+			await secrets.set(keyName, correctKey);
+			assert.strictEqual((await second.getMap()).secretKey1.value, 'secretValue1');
+		});
+
+		test('a key whose stored value changed is imported again before the next sealing', async () => {
+			const secrets = new CountingSecretStorageService();
+			const first = createInstance(secrets);
+			await first.setSecrets({ 'a': { value: 'valueA' } });
+			const replacement = await newKeyText();
+			await secrets.set(keyName, replacement);
+
+			await first.setSecrets({ 'b': { value: 'valueB' } });
+			await testStorageService.flush();
+
+			// Sealed with the key that is stored now, not with the one imported before it changed.
+			assert.strictEqual(await secrets.get(keyName), replacement);
+			const second = createInstance(secrets);
+			const map = await second.getMap();
+			assert.strictEqual(map.a.value, 'valueA');
+			assert.strictEqual(map.b.value, 'valueB');
+		});
+
+		suite('a malformed shared key, in both scopes', () => {
+			let secrets: CountingSecretStorageService;
+			let profileSealed: string;
+			let workspaceSealed: string;
+
+			setup(async () => {
+				secrets = new CountingSecretStorageService();
+				const profile = createInstance(secrets, StorageScope.PROFILE);
+				const workspace = createInstance(secrets, StorageScope.WORKSPACE);
+				await profile.setPlainText({ 'pPlain': { value: 'profile-plain' } });
+				await profile.setSecrets({ 'pSecret': { value: 'profile-secret' } });
+				await workspace.setPlainText({ 'wPlain': { value: 'workspace-plain' } });
+				await workspace.setSecrets({ 'wSecret': { value: 'workspace-secret' } });
+				await testStorageService.flush();
+				profileSealed = storedInputs(StorageScope.PROFILE)!;
+				workspaceSealed = storedInputs(StorageScope.WORKSPACE)!;
+				assert.ok(profileSealed.includes('"secrets"') && workspaceSealed.includes('"secrets"'));
+
+				await secrets.set(keyName, notAKey);
+				secrets.setCalls = 0;
+				secrets.deleteCalls = 0;
+			});
+
+			function namedKey(e: unknown): boolean {
+				return e instanceof InvalidStoredSecretError && e.key === keyName && !e.message.includes(notAKey);
+			}
+
+			test('clearing the inputs of one scope does not delete the shared key, and the other scope is untouched', async () => {
+				const profile = createInstance(secrets, StorageScope.PROFILE);
+				const workspace = createInstance(secrets, StorageScope.WORKSPACE);
+				await assert.rejects(profile.getMap(), namedKey);
+				await assert.rejects(workspace.getMap(), namedKey);
+
+				profile.clearAll();
+				await assert.rejects(profile.setSecrets({ 'k': { value: 'v' } }), namedKey);
+				await testStorageService.flush();
+
+				assert.strictEqual(await secrets.get(keyName), notAKey);
+				assert.strictEqual(secrets.deleteCalls, 0);
+				assert.strictEqual(secrets.setCalls, 0);
+				assert.strictEqual(storedInputs(StorageScope.WORKSPACE), workspaceSealed);
+				await assert.rejects(workspace.getMap(), namedKey);
+			});
+
+			test('resetUnusableEncryptionKey, an explicit act, deletes the key, drops this scope\'s sealed secrets and keeps its plain values', async () => {
+				const profile = createInstance(secrets, StorageScope.PROFILE);
+				await assert.rejects(profile.getMap(), namedKey);
+
+				await profile.resetUnusableEncryptionKey();
+
+				assert.strictEqual(await secrets.get(keyName), undefined);
+				assert.strictEqual(secrets.deleteCalls, 1);
+				assert.deepStrictEqual(await profile.getMap(), { 'pPlain': { value: 'profile-plain' } });
+				// A new key is made at the next sealing, and sealing works again.
+				await profile.setSecrets({ 'pSecret2': { value: 'profile-secret2' } });
+				assert.strictEqual(secrets.setCalls, 1);
+				assert.ok(await secrets.get(keyName));
+				await testStorageService.flush();
+				const map = await createInstance(secrets, StorageScope.PROFILE).getMap();
+				assert.strictEqual(map.pPlain.value, 'profile-plain');
+				assert.strictEqual(map.pSecret2.value, 'profile-secret2');
+				assert.strictEqual(map.pSecret, undefined);
+			});
+
+			test('the other scope keeps its sealed secrets after a reset, until its own explicit discard; its plain values survive both', async () => {
+				const profile = createInstance(secrets, StorageScope.PROFILE);
+				await profile.resetUnusableEncryptionKey();
+				await profile.setSecrets({ 'pSecret2': { value: 'profile-secret2' } });
+				await testStorageService.flush();
+
+				const workspace = createInstance(secrets, StorageScope.WORKSPACE);
+				await assert.rejects(workspace.getMap(), (e: unknown) => e instanceof InvalidStoredSecretError && e.key === 'mcpInputs');
+				await testStorageService.flush();
+				assert.strictEqual(storedInputs(StorageScope.WORKSPACE), workspaceSealed);
+
+				workspace.discardSealedSecrets();
+				assert.deepStrictEqual(await workspace.getMap(), { 'wPlain': { value: 'workspace-plain' } });
+				await testStorageService.flush();
+				const stored = JSON.parse(storedInputs(StorageScope.WORKSPACE)!);
+				assert.strictEqual(stored.secrets, undefined);
+				assert.strictEqual(stored.values.wPlain.value, 'workspace-plain');
+			});
+
+			test('resetUnusableEncryptionKey never deletes a key that can be used', async () => {
+				const good = await newKeyText();
+				await secrets.set(keyName, good);
+				secrets.setCalls = 0;
+
+				await assert.rejects(createInstance(secrets, StorageScope.PROFILE).resetUnusableEncryptionKey(), /is a usable key; it is kept/);
+				assert.strictEqual(await secrets.get(keyName), good);
+				assert.strictEqual(secrets.deleteCalls, 0);
+				assert.strictEqual(secrets.setCalls, 0);
+			});
+
+			test('resetUnusableEncryptionKey leaves the key in place when this scope\'s record cannot be read', async () => {
+				testStorageService.store('mcpInputs', JSON.stringify({ ...JSON.parse(profileSealed), version: 2 }), StorageScope.PROFILE, StorageTarget.MACHINE);
+				const unreadable = storedInputs(StorageScope.PROFILE);
+
+				await assert.rejects(createInstance(secrets, StorageScope.PROFILE).resetUnusableEncryptionKey(), (e: unknown) => e instanceof InvalidStoredSecretError && e.key === 'mcpInputs');
+				assert.strictEqual(await secrets.get(keyName), notAKey);
+				assert.strictEqual(secrets.deleteCalls, 0);
+				assert.strictEqual(storedInputs(StorageScope.PROFILE), unreadable);
+			});
+		});
+
+		test('resetUnusableEncryptionKey with no stored key rejects: there is nothing to reset', async () => {
+			const secrets = new CountingSecretStorageService();
+			await assert.rejects(createInstance(secrets).resetUnusableEncryptionKey(), /does not exist/);
+			assert.strictEqual(secrets.deleteCalls, 0);
+			assert.strictEqual(secrets.setCalls, 0);
 		});
 	});
 });

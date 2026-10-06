@@ -53,9 +53,31 @@ export class McpRegistryInputStorage extends Disposable {
 
 	private _encryptionKey: Promise<CryptoKey> | undefined;
 
+	/** Imports the stored key text. It never quotes the text, and a failure is named and keeps the stored key. */
+	private async _importStoredKey(existing: string): Promise<CryptoKey> {
+		let parsed: JsonWebKey;
+		try {
+			parsed = JSON.parse(existing);
+		} catch {
+			// The parse error quotes the stored text, so it is not carried.
+			throw new InvalidStoredSecretError(MCP_ENCRYPTION_KEY_NAME, 'is not valid JSON');
+		}
+		try {
+			return await crypto.subtle.importKey('jwk', parsed, MCP_ENCRYPTION_KEY_ALGORITHM, false, ['encrypt', 'decrypt']);
+		} catch (e) {
+			throw new InvalidStoredSecretError(MCP_ENCRYPTION_KEY_NAME, 'is not a usable encryption key', { cause: e });
+		}
+	}
+
+	/** Forgets the imported key, so that the next use reads the stored key again. */
+	private _forgetEncryptionKey(): void {
+		this._encryptionKey = undefined;
+	}
+
 	/**
 	 * The key that seals the input secrets. A new key is made only when none is stored; a stored key that cannot be
-	 * read rejects and is kept. A rejection is not remembered: the next call reads the secret store again.
+	 * read rejects and is kept. A rejection is not remembered: the next call reads the secret store again. The imported
+	 * key is not remembered past a change of the stored key (see the constructor) or a failed unseal.
 	 */
 	private _getEncryptionKey(): Promise<CryptoKey> {
 		if (this._encryptionKey) {
@@ -65,18 +87,7 @@ export class McpRegistryInputStorage extends Disposable {
 			const existing = await this._secretStorageService.get(MCP_ENCRYPTION_KEY_NAME);
 			// Only undefined is absence: a stored empty string is a present key that is unusable, and is kept.
 			if (existing !== undefined) {
-				let parsed: JsonWebKey;
-				try {
-					parsed = JSON.parse(existing);
-				} catch {
-					// The parse error quotes the stored text, so it is not carried.
-					throw new InvalidStoredSecretError(MCP_ENCRYPTION_KEY_NAME, 'is not valid JSON');
-				}
-				try {
-					return await crypto.subtle.importKey('jwk', parsed, MCP_ENCRYPTION_KEY_ALGORITHM, false, ['encrypt', 'decrypt']);
-				} catch (e) {
-					throw new InvalidStoredSecretError(MCP_ENCRYPTION_KEY_NAME, 'is not a usable encryption key', { cause: e });
-				}
+				return this._importStoredKey(existing);
 			}
 
 			const key = await crypto.subtle.generateKey(
@@ -153,6 +164,14 @@ export class McpRegistryInputStorage extends Disposable {
 	) {
 		super();
 
+		// The key is shared by both scopes: a change of its stored value, by either scope or another window, makes the
+		// imported key stale, so the next use reads it again.
+		this._register(_secretStorageService.onDidChangeSecret(key => {
+			if (key === MCP_ENCRYPTION_KEY_NAME) {
+				this._forgetEncryptionKey();
+			}
+		}));
+
 		this._register(_storageService.onWillSaveState(() => {
 			if (this._didChange) {
 				// _didChange is only set after the record was read, so this never hydrates.
@@ -172,6 +191,46 @@ export class McpRegistryInputStorage extends Disposable {
 		// An explicit act of the user: it starts an empty record whether or not the stored one could be read.
 		this._hydrated = { version: MCP_DATA_STORED_VERSION, values: {} };
 		this._didChange = true;
+	}
+
+	/**
+	 * Explicit recovery of this scope's sealed secrets: drops them and keeps the plain values. It is for the user who
+	 * accepts that sealed secrets which cannot be unsealed are lost. It never touches the shared encryption key and
+	 * never the other scope.
+	 */
+	public discardSealedSecrets(): void {
+		const record = this._getRecord();
+		record.secrets = undefined;
+		record.unsealedSecrets = undefined;
+		this._didChange = true;
+	}
+
+	/**
+	 * Explicit recovery of a stored encryption key that cannot be imported (empty, not JSON, not a key): deletes that
+	 * key, so that the next sealing makes a new one, and discards this scope's sealed secrets, which only that key
+	 * could unseal. It is for an explicit act of the user. A usable key is never deleted: it rejects. The other
+	 * scope's sealed secrets are not touched; its user discards them with discardSealedSecrets() there.
+	 * Clearing inputs never deletes the shared key.
+	 */
+	public async resetUnusableEncryptionKey(): Promise<void> {
+		// The record is read first, so that a record that cannot be read leaves the key in place.
+		const record = this._getRecord();
+		await McpRegistryInputStorage.secretSequencer.queue(async () => {
+			const existing = await this._secretStorageService.get(MCP_ENCRYPTION_KEY_NAME);
+			if (existing === undefined) {
+				throw new Error(`The stored secret '${MCP_ENCRYPTION_KEY_NAME}' does not exist; there is nothing to reset.`);
+			}
+			// The import failure itself is the condition for the reset, not an error to report.
+			const unusable = await this._importStoredKey(existing).then(() => false, () => true);
+			if (!unusable) {
+				throw new Error(`The stored secret '${MCP_ENCRYPTION_KEY_NAME}' is a usable key; it is kept.`);
+			}
+			await this._secretStorageService.delete(MCP_ENCRYPTION_KEY_NAME);
+			this._forgetEncryptionKey();
+			record.secrets = undefined;
+			record.unsealedSecrets = undefined;
+			this._didChange = true;
+		});
 	}
 
 	/** Delete a single collection data from the storage. */
@@ -251,6 +310,8 @@ export class McpRegistryInputStorage extends Disposable {
 				encrypted.buffer as Uint8Array<ArrayBuffer>,
 			);
 		} catch (e) {
+			// The imported key may be the wrong one: forget it, so that restoring the right one is read by this instance.
+			this._forgetEncryptionKey();
 			const error = new InvalidStoredSecretError(MCP_DATA_STORED_KEY, 'could not be unsealed with the stored key', { cause: e });
 			this._logService.error(error);
 			throw error;
