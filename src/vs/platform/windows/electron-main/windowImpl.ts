@@ -754,6 +754,17 @@ export class CodeWindow extends BaseWindow implements ICodeWindow {
 		});
 	}
 
+	/**
+	 * QuantLab host (U5): re-points this window at `standIn` (the hidden stock BrowserWindow whose `webContents` and `loadURL`
+	 * are the workbench view's) and binds the window's listeners to it. Called once by `qlHost/adopt.ts`, inside
+	 * `onDidOpenWindow`, before the first load. A public member because the build's mangler renames `_win` and
+	 * `registerListeners` (every private and protected member), which a caller outside this class cannot follow.
+	 */
+	qlAdoptBrowserWindow(standIn: electron.BrowserWindow): void {
+		this._win = standIn;
+		this.registerListeners();
+	}
+
 	private registerListeners(): void {
 
 		// Window error conditions to handle
