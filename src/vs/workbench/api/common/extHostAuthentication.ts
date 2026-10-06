@@ -395,33 +395,35 @@ const REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID = 'workbench.action.removeDynamic
 
 /**
  * Refreshing stored sessions failed. They stay stored: a failure may be transient, and a refresh token is a credential.
- * Only an explicit act of the user (signing out, or removing the provider) removes them. The message carries no token.
+ * Only an explicit act of the user (signing out, or removing the provider) removes them. The message carries no token and
+ * no issuer string: `label` is the provider's issuer-free display name ({@link DynamicAuthProvider} `_errorLabel`).
  */
 export class DynamicAuthSessionRefreshError extends Error {
 	override readonly name = 'DynamicAuthSessionRefreshError';
-	constructor(readonly providerId: string, label: string, count: number) {
+	constructor(label: string, count: number) {
 		super(nls.localize('dynamicAuthSessionRefreshFailed', "Refreshing {0} stored session(s) of '{1}' failed; they are kept. Try again, sign out and sign in again, or remove them with the command 'Authentication: Remove Dynamic Authentication Providers' ({2}).", count, label, REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID));
 	}
 }
 
 /**
  * Stored sessions have expired and carry no refresh token. They stay stored: only an explicit act of the user (signing
- * out, or removing the provider) removes them. The message carries no token.
+ * out, or removing the provider) removes them. The message carries no token and no issuer string (see `label` above).
  */
 export class DynamicAuthSessionExpiredError extends Error {
 	override readonly name = 'DynamicAuthSessionExpiredError';
-	constructor(readonly providerId: string, label: string, count: number) {
+	constructor(label: string, count: number) {
 		super(nls.localize('dynamicAuthSessionExpired', "{0} stored session(s) of '{1}' have expired and cannot be refreshed; they are kept. Sign out and sign in again, or remove them with the command 'Authentication: Remove Dynamic Authentication Providers' ({2}).", count, label, REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID));
 	}
 }
 
 /**
  * The authorization server rejected the stored client registration (invalid_client). It is kept, with its sessions: a new
- * registration is made only after an explicit act of the user has removed the stored one. The message carries no secret.
+ * registration is made only after an explicit act of the user has removed the stored one. The message carries no secret
+ * and no issuer string (see `label` above).
  */
 export class DynamicAuthClientRejectedError extends Error {
 	override readonly name = 'DynamicAuthClientRejectedError';
-	constructor(readonly providerId: string, label: string) {
+	constructor(label: string) {
 		super(nls.localize('dynamicAuthClientRejected', "The authorization server rejected the stored client registration of '{0}'; it is kept. Remove it with the command 'Authentication: Remove Dynamic Authentication Providers' ({1}), then sign in again.", label, REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID));
 	}
 }
@@ -456,6 +458,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	}>;
 
 	protected readonly _logger: ILogger;
+	/** The provider's display name for an error message: {@link label} without the user info of the issuer's authority. */
+	protected readonly _errorLabel: string;
 	private readonly _disposable: DisposableStore;
 
 	constructor(
@@ -480,6 +484,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			: stringifiedServer;
 		// Auth Provider label is just the resource name if provided, otherwise the authority of the authorization server.
 		this.label = _resourceMetadata?.resource_name ?? this.authorizationServer.authority;
+		// An error message names the provider without the issuer string: the authority's user info can hold a credential, so
+		// it is cut off (the id, which is the whole issuer string, is never put in an error).
+		const authority = this.authorizationServer.authority;
+		this._errorLabel = _resourceMetadata?.resource_name ?? authority.slice(authority.lastIndexOf('@') + 1);
 
 		this._logger = loggerService.createLogger(this.id, { name: `Auth: ${this.label}` });
 		this._disposable = new DisposableStore();
@@ -588,10 +596,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
 			}
 			if (failedRefreshTokens.length) {
-				throw new DynamicAuthSessionRefreshError(this.id, this.label, failedRefreshTokens.length);
+				throw new DynamicAuthSessionRefreshError(this._errorLabel, failedRefreshTokens.length);
 			}
 			if (expiredTokens.length) {
-				throw new DynamicAuthSessionExpiredError(this.id, this.label, expiredTokens.length);
+				throw new DynamicAuthSessionExpiredError(this._errorLabel, expiredTokens.length);
 			}
 			this._logger.info(`Found ${sessions.length} sessions for ${scopeCountText(scopes)}`);
 			return sessions;
@@ -865,7 +873,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 		if (!response.ok && await this._isInvalidClientResponse(response)) {
 			this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
-			throw new DynamicAuthClientRejectedError(this.id, this.label);
+			throw new DynamicAuthClientRejectedError(this._errorLabel);
 		}
 		if (!response.ok) {
 			// Status and a vetted OAuth error code only: the body can hold credentials
@@ -878,7 +886,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			return result;
 		} else if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
 			this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
-			throw new DynamicAuthClientRejectedError(this.id, this.label);
+			throw new DynamicAuthClientRejectedError(this._errorLabel);
 		}
 		throw createOAuthInvalidResponseError('authorization token', response, result);
 	}
@@ -886,18 +894,13 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	/**
 	 * Whether an unsuccessful response is the OAuth error `invalid_client` (RFC 6749 section 5.2), which servers send with
 	 * HTTP 400 or 401. It reads a clone, so the caller can still read the response, and it logs nothing of the body.
+	 * The clone is read by {@link readOAuthErrorBody}, which keeps no part of a read or parser error (either can quote a
+	 * credential): a body that cannot be read or is not JSON is not `invalid_client`, and the caller's own reading of the
+	 * response names that outcome in its failure.
 	 */
 	protected async _isInvalidClientResponse(response: Response): Promise<boolean> {
-		const text = await response.clone().text();
-		let body: unknown;
-		try {
-			body = JSON.parse(text);
-		} catch {
-			// Not JSON, so not an OAuth error response: the caller's own handling reports this failure. The parse error
-			// quotes the body, so it is not carried.
-			return false;
-		}
-		return isAuthorizationErrorResponse(body) && body.error === AuthorizationErrorType.InvalidClient;
+		const outcome = await readOAuthErrorBody(response.clone());
+		return outcome.kind === 'json' && isAuthorizationErrorResponse(outcome.body) && outcome.body.error === AuthorizationErrorType.InvalidClient;
 	}
 
 	protected async exchangeRefreshTokenForToken(refreshToken: string): Promise<IAuthorizationToken> {
@@ -955,7 +958,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		}
 		if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
 			this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
-			throw new DynamicAuthClientRejectedError(this.id, this.label);
+			throw new DynamicAuthClientRejectedError(this._errorLabel);
 		}
 		if (failure) {
 			throw new OAuthSafeError(formatOAuthHttpFailure('Token refresh', response, failure));

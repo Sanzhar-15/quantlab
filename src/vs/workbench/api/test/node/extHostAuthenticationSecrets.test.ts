@@ -175,6 +175,14 @@ class TestProvider extends NodeDynamicAuthProvider {
 	}
 
 	/**
+	 * A new client registration (dynamic registration, then the user prompt). invalid_client no longer starts it (F-SECRETS-3
+	 * keeps the stored registration), so its no-leak checks call it directly.
+	 */
+	regenerateClient() {
+		return this._generateNewClientId();
+	}
+
+	/**
 	 * Runs one of the create flows. The provider is remote so the flows are [URL handler, device code].
 	 */
 	runFlow(index: number, reports: unknown[] = []) {
@@ -221,9 +229,11 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 		return () => new Response(body, { status, statusText: reasonPhrase });
 	}
 
-	// A response whose body cannot be read; the read error itself holds a credential
+	// A response whose body cannot be read; the read error itself holds a credential. Like a real fetch Response it can be
+	// cloned (Response.prototype.clone), and a clone of an unreadable body cannot be read either.
 	function respondUnreadable(status: number): FetchResponder {
-		return () => ({ ok: status >= 200 && status < 300, status, statusText: STATUS_TEXT[status], text: async () => { throw new Error(`read failed ${ACCESS_TOKEN}`); } }) as unknown as Response;
+		const unreadable = (): Response => ({ ok: status >= 200 && status < 300, status, statusText: STATUS_TEXT[status], text: async () => { throw new Error(`read failed ${ACCESS_TOKEN}`); }, clone: unreadable }) as unknown as Response;
+		return unreadable;
 	}
 
 	// A fetch that rejects the way a transport does: the message and a nested cause quote a credential
@@ -556,33 +566,51 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			assert.strictEqual(error.message, 'Invalid authorization token response: 200 (no error code in body)');
 		});
 
-		test('non-ok invalid_client still regenerates the client; a failed registration does not leak its response', async () => {
+		// F-SECRETS-3 (cb60eb38859): invalid_client keeps the stored registration and names the explicit reset; it no longer
+		// starts a new registration.
+		test('non-ok invalid_client keeps the client registration and rejects without the response', async () => {
 			const { provider, logger, proxy } = createProvider();
 			fetchQueue.push(respondJson(400, { error: 'invalid_client', error_description: CLIENT_SECRET }));
-			// The registration response is the wrong shape (no client_id) and holds a secret and a registration token
-			fetchQueue.push(respondJson(200, { client_secret: NEW_CLIENT_SECRET, registration_access_token: REGISTRATION_TOKEN }));
 
 			const error = await rejection(provider.refresh(STORED_REFRESH_TOKEN));
 			assertClean(logger, error);
 
-			assert.deepStrictEqual(fetchCalls.map(call => call.url), [TOKEN_ENDPOINT, REGISTRATION_ENDPOINT]);
+			assert.deepStrictEqual(fetchCalls.map(call => call.url), [TOKEN_ENDPOINT]);
+			assert.strictEqual(proxy.registrationPrompts, 0);
+			assert.strictEqual(error.name, 'DynamicAuthClientRejectedError');
+			assert.strictEqual(provider.clientId, CLIENT_ID);
+			assert.ok(logger.messages('warn').some(message => message.includes(`Client ID (${CLIENT_ID}) was rejected as invalid; the stored client registration is kept.`)));
+		});
+
+		test('a new client registration that fails does not leak its response', async () => {
+			const { provider, logger, proxy } = createProvider();
+			// The registration response is the wrong shape (no client_id) and holds a secret and a registration token
+			fetchQueue.push(respondJson(200, { client_secret: NEW_CLIENT_SECRET, registration_access_token: REGISTRATION_TOKEN }));
+
+			const error = await rejection(provider.regenerateClient());
+			assertClean(logger, error);
+
+			assert.deepStrictEqual(fetchCalls.map(call => call.url), [REGISTRATION_ENDPOINT]);
 			assert.strictEqual(proxy.registrationPrompts, 1);
 			assert.strictEqual(error.message, 'Failed to fetch new client ID and user did not provide one: Invalid dynamic client registration response: 200 (no error code in body)');
-			assert.ok(logger.messages('warn').some(message => message.includes(`Client ID (${CLIENT_ID}) was invalid`)));
 			assert.ok(logger.messages('info').some(message => message.includes('Dynamic registration failed')));
 		});
 
+		// F-SECRETS-3 (cb60eb38859): a failed refresh keeps the stored session and getSessions rejects with
+		// DynamicAuthSessionRefreshError; the rejection is checked for credentials like the log.
 		test('getSessions: a failed refresh is logged without the response or the stored tokens', async () => {
-			const { provider, logger } = createProvider({
+			const { provider, logger, proxy } = createProvider({
 				initialTokens: [{ access_token: STORED_ACCESS_TOKEN, token_type: 'Bearer', refresh_token: STORED_REFRESH_TOKEN, expires_in: 60, scope: 'read', created_at: 0 }]
 			});
 			fetchQueue.push(respondJson(500, { error: 'server_error', ...tokenBody }));
 
-			const sessions = await provider.getSessions(['read'], {});
-			assertClean(logger);
+			const error = await rejection(provider.getSessions(['read'], {}));
+			assertClean(logger, error);
 
-			assert.deepStrictEqual(sessions, []);
+			assert.strictEqual(error.name, 'DynamicAuthSessionRefreshError');
 			assert.deepStrictEqual(logger.messages('error').filter(message => message.includes('Failed to refresh token')), ['Failed to refresh token: Token refresh failed: 500 (server_error)']);
+			assert.deepStrictEqual(proxy.persisted, []);
+			assert.deepStrictEqual((await provider.getSessions(undefined, {})).map(session => session.accessToken), [STORED_ACCESS_TOKEN]);
 		});
 
 		test('getSessions: a refresh with malformed JSON is logged without the response', async () => {
@@ -591,9 +619,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			});
 			fetchQueue.push(respond(200, malformedBody));
 
-			await provider.getSessions(['read'], {});
-			assertClean(logger);
+			const error = await rejection(provider.getSessions(['read'], {}));
+			assertClean(logger, error);
 
+			assert.strictEqual(error.name, 'DynamicAuthSessionRefreshError');
 			assert.ok(logger.messages('error').some(message => message.includes('Failed to refresh token')));
 		});
 
@@ -995,9 +1024,11 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			});
 			fetchQueue.push(rejectTransport(ACCESS_TOKEN));
 
-			await provider.getSessions(['read'], {});
-			assertClean(logger);
+			// F-SECRETS-3 (cb60eb38859): the session is kept and getSessions rejects with DynamicAuthSessionRefreshError
+			const error = await rejection(provider.getSessions(['read'], {}));
+			assertClean(logger, error);
 
+			assert.strictEqual(error.name, 'DynamicAuthSessionRefreshError');
 			assert.deepStrictEqual(logger.messages('error').filter(message => message.includes('Failed to refresh token')), ['Failed to refresh token: Token refresh failed: the request could not be completed']);
 		});
 
@@ -1011,11 +1042,12 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			assert.deepStrictEqual(findMarkers(error), []);
 		});
 
-		test('registration recovery after invalid_client: a rejected registration fetch reaches neither the log nor the error', async () => {
+		// F-SECRETS-3 (cb60eb38859): invalid_client no longer starts a new registration, so the registration is run directly
+		test('a new client registration: a rejected registration fetch reaches neither the log nor the error', async () => {
 			const { provider, logger, proxy } = createProvider();
-			fetchQueue.push(respondJson(400, { error: 'invalid_client' }), rejectTransport(NEW_CLIENT_SECRET));
+			fetchQueue.push(rejectTransport(NEW_CLIENT_SECRET));
 
-			const error = await rejection(provider.refresh(STORED_REFRESH_TOKEN));
+			const error = await rejection(provider.regenerateClient());
 			assertClean(logger, error);
 
 			assert.strictEqual(proxy.registrationPrompts, 1);
@@ -1504,18 +1536,30 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			assert.deepStrictEqual(findMarkers(error), []);
 		});
 
-		test('regeneration after invalid_client: the issuer is not logged when registration fails, nor when the user supplies a client', async () => {
+		test('invalid_client: the issuer is neither logged nor in the error, which keeps the registration', async () => {
+			const ctx = createProvider({ authorizationServer: URI.from(issuerComponents) });
+			fetchQueue.push(respondJson(400, { error: 'invalid_client' }));
+			const rejected = await rejection(ctx.provider.refresh(STORED_REFRESH_TOKEN));
+			assert.deepStrictEqual(findMarkers(ctx.logger.records), []);
+			assert.deepStrictEqual(findMarkers(rejected), []);
+			assert.ok(ctx.logger.records.length >= 1);
+			assert.strictEqual(rejected.name, 'DynamicAuthClientRejectedError');
+			assert.ok(rejected.message.includes(`'auth.example.com'`), rejected.message);
+			assert.deepStrictEqual(fetchCalls.map(call => call.url), [TOKEN_ENDPOINT]);
+		});
+
+		test('a new client registration: the issuer is not logged when registration fails, nor when the user supplies a client', async () => {
 			let ctx = createProvider({ authorizationServer: URI.from(issuerComponents) });
-			fetchQueue.push(respondJson(400, { error: 'invalid_client' }), rejectTransport(ACCESS_TOKEN));
-			const failed = await rejection(ctx.provider.refresh(STORED_REFRESH_TOKEN));
+			fetchQueue.push(rejectTransport(ACCESS_TOKEN));
+			const failed = await rejection(ctx.provider.regenerateClient());
 			assert.deepStrictEqual(findMarkers(ctx.logger.records), []);
 			assert.deepStrictEqual(findMarkers(failed), []);
 			assert.ok(ctx.logger.records.length >= 2);
 
 			ctx = createProvider({ authorizationServer: URI.from(issuerComponents) });
 			ctx.proxy.promptAnswer = { clientId: CLIENT_ID, clientSecret: NEW_CLIENT_SECRET };
-			fetchQueue.push(respondJson(400, { error: 'invalid_client' }), respondJson(200, { client_secret: NEW_CLIENT_SECRET }));
-			await rejection(ctx.provider.refresh(STORED_REFRESH_TOKEN));
+			fetchQueue.push(respondJson(200, { client_secret: NEW_CLIENT_SECRET }));
+			await ctx.provider.regenerateClient();
 			assert.deepStrictEqual(findMarkers(ctx.logger.records), []);
 			assert.ok(ctx.logger.messages('info').includes('User provided client ID'), ctx.logger.messages('info').join('\n'));
 		});
