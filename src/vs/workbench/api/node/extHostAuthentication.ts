@@ -6,14 +6,14 @@
 import * as nls from '../../../nls.js';
 import type * as vscode from 'vscode';
 import { URL } from 'url';
-import { ExtHostAuthentication, DynamicAuthClientRejectedError, DynamicAuthProvider, errorClassName, IExtHostAuthentication } from '../common/extHostAuthentication.js';
+import { ExtHostAuthentication, DynamicAuthClientRejectedError, DynamicAuthProvider, IExtHostAuthentication } from '../common/extHostAuthentication.js';
 import { IExtHostRpcService } from '../common/extHostRpcService.js';
 import { IExtHostInitDataService } from '../common/extHostInitDataService.js';
 import { IExtHostWindow } from '../common/extHostWindow.js';
 import { IExtHostUrlsService } from '../common/extHostUrls.js';
 import { ILoggerService, ILogService } from '../../../platform/log/common/log.js';
 import { MainThreadAuthenticationShape } from '../common/extHost.protocol.js';
-import { IAuthorizationServerMetadata, IAuthorizationProtectedResourceMetadata, IAuthorizationTokenResponse, IAuthorizationDeviceResponse, isAuthorizationDeviceResponse, isAuthorizationTokenResponse, IAuthorizationDeviceTokenErrorResponse, AuthorizationErrorType, AuthorizationDeviceCodeErrorType } from '../../../base/common/oauth.js';
+import { IAuthorizationServerMetadata, IAuthorizationProtectedResourceMetadata, IAuthorizationTokenResponse, isAuthorizationDeviceResponse, AuthorizationErrorType, AuthorizationDeviceCodeErrorType, createOAuthHttpError, createOAuthInvalidResponseError, createOAuthTransportError, describeOAuthFailure, formatOAuthHttpFailure, getSafeOAuthErrorCode, isValidAuthorizationTokenResponse, OAuthSafeError, readOAuthJsonResponse } from '../../../base/common/oauth.js';
 import { Emitter } from '../../../base/common/event.js';
 import { raceCancellationError } from '../../../base/common/async.js';
 import { IExtHostProgress } from '../common/extHostProgress.js';
@@ -91,8 +91,9 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		let appUri: URI;
 		try {
 			appUri = await this._extHostUrls.createAppUri(callbackUri);
-		} catch (error) {
-			throw new Error(`Failed to create external URI: ${errorClassName(error)}`);
+		} catch {
+			// The error comes from another process: report a new error without its text
+			throw new OAuthSafeError('Failed to create external URI');
 		}
 
 		// Prepare the authorization request URL
@@ -118,8 +119,9 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		);
 		try {
 			await server.start();
-		} catch (err) {
-			throw new Error(`Failed to start loopback server: ${errorClassName(err)}`);
+		} catch {
+			// The listen error is not part of the credential boundary but is not trusted either: report a new error
+			throw new OAuthSafeError('Failed to start loopback server');
 		}
 
 		// Update the authorization URL with the actual redirect URI
@@ -133,8 +135,16 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		try {
 			// Open the browser for user authorization
 			this._logger.info(`Opening authorization URL for scopes: ${scopeString}`);
-			this._logger.trace(`Authorization URL: ${authorizationUrl.toString()}`);
-			const opened = await this._extHostWindow.openUri(authorizationUrl.toString(), {});
+			let opened: boolean;
+			try {
+				opened = await this._extHostWindow.openUri(authorizationUrl.toString(), {});
+			} catch (openError) {
+				if (isCancellationError(openError)) {
+					throw openError;
+				}
+				// The error comes from another process and can quote the authorization URL: report a new error without its text
+				throw new OAuthSafeError('Failed to open the authorization URL');
+			}
 			if (!opened) {
 				throw new CancellationError();
 			}
@@ -152,8 +162,9 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 					this._logger.info('Authorization code request was cancelled by the user.');
 					throw err;
 				}
-				this._logger.error(`Failed to receive authorization code: ${errorClassName(err)}`);
-				throw new Error(`Failed to receive authorization code: ${errorClassName(err)}`);
+				const detail = describeOAuthFailure(err, 'the redirect failed unexpectedly');
+				this._logger.error(`Failed to receive authorization code: ${detail}`);
+				throw new OAuthSafeError(`Failed to receive authorization code: ${detail}`);
 			}
 			this._logger.info(`Authorization code received for scopes: ${scopeString}`);
 
@@ -201,9 +212,11 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 				},
 				body: deviceCodeRequest.toString()
 			});
-		} catch (error) {
-			this._logger.error(`Failed to request device code: ${error}`);
-			throw new Error(`Failed to request device code: ${error}`);
+		} catch {
+			// The transport error quotes the endpoint URL, which can hold credentials: report a new error without it
+			const error = createOAuthTransportError('Device code request');
+			this._logger.error(describeOAuthFailure(error, 'the request failed unexpectedly'));
+			throw error;
 		}
 
 		if (!deviceCodeResponse.ok && await this._isInvalidClientResponse(deviceCodeResponse)) {
@@ -211,22 +224,34 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 			throw new DynamicAuthClientRejectedError(this.id, this.label);
 		}
 		if (!deviceCodeResponse.ok) {
-			// Not the body: a response may echo a credential.
-			throw new Error(`Device code request failed: ${deviceCodeResponse.status}`);
+			// Status and a vetted OAuth error code only: the body can hold the device code
+			throw await createOAuthHttpError('Device code request', deviceCodeResponse);
 		}
 
-		const deviceCodeData: IAuthorizationDeviceResponse = await deviceCodeResponse.json();
-		if (!isAuthorizationDeviceResponse(deviceCodeData)) {
-			this._logger.error('Invalid device code response received from server');
-			throw new Error('Invalid device code response received from server');
+		const deviceCodeResult = await readOAuthJsonResponse(deviceCodeResponse, 'Device code request');
+		if (!isAuthorizationDeviceResponse(deviceCodeResult)) {
+			const error = createOAuthInvalidResponseError('device code', deviceCodeResponse, deviceCodeResult);
+			this._logger.error(describeOAuthFailure(error, 'the request failed unexpectedly'));
+			throw error;
 		}
-		this._logger.info(`Device code received: ${deviceCodeData.user_code}`);
+		const deviceCodeData = deviceCodeResult;
+		// The user code is shown to the user in the modal below, not logged: it is a live authentication code
+		this._logger.info('Device code received.');
 
 		// Step 2: Show the device code modal
-		const userConfirmed = await this._proxy.$showDeviceCodeModal(
-			deviceCodeData.user_code,
-			deviceCodeData.verification_uri
-		);
+		let userConfirmed: boolean;
+		try {
+			userConfirmed = await this._proxy.$showDeviceCodeModal(
+				deviceCodeData.user_code,
+				deviceCodeData.verification_uri
+			);
+		} catch (modalError) {
+			if (isCancellationError(modalError)) {
+				throw modalError;
+			}
+			// The error comes from another process and can quote the device code: report a new error without its text
+			throw new OAuthSafeError('Failed to show the device code');
+		}
 
 		if (!userConfirmed) {
 			throw new CancellationError();
@@ -264,61 +289,64 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 			}
 
 			try {
-				const tokenResponse = await fetch(this._serverMetadata.token_endpoint, {
-					method: 'POST',
-					headers: {
-						'Content-Type': 'application/x-www-form-urlencoded',
-						'Accept': 'application/json'
-					},
-					body: tokenRequest.toString()
-				});
+				let tokenResponse: Response;
+				try {
+					tokenResponse = await fetch(this._serverMetadata.token_endpoint, {
+						method: 'POST',
+						headers: {
+							'Content-Type': 'application/x-www-form-urlencoded',
+							'Accept': 'application/json'
+						},
+						body: tokenRequest.toString()
+					});
+				} catch {
+					// The transport error quotes the endpoint URL, which can hold credentials: report a new error without it
+					throw createOAuthTransportError('Device code token request');
+				}
 
 				if (tokenResponse.ok) {
-					const tokenData: IAuthorizationTokenResponse = await tokenResponse.json();
-					if (!isAuthorizationTokenResponse(tokenData)) {
-						this._logger.error('Invalid token response received from server');
-						throw new Error('Invalid token response received from server');
+					const tokenData = await readOAuthJsonResponse(tokenResponse, 'Device code token request');
+					if (!isValidAuthorizationTokenResponse(tokenData)) {
+						const error = createOAuthInvalidResponseError('device code token', tokenResponse, tokenData);
+						this._logger.error(describeOAuthFailure(error, 'the request failed unexpectedly'));
+						throw error;
 					}
 					this._logger.info(`Device code flow completed successfully for scopes: ${scopeString}`);
 					return tokenData;
 				} else {
-					let errorData: IAuthorizationDeviceTokenErrorResponse;
-					try {
-						errorData = await tokenResponse.json();
-					} catch (e) {
-						this._logger.error(`Failed to parse error response: ${e}`);
-						throw new Error(`Token request failed with status ${tokenResponse.status}: ${tokenResponse.statusText}`);
-					}
+					// A failure body is read as text and parsed without keeping any parser message; a malformed one
+					// throws a new error naming the HTTP status only
+					const errorBody = await readOAuthJsonResponse(tokenResponse, 'Device code token request');
+					const errorCode = getSafeOAuthErrorCode(errorBody);
 
 					// Handle known error cases
-					if (errorData.error === AuthorizationDeviceCodeErrorType.AuthorizationPending) {
+					if (errorCode === AuthorizationDeviceCodeErrorType.AuthorizationPending) {
 						// User hasn't completed authorization yet, continue polling
 						continue;
-					} else if (errorData.error === AuthorizationDeviceCodeErrorType.SlowDown) {
+					} else if (errorCode === AuthorizationDeviceCodeErrorType.SlowDown) {
 						// Server is asking us to slow down
 						await new Promise(resolve => setTimeout(resolve, pollInterval));
 						continue;
-					} else if (errorData.error === AuthorizationDeviceCodeErrorType.ExpiredToken) {
-						throw new Error('Device code expired. Please try again.');
-					} else if (errorData.error === AuthorizationDeviceCodeErrorType.AccessDenied) {
+					} else if (errorCode === AuthorizationDeviceCodeErrorType.ExpiredToken) {
+						throw new OAuthSafeError('Device code expired. Please try again.');
+					} else if (errorCode === AuthorizationDeviceCodeErrorType.AccessDenied) {
 						throw new CancellationError();
-					} else if (errorData.error === AuthorizationErrorType.InvalidClient) {
+					} else if (errorCode === AuthorizationErrorType.InvalidClient) {
 						this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
 						throw new DynamicAuthClientRejectedError(this.id, this.label);
 					} else {
-						// Not the description: it is server text from the response body.
-						throw new Error(`Token request failed with status ${tokenResponse.status}`);
+						throw new OAuthSafeError(formatOAuthHttpFailure('Token request', tokenResponse, { kind: 'json', body: errorBody }));
 					}
 				}
 			} catch (error) {
 				if (isCancellationError(error) || error instanceof DynamicAuthClientRejectedError) {
 					throw error;
 				}
-				throw new Error(`Error polling for token: ${error}`);
+				throw new OAuthSafeError(`Error polling for token: ${describeOAuthFailure(error, 'the polling failed unexpectedly')}`);
 			}
 		}
 
-		throw new Error('Device code flow timed out. Please try again.');
+		throw new OAuthSafeError('Device code flow timed out. Please try again.');
 	}
 }
 
