@@ -13,6 +13,17 @@ import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { Queue } from '../../../../base/common/async.js';
 
+/**
+ * The stored dynamic authentication provider list is present but unreadable. Carries the storage key and a
+ * reason; never the stored text.
+ */
+export class InvalidStoredProviderListError extends Error {
+	constructor(readonly storageKey: string, readonly reason: string) {
+		super(`Stored dynamic authentication provider list '${storageKey}' is invalid: ${reason}. It was left unchanged.`);
+		this.name = 'InvalidStoredProviderListError';
+	}
+}
+
 export class DynamicAuthenticationProviderStorageService extends Disposable implements IDynamicAuthenticationProviderStorageService {
 	declare readonly _serviceBrand: undefined;
 
@@ -120,20 +131,54 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		}
 	}
 
+	/**
+	 * Reads the stored provider list. An absent key is a real empty list. A present value that is not
+	 * JSON, not an array, or holds an entry that is not an object with a string `providerId` is logged
+	 * (key and reason only, never the stored text) and thrown as {@link InvalidStoredProviderListError},
+	 * so no caller can write a replacement list over it.
+	 */
 	private _getStoredProviders(): DynamicAuthenticationProviderInfo[] {
-		const stored = this.storageService.get(DynamicAuthenticationProviderStorageService.PROVIDERS_STORAGE_KEY, StorageScope.APPLICATION, '[]');
-		try {
-			const providerInfos = JSON.parse(stored);
-			// MIGRATION: remove after an iteration or 2
-			for (const providerInfo of providerInfos) {
-				if (!providerInfo.authorizationServer) {
-					providerInfo.authorizationServer = providerInfo.issuer;
-				}
-			}
-			return providerInfos;
-		} catch {
+		const storageKey = DynamicAuthenticationProviderStorageService.PROVIDERS_STORAGE_KEY;
+		const stored = this.storageService.get(storageKey, StorageScope.APPLICATION);
+		if (stored === undefined) {
 			return [];
 		}
+
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(stored);
+		} catch (error) {
+			// The parse message quotes its input, so only the error class is carried.
+			const errorClass = error instanceof Error ? error.name : typeof error;
+			throw this._invalidStoredProviders(storageKey, `not valid JSON (${errorClass})`);
+		}
+
+		if (!Array.isArray(parsed)) {
+			throw this._invalidStoredProviders(storageKey, `not an array (${parsed === null ? 'null' : typeof parsed})`);
+		}
+
+		const providerInfos: { providerId: string; authorizationServer?: unknown; issuer?: unknown }[] = [];
+		for (let index = 0; index < parsed.length; index++) {
+			const entry: unknown = parsed[index];
+			if (typeof entry !== 'object' || entry === null || Array.isArray(entry) || typeof (entry as { providerId?: unknown }).providerId !== 'string') {
+				throw this._invalidStoredProviders(storageKey, `entry ${index} is not an object with a string providerId`);
+			}
+			providerInfos.push(entry as { providerId: string; authorizationServer?: unknown; issuer?: unknown });
+		}
+
+		// MIGRATION: remove after an iteration or 2
+		for (const providerInfo of providerInfos) {
+			if (!providerInfo.authorizationServer) {
+				providerInfo.authorizationServer = providerInfo.issuer;
+			}
+		}
+		return providerInfos as DynamicAuthenticationProviderInfo[];
+	}
+
+	private _invalidStoredProviders(storageKey: string, reason: string): InvalidStoredProviderListError {
+		const error = new InvalidStoredProviderListError(storageKey, reason);
+		this.logService.error(error.message);
+		return error;
 	}
 
 	private _storeProviders(providers: DynamicAuthenticationProviderInfo[]): void {
