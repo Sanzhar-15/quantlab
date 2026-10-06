@@ -11,6 +11,7 @@ import { Emitter, Event } from '../../../base/common/event.js';
 import { ILogService } from '../../log/common/log.js';
 import { Disposable, DisposableStore } from '../../../base/common/lifecycle.js';
 import { Lazy } from '../../../base/common/lazy.js';
+import { localize } from '../../../nls.js';
 
 export const ISecretStorageService = createDecorator<ISecretStorageService>('secretStorageService');
 
@@ -44,7 +45,7 @@ export class InvalidStoredSecretError extends Error {
 export class SecretStorageUnavailableError extends Error {
 	override readonly name = 'SecretStorageUnavailableError';
 	constructor() {
-		super('Secret storage is unavailable because encryption is not available; stored secrets are kept and can be neither read nor written until it is.');
+		super(localize('secretStorageUnavailable', "Secret storage is unavailable because encryption is not available; stored secrets are kept and can be neither read nor written until it is."));
 	}
 }
 

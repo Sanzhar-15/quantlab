@@ -361,8 +361,8 @@ class TaskSingler<T> {
 	}
 }
 
-/** The explicit reset of a stored dynamic client registration and its sessions (RemoveDynamicAuthenticationProvidersAction). */
-const REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND = `'Authentication: Remove Dynamic Authentication Providers' (workbench.action.removeDynamicAuthenticationProviders)`;
+/** The id of the explicit reset of a stored dynamic client registration and its sessions (RemoveDynamicAuthenticationProvidersAction). */
+const REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID = 'workbench.action.removeDynamicAuthenticationProviders';
 
 /**
  * Refreshing stored sessions failed. They stay stored: a failure may be transient, and a refresh token is a credential.
@@ -371,7 +371,7 @@ const REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND = `'Authentication: Remove Dynamic A
 export class DynamicAuthSessionRefreshError extends Error {
 	override readonly name = 'DynamicAuthSessionRefreshError';
 	constructor(readonly providerId: string, label: string, count: number) {
-		super(`Refreshing ${count} stored session(s) of '${label}' failed; they are kept. Try again, sign out and sign in again, or remove them with the command ${REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND}.`);
+		super(nls.localize('dynamicAuthSessionRefreshFailed', "Refreshing {0} stored session(s) of '{1}' failed; they are kept. Try again, sign out and sign in again, or remove them with the command 'Authentication: Remove Dynamic Authentication Providers' ({2}).", count, label, REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID));
 	}
 }
 
@@ -382,7 +382,7 @@ export class DynamicAuthSessionRefreshError extends Error {
 export class DynamicAuthSessionExpiredError extends Error {
 	override readonly name = 'DynamicAuthSessionExpiredError';
 	constructor(readonly providerId: string, label: string, count: number) {
-		super(`${count} stored session(s) of '${label}' have expired and cannot be refreshed; they are kept. Sign out and sign in again, or remove them with the command ${REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND}.`);
+		super(nls.localize('dynamicAuthSessionExpired', "{0} stored session(s) of '{1}' have expired and cannot be refreshed; they are kept. Sign out and sign in again, or remove them with the command 'Authentication: Remove Dynamic Authentication Providers' ({2}).", count, label, REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID));
 	}
 }
 
@@ -393,7 +393,7 @@ export class DynamicAuthSessionExpiredError extends Error {
 export class DynamicAuthClientRejectedError extends Error {
 	override readonly name = 'DynamicAuthClientRejectedError';
 	constructor(readonly providerId: string, label: string) {
-		super(`The authorization server rejected the stored client registration of '${label}'; it is kept. Remove it with the command ${REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND}, then sign in again.`);
+		super(nls.localize('dynamicAuthClientRejected', "The authorization server rejected the stored client registration of '{0}'; it is kept. Remove it with the command 'Authentication: Remove Dynamic Authentication Providers' ({1}), then sign in again.", label, REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID));
 	}
 }
 
@@ -405,7 +405,7 @@ export class DynamicAuthClientRejectedError extends Error {
 export class DynamicAuthSessionPersistError extends Error {
 	override readonly name = 'DynamicAuthSessionPersistError';
 	constructor(count: number, failure: string) {
-		super(`${count} session(s) could not be saved to secret storage (${failure}); the change is kept in this window and saved by the next sign-in operation. Until then it is lost on restart.`);
+		super(nls.localize('dynamicAuthSessionPersistFailed', "{0} session(s) could not be saved to secret storage ({1}); the change is kept in this window and saved by the next sign-in operation. Until then it is lost on restart.", count, failure));
 	}
 }
 

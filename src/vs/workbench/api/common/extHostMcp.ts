@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
+import * as nls from '../../../nls.js';
 import { DeferredPromise, raceCancellationError, Sequencer, timeout } from '../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../base/common/cancellation.js';
 import { CancellationError } from '../../../base/common/errors.js';
@@ -246,8 +247,8 @@ type HttpModeT =
 const MAX_FOLLOW_REDIRECTS = 5;
 const REDIRECT_STATUS_CODES = [301, 302, 303, 307, 308];
 
-/** The explicit reset of a stored dynamic client registration and its sessions (RemoveDynamicAuthenticationProvidersAction). */
-const REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND = `'Authentication: Remove Dynamic Authentication Providers' (workbench.action.removeDynamicAuthenticationProviders)`;
+/** The id of the explicit reset of a stored dynamic client registration and its sessions (RemoveDynamicAuthenticationProvidersAction). */
+const REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID = 'workbench.action.removeDynamicAuthenticationProviders';
 
 /**
  * The server rejected a request that carried the stored authorization (HTTP 401/403). Nothing is removed or registered
@@ -256,7 +257,7 @@ const REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND = `'Authentication: Remove Dynamic A
 export class McpAuthorizationRejectedError extends Error {
 	override readonly name = 'McpAuthorizationRejectedError';
 	constructor(readonly status: number) {
-		super(`The server rejected the stored authorization (HTTP ${status}). The stored sign-in is kept; sign out and sign in again, or remove it with the command ${REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND}.`);
+		super(nls.localize('mcpAuthorizationRejected', "The server rejected the stored authorization (HTTP {0}). The stored sign-in is kept; sign out and sign in again, or remove it with the command 'Authentication: Remove Dynamic Authentication Providers' ({1}).", status, REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID));
 	}
 }
 
@@ -267,7 +268,9 @@ export class McpAuthorizationRejectedError extends Error {
 export class McpAuthenticationFailedError extends Error {
 	override readonly name = 'McpAuthenticationFailedError';
 	constructor(source: 'server metadata' | 'provided authentication config') {
-		super(`Could not get a token from the ${source}; the request was not sent without authorization.`);
+		super(source === 'server metadata'
+			? nls.localize('mcpAuthenticationFailedServerMetadata', "Could not get a token from the server metadata; the request was not sent without authorization.")
+			: nls.localize('mcpAuthenticationFailedProvidedConfig', "Could not get a token from the provided authentication config; the request was not sent without authorization."));
 	}
 }
 

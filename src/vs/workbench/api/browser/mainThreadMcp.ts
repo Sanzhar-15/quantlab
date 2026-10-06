@@ -192,7 +192,7 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		if (forceNewRegistration) {
 			// A new registration would remove the stored client registration and sessions. That happens only by an explicit
 			// act of the user (the 'Remove Dynamic Authentication Providers' command), never on request of an automatic path.
-			throw new Error('A new client registration is never forced automatically; remove the stored sign-in with the command \'Authentication: Remove Dynamic Authentication Providers\'.');
+			throw new Error(nls.localize('mcpForcedRegistrationRefused', "A new client registration is never forced automatically; remove the stored sign-in with the command 'Authentication: Remove Dynamic Authentication Providers'."));
 		}
 		const server = this._serverDefinitions.get(id);
 		if (!server) {
