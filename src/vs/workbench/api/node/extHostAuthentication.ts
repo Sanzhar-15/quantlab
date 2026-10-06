@@ -130,7 +130,16 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 
 		const promise = server.waitForOAuthResponse();
 		// Set up a Uri Handler but it's just to redirect not to handle the code
-		void this._proxy.$waitForUriHandler(appUri);
+		// The promise is observed as soon as it exists. The loopback server, not this call, supplies the code, so the flow does
+		// not need the result: a rejection is logged with fixed text and is neither rethrown nor left unhandled (its text and
+		// causes come from another process and are not trusted).
+		void this._proxy.$waitForUriHandler(appUri).then(undefined, (uriHandlerError: unknown) => {
+			if (isCancellationError(uriHandlerError)) {
+				this._logger.trace('The URI handler wait was cancelled.');
+			} else {
+				this._logger.warn('The URI handler wait failed; the loopback redirect is not affected.');
+			}
+		});
 
 		try {
 			// Open the browser for user authorization

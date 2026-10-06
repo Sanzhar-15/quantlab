@@ -12,7 +12,6 @@ import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, DisposableStore, IDisposable } from '../../../../base/common/lifecycle.js';
 import { MarshalledObject } from '../../../../base/common/marshalling.js';
 import { MarshalledId } from '../../../../base/common/marshallingIds.js';
-import { URI } from '../../../../base/common/uri.js';
 import { IURITransformer, transformIncomingURIs } from '../../../../base/common/uriIpc.js';
 import { IMessagePassingProtocol } from '../../../../base/parts/ipc/common/ipc.js';
 import { CanceledLazyPromise, LazyPromise } from './lazyPromise.js';
@@ -107,8 +106,9 @@ export const enum ResponsiveState {
 
 /**
  * A value-free description of an RPC payload: one type tag per request argument,
- * or a single tag for a reply or an error. Built from constants and numbers only:
- * never string content, object keys, error messages, names or stacks.
+ * or a single tag for a reply or an error. Each tag is the `typeof` result ('null'
+ * for null) and nothing else: no property of the payload is read, so no payload
+ * accessor runs and no payload text, key, length or message is reachable.
  */
 export type RPCPayloadShape = readonly string[];
 
@@ -122,40 +122,12 @@ export interface IRPCProtocolLogger {
 }
 
 /**
- * The value-free type tag of one payload value. Reads no string content, no key and no message.
+ * The value-free type tag of one payload value: `typeof`, with 'null' for null.
+ * Deliberately no Array.isArray, instanceof, URI.isUri or property read: any of
+ * them can run payload-owned code or surface payload-owned text.
  */
 function describeRPCValue(value: unknown): string {
-	if (value === null) {
-		return 'null';
-	}
-	switch (typeof value) {
-		case 'string': return 'string';
-		case 'number': return 'number';
-		case 'boolean': return 'boolean';
-		case 'undefined': return 'undefined';
-		case 'bigint': return 'bigint';
-		case 'symbol': return 'symbol';
-		case 'function': return 'function';
-	}
-	if (Array.isArray(value)) {
-		return `array(${value.length})`;
-	}
-	if (value instanceof VSBuffer) {
-		return `buffer(${value.byteLength} bytes)`;
-	}
-	if (value instanceof ArrayBuffer) {
-		return `buffer(${value.byteLength} bytes)`;
-	}
-	if (ArrayBuffer.isView(value)) {
-		return `buffer(${value.byteLength} bytes)`;
-	}
-	if (URI.isUri(value)) {
-		return 'uri';
-	}
-	if (value instanceof Error || (value as { $isError?: unknown }).$isError === true) {
-		return 'error';
-	}
-	return 'object';
+	return value === null ? 'null' : typeof value;
 }
 
 function describeRPCArguments(args: readonly unknown[]): RPCPayloadShape {
@@ -405,8 +377,8 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 				break;
 			}
 			default:
-				console.error(`received unexpected message`);
-				console.error(rawmsg);
+				// Fixed text and numbers only: the packet itself may carry credentials
+				console.error(`received unexpected message: type ${messageType}, request ${req}, length ${msgLength} bytes`);
 		}
 	}
 

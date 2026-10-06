@@ -116,13 +116,45 @@ const M_PROMPT_REPLY_SECRET = 'MARK-WIN-REPLY-CLIENT-SECRET-e1a4';
 const M_WIN_ERROR_MESSAGE = 'MARK-WIN-ERROR-MESSAGE-5f62';
 const M_WIN_ERROR_STACK = 'MARK-WIN-ERROR-STACK-9a0c';
 
+// Hostile payloads: serializable values whose own properties run code or hold text if anything reads them
+const M_HOSTILE_ISERROR = 'MARK-HOSTILE-ISERROR-GETTER-6b3e';
+const M_HOSTILE_AUTHORITY = 'MARK-HOSTILE-AUTHORITY-GETTER-0d7f';
+const M_HOSTILE_BYTELENGTH = 'MARK-HOSTILE-BYTELENGTH-OWN-PROP-a45c';
+
+// An unsupported packet: its bytes carry a credential
+const M_BAD_PACKET = 'MARK-BAD-PACKET-PAYLOAD-e82d';
+
 const ALL_MARKERS = [
 	M_GET_SESSIONS_OPTIONS_SECRET, M_CREATE_SESSION_OPTIONS_CODE,
 	M_EXT_REPLY_ACCESS, M_EXT_REPLY_REFRESH, M_EXT_REPLY_ID, M_EXT_ERROR_MESSAGE, M_EXT_ERROR_STACK,
 	M_REG_CLIENT_SECRET, M_REG_ACCESS, M_REG_REFRESH, M_REG_ID,
 	M_SET_ACCESS, M_SET_REFRESH, M_SET_ID,
-	M_WAIT_REQUEST_QUERY, M_WAIT_REPLY_CODE, M_PROMPT_REPLY_SECRET, M_WIN_ERROR_MESSAGE, M_WIN_ERROR_STACK
+	M_WAIT_REQUEST_QUERY, M_WAIT_REPLY_CODE, M_PROMPT_REPLY_SECRET, M_WIN_ERROR_MESSAGE, M_WIN_ERROR_STACK,
+	M_HOSTILE_ISERROR, M_HOSTILE_AUTHORITY, M_HOSTILE_BYTELENGTH, M_BAD_PACKET
 ];
+
+/** JSON-serializable (the hostile members are non-enumerable) but every read of the hostile member throws */
+function makeThrowingIsError(): object {
+	const value = { visible: 1 };
+	Object.defineProperty(value, '$isError', { enumerable: false, get() { throw new Error(M_HOSTILE_ISERROR); } });
+	return value;
+}
+
+function makeThrowingAuthority(): object {
+	const value = { visible: 2 };
+	Object.defineProperty(value, 'authority', { enumerable: false, get() { throw new Error(M_HOSTILE_AUTHORITY); } });
+	return value;
+}
+
+/** a typed array whose own byteLength is text */
+function makeShadowedByteLength(): Uint8Array {
+	const value = new Uint8Array([1, 2, 3]);
+	Object.defineProperty(value, 'byteLength', { enumerable: false, value: M_HOSTILE_BYTELENGTH });
+	return value;
+}
+
+const HOSTILE_FACTORIES: readonly (() => unknown)[] = [makeThrowingIsError, makeThrowingAuthority, makeShadowedByteLength];
+const HOSTILE_DELIVERED: readonly unknown[] = [{ visible: 1 }, { visible: 2 }, { 0: 1, 1: 2, 2: 3 }];
 
 suite('RPCProtocol logging carries no payload value', () => {
 
@@ -142,6 +174,11 @@ suite('RPCProtocol logging carries no payload value', () => {
 			Promise.resolve().then(() => {
 				this._pair!._onMessage.fire(buffer);
 			});
+		}
+
+		/** delivers a packet to the RPCProtocol on this end, as if the other end had sent it */
+		public inject(buffer: VSBuffer): void {
+			this._onMessage.fire(buffer);
 		}
 	}
 
@@ -167,6 +204,10 @@ suite('RPCProtocol logging carries no payload value', () => {
 			receivedByWindow.push(args);
 			return Promise.resolve({ clientId: 'client-id', clientSecret: M_PROMPT_REPLY_SECRET });
 		}
+		$hostile(kind: number, value: unknown): Promise<unknown> {
+			receivedByWindow.push([kind, value]);
+			return Promise.resolve(HOSTILE_FACTORIES[kind]());
+		}
 		$failInWindow(...args: unknown[]): Promise<void> {
 			receivedByWindow.push(args);
 			const err = new Error(`rejected: ${M_WIN_ERROR_MESSAGE}`);
@@ -184,6 +225,10 @@ suite('RPCProtocol logging carries no payload value', () => {
 			receivedByExtHost.push(args);
 			return Promise.resolve({ id: 's2', accessToken: M_EXT_REPLY_ACCESS, refreshToken: M_EXT_REPLY_REFRESH, idToken: M_EXT_REPLY_ID });
 		}
+		$hostile(kind: number, value: unknown): Promise<unknown> {
+			receivedByExtHost.push([kind, value]);
+			return Promise.resolve(HOSTILE_FACTORIES[kind]());
+		}
 		$failInExtHost(...args: unknown[]): Promise<void> {
 			receivedByExtHost.push(args);
 			const err = new Error(`rejected: ${M_EXT_ERROR_MESSAGE}`);
@@ -197,6 +242,9 @@ suite('RPCProtocol logging carries no payload value', () => {
 
 	let consoleLogCalls: unknown[][];
 	let originalConsoleLog: typeof console.log;
+	let consoleErrorCalls: unknown[][];
+	let originalConsoleError: typeof console.error;
+	let windowProtocol: MessagePassingProtocol;
 	let windowLogger: RecordingLogger;
 	let extHostLogger: RecordingLogger;
 	let mainProxy: MainThreadAuthActor; // called by the extension host side
@@ -210,9 +258,12 @@ suite('RPCProtocol logging carries no payload value', () => {
 		consoleLogCalls = [];
 		originalConsoleLog = console.log;
 		console.log = (...args: unknown[]) => { consoleLogCalls.push(args); };
+		consoleErrorCalls = [];
+		originalConsoleError = console.error;
+		console.error = (...args: unknown[]) => { consoleErrorCalls.push(args); };
 
 		const extProtocol = new MessagePassingProtocol();
-		const windowProtocol = new MessagePassingProtocol();
+		windowProtocol = new MessagePassingProtocol();
 		extProtocol.setPair(windowProtocol);
 		windowProtocol.setPair(extProtocol);
 
@@ -229,6 +280,7 @@ suite('RPCProtocol logging carries no payload value', () => {
 
 	teardown(() => {
 		console.log = originalConsoleLog;
+		console.error = originalConsoleError;
 		disposables.dispose();
 	});
 
@@ -278,7 +330,7 @@ suite('RPCProtocol logging carries no payload value', () => {
 		for (const call of [...windowLogger.calls, ...extHostLogger.calls]) {
 			deepText(call.rawArguments, texts);
 		}
-		for (const args of consoleLogCalls) {
+		for (const args of [...consoleLogCalls, ...consoleErrorCalls]) {
 			deepText(args, texts);
 		}
 		return texts.join('\n');
@@ -327,12 +379,13 @@ suite('RPCProtocol logging carries no payload value', () => {
 
 		const registerCall = windowLogger.calls.find(c => c.direction === 'in' && c.str.endsWith('.$registerDynamicAuthProvider('));
 		assert.ok(registerCall);
-		assert.deepStrictEqual(registerCall.shape, ['object', 'object', 'object', 'string', 'string', 'array(1)']);
+		assert.deepStrictEqual(registerCall.shape, ['object', 'object', 'object', 'string', 'string', 'object']);
 		const sentRegisterCall = extHostLogger.calls.find(c => c.direction === 'out' && c.str.endsWith('.$registerDynamicAuthProvider('));
 		assert.ok(sentRegisterCall);
-		assert.deepStrictEqual(sentRegisterCall.shape, ['uri', 'object', 'object', 'string', 'string', 'array(1)']);
+		assert.deepStrictEqual(sentRegisterCall.shape, ['object', 'object', 'object', 'string', 'string', 'object']);
 
-		const allowedTag = /^(string|number|boolean|null|undefined|bigint|symbol|function|object|uri|error|array\(\d+\)|buffer\(\d+ bytes\))$/;
+		// typeof results, 'null' for null: nothing read from the payload
+		const allowedTag = /^(string|number|boolean|null|undefined|bigint|symbol|function|object)$/;
 		for (const call of [...windowLogger.calls, ...extHostLogger.calls]) {
 			assert.strictEqual(call.rawArguments.length, 5);
 			assert.strictEqual(typeof call.msgLength, 'number');
@@ -345,9 +398,9 @@ suite('RPCProtocol logging carries no payload value', () => {
 		}
 
 		const errorReply = extHostLogger.calls.find(c => c.direction === 'in' && c.str === 'receiveReplyErr:');
-		assert.deepStrictEqual(errorReply?.shape, ['error']);
+		assert.deepStrictEqual(errorReply?.shape, ['object']);
 		const sentError = windowLogger.calls.find(c => c.direction === 'out' && c.str === 'replyErr:');
-		assert.deepStrictEqual(sentError?.shape, ['error']);
+		assert.deepStrictEqual(sentError?.shape, ['object']);
 	});
 
 	test('transmission is unchanged: the recipient receives every marker intact', async () => {
@@ -379,5 +432,58 @@ suite('RPCProtocol logging carries no payload value', () => {
 		assert.ok(extHostError);
 		assert.strictEqual(extHostError.message, `rejected: ${M_EXT_ERROR_MESSAGE}`);
 		assert.ok(extHostError.stack?.includes(M_EXT_ERROR_STACK));
+	});
+
+	test('hostile payloads: a throwing accessor or a shadowed property neither reaches a logger nor stops delivery', async () => {
+		for (let kind = 0; kind < HOSTILE_FACTORIES.length; kind++) {
+			// extension host -> window and window -> extension host: the argument and the reply are both hostile
+			const fromWindow = await mainProxy.$hostile(kind, HOSTILE_FACTORIES[kind]());
+			const fromExtHost = await extProxy.$hostile(kind, HOSTILE_FACTORIES[kind]());
+			assert.deepStrictEqual(fromWindow, HOSTILE_DELIVERED[kind], `reply ${kind} to the extension host`);
+			assert.deepStrictEqual(fromExtHost, HOSTILE_DELIVERED[kind], `reply ${kind} to the window`);
+		}
+		assert.deepStrictEqual(receivedByWindow, HOSTILE_DELIVERED.map((delivered, kind) => [kind, delivered]));
+		assert.deepStrictEqual(receivedByExtHost, HOSTILE_DELIVERED.map((delivered, kind) => [kind, delivered]));
+
+		// each request and each reply was logged, on both sides, as an 'object' tag
+		for (const logger of [windowLogger, extHostLogger]) {
+			const requests = logger.calls.filter(c => c.str.includes('.$hostile('));
+			assert.strictEqual(requests.length, HOSTILE_FACTORIES.length * 2);
+			for (const request of requests) {
+				assert.deepStrictEqual(request.shape, ['number', 'object']);
+			}
+			const replies = logger.calls.filter(c => c.str === 'reply:' || c.str === 'receiveReply:');
+			assert.strictEqual(replies.length, HOSTILE_FACTORIES.length * 2);
+			for (const reply of replies) {
+				assert.deepStrictEqual(reply.shape, ['object']);
+			}
+		}
+
+		const text = allLoggedText();
+		for (const marker of [M_HOSTILE_ISERROR, M_HOSTILE_AUTHORITY, M_HOSTILE_BYTELENGTH]) {
+			assert.ok(!text.includes(marker), `${marker} reached a logger or console`);
+		}
+	});
+
+	test('an unsupported packet is reported with fixed text and numbers, never its bytes', () => {
+		const payload = VSBuffer.fromString(M_BAD_PACKET);
+		const packet = VSBuffer.alloc(1 + 4 + payload.byteLength);
+		packet.writeUInt8(99, 0);
+		packet.writeUInt32BE(7, 1);
+		packet.set(payload, 5);
+
+		windowProtocol.inject(packet);
+
+		assert.ok(consoleErrorCalls.length > 0, 'a diagnostic must be emitted');
+		assert.ok(consoleErrorCalls.some(args => typeof args[0] === 'string' && args[0].includes('received unexpected message')), 'the diagnostic names the problem');
+		assert.ok(consoleErrorCalls.some(args => args.some(arg => typeof arg === 'string' && arg.includes('type 99') && arg.includes('request 7') && arg.includes(`length ${packet.byteLength} bytes`))), 'the diagnostic carries the numeric type, request and length');
+		for (const args of consoleErrorCalls) {
+			for (const arg of args) {
+				assert.strictEqual(typeof arg, 'string', 'only text is passed to console.error');
+			}
+		}
+		assert.ok(!allLoggedText().includes(M_BAD_PACKET), 'a packet byte reached the console');
+		// negative control: the same check does see the packet when it is handed over as a buffer
+		assert.ok(deepText([packet]).join('\n').includes(M_BAD_PACKET));
 	});
 });
