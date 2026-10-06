@@ -709,5 +709,154 @@ suite('Workbench - MCP - RegistryInputStorage', () => {
 			await testStorageService.flush();
 			assert.deepStrictEqual(await createInstance().getMap(), {});
 		});
+
+		// F-SECRETS-6 (R-92): another window replaces the shared key while a seal or an unseal is in flight. Every sealed
+		// secret stays readable under the key stored in the end, or the failure is named and the stored record is unchanged.
+		suite('the shared key replaced by another window while an operation is in flight', () => {
+			const keyName = 'mcpEncryptionKey';
+
+			async function newKeyText(): Promise<string> {
+				const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+				return JSON.stringify(await crypto.subtle.exportKey('jwk', key));
+			}
+
+			class RecordingLogService extends NullLogService {
+				readonly errors: string[] = [];
+				override error(message: string | Error): void { this.errors.push(message instanceof Error ? `${message.name}: ${message.message}` : message); }
+			}
+
+			/**
+			 * Seals one secret with an instance that is then closed (so it takes no part in what follows), saves it, and
+			 * returns a new instance whose record is sealed and not yet unsealed.
+			 */
+			async function sealedByClosedInstance(logService: ILogService = testLogService, secrets: TestSecretStorageService = testSecretStorageService): Promise<McpRegistryInputStorage> {
+				const first = new McpRegistryInputStorage(StorageScope.APPLICATION, StorageTarget.MACHINE, testStorageService, secrets, testLogService);
+				await first.setSecrets({ 's0': { value: 'sealed0' } });
+				await testStorageService.flush();
+				first.dispose();
+				return store.add(new McpRegistryInputStorage(StorageScope.APPLICATION, StorageTarget.MACHINE, testStorageService, secrets, logService));
+			}
+
+			/** Runs `after` once each call of one WebCrypto method has completed, before its result is returned. */
+			function afterEachWebCryptoCall(method: 'encrypt', after: () => Promise<void>) {
+				const subtle = crypto.subtle as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+				const wasOwn = Object.prototype.hasOwnProperty.call(subtle, method);
+				const original = subtle[method];
+				let calls = 0;
+				subtle[method] = async (...args: unknown[]) => {
+					calls++;
+					const result = await original.apply(crypto.subtle, args);
+					await after();
+					return result;
+				};
+				return {
+					get calls() { return calls; },
+					restore(): void {
+						if (wasOwn) {
+							subtle[method] = original;
+						} else {
+							delete subtle[method];
+						}
+					},
+				};
+			}
+
+			test('an unseal in flight: the secrets it read are sealed again under the new key, and a new instance reads them', async () => {
+				const second = await sealedByClosedInstance();
+				const pause = pauseWebCrypto('decrypt');
+				let map: unknown;
+				try {
+					const reading = second.getMap();
+					await pause.reached();
+					await testSecretStorageService.set(keyName, await newKeyText());
+					pause.release();
+					map = await reading;
+				} finally {
+					pause.restore();
+				}
+				assert.deepStrictEqual(map, { 's0': { value: 'sealed0' } });
+
+				await testStorageService.flush();
+				assert.deepStrictEqual(await createInstance().getMap(), { 's0': { value: 'sealed0' } }, 'readable under the stored key');
+			});
+
+			test('a seal in flight: it is not installed under the replaced key; a new instance reads every secret under the new key', async () => {
+				const second = await sealedByClosedInstance();
+				await second.getMap(); // unsealed; only the encryption of the next setSecrets is held
+				const pause = pauseWebCrypto('encrypt');
+				try {
+					const sealing = second.setSecrets({ 'a': { value: 'valueA' } });
+					await pause.reached();
+					await testSecretStorageService.set(keyName, await newKeyText());
+					pause.release();
+					await sealing;
+				} finally {
+					pause.restore();
+				}
+
+				const expected = { 's0': { value: 'sealed0' }, 'a': { value: 'valueA' } };
+				assert.deepStrictEqual(await second.getMap(), expected);
+				await testStorageService.flush();
+				assert.deepStrictEqual(await createInstance().getMap(), expected, 'readable under the stored key');
+			});
+
+			test('a key replaced after a seal, before the record is saved: the record is sealed again under the new key', async () => {
+				const second = await sealedByClosedInstance();
+				await second.setSecrets({ 'a': { value: 'valueA' } });
+				await testSecretStorageService.set(keyName, await newKeyText());
+				await second.setSecrets({}); // its turn in the sealer queue comes after the one the key change started
+
+				await testStorageService.flush();
+				assert.deepStrictEqual(await createInstance().getMap(), { 's0': { value: 'sealed0' }, 'a': { value: 'valueA' } });
+			});
+
+			test('a key that keeps changing while sealing: the seal rejects, named, and the stored record is unchanged', async () => {
+				// No change is announced: the seal itself tells that the key changed (a store that announces changes would
+				// also start a sealing again once the key stops changing).
+				const secrets = new class extends TestSecretStorageService { override readonly onDidChangeSecret = Event.None; }();
+				const second = await sealedByClosedInstance(testLogService, secrets);
+				await second.getMap();
+				const before = testStorageService.get('mcpInputs', StorageScope.APPLICATION);
+				const keyBefore = await secrets.get(keyName);
+				const churn = afterEachWebCryptoCall('encrypt', async () => secrets.set(keyName, await newKeyText()));
+				let outcome: unknown;
+				try {
+					outcome = await second.setSecrets({ 'a': { value: 'valueA' } }).then(() => undefined, e => e);
+				} finally {
+					churn.restore();
+				}
+
+				assert.ok(outcome instanceof Error && outcome.name === 'McpInputsKeyChangedError' && !outcome.message.includes('valueA'), `expected the named rejection, got ${outcome}`);
+				await testStorageService.flush();
+				assert.strictEqual(testStorageService.get('mcpInputs', StorageScope.APPLICATION), before, 'the stored record is byte-identical');
+				// With the key it was sealed with, the stored record still reads.
+				await secrets.set(keyName, keyBefore!);
+				const third = store.add(new McpRegistryInputStorage(StorageScope.APPLICATION, StorageTarget.MACHINE, testStorageService, secrets, testLogService));
+				assert.deepStrictEqual(await third.getMap(), { 's0': { value: 'sealed0' } });
+			});
+
+			test('an unseal in flight and a key replaced by one that is not a key: the read returns, the failure is logged named, the stored record is unchanged', async () => {
+				const logService = store.add(new RecordingLogService());
+				const second = await sealedByClosedInstance(logService);
+				const before = testStorageService.get('mcpInputs', StorageScope.APPLICATION);
+				const pause = pauseWebCrypto('decrypt');
+				let map: unknown;
+				try {
+					const reading = second.getMap();
+					await pause.reached();
+					await testSecretStorageService.set(keyName, 'not a key {');
+					pause.release();
+					map = await reading;
+				} finally {
+					pause.restore();
+				}
+
+				assert.deepStrictEqual(map, { 's0': { value: 'sealed0' } });
+				assert.ok(logService.errors.some(line => line.includes('InvalidStoredSecretError')), logService.errors.join('\n'));
+				assert.ok(logService.errors.every(line => !line.includes('sealed0') && !line.includes('not a key')), 'no secret and no stored text is logged');
+				await testStorageService.flush();
+				assert.strictEqual(testStorageService.get('mcpInputs', StorageScope.APPLICATION), before, 'the stored record is byte-identical');
+			});
+		});
 	});
 });

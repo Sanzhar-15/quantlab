@@ -18,7 +18,8 @@ import { IExtHostWindow } from './extHostWindow.js';
 import { IExtHostInitDataService } from './extHostInitDataService.js';
 import { ILogger, ILoggerService, ILogService } from '../../../platform/log/common/log.js';
 import { autorun, derivedOpts, IObservable, ISettableObservable, observableValue } from '../../../base/common/observable.js';
-import { stringHash } from '../../../base/common/hash.js';
+import { StringSHA1 } from '../../../base/common/hash.js';
+import { generateUuid } from '../../../base/common/uuid.js';
 import { DisposableStore, IDisposable } from '../../../base/common/lifecycle.js';
 import { IExtHostUrlsService } from './extHostUrls.js';
 import { encodeBase64, VSBuffer } from '../../../base/common/buffer.js';
@@ -26,7 +27,7 @@ import { equals as arraysEqual } from '../../../base/common/arrays.js';
 import { IExtHostProgress } from './extHostProgress.js';
 import { IProgressStep } from '../../../platform/progress/common/progress.js';
 import { CancellationError, isCancellationError } from '../../../base/common/errors.js';
-import { raceCancellationError, SequencerByKey } from '../../../base/common/async.js';
+import { raceCancellationError, Sequencer, SequencerByKey } from '../../../base/common/async.js';
 
 export interface IExtHostAuthentication extends ExtHostAuthentication { }
 
@@ -539,11 +540,11 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		let sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
 		this._logger.info(`Found ${sessions.length} sessions for ${scopeCountText(scopes)}`);
 		if (sessions.length) {
-			const newTokens: IAuthorizationToken[] = [];
-			const removedTokens: IAuthorizationToken[] = [];
-			const refreshedTokens = new Set<IAuthorizationToken>();
-			const expiredTokens: IAuthorizationToken[] = [];
-			const tokenMap = new Map<string, IAuthorizationToken>(this._tokenStore.tokens.map(token => [token.access_token, token]));
+			const removedTokens: ISessionToken[] = [];
+			/** Each refreshed token and the token that replaces it. */
+			const refreshedTokens = new Map<ISessionToken, IAuthorizationToken>();
+			const expiredTokens: ISessionToken[] = [];
+			const tokenMap = new Map<string, ISessionToken>(this._tokenStore.tokens.map(token => [token.access_token, token]));
 			for (const session of sessions) {
 				const token = tokenMap.get(session.accessToken);
 				if (token && token.expires_in) {
@@ -576,8 +577,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 								newToken.scope = scopeStr;
 							}
 							this._logger.info(`Successfully created a new token for ${scopeCountText(session.scopes)}.`);
-							newTokens.push(newToken);
-							refreshedTokens.add(token);
+							refreshedTokens.set(token, newToken);
 						} catch (err) {
 							this._logger.error(`Failed to refresh token: ${describeOAuthFailure(err, 'the refresh failed unexpectedly')}`);
 						}
@@ -588,9 +588,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			// A token whose refresh failed stays stored (a failure may be transient; its refresh token is a credential) and
 			// this operation rejects. Only an explicit act of the user removes it: signing out, or removing the provider.
 			const failedRefreshTokens = removedTokens.filter(t => !refreshedTokens.has(t));
-			const replacedTokens = removedTokens.filter(t => refreshedTokens.has(t));
-			if (newTokens.length || replacedTokens.length) {
-				await this._tokenStore.update({ added: newTokens, removed: replacedTokens });
+			if (refreshedTokens.size) {
+				await this._tokenStore.update({ refreshed: [...refreshedTokens].map(([previous, token]) => ({ previous, token })) });
 				// Since we updated the tokens, we need to re-filter the sessions
 				// to get the latest state
 				sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
@@ -672,7 +671,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		}
 
 		// Store session for later retrieval
-		await this._tokenStore.update({ added: [{ ...token, created_at: Date.now() }], removed: [] });
+		await this._tokenStore.update({ added: [{ ...token, created_at: Date.now() }] });
 		const session = this._tokenStore.sessions.find(t => t.accessToken === token.access_token)!;
 		this._logger.info(`Created ${token.refresh_token ? 'refreshable' : 'non-refreshable'} session for ${scopeCountText(scopes)}${token.expires_in ? ` that expires in ${token.expires_in} seconds` : ''}`);
 		return session;
@@ -692,7 +691,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			this._logger.error(`Failed to retrieve token for removed session: ${session.id}`);
 			return;
 		}
-		await this._tokenStore.update({ added: [], removed: [token] });
+		await this._tokenStore.update({ removed: [token] });
 		this._logger.info(`Removed token for session: ${session.id} with ${scopeCountText(session.scopes)}`);
 	}
 
@@ -1018,12 +1017,185 @@ type IAuthorizationToken = IAuthorizationTokenResponse & {
 	created_at: number;
 };
 
+/**
+ * A token as {@link TokenStore} keeps it. `session_id` names the logical session: it is made at sign-in and kept by every
+ * refresh, so a session is never identified by its access token (a refresh replaces it) or by a hash of it (which can
+ * collide). `revision` names this credential of the session: every sign-in and every refresh makes a new one. Both are
+ * stored beside the token.
+ */
+type ISessionToken = IAuthorizationToken & {
+	session_id: string;
+	revision: string;
+};
+
+/**
+ * Stored on each token of a saved list (the same on every token of it): the revisions of the stored list that this list
+ * includes, newest first, its own first. A window tells from them whether a list it reads was written with its own last
+ * save in view, and which earlier list both include.
+ */
+const STORED_REVISIONS = 'stored_revisions';
+/**
+ * Stored on each token of a saved list (the same on every token of it): the ids of sessions recently signed out, newest
+ * first. A list that still holds such a session (written without the sign-out in view) is corrected by every window that
+ * knows of the sign-out. An empty list cannot carry it: a window that saw the sign-out keeps it in memory as well.
+ */
+const SIGNED_OUT_SESSIONS = 'signed_out_sessions';
+const STORED_REVISIONS_MAX = 32;
+const SIGNED_OUT_SESSIONS_MAX = 32;
+const REMEMBERED_LISTS_MAX = 32;
+/** Saves of one operation while the stored sessions keep changing, before it rejects. */
+const SAVE_ROUNDS_MAX = 5;
+
+/** A list of sessions as stored. */
+interface ISessionList {
+	readonly tokens: readonly ISessionToken[];
+	/** Its stored revisions, newest first. Empty when unknown: an empty list, or a list saved by an earlier version. */
+	readonly revisions: readonly string[];
+	/** The ids of sessions recently signed out, newest first. */
+	readonly signedOut: readonly string[];
+}
+
+/** The stored sessions cannot be read as sessions: the stored value is kept and not used. The message carries no token. */
+class InvalidStoredSessionsError extends Error {
+	override readonly name = 'InvalidStoredSessionsError';
+}
+
+function newRevision(): string {
+	return generateUuid().replace(/-/g, '').slice(0, 16);
+}
+
+/**
+ * The session id and revision of a token saved by an earlier version, which stored neither: derived from its whole access
+ * token, so every window derives the same, and two tokens never share one (a SHA-1, not a 32-bit hash). It reveals no token.
+ */
+function legacySessionId(token: IAuthorizationToken): string {
+	const sha = new StringSHA1();
+	sha.update(token.access_token);
+	return `legacy-${sha.digest()}`;
+}
+
+function isStringList(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every(item => typeof item === 'string');
+}
+
+/** The first `max` distinct items of the lists, in order. */
+function newestFirst(max: number, ...lists: (readonly string[])[]): string[] {
+	return [...new Set(lists.flat())].slice(0, max);
+}
+
+/** Reads a stored list. Rejects with {@link InvalidStoredSessionsError} when its session bookkeeping is malformed. */
+function readSessionList(stored: readonly IAuthorizationToken[]): ISessionList {
+	const tokens: ISessionToken[] = [];
+	let lists: { revisions: string[]; signedOut: string[] } | undefined;
+	let fromEarlierVersion = false;
+	for (const entry of stored) {
+		const { [STORED_REVISIONS]: revisions, [SIGNED_OUT_SESSIONS]: signedOut, ...token } = entry as IAuthorizationToken & { session_id?: unknown; revision?: unknown; [STORED_REVISIONS]?: unknown; [SIGNED_OUT_SESSIONS]?: unknown };
+		if (token.session_id === undefined && token.revision === undefined && revisions === undefined && signedOut === undefined) {
+			const id = legacySessionId(entry);
+			tokens.push({ ...token, session_id: id, revision: id });
+			fromEarlierVersion = true;
+			continue;
+		}
+		if (typeof token.session_id !== 'string' || typeof token.revision !== 'string' || !isStringList(revisions) || !revisions.length || !isStringList(signedOut)) {
+			throw new InvalidStoredSessionsError('A stored session has malformed session bookkeeping.');
+		}
+		if (!lists) {
+			lists = { revisions, signedOut };
+		} else if (!arraysEqual(lists.revisions, revisions) || !arraysEqual(lists.signedOut, signedOut)) {
+			throw new InvalidStoredSessionsError('The stored sessions disagree on the bookkeeping of their list.');
+		}
+		tokens.push({ ...token, session_id: token.session_id, revision: token.revision });
+	}
+	if (new Set(tokens.map(t => t.session_id)).size !== tokens.length) {
+		throw new InvalidStoredSessionsError('Two stored sessions share a session id.');
+	}
+	return { tokens, revisions: fromEarlierVersion || !lists ? [] : lists.revisions, signedOut: lists ? lists.signedOut : [] };
+}
+
+/** Whether two lists hold the same credentials: the same sessions, each at the same revision. */
+function sameSessions(a: readonly ISessionToken[], b: readonly ISessionToken[]): boolean {
+	return a.length === b.length && a.every(token => b.some(other => other.session_id === token.session_id && other.revision === token.revision));
+}
+
+/**
+ * Merges a list stored by another window (`theirs`) with this window's sessions (`ours`), both changed since `base`
+ * (a list each of them includes). A signed-out session is dropped from every side. Per logical session, a change on one
+ * side only is taken. Changed on both sides: a sign-out wins over a refresh (it is the user's explicit act), and two
+ * refreshes are both kept (no credential another window saved is lost, and none made here). Which of the two keeps the
+ * session id and which becomes a session of its own (its id: its revision) is decided by revision alone, so every window
+ * that merges the same two decides the same. Returns the merged sessions and the ids of the sessions it found signed out.
+ */
+function mergeSessions(base: readonly ISessionToken[], theirs: readonly ISessionToken[], ours: readonly ISessionToken[], signedOut: ReadonlySet<string>, logger: ILogger): { tokens: ISessionToken[]; signedOut: string[] } {
+	const live = (tokens: readonly ISessionToken[]) => new Map(tokens.filter(t => !signedOut.has(t.session_id)).map(t => [t.session_id, t]));
+	const b = live(base), t = live(theirs), o = live(ours);
+	if (ours.some(token => signedOut.has(token.session_id))) {
+		logger.warn('A session held here was signed out in another window; it stays signed out.');
+	}
+	const merged = new Map<string, ISessionToken>();
+	const forks: ISessionToken[] = [];
+	const removed: string[] = [];
+	for (const id of new Set([...t.keys(), ...o.keys(), ...b.keys()])) {
+		const ancestor = b.get(id)?.revision, mine = o.get(id), other = t.get(id);
+		let kept: ISessionToken | undefined;
+		if (other?.revision === mine?.revision || mine?.revision === ancestor) {
+			kept = other;
+		} else if (other?.revision === ancestor) {
+			kept = mine;
+		} else if (!other || !mine) {
+			logger.warn(other
+				? 'A session signed out here was refreshed in another window; it stays signed out.'
+				: 'A session refreshed here was signed out in another window; it stays signed out and the refreshed credential is not kept.');
+		} else {
+			const [winner, forked] = other.revision < mine.revision ? [other, mine] : [mine, other];
+			kept = winner;
+			forks.push({ ...forked, session_id: forked.revision });
+			logger.warn('A session was refreshed both here and in another window; both credentials are kept, as two sessions.');
+		}
+		if (kept) {
+			merged.set(id, kept);
+		} else {
+			removed.push(id);
+		}
+	}
+	for (const fork of forks) {
+		// The other side may hold the same fork already.
+		if (!merged.has(fork.session_id)) {
+			merged.set(fork.session_id, fork);
+		}
+	}
+	return { tokens: [...merged.values()], signedOut: removed };
+}
+
+/**
+ * The sessions of one dynamic provider and client, shared with every other window through secret storage. Each window
+ * keeps the sessions it uses ({@link tokens}): the stored ones merged with every change it saw or made. A save writes
+ * them with the revisions of the stored lists they include and the sessions recently signed out; a list another window
+ * stores is merged against the last list both include ({@link mergeSessions}), so a save that lands over another
+ * window's never decides the outcome: a window whose change is missing from a stored list saves the merged sessions again.
+ *
+ * There is no compare-and-set at the storage boundary, and an EMPTY list carries no revisions: an empty list read from
+ * another window is taken as written after the last list this window knew to be stored (its removals win). A session
+ * that this window had saved, and that a window without it in view then overwrote with an empty list, is lost.
+ */
 class TokenStore implements Disposable {
-	/** The tokens this window uses. They may hold a change that is not saved yet ({@link _pending}). */
-	private _tokens: IAuthorizationToken[];
-	private _pending = false;
+	/** The sessions this window uses. They may hold a change that is not saved yet. */
+	private _tokens: ISessionToken[];
+	/** The stored revisions whose lists {@link _tokens} includes, newest first. */
+	private _revisions: string[];
+	/** The ids of sessions signed out (here, or seen signed out), newest first. */
+	private _signedOut: string[];
+	/** The last list known to be stored: read from storage, or saved here with nothing read meanwhile. */
+	private _stored: ISessionList;
+	/** Lists by stored revision, read or saved here: the merge base for a list another window stores. */
+	private readonly _lists = new Map<string, readonly ISessionToken[]>();
+	/** Empty lists saved here whose change has not been read back yet (an empty list carries no revision). */
+	private _unreadEmptySaves = 0;
+	/** Counts the lists read from storage, so that a save tells whether one was read while it ran. */
+	private _reads = 0;
+	private _saving = false;
+	private readonly _saves = new Sequencer();
 	/** The tokens known to be saved: completed-change events are published from these only. */
-	private readonly _tokensObservable: ISettableObservable<IAuthorizationToken[]>;
+	private readonly _tokensObservable: ISettableObservable<readonly ISessionToken[]>;
 	private readonly _sessionsObservable: IObservable<vscode.AuthenticationSession[]>;
 
 	private readonly _onDidChangeSessions = new Emitter<vscode.AuthenticationProviderAuthenticationSessionsChangeEvent>();
@@ -1032,30 +1204,27 @@ class TokenStore implements Disposable {
 	private readonly _disposable: DisposableStore;
 
 	constructor(
-		private readonly _persistence: { onDidChange: Event<IAuthorizationToken[]>; set: (tokens: IAuthorizationToken[]) => Promise<void> },
+		private readonly _persistence: { onDidChange: Event<IAuthorizationToken[] | undefined>; set: (tokens: IAuthorizationToken[]) => Promise<void> },
 		initialTokens: IAuthorizationToken[],
 		private readonly _logger: ILogger
 	) {
 		this._disposable = new DisposableStore();
-		this._tokens = initialTokens;
-		this._tokensObservable = observableValue<IAuthorizationToken[]>('tokens', initialTokens);
+		const initial = readSessionList(initialTokens);
+		this._tokens = [...initial.tokens];
+		this._revisions = [...initial.revisions];
+		this._signedOut = [...initial.signedOut];
+		this._stored = initial;
+		this._remember(initial);
+		this._tokensObservable = observableValue<readonly ISessionToken[]>('tokens', initial.tokens);
 		this._sessionsObservable = derivedOpts(
 			{ equalsFn: (a, b) => arraysEqual(a, b, (a, b) => a.accessToken === b.accessToken) },
 			(reader) => this._tokensObservable.read(reader).map(t => this._getSessionFromToken(t))
 		);
 		this._disposable.add(this._registerChangeEventAutorun());
-		this._disposable.add(this._persistence.onDidChange((tokens) => {
-			this._tokensObservable.set(tokens, undefined);
-			if (this._pending) {
-				// The unsaved change may hold a rotated refresh token: it is kept, and saved by the next operation.
-				this._logger.warn('The stored sessions changed while a change here is not saved yet; the change here is kept and saved by the next operation.');
-			} else {
-				this._tokens = tokens;
-			}
-		}));
+		this._disposable.add(this._persistence.onDidChange(tokens => this._onDidStore(tokens)));
 	}
 
-	get tokens(): IAuthorizationToken[] {
+	get tokens(): ISessionToken[] {
 		return this._tokens;
 	}
 
@@ -1067,57 +1236,163 @@ class TokenStore implements Disposable {
 		this._disposable.dispose();
 	}
 
+	/** A list was stored (by any window, this one included): it is merged into the sessions here. */
+	private _onDidStore(stored: IAuthorizationToken[] | undefined): void {
+		let list: ISessionList;
+		try {
+			// The storage reports a deleted list as undefined. Only removing the provider deletes it: it holds no session.
+			list = readSessionList(stored === undefined ? [] : stored);
+		} catch (error) {
+			if (!(error instanceof InvalidStoredSessionsError)) {
+				throw error;
+			}
+			this._logger.error(`The stored sessions changed but cannot be read: ${error.message} They are not used here.`);
+			return;
+		}
+		this._reads++;
+		const signedOut = new Set([...this._signedOut, ...list.signedOut]);
+		const merged = mergeSessions(this._mergeBase(list), list.tokens, this._tokens, signedOut, this._logger);
+		this._tokens = merged.tokens;
+		this._signedOut = newestFirst(SIGNED_OUT_SESSIONS_MAX, merged.signedOut, list.signedOut, this._signedOut);
+		this._revisions = newestFirst(STORED_REVISIONS_MAX, list.revisions, this._revisions);
+		this._remember(list);
+		this._stored = list;
+		this._tokensObservable.set(list.tokens, undefined);
+		if (!this._saving && !sameSessions(this._tokens, list.tokens)) {
+			// A change made here and not saved yet, or one that a save of another window overwrote.
+			this._logger.info('The stored sessions lack a change known here; the merged sessions are saved.');
+			this.savePending().then(undefined, () => {
+				this._logger.error('The merged sessions could not be saved; the change is kept here and saved by the next operation.');
+			});
+		}
+	}
+
+	/** The last list that both a stored list and the sessions here include. */
+	private _mergeBase(list: ISessionList): readonly ISessionToken[] {
+		if (list.revisions.length) {
+			for (const revision of list.revisions) {
+				const known = this._revisions.includes(revision) ? this._lists.get(revision) : undefined;
+				if (known) {
+					return known;
+				}
+			}
+		} else if (!list.tokens.length && this._unreadEmptySaves > 0) {
+			// The empty list saved here, read back.
+			this._unreadEmptySaves--;
+			return list.tokens;
+		}
+		// No list known to both: the stored one is taken as written after the last list known to be stored.
+		return this._stored.tokens;
+	}
+
+	private _remember(list: ISessionList): void {
+		if (list.revisions.length) {
+			this._lists.set(list.revisions[0], list.tokens);
+			for (const revision of this._lists.keys()) {
+				if (this._lists.size <= REMEMBERED_LISTS_MAX) {
+					break;
+				}
+				this._lists.delete(revision);
+			}
+		}
+	}
+
 	/**
 	 * Applies the change here and saves it. When it cannot be saved this rejects with {@link DynamicAuthSessionPersistError}
 	 * (after one error line) and the change stays pending: {@link savePending} saves it before a later operation succeeds.
+	 * A refresh replaces the credential of its session only if it is still the one refreshed: a session another window
+	 * refreshed meanwhile keeps that credential and the new one becomes a session of its own; a session signed out
+	 * meanwhile stays signed out.
 	 */
-	async update({ added, removed }: { added: IAuthorizationToken[]; removed: IAuthorizationToken[] }): Promise<void> {
-		this._logger.trace(`Updating tokens: added ${added.length}, removed ${removed.length}`);
-		const currentTokens = [...this._tokens];
-		for (const token of removed) {
-			const index = currentTokens.findIndex(t => t.access_token === token.access_token);
-			if (index !== -1) {
-				currentTokens.splice(index, 1);
+	async update({ added = [], refreshed = [], removed = [] }: {
+		added?: readonly IAuthorizationToken[];
+		refreshed?: readonly { previous: ISessionToken; token: IAuthorizationToken }[];
+		removed?: readonly ISessionToken[];
+	}): Promise<void> {
+		this._logger.trace(`Updating tokens: added ${added.length + refreshed.length}, removed ${refreshed.length + removed.length}`);
+		let tokens = [...this._tokens];
+		for (const { previous, token } of refreshed) {
+			const index = tokens.findIndex(t => t.session_id === previous.session_id);
+			if (index === -1) {
+				this._logger.warn('A session refreshed here was signed out meanwhile; it stays signed out and the refreshed credential is not kept.');
+			} else if (tokens[index].revision !== previous.revision) {
+				// The other window's credential is stored already: it keeps the session id, and this one is a session of its own.
+				this._logger.warn('A session was refreshed both here and in another window; both credentials are kept, as two sessions.');
+				const revision = newRevision();
+				tokens.push({ ...token, session_id: revision, revision });
+			} else {
+				tokens[index] = { ...token, session_id: previous.session_id, revision: newRevision() };
 			}
 		}
 		for (const token of added) {
-			const index = currentTokens.findIndex(t => t.access_token === token.access_token);
-			if (index === -1) {
-				currentTokens.push(token);
-			} else {
-				currentTokens[index] = token;
-			}
+			tokens.push({ ...token, session_id: newRevision(), revision: newRevision() });
 		}
-		if (added.length || removed.length) {
-			this._tokens = currentTokens;
-			this._pending = true;
+		if (removed.length) {
+			const ids = removed.map(token => token.session_id);
+			tokens = tokens.filter(t => !ids.includes(t.session_id));
+			this._signedOut = newestFirst(SIGNED_OUT_SESSIONS_MAX, ids, this._signedOut);
 		}
+		this._tokens = tokens;
 		await this.savePending();
-		this._logger.trace(`Tokens updated: ${currentTokens.length} tokens stored.`);
+		this._logger.trace(`Tokens updated: ${tokens.length} tokens stored.`);
 	}
 
 	/**
 	 * Saves a change that is not saved yet; nothing to do otherwise. Once saved, the completed-change event is published.
-	 * Rejects with {@link DynamicAuthSessionPersistError} after one error line, leaving the change pending.
+	 * Rejects with {@link DynamicAuthSessionPersistError} after one error line, leaving the change pending. Saves are
+	 * serialized; a list stored by another window while a save runs is merged, and the merged sessions are saved again.
 	 */
-	async savePending(): Promise<void> {
-		if (!this._pending) {
-			return;
-		}
-		const tokens = this._tokens;
+	savePending(): Promise<void> {
+		return this._saves.queue(() => this._saveRounds());
+	}
+
+	private async _saveRounds(): Promise<void> {
+		this._saving = true;
 		try {
-			await this._persistence.set(tokens);
+			for (let round = 1; !sameSessions(this._tokens, this._stored.tokens); round++) {
+				if (round > SAVE_ROUNDS_MAX) {
+					this._logger.error(`The stored sessions kept changing while ${this._tokens.length} token(s) were saved; the change is kept here and saved by the next operation.`);
+					throw new DynamicAuthSessionPersistError(this._tokens.length, 'ConcurrentChange');
+				}
+				if (round > 1) {
+					this._logger.warn('The sessions changed while they were saved; the merged sessions are saved again.');
+				}
+				await this._saveOnce();
+			}
+		} finally {
+			this._saving = false;
+		}
+	}
+
+	private async _saveOnce(): Promise<void> {
+		const tokens = this._tokens;
+		const revisions = newestFirst(STORED_REVISIONS_MAX, [newRevision()], this._revisions);
+		const signedOut = this._signedOut;
+		this._revisions = revisions;
+		const list: ISessionList = { tokens, revisions: tokens.length ? revisions : [], signedOut: tokens.length ? signedOut : [] };
+		this._remember(list);
+		const reads = this._reads;
+		if (!tokens.length) {
+			this._unreadEmptySaves++;
+		}
+		try {
+			await this._persistence.set(tokens.map(token => Object.assign({}, token, { [STORED_REVISIONS]: revisions, [SIGNED_OUT_SESSIONS]: signedOut })));
 		} catch (error) {
+			if (!tokens.length) {
+				this._unreadEmptySaves--;
+			}
 			// The tokens are credentials, and a storage error's text is not safe by construction: only the count and the
 			// error's class are logged and carried (no cause).
 			const failure = error instanceof Error ? error.name : typeof error;
 			this._logger.error(`Failed to save ${tokens.length} token(s) to secret storage: ${failure}`);
 			throw new DynamicAuthSessionPersistError(tokens.length, failure);
 		}
-		if (this._tokens === tokens) {
-			this._pending = false;
+		if (this._reads === reads) {
+			// Nothing was read while saving: the saved list is the stored one. Otherwise the last list read is the one
+			// compared with, and the merged sessions are saved again if they differ.
+			this._stored = list;
+			this._tokensObservable.set(tokens, undefined);
 		}
-		this._tokensObservable.set(tokens, undefined);
 	}
 
 	private _registerChangeEventAutorun(): IDisposable {
@@ -1174,7 +1449,7 @@ class TokenStore implements Disposable {
 		});
 	}
 
-	private _getSessionFromToken(token: IAuthorizationTokenResponse): vscode.AuthenticationSession {
+	private _getSessionFromToken(token: ISessionToken): vscode.AuthenticationSession {
 		let claims: IAuthorizationJWTClaims | undefined;
 		if (token.id_token) {
 			try {
@@ -1196,7 +1471,8 @@ class TokenStore implements Disposable {
 				? claims.scope.split(' ')
 				: [];
 		return {
-			id: stringHash(token.access_token, 0).toString(),
+			// The credential's revision: unique, free of token text, and new at each refresh (as the access token is).
+			id: token.revision,
 			accessToken: token.access_token,
 			account: {
 				id: claims?.sub || 'unknown',
