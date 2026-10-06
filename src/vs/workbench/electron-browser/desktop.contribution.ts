@@ -28,6 +28,7 @@ import { NativeWindow } from './window.js';
 import { ModifierKeyEmitter } from '../../base/browser/dom.js';
 import { applicationConfigurationNodeBase, securityConfigurationNodeBase } from '../common/configuration.js';
 import { MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL } from '../../platform/window/electron-browser/window.js';
+import { QL_POLICY_CUSTOM_TITLE_BAR_VISIBILITY, QL_POLICY_TITLE_BAR_STYLE } from '../../platform/policy/common/qlChromePolicy.js'; // QuantLab host (U7)
 
 // Actions
 (function registerActions(): void {
@@ -241,6 +242,7 @@ import { MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL } from '../../platform/window/electron-b
 				'default': 'custom',
 				'scope': ConfigurationScope.APPLICATION,
 				'description': localize('titleBarStyle', "Adjust the appearance of the window title bar to be native by the OS or custom. Changes require a full restart to apply."),
+				'policy': QL_POLICY_TITLE_BAR_STYLE, // QuantLab host (U7)
 			},
 			'window.controlsStyle': {
 				'type': 'string',
@@ -261,6 +263,7 @@ import { MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL } from '../../platform/window/electron-b
 				'default': 'auto',
 				'scope': ConfigurationScope.APPLICATION,
 				'markdownDescription': localize('window.customTitleBarVisibility', "Adjust when the custom title bar should be shown. The custom title bar can be hidden when in full screen mode with `windowed`. The custom title bar can only be hidden in non full screen mode with `never` when {0} is set to `native`.", '`#window.titleBarStyle#`'),
+				'policy': QL_POLICY_CUSTOM_TITLE_BAR_VISIBILITY, // QuantLab host (U7)
 			},
 			'window.menuStyle': {
 				'type': 'string',
