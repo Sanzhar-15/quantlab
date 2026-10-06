@@ -192,7 +192,8 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		const key = JSON.stringify({ isDynamicAuthProvider: true, authProviderId, clientId });
 		const value = JSON.stringify(sessions);
 		await this.secretStorageService.set(key, value);
-		this.logService.trace(`Set session data for ${authProviderId} (${clientId}) in secret storage:`, sessions);
+		// The token responses are credentials: only their count is logged.
+		this.logService.trace(`Set ${sessions.length} session(s) for ${authProviderId} (${clientId}) in secret storage`);
 	}
 }
 

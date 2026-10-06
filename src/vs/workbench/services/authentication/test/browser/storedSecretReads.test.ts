@@ -5,7 +5,7 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
-import { NullLogService } from '../../../../../platform/log/common/log.js';
+import { ILogService, NullLogService } from '../../../../../platform/log/common/log.js';
 import { InvalidStoredSecretError } from '../../../../../platform/secrets/common/secrets.js';
 import { TestSecretStorageService } from '../../../../../platform/secrets/test/common/testSecretStorageService.js';
 import { TestProductService, TestStorageService } from '../../../../test/common/workbenchTestServices.js';
@@ -63,6 +63,22 @@ suite('Authentication - stored secrets that cannot be read', () => {
 			const service = createService();
 			await assert.rejects(service.getSessionsForDynamicAuthProvider('p1', 'c1'), invalid(key, 'tok-secret-text'));
 			assert.strictEqual(await secrets.get(key), stored);
+		});
+	});
+
+	suite('DynamicAuthenticationProviderStorageService logs', () => {
+		test('storing sessions logs no token text at any level', async () => {
+			const logged: string[] = [];
+			class RecordingLogService extends NullLogService {
+				override trace(message: string, ...args: unknown[]): void { logged.push(message, JSON.stringify(args)); }
+				override debug(message: string, ...args: unknown[]): void { logged.push(message, JSON.stringify(args)); }
+				override info(message: string, ...args: unknown[]): void { logged.push(message, JSON.stringify(args)); }
+			}
+			const logService: ILogService = new RecordingLogService();
+			const service = store.add(new DynamicAuthenticationProviderStorageService(store.add(new TestStorageService()), new TestSecretStorageService(), logService));
+			await service.setSessionsForDynamicAuthProvider('p1', 'c1', [{ access_token: 'tok-secret-text', token_type: 'Bearer', created_at: 1 }]);
+			assert.ok(logged.length > 0);
+			assert.ok(logged.every(line => !line.includes('tok-secret-text')), logged.join(' | '));
 		});
 	});
 
