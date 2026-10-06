@@ -127,6 +127,7 @@ import ErrorTelemetry from '../../platform/telemetry/electron-main/errorTelemetr
 // electron-updater is CommonJS with getter-defined exports: node's ESM loader finds no named export (`autoUpdater`), and
 // out/main.js is ESM, so a named import throws SyntaxError before `ready` (package 5, folds/HOST/U5-LAUNCH-1.md). Default import.
 import electronUpdater from 'electron-updater';
+import { existsSync } from 'fs';
 import { bakedBuildValues, createUpdater, startTerminalHost, type Ports, type TerminalHost } from './ql-client/index.js';
 // QuantLab host (U5): the lazy gate and the adopted workbench view (qlHost/)
 import { QlDialogMainService } from './qlHost/dialogs.js';
@@ -1378,11 +1379,31 @@ export class CodeApplication extends Disposable {
 
 		// QuantLab updater (PACK, folds/HOST/PACK-UPDATER-HUNK.md): the ONE updater, electron-updater injected into the client
 		// module; install on Electron's quit only (autoInstallOnAppQuit), no quitAndInstall and no restart UI in v1
+		// F-PACK-18: the macOS executable is Contents/MacOS/Electron (as upstream), so Electron's app.isPackaged is false and
+		// electron-updater 6.6.2 would skip every check (isUpdaterActive). In a real bundle (not a default app, the executable inside
+		// <X>.app/Contents/MacOS, Resources/app-update.yml present) the updater is pointed at that file and its isPackaged gate lifted;
+		// anywhere else it is NOT registered and that is logged: an error in a built app (a broken package), info in a source run.
 		const { autoUpdater } = electronUpdater;
-		autoUpdater.autoDownload = true;
-		autoUpdater.autoInstallOnAppQuit = true;
-		const updater = createUpdater(terminalHost.host, { updater: autoUpdater });
-		updater.checkForUpdates().catch(err => this.logService.error('updater: check failed', err));
+		const updateConfig = join(process.resourcesPath, 'app-update.yml');
+		const bundled = isMacintosh && !process.defaultApp && /\.app\/Contents\/MacOS\/[^/]+$/.test(process.execPath) && existsSync(updateConfig);
+		if (!bundled && !app.isPackaged) {
+			const why = `execPath ${process.execPath}, defaultApp ${process.defaultApp === true}, ${updateConfig} ${existsSync(updateConfig) ? 'present' : 'absent'}`;
+			if (this.environmentMainService.isBuilt) {
+				this.logService.error(`updater: NOT registered: a built app that is not a packaged app bundle (${why})`);
+			} else {
+				this.logService.info(`updater: not registered: development run (${why})`);
+			}
+		} else {
+			if (bundled) {
+				autoUpdater.updateConfigPath = updateConfig;
+				autoUpdater.forceDevUpdateConfig = true;
+			}
+			autoUpdater.autoDownload = true;
+			autoUpdater.autoInstallOnAppQuit = true;
+			this.logService.info(`updater: registered (${bundled ? `bundle, config ${updateConfig}` : 'app.isPackaged'})`);
+			const updater = createUpdater(terminalHost.host, { updater: autoUpdater });
+			updater.checkForUpdates().catch(err => this.logService.error('updater: check failed', err));
+		}
 
 		// QuantLab host (U5): the workbench host takes over the window's close (the quit handshake runs through the lifecycle
 		// before the window goes), the toggle key, and the gate's requests
