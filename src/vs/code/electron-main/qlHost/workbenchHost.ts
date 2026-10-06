@@ -8,7 +8,7 @@
 // registration with the lifecycle service. The lazy gate and the adoption are `gate.ts` and `adopt.ts`.
 
 import { EventEmitter } from 'events';
-import type { BaseWindow, BrowserWindow, Event as ElectronEvent, Input, WebContents } from 'electron';
+import type { BaseWindow, BrowserWindow, Event as ElectronEvent, Input, MessageBoxOptions, WebContents } from 'electron';
 import { DeferredPromise, timeout } from '../../../base/common/async.js';
 import { toErrorMessage } from '../../../base/common/errorMessage.js';
 import { Event } from '../../../base/common/event.js';
@@ -353,11 +353,12 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 	private showFailure(headline: string, what: string, error: unknown): void {
 		this.deps.logService.error(`QuantLab host: ${what} failed`, error);
 
-		this.deps.dialogs.showMessageBox({
-			type: 'error',
-			message: headline,
-			detail: `${what}: ${toErrorMessage(error)}`
-		}).then(undefined, shown => this.deps.logService.error('QuantLab host: showing the failure dialog failed', shown));
+		// On the host window when there is one: unparented, the dialog is app-modal on macOS and holds the main thread (no
+		// quit, no other event) until it is answered. Before the terminal host is attached there is no window to carry it.
+		const options: MessageBoxOptions = { type: 'error', message: headline, detail: `${what}: ${toErrorMessage(error)}` };
+		const host = this.terminalHost?.window;
+		const shown = host && !host.isDestroyed() ? this.deps.dialogs.showMessageBoxOnHost(options, host) : this.deps.dialogs.showMessageBox(options);
+		shown.then(undefined, failure => this.deps.logService.error('QuantLab host: showing the failure dialog failed', failure));
 	}
 
 	//#endregion
