@@ -147,6 +147,9 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		if (perfDelayedSwitchActive()) {
 			terminalHost.host.log(`mutant ${PERF_DELAYED_SWITCH_MUTANT} ACTIVE`);
 		}
+		// From here on the toggle key and the overlay key are watched: a key pressed on the terminal page BEFORE this line reached
+		// no watch (the page can finish loading before startTerminalHost() returns). The line makes that gap readable in the log.
+		terminalHost.host.log('workbench host attached');
 		this.attached.complete(terminalHost);
 	}
 
