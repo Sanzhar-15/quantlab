@@ -74,7 +74,7 @@ class TestMcpHTTPHandle extends McpHTTPHandle {
 
 export interface IMcpHttpHarness {
 	readonly handle: McpHTTPHandle;
-	/** The Authorization header of each POST to the MCP endpoint, in order (undefined: sent without one). */
+	/** The Authorization header (any casing) of each POST to the MCP endpoint, in order (undefined: sent without one). */
 	readonly posts: (string | undefined)[];
 	/** Every request the transport answered, in order. */
 	readonly requests: { method: string | undefined; url: string; authorization: string | undefined }[];
@@ -91,6 +91,20 @@ export interface IMcpHttpHarnessSetup {
 	readonly getToken: (authDetails: IMcpAuthenticationDetails, options: IMcpAuthenticationOptions | undefined) => Promise<string | undefined>;
 	readonly getTokenForProvider: (providerId: string, scopes: string[]) => Promise<string | undefined>;
 	readonly authentication: McpServerTransportHTTPAuthentication | undefined;
+	/** The configured headers of the server (its launch headers), sent with every request. */
+	readonly launchHeaders: [string, string][];
+}
+
+/**
+ * The Authorization header a request carries, its name matched in any casing (HTTP header names are case-insensitive);
+ * several keys are joined as one header would be. Undefined: sent without one. Independent of the handle's own lookup.
+ */
+export function requestAuthorization(headers: Record<string, string> | undefined): string | undefined {
+	if (!headers) {
+		return undefined; // a request without options carries no header
+	}
+	const values = Object.entries(headers).filter(([name]) => name.toLowerCase() === 'authorization').map(([, value]) => value);
+	return values.length ? values.join(', ') : undefined;
 }
 
 export function createMcpHttpHarnessFrom(setup: IMcpHttpHarnessSetup): IMcpHttpHarness {
@@ -109,11 +123,11 @@ export function createMcpHttpHarnessFrom(setup: IMcpHttpHarnessSetup): IMcpHttpH
 		},
 		$getTokenForProviderId: (_id, providerId, scopes) => setup.getTokenForProvider(providerId, scopes),
 	};
-	const launch: McpServerTransportHTTP = { type: McpServerTransportType.HTTP, uri: URI.parse(HARNESS_MCP_URL), headers: [], authentication: setup.authentication };
+	const launch: McpServerTransportHTTP = { type: McpServerTransportType.HTTP, uri: URI.parse(HARNESS_MCP_URL), headers: setup.launchHeaders, authentication: setup.authentication };
 	const handle = new TestMcpHTTPHandle(launch, proxy as MainThreadMcpShape, new TraceLogService(), (url, init) => {
-		requests.push({ method: init?.method, url, authorization: init?.headers['Authorization'] });
+		requests.push({ method: init?.method, url, authorization: requestAuthorization(init?.headers) });
 		if (url === HARNESS_MCP_URL && init?.method === 'POST') {
-			posts.push(init.headers['Authorization']);
+			posts.push(requestAuthorization(init.headers));
 		}
 		return setup.transport(url, init);
 	});
@@ -131,6 +145,7 @@ export function createMcpHttpHarness(postStatuses: number[], getToken: (authDeta
 		getToken,
 		getTokenForProvider: () => Promise.reject(new Error('not used by this harness')),
 		authentication: undefined,
+		launchHeaders: [],
 		transport: async (url, init) => {
 			if (url !== HARNESS_MCP_URL || init?.method !== 'POST') {
 				return harnessResponse(404, url);

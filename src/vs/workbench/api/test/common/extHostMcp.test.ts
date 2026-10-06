@@ -809,6 +809,7 @@ suite('McpHTTPHandle authentication failures', () => {
 			getToken: async () => 'stored-token',
 			getTokenForProvider: () => Promise.reject(new Error('not used')),
 			authentication: undefined,
+			launchHeaders: [],
 			transport: async (url, init) => {
 				if (url === HARNESS_MCP_URL && init?.method === 'POST') {
 					return harnessResponse(405, url); // not streamable HTTP: fall back to legacy SSE
@@ -867,6 +868,7 @@ suite('McpHTTPHandle authentication failures', () => {
 			getToken: () => Promise.reject(new Error('not used')),
 			getTokenForProvider: async () => { throw new Error(`provider said ${PROVIDER}`); },
 			authentication: { providerId: 'example', scopes: ['read'] },
+			launchHeaders: [],
 			transport: async url => harnessResponse(200, url),
 		});
 		store.add(providerFails.handle);
@@ -902,6 +904,7 @@ suite('McpHTTPHandle authentication failures', () => {
 				getToken: async () => undefined,
 				getTokenForProvider: () => Promise.reject(new Error('not used')),
 				authentication: undefined,
+				launchHeaders: [],
 				transport: (url, init) => {
 					const key = `${init?.method} ${url}`;
 					const nth = (counts.get(key) ?? 0) + 1;
@@ -985,4 +988,111 @@ suite('McpHTTPHandle authentication failures', () => {
 			}
 		}
 	});
+
+	// review-c2 c2-3 (R-91): HTTP header names are case-insensitive. A configured Authorization header, in any casing, is the
+	// stored authorization: a 401/403 to a request carrying it stops, named, on both transports, and the trace masks it.
+	const CONFIGURED_AUTH_NAMES = ['authorization', 'Authorization', 'AuThOrIzAtIoN'];
+	const CONFIGURED_TOKEN = 'Bearer configured-token';
+
+	for (const name of CONFIGURED_AUTH_NAMES) {
+		for (const status of [401, 403]) {
+			test(`streamable HTTP: a configured '${name}' header rejected with ${status} stops, named; no new registration`, async () => {
+				const harness = createMcpHttpHarnessFrom({
+					getToken: async () => undefined, // no generated token: only the configured header authorizes
+					getTokenForProvider: () => Promise.reject(new Error('not used')),
+					authentication: undefined,
+					launchHeaders: [[name, CONFIGURED_TOKEN]],
+					transport: async (url, init) => {
+						if (url === HARNESS_MCP_URL && init?.method === 'POST') {
+							return harnessResponse(status, url, status === 401 ? { 'WWW-Authenticate': 'Bearer realm="example"' } : {}, 'echo configured-token');
+						}
+						return harnessResponse(404, url);
+					},
+				});
+				store.add(harness.handle);
+
+				await harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+
+				assert.deepStrictEqual(harness.tokenRequests.map(o => o?.forceNewRegistration), [undefined], 'one token request, never forcing a new registration');
+				assert.deepStrictEqual(harness.posts, [CONFIGURED_TOKEN, CONFIGURED_TOKEN], 'the request once after the metadata lookup; no retry after the rejection');
+				const errors = errorStateMessages(harness.states);
+				assert.strictEqual(errors.length, 1, errors.join('\n'));
+				assert.ok(errors[0].includes('McpAuthorizationRejectedError') && errors[0].includes(`HTTP ${status}`), errors[0]);
+				assert.ok(errors[0].includes('Remove Dynamic Authentication Providers'), 'the message names the explicit reset');
+				assert.ok(!errors[0].includes('configured-token'), 'the message carries no token');
+			});
+
+			test(`legacy SSE: a configured '${name}' header rejected with ${status} stops, named; no retry, no registration`, async () => {
+				const messagesUrl = 'https://mcp.example.com/messages';
+				const harness = createMcpHttpHarnessFrom({
+					getToken: () => Promise.reject(new Error('not used: the configured header authorizes')),
+					getTokenForProvider: () => Promise.reject(new Error('not used')),
+					authentication: undefined,
+					launchHeaders: [[name, CONFIGURED_TOKEN]],
+					transport: async (url, init) => {
+						if (url === HARNESS_MCP_URL && init?.method === 'POST') {
+							return harnessResponse(405, url); // not streamable HTTP: fall back to legacy SSE
+						}
+						if (url === HARNESS_MCP_URL && init?.method === 'GET') {
+							return new Response('event: endpoint\ndata: /messages\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } }) as unknown as CommonResponse;
+						}
+						if (url === messagesUrl && init?.method === 'POST') {
+							return harnessResponse(status, url, {}, 'echo configured-token');
+						}
+						return harnessResponse(404, url);
+					},
+				});
+				store.add(harness.handle);
+
+				await harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+				await waitFor(() => errorStateMessages(harness.states).length === 1, 'the legacy POST to fail');
+
+				const errors = errorStateMessages(harness.states);
+				assert.strictEqual(errors.length, 1, errors.join('\n'));
+				assert.ok(errors[0].includes('McpAuthorizationRejectedError') && errors[0].includes(`HTTP ${status}`), errors[0]);
+				assert.ok(!errors[0].includes('configured-token'), 'the message carries no token');
+				const legacyPosts = harness.requests.filter(r => r.url === messagesUrl);
+				assert.deepStrictEqual(legacyPosts.map(r => r.authorization), [CONFIGURED_TOKEN], 'no retry after a rejection');
+				assert.deepStrictEqual(harness.tokenRequests, [], 'no token request: nothing is registered or replaced');
+			});
+		}
+	}
+
+	for (const name of CONFIGURED_AUTH_NAMES) {
+		test(`the request trace masks a configured '${name}' header and a generated one; no credential reaches a log line`, async () => {
+			const CONFIGURED = 'CONFIGURED-SECRET-71a';
+			const GENERATED = 'GENERATED-SECRET-2f9';
+			let postCount = 0;
+			const harness = createMcpHttpHarnessFrom({
+				getToken: async () => GENERATED,
+				getTokenForProvider: () => Promise.reject(new Error('not used')),
+				authentication: undefined,
+				launchHeaders: [[name, `Bearer ${CONFIGURED}`]],
+				transport: async (url, init) => {
+					if (url === HARNESS_MCP_URL && init?.method === 'POST') {
+						// A 401 first (the token is fetched and added), then a 500 that ends the operation.
+						return ++postCount === 1 ? harnessResponse(401, url, { 'WWW-Authenticate': 'Bearer realm="example"' }) : harnessResponse(500, url);
+					}
+					return harnessResponse(404, url);
+				},
+			});
+			store.add(harness.handle);
+
+			await harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+
+			// The credentials did go on the wire, so their absence from the trace is the masking.
+			assert.strictEqual(harness.posts.length, 2, `${harness.posts.length} POSTs`);
+			assert.ok(harness.posts[0]?.includes(CONFIGURED), 'the configured header was sent');
+			assert.ok(harness.posts[1]?.includes(GENERATED), 'the generated header was sent');
+			const postTraces = harness.logs.filter(l => l.startsWith(`Fetching ${HARNESS_MCP_URL} with options:`) && l.includes('"method":"POST"'));
+			assert.strictEqual(postTraces.length, 2, postTraces.join('\n'));
+			for (const line of postTraces) {
+				assert.ok(line.includes(`"${name}":"***"`), `the configured header is masked: ${line}`);
+			}
+			assert.ok(postTraces[1].includes('"Authorization":"***"'), `the generated header is masked: ${postTraces[1]}`);
+			for (const line of [...harness.logs, ...harness.states.map(s => JSON.stringify(s))]) {
+				assert.ok(!line.includes(CONFIGURED) && !line.includes(GENERATED), `a credential reached a log line or the state: ${line}`);
+			}
+		});
+	}
 });

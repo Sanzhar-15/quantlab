@@ -626,7 +626,7 @@ export class McpHTTPHandle extends Disposable {
 		});
 
 		// The server rejected the stored authorization: the operation stops, named, as on the streamable HTTP path.
-		if (headers['Authorization'] && isAuthStatusCode(res.status)) {
+		if (hasAuthorizationHeader(headers) && isAuthStatusCode(res.status)) {
 			this._log(LogLevel.Warning, `Received ${res.status} status with Authorization header sending a message; the stored authorization is kept and the request stops.`);
 			throw new McpAuthorizationRejectedError(res.status);
 		}
@@ -745,7 +745,7 @@ export class McpHTTPHandle extends Disposable {
 					log: (level, message) => this._log(level, message)
 				});
 				await this._addAuthHeader(headers);
-				if (headers['Authorization']) {
+				if (hasAuthorizationHeader(headers)) {
 					// Update the headers in the init object
 					init.headers = headers;
 					res = await doFetch();
@@ -754,7 +754,7 @@ export class McpHTTPHandle extends Disposable {
 				// We have auth metadata, but got an auth error. Check if the scopes changed.
 				if (this._authMetadata.update(res)) {
 					await this._addAuthHeader(headers);
-					if (headers['Authorization']) {
+					if (hasAuthorizationHeader(headers)) {
 						// Update the headers in the init object
 						init.headers = headers;
 						res = await doFetch();
@@ -764,7 +764,7 @@ export class McpHTTPHandle extends Disposable {
 		}
 		// The server rejected the stored authorization. No new registration is forced: that would remove the stored client
 		// registration and sessions without an act of the user. The operation stops and names the explicit reset.
-		if (headers['Authorization'] && isAuthStatusCode(res.status)) {
+		if (hasAuthorizationHeader(headers) && isAuthStatusCode(res.status)) {
 			// No response body: it may echo a credential.
 			this._log(LogLevel.Warning, `Received ${res.status} status with Authorization header; the stored authorization is kept and the request stops.`);
 			throw new McpAuthorizationRejectedError(res.status);
@@ -780,8 +780,8 @@ export class McpHTTPHandle extends Disposable {
 			if (traceObj.body) {
 				traceObj.body = new TextDecoder().decode(traceObj.body);
 			}
-			if (traceObj.headers?.Authorization) {
-				traceObj.headers.Authorization = '***'; // don't log the auth header
+			for (const key of authorizationHeaderKeys(traceObj.headers)) {
+				traceObj.headers[key] = '***'; // don't log the auth header, in any casing
 			}
 			this._log(LogLevel.Trace, `Fetching ${url} with options: ${JSON.stringify(traceObj)}`);
 		}
@@ -877,6 +877,19 @@ function safeErrorText(err: unknown): string {
 
 function isAuthStatusCode(status: number): boolean {
 	return status === 401 || status === 403;
+}
+
+/**
+ * Every key of `headers` that names the Authorization header, in any casing: HTTP header names are case-insensitive, and
+ * configured headers keep the names they were given.
+ */
+function authorizationHeaderKeys(headers: Record<string, string>): string[] {
+	return Object.keys(headers).filter(key => key.toLowerCase() === 'authorization');
+}
+
+/** Whether the request carries an Authorization header (any casing) with a value. */
+function hasAuthorizationHeader(headers: Record<string, string>): boolean {
+	return authorizationHeaderKeys(headers).some(key => !!headers[key]);
 }
 
 
