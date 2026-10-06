@@ -124,7 +124,9 @@ import { IWebContentExtractorService } from '../../platform/webContentExtractor/
 import { NativeWebContentExtractorService } from '../../platform/webContentExtractor/electron-main/webContentExtractorService.js';
 import ErrorTelemetry from '../../platform/telemetry/electron-main/errorTelemetry.js';
 // QuantLab host (U3): the terminal host (generated client, see ql-client/MANIFEST.json)
-import { autoUpdater } from 'electron-updater';
+// electron-updater is CommonJS with getter-defined exports: node's ESM loader finds no named export (`autoUpdater`), and
+// out/main.js is ESM, so a named import throws SyntaxError before `ready` (package 5, folds/HOST/U5-LAUNCH-1.md). Default import.
+import electronUpdater from 'electron-updater';
 import { bakedBuildValues, createUpdater, startTerminalHost, type Ports, type TerminalHost } from './ql-client/index.js';
 // QuantLab host (U5): the lazy gate and the adopted workbench view (qlHost/)
 import { QlDialogMainService } from './qlHost/dialogs.js';
@@ -1373,6 +1375,7 @@ export class CodeApplication extends Disposable {
 
 		// QuantLab updater (PACK, folds/HOST/PACK-UPDATER-HUNK.md): the ONE updater, electron-updater injected into the client
 		// module; install on Electron's quit only (autoInstallOnAppQuit), no quitAndInstall and no restart UI in v1
+		const { autoUpdater } = electronUpdater;
 		autoUpdater.autoDownload = true;
 		autoUpdater.autoInstallOnAppQuit = true;
 		const updater = createUpdater(terminalHost.host, { updater: autoUpdater });
