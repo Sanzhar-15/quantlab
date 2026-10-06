@@ -9,7 +9,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
 import { IEncryptionService, KnownStorageProvider } from '../../../encryption/common/encryptionService.js';
 import { transformErrorForSerialization } from '../../../../base/common/errors.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { BaseSecretStorageService, SecretDecryptionCause, SecretDecryptionError, SecretStorageUnavailableError } from '../../common/secrets.js';
+import { BaseSecretStorageService, SecretDecryptionCause, SecretDecryptionError, SecretEncryptionCause, SecretEncryptionError, SecretStorageUnavailableError } from '../../common/secrets.js';
 import { InMemoryStorageService, StorageScope, StorageTarget } from '../../../storage/common/storage.js';
 
 class TestEncryptionService implements IEncryptionService {
@@ -49,6 +49,48 @@ class TestNoEncryptionService implements IEncryptionService {
 	isEncryptionAvailable(): Promise<boolean> {
 		return Promise.resolve(false);
 	}
+}
+
+/** Reads a property the way an observer would; a getter that throws yields the thrown value, so it is inspected too. */
+function observe(target: object, name: string): unknown {
+	try {
+		return (target as Record<string, unknown>)[name];
+	} catch (thrown) {
+		return thrown;
+	}
+}
+
+/** Every string an observer can read out of a value, at any depth: own properties, message, stack, cause chain. */
+function deepText(value: unknown, seen: Set<unknown> = new Set()): string {
+	if (typeof value === 'string') {
+		return value;
+	}
+	if (typeof value !== 'object' || value === null) {
+		return String(value);
+	}
+	if (seen.has(value)) {
+		return '';
+	}
+	seen.add(value);
+	const parts: string[] = [];
+	if (value instanceof Error) {
+		parts.push(deepText(observe(value, 'name'), seen), deepText(observe(value, 'message'), seen), deepText(observe(value, 'stack'), seen));
+	}
+	for (const name of Object.getOwnPropertyNames(value)) {
+		parts.push(name, deepText(observe(value, name), seen));
+	}
+	return parts.join('\n');
+}
+
+/** Records every argument of every log call, of all six levels. */
+class CapturingLogService extends NullLogService {
+	readonly calls: unknown[][] = [];
+	override trace(message: string, ...args: unknown[]): void { this.calls.push([message, ...args]); }
+	override debug(message: string, ...args: unknown[]): void { this.calls.push([message, ...args]); }
+	override info(message: string, ...args: unknown[]): void { this.calls.push([message, ...args]); }
+	override warn(message: string, ...args: unknown[]): void { this.calls.push([message, ...args]); }
+	override error(message: string | Error, ...args: unknown[]): void { this.calls.push([message, ...args]); }
+	override critical(message: string | Error, ...args: unknown[]): void { this.calls.push([message, ...args]); }
 }
 
 suite('secrets', () => {
@@ -198,6 +240,113 @@ suite('secrets', () => {
 		});
 	});
 
+	// F-SECRETS-7: a failed get() or set() is logged and rejected as a named error with a fixed cause. Nothing of the
+	// failure is read: not its message, stack or cause, and not its name (an identifier-shaped name can be a secret).
+	suite('BaseSecretStorageService useInMemoryStorage=false, the encryption layer fails', () => {
+		const marker = 'PLANTEDSECRETVALUE7f3a';
+
+		const failures: { readonly label: string; readonly make: () => unknown }[] = [
+			{
+				label: 'an error whose message, stack and nested cause carry the marker',
+				make: () => {
+					const failure = new Error(`denied ${marker}`, { cause: new Error(`nested ${marker}`, { cause: marker }) });
+					failure.stack = `Error: denied ${marker}\n    at ${marker}`;
+					return failure;
+				}
+			},
+			{
+				label: 'an error whose name is an identifier-shaped secret and whose message, stack and cause carry it too',
+				make: () => {
+					const failure = new Error(`denied ${marker}`, { cause: new Error(`nested ${marker}`) });
+					failure.name = marker;
+					failure.stack = `${marker}: denied ${marker}\n    at ${marker}`;
+					return failure;
+				}
+			},
+			{
+				label: 'an error whose name getter throws an error that carries the marker',
+				make: () => {
+					const failure = new Error(`denied ${marker}`);
+					Object.defineProperty(failure, 'name', { get() { throw new Error(`name read ${marker}`, { cause: marker }); } });
+					return failure;
+				}
+			},
+			{ label: 'a string that is the marker', make: () => marker },
+			{ label: 'an object whose message is the marker', make: () => ({ message: marker, name: marker }) },
+			{ label: 'null', make: () => null },
+		];
+
+		async function failingOperation(operation: 'get' | 'set', failure: unknown) {
+			const encryptionService = new TestEncryptionService();
+			const storageService = store.add(new InMemoryStorageService());
+			const logService = store.add(new CapturingLogService());
+			const service = store.add(new BaseSecretStorageService(false, storageService, encryptionService, logService));
+			if (operation === 'get') {
+				await service.set('my-secret', 'my-secret-value');
+				sinon.stub(encryptionService, 'decrypt').callsFake(() => Promise.reject(failure));
+			} else {
+				sinon.stub(encryptionService, 'encrypt').callsFake(() => Promise.reject(failure));
+			}
+			logService.calls.length = 0;
+			let rejection: unknown;
+			try {
+				if (operation === 'get') {
+					await service.get('my-secret');
+				} else {
+					await service.set('my-secret', 'my-secret-value');
+				}
+			} catch (e) {
+				rejection = e;
+			}
+			return { service, storageService, logService, rejection };
+		}
+
+		for (const operation of ['get', 'set'] as const) {
+			const wrapper = operation === 'get' ? SecretDecryptionError : SecretEncryptionError;
+			const causeType = operation === 'get' ? SecretDecryptionCause : SecretEncryptionCause;
+
+			for (const { label, make } of failures) {
+				test(`${operation}() rejects ${wrapper.name} naming the key and leaks nothing of ${label}`, async () => {
+					const failure = make();
+					const { service, storageService, logService, rejection } = await failingOperation(operation, failure);
+
+					assert.ok(rejection instanceof wrapper, `rejected with ${deepText(rejection)}`);
+					assert.notStrictEqual(rejection, failure, 'the rejection is not the raw error');
+					assert.strictEqual(rejection.key, 'my-secret');
+					assert.ok(rejection.message.includes(`'my-secret'`));
+					assert.ok(rejection.cause instanceof causeType);
+					assert.strictEqual(rejection.cause.message, 'The encryption service failed.');
+					assert.strictEqual(rejection.cause.kind, 'encryption-service');
+					assert.strictEqual(rejection.cause.cause, undefined);
+
+					assert.ok(!deepText(rejection).includes(marker), 'message, stack, cause chain');
+					assert.ok(!JSON.stringify(transformErrorForSerialization(rejection)).includes(marker), 'serialized for RPC');
+					assert.ok(!JSON.stringify(rejection, Object.getOwnPropertyNames(rejection)).includes(marker), 'as JSON');
+					assert.ok(!JSON.stringify(rejection.cause, Object.getOwnPropertyNames(rejection.cause)).includes(marker), 'cause as JSON');
+
+					assert.ok(logService.calls.some(args => args.some(arg => arg instanceof wrapper)), 'the failure is logged as the named error');
+					for (const args of logService.calls) {
+						assert.ok(!args.includes(failure), 'the raw error is not a log argument');
+						assert.ok(!deepText(args).includes(marker), deepText(args));
+					}
+
+					if (operation === 'get') {
+						assert.ok(storageService.get('secret://my-secret', StorageScope.APPLICATION), 'the stored value is kept');
+						assert.deepStrictEqual(await service.keys(), ['my-secret']);
+					} else {
+						assert.strictEqual(storageService.get('secret://my-secret', StorageScope.APPLICATION), undefined);
+						assert.deepStrictEqual(await service.keys(), []);
+					}
+				});
+			}
+		}
+
+		test('an error built without a failure has no cause', () => {
+			assert.strictEqual(new SecretEncryptionError('my-secret').cause, undefined);
+			assert.strictEqual(new SecretEncryptionError('my-secret').name, 'SecretEncryptionError');
+		});
+	});
+
 	suite('BaseSecretStorageService useInMemoryStorage=false, encryption not available', () => {
 		// F-SECRETS-3: no fallback to an in-memory store. Every call rejects, named; the persisted secrets are kept; the failure
 		// is not remembered, so the persisted secret is read once encryption is available.
@@ -340,15 +489,6 @@ suite('secrets', () => {
 			return parts.join('\n');
 		}
 
-		class RecordingLogService extends NullLogService {
-			readonly errors: Error[] = [];
-			override error(message: string | Error): void {
-				if (message instanceof Error) {
-					this.errors.push(message);
-				}
-			}
-		}
-
 		async function failingGet(failure: unknown, logService: NullLogService = store.add(new NullLogService())): Promise<unknown> {
 			const encryptionService = new TestEncryptionService();
 			const storageService = store.add(new InMemoryStorageService());
@@ -370,36 +510,35 @@ suite('secrets', () => {
 			assert.strictEqual(error.key, 'my-secret');
 			assert.ok(error.cause instanceof SecretDecryptionCause);
 			assert.notStrictEqual(error.cause, failure);
-			assert.strictEqual((error.cause as SecretDecryptionCause).kind, 'SyntaxError');
+			assert.strictEqual((error.cause as SecretDecryptionCause).kind, 'encryption-service');
 			assert.strictEqual((error.cause as SecretDecryptionCause).cause, undefined);
 			assert.ok(!everythingObservable(error).includes(marker));
 		});
 
-		test('the cause names the class of the failure and nothing else', async () => {
-			const failure = new Error(`denied ${marker}`);
-			failure.name = 'KeychainDeniedError';
-			const error = await failingGet(failure) as SecretDecryptionError;
-			assert.strictEqual((error.cause as Error).message, 'The encryption service failed (KeychainDeniedError).');
-			assert.ok(!everythingObservable(error).includes(marker));
-		});
-
-		test('a failure whose name is not a plain identifier, or that is not an error, names no kind', async () => {
-			const named = new Error('x');
-			named.name = marker + ' with spaces';
-			for (const failure of [named, marker, { message: marker }, null]) {
+		test('the cause is a fixed text and a fixed kind whatever the failure is', async () => {
+			const named = new Error(`denied ${marker}`);
+			named.name = 'KeychainDeniedError';
+			const spaced = new Error('x');
+			spaced.name = `${marker} with spaces`;
+			for (const failure of [named, spaced, marker, { message: marker }, null]) {
 				const error = await failingGet(failure) as SecretDecryptionError;
 				assert.ok(error instanceof SecretDecryptionError);
-				assert.strictEqual((error.cause as SecretDecryptionCause).kind, 'unknown');
+				assert.strictEqual((error.cause as Error).message, 'The encryption service failed.');
+				assert.strictEqual((error.cause as SecretDecryptionCause).kind, 'encryption-service');
 				assert.ok(!everythingObservable(error).includes(marker));
+				assert.ok(!everythingObservable(error).includes('KeychainDeniedError'));
 			}
 		});
 
-		test('the logged error carries no marker either', async () => {
-			const logService = store.add(new RecordingLogService());
-			await failingGet(new Error(`denied ${marker}`, { cause: new Error(marker) }), logService);
-			assert.strictEqual(logService.errors.length, 1);
-			assert.ok(logService.errors[0] instanceof SecretDecryptionError);
-			assert.ok(!everythingObservable(logService.errors[0]).includes(marker));
+		test('the logged error carries no marker either, at any level or in any argument', async () => {
+			const logService = store.add(new CapturingLogService());
+			const failure = new Error(`denied ${marker}`, { cause: new Error(marker) });
+			await failingGet(failure, logService);
+			assert.ok(logService.calls.some(args => args.some(arg => arg instanceof SecretDecryptionError)));
+			for (const args of logService.calls) {
+				assert.ok(!args.includes(failure), 'the raw error is not a log argument');
+				assert.ok(!deepText(args).includes(marker), deepText(args));
+			}
 		});
 
 		test('an error built without a failure has no cause', () => {
